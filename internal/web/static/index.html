@@ -286,6 +286,7 @@ html, body {
   line-height: 1.55;
   animation: msgIn 0.25s ease-out;
   position: relative;
+  overflow: visible;
 }
 
 @keyframes msgIn {
@@ -376,20 +377,34 @@ html, body {
   display: flex;
   flex-wrap: wrap;
   gap: 4px;
-  margin-top: 6px;
+  position: absolute;
+  bottom: -12px;
+  left: 12px;
+  z-index: 2;
+}
+
+.msg.sent .msg-reactions {
+  left: auto;
+  right: 12px;
+}
+
+.msg:has(.msg-reactions) {
+  margin-bottom: 18px;
 }
 
 .reaction-pill {
   display: inline-flex;
   align-items: center;
-  gap: 3px;
-  padding: 2px 8px;
-  border-radius: 12px;
-  background: var(--cream-soft);
+  gap: 2px;
+  padding: 1px 6px;
+  border-radius: 10px;
+  background: var(--bg-primary);
   border: 1px solid var(--border);
-  font-size: 13px;
+  font-size: 14px;
   cursor: pointer;
   transition: background 0.15s, border-color 0.15s;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+  line-height: 1.4;
 }
 
 .reaction-pill:hover {
@@ -398,7 +413,7 @@ html, body {
 }
 
 .reaction-pill .reaction-count {
-  font-size: 11px;
+  font-size: 10px;
   color: var(--text-muted);
 }
 
