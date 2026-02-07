@@ -258,92 +258,10 @@ h1 em {
 .preview-dot:nth-child(2) { background: #ffbd2e; border-color: #dea123; }
 .preview-dot:nth-child(3) { background: #28c840; border-color: #1aab29; }
 
-.preview-body {
-  display: grid;
-  grid-template-columns: 220px 1fr;
-  height: 420px;
-}
-
-.preview-sidebar {
-  border-right: 1px solid var(--border);
-  padding: 16px 12px;
-}
-
-.preview-convo {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 10px 12px;
-  border-radius: 10px;
-  margin-bottom: 4px;
-}
-
-.preview-convo.active {
-  background: var(--accent-dim);
-}
-
-.preview-avatar {
-  width: 34px;
-  height: 34px;
-  border-radius: 50%;
-  background: var(--bg-elevated);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-family: var(--font-serif);
-  font-size: 14px;
-  color: var(--accent);
-  flex-shrink: 0;
-  border: 1px solid var(--border);
-}
-
-.preview-convo-name {
-  font-family: var(--font-serif);
-  font-size: 14px;
-}
-
-.preview-convo-sub {
-  font-size: 11px;
-  color: var(--text-muted);
-  margin-top: 1px;
-}
-
-.preview-messages {
-  padding: 20px;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  justify-content: flex-end;
-}
-
-.preview-msg {
-  padding: 8px 14px;
-  border-radius: 16px;
-  font-size: 13px;
-  line-height: 1.5;
-  max-width: 320px;
-}
-
-.preview-msg.received {
-  align-self: flex-start;
-  background: var(--bg-elevated);
-  border: 1px solid var(--border);
-  border-bottom-left-radius: 4px;
-}
-
-.preview-msg.sent {
-  align-self: flex-end;
-  background: rgba(232, 164, 74, 0.12);
-  border: 1px solid rgba(232, 164, 74, 0.15);
-  border-bottom-right-radius: 4px;
-}
-
-.preview-msg .label {
-  font-size: 10px;
-  color: var(--accent);
-  margin-bottom: 2px;
-  font-family: var(--font-sans);
-  font-weight: 500;
+.preview-screenshot {
+  width: 100%;
+  display: block;
+  border-radius: 0 0 12px 12px;
 }
 
 /* ─── Features ─── */
@@ -512,8 +430,7 @@ footer a:hover { color: var(--accent); }
   .hero-actions { flex-direction: column; width: 100%; }
   .btn-primary, .btn-secondary { width: 100%; justify-content: center; }
   .features-grid { grid-template-columns: 1fr; }
-  .preview-body { grid-template-columns: 1fr; }
-  .preview-sidebar { display: none; }
+  .preview-screenshot { border-radius: 0 0 10px 10px; }
   footer { flex-direction: column; gap: 12px; text-align: center; }
 }
 </style>
@@ -563,47 +480,7 @@ footer a:hover { color: var(--accent); }
         <div class="preview-dot"></div>
         <div class="preview-dot"></div>
       </div>
-      <div class="preview-body">
-        <div class="preview-sidebar">
-          <div class="preview-convo active">
-            <div class="preview-avatar">A</div>
-            <div>
-              <div class="preview-convo-name">Alice Chen</div>
-              <div class="preview-convo-sub">Sounds great!</div>
-            </div>
-          </div>
-          <div class="preview-convo">
-            <div class="preview-avatar">M</div>
-            <div>
-              <div class="preview-convo-name">Mom</div>
-              <div class="preview-convo-sub">Call me when free</div>
-            </div>
-          </div>
-          <div class="preview-convo">
-            <div class="preview-avatar">T</div>
-            <div>
-              <div class="preview-convo-name">Team chat</div>
-              <div class="preview-convo-sub">See you at 3</div>
-            </div>
-          </div>
-          <div class="preview-convo">
-            <div class="preview-avatar">D</div>
-            <div>
-              <div class="preview-convo-name">David Park</div>
-              <div class="preview-convo-sub">Thanks!</div>
-            </div>
-          </div>
-        </div>
-        <div class="preview-messages">
-          <div class="preview-msg received">Hey, are we still on for dinner Friday?</div>
-          <div class="preview-msg sent">Yes! 7pm at the usual spot?</div>
-          <div class="preview-msg received">Sounds great! Should I invite Sarah too?</div>
-          <div class="preview-msg sent">
-            <div class="label">via Claude</div>
-            Definitely, the more the merrier. I'll make a reservation for three.
-          </div>
-        </div>
-      </div>
+      <img src="screenshot.png" alt="OpenMessages app showing a conversation with messages, reactions, and a sidebar of recent chats" class="preview-screenshot">
     </div>
   </div>
 </section>
