@@ -1,4 +1,6 @@
-openmessages
+/openmessages
 *.db
 session.json
 .vercel/
+macos/build/
+macos/OpenMessages/.build/
