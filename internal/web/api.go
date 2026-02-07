@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/fs"
 	"math/rand"
 	"time"
@@ -166,6 +167,113 @@ func APIHandler(store *db.Store, cli *client.Client, logger zerolog.Logger, onDe
 		})
 	})
 
+	mux.HandleFunc("/api/send-media", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			httpError(w, "method not allowed", 405)
+			return
+		}
+		if cli == nil {
+			httpError(w, "not connected to Google Messages", 503)
+			return
+		}
+
+		// Parse multipart form (max 10MB)
+		if err := r.ParseMultipartForm(10 << 20); err != nil {
+			httpError(w, "invalid multipart form: "+err.Error(), 400)
+			return
+		}
+
+		convID := r.FormValue("conversation_id")
+		if convID == "" {
+			httpError(w, "conversation_id is required", 400)
+			return
+		}
+
+		file, header, err := r.FormFile("file")
+		if err != nil {
+			httpError(w, "file is required: "+err.Error(), 400)
+			return
+		}
+		defer file.Close()
+
+		data, err := io.ReadAll(file)
+		if err != nil {
+			httpError(w, "read file: "+err.Error(), 500)
+			return
+		}
+
+		mime := header.Header.Get("Content-Type")
+		if mime == "" {
+			mime = "application/octet-stream"
+		}
+
+		// Upload media via libgm
+		media, err := cli.GM.UploadMedia(data, header.Filename, mime)
+		if err != nil {
+			httpError(w, "upload media: "+err.Error(), 502)
+			return
+		}
+
+		// Get SIM and participant info
+		conv, err := cli.GM.GetConversation(convID)
+		if err != nil {
+			httpError(w, "get conversation: "+err.Error(), 502)
+			return
+		}
+
+		var myParticipantID string
+		var simPayload *gmproto.SIMPayload
+		for _, p := range conv.GetParticipants() {
+			if p.GetIsMe() {
+				if id := p.GetID(); id != nil {
+					myParticipantID = id.GetNumber()
+				}
+				simPayload = p.GetSimPayload()
+				break
+			}
+		}
+		if simPayload == nil {
+			if sc := conv.GetSimCard(); sc != nil {
+				simPayload = sc.GetSIMData().GetSIMPayload()
+			}
+		}
+
+		payload := BuildSendMediaPayload(convID, media, myParticipantID, simPayload)
+
+		logger.Info().
+			Str("conv_id", convID).
+			Str("mime", mime).
+			Str("filename", header.Filename).
+			Int("size", len(data)).
+			Msg("Sending media message")
+
+		resp, err := cli.GM.SendMessage(payload)
+		if err != nil {
+			httpError(w, "send message: "+err.Error(), 502)
+			return
+		}
+		success := resp.GetStatus() == gmproto.SendMessageResponse_SUCCESS
+		if success {
+			now := time.Now().UnixMilli()
+			store.UpsertMessage(&db.Message{
+				MessageID:      payload.TmpID,
+				ConversationID: convID,
+				Body:           "",
+				IsFromMe:       true,
+				TimestampMS:    now,
+				Status:         "OUTGOING_SENDING",
+				MediaID:        media.MediaID,
+				MimeType:       media.MimeType,
+				DecryptionKey:  hex.EncodeToString(media.DecryptionKey),
+			})
+			store.UpdateConversationTimestamp(convID, now)
+		}
+		writeJSON(w, map[string]any{
+			"status":  resp.GetStatus().String(),
+			"success": success,
+		})
+	})
+
 	mux.HandleFunc("/api/media/", func(w http.ResponseWriter, r *http.Request) {
 		msgID := strings.TrimPrefix(r.URL.Path, "/api/media/")
 		if msgID == "" {
@@ -304,6 +412,27 @@ func BuildSendPayload(conversationID, message, replyToID, participantID string, 
 		}
 	}
 	return req
+}
+
+// BuildSendMediaPayload constructs a SendMessageRequest with a MediaContent attachment
+// instead of text. Uses the same MessageInfo array format as BuildSendPayload.
+func BuildSendMediaPayload(conversationID string, media *gmproto.MediaContent, participantID string, sim *gmproto.SIMPayload) *gmproto.SendMessageRequest {
+	tmpID := fmt.Sprintf("tmp_%012d", rand.Int63n(1e12))
+	return &gmproto.SendMessageRequest{
+		ConversationID: conversationID,
+		MessagePayload: &gmproto.MessagePayload{
+			TmpID:                 tmpID,
+			MessagePayloadContent: nil,
+			MessageInfo: []*gmproto.MessageInfo{{
+				Data: &gmproto.MessageInfo_MediaContent{MediaContent: media},
+			}},
+			ConversationID: conversationID,
+			ParticipantID:  participantID,
+			TmpID2:         tmpID,
+		},
+		SIMPayload: sim,
+		TmpID:      tmpID,
+	}
 }
 
 // BuildReactionPayload constructs a SendReactionRequest using gmproto.MakeReactionData

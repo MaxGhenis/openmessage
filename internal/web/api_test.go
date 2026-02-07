@@ -571,6 +571,87 @@ func TestBuildSendPayloadNoReply(t *testing.T) {
 	}
 }
 
+func TestBuildSendMediaPayload(t *testing.T) {
+	sim := &gmproto.SIMPayload{SIMNumber: 1}
+	media := &gmproto.MediaContent{
+		Format:    4, // image
+		MediaID:   "media-abc-123",
+		MediaName: "photo.jpg",
+		Size:      54321,
+		MimeType:  "image/jpeg",
+	}
+	payload := BuildSendMediaPayload("conv-1", media, "+15551234567", sim)
+
+	// Must use MessageInfo with MediaContent (not MessageContent)
+	if payload.MessagePayload.MessagePayloadContent != nil {
+		t.Error("MessagePayloadContent must be nil; use MessageInfo instead")
+	}
+	if len(payload.MessagePayload.MessageInfo) != 1 {
+		t.Fatalf("expected 1 MessageInfo entry, got %d", len(payload.MessagePayload.MessageInfo))
+	}
+
+	// Should have MediaContent, not MessageContent
+	mc := payload.MessagePayload.MessageInfo[0].GetMessageContent()
+	if mc != nil {
+		t.Error("MessageContent should be nil for media messages")
+	}
+	mediaCont := payload.MessagePayload.MessageInfo[0].GetMediaContent()
+	if mediaCont == nil {
+		t.Fatal("MediaContent must be set")
+	}
+	if mediaCont.MediaID != "media-abc-123" {
+		t.Errorf("MediaID = %q, want media-abc-123", mediaCont.MediaID)
+	}
+	if mediaCont.MimeType != "image/jpeg" {
+		t.Errorf("MimeType = %q, want image/jpeg", mediaCont.MimeType)
+	}
+
+	// TmpID format: tmp_ followed by 12 digits
+	if !strings.HasPrefix(payload.TmpID, "tmp_") || len(payload.TmpID) != 16 {
+		t.Errorf("TmpID format wrong: %q (want tmp_ + 12 digits)", payload.TmpID)
+	}
+	// TmpID must be in all 3 places
+	if payload.MessagePayload.TmpID != payload.TmpID {
+		t.Error("MessagePayload.TmpID must match root TmpID")
+	}
+	if payload.MessagePayload.TmpID2 != payload.TmpID {
+		t.Error("MessagePayload.TmpID2 must match root TmpID")
+	}
+
+	// SIM payload must be set
+	if payload.SIMPayload == nil || payload.SIMPayload.SIMNumber != 1 {
+		t.Error("SIMPayload not set correctly")
+	}
+
+	// ParticipantID and ConversationID
+	if payload.MessagePayload.ParticipantID != "+15551234567" {
+		t.Errorf("ParticipantID = %q, want +15551234567", payload.MessagePayload.ParticipantID)
+	}
+	if payload.ConversationID != "conv-1" {
+		t.Errorf("root ConversationID = %q", payload.ConversationID)
+	}
+	if payload.MessagePayload.ConversationID != "conv-1" {
+		t.Errorf("payload ConversationID = %q", payload.MessagePayload.ConversationID)
+	}
+}
+
+func TestSendMediaEndpointNoClient(t *testing.T) {
+	ts := newTestServer(t)
+
+	// Multipart form with image data
+	body := strings.NewReader("")
+	resp, err := http.Post(ts.server.URL+"/api/send-media", "application/json", body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	// Should return 405 for GET or 400/503 for POST without proper body
+	if resp.StatusCode != 400 && resp.StatusCode != 503 {
+		t.Fatalf("got status %d, want 400 or 503", resp.StatusCode)
+	}
+}
+
 func TestStaticFileServing(t *testing.T) {
 	ts := newTestServer(t)
 

@@ -578,6 +578,61 @@ html, body {
   color: var(--bg-deep);
 }
 
+/* ─── Attachment Preview ─── */
+.attach-preview {
+  display: none;
+  padding: 8px 28px 0;
+  border-top: 1px solid var(--border);
+  background: var(--bg-surface);
+}
+.attach-preview.active { display: flex; align-items: center; gap: 10px; }
+.attach-preview img {
+  max-height: 80px;
+  max-width: 120px;
+  border-radius: var(--radius-sm);
+  object-fit: cover;
+}
+.attach-preview .attach-name {
+  font-size: 12px;
+  color: var(--text-secondary);
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.attach-preview .attach-remove {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 18px;
+  padding: 4px 8px;
+}
+.attach-preview .attach-remove:hover { color: var(--text-primary); }
+
+.attach-btn {
+  width: 44px;
+  height: 44px;
+  border-radius: 50%;
+  background: none;
+  border: 1px solid var(--border);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  transition: border-color 0.2s, background 0.2s;
+}
+.attach-btn:hover {
+  border-color: var(--border-accent);
+  background: var(--accent-dim);
+}
+.attach-btn svg {
+  width: 20px;
+  height: 20px;
+  color: var(--text-secondary);
+}
+
 /* ─── Empty State ─── */
 .empty-state {
   flex: 1;
@@ -689,7 +744,16 @@ html, body {
       <div class="reply-preview">Replying to <span id="reply-to-name"></span>: <span id="reply-to-text"></span></div>
       <button class="reply-close" id="reply-close">&times;</button>
     </div>
+    <div class="attach-preview" id="attach-preview">
+      <img id="attach-thumb" alt="Preview">
+      <span class="attach-name" id="attach-name"></span>
+      <button class="attach-remove" id="attach-remove">&times;</button>
+    </div>
     <div class="compose-bar" id="compose-bar" style="display:none">
+      <input type="file" id="file-input" accept="image/*,video/*" style="display:none">
+      <button class="attach-btn" id="attach-btn" title="Attach image">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
+      </button>
       <textarea class="compose-input" id="compose-input" placeholder="Write a message..." rows="1"></textarea>
       <button class="send-btn" id="send-btn" disabled>
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
@@ -718,6 +782,13 @@ html, body {
   const $composeBar = document.getElementById('compose-bar');
   const $composeInput = document.getElementById('compose-input');
   const $sendBtn = document.getElementById('send-btn');
+  const $fileInput = document.getElementById('file-input');
+  const $attachBtn = document.getElementById('attach-btn');
+  const $attachPreview = document.getElementById('attach-preview');
+  const $attachThumb = document.getElementById('attach-thumb');
+  const $attachName = document.getElementById('attach-name');
+  const $attachRemove = document.getElementById('attach-remove');
+  let pendingFile = null; // { file: File, dataUrl: string }
   const $searchInput = document.getElementById('search-input');
   const $connectionBanner = document.getElementById('connection-banner');
   const $replyIndicator = document.getElementById('reply-indicator');
@@ -993,23 +1064,34 @@ html, body {
   // ─── Send Message ───
   async function sendMessage() {
     const text = $composeInput.value.trim();
-    if (!text || !activeConvoId) return;
+    const hasMedia = !!pendingFile;
+    if ((!text && !hasMedia) || !activeConvoId) return;
 
     $composeInput.value = '';
     $sendBtn.disabled = true;
     autoResize();
 
     try {
-      const payload = {
-        conversation_id: activeConvoId,
-        message: text,
-      };
-      if (replyToMsg) {
-        payload.reply_to_id = replyToMsg.MessageID;
+      if (hasMedia) {
+        // Send media via multipart form
+        const form = new FormData();
+        form.append('conversation_id', activeConvoId);
+        form.append('file', pendingFile.file);
+        const resp = await fetch('/api/send-media', { method: 'POST', body: form });
+        if (!resp.ok) throw new Error(await resp.text());
+        clearAttachment();
       }
-      await postJSON('/api/send', payload);
+      if (text) {
+        const payload = {
+          conversation_id: activeConvoId,
+          message: text,
+        };
+        if (replyToMsg) {
+          payload.reply_to_id = replyToMsg.MessageID;
+        }
+        await postJSON('/api/send', payload);
+      }
       clearReply();
-      // Reload both messages and conversations so sent-to chat jumps to top
       await loadMessages(activeConvoId);
       await loadConversations();
     } catch (err) {
@@ -1032,6 +1114,52 @@ html, body {
     }
   });
   $sendBtn.addEventListener('click', sendMessage);
+
+  // ─── Attachments (paste + file picker) ───
+  function setAttachment(file) {
+    pendingFile = { file };
+    $attachName.textContent = file.name || 'Pasted image';
+    $attachPreview.classList.add('active');
+    $sendBtn.disabled = false;
+
+    if (file.type.startsWith('image/')) {
+      const reader = new FileReader();
+      reader.onload = e => { $attachThumb.src = e.target.result; $attachThumb.style.display = 'block'; };
+      reader.readAsDataURL(file);
+    } else {
+      $attachThumb.style.display = 'none';
+    }
+  }
+
+  function clearAttachment() {
+    pendingFile = null;
+    $attachPreview.classList.remove('active');
+    $attachThumb.src = '';
+    $attachName.textContent = '';
+    $fileInput.value = '';
+    autoResize();
+  }
+
+  // Paste handler: Ctrl+V / Cmd+V with image data
+  $composeInput.addEventListener('paste', e => {
+    const items = e.clipboardData?.items;
+    if (!items) return;
+    for (const item of items) {
+      if (item.kind === 'file' && item.type.startsWith('image/')) {
+        e.preventDefault();
+        const file = item.getAsFile();
+        if (file) setAttachment(file);
+        return;
+      }
+    }
+  });
+
+  // File picker button
+  $attachBtn.addEventListener('click', () => $fileInput.click());
+  $fileInput.addEventListener('change', () => {
+    if ($fileInput.files[0]) setAttachment($fileInput.files[0]);
+  });
+  $attachRemove.addEventListener('click', clearAttachment);
 
   // ─── Search ───
   let searchTimeout;
