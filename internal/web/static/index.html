@@ -1092,6 +1092,9 @@ html, body {
         await postJSON('/api/send', payload);
       }
       clearReply();
+      // Wait briefly for server echo to arrive, then force re-render
+      if (hasMedia) await new Promise(r => setTimeout(r, 1500));
+      lastMsgCount = -1;
       await loadMessages(activeConvoId);
       await loadConversations();
     } catch (err) {
