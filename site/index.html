@@ -548,22 +548,37 @@ footer a:hover { color: var(--accent); }
     <div class="step">
       <div class="step-num">1</div>
       <div>
-        <h3>Download</h3>
-        <p>Grab <code>OpenMessages.dmg</code> from <a href="https://github.com/MaxGhenis/openmessages/releases/latest/download/OpenMessages.dmg" style="color:var(--accent)">the latest release</a> and drag to Applications. Universal binary, works on all Macs.</p>
+        <h3>Download and install</h3>
+        <p><a href="https://github.com/MaxGhenis/openmessages/releases/latest/download/OpenMessages.dmg" style="color:var(--accent)">Download OpenMessages.dmg</a>, open it, and drag to Applications. On first launch, <strong>right-click &rarr; Open</strong> to bypass Gatekeeper (it's unsigned). Universal binary — Apple Silicon and Intel.</p>
       </div>
     </div>
     <div class="step">
       <div class="step-num">2</div>
       <div>
         <h3>Pair your phone</h3>
-        <p>Open the app and scan the QR code with Google Messages on your Android phone. One-time setup — your session persists across restarts.</p>
+        <p>Launch the app. It shows a QR code. On your Android phone, open <strong>Google Messages &rarr; Settings &rarr; Device pairing</strong> and scan it. One-time setup — your session persists across restarts.</p>
       </div>
     </div>
     <div class="step">
       <div class="step-num">3</div>
       <div>
         <h3>Start messaging</h3>
-        <p>Your conversations sync instantly. The app lives in your menu bar. For AI integration, add the bundled MCP server to your <code>~/.mcp.json</code> for Claude Code.</p>
+        <p>Your conversations sync instantly. Send and receive SMS/RCS from the desktop. The app lives in your menu bar with native notifications.</p>
+      </div>
+    </div>
+    <div class="step">
+      <div class="step-num">4</div>
+      <div>
+        <h3>Add AI integration</h3>
+        <p>Add to <code>~/.mcp.json</code> for Claude Code:</p>
+        <pre style="background:var(--bg-elevated);padding:12px 16px;border-radius:8px;font-size:12px;margin-top:8px;overflow-x:auto;border:1px solid var(--border)"><code>{
+  "mcpServers": {
+    "openmessages": {
+      "command": "/Applications/OpenMessages.app/Contents/Resources/openmessages",
+      "args": ["serve"]
+    }
+  }
+}</code></pre>
       </div>
     </div>
   </div>

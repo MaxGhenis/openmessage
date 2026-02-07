@@ -47,6 +47,13 @@ cp "$SCRIPT_DIR/OpenMessages/Sources/Info.plist" "$APP_BUNDLE/Contents/Info.plis
 # Create PkgInfo
 echo -n "APPL????" > "$APP_BUNDLE/Contents/PkgInfo"
 
+# Ad-hoc code sign (avoids "unidentified developer" for local builds)
+echo "==> Code signing..."
+codesign --force --deep --sign - "$APP_BUNDLE"
+
+# Remove quarantine attribute
+xattr -cr "$APP_BUNDLE"
+
 echo "==> Built: $APP_BUNDLE"
 echo "   Size: $(du -sh "$APP_BUNDLE" | cut -f1)"
 echo ""
