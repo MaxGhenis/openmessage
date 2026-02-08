@@ -584,31 +584,22 @@ footer a:hover { color: var(--accent); }
       <div class="step-num">1</div>
       <div>
         <h3>Download and install</h3>
-        <p><a href="https://github.com/MaxGhenis/openmessages/releases/latest/download/OpenMessages.dmg" style="color:var(--accent)">Download OpenMessages.dmg</a>, open it, and drag to Applications. On first launch, <strong>right-click &rarr; Open</strong> to bypass Gatekeeper (it's unsigned). Universal binary — Apple Silicon and Intel.</p>
+        <p><a href="https://github.com/MaxGhenis/openmessages/releases/latest/download/OpenMessages.dmg" style="color:var(--accent)">Download OpenMessages.dmg</a>, open it, and drag to Applications. On first launch, <strong>right-click &rarr; Open</strong> to bypass Gatekeeper (it's unsigned).</p>
       </div>
     </div>
     <div class="step">
       <div class="step-num">2</div>
       <div>
-        <h3>Pair your phone</h3>
-        <p>Launch the app. It shows a QR code. On your Android phone, open <strong>Google Messages &rarr; Settings &rarr; Device pairing</strong> and scan it. One-time setup — your session persists across restarts.</p>
-        <p style="margin-top:8px;font-size:13px;color:var(--text-muted)">Don't see a QR scan option? You may be using Google account pairing. Switch to QR code pairing in Device pairing settings — this also lets you use Google Messages web alongside OpenMessages.</p>
+        <h3>Open and pair</h3>
+        <p>The app walks you through pairing with your phone — scan a QR code and you're done.</p>
       </div>
     </div>
     <div class="step">
       <div class="step-num">3</div>
       <div>
-        <h3>Start messaging</h3>
-        <p>Your conversations sync instantly. Send and receive SMS/RCS from the desktop. The app lives in your menu bar with native notifications.</p>
-      </div>
-    </div>
-    <div class="step">
-      <div class="step-num">4</div>
-      <div>
         <h3>Connect to AI</h3>
-        <p>The app runs an MCP server automatically on port 7007. Add it to Claude Code:</p>
+        <p>The app runs an MCP server automatically. Add it to Claude Code:</p>
         <pre style="background:var(--bg-elevated);padding:12px 16px;border-radius:8px;font-size:12px;margin-top:8px;overflow-x:auto;border:1px solid var(--border);white-space:pre-wrap;word-break:break-all"><code>claude mcp add -s user --transport sse openmessages http://localhost:7007/mcp/sse</code></pre>
-        <p style="margin-top:8px">Or install the <a href="#ai" style="color:var(--accent)">Claude Code plugin</a> for the <code>/messages</code> slash command.</p>
       </div>
     </div>
   </div>
