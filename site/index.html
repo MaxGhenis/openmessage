@@ -422,9 +422,39 @@ footer a:hover { color: var(--accent); }
 }
 
 /* ─── Responsive ─── */
+/* ─── Mobile nav toggle ─── */
+.nav-toggle {
+  display: none;
+  background: none;
+  border: none;
+  color: var(--text-primary);
+  cursor: pointer;
+  padding: 4px;
+}
+
+.nav-toggle svg {
+  width: 24px;
+  height: 24px;
+}
+
 @media (max-width: 768px) {
   nav { padding: 16px 20px; }
-  .nav-links { gap: 16px; }
+  .nav-toggle { display: block; }
+  .nav-links {
+    display: none;
+    position: absolute;
+    top: 100%;
+    left: 0;
+    right: 0;
+    flex-direction: column;
+    background: rgba(12, 12, 12, 0.95);
+    backdrop-filter: blur(20px);
+    padding: 16px 20px;
+    gap: 16px;
+    border-bottom: 1px solid var(--border);
+  }
+  .nav-links.open { display: flex; }
+  .nav-cta { text-align: center; }
   .hero { padding: 100px 24px 60px; }
   h1 { letter-spacing: -1px; }
   .hero-actions { flex-direction: column; width: 100%; }
@@ -439,6 +469,9 @@ footer a:hover { color: var(--accent); }
 
 <nav>
   <a href="/" class="nav-logo">Open<span>Messages</span></a>
+  <button class="nav-toggle" onclick="document.querySelector('.nav-links').classList.toggle('open')" aria-label="Toggle menu">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+  </button>
   <div class="nav-links">
     <a href="#features">Features</a>
     <a href="#setup">Setup</a>
