@@ -552,6 +552,44 @@ footer a:hover { color: var(--accent); }
   color: var(--accent);
   border-color: var(--border-accent);
 }
+
+/* ─── Code blocks ─── */
+pre {
+  background: var(--bg-elevated);
+  padding: 12px 16px;
+  padding-right: 60px;
+  border-radius: 8px;
+  font-size: 12px;
+  margin-top: 8px;
+  overflow-x: auto;
+  border: 1px solid var(--border);
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+/* ─── Copy button on code blocks ─── */
+.code-wrap { position: relative; }
+
+.copy-btn {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 4px 8px;
+  font-size: 11px;
+  color: var(--text-muted);
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.15s, color 0.15s;
+  font-family: var(--font-sans);
+  z-index: 1;
+}
+
+.code-wrap:hover .copy-btn { opacity: 1; }
+.copy-btn:hover { color: var(--accent); border-color: var(--border-accent); }
+.copy-btn.copied { color: var(--accent); opacity: 1; }
 </style>
 </head>
 <body>
@@ -695,7 +733,7 @@ footer a:hover { color: var(--accent); }
       <div>
         <h3>Connect to AI</h3>
         <p>The app runs an MCP server automatically. Add it to Claude Code:</p>
-        <pre style="background:var(--bg-elevated);padding:12px 16px;border-radius:8px;font-size:12px;margin-top:8px;overflow-x:auto;border:1px solid var(--border);white-space:pre-wrap;word-break:break-all"><code>claude mcp add -s user --transport sse openmessage http://localhost:7007/mcp/sse</code></pre>
+        <pre><code>claude mcp add -s user --transport sse openmessage http://localhost:7007/mcp/sse</code></pre>
       </div>
     </div>
   </div>
@@ -706,7 +744,7 @@ footer a:hover { color: var(--accent); }
       <div>
         <h3>Download the binary</h3>
         <p>Grab the standalone Go binary for your platform from <a href="https://github.com/MaxGhenis/openmessage/releases/latest" style="color:var(--accent)">GitHub Releases</a>, or build from source:</p>
-        <pre style="background:var(--bg-elevated);padding:12px 16px;border-radius:8px;font-size:12px;margin-top:8px;overflow-x:auto;border:1px solid var(--border)"><code># macOS (Apple Silicon)
+        <pre><code># macOS (Apple Silicon)
 curl -L https://github.com/MaxGhenis/openmessage/releases/latest/download/openmessage-darwin-arm64.tar.gz | tar xz
 # Linux (x86_64)
 curl -L https://github.com/MaxGhenis/openmessage/releases/latest/download/openmessage-linux-amd64.tar.gz | tar xz
@@ -719,7 +757,7 @@ chmod +x openmessage-* && sudo mv openmessage-* /usr/local/bin/openmessage</code
       <div>
         <h3>Pair with your phone</h3>
         <p>Run the pairing command — it shows a QR code right in your terminal:</p>
-        <pre style="background:var(--bg-elevated);padding:12px 16px;border-radius:8px;font-size:12px;margin-top:8px;overflow-x:auto;border:1px solid var(--border)"><code>openmessage pair</code></pre>
+        <pre><code>openmessage pair</code></pre>
         <p style="margin-top:8px">Open Google Messages on your phone &rarr; Settings &rarr; Device pairing &rarr; scan the QR code.</p>
       </div>
     </div>
@@ -728,11 +766,11 @@ chmod +x openmessage-* && sudo mv openmessage-* /usr/local/bin/openmessage</code
       <div>
         <h3>Start the MCP server</h3>
         <p>One command starts the web UI and MCP server. No macOS app required — works on Linux too.</p>
-        <pre style="background:var(--bg-elevated);padding:12px 16px;border-radius:8px;font-size:12px;margin-top:8px;overflow-x:auto;border:1px solid var(--border)"><code>openmessage serve
+        <pre><code>openmessage serve
 # Web UI at http://localhost:7007
 # MCP SSE at http://localhost:7007/mcp/sse</code></pre>
         <p style="margin-top:8px">Then connect your AI client:</p>
-        <pre style="background:var(--bg-elevated);padding:12px 16px;border-radius:8px;font-size:12px;margin-top:8px;overflow-x:auto;border:1px solid var(--border);white-space:pre-wrap;word-break:break-all"><code>claude mcp add -s user --transport sse openmessage http://localhost:7007/mcp/sse</code></pre>
+        <pre><code>claude mcp add -s user --transport sse openmessage http://localhost:7007/mcp/sse</code></pre>
       </div>
     </div>
   </div>
@@ -786,7 +824,7 @@ chmod +x openmessage-* && sudo mv openmessage-* /usr/local/bin/openmessage</code
       <div>
         <h3>Claude Code plugin</h3>
         <p>Install the plugin for a <code>/messages</code> slash command that gives Claude context about the MCP tools and best practices for handling texts.</p>
-        <pre style="background:var(--bg-elevated);padding:12px 16px;border-radius:8px;font-size:12px;margin-top:8px;overflow-x:auto;border:1px solid var(--border)"><code># In your Claude Code settings, add the plugin source:
+        <pre><code># In your Claude Code settings, add the plugin source:
 "pluginSources": {
   "openmessage": "/path/to/openmessage/.claude-plugin"
 }
@@ -803,7 +841,7 @@ chmod +x openmessage-* && sudo mv openmessage-* /usr/local/bin/openmessage</code
       <div>
         <h3>OpenClaw integration</h3>
         <p>OpenClaw supports WhatsApp, Telegram, Discord, Signal, and iMessage — but <strong>not SMS/RCS</strong>. OpenMessage fills that gap. Connect via the <a href="https://github.com/lunarpulse/openclaw-mcp-plugin" target="_blank" style="color:var(--accent)">MCP plugin</a>:</p>
-        <pre style="background:var(--bg-elevated);padding:12px 16px;border-radius:8px;font-size:12px;margin-top:8px;overflow-x:auto;border:1px solid var(--border)"><code>// ~/.openclaw/openclaw.json
+        <pre><code>// ~/.openclaw/openclaw.json
 "mcp-integration": {
   "enabled": true,
   "config": {
@@ -844,6 +882,27 @@ function switchSetup(mode) {
   document.querySelectorAll('.setup-tab').forEach(t => t.classList.remove('active'));
   event.target.classList.add('active');
 }
+
+// Add copy buttons to all <pre> blocks
+document.querySelectorAll('pre').forEach(pre => {
+  const wrap = document.createElement('div');
+  wrap.className = 'code-wrap';
+  pre.parentNode.insertBefore(wrap, pre);
+  wrap.appendChild(pre);
+
+  const btn = document.createElement('button');
+  btn.className = 'copy-btn';
+  btn.textContent = 'Copy';
+  btn.onclick = () => {
+    const text = pre.textContent.replace(/^#[^\n]*\n?/gm, '').trim();
+    navigator.clipboard.writeText(text).then(() => {
+      btn.textContent = 'Copied!';
+      btn.classList.add('copied');
+      setTimeout(() => { btn.textContent = 'Copy'; btn.classList.remove('copied'); }, 1500);
+    });
+  };
+  wrap.appendChild(btn);
+});
 </script>
 
 </body>
