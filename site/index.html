@@ -762,6 +762,7 @@ pre {
           <li>Scroll down and click <strong>"Open Anyway"</strong> next to the OpenMessage message</li>
           <li>Click <strong>Open</strong> in the confirmation dialog</li>
         </ol>
+        <img src="gatekeeper.png" alt="macOS Privacy & Security settings showing Open Anyway button for OpenMessage" style="margin-top:12px;max-width:100%;border-radius:8px;border:1px solid var(--border)">
         <p style="margin-top:10px;font-size:13px;color:var(--text-muted)">App Store version coming soon — no Gatekeeper workaround needed once it's live.</p>
       </div>
     </div>
@@ -820,9 +821,8 @@ sudo mv openmessage-linux-arm64 /usr/local/bin/openmessage</code></pre>
       <div>
         <h3>Start the MCP server</h3>
         <p>One command starts the web UI and MCP server. No macOS app required — works on Linux too.</p>
-        <pre><code>openmessage serve
-# Web UI at http://localhost:7007
-# MCP SSE at http://localhost:7007/mcp/sse</code></pre>
+        <pre><code>openmessage serve</code></pre>
+        <p style="margin-top:6px;font-size:13px;color:var(--text-muted)">Web UI at <code>localhost:7007</code> &middot; MCP at <code>localhost:7007/mcp/sse</code></p>
         <p style="margin-top:8px">Then connect your AI client:</p>
         <pre><code>claude mcp add -s user --transport sse openmessage http://localhost:7007/mcp/sse</code></pre>
       </div>

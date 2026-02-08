@@ -41,6 +41,14 @@ func listContactsHandler(a *app.App) server.ToolHandlerFunc {
 			return errorResult(fmt.Sprintf("query failed: %v", err)), nil
 		}
 
+		// Fall back to conversation participants if contacts table is empty
+		if len(contacts) == 0 {
+			contacts, err = a.Store.ListContactsFromConversations(query, limit)
+			if err != nil {
+				return errorResult(fmt.Sprintf("query failed: %v", err)), nil
+			}
+		}
+
 		if len(contacts) == 0 {
 			return textResult("No contacts found."), nil
 		}
@@ -48,7 +56,11 @@ func listContactsHandler(a *app.App) server.ToolHandlerFunc {
 		var sb strings.Builder
 		fmt.Fprintf(&sb, "%d contacts:\n\n", len(contacts))
 		for _, c := range contacts {
-			fmt.Fprintf(&sb, "- %s: %s\n", c.Name, c.Number)
+			if c.Number != "" {
+				fmt.Fprintf(&sb, "- %s: %s\n", c.Name, c.Number)
+			} else {
+				fmt.Fprintf(&sb, "- %s\n", c.Name)
+			}
 		}
 		return textResult(sb.String()), nil
 	}

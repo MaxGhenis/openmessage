@@ -19,6 +19,7 @@ final class BackendManager: ObservableObject {
     private var process: Process?
     private let logger = Logger(subsystem: "com.openmessage.app", category: "Backend")
     private var healthCheckTask: Task<Void, Never>?
+    private var connectionMonitorTask: Task<Void, Never>?
 
     /// Path to the embedded Go binary inside the app bundle.
     var binaryPath: String {
@@ -127,6 +128,8 @@ final class BackendManager: ObservableObject {
     func stop() {
         healthCheckTask?.cancel()
         healthCheckTask = nil
+        connectionMonitorTask?.cancel()
+        connectionMonitorTask = nil
         process?.terminate()
         process = nil
         state = .stopped
@@ -146,6 +149,7 @@ final class BackendManager: ObservableObject {
                        json["connected"] as? Bool == true {
                         self.state = .running
                         self.logger.info("Backend ready after \(attempt) checks")
+                        self.startConnectionMonitor()
                         return
                     }
                 } catch {
@@ -156,6 +160,56 @@ final class BackendManager: ObservableObject {
                 self.state = .error("Backend failed to start within 15 seconds")
             }
         }
+    }
+
+    /// Periodically polls /api/status while running.
+    /// If the backend reports disconnected, transitions back to needsPairing.
+    private func startConnectionMonitor() {
+        connectionMonitorTask = Task {
+            var consecutiveDisconnects = 0
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(3))
+                if Task.isCancelled { return }
+                do {
+                    let url = baseURL.appendingPathComponent("api/status")
+                    let (data, response) = try await URLSession.shared.data(from: url)
+                    if let http = response as? HTTPURLResponse, http.statusCode == 200,
+                       let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                       json["connected"] as? Bool == false {
+                        consecutiveDisconnects += 1
+                        self.logger.warning("Disconnect detected (\(consecutiveDisconnects)/3)")
+                        if consecutiveDisconnects >= 3 {
+                            self.logger.error("Phone disconnected — returning to pairing")
+                            self.handleDisconnect()
+                            return
+                        }
+                    } else {
+                        consecutiveDisconnects = 0
+                    }
+                } catch {
+                    self.logger.debug("Connection monitor error: \(error)")
+                }
+            }
+        }
+    }
+
+    /// Stop the backend, clean up session, and go back to pairing.
+    private func handleDisconnect() {
+        // Tell the backend to clean up (capture URL before stopping)
+        let unpairURL = baseURL.appendingPathComponent("api/unpair")
+        Task.detached {
+            var request = URLRequest(url: unpairURL)
+            request.httpMethod = "POST"
+            _ = try? await URLSession.shared.data(for: request)
+        }
+
+        // Delete session file locally so pairing starts fresh
+        let sessionPath = dataDir + "/session.json"
+        try? FileManager.default.removeItem(atPath: sessionPath)
+
+        // Stop the backend process and go to pairing
+        stop()
+        state = .needsPairing
     }
 
     /// Run the pairing flow. Returns the QR code URL for display.

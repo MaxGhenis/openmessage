@@ -27,7 +27,17 @@ var staticFS embed.FS
 // The client may be nil (disconnected state).
 // mcpHandler is an optional http.Handler for the MCP SSE endpoint (mounted at /mcp/).
 // onDeepBackfill is an optional callback triggered by POST /api/backfill.
+// StatusChecker returns whether the backend is connected.
+type StatusChecker func() bool
+
+// UnpairFunc deletes the session and disconnects.
+type UnpairFunc func() error
+
 func APIHandler(store *db.Store, cli *client.Client, logger zerolog.Logger, mcpHandler http.Handler, onDeepBackfill ...func()) http.Handler {
+	return APIHandlerFull(store, cli, logger, mcpHandler, nil, nil, onDeepBackfill...)
+}
+
+func APIHandlerFull(store *db.Store, cli *client.Client, logger zerolog.Logger, mcpHandler http.Handler, isConnected StatusChecker, unpair UnpairFunc, onDeepBackfill ...func()) http.Handler {
 	mux := http.NewServeMux()
 
 	_ = mcpHandler // used in the return wrapper below
@@ -447,6 +457,129 @@ func APIHandler(store *db.Store, cli *client.Client, logger zerolog.Logger, mcpH
 		writeJSON(w, map[string]string{"status": "ok"})
 	})
 
+	mux.HandleFunc("/api/drafts", func(w http.ResponseWriter, r *http.Request) {
+		conversationID := r.URL.Query().Get("conversation_id")
+		if conversationID == "" {
+			httpError(w, "conversation_id is required", 400)
+			return
+		}
+		drafts, err := store.ListDrafts(conversationID)
+		if err != nil {
+			httpError(w, "list drafts: "+err.Error(), 500)
+			return
+		}
+		if drafts == nil {
+			drafts = []*db.Draft{}
+		}
+		writeJSON(w, drafts)
+	})
+
+	mux.HandleFunc("/api/drafts/send", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			httpError(w, "method not allowed", 405)
+			return
+		}
+		var req struct {
+			DraftID string `json:"draft_id"`
+			Body    string `json:"body"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			httpError(w, "invalid JSON: "+err.Error(), 400)
+			return
+		}
+		if req.DraftID == "" || req.Body == "" {
+			httpError(w, "draft_id and body are required", 400)
+			return
+		}
+		if cli == nil {
+			httpError(w, "not connected to Google Messages", 503)
+			return
+		}
+
+		// Look up the draft to get conversation_id
+		draft, err := store.GetDraft(req.DraftID)
+		if err != nil {
+			httpError(w, "get draft: "+err.Error(), 500)
+			return
+		}
+		if draft == nil {
+			httpError(w, "draft not found", 404)
+			return
+		}
+
+		// Use the same send logic as /api/send
+		conv, err := cli.GM.GetConversation(draft.ConversationID)
+		if err != nil {
+			httpError(w, "get conversation: "+err.Error(), 502)
+			return
+		}
+
+		var myParticipantID string
+		var simPayload *gmproto.SIMPayload
+		for _, p := range conv.GetParticipants() {
+			if p.GetIsMe() {
+				if id := p.GetID(); id != nil {
+					myParticipantID = id.GetNumber()
+				}
+				simPayload = p.GetSimPayload()
+				break
+			}
+		}
+		if simPayload == nil {
+			if sc := conv.GetSimCard(); sc != nil {
+				simPayload = sc.GetSIMData().GetSIMPayload()
+			}
+		}
+
+		payload := BuildSendPayload(draft.ConversationID, req.Body, "", myParticipantID, simPayload)
+
+		logger.Info().
+			Str("conv_id", draft.ConversationID).
+			Str("draft_id", req.DraftID).
+			Msg("Sending draft message")
+
+		resp, err := cli.GM.SendMessage(payload)
+		if err != nil {
+			httpError(w, "send message: "+err.Error(), 502)
+			return
+		}
+		success := resp.GetStatus() == gmproto.SendMessageResponse_SUCCESS
+		if success {
+			now := time.Now().UnixMilli()
+			store.UpsertMessage(&db.Message{
+				MessageID:      payload.TmpID,
+				ConversationID: draft.ConversationID,
+				Body:           req.Body,
+				IsFromMe:       true,
+				TimestampMS:    now,
+				Status:         "OUTGOING_SENDING",
+			})
+			store.UpdateConversationTimestamp(draft.ConversationID, now)
+			store.DeleteDraft(req.DraftID)
+		}
+		writeJSON(w, map[string]any{
+			"status":  resp.GetStatus().String(),
+			"success": success,
+		})
+	})
+
+	mux.HandleFunc("/api/drafts/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete {
+			httpError(w, "method not allowed", 405)
+			return
+		}
+		draftID := strings.TrimPrefix(r.URL.Path, "/api/drafts/")
+		if draftID == "" {
+			httpError(w, "draft_id required", 400)
+			return
+		}
+		if err := store.DeleteDraft(draftID); err != nil {
+			httpError(w, "delete draft: "+err.Error(), 500)
+			return
+		}
+		writeJSON(w, map[string]string{"status": "ok"})
+	})
+
 	mux.HandleFunc("/api/backfill", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			httpError(w, "method not allowed", 405)
@@ -462,9 +595,26 @@ func APIHandler(store *db.Store, cli *client.Client, logger zerolog.Logger, mcpH
 
 	mux.HandleFunc("/api/status", func(w http.ResponseWriter, r *http.Request) {
 		connected := cli != nil
+		if isConnected != nil {
+			connected = isConnected()
+		}
 		writeJSON(w, map[string]any{
 			"connected": connected,
 		})
+	})
+
+	mux.HandleFunc("/api/unpair", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			httpError(w, "method not allowed", 405)
+			return
+		}
+		if unpair != nil {
+			if err := unpair(); err != nil {
+				httpError(w, "unpair: "+err.Error(), 500)
+				return
+			}
+		}
+		writeJSON(w, map[string]string{"status": "ok"})
 	})
 
 	// Serve embedded static files at root

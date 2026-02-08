@@ -13,11 +13,15 @@ import (
 	"github.com/maxghenis/openmessage/internal/db"
 )
 
+// OnDisconnect is called when the client fatally disconnects (e.g. unpaired).
+type OnDisconnect func()
+
 type EventHandler struct {
-	Store       *db.Store
-	Logger      zerolog.Logger
-	SessionPath string
-	Client      *Client
+	Store        *db.Store
+	Logger       zerolog.Logger
+	SessionPath  string
+	Client       *Client
+	OnDisconnect OnDisconnect
 }
 
 func (h *EventHandler) Handle(rawEvt any) {
@@ -34,6 +38,9 @@ func (h *EventHandler) Handle(rawEvt any) {
 		h.Logger.Info().Str("phone_id", evt.PhoneID).Msg("Pairing successful")
 	case *events.ListenFatalError:
 		h.Logger.Error().Err(evt.Error).Msg("Listen fatal error")
+		if h.OnDisconnect != nil {
+			h.OnDisconnect()
+		}
 	case *events.ListenTemporaryError:
 		h.Logger.Warn().Err(evt.Error).Msg("Listen temporary error")
 	case *events.ListenRecovered:

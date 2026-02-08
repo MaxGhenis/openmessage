@@ -15,6 +15,7 @@ func Register(s *server.MCPServer, a *app.App) {
 	s.AddTool(listConversationsTool(), listConversationsHandler(a))
 	s.AddTool(listContactsTool(), listContactsHandler(a))
 	s.AddTool(getStatusTool(), getStatusHandler(a))
+	s.AddTool(draftMessageTool(), draftMessageHandler(a))
 }
 
 func strArg(args map[string]any, key string) string {

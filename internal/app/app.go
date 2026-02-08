@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 
 	"github.com/rs/zerolog"
 
@@ -18,6 +19,7 @@ type App struct {
 	Logger       zerolog.Logger
 	DataDir      string
 	SessionPath  string
+	Connected    atomic.Bool
 }
 
 func DefaultDataDir() string {
@@ -68,13 +70,32 @@ func (a *App) LoadAndConnect() error {
 		Logger:      a.Logger,
 		SessionPath: a.SessionPath,
 		Client:      cli,
+		OnDisconnect: func() {
+			a.Connected.Store(false)
+			a.Logger.Warn().Msg("Disconnected from Google Messages")
+		},
 	}
 	cli.GM.SetEventHandler(a.EventHandler.Handle)
 
 	if err := cli.GM.Connect(); err != nil {
 		return fmt.Errorf("connect: %w", err)
 	}
+	a.Connected.Store(true)
 	a.Logger.Info().Msg("Connected to Google Messages")
+	return nil
+}
+
+// Unpair deletes the session file so the app can re-pair.
+func (a *App) Unpair() error {
+	a.Connected.Store(false)
+	if a.Client != nil {
+		a.Client.GM.Disconnect()
+		a.Client = nil
+	}
+	if err := os.Remove(a.SessionPath); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("remove session: %w", err)
+	}
+	a.Logger.Info().Msg("Unpaired — session deleted")
 	return nil
 }
 

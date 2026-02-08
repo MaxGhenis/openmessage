@@ -59,7 +59,11 @@ func RunServe(logger zerolog.Logger) error {
 		mcpserver.WithStaticBasePath("/mcp"),
 	)
 
-	httpHandler := web.APIHandler(a.Store, a.Client, logger, sseSrv, a.DeepBackfill)
+	httpHandler := web.APIHandlerFull(a.Store, a.Client, logger, sseSrv,
+		func() bool { return a.Connected.Load() },
+		a.Unpair,
+		a.DeepBackfill,
+	)
 	ln, err := net.Listen("tcp", ":"+port)
 	if err != nil {
 		return fmt.Errorf("listen on port %s: %w", port, err)

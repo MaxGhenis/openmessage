@@ -42,6 +42,13 @@ type Contact struct {
 	Number    string
 }
 
+type Draft struct {
+	DraftID        string
+	ConversationID string
+	Body           string
+	CreatedAt      int64
+}
+
 func New(dsn string) (*Store, error) {
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
@@ -101,6 +108,13 @@ func (s *Store) migrate() error {
 		contact_id TEXT PRIMARY KEY,
 		name TEXT NOT NULL DEFAULT '',
 		number TEXT NOT NULL DEFAULT ''
+	);
+
+	CREATE TABLE IF NOT EXISTS drafts (
+		draft_id TEXT PRIMARY KEY,
+		conversation_id TEXT NOT NULL,
+		body TEXT NOT NULL DEFAULT '',
+		created_at INTEGER NOT NULL DEFAULT 0
 	);
 	`
 	if _, err := s.db.Exec(schema); err != nil {
