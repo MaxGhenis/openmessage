@@ -11,7 +11,7 @@ body {
   background: #1e1e1e;
   font-family: 'JetBrains Mono', 'SF Mono', 'Menlo', 'Monaco', monospace;
   color: #d4d4d4;
-  width: 1500px;
+  width: 800px;
   height: 900px;
   overflow: hidden;
 }
@@ -43,8 +43,8 @@ body {
 /* Terminal content */
 .content {
   padding: 24px 32px;
-  font-size: 15.5px;
-  line-height: 1.5;
+  font-size: 18px;
+  line-height: 1.45;
 }
 
 /* Claude Code header */
@@ -52,12 +52,12 @@ body {
   display: flex;
   gap: 12px;
   align-items: flex-start;
-  margin-bottom: 12px;
+  margin-bottom: 10px;
 }
 
 .mascot {
   color: #e8896b;
-  font-size: 15.5px;
+  font-size: 18px;
   line-height: 1.15;
   flex-shrink: 0;
 }
@@ -70,7 +70,7 @@ body {
 
 .header-text .version { color: #fff; font-weight: 700; }
 .header-text .meta { color: #777; }
-.header-text .promo { color: #e8896b; font-size: 13px; }
+.header-text .promo { color: #e8896b; font-size: 15px; }
 
 /* Prompt */
 .prompt-char { color: #e8896b; font-weight: 700; }
@@ -98,7 +98,7 @@ body {
 .cursor-block {
   display: inline-block;
   width: 10px;
-  height: 18px;
+  height: 22px;
   background: #aeafad;
   vertical-align: text-bottom;
   margin-left: 2px;
@@ -114,7 +114,7 @@ body {
   align-items: center;
   padding: 0 32px;
   gap: 10px;
-  font-size: 13px;
+  font-size: 15px;
   color: #777;
 }
 
@@ -179,11 +179,12 @@ body {
 
   <!-- Tool call 4: draft_message -->
   <div class="tool-block">
-    <div><span class="ai-bullet">⏺</span> <span class="tool-name">openmessage - draft_message</span> <span class="tool-params">(MCP)</span><span class="tool-params">(conversation_id: "conv1", message:</span></div>
-    <div class="tool-params" style="padding-left: 370px;">"Hey! That Thai place is Kin Khao at 55 Cyril</div>
-    <div class="tool-params" style="padding-left: 370px;">Magnin St. Open til 10pm tonight and has 4.5</div>
-    <div class="tool-params" style="padding-left: 370px;">stars. Want me to book on OpenTable?")</div>
-    <div class="tool-result"><span class="tool-result-prefix">⎿</span>  Draft created. The user can review and send it from the app.</div>
+    <div><span class="ai-bullet">⏺</span> <span class="tool-name">openmessage - draft_message</span> <span class="tool-params">(MCP)</span></div>
+    <div class="tool-params" style="padding-left: 20px;">(conversation_id: "conv1", message: "Hey! That Thai</div>
+    <div class="tool-params" style="padding-left: 20px;">place is Kin Khao at 55 Cyril Magnin St. Open til</div>
+    <div class="tool-params" style="padding-left: 20px;">10pm tonight and has 4.5 stars. Want me to book</div>
+    <div class="tool-params" style="padding-left: 20px;">on OpenTable?")</div>
+    <div class="tool-result"><span class="tool-result-prefix">⎿</span>  Draft created. Review and send from the app.</div>
   </div>
 
   <!-- AI response -->
