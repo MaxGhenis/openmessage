@@ -47,12 +47,23 @@ body {
   line-height: 1.45;
 }
 
-/* Claude Code header */
+/* Claude Code header — version above, mascot + text side by side */
 .header {
+  margin-bottom: 10px;
+}
+
+.header-version {
+  color: #fff;
+  font-weight: 700;
+  margin-left: 130px;
+  margin-bottom: 0;
+  line-height: 1.45;
+}
+
+.header-row {
   display: flex;
   gap: 12px;
   align-items: flex-start;
-  margin-bottom: 10px;
 }
 
 .mascot {
@@ -68,7 +79,6 @@ body {
   gap: 0;
 }
 
-.header-text .version { color: #fff; font-weight: 700; }
 .header-text .meta { color: #777; }
 .header-text .promo { color: #e8896b; font-size: 15px; }
 
@@ -135,69 +145,71 @@ body {
 <div class="content">
   <!-- Header -->
   <div class="header">
-    <div class="mascot"><pre style="margin:0;font-family:inherit;font-size:inherit;line-height:1.15;background:none;border:none;padding:0;color:inherit"> ▐▛███▜▌
+    <div class="header-version">Claude Code v2.1.37</div>
+    <div class="header-row">
+      <div class="mascot"><pre style="margin:0;font-family:inherit;font-size:inherit;line-height:1.15;background:none;border:none;padding:0;color:inherit"> ▐▛███▜▌
 ▝▜█████▛▘
   ▘▘ ▝▝</pre></div>
-    <div class="header-text">
-      <span class="version">Claude Code v2.1.37</span>
-      <span class="meta">Opus 4.6 · Claude Max</span>
-      <span class="meta">/Users/maxghenis</span>
-      <span class="promo">Opus 4.6 is here · $50 free extra usage · Try fast mode o…</span>
+      <div class="header-text">
+        <span class="meta">Opus 4.6 · Claude Max</span>
+        <span class="meta">/Users/maxghenis</span>
+        <span class="promo">Opus 4.6 is here · $50 free extra usage · /extra-usage to…</span>
+      </div>
     </div>
   </div>
 
   <!-- User prompt -->
   <div style="margin: 12px 0 8px;">
     <span class="prompt-char">❯</span>
-    <span class="prompt-text"> Sarah mentioned a Thai place on Valencia. Draft her the address</span>
+    <span class="prompt-text"> Catch me up on the hiking group and tell them I'm in</span>
   </div>
 
-  <!-- Tool call 1: search_contacts -->
+  <!-- Tool call 1: list_conversations -->
   <div class="tool-block">
-    <div><span class="ai-bullet">⏺</span> <span class="tool-name">openmessage - search_contacts</span> <span class="tool-params">(MCP)</span><span class="tool-params">(query: "Sarah")</span></div>
-    <div class="tool-result"><span class="tool-result-prefix">⎿</span>  1 contacts:</div>
-    <div class="tool-result">   - Sarah Chen: +14155551234</div>
+    <div><span class="ai-bullet">⏺</span> <span class="tool-name">openmessage - list_conversations</span> <span class="tool-params">(MCP)</span></div>
+    <div class="tool-result"><span class="tool-result-prefix">⎿</span>  8 conversations</div>
+    <div class="tool-result">   Most recent: Weekend Hiking Group</div>
   </div>
 
-  <!-- Tool call 2: get_conversation -->
+  <!-- Tool call 2: get_messages -->
   <div class="tool-block">
-    <div><span class="ai-bullet">⏺</span> <span class="tool-name">openmessage - get_conversation</span> <span class="tool-params">(MCP)</span><span class="tool-params">(conversation_id: "conv1")</span></div>
-    <div class="tool-result"><span class="tool-result-prefix">⎿</span>  Conversation: Sarah Chen (ID: conv1)</div>
-    <div class="tool-result">   [6 messages about dinner plans and Thai on Valencia]</div>
+    <div><span class="ai-bullet">⏺</span> <span class="tool-name">openmessage - get_messages</span> <span class="tool-params">(MCP)</span><span class="tool-params">(conversation_id: "conv3")</span></div>
+    <div class="tool-result"><span class="tool-result-prefix">⎿</span>  Weekend Hiking Group — 5 messages</div>
+    <div class="tool-result">   Planning Saturday hike, discussing trails.</div>
+    <div class="tool-result">   Lands End chosen, 9am start proposed.</div>
   </div>
 
   <!-- AI thinking -->
   <div class="ai-text">
-    <span class="ai-bullet">⏺</span> Found the conversation. Let me look up that restaurant and draft a reply.
+    <span class="ai-bullet">⏺</span> They're planning Lands End on Saturday at 9am. Let me check trail conditions and RSVP.
   </div>
 
   <!-- Tool call 3: web search -->
   <div class="tool-block">
-    <div><span class="ai-bullet">⏺</span> <span class="tool-name">Web Search</span><span class="tool-params">("new Thai restaurant Valencia St SF 2026")</span></div>
-    <div class="tool-result"><span class="tool-result-prefix">⎿</span>  Did 1 search in 3s</div>
+    <div><span class="ai-bullet">⏺</span> <span class="tool-name">Web Search</span><span class="tool-params">("Lands End trail SF conditions Feb 2026")</span></div>
+    <div class="tool-result"><span class="tool-result-prefix">⎿</span>  Did 1 search in 2s</div>
   </div>
 
   <!-- Tool call 4: draft_message -->
   <div class="tool-block">
     <div><span class="ai-bullet">⏺</span> <span class="tool-name">openmessage - draft_message</span> <span class="tool-params">(MCP)</span></div>
-    <div class="tool-params" style="padding-left: 20px;">(conversation_id: "conv1", message: "Hey! That Thai</div>
-    <div class="tool-params" style="padding-left: 20px;">place is Kin Khao at 55 Cyril Magnin St. Open til</div>
-    <div class="tool-params" style="padding-left: 20px;">10pm tonight and has 4.5 stars. Want me to book</div>
-    <div class="tool-params" style="padding-left: 20px;">on OpenTable?")</div>
+    <div class="tool-params" style="padding-left: 20px;">(conversation_id: "conv3", message: "Count me in</div>
+    <div class="tool-params" style="padding-left: 20px;">for Saturday! Lands End trail looks clear —</div>
+    <div class="tool-params" style="padding-left: 20px;">62°F and sunny. Want me to bring snacks?")</div>
     <div class="tool-result"><span class="tool-result-prefix">⎿</span>  Draft created. Review and send from the app.</div>
   </div>
 
   <!-- AI response -->
   <div class="ai-text" style="margin-top: 8px;">
-    <span class="ai-bullet">⏺</span> Draft created for Sarah Chen. You can review and send it from the
+    <span class="ai-bullet">⏺</span> Draft ready in the Weekend Hiking Group. Trail
   </div>
   <div class="ai-text" style="margin-top: 0; padding-left: 20px;">
-    OpenMessage app.
+    is in good shape — clear skies, 62°F expected.
   </div>
 
   <!-- Cooking time -->
   <div class="cook-time">
-    <span class="star">✻</span> Cooked for 34s
+    <span class="star">✻</span> Cooked for 28s
   </div>
 
   <!-- Separator -->
