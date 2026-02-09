@@ -55,7 +55,7 @@ body {
 .header-version {
   color: #fff;
   font-weight: 700;
-  margin-left: 130px;
+  margin-left: 89px;
   margin-bottom: 0;
   line-height: 1.45;
 }
@@ -129,6 +129,23 @@ body {
 }
 
 .status-play { color: #c8a84a; }
+
+/* ─── Light mode ─── */
+@media (prefers-color-scheme: light) {
+  body { background: #f5f5f5; color: #333; }
+  .chrome { background: #e8e8e8; }
+  .chrome-title { color: #666; }
+  .prompt-text { color: #1a1a1a; }
+  .tool-name { color: #333; }
+  .tool-params { color: #888; }
+  .tool-result { color: #888; }
+  .tool-result-prefix { color: #aaa; }
+  .ai-text { color: #333; }
+  .cook-time { color: #888; }
+  .separator { color: #ccc; }
+  .cursor-block { background: #555; }
+  .status-bar { background: #e0e0e0; color: #888; }
+}
 </style>
 </head>
 <body>
@@ -143,19 +160,6 @@ body {
 </div>
 
 <div class="content">
-  <!-- Header -->
-  <div class="header">
-    <div class="header-version">Claude Code v2.1.37</div>
-    <div class="header-row">
-      <div class="mascot"><img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAE0AAAA4CAYAAAC45nXCAAAA/UlEQVR4nO3bsQnCQBSA4Tux1CJVXMUhHMPKzsYZ0qSzcwjBIVzFVCm01wlS+PNyHPp/bSAHPw/yIElOM3h0h3eqxOZ0ztH3XETf8B8YDTAaYDTAaIDRgPwLa0XpdcRJA4wGGA0wGmA0wGhAnmOtWLdtqsVzGMLXEScNMBpgNMBogNEAowHLNIP95Tp5rd9tw8873u5Fz3PSAKMBRgOMBhgNMFotK0cPH/OvcZy8tmqa8PMoJw0wGmA0wGiA0QCjAX7LAThpgNEAowFGA4wGGA0I/5ujtnXEP1YqYTTAaIDRAKMBRqvlxUrpFaD0iuOkAUYDjAYYDTAaYLT0vQ9PbiZfi3nq5gAAAABJRU5ErkJggg==" alt="" style="width:66px;height:48px;image-rendering:pixelated;vertical-align:top"></div>
-      <div class="header-text">
-        <span class="meta">Opus 4.6 · Claude Max</span>
-        <span class="meta">/Users/maxghenis</span>
-        <span class="promo">Opus 4.6 is here · /extra-usage to learn more…</span>
-      </div>
-    </div>
-  </div>
-
   <!-- User prompt -->
   <div style="margin: 12px 0 8px;">
     <span class="prompt-char">❯</span>
