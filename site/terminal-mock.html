@@ -12,7 +12,7 @@ body {
   font-family: 'JetBrains Mono', 'SF Mono', 'Menlo', 'Monaco', monospace;
   color: #d4d4d4;
   width: 1500px;
-  height: 780px;
+  height: 900px;
   overflow: hidden;
 }
 
@@ -26,16 +26,8 @@ body {
   position: relative;
 }
 
-.dots {
-  display: flex;
-  gap: 8px;
-}
-
-.dot {
-  width: 14px;
-  height: 14px;
-  border-radius: 50%;
-}
+.dots { display: flex; gap: 8px; }
+.dot { width: 14px; height: 14px; border-radius: 50%; }
 .dot.red { background: #ff5f57; }
 .dot.yellow { background: #ffbd2e; }
 .dot.green { background: #27c93f; }
@@ -46,113 +38,67 @@ body {
   transform: translateX(-50%);
   color: #999;
   font-size: 13px;
-  font-weight: 400;
 }
 
 /* Terminal content */
 .content {
-  padding: 32px 40px;
-  font-size: 20px;
-  line-height: 1.7;
+  padding: 24px 32px;
+  font-size: 15.5px;
+  line-height: 1.5;
 }
 
 /* Claude Code header */
 .header {
   display: flex;
-  gap: 16px;
+  gap: 12px;
   align-items: flex-start;
-  margin-bottom: 24px;
+  margin-bottom: 12px;
 }
 
 .mascot {
   color: #e8896b;
-  font-size: 20px;
+  font-size: 15.5px;
   line-height: 1.15;
   flex-shrink: 0;
-  letter-spacing: 0;
 }
 
 .header-text {
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: 0;
 }
 
-.header-text .version {
-  color: #fff;
-  font-weight: 700;
-  font-size: 20px;
-}
-
-.header-text .meta {
-  color: #777;
-  font-size: 16px;
-}
-
-.header-text .promo {
-  color: #e8896b;
-  font-size: 13px;
-}
+.header-text .version { color: #fff; font-weight: 700; }
+.header-text .meta { color: #777; }
+.header-text .promo { color: #e8896b; font-size: 13px; }
 
 /* Prompt */
-.prompt-char {
-  color: #e8896b;
-  font-weight: 700;
-}
+.prompt-char { color: #e8896b; font-weight: 700; }
+.prompt-text { color: #fff; }
 
-.prompt-text {
-  color: #fff;
-}
+/* Tool call blocks */
+.tool-block { margin: 5px 0; }
+.tool-name { color: #d4d4d4; }
+.tool-params { color: #777; }
+.tool-result { color: #777; padding-left: 20px; }
+.tool-result-prefix { color: #555; }
 
-/* Spinner / thinking */
-.spinner {
-  color: #e8896b;
-  margin: 20px 0;
-}
+/* AI response text */
+.ai-text { color: #d4d4d4; margin: 6px 0; }
+.ai-bullet { color: #e8896b; }
 
-/* Tool calls */
-.tool-line {
-  margin: 6px 0;
-  display: flex;
-  align-items: center;
-  gap: 10px;
-}
+/* Cooking time */
+.cook-time { color: #777; margin: 6px 0; }
+.cook-time .star { color: #e8896b; }
 
-.tool-dot {
-  color: #50c878;
-  font-size: 12px;
-}
+/* Separator line */
+.separator { color: #444; margin: 6px 0; overflow: hidden; white-space: nowrap; }
 
-.tool-text {
-  color: #999;
-  font-size: 18px;
-}
-
-/* Output text */
-.output {
-  margin: 20px 0;
-  font-size: 20px;
-}
-
-.output .label {
-  color: #777;
-}
-
-.output .quoted {
-  color: #e8a44a;
-  margin-left: 20px;
-}
-
-.output .result {
-  color: #d4d4d4;
-  margin-top: 12px;
-}
-
-/* New prompt at bottom */
+/* Cursor */
 .cursor-block {
   display: inline-block;
-  width: 12px;
-  height: 24px;
+  width: 10px;
+  height: 18px;
   background: #aeafad;
   vertical-align: text-bottom;
   margin-left: 2px;
@@ -161,29 +107,18 @@ body {
 /* Bottom status bar */
 .status-bar {
   position: absolute;
-  bottom: 0;
-  left: 0;
-  right: 0;
-  height: 40px;
+  bottom: 0; left: 0; right: 0;
+  height: 32px;
   background: #232323;
   display: flex;
   align-items: center;
   padding: 0 32px;
-  gap: 12px;
+  gap: 10px;
   font-size: 13px;
   color: #777;
 }
 
-.status-dots {
-  color: #c8a84a;
-}
-
-/* separator */
-hr {
-  border: none;
-  border-top: 1px solid #333;
-  margin: 16px 0;
-}
+.status-play { color: #c8a84a; }
 </style>
 </head>
 <body>
@@ -198,6 +133,7 @@ hr {
 </div>
 
 <div class="content">
+  <!-- Header -->
   <div class="header">
     <div class="mascot"><pre style="margin:0;font-family:inherit;font-size:inherit;line-height:1.15;background:none;border:none;padding:0;color:inherit"> ▐▛███▜▌
 ▝▜█████▛▘
@@ -206,42 +142,79 @@ hr {
       <span class="version">Claude Code v2.1.37</span>
       <span class="meta">Opus 4.6 · Claude Max</span>
       <span class="meta">/Users/maxghenis</span>
+      <span class="promo">Opus 4.6 is here · $50 free extra usage · Try fast mode o…</span>
     </div>
   </div>
 
-  <div style="margin: 20px 0;">
+  <!-- User prompt -->
+  <div style="margin: 12px 0 8px;">
     <span class="prompt-char">❯</span>
-    <span class="prompt-text"> Sarah mentioned a Thai place on Valencia. Send her the address</span>
+    <span class="prompt-text"> Sarah mentioned a Thai place on Valencia. Draft her the address</span>
   </div>
 
-  <div class="spinner">⏺ Searching for Thai restaurants on Valencia St...</div>
-
-  <div style="margin: 12px 0;">
-    <div class="tool-line"><span class="tool-dot">●</span><span class="tool-text">Read conversation with Sarah Chen</span></div>
-    <div class="tool-line"><span class="tool-dot">●</span><span class="tool-text">Searched for Thai restaurants on Valencia St, SF</span></div>
-    <div class="tool-line"><span class="tool-dot">●</span><span class="tool-text">Called draft_message</span></div>
+  <!-- Tool call 1: search_contacts -->
+  <div class="tool-block">
+    <div><span class="ai-bullet">⏺</span> <span class="tool-name">openmessage - search_contacts</span> <span class="tool-params">(MCP)</span><span class="tool-params">(query: "Sarah")</span></div>
+    <div class="tool-result"><span class="tool-result-prefix">⎿</span>  1 contacts:</div>
+    <div class="tool-result">   - Sarah Chen: +14155551234</div>
   </div>
 
-  <div class="output">
-    <div class="label">message:</div>
-    <div class="quoted">"Hey! That Thai place is Kin Khao at 55 Cyril</div>
-    <div class="quoted">Magnin St. Open til 10pm tonight and has 4.5</div>
-    <div class="quoted">stars. Want me to book on OpenTable?"</div>
+  <!-- Tool call 2: get_conversation -->
+  <div class="tool-block">
+    <div><span class="ai-bullet">⏺</span> <span class="tool-name">openmessage - get_conversation</span> <span class="tool-params">(MCP)</span><span class="tool-params">(conversation_id: "conv1")</span></div>
+    <div class="tool-result"><span class="tool-result-prefix">⎿</span>  Conversation: Sarah Chen (ID: conv1)</div>
+    <div class="tool-result">   [6 messages about dinner plans and Thai on Valencia]</div>
   </div>
 
-  <div class="output result">
-    Draft created. It will appear in the OpenMessage app for you to review and send.
+  <!-- AI thinking -->
+  <div class="ai-text">
+    <span class="ai-bullet">⏺</span> Found the conversation. Let me look up that restaurant and draft a reply.
   </div>
 
-  <div style="margin-top: 24px;">
+  <!-- Tool call 3: web search -->
+  <div class="tool-block">
+    <div><span class="ai-bullet">⏺</span> <span class="tool-name">Web Search</span><span class="tool-params">("new Thai restaurant Valencia St SF 2026")</span></div>
+    <div class="tool-result"><span class="tool-result-prefix">⎿</span>  Did 1 search in 3s</div>
+  </div>
+
+  <!-- Tool call 4: draft_message -->
+  <div class="tool-block">
+    <div><span class="ai-bullet">⏺</span> <span class="tool-name">openmessage - draft_message</span> <span class="tool-params">(MCP)</span><span class="tool-params">(conversation_id: "conv1", message:</span></div>
+    <div class="tool-params" style="padding-left: 370px;">"Hey! That Thai place is Kin Khao at 55 Cyril</div>
+    <div class="tool-params" style="padding-left: 370px;">Magnin St. Open til 10pm tonight and has 4.5</div>
+    <div class="tool-params" style="padding-left: 370px;">stars. Want me to book on OpenTable?")</div>
+    <div class="tool-result"><span class="tool-result-prefix">⎿</span>  Draft created. The user can review and send it from the app.</div>
+  </div>
+
+  <!-- AI response -->
+  <div class="ai-text" style="margin-top: 8px;">
+    <span class="ai-bullet">⏺</span> Draft created for Sarah Chen. You can review and send it from the
+  </div>
+  <div class="ai-text" style="margin-top: 0; padding-left: 20px;">
+    OpenMessage app.
+  </div>
+
+  <!-- Cooking time -->
+  <div class="cook-time">
+    <span class="star">✻</span> Cooked for 34s
+  </div>
+
+  <!-- Separator -->
+  <div class="separator">─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────</div>
+
+  <!-- New prompt -->
+  <div>
     <span class="prompt-char">❯</span><span class="cursor-block"></span>
   </div>
+
+  <!-- Another separator -->
+  <div class="separator">─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────</div>
 </div>
 
 <div class="status-bar">
-  <span class="status-dots">●●</span>
+  <span class="status-play">⏵⏵</span>
   <span>bypass permissions on</span>
-  <span style="margin-left:auto; color:#555">esc to interrupt</span>
+  <span style="margin-left: auto; color: #555">(shift+tab to cycle)</span>
 </div>
 
 </body>
