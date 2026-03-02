@@ -12,7 +12,8 @@ Local-first universal message database with built-in MCP server. Ingests message
 │   ├── db/           SQLite store (conversations, messages, contacts, unified_contacts, drafts)
 │   ├── importer/     Multi-platform import adapters (gchat, imessage, whatsapp)
 │   ├── story/        Stats computation + narrative story generation
-│   ├── tools/        MCP tools (13 tools)
+│   ├── tools/        MCP tools (16 tools)
+│   ├── viz/          Relationship visualization renderer (self-contained HTML)
 │   └── web/          HTTP API + embedded React UI
 ├── macos/            Swift macOS app wrapper
 │   ├── OpenMessage/  Swift package (BackendManager, PairingView, etc.)
@@ -32,13 +33,16 @@ openmessage import whatsapp /path/to/chat.txt --name "Your Name"
 
 ### MCP tools
 
-13 tools registered:
+16 tools registered:
 - `get_messages`, `get_conversation`, `search_messages` — cross-platform by default
 - `list_conversations` — optional `source_platform` filter (sms, gchat, imessage, whatsapp)
 - `get_person_messages` — all messages with a person across all platforms
 - `import_messages` — import from any supported source
-- `conversation_stats` — volume, heatmap, phrases, response times, gaps
-- `generate_story` — narrative chapters with optional Claude API enhancement
+- `conversation_stats` — volume, heatmap, phrases, response times, gaps (single conversation)
+- `generate_story` — narrative chapters with optional Claude API enhancement (single conversation)
+- `person_stats` — cross-platform stats for all 1:1 messages with a person (merges + deduplicates)
+- `generate_person_story` — cross-platform narrative story for a person (merges + deduplicates)
+- `generate_viz` — self-contained HTML visualization combining data dashboards + narrative (see below)
 - `send_message`, `draft_message`, `download_media`, `list_contacts`, `get_status`
 
 ### HTTP API
@@ -97,12 +101,32 @@ go test ./cmd/ -v      # Unit + integration tests
 go test ./... -v       # All tests
 ```
 
+## Relationship visualization (`generate_viz`)
+
+Generates a self-contained HTML file combining data dashboards with narrative chapters. Output is deployable to Vercel or viewable locally.
+
+**Sections**: password gate, hero, timeline nav, narrative chapters (early/middle/late), monthly volume chart (Chart.js), sender split donut, response times, hour-of-week heatmap, phrase cloud (colored by sender ratio), longest gap callout, photo gallery, interludes, closing.
+
+**Key parameters**: `name` (person to search), `output_path`, `timezone` (default ET), `password`, `api_key` (for Claude-generated narrative), colors (`primary_color`, `secondary_color`, etc.).
+
+**Architecture**:
+- `internal/viz/config.go` — `VizConfig` struct, section ordering, color theming
+- `internal/viz/render.go` — `RenderHTML()` orchestrator, Chart.js data building
+- `internal/viz/template.go` — Go html/template with all CSS/JS inline (except CDN fonts + Chart.js)
+- `internal/viz/photos.go` — `FindMediaMessages()` for photo gallery
+- `internal/tools/viz.go` — MCP tool handler
+
+**Stats engine extensions** (`internal/story/stats.go`):
+- `PhraseCount.BySender` — per-sender phrase counts for colored word cloud
+- `ComputeStats(messages, tz)` — timezone parameter for TZ-shifted heatmap
+
 ## Key files
 
 - `internal/app/app.go` — data dir resolution (`OPENMESSAGES_DATA_DIR` env var, defaults to `~/.local/share/openmessage`)
 - `internal/db/db.go` — schema, structs, migration
 - `internal/importer/` — gchat.go, imessage.go, whatsapp.go
-- `internal/story/stats.go` — conversation statistics computation
+- `internal/story/stats.go` — conversation statistics computation (with timezone + per-sender phrases)
 - `internal/story/generate.go` — narrative story generation (local or Claude API)
+- `internal/viz/` — relationship visualization renderer (config, template, render, photos)
 - `internal/client/events.go` — handles Google Messages protocol events
 - `macos/OpenMessage/Sources/BackendManager.swift` — launches Go backend, manages app state

@@ -596,7 +596,7 @@ func APIHandlerFull(store *db.Store, cli *client.Client, logger zerolog.Logger, 
 			httpError(w, "no messages found", 404)
 			return
 		}
-		stats := story.ComputeStats(msgs)
+		stats := story.ComputeStats(msgs, nil)
 		writeJSON(w, stats)
 	})
 

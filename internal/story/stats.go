@@ -42,8 +42,9 @@ type HourCount struct {
 }
 
 type PhraseCount struct {
-	Phrase string `json:"phrase"`
-	Count  int    `json:"count"`
+	Phrase   string         `json:"phrase"`
+	Count    int            `json:"count"`
+	BySender map[string]int `json:"by_sender"`
 }
 
 type Gap struct {
@@ -54,7 +55,11 @@ type Gap struct {
 
 // ComputeStats calculates conversation statistics from a list of messages.
 // Messages should be sorted by timestamp ascending for correct gap/response calculations.
-func ComputeStats(messages []*db.Message) *Stats {
+func ComputeStats(messages []*db.Message, tz *time.Location) *Stats {
+	if tz == nil {
+		tz = time.UTC
+	}
+
 	if len(messages) == 0 {
 		return &Stats{
 			SenderSplit:      map[string]int{},
@@ -77,14 +82,15 @@ func ComputeStats(messages []*db.Message) *Stats {
 
 	// Date range
 	stats.DateRange = DateRange{
-		Start: time.UnixMilli(sorted[0].TimestampMS).UTC().Format("2006-01-02"),
-		End:   time.UnixMilli(sorted[len(sorted)-1].TimestampMS).UTC().Format("2006-01-02"),
+		Start: time.UnixMilli(sorted[0].TimestampMS).In(tz).Format("2006-01-02"),
+		End:   time.UnixMilli(sorted[len(sorted)-1].TimestampMS).In(tz).Format("2006-01-02"),
 	}
 
 	// Group by year
 	yearMap := map[string]*YearStats{}
 	hourMap := map[[2]int]int{} // [hour, dayOfWeek] -> count
 	phraseMap := map[string]int{}
+	phraseBySender := map[string]map[string]int{} // phrase -> sender -> count
 
 	// Response time tracking
 	responseTotal := map[string]float64{}
@@ -98,7 +104,7 @@ func ComputeStats(messages []*db.Message) *Stats {
 	var prevTS int64
 
 	for _, m := range sorted {
-		t := time.UnixMilli(m.TimestampMS).UTC()
+		t := time.UnixMilli(m.TimestampMS).In(tz)
 		year := t.Format("2006")
 		month := int(t.Month()) - 1
 		hour := t.Hour()
@@ -120,8 +126,8 @@ func ComputeStats(messages []*db.Message) *Stats {
 		// Hour heatmap
 		hourMap[[2]int{hour, dow}]++
 
-		// Phrase counting
-		countPhrases(m.Body, phraseMap)
+		// Phrase counting (with per-sender tracking)
+		countPhrases(m.Body, phraseMap, phraseBySender, sender)
 
 		// Response times and gaps
 		if prevTS > 0 {
@@ -168,7 +174,7 @@ func ComputeStats(messages []*db.Message) *Stats {
 	}
 
 	// Top phrases (filter stop words)
-	stats.TopPhrases = topPhrases(phraseMap, 100)
+	stats.TopPhrases = topPhrases(phraseMap, phraseBySender, 100)
 
 	// Average response times
 	for sender, total := range responseTotal {
@@ -180,8 +186,8 @@ func ComputeStats(messages []*db.Message) *Stats {
 	// Longest gap
 	if longestGap.days > 0 {
 		stats.LongestGap = Gap{
-			Start: time.UnixMilli(longestGap.start).UTC().Format("2006-01-02"),
-			End:   time.UnixMilli(longestGap.end).UTC().Format("2006-01-02"),
+			Start: time.UnixMilli(longestGap.start).In(tz).Format("2006-01-02"),
+			End:   time.UnixMilli(longestGap.end).In(tz).Format("2006-01-02"),
 			Days:  int(math.Round(longestGap.days)),
 		}
 	}
@@ -204,7 +210,7 @@ func senderKey(m *db.Message) string {
 
 var wordRe = regexp.MustCompile(`[^\w\s]`)
 
-func countPhrases(text string, phraseMap map[string]int) {
+func countPhrases(text string, phraseMap map[string]int, phraseBySender map[string]map[string]int, sender string) {
 	cleaned := wordRe.ReplaceAllString(strings.ToLower(text), "")
 	words := strings.Fields(cleaned)
 	// Filter short words
@@ -214,20 +220,29 @@ func countPhrases(text string, phraseMap map[string]int) {
 			filtered = append(filtered, w)
 		}
 	}
+
+	addPhrase := func(phrase string) {
+		phraseMap[phrase]++
+		if phraseBySender[phrase] == nil {
+			phraseBySender[phrase] = map[string]int{}
+		}
+		phraseBySender[phrase][sender]++
+	}
+
 	// Bigrams
 	for i := 0; i < len(filtered)-1; i++ {
 		phrase := filtered[i] + " " + filtered[i+1]
-		phraseMap[phrase]++
+		addPhrase(phrase)
 	}
 	// Single words > 3 chars
 	for _, w := range filtered {
 		if len([]rune(w)) > 3 && !isStopWord(w) {
-			phraseMap[w]++
+			addPhrase(w)
 		}
 	}
 }
 
-func topPhrases(phraseMap map[string]int, n int) []PhraseCount {
+func topPhrases(phraseMap map[string]int, phraseBySender map[string]map[string]int, n int) []PhraseCount {
 	type kv struct {
 		phrase string
 		count  int
@@ -266,7 +281,11 @@ func topPhrases(phraseMap map[string]int, n int) []PhraseCount {
 	}
 	result := make([]PhraseCount, len(items))
 	for i, kv := range items {
-		result[i] = PhraseCount{Phrase: kv.phrase, Count: kv.count}
+		bySender := phraseBySender[kv.phrase]
+		if bySender == nil {
+			bySender = map[string]int{}
+		}
+		result[i] = PhraseCount{Phrase: kv.phrase, Count: kv.count, BySender: bySender}
 	}
 	return result
 }

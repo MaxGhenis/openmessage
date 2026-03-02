@@ -60,7 +60,7 @@ func Generate(messages []*db.Message, config GenerateConfig) (*Story, error) {
 		return sorted[i].TimestampMS < sorted[j].TimestampMS
 	})
 
-	stats := ComputeStats(sorted)
+	stats := ComputeStats(sorted, nil)
 	sampled := sampleMessages(sorted, config.MaxSampleMessages)
 
 	story := &Story{

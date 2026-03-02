@@ -2,12 +2,13 @@ package story
 
 import (
 	"testing"
+	"time"
 
 	"github.com/maxghenis/openmessage/internal/db"
 )
 
 func TestComputeStatsEmpty(t *testing.T) {
-	stats := ComputeStats(nil)
+	stats := ComputeStats(nil, nil)
 	if stats.TotalMessages != 0 {
 		t.Errorf("total = %d, want 0", stats.TotalMessages)
 	}
@@ -22,7 +23,7 @@ func TestComputeStats(t *testing.T) {
 		{MessageID: "5", SenderName: "Alice", Body: "Want to grab coffee?", TimestampMS: 1700000240000, IsFromMe: false},
 	}
 
-	stats := ComputeStats(messages)
+	stats := ComputeStats(messages, nil)
 
 	if stats.TotalMessages != 5 {
 		t.Errorf("total = %d, want 5", stats.TotalMessages)
@@ -61,7 +62,7 @@ func TestComputeStatsResponseTimes(t *testing.T) {
 		{MessageID: "3", SenderName: "Alice", Body: "What's up", TimestampMS: 1700000600000, IsFromMe: false}, // 5 min later
 	}
 
-	stats := ComputeStats(messages)
+	stats := ComputeStats(messages, nil)
 
 	// "me" responded to Alice in 5 minutes
 	if rt, ok := stats.AvgResponseTimes["me"]; !ok || rt != 5 {
@@ -80,10 +81,121 @@ func TestComputeStatsLongestGap(t *testing.T) {
 		{MessageID: "2", Body: "Hi again", TimestampMS: 1700864000000, IsFromMe: true},
 	}
 
-	stats := ComputeStats(messages)
+	stats := ComputeStats(messages, nil)
 
 	if stats.LongestGap.Days != 10 {
 		t.Errorf("longest gap = %d days, want 10", stats.LongestGap.Days)
+	}
+}
+
+func TestPhraseCountBySender(t *testing.T) {
+	// Alice says "really great" twice, "me" says "really great" once
+	// "really" alone (>3 chars, not stop word) should also appear per-sender
+	messages := []*db.Message{
+		{MessageID: "1", SenderName: "Alice", Body: "This is really great stuff", TimestampMS: 1700000000000, IsFromMe: false},
+		{MessageID: "2", Body: "I think really great work here", TimestampMS: 1700000060000, IsFromMe: true},
+		{MessageID: "3", SenderName: "Alice", Body: "Yes really great results overall", TimestampMS: 1700000120000, IsFromMe: false},
+	}
+
+	stats := ComputeStats(messages, nil)
+
+	// Find "really great" in top phrases
+	var found *PhraseCount
+	for i := range stats.TopPhrases {
+		if stats.TopPhrases[i].Phrase == "really great" {
+			found = &stats.TopPhrases[i]
+			break
+		}
+	}
+	if found == nil {
+		t.Fatal("expected 'really great' in top phrases")
+	}
+	if found.Count != 3 {
+		t.Errorf("'really great' total count = %d, want 3", found.Count)
+	}
+	if found.BySender == nil {
+		t.Fatal("BySender should not be nil")
+	}
+	if found.BySender["Alice"] != 2 {
+		t.Errorf("'really great' Alice count = %d, want 2", found.BySender["Alice"])
+	}
+	if found.BySender["me"] != 1 {
+		t.Errorf("'really great' me count = %d, want 1", found.BySender["me"])
+	}
+}
+
+func TestComputeStatsTimezone(t *testing.T) {
+	// Create a message at a known UTC time: 2023-11-14 03:00:00 UTC
+	// That's 2023-11-13 22:00:00 EST (UTC-5, November is standard time)
+	// TimestampMS for 2023-11-14 03:00 UTC = 1699930800000
+	utcTime := time.Date(2023, 11, 14, 3, 0, 0, 0, time.UTC)
+	tsMS := utcTime.UnixMilli()
+
+	messages := []*db.Message{
+		{MessageID: "1", SenderName: "Alice", Body: "Late night message", TimestampMS: tsMS, IsFromMe: false},
+	}
+
+	nyTZ, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		t.Fatalf("failed to load timezone: %v", err)
+	}
+
+	stats := ComputeStats(messages, nyTZ)
+
+	// In UTC: hour=3, day=Tuesday (2023-11-14 is a Tuesday)
+	// In EST: hour=22, day=Monday (2023-11-13 is a Monday)
+	// dayOfWeek: Monday=1
+
+	// Verify heatmap has the count in the EST bucket
+	var utcBucket, estBucket HourCount
+	for _, hc := range stats.HourHeatmap {
+		if hc.Hour == 3 && hc.Day == 2 { // UTC: hour 3, Tuesday
+			utcBucket = hc
+		}
+		if hc.Hour == 22 && hc.Day == 1 { // EST: hour 22, Monday
+			estBucket = hc
+		}
+	}
+	if estBucket.Count != 1 {
+		t.Errorf("EST bucket (hour=22, day=Monday) count = %d, want 1", estBucket.Count)
+	}
+	if utcBucket.Count != 0 {
+		t.Errorf("UTC bucket (hour=3, day=Tuesday) count = %d, want 0 (should be shifted to EST)", utcBucket.Count)
+	}
+
+	// Verify date range is formatted in EST
+	// 2023-11-14 03:00 UTC = 2023-11-13 in EST
+	if stats.DateRange.Start != "2023-11-13" {
+		t.Errorf("DateRange.Start = %s, want 2023-11-13 (EST date)", stats.DateRange.Start)
+	}
+}
+
+func TestComputeStatsTimezoneNil(t *testing.T) {
+	// Same message as above: 2023-11-14 03:00:00 UTC
+	utcTime := time.Date(2023, 11, 14, 3, 0, 0, 0, time.UTC)
+	tsMS := utcTime.UnixMilli()
+
+	messages := []*db.Message{
+		{MessageID: "1", SenderName: "Alice", Body: "A test message", TimestampMS: tsMS, IsFromMe: false},
+	}
+
+	stats := ComputeStats(messages, nil)
+
+	// With nil timezone, should use UTC
+	// UTC: hour=3, day=Tuesday (dayOfWeek=2)
+	var utcBucket HourCount
+	for _, hc := range stats.HourHeatmap {
+		if hc.Hour == 3 && hc.Day == 2 { // UTC: hour 3, Tuesday
+			utcBucket = hc
+		}
+	}
+	if utcBucket.Count != 1 {
+		t.Errorf("UTC bucket (hour=3, day=Tuesday) count = %d, want 1", utcBucket.Count)
+	}
+
+	// Date should be in UTC: 2023-11-14
+	if stats.DateRange.Start != "2023-11-14" {
+		t.Errorf("DateRange.Start = %s, want 2023-11-14 (UTC date)", stats.DateRange.Start)
 	}
 }
 

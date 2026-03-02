@@ -122,6 +122,34 @@ func (s *Store) GetMessageByID(messageID string) (*Message, error) {
 	return m, nil
 }
 
+// GetMessagesByConversations returns messages from multiple conversations,
+// ordered by timestamp ascending. Useful for cross-platform person queries.
+func (s *Store) GetMessagesByConversations(conversationIDs []string, limit int) ([]*Message, error) {
+	if len(conversationIDs) == 0 {
+		return nil, nil
+	}
+	placeholders := make([]string, len(conversationIDs))
+	args := make([]any, len(conversationIDs))
+	for i, id := range conversationIDs {
+		placeholders[i] = "?"
+		args[i] = id
+	}
+	args = append(args, limit)
+
+	rows, err := s.db.Query(`
+		SELECT `+messageColumns+`
+		FROM messages
+		WHERE conversation_id IN (`+strings.Join(placeholders, ",")+`)
+		ORDER BY timestamp_ms ASC
+		LIMIT ?
+	`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanMessages(rows)
+}
+
 // DeleteTmpMessages removes locally-created tmp_ messages for a conversation.
 // Called when the server echo arrives with a real message ID.
 func (s *Store) DeleteTmpMessages(conversationID string) (int64, error) {
