@@ -52,7 +52,7 @@ Add to `~/.mcp.json`:
 }
 ```
 
-Restart Claude Code. The 7 tools appear automatically.
+Restart Claude Code. The 8 tools appear automatically.
 
 ## Features
 
@@ -61,7 +61,7 @@ Restart Claude Code. The 7 tools appear automatically.
 - **React to messages** — emoji reactions on any message
 - **Image/media display** — inline images with fullscreen viewer
 - **Web UI** — real-time conversation view at localhost:7007
-- **MCP tools** — 7 tools for Claude Code integration
+- **MCP tools** — 8 tools for Claude Code integration
 - **Local storage** — SQLite database, your data stays on your machine
 
 ## MCP tools
@@ -72,6 +72,7 @@ Restart Claude Code. The 7 tools appear automatically.
 | `get_conversation` | Messages in a specific conversation |
 | `search_messages` | Full-text search across all messages |
 | `send_message` | Send SMS/RCS to a phone number |
+| `send_to_conversation` | Send a message to an existing conversation by ID |
 | `list_conversations` | List recent conversations |
 | `list_contacts` | List/search contacts |
 | `get_status` | Connection status and paired phone info |
