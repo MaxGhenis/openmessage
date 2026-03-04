@@ -240,6 +240,59 @@ func TestSendMessageNotConnected(t *testing.T) {
 	}
 }
 
+func TestSendToConversationNotConnected(t *testing.T) {
+	a := testApp(t)
+
+	handler := sendToConversationHandler(a)
+	req := mcp.CallToolRequest{}
+	req.Params.Arguments = map[string]any{
+		"conversation_id": "conv-123",
+		"message":         "Hello",
+	}
+
+	result, err := handler(context.Background(), req)
+	if err != nil {
+		t.Fatalf("handler error: %v", err)
+	}
+	if !result.IsError {
+		t.Error("expected error when not connected")
+	}
+	text := result.Content[0].(mcp.TextContent).Text
+	if !contains(text, "not connected") {
+		t.Errorf("expected 'not connected' error, got: %s", text)
+	}
+}
+
+func TestSendToConversationMissingArgs(t *testing.T) {
+	a := testApp(t)
+	handler := sendToConversationHandler(a)
+
+	// Missing conversation_id
+	req := mcp.CallToolRequest{}
+	req.Params.Arguments = map[string]any{
+		"message": "Hello",
+	}
+	result, err := handler(context.Background(), req)
+	if err != nil {
+		t.Fatalf("handler error: %v", err)
+	}
+	if !result.IsError {
+		t.Error("expected error for missing conversation_id")
+	}
+
+	// Missing message
+	req.Params.Arguments = map[string]any{
+		"conversation_id": "conv-123",
+	}
+	result, err = handler(context.Background(), req)
+	if err != nil {
+		t.Fatalf("handler error: %v", err)
+	}
+	if !result.IsError {
+		t.Error("expected error for missing message")
+	}
+}
+
 func TestGetStatus(t *testing.T) {
 	a := testApp(t)
 
