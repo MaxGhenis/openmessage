@@ -981,9 +981,10 @@ html, body {
 
 .msg-media-loading {
   display: flex;
+  flex-direction: column;
   align-items: center;
   justify-content: center;
-  gap: 8px;
+  gap: 10px;
   width: 200px;
   height: 120px;
   border-radius: var(--radius-md);
@@ -991,6 +992,7 @@ html, body {
   color: var(--text-muted);
   font-size: 12px;
   margin: 4px 0;
+  text-align: center;
 }
 
 .msg-media-loading .spinner {
@@ -1000,6 +1002,20 @@ html, body {
   border-top-color: var(--accent);
   border-radius: 50%;
   animation: spin 0.8s linear infinite;
+}
+
+.msg-media-loading-text {
+  display: none;
+  line-height: 1.4;
+}
+
+.msg-media-loading.show-label .msg-media-loading-text,
+.msg-media-loading.is-error .msg-media-loading-text {
+  display: block;
+}
+
+.msg-media-loading.is-error .spinner {
+  display: none;
 }
 
 @keyframes spin {
@@ -4192,12 +4208,14 @@ body::after {
   const LINK_PREVIEW_CACHE_LIMIT = 256;
   const NATIVE_AVATAR_CACHE_LIMIT = 256;
   const WHATSAPP_AVATAR_CACHE_LIMIT = 128;
+  const MEDIA_LOADER_LABEL_DELAY_MS = 2500;
   const linkPreviewCache = new Map();
   const linkPreviewInflight = new Map();
   const nativeAvatarCache = new Map();
   const nativeAvatarInflight = new Map();
   const whatsAppAvatarCache = new Map();
   const whatsAppAvatarInflight = new Map();
+  const pendingMediaLoaderTimers = new WeakMap();
 
   // ─── DOM refs ───
   const $convoList = document.getElementById('conversation-list');
@@ -4713,6 +4731,52 @@ body::after {
         applyAvatarImage(el, dataURL, el.dataset.avatarName || name);
       });
     });
+  }
+
+  function mediaLoaderFor(el) {
+    const loader = el && el.previousElementSibling;
+    return loader && loader.classList && loader.classList.contains('msg-media-loading') ? loader : null;
+  }
+
+  function clearMediaLoaderTimer(loader) {
+    if (!loader) return;
+    const timer = pendingMediaLoaderTimers.get(loader);
+    if (timer) {
+      clearTimeout(timer);
+      pendingMediaLoaderTimers.delete(loader);
+    }
+  }
+
+  function scheduleMediaLoaderLabels(root = document) {
+    if (!root || !root.querySelectorAll) return;
+    root.querySelectorAll('.msg-media-loading').forEach((loader) => {
+      if (loader.dataset.labelScheduled === '1') return;
+      loader.dataset.labelScheduled = '1';
+      const timer = setTimeout(() => {
+        pendingMediaLoaderTimers.delete(loader);
+        if (!loader.isConnected || loader.classList.contains('is-error')) return;
+        loader.classList.add('show-label');
+      }, MEDIA_LOADER_LABEL_DELAY_MS);
+      pendingMediaLoaderTimers.set(loader, timer);
+    });
+  }
+
+  function handleMediaLoad(el) {
+    const loader = mediaLoaderFor(el);
+    clearMediaLoaderTimer(loader);
+    if (loader) loader.remove();
+  }
+
+  function handleMediaError(el, kind) {
+    const loader = mediaLoaderFor(el);
+    clearMediaLoaderTimer(loader);
+    if (!loader) return;
+    loader.classList.remove('show-label');
+    loader.classList.add('is-error');
+    const label = loader.querySelector('.msg-media-loading-text');
+    if (label) {
+      label.textContent = kind === 'video' ? 'Video unavailable' : 'Image unavailable';
+    }
   }
 
   function renderAvatarElement(el, { name = '', numbers = [], whatsAppConversationID = '', platforms = [], text = initials(name) || '?', background = avatarColor(name) } = {}) {
@@ -6682,8 +6746,8 @@ body::after {
 
           if (hasMediaID && isImage) {
             html += `<div class="msg-media">`;
-            html += `<div class="msg-media-loading" data-msg-id="${escapeHtml(m.MessageID)}"><div class="spinner"></div>Loading image...</div>`;
-            html += `<img src="${mediaSrc}" alt="Image" loading="lazy" decoding="async" onload="this.previousElementSibling.remove();" onerror="var ldr=this.previousElementSibling;if(ldr){ldr.innerHTML='Image not available';}" onclick="showFullscreen(this.src,'image')">`;
+            html += `<div class="msg-media-loading" data-msg-id="${escapeHtml(m.MessageID)}" data-kind="image"><div class="spinner"></div><span class="msg-media-loading-text">Fetching image...</span></div>`;
+            html += `<img src="${mediaSrc}" alt="Image" loading="lazy" decoding="async" onload="handleMediaLoad(this)" onerror="handleMediaError(this, 'image')" onclick="showFullscreen(this.src,'image')">`;
             html += `</div>`;
           } else if (hasMediaID && isAudio) {
             html += `<div class="msg-media">`;
@@ -6694,8 +6758,8 @@ body::after {
             html += `</div>`;
           } else if (hasMediaID && isVideo) {
             html += `<div class="msg-media">`;
-            html += `<div class="msg-media-loading" data-msg-id="${escapeHtml(m.MessageID)}"><div class="spinner"></div>Loading video...</div>`;
-            html += `<video src="${mediaSrc}" preload="none" controls playsinline style="display:none" onloadeddata="this.style.display='block';this.previousElementSibling.remove();" onerror="var ldr=this.previousElementSibling;if(ldr){ldr.innerHTML='Video not available';}" onclick="event.stopPropagation()"></video>`;
+            html += `<div class="msg-media-loading" data-msg-id="${escapeHtml(m.MessageID)}" data-kind="video"><div class="spinner"></div><span class="msg-media-loading-text">Fetching video...</span></div>`;
+            html += `<video src="${mediaSrc}" preload="none" controls playsinline style="display:none" onloadeddata="this.style.display='block';handleMediaLoad(this)" onerror="handleMediaError(this, 'video')" onclick="event.stopPropagation()"></video>`;
             html += `</div>`;
           } else if (!hasMediaID && (isImage || isAudio || isVideo)) {
             const icon = isImage ? '\uD83D\uDDBC\uFE0F' : (isAudio ? '\uD83C\uDFA4' : '\uD83C\uDFA5');
@@ -6844,6 +6908,7 @@ body::after {
       refreshConversationChrome(protocolDetail);
       hydrateLinkPreviews();
       hydrateNativeAvatars($messagesArea);
+      scheduleMediaLoaderLabels($messagesArea);
       observeThreadContentResize();
       observeThreadViewportResize();
 
