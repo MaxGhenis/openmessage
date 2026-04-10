@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -182,15 +183,20 @@ func TestStartReceiveLoopDropsSignalConnectionAfterRepeatedReceiveFailures(t *te
 	}
 
 	originalRun := runSignalCLI
-	defer func() { runSignalCLI = originalRun }()
+	defer func() {
+		_ = bridge.Close()
+		bridge.commandMu.Lock()
+		runSignalCLI = originalRun
+		bridge.commandMu.Unlock()
+	}()
 
-	var receiveCalls int
+	var receiveCalls atomic.Int32
 	runSignalCLI = func(ctx context.Context, configDir string, args ...string) ([]byte, error) {
 		if strings.Contains(strings.Join(args, " "), " listAccounts") {
 			return []byte(`[{"number":"+15551230000"}]`), nil
 		}
 		if strings.Contains(strings.Join(args, " "), " receive ") {
-			receiveCalls++
+			receiveCalls.Add(1)
 			return []byte("WARN  ReceiveHelper - Connection closed unexpectedly, reconnecting in 100 ms"), context.DeadlineExceeded
 		}
 		return []byte{}, nil
@@ -205,8 +211,8 @@ func TestStartReceiveLoopDropsSignalConnectionAfterRepeatedReceiveFailures(t *te
 			status.Paired &&
 			strings.Contains(status.LastError, "Connection closed unexpectedly")
 	})
-	if receiveCalls < receiveFailureLimit {
-		t.Fatalf("receive called %d times, want at least %d", receiveCalls, receiveFailureLimit)
+	if calls := receiveCalls.Load(); calls < int32(receiveFailureLimit) {
+		t.Fatalf("receive called %d times, want at least %d", calls, receiveFailureLimit)
 	}
 }
 
@@ -217,16 +223,21 @@ func TestStartReceiveLoopIgnoresIdleReceiveTimeouts(t *testing.T) {
 	}
 
 	originalRun := runSignalCLI
-	defer func() { runSignalCLI = originalRun }()
+	defer func() {
+		_ = bridge.Close()
+		bridge.commandMu.Lock()
+		runSignalCLI = originalRun
+		bridge.commandMu.Unlock()
+	}()
 
-	var receiveCalls int
+	var receiveCalls atomic.Int32
 	runSignalCLI = func(ctx context.Context, configDir string, args ...string) ([]byte, error) {
 		if strings.Contains(strings.Join(args, " "), " listAccounts") {
 			return []byte(`[{"number":"+15551230000"}]`), nil
 		}
 		if strings.Contains(strings.Join(args, " "), " receive ") {
-			receiveCalls++
-			if receiveCalls >= receiveFailureLimit+1 {
+			calls := receiveCalls.Add(1)
+			if calls >= int32(receiveFailureLimit+1) {
 				go bridge.Close()
 			}
 			return []byte{}, context.DeadlineExceeded
@@ -237,7 +248,7 @@ func TestStartReceiveLoopIgnoresIdleReceiveTimeouts(t *testing.T) {
 	go bridge.startReceiveLoop("+15551230000", false)
 
 	waitForCondition(t, 2*time.Second, func() bool {
-		return receiveCalls >= receiveFailureLimit+1
+		return receiveCalls.Load() >= int32(receiveFailureLimit+1)
 	})
 	waitForCondition(t, 2*time.Second, func() bool {
 		return !bridge.Status().Connected
@@ -247,8 +258,8 @@ func TestStartReceiveLoopIgnoresIdleReceiveTimeouts(t *testing.T) {
 	if status.LastError != "" {
 		t.Fatalf("expected idle timeouts to avoid last_error, got %+v", status)
 	}
-	if receiveCalls < receiveFailureLimit+1 {
-		t.Fatalf("receive called %d times, want at least %d", receiveCalls, receiveFailureLimit+1)
+	if calls := receiveCalls.Load(); calls < int32(receiveFailureLimit+1) {
+		t.Fatalf("receive called %d times, want at least %d", calls, receiveFailureLimit+1)
 	}
 }
 
@@ -841,8 +852,11 @@ func TestConnectEmitsSignalQRCodeAndStoresPairedAccount(t *testing.T) {
 	originalStartLink := startSignalLink
 	originalRun := runSignalCLI
 	defer func() {
-		startSignalLink = originalStartLink
+		_ = bridge.Close()
+		bridge.commandMu.Lock()
 		runSignalCLI = originalRun
+		bridge.commandMu.Unlock()
+		startSignalLink = originalStartLink
 	}()
 
 	releaseWait := make(chan struct{})
@@ -894,7 +908,6 @@ func TestConnectEmitsSignalQRCodeAndStoresPairedAccount(t *testing.T) {
 		return false
 	})
 
-	_ = bridge.Close()
 }
 
 func waitForCondition(t *testing.T, timeout time.Duration, cond func() bool) {
