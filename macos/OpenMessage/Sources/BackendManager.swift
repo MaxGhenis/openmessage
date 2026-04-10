@@ -49,12 +49,17 @@ final class BackendManager: ObservableObject {
     }
 
     /// Data directory for session, DB, etc.
-    /// Uses Application Support inside the sandbox container, which is always writable.
+    /// Prefer the stable user Application Support path used by the local app install.
+    /// Fall back to the containerized path if the direct location cannot be created.
     var dataDir: String {
+        let direct = (NSHomeDirectory() as NSString).appendingPathComponent("Library/Application Support/OpenMessage")
+        if ensureDirectoryExists(at: direct) {
+            return direct
+        }
         let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        let dir = appSupport.appendingPathComponent("OpenMessage").path
-        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true, attributes: nil)
-        return dir
+        let container = appSupport.appendingPathComponent("OpenMessage").path
+        _ = ensureDirectoryExists(at: container)
+        return container
     }
 
     /// Migrate session and DB from old data dir (~/.local/share/openmessage) if present.
@@ -85,27 +90,36 @@ final class BackendManager: ObservableObject {
     }
 
     func start() {
-        guard state == .stopped || state == .needsPairing || state != .running else { return }
-
-        if !hasSession {
-            state = .needsPairing
-            return
-        }
+        guard state != .starting, state != .running else { return }
 
         state = .starting
+        healthCheckTask?.cancel()
+        healthCheckTask = nil
+        connectionMonitorTask?.cancel()
+        connectionMonitorTask = nil
+        if reuseExistingBackendIfNeeded() {
+            return
+        }
         cleanupConflictingBackendIfNeeded()
+        if reuseExistingBackendIfNeeded() {
+            return
+        }
         let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: binaryPath)
+        let path = binaryPath
+        let dir = dataDir
+        proc.executableURL = URL(fileURLWithPath: path)
         proc.arguments = ["serve"]
+        proc.currentDirectoryURL = URL(fileURLWithPath: dir, isDirectory: true)
         proc.environment = [
             "OPENMESSAGES_PORT": String(port),
-            "OPENMESSAGES_DATA_DIR": dataDir,
+            "OPENMESSAGES_DATA_DIR": dir,
             "OPENMESSAGES_LOG_LEVEL": "info",
             "OPENMESSAGES_APP_SANDBOX": "1",
             "OPENMESSAGES_MACOS_NOTIFICATIONS": "1",
             "HOME": NSHomeDirectory(),
-            "PATH": "/usr/local/bin:/usr/bin:/bin",
+            "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
         ]
+        logger.info("Launching backend at \(path, privacy: .public) with data dir \(dir, privacy: .public)")
 
         let pipe = Pipe()
         proc.standardOutput = pipe
@@ -119,11 +133,15 @@ final class BackendManager: ObservableObject {
         }
 
         proc.terminationHandler = { [weak self] proc in
+            let manager = self
             Task { @MainActor in
-                guard let self else { return }
-                self.logger.warning("Backend exited with code \(proc.terminationStatus)")
-                if self.state == .running {
-                    self.state = .error("Backend exited unexpectedly (code \(proc.terminationStatus))")
+                guard let manager else { return }
+                let reason = proc.terminationReason == .uncaughtSignal ? "signal" : "exit"
+                manager.logger.warning("Backend terminated via \(reason, privacy: .public) with code \(proc.terminationStatus)")
+                guard manager.process === proc else { return }
+                manager.process = nil
+                if manager.state == .running || manager.state == .starting {
+                    manager.state = .error("Backend exited unexpectedly (code \(proc.terminationStatus))")
                 }
             }
         }
@@ -138,6 +156,20 @@ final class BackendManager: ObservableObject {
         }
     }
 
+    private func reuseExistingBackendIfNeeded() -> Bool {
+        let pids = listeningPIDs(on: port)
+        guard !pids.isEmpty else { return false }
+        for pid in pids {
+            guard pid > 0 else { continue }
+            guard let command = commandLine(for: pid), isManagedBackendCommand(command) else { continue }
+            logger.info("Reusing existing backend pid \(pid): \(command, privacy: .public)")
+            process = nil
+            startHealthCheck()
+            return true
+        }
+        return false
+    }
+
     private func cleanupConflictingBackendIfNeeded() {
         let pids = listeningPIDs(on: port)
         guard !pids.isEmpty else { return }
@@ -146,9 +178,7 @@ final class BackendManager: ObservableObject {
         for pid in pids {
             guard pid > 0 else { continue }
             guard let command = commandLine(for: pid) else { continue }
-            guard command.contains("/usr/local/bin/openmessage serve")
-                || command.contains("OpenMessage.app/Contents/Resources/openmessage serve")
-            else { continue }
+            guard isManagedBackendCommand(command) else { continue }
 
             logger.warning("Stopping conflicting backend pid \(pid): \(command, privacy: .public)")
             _ = Darwin.kill(pid_t(pid), SIGTERM)
@@ -156,7 +186,43 @@ final class BackendManager: ObservableObject {
         }
 
         if terminatedAny {
-            Thread.sleep(forTimeInterval: 0.5)
+            waitForPortRelease()
+            for pid in listeningPIDs(on: port) {
+                guard pid > 0 else { continue }
+                guard let command = commandLine(for: pid), isManagedBackendCommand(command) else { continue }
+                logger.warning("Force stopping lingering backend pid \(pid): \(command, privacy: .public)")
+                _ = Darwin.kill(pid_t(pid), SIGKILL)
+            }
+            waitForPortRelease()
+        }
+    }
+
+    private func isManagedBackendCommand(_ command: String) -> Bool {
+        let managedPaths = [
+            "/usr/local/bin/openmessage",
+            "OpenMessage.app/Contents/Resources/openmessage",
+            "OpenMessage.app/Contents/MacOS/openmessage-helper",
+            binaryPath,
+        ]
+        return managedPaths.contains { command.contains("\($0) serve") }
+    }
+
+    private func waitForPortRelease() {
+        for _ in 0..<20 {
+            if listeningPIDs(on: port).isEmpty {
+                return
+            }
+            Thread.sleep(forTimeInterval: 0.1)
+        }
+    }
+
+    private func ensureDirectoryExists(at path: String) -> Bool {
+        do {
+            try FileManager.default.createDirectory(atPath: path, withIntermediateDirectories: true, attributes: nil)
+            return true
+        } catch {
+            logger.error("Failed to create data dir \(path, privacy: .public): \(error.localizedDescription, privacy: .public)")
+            return false
         }
     }
 
@@ -217,7 +283,7 @@ final class BackendManager: ObservableObject {
     /// Poll /api/status until the backend is ready.
     private func startHealthCheck() {
         healthCheckTask = Task {
-            for attempt in 1...30 {
+            for attempt in 1...60 {
                 if Task.isCancelled { return }
                 try? await Task.sleep(for: .milliseconds(500))
                 do {
@@ -225,63 +291,48 @@ final class BackendManager: ObservableObject {
                     let (data, response) = try await URLSession.shared.data(from: url)
                     if let http = response as? HTTPURLResponse, http.statusCode == 200,
                        let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                        if json["connected"] as? Bool == true {
-                            self.state = .running
-                            self.logger.info("Backend ready after \(attempt) checks")
-                            self.startConnectionMonitor()
-                            return
-                        }
-                        if let google = json["google"] as? [String: Any],
-                           google["needs_pairing"] as? Bool == true {
-                            self.logger.warning("Backend reports Google Messages needs pairing")
-                            self.stop()
-                            self.state = .needsPairing
-                            return
-                        }
+                        _ = json
+                        self.state = .running
+                        self.logger.info("Backend ready after \(attempt) checks")
+                        self.startConnectionMonitor()
+                        return
                     }
                 } catch {
                     self.logger.debug("Health check \(attempt): \(error)")
                 }
             }
             if !Task.isCancelled {
-                self.state = .error("Backend failed to start within 15 seconds")
+                self.state = .error("Backend failed to start within 30 seconds")
             }
         }
     }
 
     /// Periodically polls /api/status while running.
-    /// If the backend reports disconnected, transitions back to needsPairing.
+    /// If the backend becomes unreachable, surface an error state.
     private func startConnectionMonitor() {
         connectionMonitorTask = Task {
-            var consecutiveDisconnects = 0
+            var consecutiveFailures = 0
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(3))
                 if Task.isCancelled { return }
                 do {
                     let url = baseURL.appendingPathComponent("api/status")
-                    let (data, response) = try await URLSession.shared.data(from: url)
-                    if let http = response as? HTTPURLResponse, http.statusCode == 200,
-                       let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                        let google = json["google"] as? [String: Any]
-                        if google?["needs_pairing"] as? Bool == true {
-                            self.logger.error("Google Messages session invalidated — returning to pairing")
-                            self.handleDisconnect()
-                            return
-                        }
-                        if json["connected"] as? Bool == false {
-                            consecutiveDisconnects += 1
-                            self.logger.warning("Disconnect detected (\(consecutiveDisconnects)/3)")
-                            if consecutiveDisconnects >= 3 {
-                                self.logger.error("Phone disconnected — returning to pairing")
-                                self.handleDisconnect()
-                                return
-                            }
-                        } else {
-                            consecutiveDisconnects = 0
-                        }
+                    let (_, response) = try await URLSession.shared.data(from: url)
+                    if let http = response as? HTTPURLResponse, http.statusCode == 200 {
+                        consecutiveFailures = 0
+                    } else {
+                        consecutiveFailures += 1
+                        self.logger.warning("Backend monitor HTTP failure (\(consecutiveFailures)/3)")
                     }
                 } catch {
                     self.logger.debug("Connection monitor error: \(error)")
+                    consecutiveFailures += 1
+                }
+                if consecutiveFailures >= 3 {
+                    self.logger.error("Lost connection to backend — showing error state")
+                    self.stop()
+                    self.state = .error("Lost connection to backend")
+                    return
                 }
             }
         }
@@ -304,6 +355,10 @@ final class BackendManager: ObservableObject {
         // Stop the backend process and go to pairing
         stop()
         state = .needsPairing
+    }
+
+    func beginGooglePairing() {
+        handleDisconnect()
     }
 
     /// Run the pairing flow. Returns the QR code URL for display.

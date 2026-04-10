@@ -3,6 +3,7 @@ package client
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/rs/zerolog"
 	"go.mau.fi/mautrix-gmessages/pkg/libgm"
@@ -68,14 +69,14 @@ func ExtractMessageBody(msg *gmproto.Message) string {
 
 // MediaInfo holds extracted media metadata from a protobuf Message.
 type MediaInfo struct {
-	MediaID                 string
-	MimeType                string
-	MediaName               string
-	DecryptionKey           []byte
-	Size                    int64
-	ThumbnailMediaID        string
-	ThumbnailDecryptionKey  []byte
-	InlineData              []byte // Inline thumbnail bytes from mediaData field
+	MediaID                string
+	MimeType               string
+	MediaName              string
+	DecryptionKey          []byte
+	Size                   int64
+	ThumbnailMediaID       string
+	ThumbnailDecryptionKey []byte
+	InlineData             []byte // Inline thumbnail bytes from mediaData field
 }
 
 // ExtractMediaInfo extracts media content from a protobuf Message.
@@ -96,13 +97,13 @@ func ExtractMediaInfo(msg *gmproto.Message) *MediaInfo {
 
 			mi := &MediaInfo{
 				MediaID:                mc.GetMediaID(),
-				MimeType:              mime,
-				MediaName:             mc.GetMediaName(),
-				DecryptionKey:         mc.GetDecryptionKey(),
-				Size:                  mc.GetSize(),
-				ThumbnailMediaID:      mc.GetThumbnailMediaID(),
+				MimeType:               mime,
+				MediaName:              mc.GetMediaName(),
+				DecryptionKey:          mc.GetDecryptionKey(),
+				Size:                   mc.GetSize(),
+				ThumbnailMediaID:       mc.GetThumbnailMediaID(),
 				ThumbnailDecryptionKey: mc.GetThumbnailDecryptionKey(),
-				InlineData:            mc.GetMediaData(),
+				InlineData:             mc.GetMediaData(),
 			}
 
 			// If no full-size MediaID, fall back to thumbnail
@@ -172,4 +173,20 @@ func ExtractSenderInfo(msg *gmproto.Message) (name, number string) {
 		}
 	}
 	return
+}
+
+// MessageIsFromMe infers whether a Google Messages/RCS message was sent by the
+// local account. Historical backfill messages sometimes omit sender participant
+// metadata even when the message status is clearly outgoing.
+func MessageIsFromMe(msg *gmproto.Message) bool {
+	if msg == nil {
+		return false
+	}
+	if p := msg.GetSenderParticipant(); p != nil && p.GetIsMe() {
+		return true
+	}
+	if ms := msg.GetMessageStatus(); ms != nil {
+		return strings.HasPrefix(ms.GetStatus().String(), "OUTGOING")
+	}
+	return false
 }

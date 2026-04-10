@@ -24,6 +24,7 @@ type EventHandler struct {
 	OnConversationsChange  func()
 	OnDisconnect           OnDisconnect
 	OnIncomingMessage      func(*db.Message)
+	OnPendingMedia         func(conversationID, messageID string)
 	OnMessagesChange       func(string)
 	OnRealtimeGapRecovered func(string)
 	OnTypingChange         func(conversationID, senderName, senderNumber string, typing bool)
@@ -99,7 +100,7 @@ func (h *EventHandler) handleMessage(evt *libgm.WrappedMessage) {
 		Body:           body,
 		TimestampMS:    msg.GetTimestamp() / 1000, // proto timestamp is microseconds
 		Status:         status,
-		IsFromMe:       msg.GetSenderParticipant() != nil && msg.GetSenderParticipant().GetIsMe(),
+		IsFromMe:       MessageIsFromMe(msg),
 	}
 
 	if media := ExtractMediaInfo(msg); media != nil {
@@ -141,6 +142,9 @@ func (h *EventHandler) handleMessage(evt *libgm.WrappedMessage) {
 
 	if !dbMsg.IsFromMe && !evt.IsOld && h.OnIncomingMessage != nil {
 		h.OnIncomingMessage(dbMsg)
+	}
+	if !dbMsg.IsFromMe && !evt.IsOld && h.OnPendingMedia != nil && messageNeedsPendingMediaRefresh(msg, dbMsg) {
+		h.OnPendingMedia(dbMsg.ConversationID, dbMsg.MessageID)
 	}
 	if h.OnMessagesChange != nil {
 		h.OnMessagesChange(dbMsg.ConversationID)
@@ -255,6 +259,20 @@ func (h *EventHandler) typingSenderName(conversationID, senderNumber string) str
 		return strings.TrimSpace(conv.Name)
 	}
 	return ""
+}
+
+func messageNeedsPendingMediaRefresh(msg *gmproto.Message, dbMsg *db.Message) bool {
+	if msg == nil || dbMsg == nil || dbMsg.IsFromMe {
+		return false
+	}
+	if ExtractMediaInfo(msg) != nil {
+		return false
+	}
+	if msg.GetType() == 3 {
+		return true
+	}
+	body := strings.ToLower(strings.TrimSpace(dbMsg.Body))
+	return body != "" && strings.HasSuffix(body, "from phone")
 }
 
 func normalizeTypingParticipant(value string) string {

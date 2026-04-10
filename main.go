@@ -26,6 +26,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "  import gchat-conversation <messages.json> - Import single GChat conversation")
 		fmt.Fprintln(os.Stderr, "  import imessage [db-path]                 - Import iMessage (needs Full Disk Access)")
 		fmt.Fprintln(os.Stderr, "  import whatsapp <chat.txt> [--name You]   - Import WhatsApp text export")
+		fmt.Fprintln(os.Stderr, "  import signal [support-dir]               - Import Signal Desktop history")
 		os.Exit(1)
 	}
 
@@ -52,7 +53,7 @@ func main() {
 		err = cmd.RunSendGroup(logger, phones, os.Args[3])
 	case "import":
 		if len(os.Args) < 3 {
-			fmt.Fprintln(os.Stderr, "Usage: openmessage import <gchat|gchat-conversation|imessage|whatsapp> [args...]")
+			fmt.Fprintln(os.Stderr, "Usage: openmessage import <gchat|gchat-conversation|imessage|whatsapp|signal> [args...]")
 			os.Exit(1)
 		}
 		err = cmd.RunImport(logger, os.Args[2], os.Args[3:])

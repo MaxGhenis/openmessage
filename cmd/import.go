@@ -106,8 +106,33 @@ func RunImport(logger zerolog.Logger, source string, args []string) error {
 		printResult("WhatsApp (native)", result)
 		return nil
 
+	case "signal":
+		supportDir := ""
+		if len(args) > 0 && !strings.HasPrefix(args[0], "--") {
+			supportDir = args[0]
+		}
+		myName := flagValue(args, "--name")
+		if myName == "" {
+			myName = "Me"
+		}
+		myAddress := flagValue(args, "--account")
+		imp := &importer.SignalDesktop{
+			SupportDir: supportDir,
+			MyName:     myName,
+			MyAddress:  myAddress,
+		}
+		if hasFlag(args, "--full") {
+			imp.SinceMS = -1
+		}
+		result, err := imp.ImportFromDB(a.Store)
+		if err != nil {
+			return fmt.Errorf("import signal desktop: %w", err)
+		}
+		printResult("Signal Desktop", result)
+		return nil
+
 	default:
-		return fmt.Errorf("unknown import source: %s\nSupported: gchat, gchat-conversation, imessage, whatsapp", source)
+		return fmt.Errorf("unknown import source: %s\nSupported: gchat, gchat-conversation, imessage, whatsapp, signal", source)
 	}
 }
 

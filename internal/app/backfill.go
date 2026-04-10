@@ -4,6 +4,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"strings"
+	"time"
 
 	"go.mau.fi/mautrix-gmessages/pkg/libgm/gmproto"
 
@@ -485,6 +487,76 @@ func (a *App) reconcileRecentConversationMessages(gm GMClient, convID string, cl
 	return storedAny, false
 }
 
+func (a *App) refreshPendingMediaMessageWithSchedule(convID, messageID string, schedule []time.Duration) {
+	for idx, delay := range schedule {
+		if idx > 0 && delay > 0 {
+			time.Sleep(delay)
+		}
+		refreshed, resolved := a.refreshPendingMediaMessageAttempt(convID, messageID)
+		if refreshed {
+			a.emitMessagesChange(convID)
+		}
+		if resolved {
+			return
+		}
+	}
+}
+
+func (a *App) refreshPendingMediaMessageAttempt(convID, messageID string) (bool, bool) {
+	gm, clientToken := a.currentBackfillClient()
+	if gm == nil {
+		a.Logger.Warn().Str("conv_id", convID).Str("msg_id", messageID).Msg("Pending media refresh skipped because client is not connected")
+		return false, true
+	}
+
+	var cursor *gmproto.Cursor
+	for page := 0; page < recentReconcileMaxPages; page++ {
+		if clientToken != nil && !a.backfillClientStillCurrent(clientToken) {
+			a.Logger.Warn().Str("conv_id", convID).Str("msg_id", messageID).Msg("Pending media refresh aborted because client changed or disconnected")
+			return false, true
+		}
+		msgResp, err := gm.FetchMessages(convID, recentReconcileMessageLimit, cursor)
+		if err != nil {
+			a.Logger.Warn().Err(err).Str("conv_id", convID).Str("msg_id", messageID).Msg("Pending media refresh fetch failed")
+			return false, false
+		}
+		msgs := msgResp.GetMessages()
+		if len(msgs) == 0 {
+			return false, false
+		}
+
+		for _, msg := range msgs {
+			if strings.TrimSpace(msg.GetMessageID()) != messageID {
+				continue
+			}
+			a.storeMessage(msg)
+			refreshed, resolved := a.pendingMediaRefreshResolved(msg)
+			return refreshed, resolved
+		}
+
+		cursor = msgResp.GetCursor()
+		if cursor == nil {
+			return false, false
+		}
+	}
+
+	return false, false
+}
+
+func (a *App) pendingMediaRefreshResolved(msg *gmproto.Message) (bool, bool) {
+	if msg == nil {
+		return false, false
+	}
+	if media := client.ExtractMediaInfo(msg); media != nil && strings.TrimSpace(media.MediaID) != "" {
+		return true, true
+	}
+	body := strings.ToLower(strings.TrimSpace(client.ExtractMessageBody(msg)))
+	if msg.GetType() != 3 && !strings.HasSuffix(body, "from phone") {
+		return true, true
+	}
+	return true, false
+}
+
 func reconcileBatchReachedLocalBoundary(msgs []*gmproto.Message, localLatestTS int64, localLatestID string) bool {
 	if localLatestTS == 0 || len(msgs) == 0 {
 		return true
@@ -563,7 +635,7 @@ func (a *App) storeMessage(msg *gmproto.Message) {
 		Body:           body,
 		TimestampMS:    msg.GetTimestamp() / 1000,
 		Status:         status,
-		IsFromMe:       msg.GetSenderParticipant() != nil && msg.GetSenderParticipant().GetIsMe(),
+		IsFromMe:       client.MessageIsFromMe(msg),
 	}
 
 	if media := client.ExtractMediaInfo(msg); media != nil {

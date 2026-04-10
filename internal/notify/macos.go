@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/url"
 	"os/exec"
+	"regexp"
 	"strings"
 	"sync"
 
@@ -19,6 +20,8 @@ type commandRunner func(name string, args ...string) error
 type MacOSNotifier struct {
 	logger               zerolog.Logger
 	enabled              bool
+	store                *db.Store
+	mentionNames         []string
 	run                  commandRunner
 	baseURL              string
 	terminalNotifierPath string
@@ -28,10 +31,12 @@ type MacOSNotifier struct {
 	order []string
 }
 
-func NewMacOSNotifier(logger zerolog.Logger, enabled bool, baseURL string) *MacOSNotifier {
+func NewMacOSNotifier(logger zerolog.Logger, enabled bool, baseURL string, store *db.Store, identityName string) *MacOSNotifier {
 	notifier := &MacOSNotifier{
-		logger:  logger,
-		enabled: enabled,
+		logger:       logger,
+		enabled:      enabled,
+		store:        store,
+		mentionNames: mentionNamesForIdentity(identityName),
 		run: func(name string, args ...string) error {
 			return exec.Command(name, args...).Run()
 		},
@@ -52,6 +57,9 @@ func (n *MacOSNotifier) Enabled() bool {
 
 func (n *MacOSNotifier) NotifyIncomingMessage(message *db.Message) {
 	if n == nil || !n.enabled || message == nil || message.IsFromMe {
+		return
+	}
+	if !n.notificationAllowed(message) {
 		return
 	}
 	messageID := strings.TrimSpace(message.MessageID)
@@ -81,6 +89,24 @@ func (n *MacOSNotifier) NotifyIncomingMessage(message *db.Message) {
 			n.logger.Debug().Err(err).Str("msg_id", messageID).Msg("macOS notification failed")
 		}
 	}()
+}
+
+func (n *MacOSNotifier) notificationAllowed(message *db.Message) bool {
+	if n == nil || message == nil || n.store == nil {
+		return true
+	}
+	conversation, err := n.store.GetConversation(message.ConversationID)
+	if err != nil || conversation == nil {
+		return true
+	}
+	switch conversation.NotificationMode {
+	case db.NotificationModeMuted:
+		return false
+	case db.NotificationModeMentions:
+		return message.MentionsMe || bodyMentionsAnyName(message.Body, n.mentionNames)
+	default:
+		return true
+	}
 }
 
 func (n *MacOSNotifier) notify(title, body, messageID, conversationID string) error {
@@ -138,4 +164,46 @@ func appleScriptNotification(title, body string) string {
 func appleScriptString(value string) string {
 	replacer := strings.NewReplacer(`\`, `\\`, `"`, `\"`)
 	return `"` + replacer.Replace(value) + `"`
+}
+
+func mentionNamesForIdentity(identity string) []string {
+	identity = strings.TrimSpace(identity)
+	if identity == "" {
+		return nil
+	}
+	seen := map[string]struct{}{}
+	var names []string
+	add := func(candidate string) {
+		candidate = strings.TrimSpace(candidate)
+		if len(candidate) < 3 {
+			return
+		}
+		key := strings.ToLower(candidate)
+		if _, ok := seen[key]; ok {
+			return
+		}
+		seen[key] = struct{}{}
+		names = append(names, candidate)
+	}
+
+	add(identity)
+	fields := strings.Fields(identity)
+	if len(fields) > 0 {
+		add(fields[0])
+	}
+	return names
+}
+
+func bodyMentionsAnyName(body string, names []string) bool {
+	body = strings.TrimSpace(body)
+	if body == "" || len(names) == 0 {
+		return false
+	}
+	for _, name := range names {
+		pattern := `(?i)(^|[^a-z0-9])` + regexp.QuoteMeta(name) + `([^a-z0-9]|$)`
+		if matched, _ := regexp.MatchString(pattern, body); matched {
+			return true
+		}
+	}
+	return false
 }

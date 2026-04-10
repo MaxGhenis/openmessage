@@ -15,7 +15,7 @@ struct ContentView: View {
             case .needsPairing:
                 PairingView(backend: backend)
             case .running:
-                WebViewContainer(url: backend.baseURL, notifications: notifications, contacts: contacts)
+                WebViewContainer(url: backend.baseURL, backend: backend, notifications: notifications, contacts: contacts)
             case .error(let message):
                 ErrorView(message: message, backend: backend)
             }
@@ -88,11 +88,12 @@ struct ErrorView: View {
 
 struct WebViewContainer: NSViewRepresentable {
     let url: URL
+    @ObservedObject var backend: BackendManager
     @ObservedObject var notifications: NotificationManager
     @ObservedObject var contacts: ContactsManager
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(notifications: notifications, contacts: contacts)
+        Coordinator(backend: backend, notifications: notifications, contacts: contacts)
     }
 
     func makeNSView(context: Context) -> WKWebView {
@@ -114,6 +115,7 @@ struct WebViewContainer: NSViewRepresentable {
     }
 
     func updateNSView(_ webView: WKWebView, context: Context) {
+        context.coordinator.backend = backend
         context.coordinator.notifications = notifications
         context.coordinator.contacts = contacts
         // Only reload if URL changed
@@ -124,7 +126,7 @@ struct WebViewContainer: NSViewRepresentable {
 
     private static let notificationBridgeScript = """
     (() => {
-      if (window.OpenMessageNativeNotifications) return;
+      if (window.OpenMessageNativeNotifications && window.OpenMessageNativeContacts && window.OpenMessageNativeApp) return;
       const pending = new Map();
       function request(type, extra = {}) {
         return new Promise((resolve, reject) => {
@@ -166,19 +168,40 @@ struct WebViewContainer: NSViewRepresentable {
           });
         },
       };
+      window.OpenMessageNativeApp = {
+        isNative: true,
+        startGooglePairing() {
+          return request('startGooglePairing');
+        },
+      };
     })();
     """
 
     final class Coordinator: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
         static let handlerName = "openmessageNotifications"
+        private static let openPlatformsScript = "if (typeof openWhatsAppOverlay === 'function') { openWhatsAppOverlay().catch(err => console.error('Failed to open platforms from native settings:', err)); }"
 
+        var backend: BackendManager
         var notifications: NotificationManager
         var contacts: ContactsManager
         weak var webView: WKWebView?
+        private var shouldOpenPlatformsAfterLoad = false
 
-        init(notifications: NotificationManager, contacts: ContactsManager) {
+        init(backend: BackendManager, notifications: NotificationManager, contacts: ContactsManager) {
+            self.backend = backend
             self.notifications = notifications
             self.contacts = contacts
+            super.init()
+            NotificationCenter.default.addObserver(
+                self,
+                selector: #selector(handleOpenPlatformsNotification),
+                name: .openPlatformsRequested,
+                object: nil
+            )
+        }
+
+        deinit {
+            NotificationCenter.default.removeObserver(self)
         }
 
         func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
@@ -199,6 +222,9 @@ struct WebViewContainer: NSViewRepresentable {
                         resolve(requestID: requestID, payload: state)
                     case "openSettings":
                         notifications.openSystemSettings()
+                        resolveEmpty(requestID: requestID)
+                    case "startGooglePairing":
+                        backend.beginGooglePairing()
                         resolveEmpty(requestID: requestID)
                     case "getAvatar":
                         let name = body["name"] as? String ?? ""
@@ -221,6 +247,16 @@ struct WebViewContainer: NSViewRepresentable {
                 return
             }
             decisionHandler(.allow)
+        }
+
+        func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+            guard shouldOpenPlatformsAfterLoad else { return }
+            shouldOpenPlatformsAfterLoad = false
+            openPlatforms()
+        }
+
+        @objc private func handleOpenPlatformsNotification() {
+            openPlatforms()
         }
 
         private func resolve<T: Encodable>(requestID: String, payload: T) {
@@ -262,6 +298,19 @@ struct WebViewContainer: NSViewRepresentable {
                 return
             }
             webView.evaluateJavaScript("window.__openMessageResolveNativeNotifications(\(requestJSON), null);")
+        }
+
+        private func openPlatforms() {
+            NSApp.activate(ignoringOtherApps: true)
+            guard let webView else {
+                shouldOpenPlatformsAfterLoad = true
+                return
+            }
+            if webView.isLoading {
+                shouldOpenPlatformsAfterLoad = true
+                return
+            }
+            webView.evaluateJavaScript(Self.openPlatformsScript)
         }
     }
 }

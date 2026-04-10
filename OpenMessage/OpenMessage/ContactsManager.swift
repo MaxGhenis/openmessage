@@ -11,6 +11,7 @@ final class ContactsManager: NSObject, ObservableObject {
     private let store = CNContactStore()
     private var phoneIndex: [String: String] = [:]
     private var nameIndex: [String: String] = [:]
+    private var avatarIndex: [String: String] = [:]
     private var cacheLoaded = false
     private var accessRequestTask: Task<Bool, Never>?
 
@@ -35,13 +36,15 @@ final class ContactsManager: NSObject, ObservableObject {
         loadCacheIfNeeded()
         for number in numbers {
             for candidate in normalizedPhoneCandidates(number) {
-                if let avatar = phoneIndex[candidate] {
+                if let avatarID = phoneIndex[candidate], let avatar = avatarIndex[avatarID] {
                     return avatar
                 }
             }
         }
         let normalizedName = normalizedLookupName(name)
-        if !normalizedName.isEmpty, let avatar = nameIndex[normalizedName] {
+        if !normalizedName.isEmpty,
+           let avatarID = nameIndex[normalizedName],
+           let avatar = avatarIndex[avatarID] {
             return avatar
         }
         return nil
@@ -51,6 +54,7 @@ final class ContactsManager: NSObject, ObservableObject {
     private func handleContactsChanged() {
         phoneIndex.removeAll()
         nameIndex.removeAll()
+        avatarIndex.removeAll()
         cacheLoaded = false
     }
 
@@ -82,6 +86,7 @@ final class ContactsManager: NSObject, ObservableObject {
         guard !cacheLoaded else { return }
 
         let keys: [CNKeyDescriptor] = [
+            CNContactIdentifierKey as CNKeyDescriptor,
             CNContactGivenNameKey as CNKeyDescriptor,
             CNContactFamilyNameKey as CNKeyDescriptor,
             CNContactMiddleNameKey as CNKeyDescriptor,
@@ -96,6 +101,7 @@ final class ContactsManager: NSObject, ObservableObject {
 
         var phoneLookup: [String: String] = [:]
         var nameLookup: [String: String] = [:]
+        var avatarLookup: [String: String] = [:]
 
         do {
             try store.enumerateContacts(with: request) { contact, _ in
@@ -107,10 +113,12 @@ final class ContactsManager: NSObject, ObservableObject {
                     return
                 }
 
-                let dataURL = Self.makeDataURL(for: data)
+                let avatarID = contact.identifier
+                let dataURL = avatarLookup[avatarID] ?? Self.makeDataURL(for: data)
+                avatarLookup[avatarID] = dataURL
                 for phoneNumber in contact.phoneNumbers {
                     for candidate in self.normalizedPhoneCandidates(phoneNumber.value.stringValue) {
-                        phoneLookup[candidate] = phoneLookup[candidate] ?? dataURL
+                        phoneLookup[candidate] = phoneLookup[candidate] ?? avatarID
                     }
                 }
 
@@ -122,15 +130,17 @@ final class ContactsManager: NSObject, ObservableObject {
                 for candidateName in candidateNames {
                     let normalizedName = self.normalizedLookupName(candidateName)
                     if normalizedName.isEmpty { continue }
-                    nameLookup[normalizedName] = nameLookup[normalizedName] ?? dataURL
+                    nameLookup[normalizedName] = nameLookup[normalizedName] ?? avatarID
                 }
             }
             phoneIndex = phoneLookup
             nameIndex = nameLookup
+            avatarIndex = avatarLookup
             cacheLoaded = true
         } catch {
             phoneIndex.removeAll()
             nameIndex.removeAll()
+            avatarIndex.removeAll()
             cacheLoaded = false
         }
     }

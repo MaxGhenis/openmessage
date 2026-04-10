@@ -37,12 +37,14 @@ type LinkPreviewFetcher func(ctx context.Context, rawURL string) (*LinkPreview, 
 type linkPreviewCacheEntry struct {
 	preview   *LinkPreview
 	expiresAt time.Time
+	touchedAt time.Time
 }
 
 type LinkPreviewService struct {
 	logger            zerolog.Logger
 	client            *http.Client
 	ttl               time.Duration
+	maxEntries        int
 	allowPrivateHosts bool
 
 	mu    sync.Mutex
@@ -61,8 +63,9 @@ func NewLinkPreviewService(logger zerolog.Logger) *LinkPreviewService {
 				return nil
 			},
 		},
-		ttl:   6 * time.Hour,
-		cache: make(map[string]linkPreviewCacheEntry),
+		ttl:        6 * time.Hour,
+		maxEntries: 256,
+		cache:      make(map[string]linkPreviewCacheEntry),
 	}
 }
 
@@ -145,15 +148,49 @@ func (s *LinkPreviewService) cached(rawURL string) *LinkPreview {
 		delete(s.cache, rawURL)
 		return nil
 	}
+	entry.touchedAt = time.Now()
+	s.cache[rawURL] = entry
 	return cloneLinkPreview(entry.preview)
 }
 
 func (s *LinkPreviewService) store(rawURL string, preview *LinkPreview) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	now := time.Now()
+	s.pruneExpiredLocked(now)
 	s.cache[rawURL] = linkPreviewCacheEntry{
 		preview:   cloneLinkPreview(preview),
-		expiresAt: time.Now().Add(s.ttl),
+		expiresAt: now.Add(s.ttl),
+		touchedAt: now,
+	}
+	s.evictIfNeededLocked()
+}
+
+func (s *LinkPreviewService) pruneExpiredLocked(now time.Time) {
+	for rawURL, entry := range s.cache {
+		if now.After(entry.expiresAt) {
+			delete(s.cache, rawURL)
+		}
+	}
+}
+
+func (s *LinkPreviewService) evictIfNeededLocked() {
+	if s.maxEntries <= 0 {
+		return
+	}
+	for len(s.cache) > s.maxEntries {
+		oldestURL := ""
+		var oldestTouched time.Time
+		for rawURL, entry := range s.cache {
+			if oldestURL == "" || entry.touchedAt.Before(oldestTouched) {
+				oldestURL = rawURL
+				oldestTouched = entry.touchedAt
+			}
+		}
+		if oldestURL == "" {
+			return
+		}
+		delete(s.cache, oldestURL)
 	}
 }
 

@@ -246,6 +246,54 @@ func TestHandleMessage_NotifiesOnlyFreshIncomingMessages(t *testing.T) {
 	}
 }
 
+func TestHandleMessage_SchedulesPendingMediaRefreshForUndownloadedMMS(t *testing.T) {
+	store, err := db.New(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	handler := &EventHandler{
+		Store:  store,
+		Logger: zerolog.Nop(),
+	}
+
+	var got struct {
+		conversationID string
+		messageID      string
+	}
+	handler.OnPendingMedia = func(conversationID, messageID string) {
+		got.conversationID = conversationID
+		got.messageID = messageID
+	}
+
+	handler.handleMessage(&libgm.WrappedMessage{
+		Message: &gmproto.Message{
+			MessageID:      "incoming-mms",
+			ConversationID: "c1",
+			Timestamp:      1000 * 1000,
+			Type:           3,
+			SenderParticipant: &gmproto.Participant{
+				IsMe:     false,
+				FullName: "Alice",
+				ID:       &gmproto.SmallInfo{Number: "+15551234567"},
+			},
+			MessageInfo: []*gmproto.MessageInfo{{
+				Data: &gmproto.MessageInfo_MessageContent{
+					MessageContent: &gmproto.MessageContent{Content: "Image from phone"},
+				},
+			}},
+		},
+	})
+
+	if got.conversationID != "c1" {
+		t.Fatalf("conversationID = %q, want c1", got.conversationID)
+	}
+	if got.messageID != "incoming-mms" {
+		t.Fatalf("messageID = %q, want incoming-mms", got.messageID)
+	}
+}
+
 func TestHandleTyping_ResolvesParticipantName(t *testing.T) {
 	store, err := db.New(":memory:")
 	if err != nil {

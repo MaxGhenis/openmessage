@@ -17,6 +17,7 @@ struct PairingView: View {
     @State private var statusText = "Choose a pairing method to connect Google Messages."
     @State private var isPairing = false
     @State private var pairingSucceeded = false
+    @State private var pairingAttemptID = UUID()
 
     var body: some View {
         VStack(spacing: 24) {
@@ -35,7 +36,7 @@ struct PairingView: View {
             }
             .pickerStyle(.segmented)
             .frame(maxWidth: 420)
-            .disabled(isPairing)
+            .disabled(isPairing && qrURL == nil && pairingEmoji == nil)
 
             if method == .qr {
                 Text("Open Google Messages on your phone, go to\nSettings > Device pairing, and scan this QR code.")
@@ -122,6 +123,7 @@ struct PairingView: View {
             pairingEmoji = nil
             pairingSucceeded = false
             isPairing = false
+            pairingAttemptID = UUID()
             statusText = newValue == .qr
                 ? "Ready to generate a QR code."
                 : "Paste your Google cookies or cURL command to start account pairing."
@@ -145,6 +147,8 @@ struct PairingView: View {
     }
 
     private func startPairing() {
+        let attemptID = UUID()
+        pairingAttemptID = attemptID
         isPairing = true
         pairingSucceeded = false
         qrURL = nil
@@ -156,12 +160,15 @@ struct PairingView: View {
                 ? await backend.startPairing()
                 : await backend.startGooglePairing(cookieInput: googleInput)
             for await event in events {
+                guard pairingAttemptID == attemptID else { continue }
                 switch event {
                 case .qrURL(let url):
                     qrURL = url
+                    isPairing = false
                     statusText = "Scan the QR code with your phone."
                 case .emoji(let emoji):
                     pairingEmoji = emoji
+                    isPairing = false
                     statusText = "Confirm the emoji on your phone."
                 case .log(let msg):
                     statusText = msg

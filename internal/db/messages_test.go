@@ -89,6 +89,7 @@ func TestUpsertMessage_InsertAndUpdate(t *testing.T) {
 			TimestampMS:    2000,
 			Status:         "read",
 			IsFromMe:       true,
+			MentionsMe:     true,
 			MediaID:        "media-xyz",
 			MimeType:       "image/png",
 			DecryptionKey:  "deadbeef",
@@ -120,6 +121,9 @@ func TestUpsertMessage_InsertAndUpdate(t *testing.T) {
 		}
 		if !got.IsFromMe {
 			t.Error("IsFromMe: got false, want true")
+		}
+		if !got.MentionsMe {
+			t.Error("MentionsMe: got false, want true")
 		}
 	})
 }

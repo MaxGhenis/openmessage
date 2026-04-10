@@ -3,9 +3,11 @@ package web
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/rs/zerolog"
 )
@@ -58,5 +60,48 @@ func TestLinkPreviewServiceBlocksPrivateHostsByDefault(t *testing.T) {
 	_, err := service.Fetch(context.Background(), srv.URL)
 	if !errors.Is(err, ErrBlockedLinkPreviewURL) {
 		t.Fatalf("got err %v, want ErrBlockedLinkPreviewURL", err)
+	}
+}
+
+func TestLinkPreviewServiceEvictsLeastRecentlyUsedEntries(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = fmt.Fprintf(w, `<!doctype html><html><head><meta property="og:title" content="%s"></head></html>`, r.URL.Path)
+	}))
+	defer srv.Close()
+
+	service := NewLinkPreviewService(zerolog.Nop())
+	service.allowPrivateHosts = true
+	service.maxEntries = 2
+	service.ttl = time.Hour
+
+	urlA := srv.URL + "/a"
+	urlB := srv.URL + "/b"
+	urlC := srv.URL + "/c"
+
+	if _, err := service.Fetch(context.Background(), urlA); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Fetch(context.Background(), urlB); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Fetch(context.Background(), urlA); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Fetch(context.Background(), urlC); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(service.cache) != 2 {
+		t.Fatalf("cache size = %d, want 2", len(service.cache))
+	}
+	if _, ok := service.cache[urlA]; !ok {
+		t.Fatalf("expected %s to remain cached", urlA)
+	}
+	if _, ok := service.cache[urlC]; !ok {
+		t.Fatalf("expected %s to remain cached", urlC)
+	}
+	if _, ok := service.cache[urlB]; ok {
+		t.Fatalf("expected %s to be evicted", urlB)
 	}
 }

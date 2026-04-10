@@ -76,6 +76,13 @@ html, body {
   border-bottom: 1px solid var(--border);
 }
 
+.sidebar-header-main {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
 .sidebar-header h1 {
   font-family: var(--font-serif);
   font-size: 28px;
@@ -124,22 +131,30 @@ html, body {
 
 .wa-overlay {
   display: none;
-  position: absolute;
+  position: fixed;
   inset: 0;
   z-index: 55;
-  background: rgba(246, 244, 240, 0.92);
-  padding: 16px;
+  background: rgba(6, 11, 20, 0.7);
+  padding: 28px;
+  align-items: center;
+  justify-content: center;
+  overflow-y: auto;
+  backdrop-filter: blur(12px);
 }
 
 .wa-overlay.show {
-  display: block;
+  display: flex;
 }
 
 .wa-panel {
-  background: var(--bg-surface);
-  border: 1px solid var(--border);
-  border-radius: 18px;
-  box-shadow: 0 22px 48px rgba(25, 27, 32, 0.12);
+  width: min(680px, calc(100vw - 56px));
+  max-height: calc(100vh - 56px);
+  display: flex;
+  flex-direction: column;
+  background: rgba(9, 17, 28, 0.96);
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  border-radius: 20px;
+  box-shadow: 0 28px 72px rgba(0, 0, 0, 0.38);
   overflow: hidden;
 }
 
@@ -241,7 +256,70 @@ html, body {
 }
 
 .wa-body {
-  padding: 16px 20px 20px;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 18px 20px 22px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.wa-body::-webkit-scrollbar {
+  width: 8px;
+}
+
+.wa-body::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.wa-body::-webkit-scrollbar-thumb {
+  background: rgba(148, 163, 184, 0.22);
+  border-radius: 999px;
+}
+
+.platforms-header {
+  display: flex;
+  align-items: flex-start;
+  gap: 14px;
+  padding: 22px 20px 16px;
+  border-bottom: 1px solid var(--border);
+}
+
+.platforms-header-copy {
+  min-width: 0;
+  flex: 1;
+}
+
+.platforms-header h2 {
+  font-family: var(--font-sans);
+  font-size: 21px;
+  font-weight: 700;
+  letter-spacing: -0.04em;
+  color: var(--text-primary);
+}
+
+.platforms-intro {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 0 2px 2px;
+}
+
+.platforms-kicker {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.platforms-intro p {
+  color: var(--text-secondary);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.platforms-stack {
   display: flex;
   flex-direction: column;
   gap: 12px;
@@ -251,10 +329,12 @@ html, body {
   display: flex;
   flex-direction: column;
   gap: 10px;
-  padding: 14px;
-  border-radius: 16px;
-  border: 1px solid var(--border);
-  background: var(--bg-elevated);
+  padding: 16px;
+  border-radius: 18px;
+  border: 1px solid rgba(148, 163, 184, 0.12);
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.035), rgba(255, 255, 255, 0.02)),
+    rgba(255, 255, 255, 0.02);
 }
 
 .wa-section-head {
@@ -266,9 +346,74 @@ html, body {
 
 .wa-status-line {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   justify-content: space-between;
   gap: 12px;
+}
+
+.platform-card-main {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  min-width: 0;
+}
+
+.platform-logo {
+  width: 42px;
+  height: 42px;
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 14px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text-secondary);
+}
+
+.platform-logo--google {
+  background: rgba(61, 110, 240, 0.14);
+  color: #9db7ff;
+}
+
+.platform-logo--whatsapp {
+  background: rgba(54, 151, 101, 0.14);
+  color: #8fddb1;
+}
+
+.platform-logo--signal {
+  width: auto;
+  min-width: 74px;
+  padding: 0 10px;
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  background: rgba(86, 147, 255, 0.16);
+  color: #a8cbff;
+}
+
+.platform-card-copy {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.platform-card-title {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text-primary);
+  letter-spacing: -0.02em;
+}
+
+.platform-card-meta {
+  font-size: 12px;
+  color: var(--text-muted);
+  line-height: 1.4;
 }
 
 .wa-status-label {
@@ -280,11 +425,12 @@ html, body {
 
 .wa-state-pill {
   border-radius: 999px;
-  padding: 6px 10px;
-  font-size: 12px;
+  padding: 6px 11px;
+  font-size: 11px;
   font-weight: 600;
   background: var(--accent-dim);
   color: var(--accent-strong);
+  white-space: nowrap;
 }
 
 .wa-state-pill.connected {
@@ -302,6 +448,7 @@ html, body {
   font-size: 13px;
   line-height: 1.5;
   color: var(--text-secondary);
+  padding-left: 54px;
 }
 
 .wa-qr-card {
@@ -309,10 +456,11 @@ html, body {
   align-items: center;
   flex-direction: column;
   gap: 12px;
+  margin-left: 54px;
   padding: 16px;
   border-radius: 16px;
   border: 1px solid var(--border);
-  background: var(--bg-elevated);
+  background: rgba(255, 255, 255, 0.03);
 }
 
 .wa-qr-card.active {
@@ -338,6 +486,8 @@ html, body {
 .wa-actions-row {
   display: flex;
   gap: 10px;
+  align-items: center;
+  padding-left: 54px;
 }
 
 .wa-actions-row.wrap {
@@ -346,7 +496,8 @@ html, body {
 
 .wa-connect-btn {
   margin-top: 0;
-  flex: 1;
+  flex: 0 0 auto;
+  min-width: 180px;
 }
 
 .wa-reset-btn {
@@ -354,7 +505,7 @@ html, body {
   padding: 10px 14px;
   border-radius: 12px;
   border: 1px solid var(--border);
-  background: var(--bg-elevated);
+  background: rgba(255, 255, 255, 0.02);
   color: var(--text-secondary);
   font: inherit;
   cursor: pointer;
@@ -368,14 +519,15 @@ html, body {
 .wa-error {
   display: none;
   margin-top: 0;
+  margin-left: 54px;
 }
 
 .wa-tertiary-btn {
-  flex: 1 1 140px;
+  flex: 0 0 auto;
   padding: 10px 14px;
   border-radius: 12px;
   border: 1px solid var(--border);
-  background: var(--bg-surface);
+  background: rgba(255, 255, 255, 0.02);
   color: var(--text-secondary);
   font: inherit;
   cursor: pointer;
@@ -384,6 +536,35 @@ html, body {
 .wa-tertiary-btn:hover {
   background: var(--bg-hover);
   color: var(--text-primary);
+}
+
+.platforms-support {
+  margin-top: 2px;
+  padding: 14px 16px 0;
+  border-top: 1px solid rgba(148, 163, 184, 0.12);
+}
+
+.platforms-support .wa-actions-row {
+  padding-left: 0;
+}
+
+.platforms-support-head {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 12px;
+}
+
+.platforms-support-head strong {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.platforms-support-head span {
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--text-muted);
 }
 
 .search-box {
@@ -2184,6 +2365,10 @@ body::after {
   border-bottom: 1px solid var(--border);
 }
 
+.sidebar-header-main {
+  width: 100%;
+}
+
 .sidebar-brand {
   display: flex;
   align-items: center;
@@ -2410,6 +2595,7 @@ body::after {
 }
 
 .convo-avatar {
+  position: relative;
   width: 40px;
   height: 40px;
   border-radius: 12px;
@@ -2439,6 +2625,9 @@ body::after {
 }
 
 .convo-route-name {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
   font-family: var(--font-sans);
   font-size: 14px;
   font-weight: 600;
@@ -2516,11 +2705,64 @@ body::after {
 }
 
 .chat-header-avatar {
+  position: relative;
   width: 40px;
   height: 40px;
   border-radius: 12px;
   border: 1px solid transparent;
   box-shadow: none;
+}
+
+.avatar-face {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: inherit;
+  overflow: hidden;
+}
+
+.avatar-platform-stack {
+  position: absolute;
+  right: -3px;
+  bottom: -3px;
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px 3px;
+  border-radius: 999px;
+  background: rgba(247, 249, 253, 0.92);
+  border: 1px solid rgba(194, 202, 218, 0.72);
+  box-shadow: 0 6px 16px rgba(11, 18, 31, 0.14);
+  backdrop-filter: blur(10px);
+  pointer-events: none;
+}
+
+.avatar-platform-stack .platform-chip {
+  min-width: 12px;
+  height: 12px;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  font-size: 7px;
+  letter-spacing: 0.02em;
+}
+
+.avatar-platform-stack .platform-chip--icon-only {
+  min-width: 12px;
+  width: 12px;
+}
+
+.avatar-platform-stack .platform-chip-image {
+  width: 10px;
+  height: 10px;
+}
+
+.avatar-platform-stack .platform-chip--avatar {
+  color: var(--text-secondary);
 }
 
 .chat-header-name {
@@ -2534,6 +2776,7 @@ body::after {
   display: flex;
   align-items: center;
   gap: 10px;
+  min-width: 0;
 }
 
 .chat-header-status {
@@ -2547,8 +2790,65 @@ body::after {
 }
 
 .chat-header-source {
+  display: flex;
+  align-items: center;
+  min-height: 30px;
+  margin-top: 10px;
+}
+
+.chat-header-actions {
   display: inline-flex;
   align-items: center;
+  gap: 6px;
+  margin-left: auto;
+  flex: 0 0 auto;
+}
+
+.chat-header-action-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--bg-surface);
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: background 0.16s ease, color 0.16s ease, border-color 0.16s ease;
+}
+
+.chat-header-action-btn.label {
+  width: auto;
+  min-width: 28px;
+  padding: 0 10px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.chat-header-action-btn.destructive {
+  color: #c85a5a;
+}
+
+.chat-header-action-btn:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.chat-header-action-btn.destructive:hover {
+  color: #b84646;
+}
+
+.chat-header-action-btn.active {
+  border-color: var(--border-accent);
+  color: var(--accent-strong);
+}
+
+.chat-header-action-btn svg {
+  width: 14px;
+  height: 14px;
 }
 
 .chat-header-source .platform-chip {
@@ -2559,12 +2859,104 @@ body::after {
   letter-spacing: 0.08em;
 }
 
+.chat-route-tabs {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.chat-route-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 30px;
+  padding: 0 12px 0 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--bg-surface);
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: background 0.16s ease, border-color 0.16s ease, color 0.16s ease, box-shadow 0.16s ease;
+}
+
+.chat-route-tab:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.chat-route-tab.active {
+  background: var(--accent-dim);
+  border-color: var(--border-accent);
+  color: var(--text-primary);
+  box-shadow: 0 8px 24px rgba(73, 97, 182, 0.12);
+}
+
+.chat-route-tab.read-only {
+  color: var(--text-muted);
+}
+
+.chat-route-tab-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.72);
+  border: 1px solid rgba(194, 202, 218, 0.6);
+}
+
+.chat-route-tab.active .chat-route-tab-icon {
+  background: rgba(255, 255, 255, 0.82);
+}
+
+.chat-route-tab-icon img {
+  display: block;
+  width: 12px;
+  height: 12px;
+}
+
+.chat-route-tab-monogram {
+  font-family: var(--font-mono);
+  font-size: 9px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.chat-route-tab-label {
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+.chat-route-tab-unread {
+  min-width: 16px;
+  height: 16px;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: rgba(73, 97, 182, 0.12);
+  color: var(--accent-strong);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  line-height: 16px;
+  text-align: center;
+}
+
+.chat-route-tab.active .chat-route-tab-unread {
+  background: rgba(73, 97, 182, 0.18);
+}
+
 .convo-avatar.has-photo,
 .chat-header-avatar.has-photo,
 .msg-avatar.has-photo {
-  background: transparent !important;
   color: transparent;
-  overflow: hidden;
+}
+
+.convo-avatar.has-photo .avatar-face,
+.chat-header-avatar.has-photo .avatar-face,
+.msg-avatar.has-photo .avatar-face {
+  background: transparent !important;
 }
 
 .convo-avatar.has-photo img,
@@ -2626,6 +3018,89 @@ body::after {
   color: var(--text-muted);
 }
 
+.notification-mode-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 20px;
+  height: 20px;
+  padding: 0 6px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--bg-surface);
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+}
+
+.notification-mode-badge svg {
+  width: 11px;
+  height: 11px;
+}
+
+.context-menu {
+  position: fixed;
+  z-index: 2000;
+  min-width: 220px;
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  background: rgba(11, 18, 31, 0.96);
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.28);
+  backdrop-filter: blur(20px);
+}
+
+.context-menu[hidden] {
+  display: none;
+}
+
+.context-menu-section-label {
+  padding: 4px 8px 8px;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.context-menu-item {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 0;
+  border-radius: 10px;
+  background: transparent;
+  color: var(--text-primary);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.context-menu-item:hover:not(:disabled) {
+  background: var(--bg-hover);
+}
+
+.context-menu-item:disabled {
+  color: var(--text-muted);
+  cursor: default;
+}
+
+.context-menu-item-meta {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.context-menu-divider {
+  height: 1px;
+  margin: 8px 4px;
+  background: var(--border);
+}
+
 .platform-chip {
   display: inline-flex;
   align-items: center;
@@ -2642,6 +3117,12 @@ body::after {
   letter-spacing: 0.06em;
   text-transform: uppercase;
   white-space: nowrap;
+}
+
+.platform-chip--icon-only {
+  min-width: 30px;
+  padding: 0 7px;
+  gap: 0;
 }
 
 .platform-chip--sms {
@@ -2669,9 +3150,9 @@ body::after {
 }
 
 .platform-chip--signal {
-  background: rgba(58, 118, 240, 0.12);
-  border-color: rgba(58, 118, 240, 0.2);
-  color: #2760cc;
+  background: rgba(46, 163, 255, 0.12);
+  border-color: rgba(46, 163, 255, 0.24);
+  color: #1181d8;
 }
 
 .platform-chip--telegram {
@@ -2684,6 +3165,30 @@ body::after {
   background: rgba(127, 140, 161, 0.12);
   border-color: rgba(127, 140, 161, 0.2);
   color: var(--text-secondary);
+}
+
+.platform-chip-logo {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.platform-chip-image {
+  display: block;
+  width: 12px;
+  height: 12px;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
 }
 
 .messages-area {
@@ -3318,8 +3823,38 @@ body::after {
     padding: 16px;
   }
 
+  .sidebar-header-main {
+    gap: 10px;
+  }
+
   .sidebar-brand {
     gap: 0;
+  }
+
+  .wa-overlay {
+    align-items: flex-start;
+    padding: 16px;
+  }
+
+  .wa-panel {
+    width: min(100%, calc(100vw - 32px));
+    max-height: calc(100vh - 32px);
+  }
+
+  .platforms-header {
+    padding: 18px 16px 14px;
+  }
+
+  .wa-body {
+    padding: 16px;
+  }
+
+  .wa-helper,
+  .wa-actions-row,
+  .wa-error,
+  .wa-qr-card {
+    padding-left: 0;
+    margin-left: 0;
   }
 
   .search-box {
@@ -3383,19 +3918,21 @@ body::after {
   <!-- Left Rail -->
   <div class="sidebar" id="sidebar" style="position:relative">
       <div class="sidebar-header">
-        <div class="sidebar-brand">
-          <div class="sidebar-brand-copy">
-            <h1>OpenMessage</h1>
+        <div class="sidebar-header-main">
+          <div class="sidebar-brand">
+            <div class="sidebar-brand-copy">
+              <h1>OpenMessage</h1>
+            </div>
           </div>
-        </div>
         <div class="sidebar-actions">
-        <button class="new-msg-btn notif-btn" id="notif-btn" type="button" title="Enable desktop notifications" aria-label="Enable desktop notifications" aria-pressed="false">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M15 17h5l-1.4-1.4A2 2 0 0 1 18 14.2V11a6 6 0 1 0-12 0v3.2a2 2 0 0 1-.6 1.4L4 17h5"/><path d="M9.5 17a2.5 2.5 0 0 0 5 0"/></svg>
-        </button>
-        <button class="new-msg-btn" id="new-msg-btn" title="New message">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>
-        </button>
-      </div>
+          <button class="new-msg-btn notif-btn" id="notif-btn" type="button" title="Enable desktop notifications" aria-label="Enable desktop notifications" aria-pressed="false">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M15 17h5l-1.4-1.4A2 2 0 0 1 18 14.2V11a6 6 0 1 0-12 0v3.2a2 2 0 0 1-.6 1.4L4 17h5"/><path d="M9.5 17a2.5 2.5 0 0 0 5 0"/></svg>
+          </button>
+          <button class="new-msg-btn" id="new-msg-btn" title="New message">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>
+          </button>
+        </div>
+        </div>
     </div>
     <div class="search-box">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
@@ -3409,7 +3946,6 @@ body::after {
     <div class="new-msg-overlay" id="new-msg-overlay">
       <div class="new-msg-header">
         <h2>New message</h2>
-        <button class="new-msg-link-btn" id="new-msg-connections" type="button">Connections</button>
         <button class="new-msg-close" id="new-msg-close">&times;</button>
       </div>
       <div class="new-msg-input-area">
@@ -3424,46 +3960,87 @@ body::after {
 
     <div class="wa-overlay" id="wa-overlay">
       <div class="wa-panel">
-        <div class="new-msg-header">
-          <h2>Connections</h2>
+        <div class="platforms-header">
+          <div class="platforms-header-copy">
+            <div class="platforms-kicker">Platforms</div>
+            <h2>Platforms</h2>
+          </div>
           <button class="new-msg-close" id="wa-close">&times;</button>
         </div>
         <div class="wa-body">
-          <div class="wa-section">
-            <div class="wa-section-head">
-              <div>
-                <div class="wa-status-label">Google Messages</div>
-                <p class="wa-helper" id="gm-helper">Check SMS and RCS connection state and reconnect if your phone stops syncing.</p>
-              </div>
-              <span class="wa-state-pill" id="gm-status-pill">Disconnected</span>
-            </div>
-            <div class="wa-actions-row" id="gm-actions-row">
-              <button class="wa-connect-btn wa-reset-btn" id="gm-reconnect-btn" type="button">Reconnect Google Messages</button>
-            </div>
-            <div class="new-msg-error wa-error" id="gm-error"></div>
+          <div class="platforms-intro">
+            <p>Pair each service once, then come back here whenever you need to reconnect or reset it.</p>
           </div>
-          <div class="wa-section">
-            <div class="wa-status-line">
-              <span class="wa-status-label">WhatsApp</span>
-              <span class="wa-state-pill" id="wa-status-pill">Not paired</span>
-            </div>
-            <p class="wa-helper" id="wa-helper">Link a WhatsApp companion device for live WhatsApp sync, typing updates, and text replies inside OpenMessage.</p>
-            <div class="wa-qr-card" id="wa-qr-card">
-              <img class="wa-qr-image" id="wa-qr-image" alt="WhatsApp QR code">
-              <div class="wa-qr-caption" id="wa-qr-caption"></div>
-            </div>
-            <div class="wa-actions-row">
-              <button class="new-msg-go wa-connect-btn" id="wa-connect-btn">Connect WhatsApp</button>
-              <button class="wa-reset-btn" id="wa-reset-btn" type="button">Reset</button>
-            </div>
-            <div class="new-msg-error wa-error" id="wa-error"></div>
-          </div>
-          <div class="wa-section">
-            <div class="wa-section-head">
-              <div>
-                <div class="wa-status-label">Support</div>
-                <p class="wa-helper">Export a local diagnostics snapshot before filing an issue if something goes wrong.</p>
+          <div class="platforms-stack">
+            <div class="wa-section">
+              <div class="wa-section-head">
+                <div class="platform-card-main">
+                  <div class="platform-logo platform-logo--google">SMS</div>
+                  <div class="platform-card-copy">
+                    <div class="platform-card-title">Google Messages</div>
+                    <div class="platform-card-meta">SMS and RCS through your Android phone</div>
+                  </div>
+                </div>
+                <span class="wa-state-pill" id="gm-status-pill">Disconnected</span>
               </div>
+              <p class="wa-helper" id="gm-helper">Check SMS and RCS connection state and reconnect if your phone stops syncing.</p>
+              <div class="wa-actions-row" id="gm-actions-row">
+                <button class="wa-connect-btn wa-reset-btn" id="gm-reconnect-btn" type="button">Reconnect Google Messages</button>
+                <button class="wa-tertiary-btn" id="gm-history-btn" type="button">Sync history</button>
+              </div>
+              <div class="wa-helper" id="gm-backfill-note"></div>
+              <div class="new-msg-error wa-error" id="gm-error"></div>
+            </div>
+            <div class="wa-section">
+              <div class="wa-status-line">
+                <div class="platform-card-main">
+                  <div class="platform-logo platform-logo--whatsapp">WA</div>
+                  <div class="platform-card-copy">
+                    <div class="platform-card-title">WhatsApp</div>
+                    <div class="platform-card-meta">Live linked-device sync, media, typing, and replies</div>
+                  </div>
+                </div>
+                <span class="wa-state-pill" id="wa-status-pill">Not paired</span>
+              </div>
+              <p class="wa-helper" id="wa-helper">Link a WhatsApp companion device for live WhatsApp sync, typing updates, and text replies inside OpenMessage.</p>
+              <div class="wa-qr-card" id="wa-qr-card">
+                <img class="wa-qr-image" id="wa-qr-image" alt="WhatsApp QR code">
+                <div class="wa-qr-caption" id="wa-qr-caption"></div>
+              </div>
+              <div class="wa-actions-row">
+                <button class="new-msg-go wa-connect-btn" id="wa-connect-btn">Connect WhatsApp</button>
+                <button class="wa-reset-btn" id="wa-reset-btn" type="button">Reset</button>
+              </div>
+              <div class="new-msg-error wa-error" id="wa-error"></div>
+            </div>
+            <div class="wa-section">
+              <div class="wa-status-line">
+                <div class="platform-card-main">
+                  <div class="platform-logo platform-logo--signal">SIGNAL</div>
+                  <div class="platform-card-copy">
+                    <div class="platform-card-title">Signal</div>
+                    <div class="platform-card-meta">Private text sync from a linked Signal device</div>
+                  </div>
+                </div>
+                <span class="wa-state-pill" id="signal-status-pill">Not paired</span>
+              </div>
+              <p class="wa-helper" id="signal-helper">Link Signal as a companion device for live Signal sync and replies inside OpenMessage. Choose Transfer Message History on your phone during pairing if you want existing chats imported.</p>
+              <div class="wa-qr-card" id="signal-qr-card">
+                <img class="wa-qr-image" id="signal-qr-image" alt="Signal QR code">
+                <div class="wa-qr-caption" id="signal-qr-caption"></div>
+              </div>
+              <div class="wa-actions-row">
+                <button class="new-msg-go wa-connect-btn" id="signal-connect-btn">Connect Signal</button>
+                <button class="wa-reset-btn" id="signal-reset-btn" type="button">Reset Signal</button>
+              </div>
+              <div class="wa-helper" id="signal-history-note"></div>
+              <div class="new-msg-error wa-error" id="signal-error"></div>
+            </div>
+          </div>
+          <div class="platforms-support">
+            <div class="platforms-support-head">
+              <strong>Need help?</strong>
+              <span>Export a local diagnostics snapshot before filing an issue.</span>
             </div>
             <div class="wa-actions-row wrap">
               <button class="wa-tertiary-btn" id="copy-diagnostics-btn" type="button">Copy diagnostics</button>
@@ -3492,7 +4069,7 @@ body::after {
       <h2 id="empty-state-title">No conversations yet</h2>
       <p id="empty-state-copy"></p>
       <div class="empty-state-notes" id="empty-state-notes"></div>
-      <button class="empty-state-cta" id="empty-state-cta">Start New Thread</button>
+      <button class="empty-state-cta" id="empty-state-cta">New message</button>
     </div>
 
     <!-- Chat view (hidden until conversation selected) -->
@@ -3501,8 +4078,9 @@ body::after {
       <div>
         <div class="chat-header-name-row">
           <div class="chat-header-name" id="chat-header-name"></div>
-          <div class="chat-header-source" id="chat-header-source"></div>
+          <div class="chat-header-actions" id="chat-header-actions"></div>
         </div>
+        <div class="chat-header-source" id="chat-header-source"></div>
         <div class="chat-header-status" id="chat-header-status"></div>
       </div>
     </div>
@@ -3531,6 +4109,8 @@ body::after {
   </div>
 </div>
 
+<div class="context-menu" id="context-menu" hidden></div>
+
 <script>
 (function() {
   'use strict';
@@ -3544,6 +4124,9 @@ body::after {
   const TYPING_IDLE_MS = 6000;
   const URL_CONVERSATION_KEY = 'conversation';
   const URL_MATCH_REGEX = /((?:https?:\/\/|www\.|(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,})(?:\/[^\s<]*)?)/ig;
+  const NOTIFICATION_MODE_ALL = 'all';
+  const NOTIFICATION_MODE_MENTIONS = 'mentions';
+  const NOTIFICATION_MODE_MUTED = 'muted';
   let activeConvoId = null;
   let conversations = [];
   let allConversations = [];
@@ -3563,7 +4146,7 @@ body::after {
   let notificationsEnabled = readNotificationPreference();
   let nativeNotificationState = null;
   let pendingDeepLinkConversationID = conversationIDFromURL();
-  let appStatus = { connected: false, google: {}, whatsapp: {}, backfill: {} };
+  let appStatus = { connected: false, google: {}, whatsapp: {}, signal: {}, backfill: {}, identity_name: '' };
   let googleStatus = {
     connected: false,
     paired: false,
@@ -3577,11 +4160,38 @@ body::after {
     qr_updated_at: 0,
     last_error: '',
   };
+  let signalStatus = {
+    connected: false,
+    paired: false,
+    pairing: false,
+    qr_available: false,
+    qr_updated_at: 0,
+    last_error: '',
+    history_sync: {
+      running: false,
+      started_at: 0,
+      completed_at: 0,
+      imported_conversations: 0,
+      imported_messages: 0,
+    },
+  };
+  let backfillStatus = {
+    running: false,
+    phase: '',
+    folders_scanned: 0,
+    conversations_found: 0,
+    messages_found: 0,
+    contacts_checked: 0,
+    errors: 0,
+  };
   let whatsAppPollTimer = null;
   const knownMessageIDs = new Set();
   const knownMessageOrder = [];
   const typingStateByConversation = new Map();
   const typingClearTimers = new Map();
+  const LINK_PREVIEW_CACHE_LIMIT = 256;
+  const NATIVE_AVATAR_CACHE_LIMIT = 256;
+  const WHATSAPP_AVATAR_CACHE_LIMIT = 128;
   const linkPreviewCache = new Map();
   const linkPreviewInflight = new Map();
   const nativeAvatarCache = new Map();
@@ -3597,6 +4207,7 @@ body::after {
   const $chatHeaderAvatar = document.getElementById('chat-header-avatar');
   const $chatHeaderName = document.getElementById('chat-header-name');
   const $chatHeaderSource = document.getElementById('chat-header-source');
+  const $chatHeaderActions = document.getElementById('chat-header-actions');
   const $chatHeaderStatus = document.getElementById('chat-header-status');
   const $messagesArea = document.getElementById('messages-area');
   const $composeBar = document.getElementById('compose-bar');
@@ -3624,7 +4235,9 @@ body::after {
   const $gmStatusPill = document.getElementById('gm-status-pill');
   const $gmHelper = document.getElementById('gm-helper');
   const $gmReconnectBtn = document.getElementById('gm-reconnect-btn');
+  const $gmHistoryBtn = document.getElementById('gm-history-btn');
   const $gmActionsRow = document.getElementById('gm-actions-row');
+  const $gmBackfillNote = document.getElementById('gm-backfill-note');
   const $gmError = document.getElementById('gm-error');
   const $waStatusPill = document.getElementById('wa-status-pill');
   const $waHelper = document.getElementById('wa-helper');
@@ -3634,6 +4247,15 @@ body::after {
   const $waConnectBtn = document.getElementById('wa-connect-btn');
   const $waResetBtn = document.getElementById('wa-reset-btn');
   const $waError = document.getElementById('wa-error');
+  const $signalStatusPill = document.getElementById('signal-status-pill');
+  const $signalHelper = document.getElementById('signal-helper');
+  const $signalQRCodeCard = document.getElementById('signal-qr-card');
+  const $signalQRCodeImage = document.getElementById('signal-qr-image');
+  const $signalQRCodeCaption = document.getElementById('signal-qr-caption');
+  const $signalConnectBtn = document.getElementById('signal-connect-btn');
+  const $signalResetBtn = document.getElementById('signal-reset-btn');
+  const $signalHistoryNote = document.getElementById('signal-history-note');
+  const $signalError = document.getElementById('signal-error');
   const $copyDiagnosticsBtn = document.getElementById('copy-diagnostics-btn');
   const $downloadDiagnosticsBtn = document.getElementById('download-diagnostics-btn');
   const $reportIssueBtn = document.getElementById('report-issue-btn');
@@ -3641,18 +4263,19 @@ body::after {
   const $newMsgBtn = document.getElementById('new-msg-btn');
   const $newMsgOverlay = document.getElementById('new-msg-overlay');
   const $newMsgClose = document.getElementById('new-msg-close');
-  const $newMsgConnections = document.getElementById('new-msg-connections');
   const $newMsgPhone = document.getElementById('new-msg-phone');
   const $newMsgHelper = document.getElementById('new-msg-helper');
   const $emptyStateTitle = document.getElementById('empty-state-title');
   const $emptyStateCopy = document.getElementById('empty-state-copy');
   const $emptyStateNotes = document.getElementById('empty-state-notes');
+  const $contextMenu = document.getElementById('context-menu');
   const $newMsgRoutes = document.getElementById('new-msg-routes');
   const $newMsgGo = document.getElementById('new-msg-go');
   const $newMsgError = document.getElementById('new-msg-error');
   const $emptyStateCta = document.getElementById('empty-state-cta');
 
   let replyToMsg = null; // {MessageID, SenderName, Body}
+  let contextMenuState = null;
   const QUICK_EMOJIS = ['😂', '❤️', '👍', '👎', '😮', '😢', '😡', '🙏', '🔥', '🎉', '👀', '💯'];
 
   // Full emoji dataset by category
@@ -3709,10 +4332,10 @@ body::after {
 
   const PLATFORM_META = {
     sms: { label: 'SMS', short: 'SMS', css: 'sms' },
-    whatsapp: { label: 'WhatsApp', short: 'WA', css: 'whatsapp' },
+    whatsapp: { label: 'WhatsApp', short: 'WHATSAPP', css: 'whatsapp', chipAsset: '/platform-whatsapp.svg' },
     imessage: { label: 'iMessage', short: 'IM', css: 'imessage' },
     gchat: { label: 'Google Chat', short: 'GC', css: 'gchat' },
-    signal: { label: 'Signal', short: 'SG', css: 'signal' },
+    signal: { label: 'Signal', short: 'SIGNAL', css: 'signal', chipAsset: '/platform-signal.svg' },
     telegram: { label: 'Telegram', short: 'TG', css: 'telegram' },
   };
 
@@ -3739,8 +4362,117 @@ body::after {
 
   function platformBadgeHTML(platform, variant = 'default') {
     const meta = platformMeta(platform);
+    const extraClass = variant === 'avatar' ? ' platform-chip--avatar' : '';
+    if (meta.chipAsset) {
+      return `<span class="platform-chip platform-chip--${meta.css} platform-chip--icon-only${extraClass}" title="${escapeHtml(meta.label)}" aria-label="${escapeHtml(meta.label)}"><span class="platform-chip-logo" aria-hidden="true"><img class="platform-chip-image" src="${escapeHtml(meta.chipAsset)}" alt=""></span><span class="sr-only">${escapeHtml(meta.label)}</span></span>`;
+    }
     const label = variant === 'header' ? meta.label : meta.short;
-    return `<span class="platform-chip platform-chip--${meta.css}" title="${escapeHtml(meta.label)}">${escapeHtml(label)}</span>`;
+    return `<span class="platform-chip platform-chip--${meta.css}${extraClass}" title="${escapeHtml(meta.label)}">${escapeHtml(label)}</span>`;
+  }
+
+  function distinctPlatforms(platforms = []) {
+    const seen = new Set();
+    return (platforms || []).map(normalizePlatform).filter((platform) => {
+      if (!platform || seen.has(platform)) return false;
+      seen.add(platform);
+      return true;
+    }).sort((a, b) => {
+      const ai = PLATFORM_ORDER.indexOf(a);
+      const bi = PLATFORM_ORDER.indexOf(b);
+      if (ai === -1 && bi === -1) return a.localeCompare(b);
+      if (ai === -1) return 1;
+      if (bi === -1) return -1;
+      return ai - bi;
+    });
+  }
+
+  function avatarPlatformMarkersHTML(platforms = []) {
+    const markers = distinctPlatforms(platforms).slice(0, 3);
+    if (!markers.length) return '';
+    return `<span class="avatar-platform-stack">${markers.map(platform => platformBadgeHTML(platform, 'avatar')).join('')}</span>`;
+  }
+
+  function normalizeNotificationMode(mode) {
+    switch (String(mode || '').trim().toLowerCase()) {
+      case NOTIFICATION_MODE_MENTIONS:
+      case 'mention':
+        return NOTIFICATION_MODE_MENTIONS;
+      case NOTIFICATION_MODE_MUTED:
+      case 'mute':
+      case 'none':
+      case 'off':
+        return NOTIFICATION_MODE_MUTED;
+      default:
+        return NOTIFICATION_MODE_ALL;
+    }
+  }
+
+  function notificationModeOf(convo) {
+    if (!convo) return NOTIFICATION_MODE_ALL;
+    return normalizeNotificationMode(convo.NotificationMode || convo.notification_mode);
+  }
+
+  function notificationModeLabel(mode) {
+    switch (normalizeNotificationMode(mode)) {
+      case NOTIFICATION_MODE_MENTIONS:
+        return 'Mentions';
+      case NOTIFICATION_MODE_MUTED:
+        return 'Muted';
+      default:
+        return 'All';
+    }
+  }
+
+  function notificationModeBadgeHTML(mode) {
+    switch (normalizeNotificationMode(mode)) {
+      case NOTIFICATION_MODE_MENTIONS:
+        return '<span class="notification-mode-badge" title="Notify on mentions only">@</span>';
+      case NOTIFICATION_MODE_MUTED:
+        return `<span class="notification-mode-badge" title="Notifications muted"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 17h5l-1.4-1.4A2 2 0 0 1 18 14.2V11a6 6 0 1 0-12 0v3.2a2 2 0 0 1-.6 1.4L4 17h11"/><path d="M9.5 17a2.5 2.5 0 0 0 4.3 1.7"/><line x1="3" y1="3" x2="21" y2="21"/></svg></span>`;
+      default:
+        return '';
+    }
+  }
+
+  function notificationActionIconHTML(mode) {
+    switch (normalizeNotificationMode(mode)) {
+      case NOTIFICATION_MODE_MENTIONS:
+        return '@';
+      case NOTIFICATION_MODE_MUTED:
+        return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 17h5l-1.4-1.4A2 2 0 0 1 18 14.2V11a6 6 0 1 0-12 0v3.2a2 2 0 0 1-.6 1.4L4 17h11"/><path d="M9.5 17a2.5 2.5 0 0 0 4.3 1.7"/><line x1="3" y1="3" x2="21" y2="21"/></svg>`;
+      default:
+        return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 17h5l-1.4-1.4A2 2 0 0 1 18 14.2V11a6 6 0 1 0-12 0v3.2a2 2 0 0 1-.6 1.4L4 17h11"/><path d="M9.5 17a2.5 2.5 0 0 0 5 0"/></svg>`;
+    }
+  }
+
+  function identityMentionNames() {
+    const identity = String(appStatus.identity_name || '').trim();
+    if (!identity) return [];
+    const names = new Set();
+    const add = (value) => {
+      const normalized = String(value || '').trim();
+      if (normalized.length < 3) return;
+      names.add(normalized);
+    };
+    add(identity);
+    const first = identity.split(/\s+/)[0] || '';
+    add(first);
+    return Array.from(names);
+  }
+
+  function bodyMentionsIdentity(body) {
+    const text = String(body || '').trim();
+    if (!text) return false;
+    return identityMentionNames().some((name) => {
+      const pattern = new RegExp(`(^|[^a-z0-9])${escapeRegExp(name)}([^a-z0-9]|$)`, 'i');
+      return pattern.test(text);
+    });
+  }
+
+  function messageMentionsIdentity(message) {
+    if (!message) return false;
+    if (message.mentions_me || message.MentionsMe) return true;
+    return bodyMentionsIdentity(message.Body || message.body || '');
   }
 
   function conversationParticipants(convo) {
@@ -3814,7 +4546,17 @@ body::after {
     return uniqueAvatarNumbers((convos || []).flatMap(conversationAvatarNumbers));
   }
 
-  function avatarHTML({ name = '', numbers = [], whatsAppConversationID = '', className = '', style = '', text = initials(name) || '?' } = {}) {
+  function avatarPlatformsForConversation(convo) {
+    if (!convo) return [];
+    if (convo.IsGroup) return [sourcePlatformOf(convo)];
+    return linkedRoutesForConversation(convo).map(sourcePlatformOf);
+  }
+
+  function avatarPlatformsForConversations(convos = []) {
+    return distinctPlatforms((convos || []).map(sourcePlatformOf));
+  }
+
+  function avatarHTML({ name = '', numbers = [], whatsAppConversationID = '', platforms = [], className = '', style = '', text = initials(name) || '?' } = {}) {
     const lookupNumbers = uniqueAvatarNumbers(numbers);
     const lookupKey = avatarLookupKey(name, lookupNumbers);
     const styleAttr = style ? ` style="${escapeHtml(style)}"` : '';
@@ -3828,7 +4570,7 @@ body::after {
       dataAttrs.push(`data-avatar-wa-conversation-id="${escapeHtml(whatsAppConversationID)}"`);
     }
     const attrs = dataAttrs.length ? ' ' + dataAttrs.join(' ') : '';
-    return `<div class="${escapeHtml(className)}"${styleAttr}${attrs}>${escapeHtml(text || '?')}</div>`;
+    return `<div class="${escapeHtml(className)}"${attrs}><span class="avatar-face"${styleAttr}>${escapeHtml(text || '?')}</span>${avatarPlatformMarkersHTML(platforms)}</div>`;
   }
 
   function setAvatarDataAttributes(el, name, numbers, whatsAppConversationID = '') {
@@ -3855,12 +4597,18 @@ body::after {
   function applyAvatarImage(el, dataURL, name) {
     if (!el || !dataURL) return;
     el.classList.add('has-photo');
-    el.textContent = '';
+    let face = el.querySelector('.avatar-face');
+    if (!face) {
+      face = document.createElement('span');
+      face.className = 'avatar-face';
+      el.prepend(face);
+    }
+    face.textContent = '';
     const img = document.createElement('img');
     img.src = dataURL;
     img.alt = name ? `${name} photo` : '';
     img.loading = 'lazy';
-    el.replaceChildren(img);
+    face.replaceChildren(img);
   }
 
   async function fetchNativeAvatar(name, numbers = []) {
@@ -3869,8 +4617,9 @@ body::after {
     const lookupNumbers = uniqueAvatarNumbers(numbers);
     const lookupKey = avatarLookupKey(name, lookupNumbers);
     if (!lookupKey) return null;
-    if (nativeAvatarCache.has(lookupKey)) {
-      return nativeAvatarCache.get(lookupKey);
+    const cachedAvatar = cacheGetFresh(nativeAvatarCache, lookupKey);
+    if (cachedAvatar !== undefined) {
+      return cachedAvatar;
     }
     if (nativeAvatarInflight.has(lookupKey)) {
       return nativeAvatarInflight.get(lookupKey);
@@ -3878,13 +4627,13 @@ body::after {
     const request = bridge.getAvatar(name || '', lookupNumbers)
       .then((payload) => {
         const dataURL = payload && typeof payload.data_url === 'string' ? payload.data_url : null;
-        nativeAvatarCache.set(lookupKey, dataURL);
+        cacheSetBounded(nativeAvatarCache, lookupKey, dataURL, NATIVE_AVATAR_CACHE_LIMIT);
         nativeAvatarInflight.delete(lookupKey);
         return dataURL;
       })
       .catch((err) => {
         console.error('Failed to load native avatar:', err);
-        nativeAvatarCache.set(lookupKey, null);
+        cacheSetBounded(nativeAvatarCache, lookupKey, null, NATIVE_AVATAR_CACHE_LIMIT);
         nativeAvatarInflight.delete(lookupKey);
         return null;
       });
@@ -3895,8 +4644,9 @@ body::after {
   async function fetchWhatsAppAvatar(conversationID = '') {
     const normalizedID = String(conversationID || '').trim();
     if (!normalizedID || !normalizedID.startsWith('whatsapp:')) return null;
-    if (whatsAppAvatarCache.has(normalizedID)) {
-      return whatsAppAvatarCache.get(normalizedID);
+    const cachedAvatar = cacheGetFresh(whatsAppAvatarCache, normalizedID);
+    if (cachedAvatar !== undefined) {
+      return cachedAvatar;
     }
     if (whatsAppAvatarInflight.has(normalizedID)) {
       return whatsAppAvatarInflight.get(normalizedID);
@@ -3904,7 +4654,7 @@ body::after {
     const request = fetch(`${API}/api/whatsapp/avatar?conversation_id=${encodeURIComponent(normalizedID)}`)
       .then(async (resp) => {
         if (resp.status === 404) {
-          whatsAppAvatarCache.set(normalizedID, null);
+          cacheSetBounded(whatsAppAvatarCache, normalizedID, null, WHATSAPP_AVATAR_CACHE_LIMIT);
           return null;
         }
         if (!resp.ok) {
@@ -3912,11 +4662,15 @@ body::after {
         }
         const blob = await resp.blob();
         if (!blob || blob.size === 0) {
-          whatsAppAvatarCache.set(normalizedID, null);
+          cacheSetBounded(whatsAppAvatarCache, normalizedID, null, WHATSAPP_AVATAR_CACHE_LIMIT);
           return null;
         }
         const objectURL = URL.createObjectURL(blob);
-        whatsAppAvatarCache.set(normalizedID, objectURL);
+        cacheSetBounded(whatsAppAvatarCache, normalizedID, objectURL, WHATSAPP_AVATAR_CACHE_LIMIT, (staleValue) => {
+          if (typeof staleValue === 'string' && staleValue.startsWith('blob:')) {
+            URL.revokeObjectURL(staleValue);
+          }
+        });
         return objectURL;
       })
       .catch(() => null)
@@ -3933,6 +4687,11 @@ body::after {
     return fetchNativeAvatar(name, numbers);
   }
 
+  function avatarHydrationIdentity(el) {
+    if (!el) return '';
+    return `${el.dataset.avatarKey || ''}::${el.dataset.avatarWaConversationId || ''}`;
+  }
+
   function hydrateNativeAvatars(root = document) {
     const targets = [];
     if (root && root.nodeType === 1 && root.matches && root.matches('[data-avatar-key], [data-avatar-wa-conversation-id]')) {
@@ -3947,18 +4706,23 @@ body::after {
       const name = el.dataset.avatarName || '';
       const numbers = (el.dataset.avatarNumbers || '').split('|').filter(Boolean);
       const whatsAppConversationID = el.dataset.avatarWaConversationId || '';
+      const expectedIdentity = avatarHydrationIdentity(el);
       fetchAvatarImage(name, numbers, whatsAppConversationID).then((dataURL) => {
         if (!dataURL || !el.isConnected) return;
-        applyAvatarImage(el, dataURL, name);
+        if (avatarHydrationIdentity(el) !== expectedIdentity) return;
+        applyAvatarImage(el, dataURL, el.dataset.avatarName || name);
       });
     });
   }
 
-  function renderAvatarElement(el, { name = '', numbers = [], whatsAppConversationID = '', text = initials(name) || '?', background = avatarColor(name) } = {}) {
+  function renderAvatarElement(el, { name = '', numbers = [], whatsAppConversationID = '', platforms = [], text = initials(name) || '?', background = avatarColor(name) } = {}) {
     if (!el) return;
     el.classList.remove('has-photo');
-    el.replaceChildren(document.createTextNode(text || '?'));
-    el.style.background = background;
+    el.innerHTML = `<span class="avatar-face">${escapeHtml(text || '?')}</span>${avatarPlatformMarkersHTML(platforms)}`;
+    const face = el.querySelector('.avatar-face');
+    if (face) {
+      face.style.background = background;
+    }
     setAvatarDataAttributes(el, name, numbers, whatsAppConversationID);
     hydrateNativeAvatars(el);
   }
@@ -3987,13 +4751,20 @@ body::after {
   function conversationSupportsOutbound(convo) {
     if (!convo) return false;
     const platform = sourcePlatformOf(convo);
-    return platform === 'sms' || (platform === 'whatsapp' && whatsAppStatus.connected);
+    return platform === 'sms'
+      || (platform === 'whatsapp' && whatsAppStatus.connected)
+      || (platform === 'signal' && signalStatus.connected);
+  }
+
+  function isLeaveableWhatsAppGroup(convo) {
+    return !!(convo && convo.IsGroup && sourcePlatformOf(convo) === 'whatsapp');
   }
 
   function conversationSupportsMediaOutbound(convo) {
     return !!convo && (
       sourcePlatformOf(convo) === 'sms'
       || (sourcePlatformOf(convo) === 'whatsapp' && whatsAppStatus.connected)
+      || (sourcePlatformOf(convo) === 'signal' && signalStatus.connected)
     );
   }
 
@@ -4007,6 +4778,14 @@ body::after {
         return ai - bi;
       }
       return (b.LastMessageTS || 0) - (a.LastMessageTS || 0);
+    });
+  }
+
+  function sortRoutesByRecency(convos) {
+    return convos.slice().sort((a, b) => {
+      const timeDelta = (b.LastMessageTS || 0) - (a.LastMessageTS || 0);
+      if (timeDelta !== 0) return timeDelta;
+      return sortRouteConversations([a, b])[0] === a ? -1 : 1;
     });
   }
 
@@ -4046,6 +4825,83 @@ body::after {
     const key = normalizeParticipantIdentifier(phone);
     if (!key) return [];
     return sortRouteConversations(allConversations.filter(convo => conversationParticipantIdentifier(convo) === key));
+  }
+
+  function activeConversationIdentityKey() {
+    const identity = conversationPersonIdentity(activeConversation);
+    return identity ? identity.key : '';
+  }
+
+  function representativeRouteForConversations(convos = []) {
+    const routes = sortRoutesByRecency(convos || []);
+    if (!routes.length) return null;
+    const activeMatch = (convos || []).find(route => route.ConversationID === activeConvoId);
+    return activeMatch || routes[0];
+  }
+
+  function aggregateUnreadCount(convos = []) {
+    return (convos || []).reduce((sum, convo) => sum + (convo.UnreadCount || 0), 0);
+  }
+
+  function rowMatchesActiveConversation(el) {
+    if (!el || !activeConversation) return false;
+    const personKey = el.dataset.personKey || '';
+    if (personKey) {
+      return personKey === activeConversationIdentityKey();
+    }
+    return (el.dataset.id || '') === activeConvoId;
+  }
+
+  function syncSidebarSelectionState() {
+    document.querySelectorAll('.convo-item').forEach(el => {
+      el.classList.toggle('active', rowMatchesActiveConversation(el));
+    });
+  }
+
+  function routeTabIconHTML(platform) {
+    const meta = platformMeta(platform);
+    if (meta.chipAsset) {
+      return `<span class="chat-route-tab-icon" aria-hidden="true"><img src="${escapeHtml(meta.chipAsset)}" alt=""></span>`;
+    }
+    return `<span class="chat-route-tab-icon" aria-hidden="true"><span class="chat-route-tab-monogram">${escapeHtml(meta.short)}</span></span>`;
+  }
+
+  function renderHeaderRouteTabs(container, routes, activeID, onSelect) {
+    if (!container) return;
+    if (!routes || !routes.length) {
+      container.innerHTML = '';
+      return;
+    }
+    if (routes.length < 2) {
+      container.innerHTML = platformBadgeHTML(sourcePlatformOf(routes[0]), 'header');
+      return;
+    }
+    container.innerHTML = `<div class="chat-route-tabs">${
+      routes.map(route => {
+        const platform = sourcePlatformOf(route);
+        const active = route.ConversationID === activeID;
+        const unread = route.UnreadCount || 0;
+        return `
+          <button
+            type="button"
+            class="chat-route-tab${active ? ' active' : ''}${conversationSupportsOutbound(route) ? '' : ' read-only'}"
+            data-route-id="${escapeHtml(route.ConversationID)}"
+            title="${escapeHtml(platformMeta(platform).label)}"
+            ${active ? 'aria-current="page"' : ''}
+          >
+            ${routeTabIconHTML(platform)}
+            <span class="chat-route-tab-label">${escapeHtml(platformMeta(platform).label)}</span>
+            ${unread ? `<span class="chat-route-tab-unread">${unread}</span>` : ''}
+          </button>
+        `;
+      }).join('')
+    }</div>`;
+    container.querySelectorAll('.chat-route-tab').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const route = routes.find(candidate => candidate.ConversationID === btn.dataset.routeId);
+        if (route) onSelect(route);
+      });
+    });
   }
 
   async function revealAndSelectConversation(convo) {
@@ -4146,7 +5002,7 @@ body::after {
       btn.className = 'route-switch-btn'
         + (isActive ? ' active' : '')
         + (conversationSupportsOutbound(route) ? '' : ' read-only');
-      btn.innerHTML = `${platformBadgeHTML(routePlatform)}<span>${escapeHtml(platformMeta(routePlatform).label)}</span><span class="route-switch-btn-meta">${conversationSupportsOutbound(route) ? (isActive ? 'Replies here' : 'Reply route') : 'History'}</span>`;
+      btn.innerHTML = `${platformBadgeHTML(routePlatform)}<span class="route-switch-btn-meta">${conversationSupportsOutbound(route) ? (isActive ? 'Replies here' : 'Reply route') : 'History'}</span>`;
       if (isActive) {
         btn.setAttribute('aria-current', 'page');
       }
@@ -4197,7 +5053,7 @@ body::after {
         class="source-filter-btn${option.value === currentPlatformFilter ? ' active' : ''}"
         data-platform="${escapeHtml(option.value)}"
       >
-        <span>${escapeHtml(option.label)}</span>
+        ${option.value === 'all' ? `<span>${escapeHtml(option.label)}</span>` : platformBadgeHTML(option.value)}
         <span class="source-filter-count">${option.count}</span>
       </button>
     `).join('');
@@ -4233,9 +5089,9 @@ body::after {
         return item.convos.map(convo => ({ type: 'conversation', convo }));
       }
       return [{
-        type: 'cluster',
+        type: 'contact',
         identity: item.identity,
-        convos: item.convos,
+        convos: sortRouteConversations(item.convos),
       }];
     });
   }
@@ -4244,6 +5100,7 @@ body::after {
     const el = document.createElement('div');
     const hasUnread = c.UnreadCount > 0;
     const platform = sourcePlatformOf(c);
+    const notificationBadge = notificationModeBadgeHTML(notificationModeOf(c));
     const preview = c._searchPreview
       ? `<div class="convo-preview">${escapeHtml(c._searchPreview.substring(0, 60))}</div>`
       : '';
@@ -4257,7 +5114,7 @@ body::after {
       el.innerHTML = `
         <div class="convo-route-badge">${platformBadgeHTML(platform)}</div>
         <div class="convo-meta">
-          <div class="convo-route-name">${escapeHtml(platformMeta(platform).label)}</div>
+          <div class="convo-route-name">${notificationBadge}</div>
           ${preview}
         </div>
         <div class="convo-time">${formatTime(c.LastMessageTS)}</div>
@@ -4269,13 +5126,14 @@ body::after {
           name: c.Name,
           numbers: conversationAvatarNumbers(c),
           whatsAppConversationID: conversationAvatarWhatsAppConversationID(c),
+          platforms: avatarPlatformsForConversation(c),
           className: 'convo-avatar',
           style: `background:${avatarColor(c.Name)}`,
         })}
         <div class="convo-meta">
           <div class="convo-name">${escapeHtml(c.Name || 'Unknown')}</div>
           <div class="convo-subline">
-            ${platformBadgeHTML(platform)}
+            ${notificationBadge}
             ${preview}
           </div>
         </div>
@@ -4284,6 +5142,43 @@ body::after {
       `;
     }
     el.addEventListener('click', () => selectConversation(c));
+    el.addEventListener('contextmenu', (event) => {
+      openContextMenu(event, conversationContextMenuItems(c), { type: 'conversation', conversation: c });
+    });
+    return el;
+  }
+
+  function createContactRow(identity, convos = []) {
+    const routes = sortRouteConversations(convos);
+    const primary = representativeRouteForConversations(routes);
+    if (!primary) return document.createElement('div');
+    const hasUnread = aggregateUnreadCount(routes) > 0;
+    const unreadCount = aggregateUnreadCount(routes);
+    const el = document.createElement('div');
+    el.className = 'convo-item'
+      + (activeConversationIdentityKey() === identity.key ? ' active' : '')
+      + (hasUnread ? ' unread' : '');
+    el.dataset.personKey = identity.key;
+    el.innerHTML = `
+      ${avatarHTML({
+        name: identity.displayName,
+        numbers: clusterAvatarNumbers(routes),
+        whatsAppConversationID: clusterAvatarWhatsAppConversationID(routes),
+        platforms: avatarPlatformsForConversations(routes),
+        className: 'convo-avatar',
+        style: `background:${avatarColor(identity.displayName)}`,
+      })}
+      <div class="convo-meta">
+        <div class="convo-name">${escapeHtml(identity.displayName)}</div>
+      </div>
+      <div class="convo-time">${formatTime(primary.LastMessageTS)}</div>
+      ${unreadCount ? '<div class="convo-unread">' + unreadCount + '</div>' : ''}
+    `;
+    el.addEventListener('click', () => selectConversation(primary));
+    el.addEventListener('contextmenu', (event) => {
+      const contextRoute = routes.find(route => route.ConversationID === activeConvoId) || primary;
+      openContextMenu(event, conversationContextMenuItems(contextRoute), { type: 'conversation', conversation: contextRoute });
+    });
     return el;
   }
 
@@ -4291,12 +5186,58 @@ body::after {
     activeProtocolDetail = protocolDetail || '';
     if (!activeConversation) {
       $chatHeaderSource.innerHTML = '';
+      $chatHeaderActions.innerHTML = '';
       $chatHeaderStatus.textContent = '';
       $chatHeaderStatus.classList.remove('typing');
       return;
     }
-    const platform = sourcePlatformOf(activeConversation);
-    $chatHeaderSource.innerHTML = platformBadgeHTML(platform, 'header');
+    const routes = activeConversation.IsGroup ? [activeConversation] : linkedRoutesForConversation(activeConversation);
+    renderHeaderRouteTabs($chatHeaderSource, routes, activeConversation.ConversationID, async (route) => {
+      if (route.ConversationID === activeConvoId) return;
+      await selectConversation(route);
+    });
+    const notificationMode = notificationModeOf(activeConversation);
+    const leaveButtonHTML = isLeaveableWhatsAppGroup(activeConversation)
+      ? `
+      <button
+        type="button"
+        class="chat-header-action-btn label destructive"
+        id="chat-header-leave-group-btn"
+        title="Leave this WhatsApp group"
+        aria-label="Leave this WhatsApp group"
+      >Leave group</button>
+    `
+      : '';
+    $chatHeaderActions.innerHTML = `
+      ${leaveButtonHTML}
+      <button
+        type="button"
+        class="chat-header-action-btn${notificationMode !== NOTIFICATION_MODE_ALL ? ' active' : ''}"
+        id="chat-header-notification-btn"
+        title="Notification settings: ${escapeHtml(notificationModeLabel(notificationMode))}"
+        aria-label="Notification settings"
+      >${notificationActionIconHTML(notificationMode)}</button>
+    `;
+    const $leaveGroupBtn = document.getElementById('chat-header-leave-group-btn');
+    if ($leaveGroupBtn) {
+      $leaveGroupBtn.addEventListener('click', () => {
+        leaveWhatsAppGroup(activeConversation).catch(err => {
+          console.error('Failed to leave WhatsApp group:', err);
+          showThreadFeedback(err.message || 'Failed to leave WhatsApp group.');
+        });
+      });
+    }
+    const $notificationBtn = document.getElementById('chat-header-notification-btn');
+    if ($notificationBtn) {
+      $notificationBtn.addEventListener('click', (event) => {
+        if (!activeConversation) return;
+        const rect = $notificationBtn.getBoundingClientRect();
+        openContextMenuAt(rect.left, rect.bottom + 8, conversationNotificationMenuItems(activeConversation), {
+          type: 'conversation',
+          conversation: activeConversation,
+        });
+      });
+    }
     const details = [];
     if (activeProtocolDetail) details.push(activeProtocolDetail);
     if (activeConversation.IsGroup) details.push('Group chat');
@@ -4341,6 +5282,10 @@ body::after {
   let activeConvoIsGroup = false;
 
   // ─── Utilities ───
+  function escapeRegExp(value) {
+    return String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  }
+
   function initials(name) {
     if (!name) return '?';
     return name.split(/\s+/).map(w => w[0]).slice(0, 2).join('').toUpperCase();
@@ -4457,6 +5402,12 @@ body::after {
   function nativeNotificationBridge() {
     return window.OpenMessageNativeNotifications && window.OpenMessageNativeNotifications.isNative
       ? window.OpenMessageNativeNotifications
+      : null;
+  }
+
+  function nativeAppBridge() {
+    return window.OpenMessageNativeApp && window.OpenMessageNativeApp.isNative
+      ? window.OpenMessageNativeApp
       : null;
   }
 
@@ -4623,11 +5574,46 @@ body::after {
     (messages || []).forEach(message => rememberKnownMessage(message && message.MessageID));
   }
 
+  function cacheGetFresh(cache, key) {
+    if (!cache.has(key)) return undefined;
+    const value = cache.get(key);
+    cache.delete(key);
+    cache.set(key, value);
+    return value;
+  }
+
+  function cacheSetBounded(cache, key, value, limit, onEvict = null) {
+    if (cache.has(key)) {
+      cache.delete(key);
+    }
+    cache.set(key, value);
+    while (cache.size > limit) {
+      const oldestKey = cache.keys().next().value;
+      if (oldestKey === undefined) break;
+      const oldestValue = cache.get(oldestKey);
+      cache.delete(oldestKey);
+      if (onEvict) onEvict(oldestValue, oldestKey);
+    }
+    return value;
+  }
+
   function conversationByID(conversationID) {
     if (activeConversation && activeConversation.ConversationID === conversationID) return activeConversation;
     return allConversations.find(convo => convo.ConversationID === conversationID)
       || conversations.find(convo => convo.ConversationID === conversationID)
       || null;
+  }
+
+  function applyConversationPatch(conversationID, patch) {
+    const apply = (convo) => {
+      if (!convo || convo.ConversationID !== conversationID) return convo;
+      return Object.assign(convo, patch);
+    };
+    allConversations = allConversations.map(apply);
+    conversations = conversations.map(apply);
+    if (activeConversation && activeConversation.ConversationID === conversationID) {
+      activeConversation = Object.assign(activeConversation, patch);
+    }
   }
 
   function notificationShouldSuppress(conversationID) {
@@ -4653,6 +5639,9 @@ body::after {
       const messageID = String(latest.MessageID || '');
       if (!rememberKnownMessage(messageID)) return;
       const convo = conversationByID(conversationID);
+      const notificationMode = notificationModeOf(convo);
+      if (notificationMode === NOTIFICATION_MODE_MUTED) return;
+      if (notificationMode === NOTIFICATION_MODE_MENTIONS && !messageMentionsIdentity(latest)) return;
       const title = (convo && convo.Name) || latest.SenderName || 'New message';
       const body = latest.Body || (latest.MediaID ? 'Sent an attachment' : 'New message');
       const notification = new window.Notification(title, {
@@ -4676,6 +5665,202 @@ body::after {
     } catch (err) {
       console.error('Failed to show notification:', err);
     }
+  }
+
+  async function setConversationNotificationMode(convo, mode) {
+    if (!convo) return;
+    const normalized = normalizeNotificationMode(mode);
+    const updated = await postJSON(`/api/conversations/${encodeURIComponent(convo.ConversationID)}/notification-mode`, {
+      notification_mode: normalized,
+    });
+    applyConversationPatch(convo.ConversationID, {
+      NotificationMode: updated.NotificationMode || updated.notification_mode || normalized,
+      notification_mode: updated.NotificationMode || updated.notification_mode || normalized,
+    });
+    renderConversations(allConversations);
+    if (activeConversation && activeConversation.ConversationID === convo.ConversationID) {
+      refreshConversationChrome();
+    }
+  }
+
+  async function leaveWhatsAppGroup(convo = activeConversation) {
+    if (!isLeaveableWhatsAppGroup(convo)) return;
+    const groupName = String(convo.Name || 'this group').trim() || 'this group';
+    const confirmed = window.confirm(`Leave ${groupName} on WhatsApp and remove it from OpenMessage on this Mac?`);
+    if (!confirmed) return;
+
+    await postJSON('/api/whatsapp/leave-group', {
+      conversation_id: convo.ConversationID,
+    });
+
+    if (activeConversation && activeConversation.ConversationID === convo.ConversationID) {
+      clearReply();
+      deselectConversation();
+    }
+    await loadConversations();
+    showThreadFeedback('Left WhatsApp group.');
+  }
+
+  async function copyTextToClipboard(text) {
+    if (!text) return;
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      try {
+        await navigator.clipboard.writeText(text);
+        return;
+      } catch (err) {
+        console.warn('Clipboard API write failed, falling back:', err);
+      }
+    }
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand('copy');
+    ta.remove();
+  }
+
+  async function launchGooglePairing() {
+    const nativeBridge = nativeAppBridge();
+    if (nativeBridge && typeof nativeBridge.startGooglePairing === 'function') {
+      closeWhatsAppOverlay();
+      await nativeBridge.startGooglePairing();
+      return;
+    }
+    await copyTextToClipboard('openmessage pair');
+    showThreadFeedback('Pair command copied. Run `openmessage pair` in Terminal to connect Google Messages.');
+  }
+
+  function closeContextMenu() {
+    contextMenuState = null;
+    if ($contextMenu) {
+      $contextMenu.hidden = true;
+      $contextMenu.innerHTML = '';
+    }
+  }
+
+  function openContextMenuAt(x, y, items, context = null) {
+    if (!$contextMenu) return;
+    const filteredItems = (items || []).filter(Boolean);
+    if (!filteredItems.length) {
+      closeContextMenu();
+      return;
+    }
+    $contextMenu.innerHTML = filteredItems.map((item) => {
+      if (item.type === 'divider') {
+        return '<div class="context-menu-divider"></div>';
+      }
+      if (item.type === 'label') {
+        return `<div class="context-menu-section-label">${escapeHtml(item.label || '')}</div>`;
+      }
+      return `
+        <button
+          type="button"
+          class="context-menu-item"
+          data-action="${escapeHtml(item.action || '')}"
+          ${item.disabled ? 'disabled' : ''}
+        >
+          <span>${escapeHtml(item.label || '')}</span>
+          <span class="context-menu-item-meta">${escapeHtml(item.meta || '')}</span>
+        </button>
+      `;
+    }).join('');
+    contextMenuState = {
+      items: filteredItems,
+      context,
+    };
+    $contextMenu.hidden = false;
+    $contextMenu.style.left = '0px';
+    $contextMenu.style.top = '0px';
+    const menuWidth = $contextMenu.offsetWidth || 220;
+    const menuHeight = $contextMenu.offsetHeight || 220;
+    const maxLeft = Math.max(8, window.innerWidth - menuWidth - 8);
+    const maxTop = Math.max(8, window.innerHeight - menuHeight - 8);
+    $contextMenu.style.left = `${Math.min(Math.max(8, x), maxLeft)}px`;
+    $contextMenu.style.top = `${Math.min(Math.max(8, y), maxTop)}px`;
+  }
+
+  function openContextMenu(event, items, context = null) {
+    event.preventDefault();
+    event.stopPropagation();
+    openContextMenuAt(event.clientX, event.clientY, items, context);
+  }
+
+  function conversationNotificationMenuItems(convo) {
+    const mode = notificationModeOf(convo);
+    return [
+      { type: 'label', label: 'Notifications' },
+      {
+        label: 'Notify for all messages',
+        meta: mode === NOTIFICATION_MODE_ALL ? 'Current' : '',
+        action: `notification:${NOTIFICATION_MODE_ALL}`,
+      },
+      {
+        label: 'Notify on mentions only',
+        meta: mode === NOTIFICATION_MODE_MENTIONS ? 'Current' : '',
+        action: `notification:${NOTIFICATION_MODE_MENTIONS}`,
+      },
+      {
+        label: 'Mute notifications',
+        meta: mode === NOTIFICATION_MODE_MUTED ? 'Current' : '',
+        action: `notification:${NOTIFICATION_MODE_MUTED}`,
+      },
+    ];
+  }
+
+  function conversationContextMenuItems(convo) {
+    const items = [
+      {
+        label: 'Open thread',
+        action: 'open-thread',
+      },
+    ];
+    if (isLeaveableWhatsAppGroup(convo)) {
+      items.push({
+        label: 'Leave WhatsApp group',
+        action: 'leave-whatsapp-group',
+      });
+    }
+    items.push(
+      { type: 'divider' },
+      ...conversationNotificationMenuItems(convo),
+    );
+    const identity = conversationPersonIdentity(convo);
+    const number = identity && identity.number ? identity.number : '';
+    if (number) {
+      items.push({ type: 'divider' });
+      items.push({
+        label: 'Copy number',
+        action: 'copy-number',
+        meta: number,
+      });
+    }
+    return items;
+  }
+
+  function messageContextMenuItems(message) {
+    const urls = extractMessageURLs(message && message.Body ? message.Body : '');
+    return [
+      {
+        label: 'Reply',
+        action: 'reply-message',
+      },
+      {
+        label: 'Copy text',
+        action: 'copy-message',
+        disabled: !String(message && message.Body || '').trim(),
+      },
+      urls[0] ? {
+        label: 'Open link',
+        action: 'open-link',
+        meta: urls[0],
+      } : null,
+      urls[0] ? {
+        label: 'Copy link',
+        action: 'copy-link',
+      } : null,
+    ];
   }
 
   function isSameDay(ms1, ms2) {
@@ -4842,31 +6027,8 @@ body::after {
     }
     const renderItems = buildConversationRenderItems(visibleConvos, isSearch);
     renderItems.forEach(item => {
-      if (item.type === 'cluster') {
-        const cluster = document.createElement('div');
-        const clusterIsActive = item.convos.some(convo => convo.ConversationID === activeConvoId);
-        cluster.className = 'contact-cluster' + (clusterIsActive ? ' active' : '');
-        cluster.innerHTML = `
-          <div class="contact-cluster-head">
-            ${avatarHTML({
-              name: item.identity.displayName,
-              numbers: clusterAvatarNumbers(item.convos),
-              whatsAppConversationID: clusterAvatarWhatsAppConversationID(item.convos),
-              className: 'convo-avatar',
-              style: `background:${avatarColor(item.identity.displayName)}`,
-            })}
-            <div class="contact-cluster-meta">
-              <div class="convo-name">${escapeHtml(item.identity.displayName)}</div>
-            </div>
-          </div>
-        `;
-        const threads = document.createElement('div');
-        threads.className = 'contact-cluster-threads';
-        item.convos.forEach(convo => {
-          threads.appendChild(createConversationRow(convo, { clustered: true }));
-        });
-        cluster.appendChild(threads);
-        $convoList.appendChild(cluster);
+      if (item.type === 'contact') {
+        $convoList.appendChild(createContactRow(item.identity, item.convos));
         return;
       }
       $convoList.appendChild(createConversationRow(item.convo));
@@ -4966,8 +6128,9 @@ body::after {
 
   async function fetchLinkPreview(url) {
     if (!url) return null;
-    if (linkPreviewCache.has(url)) {
-      return linkPreviewCache.get(url);
+    const cachedPreview = cacheGetFresh(linkPreviewCache, url);
+    if (cachedPreview !== undefined) {
+      return cachedPreview;
     }
     if (linkPreviewInflight.has(url)) {
       return linkPreviewInflight.get(url);
@@ -4975,13 +6138,13 @@ body::after {
     const request = fetchJSON(`/api/link-preview?url=${encodeURIComponent(url)}`)
       .then(preview => {
         const resolved = hasRenderableLinkPreview(preview) ? preview : null;
-        linkPreviewCache.set(url, resolved);
+        cacheSetBounded(linkPreviewCache, url, resolved, LINK_PREVIEW_CACHE_LIMIT);
         linkPreviewInflight.delete(url);
         return resolved;
       })
       .catch(err => {
         console.error('Failed to load link preview:', err);
-        linkPreviewCache.set(url, null);
+        cacheSetBounded(linkPreviewCache, url, null, LINK_PREVIEW_CACHE_LIMIT);
         linkPreviewInflight.delete(url);
         return null;
       });
@@ -5033,11 +6196,7 @@ body::after {
     document.title = total > 0 ? `(${total}) OpenMessage` : 'OpenMessage';
   }
 
-  function syncActiveClusterState() {
-    document.querySelectorAll('.contact-cluster').forEach(cluster => {
-      cluster.classList.toggle('active', !!cluster.querySelector('.convo-item.active'));
-    });
-  }
+  function syncActiveClusterState() {}
 
   // ─── Select Conversation ───
   async function selectConversation(convo) {
@@ -5056,17 +6215,10 @@ body::after {
       }).catch(() => {});
     }
 
-    // Update sidebar active state
-    document.querySelectorAll('.convo-item').forEach(el => {
-      el.classList.toggle('active', el.dataset.id === activeConvoId);
-      // Remove unread badge from the selected conversation
-      if (el.dataset.id === activeConvoId) {
-        el.classList.remove('unread');
-        const badge = el.querySelector('.convo-unread');
-        if (badge) badge.remove();
-      }
-    });
-    syncActiveClusterState();
+    syncSidebarSelectionState();
+    if (convo.UnreadCount === 0 && !$searchInput.value.trim()) {
+      renderConversations(allConversations);
+    }
 
     // Show chat UI
     $emptyState.style.display = 'none';
@@ -5078,6 +6230,7 @@ body::after {
       name: convo.Name,
       numbers: conversationAvatarNumbers(convo),
       whatsAppConversationID: conversationAvatarWhatsAppConversationID(convo),
+      platforms: avatarPlatformsForConversation(convo),
       text: initials(convo.Name),
       background: avatarColor(convo.Name),
     });
@@ -5092,6 +6245,9 @@ body::after {
   // ─── Load Messages ───
   const MESSAGE_PAGE_SIZE = 100;
   const THREAD_BOTTOM_THRESHOLD_PX = 72;
+  const THREAD_RENDER_WINDOW_SIZE = 140;
+  const THREAD_RENDER_WINDOW_OVERSCAN = 40;
+  const THREAD_RENDER_WINDOW_STEP = 70;
   let loadedMessages = [];
   let loadedDrafts = [];
   let draftEdits = new Map();
@@ -5110,6 +6266,9 @@ body::after {
   let threadIgnoreScrollSyncUntil = 0;
   let threadScrollIntentUntil = 0;
   let threadPointerScrollActive = false;
+  let threadRenderWindowStart = 0;
+  let lastRenderedWindowStart = 0;
+  let lastRenderedWindowEnd = 0;
 
   function resetLoadedThreadState() {
     activeThreadToken += 1;
@@ -5137,6 +6296,9 @@ body::after {
     threadIgnoreScrollSyncUntil = 0;
     threadScrollIntentUntil = 0;
     threadPointerScrollActive = false;
+    threadRenderWindowStart = 0;
+    lastRenderedWindowStart = 0;
+    lastRenderedWindowEnd = 0;
     activeProtocolDetail = '';
     clearThreadFeedback();
   }
@@ -5231,6 +6393,80 @@ body::after {
     threadViewportResizeObserver.observe($messagesArea);
   }
 
+  function maxThreadRenderWindowStart() {
+    return Math.max(0, loadedMessages.length - THREAD_RENDER_WINDOW_SIZE);
+  }
+
+  function clampThreadRenderWindowStart(start) {
+    const numericStart = Number.isFinite(Number(start)) ? Number(start) : 0;
+    return Math.min(Math.max(0, Math.round(numericStart)), maxThreadRenderWindowStart());
+  }
+
+  function currentThreadRenderWindow() {
+    if (loadedMessages.length <= THREAD_RENDER_WINDOW_SIZE) {
+      threadRenderWindowStart = 0;
+    } else {
+      threadRenderWindowStart = clampThreadRenderWindowStart(threadRenderWindowStart);
+    }
+    const start = threadRenderWindowStart;
+    const end = loadedMessages.length <= THREAD_RENDER_WINDOW_SIZE
+      ? loadedMessages.length
+      : Math.min(loadedMessages.length, start + THREAD_RENDER_WINDOW_SIZE);
+    return {
+      start,
+      end,
+      messages: loadedMessages.slice(start, end),
+    };
+  }
+
+  function moveThreadRenderWindowToBottom() {
+    threadRenderWindowStart = maxThreadRenderWindowStart();
+  }
+
+  function captureThreadViewportAnchor() {
+    if (!$messagesArea) return null;
+    const containerRect = $messagesArea.getBoundingClientRect();
+    const messages = Array.from($messagesArea.querySelectorAll('.msg[data-msg-id]'));
+    for (const el of messages) {
+      const rect = el.getBoundingClientRect();
+      if (rect.bottom >= containerRect.top) {
+        return {
+          messageID: el.dataset.msgId || '',
+          offsetTop: rect.top - containerRect.top,
+        };
+      }
+    }
+    return null;
+  }
+
+  function restoreThreadViewportAnchor(anchor) {
+    if (!anchor || !$messagesArea || !anchor.messageID) return false;
+    const el = Array.from($messagesArea.querySelectorAll('.msg[data-msg-id]'))
+      .find(candidate => (candidate.dataset.msgId || '') === anchor.messageID);
+    if (!el) return false;
+    const containerRect = $messagesArea.getBoundingClientRect();
+    const rect = el.getBoundingClientRect();
+    $messagesArea.scrollTop += (rect.top - containerRect.top) - anchor.offsetTop;
+    return true;
+  }
+
+  function shiftThreadRenderWindow(delta) {
+    if (loadedMessages.length <= THREAD_RENDER_WINDOW_SIZE) return false;
+    const previousStart = threadRenderWindowStart;
+    const nextStart = clampThreadRenderWindowStart(previousStart + delta);
+    if (nextStart === previousStart) return false;
+    const anchor = captureThreadViewportAnchor();
+    const previousScrollTop = $messagesArea.scrollTop;
+    const previousScrollHeight = $messagesArea.scrollHeight;
+    threadRenderWindowStart = nextStart;
+    renderLoadedMessages({
+      previousScrollTop,
+      previousScrollHeight,
+      preserveAnchor: anchor,
+    });
+    return true;
+  }
+
   function sortMessagesChronologically(msgs) {
     return msgs.sort((a, b) => {
       if (a.TimestampMS !== b.TimestampMS) return a.TimestampMS - b.TimestampMS;
@@ -5273,12 +6509,28 @@ body::after {
     newestLoadedID = loadedMessages.length ? String(loadedMessages[loadedMessages.length - 1].MessageID || '') : '';
   }
 
-  function threadSignature(msgs, drafts) {
-    const tail = msgs.slice(-25).map(m =>
-      [m.MessageID, m.TimestampMS, m.Status || '', m.Reactions || '', m.ReplyToID || '', m.MediaID || '', m.Body || '', sourcePlatformOf(m)].join(':')
-    ).join('|');
-    const draftsSig = drafts.map(d => `${d.DraftID}:${d.Body}`).join('|');
-    return `${msgs.length}::${tail}::${draftsSig}`;
+  function messageRenderSignature(msg) {
+    if (!msg) return '';
+    return [
+      msg.MessageID || '',
+      Number(msg.TimestampMS || 0),
+      msg.Status || '',
+      msg.IsFromMe ? '1' : '0',
+      msg.SenderName || '',
+      msg.SenderNumber || '',
+      msg.Reactions || '',
+      msg.ReplyToID || '',
+      msg.MediaID || '',
+      msg.MimeType || '',
+      msg.Body || '',
+      sourcePlatformOf(msg),
+    ].join(':');
+  }
+
+  function threadSignature(msgs, drafts, windowStart = 0, windowEnd = msgs.length, loadedCount = msgs.length) {
+    const messagesSig = msgs.map(messageRenderSignature).join('|');
+    const draftsSig = drafts.map(d => `${d.DraftID}:${draftDisplayBody(d)}`).join('|');
+    return `${loadedCount}:${windowStart}:${windowEnd}::${messagesSig}::${draftsSig}`;
   }
 
   function captureDraftEdits() {
@@ -5317,12 +6569,48 @@ body::after {
     }
   }
 
-  function renderLoadedMessages({older = false, previousScrollTop = 0, previousScrollHeight = 0, stickToBottom = false} = {}) {
-    const msgs = loadedMessages;
+  function buildEmojiFullPanelHTML(messageId) {
+    let html = '<div class="emoji-search"><input type="text" placeholder="Search emoji..." oninput="filterEmojis(event, \'' + messageId + '\')"></div>';
+    html += `<div class="emoji-grid" id="emoji-grid-${messageId}">`;
+    EMOJI_CATEGORIES.forEach(cat => {
+      html += `<div class="emoji-cat-label">${cat.name}</div>`;
+      cat.emojis.forEach(e => {
+        html += `<button data-emoji="${e}" data-name="${escapeHtml(EN[e] || '')}" onclick="sendReactionFromGrid(this, '${messageId}')">${e}</button>`;
+      });
+    });
+    html += '</div>';
+    return html;
+  }
+
+  function ensureEmojiFullPanel(messageId) {
+    const panel = document.getElementById('emoji-full-' + messageId);
+    if (!panel) return null;
+    if (panel.dataset.hydrated === 'true') return panel;
+    panel.innerHTML = buildEmojiFullPanelHTML(messageId);
+    panel.dataset.hydrated = 'true';
+    return panel;
+  }
+
+  function autosizeDraftTextarea(ta) {
+    if (!ta) return;
+    ta.style.height = 'auto';
+    ta.style.height = Math.max(42, ta.scrollHeight) + 'px';
+  }
+
+  function renderLoadedMessages({older = false, previousScrollTop = 0, previousScrollHeight = 0, stickToBottom = false, preserveAnchor = null} = {}) {
+    const allMsgs = loadedMessages;
     const drafts = loadedDrafts;
-    const showMixedSourceChips = new Set(msgs.map(m => sourcePlatformOf(m))).size > 1;
+    if (stickToBottom) {
+      moveThreadRenderWindowToBottom();
+    }
+    const renderWindow = currentThreadRenderWindow();
+    const msgs = renderWindow.messages;
+    lastRenderedWindowStart = renderWindow.start;
+    lastRenderedWindowEnd = renderWindow.end;
+    const showMixedSourceChips = new Set(allMsgs.map(m => sourcePlatformOf(m))).size > 1;
     const canSendActiveRoute = conversationSupportsOutbound(activeConversation);
-    const sig = threadSignature(msgs, drafts);
+    const messagesByID = new Map(allMsgs.map(m => [String(m.MessageID || ''), m]));
+    const sig = threadSignature(msgs, drafts, renderWindow.start, renderWindow.end, allMsgs.length);
     if (!older && sig === lastThreadSignature) {
       if (stickToBottom) {
         scheduleThreadBottomScroll(true);
@@ -5333,15 +6621,18 @@ body::after {
 
     captureDraftEdits();
     $messagesArea.innerHTML = '';
+    const fragment = document.createDocumentFragment();
+    const draftTextareasToAutosize = [];
     let lastDate = 0;
 
     msgs.forEach((m, mi) => {
+        const absoluteMessageIndex = renderWindow.start + mi;
         // Date divider
         if (!isSameDay(m.TimestampMS, lastDate)) {
           const divider = document.createElement('div');
           divider.className = 'date-divider';
           divider.textContent = formatDateDivider(m.TimestampMS);
-          $messagesArea.appendChild(divider);
+          fragment.appendChild(divider);
           lastDate = m.TimestampMS;
         }
 
@@ -5356,7 +6647,7 @@ body::after {
             sysText = '💬 ' + sysText;
           }
           sysEl.textContent = sysText;
-          $messagesArea.appendChild(sysEl);
+          fragment.appendChild(sysEl);
           return;
         }
 
@@ -5367,7 +6658,7 @@ body::after {
 
         // Reply banner
         if (m.ReplyToID) {
-          const original = msgs.find(om => om.MessageID === m.ReplyToID);
+          const original = messagesByID.get(String(m.ReplyToID || ''));
           const origName = original ? (original.SenderName || 'You') : '';
           const origBody = original ? (original.Body || 'Media') : 'Original message';
           const truncBody = origBody.length > 60 ? origBody.substring(0, 60) + '\u2026' : origBody;
@@ -5392,7 +6683,7 @@ body::after {
           if (hasMediaID && isImage) {
             html += `<div class="msg-media">`;
             html += `<div class="msg-media-loading" data-msg-id="${escapeHtml(m.MessageID)}"><div class="spinner"></div>Loading image...</div>`;
-            html += `<img src="${mediaSrc}" alt="Image" style="display:none" onload="this.style.display='block';this.previousElementSibling.remove();" onerror="var ldr=this.previousElementSibling;if(ldr){ldr.innerHTML='Image not available';}" onclick="showFullscreen(this.src,'image')">`;
+            html += `<img src="${mediaSrc}" alt="Image" loading="lazy" decoding="async" onload="this.previousElementSibling.remove();" onerror="var ldr=this.previousElementSibling;if(ldr){ldr.innerHTML='Image not available';}" onclick="showFullscreen(this.src,'image')">`;
             html += `</div>`;
           } else if (hasMediaID && isAudio) {
             html += `<div class="msg-media">`;
@@ -5404,7 +6695,7 @@ body::after {
           } else if (hasMediaID && isVideo) {
             html += `<div class="msg-media">`;
             html += `<div class="msg-media-loading" data-msg-id="${escapeHtml(m.MessageID)}"><div class="spinner"></div>Loading video...</div>`;
-            html += `<video src="${mediaSrc}" preload="metadata" controls playsinline style="display:none" onloadeddata="this.style.display='block';this.previousElementSibling.remove();" onerror="var ldr=this.previousElementSibling;if(ldr){ldr.innerHTML='Video not available';}" onclick="event.stopPropagation()"></video>`;
+            html += `<video src="${mediaSrc}" preload="none" controls playsinline style="display:none" onloadeddata="this.style.display='block';this.previousElementSibling.remove();" onerror="var ldr=this.previousElementSibling;if(ldr){ldr.innerHTML='Video not available';}" onclick="event.stopPropagation()"></video>`;
             html += `</div>`;
           } else if (!hasMediaID && (isImage || isAudio || isVideo)) {
             const icon = isImage ? '\uD83D\uDDBC\uFE0F' : (isAudio ? '\uD83C\uDFA4' : '\uD83C\uDFA5');
@@ -5463,17 +6754,8 @@ body::after {
         html += `<button class="emoji-plus" data-msg-id="${m.MessageID}" onclick="toggleFullEmojiPanel(event, '${m.MessageID}')">+</button>`;
         html += '</div>';
 
-        // Full emoji panel (hidden, toggled by "+" button)
-        html += `<div class="emoji-full-panel" id="emoji-full-${m.MessageID}">`;
-        html += `<div class="emoji-search"><input type="text" placeholder="Search emoji..." oninput="filterEmojis(event, '${m.MessageID}')"></div>`;
-        html += `<div class="emoji-grid" id="emoji-grid-${m.MessageID}">`;
-        EMOJI_CATEGORIES.forEach(cat => {
-          html += `<div class="emoji-cat-label">${cat.name}</div>`;
-          cat.emojis.forEach(e => {
-            html += `<button data-emoji="${e}" data-name="${EN[e]||''}" onclick="sendReactionFromGrid(this, '${m.MessageID}')">${e}</button>`;
-          });
-        });
-        html += '</div></div>';
+        // Full emoji panel is hydrated on demand instead of for every message upfront.
+        html += `<div class="emoji-full-panel" id="emoji-full-${m.MessageID}"></div>`;
 
         el.innerHTML = html;
         el.dataset.msgId = m.MessageID;
@@ -5492,10 +6774,14 @@ body::after {
           setReplyTo(m);
         });
 
+        el.addEventListener('contextmenu', (event) => {
+          openContextMenu(event, messageContextMenuItems(m), { type: 'message', message: m });
+        });
+
         // In group chats, wrap received messages with an avatar
         if (activeConvoIsGroup && !m.IsFromMe && m.SenderName) {
           // Show avatar only for the last message in a consecutive run from the same sender
-          const nextMsg = msgs[mi + 1];
+          const nextMsg = allMsgs[absoluteMessageIndex + 1];
           const isLastFromSender = !nextMsg || nextMsg.IsFromMe || nextMsg.SenderName !== m.SenderName ||
             (nextMsg.Status || '').startsWith('TOMBSTONE_') || !isSameDay(m.TimestampMS, nextMsg.TimestampMS);
 
@@ -5512,9 +6798,9 @@ body::after {
           });
           row.appendChild(avatarDiv);
           row.appendChild(el);
-          $messagesArea.appendChild(row);
+          fragment.appendChild(row);
         } else {
-          $messagesArea.appendChild(el);
+          fragment.appendChild(el);
         }
       });
 
@@ -5531,21 +6817,22 @@ body::after {
             <button class="draft-send-btn" onclick="sendDraft('${escapeHtml(draft.DraftID)}', this)" ${canSendActiveRoute ? '' : `disabled title="${escapeHtml(routeUnavailableMessage('send drafts', activeConversation))}"`}>Send</button>
           </div>
         `;
-        $messagesArea.appendChild(draftEl);
+        fragment.appendChild(draftEl);
         const ta = draftEl.querySelector('textarea');
         ta.value = draftDisplayBody(draft);
-        ta.style.height = 'auto';
-        ta.style.height = ta.scrollHeight + 'px';
+        draftTextareasToAutosize.push(ta);
         ta.addEventListener('input', () => {
           draftEdits.set(String(draft.DraftID || ''), ta.value);
-          ta.style.height = 'auto';
-          ta.style.height = ta.scrollHeight + 'px';
+          autosizeDraftTextarea(ta);
         });
       });
 
+      $messagesArea.appendChild(fragment);
+      draftTextareasToAutosize.forEach(autosizeDraftTextarea);
+
       // Update protocol indicator in header from most recent tombstone
       // msgs are in chronological order (oldest first), so findLast gets the latest
-      const lastTombstone = msgs.findLast(m => (m.Status || '').startsWith('TOMBSTONE_'));
+      const lastTombstone = allMsgs.findLast(m => (m.Status || '').startsWith('TOMBSTONE_'));
       let protocolDetail = '';
       if (lastTombstone) {
         if (lastTombstone.Status.includes('RCS')) {
@@ -5560,7 +6847,9 @@ body::after {
       observeThreadContentResize();
       observeThreadViewportResize();
 
-    if (older) {
+    if (preserveAnchor && restoreThreadViewportAnchor(preserveAnchor)) {
+      syncThreadBottomFollowState();
+    } else if (older) {
       $messagesArea.scrollTop = $messagesArea.scrollHeight - previousScrollHeight + previousScrollTop;
       syncThreadBottomFollowState();
     } else if (stickToBottom) {
@@ -5584,13 +6873,15 @@ body::after {
     const threadToken = activeThreadToken;
     const previousScrollTop = $messagesArea.scrollTop;
     const previousScrollHeight = $messagesArea.scrollHeight;
+    const previousAnchor = older ? captureThreadViewportAnchor() : null;
+    const previousWindowStart = threadRenderWindowStart;
     const wasNearBottom = !older && (threadShouldFollowBottom || isThreadNearBottom());
 
     if (older) loadingOlderMessages = true;
 
     try {
     if (reset) {
-        const msgs = await fetchJSON(`/api/conversations/${convoId}/messages?limit=${MESSAGE_PAGE_SIZE}`);
+        const msgs = await fetchJSON(`/api/conversations/${encodeURIComponent(convoId)}/messages?limit=${MESSAGE_PAGE_SIZE}`);
         msgs.reverse();
         if (threadToken !== activeThreadToken || activeConvoId !== convoId) return;
         loadedMessages = msgs;
@@ -5607,13 +6898,18 @@ body::after {
         if (oldestLoadedID) {
           olderParams.set('before_id', oldestLoadedID);
         }
-        const olderMsgs = await fetchJSON(`/api/conversations/${convoId}/messages?${olderParams.toString()}`);
+        const olderMsgs = await fetchJSON(`/api/conversations/${encodeURIComponent(convoId)}/messages?${olderParams.toString()}`);
         olderMsgs.reverse();
         if (threadToken !== activeThreadToken || activeConvoId !== convoId) return;
         loadedMessages = mergeMessages(olderMsgs, loadedMessages);
+        if (olderMsgs.length > 0) {
+          threadRenderWindowStart = clampThreadRenderWindowStart(
+            previousWindowStart + Math.max(0, olderMsgs.length - THREAD_RENDER_WINDOW_OVERSCAN)
+          );
+        }
         hasOlderMessages = olderMsgs.length === MESSAGE_PAGE_SIZE;
       } else {
-        const latestMsgs = await fetchJSON(`/api/conversations/${convoId}/messages?limit=${MESSAGE_PAGE_SIZE}`);
+        const latestMsgs = await fetchJSON(`/api/conversations/${encodeURIComponent(convoId)}/messages?limit=${MESSAGE_PAGE_SIZE}`);
         latestMsgs.reverse();
         if (threadToken !== activeThreadToken || activeConvoId !== convoId) return;
         loadedMessages = mergeMessages(pruneMissingLatestTempMessages(loadedMessages, latestMsgs), latestMsgs);
@@ -5633,7 +6929,8 @@ body::after {
         older,
         previousScrollTop,
         previousScrollHeight,
-        stickToBottom: shouldStickToBottom
+        stickToBottom: shouldStickToBottom,
+        preserveAnchor: previousAnchor,
       });
     } catch (err) {
       console.error('Failed to load messages:', err);
@@ -5646,9 +6943,16 @@ body::after {
     if (hasThreadUserScrollIntent() && !shouldIgnoreThreadScrollSync()) {
       syncThreadBottomFollowState();
     }
-    if (!activeConvoId || loadingOlderMessages || !hasOlderMessages) return;
+    if (!activeConvoId || loadingOlderMessages) return;
     if ($messagesArea.scrollTop < 120) {
-      loadMessages(activeConvoId, {older: true});
+      if (shiftThreadRenderWindow(-THREAD_RENDER_WINDOW_STEP)) return;
+      if (hasOlderMessages) {
+        loadMessages(activeConvoId, {older: true});
+      }
+      return;
+    }
+    if (threadDistanceFromBottom() < 120 && lastRenderedWindowEnd < loadedMessages.length) {
+      shiftThreadRenderWindow(THREAD_RENDER_WINDOW_STEP);
     }
   });
 
@@ -5764,10 +7068,10 @@ body::after {
         const form = new FormData();
         form.append('conversation_id', activeConvoId);
         form.append('file', pendingFile.file);
-        if (activePlatform === 'whatsapp' && replyToMsg) {
+        if ((activePlatform === 'whatsapp' || activePlatform === 'signal') && replyToMsg) {
           form.append('reply_to_id', replyToMsg.MessageID);
         }
-        if (sendsCaptionedWhatsAppMedia && text) {
+        if ((sendsCaptionedWhatsAppMedia || activePlatform === 'signal') && text) {
           form.append('caption', text);
         }
         const resp = await fetch('/api/send-media', { method: 'POST', body: form });
@@ -5939,8 +7243,8 @@ body::after {
       $connectionBannerAction.style.display = '';
     } else {
       $connectionBannerCopy.textContent = 'Pair Google Messages to start SMS and RCS sync';
-      $connectionBannerAction.textContent = 'Connections';
-      $connectionBannerAction.dataset.action = 'open-connections';
+      $connectionBannerAction.textContent = 'Platforms';
+      $connectionBannerAction.dataset.action = 'open-platforms';
       $connectionBannerAction.style.display = '';
     }
   }
@@ -5960,10 +7264,61 @@ body::after {
     };
   }
 
+  function normalizeSignalHistorySync(raw = {}) {
+    return {
+      running: !!raw.running,
+      started_at: Number(raw.started_at || 0),
+      completed_at: Number(raw.completed_at || 0),
+      imported_conversations: Number(raw.imported_conversations || 0),
+      imported_messages: Number(raw.imported_messages || 0),
+    };
+  }
+
+  function normalizeSignalStatus(raw = {}) {
+    return {
+      connected: !!raw.connected,
+      connecting: !!raw.connecting,
+      paired: !!raw.paired,
+      pairing: !!raw.pairing,
+      qr_available: !!raw.qr_available,
+      qr_updated_at: Number(raw.qr_updated_at || 0),
+      account: raw.account || '',
+      last_error: raw.last_error || '',
+      history_sync: normalizeSignalHistorySync(raw.history_sync || {}),
+    };
+  }
+
+  function normalizeBackfillStatus(raw = {}) {
+    return {
+      running: !!raw.running,
+      phase: raw.phase || '',
+      folders_scanned: Number(raw.folders_scanned || 0),
+      conversations_found: Number(raw.conversations_found || 0),
+      messages_found: Number(raw.messages_found || 0),
+      contacts_checked: Number(raw.contacts_checked || 0),
+      errors: Number(raw.errors || 0),
+    };
+  }
+
+  function formatBackfillSummary(status = backfillStatus) {
+    if (!status.running) {
+      return 'Fetch older SMS and RCS threads from your Android phone when you need them.';
+    }
+    const parts = [];
+    if (status.phase) parts.push(`phase: ${status.phase}`);
+    if (status.folders_scanned > 0) parts.push(`${status.folders_scanned} folders`);
+    if (status.conversations_found > 0) parts.push(`${status.conversations_found} conversations`);
+    if (status.messages_found > 0) parts.push(`${status.messages_found} messages`);
+    if (status.errors > 0) parts.push(`${status.errors} errors`);
+    return `History sync running${parts.length ? ' • ' + parts.join(' • ') : '…'}`;
+  }
+
   function applyAppStatus(status = {}) {
     appStatus = status || {};
     googleStatus = normalizeGoogleStatus(appStatus.google || { connected: !!appStatus.connected });
     whatsAppStatus = normalizeWhatsAppStatus(appStatus.whatsapp || {});
+    signalStatus = normalizeSignalStatus(appStatus.signal || {});
+    backfillStatus = normalizeBackfillStatus(appStatus.backfill || {});
     setConnectionState();
     renderWhatsAppButton();
     renderEmptyState();
@@ -5992,17 +7347,21 @@ body::after {
 
     const noConversations = allConversations.length === 0;
     let title = 'No conversations yet';
-    let copy = '';
+    let copy = 'Start a new conversation or wait for your linked platforms to finish syncing recent history.';
     let notes = [];
     let action = 'new';
-    let cta = 'Start New Thread';
+    let cta = 'New message';
 
-    if (!googleStatus.paired && !whatsAppStatus.paired && !whatsAppStatus.connected) {
-      title = 'Pair a transport to get started';
-      copy = 'Connect Google Messages or WhatsApp to start syncing.';
-      notes = [];
-      action = 'open-connections';
-      cta = 'Open Connections';
+    if (!googleStatus.paired && !whatsAppStatus.paired && !whatsAppStatus.connected && !signalStatus.paired && !signalStatus.connected) {
+      title = 'Add your first platform';
+      copy = 'Pair the services you want in one local inbox, then messages and routes will appear here automatically.';
+      notes = [
+        'Google Messages for SMS and RCS',
+        'WhatsApp for live linked-device sync',
+        'Signal for private text sync',
+      ];
+      action = 'open-platforms';
+      cta = 'Add platform';
     } else if (!googleStatus.connected && googleStatus.paired && !googleStatus.needs_pairing) {
       title = noConversations ? 'Reconnect Google Messages' : 'Live sync is paused';
       copy = 'New messages will not arrive until Google Messages reconnects.';
@@ -6032,12 +7391,49 @@ body::after {
     showWhatsAppError('');
   }
 
+  function showSignalError(message) {
+    if (!$signalError) return;
+    $signalError.textContent = message || '';
+    $signalError.style.display = message ? 'block' : 'none';
+  }
+
+  function clearSignalError() {
+    showSignalError('');
+  }
+
   function whatsappStatusText() {
     if (whatsAppStatus.connected) return 'Connected';
     if (whatsAppStatus.connecting) return 'Connecting';
     if (whatsAppStatus.pairing) return 'Awaiting scan';
     if (whatsAppStatus.paired) return 'Paired';
     return 'Not paired';
+  }
+
+  function signalStatusText() {
+    if (signalStatus.history_sync?.running) return 'Importing history';
+    if (signalStatus.connected) return 'Connected';
+    if (signalStatus.connecting) return 'Connecting';
+    if (signalStatus.pairing) return 'Awaiting scan';
+    if (signalStatus.paired) return 'Paired';
+    return 'Not paired';
+  }
+
+  function formatSignalHistorySummary(sync = signalStatus.history_sync || {}) {
+    const chats = Number(sync.imported_conversations || 0);
+    const messages = Number(sync.imported_messages || 0);
+    if (sync.running) {
+      if (chats > 0 || messages > 0) {
+        return `Importing history • ${chats} chats • ${messages} messages so far.`;
+      }
+      return 'Importing history from Signal. Keep your phone nearby while the linked-device transfer runs.';
+    }
+    if (sync.completed_at) {
+      if (chats > 0 || messages > 0) {
+        return `History import complete • ${chats} chats • ${messages} messages imported during pairing.`;
+      }
+      return 'Signal pairing finished, but no older history arrived. If you expected existing chats, Reset Signal and pair again, then choose Transfer Message History on your phone.';
+    }
+    return '';
   }
 
   function renderWhatsAppOverlay() {
@@ -6059,12 +7455,31 @@ body::after {
       $gmActionsRow.style.display = '';
       $gmReconnectBtn.disabled = false;
       $gmReconnectBtn.textContent = 'Reconnect Google Messages';
+      $gmReconnectBtn.dataset.mode = 'reconnect';
     } else {
+      const canOpenNativePairing = !!nativeAppBridge();
       $gmHelper.textContent = googleStatus.last_error
-        ? 'Google Messages needs to be paired again. Open the macOS pairing screen or run openmessage pair to reconnect.'
-        : 'Google Messages is not paired yet. In the macOS app, restart to see the pairing screen. From the CLI, run openmessage pair.';
+        ? (canOpenNativePairing
+          ? 'Google Messages needs to be paired again. Open the native pairing flow to reconnect your Android phone.'
+          : 'Google Messages needs to be paired again. Use the button below to copy the pair command, then run it in Terminal.')
+        : (canOpenNativePairing
+          ? 'Pair your Android phone with Google Messages to bring SMS and RCS into OpenMessage.'
+          : 'Pair Google Messages from Terminal, then return here once your phone is linked.');
       showGoogleError(googleStatus.last_error);
-      $gmActionsRow.style.display = 'none';
+      $gmActionsRow.style.display = '';
+      $gmReconnectBtn.disabled = false;
+      $gmReconnectBtn.textContent = canOpenNativePairing ? 'Open Google pairing' : 'Copy pair command';
+      $gmReconnectBtn.dataset.mode = 'pair';
+    }
+    const googleCanBackfill = googleStatus.connected;
+    if ($gmHistoryBtn) {
+      $gmHistoryBtn.style.display = googleCanBackfill ? '' : 'none';
+      $gmHistoryBtn.disabled = !googleCanBackfill || backfillStatus.running;
+      $gmHistoryBtn.textContent = backfillStatus.running ? 'Syncing history…' : 'Sync history';
+    }
+    if ($gmBackfillNote) {
+      $gmBackfillNote.textContent = googleCanBackfill ? formatBackfillSummary() : '';
+      $gmBackfillNote.style.display = $gmBackfillNote.textContent ? 'block' : 'none';
     }
 
     const statusText = whatsappStatusText();
@@ -6105,6 +7520,60 @@ body::after {
     if (whatsAppStatus.last_error && !whatsAppStatus.pairing) {
       showWhatsAppError(whatsAppStatus.last_error);
     }
+
+    const signalText = signalStatusText();
+    $signalStatusPill.textContent = signalText;
+    $signalStatusPill.className = 'wa-state-pill';
+    if (signalStatus.connected) {
+      $signalStatusPill.classList.add('connected');
+    } else if (signalStatus.last_error) {
+      $signalStatusPill.classList.add('error');
+    }
+
+    const signalHistorySummary = formatSignalHistorySummary();
+    if (signalStatus.connected && signalStatus.history_sync?.running) {
+      const identity = signalStatus.account || 'your paired Signal account';
+      $signalHelper.textContent = `Live sync is active for ${identity}. Signal is still importing older history in the background.`;
+    } else if (signalStatus.connected) {
+      const identity = signalStatus.account || 'your paired Signal account';
+      $signalHelper.textContent = `Live sync is active for ${identity}. Incoming Signal messages and text replies should now flow through OpenMessage immediately.`;
+    } else if (signalStatus.connecting) {
+      const identity = signalStatus.account || 'your paired Signal account';
+      $signalHelper.textContent = `Reconnecting live sync for ${identity}. This should usually complete automatically in a few seconds after launch.`;
+    } else if (signalStatus.pairing) {
+      $signalHelper.textContent = 'Scan the QR code below from Signal on your phone: Settings -> Linked devices -> Link New Device. If Signal offers Transfer Message History, choose it to bring existing chats into OpenMessage.';
+    } else if (signalStatus.paired) {
+      $signalHelper.textContent = 'This Signal account is already paired locally. Reconnect to resume live Signal sync.';
+    } else {
+      $signalHelper.textContent = 'Link Signal as a companion device for live Signal sync and replies inside OpenMessage. Choose Transfer Message History on your phone during pairing if you want existing chats imported.';
+    }
+    if ($signalHistoryNote) {
+      if (signalHistorySummary) {
+        $signalHistoryNote.textContent = signalHistorySummary;
+      } else if (signalStatus.pairing) {
+        $signalHistoryNote.textContent = 'Signal history transfer happens during pairing. After you scan, choose Transfer Message History on your phone. Initial import can take a while.';
+      } else if (signalStatus.paired || signalStatus.connected || signalStatus.connecting) {
+        $signalHistoryNote.textContent = 'Signal history transfer only happens during pairing. If you skipped it, use Reset Signal and pair again, then choose Transfer Message History on your phone.';
+      } else {
+        $signalHistoryNote.textContent = 'To import existing Signal chats, choose Transfer Message History on your phone while pairing. If you skip it, you can Reset Signal and pair again later.';
+      }
+    }
+
+    $signalConnectBtn.disabled = signalStatus.connected || signalStatus.pairing;
+    $signalConnectBtn.textContent = signalStatus.connected
+      ? 'Signal Connected'
+      : (signalStatus.paired ? 'Reconnect Signal' : 'Connect Signal');
+
+    const showSignalQR = signalStatus.qr_available;
+    $signalQRCodeCard.classList.toggle('active', showSignalQR);
+    if (!showSignalQR) {
+      $signalQRCodeImage.removeAttribute('src');
+      $signalQRCodeCaption.textContent = '';
+    }
+
+    if (signalStatus.last_error && !signalStatus.pairing) {
+      showSignalError(signalStatus.last_error);
+    }
   }
 
   function stopWhatsAppPolling() {
@@ -6118,7 +7587,14 @@ body::after {
     if (whatsAppPollTimer) return;
     whatsAppPollTimer = setInterval(() => {
       refreshWhatsAppStatus().catch(err => console.error('Failed to refresh WhatsApp status:', err));
+      refreshSignalStatus().catch(err => console.error('Failed to refresh Signal status:', err));
+      refreshBackfillStatus().catch(err => console.error('Failed to refresh backfill status:', err));
     }, 2500);
+  }
+
+  async function refreshBackfillStatus() {
+    const status = await fetchJSON('/api/backfill/status');
+    applyAppStatus({ ...appStatus, backfill: status || {} });
   }
 
   async function refreshWhatsAppQRCode() {
@@ -6153,9 +7629,12 @@ body::after {
   async function openWhatsAppOverlay() {
     if (!$waOverlay) return;
     clearWhatsAppError();
+    clearSignalError();
     $waOverlay.classList.add('show');
     renderWhatsAppOverlay();
+    await refreshBackfillStatus().catch(() => {});
     await refreshWhatsAppStatus();
+    await refreshSignalStatus();
     startWhatsAppPolling();
   }
 
@@ -6164,6 +7643,7 @@ body::after {
     $waOverlay.classList.remove('show');
     stopWhatsAppPolling();
     clearWhatsAppError();
+    clearSignalError();
   }
 
   async function connectWhatsAppBridge() {
@@ -6190,6 +7670,56 @@ body::after {
     }
   }
 
+  async function refreshSignalQRCode() {
+    if (!$waOverlay.classList.contains('show') || !signalStatus.qr_available) return;
+    try {
+      const qrPayload = await fetchJSON('/api/signal/qr');
+      if (qrPayload.png_data_url) {
+        $signalQRCodeImage.src = qrPayload.png_data_url;
+      }
+      $signalQRCodeCaption.textContent = 'This QR code refreshes automatically while pairing is active.';
+    } catch (err) {
+      $signalQRCodeCard.classList.remove('active');
+      $signalQRCodeImage.removeAttribute('src');
+      $signalQRCodeCaption.textContent = '';
+      if (signalStatus.pairing) {
+        showSignalError(err.message || 'Failed to load Signal QR code');
+      }
+    }
+  }
+
+  async function refreshSignalStatus() {
+    const status = await fetchJSON('/api/signal/status');
+    applyAppStatus({ ...appStatus, signal: status });
+    if (signalStatus.qr_available) {
+      await refreshSignalQRCode();
+    }
+  }
+
+  async function connectSignalBridge() {
+    clearSignalError();
+    try {
+      const status = await postJSON('/api/signal/connect', {});
+      applyAppStatus({ ...appStatus, signal: status || {} });
+      if (signalStatus.qr_available) {
+        await refreshSignalQRCode();
+      }
+    } catch (err) {
+      showSignalError(err.message || 'Failed to start Signal pairing');
+    }
+  }
+
+  async function resetSignalBridge() {
+    clearSignalError();
+    if (!window.confirm('Reset the local Signal pairing for OpenMessage?')) return;
+    try {
+      const status = await postJSON('/api/signal/unpair', {});
+      applyAppStatus({ ...appStatus, signal: status || {} });
+    } catch (err) {
+      showSignalError(err.message || 'Failed to reset Signal pairing');
+    }
+  }
+
   async function reconnectGoogleMessages() {
     showGoogleError('');
     $gmReconnectBtn.disabled = true;
@@ -6205,6 +7735,33 @@ body::after {
         renderWhatsAppOverlay();
       }
     }
+  }
+
+  async function startGoogleHistorySync() {
+    showGoogleError('');
+    if ($gmHistoryBtn) {
+      $gmHistoryBtn.disabled = true;
+      $gmHistoryBtn.textContent = 'Syncing history…';
+    }
+    try {
+      await postJSON('/api/backfill', {});
+      await refreshBackfillStatus().catch(() => {});
+      showThreadFeedback('Google Messages history sync started.');
+    } catch (err) {
+      showGoogleError(err.message || 'Failed to start history sync');
+    } finally {
+      if ($waOverlay.classList.contains('show')) {
+        renderWhatsAppOverlay();
+      }
+    }
+  }
+
+  async function handleGooglePlatformAction() {
+    if (($gmReconnectBtn.dataset.mode || '') === 'pair') {
+      await launchGooglePairing();
+      return;
+    }
+    await reconnectGoogleMessages();
   }
 
   async function fetchDiagnostics() {
@@ -6448,7 +8005,7 @@ body::after {
     // Close the quick picker
     document.querySelectorAll('.emoji-picker.show').forEach(p => p.classList.remove('show'));
     // Toggle the full panel
-    const panel = document.getElementById('emoji-full-' + messageId);
+    const panel = ensureEmojiFullPanel(messageId);
     if (panel) {
       // Close any other open panels first
       document.querySelectorAll('.emoji-full-panel.show').forEach(p => {
@@ -6506,7 +8063,80 @@ body::after {
       document.querySelectorAll('.emoji-picker.show').forEach(p => p.classList.remove('show'));
       document.querySelectorAll('.emoji-full-panel.show').forEach(p => p.classList.remove('show'));
     }
+    if ($contextMenu && !$contextMenu.hidden && !e.target.closest('.context-menu') && !e.target.closest('.chat-header-action-btn')) {
+      closeContextMenu();
+    }
   });
+
+  if ($contextMenu) {
+    $contextMenu.addEventListener('click', async (event) => {
+      const button = event.target.closest('.context-menu-item');
+      if (!button || button.disabled || !contextMenuState) return;
+      const action = button.dataset.action || '';
+      const context = contextMenuState.context || {};
+      closeContextMenu();
+      try {
+        if (context.type === 'conversation' && context.conversation) {
+          if (action === 'open-thread') {
+            await revealAndSelectConversation(context.conversation);
+            return;
+          }
+          if (action === 'leave-whatsapp-group') {
+            await leaveWhatsAppGroup(context.conversation);
+            return;
+          }
+          if (action === 'copy-number') {
+            const identity = conversationPersonIdentity(context.conversation);
+            if (identity && identity.number) {
+              await copyTextToClipboard(identity.number);
+              showThreadFeedback('Phone number copied.');
+            }
+            return;
+          }
+          if (action.startsWith('notification:')) {
+            const mode = action.split(':')[1] || NOTIFICATION_MODE_ALL;
+            await setConversationNotificationMode(context.conversation, mode);
+            showThreadFeedback(`Notifications set to ${notificationModeLabel(mode).toLowerCase()}.`);
+            return;
+          }
+        }
+        if (context.type === 'message' && context.message) {
+          const message = context.message;
+          const urls = extractMessageURLs(message.Body || '');
+          if (action === 'reply-message') {
+            setReplyTo(message);
+            return;
+          }
+          if (action === 'copy-message') {
+            await copyTextToClipboard(message.Body || '');
+            showThreadFeedback('Message copied.');
+            return;
+          }
+          if (action === 'open-link' && urls[0]) {
+            window.open(urls[0], '_blank', 'noopener');
+            return;
+          }
+          if (action === 'copy-link' && urls[0]) {
+            await copyTextToClipboard(urls[0]);
+            showThreadFeedback('Link copied.');
+            return;
+          }
+        }
+      } catch (err) {
+        console.error('Context menu action failed:', err);
+        showThreadFeedback(err.message || 'Action failed.');
+      }
+    });
+  }
+
+  window.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape') {
+      closeContextMenu();
+    }
+  });
+
+  window.addEventListener('blur', closeContextMenu);
+  window.addEventListener('resize', closeContextMenu);
 
   // ─── Reply ───
   function setReplyTo(msg) {
@@ -6590,7 +8220,7 @@ body::after {
     clearTimeout(threadRefreshTimer);
     threadRefreshTimer = null;
     document.querySelectorAll('.convo-item').forEach(el => el.classList.remove('active'));
-    syncActiveClusterState();
+    syncSidebarSelectionState();
     $emptyState.style.display = '';
     $chatHeader.style.display = 'none';
     $messagesArea.style.display = 'none';
@@ -6678,10 +8308,10 @@ body::after {
       return;
     }
 
-    // ── Cmd/Ctrl+, : Open connections (works everywhere) ──
+    // ── Cmd/Ctrl+, : Open platforms (works everywhere) ──
     if (mod && e.key === ',') {
       e.preventDefault();
-      openWhatsAppOverlay().catch(err => showWhatsAppError(err.message || 'Failed to load connections'));
+      openWhatsAppOverlay().catch(err => showWhatsAppError(err.message || 'Failed to load platforms'));
       return;
     }
 
@@ -6768,6 +8398,7 @@ body::after {
   async function handleLaunchAction(action) {
     switch (action) {
       case 'open-connections':
+      case 'open-platforms':
         await openWhatsAppOverlay();
         return;
       case 'reconnect-google':
@@ -6826,11 +8457,14 @@ body::after {
   if ($waClose) $waClose.addEventListener('click', closeWhatsAppOverlay);
   if ($waConnectBtn) $waConnectBtn.addEventListener('click', () => { connectWhatsAppBridge().catch(err => showWhatsAppError(err.message || 'Failed to connect WhatsApp')); });
   if ($waResetBtn) $waResetBtn.addEventListener('click', () => { resetWhatsAppBridge().catch(err => showWhatsAppError(err.message || 'Failed to reset WhatsApp')); });
-  if ($newMsgConnections) $newMsgConnections.addEventListener('click', () => {
-    closeNewMsg();
-    openWhatsAppOverlay().catch(err => showWhatsAppError(err.message || 'Failed to load connections'));
+  if ($signalConnectBtn) $signalConnectBtn.addEventListener('click', () => { connectSignalBridge().catch(err => showSignalError(err.message || 'Failed to connect Signal')); });
+  if ($signalResetBtn) $signalResetBtn.addEventListener('click', () => { resetSignalBridge().catch(err => showSignalError(err.message || 'Failed to reset Signal')); });
+  if ($gmReconnectBtn) $gmReconnectBtn.addEventListener('click', () => {
+    handleGooglePlatformAction().catch(err => showGoogleError(err.message || 'Failed to update Google Messages'));
   });
-  if ($gmReconnectBtn) $gmReconnectBtn.addEventListener('click', () => { reconnectGoogleMessages().catch(err => showGoogleError(err.message || 'Failed to reconnect Google Messages')); });
+  if ($gmHistoryBtn) $gmHistoryBtn.addEventListener('click', () => {
+    startGoogleHistorySync().catch(err => showGoogleError(err.message || 'Failed to start history sync'));
+  });
   if ($copyDiagnosticsBtn) $copyDiagnosticsBtn.addEventListener('click', () => { copyDiagnostics().catch(err => showThreadFeedback(err.message || 'Failed to copy diagnostics')); });
   if ($downloadDiagnosticsBtn) $downloadDiagnosticsBtn.addEventListener('click', () => { downloadDiagnostics().catch(err => showThreadFeedback(err.message || 'Failed to export diagnostics')); });
   if ($reportIssueBtn) $reportIssueBtn.addEventListener('click', () => { reportIssue().catch(err => showThreadFeedback(err.message || 'Failed to prepare issue report')); });
@@ -6859,6 +8493,35 @@ body::after {
       closeWhatsAppOverlay();
     }
   });
+
+  if (navigator.webdriver) {
+    window.__openMessageTestHooks = {
+      updateLoadedMessage(messageID, patch = {}) {
+        const target = loadedMessages.find((msg) => String(msg.MessageID || '') === String(messageID || ''));
+        if (!target) return false;
+        Object.assign(target, patch || {});
+        return true;
+      },
+      renderLoadedMessages(options = {}) {
+        renderLoadedMessages(options || {});
+      },
+      installAvatarFetchOverride(fn) {
+        fetchAvatarImage = fn;
+      },
+      renderAvatarElement(el, options = {}) {
+        renderAvatarElement(el, options);
+      },
+      threadRenderStats() {
+        return {
+          loadedMessages: loadedMessages.length,
+          renderedMessages: $messagesArea ? $messagesArea.querySelectorAll('.msg').length : 0,
+          windowStart: lastRenderedWindowStart,
+          windowEnd: lastRenderedWindowEnd,
+          windowSize: THREAD_RENDER_WINDOW_SIZE,
+        };
+      },
+    };
+  }
 
   // ─── Init ───
   syncNotificationButton();

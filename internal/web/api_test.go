@@ -1241,16 +1241,47 @@ func TestGetStatusIncludesGoogleSnapshot(t *testing.T) {
 	}
 }
 
-func TestDiagnosticsEndpointIncludesCountsAndStatus(t *testing.T) {
+func TestDiagnosticsEndpointIncludesCountsStatusAndReleaseSnapshot(t *testing.T) {
 	ts := newTestServerWithOptions(t, APIOptions{
+		IdentityName: "Max",
+		IsConnected: func() bool {
+			return true
+		},
 		GoogleStatus: func() any {
 			return map[string]any{"connected": true, "paired": true, "needs_pairing": false}
+		},
+		ReconnectGoogle: func() error {
+			return nil
 		},
 		WhatsAppStatus: func() any {
 			return map[string]any{"connected": false, "paired": true}
 		},
+		ConnectWhatsApp: func() error {
+			return nil
+		},
+		WhatsAppQRCode: func() (any, error) {
+			return map[string]any{"qr_available": false}, nil
+		},
+		LeaveWhatsAppGroup: func(conversationID string) error {
+			return nil
+		},
+		SignalStatus: func() any {
+			return map[string]any{"connected": false, "paired": true, "account": "+15551234567"}
+		},
+		ConnectSignal: func() error {
+			return nil
+		},
+		SignalQRCode: func() (any, error) {
+			return map[string]any{"qr_available": false}, nil
+		},
 		BackfillStatus: func() any {
 			return map[string]any{"running": true, "phase": "messages"}
+		},
+		StartDeepBackfill: func() bool {
+			return false
+		},
+		BackfillPhone: func(phone string) error {
+			return nil
 		},
 	})
 
@@ -1271,6 +1302,24 @@ func TestDiagnosticsEndpointIncludesCountsAndStatus(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	if err := ts.store.UpsertConversation(&db.Conversation{
+		ConversationID: "signal-1",
+		Name:           "Signal Friends",
+		LastMessageTS:  220,
+		SourcePlatform: "signal",
+		IsGroup:        true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := ts.store.UpsertMessage(&db.Message{
+		MessageID:      "signal:m1",
+		ConversationID: "signal-1",
+		Body:           "hi from signal",
+		TimestampMS:    220,
+		SourcePlatform: "signal",
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	resp, err := http.Get(ts.server.URL + "/api/diagnostics")
 	if err != nil {
@@ -1282,14 +1331,71 @@ func TestDiagnosticsEndpointIncludesCountsAndStatus(t *testing.T) {
 	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
 		t.Fatal(err)
 	}
-	if payload["conversation_count"] != float64(1) {
-		t.Fatalf("conversation_count = %v, want 1", payload["conversation_count"])
+	if payload["schema_version"] != float64(1) {
+		t.Fatalf("schema_version = %v, want 1", payload["schema_version"])
 	}
-	if payload["message_count"] != float64(1) {
-		t.Fatalf("message_count = %v, want 1", payload["message_count"])
+	if _, err := time.Parse(time.RFC3339Nano, payload["generated_at_iso"].(string)); err != nil {
+		t.Fatalf("generated_at_iso is not RFC3339Nano: %v", err)
+	}
+	if payload["connected"] != true {
+		t.Fatalf("connected = %v, want true", payload["connected"])
+	}
+	if payload["identity_name"] != "Max" {
+		t.Fatalf("identity_name = %v, want Max", payload["identity_name"])
+	}
+	if payload["conversation_count"] != float64(2) {
+		t.Fatalf("conversation_count = %v, want 2", payload["conversation_count"])
+	}
+	if payload["message_count"] != float64(2) {
+		t.Fatalf("message_count = %v, want 2", payload["message_count"])
 	}
 	if _, ok := payload["google"].(map[string]any); !ok {
 		t.Fatalf("expected google status in diagnostics, got %#v", payload["google"])
+	}
+	convCounts := payload["conversation_counts"].(map[string]any)
+	if convCounts["sms"] != float64(1) || convCounts["signal"] != float64(1) {
+		t.Fatalf("unexpected conversation_counts: %#v", convCounts)
+	}
+	msgCounts := payload["message_counts"].(map[string]any)
+	if msgCounts["sms"] != float64(1) || msgCounts["signal"] != float64(1) {
+		t.Fatalf("unexpected message_counts: %#v", msgCounts)
+	}
+	latest := payload["latest_message_ts"].(map[string]any)
+	if latest["signal"] != float64(220) {
+		t.Fatalf("latest signal timestamp = %v, want 220", latest["signal"])
+	}
+	backend := payload["backend"].(map[string]any)
+	for _, key := range []string{"go_version", "goos", "goarch"} {
+		if backend[key] == "" {
+			t.Fatalf("backend.%s is empty: %#v", key, backend)
+		}
+	}
+	if backend["goroutines"].(float64) < 1 {
+		t.Fatalf("backend.goroutines = %v, want at least 1", backend["goroutines"])
+	}
+	if backend["uptime_ms"].(float64) < 0 {
+		t.Fatalf("backend.uptime_ms = %v, want non-negative", backend["uptime_ms"])
+	}
+	memory := payload["memory"].(map[string]any)
+	if memory["alloc_bytes"].(float64) <= 0 || memory["sys_bytes"].(float64) <= 0 {
+		t.Fatalf("memory snapshot missing allocations: %#v", memory)
+	}
+	capabilities := payload["capabilities"].(map[string]any)
+	google := capabilities["google"].(map[string]any)
+	if google["status"] != true || google["reconnect"] != true || google["unpair"] != false {
+		t.Fatalf("unexpected google capabilities: %#v", google)
+	}
+	whatsapp := capabilities["whatsapp"].(map[string]any)
+	if whatsapp["connect"] != true || whatsapp["qr"] != true || whatsapp["leave_group"] != true || whatsapp["send_text"] != false {
+		t.Fatalf("unexpected whatsapp capabilities: %#v", whatsapp)
+	}
+	signal := capabilities["signal"].(map[string]any)
+	if signal["status"] != true || signal["connect"] != true || signal["qr"] != true || signal["send_media"] != false {
+		t.Fatalf("unexpected signal capabilities: %#v", signal)
+	}
+	backfill := capabilities["backfill"].(map[string]any)
+	if backfill["status"] != true || backfill["deep"] != true || backfill["targeted"] != true {
+		t.Fatalf("unexpected backfill capabilities: %#v", backfill)
 	}
 }
 

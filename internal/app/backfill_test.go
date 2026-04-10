@@ -3,6 +3,7 @@ package app
 import (
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/rs/zerolog"
 	"go.mau.fi/mautrix-gmessages/pkg/libgm/gmproto"
@@ -845,6 +846,75 @@ func TestRecentReconcilePagesUntilItCrossesLocalBoundary(t *testing.T) {
 	}
 	if msgs[0].MessageID != "m5" {
 		t.Fatalf("most recent message = %q, want m5", msgs[0].MessageID)
+	}
+}
+
+func TestPendingMediaRefreshRetriesUntilMMSHydrates(t *testing.T) {
+	placeholder := &gmproto.Message{
+		MessageID:      "m1",
+		ConversationID: "c1",
+		Timestamp:      500 * 1000,
+		Type:           3,
+		MessageInfo: []*gmproto.MessageInfo{{
+			Data: &gmproto.MessageInfo_MessageContent{
+				MessageContent: &gmproto.MessageContent{Content: "Image from phone"},
+			},
+		}},
+	}
+	hydrated := &gmproto.Message{
+		MessageID:      "m1",
+		ConversationID: "c1",
+		Timestamp:      500 * 1000,
+		Type:           2,
+		MessageInfo: []*gmproto.MessageInfo{{
+			Data: &gmproto.MessageInfo_MediaContent{
+				MediaContent: &gmproto.MediaContent{
+					MediaID:       "media-123",
+					MimeType:      "image/jpeg",
+					DecryptionKey: []byte{0x01, 0x02},
+				},
+			},
+		}},
+	}
+
+	mock := &mockGMClient{
+		messages: map[string][][]*gmproto.Message{
+			"c1": {{placeholder}},
+		},
+		fetchCalls: map[string]int{},
+	}
+	mock.afterFetchMessages = func(conversationID string, pageIdx int) {
+		if conversationID == "c1" && pageIdx == 0 && mock.fetchCalls[conversationID] == 1 {
+			mock.messages[conversationID] = [][]*gmproto.Message{{hydrated}}
+		}
+	}
+
+	a := newTestApp(t, mock)
+	var changed []string
+	a.OnMessagesChange = func(conversationID string) {
+		changed = append(changed, conversationID)
+	}
+
+	a.refreshPendingMediaMessageWithSchedule("c1", "m1", []time.Duration{0, 0})
+
+	msg, err := a.Store.GetMessageByID("m1")
+	if err != nil {
+		t.Fatalf("GetMessageByID(): %v", err)
+	}
+	if msg == nil {
+		t.Fatal("expected stored message")
+	}
+	if msg.MediaID != "media-123" {
+		t.Fatalf("media_id = %q, want media-123", msg.MediaID)
+	}
+	if msg.MimeType != "image/jpeg" {
+		t.Fatalf("mime_type = %q, want image/jpeg", msg.MimeType)
+	}
+	if len(changed) != 2 {
+		t.Fatalf("messages change callbacks = %d, want 2 attempts", len(changed))
+	}
+	if mock.fetchCalls["c1"] != 2 {
+		t.Fatalf("fetch call count = %d, want 2", mock.fetchCalls["c1"])
 	}
 }
 

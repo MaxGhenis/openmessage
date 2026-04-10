@@ -38,6 +38,7 @@ const recentIncomingWindow = 2 * time.Minute
 const avatarCacheTTL = 30 * time.Minute
 const unavailablePlaceholderRepairCooldown = 30 * time.Minute
 const maxUnavailablePlaceholderRepairs = 25
+const recentlyLeftGroupTTL = 6 * time.Hour
 
 var ErrProfilePhotoNotFound = errors.New("whatsapp profile photo not found")
 
@@ -67,6 +68,10 @@ var clientIsConnected = func(cli *whatsmeow.Client) bool {
 
 var getProfilePictureInfo = func(cli *whatsmeow.Client, ctx context.Context, jid watypes.JID, params *whatsmeow.GetProfilePictureParams) (*watypes.ProfilePictureInfo, error) {
 	return cli.GetProfilePictureInfo(ctx, jid, params)
+}
+
+var leaveGroup = func(cli *whatsmeow.Client, ctx context.Context, jid watypes.JID) error {
+	return cli.LeaveGroup(ctx, jid)
 }
 
 var downloadProfilePhoto = func(ctx context.Context, rawURL string) ([]byte, string, error) {
@@ -167,21 +172,23 @@ type Bridge struct {
 	container *sqlstore.Container
 	client    *whatsmeow.Client
 
-	connected  bool
-	connecting bool
-	pairing    bool
-	lastError  string
-	qr         QRSnapshot
-	avatars    map[string]avatarCacheEntry
+	connected                 bool
+	connecting                bool
+	pairing                   bool
+	lastError                 string
+	qr                        QRSnapshot
+	avatars                   map[string]avatarCacheEntry
 	unavailableRepairRequests map[string]time.Time
+	recentlyLeftGroups        map[string]time.Time
 }
 
 func New(sessionPath string, store *db.Store, logger zerolog.Logger, callbacks Callbacks) (*Bridge, error) {
 	bridge := &Bridge{
-		store:       store,
-		logger:      logger,
-		sessionPath: sessionPath,
-		callbacks:   callbacks,
+		store:              store,
+		logger:             logger,
+		sessionPath:        sessionPath,
+		callbacks:          callbacks,
+		recentlyLeftGroups: make(map[string]time.Time),
 	}
 	if err := bridge.initClientLocked(); err != nil {
 		return nil, err
@@ -712,6 +719,142 @@ func (b *Bridge) SendMedia(conversationID string, data []byte, filename, mime, c
 	}, nil
 }
 
+func (b *Bridge) SendReaction(conversationID, targetMessageID, emoji, action string) error {
+	targetMessageID = strings.TrimSpace(targetMessageID)
+	if targetMessageID == "" {
+		return errors.New("whatsapp target message is required")
+	}
+	emoji = strings.TrimSpace(emoji)
+	action = strings.ToLower(strings.TrimSpace(action))
+	if action == "" {
+		action = "add"
+	}
+	if emoji == "" {
+		return errors.New("whatsapp reaction emoji is required")
+	}
+
+	target, err := b.store.GetMessageByID(targetMessageID)
+	if err != nil {
+		return fmt.Errorf("load WhatsApp reaction target: %w", err)
+	}
+	if target == nil && !strings.HasPrefix(targetMessageID, "whatsapp:") {
+		target, err = b.store.GetMessageByID("whatsapp:" + targetMessageID)
+		if err != nil {
+			return fmt.Errorf("load WhatsApp reaction target: %w", err)
+		}
+	}
+	if target == nil || target.SourcePlatform != "whatsapp" {
+		return errors.New("whatsapp reaction target not found")
+	}
+
+	targetConversationID := strings.TrimSpace(target.ConversationID)
+	if targetConversationID == "" {
+		targetConversationID = strings.TrimSpace(conversationID)
+	}
+	if targetConversationID == "" {
+		return errors.New("whatsapp reaction conversation is required")
+	}
+
+	chatJID, err := parseConversationJID(targetConversationID)
+	if err != nil {
+		return err
+	}
+	chatJID = b.normalizeConversationJID(chatJID)
+
+	targetSourceID := strings.TrimSpace(target.SourceID)
+	if targetSourceID == "" {
+		targetSourceID = strings.TrimSpace(strings.TrimPrefix(target.MessageID, "whatsapp:"))
+	}
+	if targetSourceID == "" {
+		return errors.New("whatsapp reaction target id is unavailable")
+	}
+
+	cli, err := b.ensureSendClient(15*time.Second, "reconnecting WhatsApp before reaction")
+	if err != nil {
+		return err
+	}
+
+	reactionText := emoji
+	if action == "remove" {
+		reactionText = ""
+	}
+	reqID := cli.GenerateMessageID()
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+
+	_, err = sendTextMessage(cli, ctx, chatJID, cli.BuildReaction(chatJID, b.reactionTargetSenderJID(target, chatJID), watypes.MessageID(targetSourceID), reactionText), whatsmeow.SendRequestExtra{
+		ID: reqID,
+	})
+	if err != nil {
+		if shouldReconnectWhatsAppSend(err) {
+			if reconnectErr := b.beginReconnect("WhatsApp reaction timed out; reconnecting", true); reconnectErr != nil {
+				b.logger.Debug().Err(reconnectErr).Msg("Failed to start WhatsApp reconnect after reaction error")
+			}
+		}
+		return fmt.Errorf("send WhatsApp reaction: %w", err)
+	}
+
+	nextReactions, changed, err := updateStoredReactions(target.Reactions, b.reactionActorIDForClient(cli), reactionText)
+	if err != nil {
+		return fmt.Errorf("update local WhatsApp reaction state: %w", err)
+	}
+	if !changed {
+		return nil
+	}
+	target.Reactions = nextReactions
+	if err := b.store.UpsertMessage(target); err != nil {
+		return fmt.Errorf("store WhatsApp reaction update: %w", err)
+	}
+	if b.callbacks.OnMessagesChange != nil {
+		b.callbacks.OnMessagesChange(target.ConversationID)
+	}
+	return nil
+}
+
+func (b *Bridge) LeaveGroup(conversationID string) error {
+	if strings.TrimSpace(conversationID) == "" {
+		return errors.New("conversation_id is required")
+	}
+	chatJID, err := parseConversationJID(conversationID)
+	if err != nil {
+		return err
+	}
+	chatJID = b.normalizeConversationJID(chatJID)
+	if chatJID.Server != watypes.GroupServer {
+		return errors.New("conversation is not a WhatsApp group")
+	}
+
+	cli, err := b.ensureSendClient(30*time.Second, "reconnecting WhatsApp before leaving group")
+	if err != nil {
+		return err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+
+	if err := leaveGroup(cli, ctx, chatJID); err != nil {
+		if shouldReconnectWhatsAppSend(err) {
+			if reconnectErr := b.beginReconnect("WhatsApp leave group timed out; reconnecting", true); reconnectErr != nil {
+				b.logger.Debug().Err(reconnectErr).Msg("Failed to start WhatsApp reconnect after leave-group error")
+			}
+		}
+		return fmt.Errorf("leave WhatsApp group: %w", err)
+	}
+
+	b.markLeftGroup(conversationID)
+	if err := b.store.DeleteConversation(conversationID); err != nil {
+		return fmt.Errorf("remove local WhatsApp group thread: %w", err)
+	}
+	if b.callbacks.OnMessagesChange != nil {
+		b.callbacks.OnMessagesChange(conversationID)
+	}
+	if b.callbacks.OnConversationsChange != nil {
+		b.callbacks.OnConversationsChange()
+	}
+
+	return nil
+}
+
 func (b *Bridge) DownloadStoredMedia(msg *db.Message) ([]byte, string, error) {
 	if msg == nil {
 		return nil, "", errors.New("message not found")
@@ -985,6 +1128,10 @@ func (b *Bridge) handleMessage(evt *waevents.Message) {
 	if evt == nil || evt.Message == nil {
 		return
 	}
+	chatJID := b.normalizeConversationJID(evt.Info.Chat)
+	if evt.Info.IsGroup && b.shouldSuppressLeftGroup(waConversationID(chatJID)) {
+		return
+	}
 	if b.handleReactionMessage(evt) {
 		return
 	}
@@ -998,8 +1145,6 @@ func (b *Bridge) handleMessage(evt *waevents.Message) {
 	if err != nil {
 		b.logger.Warn().Err(err).Str("chat", evt.Info.Chat.String()).Msg("Failed to upsert WhatsApp conversation")
 	}
-	chatJID := b.normalizeConversationJID(evt.Info.Chat)
-
 	senderName, senderNumber := b.resolveSender(evt, conv)
 	msg := &db.Message{
 		MessageID:      "whatsapp:" + string(evt.Info.ID),
@@ -1010,6 +1155,7 @@ func (b *Bridge) handleMessage(evt *waevents.Message) {
 		TimestampMS:    evt.Info.Timestamp.UnixMilli(),
 		Status:         "delivered",
 		IsFromMe:       evt.Info.IsFromMe,
+		MentionsMe:     b.messageMentionsOwnAccount(evt.Message),
 		ReplyToID:      extractReplyToID(evt.Message),
 		SourcePlatform: "whatsapp",
 		SourceID:       string(evt.Info.ID),
@@ -1190,12 +1336,36 @@ func (b *Bridge) handleGroupInfo(evt *waevents.GroupInfo) {
 	if evt == nil {
 		return
 	}
+	chatJID := b.normalizeConversationJID(evt.JID)
+	conversationID := waConversationID(chatJID)
+	if b.didOwnAccountJoinGroup(evt) {
+		b.clearLeftGroup(conversationID)
+	} else if b.shouldSuppressLeftGroup(conversationID) {
+		if err := b.store.DeleteConversation(conversationID); err != nil {
+			b.logger.Debug().Err(err).Str("chat", chatJID.String()).Msg("Failed to delete suppressed WhatsApp group")
+		}
+		return
+	}
+	if b.didOwnAccountLeaveGroup(evt) {
+		b.markLeftGroup(conversationID)
+		if err := b.store.DeleteConversation(conversationID); err != nil {
+			b.logger.Debug().Err(err).Str("chat", chatJID.String()).Msg("Failed to delete WhatsApp group after leave event")
+			return
+		}
+		if b.callbacks.OnMessagesChange != nil {
+			b.callbacks.OnMessagesChange(conversationID)
+		}
+		if b.callbacks.OnConversationsChange != nil {
+			b.callbacks.OnConversationsChange()
+		}
+		return
+	}
 	name := ""
 	if evt.Name != nil {
 		name = evt.Name.Name
 	}
-	if err := b.upsertGroupConversation(evt.JID, name, nil); err != nil {
-		b.logger.Debug().Err(err).Str("chat", evt.JID.String()).Msg("Failed to update WhatsApp group metadata")
+	if err := b.upsertGroupConversation(chatJID, name, nil); err != nil {
+		b.logger.Debug().Err(err).Str("chat", chatJID.String()).Msg("Failed to update WhatsApp group metadata")
 		return
 	}
 	if b.callbacks.OnConversationsChange != nil {
@@ -1375,6 +1545,82 @@ func (b *Bridge) phoneForJID(jid watypes.JID) string {
 		}
 	}
 	return ""
+}
+
+func (b *Bridge) didOwnAccountLeaveGroup(evt *waevents.GroupInfo) bool {
+	if evt == nil {
+		return false
+	}
+	return b.groupInfoIncludesOwnAccount(evt.Leave)
+}
+
+func (b *Bridge) didOwnAccountJoinGroup(evt *waevents.GroupInfo) bool {
+	if evt == nil {
+		return false
+	}
+	return b.groupInfoIncludesOwnAccount(evt.Join)
+}
+
+func (b *Bridge) groupInfoIncludesOwnAccount(members []watypes.JID) bool {
+	if len(members) == 0 {
+		return false
+	}
+	b.mu.RLock()
+	var ownJID watypes.JID
+	if b.client != nil && b.client.Store != nil && b.client.Store.ID != nil {
+		ownJID = b.client.Store.ID.ToNonAD()
+	}
+	b.mu.RUnlock()
+	if ownJID.IsEmpty() {
+		return false
+	}
+	ownCanonical := b.canonicalJID(ownJID)
+	for _, participantJID := range members {
+		participantCanonical := b.canonicalJID(participantJID)
+		if sameWhatsAppIdentity(participantJID, ownJID) || sameWhatsAppIdentity(participantCanonical, ownCanonical) {
+			return true
+		}
+	}
+	return false
+}
+
+func (b *Bridge) markLeftGroup(conversationID string) {
+	if strings.TrimSpace(conversationID) == "" {
+		return
+	}
+	b.mu.Lock()
+	if b.recentlyLeftGroups == nil {
+		b.recentlyLeftGroups = make(map[string]time.Time)
+	}
+	b.recentlyLeftGroups[conversationID] = time.Now().Add(recentlyLeftGroupTTL)
+	b.mu.Unlock()
+}
+
+func (b *Bridge) clearLeftGroup(conversationID string) {
+	if strings.TrimSpace(conversationID) == "" {
+		return
+	}
+	b.mu.Lock()
+	delete(b.recentlyLeftGroups, conversationID)
+	b.mu.Unlock()
+}
+
+func (b *Bridge) shouldSuppressLeftGroup(conversationID string) bool {
+	if strings.TrimSpace(conversationID) == "" {
+		return false
+	}
+	now := time.Now()
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	expiresAt, ok := b.recentlyLeftGroups[conversationID]
+	if !ok {
+		return false
+	}
+	if !expiresAt.After(now) {
+		delete(b.recentlyLeftGroups, conversationID)
+		return false
+	}
+	return true
 }
 
 func (b *Bridge) canonicalJID(jid watypes.JID) watypes.JID {
@@ -2002,7 +2248,7 @@ func outgoingTextMessage(body, replyToID string) *waE2E.Message {
 	}
 	return &waE2E.Message{
 		ExtendedTextMessage: &waE2E.ExtendedTextMessage{
-			Text: proto.String(body),
+			Text:        proto.String(body),
 			ContextInfo: contextInfo,
 		},
 	}
@@ -2053,6 +2299,64 @@ func extractReplyToID(msg *waE2E.Message) string {
 		return ""
 	}
 	return "whatsapp:" + strings.TrimSpace(ctx.GetStanzaID())
+}
+
+func (b *Bridge) messageMentionsOwnAccount(msg *waE2E.Message) bool {
+	ctx := messageContextInfo(msg)
+	if ctx == nil {
+		return false
+	}
+	mentioned := ctx.GetMentionedJID()
+	if len(mentioned) == 0 {
+		return false
+	}
+
+	b.mu.RLock()
+	var ownJID watypes.JID
+	if b.client != nil && b.client.Store != nil && b.client.Store.ID != nil {
+		ownJID = b.client.Store.ID.ToNonAD()
+	}
+	b.mu.RUnlock()
+	if ownJID.IsEmpty() {
+		return false
+	}
+	ownCanonical := b.canonicalJID(ownJID)
+
+	for _, rawJID := range mentioned {
+		mentionedJID, err := watypes.ParseJID(strings.TrimSpace(rawJID))
+		if err != nil {
+			continue
+		}
+		mentionedCanonical := b.canonicalJID(mentionedJID)
+		if sameWhatsAppIdentity(mentionedJID, ownJID) || sameWhatsAppIdentity(mentionedCanonical, ownCanonical) {
+			return true
+		}
+	}
+	return false
+}
+
+func sameWhatsAppIdentity(a, b watypes.JID) bool {
+	a = a.ToNonAD()
+	b = b.ToNonAD()
+	if a.IsEmpty() || b.IsEmpty() {
+		return false
+	}
+	if a.String() == b.String() {
+		return true
+	}
+	if strings.TrimSpace(a.User) == "" || strings.TrimSpace(b.User) == "" || a.User != b.User {
+		return false
+	}
+	return isWhatsAppPersonServer(a.Server) && isWhatsAppPersonServer(b.Server)
+}
+
+func isWhatsAppPersonServer(server string) bool {
+	switch server {
+	case watypes.DefaultUserServer, watypes.HiddenUserServer:
+		return true
+	default:
+		return false
+	}
 }
 
 func messageContextInfo(msg *waE2E.Message) *waE2E.ContextInfo {
@@ -2177,12 +2481,7 @@ func (b *Bridge) reactionActorID(evt *waevents.Message) string {
 		return ""
 	}
 	if evt.Info.IsFromMe {
-		b.mu.RLock()
-		defer b.mu.RUnlock()
-		if b.client != nil && b.client.Store != nil && b.client.Store.ID != nil {
-			return b.canonicalJID(*b.client.Store.ID).String()
-		}
-		return "me"
+		return b.reactionActorIDForClient(nil)
 	}
 	if evt.Info.IsGroup && !evt.Info.Sender.IsEmpty() {
 		return b.canonicalJID(evt.Info.Sender).String()
@@ -2194,6 +2493,39 @@ func (b *Bridge) reactionActorID(evt *waevents.Message) string {
 		return b.canonicalJID(evt.Info.Sender).String()
 	}
 	return ""
+}
+
+func (b *Bridge) reactionActorIDForClient(cli *whatsmeow.Client) string {
+	if cli == nil {
+		b.mu.RLock()
+		cli = b.client
+		b.mu.RUnlock()
+	}
+	if cli != nil && cli.Store != nil && cli.Store.ID != nil {
+		return b.canonicalJID(*cli.Store.ID).String()
+	}
+	return "me"
+}
+
+func (b *Bridge) reactionTargetSenderJID(msg *db.Message, chatJID watypes.JID) watypes.JID {
+	if msg == nil || msg.IsFromMe {
+		return watypes.EmptyJID
+	}
+	if senderJID := parseWhatsAppSenderJID(msg.SenderNumber); !senderJID.IsEmpty() {
+		return b.canonicalJID(senderJID)
+	}
+	if chatJID.Server == watypes.DefaultUserServer || chatJID.Server == watypes.HiddenUserServer {
+		return b.canonicalJID(chatJID)
+	}
+	return watypes.EmptyJID
+}
+
+func parseWhatsAppSenderJID(number string) watypes.JID {
+	number = strings.TrimSpace(strings.TrimPrefix(number, "+"))
+	if number == "" {
+		return watypes.EmptyJID
+	}
+	return watypes.NewJID(number, watypes.DefaultUserServer)
 }
 
 func updateStoredReactions(existingJSON, actorID, emoji string) (string, bool, error) {

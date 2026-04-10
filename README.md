@@ -178,6 +178,8 @@ npm run test:e2e     # Run browser-level web UI tests
 ./openmessage demo  # Start isolated fake-data demo mode
 ```
 
+Before publishing a build or website update, run through [the release checklist](docs/release-checklist.md).
+
 ## License
 
 MIT

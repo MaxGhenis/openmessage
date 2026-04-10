@@ -463,6 +463,89 @@ test('renders read receipts for read messages', async ({ page, request }) => {
   await expect(sentMessage.locator('.msg-status.status-read')).toBeVisible();
 });
 
+test('rerenders when an older visible message changes outside the former tail window', async ({ page }) => {
+  await openConversation(page, 'Paged Thread');
+
+  const targetMessage = page.locator('#messages-area .msg[data-msg-id="paged-150"]').first();
+  await expect(targetMessage).toContainText('Paged message 150');
+  await expect(targetMessage.locator('.reaction-pill')).toHaveCount(0);
+
+  await page.evaluate(() => {
+    if (!window.__openMessageTestHooks.updateLoadedMessage('paged-150', {
+      Reactions: JSON.stringify([{ emoji: '🔥', count: 1 }]),
+    })) {
+      throw new Error('paged-150 not found in loadedMessages');
+    }
+    window.__openMessageTestHooks.renderLoadedMessages();
+  });
+
+  await expect(targetMessage.locator('.reaction-pill')).toContainText('🔥');
+});
+
+test('ignores stale avatar fetches when reusing an avatar node', async ({ page }) => {
+  await page.evaluate(() => {
+    window.__avatarHydrationTest = { pending: [] };
+    window.__openMessageTestHooks.installAvatarFetchOverride((...args) => new Promise((resolve) => {
+      window.__avatarHydrationTest.pending.push({ args, resolve });
+    }));
+
+    const host = document.createElement('div');
+    host.id = 'e2e-avatar-host';
+    host.className = 'chat-header-avatar';
+    document.body.appendChild(host);
+
+    window.__openMessageTestHooks.renderAvatarElement(host, {
+      name: 'Sarah Chen',
+      numbers: ['+14155551234'],
+      text: 'S',
+      background: '#111827',
+    });
+    window.__openMessageTestHooks.renderAvatarElement(host, {
+      name: 'Marcus Johnson',
+      numbers: ['+12125559876'],
+      text: 'M',
+      background: '#1f2937',
+    });
+  });
+
+  await expect.poll(async () => page.evaluate(() => window.__avatarHydrationTest.pending.length)).toBe(2);
+
+  await page.evaluate(() => {
+    window.__avatarHydrationTest.pending[0].resolve('data:image/gif;base64,R0lGODlhAQABAAAAACwAAAAAAQABAAA=');
+  });
+  await expect
+    .poll(async () => page.evaluate(() => document.querySelector('#e2e-avatar-host img')?.alt || ''))
+    .not.toBe('Sarah Chen photo');
+
+  await page.evaluate(() => {
+    window.__avatarHydrationTest.pending[1].resolve('data:image/gif;base64,R0lGODlhAQABAAAAACwAAAAAAQABAAA=');
+  });
+  await expect
+    .poll(async () => page.evaluate(() => document.querySelector('#e2e-avatar-host img')?.alt || ''))
+    .toBe('Marcus Johnson photo');
+});
+
+test('hydrates the full emoji grid only when requested', async ({ page }) => {
+  await openConversation(page, 'Sarah Chen');
+
+  const firstMessage = page.locator('#messages-area .msg').first();
+  await expect(firstMessage.locator('.emoji-full-panel')).not.toHaveAttribute('data-hydrated', 'true');
+  await expect(firstMessage.locator('.emoji-full-panel [data-emoji]')).toHaveCount(0);
+
+  await page.evaluate(() => {
+    const message = document.querySelector('#messages-area .msg');
+    if (!message) throw new Error('message not found');
+    const messageId = message.getAttribute('data-msg-id');
+    if (!messageId) throw new Error('message id missing');
+    window.toggleFullEmojiPanel({ stopPropagation() {} }, messageId);
+  });
+
+  await expect(firstMessage.locator('.emoji-full-panel')).toHaveAttribute('data-hydrated', 'true');
+  await expect
+    .poll(async () => firstMessage.locator('.emoji-full-panel [data-emoji]').count())
+    .toBeGreaterThan(50);
+});
+
 test('sends a WhatsApp image attachment through the compose box', async ({ page }) => {
   const jordanRow = page.locator('#conversation-list > .convo-item').filter({
     has: page.locator('.convo-name').getByText('Jordan Rivera', { exact: true }),
@@ -815,10 +898,28 @@ test('loads older pages when scrolling up in a long thread', async ({ page }) =>
     el.dispatchEvent(new Event('scroll'));
   });
 
+  await expect
+    .poll(async () => page.evaluate(() => window.__openMessageTestHooks.threadRenderStats().loadedMessages))
+    .toBeGreaterThanOrEqual(150);
+  await expect
+    .poll(async () => page.evaluate(() => {
+      const stats = window.__openMessageTestHooks.threadRenderStats();
+      return stats.renderedMessages <= stats.windowSize;
+    }))
+    .toBe(true);
+
+  await page.locator('#messages-area').evaluate((el) => {
+    el.scrollTop = 0;
+    el.dispatchEvent(new Event('scroll'));
+  });
+
   await expect(page.locator('#messages-area')).toContainText('Paged message 001');
   await expect
-    .poll(async () => page.locator('#messages-area .msg').count())
-    .toBeGreaterThanOrEqual(150);
+    .poll(async () => page.evaluate(() => {
+      const stats = window.__openMessageTestHooks.threadRenderStats();
+      return stats.renderedMessages <= stats.windowSize;
+    }))
+    .toBe(true);
 });
 
 test('sends an AI draft from the thread banner', async ({ page }) => {

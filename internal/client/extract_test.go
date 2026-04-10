@@ -149,4 +149,26 @@ func TestExtractReplyToID_WithReply(t *testing.T) {
 	}
 }
 
+func TestMessageIsFromMeFallsBackToOutgoingStatus(t *testing.T) {
+	msg := &gmproto.Message{
+		MessageStatus: &gmproto.MessageStatus{
+			Status: gmproto.MessageStatusType_OUTGOING_COMPLETE,
+		},
+	}
+	if !MessageIsFromMe(msg) {
+		t.Fatal("expected outgoing message status to be treated as from me")
+	}
+}
+
+func TestMessageIsFromMePrefersIncomingStatusWhenParticipantMissing(t *testing.T) {
+	msg := &gmproto.Message{
+		MessageStatus: &gmproto.MessageStatus{
+			Status: gmproto.MessageStatusType_INCOMING_COMPLETE,
+		},
+	}
+	if MessageIsFromMe(msg) {
+		t.Fatal("expected incoming message status without sender participant to remain not-from-me")
+	}
+}
+
 func strPtr(s string) *string { return &s }

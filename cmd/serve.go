@@ -52,57 +52,71 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 	}
 	listenAddr := net.JoinHostPort(host, port)
 	baseURL := "http://" + net.JoinHostPort(publicHost(host), port)
+	isDemo := app.DemoMode()
 
 	events := web.NewEventBroker()
+	isConnected := func() bool {
+		if isDemo {
+			return true
+		}
+		return a.AnyConnected()
+	}
+	publishOverallStatus := func() {
+		events.PublishStatus(isConnected())
+	}
 	a.OnConversationsChange = events.PublishConversations
 	a.OnMessagesChange = events.PublishMessages
-	a.OnStatusChange = events.PublishStatus
+	a.OnStatusChange = func(bool) {
+		publishOverallStatus()
+	}
 	a.OnTypingChange = events.PublishTyping
 	a.OnWhatsAppStatusChange = func() {
-		events.PublishStatus(a.Connected.Load())
+		publishOverallStatus()
 	}
-	macNotifier := notify.NewMacOSNotifier(logger, macOSNotificationsEnabled(interactiveTerminal), baseURL)
+	a.OnSignalStatusChange = func() {
+		publishOverallStatus()
+	}
+	identityName := app.LocalIdentityName()
+	macNotifier := notify.NewMacOSNotifier(logger, macOSNotificationsEnabled(interactiveTerminal), baseURL, a.Store, identityName)
 	if macNotifier.Enabled() {
 		logger.Info().Msg("Native macOS notifications enabled for fresh inbound messages")
 	}
 	a.OnIncomingMessage = macNotifier.NotifyIncomingMessage
 
-	isDemo := app.DemoMode()
-
 	// Connect to Google Messages (skip in demo mode)
 	if !isDemo {
 		if err := a.LoadAndConnect(); err != nil {
-			return fmt.Errorf("connect: %w", err)
-		}
-
-		mode := startupBackfillMode()
-		runShallowBackfill := func() {
-			go func() {
-				if err := a.Backfill(); err != nil {
-					logger.Warn().Err(err).Msg("Backfill failed")
-				}
-			}()
-		}
-		switch mode {
-		case "off":
-			logger.Info().Msg("Startup backfill disabled")
-		case "deep":
-			if a.StartDeepBackfill() {
-				logger.Info().Msg("Started deep startup backfill")
+			logger.Warn().Err(err).Msg("Google Messages unavailable")
+		} else {
+			mode := startupBackfillMode()
+			runShallowBackfill := func() {
+				go func() {
+					if err := a.Backfill(); err != nil {
+						logger.Warn().Err(err).Msg("Backfill failed")
+					}
+				}()
 			}
-		case "shallow":
-			runShallowBackfill()
-		default:
-			smsCount, err := a.Store.MessageCount("sms")
-			if err != nil {
-				logger.Warn().Err(err).Msg("Failed to inspect local SMS cache; falling back to shallow backfill")
-				runShallowBackfill()
-			} else if smsCount == 0 {
+			switch mode {
+			case "off":
+				logger.Info().Msg("Startup backfill disabled")
+			case "deep":
 				if a.StartDeepBackfill() {
-					logger.Info().Msg("No cached SMS history found; started deep startup backfill")
+					logger.Info().Msg("Started deep startup backfill")
 				}
-			} else {
+			case "shallow":
 				runShallowBackfill()
+			default:
+				smsCount, err := a.Store.MessageCount("sms")
+				if err != nil {
+					logger.Warn().Err(err).Msg("Failed to inspect local SMS cache; falling back to shallow backfill")
+					runShallowBackfill()
+				} else if smsCount == 0 {
+					if a.StartDeepBackfill() {
+						logger.Info().Msg("No cached SMS history found; started deep startup backfill")
+					}
+				} else {
+					runShallowBackfill()
+				}
 			}
 		}
 	} else {
@@ -115,6 +129,14 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 		}
 	} else {
 		logger.Info().Msg("Demo mode — skipping WhatsApp live bridge")
+	}
+
+	if !isDemo {
+		if err := a.LoadAndConnectSignal(); err != nil {
+			logger.Warn().Err(err).Msg("Signal live bridge unavailable")
+		}
+	} else {
+		logger.Info().Msg("Demo mode — skipping Signal live bridge")
 	}
 
 	if !isDemo {
@@ -133,8 +155,23 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 		}()
 	}
 
+	if !isDemo {
+		go func() {
+			ticker := time.NewTicker(5 * time.Second)
+			defer ticker.Stop()
+			for range ticker.C {
+				status := a.SignalStatus()
+				if !status.Paired || status.Connected || status.Pairing || status.Connecting {
+					continue
+				}
+				if err := a.StartSignalConnect(); err != nil {
+					logger.Warn().Err(err).Msg("Signal reconnect attempt failed")
+				}
+			}
+		}()
+	}
+
 	// Sync WhatsApp and iMessage periodically (every 30s, incremental)
-	identityName := app.LocalIdentityName()
 	lastImportErr := map[string]string{}
 	syncLocalPlatforms := func() {
 		if app.Sandboxed() || isDemo {
@@ -162,6 +199,14 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 		if !a.UsesWhatsAppLiveBridge() {
 			syncPlatform("whatsapp", "WhatsApp sync complete", func(store *db.Store) (*importer.ImportResult, error) {
 				return (&importer.WhatsAppNative{MyName: identityName}).ImportFromDB(store)
+			})
+		}
+		if signalStatus := a.SignalStatus(); signalStatus.Paired {
+			syncPlatform("signal", "Signal desktop sync complete", func(store *db.Store) (*importer.ImportResult, error) {
+				return (&importer.SignalDesktop{
+					MyName:    identityName,
+					MyAddress: signalStatus.Account,
+				}).ImportFromDB(store)
 			})
 		}
 		syncPlatform("imessage", "iMessage sync complete", func(store *db.Store) (*importer.ImportResult, error) {
@@ -197,12 +242,6 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 		mcpserver.WithStaticBasePath("/mcp"),
 	)
 
-	isConnected := func() bool {
-		if isDemo {
-			return true
-		}
-		return a.Connected.Load()
-	}
 	googleStatus := func() any {
 		if isDemo {
 			return app.GoogleStatusSnapshot{Connected: true, Paired: true, NeedsPairing: false}
@@ -211,22 +250,35 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 	}
 
 	httpHandler := web.APIHandlerWithOptions(a.Store, nil, logger, sseSrv, web.APIOptions{
-		Client:          a.GetClient,
-		Events:          events,
-		IsConnected:     isConnected,
-		GoogleStatus:    googleStatus,
-		ReconnectGoogle: a.ReconnectGoogleMessages,
-		Unpair:          a.Unpair,
-		WhatsAppStatus:  func() any { return a.WhatsAppStatus() },
-		ConnectWhatsApp: a.StartWhatsAppConnect,
-		UnpairWhatsApp:  a.UnpairWhatsApp,
+		Client:             a.GetClient,
+		Events:             events,
+		IdentityName:       identityName,
+		IsConnected:        isConnected,
+		GoogleStatus:       googleStatus,
+		ReconnectGoogle:    a.ReconnectGoogleMessages,
+		Unpair:             a.Unpair,
+		WhatsAppStatus:     func() any { return a.WhatsAppStatus() },
+		ConnectWhatsApp:    a.StartWhatsAppConnect,
+		UnpairWhatsApp:     a.UnpairWhatsApp,
+		SignalStatus:       func() any { return a.SignalStatus() },
+		ConnectSignal:      a.StartSignalConnect,
+		UnpairSignal:       a.UnpairSignal,
+		LeaveWhatsAppGroup: a.LeaveWhatsAppGroup,
 		WhatsAppQRCode: func() (any, error) {
 			return a.WhatsAppQRCode()
 		},
+		SignalQRCode: func() (any, error) {
+			return a.SignalQRCode()
+		},
 		SendWhatsAppText:      a.SendWhatsAppText,
+		SendWhatsAppReaction:  a.SendWhatsAppReaction,
+		SendSignalText:        a.SendSignalText,
+		SendSignalMedia:       a.SendSignalMedia,
+		SendSignalReaction:    a.SendSignalReaction,
 		SendWhatsAppMedia:     a.SendWhatsAppMedia,
 		WhatsAppAvatar:        a.WhatsAppAvatar,
 		DownloadWhatsAppMedia: a.DownloadWhatsAppMedia,
+		DownloadSignalMedia:   a.DownloadSignalMedia,
 		StartDeepBackfill:     a.StartDeepBackfill,
 		BackfillStatus:        func() any { return a.GetBackfillProgress() },
 		BackfillPhone:         a.BackfillConversationByPhone,

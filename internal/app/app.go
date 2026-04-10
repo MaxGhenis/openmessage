@@ -8,12 +8,14 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/rs/zerolog"
 
 	"github.com/maxghenis/openmessage/internal/client"
 	"github.com/maxghenis/openmessage/internal/db"
 	"github.com/maxghenis/openmessage/internal/importer"
+	"github.com/maxghenis/openmessage/internal/signallive"
 	"github.com/maxghenis/openmessage/internal/whatsapplive"
 )
 
@@ -111,6 +113,7 @@ type App struct {
 	DataDir                string
 	SessionPath            string
 	WhatsAppSessionPath    string
+	SignalConfigPath       string
 	Connected              atomic.Bool
 	OnConversationsChange  func()
 	OnIncomingMessage      func(*db.Message)
@@ -118,6 +121,7 @@ type App struct {
 	OnStatusChange         func(bool)
 	OnTypingChange         func(conversationID, senderName, senderNumber string, typing bool)
 	OnWhatsAppStatusChange func()
+	OnSignalStatusChange   func()
 
 	// gmClient is used by backfill methods. If nil, it's derived from Client.GM.
 	// Set this field directly in tests to inject a mock.
@@ -127,9 +131,13 @@ type App struct {
 	reconcileRunning atomic.Bool
 	whatsAppMu       sync.Mutex
 	WhatsApp         *whatsapplive.Bridge
+	signalMu         sync.Mutex
+	Signal           *signallive.Bridge
 	statusMu         sync.Mutex
 	googleLastError  string
 	tempDataDir      string
+	pendingMediaMu   sync.Mutex
+	pendingMedia     map[string]struct{}
 }
 
 type GoogleStatusSnapshot struct {
@@ -194,10 +202,20 @@ func New(logger zerolog.Logger) (*App, error) {
 				Int("deleted", report.DeletedWhatsAppReactionPlaceholders).
 				Msg("Removed legacy WhatsApp reaction placeholder rows")
 		}
+		if report.DeletedSignalReactionPlaceholders > 0 {
+			logger.Info().
+				Int("deleted", report.DeletedSignalReactionPlaceholders).
+				Msg("Removed legacy Signal reaction placeholder rows")
+		}
 		if report.RemainingWhatsAppMediaPlaceholders > 0 {
 			logger.Info().
 				Int("count", report.RemainingWhatsAppMediaPlaceholders).
 				Msg("Legacy WhatsApp media placeholders remain without downloadable metadata")
+		}
+		if report.FixedGoogleOutgoingAttributionRows > 0 {
+			logger.Info().
+				Int("fixed", report.FixedGoogleOutgoingAttributionRows).
+				Msg("Repaired legacy Google Messages outgoing attribution rows")
 		}
 	}
 	if !Sandboxed() {
@@ -228,6 +246,7 @@ func New(logger zerolog.Logger) (*App, error) {
 
 	sessionPath := filepath.Join(dataDir, "session.json")
 	whatsAppSessionPath := filepath.Join(dataDir, "whatsapp-session.db")
+	signalConfigPath := filepath.Join(dataDir, "signal-cli")
 
 	app := &App{
 		Store:               store,
@@ -235,6 +254,7 @@ func New(logger zerolog.Logger) (*App, error) {
 		DataDir:             dataDir,
 		SessionPath:         sessionPath,
 		WhatsAppSessionPath: whatsAppSessionPath,
+		SignalConfigPath:    signalConfigPath,
 		tempDataDir:         tempDataDir,
 	}
 	return app, nil
@@ -295,6 +315,9 @@ func (a *App) LoadAndConnect() error {
 			a.emitConversationsChange()
 		},
 		OnIncomingMessage: a.OnIncomingMessage,
+		OnPendingMedia: func(conversationID, messageID string) {
+			a.StartPendingMediaRefresh(conversationID, messageID)
+		},
 		OnMessagesChange: func(conversationID string) {
 			a.emitMessagesChange(conversationID)
 		},
@@ -393,6 +416,43 @@ func (a *App) StartRecentReconcile(reason string) bool {
 	return true
 }
 
+var pendingMediaRefreshSchedule = []time.Duration{
+	0,
+	2 * time.Second,
+	6 * time.Second,
+	15 * time.Second,
+}
+
+func (a *App) StartPendingMediaRefresh(conversationID, messageID string) bool {
+	conversationID = strings.TrimSpace(conversationID)
+	messageID = strings.TrimSpace(messageID)
+	if conversationID == "" || messageID == "" || a.backfillRunning.Load() {
+		return false
+	}
+
+	key := conversationID + "|" + messageID
+	a.pendingMediaMu.Lock()
+	if a.pendingMedia == nil {
+		a.pendingMedia = make(map[string]struct{})
+	}
+	if _, exists := a.pendingMedia[key]; exists {
+		a.pendingMediaMu.Unlock()
+		return false
+	}
+	a.pendingMedia[key] = struct{}{}
+	a.pendingMediaMu.Unlock()
+
+	go func() {
+		defer func() {
+			a.pendingMediaMu.Lock()
+			delete(a.pendingMedia, key)
+			a.pendingMediaMu.Unlock()
+		}()
+		a.refreshPendingMediaMessageWithSchedule(conversationID, messageID, pendingMediaRefreshSchedule)
+	}()
+	return true
+}
+
 func (a *App) GooglePaired() bool {
 	_, err := os.Stat(a.SessionPath)
 	return err == nil
@@ -408,6 +468,19 @@ func (a *App) GoogleStatus() GoogleStatusSnapshot {
 		NeedsPairing: !a.Connected.Load() && !a.GooglePaired(),
 		LastError:    lastError,
 	}
+}
+
+func (a *App) AnyConnected() bool {
+	if a.Connected.Load() {
+		return true
+	}
+	if a.WhatsAppStatus().Connected {
+		return true
+	}
+	if a.SignalStatus().Connected {
+		return true
+	}
+	return false
 }
 
 func (a *App) ReconnectGoogleMessages() error {
@@ -466,6 +539,11 @@ func (a *App) GetBackfillProgress() BackfillProgress {
 func (a *App) Close() {
 	if cli := a.GetClient(); cli != nil {
 		cli.GM.Disconnect()
+	}
+	if signal := a.GetSignal(); signal != nil {
+		if err := signal.Close(); err != nil {
+			a.Logger.Warn().Err(err).Msg("Failed to close Signal bridge")
+		}
 	}
 	if wa := a.GetWhatsApp(); wa != nil {
 		if err := wa.Close(); err != nil {

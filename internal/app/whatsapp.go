@@ -114,6 +114,25 @@ func (a *App) SendWhatsAppMedia(conversationID string, data []byte, filename, mi
 	return bridge.SendMedia(conversationID, data, filename, mime, caption, replyToID)
 }
 
+func (a *App) SendWhatsAppReaction(conversationID, messageID, emoji, action string) error {
+	bridge, err := a.ensureWhatsApp()
+	if err != nil {
+		return fmt.Errorf("init WhatsApp bridge: %w", err)
+	}
+	return bridge.SendReaction(conversationID, messageID, emoji, action)
+}
+
+func (a *App) LeaveWhatsAppGroup(conversationID string) error {
+	bridge, err := a.ensureWhatsApp()
+	if err != nil {
+		return fmt.Errorf("init WhatsApp bridge: %w", err)
+	}
+	if err := bridge.LeaveGroup(conversationID); err != nil {
+		return fmt.Errorf("leave WhatsApp group: %w", err)
+	}
+	return nil
+}
+
 func (a *App) DownloadWhatsAppMedia(msg *db.Message) ([]byte, string, error) {
 	bridge, err := a.ensureWhatsApp()
 	if err != nil {

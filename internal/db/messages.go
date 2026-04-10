@@ -8,7 +8,7 @@ import (
 )
 
 // messageColumns is the canonical column list for SELECT queries on messages.
-const messageColumns = `message_id, conversation_id, sender_name, sender_number, body, timestamp_ms, status, is_from_me, media_id, mime_type, decryption_key, reactions, reply_to_id, source_platform, source_id`
+const messageColumns = `message_id, conversation_id, sender_name, sender_number, body, timestamp_ms, status, is_from_me, mentions_me, media_id, mime_type, decryption_key, reactions, reply_to_id, source_platform, source_id`
 
 func (s *Store) UpsertMessage(m *Message) error {
 	tx, err := s.db.Begin()
@@ -28,8 +28,8 @@ func (s *Store) UpsertMessage(m *Message) error {
 
 func upsertMessageTx(tx *sql.Tx, m *Message) error {
 	_, err := tx.Exec(`
-		INSERT INTO messages (message_id, conversation_id, sender_name, sender_number, body, timestamp_ms, status, is_from_me, media_id, mime_type, decryption_key, reactions, reply_to_id, source_platform, source_id)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO messages (message_id, conversation_id, sender_name, sender_number, body, timestamp_ms, status, is_from_me, mentions_me, media_id, mime_type, decryption_key, reactions, reply_to_id, source_platform, source_id)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(message_id) DO UPDATE SET
 			conversation_id=excluded.conversation_id,
 			sender_name=excluded.sender_name,
@@ -38,6 +38,7 @@ func upsertMessageTx(tx *sql.Tx, m *Message) error {
 			timestamp_ms=excluded.timestamp_ms,
 			status=excluded.status,
 			is_from_me=excluded.is_from_me,
+			mentions_me=excluded.mentions_me,
 			media_id=excluded.media_id,
 			mime_type=excluded.mime_type,
 			decryption_key=excluded.decryption_key,
@@ -45,7 +46,7 @@ func upsertMessageTx(tx *sql.Tx, m *Message) error {
 			reply_to_id=excluded.reply_to_id,
 			source_platform=excluded.source_platform,
 			source_id=excluded.source_id
-	`, m.MessageID, m.ConversationID, m.SenderName, m.SenderNumber, m.Body, m.TimestampMS, m.Status, m.IsFromMe, m.MediaID, m.MimeType, m.DecryptionKey, m.Reactions, m.ReplyToID, m.SourcePlatform, m.SourceID)
+	`, m.MessageID, m.ConversationID, m.SenderName, m.SenderNumber, m.Body, m.TimestampMS, m.Status, m.IsFromMe, m.MentionsMe, m.MediaID, m.MimeType, m.DecryptionKey, m.Reactions, m.ReplyToID, m.SourcePlatform, m.SourceID)
 	if err != nil {
 		return err
 	}
@@ -248,7 +249,7 @@ func (s *Store) GetMessageByID(messageID string) (*Message, error) {
 		FROM messages WHERE message_id = ?
 	`, messageID)
 	m := &Message{}
-	err := row.Scan(&m.MessageID, &m.ConversationID, &m.SenderName, &m.SenderNumber, &m.Body, &m.TimestampMS, &m.Status, &m.IsFromMe, &m.MediaID, &m.MimeType, &m.DecryptionKey, &m.Reactions, &m.ReplyToID, &m.SourcePlatform, &m.SourceID)
+	err := row.Scan(&m.MessageID, &m.ConversationID, &m.SenderName, &m.SenderNumber, &m.Body, &m.TimestampMS, &m.Status, &m.IsFromMe, &m.MentionsMe, &m.MediaID, &m.MimeType, &m.DecryptionKey, &m.Reactions, &m.ReplyToID, &m.SourcePlatform, &m.SourceID)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil
@@ -256,6 +257,24 @@ func (s *Store) GetMessageByID(messageID string) (*Message, error) {
 		return nil, err
 	}
 	return m, nil
+}
+
+func (s *Store) GetMessagesByConversationAtTimestamp(conversationID string, timestampMS int64, limit int) ([]*Message, error) {
+	if limit <= 0 {
+		limit = 10
+	}
+	rows, err := s.db.Query(`
+		SELECT `+messageColumns+`
+		FROM messages
+		WHERE conversation_id = ? AND timestamp_ms = ?
+		ORDER BY message_id ASC
+		LIMIT ?
+	`, conversationID, timestampMS, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanMessages(rows)
 }
 
 func (s *Store) ListLegacyWhatsAppMediaPlaceholders(limit int) ([]*Message, error) {
@@ -434,7 +453,7 @@ func scanMessages(rows interface {
 	var msgs []*Message
 	for rows.Next() {
 		m := &Message{}
-		if err := rows.Scan(&m.MessageID, &m.ConversationID, &m.SenderName, &m.SenderNumber, &m.Body, &m.TimestampMS, &m.Status, &m.IsFromMe, &m.MediaID, &m.MimeType, &m.DecryptionKey, &m.Reactions, &m.ReplyToID, &m.SourcePlatform, &m.SourceID); err != nil {
+		if err := rows.Scan(&m.MessageID, &m.ConversationID, &m.SenderName, &m.SenderNumber, &m.Body, &m.TimestampMS, &m.Status, &m.IsFromMe, &m.MentionsMe, &m.MediaID, &m.MimeType, &m.DecryptionKey, &m.Reactions, &m.ReplyToID, &m.SourcePlatform, &m.SourceID); err != nil {
 			return nil, err
 		}
 		msgs = append(msgs, m)

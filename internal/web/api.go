@@ -9,6 +9,7 @@ import (
 	"io"
 	"io/fs"
 	"net/http"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -42,6 +43,7 @@ type APIOptions struct {
 	Client                func() *client.Client
 	Events                *EventBroker
 	EventHeartbeat        time.Duration
+	IdentityName          string
 	IsConnected           StatusChecker
 	GoogleStatus          func() any
 	ReconnectGoogle       func() error
@@ -49,12 +51,22 @@ type APIOptions struct {
 	WhatsAppStatus        func() any
 	ConnectWhatsApp       func() error
 	UnpairWhatsApp        func() error
+	SignalStatus          func() any
+	ConnectSignal         func() error
+	UnpairSignal          func() error
+	LeaveWhatsAppGroup    func(conversationID string) error
 	WhatsAppQRCode        func() (any, error)
+	SignalQRCode          func() (any, error)
 	WhatsAppAvatar        func(conversationID string) ([]byte, string, error)
 	FetchLinkPreview      LinkPreviewFetcher
 	SendWhatsAppText      func(conversationID, body, replyToID string) (*db.Message, error)
+	SendWhatsAppReaction  func(conversationID, messageID, emoji, action string) error
+	SendSignalText        func(conversationID, body, replyToID string) (*db.Message, error)
+	SendSignalMedia       func(conversationID string, data []byte, filename, mime, caption, replyToID string) (*db.Message, error)
+	SendSignalReaction    func(conversationID, messageID, emoji, action string) error
 	SendWhatsAppMedia     func(conversationID string, data []byte, filename, mime, caption, replyToID string) (*db.Message, error)
 	DownloadWhatsAppMedia func(msg *db.Message) ([]byte, string, error)
+	DownloadSignalMedia   func(msg *db.Message) ([]byte, string, error)
 	StartDeepBackfill     func() bool
 	BackfillStatus        func() any         // returns a JSON-serializable backfill progress snapshot
 	BackfillPhone         func(string) error // targeted backfill for a single phone number
@@ -86,6 +98,7 @@ func APIHandler(store *db.Store, cli *client.Client, logger zerolog.Logger, mcpH
 
 func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.Logger, mcpHandler http.Handler, opts APIOptions) http.Handler {
 	mux := http.NewServeMux()
+	diagnosticsStartedAt := time.Now()
 	getClient := func() *client.Client {
 		if opts.Client != nil {
 			return opts.Client()
@@ -123,11 +136,17 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		payload := map[string]any{
 			"connected": connected,
 		}
+		if strings.TrimSpace(opts.IdentityName) != "" {
+			payload["identity_name"] = strings.TrimSpace(opts.IdentityName)
+		}
 		if opts.GoogleStatus != nil {
 			payload["google"] = opts.GoogleStatus()
 		}
 		if opts.WhatsAppStatus != nil {
 			payload["whatsapp"] = opts.WhatsAppStatus()
+		}
+		if opts.SignalStatus != nil {
+			payload["signal"] = opts.SignalStatus()
 		}
 		if opts.BackfillStatus != nil {
 			payload["backfill"] = opts.BackfillStatus()
@@ -135,8 +154,74 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		return payload
 	}
 	diagnosticsPayload := func() map[string]any {
+		now := time.Now()
+		var mem runtime.MemStats
+		runtime.ReadMemStats(&mem)
+
 		payload := statusPayload(currentConnected())
-		payload["generated_at"] = time.Now().UnixMilli()
+		payload["schema_version"] = 1
+		payload["generated_at"] = now.UnixMilli()
+		payload["generated_at_iso"] = now.UTC().Format(time.RFC3339Nano)
+		payload["backend"] = map[string]any{
+			"go_version": runtime.Version(),
+			"goos":       runtime.GOOS,
+			"goarch":     runtime.GOARCH,
+			"goroutines": runtime.NumGoroutine(),
+			"uptime_ms":  time.Since(diagnosticsStartedAt).Milliseconds(),
+		}
+		payload["memory"] = map[string]any{
+			"alloc_bytes":         mem.Alloc,
+			"total_alloc_bytes":   mem.TotalAlloc,
+			"sys_bytes":           mem.Sys,
+			"heap_alloc_bytes":    mem.HeapAlloc,
+			"heap_inuse_bytes":    mem.HeapInuse,
+			"heap_idle_bytes":     mem.HeapIdle,
+			"heap_released_bytes": mem.HeapReleased,
+			"next_gc_bytes":       mem.NextGC,
+			"last_gc_unix_ms":     int64(mem.LastGC / uint64(time.Millisecond)),
+			"gc_count":            mem.NumGC,
+		}
+		payload["capabilities"] = map[string]any{
+			"google": map[string]bool{
+				"status":    opts.GoogleStatus != nil,
+				"reconnect": opts.ReconnectGoogle != nil,
+				"unpair":    opts.Unpair != nil,
+			},
+			"whatsapp": map[string]bool{
+				"status":         opts.WhatsAppStatus != nil,
+				"connect":        opts.ConnectWhatsApp != nil,
+				"unpair":         opts.UnpairWhatsApp != nil,
+				"qr":             opts.WhatsAppQRCode != nil,
+				"avatar":         opts.WhatsAppAvatar != nil,
+				"send_text":      opts.SendWhatsAppText != nil,
+				"send_media":     opts.SendWhatsAppMedia != nil,
+				"send_reaction":  opts.SendWhatsAppReaction != nil,
+				"download_media": opts.DownloadWhatsAppMedia != nil,
+				"leave_group":    opts.LeaveWhatsAppGroup != nil,
+			},
+			"signal": map[string]bool{
+				"status":         opts.SignalStatus != nil,
+				"connect":        opts.ConnectSignal != nil,
+				"unpair":         opts.UnpairSignal != nil,
+				"qr":             opts.SignalQRCode != nil,
+				"send_text":      opts.SendSignalText != nil,
+				"send_media":     opts.SendSignalMedia != nil,
+				"send_reaction":  opts.SendSignalReaction != nil,
+				"download_media": opts.DownloadSignalMedia != nil,
+			},
+			"backfill": map[string]bool{
+				"status":   opts.BackfillStatus != nil,
+				"deep":     opts.StartDeepBackfill != nil,
+				"targeted": opts.BackfillPhone != nil,
+			},
+			"link_preview": map[string]bool{
+				"fetch": opts.FetchLinkPreview != nil,
+			},
+			"events": map[string]bool{
+				"sse":       opts.Events != nil,
+				"heartbeat": opts.EventHeartbeat > 0,
+			},
+		}
 
 		platforms := []string{"sms", "whatsapp", "imessage", "gchat", "signal", "telegram"}
 		convCounts := map[string]int{}
@@ -185,10 +270,20 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		conv, err := store.GetConversation(conversationID)
 		return err == nil && conv != nil && conv.SourcePlatform == "whatsapp"
 	}
+	isSignalConversation := func(conversationID string) bool {
+		if strings.HasPrefix(conversationID, "signal:") || strings.HasPrefix(conversationID, "signal-group:") {
+			return true
+		}
+		conv, err := store.GetConversation(conversationID)
+		return err == nil && conv != nil && conv.SourcePlatform == "signal"
+	}
 	var (
 		errWhatsAppTextUnavailable  = errors.New("WhatsApp sending is not available")
 		errWhatsAppMediaUnavailable = errors.New("WhatsApp media sending is not available")
 		errWhatsAppLocalStore       = errors.New("whatsapp local store update failed")
+		errSignalTextUnavailable    = errors.New("Signal sending is not available")
+		errSignalMediaUnavailable   = errors.New("Signal media sending is not available")
+		errSignalLocalStore         = errors.New("signal local store update failed")
 	)
 	sendWhatsAppText := func(conversationID, body, replyToID, deleteDraftID string) (*db.Message, error) {
 		if opts.SendWhatsAppText == nil {
@@ -213,6 +308,32 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		}
 		if err := recordOutgoingMessage(msg, ""); err != nil {
 			return nil, fmt.Errorf("%w: %v", errWhatsAppLocalStore, err)
+		}
+		return msg, nil
+	}
+	sendSignalText := func(conversationID, body, replyToID, deleteDraftID string) (*db.Message, error) {
+		if opts.SendSignalText == nil {
+			return nil, errSignalTextUnavailable
+		}
+		msg, err := opts.SendSignalText(conversationID, body, replyToID)
+		if err != nil {
+			return nil, err
+		}
+		if err := recordOutgoingMessage(msg, deleteDraftID); err != nil {
+			return nil, fmt.Errorf("%w: %v", errSignalLocalStore, err)
+		}
+		return msg, nil
+	}
+	sendSignalMedia := func(conversationID string, data []byte, filename, mime, caption, replyToID string) (*db.Message, error) {
+		if opts.SendSignalMedia == nil {
+			return nil, errSignalMediaUnavailable
+		}
+		msg, err := opts.SendSignalMedia(conversationID, data, filename, mime, caption, replyToID)
+		if err != nil {
+			return nil, err
+		}
+		if err := recordOutgoingMessage(msg, ""); err != nil {
+			return nil, fmt.Errorf("%w: %v", errSignalLocalStore, err)
 		}
 		return msg, nil
 	}
@@ -291,14 +412,43 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 	})
 
 	mux.HandleFunc("/api/conversations/", func(w http.ResponseWriter, r *http.Request) {
-		// Parse: /api/conversations/{id}/messages
 		path := strings.TrimPrefix(r.URL.Path, "/api/conversations/")
-		parts := strings.SplitN(path, "/", 2)
-		if len(parts) != 2 || parts[1] != "messages" {
+		parts := strings.Split(path, "/")
+		if len(parts) < 2 {
 			httpError(w, "not found", 404)
 			return
 		}
-		convID := parts[0]
+		action := parts[len(parts)-1]
+		convID := strings.Join(parts[:len(parts)-1], "/")
+		if action == "notification-mode" {
+			if r.Method != http.MethodPost && r.Method != http.MethodPatch {
+				httpError(w, "method not allowed", 405)
+				return
+			}
+			var req struct {
+				NotificationMode string `json:"notification_mode"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				httpError(w, "invalid JSON: "+err.Error(), 400)
+				return
+			}
+			if err := store.SetConversationNotificationMode(convID, req.NotificationMode); err != nil {
+				httpError(w, "set notification mode: "+err.Error(), 400)
+				return
+			}
+			convo, err := store.GetConversation(convID)
+			if err != nil {
+				httpError(w, "get conversation: "+err.Error(), 500)
+				return
+			}
+			publishConversations()
+			writeJSON(w, convo)
+			return
+		}
+		if action != "messages" {
+			httpError(w, "not found", 404)
+			return
+		}
 		limit := queryInt(r, "limit", 100)
 		beforeMS := queryInt64(r, "before", 0)
 		afterMS := queryInt64(r, "after", 0)
@@ -423,6 +573,28 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			})
 			return
 		}
+		if isSignalConversation(req.ConversationID) {
+			msg, err := sendSignalText(req.ConversationID, req.Message, req.ReplyToID, "")
+			switch {
+			case errors.Is(err, errSignalTextUnavailable):
+				httpError(w, err.Error(), 501)
+				return
+			case errors.Is(err, errSignalLocalStore):
+				httpError(w, "message sent remotely but failed to update local store: "+err.Error(), 500)
+				return
+			case err != nil:
+				httpError(w, err.Error(), 502)
+				return
+			}
+			publishMessages(req.ConversationID)
+			publishConversations()
+			writeJSON(w, map[string]any{
+				"message_id": msg.MessageID,
+				"status":     "SUCCESS",
+				"success":    true,
+			})
+			return
+		}
 		cli := getClient()
 		if cli == nil {
 			httpError(w, app.ErrNotConnected, 503)
@@ -510,6 +682,28 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		mime := header.Header.Get("Content-Type")
 		if mime == "" {
 			mime = "application/octet-stream"
+		}
+		if isSignalConversation(convID) {
+			msg, err := sendSignalMedia(convID, data, header.Filename, mime, caption, replyToID)
+			switch {
+			case errors.Is(err, errSignalMediaUnavailable):
+				httpError(w, err.Error(), 501)
+				return
+			case errors.Is(err, errSignalLocalStore):
+				httpError(w, "message sent remotely but failed to update local store: "+err.Error(), 500)
+				return
+			case err != nil:
+				httpError(w, err.Error(), 502)
+				return
+			}
+			publishMessages(convID)
+			publishConversations()
+			writeJSON(w, map[string]any{
+				"message_id": msg.MessageID,
+				"status":     "SUCCESS",
+				"success":    true,
+			})
+			return
 		}
 		if isWhatsAppConversation(convID) {
 			msg, err := sendWhatsAppMedia(convID, data, header.Filename, mime, caption, replyToID)
@@ -628,6 +822,24 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			w.Write(data)
 			return
 		}
+		if msg.SourcePlatform == "signal" || strings.HasPrefix(msg.MessageID, "signal:") || strings.HasPrefix(msg.MediaID, "signalatt:") {
+			if opts.DownloadSignalMedia == nil {
+				httpError(w, "signal media not available", 404)
+				return
+			}
+			data, mimeType, err := opts.DownloadSignalMedia(msg)
+			if err != nil {
+				httpError(w, err.Error(), 502)
+				return
+			}
+			if mimeType == "" {
+				mimeType = msg.MimeType
+			}
+			w.Header().Set("Content-Type", mimeType)
+			w.Header().Set("Cache-Control", "public, max-age=86400")
+			w.Write(data)
+			return
+		}
 		cli := getClient()
 		if cli == nil {
 			httpError(w, app.ErrNotConnected, 503)
@@ -668,6 +880,33 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			httpError(w, "message_id and emoji are required", 400)
 			return
 		}
+		if isWhatsAppConversation(req.ConversationID) {
+			if opts.SendWhatsAppReaction == nil {
+				httpError(w, "whatsapp reactions are not available", 501)
+				return
+			}
+			if err := opts.SendWhatsAppReaction(req.ConversationID, req.MessageID, req.Emoji, req.Action); err != nil {
+				httpError(w, "send reaction: "+err.Error(), 502)
+				return
+			}
+			publishMessages(req.ConversationID)
+			writeJSON(w, map[string]any{"success": true})
+			return
+		}
+		if isSignalConversation(req.ConversationID) {
+			if opts.SendSignalReaction == nil {
+				httpError(w, "signal reactions are not available", 501)
+				return
+			}
+			if err := opts.SendSignalReaction(req.ConversationID, req.MessageID, req.Emoji, req.Action); err != nil {
+				httpError(w, "send reaction: "+err.Error(), 502)
+				return
+			}
+			publishMessages(req.ConversationID)
+			writeJSON(w, map[string]any{"success": true})
+			return
+		}
+
 		cli := getClient()
 		if cli == nil {
 			httpError(w, app.ErrNotConnected, 503)
@@ -832,6 +1071,29 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 				httpError(w, err.Error(), 501)
 				return
 			case errors.Is(err, errWhatsAppLocalStore):
+				httpError(w, "message sent remotely but failed to update local store: "+err.Error(), 500)
+				return
+			case err != nil:
+				httpError(w, err.Error(), 502)
+				return
+			}
+			publishMessages(draft.ConversationID)
+			publishDrafts(draft.ConversationID)
+			publishConversations()
+			writeJSON(w, map[string]any{
+				"message_id": msg.MessageID,
+				"status":     "SUCCESS",
+				"success":    true,
+			})
+			return
+		}
+		if isSignalConversation(draft.ConversationID) {
+			msg, err := sendSignalText(draft.ConversationID, req.Body, "", req.DraftID)
+			switch {
+			case errors.Is(err, errSignalTextUnavailable):
+				httpError(w, err.Error(), 501)
+				return
+			case errors.Is(err, errSignalLocalStore):
 				httpError(w, "message sent remotely but failed to update local store: "+err.Error(), 500)
 				return
 			case err != nil:
@@ -1062,6 +1324,61 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		writeJSON(w, opts.WhatsAppStatus())
 	})
 
+	mux.HandleFunc("/api/signal/status", func(w http.ResponseWriter, r *http.Request) {
+		if opts.SignalStatus == nil {
+			httpError(w, "signal live bridge not available", 404)
+			return
+		}
+		writeJSON(w, opts.SignalStatus())
+	})
+
+	mux.HandleFunc("/api/signal/connect", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			httpError(w, "method not allowed", 405)
+			return
+		}
+		if opts.ConnectSignal == nil || opts.SignalStatus == nil {
+			httpError(w, "signal live bridge not available", 404)
+			return
+		}
+		if err := opts.ConnectSignal(); err != nil {
+			httpError(w, "connect signal: "+err.Error(), 502)
+			return
+		}
+		publishStatus(currentConnected())
+		writeJSON(w, opts.SignalStatus())
+	})
+
+	mux.HandleFunc("/api/signal/qr", func(w http.ResponseWriter, r *http.Request) {
+		if opts.SignalQRCode == nil {
+			httpError(w, "signal qr not available", 404)
+			return
+		}
+		qrPayload, err := opts.SignalQRCode()
+		if err != nil {
+			httpError(w, err.Error(), 404)
+			return
+		}
+		writeJSON(w, qrPayload)
+	})
+
+	mux.HandleFunc("/api/signal/unpair", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			httpError(w, "method not allowed", 405)
+			return
+		}
+		if opts.UnpairSignal == nil || opts.SignalStatus == nil {
+			httpError(w, "signal live bridge not available", 404)
+			return
+		}
+		if err := opts.UnpairSignal(); err != nil {
+			httpError(w, "unpair signal: "+err.Error(), 500)
+			return
+		}
+		publishStatus(currentConnected())
+		writeJSON(w, opts.SignalStatus())
+	})
+
 	mux.HandleFunc("/api/whatsapp/connect", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			httpError(w, "method not allowed", 405)
@@ -1141,6 +1458,57 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		}
 		publishStatus(currentConnected())
 		writeJSON(w, opts.WhatsAppStatus())
+	})
+
+	mux.HandleFunc("/api/whatsapp/leave-group", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			httpError(w, "method not allowed", 405)
+			return
+		}
+		if opts.LeaveWhatsAppGroup == nil {
+			httpError(w, "whatsapp group leave is not available", 404)
+			return
+		}
+		var req struct {
+			ConversationID string `json:"conversation_id"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			httpError(w, "invalid JSON: "+err.Error(), 400)
+			return
+		}
+		req.ConversationID = strings.TrimSpace(req.ConversationID)
+		if req.ConversationID == "" {
+			httpError(w, "conversation_id is required", 400)
+			return
+		}
+		convo, err := store.GetConversation(req.ConversationID)
+		if err != nil {
+			httpError(w, "get conversation: "+err.Error(), 500)
+			return
+		}
+		if convo == nil {
+			httpError(w, "conversation not found", 404)
+			return
+		}
+		if convo.SourcePlatform != "whatsapp" {
+			httpError(w, "conversation is not a WhatsApp thread", 400)
+			return
+		}
+		if !convo.IsGroup {
+			httpError(w, "conversation is not a WhatsApp group", 400)
+			return
+		}
+		if err := opts.LeaveWhatsAppGroup(req.ConversationID); err != nil {
+			httpError(w, err.Error(), 502)
+			return
+		}
+		publishMessages(req.ConversationID)
+		publishDrafts(req.ConversationID)
+		publishConversations()
+		writeJSON(w, map[string]any{
+			"success":         true,
+			"conversation_id": req.ConversationID,
+		})
 	})
 
 	mux.HandleFunc("/api/unpair", func(w http.ResponseWriter, r *http.Request) {

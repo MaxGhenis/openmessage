@@ -25,6 +25,10 @@ struct MenuBarView: View {
             }
             .keyboardShortcut("o")
 
+            SettingsLink {
+                Text("Settings…")
+            }
+
             Divider()
 
             Button("Quit OpenMessage") {
