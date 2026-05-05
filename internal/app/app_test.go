@@ -1,6 +1,8 @@
 package app
 
 import (
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -53,6 +55,34 @@ func TestNewDemoUsesIsolatedTempDataDir(t *testing.T) {
 
 	if _, err := os.Stat(demoDir); !os.IsNotExist(err) {
 		t.Fatalf("expected demo dir cleanup, stat err = %v", err)
+	}
+}
+
+func TestIsSessionInvalidated(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil error", nil, false},
+		{"401 status code", errors.New("http 401 while polling"), true},
+		{"SESSION_COOKIE_INVALID code", errors.New("RPC failed: SESSION_COOKIE_INVALID"), true},
+		{"401 in wrapped libgm error",
+			fmt.Errorf("listen: %w", errors.New("server returned status 401")), true},
+		{"transient network failure",
+			errors.New("dial tcp: i/o timeout"), false},
+		{"unrelated 500 error",
+			errors.New("http 500 internal server error"), false},
+		{"transient RPC error",
+			errors.New("context deadline exceeded"), false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isSessionInvalidated(tc.err); got != tc.want {
+				t.Fatalf("isSessionInvalidated(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
 	}
 }
 

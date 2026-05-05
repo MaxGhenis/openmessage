@@ -330,15 +330,26 @@ func (a *App) LoadAndConnect() error {
 		OnRealtimeGapRecovered: func(reason string) {
 			a.StartRecentReconcile(reason)
 		},
-		OnDisconnect: func() {
+		OnDisconnect: func(disconnectErr error) {
 			a.Connected.Store(false)
 			a.setClient(nil)
-			if err := os.Remove(a.SessionPath); err != nil && !os.IsNotExist(err) {
-				a.Logger.Warn().Err(err).Msg("Failed to remove invalidated Google Messages session")
+			// Distinguish a true session invalidation (e.g. user unpaired
+			// from their phone, cookies revoked) from a transient fatal
+			// error (network blip, server-side RPC failure). Issue #1
+			// specifies session.json should only be removed when the
+			// session itself is invalid; deleting on every fatal forces a
+			// full re-pair after every transient disconnect, which on
+			// long-running deployments effectively makes pairing fragile.
+			if isSessionInvalidated(disconnectErr) {
+				if err := os.Remove(a.SessionPath); err != nil && !os.IsNotExist(err) {
+					a.Logger.Warn().Err(err).Msg("Failed to remove invalidated Google Messages session")
+				}
+				a.setGoogleLastError("Google Messages session invalidated; pair again")
+			} else {
+				a.setGoogleLastError("Disconnected from Google Messages; will retry with existing session")
 			}
-			a.setGoogleLastError("Google Messages session invalidated; pair again")
 			a.emitStatusChange(false)
-			a.Logger.Warn().Msg("Disconnected from Google Messages")
+			a.Logger.Warn().Err(disconnectErr).Msg("Disconnected from Google Messages")
 		},
 	}
 	cli.GM.SetEventHandler(a.EventHandler.Handle)
@@ -352,6 +363,25 @@ func (a *App) LoadAndConnect() error {
 	a.emitStatusChange(true)
 	a.Logger.Info().Msg("Connected to Google Messages")
 	return nil
+}
+
+// isSessionInvalidated reports whether a disconnect error indicates the
+// Google Messages session itself is no longer valid (the user unpaired from
+// their phone, or the auth cookies were revoked) versus a transient fatal
+// error from libgm (network failure, RPC error). Only the former should
+// trigger session.json removal -- the latter should preserve the session so
+// reconnection can succeed without a full re-pair.
+//
+// libgm surfaces auth invalidation as an HTTP 401 with the
+// SESSION_COOKIE_INVALID error code in the response body. Both signals are
+// matched here for resilience against minor wording changes.
+func isSessionInvalidated(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "401") ||
+		strings.Contains(msg, "SESSION_COOKIE_INVALID")
 }
 
 // Unpair deletes the session file so the app can re-pair.
