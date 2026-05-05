@@ -4,6 +4,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -18,6 +19,26 @@ const (
 	recentReconcileMessageLimit      = 30
 	recentReconcileMaxPages          = 4
 )
+
+// orphanContactDiscoveryEnabled reports whether deep backfill should run
+// Phase C (contact-based orphan discovery).
+//
+// Phase C calls GetOrCreateConversation for every contact without prior
+// message history. Google Messages treats GetOrCreateConversation as a
+// thread-creation call: for each contact that has no existing thread, an
+// empty SMS thread is created on the user's phone. For users who only want
+// a deep history sync, that is an unwanted side effect.
+//
+// Phase C is therefore opt-in. Set OPENMESSAGES_BACKFILL_DISCOVER_ORPHANS=1
+// (or "true"/"yes"/"on") to enable. Default is disabled.
+func orphanContactDiscoveryEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("OPENMESSAGES_BACKFILL_DISCOVER_ORPHANS"))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
 
 // Backfill fetches existing conversations and recent messages from
 // Google Messages and stores them in the local database.
@@ -125,12 +146,20 @@ func (a *App) deepBackfill() {
 		}
 	}
 
-	// Phase C: Contact-based discovery for orphan phone numbers
-	a.BackfillProgress.setPhase(BackfillPhaseContacts)
-	if a.discoverFromContacts(gm, seen, clientToken) {
-		a.emitConversationsChange()
-		a.emitMessagesChange("")
-		return
+	// Phase C: Contact-based discovery for orphan phone numbers.
+	// Off by default because GetOrCreateConversation creates an empty SMS
+	// thread on the user's phone for each contact lacking one. Opt in via
+	// OPENMESSAGES_BACKFILL_DISCOVER_ORPHANS=1.
+	if orphanContactDiscoveryEnabled() {
+		a.BackfillProgress.setPhase(BackfillPhaseContacts)
+		if a.discoverFromContacts(gm, seen, clientToken) {
+			a.emitConversationsChange()
+			a.emitMessagesChange("")
+			return
+		}
+	} else {
+		a.Logger.Info().
+			Msg("Skipping Phase C (orphan-contact discovery); set OPENMESSAGES_BACKFILL_DISCOVER_ORPHANS=1 to enable. Note: enabling creates empty SMS threads for contacts without prior message history.")
 	}
 
 	progress := a.BackfillProgress.snapshot()
