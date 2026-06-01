@@ -45,12 +45,18 @@ func listConversationsHandler(a *app.App) server.ToolHandlerFunc {
 			if platform == "" {
 				msg += " Messages may not have synced yet."
 			}
-			return textResult(msg), nil
+			return structuredResult(map[string]any{
+				"count":           0,
+				"source_platform": platform,
+				"conversations":   []conversationSummary{},
+			}, msg), nil
 		}
 
 		var sb strings.Builder
+		summaries := make([]conversationSummary, 0, len(convs))
 		fmt.Fprintf(&sb, "%d conversations:\n\n", len(convs))
 		for _, c := range convs {
+			summaries = append(summaries, summarizeConversation(c))
 			ts := time.UnixMilli(c.LastMessageTS).Format(time.RFC3339)
 			group := ""
 			if c.IsGroup {
@@ -66,6 +72,10 @@ func listConversationsHandler(a *app.App) server.ToolHandlerFunc {
 			}
 			fmt.Fprintf(&sb, "- %s%s%s%s (ID: %s, last: %s)\n", c.Name, platform, group, unread, c.ConversationID, ts)
 		}
-		return textResult(sb.String()), nil
+		return structuredResult(map[string]any{
+			"count":           len(summaries),
+			"source_platform": platform,
+			"conversations":   summaries,
+		}, sb.String()), nil
 	}
 }

@@ -14,13 +14,15 @@ type Store struct {
 }
 
 type Conversation struct {
-	ConversationID string
-	Name           string
-	IsGroup        bool
-	Participants   string // JSON array
-	LastMessageTS  int64
-	UnreadCount    int
-	SourcePlatform string `json:"source_platform,omitempty"` // sms, gchat, imessage, whatsapp, signal, telegram
+	ConversationID   string
+	Name             string
+	IsGroup          bool
+	Participants     string // JSON array
+	LastMessageTS    int64
+	UnreadCount      int
+	SourcePlatform   string `json:"source_platform,omitempty"` // sms, gchat, imessage, whatsapp, signal, telegram
+	UnifiedID        string `json:"unified_id,omitempty"`
+	UnifiedName      string `json:"unified_name,omitempty"`
 	NotificationMode string `json:"notification_mode,omitempty"` // all, mentions, muted
 }
 

@@ -305,7 +305,7 @@ func (s *Store) ListLegacyWhatsAppMediaPlaceholders(limit int) ([]*Message, erro
 		SELECT `+messageColumns+`
 		FROM messages
 		WHERE source_platform = 'whatsapp'
-			AND body IN ('[Photo]', '[Video]', '[Audio]', '[Voice note]')
+			AND body IN ('[Photo]', '[Video]', '[Audio]', '[Voice note]', '[Sticker]')
 			AND IFNULL(media_id, '') = ''
 		ORDER BY timestamp_ms DESC, message_id DESC
 		LIMIT ?

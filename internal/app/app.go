@@ -202,6 +202,11 @@ func New(logger zerolog.Logger) (*App, error) {
 				Int("deleted", report.DeletedWhatsAppReactionPlaceholders).
 				Msg("Removed legacy WhatsApp reaction placeholder rows")
 		}
+		if report.DeletedWhatsAppUnsupportedRows > 0 {
+			logger.Info().
+				Int("deleted", report.DeletedWhatsAppUnsupportedRows).
+				Msg("Removed legacy WhatsApp unsupported placeholder rows")
+		}
 		if report.DeletedSignalReactionPlaceholders > 0 {
 			logger.Info().
 				Int("deleted", report.DeletedSignalReactionPlaceholders).

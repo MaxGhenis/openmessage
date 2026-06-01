@@ -16,6 +16,12 @@ import (
 )
 
 var (
+	sendWhatsAppText = func(a *app.App, conversationID, body, replyToID string) (*db.Message, error) {
+		return a.SendWhatsAppText(conversationID, body, replyToID)
+	}
+	sendSignalText = func(a *app.App, conversationID, body, replyToID string) (*db.Message, error) {
+		return a.SendSignalText(conversationID, body, replyToID)
+	}
 	getOrCreateGoogleConversation = func(a *app.App, phone string) (*gmproto.Conversation, error) {
 		cli := a.GetClient()
 		if cli == nil {
@@ -80,7 +86,16 @@ func sendMessageHandler(a *app.App) server.ToolHandlerFunc {
 			if err := a.Store.RecordOutgoingMessage(msg, ""); err != nil {
 				return errorResult(fmt.Sprintf("failed to persist sent message: %v", err)), nil
 			}
-			return textResult(fmt.Sprintf("Message sent to %s: %s", name, message)), nil
+			return structuredResult(map[string]any{
+				"ok": true,
+				"conversation": conversationSummary{
+					ConversationID: conversationID,
+					Name:           name,
+					SourcePlatform: "whatsapp",
+					IsGroup:        isGroup,
+				},
+				"message": summarizeMessage(msg),
+			}, fmt.Sprintf("Message sent to %s: %s", name, message)), nil
 		case "signal":
 			conversationID, name, number, isGroup, err := canonicalSignalDirectConversation(recipient)
 			if err != nil {
@@ -96,7 +111,16 @@ func sendMessageHandler(a *app.App) server.ToolHandlerFunc {
 			if err := a.Store.RecordOutgoingMessage(msg, ""); err != nil {
 				return errorResult(fmt.Sprintf("failed to persist sent message: %v", err)), nil
 			}
-			return textResult(fmt.Sprintf("Message sent to %s: %s", name, message)), nil
+			return structuredResult(map[string]any{
+				"ok": true,
+				"conversation": conversationSummary{
+					ConversationID: conversationID,
+					Name:           name,
+					SourcePlatform: "signal",
+					IsGroup:        isGroup,
+				},
+				"message": summarizeMessage(msg),
+			}, fmt.Sprintf("Message sent to %s: %s", name, message)), nil
 		case "sms":
 			conv, err := getOrCreateGoogleConversation(a, recipient)
 			if err != nil {
@@ -129,7 +153,19 @@ func sendMessageHandler(a *app.App) server.ToolHandlerFunc {
 			}, ""); err != nil {
 				return errorResult(fmt.Sprintf("failed to persist sent message: %v", err)), nil
 			}
-			return textResult(fmt.Sprintf("Message sent to %s: %s", firstNonEmpty(conv.GetName(), recipient), message)), nil
+			storedMsg, err := a.Store.GetMessageByID(payload.TmpID)
+			if err != nil {
+				return errorResult(fmt.Sprintf("failed to load sent message: %v", err)), nil
+			}
+			persistedConv, err := a.Store.GetConversation(conv.GetConversationID())
+			if err != nil {
+				return errorResult(fmt.Sprintf("failed to load conversation: %v", err)), nil
+			}
+			return structuredResult(map[string]any{
+				"ok":           true,
+				"conversation": summarizeConversation(persistedConv),
+				"message":      summarizeMessage(storedMsg),
+			}, fmt.Sprintf("Message sent to %s: %s", firstNonEmpty(conv.GetName(), recipient), message)), nil
 		default:
 			return errorResult(fmt.Sprintf("unsupported platform %q (supported: sms, whatsapp, signal)", platform)), nil
 		}

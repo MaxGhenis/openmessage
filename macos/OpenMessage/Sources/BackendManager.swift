@@ -92,6 +92,8 @@ final class BackendManager: ObservableObject {
     func start() {
         guard state != .starting, state != .running else { return }
 
+        migrateOldDataIfNeeded()
+
         state = .starting
         healthCheckTask?.cancel()
         healthCheckTask = nil

@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"mime/multipart"
 	"net/http"
@@ -1250,6 +1251,39 @@ func TestGetStatusIncludesGoogleSnapshot(t *testing.T) {
 	}
 	if google["paired"] != true || google["needs_pairing"] != false {
 		t.Fatalf("unexpected google payload: %#v", google)
+	}
+}
+
+func TestGoogleNetworkErrorIsUserFacing(t *testing.T) {
+	raw := `Post "https://instantmessaging-pa.clients6.google.com/$rpc/google.internal.communications.instantmessaging.v1.Messaging/SendMessage": dial tcp: lookup instantmessaging-pa.clients6.google.com: no such host`
+	if !isGoogleNetworkError(errors.New(raw)) {
+		t.Fatal("expected Google DNS failure to be recognized as a network error")
+	}
+
+	ts := newTestServerWithOptions(t, APIOptions{
+		ReconnectGoogle: func() error {
+			return errors.New(raw)
+		},
+	})
+	resp, err := http.Post(ts.server.URL+"/api/google/reconnect", "application/json", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("got status %d, want 502", resp.StatusCode)
+	}
+	var payload map[string]string
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	got := payload["error"]
+	if got != "Google Messages is offline. Check your internet connection, then try again." {
+		t.Fatalf("error = %q", got)
+	}
+	if strings.Contains(got, "instantmessaging") || strings.Contains(got, "dial tcp") {
+		t.Fatalf("error leaked transport details: %q", got)
 	}
 }
 

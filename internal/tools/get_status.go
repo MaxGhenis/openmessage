@@ -87,6 +87,12 @@ func getStatusHandler(a *app.App) server.ToolHandlerFunc {
 		}
 
 		fmt.Fprintf(&sb, "Data dir: %s\n", a.DataDir)
-		return textResult(sb.String()), nil
+		return structuredResult(map[string]any{
+			"overall_connected": overallConnected,
+			"google":            google,
+			"whatsapp":          whatsApp,
+			"signal":            signal,
+			"data_dir":          a.DataDir,
+		}, sb.String()), nil
 	}
 }

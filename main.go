@@ -24,9 +24,10 @@ func main() {
 	if len(os.Args) < 2 {
 		fmt.Fprintln(os.Stderr, "Usage: openmessage <pair|serve|demo|send|import>")
 		fmt.Fprintln(os.Stderr, "  pair [--google|--google-file path]       - Pair with your phone via QR or Google account cookies")
-		fmt.Fprintln(os.Stderr, "  serve [--demo|--mock]                    - Start the local web UI and MCP transports")
+		fmt.Fprintln(os.Stderr, "  serve [--demo] [--web|--no-web] [--mcp-sse|--no-mcp-sse] [--mcp-stdio] - Start explicit web/MCP transports")
 		fmt.Fprintln(os.Stderr, "  demo                                     - Start a seeded fake-data UI with live transports disabled")
-		fmt.Fprintln(os.Stderr, "  send <conversation_id> <msg>              - Send message to a conversation")
+		fmt.Fprintln(os.Stderr, "  read <query> [--limit N] [--phone X] [--json] - Search the local message store for text")
+		fmt.Fprintln(os.Stderr, "  send <conversation_id> <msg>              - Send text to an existing conversation across supported platforms")
 		fmt.Fprintln(os.Stderr, "  send-group <phone1,phone2,...> <msg>       - Send group message (MMS)")
 		fmt.Fprintln(os.Stderr, "  import gchat <groups-dir> [--email you@]  - Import Google Chat Takeout")
 		fmt.Fprintln(os.Stderr, "  import gchat-conversation <messages.json> - Import single GChat conversation")
@@ -44,6 +45,12 @@ func main() {
 		err = cmd.RunServe(logger, os.Args[2:]...)
 	case "demo":
 		err = cmd.RunDemo(logger)
+	case "read", "search":
+		if len(os.Args) < 3 {
+			fmt.Fprintln(os.Stderr, "Usage: openmessage read <query> [--limit N] [--phone NUMBER] [--json]")
+			os.Exit(1)
+		}
+		err = cmd.RunRead(logger, os.Args[2:]...)
 	case "send":
 		if len(os.Args) < 4 {
 			fmt.Fprintln(os.Stderr, "Usage: openmessage send <conversation_id> <message>")

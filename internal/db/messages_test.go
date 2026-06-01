@@ -797,3 +797,61 @@ func TestLatestReceivedTimestampIgnoresOutgoing(t *testing.T) {
 		t.Fatalf("LatestTimestamp sanity = %d, want 300", all)
 	}
 }
+
+func TestListLegacyWhatsAppMediaPlaceholdersIncludesStickers(t *testing.T) {
+	store := newTestStore(t)
+	rows := []*Message{
+		{
+			MessageID:      "whatsapp:sticker-placeholder",
+			ConversationID: "whatsapp:group@g.us",
+			Body:           "[Sticker]",
+			TimestampMS:    3000,
+			SourcePlatform: "whatsapp",
+			SourceID:       "sticker-placeholder",
+		},
+		{
+			MessageID:      "whatsapp:photo-placeholder",
+			ConversationID: "whatsapp:group@g.us",
+			Body:           "[Photo]",
+			TimestampMS:    2000,
+			SourcePlatform: "whatsapp",
+			SourceID:       "photo-placeholder",
+		},
+		{
+			MessageID:      "whatsapp:sticker-has-media",
+			ConversationID: "whatsapp:group@g.us",
+			Body:           "[Sticker]",
+			TimestampMS:    1000,
+			SourcePlatform: "whatsapp",
+			SourceID:       "sticker-has-media",
+			MediaID:        "wa:already-present",
+		},
+		{
+			MessageID:      "sms:sticker-placeholder",
+			ConversationID: "sms:thread-1",
+			Body:           "[Sticker]",
+			TimestampMS:    4000,
+			SourcePlatform: "sms",
+			SourceID:       "sms-sticker",
+		},
+	}
+	for _, row := range rows {
+		if err := store.UpsertMessage(row); err != nil {
+			t.Fatalf("upsert %s: %v", row.MessageID, err)
+		}
+	}
+
+	got, err := store.ListLegacyWhatsAppMediaPlaceholders(10)
+	if err != nil {
+		t.Fatalf("ListLegacyWhatsAppMediaPlaceholders: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d placeholders, want 2", len(got))
+	}
+	if got[0].MessageID != "whatsapp:sticker-placeholder" {
+		t.Fatalf("first placeholder = %q, want whatsapp:sticker-placeholder", got[0].MessageID)
+	}
+	if got[1].MessageID != "whatsapp:photo-placeholder" {
+		t.Fatalf("second placeholder = %q, want whatsapp:photo-placeholder", got[1].MessageID)
+	}
+}

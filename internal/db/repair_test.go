@@ -78,6 +78,81 @@ func TestRepairLegacyArtifactsDeletesLegacyWhatsAppReactionPlaceholders(t *testi
 	}
 }
 
+func TestRepairLegacyArtifactsDeletesLegacyWhatsAppUnsupportedPlaceholders(t *testing.T) {
+	store := newTestStore(t)
+
+	if err := store.UpsertConversation(&Conversation{
+		ConversationID: "whatsapp:direct@s.whatsapp.net",
+		Name:           "Direct",
+		LastMessageTS:  3000,
+		SourcePlatform: "whatsapp",
+	}); err != nil {
+		t.Fatalf("seed conversation: %v", err)
+	}
+	if err := store.UpsertMessage(&Message{
+		MessageID:      "whatsapp:real",
+		ConversationID: "whatsapp:direct@s.whatsapp.net",
+		Body:           "real message",
+		TimestampMS:    1000,
+		SourcePlatform: "whatsapp",
+		SourceID:       "real",
+	}); err != nil {
+		t.Fatalf("seed real message: %v", err)
+	}
+	if err := store.UpsertMessage(&Message{
+		MessageID:      "whatsapp:unsupported-bad",
+		ConversationID: "whatsapp:direct@s.whatsapp.net",
+		Body:           "[Unsupported message]",
+		TimestampMS:    3000,
+		SourcePlatform: "whatsapp",
+		SourceID:       "unsupported-bad",
+	}); err != nil {
+		t.Fatalf("seed legacy unsupported placeholder: %v", err)
+	}
+	if err := store.UpsertMessage(&Message{
+		MessageID:      "sms:literal-unsupported",
+		ConversationID: "whatsapp:direct@s.whatsapp.net",
+		Body:           "[Unsupported message]",
+		TimestampMS:    2000,
+		SourcePlatform: "sms",
+		SourceID:       "literal-unsupported",
+	}); err != nil {
+		t.Fatalf("seed literal unsupported message: %v", err)
+	}
+
+	report, err := store.RepairLegacyArtifacts()
+	if err != nil {
+		t.Fatalf("RepairLegacyArtifacts(): %v", err)
+	}
+	if report.DeletedWhatsAppUnsupportedRows != 1 {
+		t.Fatalf("deleted unsupported = %d, want 1", report.DeletedWhatsAppUnsupportedRows)
+	}
+
+	deleted, err := store.GetMessageByID("whatsapp:unsupported-bad")
+	if err != nil {
+		t.Fatalf("GetMessageByID(deleted): %v", err)
+	}
+	if deleted != nil {
+		t.Fatal("expected legacy unsupported placeholder to be deleted")
+	}
+
+	literal, err := store.GetMessageByID("sms:literal-unsupported")
+	if err != nil {
+		t.Fatalf("GetMessageByID(literal): %v", err)
+	}
+	if literal == nil {
+		t.Fatal("expected literal unsupported message to remain")
+	}
+
+	convo, err := store.GetConversation("whatsapp:direct@s.whatsapp.net")
+	if err != nil {
+		t.Fatalf("GetConversation(): %v", err)
+	}
+	if convo.LastMessageTS != 2000 {
+		t.Fatalf("last_message_ts = %d, want 2000", convo.LastMessageTS)
+	}
+}
+
 func TestRepairLegacyArtifactsDeletesLegacySignalReactionPlaceholders(t *testing.T) {
 	store := newTestStore(t)
 

@@ -1472,6 +1472,61 @@ func TestHandleMessageMarksMentionsFromWhatsAppContextInfo(t *testing.T) {
 	}
 }
 
+func TestHandleMessageFormatsMentionedNamesLikeWhatsApp(t *testing.T) {
+	store, err := db.New(filepath.Join(t.TempDir(), "messages.db"))
+	if err != nil {
+		t.Fatalf("db.New(): %v", err)
+	}
+	defer store.Close()
+
+	if err := store.UpsertConversation(&db.Conversation{
+		ConversationID: "whatsapp:120363019999999999@g.us",
+		Name:           "Hobbies and investing",
+		IsGroup:        true,
+		Participants:   `[{"name":"Priya Shah","number":"+261997383958549"},{"name":"Jordan Thibodeau","number":"+15551234567"}]`,
+		SourcePlatform: "whatsapp",
+	}); err != nil {
+		t.Fatalf("seed conversation: %v", err)
+	}
+
+	bridge := &Bridge{store: store}
+	bridge.handleMessage(&waevents.Message{
+		Info: watypes.MessageInfo{
+			MessageSource: watypes.MessageSource{
+				Chat:     watypes.NewJID("120363019999999999", watypes.GroupServer),
+				Sender:   watypes.NewJID("15551234567", watypes.DefaultUserServer),
+				IsFromMe: false,
+				IsGroup:  true,
+			},
+			ID:        "mention-name",
+			PushName:  "Jordan",
+			Timestamp: time.UnixMilli(1775001000000),
+		},
+		Message: &waE2E.Message{
+			ExtendedTextMessage: &waE2E.ExtendedTextMessage{
+				Text: strPtr(`I feel like I need to start charging people a monthly fee to see @261997383958549's posts "Thibodeau premium" or something.`),
+				ContextInfo: &waE2E.ContextInfo{
+					MentionedJID: []string{"261997383958549@s.whatsapp.net"},
+				},
+			},
+		},
+	})
+
+	msg, err := store.GetMessageByID("whatsapp:mention-name")
+	if err != nil {
+		t.Fatalf("GetMessageByID(): %v", err)
+	}
+	if msg == nil {
+		t.Fatal("expected stored WhatsApp message")
+	}
+	if !strings.Contains(msg.Body, "@~Priya's posts") {
+		t.Fatalf("body = %q, want @~Priya mention", msg.Body)
+	}
+	if strings.Contains(msg.Body, "@261997383958549") {
+		t.Fatalf("body = %q, did not expect raw numeric mention", msg.Body)
+	}
+}
+
 func TestConnectIfPairedStartsAsyncConnect(t *testing.T) {
 	ownJID := watypes.NewJID("15551230000", watypes.DefaultUserServer)
 	bridge := &Bridge{
@@ -2118,6 +2173,88 @@ func TestHandleMessageStoresWrappedWhatsAppAudio(t *testing.T) {
 	}
 	if msg.DecryptionKey != "0102" {
 		t.Fatalf("decryption_key = %q, want 0102", msg.DecryptionKey)
+	}
+}
+
+func TestHandleMessageStoresWhatsAppStickerMedia(t *testing.T) {
+	store, err := db.New(filepath.Join(t.TempDir(), "messages.db"))
+	if err != nil {
+		t.Fatalf("db.New(): %v", err)
+	}
+	defer store.Close()
+
+	bridge := &Bridge{store: store}
+	bridge.handleMessage(&waevents.Message{
+		Info: watypes.MessageInfo{
+			MessageSource: watypes.MessageSource{
+				Chat:   watypes.NewJID("15551234567", watypes.DefaultUserServer),
+				Sender: watypes.NewJID("15551234567", watypes.DefaultUserServer),
+			},
+			ID:        "sticker-msg",
+			Timestamp: time.UnixMilli(1700000003234),
+		},
+		Message: &waE2E.Message{
+			StickerMessage: &waE2E.StickerMessage{
+				Mimetype:      strPtr("image/webp"),
+				URL:           strPtr("https://cdn.example.test/sticker"),
+				DirectPath:    strPtr("/mms/sticker"),
+				MediaKey:      []byte{0x01, 0x02},
+				FileSHA256:    []byte{0x03, 0x04},
+				FileEncSHA256: []byte{0x05, 0x06},
+				FileLength:    uint64Ptr(7),
+			},
+		},
+	})
+
+	msg, err := store.GetMessageByID("whatsapp:sticker-msg")
+	if err != nil {
+		t.Fatalf("GetMessageByID(): %v", err)
+	}
+	if msg == nil {
+		t.Fatal("expected stored sticker message")
+	}
+	if msg.Body != "[Sticker]" {
+		t.Fatalf("body = %q, want [Sticker]", msg.Body)
+	}
+	if msg.MimeType != "image/webp" {
+		t.Fatalf("mime_type = %q, want image/webp", msg.MimeType)
+	}
+	if msg.MediaID == "" {
+		t.Fatal("expected media_id to be stored")
+	}
+	if msg.DecryptionKey != "0102" {
+		t.Fatalf("decryption_key = %q, want 0102", msg.DecryptionKey)
+	}
+}
+
+func TestHandleMessageSkipsUnsupportedWhatsAppPlaceholders(t *testing.T) {
+	store, err := db.New(filepath.Join(t.TempDir(), "messages.db"))
+	if err != nil {
+		t.Fatalf("db.New(): %v", err)
+	}
+	defer store.Close()
+
+	bridge := &Bridge{store: store}
+	bridge.handleMessage(&waevents.Message{
+		Info: watypes.MessageInfo{
+			MessageSource: watypes.MessageSource{
+				Chat:   watypes.NewJID("15551234567", watypes.DefaultUserServer),
+				Sender: watypes.NewJID("15551234567", watypes.DefaultUserServer),
+			},
+			ID:        "unsupported-msg",
+			Timestamp: time.UnixMilli(1700000004234),
+		},
+		Message: &waE2E.Message{
+			SendPaymentMessage: &waE2E.SendPaymentMessage{},
+		},
+	})
+
+	msg, err := store.GetMessageByID("whatsapp:unsupported-msg")
+	if err != nil {
+		t.Fatalf("GetMessageByID(): %v", err)
+	}
+	if msg != nil {
+		t.Fatalf("expected unsupported placeholder to be skipped, got %+v", msg)
 	}
 }
 

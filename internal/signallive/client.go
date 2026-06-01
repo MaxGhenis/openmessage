@@ -380,6 +380,7 @@ func (b *Bridge) Connect() error {
 			return nil
 		}
 		b.connecting = true
+		b.needsReauth = false
 		b.lastError = ""
 		account := b.account
 		b.mu.Unlock()
@@ -395,6 +396,7 @@ func (b *Bridge) Connect() error {
 	b.pairCancel = cancel
 	b.pairing = true
 	b.connecting = true
+	b.needsReauth = false
 	b.lastError = ""
 	b.qr = QRSnapshot{}
 	b.mu.Unlock()
@@ -2191,7 +2193,7 @@ func parseSignalAccounts(raw []byte) []string {
 	scanner := bufio.NewScanner(bytes.NewReader(raw))
 	for scanner.Scan() {
 		line := normalizeSignalAddress(scanner.Text())
-		if line != "" {
+		if isSignalAccountAddress(line) {
 			accounts = append(accounts, line)
 		}
 	}
@@ -2215,7 +2217,7 @@ func decodedSignalAccounts(raw []byte) []string {
 	accounts := make([]string, 0, 4)
 	appendAccount := func(number string) {
 		account := normalizeSignalAddress(number)
-		if account == "" {
+		if !isSignalAccountAddress(account) {
 			return
 		}
 		if _, ok := seen[account]; ok {
@@ -2425,6 +2427,19 @@ func signalConversationID(address, groupID string) string {
 
 func normalizeSignalAddress(value string) string {
 	return strings.TrimSpace(value)
+}
+
+func isSignalAccountAddress(value string) bool {
+	value = strings.TrimSpace(value)
+	if len(value) < 3 || value[0] != '+' {
+		return false
+	}
+	for _, r := range value[1:] {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // signalIncomingSourceID computes a stable SHA-1 message id from a Signal

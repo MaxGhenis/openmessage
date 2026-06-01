@@ -35,14 +35,19 @@ func getConversationHandler(a *app.App) server.ToolHandlerFunc {
 			return errorResult(fmt.Sprintf("query failed: %v", err)), nil
 		}
 
+		conv, convErr := a.Store.GetConversation(convID)
+
 		if len(msgs) == 0 {
-			return textResult("No messages found in this conversation."), nil
+			return structuredResult(map[string]any{
+				"conversation": summarizeConversation(conv),
+				"count":        0,
+				"messages":     []messageSummary{},
+			}, "No messages found in this conversation."), nil
 		}
 
 		var sb strings.Builder
 		// Show conversation info
-		conv, err := a.Store.GetConversation(convID)
-		if err == nil && conv != nil {
+		if convErr == nil && conv != nil {
 			platform := conv.SourcePlatform
 			if platform == "" {
 				platform = "sms"
@@ -55,10 +60,17 @@ func getConversationHandler(a *app.App) server.ToolHandlerFunc {
 		}
 
 		sb.WriteString(messagePreamble)
+		summaries := make([]messageSummary, 0, len(msgs))
 		for _, m := range msgs {
+			summaries = append(summaries, summarizeMessage(m))
 			sb.WriteString(formatMessageLine(m))
 			sb.WriteByte('\n')
 		}
-		return textResult(sb.String()), nil
+		return structuredResult(map[string]any{
+			"conversation":            summarizeConversation(conv),
+			"count":                   len(summaries),
+			"messages":                summaries,
+			"contains_untrusted_text": true,
+		}, sb.String()), nil
 	}
 }

@@ -3510,17 +3510,31 @@ body::after {
   color: var(--text-muted);
 }
 
+.thread-placeholder {
+  align-self: center;
+  margin: auto;
+  padding: 18px 20px;
+  color: var(--text-muted);
+  font-size: 13px;
+  text-align: center;
+}
+
+.thread-placeholder.is-error {
+  color: var(--text-secondary);
+}
+
 .connection-banner {
   margin: 16px 24px 0;
-  padding: 10px 12px;
+  padding: 12px 14px;
   border-radius: 12px;
   background: rgba(220, 80, 60, 0.08);
   border: 1px solid rgba(220, 80, 60, 0.16);
   box-shadow: none;
-  font-family: var(--font-mono);
-  font-size: 10px;
-  letter-spacing: 0.12em;
-  text-transform: uppercase;
+  font-family: var(--font-sans);
+  font-size: 13px;
+  line-height: 1.4;
+  letter-spacing: 0;
+  text-transform: none;
   color: #d44432;
   display: none;
   align-items: center;
@@ -3530,6 +3544,7 @@ body::after {
 
 .connection-banner-copy {
   flex: 1;
+  text-align: left;
 }
 
 .connection-banner-action {
@@ -3539,9 +3554,10 @@ body::after {
   border: 1px solid rgba(220, 80, 60, 0.2);
   background: rgba(220, 80, 60, 0.08);
   color: inherit;
-  font: inherit;
-  letter-spacing: 0.12em;
-  text-transform: uppercase;
+  font: 700 12px/1 var(--font-sans);
+  letter-spacing: 0;
+  text-transform: none;
+  white-space: nowrap;
   cursor: pointer;
 }
 
@@ -4277,6 +4293,8 @@ body::after {
   let nativeNotificationState = null;
   let pendingDeepLinkConversationID = conversationIDFromURL();
   let appStatus = { connected: false, google: {}, whatsapp: {}, signal: {}, backfill: {}, identity_name: '' };
+  let browserOnline = browserReportsOnline();
+  let networkIssueDetected = false;
   let googleStatus = {
     connected: false,
     paired: false,
@@ -4408,6 +4426,7 @@ body::after {
   const $emptyStateCta = document.getElementById('empty-state-cta');
 
   let replyToMsg = null; // {MessageID, SenderName, Body}
+  const composeTextByConversation = new Map();
   let contextMenuState = null;
   const QUICK_EMOJIS = ['😂', '❤️', '👍', '👎', '😮', '😢', '😡', '🙏', '🔥', '🎉', '👀', '💯'];
 
@@ -4910,6 +4929,13 @@ body::after {
     if (!convo || convo.IsGroup) return null;
     const participants = conversationParticipants(convo);
     const primary = participants.find(p => !(p && (p.is_me || p.isMe))) || participants[0] || {};
+    const unifiedID = String(convo.UnifiedID || convo.unified_id || '').trim();
+    if (unifiedID) {
+      return {
+        key: `unified::${unifiedID.toLowerCase()}`,
+        displayName: String(convo.UnifiedName || convo.unified_name || primary.name || convo.Name || 'Unknown').trim() || 'Unknown',
+      };
+    }
     const displayName = String(primary.name || convo.Name || '').trim();
     const displayKey = normalizePersonKey(displayName);
     const participantKey = normalizeParticipantIdentifier(primary.number || primary.phone || primary.email || primary.id || '');
@@ -6088,10 +6114,80 @@ body::after {
   }
 
   // ─── API calls ───
+  function browserReportsOnline() {
+    return typeof navigator === 'undefined' || navigator.onLine !== false;
+  }
+
+  function browserIsOffline() {
+    return browserOnline === false || networkIssueDetected;
+  }
+
+  function markConnectivityIssue() {
+    networkIssueDetected = true;
+    setConnectionState();
+    autoResize();
+  }
+
+  function offlineFeedbackMessage(context = 'request') {
+    switch (context) {
+      case 'send':
+        return 'No internet connection. Message not sent. Check your connection and try again.';
+      case 'start-conversation':
+        return 'No internet connection. New conversation not started. Check your connection and try again.';
+      case 'reconnect':
+        return "No internet connection. Google Messages will reconnect once you're back online.";
+      case 'google':
+        return 'Google Messages is offline. Check your internet connection, then try again.';
+      default:
+        return 'No internet connection. Local message history is still available.';
+    }
+  }
+
+  function isConnectivityErrorMessage(value) {
+    const message = String(value || '').toLowerCase();
+    return [
+      'google messages is offline',
+      'instantmessaging-pa.clients6.google.com',
+      'google.internal.communications.instantmessaging',
+      'no such host',
+      'temporary failure in name resolution',
+      'server misbehaving',
+      'dial tcp',
+      'lookup ',
+      'network is unreachable',
+      'no route to host',
+      'i/o timeout',
+      'context deadline exceeded',
+      'client.timeout exceeded',
+      'tls handshake timeout',
+      'connection refused',
+      'connection reset by peer',
+      'no internet connection',
+      'internet connection appears to be offline',
+      'not connected to the internet',
+    ].some(needle => message.includes(needle));
+  }
+
+  function userFacingErrorMessage(error, context = 'request') {
+    const message = error instanceof Error
+      ? error.message
+      : String(error || '');
+    if (!message) return '';
+    if (isConnectivityErrorMessage(message)) {
+      markConnectivityIssue();
+      return offlineFeedbackMessage(context);
+    }
+    return message;
+  }
+
   async function fetchJSON(url) {
-    const r = await fetch(API + url);
-    if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
-    return r.json();
+    try {
+      const r = await fetch(API + url);
+      if (!r.ok) throw new Error(await responseError(r));
+      return r.json();
+    } catch (err) {
+      throw err instanceof Error ? err : new Error(String(err || 'Request failed'));
+    }
   }
 
   async function responseError(r) {
@@ -6108,14 +6204,18 @@ body::after {
   }
 
   async function postJSON(url, body) {
-    const r = await fetch(API + url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    });
-    if (!r.ok) throw new Error(await responseError(r));
-    const text = await r.text();
-    return text ? JSON.parse(text) : null;
+    try {
+      const r = await fetch(API + url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      if (!r.ok) throw new Error(await responseError(r));
+      const text = await r.text();
+      return text ? JSON.parse(text) : null;
+    } catch (err) {
+      throw err instanceof Error ? err : new Error(String(err || 'Request failed'));
+    }
   }
 
   function clearThreadFeedback() {
@@ -6127,7 +6227,8 @@ body::after {
     $threadFeedback.classList.remove('active');
   }
 
-  function showThreadFeedback(message) {
+  function showThreadFeedback(message, context = 'request') {
+    message = userFacingErrorMessage(message, context);
     if (!message) return;
     if (threadFeedbackTimer) {
       clearTimeout(threadFeedbackTimer);
@@ -6387,6 +6488,11 @@ body::after {
 
   // ─── Select Conversation ───
   async function selectConversation(convo) {
+    const previousConvoId = activeConvoId;
+    const isConversationSwitch = previousConvoId !== convo.ConversationID;
+    if (isConversationSwitch) {
+      rememberActiveComposeText(previousConvoId);
+    }
     activeConvoId = convo.ConversationID;
     activeConversation = convo;
     pendingDeepLinkConversationID = '';
@@ -6424,8 +6530,14 @@ body::after {
     $chatHeaderName.textContent = convo.Name || 'Unknown';
     activeConvoIsGroup = !!convo.IsGroup;
     activeProtocolDetail = '';
+    if (isConversationSwitch) {
+      clearTransientComposerState();
+      restoreComposeText(convo.ConversationID);
+    }
     refreshConversationChrome();
     resetLoadedThreadState();
+    $messagesArea.setAttribute('aria-busy', 'true');
+    renderThreadPlaceholder('Loading messages...');
     await loadMessages(convo.ConversationID, {reset: true});
   }
 
@@ -6488,6 +6600,15 @@ body::after {
     lastRenderedWindowEnd = 0;
     activeProtocolDetail = '';
     clearThreadFeedback();
+  }
+
+  function renderThreadPlaceholder(message, modifier = '') {
+    if (!$messagesArea) return;
+    $messagesArea.innerHTML = '';
+    const el = document.createElement('div');
+    el.className = 'thread-placeholder' + (modifier ? ` ${modifier}` : '');
+    el.textContent = message;
+    $messagesArea.appendChild(el);
   }
 
   function threadDistanceFromBottom() {
@@ -6899,7 +7020,8 @@ body::after {
           m.Body === '[Photo]' ||
           m.Body === '[Video]' ||
           m.Body === '[Audio]' ||
-          m.Body === '[Voice note]'
+          m.Body === '[Voice note]' ||
+          m.Body === '[Sticker]'
         );
         if (m.Body && !shouldHideGenericMediaBody) {
           html += `<div class="msg-body">${linkifyMessageBody(m.Body)}</div>`;
@@ -7085,7 +7207,7 @@ body::after {
     if (older) loadingOlderMessages = true;
 
     try {
-    if (reset) {
+      if (reset) {
         const msgs = await fetchJSON(`/api/conversations/${encodeURIComponent(convoId)}/messages?limit=${MESSAGE_PAGE_SIZE}`);
         msgs.reverse();
         if (threadToken !== activeThreadToken || activeConvoId !== convoId) return;
@@ -7139,8 +7261,14 @@ body::after {
       });
     } catch (err) {
       console.error('Failed to load messages:', err);
+      if (reset && threadToken === activeThreadToken && activeConvoId === convoId) {
+        renderThreadPlaceholder("Couldn't load messages.", 'is-error');
+      }
     } finally {
       if (older) loadingOlderMessages = false;
+      if (!older && threadToken === activeThreadToken && activeConvoId === convoId) {
+        $messagesArea.removeAttribute('aria-busy');
+      }
     }
   }
 
@@ -7192,6 +7320,10 @@ body::after {
 
   // ─── Draft Actions ───
   window.sendDraft = async function(draftId, btn) {
+    if (browserIsOffline()) {
+      showThreadFeedback(offlineFeedbackMessage('send'), 'send');
+      return;
+    }
     if (!conversationSupportsOutbound(activeConversation)) {
       showThreadFeedback(routeUnavailableMessage('send drafts', activeConversation));
       return;
@@ -7208,7 +7340,7 @@ body::after {
       await loadMessages(activeConvoId, {poll: true});
     } catch (e) {
       btn.disabled = false;
-      showThreadFeedback(e.message || 'Failed to send draft');
+      showThreadFeedback(e.message || 'Failed to send draft', 'send');
       console.error('Failed to send draft:', e);
     }
   }
@@ -7231,11 +7363,17 @@ body::after {
     if (!activeConversation) {
       return;
     }
-    const canSendText = conversationSupportsOutbound(activeConversation);
-    const canSendMedia = conversationSupportsMediaOutbound(activeConversation);
-    const activePlatform = sourcePlatformOf(activeConversation);
+    if (browserIsOffline()) {
+      showThreadFeedback(offlineFeedbackMessage('send'), 'send');
+      return;
+    }
+    const sendConvoId = activeConvoId;
+    const sendConversation = activeConversation;
+    const canSendText = conversationSupportsOutbound(sendConversation);
+    const canSendMedia = conversationSupportsMediaOutbound(sendConversation);
+    const activePlatform = sourcePlatformOf(sendConversation);
     if ($composeInput.value.trim() && !canSendText) {
-      showThreadFeedback(routeUnavailableMessage('reply', activeConversation));
+      showThreadFeedback(routeUnavailableMessage('reply', sendConversation));
       return;
     }
     if (pendingFile && !canSendMedia) {
@@ -7250,10 +7388,11 @@ body::after {
       && !(pendingFile.file?.type || '').startsWith('audio/');
     const sendsCaptionedMedia = sendsCaptionedWhatsAppMedia
       || (hasMedia && activePlatform === 'signal');
-    if ((!text && !hasMedia) || !activeConvoId) return;
+    if ((!text && !hasMedia) || !sendConvoId) return;
 
     clearThreadFeedback();
     $composeInput.value = '';
+    composeTextByConversation.delete(sendConvoId);
     $sendBtn.disabled = true;
     autoResize();
 
@@ -7273,7 +7412,7 @@ body::after {
       if (hasMedia) {
         // Send media via multipart form
         const form = new FormData();
-        form.append('conversation_id', activeConvoId);
+        form.append('conversation_id', sendConvoId);
         form.append('file', pendingFile.file);
         if ((activePlatform === 'whatsapp' || activePlatform === 'signal') && replyToMsg) {
           form.append('reply_to_id', replyToMsg.MessageID);
@@ -7282,12 +7421,12 @@ body::after {
           form.append('caption', text);
         }
         const resp = await fetch('/api/send-media', { method: 'POST', body: form });
-        if (!resp.ok) throw new Error(await resp.text());
+        if (!resp.ok) throw new Error(await responseError(resp));
         clearAttachment();
       }
       if (text && !sendsCaptionedMedia) {
         const payload = {
-          conversation_id: activeConvoId,
+          conversation_id: sendConvoId,
           message: text,
         };
         if (replyToMsg) {
@@ -7297,14 +7436,19 @@ body::after {
       }
       clearReply();
       // Refresh to get the real message from server
-      await loadMessages(activeConvoId, {poll: true, forceBottom: true});
+      if (activeConvoId === sendConvoId) {
+        await loadMessages(sendConvoId, {poll: true, forceBottom: true});
+      }
       await loadConversations();
     } catch (err) {
       if (optimisticEl) optimisticEl.remove();
       if (text) {
-        $composeInput.value = originalText;
+        if (activeConvoId === sendConvoId) {
+          $composeInput.value = originalText;
+        }
+        rememberComposeText(sendConvoId, originalText);
       }
-      showThreadFeedback(err.message || 'Failed to send message');
+      showThreadFeedback(err.message || 'Failed to send message', 'send');
       console.error('Failed to send:', err);
     } finally {
       autoResize();
@@ -7312,6 +7456,25 @@ body::after {
   }
 
   // ─── Compose Input ───
+  function rememberComposeText(convoId, value) {
+    if (!convoId) return;
+    const text = String(value || '');
+    if (text) {
+      composeTextByConversation.set(convoId, text);
+    } else {
+      composeTextByConversation.delete(convoId);
+    }
+  }
+
+  function rememberActiveComposeText(convoId = activeConvoId) {
+    rememberComposeText(convoId, $composeInput.value);
+  }
+
+  function restoreComposeText(convoId) {
+    $composeInput.value = composeTextByConversation.get(convoId) || '';
+    autoResize();
+  }
+
   function autoResize() {
     $composeInput.style.height = 'auto';
     $composeInput.style.height = Math.min($composeInput.scrollHeight, 160) + 'px';
@@ -7319,11 +7482,15 @@ body::after {
     const hasMedia = !!pendingFile;
     $sendBtn.disabled = !activeConversation
       || (!hasText && !hasMedia)
+      || browserIsOffline()
       || (hasText && !conversationSupportsOutbound(activeConversation))
       || (hasMedia && !conversationSupportsMediaOutbound(activeConversation));
   }
 
-  $composeInput.addEventListener('input', autoResize);
+  $composeInput.addEventListener('input', () => {
+    rememberActiveComposeText();
+    autoResize();
+  });
   $composeInput.addEventListener('keydown', e => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
@@ -7401,8 +7568,11 @@ body::after {
       Name: result.Name || 'Unknown',
       LastMessageTS: result.LastMessageTS,
       IsGroup: !!result.IsGroup,
+      Participants: result.Participants || result.participants || '',
       UnreadCount: result.UnreadCount || 0,
       source_platform: result.SourcePlatform || result.source_platform,
+      UnifiedID: result.UnifiedID || result.unified_id || '',
+      UnifiedName: result.UnifiedName || result.unified_name || '',
       _searchPreview: result.preview || '',
     }));
     renderConversations(searchConvos, true);
@@ -7437,6 +7607,15 @@ body::after {
 
   function setConnectionState() {
     if (!$connectionBanner) return;
+    if (browserIsOffline()) {
+      $connectionBanner.className = 'connection-banner disconnected offline';
+      $connectionBanner.style.display = 'flex';
+      $connectionBannerCopy.textContent = 'No internet connection. Local history is available, but new messages will wait until you are back online.';
+      $connectionBannerAction.textContent = 'Retry';
+      $connectionBannerAction.dataset.action = 'retry-connection';
+      $connectionBannerAction.style.display = '';
+      return;
+    }
     if (googleStatus.connected) {
       $connectionBanner.style.display = 'none';
       return;
@@ -7537,8 +7716,9 @@ body::after {
     }
   }
 
-  function showGoogleError(message) {
+  function showGoogleError(message, context = 'google') {
     if (!$gmError) return;
+    message = userFacingErrorMessage(message, context);
     $gmError.textContent = message || '';
     $gmError.style.display = message ? 'block' : 'none';
   }
@@ -7590,6 +7770,7 @@ body::after {
 
   function showWhatsAppError(message) {
     if (!$waError) return;
+    message = userFacingErrorMessage(message);
     $waError.textContent = message || '';
     $waError.style.display = message ? 'block' : 'none';
   }
@@ -7600,6 +7781,7 @@ body::after {
 
   function showSignalError(message) {
     if (!$signalError) return;
+    message = userFacingErrorMessage(message);
     $signalError.textContent = message || '';
     $signalError.style.display = message ? 'block' : 'none';
   }
@@ -7929,6 +8111,10 @@ body::after {
 
   async function reconnectGoogleMessages() {
     showGoogleError('');
+    if (browserIsOffline()) {
+      showGoogleError(offlineFeedbackMessage('reconnect'), 'reconnect');
+      return;
+    }
     $gmReconnectBtn.disabled = true;
     $gmReconnectBtn.textContent = 'Reconnecting...';
     try {
@@ -7936,7 +8122,7 @@ body::after {
       applyAppStatus(status || {});
       showThreadFeedback('Google Messages reconnected.');
     } catch (err) {
-      showGoogleError(err.message || 'Failed to reconnect Google Messages');
+      showGoogleError(err.message || 'Failed to reconnect Google Messages', 'reconnect');
     } finally {
       if ($waOverlay.classList.contains('show')) {
         renderWhatsAppOverlay();
@@ -7946,6 +8132,10 @@ body::after {
 
   async function startGoogleHistorySync() {
     showGoogleError('');
+    if (browserIsOffline()) {
+      showGoogleError(offlineFeedbackMessage('google'), 'google');
+      return;
+    }
     if ($gmHistoryBtn) {
       $gmHistoryBtn.disabled = true;
       $gmHistoryBtn.textContent = 'Syncing history…';
@@ -8030,8 +8220,10 @@ body::after {
   async function checkStatus() {
     try {
       const status = await fetchJSON('/api/status');
+      browserOnline = browserReportsOnline();
       applyAppStatus(status);
     } catch {
+      browserOnline = browserReportsOnline();
       applyAppStatus({ connected: false });
     }
   }
@@ -8201,7 +8393,7 @@ body::after {
       // Reload to see updated reactions
       if (activeConvoId) await loadMessages(activeConvoId, {poll: true});
     } catch (err) {
-      showThreadFeedback(err.message || 'Failed to send reaction');
+      showThreadFeedback(err.message || 'Failed to send reaction', 'send');
       console.error('Failed to send reaction:', err);
     }
   };
@@ -8372,6 +8564,13 @@ body::after {
     $replyIndicator.classList.remove('show');
   }
 
+  function clearTransientComposerState() {
+    clearReply();
+    if (pendingFile) {
+      clearAttachment();
+    }
+  }
+
   $replyClose.addEventListener('click', clearReply);
 
   window.scrollToMessage = function(msgId) {
@@ -8428,6 +8627,8 @@ body::after {
 
   // Helper: deselect current conversation and return to empty state
   function deselectConversation() {
+    const previousConvoId = activeConvoId;
+    rememberActiveComposeText(previousConvoId);
     activeConvoId = null;
     activeConvoIsGroup = false;
     activeConversation = null;
@@ -8452,7 +8653,9 @@ body::after {
     clearThreadFeedback();
     refreshConversationChrome();
     renderEmptyState();
-    clearReply();
+    clearTransientComposerState();
+    $composeInput.value = '';
+    autoResize();
   }
 
   function setPlatformFilter(platform) {
@@ -8690,6 +8893,9 @@ body::after {
 
   async function handleLaunchAction(action) {
     switch (action) {
+      case 'retry-connection':
+        await retryConnection();
+        return;
       case 'open-connections':
       case 'open-platforms':
         await openWhatsAppOverlay();
@@ -8700,6 +8906,21 @@ body::after {
       default:
         openNewMsg();
     }
+  }
+
+  async function retryConnection() {
+    networkIssueDetected = false;
+    browserOnline = browserReportsOnline();
+    setConnectionState();
+    await checkStatus();
+    await loadConversations();
+    if (activeConvoId) {
+      await loadMessages(activeConvoId, {poll: true});
+    }
+    autoResize();
+    showThreadFeedback(browserIsOffline()
+      ? offlineFeedbackMessage()
+      : 'Connection check complete.');
   }
 
   async function startNewConversation() {
@@ -8727,6 +8948,11 @@ body::after {
       await revealAndSelectConversation(existingReplyRoute);
       return;
     }
+    if (browserIsOffline()) {
+      $newMsgError.textContent = offlineFeedbackMessage('start-conversation');
+      $newMsgError.style.display = 'block';
+      return;
+    }
 
     $newMsgGo.disabled = true;
     $newMsgGo.innerHTML = '<span class="spinner" aria-hidden="true"></span>Connecting...';
@@ -8744,8 +8970,7 @@ body::after {
         signal: controller.signal,
       });
       if (!resp.ok) {
-        const errText = await resp.text();
-        throw new Error(errText);
+        throw new Error(await responseError(resp));
       }
       const data = await resp.json();
       closeNewMsg();
@@ -8765,7 +8990,7 @@ body::after {
       const isAbort = err && err.name === 'AbortError';
       $newMsgError.textContent = isAbort
         ? 'Request timed out. Check that Google Messages is paired and try again.'
-        : (err.message || 'Failed to start conversation');
+        : (userFacingErrorMessage(err, 'start-conversation') || 'Failed to start conversation');
       $newMsgError.style.display = 'block';
       $newMsgGo.disabled = false;
       $newMsgGo.textContent = 'Start conversation';
@@ -8832,6 +9057,27 @@ body::after {
     if (e.key === 'Escape' && $waOverlay && $waOverlay.classList.contains('show')) {
       closeWhatsAppOverlay();
     }
+  });
+
+  window.addEventListener('offline', () => {
+    browserOnline = false;
+    networkIssueDetected = false;
+    setConnectionState();
+    autoResize();
+    showThreadFeedback(offlineFeedbackMessage());
+  });
+
+  window.addEventListener('online', () => {
+    browserOnline = true;
+    networkIssueDetected = false;
+    setConnectionState();
+    autoResize();
+    checkStatus();
+    loadConversations();
+    if (activeConvoId) {
+      loadMessages(activeConvoId, {poll: true});
+    }
+    showThreadFeedback('Back online. You can send messages again.');
   });
 
   if (navigator.webdriver) {

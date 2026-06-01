@@ -39,13 +39,21 @@ func searchMessagesHandler(a *app.App) server.ToolHandlerFunc {
 		}
 
 		if len(msgs) == 0 {
-			return textResult(fmt.Sprintf("No messages found matching '%s'.", query)), nil
+			return structuredResult(map[string]any{
+				"query":                   query,
+				"phone_number":            phone,
+				"count":                   0,
+				"messages":                []messageSummary{},
+				"contains_untrusted_text": true,
+			}, fmt.Sprintf("No messages found matching '%s'.", query)), nil
 		}
 
 		var sb strings.Builder
 		sb.WriteString(messagePreamble)
 		fmt.Fprintf(&sb, "Found %d messages matching '%s':\n\n", len(msgs), query)
+		summaries := make([]messageSummary, 0, len(msgs))
 		for _, m := range msgs {
+			summaries = append(summaries, summarizeMessage(m))
 			ts := time.UnixMilli(m.TimestampMS).Format(time.RFC3339)
 			direction := "←"
 			if m.IsFromMe {
@@ -59,6 +67,12 @@ func searchMessagesHandler(a *app.App) server.ToolHandlerFunc {
 			display := formatMessageBody(m.Body, m.MediaID, m.MimeType, m.MessageID)
 			fmt.Fprintf(&sb, "[%s] %s %s%s (conv: %s): «%s»\n", ts, direction, sender, platform, m.ConversationID, display)
 		}
-		return textResult(sb.String()), nil
+		return structuredResult(map[string]any{
+			"query":                   query,
+			"phone_number":            phone,
+			"count":                   len(summaries),
+			"messages":                summaries,
+			"contains_untrusted_text": true,
+		}, sb.String()), nil
 	}
 }

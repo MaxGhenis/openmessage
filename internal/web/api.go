@@ -77,9 +77,12 @@ type SearchResult struct {
 	ConversationID string `json:"ConversationID"`
 	Name           string `json:"Name"`
 	IsGroup        bool   `json:"IsGroup"`
+	Participants   string `json:"Participants,omitempty"`
 	LastMessageTS  int64  `json:"LastMessageTS"`
 	UnreadCount    int    `json:"UnreadCount"`
 	SourcePlatform string `json:"source_platform,omitempty"`
+	UnifiedID      string `json:"unified_id,omitempty"`
+	UnifiedName    string `json:"unified_name,omitempty"`
 	Preview        string `json:"preview,omitempty"`
 }
 
@@ -409,6 +412,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		if convos == nil {
 			convos = []*db.Conversation{}
 		}
+		enrichUnifiedConversationIdentities(store, convos)
 		writeJSON(w, convos)
 	})
 
@@ -645,7 +649,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		// Fetch conversation to get SIM and participant info
 		conv, err := cli.GM.GetConversation(req.ConversationID)
 		if err != nil {
-			httpError(w, "get conversation: "+err.Error(), 502)
+			httpError(w, googleAPIErrorMessage("get conversation", err), 502)
 			return
 		}
 
@@ -661,7 +665,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 
 		resp, err := cli.GM.SendMessage(payload)
 		if err != nil {
-			httpError(w, "send message: "+err.Error(), 502)
+			httpError(w, googleAPIErrorMessage("send message", err), 502)
 			return
 		}
 		success := resp.GetStatus() == gmproto.SendMessageResponse_SUCCESS
@@ -797,14 +801,14 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		// Upload media via libgm
 		media, err := cli.GM.UploadMedia(data, header.Filename, mime)
 		if err != nil {
-			httpError(w, "upload media: "+err.Error(), 502)
+			httpError(w, googleAPIErrorMessage("upload media", err), 502)
 			return
 		}
 
 		// Get SIM and participant info
 		conv, err := cli.GM.GetConversation(convID)
 		if err != nil {
-			httpError(w, "get conversation: "+err.Error(), 502)
+			httpError(w, googleAPIErrorMessage("get conversation", err), 502)
 			return
 		}
 
@@ -821,7 +825,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 
 		resp, err := cli.GM.SendMessage(payload)
 		if err != nil {
-			httpError(w, "send message: "+err.Error(), 502)
+			httpError(w, googleAPIErrorMessage("send message", err), 502)
 			return
 		}
 		success := resp.GetStatus() == gmproto.SendMessageResponse_SUCCESS
@@ -930,7 +934,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		}
 		data, err := cli.GM.DownloadMedia(msg.MediaID, key)
 		if err != nil {
-			httpError(w, "download media: "+err.Error(), 502)
+			httpError(w, googleAPIErrorMessage("download media", err), 502)
 			return
 		}
 		w.Header().Set("Content-Type", msg.MimeType)
@@ -1001,7 +1005,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		payload := app.BuildReactionPayload(req.MessageID, req.Emoji, req.Action, sim)
 		resp, err := cli.GM.SendReaction(payload)
 		if err != nil {
-			httpError(w, "send reaction: "+err.Error(), 502)
+			httpError(w, googleAPIErrorMessage("send reaction", err), 502)
 			return
 		}
 		writeJSON(w, map[string]any{
@@ -1035,7 +1039,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			Numbers: app.NewContactNumbers([]string{req.PhoneNumber}),
 		})
 		if err != nil {
-			httpError(w, "failed to get/create conversation: "+err.Error(), 502)
+			httpError(w, googleAPIErrorMessage("failed to get/create conversation", err), 502)
 			return
 		}
 		conv := convResp.GetConversation()
@@ -1196,7 +1200,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		// Use the same send logic as /api/send
 		conv, err := cli.GM.GetConversation(draft.ConversationID)
 		if err != nil {
-			httpError(w, "get conversation: "+err.Error(), 502)
+			httpError(w, googleAPIErrorMessage("get conversation", err), 502)
 			return
 		}
 
@@ -1211,7 +1215,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 
 		resp, err := cli.GM.SendMessage(payload)
 		if err != nil {
-			httpError(w, "send message: "+err.Error(), 502)
+			httpError(w, googleAPIErrorMessage("send message", err), 502)
 			return
 		}
 		success := resp.GetStatus() == gmproto.SendMessageResponse_SUCCESS
@@ -1373,7 +1377,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			return
 		}
 		if err := opts.BackfillPhone(req.PhoneNumber); err != nil {
-			httpError(w, "backfill phone: "+err.Error(), 502)
+			httpError(w, googleAPIErrorMessage("backfill phone", err), 502)
 			return
 		}
 		publishConversations()
@@ -1399,7 +1403,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			return
 		}
 		if err := opts.ReconnectGoogle(); err != nil {
-			httpError(w, "reconnect google messages: "+err.Error(), 502)
+			httpError(w, googleAPIErrorMessage("reconnect google messages", err), 502)
 			return
 		}
 		publishStatus(currentConnected())
@@ -1657,6 +1661,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 func mergeSearchResults(store *db.Store, msgs []*db.Message, convos []*db.Conversation, limit int) []SearchResult {
 	results := make([]SearchResult, 0, limit)
 	seen := make(map[string]struct{}, limit)
+	identityIndex := loadUnifiedIdentityIndex(store)
 
 	appendResult := func(result SearchResult) {
 		if _, ok := seen[result.ConversationID]; ok {
@@ -1671,15 +1676,7 @@ func mergeSearchResults(store *db.Store, msgs []*db.Message, convos []*db.Conver
 		if err != nil || conv == nil {
 			continue
 		}
-		appendResult(SearchResult{
-			ConversationID: conv.ConversationID,
-			Name:           conv.Name,
-			IsGroup:        conv.IsGroup,
-			LastMessageTS:  msg.TimestampMS,
-			UnreadCount:    conv.UnreadCount,
-			SourcePlatform: conv.SourcePlatform,
-			Preview:        searchPreviewForMessage(msg),
-		})
+		appendResult(searchResultForConversation(conv, msg.TimestampMS, searchPreviewForMessage(msg), identityIndex))
 	}
 
 	for _, conv := range convos {
@@ -1691,15 +1688,7 @@ func mergeSearchResults(store *db.Store, msgs []*db.Message, convos []*db.Conver
 		if err == nil && len(msgs) > 0 {
 			preview = searchPreviewForMessage(msgs[0])
 		}
-		appendResult(SearchResult{
-			ConversationID: conv.ConversationID,
-			Name:           conv.Name,
-			IsGroup:        conv.IsGroup,
-			LastMessageTS:  conv.LastMessageTS,
-			UnreadCount:    conv.UnreadCount,
-			SourcePlatform: conv.SourcePlatform,
-			Preview:        preview,
-		})
+		appendResult(searchResultForConversation(conv, conv.LastMessageTS, preview, identityIndex))
 	}
 
 	sort.Slice(results, func(i, j int) bool {
@@ -1712,6 +1701,161 @@ func mergeSearchResults(store *db.Store, msgs []*db.Message, convos []*db.Conver
 		results = results[:limit]
 	}
 	return results
+}
+
+type unifiedConversationIdentity struct {
+	ID   string
+	Name string
+}
+
+type unifiedIdentifier struct {
+	Platform string `json:"platform"`
+	Value    string `json:"value"`
+}
+
+type conversationParticipant struct {
+	Name      string `json:"name"`
+	Number    string `json:"number"`
+	Phone     string `json:"phone"`
+	Email     string `json:"email"`
+	ID        string `json:"id"`
+	IsMe      bool   `json:"is_me"`
+	IsMeCamel bool   `json:"isMe"`
+}
+
+func enrichUnifiedConversationIdentities(store *db.Store, convos []*db.Conversation) {
+	identityIndex := loadUnifiedIdentityIndex(store)
+	if len(identityIndex) == 0 {
+		return
+	}
+	for _, conv := range convos {
+		if identity, ok := unifiedIdentityForConversation(conv, identityIndex); ok {
+			conv.UnifiedID = identity.ID
+			conv.UnifiedName = identity.Name
+		}
+	}
+}
+
+func loadUnifiedIdentityIndex(store *db.Store) map[string]unifiedConversationIdentity {
+	contacts, err := store.ListUnifiedContacts("", 10000)
+	if err != nil || len(contacts) == 0 {
+		return nil
+	}
+	index := make(map[string]unifiedConversationIdentity)
+	for _, contact := range contacts {
+		if contact == nil || strings.TrimSpace(contact.UnifiedID) == "" {
+			continue
+		}
+		var identifiers []unifiedIdentifier
+		if err := json.Unmarshal([]byte(contact.Identifiers), &identifiers); err != nil {
+			continue
+		}
+		identity := unifiedConversationIdentity{
+			ID:   strings.TrimSpace(contact.UnifiedID),
+			Name: strings.TrimSpace(contact.DisplayName),
+		}
+		for _, identifier := range identifiers {
+			key := unifiedIdentifierKey(identifier.Platform, identifier.Value)
+			if key == "" {
+				continue
+			}
+			index[key] = identity
+		}
+	}
+	return index
+}
+
+func searchResultForConversation(conv *db.Conversation, timestamp int64, preview string, identityIndex map[string]unifiedConversationIdentity) SearchResult {
+	result := SearchResult{
+		ConversationID: conv.ConversationID,
+		Name:           conv.Name,
+		IsGroup:        conv.IsGroup,
+		Participants:   conv.Participants,
+		LastMessageTS:  timestamp,
+		UnreadCount:    conv.UnreadCount,
+		SourcePlatform: conv.SourcePlatform,
+		Preview:        preview,
+	}
+	if identity, ok := unifiedIdentityForConversation(conv, identityIndex); ok {
+		result.UnifiedID = identity.ID
+		result.UnifiedName = identity.Name
+	}
+	return result
+}
+
+func unifiedIdentityForConversation(conv *db.Conversation, identityIndex map[string]unifiedConversationIdentity) (unifiedConversationIdentity, bool) {
+	if conv == nil || conv.IsGroup || len(identityIndex) == 0 {
+		return unifiedConversationIdentity{}, false
+	}
+	participantID := primaryConversationParticipantID(conv)
+	if participantID == "" {
+		return unifiedConversationIdentity{}, false
+	}
+	identity, ok := identityIndex[unifiedIdentifierKey(conv.SourcePlatform, participantID)]
+	return identity, ok
+}
+
+func primaryConversationParticipantID(conv *db.Conversation) string {
+	if conv == nil || strings.TrimSpace(conv.Participants) == "" {
+		return ""
+	}
+	var participants []conversationParticipant
+	if err := json.Unmarshal([]byte(conv.Participants), &participants); err != nil {
+		return ""
+	}
+	for _, participant := range participants {
+		if participant.IsMe || participant.IsMeCamel {
+			continue
+		}
+		if id := participantIdentifier(participant); id != "" {
+			return id
+		}
+	}
+	if len(participants) == 0 {
+		return ""
+	}
+	return participantIdentifier(participants[0])
+}
+
+func participantIdentifier(participant conversationParticipant) string {
+	for _, value := range []string{participant.Number, participant.Phone, participant.Email, participant.ID} {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func unifiedIdentifierKey(platform, value string) string {
+	platform = strings.ToLower(strings.TrimSpace(platform))
+	value = normalizeUnifiedIdentifier(value)
+	if platform == "" || value == "" {
+		return ""
+	}
+	return platform + "\x00" + value
+}
+
+func normalizeUnifiedIdentifier(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "" {
+		return ""
+	}
+	digits := make([]byte, 0, len(value))
+	phoneLike := true
+	for i := 0; i < len(value); i++ {
+		c := value[i]
+		switch {
+		case c >= '0' && c <= '9':
+			digits = append(digits, c)
+		case c == '+' || c == '(' || c == ')' || c == '-' || c == '.' || c == ' ':
+		default:
+			phoneLike = false
+		}
+	}
+	if phoneLike && len(digits) >= 7 {
+		return string(digits)
+	}
+	return value
 }
 
 func searchPreviewForMessage(msg *db.Message) string {
@@ -1754,6 +1898,43 @@ func httpError(w http.ResponseWriter, msg string, code int) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	json.NewEncoder(w).Encode(map[string]string{"error": msg})
+}
+
+func googleAPIErrorMessage(action string, err error) string {
+	if isGoogleNetworkError(err) {
+		return "Google Messages is offline. Check your internet connection, then try again."
+	}
+	return action + ": " + err.Error()
+}
+
+func isGoogleNetworkError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	needles := []string{
+		"instantmessaging-pa.clients6.google.com",
+		"google.internal.communications.instantmessaging",
+		"no such host",
+		"temporary failure in name resolution",
+		"server misbehaving",
+		"dial tcp",
+		"lookup ",
+		"network is unreachable",
+		"no route to host",
+		"i/o timeout",
+		"context deadline exceeded",
+		"client.timeout exceeded",
+		"tls handshake timeout",
+		"connection refused",
+		"connection reset by peer",
+	}
+	for _, needle := range needles {
+		if strings.Contains(message, needle) {
+			return true
+		}
+	}
+	return false
 }
 
 // normalizeContactKey returns a stable dedup key for a contact entry. We

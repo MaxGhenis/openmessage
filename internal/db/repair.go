@@ -4,6 +4,7 @@ import "database/sql"
 
 type LegacyRepairReport struct {
 	DeletedWhatsAppReactionPlaceholders int
+	DeletedWhatsAppUnsupportedRows      int
 	DeletedSignalReactionPlaceholders   int
 	FixedSignalBlankMessages            int
 	RemainingWhatsAppMediaPlaceholders  int
@@ -13,6 +14,16 @@ type LegacyRepairReport struct {
 const legacyWhatsAppReactionPlaceholderWhere = `
 	source_platform = 'whatsapp'
 	AND body = '[Reaction]'
+	AND IFNULL(media_id, '') = ''
+	AND IFNULL(mime_type, '') = ''
+	AND IFNULL(reactions, '') = ''
+	AND IFNULL(reply_to_id, '') = ''
+	AND IFNULL(source_id, '') != ''
+`
+
+const legacyWhatsAppUnsupportedPlaceholderWhere = `
+	source_platform = 'whatsapp'
+	AND body = '[Unsupported message]'
 	AND IFNULL(media_id, '') = ''
 	AND IFNULL(mime_type, '') = ''
 	AND IFNULL(reactions, '') = ''
@@ -57,6 +68,14 @@ func (s *Store) RepairLegacyArtifacts() (LegacyRepairReport, error) {
 	if err != nil {
 		return report, err
 	}
+	unsupportedConversationIDs, err := selectStringColumnTx(tx, `
+		SELECT DISTINCT conversation_id
+		FROM messages
+		WHERE `+legacyWhatsAppUnsupportedPlaceholderWhere)
+	if err != nil {
+		return report, err
+	}
+	affectedConversationIDs = append(affectedConversationIDs, unsupportedConversationIDs...)
 	signalConversationIDs, err := selectStringColumnTx(tx, `
 		SELECT DISTINCT conversation_id
 		FROM messages
@@ -74,6 +93,16 @@ func (s *Store) RepairLegacyArtifacts() (LegacyRepairReport, error) {
 	}
 	if deleted, err := result.RowsAffected(); err == nil {
 		report.DeletedWhatsAppReactionPlaceholders = int(deleted)
+	}
+
+	unsupportedResult, err := tx.Exec(`
+		DELETE FROM messages
+		WHERE ` + legacyWhatsAppUnsupportedPlaceholderWhere)
+	if err != nil {
+		return report, err
+	}
+	if deleted, err := unsupportedResult.RowsAffected(); err == nil {
+		report.DeletedWhatsAppUnsupportedRows = int(deleted)
 	}
 
 	signalResult, err := tx.Exec(`
@@ -152,6 +181,7 @@ func (s *Store) RepairLegacyArtifacts() (LegacyRepairReport, error) {
 	}
 
 	if (report.DeletedWhatsAppReactionPlaceholders > 0 ||
+		report.DeletedWhatsAppUnsupportedRows > 0 ||
 		report.DeletedSignalReactionPlaceholders > 0 ||
 		report.FixedSignalBlankMessages > 0) && s.ftsEnabled {
 		if err := s.rebuildFTS(); err != nil {
