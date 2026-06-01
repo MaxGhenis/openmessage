@@ -8,11 +8,14 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"net"
 	"net/http"
+	"net/url"
 	"runtime"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -136,6 +139,61 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			opts.Events.PublishStatus(connected)
 		}
 	}
+	// Per-platform data-freshness, used to catch "zombie" bridges that report
+	// connected=true while no longer actually syncing (the connection flag
+	// lies; the data doesn't). Computing this scans the messages table, and
+	// /api/status is polled every few seconds, so cache it — staleness is a
+	// multi-day signal, so a 30s cache is plenty fresh.
+	var (
+		freshnessMu       sync.Mutex
+		freshnessComputed time.Time
+		freshnessValue    map[string]any
+	)
+	computeFreshness := func() map[string]any {
+		freshnessMu.Lock()
+		defer freshnessMu.Unlock()
+		if freshnessValue != nil && time.Since(freshnessComputed) < 30*time.Second {
+			return freshnessValue
+		}
+		stats, err := store.PlatformStats()
+		if err != nil {
+			return freshnessValue // keep last good value on error
+		}
+		var newest int64
+		for _, st := range stats {
+			if st.LatestMS > newest {
+				newest = st.LatestMS
+			}
+		}
+		// Map storage platform → status-block key (Google Messages stores SMS/RCS).
+		keyFor := map[string]string{"sms": "google", "rcs": "google", "whatsapp": "whatsapp", "signal": "signal"}
+		out := map[string]any{"newest_ms": newest}
+		for _, st := range stats {
+			key := keyFor[st.Platform]
+			if key == "" {
+				continue
+			}
+			behind := daysBehind(st.LatestMS, newest)
+			entry := map[string]any{
+				"latest_ms":          st.LatestMS,
+				"latest_received_ms": st.LatestRecvMS,
+				"behind_days":        behind,
+				"stale":              st.LatestMS > 0 && behind >= staleDaysThreshold,
+			}
+			// sms + rcs both map to "google"; keep the freshest.
+			if existing, ok := out[key].(map[string]any); ok {
+				if st.LatestMS > existing["latest_ms"].(int64) {
+					out[key] = entry
+				}
+			} else {
+				out[key] = entry
+			}
+		}
+		freshnessValue = out
+		freshnessComputed = time.Now()
+		return out
+	}
+
 	statusPayload := func(connected bool) map[string]any {
 		payload := map[string]any{
 			"connected": connected,
@@ -154,6 +212,9 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		}
 		if opts.BackfillStatus != nil {
 			payload["backfill"] = opts.BackfillStatus()
+		}
+		if f := computeFreshness(); f != nil {
+			payload["freshness"] = f
 		}
 		return payload
 	}
@@ -403,7 +464,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 	})
 
 	mux.HandleFunc("/api/conversations", func(w http.ResponseWriter, r *http.Request) {
-		limit := queryInt(r, "limit", 50)
+		limit := queryIntClamped(r, "limit", 50, 500)
 		convos, err := store.ListConversations(limit)
 		if err != nil {
 			httpError(w, "list conversations: "+err.Error(), 500)
@@ -454,7 +515,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			httpError(w, "not found", 404)
 			return
 		}
-		limit := queryInt(r, "limit", 100)
+		limit := queryIntClamped(r, "limit", 100, 1000)
 		beforeMS := queryInt64(r, "before", 0)
 		afterMS := queryInt64(r, "after", 0)
 		beforeID := r.URL.Query().Get("before_id")
@@ -537,7 +598,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			httpError(w, "query parameter 'q' is required", 400)
 			return
 		}
-		limit := queryInt(r, "limit", 50)
+		limit := queryIntClamped(r, "limit", 50, 500)
 		msgs, err := store.SearchMessages(q, "", limit)
 		if err != nil {
 			httpError(w, "search: "+err.Error(), 500)
@@ -1315,7 +1376,13 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			httpError(w, "no messages found", 404)
 			return
 		}
-		apiKey := r.URL.Query().Get("api_key")
+		// Prefer the API key from a header — secrets in query strings leak into
+		// logs, history, and proxies. The query param is kept only as a
+		// deprecated fallback for existing callers.
+		apiKey := strings.TrimSpace(r.Header.Get("X-Anthropic-Api-Key"))
+		if apiKey == "" {
+			apiKey = r.URL.Query().Get("api_key")
+		}
 		style := r.URL.Query().Get("style")
 		s, err := story.Generate(msgs, story.GenerateConfig{
 			Style:             style,
@@ -1336,7 +1403,11 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		}
 		if opts.StartDeepBackfill != nil {
 			if !opts.StartDeepBackfill() {
-				httpError(w, "deep backfill already running", 409)
+				// Could be a deep backfill OR the shallow startup catch-up
+				// holding the shared guard — keep the message generic and
+				// consistent with /api/backfill/status (which now reports
+				// running=true in both cases).
+				httpError(w, "a sync is already running — try again in a moment", 409)
 				return
 			}
 			writeJSON(w, map[string]string{"status": "started"})
@@ -1645,8 +1716,9 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 	mux.Handle("/", staticHandler)
 
 	// Wrap the mux to intercept /mcp/ requests before the mux's catch-all
+	var handler http.Handler = mux
 	if mcpHandler != nil {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if strings.HasPrefix(r.URL.Path, "/mcp/") {
 				mcpHandler.ServeHTTP(w, r)
 				return
@@ -1655,7 +1727,56 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		})
 	}
 
-	return mux
+	// Guard the HTTP API against cross-origin / DNS-rebinding abuse. The server
+	// binds to 127.0.0.1, but that does NOT stop a malicious web page the user
+	// visits from POSTing to http://127.0.0.1:<port>/api/... (multipart and
+	// body-less POSTs are CORS "simple requests" with no preflight) — which
+	// could drive-by send messages or unpair accounts. Requiring a loopback
+	// Host and (when present) a loopback Origin/Referer closes that vector
+	// without affecting the native app, whose requests are same-origin.
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/api/") && !isLocalAPIRequest(r) {
+			httpError(w, "forbidden: API requests must originate from the local OpenMessage app", http.StatusForbidden)
+			return
+		}
+		handler.ServeHTTP(w, r)
+	})
+}
+
+// isLoopbackHost reports whether a bare hostname refers to this machine's
+// loopback interface.
+func isLoopbackHost(hostname string) bool {
+	switch strings.ToLower(strings.Trim(hostname, "[]")) {
+	case "127.0.0.1", "localhost", "::1":
+		return true
+	}
+	return false
+}
+
+// isLocalAPIRequest validates that an /api/ request originates from the local
+// app rather than a cross-origin web page: the Host must be loopback (defends
+// DNS rebinding), and any Origin/Referer the browser attached must be loopback
+// too (defends drive-by cross-origin POSTs). Same-origin GETs carry no Origin
+// and pass; the native WKWebView is same-origin on 127.0.0.1 and passes.
+func isLocalAPIRequest(r *http.Request) bool {
+	host := r.Host
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	if host != "" && !isLoopbackHost(host) {
+		return false
+	}
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		origin = r.Header.Get("Referer")
+	}
+	if origin != "" {
+		u, err := url.Parse(origin)
+		if err != nil || !isLoopbackHost(u.Hostname()) {
+			return false
+		}
+	}
+	return true
 }
 
 func mergeSearchResults(store *db.Store, msgs []*db.Message, convos []*db.Conversation, limit int) []SearchResult {
@@ -1973,4 +2094,31 @@ func queryInt64(r *http.Request, key string, defaultVal int64) int64 {
 		return defaultVal
 	}
 	return n
+}
+
+// queryIntClamped reads an int "limit"-style param and clamps it to [1, max],
+// falling back to def for missing/non-positive values. SQLite treats LIMIT -1
+// as "no limit", so an unclamped negative/zero limit would return the entire
+// table — an unbounded-response/DoS vector.
+func queryIntClamped(r *http.Request, key string, def, max int) int {
+	n := queryInt(r, key, def)
+	if n <= 0 {
+		n = def
+	}
+	if n > max {
+		n = max
+	}
+	return n
+}
+
+// staleDaysThreshold is how many whole days a platform's latest message may
+// trail the newest message overall before it's flagged as not syncing.
+const staleDaysThreshold = 3
+
+// daysBehind returns how many whole days `older` trails `newer` (0 if not behind).
+func daysBehind(older, newer int64) int {
+	if older <= 0 || newer <= older {
+		return 0
+	}
+	return int(time.UnixMilli(newer).Sub(time.UnixMilli(older)).Hours() / 24)
 }

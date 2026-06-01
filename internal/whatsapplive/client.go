@@ -802,7 +802,7 @@ func (b *Bridge) SendReaction(conversationID, targetMessageID, emoji, action str
 		return nil
 	}
 	target.Reactions = nextReactions
-	if err := b.store.UpsertMessage(target); err != nil {
+	if err := b.store.UpdateMessageReactions(target.MessageID, nextReactions); err != nil {
 		return fmt.Errorf("store WhatsApp reaction update: %w", err)
 	}
 	if b.callbacks.OnMessagesChange != nil {
@@ -1124,6 +1124,65 @@ func (b *Bridge) reinitializeAfterLogout() {
 	b.emitStatusChange()
 }
 
+// handleProtocolMessage applies WhatsApp edits and revokes (deletions) to an
+// already-stored message. These arrive as ProtocolMessage envelopes that
+// extractMessageBody deliberately renders as "" — without this they'd be
+// silently dropped, leaving edited text stale and deleted messages present
+// forever. Returns true if the event was an edit/revoke (and thus consumed).
+func (b *Bridge) handleProtocolMessage(evt *waevents.Message) bool {
+	pm := unwrapWhatsAppMessage(evt.Message).GetProtocolMessage()
+	if pm == nil {
+		return false
+	}
+	switch pm.GetType() {
+	case waE2E.ProtocolMessage_REVOKE:
+		// REVOKE is the zero value, so only treat it as a deletion when there
+		// is a real target key — otherwise let it fall through to be skipped.
+		key := pm.GetKey()
+		if key == nil || strings.TrimSpace(key.GetID()) == "" {
+			return false
+		}
+		targetID := "whatsapp:" + key.GetID()
+		if err := b.store.DeleteMessageByID(targetID); err != nil {
+			b.logger.Debug().Err(err).Str("target_msg_id", targetID).Msg("Failed to delete revoked WhatsApp message")
+		}
+		if b.callbacks.OnMessagesChange != nil {
+			b.callbacks.OnMessagesChange(waConversationID(b.normalizeConversationJID(evt.Info.Chat)))
+		}
+		return true
+	case waE2E.ProtocolMessage_MESSAGE_EDIT:
+		key := pm.GetKey()
+		edited := pm.GetEditedMessage()
+		if key == nil || edited == nil || strings.TrimSpace(key.GetID()) == "" {
+			return true
+		}
+		targetID := "whatsapp:" + key.GetID()
+		newBody := extractMessageBody(edited)
+		if newBody == "" || newBody == "[Unsupported message]" {
+			return true
+		}
+		existing, err := b.store.GetMessageByID(targetID)
+		if err != nil || existing == nil {
+			// Edit for a message we never stored — nothing to update.
+			return true
+		}
+		conv, _ := b.store.GetConversation(existing.ConversationID)
+		existing.Body = b.formatMentionedBody(newBody, edited, conv)
+		if err := b.store.UpsertMessage(existing); err != nil {
+			b.logger.Debug().Err(err).Str("target_msg_id", targetID).Msg("Failed to apply WhatsApp edit")
+			return true
+		}
+		if b.callbacks.OnMessagesChange != nil {
+			b.callbacks.OnMessagesChange(existing.ConversationID)
+		}
+		return true
+	default:
+		// Other protocol messages (ephemeral settings, history sync, app-state
+		// key shares, …) are control traffic — let extractMessageBody skip them.
+		return false
+	}
+}
+
 func (b *Bridge) handleMessage(evt *waevents.Message) {
 	if evt == nil || evt.Message == nil {
 		return
@@ -1133,6 +1192,9 @@ func (b *Bridge) handleMessage(evt *waevents.Message) {
 		return
 	}
 	if b.handleReactionMessage(evt) {
+		return
+	}
+	if b.handleProtocolMessage(evt) {
 		return
 	}
 	// Encrypted reactions (communities/newsletters). We don't decrypt these
@@ -1249,7 +1311,7 @@ func (b *Bridge) handleReactionMessage(evt *waevents.Message) bool {
 	}
 
 	msg.Reactions = nextReactions
-	if err := b.store.UpsertMessage(msg); err != nil {
+	if err := b.store.UpdateMessageReactions(msg.MessageID, nextReactions); err != nil {
 		b.logger.Warn().Err(err).Str("target_msg_id", targetID).Msg("Failed to store WhatsApp reaction update")
 		return true
 	}
@@ -2616,12 +2678,13 @@ func extractMessageBody(msg *waE2E.Message) string {
 		msg.GetPlaceholderMessage() != nil,
 		msg.GetSecretEncryptedMessage() != nil,
 		msg.GetMessageContextInfo() != nil && proto.Size(msg) <= proto.Size(msg.GetMessageContextInfo())+4:
-		// Control/sync traffic that should never surface in a thread:
-		// group-key rotations, admin protocol events (revoke/edit/ephemeral
-		// settings/history sync/etc — revoke and edit are handled by their
-		// own ingestion paths, not here), disappearing-message key shares,
-		// and lone MessageContextInfo envelopes. Returning empty causes
-		// handleMessageEvent to skip the insert rather than render a row.
+		// Control/sync traffic that should never surface as a new thread row:
+		// group-key rotations, admin protocol events (ephemeral settings,
+		// history sync, etc.), disappearing-message key shares, and lone
+		// MessageContextInfo envelopes. Revoke (delete) and MESSAGE_EDIT are
+		// intercepted earlier by handleProtocolMessage, which mutates the
+		// existing row; everything else here returns empty so the insert is
+		// skipped rather than rendered.
 		return ""
 	case hasUnsupportedWhatsAppContent(msg):
 		return "[Unsupported message]"

@@ -80,6 +80,21 @@ func New(dsn string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("enable foreign keys: %w", err)
 	}
+	// The daemon (serve) and one-shot CLI commands (read/status/send/import)
+	// open the same DB concurrently. Without a busy timeout, a second writer
+	// gets an immediate SQLITE_BUSY and the write is lost; wait-and-retry
+	// instead so concurrent writes serialize rather than drop.
+	if _, err := db.Exec("PRAGMA busy_timeout=5000"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("set busy timeout: %w", err)
+	}
+	// NORMAL is the recommended durability level under WAL: safe across app
+	// crashes (only an OS crash/power loss can lose the last transaction) and
+	// markedly faster on the write-heavy live-sync path.
+	if _, err := db.Exec("PRAGMA synchronous=NORMAL"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("set synchronous mode: %w", err)
+	}
 	s := &Store{db: db}
 	if err := s.migrate(); err != nil {
 		db.Close()
@@ -254,6 +269,9 @@ func (s *Store) migrate() error {
 
 	CREATE INDEX IF NOT EXISTS idx_messages_conv_ts ON messages(conversation_id, timestamp_ms);
 	CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages(timestamp_ms DESC);
+	-- Person/phone lookups (get_person_messages, --phone, metadata search JOIN)
+	-- filter on sender_number; without this they full-scan the messages table.
+	CREATE INDEX IF NOT EXISTS idx_messages_sender ON messages(sender_number);
 
 	CREATE TABLE IF NOT EXISTS contacts (
 		contact_id TEXT PRIMARY KEY,
@@ -301,6 +319,9 @@ func (s *Store) migrate() error {
 	// Index for platform-filtered conversation queries
 	s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_conversations_platform ON conversations(source_platform)`)
 
+	// Index for the contacts.number = messages.sender_number JOIN in metadata search
+	s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_contacts_number ON contacts(number)`)
+
 	// One-shot: consolidate any Signal duplicate clusters left over from
 	// the pre-v0.2.9 schema where the message_id hash included body. Now
 	// that hash is body-independent, (conv, sender, timestamp) is the true
@@ -343,6 +364,12 @@ func (s *Store) enableFTS() error {
 	return nil
 }
 
+// rebuildFTS ensures the FTS table exists and is populated. It only pays the
+// cost of a full repopulation when the index is actually out of sync with the
+// messages table (row counts differ). On a normal start the incremental
+// maintenance in syncMessageSearchIndex keeps them equal, so this is just a
+// cheap count check instead of re-indexing the entire archive on every CLI
+// invocation and daemon start.
 func (s *Store) rebuildFTS() error {
 	if _, err := s.db.Exec(`CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
 		message_id UNINDEXED,
@@ -352,6 +379,22 @@ func (s *Store) rebuildFTS() error {
 		return fmt.Errorf("create messages search index: %w", err)
 	}
 	s.ftsEnabled = true
+	var ftsCount, msgCount int
+	if err := s.db.QueryRow(`SELECT count(*) FROM messages_fts`).Scan(&ftsCount); err != nil {
+		return fmt.Errorf("count messages search index: %w", err)
+	}
+	if err := s.db.QueryRow(`SELECT count(*) FROM messages`).Scan(&msgCount); err != nil {
+		return fmt.Errorf("count messages: %w", err)
+	}
+	if ftsCount == msgCount {
+		return nil
+	}
+	return s.forceRebuildFTS()
+}
+
+// forceRebuildFTS unconditionally repopulates the FTS index from messages.
+// Assumes the messages_fts table already exists.
+func (s *Store) forceRebuildFTS() error {
 	if _, err := s.db.Exec(`DELETE FROM messages_fts`); err != nil {
 		return fmt.Errorf("reset messages search index: %w", err)
 	}

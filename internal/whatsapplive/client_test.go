@@ -2348,6 +2348,96 @@ func TestHandleMessageAppliesWhatsAppReactionsToTargetMessage(t *testing.T) {
 	}
 }
 
+func TestHandleProtocolMessageEditsAndRevokes(t *testing.T) {
+	store, err := db.New(filepath.Join(t.TempDir(), "messages.db"))
+	if err != nil {
+		t.Fatalf("db.New(): %v", err)
+	}
+	defer store.Close()
+
+	seed := func(id, body string) {
+		if err := store.UpsertMessage(&db.Message{
+			MessageID:      "whatsapp:" + id,
+			ConversationID: "whatsapp:15551234567@s.whatsapp.net",
+			SenderName:     "Jenn",
+			SenderNumber:   "+15551234567",
+			Body:           body,
+			TimestampMS:    1700000000000,
+			MediaID:        "media-keep",
+			SourcePlatform: "whatsapp",
+			SourceID:       id,
+		}); err != nil {
+			t.Fatalf("seed %s: %v", id, err)
+		}
+	}
+
+	bridge := &Bridge{store: store}
+	protocolEvent := func(eventID string, pm *waE2E.ProtocolMessage) *waevents.Message {
+		return &waevents.Message{
+			Info: watypes.MessageInfo{
+				MessageSource: watypes.MessageSource{
+					Chat:   watypes.NewJID("15551234567", watypes.DefaultUserServer),
+					Sender: watypes.NewJID("15551234567", watypes.DefaultUserServer),
+				},
+				ID:        watypes.MessageID(eventID),
+				Timestamp: time.UnixMilli(1700000002000),
+			},
+			Message: &waE2E.Message{ProtocolMessage: pm},
+		}
+	}
+
+	t.Run("edit updates body, preserves media", func(t *testing.T) {
+		seed("edit-target", "original text")
+		bridge.handleMessage(protocolEvent("edit-evt", &waE2E.ProtocolMessage{
+			Type: waE2E.ProtocolMessage_MESSAGE_EDIT.Enum(),
+			Key:  &waCommon.MessageKey{ID: strPtr("edit-target")},
+			EditedMessage: &waE2E.Message{
+				Conversation: strPtr("edited text"),
+			},
+		}))
+		got, err := store.GetMessageByID("whatsapp:edit-target")
+		if err != nil || got == nil {
+			t.Fatalf("get edited: %v / %v", got, err)
+		}
+		if got.Body != "edited text" {
+			t.Errorf("edit not applied: got %q, want %q", got.Body, "edited text")
+		}
+		if got.MediaID != "media-keep" {
+			t.Errorf("edit wiped media: got %q", got.MediaID)
+		}
+		// The edit envelope itself must not create a standalone row.
+		if extra, _ := store.GetMessageByID("whatsapp:edit-evt"); extra != nil {
+			t.Errorf("edit envelope leaked a row: %+v", extra)
+		}
+	})
+
+	t.Run("revoke deletes the target", func(t *testing.T) {
+		seed("revoke-target", "delete me")
+		bridge.handleMessage(protocolEvent("revoke-evt", &waE2E.ProtocolMessage{
+			Type: waE2E.ProtocolMessage_REVOKE.Enum(),
+			Key:  &waCommon.MessageKey{ID: strPtr("revoke-target")},
+		}))
+		got, err := store.GetMessageByID("whatsapp:revoke-target")
+		if err != nil {
+			t.Fatalf("get revoked: %v", err)
+		}
+		if got != nil {
+			t.Errorf("revoke did not delete message: %+v", got)
+		}
+	})
+
+	t.Run("typeless protocol message without key is ignored, not treated as revoke", func(t *testing.T) {
+		seed("safe-target", "keep me")
+		// A ProtocolMessage with the zero-value type (REVOKE) but no key must
+		// not delete anything.
+		bridge.handleMessage(protocolEvent("noop-evt", &waE2E.ProtocolMessage{}))
+		got, err := store.GetMessageByID("whatsapp:safe-target")
+		if err != nil || got == nil {
+			t.Fatalf("typeless protocol message should be a no-op, got %v / %v", got, err)
+		}
+	})
+}
+
 func TestHandleReceiptUpdatesOutgoingWhatsAppStatus(t *testing.T) {
 	store, err := db.New(filepath.Join(t.TempDir(), "messages.db"))
 	if err != nil {

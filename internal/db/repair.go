@@ -184,7 +184,10 @@ func (s *Store) RepairLegacyArtifacts() (LegacyRepairReport, error) {
 		report.DeletedWhatsAppUnsupportedRows > 0 ||
 		report.DeletedSignalReactionPlaceholders > 0 ||
 		report.FixedSignalBlankMessages > 0) && s.ftsEnabled {
-		if err := s.rebuildFTS(); err != nil {
+		// Repair rewrites message bodies in place (blank → placeholder), which
+		// doesn't change the row count, so the count-guarded rebuildFTS would
+		// skip it. Force a full repopulation to pick up the new bodies.
+		if err := s.forceRebuildFTS(); err != nil {
 			return report, err
 		}
 	}

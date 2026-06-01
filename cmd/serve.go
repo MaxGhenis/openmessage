@@ -202,6 +202,29 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 		}()
 	}
 
+	// Google Messages reconnect watchdog. libgm has no auto-reconnect and the
+	// long-poll goroutine can die (panic, ping failure, transient fatal error)
+	// while the session stays valid. Without this, SMS silently freezes with
+	// Connected=true forever. Only reconnect a paired-but-disconnected session;
+	// skip when it genuinely needs re-pairing (session deleted) so we don't
+	// hammer a known-bad state.
+	if !isDemo {
+		go func() {
+			ticker := time.NewTicker(15 * time.Second)
+			defer ticker.Stop()
+			for range ticker.C {
+				g := a.GoogleStatus()
+				if !g.Paired || g.Connected || g.NeedsPairing {
+					continue
+				}
+				logger.Info().Msg("Google Messages disconnected — attempting reconnect")
+				if err := a.ReconnectGoogleMessages(); err != nil {
+					logger.Warn().Err(err).Msg("Google Messages reconnect attempt failed")
+				}
+			}
+		}()
+	}
+
 	// Sync WhatsApp and iMessage periodically (every 30s, incremental)
 	lastImportErr := map[string]string{}
 	syncLocalPlatforms := func() {

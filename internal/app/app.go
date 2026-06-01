@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -335,7 +336,15 @@ func (a *App) LoadAndConnect() error {
 		OnRealtimeGapRecovered: func(reason string) {
 			a.StartRecentReconcile(reason)
 		},
-		OnDisconnect: func() {
+		OnConnectionLost: func() {
+			// Transient: keep the session so the reconnect watchdog can
+			// recover without a manual re-pair.
+			a.Connected.Store(false)
+			a.setGoogleLastError("Google Messages connection lost; reconnecting…")
+			a.emitStatusChange(false)
+			a.Logger.Warn().Msg("Google Messages connection lost; will attempt to reconnect")
+		},
+		OnSessionInvalid: func() {
 			a.Connected.Store(false)
 			a.setClient(nil)
 			if err := os.Remove(a.SessionPath); err != nil && !os.IsNotExist(err) {
@@ -346,7 +355,25 @@ func (a *App) LoadAndConnect() error {
 			a.Logger.Warn().Msg("Disconnected from Google Messages")
 		},
 	}
-	cli.GM.SetEventHandler(a.EventHandler.Handle)
+	// Wrap the handler so a panic on a malformed event can't kill libgm's
+	// single long-poll goroutine (it has no recover() of its own). A dead
+	// goroutine would freeze SMS while Connected stayed true — the zombie. On
+	// panic, mark disconnected so the reconnect watchdog re-establishes the
+	// long-poll.
+	cli.GM.SetEventHandler(func(evt any) {
+		defer func() {
+			if r := recover(); r != nil {
+				a.Logger.Error().
+					Interface("panic", r).
+					Bytes("stack", debug.Stack()).
+					Msg("Recovered from panic in Google Messages event handler")
+				a.Connected.Store(false)
+				a.setGoogleLastError("Google Messages sync interrupted; reconnecting…")
+				a.emitStatusChange(false)
+			}
+		}()
+		a.EventHandler.Handle(evt)
+	})
 
 	if err := cli.GM.Connect(); err != nil {
 		a.setGoogleLastError(err.Error())
@@ -543,7 +570,17 @@ func (a *App) IsDeepBackfillRunning() bool {
 
 // GetBackfillProgress returns a snapshot of the current backfill progress.
 func (a *App) GetBackfillProgress() BackfillProgress {
-	return a.BackfillProgress.snapshot()
+	snap := a.BackfillProgress.snapshot()
+	// A shallow Backfill (startup catch-up) holds the same mutual-exclusion
+	// guard (backfillRunning) without populating the deep-backfill progress
+	// struct. Reflect the guard here so status never reports "idle" while a
+	// sync is actually running — otherwise a concurrent deep-backfill request
+	// is rejected as "already running" while this status shows nothing going
+	// on, which looks like a phantom/zombie state.
+	if a.backfillRunning.Load() {
+		snap.Running = true
+	}
+	return snap
 }
 
 func (a *App) Close() {

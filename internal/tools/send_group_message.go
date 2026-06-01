@@ -5,12 +5,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 	"go.mau.fi/mautrix-gmessages/pkg/libgm/gmproto"
 
 	"github.com/maxghenis/openmessage/internal/app"
+	"github.com/maxghenis/openmessage/internal/db"
 )
 
 func sendGroupMessageTool() mcp.Tool {
@@ -62,9 +64,27 @@ func sendGroupMessageHandler(a *app.App) server.ToolHandlerFunc {
 		}
 
 		payload := app.BuildSendPayload(conv.GetConversationID(), message, "", "", nil)
-		_, err = cli.GM.SendMessage(payload)
+		resp, err := cli.GM.SendMessage(payload)
 		if err != nil {
 			return errorResult(fmt.Sprintf("failed to send group message: %v", err)), nil
+		}
+		// Surface a carrier/Google rejection instead of reporting success on a
+		// non-SUCCESS status (matches the 1:1 send path).
+		if resp.GetStatus() != gmproto.SendMessageResponse_SUCCESS {
+			return errorResult(fmt.Sprintf("failed to send group message: %s", resp.GetStatus().String())), nil
+		}
+
+		// Persist so the group send appears in local history (like 1:1 sends).
+		if err := a.Store.RecordOutgoingMessage(&db.Message{
+			MessageID:      payload.TmpID,
+			ConversationID: conv.GetConversationID(),
+			Body:           message,
+			IsFromMe:       true,
+			TimestampMS:    time.Now().UnixMilli(),
+			Status:         "OUTGOING_SENDING",
+			SourcePlatform: "sms",
+		}, ""); err != nil {
+			return errorResult(fmt.Sprintf("group message sent but failed to persist: %v", err)), nil
 		}
 
 		return textResult(fmt.Sprintf("Group message sent to %s: %s", strings.Join(phones, ", "), message)), nil

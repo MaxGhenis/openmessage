@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -110,10 +111,10 @@ func generateVizHandler(a *app.App) server.ToolHandlerFunc {
 		config := viz.VizConfig{
 			Person1:         person1,
 			Person2:         person2,
-			PrimaryColor:    strArg(args, "primary_color"),
-			SecondaryColor:  strArg(args, "secondary_color"),
-			AccentColor:     strArg(args, "accent_color"),
-			BackgroundColor: strArg(args, "background_color"),
+			PrimaryColor:    safeCSSColor(strArg(args, "primary_color")),
+			SecondaryColor:  safeCSSColor(strArg(args, "secondary_color")),
+			AccentColor:     safeCSSColor(strArg(args, "accent_color")),
+			BackgroundColor: safeCSSColor(strArg(args, "background_color")),
 			Timezone:        tzName,
 			PasswordHash:    hashPassword(strArg(args, "password")),
 		}
@@ -184,4 +185,28 @@ func joinNames(names []string) string {
 		return fmt.Sprintf("%s, %s, %s, +%d more", names[0], names[1], names[2], len(names)-3)
 	}
 	return strings.Join(names, ", ")
+}
+
+var (
+	hexColorRE     = regexp.MustCompile(`^#[0-9a-fA-F]{3,8}$`)
+	cssColorNameRE = regexp.MustCompile(`^[a-zA-Z]{3,20}$`)
+)
+
+// safeCSSColor validates a caller-supplied color before it's interpolated into
+// the generated viz HTML's CSS. It accepts hex colors (#rgb…#rrggbbaa) and bare
+// alphabetic CSS color names, and rejects anything else — so a value like
+// "red;}body{...}" can't break out of the CSS declaration and inject rules.
+// Returns "" for invalid input so the template falls back to its defaults.
+func safeCSSColor(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	if hexColorRE.MatchString(s) {
+		return s
+	}
+	if cssColorNameRE.MatchString(s) {
+		return strings.ToLower(s)
+	}
+	return ""
 }

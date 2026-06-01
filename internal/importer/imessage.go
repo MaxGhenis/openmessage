@@ -1,12 +1,15 @@
 package importer
 
 import (
+	"bytes"
 	"database/sql"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/maxghenis/openmessage/internal/db"
 
@@ -194,7 +197,7 @@ func (im *IMessage) loadChatParticipants(chatDB *sql.DB, chatRowID int) []map[st
 
 func (im *IMessage) loadMessages(chatDB *sql.DB, chatRowID int) ([]imessageMessage, error) {
 	rows, err := chatDB.Query(`
-		SELECT m.guid, m.text, m.date, m.is_from_me,
+		SELECT m.guid, COALESCE(m.text, ''), m.attributedBody, m.date, m.is_from_me,
 			COALESCE(h.id, '') as handle_id,
 			COALESCE(h.uncanonicalized_id, h.id, '') as handle_display
 		FROM message m
@@ -218,8 +221,15 @@ func (im *IMessage) loadMessages(chatDB *sql.DB, chatRowID int) ([]imessageMessa
 		var m imessageMessage
 		var date int64
 		var handleID, handleDisplay string
-		if err := rows.Scan(&m.guid, &m.text, &date, &m.isFromMe, &handleID, &handleDisplay); err != nil {
+		var attributedBody []byte
+		if err := rows.Scan(&m.guid, &m.text, &attributedBody, &date, &m.isFromMe, &handleID, &handleDisplay); err != nil {
 			continue
+		}
+		// Modern Messages stores the body in attributedBody (an NSAttributedString
+		// archive) and leaves text NULL — without this, the bulk of recent
+		// messages would import as empty and be skipped.
+		if m.text == "" && len(attributedBody) > 0 {
+			m.text = decodeAttributedBody(attributedBody)
 		}
 		if m.text == "" {
 			continue
@@ -234,6 +244,55 @@ func (im *IMessage) loadMessages(chatDB *sql.DB, chatRowID int) ([]imessageMessa
 		msgs = append(msgs, m)
 	}
 	return msgs, rows.Err()
+}
+
+// decodeAttributedBody best-effort extracts the plain message text from an
+// iMessage `attributedBody` blob (an NSArchiver "streamtyped" archive of an
+// NSAttributedString). The text is stored as an NSString whose UTF-8 bytes
+// follow the "NSString" class marker, a few control bytes, a '+' (0x2B), and a
+// length. The length uses the streamtyped variable-length integer encoding.
+// Returns "" if the structure isn't recognized or the result isn't valid UTF-8
+// (so a parse failure degrades to skipping, never to garbage).
+func decodeAttributedBody(blob []byte) string {
+	idx := bytes.Index(blob, []byte("NSString"))
+	if idx < 0 {
+		return ""
+	}
+	rest := blob[idx+len("NSString"):]
+	plus := bytes.IndexByte(rest, '+')
+	if plus < 0 || plus+1 >= len(rest) {
+		return ""
+	}
+	rest = rest[plus+1:]
+
+	var length int
+	switch {
+	case rest[0] < 0x80:
+		length = int(rest[0])
+		rest = rest[1:]
+	case rest[0] == 0x81: // next 2 bytes, little-endian
+		if len(rest) < 3 {
+			return ""
+		}
+		length = int(binary.LittleEndian.Uint16(rest[1:3]))
+		rest = rest[3:]
+	case rest[0] == 0x82: // next 4 bytes, little-endian
+		if len(rest) < 5 {
+			return ""
+		}
+		length = int(binary.LittleEndian.Uint32(rest[1:5]))
+		rest = rest[5:]
+	default:
+		return ""
+	}
+	if length <= 0 || length > len(rest) {
+		return ""
+	}
+	text := string(rest[:length])
+	if !utf8.ValidString(text) {
+		return ""
+	}
+	return text
 }
 
 // coreDataToMS converts a macOS Core Data timestamp (nanoseconds since 2001-01-01) to milliseconds since Unix epoch.

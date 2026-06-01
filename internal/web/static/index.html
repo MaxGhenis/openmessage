@@ -7835,9 +7835,16 @@ body::after {
       $gmStatusPill.classList.add('error');
     }
     if (googleStatus.connected) {
-      $gmHelper.textContent = 'Google Messages live sync is active. New SMS and RCS messages should appear immediately.';
+      $gmHelper.textContent = 'Google Messages live sync is active. New SMS and RCS messages should appear immediately. If new messages stop arriving, pair again to refresh the connection.';
       showGoogleError('');
-      $gmActionsRow.style.display = 'none';
+      // Keep a re-pair affordance available even while "connected": the
+      // connection flag can stay true after the session has silently gone
+      // stale, and hiding all actions would strand that state with no way to
+      // recover. "Pair again" opens the native Google sign-in.
+      $gmActionsRow.style.display = '';
+      $gmReconnectBtn.disabled = false;
+      $gmReconnectBtn.textContent = 'Pair again';
+      $gmReconnectBtn.dataset.mode = 'pair';
     } else if (googleStatus.paired && !googleStatus.needs_pairing) {
       $gmHelper.textContent = 'This Google Messages account is paired locally, but live SMS and RCS sync is currently paused. Reconnect to resume updates.';
       showGoogleError(googleStatus.last_error);

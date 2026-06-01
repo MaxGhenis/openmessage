@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -678,7 +679,7 @@ func (b *Bridge) SendReaction(conversationID, targetMessageID, emoji, action str
 		return nil
 	}
 	target.Reactions = nextReactions
-	if err := b.store.UpsertMessage(target); err != nil {
+	if err := b.store.UpdateMessageReactions(target.MessageID, nextReactions); err != nil {
 		return fmt.Errorf("store Signal reaction update: %w", err)
 	}
 	if b.callbacks.OnMessagesChange != nil {
@@ -759,6 +760,23 @@ func (b *Bridge) runLink(ctx context.Context) {
 }
 
 func (b *Bridge) startReceiveLoop(account string, requestSync bool) {
+	// A panic while parsing an attacker-influenced envelope (unchecked indexes
+	// into attachments/reactions/quotes) would otherwise kill this goroutine
+	// and leave connected=true — Signal silently freezes. Recover, reset the
+	// connection state, and let the reconnect watchdog re-spawn the loop.
+	defer func() {
+		if r := recover(); r != nil {
+			b.logger.Error().
+				Interface("panic", r).
+				Bytes("stack", debug.Stack()).
+				Msg("Recovered from panic in Signal receive loop")
+			b.mu.Lock()
+			b.connected = false
+			b.connecting = false
+			b.mu.Unlock()
+			b.emitStatusChange()
+		}
+	}()
 	ctx, cancel := context.WithCancel(context.Background())
 	b.mu.Lock()
 	if b.receiveCancel != nil {
@@ -1880,7 +1898,7 @@ func (b *Bridge) applyReactionToConversation(conversationID string, reaction *si
 		return nil
 	}
 	targetMessage.Reactions = nextReactions
-	if err := b.store.UpsertMessage(targetMessage); err != nil {
+	if err := b.store.UpdateMessageReactions(targetMessage.MessageID, nextReactions); err != nil {
 		return err
 	}
 	if b.callbacks.OnMessagesChange != nil {
