@@ -120,7 +120,10 @@ func (h *EventHandler) handleMessage(evt *libgm.WrappedMessage) {
 		h.Logger.Error().Err(err).Str("msg_id", dbMsg.MessageID).Msg("Failed to store message")
 		return
 	}
-	if err := h.Store.BumpConversationTimestamp(dbMsg.ConversationID, dbMsg.TimestampMS); err != nil {
+	// Only real content advances inbox recency. A contentless stub (e.g. an
+	// emoji reaction made in a group that arrives as an empty message in the
+	// reactor's 1:1 thread) must not float that conversation to the top.
+	if err := h.Store.AdvanceConversationRecency(dbMsg); err != nil {
 		h.Logger.Warn().Err(err).Str("conv_id", dbMsg.ConversationID).Msg("Failed to update conversation timestamp from message")
 	}
 
@@ -170,6 +173,7 @@ func (h *EventHandler) storeConversation(conv *gmproto.Conversation) bool {
 			Name   string `json:"name"`
 			Number string `json:"number"`
 			IsMe   bool   `json:"is_me,omitempty"`
+			ID     string `json:"id,omitempty"` // participant ID, used to resolve reaction actors to names
 		}
 		var infos []pInfo
 		for _, p := range ps {
@@ -179,6 +183,7 @@ func (h *EventHandler) storeConversation(conv *gmproto.Conversation) bool {
 			}
 			if id := p.GetID(); id != nil {
 				info.Number = id.GetNumber()
+				info.ID = id.GetParticipantID()
 			}
 			if info.Number == "" {
 				info.Number = p.GetFormattedNumber()

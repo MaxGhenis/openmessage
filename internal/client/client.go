@@ -118,10 +118,13 @@ func ExtractMediaInfo(msg *gmproto.Message) *MediaInfo {
 	return nil
 }
 
-// Reaction holds an emoji and how many people reacted with it.
+// Reaction holds an emoji, how many people reacted with it, and the participant
+// IDs of those reactors. Actors are Google Messages participant IDs that resolve
+// to names via the conversation's participant list (see SmallInfo.ParticipantID).
 type Reaction struct {
-	Emoji string `json:"emoji"`
-	Count int    `json:"count"`
+	Emoji  string   `json:"emoji"`
+	Count  int      `json:"count"`
+	Actors []string `json:"actors,omitempty"`
 }
 
 // ExtractReactions extracts reaction data from a protobuf Message.
@@ -138,9 +141,11 @@ func ExtractReactions(msg *gmproto.Message) []Reaction {
 			if emoji == "" {
 				continue
 			}
+			participantIDs := entry.GetParticipantIDs()
 			reactions = append(reactions, Reaction{
-				Emoji: emoji,
-				Count: len(entry.GetParticipantIDs()),
+				Emoji:  emoji,
+				Count:  len(participantIDs),
+				Actors: participantIDs,
 			})
 		}
 	}

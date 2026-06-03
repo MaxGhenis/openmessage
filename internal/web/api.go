@@ -446,6 +446,31 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			writeJSON(w, convo)
 			return
 		}
+		if action == "tab" {
+			if r.Method != http.MethodPost && r.Method != http.MethodPatch {
+				httpError(w, "method not allowed", 405)
+				return
+			}
+			var req struct {
+				Tab string `json:"tab"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				httpError(w, "invalid JSON: "+err.Error(), 400)
+				return
+			}
+			if err := store.SetConversationTab(convID, req.Tab); err != nil {
+				httpError(w, "set tab: "+err.Error(), 400)
+				return
+			}
+			convo, err := store.GetConversation(convID)
+			if err != nil {
+				httpError(w, "get conversation: "+err.Error(), 500)
+				return
+			}
+			publishConversations()
+			writeJSON(w, convo)
+			return
+		}
 		if action != "messages" {
 			httpError(w, "not found", 404)
 			return
@@ -484,6 +509,99 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			msgs = []*db.Message{}
 		}
 		writeJSON(w, msgs)
+	})
+
+	// Bulk-move multiple conversations into a tab ("" = Recent, "archive", or a custom tab id).
+	mux.HandleFunc("/api/conversations/move", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			httpError(w, "method not allowed", 405)
+			return
+		}
+		var req struct {
+			IDs []string `json:"ids"`
+			Tab string   `json:"tab"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			httpError(w, "invalid JSON: "+err.Error(), 400)
+			return
+		}
+		if len(req.IDs) == 0 {
+			httpError(w, "ids is required", 400)
+			return
+		}
+		if err := store.SetConversationsTab(req.IDs, req.Tab); err != nil {
+			httpError(w, "move conversations: "+err.Error(), 400)
+			return
+		}
+		publishConversations()
+		writeJSON(w, map[string]any{"moved": len(req.IDs), "tab": strings.TrimSpace(req.Tab)})
+	})
+
+	// List (GET) or create (POST) custom tabs.
+	mux.HandleFunc("/api/tabs", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			tabs, err := store.ListTabs()
+			if err != nil {
+				httpError(w, "list tabs: "+err.Error(), 500)
+				return
+			}
+			if tabs == nil {
+				tabs = []*db.Tab{}
+			}
+			writeJSON(w, tabs)
+		case http.MethodPost:
+			var req struct {
+				Name string `json:"name"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				httpError(w, "invalid JSON: "+err.Error(), 400)
+				return
+			}
+			tab, err := store.CreateTab(req.Name)
+			if err != nil {
+				httpError(w, "create tab: "+err.Error(), 400)
+				return
+			}
+			publishConversations()
+			writeJSON(w, tab)
+		default:
+			httpError(w, "method not allowed", 405)
+		}
+	})
+
+	// Rename (POST) or delete (DELETE) a custom tab by id.
+	mux.HandleFunc("/api/tabs/", func(w http.ResponseWriter, r *http.Request) {
+		tabID := strings.TrimPrefix(r.URL.Path, "/api/tabs/")
+		if tabID == "" {
+			httpError(w, "tab id required", 400)
+			return
+		}
+		switch r.Method {
+		case http.MethodPost, http.MethodPatch:
+			var req struct {
+				Name string `json:"name"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				httpError(w, "invalid JSON: "+err.Error(), 400)
+				return
+			}
+			if err := store.RenameTab(tabID, req.Name); err != nil {
+				httpError(w, "rename tab: "+err.Error(), 400)
+				return
+			}
+			publishConversations()
+			writeJSON(w, map[string]any{"tab_id": tabID, "name": strings.TrimSpace(req.Name)})
+		case http.MethodDelete:
+			if err := store.DeleteTab(tabID); err != nil {
+				httpError(w, "delete tab: "+err.Error(), 400)
+				return
+			}
+			publishConversations()
+			writeJSON(w, map[string]any{"deleted": tabID})
+		default:
+			httpError(w, "method not allowed", 405)
+		}
 	})
 
 	mux.HandleFunc("/api/contacts", func(w http.ResponseWriter, r *http.Request) {

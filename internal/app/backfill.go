@@ -583,6 +583,7 @@ func (a *App) storeConversation(conv *gmproto.Conversation) error {
 			Name   string `json:"name"`
 			Number string `json:"number"`
 			IsMe   bool   `json:"is_me,omitempty"`
+			ID     string `json:"id,omitempty"` // participant ID, used to resolve reaction actors to names
 		}
 		var infos []pInfo
 		for _, p := range ps {
@@ -592,6 +593,7 @@ func (a *App) storeConversation(conv *gmproto.Conversation) error {
 			}
 			if id := p.GetID(); id != nil {
 				info.Number = id.GetNumber()
+				info.ID = id.GetParticipantID()
 			}
 			if info.Number == "" {
 				info.Number = p.GetFormattedNumber()

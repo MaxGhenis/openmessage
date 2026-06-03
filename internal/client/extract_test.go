@@ -129,6 +129,13 @@ func TestExtractReactions_WithEmojis(t *testing.T) {
 	if reactions[1].Count != 1 {
 		t.Errorf("expected count 1, got %d", reactions[1].Count)
 	}
+	// Actors carry the reactor participant IDs so the UI can name who reacted.
+	if got := reactions[0].Actors; len(got) != 3 || got[0] != "p1" || got[1] != "p2" || got[2] != "p3" {
+		t.Errorf("expected actors [p1 p2 p3], got %v", got)
+	}
+	if got := reactions[1].Actors; len(got) != 1 || got[0] != "p1" {
+		t.Errorf("expected actors [p1], got %v", got)
+	}
 }
 
 func TestExtractReplyToID_None(t *testing.T) {

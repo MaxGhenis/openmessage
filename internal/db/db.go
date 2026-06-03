@@ -22,6 +22,7 @@ type Conversation struct {
 	UnreadCount    int
 	SourcePlatform string `json:"source_platform,omitempty"` // sms, gchat, imessage, whatsapp, signal, telegram
 	NotificationMode string `json:"notification_mode,omitempty"` // all, mentions, muted
+	Tab            string `json:"tab,omitempty"` // "" = Recent (inbox), "archive", or a custom tab id
 }
 
 type Message struct {
@@ -230,7 +231,15 @@ func (s *Store) migrate() error {
 		participants TEXT NOT NULL DEFAULT '[]',
 		last_message_ts INTEGER NOT NULL DEFAULT 0,
 		unread_count INTEGER NOT NULL DEFAULT 0,
-		notification_mode TEXT NOT NULL DEFAULT 'all'
+		notification_mode TEXT NOT NULL DEFAULT 'all',
+		tab TEXT NOT NULL DEFAULT ''
+	);
+
+	CREATE TABLE IF NOT EXISTS tabs (
+		tab_id TEXT PRIMARY KEY,
+		name TEXT NOT NULL DEFAULT '',
+		position INTEGER NOT NULL DEFAULT 0,
+		created_at INTEGER NOT NULL DEFAULT 0
 	);
 
 	CREATE TABLE IF NOT EXISTS messages (
@@ -282,6 +291,7 @@ func (s *Store) migrate() error {
 		"ALTER TABLE messages ADD COLUMN source_id TEXT NOT NULL DEFAULT ''",
 		"ALTER TABLE conversations ADD COLUMN source_platform TEXT NOT NULL DEFAULT 'sms'",
 		"ALTER TABLE conversations ADD COLUMN notification_mode TEXT NOT NULL DEFAULT 'all'",
+		"ALTER TABLE conversations ADD COLUMN tab TEXT NOT NULL DEFAULT ''",
 	} {
 		s.db.Exec(col) // ignore "duplicate column" errors
 	}

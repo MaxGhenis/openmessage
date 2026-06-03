@@ -223,6 +223,13 @@ func New(logger zerolog.Logger) (*App, error) {
 				Msg("Repaired legacy Google Messages outgoing attribution rows")
 		}
 	}
+	// Drop conversations that a contentless stub (e.g. a group reaction arriving
+	// as an empty message in a 1:1 thread) wrongly floated to the top of recents.
+	if fixed, err := store.RepairContentlessRecency(); err != nil {
+		logger.Warn().Err(err).Msg("Failed to repair contentless conversation recency")
+	} else if fixed > 0 {
+		logger.Info().Int("fixed", fixed).Msg("Repaired conversations floated up by contentless messages")
+	}
 	if !Sandboxed() {
 		if mediaRepair, err := (&importer.WhatsAppNative{}).RepairLegacyMediaPlaceholders(store); err != nil {
 			logger.Warn().Err(err).Msg("Failed to repair legacy WhatsApp media placeholders")
