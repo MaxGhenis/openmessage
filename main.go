@@ -22,11 +22,13 @@ func main() {
 		With().Timestamp().Logger().Level(level)
 
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "Usage: openmessage <pair|serve|demo|send|import>")
+		fmt.Fprintln(os.Stderr, "Usage: openmessage <pair|serve|demo|read|thread|threads|send|import>")
 		fmt.Fprintln(os.Stderr, "  pair [--google|--google-file path]       - Pair with your phone via QR or Google account cookies")
 		fmt.Fprintln(os.Stderr, "  serve [--demo] [--web|--no-web] [--mcp-sse|--no-mcp-sse] [--mcp-stdio] - Start explicit web/MCP transports")
 		fmt.Fprintln(os.Stderr, "  demo                                     - Start a seeded fake-data UI with live transports disabled")
 		fmt.Fprintln(os.Stderr, "  read <query> [--limit N] [--phone X] [--since YYYY-MM-DD] [--until YYYY-MM-DD] [--json] - Search the local store")
+		fmt.Fprintln(os.Stderr, "  thread <name|number|conversation_id> [--limit N] [--since YYYY-MM-DD] [--until YYYY-MM-DD] [--json] - Print a full conversation chronologically")
+		fmt.Fprintln(os.Stderr, "  threads [--limit N] [--json]             - List recent conversations (find an id/name for thread)")
 		fmt.Fprintln(os.Stderr, "  status [--json]                          - Show per-platform message counts and sync freshness")
 		fmt.Fprintln(os.Stderr, "  send <conversation_id> <msg>              - Send text to an existing conversation across supported platforms")
 		fmt.Fprintln(os.Stderr, "  send-group <phone1,phone2,...> <msg>       - Send group message (MMS)")
@@ -52,6 +54,14 @@ func main() {
 			os.Exit(1)
 		}
 		err = cmd.RunRead(logger, os.Args[2:]...)
+	case "thread":
+		if len(os.Args) < 3 {
+			fmt.Fprintln(os.Stderr, "Usage: openmessage thread <name|number|conversation_id> [--limit N] [--since YYYY-MM-DD] [--until YYYY-MM-DD] [--json]")
+			os.Exit(1)
+		}
+		err = cmd.RunThread(logger, os.Args[2:]...)
+	case "threads":
+		err = cmd.RunThreads(logger, os.Args[2:]...)
 	case "status":
 		err = cmd.RunStatus(logger, os.Args[2:]...)
 	case "send":
@@ -81,7 +91,7 @@ func main() {
 		err = cmd.RunDebugMedia(logger, os.Args[2])
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown command: %s\n", os.Args[1])
-		fmt.Fprintln(os.Stderr, "Usage: openmessage <pair|serve|demo|send|import>")
+		fmt.Fprintln(os.Stderr, "Usage: openmessage <pair|serve|demo|read|thread|threads|send|import>")
 		os.Exit(1)
 	}
 
