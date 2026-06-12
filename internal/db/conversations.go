@@ -7,7 +7,7 @@ import (
 )
 
 // conversationColumns is the canonical column list for SELECT queries on conversations.
-const conversationColumns = `conversation_id, name, is_group, participants, last_message_ts, unread_count, source_platform, notification_mode`
+const conversationColumns = `conversation_id, name, is_group, participants, last_message_ts, unread_count, source_platform, notification_mode, tab`
 
 const (
 	NotificationModeAll      = "all"
@@ -76,7 +76,7 @@ func (s *Store) GetConversation(id string) (*Conversation, error) {
 	err := s.db.QueryRow(`
 		SELECT `+conversationColumns+`
 		FROM conversations WHERE conversation_id = ?
-	`, id).Scan(&c.ConversationID, &c.Name, &c.IsGroup, &c.Participants, &c.LastMessageTS, &c.UnreadCount, &c.SourcePlatform, &c.NotificationMode)
+	`, id).Scan(&c.ConversationID, &c.Name, &c.IsGroup, &c.Participants, &c.LastMessageTS, &c.UnreadCount, &c.SourcePlatform, &c.NotificationMode, &c.Tab)
 	if err != nil {
 		return nil, err
 	}
@@ -180,6 +180,44 @@ func (s *Store) SetConversationNotificationMode(id, mode string) error {
 	return err
 }
 
+// Built-in tab identifiers. "" is the implicit Recent (inbox) tab.
+const (
+	TabInbox   = ""        // Recent threads
+	TabArchive = "archive" // Archived threads
+)
+
+// SetConversationTab moves a single conversation into the given tab.
+// An empty tab returns it to Recent (inbox).
+func (s *Store) SetConversationTab(id, tab string) error {
+	_, err := s.db.Exec(`UPDATE conversations SET tab = ? WHERE conversation_id = ?`, strings.TrimSpace(tab), id)
+	return err
+}
+
+// SetConversationsTab moves multiple conversations into the given tab in one transaction.
+func (s *Store) SetConversationsTab(ids []string, tab string) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	tab = strings.TrimSpace(tab)
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	stmt, err := tx.Prepare(`UPDATE conversations SET tab = ? WHERE conversation_id = ?`)
+	if err != nil {
+		tx.Rollback()
+		return err
+	}
+	defer stmt.Close()
+	for _, id := range ids {
+		if _, err := stmt.Exec(tab, id); err != nil {
+			tx.Rollback()
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
 func (s *Store) ListConversations(limit int) ([]*Conversation, error) {
 	rows, err := s.db.Query(`
 		SELECT `+conversationColumns+`
@@ -257,7 +295,7 @@ func scanConversations(rows interface {
 	var convs []*Conversation
 	for rows.Next() {
 		c := &Conversation{}
-		if err := rows.Scan(&c.ConversationID, &c.Name, &c.IsGroup, &c.Participants, &c.LastMessageTS, &c.UnreadCount, &c.SourcePlatform, &c.NotificationMode); err != nil {
+		if err := rows.Scan(&c.ConversationID, &c.Name, &c.IsGroup, &c.Participants, &c.LastMessageTS, &c.UnreadCount, &c.SourcePlatform, &c.NotificationMode, &c.Tab); err != nil {
 			return nil, err
 		}
 		c.NotificationMode = normalizeStoredNotificationMode(c.NotificationMode)
@@ -271,7 +309,7 @@ func getConversationTx(tx *sql.Tx, id string) (*Conversation, error) {
 	err := tx.QueryRow(`
 		SELECT `+conversationColumns+`
 		FROM conversations WHERE conversation_id = ?
-	`, id).Scan(&c.ConversationID, &c.Name, &c.IsGroup, &c.Participants, &c.LastMessageTS, &c.UnreadCount, &c.SourcePlatform, &c.NotificationMode)
+	`, id).Scan(&c.ConversationID, &c.Name, &c.IsGroup, &c.Participants, &c.LastMessageTS, &c.UnreadCount, &c.SourcePlatform, &c.NotificationMode, &c.Tab)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return nil, nil

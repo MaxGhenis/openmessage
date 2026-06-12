@@ -52,21 +52,71 @@ type LinkPreviewService struct {
 }
 
 func NewLinkPreviewService(logger zerolog.Logger) *LinkPreviewService {
-	return &LinkPreviewService{
-		logger: logger,
-		client: &http.Client{
-			Timeout: 6 * time.Second,
-			CheckRedirect: func(req *http.Request, via []*http.Request) error {
-				if len(via) >= 5 {
-					return errors.New("too many redirects")
-				}
-				return nil
-			},
-		},
+	s := &LinkPreviewService{
+		logger:     logger,
 		ttl:        6 * time.Hour,
 		maxEntries: 256,
 		cache:      make(map[string]linkPreviewCacheEntry),
 	}
+	s.client = &http.Client{
+		Timeout: 6 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 5 {
+				return errors.New("too many redirects")
+			}
+			return nil
+		},
+		Transport: &http.Transport{
+			// Validate AND connect to the same resolved IP, closing the
+			// resolve-then-fetch TOCTOU (DNS-rebinding) gap where a hostname
+			// could resolve to a public IP for the guard check and a private
+			// IP for the actual connection. This covers the initial request
+			// and every redirect in one place.
+			DialContext:           s.guardedDialContext,
+			ForceAttemptHTTP2:     true,
+			MaxIdleConns:          10,
+			IdleConnTimeout:       30 * time.Second,
+			TLSHandshakeTimeout:   5 * time.Second,
+			ExpectContinueTimeout: time.Second,
+		},
+	}
+	return s
+}
+
+// guardedDialContext resolves the target host, rejects it if any resolved
+// address is private/loopback (unless allowPrivateHosts), and dials the exact
+// IP it validated — so there is no second, unchecked DNS resolution. TLS still
+// verifies against the original hostname (the transport sets ServerName from
+// the request URL, not the dialed address).
+func (s *LinkPreviewService) guardedDialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, err
+	}
+	ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		return nil, fmt.Errorf("resolve preview host: %w", err)
+	}
+	if !s.allowPrivateHosts {
+		for _, ip := range ips {
+			if isPrivatePreviewIP(ip.IP) {
+				return nil, ErrBlockedLinkPreviewURL
+			}
+		}
+	}
+	dialer := &net.Dialer{Timeout: 5 * time.Second}
+	var lastErr error
+	for _, ip := range ips {
+		conn, err := dialer.DialContext(ctx, network, net.JoinHostPort(ip.IP.String(), port))
+		if err == nil {
+			return conn, nil
+		}
+		lastErr = err
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no addresses for preview host %q", host)
+	}
+	return nil, lastErr
 }
 
 func (s *LinkPreviewService) Fetch(ctx context.Context, rawURL string) (*LinkPreview, error) {
@@ -361,6 +411,12 @@ func resolvePreviewURL(baseURL *url.URL, raw string) string {
 		return ""
 	}
 	if parsed.IsAbs() {
+		// Only http(s) image URLs are allowed through. og:image is
+		// attacker-controlled (it comes from the linked page's meta tags), so
+		// reject data:/javascript:/file:/etc. before it reaches an <img src>.
+		if parsed.Scheme != "http" && parsed.Scheme != "https" {
+			return ""
+		}
 		return parsed.String()
 	}
 	if baseURL == nil {

@@ -13,8 +13,16 @@ import (
 	"github.com/maxghenis/openmessage/internal/db"
 )
 
-// OnDisconnect is called when the client fatally disconnects (e.g. unpaired).
-type OnDisconnect func()
+// OnSessionInvalid is called when the session is genuinely dead (server-side
+// logout / invalid credentials) and the user must re-pair. The session file
+// should be deleted.
+type OnSessionInvalid func()
+
+// OnConnectionLost is called when the live connection dropped but the session
+// is (likely) still valid — a transient error. The session must be KEPT so a
+// reconnect can succeed; deleting it here would force a spurious manual re-pair
+// on a mere network blip or token-refresh race.
+type OnConnectionLost func()
 
 type EventHandler struct {
 	Store                  *db.Store
@@ -22,7 +30,8 @@ type EventHandler struct {
 	SessionPath            string
 	Client                 *Client
 	OnConversationsChange  func()
-	OnDisconnect           OnDisconnect
+	OnSessionInvalid       OnSessionInvalid
+	OnConnectionLost       OnConnectionLost
 	OnIncomingMessage      func(*db.Message)
 	OnPendingMedia         func(conversationID, messageID string)
 	OnMessagesChange       func(string)
@@ -43,10 +52,34 @@ func (h *EventHandler) Handle(rawEvt any) {
 	case *events.PairSuccessful:
 		h.Logger.Info().Str("phone_id", evt.PhoneID).Msg("Pairing successful")
 	case *events.ListenFatalError:
-		h.Logger.Error().Err(evt.Error).Msg("Listen fatal error")
-		if h.OnDisconnect != nil {
-			h.OnDisconnect()
+		// Treat as transient: mark the connection lost (keep the session) and
+		// let the reconnect watchdog retry. libgm raises this on a single
+		// failed token refresh or a one-off 401, so deleting the session here
+		// would force a needless re-pair. A genuine logout arrives separately
+		// as GaiaLoggedOut (handled below) and DOES drop the session.
+		h.Logger.Error().Err(evt.Error).Msg("Listen fatal error — marking connection lost")
+		if h.OnConnectionLost != nil {
+			h.OnConnectionLost()
 		}
+	case *events.GaiaLoggedOut:
+		// Explicit server-side logout: the session is genuinely dead. Without
+		// handling this, libgm keeps long-polling and getting "logged out"
+		// replies while Connected stays true — the classic zombie where SMS
+		// silently stops for months.
+		h.Logger.Warn().Msg("Google account logged out server-side — session invalid")
+		if h.OnSessionInvalid != nil {
+			h.OnSessionInvalid()
+		}
+	case *events.PingFailed:
+		// Repeated ping failures mean the long-poll is no longer healthy.
+		// Surface it and, once it persists, mark the connection lost so the
+		// watchdog reconnects instead of sitting in a silent zombie state.
+		h.Logger.Warn().Err(evt.Error).Int("count", evt.ErrorCount).Msg("Google Messages ping failed")
+		if evt.ErrorCount >= 3 && h.OnConnectionLost != nil {
+			h.OnConnectionLost()
+		}
+	case *events.NoDataReceived:
+		h.Logger.Debug().Msg("Google Messages long-poll received no data")
 	case *events.ListenTemporaryError:
 		h.Logger.Warn().Err(evt.Error).Msg("Listen temporary error")
 	case *events.ListenRecovered:
@@ -120,7 +153,10 @@ func (h *EventHandler) handleMessage(evt *libgm.WrappedMessage) {
 		h.Logger.Error().Err(err).Str("msg_id", dbMsg.MessageID).Msg("Failed to store message")
 		return
 	}
-	if err := h.Store.BumpConversationTimestamp(dbMsg.ConversationID, dbMsg.TimestampMS); err != nil {
+	// Only real content advances inbox recency. A contentless stub (e.g. an
+	// emoji reaction made in a group that arrives as an empty message in the
+	// reactor's 1:1 thread) must not float that conversation to the top.
+	if err := h.Store.AdvanceConversationRecency(dbMsg); err != nil {
 		h.Logger.Warn().Err(err).Str("conv_id", dbMsg.ConversationID).Msg("Failed to update conversation timestamp from message")
 	}
 
@@ -170,6 +206,7 @@ func (h *EventHandler) storeConversation(conv *gmproto.Conversation) bool {
 			Name   string `json:"name"`
 			Number string `json:"number"`
 			IsMe   bool   `json:"is_me,omitempty"`
+			ID     string `json:"id,omitempty"` // participant ID, used to resolve reaction actors to names
 		}
 		var infos []pInfo
 		for _, p := range ps {
@@ -179,6 +216,7 @@ func (h *EventHandler) storeConversation(conv *gmproto.Conversation) bool {
 			}
 			if id := p.GetID(); id != nil {
 				info.Number = id.GetNumber()
+				info.ID = id.GetParticipantID()
 			}
 			if info.Number == "" {
 				info.Number = p.GetFormattedNumber()

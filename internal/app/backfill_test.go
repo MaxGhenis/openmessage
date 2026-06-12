@@ -335,6 +335,7 @@ func TestDeepBackfillMessagePagination(t *testing.T) {
 }
 
 func TestDeepBackfillContactDiscovery(t *testing.T) {
+	t.Setenv("OPENMESSAGES_BACKFILL_DISCOVER_ORPHANS", "1")
 	mock := &mockGMClient{
 		conversations: map[gmproto.ListConversationsRequest_Folder][][]*gmproto.Conversation{
 			gmproto.ListConversationsRequest_INBOX: {
@@ -371,6 +372,7 @@ func TestDeepBackfillContactDiscovery(t *testing.T) {
 }
 
 func TestDeepBackfillContactDiscoverySkipsAlreadySeen(t *testing.T) {
+	t.Setenv("OPENMESSAGES_BACKFILL_DISCOVER_ORPHANS", "1")
 	// Contact's phone maps to a conversation already found in INBOX
 	mock := &mockGMClient{
 		conversations: map[gmproto.ListConversationsRequest_Folder][][]*gmproto.Conversation{
@@ -398,6 +400,48 @@ func TestDeepBackfillContactDiscoverySkipsAlreadySeen(t *testing.T) {
 	convos, _ := a.Store.ListConversations(50)
 	if len(convos) != 1 {
 		t.Fatalf("got %d conversations, want 1 (contact maps to existing)", len(convos))
+	}
+}
+
+// TestDeepBackfillSkipsPhaseCWhenOptOut confirms Phase C does NOT run when
+// the env var is unset. The mock has a contact whose phone would map to a
+// brand-new conversation; without orphan discovery enabled, that contact
+// must not be queried via GetOrCreateConversation, so the conversation
+// must not appear in the store.
+func TestDeepBackfillSkipsPhaseCWhenOptOut(t *testing.T) {
+	// Explicitly empty (default behavior).
+	t.Setenv("OPENMESSAGES_BACKFILL_DISCOVER_ORPHANS", "")
+	mock := &mockGMClient{
+		conversations: map[gmproto.ListConversationsRequest_Folder][][]*gmproto.Conversation{
+			gmproto.ListConversationsRequest_INBOX: {
+				{makeConv("c1", "Alice")},
+			},
+		},
+		messages: map[string][][]*gmproto.Message{
+			"c1":     {{makeMsg("m1", "c1", "hi", 100)}},
+			"c-mary": {{makeMsg("m2", "c-mary", "old msg", 50)}},
+		},
+		contacts: []*gmproto.Contact{
+			{
+				Name:   "Mary",
+				Number: &gmproto.ContactNumber{Number: "+15555555555"},
+			},
+		},
+		getOrCreateResults: map[string]*gmproto.Conversation{
+			"+15555555555": makeConv("c-mary", "Mary"),
+		},
+	}
+
+	a := newTestApp(t, mock)
+	a.DeepBackfill()
+
+	convos, _ := a.Store.ListConversations(50)
+	if len(convos) != 1 {
+		t.Fatalf("got %d conversations, want 1 (Phase C should be skipped)", len(convos))
+	}
+	progress := a.BackfillProgress.snapshot()
+	if progress.ContactsChecked != 0 {
+		t.Fatalf("got %d contacts checked, want 0 (Phase C should be skipped)", progress.ContactsChecked)
 	}
 }
 
@@ -463,6 +507,7 @@ func TestDeepBackfillMessageFetchError(t *testing.T) {
 }
 
 func TestDeepBackfillGetOrCreateError(t *testing.T) {
+	t.Setenv("OPENMESSAGES_BACKFILL_DISCOVER_ORPHANS", "1")
 	mock := &mockGMClient{
 		contacts: []*gmproto.Contact{
 			{
@@ -1006,5 +1051,36 @@ func TestBackfillPopulatesDB(t *testing.T) {
 	}
 	if msgs[0].Body != "Hello from backfill" {
 		t.Fatalf("got body %q", msgs[0].Body)
+	}
+}
+
+
+func TestOrphanContactDiscoveryEnabled(t *testing.T) {
+	cases := []struct {
+		name string
+		env  string
+		want bool
+	}{
+		{"unset", "", false},
+		{"empty", "", false},
+		{"explicit zero", "0", false},
+		{"explicit false", "false", false},
+		{"no", "no", false},
+		{"off", "off", false},
+		{"one", "1", true},
+		{"true", "true", true},
+		{"True mixed case", "True", true},
+		{"YES upper", "YES", true},
+		{"on padded", "  on  ", true},
+		{"unrecognized", "maybe", false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("OPENMESSAGES_BACKFILL_DISCOVER_ORPHANS", tc.env)
+			if got := orphanContactDiscoveryEnabled(); got != tc.want {
+				t.Fatalf("orphanContactDiscoveryEnabled() = %v with env=%q, want %v", got, tc.env, tc.want)
+			}
+		})
 	}
 }

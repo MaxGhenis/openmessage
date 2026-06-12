@@ -168,6 +168,7 @@ The macOS app target lives under `OpenMessage/`.
 | `OPENMESSAGES_HOST` | `127.0.0.1` | Host/interface to bind the local web server to |
 | `OPENMESSAGES_MY_NAME` | system user name | Display name for outgoing imported iMessage/WhatsApp messages |
 | `OPENMESSAGES_STARTUP_BACKFILL` | `auto` | Startup history sync mode: `auto`, `shallow`, `deep`, or `off` |
+| `OPENMESSAGES_BACKFILL_DISCOVER_ORPHANS` | `0` | Opt in to deep backfill's Phase C (contact-based orphan discovery). **Off by default** because it creates an empty SMS thread on your phone for each contact without prior message history. Enable with `1`/`true`/`yes`/`on` only if you understand the side effect. |
 | `OPENMESSAGES_MACOS_NOTIFICATIONS` | interactive macOS `serve` sessions only | Enable/disable native macOS notifications for fresh inbound live messages (`1`/`0`). Click-through opens the matching thread when `terminal-notifier` is available. |
 | `OPENMESSAGE_TELEMETRY` | unset (off) | Set to `1` to send one anonymous heartbeat per launch (max one per 24h). Reports only: random install ID, version, OS/arch, and which platforms are paired (Google Messages / WhatsApp / Signal). No message content, no contact info, no IP-based identity. See `internal/telemetry/`. |
 

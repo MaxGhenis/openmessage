@@ -1,4 +1,6 @@
 /openmessages
+/om-bin
+.claude/launch.json
 *.db
 session.json
 .vercel/

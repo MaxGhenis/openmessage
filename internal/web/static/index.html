@@ -2537,6 +2537,206 @@ body::after {
   color: var(--text-muted);
 }
 
+/* ─── Tab bar (Recent / Archive / custom / +) ─── */
+.sidebar-tabs-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 20px 12px;
+}
+
+.sidebar-tabs {
+  display: flex;
+  gap: 6px;
+  flex: 1 1 auto;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.sidebar-tabs::-webkit-scrollbar { display: none; }
+
+.sidebar-tab {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 12px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--bg-elevated);
+  color: var(--text-secondary);
+  font-family: var(--font-sans);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.16s ease, border-color 0.16s ease, color 0.16s ease;
+}
+
+.sidebar-tab:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.sidebar-tab.active {
+  background: var(--accent-dim);
+  border-color: var(--border-accent);
+  color: var(--text-primary);
+}
+
+.sidebar-tab-count {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.sidebar-tab-add {
+  flex: 0 0 auto;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px dashed var(--border);
+  border-radius: 50%;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+  transition: background 0.16s ease, color 0.16s ease, border-color 0.16s ease;
+}
+
+.sidebar-tab-add:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+  border-color: var(--border-accent);
+}
+
+.sidebar-tab-input {
+  flex: 0 0 auto;
+  width: 120px;
+  padding: 7px 12px;
+  border: 1px solid var(--border-accent);
+  border-radius: 999px;
+  background: var(--bg-elevated);
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  font-size: 12px;
+  font-weight: 600;
+  outline: none;
+}
+
+.select-toggle-btn {
+  flex: 0 0 auto;
+  padding: 7px 12px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--bg-elevated);
+  color: var(--text-secondary);
+  font-family: var(--font-sans);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.16s ease, color 0.16s ease, border-color 0.16s ease;
+}
+
+.select-toggle-btn:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.select-toggle-btn.active {
+  background: var(--accent-dim);
+  border-color: var(--border-accent);
+  color: var(--text-primary);
+}
+
+/* ─── Bulk action bar ─── */
+.bulk-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 0 20px 12px;
+  padding: 10px 14px;
+  border: 1px solid var(--border-accent);
+  border-radius: 14px;
+  background: var(--accent-dim);
+}
+
+.bulk-bar[hidden] { display: none; }
+
+.bulk-count {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.bulk-bar-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.bulk-btn {
+  padding: 7px 12px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--bg-elevated);
+  color: var(--text-secondary);
+  font-family: var(--font-sans);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.16s ease, color 0.16s ease, border-color 0.16s ease;
+}
+
+.bulk-btn:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.bulk-btn.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+.bulk-btn.primary:hover {
+  background: var(--accent-strong);
+  border-color: var(--accent-strong);
+  color: #fff;
+}
+
+/* ─── Multi-select checkboxes on rows ─── */
+.convo-select-box {
+  flex: 0 0 auto;
+  width: 20px;
+  height: 20px;
+  margin-right: 10px;
+  border: 1.5px solid var(--text-muted);
+  border-radius: 6px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: transparent;
+  font-size: 12px;
+  font-weight: 700;
+  transition: background 0.14s ease, border-color 0.14s ease, color 0.14s ease;
+}
+
+.convo-item.selecting { cursor: pointer; }
+
+.convo-item.selected .convo-select-box {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+.convo-item.selected {
+  background: var(--accent-dim);
+}
+
 .sidebar-source-filters {
   display: flex;
   gap: 8px;
@@ -3135,7 +3335,9 @@ body::after {
 
 .context-menu-section-label {
   padding: 4px 8px 8px;
-  color: var(--text-muted);
+  /* Menu background is always dark, so pin label text to a dim smokey white
+     instead of theme vars that flip to near-black in light mode. */
+  color: rgba(230, 233, 240, 0.55);
   font-family: var(--font-mono);
   font-size: 10px;
   letter-spacing: 0.12em;
@@ -3152,30 +3354,31 @@ body::after {
   border: 0;
   border-radius: 10px;
   background: transparent;
-  color: var(--text-primary);
+  /* Smokey white — readable on the menu's always-dark background. */
+  color: #e6e9f0;
   font: inherit;
   text-align: left;
   cursor: pointer;
 }
 
 .context-menu-item:hover:not(:disabled) {
-  background: var(--bg-hover);
+  background: rgba(255, 255, 255, 0.07);
 }
 
 .context-menu-item:disabled {
-  color: var(--text-muted);
+  color: rgba(230, 233, 240, 0.38);
   cursor: default;
 }
 
 .context-menu-item-meta {
-  color: var(--text-muted);
+  color: rgba(230, 233, 240, 0.55);
   font-size: 12px;
 }
 
 .context-menu-divider {
   height: 1px;
   margin: 8px 4px;
-  background: var(--border);
+  background: rgba(255, 255, 255, 0.1);
 }
 
 .platform-chip {
@@ -3523,17 +3726,31 @@ body::after {
   color: var(--text-muted);
 }
 
+.thread-placeholder {
+  align-self: center;
+  margin: auto;
+  padding: 18px 20px;
+  color: var(--text-muted);
+  font-size: 13px;
+  text-align: center;
+}
+
+.thread-placeholder.is-error {
+  color: var(--text-secondary);
+}
+
 .connection-banner {
   margin: 16px 24px 0;
-  padding: 10px 12px;
+  padding: 12px 14px;
   border-radius: 12px;
   background: rgba(220, 80, 60, 0.08);
   border: 1px solid rgba(220, 80, 60, 0.16);
   box-shadow: none;
-  font-family: var(--font-mono);
-  font-size: 10px;
-  letter-spacing: 0.12em;
-  text-transform: uppercase;
+  font-family: var(--font-sans);
+  font-size: 13px;
+  line-height: 1.4;
+  letter-spacing: 0;
+  text-transform: none;
   color: #d44432;
   display: none;
   align-items: center;
@@ -3543,6 +3760,7 @@ body::after {
 
 .connection-banner-copy {
   flex: 1;
+  text-align: left;
 }
 
 .connection-banner-action {
@@ -3552,9 +3770,10 @@ body::after {
   border: 1px solid rgba(220, 80, 60, 0.2);
   background: rgba(220, 80, 60, 0.08);
   color: inherit;
-  font: inherit;
-  letter-spacing: 0.12em;
-  text-transform: uppercase;
+  font: 700 12px/1 var(--font-sans);
+  letter-spacing: 0;
+  text-transform: none;
+  white-space: nowrap;
   cursor: pointer;
 }
 
@@ -4068,7 +4287,17 @@ body::after {
       <input type="text" id="search-input" placeholder="Search all messages" autocomplete="off" aria-label="Search all messages">
       <kbd class="search-shortcut" aria-hidden="true">⌘K</kbd>
     </div>
-    <div class="sidebar-section-label">Recent Threads</div>
+    <div class="sidebar-tabs-row">
+      <div class="sidebar-tabs" id="sidebar-tabs"></div>
+      <button class="select-toggle-btn" id="select-toggle-btn" type="button" title="Select threads to organize" aria-label="Select threads to organize">Select</button>
+    </div>
+    <div class="bulk-bar" id="bulk-bar" hidden>
+      <span class="bulk-count" id="bulk-count">0 selected</span>
+      <div class="bulk-bar-actions">
+        <button class="bulk-btn primary" id="bulk-move-btn" type="button">Move to…</button>
+        <button class="bulk-btn" id="bulk-cancel-btn" type="button">Cancel</button>
+      </div>
+    </div>
     <div class="sidebar-source-filters" id="sidebar-source-filters"></div>
     <div class="conversation-list" id="conversation-list"></div>
 
@@ -4275,6 +4504,11 @@ body::after {
   let allConversations = [];
   let activeConversation = null;
   let currentPlatformFilter = 'all';
+  let customTabs = [];          // [{tab_id, name, position, created_at}]
+  let currentTab = '';          // '' = Recent (inbox), 'archive', or a custom tab id
+  const TAB_ARCHIVE = 'archive';
+  let selectionMode = false;
+  const selectedIds = new Set();
   let conversationsRefreshTimer = null;
   let eventSource = null;
   let threadFeedbackTimer = null;
@@ -4290,6 +4524,8 @@ body::after {
   let nativeNotificationState = null;
   let pendingDeepLinkConversationID = conversationIDFromURL();
   let appStatus = { connected: false, google: {}, whatsapp: {}, signal: {}, backfill: {}, identity_name: '' };
+  let browserOnline = browserReportsOnline();
+  let networkIssueDetected = false;
   let googleStatus = {
     connected: false,
     paired: false,
@@ -4347,6 +4583,12 @@ body::after {
   // ─── DOM refs ───
   const $convoList = document.getElementById('conversation-list');
   const $sourceFilters = document.getElementById('sidebar-source-filters');
+  const $sidebarTabs = document.getElementById('sidebar-tabs');
+  const $selectToggleBtn = document.getElementById('select-toggle-btn');
+  const $bulkBar = document.getElementById('bulk-bar');
+  const $bulkCount = document.getElementById('bulk-count');
+  const $bulkMoveBtn = document.getElementById('bulk-move-btn');
+  const $bulkCancelBtn = document.getElementById('bulk-cancel-btn');
   const $emptyState = document.getElementById('empty-state');
   const $chatHeader = document.getElementById('chat-header');
   const $chatHeaderAvatar = document.getElementById('chat-header-avatar');
@@ -4421,6 +4663,7 @@ body::after {
   const $emptyStateCta = document.getElementById('empty-state-cta');
 
   let replyToMsg = null; // {MessageID, SenderName, Body}
+  const composeTextByConversation = new Map();
   let contextMenuState = null;
   const QUICK_EMOJIS = ['😂', '❤️', '👍', '👎', '😮', '😢', '😡', '🙏', '🔥', '🎉', '👀', '💯'];
 
@@ -4640,6 +4883,77 @@ body::after {
       .toLowerCase()
       .replace(/[^a-z0-9]+/g, ' ')
       .trim();
+  }
+
+  // Strip platform suffixes (e.g. "15551234567@s.whatsapp.net" -> "15551234567")
+  // for a last-resort human-ish label when no name can be resolved.
+  function formatReactorFallback(value) {
+    const raw = String(value || '').trim();
+    if (!raw) return '';
+    const head = raw.split('@')[0].trim();
+    return head || raw;
+  }
+
+  // Resolve a single reaction actor identifier to a display name.
+  // Actors are platform-specific: Google Messages participant IDs, WhatsApp JIDs,
+  // Signal accounts/numbers, or the literal "me".
+  function reactionActorName(actorId, convo) {
+    const raw = String(actorId || '').trim();
+    if (!raw) return '';
+    if (raw.toLowerCase() === 'me') return 'You';
+
+    const norm = normalizeParticipantIdentifier(raw);
+    const myWa = normalizeParticipantIdentifier((whatsAppStatus && whatsAppStatus.account_jid) || '');
+    const mySignal = normalizeParticipantIdentifier((signalStatus && signalStatus.account) || '');
+    if (norm && (norm === myWa || norm === mySignal)) return 'You';
+
+    const participants = conversationParticipants(convo);
+    // 1) Google Messages: exact participant-ID match.
+    for (const p of participants) {
+      if (p && p.id && String(p.id).trim() === raw) {
+        if (p.is_me) return 'You';
+        return p.name || formatReactorFallback(p.number) || formatReactorFallback(raw);
+      }
+    }
+    // 2) Match by number/JID digits.
+    if (norm) {
+      for (const p of participants) {
+        const pn = normalizeParticipantIdentifier((p && (p.number || p.id)) || '');
+        if (pn && pn === norm) {
+          if (p.is_me) return 'You';
+          return p.name || formatReactorFallback(p.number) || formatReactorFallback(raw);
+        }
+      }
+    }
+    // 3) 1:1 fallback: the only non-me reactor is the other party.
+    if (convo && !convo.IsGroup) {
+      const others = participants.filter(p => p && !p.is_me);
+      if (others.length === 1 && (others[0].name || others[0].number)) {
+        return others[0].name || formatReactorFallback(others[0].number);
+      }
+      const convoName = String(convo.Name || '').trim();
+      if (convoName) return convoName;
+    }
+    // 4) Last resort.
+    return formatReactorFallback(raw) || 'Someone';
+  }
+
+  // Build the hover tooltip text for a reaction pill: the reactor names, or a
+  // count fallback when reactor identities aren't available (older/historical data).
+  function reactionTooltip(reaction, convo) {
+    const count = Number(reaction && reaction.count) || 0;
+    const actors = Array.isArray(reaction && reaction.actors) ? reaction.actors : [];
+    if (actors.length) {
+      const names = [];
+      const seen = new Set();
+      actors.forEach(a => {
+        const name = reactionActorName(a, convo);
+        const key = name.toLowerCase();
+        if (name && !seen.has(key)) { seen.add(key); names.push(name); }
+      });
+      if (names.length) return names.join(', ');
+    }
+    return `${count} reaction${count !== 1 ? 's' : ''}`;
   }
 
   function normalizeParticipantIdentifier(value) {
@@ -4923,6 +5237,13 @@ body::after {
     if (!convo || convo.IsGroup) return null;
     const participants = conversationParticipants(convo);
     const primary = participants.find(p => !(p && (p.is_me || p.isMe))) || participants[0] || {};
+    const unifiedID = String(convo.UnifiedID || convo.unified_id || '').trim();
+    if (unifiedID) {
+      return {
+        key: `unified::${unifiedID.toLowerCase()}`,
+        displayName: String(convo.UnifiedName || convo.unified_name || primary.name || convo.Name || 'Unknown').trim() || 'Unknown',
+      };
+    }
     const displayName = String(primary.name || convo.Name || '').trim();
     const displayKey = normalizePersonKey(displayName);
     const participantKey = normalizeParticipantIdentifier(primary.number || primary.phone || primary.email || primary.id || '');
@@ -5209,6 +5530,232 @@ body::after {
     return convos.filter(c => sourcePlatformOf(c) === currentPlatformFilter);
   }
 
+  // ─── Tabs (Recent / Archive / custom folders) ───
+  function conversationTabOf(convo) {
+    if (!convo) return '';
+    return String(convo.Tab || convo.tab || '').trim();
+  }
+
+  function filterConversationsByTab(convos) {
+    return convos.filter(c => conversationTabOf(c) === currentTab);
+  }
+
+  function tabById(id) {
+    return customTabs.find(t => t.tab_id === id) || null;
+  }
+
+  function tabDisplayName(tab) {
+    if (tab === '') return 'Recent';
+    if (tab === TAB_ARCHIVE) return 'Archive';
+    const t = tabById(tab);
+    return t ? t.name : 'tab';
+  }
+
+  function renderTabs() {
+    if (!$sidebarTabs) return;
+    const counts = new Map();
+    allConversations.forEach(c => {
+      const t = conversationTabOf(c);
+      counts.set(t, (counts.get(t) || 0) + 1);
+    });
+    const tabs = [
+      { id: '', label: 'Recent' },
+      { id: TAB_ARCHIVE, label: 'Archive' },
+      ...customTabs.map(t => ({ id: t.tab_id, label: t.name, custom: true })),
+    ];
+    $sidebarTabs.innerHTML = tabs.map(tab => {
+      const count = counts.get(tab.id) || 0;
+      const countHTML = count ? `<span class="sidebar-tab-count">${count}</span>` : '';
+      return `<button type="button" class="sidebar-tab${tab.id === currentTab ? ' active' : ''}" data-tab="${escapeHtml(tab.id)}"${tab.custom ? ' data-custom="1"' : ''}>
+        <span>${escapeHtml(tab.label)}</span>${countHTML}
+      </button>`;
+    }).join('') + `<button type="button" class="sidebar-tab-add" id="sidebar-tab-add" title="Create a new tab" aria-label="Create a new tab">+</button>`;
+
+    $sidebarTabs.querySelectorAll('.sidebar-tab').forEach(btn => {
+      btn.addEventListener('click', () => setCurrentTab(btn.dataset.tab || ''));
+      if (btn.dataset.custom === '1') {
+        btn.addEventListener('contextmenu', (event) => {
+          event.preventDefault();
+          openContextMenu(event, [
+            { label: 'Rename tab', action: 'rename-tab' },
+            { label: 'Delete tab', action: 'delete-tab' },
+          ], { type: 'tab', tabId: btn.dataset.tab || '' });
+        });
+      }
+    });
+    const addBtn = document.getElementById('sidebar-tab-add');
+    if (addBtn) addBtn.addEventListener('click', startCreateTab);
+  }
+
+  function setCurrentTab(tab) {
+    if (currentTab === tab) return;
+    currentTab = tab;
+    if (activeConversation && conversationTabOf(activeConversation) !== currentTab) {
+      deselectConversation();
+    }
+    if (selectionMode) exitSelectionMode();
+    const q = $searchInput.value.trim();
+    if (q) { renderSearchResults(q).catch(err => console.error('Search failed:', err)); return; }
+    renderConversations(allConversations);
+  }
+
+  async function loadTabs() {
+    try {
+      const tabs = await fetchJSON('/api/tabs');
+      customTabs = Array.isArray(tabs) ? tabs : [];
+    } catch (err) {
+      console.error('Failed to load tabs:', err);
+      customTabs = [];
+    }
+    if (currentTab && currentTab !== TAB_ARCHIVE && !tabById(currentTab)) {
+      currentTab = '';
+    }
+    renderTabs();
+  }
+
+  function startCreateTab() {
+    const addBtn = document.getElementById('sidebar-tab-add');
+    if (!addBtn) return;
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.className = 'sidebar-tab-input';
+    input.placeholder = 'Tab name';
+    input.maxLength = 40;
+    addBtn.replaceWith(input);
+    input.focus();
+    let done = false;
+    const commit = async () => {
+      if (done) return;
+      done = true;
+      const name = input.value.trim();
+      if (!name) { renderTabs(); return; }
+      try {
+        const tab = await postJSON('/api/tabs', { name });
+        if (tab && tab.tab_id) {
+          customTabs.push(tab);
+          currentTab = tab.tab_id;
+        }
+      } catch (err) {
+        console.error('Failed to create tab:', err);
+        showThreadFeedback(err.message || 'Failed to create tab.');
+      }
+      renderConversations(allConversations);
+    };
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); commit(); }
+      else if (e.key === 'Escape') { done = true; renderTabs(); }
+    });
+    input.addEventListener('blur', commit);
+  }
+
+  async function renameTabFlow(tabId) {
+    const tab = tabById(tabId);
+    if (!tab) return;
+    const name = window.prompt('Rename tab', tab.name);
+    if (name === null) return;
+    const trimmed = name.trim();
+    if (!trimmed) return;
+    try {
+      await postJSON(`/api/tabs/${encodeURIComponent(tabId)}`, { name: trimmed });
+      tab.name = trimmed;
+      renderTabs();
+    } catch (err) {
+      console.error('Failed to rename tab:', err);
+      showThreadFeedback(err.message || 'Failed to rename tab.');
+    }
+  }
+
+  async function deleteTabFlow(tabId) {
+    const tab = tabById(tabId);
+    if (!tab) return;
+    if (!window.confirm(`Delete "${tab.name}"? Its threads return to Recent.`)) return;
+    try {
+      const r = await fetch(API + `/api/tabs/${encodeURIComponent(tabId)}`, { method: 'DELETE' });
+      if (!r.ok) throw new Error(await responseError(r));
+      customTabs = customTabs.filter(t => t.tab_id !== tabId);
+      if (currentTab === tabId) currentTab = '';
+      await loadConversations();
+    } catch (err) {
+      console.error('Failed to delete tab:', err);
+      showThreadFeedback(err.message || 'Failed to delete tab.');
+    }
+  }
+
+  // ─── Moving conversations between tabs ───
+  function tabMoveMenuItems(excludeTab) {
+    const targets = [
+      { id: '', label: 'Move to Recent' },
+      { id: TAB_ARCHIVE, label: 'Archive' },
+      ...customTabs.map(t => ({ id: t.tab_id, label: `Move to: ${t.name}` })),
+    ];
+    return targets
+      .filter(t => t.id !== excludeTab)
+      .map(t => ({ label: t.label, action: `move-tab:${t.id}` }));
+  }
+
+  async function moveConversationToTab(convo, tab) {
+    if (!convo) return;
+    await postJSON(`/api/conversations/${encodeURIComponent(convo.ConversationID)}/tab`, { tab });
+    applyConversationPatch(convo.ConversationID, { Tab: tab, tab });
+    if (activeConversation && activeConversation.ConversationID === convo.ConversationID && tab !== currentTab) {
+      deselectConversation();
+    }
+    renderConversations(allConversations);
+    showThreadFeedback(tab === TAB_ARCHIVE ? 'Moved to Archive.' : `Moved to ${tabDisplayName(tab)}.`);
+  }
+
+  async function moveSelectedToTab(tab) {
+    const ids = Array.from(selectedIds);
+    if (!ids.length) return;
+    try {
+      await postJSON('/api/conversations/move', { ids, tab });
+      ids.forEach(id => applyConversationPatch(id, { Tab: tab, tab }));
+      const n = ids.length;
+      exitSelectionMode();
+      showThreadFeedback(`Moved ${n} thread${n === 1 ? '' : 's'} to ${tabDisplayName(tab)}.`);
+    } catch (err) {
+      console.error('Failed to move conversations:', err);
+      showThreadFeedback(err.message || 'Failed to move threads.');
+    }
+  }
+
+  // ─── Multi-select ───
+  function enterSelectionMode() {
+    selectionMode = true;
+    selectedIds.clear();
+    if ($selectToggleBtn) $selectToggleBtn.classList.add('active');
+    updateBulkBar();
+    renderConversations(allConversations);
+  }
+
+  function exitSelectionMode() {
+    selectionMode = false;
+    selectedIds.clear();
+    if ($selectToggleBtn) $selectToggleBtn.classList.remove('active');
+    updateBulkBar();
+    renderConversations(allConversations);
+  }
+
+  function toggleSelectionMode() {
+    if (selectionMode) exitSelectionMode();
+    else enterSelectionMode();
+  }
+
+  function updateBulkBar() {
+    if (!$bulkBar) return;
+    if (!selectionMode) { $bulkBar.hidden = true; return; }
+    $bulkBar.hidden = false;
+    const n = selectedIds.size;
+    if ($bulkCount) $bulkCount.textContent = `${n} selected`;
+    if ($bulkMoveBtn) $bulkMoveBtn.disabled = n === 0;
+  }
+
+  function openBulkMoveMenu() {
+    if (!$bulkMoveBtn || selectedIds.size === 0) return;
+    const rect = $bulkMoveBtn.getBoundingClientRect();
+    openContextMenuAt(rect.left, rect.bottom + 8, tabMoveMenuItems(currentTab), { type: 'bulk-move' });
+  }
+
   function platformFilterOptions(convos) {
     const counts = new Map();
     convos.forEach(c => {
@@ -5255,7 +5802,7 @@ body::after {
   }
 
   function buildConversationRenderItems(convos, isSearch) {
-    if (isSearch) {
+    if (isSearch || selectionMode) {
       return convos.map(convo => ({ type: 'conversation', convo }));
     }
     const items = [];
@@ -5302,6 +5849,10 @@ body::after {
       + (c.ConversationID === activeConvoId ? ' active' : '')
       + (hasUnread ? ' unread' : '');
     el.dataset.id = c.ConversationID;
+    if (selectionMode) {
+      el.classList.add('selecting');
+      if (selectedIds.has(c.ConversationID)) el.classList.add('selected');
+    }
     if (clustered) {
       el.innerHTML = `
         <div class="convo-route-badge">${platformBadgeHTML(platform)}</div>
@@ -5332,6 +5883,23 @@ body::after {
         <div class="convo-time">${formatTime(c.LastMessageTS)}</div>
         ${hasUnread ? '<div class="convo-unread">' + c.UnreadCount + '</div>' : ''}
       `;
+    }
+    if (selectionMode) {
+      const box = document.createElement('div');
+      box.className = 'convo-select-box';
+      box.textContent = '✓';
+      el.insertBefore(box, el.firstChild);
+      el.addEventListener('click', () => {
+        const id = c.ConversationID;
+        if (selectedIds.has(id)) selectedIds.delete(id);
+        else selectedIds.add(id);
+        el.classList.toggle('selected', selectedIds.has(id));
+        updateBulkBar();
+      });
+      el.addEventListener('contextmenu', (event) => {
+        openContextMenu(event, conversationContextMenuItems(c), { type: 'conversation', conversation: c });
+      });
+      return el;
     }
     el.addEventListener('click', () => selectConversation(c));
     el.addEventListener('contextmenu', (event) => {
@@ -6016,6 +6584,10 @@ body::after {
     }
     items.push(
       { type: 'divider' },
+      ...tabMoveMenuItems(conversationTabOf(convo)),
+    );
+    items.push(
+      { type: 'divider' },
       ...conversationNotificationMenuItems(convo),
     );
     const identity = conversationPersonIdentity(convo);
@@ -6101,10 +6673,80 @@ body::after {
   }
 
   // ─── API calls ───
+  function browserReportsOnline() {
+    return typeof navigator === 'undefined' || navigator.onLine !== false;
+  }
+
+  function browserIsOffline() {
+    return browserOnline === false || networkIssueDetected;
+  }
+
+  function markConnectivityIssue() {
+    networkIssueDetected = true;
+    setConnectionState();
+    autoResize();
+  }
+
+  function offlineFeedbackMessage(context = 'request') {
+    switch (context) {
+      case 'send':
+        return 'No internet connection. Message not sent. Check your connection and try again.';
+      case 'start-conversation':
+        return 'No internet connection. New conversation not started. Check your connection and try again.';
+      case 'reconnect':
+        return "No internet connection. Google Messages will reconnect once you're back online.";
+      case 'google':
+        return 'Google Messages is offline. Check your internet connection, then try again.';
+      default:
+        return 'No internet connection. Local message history is still available.';
+    }
+  }
+
+  function isConnectivityErrorMessage(value) {
+    const message = String(value || '').toLowerCase();
+    return [
+      'google messages is offline',
+      'instantmessaging-pa.clients6.google.com',
+      'google.internal.communications.instantmessaging',
+      'no such host',
+      'temporary failure in name resolution',
+      'server misbehaving',
+      'dial tcp',
+      'lookup ',
+      'network is unreachable',
+      'no route to host',
+      'i/o timeout',
+      'context deadline exceeded',
+      'client.timeout exceeded',
+      'tls handshake timeout',
+      'connection refused',
+      'connection reset by peer',
+      'no internet connection',
+      'internet connection appears to be offline',
+      'not connected to the internet',
+    ].some(needle => message.includes(needle));
+  }
+
+  function userFacingErrorMessage(error, context = 'request') {
+    const message = error instanceof Error
+      ? error.message
+      : String(error || '');
+    if (!message) return '';
+    if (isConnectivityErrorMessage(message)) {
+      markConnectivityIssue();
+      return offlineFeedbackMessage(context);
+    }
+    return message;
+  }
+
   async function fetchJSON(url) {
-    const r = await fetch(API + url);
-    if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
-    return r.json();
+    try {
+      const r = await fetch(API + url);
+      if (!r.ok) throw new Error(await responseError(r));
+      return r.json();
+    } catch (err) {
+      throw err instanceof Error ? err : new Error(String(err || 'Request failed'));
+    }
   }
 
   async function responseError(r) {
@@ -6121,14 +6763,18 @@ body::after {
   }
 
   async function postJSON(url, body) {
-    const r = await fetch(API + url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    });
-    if (!r.ok) throw new Error(await responseError(r));
-    const text = await r.text();
-    return text ? JSON.parse(text) : null;
+    try {
+      const r = await fetch(API + url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      if (!r.ok) throw new Error(await responseError(r));
+      const text = await r.text();
+      return text ? JSON.parse(text) : null;
+    } catch (err) {
+      throw err instanceof Error ? err : new Error(String(err || 'Request failed'));
+    }
   }
 
   function clearThreadFeedback() {
@@ -6140,7 +6786,8 @@ body::after {
     $threadFeedback.classList.remove('active');
   }
 
-  function showThreadFeedback(message) {
+  function showThreadFeedback(message, context = 'request') {
+    message = userFacingErrorMessage(message, context);
     if (!message) return;
     if (threadFeedbackTimer) {
       clearTimeout(threadFeedbackTimer);
@@ -6203,13 +6850,19 @@ body::after {
       allConversations = convos;
     }
     renderEmptyState();
-    renderPlatformFilters(convos);
-    const visibleConvos = filterConversationsByPlatform(convos);
+    renderTabs();
+    const tabConvos = isSearch ? convos : filterConversationsByTab(convos);
+    renderPlatformFilters(tabConvos);
+    const visibleConvos = filterConversationsByPlatform(tabConvos);
     conversations = visibleConvos;
     $convoList.innerHTML = '';
     if (!visibleConvos.length) {
       let emptyMsg = isSearch ? 'No results found' : 'No conversations yet';
-      if (currentPlatformFilter !== 'all') {
+      if (!isSearch && currentTab) {
+        emptyMsg = currentTab === TAB_ARCHIVE
+          ? 'No archived threads'
+          : `No threads in “${tabDisplayName(currentTab)}” yet`;
+      } else if (currentPlatformFilter !== 'all') {
         emptyMsg = isSearch
           ? `No ${platformMeta(currentPlatformFilter).label} results found`
           : `No ${platformMeta(currentPlatformFilter).label} conversations`;
@@ -6400,6 +7053,11 @@ body::after {
 
   // ─── Select Conversation ───
   async function selectConversation(convo) {
+    const previousConvoId = activeConvoId;
+    const isConversationSwitch = previousConvoId !== convo.ConversationID;
+    if (isConversationSwitch) {
+      rememberActiveComposeText(previousConvoId);
+    }
     activeConvoId = convo.ConversationID;
     activeConversation = convo;
     pendingDeepLinkConversationID = '';
@@ -6437,8 +7095,14 @@ body::after {
     $chatHeaderName.textContent = convo.Name || 'Unknown';
     activeConvoIsGroup = !!convo.IsGroup;
     activeProtocolDetail = '';
+    if (isConversationSwitch) {
+      clearTransientComposerState();
+      restoreComposeText(convo.ConversationID);
+    }
     refreshConversationChrome();
     resetLoadedThreadState();
+    $messagesArea.setAttribute('aria-busy', 'true');
+    renderThreadPlaceholder('Loading messages...');
     await loadMessages(convo.ConversationID, {reset: true});
   }
 
@@ -6501,6 +7165,15 @@ body::after {
     lastRenderedWindowEnd = 0;
     activeProtocolDetail = '';
     clearThreadFeedback();
+  }
+
+  function renderThreadPlaceholder(message, modifier = '') {
+    if (!$messagesArea) return;
+    $messagesArea.innerHTML = '';
+    const el = document.createElement('div');
+    el.className = 'thread-placeholder' + (modifier ? ` ${modifier}` : '');
+    el.textContent = message;
+    $messagesArea.appendChild(el);
   }
 
   function threadDistanceFromBottom() {
@@ -6917,7 +7590,8 @@ body::after {
           m.Body === '[Photo]' ||
           m.Body === '[Video]' ||
           m.Body === '[Audio]' ||
-          m.Body === '[Voice note]'
+          m.Body === '[Voice note]' ||
+          m.Body === '[Sticker]'
         );
         if (m.Body && !shouldHideGenericMediaBody) {
           html += `<div class="msg-body">${linkifyMessageBody(m.Body)}</div>`;
@@ -6947,8 +7621,8 @@ body::after {
               reactions.forEach(r => {
                 const count = Number(r.count) || 0;
                 const emoji = escapeHtml(r.emoji || '');
-                const countLabel = escapeHtml(`${count} reaction${count > 1 ? 's' : ''}`);
-                html += `<span class="reaction-pill" title="${countLabel}">${emoji}<span class="reaction-count">${count > 1 ? count : ''}</span></span>`;
+                const tip = escapeHtml(reactionTooltip(r, activeConversation));
+                html += `<span class="reaction-pill" title="${tip}">${emoji}<span class="reaction-count">${count > 1 ? count : ''}</span></span>`;
               });
               html += '</div>';
             }
@@ -7103,7 +7777,7 @@ body::after {
     if (older) loadingOlderMessages = true;
 
     try {
-    if (reset) {
+      if (reset) {
         const msgs = await fetchJSON(`/api/conversations/${encodeURIComponent(convoId)}/messages?limit=${MESSAGE_PAGE_SIZE}`);
         msgs.reverse();
         if (threadToken !== activeThreadToken || activeConvoId !== convoId) return;
@@ -7157,8 +7831,14 @@ body::after {
       });
     } catch (err) {
       console.error('Failed to load messages:', err);
+      if (reset && threadToken === activeThreadToken && activeConvoId === convoId) {
+        renderThreadPlaceholder("Couldn't load messages.", 'is-error');
+      }
     } finally {
       if (older) loadingOlderMessages = false;
+      if (!older && threadToken === activeThreadToken && activeConvoId === convoId) {
+        $messagesArea.removeAttribute('aria-busy');
+      }
     }
   }
 
@@ -7210,6 +7890,10 @@ body::after {
 
   // ─── Draft Actions ───
   window.sendDraft = async function(draftId, btn) {
+    if (browserIsOffline()) {
+      showThreadFeedback(offlineFeedbackMessage('send'), 'send');
+      return;
+    }
     if (!conversationSupportsOutbound(activeConversation)) {
       showThreadFeedback(routeUnavailableMessage('send drafts', activeConversation));
       return;
@@ -7226,7 +7910,7 @@ body::after {
       await loadMessages(activeConvoId, {poll: true});
     } catch (e) {
       btn.disabled = false;
-      showThreadFeedback(e.message || 'Failed to send draft');
+      showThreadFeedback(e.message || 'Failed to send draft', 'send');
       console.error('Failed to send draft:', e);
     }
   }
@@ -7249,11 +7933,17 @@ body::after {
     if (!activeConversation) {
       return;
     }
-    const canSendText = conversationSupportsOutbound(activeConversation);
-    const canSendMedia = conversationSupportsMediaOutbound(activeConversation);
-    const activePlatform = sourcePlatformOf(activeConversation);
+    if (browserIsOffline()) {
+      showThreadFeedback(offlineFeedbackMessage('send'), 'send');
+      return;
+    }
+    const sendConvoId = activeConvoId;
+    const sendConversation = activeConversation;
+    const canSendText = conversationSupportsOutbound(sendConversation);
+    const canSendMedia = conversationSupportsMediaOutbound(sendConversation);
+    const activePlatform = sourcePlatformOf(sendConversation);
     if ($composeInput.value.trim() && !canSendText) {
-      showThreadFeedback(routeUnavailableMessage('reply', activeConversation));
+      showThreadFeedback(routeUnavailableMessage('reply', sendConversation));
       return;
     }
     if (pendingFile && !canSendMedia) {
@@ -7268,10 +7958,11 @@ body::after {
       && !(pendingFile.file?.type || '').startsWith('audio/');
     const sendsCaptionedMedia = sendsCaptionedWhatsAppMedia
       || (hasMedia && activePlatform === 'signal');
-    if ((!text && !hasMedia) || !activeConvoId) return;
+    if ((!text && !hasMedia) || !sendConvoId) return;
 
     clearThreadFeedback();
     $composeInput.value = '';
+    composeTextByConversation.delete(sendConvoId);
     $sendBtn.disabled = true;
     autoResize();
 
@@ -7291,7 +7982,7 @@ body::after {
       if (hasMedia) {
         // Send media via multipart form
         const form = new FormData();
-        form.append('conversation_id', activeConvoId);
+        form.append('conversation_id', sendConvoId);
         form.append('file', pendingFile.file);
         if ((activePlatform === 'whatsapp' || activePlatform === 'signal') && replyToMsg) {
           form.append('reply_to_id', replyToMsg.MessageID);
@@ -7300,12 +7991,12 @@ body::after {
           form.append('caption', text);
         }
         const resp = await fetch('/api/send-media', { method: 'POST', body: form });
-        if (!resp.ok) throw new Error(await resp.text());
+        if (!resp.ok) throw new Error(await responseError(resp));
         clearAttachment();
       }
       if (text && !sendsCaptionedMedia) {
         const payload = {
-          conversation_id: activeConvoId,
+          conversation_id: sendConvoId,
           message: text,
         };
         if (replyToMsg) {
@@ -7315,14 +8006,19 @@ body::after {
       }
       clearReply();
       // Refresh to get the real message from server
-      await loadMessages(activeConvoId, {poll: true, forceBottom: true});
+      if (activeConvoId === sendConvoId) {
+        await loadMessages(sendConvoId, {poll: true, forceBottom: true});
+      }
       await loadConversations();
     } catch (err) {
       if (optimisticEl) optimisticEl.remove();
       if (text) {
-        $composeInput.value = originalText;
+        if (activeConvoId === sendConvoId) {
+          $composeInput.value = originalText;
+        }
+        rememberComposeText(sendConvoId, originalText);
       }
-      showThreadFeedback(err.message || 'Failed to send message');
+      showThreadFeedback(err.message || 'Failed to send message', 'send');
       console.error('Failed to send:', err);
     } finally {
       autoResize();
@@ -7330,6 +8026,25 @@ body::after {
   }
 
   // ─── Compose Input ───
+  function rememberComposeText(convoId, value) {
+    if (!convoId) return;
+    const text = String(value || '');
+    if (text) {
+      composeTextByConversation.set(convoId, text);
+    } else {
+      composeTextByConversation.delete(convoId);
+    }
+  }
+
+  function rememberActiveComposeText(convoId = activeConvoId) {
+    rememberComposeText(convoId, $composeInput.value);
+  }
+
+  function restoreComposeText(convoId) {
+    $composeInput.value = composeTextByConversation.get(convoId) || '';
+    autoResize();
+  }
+
   function autoResize() {
     $composeInput.style.height = 'auto';
     $composeInput.style.height = Math.min($composeInput.scrollHeight, 160) + 'px';
@@ -7337,11 +8052,15 @@ body::after {
     const hasMedia = !!pendingFile;
     $sendBtn.disabled = !activeConversation
       || (!hasText && !hasMedia)
+      || browserIsOffline()
       || (hasText && !conversationSupportsOutbound(activeConversation))
       || (hasMedia && !conversationSupportsMediaOutbound(activeConversation));
   }
 
-  $composeInput.addEventListener('input', autoResize);
+  $composeInput.addEventListener('input', () => {
+    rememberActiveComposeText();
+    autoResize();
+  });
   $composeInput.addEventListener('keydown', e => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
@@ -7419,8 +8138,11 @@ body::after {
       Name: result.Name || 'Unknown',
       LastMessageTS: result.LastMessageTS,
       IsGroup: !!result.IsGroup,
+      Participants: result.Participants || result.participants || '',
       UnreadCount: result.UnreadCount || 0,
       source_platform: result.SourcePlatform || result.source_platform,
+      UnifiedID: result.UnifiedID || result.unified_id || '',
+      UnifiedName: result.UnifiedName || result.unified_name || '',
       _searchPreview: result.preview || '',
     }));
     renderConversations(searchConvos, true);
@@ -7455,20 +8177,16 @@ body::after {
 
   function setConnectionState() {
     if (!$connectionBanner) return;
-    const hasSecondaryPlatformPairing = whatsAppStatus.paired
-      || whatsAppStatus.connected
-      || signalStatus.paired
-      || signalStatus.connected;
+    if (browserIsOffline()) {
+      $connectionBanner.className = 'connection-banner disconnected offline';
+      $connectionBanner.style.display = 'flex';
+      $connectionBannerCopy.textContent = 'No internet connection. Local history is available, but new messages will wait until you are back online.';
+      $connectionBannerAction.textContent = 'Retry';
+      $connectionBannerAction.dataset.action = 'retry-connection';
+      $connectionBannerAction.style.display = '';
+      return;
+    }
     if (googleStatus.connected) {
-      if (!hasSecondaryPlatformPairing) {
-        $connectionBanner.className = 'connection-banner';
-        $connectionBanner.style.display = 'flex';
-        $connectionBannerCopy.textContent = 'Add WhatsApp or Signal to connect more conversations';
-        $connectionBannerAction.textContent = 'Platforms';
-        $connectionBannerAction.dataset.action = 'open-platforms';
-        $connectionBannerAction.style.display = '';
-        return;
-      }
       $connectionBanner.style.display = 'none';
       return;
     }
@@ -7568,8 +8286,9 @@ body::after {
     }
   }
 
-  function showGoogleError(message) {
+  function showGoogleError(message, context = 'google') {
     if (!$gmError) return;
+    message = userFacingErrorMessage(message, context);
     $gmError.textContent = message || '';
     $gmError.style.display = message ? 'block' : 'none';
   }
@@ -7621,6 +8340,7 @@ body::after {
 
   function showWhatsAppError(message) {
     if (!$waError) return;
+    message = userFacingErrorMessage(message);
     $waError.textContent = message || '';
     $waError.style.display = message ? 'block' : 'none';
   }
@@ -7631,6 +8351,7 @@ body::after {
 
   function showSignalError(message) {
     if (!$signalError) return;
+    message = userFacingErrorMessage(message);
     $signalError.textContent = message || '';
     $signalError.style.display = message ? 'block' : 'none';
   }
@@ -7684,9 +8405,16 @@ body::after {
       $gmStatusPill.classList.add('error');
     }
     if (googleStatus.connected) {
-      $gmHelper.textContent = 'Google Messages live sync is active. New SMS and RCS messages should appear immediately.';
+      $gmHelper.textContent = 'Google Messages live sync is active. New SMS and RCS messages should appear immediately. If new messages stop arriving, pair again to refresh the connection.';
       showGoogleError('');
-      $gmActionsRow.style.display = 'none';
+      // Keep a re-pair affordance available even while "connected": the
+      // connection flag can stay true after the session has silently gone
+      // stale, and hiding all actions would strand that state with no way to
+      // recover. "Pair again" opens the native Google sign-in.
+      $gmActionsRow.style.display = '';
+      $gmReconnectBtn.disabled = false;
+      $gmReconnectBtn.textContent = 'Pair again';
+      $gmReconnectBtn.dataset.mode = 'pair';
     } else if (googleStatus.paired && !googleStatus.needs_pairing) {
       $gmHelper.textContent = 'This Google Messages account is paired locally, but live SMS and RCS sync is currently paused. Reconnect to resume updates.';
       showGoogleError(googleStatus.last_error);
@@ -7960,6 +8688,10 @@ body::after {
 
   async function reconnectGoogleMessages() {
     showGoogleError('');
+    if (browserIsOffline()) {
+      showGoogleError(offlineFeedbackMessage('reconnect'), 'reconnect');
+      return;
+    }
     $gmReconnectBtn.disabled = true;
     $gmReconnectBtn.textContent = 'Reconnecting...';
     try {
@@ -7967,7 +8699,7 @@ body::after {
       applyAppStatus(status || {});
       showThreadFeedback('Google Messages reconnected.');
     } catch (err) {
-      showGoogleError(err.message || 'Failed to reconnect Google Messages');
+      showGoogleError(err.message || 'Failed to reconnect Google Messages', 'reconnect');
     } finally {
       if ($waOverlay.classList.contains('show')) {
         renderWhatsAppOverlay();
@@ -7977,6 +8709,10 @@ body::after {
 
   async function startGoogleHistorySync() {
     showGoogleError('');
+    if (browserIsOffline()) {
+      showGoogleError(offlineFeedbackMessage('google'), 'google');
+      return;
+    }
     if ($gmHistoryBtn) {
       $gmHistoryBtn.disabled = true;
       $gmHistoryBtn.textContent = 'Syncing history…';
@@ -8061,8 +8797,10 @@ body::after {
   async function checkStatus() {
     try {
       const status = await fetchJSON('/api/status');
+      browserOnline = browserReportsOnline();
       applyAppStatus(status);
     } catch {
+      browserOnline = browserReportsOnline();
       applyAppStatus({ connected: false });
     }
   }
@@ -8232,7 +8970,7 @@ body::after {
       // Reload to see updated reactions
       if (activeConvoId) await loadMessages(activeConvoId, {poll: true});
     } catch (err) {
-      showThreadFeedback(err.message || 'Failed to send reaction');
+      showThreadFeedback(err.message || 'Failed to send reaction', 'send');
       console.error('Failed to send reaction:', err);
     }
   };
@@ -8301,7 +9039,7 @@ body::after {
       document.querySelectorAll('.emoji-picker.show').forEach(p => p.classList.remove('show'));
       document.querySelectorAll('.emoji-full-panel.show').forEach(p => p.classList.remove('show'));
     }
-    if ($contextMenu && !$contextMenu.hidden && !e.target.closest('.context-menu') && !e.target.closest('.chat-header-action-btn')) {
+    if ($contextMenu && !$contextMenu.hidden && !e.target.closest('.context-menu') && !e.target.closest('.chat-header-action-btn') && !e.target.closest('#bulk-move-btn')) {
       closeContextMenu();
     }
   });
@@ -8337,6 +9075,18 @@ body::after {
             showThreadFeedback(`Notifications set to ${notificationModeLabel(mode).toLowerCase()}.`);
             return;
           }
+          if (action.startsWith('move-tab:')) {
+            await moveConversationToTab(context.conversation, action.slice('move-tab:'.length));
+            return;
+          }
+        }
+        if (context.type === 'bulk-move' && action.startsWith('move-tab:')) {
+          await moveSelectedToTab(action.slice('move-tab:'.length));
+          return;
+        }
+        if (context.type === 'tab' && context.tabId) {
+          if (action === 'rename-tab') { await renameTabFlow(context.tabId); return; }
+          if (action === 'delete-tab') { await deleteTabFlow(context.tabId); return; }
         }
         if (context.type === 'message' && context.message) {
           const message = context.message;
@@ -8403,6 +9153,13 @@ body::after {
     $replyIndicator.classList.remove('show');
   }
 
+  function clearTransientComposerState() {
+    clearReply();
+    if (pendingFile) {
+      clearAttachment();
+    }
+  }
+
   $replyClose.addEventListener('click', clearReply);
 
   window.scrollToMessage = function(msgId) {
@@ -8459,6 +9216,8 @@ body::after {
 
   // Helper: deselect current conversation and return to empty state
   function deselectConversation() {
+    const previousConvoId = activeConvoId;
+    rememberActiveComposeText(previousConvoId);
     activeConvoId = null;
     activeConvoIsGroup = false;
     activeConversation = null;
@@ -8483,7 +9242,9 @@ body::after {
     clearThreadFeedback();
     refreshConversationChrome();
     renderEmptyState();
-    clearReply();
+    clearTransientComposerState();
+    $composeInput.value = '';
+    autoResize();
   }
 
   function setPlatformFilter(platform) {
@@ -8721,6 +9482,9 @@ body::after {
 
   async function handleLaunchAction(action) {
     switch (action) {
+      case 'retry-connection':
+        await retryConnection();
+        return;
       case 'open-connections':
       case 'open-platforms':
         await openWhatsAppOverlay();
@@ -8731,6 +9495,21 @@ body::after {
       default:
         openNewMsg();
     }
+  }
+
+  async function retryConnection() {
+    networkIssueDetected = false;
+    browserOnline = browserReportsOnline();
+    setConnectionState();
+    await checkStatus();
+    await loadConversations();
+    if (activeConvoId) {
+      await loadMessages(activeConvoId, {poll: true});
+    }
+    autoResize();
+    showThreadFeedback(browserIsOffline()
+      ? offlineFeedbackMessage()
+      : 'Connection check complete.');
   }
 
   async function startNewConversation() {
@@ -8758,6 +9537,11 @@ body::after {
       await revealAndSelectConversation(existingReplyRoute);
       return;
     }
+    if (browserIsOffline()) {
+      $newMsgError.textContent = offlineFeedbackMessage('start-conversation');
+      $newMsgError.style.display = 'block';
+      return;
+    }
 
     $newMsgGo.disabled = true;
     $newMsgGo.innerHTML = '<span class="spinner" aria-hidden="true"></span>Connecting...';
@@ -8775,8 +9559,7 @@ body::after {
         signal: controller.signal,
       });
       if (!resp.ok) {
-        const errText = await resp.text();
-        throw new Error(errText);
+        throw new Error(await responseError(resp));
       }
       const data = await resp.json();
       closeNewMsg();
@@ -8796,7 +9579,7 @@ body::after {
       const isAbort = err && err.name === 'AbortError';
       $newMsgError.textContent = isAbort
         ? 'Request timed out. Check that Google Messages is paired and try again.'
-        : (err.message || 'Failed to start conversation');
+        : (userFacingErrorMessage(err, 'start-conversation') || 'Failed to start conversation');
       $newMsgError.style.display = 'block';
       $newMsgGo.disabled = false;
       $newMsgGo.textContent = 'Start conversation';
@@ -8865,6 +9648,27 @@ body::after {
     }
   });
 
+  window.addEventListener('offline', () => {
+    browserOnline = false;
+    networkIssueDetected = false;
+    setConnectionState();
+    autoResize();
+    showThreadFeedback(offlineFeedbackMessage());
+  });
+
+  window.addEventListener('online', () => {
+    browserOnline = true;
+    networkIssueDetected = false;
+    setConnectionState();
+    autoResize();
+    checkStatus();
+    loadConversations();
+    if (activeConvoId) {
+      loadMessages(activeConvoId, {poll: true});
+    }
+    showThreadFeedback('Back online. You can send messages again.');
+  });
+
   if (navigator.webdriver) {
     window.__openMessageTestHooks = {
       updateLoadedMessage(messageID, patch = {}) {
@@ -8900,7 +9704,11 @@ body::after {
     .then(() => syncNotificationButton())
     .catch(err => console.error('Failed to initialize native notifications:', err));
   renderEmptyState();
+  if ($selectToggleBtn) $selectToggleBtn.addEventListener('click', toggleSelectionMode);
+  if ($bulkCancelBtn) $bulkCancelBtn.addEventListener('click', exitSelectionMode);
+  if ($bulkMoveBtn) $bulkMoveBtn.addEventListener('click', openBulkMoveMenu);
   startEventStream();
+  loadTabs();
   loadConversations();
   checkStatus();
 

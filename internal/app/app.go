@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -32,9 +33,9 @@ const (
 
 const maxErrorDetails = 100
 
-// BackfillProgress tracks the current state of a deep backfill operation.
-type BackfillProgress struct {
-	mu                 sync.Mutex
+// BackfillSnapshot is a point-in-time copy of backfill progress, safe to
+// pass and marshal by value.
+type BackfillSnapshot struct {
 	Running            bool          `json:"running"`
 	Phase              BackfillPhase `json:"phase"`
 	FoldersScanned     int           `json:"folders_scanned"`
@@ -43,6 +44,12 @@ type BackfillProgress struct {
 	ContactsChecked    int           `json:"contacts_checked"`
 	Errors             int           `json:"errors"`
 	ErrorDetails       []string      `json:"error_details,omitempty"`
+}
+
+// BackfillProgress tracks the current state of a deep backfill operation.
+type BackfillProgress struct {
+	mu sync.Mutex
+	BackfillSnapshot
 }
 
 // reset clears all fields for a fresh backfill run.
@@ -94,10 +101,10 @@ func (p *BackfillProgress) add(conversations, messages, contacts, folders int) {
 	p.FoldersScanned += folders
 }
 
-func (p *BackfillProgress) snapshot() BackfillProgress {
+func (p *BackfillProgress) snapshot() BackfillSnapshot {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	cp := *p
+	cp := p.BackfillSnapshot
 	if len(p.ErrorDetails) > 0 {
 		cp.ErrorDetails = append([]string(nil), p.ErrorDetails...)
 	}
@@ -202,6 +209,11 @@ func New(logger zerolog.Logger) (*App, error) {
 				Int("deleted", report.DeletedWhatsAppReactionPlaceholders).
 				Msg("Removed legacy WhatsApp reaction placeholder rows")
 		}
+		if report.DeletedWhatsAppUnsupportedRows > 0 {
+			logger.Info().
+				Int("deleted", report.DeletedWhatsAppUnsupportedRows).
+				Msg("Removed legacy WhatsApp unsupported placeholder rows")
+		}
 		if report.DeletedSignalReactionPlaceholders > 0 {
 			logger.Info().
 				Int("deleted", report.DeletedSignalReactionPlaceholders).
@@ -222,6 +234,13 @@ func New(logger zerolog.Logger) (*App, error) {
 				Int("fixed", report.FixedGoogleOutgoingAttributionRows).
 				Msg("Repaired legacy Google Messages outgoing attribution rows")
 		}
+	}
+	// Drop conversations that a contentless stub (e.g. a group reaction arriving
+	// as an empty message in a 1:1 thread) wrongly floated to the top of recents.
+	if fixed, err := store.RepairContentlessRecency(); err != nil {
+		logger.Warn().Err(err).Msg("Failed to repair contentless conversation recency")
+	} else if fixed > 0 {
+		logger.Info().Int("fixed", fixed).Msg("Repaired conversations floated up by contentless messages")
 	}
 	if !Sandboxed() {
 		if mediaRepair, err := (&importer.WhatsAppNative{}).RepairLegacyMediaPlaceholders(store); err != nil {
@@ -330,7 +349,15 @@ func (a *App) LoadAndConnect() error {
 		OnRealtimeGapRecovered: func(reason string) {
 			a.StartRecentReconcile(reason)
 		},
-		OnDisconnect: func() {
+		OnConnectionLost: func() {
+			// Transient: keep the session so the reconnect watchdog can
+			// recover without a manual re-pair.
+			a.Connected.Store(false)
+			a.setGoogleLastError("Google Messages connection lost; reconnecting…")
+			a.emitStatusChange(false)
+			a.Logger.Warn().Msg("Google Messages connection lost; will attempt to reconnect")
+		},
+		OnSessionInvalid: func() {
 			a.Connected.Store(false)
 			a.setClient(nil)
 			if err := os.Remove(a.SessionPath); err != nil && !os.IsNotExist(err) {
@@ -341,7 +368,25 @@ func (a *App) LoadAndConnect() error {
 			a.Logger.Warn().Msg("Disconnected from Google Messages")
 		},
 	}
-	cli.GM.SetEventHandler(a.EventHandler.Handle)
+	// Wrap the handler so a panic on a malformed event can't kill libgm's
+	// single long-poll goroutine (it has no recover() of its own). A dead
+	// goroutine would freeze SMS while Connected stayed true — the zombie. On
+	// panic, mark disconnected so the reconnect watchdog re-establishes the
+	// long-poll.
+	cli.GM.SetEventHandler(func(evt any) {
+		defer func() {
+			if r := recover(); r != nil {
+				a.Logger.Error().
+					Interface("panic", r).
+					Bytes("stack", debug.Stack()).
+					Msg("Recovered from panic in Google Messages event handler")
+				a.Connected.Store(false)
+				a.setGoogleLastError("Google Messages sync interrupted; reconnecting…")
+				a.emitStatusChange(false)
+			}
+		}()
+		a.EventHandler.Handle(evt)
+	})
 
 	if err := cli.GM.Connect(); err != nil {
 		a.setGoogleLastError(err.Error())
@@ -537,8 +582,18 @@ func (a *App) IsDeepBackfillRunning() bool {
 }
 
 // GetBackfillProgress returns a snapshot of the current backfill progress.
-func (a *App) GetBackfillProgress() BackfillProgress {
-	return a.BackfillProgress.snapshot()
+func (a *App) GetBackfillProgress() BackfillSnapshot {
+	snap := a.BackfillProgress.snapshot()
+	// A shallow Backfill (startup catch-up) holds the same mutual-exclusion
+	// guard (backfillRunning) without populating the deep-backfill progress
+	// struct. Reflect the guard here so status never reports "idle" while a
+	// sync is actually running — otherwise a concurrent deep-backfill request
+	// is rejected as "already running" while this status shows nothing going
+	// on, which looks like a phantom/zombie state.
+	if a.backfillRunning.Load() {
+		snap.Running = true
+	}
+	return snap
 }
 
 func (a *App) Close() {

@@ -48,23 +48,29 @@ func TestBuiltBinaryAcceptsPairCommand(t *testing.T) {
 		t.Fatalf("failed to start binary: %v", err)
 	}
 
-	// Wait briefly then kill — we just want to confirm it doesn't crash immediately
-	timer := time.AfterFunc(3*time.Second, func() {
-		cmd.Process.Kill()
-	})
-	defer timer.Stop()
+	// We only want to confirm the binary doesn't crash on startup. Surviving
+	// the grace period is a pass in itself: pairing may legitimately produce
+	// no output for a while (it contacts Google before printing the QR), so
+	// a kill-then-inspect approach can't tell a quiet healthy process from a
+	// crashed one.
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
 
-	err := cmd.Wait()
-	output := out.String()
-
-	// The process should either still be running (killed by our timer) or
-	// have produced some output before failing. A zero-length output + immediate
-	// exit means the binary crashed.
-	if err != nil && len(output) == 0 {
-		t.Errorf("binary exited immediately with no output: %v", err)
+	select {
+	case err := <-done:
+		// Exited on its own — fine if it said something first (e.g. a
+		// pairing error without a phone), a crash if it was silent.
+		if err != nil && len(out.String()) == 0 {
+			t.Errorf("binary exited immediately with no output: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		// Still running after the grace period: startup succeeded.
+		_ = cmd.Process.Kill()
+		<-done
 	}
 
-	// Should not contain panic traces
+	// Should not contain panic traces in either outcome.
+	output := out.String()
 	if strings.Contains(output, "panic:") || strings.Contains(output, "runtime error") {
 		t.Errorf("binary panicked:\n%s", output)
 	}

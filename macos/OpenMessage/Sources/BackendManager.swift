@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import Combine
 import Darwin
@@ -18,10 +19,38 @@ final class BackendManager: ObservableObject {
     @Published var state: State = .stopped
     @Published var port: Int = 7007
 
+    /// Non-nil when a paired platform has silently stopped syncing and needs
+    /// the user's attention (e.g. Google Messages session invalidated). The
+    /// backend process itself stays healthy when this happens — WhatsApp and
+    /// Signal keep it alive — so the overall `state` stays `.running` and the
+    /// menu bar would otherwise show a misleading green "Connected". This
+    /// surfaces the per-platform problem so a dead bridge can't silently rot.
+    @Published var platformAlert: String?
+
     private var process: Process?
+    /// PID of a backend we adopted instead of spawning (process == nil). Tracked
+    /// so stop()/quit can still terminate it — otherwise an orphan adopted on a
+    /// later launch would be unkillable by the app.
+    private var reusedBackendPID: pid_t?
     private let logger = Logger(subsystem: "com.openmessage.app", category: "Backend")
     private var healthCheckTask: Task<Void, Never>?
     private var connectionMonitorTask: Task<Void, Never>?
+
+    init() {
+        // Standard Cmd-Q / app-menu "Quit" terminates via NSApplication without
+        // going through the menu-bar button's stop(), which left the spawned
+        // `serve` process reparented to launchd, holding the port and DB. Hook
+        // app termination to shut the backend down cleanly.
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.willTerminateNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.terminateForQuit()
+            }
+        }
+    }
 
     /// Path to the embedded Go binary inside the app bundle.
     var binaryPath: String {
@@ -92,6 +121,8 @@ final class BackendManager: ObservableObject {
     func start() {
         guard state != .starting, state != .running else { return }
 
+        migrateOldDataIfNeeded()
+
         state = .starting
         healthCheckTask?.cancel()
         healthCheckTask = nil
@@ -154,6 +185,7 @@ final class BackendManager: ObservableObject {
         do {
             try proc.run()
             process = proc
+            reusedBackendPID = nil
             startHealthCheck()
         } catch {
             state = .error("Failed to launch backend: \(error.localizedDescription)")
@@ -169,6 +201,7 @@ final class BackendManager: ObservableObject {
             guard let command = commandLine(for: pid), isReusableBackendCommand(command) else { continue }
             logger.info("Reusing existing backend pid \(pid): \(command, privacy: .public)")
             process = nil
+            reusedBackendPID = pid
             startHealthCheck()
             return true
         }
@@ -289,9 +322,36 @@ final class BackendManager: ObservableObject {
         healthCheckTask = nil
         connectionMonitorTask?.cancel()
         connectionMonitorTask = nil
-        process?.terminate()
+        if let process {
+            process.terminate()
+        } else if let pid = reusedBackendPID {
+            // We adopted this backend rather than spawning it, so there's no
+            // Process handle — signal it by PID so it can still be stopped.
+            _ = Darwin.kill(pid, SIGTERM)
+        }
         process = nil
+        reusedBackendPID = nil
         state = .stopped
+    }
+
+    /// Synchronously terminate the backend on app quit, briefly waiting for the
+    /// spawned process to exit so it isn't reparented to launchd (which would
+    /// leave it holding the port and the SQLite/session files).
+    private func terminateForQuit() {
+        healthCheckTask?.cancel()
+        connectionMonitorTask?.cancel()
+        if let process, process.isRunning {
+            process.terminate()
+            let deadline = Date().addingTimeInterval(2)
+            while process.isRunning && Date() < deadline {
+                Thread.sleep(forTimeInterval: 0.05)
+            }
+            if process.isRunning {
+                _ = Darwin.kill(process.processIdentifier, SIGKILL)
+            }
+        } else if let pid = reusedBackendPID {
+            _ = Darwin.kill(pid, SIGTERM)
+        }
     }
 
     /// Poll /api/status until the backend is ready.
@@ -331,9 +391,10 @@ final class BackendManager: ObservableObject {
                 if Task.isCancelled { return }
                 do {
                     let url = baseURL.appendingPathComponent("api/status")
-                    let (_, response) = try await URLSession.shared.data(from: url)
+                    let (data, response) = try await URLSession.shared.data(from: url)
                     if let http = response as? HTTPURLResponse, http.statusCode == 200 {
                         consecutiveFailures = 0
+                        self.updatePlatformAlert(from: data)
                     } else {
                         consecutiveFailures += 1
                         self.logger.warning("Backend monitor HTTP failure (\(consecutiveFailures)/3)")
@@ -342,13 +403,79 @@ final class BackendManager: ObservableObject {
                     self.logger.debug("Connection monitor error: \(error)")
                     consecutiveFailures += 1
                 }
-                if consecutiveFailures >= 3 {
-                    self.logger.error("Lost connection to backend — showing error state")
-                    self.stop()
-                    self.state = .error("Lost connection to backend")
-                    return
+                if consecutiveFailures >= 5 {
+                    // Only treat this as a real outage if the backend process
+                    // actually died. A transient unreachable window (sleep/wake,
+                    // a GC pause, a slow localhost round-trip) must not tear
+                    // down a healthy backend and drop the user's session — the
+                    // previous behavior killed the process on ~9s of trouble.
+                    if self.backendProcessIsDead() {
+                        self.logger.error("Backend process is gone — showing error state")
+                        self.state = .error("Lost connection to backend")
+                        return
+                    }
+                    self.logger.warning("Backend unreachable but process is alive; continuing to monitor")
+                    consecutiveFailures = 0
                 }
             }
+        }
+    }
+
+    /// Whether the backend is genuinely down (vs. briefly unreachable).
+    private func backendProcessIsDead() -> Bool {
+        if let process {
+            return !process.isRunning
+        }
+        // Adopted backend (no Process handle): dead if nothing is listening.
+        return listeningPIDs(on: port).isEmpty
+    }
+
+    /// Inspect the /api/status body for a paired platform that has silently
+    /// stopped syncing, and surface it via `platformAlert`. Only flags a
+    /// platform that *was* paired (so we don't nag about platforms the user
+    /// never set up).
+    private func updatePlatformAlert(from data: Data) {
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
+
+        let freshness = json["freshness"] as? [String: Any]
+
+        func needsAttention(_ key: String) -> Bool {
+            guard let p = json[key] as? [String: Any] else { return false }
+            let paired = (p["paired"] as? Bool) ?? false
+            let connected = (p["connected"] as? Bool) ?? false
+            let needsPairing = (p["needs_pairing"] as? Bool) ?? false
+            let needsReauth = (p["needs_reauth"] as? Bool) ?? false
+            // A paired platform that is not connected (or explicitly flags a
+            // re-pair/reauth need) has silently stopped syncing.
+            if needsPairing || needsReauth || (paired && !connected) {
+                return true
+            }
+            // Zombie guard: `connected` can stay true while a bridge has
+            // silently stopped delivering. The connection flag lies; the data
+            // doesn't. Trust freshness — a paired platform whose latest message
+            // trails the newest overall by the stale threshold needs attention
+            // even while it reports connected.
+            if paired,
+               let fresh = freshness?[key] as? [String: Any],
+               (fresh["stale"] as? Bool) ?? false {
+                return true
+            }
+            return false
+        }
+
+        var stale: [String] = []
+        if needsAttention("google") { stale.append("Google Messages") }
+        if needsAttention("whatsapp") { stale.append("WhatsApp") }
+        if needsAttention("signal") { stale.append("Signal") }
+
+        let alert: String?
+        switch stale.count {
+        case 0: alert = nil
+        case 1: alert = "\(stale[0]) needs re-pairing — it has stopped syncing."
+        default: alert = "\(stale.joined(separator: ", ")) need re-pairing — they have stopped syncing."
+        }
+        if alert != platformAlert {
+            platformAlert = alert
         }
     }
 
@@ -401,11 +528,21 @@ final class BackendManager: ObservableObject {
                 let pipe = Pipe()
                 proc.standardOutput = pipe
                 proc.standardError = pipe
-                if let stdinText {
-                    let stdinPipe = Pipe()
-                    proc.standardInput = stdinPipe
-                    stdinPipe.fileHandleForWriting.write(Data(stdinText.utf8))
-                    stdinPipe.fileHandleForWriting.closeFile()
+                var stdinPipe: Pipe?
+                if stdinText != nil {
+                    let p = Pipe()
+                    proc.standardInput = p
+                    stdinPipe = p
+                }
+
+                // When the consumer cancels (user navigates away / restarts the
+                // pairing flow), terminate the subprocess so abandoned `pair`
+                // attempts don't linger holding a Google connection.
+                let procBox = ProcBox()
+                continuation.onTermination = { _ in
+                    if let p = procBox.proc, p.isRunning {
+                        p.terminate()
+                    }
                 }
 
                 pipe.fileHandleForReading.readabilityHandler = { handle in
@@ -436,6 +573,8 @@ final class BackendManager: ObservableObject {
                 }
 
                 proc.terminationHandler = { proc in
+                    // Release the pipe reader so it isn't retained after exit.
+                    pipe.fileHandleForReading.readabilityHandler = nil
                     if proc.terminationStatus == 0 {
                         continuation.yield(.success)
                     } else {
@@ -446,6 +585,23 @@ final class BackendManager: ObservableObject {
 
                 do {
                     try proc.run()
+                    procBox.proc = proc
+                    // Write stdin AFTER the process is running: writing a large
+                    // cookie/cURL paste before there's a reader can block on the
+                    // pipe buffer, and the throwing API avoids the uncatchable
+                    // Objective-C exception FileHandle.write raises on a broken
+                    // pipe.
+                    if let stdinText, let stdinPipe {
+                        let handle = stdinPipe.fileHandleForWriting
+                        DispatchQueue.global(qos: .userInitiated).async {
+                            do {
+                                try handle.write(contentsOf: Data(stdinText.utf8))
+                                try handle.close()
+                            } catch {
+                                // Best-effort: the process may have already exited.
+                            }
+                        }
+                    }
                 } catch {
                     continuation.yield(.failed("Could not start pairing: \(error.localizedDescription)"))
                     continuation.finish()
@@ -457,6 +613,12 @@ final class BackendManager: ObservableObject {
     deinit {
         process?.terminate()
     }
+}
+
+/// Sendable holder so the AsyncStream's onTermination closure can reach the
+/// pairing Process without capturing a non-Sendable value across the boundary.
+private final class ProcBox: @unchecked Sendable {
+    var proc: Process?
 }
 
 enum PairingEvent {

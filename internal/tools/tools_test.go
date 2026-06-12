@@ -33,6 +33,15 @@ func testApp(t *testing.T) *app.App {
 	}
 }
 
+func structuredMap(t *testing.T, result *mcp.CallToolResult) map[string]any {
+	t.Helper()
+	payload, ok := result.StructuredContent.(map[string]any)
+	if !ok {
+		t.Fatalf("expected structured content map, got %T", result.StructuredContent)
+	}
+	return payload
+}
+
 func TestRegisterTools(t *testing.T) {
 	a := testApp(t)
 	s := server.NewMCPServer("gmessages-test", "0.1.0")
@@ -148,6 +157,14 @@ func TestSearchMessages(t *testing.T) {
 	if !strings.Contains(text, "Hello world") {
 		t.Errorf("expected 'Hello world', got: %s", text)
 	}
+	payload := structuredMap(t, result)
+	messages, ok := payload["messages"].([]messageSummary)
+	if !ok {
+		t.Fatalf("expected typed messages slice, got %T", payload["messages"])
+	}
+	if len(messages) != 1 || messages[0].Body != "Hello world" {
+		t.Fatalf("unexpected structured messages: %#v", messages)
+	}
 
 	// Empty query
 	req.Params.Arguments = map[string]any{}
@@ -186,6 +203,14 @@ func TestListConversations(t *testing.T) {
 	if !strings.Contains(text, "[group]") {
 		t.Errorf("expected [group], got: %s", text)
 	}
+	payload := structuredMap(t, result)
+	conversations, ok := payload["conversations"].([]conversationSummary)
+	if !ok {
+		t.Fatalf("expected typed conversations slice, got %T", payload["conversations"])
+	}
+	if len(conversations) != 2 {
+		t.Fatalf("expected 2 conversations, got %d", len(conversations))
+	}
 }
 
 func TestGetConversation(t *testing.T) {
@@ -211,6 +236,14 @@ func TestGetConversation(t *testing.T) {
 	text := result.Content[0].(mcp.TextContent).Text
 	if !strings.Contains(text, "Hi there") {
 		t.Errorf("expected 'Hi there', got: %s", text)
+	}
+	payload := structuredMap(t, result)
+	messages, ok := payload["messages"].([]messageSummary)
+	if !ok {
+		t.Fatalf("expected typed messages slice, got %T", payload["messages"])
+	}
+	if len(messages) != 1 || messages[0].Body != "Hi there" {
+		t.Fatalf("unexpected structured messages: %#v", messages)
 	}
 
 	// Missing conversation_id
@@ -244,6 +277,10 @@ func TestSendMessageNotConnected(t *testing.T) {
 	text := result.Content[0].(mcp.TextContent).Text
 	if !strings.Contains(text, "not connected") {
 		t.Errorf("expected 'not connected' error, got: %s", text)
+	}
+	payload := structuredMap(t, result)
+	if payload["error"] == "" {
+		t.Fatalf("expected structured error payload, got %#v", payload)
 	}
 }
 
@@ -296,6 +333,10 @@ func TestSendMessageSignalDirect(t *testing.T) {
 	}
 	if convo == nil || convo.SourcePlatform != "signal" {
 		t.Fatalf("expected persisted signal conversation, got %#v", convo)
+	}
+	payload := structuredMap(t, result)
+	if payload["ok"] != true {
+		t.Fatalf("expected ok=true, got %#v", payload["ok"])
 	}
 	msg, err := a.Store.GetMessageByID("signal:direct-1")
 	if err != nil {
@@ -412,6 +453,14 @@ func TestSendMessageSMSPersistsConversationAndOutgoingMessage(t *testing.T) {
 	if len(msgs) != 1 || msgs[0].Body != "hi sms" {
 		t.Fatalf("expected persisted outgoing sms message, got %#v", msgs)
 	}
+	payload := structuredMap(t, result)
+	message, ok := payload["message"].(messageSummary)
+	if !ok {
+		t.Fatalf("expected typed message summary, got %T", payload["message"])
+	}
+	if message.Body != "hi sms" {
+		t.Fatalf("unexpected structured message: %#v", message)
+	}
 }
 
 func TestSendToConversationValidation(t *testing.T) {
@@ -465,6 +514,10 @@ func TestSendToConversationNotConnected(t *testing.T) {
 	text := result.Content[0].(mcp.TextContent).Text
 	if !strings.Contains(text, "not connected") {
 		t.Fatalf("expected not connected error, got: %s", text)
+	}
+	payload := structuredMap(t, result)
+	if payload["error"] == "" {
+		t.Fatalf("expected structured error payload, got %#v", payload)
 	}
 }
 
@@ -523,6 +576,88 @@ func TestGetStatus(t *testing.T) {
 	if !strings.Contains(text, "signal-cli unavailable") {
 		t.Errorf("expected Signal last error, got: %s", text)
 	}
+	payload := structuredMap(t, result)
+	if payload["overall_connected"] != true {
+		t.Fatalf("expected overall_connected=true, got %#v", payload["overall_connected"])
+	}
+}
+
+func TestResolveContactRoutesPrefersSMSThread(t *testing.T) {
+	a := testApp(t)
+	now := time.Now().UnixMilli()
+
+	if err := a.Store.UpsertConversation(&db.Conversation{
+		ConversationID: "sms-conv-1",
+		Name:           "Leigh Gibson",
+		Participants:   `[{"name":"Leigh Gibson","number":"+15551230000"}]`,
+		LastMessageTS:  now,
+		SourcePlatform: "sms",
+	}); err != nil {
+		t.Fatalf("seed sms conversation: %v", err)
+	}
+	if err := a.Store.UpsertConversation(&db.Conversation{
+		ConversationID: "whatsapp:15551230000@s.whatsapp.net",
+		Name:           "Leigh Gibson",
+		Participants:   `[{"name":"Leigh Gibson","number":"+15551230000"}]`,
+		LastMessageTS:  now + 1,
+		SourcePlatform: "whatsapp",
+	}); err != nil {
+		t.Fatalf("seed whatsapp conversation: %v", err)
+	}
+	if err := a.Store.UpsertUnifiedContact(&db.UnifiedContact{
+		UnifiedID:   "leigh",
+		DisplayName: "Leigh Gibson",
+		Identifiers: `[{"platform":"sms","value":"+15551230000"},{"platform":"whatsapp","value":"+15551230000"}]`,
+	}); err != nil {
+		t.Fatalf("seed unified contact: %v", err)
+	}
+
+	originalWhatsAppStatus := whatsAppStatus
+	originalSignalStatus := signalStatus
+	whatsAppStatus = func(*app.App) whatsapplive.StatusSnapshot {
+		return whatsapplive.StatusSnapshot{Connected: true}
+	}
+	signalStatus = func(*app.App) signallive.StatusSnapshot {
+		return signallive.StatusSnapshot{}
+	}
+	t.Cleanup(func() {
+		whatsAppStatus = originalWhatsAppStatus
+		signalStatus = originalSignalStatus
+	})
+
+	handler := resolveContactRoutesHandler(a)
+	req := mcp.CallToolRequest{}
+	req.Params.Arguments = map[string]any{"query": "Leigh"}
+
+	result, err := handler(context.Background(), req)
+	if err != nil {
+		t.Fatalf("handler error: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("unexpected error result: %v", result.Content)
+	}
+
+	payload := structuredMap(t, result)
+	matches, ok := payload["matches"].([]resolvedRouteMatch)
+	if !ok {
+		t.Fatalf("expected typed route matches, got %T", payload["matches"])
+	}
+	if len(matches) != 1 {
+		t.Fatalf("expected 1 route match, got %d (%#v)", len(matches), matches)
+	}
+	match := matches[0]
+	if match.PreferredReplyConversationID != "sms-conv-1" {
+		t.Fatalf("preferred reply route = %q, want sms-conv-1", match.PreferredReplyConversationID)
+	}
+	if match.RouteCount != 2 {
+		t.Fatalf("route count = %d, want 2", match.RouteCount)
+	}
+	if len(match.Routes) != 2 {
+		t.Fatalf("routes length = %d, want 2", len(match.Routes))
+	}
+	if match.Routes[0].Conversation.SourcePlatform != "sms" {
+		t.Fatalf("expected sms route first, got %#v", match.Routes)
+	}
 }
 
 func TestSendToConversationSignal(t *testing.T) {
@@ -537,9 +672,9 @@ func TestSendToConversationSignal(t *testing.T) {
 		t.Fatalf("seed conversation: %v", err)
 	}
 
-	originalSendSignalText := sendSignalText
+	originalSendTextToConversation := sendTextToConversation
 	called := false
-	sendSignalText = func(_ *app.App, conversationID, body, replyToID string) (*db.Message, error) {
+	sendTextToConversation = func(_ *app.App, conversationID, body string) (conversationSummary, messageSummary, error) {
 		called = true
 		if conversationID != "signal:group-1" {
 			t.Fatalf("conversationID = %q, want signal:group-1", conversationID)
@@ -547,20 +682,23 @@ func TestSendToConversationSignal(t *testing.T) {
 		if body != "Hello from MCP" {
 			t.Fatalf("body = %q, want Hello from MCP", body)
 		}
-		if replyToID != "" {
-			t.Fatalf("replyToID = %q, want empty", replyToID)
-		}
-		return &db.Message{
-			MessageID:      "signal:out-1",
-			ConversationID: conversationID,
-			Body:           body,
-			TimestampMS:    now + 1,
-			IsFromMe:       true,
-			SourcePlatform: "signal",
-		}, nil
+		return conversationSummary{
+				ConversationID: conversationID,
+				Name:           "Taylor",
+				SourcePlatform: "signal",
+				IsGroup:        true,
+				LastMessageTS:  now,
+			}, messageSummary{
+				MessageID:      "signal:out-1",
+				ConversationID: conversationID,
+				Body:           body,
+				TimestampMS:    now + 1,
+				IsFromMe:       true,
+				SourcePlatform: "signal",
+			}, nil
 	}
 	t.Cleanup(func() {
-		sendSignalText = originalSendSignalText
+		sendTextToConversation = originalSendTextToConversation
 	})
 
 	handler := sendToConversationHandler(a)
@@ -584,12 +722,13 @@ func TestSendToConversationSignal(t *testing.T) {
 	if !strings.Contains(text, "Taylor") {
 		t.Fatalf("expected conversation name in response, got: %s", text)
 	}
-	msg, err := a.Store.GetMessageByID("signal:out-1")
-	if err != nil {
-		t.Fatalf("GetMessageByID: %v", err)
+	payload := structuredMap(t, result)
+	message, ok := payload["message"].(messageSummary)
+	if !ok {
+		t.Fatalf("expected typed message summary, got %T", payload["message"])
 	}
-	if msg == nil {
-		t.Fatal("expected outgoing Signal message to be persisted")
+	if message.MessageID != "signal:out-1" {
+		t.Fatalf("unexpected structured message: %#v", message)
 	}
 }
 

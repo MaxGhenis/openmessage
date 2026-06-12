@@ -33,6 +33,20 @@ func TestQRCodeRendersDataURL(t *testing.T) {
 	}
 }
 
+func TestParseSignalAccountsIgnoresSignalCLIErrorOutput(t *testing.T) {
+	raw := []byte("WARN  MultiAccountManager - Ignoring +15551230000: User is not registered. (NotRegisteredException)\nUser +15551230000 is not registered.\n")
+	if got := parseSignalAccounts(raw); len(got) != 0 {
+		t.Fatalf("parseSignalAccounts() = %#v, want no accounts from error output", got)
+	}
+}
+
+func TestParseSignalAccountsAcceptsJSONPhoneNumbers(t *testing.T) {
+	got := parseSignalAccounts([]byte(`[{"number":"+15551230000"}]`))
+	if len(got) != 1 || got[0] != "+15551230000" {
+		t.Fatalf("parseSignalAccounts() = %#v, want +15551230000", got)
+	}
+}
+
 func TestBridgeSendTextRunsSignalCLI(t *testing.T) {
 	bridge := &Bridge{
 		account:   "+15551230000",

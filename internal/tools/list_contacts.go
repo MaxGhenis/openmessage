@@ -50,19 +50,29 @@ func listContactsHandler(a *app.App) server.ToolHandlerFunc {
 		}
 
 		if len(contacts) == 0 {
-			return textResult("No contacts found."), nil
+			return structuredResult(map[string]any{
+				"count":    0,
+				"query":    query,
+				"contacts": []contactSummary{},
+			}, "No contacts found."), nil
 		}
 
 		var sb strings.Builder
+		summaries := make([]contactSummary, 0, len(contacts))
 		fmt.Fprintf(&sb, "%d contacts:\n\n", len(contacts))
 		for _, c := range contacts {
+			summaries = append(summaries, summarizeContact(c))
 			if c.Number != "" {
 				fmt.Fprintf(&sb, "- %s: %s\n", c.Name, c.Number)
 			} else {
 				fmt.Fprintf(&sb, "- %s\n", c.Name)
 			}
 		}
-		return textResult(sb.String()), nil
+		return structuredResult(map[string]any{
+			"count":    len(summaries),
+			"query":    query,
+			"contacts": summaries,
+		}, sb.String()), nil
 	}
 }
 

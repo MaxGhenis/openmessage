@@ -27,7 +27,10 @@ import (
 )
 
 type serveOptions struct {
-	demo bool
+	demo     bool
+	web      bool
+	mcpSSE   bool
+	mcpStdio bool
 }
 
 // buildVersion is the version string baked in at build time. SetVersion is
@@ -199,6 +202,29 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 		}()
 	}
 
+	// Google Messages reconnect watchdog. libgm has no auto-reconnect and the
+	// long-poll goroutine can die (panic, ping failure, transient fatal error)
+	// while the session stays valid. Without this, SMS silently freezes with
+	// Connected=true forever. Only reconnect a paired-but-disconnected session;
+	// skip when it genuinely needs re-pairing (session deleted) so we don't
+	// hammer a known-bad state.
+	if !isDemo {
+		go func() {
+			ticker := time.NewTicker(15 * time.Second)
+			defer ticker.Stop()
+			for range ticker.C {
+				g := a.GoogleStatus()
+				if !g.Paired || g.Connected || g.NeedsPairing {
+					continue
+				}
+				logger.Info().Msg("Google Messages disconnected — attempting reconnect")
+				if err := a.ReconnectGoogleMessages(); err != nil {
+					logger.Warn().Err(err).Msg("Google Messages reconnect attempt failed")
+				}
+			}
+		}()
+	}
+
 	// Sync WhatsApp and iMessage periodically (every 30s, incremental)
 	lastImportErr := map[string]string{}
 	syncLocalPlatforms := func() {
@@ -330,11 +356,13 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 	)
 	tools.Register(mcpSrv, a)
 
-	// Create SSE transport for MCP, mounted at /mcp/
-	sseSrv := mcpserver.NewSSEServer(mcpSrv,
-		mcpserver.WithBaseURL(baseURL),
-		mcpserver.WithStaticBasePath("/mcp"),
-	)
+	var sseSrv http.Handler
+	if opts.mcpSSE {
+		sseSrv = mcpserver.NewSSEServer(mcpSrv,
+			mcpserver.WithBaseURL(baseURL),
+			mcpserver.WithStaticBasePath("/mcp"),
+		)
+	}
 
 	googleStatus := func() any {
 		if isDemo {
@@ -343,62 +371,81 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 		return a.GoogleStatus()
 	}
 
-	httpHandler := web.APIHandlerWithOptions(a.Store, nil, logger, sseSrv, web.APIOptions{
-		Client:               a.GetClient,
-		Events:               events,
-		IdentityName:         identityName,
-		IsConnected:          isConnected,
-		GoogleStatus:         googleStatus,
-		ReconnectGoogle:      a.ReconnectGoogleMessages,
-		Unpair:               a.Unpair,
-		WhatsAppStatus:       func() any { return a.WhatsAppStatus() },
-		ConnectWhatsApp:      a.StartWhatsAppConnect,
-		UnpairWhatsApp:       a.UnpairWhatsApp,
-		SignalStatus:         func() any { return a.SignalStatus() },
-		ConnectSignal:        a.StartSignalConnect,
-		ReplaySignalRecovery: a.ReplaySignalRecoveryQueue,
-		UnpairSignal:         a.UnpairSignal,
-		LeaveWhatsAppGroup:   a.LeaveWhatsAppGroup,
-		WhatsAppQRCode: func() (any, error) {
-			return a.WhatsAppQRCode()
-		},
-		SignalQRCode: func() (any, error) {
-			return a.SignalQRCode()
-		},
-		SendWhatsAppText:      a.SendWhatsAppText,
-		SendWhatsAppReaction:  a.SendWhatsAppReaction,
-		SendSignalText:        a.SendSignalText,
-		SendSignalMedia:       a.SendSignalMedia,
-		SendSignalReaction:    a.SendSignalReaction,
-		SendWhatsAppMedia:     a.SendWhatsAppMedia,
-		WhatsAppAvatar:        a.WhatsAppAvatar,
-		DownloadWhatsAppMedia: a.DownloadWhatsAppMedia,
-		DownloadSignalMedia:   a.DownloadSignalMedia,
-		StartDeepBackfill:     a.StartDeepBackfill,
-		BackfillStatus:        func() any { return a.GetBackfillProgress() },
-		BackfillPhone:         a.BackfillConversationByPhone,
-	})
-	ln, err := net.Listen("tcp", listenAddr)
-	if err != nil {
-		return fmt.Errorf("listen on %s: %w", listenAddr, err)
-	}
-	go func() {
-		logger.Info().Str("addr", listenAddr).Msg("Web UI available at " + baseURL)
-		logger.Info().Str("addr", listenAddr).Msg("MCP SSE available at " + baseURL + "/mcp/sse")
-		if err := http.Serve(ln, httpHandler); err != nil {
-			logger.Error().Err(err).Msg("HTTP server error")
+	httpEnabled := opts.web || opts.mcpSSE
+	if httpEnabled {
+		httpHandler := http.Handler(nil)
+		if opts.web {
+			httpHandler = web.APIHandlerWithOptions(a.Store, nil, logger, sseSrv, web.APIOptions{
+				Client:               a.GetClient,
+				Events:               events,
+				IdentityName:         identityName,
+				IsConnected:          isConnected,
+				GoogleStatus:         googleStatus,
+				ReconnectGoogle:      a.ReconnectGoogleMessages,
+				Unpair:               a.Unpair,
+				WhatsAppStatus:       func() any { return a.WhatsAppStatus() },
+				ConnectWhatsApp:      a.StartWhatsAppConnect,
+				UnpairWhatsApp:       a.UnpairWhatsApp,
+				SignalStatus:         func() any { return a.SignalStatus() },
+				ConnectSignal:        a.StartSignalConnect,
+				ReplaySignalRecovery: a.ReplaySignalRecoveryQueue,
+				UnpairSignal:         a.UnpairSignal,
+				LeaveWhatsAppGroup:   a.LeaveWhatsAppGroup,
+				WhatsAppQRCode: func() (any, error) {
+					return a.WhatsAppQRCode()
+				},
+				SignalQRCode: func() (any, error) {
+					return a.SignalQRCode()
+				},
+				SendWhatsAppText:      a.SendWhatsAppText,
+				SendWhatsAppReaction:  a.SendWhatsAppReaction,
+				SendSignalText:        a.SendSignalText,
+				SendSignalMedia:       a.SendSignalMedia,
+				SendSignalReaction:    a.SendSignalReaction,
+				SendWhatsAppMedia:     a.SendWhatsAppMedia,
+				WhatsAppAvatar:        a.WhatsAppAvatar,
+				DownloadWhatsAppMedia: a.DownloadWhatsAppMedia,
+				DownloadSignalMedia:   a.DownloadSignalMedia,
+				StartDeepBackfill:     a.StartDeepBackfill,
+				BackfillStatus:        func() any { return a.GetBackfillProgress() },
+				BackfillPhone:         a.BackfillConversationByPhone,
+			})
+		} else {
+			mux := http.NewServeMux()
+			if sseSrv != nil {
+				mux.Handle("/mcp/", sseSrv)
+			}
+			httpHandler = mux
 		}
-	}()
 
-	if !interactiveTerminal {
+		ln, err := net.Listen("tcp", listenAddr)
+		if err != nil {
+			return fmt.Errorf("listen on %s: %w", listenAddr, err)
+		}
+		go func() {
+			if opts.web {
+				logger.Info().Str("addr", listenAddr).Msg("Web UI available at " + baseURL)
+			}
+			if opts.mcpSSE {
+				logger.Info().Str("addr", listenAddr).Msg("MCP SSE available at " + baseURL + "/mcp/sse")
+			}
+			if err := http.Serve(ln, httpHandler); err != nil {
+				logger.Error().Err(err).Msg("HTTP server error")
+			}
+		}()
+	}
+
+	if opts.mcpStdio {
+		if !httpEnabled {
+			logger.Info().Msg("Starting MCP stdio transport")
+			return mcpserver.ServeStdio(mcpSrv)
+		}
 		go func() {
 			logger.Info().Msg("Starting MCP stdio transport")
 			if err := mcpserver.ServeStdio(mcpSrv); err != nil {
 				logger.Warn().Err(err).Msg("MCP stdio server exited")
 			}
 		}()
-	} else {
-		logger.Debug().Msg("Skipping MCP stdio transport on interactive terminal")
 	}
 
 	// Send anonymous heartbeat (opt-in only, off by default).
@@ -441,15 +488,49 @@ func RunDemo(logger zerolog.Logger) error {
 }
 
 func parseServeOptions(args []string) (serveOptions, error) {
-	opts := serveOptions{}
+	opts := serveOptions{
+		web:    true,
+		mcpSSE: true,
+	}
+	transportFlagsSeen := false
+	enableExplicitTransportMode := func() {
+		if transportFlagsSeen {
+			return
+		}
+		transportFlagsSeen = true
+		opts.web = false
+		opts.mcpSSE = false
+		opts.mcpStdio = false
+	}
 	for _, arg := range args {
 		switch arg {
-		case "--demo", "--mock":
+		case "--demo":
 			opts.demo = true
+		case "--web":
+			enableExplicitTransportMode()
+			opts.web = true
+		case "--no-web":
+			enableExplicitTransportMode()
+			opts.web = false
+		case "--mcp-sse":
+			enableExplicitTransportMode()
+			opts.mcpSSE = true
+		case "--no-mcp-sse":
+			enableExplicitTransportMode()
+			opts.mcpSSE = false
+		case "--mcp-stdio":
+			enableExplicitTransportMode()
+			opts.mcpStdio = true
+		case "--no-mcp-stdio":
+			enableExplicitTransportMode()
+			opts.mcpStdio = false
 		case "":
 		default:
 			return serveOptions{}, fmt.Errorf("unknown serve option: %s", arg)
 		}
+	}
+	if !opts.web && !opts.mcpSSE && !opts.mcpStdio {
+		return serveOptions{}, fmt.Errorf("serve requires at least one enabled transport: web, mcp-sse, or mcp-stdio")
 	}
 	return opts, nil
 }

@@ -78,12 +78,19 @@ final class NotificationManager: NSObject, ObservableObject, UNUserNotificationC
         streamTask = nil
     }
 
-    func bridgeState() async -> BridgeState {
+    /// Helper that crosses the actor boundary returning only the Sendable
+    /// auth status, not the full UNNotificationSettings (which is not Sendable).
+    private nonisolated func currentAuthStatus() async -> UNAuthorizationStatus {
         let settings = await UNUserNotificationCenter.current().notificationSettings()
+        return settings.authorizationStatus
+    }
+
+    func bridgeState() async -> BridgeState {
+        let status = await currentAuthStatus()
         return BridgeState(
             supported: true,
-            enabled: preferenceEnabled && isGranted(settings.authorizationStatus),
-            permission: permissionString(settings.authorizationStatus)
+            enabled: preferenceEnabled && isGranted(status),
+            permission: permissionString(status)
         )
     }
 
@@ -96,14 +103,14 @@ final class NotificationManager: NSObject, ObservableObject, UNUserNotificationC
         preferenceEnabled = true
         defaults.set(true, forKey: preferenceKey)
 
-        let current = await UNUserNotificationCenter.current().notificationSettings()
-        if current.authorizationStatus == .notDetermined {
+        let status = await currentAuthStatus()
+        if status == .notDetermined {
             let granted = await requestPermission()
             if !granted {
                 disablePreferenceAndStop()
                 return await bridgeState()
             }
-        } else if !isGranted(current.authorizationStatus) {
+        } else if !isGranted(status) {
             disablePreferenceAndStop()
             return await bridgeState()
         }
@@ -139,8 +146,7 @@ final class NotificationManager: NSObject, ObservableObject, UNUserNotificationC
 
     private func startIfAllowed() async {
         guard preferenceEnabled else { return }
-        let settings = await UNUserNotificationCenter.current().notificationSettings()
-        let status = settings.authorizationStatus
+        let status = await currentAuthStatus()
         if status == .notDetermined {
             let granted = await requestPermission()
             guard granted else {

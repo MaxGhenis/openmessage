@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"mime/multipart"
 	"net/http"
@@ -1440,6 +1441,39 @@ func TestGetStatusIncludesGoogleSnapshot(t *testing.T) {
 	}
 }
 
+func TestGoogleNetworkErrorIsUserFacing(t *testing.T) {
+	raw := `Post "https://instantmessaging-pa.clients6.google.com/$rpc/google.internal.communications.instantmessaging.v1.Messaging/SendMessage": dial tcp: lookup instantmessaging-pa.clients6.google.com: no such host`
+	if !isGoogleNetworkError(errors.New(raw)) {
+		t.Fatal("expected Google DNS failure to be recognized as a network error")
+	}
+
+	ts := newTestServerWithOptions(t, APIOptions{
+		ReconnectGoogle: func() error {
+			return errors.New(raw)
+		},
+	})
+	resp, err := http.Post(ts.server.URL+"/api/google/reconnect", "application/json", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("got status %d, want 502", resp.StatusCode)
+	}
+	var payload map[string]string
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	got := payload["error"]
+	if got != "Google Messages is offline. Check your internet connection, then try again." {
+		t.Fatalf("error = %q", got)
+	}
+	if strings.Contains(got, "instantmessaging") || strings.Contains(got, "dial tcp") {
+		t.Fatalf("error leaked transport details: %q", got)
+	}
+}
+
 func TestDiagnosticsEndpointIncludesCountsStatusAndReleaseSnapshot(t *testing.T) {
 	ts := newTestServerWithOptions(t, APIOptions{
 		IdentityName: "Max",
@@ -2553,6 +2587,108 @@ func TestBackfillReturnsConflictWhenAlreadyRunning(t *testing.T) {
 
 	if resp.StatusCode != 409 {
 		t.Fatalf("got status %d, want 409", resp.StatusCode)
+	}
+}
+
+func TestStatusFreshnessFlagsStalePlatform(t *testing.T) {
+	store, err := db.New(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	now := time.Now().UnixMilli()
+	tenDaysAgo := now - 10*24*60*60*1000
+	// WhatsApp is fresh; Google Messages (sms) is 10 days behind → stale even
+	// though Google reports connected (the zombie case).
+	if err := store.UpsertMessage(&db.Message{
+		MessageID: "whatsapp:fresh", ConversationID: "whatsapp:c", Body: "hi",
+		TimestampMS: now, SourcePlatform: "whatsapp", SourceID: "fresh",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertMessage(&db.Message{
+		MessageID: "sms:old", ConversationID: "sms:c", Body: "old",
+		TimestampMS: tenDaysAgo, SourcePlatform: "sms", SourceID: "old",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	logger := zerolog.Nop()
+	h := APIHandlerWithOptions(store, nil, logger, nil, APIOptions{
+		GoogleStatus: func() any {
+			return map[string]any{"connected": true, "paired": true, "needs_pairing": false}
+		},
+	})
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/api/status")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	var payload map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	freshness, ok := payload["freshness"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected freshness block, got %v", payload["freshness"])
+	}
+	google, ok := freshness["google"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected google freshness, got %v", freshness["google"])
+	}
+	if stale, _ := google["stale"].(bool); !stale {
+		t.Errorf("expected google to be flagged stale (zombie), got %v", google)
+	}
+	if wa, ok := freshness["whatsapp"].(map[string]any); ok {
+		if stale, _ := wa["stale"].(bool); stale {
+			t.Errorf("expected whatsapp to be fresh, got %v", wa)
+		}
+	}
+}
+
+func TestAPIRejectsCrossOriginRequests(t *testing.T) {
+	ts := newTestServer(t)
+
+	// A cross-origin Origin header must be rejected by the guard before
+	// reaching any handler (drive-by attack vector).
+	req, _ := http.NewRequest("POST", ts.server.URL+"/api/backfill", strings.NewReader("{}"))
+	req.Header.Set("Origin", "http://evil.example.com")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("cross-origin POST: got %d, want 403", resp.StatusCode)
+	}
+
+	// A request with no Origin (same-origin / native app) passes the guard
+	// (the handler may still respond non-2xx, just not 403 from the guard).
+	req2, _ := http.NewRequest("POST", ts.server.URL+"/api/backfill", strings.NewReader("{}"))
+	resp2, err := http.DefaultClient.Do(req2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode == http.StatusForbidden {
+		t.Fatal("same-origin POST should not be forbidden")
+	}
+
+	// A loopback Origin is allowed.
+	req3, _ := http.NewRequest("POST", ts.server.URL+"/api/backfill", strings.NewReader("{}"))
+	req3.Header.Set("Origin", "http://127.0.0.1:7007")
+	resp3, err := http.DefaultClient.Do(req3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp3.Body.Close()
+	if resp3.StatusCode == http.StatusForbidden {
+		t.Fatal("loopback-origin POST should not be forbidden")
 	}
 }
 

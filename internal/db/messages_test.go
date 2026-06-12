@@ -159,6 +159,103 @@ func TestUpsertMessage_InsertAndUpdate(t *testing.T) {
 	})
 }
 
+// TestUpsertMessage_StatusUpdatePreservesContent guards the data-loss path
+// where a status-only re-delivery of an existing message_id (empty media /
+// reactions / body, as happens on delivery/read receipts) must NOT wipe the
+// media references and reactions already stored on the complete row.
+func TestUpsertMessage_StatusUpdatePreservesContent(t *testing.T) {
+	store := newTestStore(t)
+
+	full := &Message{
+		MessageID:      "msg-media",
+		ConversationID: "conv-1",
+		SenderName:     "Alice",
+		SenderNumber:   "+15551234567",
+		Body:           "Check this photo",
+		TimestampMS:    1000,
+		Status:         "sent",
+		MediaID:        "media-abc",
+		MimeType:       "image/jpeg",
+		DecryptionKey:  "cafebabe",
+		Reactions:      `[{"emoji":"heart","count":2}]`,
+		ReplyToID:      "msg-0",
+	}
+	if err := store.UpsertMessage(full); err != nil {
+		t.Fatalf("insert full message: %v", err)
+	}
+
+	// Simulate a status-only update: same message_id, only status changes,
+	// content fields empty (this is exactly what the live bridges re-deliver).
+	statusOnly := &Message{
+		MessageID:      "msg-media",
+		ConversationID: "conv-1",
+		SenderName:     "",
+		SenderNumber:   "",
+		Body:           "",
+		TimestampMS:    0,
+		Status:         "delivered",
+	}
+	if err := store.UpsertMessage(statusOnly); err != nil {
+		t.Fatalf("status-only upsert: %v", err)
+	}
+
+	got, err := store.GetMessageByID("msg-media")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	// Volatile field updated...
+	if got.Status != "delivered" {
+		t.Errorf("status: got %q, want %q", got.Status, "delivered")
+	}
+	// ...content preserved.
+	if got.MediaID != "media-abc" {
+		t.Errorf("MediaID wiped: got %q, want %q", got.MediaID, "media-abc")
+	}
+	if got.MimeType != "image/jpeg" {
+		t.Errorf("MimeType wiped: got %q, want %q", got.MimeType, "image/jpeg")
+	}
+	if got.DecryptionKey != "cafebabe" {
+		t.Errorf("DecryptionKey wiped: got %q, want %q", got.DecryptionKey, "cafebabe")
+	}
+	if got.Reactions != `[{"emoji":"heart","count":2}]` {
+		t.Errorf("Reactions wiped: got %q", got.Reactions)
+	}
+	if got.Body != "Check this photo" {
+		t.Errorf("Body wiped: got %q, want %q", got.Body, "Check this photo")
+	}
+	if got.SenderName != "Alice" {
+		t.Errorf("SenderName wiped: got %q, want %q", got.SenderName, "Alice")
+	}
+	if got.TimestampMS != 1000 {
+		t.Errorf("TimestampMS wiped: got %d, want %d", got.TimestampMS, 1000)
+	}
+	if got.ReplyToID != "msg-0" {
+		t.Errorf("ReplyToID wiped: got %q, want %q", got.ReplyToID, "msg-0")
+	}
+
+	// A genuine edit (non-empty body) must still update the body.
+	edit := &Message{
+		MessageID:      "msg-media",
+		ConversationID: "conv-1",
+		Body:           "Check this photo (edited)",
+		TimestampMS:    1500,
+		Status:         "delivered",
+	}
+	if err := store.UpsertMessage(edit); err != nil {
+		t.Fatalf("edit upsert: %v", err)
+	}
+	got, err = store.GetMessageByID("msg-media")
+	if err != nil {
+		t.Fatalf("get after edit: %v", err)
+	}
+	if got.Body != "Check this photo (edited)" {
+		t.Errorf("edit not applied: got %q", got.Body)
+	}
+	if got.MediaID != "media-abc" {
+		t.Errorf("MediaID wiped on edit: got %q", got.MediaID)
+	}
+}
+
 func TestGetMessages_Filters(t *testing.T) {
 	store := newTestStore(t)
 
@@ -1085,5 +1182,185 @@ func TestLatestReceivedTimestampIgnoresOutgoing(t *testing.T) {
 	all, _ := store.LatestTimestamp("signal")
 	if all != 300 {
 		t.Fatalf("LatestTimestamp sanity = %d, want 300", all)
+	}
+}
+
+func TestListLegacyWhatsAppMediaPlaceholdersIncludesStickers(t *testing.T) {
+	store := newTestStore(t)
+	rows := []*Message{
+		{
+			MessageID:      "whatsapp:sticker-placeholder",
+			ConversationID: "whatsapp:group@g.us",
+			Body:           "[Sticker]",
+			TimestampMS:    3000,
+			SourcePlatform: "whatsapp",
+			SourceID:       "sticker-placeholder",
+		},
+		{
+			MessageID:      "whatsapp:photo-placeholder",
+			ConversationID: "whatsapp:group@g.us",
+			Body:           "[Photo]",
+			TimestampMS:    2000,
+			SourcePlatform: "whatsapp",
+			SourceID:       "photo-placeholder",
+		},
+		{
+			MessageID:      "whatsapp:sticker-has-media",
+			ConversationID: "whatsapp:group@g.us",
+			Body:           "[Sticker]",
+			TimestampMS:    1000,
+			SourcePlatform: "whatsapp",
+			SourceID:       "sticker-has-media",
+			MediaID:        "wa:already-present",
+		},
+		{
+			MessageID:      "sms:sticker-placeholder",
+			ConversationID: "sms:thread-1",
+			Body:           "[Sticker]",
+			TimestampMS:    4000,
+			SourcePlatform: "sms",
+			SourceID:       "sms-sticker",
+		},
+	}
+	for _, row := range rows {
+		if err := store.UpsertMessage(row); err != nil {
+			t.Fatalf("upsert %s: %v", row.MessageID, err)
+		}
+	}
+
+	got, err := store.ListLegacyWhatsAppMediaPlaceholders(10)
+	if err != nil {
+		t.Fatalf("ListLegacyWhatsAppMediaPlaceholders: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d placeholders, want 2", len(got))
+	}
+	if got[0].MessageID != "whatsapp:sticker-placeholder" {
+		t.Fatalf("first placeholder = %q, want whatsapp:sticker-placeholder", got[0].MessageID)
+	}
+	if got[1].MessageID != "whatsapp:photo-placeholder" {
+		t.Fatalf("second placeholder = %q, want whatsapp:photo-placeholder", got[1].MessageID)
+	}
+}
+
+func TestPlatformStats(t *testing.T) {
+	store := newTestStore(t)
+
+	msgs := []*Message{
+		{MessageID: "s1", ConversationID: "c1", Body: "hi", TimestampMS: 5000, SourcePlatform: "sms", IsFromMe: false},
+		{MessageID: "s2", ConversationID: "c1", Body: "yo", TimestampMS: 9000, SourcePlatform: "sms", IsFromMe: true}, // newest sms, but outgoing
+		{MessageID: "w1", ConversationID: "c2", Body: "hey", TimestampMS: 3000, SourcePlatform: "whatsapp", IsFromMe: false},
+		{MessageID: "u1", ConversationID: "c3", Body: "??", TimestampMS: 7000, SourcePlatform: "", IsFromMe: false}, // blank → "unknown"
+	}
+	for _, m := range msgs {
+		if err := store.UpsertMessage(m); err != nil {
+			t.Fatalf("insert %s: %v", m.MessageID, err)
+		}
+	}
+
+	stats, err := store.PlatformStats()
+	if err != nil {
+		t.Fatalf("PlatformStats: %v", err)
+	}
+	if len(stats) != 3 {
+		t.Fatalf("platform count: got %d, want 3 (%+v)", len(stats), stats)
+	}
+
+	// Ordered by latest activity DESC: sms(9000), unknown(7000), whatsapp(3000).
+	if stats[0].Platform != "sms" || stats[1].Platform != "unknown" || stats[2].Platform != "whatsapp" {
+		t.Fatalf("ordering: got %s, %s, %s; want sms, unknown, whatsapp",
+			stats[0].Platform, stats[1].Platform, stats[2].Platform)
+	}
+
+	sms := stats[0]
+	if sms.Count != 2 {
+		t.Errorf("sms count: got %d, want 2", sms.Count)
+	}
+	if sms.LatestMS != 9000 {
+		t.Errorf("sms latest: got %d, want 9000", sms.LatestMS)
+	}
+	// Newest sms message is outgoing, so latest *received* must stay at 5000 —
+	// this is the gap-masking case the status command exists to surface.
+	if sms.LatestRecvMS != 5000 {
+		t.Errorf("sms latest received: got %d, want 5000", sms.LatestRecvMS)
+	}
+
+	unknown := stats[1]
+	if unknown.Count != 1 || unknown.LatestMS != 7000 {
+		t.Errorf("unknown bucket: got count=%d latest=%d, want 1/7000", unknown.Count, unknown.LatestMS)
+	}
+}
+
+func TestPlatformStats_Empty(t *testing.T) {
+	store := newTestStore(t)
+	stats, err := store.PlatformStats()
+	if err != nil {
+		t.Fatalf("PlatformStats on empty store: %v", err)
+	}
+	if len(stats) != 0 {
+		t.Fatalf("empty store: got %d platforms, want 0", len(stats))
+	}
+}
+
+func TestSearchMessagesFiltered_DateWindow(t *testing.T) {
+	store := newTestStore(t)
+	day := int64(24 * 60 * 60 * 1000)
+	base := int64(1_700_000_000_000) // fixed reference instant
+
+	for i := 0; i < 5; i++ { // one "flight" message per day, days 0..4
+		m := &Message{
+			MessageID:      fmt.Sprintf("m%d", i),
+			ConversationID: "c1",
+			SenderName:     "Travel",
+			Body:           fmt.Sprintf("your flight booking %d", i),
+			TimestampMS:    base + int64(i)*day,
+			SourcePlatform: "sms",
+		}
+		if err := store.UpsertMessage(m); err != nil {
+			t.Fatalf("insert m%d: %v", i, err)
+		}
+	}
+
+	// Window covering days 1..3 inclusive.
+	got, err := store.SearchMessagesFiltered("flight", SearchFilter{
+		SinceMS: base + 1*day, UntilMS: base + 3*day, Limit: 100,
+	})
+	if err != nil {
+		t.Fatalf("windowed search: %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("windowed search: got %d, want 3", len(got))
+	}
+	for _, m := range got {
+		if m.TimestampMS < base+1*day || m.TimestampMS > base+3*day {
+			t.Errorf("message %s ts %d outside window", m.MessageID, m.TimestampMS)
+		}
+	}
+
+	// Swapped bounds (until < since) are normalized, not treated as empty.
+	swapped, err := store.SearchMessagesFiltered("flight", SearchFilter{
+		SinceMS: base + 3*day, UntilMS: base + 1*day, Limit: 100,
+	})
+	if err != nil {
+		t.Fatalf("swapped search: %v", err)
+	}
+	if len(swapped) != 3 {
+		t.Errorf("swapped bounds: got %d, want 3", len(swapped))
+	}
+
+	// No bounds → all five; legacy wrapper agrees.
+	all, err := store.SearchMessagesFiltered("flight", SearchFilter{Limit: 100})
+	if err != nil {
+		t.Fatalf("unbounded search: %v", err)
+	}
+	if len(all) != 5 {
+		t.Errorf("unbounded: got %d, want 5", len(all))
+	}
+	legacy, err := store.SearchMessages("flight", "", 100)
+	if err != nil {
+		t.Fatalf("legacy search: %v", err)
+	}
+	if len(legacy) != 5 {
+		t.Errorf("legacy wrapper: got %d, want 5", len(legacy))
 	}
 }

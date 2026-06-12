@@ -88,9 +88,12 @@ func downloadMediaHandler(a *app.App) server.ToolHandlerFunc {
 		// Determine file extension from mime type
 		ext := extensionForMime(mimeType)
 
-		// Save to a temp file
+		// Save to a temp file. Sanitize the message id for use in a filename —
+		// iMessage GUIDs and conversation-scoped ids contain "/" and ":", which
+		// would turn into bogus nested paths and fail the write.
 		tmpDir := os.TempDir()
-		filename := fmt.Sprintf("openmessage-%s%s", msgID, ext)
+		safeID := strings.NewReplacer("/", "_", ":", "_", "\\", "_", " ", "_").Replace(msgID)
+		filename := fmt.Sprintf("openmessage-%s%s", safeID, ext)
 		filePath := filepath.Join(tmpDir, filename)
 
 		if err := os.WriteFile(filePath, data, 0644); err != nil {

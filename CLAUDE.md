@@ -5,7 +5,7 @@ Local-first universal message database with built-in MCP server. Ingests message
 ## Architecture
 
 ```
-├── cmd/              Go CLI commands (pair, serve, send, import)
+├── cmd/              Go CLI commands (pair, serve, send, read, status, import)
 ├── internal/
 │   ├── app/          Bootstrap, data dir, backfill
 │   ├── client/       libgm Google Messages protocol
@@ -21,6 +21,28 @@ Local-first universal message database with built-in MCP server. Ingests message
 ├── site/             Static website (deployed to openmessage.ai)
 └── vercel.json       Vercel config (root — NOT site/vercel.json)
 ```
+
+## Local CLI (read-only, no transports)
+
+These commands open the store directly and start no live transports, so they
+work in a one-shot terminal session without pairing or Full Disk Access:
+
+```bash
+openmessage read "<query>" [--limit N] [--phone NUMBER] [--since YYYY-MM-DD] [--until YYYY-MM-DD] [--json]
+openmessage search ...                                            # alias for read
+openmessage status [--json]                                       # per-platform counts + sync freshness
+```
+
+`status` is the fast way to check coverage before trusting a search: it lists
+each platform's message count and latest sent/received timestamps, and flags any
+platform whose latest message trails the newest overall by ≥3 days ("Nd behind").
+A stale row means the daemon isn't syncing that platform — searches over that
+window will miss messages. `read` resolves each hit's sender (name → number →
+conversation id) so results are legible without a second lookup, and accepts
+`--since`/`--until` (YYYY-MM-DD, local time; `--until` is inclusive to end of
+day) to scope a search to a date window. Date filtering lives in the store via
+`SearchFilter`/`SearchMessagesFiltered`; the legacy `SearchMessages(query,
+phone, limit)` wrapper is preserved for the MCP tool and HTTP API.
 
 ## Multi-platform import
 

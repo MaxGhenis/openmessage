@@ -14,10 +14,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -53,21 +55,58 @@ var (
 	runSignalCLI = func(ctx context.Context, configDir string, args ...string) ([]byte, error) {
 		commandArgs := append([]string{"--config", configDir}, args...)
 		cmd := exec.CommandContext(ctx, signalCLIExecutable(), commandArgs...)
+		tmpDir, cleanupTmp, tmpErr := newSignalRunTmpDir(configDir)
+		if tmpErr == nil {
+			cmd.Env = signalCLIEnv(os.Environ(), tmpDir)
+			defer cleanupTmp()
+		}
+		configureSignalCancel(cmd)
 		return cmd.CombinedOutput()
 	}
 
 	startSignalLink = func(ctx context.Context, configDir string) (io.ReadCloser, func() error, error) {
 		cmd := exec.CommandContext(ctx, "script", "-q", "/dev/null", signalCLIExecutable(), "--config", configDir, "link", "-n", "OpenMessage")
+		tmpDir, cleanupTmp, tmpErr := newSignalRunTmpDir(configDir)
+		if tmpErr == nil {
+			cmd.Env = signalCLIEnv(os.Environ(), tmpDir)
+		}
+		configureSignalCancel(cmd)
 		stdout, err := cmd.StdoutPipe()
 		if err != nil {
+			if tmpErr == nil {
+				cleanupTmp()
+			}
 			return nil, nil, err
 		}
 		if err := cmd.Start(); err != nil {
+			if tmpErr == nil {
+				cleanupTmp()
+			}
 			return nil, nil, err
 		}
-		return stdout, cmd.Wait, nil
+		wait := func() error {
+			err := cmd.Wait()
+			if tmpErr == nil {
+				cleanupTmp()
+			}
+			return err
+		}
+		return stdout, wait, nil
 	}
 )
+
+// configureSignalCancel asks for a graceful stop before the hard kill so
+// the JVM gets a chance to run its shutdown hooks (which include libsignal
+// temp cleanup) and flush output when a context deadline fires.
+func configureSignalCancel(cmd *exec.Cmd) {
+	cmd.Cancel = func() error {
+		if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+			return cmd.Process.Kill()
+		}
+		return nil
+	}
+	cmd.WaitDelay = 3 * time.Second
+}
 
 type Callbacks struct {
 	OnConversationsChange func()
@@ -164,6 +203,7 @@ type Bridge struct {
 		importedMessages      int
 	}
 	lastReceiveRecoveryAt int64
+	lastTmpSweep          time.Time
 }
 
 type signalReceiveRecoveryRecord struct {
@@ -325,6 +365,14 @@ func New(configDir string, store *db.Store, logger zerolog.Logger, callbacks Cal
 		contactByACI: map[string]string{},
 	}
 	bridge.account = bridge.firstStoredAccount()
+	bridge.lastTmpSweep = now()
+	go sweepSignalTmpRoot(logger, configDir, signalRunTmpMaxAge)
+	if bridge.account != "" {
+		// Only a paired install can have produced libsignal litter, so the
+		// legacy system-temp sweep stays scoped to installs that ran the
+		// bridge before per-run temp dirs existed.
+		go sweepLegacyLibsignalTemp(logger)
+	}
 	return bridge, nil
 }
 
@@ -380,6 +428,7 @@ func (b *Bridge) Connect() error {
 			return nil
 		}
 		b.connecting = true
+		b.needsReauth = false
 		b.lastError = ""
 		account := b.account
 		b.mu.Unlock()
@@ -395,6 +444,7 @@ func (b *Bridge) Connect() error {
 	b.pairCancel = cancel
 	b.pairing = true
 	b.connecting = true
+	b.needsReauth = false
 	b.lastError = ""
 	b.qr = QRSnapshot{}
 	b.mu.Unlock()
@@ -676,7 +726,7 @@ func (b *Bridge) SendReaction(conversationID, targetMessageID, emoji, action str
 		return nil
 	}
 	target.Reactions = nextReactions
-	if err := b.store.UpsertMessage(target); err != nil {
+	if err := b.store.UpdateMessageReactions(target.MessageID, nextReactions); err != nil {
 		return fmt.Errorf("store Signal reaction update: %w", err)
 	}
 	if b.callbacks.OnMessagesChange != nil {
@@ -757,6 +807,23 @@ func (b *Bridge) runLink(ctx context.Context) {
 }
 
 func (b *Bridge) startReceiveLoop(account string, requestSync bool) {
+	// A panic while parsing an attacker-influenced envelope (unchecked indexes
+	// into attachments/reactions/quotes) would otherwise kill this goroutine
+	// and leave connected=true — Signal silently freezes. Recover, reset the
+	// connection state, and let the reconnect watchdog re-spawn the loop.
+	defer func() {
+		if r := recover(); r != nil {
+			b.logger.Error().
+				Interface("panic", r).
+				Bytes("stack", debug.Stack()).
+				Msg("Recovered from panic in Signal receive loop")
+			b.mu.Lock()
+			b.connected = false
+			b.connecting = false
+			b.mu.Unlock()
+			b.emitStatusChange()
+		}
+	}()
 	ctx, cancel := context.WithCancel(context.Background())
 	b.mu.Lock()
 	if b.receiveCancel != nil {
@@ -819,6 +886,8 @@ func (b *Bridge) startReceiveLoop(account string, requestSync bool) {
 		default:
 		}
 
+		b.maybeSweepTmp()
+
 		callCtx, callCancel := context.WithTimeout(ctx, time.Duration(receiveTimeoutSeconds+3)*time.Second)
 		b.commandMu.Lock()
 		output, err := runSignalCLI(callCtx, b.configDir, "-a", probedAccount, "--output", "json", "receive", "--timeout", strconv.Itoa(receiveTimeoutSeconds), "--max-messages", strconv.Itoa(receiveMaxMessages))
@@ -878,6 +947,25 @@ func (b *Bridge) startReceiveLoop(account string, requestSync bool) {
 		if err := b.handleReceiveOutput(probedAccount, output); err != nil {
 			b.logger.Debug().Err(err).Msg("Failed to process Signal receive payload")
 		}
+	}
+}
+
+// maybeSweepTmp runs the crash-backstop sweeps at most once per
+// signalTmpSweepInterval. Normal runs clean up after themselves, so the
+// app-tmp sweep usually finds nothing; the legacy sweep keeps reaping
+// system-temp dirs leaked by older builds as they age past the gate.
+func (b *Bridge) maybeSweepTmp() {
+	b.mu.Lock()
+	due := now().Sub(b.lastTmpSweep) >= signalTmpSweepInterval
+	if due {
+		b.lastTmpSweep = now()
+	}
+	b.mu.Unlock()
+	if due {
+		go func() {
+			sweepSignalTmpRoot(b.logger, b.configDir, signalRunTmpMaxAge)
+			sweepLegacyLibsignalTemp(b.logger)
+		}()
 	}
 }
 
@@ -1878,7 +1966,7 @@ func (b *Bridge) applyReactionToConversation(conversationID string, reaction *si
 		return nil
 	}
 	targetMessage.Reactions = nextReactions
-	if err := b.store.UpsertMessage(targetMessage); err != nil {
+	if err := b.store.UpdateMessageReactions(targetMessage.MessageID, nextReactions); err != nil {
 		return err
 	}
 	if b.callbacks.OnMessagesChange != nil {
@@ -2191,7 +2279,7 @@ func parseSignalAccounts(raw []byte) []string {
 	scanner := bufio.NewScanner(bytes.NewReader(raw))
 	for scanner.Scan() {
 		line := normalizeSignalAddress(scanner.Text())
-		if line != "" {
+		if isSignalAccountAddress(line) {
 			accounts = append(accounts, line)
 		}
 	}
@@ -2215,7 +2303,7 @@ func decodedSignalAccounts(raw []byte) []string {
 	accounts := make([]string, 0, 4)
 	appendAccount := func(number string) {
 		account := normalizeSignalAddress(number)
-		if account == "" {
+		if !isSignalAccountAddress(account) {
 			return
 		}
 		if _, ok := seen[account]; ok {
@@ -2425,6 +2513,19 @@ func signalConversationID(address, groupID string) string {
 
 func normalizeSignalAddress(value string) string {
 	return strings.TrimSpace(value)
+}
+
+func isSignalAccountAddress(value string) bool {
+	value = strings.TrimSpace(value)
+	if len(value) < 3 || value[0] != '+' {
+		return false
+	}
+	for _, r := range value[1:] {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // signalIncomingSourceID computes a stable SHA-1 message id from a Signal

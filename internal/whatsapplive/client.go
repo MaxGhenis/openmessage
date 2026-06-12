@@ -824,7 +824,7 @@ func (b *Bridge) SendReaction(conversationID, targetMessageID, emoji, action str
 		return nil
 	}
 	target.Reactions = nextReactions
-	if err := b.store.UpsertMessage(target); err != nil {
+	if err := b.store.UpdateMessageReactions(target.MessageID, nextReactions); err != nil {
 		return fmt.Errorf("store WhatsApp reaction update: %w", err)
 	}
 	if b.callbacks.OnMessagesChange != nil {
@@ -1146,6 +1146,65 @@ func (b *Bridge) reinitializeAfterLogout() {
 	b.emitStatusChange()
 }
 
+// handleProtocolMessage applies WhatsApp edits and revokes (deletions) to an
+// already-stored message. These arrive as ProtocolMessage envelopes that
+// extractMessageBody deliberately renders as "" — without this they'd be
+// silently dropped, leaving edited text stale and deleted messages present
+// forever. Returns true if the event was an edit/revoke (and thus consumed).
+func (b *Bridge) handleProtocolMessage(evt *waevents.Message) bool {
+	pm := unwrapWhatsAppMessage(evt.Message).GetProtocolMessage()
+	if pm == nil {
+		return false
+	}
+	switch pm.GetType() {
+	case waE2E.ProtocolMessage_REVOKE:
+		// REVOKE is the zero value, so only treat it as a deletion when there
+		// is a real target key — otherwise let it fall through to be skipped.
+		key := pm.GetKey()
+		if key == nil || strings.TrimSpace(key.GetID()) == "" {
+			return false
+		}
+		targetID := "whatsapp:" + key.GetID()
+		if err := b.store.DeleteMessageByID(targetID); err != nil {
+			b.logger.Debug().Err(err).Str("target_msg_id", targetID).Msg("Failed to delete revoked WhatsApp message")
+		}
+		if b.callbacks.OnMessagesChange != nil {
+			b.callbacks.OnMessagesChange(waConversationID(b.normalizeConversationJID(evt.Info.Chat)))
+		}
+		return true
+	case waE2E.ProtocolMessage_MESSAGE_EDIT:
+		key := pm.GetKey()
+		edited := pm.GetEditedMessage()
+		if key == nil || edited == nil || strings.TrimSpace(key.GetID()) == "" {
+			return true
+		}
+		targetID := "whatsapp:" + key.GetID()
+		newBody := extractMessageBody(edited)
+		if newBody == "" || newBody == "[Unsupported message]" {
+			return true
+		}
+		existing, err := b.store.GetMessageByID(targetID)
+		if err != nil || existing == nil {
+			// Edit for a message we never stored — nothing to update.
+			return true
+		}
+		conv, _ := b.store.GetConversation(existing.ConversationID)
+		existing.Body = b.formatMentionedBody(newBody, edited, conv)
+		if err := b.store.UpsertMessage(existing); err != nil {
+			b.logger.Debug().Err(err).Str("target_msg_id", targetID).Msg("Failed to apply WhatsApp edit")
+			return true
+		}
+		if b.callbacks.OnMessagesChange != nil {
+			b.callbacks.OnMessagesChange(existing.ConversationID)
+		}
+		return true
+	default:
+		// Other protocol messages (ephemeral settings, history sync, app-state
+		// key shares, …) are control traffic — let extractMessageBody skip them.
+		return false
+	}
+}
+
 func (b *Bridge) handleMessage(evt *waevents.Message) {
 	if evt == nil || evt.Message == nil {
 		return
@@ -1155,6 +1214,9 @@ func (b *Bridge) handleMessage(evt *waevents.Message) {
 		return
 	}
 	if b.handleReactionMessage(evt) {
+		return
+	}
+	if b.handleProtocolMessage(evt) {
 		return
 	}
 	// Encrypted reactions (communities/newsletters). We don't decrypt these
@@ -1181,13 +1243,15 @@ func (b *Bridge) handleMessage(evt *waevents.Message) {
 			Str("msg_id", string(evt.Info.ID)).
 			Str("chat", evt.Info.Chat.String()).
 			Str("content_types", describeWhatsAppMessageContent(evt.Message)).
-			Msg("WhatsApp message fell through to [Unsupported message]")
+			Msg("Skipping unsupported WhatsApp message placeholder")
+		return
 	}
 
 	conv, err := b.upsertConversationForMessage(evt)
 	if err != nil {
 		b.logger.Warn().Err(err).Str("chat", evt.Info.Chat.String()).Msg("Failed to upsert WhatsApp conversation")
 	}
+	body = b.formatMentionedBody(body, evt.Message, conv)
 	senderName, senderNumber := b.resolveSender(evt, conv)
 	msg := &db.Message{
 		MessageID:      "whatsapp:" + string(evt.Info.ID),
@@ -1269,7 +1333,7 @@ func (b *Bridge) handleReactionMessage(evt *waevents.Message) bool {
 	}
 
 	msg.Reactions = nextReactions
-	if err := b.store.UpsertMessage(msg); err != nil {
+	if err := b.store.UpdateMessageReactions(msg.MessageID, nextReactions); err != nil {
 		b.logger.Warn().Err(err).Str("target_msg_id", targetID).Msg("Failed to store WhatsApp reaction update")
 		return true
 	}
@@ -1558,6 +1622,176 @@ func (b *Bridge) resolveSender(evt *waevents.Message, convo *db.Conversation) (s
 	senderJID := b.canonicalJID(evt.Info.Sender)
 	name := b.contactDisplayName(senderJID, evt.Info.PushName)
 	return firstNonEmpty(name, fallbackChatName(senderJID)), b.phoneForJID(senderJID)
+}
+
+func (b *Bridge) formatMentionedBody(body string, msg *waE2E.Message, convo *db.Conversation) string {
+	body = strings.TrimSpace(body)
+	if body == "" {
+		return ""
+	}
+	ctx := messageContextInfo(msg)
+	if ctx == nil {
+		return body
+	}
+	mentioned := ctx.GetMentionedJID()
+	if len(mentioned) == 0 {
+		return body
+	}
+
+	type mentionReplacement struct {
+		token string
+		value string
+	}
+
+	replacements := make([]mentionReplacement, 0, len(mentioned)*2)
+	seen := make(map[string]struct{}, len(mentioned)*2)
+	for _, rawJID := range mentioned {
+		mentionedJID, err := watypes.ParseJID(strings.TrimSpace(rawJID))
+		if err != nil {
+			continue
+		}
+		label := b.whatsAppMentionLabel(mentionedJID, convo)
+		if label == "" {
+			continue
+		}
+		value := "@~" + label
+		for _, token := range b.whatsAppMentionTokens(mentionedJID) {
+			if token == "" || token == value {
+				continue
+			}
+			if _, ok := seen[token]; ok {
+				continue
+			}
+			seen[token] = struct{}{}
+			replacements = append(replacements, mentionReplacement{token: token, value: value})
+		}
+	}
+	sort.Slice(replacements, func(i, j int) bool {
+		if len(replacements[i].token) != len(replacements[j].token) {
+			return len(replacements[i].token) > len(replacements[j].token)
+		}
+		return replacements[i].token < replacements[j].token
+	})
+	for _, replacement := range replacements {
+		body = strings.ReplaceAll(body, replacement.token, replacement.value)
+	}
+	return body
+}
+
+func (b *Bridge) whatsAppMentionLabel(jid watypes.JID, convo *db.Conversation) string {
+	jid = b.canonicalJID(jid)
+	if name := b.groupParticipantName(convo, jid); !looksLikeMentionIdentifier(name) {
+		return shortMentionName(name)
+	}
+	if name := b.contactDisplayName(jid, ""); !looksLikeMentionIdentifier(name) {
+		return shortMentionName(name)
+	}
+	return ""
+}
+
+func (b *Bridge) whatsAppMentionTokens(jid watypes.JID) []string {
+	seen := map[string]struct{}{}
+	var tokens []string
+	add := func(raw string) {
+		raw = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(raw), "@"))
+		if raw == "" {
+			return
+		}
+		token := "@" + raw
+		if _, ok := seen[token]; ok {
+			return
+		}
+		seen[token] = struct{}{}
+		tokens = append(tokens, token)
+	}
+
+	jid = jid.ToNonAD()
+	add(jid.User)
+	canonical := b.canonicalJID(jid)
+	add(canonical.User)
+	add(normalizeMentionLookupKey(b.phoneForJID(jid)))
+	add(normalizeMentionLookupKey(b.phoneForJID(canonical)))
+	return tokens
+}
+
+func (b *Bridge) groupParticipantName(convo *db.Conversation, jid watypes.JID) string {
+	if convo == nil {
+		return ""
+	}
+	raw := strings.TrimSpace(convo.Participants)
+	if raw == "" || raw == "[]" {
+		return ""
+	}
+	var participants []participantJSON
+	if err := json.Unmarshal([]byte(raw), &participants); err != nil {
+		return ""
+	}
+	targetPhone := normalizeMentionLookupKey(b.phoneForJID(jid))
+	targetUser := normalizeMentionLookupKey(jid.User)
+	for _, participant := range participants {
+		if !participantMatchesMention(participant, targetPhone, targetUser) {
+			continue
+		}
+		return strings.TrimSpace(participant.Name)
+	}
+	return ""
+}
+
+func participantMatchesMention(participant participantJSON, targetPhone, targetUser string) bool {
+	candidate := normalizeMentionLookupKey(participant.Number)
+	if candidate == "" {
+		return false
+	}
+	return (targetPhone != "" && candidate == targetPhone) || (targetUser != "" && candidate == targetUser)
+}
+
+func normalizeMentionLookupKey(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	if digits := digitsOnly(value); digits != "" {
+		return digits
+	}
+	value = strings.TrimPrefix(value, "@")
+	value = strings.TrimPrefix(value, "+")
+	return strings.TrimSpace(value)
+}
+
+func looksLikeMentionIdentifier(value string) bool {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return true
+	}
+	if looksLikeRawIdentifier(value) {
+		return true
+	}
+	digits := digitsOnly(value)
+	return digits != "" && digits == value
+}
+
+func digitsOnly(value string) string {
+	var digits strings.Builder
+	for _, r := range value {
+		if r >= '0' && r <= '9' {
+			digits.WriteRune(r)
+		}
+	}
+	return digits.String()
+}
+
+func shortMentionName(value string) string {
+	value = strings.TrimSpace(value)
+	value = strings.TrimPrefix(value, "@~")
+	value = strings.TrimPrefix(value, "@")
+	if looksLikeMentionIdentifier(value) {
+		return ""
+	}
+	fields := strings.Fields(value)
+	if len(fields) == 0 {
+		return ""
+	}
+	return fields[0]
 }
 
 func (b *Bridge) contactDisplayName(jid watypes.JID, pushName string) string {
@@ -1902,7 +2136,7 @@ func shouldRequestUnavailablePlaceholder(msg *db.Message) bool {
 		return false
 	}
 	switch strings.TrimSpace(msg.Body) {
-	case "[Photo]", "[Video]", "[Audio]", "[Voice note]":
+	case "[Photo]", "[Video]", "[Audio]", "[Voice note]", "[Sticker]":
 		return true
 	default:
 		return false
@@ -2230,6 +2464,15 @@ func extractStoredMediaRef(msg *waE2E.Message) (storedMediaRef, []byte, string, 
 			FileEncSHA256: encodeBytes(part.GetFileEncSHA256()),
 			FileLength:    part.GetFileLength(),
 		}, part.GetMediaKey(), part.GetMimetype(), true
+	case msg.GetStickerMessage() != nil:
+		part := msg.GetStickerMessage()
+		return storedMediaRef{
+			URL:           strings.TrimSpace(part.GetURL()),
+			DirectPath:    strings.TrimSpace(part.GetDirectPath()),
+			FileSHA256:    encodeBytes(part.GetFileSHA256()),
+			FileEncSHA256: encodeBytes(part.GetFileEncSHA256()),
+			FileLength:    part.GetFileLength(),
+		}, part.GetMediaKey(), firstNonEmpty(strings.TrimSpace(part.GetMimetype()), "image/webp"), true
 	default:
 		return storedMediaRef{}, nil, "", false
 	}
@@ -2449,12 +2692,13 @@ func extractMessageBody(msg *waE2E.Message) string {
 		msg.GetPlaceholderMessage() != nil,
 		msg.GetSecretEncryptedMessage() != nil,
 		msg.GetMessageContextInfo() != nil && proto.Size(msg) <= proto.Size(msg.GetMessageContextInfo())+4:
-		// Control/sync traffic that should never surface in a thread:
-		// group-key rotations, admin protocol events (revoke/edit/ephemeral
-		// settings/history sync/etc — revoke and edit are handled by their
-		// own ingestion paths, not here), disappearing-message key shares,
-		// and lone MessageContextInfo envelopes. Returning empty causes
-		// handleMessageEvent to skip the insert rather than render a row.
+		// Control/sync traffic that should never surface as a new thread row:
+		// group-key rotations, admin protocol events (ephemeral settings,
+		// history sync, etc.), disappearing-message key shares, and lone
+		// MessageContextInfo envelopes. Revoke (delete) and MESSAGE_EDIT are
+		// intercepted earlier by handleProtocolMessage, which mutates the
+		// existing row; everything else here returns empty so the insert is
+		// skipped rather than rendered.
 		return ""
 	case hasUnsupportedWhatsAppContent(msg):
 		return "[Unsupported message]"

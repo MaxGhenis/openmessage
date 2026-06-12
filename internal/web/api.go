@@ -8,11 +8,14 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"net"
 	"net/http"
+	"net/url"
 	"runtime"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -78,9 +81,12 @@ type SearchResult struct {
 	ConversationID string `json:"ConversationID"`
 	Name           string `json:"Name"`
 	IsGroup        bool   `json:"IsGroup"`
+	Participants   string `json:"Participants,omitempty"`
 	LastMessageTS  int64  `json:"LastMessageTS"`
 	UnreadCount    int    `json:"UnreadCount"`
 	SourcePlatform string `json:"source_platform,omitempty"`
+	UnifiedID      string `json:"unified_id,omitempty"`
+	UnifiedName    string `json:"unified_name,omitempty"`
 	Preview        string `json:"preview,omitempty"`
 }
 
@@ -134,6 +140,61 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			opts.Events.PublishStatus(connected)
 		}
 	}
+	// Per-platform data-freshness, used to catch "zombie" bridges that report
+	// connected=true while no longer actually syncing (the connection flag
+	// lies; the data doesn't). Computing this scans the messages table, and
+	// /api/status is polled every few seconds, so cache it — staleness is a
+	// multi-day signal, so a 30s cache is plenty fresh.
+	var (
+		freshnessMu       sync.Mutex
+		freshnessComputed time.Time
+		freshnessValue    map[string]any
+	)
+	computeFreshness := func() map[string]any {
+		freshnessMu.Lock()
+		defer freshnessMu.Unlock()
+		if freshnessValue != nil && time.Since(freshnessComputed) < 30*time.Second {
+			return freshnessValue
+		}
+		stats, err := store.PlatformStats()
+		if err != nil {
+			return freshnessValue // keep last good value on error
+		}
+		var newest int64
+		for _, st := range stats {
+			if st.LatestMS > newest {
+				newest = st.LatestMS
+			}
+		}
+		// Map storage platform → status-block key (Google Messages stores SMS/RCS).
+		keyFor := map[string]string{"sms": "google", "rcs": "google", "whatsapp": "whatsapp", "signal": "signal"}
+		out := map[string]any{"newest_ms": newest}
+		for _, st := range stats {
+			key := keyFor[st.Platform]
+			if key == "" {
+				continue
+			}
+			behind := daysBehind(st.LatestMS, newest)
+			entry := map[string]any{
+				"latest_ms":          st.LatestMS,
+				"latest_received_ms": st.LatestRecvMS,
+				"behind_days":        behind,
+				"stale":              st.LatestMS > 0 && behind >= staleDaysThreshold,
+			}
+			// sms + rcs both map to "google"; keep the freshest.
+			if existing, ok := out[key].(map[string]any); ok {
+				if st.LatestMS > existing["latest_ms"].(int64) {
+					out[key] = entry
+				}
+			} else {
+				out[key] = entry
+			}
+		}
+		freshnessValue = out
+		freshnessComputed = time.Now()
+		return out
+	}
+
 	statusPayload := func(connected bool) map[string]any {
 		payload := map[string]any{
 			"connected": connected,
@@ -152,6 +213,9 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		}
 		if opts.BackfillStatus != nil {
 			payload["backfill"] = opts.BackfillStatus()
+		}
+		if f := computeFreshness(); f != nil {
+			payload["freshness"] = f
 		}
 		return payload
 	}
@@ -401,7 +465,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 	})
 
 	mux.HandleFunc("/api/conversations", func(w http.ResponseWriter, r *http.Request) {
-		limit := queryInt(r, "limit", 50)
+		limit := queryIntClamped(r, "limit", 50, 500)
 		convos, err := store.ListConversations(limit)
 		if err != nil {
 			httpError(w, "list conversations: "+err.Error(), 500)
@@ -410,6 +474,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		if convos == nil {
 			convos = []*db.Conversation{}
 		}
+		enrichUnifiedConversationIdentities(store, convos)
 		writeJSON(w, convos)
 	})
 
@@ -447,11 +512,36 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			writeJSON(w, convo)
 			return
 		}
+		if action == "tab" {
+			if r.Method != http.MethodPost && r.Method != http.MethodPatch {
+				httpError(w, "method not allowed", 405)
+				return
+			}
+			var req struct {
+				Tab string `json:"tab"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				httpError(w, "invalid JSON: "+err.Error(), 400)
+				return
+			}
+			if err := store.SetConversationTab(convID, req.Tab); err != nil {
+				httpError(w, "set tab: "+err.Error(), 400)
+				return
+			}
+			convo, err := store.GetConversation(convID)
+			if err != nil {
+				httpError(w, "get conversation: "+err.Error(), 500)
+				return
+			}
+			publishConversations()
+			writeJSON(w, convo)
+			return
+		}
 		if action != "messages" {
 			httpError(w, "not found", 404)
 			return
 		}
-		limit := queryInt(r, "limit", 100)
+		limit := queryIntClamped(r, "limit", 100, 1000)
 		beforeMS := queryInt64(r, "before", 0)
 		afterMS := queryInt64(r, "after", 0)
 		beforeID := r.URL.Query().Get("before_id")
@@ -485,6 +575,99 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			msgs = []*db.Message{}
 		}
 		writeJSON(w, msgs)
+	})
+
+	// Bulk-move multiple conversations into a tab ("" = Recent, "archive", or a custom tab id).
+	mux.HandleFunc("/api/conversations/move", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			httpError(w, "method not allowed", 405)
+			return
+		}
+		var req struct {
+			IDs []string `json:"ids"`
+			Tab string   `json:"tab"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			httpError(w, "invalid JSON: "+err.Error(), 400)
+			return
+		}
+		if len(req.IDs) == 0 {
+			httpError(w, "ids is required", 400)
+			return
+		}
+		if err := store.SetConversationsTab(req.IDs, req.Tab); err != nil {
+			httpError(w, "move conversations: "+err.Error(), 400)
+			return
+		}
+		publishConversations()
+		writeJSON(w, map[string]any{"moved": len(req.IDs), "tab": strings.TrimSpace(req.Tab)})
+	})
+
+	// List (GET) or create (POST) custom tabs.
+	mux.HandleFunc("/api/tabs", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			tabs, err := store.ListTabs()
+			if err != nil {
+				httpError(w, "list tabs: "+err.Error(), 500)
+				return
+			}
+			if tabs == nil {
+				tabs = []*db.Tab{}
+			}
+			writeJSON(w, tabs)
+		case http.MethodPost:
+			var req struct {
+				Name string `json:"name"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				httpError(w, "invalid JSON: "+err.Error(), 400)
+				return
+			}
+			tab, err := store.CreateTab(req.Name)
+			if err != nil {
+				httpError(w, "create tab: "+err.Error(), 400)
+				return
+			}
+			publishConversations()
+			writeJSON(w, tab)
+		default:
+			httpError(w, "method not allowed", 405)
+		}
+	})
+
+	// Rename (POST) or delete (DELETE) a custom tab by id.
+	mux.HandleFunc("/api/tabs/", func(w http.ResponseWriter, r *http.Request) {
+		tabID := strings.TrimPrefix(r.URL.Path, "/api/tabs/")
+		if tabID == "" {
+			httpError(w, "tab id required", 400)
+			return
+		}
+		switch r.Method {
+		case http.MethodPost, http.MethodPatch:
+			var req struct {
+				Name string `json:"name"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				httpError(w, "invalid JSON: "+err.Error(), 400)
+				return
+			}
+			if err := store.RenameTab(tabID, req.Name); err != nil {
+				httpError(w, "rename tab: "+err.Error(), 400)
+				return
+			}
+			publishConversations()
+			writeJSON(w, map[string]any{"tab_id": tabID, "name": strings.TrimSpace(req.Name)})
+		case http.MethodDelete:
+			if err := store.DeleteTab(tabID); err != nil {
+				httpError(w, "delete tab: "+err.Error(), 400)
+				return
+			}
+			publishConversations()
+			writeJSON(w, map[string]any{"deleted": tabID})
+		default:
+			httpError(w, "method not allowed", 405)
+		}
 	})
 
 	mux.HandleFunc("/api/contacts", func(w http.ResponseWriter, r *http.Request) {
@@ -534,7 +717,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			httpError(w, "query parameter 'q' is required", 400)
 			return
 		}
-		limit := queryInt(r, "limit", 50)
+		limit := queryIntClamped(r, "limit", 50, 500)
 		msgs, err := store.SearchMessages(q, "", limit)
 		if err != nil {
 			httpError(w, "search: "+err.Error(), 500)
@@ -646,7 +829,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		// Fetch conversation to get SIM and participant info
 		conv, err := cli.GM.GetConversation(req.ConversationID)
 		if err != nil {
-			httpError(w, "get conversation: "+err.Error(), 502)
+			httpError(w, googleAPIErrorMessage("get conversation", err), 502)
 			return
 		}
 
@@ -662,7 +845,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 
 		resp, err := cli.GM.SendMessage(payload)
 		if err != nil {
-			httpError(w, "send message: "+err.Error(), 502)
+			httpError(w, googleAPIErrorMessage("send message", err), 502)
 			return
 		}
 		success := resp.GetStatus() == gmproto.SendMessageResponse_SUCCESS
@@ -798,14 +981,14 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		// Upload media via libgm
 		media, err := cli.GM.UploadMedia(data, header.Filename, mime)
 		if err != nil {
-			httpError(w, "upload media: "+err.Error(), 502)
+			httpError(w, googleAPIErrorMessage("upload media", err), 502)
 			return
 		}
 
 		// Get SIM and participant info
 		conv, err := cli.GM.GetConversation(convID)
 		if err != nil {
-			httpError(w, "get conversation: "+err.Error(), 502)
+			httpError(w, googleAPIErrorMessage("get conversation", err), 502)
 			return
 		}
 
@@ -822,7 +1005,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 
 		resp, err := cli.GM.SendMessage(payload)
 		if err != nil {
-			httpError(w, "send message: "+err.Error(), 502)
+			httpError(w, googleAPIErrorMessage("send message", err), 502)
 			return
 		}
 		success := resp.GetStatus() == gmproto.SendMessageResponse_SUCCESS
@@ -931,7 +1114,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		}
 		data, err := cli.GM.DownloadMedia(msg.MediaID, key)
 		if err != nil {
-			httpError(w, "download media: "+err.Error(), 502)
+			httpError(w, googleAPIErrorMessage("download media", err), 502)
 			return
 		}
 		w.Header().Set("Content-Type", msg.MimeType)
@@ -1002,7 +1185,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		payload := app.BuildReactionPayload(req.MessageID, req.Emoji, req.Action, sim)
 		resp, err := cli.GM.SendReaction(payload)
 		if err != nil {
-			httpError(w, "send reaction: "+err.Error(), 502)
+			httpError(w, googleAPIErrorMessage("send reaction", err), 502)
 			return
 		}
 		writeJSON(w, map[string]any{
@@ -1081,7 +1264,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			Numbers: app.NewContactNumbers([]string{req.PhoneNumber}),
 		})
 		if err != nil {
-			httpError(w, "failed to get/create conversation: "+err.Error(), 502)
+			httpError(w, googleAPIErrorMessage("failed to get/create conversation", err), 502)
 			return
 		}
 		conv := convResp.GetConversation()
@@ -1242,7 +1425,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		// Use the same send logic as /api/send
 		conv, err := cli.GM.GetConversation(draft.ConversationID)
 		if err != nil {
-			httpError(w, "get conversation: "+err.Error(), 502)
+			httpError(w, googleAPIErrorMessage("get conversation", err), 502)
 			return
 		}
 
@@ -1257,7 +1440,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 
 		resp, err := cli.GM.SendMessage(payload)
 		if err != nil {
-			httpError(w, "send message: "+err.Error(), 502)
+			httpError(w, googleAPIErrorMessage("send message", err), 502)
 			return
 		}
 		success := resp.GetStatus() == gmproto.SendMessageResponse_SUCCESS
@@ -1357,7 +1540,13 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			httpError(w, "no messages found", 404)
 			return
 		}
-		apiKey := r.URL.Query().Get("api_key")
+		// Prefer the API key from a header — secrets in query strings leak into
+		// logs, history, and proxies. The query param is kept only as a
+		// deprecated fallback for existing callers.
+		apiKey := strings.TrimSpace(r.Header.Get("X-Anthropic-Api-Key"))
+		if apiKey == "" {
+			apiKey = r.URL.Query().Get("api_key")
+		}
 		style := r.URL.Query().Get("style")
 		s, err := story.Generate(msgs, story.GenerateConfig{
 			Style:             style,
@@ -1378,7 +1567,11 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		}
 		if opts.StartDeepBackfill != nil {
 			if !opts.StartDeepBackfill() {
-				httpError(w, "deep backfill already running", 409)
+				// Could be a deep backfill OR the shallow startup catch-up
+				// holding the shared guard — keep the message generic and
+				// consistent with /api/backfill/status (which now reports
+				// running=true in both cases).
+				httpError(w, "a sync is already running — try again in a moment", 409)
 				return
 			}
 			writeJSON(w, map[string]string{"status": "started"})
@@ -1419,7 +1612,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			return
 		}
 		if err := opts.BackfillPhone(req.PhoneNumber); err != nil {
-			httpError(w, "backfill phone: "+err.Error(), 502)
+			httpError(w, googleAPIErrorMessage("backfill phone", err), 502)
 			return
 		}
 		publishConversations()
@@ -1445,7 +1638,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			return
 		}
 		if err := opts.ReconnectGoogle(); err != nil {
-			httpError(w, "reconnect google messages: "+err.Error(), 502)
+			httpError(w, googleAPIErrorMessage("reconnect google messages", err), 502)
 			return
 		}
 		publishStatus(currentConnected())
@@ -1687,8 +1880,9 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 	mux.Handle("/", staticHandler)
 
 	// Wrap the mux to intercept /mcp/ requests before the mux's catch-all
+	var handler http.Handler = mux
 	if mcpHandler != nil {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if strings.HasPrefix(r.URL.Path, "/mcp/") {
 				mcpHandler.ServeHTTP(w, r)
 				return
@@ -1697,12 +1891,62 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		})
 	}
 
-	return mux
+	// Guard the HTTP API against cross-origin / DNS-rebinding abuse. The server
+	// binds to 127.0.0.1, but that does NOT stop a malicious web page the user
+	// visits from POSTing to http://127.0.0.1:<port>/api/... (multipart and
+	// body-less POSTs are CORS "simple requests" with no preflight) — which
+	// could drive-by send messages or unpair accounts. Requiring a loopback
+	// Host and (when present) a loopback Origin/Referer closes that vector
+	// without affecting the native app, whose requests are same-origin.
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/api/") && !isLocalAPIRequest(r) {
+			httpError(w, "forbidden: API requests must originate from the local OpenMessage app", http.StatusForbidden)
+			return
+		}
+		handler.ServeHTTP(w, r)
+	})
+}
+
+// isLoopbackHost reports whether a bare hostname refers to this machine's
+// loopback interface.
+func isLoopbackHost(hostname string) bool {
+	switch strings.ToLower(strings.Trim(hostname, "[]")) {
+	case "127.0.0.1", "localhost", "::1":
+		return true
+	}
+	return false
+}
+
+// isLocalAPIRequest validates that an /api/ request originates from the local
+// app rather than a cross-origin web page: the Host must be loopback (defends
+// DNS rebinding), and any Origin/Referer the browser attached must be loopback
+// too (defends drive-by cross-origin POSTs). Same-origin GETs carry no Origin
+// and pass; the native WKWebView is same-origin on 127.0.0.1 and passes.
+func isLocalAPIRequest(r *http.Request) bool {
+	host := r.Host
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	if host != "" && !isLoopbackHost(host) {
+		return false
+	}
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		origin = r.Header.Get("Referer")
+	}
+	if origin != "" {
+		u, err := url.Parse(origin)
+		if err != nil || !isLoopbackHost(u.Hostname()) {
+			return false
+		}
+	}
+	return true
 }
 
 func mergeSearchResults(store *db.Store, msgs []*db.Message, convos []*db.Conversation, limit int) []SearchResult {
 	results := make([]SearchResult, 0, limit)
 	seen := make(map[string]struct{}, limit)
+	identityIndex := loadUnifiedIdentityIndex(store)
 
 	appendResult := func(result SearchResult) {
 		if _, ok := seen[result.ConversationID]; ok {
@@ -1717,15 +1961,7 @@ func mergeSearchResults(store *db.Store, msgs []*db.Message, convos []*db.Conver
 		if err != nil || conv == nil {
 			continue
 		}
-		appendResult(SearchResult{
-			ConversationID: conv.ConversationID,
-			Name:           conv.Name,
-			IsGroup:        conv.IsGroup,
-			LastMessageTS:  msg.TimestampMS,
-			UnreadCount:    conv.UnreadCount,
-			SourcePlatform: conv.SourcePlatform,
-			Preview:        searchPreviewForMessage(msg),
-		})
+		appendResult(searchResultForConversation(conv, msg.TimestampMS, searchPreviewForMessage(msg), identityIndex))
 	}
 
 	for _, conv := range convos {
@@ -1737,15 +1973,7 @@ func mergeSearchResults(store *db.Store, msgs []*db.Message, convos []*db.Conver
 		if err == nil && len(msgs) > 0 {
 			preview = searchPreviewForMessage(msgs[0])
 		}
-		appendResult(SearchResult{
-			ConversationID: conv.ConversationID,
-			Name:           conv.Name,
-			IsGroup:        conv.IsGroup,
-			LastMessageTS:  conv.LastMessageTS,
-			UnreadCount:    conv.UnreadCount,
-			SourcePlatform: conv.SourcePlatform,
-			Preview:        preview,
-		})
+		appendResult(searchResultForConversation(conv, conv.LastMessageTS, preview, identityIndex))
 	}
 
 	sort.Slice(results, func(i, j int) bool {
@@ -1758,6 +1986,161 @@ func mergeSearchResults(store *db.Store, msgs []*db.Message, convos []*db.Conver
 		results = results[:limit]
 	}
 	return results
+}
+
+type unifiedConversationIdentity struct {
+	ID   string
+	Name string
+}
+
+type unifiedIdentifier struct {
+	Platform string `json:"platform"`
+	Value    string `json:"value"`
+}
+
+type conversationParticipant struct {
+	Name      string `json:"name"`
+	Number    string `json:"number"`
+	Phone     string `json:"phone"`
+	Email     string `json:"email"`
+	ID        string `json:"id"`
+	IsMe      bool   `json:"is_me"`
+	IsMeCamel bool   `json:"isMe"`
+}
+
+func enrichUnifiedConversationIdentities(store *db.Store, convos []*db.Conversation) {
+	identityIndex := loadUnifiedIdentityIndex(store)
+	if len(identityIndex) == 0 {
+		return
+	}
+	for _, conv := range convos {
+		if identity, ok := unifiedIdentityForConversation(conv, identityIndex); ok {
+			conv.UnifiedID = identity.ID
+			conv.UnifiedName = identity.Name
+		}
+	}
+}
+
+func loadUnifiedIdentityIndex(store *db.Store) map[string]unifiedConversationIdentity {
+	contacts, err := store.ListUnifiedContacts("", 10000)
+	if err != nil || len(contacts) == 0 {
+		return nil
+	}
+	index := make(map[string]unifiedConversationIdentity)
+	for _, contact := range contacts {
+		if contact == nil || strings.TrimSpace(contact.UnifiedID) == "" {
+			continue
+		}
+		var identifiers []unifiedIdentifier
+		if err := json.Unmarshal([]byte(contact.Identifiers), &identifiers); err != nil {
+			continue
+		}
+		identity := unifiedConversationIdentity{
+			ID:   strings.TrimSpace(contact.UnifiedID),
+			Name: strings.TrimSpace(contact.DisplayName),
+		}
+		for _, identifier := range identifiers {
+			key := unifiedIdentifierKey(identifier.Platform, identifier.Value)
+			if key == "" {
+				continue
+			}
+			index[key] = identity
+		}
+	}
+	return index
+}
+
+func searchResultForConversation(conv *db.Conversation, timestamp int64, preview string, identityIndex map[string]unifiedConversationIdentity) SearchResult {
+	result := SearchResult{
+		ConversationID: conv.ConversationID,
+		Name:           conv.Name,
+		IsGroup:        conv.IsGroup,
+		Participants:   conv.Participants,
+		LastMessageTS:  timestamp,
+		UnreadCount:    conv.UnreadCount,
+		SourcePlatform: conv.SourcePlatform,
+		Preview:        preview,
+	}
+	if identity, ok := unifiedIdentityForConversation(conv, identityIndex); ok {
+		result.UnifiedID = identity.ID
+		result.UnifiedName = identity.Name
+	}
+	return result
+}
+
+func unifiedIdentityForConversation(conv *db.Conversation, identityIndex map[string]unifiedConversationIdentity) (unifiedConversationIdentity, bool) {
+	if conv == nil || conv.IsGroup || len(identityIndex) == 0 {
+		return unifiedConversationIdentity{}, false
+	}
+	participantID := primaryConversationParticipantID(conv)
+	if participantID == "" {
+		return unifiedConversationIdentity{}, false
+	}
+	identity, ok := identityIndex[unifiedIdentifierKey(conv.SourcePlatform, participantID)]
+	return identity, ok
+}
+
+func primaryConversationParticipantID(conv *db.Conversation) string {
+	if conv == nil || strings.TrimSpace(conv.Participants) == "" {
+		return ""
+	}
+	var participants []conversationParticipant
+	if err := json.Unmarshal([]byte(conv.Participants), &participants); err != nil {
+		return ""
+	}
+	for _, participant := range participants {
+		if participant.IsMe || participant.IsMeCamel {
+			continue
+		}
+		if id := participantIdentifier(participant); id != "" {
+			return id
+		}
+	}
+	if len(participants) == 0 {
+		return ""
+	}
+	return participantIdentifier(participants[0])
+}
+
+func participantIdentifier(participant conversationParticipant) string {
+	for _, value := range []string{participant.Number, participant.Phone, participant.Email, participant.ID} {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func unifiedIdentifierKey(platform, value string) string {
+	platform = strings.ToLower(strings.TrimSpace(platform))
+	value = normalizeUnifiedIdentifier(value)
+	if platform == "" || value == "" {
+		return ""
+	}
+	return platform + "\x00" + value
+}
+
+func normalizeUnifiedIdentifier(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "" {
+		return ""
+	}
+	digits := make([]byte, 0, len(value))
+	phoneLike := true
+	for i := 0; i < len(value); i++ {
+		c := value[i]
+		switch {
+		case c >= '0' && c <= '9':
+			digits = append(digits, c)
+		case c == '+' || c == '(' || c == ')' || c == '-' || c == '.' || c == ' ':
+		default:
+			phoneLike = false
+		}
+	}
+	if phoneLike && len(digits) >= 7 {
+		return string(digits)
+	}
+	return value
 }
 
 func searchPreviewForMessage(msg *db.Message) string {
@@ -1802,6 +2185,43 @@ func httpError(w http.ResponseWriter, msg string, code int) {
 	json.NewEncoder(w).Encode(map[string]string{"error": msg})
 }
 
+func googleAPIErrorMessage(action string, err error) string {
+	if isGoogleNetworkError(err) {
+		return "Google Messages is offline. Check your internet connection, then try again."
+	}
+	return action + ": " + err.Error()
+}
+
+func isGoogleNetworkError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	needles := []string{
+		"instantmessaging-pa.clients6.google.com",
+		"google.internal.communications.instantmessaging",
+		"no such host",
+		"temporary failure in name resolution",
+		"server misbehaving",
+		"dial tcp",
+		"lookup ",
+		"network is unreachable",
+		"no route to host",
+		"i/o timeout",
+		"context deadline exceeded",
+		"client.timeout exceeded",
+		"tls handshake timeout",
+		"connection refused",
+		"connection reset by peer",
+	}
+	for _, needle := range needles {
+		if strings.Contains(message, needle) {
+			return true
+		}
+	}
+	return false
+}
+
 // normalizeContactKey returns a stable dedup key for a contact entry. We
 // fold names case-insensitively and reduce phone numbers to digits-only so
 // that "+1 (650) 555-1234", "16505551234", and "650-555-1234" all collide.
@@ -1838,4 +2258,31 @@ func queryInt64(r *http.Request, key string, defaultVal int64) int64 {
 		return defaultVal
 	}
 	return n
+}
+
+// queryIntClamped reads an int "limit"-style param and clamps it to [1, max],
+// falling back to def for missing/non-positive values. SQLite treats LIMIT -1
+// as "no limit", so an unclamped negative/zero limit would return the entire
+// table — an unbounded-response/DoS vector.
+func queryIntClamped(r *http.Request, key string, def, max int) int {
+	n := queryInt(r, key, def)
+	if n <= 0 {
+		n = def
+	}
+	if n > max {
+		n = max
+	}
+	return n
+}
+
+// staleDaysThreshold is how many whole days a platform's latest message may
+// trail the newest message overall before it's flagged as not syncing.
+const staleDaysThreshold = 3
+
+// daysBehind returns how many whole days `older` trails `newer` (0 if not behind).
+func daysBehind(older, newer int64) int {
+	if older <= 0 || newer <= older {
+		return 0
+	}
+	return int(time.UnixMilli(newer).Sub(time.UnixMilli(older)).Hours() / 24)
 }

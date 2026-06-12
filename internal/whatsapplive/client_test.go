@@ -1500,6 +1500,61 @@ func TestHandleMessageMarksMentionsFromWhatsAppContextInfo(t *testing.T) {
 	}
 }
 
+func TestHandleMessageFormatsMentionedNamesLikeWhatsApp(t *testing.T) {
+	store, err := db.New(filepath.Join(t.TempDir(), "messages.db"))
+	if err != nil {
+		t.Fatalf("db.New(): %v", err)
+	}
+	defer store.Close()
+
+	if err := store.UpsertConversation(&db.Conversation{
+		ConversationID: "whatsapp:120363019999999999@g.us",
+		Name:           "Hobbies and investing",
+		IsGroup:        true,
+		Participants:   `[{"name":"Priya Shah","number":"+261997383958549"},{"name":"Jordan Thibodeau","number":"+15551234567"}]`,
+		SourcePlatform: "whatsapp",
+	}); err != nil {
+		t.Fatalf("seed conversation: %v", err)
+	}
+
+	bridge := &Bridge{store: store}
+	bridge.handleMessage(&waevents.Message{
+		Info: watypes.MessageInfo{
+			MessageSource: watypes.MessageSource{
+				Chat:     watypes.NewJID("120363019999999999", watypes.GroupServer),
+				Sender:   watypes.NewJID("15551234567", watypes.DefaultUserServer),
+				IsFromMe: false,
+				IsGroup:  true,
+			},
+			ID:        "mention-name",
+			PushName:  "Jordan",
+			Timestamp: time.UnixMilli(1775001000000),
+		},
+		Message: &waE2E.Message{
+			ExtendedTextMessage: &waE2E.ExtendedTextMessage{
+				Text: strPtr(`I feel like I need to start charging people a monthly fee to see @261997383958549's posts "Thibodeau premium" or something.`),
+				ContextInfo: &waE2E.ContextInfo{
+					MentionedJID: []string{"261997383958549@s.whatsapp.net"},
+				},
+			},
+		},
+	})
+
+	msg, err := store.GetMessageByID("whatsapp:mention-name")
+	if err != nil {
+		t.Fatalf("GetMessageByID(): %v", err)
+	}
+	if msg == nil {
+		t.Fatal("expected stored WhatsApp message")
+	}
+	if !strings.Contains(msg.Body, "@~Priya's posts") {
+		t.Fatalf("body = %q, want @~Priya mention", msg.Body)
+	}
+	if strings.Contains(msg.Body, "@261997383958549") {
+		t.Fatalf("body = %q, did not expect raw numeric mention", msg.Body)
+	}
+}
+
 func TestConnectIfPairedStartsAsyncConnect(t *testing.T) {
 	ownJID := watypes.NewJID("15551230000", watypes.DefaultUserServer)
 	bridge := &Bridge{
@@ -2149,6 +2204,88 @@ func TestHandleMessageStoresWrappedWhatsAppAudio(t *testing.T) {
 	}
 }
 
+func TestHandleMessageStoresWhatsAppStickerMedia(t *testing.T) {
+	store, err := db.New(filepath.Join(t.TempDir(), "messages.db"))
+	if err != nil {
+		t.Fatalf("db.New(): %v", err)
+	}
+	defer store.Close()
+
+	bridge := &Bridge{store: store}
+	bridge.handleMessage(&waevents.Message{
+		Info: watypes.MessageInfo{
+			MessageSource: watypes.MessageSource{
+				Chat:   watypes.NewJID("15551234567", watypes.DefaultUserServer),
+				Sender: watypes.NewJID("15551234567", watypes.DefaultUserServer),
+			},
+			ID:        "sticker-msg",
+			Timestamp: time.UnixMilli(1700000003234),
+		},
+		Message: &waE2E.Message{
+			StickerMessage: &waE2E.StickerMessage{
+				Mimetype:      strPtr("image/webp"),
+				URL:           strPtr("https://cdn.example.test/sticker"),
+				DirectPath:    strPtr("/mms/sticker"),
+				MediaKey:      []byte{0x01, 0x02},
+				FileSHA256:    []byte{0x03, 0x04},
+				FileEncSHA256: []byte{0x05, 0x06},
+				FileLength:    uint64Ptr(7),
+			},
+		},
+	})
+
+	msg, err := store.GetMessageByID("whatsapp:sticker-msg")
+	if err != nil {
+		t.Fatalf("GetMessageByID(): %v", err)
+	}
+	if msg == nil {
+		t.Fatal("expected stored sticker message")
+	}
+	if msg.Body != "[Sticker]" {
+		t.Fatalf("body = %q, want [Sticker]", msg.Body)
+	}
+	if msg.MimeType != "image/webp" {
+		t.Fatalf("mime_type = %q, want image/webp", msg.MimeType)
+	}
+	if msg.MediaID == "" {
+		t.Fatal("expected media_id to be stored")
+	}
+	if msg.DecryptionKey != "0102" {
+		t.Fatalf("decryption_key = %q, want 0102", msg.DecryptionKey)
+	}
+}
+
+func TestHandleMessageSkipsUnsupportedWhatsAppPlaceholders(t *testing.T) {
+	store, err := db.New(filepath.Join(t.TempDir(), "messages.db"))
+	if err != nil {
+		t.Fatalf("db.New(): %v", err)
+	}
+	defer store.Close()
+
+	bridge := &Bridge{store: store}
+	bridge.handleMessage(&waevents.Message{
+		Info: watypes.MessageInfo{
+			MessageSource: watypes.MessageSource{
+				Chat:   watypes.NewJID("15551234567", watypes.DefaultUserServer),
+				Sender: watypes.NewJID("15551234567", watypes.DefaultUserServer),
+			},
+			ID:        "unsupported-msg",
+			Timestamp: time.UnixMilli(1700000004234),
+		},
+		Message: &waE2E.Message{
+			SendPaymentMessage: &waE2E.SendPaymentMessage{},
+		},
+	})
+
+	msg, err := store.GetMessageByID("whatsapp:unsupported-msg")
+	if err != nil {
+		t.Fatalf("GetMessageByID(): %v", err)
+	}
+	if msg != nil {
+		t.Fatalf("expected unsupported placeholder to be skipped, got %+v", msg)
+	}
+}
+
 func TestHandleMessageAppliesWhatsAppReactionsToTargetMessage(t *testing.T) {
 	store, err := db.New(filepath.Join(t.TempDir(), "messages.db"))
 	if err != nil {
@@ -2237,6 +2374,96 @@ func TestHandleMessageAppliesWhatsAppReactionsToTargetMessage(t *testing.T) {
 	if strings.TrimSpace(msg.Reactions) != "" {
 		t.Fatalf("expected reactions to be cleared, got %q", msg.Reactions)
 	}
+}
+
+func TestHandleProtocolMessageEditsAndRevokes(t *testing.T) {
+	store, err := db.New(filepath.Join(t.TempDir(), "messages.db"))
+	if err != nil {
+		t.Fatalf("db.New(): %v", err)
+	}
+	defer store.Close()
+
+	seed := func(id, body string) {
+		if err := store.UpsertMessage(&db.Message{
+			MessageID:      "whatsapp:" + id,
+			ConversationID: "whatsapp:15551234567@s.whatsapp.net",
+			SenderName:     "Jenn",
+			SenderNumber:   "+15551234567",
+			Body:           body,
+			TimestampMS:    1700000000000,
+			MediaID:        "media-keep",
+			SourcePlatform: "whatsapp",
+			SourceID:       id,
+		}); err != nil {
+			t.Fatalf("seed %s: %v", id, err)
+		}
+	}
+
+	bridge := &Bridge{store: store}
+	protocolEvent := func(eventID string, pm *waE2E.ProtocolMessage) *waevents.Message {
+		return &waevents.Message{
+			Info: watypes.MessageInfo{
+				MessageSource: watypes.MessageSource{
+					Chat:   watypes.NewJID("15551234567", watypes.DefaultUserServer),
+					Sender: watypes.NewJID("15551234567", watypes.DefaultUserServer),
+				},
+				ID:        watypes.MessageID(eventID),
+				Timestamp: time.UnixMilli(1700000002000),
+			},
+			Message: &waE2E.Message{ProtocolMessage: pm},
+		}
+	}
+
+	t.Run("edit updates body, preserves media", func(t *testing.T) {
+		seed("edit-target", "original text")
+		bridge.handleMessage(protocolEvent("edit-evt", &waE2E.ProtocolMessage{
+			Type: waE2E.ProtocolMessage_MESSAGE_EDIT.Enum(),
+			Key:  &waCommon.MessageKey{ID: strPtr("edit-target")},
+			EditedMessage: &waE2E.Message{
+				Conversation: strPtr("edited text"),
+			},
+		}))
+		got, err := store.GetMessageByID("whatsapp:edit-target")
+		if err != nil || got == nil {
+			t.Fatalf("get edited: %v / %v", got, err)
+		}
+		if got.Body != "edited text" {
+			t.Errorf("edit not applied: got %q, want %q", got.Body, "edited text")
+		}
+		if got.MediaID != "media-keep" {
+			t.Errorf("edit wiped media: got %q", got.MediaID)
+		}
+		// The edit envelope itself must not create a standalone row.
+		if extra, _ := store.GetMessageByID("whatsapp:edit-evt"); extra != nil {
+			t.Errorf("edit envelope leaked a row: %+v", extra)
+		}
+	})
+
+	t.Run("revoke deletes the target", func(t *testing.T) {
+		seed("revoke-target", "delete me")
+		bridge.handleMessage(protocolEvent("revoke-evt", &waE2E.ProtocolMessage{
+			Type: waE2E.ProtocolMessage_REVOKE.Enum(),
+			Key:  &waCommon.MessageKey{ID: strPtr("revoke-target")},
+		}))
+		got, err := store.GetMessageByID("whatsapp:revoke-target")
+		if err != nil {
+			t.Fatalf("get revoked: %v", err)
+		}
+		if got != nil {
+			t.Errorf("revoke did not delete message: %+v", got)
+		}
+	})
+
+	t.Run("typeless protocol message without key is ignored, not treated as revoke", func(t *testing.T) {
+		seed("safe-target", "keep me")
+		// A ProtocolMessage with the zero-value type (REVOKE) but no key must
+		// not delete anything.
+		bridge.handleMessage(protocolEvent("noop-evt", &waE2E.ProtocolMessage{}))
+		got, err := store.GetMessageByID("whatsapp:safe-target")
+		if err != nil || got == nil {
+			t.Fatalf("typeless protocol message should be a no-op, got %v / %v", got, err)
+		}
+	})
 }
 
 func TestHandleReceiptUpdatesOutgoingWhatsAppStatus(t *testing.T) {

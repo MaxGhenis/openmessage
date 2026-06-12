@@ -19,25 +19,14 @@ func RunSend(logger zerolog.Logger, conversationID, message string) error {
 		return fmt.Errorf("connect: %w", err)
 	}
 
-	// Look up conversation to get outgoing participant ID
-	conv, err := a.Store.GetConversation(conversationID)
-	if err != nil {
-		return fmt.Errorf("get conversation: %w", err)
-	}
-	if conv == nil {
-		return fmt.Errorf("conversation %s not found", conversationID)
-	}
-
-	payload := app.BuildSendPayload(conversationID, message, "", "", nil)
-	cli := a.GetClient()
-	if cli == nil {
-		return fmt.Errorf("client not connected")
-	}
-	_, err = cli.GM.SendMessage(payload)
+	conv, _, err := a.SendTextToConversation(conversationID, message)
 	if err != nil {
 		return fmt.Errorf("send: %w", err)
 	}
 
-	logger.Info().Str("conversation", conversationID).Msg("Message sent")
+	logger.Info().
+		Str("conversation", conversationID).
+		Str("platform", conv.SourcePlatform).
+		Msg("Message sent")
 	return nil
 }

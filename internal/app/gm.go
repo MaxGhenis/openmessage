@@ -8,6 +8,23 @@ import (
 	"go.mau.fi/mautrix-gmessages/pkg/libgm/gmproto"
 )
 
+var (
+	getGoogleConversationForSend = func(a *App, conversationID string) (*gmproto.Conversation, error) {
+		cli := a.GetClient()
+		if cli == nil {
+			return nil, fmt.Errorf(ErrNotConnected)
+		}
+		return cli.GM.GetConversation(conversationID)
+	}
+	sendGoogleTextPayload = func(a *App, payload *gmproto.SendMessageRequest) (*gmproto.SendMessageResponse, error) {
+		cli := a.GetClient()
+		if cli == nil {
+			return nil, fmt.Errorf(ErrNotConnected)
+		}
+		return cli.GM.SendMessage(payload)
+	}
+)
+
 // ErrNotConnected is the error message returned when an operation requires
 // a Google Messages connection but one is not established.
 const ErrNotConnected = "not connected to Google Messages"
