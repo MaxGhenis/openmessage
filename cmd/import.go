@@ -131,8 +131,31 @@ func RunImport(logger zerolog.Logger, source string, args []string) error {
 		printResult("Signal Desktop", result)
 		return nil
 
+	case "contacts":
+		imp := &importer.MacOSContacts{}
+		result, err := imp.ImportFromAddressBook(a.Store)
+		if err != nil {
+			return fmt.Errorf("import contacts: %w", err)
+		}
+		printContactsResult(result)
+		return nil
+
 	default:
-		return fmt.Errorf("unknown import source: %s\nSupported: gchat, gchat-conversation, imessage, whatsapp, signal", source)
+		return fmt.Errorf("unknown import source: %s\nSupported: gchat, gchat-conversation, imessage, whatsapp, signal, contacts", source)
+	}
+}
+
+func printContactsResult(result *importer.ContactsImportResult) {
+	fmt.Printf("\nmacOS Contacts import complete:\n")
+	fmt.Printf("  Contacts imported: %d\n", result.ContactsImported)
+	fmt.Printf("  Phone numbers:     %d\n", result.PhoneNumbers)
+	fmt.Printf("  Email addresses:   %d\n", result.Emails)
+	fmt.Printf("  Address books:     %d\n", result.Sources)
+	if len(result.Errors) > 0 {
+		fmt.Printf("  Errors:            %d\n", len(result.Errors))
+		for _, e := range result.Errors {
+			fmt.Printf("    - %s\n", e)
+		}
 	}
 }
 

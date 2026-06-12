@@ -37,6 +37,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "  import imessage [db-path]                 - Import iMessage (needs Full Disk Access)")
 		fmt.Fprintln(os.Stderr, "  import whatsapp <chat.txt> [--name You]   - Import WhatsApp text export")
 		fmt.Fprintln(os.Stderr, "  import signal [support-dir]               - Import Signal Desktop history")
+		fmt.Fprintln(os.Stderr, "  import contacts                          - Import macOS Contacts (needs Full Disk Access)")
 		os.Exit(1)
 	}
 

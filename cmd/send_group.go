@@ -5,7 +5,6 @@ import (
 	"strings"
 
 	"github.com/rs/zerolog"
-	"go.mau.fi/mautrix-gmessages/pkg/libgm/gmproto"
 
 	"github.com/maxghenis/openmessage/internal/app"
 )
@@ -26,16 +25,14 @@ func RunSendGroup(logger zerolog.Logger, phones []string, message string) error 
 		return fmt.Errorf("client not connected")
 	}
 
-	convResp, err := cli.GM.GetOrCreateConversation(&gmproto.GetOrCreateConversationRequest{
-		Numbers: app.NewContactNumbers(phones),
-	})
+	convResp, err := app.GetOrCreateConversationForNumbers(cli, app.NewGroupContactNumbers(phones), "")
 	if err != nil {
 		return fmt.Errorf("get/create group conversation: %w", err)
 	}
 
 	conv := convResp.GetConversation()
 	if conv == nil {
-		return fmt.Errorf("no conversation returned")
+		return fmt.Errorf("no conversation returned (status: %s)", convResp.GetStatus().String())
 	}
 
 	payload := app.BuildSendPayload(conv.GetConversationID(), message, "", "", nil)

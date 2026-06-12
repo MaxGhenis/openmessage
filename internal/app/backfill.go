@@ -682,6 +682,12 @@ func (a *App) storeMessage(msg *gmproto.Message) {
 	}
 	dbMsg.ReplyToID = client.ExtractReplyToID(msg)
 
+	// Skip completed contentless stubs so they never accumulate (they'd render
+	// as "Empty message" and wrongly surface a conversation).
+	if db.IsEmptyStubMessage(dbMsg) {
+		return
+	}
+
 	if err := a.Store.UpsertMessage(dbMsg); err != nil {
 		a.Logger.Error().Err(err).Str("msg_id", dbMsg.MessageID).Msg("Failed to store backfill message")
 	}

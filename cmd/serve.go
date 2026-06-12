@@ -141,6 +141,23 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 					runShallowBackfill()
 				}
 			}
+
+			// Pull the Google Messages contact list once on startup. Read-only:
+			// it only lists contacts and never creates conversations, so it
+			// cannot flood the inbox.
+			go func() {
+				for i := 0; i < 30 && !a.Connected.Load(); i++ {
+					time.Sleep(time.Second)
+				}
+				if !a.Connected.Load() {
+					return
+				}
+				if n, err := a.SyncGoogleContacts(); err != nil {
+					logger.Warn().Err(err).Msg("Startup Google contacts sync failed")
+				} else {
+					logger.Info().Int("count", n).Msg("Synced Google Messages contacts")
+				}
+			}()
 		}
 	} else {
 		logger.Info().Msg("Demo mode — skipping phone connection")
@@ -371,6 +388,9 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 		return a.GoogleStatus()
 	}
 
+	// Background loop that sends due scheduled ("send later") messages.
+	a.StartScheduler()
+
 	httpEnabled := opts.web || opts.mcpSSE
 	if httpEnabled {
 		httpHandler := http.Handler(nil)
@@ -409,6 +429,7 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 				StartDeepBackfill:     a.StartDeepBackfill,
 				BackfillStatus:        func() any { return a.GetBackfillProgress() },
 				BackfillPhone:         a.BackfillConversationByPhone,
+				SyncGoogleContacts:    a.SyncGoogleContacts,
 			})
 		} else {
 			mux := http.NewServeMux()

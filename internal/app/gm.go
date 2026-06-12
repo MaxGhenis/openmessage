@@ -6,6 +6,8 @@ import (
 	"strings"
 
 	"go.mau.fi/mautrix-gmessages/pkg/libgm/gmproto"
+
+	"github.com/maxghenis/openmessage/internal/client"
 )
 
 var (
@@ -24,6 +26,46 @@ var (
 		return cli.GM.SendMessage(payload)
 	}
 )
+
+// NewGroupContactNumbers builds contact numbers for creating a group chat,
+// using the MysteriousInt value the upstream connector uses for group creation.
+func NewGroupContactNumbers(phones []string) []*gmproto.ContactNumber {
+	numbers := make([]*gmproto.ContactNumber, len(phones))
+	for i, phone := range phones {
+		numbers[i] = &gmproto.ContactNumber{
+			MysteriousInt: 2,
+			Number:        phone,
+			Number2:       phone,
+		}
+	}
+	return numbers
+}
+
+// GetOrCreateConversationForNumbers fetches or creates a conversation for the
+// given recipients. Creating a brand-new RCS group is a two-step flow: the
+// first call returns Status_CREATE_RCS, and the request must be resent with
+// CreateRCSGroup=true (this is what the upstream connector does). Without the
+// retry, the group create returns no conversation.
+func GetOrCreateConversationForNumbers(cli *client.Client, numbers []*gmproto.ContactNumber, groupName string) (*gmproto.GetOrCreateConversationResponse, error) {
+	req := &gmproto.GetOrCreateConversationRequest{Numbers: numbers}
+	if groupName != "" {
+		req.RCSGroupName = &groupName
+	}
+	resp, err := cli.GM.GetOrCreateConversation(req)
+	if err != nil {
+		return resp, err
+	}
+	if resp.GetStatus() == gmproto.GetOrCreateConversationResponse_CREATE_RCS {
+		if req.RCSGroupName == nil {
+			empty := ""
+			req.RCSGroupName = &empty
+		}
+		createGroup := true
+		req.CreateRCSGroup = &createGroup
+		resp, err = cli.GM.GetOrCreateConversation(req)
+	}
+	return resp, err
+}
 
 // ErrNotConnected is the error message returned when an operation requires
 // a Google Messages connection but one is not established.

@@ -121,6 +121,16 @@ type App struct {
 	SessionPath            string
 	WhatsAppSessionPath    string
 	SignalConfigPath       string
+	// sendTextOverride lets tests substitute the scheduler's send. Nil in prod.
+	sendTextOverride func(conversationID, body, replyToID string) (*db.Message, error)
+	// sendMediaOverride lets tests substitute the scheduler's media send. Nil in prod.
+	sendMediaOverride func(conversationID string, data []byte, filename, mime, caption, replyToID string) (*db.Message, error)
+	// EnableContactDiscovery controls the deep-backfill phase that calls
+	// GetOrCreateConversation for every address-book contact. That phase
+	// CREATES a thread on the phone for each contact, flooding Google Messages
+	// with empty conversations, so it is OFF by default. Conversations that
+	// actually have messages are already covered by the folder scan.
+	EnableContactDiscovery bool
 	Connected              atomic.Bool
 	OnConversationsChange  func()
 	OnIncomingMessage      func(*db.Message)
@@ -241,6 +251,19 @@ func New(logger zerolog.Logger) (*App, error) {
 		logger.Warn().Err(err).Msg("Failed to repair contentless conversation recency")
 	} else if fixed > 0 {
 		logger.Info().Int("fixed", fixed).Msg("Repaired conversations floated up by contentless messages")
+	}
+	// Convert already-stored iMessage tapback texts (`Loved "..."`) into reactions.
+	if converted, err := store.RepairTapbacks(); err != nil {
+		logger.Warn().Err(err).Msg("Failed to convert legacy tapback messages")
+	} else if converted > 0 {
+		logger.Info().Int("converted", converted).Msg("Converted iMessage tapback texts into reactions")
+	}
+	// Remove contentless "Empty message" stubs that group activity leaked into
+	// 1:1 threads, fixing any conversation they were surfacing.
+	if removed, err := store.RepairEmptyStubMessages(); err != nil {
+		logger.Warn().Err(err).Msg("Failed to remove empty stub messages")
+	} else if removed > 0 {
+		logger.Info().Int("removed", removed).Msg("Removed empty stub messages")
 	}
 	if !Sandboxed() {
 		if mediaRepair, err := (&importer.WhatsAppNative{}).RepairLegacyMediaPlaceholders(store); err != nil {
