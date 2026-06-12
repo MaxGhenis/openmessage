@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -54,21 +55,58 @@ var (
 	runSignalCLI = func(ctx context.Context, configDir string, args ...string) ([]byte, error) {
 		commandArgs := append([]string{"--config", configDir}, args...)
 		cmd := exec.CommandContext(ctx, signalCLIExecutable(), commandArgs...)
+		tmpDir, cleanupTmp, tmpErr := newSignalRunTmpDir(configDir)
+		if tmpErr == nil {
+			cmd.Env = signalCLIEnv(os.Environ(), tmpDir)
+			defer cleanupTmp()
+		}
+		configureSignalCancel(cmd)
 		return cmd.CombinedOutput()
 	}
 
 	startSignalLink = func(ctx context.Context, configDir string) (io.ReadCloser, func() error, error) {
 		cmd := exec.CommandContext(ctx, "script", "-q", "/dev/null", signalCLIExecutable(), "--config", configDir, "link", "-n", "OpenMessage")
+		tmpDir, cleanupTmp, tmpErr := newSignalRunTmpDir(configDir)
+		if tmpErr == nil {
+			cmd.Env = signalCLIEnv(os.Environ(), tmpDir)
+		}
+		configureSignalCancel(cmd)
 		stdout, err := cmd.StdoutPipe()
 		if err != nil {
+			if tmpErr == nil {
+				cleanupTmp()
+			}
 			return nil, nil, err
 		}
 		if err := cmd.Start(); err != nil {
+			if tmpErr == nil {
+				cleanupTmp()
+			}
 			return nil, nil, err
 		}
-		return stdout, cmd.Wait, nil
+		wait := func() error {
+			err := cmd.Wait()
+			if tmpErr == nil {
+				cleanupTmp()
+			}
+			return err
+		}
+		return stdout, wait, nil
 	}
 )
+
+// configureSignalCancel asks for a graceful stop before the hard kill so
+// the JVM gets a chance to run its shutdown hooks (which include libsignal
+// temp cleanup) and flush output when a context deadline fires.
+func configureSignalCancel(cmd *exec.Cmd) {
+	cmd.Cancel = func() error {
+		if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+			return cmd.Process.Kill()
+		}
+		return nil
+	}
+	cmd.WaitDelay = 3 * time.Second
+}
 
 type Callbacks struct {
 	OnConversationsChange func()
@@ -165,6 +203,7 @@ type Bridge struct {
 		importedMessages      int
 	}
 	lastReceiveRecoveryAt int64
+	lastTmpSweep          time.Time
 }
 
 type signalReceiveRecoveryRecord struct {
@@ -326,6 +365,14 @@ func New(configDir string, store *db.Store, logger zerolog.Logger, callbacks Cal
 		contactByACI: map[string]string{},
 	}
 	bridge.account = bridge.firstStoredAccount()
+	bridge.lastTmpSweep = now()
+	go sweepSignalTmpRoot(logger, configDir, signalRunTmpMaxAge)
+	if bridge.account != "" {
+		// Only a paired install can have produced libsignal litter, so the
+		// legacy system-temp sweep stays scoped to installs that ran the
+		// bridge before per-run temp dirs existed.
+		go sweepLegacyLibsignalTemp(logger)
+	}
 	return bridge, nil
 }
 
@@ -839,6 +886,8 @@ func (b *Bridge) startReceiveLoop(account string, requestSync bool) {
 		default:
 		}
 
+		b.maybeSweepTmp()
+
 		callCtx, callCancel := context.WithTimeout(ctx, time.Duration(receiveTimeoutSeconds+3)*time.Second)
 		b.commandMu.Lock()
 		output, err := runSignalCLI(callCtx, b.configDir, "-a", probedAccount, "--output", "json", "receive", "--timeout", strconv.Itoa(receiveTimeoutSeconds), "--max-messages", strconv.Itoa(receiveMaxMessages))
@@ -898,6 +947,25 @@ func (b *Bridge) startReceiveLoop(account string, requestSync bool) {
 		if err := b.handleReceiveOutput(probedAccount, output); err != nil {
 			b.logger.Debug().Err(err).Msg("Failed to process Signal receive payload")
 		}
+	}
+}
+
+// maybeSweepTmp runs the crash-backstop sweeps at most once per
+// signalTmpSweepInterval. Normal runs clean up after themselves, so the
+// app-tmp sweep usually finds nothing; the legacy sweep keeps reaping
+// system-temp dirs leaked by older builds as they age past the gate.
+func (b *Bridge) maybeSweepTmp() {
+	b.mu.Lock()
+	due := now().Sub(b.lastTmpSweep) >= signalTmpSweepInterval
+	if due {
+		b.lastTmpSweep = now()
+	}
+	b.mu.Unlock()
+	if due {
+		go func() {
+			sweepSignalTmpRoot(b.logger, b.configDir, signalRunTmpMaxAge)
+			sweepLegacyLibsignalTemp(b.logger)
+		}()
 	}
 }
 
