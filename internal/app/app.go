@@ -33,9 +33,9 @@ const (
 
 const maxErrorDetails = 100
 
-// BackfillProgress tracks the current state of a deep backfill operation.
-type BackfillProgress struct {
-	mu                 sync.Mutex
+// BackfillSnapshot is a point-in-time copy of backfill progress, safe to
+// pass and marshal by value.
+type BackfillSnapshot struct {
 	Running            bool          `json:"running"`
 	Phase              BackfillPhase `json:"phase"`
 	FoldersScanned     int           `json:"folders_scanned"`
@@ -44,6 +44,12 @@ type BackfillProgress struct {
 	ContactsChecked    int           `json:"contacts_checked"`
 	Errors             int           `json:"errors"`
 	ErrorDetails       []string      `json:"error_details,omitempty"`
+}
+
+// BackfillProgress tracks the current state of a deep backfill operation.
+type BackfillProgress struct {
+	mu sync.Mutex
+	BackfillSnapshot
 }
 
 // reset clears all fields for a fresh backfill run.
@@ -95,10 +101,10 @@ func (p *BackfillProgress) add(conversations, messages, contacts, folders int) {
 	p.FoldersScanned += folders
 }
 
-func (p *BackfillProgress) snapshot() BackfillProgress {
+func (p *BackfillProgress) snapshot() BackfillSnapshot {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	cp := *p
+	cp := p.BackfillSnapshot
 	if len(p.ErrorDetails) > 0 {
 		cp.ErrorDetails = append([]string(nil), p.ErrorDetails...)
 	}
@@ -569,7 +575,7 @@ func (a *App) IsDeepBackfillRunning() bool {
 }
 
 // GetBackfillProgress returns a snapshot of the current backfill progress.
-func (a *App) GetBackfillProgress() BackfillProgress {
+func (a *App) GetBackfillProgress() BackfillSnapshot {
 	snap := a.BackfillProgress.snapshot()
 	// A shallow Backfill (startup catch-up) holds the same mutual-exclusion
 	// guard (backfillRunning) without populating the deep-backfill progress
