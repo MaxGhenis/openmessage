@@ -64,7 +64,14 @@ func (s *Store) UpsertConversation(c *Conversation) error {
 			is_group=excluded.is_group,
 			participants=excluded.participants,
 			last_message_ts=excluded.last_message_ts,
-			unread_count=excluded.unread_count,
+			-- Only honor an incoming unread flag when the event carries genuinely
+			-- new activity (a message newer than the user's read watermark).
+			-- Otherwise force 0, so Google's stale unread re-syncs can't
+			-- resurrect a badge the user already cleared.
+			unread_count=CASE
+				WHEN excluded.last_message_ts > conversations.last_read_ts THEN excluded.unread_count
+				ELSE 0
+			END,
 			source_platform=excluded.source_platform,
 			notification_mode=CASE WHEN ? != '' THEN ? ELSE conversations.notification_mode END
 	`, c.ConversationID, c.Name, c.IsGroup, c.Participants, c.LastMessageTS, c.UnreadCount, c.SourcePlatform, notificationMode, maybeNotificationModeArg(hasNotificationMode, notificationMode), maybeNotificationModeArg(hasNotificationMode, notificationMode))
@@ -167,7 +174,10 @@ func (s *Store) DeleteConversation(id string) error {
 }
 
 func (s *Store) MarkConversationRead(id string) error {
-	_, err := s.db.Exec(`UPDATE conversations SET unread_count = 0 WHERE conversation_id = ?`, id)
+	// Clear the badge and advance the read watermark to the latest message, so a
+	// stale conversation re-sync from Google (same last_message_ts, unread flag
+	// still set on the phone) can't resurrect the unread badge.
+	_, err := s.db.Exec(`UPDATE conversations SET unread_count = 0, last_read_ts = last_message_ts WHERE conversation_id = ?`, id)
 	return err
 }
 
@@ -333,7 +343,14 @@ func upsertConversationTx(tx *sql.Tx, c *Conversation) error {
 			is_group=excluded.is_group,
 			participants=excluded.participants,
 			last_message_ts=excluded.last_message_ts,
-			unread_count=excluded.unread_count,
+			-- Only honor an incoming unread flag when the event carries genuinely
+			-- new activity (a message newer than the user's read watermark).
+			-- Otherwise force 0, so Google's stale unread re-syncs can't
+			-- resurrect a badge the user already cleared.
+			unread_count=CASE
+				WHEN excluded.last_message_ts > conversations.last_read_ts THEN excluded.unread_count
+				ELSE 0
+			END,
 			source_platform=excluded.source_platform,
 			notification_mode=CASE WHEN ? != '' THEN ? ELSE conversations.notification_mode END
 	`, c.ConversationID, c.Name, c.IsGroup, c.Participants, c.LastMessageTS, c.UnreadCount, c.SourcePlatform, notificationMode, maybeNotificationModeArg(hasNotificationMode, notificationMode), maybeNotificationModeArg(hasNotificationMode, notificationMode))

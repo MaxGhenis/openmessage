@@ -251,6 +251,7 @@ func (s *Store) migrate() error {
 		participants TEXT NOT NULL DEFAULT '[]',
 		last_message_ts INTEGER NOT NULL DEFAULT 0,
 		unread_count INTEGER NOT NULL DEFAULT 0,
+		last_read_ts INTEGER NOT NULL DEFAULT 0,
 		notification_mode TEXT NOT NULL DEFAULT 'all',
 		tab TEXT NOT NULL DEFAULT ''
 	);
@@ -318,9 +319,19 @@ func (s *Store) migrate() error {
 		"ALTER TABLE conversations ADD COLUMN source_platform TEXT NOT NULL DEFAULT 'sms'",
 		"ALTER TABLE conversations ADD COLUMN notification_mode TEXT NOT NULL DEFAULT 'all'",
 		"ALTER TABLE conversations ADD COLUMN tab TEXT NOT NULL DEFAULT ''",
+		// Local read watermark: highest last_message_ts the user has read. A
+		// conversation event only re-marks unread when it carries a newer
+		// message, so Google's stale unread re-syncs can't resurrect the badge.
+		"ALTER TABLE conversations ADD COLUMN last_read_ts INTEGER NOT NULL DEFAULT 0",
 	} {
 		s.db.Exec(col) // ignore "duplicate column" errors
 	}
+
+	// Seed the read watermark for already-read conversations so existing installs
+	// are protected from stale unread re-syncs immediately (not only after the
+	// next local read). Unread conversations (unread_count > 0) are left at 0 so
+	// they stay visible.
+	s.db.Exec(`UPDATE conversations SET last_read_ts = last_message_ts WHERE unread_count = 0 AND last_read_ts < last_message_ts`)
 
 	// Unified contacts table
 	s.db.Exec(`CREATE TABLE IF NOT EXISTS unified_contacts (
@@ -328,6 +339,40 @@ func (s *Store) migrate() error {
 		display_name TEXT NOT NULL DEFAULT '',
 		identifiers TEXT NOT NULL DEFAULT '[]'
 	)`)
+
+	// Per-person CRM metadata (tags, reach-out cadence, cached relationship
+	// summary), keyed by a normalized person key. See contact_meta.go.
+	s.db.Exec(`CREATE TABLE IF NOT EXISTS contact_meta (
+		person_key TEXT PRIMARY KEY,
+		display_name TEXT NOT NULL DEFAULT '',
+		tags TEXT NOT NULL DEFAULT '[]',
+		reach_out_days INTEGER NOT NULL DEFAULT 0,
+		summary TEXT NOT NULL DEFAULT '',
+		summary_at INTEGER NOT NULL DEFAULT 0,
+		updated_at INTEGER NOT NULL DEFAULT 0
+	)`)
+
+	// Scheduled (send-later) messages. See scheduled.go.
+	s.db.Exec(`CREATE TABLE IF NOT EXISTS scheduled_messages (
+		id TEXT PRIMARY KEY,
+		conversation_id TEXT NOT NULL DEFAULT '',
+		body TEXT NOT NULL DEFAULT '',
+		reply_to_id TEXT NOT NULL DEFAULT '',
+		send_at INTEGER NOT NULL DEFAULT 0,
+		status TEXT NOT NULL DEFAULT 'pending',
+		attempts INTEGER NOT NULL DEFAULT 0,
+		last_error TEXT NOT NULL DEFAULT '',
+		created_at INTEGER NOT NULL DEFAULT 0,
+		sent_message_id TEXT NOT NULL DEFAULT '',
+		media_data BLOB,
+		media_filename TEXT NOT NULL DEFAULT '',
+		media_mime TEXT NOT NULL DEFAULT ''
+	)`)
+	s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_scheduled_due ON scheduled_messages(status, send_at)`)
+	// Add media columns to scheduled_messages on already-created DBs.
+	s.db.Exec(`ALTER TABLE scheduled_messages ADD COLUMN media_data BLOB`)
+	s.db.Exec(`ALTER TABLE scheduled_messages ADD COLUMN media_filename TEXT NOT NULL DEFAULT ''`)
+	s.db.Exec(`ALTER TABLE scheduled_messages ADD COLUMN media_mime TEXT NOT NULL DEFAULT ''`)
 
 	// Index for dedup on import
 	s.db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_source ON messages(source_platform, source_id) WHERE source_id != ''`)
