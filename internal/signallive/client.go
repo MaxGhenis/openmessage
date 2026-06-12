@@ -55,7 +55,7 @@ var (
 	runSignalCLI = func(ctx context.Context, configDir string, args ...string) ([]byte, error) {
 		commandArgs := append([]string{"--config", configDir}, args...)
 		cmd := exec.CommandContext(ctx, signalCLIExecutable(), commandArgs...)
-		tmpDir, cleanupTmp, tmpErr := newSignalRunTmpDir(configDir)
+		tmpDir, cleanupTmp, tmpErr := newSignalRunTmpDir()
 		if tmpErr == nil {
 			cmd.Env = signalCLIEnv(os.Environ(), tmpDir)
 			defer cleanupTmp()
@@ -66,7 +66,7 @@ var (
 
 	startSignalLink = func(ctx context.Context, configDir string) (io.ReadCloser, func() error, error) {
 		cmd := exec.CommandContext(ctx, "script", "-q", "/dev/null", signalCLIExecutable(), "--config", configDir, "link", "-n", "OpenMessage")
-		tmpDir, cleanupTmp, tmpErr := newSignalRunTmpDir(configDir)
+		tmpDir, cleanupTmp, tmpErr := newSignalRunTmpDir()
 		if tmpErr == nil {
 			cmd.Env = signalCLIEnv(os.Environ(), tmpDir)
 		}
@@ -204,6 +204,22 @@ type Bridge struct {
 	}
 	lastReceiveRecoveryAt int64
 	lastTmpSweep          time.Time
+
+	// wg tracks background goroutines (link, receive loop, metadata refresh,
+	// sweeps, sync requests) so Close can wait for them to finish. Without
+	// the join, reuse of package state after Close — tests swapping the
+	// runSignalCLI stub, serve restarting a bridge — races with loops that
+	// are still draining.
+	wg sync.WaitGroup
+}
+
+// goTracked runs fn on a goroutine that Close waits for.
+func (b *Bridge) goTracked(fn func()) {
+	b.wg.Add(1)
+	go func() {
+		defer b.wg.Done()
+		fn()
+	}()
 }
 
 type signalReceiveRecoveryRecord struct {
@@ -366,7 +382,7 @@ func New(configDir string, store *db.Store, logger zerolog.Logger, callbacks Cal
 	}
 	bridge.account = bridge.firstStoredAccount()
 	bridge.lastTmpSweep = now()
-	go sweepSignalTmpRoot(logger, configDir, signalRunTmpMaxAge)
+	go sweepSignalTmpRoot(logger, signalRunTmpMaxAge)
 	if bridge.account != "" {
 		// Only a paired install can have produced libsignal litter, so the
 		// legacy system-temp sweep stays scoped to installs that ran the
@@ -413,7 +429,7 @@ func (b *Bridge) ConnectIfPaired() error {
 	account := b.account
 	b.mu.Unlock()
 	b.emitStatusChange()
-	go b.startReceiveLoop(account, false)
+	b.goTracked(func() { b.startReceiveLoop(account, false) })
 	return nil
 }
 
@@ -433,7 +449,7 @@ func (b *Bridge) Connect() error {
 		account := b.account
 		b.mu.Unlock()
 		b.emitStatusChange()
-		go b.startReceiveLoop(account, false)
+		b.goTracked(func() { b.startReceiveLoop(account, false) })
 		return nil
 	}
 	if b.pairing || b.connecting {
@@ -449,12 +465,16 @@ func (b *Bridge) Connect() error {
 	b.qr = QRSnapshot{}
 	b.mu.Unlock()
 	b.emitStatusChange()
-	go b.runLink(ctx)
+	b.goTracked(func() { b.runLink(ctx) })
 	return nil
 }
 
 func (b *Bridge) Unpair() error {
 	b.cancelBackgroundWork(true)
+	// Wait for in-flight loops before removing the config dir: a draining
+	// receive poll may still be writing WAL/recovery files inside it, and
+	// RemoveAll on a directory that's being written to fails part-way.
+	b.wg.Wait()
 	if err := os.RemoveAll(b.configDir); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("remove Signal config dir: %w", err)
 	}
@@ -737,6 +757,7 @@ func (b *Bridge) SendReaction(conversationID, targetMessageID, emoji, action str
 
 func (b *Bridge) Close() error {
 	b.cancelBackgroundWork(false)
+	b.wg.Wait()
 	return nil
 }
 
@@ -860,7 +881,7 @@ func (b *Bridge) startReceiveLoop(account string, requestSync bool) {
 	b.lastError = ""
 	b.mu.Unlock()
 	b.emitStatusChange()
-	go b.refreshMetadataAndReplay(probedAccount)
+	b.goTracked(func() { b.refreshMetadataAndReplay(probedAccount) })
 	if requestSync {
 		b.beginHistorySync()
 		b.emitStatusChange()
@@ -962,10 +983,10 @@ func (b *Bridge) maybeSweepTmp() {
 	}
 	b.mu.Unlock()
 	if due {
-		go func() {
-			sweepSignalTmpRoot(b.logger, b.configDir, signalRunTmpMaxAge)
+		b.goTracked(func() {
+			sweepSignalTmpRoot(b.logger, signalRunTmpMaxAge)
 			sweepLegacyLibsignalTemp(b.logger)
-		}()
+		})
 	}
 }
 
@@ -1192,11 +1213,11 @@ func (b *Bridge) recordReceiveRecoveryIssue(account string, rawLine []byte, reas
 	}
 	b.beginHistorySync()
 	b.emitStatusChange()
-	go func() {
+	b.goTracked(func() {
 		if syncErr := b.requestSync(account); syncErr != nil {
 			b.logger.Debug().Err(syncErr).Str("reason", reason).Msg("Failed to request Signal recovery sync")
 		}
-	}()
+	})
 }
 
 func (b *Bridge) appendReceiveRecoveryRecord(account string, rawLine []byte, reason string, cause error) error {

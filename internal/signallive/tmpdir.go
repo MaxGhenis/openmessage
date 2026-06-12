@@ -1,6 +1,7 @@
 package signallive
 
 import (
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -18,9 +19,9 @@ import (
 // leaked directories can fill the disk (issue #27). Three defenses:
 //
 //  1. Every invocation runs with TMPDIR/java.io.tmpdir pointed at a private
-//     per-run directory under <configDir>/tmp, removed as soon as the
+//     per-run directory under signalTmpRoot(), removed as soon as the
 //     process exits — no accumulation by construction.
-//  2. <configDir>/tmp is swept at startup and periodically for entries old
+//  2. signalTmpRoot() is swept at startup and periodically for entries old
 //     enough that no live invocation can still own them (crash backstop).
 //  3. A one-time sweep of the system temp dir removes libsignal* dirs
 //     abandoned by earlier versions, so existing installs recover their
@@ -43,15 +44,20 @@ const (
 	signalTmpSweepEnvVar = "OPENMESSAGES_SIGNAL_TMP_SWEEP"
 )
 
-func signalTmpRoot(configDir string) string {
-	return filepath.Join(configDir, "tmp")
+// signalTmpRoot lives under the system temp dir rather than the Signal
+// config dir: Unpair removes the config dir wholesale (and tests remove
+// their temp config dirs on cleanup), which would race with a lingering
+// invocation still creating its run dir inside. The uid suffix keeps the
+// root private per user on systems with a shared /tmp.
+func signalTmpRoot() string {
+	return filepath.Join(os.TempDir(), fmt.Sprintf("openmessage-signal-cli-%d", os.Getuid()))
 }
 
 // newSignalRunTmpDir creates a private temp dir for one signal-cli
 // invocation. The returned cleanup removes it; callers must invoke cleanup
 // only after the subprocess has exited.
-func newSignalRunTmpDir(configDir string) (string, func(), error) {
-	root := signalTmpRoot(configDir)
+func newSignalRunTmpDir() (string, func(), error) {
+	root := signalTmpRoot()
 	if err := os.MkdirAll(root, 0o700); err != nil {
 		return "", nil, err
 	}
@@ -89,14 +95,14 @@ func signalTmpSweepDisabled() bool {
 	return strings.TrimSpace(os.Getenv(signalTmpSweepEnvVar)) == "0"
 }
 
-// sweepSignalTmpRoot removes entries under <configDir>/tmp older than
-// maxAge. The bridge owns this directory outright, so every stale entry is
-// a leftover from a crashed run regardless of its name.
-func sweepSignalTmpRoot(logger zerolog.Logger, configDir string, maxAge time.Duration) {
+// sweepSignalTmpRoot removes entries under the app-owned tmp root older
+// than maxAge. The bridge owns this directory outright, so every stale
+// entry is a leftover from a crashed run regardless of its name.
+func sweepSignalTmpRoot(logger zerolog.Logger, maxAge time.Duration) {
 	if signalTmpSweepDisabled() {
 		return
 	}
-	removed, bytes := sweepDirEntries(signalTmpRoot(configDir), maxAge, func(string) bool { return true })
+	removed, bytes := sweepDirEntries(signalTmpRoot(), maxAge, func(string) bool { return true })
 	if removed > 0 {
 		logger.Info().
 			Int("dirs", removed).

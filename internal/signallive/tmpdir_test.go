@@ -58,13 +58,13 @@ func TestSignalCLIEnvAppendsToExistingOptsSoOursWins(t *testing.T) {
 }
 
 func TestNewSignalRunTmpDirCreatesAndCleansUp(t *testing.T) {
-	configDir := t.TempDir()
-	dir, cleanup, err := newSignalRunTmpDir(configDir)
+	t.Setenv("TMPDIR", t.TempDir())
+	dir, cleanup, err := newSignalRunTmpDir()
 	if err != nil {
 		t.Fatalf("newSignalRunTmpDir: %v", err)
 	}
-	if !strings.HasPrefix(dir, signalTmpRoot(configDir)) {
-		t.Fatalf("run dir %q not under tmp root %q", dir, signalTmpRoot(configDir))
+	if !strings.HasPrefix(dir, signalTmpRoot()) {
+		t.Fatalf("run dir %q not under tmp root %q", dir, signalTmpRoot())
 	}
 	if err := os.WriteFile(filepath.Join(dir, "libsignal.so"), []byte("x"), 0o600); err != nil {
 		t.Fatalf("write fixture: %v", err)
@@ -76,8 +76,8 @@ func TestNewSignalRunTmpDirCreatesAndCleansUp(t *testing.T) {
 }
 
 func TestSweepSignalTmpRootRemovesOnlyStaleEntries(t *testing.T) {
-	configDir := t.TempDir()
-	root := signalTmpRoot(configDir)
+	t.Setenv("TMPDIR", t.TempDir())
+	root := signalTmpRoot()
 	if err := os.MkdirAll(root, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -103,7 +103,7 @@ func TestSweepSignalTmpRootRemovesOnlyStaleEntries(t *testing.T) {
 		}
 	}
 
-	sweepSignalTmpRoot(zerolog.Nop(), configDir, signalRunTmpMaxAge)
+	sweepSignalTmpRoot(zerolog.Nop(), signalRunTmpMaxAge)
 
 	if _, err := os.Stat(stale); !os.IsNotExist(err) {
 		t.Fatalf("stale run dir should be removed, stat err = %v", err)
@@ -163,7 +163,7 @@ func TestSweepRespectsOptOut(t *testing.T) {
 	}
 
 	sweepLegacyLibsignalTemp(zerolog.Nop())
-	sweepSignalTmpRoot(zerolog.Nop(), tempRoot, signalRunTmpMaxAge)
+	sweepSignalTmpRoot(zerolog.Nop(), signalRunTmpMaxAge)
 
 	if _, err := os.Stat(leak); err != nil {
 		t.Fatalf("opt-out must disable all sweeping: %v", err)
@@ -174,6 +174,7 @@ func TestSweepRespectsOptOut(t *testing.T) {
 // against a stub executable to prove the subprocess sees the confined
 // TMPDIR/SIGNAL_CLI_OPTS and that the per-run dir is removed afterwards.
 func TestRunSignalCLIConfinesTempAndCleansUp(t *testing.T) {
+	t.Setenv("TMPDIR", t.TempDir())
 	configDir := t.TempDir()
 	stub := filepath.Join(t.TempDir(), "signal-cli-stub")
 	script := "#!/bin/sh\nprintf '%s|%s' \"$TMPDIR\" \"$SIGNAL_CLI_OPTS\"\nmkdir -p \"$TMPDIR/libsignal-test\"\n"
@@ -191,8 +192,8 @@ func TestRunSignalCLIConfinesTempAndCleansUp(t *testing.T) {
 		t.Fatalf("unexpected stub output: %q", out)
 	}
 	tmpdir, opts := parts[0], parts[1]
-	if !strings.HasPrefix(tmpdir, signalTmpRoot(configDir)) {
-		t.Fatalf("subprocess TMPDIR %q not confined under %q", tmpdir, signalTmpRoot(configDir))
+	if !strings.HasPrefix(tmpdir, signalTmpRoot()) {
+		t.Fatalf("subprocess TMPDIR %q not confined under %q", tmpdir, signalTmpRoot())
 	}
 	if !strings.Contains(opts, "-Djava.io.tmpdir="+tmpdir) {
 		t.Fatalf("subprocess SIGNAL_CLI_OPTS %q missing java.io.tmpdir", opts)
@@ -200,7 +201,7 @@ func TestRunSignalCLIConfinesTempAndCleansUp(t *testing.T) {
 	if _, err := os.Stat(tmpdir); !os.IsNotExist(err) {
 		t.Fatalf("per-run tmp dir %q should be removed after the run, stat err = %v", tmpdir, err)
 	}
-	entries, err := os.ReadDir(signalTmpRoot(configDir))
+	entries, err := os.ReadDir(signalTmpRoot())
 	if err != nil {
 		t.Fatalf("tmp root should still exist: %v", err)
 	}
