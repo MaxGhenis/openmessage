@@ -233,6 +233,11 @@ html, body {
   border-color: var(--border-accent);
   box-shadow: 0 0 0 3px var(--accent-dim);
 }
+.new-msg-recipients { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
+.new-msg-recipients[hidden] { display: none; }
+.new-msg-recipient-chip { display: inline-flex; align-items: center; gap: 6px; padding: 5px 10px; border-radius: 999px; background: var(--accent-dim); border: 1px solid var(--border-accent); color: var(--text-primary); font-size: 13px; font-weight: 600; }
+.new-msg-recipient-chip button { background: none; border: 0; color: var(--text-muted); cursor: pointer; font-size: 15px; line-height: 1; padding: 0; }
+.new-msg-recipient-chip button:hover { color: var(--text-primary); }
 .new-msg-go {
   margin-top: 12px;
   width: 100%;
@@ -2737,6 +2742,76 @@ body::after {
   background: var(--accent-dim);
 }
 
+/* ─── Contacts / CRM overlay ─── */
+.contacts-overlay { position: fixed; inset: 0; z-index: 1500; display: none; background: var(--bg-deep); }
+.contacts-overlay.show { display: flex; }
+.contacts-pane-left { width: 340px; flex: 0 0 340px; display: flex; flex-direction: column; border-right: 1px solid var(--border); background: var(--bg-surface); }
+.contacts-left-header { display: flex; align-items: center; justify-content: space-between; padding: 20px 20px 12px; }
+.contacts-left-header h2 { margin: 0; font-size: 20px; color: var(--text-primary); }
+.contacts-search { display: flex; align-items: center; gap: 8px; margin: 0 16px 12px; padding: 9px 12px; border: 1px solid var(--border); border-radius: 12px; background: var(--bg-elevated); }
+.contacts-search svg { width: 16px; height: 16px; color: var(--text-muted); flex: 0 0 auto; }
+.contacts-search input { border: 0; background: transparent; outline: none; width: 100%; color: var(--text-primary); font: inherit; }
+.contacts-sort { display: flex; gap: 6px; padding: 0 16px 12px; }
+.contacts-sort-btn { flex: 1; padding: 7px 8px; border: 1px solid var(--border); border-radius: 999px; background: var(--bg-elevated); color: var(--text-secondary); font-family: var(--font-sans); font-size: 12px; font-weight: 600; cursor: pointer; white-space: nowrap; transition: background 0.16s ease, color 0.16s ease, border-color 0.16s ease; }
+.contacts-sort-btn:hover { background: var(--bg-hover); color: var(--text-primary); }
+.contacts-sort-btn.active { background: var(--accent-dim); border-color: var(--border-accent); color: var(--text-primary); }
+.contacts-list { flex: 1; overflow-y: auto; padding: 0 10px 16px; }
+.contact-row { display: flex; align-items: center; gap: 12px; padding: 10px 12px; border-radius: 12px; cursor: pointer; }
+.contact-row:hover { background: var(--bg-hover); }
+.contact-row.active { background: var(--accent-dim); }
+.contact-row .convo-avatar { width: 40px; height: 40px; flex: 0 0 40px; }
+.contact-row-meta { flex: 1; min-width: 0; }
+.contact-row-name { color: var(--text-primary); font-weight: 600; font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.contact-row-sub { color: var(--text-muted); font-size: 12px; margin-top: 2px; }
+.contact-row-due { flex: 0 0 auto; font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; padding: 3px 7px; border-radius: 999px; background: rgba(229, 72, 77, 0.16); color: #ff6b6b; }
+.contacts-pane-right { flex: 1; overflow-y: auto; padding: 32px 40px; }
+.contacts-detail-empty { color: var(--text-muted); font-size: 14px; margin-top: 80px; text-align: center; }
+.contacts-detail-body { max-width: 640px; }
+.cd-head { display: flex; align-items: center; gap: 18px; margin-bottom: 24px; }
+.cd-head .convo-avatar { width: 72px; height: 72px; flex: 0 0 72px; font-size: 26px; }
+.cd-name { font-size: 26px; font-weight: 700; color: var(--text-primary); }
+.cd-sub { color: var(--text-secondary); font-size: 13px; margin-top: 4px; }
+.cd-section { margin-bottom: 26px; }
+.cd-label { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.1em; color: var(--text-muted); margin-bottom: 10px; }
+.cd-info-row { color: var(--text-primary); font-size: 14px; padding: 7px 0; border-bottom: 1px solid var(--border); display: flex; gap: 10px; }
+.cd-info-row .k { color: var(--text-muted); width: 130px; flex: 0 0 130px; }
+.cd-tags { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.cd-tag { display: inline-flex; align-items: center; gap: 6px; padding: 5px 10px; border-radius: 999px; background: var(--accent-dim); border: 1px solid var(--border-accent); color: var(--text-primary); font-size: 12px; font-weight: 600; }
+.cd-tag button { background: none; border: 0; color: var(--text-muted); cursor: pointer; font-size: 14px; line-height: 1; padding: 0; }
+.cd-tag-input { padding: 6px 10px; border: 1px dashed var(--border); border-radius: 999px; background: var(--bg-elevated); color: var(--text-primary); font: inherit; font-size: 12px; width: 110px; outline: none; }
+.cd-summary { color: var(--text-secondary); font-size: 14px; line-height: 1.65; }
+.cd-tickler { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.cd-tickler input { width: 70px; padding: 8px 10px; border: 1px solid var(--border); border-radius: 10px; background: var(--bg-elevated); color: var(--text-primary); font: inherit; outline: none; }
+.cd-tickler .muted { color: var(--text-muted); font-size: 13px; }
+.cd-btn { padding: 8px 14px; border: 1px solid var(--border); border-radius: 10px; background: var(--bg-elevated); color: var(--text-secondary); font: inherit; font-size: 13px; font-weight: 600; cursor: pointer; }
+.cd-btn:hover { background: var(--bg-hover); color: var(--text-primary); }
+.cd-btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.cd-due-pill { display: inline-block; padding: 4px 10px; border-radius: 999px; font-size: 12px; font-weight: 600; margin-left: 4px; }
+.cd-due-pill.overdue { background: rgba(229, 72, 77, 0.16); color: #ff6b6b; }
+.cd-due-pill.ok { background: rgba(60, 200, 120, 0.14); color: #36c47a; }
+
+/* ─── Scheduled (send-later) messages ─── */
+.schedule-btn { background: transparent; border: 0; color: var(--text-muted); cursor: pointer; padding: 8px; border-radius: 10px; display: inline-flex; align-items: center; justify-content: center; }
+.schedule-btn svg { width: 20px; height: 20px; }
+.schedule-btn:hover:not(:disabled) { background: var(--bg-hover); color: var(--text-primary); }
+.schedule-btn:disabled { opacity: 0.4; cursor: default; }
+.scheduled-strip { display: flex; flex-direction: column; gap: 6px; padding: 0 16px 6px; }
+.scheduled-strip:empty { display: none; padding: 0; }
+.scheduled-item { display: flex; align-items: center; gap: 10px; padding: 8px 12px; border: 1px solid var(--border-accent); border-radius: 12px; background: var(--accent-dim); }
+.scheduled-item > svg { width: 15px; height: 15px; color: var(--accent); flex: 0 0 auto; }
+.scheduled-item.failed { border-color: rgba(229, 72, 77, 0.4); background: rgba(229, 72, 77, 0.1); }
+.scheduled-item.failed > svg { color: #ff6b6b; }
+.scheduled-item-body { flex: 1; min-width: 0; }
+.scheduled-item-text { color: var(--text-primary); font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.scheduled-item-when { color: var(--text-muted); font-size: 11px; margin-top: 2px; }
+.scheduled-item.failed .scheduled-item-when { color: #ff6b6b; }
+.scheduled-item-cancel { background: none; border: 0; color: var(--text-muted); cursor: pointer; font-size: 17px; line-height: 1; padding: 2px 6px; }
+.scheduled-item-cancel:hover { color: var(--text-primary); }
+.schedule-custom { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 10px 16px; }
+.schedule-custom[hidden] { display: none; }
+.schedule-custom label { color: var(--text-muted); font-size: 13px; }
+.schedule-custom input { padding: 7px 10px; border: 1px solid var(--border); border-radius: 10px; background: var(--bg-elevated); color: var(--text-primary); font: inherit; }
+
 .sidebar-source-filters {
   display: flex;
   gap: 8px;
@@ -4273,6 +4348,9 @@ body::after {
             </div>
           </div>
         <div class="sidebar-actions">
+          <button class="new-msg-btn" id="contacts-btn" type="button" title="Contacts" aria-label="Contacts">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+          </button>
           <button class="new-msg-btn notif-btn" id="notif-btn" type="button" title="Enable desktop notifications" aria-label="Enable desktop notifications" aria-pressed="false">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M15 17h5l-1.4-1.4A2 2 0 0 1 18 14.2V11a6 6 0 1 0-12 0v3.2a2 2 0 0 1-.6 1.4L4 17h5"/><path d="M9.5 17a2.5 2.5 0 0 0 5 0"/></svg>
           </button>
@@ -4309,6 +4387,7 @@ body::after {
       </div>
       <div class="new-msg-input-area">
         <label>To</label>
+        <div class="new-msg-recipients" id="new-msg-recipients" hidden></div>
         <input
           type="text"
           class="new-msg-phone"
@@ -4324,6 +4403,37 @@ body::after {
         <div class="new-msg-routes" id="new-msg-routes"></div>
         <button class="new-msg-go" id="new-msg-go">Start conversation</button>
         <div class="new-msg-error" id="new-msg-error"></div>
+
+        <div style="height:1px;background:var(--border);margin:18px 0 14px;"></div>
+        <label>Save a contact</label>
+        <input type="text" class="new-msg-phone" id="add-contact-name" placeholder="Name" autocomplete="off" autocapitalize="words" spellcheck="false">
+        <input type="text" class="new-msg-phone" id="add-contact-number" placeholder="Phone number" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" inputmode="tel" style="margin-top:8px;">
+        <div class="new-msg-helper">Saved locally in this app. It won't be added to your Google account.</div>
+        <button class="new-msg-go" id="add-contact-go">Save contact</button>
+        <div class="new-msg-error" id="add-contact-msg"></div>
+      </div>
+    </div>
+
+    <div class="contacts-overlay" id="contacts-overlay">
+      <div class="contacts-pane-left">
+        <div class="contacts-left-header">
+          <h2>Contacts</h2>
+          <button class="new-msg-close" id="contacts-close" aria-label="Close contacts">&times;</button>
+        </div>
+        <div class="contacts-search">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+          <input type="text" id="contacts-search-input" placeholder="Search contacts" autocomplete="off" spellcheck="false">
+        </div>
+        <div class="contacts-sort" id="contacts-sort">
+          <button type="button" class="contacts-sort-btn active" data-sort="recent">Recent</button>
+          <button type="button" class="contacts-sort-btn" data-sort="alpha">A–Z</button>
+          <button type="button" class="contacts-sort-btn" data-sort="messages">Most messages</button>
+        </div>
+        <div class="contacts-list" id="contacts-list"></div>
+      </div>
+      <div class="contacts-pane-right">
+        <div class="contacts-detail-empty" id="contacts-detail-empty">Select a contact to see their details, tags, and relationship summary.</div>
+        <div class="contacts-detail-body" id="contacts-detail-body" hidden></div>
       </div>
     </div>
 
@@ -4466,6 +4576,13 @@ body::after {
       <span class="attach-name" id="attach-name"></span>
       <button class="attach-remove" id="attach-remove" aria-label="Remove attachment">&times;</button>
     </div>
+    <div class="scheduled-strip" id="scheduled-strip"></div>
+    <div class="schedule-custom" id="schedule-custom" hidden>
+      <label for="schedule-custom-input">Send at</label>
+      <input type="datetime-local" id="schedule-custom-input">
+      <button class="cd-btn primary" id="schedule-custom-go">Schedule</button>
+      <button class="cd-btn" id="schedule-custom-cancel" type="button">Cancel</button>
+    </div>
     <div class="compose-bar" id="compose-bar" style="display:none">
       <div class="compose-row">
         <input type="file" id="file-input" accept="image/*,video/*,audio/*" style="display:none">
@@ -4473,6 +4590,9 @@ body::after {
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
         </button>
         <textarea class="compose-input" id="compose-input" placeholder="Write a message..." rows="1" aria-label="Message"></textarea>
+        <button class="schedule-btn" id="schedule-btn" title="Schedule send" aria-label="Schedule send" disabled>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15 14"/></svg>
+        </button>
         <button class="send-btn" id="send-btn" disabled aria-label="Send message">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
         </button>
@@ -4600,6 +4720,12 @@ body::after {
   const $composeBar = document.getElementById('compose-bar');
   const $composeInput = document.getElementById('compose-input');
   const $sendBtn = document.getElementById('send-btn');
+  const $scheduleBtn = document.getElementById('schedule-btn');
+  const $scheduledStrip = document.getElementById('scheduled-strip');
+  const $scheduleCustom = document.getElementById('schedule-custom');
+  const $scheduleCustomInput = document.getElementById('schedule-custom-input');
+  const $scheduleCustomGo = document.getElementById('schedule-custom-go');
+  const $scheduleCustomCancel = document.getElementById('schedule-custom-cancel');
   const $fileInput = document.getElementById('file-input');
   const $attachBtn = document.getElementById('attach-btn');
   const $attachPreview = document.getElementById('attach-preview');
@@ -4659,6 +4785,10 @@ body::after {
   const $newMsgRoutes = document.getElementById('new-msg-routes');
   const $newMsgGo = document.getElementById('new-msg-go');
   const $newMsgError = document.getElementById('new-msg-error');
+  const $addContactName = document.getElementById('add-contact-name');
+  const $addContactNumber = document.getElementById('add-contact-number');
+  const $addContactGo = document.getElementById('add-contact-go');
+  const $addContactMsg = document.getElementById('add-contact-msg');
   const $newMsgSuggestions = document.getElementById('new-msg-suggestions');
   const $emptyStateCta = document.getElementById('empty-state-cta');
 
@@ -5220,6 +5350,29 @@ body::after {
       label.textContent = kind === 'video' ? 'Video unavailable' : 'Image unavailable';
     }
   }
+
+  // When messages are (re)rendered via innerHTML, an already-cached image can
+  // finish loading before — or without — its inline onload handler running,
+  // which would leave the spinner stuck on an image that's already visible.
+  // After each render, proactively resolve any image that's already complete so
+  // cached images never show a loading animation.
+  function resolveCompletedMedia(root = document) {
+    if (!root || !root.querySelectorAll) return;
+    root.querySelectorAll('.msg-media img').forEach((img) => {
+      if (!img.complete) return; // still loading (incl. off-screen lazy) — onload handles it
+      if (img.naturalWidth > 0) {
+        handleMediaLoad(img);
+      } else {
+        handleMediaError(img, 'image');
+      }
+    });
+  }
+
+  // The app runs inside an IIFE, but inline onload/onerror attributes execute in
+  // the global scope — so the media handlers must be reachable on window, or the
+  // loader would never be removed and every image would show a stuck spinner.
+  window.handleMediaLoad = handleMediaLoad;
+  window.handleMediaError = handleMediaError;
 
   function renderAvatarElement(el, { name = '', numbers = [], whatsAppConversationID = '', platforms = [], text = initials(name) || '?', background = avatarColor(name) } = {}) {
     if (!el) return;
@@ -7104,6 +7257,7 @@ body::after {
     $messagesArea.setAttribute('aria-busy', 'true');
     renderThreadPlaceholder('Loading messages...');
     await loadMessages(convo.ConversationID, {reset: true});
+    loadScheduledMessages(convo.ConversationID);
   }
 
   // ─── Load Messages ───
@@ -7493,7 +7647,9 @@ body::after {
     lastThreadSignature = sig;
 
     captureDraftEdits();
-    $messagesArea.innerHTML = '';
+    // Build into a fragment and reconcile against the existing DOM (below) so
+    // unchanged messages keep their nodes — a status update or a single new
+    // message must not tear down and re-flash the whole thread.
     const fragment = document.createDocumentFragment();
     const draftTextareasToAutosize = [];
     let lastDate = 0;
@@ -7505,6 +7661,8 @@ body::after {
           const divider = document.createElement('div');
           divider.className = 'date-divider';
           divider.textContent = formatDateDivider(m.TimestampMS);
+          divider.dataset.rk = 'date:' + new Date(m.TimestampMS).toDateString();
+          divider.dataset.rs = divider.textContent;
           fragment.appendChild(divider);
           lastDate = m.TimestampMS;
         }
@@ -7520,6 +7678,8 @@ body::after {
             sysText = '💬 ' + sysText;
           }
           sysEl.textContent = sysText;
+          sysEl.dataset.rk = 'sys:' + (m.MessageID || ('i' + absoluteMessageIndex));
+          sysEl.dataset.rs = (m.Status || '') + '|' + sysText;
           fragment.appendChild(sysEl);
           return;
         }
@@ -7694,8 +7854,12 @@ body::after {
           });
           row.appendChild(avatarDiv);
           row.appendChild(el);
+          row.dataset.rk = 'msg:' + (m.MessageID || ('i' + absoluteMessageIndex));
+          row.dataset.rs = messageRenderSignature(m) + '|mix' + (showMixedSourceChips ? '1' : '0') + '|snd' + (canSendActiveRoute ? '1' : '0') + '|last' + (isLastFromSender ? '1' : '0');
           fragment.appendChild(row);
         } else {
+          el.dataset.rk = 'msg:' + (m.MessageID || ('i' + absoluteMessageIndex));
+          el.dataset.rs = messageRenderSignature(m) + '|mix' + (showMixedSourceChips ? '1' : '0') + '|snd' + (canSendActiveRoute ? '1' : '0');
           fragment.appendChild(el);
         }
       });
@@ -7723,7 +7887,28 @@ body::after {
         });
       });
 
-      $messagesArea.appendChild(fragment);
+      // Reconcile: reuse any currently-rendered node whose key + signature is
+      // unchanged (so its DOM — and any already-loaded images — survive),
+      // replacing only what actually changed. This removes the multi-flash
+      // teardown when sending/receiving. Untagged nodes (drafts, optimistic
+      // sends) are always rebuilt.
+      const prevByKey = new Map();
+      Array.from($messagesArea.children).forEach((ch) => {
+        const k = ch.dataset.rk;
+        if (k) prevByKey.set(k, ch);
+      });
+      const finalEls = Array.from(fragment.children).map((fresh) => {
+        const k = fresh.dataset.rk;
+        if (k) {
+          const prev = prevByKey.get(k);
+          if (prev && prev.dataset.rs === fresh.dataset.rs) {
+            prevByKey.delete(k);
+            return prev;
+          }
+        }
+        return fresh;
+      });
+      $messagesArea.replaceChildren(...finalEls);
       draftTextareasToAutosize.forEach(autosizeDraftTextarea);
 
       // Update protocol indicator in header from most recent tombstone
@@ -7741,6 +7926,8 @@ body::after {
       hydrateLinkPreviews();
       hydrateNativeAvatars($messagesArea);
       scheduleMediaLoaderLabels($messagesArea);
+      resolveCompletedMedia($messagesArea);
+      requestAnimationFrame(() => resolveCompletedMedia($messagesArea));
       observeThreadContentResize();
       observeThreadViewportResize();
 
@@ -8055,6 +8242,12 @@ body::after {
       || browserIsOffline()
       || (hasText && !conversationSupportsOutbound(activeConversation))
       || (hasMedia && !conversationSupportsMediaOutbound(activeConversation));
+    // Schedule supports text and media attachments.
+    if ($scheduleBtn) {
+      const canScheduleText = hasText && conversationSupportsOutbound(activeConversation);
+      const canScheduleMedia = hasMedia && conversationSupportsMediaOutbound(activeConversation);
+      $scheduleBtn.disabled = !activeConversation || (!canScheduleText && !canScheduleMedia);
+    }
   }
 
   $composeInput.addEventListener('input', () => {
@@ -8078,7 +8271,7 @@ body::after {
     pendingFile = { file };
     $attachName.textContent = file.name || 'Attachment';
     $attachPreview.classList.add('active');
-    $sendBtn.disabled = false;
+    autoResize();
 
     if (file.type.startsWith('image/')) {
       const reader = new FileReader();
@@ -8820,7 +9013,10 @@ body::after {
     clearTimeout(threadRefreshTimer);
     threadRefreshTimer = setTimeout(() => {
       threadRefreshTimer = null;
-      if (activeConvoId) loadMessages(activeConvoId, {poll: true});
+      if (activeConvoId) {
+        loadMessages(activeConvoId, {poll: true});
+        loadScheduledMessages(activeConvoId);
+      }
     }, delay);
   }
 
@@ -9039,7 +9235,7 @@ body::after {
       document.querySelectorAll('.emoji-picker.show').forEach(p => p.classList.remove('show'));
       document.querySelectorAll('.emoji-full-panel.show').forEach(p => p.classList.remove('show'));
     }
-    if ($contextMenu && !$contextMenu.hidden && !e.target.closest('.context-menu') && !e.target.closest('.chat-header-action-btn') && !e.target.closest('#bulk-move-btn')) {
+    if ($contextMenu && !$contextMenu.hidden && !e.target.closest('.context-menu') && !e.target.closest('.chat-header-action-btn') && !e.target.closest('#bulk-move-btn') && !e.target.closest('#schedule-btn')) {
       closeContextMenu();
     }
   });
@@ -9087,6 +9283,11 @@ body::after {
         if (context.type === 'tab' && context.tabId) {
           if (action === 'rename-tab') { await renameTabFlow(context.tabId); return; }
           if (action === 'delete-tab') { await deleteTabFlow(context.tabId); return; }
+        }
+        if (context.type === 'schedule') {
+          if (action === 'sched:9') { scheduleSend(nextDayAtHour(9)); return; }
+          if (action === 'sched:17') { scheduleSend(nextDayAtHour(17)); return; }
+          if (action === 'sched:custom') { showScheduleCustom(); return; }
         }
         if (context.type === 'message' && context.message) {
           const message = context.message;
@@ -9221,6 +9422,8 @@ body::after {
     activeConvoId = null;
     activeConvoIsGroup = false;
     activeConversation = null;
+    if ($scheduledStrip) $scheduledStrip.innerHTML = '';
+    hideScheduleCustom();
     syncConversationURL('');
     activeProtocolDetail = '';
     clearTimeout(threadRefreshTimer);
@@ -9367,8 +9570,8 @@ body::after {
     if (!phone || !routes.length) {
       $newMsgRoutes.classList.remove('active');
       $newMsgRoutes.innerHTML = '';
-      $newMsgHelper.textContent = 'New conversations start on SMS. If this number already exists on another route, choose it explicitly below.';
-      $newMsgGo.textContent = 'Start conversation';
+      $newMsgHelper.textContent = '';
+      updateNewMsgButtonLabel();
       return;
     }
 
@@ -9393,9 +9596,13 @@ body::after {
     $newMsgError.style.display = 'none';
     $newMsgGo.disabled = false;
     $newMsgGo.textContent = 'Start conversation';
-    $newMsgHelper.textContent = 'Type a name from your contacts, or paste a phone number.';
+    $newMsgHelper.textContent = 'Add one person, or add several (Enter after each) to start a group.';
     $newMsgRoutes.classList.remove('active');
     $newMsgRoutes.innerHTML = '';
+    resetNewMsgRecipients();
+    if ($addContactName) $addContactName.value = '';
+    if ($addContactNumber) $addContactNumber.value = '';
+    if ($addContactMsg) $addContactMsg.style.display = 'none';
     hideSuggestions();
     setTimeout(() => $newMsgPhone.focus(), 100);
   }
@@ -9404,6 +9611,37 @@ body::after {
     $newMsgOverlay.classList.remove('show');
     hideSuggestions();
   }
+
+  // ── Save a local contact (name + number) ──
+  async function saveLocalContact() {
+    if (!$addContactGo) return;
+    const name = ($addContactName.value || '').trim();
+    const number = ($addContactNumber.value || '').trim();
+    if (!name && !number) return;
+    $addContactGo.disabled = true;
+    try {
+      await postJSON('/api/contacts', { name, number });
+      $addContactName.value = '';
+      $addContactNumber.value = '';
+      if ($addContactMsg) {
+        $addContactMsg.style.display = 'block';
+        $addContactMsg.style.color = 'var(--text-secondary)';
+        $addContactMsg.textContent = `Saved ${name || number}.`;
+      }
+    } catch (err) {
+      if ($addContactMsg) {
+        $addContactMsg.style.display = 'block';
+        $addContactMsg.style.color = '';
+        $addContactMsg.textContent = err.message || 'Failed to save contact.';
+      }
+    } finally {
+      $addContactGo.disabled = false;
+    }
+  }
+  if ($addContactGo) $addContactGo.addEventListener('click', saveLocalContact);
+  if ($addContactNumber) $addContactNumber.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); saveLocalContact(); }
+  });
 
   // ── Contact autocomplete ──
   // When the user types a name (anything that isn't pure phone-number chars),
@@ -9446,10 +9684,8 @@ body::after {
         // mousedown so we fire before the input loses focus
         e.preventDefault();
         const phone = c.number || c.Number || '';
-        $newMsgPhone.value = phone;
-        hideSuggestions();
-        updateNewMessageRoutes();
-        $newMsgPhone.focus();
+        const display = c.name || c.Name || phone;
+        addNewMsgRecipient(display, phone);
       });
       $newMsgSuggestions.appendChild(row);
     });
@@ -9512,50 +9748,94 @@ body::after {
       : 'Connection check complete.');
   }
 
-  async function startNewConversation() {
+  // ── Recipients (supports multiple → group conversations) ──
+  let newMsgRecipients = []; // [{ display, number }]
+  const $newMsgRecipients = document.getElementById('new-msg-recipients');
+
+  function recipientNumberKey(num) {
+    return String(num || '').replace(/\D/g, '') || String(num || '');
+  }
+
+  function renderNewMsgRecipients() {
+    if ($newMsgRecipients) {
+      if (!newMsgRecipients.length) {
+        $newMsgRecipients.hidden = true;
+        $newMsgRecipients.innerHTML = '';
+      } else {
+        $newMsgRecipients.hidden = false;
+        $newMsgRecipients.innerHTML = newMsgRecipients.map((r, i) =>
+          `<span class="new-msg-recipient-chip">${escapeHtml(r.display)}<button type="button" data-idx="${i}" aria-label="Remove">&times;</button></span>`
+        ).join('');
+        $newMsgRecipients.querySelectorAll('button[data-idx]').forEach(btn => {
+          btn.addEventListener('click', () => removeNewMsgRecipient(parseInt(btn.dataset.idx, 10)));
+        });
+      }
+    }
+    // Keep the helper area clean while choosing recipients. When there are no
+    // recipients, leave the helper to updateNewMessageRoutes (route detection)
+    // and openNewMsg (the initial hint).
+    if ($newMsgHelper && newMsgRecipients.length) {
+      $newMsgHelper.textContent = '';
+    }
+    updateNewMsgButtonLabel();
+  }
+
+  function updateNewMsgButtonLabel() {
+    // When route detection is showing existing routes for a single number, it
+    // owns the button label ("Open SMS route"); don't override it.
+    if ($newMsgRoutes && $newMsgRoutes.classList.contains('active')) return;
+    const pending = $newMsgPhone.value.trim();
+    const count = newMsgRecipients.length + (pending && looksLikePhoneNumber(pending) ? 1 : 0);
+    $newMsgGo.textContent = count >= 2 ? 'Start group conversation' : 'Start conversation';
+  }
+
+  function addNewMsgRecipient(display, number) {
+    const num = String(number || '').trim();
+    if (!num) return;
+    const key = recipientNumberKey(num);
+    if (!newMsgRecipients.some(r => recipientNumberKey(r.number) === key)) {
+      newMsgRecipients.push({ display: String(display || num).trim(), number: num });
+    }
+    $newMsgPhone.value = '';
+    hideSuggestions();
+    $newMsgRoutes.classList.remove('active');
+    $newMsgRoutes.innerHTML = '';
+    renderNewMsgRecipients();
+    $newMsgPhone.focus();
+  }
+
+  function removeNewMsgRecipient(idx) {
+    newMsgRecipients.splice(idx, 1);
+    renderNewMsgRecipients();
+    $newMsgPhone.focus();
+  }
+
+  // Commit whatever is typed into the input as a recipient chip. Returns false
+  // only when the text is a name with no contact match (can't be a recipient).
+  function commitPendingRecipient() {
     const raw = $newMsgPhone.value.trim();
-    if (!raw) return;
+    if (!raw) return true;
+    if (!looksLikePhoneNumber(raw)) return false;
+    addNewMsgRecipient(raw.replace(/[\s\-()]/g, ''), raw.replace(/[\s\-()]/g, ''));
+    return true;
+  }
 
-    // If they typed a name and there's a suggestion visible, prefer that.
-    if (!looksLikePhoneNumber(raw) && $newMsgSuggestions && !$newMsgSuggestions.hidden) {
-      const first = $newMsgSuggestions.querySelector('.new-msg-suggestion');
-      if (first) { first.dispatchEvent(new MouseEvent('mousedown')); return; }
-    }
+  function resetNewMsgRecipients() {
+    newMsgRecipients = [];
+    renderNewMsgRecipients();
+  }
 
-    // If they typed a name with no matching contact, refuse rather than
-    // sending an unparseable string to the new-conversation endpoint.
-    if (!looksLikePhoneNumber(raw)) {
-      $newMsgError.textContent = 'No matching contact. Type a phone number to start a new thread.';
-      $newMsgError.style.display = 'block';
-      return;
-    }
-
-    const phone = raw.replace(/[\s\-()]/g, '');
-    const existingReplyRoute = preferredReplyRoute(matchingRoutesForPhone(phone));
-    if (existingReplyRoute) {
-      closeNewMsg();
-      await revealAndSelectConversation(existingReplyRoute);
-      return;
-    }
-    if (browserIsOffline()) {
-      $newMsgError.textContent = offlineFeedbackMessage('start-conversation');
-      $newMsgError.style.display = 'block';
-      return;
-    }
-
+  async function createConversationRequest(body, fallbackName) {
     $newMsgGo.disabled = true;
     $newMsgGo.innerHTML = '<span class="spinner" aria-hidden="true"></span>Connecting...';
     $newMsgError.style.display = 'none';
-
-    // Hard timeout so the button never hangs forever if the backend stalls.
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 15000);
-
     try {
       const resp = await fetch(API + '/api/new-conversation', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ phone_number: phone }),
+        body: JSON.stringify(body),
         signal: controller.signal,
       });
       if (!resp.ok) {
@@ -9563,17 +9843,12 @@ body::after {
       }
       const data = await resp.json();
       closeNewMsg();
-      // Refresh conversation list and select the new one
       await loadConversations();
       const convo = conversations.find(c => c.ConversationID === data.conversation_id);
       if (convo) {
         revealAndSelectConversation(convo);
       } else {
-        // Conversation might not be in the list yet, create a minimal one
-        revealAndSelectConversation({
-          ConversationID: data.conversation_id,
-          Name: data.name || phone,
-        });
+        revealAndSelectConversation({ ConversationID: data.conversation_id, Name: data.name || fallbackName });
       }
     } catch (err) {
       const isAbort = err && err.name === 'AbortError';
@@ -9582,10 +9857,50 @@ body::after {
         : (userFacingErrorMessage(err, 'start-conversation') || 'Failed to start conversation');
       $newMsgError.style.display = 'block';
       $newMsgGo.disabled = false;
-      $newMsgGo.textContent = 'Start conversation';
+      updateNewMsgButtonLabel();
     } finally {
       clearTimeout(timeoutId);
     }
+  }
+
+  async function startNewConversation() {
+    // Pull in whatever is still typed in the box.
+    const raw = $newMsgPhone.value.trim();
+    if (raw && !commitPendingRecipient()) {
+      if ($newMsgSuggestions && !$newMsgSuggestions.hidden) {
+        const first = $newMsgSuggestions.querySelector('.new-msg-suggestion');
+        if (first) { first.dispatchEvent(new MouseEvent('mousedown')); return; }
+      }
+      $newMsgError.textContent = 'No matching contact. Type a phone number to add a recipient.';
+      $newMsgError.style.display = 'block';
+      return;
+    }
+
+    const recipients = newMsgRecipients.slice();
+    if (!recipients.length) {
+      $newMsgError.textContent = 'Add at least one recipient.';
+      $newMsgError.style.display = 'block';
+      return;
+    }
+
+    if (recipients.length === 1) {
+      // 1:1 — reuse an existing route if this number already has a thread.
+      const phone = recipients[0].number;
+      const existingReplyRoute = preferredReplyRoute(matchingRoutesForPhone(phone));
+      if (existingReplyRoute) {
+        closeNewMsg();
+        await revealAndSelectConversation(existingReplyRoute);
+        return;
+      }
+      await createConversationRequest({ phone_number: phone }, phone);
+      return;
+    }
+
+    // Group conversation.
+    await createConversationRequest(
+      { phone_numbers: recipients.map(r => r.number) },
+      recipients.map(r => r.display).join(', '),
+    );
   }
 
   $newMsgBtn.addEventListener('click', openNewMsg);
@@ -9617,13 +9932,14 @@ body::after {
   $newMsgClose.addEventListener('click', closeNewMsg);
   $newMsgGo.addEventListener('click', startNewConversation);
   $newMsgPhone.addEventListener('input', () => {
-    updateNewMessageRoutes();
+    if (!newMsgRecipients.length) updateNewMessageRoutes();
+    updateNewMsgButtonLabel();
     scheduleContactSearch();
   });
   $newMsgPhone.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') {
+    if (e.key === 'Enter' || e.key === ',') {
       e.preventDefault();
-      // If suggestions are visible, pick the first one
+      // If suggestions are visible, pick the first one (adds it as a recipient).
       const firstSuggestion = $newMsgSuggestions && !$newMsgSuggestions.hidden
         ? $newMsgSuggestions.querySelector('.new-msg-suggestion')
         : null;
@@ -9631,7 +9947,18 @@ body::after {
         firstSuggestion.dispatchEvent(new MouseEvent('mousedown'));
         return;
       }
-      startNewConversation();
+      // Commit the typed number as a recipient chip; keep the box open to add more.
+      if ($newMsgPhone.value.trim()) {
+        if (commitPendingRecipient()) return;
+      }
+      // Empty box + Enter starts the conversation with the recipients added so far.
+      if (e.key === 'Enter') startNewConversation();
+      return;
+    }
+    if (e.key === 'Backspace' && !$newMsgPhone.value && newMsgRecipients.length) {
+      e.preventDefault();
+      removeNewMsgRecipient(newMsgRecipients.length - 1);
+      return;
     }
     if (e.key === 'Escape') {
       e.preventDefault();
@@ -9698,6 +10025,356 @@ body::after {
     };
   }
 
+  // ─── Contacts / CRM view ───
+  const $contactsBtn = document.getElementById('contacts-btn');
+  const $contactsOverlay = document.getElementById('contacts-overlay');
+  const $contactsClose = document.getElementById('contacts-close');
+  const $contactsSearchInput = document.getElementById('contacts-search-input');
+  const $contactsList = document.getElementById('contacts-list');
+  const $contactsDetailEmpty = document.getElementById('contacts-detail-empty');
+  const $contactsDetailBody = document.getElementById('contacts-detail-body');
+  let contactsCurrentKey = null;
+  let contactsSearchTimer = null;
+  let contactsPeople = [];
+  let contactsSortMode = 'recent';
+
+  function openContacts() {
+    if (!$contactsOverlay) return;
+    $contactsOverlay.classList.add('show');
+    loadPeople('');
+    if ($contactsSearchInput) { $contactsSearchInput.value = ''; setTimeout(() => $contactsSearchInput.focus(), 80); }
+  }
+  function closeContacts() {
+    if ($contactsOverlay) $contactsOverlay.classList.remove('show');
+  }
+
+  function formatLastContacted(ts) {
+    if (!ts) return 'Never contacted';
+    const days = Math.floor((Date.now() - ts) / 86400000);
+    if (days <= 0) return 'Today';
+    if (days === 1) return 'Yesterday';
+    if (days < 30) return `${days} days ago`;
+    if (days < 365) return `${Math.floor(days / 30)} mo ago`;
+    return new Date(ts).toLocaleDateString([], { year: 'numeric', month: 'short' });
+  }
+
+  async function loadPeople(q) {
+    if (!$contactsList) return;
+    try {
+      const people = await fetchJSON(`/api/people${q ? `?q=${encodeURIComponent(q)}` : ''}`);
+      contactsPeople = Array.isArray(people) ? people : [];
+      renderContactsList(sortPeople(contactsPeople));
+    } catch (err) {
+      $contactsList.innerHTML = `<div style="padding:24px;color:var(--text-muted);font-size:13px">Failed to load contacts.</div>`;
+    }
+  }
+
+  function personHasName(p) {
+    return /[a-z]/i.test(String(p.name || ''));
+  }
+
+  // Sort the loaded people by the active mode without re-fetching.
+  function sortPeople(people) {
+    const list = people.slice();
+    if (contactsSortMode === 'alpha') {
+      // Named contacts A–Z first; "numbers only" names sorted last.
+      list.sort((a, b) => {
+        const an = personHasName(a), bn = personHasName(b);
+        if (an !== bn) return an ? -1 : 1;
+        return String(a.name || '').localeCompare(String(b.name || ''), undefined, { sensitivity: 'base' });
+      });
+    } else if (contactsSortMode === 'messages') {
+      list.sort((a, b) => (b.message_count || 0) - (a.message_count || 0) || (b.last_contacted_ts || 0) - (a.last_contacted_ts || 0));
+    } else {
+      list.sort((a, b) => (b.last_contacted_ts || 0) - (a.last_contacted_ts || 0));
+    }
+    return list;
+  }
+
+  function setContactsSort(mode) {
+    if (contactsSortMode === mode) return;
+    contactsSortMode = mode;
+    document.querySelectorAll('#contacts-sort .contacts-sort-btn').forEach(b => b.classList.toggle('active', b.dataset.sort === mode));
+    renderContactsList(sortPeople(contactsPeople));
+  }
+
+  function renderContactsList(people) {
+    if (!people.length) {
+      $contactsList.innerHTML = `<div style="padding:24px;color:var(--text-muted);font-size:13px">No contacts found.</div>`;
+      return;
+    }
+    $contactsList.innerHTML = '';
+    people.forEach(p => {
+      const el = document.createElement('div');
+      el.className = 'contact-row' + (p.key === contactsCurrentKey ? ' active' : '');
+      el.dataset.key = p.key;
+      const due = p.overdue ? '<span class="contact-row-due">Due</span>' : '';
+      el.innerHTML = `
+        ${avatarHTML({ name: p.name, numbers: p.numbers || [], className: 'convo-avatar', style: `background:${avatarColor(p.name)}` })}
+        <div class="contact-row-meta">
+          <div class="contact-row-name">${escapeHtml(p.name)}</div>
+          <div class="contact-row-sub">${escapeHtml(formatLastContacted(p.last_contacted_ts))} · ${p.message_count || 0} msg${p.message_count === 1 ? '' : 's'}</div>
+        </div>
+        ${due}
+      `;
+      el.addEventListener('click', () => selectPerson(p.key));
+      $contactsList.appendChild(el);
+    });
+    hydrateNativeAvatars($contactsList);
+  }
+
+  async function selectPerson(key) {
+    contactsCurrentKey = key;
+    $contactsList.querySelectorAll('.contact-row').forEach(r => r.classList.toggle('active', r.dataset.key === key));
+    $contactsDetailEmpty.style.display = 'none';
+    $contactsDetailBody.hidden = false;
+    $contactsDetailBody.innerHTML = `<div style="color:var(--text-muted);font-size:13px">Loading…</div>`;
+    try {
+      const p = await fetchJSON(`/api/people/${encodeURIComponent(key)}`);
+      renderPersonDetail(p);
+    } catch (err) {
+      $contactsDetailBody.innerHTML = `<div style="color:var(--text-muted)">Failed to load contact.</div>`;
+    }
+  }
+
+  function renderPersonDetail(p) {
+    const numbers = p.numbers || [];
+    const platforms = p.platforms || [];
+    const tags = p.tags || [];
+    let dueHtml = '';
+    if (p.reach_out_days > 0) {
+      dueHtml = p.overdue
+        ? `<span class="cd-due-pill overdue">Overdue</span>`
+        : `<span class="cd-due-pill ok">On track</span>`;
+    }
+    let infoRows = '';
+    if (numbers.length) infoRows += `<div class="cd-info-row"><span class="k">Phone</span><span>${numbers.map(escapeHtml).join('<br>')}</span></div>`;
+    if (platforms.length) infoRows += `<div class="cd-info-row"><span class="k">Platforms</span><span>${platforms.map(escapeHtml).join(', ')}</span></div>`;
+    infoRows += `<div class="cd-info-row"><span class="k">Last contacted</span><span>${escapeHtml(formatLastContacted(p.last_contacted_ts))}</span></div>`;
+    infoRows += `<div class="cd-info-row"><span class="k">Messages</span><span>${p.message_count || 0}</span></div>`;
+
+    const tagsHtml = tags.map((t, i) => `<span class="cd-tag">${escapeHtml(t)}<button data-tag-idx="${i}" title="Remove">&times;</button></span>`).join('');
+
+    $contactsDetailBody.innerHTML = `
+      <div class="cd-head">
+        ${avatarHTML({ name: p.name, numbers: numbers, className: 'convo-avatar', style: `background:${avatarColor(p.name)}` })}
+        <div>
+          <div class="cd-name">${escapeHtml(p.name)}</div>
+          <div class="cd-sub">${escapeHtml(formatLastContacted(p.last_contacted_ts))} · ${p.message_count || 0} messages</div>
+        </div>
+      </div>
+      ${(p.conversation_ids && p.conversation_ids.length) ? `<div class="cd-section"><button class="cd-btn primary" id="cd-open-convo">Open conversation${p.conversation_ids.length > 1 ? 's' : ''}</button></div>` : ''}
+      <div class="cd-section">
+        <div class="cd-label">Contact information</div>
+        ${infoRows}
+      </div>
+      <div class="cd-section">
+        <div class="cd-label">Tags</div>
+        <div class="cd-tags" id="cd-tags">
+          ${tagsHtml}
+          <input type="text" class="cd-tag-input" id="cd-tag-input" placeholder="Add tag…" autocomplete="off">
+        </div>
+      </div>
+      <div class="cd-section">
+        <div class="cd-label">Reach-out reminder ${dueHtml}</div>
+        <div class="cd-tickler">
+          <span class="muted">Remind me to reach out every</span>
+          <input type="number" id="cd-reachout-input" min="0" max="3650" value="${p.reach_out_days || ''}" placeholder="0">
+          <span class="muted">days</span>
+          <button class="cd-btn primary" id="cd-reachout-save">Save</button>
+        </div>
+      </div>
+      <div class="cd-section">
+        <div class="cd-label">Relationship summary</div>
+        <div class="cd-summary" id="cd-summary">${escapeHtml(p.summary || 'No summary yet.')}</div>
+        <div style="margin-top:12px"><button class="cd-btn" id="cd-summary-regen">Regenerate</button></div>
+      </div>
+    `;
+    wirePersonDetail(p);
+  }
+
+  async function openPersonConversation(p) {
+    const ids = (p && p.conversation_ids) || [];
+    if (!ids.length) return;
+    closeContacts();
+    let convo = null;
+    for (const id of ids) { // ids are most-recent-first
+      convo = allConversations.find(c => c.ConversationID === id);
+      if (convo) break;
+    }
+    if (!convo) {
+      // Not in the loaded set yet — reload conversations, then try again.
+      await loadConversations();
+      convo = allConversations.find(c => ids.includes(c.ConversationID)) || null;
+    }
+    if (convo) await revealAndSelectConversation(convo);
+  }
+
+  function wirePersonDetail(p) {
+    const key = p.key;
+    const tags = (p.tags || []).slice();
+    const openBtn = document.getElementById('cd-open-convo');
+    if (openBtn) openBtn.addEventListener('click', () => openPersonConversation(p));
+    const refresh = () => { selectPerson(key); loadPeople($contactsSearchInput.value.trim()); };
+    const saveTags = async (next) => {
+      try { await postJSON(`/api/people/${encodeURIComponent(key)}/tags`, { tags: next }); refresh(); }
+      catch (err) { showThreadFeedback(err.message || 'Failed to save tags.'); }
+    };
+    const tagInput = document.getElementById('cd-tag-input');
+    if (tagInput) tagInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); const v = tagInput.value.trim(); if (v) saveTags([...tags, v]); }
+    });
+    document.querySelectorAll('#cd-tags .cd-tag button').forEach(btn => {
+      btn.addEventListener('click', () => { const idx = parseInt(btn.dataset.tagIdx, 10); saveTags(tags.filter((_, i) => i !== idx)); });
+    });
+    const reachSave = document.getElementById('cd-reachout-save');
+    if (reachSave) reachSave.addEventListener('click', async () => {
+      const days = parseInt(document.getElementById('cd-reachout-input').value, 10) || 0;
+      try { await postJSON(`/api/people/${encodeURIComponent(key)}/reach-out`, { days }); refresh(); }
+      catch (err) { showThreadFeedback(err.message || 'Failed to save reminder.'); }
+    });
+    const regen = document.getElementById('cd-summary-regen');
+    if (regen) regen.addEventListener('click', async () => {
+      regen.disabled = true; regen.textContent = 'Generating…';
+      try { const updated = await postJSON(`/api/people/${encodeURIComponent(key)}/summary`, {}); document.getElementById('cd-summary').textContent = updated.summary || 'No summary.'; }
+      catch (err) { showThreadFeedback(err.message || 'Failed to generate summary.'); }
+      finally { regen.disabled = false; regen.textContent = 'Regenerate'; }
+    });
+  }
+
+  // ─── Scheduled (send-later) messages ───
+  function nextDayAtHour(hour) {
+    const d = new Date();
+    d.setDate(d.getDate() + 1);
+    d.setHours(hour, 0, 0, 0);
+    return d.getTime();
+  }
+
+  function openScheduleMenu() {
+    if (!$scheduleBtn || $scheduleBtn.disabled) return;
+    const rect = $scheduleBtn.getBoundingClientRect();
+    openContextMenuAt(rect.left - 60, rect.top - 8, [
+      { label: 'Tomorrow 9:00 AM', action: 'sched:9' },
+      { label: 'Tomorrow 5:00 PM', action: 'sched:17' },
+      { type: 'divider' },
+      { label: 'Custom date & time…', action: 'sched:custom' },
+    ], { type: 'schedule' });
+  }
+
+  function formatScheduledWhen(ts) {
+    const d = new Date(ts);
+    const now = new Date();
+    const opts = { hour: 'numeric', minute: '2-digit' };
+    const tomorrow = new Date(now); tomorrow.setDate(now.getDate() + 1);
+    if (d.toDateString() === now.toDateString()) return `Today ${d.toLocaleTimeString([], opts)}`;
+    if (d.toDateString() === tomorrow.toDateString()) return `Tomorrow ${d.toLocaleTimeString([], opts)}`;
+    return d.toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' }) + ' ' + d.toLocaleTimeString([], opts);
+  }
+
+  async function scheduleSend(sendAt) {
+    if (!activeConvoId) return;
+    const text = $composeInput.value.trim();
+    const hasMedia = !!pendingFile;
+    if (!text && !hasMedia) { showThreadFeedback('Type a message or attach a file to schedule.'); return; }
+    if (!Number.isFinite(sendAt) || sendAt < Date.now() + 10000) {
+      showThreadFeedback('Pick a time at least a moment in the future.');
+      return;
+    }
+    const replyId = replyToMsg ? replyToMsg.MessageID : '';
+    try {
+      if (hasMedia) {
+        const form = new FormData();
+        form.append('conversation_id', activeConvoId);
+        form.append('file', pendingFile.file);
+        form.append('caption', text);
+        form.append('reply_to_id', replyId);
+        form.append('send_at', String(sendAt));
+        const resp = await fetch(API + '/api/schedule-media', { method: 'POST', body: form });
+        if (!resp.ok) {
+          const msg = await resp.text();
+          throw new Error(msg || 'Failed to schedule attachment.');
+        }
+        clearAttachment();
+      } else {
+        await postJSON('/api/schedule', {
+          conversation_id: activeConvoId,
+          body: text,
+          reply_to_id: replyId,
+          send_at: sendAt,
+        });
+      }
+      $composeInput.value = '';
+      autoResize();
+      if (replyToMsg) clearReply();
+      hideScheduleCustom();
+      showThreadFeedback(`Scheduled for ${formatScheduledWhen(sendAt)}.`);
+      loadScheduledMessages(activeConvoId);
+    } catch (err) {
+      showThreadFeedback(err.message || 'Failed to schedule message.');
+    }
+  }
+
+  async function loadScheduledMessages(convId) {
+    if (!$scheduledStrip) return;
+    if (!convId) { $scheduledStrip.innerHTML = ''; return; }
+    try {
+      const list = await fetchJSON(`/api/schedule?conversation_id=${encodeURIComponent(convId)}`);
+      if (activeConvoId !== convId) return;
+      renderScheduledStrip(Array.isArray(list) ? list : []);
+    } catch (err) {
+      $scheduledStrip.innerHTML = '';
+    }
+  }
+
+  function renderScheduledStrip(list) {
+    if (!$scheduledStrip) return;
+    const clock = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15 14"/></svg>';
+    $scheduledStrip.innerHTML = list.map(s => {
+      const failed = s.status === 'failed';
+      const when = failed
+        ? `Couldn't send: ${escapeHtml(s.last_error || 'failed')}`
+        : `Scheduled for ${escapeHtml(formatScheduledWhen(s.send_at))}`;
+      const paperclip = '<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:4px;"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>';
+      let textHtml;
+      if (s.media_filename) {
+        const cap = s.body ? escapeHtml(s.body) : escapeHtml(s.media_filename);
+        textHtml = `${paperclip}${cap}`;
+      } else {
+        textHtml = escapeHtml(s.body);
+      }
+      return `<div class="scheduled-item${failed ? ' failed' : ''}">
+        ${clock}
+        <div class="scheduled-item-body">
+          <div class="scheduled-item-text">${textHtml}</div>
+          <div class="scheduled-item-when">${when}</div>
+        </div>
+        <button class="scheduled-item-cancel" data-id="${escapeHtml(s.id)}" title="Cancel" aria-label="Cancel scheduled message">&times;</button>
+      </div>`;
+    }).join('');
+    $scheduledStrip.querySelectorAll('.scheduled-item-cancel').forEach(btn => {
+      btn.addEventListener('click', () => cancelScheduled(btn.dataset.id));
+    });
+  }
+
+  async function cancelScheduled(id) {
+    try {
+      await fetch(API + `/api/schedule/${encodeURIComponent(id)}`, { method: 'DELETE' });
+    } catch (err) { /* ignore */ }
+    loadScheduledMessages(activeConvoId);
+  }
+
+  function showScheduleCustom() {
+    if (!$scheduleCustom || !$scheduleCustomInput) return;
+    const d = new Date(nextDayAtHour(9));
+    const pad = n => String(n).padStart(2, '0');
+    $scheduleCustomInput.value = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    $scheduleCustom.hidden = false;
+    setTimeout(() => $scheduleCustomInput.focus(), 50);
+  }
+  function hideScheduleCustom() {
+    if ($scheduleCustom) $scheduleCustom.hidden = true;
+  }
+
   // ─── Init ───
   syncNotificationButton();
   refreshNativeNotificationState()
@@ -9707,6 +10384,25 @@ body::after {
   if ($selectToggleBtn) $selectToggleBtn.addEventListener('click', toggleSelectionMode);
   if ($bulkCancelBtn) $bulkCancelBtn.addEventListener('click', exitSelectionMode);
   if ($bulkMoveBtn) $bulkMoveBtn.addEventListener('click', openBulkMoveMenu);
+  if ($scheduleBtn) $scheduleBtn.addEventListener('click', openScheduleMenu);
+  if ($scheduleCustomCancel) $scheduleCustomCancel.addEventListener('click', hideScheduleCustom);
+  if ($scheduleCustomGo) $scheduleCustomGo.addEventListener('click', () => {
+    const v = $scheduleCustomInput && $scheduleCustomInput.value;
+    if (!v) { showThreadFeedback('Pick a date and time.'); return; }
+    scheduleSend(new Date(v).getTime());
+  });
+  if ($contactsBtn) $contactsBtn.addEventListener('click', openContacts);
+  if ($contactsClose) $contactsClose.addEventListener('click', closeContacts);
+  if ($contactsSearchInput) $contactsSearchInput.addEventListener('input', () => {
+    clearTimeout(contactsSearchTimer);
+    contactsSearchTimer = setTimeout(() => loadPeople($contactsSearchInput.value.trim()), 200);
+  });
+  document.querySelectorAll('#contacts-sort .contacts-sort-btn').forEach(btn => {
+    btn.addEventListener('click', () => setContactsSort(btn.dataset.sort));
+  });
+  window.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && $contactsOverlay && $contactsOverlay.classList.contains('show')) closeContacts();
+  });
   startEventStream();
   loadTabs();
   loadConversations();

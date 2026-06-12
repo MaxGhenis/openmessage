@@ -1050,3 +1050,28 @@ test('discards an AI draft from the thread banner', async ({ page }) => {
   await page.locator('.draft-discard-btn').click();
   await expect(page.locator('.draft-banner')).toHaveCount(0);
 });
+
+test('reuses existing message nodes on new messages (no full-thread re-render flash)', async ({ page, request, baseURL }) => {
+  await openConversation(page, 'Sarah Chen');
+  await expect.poll(async () => page.locator('#messages-area .msg').count()).toBeGreaterThan(0);
+
+  // Tag every currently-rendered message node so we can detect teardown.
+  const before = await page.locator('#messages-area .msg').evaluateAll((els) => {
+    els.forEach((el, i) => el.setAttribute('data-reuse-test', 'm' + i));
+    return els.length;
+  });
+  expect(before).toBeGreaterThan(0);
+
+  // Inject a new (from-me) message -> SSE -> the thread re-renders. Sending it
+  // as from-me leaves every existing message unchanged, so all should survive.
+  const resp = await request.post(`${baseURL}/_e2e/messages`, {
+    data: { conversation_id: 'conv1', body: 'reuse-test new message', is_from_me: true },
+  });
+  expect(resp.ok()).toBeTruthy();
+  await expect(page.locator('#messages-area')).toContainText('reuse-test new message');
+
+  // The previously-rendered nodes must still carry their marker — i.e. they were
+  // reused, not destroyed and rebuilt. A full innerHTML teardown would drop them.
+  const survived = await page.locator('#messages-area .msg[data-reuse-test]').count();
+  expect(survived).toBe(before);
+});

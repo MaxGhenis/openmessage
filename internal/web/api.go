@@ -1,11 +1,13 @@
 package web
 
 import (
+	"crypto/rand"
 	"embed"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"io/fs"
 	"net"
@@ -75,6 +77,7 @@ type APIOptions struct {
 	StartDeepBackfill     func() bool
 	BackfillStatus        func() any         // returns a JSON-serializable backfill progress snapshot
 	BackfillPhone         func(string) error // targeted backfill for a single phone number
+	SyncGoogleContacts    func() (int, error) // read-only pull of Google Messages contacts
 }
 
 type SearchResult struct {
@@ -671,6 +674,36 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 	})
 
 	mux.HandleFunc("/api/contacts", func(w http.ResponseWriter, r *http.Request) {
+		// POST creates a local contact (name + number). This is stored only in
+		// this app's database — it is not pushed to your Google account, since
+		// the linked Google Messages protocol has no create-contact API.
+		if r.Method == http.MethodPost {
+			var req struct {
+				Name   string `json:"name"`
+				Number string `json:"number"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				httpError(w, "invalid JSON: "+err.Error(), 400)
+				return
+			}
+			name := strings.TrimSpace(req.Name)
+			number := strings.TrimSpace(req.Number)
+			if name == "" && number == "" {
+				httpError(w, "name or number is required", 400)
+				return
+			}
+			contact := &db.Contact{
+				ContactID: "local:" + localContactID(name, number),
+				Name:      name,
+				Number:    number,
+			}
+			if err := store.UpsertContact(contact); err != nil {
+				httpError(w, "add contact: "+err.Error(), 500)
+				return
+			}
+			writeJSON(w, contact)
+			return
+		}
 		q := strings.TrimSpace(r.URL.Query().Get("q"))
 		limit := queryInt(r, "limit", 20)
 		if limit <= 0 || limit > 100 {
@@ -709,6 +742,310 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			contacts = []*db.Contact{}
 		}
 		writeJSON(w, contacts)
+	})
+
+	// Pull contacts from the linked Google Messages account. Read-only — it only
+	// lists contacts and never creates conversations, so it can't flood the inbox.
+	mux.HandleFunc("/api/contacts/sync", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			httpError(w, "method not allowed", 405)
+			return
+		}
+		if opts.SyncGoogleContacts == nil {
+			httpError(w, "contact sync unavailable", 501)
+			return
+		}
+		n, err := opts.SyncGoogleContacts()
+		if err != nil {
+			httpError(w, "sync contacts: "+err.Error(), 500)
+			return
+		}
+		writeJSON(w, map[string]any{"synced": n})
+	})
+
+	// ── People / CRM view ─────────────────────────────────────────────────
+	// GET /api/people — everyone you've messaged, with tags + reach-out status.
+	mux.HandleFunc("/api/people", func(w http.ResponseWriter, r *http.Request) {
+		people, err := store.ListMessagedPeople()
+		if err != nil {
+			httpError(w, "list people: "+err.Error(), 500)
+			return
+		}
+		metaMap, _ := store.GetContactMetaMap()
+		now := time.Now().UnixMilli()
+		q := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("q")))
+		out := make([]*personPayload, 0, len(people))
+		for _, p := range people {
+			if q != "" && !strings.Contains(strings.ToLower(p.Name), q) {
+				match := false
+				for _, num := range p.Numbers {
+					if strings.Contains(num, q) {
+						match = true
+						break
+					}
+				}
+				if !match {
+					continue
+				}
+			}
+			out = append(out, buildPersonPayload(p, metaMap[p.Key], now))
+		}
+		writeJSON(w, out)
+	})
+
+	// /api/people/{key} and /api/people/{key}/{action}
+	mux.HandleFunc("/api/people/", func(w http.ResponseWriter, r *http.Request) {
+		rest := strings.TrimPrefix(r.URL.Path, "/api/people/")
+		if rest == "" {
+			httpError(w, "person key required", 400)
+			return
+		}
+		parts := strings.SplitN(rest, "/", 2)
+		key, err := url.PathUnescape(parts[0])
+		if err != nil {
+			key = parts[0]
+		}
+		action := ""
+		if len(parts) > 1 {
+			action = parts[1]
+		}
+
+		person, err := store.PersonByKey(key)
+		if err != nil {
+			httpError(w, "lookup person: "+err.Error(), 500)
+			return
+		}
+		if person == nil {
+			httpError(w, "person not found", 404)
+			return
+		}
+		displayName := person.Name
+
+		switch action {
+		case "tags":
+			var req struct {
+				Tags []string `json:"tags"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				httpError(w, "invalid JSON: "+err.Error(), 400)
+				return
+			}
+			if err := store.SetContactTags(key, displayName, req.Tags); err != nil {
+				httpError(w, "set tags: "+err.Error(), 500)
+				return
+			}
+		case "reach-out":
+			var req struct {
+				Days int `json:"days"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				httpError(w, "invalid JSON: "+err.Error(), 400)
+				return
+			}
+			if err := store.SetContactReachOut(key, displayName, req.Days); err != nil {
+				httpError(w, "set reach-out: "+err.Error(), 500)
+				return
+			}
+		case "summary":
+			// Regenerate the relationship summary from message history.
+			msgs, err := store.PersonMessages(person.ConversationIDs)
+			if err != nil {
+				httpError(w, "load messages: "+err.Error(), 500)
+				return
+			}
+			summary := story.RelationshipSummary(msgs, displayName, time.Local)
+			if err := store.SetContactSummary(key, displayName, summary, time.Now().UnixMilli()); err != nil {
+				httpError(w, "save summary: "+err.Error(), 500)
+				return
+			}
+		case "":
+			// GET detail — fall through below.
+		default:
+			httpError(w, "not found", 404)
+			return
+		}
+
+		// Build the (possibly updated) detail payload.
+		meta, _ := store.GetContactMeta(key)
+		msgs, _ := store.PersonMessages(person.ConversationIDs)
+		// Generate a summary on first view if none cached yet.
+		if meta != nil && meta.Summary == "" && len(msgs) > 0 {
+			meta.Summary = story.RelationshipSummary(msgs, displayName, time.Local)
+			meta.SummaryAt = time.Now().UnixMilli()
+			_ = store.SetContactSummary(key, displayName, meta.Summary, meta.SummaryAt)
+		}
+		payload := buildPersonPayload(person, meta, time.Now().UnixMilli())
+		payload.MessageCount = len(story.FilterRealMessages(msgs))
+		if meta != nil {
+			payload.Summary = meta.Summary
+			payload.SummaryAt = meta.SummaryAt
+		}
+		writeJSON(w, payload)
+	})
+
+	// ── Scheduled (send-later) messages ───────────────────────────────────
+	// GET  /api/schedule?conversation_id=  — list active scheduled messages
+	// POST /api/schedule                   — schedule a message
+	mux.HandleFunc("/api/schedule", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			convID := strings.TrimSpace(r.URL.Query().Get("conversation_id"))
+			if convID == "" {
+				httpError(w, "conversation_id is required", 400)
+				return
+			}
+			list, err := store.ListScheduledMessages(convID)
+			if err != nil {
+				httpError(w, "list scheduled: "+err.Error(), 500)
+				return
+			}
+			if list == nil {
+				list = []*db.ScheduledMessage{}
+			}
+			writeJSON(w, list)
+		case http.MethodPost:
+			var req struct {
+				ConversationID string `json:"conversation_id"`
+				Body           string `json:"body"`
+				ReplyToID      string `json:"reply_to_id"`
+				SendAt         int64  `json:"send_at"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				httpError(w, "invalid JSON: "+err.Error(), 400)
+				return
+			}
+			if strings.TrimSpace(req.ConversationID) == "" || strings.TrimSpace(req.Body) == "" {
+				httpError(w, "conversation_id and body are required", 400)
+				return
+			}
+			if err := db.ValidateScheduleTime(req.SendAt, time.Now().UnixMilli()); err != nil {
+				httpError(w, err.Error(), 400)
+				return
+			}
+			if conv, _ := store.GetConversation(req.ConversationID); conv == nil {
+				httpError(w, "conversation not found", 400)
+				return
+			}
+			sm := &db.ScheduledMessage{
+				ID:             scheduledID(),
+				ConversationID: req.ConversationID,
+				Body:           strings.TrimSpace(req.Body),
+				ReplyToID:      strings.TrimSpace(req.ReplyToID),
+				SendAt:         req.SendAt,
+				Status:         db.ScheduleStatusPending,
+				CreatedAt:      time.Now().UnixMilli(),
+			}
+			if err := store.CreateScheduledMessage(sm); err != nil {
+				httpError(w, "schedule message: "+err.Error(), 500)
+				return
+			}
+			publishMessages(req.ConversationID)
+			publishConversations()
+			writeJSON(w, sm)
+		default:
+			httpError(w, "method not allowed", 405)
+		}
+	})
+
+	// DELETE /api/schedule/{id} — cancel a still-pending scheduled message.
+	mux.HandleFunc("/api/schedule/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete {
+			httpError(w, "method not allowed", 405)
+			return
+		}
+		id := strings.TrimPrefix(r.URL.Path, "/api/schedule/")
+		if id == "" {
+			httpError(w, "scheduled message id required", 400)
+			return
+		}
+		sm, _ := store.GetScheduledMessage(id)
+		if sm == nil {
+			httpError(w, "scheduled message not found", 404)
+			return
+		}
+		ok, err := store.CancelScheduledMessage(id)
+		if err != nil {
+			httpError(w, "cancel: "+err.Error(), 500)
+			return
+		}
+		if !ok {
+			httpError(w, "message is already sending, sent, or canceled", 409)
+			return
+		}
+		publishMessages(sm.ConversationID)
+		publishConversations()
+		writeJSON(w, map[string]any{"canceled": id})
+	})
+
+	// POST /api/schedule-media — schedule a media attachment (with optional
+	// caption) to send at a future time. Multipart, mirrors /api/send-media.
+	mux.HandleFunc("/api/schedule-media", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			httpError(w, "method not allowed", 405)
+			return
+		}
+		if err := r.ParseMultipartForm(25 << 20); err != nil {
+			httpError(w, "invalid multipart form: "+err.Error(), 400)
+			return
+		}
+		convID := strings.TrimSpace(r.FormValue("conversation_id"))
+		caption := strings.TrimSpace(r.FormValue("caption"))
+		replyToID := strings.TrimSpace(r.FormValue("reply_to_id"))
+		if convID == "" {
+			httpError(w, "conversation_id is required", 400)
+			return
+		}
+		sendAt, err := strconv.ParseInt(strings.TrimSpace(r.FormValue("send_at")), 10, 64)
+		if err != nil {
+			httpError(w, "send_at must be an epoch-ms integer", 400)
+			return
+		}
+		if err := db.ValidateScheduleTime(sendAt, time.Now().UnixMilli()); err != nil {
+			httpError(w, err.Error(), 400)
+			return
+		}
+		if conv, _ := store.GetConversation(convID); conv == nil {
+			httpError(w, "conversation not found", 400)
+			return
+		}
+		file, header, err := r.FormFile("file")
+		if err != nil {
+			httpError(w, "file is required: "+err.Error(), 400)
+			return
+		}
+		defer file.Close()
+		data, err := io.ReadAll(file)
+		if err != nil {
+			httpError(w, "read file: "+err.Error(), 500)
+			return
+		}
+		if len(data) == 0 {
+			httpError(w, "file is empty", 400)
+			return
+		}
+		mime := header.Header.Get("Content-Type")
+		if mime == "" {
+			mime = "application/octet-stream"
+		}
+		sm := &db.ScheduledMessage{
+			ID:             scheduledID(),
+			ConversationID: convID,
+			Body:           caption,
+			ReplyToID:      replyToID,
+			SendAt:         sendAt,
+			Status:         db.ScheduleStatusPending,
+			CreatedAt:      time.Now().UnixMilli(),
+			MediaData:      data,
+			MediaFilename:  header.Filename,
+			MediaMime:      mime,
+		}
+		if err := store.CreateScheduledMessage(sm); err != nil {
+			httpError(w, "schedule media: "+err.Error(), 500)
+			return
+		}
+		publishMessages(convID)
+		publishConversations()
+		writeJSON(w, sm)
 	})
 
 	mux.HandleFunc("/api/search", func(w http.ResponseWriter, r *http.Request) {
@@ -1244,14 +1581,37 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			return
 		}
 		var req struct {
-			PhoneNumber string `json:"phone_number"`
+			PhoneNumber  string   `json:"phone_number"`
+			PhoneNumbers []string `json:"phone_numbers"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			httpError(w, "invalid JSON: "+err.Error(), 400)
 			return
 		}
-		if req.PhoneNumber == "" {
-			httpError(w, "phone_number is required", 400)
+		// Collect + dedupe recipients. Two or more makes a group conversation.
+		raw := req.PhoneNumbers
+		if req.PhoneNumber != "" {
+			raw = append(raw, req.PhoneNumber)
+		}
+		var numbers []string
+		seen := map[string]bool{}
+		for _, n := range raw {
+			n = normalizePhoneNumber(n)
+			if n == "" {
+				continue
+			}
+			key := digitsOnly(n)
+			if key == "" {
+				key = n
+			}
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			numbers = append(numbers, n)
+		}
+		if len(numbers) == 0 {
+			httpError(w, "at least one phone number is required", 400)
 			return
 		}
 		cli := getClient()
@@ -1260,37 +1620,52 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			return
 		}
 
-		convResp, err := cli.GM.GetOrCreateConversation(&gmproto.GetOrCreateConversationRequest{
-			Numbers: app.NewContactNumbers([]string{req.PhoneNumber}),
-		})
+		// Two or more recipients = a group: use the group MysteriousInt and the
+		// two-step CREATE_RCS flow that Google Messages requires for new groups.
+		contactNums := app.NewContactNumbers(numbers)
+		if len(numbers) > 1 {
+			contactNums = app.NewGroupContactNumbers(numbers)
+		}
+		convResp, err := app.GetOrCreateConversationForNumbers(cli, contactNums, "")
 		if err != nil {
 			httpError(w, googleAPIErrorMessage("failed to get/create conversation", err), 502)
 			return
 		}
 		conv := convResp.GetConversation()
 		if conv == nil {
-			httpError(w, "no conversation returned", 502)
+			httpError(w, "Google Messages didn't return a conversation (status: "+convResp.GetStatus().String()+") — a recipient may not be reachable via SMS/RCS.", 502)
 			return
 		}
 
 		convoID := conv.GetConversationID()
-		name := req.PhoneNumber
-		// Try to get a name from participants
+		isGroup := conv.GetIsGroupChat() || len(numbers) > 1
+		// Build a display name. For a group, join the other participants' names;
+		// for a 1:1, use the single participant's name/number.
+		var others []string
 		for _, p := range conv.GetParticipants() {
-			if !p.GetIsMe() {
-				if fn := p.GetFormattedNumber(); fn != "" {
-					name = fn
-				}
-				if cn := p.GetFullName(); cn != "" {
-					name = cn
-				}
+			if p.GetIsMe() {
+				continue
 			}
+			label := p.GetFullName()
+			if label == "" {
+				label = p.GetFormattedNumber()
+			}
+			if label != "" {
+				others = append(others, label)
+			}
+		}
+		name := strings.Join(numbers, ", ")
+		if len(others) > 0 {
+			name = strings.Join(others, ", ")
+		} else if len(numbers) == 1 {
+			name = numbers[0]
 		}
 
 		// Upsert into local DB so it shows in the sidebar
 		store.UpsertConversation(&db.Conversation{
 			ConversationID: convoID,
 			Name:           name,
+			IsGroup:        isGroup,
 			LastMessageTS:  time.Now().UnixMilli(),
 		})
 		publishConversations()
@@ -2225,6 +2600,45 @@ func isGoogleNetworkError(err error) bool {
 // normalizeContactKey returns a stable dedup key for a contact entry. We
 // fold names case-insensitively and reduce phone numbers to digits-only so
 // that "+1 (650) 555-1234", "16505551234", and "650-555-1234" all collide.
+func digitsOnly(s string) string {
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		if s[i] >= '0' && s[i] <= '9' {
+			b.WriteByte(s[i])
+		}
+	}
+	return b.String()
+}
+
+// normalizePhoneNumber best-effort converts a phone string to E.164 so Google
+// Messages can resolve it. Numbers already starting with '+' keep their digits;
+// bare North-American 10/11-digit numbers get a country code; short codes (which
+// have too few digits) are left untouched.
+func normalizePhoneNumber(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	hasPlus := strings.HasPrefix(s, "+")
+	digits := digitsOnly(s)
+	if digits == "" {
+		return ""
+	}
+	if hasPlus {
+		return "+" + digits
+	}
+	switch {
+	case len(digits) == 11 && strings.HasPrefix(digits, "1"):
+		return "+" + digits
+	case len(digits) == 10:
+		return "+1" + digits
+	case len(digits) >= 11:
+		return "+" + digits
+	default:
+		return s // short codes / unusual — pass through unchanged
+	}
+}
+
 func normalizeContactKey(name, number string) string {
 	digits := make([]byte, 0, len(number))
 	for i := 0; i < len(number); i++ {
@@ -2234,6 +2648,70 @@ func normalizeContactKey(name, number string) string {
 		}
 	}
 	return strings.ToLower(strings.TrimSpace(name)) + "|" + string(digits)
+}
+
+// localContactID derives a stable ID for a user-added local contact so that
+// re-adding the same name+number updates rather than duplicates it.
+func localContactID(name, number string) string {
+	h := fnv.New64a()
+	h.Write([]byte(normalizeContactKey(name, number)))
+	return fmt.Sprintf("%016x", h.Sum64())
+}
+
+func scheduledID() string {
+	b := make([]byte, 8)
+	_, _ = rand.Read(b)
+	return "sched:" + hex.EncodeToString(b)
+}
+
+// personPayload is the JSON shape for the Contacts/CRM view.
+type personPayload struct {
+	Key             string   `json:"key"`
+	Name            string   `json:"name"`
+	Numbers         []string `json:"numbers"`
+	Platforms       []string `json:"platforms"`
+	LastContactedTS int64    `json:"last_contacted_ts"`
+	Tags            []string `json:"tags"`
+	ReachOutDays    int      `json:"reach_out_days"`
+	NextDueTS       int64    `json:"next_due_ts"`
+	Overdue         bool     `json:"overdue"`
+	MessageCount    int      `json:"message_count"`
+	Summary         string   `json:"summary"`
+	SummaryAt       int64    `json:"summary_at"`
+	ConversationIDs []string `json:"conversation_ids"`
+}
+
+func buildPersonPayload(p *db.Person, meta *db.ContactMeta, now int64) *personPayload {
+	pp := &personPayload{
+		Key:             p.Key,
+		Name:            p.Name,
+		Numbers:         p.Numbers,
+		Platforms:       p.Platforms,
+		LastContactedTS: p.LastContactedTS,
+		MessageCount:    p.MessageCount,
+		Tags:            []string{},
+		ConversationIDs: p.ConversationIDs,
+	}
+	if pp.ConversationIDs == nil {
+		pp.ConversationIDs = []string{}
+	}
+	if pp.Numbers == nil {
+		pp.Numbers = []string{}
+	}
+	if pp.Platforms == nil {
+		pp.Platforms = []string{}
+	}
+	if meta != nil {
+		if meta.Tags != nil {
+			pp.Tags = meta.Tags
+		}
+		pp.ReachOutDays = meta.ReachOutDays
+		if meta.ReachOutDays > 0 && p.LastContactedTS > 0 {
+			pp.NextDueTS = p.LastContactedTS + int64(meta.ReachOutDays)*86400000
+			pp.Overdue = now > pp.NextDueTS
+		}
+	}
+	return pp
 }
 
 func queryInt(r *http.Request, key string, defaultVal int) int {
