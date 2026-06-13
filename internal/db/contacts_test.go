@@ -246,3 +246,57 @@ func TestListContacts_QueryMatchesBothNameAndNumber(t *testing.T) {
 		t.Errorf("count: got %d, want 2 (matches both name and number)", len(got))
 	}
 }
+
+func TestListContactsFromConversationsPrefilter(t *testing.T) {
+	store := newTestStore(t)
+	convos := []*Conversation{
+		{ConversationID: "c1", Name: "Alice Smith", Participants: `[{"name":"Alice Smith","number":"+15551112222"}]`, LastMessageTS: 300},
+		{ConversationID: "c2", Name: "Bob Jones", Participants: `[{"name":"Bob Jones","number":"+15553334444"}]`, LastMessageTS: 200},
+		{ConversationID: "c3", Name: "carol ALICEson", Participants: `[{"name":"carol ALICEson","number":"+15555556666"}]`, LastMessageTS: 100},
+	}
+	for _, c := range convos {
+		if err := store.UpsertConversation(c); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	t.Run("case-insensitive name match", func(t *testing.T) {
+		got, err := store.ListContactsFromConversations("alice", 10)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 2 {
+			t.Fatalf("got %d contacts, want 2 (Alice Smith + carol ALICEson): %+v", len(got), got)
+		}
+	})
+
+	t.Run("number match", func(t *testing.T) {
+		got, err := store.ListContactsFromConversations("5553334444", 10)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 1 || got[0].Name != "Bob Jones" {
+			t.Fatalf("number search wrong: %+v", got)
+		}
+	})
+
+	t.Run("no match", func(t *testing.T) {
+		got, err := store.ListContactsFromConversations("zzzz", 10)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 0 {
+			t.Fatalf("got %d contacts, want 0", len(got))
+		}
+	})
+
+	t.Run("empty query returns all up to limit", func(t *testing.T) {
+		got, err := store.ListContactsFromConversations("", 2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 2 {
+			t.Fatalf("got %d contacts, want limit 2", len(got))
+		}
+	})
+}

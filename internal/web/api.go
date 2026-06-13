@@ -32,6 +32,11 @@ import (
 //go:embed static/*
 var staticFS embed.FS
 
+// maxUploadBytes bounds /api/send-media request bodies. 128MB sits above
+// every platform's attachment cap (Signal ~100MB, WhatsApp ~64MB, MMS ~1MB)
+// while keeping a runaway POST from exhausting memory.
+const maxUploadBytes = 128 << 20
+
 // APIHandler creates the HTTP handler with JSON API routes and static file serving.
 // The client may be nil (disconnected state).
 // mcpHandler is an optional http.Handler for the MCP SSE endpoint (mounted at /mcp/).
@@ -897,8 +902,18 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			httpError(w, "method not allowed", 405)
 			return
 		}
-		// Parse multipart form (max 10MB)
+		// Cap the whole request body: ParseMultipartForm's argument only
+		// bounds the in-memory portion (the rest spills to disk), and the
+		// attachment is read fully into memory below — without this cap a
+		// single oversized POST can OOM the backend and take every live
+		// sync down with it.
+		r.Body = http.MaxBytesReader(w, r.Body, maxUploadBytes)
 		if err := r.ParseMultipartForm(10 << 20); err != nil {
+			var tooLarge *http.MaxBytesError
+			if errors.As(err, &tooLarge) {
+				httpError(w, fmt.Sprintf("attachment too large (limit %d MB)", maxUploadBytes>>20), http.StatusRequestEntityTooLarge)
+				return
+			}
 			httpError(w, "invalid multipart form: "+err.Error(), 400)
 			return
 		}
@@ -920,6 +935,11 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 
 		data, err := io.ReadAll(file)
 		if err != nil {
+			var tooLarge *http.MaxBytesError
+			if errors.As(err, &tooLarge) {
+				httpError(w, fmt.Sprintf("attachment too large (limit %d MB)", maxUploadBytes>>20), http.StatusRequestEntityTooLarge)
+				return
+			}
 			httpError(w, "read file: "+err.Error(), 500)
 			return
 		}
@@ -1903,8 +1923,31 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			httpError(w, "forbidden: API requests must originate from the local OpenMessage app", http.StatusForbidden)
 			return
 		}
+		setSecurityHeaders(w)
 		handler.ServeHTTP(w, r)
 	})
+}
+
+// setSecurityHeaders adds defense-in-depth headers. The UI relies on
+// disciplined manual escaping against XSS; the CSP doesn't stop inline-
+// handler injection (the app uses inline scripts/handlers throughout) but
+// it does contain a missed sink's blast radius: scripts, fetches, images,
+// and media can't reach non-loopback origins, so message history can't be
+// exfiltrated to an attacker host. Fonts are the one external dependency.
+func setSecurityHeaders(w http.ResponseWriter) {
+	w.Header().Set("Content-Security-Policy",
+		"default-src 'self'; "+
+			"script-src 'self' 'unsafe-inline'; "+
+			"style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "+
+			"font-src 'self' https://fonts.gstatic.com; "+
+			"img-src 'self' data: blob:; "+
+			"media-src 'self' data: blob:; "+
+			"connect-src 'self'; "+
+			"object-src 'none'; "+
+			"base-uri 'self'; "+
+			"frame-ancestors 'none'")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Referrer-Policy", "no-referrer")
 }
 
 // isLoopbackHost reports whether a bare hostname refers to this machine's
@@ -1927,7 +1970,10 @@ func isLocalAPIRequest(r *http.Request) bool {
 	if h, _, err := net.SplitHostPort(host); err == nil {
 		host = h
 	}
-	if host != "" && !isLoopbackHost(host) {
+	// An absent Host header is treated as non-local: browsers always send
+	// one, so an empty value only ever comes from a hand-rolled client —
+	// which must not slip past the loopback check by omission.
+	if host == "" || !isLoopbackHost(host) {
 		return false
 	}
 	origin := r.Header.Get("Origin")

@@ -639,7 +639,7 @@ func (a *App) storeConversation(conv *gmproto.Conversation) error {
 		unread = 1
 	}
 
-	return a.Store.UpsertConversation(&db.Conversation{
+	return a.Store.ApplyConversationSnapshot(&db.Conversation{
 		ConversationID: conv.GetConversationID(),
 		Name:           conv.GetName(),
 		IsGroup:        conv.GetIsGroupChat(),

@@ -379,3 +379,31 @@ func maybeNotificationModeArg(hasMode bool, mode string) string {
 	}
 	return mode
 }
+
+// ApplyConversationSnapshot upserts a conversation from a platform-state
+// snapshot (a Google Messages conversation event or a backfill page) while
+// guarding local state against stale snapshots:
+//
+//   - last_message_ts never moves backward, matching the recency rule used
+//     for messages (AdvanceConversationRecency).
+//   - A snapshot may set the unread flag only when it carries something
+//     newer than what's stored. The phone re-sends conversation state on
+//     unrelated events, and a snapshot that is no newer than local state
+//     must not resurrect unread on a conversation already read locally.
+//     Clearing unread (the user read it on the phone) is always honored.
+//
+// Live-transport handlers that compute unread deltas themselves (WhatsApp,
+// Signal) should keep using UpsertConversation directly.
+func (s *Store) ApplyConversationSnapshot(c *Conversation) error {
+	existing, err := s.GetConversation(c.ConversationID)
+	if err == nil && existing != nil {
+		snapshotTS := c.LastMessageTS
+		if snapshotTS < existing.LastMessageTS {
+			c.LastMessageTS = existing.LastMessageTS
+		}
+		if c.UnreadCount > 0 && existing.UnreadCount == 0 && snapshotTS <= existing.LastMessageTS {
+			c.UnreadCount = 0
+		}
+	}
+	return s.UpsertConversation(c)
+}

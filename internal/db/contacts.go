@@ -59,11 +59,21 @@ func (s *Store) ListContacts(query string, limit int) ([]*Contact, error) {
 
 // ListContactsFromConversations extracts contacts from conversation participants
 // as a fallback when the contacts table is empty.
+//
+// The SQL prefilter is a strict superset of the per-participant matching
+// below (the participants JSON contains every name and number verbatim), so
+// it never hides a match — it just keeps a filtered autocomplete keystroke
+// from JSON-decoding every conversation in the store. The row LIMIT bounds
+// worst-case work; it is generous because one row can fan out to many
+// participants and duplicates are dropped.
 func (s *Store) ListContactsFromConversations(query string, limit int) ([]*Contact, error) {
+	queryFilter := strings.ToLower(query)
 	rows, err := s.db.Query(`
 		SELECT conversation_id, name, participants FROM conversations
+		WHERE ? = '' OR instr(lower(name), ?) > 0 OR instr(lower(participants), ?) > 0
 		ORDER BY last_message_ts DESC
-	`)
+		LIMIT ?
+	`, queryFilter, queryFilter, queryFilter, limit*20)
 	if err != nil {
 		return nil, err
 	}

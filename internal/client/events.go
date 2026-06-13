@@ -242,7 +242,7 @@ func (h *EventHandler) storeConversation(conv *gmproto.Conversation) bool {
 		UnreadCount:    unread,
 	}
 
-	if err := h.Store.UpsertConversation(dbConv); err != nil {
+	if err := h.Store.ApplyConversationSnapshot(dbConv); err != nil {
 		h.Logger.Error().Err(err).Str("conv_id", dbConv.ConversationID).Msg("Failed to store conversation")
 		return false
 	}

@@ -518,3 +518,105 @@ func TestSearchConversationsByMetadata(t *testing.T) {
 		t.Fatalf("got conversation %q, want c1", got[0].ConversationID)
 	}
 }
+
+func TestApplyConversationSnapshotGuardsStaleState(t *testing.T) {
+	store := newTestStore(t)
+
+	seed := &Conversation{
+		ConversationID: "conv-snap",
+		Name:           "Alice",
+		Participants:   `[{"name":"Alice","number":"+15551234567"}]`,
+		LastMessageTS:  5000,
+		UnreadCount:    1,
+	}
+	if err := store.UpsertConversation(seed); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if err := store.MarkConversationRead("conv-snap"); err != nil {
+		t.Fatalf("mark read: %v", err)
+	}
+
+	t.Run("stale snapshot cannot resurrect unread or regress recency", func(t *testing.T) {
+		stale := &Conversation{
+			ConversationID: "conv-snap",
+			Name:           "Alice",
+			Participants:   seed.Participants,
+			LastMessageTS:  4000, // older than stored 5000
+			UnreadCount:    1,
+		}
+		if err := store.ApplyConversationSnapshot(stale); err != nil {
+			t.Fatalf("apply: %v", err)
+		}
+		got, _ := store.GetConversation("conv-snap")
+		if got.UnreadCount != 0 {
+			t.Errorf("unread resurrected by stale snapshot: got %d, want 0", got.UnreadCount)
+		}
+		if got.LastMessageTS != 5000 {
+			t.Errorf("recency regressed: got %d, want 5000", got.LastMessageTS)
+		}
+	})
+
+	t.Run("equal-timestamp snapshot cannot resurrect unread", func(t *testing.T) {
+		same := &Conversation{
+			ConversationID: "conv-snap",
+			Participants:   seed.Participants,
+			LastMessageTS:  5000,
+			UnreadCount:    1,
+		}
+		if err := store.ApplyConversationSnapshot(same); err != nil {
+			t.Fatalf("apply: %v", err)
+		}
+		got, _ := store.GetConversation("conv-snap")
+		if got.UnreadCount != 0 {
+			t.Errorf("unread resurrected by same-age snapshot: got %d, want 0", got.UnreadCount)
+		}
+	})
+
+	t.Run("newer snapshot sets unread and advances recency", func(t *testing.T) {
+		newer := &Conversation{
+			ConversationID: "conv-snap",
+			Participants:   seed.Participants,
+			LastMessageTS:  6000,
+			UnreadCount:    1,
+		}
+		if err := store.ApplyConversationSnapshot(newer); err != nil {
+			t.Fatalf("apply: %v", err)
+		}
+		got, _ := store.GetConversation("conv-snap")
+		if got.UnreadCount != 1 || got.LastMessageTS != 6000 {
+			t.Errorf("newer snapshot not applied: unread=%d ts=%d, want 1/6000", got.UnreadCount, got.LastMessageTS)
+		}
+	})
+
+	t.Run("phone-side read always clears unread", func(t *testing.T) {
+		read := &Conversation{
+			ConversationID: "conv-snap",
+			Participants:   seed.Participants,
+			LastMessageTS:  6000,
+			UnreadCount:    0,
+		}
+		if err := store.ApplyConversationSnapshot(read); err != nil {
+			t.Fatalf("apply: %v", err)
+		}
+		got, _ := store.GetConversation("conv-snap")
+		if got.UnreadCount != 0 {
+			t.Errorf("phone read not honored: got %d, want 0", got.UnreadCount)
+		}
+	})
+
+	t.Run("new conversation inserts as-is", func(t *testing.T) {
+		fresh := &Conversation{
+			ConversationID: "conv-new",
+			Name:           "Bob",
+			LastMessageTS:  100,
+			UnreadCount:    1,
+		}
+		if err := store.ApplyConversationSnapshot(fresh); err != nil {
+			t.Fatalf("apply: %v", err)
+		}
+		got, _ := store.GetConversation("conv-new")
+		if got == nil || got.UnreadCount != 1 {
+			t.Fatalf("fresh insert wrong: %+v", got)
+		}
+	})
+}

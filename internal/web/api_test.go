@@ -2981,3 +2981,98 @@ func TestMarkReadPublishesConversationInvalidation(t *testing.T) {
 		t.Fatalf("stream event = %q, want %q", evt.Event, EventTypeConversations)
 	}
 }
+
+func TestAPIGuardRejectsEmptyHost(t *testing.T) {
+	// Go's HTTP client always sends a Host, so exercise the guard directly
+	// the way a hand-rolled client omitting it would reach it.
+	r := httptest.NewRequest(http.MethodGet, "/api/conversations", nil)
+	r.Host = ""
+	if isLocalAPIRequest(r) {
+		t.Fatal("request with empty Host must not pass the loopback guard")
+	}
+
+	r.Host = "127.0.0.1:7007"
+	if !isLocalAPIRequest(r) {
+		t.Fatal("loopback Host must pass the guard")
+	}
+
+	r.Host = "evil.example.com"
+	if isLocalAPIRequest(r) {
+		t.Fatal("non-loopback Host must not pass the guard")
+	}
+}
+
+func TestSecurityHeadersPresent(t *testing.T) {
+	ts := newTestServer(t)
+	defer ts.server.Close()
+
+	resp, err := http.Get(ts.server.URL + "/api/conversations")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	csp := resp.Header.Get("Content-Security-Policy")
+	if csp == "" {
+		t.Fatal("Content-Security-Policy header missing")
+	}
+	for _, directive := range []string{"default-src 'self'", "connect-src 'self'", "frame-ancestors 'none'", "object-src 'none'"} {
+		if !strings.Contains(csp, directive) {
+			t.Errorf("CSP missing %q: %s", directive, csp)
+		}
+	}
+	if got := resp.Header.Get("X-Content-Type-Options"); got != "nosniff" {
+		t.Errorf("X-Content-Type-Options = %q, want nosniff", got)
+	}
+}
+
+func TestSendMediaRejectsOversizedUpload(t *testing.T) {
+	ts := newTestServer(t)
+	defer ts.server.Close()
+
+	// Stream a multipart body larger than maxUploadBytes without buffering
+	// it in the test: a 129MB zero-filled part.
+	pr, pw := io.Pipe()
+	mw := multipart.NewWriter(pw)
+	go func() {
+		defer pw.Close()
+		_ = mw.WriteField("conversation_id", "conv-1")
+		part, err := mw.CreateFormFile("file", "huge.bin")
+		if err != nil {
+			pw.CloseWithError(err)
+			return
+		}
+		if _, err := io.CopyN(part, zeroReader{}, maxUploadBytes+(1<<20)); err != nil {
+			pw.CloseWithError(err)
+			return
+		}
+		_ = mw.Close()
+	}()
+
+	req, err := http.NewRequest(http.MethodPost, ts.server.URL+"/api/send-media", pr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		// The server may reset the connection once MaxBytesReader trips;
+		// either a clean 413 or a transport error after refusal is
+		// acceptable proof the body was not buffered to completion.
+		t.Logf("transport error after refusal (acceptable): %v", err)
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want 413", resp.StatusCode)
+	}
+}
+
+type zeroReader struct{}
+
+func (zeroReader) Read(p []byte) (int, error) {
+	for i := range p {
+		p[i] = 0
+	}
+	return len(p), nil
+}
