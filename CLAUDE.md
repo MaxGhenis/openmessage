@@ -12,7 +12,7 @@ Local-first universal message database with built-in MCP server. Ingests message
 │   ├── db/           SQLite store (conversations, messages, contacts, unified_contacts, drafts)
 │   ├── importer/     Multi-platform import adapters (gchat, imessage, whatsapp)
 │   ├── story/        Stats computation + narrative story generation
-│   ├── tools/        MCP tools (18 tools)
+│   ├── tools/        MCP tools (24 tools)
 │   ├── viz/          Relationship visualization renderer (self-contained HTML)
 │   └── web/          HTTP API + embedded React UI
 ├── macos/            Swift macOS app wrapper
@@ -55,7 +55,7 @@ openmessage import whatsapp /path/to/chat.txt --name "Your Name"
 
 ### MCP tools
 
-18 tools registered:
+24 tools registered (see internal/tools/tools.go Register for the authoritative list):
 - `get_messages`, `get_conversation`, `search_messages` — cross-platform by default
 - `list_conversations` — optional `source_platform` filter (sms, gchat, imessage, whatsapp)
 - `get_person_messages` — all messages with a person across all platforms
