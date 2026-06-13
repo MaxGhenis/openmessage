@@ -358,7 +358,6 @@ func TestDeepBackfillContactDiscovery(t *testing.T) {
 	}
 
 	a := newTestApp(t, mock)
-	a.EnableContactDiscovery = true
 	a.DeepBackfill()
 
 	convos, _ := a.Store.ListConversations(50)
@@ -396,7 +395,6 @@ func TestDeepBackfillContactDiscoverySkipsAlreadySeen(t *testing.T) {
 	}
 
 	a := newTestApp(t, mock)
-	a.EnableContactDiscovery = true
 	a.DeepBackfill()
 
 	convos, _ := a.Store.ListConversations(50)
@@ -523,7 +521,6 @@ func TestDeepBackfillGetOrCreateError(t *testing.T) {
 	}
 
 	a := newTestApp(t, mock)
-	a.EnableContactDiscovery = true
 	a.DeepBackfill()
 
 	progress := a.GetBackfillProgress()

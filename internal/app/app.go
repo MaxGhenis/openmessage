@@ -125,13 +125,7 @@ type App struct {
 	sendTextOverride func(conversationID, body, replyToID string) (*db.Message, error)
 	// sendMediaOverride lets tests substitute the scheduler's media send. Nil in prod.
 	sendMediaOverride func(conversationID string, data []byte, filename, mime, caption, replyToID string) (*db.Message, error)
-	// EnableContactDiscovery controls the deep-backfill phase that calls
-	// GetOrCreateConversation for every address-book contact. That phase
-	// CREATES a thread on the phone for each contact, flooding Google Messages
-	// with empty conversations, so it is OFF by default. Conversations that
-	// actually have messages are already covered by the folder scan.
-	EnableContactDiscovery bool
-	Connected              atomic.Bool
+	Connected         atomic.Bool
 	OnConversationsChange  func()
 	OnIncomingMessage      func(*db.Message)
 	OnMessagesChange       func(string)
