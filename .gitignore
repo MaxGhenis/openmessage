@@ -31,3 +31,9 @@ output/
 
 # Top-level bun lockfile from running e2e tests at the repo root
 /bun.lock
+
+# Build artifacts and one-off recovery dumps that should never be tracked
+/openmessage-demo
+/genviz
+/cc.json
+/.tmp-*.sql
