@@ -36,6 +36,20 @@ final class BackendManager: ObservableObject {
     private var healthCheckTask: Task<Void, Never>?
     private var connectionMonitorTask: Task<Void, Never>?
 
+    // ── Bounded auto-restart ──
+    // When the backend exits unexpectedly we retry a few times with exponential
+    // backoff instead of immediately dumping the user into a manual "Try again"
+    // screen. The counter resets once a restarted backend has stayed healthy for
+    // `healthyResetInterval`, so a backend that crashes once an hour doesn't burn
+    // through its budget permanently. Only after the budget is exhausted do we
+    // surface `.error(...)`.
+    private static let maxRestartAttempts = 3
+    private static let restartBackoff: [Duration] = [.seconds(1), .seconds(3), .seconds(9)]
+    private static let healthyResetInterval: Duration = .seconds(60)
+    private var restartAttempts = 0
+    private var pendingRestartTask: Task<Void, Never>?
+    private var healthyResetTask: Task<Void, Never>?
+
     init() {
         // Standard Cmd-Q / app-menu "Quit" terminates via NSApplication without
         // going through the menu-bar button's stop(), which left the spawned
@@ -118,9 +132,19 @@ final class BackendManager: ObservableObject {
         URL(string: "http://127.0.0.1:\(port)")!
     }
 
+    /// User- or lifecycle-initiated start. Resets the auto-restart budget so a
+    /// deliberate (re)start always gets the full retry allowance, then launches.
     func start() {
         guard state != .starting, state != .running else { return }
+        cancelPendingRestart()
+        restartAttempts = 0
+        launchBackend()
+    }
 
+    /// Spawns (or adopts) the backend process. Shared by the public `start()` and
+    /// the auto-restart path, so a restart doesn't trip `start()`'s running/
+    /// starting guard.
+    private func launchBackend() {
         migrateOldDataIfNeeded()
 
         state = .starting
@@ -128,6 +152,7 @@ final class BackendManager: ObservableObject {
         healthCheckTask = nil
         connectionMonitorTask?.cancel()
         connectionMonitorTask = nil
+        cancelHealthyResetTimer()
         if reuseExistingBackendIfNeeded() {
             return
         }
@@ -146,7 +171,14 @@ final class BackendManager: ObservableObject {
             "OPENMESSAGES_DATA_DIR": dir,
             "OPENMESSAGES_LOG_LEVEL": "info",
             "OPENMESSAGES_APP_SANDBOX": "1",
-            "OPENMESSAGES_MACOS_NOTIFICATIONS": "1",
+            // The native app owns notifications when it wraps the backend:
+            // NotificationManager posts UNUserNotificationCenter banners off the
+            // SSE event stream, with tap-to-open and foreground suppression that
+            // the Go side can't do. Disable the backend's own osascript/
+            // terminal-notifier banners so a single inbound message doesn't fire
+            // two notifications. Bare `openmessage serve` in a terminal (no app,
+            // env var unset) still gets Go-side banners via its default logic.
+            "OPENMESSAGES_MACOS_NOTIFICATIONS": "0",
             "HOME": NSHomeDirectory(),
             "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
         ]
@@ -170,14 +202,18 @@ final class BackendManager: ObservableObject {
 
         proc.terminationHandler = { [weak self] proc in
             let manager = self
+            let reason = proc.terminationReason == .uncaughtSignal ? "signal" : "exit"
+            let code = proc.terminationStatus
             Task { @MainActor in
                 guard let manager else { return }
-                let reason = proc.terminationReason == .uncaughtSignal ? "signal" : "exit"
-                manager.logger.warning("Backend terminated via \(reason, privacy: .public) with code \(proc.terminationStatus)")
+                manager.logger.warning("Backend terminated via \(reason, privacy: .public) with code \(code)")
                 guard manager.process === proc else { return }
                 manager.process = nil
+                // Only react to crashes while we believed the backend was up. A
+                // deliberate stop()/quit clears `state` first, so this won't
+                // fight an intentional shutdown.
                 if manager.state == .running || manager.state == .starting {
-                    manager.state = .error("Backend exited unexpectedly (code \(proc.terminationStatus))")
+                    manager.handleUnexpectedTermination(code: code)
                 }
             }
         }
@@ -318,6 +354,8 @@ final class BackendManager: ObservableObject {
     }
 
     func stop() {
+        cancelPendingRestart()
+        restartAttempts = 0
         healthCheckTask?.cancel()
         healthCheckTask = nil
         connectionMonitorTask?.cancel()
@@ -338,6 +376,7 @@ final class BackendManager: ObservableObject {
     /// spawned process to exit so it isn't reparented to launchd (which would
     /// leave it holding the port and the SQLite/session files).
     private func terminateForQuit() {
+        cancelPendingRestart()
         healthCheckTask?.cancel()
         connectionMonitorTask?.cancel()
         if let process, process.isRunning {
@@ -354,6 +393,55 @@ final class BackendManager: ObservableObject {
         }
     }
 
+    // ── Auto-restart plumbing ──
+
+    /// Reacts to the backend dying while we believed it was up: retry with
+    /// backoff until the budget is exhausted, then surface the error UI.
+    private func handleUnexpectedTermination(code: Int32) {
+        guard restartAttempts < Self.maxRestartAttempts else {
+            logger.error("Backend exited (code \(code)) and the restart budget is exhausted")
+            state = .error("Backend exited unexpectedly (code \(code))")
+            return
+        }
+        let delay = Self.restartBackoff[min(restartAttempts, Self.restartBackoff.count - 1)]
+        restartAttempts += 1
+        let attempt = restartAttempts
+        logger.warning("Backend exited (code \(code)); auto-restart \(attempt)/\(Self.maxRestartAttempts) in \(String(describing: delay), privacy: .public)")
+        state = .starting
+        pendingRestartTask?.cancel()
+        pendingRestartTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: delay)
+            guard let self, !Task.isCancelled else { return }
+            self.pendingRestartTask = nil
+            self.launchBackend()
+        }
+    }
+
+    /// Once a (re)started backend has stayed healthy for a minute, forget
+    /// past crashes so an occasional failure never permanently drains the
+    /// retry budget.
+    private func scheduleRestartBudgetReset() {
+        healthyResetTask?.cancel()
+        healthyResetTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: Self.healthyResetInterval)
+            guard let self, !Task.isCancelled else { return }
+            if self.state == .running {
+                self.restartAttempts = 0
+            }
+            self.healthyResetTask = nil
+        }
+    }
+
+    private func cancelPendingRestart() {
+        pendingRestartTask?.cancel()
+        pendingRestartTask = nil
+    }
+
+    private func cancelHealthyResetTimer() {
+        healthyResetTask?.cancel()
+        healthyResetTask = nil
+    }
+
     /// Poll /api/status until the backend is ready.
     private func startHealthCheck() {
         healthCheckTask = Task {
@@ -368,6 +456,7 @@ final class BackendManager: ObservableObject {
                         _ = json
                         self.state = .running
                         self.logger.info("Backend ready after \(attempt) checks")
+                        self.scheduleRestartBudgetReset()
                         self.startConnectionMonitor()
                         return
                     }
