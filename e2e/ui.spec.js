@@ -1050,3 +1050,42 @@ test('discards an AI draft from the thread banner', async ({ page }) => {
   await page.locator('.draft-discard-btn').click();
   await expect(page.locator('.draft-banner')).toHaveCount(0);
 });
+
+test('deselecting shows select-a-conversation state, not onboarding copy', async ({ page }) => {
+  await openConversation(page, 'Sarah Chen');
+  await page.keyboard.press('Escape'); // blur compose focus if any
+  await page.keyboard.press('Escape'); // deselect conversation
+  await expect(page.locator('#empty-state-title')).toHaveText('Select a conversation');
+  await expect(page.locator('#empty-state-cta')).toBeHidden();
+});
+
+test('conversation rows are keyboard-activatable', async ({ page }) => {
+  const row = page.locator('#conversation-list .convo-item').first();
+  await expect(row).toHaveAttribute('role', 'button');
+  await expect(row).toHaveAttribute('tabindex', '0');
+  await row.focus();
+  await page.keyboard.press('Enter');
+  await expect(page.locator('#chat-header')).toBeVisible();
+});
+
+test('narrow viewport uses single-pane flow with back button', async ({ page }) => {
+  await page.setViewportSize({ width: 480, height: 820 });
+  // Reload so the app boots in the narrow layout: a fresh narrow session
+  // lands on the list (no desktop auto-select), not inside a thread.
+  await page.goto('/');
+  await expect(page.locator('.sidebar')).toBeVisible();
+  await expect(page.locator('#chat-header')).toBeHidden();
+  await openConversation(page, 'Sarah Chen');
+  await expect(page.locator('.sidebar')).toBeHidden();
+  await expect(page.locator('#chat-back-btn')).toBeVisible();
+  await page.locator('#chat-back-btn').click();
+  await expect(page.locator('.sidebar')).toBeVisible();
+});
+
+test('escape closes the platforms overlay without clearing search', async ({ page }) => {
+  await page.locator('#search-input').fill('hike');
+  await openPlatforms(page);
+  await page.keyboard.press('Escape');
+  await expect(page.locator('#wa-overlay')).not.toHaveClass(/show/);
+  await expect(page.locator('#search-input')).toHaveValue('hike');
+});

@@ -489,6 +489,7 @@ html, body {
   gap: 10px;
   align-items: center;
   padding-left: 54px;
+  flex-wrap: wrap;
 }
 
 .wa-actions-row.wrap {
@@ -499,6 +500,15 @@ html, body {
   margin-top: 0;
   flex: 0 0 auto;
   min-width: 180px;
+}
+
+/* .new-msg-go (re)defines width:100% later in this sheet; inside an actions
+   row the connect button must share the line with the Reset button instead
+   of shoving it past the dialog edge, so scope a higher-specificity
+   override. */
+.wa-actions-row .wa-connect-btn {
+  width: auto;
+  flex: 1 1 180px;
 }
 
 .wa-reset-btn {
@@ -2127,8 +2137,12 @@ body::after {
     border-right: none;
   }
 
-  .sidebar { display: none; }
-  .sidebar.mobile-open { display: flex; position: fixed; inset: 0; z-index: 10; }
+  /* Single-pane flow: the conversation list IS the screen until a thread
+     is opened (body.thread-open); the chat header's back button returns
+     to the list. */
+  .sidebar { display: flex; }
+  body.thread-open .sidebar { display: none; }
+  body:not(.thread-open) .chat-pane { display: none; }
   .chat-header,
   .messages-area {
     padding-left: 18px;
@@ -4163,10 +4177,6 @@ body::after {
     border-radius: 0;
   }
 
-  .sidebar.mobile-open {
-    background: var(--bg-surface);
-  }
-
   .sidebar-header {
     padding: 16px;
   }
@@ -4256,6 +4266,15 @@ body::after {
 
   .empty-state-notes {
     gap: 6px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
   }
 }
 </style>
@@ -5835,6 +5854,22 @@ body::after {
     });
   }
 
+  // makeRowKeyboardAccessible turns a clickable conversation row into a
+  // keyboard-reachable control: Tab focuses it, Enter/Space activates the
+  // same click handler, and assistive tech announces it by name.
+  function makeRowKeyboardAccessible(el, label, isActive) {
+    el.setAttribute('role', 'button');
+    el.setAttribute('tabindex', '0');
+    if (label) el.setAttribute('aria-label', label);
+    if (isActive) el.setAttribute('aria-current', 'true');
+    el.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        el.click();
+      }
+    });
+  }
+
   function createConversationRow(c, options = {}) {
     const el = document.createElement('div');
     const hasUnread = c.UnreadCount > 0;
@@ -5899,12 +5934,14 @@ body::after {
       el.addEventListener('contextmenu', (event) => {
         openContextMenu(event, conversationContextMenuItems(c), { type: 'conversation', conversation: c });
       });
+      makeRowKeyboardAccessible(el, `Select ${c.Name || 'conversation'}`, false);
       return el;
     }
     el.addEventListener('click', () => selectConversation(c));
     el.addEventListener('contextmenu', (event) => {
       openContextMenu(event, conversationContextMenuItems(c), { type: 'conversation', conversation: c });
     });
+    makeRowKeyboardAccessible(el, c.Name || 'Conversation', c.ConversationID === activeConvoId);
     return el;
   }
 
@@ -5939,6 +5976,7 @@ body::after {
       const contextRoute = routes.find(route => route.ConversationID === activeConvoId) || primary;
       openContextMenu(event, conversationContextMenuItems(contextRoute), { type: 'conversation', conversation: contextRoute });
     });
+    makeRowKeyboardAccessible(el, identity.displayName, activeConversationIdentityKey() === identity.key);
     return el;
   }
 
@@ -6829,8 +6867,18 @@ body::after {
     }
   }
 
-  function scheduleStreamReconnect(reason, delay = STREAM_RECONNECT_DELAY_MS) {
+  // Reconnect with exponential backoff + jitter so a hard-down server gets
+  // 2.5s/5s/10s/20s/30s-capped retries instead of a fixed 2.5s hammer on
+  // top of the fallback pollers. streamBackoffAttempts resets when a stream
+  // delivers an event again (noteStreamHealthy).
+  let streamBackoffAttempts = 0;
+  function scheduleStreamReconnect(reason, delay) {
     if (streamReconnectTimer) return;
+    if (delay === undefined) {
+      const backoff = STREAM_RECONNECT_DELAY_MS * Math.pow(2, Math.min(streamBackoffAttempts, 4));
+      delay = Math.min(backoff, 30000) + Math.floor(Math.random() * 500);
+      streamBackoffAttempts++;
+    }
     streamReconnectTimer = setTimeout(() => {
       streamReconnectTimer = null;
       if (eventSource) {
@@ -6841,7 +6889,7 @@ body::after {
       startEventStream();
     }, Math.max(0, delay));
     startFallbackPolling();
-    console.warn('Reconnecting event stream:', reason);
+    console.warn('Reconnecting event stream:', reason, `(retry in ${Math.round(delay)}ms)`);
   }
 
   // ─── Render Conversations ───
@@ -6896,6 +6944,17 @@ body::after {
       .replace(/>/g, '&gt;')
       .replace(/"/g, '&quot;')
       .replace(/'/g, '&#39;');
+  }
+
+  // jsEscape makes a value safe inside a single-quoted JS string literal in
+  // an inline handler. The HTML parser decodes entities BEFORE the JS parser
+  // sees the attribute value, so escapeHtml alone cannot protect that inner
+  // context — backslash-escape quotes for the JS layer, then escapeHtml the
+  // result for the attribute layer.
+  function jsEscape(str) {
+    return String(str == null ? '' : str)
+      .replace(/\\/g, '\\\\')
+      .replace(/'/g, "\\'");
   }
 
   function trimTrailingURLPunctuation(rawURL) {
@@ -7061,6 +7120,7 @@ body::after {
     activeConvoId = convo.ConversationID;
     activeConversation = convo;
     pendingDeepLinkConversationID = '';
+    document.body.classList.add('thread-open');
     syncConversationURL(convo.ConversationID);
 
     // Mark as read
@@ -7443,12 +7503,17 @@ body::after {
   }
 
   function buildEmojiFullPanelHTML(messageId) {
-    let html = '<div class="emoji-search"><input type="text" placeholder="Search emoji..." oninput="filterEmojis(event, \'' + messageId + '\')"></div>';
-    html += `<div class="emoji-grid" id="emoji-grid-${messageId}">`;
+    // Escape at the sink, per context: the id attribute needs HTML escaping;
+    // the inline-handler arguments additionally need JS-string escaping
+    // underneath it. Callers pass the raw message id.
+    const idAttr = escapeHtml(messageId);
+    const jsArg = escapeHtml(jsEscape(messageId));
+    let html = '<div class="emoji-search"><input type="text" placeholder="Search emoji..." oninput="filterEmojis(event, \'' + jsArg + '\')"></div>';
+    html += `<div class="emoji-grid" id="emoji-grid-${idAttr}">`;
     EMOJI_CATEGORIES.forEach(cat => {
       html += `<div class="emoji-cat-label">${cat.name}</div>`;
       cat.emojis.forEach(e => {
-        html += `<button data-emoji="${e}" data-name="${escapeHtml(EN[e] || '')}" onclick="sendReactionFromGrid(this, '${messageId}')">${e}</button>`;
+        html += `<button data-emoji="${e}" data-name="${escapeHtml(EN[e] || '')}" onclick="sendReactionFromGrid(this, '${jsArg}')">${e}</button>`;
       });
     });
     html += '</div>';
@@ -8303,13 +8368,20 @@ body::after {
     if (!$emptyStateTitle || activeConvoId) return;
 
     const noConversations = allConversations.length === 0;
+    const noPlatforms = !googleStatus.paired && !whatsAppStatus.paired && !whatsAppStatus.connected && !signalStatus.paired && !signalStatus.connected;
+    const googleDisconnected = !googleStatus.connected && googleStatus.paired && !googleStatus.needs_pairing;
     let title = 'No conversations yet';
     let copy = 'Start a new conversation or wait for your linked platforms to finish syncing recent history.';
     let notes = [];
     let action = 'new';
     let cta = 'New message';
+    // The CTA button is hidden when conversations already exist but none is
+    // selected — composing a new thread is already available from the top bar,
+    // so the right pane only needs to point the user back at the list.
+    let showCta = true;
 
-    if (!googleStatus.paired && !whatsAppStatus.paired && !whatsAppStatus.connected && !signalStatus.paired && !signalStatus.connected) {
+    if (noPlatforms && noConversations) {
+      // True first run: nothing paired and nothing imported.
       title = 'Add your first platform';
       copy = 'Pair the services you want in one local inbox, then messages and routes will appear here automatically.';
       notes = [
@@ -8319,12 +8391,21 @@ body::after {
       ];
       action = 'open-platforms';
       cta = 'Add platform';
-    } else if (!googleStatus.connected && googleStatus.paired && !googleStatus.needs_pairing) {
+    } else if (googleDisconnected) {
+      // Live sync warning still surfaces a reconnect CTA whether or not
+      // conversations already exist, because it is actionable either way.
       title = noConversations ? 'Reconnect Google Messages' : 'Live sync is paused';
       copy = 'New messages will not arrive until Google Messages reconnects.';
       notes = [];
       action = 'reconnect-google';
       cta = 'Reconnect';
+    } else if (!noConversations) {
+      // Conversations exist but none is selected (Escape-deselect, search,
+      // select mode, narrow back-out). Point at the list, no compose CTA.
+      title = 'Select a conversation';
+      copy = 'Choose a thread from the list, or press ⌘K to search.';
+      notes = [];
+      showCta = false;
     }
 
     $emptyStateTitle.textContent = title;
@@ -8332,6 +8413,7 @@ body::after {
     $emptyStateNotes.innerHTML = notes.map(note => `<span>${escapeHtml(note)}</span>`).join('');
     $emptyStateCta.textContent = cta;
     $emptyStateCta.dataset.action = action;
+    $emptyStateCta.style.display = showCta ? '' : 'none';
   }
 
   function renderWhatsAppButton() {
@@ -8868,6 +8950,7 @@ body::after {
     const markHealthy = () => {
       touchStreamActivity();
       stopFallbackPolling();
+      streamBackoffAttempts = 0;
       if (streamReconnectTimer) {
         clearTimeout(streamReconnectTimer);
         streamReconnectTimer = null;
@@ -8945,8 +9028,12 @@ body::after {
         }
         pendingDeepLinkConversationID = requestedConversationID;
       }
-      // Auto-select the most recent conversation when none is specified
-      if (!requestedConversationID && !activeConvoId && conversations.length > 0) {
+      // Auto-select the most recent conversation when none is specified —
+      // but not in the narrow single-pane layout, where the right landing
+      // surface is the list itself, not a thread with the list hidden
+      // behind it.
+      const narrowLayout = window.matchMedia('(max-width: 768px)').matches;
+      if (!requestedConversationID && !activeConvoId && conversations.length > 0 && !narrowLayout) {
         const first = document.querySelector('.convo-item');
         if (first) first.click();
       }
@@ -9117,21 +9204,8 @@ body::after {
     });
   }
 
-  window.addEventListener('keydown', (event) => {
-    if (event.key === 'Escape') {
-      closeContextMenu();
-    }
-    // ⌘K / Ctrl+K — focus search
-    if ((event.metaKey || event.ctrlKey) && event.key === 'k') {
-      event.preventDefault();
-      const searchEl = document.getElementById('search-input');
-      if (searchEl) {
-        searchEl.focus();
-        searchEl.select();
-      }
-    }
-  });
-
+  // Escape and ⌘K for the context menu are handled by the single global
+  // keydown handler's layered Escape stack below.
   window.addEventListener('blur', closeContextMenu);
   window.addEventListener('resize', closeContextMenu);
 
@@ -9221,6 +9295,7 @@ body::after {
     activeConvoId = null;
     activeConvoIsGroup = false;
     activeConversation = null;
+    document.body.classList.remove('thread-open');
     syncConversationURL('');
     activeProtocolDetail = '';
     clearTimeout(threadRefreshTimer);
@@ -9276,9 +9351,12 @@ body::after {
       return;
     }
 
-    // ── Escape: works everywhere ──
+    // ── Escape: one layered stack, top-most surface first. Each step
+    // returns so a single press closes exactly one thing. ──
     if (e.key === 'Escape') {
       e.preventDefault();
+      // Close the context menu if open
+      if ($contextMenu && !$contextMenu.hidden) { closeContextMenu(); return; }
       // Close fullscreen image viewer if open
       const fullscreen = document.querySelector('.msg-image-fullscreen');
       if (fullscreen) { fullscreen.remove(); return; }
@@ -9287,6 +9365,11 @@ body::after {
       if (openPanels.length) { openPanels.forEach(p => p.classList.remove('show')); return; }
       const openPickers = document.querySelectorAll('.emoji-picker.show');
       if (openPickers.length) { openPickers.forEach(p => p.classList.remove('show')); return; }
+      // Close the new-message dialog if open (its own input handler takes
+      // precedence while focus is inside it)
+      if ($newMsgOverlay && $newMsgOverlay.classList.contains('show')) { closeNewMsg(); return; }
+      // Close the platforms overlay if open
+      if ($waOverlay && $waOverlay.classList.contains('show')) { closeWhatsAppOverlay(); return; }
       // Clear search if there is text
       if ($searchInput.value.trim()) {
         $searchInput.value = '';
@@ -9612,7 +9695,6 @@ body::after {
   });
   document.getElementById('chat-back-btn').addEventListener('click', () => {
     deselectConversation();
-    document.querySelector('.sidebar')?.classList.add('mobile-open');
   });
   $newMsgClose.addEventListener('click', closeNewMsg);
   $newMsgGo.addEventListener('click', startNewConversation);
@@ -9635,6 +9717,8 @@ body::after {
     }
     if (e.key === 'Escape') {
       e.preventDefault();
+      // Don't let the global Escape stack also fire — one press, one action.
+      e.stopPropagation();
       if ($newMsgSuggestions && !$newMsgSuggestions.hidden) {
         hideSuggestions();
       } else {
@@ -9642,12 +9726,6 @@ body::after {
       }
     }
   });
-  document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape' && $waOverlay && $waOverlay.classList.contains('show')) {
-      closeWhatsAppOverlay();
-    }
-  });
-
   window.addEventListener('offline', () => {
     browserOnline = false;
     networkIssueDetected = false;
