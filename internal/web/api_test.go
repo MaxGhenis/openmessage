@@ -96,7 +96,10 @@ func readSSEEvent(t *testing.T, reader *bufio.Reader) sseEvent {
 			t.Fatal(res.err)
 		}
 		return res.evt
-	case <-time.After(2 * time.Second):
+	case <-time.After(10 * time.Second):
+		// Generous on purpose: events arrive within milliseconds when
+		// healthy, but a loaded CI runner can stall the goroutine past a
+		// tight deadline and turn this helper into a flake.
 		t.Fatal("timed out waiting for SSE event")
 		return sseEvent{}
 	}
