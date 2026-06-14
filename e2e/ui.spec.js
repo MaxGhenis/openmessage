@@ -1089,3 +1089,34 @@ test('escape closes the platforms overlay without clearing search', async ({ pag
   await expect(page.locator('#wa-overlay')).not.toHaveClass(/show/);
   await expect(page.locator('#search-input')).toHaveValue('hike');
 });
+
+test('status flap from a flapping bridge does not re-render the main UI', async ({ page }) => {
+  await page.waitForFunction(() => window.__openMessageTestHooks?.applyAppStatus);
+  const r = await page.evaluate(() => {
+    const H = window.__openMessageTestHooks;
+    const banner = () => {
+      const b = document.getElementById('connection-banner');
+      const copy = document.getElementById('connection-banner-copy');
+      return JSON.stringify({ disp: b ? getComputedStyle(b).display : null, text: copy ? copy.textContent : null });
+    };
+    const base = {
+      connected: true,
+      google: { connected: true, paired: true, needs_pairing: false },
+      whatsapp: { connected: true, paired: true },
+      signal: { connected: true, paired: true },
+      backfill: { running: false },
+    };
+    const flap = JSON.parse(JSON.stringify(base)); flap.signal.connected = false; // bridge crash; paired stays
+    const gDown = JSON.parse(JSON.stringify(base)); gDown.google.connected = false; gDown.connected = false;
+
+    H.applyAppStatus(base);
+    const sig0 = H.lastStatusRenderSig(); const banner0 = banner();
+    for (let i = 0; i < 6; i++) H.applyAppStatus(i % 2 ? flap : base);
+    const flapStable = sig0 === H.lastStatusRenderSig() && banner0 === banner();
+    H.applyAppStatus(gDown);
+    const realChanged = sig0 !== H.lastStatusRenderSig() && banner0 !== banner();
+    return { flapStable, realChanged };
+  });
+  expect(r.flapStable).toBe(true);   // Signal flapping must not churn the banner
+  expect(r.realChanged).toBe(true);  // a genuine Google disconnect still renders
+});

@@ -4582,6 +4582,12 @@ body::after {
     contacts_checked: 0,
     errors: 0,
   };
+  // Signature of the last status that actually drove a render. The backend
+  // pushes a status SSE event on every platform state change, and a flapping
+  // bridge (or the 10s fallback poll) can fire many identical ones; rendering
+  // each rebuilds the connection banner + header chrome and visibly flickers.
+  // applyAppStatus skips the render pass when this signature is unchanged.
+  let lastStatusRenderSig = null;
   let whatsAppPollTimer = null;
   const knownMessageIDs = new Set();
   const knownMessageOrder = [];
@@ -8340,6 +8346,24 @@ body::after {
     whatsAppStatus = normalizeWhatsAppStatus(appStatus.whatsapp || {});
     signalStatus = normalizeSignalStatus(appStatus.signal || {});
     backfillStatus = normalizeBackfillStatus(appStatus.backfill || {});
+    // Only re-render when something the always-on UI actually shows changed.
+    // The banner and empty state key off whether secondary platforms are
+    // PAIRED, not their live connected flag — so a Signal/WhatsApp bridge
+    // flapping connected↔disconnected (e.g. a signal-cli crash loop) must not
+    // churn the main UI. Live per-platform detail (connect progress, QR) only
+    // matters while the Platforms dialog is open, so it's folded in only then.
+    // Freshness timestamps are excluded entirely (they tick on every message).
+    const overlayOpen = !!($waOverlay && $waOverlay.classList.contains('show'));
+    const hasSecondaryPaired = whatsAppStatus.paired || whatsAppStatus.connected
+      || signalStatus.paired || signalStatus.connected;
+    const sig = JSON.stringify([
+      googleStatus, hasSecondaryPaired,
+      backfillStatus.running, allConversations.length,
+      browserReportsOnline(), activeConvoId, overlayOpen,
+      overlayOpen ? [whatsAppStatus, signalStatus] : null,
+    ]);
+    if (sig === lastStatusRenderSig) return;
+    lastStatusRenderSig = sig;
     setConnectionState();
     renderWhatsAppButton();
     renderEmptyState();
@@ -9772,6 +9796,12 @@ body::after {
           windowEnd: lastRenderedWindowEnd,
           windowSize: THREAD_RENDER_WINDOW_SIZE,
         };
+      },
+      applyAppStatus(status = {}) {
+        applyAppStatus(status || {});
+      },
+      lastStatusRenderSig() {
+        return lastStatusRenderSig;
       },
     };
   }
