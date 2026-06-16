@@ -142,8 +142,14 @@ type App struct {
 	Signal           *signallive.Bridge
 	statusMu         sync.Mutex
 	googleLastError  string
-	tempDataDir      string
-	pendingMediaMu   sync.Mutex
+	// A lapsed Google Messages linked-device session keeps reporting
+	// Connected=true while every send comes back UNKNOWN (the phone has
+	// silently unlinked us). Count consecutive non-SUCCESS Google sends so
+	// the UI can surface a re-pair affordance even while "connected".
+	googleSendFailures atomic.Int32
+	googleNeedsRepair  atomic.Bool
+	tempDataDir        string
+	pendingMediaMu     sync.Mutex
 	pendingMedia     map[string]struct{}
 }
 
@@ -151,7 +157,36 @@ type GoogleStatusSnapshot struct {
 	Connected    bool   `json:"connected"`
 	Paired       bool   `json:"paired"`
 	NeedsPairing bool   `json:"needs_pairing"`
-	LastError    string `json:"last_error,omitempty"`
+	// NeedsRepair is set when the session reports connected but sends keep
+	// failing — the phone has likely unlinked the device. The UI should
+	// offer re-pairing even though Connected is true.
+	NeedsRepair bool   `json:"needs_repair,omitempty"`
+	LastError   string `json:"last_error,omitempty"`
+}
+
+// googleRepairThreshold is how many consecutive failed Google sends (with no
+// success in between) flip the session into the "needs re-pair" state.
+const googleRepairThreshold = 3
+
+// RecordGoogleSendOutcome tracks Google Messages send results so a silently
+// unlinked session (Connected=true, every send UNKNOWN) becomes visible. A
+// single success clears the flag.
+func (a *App) RecordGoogleSendOutcome(success bool) {
+	if success {
+		a.googleSendFailures.Store(0)
+		a.googleNeedsRepair.Store(false)
+		return
+	}
+	if a.googleSendFailures.Add(1) >= googleRepairThreshold {
+		a.googleNeedsRepair.Store(true)
+	}
+}
+
+// ClearGoogleRepairFlag resets the stuck-session state, e.g. after a fresh
+// (re)connect or pairing where sends haven't been attempted yet.
+func (a *App) ClearGoogleRepairFlag() {
+	a.googleSendFailures.Store(0)
+	a.googleNeedsRepair.Store(false)
 }
 
 func DefaultDataDir() string {
@@ -317,6 +352,9 @@ func (a *App) setClient(cli *client.Client) {
 }
 
 func (a *App) LoadAndConnect() error {
+	// A fresh load/connect (including right after re-pairing) starts from a
+	// clean slate; don't carry a prior session's stuck-send state forward.
+	a.ClearGoogleRepairFlag()
 	sessionData, err := client.LoadSession(a.SessionPath)
 	if err != nil {
 		a.setGoogleLastError(err.Error())
@@ -512,10 +550,12 @@ func (a *App) GoogleStatus() GoogleStatusSnapshot {
 	a.statusMu.Lock()
 	lastError := a.googleLastError
 	a.statusMu.Unlock()
+	connected := a.Connected.Load()
 	return GoogleStatusSnapshot{
-		Connected:    a.Connected.Load(),
+		Connected:    connected,
 		Paired:       a.GooglePaired(),
-		NeedsPairing: !a.Connected.Load() && !a.GooglePaired(),
+		NeedsPairing: !connected && !a.GooglePaired(),
+		NeedsRepair:  connected && a.googleNeedsRepair.Load(),
 		LastError:    lastError,
 	}
 }

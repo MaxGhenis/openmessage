@@ -86,3 +86,42 @@ func TestDemoModeEnvParsing(t *testing.T) {
 		}
 	})
 }
+
+func TestGoogleSendOutcomeRepairFlag(t *testing.T) {
+	a := &App{}
+
+	// Below threshold: not yet flagged.
+	a.RecordGoogleSendOutcome(false)
+	a.RecordGoogleSendOutcome(false)
+	if a.googleNeedsRepair.Load() {
+		t.Fatal("should not flag before threshold")
+	}
+	// Reaching the threshold flags it.
+	a.RecordGoogleSendOutcome(false)
+	if !a.googleNeedsRepair.Load() {
+		t.Fatalf("should flag after %d consecutive failures", googleRepairThreshold)
+	}
+
+	// Surfaced in status only while connected.
+	a.Connected.Store(true)
+	if !a.GoogleStatus().NeedsRepair {
+		t.Fatal("connected + stuck should report needs_repair")
+	}
+	a.Connected.Store(false)
+	if a.GoogleStatus().NeedsRepair {
+		t.Fatal("needs_repair must not surface while disconnected (normal pairing flow handles that)")
+	}
+
+	// A single success clears it.
+	a.Connected.Store(true)
+	a.RecordGoogleSendOutcome(true)
+	if a.googleNeedsRepair.Load() || a.GoogleStatus().NeedsRepair {
+		t.Fatal("a successful send must clear the repair flag")
+	}
+
+	// Counter reset by success: it takes a full threshold run to re-flag.
+	a.RecordGoogleSendOutcome(false)
+	if a.googleNeedsRepair.Load() {
+		t.Fatal("one failure after a success must not immediately re-flag")
+	}
+}

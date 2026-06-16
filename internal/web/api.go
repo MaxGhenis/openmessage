@@ -55,6 +55,7 @@ type APIOptions struct {
 	IdentityName          string
 	IsConnected           StatusChecker
 	GoogleStatus          func() any
+	RecordGoogleSend      func(success bool) // tracks Google send outcomes for stuck-session detection
 	ReconnectGoogle       func() error
 	Unpair                UnpairFunc
 	WhatsAppStatus        func() any
@@ -143,6 +144,11 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 	publishStatus := func(connected bool) {
 		if opts.Events != nil {
 			opts.Events.PublishStatus(connected)
+		}
+	}
+	recordGoogleSend := func(success bool) {
+		if opts.RecordGoogleSend != nil {
+			opts.RecordGoogleSend(success)
 		}
 	}
 	// Per-platform data-freshness, used to catch "zombie" bridges that report
@@ -872,9 +878,11 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			}, "")
 			publishMessages(req.ConversationID)
 			publishConversations()
-			httpError(w, "send failed with status "+resp.GetStatus().String()+" (Google Messages rejected the send — check that OpenMessage is still paired and that Messages is your default SMS app)", 502)
+			recordGoogleSend(false)
+			httpError(w, googleSendRejectedMessage(resp.GetStatus().String()), 502)
 			return
 		}
+		recordGoogleSend(true)
 		// Store sent message in DB immediately so UI shows it
 		now := time.Now().UnixMilli()
 		if err := recordOutgoingMessage(&db.Message{
@@ -1044,9 +1052,11 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			}, "")
 			publishMessages(convID)
 			publishConversations()
-			httpError(w, "send failed with status "+resp.GetStatus().String()+" (Google Messages rejected the media send — check pairing and that Messages is your default SMS app)", 502)
+			recordGoogleSend(false)
+			httpError(w, googleSendRejectedMessage(resp.GetStatus().String()), 502)
 			return
 		}
+		recordGoogleSend(true)
 		now := time.Now().UnixMilli()
 		if err := recordOutgoingMessage(&db.Message{
 			MessageID:      payload.TmpID,
@@ -1476,9 +1486,11 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			}, "")
 			publishMessages(draft.ConversationID)
 			publishConversations()
-			httpError(w, "send failed with status "+resp.GetStatus().String()+" (Google Messages rejected the draft send — check pairing and that Messages is your default SMS app)", 502)
+			recordGoogleSend(false)
+			httpError(w, googleSendRejectedMessage(resp.GetStatus().String()), 502)
 			return
 		}
+		recordGoogleSend(true)
 		now := time.Now().UnixMilli()
 		if err := recordOutgoingMessage(&db.Message{
 			MessageID:      payload.TmpID,
@@ -2236,6 +2248,16 @@ func googleAPIErrorMessage(action string, err error) string {
 		return "Google Messages is offline. Check your internet connection, then try again."
 	}
 	return action + ": " + err.Error()
+}
+
+// googleSendRejectedMessage builds the user-facing error for a non-SUCCESS
+// Google send. UNKNOWN is what a silently-unlinked linked device returns on
+// every send, so the message points at re-pairing rather than leaving the
+// user with a bare status code.
+func googleSendRejectedMessage(status string) string {
+	return "send failed (Google Messages returned " + status + "). If this keeps happening your phone has " +
+		"likely unlinked OpenMessage — open Platforms → Google Messages → Pair again. " +
+		"Also confirm Messages is set as your phone's default SMS app."
 }
 
 func isGoogleNetworkError(err error) bool {

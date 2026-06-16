@@ -1120,3 +1120,24 @@ test('status flap from a flapping bridge does not re-render the main UI', async 
   expect(r.flapStable).toBe(true);   // Signal flapping must not churn the banner
   expect(r.realChanged).toBe(true);  // a genuine Google disconnect still renders
 });
+
+test('a stuck Google session (connected + needs_repair) surfaces a re-pair banner', async ({ page }) => {
+  await page.waitForFunction(() => window.__openMessageTestHooks?.applyAppStatus);
+  const stuck = {
+    connected: true,
+    google: { connected: true, paired: true, needs_pairing: false, needs_repair: true },
+    whatsapp: { connected: true, paired: true },
+    signal: { connected: true, paired: true },
+    backfill: { running: false },
+  };
+  await page.evaluate((s) => window.__openMessageTestHooks.applyAppStatus(s), stuck);
+  await expect(page.locator('#connection-banner')).toBeVisible();
+  await expect(page.locator('#connection-banner-action')).toHaveText('Re-pair');
+  await expect(page.locator('#connection-banner-copy')).toContainText('Re-pair to fix it');
+
+  // Healthy again → banner hides.
+  const healthy = JSON.parse(JSON.stringify(stuck));
+  healthy.google.needs_repair = false;
+  await page.evaluate((s) => window.__openMessageTestHooks.applyAppStatus(s), healthy);
+  await expect(page.locator('#connection-banner')).toBeHidden();
+});

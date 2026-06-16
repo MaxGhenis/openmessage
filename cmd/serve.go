@@ -381,6 +381,7 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 				IdentityName:         identityName,
 				IsConnected:          isConnected,
 				GoogleStatus:         googleStatus,
+				RecordGoogleSend:     a.RecordGoogleSendOutcome,
 				ReconnectGoogle:      a.ReconnectGoogleMessages,
 				Unpair:               a.Unpair,
 				WhatsAppStatus:       func() any { return a.WhatsAppStatus() },
