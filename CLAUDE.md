@@ -22,6 +22,24 @@ Local-first universal message database with built-in MCP server. Ingests message
 └── vercel.json       Vercel config (root — NOT site/vercel.json)
 ```
 
+## Supporting a live install (READ FIRST for support/debug tasks)
+
+If you are debugging a real user's install — sends failing, re-pairing, reading
+their actual messages — read **[docs/agent-runbook.md](docs/agent-runbook.md)**
+before touching anything. The traps that cost the most:
+
+- **Two data dirs, not one.** The macOS app's live store is
+  `~/Library/Application Support/OpenMessage/` (set via `OPENMESSAGES_DATA_DIR`).
+  The CLI default (`~/.local/share/openmessage/`) is a **separate, usually
+  stale** store. Point CLI tools at the app dir for live data.
+- **Read live messages via the HTTP API** (`/api/conversations/<id>/messages`,
+  `/api/search`, `/api/status`) — the app holds the WAL'd DB, so a direct
+  `sqlite3` reader hits "unable to open database file (14)".
+- **Re-pairing Google Messages:** QR is dead; use Google Account pairing via the
+  cookie method; clear `session.json` from **both** data dirs to reach the
+  pairing screen; don't over-reconnect (it throttles the account). Full recipe
+  in the runbook.
+
 ## Local CLI (read-only, no transports)
 
 These commands open the store directly and start no live transports, so they
@@ -164,7 +182,7 @@ Claude Code slash command that produces fact-grounded relationship visualization
 
 ## Key files
 
-- `internal/app/app.go` — data dir resolution (`OPENMESSAGES_DATA_DIR` env var, defaults to `~/.local/share/openmessage`)
+- `internal/app/app.go` — data dir resolution (`OPENMESSAGES_DATA_DIR` env var; CLI default is `~/.local/share/openmessage`, but **the macOS app overrides it to `~/Library/Application Support/OpenMessage`** — see [docs/agent-runbook.md](docs/agent-runbook.md))
 - `internal/db/db.go` — schema, structs, migration
 - `internal/importer/` — gchat.go, imessage.go, whatsapp.go
 - `internal/story/stats.go` — conversation statistics computation (with timezone + per-sender phrases)

@@ -202,6 +202,8 @@ npm run test:e2e     # Run browser-level web UI tests
 
 Before publishing a build or website update, run through [the release checklist](docs/release-checklist.md).
 
+Debugging a live install (failing sends, re-pairing, the two-data-dir gotcha, signal-cli version)? See [docs/agent-runbook.md](docs/agent-runbook.md).
+
 ## License
 
 MIT
