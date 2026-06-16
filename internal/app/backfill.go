@@ -40,6 +40,30 @@ func orphanContactDiscoveryEnabled() bool {
 	}
 }
 
+func isGoogleAuthExpiredError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "http 401") ||
+		strings.Contains(msg, "session_cookie_invalid") ||
+		strings.Contains(msg, "invalid authentication credentials")
+}
+
+func (a *App) abortBackfillForGoogleAuthError(err error, phase, detail string) bool {
+	if !isGoogleAuthExpiredError(err) {
+		return false
+	}
+	if detail != "" {
+		a.BackfillProgress.addError(detail)
+	}
+	a.Connected.Store(false)
+	a.setGoogleLastError("Google Messages session cookie expired; refreshing and reconnecting…")
+	a.emitStatusChange(false)
+	a.Logger.Warn().Err(err).Str("phase", phase).Msg("Deep backfill aborted because Google auth expired")
+	return true
+}
+
 // Backfill fetches existing conversations and recent messages from
 // Google Messages and stores them in the local database.
 func (a *App) Backfill() error {
@@ -194,6 +218,9 @@ func (a *App) paginateFolder(gm GMClient, folder gmproto.ListConversationsReques
 		}
 		resp, err := gm.ListConversationsWithCursor(100, folder, cursor)
 		if err != nil {
+			if a.abortBackfillForGoogleAuthError(err, "folders", fmt.Sprintf("list %s: %v", folder.String(), err)) {
+				return found, true
+			}
 			a.Logger.Error().Err(err).Str("folder", folder.String()).Msg("Deep backfill: list conversations failed")
 			a.BackfillProgress.addError(fmt.Sprintf("list %s: %v", folder.String(), err))
 			break
@@ -260,6 +287,9 @@ func (a *App) deepBackfillConversationWithToken(gm GMClient, convID string, clie
 		}
 		resp, err := gm.FetchMessages(convID, 50, cursor)
 		if err != nil {
+			if a.abortBackfillForGoogleAuthError(err, "messages", fmt.Sprintf("fetch messages %s: %v", convID, err)) {
+				return total, true
+			}
 			a.Logger.Warn().Err(err).Str("conv_id", convID).Msg("Deep backfill: fetch messages failed")
 			a.BackfillProgress.addError(fmt.Sprintf("fetch messages %s: %v", convID, err))
 			break
@@ -305,6 +335,9 @@ func (a *App) discoverFromContacts(gm GMClient, seen map[string]bool, clientToke
 	}
 	contactsResp, err := gm.ListContacts()
 	if err != nil {
+		if a.abortBackfillForGoogleAuthError(err, "contacts", fmt.Sprintf("list contacts: %v", err)) {
+			return true
+		}
 		a.Logger.Warn().Err(err).Msg("Deep backfill: list contacts failed")
 		a.BackfillProgress.addError(fmt.Sprintf("list contacts: %v", err))
 		return false
@@ -335,6 +368,9 @@ func (a *App) discoverFromContacts(gm GMClient, seen map[string]bool, clientToke
 			},
 		})
 		if err != nil {
+			if a.abortBackfillForGoogleAuthError(err, "contacts", fmt.Sprintf("get or create conversation %s: %v", phone, err)) {
+				return true
+			}
 			a.Logger.Debug().Err(err).Str("phone", phone).Msg("Deep backfill: GetOrCreateConversation failed for contact")
 			a.BackfillProgress.addError("")
 			continue

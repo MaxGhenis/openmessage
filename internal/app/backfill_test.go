@@ -2,6 +2,7 @@ package app
 
 import (
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -922,6 +923,74 @@ func TestStartRecentReconcileReturnsFalseWhenBackfillIsRunning(t *testing.T) {
 
 	if a.StartRecentReconcile("listen_recovered") {
 		t.Fatal("recent reconcile should not start while another backfill is active")
+	}
+}
+
+func TestDeepBackfillAbortsOnFolderAuthExpired(t *testing.T) {
+	mock := &mockGMClient{
+		listConvErrors: map[gmproto.ListConversationsRequest_Folder]error{
+			gmproto.ListConversationsRequest_INBOX: fmt.Errorf("HTTP 401: SESSION_COOKIE_INVALID"),
+		},
+	}
+	a := newTestApp(t, mock)
+	a.Connected.Store(true)
+
+	var statusChanges int
+	a.OnStatusChange = func(connected bool) {
+		statusChanges++
+		if connected {
+			t.Fatal("auth-expired backfill should mark Google disconnected")
+		}
+	}
+
+	a.DeepBackfill()
+
+	if a.Connected.Load() {
+		t.Fatal("Google connection should be marked disconnected")
+	}
+	if statusChanges != 1 {
+		t.Fatalf("status change callbacks = %d, want 1", statusChanges)
+	}
+	if got := a.GoogleStatus().LastError; !strings.Contains(got, "session cookie expired") {
+		t.Fatalf("last error = %q, want session cookie expired message", got)
+	}
+	progress := a.GetBackfillProgress()
+	if progress.Errors != 1 {
+		t.Fatalf("errors = %d, want 1", progress.Errors)
+	}
+	if progress.ConversationsFound != 0 {
+		t.Fatalf("conversations found = %d, want 0", progress.ConversationsFound)
+	}
+}
+
+func TestDeepBackfillAbortsOnMessageAuthExpired(t *testing.T) {
+	mock := &mockGMClient{
+		conversations: map[gmproto.ListConversationsRequest_Folder][][]*gmproto.Conversation{
+			gmproto.ListConversationsRequest_INBOX: {
+				{makeConv("c1", "Alice")},
+			},
+		},
+		fetchMsgErrors: map[string]error{
+			"c1": fmt.Errorf("Request had invalid authentication credentials"),
+		},
+	}
+	a := newTestApp(t, mock)
+	a.Connected.Store(true)
+
+	a.DeepBackfill()
+
+	if a.Connected.Load() {
+		t.Fatal("Google connection should be marked disconnected")
+	}
+	if got := a.GoogleStatus().LastError; !strings.Contains(got, "session cookie expired") {
+		t.Fatalf("last error = %q, want session cookie expired message", got)
+	}
+	progress := a.GetBackfillProgress()
+	if progress.Errors != 1 {
+		t.Fatalf("errors = %d, want 1", progress.Errors)
+	}
+	if progress.MessagesFound != 0 {
+		t.Fatalf("messages found = %d, want 0", progress.MessagesFound)
 	}
 }
 
