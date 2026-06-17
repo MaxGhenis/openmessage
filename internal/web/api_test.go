@@ -231,6 +231,44 @@ func TestSetConversationNotificationMode(t *testing.T) {
 	}
 }
 
+func TestSetConversationFavorite(t *testing.T) {
+	ts := newTestServer(t)
+	if err := ts.store.UpsertConversation(&db.Conversation{
+		ConversationID: "c1",
+		Name:           "Alice",
+		LastMessageTS:  100,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := http.Post(ts.server.URL+"/api/conversations/c1/favorite", "application/json", strings.NewReader(`{"favorite":true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("got status %d, want 200: %s", resp.StatusCode, body)
+	}
+
+	var convo db.Conversation
+	if err := json.NewDecoder(resp.Body).Decode(&convo); err != nil {
+		t.Fatal(err)
+	}
+	if !convo.IsFavorite {
+		t.Fatal("response conversation should be favorite")
+	}
+
+	stored, err := ts.store.GetConversation("c1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !stored.IsFavorite {
+		t.Fatal("stored conversation should be favorite")
+	}
+}
+
 func TestSetConversationNotificationModeRejectsInvalid(t *testing.T) {
 	ts := newTestServer(t)
 	if err := ts.store.UpsertConversation(&db.Conversation{

@@ -505,6 +505,7 @@ test('keeps the thread header compact with actions after search', async ({ page 
       source: rectFor('#chat-header-source'),
       search: rectFor('.thread-search-input-wrap'),
       notification: rectFor('#chat-header-notification-btn'),
+      favorite: rectFor('#chat-header-favorite-btn'),
     };
   });
   const centerY = (rect) => rect.top + rect.height / 2;
@@ -515,19 +516,86 @@ test('keeps the thread header compact with actions after search', async ({ page 
 
   await openConversation(page, 'Sarah Chen');
   const layout = await readHeaderLayout();
-  expect(layout.header.height).toBeLessThanOrEqual(74);
+  expect(layout.header.height).toBeLessThanOrEqual(64);
   expect(Math.abs(centerY(layout.name) - centerY(layout.source))).toBeLessThanOrEqual(12);
   expect(layout.source.left).toBeGreaterThan(layout.name.right);
   expect(layout.notification.left).toBeGreaterThan(layout.search.right);
+  expect(layout.favorite.left).toBeGreaterThan(layout.notification.right);
 
   await page.setViewportSize({ width: 920, height: 700 });
   await page.reload();
   await openConversation(page, 'Sarah Chen');
   const mediumLayout = await readHeaderLayout();
-  for (const rect of [mediumLayout.name, mediumLayout.source, mediumLayout.search, mediumLayout.notification]) {
+  for (const rect of [mediumLayout.name, mediumLayout.source, mediumLayout.search, mediumLayout.notification, mediumLayout.favorite]) {
     expectInsideHeader(mediumLayout, rect);
   }
   expect(mediumLayout.notification.left).toBeGreaterThan(mediumLayout.search.right);
+  expect(mediumLayout.favorite.left).toBeGreaterThan(mediumLayout.notification.right);
+});
+
+test('keeps sidebar search and tabs tightly stacked', async ({ page }) => {
+  const layout = await page.evaluate(() => {
+    const header = document.querySelector('.sidebar-header').getBoundingClientRect();
+    const search = document.querySelector('.search-box').getBoundingClientRect();
+    const tabs = document.querySelector('.sidebar-tabs-row').getBoundingClientRect();
+    return {
+      headerHeight: header.height,
+      headerToSearch: search.top - header.bottom,
+      searchToTabs: tabs.top - search.bottom,
+    };
+  });
+
+  expect(layout.headerHeight).toBeLessThanOrEqual(72);
+  expect(layout.headerToSearch).toBeLessThanOrEqual(10);
+  expect(layout.searchToTabs).toBeLessThanOrEqual(8);
+});
+
+test('favorites conversations from the header and row context menu', async ({ page, request }) => {
+  await request.post('/api/conversations/conv1/favorite', { data: { favorite: false } });
+  await request.post('/api/conversations/conv2/favorite', { data: { favorite: false } });
+  await request.post('/api/mark-read', { data: { conversation_id: 'conv2' } });
+  await page.reload();
+
+  await openConversation(page, 'Sarah Chen');
+  await request.post('/_e2e/messages', {
+    data: {
+      conversation_id: 'conv2',
+      body: `Favorite badge check ${Date.now()}`,
+      sender_name: 'Marcus Johnson',
+      sender_number: '+12125559876',
+      timestamp_ms: 1738956601000,
+    },
+  });
+
+  const headerFavorite = page.locator('#chat-header-favorite-btn');
+  await expect(headerFavorite).toHaveAttribute('aria-pressed', 'false');
+  await headerFavorite.click();
+  await expect(page.locator('#chat-header-favorite-btn')).toHaveAttribute('aria-pressed', 'true');
+
+  const sarahFavorite = page.locator('#favorites-rail .favorite-chip[title="Sarah Chen"]');
+  await expect(sarahFavorite).toBeVisible();
+  await expect(sarahFavorite).toHaveClass(/active/);
+
+  const marcusRow = page.locator('#conversation-list .convo-item').filter({ hasText: 'Marcus Johnson' }).first();
+  await expect(marcusRow.locator('.convo-unread')).toHaveText('1');
+  await marcusRow.click({ button: 'right' });
+  await page.locator('#context-menu .context-menu-item').getByText('Add to favorites', { exact: true }).click();
+
+  const marcusFavorite = page.locator('#favorites-rail .favorite-chip[title="Marcus Johnson"]');
+  await expect(marcusFavorite).toBeVisible();
+  await expect(marcusFavorite.locator('.favorite-unread')).toHaveText('1');
+
+  await marcusFavorite.click();
+  await expect(page.locator('#chat-header-name')).toHaveText('Marcus Johnson');
+  await expect(marcusFavorite).toHaveClass(/active/);
+
+  await page.locator('#chat-header-favorite-btn').click();
+  await expect(page.locator('#favorites-rail .favorite-chip[title="Marcus Johnson"]')).toHaveCount(0);
+
+  await sarahFavorite.click();
+  await expect(page.locator('#chat-header-name')).toHaveText('Sarah Chen');
+  await page.locator('#chat-header-favorite-btn').click();
+  await expect(page.locator('#favorites-rail .favorite-chip[title="Sarah Chen"]')).toHaveCount(0);
 });
 
 test('inserts emoji into the compose message', async ({ page }) => {

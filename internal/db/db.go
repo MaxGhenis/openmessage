@@ -25,6 +25,7 @@ type Conversation struct {
 	LastMessagePreview string `json:"last_message_preview,omitempty"`
 	UnifiedID          string `json:"unified_id,omitempty"`
 	UnifiedName        string `json:"unified_name,omitempty"`
+	IsFavorite         bool   `json:"is_favorite,omitempty"`
 	NotificationMode   string `json:"notification_mode,omitempty"` // all, mentions, muted
 	Tab                string `json:"tab,omitempty"`               // "" = Recent (inbox), "archive", or a custom tab id
 }
@@ -357,6 +358,7 @@ func (s *Store) migrate() error {
 		"ALTER TABLE conversations ADD COLUMN source_platform TEXT NOT NULL DEFAULT 'sms'",
 		"ALTER TABLE conversations ADD COLUMN display_protocol TEXT NOT NULL DEFAULT ''",
 		"ALTER TABLE conversations ADD COLUMN notification_mode TEXT NOT NULL DEFAULT 'all'",
+		"ALTER TABLE conversations ADD COLUMN is_favorite INTEGER NOT NULL DEFAULT 0",
 		"ALTER TABLE conversations ADD COLUMN tab TEXT NOT NULL DEFAULT ''",
 	} {
 		s.db.Exec(col) // ignore "duplicate column" errors

@@ -529,6 +529,31 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			writeJSON(w, convo)
 			return
 		}
+		if action == "favorite" {
+			if r.Method != http.MethodPost && r.Method != http.MethodPatch {
+				httpError(w, "method not allowed", 405)
+				return
+			}
+			var req struct {
+				Favorite bool `json:"favorite"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				httpError(w, "invalid JSON: "+err.Error(), 400)
+				return
+			}
+			if err := store.SetConversationFavorite(convID, req.Favorite); err != nil {
+				httpError(w, "set favorite: "+err.Error(), 500)
+				return
+			}
+			convo, err := store.GetConversation(convID)
+			if err != nil {
+				httpError(w, "get conversation: "+err.Error(), 500)
+				return
+			}
+			publishConversations()
+			writeJSON(w, convo)
+			return
+		}
 		if action == "tab" {
 			if r.Method != http.MethodPost && r.Method != http.MethodPatch {
 				httpError(w, "method not allowed", 405)

@@ -2610,7 +2610,7 @@ body::after {
 .sidebar-header {
   align-items: center;
   gap: 12px;
-  padding: 18px 20px 16px;
+  padding: 14px 20px 12px;
   border-bottom: 1px solid var(--border);
 }
 
@@ -2707,7 +2707,7 @@ body::after {
 }
 
 .search-box {
-  margin: 14px 20px 10px;
+  margin: 7px 20px 6px;
   position: relative;
 }
 
@@ -2761,7 +2761,7 @@ body::after {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 4px 20px 12px;
+  padding: 0 20px 8px;
 }
 
 .sidebar-tabs {
@@ -3173,7 +3173,7 @@ body::after {
 }
 
 .chat-header {
-  padding: 10px 28px;
+  padding: 7px 28px;
   background: var(--bg-elevated);
   border-bottom: 1px solid var(--border);
   backdrop-filter: none;
@@ -3373,9 +3373,91 @@ body::after {
   color: var(--accent-strong);
 }
 
+.chat-header-action-btn.favorite.active {
+  border-color: rgba(245, 158, 11, 0.42);
+  background: rgba(245, 158, 11, 0.12);
+  color: #f59e0b;
+}
+
 .chat-header-action-btn svg {
   width: 14px;
   height: 14px;
+}
+
+.favorites-rail {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  max-width: 154px;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.favorites-rail[hidden] {
+  display: none;
+}
+
+.favorites-rail::-webkit-scrollbar {
+  display: none;
+}
+
+.favorite-chip {
+  position: relative;
+  flex: 0 0 auto;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-primary);
+  cursor: pointer;
+}
+
+.favorite-chip:hover,
+.favorite-chip.active {
+  border-color: var(--border-accent);
+}
+
+.favorite-avatar {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 700;
+  overflow: visible;
+}
+
+.favorite-avatar .avatar-face {
+  border-radius: 999px;
+  overflow: hidden;
+}
+
+.favorite-avatar .avatar-platform-stack {
+  right: -4px;
+  bottom: -4px;
+  transform: scale(0.82);
+  transform-origin: right bottom;
+}
+
+.favorite-unread {
+  position: absolute;
+  top: -5px;
+  right: -5px;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  border: 2px solid var(--bg-elevated);
+  border-radius: 999px;
+  background: var(--accent-strong);
+  color: #fff;
+  font-family: var(--font-mono);
+  font-size: 9px;
+  font-weight: 700;
+  line-height: 12px;
+  text-align: center;
 }
 
 .chat-header-source .platform-chip {
@@ -3476,18 +3558,21 @@ body::after {
 
 .convo-avatar.has-photo,
 .chat-header-avatar.has-photo,
+.favorite-avatar.has-photo,
 .msg-avatar.has-photo {
   color: transparent;
 }
 
 .convo-avatar.has-photo .avatar-face,
 .chat-header-avatar.has-photo .avatar-face,
+.favorite-avatar.has-photo .avatar-face,
 .msg-avatar.has-photo .avatar-face {
   background: transparent !important;
 }
 
 .convo-avatar.has-photo img,
 .chat-header-avatar.has-photo img,
+.favorite-avatar.has-photo img,
 .msg-avatar.has-photo img {
   display: block;
   width: 100%;
@@ -4485,7 +4570,7 @@ body::after {
   }
 
   .sidebar-header {
-    padding: 16px;
+    padding: 12px 16px;
   }
 
   .sidebar-header-main {
@@ -4523,7 +4608,7 @@ body::after {
   }
 
   .search-box {
-    margin: 12px 16px 8px;
+    margin: 8px 16px 6px;
   }
 
   .sidebar-section-label {
@@ -4791,6 +4876,7 @@ body::after {
           <div class="thread-search-results" id="thread-search-results" hidden></div>
         </div>
         <div class="chat-header-actions" id="chat-header-actions"></div>
+        <div class="favorites-rail" id="favorites-rail" aria-label="Favorite threads" hidden></div>
       </div>
       <div class="contact-popover" id="contact-popover" hidden role="dialog" aria-label="Contact details"></div>
     </div>
@@ -4946,6 +5032,7 @@ body::after {
   const $chatHeaderName = document.getElementById('chat-header-name');
   const $chatHeaderSource = document.getElementById('chat-header-source');
   const $chatHeaderActions = document.getElementById('chat-header-actions');
+  const $favoritesRail = document.getElementById('favorites-rail');
   const $chatHeaderStatus = document.getElementById('chat-header-status');
   const $threadSearchInput = document.getElementById('thread-search-input');
   const $threadSearchClear = document.getElementById('thread-search-clear');
@@ -5179,6 +5266,11 @@ body::after {
     return normalizeNotificationMode(convo.NotificationMode || convo.notification_mode);
   }
 
+  function conversationFavoriteOf(convo) {
+    if (!convo) return false;
+    return !!(convo.IsFavorite || convo.is_favorite);
+  }
+
   function notificationModeLabel(mode) {
     switch (normalizeNotificationMode(mode)) {
       case NOTIFICATION_MODE_MENTIONS:
@@ -5210,6 +5302,10 @@ body::after {
       default:
         return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 17h5l-1.4-1.4A2 2 0 0 1 18 14.2V11a6 6 0 1 0-12 0v3.2a2 2 0 0 1-.6 1.4L4 17h11"/><path d="M9.5 17a2.5 2.5 0 0 0 5 0"/></svg>`;
     }
+  }
+
+  function favoriteActionIconHTML(isFavorite) {
+    return `<svg viewBox="0 0 24 24" fill="${isFavorite ? 'currentColor' : 'none'}" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>`;
   }
 
   function identityMentionNames() {
@@ -6580,6 +6676,60 @@ body::after {
     return el;
   }
 
+  function renderFavoritesRail(convos = allConversations) {
+    if (!$favoritesRail) return;
+    const favorites = (convos || [])
+      .filter(conversationFavoriteOf)
+      .slice()
+      .sort((a, b) => (b.LastMessageTS || 0) - (a.LastMessageTS || 0));
+
+    if (!favorites.length) {
+      $favoritesRail.hidden = true;
+      $favoritesRail.innerHTML = '';
+      return;
+    }
+
+    $favoritesRail.hidden = false;
+    $favoritesRail.innerHTML = favorites.map((convo) => {
+      const avatarRefs = conversationAvatarRefs(convo);
+      const unread = Number(convo.UnreadCount || convo.unread_count || 0);
+      const unreadLabel = unread > 99 ? '99+' : String(unread);
+      return `
+        <button
+          type="button"
+          class="favorite-chip${convo.ConversationID === activeConvoId ? ' active' : ''}"
+          data-conversation-id="${escapeHtml(convo.ConversationID)}"
+          title="${escapeHtml(convo.Name || 'Favorite thread')}"
+          aria-label="Open ${escapeHtml(convo.Name || 'favorite thread')}"
+          ${convo.ConversationID === activeConvoId ? 'aria-current="page"' : ''}
+        >
+          ${avatarHTML({
+            name: convo.Name,
+            numbers: conversationAvatarNumbers(convo),
+            whatsAppConversationID: conversationAvatarWhatsAppConversationID(convo),
+            avatarSource: avatarRefs.source,
+            participantIDs: avatarRefs.participantIDs,
+            contactIDs: avatarRefs.contactIDs,
+            platforms: avatarPlatformsForConversation(convo),
+            className: 'favorite-avatar',
+            style: `background:${avatarColor(convo.Name)}`,
+          })}
+          ${unread > 0 ? `<span class="favorite-unread">${escapeHtml(unreadLabel)}</span>` : ''}
+        </button>
+      `;
+    }).join('');
+
+    $favoritesRail.querySelectorAll('.favorite-chip').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        const convo = conversationByID(btn.dataset.conversationId || '');
+        if (convo) {
+          await revealAndSelectConversation(convo);
+        }
+      });
+    });
+    hydrateNativeAvatars($favoritesRail);
+  }
+
   function updateChatHeaderPlatform(protocolDetail = '') {
     activeProtocolDetail = protocolDetail || displayProtocolOf(activeConversation);
     if (!activeConversation) {
@@ -6595,6 +6745,7 @@ body::after {
       await selectConversation(route);
     });
     const notificationMode = notificationModeOf(activeConversation);
+    const isFavorite = conversationFavoriteOf(activeConversation);
     const leaveButtonHTML = isLeaveableWhatsAppGroup(activeConversation)
       ? `
       <button
@@ -6615,6 +6766,14 @@ body::after {
         title="Notification settings: ${escapeHtml(notificationModeLabel(notificationMode))}"
         aria-label="Notification settings"
       >${notificationActionIconHTML(notificationMode)}</button>
+      <button
+        type="button"
+        class="chat-header-action-btn favorite${isFavorite ? ' active' : ''}"
+        id="chat-header-favorite-btn"
+        title="${isFavorite ? 'Remove from favorites' : 'Add to favorites'}"
+        aria-label="${isFavorite ? 'Remove from favorites' : 'Add to favorites'}"
+        aria-pressed="${isFavorite ? 'true' : 'false'}"
+      >${favoriteActionIconHTML(isFavorite)}</button>
     `;
     const $leaveGroupBtn = document.getElementById('chat-header-leave-group-btn');
     if ($leaveGroupBtn) {
@@ -6633,6 +6792,15 @@ body::after {
         openContextMenuAt(rect.left, rect.bottom + 8, conversationNotificationMenuItems(activeConversation), {
           type: 'conversation',
           conversation: activeConversation,
+        });
+      });
+    }
+    const $favoriteBtn = document.getElementById('chat-header-favorite-btn');
+    if ($favoriteBtn) {
+      $favoriteBtn.addEventListener('click', () => {
+        toggleConversationFavorite(activeConversation).catch(err => {
+          console.error('Failed to update favorite:', err);
+          showThreadFeedback(err.message || 'Failed to update favorite.');
         });
       });
     }
@@ -6677,6 +6845,7 @@ body::after {
 
   function refreshConversationChrome(protocolDetail = activeProtocolDetail) {
     updateChatHeaderPlatform(protocolDetail);
+    renderFavoritesRail();
     refreshComposeRouteUI();
   }
 
@@ -7085,6 +7254,27 @@ body::after {
     }
   }
 
+  async function setConversationFavorite(convo, favorite) {
+    if (!convo) return;
+    const updated = await postJSON(`/api/conversations/${encodeURIComponent(convo.ConversationID)}/favorite`, {
+      favorite: !!favorite,
+    });
+    const isFavorite = !!(updated.IsFavorite || updated.is_favorite || favorite);
+    applyConversationPatch(convo.ConversationID, {
+      IsFavorite: isFavorite,
+      is_favorite: isFavorite,
+    });
+    renderConversations(allConversations);
+    if (activeConversation && activeConversation.ConversationID === convo.ConversationID) {
+      refreshConversationChrome();
+    }
+  }
+
+  async function toggleConversationFavorite(convo) {
+    if (!convo) return;
+    await setConversationFavorite(convo, !conversationFavoriteOf(convo));
+  }
+
   async function leaveWhatsAppGroup(convo = activeConversation) {
     if (!isLeaveableWhatsAppGroup(convo)) return;
     const groupName = String(convo.Name || 'this group').trim() || 'this group';
@@ -7212,10 +7402,15 @@ body::after {
   }
 
   function conversationContextMenuItems(convo) {
+    const isFavorite = conversationFavoriteOf(convo);
     const items = [
       {
         label: 'Open thread',
         action: 'open-thread',
+      },
+      {
+        label: isFavorite ? 'Remove from favorites' : 'Add to favorites',
+        action: 'toggle-favorite',
       },
     ];
     if (isLeaveableWhatsAppGroup(convo)) {
@@ -7501,6 +7696,7 @@ body::after {
     if (!isSearch) {
       allConversations = convos;
     }
+    renderFavoritesRail();
     renderEmptyState();
     renderTabs();
     const tabConvos = isSearch ? convos : filterConversationsByTab(convos);
@@ -10085,6 +10281,12 @@ body::after {
           }
           if (action === 'leave-whatsapp-group') {
             await leaveWhatsAppGroup(context.conversation);
+            return;
+          }
+          if (action === 'toggle-favorite') {
+            const willFavorite = !conversationFavoriteOf(context.conversation);
+            await setConversationFavorite(context.conversation, willFavorite);
+            showThreadFeedback(willFavorite ? 'Added to favorites.' : 'Removed from favorites.');
             return;
           }
           if (action === 'copy-number') {
