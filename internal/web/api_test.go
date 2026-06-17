@@ -269,6 +269,54 @@ func TestSetConversationFavorite(t *testing.T) {
 	}
 }
 
+func TestSetConversationFavoriteMissingConversation(t *testing.T) {
+	ts := newTestServer(t)
+
+	resp, err := http.Post(ts.server.URL+"/api/conversations/missing/favorite", "application/json", strings.NewReader(`{"favorite":true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNotFound {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("got status %d, want 404: %s", resp.StatusCode, body)
+	}
+}
+
+func TestSetConversationFavoriteRequiresBoolean(t *testing.T) {
+	ts := newTestServer(t)
+	if err := ts.store.UpsertConversation(&db.Conversation{
+		ConversationID: "c1",
+		Name:           "Alice",
+		LastMessageTS:  100,
+		IsFavorite:     true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, body := range []string{`{}`, `{"favorite":null}`} {
+		resp, err := http.Post(ts.server.URL+"/api/conversations/c1/favorite", "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if resp.StatusCode != http.StatusBadRequest {
+			respBody, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			t.Fatalf("body %s got status %d, want 400: %s", body, resp.StatusCode, respBody)
+		}
+		resp.Body.Close()
+	}
+
+	stored, err := ts.store.GetConversation("c1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !stored.IsFavorite {
+		t.Fatal("invalid favorite requests should not clear stored favorite state")
+	}
+}
+
 func TestSetConversationNotificationModeRejectsInvalid(t *testing.T) {
 	ts := newTestServer(t)
 	if err := ts.store.UpsertConversation(&db.Conversation{
@@ -699,6 +747,7 @@ func TestSearchMessages(t *testing.T) {
 		Participants:   `[{"name":"Nathan","number":"+12675550100"}]`,
 		LastMessageTS:  200,
 		SourcePlatform: "sms",
+		IsFavorite:     true,
 	})
 	ts.store.UpsertMessage(&db.Message{
 		MessageID: "m1", ConversationID: "c1", Body: "lunch tomorrow?",
@@ -731,6 +780,9 @@ func TestSearchMessages(t *testing.T) {
 	}
 	if results[0].Name != "Nathan" {
 		t.Fatalf("got name %q, want Nathan", results[0].Name)
+	}
+	if !results[0].IsFavorite {
+		t.Fatal("search result should include favorite state")
 	}
 }
 

@@ -1,6 +1,7 @@
 package web
 
 import (
+	"database/sql"
 	"embed"
 	"encoding/hex"
 	"encoding/json"
@@ -93,6 +94,7 @@ type SearchResult struct {
 	UnreadCount     int    `json:"UnreadCount"`
 	SourcePlatform  string `json:"source_platform,omitempty"`
 	DisplayProtocol string `json:"display_protocol,omitempty"`
+	IsFavorite      bool   `json:"is_favorite,omitempty"`
 	UnifiedID       string `json:"unified_id,omitempty"`
 	UnifiedName     string `json:"unified_name,omitempty"`
 	Preview         string `json:"preview,omitempty"`
@@ -535,18 +537,30 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 				return
 			}
 			var req struct {
-				Favorite bool `json:"favorite"`
+				Favorite *bool `json:"favorite"`
 			}
 			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 				httpError(w, "invalid JSON: "+err.Error(), 400)
 				return
 			}
-			if err := store.SetConversationFavorite(convID, req.Favorite); err != nil {
+			if req.Favorite == nil {
+				httpError(w, "favorite is required", 400)
+				return
+			}
+			if err := store.SetConversationFavorite(convID, *req.Favorite); err != nil {
+				if errors.Is(err, sql.ErrNoRows) {
+					httpError(w, "conversation not found", 404)
+					return
+				}
 				httpError(w, "set favorite: "+err.Error(), 500)
 				return
 			}
 			convo, err := store.GetConversation(convID)
 			if err != nil {
+				if errors.Is(err, sql.ErrNoRows) {
+					httpError(w, "conversation not found", 404)
+					return
+				}
 				httpError(w, "get conversation: "+err.Error(), 500)
 				return
 			}
@@ -2288,6 +2302,7 @@ func searchResultForConversation(conv *db.Conversation, timestamp int64, preview
 		UnreadCount:     conv.UnreadCount,
 		SourcePlatform:  conv.SourcePlatform,
 		DisplayProtocol: conv.DisplayProtocol,
+		IsFavorite:      conv.IsFavorite,
 		Preview:         preview,
 	}
 	if identity, ok := unifiedIdentityForConversation(conv, identityIndex); ok {

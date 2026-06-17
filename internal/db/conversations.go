@@ -186,8 +186,21 @@ func (s *Store) SetConversationNotificationMode(id, mode string) error {
 
 // SetConversationFavorite stores the local favorite state for a thread.
 func (s *Store) SetConversationFavorite(id string, favorite bool) error {
-	_, err := s.db.Exec(`UPDATE conversations SET is_favorite = ? WHERE conversation_id = ?`, favorite, id)
-	return err
+	if strings.TrimSpace(id) == "" {
+		return sql.ErrNoRows
+	}
+	result, err := s.db.Exec(`UPDATE conversations SET is_favorite = ? WHERE conversation_id = ?`, favorite, id)
+	if err != nil {
+		return err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
 }
 
 func normalizeDisplayProtocol(protocol string) string {
@@ -249,11 +262,21 @@ func (s *Store) SetConversationsTab(ids []string, tab string) error {
 }
 
 func (s *Store) ListConversations(limit int) ([]*Conversation, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
 	rows, err := s.db.Query(`
+		WITH recent AS (
+			SELECT conversation_id
+			FROM conversations
+			ORDER BY last_message_ts DESC
+			LIMIT ?
+		)
 		SELECT `+conversationColumns+`
 		FROM conversations
+		WHERE conversation_id IN (SELECT conversation_id FROM recent)
+			OR is_favorite = 1
 		ORDER BY last_message_ts DESC
-		LIMIT ?
 	`, limit)
 	if err != nil {
 		return nil, err

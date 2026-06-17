@@ -608,6 +608,24 @@ test('favorites conversations from the header and row context menu', async ({ pa
   await expect(page.locator('#favorites-rail .favorite-chip[title="Sarah Chen"]')).toHaveCount(0);
 });
 
+test('keeps global search active when favoriting a search result', async ({ page, request }) => {
+  await request.post('/api/conversations/conv2/favorite', { data: { favorite: false } });
+  await page.reload();
+
+  await page.locator('#search-input').fill('Marcus');
+  const marcusRow = page.locator('#conversation-list .convo-item').filter({ hasText: 'Marcus Johnson' }).first();
+  await expect(marcusRow).toBeVisible();
+  await expect(page.locator('#conversation-list')).not.toContainText('Sarah Chen');
+
+  await marcusRow.click({ button: 'right' });
+  await page.locator('#context-menu .context-menu-item').getByText('Add to favorites', { exact: true }).click();
+
+  await expect(page.locator('#search-input')).toHaveValue('Marcus');
+  await expect(page.locator('#conversation-list')).toContainText('Marcus Johnson');
+  await expect(page.locator('#conversation-list')).not.toContainText('Sarah Chen');
+  await expect(page.locator('#favorites-rail .favorite-chip[title="Marcus Johnson"]')).toBeVisible();
+});
+
 test('inserts emoji into the compose message', async ({ page }) => {
   await openConversation(page, 'Sarah Chen');
 

@@ -5276,6 +5276,16 @@ body::after {
     return !!(convo.IsFavorite || convo.is_favorite);
   }
 
+  function favoriteValueFromResponse(convo, fallback) {
+    if (convo && Object.prototype.hasOwnProperty.call(convo, 'IsFavorite')) {
+      return !!convo.IsFavorite;
+    }
+    if (convo && Object.prototype.hasOwnProperty.call(convo, 'is_favorite')) {
+      return !!convo.is_favorite;
+    }
+    return !!fallback;
+  }
+
   function notificationModeLabel(mode) {
     switch (normalizeNotificationMode(mode)) {
       case NOTIFICATION_MODE_MENTIONS:
@@ -6699,13 +6709,15 @@ body::after {
       const avatarRefs = conversationAvatarRefs(convo);
       const unread = Number(convo.UnreadCount || convo.unread_count || 0);
       const unreadLabel = unread > 99 ? '99+' : String(unread);
+      const labelName = convo.Name || 'favorite thread';
+      const unreadAria = unread > 0 ? `, ${unreadLabel} unread` : '';
       return `
         <button
           type="button"
           class="favorite-chip${convo.ConversationID === activeConvoId ? ' active' : ''}"
           data-conversation-id="${escapeHtml(convo.ConversationID)}"
-          title="${escapeHtml(convo.Name || 'Favorite thread')}"
-          aria-label="Open ${escapeHtml(convo.Name || 'favorite thread')}"
+          title="${escapeHtml(labelName)}"
+          aria-label="${escapeHtml(`Open ${labelName}${unreadAria}`)}"
           ${convo.ConversationID === activeConvoId ? 'aria-current="page"' : ''}
         >
           ${avatarHTML({
@@ -6719,7 +6731,7 @@ body::after {
             className: 'favorite-avatar',
             style: `background:${avatarColor(convo.Name)}`,
           })}
-          ${unread > 0 ? `<span class="favorite-unread">${escapeHtml(unreadLabel)}</span>` : ''}
+          ${unread > 0 ? `<span class="favorite-unread" aria-hidden="true">${escapeHtml(unreadLabel)}</span>` : ''}
         </button>
       `;
     }).join('');
@@ -6776,7 +6788,7 @@ body::after {
         class="chat-header-action-btn favorite${isFavorite ? ' active' : ''}"
         id="chat-header-favorite-btn"
         title="${isFavorite ? 'Remove from favorites' : 'Add to favorites'}"
-        aria-label="${isFavorite ? 'Remove from favorites' : 'Add to favorites'}"
+        aria-label="Favorite thread"
         aria-pressed="${isFavorite ? 'true' : 'false'}"
       >${favoriteActionIconHTML(isFavorite)}</button>
     `;
@@ -7180,13 +7192,20 @@ body::after {
       || null;
   }
 
-  function applyConversationPatch(conversationID, patch) {
-    const apply = (convo) => {
+  function applyConversationPatch(conversationID, patch, fallbackConvo = null) {
+    let patchedAllConversations = false;
+    allConversations = allConversations.map((convo) => {
+      if (!convo || convo.ConversationID !== conversationID) return convo;
+      patchedAllConversations = true;
+      return Object.assign(convo, patch);
+    });
+    conversations = conversations.map((convo) => {
       if (!convo || convo.ConversationID !== conversationID) return convo;
       return Object.assign(convo, patch);
-    };
-    allConversations = allConversations.map(apply);
-    conversations = conversations.map(apply);
+    });
+    if (!patchedAllConversations && fallbackConvo && conversationFavoriteOf(Object.assign({}, fallbackConvo, patch))) {
+      allConversations.push(Object.assign({}, fallbackConvo, patch));
+    }
     if (activeConversation && activeConversation.ConversationID === conversationID) {
       activeConversation = Object.assign(activeConversation, patch);
     }
@@ -7264,12 +7283,13 @@ body::after {
     const updated = await postJSON(`/api/conversations/${encodeURIComponent(convo.ConversationID)}/favorite`, {
       favorite: !!favorite,
     });
-    const isFavorite = !!(updated.IsFavorite || updated.is_favorite || favorite);
-    applyConversationPatch(convo.ConversationID, {
+    const isFavorite = favoriteValueFromResponse(updated, favorite);
+    const patch = {
       IsFavorite: isFavorite,
       is_favorite: isFavorite,
-    });
-    renderConversations(allConversations);
+    };
+    applyConversationPatch(convo.ConversationID, patch, Object.assign({}, convo, updated));
+    await renderConversationListPreservingSearch();
     if (activeConversation && activeConversation.ConversationID === convo.ConversationID) {
       refreshConversationChrome();
     }
@@ -9299,11 +9319,22 @@ body::after {
       UnreadCount: result.UnreadCount || 0,
       source_platform: result.SourcePlatform || result.source_platform,
       DisplayProtocol: result.DisplayProtocol || result.display_protocol || '',
+      IsFavorite: !!(result.IsFavorite || result.is_favorite),
+      is_favorite: !!(result.IsFavorite || result.is_favorite),
       UnifiedID: result.UnifiedID || result.unified_id || '',
       UnifiedName: result.UnifiedName || result.unified_name || '',
       _searchPreview: result.preview || '',
     }));
     renderConversations(searchConvos, true);
+  }
+
+  async function renderConversationListPreservingSearch() {
+    const query = $searchInput.value.trim();
+    if (query) {
+      await renderSearchResults(query);
+      return;
+    }
+    renderConversations(allConversations);
   }
 
   $searchInput.addEventListener('input', () => {

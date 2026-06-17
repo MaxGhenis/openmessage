@@ -1,6 +1,7 @@
 package db
 
 import (
+	"database/sql"
 	"fmt"
 	"testing"
 )
@@ -203,6 +204,10 @@ func TestConversationFavoriteLifecycle(t *testing.T) {
 	if got.IsFavorite {
 		t.Fatal("conversation should not be favorite after clearing")
 	}
+
+	if err := store.SetConversationFavorite("missing-favorite", true); err != sql.ErrNoRows {
+		t.Fatalf("SetConversationFavorite missing = %v, want sql.ErrNoRows", err)
+	}
 }
 
 func TestGetConversation_NotFound(t *testing.T) {
@@ -260,6 +265,22 @@ func TestListConversations_Ordering(t *testing.T) {
 		}
 		if got[1].Name != "New" {
 			t.Errorf("second: got %q, want New", got[1].Name)
+		}
+	})
+
+	t.Run("favorite outside limit is still returned", func(t *testing.T) {
+		if err := store.SetConversationFavorite("c-ancient", true); err != nil {
+			t.Fatalf("favorite ancient: %v", err)
+		}
+		got, err := store.ListConversations(2)
+		if err != nil {
+			t.Fatalf("list: %v", err)
+		}
+		if len(got) != 3 {
+			t.Fatalf("count: got %d, want 3", len(got))
+		}
+		if got[0].Name != "Newest" || got[1].Name != "New" || got[2].Name != "Ancient" {
+			t.Fatalf("order = [%s %s %s], want [Newest New Ancient]", got[0].Name, got[1].Name, got[2].Name)
 		}
 	})
 
