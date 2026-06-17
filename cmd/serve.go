@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"runtime"
 	"runtime/debug"
@@ -78,6 +79,7 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 	isDemo := app.DemoMode()
 
 	events := web.NewEventBroker()
+	googleReconnectNow := make(chan struct{}, 1)
 	isConnected := func() bool {
 		if isDemo {
 			return true
@@ -89,8 +91,14 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 	}
 	a.OnConversationsChange = events.PublishConversations
 	a.OnMessagesChange = events.PublishMessages
-	a.OnStatusChange = func(bool) {
+	a.OnStatusChange = func(connected bool) {
 		publishOverallStatus()
+		if !connected {
+			select {
+			case googleReconnectNow <- struct{}{}:
+			default:
+			}
+		}
 	}
 	a.OnTypingChange = events.PublishTyping
 	a.OnWhatsAppStatusChange = func() {
@@ -212,18 +220,46 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 		go func() {
 			ticker := time.NewTicker(15 * time.Second)
 			defer ticker.Stop()
-			for range ticker.C {
-				g := a.GoogleStatus()
-				// Skip reconnect when the credentials are dead (NeedsRepair):
-				// retrying a 401'd session just spams the log every 15s and
-				// never recovers. The UI shows a "Re-pair" banner instead; a
-				// successful re-pair clears the flag and reconnect resumes.
-				if !g.Paired || g.Connected || g.NeedsPairing || g.NeedsRepair {
-					continue
+			lastAttempt := time.Time{}
+			attemptReconnect := func(trigger string) {
+				if !lastAttempt.IsZero() && time.Since(lastAttempt) < 5*time.Second {
+					return
 				}
-				logger.Info().Msg("Google Messages disconnected — attempting reconnect")
+				lastAttempt = time.Now()
+				g := a.GoogleStatus()
+				// Skip reconnect when sends prove the linked device needs a
+				// manual re-pair. Cookie-expiry 401s clear NeedsRepair and use
+				// the auth-refresh reconnect path below.
+				if !g.Paired || g.Connected || g.NeedsPairing || g.NeedsRepair {
+					return
+				}
+				if app.IsGoogleAuthExpiredError(fmt.Errorf("%s", g.LastError)) {
+					if strings.TrimSpace(os.Getenv("OPENMESSAGE_COOKIE_REFRESH_SCRIPT")) != "" {
+						logger.Info().Msg("Google auth expired - refreshing Chrome cookies before reconnect")
+						ctx, cancel := context.WithTimeout(context.Background(), googleCookieRefreshTimeout)
+						err := refreshGoogleSessionCookies(ctx)
+						cancel()
+						if err != nil {
+							logger.Warn().Err(err).Msg("Google cookie refresh before reconnect failed")
+						} else {
+							logger.Info().Msg("Refreshed Google cookies before reconnect")
+						}
+					} else {
+						logger.Info().Msg("Google auth expired - reconnecting without cookie refresh script")
+					}
+				}
+				logger.Info().Str("trigger", trigger).Msg("Google Messages disconnected - attempting reconnect")
 				if err := a.ReconnectGoogleMessages(); err != nil {
+					a.HandleGoogleAuthExpiredError(err)
 					logger.Warn().Err(err).Msg("Google Messages reconnect attempt failed")
+				}
+			}
+			for {
+				select {
+				case <-ticker.C:
+					attemptReconnect("timer")
+				case <-googleReconnectNow:
+					attemptReconnect("status-change")
 				}
 			}
 		}()
@@ -588,6 +624,33 @@ func startupBackfillMode() string {
 	default:
 		return "auto"
 	}
+}
+
+const googleCookieRefreshTimeout = 20 * time.Second
+
+var refreshGoogleSessionCookies = func(ctx context.Context) error {
+	script := strings.TrimSpace(os.Getenv("OPENMESSAGE_COOKIE_REFRESH_SCRIPT"))
+	if script == "" {
+		return nil
+	}
+	if _, err := os.Stat(script); err != nil {
+		return fmt.Errorf("refresh script unavailable at %s: %w", script, err)
+	}
+
+	cmd := exec.CommandContext(ctx, script, "--quiet", "--no-backup")
+	cmd.Env = os.Environ()
+	output, err := cmd.CombinedOutput()
+	if ctx.Err() != nil {
+		return fmt.Errorf("refresh Google cookies timed out after %s", googleCookieRefreshTimeout)
+	}
+	if err != nil {
+		detail := strings.TrimSpace(string(output))
+		if detail == "" {
+			return fmt.Errorf("refresh Google cookies: %w", err)
+		}
+		return fmt.Errorf("refresh Google cookies: %w: %s", err, detail)
+	}
+	return nil
 }
 
 func macOSNotificationsEnabled(interactive bool) bool {

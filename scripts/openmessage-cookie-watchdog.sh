@@ -3,7 +3,8 @@ set -euo pipefail
 
 STATUS_URL="${OPENMESSAGE_STATUS_URL:-http://127.0.0.1:7007/api/status}"
 SERVICE_NAME="${OPENMESSAGE_SERVICE_NAME:-openmessage.service}"
-REFRESH_SCRIPT="${OPENMESSAGE_COOKIE_REFRESH_SCRIPT:-/home/tim/source/openmessage/scripts/refresh-google-session-cookies-linux.py}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REFRESH_SCRIPT="${OPENMESSAGE_COOKIE_REFRESH_SCRIPT:-$SCRIPT_DIR/refresh-google-session-cookies-linux.py}"
 FORCE=0
 
 auth_error_pattern="SESSION_COOKIE_INVALID|invalid authentication credentials|HTTP 401"

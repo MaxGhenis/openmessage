@@ -2,11 +2,13 @@ package cmd
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -136,6 +138,41 @@ func TestIMessageSyncSupported(t *testing.T) {
 	runtimeGOOS = func() string { return "windows" }
 	if iMessageSyncSupported() {
 		t.Fatal("expected iMessage sync to be unsupported on windows")
+	}
+}
+
+func TestRefreshGoogleSessionCookiesSkipsWhenUnconfigured(t *testing.T) {
+	t.Setenv("OPENMESSAGE_COOKIE_REFRESH_SCRIPT", "")
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := refreshGoogleSessionCookies(ctx); err != nil {
+		t.Fatalf("refreshGoogleSessionCookies(): %v", err)
+	}
+}
+
+func TestRefreshGoogleSessionCookiesUsesEnvScript(t *testing.T) {
+	dir := t.TempDir()
+	script := filepath.Join(dir, "refresh.sh")
+	argsPath := filepath.Join(dir, "args")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\nprintf '%s' \"$*\" > \"$ARGS_PATH\"\n"), 0o700); err != nil {
+		t.Fatalf("write script: %v", err)
+	}
+	t.Setenv("OPENMESSAGE_COOKIE_REFRESH_SCRIPT", script)
+	t.Setenv("ARGS_PATH", argsPath)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := refreshGoogleSessionCookies(ctx); err != nil {
+		t.Fatalf("refreshGoogleSessionCookies(): %v", err)
+	}
+
+	args, err := os.ReadFile(argsPath)
+	if err != nil {
+		t.Fatalf("read args: %v", err)
+	}
+	if got := strings.TrimSpace(string(args)); got != "--quiet --no-backup" {
+		t.Fatalf("args = %q, want %q", got, "--quiet --no-backup")
 	}
 }
 
