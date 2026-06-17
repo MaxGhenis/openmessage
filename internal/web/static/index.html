@@ -5246,6 +5246,30 @@ body::after {
     }
   }
 
+  function hydrateMediaElements(root = document) {
+    if (!root || !root.querySelectorAll) return;
+    root.querySelectorAll('.msg-media img, .msg-media video').forEach((el) => {
+      if (el.dataset.mediaHydrated !== 'true') {
+        el.dataset.mediaHydrated = 'true';
+        const kind = el.tagName === 'VIDEO' ? 'video' : 'image';
+        el.addEventListener('load', () => handleMediaLoad(el));
+        el.addEventListener('loadeddata', () => {
+          if (el.tagName === 'VIDEO') {
+            el.style.display = 'block';
+          }
+          handleMediaLoad(el);
+        });
+        el.addEventListener('error', () => handleMediaError(el, kind));
+      }
+      if (el.tagName === 'IMG' && el.complete && el.naturalWidth > 0) {
+        handleMediaLoad(el);
+      } else if (el.tagName === 'VIDEO' && el.readyState >= 2) {
+        el.style.display = 'block';
+        handleMediaLoad(el);
+      }
+    });
+  }
+
   function renderAvatarElement(el, { name = '', numbers = [], whatsAppConversationID = '', platforms = [], text = initials(name) || '?', background = avatarColor(name) } = {}) {
     if (!el) return;
     el.classList.remove('has-photo');
@@ -7811,6 +7835,7 @@ body::after {
       refreshConversationChrome(protocolDetail);
       hydrateLinkPreviews();
       hydrateNativeAvatars($messagesArea);
+      hydrateMediaElements($messagesArea);
       scheduleMediaLoaderLabels($messagesArea);
       observeThreadContentResize();
       observeThreadViewportResize();

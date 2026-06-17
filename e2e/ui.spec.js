@@ -486,7 +486,9 @@ test('sends a Signal image attachment through the compose box', async ({ page })
   await page.locator('#send-btn').click();
 
   await expect(page.locator('#attach-preview')).not.toHaveClass(/active/);
-  await expect(page.locator('#messages-area img[src*="/api/media/"]').last()).toBeVisible();
+  const latestMessage = page.locator('#messages-area .msg').last();
+  await expect(latestMessage.locator('img[src*="/api/media/"]')).toBeVisible();
+  await expect(latestMessage.locator('.msg-media-loading')).toHaveCount(0);
 });
 
 test('sends a captioned Signal image as one message, not two', async ({ page }) => {
@@ -676,7 +678,9 @@ test('sends a WhatsApp image attachment through the compose box', async ({ page 
   await page.locator('#send-btn').click();
 
   await expect(page.locator('#attach-preview')).not.toHaveClass(/active/);
-  await expect(page.locator('#messages-area img[src*="/api/media/"]').last()).toBeVisible();
+  const latestMessage = page.locator('#messages-area .msg').last();
+  await expect(latestMessage.locator('img[src*="/api/media/"]')).toBeVisible();
+  await expect(latestMessage.locator('.msg-media-loading')).toHaveCount(0);
 });
 
 test('sends a WhatsApp voice note attachment through the compose box', async ({ page }) => {
