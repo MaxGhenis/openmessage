@@ -30,6 +30,9 @@ func (s *Store) UpsertMessage(m *Message) error {
 }
 
 func upsertMessageTx(tx *sql.Tx, m *Message) error {
+	if strings.TrimSpace(m.SourcePlatform) == "" {
+		m.SourcePlatform = "sms"
+	}
 	// On conflict we must NOT blindly overwrite content columns with the
 	// incoming row: the live bridges re-deliver the same message_id for
 	// status-only updates (delivery/read receipts), where media_id /

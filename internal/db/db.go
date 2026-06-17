@@ -360,6 +360,12 @@ func (s *Store) migrate() error {
 	} {
 		s.db.Exec(col) // ignore "duplicate column" errors
 	}
+	if _, err := s.db.Exec(`UPDATE messages SET source_platform = 'sms' WHERE IFNULL(source_platform, '') = ''`); err != nil {
+		return fmt.Errorf("normalize blank message source platform: %w", err)
+	}
+	if _, err := s.db.Exec(`UPDATE conversations SET source_platform = 'sms' WHERE IFNULL(source_platform, '') = ''`); err != nil {
+		return fmt.Errorf("normalize blank conversation source platform: %w", err)
+	}
 
 	// Unified contacts table
 	s.db.Exec(`CREATE TABLE IF NOT EXISTS unified_contacts (

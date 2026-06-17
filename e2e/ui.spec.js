@@ -452,6 +452,21 @@ test('inserts emoji into the compose message', async ({ page }) => {
   await expect(page.locator('#send-btn')).toBeEnabled();
 });
 
+test('centers the compose card in the bottom input layer', async ({ page }) => {
+  await openConversation(page, 'Sarah Chen');
+
+  const gaps = await page.evaluate(() => {
+    const pane = document.querySelector('.chat-pane').getBoundingClientRect();
+    const messages = document.querySelector('#messages-area').getBoundingClientRect();
+    const compose = document.querySelector('#compose-bar').getBoundingClientRect();
+    return {
+      top: compose.top - messages.bottom,
+      bottom: pane.bottom - compose.bottom,
+    };
+  });
+  expect(Math.abs(gaps.top - gaps.bottom)).toBeLessThanOrEqual(2);
+});
+
 test('hydrates cached Google contact photos into avatars', async ({ page, request }) => {
   await request.post('/_e2e/avatar', {
     data: {

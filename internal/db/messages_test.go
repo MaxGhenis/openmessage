@@ -51,6 +51,9 @@ func TestUpsertMessage_InsertAndUpdate(t *testing.T) {
 		if got.Status != "sent" {
 			t.Errorf("status: got %q, want %q", got.Status, "sent")
 		}
+		if got.SourcePlatform != "sms" {
+			t.Errorf("source platform: got %q, want sms", got.SourcePlatform)
+		}
 	})
 
 	t.Run("update existing message", func(t *testing.T) {
@@ -1251,7 +1254,7 @@ func TestPlatformStats(t *testing.T) {
 		{MessageID: "s1", ConversationID: "c1", Body: "hi", TimestampMS: 5000, SourcePlatform: "sms", IsFromMe: false},
 		{MessageID: "s2", ConversationID: "c1", Body: "yo", TimestampMS: 9000, SourcePlatform: "sms", IsFromMe: true}, // newest sms, but outgoing
 		{MessageID: "w1", ConversationID: "c2", Body: "hey", TimestampMS: 3000, SourcePlatform: "whatsapp", IsFromMe: false},
-		{MessageID: "u1", ConversationID: "c3", Body: "??", TimestampMS: 7000, SourcePlatform: "", IsFromMe: false}, // blank → "unknown"
+		{MessageID: "u1", ConversationID: "c3", Body: "??", TimestampMS: 7000, SourcePlatform: "", IsFromMe: false}, // blank defaults to sms
 	}
 	for _, m := range msgs {
 		if err := store.UpsertMessage(m); err != nil {
@@ -1263,32 +1266,28 @@ func TestPlatformStats(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PlatformStats: %v", err)
 	}
-	if len(stats) != 3 {
-		t.Fatalf("platform count: got %d, want 3 (%+v)", len(stats), stats)
+	if len(stats) != 2 {
+		t.Fatalf("platform count: got %d, want 2 (%+v)", len(stats), stats)
 	}
 
-	// Ordered by latest activity DESC: sms(9000), unknown(7000), whatsapp(3000).
-	if stats[0].Platform != "sms" || stats[1].Platform != "unknown" || stats[2].Platform != "whatsapp" {
-		t.Fatalf("ordering: got %s, %s, %s; want sms, unknown, whatsapp",
-			stats[0].Platform, stats[1].Platform, stats[2].Platform)
+	// Ordered by latest activity DESC: sms(9000), whatsapp(3000).
+	if stats[0].Platform != "sms" || stats[1].Platform != "whatsapp" {
+		t.Fatalf("ordering: got %s, %s; want sms, whatsapp",
+			stats[0].Platform, stats[1].Platform)
 	}
 
 	sms := stats[0]
-	if sms.Count != 2 {
-		t.Errorf("sms count: got %d, want 2", sms.Count)
+	if sms.Count != 3 {
+		t.Errorf("sms count: got %d, want 3", sms.Count)
 	}
 	if sms.LatestMS != 9000 {
 		t.Errorf("sms latest: got %d, want 9000", sms.LatestMS)
 	}
-	// Newest sms message is outgoing, so latest *received* must stay at 5000 —
-	// this is the gap-masking case the status command exists to surface.
-	if sms.LatestRecvMS != 5000 {
-		t.Errorf("sms latest received: got %d, want 5000", sms.LatestRecvMS)
-	}
-
-	unknown := stats[1]
-	if unknown.Count != 1 || unknown.LatestMS != 7000 {
-		t.Errorf("unknown bucket: got count=%d latest=%d, want 1/7000", unknown.Count, unknown.LatestMS)
+	// Newest sms message is outgoing, so latest *received* must use the next
+	// inbound SMS-row timestamp. This is the gap-masking case the status command
+	// exists to surface.
+	if sms.LatestRecvMS != 7000 {
+		t.Errorf("sms latest received: got %d, want 7000", sms.LatestRecvMS)
 	}
 }
 
