@@ -392,6 +392,40 @@ test('renders clickable links with a social preview card', async ({ page, reques
   await expect(linkedMessage.locator('.msg-link-preview')).toContainText('Example');
 });
 
+test('shows latest message previews in sidebar rows', async ({ page, request }) => {
+  const now = Date.now();
+  const sarahPreview = `Sidebar sent preview ${now}`;
+  const jordanPreview = `Sidebar grouped preview ${now}`;
+  await request.post('/_e2e/messages', {
+    data: {
+      body: sarahPreview,
+      conversation_id: 'conv1',
+      is_from_me: true,
+      timestamp_ms: now + 1000,
+    },
+  });
+  await request.post('/_e2e/messages', {
+    data: {
+      body: jordanPreview,
+      conversation_id: 'conv10',
+      sender_name: 'Jordan Rivera',
+      sender_number: '+14155550199',
+      timestamp_ms: now + 2000,
+    },
+  });
+  await page.reload();
+
+  const sarahRow = page.locator('#conversation-list > .convo-item').filter({
+    has: page.locator('.convo-name').getByText('Sarah Chen', { exact: true }),
+  }).first();
+  await expect(sarahRow.locator('.convo-preview')).toHaveText(`You: ${sarahPreview}`);
+
+  const jordanRows = page.locator('#conversation-list > .convo-item').filter({
+    has: page.locator('.convo-name').getByText('Jordan Rivera', { exact: true }),
+  });
+  await expect(jordanRows.first().locator('.convo-preview')).toHaveText(jordanPreview);
+});
+
 test('coalesces duplicate direct chats into one sidebar row with route tabs in the thread header', async ({ page }) => {
   const jordanRows = page.locator('#conversation-list > .convo-item').filter({
     has: page.locator('.convo-name').getByText('Jordan Rivera', { exact: true }),
@@ -439,6 +473,52 @@ test('searches only within the active thread', async ({ page }) => {
 
   await page.locator('#thread-search-input').fill('Wrong Jordan');
   await expect(page.locator('#thread-search-results')).toContainText('No matches in this thread');
+});
+
+test('keeps the thread header compact with actions after search', async ({ page }) => {
+  const readHeaderLayout = () => page.locator('#chat-header').evaluate((header) => {
+    const rectFor = (selector) => {
+      const el = header.querySelector(selector);
+      if (!el) throw new Error(`Missing ${selector}`);
+      const rect = el.getBoundingClientRect();
+      return {
+        left: rect.left,
+        right: rect.right,
+        top: rect.top,
+        bottom: rect.bottom,
+        height: rect.height,
+      };
+    };
+    const headerRect = header.getBoundingClientRect();
+    return {
+      header: { left: headerRect.left, right: headerRect.right, height: headerRect.height },
+      name: rectFor('#chat-header-name'),
+      source: rectFor('#chat-header-source'),
+      search: rectFor('.thread-search-input-wrap'),
+      notification: rectFor('#chat-header-notification-btn'),
+    };
+  });
+  const centerY = (rect) => rect.top + rect.height / 2;
+  const expectInsideHeader = (layout, rect) => {
+    expect(rect.left).toBeGreaterThanOrEqual(layout.header.left - 1);
+    expect(rect.right).toBeLessThanOrEqual(layout.header.right + 1);
+  };
+
+  await openConversation(page, 'Sarah Chen');
+  const layout = await readHeaderLayout();
+  expect(layout.header.height).toBeLessThanOrEqual(74);
+  expect(Math.abs(centerY(layout.name) - centerY(layout.source))).toBeLessThanOrEqual(12);
+  expect(layout.source.left).toBeGreaterThan(layout.name.right);
+  expect(layout.notification.left).toBeGreaterThan(layout.search.right);
+
+  await page.setViewportSize({ width: 920, height: 700 });
+  await page.reload();
+  await openConversation(page, 'Sarah Chen');
+  const mediumLayout = await readHeaderLayout();
+  for (const rect of [mediumLayout.name, mediumLayout.source, mediumLayout.search, mediumLayout.notification]) {
+    expectInsideHeader(mediumLayout, rect);
+  }
+  expect(mediumLayout.notification.left).toBeGreaterThan(mediumLayout.search.right);
 });
 
 test('inserts emoji into the compose message', async ({ page }) => {

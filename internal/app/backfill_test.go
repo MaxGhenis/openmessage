@@ -2,7 +2,6 @@ package app
 
 import (
 	"fmt"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -1187,7 +1186,6 @@ func TestBackfillPopulatesDB(t *testing.T) {
 		t.Fatalf("got body %q", msgs[0].Body)
 	}
 }
-
 
 func TestOrphanContactDiscoveryEnabled(t *testing.T) {
 	cases := []struct {

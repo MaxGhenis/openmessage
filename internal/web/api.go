@@ -488,6 +488,10 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			convos = []*db.Conversation{}
 		}
 		enrichUnifiedConversationIdentities(store, convos)
+		if err := enrichConversationPreviews(store, convos); err != nil {
+			httpError(w, "conversation previews: "+err.Error(), 500)
+			return
+		}
 		writeJSON(w, convos)
 	})
 
@@ -2184,6 +2188,27 @@ type conversationParticipant struct {
 	ID        string `json:"id"`
 	IsMe      bool   `json:"is_me"`
 	IsMeCamel bool   `json:"isMe"`
+}
+
+func enrichConversationPreviews(store *db.Store, convos []*db.Conversation) error {
+	ids := make([]string, 0, len(convos))
+	for _, conv := range convos {
+		if conv == nil {
+			continue
+		}
+		ids = append(ids, conv.ConversationID)
+	}
+	previews, err := store.LatestConversationPreviews(ids)
+	if err != nil {
+		return err
+	}
+	for _, conv := range convos {
+		if conv == nil {
+			continue
+		}
+		conv.LastMessagePreview = previews[conv.ConversationID]
+	}
+	return nil
 }
 
 func enrichUnifiedConversationIdentities(store *db.Store, convos []*db.Conversation) {

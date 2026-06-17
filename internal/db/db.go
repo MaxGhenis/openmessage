@@ -14,18 +14,19 @@ type Store struct {
 }
 
 type Conversation struct {
-	ConversationID   string
-	Name             string
-	IsGroup          bool
-	Participants     string // JSON array
-	LastMessageTS    int64
-	UnreadCount      int
-	SourcePlatform   string `json:"source_platform,omitempty"`  // sms, gchat, imessage, whatsapp, signal, telegram
-	DisplayProtocol  string `json:"display_protocol,omitempty"` // display-only SMS/RCS protocol detail
-	UnifiedID        string `json:"unified_id,omitempty"`
-	UnifiedName      string `json:"unified_name,omitempty"`
-	NotificationMode string `json:"notification_mode,omitempty"` // all, mentions, muted
-	Tab              string `json:"tab,omitempty"`               // "" = Recent (inbox), "archive", or a custom tab id
+	ConversationID     string
+	Name               string
+	IsGroup            bool
+	Participants       string // JSON array
+	LastMessageTS      int64
+	UnreadCount        int
+	SourcePlatform     string `json:"source_platform,omitempty"`  // sms, gchat, imessage, whatsapp, signal, telegram
+	DisplayProtocol    string `json:"display_protocol,omitempty"` // display-only SMS/RCS protocol detail
+	LastMessagePreview string `json:"last_message_preview,omitempty"`
+	UnifiedID          string `json:"unified_id,omitempty"`
+	UnifiedName        string `json:"unified_name,omitempty"`
+	NotificationMode   string `json:"notification_mode,omitempty"` // all, mentions, muted
+	Tab                string `json:"tab,omitempty"`               // "" = Recent (inbox), "archive", or a custom tab id
 }
 
 type Message struct {

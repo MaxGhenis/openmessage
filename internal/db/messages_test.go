@@ -3,6 +3,7 @@ package db
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 )
 
@@ -1299,6 +1300,73 @@ func TestPlatformStats_Empty(t *testing.T) {
 	}
 	if len(stats) != 0 {
 		t.Fatalf("empty store: got %d platforms, want 0", len(stats))
+	}
+}
+
+func TestLatestConversationPreviews(t *testing.T) {
+	store := newTestStore(t)
+
+	msgs := []*Message{
+		{
+			MessageID:      "c1-old",
+			ConversationID: "c1",
+			Body:           "Older received message",
+			TimestampMS:    1000,
+		},
+		{
+			MessageID:      "c1-new",
+			ConversationID: "c1",
+			Body:           "Latest\nsent   message",
+			TimestampMS:    2000,
+			IsFromMe:       true,
+		},
+		{
+			MessageID:      "c2-photo",
+			ConversationID: "c2",
+			TimestampMS:    3000,
+			MediaID:        "media-photo",
+			MimeType:       "image/jpeg",
+		},
+		{
+			MessageID:      "c3-audio",
+			ConversationID: "c3",
+			TimestampMS:    4000,
+			MediaID:        "media-audio",
+			MimeType:       "audio/ogg",
+			IsFromMe:       true,
+		},
+		{
+			MessageID:      "c4-long",
+			ConversationID: "c4",
+			Body:           strings.Repeat("🙂", 160),
+			TimestampMS:    5000,
+		},
+	}
+	for _, msg := range msgs {
+		if err := store.UpsertMessage(msg); err != nil {
+			t.Fatalf("upsert %s: %v", msg.MessageID, err)
+		}
+	}
+
+	previews, err := store.LatestConversationPreviews([]string{"c1", "c2", "c3", "c4", "c1", "", "missing"})
+	if err != nil {
+		t.Fatalf("LatestConversationPreviews: %v", err)
+	}
+
+	if got, want := previews["c1"], "You: Latest sent message"; got != want {
+		t.Fatalf("c1 preview = %q, want %q", got, want)
+	}
+	if got, want := previews["c2"], "Photo"; got != want {
+		t.Fatalf("c2 preview = %q, want %q", got, want)
+	}
+	if got, want := previews["c3"], "You: Audio"; got != want {
+		t.Fatalf("c3 preview = %q, want %q", got, want)
+	}
+	if got := previews["c4"]; len([]rune(got)) != 120 || !strings.HasSuffix(got, "…") {
+		t.Fatalf("c4 preview = %q, want 120 runes ending in ellipsis", got)
+	}
+	if _, ok := previews["missing"]; ok {
+		t.Fatalf("missing conversation should not have a preview: %#v", previews)
 	}
 }
 

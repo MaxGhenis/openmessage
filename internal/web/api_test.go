@@ -132,12 +132,41 @@ func TestListConversations(t *testing.T) {
 	}
 
 	// Add some conversations
-	ts.store.UpsertConversation(&db.Conversation{
+	if err := ts.store.UpsertConversation(&db.Conversation{
 		ConversationID: "c1", Name: "Alice", LastMessageTS: 200,
-	})
-	ts.store.UpsertConversation(&db.Conversation{
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := ts.store.UpsertConversation(&db.Conversation{
 		ConversationID: "c2", Name: "Bob", LastMessageTS: 100,
-	})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := ts.store.UpsertMessage(&db.Message{
+		MessageID:      "m1",
+		ConversationID: "c1",
+		Body:           "Older Alice preview",
+		TimestampMS:    100,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := ts.store.UpsertMessage(&db.Message{
+		MessageID:      "m2",
+		ConversationID: "c1",
+		Body:           "Latest Alice preview",
+		TimestampMS:    200,
+		IsFromMe:       true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := ts.store.UpsertMessage(&db.Message{
+		MessageID:      "m3",
+		ConversationID: "c2",
+		Body:           "Bob received preview",
+		TimestampMS:    100,
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	resp2, err := http.Get(ts.server.URL + "/api/conversations")
 	if err != nil {
@@ -155,6 +184,12 @@ func TestListConversations(t *testing.T) {
 	// Should be ordered by last_message_ts DESC
 	if convos2[0].Name != "Alice" {
 		t.Fatalf("first conversation should be Alice (most recent), got %q", convos2[0].Name)
+	}
+	if got, want := convos2[0].LastMessagePreview, "You: Latest Alice preview"; got != want {
+		t.Fatalf("Alice preview = %q, want %q", got, want)
+	}
+	if got, want := convos2[1].LastMessagePreview, "Bob received preview"; got != want {
+		t.Fatalf("Bob preview = %q, want %q", got, want)
 	}
 }
 

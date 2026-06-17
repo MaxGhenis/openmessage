@@ -3173,7 +3173,7 @@ body::after {
 }
 
 .chat-header {
-  padding: 22px 28px 18px;
+  padding: 10px 28px;
   background: var(--bg-elevated);
   border-bottom: 1px solid var(--border);
   backdrop-filter: none;
@@ -3267,6 +3267,10 @@ body::after {
   font-weight: 700;
   letter-spacing: 0;
   line-height: 1.2;
+  max-width: min(34vw, 360px);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .chat-header-name-row {
@@ -3274,9 +3278,13 @@ body::after {
   align-items: center;
   gap: 10px;
   min-width: 0;
+  flex: 0 1 auto;
 }
 
 .chat-header-main {
+  display: flex;
+  align-items: center;
+  gap: 12px;
   min-width: 0;
   flex: 1 1 auto;
 }
@@ -3286,13 +3294,19 @@ body::after {
   display: flex;
   align-items: center;
   gap: 10px;
-  min-width: 220px;
-  max-width: 360px;
-  flex: 0 1 360px;
+  min-width: 260px;
+  max-width: 520px;
+  flex: 0 1 min(42vw, 520px);
+}
+
+.chat-header-tools .thread-search {
+  flex: 1 1 220px;
+  min-width: 0;
 }
 
 .chat-header-status {
-  margin-top: 4px;
+  margin: 0;
+  flex: 0 0 auto;
   font-size: 10px;
   color: var(--text-muted);
 }
@@ -3304,15 +3318,16 @@ body::after {
 .chat-header-source {
   display: flex;
   align-items: center;
-  min-height: 30px;
-  margin-top: 10px;
+  min-height: 0;
+  margin-top: 0;
+  flex: 0 0 auto;
 }
 
 .chat-header-actions {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  margin-left: auto;
+  margin-left: 0;
   flex: 0 0 auto;
 }
 
@@ -4207,7 +4222,7 @@ body::after {
   transform: none;
 }
 
-@media (max-width: 900px) {
+@media (max-width: 1120px) {
   .chat-header {
     flex-wrap: wrap;
   }
@@ -4748,7 +4763,6 @@ body::after {
       <div class="chat-header-main">
         <div class="chat-header-name-row">
           <button type="button" class="chat-header-name" id="chat-header-name" aria-haspopup="dialog" aria-expanded="false"></button>
-          <div class="chat-header-actions" id="chat-header-actions"></div>
         </div>
         <div class="chat-header-source" id="chat-header-source"></div>
         <div class="chat-header-status" id="chat-header-status"></div>
@@ -4762,6 +4776,7 @@ body::after {
           </div>
           <div class="thread-search-results" id="thread-search-results" hidden></div>
         </div>
+        <div class="chat-header-actions" id="chat-header-actions"></div>
       </div>
       <div class="contact-popover" id="contact-popover" hidden role="dialog" aria-label="Contact details"></div>
     </div>
@@ -6400,14 +6415,22 @@ body::after {
     });
   }
 
+  function conversationPreviewText(convo) {
+    return String((convo && (convo._searchPreview || convo.LastMessagePreview || convo.last_message_preview)) || '').trim();
+  }
+
+  function conversationPreviewHTML(convo) {
+    const previewText = conversationPreviewText(convo);
+    if (!previewText) return '';
+    return `<div class="convo-preview">${escapeHtml(previewText.substring(0, 90))}</div>`;
+  }
+
   function createConversationRow(c, options = {}) {
     const el = document.createElement('div');
     const hasUnread = c.UnreadCount > 0;
     const platform = displayPlatformForRoute(c);
     const notificationBadge = notificationModeBadgeHTML(notificationModeOf(c));
-    const preview = c._searchPreview
-      ? `<div class="convo-preview">${escapeHtml(c._searchPreview.substring(0, 60))}</div>`
-      : '';
+    const preview = conversationPreviewHTML(c);
     const clustered = !!options.clustered;
     el.className = 'convo-item'
       + (clustered ? ' convo-item--clustered' : '')
@@ -6505,6 +6528,7 @@ body::after {
       })}
       <div class="convo-meta">
         <div class="convo-name">${escapeHtml(identity.displayName)}</div>
+        ${conversationPreviewHTML(primary)}
       </div>
       <div class="convo-time">${formatTime(primary.LastMessageTS)}</div>
       ${unreadCount ? '<div class="convo-unread">' + unreadCount + '</div>' : ''}

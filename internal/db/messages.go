@@ -644,6 +644,88 @@ func (s *Store) LatestReceivedTimestamp(sourcePlatform string) (int64, error) {
 	return ts.Int64, nil
 }
 
+func (s *Store) LatestConversationPreviews(conversationIDs []string) (map[string]string, error) {
+	ids := make([]string, 0, len(conversationIDs))
+	seen := map[string]struct{}{}
+	for _, id := range conversationIDs {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+	previews := make(map[string]string, len(ids))
+	if len(ids) == 0 {
+		return previews, nil
+	}
+
+	stmt, err := s.db.Prepare(`
+		SELECT body, media_id, mime_type, is_from_me
+		FROM messages
+		WHERE conversation_id = ?
+		ORDER BY timestamp_ms DESC, message_id DESC
+		LIMIT 1
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer stmt.Close()
+
+	for _, conversationID := range ids {
+		var body, mediaID, mimeType string
+		var isFromMe bool
+		err := stmt.QueryRow(conversationID).Scan(&body, &mediaID, &mimeType, &isFromMe)
+		if errors.Is(err, sql.ErrNoRows) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		previews[conversationID] = formatLastMessagePreview(body, mediaID, mimeType, isFromMe)
+	}
+	return previews, nil
+}
+
+func formatLastMessagePreview(body, mediaID, mimeType string, isFromMe bool) string {
+	const previewRuneLimit = 120
+
+	preview := strings.Join(strings.Fields(body), " ")
+	if preview == "" && strings.TrimSpace(mediaID) != "" {
+		switch {
+		case strings.HasPrefix(strings.ToLower(mimeType), "image/"):
+			preview = "Photo"
+		case strings.HasPrefix(strings.ToLower(mimeType), "video/"):
+			preview = "Video"
+		case strings.HasPrefix(strings.ToLower(mimeType), "audio/"):
+			preview = "Audio"
+		default:
+			preview = "Attachment"
+		}
+	}
+	if preview == "" {
+		return ""
+	}
+	if isFromMe {
+		preview = "You: " + preview
+	}
+	return truncateRunes(preview, previewRuneLimit)
+}
+
+func truncateRunes(value string, limit int) string {
+	if limit <= 0 {
+		return ""
+	}
+	runes := []rune(value)
+	if len(runes) <= limit {
+		return value
+	}
+	return string(runes[:limit-1]) + "…"
+}
+
 // PlatformStat summarizes stored message coverage for one source platform.
 type PlatformStat struct {
 	Platform     string
