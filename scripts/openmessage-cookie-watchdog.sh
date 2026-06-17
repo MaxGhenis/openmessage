@@ -6,6 +6,8 @@ SERVICE_NAME="${OPENMESSAGE_SERVICE_NAME:-openmessage.service}"
 REFRESH_SCRIPT="${OPENMESSAGE_COOKIE_REFRESH_SCRIPT:-/home/tim/source/openmessage/scripts/refresh-google-session-cookies-linux.py}"
 FORCE=0
 
+auth_error_pattern="SESSION_COOKIE_INVALID|invalid authentication credentials|HTTP 401"
+
 if [[ "${1:-}" == "--force" ]]; then
   FORCE=1
 fi
@@ -28,6 +30,19 @@ if [[ "$FORCE" != "1" ]]; then
   if [[ "$paired" != "true" ]]; then
     echo "OpenMessage is not paired; cookie watchdog has nothing to refresh."
     exit 0
+  fi
+  if grep -Eiq "$auth_error_pattern" <<<"$last_error"; then
+    connected="false"
+  fi
+  if [[ "$connected" == "true" ]]; then
+    main_pid="$(systemctl --user show "$SERVICE_NAME" -P MainPID 2>/dev/null || true)"
+    if [[ "$main_pid" =~ ^[0-9]+$ ]] && [[ "$main_pid" != "0" ]]; then
+      if journalctl --user "_PID=$main_pid" --since "${OPENMESSAGE_COOKIE_WATCHDOG_LOG_WINDOW:-3 minutes ago}" --no-pager 2>/dev/null | grep -Eiq "$auth_error_pattern"; then
+        echo "Current OpenMessage process logged Google auth expiry; refreshing cookies."
+        connected="false"
+        last_error="recent service log contains Google auth expiry"
+      fi
+    fi
   fi
   if [[ "$connected" == "true" ]]; then
     echo "OpenMessage Google connection is healthy."

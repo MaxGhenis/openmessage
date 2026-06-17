@@ -55,7 +55,9 @@ func sendGroupMessageHandler(a *app.App) server.ToolHandlerFunc {
 			Numbers: app.NewContactNumbers(phones),
 		})
 		if err != nil {
-			a.RecordGoogleSendError(err)
+			if !a.HandleGoogleAuthExpiredError(err) {
+				a.RecordGoogleSendError(err)
+			}
 			return errorResult(fmt.Sprintf("failed to get/create group conversation: %v", err)), nil
 		}
 
@@ -67,7 +69,9 @@ func sendGroupMessageHandler(a *app.App) server.ToolHandlerFunc {
 		payload := app.BuildSendPayload(conv.GetConversationID(), message, "", "", nil)
 		resp, err := cli.GM.SendMessage(payload)
 		if err != nil {
-			a.RecordGoogleSendError(err)
+			if !a.HandleGoogleAuthExpiredError(err) {
+				a.RecordGoogleSendError(err)
+			}
 			return errorResult(fmt.Sprintf("failed to send group message: %v", err)), nil
 		}
 		// Surface a carrier/Google rejection instead of reporting success on a

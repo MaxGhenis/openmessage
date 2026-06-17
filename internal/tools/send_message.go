@@ -131,7 +131,9 @@ func sendMessageHandler(a *app.App) server.ToolHandlerFunc {
 			}
 			conv, err := getOrCreateGoogleConversation(a, recipient)
 			if err != nil {
-				a.RecordGoogleSendError(err)
+				if !a.HandleGoogleAuthExpiredError(err) {
+					a.RecordGoogleSendError(err)
+				}
 				return errorResult(fmt.Sprintf("failed to get/create conversation: %v", err)), nil
 			}
 			if conv == nil {
@@ -144,7 +146,9 @@ func sendMessageHandler(a *app.App) server.ToolHandlerFunc {
 			payload := app.BuildSendPayload(conv.GetConversationID(), message, "", myParticipantID, simPayload)
 			resp, err := sendGoogleTextPayload(a, payload)
 			if err != nil {
-				a.RecordGoogleSendError(err)
+				if !a.HandleGoogleAuthExpiredError(err) {
+					a.RecordGoogleSendError(err)
+				}
 				return errorResult(fmt.Sprintf("failed to send: %v", err)), nil
 			}
 			if resp.GetStatus() != gmproto.SendMessageResponse_SUCCESS {

@@ -244,3 +244,38 @@ func TestIsGoogleAuthInvalid(t *testing.T) {
 		})
 	}
 }
+
+func TestHandleGoogleAuthExpiredErrorMarksDisconnected(t *testing.T) {
+	a := &App{Logger: zerolog.Nop()}
+	a.Connected.Store(true)
+	a.googleNeedsRepair.Store(true)
+	a.googleSendFailures.Store(googleRepairThreshold)
+	statusEmitted := false
+	a.OnStatusChange = func(connected bool) {
+		statusEmitted = true
+		if connected {
+			t.Fatal("expected disconnected status event")
+		}
+	}
+
+	err := errors.New("send message: HTTP 401: 16: Request had invalid authentication credentials")
+	if !a.HandleGoogleAuthExpiredError(err) {
+		t.Fatal("expected auth-expired error to be handled")
+	}
+	if a.Connected.Load() {
+		t.Fatal("expected Google connection to be marked disconnected")
+	}
+	if !statusEmitted {
+		t.Fatal("expected status change event")
+	}
+	if a.googleNeedsRepair.Load() {
+		t.Fatal("auth expiry should clear repair flag and use reconnect flow")
+	}
+	if got := a.GoogleStatus().LastError; got != googleAuthExpiredStatusMessage {
+		t.Fatalf("last error = %q, want %q", got, googleAuthExpiredStatusMessage)
+	}
+
+	if a.HandleGoogleAuthExpiredError(errors.New("temporary failure in name resolution")) {
+		t.Fatal("network errors should not be treated as auth expiry")
+	}
+}

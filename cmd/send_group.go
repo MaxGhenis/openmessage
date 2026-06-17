@@ -30,6 +30,7 @@ func RunSendGroup(logger zerolog.Logger, phones []string, message string) error 
 		Numbers: app.NewContactNumbers(phones),
 	})
 	if err != nil {
+		a.HandleGoogleAuthExpiredError(err)
 		return fmt.Errorf("get/create group conversation: %w", err)
 	}
 
@@ -41,6 +42,7 @@ func RunSendGroup(logger zerolog.Logger, phones []string, message string) error 
 	payload := app.BuildSendPayload(conv.GetConversationID(), message, "", "", nil)
 	_, err = cli.GM.SendMessage(payload)
 	if err != nil {
+		a.HandleGoogleAuthExpiredError(err)
 		return fmt.Errorf("send: %w", err)
 	}
 
