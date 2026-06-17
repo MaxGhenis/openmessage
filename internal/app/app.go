@@ -136,6 +136,12 @@ type App struct {
 	BackfillProgress BackfillProgress
 	backfillRunning  atomic.Bool
 	reconcileRunning atomic.Bool
+	avatarSyncMu     sync.Mutex
+	avatarSyncOnce   sync.Once
+	avatarSyncWG     sync.WaitGroup
+	avatarSyncClosed bool
+	avatarSyncQueue  chan db.ContactAvatarCandidate
+	avatarSyncStop   chan struct{}
 	whatsAppMu       sync.Mutex
 	WhatsApp         *whatsapplive.Bridge
 	signalMu         sync.Mutex
@@ -150,13 +156,13 @@ type App struct {
 	googleNeedsRepair  atomic.Bool
 	tempDataDir        string
 	pendingMediaMu     sync.Mutex
-	pendingMedia     map[string]struct{}
+	pendingMedia       map[string]struct{}
 }
 
 type GoogleStatusSnapshot struct {
-	Connected    bool   `json:"connected"`
-	Paired       bool   `json:"paired"`
-	NeedsPairing bool   `json:"needs_pairing"`
+	Connected    bool `json:"connected"`
+	Paired       bool `json:"paired"`
+	NeedsPairing bool `json:"needs_pairing"`
 	// NeedsRepair is set when the session reports connected but sends keep
 	// failing — the phone has likely unlinked the device. The UI should
 	// offer re-pairing even though Connected is true.
@@ -383,7 +389,8 @@ func (a *App) LoadAndConnect() error {
 		OnMessagesChange: func(conversationID string) {
 			a.emitMessagesChange(conversationID)
 		},
-		OnTypingChange: a.OnTypingChange,
+		OnTypingChange:           a.OnTypingChange,
+		OnGoogleAvatarCandidates: a.QueueGoogleAvatarCandidates,
 		OnRealtimeGapRecovered: func(reason string) {
 			a.StartRecentReconcile(reason)
 		},
@@ -434,6 +441,7 @@ func (a *App) LoadAndConnect() error {
 	a.setGoogleLastError("")
 	a.emitStatusChange(true)
 	a.Logger.Info().Msg("Connected to Google Messages")
+	a.StartGoogleContactSync()
 	return nil
 }
 
@@ -637,6 +645,7 @@ func (a *App) GetBackfillProgress() BackfillSnapshot {
 }
 
 func (a *App) Close() {
+	a.StopGoogleAvatarSync()
 	if cli := a.GetClient(); cli != nil {
 		cli.GM.Disconnect()
 	}

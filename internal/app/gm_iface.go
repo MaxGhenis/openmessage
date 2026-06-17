@@ -12,6 +12,8 @@ type GMClient interface {
 	FetchMessages(conversationID string, count int64, cursor *gmproto.Cursor) (*gmproto.ListMessagesResponse, error)
 	GetOrCreateConversation(req *gmproto.GetOrCreateConversationRequest) (*gmproto.GetOrCreateConversationResponse, error)
 	ListContacts() (*gmproto.ListContactsResponse, error)
+	GetParticipantThumbnail(participantIDs ...string) (*gmproto.GetThumbnailResponse, error)
+	GetContactThumbnail(contactIDs ...string) (*gmproto.GetThumbnailResponse, error)
 }
 
 // realGMClient wraps *libgm.Client to implement GMClient.
@@ -37,4 +39,12 @@ func (r *realGMClient) GetOrCreateConversation(req *gmproto.GetOrCreateConversat
 
 func (r *realGMClient) ListContacts() (*gmproto.ListContactsResponse, error) {
 	return r.gm.ListContacts()
+}
+
+func (r *realGMClient) GetParticipantThumbnail(participantIDs ...string) (*gmproto.GetThumbnailResponse, error) {
+	return r.gm.GetParticipantThumbnail(participantIDs...)
+}
+
+func (r *realGMClient) GetContactThumbnail(contactIDs ...string) (*gmproto.GetThumbnailResponse, error) {
+	return r.gm.GetContactThumbnail(contactIDs...)
 }

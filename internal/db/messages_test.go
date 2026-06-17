@@ -1,6 +1,7 @@
 package db
 
 import (
+	"errors"
 	"fmt"
 	"testing"
 )
@@ -1362,5 +1363,70 @@ func TestSearchMessagesFiltered_DateWindow(t *testing.T) {
 	}
 	if len(legacy) != 5 {
 		t.Errorf("legacy wrapper: got %d, want 5", len(legacy))
+	}
+}
+
+func TestSearchMessagesFilteredConversationID(t *testing.T) {
+	store := newTestStore(t)
+
+	for _, convID := range []string{"c1", "c2"} {
+		if err := store.UpsertConversation(&Conversation{ConversationID: convID, Name: convID, LastMessageTS: 100}); err != nil {
+			t.Fatalf("seed conversation %s: %v", convID, err)
+		}
+	}
+	for _, msg := range []*Message{
+		{MessageID: "m1", ConversationID: "c1", Body: "thread needle", TimestampMS: 100},
+		{MessageID: "m2", ConversationID: "c2", Body: "thread needle", TimestampMS: 200},
+	} {
+		if err := store.UpsertMessage(msg); err != nil {
+			t.Fatalf("seed message %s: %v", msg.MessageID, err)
+		}
+	}
+
+	got, err := store.SearchMessagesFiltered("needle", SearchFilter{ConversationID: "c1", Limit: 10})
+	if err != nil {
+		t.Fatalf("search: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d messages, want 1", len(got))
+	}
+	if got[0].ConversationID != "c1" || got[0].MessageID != "m1" {
+		t.Fatalf("got message %s in %s, want m1 in c1", got[0].MessageID, got[0].ConversationID)
+	}
+}
+
+func TestGetMessagesAroundMessage(t *testing.T) {
+	store := newTestStore(t)
+
+	if err := store.UpsertConversation(&Conversation{ConversationID: "c1", Name: "Alice", LastMessageTS: 500}); err != nil {
+		t.Fatalf("seed conversation: %v", err)
+	}
+	for i := 1; i <= 5; i++ {
+		if err := store.UpsertMessage(&Message{
+			MessageID:      fmt.Sprintf("m%d", i),
+			ConversationID: "c1",
+			Body:           fmt.Sprintf("message %d", i),
+			TimestampMS:    int64(i * 100),
+		}); err != nil {
+			t.Fatalf("seed message %d: %v", i, err)
+		}
+	}
+
+	got, err := store.GetMessagesAroundMessage("c1", "m3", 2, 1)
+	if err != nil {
+		t.Fatalf("around: %v", err)
+	}
+	wantIDs := []string{"m1", "m2", "m3", "m4"}
+	if len(got) != len(wantIDs) {
+		t.Fatalf("got %d messages, want %d", len(got), len(wantIDs))
+	}
+	for i, want := range wantIDs {
+		if got[i].MessageID != want {
+			t.Fatalf("result %d = %s, want %s", i, got[i].MessageID, want)
+		}
+	}
+
+	if _, err := store.GetMessagesAroundMessage("other", "m3", 1, 1); !errors.Is(err, ErrMessageNotFound) {
+		t.Fatalf("wrong conversation err = %v, want ErrMessageNotFound", err)
 	}
 }

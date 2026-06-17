@@ -414,6 +414,62 @@ test('shows platform markers on avatars instead of direct-row text pills', async
   await expect(sarahRow.locator('.convo-subline .platform-chip')).toHaveCount(0);
 });
 
+test('shows RCS route badge without a separate protocol status line', async ({ page }) => {
+  await openConversation(page, 'Sarah Chen');
+
+  await expect(page.locator('#chat-header-source')).toContainText('RCS');
+  await expect(page.locator('#chat-header-source')).not.toContainText('SMS');
+  await expect(page.locator('#chat-header-status')).not.toContainText('RCS');
+});
+
+test('opens contact details from the thread header name', async ({ page }) => {
+  await openConversation(page, 'Sarah Chen');
+
+  await page.locator('#chat-header-name').click();
+  await expect(page.locator('#contact-popover')).toBeVisible();
+  await expect(page.locator('#contact-popover')).toContainText('+14155551234');
+});
+
+test('searches only within the active thread', async ({ page }) => {
+  await openConversation(page, 'Sarah Chen');
+
+  await page.locator('#thread-search-input').fill('reservation');
+  await expect(page.locator('#thread-search-results .thread-search-result')).toHaveCount(1);
+  await expect(page.locator('#thread-search-results')).toContainText('reservation');
+
+  await page.locator('#thread-search-input').fill('Wrong Jordan');
+  await expect(page.locator('#thread-search-results')).toContainText('No matches in this thread');
+});
+
+test('inserts emoji into the compose message', async ({ page }) => {
+  await openConversation(page, 'Sarah Chen');
+
+  await page.locator('#compose-emoji-btn').click();
+  await expect(page.locator('#compose-emoji-panel')).toHaveClass(/show/);
+  await page.locator('#compose-emoji-panel .emoji-grid button').filter({ hasText: '🎉' }).first().click();
+
+  await expect(page.locator('#compose-input')).toHaveValue('🎉');
+  await expect(page.locator('#send-btn')).toBeEnabled();
+});
+
+test('hydrates cached Google contact photos into avatars', async ({ page, request }) => {
+  await request.post('/_e2e/avatar', {
+    data: {
+      source_platform: 'sms',
+      phone_number: '+14155551234',
+      display_name: 'Sarah Chen',
+      image_base64: 'R0lGODlhAQABAAAAACwAAAAAAQABAAA=',
+      image_hash: 'sarah-e2e-avatar',
+      mime_type: 'image/gif',
+    },
+  });
+  await page.reload();
+  await openConversation(page, 'Sarah Chen');
+
+  await expect(page.locator('#chat-header-avatar img')).toHaveAttribute('alt', 'Sarah Chen photo');
+  await expect(page.locator('#conversation-list .convo-item').filter({ hasText: 'Sarah Chen' }).first().locator('.convo-avatar img')).toHaveAttribute('alt', 'Sarah Chen photo');
+});
+
 test('switches routes from the thread header tabs while keeping the sidebar person-first', async ({ page }) => {
   const jordanRows = page.locator('#conversation-list > .convo-item').filter({
     has: page.locator('.convo-name').getByText('Jordan Rivera', { exact: true }),

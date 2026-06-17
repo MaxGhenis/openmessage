@@ -410,6 +410,7 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 				StartDeepBackfill:     a.StartDeepBackfill,
 				BackfillStatus:        func() any { return a.GetBackfillProgress() },
 				BackfillPhone:         a.BackfillConversationByPhone,
+				SyncGoogleContacts:    a.SyncGoogleContacts,
 			})
 		} else {
 			mux := http.NewServeMux()

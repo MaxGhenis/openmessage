@@ -149,6 +149,79 @@ func TestListContacts_QueryFilter(t *testing.T) {
 	})
 }
 
+func TestContactAvatarCacheLookup(t *testing.T) {
+	store := newTestStore(t)
+	now := int64(1700000000000)
+	candidate := ContactAvatarCandidate{
+		SourcePlatform: "sms",
+		ParticipantID:  "participant-1",
+		ContactID:      "contact-1",
+		PhoneNumber:    "+1 (555) 123-4567",
+		DisplayName:    "Alice",
+	}
+	if err := store.UpsertContactAvatar(candidate, []byte("avatar-bytes"), "image/png", "hash-1", now); err != nil {
+		t.Fatalf("upsert avatar: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name          string
+		participantID string
+		contactID     string
+		phone         string
+	}{
+		{name: "participant", participantID: "participant-1"},
+		{name: "contact", contactID: "contact-1"},
+		{name: "phone", phone: "5551234567"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := store.GetContactAvatar("sms", tc.participantID, tc.contactID, tc.phone)
+			if err != nil {
+				t.Fatalf("get avatar: %v", err)
+			}
+			if got == nil {
+				t.Fatal("got nil avatar")
+			}
+			if string(got.ImageData) != "avatar-bytes" {
+				t.Fatalf("image data = %q, want avatar-bytes", string(got.ImageData))
+			}
+			if got.ImageHash != "hash-1" {
+				t.Fatalf("image hash = %q, want hash-1", got.ImageHash)
+			}
+		})
+	}
+}
+
+func TestContactAvatarContactOnlyThenParticipantContactDoesNotConflict(t *testing.T) {
+	store := newTestStore(t)
+	now := int64(1700000000000)
+
+	if err := store.MarkContactAvatarChecked(ContactAvatarCandidate{
+		SourcePlatform: "sms",
+		ContactID:      "contact-1",
+		PhoneNumber:    "+15551234567",
+		DisplayName:    "Alice",
+	}, now); err != nil {
+		t.Fatalf("mark checked: %v", err)
+	}
+	if err := store.UpsertContactAvatar(ContactAvatarCandidate{
+		SourcePlatform: "sms",
+		ParticipantID:  "participant-1",
+		ContactID:      "contact-1",
+		PhoneNumber:    "+15551234567",
+		DisplayName:    "Alice",
+	}, []byte("avatar-bytes"), "image/jpeg", "hash-2", now+1); err != nil {
+		t.Fatalf("upsert participant avatar after contact row: %v", err)
+	}
+
+	got, err := store.GetContactAvatar("sms", "", "contact-1", "")
+	if err != nil {
+		t.Fatalf("get by contact: %v", err)
+	}
+	if got == nil || got.ImageHash != "hash-2" {
+		t.Fatalf("got avatar %#v, want image hash hash-2", got)
+	}
+}
+
 func TestListContacts_Empty(t *testing.T) {
 	store := newTestStore(t)
 

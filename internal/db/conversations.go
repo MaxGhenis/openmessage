@@ -7,7 +7,7 @@ import (
 )
 
 // conversationColumns is the canonical column list for SELECT queries on conversations.
-const conversationColumns = `conversation_id, name, is_group, participants, last_message_ts, unread_count, source_platform, notification_mode, tab`
+const conversationColumns = `conversation_id, name, is_group, participants, last_message_ts, unread_count, source_platform, display_protocol, notification_mode, tab`
 
 const (
 	NotificationModeAll      = "all"
@@ -55,10 +55,11 @@ func (s *Store) UpsertConversation(c *Conversation) error {
 	if c.SourcePlatform == "" {
 		c.SourcePlatform = "sms"
 	}
+	c.DisplayProtocol = normalizeDisplayProtocol(c.DisplayProtocol)
 	notificationMode, hasNotificationMode := explicitNotificationMode(c.NotificationMode)
 	_, err := s.db.Exec(`
-		INSERT INTO conversations (conversation_id, name, is_group, participants, last_message_ts, unread_count, source_platform, notification_mode)
-		VALUES (?, ?, ?, ?, ?, ?, ?, COALESCE(NULLIF(?, ''), 'all'))
+		INSERT INTO conversations (conversation_id, name, is_group, participants, last_message_ts, unread_count, source_platform, display_protocol, notification_mode)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, COALESCE(NULLIF(?, ''), 'all'))
 		ON CONFLICT(conversation_id) DO UPDATE SET
 			name=excluded.name,
 			is_group=excluded.is_group,
@@ -66,8 +67,9 @@ func (s *Store) UpsertConversation(c *Conversation) error {
 			last_message_ts=excluded.last_message_ts,
 			unread_count=excluded.unread_count,
 			source_platform=excluded.source_platform,
+			display_protocol=CASE WHEN excluded.display_protocol != '' THEN excluded.display_protocol ELSE conversations.display_protocol END,
 			notification_mode=CASE WHEN ? != '' THEN ? ELSE conversations.notification_mode END
-	`, c.ConversationID, c.Name, c.IsGroup, c.Participants, c.LastMessageTS, c.UnreadCount, c.SourcePlatform, notificationMode, maybeNotificationModeArg(hasNotificationMode, notificationMode), maybeNotificationModeArg(hasNotificationMode, notificationMode))
+	`, c.ConversationID, c.Name, c.IsGroup, c.Participants, c.LastMessageTS, c.UnreadCount, c.SourcePlatform, c.DisplayProtocol, notificationMode, maybeNotificationModeArg(hasNotificationMode, notificationMode), maybeNotificationModeArg(hasNotificationMode, notificationMode))
 	return err
 }
 
@@ -76,10 +78,11 @@ func (s *Store) GetConversation(id string) (*Conversation, error) {
 	err := s.db.QueryRow(`
 		SELECT `+conversationColumns+`
 		FROM conversations WHERE conversation_id = ?
-	`, id).Scan(&c.ConversationID, &c.Name, &c.IsGroup, &c.Participants, &c.LastMessageTS, &c.UnreadCount, &c.SourcePlatform, &c.NotificationMode, &c.Tab)
+	`, id).Scan(&c.ConversationID, &c.Name, &c.IsGroup, &c.Participants, &c.LastMessageTS, &c.UnreadCount, &c.SourcePlatform, &c.DisplayProtocol, &c.NotificationMode, &c.Tab)
 	if err != nil {
 		return nil, err
 	}
+	c.DisplayProtocol = normalizeDisplayProtocol(c.DisplayProtocol)
 	c.NotificationMode = normalizeStoredNotificationMode(c.NotificationMode)
 	return c, nil
 }
@@ -177,6 +180,26 @@ func (s *Store) SetConversationNotificationMode(id, mode string) error {
 		return err
 	}
 	_, err = s.db.Exec(`UPDATE conversations SET notification_mode = ? WHERE conversation_id = ?`, normalized, id)
+	return err
+}
+
+func normalizeDisplayProtocol(protocol string) string {
+	switch strings.ToUpper(strings.TrimSpace(protocol)) {
+	case "RCS":
+		return "RCS"
+	case "TEXT", "SMS", "SMS/MMS":
+		return "Text"
+	default:
+		return ""
+	}
+}
+
+func (s *Store) SetConversationDisplayProtocol(id, protocol string) error {
+	normalized := normalizeDisplayProtocol(protocol)
+	if strings.TrimSpace(id) == "" || normalized == "" {
+		return nil
+	}
+	_, err := s.db.Exec(`UPDATE conversations SET display_protocol = ? WHERE conversation_id = ?`, normalized, id)
 	return err
 }
 
@@ -295,9 +318,10 @@ func scanConversations(rows interface {
 	var convs []*Conversation
 	for rows.Next() {
 		c := &Conversation{}
-		if err := rows.Scan(&c.ConversationID, &c.Name, &c.IsGroup, &c.Participants, &c.LastMessageTS, &c.UnreadCount, &c.SourcePlatform, &c.NotificationMode, &c.Tab); err != nil {
+		if err := rows.Scan(&c.ConversationID, &c.Name, &c.IsGroup, &c.Participants, &c.LastMessageTS, &c.UnreadCount, &c.SourcePlatform, &c.DisplayProtocol, &c.NotificationMode, &c.Tab); err != nil {
 			return nil, err
 		}
+		c.DisplayProtocol = normalizeDisplayProtocol(c.DisplayProtocol)
 		c.NotificationMode = normalizeStoredNotificationMode(c.NotificationMode)
 		convs = append(convs, c)
 	}
@@ -309,13 +333,14 @@ func getConversationTx(tx *sql.Tx, id string) (*Conversation, error) {
 	err := tx.QueryRow(`
 		SELECT `+conversationColumns+`
 		FROM conversations WHERE conversation_id = ?
-	`, id).Scan(&c.ConversationID, &c.Name, &c.IsGroup, &c.Participants, &c.LastMessageTS, &c.UnreadCount, &c.SourcePlatform, &c.NotificationMode, &c.Tab)
+	`, id).Scan(&c.ConversationID, &c.Name, &c.IsGroup, &c.Participants, &c.LastMessageTS, &c.UnreadCount, &c.SourcePlatform, &c.DisplayProtocol, &c.NotificationMode, &c.Tab)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return nil, nil
 		}
 		return nil, err
 	}
+	c.DisplayProtocol = normalizeDisplayProtocol(c.DisplayProtocol)
 	c.NotificationMode = normalizeStoredNotificationMode(c.NotificationMode)
 	return c, nil
 }
@@ -324,10 +349,11 @@ func upsertConversationTx(tx *sql.Tx, c *Conversation) error {
 	if c.SourcePlatform == "" {
 		c.SourcePlatform = "sms"
 	}
+	c.DisplayProtocol = normalizeDisplayProtocol(c.DisplayProtocol)
 	notificationMode, hasNotificationMode := explicitNotificationMode(c.NotificationMode)
 	_, err := tx.Exec(`
-		INSERT INTO conversations (conversation_id, name, is_group, participants, last_message_ts, unread_count, source_platform, notification_mode)
-		VALUES (?, ?, ?, ?, ?, ?, ?, COALESCE(NULLIF(?, ''), 'all'))
+		INSERT INTO conversations (conversation_id, name, is_group, participants, last_message_ts, unread_count, source_platform, display_protocol, notification_mode)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, COALESCE(NULLIF(?, ''), 'all'))
 		ON CONFLICT(conversation_id) DO UPDATE SET
 			name=excluded.name,
 			is_group=excluded.is_group,
@@ -335,8 +361,9 @@ func upsertConversationTx(tx *sql.Tx, c *Conversation) error {
 			last_message_ts=excluded.last_message_ts,
 			unread_count=excluded.unread_count,
 			source_platform=excluded.source_platform,
+			display_protocol=CASE WHEN excluded.display_protocol != '' THEN excluded.display_protocol ELSE conversations.display_protocol END,
 			notification_mode=CASE WHEN ? != '' THEN ? ELSE conversations.notification_mode END
-	`, c.ConversationID, c.Name, c.IsGroup, c.Participants, c.LastMessageTS, c.UnreadCount, c.SourcePlatform, notificationMode, maybeNotificationModeArg(hasNotificationMode, notificationMode), maybeNotificationModeArg(hasNotificationMode, notificationMode))
+	`, c.ConversationID, c.Name, c.IsGroup, c.Participants, c.LastMessageTS, c.UnreadCount, c.SourcePlatform, c.DisplayProtocol, notificationMode, maybeNotificationModeArg(hasNotificationMode, notificationMode), maybeNotificationModeArg(hasNotificationMode, notificationMode))
 	return err
 }
 
@@ -344,6 +371,7 @@ func mergeConversationRecords(source, target *Conversation, targetID string) *Co
 	if target == nil {
 		merged := *source
 		merged.ConversationID = targetID
+		merged.DisplayProtocol = normalizeDisplayProtocol(merged.DisplayProtocol)
 		merged.NotificationMode = normalizeStoredNotificationMode(merged.NotificationMode)
 		return &merged
 	}
@@ -364,6 +392,11 @@ func mergeConversationRecords(source, target *Conversation, targetID string) *Co
 	}
 	if merged.SourcePlatform == "" {
 		merged.SourcePlatform = source.SourcePlatform
+	}
+	if merged.DisplayProtocol == "" {
+		merged.DisplayProtocol = normalizeDisplayProtocol(source.DisplayProtocol)
+	} else {
+		merged.DisplayProtocol = normalizeDisplayProtocol(merged.DisplayProtocol)
 	}
 	if normalizeStoredNotificationMode(merged.NotificationMode) == NotificationModeAll && normalizeStoredNotificationMode(source.NotificationMode) != NotificationModeAll {
 		merged.NotificationMode = normalizeStoredNotificationMode(source.NotificationMode)

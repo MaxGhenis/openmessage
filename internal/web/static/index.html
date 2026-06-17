@@ -5,6 +5,11 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>OpenMessage</title>
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="manifest" href="/manifest.webmanifest">
+<meta name="theme-color" content="#09111c">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="OpenMessage">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Public+Sans:ital,wght@0,300..700;1,300..700&display=swap" rel="stylesheet">
@@ -749,6 +754,7 @@ html, body {
   display: flex;
   align-items: center;
   gap: 14px;
+  position: relative;
 }
 
 .chat-header-avatar {
@@ -771,6 +777,204 @@ html, body {
   font-family: var(--font-serif);
   font-size: 20px;
   font-weight: 400;
+  border: 0;
+  background: transparent;
+  color: var(--text-primary);
+  cursor: pointer;
+  padding: 0;
+  text-align: left;
+}
+
+.chat-header-main {
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.chat-header-tools {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 220px;
+  max-width: 360px;
+  flex: 0 1 360px;
+}
+
+.thread-search {
+  position: relative;
+  width: 100%;
+}
+
+.thread-search-input-wrap {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 36px;
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--bg-elevated);
+}
+
+.thread-search-input-wrap svg {
+  width: 16px;
+  height: 16px;
+  color: var(--text-muted);
+  flex: 0 0 auto;
+}
+
+#thread-search-input {
+  width: 100%;
+  min-width: 0;
+  border: 0;
+  outline: none;
+  background: transparent;
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 13px;
+}
+
+#thread-search-clear {
+  width: 20px;
+  height: 20px;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 16px;
+  line-height: 1;
+}
+
+#thread-search-clear:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.thread-search-results {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  width: min(420px, 78vw);
+  max-height: 340px;
+  overflow-y: auto;
+  padding: 6px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--panel-strong);
+  box-shadow: var(--shadow-soft);
+  z-index: 60;
+}
+
+.thread-search-results[hidden] {
+  display: none;
+}
+
+.thread-search-result,
+.thread-search-empty {
+  width: 100%;
+  border: 0;
+  border-radius: 8px;
+  padding: 9px 10px;
+  background: transparent;
+  color: var(--text-primary);
+  text-align: left;
+  font: inherit;
+}
+
+.thread-search-result {
+  cursor: pointer;
+}
+
+.thread-search-result:hover,
+.thread-search-result.active {
+  background: var(--bg-hover);
+}
+
+.thread-search-result-meta {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  color: var(--text-muted);
+  font-size: 11px;
+  margin-bottom: 3px;
+}
+
+.thread-search-result-snippet {
+  color: var(--text-secondary);
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+.thread-search-empty {
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.contact-popover {
+  position: absolute;
+  top: calc(100% - 10px);
+  left: 78px;
+  width: min(360px, calc(100vw - 40px));
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--panel-strong);
+  box-shadow: var(--shadow-soft);
+  z-index: 65;
+}
+
+.contact-popover[hidden] {
+  display: none;
+}
+
+.contact-popover-name {
+  color: var(--text-primary);
+  font-weight: 700;
+  margin-bottom: 8px;
+}
+
+.contact-popover-row,
+.contact-popover-participant {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 7px 0;
+  border-top: 1px solid var(--border);
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
+.contact-popover-row:first-of-type {
+  border-top: 0;
+}
+
+.contact-popover-number {
+  overflow-wrap: anywhere;
+}
+
+.contact-popover-copy {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-elevated);
+  color: var(--text-secondary);
+  padding: 5px 8px;
+  cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+}
+
+.contact-popover-copy:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.contact-popover-routes {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 10px;
 }
 
 .chat-header-status {
@@ -1474,6 +1678,7 @@ html, body {
   display: flex;
   gap: 12px;
   align-items: flex-end;
+  position: relative;
 }
 
 .compose-input {
@@ -3060,7 +3265,8 @@ body::after {
   font-family: var(--font-sans);
   font-size: 19px;
   font-weight: 700;
-  letter-spacing: -0.045em;
+  letter-spacing: 0;
+  line-height: 1.2;
 }
 
 .chat-header-name-row {
@@ -3068,6 +3274,21 @@ body::after {
   align-items: center;
   gap: 10px;
   min-width: 0;
+}
+
+.chat-header-main {
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.chat-header-tools {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 220px;
+  max-width: 360px;
+  flex: 0 1 360px;
 }
 
 .chat-header-status {
@@ -3423,6 +3644,12 @@ body::after {
   background: rgba(79, 108, 255, 0.12);
   border-color: rgba(79, 108, 255, 0.2);
   color: #4166ff;
+}
+
+.platform-chip--rcs {
+  background: rgba(52, 211, 153, 0.14);
+  border-color: rgba(52, 211, 153, 0.28);
+  color: #39b981;
 }
 
 .platform-chip--whatsapp {
@@ -3904,7 +4131,7 @@ body::after {
 .compose-row {
   display: flex;
   width: 100%;
-  align-items: flex-end;
+  align-items: center;
   gap: 10px;
 }
 
@@ -3915,6 +4142,7 @@ body::after {
   border: 1px solid transparent;
   color: var(--text-primary);
   font-size: 14px;
+  line-height: 1.45;
 }
 
 .compose-input:disabled {
@@ -3929,25 +4157,44 @@ body::after {
 }
 
 .attach-btn,
+.emoji-compose-btn,
 .send-btn {
   width: 46px;
   height: 46px;
   border-radius: 12px;
+  flex: 0 0 46px;
 }
 
 .attach-btn:disabled,
+.emoji-compose-btn:disabled,
 .send-btn:disabled {
   opacity: 0.45;
   cursor: not-allowed;
 }
 
-.attach-btn {
+.attach-btn,
+.emoji-compose-btn {
   background: var(--bg-surface);
   border: 1px solid var(--border);
+  color: var(--text-secondary);
 }
 
-.attach-btn:hover {
+.attach-btn:hover,
+.emoji-compose-btn:hover {
   background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.emoji-compose-btn svg {
+  width: 20px;
+  height: 20px;
+}
+
+.compose-emoji-panel {
+  left: 58px;
+  right: auto;
+  bottom: calc(100% + 8px);
+  z-index: 70;
 }
 
 .send-btn {
@@ -3958,6 +4205,37 @@ body::after {
 .send-btn:active,
 .send-btn:hover:not(:disabled) {
   transform: none;
+}
+
+@media (max-width: 900px) {
+  .chat-header {
+    flex-wrap: wrap;
+  }
+
+  .chat-header-tools {
+    order: 3;
+    flex: 1 0 100%;
+    min-width: 0;
+    max-width: none;
+    margin-left: 0;
+  }
+
+  .contact-popover {
+    left: 16px;
+    top: calc(100% + 8px);
+  }
+}
+
+@media (max-width: 520px) {
+  .thread-search-results,
+  .compose-emoji-panel {
+    width: min(320px, calc(100vw - 32px));
+  }
+
+  .compose-emoji-panel {
+    left: 0;
+    right: auto;
+  }
 }
 
 .empty-state {
@@ -4466,14 +4744,25 @@ body::after {
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>
       </button>
       <div class="chat-header-avatar" id="chat-header-avatar"></div>
-      <div>
+      <div class="chat-header-main">
         <div class="chat-header-name-row">
-          <div class="chat-header-name" id="chat-header-name"></div>
+          <button type="button" class="chat-header-name" id="chat-header-name" aria-haspopup="dialog" aria-expanded="false"></button>
           <div class="chat-header-actions" id="chat-header-actions"></div>
         </div>
         <div class="chat-header-source" id="chat-header-source"></div>
         <div class="chat-header-status" id="chat-header-status"></div>
       </div>
+      <div class="chat-header-tools">
+        <div class="thread-search" id="thread-search">
+          <div class="thread-search-input-wrap">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><line x1="16.5" y1="16.5" x2="21" y2="21"/></svg>
+            <input type="search" id="thread-search-input" placeholder="Search this thread..." aria-label="Search this thread" autocomplete="off">
+            <button type="button" id="thread-search-clear" aria-label="Clear thread search" hidden>&times;</button>
+          </div>
+          <div class="thread-search-results" id="thread-search-results" hidden></div>
+        </div>
+      </div>
+      <div class="contact-popover" id="contact-popover" hidden role="dialog" aria-label="Contact details"></div>
     </div>
     <div class="messages-area" id="messages-area" style="display:none"></div>
     <div class="reply-indicator" id="reply-indicator">
@@ -4491,11 +4780,15 @@ body::after {
         <button class="attach-btn" id="attach-btn" title="Attach media" aria-label="Attach media">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
         </button>
+        <button class="emoji-compose-btn" id="compose-emoji-btn" type="button" title="Insert emoji" aria-label="Insert emoji" aria-expanded="false" aria-controls="compose-emoji-panel">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M8 14s1.5 2 4 2 4-2 4-2"/><line x1="9" y1="9" x2="9.01" y2="9"/><line x1="15" y1="9" x2="15.01" y2="9"/></svg>
+        </button>
         <textarea class="compose-input" id="compose-input" placeholder="Write a message..." rows="1" aria-label="Message"></textarea>
         <button class="send-btn" id="send-btn" disabled aria-label="Send message">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
         </button>
       </div>
+      <div class="emoji-full-panel compose-emoji-panel" id="compose-emoji-panel" role="dialog" aria-label="Emoji picker"></div>
     </div>
   </div>
 </div>
@@ -4596,6 +4889,7 @@ body::after {
   const LINK_PREVIEW_CACHE_LIMIT = 256;
   const NATIVE_AVATAR_CACHE_LIMIT = 256;
   const WHATSAPP_AVATAR_CACHE_LIMIT = 128;
+  const GOOGLE_AVATAR_CACHE_LIMIT = 256;
   const MEDIA_LOADER_LABEL_DELAY_MS = 2500;
   const linkPreviewCache = new Map();
   const linkPreviewInflight = new Map();
@@ -4603,6 +4897,8 @@ body::after {
   const nativeAvatarInflight = new Map();
   const whatsAppAvatarCache = new Map();
   const whatsAppAvatarInflight = new Map();
+  const googleAvatarCache = new Map();
+  const googleAvatarInflight = new Map();
   const pendingMediaLoaderTimers = new WeakMap();
 
   // ─── DOM refs ───
@@ -4621,9 +4917,15 @@ body::after {
   const $chatHeaderSource = document.getElementById('chat-header-source');
   const $chatHeaderActions = document.getElementById('chat-header-actions');
   const $chatHeaderStatus = document.getElementById('chat-header-status');
+  const $threadSearchInput = document.getElementById('thread-search-input');
+  const $threadSearchClear = document.getElementById('thread-search-clear');
+  const $threadSearchResults = document.getElementById('thread-search-results');
+  const $contactPopover = document.getElementById('contact-popover');
   const $messagesArea = document.getElementById('messages-area');
   const $composeBar = document.getElementById('compose-bar');
   const $composeInput = document.getElementById('compose-input');
+  const $composeEmojiBtn = document.getElementById('compose-emoji-btn');
+  const $composeEmojiPanel = document.getElementById('compose-emoji-panel');
   const $sendBtn = document.getElementById('send-btn');
   const $fileInput = document.getElementById('file-input');
   const $attachBtn = document.getElementById('attach-btn');
@@ -4690,6 +4992,10 @@ body::after {
   let replyToMsg = null; // {MessageID, SenderName, Body}
   const composeTextByConversation = new Map();
   let contextMenuState = null;
+  let threadSearchTimer = 0;
+  let threadSearchRequestID = 0;
+  let threadSearchMode = 'latest';
+  let threadSearchAnchorMessageID = '';
   const QUICK_EMOJIS = ['😂', '❤️', '👍', '👎', '😮', '😢', '😡', '🙏', '🔥', '🎉', '👀', '💯'];
 
   // Full emoji dataset by category
@@ -4746,6 +5052,7 @@ body::after {
 
   const PLATFORM_META = {
     sms: { label: 'SMS', short: 'SMS', css: 'sms' },
+    rcs: { label: 'RCS', short: 'RCS', css: 'rcs' },
     whatsapp: { label: 'WhatsApp', short: 'WHATSAPP', css: 'whatsapp', chipAsset: '/platform-whatsapp.svg' },
     imessage: { label: 'iMessage', short: 'IM', css: 'imessage' },
     gchat: { label: 'Google Chat', short: 'GC', css: 'gchat' },
@@ -4753,7 +5060,7 @@ body::after {
     telegram: { label: 'Telegram', short: 'TG', css: 'telegram' },
   };
 
-  const PLATFORM_ORDER = ['sms', 'whatsapp', 'imessage', 'gchat', 'signal', 'telegram'];
+  const PLATFORM_ORDER = ['sms', 'rcs', 'whatsapp', 'imessage', 'gchat', 'signal', 'telegram'];
 
   function normalizePlatform(platform) {
     return String(platform || 'sms').trim().toLowerCase() || 'sms';
@@ -4762,6 +5069,22 @@ body::after {
   function sourcePlatformOf(entity) {
     if (!entity) return 'sms';
     return normalizePlatform(entity.SourcePlatform || entity.source_platform);
+  }
+
+  function displayProtocolOf(entity) {
+    const raw = String((entity && (entity.DisplayProtocol || entity.display_protocol)) || '').trim().toUpperCase();
+    if (raw === 'RCS') return 'RCS';
+    if (raw === 'TEXT' || raw === 'SMS' || raw === 'SMS/MMS') return 'Text';
+    return '';
+  }
+
+  function displayPlatformForRoute(route) {
+    const source = sourcePlatformOf(route);
+    if (source !== 'sms') return source;
+    const protocol = route && route.ConversationID === activeConvoId
+      ? (activeProtocolDetail || displayProtocolOf(route))
+      : displayProtocolOf(route);
+    return protocol === 'RCS' ? 'rcs' : 'sms';
   }
 
   function platformMeta(platform) {
@@ -5027,29 +5350,79 @@ body::after {
     return uniqueAvatarNumbers(source.flatMap(p => [p && p.number, p && p.phone]));
   }
 
+  function uniqueStringValues(values) {
+    const seen = new Set();
+    const result = [];
+    (values || []).forEach((value) => {
+      const raw = String(value || '').trim();
+      if (!raw || seen.has(raw)) return;
+      seen.add(raw);
+      result.push(raw);
+    });
+    return result;
+  }
+
+  function conversationAvatarRefs(convo) {
+    if (!convo || sourcePlatformOf(convo) !== 'sms') {
+      return { source: '', participantIDs: [], contactIDs: [] };
+    }
+    const participants = conversationParticipants(convo);
+    const others = participants.filter(p => !(p && (p.is_me || p.isMe)));
+    const source = others.length ? others : participants;
+    return {
+      source: 'sms',
+      participantIDs: uniqueStringValues(source.map(p => p && (p.id || p.participant_id || p.participantId))),
+      contactIDs: uniqueStringValues(source.map(p => p && (p.contact_id || p.contactId))),
+    };
+  }
+
+  function senderAvatarRefs(message) {
+    if (!message || !activeConversation || sourcePlatformOf(activeConversation) !== 'sms') {
+      return { source: '', participantIDs: [], contactIDs: [] };
+    }
+    const senderKey = normalizeParticipantIdentifier(message.SenderNumber || message.sender_number || '');
+    if (!senderKey) return { source: 'sms', participantIDs: [], contactIDs: [] };
+    const participant = conversationParticipants(activeConversation).find((p) => {
+      if (!p || p.is_me || p.isMe) return false;
+      return normalizeParticipantIdentifier(p.number || p.phone || '') === senderKey;
+    }) || {};
+    return {
+      source: 'sms',
+      participantIDs: uniqueStringValues([participant.id || participant.participant_id || participant.participantId]),
+      contactIDs: uniqueStringValues([participant.contact_id || participant.contactId]),
+    };
+  }
+
   function clusterAvatarNumbers(convos) {
     return uniqueAvatarNumbers((convos || []).flatMap(conversationAvatarNumbers));
   }
 
   function avatarPlatformsForConversation(convo) {
     if (!convo) return [];
-    if (convo.IsGroup) return [sourcePlatformOf(convo)];
-    return linkedRoutesForConversation(convo).map(sourcePlatformOf);
+    if (convo.IsGroup) return [displayPlatformForRoute(convo)];
+    return linkedRoutesForConversation(convo).map(displayPlatformForRoute);
   }
 
   function avatarPlatformsForConversations(convos = []) {
-    return distinctPlatforms((convos || []).map(sourcePlatformOf));
+    return distinctPlatforms((convos || []).map(displayPlatformForRoute));
   }
 
-  function avatarHTML({ name = '', numbers = [], whatsAppConversationID = '', platforms = [], className = '', style = '', text = initials(name) || '?' } = {}) {
+  function avatarHTML({ name = '', numbers = [], whatsAppConversationID = '', avatarSource = '', participantIDs = [], contactIDs = [], platforms = [], className = '', style = '', text = initials(name) || '?' } = {}) {
     const lookupNumbers = uniqueAvatarNumbers(numbers);
     const lookupKey = avatarLookupKey(name, lookupNumbers);
+    const normalizedParticipantIDs = uniqueStringValues(participantIDs);
+    const normalizedContactIDs = uniqueStringValues(contactIDs);
     const styleAttr = style ? ` style="${escapeHtml(style)}"` : '';
     const dataAttrs = [];
     if (lookupKey) {
       dataAttrs.push(`data-avatar-key="${escapeHtml(lookupKey)}"`);
       dataAttrs.push(`data-avatar-name="${escapeHtml(name || '')}"`);
       dataAttrs.push(`data-avatar-numbers="${escapeHtml(lookupNumbers.join('|'))}"`);
+    }
+    if (avatarSource && (normalizedParticipantIDs.length || normalizedContactIDs.length || lookupNumbers.length)) {
+      dataAttrs.push(`data-avatar-source="${escapeHtml(avatarSource)}"`);
+      dataAttrs.push(`data-avatar-participant-ids="${escapeHtml(normalizedParticipantIDs.join('|'))}"`);
+      dataAttrs.push(`data-avatar-contact-ids="${escapeHtml(normalizedContactIDs.join('|'))}"`);
     }
     if (whatsAppConversationID) {
       dataAttrs.push(`data-avatar-wa-conversation-id="${escapeHtml(whatsAppConversationID)}"`);
@@ -5058,24 +5431,41 @@ body::after {
     return `<div class="${escapeHtml(className)}"${attrs}><span class="avatar-face"${styleAttr}>${escapeHtml(text || '?')}</span>${avatarPlatformMarkersHTML(platforms)}</div>`;
   }
 
-  function setAvatarDataAttributes(el, name, numbers, whatsAppConversationID = '') {
+  function setAvatarDataAttributes(el, name, numbers, whatsAppConversationID = '', avatarSource = '', participantIDs = [], contactIDs = []) {
     const lookupNumbers = uniqueAvatarNumbers(numbers);
     const lookupKey = avatarLookupKey(name, lookupNumbers);
+    const normalizedParticipantIDs = uniqueStringValues(participantIDs);
+    const normalizedContactIDs = uniqueStringValues(contactIDs);
     if (whatsAppConversationID) {
       el.dataset.avatarWaConversationId = whatsAppConversationID;
     } else {
       delete el.dataset.avatarWaConversationId;
     }
-    if (!lookupKey) {
+    if (avatarSource && (normalizedParticipantIDs.length || normalizedContactIDs.length || lookupNumbers.length)) {
+      el.dataset.avatarSource = avatarSource;
+      el.dataset.avatarParticipantIds = normalizedParticipantIDs.join('|');
+      el.dataset.avatarContactIds = normalizedContactIDs.join('|');
+    } else {
+      delete el.dataset.avatarSource;
+      delete el.dataset.avatarParticipantIds;
+      delete el.dataset.avatarContactIds;
+    }
+    if (!lookupKey && !avatarSource) {
       delete el.dataset.avatarKey;
       delete el.dataset.avatarName;
       delete el.dataset.avatarNumbers;
       delete el.dataset.avatarHydrated;
       return;
     }
-    el.dataset.avatarKey = lookupKey;
-    el.dataset.avatarName = name || '';
-    el.dataset.avatarNumbers = lookupNumbers.join('|');
+    if (lookupKey) {
+      el.dataset.avatarKey = lookupKey;
+      el.dataset.avatarName = name || '';
+      el.dataset.avatarNumbers = lookupNumbers.join('|');
+    } else {
+      delete el.dataset.avatarKey;
+      el.dataset.avatarName = name || '';
+      el.dataset.avatarNumbers = lookupNumbers.join('|');
+    }
     delete el.dataset.avatarHydrated;
   }
 
@@ -5166,24 +5556,84 @@ body::after {
     return request;
   }
 
-  async function fetchAvatarImage(name, numbers = [], whatsAppConversationID = '') {
+  function googleAvatarLookupKey({ source = '', participantIDs = [], contactIDs = [], numbers = [] } = {}) {
+    const sourceKey = String(source || '').trim().toLowerCase();
+    const participants = uniqueStringValues(participantIDs).join('|');
+    const contacts = uniqueStringValues(contactIDs).join('|');
+    const phones = uniqueAvatarNumbers(numbers).map(normalizeParticipantIdentifier).sort().join('|');
+    if (!sourceKey || (!participants && !contacts && !phones)) return '';
+    return `${sourceKey}::${participants}::${contacts}::${phones}`;
+  }
+
+  async function fetchGoogleCachedAvatar({ source = '', participantIDs = [], contactIDs = [], numbers = [] } = {}) {
+    const lookupKey = googleAvatarLookupKey({ source, participantIDs, contactIDs, numbers });
+    if (!lookupKey) return null;
+    const cachedAvatar = cacheGetFresh(googleAvatarCache, lookupKey);
+    if (cachedAvatar !== undefined) return cachedAvatar;
+    if (googleAvatarInflight.has(lookupKey)) return googleAvatarInflight.get(lookupKey);
+
+    const params = new URLSearchParams();
+    params.set('source', source);
+    const participantID = uniqueStringValues(participantIDs)[0] || '';
+    const contactID = uniqueStringValues(contactIDs)[0] || '';
+    const phone = uniqueAvatarNumbers(numbers)[0] || '';
+    if (participantID) params.set('participant_id', participantID);
+    if (contactID) params.set('contact_id', contactID);
+    if (phone) params.set('phone', phone);
+    const request = fetch(`${API}/api/avatar?${params.toString()}`)
+      .then(async (resp) => {
+        if (resp.status === 404) {
+          cacheSetBounded(googleAvatarCache, lookupKey, null, GOOGLE_AVATAR_CACHE_LIMIT);
+          return null;
+        }
+        if (!resp.ok) throw new Error(`avatar ${resp.status}`);
+        const blob = await resp.blob();
+        if (!blob || blob.size === 0) {
+          cacheSetBounded(googleAvatarCache, lookupKey, null, GOOGLE_AVATAR_CACHE_LIMIT);
+          return null;
+        }
+        const objectURL = URL.createObjectURL(blob);
+        cacheSetBounded(googleAvatarCache, lookupKey, objectURL, GOOGLE_AVATAR_CACHE_LIMIT, (staleValue) => {
+          if (typeof staleValue === 'string' && staleValue.startsWith('blob:')) {
+            URL.revokeObjectURL(staleValue);
+          }
+        });
+        return objectURL;
+      })
+      .catch(() => null)
+      .finally(() => {
+        googleAvatarInflight.delete(lookupKey);
+      });
+    googleAvatarInflight.set(lookupKey, request);
+    return request;
+  }
+
+  async function fetchAvatarImage(name, numbers = [], whatsAppConversationID = '', googleRefs = {}) {
     const whatsAppAvatar = await fetchWhatsAppAvatar(whatsAppConversationID);
     if (whatsAppAvatar) return whatsAppAvatar;
+    const googleAvatar = await fetchGoogleCachedAvatar({ ...googleRefs, numbers });
+    if (googleAvatar) return googleAvatar;
     return fetchNativeAvatar(name, numbers);
   }
 
   function avatarHydrationIdentity(el) {
     if (!el) return '';
-    return `${el.dataset.avatarKey || ''}::${el.dataset.avatarWaConversationId || ''}`;
+    return [
+      el.dataset.avatarKey || '',
+      el.dataset.avatarWaConversationId || '',
+      el.dataset.avatarSource || '',
+      el.dataset.avatarParticipantIds || '',
+      el.dataset.avatarContactIds || '',
+    ].join('::');
   }
 
   function hydrateNativeAvatars(root = document) {
     const targets = [];
-    if (root && root.nodeType === 1 && root.matches && root.matches('[data-avatar-key], [data-avatar-wa-conversation-id]')) {
+    if (root && root.nodeType === 1 && root.matches && root.matches('[data-avatar-key], [data-avatar-wa-conversation-id], [data-avatar-source]')) {
       targets.push(root);
     }
     if (root && root.querySelectorAll) {
-      root.querySelectorAll('[data-avatar-key], [data-avatar-wa-conversation-id]').forEach(el => targets.push(el));
+      root.querySelectorAll('[data-avatar-key], [data-avatar-wa-conversation-id], [data-avatar-source]').forEach(el => targets.push(el));
     }
     targets.forEach((el) => {
       if (el.dataset.avatarHydrated === 'true') return;
@@ -5191,8 +5641,13 @@ body::after {
       const name = el.dataset.avatarName || '';
       const numbers = (el.dataset.avatarNumbers || '').split('|').filter(Boolean);
       const whatsAppConversationID = el.dataset.avatarWaConversationId || '';
+      const googleRefs = {
+        source: el.dataset.avatarSource || '',
+        participantIDs: (el.dataset.avatarParticipantIds || '').split('|').filter(Boolean),
+        contactIDs: (el.dataset.avatarContactIds || '').split('|').filter(Boolean),
+      };
       const expectedIdentity = avatarHydrationIdentity(el);
-      fetchAvatarImage(name, numbers, whatsAppConversationID).then((dataURL) => {
+      fetchAvatarImage(name, numbers, whatsAppConversationID, googleRefs).then((dataURL) => {
         if (!dataURL || !el.isConnected) return;
         if (avatarHydrationIdentity(el) !== expectedIdentity) return;
         applyAvatarImage(el, dataURL, el.dataset.avatarName || name);
@@ -5246,7 +5701,7 @@ body::after {
     }
   }
 
-  function renderAvatarElement(el, { name = '', numbers = [], whatsAppConversationID = '', platforms = [], text = initials(name) || '?', background = avatarColor(name) } = {}) {
+  function renderAvatarElement(el, { name = '', numbers = [], whatsAppConversationID = '', avatarSource = '', participantIDs = [], contactIDs = [], platforms = [], text = initials(name) || '?', background = avatarColor(name) } = {}) {
     if (!el) return;
     el.classList.remove('has-photo');
     el.innerHTML = `<span class="avatar-face">${escapeHtml(text || '?')}</span>${avatarPlatformMarkersHTML(platforms)}`;
@@ -5254,7 +5709,7 @@ body::after {
     if (face) {
       face.style.background = background;
     }
-    setAvatarDataAttributes(el, name, numbers, whatsAppConversationID);
+    setAvatarDataAttributes(el, name, numbers, whatsAppConversationID, avatarSource, participantIDs, contactIDs);
     hydrateNativeAvatars(el);
   }
 
@@ -5267,6 +5722,7 @@ body::after {
       return {
         key: `unified::${unifiedID.toLowerCase()}`,
         displayName: String(convo.UnifiedName || convo.unified_name || primary.name || convo.Name || 'Unknown').trim() || 'Unknown',
+        number: String(primary.number || primary.phone || '').trim(),
       };
     }
     const displayName = String(primary.name || convo.Name || '').trim();
@@ -5276,6 +5732,7 @@ body::after {
     return {
       key: `${displayKey}::${participantKey}`,
       displayName: displayName || 'Unknown',
+      number: String(primary.number || primary.phone || primary.email || '').trim(),
     };
   }
 
@@ -5404,6 +5861,10 @@ body::after {
     return `<span class="chat-route-tab-icon" aria-hidden="true"><span class="chat-route-tab-monogram">${escapeHtml(meta.short)}</span></span>`;
   }
 
+  function routeDisplayLabel(route) {
+    return platformMeta(displayPlatformForRoute(route)).label;
+  }
+
   function renderHeaderRouteTabs(container, routes, activeID, onSelect) {
     if (!container) return;
     if (!routes || !routes.length) {
@@ -5411,12 +5872,12 @@ body::after {
       return;
     }
     if (routes.length < 2) {
-      container.innerHTML = platformBadgeHTML(sourcePlatformOf(routes[0]), 'header');
+      container.innerHTML = platformBadgeHTML(displayPlatformForRoute(routes[0]), 'header');
       return;
     }
     container.innerHTML = `<div class="chat-route-tabs">${
       routes.map(route => {
-        const platform = sourcePlatformOf(route);
+        const platform = displayPlatformForRoute(route);
         const active = route.ConversationID === activeID;
         const unread = route.UnreadCount || 0;
         return `
@@ -5424,11 +5885,11 @@ body::after {
             type="button"
             class="chat-route-tab${active ? ' active' : ''}${conversationSupportsOutbound(route) ? '' : ' read-only'}"
             data-route-id="${escapeHtml(route.ConversationID)}"
-            title="${escapeHtml(platformMeta(platform).label)}"
+            title="${escapeHtml(routeDisplayLabel(route))}"
             ${active ? 'aria-current="page"' : ''}
           >
             ${routeTabIconHTML(platform)}
-            <span class="chat-route-tab-label">${escapeHtml(platformMeta(platform).label)}</span>
+            <span class="chat-route-tab-label">${escapeHtml(routeDisplayLabel(route))}</span>
             ${unread ? `<span class="chat-route-tab-unread">${unread}</span>` : ''}
           </button>
         `;
@@ -5440,6 +5901,68 @@ body::after {
         if (route) onSelect(route);
       });
     });
+  }
+
+  function primaryContactParticipants(convo = activeConversation) {
+    if (!convo) return [];
+    const participants = conversationParticipants(convo).filter(p => p && !(p.is_me || p.isMe));
+    if (convo.IsGroup) return participants;
+    return participants.length ? [participants[0]] : [];
+  }
+
+  function contactDisplayNumber(participant) {
+    return String((participant && (participant.number || participant.phone || participant.email)) || '').trim();
+  }
+
+  function closeContactPopover() {
+    if (!$contactPopover) return;
+    $contactPopover.hidden = true;
+    $contactPopover.innerHTML = '';
+    if ($chatHeaderName) $chatHeaderName.setAttribute('aria-expanded', 'false');
+  }
+
+  function renderContactPopover() {
+    if (!$contactPopover || !activeConversation) return;
+    const participants = primaryContactParticipants(activeConversation);
+    const routes = activeConversation.IsGroup ? [activeConversation] : linkedRoutesForConversation(activeConversation);
+    const routePlatforms = distinctPlatforms(routes.map(displayPlatformForRoute));
+    const rows = participants.map((participant, index) => {
+      const name = String(participant.name || '').trim();
+      const number = contactDisplayNumber(participant);
+      const label = activeConversation.IsGroup ? (name || `Participant ${index + 1}`) : 'Phone';
+      return `
+        <div class="${activeConversation.IsGroup ? 'contact-popover-participant' : 'contact-popover-row'}">
+          <div>
+            ${activeConversation.IsGroup ? `<div class="contact-popover-name">${escapeHtml(label)}</div>` : ''}
+            <div class="contact-popover-number">${escapeHtml(number || 'No number stored')}</div>
+          </div>
+          ${number ? `<button type="button" class="contact-popover-copy" data-copy="${escapeHtml(number)}">Copy</button>` : ''}
+        </div>
+      `;
+    }).join('');
+    $contactPopover.innerHTML = `
+      <div class="contact-popover-name">${escapeHtml(activeConversation.Name || 'Unknown')}</div>
+      ${rows || '<div class="contact-popover-row"><span class="contact-popover-number">No contact number stored</span></div>'}
+      ${routePlatforms.length ? `<div class="contact-popover-routes">${routePlatforms.map(platform => platformBadgeHTML(platform)).join('')}</div>` : ''}
+    `;
+    $contactPopover.hidden = false;
+    if ($chatHeaderName) $chatHeaderName.setAttribute('aria-expanded', 'true');
+    $contactPopover.querySelectorAll('.contact-popover-copy').forEach(btn => {
+      btn.addEventListener('click', async (event) => {
+        event.stopPropagation();
+        const value = btn.dataset.copy || '';
+        if (!value) return;
+        await copyTextToClipboard(value);
+        showThreadFeedback('Phone number copied.');
+        closeContactPopover();
+      });
+    });
+  }
+
+  function toggleContactPopover() {
+    if (!$contactPopover || !activeConversation) return;
+    if ($contactPopover.hidden) renderContactPopover();
+    else closeContactPopover();
   }
 
   async function revealAndSelectConversation(convo) {
@@ -5879,7 +6402,7 @@ body::after {
   function createConversationRow(c, options = {}) {
     const el = document.createElement('div');
     const hasUnread = c.UnreadCount > 0;
-    const platform = sourcePlatformOf(c);
+    const platform = displayPlatformForRoute(c);
     const notificationBadge = notificationModeBadgeHTML(notificationModeOf(c));
     const preview = c._searchPreview
       ? `<div class="convo-preview">${escapeHtml(c._searchPreview.substring(0, 60))}</div>`
@@ -5905,11 +6428,15 @@ body::after {
         ${hasUnread ? '<div class="convo-unread">' + c.UnreadCount + '</div>' : ''}
       `;
     } else {
+      const avatarRefs = conversationAvatarRefs(c);
       el.innerHTML = `
         ${avatarHTML({
           name: c.Name,
           numbers: conversationAvatarNumbers(c),
           whatsAppConversationID: conversationAvatarWhatsAppConversationID(c),
+          avatarSource: avatarRefs.source,
+          participantIDs: avatarRefs.participantIDs,
+          contactIDs: avatarRefs.contactIDs,
           platforms: avatarPlatformsForConversation(c),
           className: 'convo-avatar',
           style: `background:${avatarColor(c.Name)}`,
@@ -5957,6 +6484,7 @@ body::after {
     if (!primary) return document.createElement('div');
     const hasUnread = aggregateUnreadCount(routes) > 0;
     const unreadCount = aggregateUnreadCount(routes);
+    const primaryAvatarRefs = conversationAvatarRefs(primary);
     const el = document.createElement('div');
     el.className = 'convo-item'
       + (activeConversationIdentityKey() === identity.key ? ' active' : '')
@@ -5967,6 +6495,9 @@ body::after {
         name: identity.displayName,
         numbers: clusterAvatarNumbers(routes),
         whatsAppConversationID: clusterAvatarWhatsAppConversationID(routes),
+        avatarSource: primaryAvatarRefs.source,
+        participantIDs: routes.flatMap(route => conversationAvatarRefs(route).participantIDs),
+        contactIDs: routes.flatMap(route => conversationAvatarRefs(route).contactIDs),
         platforms: avatarPlatformsForConversations(routes),
         className: 'convo-avatar',
         style: `background:${avatarColor(identity.displayName)}`,
@@ -5987,7 +6518,7 @@ body::after {
   }
 
   function updateChatHeaderPlatform(protocolDetail = '') {
-    activeProtocolDetail = protocolDetail || '';
+    activeProtocolDetail = protocolDetail || displayProtocolOf(activeConversation);
     if (!activeConversation) {
       $chatHeaderSource.innerHTML = '';
       $chatHeaderActions.innerHTML = '';
@@ -6043,7 +6574,6 @@ body::after {
       });
     }
     const details = [];
-    if (activeProtocolDetail) details.push(activeProtocolDetail);
     if (activeConversation.IsGroup) details.push('Group chat');
     const typingText = typingStatusText(activeConversation);
     $chatHeaderStatus.textContent = typingText || details.join(' • ');
@@ -6053,6 +6583,7 @@ body::after {
   function refreshComposeRouteUI() {
     if (!activeConversation) {
       $composeInput.disabled = false;
+      if ($composeEmojiBtn) $composeEmojiBtn.disabled = false;
       $attachBtn.disabled = false;
       $attachBtn.title = 'Attach media';
       return;
@@ -6061,6 +6592,7 @@ body::after {
     const canSend = conversationSupportsOutbound(activeConversation);
     const canSendMedia = conversationSupportsMediaOutbound(activeConversation);
     $composeInput.disabled = !canSend;
+    if ($composeEmojiBtn) $composeEmojiBtn.disabled = !canSend;
     $attachBtn.disabled = !canSendMedia;
     $attachBtn.title = canSendMedia
       ? 'Attach media'
@@ -6073,6 +6605,9 @@ body::after {
     }
     if (!canSend && replyToMsg) {
       clearReply();
+    }
+    if (!canSend) {
+      closeComposeEmojiPanel();
     }
     autoResize();
   }
@@ -7150,15 +7685,21 @@ body::after {
     $messagesArea.style.display = 'flex';
     $composeBar.style.display = 'flex';
 
+    const avatarRefs = conversationAvatarRefs(convo);
     renderAvatarElement($chatHeaderAvatar, {
       name: convo.Name,
       numbers: conversationAvatarNumbers(convo),
       whatsAppConversationID: conversationAvatarWhatsAppConversationID(convo),
+      avatarSource: avatarRefs.source,
+      participantIDs: avatarRefs.participantIDs,
+      contactIDs: avatarRefs.contactIDs,
       platforms: avatarPlatformsForConversation(convo),
       text: initials(convo.Name),
       background: avatarColor(convo.Name),
     });
     $chatHeaderName.textContent = convo.Name || 'Unknown';
+    closeContactPopover();
+    clearThreadSearchUI();
     activeConvoIsGroup = !!convo.IsGroup;
     activeProtocolDetail = '';
     if (isConversationSwitch) {
@@ -7200,7 +7741,7 @@ body::after {
   let lastRenderedWindowStart = 0;
   let lastRenderedWindowEnd = 0;
 
-  function resetLoadedThreadState() {
+  function resetLoadedThreadState({ preserveThreadSearch = false } = {}) {
     activeThreadToken += 1;
     if (pendingBottomScrollFrame) {
       cancelAnimationFrame(pendingBottomScrollFrame);
@@ -7230,6 +7771,10 @@ body::after {
     lastRenderedWindowStart = 0;
     lastRenderedWindowEnd = 0;
     activeProtocolDetail = '';
+    if (!preserveThreadSearch) {
+      threadSearchMode = 'latest';
+      threadSearchAnchorMessageID = '';
+    }
     clearThreadFeedback();
   }
 
@@ -7756,10 +8301,14 @@ body::after {
           row.className = 'msg-row received';
           const avatarDiv = document.createElement('div');
           avatarDiv.className = 'msg-avatar' + (isLastFromSender ? '' : ' avatar-hidden');
+          const avatarRefs = senderAvatarRefs(m);
           renderAvatarElement(avatarDiv, {
             name: m.SenderName,
             numbers: uniqueAvatarNumbers([m.SenderNumber]),
             whatsAppConversationID: senderAvatarWhatsAppConversationID(m),
+            avatarSource: avatarRefs.source,
+            participantIDs: avatarRefs.participantIDs,
+            contactIDs: avatarRefs.contactIDs,
             text: initials(m.SenderName).charAt(0),
             background: avatarColor(m.SenderName),
           });
@@ -7836,6 +8385,7 @@ body::after {
     const reset = !!options.reset;
     const poll = !!options.poll;
     const forceBottom = !!options.forceBottom;
+    if (poll && !forceBottom && threadSearchMode === 'centered') return;
     if (older && (!hasOlderMessages || loadingOlderMessages || !oldestLoadedTS)) return;
 
     const threadToken = activeThreadToken;
@@ -7908,6 +8458,157 @@ body::after {
     } finally {
       if (older) loadingOlderMessages = false;
       if (!older && threadToken === activeThreadToken && activeConvoId === convoId) {
+        $messagesArea.removeAttribute('aria-busy');
+      }
+    }
+  }
+
+  function clearThreadSearchResults() {
+    if ($threadSearchResults) {
+      $threadSearchResults.hidden = true;
+      $threadSearchResults.innerHTML = '';
+    }
+  }
+
+  function clearThreadSearchUI() {
+    clearTimeout(threadSearchTimer);
+    threadSearchRequestID++;
+    threadSearchMode = 'latest';
+    threadSearchAnchorMessageID = '';
+    if ($threadSearchInput) $threadSearchInput.value = '';
+    if ($threadSearchClear) $threadSearchClear.hidden = true;
+    clearThreadSearchResults();
+  }
+
+  async function clearThreadSearch({ restoreLatest = true } = {}) {
+    const shouldReload = restoreLatest && activeConvoId && threadSearchMode === 'centered';
+    clearThreadSearchUI();
+    if (shouldReload) {
+      $messagesArea.setAttribute('aria-busy', 'true');
+      renderThreadPlaceholder('Loading latest messages...');
+      resetLoadedThreadState();
+      await loadMessages(activeConvoId, { reset: true, forceBottom: true });
+    }
+  }
+
+  function threadSearchSnippet(message, query) {
+    const body = String((message && (message.Body || message.body)) || '').replace(/\s+/g, ' ').trim();
+    if (!body) return 'Media or empty message';
+    const q = String(query || '').trim().toLowerCase();
+    if (!q) return body.length > 120 ? body.slice(0, 117) + '...' : body;
+    const idx = body.toLowerCase().indexOf(q);
+    if (idx < 0) return body.length > 120 ? body.slice(0, 117) + '...' : body;
+    const start = Math.max(0, idx - 48);
+    const end = Math.min(body.length, idx + q.length + 72);
+    return `${start > 0 ? '...' : ''}${body.slice(start, end)}${end < body.length ? '...' : ''}`;
+  }
+
+  function renderThreadSearchResults(results, query) {
+    if (!$threadSearchResults) return;
+    if (!query) {
+      clearThreadSearchResults();
+      return;
+    }
+    if (!results.length) {
+      $threadSearchResults.innerHTML = '<div class="thread-search-empty">No matches in this thread</div>';
+      $threadSearchResults.hidden = false;
+      return;
+    }
+    $threadSearchResults.innerHTML = results.map((message, index) => {
+      const sender = message.IsFromMe ? 'You' : (message.SenderName || activeConversation?.Name || 'Unknown');
+      return `
+        <button type="button" class="thread-search-result" data-message-id="${escapeHtml(message.MessageID || '')}" ${index === 0 ? 'data-first="1"' : ''}>
+          <div class="thread-search-result-meta">
+            <span>${escapeHtml(sender)}</span>
+            <span>${escapeHtml(formatTime(message.TimestampMS || 0))}</span>
+          </div>
+          <div class="thread-search-result-snippet">${escapeHtml(threadSearchSnippet(message, query))}</div>
+        </button>
+      `;
+    }).join('');
+    $threadSearchResults.hidden = false;
+    $threadSearchResults.querySelectorAll('.thread-search-result').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        const messageID = btn.dataset.messageId || '';
+        if (!messageID) return;
+        clearThreadSearchResults();
+        await centerThreadOnMessage(messageID);
+      });
+    });
+  }
+
+  async function runThreadSearch() {
+    if (!$threadSearchInput || !activeConvoId) return;
+    const query = $threadSearchInput.value.trim();
+    if ($threadSearchClear) $threadSearchClear.hidden = !query;
+    if (!query) {
+      await clearThreadSearch({ restoreLatest: true });
+      return;
+    }
+    const requestID = ++threadSearchRequestID;
+    try {
+      const results = await fetchJSON(`/api/conversations/${encodeURIComponent(activeConvoId)}/search?q=${encodeURIComponent(query)}&limit=30`);
+      if (requestID !== threadSearchRequestID || !activeConvoId) return;
+      renderThreadSearchResults(Array.isArray(results) ? results : [], query);
+    } catch (err) {
+      if (requestID !== threadSearchRequestID) return;
+      $threadSearchResults.innerHTML = '<div class="thread-search-empty">Search failed</div>';
+      $threadSearchResults.hidden = false;
+      console.error('Thread search failed:', err);
+    }
+  }
+
+  function scheduleThreadSearch() {
+    clearTimeout(threadSearchTimer);
+    threadSearchTimer = setTimeout(runThreadSearch, 180);
+  }
+
+  function messageElementByID(messageID) {
+    const id = String(messageID || '');
+    if (!id || !$messagesArea) return null;
+    return Array.from($messagesArea.querySelectorAll('[data-msg-id]')).find(el => el.dataset.msgId === id) || null;
+  }
+
+  async function centerThreadOnMessage(messageID) {
+    if (!activeConvoId || !messageID) return;
+    threadSearchMode = 'centered';
+    threadSearchAnchorMessageID = messageID;
+    resetLoadedThreadState({ preserveThreadSearch: true });
+    threadSearchMode = 'centered';
+    threadSearchAnchorMessageID = messageID;
+    const threadToken = activeThreadToken;
+    $messagesArea.setAttribute('aria-busy', 'true');
+    renderThreadPlaceholder('Loading search result...');
+    try {
+      const params = new URLSearchParams({
+        message_id: messageID,
+        before: '60',
+        after: '60',
+      });
+      const msgs = await fetchJSON(`/api/conversations/${encodeURIComponent(activeConvoId)}/messages-around?${params.toString()}`);
+      if (threadToken !== activeThreadToken) return;
+      loadedMessages = Array.isArray(msgs) ? msgs : [];
+      loadedDrafts = await fetchDrafts(activeConvoId);
+      if (threadToken !== activeThreadToken) return;
+      syncDraftEditCache(loadedDrafts);
+      hasOlderMessages = loadedMessages.length > 0;
+      updateLoadedMessageBounds();
+      rememberKnownMessages(loadedMessages);
+      renderLoadedMessages({ stickToBottom: false });
+      requestAnimationFrame(() => {
+        const el = messageElementByID(messageID);
+        if (el) {
+          el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          el.style.outline = '2px solid var(--accent)';
+          setTimeout(() => { el.style.outline = ''; }, 1500);
+        }
+      });
+      showThreadFeedback('Showing thread search result.');
+    } catch (err) {
+      console.error('Failed to center thread search result:', err);
+      renderThreadPlaceholder("Couldn't load that search result.", 'is-error');
+    } finally {
+      if (threadToken === activeThreadToken) {
         $messagesArea.removeAttribute('aria-busy');
       }
     }
@@ -8078,7 +8779,13 @@ body::after {
       clearReply();
       // Refresh to get the real message from server
       if (activeConvoId === sendConvoId) {
-        await loadMessages(sendConvoId, {poll: true, forceBottom: true});
+        if (threadSearchMode === 'centered') {
+          clearThreadSearchUI();
+          resetLoadedThreadState();
+          await loadMessages(sendConvoId, {reset: true, forceBottom: true});
+        } else {
+          await loadMessages(sendConvoId, {poll: true, forceBottom: true});
+        }
       }
       await loadConversations();
     } catch (err) {
@@ -8139,6 +8846,120 @@ body::after {
     }
   });
   $sendBtn.addEventListener('click', sendMessage);
+
+  function buildComposeEmojiPanel() {
+    if (!$composeEmojiPanel || $composeEmojiPanel.dataset.hydrated === 'true') return;
+    let html = '<div class="emoji-search"><input type="text" id="compose-emoji-search" placeholder="Search emoji..." aria-label="Search emoji" autocomplete="off"></div>';
+    html += '<div class="emoji-grid" id="compose-emoji-grid">';
+    EMOJI_CATEGORIES.forEach(cat => {
+      html += `<div class="emoji-cat-label">${escapeHtml(cat.name)}</div>`;
+      cat.emojis.forEach(emoji => {
+        const name = EN[emoji] || 'emoji';
+        html += `<button type="button" data-emoji="${escapeHtml(emoji)}" data-name="${escapeHtml(name)}" aria-label="${escapeHtml(name)}" title="${escapeHtml(name)}">${escapeHtml(emoji)}</button>`;
+      });
+    });
+    html += '</div>';
+    $composeEmojiPanel.innerHTML = html;
+    $composeEmojiPanel.dataset.hydrated = 'true';
+    const search = document.getElementById('compose-emoji-search');
+    if (search) {
+      search.addEventListener('input', () => filterComposeEmojis(search.value));
+    }
+    $composeEmojiPanel.querySelectorAll('.emoji-grid button').forEach(btn => {
+      btn.addEventListener('click', () => insertComposeEmoji(btn.dataset.emoji || btn.textContent.trim()));
+    });
+  }
+
+  function filterComposeEmojis(value) {
+    const grid = document.getElementById('compose-emoji-grid');
+    if (!grid) return;
+    const query = String(value || '').toLowerCase().trim();
+    grid.querySelectorAll('button').forEach(btn => {
+      const name = (btn.dataset.name || '').toLowerCase();
+      const match = !query || name.includes(query) || name.split(/\s+/).some(word => word.startsWith(query));
+      btn.style.display = match ? '' : 'none';
+    });
+    grid.querySelectorAll('.emoji-cat-label').forEach(label => {
+      let next = label.nextElementSibling;
+      let anyVisible = false;
+      while (next && !next.classList.contains('emoji-cat-label')) {
+        if (next.style.display !== 'none') anyVisible = true;
+        next = next.nextElementSibling;
+      }
+      label.style.display = anyVisible ? '' : 'none';
+    });
+  }
+
+  function closeComposeEmojiPanel() {
+    if (!$composeEmojiPanel) return;
+    $composeEmojiPanel.classList.remove('show');
+    if ($composeEmojiBtn) $composeEmojiBtn.setAttribute('aria-expanded', 'false');
+  }
+
+  function toggleComposeEmojiPanel() {
+    if (!$composeEmojiPanel || !$composeEmojiBtn) return;
+    buildComposeEmojiPanel();
+    const willOpen = !$composeEmojiPanel.classList.contains('show');
+    document.querySelectorAll('.emoji-picker.show').forEach(p => p.classList.remove('show'));
+    document.querySelectorAll('.emoji-full-panel.show').forEach(p => {
+      if (p !== $composeEmojiPanel) p.classList.remove('show');
+    });
+    $composeEmojiPanel.classList.toggle('show', willOpen);
+    $composeEmojiBtn.setAttribute('aria-expanded', willOpen ? 'true' : 'false');
+    if (willOpen) {
+      const input = document.getElementById('compose-emoji-search');
+      if (input) {
+        input.value = '';
+        filterComposeEmojis('');
+        input.focus();
+      }
+    }
+  }
+
+  function insertComposeEmoji(emoji) {
+    if (!emoji || !$composeInput || $composeInput.disabled) return;
+    const start = $composeInput.selectionStart ?? $composeInput.value.length;
+    const end = $composeInput.selectionEnd ?? start;
+    const value = $composeInput.value;
+    $composeInput.value = value.slice(0, start) + emoji + value.slice(end);
+    const nextPos = start + emoji.length;
+    $composeInput.setSelectionRange(nextPos, nextPos);
+    rememberActiveComposeText();
+    autoResize();
+    $composeInput.focus();
+  }
+
+  if ($composeEmojiBtn) {
+    $composeEmojiBtn.addEventListener('click', (event) => {
+      event.stopPropagation();
+      toggleComposeEmojiPanel();
+    });
+  }
+
+  if ($threadSearchInput) {
+    $threadSearchInput.addEventListener('input', scheduleThreadSearch);
+    $threadSearchInput.addEventListener('keydown', async (event) => {
+      if (event.key === 'Enter') {
+        const first = $threadSearchResults && $threadSearchResults.querySelector('.thread-search-result');
+        if (first) {
+          event.preventDefault();
+          await centerThreadOnMessage(first.dataset.messageId || '');
+        }
+      }
+    });
+  }
+  if ($threadSearchClear) {
+    $threadSearchClear.addEventListener('click', () => {
+      clearThreadSearch({ restoreLatest: true }).catch(err => console.error('Failed to clear thread search:', err));
+      if ($threadSearchInput) $threadSearchInput.focus();
+    });
+  }
+  if ($chatHeaderName) {
+    $chatHeaderName.addEventListener('click', (event) => {
+      event.stopPropagation();
+      toggleContactPopover();
+    });
+  }
 
   // ─── Attachments (paste + file picker) ───
   function setAttachment(file) {
@@ -8212,6 +9033,7 @@ body::after {
       Participants: result.Participants || result.participants || '',
       UnreadCount: result.UnreadCount || 0,
       source_platform: result.SourcePlatform || result.source_platform,
+      DisplayProtocol: result.DisplayProtocol || result.display_protocol || '',
       UnifiedID: result.UnifiedID || result.unified_id || '',
       UnifiedName: result.UnifiedName || result.unified_name || '',
       _searchPreview: result.preview || '',
@@ -8935,6 +9757,7 @@ body::after {
 
   function scheduleThreadRefresh(conversationId, delay = 100) {
     if (!activeConvoId) return;
+    if (threadSearchMode === 'centered') return;
     if (conversationId && conversationId !== activeConvoId) return;
     clearTimeout(threadRefreshTimer);
     threadRefreshTimer = setTimeout(() => {
@@ -8959,7 +9782,7 @@ body::after {
       if (!$searchInput.value.trim()) loadConversations();
     }, 5000);
     fallbackThreadTimer = setInterval(() => {
-      if (activeConvoId) loadMessages(activeConvoId, {poll: true});
+      if (activeConvoId && threadSearchMode !== 'centered') loadMessages(activeConvoId, {poll: true});
     }, 3000);
   }
 
@@ -9159,9 +9982,16 @@ body::after {
 
   // Close react picker and full panel when clicking elsewhere
   document.addEventListener('click', (e) => {
-    if (!e.target.closest('.emoji-picker') && !e.target.closest('.emoji-full-panel') && !e.target.closest('.msg-actions')) {
+    if (!e.target.closest('.emoji-picker') && !e.target.closest('.emoji-full-panel') && !e.target.closest('.msg-actions') && !e.target.closest('#compose-emoji-btn')) {
       document.querySelectorAll('.emoji-picker.show').forEach(p => p.classList.remove('show'));
       document.querySelectorAll('.emoji-full-panel.show').forEach(p => p.classList.remove('show'));
+      if ($composeEmojiBtn) $composeEmojiBtn.setAttribute('aria-expanded', 'false');
+    }
+    if ($threadSearchResults && !$threadSearchResults.hidden && !e.target.closest('.thread-search')) {
+      clearThreadSearchResults();
+    }
+    if ($contactPopover && !$contactPopover.hidden && !e.target.closest('.contact-popover') && !e.target.closest('#chat-header-name')) {
+      closeContactPopover();
     }
     if ($contextMenu && !$contextMenu.hidden && !e.target.closest('.context-menu') && !e.target.closest('.chat-header-action-btn') && !e.target.closest('#bulk-move-btn')) {
       closeContextMenu();
@@ -9274,7 +10104,7 @@ body::after {
   $replyClose.addEventListener('click', clearReply);
 
   window.scrollToMessage = function(msgId) {
-    const el = document.querySelector(`[data-msg-id="${msgId}"]`);
+    const el = messageElementByID(msgId);
     if (el) {
       el.scrollIntoView({ behavior: 'smooth', block: 'center' });
       el.style.outline = '2px solid var(--accent)';
@@ -9337,6 +10167,8 @@ body::after {
     activeProtocolDetail = '';
     clearTimeout(threadRefreshTimer);
     threadRefreshTimer = null;
+    closeContactPopover();
+    clearThreadSearchUI();
     document.querySelectorAll('.convo-item').forEach(el => el.classList.remove('active'));
     syncSidebarSelectionState();
     $emptyState.style.display = '';
@@ -9399,9 +10231,15 @@ body::after {
       if (fullscreen) { fullscreen.remove(); return; }
       // Close any open emoji pickers or full panels
       const openPanels = document.querySelectorAll('.emoji-full-panel.show');
-      if (openPanels.length) { openPanels.forEach(p => p.classList.remove('show')); return; }
+      if (openPanels.length) {
+        openPanels.forEach(p => p.classList.remove('show'));
+        if ($composeEmojiBtn) $composeEmojiBtn.setAttribute('aria-expanded', 'false');
+        return;
+      }
       const openPickers = document.querySelectorAll('.emoji-picker.show');
       if (openPickers.length) { openPickers.forEach(p => p.classList.remove('show')); return; }
+      if ($threadSearchResults && !$threadSearchResults.hidden) { clearThreadSearchResults(); return; }
+      if ($contactPopover && !$contactPopover.hidden) { closeContactPopover(); return; }
       // Close the new-message dialog if open (its own input handler takes
       // precedence while focus is inside it)
       if ($newMsgOverlay && $newMsgOverlay.classList.contains('show')) { closeNewMsg(); return; }
@@ -9492,11 +10330,11 @@ body::after {
       return;
     }
 
-    const routeLabels = Array.from(new Set(routes.map(route => platformMeta(sourcePlatformOf(route)).label)));
+    const routeLabels = Array.from(new Set(routes.map(route => platformMeta(displayPlatformForRoute(route)).label)));
     $newMsgHelper.textContent = routeLabels.length > 1
       ? `This number already appears on ${routeLabels.join(' and ')}. Choose the route you want to reply from.`
       : `This number already has a ${routeLabels[0]} route.`;
-    $newMsgGo.textContent = replyRoute ? `Open ${platformMeta(sourcePlatformOf(replyRoute)).label} route` : 'Start SMS conversation';
+    $newMsgGo.textContent = replyRoute ? `Open ${platformMeta(displayPlatformForRoute(replyRoute)).label} route` : 'Start SMS conversation';
     $newMsgRoutes.classList.add('active');
     $newMsgRoutes.innerHTML = `<div class="new-msg-routes-caption">Existing routes</div>`;
     const routeHost = document.createElement('div');
@@ -9819,7 +10657,16 @@ body::after {
     };
   }
 
+  function registerServiceWorker() {
+    if (!('serviceWorker' in navigator)) return;
+    window.addEventListener('load', () => {
+      navigator.serviceWorker.register('/sw.js')
+        .catch(err => console.error('Failed to register service worker:', err));
+    });
+  }
+
   // ─── Init ───
+  registerServiceWorker();
   syncNotificationButton();
   refreshNativeNotificationState()
     .then(() => syncNotificationButton())
