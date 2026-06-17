@@ -575,6 +575,16 @@ test('favorites conversations from the header and row context menu', async ({ pa
   const sarahFavorite = page.locator('#favorites-rail .favorite-chip[title="Sarah Chen"]');
   await expect(sarahFavorite).toBeVisible();
   await expect(sarahFavorite).toHaveClass(/active/);
+  await expect(sarahFavorite).toHaveAttribute('aria-current', 'page');
+  await expect
+    .poll(async () => page.evaluate(() => {
+      const tabs = document.querySelector('.sidebar-tabs-row')?.getBoundingClientRect();
+      const rail = document.querySelector('#favorites-rail')?.getBoundingClientRect();
+      const list = document.querySelector('#conversation-list')?.getBoundingClientRect();
+      if (!tabs || !rail || !list) return false;
+      return rail.top >= tabs.bottom - 1 && rail.bottom <= list.top + 1;
+    }))
+    .toBe(true);
 
   const marcusRow = page.locator('#conversation-list .convo-item').filter({ hasText: 'Marcus Johnson' }).first();
   await expect(marcusRow.locator('.convo-unread')).toHaveText('1');
