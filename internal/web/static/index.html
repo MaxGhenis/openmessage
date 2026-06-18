@@ -9828,6 +9828,7 @@ body::after {
 	    });
 	  }
 
+	  const GIF_SEARCH_DEBOUNCE_MS = 500;
 	  let gifSearchTimeout = null;
 	  let gifSearchRequestID = 0;
 	  let gifSending = false;
@@ -9844,17 +9845,24 @@ body::after {
 	    $composeGifPanel.dataset.hydrated = 'true';
 	    const search = document.getElementById('compose-gif-search');
 	    if (search) {
-	      search.addEventListener('input', () => {
-	        if (gifSearchTimeout) clearTimeout(gifSearchTimeout);
-	        gifSearchTimeout = setTimeout(() => {
-	          loadComposeGifs(search.value).catch(err => console.error('GIF search failed:', err));
-	        }, 250);
-	      });
+	      search.addEventListener('input', () => scheduleComposeGifSearch(search.value));
 	    }
+	  }
+
+	  function scheduleComposeGifSearch(query) {
+	    if (gifSearchTimeout) clearTimeout(gifSearchTimeout);
+	    gifSearchTimeout = setTimeout(() => {
+	      gifSearchTimeout = null;
+	      loadComposeGifs(query).catch(err => console.error('GIF search failed:', err));
+	    }, GIF_SEARCH_DEBOUNCE_MS);
 	  }
 
 	  function closeComposeGifPanel() {
 	    if (!$composeGifPanel) return;
+	    if (gifSearchTimeout) {
+	      clearTimeout(gifSearchTimeout);
+	      gifSearchTimeout = null;
+	    }
 	    $composeGifPanel.classList.remove('show');
 	    if ($composeGifBtn) $composeGifBtn.setAttribute('aria-expanded', 'false');
 	  }

@@ -908,6 +908,41 @@ test('sends a GIF through the compose picker', async ({ page }) => {
   expect(sendGIFPayload.caption).toBe(caption);
 });
 
+test('debounces GIF search while typing', async ({ page }) => {
+  const gifRequests = [];
+  await page.route(/\/api\/gifs(?:\/trending)?\?/, async route => {
+    gifRequests.push(new URL(route.request().url()));
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        results: [{
+          title: 'Wave',
+          preview_url: 'data:image/gif;base64,R0lGODlhAQABAAAAACwAAAAAAQABAAA=',
+          url: 'https://media.klipy.com/fake/wave.gif',
+          mime_type: 'image/gif',
+          width: 1,
+          height: 1,
+        }],
+      }),
+    });
+  });
+
+  await openConversation(page, 'Taylor Price');
+  await page.locator('#compose-gif-btn').click();
+  await expect(page.locator('#compose-gif-panel .gif-tile')).toHaveCount(1);
+
+  gifRequests.length = 0;
+  await page.locator('#compose-gif-search').pressSequentially('cats', { delay: 60 });
+  await page.waitForTimeout(300);
+  expect(gifRequests).toHaveLength(0);
+
+  await page.waitForTimeout(350);
+  expect(gifRequests).toHaveLength(1);
+  expect(gifRequests[0].pathname).toBe('/api/gifs');
+  expect(gifRequests[0].searchParams.get('q')).toBe('cats');
+});
+
 test('accepts dropped files in the compose box', async ({ page }) => {
   await openConversation(page, 'Taylor Price');
   await page.locator('#compose-bar').evaluate((composeBar) => {
