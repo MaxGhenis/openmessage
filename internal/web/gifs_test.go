@@ -19,12 +19,13 @@ func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
 }
 
 func TestGIFSearchEndpointReturnsProxiedKlipyResults(t *testing.T) {
+	t.Setenv("OPENMESSAGES_KLIPY_API_KEY", "test-klipy-key")
 	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if got := r.URL.Query().Get("q"); got != "thumbs up" {
 			t.Fatalf("query = %q, want thumbs up", got)
 		}
-		if got := r.URL.Query().Get("key"); got == "" {
-			t.Fatal("provider request missing API key")
+		if got := r.URL.Query().Get("key"); got != "test-klipy-key" {
+			t.Fatalf("provider API key = %q, want test-klipy-key", got)
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{
@@ -80,6 +81,19 @@ func TestGIFSearchEndpointReturnsProxiedKlipyResults(t *testing.T) {
 	}
 	if !strings.HasPrefix(result.PreviewURL, "/api/gifs/preview?url=") {
 		t.Fatalf("preview URL = %q, want local proxy path", result.PreviewURL)
+	}
+}
+
+func TestGIFSearchEndpointRequiresKlipyAPIKey(t *testing.T) {
+	t.Setenv("OPENMESSAGES_KLIPY_API_KEY", "")
+	t.Setenv("KLIPY_API_KEY", "")
+
+	results, err := searchKlipyGIFs(context.Background(), "thumbs up", 5)
+	if err == nil {
+		t.Fatalf("expected missing API key error, got results: %#v", results)
+	}
+	if !strings.Contains(err.Error(), "OPENMESSAGES_KLIPY_API_KEY") {
+		t.Fatalf("error = %q, want setup hint", err.Error())
 	}
 }
 

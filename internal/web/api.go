@@ -477,14 +477,12 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 
 		media, err := cli.GM.UploadMedia(data, filename, mimeType)
 		if err != nil {
-			markGoogleAuthExpired(err)
 			httpError(w, googleAPIErrorMessage("upload media", err), 502)
 			return
 		}
 
 		conv, err := cli.GM.GetConversation(convID)
 		if err != nil {
-			markGoogleAuthExpired(err)
 			httpError(w, googleAPIErrorMessage("get conversation", err), 502)
 			return
 		}
@@ -501,7 +499,6 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 
 		resp, err := cli.GM.SendMessage(payload)
 		if err != nil {
-			markGoogleAuthExpired(err)
 			httpError(w, googleAPIErrorMessage("send message", err), 502)
 			return
 		}

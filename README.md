@@ -169,11 +169,22 @@ The macOS app target lives under `OpenMessage/`.
 | `OPENMESSAGES_MY_NAME` | system user name | Display name for outgoing imported iMessage/WhatsApp messages |
 | `OPENMESSAGES_STARTUP_BACKFILL` | `auto` | Startup history sync mode: `auto`, `shallow`, `deep`, or `off` |
 | `OPENMESSAGES_BACKFILL_DISCOVER_ORPHANS` | `0` | Opt in to deep backfill's Phase C (contact-based orphan discovery). **Off by default** because it creates an empty SMS thread on your phone for each contact without prior message history. Enable with `1`/`true`/`yes`/`on` only if you understand the side effect. |
+| `OPENMESSAGES_KLIPY_API_KEY` | unset | Optional Klipy API key for the web compose GIF picker. GIF search is unavailable until this is set. `KLIPY_API_KEY` is also accepted as a fallback. |
 | `OPENMESSAGES_MACOS_NOTIFICATIONS` | interactive macOS `serve` sessions only | Enable/disable native macOS notifications for fresh inbound live messages (`1`/`0`). Click-through opens the matching thread when `terminal-notifier` is available. The macOS app sets this to `0` and posts its own notifications (with tap-to-open and active-thread suppression) instead. |
 | `OPENMESSAGES_SIGNAL_TMP_SWEEP` | enabled | Set to `0` to disable the cleanup of stale signal-cli temp directories (the app-owned run dirs plus `libsignal*` dirs older than 24h that pre-v0.2.10 builds leaked into the system temp dir — see #27). |
 | `OPENMESSAGES_EXPORT_DIR` | `~/Documents/OpenMessage` | Directory for `generate_viz` / `render_story` HTML outputs and photo inputs when using the default confined export mode. |
 | `OPENMESSAGES_ALLOW_ANY_EXPORT_PATH` | unset (off) | Set to `1`/`true`/`yes`/`on` to allow viz/story tools to read photos from, or write HTML to, arbitrary local paths. |
 | `OPENMESSAGE_TELEMETRY` | unset (off) | Set to `1` to send one anonymous heartbeat per launch (max one per 24h). Reports only: random install ID, version, OS/arch, and which platforms are paired (Google Messages / WhatsApp / Signal). No message content, no contact info, no IP-based identity. See `internal/telemetry/`. |
+
+### GIF picker setup
+
+The web compose GIF picker uses Klipy search. To enable it:
+
+1. Create a Klipy API key.
+2. Start OpenMessage with `OPENMESSAGES_KLIPY_API_KEY=<your key>`.
+3. Open the web UI and use the `GIF` button in a media-capable conversation.
+
+OpenMessage does not include a bundled GIF provider key. Without `OPENMESSAGES_KLIPY_API_KEY`, GIF search endpoints return a setup error and the rest of messaging continues to work normally.
 
 ## Architecture
 

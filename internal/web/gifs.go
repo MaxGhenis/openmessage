@@ -16,7 +16,6 @@ import (
 )
 
 const (
-	defaultKlipyAPIKey            = "AtywYPdjAHtT9HcbzaIi3JR3xxwGFwIiufVXOxjtP9ObHxTdY6uRXqxHcayVSsKm"
 	defaultGIFSearchQuery         = "popular"
 	maxGIFSearchResults           = 48
 	defaultGIFSearchLimit         = 24
@@ -68,6 +67,10 @@ func searchKlipyGIFs(ctx context.Context, query string, limit int) ([]gifSearchR
 	if limit > maxGIFSearchResults {
 		limit = maxGIFSearchResults
 	}
+	apiKey := klipyAPIKey()
+	if apiKey == "" {
+		return nil, errors.New("GIF search is not configured; set OPENMESSAGES_KLIPY_API_KEY")
+	}
 
 	endpoint, err := url.Parse(klipySearchEndpoint)
 	if err != nil {
@@ -75,7 +78,7 @@ func searchKlipyGIFs(ctx context.Context, query string, limit int) ([]gifSearchR
 	}
 	params := endpoint.Query()
 	params.Set("q", query)
-	params.Set("key", klipyAPIKey())
+	params.Set("key", apiKey)
 	endpoint.RawQuery = params.Encode()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
@@ -182,10 +185,13 @@ func klipyDimensions(format klipyMediaFormat) (int, int) {
 }
 
 func klipyAPIKey() string {
+	if key := strings.TrimSpace(os.Getenv("OPENMESSAGES_KLIPY_API_KEY")); key != "" {
+		return key
+	}
 	if key := strings.TrimSpace(os.Getenv("KLIPY_API_KEY")); key != "" {
 		return key
 	}
-	return defaultKlipyAPIKey
+	return ""
 }
 
 func proxyGIFPreviewURL(rawURL string) string {
