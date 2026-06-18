@@ -424,6 +424,130 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 	if fetchLinkPreview == nil {
 		fetchLinkPreview = NewLinkPreviewService(logger).Fetch
 	}
+	sendMediaBytes := func(w http.ResponseWriter, convID string, data []byte, filename, mimeType, caption, replyToID string) {
+		if isSignalConversation(convID) {
+			msg, err := sendSignalMedia(convID, data, filename, mimeType, caption, replyToID)
+			switch {
+			case errors.Is(err, errSignalMediaUnavailable):
+				httpError(w, err.Error(), 501)
+				return
+			case errors.Is(err, errSignalLocalStore):
+				httpError(w, "message sent remotely but failed to update local store: "+err.Error(), 500)
+				return
+			case err != nil:
+				httpError(w, err.Error(), 502)
+				return
+			}
+			publishMessages(convID)
+			publishConversations()
+			writeJSON(w, map[string]any{
+				"message_id": msg.MessageID,
+				"status":     "SUCCESS",
+				"success":    true,
+			})
+			return
+		}
+		if isWhatsAppConversation(convID) {
+			msg, err := sendWhatsAppMedia(convID, data, filename, mimeType, caption, replyToID)
+			switch {
+			case errors.Is(err, errWhatsAppMediaUnavailable):
+				httpError(w, err.Error(), 501)
+				return
+			case errors.Is(err, errWhatsAppLocalStore):
+				httpError(w, "message sent remotely but failed to update local store: "+err.Error(), 500)
+				return
+			case err != nil:
+				httpError(w, err.Error(), 502)
+				return
+			}
+			publishMessages(convID)
+			publishConversations()
+			writeJSON(w, map[string]any{
+				"message_id": msg.MessageID,
+				"status":     "SUCCESS",
+				"success":    true,
+			})
+			return
+		}
+		cli := getClient()
+		if cli == nil {
+			httpError(w, app.ErrNotConnected, 503)
+			return
+		}
+
+		media, err := cli.GM.UploadMedia(data, filename, mimeType)
+		if err != nil {
+			markGoogleAuthExpired(err)
+			httpError(w, googleAPIErrorMessage("upload media", err), 502)
+			return
+		}
+
+		conv, err := cli.GM.GetConversation(convID)
+		if err != nil {
+			markGoogleAuthExpired(err)
+			httpError(w, googleAPIErrorMessage("get conversation", err), 502)
+			return
+		}
+
+		myParticipantID, simPayload := app.ExtractSIMAndParticipant(conv)
+		payload := app.BuildSendMediaPayload(convID, media, myParticipantID, simPayload)
+
+		logger.Info().
+			Str("conv_id", convID).
+			Str("mime", mimeType).
+			Str("filename", filename).
+			Int("size", len(data)).
+			Msg("Sending media message")
+
+		resp, err := cli.GM.SendMessage(payload)
+		if err != nil {
+			markGoogleAuthExpired(err)
+			httpError(w, googleAPIErrorMessage("send message", err), 502)
+			return
+		}
+		success := resp.GetStatus() == gmproto.SendMessageResponse_SUCCESS
+		if !success {
+			now := time.Now().UnixMilli()
+			_ = recordOutgoingMessage(&db.Message{
+				MessageID:      payload.TmpID,
+				ConversationID: convID,
+				Body:           "",
+				IsFromMe:       true,
+				TimestampMS:    now,
+				Status:         "OUTGOING_FAILED:" + resp.GetStatus().String(),
+				MediaID:        media.MediaID,
+				MimeType:       media.MimeType,
+				DecryptionKey:  hex.EncodeToString(media.DecryptionKey),
+			}, "")
+			publishMessages(convID)
+			publishConversations()
+			recordGoogleSend(false)
+			httpError(w, googleSendRejectedMessage(resp.GetStatus().String()), 502)
+			return
+		}
+		recordGoogleSend(true)
+		now := time.Now().UnixMilli()
+		if err := recordOutgoingMessage(&db.Message{
+			MessageID:      payload.TmpID,
+			ConversationID: convID,
+			Body:           "",
+			IsFromMe:       true,
+			TimestampMS:    now,
+			Status:         "OUTGOING_SENDING",
+			MediaID:        media.MediaID,
+			MimeType:       media.MimeType,
+			DecryptionKey:  hex.EncodeToString(media.DecryptionKey),
+		}, ""); err != nil {
+			httpError(w, "message sent remotely but failed to update local store: "+err.Error(), 500)
+			return
+		}
+		publishMessages(convID)
+		publishConversations()
+		writeJSON(w, map[string]any{
+			"status":  resp.GetStatus().String(),
+			"success": success,
+		})
+	}
 
 	mux.HandleFunc("/api/events", func(w http.ResponseWriter, r *http.Request) {
 		if opts.Events == nil {
@@ -1053,6 +1177,83 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		})
 	})
 
+	mux.HandleFunc("/api/gifs", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			httpError(w, "method not allowed", 405)
+			return
+		}
+		limit := queryIntClamped(r, "limit", defaultGIFSearchLimit, maxGIFSearchResults)
+		results, err := searchKlipyGIFs(r.Context(), r.URL.Query().Get("q"), limit)
+		if err != nil {
+			httpError(w, err.Error(), 502)
+			return
+		}
+		for i := range results {
+			results[i].PreviewURL = proxyGIFPreviewURL(results[i].PreviewURL)
+		}
+		writeJSON(w, map[string]any{"results": results})
+	})
+
+	mux.HandleFunc("/api/gifs/trending", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			httpError(w, "method not allowed", 405)
+			return
+		}
+		limit := queryIntClamped(r, "limit", defaultGIFSearchLimit, maxGIFSearchResults)
+		results, err := searchKlipyGIFs(r.Context(), defaultGIFSearchQuery, limit)
+		if err != nil {
+			httpError(w, err.Error(), 502)
+			return
+		}
+		for i := range results {
+			results[i].PreviewURL = proxyGIFPreviewURL(results[i].PreviewURL)
+		}
+		writeJSON(w, map[string]any{"results": results})
+	})
+
+	mux.HandleFunc("/api/gifs/preview", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			httpError(w, "method not allowed", 405)
+			return
+		}
+		data, _, mimeType, err := downloadGIFMedia(r.Context(), r.URL.Query().Get("url"), maxGIFPreviewBytes)
+		if err != nil {
+			httpError(w, err.Error(), 400)
+			return
+		}
+		w.Header().Set("Cache-Control", "private, max-age=3600")
+		w.Header().Set("Content-Type", mimeType)
+		_, _ = w.Write(data)
+	})
+
+	mux.HandleFunc("/api/send-gif", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			httpError(w, "method not allowed", 405)
+			return
+		}
+		var req struct {
+			ConversationID string `json:"conversation_id"`
+			URL            string `json:"url"`
+			Caption        string `json:"caption"`
+			ReplyToID      string `json:"reply_to_id"`
+		}
+		if err := json.NewDecoder(io.LimitReader(r.Body, 64<<10)).Decode(&req); err != nil {
+			httpError(w, "invalid JSON: "+err.Error(), 400)
+			return
+		}
+		convID := strings.TrimSpace(req.ConversationID)
+		if convID == "" {
+			httpError(w, "conversation_id is required", 400)
+			return
+		}
+		data, filename, mimeType, err := downloadGIFMedia(r.Context(), req.URL, maxGIFSendBytes)
+		if err != nil {
+			httpError(w, err.Error(), 400)
+			return
+		}
+		sendMediaBytes(w, convID, data, filename, mimeType, strings.TrimSpace(req.Caption), strings.TrimSpace(req.ReplyToID))
+	})
+
 	mux.HandleFunc("/api/send-media", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			httpError(w, "method not allowed", 405)
@@ -1104,128 +1305,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		if mime == "" {
 			mime = "application/octet-stream"
 		}
-		if isSignalConversation(convID) {
-			msg, err := sendSignalMedia(convID, data, header.Filename, mime, caption, replyToID)
-			switch {
-			case errors.Is(err, errSignalMediaUnavailable):
-				httpError(w, err.Error(), 501)
-				return
-			case errors.Is(err, errSignalLocalStore):
-				httpError(w, "message sent remotely but failed to update local store: "+err.Error(), 500)
-				return
-			case err != nil:
-				httpError(w, err.Error(), 502)
-				return
-			}
-			publishMessages(convID)
-			publishConversations()
-			writeJSON(w, map[string]any{
-				"message_id": msg.MessageID,
-				"status":     "SUCCESS",
-				"success":    true,
-			})
-			return
-		}
-		if isWhatsAppConversation(convID) {
-			msg, err := sendWhatsAppMedia(convID, data, header.Filename, mime, caption, replyToID)
-			switch {
-			case errors.Is(err, errWhatsAppMediaUnavailable):
-				httpError(w, err.Error(), 501)
-				return
-			case errors.Is(err, errWhatsAppLocalStore):
-				httpError(w, "message sent remotely but failed to update local store: "+err.Error(), 500)
-				return
-			case err != nil:
-				httpError(w, err.Error(), 502)
-				return
-			}
-			publishMessages(convID)
-			publishConversations()
-			writeJSON(w, map[string]any{
-				"message_id": msg.MessageID,
-				"status":     "SUCCESS",
-				"success":    true,
-			})
-			return
-		}
-		cli := getClient()
-		if cli == nil {
-			httpError(w, app.ErrNotConnected, 503)
-			return
-		}
-
-		// Upload media via libgm
-		media, err := cli.GM.UploadMedia(data, header.Filename, mime)
-		if err != nil {
-			httpError(w, googleAPIErrorMessage("upload media", err), 502)
-			return
-		}
-
-		// Get SIM and participant info
-		conv, err := cli.GM.GetConversation(convID)
-		if err != nil {
-			httpError(w, googleAPIErrorMessage("get conversation", err), 502)
-			return
-		}
-
-		myParticipantID, simPayload := app.ExtractSIMAndParticipant(conv)
-
-		payload := app.BuildSendMediaPayload(convID, media, myParticipantID, simPayload)
-
-		logger.Info().
-			Str("conv_id", convID).
-			Str("mime", mime).
-			Str("filename", header.Filename).
-			Int("size", len(data)).
-			Msg("Sending media message")
-
-		resp, err := cli.GM.SendMessage(payload)
-		if err != nil {
-			httpError(w, googleAPIErrorMessage("send message", err), 502)
-			return
-		}
-		success := resp.GetStatus() == gmproto.SendMessageResponse_SUCCESS
-		if !success {
-			now := time.Now().UnixMilli()
-			_ = recordOutgoingMessage(&db.Message{
-				MessageID:      payload.TmpID,
-				ConversationID: convID,
-				Body:           "",
-				IsFromMe:       true,
-				TimestampMS:    now,
-				Status:         "OUTGOING_FAILED:" + resp.GetStatus().String(),
-				MediaID:        media.MediaID,
-				MimeType:       media.MimeType,
-				DecryptionKey:  hex.EncodeToString(media.DecryptionKey),
-			}, "")
-			publishMessages(convID)
-			publishConversations()
-			recordGoogleSend(false)
-			httpError(w, googleSendRejectedMessage(resp.GetStatus().String()), 502)
-			return
-		}
-		recordGoogleSend(true)
-		now := time.Now().UnixMilli()
-		if err := recordOutgoingMessage(&db.Message{
-			MessageID:      payload.TmpID,
-			ConversationID: convID,
-			Body:           "",
-			IsFromMe:       true,
-			TimestampMS:    now,
-			Status:         "OUTGOING_SENDING",
-			MediaID:        media.MediaID,
-			MimeType:       media.MimeType,
-			DecryptionKey:  hex.EncodeToString(media.DecryptionKey),
-		}, ""); err != nil {
-			httpError(w, "message sent remotely but failed to update local store: "+err.Error(), 500)
-			return
-		}
-		publishMessages(convID)
-		publishConversations()
-		writeJSON(w, map[string]any{
-			"status":  resp.GetStatus().String(),
-			"success": success,
-		})
+		sendMediaBytes(w, convID, data, header.Filename, mime, caption, replyToID)
 	})
 
 	mux.HandleFunc("/api/media/", func(w http.ResponseWriter, r *http.Request) {

@@ -4438,6 +4438,7 @@ body::after {
 }
 
 .attach-btn,
+.gif-compose-btn,
 .emoji-compose-btn,
 .send-btn {
   width: 46px;
@@ -4447,6 +4448,7 @@ body::after {
 }
 
 .attach-btn:disabled,
+.gif-compose-btn:disabled,
 .emoji-compose-btn:disabled,
 .send-btn:disabled {
   opacity: 0.45;
@@ -4454,6 +4456,7 @@ body::after {
 }
 
 .attach-btn,
+.gif-compose-btn,
 .emoji-compose-btn {
   background: var(--bg-surface);
   border: 1px solid var(--border);
@@ -4461,14 +4464,25 @@ body::after {
 }
 
 .attach-btn:hover,
+.gif-compose-btn:hover,
 .emoji-compose-btn:hover {
   background: var(--bg-hover);
   color: var(--text-primary);
 }
 
+.gif-compose-btn {
+  font: 700 11px/1 var(--font-sans);
+  letter-spacing: 0.02em;
+}
+
 .emoji-compose-btn svg {
   width: 20px;
   height: 20px;
+}
+
+.compose-bar.drag-over {
+  border-color: var(--border-accent);
+  background: var(--bg-hover);
 }
 
 .compose-emoji-panel {
@@ -4490,6 +4504,87 @@ body::after {
   width: 100%;
   min-width: 0;
   aspect-ratio: 1;
+}
+
+.gif-compose-panel {
+  position: absolute;
+  left: 58px;
+  right: auto;
+  bottom: calc(100% + 8px);
+  z-index: 72;
+  display: none;
+  width: min(560px, calc(100vw - 96px));
+  max-height: min(430px, calc(100vh - 260px));
+  overflow: hidden;
+  flex-direction: column;
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  background: var(--bg-elevated);
+  box-shadow: var(--shadow-soft);
+}
+
+.gif-compose-panel.show {
+  display: flex;
+}
+
+.gif-search {
+  padding: 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.gif-search input {
+  width: 100%;
+  height: 42px;
+  padding: 0 14px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--bg-surface);
+  color: var(--text-primary);
+  font: 500 14px/1 var(--font-sans);
+  outline: none;
+}
+
+.gif-search input:focus {
+  border-color: var(--border-accent);
+}
+
+.gif-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(112px, 1fr));
+  gap: 8px;
+  overflow-y: auto;
+  padding: 12px;
+}
+
+.gif-tile {
+  min-width: 0;
+  aspect-ratio: 1.1;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--bg-surface);
+  cursor: pointer;
+  padding: 0;
+}
+
+.gif-tile:hover,
+.gif-tile:focus-visible {
+  border-color: var(--border-accent);
+  outline: none;
+}
+
+.gif-tile img {
+  width: 100%;
+  height: 100%;
+  display: block;
+  object-fit: cover;
+}
+
+.gif-status {
+  padding: 18px 12px;
+  color: var(--text-muted);
+  font-size: 13px;
+  text-align: center;
 }
 
 .send-btn {
@@ -4522,11 +4617,13 @@ body::after {
 }
 
 @media (max-width: 520px) {
-  .thread-search-results {
+  .thread-search-results,
+  .gif-compose-panel {
     width: min(320px, calc(100vw - 32px));
   }
 
-  .compose-emoji-panel {
+  .compose-emoji-panel,
+  .gif-compose-panel {
     left: 0;
     right: 0;
     width: auto;
@@ -5073,10 +5170,11 @@ body::after {
     </div>
     <div class="compose-bar" id="compose-bar" style="display:none">
       <div class="compose-row">
-        <input type="file" id="file-input" accept="image/*,video/*,audio/*" style="display:none">
+        <input type="file" id="file-input" style="display:none">
         <button class="attach-btn" id="attach-btn" title="Attach media" aria-label="Attach media">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
         </button>
+        <button class="gif-compose-btn" id="compose-gif-btn" type="button" title="Search GIFs" aria-label="Search GIFs" aria-expanded="false" aria-controls="compose-gif-panel">GIF</button>
         <button class="emoji-compose-btn" id="compose-emoji-btn" type="button" title="Insert emoji" aria-label="Insert emoji" aria-expanded="false" aria-controls="compose-emoji-panel">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M8 14s1.5 2 4 2 4-2 4-2"/><line x1="9" y1="9" x2="9.01" y2="9"/><line x1="15" y1="9" x2="15.01" y2="9"/></svg>
         </button>
@@ -5086,6 +5184,7 @@ body::after {
         </button>
       </div>
       <div class="emoji-full-panel compose-emoji-panel" id="compose-emoji-panel" role="dialog" aria-label="Emoji picker"></div>
+      <div class="gif-compose-panel" id="compose-gif-panel" role="dialog" aria-label="GIF picker"></div>
     </div>
   </div>
 </div>
@@ -5239,6 +5338,8 @@ body::after {
   const $messagesArea = document.getElementById('messages-area');
   const $composeBar = document.getElementById('compose-bar');
   const $composeInput = document.getElementById('compose-input');
+  const $composeGifBtn = document.getElementById('compose-gif-btn');
+  const $composeGifPanel = document.getElementById('compose-gif-panel');
   const $composeEmojiBtn = document.getElementById('compose-emoji-btn');
   const $composeEmojiPanel = document.getElementById('compose-emoji-panel');
   const $sendBtn = document.getElementById('send-btn');
@@ -7106,8 +7207,10 @@ body::after {
     if (!activeConversation) {
       $composeInput.disabled = false;
       if ($composeEmojiBtn) $composeEmojiBtn.disabled = false;
+      if ($composeGifBtn) $composeGifBtn.disabled = composeSendInFlight;
       $attachBtn.disabled = composeSendInFlight;
       $attachBtn.title = 'Attach media';
+      if ($composeGifBtn) $composeGifBtn.title = 'Search GIFs';
       return;
     }
 
@@ -7115,12 +7218,20 @@ body::after {
     const canSendMedia = conversationSupportsMediaOutbound(activeConversation);
     $composeInput.disabled = !canSend;
     if ($composeEmojiBtn) $composeEmojiBtn.disabled = !canSend;
+    if ($composeGifBtn) $composeGifBtn.disabled = composeSendInFlight || !canSendMedia;
     $attachBtn.disabled = composeSendInFlight || !canSendMedia;
     $attachBtn.title = canSendMedia
       ? 'Attach media'
       : (sourcePlatformOf(activeConversation) === 'whatsapp'
         ? 'Reconnect WhatsApp to send attachments on this route'
         : 'Attachments unavailable on this route');
+    if ($composeGifBtn) {
+      $composeGifBtn.title = canSendMedia
+        ? 'Search GIFs'
+        : (sourcePlatformOf(activeConversation) === 'whatsapp'
+          ? 'Reconnect WhatsApp to send GIFs on this route'
+          : 'GIFs unavailable on this route');
+    }
     $composeInput.placeholder = canSend ? 'Write a message...' : routeUnavailablePlaceholder(activeConversation);
     if (!canSendMedia && pendingFile) {
       clearAttachment();
@@ -7130,6 +7241,9 @@ body::after {
     }
     if (!canSend) {
       closeComposeEmojiPanel();
+    }
+    if (!canSendMedia) {
+      closeComposeGifPanel();
     }
     autoResize();
   }
@@ -9673,13 +9787,14 @@ body::after {
     if ($composeEmojiBtn) $composeEmojiBtn.setAttribute('aria-expanded', 'false');
   }
 
-  function toggleComposeEmojiPanel() {
-    if (!$composeEmojiPanel || !$composeEmojiBtn) return;
-    buildComposeEmojiPanel();
-    const willOpen = !$composeEmojiPanel.classList.contains('show');
-    document.querySelectorAll('.emoji-picker.show').forEach(p => p.classList.remove('show'));
-    document.querySelectorAll('.emoji-full-panel.show').forEach(p => {
-      if (p !== $composeEmojiPanel) p.classList.remove('show');
+	  function toggleComposeEmojiPanel() {
+	    if (!$composeEmojiPanel || !$composeEmojiBtn) return;
+	    buildComposeEmojiPanel();
+	    const willOpen = !$composeEmojiPanel.classList.contains('show');
+	    closeComposeGifPanel();
+	    document.querySelectorAll('.emoji-picker.show').forEach(p => p.classList.remove('show'));
+	    document.querySelectorAll('.emoji-full-panel.show').forEach(p => {
+	      if (p !== $composeEmojiPanel) p.classList.remove('show');
     });
     $composeEmojiPanel.classList.toggle('show', willOpen);
     $composeEmojiBtn.setAttribute('aria-expanded', willOpen ? 'true' : 'false');
@@ -9706,14 +9821,211 @@ body::after {
     $composeInput.focus();
   }
 
-  if ($composeEmojiBtn) {
-    $composeEmojiBtn.addEventListener('click', (event) => {
-      event.stopPropagation();
-      toggleComposeEmojiPanel();
-    });
-  }
+	  if ($composeEmojiBtn) {
+	    $composeEmojiBtn.addEventListener('click', (event) => {
+	      event.stopPropagation();
+	      toggleComposeEmojiPanel();
+	    });
+	  }
 
-  if ($threadSearchInput) {
+	  let gifSearchTimeout = null;
+	  let gifSearchRequestID = 0;
+	  let gifSending = false;
+
+	  function buildComposeGifPanel() {
+	    if (!$composeGifPanel || $composeGifPanel.dataset.hydrated === 'true') return;
+	    $composeGifPanel.innerHTML = `
+	      <div class="gif-search">
+	        <input type="text" id="compose-gif-search" placeholder="Search GIFs..." aria-label="Search GIFs" autocomplete="off">
+	      </div>
+	      <div class="gif-status" id="compose-gif-status"></div>
+	      <div class="gif-grid" id="compose-gif-grid" aria-live="polite"></div>
+	    `;
+	    $composeGifPanel.dataset.hydrated = 'true';
+	    const search = document.getElementById('compose-gif-search');
+	    if (search) {
+	      search.addEventListener('input', () => {
+	        if (gifSearchTimeout) clearTimeout(gifSearchTimeout);
+	        gifSearchTimeout = setTimeout(() => {
+	          loadComposeGifs(search.value).catch(err => console.error('GIF search failed:', err));
+	        }, 250);
+	      });
+	    }
+	  }
+
+	  function closeComposeGifPanel() {
+	    if (!$composeGifPanel) return;
+	    $composeGifPanel.classList.remove('show');
+	    if ($composeGifBtn) $composeGifBtn.setAttribute('aria-expanded', 'false');
+	  }
+
+	  function toggleComposeGifPanel() {
+	    if (!$composeGifPanel || !$composeGifBtn) return;
+	    if (!conversationSupportsMediaOutbound(activeConversation)) {
+	      showThreadFeedback('GIFs are unavailable on this route right now.');
+	      return;
+	    }
+	    buildComposeGifPanel();
+	    const willOpen = !$composeGifPanel.classList.contains('show');
+	    closeComposeEmojiPanel();
+	    document.querySelectorAll('.emoji-picker.show').forEach(p => p.classList.remove('show'));
+	    document.querySelectorAll('.emoji-full-panel.show').forEach(p => p.classList.remove('show'));
+	    $composeGifPanel.classList.toggle('show', willOpen);
+	    $composeGifBtn.setAttribute('aria-expanded', willOpen ? 'true' : 'false');
+	    if (willOpen) {
+	      const input = document.getElementById('compose-gif-search');
+	      if (input) input.focus();
+	      if ($composeGifPanel.dataset.loaded !== 'true') {
+	        loadComposeGifs('').catch(err => console.error('GIF search failed:', err));
+	      }
+	    }
+	  }
+
+	  async function loadComposeGifs(query) {
+	    if (!$composeGifPanel) return;
+	    const requestID = ++gifSearchRequestID;
+	    const trimmed = String(query || '').trim();
+	    const status = document.getElementById('compose-gif-status');
+	    const grid = document.getElementById('compose-gif-grid');
+	    if (!status || !grid) return;
+	    status.hidden = false;
+	    status.textContent = 'Loading GIFs...';
+	    grid.innerHTML = '';
+
+	    const endpoint = trimmed
+	      ? `/api/gifs?q=${encodeURIComponent(trimmed)}&limit=32`
+	      : '/api/gifs/trending?limit=32';
+	    try {
+	      const payload = await fetchJSON(endpoint);
+	      if (requestID !== gifSearchRequestID) return;
+	      const results = Array.isArray(payload) ? payload : (payload.results || []);
+	      renderComposeGifs(results);
+	      $composeGifPanel.dataset.loaded = 'true';
+	    } catch (err) {
+	      if (requestID !== gifSearchRequestID) return;
+	      status.hidden = false;
+	      status.textContent = 'GIF search failed.';
+	      throw err;
+	    }
+	  }
+
+	  function renderComposeGifs(results) {
+	    const status = document.getElementById('compose-gif-status');
+	    const grid = document.getElementById('compose-gif-grid');
+	    if (!status || !grid) return;
+	    grid.innerHTML = '';
+	    if (!Array.isArray(results) || results.length === 0) {
+	      status.hidden = false;
+	      status.textContent = 'No GIFs found.';
+	      return;
+	    }
+	    status.hidden = true;
+	    results.forEach(result => {
+	      if (!result || !result.preview_url || !result.url) return;
+	      const btn = document.createElement('button');
+	      btn.type = 'button';
+	      btn.className = 'gif-tile';
+	      const title = result.title || 'GIF';
+	      btn.title = title;
+	      btn.setAttribute('aria-label', title);
+	      const img = document.createElement('img');
+	      img.src = result.preview_url;
+	      img.alt = title;
+	      img.loading = 'lazy';
+	      btn.appendChild(img);
+	      btn.addEventListener('click', () => {
+	        sendComposeGif(result).catch(err => console.error('Failed to send GIF:', err));
+	      });
+	      grid.appendChild(btn);
+	    });
+	    if (!grid.children.length) {
+	      status.hidden = false;
+	      status.textContent = 'No GIFs found.';
+	    }
+	  }
+
+	  async function sendComposeGif(result) {
+	    if (gifSending) return;
+	    if (!activeConversation || !activeConvoId) return;
+	    if (browserIsOffline()) {
+	      showThreadFeedback(offlineFeedbackMessage('send'), 'send');
+	      return;
+	    }
+	    if (!conversationSupportsMediaOutbound(activeConversation)) {
+	      showThreadFeedback('GIFs are unavailable on this route right now.');
+	      return;
+	    }
+	    if (pendingFile) {
+	      showThreadFeedback('Send or remove the current attachment before choosing a GIF.');
+	      return;
+	    }
+
+	    const sendConvoId = activeConvoId;
+	    const sendConversation = activeConversation;
+	    const activePlatform = sourcePlatformOf(sendConversation);
+	    const text = $composeInput.value.trim();
+	    const originalText = $composeInput.value;
+	    const supportsMediaCaption = activePlatform === 'whatsapp' || activePlatform === 'signal';
+
+	    clearThreadFeedback();
+	    gifSending = true;
+	    $composeInput.value = '';
+	    composeTextByConversation.delete(sendConvoId);
+	    autoResize();
+
+	    try {
+	      const payload = {
+	        conversation_id: sendConvoId,
+	        url: result.url,
+	      };
+	      if (supportsMediaCaption && text) payload.caption = text;
+	      if (supportsMediaCaption && replyToMsg) payload.reply_to_id = replyToMsg.MessageID;
+	      await postJSON('/api/send-gif', payload);
+
+	      if (text && !supportsMediaCaption) {
+	        const textPayload = {
+	          conversation_id: sendConvoId,
+	          message: text,
+	        };
+	        if (replyToMsg) textPayload.reply_to_id = replyToMsg.MessageID;
+	        await postJSON('/api/send', textPayload);
+	      }
+
+	      closeComposeGifPanel();
+	      clearReply();
+	      if (activeConvoId === sendConvoId) {
+	        if (threadSearchMode === 'centered') {
+	          clearThreadSearchUI();
+	          resetLoadedThreadState();
+	          await loadMessages(sendConvoId, {reset: true, forceBottom: true});
+	        } else {
+	          await loadMessages(sendConvoId, {poll: true, forceBottom: true});
+	        }
+	      }
+	      await loadConversations();
+	    } catch (err) {
+	      if (text) {
+	        if (activeConvoId === sendConvoId) {
+	          $composeInput.value = originalText;
+	        }
+	        rememberComposeText(sendConvoId, originalText);
+	      }
+	      showThreadFeedback(err.message || 'Failed to send GIF', 'send');
+	      throw err;
+	    } finally {
+	      gifSending = false;
+	      autoResize();
+	    }
+	  }
+
+	  if ($composeGifBtn) {
+	    $composeGifBtn.addEventListener('click', (event) => {
+	      event.stopPropagation();
+	      toggleComposeGifPanel();
+	    });
+	  }
+
+	  if ($threadSearchInput) {
     $threadSearchInput.addEventListener('input', scheduleThreadSearch);
     $threadSearchInput.addEventListener('keydown', async (event) => {
       if (event.key === 'Enter') {
@@ -9771,22 +10083,61 @@ body::after {
     autoResize();
   }
 
-  // Paste handler: Ctrl+V / Cmd+V with image data
-  $composeInput.addEventListener('paste', e => {
-    const items = e.clipboardData?.items;
-    if (!items) return;
+	  // Paste handler: Ctrl+V / Cmd+V with image data
+	  $composeInput.addEventListener('paste', e => {
+	    const items = e.clipboardData?.items;
+	    if (!items) return;
     for (const item of items) {
       if (item.kind === 'file' && item.type.startsWith('image/')) {
         e.preventDefault();
         const file = item.getAsFile();
         if (file) setAttachment(file);
         return;
-      }
-    }
-  });
+	      }
+	    }
+	  });
 
-  // File picker button
-  $attachBtn.addEventListener('click', () => {
+	  let composeDragDepth = 0;
+
+	  function dragEventHasFiles(event) {
+	    const types = event.dataTransfer?.types;
+	    return !!types && Array.from(types).includes('Files');
+	  }
+
+	  function setComposeDragOver(active) {
+	    if (!$composeBar) return;
+	    $composeBar.classList.toggle('drag-over', !!active);
+	  }
+
+	  if ($composeBar) {
+	    $composeBar.addEventListener('dragenter', event => {
+	      if (!dragEventHasFiles(event)) return;
+	      event.preventDefault();
+	      composeDragDepth += 1;
+	      setComposeDragOver(true);
+	    });
+	    $composeBar.addEventListener('dragover', event => {
+	      if (!dragEventHasFiles(event)) return;
+	      event.preventDefault();
+	      event.dataTransfer.dropEffect = conversationSupportsMediaOutbound(activeConversation) ? 'copy' : 'none';
+	    });
+	    $composeBar.addEventListener('dragleave', event => {
+	      if (!dragEventHasFiles(event)) return;
+	      composeDragDepth = Math.max(0, composeDragDepth - 1);
+	      if (composeDragDepth === 0) setComposeDragOver(false);
+	    });
+	    $composeBar.addEventListener('drop', event => {
+	      if (!dragEventHasFiles(event)) return;
+	      event.preventDefault();
+	      composeDragDepth = 0;
+	      setComposeDragOver(false);
+	      const file = event.dataTransfer?.files?.[0];
+	      if (file) setAttachment(file);
+	    });
+	  }
+
+	  // File picker button
+	  $attachBtn.addEventListener('click', () => {
     if (!conversationSupportsMediaOutbound(activeConversation)) {
       showThreadFeedback('Attachments are unavailable on this route right now.');
       return;
@@ -10703,10 +11054,11 @@ body::after {
   }
 
   // ─── Reactions ───
-  window.sendReaction = async function(messageId, emoji) {
-    // Close pickers
-    document.querySelectorAll('.emoji-picker.show').forEach(p => p.classList.remove('show'));
-    document.querySelectorAll('.emoji-full-panel.show').forEach(p => p.classList.remove('show'));
+	  window.sendReaction = async function(messageId, emoji) {
+	    // Close pickers
+	    document.querySelectorAll('.emoji-picker.show').forEach(p => p.classList.remove('show'));
+	    document.querySelectorAll('.emoji-full-panel.show').forEach(p => p.classList.remove('show'));
+	    closeComposeGifPanel();
     try {
       await postJSON('/api/react', {
         message_id: messageId,
@@ -10781,12 +11133,13 @@ body::after {
   };
 
   // Close react picker and full panel when clicking elsewhere
-  document.addEventListener('click', (e) => {
-    if (!e.target.closest('.emoji-picker') && !e.target.closest('.emoji-full-panel') && !e.target.closest('.msg-actions') && !e.target.closest('#compose-emoji-btn')) {
-      document.querySelectorAll('.emoji-picker.show').forEach(p => p.classList.remove('show'));
-      document.querySelectorAll('.emoji-full-panel.show').forEach(p => p.classList.remove('show'));
-      if ($composeEmojiBtn) $composeEmojiBtn.setAttribute('aria-expanded', 'false');
-    }
+	  document.addEventListener('click', (e) => {
+	    if (!e.target.closest('.emoji-picker') && !e.target.closest('.emoji-full-panel') && !e.target.closest('.gif-compose-panel') && !e.target.closest('.msg-actions') && !e.target.closest('#compose-emoji-btn') && !e.target.closest('#compose-gif-btn')) {
+	      document.querySelectorAll('.emoji-picker.show').forEach(p => p.classList.remove('show'));
+	      document.querySelectorAll('.emoji-full-panel.show').forEach(p => p.classList.remove('show'));
+	      if ($composeEmojiBtn) $composeEmojiBtn.setAttribute('aria-expanded', 'false');
+	      closeComposeGifPanel();
+	    }
     if ($threadSearchResults && !$threadSearchResults.hidden && !e.target.closest('.thread-search')) {
       clearThreadSearchResults();
     }
@@ -10920,12 +11273,13 @@ body::after {
     $replyIndicator.classList.remove('show');
   }
 
-  function clearTransientComposerState() {
-    clearReply();
-    if (pendingFile) {
-      clearAttachment();
-    }
-  }
+	  function clearTransientComposerState() {
+	    clearReply();
+	    if (pendingFile) {
+	      clearAttachment();
+	    }
+	    closeComposeGifPanel();
+	  }
 
   $replyClose.addEventListener('click', clearReply);
 
@@ -11060,6 +11414,7 @@ body::after {
       // Close fullscreen image viewer if open
       const fullscreen = document.querySelector('.msg-image-fullscreen');
       if (fullscreen) { fullscreen.remove(); return; }
+      if ($composeGifPanel && $composeGifPanel.classList.contains('show')) { closeComposeGifPanel(); return; }
       // Close any open emoji pickers or full panels
       const openPanels = document.querySelectorAll('.emoji-full-panel.show');
       if (openPanels.length) {

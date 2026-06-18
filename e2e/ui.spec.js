@@ -867,6 +867,61 @@ test('sends a captioned Signal image as one message, not two', async ({ page }) 
   }
 });
 
+test('sends a GIF through the compose picker', async ({ page }) => {
+  const caption = `GIF caption ${Date.now()}`;
+  let sendGIFPayload = null;
+  await page.route(/\/api\/gifs(?:\/trending)?\?/, async route => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        results: [{
+          title: 'Wave',
+          preview_url: 'data:image/gif;base64,R0lGODlhAQABAAAAACwAAAAAAQABAAA=',
+          url: 'https://media.klipy.com/fake/wave.gif',
+          mime_type: 'image/gif',
+          width: 1,
+          height: 1,
+        }],
+      }),
+    });
+  });
+  await page.route('**/api/send-gif', async route => {
+    sendGIFPayload = JSON.parse(route.request().postData() || '{}');
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ status: 'SUCCESS', success: true }),
+    });
+  });
+
+  await openConversation(page, 'Taylor Price');
+  await expect(page.locator('#chat-header-source')).toContainText('Signal');
+  await page.locator('#compose-input').fill(caption);
+  await page.locator('#compose-gif-btn').click();
+  await expect(page.locator('#compose-gif-panel.show')).toBeVisible();
+  await page.locator('#compose-gif-panel .gif-tile').first().click();
+
+  await expect.poll(() => sendGIFPayload).not.toBeNull();
+  expect(sendGIFPayload.conversation_id).toContain('signal:');
+  expect(sendGIFPayload.url).toBe('https://media.klipy.com/fake/wave.gif');
+  expect(sendGIFPayload.caption).toBe(caption);
+});
+
+test('accepts dropped files in the compose box', async ({ page }) => {
+  await openConversation(page, 'Taylor Price');
+  await page.locator('#compose-bar').evaluate((composeBar) => {
+    const dataTransfer = new DataTransfer();
+    dataTransfer.items.add(new File(['hello from drop'], 'dropped-note.txt', { type: 'text/plain' }));
+    const event = new Event('drop', { bubbles: true, cancelable: true });
+    Object.defineProperty(event, 'dataTransfer', { value: dataTransfer });
+    composeBar.dispatchEvent(event);
+  });
+
+  await expect(page.locator('#attach-preview')).toHaveClass(/active/);
+  await expect(page.locator('#attach-name')).toHaveText('dropped-note.txt');
+});
+
 test('keeps the active thread pinned to the bottom after sending', async ({ page }) => {
   const outbound = `Bottom send ${Date.now()}`;
 
