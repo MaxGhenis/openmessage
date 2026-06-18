@@ -352,9 +352,6 @@ func (a *App) setClient(cli *client.Client) {
 }
 
 func (a *App) LoadAndConnect() error {
-	// A fresh load/connect (including right after re-pairing) starts from a
-	// clean slate; don't carry a prior session's stuck-send state forward.
-	a.ClearGoogleRepairFlag()
 	sessionData, err := client.LoadSession(a.SessionPath)
 	if err != nil {
 		a.setGoogleLastError(err.Error())
@@ -428,13 +425,38 @@ func (a *App) LoadAndConnect() error {
 
 	if err := cli.GM.Connect(); err != nil {
 		a.setGoogleLastError(err.Error())
+		// A 401/UNAUTHENTICATED on connect or token refresh means the session
+		// is genuinely dead — the phone unlinked this device. Retrying can't
+		// recover it, so flag it for re-pair (the reconnect watchdog backs off
+		// on this, and the UI surfaces a "Re-pair" banner) instead of looping
+		// "reconnecting…" forever with a bare 401 the user can't act on.
+		if isGoogleAuthInvalid(err) {
+			a.googleNeedsRepair.Store(true)
+		}
 		return fmt.Errorf("connect: %w", err)
 	}
+	// A clean connect proves the session is alive; clear any prior stuck/dead
+	// state (also covers the path right after re-pairing).
+	a.ClearGoogleRepairFlag()
 	a.Connected.Store(true)
 	a.setGoogleLastError("")
 	a.emitStatusChange(true)
 	a.Logger.Info().Msg("Connected to Google Messages")
 	return nil
+}
+
+// isGoogleAuthInvalid reports whether a Google Messages connect/refresh error
+// means the stored credentials are dead (re-pair required) rather than a
+// transient network failure (reconnect will recover).
+func isGoogleAuthInvalid(err error) bool {
+	if err == nil {
+		return false
+	}
+	m := strings.ToLower(err.Error())
+	return strings.Contains(m, "invalid authentication credentials") ||
+		strings.Contains(m, "unauthenticated") ||
+		strings.Contains(m, "http 401") ||
+		(strings.Contains(m, "refresh auth token") && strings.Contains(m, "401"))
 }
 
 // Unpair deletes the session file so the app can re-pair.
@@ -551,12 +573,18 @@ func (a *App) GoogleStatus() GoogleStatusSnapshot {
 	lastError := a.googleLastError
 	a.statusMu.Unlock()
 	connected := a.Connected.Load()
+	paired := a.GooglePaired()
 	return GoogleStatusSnapshot{
 		Connected:    connected,
-		Paired:       a.GooglePaired(),
-		NeedsPairing: !connected && !a.GooglePaired(),
-		NeedsRepair:  connected && a.googleNeedsRepair.Load(),
-		LastError:    lastError,
+		Paired:       paired,
+		NeedsPairing: !connected && !paired,
+		// needs_repair surfaces whenever the session is known-bad and a session
+		// file still exists — whether that's a zombie (connected, sends fail)
+		// or a dead-credentials disconnect (auth 401). Either way the fix is
+		// re-pair, not reconnect; gating on `connected` alone would hide the
+		// 401 case (which is disconnected).
+		NeedsRepair: paired && a.googleNeedsRepair.Load(),
+		LastError:   lastError,
 	}
 }
 

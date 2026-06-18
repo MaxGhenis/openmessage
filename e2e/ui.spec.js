@@ -1141,3 +1141,28 @@ test('a stuck Google session (connected + needs_repair) surfaces a re-pair banne
   await page.evaluate((s) => window.__openMessageTestHooks.applyAppStatus(s), healthy);
   await expect(page.locator('#connection-banner')).toBeHidden();
 });
+
+test('an auth-dead Google session (disconnected + needs_repair) shows Re-pair, not Reconnect', async ({ page }) => {
+  await page.waitForFunction(() => window.__openMessageTestHooks?.applyAppStatus);
+  // connected=false (the 401 case) but paired + needs_repair.
+  await page.evaluate(() => window.__openMessageTestHooks.applyAppStatus({
+    connected: false,
+    google: { connected: false, paired: true, needs_pairing: false, needs_repair: true },
+    whatsapp: { connected: true, paired: true },
+    signal: { connected: true, paired: true },
+    backfill: { running: false },
+  }));
+  await expect(page.locator('#connection-banner')).toBeVisible();
+  await expect(page.locator('#connection-banner-action')).toHaveText('Re-pair');
+  await expect(page.locator('#connection-banner-copy')).toContainText('unlinked OpenMessage');
+
+  // A plain disconnected (no needs_repair) still says Reconnect.
+  await page.evaluate(() => window.__openMessageTestHooks.applyAppStatus({
+    connected: false,
+    google: { connected: false, paired: true, needs_pairing: false, needs_repair: false },
+    whatsapp: { connected: true, paired: true },
+    signal: { connected: true, paired: true },
+    backfill: { running: false },
+  }));
+  await expect(page.locator('#connection-banner-action')).toHaveText('Reconnect');
+});

@@ -1,6 +1,7 @@
 package app
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -89,6 +90,11 @@ func TestDemoModeEnvParsing(t *testing.T) {
 
 func TestGoogleSendOutcomeRepairFlag(t *testing.T) {
 	a := &App{}
+	// A session file makes GooglePaired() true so NeedsRepair can surface.
+	a.SessionPath = filepath.Join(t.TempDir(), "session.json")
+	if err := os.WriteFile(a.SessionPath, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 
 	// Below threshold: not yet flagged.
 	a.RecordGoogleSendOutcome(false)
@@ -102,18 +108,26 @@ func TestGoogleSendOutcomeRepairFlag(t *testing.T) {
 		t.Fatalf("should flag after %d consecutive failures", googleRepairThreshold)
 	}
 
-	// Surfaced in status only while connected.
+	// Surfaces whenever paired — both the zombie (connected) and the
+	// dead-credentials (disconnected) cases, since the fix is re-pair either way.
 	a.Connected.Store(true)
 	if !a.GoogleStatus().NeedsRepair {
 		t.Fatal("connected + stuck should report needs_repair")
 	}
 	a.Connected.Store(false)
-	if a.GoogleStatus().NeedsRepair {
-		t.Fatal("needs_repair must not surface while disconnected (normal pairing flow handles that)")
+	if !a.GoogleStatus().NeedsRepair {
+		t.Fatal("needs_repair must still surface while disconnected (auth-dead session)")
 	}
 
+	// Not surfaced when there's no session at all (the normal pairing flow).
+	prev := a.SessionPath
+	a.SessionPath = filepath.Join(t.TempDir(), "missing.json")
+	if a.GoogleStatus().NeedsRepair {
+		t.Fatal("needs_repair must not surface when unpaired")
+	}
+	a.SessionPath = prev
+
 	// A single success clears it.
-	a.Connected.Store(true)
 	a.RecordGoogleSendOutcome(true)
 	if a.googleNeedsRepair.Load() || a.GoogleStatus().NeedsRepair {
 		t.Fatal("a successful send must clear the repair flag")
@@ -123,5 +137,26 @@ func TestGoogleSendOutcomeRepairFlag(t *testing.T) {
 	a.RecordGoogleSendOutcome(false)
 	if a.googleNeedsRepair.Load() {
 		t.Fatal("one failure after a success must not immediately re-flag")
+	}
+}
+
+func TestIsGoogleAuthInvalid(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"the real 401", errors.New("connect: failed to refresh auth token: HTTP 401: 16: Request had invalid authentication credentials."), true},
+		{"unauthenticated", errors.New("rpc error: code = Unauthenticated desc = ..."), true},
+		{"transient network", errors.New("dial tcp: i/o timeout"), false},
+		{"unrelated 500", errors.New("HTTP 500 internal server error"), false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := isGoogleAuthInvalid(c.err); got != c.want {
+				t.Fatalf("isGoogleAuthInvalid(%v) = %v, want %v", c.err, got, c.want)
+			}
+		})
 	}
 }

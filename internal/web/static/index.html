@@ -8276,7 +8276,15 @@ body::after {
     }
     $connectionBanner.className = 'connection-banner disconnected';
     $connectionBanner.style.display = 'flex';
-    if (googleStatus.paired && !googleStatus.needs_pairing) {
+    if (googleStatus.paired && googleStatus.needs_repair) {
+      // Disconnected because the credentials are dead (auth 401) — reconnect
+      // won't recover it, so steer to re-pair rather than a "Reconnect" that
+      // just 401s again.
+      $connectionBannerCopy.textContent = 'Google Messages disconnected — your phone unlinked OpenMessage. Re-pair to fix it.';
+      $connectionBannerAction.textContent = 'Re-pair';
+      $connectionBannerAction.dataset.action = 'open-platforms';
+      $connectionBannerAction.style.display = '';
+    } else if (googleStatus.paired && !googleStatus.needs_pairing) {
       $connectionBannerCopy.textContent = 'Google Messages sync is paused';
       $connectionBannerAction.textContent = 'Reconnect';
       $connectionBannerAction.dataset.action = 'reconnect-google';

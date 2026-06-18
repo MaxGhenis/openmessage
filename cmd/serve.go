@@ -214,7 +214,11 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 			defer ticker.Stop()
 			for range ticker.C {
 				g := a.GoogleStatus()
-				if !g.Paired || g.Connected || g.NeedsPairing {
+				// Skip reconnect when the credentials are dead (NeedsRepair):
+				// retrying a 401'd session just spams the log every 15s and
+				// never recovers. The UI shows a "Re-pair" banner instead; a
+				// successful re-pair clears the flag and reconnect resumes.
+				if !g.Paired || g.Connected || g.NeedsPairing || g.NeedsRepair {
 					continue
 				}
 				logger.Info().Msg("Google Messages disconnected — attempting reconnect")
