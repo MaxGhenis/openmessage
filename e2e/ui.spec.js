@@ -653,6 +653,26 @@ test('centers the compose card in the bottom input layer', async ({ page }) => {
   expect(Math.abs(gaps.top - gaps.bottom)).toBeLessThanOrEqual(2);
 });
 
+test('keeps compose tool buttons tightly grouped', async ({ page }) => {
+  await openConversation(page, 'Sarah Chen');
+
+  const gaps = await page.evaluate(() => {
+    const rectFor = (selector) => document.querySelector(selector).getBoundingClientRect();
+    const attach = rectFor('#attach-btn');
+    const gif = rectFor('#compose-gif-btn');
+    const emoji = rectFor('#compose-emoji-btn');
+    const input = rectFor('#compose-input');
+    return {
+      attachToGif: gif.left - attach.right,
+      gifToEmoji: emoji.left - gif.right,
+      emojiToInput: input.left - emoji.right,
+    };
+  });
+  expect(gaps.attachToGif).toBeLessThanOrEqual(5);
+  expect(gaps.gifToEmoji).toBeLessThanOrEqual(5);
+  expect(gaps.emojiToInput).toBeGreaterThanOrEqual(8);
+});
+
 test('hydrates cached Google contact photos into avatars', async ({ page, request }) => {
   await request.post('/_e2e/avatar', {
     data: {
