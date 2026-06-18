@@ -88,12 +88,22 @@ func TestGIFSearchEndpointRequiresKlipyAPIKey(t *testing.T) {
 	t.Setenv("OPENMESSAGES_KLIPY_API_KEY", "")
 	t.Setenv("KLIPY_API_KEY", "")
 
-	results, err := searchKlipyGIFs(context.Background(), "thumbs up", 5)
-	if err == nil {
-		t.Fatalf("expected missing API key error, got results: %#v", results)
+	ts := newTestServer(t)
+	resp, err := http.Get(ts.server.URL + "/api/gifs?q=thumbs%20up&limit=5")
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !strings.Contains(err.Error(), "OPENMESSAGES_KLIPY_API_KEY") {
-		t.Fatalf("error = %q, want setup hint", err.Error())
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNotImplemented {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 501: %s", resp.StatusCode, string(raw))
+	}
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), "OPENMESSAGES_KLIPY_API_KEY") {
+		t.Fatalf("body = %q, want setup hint", string(raw))
 	}
 }
 

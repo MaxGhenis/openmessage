@@ -1182,6 +1182,10 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		limit := queryIntClamped(r, "limit", defaultGIFSearchLimit, maxGIFSearchResults)
 		results, err := searchKlipyGIFs(r.Context(), r.URL.Query().Get("q"), limit)
 		if err != nil {
+			if errors.Is(err, errGIFProviderNotConfigured) {
+				httpError(w, err.Error(), 501)
+				return
+			}
 			httpError(w, err.Error(), 502)
 			return
 		}
@@ -1199,6 +1203,10 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		limit := queryIntClamped(r, "limit", defaultGIFSearchLimit, maxGIFSearchResults)
 		results, err := searchKlipyGIFs(r.Context(), defaultGIFSearchQuery, limit)
 		if err != nil {
+			if errors.Is(err, errGIFProviderNotConfigured) {
+				httpError(w, err.Error(), 501)
+				return
+			}
 			httpError(w, err.Error(), 502)
 			return
 		}

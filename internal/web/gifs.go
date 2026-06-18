@@ -25,8 +25,9 @@ const (
 )
 
 var (
-	klipySearchEndpoint = "https://api.klipy.com/v2/search"
-	gifHTTPClient       = &http.Client{Timeout: 15 * time.Second}
+	errGIFProviderNotConfigured = errors.New("GIF search is not configured; set OPENMESSAGES_KLIPY_API_KEY")
+	klipySearchEndpoint         = "https://api.klipy.com/v2/search"
+	gifHTTPClient               = &http.Client{Timeout: 15 * time.Second}
 )
 
 type gifSearchResult struct {
@@ -69,7 +70,7 @@ func searchKlipyGIFs(ctx context.Context, query string, limit int) ([]gifSearchR
 	}
 	apiKey := klipyAPIKey()
 	if apiKey == "" {
-		return nil, errors.New("GIF search is not configured; set OPENMESSAGES_KLIPY_API_KEY")
+		return nil, errGIFProviderNotConfigured
 	}
 
 	endpoint, err := url.Parse(klipySearchEndpoint)
