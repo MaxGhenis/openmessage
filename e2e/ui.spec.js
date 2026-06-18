@@ -526,6 +526,7 @@ test('inserts emoji into the compose message', async ({ page }) => {
 
   await page.locator('#compose-emoji-btn').click();
   await expect(page.locator('#compose-emoji-panel')).toHaveClass(/show/);
+  await expect.poll(async () => page.locator('#compose-emoji-grid').evaluate((grid) => grid.scrollWidth <= grid.clientWidth + 1)).toBeTruthy();
   await page.locator('#compose-emoji-panel .emoji-grid button').filter({ hasText: '🎉' }).first().click();
 
   await expect(page.locator('#compose-input')).toHaveValue('🎉');
