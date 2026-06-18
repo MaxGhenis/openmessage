@@ -74,7 +74,8 @@ Key facts:
    `~/.local/share/openmessage/session.json` (else migration copies the old one
    back). Other platforms' sessions (`whatsapp-session.db`, `signal-cli/`) are
    independent — leave them.
-3. The embedded Google sign-in inside `PairingView` is **blocked by Google**
+3. **Clear the stale session FIRST (don't skip).** Running `pair --google` while a dead `session.json` is still in the data dir floods the pairing with `failed to decrypt data event: HMAC mismatch` and yields a new session that 401s on token refresh **immediately** (dead on arrival). Removing both `session.json` files (step 2) before pairing is what produces a healthy session that connects *and* syncs (`/api/status` freshness `behind_days` drops to 0). Some HMAC-mismatch lines are normal noise (events from the phone's own session the pairing client can't read) — the tell for a bad pair is an immediate post-pair 401, not the noise itself.
+4. The embedded Google sign-in inside `PairingView` is **blocked by Google**
    ("sign-in not allowed in this app") and dead-ends in Google's troubleshooter.
    Use the **cookie method** instead — extract Google cookies from the user's
    signed-in Chrome and run:
@@ -97,7 +98,7 @@ Key facts:
 4. `pair --google` prints `EMOJI: <emoji>`. The user taps that emoji in Google
    Messages **on the phone** (notification shade, or profile → Device pairing)
    to confirm. The Gaia client init can time out once — just retry.
-5. On confirmation the session saves to the app dir; relaunch the app and sends
+6. On confirmation the session saves to the app dir; relaunch the app and sends
    work. Wipe the cookie file afterwards.
 
 ### Don't over-reconnect
