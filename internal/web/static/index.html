@@ -8193,7 +8193,7 @@ body::after {
           html += `<div class="msg-reply-preview" data-reply-id="${escapeHtml(m.ReplyToID)}" onclick="scrollToMessage('${escapeHtml(m.ReplyToID)}')"><span class="reply-author">${escapeHtml(origName)}</span><span class="reply-body">${escapeHtml(truncBody)}</span></div>`;
         }
 
-        if (!m.IsFromMe && m.SenderName) {
+        if (activeConvoIsGroup && !m.IsFromMe && m.SenderName) {
           html += `<div class="msg-sender" style="color:${avatarColor(m.SenderName)}">${escapeHtml(m.SenderName)}</div>`;
         }
         if (showMixedSourceChips) {

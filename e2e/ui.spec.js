@@ -71,6 +71,15 @@ test('loads the seeded conversation list and thread view', async ({ page }) => {
   await expect(page.locator('#compose-input')).toBeVisible();
 });
 
+test('shows sender labels only in group conversations', async ({ page }) => {
+  await openConversation(page, 'Sarah Chen');
+  await expect(page.locator('#messages-area .msg-sender')).toHaveCount(0);
+
+  await openConversation(page, 'Weekend Hiking Group');
+  await expect(page.locator('#messages-area .msg-sender').filter({ hasText: 'Emily Park' }).first()).toBeVisible();
+  await expect(page.locator('#messages-area .msg-sender').filter({ hasText: 'David Kim' }).first()).toBeVisible();
+});
+
 test('does not show stale messages when a selected thread fails to load', async ({ page }) => {
   await openConversation(page, 'Sarah Chen');
   await expect(page.locator('#messages-area')).toContainText('Hey! Are you free for dinner tonight?');
