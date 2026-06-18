@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"mime/multipart"
 	"net/http"
@@ -131,12 +132,41 @@ func TestListConversations(t *testing.T) {
 	}
 
 	// Add some conversations
-	ts.store.UpsertConversation(&db.Conversation{
+	if err := ts.store.UpsertConversation(&db.Conversation{
 		ConversationID: "c1", Name: "Alice", LastMessageTS: 200,
-	})
-	ts.store.UpsertConversation(&db.Conversation{
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := ts.store.UpsertConversation(&db.Conversation{
 		ConversationID: "c2", Name: "Bob", LastMessageTS: 100,
-	})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := ts.store.UpsertMessage(&db.Message{
+		MessageID:      "m1",
+		ConversationID: "c1",
+		Body:           "Older Alice preview",
+		TimestampMS:    100,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := ts.store.UpsertMessage(&db.Message{
+		MessageID:      "m2",
+		ConversationID: "c1",
+		Body:           "Latest Alice preview",
+		TimestampMS:    200,
+		IsFromMe:       true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := ts.store.UpsertMessage(&db.Message{
+		MessageID:      "m3",
+		ConversationID: "c2",
+		Body:           "Bob received preview",
+		TimestampMS:    100,
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	resp2, err := http.Get(ts.server.URL + "/api/conversations")
 	if err != nil {
@@ -154,6 +184,12 @@ func TestListConversations(t *testing.T) {
 	// Should be ordered by last_message_ts DESC
 	if convos2[0].Name != "Alice" {
 		t.Fatalf("first conversation should be Alice (most recent), got %q", convos2[0].Name)
+	}
+	if got, want := convos2[0].LastMessagePreview, "You: Latest Alice preview"; got != want {
+		t.Fatalf("Alice preview = %q, want %q", got, want)
+	}
+	if got, want := convos2[1].LastMessagePreview, "Bob received preview"; got != want {
+		t.Fatalf("Bob preview = %q, want %q", got, want)
 	}
 }
 
@@ -723,6 +759,91 @@ func TestSearchRequiresQuery(t *testing.T) {
 
 	if resp.StatusCode != 400 {
 		t.Fatalf("got status %d, want 400", resp.StatusCode)
+	}
+}
+
+func TestConversationThreadSearchRoute(t *testing.T) {
+	ts := newTestServer(t)
+
+	for _, convID := range []string{"c1", "c2"} {
+		if err := ts.store.UpsertConversation(&db.Conversation{
+			ConversationID: convID,
+			Name:           convID,
+			LastMessageTS:  200,
+			SourcePlatform: "sms",
+		}); err != nil {
+			t.Fatalf("seed conversation %s: %v", convID, err)
+		}
+	}
+	for _, msg := range []*db.Message{
+		{MessageID: "m1", ConversationID: "c1", Body: "needle in this thread", TimestampMS: 100},
+		{MessageID: "m2", ConversationID: "c2", Body: "needle in other thread", TimestampMS: 200},
+	} {
+		if err := ts.store.UpsertMessage(msg); err != nil {
+			t.Fatalf("seed message %s: %v", msg.MessageID, err)
+		}
+	}
+
+	resp, err := http.Get(ts.server.URL + "/api/conversations/c1/search?q=needle&limit=10")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("got status %d, want 200", resp.StatusCode)
+	}
+	var got []db.Message
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].MessageID != "m1" {
+		t.Fatalf("got results %+v, want only m1", got)
+	}
+}
+
+func TestConversationMessagesAroundRoute(t *testing.T) {
+	ts := newTestServer(t)
+	conversationID := "signal-group:abc/def="
+	if err := ts.store.UpsertConversation(&db.Conversation{
+		ConversationID: conversationID,
+		Name:           "Group",
+		LastMessageTS:  500,
+		SourcePlatform: "signal",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for i := 1; i <= 5; i++ {
+		if err := ts.store.UpsertMessage(&db.Message{
+			MessageID:      fmt.Sprintf("m%d", i),
+			ConversationID: conversationID,
+			Body:           fmt.Sprintf("message %d", i),
+			TimestampMS:    int64(i * 100),
+			SourcePlatform: "signal",
+		}); err != nil {
+			t.Fatalf("seed message %d: %v", i, err)
+		}
+	}
+
+	resp, err := http.Get(ts.server.URL + "/api/conversations/" + url.PathEscape(conversationID) + "/messages-around?message_id=m3&before=1&after=1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("got status %d, want 200", resp.StatusCode)
+	}
+	var got []db.Message
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"m2", "m3", "m4"}
+	if len(got) != len(want) {
+		t.Fatalf("got %d messages, want %d", len(got), len(want))
+	}
+	for i, wantID := range want {
+		if got[i].MessageID != wantID {
+			t.Fatalf("result %d = %s, want %s", i, got[i].MessageID, wantID)
+		}
 	}
 }
 
@@ -1896,6 +2017,83 @@ func TestWhatsAppAvatarRouteReturns404WhenMissing(t *testing.T) {
 
 	if resp.StatusCode != 404 {
 		t.Fatalf("got status %d, want 404", resp.StatusCode)
+	}
+}
+
+func TestCachedContactAvatarRoute(t *testing.T) {
+	ts := newTestServer(t)
+	if err := ts.store.UpsertContactAvatar(db.ContactAvatarCandidate{
+		SourcePlatform: "sms",
+		ParticipantID:  "participant-1",
+		ContactID:      "contact-1",
+		PhoneNumber:    "+15551234567",
+		DisplayName:    "Alice",
+	}, []byte("avatar-bytes"), "image/png", "hash-1", time.Now().UnixMilli()); err != nil {
+		t.Fatalf("seed avatar: %v", err)
+	}
+
+	resp, err := http.Get(ts.server.URL + "/api/avatar?source=sms&contact_id=contact-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("got status %d, want 200", resp.StatusCode)
+	}
+	if got := resp.Header.Get("Content-Type"); got != "image/png" {
+		t.Fatalf("content-type = %q, want image/png", got)
+	}
+	if got := resp.Header.Get("ETag"); got != `"hash-1"` {
+		t.Fatalf("etag = %q, want hash-1", got)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) != "avatar-bytes" {
+		t.Fatalf("body = %q, want avatar-bytes", string(body))
+	}
+
+	req, err := http.NewRequest(http.MethodGet, ts.server.URL+"/api/avatar?source=sms&participant_id=participant-1", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("If-None-Match", `"hash-1"`)
+	resp2, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp2.Body.Close()
+	if resp2.StatusCode != http.StatusNotModified {
+		t.Fatalf("got status %d, want 304", resp2.StatusCode)
+	}
+}
+
+func TestPWAStaticAssets(t *testing.T) {
+	ts := newTestServer(t)
+
+	resp, err := http.Get(ts.server.URL + "/manifest.webmanifest")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("manifest status = %d, want 200", resp.StatusCode)
+	}
+	if got := resp.Header.Get("Content-Type"); !strings.HasPrefix(got, "application/manifest+json") {
+		t.Fatalf("manifest content-type = %q", got)
+	}
+
+	resp2, err := http.Get(ts.server.URL + "/sw.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp2.Body.Close()
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("service worker status = %d, want 200", resp2.StatusCode)
+	}
+	if got := resp2.Header.Get("Content-Type"); !strings.HasPrefix(got, "text/javascript") {
+		t.Fatalf("service worker content-type = %q", got)
 	}
 }
 

@@ -71,6 +71,15 @@ test('loads the seeded conversation list and thread view', async ({ page }) => {
   await expect(page.locator('#compose-input')).toBeVisible();
 });
 
+test('shows sender labels only in group conversations', async ({ page }) => {
+  await openConversation(page, 'Sarah Chen');
+  await expect(page.locator('#messages-area .msg-sender')).toHaveCount(0);
+
+  await openConversation(page, 'Weekend Hiking Group');
+  await expect(page.locator('#messages-area .msg-sender').filter({ hasText: 'Emily Park' }).first()).toBeVisible();
+  await expect(page.locator('#messages-area .msg-sender').filter({ hasText: 'David Kim' }).first()).toBeVisible();
+});
+
 test('does not show stale messages when a selected thread fails to load', async ({ page }) => {
   await openConversation(page, 'Sarah Chen');
   await expect(page.locator('#messages-area')).toContainText('Hey! Are you free for dinner tonight?');
@@ -392,6 +401,40 @@ test('renders clickable links with a social preview card', async ({ page, reques
   await expect(linkedMessage.locator('.msg-link-preview')).toContainText('Example');
 });
 
+test('shows latest message previews in sidebar rows', async ({ page, request }) => {
+  const now = Date.now();
+  const sarahPreview = `Sidebar sent preview ${now}`;
+  const jordanPreview = `Sidebar grouped preview ${now}`;
+  await request.post('/_e2e/messages', {
+    data: {
+      body: sarahPreview,
+      conversation_id: 'conv1',
+      is_from_me: true,
+      timestamp_ms: now + 1000,
+    },
+  });
+  await request.post('/_e2e/messages', {
+    data: {
+      body: jordanPreview,
+      conversation_id: 'conv10',
+      sender_name: 'Jordan Rivera',
+      sender_number: '+14155550199',
+      timestamp_ms: now + 2000,
+    },
+  });
+  await page.reload();
+
+  const sarahRow = page.locator('#conversation-list > .convo-item').filter({
+    has: page.locator('.convo-name').getByText('Sarah Chen', { exact: true }),
+  }).first();
+  await expect(sarahRow.locator('.convo-preview')).toHaveText(`You: ${sarahPreview}`);
+
+  const jordanRows = page.locator('#conversation-list > .convo-item').filter({
+    has: page.locator('.convo-name').getByText('Jordan Rivera', { exact: true }),
+  });
+  await expect(jordanRows.first().locator('.convo-preview')).toHaveText(jordanPreview);
+});
+
 test('coalesces duplicate direct chats into one sidebar row with route tabs in the thread header', async ({ page }) => {
   const jordanRows = page.locator('#conversation-list > .convo-item').filter({
     has: page.locator('.convo-name').getByText('Jordan Rivera', { exact: true }),
@@ -412,6 +455,124 @@ test('shows platform markers on avatars instead of direct-row text pills', async
 
   await expect(sarahRow.locator('.convo-avatar .avatar-platform-stack .platform-chip')).toHaveCount(1);
   await expect(sarahRow.locator('.convo-subline .platform-chip')).toHaveCount(0);
+});
+
+test('shows RCS route badge without a separate protocol status line', async ({ page }) => {
+  await openConversation(page, 'Sarah Chen');
+
+  await expect(page.locator('#chat-header-source')).toContainText('RCS');
+  await expect(page.locator('#chat-header-source')).not.toContainText('SMS');
+  await expect(page.locator('#chat-header-status')).not.toContainText('RCS');
+});
+
+test('opens contact details from the thread header name', async ({ page }) => {
+  await openConversation(page, 'Sarah Chen');
+
+  await page.locator('#chat-header-name').click();
+  await expect(page.locator('#contact-popover')).toBeVisible();
+  await expect(page.locator('#contact-popover')).toContainText('+14155551234');
+});
+
+test('searches only within the active thread', async ({ page }) => {
+  await openConversation(page, 'Sarah Chen');
+
+  await page.locator('#thread-search-input').fill('reservation');
+  await expect(page.locator('#thread-search-results .thread-search-result')).toHaveCount(1);
+  await expect(page.locator('#thread-search-results')).toContainText('reservation');
+
+  await page.locator('#thread-search-input').fill('Wrong Jordan');
+  await expect(page.locator('#thread-search-results')).toContainText('No matches in this thread');
+});
+
+test('keeps the thread header compact with actions after search', async ({ page }) => {
+  const readHeaderLayout = () => page.locator('#chat-header').evaluate((header) => {
+    const rectFor = (selector) => {
+      const el = header.querySelector(selector);
+      if (!el) throw new Error(`Missing ${selector}`);
+      const rect = el.getBoundingClientRect();
+      return {
+        left: rect.left,
+        right: rect.right,
+        top: rect.top,
+        bottom: rect.bottom,
+        height: rect.height,
+      };
+    };
+    const headerRect = header.getBoundingClientRect();
+    return {
+      header: { left: headerRect.left, right: headerRect.right, height: headerRect.height },
+      name: rectFor('#chat-header-name'),
+      source: rectFor('#chat-header-source'),
+      search: rectFor('.thread-search-input-wrap'),
+      notification: rectFor('#chat-header-notification-btn'),
+    };
+  });
+  const centerY = (rect) => rect.top + rect.height / 2;
+  const expectInsideHeader = (layout, rect) => {
+    expect(rect.left).toBeGreaterThanOrEqual(layout.header.left - 1);
+    expect(rect.right).toBeLessThanOrEqual(layout.header.right + 1);
+  };
+
+  await openConversation(page, 'Sarah Chen');
+  const layout = await readHeaderLayout();
+  expect(layout.header.height).toBeLessThanOrEqual(74);
+  expect(Math.abs(centerY(layout.name) - centerY(layout.source))).toBeLessThanOrEqual(12);
+  expect(layout.source.left).toBeGreaterThan(layout.name.right);
+  expect(layout.notification.left).toBeGreaterThan(layout.search.right);
+
+  await page.setViewportSize({ width: 920, height: 700 });
+  await page.reload();
+  await openConversation(page, 'Sarah Chen');
+  const mediumLayout = await readHeaderLayout();
+  for (const rect of [mediumLayout.name, mediumLayout.source, mediumLayout.search, mediumLayout.notification]) {
+    expectInsideHeader(mediumLayout, rect);
+  }
+  expect(mediumLayout.notification.left).toBeGreaterThan(mediumLayout.search.right);
+});
+
+test('inserts emoji into the compose message', async ({ page }) => {
+  await openConversation(page, 'Sarah Chen');
+
+  await page.locator('#compose-emoji-btn').click();
+  await expect(page.locator('#compose-emoji-panel')).toHaveClass(/show/);
+  await expect.poll(async () => page.locator('#compose-emoji-grid').evaluate((grid) => grid.scrollWidth <= grid.clientWidth + 1)).toBeTruthy();
+  await page.locator('#compose-emoji-panel .emoji-grid button').filter({ hasText: '🎉' }).first().click();
+
+  await expect(page.locator('#compose-input')).toHaveValue('🎉');
+  await expect(page.locator('#send-btn')).toBeEnabled();
+});
+
+test('centers the compose card in the bottom input layer', async ({ page }) => {
+  await openConversation(page, 'Sarah Chen');
+
+  const gaps = await page.evaluate(() => {
+    const pane = document.querySelector('.chat-pane').getBoundingClientRect();
+    const messages = document.querySelector('#messages-area').getBoundingClientRect();
+    const compose = document.querySelector('#compose-bar').getBoundingClientRect();
+    return {
+      top: compose.top - messages.bottom,
+      bottom: pane.bottom - compose.bottom,
+    };
+  });
+  expect(Math.abs(gaps.top - gaps.bottom)).toBeLessThanOrEqual(2);
+});
+
+test('hydrates cached Google contact photos into avatars', async ({ page, request }) => {
+  await request.post('/_e2e/avatar', {
+    data: {
+      source_platform: 'sms',
+      phone_number: '+14155551234',
+      display_name: 'Sarah Chen',
+      image_base64: 'R0lGODlhAQABAAAAACwAAAAAAQABAAA=',
+      image_hash: 'sarah-e2e-avatar',
+      mime_type: 'image/gif',
+    },
+  });
+  await page.reload();
+  await openConversation(page, 'Sarah Chen');
+
+  await expect(page.locator('#chat-header-avatar img')).toHaveAttribute('alt', 'Sarah Chen photo');
+  await expect(page.locator('#conversation-list .convo-item').filter({ hasText: 'Sarah Chen' }).first().locator('.convo-avatar img')).toHaveAttribute('alt', 'Sarah Chen photo');
 });
 
 test('switches routes from the thread header tabs while keeping the sidebar person-first', async ({ page }) => {
@@ -1144,4 +1305,29 @@ test('a stuck Google session (connected + needs_repair) surfaces a re-pair banne
   healthy.google.needs_repair = false;
   await page.evaluate((s) => window.__openMessageTestHooks.applyAppStatus(s), healthy);
   await expect(page.locator('#connection-banner')).toBeHidden();
+});
+
+test('an auth-dead Google session (disconnected + needs_repair) shows Re-pair, not Reconnect', async ({ page }) => {
+  await page.waitForFunction(() => window.__openMessageTestHooks?.applyAppStatus);
+  // connected=false (the 401 case) but paired + needs_repair.
+  await page.evaluate(() => window.__openMessageTestHooks.applyAppStatus({
+    connected: false,
+    google: { connected: false, paired: true, needs_pairing: false, needs_repair: true },
+    whatsapp: { connected: true, paired: true },
+    signal: { connected: true, paired: true },
+    backfill: { running: false },
+  }));
+  await expect(page.locator('#connection-banner')).toBeVisible();
+  await expect(page.locator('#connection-banner-action')).toHaveText('Re-pair');
+  await expect(page.locator('#connection-banner-copy')).toContainText('unlinked OpenMessage');
+
+  // A plain disconnected (no needs_repair) still says Reconnect.
+  await page.evaluate(() => window.__openMessageTestHooks.applyAppStatus({
+    connected: false,
+    google: { connected: false, paired: true, needs_pairing: false, needs_repair: false },
+    whatsapp: { connected: true, paired: true },
+    signal: { connected: true, paired: true },
+    backfill: { running: false },
+  }));
+  await expect(page.locator('#connection-banner-action')).toHaveText('Reconnect');
 });

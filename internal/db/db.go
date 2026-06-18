@@ -14,17 +14,19 @@ type Store struct {
 }
 
 type Conversation struct {
-	ConversationID   string
-	Name             string
-	IsGroup          bool
-	Participants     string // JSON array
-	LastMessageTS    int64
-	UnreadCount      int
-	SourcePlatform   string `json:"source_platform,omitempty"` // sms, gchat, imessage, whatsapp, signal, telegram
-	UnifiedID        string `json:"unified_id,omitempty"`
-	UnifiedName      string `json:"unified_name,omitempty"`
-	NotificationMode string `json:"notification_mode,omitempty"` // all, mentions, muted
-	Tab            string `json:"tab,omitempty"` // "" = Recent (inbox), "archive", or a custom tab id
+	ConversationID     string
+	Name               string
+	IsGroup            bool
+	Participants       string // JSON array
+	LastMessageTS      int64
+	UnreadCount        int
+	SourcePlatform     string `json:"source_platform,omitempty"`  // sms, gchat, imessage, whatsapp, signal, telegram
+	DisplayProtocol    string `json:"display_protocol,omitempty"` // display-only SMS/RCS protocol detail
+	LastMessagePreview string `json:"last_message_preview,omitempty"`
+	UnifiedID          string `json:"unified_id,omitempty"`
+	UnifiedName        string `json:"unified_name,omitempty"`
+	NotificationMode   string `json:"notification_mode,omitempty"` // all, mentions, muted
+	Tab                string `json:"tab,omitempty"`               // "" = Recent (inbox), "archive", or a custom tab id
 }
 
 type Message struct {
@@ -53,6 +55,29 @@ type Contact struct {
 	ContactID string
 	Name      string
 	Number    string
+}
+
+type ContactAvatar struct {
+	AvatarID        string
+	SourcePlatform  string
+	ParticipantID   string
+	ContactID       string
+	PhoneNumber     string
+	DisplayName     string
+	MimeType        string
+	ImageData       []byte
+	ImageHash       string
+	UpdatedAtMS     int64
+	LastCheckedAtMS int64
+}
+
+type ContactAvatarCandidate struct {
+	SourcePlatform string
+	ParticipantID  string
+	ContactID      string
+	PhoneNumber    string
+	DisplayName    string
+	Source         string
 }
 
 // UnifiedContact maps a person across messaging platforms.
@@ -291,6 +316,20 @@ func (s *Store) migrate() error {
 		number TEXT NOT NULL DEFAULT ''
 	);
 
+	CREATE TABLE IF NOT EXISTS contact_avatars (
+		avatar_id TEXT PRIMARY KEY,
+		source_platform TEXT NOT NULL,
+		participant_id TEXT NOT NULL DEFAULT '',
+		contact_id TEXT NOT NULL DEFAULT '',
+		phone_number TEXT NOT NULL DEFAULT '',
+		display_name TEXT NOT NULL DEFAULT '',
+		mime_type TEXT NOT NULL DEFAULT 'image/jpeg',
+		image_data BLOB,
+		image_hash TEXT NOT NULL DEFAULT '',
+		updated_at_ms INTEGER NOT NULL DEFAULT 0,
+		last_checked_at_ms INTEGER NOT NULL DEFAULT 0
+	);
+
 	CREATE TABLE IF NOT EXISTS drafts (
 		draft_id TEXT PRIMARY KEY,
 		conversation_id TEXT NOT NULL,
@@ -316,10 +355,17 @@ func (s *Store) migrate() error {
 		"ALTER TABLE messages ADD COLUMN transcribed_at INTEGER NOT NULL DEFAULT 0",
 		"ALTER TABLE messages ADD COLUMN transcript_model TEXT NOT NULL DEFAULT ''",
 		"ALTER TABLE conversations ADD COLUMN source_platform TEXT NOT NULL DEFAULT 'sms'",
+		"ALTER TABLE conversations ADD COLUMN display_protocol TEXT NOT NULL DEFAULT ''",
 		"ALTER TABLE conversations ADD COLUMN notification_mode TEXT NOT NULL DEFAULT 'all'",
 		"ALTER TABLE conversations ADD COLUMN tab TEXT NOT NULL DEFAULT ''",
 	} {
 		s.db.Exec(col) // ignore "duplicate column" errors
+	}
+	if _, err := s.db.Exec(`UPDATE messages SET source_platform = 'sms' WHERE IFNULL(source_platform, '') = ''`); err != nil {
+		return fmt.Errorf("normalize blank message source platform: %w", err)
+	}
+	if _, err := s.db.Exec(`UPDATE conversations SET source_platform = 'sms' WHERE IFNULL(source_platform, '') = ''`); err != nil {
+		return fmt.Errorf("normalize blank conversation source platform: %w", err)
 	}
 
 	// Unified contacts table
@@ -337,6 +383,25 @@ func (s *Store) migrate() error {
 
 	// Index for the contacts.number = messages.sender_number JOIN in metadata search
 	s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_contacts_number ON contacts(number)`)
+
+	if _, err := s.db.Exec(`
+		DROP INDEX IF EXISTS idx_contact_avatars_source_participant;
+		DROP INDEX IF EXISTS idx_contact_avatars_source_contact;
+		DROP INDEX IF EXISTS idx_contact_avatars_source_phone_only;
+		CREATE INDEX IF NOT EXISTS idx_contact_avatars_source_participant
+			ON contact_avatars(source_platform, participant_id)
+			WHERE participant_id != '';
+		CREATE INDEX IF NOT EXISTS idx_contact_avatars_source_contact
+			ON contact_avatars(source_platform, contact_id)
+			WHERE contact_id != '';
+		CREATE UNIQUE INDEX IF NOT EXISTS idx_contact_avatars_source_phone_only
+			ON contact_avatars(source_platform, phone_number)
+			WHERE participant_id = '' AND contact_id = '' AND phone_number != '';
+		CREATE INDEX IF NOT EXISTS idx_contact_avatars_source_phone
+			ON contact_avatars(source_platform, phone_number);
+	`); err != nil {
+		return err
+	}
 
 	// One-shot: consolidate any Signal duplicate clusters left over from
 	// the pre-v0.2.9 schema where the message_id hash included body. Now

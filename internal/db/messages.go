@@ -30,6 +30,9 @@ func (s *Store) UpsertMessage(m *Message) error {
 }
 
 func upsertMessageTx(tx *sql.Tx, m *Message) error {
+	if strings.TrimSpace(m.SourcePlatform) == "" {
+		m.SourcePlatform = "sms"
+	}
 	// On conflict we must NOT blindly overwrite content columns with the
 	// incoming row: the live bridges re-deliver the same message_id for
 	// status-only updates (delivery/read receipts), where media_id /
@@ -62,7 +65,26 @@ func upsertMessageTx(tx *sql.Tx, m *Message) error {
 	if err != nil {
 		return err
 	}
+	if protocol := DisplayProtocolFromStatus(m.Status); protocol != "" && strings.TrimSpace(m.ConversationID) != "" {
+		if _, err := tx.Exec(`UPDATE conversations SET display_protocol = ? WHERE conversation_id = ?`, protocol, m.ConversationID); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+func DisplayProtocolFromStatus(status string) string {
+	upper := strings.ToUpper(strings.TrimSpace(status))
+	if upper == "" {
+		return ""
+	}
+	if strings.Contains(upper, "RCS") {
+		return "RCS"
+	}
+	if strings.Contains(upper, "TEXT") || strings.Contains(upper, "SMS") {
+		return "Text"
+	}
+	return ""
 }
 
 // UpdateMessageReactions explicitly sets the reactions JSON for a message,
@@ -205,10 +227,11 @@ func (s *Store) GetMessages(phoneNumber string, afterMS, beforeMS int64, limit i
 // SearchFilter narrows a text search beyond the query string. Zero values mean
 // "no constraint": empty Phone, zero SinceMS/UntilMS, and Limit<=0 → default.
 type SearchFilter struct {
-	Phone   string // restrict to this sender number
-	SinceMS int64  // only messages at/after this ms (0 = no lower bound)
-	UntilMS int64  // only messages at/before this ms (0 = no upper bound)
-	Limit   int    // max rows (<=0 → 20)
+	Phone          string // restrict to this sender number
+	ConversationID string // restrict to one conversation
+	SinceMS        int64  // only messages at/after this ms (0 = no lower bound)
+	UntilMS        int64  // only messages at/before this ms (0 = no upper bound)
+	Limit          int    // max rows (<=0 → 20)
 }
 
 func (s *Store) SearchMessages(query, phoneNumber string, limit int) ([]*Message, error) {
@@ -243,6 +266,10 @@ func (s *Store) searchMessagesFTS(query string, f SearchFilter) ([]*Message, err
 		conditions = append(conditions, "m.sender_number = ?")
 		args = append(args, f.Phone)
 	}
+	if f.ConversationID != "" {
+		conditions = append(conditions, "m.conversation_id = ?")
+		args = append(args, f.ConversationID)
+	}
 	if f.SinceMS > 0 {
 		conditions = append(conditions, "m.timestamp_ms >= ?")
 		args = append(args, f.SinceMS)
@@ -257,7 +284,7 @@ func (s *Store) searchMessagesFTS(query string, f SearchFilter) ([]*Message, err
 		FROM messages_fts f
 		JOIN messages m ON m.message_id = f.message_id
 		WHERE ` + strings.Join(conditions, " AND ") + `
-		ORDER BY m.timestamp_ms DESC
+		ORDER BY m.timestamp_ms DESC, m.message_id DESC
 		LIMIT ?`
 
 	rows, err := s.db.Query(q, args...)
@@ -276,6 +303,10 @@ func (s *Store) searchMessagesLike(query string, f SearchFilter) ([]*Message, er
 		conditions = append(conditions, "sender_number = ?")
 		args = append(args, f.Phone)
 	}
+	if f.ConversationID != "" {
+		conditions = append(conditions, "conversation_id = ?")
+		args = append(args, f.ConversationID)
+	}
 	if f.SinceMS > 0 {
 		conditions = append(conditions, "timestamp_ms >= ?")
 		args = append(args, f.SinceMS)
@@ -287,7 +318,7 @@ func (s *Store) searchMessagesLike(query string, f SearchFilter) ([]*Message, er
 
 	q := `SELECT ` + messageColumns + ` FROM messages WHERE ` +
 		strings.Join(conditions, " AND ") +
-		` ORDER BY timestamp_ms DESC LIMIT ?`
+		` ORDER BY timestamp_ms DESC, message_id DESC LIMIT ?`
 	args = append(args, f.Limit)
 
 	rows, err := s.db.Query(q, args...)
@@ -353,6 +384,70 @@ func (s *Store) GetMessagesByConversationBetween(conversationID string, startMS,
 	}
 	defer rows.Close()
 	return scanMessages(rows)
+}
+
+func (s *Store) GetMessagesAroundMessage(conversationID, messageID string, before, after int) ([]*Message, error) {
+	if before < 0 {
+		before = 0
+	}
+	if after < 0 {
+		after = 0
+	}
+	if before == 0 {
+		before = 40
+	}
+	if after == 0 {
+		after = 40
+	}
+	anchor, err := s.GetMessageByID(messageID)
+	if err != nil {
+		return nil, err
+	}
+	if anchor == nil {
+		return nil, ErrMessageNotFound
+	}
+	if anchor.ConversationID != conversationID {
+		return nil, ErrMessageNotFound
+	}
+	beforeRows, err := s.db.Query(`
+		SELECT `+messageColumns+`
+		FROM messages
+		WHERE conversation_id = ?
+			AND (timestamp_ms < ? OR (timestamp_ms = ? AND message_id < ?))
+		ORDER BY timestamp_ms DESC, message_id DESC
+		LIMIT ?
+	`, conversationID, anchor.TimestampMS, anchor.TimestampMS, anchor.MessageID, before)
+	if err != nil {
+		return nil, err
+	}
+	beforeMsgs, err := scanMessages(beforeRows)
+	beforeRows.Close()
+	if err != nil {
+		return nil, err
+	}
+	afterRows, err := s.db.Query(`
+		SELECT `+messageColumns+`
+		FROM messages
+		WHERE conversation_id = ?
+			AND (timestamp_ms > ? OR (timestamp_ms = ? AND message_id > ?))
+		ORDER BY timestamp_ms ASC, message_id ASC
+		LIMIT ?
+	`, conversationID, anchor.TimestampMS, anchor.TimestampMS, anchor.MessageID, after)
+	if err != nil {
+		return nil, err
+	}
+	afterMsgs, err := scanMessages(afterRows)
+	afterRows.Close()
+	if err != nil {
+		return nil, err
+	}
+	result := make([]*Message, 0, len(beforeMsgs)+1+len(afterMsgs))
+	for i := len(beforeMsgs) - 1; i >= 0; i-- {
+		result = append(result, beforeMsgs[i])
+	}
+	result = append(result, anchor)
+	result = append(result, afterMsgs...)
+	return result, nil
 }
 
 func (s *Store) ListLegacyWhatsAppMediaPlaceholders(limit int) ([]*Message, error) {
@@ -547,6 +642,88 @@ func (s *Store) LatestReceivedTimestamp(sourcePlatform string) (int64, error) {
 		return 0, err
 	}
 	return ts.Int64, nil
+}
+
+func (s *Store) LatestConversationPreviews(conversationIDs []string) (map[string]string, error) {
+	ids := make([]string, 0, len(conversationIDs))
+	seen := map[string]struct{}{}
+	for _, id := range conversationIDs {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+	previews := make(map[string]string, len(ids))
+	if len(ids) == 0 {
+		return previews, nil
+	}
+
+	stmt, err := s.db.Prepare(`
+		SELECT body, media_id, mime_type, is_from_me
+		FROM messages
+		WHERE conversation_id = ?
+		ORDER BY timestamp_ms DESC, message_id DESC
+		LIMIT 1
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer stmt.Close()
+
+	for _, conversationID := range ids {
+		var body, mediaID, mimeType string
+		var isFromMe bool
+		err := stmt.QueryRow(conversationID).Scan(&body, &mediaID, &mimeType, &isFromMe)
+		if errors.Is(err, sql.ErrNoRows) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		previews[conversationID] = formatLastMessagePreview(body, mediaID, mimeType, isFromMe)
+	}
+	return previews, nil
+}
+
+func formatLastMessagePreview(body, mediaID, mimeType string, isFromMe bool) string {
+	const previewRuneLimit = 120
+
+	preview := strings.Join(strings.Fields(body), " ")
+	if preview == "" && strings.TrimSpace(mediaID) != "" {
+		switch {
+		case strings.HasPrefix(strings.ToLower(mimeType), "image/"):
+			preview = "Photo"
+		case strings.HasPrefix(strings.ToLower(mimeType), "video/"):
+			preview = "Video"
+		case strings.HasPrefix(strings.ToLower(mimeType), "audio/"):
+			preview = "Audio"
+		default:
+			preview = "Attachment"
+		}
+	}
+	if preview == "" {
+		return ""
+	}
+	if isFromMe {
+		preview = "You: " + preview
+	}
+	return truncateRunes(preview, previewRuneLimit)
+}
+
+func truncateRunes(value string, limit int) string {
+	if limit <= 0 {
+		return ""
+	}
+	runes := []rune(value)
+	if len(runes) <= limit {
+		return value
+	}
+	return string(runes[:limit-1]) + "…"
 }
 
 // PlatformStat summarizes stored message coverage for one source platform.

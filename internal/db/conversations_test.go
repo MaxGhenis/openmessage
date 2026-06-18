@@ -620,3 +620,48 @@ func TestApplyConversationSnapshotGuardsStaleState(t *testing.T) {
 		}
 	})
 }
+
+func TestConversationDisplayProtocolPersistsFromMessages(t *testing.T) {
+	store := newTestStore(t)
+
+	if err := store.UpsertConversation(&Conversation{
+		ConversationID: "c1",
+		Name:           "Alice",
+		LastMessageTS:  100,
+		SourcePlatform: "sms",
+	}); err != nil {
+		t.Fatalf("seed conversation: %v", err)
+	}
+	if err := store.UpsertMessage(&Message{
+		MessageID:      "m1",
+		ConversationID: "c1",
+		Body:           "hello",
+		TimestampMS:    100,
+		Status:         "TOMBSTONE_RCS",
+	}); err != nil {
+		t.Fatalf("seed message: %v", err)
+	}
+	got, err := store.GetConversation("c1")
+	if err != nil {
+		t.Fatalf("get conversation: %v", err)
+	}
+	if got.DisplayProtocol != "RCS" {
+		t.Fatalf("display protocol = %q, want RCS", got.DisplayProtocol)
+	}
+
+	if err := store.UpsertConversation(&Conversation{
+		ConversationID: "c1",
+		Name:           "Alice Updated",
+		LastMessageTS:  200,
+		SourcePlatform: "sms",
+	}); err != nil {
+		t.Fatalf("update conversation without protocol: %v", err)
+	}
+	got, err = store.GetConversation("c1")
+	if err != nil {
+		t.Fatalf("get updated conversation: %v", err)
+	}
+	if got.DisplayProtocol != "RCS" {
+		t.Fatalf("display protocol after empty update = %q, want RCS", got.DisplayProtocol)
+	}
+}

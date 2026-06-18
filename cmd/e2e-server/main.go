@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -260,6 +261,60 @@ func main() {
 		writeJSON(w, map[string]any{"success": true})
 	})
 
+	mux.HandleFunc("/_e2e/avatar", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			SourcePlatform string `json:"source_platform"`
+			ParticipantID  string `json:"participant_id"`
+			ContactID      string `json:"contact_id"`
+			PhoneNumber    string `json:"phone_number"`
+			DisplayName    string `json:"display_name"`
+			MimeType       string `json:"mime_type"`
+			ImageBase64    string `json:"image_base64"`
+			ImageHash      string `json:"image_hash"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		data := []byte("avatar-bytes")
+		if req.ImageBase64 != "" {
+			encoded := req.ImageBase64
+			if idx := strings.Index(encoded, ","); idx >= 0 {
+				encoded = encoded[idx+1:]
+			}
+			decoded, err := base64.StdEncoding.DecodeString(encoded)
+			if err != nil {
+				http.Error(w, "invalid image_base64", http.StatusBadRequest)
+				return
+			}
+			data = decoded
+		}
+		mimeType := strings.TrimSpace(req.MimeType)
+		if mimeType == "" {
+			mimeType = "image/png"
+		}
+		imageHash := strings.TrimSpace(req.ImageHash)
+		if imageHash == "" {
+			imageHash = fmt.Sprintf("e2e-avatar-%d", nextID.Add(1))
+		}
+		if err := store.UpsertContactAvatar(db.ContactAvatarCandidate{
+			SourcePlatform: req.SourcePlatform,
+			ParticipantID:  req.ParticipantID,
+			ContactID:      req.ContactID,
+			PhoneNumber:    req.PhoneNumber,
+			DisplayName:    req.DisplayName,
+			Source:         "e2e",
+		}, data, mimeType, imageHash, time.Now().UnixMilli()); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, map[string]any{"success": true, "image_hash": imageHash})
+	})
+
 	mux.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			base.ServeHTTP(w, r)
@@ -346,6 +401,9 @@ func main() {
 
 func seedFixture(store *db.Store) error {
 	if err := store.SeedDemo(); err != nil {
+		return err
+	}
+	if err := store.SetConversationDisplayProtocol("conv1", "RCS"); err != nil {
 		return err
 	}
 	for _, convoID := range []string{"conv3", "conv5"} {

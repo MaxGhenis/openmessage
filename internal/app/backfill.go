@@ -607,18 +607,21 @@ func reconcileBatchReachedLocalBoundary(msgs []*gmproto.Message, localLatestTS i
 
 func (a *App) storeConversation(conv *gmproto.Conversation) error {
 	participantsJSON := "[]"
+	var avatarCandidates []db.ContactAvatarCandidate
 	if ps := conv.GetParticipants(); len(ps) > 0 {
 		type pInfo struct {
-			Name   string `json:"name"`
-			Number string `json:"number"`
-			IsMe   bool   `json:"is_me,omitempty"`
-			ID     string `json:"id,omitempty"` // participant ID, used to resolve reaction actors to names
+			Name      string `json:"name"`
+			Number    string `json:"number"`
+			IsMe      bool   `json:"is_me,omitempty"`
+			ID        string `json:"id,omitempty"` // participant ID, used to resolve reaction actors to names
+			ContactID string `json:"contact_id,omitempty"`
 		}
 		var infos []pInfo
 		for _, p := range ps {
 			info := pInfo{
-				Name: p.GetFullName(),
-				IsMe: p.GetIsMe(),
+				Name:      p.GetFullName(),
+				IsMe:      p.GetIsMe(),
+				ContactID: p.GetContactID(),
 			}
 			if id := p.GetID(); id != nil {
 				info.Number = id.GetNumber()
@@ -626,6 +629,16 @@ func (a *App) storeConversation(conv *gmproto.Conversation) error {
 			}
 			if info.Number == "" {
 				info.Number = p.GetFormattedNumber()
+			}
+			if !info.IsMe {
+				avatarCandidates = append(avatarCandidates, db.ContactAvatarCandidate{
+					SourcePlatform: "sms",
+					ParticipantID:  info.ID,
+					ContactID:      info.ContactID,
+					PhoneNumber:    info.Number,
+					DisplayName:    info.Name,
+					Source:         "backfill",
+				})
 			}
 			infos = append(infos, info)
 		}
@@ -639,14 +652,18 @@ func (a *App) storeConversation(conv *gmproto.Conversation) error {
 		unread = 1
 	}
 
-	return a.Store.ApplyConversationSnapshot(&db.Conversation{
+	if err := a.Store.ApplyConversationSnapshot(&db.Conversation{
 		ConversationID: conv.GetConversationID(),
 		Name:           conv.GetName(),
 		IsGroup:        conv.GetIsGroupChat(),
 		Participants:   participantsJSON,
 		LastMessageTS:  conv.GetLastMessageTimestamp() / 1000,
 		UnreadCount:    unread,
-	})
+	}); err != nil {
+		return err
+	}
+	a.QueueGoogleAvatarCandidates(avatarCandidates)
+	return nil
 }
 
 func (a *App) storeMessage(msg *gmproto.Message) {
@@ -667,6 +684,7 @@ func (a *App) storeMessage(msg *gmproto.Message) {
 		TimestampMS:    msg.GetTimestamp() / 1000,
 		Status:         status,
 		IsFromMe:       client.MessageIsFromMe(msg),
+		SourcePlatform: "sms",
 	}
 
 	if media := client.ExtractMediaInfo(msg); media != nil {

@@ -2,6 +2,7 @@ package app
 
 import (
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -34,6 +35,12 @@ type mockGMClient struct {
 
 	afterFetchMessages func(conversationID string, pageIdx int)
 	fetchCalls         map[string]int
+
+	mu                    sync.Mutex
+	participantThumbnails map[string][]byte
+	contactThumbnails     map[string][]byte
+	participantThumbCalls map[string]int
+	contactThumbCalls     map[string]int
 }
 
 func (m *mockGMClient) ListConversationsWithCursor(count int, folder gmproto.ListConversationsRequest_Folder, cursor *gmproto.Cursor) (*gmproto.ListConversationsResponse, error) {
@@ -137,6 +144,44 @@ func (m *mockGMClient) ListContacts() (*gmproto.ListContactsResponse, error) {
 	}, nil
 }
 
+func (m *mockGMClient) GetParticipantThumbnail(participantIDs ...string) (*gmproto.GetThumbnailResponse, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.participantThumbCalls == nil {
+		m.participantThumbCalls = map[string]int{}
+	}
+	for _, id := range participantIDs {
+		m.participantThumbCalls[id]++
+	}
+	return thumbnailResponseForIDs(participantIDs, m.participantThumbnails), nil
+}
+
+func (m *mockGMClient) GetContactThumbnail(contactIDs ...string) (*gmproto.GetThumbnailResponse, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.contactThumbCalls == nil {
+		m.contactThumbCalls = map[string]int{}
+	}
+	for _, id := range contactIDs {
+		m.contactThumbCalls[id]++
+	}
+	return thumbnailResponseForIDs(contactIDs, m.contactThumbnails), nil
+}
+
+func thumbnailResponseForIDs(ids []string, images map[string][]byte) *gmproto.GetThumbnailResponse {
+	resp := &gmproto.GetThumbnailResponse{}
+	for _, id := range ids {
+		if len(images[id]) == 0 {
+			continue
+		}
+		resp.Thumbnail = append(resp.Thumbnail, &gmproto.GetThumbnailResponse_Thumbnail{
+			Identifier: id,
+			Data:       &gmproto.ThumbnailData{ImageBuffer: images[id]},
+		})
+	}
+	return resp
+}
+
 // helper to make a proto conversation
 func makeConv(id, name string) *gmproto.Conversation {
 	return &gmproto.Conversation{
@@ -168,10 +213,98 @@ func newTestApp(t *testing.T, mock *mockGMClient) *App {
 	}
 	t.Cleanup(func() { store.Close() })
 
-	return &App{
+	a := &App{
 		Store:    store,
 		Logger:   zerolog.Nop(),
 		gmClient: mock,
+	}
+	t.Cleanup(a.StopGoogleAvatarSync)
+	return a
+}
+
+var testAvatarPNG = []byte{
+	0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+	0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+	0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+	0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4,
+	0x89, 0x00, 0x00, 0x00, 0x0a, 0x49, 0x44, 0x41,
+	0x54, 0x78, 0x9c, 0x63, 0x00, 0x01, 0x00, 0x00,
+	0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00,
+	0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae,
+	0x42, 0x60, 0x82,
+}
+
+func TestSyncGoogleContactsQueuesAvatarFetch(t *testing.T) {
+	mock := &mockGMClient{
+		contacts: []*gmproto.Contact{{
+			ParticipantID: "participant-1",
+			ContactID:     "contact-1",
+			Name:          "Alice",
+			Number:        &gmproto.ContactNumber{Number: "(615) 555-0100"},
+		}},
+		contactThumbnails: map[string][]byte{"contact-1": testAvatarPNG},
+	}
+	a := newTestApp(t, mock)
+
+	count, err := a.SyncGoogleContacts()
+	if err != nil {
+		t.Fatalf("SyncGoogleContacts() error = %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("SyncGoogleContacts() count = %d, want 1", count)
+	}
+
+	var avatar *db.ContactAvatar
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		avatar, err = a.Store.GetContactAvatar("sms", "participant-1", "contact-1", "(615) 555-0100")
+		if err != nil {
+			t.Fatalf("GetContactAvatar() error = %v", err)
+		}
+		if avatar != nil && len(avatar.ImageData) > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if avatar == nil || len(avatar.ImageData) == 0 {
+		t.Fatal("Google contact avatar was not cached")
+	}
+	if avatar.MimeType != "image/png" {
+		t.Fatalf("avatar.MimeType = %q, want image/png", avatar.MimeType)
+	}
+
+	mock.mu.Lock()
+	contactCalls := mock.contactThumbCalls["contact-1"]
+	participantCalls := mock.participantThumbCalls["participant-1"]
+	mock.mu.Unlock()
+	if contactCalls == 0 {
+		t.Fatal("GetContactThumbnail(contact-1) was not called")
+	}
+	if participantCalls != 0 {
+		t.Fatalf("GetParticipantThumbnail(participant-1) calls = %d, want 0", participantCalls)
+	}
+}
+
+func TestStopGoogleAvatarSyncPreventsLaterQueue(t *testing.T) {
+	mock := &mockGMClient{
+		contactThumbnails: map[string][]byte{"contact-1": testAvatarPNG},
+	}
+	a := newTestApp(t, mock)
+	a.StopGoogleAvatarSync()
+
+	a.QueueGoogleAvatarCandidates([]db.ContactAvatarCandidate{{
+		SourcePlatform: "sms",
+		ContactID:      "contact-1",
+		PhoneNumber:    "6155550100",
+		Source:         "contacts",
+	}})
+	time.Sleep(25 * time.Millisecond)
+
+	mock.mu.Lock()
+	contactCalls := mock.contactThumbCalls["contact-1"]
+	mock.mu.Unlock()
+	if contactCalls != 0 {
+		t.Fatalf("GetContactThumbnail(contact-1) calls after stop = %d, want 0", contactCalls)
 	}
 }
 
@@ -1053,7 +1186,6 @@ func TestBackfillPopulatesDB(t *testing.T) {
 		t.Fatalf("got body %q", msgs[0].Body)
 	}
 }
-
 
 func TestOrphanContactDiscoveryEnabled(t *testing.T) {
 	cases := []struct {

@@ -81,19 +81,21 @@ type APIOptions struct {
 	StartDeepBackfill     func() bool
 	BackfillStatus        func() any         // returns a JSON-serializable backfill progress snapshot
 	BackfillPhone         func(string) error // targeted backfill for a single phone number
+	SyncGoogleContacts    func() (int, error)
 }
 
 type SearchResult struct {
-	ConversationID string `json:"ConversationID"`
-	Name           string `json:"Name"`
-	IsGroup        bool   `json:"IsGroup"`
-	Participants   string `json:"Participants,omitempty"`
-	LastMessageTS  int64  `json:"LastMessageTS"`
-	UnreadCount    int    `json:"UnreadCount"`
-	SourcePlatform string `json:"source_platform,omitempty"`
-	UnifiedID      string `json:"unified_id,omitempty"`
-	UnifiedName    string `json:"unified_name,omitempty"`
-	Preview        string `json:"preview,omitempty"`
+	ConversationID  string `json:"ConversationID"`
+	Name            string `json:"Name"`
+	IsGroup         bool   `json:"IsGroup"`
+	Participants    string `json:"Participants,omitempty"`
+	LastMessageTS   int64  `json:"LastMessageTS"`
+	UnreadCount     int    `json:"UnreadCount"`
+	SourcePlatform  string `json:"source_platform,omitempty"`
+	DisplayProtocol string `json:"display_protocol,omitempty"`
+	UnifiedID       string `json:"unified_id,omitempty"`
+	UnifiedName     string `json:"unified_name,omitempty"`
+	Preview         string `json:"preview,omitempty"`
 }
 
 // APIHandler creates a handler with minimal options (used by tests).
@@ -486,6 +488,10 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			convos = []*db.Conversation{}
 		}
 		enrichUnifiedConversationIdentities(store, convos)
+		if err := enrichConversationPreviews(store, convos); err != nil {
+			httpError(w, "conversation previews: "+err.Error(), 500)
+			return
+		}
 		writeJSON(w, convos)
 	})
 
@@ -546,6 +552,56 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			}
 			publishConversations()
 			writeJSON(w, convo)
+			return
+		}
+		if action == "search" {
+			if r.Method != http.MethodGet {
+				httpError(w, "method not allowed", 405)
+				return
+			}
+			q := strings.TrimSpace(r.URL.Query().Get("q"))
+			if q == "" {
+				httpError(w, "query parameter 'q' is required", 400)
+				return
+			}
+			limit := queryIntClamped(r, "limit", 50, 100)
+			msgs, err := store.SearchMessagesFiltered(q, db.SearchFilter{
+				ConversationID: convID,
+				Limit:          limit,
+			})
+			if err != nil {
+				httpError(w, "search: "+err.Error(), 500)
+				return
+			}
+			if msgs == nil {
+				msgs = []*db.Message{}
+			}
+			writeJSON(w, msgs)
+			return
+		}
+		if action == "messages-around" {
+			if r.Method != http.MethodGet {
+				httpError(w, "method not allowed", 405)
+				return
+			}
+			messageID := strings.TrimSpace(r.URL.Query().Get("message_id"))
+			if messageID == "" {
+				httpError(w, "message_id is required", 400)
+				return
+			}
+			msgs, err := store.GetMessagesAroundMessage(convID, messageID, queryIntClamped(r, "before", 40, 200), queryIntClamped(r, "after", 40, 200))
+			if err != nil {
+				if errors.Is(err, db.ErrMessageNotFound) {
+					httpError(w, "message not found", 404)
+					return
+				}
+				httpError(w, "get messages around: "+err.Error(), 500)
+				return
+			}
+			if msgs == nil {
+				msgs = []*db.Message{}
+			}
+			writeJSON(w, msgs)
 			return
 		}
 		if action != "messages" {
@@ -722,6 +778,23 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		writeJSON(w, contacts)
 	})
 
+	mux.HandleFunc("/api/contacts/sync", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			httpError(w, "method not allowed", 405)
+			return
+		}
+		if opts.SyncGoogleContacts == nil {
+			httpError(w, "google contact sync unavailable", 501)
+			return
+		}
+		count, err := opts.SyncGoogleContacts()
+		if err != nil {
+			httpError(w, "sync contacts: "+err.Error(), 500)
+			return
+		}
+		writeJSON(w, map[string]any{"synced": count})
+	})
+
 	mux.HandleFunc("/api/search", func(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query().Get("q")
 		if q == "" {
@@ -741,6 +814,40 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		}
 		results := mergeSearchResults(store, msgs, convos, limit)
 		writeJSON(w, results)
+	})
+
+	mux.HandleFunc("/api/avatar", func(w http.ResponseWriter, r *http.Request) {
+		source := strings.TrimSpace(r.URL.Query().Get("source"))
+		if source == "" {
+			source = "sms"
+		}
+		avatar, err := store.GetContactAvatar(
+			source,
+			r.URL.Query().Get("participant_id"),
+			r.URL.Query().Get("contact_id"),
+			r.URL.Query().Get("phone"),
+		)
+		if err != nil {
+			httpError(w, "get avatar: "+err.Error(), 500)
+			return
+		}
+		if avatar == nil || len(avatar.ImageData) == 0 || avatar.ImageHash == "" {
+			httpError(w, "avatar not found", 404)
+			return
+		}
+		etag := `"` + avatar.ImageHash + `"`
+		if r.Header.Get("If-None-Match") == etag {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		mimeType := strings.TrimSpace(avatar.MimeType)
+		if mimeType == "" {
+			mimeType = http.DetectContentType(avatar.ImageData)
+		}
+		w.Header().Set("Content-Type", mimeType)
+		w.Header().Set("Cache-Control", "private, max-age=86400")
+		w.Header().Set("ETag", etag)
+		w.Write(avatar.ImageData)
 	})
 
 	mux.HandleFunc("/api/link-preview", func(w http.ResponseWriter, r *http.Request) {
@@ -1909,7 +2016,22 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		logger.Fatal().Err(err).Msg("Failed to create static sub-filesystem")
 	}
 	staticHandler := http.FileServer(http.FS(staticContent))
-	mux.Handle("/", staticHandler)
+	mux.Handle("/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/manifest.webmanifest":
+			w.Header().Set("Content-Type", "application/manifest+json")
+			w.Header().Set("Cache-Control", "no-cache")
+		case "/sw.js":
+			w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
+			w.Header().Set("Cache-Control", "no-cache")
+		default:
+			if strings.HasSuffix(r.URL.Path, ".png") {
+				w.Header().Set("Content-Type", "image/png")
+				w.Header().Set("Cache-Control", "public, max-age=31536000")
+			}
+		}
+		staticHandler.ServeHTTP(w, r)
+	}))
 
 	// Wrap the mux to intercept /mcp/ requests before the mux's catch-all
 	var handler http.Handler = mux
@@ -1950,6 +2072,8 @@ func setSecurityHeaders(w http.ResponseWriter) {
 	w.Header().Set("Content-Security-Policy",
 		"default-src 'self'; "+
 			"script-src 'self' 'unsafe-inline'; "+
+			"worker-src 'self'; "+
+			"manifest-src 'self'; "+
 			"style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "+
 			"font-src 'self' https://fonts.gstatic.com; "+
 			"img-src 'self' data: blob:; "+
@@ -2066,6 +2190,27 @@ type conversationParticipant struct {
 	IsMeCamel bool   `json:"isMe"`
 }
 
+func enrichConversationPreviews(store *db.Store, convos []*db.Conversation) error {
+	ids := make([]string, 0, len(convos))
+	for _, conv := range convos {
+		if conv == nil {
+			continue
+		}
+		ids = append(ids, conv.ConversationID)
+	}
+	previews, err := store.LatestConversationPreviews(ids)
+	if err != nil {
+		return err
+	}
+	for _, conv := range convos {
+		if conv == nil {
+			continue
+		}
+		conv.LastMessagePreview = previews[conv.ConversationID]
+	}
+	return nil
+}
+
 func enrichUnifiedConversationIdentities(store *db.Store, convos []*db.Conversation) {
 	identityIndex := loadUnifiedIdentityIndex(store)
 	if len(identityIndex) == 0 {
@@ -2110,14 +2255,15 @@ func loadUnifiedIdentityIndex(store *db.Store) map[string]unifiedConversationIde
 
 func searchResultForConversation(conv *db.Conversation, timestamp int64, preview string, identityIndex map[string]unifiedConversationIdentity) SearchResult {
 	result := SearchResult{
-		ConversationID: conv.ConversationID,
-		Name:           conv.Name,
-		IsGroup:        conv.IsGroup,
-		Participants:   conv.Participants,
-		LastMessageTS:  timestamp,
-		UnreadCount:    conv.UnreadCount,
-		SourcePlatform: conv.SourcePlatform,
-		Preview:        preview,
+		ConversationID:  conv.ConversationID,
+		Name:            conv.Name,
+		IsGroup:         conv.IsGroup,
+		Participants:    conv.Participants,
+		LastMessageTS:   timestamp,
+		UnreadCount:     conv.UnreadCount,
+		SourcePlatform:  conv.SourcePlatform,
+		DisplayProtocol: conv.DisplayProtocol,
+		Preview:         preview,
 	}
 	if identity, ok := unifiedIdentityForConversation(conv, identityIndex); ok {
 		result.UnifiedID = identity.ID

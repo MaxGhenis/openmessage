@@ -1,7 +1,9 @@
 package db
 
 import (
+	"errors"
 	"fmt"
+	"strings"
 	"testing"
 )
 
@@ -49,6 +51,9 @@ func TestUpsertMessage_InsertAndUpdate(t *testing.T) {
 		}
 		if got.Status != "sent" {
 			t.Errorf("status: got %q, want %q", got.Status, "sent")
+		}
+		if got.SourcePlatform != "sms" {
+			t.Errorf("source platform: got %q, want sms", got.SourcePlatform)
 		}
 	})
 
@@ -1250,7 +1255,7 @@ func TestPlatformStats(t *testing.T) {
 		{MessageID: "s1", ConversationID: "c1", Body: "hi", TimestampMS: 5000, SourcePlatform: "sms", IsFromMe: false},
 		{MessageID: "s2", ConversationID: "c1", Body: "yo", TimestampMS: 9000, SourcePlatform: "sms", IsFromMe: true}, // newest sms, but outgoing
 		{MessageID: "w1", ConversationID: "c2", Body: "hey", TimestampMS: 3000, SourcePlatform: "whatsapp", IsFromMe: false},
-		{MessageID: "u1", ConversationID: "c3", Body: "??", TimestampMS: 7000, SourcePlatform: "", IsFromMe: false}, // blank → "unknown"
+		{MessageID: "u1", ConversationID: "c3", Body: "??", TimestampMS: 7000, SourcePlatform: "", IsFromMe: false}, // blank defaults to sms
 	}
 	for _, m := range msgs {
 		if err := store.UpsertMessage(m); err != nil {
@@ -1262,32 +1267,28 @@ func TestPlatformStats(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PlatformStats: %v", err)
 	}
-	if len(stats) != 3 {
-		t.Fatalf("platform count: got %d, want 3 (%+v)", len(stats), stats)
+	if len(stats) != 2 {
+		t.Fatalf("platform count: got %d, want 2 (%+v)", len(stats), stats)
 	}
 
-	// Ordered by latest activity DESC: sms(9000), unknown(7000), whatsapp(3000).
-	if stats[0].Platform != "sms" || stats[1].Platform != "unknown" || stats[2].Platform != "whatsapp" {
-		t.Fatalf("ordering: got %s, %s, %s; want sms, unknown, whatsapp",
-			stats[0].Platform, stats[1].Platform, stats[2].Platform)
+	// Ordered by latest activity DESC: sms(9000), whatsapp(3000).
+	if stats[0].Platform != "sms" || stats[1].Platform != "whatsapp" {
+		t.Fatalf("ordering: got %s, %s; want sms, whatsapp",
+			stats[0].Platform, stats[1].Platform)
 	}
 
 	sms := stats[0]
-	if sms.Count != 2 {
-		t.Errorf("sms count: got %d, want 2", sms.Count)
+	if sms.Count != 3 {
+		t.Errorf("sms count: got %d, want 3", sms.Count)
 	}
 	if sms.LatestMS != 9000 {
 		t.Errorf("sms latest: got %d, want 9000", sms.LatestMS)
 	}
-	// Newest sms message is outgoing, so latest *received* must stay at 5000 —
-	// this is the gap-masking case the status command exists to surface.
-	if sms.LatestRecvMS != 5000 {
-		t.Errorf("sms latest received: got %d, want 5000", sms.LatestRecvMS)
-	}
-
-	unknown := stats[1]
-	if unknown.Count != 1 || unknown.LatestMS != 7000 {
-		t.Errorf("unknown bucket: got count=%d latest=%d, want 1/7000", unknown.Count, unknown.LatestMS)
+	// Newest sms message is outgoing, so latest *received* must use the next
+	// inbound SMS-row timestamp. This is the gap-masking case the status command
+	// exists to surface.
+	if sms.LatestRecvMS != 7000 {
+		t.Errorf("sms latest received: got %d, want 7000", sms.LatestRecvMS)
 	}
 }
 
@@ -1299,6 +1300,73 @@ func TestPlatformStats_Empty(t *testing.T) {
 	}
 	if len(stats) != 0 {
 		t.Fatalf("empty store: got %d platforms, want 0", len(stats))
+	}
+}
+
+func TestLatestConversationPreviews(t *testing.T) {
+	store := newTestStore(t)
+
+	msgs := []*Message{
+		{
+			MessageID:      "c1-old",
+			ConversationID: "c1",
+			Body:           "Older received message",
+			TimestampMS:    1000,
+		},
+		{
+			MessageID:      "c1-new",
+			ConversationID: "c1",
+			Body:           "Latest\nsent   message",
+			TimestampMS:    2000,
+			IsFromMe:       true,
+		},
+		{
+			MessageID:      "c2-photo",
+			ConversationID: "c2",
+			TimestampMS:    3000,
+			MediaID:        "media-photo",
+			MimeType:       "image/jpeg",
+		},
+		{
+			MessageID:      "c3-audio",
+			ConversationID: "c3",
+			TimestampMS:    4000,
+			MediaID:        "media-audio",
+			MimeType:       "audio/ogg",
+			IsFromMe:       true,
+		},
+		{
+			MessageID:      "c4-long",
+			ConversationID: "c4",
+			Body:           strings.Repeat("🙂", 160),
+			TimestampMS:    5000,
+		},
+	}
+	for _, msg := range msgs {
+		if err := store.UpsertMessage(msg); err != nil {
+			t.Fatalf("upsert %s: %v", msg.MessageID, err)
+		}
+	}
+
+	previews, err := store.LatestConversationPreviews([]string{"c1", "c2", "c3", "c4", "c1", "", "missing"})
+	if err != nil {
+		t.Fatalf("LatestConversationPreviews: %v", err)
+	}
+
+	if got, want := previews["c1"], "You: Latest sent message"; got != want {
+		t.Fatalf("c1 preview = %q, want %q", got, want)
+	}
+	if got, want := previews["c2"], "Photo"; got != want {
+		t.Fatalf("c2 preview = %q, want %q", got, want)
+	}
+	if got, want := previews["c3"], "You: Audio"; got != want {
+		t.Fatalf("c3 preview = %q, want %q", got, want)
+	}
+	if got := previews["c4"]; len([]rune(got)) != 120 || !strings.HasSuffix(got, "…") {
+		t.Fatalf("c4 preview = %q, want 120 runes ending in ellipsis", got)
+	}
+	if _, ok := previews["missing"]; ok {
+		t.Fatalf("missing conversation should not have a preview: %#v", previews)
 	}
 }
 
@@ -1362,5 +1430,70 @@ func TestSearchMessagesFiltered_DateWindow(t *testing.T) {
 	}
 	if len(legacy) != 5 {
 		t.Errorf("legacy wrapper: got %d, want 5", len(legacy))
+	}
+}
+
+func TestSearchMessagesFilteredConversationID(t *testing.T) {
+	store := newTestStore(t)
+
+	for _, convID := range []string{"c1", "c2"} {
+		if err := store.UpsertConversation(&Conversation{ConversationID: convID, Name: convID, LastMessageTS: 100}); err != nil {
+			t.Fatalf("seed conversation %s: %v", convID, err)
+		}
+	}
+	for _, msg := range []*Message{
+		{MessageID: "m1", ConversationID: "c1", Body: "thread needle", TimestampMS: 100},
+		{MessageID: "m2", ConversationID: "c2", Body: "thread needle", TimestampMS: 200},
+	} {
+		if err := store.UpsertMessage(msg); err != nil {
+			t.Fatalf("seed message %s: %v", msg.MessageID, err)
+		}
+	}
+
+	got, err := store.SearchMessagesFiltered("needle", SearchFilter{ConversationID: "c1", Limit: 10})
+	if err != nil {
+		t.Fatalf("search: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d messages, want 1", len(got))
+	}
+	if got[0].ConversationID != "c1" || got[0].MessageID != "m1" {
+		t.Fatalf("got message %s in %s, want m1 in c1", got[0].MessageID, got[0].ConversationID)
+	}
+}
+
+func TestGetMessagesAroundMessage(t *testing.T) {
+	store := newTestStore(t)
+
+	if err := store.UpsertConversation(&Conversation{ConversationID: "c1", Name: "Alice", LastMessageTS: 500}); err != nil {
+		t.Fatalf("seed conversation: %v", err)
+	}
+	for i := 1; i <= 5; i++ {
+		if err := store.UpsertMessage(&Message{
+			MessageID:      fmt.Sprintf("m%d", i),
+			ConversationID: "c1",
+			Body:           fmt.Sprintf("message %d", i),
+			TimestampMS:    int64(i * 100),
+		}); err != nil {
+			t.Fatalf("seed message %d: %v", i, err)
+		}
+	}
+
+	got, err := store.GetMessagesAroundMessage("c1", "m3", 2, 1)
+	if err != nil {
+		t.Fatalf("around: %v", err)
+	}
+	wantIDs := []string{"m1", "m2", "m3", "m4"}
+	if len(got) != len(wantIDs) {
+		t.Fatalf("got %d messages, want %d", len(got), len(wantIDs))
+	}
+	for i, want := range wantIDs {
+		if got[i].MessageID != want {
+			t.Fatalf("result %d = %s, want %s", i, got[i].MessageID, want)
+		}
+	}
+
+	if _, err := store.GetMessagesAroundMessage("other", "m3", 1, 1); !errors.Is(err, ErrMessageNotFound) {
+		t.Fatalf("wrong conversation err = %v, want ErrMessageNotFound", err)
 	}
 }

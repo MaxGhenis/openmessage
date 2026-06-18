@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 )
 
@@ -201,4 +202,155 @@ func (s *Store) ListUnifiedContacts(query string, limit int) ([]*UnifiedContact,
 
 func containsInsensitive(s, sub string) bool {
 	return strings.Contains(strings.ToLower(s), sub)
+}
+
+func NormalizeAvatarPhone(phone string) string {
+	var digits strings.Builder
+	for _, r := range phone {
+		if r >= '0' && r <= '9' {
+			digits.WriteRune(r)
+		}
+	}
+	if digits.Len() == 0 {
+		return strings.TrimSpace(phone)
+	}
+	value := digits.String()
+	if len(value) == 10 {
+		return "+1" + value
+	}
+	if len(value) == 11 && strings.HasPrefix(value, "1") {
+		return "+" + value
+	}
+	if strings.HasPrefix(strings.TrimSpace(phone), "+") {
+		return "+" + value
+	}
+	return value
+}
+
+func avatarCandidateKey(c ContactAvatarCandidate) (source, participantID, contactID, phone string) {
+	source = strings.ToLower(strings.TrimSpace(c.SourcePlatform))
+	if source == "" {
+		source = "sms"
+	}
+	participantID = strings.TrimSpace(c.ParticipantID)
+	contactID = strings.TrimSpace(c.ContactID)
+	phone = NormalizeAvatarPhone(c.PhoneNumber)
+	return source, participantID, contactID, phone
+}
+
+func ContactAvatarID(c ContactAvatarCandidate) string {
+	source, participantID, contactID, phone := avatarCandidateKey(c)
+	switch {
+	case participantID != "":
+		return fmt.Sprintf("%s:participant:%s", source, participantID)
+	case contactID != "":
+		return fmt.Sprintf("%s:contact:%s", source, contactID)
+	case phone != "":
+		return fmt.Sprintf("%s:phone:%s", source, phone)
+	default:
+		return ""
+	}
+}
+
+func (s *Store) UpsertContactAvatar(candidate ContactAvatarCandidate, imageData []byte, mimeType, imageHash string, nowMS int64) error {
+	source, participantID, contactID, phone := avatarCandidateKey(candidate)
+	avatarID := ContactAvatarID(candidate)
+	if avatarID == "" {
+		return nil
+	}
+	if mimeType == "" {
+		mimeType = "image/jpeg"
+	}
+	displayName := strings.TrimSpace(candidate.DisplayName)
+	_, err := s.db.Exec(`
+		INSERT INTO contact_avatars (
+			avatar_id, source_platform, participant_id, contact_id, phone_number,
+			display_name, mime_type, image_data, image_hash, updated_at_ms, last_checked_at_ms
+		)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(avatar_id) DO UPDATE SET
+			source_platform=excluded.source_platform,
+			participant_id=excluded.participant_id,
+			contact_id=excluded.contact_id,
+			phone_number=excluded.phone_number,
+			display_name=CASE WHEN excluded.display_name != '' THEN excluded.display_name ELSE contact_avatars.display_name END,
+			mime_type=CASE WHEN excluded.image_hash != contact_avatars.image_hash THEN excluded.mime_type ELSE contact_avatars.mime_type END,
+			image_data=CASE WHEN excluded.image_hash != contact_avatars.image_hash THEN excluded.image_data ELSE contact_avatars.image_data END,
+			image_hash=CASE WHEN excluded.image_hash != contact_avatars.image_hash THEN excluded.image_hash ELSE contact_avatars.image_hash END,
+			updated_at_ms=CASE WHEN excluded.image_hash != contact_avatars.image_hash THEN excluded.updated_at_ms ELSE contact_avatars.updated_at_ms END,
+			last_checked_at_ms=excluded.last_checked_at_ms
+	`, avatarID, source, participantID, contactID, phone, displayName, mimeType, imageData, imageHash, nowMS, nowMS)
+	return err
+}
+
+func (s *Store) MarkContactAvatarChecked(candidate ContactAvatarCandidate, nowMS int64) error {
+	source, participantID, contactID, phone := avatarCandidateKey(candidate)
+	avatarID := ContactAvatarID(candidate)
+	if avatarID == "" {
+		return nil
+	}
+	displayName := strings.TrimSpace(candidate.DisplayName)
+	_, err := s.db.Exec(`
+		INSERT INTO contact_avatars (
+			avatar_id, source_platform, participant_id, contact_id, phone_number,
+			display_name, last_checked_at_ms
+		)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(avatar_id) DO UPDATE SET
+			display_name=CASE WHEN excluded.display_name != '' THEN excluded.display_name ELSE contact_avatars.display_name END,
+			last_checked_at_ms=excluded.last_checked_at_ms
+	`, avatarID, source, participantID, contactID, phone, displayName, nowMS)
+	return err
+}
+
+func (s *Store) GetContactAvatar(sourcePlatform, participantID, contactID, phoneNumber string) (*ContactAvatar, error) {
+	source := strings.ToLower(strings.TrimSpace(sourcePlatform))
+	if source == "" {
+		source = "sms"
+	}
+	participantID = strings.TrimSpace(participantID)
+	contactID = strings.TrimSpace(contactID)
+	phoneNumber = NormalizeAvatarPhone(phoneNumber)
+	queries := []struct {
+		where string
+		args  []any
+	}{
+		{"source_platform = ? AND participant_id = ? AND participant_id != ''", []any{source, participantID}},
+		{"source_platform = ? AND contact_id = ? AND contact_id != ''", []any{source, contactID}},
+		{"source_platform = ? AND phone_number = ? AND phone_number != ''", []any{source, phoneNumber}},
+	}
+	for _, q := range queries {
+		if len(q.args) < 2 || q.args[1] == "" {
+			continue
+		}
+		row := s.db.QueryRow(`
+			SELECT avatar_id, source_platform, participant_id, contact_id, phone_number,
+				display_name, mime_type, image_data, image_hash, updated_at_ms, last_checked_at_ms
+			FROM contact_avatars
+			WHERE `+q.where+`
+			ORDER BY CASE WHEN image_hash != '' THEN 0 ELSE 1 END, updated_at_ms DESC
+			LIMIT 1
+		`, q.args...)
+		avatar := &ContactAvatar{}
+		err := row.Scan(
+			&avatar.AvatarID,
+			&avatar.SourcePlatform,
+			&avatar.ParticipantID,
+			&avatar.ContactID,
+			&avatar.PhoneNumber,
+			&avatar.DisplayName,
+			&avatar.MimeType,
+			&avatar.ImageData,
+			&avatar.ImageHash,
+			&avatar.UpdatedAtMS,
+			&avatar.LastCheckedAtMS,
+		)
+		if err == nil {
+			return avatar, nil
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return nil, err
+		}
+	}
+	return nil, nil
 }

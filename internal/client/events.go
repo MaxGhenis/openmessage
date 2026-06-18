@@ -25,18 +25,19 @@ type OnSessionInvalid func()
 type OnConnectionLost func()
 
 type EventHandler struct {
-	Store                  *db.Store
-	Logger                 zerolog.Logger
-	SessionPath            string
-	Client                 *Client
-	OnConversationsChange  func()
-	OnSessionInvalid       OnSessionInvalid
-	OnConnectionLost       OnConnectionLost
-	OnIncomingMessage      func(*db.Message)
-	OnPendingMedia         func(conversationID, messageID string)
-	OnMessagesChange       func(string)
-	OnRealtimeGapRecovered func(string)
-	OnTypingChange         func(conversationID, senderName, senderNumber string, typing bool)
+	Store                    *db.Store
+	Logger                   zerolog.Logger
+	SessionPath              string
+	Client                   *Client
+	OnConversationsChange    func()
+	OnSessionInvalid         OnSessionInvalid
+	OnConnectionLost         OnConnectionLost
+	OnIncomingMessage        func(*db.Message)
+	OnPendingMedia           func(conversationID, messageID string)
+	OnMessagesChange         func(string)
+	OnRealtimeGapRecovered   func(string)
+	OnTypingChange           func(conversationID, senderName, senderNumber string, typing bool)
+	OnGoogleAvatarCandidates func([]db.ContactAvatarCandidate)
 }
 
 func (h *EventHandler) Handle(rawEvt any) {
@@ -201,18 +202,21 @@ func (h *EventHandler) handleConversation(conv *gmproto.Conversation) {
 
 func (h *EventHandler) storeConversation(conv *gmproto.Conversation) bool {
 	participantsJSON := "[]"
+	var avatarCandidates []db.ContactAvatarCandidate
 	if ps := conv.GetParticipants(); len(ps) > 0 {
 		type pInfo struct {
-			Name   string `json:"name"`
-			Number string `json:"number"`
-			IsMe   bool   `json:"is_me,omitempty"`
-			ID     string `json:"id,omitempty"` // participant ID, used to resolve reaction actors to names
+			Name      string `json:"name"`
+			Number    string `json:"number"`
+			IsMe      bool   `json:"is_me,omitempty"`
+			ID        string `json:"id,omitempty"` // participant ID, used to resolve reaction actors to names
+			ContactID string `json:"contact_id,omitempty"`
 		}
 		var infos []pInfo
 		for _, p := range ps {
 			info := pInfo{
-				Name: p.GetFullName(),
-				IsMe: p.GetIsMe(),
+				Name:      p.GetFullName(),
+				IsMe:      p.GetIsMe(),
+				ContactID: p.GetContactID(),
 			}
 			if id := p.GetID(); id != nil {
 				info.Number = id.GetNumber()
@@ -220,6 +224,16 @@ func (h *EventHandler) storeConversation(conv *gmproto.Conversation) bool {
 			}
 			if info.Number == "" {
 				info.Number = p.GetFormattedNumber()
+			}
+			if !info.IsMe {
+				avatarCandidates = append(avatarCandidates, db.ContactAvatarCandidate{
+					SourcePlatform: "sms",
+					ParticipantID:  info.ID,
+					ContactID:      info.ContactID,
+					PhoneNumber:    info.Number,
+					DisplayName:    info.Name,
+					Source:         "live",
+				})
 			}
 			infos = append(infos, info)
 		}
@@ -245,6 +259,9 @@ func (h *EventHandler) storeConversation(conv *gmproto.Conversation) bool {
 	if err := h.Store.ApplyConversationSnapshot(dbConv); err != nil {
 		h.Logger.Error().Err(err).Str("conv_id", dbConv.ConversationID).Msg("Failed to store conversation")
 		return false
+	}
+	if h.OnGoogleAvatarCandidates != nil && len(avatarCandidates) > 0 {
+		h.OnGoogleAvatarCandidates(avatarCandidates)
 	}
 	h.Logger.Debug().Str("conv_id", dbConv.ConversationID).Str("name", dbConv.Name).Msg("Stored conversation")
 	return true
