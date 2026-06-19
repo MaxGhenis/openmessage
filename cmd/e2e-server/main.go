@@ -45,6 +45,20 @@ func main() {
 		mime string
 	}
 	var mediaStore sync.Map
+	mediaStore.Store("m10media", mediaBlob{
+		data: []byte{
+			0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+			0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+			0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+			0x08, 0x04, 0x00, 0x00, 0x00, 0xb5, 0x1c, 0x0c,
+			0x02, 0x00, 0x00, 0x00, 0x0b, 0x49, 0x44, 0x41,
+			0x54, 0x78, 0xda, 0x63, 0xfc, 0xff, 0x1f, 0x00,
+			0x03, 0x03, 0x02, 0x00, 0xee, 0xd9, 0xf7, 0x00,
+			0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae,
+			0x42, 0x60, 0x82,
+		},
+		mime: "image/png",
+	})
 	base := web.APIHandlerWithOptions(store, nil, logger, nil, web.APIOptions{
 		Events:       events,
 		IdentityName: "Max Ghenis",
@@ -446,7 +460,7 @@ func seedFixture(store *db.Store) error {
 		ConversationID: "conv10",
 		Name:           "Jordan Rivera",
 		Participants:   `[{"name":"Jordan Rivera","number":"+14155550199"}]`,
-		LastMessageTS:  1738959900000,
+		LastMessageTS:  1738960200000,
 		UnreadCount:    1,
 		SourcePlatform: "whatsapp",
 	}, []*db.Message{
@@ -468,6 +482,18 @@ func seedFixture(store *db.Store) error {
 			Body:           "Also, do you want me to bring dessert?",
 			TimestampMS:    1738959900000,
 			Status:         "delivered",
+			SourcePlatform: "whatsapp",
+		},
+		{
+			MessageID:      "m10media",
+			ConversationID: "conv10",
+			SenderName:     "Jordan Rivera",
+			SenderNumber:   "+14155550199",
+			Body:           "Lisbon photo",
+			TimestampMS:    1738960200000,
+			Status:         "delivered",
+			MediaID:        "wa:seed-media",
+			MimeType:       "image/png",
 			SourcePlatform: "whatsapp",
 		},
 	}); err != nil {

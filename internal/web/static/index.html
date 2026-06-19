@@ -3631,6 +3631,182 @@ body::after {
   background: rgba(255, 255, 255, 0.1);
 }
 
+.forward-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 2100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: rgba(6, 11, 20, 0.68);
+  backdrop-filter: blur(14px);
+}
+
+.forward-overlay[hidden] {
+  display: none;
+}
+
+.forward-panel {
+  width: min(460px, calc(100vw - 32px));
+  max-height: min(620px, calc(100vh - 48px));
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  background: var(--panel-strong);
+  box-shadow: 0 24px 72px rgba(0, 0, 0, 0.36);
+}
+
+.forward-header {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 18px 18px 14px;
+  border-bottom: 1px solid var(--border);
+}
+
+.forward-title-wrap {
+  min-width: 0;
+  flex: 1;
+}
+
+.forward-header h2 {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 650;
+  color: var(--text-primary);
+}
+
+.forward-preview {
+  margin-top: 4px;
+  font-size: 13px;
+  line-height: 1.45;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.forward-search-wrap {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 14px 18px 10px;
+  padding: 0 12px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--bg-elevated);
+}
+
+.forward-search-wrap svg {
+  width: 16px;
+  height: 16px;
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+
+.forward-search {
+  min-width: 0;
+  width: 100%;
+  height: 40px;
+  border: 0;
+  outline: none;
+  background: transparent;
+  color: var(--text-primary);
+  font: inherit;
+}
+
+.forward-search::placeholder {
+  color: var(--text-muted);
+}
+
+.forward-list {
+  min-height: 180px;
+  overflow-y: auto;
+  padding: 0 10px 10px;
+}
+
+.forward-target {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 8px;
+  border: 0;
+  border-radius: 12px;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.forward-target:hover:not(:disabled),
+.forward-target:focus-visible {
+  background: var(--bg-hover);
+  outline: none;
+}
+
+.forward-target:disabled {
+  cursor: default;
+  opacity: 0.55;
+}
+
+.forward-avatar {
+  width: 36px;
+  height: 36px;
+  flex-shrink: 0;
+}
+
+.forward-target-main {
+  min-width: 0;
+  flex: 1;
+}
+
+.forward-target-name {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.forward-target-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 20px;
+  margin-top: 2px;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.forward-target-preview {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.forward-empty,
+.forward-status {
+  padding: 14px 18px;
+  color: var(--text-muted);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.forward-status {
+  min-height: 44px;
+  border-top: 1px solid var(--border);
+}
+
+.forward-status.error {
+  color: #dc503c;
+}
+
 .platform-chip {
   display: inline-flex;
   align-items: center;
@@ -4824,6 +5000,23 @@ body::after {
 </div>
 
 <div class="context-menu" id="context-menu" hidden></div>
+<div class="forward-overlay" id="forward-overlay" hidden>
+  <div class="forward-panel" role="dialog" aria-modal="true" aria-labelledby="forward-title">
+    <div class="forward-header">
+      <div class="forward-title-wrap">
+        <h2 id="forward-title">Forward message</h2>
+        <div class="forward-preview" id="forward-preview"></div>
+      </div>
+      <button class="new-msg-close" id="forward-close" type="button" aria-label="Close forward dialog">&times;</button>
+    </div>
+    <div class="forward-search-wrap">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><line x1="16.5" y1="16.5" x2="21" y2="21"/></svg>
+      <input class="forward-search" id="forward-search" type="search" placeholder="Search conversations" aria-label="Search conversations" autocomplete="off">
+    </div>
+    <div class="forward-list" id="forward-list" role="listbox" aria-label="Forward destinations"></div>
+    <div class="forward-status" id="forward-status" aria-live="polite"></div>
+  </div>
+</div>
 
 <script>
 (function() {
@@ -5013,6 +5206,12 @@ body::after {
   const $emptyStateCopy = document.getElementById('empty-state-copy');
   const $emptyStateNotes = document.getElementById('empty-state-notes');
   const $contextMenu = document.getElementById('context-menu');
+  const $forwardOverlay = document.getElementById('forward-overlay');
+  const $forwardClose = document.getElementById('forward-close');
+  const $forwardSearch = document.getElementById('forward-search');
+  const $forwardList = document.getElementById('forward-list');
+  const $forwardPreview = document.getElementById('forward-preview');
+  const $forwardStatus = document.getElementById('forward-status');
   const $newMsgRoutes = document.getElementById('new-msg-routes');
   const $newMsgGo = document.getElementById('new-msg-go');
   const $newMsgError = document.getElementById('new-msg-error');
@@ -5020,6 +5219,8 @@ body::after {
   const $emptyStateCta = document.getElementById('empty-state-cta');
 
   let replyToMsg = null; // {MessageID, SenderName, Body}
+  let forwardMessage = null;
+  let forwarding = false;
   const composeTextByConversation = new Map();
   let contextMenuState = null;
   let threadSearchTimer = 0;
@@ -5815,6 +6016,78 @@ body::after {
       || (sourcePlatformOf(convo) === 'whatsapp' && whatsAppStatus.connected)
       || (sourcePlatformOf(convo) === 'signal' && signalStatus.connected)
     );
+  }
+
+  function isGenericMediaBody(body) {
+    return [
+      '[Photo]',
+      '[Video]',
+      '[Audio]',
+      '[Voice note]',
+      '[Sticker]',
+      '[Attachment]',
+    ].includes(String(body || '').trim());
+  }
+
+  function forwardableBody(message) {
+    const body = String(message && message.Body || '').trim();
+    if (!body) return '';
+    return message && message.MediaID && isGenericMediaBody(body) ? '' : body;
+  }
+
+  function messageHasForwardableContent(message) {
+    return !!(forwardableBody(message) || (message && message.MediaID));
+  }
+
+  function mediaKindLabel(mimeType) {
+    const mime = String(mimeType || '').toLowerCase();
+    if (mime.startsWith('image/')) return 'Image';
+    if (mime.startsWith('video/')) return 'Video';
+    if (mime.startsWith('audio/')) return 'Audio';
+    return 'Attachment';
+  }
+
+  function extensionForMime(mimeType) {
+    const mime = String(mimeType || '').toLowerCase();
+    if (mime.startsWith('audio/ogg')) return '.ogg';
+    if (mime.startsWith('audio/aac')) return '.aac';
+    if (mime.startsWith('audio/mp4') || mime.startsWith('audio/m4a')) return '.m4a';
+    if (mime.startsWith('audio/mpeg')) return '.mp3';
+    if (mime.startsWith('audio/amr')) return '.amr';
+    if (mime.startsWith('audio/')) return '.audio';
+    if (mime.startsWith('image/jpeg')) return '.jpg';
+    if (mime.startsWith('image/png')) return '.png';
+    if (mime.startsWith('image/gif')) return '.gif';
+    if (mime.startsWith('image/webp')) return '.webp';
+    if (mime.startsWith('image/')) return '.img';
+    if (mime.startsWith('video/mp4')) return '.mp4';
+    if (mime.startsWith('video/3gpp')) return '.3gp';
+    if (mime.startsWith('video/')) return '.video';
+    if (mime.startsWith('text/plain')) return '.txt';
+    if (mime.startsWith('application/pdf')) return '.pdf';
+    return '.bin';
+  }
+
+  function forwardFilename(message, mimeType) {
+    const rawID = String(message && message.MessageID || 'message')
+      .replace(/[^a-z0-9._-]+/gi, '_')
+      .replace(/^_+|_+$/g, '')
+      .substring(0, 80) || 'message';
+    return `openmessage-forward-${rawID}${extensionForMime(mimeType)}`;
+  }
+
+  function truncateOneLine(value, max = 96) {
+    const text = String(value || '').replace(/\s+/g, ' ').trim();
+    return text.length > max ? text.substring(0, Math.max(0, max - 3)) + '...' : text;
+  }
+
+  function forwardPreviewText(message) {
+    const body = forwardableBody(message);
+    if (message && (message.MediaID || message.MimeType)) {
+      const label = mediaKindLabel(message.MimeType);
+      return body ? `${label}: ${truncateOneLine(body, 90)}` : label;
+    }
+    return truncateOneLine(body || 'Empty message', 110);
   }
 
   function sortRouteConversations(convos) {
@@ -7253,6 +7526,11 @@ body::after {
         action: 'reply-message',
       },
       {
+        label: 'Forward',
+        action: 'forward-message',
+        disabled: !messageHasForwardableContent(message),
+      },
+      {
         label: 'Copy text',
         action: 'copy-message',
         disabled: !String(message && message.Body || '').trim(),
@@ -7267,6 +7545,211 @@ body::after {
         action: 'copy-link',
       } : null,
     ];
+  }
+
+  function closeForwardDialog() {
+    forwardMessage = null;
+    forwarding = false;
+    if (!$forwardOverlay) return;
+    $forwardOverlay.hidden = true;
+    if ($forwardSearch) {
+      $forwardSearch.value = '';
+      $forwardSearch.disabled = false;
+    }
+    if ($forwardList) $forwardList.innerHTML = '';
+    if ($forwardStatus) {
+      $forwardStatus.textContent = '';
+      $forwardStatus.classList.remove('error');
+    }
+  }
+
+  function forwardTargetSearchText(convo) {
+    const participants = conversationParticipants(convo)
+      .flatMap(p => [p && p.name, p && p.number, p && p.phone, p && p.email])
+      .filter(Boolean)
+      .join(' ');
+    return [
+      convo && convo.Name,
+      routeDisplayLabel(convo),
+      conversationPreviewText(convo),
+      participants,
+    ].filter(Boolean).join(' ').toLowerCase();
+  }
+
+  function forwardTargetConversations(message) {
+    const needsMedia = !!(message && message.MediaID);
+    return sortRoutesByRecency(allConversations)
+      .filter(convo => convo && convo.ConversationID)
+      .filter(convo => conversationSupportsOutbound(convo))
+      .filter(convo => !needsMedia || conversationSupportsMediaOutbound(convo));
+  }
+
+  function setForwardStatus(message, isError = false) {
+    if (!$forwardStatus) return;
+    $forwardStatus.textContent = message || '';
+    $forwardStatus.classList.toggle('error', !!isError);
+  }
+
+  function setForwardBusy(isBusy) {
+    forwarding = !!isBusy;
+    if ($forwardSearch) $forwardSearch.disabled = forwarding;
+    if ($forwardList) {
+      $forwardList.querySelectorAll('.forward-target').forEach(btn => {
+        btn.disabled = forwarding;
+      });
+    }
+  }
+
+  function renderForwardTargets() {
+    if (!$forwardList || !forwardMessage) return;
+    const query = String($forwardSearch && $forwardSearch.value || '').trim().toLowerCase();
+    const targets = forwardTargetConversations(forwardMessage)
+      .filter(convo => !query || forwardTargetSearchText(convo).includes(query))
+      .slice(0, 80);
+    if (!targets.length) {
+      const emptyCopy = forwardMessage.MediaID
+        ? 'No media-capable conversations match that search.'
+        : 'No sendable conversations match that search.';
+      $forwardList.innerHTML = `<div class="forward-empty">${escapeHtml(emptyCopy)}</div>`;
+      return;
+    }
+    $forwardList.innerHTML = '';
+    targets.forEach(convo => {
+      const btn = document.createElement('button');
+      const avatarRefs = conversationAvatarRefs(convo);
+      btn.type = 'button';
+      btn.className = 'forward-target';
+      btn.dataset.conversationId = convo.ConversationID;
+      btn.innerHTML = `
+        ${avatarHTML({
+          name: convo.Name,
+          numbers: conversationAvatarNumbers(convo),
+          whatsAppConversationID: conversationAvatarWhatsAppConversationID(convo),
+          avatarSource: avatarRefs.source,
+          participantIDs: avatarRefs.participantIDs,
+          contactIDs: avatarRefs.contactIDs,
+          platforms: avatarPlatformsForConversation(convo),
+          className: 'forward-avatar',
+          style: `background:${avatarColor(convo.Name)}`,
+        })}
+        <div class="forward-target-main">
+          <div class="forward-target-name">${escapeHtml(convo.Name || 'Unknown')}</div>
+          <div class="forward-target-meta">
+            ${platformBadgeHTML(displayPlatformForRoute(convo))}
+            <span class="forward-target-preview">${escapeHtml(truncateOneLine(conversationPreviewText(convo), 72))}</span>
+          </div>
+        </div>
+      `;
+      btn.addEventListener('click', () => {
+        const selectedMessage = forwardMessage;
+        forwardMessageToConversation(selectedMessage, convo).catch(err => {
+          console.error('Forward failed:', err);
+          setForwardStatus(userFacingErrorMessage(err, 'send') || 'Forward failed.', true);
+          setForwardBusy(false);
+        });
+      });
+      $forwardList.appendChild(btn);
+    });
+    hydrateNativeAvatars($forwardList);
+  }
+
+  function openForwardDialog(message) {
+    if (!messageHasForwardableContent(message)) {
+      showThreadFeedback('Nothing to forward from this message.');
+      return;
+    }
+    forwardMessage = message;
+    if ($forwardPreview) $forwardPreview.textContent = forwardPreviewText(message);
+    if ($forwardOverlay) $forwardOverlay.hidden = false;
+    setForwardStatus('');
+    if ($forwardSearch) {
+      $forwardSearch.value = '';
+      $forwardSearch.disabled = false;
+    }
+    renderForwardTargets();
+    requestAnimationFrame(() => {
+      if ($forwardSearch) $forwardSearch.focus();
+    });
+  }
+
+  async function mediaBlobForForward(message) {
+    const response = await fetch(`/api/media/${encodeURIComponent(message.MessageID)}`);
+    if (!response.ok) {
+      throw new Error(await responseError(response));
+    }
+    let blob = await response.blob();
+    const mime = (blob.type || message.MimeType || 'application/octet-stream').split(';')[0] || 'application/octet-stream';
+    if (!blob.type) {
+      blob = new Blob([await blob.arrayBuffer()], { type: mime });
+    }
+    return { blob, mime };
+  }
+
+  async function forwardMessageToConversation(message, targetConvo) {
+    if (!message || !targetConvo || forwarding) return;
+    if (browserIsOffline()) {
+      setForwardStatus(offlineFeedbackMessage('send'), true);
+      return;
+    }
+    if (!conversationSupportsOutbound(targetConvo)) {
+      setForwardStatus(routeUnavailableMessage('forward messages', targetConvo), true);
+      return;
+    }
+    if (message.MediaID && !conversationSupportsMediaOutbound(targetConvo)) {
+      setForwardStatus('Attachments are unavailable on that route right now.', true);
+      return;
+    }
+
+    const body = forwardableBody(message);
+    const targetID = targetConvo.ConversationID;
+    const targetPlatform = sourcePlatformOf(targetConvo);
+    const targetName = targetConvo.Name || 'conversation';
+    setForwardBusy(true);
+    setForwardStatus(`Forwarding to ${targetName}...`);
+
+    try {
+      if (message.MediaID) {
+        const { blob, mime } = await mediaBlobForForward(message);
+        const form = new FormData();
+        form.append('conversation_id', targetID);
+        form.append('file', blob, forwardFilename(message, mime));
+        const captionedWhatsAppMedia = targetPlatform === 'whatsapp' && !mime.toLowerCase().startsWith('audio/');
+        const captionedMedia = captionedWhatsAppMedia || targetPlatform === 'signal';
+        if (body && captionedMedia) {
+          form.append('caption', body);
+        }
+        const mediaResponse = await fetch('/api/send-media', { method: 'POST', body: form });
+        if (!mediaResponse.ok) {
+          throw new Error(await responseError(mediaResponse));
+        }
+        if (body && !captionedMedia) {
+          await postJSON('/api/send', {
+            conversation_id: targetID,
+            message: body,
+          });
+        }
+      } else if (body) {
+        await postJSON('/api/send', {
+          conversation_id: targetID,
+          message: body,
+        });
+      } else {
+        throw new Error('Nothing to forward from this message.');
+      }
+
+      closeForwardDialog();
+      showThreadFeedback(`Forwarded to ${targetName}.`);
+      try {
+        if (activeConvoId === targetID) {
+          await loadMessages(targetID, {poll: true, forceBottom: true});
+        }
+        await loadConversations();
+      } catch (refreshErr) {
+        console.error('Failed to refresh after forwarding:', refreshErr);
+      }
+    } finally {
+      setForwardBusy(false);
+    }
   }
 
   function isSameDay(ms1, ms2) {
@@ -8265,13 +8748,7 @@ body::after {
           }
         }
         const previewURL = m.Body ? extractMessageURLs(m.Body)[0] : '';
-        const shouldHideGenericMediaBody = !!m.MediaID && (
-          m.Body === '[Photo]' ||
-          m.Body === '[Video]' ||
-          m.Body === '[Audio]' ||
-          m.Body === '[Voice note]' ||
-          m.Body === '[Sticker]'
-        );
+        const shouldHideGenericMediaBody = !!m.MediaID && isGenericMediaBody(m.Body);
         if (m.Body && !shouldHideGenericMediaBody) {
           html += `<div class="msg-body">${linkifyMessageBody(m.Body)}</div>`;
           if (previewURL) {
@@ -8314,6 +8791,7 @@ body::after {
         html += `<div class="msg-actions">`;
         html += `<button class="action-react" title="React"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M8 14s1.5 2 4 2 4-2 4-2"/><line x1="9" y1="9" x2="9.01" y2="9"/><line x1="15" y1="9" x2="15.01" y2="9"/></svg></button>`;
         html += `<button class="action-reply" title="Reply"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 17 4 12 9 7"/><path d="M20 18v-2a4 4 0 0 0-4-4H4"/></svg></button>`;
+        html += `<button class="action-forward" title="Forward" aria-label="Forward message" ${messageHasForwardableContent(m) ? '' : 'disabled'}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 17 20 12 15 7"/><path d="M4 18v-2a4 4 0 0 1 4-4h12"/><polyline points="13 6 18 1 23 6"/><path d="M11 12h7"/></svg></button>`;
         html += `</div>`;
 
         // Emoji picker (hidden, toggled by react button). MessageID is
@@ -8347,6 +8825,11 @@ body::after {
         el.querySelector('.action-reply').addEventListener('click', (e) => {
           e.stopPropagation();
           setReplyTo(m);
+        });
+
+        el.querySelector('.action-forward').addEventListener('click', (e) => {
+          e.stopPropagation();
+          openForwardDialog(m);
         });
 
         el.addEventListener('contextmenu', (event) => {
@@ -10121,6 +10604,10 @@ body::after {
             setReplyTo(message);
             return;
           }
+          if (action === 'forward-message') {
+            openForwardDialog(message);
+            return;
+          }
           if (action === 'copy-message') {
             await copyTextToClipboard(message.Body || '');
             showThreadFeedback('Message copied.');
@@ -10147,6 +10634,22 @@ body::after {
   // keydown handler's layered Escape stack below.
   window.addEventListener('blur', closeContextMenu);
   window.addEventListener('resize', closeContextMenu);
+
+  if ($forwardClose) {
+    $forwardClose.addEventListener('click', () => {
+      if (!forwarding) closeForwardDialog();
+    });
+  }
+  if ($forwardOverlay) {
+    $forwardOverlay.addEventListener('click', (event) => {
+      if (event.target === $forwardOverlay && !forwarding) {
+        closeForwardDialog();
+      }
+    });
+  }
+  if ($forwardSearch) {
+    $forwardSearch.addEventListener('input', renderForwardTargets);
+  }
 
   // ─── Reply ───
   function setReplyTo(msg) {
@@ -10298,6 +10801,11 @@ body::after {
       e.preventDefault();
       // Close the context menu if open
       if ($contextMenu && !$contextMenu.hidden) { closeContextMenu(); return; }
+      // Close the forward dialog if open
+      if ($forwardOverlay && !$forwardOverlay.hidden) {
+        if (!forwarding) closeForwardDialog();
+        return;
+      }
       // Close fullscreen image viewer if open
       const fullscreen = document.querySelector('.msg-image-fullscreen');
       if (fullscreen) { fullscreen.remove(); return; }

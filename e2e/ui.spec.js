@@ -610,6 +610,42 @@ test('new message surfaces existing routes for the same number', async ({ page }
   await expect(page.locator('#new-msg-go')).toContainText('Open SMS route');
 });
 
+test('forwards text and media messages', async ({ page }) => {
+  const textToForward = 'There is a new Thai place on Valencia';
+
+  await openConversation(page, 'Sarah Chen');
+  const textMessage = page.locator('#messages-area .msg').filter({ hasText: textToForward }).first();
+  await textMessage.hover();
+  await expect(textMessage.locator('.action-forward')).toBeVisible();
+  await textMessage.locator('.action-forward').click();
+
+  await expect(page.locator('#forward-overlay')).toBeVisible();
+  await expect(page.locator('#forward-preview')).toContainText(textToForward);
+  await page.locator('#forward-search').fill('Marcus');
+  await page.locator('#forward-list .forward-target').filter({ hasText: 'Marcus Johnson' }).click();
+
+  await expect(page.locator('#thread-feedback')).toContainText('Forwarded to Marcus Johnson.');
+  await openConversation(page, 'Marcus Johnson');
+  await expect(page.locator('#messages-area')).toContainText(textToForward);
+
+  await openConversation(page, 'Jordan Rivera');
+  await expect(page.locator('#chat-header-source .chat-route-tab.active')).toContainText('WhatsApp');
+  const mediaMessage = page.locator('#messages-area .msg').filter({ hasText: 'Lisbon photo' }).last();
+  await expect(mediaMessage.locator('img[src*="/api/media/"]')).toBeVisible();
+  await mediaMessage.click({ button: 'right' });
+  await page.locator('#context-menu .context-menu-item[data-action="forward-message"]').click();
+
+  await expect(page.locator('#forward-overlay')).toBeVisible();
+  await expect(page.locator('#forward-preview')).toContainText('Image: Lisbon photo');
+  await page.locator('#forward-search').fill('Taylor');
+  await page.locator('#forward-list .forward-target').filter({ hasText: 'Taylor Price' }).click();
+
+  await expect(page.locator('#thread-feedback')).toContainText('Forwarded to Taylor Price.');
+  await openConversation(page, 'Taylor Price');
+  const forwardedMedia = page.locator('#messages-area .msg').filter({ hasText: 'Lisbon photo' }).last();
+  await expect(forwardedMedia.locator('img[src*="/api/media/"]')).toBeVisible();
+});
+
 test('sends a message through the compose box', async ({ page }) => {
   const outbound = `Playwright outbound ${Date.now()}`;
 
