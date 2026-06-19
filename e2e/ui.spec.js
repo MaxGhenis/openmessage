@@ -652,6 +652,53 @@ test('sends a Signal image attachment through the compose box', async ({ page })
   await expect(latestMessage.locator('.msg-media-loading')).toHaveCount(0);
 });
 
+test('ignores duplicate composer submissions while media send is in flight', async ({ page }) => {
+  let sendMediaRequests = 0;
+  let releaseSend;
+  const sendBlocked = new Promise(resolve => {
+    releaseSend = resolve;
+  });
+
+  await page.route('**/api/send-media', async route => {
+    sendMediaRequests += 1;
+    await sendBlocked;
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        message_id: 'signal:e2e-delayed-media',
+        status: 'SUCCESS',
+        success: true,
+      }),
+    });
+  });
+
+  await openConversation(page, 'Taylor Price');
+  await expect(page.locator('#chat-header-source')).toContainText('Signal');
+  await page.locator('#file-input').setInputFiles({
+    name: 'signal-delayed.png',
+    mimeType: 'image/png',
+    buffer: Buffer.from(
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO7Z9wAAAABJRU5ErkJggg==',
+      'base64',
+    ),
+  });
+
+  await expect(page.locator('#attach-preview')).toHaveClass(/active/);
+  await page.locator('#compose-input').press('Enter');
+  await expect.poll(() => sendMediaRequests).toBe(1);
+  await expect(page.locator('#send-btn')).toBeDisabled();
+
+  await page.locator('#compose-input').press('Enter');
+  await page.locator('#compose-input').press('Enter');
+  await page.waitForTimeout(150);
+  expect(sendMediaRequests).toBe(1);
+
+  releaseSend();
+  await expect(page.locator('#attach-preview')).not.toHaveClass(/active/);
+  expect(sendMediaRequests).toBe(1);
+});
+
 test('sends a captioned Signal image as one message, not two', async ({ page }) => {
   const caption = `Signal captioned ${Date.now()}`;
   const sendMediaRequests = [];
