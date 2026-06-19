@@ -795,6 +795,135 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		writeJSON(w, map[string]any{"synced": count})
 	})
 
+	mux.HandleFunc("/api/people", func(w http.ResponseWriter, r *http.Request) {
+		people, err := store.ListMessagedPeople()
+		if err != nil {
+			httpError(w, "list people: "+err.Error(), 500)
+			return
+		}
+		metaMap, _ := store.GetContactMetaMap()
+		now := time.Now().UnixMilli()
+		q := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("q")))
+		out := make([]*personPayload, 0, len(people))
+		for _, p := range people {
+			if q != "" && !strings.Contains(strings.ToLower(p.Name), q) {
+				match := false
+				for _, num := range p.Numbers {
+					if strings.Contains(num, q) {
+						match = true
+						break
+					}
+				}
+				if !match {
+					continue
+				}
+			}
+			out = append(out, buildPersonPayload(p, metaMap[p.Key], now))
+		}
+		writeJSON(w, out)
+	})
+
+	// /api/people/{key} and /api/people/{key}/{action}
+	mux.HandleFunc("/api/people/", func(w http.ResponseWriter, r *http.Request) {
+		rest := strings.TrimPrefix(r.URL.Path, "/api/people/")
+		if rest == "" {
+			httpError(w, "person key required", 400)
+			return
+		}
+		parts := strings.SplitN(rest, "/", 2)
+		key, err := url.PathUnescape(parts[0])
+		if err != nil {
+			key = parts[0]
+		}
+		action := ""
+		if len(parts) > 1 {
+			action = parts[1]
+		}
+
+		person, err := store.PersonByKey(key)
+		if err != nil {
+			httpError(w, "lookup person: "+err.Error(), 500)
+			return
+		}
+		if person == nil {
+			httpError(w, "person not found", 404)
+			return
+		}
+		displayName := person.Name
+
+		// Mutating sub-actions must be POST; only the detail view
+		// (action == "") may be GET, matching the sibling routes that 405.
+		if action != "" && r.Method != http.MethodPost {
+			httpError(w, "method not allowed", 405)
+			return
+		}
+
+		switch action {
+		case "tags":
+			var req struct {
+				Tags []string `json:"tags"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				httpError(w, "invalid JSON: "+err.Error(), 400)
+				return
+			}
+			if err := store.SetContactTags(key, displayName, req.Tags); err != nil {
+				httpError(w, "set tags: "+err.Error(), 500)
+				return
+			}
+		case "reach-out":
+			var req struct {
+				Days int `json:"days"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				httpError(w, "invalid JSON: "+err.Error(), 400)
+				return
+			}
+			if err := store.SetContactReachOut(key, displayName, req.Days); err != nil {
+				httpError(w, "set reach-out: "+err.Error(), 500)
+				return
+			}
+		case "summary":
+			// Regenerate the relationship summary from message history.
+			msgs, err := store.PersonMessages(person.ConversationIDs)
+			if err != nil {
+				httpError(w, "load messages: "+err.Error(), 500)
+				return
+			}
+			summary := story.RelationshipSummary(msgs, displayName, time.Local)
+			if err := store.SetContactSummary(key, displayName, summary, time.Now().UnixMilli()); err != nil {
+				httpError(w, "save summary: "+err.Error(), 500)
+				return
+			}
+		case "":
+			// GET detail — fall through below.
+		default:
+			httpError(w, "not found", 404)
+			return
+		}
+
+		// Build the (possibly updated) detail payload.
+		meta, _ := store.GetContactMeta(key)
+		msgs, _ := store.PersonMessages(person.ConversationIDs)
+		// Generate a summary on first view if none cached yet.
+		if meta != nil && meta.Summary == "" && len(msgs) > 0 {
+			meta.Summary = story.RelationshipSummary(msgs, displayName, time.Local)
+			meta.SummaryAt = time.Now().UnixMilli()
+			_ = store.SetContactSummary(key, displayName, meta.Summary, meta.SummaryAt)
+		}
+		payload := buildPersonPayload(person, meta, time.Now().UnixMilli())
+		payload.MessageCount = len(story.FilterRealMessages(msgs))
+		if meta != nil {
+			payload.Summary = meta.Summary
+			payload.SummaryAt = meta.SummaryAt
+		}
+		writeJSON(w, payload)
+	})
+
+	// ── Scheduled (send-later) messages ───────────────────────────────────
+	// GET  /api/schedule?conversation_id=  — list active scheduled messages
+	// POST /api/schedule                   — schedule a message
+
 	mux.HandleFunc("/api/search", func(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query().Get("q")
 		if q == "" {
@@ -2358,6 +2487,91 @@ func searchPreviewForMessage(msg *db.Message) string {
 		return "[Media]"
 	}
 	return ""
+}
+
+func normalizePhoneNumber(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	hasPlus := strings.HasPrefix(s, "+")
+	digits := digitsOnly(s)
+	if digits == "" {
+		return ""
+	}
+	if hasPlus {
+		return "+" + digits
+	}
+	switch {
+	case len(digits) == 11 && strings.HasPrefix(digits, "1"):
+		return "+" + digits
+	case len(digits) == 10:
+		return "+1" + digits
+	case len(digits) >= 11:
+		return "+" + digits
+	default:
+		return s // short codes / unusual — pass through unchanged
+	}
+}
+
+
+type personPayload struct {
+	Key             string   `json:"key"`
+	Name            string   `json:"name"`
+	Numbers         []string `json:"numbers"`
+	Platforms       []string `json:"platforms"`
+	LastContactedTS int64    `json:"last_contacted_ts"`
+	Tags            []string `json:"tags"`
+	ReachOutDays    int      `json:"reach_out_days"`
+	NextDueTS       int64    `json:"next_due_ts"`
+	Overdue         bool     `json:"overdue"`
+	MessageCount    int      `json:"message_count"`
+	Summary         string   `json:"summary"`
+	SummaryAt       int64    `json:"summary_at"`
+	ConversationIDs []string `json:"conversation_ids"`
+}
+
+func buildPersonPayload(p *db.Person, meta *db.ContactMeta, now int64) *personPayload {
+	pp := &personPayload{
+		Key:             p.Key,
+		Name:            p.Name,
+		Numbers:         p.Numbers,
+		Platforms:       p.Platforms,
+		LastContactedTS: p.LastContactedTS,
+		MessageCount:    p.MessageCount,
+		Tags:            []string{},
+		ConversationIDs: p.ConversationIDs,
+	}
+	if pp.ConversationIDs == nil {
+		pp.ConversationIDs = []string{}
+	}
+	if pp.Numbers == nil {
+		pp.Numbers = []string{}
+	}
+	if pp.Platforms == nil {
+		pp.Platforms = []string{}
+	}
+	if meta != nil {
+		if meta.Tags != nil {
+			pp.Tags = meta.Tags
+		}
+		pp.ReachOutDays = meta.ReachOutDays
+		if meta.ReachOutDays > 0 && p.LastContactedTS > 0 {
+			pp.NextDueTS = p.LastContactedTS + int64(meta.ReachOutDays)*86400000
+			pp.Overdue = now > pp.NextDueTS
+		}
+	}
+	return pp
+}
+
+func digitsOnly(s string) string {
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		if s[i] >= '0' && s[i] <= '9' {
+			b.WriteByte(s[i])
+		}
+	}
+	return b.String()
 }
 
 func writeJSON(w http.ResponseWriter, v any) {

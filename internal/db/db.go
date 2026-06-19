@@ -423,6 +423,18 @@ func (s *Store) migrate() error {
 		WHERE rowid IN (SELECT rowid FROM ranked WHERE rn > 1)
 	`)
 
+	// Per-person CRM metadata (tags, reach-out cadence, cached relationship
+	// summary), keyed by a normalized person key. See contact_meta.go.
+	s.db.Exec(`CREATE TABLE IF NOT EXISTS contact_meta (
+		person_key TEXT PRIMARY KEY,
+		display_name TEXT NOT NULL DEFAULT '',
+		tags TEXT NOT NULL DEFAULT '[]',
+		reach_out_days INTEGER NOT NULL DEFAULT 0,
+		summary TEXT NOT NULL DEFAULT '',
+		summary_at INTEGER NOT NULL DEFAULT 0,
+		updated_at INTEGER NOT NULL DEFAULT 0
+	)`)
+
 	if err := s.enableFTS(); err != nil {
 		return err
 	}
