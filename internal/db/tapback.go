@@ -10,9 +10,10 @@ import (
 // `Loved "see you then"`. iPhones send these as plain messages to Android, and
 // we convert them into an emoji reaction on the message they refer to.
 type Tapback struct {
-	Emoji  string
-	Quoted string // the referenced message text (may be truncated with an ellipsis)
-	Remove bool   // true when the reaction was removed
+	Emoji     string
+	Quoted    string // the referenced message text (may be truncated with an ellipsis)
+	Remove    bool   // true when the reaction was removed
+	Truncated bool   // the quoted text ended with an ellipsis (iMessage truncates long quotes)
 }
 
 type tapbackPattern struct {
@@ -56,13 +57,23 @@ func ParseTapback(body string) (*Tapback, bool) {
 	}
 	for _, p := range tapbackPatterns {
 		if m := p.re.FindStringSubmatch(body); m != nil {
-			return &Tapback{Emoji: p.emoji, Quoted: strings.TrimSpace(m[1]), Remove: p.remove}, true
+			q := strings.TrimSpace(m[1])
+			return &Tapback{Emoji: p.emoji, Quoted: q, Remove: p.remove, Truncated: isTruncatedQuote(q)}, true
 		}
 	}
 	if m := reactedPattern.FindStringSubmatch(body); m != nil {
-		return &Tapback{Emoji: strings.TrimSpace(m[1]), Quoted: strings.TrimSpace(m[2])}, true
+		q := strings.TrimSpace(m[2])
+		return &Tapback{Emoji: strings.TrimSpace(m[1]), Quoted: q, Truncated: isTruncatedQuote(q)}, true
 	}
 	return nil, false
+}
+
+// isTruncatedQuote reports whether a tapback's quoted text was cut off by
+// iMessage (which appends an ellipsis to long quotes). Only truncated quotes
+// are matched by prefix; exact quotes must match a message in full.
+func isTruncatedQuote(quoted string) bool {
+	q := strings.TrimRight(quoted, " ")
+	return strings.HasSuffix(q, "…") || strings.HasSuffix(q, "...")
 }
 
 // ApplyTapback detects whether m is a tapback and, if so, applies it as an
@@ -78,7 +89,7 @@ func (s *Store) ApplyTapback(m *Message) (bool, error) {
 	if !ok {
 		return false, nil
 	}
-	target, err := s.findTapbackTarget(m.ConversationID, tb.Quoted, m.TimestampMS)
+	target, err := s.findTapbackTarget(m.ConversationID, tb.Quoted, m.TimestampMS, tb.Truncated)
 	if err != nil {
 		return false, err
 	}
@@ -106,7 +117,7 @@ func (s *Store) ApplyTapback(m *Message) (bool, error) {
 // findTapbackTarget locates the message a tapback refers to: the most recent
 // message in the conversation (at or before the tapback) whose body equals the
 // quoted text, or — for truncated quotes — starts with it.
-func (s *Store) findTapbackTarget(conversationID, quoted string, beforeTS int64) (*Message, error) {
+func (s *Store) findTapbackTarget(conversationID, quoted string, beforeTS int64, truncated bool) (*Message, error) {
 	quoted = strings.TrimRight(strings.TrimSpace(quoted), ". …")
 	if quoted == "" {
 		return nil, nil
@@ -127,7 +138,11 @@ func (s *Store) findTapbackTarget(conversationID, quoted string, beforeTS int64)
 			return nil, err
 		}
 		b := strings.TrimSpace(body)
-		if b == quoted || strings.HasPrefix(b, quoted) {
+		// Require an exact match for non-truncated quotes; only iMessage-
+		// truncated quotes (ellipsis) may match by prefix. This avoids silently
+		// converting a real typed message like `Loved "hello"` into a reaction
+		// just because some earlier message happened to start with "hello".
+		if b == quoted || (truncated && strings.HasPrefix(b, quoted)) {
 			return &Message{MessageID: id, Body: body, Reactions: reactions}, nil
 		}
 	}

@@ -700,6 +700,12 @@ func (a *App) storeMessage(msg *gmproto.Message) {
 	}
 	dbMsg.ReplyToID = client.ExtractReplyToID(msg)
 
+	// Skip empty contentless stubs so backfill doesn't repopulate "Empty
+	// message" rows that the live path and startup repair remove.
+	if db.IsEmptyStubMessage(dbMsg) {
+		return
+	}
+
 	if err := a.Store.UpsertMessage(dbMsg); err != nil {
 		a.Logger.Error().Err(err).Str("msg_id", dbMsg.MessageID).Msg("Failed to store backfill message")
 	}

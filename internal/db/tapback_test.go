@@ -93,6 +93,15 @@ func TestApplyTapback(t *testing.T) {
 	if !applied2 {
 		t.Error("expected truncated-quote tapback to match the original by prefix")
 	}
+
+	// Guard against false positives: a NON-truncated quote must match a message
+	// in full. A user who literally types `Loved "hi"` must not have it silently
+	// converted just because some earlier message starts with "hi".
+	mustUpsert(&Message{MessageID: "m3", ConversationID: "c1", Body: "hi there, how are you?", TimestampMS: 7000})
+	appliedFP, _ := store.ApplyTapback(&Message{ConversationID: "c1", SenderNumber: "+15551234567", Body: `Loved "hi"`, TimestampMS: 8000})
+	if appliedFP {
+		t.Error("a non-truncated quote must require an exact match, not a prefix match")
+	}
 }
 
 func TestRepairTapbacks(t *testing.T) {

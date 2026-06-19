@@ -150,6 +150,30 @@ func (h *EventHandler) handleMessage(evt *libgm.WrappedMessage) {
 	}
 	dbMsg.ReplyToID = ExtractReplyToID(msg)
 
+	// iMessage tapbacks (e.g. `Loved "see you then"`) arrive from iPhones as
+	// plain SMS/RCS text. Convert them into an emoji reaction on the message
+	// they refer to instead of storing them as a separate message.
+	if applied, err := h.Store.ApplyTapback(dbMsg); err != nil {
+		h.Logger.Warn().Err(err).Str("msg_id", dbMsg.MessageID).Msg("Failed to apply tapback")
+	} else if applied {
+		h.Logger.Debug().Str("msg_id", dbMsg.MessageID).Str("conv_id", dbMsg.ConversationID).Msg("Applied tapback as reaction")
+		if h.OnMessagesChange != nil {
+			h.OnMessagesChange(dbMsg.ConversationID)
+		}
+		if h.OnConversationsChange != nil {
+			h.OnConversationsChange()
+		}
+		return
+	}
+
+	// Drop completed contentless stubs (e.g. an empty message that group
+	// activity leaks into a 1:1 thread). They would render as "Empty message"
+	// and wrongly surface the conversation in recents.
+	if db.IsEmptyStubMessage(dbMsg) {
+		h.Logger.Debug().Str("msg_id", dbMsg.MessageID).Str("conv_id", dbMsg.ConversationID).Msg("Skipped empty stub message")
+		return
+	}
+
 	if err := h.Store.UpsertMessage(dbMsg); err != nil {
 		h.Logger.Error().Err(err).Str("msg_id", dbMsg.MessageID).Msg("Failed to store message")
 		return

@@ -283,6 +283,16 @@ func New(logger zerolog.Logger) (*App, error) {
 	} else if fixed > 0 {
 		logger.Info().Int("fixed", fixed).Msg("Repaired conversations floated up by contentless messages")
 	}
+	if converted, err := store.RepairTapbacks(); err != nil {
+		logger.Warn().Err(err).Msg("Failed to convert legacy iMessage tapbacks to reactions")
+	} else if converted > 0 {
+		logger.Info().Int("converted", converted).Msg("Converted iMessage tapback texts into reactions")
+	}
+	if removed, err := store.RepairEmptyStubMessages(); err != nil {
+		logger.Warn().Err(err).Msg("Failed to remove empty stub messages")
+	} else if removed > 0 {
+		logger.Info().Int("removed", removed).Msg("Removed empty stub messages")
+	}
 	if !Sandboxed() {
 		if mediaRepair, err := (&importer.WhatsAppNative{}).RepairLegacyMediaPlaceholders(store); err != nil {
 			logger.Warn().Err(err).Msg("Failed to repair legacy WhatsApp media placeholders")
