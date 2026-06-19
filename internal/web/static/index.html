@@ -1761,6 +1761,28 @@ html, body {
 }
 .attach-preview .attach-remove:hover { color: var(--text-primary); }
 
+/* ─── Scheduled (send-later) messages ─── */
+.schedule-btn { background: transparent; border: 0; color: var(--text-muted); cursor: pointer; padding: 8px; border-radius: 10px; display: inline-flex; align-items: center; justify-content: center; }
+.schedule-btn svg { width: 20px; height: 20px; }
+.schedule-btn:hover:not(:disabled) { background: var(--bg-hover); color: var(--text-primary); }
+.schedule-btn:disabled { opacity: 0.4; cursor: default; }
+.scheduled-strip { display: flex; flex-direction: column; gap: 6px; padding: 0 16px 6px; }
+.scheduled-strip:empty { display: none; padding: 0; }
+.scheduled-item { display: flex; align-items: center; gap: 10px; padding: 8px 12px; border: 1px solid var(--border-accent); border-radius: 12px; background: var(--accent-dim); }
+.scheduled-item > svg { width: 15px; height: 15px; color: var(--accent); flex: 0 0 auto; }
+.scheduled-item.failed { border-color: rgba(229, 72, 77, 0.4); background: rgba(229, 72, 77, 0.1); }
+.scheduled-item.failed > svg { color: #ff6b6b; }
+.scheduled-item-body { flex: 1; min-width: 0; }
+.scheduled-item-text { color: var(--text-primary); font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.scheduled-item-when { color: var(--text-muted); font-size: 11px; margin-top: 2px; }
+.scheduled-item.failed .scheduled-item-when { color: #ff6b6b; }
+.scheduled-item-cancel { background: none; border: 0; color: var(--text-muted); cursor: pointer; font-size: 17px; line-height: 1; padding: 2px 6px; }
+.scheduled-item-cancel:hover { color: var(--text-primary); }
+.schedule-custom { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 10px 16px; }
+.schedule-custom[hidden] { display: none; }
+.schedule-custom label { color: var(--text-muted); font-size: 13px; }
+.schedule-custom input { padding: 7px 10px; border: 1px solid var(--border); border-radius: 10px; background: var(--bg-elevated); color: var(--text-primary); font: inherit; }
+
 .attach-btn {
   width: 44px;
   height: 44px;
@@ -4804,6 +4826,13 @@ body::after {
       <span class="attach-name" id="attach-name"></span>
       <button class="attach-remove" id="attach-remove" aria-label="Remove attachment">&times;</button>
     </div>
+    <div class="scheduled-strip" id="scheduled-strip"></div>
+    <div class="schedule-custom" id="schedule-custom" hidden>
+      <label for="schedule-custom-input">Send at</label>
+      <input type="datetime-local" id="schedule-custom-input">
+      <button class="cd-btn primary" id="schedule-custom-go">Schedule</button>
+      <button class="cd-btn" id="schedule-custom-cancel" type="button">Cancel</button>
+    </div>
     <div class="compose-bar" id="compose-bar" style="display:none">
       <div class="compose-row">
         <input type="file" id="file-input" accept="image/*,video/*,audio/*" style="display:none">
@@ -4814,6 +4843,9 @@ body::after {
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M8 14s1.5 2 4 2 4-2 4-2"/><line x1="9" y1="9" x2="9.01" y2="9"/><line x1="15" y1="9" x2="15.01" y2="9"/></svg>
         </button>
         <textarea class="compose-input" id="compose-input" placeholder="Write a message..." rows="1" aria-label="Message"></textarea>
+        <button class="schedule-btn" id="schedule-btn" title="Schedule send" aria-label="Schedule send" disabled>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15 14"/></svg>
+        </button>
         <button class="send-btn" id="send-btn" disabled aria-label="Send message">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
         </button>
@@ -4957,6 +4989,12 @@ body::after {
   const $composeEmojiBtn = document.getElementById('compose-emoji-btn');
   const $composeEmojiPanel = document.getElementById('compose-emoji-panel');
   const $sendBtn = document.getElementById('send-btn');
+  const $scheduleBtn = document.getElementById('schedule-btn');
+  const $scheduledStrip = document.getElementById('scheduled-strip');
+  const $scheduleCustom = document.getElementById('schedule-custom');
+  const $scheduleCustomInput = document.getElementById('schedule-custom-input');
+  const $scheduleCustomGo = document.getElementById('schedule-custom-go');
+  const $scheduleCustomCancel = document.getElementById('schedule-custom-cancel');
   const $fileInput = document.getElementById('file-input');
   const $attachBtn = document.getElementById('attach-btn');
   const $attachPreview = document.getElementById('attach-preview');
@@ -7774,6 +7812,7 @@ body::after {
     $messagesArea.setAttribute('aria-busy', 'true');
     renderThreadPlaceholder('Loading messages...');
     await loadMessages(convo.ConversationID, {reset: true});
+    loadScheduledMessages(convo.ConversationID);
   }
 
   // ─── Load Messages ───
@@ -8897,6 +8936,12 @@ body::after {
       || browserIsOffline()
       || (hasText && !conversationSupportsOutbound(activeConversation))
       || (hasMedia && !conversationSupportsMediaOutbound(activeConversation));
+    // Schedule supports text and media attachments.
+    if ($scheduleBtn) {
+      const canScheduleText = hasText && conversationSupportsOutbound(activeConversation);
+      const canScheduleMedia = hasMedia && conversationSupportsMediaOutbound(activeConversation);
+      $scheduleBtn.disabled = !activeConversation || (!canScheduleText && !canScheduleMedia);
+    }
   }
 
   $composeInput.addEventListener('input', () => {
@@ -8910,6 +8955,139 @@ body::after {
     }
   });
   $sendBtn.addEventListener('click', sendMessage);
+
+  // ─── Scheduled (send-later) messages ───
+  function nextDayAtHour(hour) {
+    const d = new Date();
+    d.setDate(d.getDate() + 1);
+    d.setHours(hour, 0, 0, 0);
+    return d.getTime();
+  }
+
+  function openScheduleMenu() {
+    if (!$scheduleBtn || $scheduleBtn.disabled) return;
+    const rect = $scheduleBtn.getBoundingClientRect();
+    openContextMenuAt(rect.left - 60, rect.top - 8, [
+      { label: 'Tomorrow 9:00 AM', action: 'sched:9' },
+      { label: 'Tomorrow 5:00 PM', action: 'sched:17' },
+      { type: 'divider' },
+      { label: 'Custom date & time…', action: 'sched:custom' },
+    ], { type: 'schedule' });
+  }
+
+  function formatScheduledWhen(ts) {
+    const d = new Date(ts);
+    const now = new Date();
+    const opts = { hour: 'numeric', minute: '2-digit' };
+    const tomorrow = new Date(now); tomorrow.setDate(now.getDate() + 1);
+    if (d.toDateString() === now.toDateString()) return `Today ${d.toLocaleTimeString([], opts)}`;
+    if (d.toDateString() === tomorrow.toDateString()) return `Tomorrow ${d.toLocaleTimeString([], opts)}`;
+    return d.toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' }) + ' ' + d.toLocaleTimeString([], opts);
+  }
+
+  async function scheduleSend(sendAt) {
+    if (!activeConvoId) return;
+    const text = $composeInput.value.trim();
+    const hasMedia = !!pendingFile;
+    if (!text && !hasMedia) { showThreadFeedback('Type a message or attach a file to schedule.'); return; }
+    if (!Number.isFinite(sendAt) || sendAt < Date.now() + 10000) {
+      showThreadFeedback('Pick a time at least a moment in the future.');
+      return;
+    }
+    const replyId = replyToMsg ? replyToMsg.MessageID : '';
+    try {
+      if (hasMedia) {
+        const form = new FormData();
+        form.append('conversation_id', activeConvoId);
+        form.append('file', pendingFile.file);
+        form.append('caption', text);
+        form.append('reply_to_id', replyId);
+        form.append('send_at', String(sendAt));
+        const resp = await fetch(API + '/api/schedule-media', { method: 'POST', body: form });
+        if (!resp.ok) {
+          const msg = await resp.text();
+          throw new Error(msg || 'Failed to schedule attachment.');
+        }
+        clearAttachment();
+      } else {
+        await postJSON('/api/schedule', {
+          conversation_id: activeConvoId,
+          body: text,
+          reply_to_id: replyId,
+          send_at: sendAt,
+        });
+      }
+      $composeInput.value = '';
+      autoResize();
+      if (replyToMsg) clearReply();
+      hideScheduleCustom();
+      showThreadFeedback(`Scheduled for ${formatScheduledWhen(sendAt)}.`);
+      loadScheduledMessages(activeConvoId);
+    } catch (err) {
+      showThreadFeedback(err.message || 'Failed to schedule message.');
+    }
+  }
+
+  async function loadScheduledMessages(convId) {
+    if (!$scheduledStrip) return;
+    if (!convId) { $scheduledStrip.innerHTML = ''; return; }
+    try {
+      const list = await fetchJSON(`/api/schedule?conversation_id=${encodeURIComponent(convId)}`);
+      if (activeConvoId !== convId) return;
+      renderScheduledStrip(Array.isArray(list) ? list : []);
+    } catch (err) {
+      $scheduledStrip.innerHTML = '';
+    }
+  }
+
+  function renderScheduledStrip(list) {
+    if (!$scheduledStrip) return;
+    const clock = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15 14"/></svg>';
+    $scheduledStrip.innerHTML = list.map(s => {
+      const failed = s.status === 'failed';
+      const when = failed
+        ? `Couldn't send: ${escapeHtml(s.last_error || 'failed')}`
+        : `Scheduled for ${escapeHtml(formatScheduledWhen(s.send_at))}`;
+      const paperclip = '<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:4px;"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>';
+      let textHtml;
+      if (s.media_filename) {
+        const cap = s.body ? escapeHtml(s.body) : escapeHtml(s.media_filename);
+        textHtml = `${paperclip}${cap}`;
+      } else {
+        textHtml = escapeHtml(s.body);
+      }
+      return `<div class="scheduled-item${failed ? ' failed' : ''}">
+        ${clock}
+        <div class="scheduled-item-body">
+          <div class="scheduled-item-text">${textHtml}</div>
+          <div class="scheduled-item-when">${when}</div>
+        </div>
+        <button class="scheduled-item-cancel" data-id="${escapeHtml(s.id)}" title="Cancel" aria-label="Cancel scheduled message">&times;</button>
+      </div>`;
+    }).join('');
+    $scheduledStrip.querySelectorAll('.scheduled-item-cancel').forEach(btn => {
+      btn.addEventListener('click', () => cancelScheduled(btn.dataset.id));
+    });
+  }
+
+  async function cancelScheduled(id) {
+    try {
+      await fetch(API + `/api/schedule/${encodeURIComponent(id)}`, { method: 'DELETE' });
+    } catch (err) { /* ignore */ }
+    loadScheduledMessages(activeConvoId);
+  }
+
+  function showScheduleCustom() {
+    if (!$scheduleCustom || !$scheduleCustomInput) return;
+    const d = new Date(nextDayAtHour(9));
+    const pad = n => String(n).padStart(2, '0');
+    $scheduleCustomInput.value = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    $scheduleCustom.hidden = false;
+    setTimeout(() => $scheduleCustomInput.focus(), 50);
+  }
+  function hideScheduleCustom() {
+    if ($scheduleCustom) $scheduleCustom.hidden = true;
+  }
 
   function buildComposeEmojiPanel() {
     if (!$composeEmojiPanel || $composeEmojiPanel.dataset.hydrated === 'true') return;
@@ -9034,7 +9212,7 @@ body::after {
     pendingFile = { file };
     $attachName.textContent = file.name || 'Attachment';
     $attachPreview.classList.add('active');
-    $sendBtn.disabled = false;
+    autoResize();
 
     if (file.type.startsWith('image/')) {
       const reader = new FileReader();
@@ -9834,7 +10012,10 @@ body::after {
     clearTimeout(threadRefreshTimer);
     threadRefreshTimer = setTimeout(() => {
       threadRefreshTimer = null;
-      if (activeConvoId) loadMessages(activeConvoId, {poll: true});
+      if (activeConvoId) {
+        loadMessages(activeConvoId, {poll: true});
+        loadScheduledMessages(activeConvoId);
+      }
     }, delay);
   }
 
@@ -10065,7 +10246,7 @@ body::after {
     if ($contactPopover && !$contactPopover.hidden && !e.target.closest('.contact-popover') && !e.target.closest('#chat-header-name')) {
       closeContactPopover();
     }
-    if ($contextMenu && !$contextMenu.hidden && !e.target.closest('.context-menu') && !e.target.closest('.chat-header-action-btn') && !e.target.closest('#bulk-move-btn')) {
+    if ($contextMenu && !$contextMenu.hidden && !e.target.closest('.context-menu') && !e.target.closest('.chat-header-action-btn') && !e.target.closest('#bulk-move-btn') && !e.target.closest('#schedule-btn')) {
       closeContextMenu();
     }
   });
@@ -10113,6 +10294,11 @@ body::after {
         if (context.type === 'tab' && context.tabId) {
           if (action === 'rename-tab') { await renameTabFlow(context.tabId); return; }
           if (action === 'delete-tab') { await deleteTabFlow(context.tabId); return; }
+        }
+        if (context.type === 'schedule') {
+          if (action === 'sched:9') { scheduleSend(nextDayAtHour(9)); return; }
+          if (action === 'sched:17') { scheduleSend(nextDayAtHour(17)); return; }
+          if (action === 'sched:custom') { showScheduleCustom(); return; }
         }
         if (context.type === 'message' && context.message) {
           const message = context.message;
@@ -10234,6 +10420,8 @@ body::after {
     activeConvoId = null;
     activeConvoIsGroup = false;
     activeConversation = null;
+    if ($scheduledStrip) $scheduledStrip.innerHTML = '';
+    hideScheduleCustom();
     document.body.classList.remove('thread-open');
     syncConversationURL('');
     activeProtocolDetail = '';
@@ -10747,6 +10935,13 @@ body::after {
   if ($selectToggleBtn) $selectToggleBtn.addEventListener('click', toggleSelectionMode);
   if ($bulkCancelBtn) $bulkCancelBtn.addEventListener('click', exitSelectionMode);
   if ($bulkMoveBtn) $bulkMoveBtn.addEventListener('click', openBulkMoveMenu);
+  if ($scheduleBtn) $scheduleBtn.addEventListener('click', openScheduleMenu);
+  if ($scheduleCustomCancel) $scheduleCustomCancel.addEventListener('click', hideScheduleCustom);
+  if ($scheduleCustomGo) $scheduleCustomGo.addEventListener('click', () => {
+    const v = $scheduleCustomInput && $scheduleCustomInput.value;
+    if (!v) { showThreadFeedback('Pick a date and time.'); return; }
+    scheduleSend(new Date(v).getTime());
+  });
   startEventStream();
   loadTabs();
   loadConversations();
