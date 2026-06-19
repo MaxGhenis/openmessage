@@ -135,6 +135,54 @@ html, body {
 }
 .new-msg-overlay.show { display: flex; }
 
+/* ─── Contacts / CRM overlay ─── */
+.contacts-overlay { position: fixed; inset: 0; z-index: 1500; display: none; background: var(--bg-deep); }
+.contacts-overlay.show { display: flex; }
+.contacts-pane-left { width: 340px; flex: 0 0 340px; display: flex; flex-direction: column; border-right: 1px solid var(--border); background: var(--bg-surface); }
+.contacts-left-header { display: flex; align-items: center; justify-content: space-between; padding: 20px 20px 12px; }
+.contacts-left-header h2 { margin: 0; font-size: 20px; color: var(--text-primary); }
+.contacts-search { display: flex; align-items: center; gap: 8px; margin: 0 16px 12px; padding: 9px 12px; border: 1px solid var(--border); border-radius: 12px; background: var(--bg-elevated); }
+.contacts-search svg { width: 16px; height: 16px; color: var(--text-muted); flex: 0 0 auto; }
+.contacts-search input { border: 0; background: transparent; outline: none; width: 100%; color: var(--text-primary); font: inherit; }
+.contacts-sort { display: flex; gap: 6px; padding: 0 16px 12px; }
+.contacts-sort-btn { flex: 1; padding: 7px 8px; border: 1px solid var(--border); border-radius: 999px; background: var(--bg-elevated); color: var(--text-secondary); font-family: var(--font-sans); font-size: 12px; font-weight: 600; cursor: pointer; white-space: nowrap; transition: background 0.16s ease, color 0.16s ease, border-color 0.16s ease; }
+.contacts-sort-btn:hover { background: var(--bg-hover); color: var(--text-primary); }
+.contacts-sort-btn.active { background: var(--accent-dim); border-color: var(--border-accent); color: var(--text-primary); }
+.contacts-list { flex: 1; overflow-y: auto; padding: 0 10px 16px; }
+.contact-row { display: flex; align-items: center; gap: 12px; padding: 10px 12px; border-radius: 12px; cursor: pointer; }
+.contact-row:hover { background: var(--bg-hover); }
+.contact-row.active { background: var(--accent-dim); }
+.contact-row .convo-avatar { width: 40px; height: 40px; flex: 0 0 40px; }
+.contact-row-meta { flex: 1; min-width: 0; }
+.contact-row-name { color: var(--text-primary); font-weight: 600; font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.contact-row-sub { color: var(--text-muted); font-size: 12px; margin-top: 2px; }
+.contact-row-due { flex: 0 0 auto; font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; padding: 3px 7px; border-radius: 999px; background: rgba(229, 72, 77, 0.16); color: #ff6b6b; }
+.contacts-pane-right { flex: 1; overflow-y: auto; padding: 32px 40px; }
+.contacts-detail-empty { color: var(--text-muted); font-size: 14px; margin-top: 80px; text-align: center; }
+.contacts-detail-body { max-width: 640px; }
+.cd-head { display: flex; align-items: center; gap: 18px; margin-bottom: 24px; }
+.cd-head .convo-avatar { width: 72px; height: 72px; flex: 0 0 72px; font-size: 26px; }
+.cd-name { font-size: 26px; font-weight: 700; color: var(--text-primary); }
+.cd-sub { color: var(--text-secondary); font-size: 13px; margin-top: 4px; }
+.cd-section { margin-bottom: 26px; }
+.cd-label { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.1em; color: var(--text-muted); margin-bottom: 10px; }
+.cd-info-row { color: var(--text-primary); font-size: 14px; padding: 7px 0; border-bottom: 1px solid var(--border); display: flex; gap: 10px; }
+.cd-info-row .k { color: var(--text-muted); width: 130px; flex: 0 0 130px; }
+.cd-tags { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.cd-tag { display: inline-flex; align-items: center; gap: 6px; padding: 5px 10px; border-radius: 999px; background: var(--accent-dim); border: 1px solid var(--border-accent); color: var(--text-primary); font-size: 12px; font-weight: 600; }
+.cd-tag button { background: none; border: 0; color: var(--text-muted); cursor: pointer; font-size: 14px; line-height: 1; padding: 0; }
+.cd-tag-input { padding: 6px 10px; border: 1px dashed var(--border); border-radius: 999px; background: var(--bg-elevated); color: var(--text-primary); font: inherit; font-size: 12px; width: 110px; outline: none; }
+.cd-summary { color: var(--text-secondary); font-size: 14px; line-height: 1.65; }
+.cd-tickler { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.cd-tickler input { width: 70px; padding: 8px 10px; border: 1px solid var(--border); border-radius: 10px; background: var(--bg-elevated); color: var(--text-primary); font: inherit; outline: none; }
+.cd-tickler .muted { color: var(--text-muted); font-size: 13px; }
+.cd-btn { padding: 8px 14px; border: 1px solid var(--border); border-radius: 10px; background: var(--bg-elevated); color: var(--text-secondary); font: inherit; font-size: 13px; font-weight: 600; cursor: pointer; }
+.cd-btn:hover { background: var(--bg-hover); color: var(--text-primary); }
+.cd-btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.cd-due-pill { display: inline-block; padding: 4px 10px; border-radius: 999px; font-size: 12px; font-weight: 600; margin-left: 4px; }
+.cd-due-pill.overdue { background: rgba(229, 72, 77, 0.16); color: #ff6b6b; }
+.cd-due-pill.ok { background: rgba(60, 200, 120, 0.14); color: #36c47a; }
+
 .wa-overlay {
   display: none;
   position: fixed;
@@ -4600,6 +4648,9 @@ body::after {
             </div>
           </div>
         <div class="sidebar-actions">
+          <button class="new-msg-btn" id="contacts-btn" type="button" title="Contacts" aria-label="Contacts">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+          </button>
           <button class="new-msg-btn notif-btn" id="notif-btn" type="button" title="Enable desktop notifications" aria-label="Enable desktop notifications" aria-pressed="false">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M15 17h5l-1.4-1.4A2 2 0 0 1 18 14.2V11a6 6 0 1 0-12 0v3.2a2 2 0 0 1-.6 1.4L4 17h5"/><path d="M9.5 17a2.5 2.5 0 0 0 5 0"/></svg>
           </button>
@@ -4651,6 +4702,29 @@ body::after {
         <div class="new-msg-routes" id="new-msg-routes"></div>
         <button class="new-msg-go" id="new-msg-go">Start conversation</button>
         <div class="new-msg-error" id="new-msg-error"></div>
+      </div>
+    </div>
+
+    <div class="contacts-overlay" id="contacts-overlay">
+      <div class="contacts-pane-left">
+        <div class="contacts-left-header">
+          <h2>Contacts</h2>
+          <button class="new-msg-close" id="contacts-close" aria-label="Close contacts">&times;</button>
+        </div>
+        <div class="contacts-search">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+          <input type="text" id="contacts-search-input" placeholder="Search contacts" autocomplete="off" spellcheck="false">
+        </div>
+        <div class="contacts-sort" id="contacts-sort">
+          <button type="button" class="contacts-sort-btn active" data-sort="recent">Recent</button>
+          <button type="button" class="contacts-sort-btn" data-sort="alpha">A–Z</button>
+          <button type="button" class="contacts-sort-btn" data-sort="messages">Most messages</button>
+        </div>
+        <div class="contacts-list" id="contacts-list"></div>
+      </div>
+      <div class="contacts-pane-right">
+        <div class="contacts-detail-empty" id="contacts-detail-empty">Select a contact to see their details, tags, and relationship summary.</div>
+        <div class="contacts-detail-body" id="contacts-detail-body" hidden></div>
       </div>
     </div>
 
@@ -4976,6 +5050,17 @@ body::after {
   const $notifBtn = document.getElementById('notif-btn');
   const $waOverlay = document.getElementById('wa-overlay');
   const $waClose = document.getElementById('wa-close');
+  const $contactsBtn = document.getElementById('contacts-btn');
+  const $contactsOverlay = document.getElementById('contacts-overlay');
+  const $contactsClose = document.getElementById('contacts-close');
+  const $contactsSearchInput = document.getElementById('contacts-search-input');
+  const $contactsList = document.getElementById('contacts-list');
+  const $contactsDetailEmpty = document.getElementById('contacts-detail-empty');
+  const $contactsDetailBody = document.getElementById('contacts-detail-body');
+  let contactsCurrentKey = null;
+  let contactsSearchTimer = null;
+  let contactsPeople = [];
+  let contactsSortMode = 'recent';
   const $gmStatusPill = document.getElementById('gm-status-pill');
   const $gmHelper = document.getElementById('gm-helper');
   const $gmReconnectBtn = document.getElementById('gm-reconnect-btn');
@@ -9625,6 +9710,211 @@ body::after {
     clearSignalError();
   }
 
+  // ─── Contacts / CRM view ───
+  function openContacts() {
+    if (!$contactsOverlay) return;
+    $contactsOverlay.classList.add('show');
+    loadPeople('');
+    if ($contactsSearchInput) { $contactsSearchInput.value = ''; setTimeout(() => $contactsSearchInput.focus(), 80); }
+  }
+  function closeContacts() {
+    if ($contactsOverlay) $contactsOverlay.classList.remove('show');
+  }
+
+  function formatLastContacted(ts) {
+    if (!ts) return 'Never contacted';
+    const days = Math.floor((Date.now() - ts) / 86400000);
+    if (days <= 0) return 'Today';
+    if (days === 1) return 'Yesterday';
+    if (days < 30) return `${days} days ago`;
+    if (days < 365) return `${Math.floor(days / 30)} mo ago`;
+    return new Date(ts).toLocaleDateString([], { year: 'numeric', month: 'short' });
+  }
+
+  async function loadPeople(q) {
+    if (!$contactsList) return;
+    try {
+      const people = await fetchJSON(`/api/people${q ? `?q=${encodeURIComponent(q)}` : ''}`);
+      contactsPeople = Array.isArray(people) ? people : [];
+      renderContactsList(sortPeople(contactsPeople));
+    } catch (err) {
+      $contactsList.innerHTML = `<div style="padding:24px;color:var(--text-muted);font-size:13px">Failed to load contacts.</div>`;
+    }
+  }
+
+  function personHasName(p) {
+    return /[a-z]/i.test(String(p.name || ''));
+  }
+
+  // Sort the loaded people by the active mode without re-fetching.
+  function sortPeople(people) {
+    const list = people.slice();
+    if (contactsSortMode === 'alpha') {
+      // Named contacts A–Z first; "numbers only" names sorted last.
+      list.sort((a, b) => {
+        const an = personHasName(a), bn = personHasName(b);
+        if (an !== bn) return an ? -1 : 1;
+        return String(a.name || '').localeCompare(String(b.name || ''), undefined, { sensitivity: 'base' });
+      });
+    } else if (contactsSortMode === 'messages') {
+      list.sort((a, b) => (b.message_count || 0) - (a.message_count || 0) || (b.last_contacted_ts || 0) - (a.last_contacted_ts || 0));
+    } else {
+      list.sort((a, b) => (b.last_contacted_ts || 0) - (a.last_contacted_ts || 0));
+    }
+    return list;
+  }
+
+  function setContactsSort(mode) {
+    if (contactsSortMode === mode) return;
+    contactsSortMode = mode;
+    document.querySelectorAll('#contacts-sort .contacts-sort-btn').forEach(b => b.classList.toggle('active', b.dataset.sort === mode));
+    renderContactsList(sortPeople(contactsPeople));
+  }
+
+  function renderContactsList(people) {
+    if (!people.length) {
+      $contactsList.innerHTML = `<div style="padding:24px;color:var(--text-muted);font-size:13px">No contacts found.</div>`;
+      return;
+    }
+    $contactsList.innerHTML = '';
+    people.forEach(p => {
+      const el = document.createElement('div');
+      el.className = 'contact-row' + (p.key === contactsCurrentKey ? ' active' : '');
+      el.dataset.key = p.key;
+      const due = p.overdue ? '<span class="contact-row-due">Due</span>' : '';
+      el.innerHTML = `
+        ${avatarHTML({ name: p.name, numbers: p.numbers || [], className: 'convo-avatar', style: `background:${avatarColor(p.name)}` })}
+        <div class="contact-row-meta">
+          <div class="contact-row-name">${escapeHtml(p.name)}</div>
+          <div class="contact-row-sub">${escapeHtml(formatLastContacted(p.last_contacted_ts))} · ${p.message_count || 0} msg${p.message_count === 1 ? '' : 's'}</div>
+        </div>
+        ${due}
+      `;
+      el.addEventListener('click', () => selectPerson(p.key));
+      $contactsList.appendChild(el);
+    });
+    hydrateNativeAvatars($contactsList);
+  }
+
+  async function selectPerson(key) {
+    contactsCurrentKey = key;
+    $contactsList.querySelectorAll('.contact-row').forEach(r => r.classList.toggle('active', r.dataset.key === key));
+    $contactsDetailEmpty.style.display = 'none';
+    $contactsDetailBody.hidden = false;
+    $contactsDetailBody.innerHTML = `<div style="color:var(--text-muted);font-size:13px">Loading…</div>`;
+    try {
+      const p = await fetchJSON(`/api/people/${encodeURIComponent(key)}`);
+      renderPersonDetail(p);
+    } catch (err) {
+      $contactsDetailBody.innerHTML = `<div style="color:var(--text-muted)">Failed to load contact.</div>`;
+    }
+  }
+
+  function renderPersonDetail(p) {
+    const numbers = p.numbers || [];
+    const platforms = p.platforms || [];
+    const tags = p.tags || [];
+    let dueHtml = '';
+    if (p.reach_out_days > 0) {
+      dueHtml = p.overdue
+        ? `<span class="cd-due-pill overdue">Overdue</span>`
+        : `<span class="cd-due-pill ok">On track</span>`;
+    }
+    let infoRows = '';
+    if (numbers.length) infoRows += `<div class="cd-info-row"><span class="k">Phone</span><span>${numbers.map(escapeHtml).join('<br>')}</span></div>`;
+    if (platforms.length) infoRows += `<div class="cd-info-row"><span class="k">Platforms</span><span>${platforms.map(escapeHtml).join(', ')}</span></div>`;
+    infoRows += `<div class="cd-info-row"><span class="k">Last contacted</span><span>${escapeHtml(formatLastContacted(p.last_contacted_ts))}</span></div>`;
+    infoRows += `<div class="cd-info-row"><span class="k">Messages</span><span>${p.message_count || 0}</span></div>`;
+
+    const tagsHtml = tags.map((t, i) => `<span class="cd-tag">${escapeHtml(t)}<button data-tag-idx="${i}" title="Remove">&times;</button></span>`).join('');
+
+    $contactsDetailBody.innerHTML = `
+      <div class="cd-head">
+        ${avatarHTML({ name: p.name, numbers: numbers, className: 'convo-avatar', style: `background:${avatarColor(p.name)}` })}
+        <div>
+          <div class="cd-name">${escapeHtml(p.name)}</div>
+          <div class="cd-sub">${escapeHtml(formatLastContacted(p.last_contacted_ts))} · ${p.message_count || 0} messages</div>
+        </div>
+      </div>
+      ${(p.conversation_ids && p.conversation_ids.length) ? `<div class="cd-section"><button class="cd-btn primary" id="cd-open-convo">Open conversation${p.conversation_ids.length > 1 ? 's' : ''}</button></div>` : ''}
+      <div class="cd-section">
+        <div class="cd-label">Contact information</div>
+        ${infoRows}
+      </div>
+      <div class="cd-section">
+        <div class="cd-label">Tags</div>
+        <div class="cd-tags" id="cd-tags">
+          ${tagsHtml}
+          <input type="text" class="cd-tag-input" id="cd-tag-input" placeholder="Add tag…" autocomplete="off">
+        </div>
+      </div>
+      <div class="cd-section">
+        <div class="cd-label">Reach-out reminder ${dueHtml}</div>
+        <div class="cd-tickler">
+          <span class="muted">Remind me to reach out every</span>
+          <input type="number" id="cd-reachout-input" min="0" max="3650" value="${p.reach_out_days || ''}" placeholder="0">
+          <span class="muted">days</span>
+          <button class="cd-btn primary" id="cd-reachout-save">Save</button>
+        </div>
+      </div>
+      <div class="cd-section">
+        <div class="cd-label">Relationship summary</div>
+        <div class="cd-summary" id="cd-summary">${escapeHtml(p.summary || 'No summary yet.')}</div>
+        <div style="margin-top:12px"><button class="cd-btn" id="cd-summary-regen">Regenerate</button></div>
+      </div>
+    `;
+    wirePersonDetail(p);
+  }
+
+  async function openPersonConversation(p) {
+    const ids = (p && p.conversation_ids) || [];
+    if (!ids.length) return;
+    closeContacts();
+    let convo = null;
+    for (const id of ids) { // ids are most-recent-first
+      convo = allConversations.find(c => c.ConversationID === id);
+      if (convo) break;
+    }
+    if (!convo) {
+      // Not in the loaded set yet — reload conversations, then try again.
+      await loadConversations();
+      convo = allConversations.find(c => ids.includes(c.ConversationID)) || null;
+    }
+    if (convo) await revealAndSelectConversation(convo);
+  }
+
+  function wirePersonDetail(p) {
+    const key = p.key;
+    const tags = (p.tags || []).slice();
+    const openBtn = document.getElementById('cd-open-convo');
+    if (openBtn) openBtn.addEventListener('click', () => openPersonConversation(p));
+    const refresh = () => { selectPerson(key); loadPeople($contactsSearchInput.value.trim()); };
+    const saveTags = async (next) => {
+      try { await postJSON(`/api/people/${encodeURIComponent(key)}/tags`, { tags: next }); refresh(); }
+      catch (err) { showThreadFeedback(err.message || 'Failed to save tags.'); }
+    };
+    const tagInput = document.getElementById('cd-tag-input');
+    if (tagInput) tagInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); const v = tagInput.value.trim(); if (v) saveTags([...tags, v]); }
+    });
+    document.querySelectorAll('#cd-tags .cd-tag button').forEach(btn => {
+      btn.addEventListener('click', () => { const idx = parseInt(btn.dataset.tagIdx, 10); saveTags(tags.filter((_, i) => i !== idx)); });
+    });
+    const reachSave = document.getElementById('cd-reachout-save');
+    if (reachSave) reachSave.addEventListener('click', async () => {
+      const days = parseInt(document.getElementById('cd-reachout-input').value, 10) || 0;
+      try { await postJSON(`/api/people/${encodeURIComponent(key)}/reach-out`, { days }); refresh(); }
+      catch (err) { showThreadFeedback(err.message || 'Failed to save reminder.'); }
+    });
+    const regen = document.getElementById('cd-summary-regen');
+    if (regen) regen.addEventListener('click', async () => {
+      regen.disabled = true; regen.textContent = 'Generating…';
+      try { const updated = await postJSON(`/api/people/${encodeURIComponent(key)}/summary`, {}); document.getElementById('cd-summary').textContent = updated.summary || 'No summary.'; }
+      catch (err) { showThreadFeedback(err.message || 'Failed to generate summary.'); }
+      finally { regen.disabled = false; regen.textContent = 'Regenerate'; }
+    });
+  }
+
   async function connectWhatsAppBridge() {
     clearWhatsAppError();
     try {
@@ -10747,6 +11037,18 @@ body::after {
   if ($selectToggleBtn) $selectToggleBtn.addEventListener('click', toggleSelectionMode);
   if ($bulkCancelBtn) $bulkCancelBtn.addEventListener('click', exitSelectionMode);
   if ($bulkMoveBtn) $bulkMoveBtn.addEventListener('click', openBulkMoveMenu);
+  if ($contactsBtn) $contactsBtn.addEventListener('click', openContacts);
+  if ($contactsClose) $contactsClose.addEventListener('click', closeContacts);
+  if ($contactsSearchInput) $contactsSearchInput.addEventListener('input', () => {
+    clearTimeout(contactsSearchTimer);
+    contactsSearchTimer = setTimeout(() => loadPeople($contactsSearchInput.value.trim()), 200);
+  });
+  document.querySelectorAll('#contacts-sort .contacts-sort-btn').forEach(btn => {
+    btn.addEventListener('click', () => setContactsSort(btn.dataset.sort));
+  });
+  window.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && $contactsOverlay && $contactsOverlay.classList.contains('show')) closeContacts();
+  });
   startEventStream();
   loadTabs();
   loadConversations();
