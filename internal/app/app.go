@@ -121,7 +121,11 @@ type App struct {
 	SessionPath            string
 	WhatsAppSessionPath    string
 	SignalConfigPath       string
-	Connected              atomic.Bool
+	// sendTextOverride lets tests substitute the scheduler's send. Nil in prod.
+	sendTextOverride func(conversationID, body, replyToID string) (*db.Message, error)
+	// sendMediaOverride lets tests substitute the scheduler's media send. Nil in prod.
+	sendMediaOverride func(conversationID string, data []byte, filename, mime, caption, replyToID string) (*db.Message, error)
+	Connected         atomic.Bool
 	OnConversationsChange  func()
 	OnIncomingMessage      func(*db.Message)
 	OnMessagesChange       func(string)

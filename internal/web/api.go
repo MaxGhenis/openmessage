@@ -1,6 +1,7 @@
 package web
 
 import (
+	"crypto/rand"
 	"embed"
 	"encoding/hex"
 	"encoding/json"
@@ -794,6 +795,169 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		}
 		writeJSON(w, map[string]any{"synced": count})
 	})
+
+	mux.HandleFunc("/api/schedule", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			convID := strings.TrimSpace(r.URL.Query().Get("conversation_id"))
+			if convID == "" {
+				httpError(w, "conversation_id is required", 400)
+				return
+			}
+			list, err := store.ListScheduledMessages(convID)
+			if err != nil {
+				httpError(w, "list scheduled: "+err.Error(), 500)
+				return
+			}
+			if list == nil {
+				list = []*db.ScheduledMessage{}
+			}
+			writeJSON(w, list)
+		case http.MethodPost:
+			var req struct {
+				ConversationID string `json:"conversation_id"`
+				Body           string `json:"body"`
+				ReplyToID      string `json:"reply_to_id"`
+				SendAt         int64  `json:"send_at"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				httpError(w, "invalid JSON: "+err.Error(), 400)
+				return
+			}
+			if strings.TrimSpace(req.ConversationID) == "" || strings.TrimSpace(req.Body) == "" {
+				httpError(w, "conversation_id and body are required", 400)
+				return
+			}
+			if err := db.ValidateScheduleTime(req.SendAt, time.Now().UnixMilli()); err != nil {
+				httpError(w, err.Error(), 400)
+				return
+			}
+			if conv, _ := store.GetConversation(req.ConversationID); conv == nil {
+				httpError(w, "conversation not found", 400)
+				return
+			}
+			sm := &db.ScheduledMessage{
+				ID:             scheduledID(),
+				ConversationID: req.ConversationID,
+				Body:           strings.TrimSpace(req.Body),
+				ReplyToID:      strings.TrimSpace(req.ReplyToID),
+				SendAt:         req.SendAt,
+				Status:         db.ScheduleStatusPending,
+				CreatedAt:      time.Now().UnixMilli(),
+			}
+			if err := store.CreateScheduledMessage(sm); err != nil {
+				httpError(w, "schedule message: "+err.Error(), 500)
+				return
+			}
+			publishMessages(req.ConversationID)
+			publishConversations()
+			writeJSON(w, sm)
+		default:
+			httpError(w, "method not allowed", 405)
+		}
+	})
+
+	// DELETE /api/schedule/{id} — cancel a still-pending scheduled message.
+	mux.HandleFunc("/api/schedule/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete {
+			httpError(w, "method not allowed", 405)
+			return
+		}
+		id := strings.TrimPrefix(r.URL.Path, "/api/schedule/")
+		if id == "" {
+			httpError(w, "scheduled message id required", 400)
+			return
+		}
+		sm, _ := store.GetScheduledMessage(id)
+		if sm == nil {
+			httpError(w, "scheduled message not found", 404)
+			return
+		}
+		ok, err := store.CancelScheduledMessage(id)
+		if err != nil {
+			httpError(w, "cancel: "+err.Error(), 500)
+			return
+		}
+		if !ok {
+			httpError(w, "message is already sending, sent, or canceled", 409)
+			return
+		}
+		publishMessages(sm.ConversationID)
+		publishConversations()
+		writeJSON(w, map[string]any{"canceled": id})
+	})
+
+	// POST /api/schedule-media — schedule a media attachment (with optional
+	// caption) to send at a future time. Multipart, mirrors /api/send-media.
+	mux.HandleFunc("/api/schedule-media", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			httpError(w, "method not allowed", 405)
+			return
+		}
+		if err := r.ParseMultipartForm(25 << 20); err != nil {
+			httpError(w, "invalid multipart form: "+err.Error(), 400)
+			return
+		}
+		convID := strings.TrimSpace(r.FormValue("conversation_id"))
+		caption := strings.TrimSpace(r.FormValue("caption"))
+		replyToID := strings.TrimSpace(r.FormValue("reply_to_id"))
+		if convID == "" {
+			httpError(w, "conversation_id is required", 400)
+			return
+		}
+		sendAt, err := strconv.ParseInt(strings.TrimSpace(r.FormValue("send_at")), 10, 64)
+		if err != nil {
+			httpError(w, "send_at must be an epoch-ms integer", 400)
+			return
+		}
+		if err := db.ValidateScheduleTime(sendAt, time.Now().UnixMilli()); err != nil {
+			httpError(w, err.Error(), 400)
+			return
+		}
+		if conv, _ := store.GetConversation(convID); conv == nil {
+			httpError(w, "conversation not found", 400)
+			return
+		}
+		file, header, err := r.FormFile("file")
+		if err != nil {
+			httpError(w, "file is required: "+err.Error(), 400)
+			return
+		}
+		defer file.Close()
+		data, err := io.ReadAll(file)
+		if err != nil {
+			httpError(w, "read file: "+err.Error(), 500)
+			return
+		}
+		if len(data) == 0 {
+			httpError(w, "file is empty", 400)
+			return
+		}
+		mime := header.Header.Get("Content-Type")
+		if mime == "" {
+			mime = "application/octet-stream"
+		}
+		sm := &db.ScheduledMessage{
+			ID:             scheduledID(),
+			ConversationID: convID,
+			Body:           caption,
+			ReplyToID:      replyToID,
+			SendAt:         sendAt,
+			Status:         db.ScheduleStatusPending,
+			CreatedAt:      time.Now().UnixMilli(),
+			MediaData:      data,
+			MediaFilename:  header.Filename,
+			MediaMime:      mime,
+		}
+		if err := store.CreateScheduledMessage(sm); err != nil {
+			httpError(w, "schedule media: "+err.Error(), 500)
+			return
+		}
+		publishMessages(convID)
+		publishConversations()
+		writeJSON(w, sm)
+	})
+
 
 	mux.HandleFunc("/api/search", func(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query().Get("q")
@@ -2358,6 +2522,12 @@ func searchPreviewForMessage(msg *db.Message) string {
 		return "[Media]"
 	}
 	return ""
+}
+
+func scheduledID() string {
+	b := make([]byte, 8)
+	_, _ = rand.Read(b)
+	return "sched:" + hex.EncodeToString(b)
 }
 
 func writeJSON(w http.ResponseWriter, v any) {

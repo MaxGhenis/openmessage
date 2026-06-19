@@ -375,6 +375,9 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 		return a.GoogleStatus()
 	}
 
+	// Background loop that sends due scheduled ("send later") messages.
+	a.StartScheduler()
+
 	httpEnabled := opts.web || opts.mcpSSE
 	if httpEnabled {
 		httpHandler := http.Handler(nil)
