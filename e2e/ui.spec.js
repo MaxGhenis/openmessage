@@ -399,6 +399,11 @@ test('renders clickable links with a social preview card', async ({ page, reques
   await expect(linkedMessage.locator('a.msg-link')).toHaveAttribute('href', 'https://example.com/story');
   await expect(linkedMessage.locator('.msg-link-preview')).toContainText('Example Story');
   await expect(linkedMessage.locator('.msg-link-preview')).toContainText('Example');
+  const previewImage = linkedMessage.locator('.msg-link-preview-media img');
+  await expect(previewImage).toHaveAttribute('src', /\/api\/link-preview-image\?url=/);
+  await expect
+    .poll(async () => previewImage.evaluate((img) => img.complete && img.naturalWidth > 0))
+    .toBe(true);
 });
 
 test('shows latest message previews in sidebar rows', async ({ page, request }) => {
@@ -1424,6 +1429,47 @@ test('narrow viewport uses single-pane flow with back button', async ({ page }) 
   await expect(page.locator('#chat-back-btn')).toBeVisible();
   await page.locator('#chat-back-btn').click();
   await expect(page.locator('.sidebar')).toBeVisible();
+});
+
+test('service worker keeps APIs network-only and serves the shell offline', async ({ page, context }) => {
+  await page.evaluate(async () => {
+    for (const registration of await navigator.serviceWorker.getRegistrations()) {
+      await registration.unregister();
+    }
+    for (const key of await caches.keys()) {
+      await caches.delete(key);
+    }
+    await caches.open('openmessage-static-old-test');
+  });
+
+  await page.goto('/');
+  await page.evaluate(async () => {
+    await navigator.serviceWorker.ready;
+  });
+  await page.reload();
+  await expect
+    .poll(async () => page.evaluate(() => !!navigator.serviceWorker.controller))
+    .toBe(true);
+
+  const cacheKeys = await page.evaluate(async () => caches.keys());
+  expect(cacheKeys).toContain('openmessage-static-v1');
+  expect(cacheKeys).not.toContain('openmessage-static-old-test');
+
+  const apiCached = await page.evaluate(async () => {
+    const response = await fetch('/api/status');
+    if (!response.ok) return 'api-failed';
+    const cache = await caches.open('openmessage-static-v1');
+    return !!(await cache.match('/api/status'));
+  });
+  expect(apiCached).toBe(false);
+
+  await context.setOffline(true);
+  try {
+    await page.goto('/offline-shell-check', { waitUntil: 'domcontentloaded' });
+    await expect(page.locator('#app')).toBeVisible();
+  } finally {
+    await context.setOffline(false);
+  }
 });
 
 test('escape closes the platforms overlay without clearing search', async ({ page }) => {

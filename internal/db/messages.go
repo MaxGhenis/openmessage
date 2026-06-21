@@ -28,7 +28,11 @@ func (s *Store) UpsertMessage(m *Message) error {
 	if err := upsertMessageTx(tx, m); err != nil {
 		return err
 	}
-	if err := s.syncMessageSearchIndex(tx, m.MessageID, m.Body); err != nil {
+	body, err := messageSearchBodyTx(tx, m.MessageID)
+	if err != nil {
+		return err
+	}
+	if err := s.syncMessageSearchIndex(tx, m.MessageID, body); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -114,7 +118,11 @@ func (s *Store) RecordOutgoingMessage(m *Message, deleteDraftID string) error {
 	if err := upsertMessageTx(tx, m); err != nil {
 		return err
 	}
-	if err := s.syncMessageSearchIndex(tx, m.MessageID, m.Body); err != nil {
+	body, err := messageSearchBodyTx(tx, m.MessageID)
+	if err != nil {
+		return err
+	}
+	if err := s.syncMessageSearchIndex(tx, m.MessageID, body); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(`UPDATE conversations SET last_message_ts = ? WHERE conversation_id = ?`, m.TimestampMS, m.ConversationID); err != nil {
@@ -126,6 +134,14 @@ func (s *Store) RecordOutgoingMessage(m *Message, deleteDraftID string) error {
 		}
 	}
 	return tx.Commit()
+}
+
+func messageSearchBodyTx(tx *sql.Tx, messageID string) (string, error) {
+	var body string
+	if err := tx.QueryRow(`SELECT body FROM messages WHERE message_id = ?`, messageID).Scan(&body); err != nil {
+		return "", err
+	}
+	return body, nil
 }
 
 func (s *Store) GetMessagesByConversation(conversationID string, limit int) ([]*Message, error) {

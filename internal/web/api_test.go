@@ -537,6 +537,37 @@ func TestSetTranscriptRejectsOversizedPayload(t *testing.T) {
 	}
 }
 
+func TestConversationTabMoveRejectsUnknownTargets(t *testing.T) {
+	ts := newTestServer(t)
+	if err := ts.store.UpsertConversation(&db.Conversation{
+		ConversationID: "conv-tab-1",
+		Name:           "Tab Target",
+		LastMessageTS:  1000,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := http.Post(ts.server.URL+"/api/conversations/conv-tab-1/tab", "application/json", strings.NewReader(`{"tab":"missing-tab"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("single move status = %d, want 400: %s", resp.StatusCode, body)
+	}
+
+	resp2, err := http.Post(ts.server.URL+"/api/conversations/move", "application/json", strings.NewReader(`{"ids":["conv-tab-1"],"tab":"missing-tab"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp2.Body.Close()
+	if resp2.StatusCode != http.StatusBadRequest {
+		body, _ := io.ReadAll(resp2.Body)
+		t.Fatalf("bulk move status = %d, want 400: %s", resp2.StatusCode, body)
+	}
+}
+
 func TestSetTranscriptPreservesModelWhenOmitted(t *testing.T) {
 	ts := newTestServer(t)
 
@@ -2778,6 +2809,12 @@ func TestLinkPreviewEndpoint(t *testing.T) {
 				Domain:      "example.com",
 			}, nil
 		},
+		FetchLinkPreviewImage: func(ctx context.Context, rawURL string) ([]byte, string, error) {
+			if rawURL != "https://cdn.example.com/story.png" {
+				t.Fatalf("unexpected image URL %q", rawURL)
+			}
+			return []byte("png-bytes"), "image/png", nil
+		},
 	})
 
 	resp, err := http.Get(ts.server.URL + "/api/link-preview?url=https%3A%2F%2Fexample.com%2Fstory")
@@ -2797,8 +2834,28 @@ func TestLinkPreviewEndpoint(t *testing.T) {
 	if preview.Title != "Example Story" {
 		t.Fatalf("got title %q", preview.Title)
 	}
-	if preview.ImageURL != "https://cdn.example.com/story.png" {
+	wantImageURL := "/api/link-preview-image?url=https%3A%2F%2Fcdn.example.com%2Fstory.png"
+	if preview.ImageURL != wantImageURL {
 		t.Fatalf("got image %q", preview.ImageURL)
+	}
+
+	imageResp, err := http.Get(ts.server.URL + preview.ImageURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer imageResp.Body.Close()
+	if imageResp.StatusCode != http.StatusOK {
+		t.Fatalf("image status = %d, want 200", imageResp.StatusCode)
+	}
+	if got := imageResp.Header.Get("Content-Type"); got != "image/png" {
+		t.Fatalf("image content type = %q, want image/png", got)
+	}
+	body, err := io.ReadAll(imageResp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) != "png-bytes" {
+		t.Fatalf("image body = %q", body)
 	}
 }
 

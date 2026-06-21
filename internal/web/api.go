@@ -73,6 +73,7 @@ type APIOptions struct {
 	SignalQRCode          func() (any, error)
 	WhatsAppAvatar        func(conversationID string) ([]byte, string, error)
 	FetchLinkPreview      LinkPreviewFetcher
+	FetchLinkPreviewImage LinkPreviewImageFetcher
 	SendWhatsAppText      func(conversationID, body, replyToID string) (*db.Message, error)
 	SendWhatsAppReaction  func(conversationID, messageID, emoji, action string) error
 	SendSignalText        func(conversationID, body, replyToID string) (*db.Message, error)
@@ -420,9 +421,14 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		}
 		return msg, nil
 	}
+	linkPreviewService := NewLinkPreviewService(logger)
 	fetchLinkPreview := opts.FetchLinkPreview
 	if fetchLinkPreview == nil {
-		fetchLinkPreview = NewLinkPreviewService(logger).Fetch
+		fetchLinkPreview = linkPreviewService.Fetch
+	}
+	fetchLinkPreviewImage := opts.FetchLinkPreviewImage
+	if fetchLinkPreviewImage == nil {
+		fetchLinkPreviewImage = linkPreviewService.FetchImage
 	}
 
 	mux.HandleFunc("/api/events", func(w http.ResponseWriter, r *http.Request) {
@@ -915,7 +921,40 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			writeJSON(w, map[string]any{})
 			return
 		}
+		if strings.TrimSpace(preview.ImageURL) != "" {
+			preview = cloneLinkPreview(preview)
+			preview.ImageURL = "/api/link-preview-image?url=" + url.QueryEscape(preview.ImageURL)
+		}
 		writeJSON(w, preview)
+	})
+
+	mux.HandleFunc("/api/link-preview-image", func(w http.ResponseWriter, r *http.Request) {
+		rawURL := r.URL.Query().Get("url")
+		if rawURL == "" {
+			httpError(w, "query parameter 'url' is required", 400)
+			return
+		}
+		data, contentType, err := fetchLinkPreviewImage(r.Context(), rawURL)
+		if err != nil {
+			switch {
+			case errors.Is(err, ErrNoLinkPreview):
+				httpError(w, "link preview image unavailable", 404)
+				return
+			case errors.Is(err, ErrInvalidLinkPreviewURL), errors.Is(err, ErrBlockedLinkPreviewURL):
+				httpError(w, err.Error(), 400)
+				return
+			default:
+				httpError(w, "link preview image: "+err.Error(), 502)
+				return
+			}
+		}
+		if strings.TrimSpace(contentType) == "" {
+			contentType = http.DetectContentType(data)
+		}
+		w.Header().Set("Content-Type", contentType)
+		w.Header().Set("Cache-Control", "private, max-age=86400")
+		w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+		_, _ = w.Write(data)
 	})
 
 	mux.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {

@@ -2,6 +2,7 @@ package db
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 )
@@ -232,7 +233,11 @@ const (
 // SetConversationTab moves a single conversation into the given tab.
 // An empty tab returns it to Recent (inbox).
 func (s *Store) SetConversationTab(id, tab string) error {
-	_, err := s.db.Exec(`UPDATE conversations SET tab = ? WHERE conversation_id = ?`, strings.TrimSpace(tab), id)
+	tab, err := s.validateConversationTab(tab)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.Exec(`UPDATE conversations SET tab = ? WHERE conversation_id = ?`, tab, id)
 	return err
 }
 
@@ -241,7 +246,10 @@ func (s *Store) SetConversationsTab(ids []string, tab string) error {
 	if len(ids) == 0 {
 		return nil
 	}
-	tab = strings.TrimSpace(tab)
+	tab, err := s.validateConversationTab(tab)
+	if err != nil {
+		return err
+	}
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
@@ -259,6 +267,23 @@ func (s *Store) SetConversationsTab(ids []string, tab string) error {
 		}
 	}
 	return tx.Commit()
+}
+
+func (s *Store) validateConversationTab(tab string) (string, error) {
+	tab = strings.TrimSpace(tab)
+	switch tab {
+	case TabInbox, TabArchive:
+		return tab, nil
+	}
+	var exists int
+	err := s.db.QueryRow(`SELECT 1 FROM tabs WHERE tab_id = ?`, tab).Scan(&exists)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", fmt.Errorf("unknown conversation tab %q", tab)
+	}
+	if err != nil {
+		return "", err
+	}
+	return tab, nil
 }
 
 func (s *Store) ListConversations(limit int) ([]*Conversation, error) {

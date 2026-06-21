@@ -837,6 +837,45 @@ func TestSearchMessages_Comprehensive(t *testing.T) {
 	})
 }
 
+func TestSearchMessagesStatusOnlyUpsertPreservesFTSBody(t *testing.T) {
+	store := newTestStore(t)
+	if !store.ftsEnabled {
+		t.Skip("fts index not enabled in this sqlite build")
+	}
+	for _, msg := range []Message{
+		{MessageID: "fts-status-1", ConversationID: "c1", Body: "needle alpha", TimestampMS: 1000},
+		{MessageID: "fts-status-2", ConversationID: "c1", Body: "needle beta", TimestampMS: 2000},
+	} {
+		if err := store.UpsertMessage(&msg); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+	}
+	if err := store.UpsertMessage(&Message{
+		MessageID:      "fts-status-1",
+		ConversationID: "c1",
+		Body:           "",
+		Status:         "OUTGOING_DELIVERED",
+		TimestampMS:    3000,
+	}); err != nil {
+		t.Fatalf("status-only upsert: %v", err)
+	}
+
+	got, err := store.SearchMessages("needle", "", 10)
+	if err != nil {
+		t.Fatalf("search: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("search result count = %d, want 2: %#v", len(got), got)
+	}
+	seen := map[string]bool{}
+	for _, msg := range got {
+		seen[msg.MessageID] = true
+	}
+	if !seen["fts-status-1"] || !seen["fts-status-2"] {
+		t.Fatalf("expected both messages to remain searchable, got %#v", seen)
+	}
+}
+
 func TestGetMessageByID_EdgeCases(t *testing.T) {
 	store := newTestStore(t)
 

@@ -210,6 +210,49 @@ func TestConversationFavoriteLifecycle(t *testing.T) {
 	}
 }
 
+func TestSetConversationTabValidatesTargets(t *testing.T) {
+	store := newTestStore(t)
+	for _, id := range []string{"conv-1", "conv-2"} {
+		if err := store.UpsertConversation(&Conversation{
+			ConversationID: id,
+			Name:           id,
+			LastMessageTS:  1000,
+		}); err != nil {
+			t.Fatalf("seed %s: %v", id, err)
+		}
+	}
+	custom, err := store.CreateTab("Follow up")
+	if err != nil {
+		t.Fatalf("CreateTab: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name string
+		tab  string
+	}{
+		{name: "inbox", tab: TabInbox},
+		{name: "archive", tab: TabArchive},
+		{name: "custom", tab: custom.TabID},
+		{name: "trimmed custom", tab: "  " + custom.TabID + "  "},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := store.SetConversationTab("conv-1", tc.tab); err != nil {
+				t.Fatalf("SetConversationTab(%q): %v", tc.tab, err)
+			}
+		})
+	}
+
+	if err := store.SetConversationTab("conv-1", "missing-tab"); err == nil {
+		t.Fatal("expected unknown single tab target error")
+	}
+	if err := store.SetConversationsTab([]string{"conv-1", "conv-2"}, "missing-tab"); err == nil {
+		t.Fatal("expected unknown bulk tab target error")
+	}
+	if err := store.SetConversationsTab([]string{"conv-1", "conv-2"}, custom.TabID); err != nil {
+		t.Fatalf("SetConversationsTab(custom): %v", err)
+	}
+}
+
 func TestGetConversation_NotFound(t *testing.T) {
 	store := newTestStore(t)
 

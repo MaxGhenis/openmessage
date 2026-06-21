@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -58,6 +60,71 @@ func TestLinkPreviewServiceBlocksPrivateHostsByDefault(t *testing.T) {
 
 	service := NewLinkPreviewService(zerolog.Nop())
 	_, err := service.Fetch(context.Background(), srv.URL)
+	if !errors.Is(err, ErrBlockedLinkPreviewURL) {
+		t.Fatalf("got err %v, want ErrBlockedLinkPreviewURL", err)
+	}
+}
+
+func TestLinkPreviewServiceFetchImageAllowsRasterImages(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "image/png; charset=binary")
+		_, _ = w.Write([]byte("png-bytes"))
+	}))
+	defer srv.Close()
+
+	service := NewLinkPreviewService(zerolog.Nop())
+	service.allowPrivateHosts = true
+	data, contentType, err := service.FetchImage(context.Background(), srv.URL+"/image.png")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "png-bytes" {
+		t.Fatalf("data = %q", data)
+	}
+	if contentType != "image/png" {
+		t.Fatalf("contentType = %q, want image/png", contentType)
+	}
+}
+
+func TestLinkPreviewServiceFetchImageRejectsSVG(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "image/svg+xml")
+		_, _ = w.Write([]byte(`<svg><script>alert(1)</script></svg>`))
+	}))
+	defer srv.Close()
+
+	service := NewLinkPreviewService(zerolog.Nop())
+	service.allowPrivateHosts = true
+	_, _, err := service.FetchImage(context.Background(), srv.URL+"/image.svg")
+	if !errors.Is(err, ErrNoLinkPreview) {
+		t.Fatalf("got err %v, want ErrNoLinkPreview", err)
+	}
+}
+
+func TestLinkPreviewServiceFetchImageRejectsOversizedImages(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "image/png")
+		_, _ = io.Copy(w, strings.NewReader(strings.Repeat("x", maxLinkPreviewImageBytes+1)))
+	}))
+	defer srv.Close()
+
+	service := NewLinkPreviewService(zerolog.Nop())
+	service.allowPrivateHosts = true
+	_, _, err := service.FetchImage(context.Background(), srv.URL+"/big.png")
+	if err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("got err %v, want oversized image error", err)
+	}
+}
+
+func TestLinkPreviewServiceFetchImageBlocksPrivateHostsByDefault(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "image/png")
+		_, _ = w.Write([]byte("png-bytes"))
+	}))
+	defer srv.Close()
+
+	service := NewLinkPreviewService(zerolog.Nop())
+	_, _, err := service.FetchImage(context.Background(), srv.URL+"/image.png")
 	if !errors.Is(err, ErrBlockedLinkPreviewURL) {
 		t.Fatalf("got err %v, want ErrBlockedLinkPreviewURL", err)
 	}
