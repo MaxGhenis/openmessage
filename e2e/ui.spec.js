@@ -1716,6 +1716,20 @@ test('a stuck Google session (connected + needs_repair) surfaces a re-pair banne
   await expect(page.locator('#connection-banner')).toBeHidden();
 });
 
+test('a connected Google session with a non-responding phone shows phone guidance', async ({ page }) => {
+  await page.waitForFunction(() => window.__openMessageTestHooks?.applyAppStatus);
+  await page.evaluate(() => window.__openMessageTestHooks.applyAppStatus({
+    connected: true,
+    google: { connected: true, paired: true, needs_pairing: false, needs_repair: false, phone_responding: false },
+    whatsapp: { connected: true, paired: true },
+    signal: { connected: true, paired: true },
+    backfill: { running: false },
+  }));
+  await expect(page.locator('#connection-banner')).toBeVisible();
+  await expect(page.locator('#connection-banner-copy')).toContainText('phone isn’t responding');
+  await expect(page.locator('#connection-banner-action')).toBeHidden();
+});
+
 test('an auth-dead Google session (disconnected + needs_repair) shows Re-pair, not Reconnect', async ({ page }) => {
   await page.waitForFunction(() => window.__openMessageTestHooks?.applyAppStatus);
   // connected=false (the 401 case) but paired + needs_repair.
@@ -1729,6 +1743,11 @@ test('an auth-dead Google session (disconnected + needs_repair) shows Re-pair, n
   await expect(page.locator('#connection-banner')).toBeVisible();
   await expect(page.locator('#connection-banner-action')).toHaveText('Re-pair');
   await expect(page.locator('#connection-banner-copy')).toContainText('unlinked OpenMessage');
+  await page.locator('#connection-banner-action').click();
+  await expect(page.locator('#wa-overlay')).toHaveClass(/show/);
+  await expect(page.locator('#gm-reconnect-btn')).toHaveText('Pair again');
+  await expect(page.locator('#gm-reconnect-btn')).toHaveAttribute('data-mode', 'pair');
+  await page.keyboard.press('Escape');
 
   // A plain disconnected (no needs_repair) still says Reconnect.
   await page.evaluate(() => window.__openMessageTestHooks.applyAppStatus({

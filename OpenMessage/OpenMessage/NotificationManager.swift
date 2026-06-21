@@ -134,13 +134,38 @@ final class NotificationManager: NSObject, ObservableObject, UNUserNotificationC
 
     nonisolated func userNotificationCenter(
         _ center: UNUserNotificationCenter,
-        willPresent notification: UNNotification,
-        withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
-    ) {
+        willPresent notification: UNNotification
+    ) async -> UNNotificationPresentationOptions {
+        let conversationID = notification.request.content.userInfo["conversationID"] as? String ?? ""
+        // Suppress the banner and sound when the user is literally looking
+        // at this conversation. On uncertainty, show the banner; silently
+        // dropping a notification is the worse failure.
+        if !conversationID.isEmpty {
+            let appActive = await MainActor.run { NSApp.isActive }
+            if appActive {
+                let active = await WebViewBridge.shared.activeConversationID()
+                if active == conversationID {
+                    return [.list]
+                }
+            }
+        }
         if #available(macOS 11.0, *) {
-            completionHandler([.banner, .list, .sound, .badge])
+            return [.banner, .list, .sound, .badge]
         } else {
-            completionHandler([.alert, .sound, .badge])
+            return [.alert, .sound, .badge]
+        }
+    }
+
+    nonisolated func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        didReceive response: UNNotificationResponse
+    ) async {
+        let conversationID = response.notification.request.content.userInfo["conversationID"] as? String ?? ""
+        await MainActor.run {
+            NSApp.activate(ignoringOtherApps: true)
+            if !conversationID.isEmpty {
+                WebViewBridge.shared.openConversation(conversationID)
+            }
         }
     }
 

@@ -53,6 +53,7 @@ func getStatusHandler(a *app.App) server.ToolHandlerFunc {
 		fmt.Fprintf(&sb, "  Connected: %v\n", google.Connected)
 		fmt.Fprintf(&sb, "  Paired: %v\n", google.Paired)
 		fmt.Fprintf(&sb, "  Needs pairing: %v\n", google.NeedsPairing)
+		fmt.Fprintf(&sb, "  Phone responding: %v\n", google.PhoneResponding)
 		if google.LastError != "" {
 			fmt.Fprintf(&sb, "  Last error: %s\n", google.LastError)
 		}

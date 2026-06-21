@@ -10514,6 +10514,7 @@ body::after {
       paired: raw.paired === undefined ? !!raw.connected : !!raw.paired,
       needs_pairing: !!raw.needs_pairing,
       needs_repair: !!raw.needs_repair,
+      phone_responding: raw.phone_responding === undefined ? true : !!raw.phone_responding,
       last_error: raw.last_error || '',
     };
   }
@@ -10539,6 +10540,13 @@ body::after {
       $connectionBannerAction.textContent = 'Re-pair';
       $connectionBannerAction.dataset.action = 'open-platforms';
       $connectionBannerAction.style.display = '';
+      return;
+    }
+    if (googleStatus.connected && !googleStatus.phone_responding) {
+      $connectionBanner.className = 'connection-banner disconnected';
+      $connectionBanner.style.display = 'flex';
+      $connectionBannerCopy.textContent = 'Your phone isn’t responding to OpenMessage right now. Make sure it’s on and online, then try again.';
+      $connectionBannerAction.style.display = 'none';
       return;
     }
     if (googleStatus.connected) {
@@ -10675,6 +10683,7 @@ body::after {
   }
 
   function googleStatusText() {
+    if (googleStatus.connected && !googleStatus.phone_responding) return 'Phone offline';
     if (googleStatus.connected) return 'Connected';
     if (googleStatus.paired && !googleStatus.needs_pairing) return 'Needs reconnect';
     return 'Needs pairing';
@@ -10802,8 +10811,19 @@ body::after {
     } else if (googleStatus.last_error) {
       $gmStatusPill.classList.add('error');
     }
-    if (googleStatus.connected) {
-      $gmHelper.textContent = 'Google Messages live sync is active. New SMS and RCS messages should appear immediately. If new messages stop arriving, pair again to refresh the connection.';
+    if (googleStatus.needs_repair) {
+      $gmHelper.textContent = nativeAppBridge()
+        ? 'Google Messages needs to be paired again. Open the native pairing flow to refresh your Android phone connection.'
+        : 'Google Messages needs to be paired again. Use the button below to copy the pair command, then run it in Terminal.';
+      showGoogleError(googleStatus.last_error);
+      $gmActionsRow.style.display = '';
+      $gmReconnectBtn.disabled = false;
+      $gmReconnectBtn.textContent = 'Pair again';
+      $gmReconnectBtn.dataset.mode = 'pair';
+    } else if (googleStatus.connected) {
+      $gmHelper.textContent = googleStatus.phone_responding
+        ? 'Google Messages live sync is active. New SMS and RCS messages should appear immediately. If new messages stop arriving, pair again to refresh the connection.'
+        : 'Google Messages is connected, but your phone is not responding right now. Keep the phone on and online, then try again.';
       showGoogleError('');
       // Keep a re-pair affordance available even while "connected": the
       // connection flag can stay true after the session has silently gone

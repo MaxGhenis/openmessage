@@ -1,6 +1,9 @@
 package app
 
 import (
+	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -72,6 +75,80 @@ func TestSendTextToConversationSMSPersistsOutgoingMessage(t *testing.T) {
 	}
 	if stored == nil || stored.Body != "hello sms" {
 		t.Fatalf("expected persisted outgoing sms message, got %#v", stored)
+	}
+}
+
+func TestSendTextToConversationSMSRejectedUsesPhoneReachability(t *testing.T) {
+	a := testSendApp(t)
+	a.SessionPath = filepath.Join(t.TempDir(), "session.json")
+	if err := os.WriteFile(a.SessionPath, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	a.RecordGooglePhoneResponding(false)
+	if err := a.Store.UpsertConversation(&db.Conversation{
+		ConversationID: "sms-conv-1",
+		Name:           "Taylor",
+		LastMessageTS:  time.Now().UnixMilli(),
+	}); err != nil {
+		t.Fatalf("seed conversation: %v", err)
+	}
+
+	originalGetGoogleConversation := getGoogleConversationForSend
+	originalSendGoogleTextPayload := sendGoogleTextPayload
+	getGoogleConversationForSend = func(_ *App, conversationID string) (*gmproto.Conversation, error) {
+		return &gmproto.Conversation{ConversationID: conversationID}, nil
+	}
+	sendGoogleTextPayload = func(_ *App, payload *gmproto.SendMessageRequest) (*gmproto.SendMessageResponse, error) {
+		return &gmproto.SendMessageResponse{Status: gmproto.SendMessageResponse_UNKNOWN}, nil
+	}
+	t.Cleanup(func() {
+		getGoogleConversationForSend = originalGetGoogleConversation
+		sendGoogleTextPayload = originalSendGoogleTextPayload
+	})
+
+	_, _, err := a.SendTextToConversation("sms-conv-1", "hello sms")
+	if err == nil {
+		t.Fatal("expected send rejection")
+	}
+	if !strings.Contains(err.Error(), "phone isn't responding") {
+		t.Fatalf("expected phone reachability error, got %v", err)
+	}
+	if a.googleSendFailures.Load() != 0 {
+		t.Fatalf("googleSendFailures = %d, want 0", a.googleSendFailures.Load())
+	}
+	if a.GoogleStatus().NeedsRepair {
+		t.Fatal("phone-offline send rejection must not mark Google session for repair")
+	}
+}
+
+func TestSendTextToConversationLookupAuthErrorMarksRepair(t *testing.T) {
+	a := testSendApp(t)
+	a.SessionPath = filepath.Join(t.TempDir(), "session.json")
+	if err := os.WriteFile(a.SessionPath, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Store.UpsertConversation(&db.Conversation{
+		ConversationID: "sms-conv-auth",
+		Name:           "Taylor",
+		LastMessageTS:  time.Now().UnixMilli(),
+	}); err != nil {
+		t.Fatalf("seed conversation: %v", err)
+	}
+
+	originalGetGoogleConversation := getGoogleConversationForSend
+	getGoogleConversationForSend = func(_ *App, conversationID string) (*gmproto.Conversation, error) {
+		return nil, errors.New("HTTP 401: invalid authentication credentials")
+	}
+	t.Cleanup(func() {
+		getGoogleConversationForSend = originalGetGoogleConversation
+	})
+
+	_, _, err := a.SendTextToConversation("sms-conv-auth", "hello sms")
+	if err == nil {
+		t.Fatal("expected lookup error")
+	}
+	if !a.GoogleStatus().NeedsRepair {
+		t.Fatal("auth-invalid lookup error should mark Google session for repair")
 	}
 }
 

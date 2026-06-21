@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/rs/zerolog"
@@ -137,6 +138,89 @@ func TestGoogleSendOutcomeRepairFlag(t *testing.T) {
 	a.RecordGoogleSendOutcome(false)
 	if a.googleNeedsRepair.Load() {
 		t.Fatal("one failure after a success must not immediately re-flag")
+	}
+}
+
+func TestGooglePhoneRespondingStatus(t *testing.T) {
+	a := &App{}
+	a.SessionPath = filepath.Join(t.TempDir(), "session.json")
+	if err := os.WriteFile(a.SessionPath, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if !a.GoogleStatus().PhoneResponding {
+		t.Fatal("unknown phone responding state should default to true")
+	}
+	a.RecordGooglePhoneResponding(false)
+	if a.GoogleStatus().PhoneResponding {
+		t.Fatal("PhoneNotResponding should surface in GoogleStatus")
+	}
+	a.RecordGooglePhoneResponding(true)
+	if !a.GoogleStatus().PhoneResponding {
+		t.Fatal("PhoneRespondingAgain should clear the offline state")
+	}
+}
+
+func TestPhoneOfflineFailuresDoNotMarkGoogleForRepair(t *testing.T) {
+	a := &App{}
+	a.SessionPath = filepath.Join(t.TempDir(), "session.json")
+	if err := os.WriteFile(a.SessionPath, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	for range googleRepairThreshold {
+		a.RecordGoogleSendOutcomeWithPhone(false, false)
+	}
+	if a.googleSendFailures.Load() != 0 {
+		t.Fatalf("googleSendFailures = %d, want 0", a.googleSendFailures.Load())
+	}
+	if a.GoogleStatus().NeedsRepair {
+		t.Fatal("phone-offline failures should not mark Google as needing repair")
+	}
+}
+
+func TestSuccessfulGoogleSendMarksPhoneResponding(t *testing.T) {
+	a := &App{}
+	a.SessionPath = filepath.Join(t.TempDir(), "session.json")
+	if err := os.WriteFile(a.SessionPath, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	a.RecordGooglePhoneResponding(false)
+	if a.GooglePhoneResponding() {
+		t.Fatal("expected phone responding false after explicit offline event")
+	}
+	a.RecordGoogleSendOutcomeWithPhone(true, false)
+	if !a.GooglePhoneResponding() {
+		t.Fatal("successful send should mark phone responding true")
+	}
+}
+
+func TestGoogleSendRejectedMessageUsesPhoneReachability(t *testing.T) {
+	offline := GoogleSendRejectedMessage("UNKNOWN", false)
+	if !strings.Contains(offline, "phone isn't responding") {
+		t.Fatalf("offline error should mention phone reachability, got %q", offline)
+	}
+	stale := GoogleSendRejectedMessage("UNKNOWN", true)
+	if !strings.Contains(stale, "Pair again") {
+		t.Fatalf("responding-phone error should mention re-pairing, got %q", stale)
+	}
+}
+
+func TestRecordGoogleSendErrorOnlyMarksAuthInvalidForRepair(t *testing.T) {
+	a := &App{}
+	a.SessionPath = filepath.Join(t.TempDir(), "session.json")
+	if err := os.WriteFile(a.SessionPath, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	a.RecordGoogleSendError(errors.New("dial tcp: i/o timeout"))
+	if a.GoogleStatus().NeedsRepair {
+		t.Fatal("transient network send errors should not mark needs_repair")
+	}
+
+	a.RecordGoogleSendError(errors.New("send message: HTTP 401: invalid authentication credentials"))
+	if !a.GoogleStatus().NeedsRepair {
+		t.Fatal("auth-invalid send errors should mark needs_repair")
 	}
 }
 

@@ -152,11 +152,13 @@ type App struct {
 	// Connected=true while every send comes back UNKNOWN (the phone has
 	// silently unlinked us). Count consecutive non-SUCCESS Google sends so
 	// the UI can surface a re-pair affordance even while "connected".
-	googleSendFailures atomic.Int32
-	googleNeedsRepair  atomic.Bool
-	tempDataDir        string
-	pendingMediaMu     sync.Mutex
-	pendingMedia       map[string]struct{}
+	googleSendFailures        atomic.Int32
+	googleNeedsRepair         atomic.Bool
+	googlePhoneResponding     atomic.Bool
+	googlePhoneRespondingSeen atomic.Bool
+	tempDataDir               string
+	pendingMediaMu            sync.Mutex
+	pendingMedia              map[string]struct{}
 }
 
 type GoogleStatusSnapshot struct {
@@ -168,6 +170,9 @@ type GoogleStatusSnapshot struct {
 	// offer re-pairing even though Connected is true.
 	NeedsRepair bool   `json:"needs_repair,omitempty"`
 	LastError   string `json:"last_error,omitempty"`
+	// PhoneResponding is false after libgm reports PhoneNotResponding. Before
+	// such an event is observed, unknown is treated as healthy.
+	PhoneResponding bool `json:"phone_responding"`
 }
 
 // googleRepairThreshold is how many consecutive failed Google sends (with no
@@ -178,12 +183,29 @@ const googleRepairThreshold = 3
 // unlinked session (Connected=true, every send UNKNOWN) becomes visible. A
 // single success clears the flag.
 func (a *App) RecordGoogleSendOutcome(success bool) {
+	a.RecordGoogleSendOutcomeWithPhone(success, true)
+}
+
+func (a *App) RecordGoogleSendOutcomeWithPhone(success bool, phoneResponding bool) {
 	if success {
+		a.RecordGooglePhoneResponding(true)
 		a.googleSendFailures.Store(0)
 		a.googleNeedsRepair.Store(false)
 		return
 	}
+	if !phoneResponding {
+		return
+	}
 	if a.googleSendFailures.Add(1) >= googleRepairThreshold {
+		a.googleNeedsRepair.Store(true)
+	}
+}
+
+// RecordGoogleSendError handles send failures that happen before Google
+// returns a SendMessageResponse status. Only auth/dead-session failures mark
+// the session for re-pair; transient network errors should remain recoverable.
+func (a *App) RecordGoogleSendError(err error) {
+	if isGoogleAuthInvalid(err) {
 		a.googleNeedsRepair.Store(true)
 	}
 }
@@ -193,6 +215,22 @@ func (a *App) RecordGoogleSendOutcome(success bool) {
 func (a *App) ClearGoogleRepairFlag() {
 	a.googleSendFailures.Store(0)
 	a.googleNeedsRepair.Store(false)
+}
+
+// RecordGooglePhoneResponding tracks whether the paired Android phone is
+// currently answering Google Messages requests. This is distinct from
+// NeedsRepair: a non-responding phone may simply be off or offline.
+func (a *App) RecordGooglePhoneResponding(responding bool) {
+	a.googlePhoneResponding.Store(responding)
+	a.googlePhoneRespondingSeen.Store(true)
+}
+
+// GooglePhoneResponding reports true until libgm explicitly says otherwise.
+func (a *App) GooglePhoneResponding() bool {
+	if !a.GooglePaired() || !a.googlePhoneRespondingSeen.Load() {
+		return true
+	}
+	return a.googlePhoneResponding.Load()
 }
 
 func DefaultDataDir() string {
@@ -391,6 +429,15 @@ func (a *App) LoadAndConnect() error {
 		OnRealtimeGapRecovered: func(reason string) {
 			a.StartRecentReconcile(reason)
 		},
+		OnPhoneRespondingChange: func(responding bool) {
+			a.RecordGooglePhoneResponding(responding)
+			if !responding {
+				a.setGoogleLastError("Your phone isn't responding to OpenMessage right now; make sure it's on and online.")
+			} else {
+				a.clearGoogleLastErrorIf("Your phone isn't responding to OpenMessage right now; make sure it's on and online.")
+			}
+			a.emitStatusChange(a.Connected.Load())
+		},
 		OnConnectionLost: func() {
 			// Transient: keep the session so the reconnect watchdog can
 			// recover without a manual re-pair.
@@ -445,6 +492,7 @@ func (a *App) LoadAndConnect() error {
 	// A clean connect proves the session is alive; clear any prior stuck/dead
 	// state (also covers the path right after re-pairing).
 	a.ClearGoogleRepairFlag()
+	a.RecordGooglePhoneResponding(true)
 	a.Connected.Store(true)
 	a.setGoogleLastError("")
 	a.emitStatusChange(true)
@@ -591,8 +639,9 @@ func (a *App) GoogleStatus() GoogleStatusSnapshot {
 		// or a dead-credentials disconnect (auth 401). Either way the fix is
 		// re-pair, not reconnect; gating on `connected` alone would hide the
 		// 401 case (which is disconnected).
-		NeedsRepair: paired && a.googleNeedsRepair.Load(),
-		LastError:   lastError,
+		NeedsRepair:     paired && a.googleNeedsRepair.Load(),
+		LastError:       lastError,
+		PhoneResponding: a.GooglePhoneResponding(),
 	}
 }
 
@@ -625,6 +674,14 @@ func (a *App) setGoogleLastError(message string) {
 	a.statusMu.Lock()
 	defer a.statusMu.Unlock()
 	a.googleLastError = strings.TrimSpace(message)
+}
+
+func (a *App) clearGoogleLastErrorIf(message string) {
+	a.statusMu.Lock()
+	defer a.statusMu.Unlock()
+	if a.googleLastError == strings.TrimSpace(message) {
+		a.googleLastError = ""
+	}
 }
 
 func (a *App) beginBackfill() bool {

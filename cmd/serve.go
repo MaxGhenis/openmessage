@@ -367,7 +367,7 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 
 	googleStatus := func() any {
 		if isDemo {
-			return app.GoogleStatusSnapshot{Connected: true, Paired: true, NeedsPairing: false}
+			return app.GoogleStatusSnapshot{Connected: true, Paired: true, NeedsPairing: false, PhoneResponding: true}
 		}
 		return a.GoogleStatus()
 	}
@@ -377,22 +377,24 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 		httpHandler := http.Handler(nil)
 		if opts.web {
 			httpHandler = web.APIHandlerWithOptions(a.Store, nil, logger, mcpHTTPHandler, web.APIOptions{
-				Client:               a.GetClient,
-				Events:               events,
-				IdentityName:         identityName,
-				IsConnected:          isConnected,
-				GoogleStatus:         googleStatus,
-				RecordGoogleSend:     a.RecordGoogleSendOutcome,
-				ReconnectGoogle:      a.ReconnectGoogleMessages,
-				Unpair:               a.Unpair,
-				WhatsAppStatus:       func() any { return a.WhatsAppStatus() },
-				ConnectWhatsApp:      a.StartWhatsAppConnect,
-				UnpairWhatsApp:       a.UnpairWhatsApp,
-				SignalStatus:         func() any { return a.SignalStatus() },
-				ConnectSignal:        a.StartSignalConnect,
-				ReplaySignalRecovery: a.ReplaySignalRecoveryQueue,
-				UnpairSignal:         a.UnpairSignal,
-				LeaveWhatsAppGroup:   a.LeaveWhatsAppGroup,
+				Client:                a.GetClient,
+				Events:                events,
+				IdentityName:          identityName,
+				IsConnected:           isConnected,
+				GoogleStatus:          googleStatus,
+				RecordGoogleSend:      a.RecordGoogleSendOutcome,
+				RecordGoogleSendError: a.RecordGoogleSendError,
+				GooglePhoneResponding: a.GooglePhoneResponding,
+				ReconnectGoogle:       a.ReconnectGoogleMessages,
+				Unpair:                a.Unpair,
+				WhatsAppStatus:        func() any { return a.WhatsAppStatus() },
+				ConnectWhatsApp:       a.StartWhatsAppConnect,
+				UnpairWhatsApp:        a.UnpairWhatsApp,
+				SignalStatus:          func() any { return a.SignalStatus() },
+				ConnectSignal:         a.StartSignalConnect,
+				ReplaySignalRecovery:  a.ReplaySignalRecoveryQueue,
+				UnpairSignal:          a.UnpairSignal,
+				LeaveWhatsAppGroup:    a.LeaveWhatsAppGroup,
 				WhatsAppQRCode: func() (any, error) {
 					return a.WhatsAppQRCode()
 				},

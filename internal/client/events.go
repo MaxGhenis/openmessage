@@ -38,6 +38,7 @@ type EventHandler struct {
 	OnRealtimeGapRecovered   func(string)
 	OnTypingChange           func(conversationID, senderName, senderNumber string, typing bool)
 	OnGoogleAvatarCandidates func([]db.ContactAvatarCandidate)
+	OnPhoneRespondingChange  func(bool)
 }
 
 func (h *EventHandler) Handle(rawEvt any) {
@@ -90,8 +91,14 @@ func (h *EventHandler) Handle(rawEvt any) {
 		}
 	case *events.PhoneNotResponding:
 		h.Logger.Warn().Msg("Phone not responding")
+		if h.OnPhoneRespondingChange != nil {
+			h.OnPhoneRespondingChange(false)
+		}
 	case *events.PhoneRespondingAgain:
 		h.Logger.Info().Msg("Phone responding again")
+		if h.OnPhoneRespondingChange != nil {
+			h.OnPhoneRespondingChange(true)
+		}
 		if h.OnRealtimeGapRecovered != nil {
 			h.OnRealtimeGapRecovered("phone_responding_again")
 		}
@@ -107,6 +114,9 @@ func (h *EventHandler) handleClientReady(evt *events.ClientReady) {
 		Str("session_id", evt.SessionID).
 		Int("conversations", len(evt.Conversations)).
 		Msg("Client ready")
+	if h.OnPhoneRespondingChange != nil {
+		h.OnPhoneRespondingChange(true)
+	}
 
 	for _, conv := range evt.Conversations {
 		h.storeConversation(conv)
@@ -179,6 +189,9 @@ func (h *EventHandler) handleMessage(evt *libgm.WrappedMessage) {
 
 	if !dbMsg.IsFromMe && !evt.IsOld && h.OnIncomingMessage != nil {
 		h.OnIncomingMessage(dbMsg)
+	}
+	if !dbMsg.IsFromMe && !evt.IsOld && h.OnPhoneRespondingChange != nil {
+		h.OnPhoneRespondingChange(true)
 	}
 	if !dbMsg.IsFromMe && !evt.IsOld && h.OnPendingMedia != nil && messageNeedsPendingMediaRefresh(msg, dbMsg) {
 		h.OnPendingMedia(dbMsg.ConversationID, dbMsg.MessageID)
