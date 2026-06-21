@@ -37,6 +37,8 @@ var staticFS embed.FS
 // while keeping a runaway POST from exhausting memory.
 const maxUploadBytes = 128 << 20
 
+const maxTranscriptRequestBytes = db.MaxTranscriptBytes + db.MaxTranscriptModelBytes + 4096
+
 // APIHandler creates the HTTP handler with JSON API routes and static file serving.
 // The client may be nil (disconnected state).
 // mcpHandler is an optional http.Handler for the MCP SSE endpoint (mounted at /mcp/).
@@ -1335,12 +1337,18 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			httpError(w, "method not allowed", 405)
 			return
 		}
+		r.Body = http.MaxBytesReader(w, r.Body, maxTranscriptRequestBytes)
 		var req struct {
 			MessageID  string  `json:"message_id"`
 			Transcript *string `json:"transcript"`
 			Model      *string `json:"model,omitempty"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			var tooLarge *http.MaxBytesError
+			if errors.As(err, &tooLarge) {
+				httpError(w, fmt.Sprintf("transcript request too large (limit %d bytes)", maxTranscriptRequestBytes), http.StatusRequestEntityTooLarge)
+				return
+			}
 			httpError(w, "invalid JSON: "+err.Error(), 400)
 			return
 		}
@@ -1350,6 +1358,10 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		}
 		if req.Transcript == nil {
 			httpError(w, "transcript required", 400)
+			return
+		}
+		if err := db.ValidateMessageTranscript(*req.Transcript, req.Model); err != nil {
+			httpError(w, err.Error(), http.StatusRequestEntityTooLarge)
 			return
 		}
 		if err := store.SetMessageTranscript(req.MessageID, *req.Transcript, req.Model); err != nil {
@@ -2045,21 +2057,29 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		})
 	}
 
-	// Guard the HTTP API against cross-origin / DNS-rebinding abuse. The server
+	// Guard local control surfaces against cross-origin / DNS-rebinding abuse. The server
 	// binds to 127.0.0.1, but that does NOT stop a malicious web page the user
-	// visits from POSTing to http://127.0.0.1:<port>/api/... (multipart and
-	// body-less POSTs are CORS "simple requests" with no preflight) — which
-	// could drive-by send messages or unpair accounts. Requiring a loopback
-	// Host and (when present) a loopback Origin/Referer closes that vector
-	// without affecting the native app, whose requests are same-origin.
+	// visits from talking to http://127.0.0.1:<port>/api/... or /mcp/... .
+	// Requiring a loopback Host and, when present, a same-origin loopback
+	// Origin/Referer closes that vector without affecting native app requests.
+	return ProtectLocalControl(handler)
+}
+
+// ProtectLocalControl rejects cross-origin browser access to local control
+// surfaces such as /api/* and /mcp/*.
+func ProtectLocalControl(handler http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasPrefix(r.URL.Path, "/api/") && !isLocalAPIRequest(r) {
+		if isProtectedLocalPath(r.URL.Path) && !isLocalControlRequest(r) {
 			httpError(w, "forbidden: API requests must originate from the local OpenMessage app", http.StatusForbidden)
 			return
 		}
 		setSecurityHeaders(w)
 		handler.ServeHTTP(w, r)
 	})
+}
+
+func isProtectedLocalPath(path string) bool {
+	return strings.HasPrefix(path, "/api/") || path == "/mcp" || strings.HasPrefix(path, "/mcp/")
 }
 
 // setSecurityHeaders adds defense-in-depth headers. The UI relies on
@@ -2096,33 +2116,91 @@ func isLoopbackHost(hostname string) bool {
 	return false
 }
 
-// isLocalAPIRequest validates that an /api/ request originates from the local
-// app rather than a cross-origin web page: the Host must be loopback (defends
-// DNS rebinding), and any Origin/Referer the browser attached must be loopback
-// too (defends drive-by cross-origin POSTs). Same-origin GETs carry no Origin
-// and pass; the native WKWebView is same-origin on 127.0.0.1 and passes.
-func isLocalAPIRequest(r *http.Request) bool {
-	host := r.Host
-	if h, _, err := net.SplitHostPort(host); err == nil {
-		host = h
-	}
-	// An absent Host header is treated as non-local: browsers always send
-	// one, so an empty value only ever comes from a hand-rolled client —
-	// which must not slip past the loopback check by omission.
-	if host == "" || !isLoopbackHost(host) {
+// isLocalControlRequest validates that a protected local request originates
+// from OpenMessage itself rather than a cross-origin browser page: Host must
+// be loopback, and Origin/Referer must be the same local scheme and port.
+func isLocalControlRequest(r *http.Request) bool {
+	reqOrigin, ok := localRequestOrigin(r)
+	if !ok {
 		return false
 	}
 	origin := r.Header.Get("Origin")
 	if origin == "" {
 		origin = r.Header.Get("Referer")
 	}
-	if origin != "" {
-		u, err := url.Parse(origin)
-		if err != nil || !isLoopbackHost(u.Hostname()) {
-			return false
-		}
+	if origin == "" {
+		return true
 	}
-	return true
+	headerOrigin, ok := parseLocalOrigin(origin)
+	return ok && headerOrigin == reqOrigin
+}
+
+type localOrigin struct {
+	Scheme string
+	Port   string
+}
+
+func localRequestOrigin(r *http.Request) (localOrigin, bool) {
+	host, port, ok := splitHostPortDefault(r.Host, requestDefaultPort(r))
+	// An absent Host header is treated as non-local: browsers always send
+	// one, so an empty value only ever comes from a hand-rolled client —
+	// which must not slip past the loopback check by omission.
+	if !ok || host == "" || !isLoopbackHost(host) {
+		return localOrigin{}, false
+	}
+	return localOrigin{Scheme: requestScheme(r), Port: port}, true
+}
+
+func parseLocalOrigin(raw string) (localOrigin, bool) {
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme == "" {
+		return localOrigin{}, false
+	}
+	host, port, ok := splitHostPortDefault(u.Host, defaultPortForScheme(u.Scheme))
+	if !ok || !isLoopbackHost(host) {
+		return localOrigin{}, false
+	}
+	return localOrigin{Scheme: strings.ToLower(u.Scheme), Port: port}, true
+}
+
+func requestScheme(r *http.Request) string {
+	if r.TLS != nil {
+		return "https"
+	}
+	return "http"
+}
+
+func requestDefaultPort(r *http.Request) string {
+	return defaultPortForScheme(requestScheme(r))
+}
+
+func defaultPortForScheme(scheme string) string {
+	if strings.EqualFold(scheme, "https") {
+		return "443"
+	}
+	return "80"
+}
+
+func splitHostPortDefault(hostport, defaultPort string) (string, string, bool) {
+	hostport = strings.TrimSpace(hostport)
+	if hostport == "" {
+		return "", "", false
+	}
+	if host, port, err := net.SplitHostPort(hostport); err == nil {
+		if port == "" {
+			port = defaultPort
+		}
+		return host, port, true
+	}
+	u, err := url.Parse("//" + hostport)
+	if err != nil || u.Hostname() == "" {
+		return "", "", false
+	}
+	port := u.Port()
+	if port == "" {
+		port = defaultPort
+	}
+	return u.Hostname(), port, true
 }
 
 func mergeSearchResults(store *db.Store, msgs []*db.Message, convos []*db.Conversation, limit int) []SearchResult {

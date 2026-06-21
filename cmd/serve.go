@@ -421,7 +421,7 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 			if sseSrv != nil {
 				mux.Handle("/mcp/", sseSrv)
 			}
-			httpHandler = mux
+			httpHandler = web.ProtectLocalControl(mux)
 		}
 
 		ln, err := net.Listen("tcp", listenAddr)

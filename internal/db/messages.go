@@ -13,6 +13,11 @@ const messageColumns = `message_id, conversation_id, sender_name, sender_number,
 
 var ErrMessageNotFound = errors.New("message not found")
 
+const (
+	MaxTranscriptBytes      = 64 << 10
+	MaxTranscriptModelBytes = 128
+)
+
 func (s *Store) UpsertMessage(m *Message) error {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -796,6 +801,9 @@ func (s *Store) SetMessageTranscript(messageID, transcript string, model *string
 	if messageID == "" {
 		return fmt.Errorf("SetMessageTranscript: empty message_id")
 	}
+	if err := ValidateMessageTranscript(transcript, model); err != nil {
+		return err
+	}
 	msg, err := s.GetMessageByID(messageID)
 	if err != nil {
 		return fmt.Errorf("SetMessageTranscript: get message: %w", err)
@@ -838,6 +846,16 @@ func (s *Store) SetMessageTranscript(messageID, transcript string, model *string
 	}
 	if n == 0 {
 		return ErrMessageNotFound
+	}
+	return nil
+}
+
+func ValidateMessageTranscript(transcript string, model *string) error {
+	if len(transcript) > MaxTranscriptBytes {
+		return fmt.Errorf("transcript exceeds %d bytes", MaxTranscriptBytes)
+	}
+	if model != nil && len(*model) > MaxTranscriptModelBytes {
+		return fmt.Errorf("transcript model exceeds %d bytes", MaxTranscriptModelBytes)
 	}
 	return nil
 }

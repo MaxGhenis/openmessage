@@ -87,7 +87,7 @@ Don't inspect all 100+ photos individually. Be efficient:
 
 ### Output
 
-Build a JSON array of the selected photo file paths (absolute paths). You'll pass this to `render_story` via the `photo_paths` parameter.
+Build a JSON array of selected photo file paths under `OPENMESSAGES_EXPORT_DIR` (default `~/Documents/OpenMessage`). If the user intentionally wants to read photos from elsewhere, explain that `OPENMESSAGES_ALLOW_ANY_EXPORT_PATH=1` is required before passing those absolute paths to `render_story`.
 
 ## Phase 4: render
 
@@ -117,9 +117,9 @@ Assemble the Story JSON and call `render_story`. The JSON format:
 Call `render_story` with:
 - `name`: the person's name
 - `story_json`: the JSON string above
-- `output_path`: `/tmp/{name_lowercase}_story.html`
+- `output_path`: `stories/{name_lowercase}_story.html` (written under `OPENMESSAGES_EXPORT_DIR`, default `~/Documents/OpenMessage`)
 - `timezone`: "America/New_York" (or ask the user if unsure)
-- `photo_paths`: JSON array of curated photo file paths (from Phase 3.5)
+- `photo_paths`: JSON array of curated photo file paths from Phase 3.5. By default, these must be inside `OPENMESSAGES_EXPORT_DIR`; set `OPENMESSAGES_ALLOW_ANY_EXPORT_PATH=1` only for an explicit outside-directory export.
 
 Photos are automatically sorted chronologically by date in their filename, and interspersed between sections so early photos appear near early chapters and recent photos near recent ones.
 

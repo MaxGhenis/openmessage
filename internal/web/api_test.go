@@ -428,6 +428,29 @@ func TestSetTranscriptRequiresTranscriptField(t *testing.T) {
 	}
 }
 
+func TestSetTranscriptRejectsOversizedPayload(t *testing.T) {
+	ts := newTestServer(t)
+
+	tooLong := strings.Repeat("x", db.MaxTranscriptBytes+1)
+	payload, err := json.Marshal(map[string]string{
+		"message_id": "audio-1",
+		"transcript": tooLong,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.Post(ts.server.URL+"/api/transcript", "application/json", strings.NewReader(string(payload)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("got status %d, want 413: %s", resp.StatusCode, body)
+	}
+}
+
 func TestSetTranscriptPreservesModelWhenOmitted(t *testing.T) {
 	ts := newTestServer(t)
 
@@ -2880,16 +2903,99 @@ func TestAPIRejectsCrossOriginRequests(t *testing.T) {
 		t.Fatal("same-origin POST should not be forbidden")
 	}
 
-	// A loopback Origin is allowed.
+	// The exact same loopback Origin is allowed.
 	req3, _ := http.NewRequest("POST", ts.server.URL+"/api/backfill", strings.NewReader("{}"))
-	req3.Header.Set("Origin", "http://127.0.0.1:7007")
+	req3.Header.Set("Origin", ts.server.URL)
 	resp3, err := http.DefaultClient.Do(req3)
 	if err != nil {
 		t.Fatal(err)
 	}
 	resp3.Body.Close()
 	if resp3.StatusCode == http.StatusForbidden {
-		t.Fatal("loopback-origin POST should not be forbidden")
+		t.Fatal("same-origin loopback POST should not be forbidden")
+	}
+
+	// A different loopback port is still cross-origin and must be rejected.
+	req4, _ := http.NewRequest("POST", ts.server.URL+"/api/backfill", strings.NewReader("{}"))
+	req4.Header.Set("Origin", "http://127.0.0.1:1")
+	resp4, err := http.DefaultClient.Do(req4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp4.Body.Close()
+	if resp4.StatusCode != http.StatusForbidden {
+		t.Fatalf("other-loopback-origin POST: got %d, want 403", resp4.StatusCode)
+	}
+}
+
+func TestMCPRouteRejectsCrossOriginRequests(t *testing.T) {
+	store, err := db.New(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	mcpHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("mcp ok"))
+	})
+	h := APIHandlerWithOptions(store, nil, zerolog.Nop(), mcpHandler, APIOptions{})
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	req, _ := http.NewRequest("GET", srv.URL+"/mcp/sse", nil)
+	req.Header.Set("Origin", "http://evil.example.com")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("cross-origin MCP: got %d, want 403", resp.StatusCode)
+	}
+
+	req2, _ := http.NewRequest("GET", srv.URL+"/mcp/sse", nil)
+	req2.Header.Set("Origin", srv.URL)
+	resp2, err := http.DefaultClient.Do(req2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("same-origin MCP: got %d, want 200", resp2.StatusCode)
+	}
+}
+
+func TestProtectLocalControlRejectsMCPOnlyCrossOriginRequests(t *testing.T) {
+	protected := ProtectLocalControl(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/mcp/sse" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	srv := httptest.NewServer(protected)
+	defer srv.Close()
+
+	req, _ := http.NewRequest("GET", srv.URL+"/mcp/sse", nil)
+	req.Header.Set("Origin", "http://evil.example.com")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("cross-origin MCP-only route: got %d, want 403", resp.StatusCode)
+	}
+
+	req2, _ := http.NewRequest("GET", srv.URL+"/mcp/sse", nil)
+	req2.Header.Set("Origin", srv.URL)
+	resp2, err := http.DefaultClient.Do(req2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("same-origin MCP-only route: got %d, want 200", resp2.StatusCode)
 	}
 }
 
@@ -3188,17 +3294,17 @@ func TestAPIGuardRejectsEmptyHost(t *testing.T) {
 	// the way a hand-rolled client omitting it would reach it.
 	r := httptest.NewRequest(http.MethodGet, "/api/conversations", nil)
 	r.Host = ""
-	if isLocalAPIRequest(r) {
+	if isLocalControlRequest(r) {
 		t.Fatal("request with empty Host must not pass the loopback guard")
 	}
 
 	r.Host = "127.0.0.1:7007"
-	if !isLocalAPIRequest(r) {
+	if !isLocalControlRequest(r) {
 		t.Fatal("loopback Host must pass the guard")
 	}
 
 	r.Host = "evil.example.com"
-	if isLocalAPIRequest(r) {
+	if isLocalControlRequest(r) {
 		t.Fatal("non-loopback Host must not pass the guard")
 	}
 }

@@ -701,6 +701,29 @@ func TestSetMessageTranscript(t *testing.T) {
 	}
 }
 
+func TestSetMessageTranscriptRejectsOversizedValues(t *testing.T) {
+	store := newTestStore(t)
+	if err := store.UpsertMessage(&Message{
+		MessageID:      "audio-oversized",
+		ConversationID: "c1",
+		Body:           "[Voice note]",
+		MediaID:        "media-x",
+		MimeType:       "audio/ogg",
+		TimestampMS:    1000,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	tooLongTranscript := strings.Repeat("x", MaxTranscriptBytes+1)
+	if err := store.SetMessageTranscript("audio-oversized", tooLongTranscript, nil); err == nil {
+		t.Fatal("expected oversized transcript error")
+	}
+	tooLongModel := strings.Repeat("m", MaxTranscriptModelBytes+1)
+	if err := store.SetMessageTranscript("audio-oversized", "ok", &tooLongModel); err == nil {
+		t.Fatal("expected oversized model error")
+	}
+}
+
 func TestSearchMessages_Comprehensive(t *testing.T) {
 	store := newTestStore(t)
 

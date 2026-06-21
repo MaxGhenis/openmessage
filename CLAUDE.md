@@ -149,7 +149,7 @@ Generates a self-contained HTML file combining data dashboards with narrative ch
 
 **Sections**: password gate, hero, timeline nav, narrative chapters (early/middle/late), monthly volume chart (Chart.js), sender split donut, response times, hour-of-week heatmap, phrase cloud (colored by sender ratio), longest gap callout, interspersed photo breaks (chronologically aligned), interludes, closing.
 
-**Key parameters**: `name` (person to search), `output_path`, `timezone` (default ET), `password`, `api_key` (for Claude-generated narrative), colors (`primary_color`, `secondary_color`, etc.).
+**Key parameters**: `name` (person to search), `output_path` (relative to `OPENMESSAGES_EXPORT_DIR`, default `~/Documents/OpenMessage`, unless `OPENMESSAGES_ALLOW_ANY_EXPORT_PATH=1` is set), `timezone` (default ET), `password`, `api_key` (for Claude-generated narrative), colors (`primary_color`, `secondary_color`, etc.).
 
 **Architecture**:
 - `internal/viz/config.go` — `VizConfig` struct, section ordering, color theming

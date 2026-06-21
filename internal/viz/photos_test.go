@@ -1,6 +1,8 @@
 package viz
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/maxghenis/openmessage/internal/db"
@@ -78,5 +80,32 @@ func TestIsVisualMedia(t *testing.T) {
 				t.Errorf("isVisualMedia(%q) = %v, want %v", tt.mime, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestEncodePhotosFromDirSkipsSymlinkedImages(t *testing.T) {
+	dir := t.TempDir()
+	outside := t.TempDir()
+
+	if err := os.WriteFile(filepath.Join(dir, "20250101-real.jpg"), []byte("real image"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(outside, "secret.jpg")
+	if err := os.WriteFile(target, []byte("secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(dir, "20250102-leak.jpg")); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+
+	photos, err := EncodePhotosFromDir(dir, 0)
+	if err != nil {
+		t.Fatalf("EncodePhotosFromDir: %v", err)
+	}
+	if len(photos) != 1 {
+		t.Fatalf("got %d photos, want only the real file", len(photos))
+	}
+	if photos[0].Filename != "20250101-real.jpg" {
+		t.Fatalf("encoded filename = %q, want real image", photos[0].Filename)
 	}
 }
