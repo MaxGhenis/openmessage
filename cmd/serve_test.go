@@ -1,12 +1,17 @@
 package cmd
 
 import (
+	"bytes"
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 	"time"
+
+	mcpserver "github.com/mark3labs/mcp-go/server"
 )
 
 func TestHTTPServerSurvivesIndependently(t *testing.T) {
@@ -46,6 +51,35 @@ func TestHTTPServerSurvivesIndependently(t *testing.T) {
 	body, _ := io.ReadAll(resp.Body)
 	if string(body) != "ok" {
 		t.Fatalf("got %q, want %q", body, "ok")
+	}
+}
+
+func TestMCPHTTPHandlerServesCodexAndClaudeTransports(t *testing.T) {
+	mcpSrv := mcpserver.NewMCPServer("test-openmessage", "test", mcpserver.WithToolCapabilities(true))
+	srv := httptest.NewServer(newMCPHTTPHandler(mcpSrv, "http://example.test"))
+	defer srv.Close()
+
+	initBody := []byte(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"0"}}}`)
+	resp, err := http.Post(srv.URL+"/mcp", "application/json", bytes.NewReader(initBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("streamable HTTP /mcp status = %d, want 200", resp.StatusCode)
+	}
+
+	req, _ := http.NewRequest("GET", srv.URL+"/mcp/sse", nil)
+	resp2, err := srv.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("SSE /mcp/sse status = %d, want 200", resp2.StatusCode)
+	}
+	if ct := resp2.Header.Get("Content-Type"); !strings.HasPrefix(ct, "text/event-stream") {
+		t.Fatalf("SSE content-type = %q, want text/event-stream", ct)
 	}
 }
 

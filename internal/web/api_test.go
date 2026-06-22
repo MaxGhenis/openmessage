@@ -2964,6 +2964,28 @@ func TestMCPRouteRejectsCrossOriginRequests(t *testing.T) {
 	if resp2.StatusCode != http.StatusOK {
 		t.Fatalf("same-origin MCP: got %d, want 200", resp2.StatusCode)
 	}
+
+	req3, _ := http.NewRequest("POST", srv.URL+"/mcp", nil)
+	req3.Header.Set("Origin", "http://evil.example.com")
+	resp3, err := http.DefaultClient.Do(req3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp3.Body.Close()
+	if resp3.StatusCode != http.StatusForbidden {
+		t.Fatalf("cross-origin MCP exact path: got %d, want 403", resp3.StatusCode)
+	}
+
+	req4, _ := http.NewRequest("POST", srv.URL+"/mcp", nil)
+	req4.Header.Set("Origin", srv.URL)
+	resp4, err := http.DefaultClient.Do(req4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp4.Body.Close()
+	if resp4.StatusCode != http.StatusOK {
+		t.Fatalf("same-origin MCP exact path: got %d, want 200", resp4.StatusCode)
+	}
 }
 
 func TestProtectLocalControlRejectsMCPOnlyCrossOriginRequests(t *testing.T) {

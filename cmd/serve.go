@@ -360,12 +360,9 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 	)
 	tools.Register(mcpSrv, a)
 
-	var sseSrv http.Handler
+	var mcpHTTPHandler http.Handler
 	if opts.mcpSSE {
-		sseSrv = mcpserver.NewSSEServer(mcpSrv,
-			mcpserver.WithBaseURL(baseURL),
-			mcpserver.WithStaticBasePath("/mcp"),
-		)
+		mcpHTTPHandler = newMCPHTTPHandler(mcpSrv, baseURL)
 	}
 
 	googleStatus := func() any {
@@ -379,7 +376,7 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 	if httpEnabled {
 		httpHandler := http.Handler(nil)
 		if opts.web {
-			httpHandler = web.APIHandlerWithOptions(a.Store, nil, logger, sseSrv, web.APIOptions{
+			httpHandler = web.APIHandlerWithOptions(a.Store, nil, logger, mcpHTTPHandler, web.APIOptions{
 				Client:               a.GetClient,
 				Events:               events,
 				IdentityName:         identityName,
@@ -417,11 +414,7 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 				SyncGoogleContacts:    a.SyncGoogleContacts,
 			})
 		} else {
-			mux := http.NewServeMux()
-			if sseSrv != nil {
-				mux.Handle("/mcp/", sseSrv)
-			}
-			httpHandler = web.ProtectLocalControl(mux)
+			httpHandler = web.ProtectLocalControl(mcpHTTPHandler)
 		}
 
 		ln, err := net.Listen("tcp", listenAddr)
@@ -471,6 +464,18 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 	<-sigCh
 	logger.Info().Msg("Shutting down")
 	return nil
+}
+
+func newMCPHTTPHandler(mcpSrv *mcpserver.MCPServer, baseURL string) http.Handler {
+	streamableSrv := mcpserver.NewStreamableHTTPServer(mcpSrv, mcpserver.WithEndpointPath("/mcp"))
+	sseSrv := mcpserver.NewSSEServer(mcpSrv,
+		mcpserver.WithBaseURL(baseURL),
+		mcpserver.WithStaticBasePath("/mcp"),
+	)
+	mux := http.NewServeMux()
+	mux.Handle("/mcp", streamableSrv)
+	mux.Handle("/mcp/", sseSrv)
+	return mux
 }
 
 // telemetrySnapshot extracts the minimal pairing-status data sent in heartbeats.

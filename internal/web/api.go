@@ -2045,11 +2045,11 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		staticHandler.ServeHTTP(w, r)
 	}))
 
-	// Wrap the mux to intercept /mcp/ requests before the mux's catch-all
+	// Wrap the mux to intercept MCP requests before the mux's catch-all.
 	var handler http.Handler = mux
 	if mcpHandler != nil {
 		handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if strings.HasPrefix(r.URL.Path, "/mcp/") {
+			if r.URL.Path == "/mcp" || strings.HasPrefix(r.URL.Path, "/mcp/") {
 				mcpHandler.ServeHTTP(w, r)
 				return
 			}
