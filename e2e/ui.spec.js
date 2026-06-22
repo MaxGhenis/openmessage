@@ -226,6 +226,7 @@ test('shows live Signal history import progress after pairing starts', async ({ 
     });
   });
 
+  await page.reload();
   await openPlatforms(page);
 
   await expect(page.locator('#signal-status-pill')).toHaveText('Importing history');
