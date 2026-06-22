@@ -464,8 +464,9 @@ func TestSendMessageSMSPersistsConversationAndOutgoingMessage(t *testing.T) {
 	}
 }
 
-func TestSendMessageLookupAuthErrorMarksRepair(t *testing.T) {
+func TestSendMessageLookupAuthErrorMarksDisconnected(t *testing.T) {
 	a := testApp(t)
+	a.Connected.Store(true)
 	a.SessionPath = filepath.Join(t.TempDir(), "session.json")
 	if err := os.WriteFile(a.SessionPath, []byte("{}"), 0o600); err != nil {
 		t.Fatal(err)
@@ -492,8 +493,15 @@ func TestSendMessageLookupAuthErrorMarksRepair(t *testing.T) {
 	if !result.IsError {
 		t.Fatal("expected error result")
 	}
-	if !a.GoogleStatus().NeedsRepair {
-		t.Fatal("auth-invalid lookup error should mark Google session for repair")
+	status := a.GoogleStatus()
+	if status.Connected {
+		t.Fatal("auth-invalid lookup error should mark Google disconnected")
+	}
+	if status.NeedsRepair {
+		t.Fatal("auth-invalid lookup error should use cookie-refresh reconnect, not repair")
+	}
+	if !strings.Contains(status.LastError, "session cookie expired") {
+		t.Fatalf("last error = %q, want session cookie expired message", status.LastError)
 	}
 }
 
