@@ -274,8 +274,22 @@ func TestHandleGoogleAuthExpiredErrorMarksDisconnected(t *testing.T) {
 	if got := a.GoogleStatus().LastError; got != googleAuthExpiredStatusMessage {
 		t.Fatalf("last error = %q, want %q", got, googleAuthExpiredStatusMessage)
 	}
+	if !a.GoogleStatus().AuthExpired {
+		t.Fatal("expected auth-expired status flag")
+	}
+
+	a.setGoogleLastError("Google Messages connection lost; reconnecting...")
+	if !a.GoogleStatus().AuthExpired {
+		t.Fatal("auth-expired flag should survive generic reconnect last-error text")
+	}
 
 	if a.HandleGoogleAuthExpiredError(errors.New("temporary failure in name resolution")) {
 		t.Fatal("network errors should not be treated as auth expiry")
+	}
+}
+
+func TestIsGoogleAuthExpiredErrorRecognizesFriendlyStatus(t *testing.T) {
+	if !IsGoogleAuthExpiredError(errors.New(googleAuthExpiredStatusMessage)) {
+		t.Fatal("expected friendly auth-expired status to be recognized")
 	}
 }

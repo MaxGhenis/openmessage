@@ -13,6 +13,7 @@ func IsGoogleAuthExpiredError(err error) bool {
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "http 401") ||
 		strings.Contains(msg, "session_cookie_invalid") ||
+		strings.Contains(msg, "session cookie expired") ||
 		strings.Contains(msg, "invalid authentication credentials")
 }
 
@@ -24,6 +25,7 @@ func (a *App) HandleGoogleAuthExpiredError(err error) bool {
 	}
 	a.Connected.Store(false)
 	a.ClearGoogleRepairFlag()
+	a.googleAuthExpired.Store(true)
 	a.setGoogleLastError(googleAuthExpiredStatusMessage)
 	a.emitStatusChange(false)
 	a.Logger.Warn().Err(err).Msg("Google auth expired; marking disconnected")

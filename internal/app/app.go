@@ -154,6 +154,7 @@ type App struct {
 	// the UI can surface a re-pair affordance even while "connected".
 	googleSendFailures        atomic.Int32
 	googleNeedsRepair         atomic.Bool
+	googleAuthExpired         atomic.Bool
 	googlePhoneResponding     atomic.Bool
 	googlePhoneRespondingSeen atomic.Bool
 	tempDataDir               string
@@ -170,6 +171,9 @@ type GoogleStatusSnapshot struct {
 	// offer re-pairing even though Connected is true.
 	NeedsRepair bool   `json:"needs_repair,omitempty"`
 	LastError   string `json:"last_error,omitempty"`
+	// AuthExpired is set when Google rejects the web session cookies. Unlike a
+	// true unpair, a cookie refresh plus reconnect can recover it.
+	AuthExpired bool `json:"auth_expired,omitempty"`
 	// PhoneResponding is false after libgm reports PhoneNotResponding. Before
 	// such an event is observed, unknown is treated as healthy.
 	PhoneResponding bool `json:"phone_responding"`
@@ -492,6 +496,7 @@ func (a *App) LoadAndConnect() error {
 	// A clean connect proves the session is alive; clear any prior stuck/dead
 	// state (also covers the path right after re-pairing).
 	a.ClearGoogleRepairFlag()
+	a.googleAuthExpired.Store(false)
 	a.RecordGooglePhoneResponding(true)
 	a.Connected.Store(true)
 	a.setGoogleLastError("")
@@ -641,6 +646,7 @@ func (a *App) GoogleStatus() GoogleStatusSnapshot {
 		// 401 case (which is disconnected).
 		NeedsRepair:     paired && a.googleNeedsRepair.Load(),
 		LastError:       lastError,
+		AuthExpired:     a.googleAuthExpired.Load(),
 		PhoneResponding: a.GooglePhoneResponding(),
 	}
 }
@@ -660,6 +666,7 @@ func (a *App) AnyConnected() bool {
 
 func (a *App) ReconnectGoogleMessages() error {
 	if a.Connected.Load() && a.GetClient() != nil {
+		a.googleAuthExpired.Store(false)
 		a.setGoogleLastError("")
 		return nil
 	}

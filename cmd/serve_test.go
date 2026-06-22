@@ -14,6 +14,8 @@ import (
 	"time"
 
 	mcpserver "github.com/mark3labs/mcp-go/server"
+
+	"github.com/maxghenis/openmessage/internal/app"
 )
 
 func TestHTTPServerSurvivesIndependently(t *testing.T) {
@@ -173,6 +175,28 @@ func TestRefreshGoogleSessionCookiesUsesEnvScript(t *testing.T) {
 	}
 	if got := strings.TrimSpace(string(args)); got != "--quiet --no-backup" {
 		t.Fatalf("args = %q, want %q", got, "--quiet --no-backup")
+	}
+}
+
+func TestGoogleStatusNeedsCookieRefreshUsesExplicitAuthExpiredFlag(t *testing.T) {
+	status := app.GoogleStatusSnapshot{
+		Paired:      true,
+		AuthExpired: true,
+		LastError:   "Google Messages connection lost; reconnecting...",
+	}
+	if !googleStatusNeedsCookieRefresh(status) {
+		t.Fatal("expected explicit auth-expired flag to trigger cookie refresh")
+	}
+
+	status.AuthExpired = false
+	status.LastError = "Google Messages session cookie expired; refreshing and reconnecting..."
+	if !googleStatusNeedsCookieRefresh(status) {
+		t.Fatal("expected auth-expired last error to trigger cookie refresh")
+	}
+
+	status.LastError = "Google Messages connection lost; reconnecting..."
+	if googleStatusNeedsCookieRefresh(status) {
+		t.Fatal("generic reconnect status should not trigger cookie refresh")
 	}
 }
 

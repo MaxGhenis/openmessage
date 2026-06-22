@@ -2703,6 +2703,9 @@ func httpError(w http.ResponseWriter, msg string, code int) {
 }
 
 func googleAPIErrorMessage(action string, err error) string {
+	if app.IsGoogleAuthExpiredError(err) {
+		return "Google Messages session expired; refreshing and reconnecting. Try again in a few seconds."
+	}
 	if isGoogleNetworkError(err) {
 		return "Google Messages is offline. Check your internet connection, then try again."
 	}

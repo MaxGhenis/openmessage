@@ -233,7 +233,7 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 				if !g.Paired || g.Connected || g.NeedsPairing || g.NeedsRepair {
 					return
 				}
-				if app.IsGoogleAuthExpiredError(fmt.Errorf("%s", g.LastError)) {
+				if googleStatusNeedsCookieRefresh(g) {
 					if strings.TrimSpace(os.Getenv("OPENMESSAGE_COOKIE_REFRESH_SCRIPT")) != "" {
 						logger.Info().Msg("Google auth expired - refreshing Chrome cookies before reconnect")
 						ctx, cancel := context.WithTimeout(context.Background(), googleCookieRefreshTimeout)
@@ -627,6 +627,10 @@ func startupBackfillMode() string {
 }
 
 const googleCookieRefreshTimeout = 20 * time.Second
+
+func googleStatusNeedsCookieRefresh(g app.GoogleStatusSnapshot) bool {
+	return g.AuthExpired || app.IsGoogleAuthExpiredError(fmt.Errorf("%s", g.LastError))
+}
 
 var refreshGoogleSessionCookies = func(ctx context.Context) error {
 	script := strings.TrimSpace(os.Getenv("OPENMESSAGE_COOKIE_REFRESH_SCRIPT"))

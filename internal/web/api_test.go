@@ -1742,6 +1742,17 @@ func TestGoogleNetworkErrorIsUserFacing(t *testing.T) {
 	}
 }
 
+func TestGoogleAuthExpiredErrorIsUserFacing(t *testing.T) {
+	raw := "HTTP 401: 16: Request had invalid authentication credentials. Expected OAuth 2 access token, login cookie or other valid authentication credential."
+	got := googleAPIErrorMessage("get conversation", errors.New(raw))
+	if got != "Google Messages session expired; refreshing and reconnecting. Try again in a few seconds." {
+		t.Fatalf("error = %q", got)
+	}
+	if strings.Contains(got, "OAuth") || strings.Contains(got, "credential") || strings.Contains(got, "HTTP 401") {
+		t.Fatalf("error leaked auth details: %q", got)
+	}
+}
+
 func TestDiagnosticsEndpointIncludesCountsStatusAndReleaseSnapshot(t *testing.T) {
 	ts := newTestServerWithOptions(t, APIOptions{
 		IdentityName: "Max",
