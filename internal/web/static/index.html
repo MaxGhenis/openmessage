@@ -4518,8 +4518,8 @@ body::after {
   bottom: calc(100% + 8px);
   z-index: 72;
   display: none;
-  width: min(560px, calc(100vw - 96px));
-  max-height: min(430px, calc(100vh - 260px));
+  width: min(720px, calc(100vw - 96px));
+  max-height: min(520px, calc(100vh - 220px));
   overflow: hidden;
   flex-direction: column;
   border: 1px solid var(--border);
@@ -4533,7 +4533,8 @@ body::after {
 }
 
 .gif-search {
-  padding: 12px;
+  flex: 0 0 auto;
+  padding: 12px 14px;
   border-bottom: 1px solid var(--border);
 }
 
@@ -4553,23 +4554,75 @@ body::after {
   border-color: var(--border-accent);
 }
 
+.gif-results-scroll {
+  min-height: 0;
+  overflow-y: auto;
+  padding: 14px;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(148, 163, 184, 0.55) transparent;
+}
+
+.gif-results-scroll::-webkit-scrollbar {
+  width: 8px;
+}
+
+.gif-results-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.gif-results-scroll::-webkit-scrollbar-thumb {
+  border: 2px solid transparent;
+  border-radius: 999px;
+  background: rgba(148, 163, 184, 0.58);
+  background-clip: padding-box;
+}
+
+.gif-results-scroll::-webkit-scrollbar-thumb:hover {
+  background: rgba(203, 213, 225, 0.72);
+  background-clip: padding-box;
+}
+
+.gif-favorites {
+  margin-bottom: 14px;
+}
+
+.gif-favorites[hidden] {
+  display: none;
+}
+
+.gif-section-label {
+  margin: 0 0 8px;
+  color: var(--text-muted);
+  font: 700 10px/1 var(--font-mono);
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+
+.gif-favorites-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(136px, 1fr));
+  gap: 12px;
+}
+
 .gif-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(112px, 1fr));
-  gap: 8px;
-  overflow-y: auto;
-  padding: 12px;
+  grid-template-columns: repeat(auto-fill, minmax(136px, 1fr));
+  gap: 12px;
+  overflow: visible;
+  padding: 0;
 }
 
 .gif-tile {
+  position: relative;
   min-width: 0;
-  aspect-ratio: 1.1;
+  aspect-ratio: 1.08;
   overflow: hidden;
   border: 1px solid var(--border);
   border-radius: 12px;
   background: var(--bg-surface);
   cursor: pointer;
   padding: 0;
+  box-shadow: inset 0 0 0 1px rgba(15, 23, 42, 0.14);
 }
 
 .gif-tile:hover,
@@ -4585,10 +4638,55 @@ body::after {
   object-fit: cover;
 }
 
+.gif-favorite-toggle {
+  position: absolute;
+  top: 7px;
+  right: 7px;
+  z-index: 1;
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  border-radius: 999px;
+  background: rgba(15, 23, 42, 0.68);
+  color: rgba(226, 232, 240, 0.92);
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 120ms ease, transform 120ms ease, color 120ms ease, background 120ms ease;
+}
+
+.gif-tile:hover .gif-favorite-toggle,
+.gif-tile:focus-within .gif-favorite-toggle,
+.gif-favorite-toggle.active {
+  opacity: 1;
+}
+
+.gif-favorite-toggle:hover,
+.gif-favorite-toggle:focus-visible,
+.gif-favorite-toggle.active {
+  background: rgba(15, 23, 42, 0.84);
+  color: #f59e0b;
+  outline: none;
+  transform: scale(1.04);
+}
+
+.gif-favorite-toggle svg {
+  width: 15px;
+  height: 15px;
+}
+
 .gif-status {
   padding: 18px 12px;
   color: var(--text-muted);
   font-size: 13px;
+  text-align: center;
+}
+
+.gif-load-status {
+  padding: 12px 0 2px;
+  color: var(--text-muted);
+  font-size: 12px;
   text-align: center;
 }
 
@@ -9834,9 +9932,91 @@ body::after {
 	  }
 
 	  const GIF_SEARCH_DEBOUNCE_MS = 500;
+	  const GIF_PAGE_SIZE = 32;
+	  const GIF_FAVORITES_STORAGE_KEY = 'openmessage.gifFavorites.v1';
+	  const GIF_FAVORITES_LIMIT = 72;
 	  let gifSearchTimeout = null;
 	  let gifSearchRequestID = 0;
 	  let gifSending = false;
+	  let gifLoading = false;
+	  let gifQuery = '';
+	  let gifPage = 0;
+	  let gifHasMore = true;
+	  let gifResults = [];
+	  let gifFavorites = loadGifFavorites();
+
+	  function normalizeGifResult(result) {
+	    if (!result || !result.url || !result.preview_url) return null;
+	    return {
+	      id: String(result.id || ''),
+	      title: String(result.title || 'GIF'),
+	      preview_url: String(result.preview_url || ''),
+	      url: String(result.url || ''),
+	      mime_type: String(result.mime_type || 'image/gif'),
+	      width: Number(result.width || 0),
+	      height: Number(result.height || 0),
+	    };
+	  }
+
+	  function gifKey(result) {
+	    return String(result && result.url || '').trim();
+	  }
+
+	  function loadGifFavorites() {
+	    try {
+	      const raw = window.localStorage ? window.localStorage.getItem(GIF_FAVORITES_STORAGE_KEY) : '';
+	      const parsed = raw ? JSON.parse(raw) : [];
+	      if (!Array.isArray(parsed)) return [];
+	      return parsed.map(normalizeGifResult).filter(Boolean).slice(0, GIF_FAVORITES_LIMIT);
+	    } catch {
+	      return [];
+	    }
+	  }
+
+	  function saveGifFavorites() {
+	    try {
+	      if (window.localStorage) {
+	        window.localStorage.setItem(GIF_FAVORITES_STORAGE_KEY, JSON.stringify(gifFavorites.slice(0, GIF_FAVORITES_LIMIT)));
+	      }
+	    } catch {}
+	  }
+
+	  function isFavoriteGif(result) {
+	    const key = gifKey(result);
+	    return !!key && gifFavorites.some(item => gifKey(item) === key);
+	  }
+
+	  function gifFavoriteIconHTML(active) {
+	    return `<svg viewBox="0 0 24 24" fill="${active ? 'currentColor' : 'none'}" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>`;
+	  }
+
+	  function updateGifFavoriteButtons(root = $composeGifPanel) {
+	    if (!root) return;
+	    root.querySelectorAll('.gif-favorite-toggle').forEach(btn => {
+	      const active = gifFavorites.some(item => gifKey(item) === btn.dataset.gifUrl);
+	      btn.classList.toggle('active', active);
+	      btn.setAttribute('aria-pressed', active ? 'true' : 'false');
+	      btn.title = active ? 'Remove from favorite GIFs' : 'Add to favorite GIFs';
+	      btn.setAttribute('aria-label', btn.title);
+	      btn.innerHTML = gifFavoriteIconHTML(active);
+	    });
+	  }
+
+	  function toggleGifFavorite(result) {
+	    const normalized = normalizeGifResult(result);
+	    if (!normalized) return;
+	    const key = gifKey(normalized);
+	    const existing = gifFavorites.findIndex(item => gifKey(item) === key);
+	    if (existing >= 0) {
+	      gifFavorites.splice(existing, 1);
+	    } else {
+	      gifFavorites.unshift(normalized);
+	      gifFavorites = gifFavorites.slice(0, GIF_FAVORITES_LIMIT);
+	    }
+	    saveGifFavorites();
+	    renderGifFavorites();
+	    updateGifFavoriteButtons();
+	  }
 
 	  function buildComposeGifPanel() {
 	    if (!$composeGifPanel || $composeGifPanel.dataset.hydrated === 'true') return;
@@ -9844,14 +10024,26 @@ body::after {
 	      <div class="gif-search">
 	        <input type="text" id="compose-gif-search" placeholder="Search GIFs..." aria-label="Search GIFs" autocomplete="off">
 	      </div>
-	      <div class="gif-status" id="compose-gif-status"></div>
-	      <div class="gif-grid" id="compose-gif-grid" aria-live="polite"></div>
+	      <div class="gif-results-scroll" id="compose-gif-scroll">
+	        <div class="gif-favorites" id="compose-gif-favorites" hidden>
+	          <div class="gif-section-label">Favorites</div>
+	          <div class="gif-favorites-grid" id="compose-gif-favorites-grid"></div>
+	        </div>
+	        <div class="gif-status" id="compose-gif-status"></div>
+	        <div class="gif-grid" id="compose-gif-grid" aria-live="polite"></div>
+	        <div class="gif-load-status" id="compose-gif-load-status" hidden></div>
+	      </div>
 	    `;
 	    $composeGifPanel.dataset.hydrated = 'true';
 	    const search = document.getElementById('compose-gif-search');
 	    if (search) {
 	      search.addEventListener('input', () => scheduleComposeGifSearch(search.value));
 	    }
+	    const scroller = document.getElementById('compose-gif-scroll');
+	    if (scroller) {
+	      scroller.addEventListener('scroll', maybeLoadMoreComposeGifs);
+	    }
+	    renderGifFavorites();
 	  }
 
 	  function scheduleComposeGifSearch(query) {
@@ -9886,6 +10078,7 @@ body::after {
 	    $composeGifPanel.classList.toggle('show', willOpen);
 	    $composeGifBtn.setAttribute('aria-expanded', willOpen ? 'true' : 'false');
 	    if (willOpen) {
+	      renderGifFavorites();
 	      const input = document.getElementById('compose-gif-search');
 	      if (input) input.focus();
 	      if ($composeGifPanel.dataset.loaded !== 'true') {
@@ -9894,66 +10087,166 @@ body::after {
 	    }
 	  }
 
-	  async function loadComposeGifs(query) {
-	    if (!$composeGifPanel) return;
-	    const requestID = ++gifSearchRequestID;
+	  function maybeLoadMoreComposeGifs() {
+	    const scroller = document.getElementById('compose-gif-scroll');
+	    if (!scroller || gifLoading || !gifHasMore) return;
+	    const remaining = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight;
+	    if (remaining <= 160) {
+	      loadComposeGifs(gifQuery, {append: true}).catch(err => console.error('GIF search failed:', err));
+	    }
+	  }
+
+	  async function loadComposeGifs(query, options = {}) {
+	    if (!$composeGifPanel || gifLoading) return;
+	    const append = !!options.append;
 	    const trimmed = String(query || '').trim();
+	    if (append && (!gifHasMore || trimmed !== gifQuery)) return;
+
+	    const requestID = ++gifSearchRequestID;
+	    const page = append ? gifPage + 1 : 1;
 	    const status = document.getElementById('compose-gif-status');
 	    const grid = document.getElementById('compose-gif-grid');
+	    const loadStatus = document.getElementById('compose-gif-load-status');
 	    if (!status || !grid) return;
-	    status.hidden = false;
-	    status.textContent = 'Loading GIFs...';
-	    grid.innerHTML = '';
+
+	    gifLoading = true;
+	    if (!append) {
+	      gifQuery = trimmed;
+	      gifPage = 0;
+	      gifHasMore = true;
+	      gifResults = [];
+	      grid.innerHTML = '';
+	      status.hidden = false;
+	      status.textContent = 'Loading GIFs...';
+	      const scroller = document.getElementById('compose-gif-scroll');
+	      if (scroller) scroller.scrollTop = 0;
+	    } else if (loadStatus) {
+	      loadStatus.hidden = false;
+	      loadStatus.textContent = 'Loading more GIFs...';
+	    }
 
 	    const endpoint = trimmed
-	      ? `/api/gifs?q=${encodeURIComponent(trimmed)}&limit=32`
-	      : '/api/gifs/trending?limit=32';
+	      ? `/api/gifs?q=${encodeURIComponent(trimmed)}&limit=${GIF_PAGE_SIZE}&page=${page}`
+	      : `/api/gifs/trending?limit=${GIF_PAGE_SIZE}&page=${page}`;
 	    try {
 	      const payload = await fetchJSON(endpoint);
 	      if (requestID !== gifSearchRequestID) return;
-	      const results = Array.isArray(payload) ? payload : (payload.results || []);
-	      renderComposeGifs(results);
+	      const incoming = (Array.isArray(payload) ? payload : (payload.results || []))
+	        .map(normalizeGifResult)
+	        .filter(Boolean);
+	      const existing = new Set(gifResults.map(gifKey));
+	      let added = 0;
+	      for (const result of incoming) {
+	        const key = gifKey(result);
+	        if (!key || existing.has(key)) continue;
+	        existing.add(key);
+	        gifResults.push(result);
+	        added += 1;
+	      }
+	      gifPage = page;
+	      gifHasMore = added > 0 && (payload && payload.has_more !== false) && incoming.length >= GIF_PAGE_SIZE;
+	      renderComposeGifs(gifResults);
 	      $composeGifPanel.dataset.loaded = 'true';
+	      requestAnimationFrame(() => {
+	        const scroller = document.getElementById('compose-gif-scroll');
+	        if (gifHasMore && scroller && scroller.scrollHeight <= scroller.clientHeight + 8) {
+	          maybeLoadMoreComposeGifs();
+	        }
+	      });
 	    } catch (err) {
 	      if (requestID !== gifSearchRequestID) return;
 	      status.hidden = false;
 	      status.textContent = userFacingErrorMessage(err) || 'GIF search failed.';
 	      throw err;
+	    } finally {
+	      if (requestID === gifSearchRequestID) {
+	        gifLoading = false;
+	        if (loadStatus) loadStatus.hidden = true;
+	      }
 	    }
+	  }
+
+	  function renderGifTile(result) {
+	    const normalized = normalizeGifResult(result);
+	    if (!normalized) return null;
+	    const tile = document.createElement('div');
+	    tile.className = 'gif-tile';
+	    tile.tabIndex = 0;
+	    tile.setAttribute('role', 'button');
+	    tile.title = normalized.title;
+	    tile.setAttribute('aria-label', normalized.title);
+
+	    const img = document.createElement('img');
+	    img.src = normalized.preview_url;
+	    img.alt = normalized.title;
+	    img.loading = 'lazy';
+	    tile.appendChild(img);
+
+	    const favorite = document.createElement('button');
+	    favorite.type = 'button';
+	    favorite.className = 'gif-favorite-toggle';
+	    favorite.dataset.gifUrl = normalized.url;
+	    favorite.addEventListener('click', (event) => {
+	      event.preventDefault();
+	      event.stopPropagation();
+	      toggleGifFavorite(normalized);
+	    });
+	    tile.appendChild(favorite);
+	    updateGifFavoriteButtons(tile);
+
+	    const send = () => {
+	      sendComposeGif(normalized).catch(err => console.error('Failed to send GIF:', err));
+	    };
+	    tile.addEventListener('click', send);
+	    tile.addEventListener('keydown', (event) => {
+	      if (event.key === 'Enter' || event.key === ' ') {
+	        event.preventDefault();
+	        send();
+	      }
+	    });
+	    return tile;
+	  }
+
+	  function renderGifFavorites() {
+	    const section = document.getElementById('compose-gif-favorites');
+	    const grid = document.getElementById('compose-gif-favorites-grid');
+	    if (!section || !grid) return;
+	    grid.innerHTML = '';
+	    if (!gifFavorites.length) {
+	      section.hidden = true;
+	      return;
+	    }
+	    section.hidden = false;
+	    gifFavorites.forEach(result => {
+	      const tile = renderGifTile(result);
+	      if (tile) grid.appendChild(tile);
+	    });
 	  }
 
 	  function renderComposeGifs(results) {
 	    const status = document.getElementById('compose-gif-status');
 	    const grid = document.getElementById('compose-gif-grid');
+	    const loadStatus = document.getElementById('compose-gif-load-status');
 	    if (!status || !grid) return;
 	    grid.innerHTML = '';
 	    if (!Array.isArray(results) || results.length === 0) {
 	      status.hidden = false;
 	      status.textContent = 'No GIFs found.';
+	      if (loadStatus) loadStatus.hidden = true;
 	      return;
 	    }
 	    status.hidden = true;
 	    results.forEach(result => {
-	      if (!result || !result.preview_url || !result.url) return;
-	      const btn = document.createElement('button');
-	      btn.type = 'button';
-	      btn.className = 'gif-tile';
-	      const title = result.title || 'GIF';
-	      btn.title = title;
-	      btn.setAttribute('aria-label', title);
-	      const img = document.createElement('img');
-	      img.src = result.preview_url;
-	      img.alt = title;
-	      img.loading = 'lazy';
-	      btn.appendChild(img);
-	      btn.addEventListener('click', () => {
-	        sendComposeGif(result).catch(err => console.error('Failed to send GIF:', err));
-	      });
-	      grid.appendChild(btn);
+	      const tile = renderGifTile(result);
+	      if (tile) grid.appendChild(tile);
 	    });
 	    if (!grid.children.length) {
 	      status.hidden = false;
 	      status.textContent = 'No GIFs found.';
+	    }
+	    if (loadStatus) {
+	      loadStatus.hidden = !gifHasMore;
+	      loadStatus.textContent = gifHasMore ? 'Scroll for more GIFs' : '';
 	    }
 	  }
 

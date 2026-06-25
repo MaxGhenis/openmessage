@@ -963,6 +963,80 @@ test('debounces GIF search while typing', async ({ page }) => {
   expect(gifRequests[0].searchParams.get('q')).toBe('cats');
 });
 
+test('loads more GIFs when scrolling the picker', async ({ page }) => {
+  const gifRequests = [];
+  await page.route(/\/api\/gifs(?:\/trending)?\?/, async route => {
+    const url = new URL(route.request().url());
+    gifRequests.push(url);
+    const pageNumber = Number(url.searchParams.get('page') || '1');
+    const results = Array.from({ length: 32 }, (_, index) => ({
+      title: `Wave ${pageNumber}-${index}`,
+      preview_url: 'data:image/gif;base64,R0lGODlhAQABAAAAACwAAAAAAQABAAA=',
+      url: `https://media.klipy.com/fake/wave-${pageNumber}-${index}.gif`,
+      mime_type: 'image/gif',
+      width: 1,
+      height: 1,
+    }));
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        results,
+        page: pageNumber,
+        has_more: pageNumber < 2,
+      }),
+    });
+  });
+
+  await openConversation(page, 'Taylor Price');
+  await page.locator('#compose-gif-btn').click();
+  await expect(page.locator('#compose-gif-grid .gif-tile')).toHaveCount(32);
+
+  await page.locator('#compose-gif-scroll').evaluate((scroller) => {
+    scroller.scrollTop = scroller.scrollHeight;
+    scroller.dispatchEvent(new Event('scroll'));
+  });
+
+  await expect
+    .poll(() => gifRequests.some(url => url.searchParams.get('page') === '2'))
+    .toBe(true);
+  await expect(page.locator('#compose-gif-grid .gif-tile')).toHaveCount(64);
+});
+
+test('favorites GIFs in the compose picker', async ({ page }) => {
+  await page.route(/\/api\/gifs(?:\/trending)?\?/, async route => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        results: [{
+          title: 'Favorite Wave',
+          preview_url: 'data:image/gif;base64,R0lGODlhAQABAAAAACwAAAAAAQABAAA=',
+          url: 'https://media.klipy.com/fake/favorite-wave.gif',
+          mime_type: 'image/gif',
+          width: 1,
+          height: 1,
+        }],
+        has_more: false,
+      }),
+    });
+  });
+
+  await openConversation(page, 'Taylor Price');
+  await page.locator('#compose-gif-btn').click();
+
+  const firstTile = page.locator('#compose-gif-grid .gif-tile').first();
+  await firstTile.hover();
+  await firstTile.locator('.gif-favorite-toggle').click();
+  await expect(firstTile.locator('.gif-favorite-toggle')).toHaveAttribute('aria-pressed', 'true');
+
+  await page.locator('#compose-gif-btn').click();
+  await page.locator('#compose-gif-btn').click();
+  await expect(page.locator('#compose-gif-favorites')).toBeVisible();
+  await expect(page.locator('#compose-gif-favorites-grid .gif-tile')).toHaveCount(1);
+  await expect(page.locator('#compose-gif-favorites-grid .gif-favorite-toggle')).toHaveAttribute('aria-pressed', 'true');
+});
+
 test('accepts dropped files in the compose box', async ({ page }) => {
   await openConversation(page, 'Taylor Price');
   await page.locator('#compose-bar').evaluate((composeBar) => {

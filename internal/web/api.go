@@ -1180,7 +1180,8 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			return
 		}
 		limit := queryIntClamped(r, "limit", defaultGIFSearchLimit, maxGIFSearchResults)
-		results, err := searchKlipyGIFs(r.Context(), r.URL.Query().Get("q"), limit)
+		page := queryIntClamped(r, "page", 1, 1000)
+		results, err := searchKlipyGIFs(r.Context(), r.URL.Query().Get("q"), limit, page)
 		if err != nil {
 			if errors.Is(err, errGIFProviderNotConfigured) {
 				httpError(w, err.Error(), 501)
@@ -1192,7 +1193,11 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		for i := range results {
 			results[i].PreviewURL = proxyGIFPreviewURL(results[i].PreviewURL)
 		}
-		writeJSON(w, map[string]any{"results": results})
+		writeJSON(w, map[string]any{
+			"results":  results,
+			"page":     page,
+			"has_more": len(results) >= limit,
+		})
 	})
 
 	mux.HandleFunc("/api/gifs/trending", func(w http.ResponseWriter, r *http.Request) {
@@ -1201,7 +1206,8 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			return
 		}
 		limit := queryIntClamped(r, "limit", defaultGIFSearchLimit, maxGIFSearchResults)
-		results, err := searchKlipyGIFs(r.Context(), defaultGIFSearchQuery, limit)
+		page := queryIntClamped(r, "page", 1, 1000)
+		results, err := searchKlipyGIFs(r.Context(), defaultGIFSearchQuery, limit, page)
 		if err != nil {
 			if errors.Is(err, errGIFProviderNotConfigured) {
 				httpError(w, err.Error(), 501)
@@ -1213,7 +1219,11 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		for i := range results {
 			results[i].PreviewURL = proxyGIFPreviewURL(results[i].PreviewURL)
 		}
-		writeJSON(w, map[string]any{"results": results})
+		writeJSON(w, map[string]any{
+			"results":  results,
+			"page":     page,
+			"has_more": len(results) >= limit,
+		})
 	})
 
 	mux.HandleFunc("/api/gifs/preview", func(w http.ResponseWriter, r *http.Request) {

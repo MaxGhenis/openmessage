@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -57,7 +58,7 @@ type klipyMediaFormat struct {
 	Dims []int  `json:"dims"`
 }
 
-func searchKlipyGIFs(ctx context.Context, query string, limit int) ([]gifSearchResult, error) {
+func searchKlipyGIFs(ctx context.Context, query string, limit, page int) ([]gifSearchResult, error) {
 	query = strings.TrimSpace(query)
 	if query == "" {
 		query = defaultGIFSearchQuery
@@ -67,6 +68,9 @@ func searchKlipyGIFs(ctx context.Context, query string, limit int) ([]gifSearchR
 	}
 	if limit > maxGIFSearchResults {
 		limit = maxGIFSearchResults
+	}
+	if page <= 0 {
+		page = 1
 	}
 	apiKey := klipyAPIKey()
 	if apiKey == "" {
@@ -80,6 +84,8 @@ func searchKlipyGIFs(ctx context.Context, query string, limit int) ([]gifSearchR
 	params := endpoint.Query()
 	params.Set("q", query)
 	params.Set("key", apiKey)
+	params.Set("page", strconv.Itoa(page))
+	params.Set("per_page", strconv.Itoa(limit))
 	endpoint.RawQuery = params.Encode()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)

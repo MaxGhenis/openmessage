@@ -27,6 +27,12 @@ func TestGIFSearchEndpointReturnsProxiedKlipyResults(t *testing.T) {
 		if got := r.URL.Query().Get("key"); got != "test-klipy-key" {
 			t.Fatalf("provider API key = %q, want test-klipy-key", got)
 		}
+		if got := r.URL.Query().Get("page"); got != "2" {
+			t.Fatalf("provider page = %q, want 2", got)
+		}
+		if got := r.URL.Query().Get("per_page"); got != "5" {
+			t.Fatalf("provider per_page = %q, want 5", got)
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{
 			"results": [{
@@ -53,7 +59,7 @@ func TestGIFSearchEndpointReturnsProxiedKlipyResults(t *testing.T) {
 	})
 
 	ts := newTestServer(t)
-	resp, err := http.Get(ts.server.URL + "/api/gifs?q=thumbs%20up&limit=5")
+	resp, err := http.Get(ts.server.URL + "/api/gifs?q=thumbs%20up&limit=5&page=2")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -65,12 +71,20 @@ func TestGIFSearchEndpointReturnsProxiedKlipyResults(t *testing.T) {
 
 	var payload struct {
 		Results []gifSearchResult `json:"results"`
+		Page    int               `json:"page"`
+		HasMore bool              `json:"has_more"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
 		t.Fatal(err)
 	}
 	if len(payload.Results) != 1 {
 		t.Fatalf("got %d results, want 1", len(payload.Results))
+	}
+	if payload.Page != 2 {
+		t.Fatalf("page = %d, want 2", payload.Page)
+	}
+	if payload.HasMore {
+		t.Fatal("has_more should be false when fewer results than limit are returned")
 	}
 	result := payload.Results[0]
 	if result.URL != "https://media.klipy.com/full.webp" {
