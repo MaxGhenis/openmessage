@@ -829,6 +829,247 @@ test('keeps existing thread nodes mounted after sending', async ({ page }) => {
   await expectStableThreadNodeStillMounted(page);
 });
 
+test('queues a text message while Google Messages is disconnected', async ({ page }) => {
+  const outbound = `Queued outbound ${Date.now()}`;
+  let sendRequests = 0;
+
+  await page.route('**/api/status', route => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({
+      connected: false,
+      google: { connected: false, paired: true, needs_pairing: false, needs_repair: false },
+      whatsapp: { connected: true, paired: true },
+      signal: { connected: true, paired: true },
+    }),
+  }));
+  page.on('request', req => {
+    if (req.method() === 'POST' && /\/api\/send(\?|$)/.test(req.url())) {
+      sendRequests += 1;
+    }
+  });
+
+  await page.reload();
+  await openConversation(page, 'Sarah Chen');
+  await page.locator('#compose-input').fill(outbound);
+  await page.locator('#send-btn').click();
+
+  await expect(page.locator('#compose-input')).toHaveValue('');
+  const latestMessage = page.locator('#messages-area .msg').last();
+  await expect(latestMessage).toContainText(outbound);
+  await expect(latestMessage.locator('.msg-status.status-sending')).toBeVisible();
+  await expect(page.locator('#thread-feedback')).toContainText('Message queued.');
+  expect(sendRequests).toBe(0);
+});
+
+test('keeps a transient Google send failure queued until reconnect', async ({ page }) => {
+  const outbound = `Reconnect queued ${Date.now()}`;
+  let sendRequests = 0;
+  let statusPayload = {
+    connected: true,
+    google: { connected: true, paired: true, needs_pairing: false, needs_repair: false },
+    whatsapp: { connected: true, paired: true },
+    signal: { connected: true, paired: true },
+    backfill: { running: false },
+  };
+
+  await page.route('**/api/status', route => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify(statusPayload),
+  }));
+  await page.route('**/api/send', route => {
+    sendRequests += 1;
+    if (sendRequests === 1) {
+      return route.fulfill({
+        status: 502,
+        contentType: 'text/plain',
+        body: 'Google Messages is offline. Check your internet connection, then try again.',
+      });
+    }
+    return route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ status: 'SUCCESS', success: true }),
+    });
+  });
+
+  await page.reload();
+  await page.waitForFunction(() => window.__openMessageTestHooks?.applyAppStatus);
+  await openConversation(page, 'Sarah Chen');
+  await page.locator('#compose-input').fill(outbound);
+  await page.locator('#send-btn').click();
+
+  await expect.poll(() => sendRequests).toBe(1);
+  const latestMessage = page.locator('#messages-area .msg').last();
+  await expect(latestMessage).toContainText(outbound);
+  await expect(latestMessage.locator('.msg-status.status-sending')).toBeVisible();
+  await expect(latestMessage.locator('.msg-status.status-failed')).toHaveCount(0);
+  await page.waitForTimeout(700);
+  expect(sendRequests).toBe(1);
+
+  statusPayload = {
+    connected: false,
+    google: { connected: false, paired: true, needs_pairing: false, needs_repair: false },
+    whatsapp: { connected: true, paired: true },
+    signal: { connected: true, paired: true },
+    backfill: { running: false },
+  };
+  await page.evaluate(status => window.__openMessageTestHooks.applyAppStatus(status), statusPayload);
+  await page.waitForTimeout(150);
+  expect(sendRequests).toBe(1);
+
+  statusPayload = {
+    connected: true,
+    google: { connected: true, paired: true, needs_pairing: false, needs_repair: false },
+    whatsapp: { connected: true, paired: true },
+    signal: { connected: true, paired: true },
+    backfill: { running: false },
+  };
+  await page.evaluate(status => window.__openMessageTestHooks.applyAppStatus(status), statusPayload);
+
+  await expect.poll(() => sendRequests).toBe(2);
+  await expect
+    .poll(() => page.evaluate(() => JSON.parse(localStorage.getItem('openmessage.pendingSends.v1') || '[]').length))
+    .toBe(0);
+});
+
+test('queues a text message while Google Messages needs repair', async ({ page }) => {
+  const outbound = `Queued repair ${Date.now()}`;
+  let sendRequests = 0;
+
+  await page.route('**/api/status', route => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({
+      connected: true,
+      google: { connected: true, paired: true, needs_pairing: false, needs_repair: true },
+      whatsapp: { connected: true, paired: true },
+      signal: { connected: true, paired: true },
+    }),
+  }));
+  page.on('request', req => {
+    if (req.method() === 'POST' && /\/api\/send(\?|$)/.test(req.url())) {
+      sendRequests += 1;
+    }
+  });
+
+  await page.reload();
+  await openConversation(page, 'Sarah Chen');
+  await page.locator('#compose-input').fill(outbound);
+  await page.locator('#send-btn').click();
+
+  await expect(page.locator('#compose-input')).toHaveValue('');
+  const latestMessage = page.locator('#messages-area .msg').last();
+  await expect(latestMessage).toContainText(outbound);
+  await expect(latestMessage.locator('.msg-status.status-sending')).toBeVisible();
+  await expect(page.locator('#thread-feedback')).toContainText('Message queued. Re-pair Google Messages to send it.');
+  expect(sendRequests).toBe(0);
+});
+
+test('queues an attachment while Google Messages needs repair', async ({ page }) => {
+  let sendMediaRequests = 0;
+
+  await page.route('**/api/status', route => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({
+      connected: true,
+      google: { connected: true, paired: true, needs_pairing: false, needs_repair: true },
+      whatsapp: { connected: true, paired: true },
+      signal: { connected: true, paired: true },
+    }),
+  }));
+  page.on('request', req => {
+    if (req.method() === 'POST' && /\/api\/send-media(\?|$)/.test(req.url())) {
+      sendMediaRequests += 1;
+    }
+  });
+
+  await page.reload();
+  await openConversation(page, 'Sarah Chen');
+  await page.locator('#file-input').setInputFiles({
+    name: 'queued-repair.png',
+    mimeType: 'image/png',
+    buffer: Buffer.from(
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO7Z9wAAAABJRU5ErkJggg==',
+      'base64',
+    ),
+  });
+
+  await expect(page.locator('#attach-preview')).toHaveClass(/active/);
+  await page.locator('#send-btn').click();
+
+  await expect(page.locator('#attach-preview')).not.toHaveClass(/active/);
+  const latestMessage = page.locator('#messages-area .msg').last();
+  await expect(latestMessage.locator('img[src^="blob:"]')).toBeVisible();
+  await expect(latestMessage.locator('.msg-status.status-sending')).toBeVisible();
+  await expect(page.locator('#thread-feedback')).toContainText('Message queued. Re-pair Google Messages to send it.');
+  expect(sendMediaRequests).toBe(0);
+});
+
+test('preserves text and attachment when the send queue is full', async ({ page }) => {
+  const outbound = `Queue cap draft ${Date.now()}`;
+  let sendRequests = 0;
+  let sendMediaRequests = 0;
+
+  await page.route('**/api/status', route => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({
+      connected: false,
+      google: { connected: false, paired: true, needs_pairing: false, needs_repair: false },
+      whatsapp: { connected: true, paired: true },
+      signal: { connected: true, paired: true },
+    }),
+  }));
+  page.on('request', req => {
+    if (req.method() === 'POST' && /\/api\/send(\?|$)/.test(req.url())) {
+      sendRequests += 1;
+    }
+    if (req.method() === 'POST' && /\/api\/send-media(\?|$)/.test(req.url())) {
+      sendMediaRequests += 1;
+    }
+  });
+
+  await page.evaluate(() => {
+    const now = Date.now();
+    const queued = Array.from({ length: 49 }, (_, i) => ({
+      id: `tmp_seed_${i}`,
+      conversation_id: `seed-conversation-${i}`,
+      platform: 'sms',
+      type: 'text',
+      body: `seed ${i}`,
+      timestamp_ms: now + i,
+      status: 'pending',
+    }));
+    localStorage.setItem('openmessage.pendingSends.v1', JSON.stringify(queued));
+  });
+  await page.reload();
+  await openConversation(page, 'Sarah Chen');
+  await page.locator('#file-input').setInputFiles({
+    name: 'queue-cap.png',
+    mimeType: 'image/png',
+    buffer: Buffer.from(
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO7Z9wAAAABJRU5ErkJggg==',
+      'base64',
+    ),
+  });
+  await page.locator('#compose-input').fill(outbound);
+
+  await page.locator('#send-btn').click();
+
+  await expect(page.locator('#thread-feedback')).toContainText('Too many queued messages.');
+  await expect(page.locator('#compose-input')).toHaveValue(outbound);
+  await expect(page.locator('#attach-preview')).toHaveClass(/active/);
+  await expect(page.locator('#messages-area')).not.toContainText(outbound);
+  await expect
+    .poll(() => page.evaluate(() => JSON.parse(localStorage.getItem('openmessage.pendingSends.v1') || '[]').length))
+    .toBe(49);
+  expect(sendRequests).toBe(0);
+  expect(sendMediaRequests).toBe(0);
+});
+
 test('sends a Signal text message through the compose box', async ({ page }) => {
   const outbound = `Signal outbound ${Date.now()}`;
 
@@ -983,6 +1224,56 @@ test('sends a GIF through the compose picker', async ({ page }) => {
   expect(sendGIFPayload.conversation_id).toContain('signal:');
   expect(sendGIFPayload.url).toBe('https://media.klipy.com/fake/wave.gif');
   expect(sendGIFPayload.caption).toBe(caption);
+});
+
+test('queues a GIF while the selected route is disconnected', async ({ page }) => {
+  let sendGIFRequests = 0;
+  await page.route('**/api/status', route => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({
+      connected: true,
+      google: { connected: true, paired: true, needs_pairing: false, needs_repair: false },
+      whatsapp: { connected: true, paired: true },
+      signal: { connected: false, paired: true },
+    }),
+  }));
+  await page.route(/\/api\/gifs(?:\/trending)?\?/, async route => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        results: [{
+          title: 'Queued wave',
+          preview_url: 'data:image/gif;base64,R0lGODlhAQABAAAAACwAAAAAAQABAAA=',
+          url: 'https://media.klipy.com/fake/queued-wave.gif',
+          mime_type: 'image/gif',
+          width: 1,
+          height: 1,
+        }],
+      }),
+    });
+  });
+  page.on('request', req => {
+    if (req.method() === 'POST' && /\/api\/send-gif(\?|$)/.test(req.url())) {
+      sendGIFRequests += 1;
+    }
+  });
+
+  await page.reload();
+  await openConversation(page, 'Taylor Price');
+  await expect(page.locator('#chat-header-source')).toContainText('Signal');
+  await page.locator('#compose-input').fill('Queued GIF caption');
+  await page.locator('#compose-gif-btn').click();
+  await expect(page.locator('#compose-gif-panel.show')).toBeVisible();
+  await page.locator('#compose-gif-panel .gif-tile').first().click();
+
+  await expect(page.locator('#compose-input')).toHaveValue('');
+  const latestMessage = page.locator('#messages-area .msg').last();
+  await expect(latestMessage.locator('img[src^="data:image/gif"]')).toBeVisible();
+  await expect(latestMessage.locator('.msg-status.status-sending')).toBeVisible();
+  await expect(page.locator('#thread-feedback')).toContainText('Message queued.');
+  expect(sendGIFRequests).toBe(0);
 });
 
 test('debounces GIF search while typing', async ({ page }) => {
@@ -1264,6 +1555,33 @@ test('sends a WhatsApp image attachment through the compose box', async ({ page 
   await expect(latestMessage.locator('.msg-media-loading')).toHaveCount(0);
 });
 
+test('renders a sent PDF attachment as an openable file card', async ({ page }) => {
+  const jordanRow = page.locator('#conversation-list > .convo-item').filter({
+    has: page.locator('.convo-name').getByText('Jordan Rivera', { exact: true }),
+  }).first();
+
+  await jordanRow.click();
+  await expect(page.locator('#chat-header-source .chat-route-tab.active')).toContainText('WhatsApp');
+  await page.locator('#file-input').setInputFiles({
+    name: 'menu.pdf',
+    mimeType: 'application/pdf',
+    buffer: Buffer.from('%PDF-1.4\n1 0 obj\n<<>>\nendobj\ntrailer\n<<>>\n%%EOF\n'),
+  });
+
+  await expect(page.locator('#attach-preview')).toHaveClass(/active/);
+  await page.locator('#send-btn').click();
+
+  await expect(page.locator('#attach-preview')).not.toHaveClass(/active/);
+  const latestMessage = page.locator('#messages-area .msg').last();
+  const preview = latestMessage.locator('iframe.msg-pdf-preview');
+  await expect(preview).toHaveAttribute('data-pdf-src', /\/api\/media\//);
+  await expect(preview).toHaveAttribute('src', /^blob:.*#toolbar=0&navpanes=0&view=FitH$/);
+  const card = latestMessage.locator('.msg-document-preview > .msg-attachment-card').last();
+  await expect(card).toContainText('PDF');
+  await expect(card).toContainText('application/pdf');
+  await expect(card).toHaveAttribute('href', /\/api\/media\//);
+});
+
 test('sends a WhatsApp voice note attachment through the compose box', async ({ page }) => {
   const jordanRow = page.locator('#conversation-list > .convo-item').filter({
     has: page.locator('.convo-name').getByText('Jordan Rivera', { exact: true }),
@@ -1284,7 +1602,7 @@ test('sends a WhatsApp voice note attachment through the compose box', async ({ 
   await expect(page.locator('#messages-area audio[src*="/api/media/"]').last()).toBeVisible();
 });
 
-test('restores compose text when send fails', async ({ page }) => {
+test('shows a failed outgoing bubble when send is rejected', async ({ page }) => {
   const outbound = `Send failure ${Date.now()}`;
 
   await openConversation(page, 'Sarah Chen');
@@ -1298,8 +1616,78 @@ test('restores compose text when send fails', async ({ page }) => {
   await page.locator('#send-btn').click();
 
   await expect(page.locator('#thread-feedback')).toContainText('local persistence failed');
-  await expect(page.locator('#compose-input')).toHaveValue(outbound);
-  await expect(page.locator('#messages-area')).not.toContainText(outbound);
+  await expect(page.locator('#compose-input')).toHaveValue('');
+  const latestMessage = page.locator('#messages-area .msg').last();
+  await expect(latestMessage).toContainText(outbound);
+  await expect(latestMessage.locator('.msg-status.status-failed')).toBeVisible();
+  await expect(latestMessage.locator('.msg-retry-send')).toBeVisible();
+});
+
+test('retries a failed queued message from the bubble', async ({ page }) => {
+  const outbound = `Retry failed send ${Date.now()}`;
+
+  await openConversation(page, 'Sarah Chen');
+  await page.route('**/api/send', route => route.fulfill({
+    status: 500,
+    contentType: 'text/plain',
+    body: 'local persistence failed',
+  }), { times: 1 });
+
+  await page.locator('#compose-input').fill(outbound);
+  await page.locator('#send-btn').click();
+
+  const latestMessage = page.locator('#messages-area .msg').last();
+  await expect(latestMessage).toContainText(outbound);
+  await expect(latestMessage.locator('.msg-status.status-failed')).toBeVisible();
+  await latestMessage.locator('.msg-retry-send').click();
+
+  await expect
+    .poll(() => page.evaluate(() => JSON.parse(localStorage.getItem('openmessage.pendingSends.v1') || '[]').length))
+    .toBe(0);
+  await expect(page.locator('#messages-area .msg').filter({ hasText: outbound })).toHaveCount(1);
+  const retriedMessage = page.locator('#messages-area .msg').filter({ hasText: outbound }).last();
+  await expect(retriedMessage.locator('.msg-status.status-failed')).toHaveCount(0);
+  await expect(retriedMessage.locator('.msg-retry-send')).toHaveCount(0);
+});
+
+test('prunes a stale failed queued bubble when the retry is already sent', async ({ page, request }) => {
+  const outbound = `Recovered retry ${Date.now()}`;
+  const now = Date.now();
+
+  await request.post('/_e2e/messages', {
+    data: {
+      body: outbound,
+      conversation_id: 'conv1',
+      is_from_me: true,
+      sender_name: 'Me',
+      sender_number: '+15551234567',
+      timestamp_ms: now,
+      status: 'OUTGOING_DELIVERED',
+    },
+  });
+  await page.evaluate(({ body, timestamp }) => {
+    localStorage.setItem('openmessage.pendingSends.v1', JSON.stringify([{
+      id: `tmp_stale_${timestamp}`,
+      conversation_id: 'conv1',
+      platform: 'sms',
+      type: 'text',
+      body,
+      timestamp_ms: timestamp - 1000,
+      status: 'failed',
+      last_error: 'local persistence failed',
+    }]));
+  }, { body: outbound, timestamp: now });
+
+  await page.reload();
+  await openConversation(page, 'Sarah Chen');
+
+  await expect(page.locator('#messages-area .msg').filter({ hasText: outbound })).toHaveCount(1);
+  const recoveredMessage = page.locator('#messages-area .msg').filter({ hasText: outbound }).last();
+  await expect(recoveredMessage.locator('.msg-status.status-failed')).toHaveCount(0);
+  await expect(recoveredMessage.locator('.msg-retry-send')).toHaveCount(0);
+  await expect
+    .poll(() => page.evaluate(() => JSON.parse(localStorage.getItem('openmessage.pendingSends.v1') || '[]').length))
+    .toBe(0);
 });
 
 test('refreshes the active thread from SSE invalidations', async ({ page, request }) => {

@@ -1065,6 +1065,66 @@ func TestSendMessageUsesWhatsAppSender(t *testing.T) {
 	}
 }
 
+func TestSendMessageIdempotencySkipsDuplicateWhatsAppSender(t *testing.T) {
+	var calls int
+	ts := newTestServerWithOptions(t, APIOptions{
+		SendWhatsAppText: func(conversationID, body, replyToID string) (*db.Message, error) {
+			calls++
+			return &db.Message{
+				MessageID:      fmt.Sprintf("whatsapp:sent-%d", calls),
+				ConversationID: conversationID,
+				Body:           body,
+				IsFromMe:       true,
+				TimestampMS:    1234,
+				Status:         "OUTGOING_SENDING",
+				SourcePlatform: "whatsapp",
+				SourceID:       fmt.Sprintf("sent-%d", calls),
+			}, nil
+		},
+	})
+
+	if err := ts.store.UpsertConversation(&db.Conversation{
+		ConversationID: "whatsapp:15551234567@s.whatsapp.net",
+		Name:           "Jordan Rivera",
+		SourcePlatform: "whatsapp",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	body := `{"conversation_id":"whatsapp:15551234567@s.whatsapp.net","message":"hello once","idempotency_key":"tmp_text_once"}`
+	for i := 0; i < 2; i++ {
+		resp, err := http.Post(ts.server.URL+"/api/send", "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != 200 {
+			raw, _ := io.ReadAll(resp.Body)
+			t.Fatalf("attempt %d status = %d, want 200: %s", i+1, resp.StatusCode, string(raw))
+		}
+		var payload map[string]any
+		if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+			t.Fatal(err)
+		}
+		if payload["message_id"] != "whatsapp:sent-1" {
+			t.Fatalf("attempt %d message_id = %#v, want whatsapp:sent-1", i+1, payload["message_id"])
+		}
+		if i == 1 && payload["deduplicated"] != true {
+			t.Fatalf("second response deduplicated = %#v, want true", payload["deduplicated"])
+		}
+	}
+	if calls != 1 {
+		t.Fatalf("SendWhatsAppText calls = %d, want 1", calls)
+	}
+	msgs, err := ts.store.GetMessagesByConversation("whatsapp:15551234567@s.whatsapp.net", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 1 {
+		t.Fatalf("stored messages = %d, want 1", len(msgs))
+	}
+}
+
 func TestSendDraftUsesWhatsAppSender(t *testing.T) {
 	var calls int
 	ts := newTestServerWithOptions(t, APIOptions{
@@ -1428,6 +1488,91 @@ func TestSendMediaUsesWhatsAppSender(t *testing.T) {
 	}
 }
 
+func TestSendMediaIdempotencySkipsDuplicateWhatsAppSender(t *testing.T) {
+	var calls int
+	ts := newTestServerWithOptions(t, APIOptions{
+		SendWhatsAppMedia: func(conversationID string, data []byte, filename, mime, caption, replyToID string) (*db.Message, error) {
+			calls++
+			return &db.Message{
+				MessageID:      fmt.Sprintf("whatsapp:media-%d", calls),
+				ConversationID: conversationID,
+				Body:           caption,
+				IsFromMe:       true,
+				TimestampMS:    1234,
+				Status:         "OUTGOING_SENDING",
+				MediaID:        fmt.Sprintf("wa:test-ref-%d", calls),
+				MimeType:       mime,
+				SourcePlatform: "whatsapp",
+				SourceID:       fmt.Sprintf("media-%d", calls),
+			}, nil
+		},
+	})
+
+	if err := ts.store.UpsertConversation(&db.Conversation{
+		ConversationID: "whatsapp:15551234567@s.whatsapp.net",
+		Name:           "Jordan Rivera",
+		SourcePlatform: "whatsapp",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	postMedia := func() map[string]any {
+		t.Helper()
+		var body bytes.Buffer
+		writer := multipart.NewWriter(&body)
+		if err := writer.WriteField("conversation_id", "whatsapp:15551234567@s.whatsapp.net"); err != nil {
+			t.Fatal(err)
+		}
+		if err := writer.WriteField("caption", "check this once"); err != nil {
+			t.Fatal(err)
+		}
+		if err := writer.WriteField("idempotency_key", "tmp_media_once"); err != nil {
+			t.Fatal(err)
+		}
+		part, err := writer.CreateFormFile("file", "menu.pdf")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := part.Write([]byte("%PDF")); err != nil {
+			t.Fatal(err)
+		}
+		if err := writer.Close(); err != nil {
+			t.Fatal(err)
+		}
+		req, err := http.NewRequest(http.MethodPost, ts.server.URL+"/api/send-media", &body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", writer.FormDataContentType())
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != 200 {
+			raw, _ := io.ReadAll(resp.Body)
+			t.Fatalf("status = %d, want 200: %s", resp.StatusCode, string(raw))
+		}
+		var payload map[string]any
+		if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+			t.Fatal(err)
+		}
+		return payload
+	}
+
+	first := postMedia()
+	second := postMedia()
+	if first["message_id"] != "whatsapp:media-1" || second["message_id"] != "whatsapp:media-1" {
+		t.Fatalf("message ids = %#v / %#v, want whatsapp:media-1", first["message_id"], second["message_id"])
+	}
+	if second["deduplicated"] != true {
+		t.Fatalf("second response deduplicated = %#v, want true", second["deduplicated"])
+	}
+	if calls != 1 {
+		t.Fatalf("SendWhatsAppMedia calls = %d, want 1", calls)
+	}
+}
+
 func TestSendMediaUsesSignalSender(t *testing.T) {
 	var gotConversationID, gotFilename, gotMIME, gotCaption, gotReplyToID string
 	var gotData []byte
@@ -1739,6 +1884,43 @@ func TestGoogleNetworkErrorIsUserFacing(t *testing.T) {
 	}
 	if strings.Contains(got, "instantmessaging") || strings.Contains(got, "dial tcp") {
 		t.Fatalf("error leaked transport details: %q", got)
+	}
+}
+
+func TestGoogleSendErrorCanRetry(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{
+			name: "network",
+			err:  errors.New("Google Messages is offline. Check your internet connection, then try again."),
+			want: true,
+		},
+		{
+			name: "not connected",
+			err:  errors.New("not connected to Google Messages"),
+			want: true,
+		},
+		{
+			name: "auth expired",
+			err:  errors.New("HTTP 401: Request had invalid authentication credentials."),
+			want: true,
+		},
+		{
+			name: "non retryable",
+			err:  errors.New("send message: invalid recipient"),
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := googleSendErrorCanRetry(tt.err); got != tt.want {
+				t.Fatalf("googleSendErrorCanRetry() = %v, want %v", got, tt.want)
+			}
+		})
 	}
 }
 
@@ -2681,6 +2863,19 @@ func TestBuildSendPayloadNoReply(t *testing.T) {
 	}
 }
 
+func TestBuildSendPayloadWithTmpID(t *testing.T) {
+	payload := app.BuildSendPayloadWithTmpID("conv-1", "Queued text", "", "+15551234567", nil, "tmp_queue_123")
+	if payload.TmpID != "tmp_queue_123" {
+		t.Fatalf("TmpID = %q, want tmp_queue_123", payload.TmpID)
+	}
+	if payload.MessagePayload.TmpID != "tmp_queue_123" {
+		t.Fatalf("MessagePayload.TmpID = %q, want tmp_queue_123", payload.MessagePayload.TmpID)
+	}
+	if payload.MessagePayload.TmpID2 != "tmp_queue_123" {
+		t.Fatalf("MessagePayload.TmpID2 = %q, want tmp_queue_123", payload.MessagePayload.TmpID2)
+	}
+}
+
 func TestBuildSendMediaPayload(t *testing.T) {
 	sim := &gmproto.SIMPayload{SIMNumber: 1}
 	media := &gmproto.MediaContent{
@@ -2742,6 +2937,20 @@ func TestBuildSendMediaPayload(t *testing.T) {
 	}
 	if payload.MessagePayload.ConversationID != "conv-1" {
 		t.Errorf("payload ConversationID = %q", payload.MessagePayload.ConversationID)
+	}
+}
+
+func TestBuildSendMediaPayloadWithTmpID(t *testing.T) {
+	media := &gmproto.MediaContent{
+		MediaID:  "media-abc-123",
+		MimeType: "application/pdf",
+	}
+	payload := app.BuildSendMediaPayloadWithTmpID("conv-1", media, "+15551234567", nil, "tmp_media_123")
+	if payload.TmpID != "tmp_media_123" {
+		t.Fatalf("TmpID = %q, want tmp_media_123", payload.TmpID)
+	}
+	if payload.MessagePayload.TmpID != "tmp_media_123" || payload.MessagePayload.TmpID2 != "tmp_media_123" {
+		t.Fatalf("payload tmp ids = %q/%q, want tmp_media_123", payload.MessagePayload.TmpID, payload.MessagePayload.TmpID2)
 	}
 }
 
@@ -3503,7 +3712,7 @@ func TestSecurityHeadersPresent(t *testing.T) {
 	if csp == "" {
 		t.Fatal("Content-Security-Policy header missing")
 	}
-	for _, directive := range []string{"default-src 'self'", "connect-src 'self'", "frame-ancestors 'none'", "object-src 'none'"} {
+	for _, directive := range []string{"default-src 'self'", "connect-src 'self'", "frame-src 'self' blob:", "frame-ancestors 'none'", "object-src 'none'"} {
 		if !strings.Contains(csp, directive) {
 			t.Errorf("CSP missing %q: %s", directive, csp)
 		}

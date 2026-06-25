@@ -41,6 +41,29 @@ const maxUploadBytes = 128 << 20
 
 const maxTranscriptRequestBytes = db.MaxTranscriptBytes + db.MaxTranscriptModelBytes + 4096
 
+func normalizeSendIdempotencyKey(raw string) (string, error) {
+	key := strings.TrimSpace(raw)
+	if key == "" {
+		return "", nil
+	}
+	if len(key) > 128 {
+		return "", fmt.Errorf("idempotency_key is too long")
+	}
+	for i := 0; i < len(key); i++ {
+		c := key[i]
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') {
+			continue
+		}
+		switch c {
+		case '_', '-', '.', ':':
+			continue
+		default:
+			return "", fmt.Errorf("idempotency_key contains unsupported characters")
+		}
+	}
+	return key, nil
+}
+
 // APIHandler creates the HTTP handler with JSON API routes and static file serving.
 // The client may be nil (disconnected state).
 // mcpHandler is an optional http.Handler for the MCP SSE endpoint (mounted at /mcp/).
@@ -372,6 +395,76 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		}
 		return nil
 	}
+	writeIdempotentSendResponse := func(w http.ResponseWriter, item *db.OutgoingSendKey) {
+		w.Header().Set("Content-Type", "application/json")
+		payload := map[string]any{
+			"deduplicated": true,
+			"success":      true,
+			"status":       "SUCCESS",
+		}
+		if item != nil {
+			if item.MessageID != "" {
+				payload["message_id"] = item.MessageID
+			}
+			switch item.Status {
+			case db.OutgoingSendStatusSending:
+				payload["success"] = false
+				payload["status"] = "SENDING"
+				payload["error"] = "message send already in progress for this idempotency key"
+				w.WriteHeader(http.StatusConflict)
+			case db.OutgoingSendStatusFailed:
+				payload["success"] = false
+				payload["status"] = "FAILED"
+				payload["error"] = "message send already failed for this idempotency key"
+				w.WriteHeader(http.StatusConflict)
+			case db.OutgoingSendStatusLocalStoreFailed:
+				payload["status"] = "SENT_LOCAL_STORE_FAILED"
+				w.WriteHeader(http.StatusAccepted)
+			}
+		}
+		writeJSON(w, payload)
+	}
+	claimIdempotentSend := func(w http.ResponseWriter, key, conversationID string) (bool, bool) {
+		if key == "" {
+			return true, true
+		}
+		claimed, existing, err := store.ClaimOutgoingSendKey(key, conversationID)
+		if err != nil {
+			httpError(w, "claim idempotency key: "+err.Error(), 500)
+			return false, false
+		}
+		if !claimed {
+			writeIdempotentSendResponse(w, existing)
+			return false, true
+		}
+		return true, true
+	}
+	completeIdempotentSend := func(key, messageID, status string) {
+		if key == "" {
+			return
+		}
+		if err := store.CompleteOutgoingSendKey(key, messageID, status); err != nil {
+			logger.Warn().Err(err).Str("idempotency_key", key).Msg("Failed to complete idempotent send")
+		}
+	}
+	releaseIdempotentSend := func(key string) {
+		if key == "" {
+			return
+		}
+		if err := store.ReleaseOutgoingSendKey(key); err != nil {
+			logger.Warn().Err(err).Str("idempotency_key", key).Msg("Failed to release idempotent send")
+		}
+	}
+	writeLocalStoreFailedSend := func(w http.ResponseWriter, messageID string, err error) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		writeJSON(w, map[string]any{
+			"message_id": messageID,
+			"status":     "SENT_LOCAL_STORE_FAILED",
+			"success":    true,
+			"warning":    "message sent remotely but failed to update local store: " + err.Error(),
+		})
+	}
 	isWhatsAppConversation := func(conversationID string) bool {
 		if strings.HasPrefix(conversationID, "whatsapp:") {
 			return true
@@ -403,7 +496,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			return nil, err
 		}
 		if err := recordOutgoingMessage(msg, deleteDraftID); err != nil {
-			return nil, fmt.Errorf("%w: %v", errWhatsAppLocalStore, err)
+			return msg, fmt.Errorf("%w: %v", errWhatsAppLocalStore, err)
 		}
 		return msg, nil
 	}
@@ -416,7 +509,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			return nil, err
 		}
 		if err := recordOutgoingMessage(msg, ""); err != nil {
-			return nil, fmt.Errorf("%w: %v", errWhatsAppLocalStore, err)
+			return msg, fmt.Errorf("%w: %v", errWhatsAppLocalStore, err)
 		}
 		return msg, nil
 	}
@@ -429,7 +522,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			return nil, err
 		}
 		if err := recordOutgoingMessage(msg, deleteDraftID); err != nil {
-			return nil, fmt.Errorf("%w: %v", errSignalLocalStore, err)
+			return msg, fmt.Errorf("%w: %v", errSignalLocalStore, err)
 		}
 		return msg, nil
 	}
@@ -442,7 +535,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			return nil, err
 		}
 		if err := recordOutgoingMessage(msg, ""); err != nil {
-			return nil, fmt.Errorf("%w: %v", errSignalLocalStore, err)
+			return msg, fmt.Errorf("%w: %v", errSignalLocalStore, err)
 		}
 		return msg, nil
 	}
@@ -455,20 +548,32 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 	if fetchLinkPreviewImage == nil {
 		fetchLinkPreviewImage = linkPreviewService.FetchImage
 	}
-	sendMediaBytes := func(w http.ResponseWriter, convID string, data []byte, filename, mimeType, caption, replyToID string) {
+	sendMediaBytes := func(w http.ResponseWriter, convID string, data []byte, filename, mimeType, caption, replyToID, idempotencyKey string) {
+		proceed, handled := claimIdempotentSend(w, idempotencyKey, convID)
+		if !handled || !proceed {
+			return
+		}
 		if isSignalConversation(convID) {
 			msg, err := sendSignalMedia(convID, data, filename, mimeType, caption, replyToID)
 			switch {
 			case errors.Is(err, errSignalMediaUnavailable):
+				releaseIdempotentSend(idempotencyKey)
 				httpError(w, err.Error(), 501)
 				return
 			case errors.Is(err, errSignalLocalStore):
-				httpError(w, "message sent remotely but failed to update local store: "+err.Error(), 500)
+				messageID := ""
+				if msg != nil {
+					messageID = msg.MessageID
+				}
+				completeIdempotentSend(idempotencyKey, messageID, db.OutgoingSendStatusLocalStoreFailed)
+				writeLocalStoreFailedSend(w, messageID, err)
 				return
 			case err != nil:
+				completeIdempotentSend(idempotencyKey, "", db.OutgoingSendStatusFailed)
 				httpError(w, err.Error(), 502)
 				return
 			}
+			completeIdempotentSend(idempotencyKey, msg.MessageID, db.OutgoingSendStatusSent)
 			publishMessages(convID)
 			publishConversations()
 			writeJSON(w, map[string]any{
@@ -482,15 +587,23 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			msg, err := sendWhatsAppMedia(convID, data, filename, mimeType, caption, replyToID)
 			switch {
 			case errors.Is(err, errWhatsAppMediaUnavailable):
+				releaseIdempotentSend(idempotencyKey)
 				httpError(w, err.Error(), 501)
 				return
 			case errors.Is(err, errWhatsAppLocalStore):
-				httpError(w, "message sent remotely but failed to update local store: "+err.Error(), 500)
+				messageID := ""
+				if msg != nil {
+					messageID = msg.MessageID
+				}
+				completeIdempotentSend(idempotencyKey, messageID, db.OutgoingSendStatusLocalStoreFailed)
+				writeLocalStoreFailedSend(w, messageID, err)
 				return
 			case err != nil:
+				completeIdempotentSend(idempotencyKey, "", db.OutgoingSendStatusFailed)
 				httpError(w, err.Error(), 502)
 				return
 			}
+			completeIdempotentSend(idempotencyKey, msg.MessageID, db.OutgoingSendStatusSent)
 			publishMessages(convID)
 			publishConversations()
 			writeJSON(w, map[string]any{
@@ -502,6 +615,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		}
 		cli := getClient()
 		if cli == nil {
+			releaseIdempotentSend(idempotencyKey)
 			httpError(w, app.ErrNotConnected, 503)
 			return
 		}
@@ -511,6 +625,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			if !markGoogleAuthExpired(err) {
 				recordGoogleSendError(err)
 			}
+			releaseIdempotentSend(idempotencyKey)
 			httpError(w, googleAPIErrorMessage("upload media", err), 502)
 			return
 		}
@@ -520,12 +635,13 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			if !markGoogleAuthExpired(err) {
 				recordGoogleSendError(err)
 			}
+			releaseIdempotentSend(idempotencyKey)
 			httpError(w, googleAPIErrorMessage("get conversation", err), 502)
 			return
 		}
 
 		myParticipantID, simPayload := app.ExtractSIMAndParticipant(conv)
-		payload := app.BuildSendMediaPayload(convID, media, myParticipantID, simPayload)
+		payload := app.BuildSendMediaPayloadWithTmpID(convID, media, myParticipantID, simPayload, idempotencyKey)
 
 		logger.Info().
 			Str("conv_id", convID).
@@ -538,6 +654,11 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		if err != nil {
 			if !markGoogleAuthExpired(err) {
 				recordGoogleSendError(err)
+			}
+			if googleSendErrorCanRetry(err) {
+				releaseIdempotentSend(idempotencyKey)
+			} else {
+				completeIdempotentSend(idempotencyKey, payload.TmpID, db.OutgoingSendStatusFailed)
 			}
 			httpError(w, googleAPIErrorMessage("send message", err), 502)
 			return
@@ -561,6 +682,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			if googlePhoneResponding() {
 				recordGoogleSend(false)
 			}
+			completeIdempotentSend(idempotencyKey, payload.TmpID, db.OutgoingSendStatusFailed)
 			httpError(w, googleSendRejectedMessage(resp.GetStatus().String(), googlePhoneResponding()), 502)
 			return
 		}
@@ -577,9 +699,11 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			MimeType:       media.MimeType,
 			DecryptionKey:  hex.EncodeToString(media.DecryptionKey),
 		}, ""); err != nil {
-			httpError(w, "message sent remotely but failed to update local store: "+err.Error(), 500)
+			completeIdempotentSend(idempotencyKey, payload.TmpID, db.OutgoingSendStatusLocalStoreFailed)
+			writeLocalStoreFailedSend(w, payload.TmpID, err)
 			return
 		}
+		completeIdempotentSend(idempotencyKey, payload.TmpID, db.OutgoingSendStatusSent)
 		publishMessages(convID)
 		publishConversations()
 		writeJSON(w, map[string]any{
@@ -604,6 +728,9 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		w.Header().Set("Connection", "keep-alive")
 		w.Header().Set("X-Accel-Buffering", "no")
 
+		subID, ch := opts.Events.Subscribe()
+		defer opts.Events.Unsubscribe(subID)
+
 		connected := currentConnected()
 		if err := writeSSEEvent(w, StreamEvent{
 			Type:      EventTypeStatus,
@@ -612,9 +739,6 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			return
 		}
 		flusher.Flush()
-
-		subID, ch := opts.Events.Subscribe()
-		defer opts.Events.Unsubscribe(subID)
 
 		heartbeat := opts.EventHeartbeat
 		if heartbeat <= 0 {
@@ -1410,6 +1534,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			ConversationID string `json:"conversation_id"`
 			Message        string `json:"message"`
 			ReplyToID      string `json:"reply_to_id,omitempty"`
+			IdempotencyKey string `json:"idempotency_key,omitempty"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			httpError(w, "invalid JSON: "+err.Error(), 400)
@@ -1419,19 +1544,36 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			httpError(w, "conversation_id and message are required", 400)
 			return
 		}
+		idempotencyKey, err := normalizeSendIdempotencyKey(req.IdempotencyKey)
+		if err != nil {
+			httpError(w, err.Error(), 400)
+			return
+		}
+		proceed, handled := claimIdempotentSend(w, idempotencyKey, req.ConversationID)
+		if !handled || !proceed {
+			return
+		}
 		if isWhatsAppConversation(req.ConversationID) {
 			msg, err := sendWhatsAppText(req.ConversationID, req.Message, req.ReplyToID, "")
 			switch {
 			case errors.Is(err, errWhatsAppTextUnavailable):
+				releaseIdempotentSend(idempotencyKey)
 				httpError(w, err.Error(), 501)
 				return
 			case errors.Is(err, errWhatsAppLocalStore):
-				httpError(w, "message sent remotely but failed to update local store: "+err.Error(), 500)
+				messageID := ""
+				if msg != nil {
+					messageID = msg.MessageID
+				}
+				completeIdempotentSend(idempotencyKey, messageID, db.OutgoingSendStatusLocalStoreFailed)
+				writeLocalStoreFailedSend(w, messageID, err)
 				return
 			case err != nil:
+				completeIdempotentSend(idempotencyKey, "", db.OutgoingSendStatusFailed)
 				httpError(w, err.Error(), 502)
 				return
 			}
+			completeIdempotentSend(idempotencyKey, msg.MessageID, db.OutgoingSendStatusSent)
 			publishMessages(req.ConversationID)
 			publishConversations()
 			writeJSON(w, map[string]any{
@@ -1445,15 +1587,23 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			msg, err := sendSignalText(req.ConversationID, req.Message, req.ReplyToID, "")
 			switch {
 			case errors.Is(err, errSignalTextUnavailable):
+				releaseIdempotentSend(idempotencyKey)
 				httpError(w, err.Error(), 501)
 				return
 			case errors.Is(err, errSignalLocalStore):
-				httpError(w, "message sent remotely but failed to update local store: "+err.Error(), 500)
+				messageID := ""
+				if msg != nil {
+					messageID = msg.MessageID
+				}
+				completeIdempotentSend(idempotencyKey, messageID, db.OutgoingSendStatusLocalStoreFailed)
+				writeLocalStoreFailedSend(w, messageID, err)
 				return
 			case err != nil:
+				completeIdempotentSend(idempotencyKey, "", db.OutgoingSendStatusFailed)
 				httpError(w, err.Error(), 502)
 				return
 			}
+			completeIdempotentSend(idempotencyKey, msg.MessageID, db.OutgoingSendStatusSent)
 			publishMessages(req.ConversationID)
 			publishConversations()
 			writeJSON(w, map[string]any{
@@ -1465,6 +1615,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		}
 		cli := getClient()
 		if cli == nil {
+			releaseIdempotentSend(idempotencyKey)
 			httpError(w, app.ErrNotConnected, 503)
 			return
 		}
@@ -1474,13 +1625,14 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			if !markGoogleAuthExpired(err) {
 				recordGoogleSendError(err)
 			}
+			releaseIdempotentSend(idempotencyKey)
 			httpError(w, googleAPIErrorMessage("get conversation", err), 502)
 			return
 		}
 
 		myParticipantID, simPayload := app.ExtractSIMAndParticipant(conv)
 
-		payload := app.BuildSendPayload(req.ConversationID, req.Message, req.ReplyToID, myParticipantID, simPayload)
+		payload := app.BuildSendPayloadWithTmpID(req.ConversationID, req.Message, req.ReplyToID, myParticipantID, simPayload, idempotencyKey)
 
 		logger.Info().
 			Str("conv_id", req.ConversationID).
@@ -1492,6 +1644,11 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		if err != nil {
 			if !markGoogleAuthExpired(err) {
 				recordGoogleSendError(err)
+			}
+			if googleSendErrorCanRetry(err) {
+				releaseIdempotentSend(idempotencyKey)
+			} else {
+				completeIdempotentSend(idempotencyKey, payload.TmpID, db.OutgoingSendStatusFailed)
 			}
 			httpError(w, googleAPIErrorMessage("send message", err), 502)
 			return
@@ -1518,6 +1675,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			if googlePhoneResponding() {
 				recordGoogleSend(false)
 			}
+			completeIdempotentSend(idempotencyKey, payload.TmpID, db.OutgoingSendStatusFailed)
 			httpError(w, googleSendRejectedMessage(resp.GetStatus().String(), googlePhoneResponding()), 502)
 			return
 		}
@@ -1533,9 +1691,11 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			Status:         "OUTGOING_SENDING",
 			ReplyToID:      req.ReplyToID,
 		}, ""); err != nil {
-			httpError(w, "message sent remotely but failed to update local store: "+err.Error(), 500)
+			completeIdempotentSend(idempotencyKey, payload.TmpID, db.OutgoingSendStatusLocalStoreFailed)
+			writeLocalStoreFailedSend(w, payload.TmpID, err)
 			return
 		}
+		completeIdempotentSend(idempotencyKey, payload.TmpID, db.OutgoingSendStatusSent)
 		publishMessages(req.ConversationID)
 		publishConversations()
 		writeJSON(w, map[string]any{
@@ -1621,6 +1781,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			URL            string `json:"url"`
 			Caption        string `json:"caption"`
 			ReplyToID      string `json:"reply_to_id"`
+			IdempotencyKey string `json:"idempotency_key"`
 		}
 		if err := json.NewDecoder(io.LimitReader(r.Body, 64<<10)).Decode(&req); err != nil {
 			httpError(w, "invalid JSON: "+err.Error(), 400)
@@ -1631,12 +1792,17 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			httpError(w, "conversation_id is required", 400)
 			return
 		}
+		idempotencyKey, err := normalizeSendIdempotencyKey(req.IdempotencyKey)
+		if err != nil {
+			httpError(w, err.Error(), 400)
+			return
+		}
 		data, filename, mimeType, err := downloadGIFMedia(r.Context(), req.URL, maxGIFSendBytes)
 		if err != nil {
 			httpError(w, err.Error(), 400)
 			return
 		}
-		sendMediaBytes(w, convID, data, filename, mimeType, strings.TrimSpace(req.Caption), strings.TrimSpace(req.ReplyToID))
+		sendMediaBytes(w, convID, data, filename, mimeType, strings.TrimSpace(req.Caption), strings.TrimSpace(req.ReplyToID), idempotencyKey)
 	})
 
 	mux.HandleFunc("/api/send-media", func(w http.ResponseWriter, r *http.Request) {
@@ -1663,6 +1829,11 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		convID := r.FormValue("conversation_id")
 		caption := strings.TrimSpace(r.FormValue("caption"))
 		replyToID := strings.TrimSpace(r.FormValue("reply_to_id"))
+		idempotencyKey, err := normalizeSendIdempotencyKey(r.FormValue("idempotency_key"))
+		if err != nil {
+			httpError(w, err.Error(), 400)
+			return
+		}
 		if convID == "" {
 			httpError(w, "conversation_id is required", 400)
 			return
@@ -1690,7 +1861,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		if mime == "" {
 			mime = "application/octet-stream"
 		}
-		sendMediaBytes(w, convID, data, header.Filename, mime, caption, replyToID)
+		sendMediaBytes(w, convID, data, header.Filename, mime, caption, replyToID, idempotencyKey)
 	})
 
 	mux.HandleFunc("/api/media/", func(w http.ResponseWriter, r *http.Request) {
@@ -2621,6 +2792,7 @@ func setSecurityHeaders(w http.ResponseWriter) {
 			"img-src 'self' data: blob:; "+
 			"media-src 'self' data: blob:; "+
 			"connect-src 'self'; "+
+			"frame-src 'self' blob:; "+
 			"object-src 'none'; "+
 			"base-uri 'self'; "+
 			"frame-ancestors 'none'")
@@ -3055,6 +3227,17 @@ func googleAPIErrorMessage(action string, err error) string {
 	return action + ": " + err.Error()
 }
 
+func googleSendErrorCanRetry(err error) bool {
+	if err == nil {
+		return false
+	}
+	if app.IsGoogleAuthExpiredError(err) || isGoogleNetworkError(err) {
+		return true
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "not connected") || strings.Contains(message, "disconnected")
+}
+
 // googleSendRejectedMessage builds the user-facing error for a non-SUCCESS
 // Google send. UNKNOWN is what a silently-unlinked linked device returns on
 // every send, so the message points at re-pairing rather than leaving the
@@ -3084,6 +3267,8 @@ func isGoogleNetworkError(err error) bool {
 		"tls handshake timeout",
 		"connection refused",
 		"connection reset by peer",
+		"google messages is offline",
+		"not connected to google messages",
 	}
 	for _, needle := range needles {
 		if strings.Contains(message, needle) {

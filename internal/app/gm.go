@@ -71,7 +71,20 @@ func ExtractSIMAndParticipant(conv *gmproto.Conversation) (participantID string,
 // the mautrix bridge: MessageInfo array (not MessagePayloadContent), TmpID in 3
 // places, SIMPayload, and ParticipantID.
 func BuildSendPayload(conversationID, message, replyToID, participantID string, sim *gmproto.SIMPayload) *gmproto.SendMessageRequest {
-	tmpID := fmt.Sprintf("tmp_%012d", rand.Int63n(1e12))
+	return BuildSendPayloadWithTmpID(conversationID, message, replyToID, participantID, sim, "")
+}
+
+func newSendTmpID(preferred string) string {
+	if preferred = strings.TrimSpace(preferred); preferred != "" {
+		return preferred
+	}
+	return fmt.Sprintf("tmp_%012d", rand.Int63n(1e12))
+}
+
+// BuildSendPayloadWithTmpID is BuildSendPayload with an optional caller-owned
+// temporary ID. Queued sends use this to make retries idempotent server-side.
+func BuildSendPayloadWithTmpID(conversationID, message, replyToID, participantID string, sim *gmproto.SIMPayload, tmpID string) *gmproto.SendMessageRequest {
+	tmpID = newSendTmpID(tmpID)
 	req := &gmproto.SendMessageRequest{
 		ConversationID: conversationID,
 		MessagePayload: &gmproto.MessagePayload{
@@ -100,7 +113,13 @@ func BuildSendPayload(conversationID, message, replyToID, participantID string, 
 // BuildSendMediaPayload constructs a SendMessageRequest with a MediaContent attachment
 // instead of text. Uses the same MessageInfo array format as BuildSendPayload.
 func BuildSendMediaPayload(conversationID string, media *gmproto.MediaContent, participantID string, sim *gmproto.SIMPayload) *gmproto.SendMessageRequest {
-	tmpID := fmt.Sprintf("tmp_%012d", rand.Int63n(1e12))
+	return BuildSendMediaPayloadWithTmpID(conversationID, media, participantID, sim, "")
+}
+
+// BuildSendMediaPayloadWithTmpID is BuildSendMediaPayload with an optional
+// caller-owned temporary ID for idempotent queued media retries.
+func BuildSendMediaPayloadWithTmpID(conversationID string, media *gmproto.MediaContent, participantID string, sim *gmproto.SIMPayload, tmpID string) *gmproto.SendMessageRequest {
+	tmpID = newSendTmpID(tmpID)
 	return &gmproto.SendMessageRequest{
 		ConversationID: conversationID,
 		MessagePayload: &gmproto.MessagePayload{

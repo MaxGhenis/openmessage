@@ -337,6 +337,15 @@ func (s *Store) migrate() error {
 		body TEXT NOT NULL DEFAULT '',
 		created_at INTEGER NOT NULL DEFAULT 0
 	);
+
+	CREATE TABLE IF NOT EXISTS outgoing_send_keys (
+		idempotency_key TEXT PRIMARY KEY,
+		conversation_id TEXT NOT NULL DEFAULT '',
+		message_id TEXT NOT NULL DEFAULT '',
+		status TEXT NOT NULL DEFAULT '',
+		created_at INTEGER NOT NULL DEFAULT 0,
+		updated_at INTEGER NOT NULL DEFAULT 0
+	);
 	`
 	if _, err := s.db.Exec(schema); err != nil {
 		return err
@@ -379,6 +388,7 @@ func (s *Store) migrate() error {
 
 	// Index for dedup on import
 	s.db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_source ON messages(source_platform, source_id) WHERE source_id != ''`)
+	s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_outgoing_send_keys_updated ON outgoing_send_keys(updated_at)`)
 
 	// Index for platform-filtered conversation queries
 	s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_conversations_platform ON conversations(source_platform)`)

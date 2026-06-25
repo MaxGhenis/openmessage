@@ -1171,6 +1171,22 @@ html, body {
   font-size: 10px;
 }
 
+.msg-retry-send {
+  margin-left: 6px;
+  border: 0;
+  background: transparent;
+  color: var(--accent);
+  font: inherit;
+  font-size: 11px;
+  font-weight: 700;
+  cursor: pointer;
+  padding: 0;
+}
+
+.msg-retry-send:hover {
+  text-decoration: underline;
+}
+
 /* ─── Media (images, videos, audio) ─── */
 .msg-media {
   margin: 4px 0;
@@ -1205,6 +1221,92 @@ html, body {
 .msg-media audio {
   width: min(320px, 100%);
   display: block;
+}
+
+.msg-document-preview {
+  border: 1px solid var(--border);
+  background: var(--bg-elevated);
+}
+
+.msg-document-preview .msg-pdf-preview {
+  display: block;
+  width: min(320px, 68vw);
+  height: 220px;
+  border: 0;
+  background: var(--bg-surface);
+}
+
+.msg-pdf-preview-error {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: min(320px, 68vw);
+  height: 220px;
+  padding: 16px;
+  color: var(--text-muted);
+  background: var(--bg-surface);
+  text-align: center;
+}
+
+.msg-pdf-preview-error[hidden] { display: none; }
+
+.msg-attachment-card {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: min(320px, 68vw);
+  padding: 10px 12px;
+  margin: 4px 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--bg-elevated);
+  color: var(--text-primary);
+  text-decoration: none;
+}
+
+.msg.sent .msg-attachment-card { margin-left: auto; }
+
+.msg-attachment-card:hover {
+  border-color: var(--border-accent);
+  background: var(--bg-hover);
+}
+
+.msg-attachment-icon {
+  width: 38px;
+  height: 42px;
+  border-radius: var(--radius-sm);
+  background: var(--accent-dim);
+  color: var(--accent-strong);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  flex-shrink: 0;
+}
+
+.msg-attachment-copy {
+  min-width: 0;
+  flex: 1;
+}
+
+.msg-attachment-title,
+.msg-attachment-meta {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.msg-attachment-title {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.msg-attachment-meta {
+  margin-top: 2px;
+  color: var(--text-secondary);
+  font-size: 12px;
 }
 
 .msg-audio-label {
@@ -5522,6 +5624,7 @@ body::after {
   const googleAvatarCache = new Map();
   const googleAvatarInflight = new Map();
   const pendingMediaLoaderTimers = new WeakMap();
+  const pdfPreviewObjectURLs = new WeakMap();
 
   // ─── DOM refs ───
   const $convoList = document.getElementById('conversation-list');
@@ -5566,6 +5669,20 @@ body::after {
   const $attachRemove = document.getElementById('attach-remove');
   let pendingFile = null; // { file: File, dataUrl: string }
   let composeSendInFlight = false;
+  const PENDING_SENDS_STORAGE_KEY = 'openmessage.pendingSends.v1';
+  const PENDING_SENDS_DB_NAME = 'openmessage-pending-sends';
+  const PENDING_SENDS_DB_STORE = 'files';
+  const PENDING_SEND_MAX_ITEMS = 50;
+  const PENDING_SEND_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+  const PENDING_SEND_CAPACITY_MESSAGE = 'Too many queued messages. Wait for some to send before adding more.';
+  let pendingSendQueue = [];
+  let pendingSendFlushInProgress = false;
+  let pendingSendFlushTimer = null;
+  let pendingSendsDBPromise = null;
+  let queuedSendPlatformReady = { sms: false, whatsapp: false, signal: false };
+  const pendingSendFiles = new Map();
+  const pendingSendObjectURLs = new Map();
+  const pendingSendPreviewHydrations = new Set();
   const $searchInput = document.getElementById('search-input');
   const $connectionBanner = document.getElementById('connection-banner');
   const $connectionBannerCopy = document.getElementById('connection-banner-copy');
@@ -6395,6 +6512,56 @@ body::after {
     });
   }
 
+  function cleanupPDFPreviewURLs(root) {
+    if (!root || !root.querySelectorAll || !window.URL?.revokeObjectURL) return;
+    root.querySelectorAll('iframe.msg-pdf-preview').forEach(frame => {
+      const objectURL = pdfPreviewObjectURLs.get(frame);
+      if (objectURL) {
+        URL.revokeObjectURL(objectURL);
+        pdfPreviewObjectURLs.delete(frame);
+      }
+    });
+  }
+
+  function markPDFPreviewUnavailable(frame) {
+    if (!frame) return;
+    frame.hidden = true;
+    const fallback = frame.parentElement ? frame.parentElement.querySelector('.msg-pdf-preview-error') : null;
+    if (fallback) fallback.hidden = false;
+  }
+
+  function hydratePDFPreviews(root = document) {
+    if (!root || !root.querySelectorAll) return;
+    root.querySelectorAll('iframe.msg-pdf-preview[data-pdf-src]').forEach(frame => {
+      if (frame.dataset.pdfHydrated === 'true') return;
+      const source = frame.dataset.pdfSrc || '';
+      if (!source || !window.URL?.createObjectURL) {
+        markPDFPreviewUnavailable(frame);
+        return;
+      }
+      frame.dataset.pdfHydrated = 'true';
+      fetch(source)
+        .then(response => {
+          if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
+          return response.blob();
+        })
+        .then(blob => {
+          if (!frame.isConnected) return;
+          const staleURL = pdfPreviewObjectURLs.get(frame);
+          if (staleURL && window.URL?.revokeObjectURL) {
+            URL.revokeObjectURL(staleURL);
+          }
+          const objectURL = URL.createObjectURL(blob);
+          pdfPreviewObjectURLs.set(frame, objectURL);
+          frame.src = `${objectURL}#toolbar=0&navpanes=0&view=FitH`;
+        })
+        .catch(err => {
+          console.warn('Failed to hydrate PDF preview:', err);
+          markPDFPreviewUnavailable(frame);
+        });
+    });
+  }
+
   function renderAvatarElement(el, { name = '', numbers = [], whatsAppConversationID = '', avatarSource = '', participantIDs = [], contactIDs = [], platforms = [], text = initials(name) || '?', background = avatarColor(name) } = {}) {
     if (!el) return;
     el.classList.remove('has-photo');
@@ -6445,6 +6612,30 @@ body::after {
       || (platform === 'signal' && signalStatus.connected);
   }
 
+  function conversationCanSendNow(convo) {
+    if (!convo) return false;
+    const platform = sourcePlatformOf(convo);
+    if (platform === 'sms') return googleStatus.connected && !googleStatus.needs_repair;
+    if (platform === 'whatsapp') return whatsAppStatus.connected;
+    if (platform === 'signal') return signalStatus.connected;
+    return false;
+  }
+
+  function conversationCanQueueOutbound(convo) {
+    if (!convo) return false;
+    const platform = sourcePlatformOf(convo);
+    if (platform === 'sms') {
+      return googleStatus.connected || (googleStatus.paired && !googleStatus.needs_pairing);
+    }
+    if (platform === 'whatsapp') {
+      return whatsAppStatus.connected || whatsAppStatus.paired;
+    }
+    if (platform === 'signal') {
+      return signalStatus.connected || signalStatus.paired;
+    }
+    return false;
+  }
+
   function isLeaveableWhatsAppGroup(convo) {
     return !!(convo && convo.IsGroup && sourcePlatformOf(convo) === 'whatsapp');
   }
@@ -6455,6 +6646,21 @@ body::after {
       || (sourcePlatformOf(convo) === 'whatsapp' && whatsAppStatus.connected)
       || (sourcePlatformOf(convo) === 'signal' && signalStatus.connected)
     );
+  }
+
+  function conversationCanQueueMediaOutbound(convo) {
+    if (!convo) return false;
+    const platform = sourcePlatformOf(convo);
+    if (platform === 'sms') {
+      return googleStatus.connected || (googleStatus.paired && !googleStatus.needs_pairing);
+    }
+    if (platform === 'whatsapp') {
+      return whatsAppStatus.connected || whatsAppStatus.paired;
+    }
+    if (platform === 'signal') {
+      return signalStatus.connected || signalStatus.paired;
+    }
+    return false;
   }
 
   function isGenericMediaBody(body) {
@@ -6513,6 +6719,66 @@ body::after {
       .replace(/^_+|_+$/g, '')
       .substring(0, 80) || 'message';
     return `openmessage-forward-${rawID}${extensionForMime(mimeType)}`;
+  }
+
+  function fileSizeLabel(bytes) {
+    const size = Number(bytes || 0);
+    if (!Number.isFinite(size) || size <= 0) return '';
+    if (size < 1024) return `${size} B`;
+    if (size < 1024 * 1024) return `${(size / 1024).toFixed(size < 10 * 1024 ? 1 : 0)} KB`;
+    return `${(size / (1024 * 1024)).toFixed(size < 10 * 1024 * 1024 ? 1 : 0)} MB`;
+  }
+
+  function attachmentTypeLabel(mimeType) {
+    const mime = String(mimeType || '').toLowerCase();
+    if (mime === 'application/pdf') return 'PDF';
+    if (mime.includes('word') || mime.includes('document')) return 'DOC';
+    if (mime.includes('spreadsheet') || mime.includes('excel')) return 'XLS';
+    if (mime.includes('presentation') || mime.includes('powerpoint')) return 'PPT';
+    if (mime.includes('zip') || mime.includes('compressed')) return 'ZIP';
+    if (mime.startsWith('text/')) return 'TXT';
+    return 'FILE';
+  }
+
+  function attachmentTitle(message) {
+    const pendingName = String(message && message._pendingFileName || '').trim();
+    if (pendingName) return pendingName;
+    const mime = String(message && message.MimeType || '').trim();
+    const label = mediaKindLabel(mime);
+    if (mime === 'application/pdf') return 'PDF document';
+    if (label !== 'Attachment') return label;
+    return mime ? `Attachment: ${mime}` : 'Attachment';
+  }
+
+  function attachmentMeta(message) {
+    const parts = [];
+    const mime = String(message && message.MimeType || '').trim();
+    const pendingItem = message && message._pendingSendItem;
+    if (mime) parts.push(mime);
+    const size = pendingItem ? fileSizeLabel(pendingItem.file_size) : '';
+    if (size) parts.push(size);
+    if (message && message._pendingSend) {
+      parts.push(message.Status && String(message.Status).startsWith('OUTGOING_FAILED') ? 'Failed' : 'Sending');
+    }
+    return parts.join(' - ');
+  }
+
+  function renderAttachmentCardHTML(message, href) {
+    const mime = String(message && message.MimeType || '').trim();
+    const title = attachmentTitle(message);
+    const meta = attachmentMeta(message);
+    const icon = attachmentTypeLabel(mime);
+    const body = `
+        <span class="msg-attachment-icon">${escapeHtml(icon)}</span>
+        <span class="msg-attachment-copy">
+          <span class="msg-attachment-title">${escapeHtml(title)}</span>
+          ${meta ? `<span class="msg-attachment-meta">${escapeHtml(meta)}</span>` : ''}
+        </span>
+    `;
+    if (!href) {
+      return `<div class="msg-attachment-card" aria-disabled="true">${body}</div>`;
+    }
+    return `<a class="msg-attachment-card" href="${escapeHtml(href)}" target="_blank" rel="noopener noreferrer">${body}</a>`;
   }
 
   function truncateOneLine(value, max = 96) {
@@ -6649,7 +6915,7 @@ body::after {
         return `
           <button
             type="button"
-            class="chat-route-tab${active ? ' active' : ''}${conversationSupportsOutbound(route) ? '' : ' read-only'}"
+            class="chat-route-tab${active ? ' active' : ''}${conversationCanQueueOutbound(route) ? '' : ' read-only'}"
             data-route-id="${escapeHtml(route.ConversationID)}"
             title="${escapeHtml(routeDisplayLabel(route))}"
             ${active ? 'aria-current="page"' : ''}
@@ -6745,24 +7011,29 @@ body::after {
 
   function routeMetaCopy(convo, routes) {
     const platformLabel = platformMeta(sourcePlatformOf(convo)).label;
-    if (conversationSupportsOutbound(convo)) {
+    if (conversationCanQueueOutbound(convo)) {
+      const connected = conversationCanSendNow(convo);
       const note = sourcePlatformOf(convo) === 'whatsapp'
-        ? `Replies and attachments from this composer stay on the ${platformLabel} route for this person.`
+        ? (connected
+          ? `Replies and attachments from this composer stay on the ${platformLabel} route for this person.`
+          : `Replies and attachments from this composer send when ${platformLabel} reconnects.`)
         : (routes.length > 1
-          ? `Replies from this composer stay on the ${platformLabel} route for this person.`
-          : 'Replies from this composer go to this thread.');
+          ? (connected
+            ? `Replies from this composer stay on the ${platformLabel} route for this person.`
+            : `Replies from this composer send on the ${platformLabel} route when it reconnects.`)
+          : (connected ? 'Replies from this composer go to this thread.' : 'Replies from this composer queue until this route reconnects.'));
       if (routes.length > 1) {
         return {
-          label: `Sending via ${platformLabel}`,
+          label: `${connected ? 'Sending' : 'Queued'} via ${platformLabel}`,
           note,
         };
       }
       return {
-        label: `Sending via ${platformLabel}`,
+        label: `${connected ? 'Sending' : 'Queued'} via ${platformLabel}`,
         note,
       };
     }
-    const sendableSibling = routes.find(route => route.ConversationID !== convo.ConversationID && conversationSupportsOutbound(route));
+    const sendableSibling = routes.find(route => route.ConversationID !== convo.ConversationID && conversationCanQueueOutbound(route));
     if (sendableSibling) {
       return {
         label: `Viewing ${platformLabel} history`,
@@ -6779,13 +7050,13 @@ body::after {
 
   function firstSendableSibling(convo = activeConversation) {
     const routes = linkedRoutesForConversation(convo);
-    return routes.find(route => convo && route.ConversationID !== convo.ConversationID && conversationSupportsOutbound(route)) || null;
+    return routes.find(route => convo && route.ConversationID !== convo.ConversationID && conversationCanQueueOutbound(route)) || null;
   }
 
   function preferredReplyRoute(routes) {
     if (!routes || !routes.length) return null;
-    return routes.find(route => sourcePlatformOf(route) === 'sms' && conversationSupportsOutbound(route))
-      || routes.find(route => conversationSupportsOutbound(route))
+    return routes.find(route => sourcePlatformOf(route) === 'sms' && conversationCanQueueOutbound(route))
+      || routes.find(route => conversationCanQueueOutbound(route))
       || null;
   }
 
@@ -6825,11 +7096,12 @@ body::after {
       const btn = document.createElement('button');
       const routePlatform = sourcePlatformOf(route);
       const isActive = route.ConversationID === activeID;
+      const queueable = conversationCanQueueOutbound(route);
       btn.type = 'button';
       btn.className = 'route-switch-btn'
         + (isActive ? ' active' : '')
-        + (conversationSupportsOutbound(route) ? '' : ' read-only');
-      btn.innerHTML = `${platformBadgeHTML(routePlatform)}<span class="route-switch-btn-meta">${conversationSupportsOutbound(route) ? (isActive ? 'Replies here' : 'Reply route') : 'History'}</span>`;
+        + (queueable ? '' : ' read-only');
+      btn.innerHTML = `${platformBadgeHTML(routePlatform)}<span class="route-switch-btn-meta">${queueable ? (isActive ? 'Replies here' : 'Reply route') : 'History'}</span>`;
       if (isActive) {
         btn.setAttribute('aria-current', 'page');
       }
@@ -7440,37 +7712,38 @@ body::after {
       return;
     }
 
-    const canSend = conversationSupportsOutbound(activeConversation);
-    const canSendMedia = conversationSupportsMediaOutbound(activeConversation);
-    $composeInput.disabled = !canSend;
-    if ($composeEmojiBtn) $composeEmojiBtn.disabled = !canSend;
-    if ($composeGifBtn) $composeGifBtn.disabled = composeSendInFlight || !canSendMedia;
-    $attachBtn.disabled = composeSendInFlight || !canSendMedia;
-    $attachBtn.title = canSendMedia
+    const canCompose = conversationCanQueueOutbound(activeConversation);
+    const canQueueMedia = conversationCanQueueMediaOutbound(activeConversation);
+    $composeInput.disabled = !canCompose;
+    if ($composeEmojiBtn) $composeEmojiBtn.disabled = !canCompose;
+    if ($composeGifBtn) $composeGifBtn.disabled = composeSendInFlight || !canQueueMedia;
+    $attachBtn.disabled = composeSendInFlight || !canQueueMedia;
+    $attachBtn.title = canQueueMedia
       ? 'Attach media'
       : (sourcePlatformOf(activeConversation) === 'whatsapp'
         ? 'Reconnect WhatsApp to send attachments on this route'
         : 'Attachments unavailable on this route');
     if ($composeGifBtn) {
-      $composeGifBtn.title = canSendMedia
+      $composeGifBtn.title = canQueueMedia
         ? 'Search GIFs'
         : (sourcePlatformOf(activeConversation) === 'whatsapp'
           ? 'Reconnect WhatsApp to send GIFs on this route'
           : 'GIFs unavailable on this route');
     }
-    $composeInput.placeholder = canSend ? 'Write a message...' : routeUnavailablePlaceholder(activeConversation);
-    if (!canSendMedia && pendingFile) {
+    $composeInput.placeholder = canCompose ? 'Write a message...' : routeUnavailablePlaceholder(activeConversation);
+    if (!canQueueMedia && pendingFile) {
       clearAttachment();
     }
-    if (!canSend && replyToMsg) {
+    if (!canCompose && replyToMsg) {
       clearReply();
     }
-    if (!canSend) {
+    if (!canCompose) {
       closeComposeEmojiPanel();
     }
-    if (!canSendMedia) {
+    if (!canQueueMedia) {
       closeComposeGifPanel();
     }
+    $composeBar.classList.toggle('is-queueing-route', canCompose && !conversationCanSendNow(activeConversation));
     autoResize();
   }
 
@@ -8081,15 +8354,22 @@ body::after {
 
   function messageContextMenuItems(message) {
     const urls = extractMessageURLs(message && message.Body ? message.Body : '');
+    const failedQueuedSend = message && message._pendingSend && message._pendingSendItem && message._pendingSendItem.status === 'failed';
     return [
+      failedQueuedSend ? {
+        label: 'Retry send',
+        action: 'retry-queued-send',
+      } : null,
+      failedQueuedSend ? { type: 'divider' } : null,
       {
         label: 'Reply',
         action: 'reply-message',
+        disabled: !!(message && message._pendingSend),
       },
       {
         label: 'Forward',
         action: 'forward-message',
-        disabled: !messageHasForwardableContent(message),
+        disabled: !!(message && message._pendingSend) || !messageHasForwardableContent(message),
       },
       {
         label: 'Copy text',
@@ -8463,6 +8743,508 @@ body::after {
     }
   }
 
+  function normalizeQueuedSend(raw) {
+    if (!raw || typeof raw !== 'object') return null;
+    const id = String(raw.id || '').trim();
+    const conversationID = String(raw.conversation_id || '').trim();
+    const type = raw.type === 'media' ? 'media' : (raw.type === 'gif' ? 'gif' : 'text');
+    if (!id || !conversationID) return null;
+    if (type === 'text' && !String(raw.body || '').trim()) return null;
+    if (type === 'media' && !String(raw.file_name || '').trim()) return null;
+    if (type === 'gif' && !String(raw.gif_url || '').trim()) return null;
+    const timestampMS = Number(raw.timestamp_ms || Date.now());
+    const rawStatus = String(raw.status || '').trim();
+    let status = rawStatus === 'failed' ? 'failed' : (rawStatus === 'sending' ? 'failed' : 'pending');
+    let lastError = String(raw.last_error || '');
+    if (rawStatus === 'sending' && !lastError) {
+      lastError = 'Send was interrupted. Check the recipient before sending again.';
+    }
+    if (status === 'pending' && Date.now() - timestampMS > PENDING_SEND_MAX_AGE_MS) {
+      status = 'failed';
+      lastError = 'Message expired before it could send.';
+    }
+    return {
+      id,
+      conversation_id: conversationID,
+      platform: normalizePlatform(raw.platform || 'sms'),
+      type,
+      body: String(raw.body || ''),
+      reply_to_id: String(raw.reply_to_id || ''),
+      file_name: String(raw.file_name || ''),
+      mime_type: String(raw.mime_type || ''),
+      file_size: Number(raw.file_size || 0),
+      gif_url: String(raw.gif_url || ''),
+      preview_url: String(raw.preview_url || ''),
+      timestamp_ms: timestampMS,
+      status,
+      wait_for_reconnect: !!raw.wait_for_reconnect,
+      attempts: Number(raw.attempts || 0),
+      next_attempt_at: Number(raw.next_attempt_at || 0),
+      last_error: lastError,
+    };
+  }
+
+  function loadQueuedSends() {
+    try {
+      const raw = localStorage.getItem(PENDING_SENDS_STORAGE_KEY);
+      const parsed = raw ? JSON.parse(raw) : [];
+      pendingSendQueue = Array.isArray(parsed)
+        ? parsed.map(normalizeQueuedSend).filter(Boolean)
+        : [];
+    } catch (err) {
+      console.warn('Failed to load pending sends:', err);
+      pendingSendQueue = [];
+    }
+  }
+
+  function saveQueuedSends() {
+    try {
+      localStorage.setItem(PENDING_SENDS_STORAGE_KEY, JSON.stringify(pendingSendQueue));
+    } catch (err) {
+      console.warn('Failed to save pending sends:', err);
+    }
+  }
+
+  function pendingSendsDB() {
+    if (pendingSendsDBPromise) return pendingSendsDBPromise;
+    pendingSendsDBPromise = new Promise((resolve, reject) => {
+      if (!window.indexedDB) {
+        reject(new Error('IndexedDB is unavailable'));
+        return;
+      }
+      const req = window.indexedDB.open(PENDING_SENDS_DB_NAME, 1);
+      req.onupgradeneeded = () => {
+        req.result.createObjectStore(PENDING_SENDS_DB_STORE);
+      };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error || new Error('open pending-send storage'));
+      req.onblocked = () => reject(new Error('pending-send storage is blocked'));
+    });
+    return pendingSendsDBPromise;
+  }
+
+  function idbTransactionDone(tx) {
+    return new Promise((resolve, reject) => {
+      tx.oncomplete = () => resolve();
+      tx.onabort = () => reject(tx.error || new Error('pending-send storage aborted'));
+      tx.onerror = () => reject(tx.error || new Error('pending-send storage failed'));
+    });
+  }
+
+  function rememberPendingSendObjectURL(id, blob) {
+    if (!id || !blob || pendingSendObjectURLs.has(id) || !window.URL?.createObjectURL) return;
+    try {
+      pendingSendObjectURLs.set(id, URL.createObjectURL(blob));
+    } catch (err) {
+      console.warn('Failed to create pending attachment preview URL:', err);
+    }
+  }
+
+  function forgetPendingSendObjectURL(id) {
+    const url = pendingSendObjectURLs.get(id);
+    if (url && window.URL?.revokeObjectURL) {
+      URL.revokeObjectURL(url);
+    }
+    pendingSendObjectURLs.delete(id);
+  }
+
+  async function storePendingSendFile(id, file) {
+    if (!id || !file) return;
+    pendingSendFiles.set(id, file);
+    rememberPendingSendObjectURL(id, file);
+    try {
+      const db = await pendingSendsDB();
+      const tx = db.transaction(PENDING_SENDS_DB_STORE, 'readwrite');
+      tx.objectStore(PENDING_SENDS_DB_STORE).put(file, id);
+      await idbTransactionDone(tx);
+    } catch (err) {
+      console.warn('Pending attachment will retry only while this page stays open:', err);
+    }
+  }
+
+  async function deletePendingSendFile(id) {
+    pendingSendFiles.delete(id);
+    forgetPendingSendObjectURL(id);
+    try {
+      const db = await pendingSendsDB();
+      const tx = db.transaction(PENDING_SENDS_DB_STORE, 'readwrite');
+      tx.objectStore(PENDING_SENDS_DB_STORE).delete(id);
+      await idbTransactionDone(tx);
+    } catch (err) {
+      console.warn('Failed to delete pending attachment:', err);
+    }
+  }
+
+  async function pendingSendFile(item) {
+    if (pendingSendFiles.has(item.id)) return pendingSendFiles.get(item.id);
+    const db = await pendingSendsDB();
+    const blob = await new Promise((resolve, reject) => {
+      const tx = db.transaction(PENDING_SENDS_DB_STORE, 'readonly');
+      const req = tx.objectStore(PENDING_SENDS_DB_STORE).get(item.id);
+      req.onsuccess = () => resolve(req.result || null);
+      req.onerror = () => reject(req.error || new Error('read pending attachment'));
+    });
+    if (!blob) {
+      throw new Error('Attachment data is no longer available.');
+    }
+    rememberPendingSendObjectURL(item.id, blob);
+    if (typeof File === 'function' && !(blob instanceof File)) {
+      const file = new File([blob], item.file_name || 'attachment', { type: item.mime_type || blob.type || 'application/octet-stream' });
+      pendingSendFiles.set(item.id, file);
+      return file;
+    }
+    pendingSendFiles.set(item.id, blob);
+    return blob;
+  }
+
+  function hydrateQueuedAttachmentPreviews() {
+    if (!activeConvoId) return;
+    queuedSendsForConversation(activeConvoId).forEach(item => {
+      if (item.type !== 'media' || pendingSendObjectURLs.has(item.id) || pendingSendPreviewHydrations.has(item.id)) return;
+      pendingSendPreviewHydrations.add(item.id);
+      pendingSendFile(item)
+        .then(file => {
+          rememberPendingSendObjectURL(item.id, file);
+          if (activeConvoId === item.conversation_id) {
+            syncQueuedSendsForActiveConversation();
+          }
+        })
+        .catch(err => console.warn('Failed to hydrate pending attachment preview:', err))
+        .finally(() => pendingSendPreviewHydrations.delete(item.id));
+    });
+  }
+
+  function queuedSendID() {
+    return `tmp_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+  }
+
+  function queuedSendsForConversation(conversationID) {
+    return pendingSendQueue
+      .filter(item => item.conversation_id === conversationID)
+      .sort((a, b) => a.timestamp_ms - b.timestamp_ms || a.id.localeCompare(b.id));
+  }
+
+  function queuedSendMessage(item) {
+    const failed = item.status === 'failed';
+    const hasMediaPreview = item.type === 'media' || item.type === 'gif';
+    return {
+      MessageID: item.id,
+      ConversationID: item.conversation_id,
+      Body: item.body,
+      TimestampMS: item.timestamp_ms,
+      Status: failed ? `OUTGOING_FAILED:${item.last_error || 'queued send failed'}` : 'OUTGOING_SENDING',
+      IsFromMe: true,
+      MediaID: hasMediaPreview ? `pending:${item.id}` : '',
+      MimeType: item.type === 'gif' ? (item.mime_type || 'image/gif') : (item.type === 'media' ? item.mime_type : ''),
+      ReplyToID: item.reply_to_id,
+      SourcePlatform: item.platform,
+      _pendingSend: true,
+      _pendingSendItem: item,
+      _pendingFileName: item.file_name,
+      _pendingFileURL: item.type === 'gif' ? item.preview_url : (pendingSendObjectURLs.get(item.id) || ''),
+    };
+  }
+
+  function queuedTextConfirmedByMessage(item, message) {
+    if (!item || item.type !== 'text' || item.status !== 'failed' || !message || message._pendingSend) return false;
+    if (!message.IsFromMe) return false;
+    if (String(message.ConversationID || '') !== item.conversation_id) return false;
+    if (normalizePlatform(message.SourcePlatform || item.platform) !== normalizePlatform(item.platform)) return false;
+    if (String(message.ReplyToID || '') !== String(item.reply_to_id || '')) return false;
+    if (String(message.Body || '').trim() !== String(item.body || '').trim()) return false;
+    const queuedAt = Number(item.timestamp_ms || 0);
+    const sentAt = Number(message.TimestampMS || 0);
+    return !queuedAt || !sentAt || sentAt >= queuedAt;
+  }
+
+  function pruneQueuedSendsConfirmedByMessages(messages, conversationID) {
+    const confirmedMessages = (messages || []).filter(message => message && !message._pendingSend && message.IsFromMe);
+    if (!confirmedMessages.length) return;
+    const removed = [];
+    pendingSendQueue = pendingSendQueue.filter(item => {
+      if (!item || item.conversation_id !== conversationID) return true;
+      if (!confirmedMessages.some(message => queuedTextConfirmedByMessage(item, message))) return true;
+      removed.push(item.id);
+      return false;
+    });
+    if (!removed.length) return;
+    saveQueuedSends();
+    removed.forEach(id => {
+      deletePendingSendFile(id).catch(err => console.warn('Failed to delete confirmed queued send attachment:', err));
+    });
+  }
+
+  function mergeQueuedSends(messages, conversationID) {
+    pruneQueuedSendsConfirmedByMessages(messages, conversationID);
+    const base = (messages || []).filter(message => !message._pendingSend);
+    const queued = queuedSendsForConversation(conversationID).map(queuedSendMessage);
+    return mergeMessages(base, queued);
+  }
+
+  function syncQueuedSendsForActiveConversation({stickToBottom = null} = {}) {
+    if (!activeConvoId) return;
+    const shouldStick = stickToBottom === null ? isThreadNearBottom() : !!stickToBottom;
+    loadedMessages = mergeQueuedSends(loadedMessages, activeConvoId);
+    updateLoadedMessageBounds();
+    lastThreadSignature = null;
+    renderLoadedMessages({stickToBottom: shouldStick});
+  }
+
+  function findQueuedSend(id) {
+    return pendingSendQueue.find(item => item.id === id) || null;
+  }
+
+  function updateQueuedSend(id, patch) {
+    const item = findQueuedSend(id);
+    if (!item) return null;
+    Object.assign(item, patch);
+    saveQueuedSends();
+    if (activeConvoId === item.conversation_id) {
+      syncQueuedSendsForActiveConversation({stickToBottom: true});
+    }
+    return item;
+  }
+
+  async function removeQueuedSend(id) {
+    const item = findQueuedSend(id);
+    pendingSendQueue = pendingSendQueue.filter(candidate => candidate.id !== id);
+    saveQueuedSends();
+    await deletePendingSendFile(id);
+    if (item && activeConvoId === item.conversation_id) {
+      loadedMessages = loadedMessages.filter(message => String(message.MessageID || '') !== id);
+      updateLoadedMessageBounds();
+      lastThreadSignature = null;
+      renderLoadedMessages({stickToBottom: true});
+    }
+  }
+
+  async function enqueueQueuedSend(item, file = null) {
+    const normalized = normalizeQueuedSend(item);
+    if (!normalized) throw new Error('Invalid queued message.');
+    if (pendingSendQueue.length >= PENDING_SEND_MAX_ITEMS) {
+      throw new Error(PENDING_SEND_CAPACITY_MESSAGE);
+    }
+    pendingSendQueue.push(normalized);
+    saveQueuedSends();
+    if (file) {
+      await storePendingSendFile(normalized.id, file);
+    }
+    if (activeConvoId === normalized.conversation_id) {
+      syncQueuedSendsForActiveConversation({stickToBottom: true});
+    }
+    scheduleQueuedSendFlush(0);
+    return normalized;
+  }
+
+  function queuedSendCapacityAvailable(additionalItems = 1) {
+    const count = Math.max(0, Number(additionalItems || 0));
+    return pendingSendQueue.length + count <= PENDING_SEND_MAX_ITEMS;
+  }
+
+  function platformReadyForQueuedSend(platform) {
+    if (browserIsOffline()) return false;
+    if (platform === 'sms') return googleStatus.connected && !googleStatus.needs_repair;
+    if (platform === 'whatsapp') return whatsAppStatus.connected;
+    if (platform === 'signal') return signalStatus.connected;
+    return false;
+  }
+
+  function queuedSendCanFlush(item) {
+    return item
+      && item.status === 'pending'
+      && !item.wait_for_reconnect
+      && Number(item.next_attempt_at || 0) <= Date.now()
+      && platformReadyForQueuedSend(item.platform);
+  }
+
+  function resetQueuedSendsWaitingForReconnect(platform) {
+    let changed = false;
+    let activeConversationChanged = false;
+    pendingSendQueue.forEach(item => {
+      if (item.platform !== platform || !item.wait_for_reconnect || item.status !== 'pending') return;
+      item.wait_for_reconnect = false;
+      item.next_attempt_at = 0;
+      changed = true;
+      if (activeConvoId === item.conversation_id) activeConversationChanged = true;
+    });
+    if (!changed) return false;
+    saveQueuedSends();
+    if (activeConversationChanged) {
+      syncQueuedSendsForActiveConversation({stickToBottom: true});
+    }
+    scheduleQueuedSendFlush(0);
+    return true;
+  }
+
+  function updateQueuedSendPlatformReadiness() {
+    const next = {
+      sms: platformReadyForQueuedSend('sms'),
+      whatsapp: platformReadyForQueuedSend('whatsapp'),
+      signal: platformReadyForQueuedSend('signal'),
+    };
+    let changed = false;
+    Object.keys(next).forEach(platform => {
+      if (next[platform] && !queuedSendPlatformReady[platform]) {
+        changed = resetQueuedSendsWaitingForReconnect(platform) || changed;
+      }
+    });
+    queuedSendPlatformReady = next;
+    return changed;
+  }
+
+  function queuedSendWaitingMessage(item) {
+    const label = platformMeta(item.platform).label;
+    if (browserIsOffline()) return 'Message queued. It will send when you are back online.';
+    if (item.platform === 'sms' && googleStatus.needs_repair) {
+      return 'Message queued. Re-pair Google Messages to send it.';
+    }
+    return `Message queued. It will send when ${label} reconnects.`;
+  }
+
+  function queuedSendErrorIsRetryable(err) {
+    const status = Number(err && err.status || 0);
+    if (status === 503 || status === 504 || status === 408 || status === 429) return true;
+    const message = err instanceof Error ? err.message : String(err || '');
+    const lower = message.toLowerCase();
+    return isConnectivityErrorMessage(lower)
+      || lower.includes('not connected')
+      || lower.includes('disconnected')
+      || lower.includes('session expired')
+      || lower.includes('refreshing and reconnecting')
+      || lower.includes('connection refused')
+      || lower.includes('connection reset');
+  }
+
+  async function postQueuedJSON(url, body) {
+    try {
+      const resp = await fetch(API + url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      if (!resp.ok) {
+        const err = new Error(await responseError(resp));
+        err.status = resp.status;
+        throw err;
+      }
+      const text = await resp.text();
+      return text ? JSON.parse(text) : null;
+    } catch (err) {
+      throw err instanceof Error ? err : new Error(String(err || 'Request failed'));
+    }
+  }
+
+  async function sendQueuedItem(item) {
+    if (item.type === 'gif') {
+      await postQueuedJSON('/api/send-gif', {
+        conversation_id: item.conversation_id,
+        url: item.gif_url,
+        caption: item.body || undefined,
+        reply_to_id: item.reply_to_id || undefined,
+        idempotency_key: item.id,
+      });
+      return;
+    }
+    if (item.type === 'media') {
+      const file = await pendingSendFile(item);
+      const form = new FormData();
+      form.append('conversation_id', item.conversation_id);
+      form.append('idempotency_key', item.id);
+      form.append('file', file, item.file_name || file.name || 'attachment');
+      if (item.reply_to_id) form.append('reply_to_id', item.reply_to_id);
+      if (item.body) form.append('caption', item.body);
+      const resp = await fetch(API + '/api/send-media', { method: 'POST', body: form });
+      if (!resp.ok) {
+        const err = new Error(await responseError(resp));
+        err.status = resp.status;
+        throw err;
+      }
+      return;
+    }
+    await postQueuedJSON('/api/send', {
+      conversation_id: item.conversation_id,
+      message: item.body,
+      reply_to_id: item.reply_to_id || undefined,
+      idempotency_key: item.id,
+    });
+  }
+
+  function scheduleQueuedSendFlush(delay = 250) {
+    if (!pendingSendQueue.some(item => item.status === 'pending')) return;
+    clearTimeout(pendingSendFlushTimer);
+    pendingSendFlushTimer = setTimeout(() => {
+      pendingSendFlushTimer = null;
+      flushQueuedSends().catch(err => console.error('Queued send flush failed:', err));
+    }, delay);
+  }
+
+  async function flushQueuedSends() {
+    if (pendingSendFlushInProgress || browserIsOffline()) return;
+    pendingSendFlushInProgress = true;
+    let sentAny = false;
+    try {
+      for (const item of pendingSendQueue.slice()) {
+        if (!queuedSendCanFlush(item)) continue;
+        updateQueuedSend(item.id, { status: 'sending', last_error: '' });
+        try {
+          await sendQueuedItem(item);
+          await removeQueuedSend(item.id);
+          sentAny = true;
+        } catch (err) {
+          const retryable = queuedSendErrorIsRetryable(err);
+          const attempts = Number(item.attempts || 0) + 1;
+          const message = retryable
+            ? queuedSendWaitingMessage(item)
+            : (userFacingErrorMessage(err, 'send') || 'Failed to send message');
+          updateQueuedSend(item.id, {
+            status: retryable ? 'pending' : 'failed',
+            attempts,
+            wait_for_reconnect: retryable,
+            next_attempt_at: 0,
+            last_error: message,
+          });
+          if (!retryable && activeConvoId === item.conversation_id) {
+            showThreadFeedback(message, 'send');
+          }
+        }
+      }
+    } finally {
+      pendingSendFlushInProgress = false;
+    }
+    if (sentAny) {
+      if (activeConvoId && threadSearchMode !== 'centered') {
+        await loadMessages(activeConvoId, {poll: true, forceBottom: true});
+      }
+      await loadConversations();
+    }
+    if (pendingSendQueue.some(item => item.status === 'pending' && item.next_attempt_at > Date.now())) {
+      const nextAttempt = Math.min(...pendingSendQueue
+        .filter(item => item.status === 'pending' && item.next_attempt_at > Date.now())
+        .map(item => item.next_attempt_at));
+      scheduleQueuedSendFlush(Math.max(500, nextAttempt - Date.now()));
+    }
+  }
+
+  async function retryQueuedSend(id) {
+    const item = findQueuedSend(id);
+    if (!item) {
+      showThreadFeedback('Queued message is no longer available.', 'send');
+      return;
+    }
+    const updated = updateQueuedSend(id, {
+      status: 'pending',
+      wait_for_reconnect: false,
+      next_attempt_at: 0,
+      last_error: '',
+    }) || item;
+    if (!queuedSendCanFlush(updated)) {
+      showThreadFeedback(queuedSendWaitingMessage(updated), 'send');
+      return;
+    }
+    showThreadFeedback('Retrying message...', 'send');
+    await flushQueuedSends();
+  }
+
   function clearThreadFeedback() {
     if (threadFeedbackTimer) {
       clearTimeout(threadFeedbackTimer);
@@ -8575,6 +9357,7 @@ body::after {
     });
     Array.from(container.children).forEach(child => {
       if (!desiredSet.has(child)) {
+        cleanupPDFPreviewURLs(child);
         child.remove();
       }
     });
@@ -8960,6 +9743,7 @@ body::after {
 
   function renderThreadPlaceholder(message, modifier = '') {
     if (!$messagesArea) return;
+    cleanupPDFPreviewURLs($messagesArea);
     $messagesArea.innerHTML = '';
     const el = document.createElement('div');
     el.className = 'thread-placeholder' + (modifier ? ` ${modifier}` : '');
@@ -9372,18 +10156,19 @@ body::after {
       const isImage = mimeType.startsWith('image/');
       const isAudio = mimeType.startsWith('audio/');
       const isVideo = mimeType.startsWith('video/');
+      const isPDF = mimeType === 'application/pdf';
       const hasMediaID = !!message.MediaID;
-      const mediaSrc = `/api/media/${encodeURIComponent(message.MessageID)}`;
+      const mediaSrc = message._pendingSend ? (message._pendingFileURL || '') : `/api/media/${encodeURIComponent(message.MessageID)}`;
       const audioLabel = (message.Body === '[Voice note]' || message.Body === '[Audio]' || !message.Body) ? (message.Body === '[Voice note]' ? 'Voice note' : 'Audio message') : '';
       const transcript = message.Transcript || message.transcript || '';
       const transcriptModel = message.TranscriptModel || message.transcript_model || '';
 
-      if (hasMediaID && isImage) {
+      if (hasMediaID && isImage && mediaSrc) {
         html += `<div class="msg-media">`;
         html += `<div class="msg-media-loading" data-msg-id="${escapeHtml(message.MessageID)}" data-kind="image"><div class="spinner"></div><span class="msg-media-loading-text">Fetching image...</span></div>`;
         html += `<img src="${mediaSrc}" alt="Image" loading="lazy" decoding="async" onload="handleMediaLoad(this)" onerror="handleMediaError(this, 'image')" onclick="showFullscreen(this.src,'image')">`;
         html += `</div>`;
-      } else if (hasMediaID && isAudio) {
+      } else if (hasMediaID && isAudio && mediaSrc) {
         html += `<div class="msg-media">`;
         if (audioLabel) {
           html += `<div class="msg-audio-label">${escapeHtml(audioLabel)}</div>`;
@@ -9393,19 +10178,25 @@ body::after {
           html += `<div class="msg-transcript" title="${escapeHtml(transcriptModel || 'auto-transcribed')}">${escapeHtml(transcript)}</div>`;
         }
         html += `</div>`;
-      } else if (hasMediaID && isVideo) {
+      } else if (hasMediaID && isVideo && mediaSrc) {
         html += `<div class="msg-media">`;
         html += `<div class="msg-media-loading" data-msg-id="${escapeHtml(message.MessageID)}" data-kind="video"><div class="spinner"></div><span class="msg-media-loading-text">Fetching video...</span></div>`;
         html += `<video src="${mediaSrc}" preload="none" controls playsinline style="display:none" onloadeddata="this.style.display='block';handleMediaLoad(this)" onerror="handleMediaError(this, 'video')" onclick="event.stopPropagation()"></video>`;
+        html += `</div>`;
+      } else if (hasMediaID && isPDF && mediaSrc) {
+        html += `<div class="msg-media msg-document-preview">`;
+        html += `<iframe class="msg-pdf-preview" data-pdf-src="${escapeHtml(mediaSrc)}" title="PDF preview" loading="lazy"></iframe>`;
+        html += `<div class="msg-pdf-preview-error" hidden>PDF preview unavailable. Open the attachment below.</div>`;
+        html += renderAttachmentCardHTML(message, mediaSrc);
         html += `</div>`;
       } else if (!hasMediaID && (isImage || isAudio || isVideo)) {
         const icon = isImage ? '\uD83D\uDDBC\uFE0F' : (isAudio ? '\uD83C\uDFA4' : '\uD83C\uDFA5');
         const label = isImage ? 'Image' : (isAudio ? 'Audio' : 'Video');
         html += `<div style="padding:12px;background:var(--bg-tertiary, #f0f0f0);border-radius:8px;text-align:center;color:var(--text-muted, #999);font-size:13px">${icon} ${label} from phone</div>`;
       } else if (hasMediaID) {
-        html += `<div style="font-size:13px;color:var(--text-secondary);padding:6px 0">Attachment: ${escapeHtml(message.MimeType || 'file')}</div>`;
+        html += renderAttachmentCardHTML(message, mediaSrc);
       } else {
-        html += `<div style="font-size:13px;color:var(--text-muted);padding:6px 0">Attachment (${escapeHtml(message.MimeType || 'file')})</div>`;
+        html += renderAttachmentCardHTML(message, '');
       }
     }
     const previewURL = message.Body ? extractMessageURLs(message.Body)[0] : '';
@@ -9436,11 +10227,16 @@ body::after {
       } catch(e) {}
     }
 
-    html += `<div class="msg-time">${formatMessageTime(message.TimestampMS)}${message.IsFromMe ? formatStatusIndicator(message.Status) : ''}</div>`;
+    const failedQueuedSend = message._pendingSend && message._pendingSendItem && message._pendingSendItem.status === 'failed';
+    html += `<div class="msg-time">${formatMessageTime(message.TimestampMS)}${message.IsFromMe ? formatStatusIndicator(message.Status) : ''}${failedQueuedSend ? '<button type="button" class="msg-retry-send">Retry</button>' : ''}</div>`;
+    const pendingActionDisabled = message._pendingSend ? 'disabled' : '';
     html += `<div class="msg-actions">`;
-    html += `<button class="action-react" title="React"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M8 14s1.5 2 4 2 4-2 4-2"/><line x1="9" y1="9" x2="9.01" y2="9"/><line x1="15" y1="9" x2="15.01" y2="9"/></svg></button>`;
-    html += `<button class="action-reply" title="Reply"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 17 4 12 9 7"/><path d="M20 18v-2a4 4 0 0 0-4-4H4"/></svg></button>`;
-    html += `<button class="action-forward" title="Forward" aria-label="Forward message" ${messageHasForwardableContent(message) ? '' : 'disabled'}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 17 20 12 15 7"/><path d="M4 18v-2a4 4 0 0 1 4-4h12"/><polyline points="13 6 18 1 23 6"/><path d="M11 12h7"/></svg></button>`;
+    if (failedQueuedSend) {
+      html += `<button class="action-retry-send" title="Retry send" aria-label="Retry send"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></svg></button>`;
+    }
+    html += `<button class="action-react" title="React" ${pendingActionDisabled}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M8 14s1.5 2 4 2 4-2 4-2"/><line x1="9" y1="9" x2="9.01" y2="9"/><line x1="15" y1="9" x2="15.01" y2="9"/></svg></button>`;
+    html += `<button class="action-reply" title="Reply" ${pendingActionDisabled}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 17 4 12 9 7"/><path d="M20 18v-2a4 4 0 0 0-4-4H4"/></svg></button>`;
+    html += `<button class="action-forward" title="Forward" aria-label="Forward message" ${!message._pendingSend && messageHasForwardableContent(message) ? '' : 'disabled'}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 17 20 12 15 7"/><path d="M4 18v-2a4 4 0 0 1 4-4h12"/><polyline points="13 6 18 1 23 6"/><path d="M11 12h7"/></svg></button>`;
     html += `</div>`;
 
     const safeMsgId = escapeHtml(message.MessageID);
@@ -9456,6 +10252,15 @@ body::after {
     el.innerHTML = html;
     el.dataset.msgId = message.MessageID;
 
+    el.querySelectorAll('.msg-retry-send, .action-retry-send').forEach(button => {
+      button.addEventListener('click', (e) => {
+        e.stopPropagation();
+        retryQueuedSend(message.MessageID).catch(err => {
+          console.error('Failed to retry queued send:', err);
+          showThreadFeedback(err.message || 'Failed to retry message.', 'send');
+        });
+      });
+    });
     el.querySelector('.action-react').addEventListener('click', (e) => {
       e.stopPropagation();
       document.querySelectorAll('.emoji-picker.show').forEach(p => p.classList.remove('show'));
@@ -9612,6 +10417,8 @@ body::after {
     hydrateLinkPreviews();
     hydrateNativeAvatars($messagesArea);
     hydrateMediaElements($messagesArea);
+    hydratePDFPreviews($messagesArea);
+    hydrateQueuedAttachmentPreviews();
     scheduleMediaLoaderLabels($messagesArea);
     observeThreadContentResize();
     observeThreadViewportResize();
@@ -9654,7 +10461,7 @@ body::after {
         const msgs = await fetchJSON(`/api/conversations/${encodeURIComponent(convoId)}/messages?limit=${MESSAGE_PAGE_SIZE}`);
         msgs.reverse();
         if (threadToken !== activeThreadToken || activeConvoId !== convoId) return;
-        loadedMessages = msgs;
+        loadedMessages = mergeQueuedSends(msgs, convoId);
         const drafts = await fetchDrafts(convoId);
         if (threadToken !== activeThreadToken || activeConvoId !== convoId) return;
         loadedDrafts = drafts;
@@ -9682,7 +10489,7 @@ body::after {
         const latestMsgs = await fetchJSON(`/api/conversations/${encodeURIComponent(convoId)}/messages?limit=${MESSAGE_PAGE_SIZE}`);
         latestMsgs.reverse();
         if (threadToken !== activeThreadToken || activeConvoId !== convoId) return;
-        loadedMessages = mergeMessages(pruneMissingLatestTempMessages(loadedMessages, latestMsgs), latestMsgs);
+        loadedMessages = mergeQueuedSends(mergeMessages(pruneMissingLatestTempMessages(loadedMessages, latestMsgs), latestMsgs), convoId);
         const drafts = await fetchDrafts(convoId);
         if (threadToken !== activeThreadToken || activeConvoId !== convoId) return;
         loadedDrafts = drafts;
@@ -9960,98 +10767,100 @@ body::after {
     if (!activeConversation) {
       return;
     }
-    if (browserIsOffline()) {
-      showThreadFeedback(offlineFeedbackMessage('send'), 'send');
-      return;
-    }
     const sendConvoId = activeConvoId;
     const sendConversation = activeConversation;
-    const canSendText = conversationSupportsOutbound(sendConversation);
-    const canSendMedia = conversationSupportsMediaOutbound(sendConversation);
+    const canQueueText = conversationCanQueueOutbound(sendConversation);
+    const canQueueMedia = conversationCanQueueMediaOutbound(sendConversation);
     const activePlatform = sourcePlatformOf(sendConversation);
-    if ($composeInput.value.trim() && !canSendText) {
+    if ($composeInput.value.trim() && !canQueueText) {
       showThreadFeedback(routeUnavailableMessage('reply', sendConversation));
       return;
     }
-    if (pendingFile && !canSendMedia) {
+    if (pendingFile && !canQueueMedia) {
       showThreadFeedback('Attachments are unavailable on this route right now.');
       return;
     }
     const text = $composeInput.value.trim();
-    const originalText = $composeInput.value;
     const hasMedia = !!pendingFile;
+    const file = pendingFile ? pendingFile.file : null;
+    const replyToID = replyToMsg ? String(replyToMsg.MessageID || '') : '';
     const sendsCaptionedWhatsAppMedia = hasMedia
       && activePlatform === 'whatsapp'
       && !(pendingFile.file?.type || '').startsWith('audio/');
     const sendsCaptionedMedia = sendsCaptionedWhatsAppMedia
       || (hasMedia && activePlatform === 'signal');
     if ((!text && !hasMedia) || !sendConvoId) return;
+    const queuedSendCount = (hasMedia ? 1 : 0) + (text && !sendsCaptionedMedia ? 1 : 0);
+    if (!queuedSendCapacityAvailable(queuedSendCount)) {
+      showThreadFeedback(PENDING_SEND_CAPACITY_MESSAGE, 'send');
+      return;
+    }
 
+    const originalText = $composeInput.value;
+    const originalPendingFile = pendingFile;
+    const originalReplyToMsg = replyToMsg;
+    const queuedItems = [];
     composeSendInFlight = true;
     clearThreadFeedback();
     $composeInput.value = '';
     composeTextByConversation.delete(sendConvoId);
-    $sendBtn.disabled = true;
-    $attachBtn.disabled = true;
-    autoResize();
-
-    // Optimistic UI: show message immediately before server round-trip
-    let optimisticEl = null;
-    if (text && !hasMedia) {
-      optimisticEl = document.createElement('div');
-      optimisticEl.className = 'msg sent';
-      const previewURL = extractMessageURLs(text)[0];
-      optimisticEl.innerHTML = `<div class="msg-body">${linkifyMessageBody(text)}</div>${previewURL ? `<div class="msg-link-preview-shell" data-preview-url="${escapeHtml(previewURL)}"></div>` : ''}<div class="msg-time">${formatMessageTime(Date.now())} <span style="opacity:0.5">&#10003;</span></div>`;
-      $messagesArea.appendChild(optimisticEl);
-      hydrateLinkPreviews();
-      $messagesArea.scrollTop = $messagesArea.scrollHeight;
+    if (hasMedia) {
+      clearAttachment();
     }
+    clearReply();
+    autoResize();
 
     try {
       if (hasMedia) {
-        // Send media via multipart form
-        const form = new FormData();
-        form.append('conversation_id', sendConvoId);
-        form.append('file', pendingFile.file);
-        if ((activePlatform === 'whatsapp' || activePlatform === 'signal') && replyToMsg) {
-          form.append('reply_to_id', replyToMsg.MessageID);
-        }
-        if ((sendsCaptionedWhatsAppMedia || activePlatform === 'signal') && text) {
-          form.append('caption', text);
-        }
-        const resp = await fetch('/api/send-media', { method: 'POST', body: form });
-        if (!resp.ok) throw new Error(await responseError(resp));
-        clearAttachment();
+        const mediaItem = {
+          id: queuedSendID(),
+          conversation_id: sendConvoId,
+          platform: activePlatform,
+          type: 'media',
+          body: sendsCaptionedMedia ? text : '',
+          reply_to_id: (activePlatform === 'whatsapp' || activePlatform === 'signal') ? replyToID : '',
+          file_name: file.name || 'attachment',
+          mime_type: file.type || 'application/octet-stream',
+          file_size: file.size || 0,
+          timestamp_ms: Date.now(),
+          status: 'pending',
+        };
+        queuedItems.push(await enqueueQueuedSend(mediaItem, file));
       }
       if (text && !sendsCaptionedMedia) {
-        const payload = {
+        const textItem = {
+          id: queuedSendID(),
           conversation_id: sendConvoId,
-          message: text,
+          platform: activePlatform,
+          type: 'text',
+          body: text,
+          reply_to_id: replyToID,
+          timestamp_ms: Date.now() + (queuedItems.length ? 1 : 0),
+          status: 'pending',
         };
-        if (replyToMsg) {
-          payload.reply_to_id = replyToMsg.MessageID;
-        }
-        await postJSON('/api/send', payload);
+        queuedItems.push(await enqueueQueuedSend(textItem));
       }
-      clearReply();
-      // Refresh to get the real message from server
-      if (activeConvoId === sendConvoId) {
-        if (threadSearchMode === 'centered') {
-          clearThreadSearchUI();
-          resetLoadedThreadState();
-          await loadMessages(sendConvoId, {reset: true, forceBottom: true});
-        } else {
-          await loadMessages(sendConvoId, {poll: true, forceBottom: true});
-        }
+      const waitingItem = queuedItems.find(item => !queuedSendCanFlush(item));
+      if (waitingItem) {
+        showThreadFeedback(queuedSendWaitingMessage(waitingItem), 'send');
       }
-      await loadConversations();
     } catch (err) {
-      if (optimisticEl) optimisticEl.remove();
-      if (text) {
+      await Promise.all(queuedItems.map(item => removeQueuedSend(item.id).catch(removeErr => {
+        console.warn('Failed to roll back queued send after enqueue failure:', removeErr);
+      })));
+      if (originalText) {
+        rememberComposeText(sendConvoId, originalText);
         if (activeConvoId === sendConvoId) {
           $composeInput.value = originalText;
         }
-        rememberComposeText(sendConvoId, originalText);
+      }
+      if (activeConvoId === sendConvoId) {
+        if (hasMedia && originalPendingFile && originalPendingFile.file) {
+          restoreAttachment(originalPendingFile.file);
+        }
+        if (originalReplyToMsg) {
+          setReply(originalReplyToMsg);
+        }
       }
       showThreadFeedback(err.message || 'Failed to send message', 'send');
       console.error('Failed to send:', err);
@@ -10090,9 +10899,8 @@ body::after {
     $sendBtn.disabled = !activeConversation
       || composeSendInFlight
       || (!hasText && !hasMedia)
-      || browserIsOffline()
-      || (hasText && !conversationSupportsOutbound(activeConversation))
-      || (hasMedia && !conversationSupportsMediaOutbound(activeConversation));
+      || (hasText && !conversationCanQueueOutbound(activeConversation))
+      || (hasMedia && !conversationCanQueueMediaOutbound(activeConversation));
     // Schedule supports text and media attachments.
     if ($scheduleBtn) {
       const canScheduleText = hasText && conversationSupportsOutbound(activeConversation);
@@ -10471,7 +11279,7 @@ body::after {
 
 	  function toggleComposeGifPanel() {
 	    if (!$composeGifPanel || !$composeGifBtn) return;
-	    if (!conversationSupportsMediaOutbound(activeConversation)) {
+	    if (!conversationCanQueueMediaOutbound(activeConversation)) {
 	      showThreadFeedback('GIFs are unavailable on this route right now.');
 	      return;
 	    }
@@ -10658,11 +11466,7 @@ body::after {
 	  async function sendComposeGif(result) {
 	    if (gifSending) return;
 	    if (!activeConversation || !activeConvoId) return;
-	    if (browserIsOffline()) {
-	      showThreadFeedback(offlineFeedbackMessage('send'), 'send');
-	      return;
-	    }
-	    if (!conversationSupportsMediaOutbound(activeConversation)) {
+	    if (!conversationCanQueueMediaOutbound(activeConversation)) {
 	      showThreadFeedback('GIFs are unavailable on this route right now.');
 	      return;
 	    }
@@ -10677,49 +11481,70 @@ body::after {
 	    const text = $composeInput.value.trim();
 	    const originalText = $composeInput.value;
 	    const supportsMediaCaption = activePlatform === 'whatsapp' || activePlatform === 'signal';
+	    const replyToID = replyToMsg ? String(replyToMsg.MessageID || '') : '';
+	    const queuedSendCount = 1 + (text && !supportsMediaCaption ? 1 : 0);
+	    if (!queuedSendCapacityAvailable(queuedSendCount)) {
+	      showThreadFeedback(PENDING_SEND_CAPACITY_MESSAGE, 'send');
+	      return;
+	    }
 
 	    clearThreadFeedback();
 	    gifSending = true;
 	    $composeInput.value = '';
 	    composeTextByConversation.delete(sendConvoId);
+	    clearReply();
 	    autoResize();
+	    const queuedItems = [];
 
 	    try {
-	      const payload = {
+	      const gifItem = {
+	        id: queuedSendID(),
 	        conversation_id: sendConvoId,
-	        url: result.url,
+	        platform: activePlatform,
+	        type: 'gif',
+	        body: supportsMediaCaption ? text : '',
+	        reply_to_id: supportsMediaCaption ? replyToID : '',
+	        gif_url: result.url,
+	        preview_url: result.preview_url,
+	        file_name: result.title || 'GIF',
+	        mime_type: result.mime_type || 'image/gif',
+	        timestamp_ms: Date.now(),
+	        status: 'pending',
 	      };
-	      if (supportsMediaCaption && text) payload.caption = text;
-	      if (supportsMediaCaption && replyToMsg) payload.reply_to_id = replyToMsg.MessageID;
-	      await postJSON('/api/send-gif', payload);
+	      queuedItems.push(await enqueueQueuedSend(gifItem));
 
 	      if (text && !supportsMediaCaption) {
-	        const textPayload = {
+	        const textItem = {
+	          id: queuedSendID(),
 	          conversation_id: sendConvoId,
-	          message: text,
+	          platform: activePlatform,
+	          type: 'text',
+	          body: text,
+	          reply_to_id: replyToID,
+	          timestamp_ms: Date.now() + 1,
+	          status: 'pending',
 	        };
-	        if (replyToMsg) textPayload.reply_to_id = replyToMsg.MessageID;
-	        await postJSON('/api/send', textPayload);
+	        queuedItems.push(await enqueueQueuedSend(textItem));
+	      }
+	      const waitingItem = queuedItems.find(item => !queuedSendCanFlush(item));
+	      if (waitingItem) {
+	        showThreadFeedback(queuedSendWaitingMessage(waitingItem), 'send');
 	      }
 
 	      closeComposeGifPanel();
-	      clearReply();
-	      if (activeConvoId === sendConvoId) {
-	        if (threadSearchMode === 'centered') {
-	          clearThreadSearchUI();
-	          resetLoadedThreadState();
-	          await loadMessages(sendConvoId, {reset: true, forceBottom: true});
-	        } else {
-	          await loadMessages(sendConvoId, {poll: true, forceBottom: true});
-	        }
-	      }
-	      await loadConversations();
 	    } catch (err) {
+	      await Promise.all(queuedItems.map(item => removeQueuedSend(item.id).catch(removeErr => {
+	        console.warn('Failed to roll back queued GIF after enqueue failure:', removeErr);
+	      })));
 	      if (text) {
 	        if (activeConvoId === sendConvoId) {
 	          $composeInput.value = originalText;
 	        }
 	        rememberComposeText(sendConvoId, originalText);
+	      }
+	      if (activeConvoId === sendConvoId && replyToID) {
+	        const replyMessage = loadedMessages.find(m => String(m.MessageID || '') === replyToID);
+	        if (replyMessage) setReply(replyMessage);
 	      }
 	      showThreadFeedback(err.message || 'Failed to send GIF', 'send');
 	      throw err;
@@ -10762,20 +11587,9 @@ body::after {
   }
 
   // ─── Attachments (paste + file picker) ───
-  function setAttachment(file) {
-    if (composeSendInFlight) {
-      $fileInput.value = '';
-      return;
-    }
-    if (!conversationSupportsMediaOutbound(activeConversation)) {
-      showThreadFeedback('Attachments are unavailable on this route right now.');
-      return;
-    }
-    pendingFile = { file };
+  function renderAttachmentPreview(file) {
     $attachName.textContent = file.name || 'Attachment';
     $attachPreview.classList.add('active');
-    autoResize();
-
     if (file.type.startsWith('image/')) {
       const reader = new FileReader();
       reader.onload = e => { $attachThumb.src = e.target.result; $attachThumb.style.display = 'block'; };
@@ -10783,6 +11597,27 @@ body::after {
     } else {
       $attachThumb.style.display = 'none';
     }
+  }
+
+  function setAttachment(file) {
+    if (composeSendInFlight) {
+      $fileInput.value = '';
+      return;
+    }
+    if (!conversationCanQueueMediaOutbound(activeConversation)) {
+      showThreadFeedback('Attachments are unavailable on this route right now.');
+      return;
+    }
+    pendingFile = { file };
+    renderAttachmentPreview(file);
+    autoResize();
+  }
+
+  function restoreAttachment(file) {
+    if (!file) return;
+    pendingFile = { file };
+    renderAttachmentPreview(file);
+    autoResize();
   }
 
   function clearAttachment() {
@@ -10830,7 +11665,7 @@ body::after {
 	    $composeBar.addEventListener('dragover', event => {
 	      if (!dragEventHasFiles(event)) return;
 	      event.preventDefault();
-	      event.dataTransfer.dropEffect = conversationSupportsMediaOutbound(activeConversation) ? 'copy' : 'none';
+	      event.dataTransfer.dropEffect = conversationCanQueueMediaOutbound(activeConversation) ? 'copy' : 'none';
 	    });
 	    $composeBar.addEventListener('dragleave', event => {
 	      if (!dragEventHasFiles(event)) return;
@@ -10849,10 +11684,10 @@ body::after {
 
 	  // File picker button
 	  $attachBtn.addEventListener('click', () => {
-    if (!conversationSupportsMediaOutbound(activeConversation)) {
-      showThreadFeedback('Attachments are unavailable on this route right now.');
-      return;
-    }
+	    if (!conversationCanQueueMediaOutbound(activeConversation)) {
+	      showThreadFeedback('Attachments are unavailable on this route right now.');
+	      return;
+	    }
     $fileInput.click();
   });
   $fileInput.addEventListener('change', () => {
@@ -11051,6 +11886,7 @@ body::after {
     whatsAppStatus = normalizeWhatsAppStatus(appStatus.whatsapp || {});
     signalStatus = normalizeSignalStatus(appStatus.signal || {});
     backfillStatus = normalizeBackfillStatus(appStatus.backfill || {});
+    updateQueuedSendPlatformReadiness();
     // Only re-render when something the always-on UI actually shows changed.
     // The banner and empty state key off whether secondary platforms are
     // PAIRED, not their live connected flag — so a Signal/WhatsApp bridge
@@ -11067,7 +11903,10 @@ body::after {
       browserReportsOnline(), activeConvoId, overlayOpen,
       overlayOpen ? [whatsAppStatus, signalStatus] : null,
     ]);
-    if (sig === lastStatusRenderSig) return;
+    if (sig === lastStatusRenderSig) {
+      scheduleQueuedSendFlush();
+      return;
+    }
     lastStatusRenderSig = sig;
     setConnectionState();
     renderWhatsAppButton();
@@ -11078,6 +11917,7 @@ body::after {
     if (activeConversation) {
       refreshConversationChrome();
     }
+    scheduleQueuedSendFlush();
   }
 
   function showGoogleError(message, context = 'google') {
@@ -12148,6 +12988,10 @@ body::after {
         if (context.type === 'message' && context.message) {
           const message = context.message;
           const urls = extractMessageURLs(message.Body || '');
+          if (action === 'retry-queued-send') {
+            await retryQueuedSend(message.MessageID);
+            return;
+          }
           if (action === 'reply-message') {
             setReplyTo(message);
             return;
@@ -12308,6 +13152,7 @@ body::after {
     if (threadContentResizeObserver) {
       threadContentResizeObserver.disconnect();
     }
+    cleanupPDFPreviewURLs($messagesArea);
     $messagesArea.innerHTML = '';
     clearThreadFeedback();
     refreshConversationChrome();
@@ -12738,7 +13583,7 @@ body::after {
     networkIssueDetected = false;
     setConnectionState();
     autoResize();
-    showThreadFeedback(offlineFeedbackMessage());
+    showThreadFeedback('Offline. New messages will queue until you are back online.');
   });
 
   window.addEventListener('online', () => {
@@ -12751,7 +13596,8 @@ body::after {
     if (activeConvoId) {
       loadMessages(activeConvoId, {poll: true});
     }
-    showThreadFeedback('Back online. You can send messages again.');
+    scheduleQueuedSendFlush(0);
+    showThreadFeedback('Back online. Queued messages will send when their route is connected.');
   });
 
   if (navigator.webdriver) {
@@ -12828,8 +13674,10 @@ body::after {
   });
   startEventStream();
   loadTabs();
+  loadQueuedSends();
   loadConversations();
   checkStatus();
+  scheduleQueuedSendFlush(1000);
 
 })();
 </script>
