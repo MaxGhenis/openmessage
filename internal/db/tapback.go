@@ -118,7 +118,15 @@ func (s *Store) ApplyTapback(m *Message) (bool, error) {
 // message in the conversation (at or before the tapback) whose body equals the
 // quoted text, or — for truncated quotes — starts with it.
 func (s *Store) findTapbackTarget(conversationID, quoted string, beforeTS int64, truncated bool) (*Message, error) {
-	quoted = strings.TrimRight(strings.TrimSpace(quoted), ". …")
+	quoted = strings.TrimSpace(quoted)
+	// iMessage truncates long quotes with an ellipsis; for those, strip the
+	// trailing ellipsis/period so the remaining text can prefix-match the
+	// original. A non-truncated quote must match the body exactly, including a
+	// trailing period — otherwise a tapback on `see you then.` leaks through as
+	// the literal text `Loved "see you then."` instead of a reaction.
+	if truncated {
+		quoted = strings.TrimRight(quoted, ". …")
+	}
 	if quoted == "" {
 		return nil, nil
 	}

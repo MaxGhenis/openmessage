@@ -920,10 +920,6 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		writeJSON(w, payload)
 	})
 
-	// ── Scheduled (send-later) messages ───────────────────────────────────
-	// GET  /api/schedule?conversation_id=  — list active scheduled messages
-	// POST /api/schedule                   — schedule a message
-
 	mux.HandleFunc("/api/search", func(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query().Get("q")
 		if q == "" {
@@ -2489,32 +2485,6 @@ func searchPreviewForMessage(msg *db.Message) string {
 	return ""
 }
 
-func normalizePhoneNumber(s string) string {
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return ""
-	}
-	hasPlus := strings.HasPrefix(s, "+")
-	digits := digitsOnly(s)
-	if digits == "" {
-		return ""
-	}
-	if hasPlus {
-		return "+" + digits
-	}
-	switch {
-	case len(digits) == 11 && strings.HasPrefix(digits, "1"):
-		return "+" + digits
-	case len(digits) == 10:
-		return "+1" + digits
-	case len(digits) >= 11:
-		return "+" + digits
-	default:
-		return s // short codes / unusual — pass through unchanged
-	}
-}
-
-
 type personPayload struct {
 	Key             string   `json:"key"`
 	Name            string   `json:"name"`
@@ -2562,16 +2532,6 @@ func buildPersonPayload(p *db.Person, meta *db.ContactMeta, now int64) *personPa
 		}
 	}
 	return pp
-}
-
-func digitsOnly(s string) string {
-	var b strings.Builder
-	for i := 0; i < len(s); i++ {
-		if s[i] >= '0' && s[i] <= '9' {
-			b.WriteByte(s[i])
-		}
-	}
-	return b.String()
 }
 
 func writeJSON(w http.ResponseWriter, v any) {

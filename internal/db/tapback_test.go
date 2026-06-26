@@ -102,6 +102,19 @@ func TestApplyTapback(t *testing.T) {
 	if appliedFP {
 		t.Error("a non-truncated quote must require an exact match, not a prefix match")
 	}
+
+	// Regression: a tapback on a message that ends in a period must still match.
+	// The quoted text carries the trailing `.`, so a non-truncated comparison
+	// must not strip it (it previously did, leaking the tapback through as the
+	// literal text `Loved "see you then."`).
+	mustUpsert(&Message{MessageID: "m4", ConversationID: "c1", Body: "see you then.", TimestampMS: 9000})
+	appliedDot, _ := store.ApplyTapback(&Message{ConversationID: "c1", SenderNumber: "+15551234567", Body: `Loved "see you then."`, TimestampMS: 10000})
+	if !appliedDot {
+		t.Error("expected a tapback on a period-terminated message to match exactly")
+	}
+	if target, _ := store.GetMessageByID("m4"); target == nil || !strings.Contains(target.Reactions, "❤️") {
+		t.Errorf("expected ❤️ reaction on m4 (period-terminated), got %v", target)
+	}
 }
 
 func TestRepairTapbacks(t *testing.T) {
