@@ -13,6 +13,11 @@ const messageColumns = `message_id, conversation_id, sender_name, sender_number,
 
 var ErrMessageNotFound = errors.New("message not found")
 
+const (
+	MaxTranscriptBytes      = 64 << 10
+	MaxTranscriptModelBytes = 128
+)
+
 func (s *Store) UpsertMessage(m *Message) error {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -23,7 +28,11 @@ func (s *Store) UpsertMessage(m *Message) error {
 	if err := upsertMessageTx(tx, m); err != nil {
 		return err
 	}
-	if err := s.syncMessageSearchIndex(tx, m.MessageID, m.Body); err != nil {
+	body, err := messageSearchBodyTx(tx, m.MessageID)
+	if err != nil {
+		return err
+	}
+	if err := s.syncMessageSearchIndex(tx, m.MessageID, body); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -109,7 +118,11 @@ func (s *Store) RecordOutgoingMessage(m *Message, deleteDraftID string) error {
 	if err := upsertMessageTx(tx, m); err != nil {
 		return err
 	}
-	if err := s.syncMessageSearchIndex(tx, m.MessageID, m.Body); err != nil {
+	body, err := messageSearchBodyTx(tx, m.MessageID)
+	if err != nil {
+		return err
+	}
+	if err := s.syncMessageSearchIndex(tx, m.MessageID, body); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(`UPDATE conversations SET last_message_ts = ? WHERE conversation_id = ?`, m.TimestampMS, m.ConversationID); err != nil {
@@ -121,6 +134,14 @@ func (s *Store) RecordOutgoingMessage(m *Message, deleteDraftID string) error {
 		}
 	}
 	return tx.Commit()
+}
+
+func messageSearchBodyTx(tx *sql.Tx, messageID string) (string, error) {
+	var body string
+	if err := tx.QueryRow(`SELECT body FROM messages WHERE message_id = ?`, messageID).Scan(&body); err != nil {
+		return "", err
+	}
+	return body, nil
 }
 
 func (s *Store) GetMessagesByConversation(conversationID string, limit int) ([]*Message, error) {
@@ -796,6 +817,9 @@ func (s *Store) SetMessageTranscript(messageID, transcript string, model *string
 	if messageID == "" {
 		return fmt.Errorf("SetMessageTranscript: empty message_id")
 	}
+	if err := ValidateMessageTranscript(transcript, model); err != nil {
+		return err
+	}
 	msg, err := s.GetMessageByID(messageID)
 	if err != nil {
 		return fmt.Errorf("SetMessageTranscript: get message: %w", err)
@@ -838,6 +862,16 @@ func (s *Store) SetMessageTranscript(messageID, transcript string, model *string
 	}
 	if n == 0 {
 		return ErrMessageNotFound
+	}
+	return nil
+}
+
+func ValidateMessageTranscript(transcript string, model *string) error {
+	if len(transcript) > MaxTranscriptBytes {
+		return fmt.Errorf("transcript exceeds %d bytes", MaxTranscriptBytes)
+	}
+	if model != nil && len(*model) > MaxTranscriptModelBytes {
+		return fmt.Errorf("transcript model exceeds %d bytes", MaxTranscriptModelBytes)
 	}
 	return nil
 }

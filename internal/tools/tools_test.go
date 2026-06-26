@@ -2,6 +2,7 @@ package tools
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -460,6 +461,47 @@ func TestSendMessageSMSPersistsConversationAndOutgoingMessage(t *testing.T) {
 	}
 	if message.Body != "hi sms" {
 		t.Fatalf("unexpected structured message: %#v", message)
+	}
+}
+
+func TestSendMessageLookupAuthErrorMarksDisconnected(t *testing.T) {
+	a := testApp(t)
+	a.Connected.Store(true)
+	a.SessionPath = filepath.Join(t.TempDir(), "session.json")
+	if err := os.WriteFile(a.SessionPath, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	originalGetOrCreateGoogleConversation := getOrCreateGoogleConversation
+	getOrCreateGoogleConversation = func(_ *app.App, phone string) (*gmproto.Conversation, error) {
+		return nil, errors.New("HTTP 401: invalid authentication credentials")
+	}
+	t.Cleanup(func() {
+		getOrCreateGoogleConversation = originalGetOrCreateGoogleConversation
+	})
+
+	handler := sendMessageHandler(a)
+	req := mcp.CallToolRequest{}
+	req.Params.Arguments = map[string]any{
+		"phone_number": "+15551230000",
+		"message":      "hi sms",
+	}
+	result, err := handler(context.Background(), req)
+	if err != nil {
+		t.Fatalf("handler error: %v", err)
+	}
+	if !result.IsError {
+		t.Fatal("expected error result")
+	}
+	status := a.GoogleStatus()
+	if status.Connected {
+		t.Fatal("auth-invalid lookup error should mark Google disconnected")
+	}
+	if status.NeedsRepair {
+		t.Fatal("auth-invalid lookup error should use cookie-refresh reconnect, not repair")
+	}
+	if !strings.Contains(status.LastError, "session cookie expired") {
+		t.Fatalf("last error = %q, want session cookie expired message", status.LastError)
 	}
 }
 

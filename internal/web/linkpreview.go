@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net"
 	"net/http"
 	"net/url"
@@ -23,6 +24,8 @@ var (
 	ErrNoLinkPreview         = errors.New("no link preview available")
 )
 
+const maxLinkPreviewImageBytes = 5 << 20
+
 type LinkPreview struct {
 	URL         string `json:"url,omitempty"`
 	Title       string `json:"title,omitempty"`
@@ -33,6 +36,7 @@ type LinkPreview struct {
 }
 
 type LinkPreviewFetcher func(ctx context.Context, rawURL string) (*LinkPreview, error)
+type LinkPreviewImageFetcher func(ctx context.Context, rawURL string) ([]byte, string, error)
 
 type linkPreviewCacheEntry struct {
 	preview   *LinkPreview
@@ -184,6 +188,67 @@ func (s *LinkPreviewService) Fetch(ctx context.Context, rawURL string) (*LinkPre
 
 	s.store(normalizedURL, preview)
 	return cloneLinkPreview(preview), nil
+}
+
+func (s *LinkPreviewService) FetchImage(ctx context.Context, rawURL string) ([]byte, string, error) {
+	normalizedURL, parsedURL, err := normalizeLinkPreviewURL(rawURL)
+	if err != nil {
+		return nil, "", err
+	}
+	if !s.allowPrivateHosts {
+		if err := ensurePublicPreviewHost(ctx, parsedURL); err != nil {
+			return nil, "", err
+		}
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, normalizedURL, nil)
+	if err != nil {
+		return nil, "", fmt.Errorf("%w: %v", ErrInvalidLinkPreviewURL, err)
+	}
+	req.Header.Set("User-Agent", "OpenMessage/1.0 (+https://openmessage.ai)")
+	req.Header.Set("Accept", "image/avif,image/webp,image/apng,image/png,image/jpeg,image/gif,*/*;q=0.8")
+
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return nil, "", fmt.Errorf("fetch link preview image: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.Request != nil && resp.Request.URL != nil && !s.allowPrivateHosts {
+		if err := ensurePublicPreviewHost(ctx, resp.Request.URL); err != nil {
+			return nil, "", err
+		}
+	}
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusBadRequest {
+		return nil, "", fmt.Errorf("fetch link preview image: unexpected status %d", resp.StatusCode)
+	}
+
+	contentType, _, err := mime.ParseMediaType(resp.Header.Get("Content-Type"))
+	if err != nil || strings.TrimSpace(contentType) == "" {
+		contentType = http.DetectContentType(nil)
+	}
+	contentType = strings.ToLower(strings.TrimSpace(contentType))
+	if !isAllowedLinkPreviewImageType(contentType) {
+		return nil, "", ErrNoLinkPreview
+	}
+	limited := io.LimitReader(resp.Body, maxLinkPreviewImageBytes+1)
+	data, err := io.ReadAll(limited)
+	if err != nil {
+		return nil, "", fmt.Errorf("read link preview image: %w", err)
+	}
+	if len(data) > maxLinkPreviewImageBytes {
+		return nil, "", fmt.Errorf("link preview image exceeds %d bytes", maxLinkPreviewImageBytes)
+	}
+	return data, contentType, nil
+}
+
+func isAllowedLinkPreviewImageType(contentType string) bool {
+	switch strings.ToLower(strings.TrimSpace(contentType)) {
+	case "image/avif", "image/webp", "image/apng", "image/png", "image/jpeg", "image/gif":
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *LinkPreviewService) cached(rawURL string) *LinkPreview {

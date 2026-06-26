@@ -145,13 +145,18 @@ func TestHandleMessage_BumpsConversationTimestamp(t *testing.T) {
 
 func TestHandleRecoveryEvents_TriggerRealtimeGapCallback(t *testing.T) {
 	var reasons []string
+	var phoneResponding []bool
 	handler := &EventHandler{
 		Logger: zerolog.Nop(),
 		OnRealtimeGapRecovered: func(reason string) {
 			reasons = append(reasons, reason)
 		},
+		OnPhoneRespondingChange: func(responding bool) {
+			phoneResponding = append(phoneResponding, responding)
+		},
 	}
 
+	handler.Handle(&events.PhoneNotResponding{})
 	handler.Handle(&events.ListenRecovered{})
 	handler.Handle(&events.PhoneRespondingAgain{})
 
@@ -163,6 +168,12 @@ func TestHandleRecoveryEvents_TriggerRealtimeGapCallback(t *testing.T) {
 	}
 	if reasons[1] != "phone_responding_again" {
 		t.Fatalf("second recovery reason = %q, want %q", reasons[1], "phone_responding_again")
+	}
+	if len(phoneResponding) != 2 {
+		t.Fatalf("phone responding callback count = %d, want 2", len(phoneResponding))
+	}
+	if phoneResponding[0] != false || phoneResponding[1] != true {
+		t.Fatalf("phone responding callbacks = %v, want [false true]", phoneResponding)
 	}
 }
 

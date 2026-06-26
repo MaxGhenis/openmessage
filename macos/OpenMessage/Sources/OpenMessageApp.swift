@@ -51,6 +51,8 @@ private final class SettingsViewModel: ObservableObject {
             let connected: Bool
             let paired: Bool
             let needs_pairing: Bool
+            let needs_repair: Bool?
+            let phone_responding: Bool?
         }
 
         struct BackfillStatus: Decodable {
@@ -254,6 +256,18 @@ private struct AppSettingsView: View {
                         backend.beginGooglePairing()
                     }
                     .buttonStyle(.borderedProminent)
+                } else if googleNeedsRepair {
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text("Google Messages needs to be paired again.")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+
+                        Button("Pair again") {
+                            openMainWindow()
+                            backend.beginGooglePairing()
+                        }
+                        .buttonStyle(.borderedProminent)
+                    }
                 } else if googleNeedsReconnect {
                     Button("Reconnect") {
                         Task {
@@ -267,6 +281,12 @@ private struct AppSettingsView: View {
                         HStack(spacing: 10) {
                             Button("Open inbox") {
                                 openMainWindow()
+                            }
+                            .buttonStyle(.bordered)
+
+                            Button("Pair again") {
+                                openMainWindow()
+                                backend.beginGooglePairing()
                             }
                             .buttonStyle(.bordered)
 
@@ -423,11 +443,18 @@ private struct AppSettingsView: View {
 
     private var googleNeedsReconnect: Bool {
         guard let google = model.appStatus.google else { return false }
-        return google.paired && !google.connected && !google.needs_pairing
+        return google.paired && !google.connected && !google.needs_pairing && google.needs_repair != true
+    }
+
+    private var googleNeedsRepair: Bool {
+        guard let google = model.appStatus.google else { return false }
+        return google.paired && google.needs_repair == true
     }
 
     private var googleStatusText: String {
         guard let google = model.appStatus.google else { return "Unavailable" }
+        if google.paired && google.needs_repair == true { return "Needs re-pair" }
+        if google.connected && google.phone_responding == false { return "Phone offline" }
         if google.connected { return "Connected" }
         if google.paired && !google.needs_pairing { return "Needs reconnect" }
         return "Needs pairing"

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/rs/zerolog"
@@ -140,6 +141,89 @@ func TestGoogleSendOutcomeRepairFlag(t *testing.T) {
 	}
 }
 
+func TestGooglePhoneRespondingStatus(t *testing.T) {
+	a := &App{}
+	a.SessionPath = filepath.Join(t.TempDir(), "session.json")
+	if err := os.WriteFile(a.SessionPath, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if !a.GoogleStatus().PhoneResponding {
+		t.Fatal("unknown phone responding state should default to true")
+	}
+	a.RecordGooglePhoneResponding(false)
+	if a.GoogleStatus().PhoneResponding {
+		t.Fatal("PhoneNotResponding should surface in GoogleStatus")
+	}
+	a.RecordGooglePhoneResponding(true)
+	if !a.GoogleStatus().PhoneResponding {
+		t.Fatal("PhoneRespondingAgain should clear the offline state")
+	}
+}
+
+func TestPhoneOfflineFailuresDoNotMarkGoogleForRepair(t *testing.T) {
+	a := &App{}
+	a.SessionPath = filepath.Join(t.TempDir(), "session.json")
+	if err := os.WriteFile(a.SessionPath, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	for range googleRepairThreshold {
+		a.RecordGoogleSendOutcomeWithPhone(false, false)
+	}
+	if a.googleSendFailures.Load() != 0 {
+		t.Fatalf("googleSendFailures = %d, want 0", a.googleSendFailures.Load())
+	}
+	if a.GoogleStatus().NeedsRepair {
+		t.Fatal("phone-offline failures should not mark Google as needing repair")
+	}
+}
+
+func TestSuccessfulGoogleSendMarksPhoneResponding(t *testing.T) {
+	a := &App{}
+	a.SessionPath = filepath.Join(t.TempDir(), "session.json")
+	if err := os.WriteFile(a.SessionPath, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	a.RecordGooglePhoneResponding(false)
+	if a.GooglePhoneResponding() {
+		t.Fatal("expected phone responding false after explicit offline event")
+	}
+	a.RecordGoogleSendOutcomeWithPhone(true, false)
+	if !a.GooglePhoneResponding() {
+		t.Fatal("successful send should mark phone responding true")
+	}
+}
+
+func TestGoogleSendRejectedMessageUsesPhoneReachability(t *testing.T) {
+	offline := GoogleSendRejectedMessage("UNKNOWN", false)
+	if !strings.Contains(offline, "phone isn't responding") {
+		t.Fatalf("offline error should mention phone reachability, got %q", offline)
+	}
+	stale := GoogleSendRejectedMessage("UNKNOWN", true)
+	if !strings.Contains(stale, "Pair again") {
+		t.Fatalf("responding-phone error should mention re-pairing, got %q", stale)
+	}
+}
+
+func TestRecordGoogleSendErrorOnlyMarksAuthInvalidForRepair(t *testing.T) {
+	a := &App{}
+	a.SessionPath = filepath.Join(t.TempDir(), "session.json")
+	if err := os.WriteFile(a.SessionPath, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	a.RecordGoogleSendError(errors.New("dial tcp: i/o timeout"))
+	if a.GoogleStatus().NeedsRepair {
+		t.Fatal("transient network send errors should not mark needs_repair")
+	}
+
+	a.RecordGoogleSendError(errors.New("send message: HTTP 401: invalid authentication credentials"))
+	if !a.GoogleStatus().NeedsRepair {
+		t.Fatal("auth-invalid send errors should mark needs_repair")
+	}
+}
+
 func TestIsGoogleAuthInvalid(t *testing.T) {
 	cases := []struct {
 		name string
@@ -158,5 +242,54 @@ func TestIsGoogleAuthInvalid(t *testing.T) {
 				t.Fatalf("isGoogleAuthInvalid(%v) = %v, want %v", c.err, got, c.want)
 			}
 		})
+	}
+}
+
+func TestHandleGoogleAuthExpiredErrorMarksDisconnected(t *testing.T) {
+	a := &App{Logger: zerolog.Nop()}
+	a.Connected.Store(true)
+	a.googleNeedsRepair.Store(true)
+	a.googleSendFailures.Store(googleRepairThreshold)
+	statusEmitted := false
+	a.OnStatusChange = func(connected bool) {
+		statusEmitted = true
+		if connected {
+			t.Fatal("expected disconnected status event")
+		}
+	}
+
+	err := errors.New("send message: HTTP 401: 16: Request had invalid authentication credentials")
+	if !a.HandleGoogleAuthExpiredError(err) {
+		t.Fatal("expected auth-expired error to be handled")
+	}
+	if a.Connected.Load() {
+		t.Fatal("expected Google connection to be marked disconnected")
+	}
+	if !statusEmitted {
+		t.Fatal("expected status change event")
+	}
+	if !a.googleNeedsRepair.Load() {
+		t.Fatal("auth expiry must NOT clear an existing repair flag: clearing it defeats the reconnect-watchdog back-off and storms Google's auth endpoint on platforms with no cookie-refresh script (e.g. macOS)")
+	}
+	if got := a.GoogleStatus().LastError; got != googleAuthExpiredStatusMessage {
+		t.Fatalf("last error = %q, want %q", got, googleAuthExpiredStatusMessage)
+	}
+	if !a.GoogleStatus().AuthExpired {
+		t.Fatal("expected auth-expired status flag")
+	}
+
+	a.setGoogleLastError("Google Messages connection lost; reconnecting...")
+	if !a.GoogleStatus().AuthExpired {
+		t.Fatal("auth-expired flag should survive generic reconnect last-error text")
+	}
+
+	if a.HandleGoogleAuthExpiredError(errors.New("temporary failure in name resolution")) {
+		t.Fatal("network errors should not be treated as auth expiry")
+	}
+}
+
+func TestIsGoogleAuthExpiredErrorRecognizesFriendlyStatus(t *testing.T) {
+	if !IsGoogleAuthExpiredError(errors.New(googleAuthExpiredStatusMessage)) {
+		t.Fatal("expected friendly auth-expired status to be recognized")
 	}
 }

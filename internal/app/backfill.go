@@ -40,6 +40,17 @@ func orphanContactDiscoveryEnabled() bool {
 	}
 }
 
+func (a *App) abortBackfillForGoogleAuthError(err error, phase, detail string) bool {
+	if !a.HandleGoogleAuthExpiredError(err) {
+		return false
+	}
+	if detail != "" {
+		a.BackfillProgress.addError(detail)
+	}
+	a.Logger.Warn().Err(err).Str("phase", phase).Msg("Deep backfill aborted because Google auth expired")
+	return true
+}
+
 // Backfill fetches existing conversations and recent messages from
 // Google Messages and stores them in the local database.
 func (a *App) Backfill() error {
@@ -57,6 +68,7 @@ func (a *App) Backfill() error {
 
 	resp, err := cli.GM.ListConversations(100, gmproto.ListConversationsRequest_INBOX)
 	if err != nil {
+		a.HandleGoogleAuthExpiredError(err)
 		return fmt.Errorf("list conversations: %w", err)
 	}
 
@@ -71,6 +83,9 @@ func (a *App) Backfill() error {
 
 		msgResp, err := cli.GM.FetchMessages(conv.GetConversationID(), 20, nil)
 		if err != nil {
+			if a.HandleGoogleAuthExpiredError(err) {
+				return fmt.Errorf("fetch messages %s: %w", conv.GetConversationID(), err)
+			}
 			a.Logger.Warn().Err(err).Str("conv_id", conv.GetConversationID()).Msg("Failed to fetch messages")
 			continue
 		}
@@ -194,6 +209,9 @@ func (a *App) paginateFolder(gm GMClient, folder gmproto.ListConversationsReques
 		}
 		resp, err := gm.ListConversationsWithCursor(100, folder, cursor)
 		if err != nil {
+			if a.abortBackfillForGoogleAuthError(err, "folders", fmt.Sprintf("list %s: %v", folder.String(), err)) {
+				return found, true
+			}
 			a.Logger.Error().Err(err).Str("folder", folder.String()).Msg("Deep backfill: list conversations failed")
 			a.BackfillProgress.addError(fmt.Sprintf("list %s: %v", folder.String(), err))
 			break
@@ -260,6 +278,9 @@ func (a *App) deepBackfillConversationWithToken(gm GMClient, convID string, clie
 		}
 		resp, err := gm.FetchMessages(convID, 50, cursor)
 		if err != nil {
+			if a.abortBackfillForGoogleAuthError(err, "messages", fmt.Sprintf("fetch messages %s: %v", convID, err)) {
+				return total, true
+			}
 			a.Logger.Warn().Err(err).Str("conv_id", convID).Msg("Deep backfill: fetch messages failed")
 			a.BackfillProgress.addError(fmt.Sprintf("fetch messages %s: %v", convID, err))
 			break
@@ -305,6 +326,9 @@ func (a *App) discoverFromContacts(gm GMClient, seen map[string]bool, clientToke
 	}
 	contactsResp, err := gm.ListContacts()
 	if err != nil {
+		if a.abortBackfillForGoogleAuthError(err, "contacts", fmt.Sprintf("list contacts: %v", err)) {
+			return true
+		}
 		a.Logger.Warn().Err(err).Msg("Deep backfill: list contacts failed")
 		a.BackfillProgress.addError(fmt.Sprintf("list contacts: %v", err))
 		return false
@@ -335,6 +359,9 @@ func (a *App) discoverFromContacts(gm GMClient, seen map[string]bool, clientToke
 			},
 		})
 		if err != nil {
+			if a.abortBackfillForGoogleAuthError(err, "contacts", fmt.Sprintf("get or create conversation %s: %v", phone, err)) {
+				return true
+			}
 			a.Logger.Debug().Err(err).Str("phone", phone).Msg("Deep backfill: GetOrCreateConversation failed for contact")
 			a.BackfillProgress.addError("")
 			continue
@@ -383,6 +410,7 @@ func (a *App) BackfillConversationByPhone(phone string) error {
 		Numbers: NewContactNumbers([]string{phone}),
 	})
 	if err != nil {
+		a.HandleGoogleAuthExpiredError(err)
 		return fmt.Errorf("get or create conversation: %w", err)
 	}
 
@@ -424,6 +452,10 @@ func (a *App) reconcileRecentConversations(reason string) {
 
 	resp, err := gm.ListConversationsWithCursor(recentReconcileConversationLimit, gmproto.ListConversationsRequest_INBOX, nil)
 	if err != nil {
+		if a.HandleGoogleAuthExpiredError(err) {
+			a.Logger.Warn().Err(err).Str("reason", reason).Msg("Recent reconcile aborted because Google auth expired")
+			return
+		}
 		a.Logger.Warn().Err(err).Str("reason", reason).Msg("Recent reconcile: list conversations failed")
 		return
 	}
@@ -486,6 +518,9 @@ func (a *App) reconcileRecentConversationMessages(gm GMClient, convID string, cl
 
 		msgResp, err := gm.FetchMessages(convID, recentReconcileMessageLimit, cursor)
 		if err != nil {
+			if a.HandleGoogleAuthExpiredError(err) {
+				return storedAny, true
+			}
 			a.Logger.Warn().Err(err).Str("conv_id", convID).Int("page", page).Msg("Recent reconcile: fetch messages failed")
 			return storedAny, false
 		}
@@ -546,6 +581,9 @@ func (a *App) refreshPendingMediaMessageAttempt(convID, messageID string) (bool,
 		}
 		msgResp, err := gm.FetchMessages(convID, recentReconcileMessageLimit, cursor)
 		if err != nil {
+			if a.HandleGoogleAuthExpiredError(err) {
+				return false, true
+			}
 			a.Logger.Warn().Err(err).Str("conv_id", convID).Str("msg_id", messageID).Msg("Pending media refresh fetch failed")
 			return false, false
 		}

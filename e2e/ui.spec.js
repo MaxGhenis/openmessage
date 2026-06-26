@@ -33,6 +33,45 @@ async function expectLastMessageVisible(page) {
     .toBe(true);
 }
 
+async function rememberStableThreadNode(page) {
+  await page.locator('#messages-area .msg').first().waitFor();
+  await page.evaluate(() => {
+    const node = document.querySelector('#messages-area .msg');
+    if (!node) throw new Error('message node not found');
+    node.dataset.e2eStableThreadNode = 'true';
+    window.__openMessageStableThreadNode = node;
+  });
+}
+
+async function expectStableThreadNodeStillMounted(page) {
+  await expect
+    .poll(async () => page.evaluate(() => {
+      const node = window.__openMessageStableThreadNode;
+      return !!node && node.isConnected && node.dataset.e2eStableThreadNode === 'true';
+    }))
+    .toBe(true);
+}
+
+async function rememberStableSidebarRow(page, rowText) {
+  await page.locator('#conversation-list .convo-item').filter({ hasText: rowText }).first().waitFor();
+  await page.evaluate((text) => {
+    const rows = Array.from(document.querySelectorAll('#conversation-list .convo-item'));
+    const row = rows.find(el => el.textContent.includes(text));
+    if (!row) throw new Error('sidebar row not found');
+    row.dataset.e2eStableSidebarRow = 'true';
+    window.__openMessageStableSidebarRow = row;
+  }, rowText);
+}
+
+async function expectStableSidebarRowStillMounted(page) {
+  await expect
+    .poll(async () => page.evaluate(() => {
+      const row = window.__openMessageStableSidebarRow;
+      return !!row && row.isConnected && row.dataset.e2eStableSidebarRow === 'true';
+    }))
+    .toBe(true);
+}
+
 async function installFakeNotifications(page) {
   await page.evaluate(() => {
     const created = [];
@@ -226,6 +265,7 @@ test('shows live Signal history import progress after pairing starts', async ({ 
     });
   });
 
+  await page.reload();
   await openPlatforms(page);
 
   await expect(page.locator('#signal-status-pill')).toHaveText('Importing history');
@@ -399,6 +439,11 @@ test('renders clickable links with a social preview card', async ({ page, reques
   await expect(linkedMessage.locator('a.msg-link')).toHaveAttribute('href', 'https://example.com/story');
   await expect(linkedMessage.locator('.msg-link-preview')).toContainText('Example Story');
   await expect(linkedMessage.locator('.msg-link-preview')).toContainText('Example');
+  const previewImage = linkedMessage.locator('.msg-link-preview-media img');
+  await expect(previewImage).toHaveAttribute('src', /\/api\/link-preview-image\?url=/);
+  await expect
+    .poll(async () => previewImage.evaluate((img) => img.complete && img.naturalWidth > 0))
+    .toBe(true);
 });
 
 test('shows latest message previews in sidebar rows', async ({ page, request }) => {
@@ -505,6 +550,7 @@ test('keeps the thread header compact with actions after search', async ({ page 
       source: rectFor('#chat-header-source'),
       search: rectFor('.thread-search-input-wrap'),
       notification: rectFor('#chat-header-notification-btn'),
+      favorite: rectFor('#chat-header-favorite-btn'),
     };
   });
   const centerY = (rect) => rect.top + rect.height / 2;
@@ -515,19 +561,114 @@ test('keeps the thread header compact with actions after search', async ({ page 
 
   await openConversation(page, 'Sarah Chen');
   const layout = await readHeaderLayout();
-  expect(layout.header.height).toBeLessThanOrEqual(74);
+  expect(layout.header.height).toBeLessThanOrEqual(64);
   expect(Math.abs(centerY(layout.name) - centerY(layout.source))).toBeLessThanOrEqual(12);
   expect(layout.source.left).toBeGreaterThan(layout.name.right);
   expect(layout.notification.left).toBeGreaterThan(layout.search.right);
+  expect(layout.favorite.left).toBeGreaterThan(layout.notification.right);
 
   await page.setViewportSize({ width: 920, height: 700 });
   await page.reload();
   await openConversation(page, 'Sarah Chen');
   const mediumLayout = await readHeaderLayout();
-  for (const rect of [mediumLayout.name, mediumLayout.source, mediumLayout.search, mediumLayout.notification]) {
+  for (const rect of [mediumLayout.name, mediumLayout.source, mediumLayout.search, mediumLayout.notification, mediumLayout.favorite]) {
     expectInsideHeader(mediumLayout, rect);
   }
   expect(mediumLayout.notification.left).toBeGreaterThan(mediumLayout.search.right);
+  expect(mediumLayout.favorite.left).toBeGreaterThan(mediumLayout.notification.right);
+});
+
+test('keeps sidebar search and tabs tightly stacked', async ({ page }) => {
+  const layout = await page.evaluate(() => {
+    const header = document.querySelector('.sidebar-header').getBoundingClientRect();
+    const search = document.querySelector('.search-box').getBoundingClientRect();
+    const tabs = document.querySelector('.sidebar-tabs-row').getBoundingClientRect();
+    return {
+      headerHeight: header.height,
+      headerToSearch: search.top - header.bottom,
+      searchToTabs: tabs.top - search.bottom,
+    };
+  });
+
+  expect(layout.headerHeight).toBeLessThanOrEqual(72);
+  expect(layout.headerToSearch).toBeLessThanOrEqual(10);
+  expect(layout.searchToTabs).toBeLessThanOrEqual(8);
+});
+
+test('favorites conversations from the header and row context menu', async ({ page, request }) => {
+  await request.post('/api/conversations/conv1/favorite', { data: { favorite: false } });
+  await request.post('/api/conversations/conv2/favorite', { data: { favorite: false } });
+  await request.post('/api/mark-read', { data: { conversation_id: 'conv2' } });
+  await page.reload();
+
+  await openConversation(page, 'Sarah Chen');
+  await request.post('/_e2e/messages', {
+    data: {
+      conversation_id: 'conv2',
+      body: `Favorite badge check ${Date.now()}`,
+      sender_name: 'Marcus Johnson',
+      sender_number: '+12125559876',
+      timestamp_ms: 1738956601000,
+    },
+  });
+
+  const headerFavorite = page.locator('#chat-header-favorite-btn');
+  await expect(headerFavorite).toHaveAttribute('aria-pressed', 'false');
+  await headerFavorite.click();
+  await expect(page.locator('#chat-header-favorite-btn')).toHaveAttribute('aria-pressed', 'true');
+
+  const sarahFavorite = page.locator('#favorites-rail .favorite-chip[title="Sarah Chen"]');
+  await expect(sarahFavorite).toBeVisible();
+  await expect(sarahFavorite).toHaveClass(/active/);
+  await expect(sarahFavorite).toHaveAttribute('aria-current', 'page');
+  await expect
+    .poll(async () => page.evaluate(() => {
+      const tabs = document.querySelector('.sidebar-tabs-row')?.getBoundingClientRect();
+      const rail = document.querySelector('#favorites-rail')?.getBoundingClientRect();
+      const list = document.querySelector('#conversation-list')?.getBoundingClientRect();
+      if (!tabs || !rail || !list) return false;
+      return rail.top >= tabs.bottom - 1 && rail.bottom <= list.top + 1;
+    }))
+    .toBe(true);
+
+  const marcusRow = page.locator('#conversation-list .convo-item').filter({ hasText: 'Marcus Johnson' }).first();
+  await expect(marcusRow.locator('.convo-unread')).toHaveText('1');
+  await marcusRow.click({ button: 'right' });
+  await page.locator('#context-menu .context-menu-item').getByText('Add to favorites', { exact: true }).click();
+
+  const marcusFavorite = page.locator('#favorites-rail .favorite-chip[title="Marcus Johnson"]');
+  await expect(marcusFavorite).toBeVisible();
+  await expect(marcusFavorite.locator('.favorite-unread')).toHaveText('1');
+
+  await marcusFavorite.click();
+  await expect(page.locator('#chat-header-name')).toHaveText('Marcus Johnson');
+  await expect(marcusFavorite).toHaveClass(/active/);
+
+  await page.locator('#chat-header-favorite-btn').click();
+  await expect(page.locator('#favorites-rail .favorite-chip[title="Marcus Johnson"]')).toHaveCount(0);
+
+  await sarahFavorite.click();
+  await expect(page.locator('#chat-header-name')).toHaveText('Sarah Chen');
+  await page.locator('#chat-header-favorite-btn').click();
+  await expect(page.locator('#favorites-rail .favorite-chip[title="Sarah Chen"]')).toHaveCount(0);
+});
+
+test('keeps global search active when favoriting a search result', async ({ page, request }) => {
+  await request.post('/api/conversations/conv2/favorite', { data: { favorite: false } });
+  await page.reload();
+
+  await page.locator('#search-input').fill('Marcus');
+  const marcusRow = page.locator('#conversation-list .convo-item').filter({ hasText: 'Marcus Johnson' }).first();
+  await expect(marcusRow).toBeVisible();
+  await expect(page.locator('#conversation-list')).not.toContainText('Sarah Chen');
+
+  await marcusRow.click({ button: 'right' });
+  await page.locator('#context-menu .context-menu-item').getByText('Add to favorites', { exact: true }).click();
+
+  await expect(page.locator('#search-input')).toHaveValue('Marcus');
+  await expect(page.locator('#conversation-list')).toContainText('Marcus Johnson');
+  await expect(page.locator('#conversation-list')).not.toContainText('Sarah Chen');
+  await expect(page.locator('#favorites-rail .favorite-chip[title="Marcus Johnson"]')).toBeVisible();
 });
 
 test('inserts emoji into the compose message', async ({ page }) => {
@@ -555,6 +696,26 @@ test('centers the compose card in the bottom input layer', async ({ page }) => {
     };
   });
   expect(Math.abs(gaps.top - gaps.bottom)).toBeLessThanOrEqual(2);
+});
+
+test('keeps compose tool buttons tightly grouped', async ({ page }) => {
+  await openConversation(page, 'Sarah Chen');
+
+  const gaps = await page.evaluate(() => {
+    const rectFor = (selector) => document.querySelector(selector).getBoundingClientRect();
+    const attach = rectFor('#attach-btn');
+    const gif = rectFor('#compose-gif-btn');
+    const emoji = rectFor('#compose-emoji-btn');
+    const input = rectFor('#compose-input');
+    return {
+      attachToGif: gif.left - attach.right,
+      gifToEmoji: emoji.left - gif.right,
+      emojiToInput: input.left - emoji.right,
+    };
+  });
+  expect(gaps.attachToGif).toBeLessThanOrEqual(5);
+  expect(gaps.gifToEmoji).toBeLessThanOrEqual(5);
+  expect(gaps.emojiToInput).toBeGreaterThanOrEqual(8);
 });
 
 test('hydrates cached Google contact photos into avatars', async ({ page, request }) => {
@@ -610,6 +771,42 @@ test('new message surfaces existing routes for the same number', async ({ page }
   await expect(page.locator('#new-msg-go')).toContainText('Open SMS route');
 });
 
+test('forwards text and media messages', async ({ page }) => {
+  const textToForward = 'There is a new Thai place on Valencia';
+
+  await openConversation(page, 'Sarah Chen');
+  const textMessage = page.locator('#messages-area .msg').filter({ hasText: textToForward }).first();
+  await textMessage.hover();
+  await expect(textMessage.locator('.action-forward')).toBeVisible();
+  await textMessage.locator('.action-forward').click();
+
+  await expect(page.locator('#forward-overlay')).toBeVisible();
+  await expect(page.locator('#forward-preview')).toContainText(textToForward);
+  await page.locator('#forward-search').fill('Marcus');
+  await page.locator('#forward-list .forward-target').filter({ hasText: 'Marcus Johnson' }).click();
+
+  await expect(page.locator('#thread-feedback')).toContainText('Forwarded to Marcus Johnson.');
+  await openConversation(page, 'Marcus Johnson');
+  await expect(page.locator('#messages-area')).toContainText(textToForward);
+
+  await openConversation(page, 'Jordan Rivera');
+  await expect(page.locator('#chat-header-source .chat-route-tab.active')).toContainText('WhatsApp');
+  const mediaMessage = page.locator('#messages-area .msg').filter({ hasText: 'Lisbon photo' }).last();
+  await expect(mediaMessage.locator('img[src*="/api/media/"]')).toBeVisible();
+  await mediaMessage.click({ button: 'right' });
+  await page.locator('#context-menu .context-menu-item[data-action="forward-message"]').click();
+
+  await expect(page.locator('#forward-overlay')).toBeVisible();
+  await expect(page.locator('#forward-preview')).toContainText('Image: Lisbon photo');
+  await page.locator('#forward-search').fill('Taylor');
+  await page.locator('#forward-list .forward-target').filter({ hasText: 'Taylor Price' }).click();
+
+  await expect(page.locator('#thread-feedback')).toContainText('Forwarded to Taylor Price.');
+  await openConversation(page, 'Taylor Price');
+  const forwardedMedia = page.locator('#messages-area .msg').filter({ hasText: 'Lisbon photo' }).last();
+  await expect(forwardedMedia.locator('img[src*="/api/media/"]')).toBeVisible();
+});
+
 test('sends a message through the compose box', async ({ page }) => {
   const outbound = `Playwright outbound ${Date.now()}`;
 
@@ -618,6 +815,18 @@ test('sends a message through the compose box', async ({ page }) => {
   await page.locator('#send-btn').click();
 
   await expect(page.locator('#messages-area')).toContainText(outbound);
+});
+
+test('keeps existing thread nodes mounted after sending', async ({ page }) => {
+  const outbound = `Stable send ${Date.now()}`;
+
+  await openConversation(page, 'Sarah Chen');
+  await rememberStableThreadNode(page);
+  await page.locator('#compose-input').fill(outbound);
+  await page.locator('#send-btn').click();
+
+  await expect(page.locator('#messages-area')).toContainText(outbound);
+  await expectStableThreadNodeStillMounted(page);
 });
 
 test('sends a Signal text message through the compose box', async ({ page }) => {
@@ -650,6 +859,53 @@ test('sends a Signal image attachment through the compose box', async ({ page })
   const latestMessage = page.locator('#messages-area .msg').last();
   await expect(latestMessage.locator('img[src*="/api/media/"]')).toBeVisible();
   await expect(latestMessage.locator('.msg-media-loading')).toHaveCount(0);
+});
+
+test('ignores duplicate composer submissions while media send is in flight', async ({ page }) => {
+  let sendMediaRequests = 0;
+  let releaseSend;
+  const sendBlocked = new Promise(resolve => {
+    releaseSend = resolve;
+  });
+
+  await page.route('**/api/send-media', async route => {
+    sendMediaRequests += 1;
+    await sendBlocked;
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        message_id: 'signal:e2e-delayed-media',
+        status: 'SUCCESS',
+        success: true,
+      }),
+    });
+  });
+
+  await openConversation(page, 'Taylor Price');
+  await expect(page.locator('#chat-header-source')).toContainText('Signal');
+  await page.locator('#file-input').setInputFiles({
+    name: 'signal-delayed.png',
+    mimeType: 'image/png',
+    buffer: Buffer.from(
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO7Z9wAAAABJRU5ErkJggg==',
+      'base64',
+    ),
+  });
+
+  await expect(page.locator('#attach-preview')).toHaveClass(/active/);
+  await page.locator('#compose-input').press('Enter');
+  await expect.poll(() => sendMediaRequests).toBe(1);
+  await expect(page.locator('#send-btn')).toBeDisabled();
+
+  await page.locator('#compose-input').press('Enter');
+  await page.locator('#compose-input').press('Enter');
+  await page.waitForTimeout(150);
+  expect(sendMediaRequests).toBe(1);
+
+  releaseSend();
+  await expect(page.locator('#attach-preview')).not.toHaveClass(/active/);
+  expect(sendMediaRequests).toBe(1);
 });
 
 test('sends a captioned Signal image as one message, not two', async ({ page }) => {
@@ -686,6 +942,170 @@ test('sends a captioned Signal image as one message, not two', async ({ page }) 
   if (body) {
     expect(body).toContain(caption);
   }
+});
+
+test('sends a GIF through the compose picker', async ({ page }) => {
+  const caption = `GIF caption ${Date.now()}`;
+  let sendGIFPayload = null;
+  await page.route(/\/api\/gifs(?:\/trending)?\?/, async route => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        results: [{
+          title: 'Wave',
+          preview_url: 'data:image/gif;base64,R0lGODlhAQABAAAAACwAAAAAAQABAAA=',
+          url: 'https://media.klipy.com/fake/wave.gif',
+          mime_type: 'image/gif',
+          width: 1,
+          height: 1,
+        }],
+      }),
+    });
+  });
+  await page.route('**/api/send-gif', async route => {
+    sendGIFPayload = JSON.parse(route.request().postData() || '{}');
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ status: 'SUCCESS', success: true }),
+    });
+  });
+
+  await openConversation(page, 'Taylor Price');
+  await expect(page.locator('#chat-header-source')).toContainText('Signal');
+  await page.locator('#compose-input').fill(caption);
+  await page.locator('#compose-gif-btn').click();
+  await expect(page.locator('#compose-gif-panel.show')).toBeVisible();
+  await page.locator('#compose-gif-panel .gif-tile').first().click();
+
+  await expect.poll(() => sendGIFPayload).not.toBeNull();
+  expect(sendGIFPayload.conversation_id).toContain('signal:');
+  expect(sendGIFPayload.url).toBe('https://media.klipy.com/fake/wave.gif');
+  expect(sendGIFPayload.caption).toBe(caption);
+});
+
+test('debounces GIF search while typing', async ({ page }) => {
+  const gifRequests = [];
+  await page.route(/\/api\/gifs(?:\/trending)?\?/, async route => {
+    gifRequests.push(new URL(route.request().url()));
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        results: [{
+          title: 'Wave',
+          preview_url: 'data:image/gif;base64,R0lGODlhAQABAAAAACwAAAAAAQABAAA=',
+          url: 'https://media.klipy.com/fake/wave.gif',
+          mime_type: 'image/gif',
+          width: 1,
+          height: 1,
+        }],
+      }),
+    });
+  });
+
+  await openConversation(page, 'Taylor Price');
+  await page.locator('#compose-gif-btn').click();
+  await expect(page.locator('#compose-gif-panel .gif-tile')).toHaveCount(1);
+
+  gifRequests.length = 0;
+  await page.locator('#compose-gif-search').pressSequentially('cats', { delay: 60 });
+  await page.waitForTimeout(300);
+  expect(gifRequests).toHaveLength(0);
+
+  await page.waitForTimeout(350);
+  expect(gifRequests).toHaveLength(1);
+  expect(gifRequests[0].pathname).toBe('/api/gifs');
+  expect(gifRequests[0].searchParams.get('q')).toBe('cats');
+});
+
+test('loads more GIFs when scrolling the picker', async ({ page }) => {
+  const gifRequests = [];
+  await page.route(/\/api\/gifs(?:\/trending)?\?/, async route => {
+    const url = new URL(route.request().url());
+    gifRequests.push(url);
+    const pageNumber = Number(url.searchParams.get('page') || '1');
+    const results = Array.from({ length: 32 }, (_, index) => ({
+      title: `Wave ${pageNumber}-${index}`,
+      preview_url: 'data:image/gif;base64,R0lGODlhAQABAAAAACwAAAAAAQABAAA=',
+      url: `https://media.klipy.com/fake/wave-${pageNumber}-${index}.gif`,
+      mime_type: 'image/gif',
+      width: 1,
+      height: 1,
+    }));
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        results,
+        page: pageNumber,
+        has_more: pageNumber < 2,
+      }),
+    });
+  });
+
+  await openConversation(page, 'Taylor Price');
+  await page.locator('#compose-gif-btn').click();
+  await expect(page.locator('#compose-gif-grid .gif-tile')).toHaveCount(32);
+
+  await page.locator('#compose-gif-scroll').evaluate((scroller) => {
+    scroller.scrollTop = scroller.scrollHeight;
+    scroller.dispatchEvent(new Event('scroll'));
+  });
+
+  await expect
+    .poll(() => gifRequests.some(url => url.searchParams.get('page') === '2'))
+    .toBe(true);
+  await expect(page.locator('#compose-gif-grid .gif-tile')).toHaveCount(64);
+});
+
+test('favorites GIFs in the compose picker', async ({ page }) => {
+  await page.route(/\/api\/gifs(?:\/trending)?\?/, async route => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        results: [{
+          title: 'Favorite Wave',
+          preview_url: 'data:image/gif;base64,R0lGODlhAQABAAAAACwAAAAAAQABAAA=',
+          url: 'https://media.klipy.com/fake/favorite-wave.gif',
+          mime_type: 'image/gif',
+          width: 1,
+          height: 1,
+        }],
+        has_more: false,
+      }),
+    });
+  });
+
+  await openConversation(page, 'Taylor Price');
+  await page.locator('#compose-gif-btn').click();
+
+  const firstTile = page.locator('#compose-gif-grid .gif-tile').first();
+  await firstTile.hover();
+  await firstTile.locator('.gif-favorite-toggle').click();
+  await expect(firstTile.locator('.gif-favorite-toggle')).toHaveAttribute('aria-pressed', 'true');
+
+  await page.locator('#compose-gif-btn').click();
+  await page.locator('#compose-gif-btn').click();
+  await expect(page.locator('#compose-gif-favorites')).toBeVisible();
+  await expect(page.locator('#compose-gif-favorites-grid .gif-tile')).toHaveCount(1);
+  await expect(page.locator('#compose-gif-favorites-grid .gif-favorite-toggle')).toHaveAttribute('aria-pressed', 'true');
+});
+
+test('accepts dropped files in the compose box', async ({ page }) => {
+  await openConversation(page, 'Taylor Price');
+  await page.locator('#compose-bar').evaluate((composeBar) => {
+    const dataTransfer = new DataTransfer();
+    dataTransfer.items.add(new File(['hello from drop'], 'dropped-note.txt', { type: 'text/plain' }));
+    const event = new Event('drop', { bubbles: true, cancelable: true });
+    Object.defineProperty(event, 'dataTransfer', { value: dataTransfer });
+    composeBar.dispatchEvent(event);
+  });
+
+  await expect(page.locator('#attach-preview')).toHaveClass(/active/);
+  await expect(page.locator('#attach-name')).toHaveText('dropped-note.txt');
 });
 
 test('keeps the active thread pinned to the bottom after sending', async ({ page }) => {
@@ -896,6 +1316,27 @@ test('refreshes the active thread from SSE invalidations', async ({ page, reques
   });
 
   await expect(page.locator('#messages-area')).toContainText(inbound);
+});
+
+test('keeps unchanged thread and sidebar nodes mounted for inbound live messages', async ({ page, request }) => {
+  const inbound = `Stable inbound ${Date.now()}`;
+
+  await openConversation(page, 'Sarah Chen');
+  await rememberStableThreadNode(page);
+  await rememberStableSidebarRow(page, 'Marcus Johnson');
+  await request.post('/_e2e/messages', {
+    data: {
+      body: inbound,
+      conversation_id: 'conv1',
+      sender_name: 'Sarah Chen',
+      sender_number: '+14155551234',
+    },
+  });
+
+  await expect(page.locator('#messages-area')).toContainText(inbound);
+  await expect(page.locator('#conversation-list .convo-item').filter({ hasText: 'Sarah Chen' }).first()).toContainText(inbound);
+  await expectStableThreadNodeStillMounted(page);
+  await expectStableSidebarRowStillMounted(page);
 });
 
 test('keeps the active thread pinned to the bottom for inbound live messages', async ({ page, request }) => {
@@ -1247,6 +1688,54 @@ test('narrow viewport uses single-pane flow with back button', async ({ page }) 
   await expect(page.locator('.sidebar')).toBeVisible();
 });
 
+test('service worker keeps APIs network-only and serves the shell offline', async ({ browser, baseURL }) => {
+  const context = await browser.newContext({ baseURL, serviceWorkers: 'allow' });
+  const page = await context.newPage();
+  try {
+    await page.goto('/');
+    await page.evaluate(async () => {
+      for (const registration of await navigator.serviceWorker.getRegistrations()) {
+        await registration.unregister();
+      }
+      for (const key of await caches.keys()) {
+        await caches.delete(key);
+      }
+      await caches.open('openmessage-static-old-test');
+    });
+
+    await page.goto('/');
+    await page.evaluate(async () => {
+      await navigator.serviceWorker.ready;
+    });
+    await page.reload();
+    await expect
+      .poll(async () => page.evaluate(() => !!navigator.serviceWorker.controller))
+      .toBe(true);
+
+    const cacheKeys = await page.evaluate(async () => caches.keys());
+    expect(cacheKeys).toContain('openmessage-static-v1');
+    expect(cacheKeys).not.toContain('openmessage-static-old-test');
+
+    const apiCached = await page.evaluate(async () => {
+      const response = await fetch('/api/status');
+      if (!response.ok) return 'api-failed';
+      const cache = await caches.open('openmessage-static-v1');
+      return !!(await cache.match('/api/status'));
+    });
+    expect(apiCached).toBe(false);
+
+    await context.setOffline(true);
+    try {
+      await page.goto('/offline-shell-check', { waitUntil: 'domcontentloaded' });
+      await expect(page.locator('#app')).toBeVisible();
+    } finally {
+      await context.setOffline(false);
+    }
+  } finally {
+    await context.close();
+  }
+});
+
 test('escape closes the platforms overlay without clearing search', async ({ page }) => {
   await page.locator('#search-input').fill('hike');
   await openPlatforms(page);
@@ -1307,6 +1796,20 @@ test('a stuck Google session (connected + needs_repair) surfaces a re-pair banne
   await expect(page.locator('#connection-banner')).toBeHidden();
 });
 
+test('a connected Google session with a non-responding phone shows phone guidance', async ({ page }) => {
+  await page.waitForFunction(() => window.__openMessageTestHooks?.applyAppStatus);
+  await page.evaluate(() => window.__openMessageTestHooks.applyAppStatus({
+    connected: true,
+    google: { connected: true, paired: true, needs_pairing: false, needs_repair: false, phone_responding: false },
+    whatsapp: { connected: true, paired: true },
+    signal: { connected: true, paired: true },
+    backfill: { running: false },
+  }));
+  await expect(page.locator('#connection-banner')).toBeVisible();
+  await expect(page.locator('#connection-banner-copy')).toContainText('phone isn’t responding');
+  await expect(page.locator('#connection-banner-action')).toBeHidden();
+});
+
 test('an auth-dead Google session (disconnected + needs_repair) shows Re-pair, not Reconnect', async ({ page }) => {
   await page.waitForFunction(() => window.__openMessageTestHooks?.applyAppStatus);
   // connected=false (the 401 case) but paired + needs_repair.
@@ -1320,6 +1823,11 @@ test('an auth-dead Google session (disconnected + needs_repair) shows Re-pair, n
   await expect(page.locator('#connection-banner')).toBeVisible();
   await expect(page.locator('#connection-banner-action')).toHaveText('Re-pair');
   await expect(page.locator('#connection-banner-copy')).toContainText('unlinked OpenMessage');
+  await page.locator('#connection-banner-action').click();
+  await expect(page.locator('#wa-overlay')).toHaveClass(/show/);
+  await expect(page.locator('#gm-reconnect-btn')).toHaveText('Pair again');
+  await expect(page.locator('#gm-reconnect-btn')).toHaveAttribute('data-mode', 'pair');
+  await page.keyboard.press('Escape');
 
   // A plain disconnected (no needs_repair) still says Reconnect.
   await page.evaluate(() => window.__openMessageTestHooks.applyAppStatus({

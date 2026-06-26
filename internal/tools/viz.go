@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
-	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
@@ -23,7 +22,7 @@ func generateVizTool() mcp.Tool {
 	return mcp.NewTool("generate_viz",
 		mcp.WithDescription("Generate a self-contained HTML visualization of a relationship. Combines data dashboards (charts, heatmap, phrase cloud) with narrative chapters. Output is a single HTML file deployable to Vercel or viewable locally."),
 		mcp.WithString("name", mcp.Required(), mcp.Description("Person's name to search for (case-insensitive partial match)")),
-		mcp.WithString("output_path", mcp.Required(), mcp.Description("File path to write the HTML output (e.g. /tmp/viz.html)")),
+		mcp.WithString("output_path", mcp.Required(), mcp.Description("Path to write the HTML output. Relative paths are written under OPENMESSAGES_EXPORT_DIR or ~/Documents/OpenMessage; set OPENMESSAGES_ALLOW_ANY_EXPORT_PATH=1 to allow arbitrary paths.")),
 		mcp.WithString("person1", mcp.Description("First person's display name (default: 'Max')")),
 		mcp.WithString("person2", mcp.Description("Second person's display name (default: matched name)")),
 		mcp.WithString("timezone", mcp.Description("Timezone for heatmap and dates (default: America/New_York)")),
@@ -48,6 +47,10 @@ func generateVizHandler(a *app.App) server.ToolHandlerFunc {
 		outputPath := strArg(args, "output_path")
 		if outputPath == "" {
 			return errorResult("output_path is required"), nil
+		}
+		outputPath, err := resolveExportWritePath(outputPath)
+		if err != nil {
+			return errorResult(err.Error()), nil
 		}
 
 		// Collect messages across all platforms
@@ -125,15 +128,8 @@ func generateVizHandler(a *app.App) server.ToolHandlerFunc {
 			return errorResult(fmt.Sprintf("render HTML: %v", err)), nil
 		}
 
-		// Ensure output directory exists
-		if dir := filepath.Dir(outputPath); dir != "" {
-			if err := os.MkdirAll(dir, 0o755); err != nil {
-				return errorResult(fmt.Sprintf("create output dir: %v", err)), nil
-			}
-		}
-
 		// Write the file
-		if err := os.WriteFile(outputPath, html, 0o644); err != nil {
+		if err := writePrivateExportFile(outputPath, html); err != nil {
 			return errorResult(fmt.Sprintf("write file: %v", err)), nil
 		}
 

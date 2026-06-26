@@ -109,6 +109,7 @@ struct WebViewContainer: NSViewRepresentable {
         let webView = WKWebView(frame: .zero, configuration: config)
         webView.setValue(false, forKey: "drawsBackground") // Transparent during load
         context.coordinator.webView = webView
+        WebViewBridge.shared.webView = webView
         webView.navigationDelegate = context.coordinator
         webView.load(URLRequest(url: url))
         return webView
