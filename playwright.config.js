@@ -11,6 +11,7 @@ module.exports = defineConfig({
   use: {
     baseURL,
     headless: true,
+    serviceWorkers: 'block',
     trace: 'retain-on-failure',
   },
   webServer: {

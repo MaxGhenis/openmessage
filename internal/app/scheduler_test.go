@@ -36,6 +36,38 @@ func seedDue(t *testing.T, a *App, id string) {
 	}
 }
 
+func TestRecordScheduledSendPersists(t *testing.T) {
+	a := newSchedulerTestApp(t)
+	msg := &db.Message{
+		MessageID:      "wa-sched-1",
+		ConversationID: "whatsapp:123@g.us",
+		Body:           "scheduled hi",
+		IsFromMe:       true,
+		TimestampMS:    1000,
+		Status:         "OUTGOING_SENT",
+	}
+	got, err := a.recordScheduledSend(msg, nil)
+	if err != nil {
+		t.Fatalf("recordScheduledSend: %v", err)
+	}
+	if got != msg {
+		t.Fatal("expected the sent message to be returned")
+	}
+	// The core of B1: a WhatsApp/Signal scheduled send must be persisted
+	// locally, or it never appears in the user's own thread.
+	stored, err := a.Store.GetMessageByID("wa-sched-1")
+	if err != nil {
+		t.Fatalf("GetMessageByID: %v", err)
+	}
+	if stored == nil {
+		t.Fatal("recordScheduledSend must persist the message locally")
+	}
+	// A send error passes through and persists nothing.
+	if _, err := a.recordScheduledSend(nil, fmt.Errorf("send failed")); err == nil {
+		t.Fatal("expected the send error to pass through")
+	}
+}
+
 func TestProcessDueScheduledMessages_Sends(t *testing.T) {
 	a := newSchedulerTestApp(t)
 	seedDue(t, a, "s1")

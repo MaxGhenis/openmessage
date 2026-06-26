@@ -1968,6 +1968,63 @@ func TestConnectEmitsSignalQRCodeAndStoresPairedAccount(t *testing.T) {
 
 }
 
+func TestCloseDuringSignalPairingSkipsPostCancelAccountProbe(t *testing.T) {
+	configDir := t.TempDir()
+	bridge, err := New(configDir, nil, zerolog.Nop(), Callbacks{})
+	if err != nil {
+		t.Fatalf("New(): %v", err)
+	}
+
+	originalStartLink := startSignalLink
+	originalRun := runSignalCLI
+	defer func() {
+		_ = bridge.Close()
+		bridge.commandMu.Lock()
+		runSignalCLI = originalRun
+		bridge.commandMu.Unlock()
+		startSignalLink = originalStartLink
+	}()
+
+	var probeCalls atomic.Int32
+	startSignalLink = func(ctx context.Context, cfg string) (io.ReadCloser, func() error, error) {
+		reader := io.NopCloser(strings.NewReader("sgnl://linkdevice?uuid=test\n"))
+		wait := func() error {
+			<-ctx.Done()
+			return ctx.Err()
+		}
+		return reader, wait, nil
+	}
+	runSignalCLI = func(ctx context.Context, cfg string, args ...string) ([]byte, error) {
+		if len(args) >= 3 && args[0] == "--output" && args[2] == "listAccounts" {
+			probeCalls.Add(1)
+		}
+		return []byte{}, nil
+	}
+
+	if err := bridge.Connect(); err != nil {
+		t.Fatalf("Connect(): %v", err)
+	}
+	waitForCondition(t, 2*time.Second, func() bool {
+		return bridge.Status().QRAvailable
+	})
+
+	done := make(chan error, 1)
+	go func() {
+		done <- bridge.Close()
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Close(): %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close did not return after pairing cancellation")
+	}
+	if got := probeCalls.Load(); got != 0 {
+		t.Fatalf("post-cancel account probe calls = %d, want 0", got)
+	}
+}
+
 func waitForCondition(t *testing.T, timeout time.Duration, cond func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)

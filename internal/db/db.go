@@ -25,6 +25,7 @@ type Conversation struct {
 	LastMessagePreview string `json:"last_message_preview,omitempty"`
 	UnifiedID          string `json:"unified_id,omitempty"`
 	UnifiedName        string `json:"unified_name,omitempty"`
+	IsFavorite         bool   `json:"is_favorite,omitempty"`
 	NotificationMode   string `json:"notification_mode,omitempty"` // all, mentions, muted
 	Tab                string `json:"tab,omitempty"`               // "" = Recent (inbox), "archive", or a custom tab id
 }
@@ -357,6 +358,7 @@ func (s *Store) migrate() error {
 		"ALTER TABLE conversations ADD COLUMN source_platform TEXT NOT NULL DEFAULT 'sms'",
 		"ALTER TABLE conversations ADD COLUMN display_protocol TEXT NOT NULL DEFAULT ''",
 		"ALTER TABLE conversations ADD COLUMN notification_mode TEXT NOT NULL DEFAULT 'all'",
+		"ALTER TABLE conversations ADD COLUMN is_favorite INTEGER NOT NULL DEFAULT 0",
 		"ALTER TABLE conversations ADD COLUMN tab TEXT NOT NULL DEFAULT ''",
 	} {
 		s.db.Exec(col) // ignore "duplicate column" errors
@@ -444,6 +446,17 @@ func (s *Store) migrate() error {
 	s.db.Exec(`ALTER TABLE scheduled_messages ADD COLUMN media_data BLOB`)
 	s.db.Exec(`ALTER TABLE scheduled_messages ADD COLUMN media_filename TEXT NOT NULL DEFAULT ''`)
 	s.db.Exec(`ALTER TABLE scheduled_messages ADD COLUMN media_mime TEXT NOT NULL DEFAULT ''`)
+	// Per-person CRM metadata (tags, reach-out cadence, cached relationship
+	// summary), keyed by a normalized person key. See contact_meta.go.
+	s.db.Exec(`CREATE TABLE IF NOT EXISTS contact_meta (
+		person_key TEXT PRIMARY KEY,
+		display_name TEXT NOT NULL DEFAULT '',
+		tags TEXT NOT NULL DEFAULT '[]',
+		reach_out_days INTEGER NOT NULL DEFAULT 0,
+		summary TEXT NOT NULL DEFAULT '',
+		summary_at INTEGER NOT NULL DEFAULT 0,
+		updated_at INTEGER NOT NULL DEFAULT 0
+	)`)
 
 	if err := s.enableFTS(); err != nil {
 		return err

@@ -36,6 +36,7 @@ const (
 	reactionMatchWindow   = 15 * time.Second
 	sendTimeout           = 20 * time.Second
 	syncRequestTimeout    = 10 * time.Second
+	postLinkProbeTimeout  = 5 * time.Second
 	historySyncQuietAfter = 45 * time.Second
 )
 
@@ -799,7 +800,13 @@ func (b *Bridge) runLink(ctx context.Context) {
 		waitErr = scanErr
 	}
 
-	account, accountErr := b.probeAccount(context.Background(), "")
+	var account string
+	var accountErr error
+	if ctx.Err() == nil {
+		probeCtx, cancel := context.WithTimeout(ctx, postLinkProbeTimeout)
+		account, accountErr = b.probeAccount(probeCtx, "")
+		cancel()
+	}
 	b.mu.Lock()
 	b.pairing = false
 	b.connecting = false

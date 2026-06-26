@@ -131,6 +131,9 @@ func sendMessageHandler(a *app.App) server.ToolHandlerFunc {
 			}
 			conv, err := getOrCreateGoogleConversation(a, recipient)
 			if err != nil {
+				if !a.HandleGoogleAuthExpiredError(err) {
+					a.RecordGoogleSendError(err)
+				}
 				return errorResult(fmt.Sprintf("failed to get/create conversation: %v", err)), nil
 			}
 			if conv == nil {
@@ -143,11 +146,16 @@ func sendMessageHandler(a *app.App) server.ToolHandlerFunc {
 			payload := app.BuildSendPayload(conv.GetConversationID(), message, "", myParticipantID, simPayload)
 			resp, err := sendGoogleTextPayload(a, payload)
 			if err != nil {
+				if !a.HandleGoogleAuthExpiredError(err) {
+					a.RecordGoogleSendError(err)
+				}
 				return errorResult(fmt.Sprintf("failed to send: %v", err)), nil
 			}
 			if resp.GetStatus() != gmproto.SendMessageResponse_SUCCESS {
-				return errorResult(fmt.Sprintf("failed to send: %s", resp.GetStatus().String())), nil
+				a.RecordGoogleSendOutcomeWithPhone(false, a.GooglePhoneResponding())
+				return errorResult(app.GoogleSendRejectedMessage(resp.GetStatus().String(), a.GooglePhoneResponding())), nil
 			}
+			a.RecordGoogleSendOutcome(true)
 			now := time.Now().UnixMilli()
 			if err := a.Store.RecordOutgoingMessage(&db.Message{
 				MessageID:      payload.TmpID,

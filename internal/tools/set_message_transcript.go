@@ -9,6 +9,7 @@ import (
 	"github.com/mark3labs/mcp-go/server"
 
 	"github.com/maxghenis/openmessage/internal/app"
+	"github.com/maxghenis/openmessage/internal/db"
 )
 
 func setMessageTranscriptTool() mcp.Tool {
@@ -28,7 +29,8 @@ func setMessageTranscriptTool() mcp.Tool {
 			mcp.Description("Free-form model identifier (for example faster-whisper:base.en)."),
 		),
 		mcp.WithReadOnlyHintAnnotation(false),
-		mcp.WithDestructiveHintAnnotation(false),
+		mcp.WithDestructiveHintAnnotation(true),
+		mcp.WithIdempotentHintAnnotation(false),
 	)
 }
 
@@ -54,6 +56,9 @@ func setMessageTranscriptHandler(a *app.App) server.ToolHandlerFunc {
 		}
 		if messageID == "" {
 			return errorResult("set_message_transcript: message_id is required"), nil
+		}
+		if err := db.ValidateMessageTranscript(transcript, model); err != nil {
+			return errorResult(fmt.Sprintf("set_message_transcript: %v", err)), nil
 		}
 		if err := a.Store.SetMessageTranscript(messageID, transcript, model); err != nil {
 			return errorResult(fmt.Sprintf("set_message_transcript: %v", err)), nil

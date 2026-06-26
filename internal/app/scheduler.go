@@ -102,9 +102,9 @@ func (a *App) retryOrFail(sm *db.ScheduledMessage, reason string) {
 func (a *App) sendScheduledText(conversationID, body, replyToID string) (*db.Message, error) {
 	switch a.conversationPlatform(conversationID) {
 	case "whatsapp":
-		return a.SendWhatsAppText(conversationID, body, replyToID)
+		return a.recordScheduledSend(a.SendWhatsAppText(conversationID, body, replyToID))
 	case "signal":
-		return a.SendSignalText(conversationID, body, replyToID)
+		return a.recordScheduledSend(a.SendSignalText(conversationID, body, replyToID))
 	default:
 		return a.sendSMSText(conversationID, body, replyToID)
 	}
@@ -131,12 +131,28 @@ func (a *App) sendScheduledMedia(sm *db.ScheduledMessage) (*db.Message, error) {
 func (a *App) SendMediaToConversation(conversationID string, data []byte, filename, mime, caption, replyToID string) (*db.Message, error) {
 	switch a.conversationPlatform(conversationID) {
 	case "whatsapp":
-		return a.SendWhatsAppMedia(conversationID, data, filename, mime, caption, replyToID)
+		return a.recordScheduledSend(a.SendWhatsAppMedia(conversationID, data, filename, mime, caption, replyToID))
 	case "signal":
-		return a.SendSignalMedia(conversationID, data, filename, mime, caption, replyToID)
+		return a.recordScheduledSend(a.SendSignalMedia(conversationID, data, filename, mime, caption, replyToID))
 	default:
 		return a.sendSMSMedia(conversationID, data, filename, mime, caption, replyToID)
 	}
+}
+
+// recordScheduledSend persists a WhatsApp/Signal message that the live bridges
+// return but do not store themselves (the web send handlers record them
+// separately). Without this, a scheduled WhatsApp/Signal send is delivered but
+// never appears in the user's own thread.
+func (a *App) recordScheduledSend(msg *db.Message, err error) (*db.Message, error) {
+	if err != nil {
+		return nil, err
+	}
+	if msg != nil {
+		if rerr := a.Store.RecordOutgoingMessage(msg, ""); rerr != nil {
+			a.Logger.Warn().Err(rerr).Msg("Scheduler: sent message but failed to record locally")
+		}
+	}
+	return msg, nil
 }
 
 // sendSMSMedia uploads and sends a Google Messages (SMS/RCS) media attachment

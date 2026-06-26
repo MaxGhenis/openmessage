@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"runtime"
 	"runtime/debug"
@@ -78,6 +79,7 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 	isDemo := app.DemoMode()
 
 	events := web.NewEventBroker()
+	googleReconnectNow := make(chan struct{}, 1)
 	isConnected := func() bool {
 		if isDemo {
 			return true
@@ -89,8 +91,14 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 	}
 	a.OnConversationsChange = events.PublishConversations
 	a.OnMessagesChange = events.PublishMessages
-	a.OnStatusChange = func(bool) {
+	a.OnStatusChange = func(connected bool) {
 		publishOverallStatus()
+		if !connected {
+			select {
+			case googleReconnectNow <- struct{}{}:
+			default:
+			}
+		}
 	}
 	a.OnTypingChange = events.PublishTyping
 	a.OnWhatsAppStatusChange = func() {
@@ -212,18 +220,53 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 		go func() {
 			ticker := time.NewTicker(15 * time.Second)
 			defer ticker.Stop()
-			for range ticker.C {
-				g := a.GoogleStatus()
-				// Skip reconnect when the credentials are dead (NeedsRepair):
-				// retrying a 401'd session just spams the log every 15s and
-				// never recovers. The UI shows a "Re-pair" banner instead; a
-				// successful re-pair clears the flag and reconnect resumes.
-				if !g.Paired || g.Connected || g.NeedsPairing || g.NeedsRepair {
-					continue
+			lastAttempt := time.Time{}
+			attemptReconnect := func(trigger string) {
+				if !lastAttempt.IsZero() && time.Since(lastAttempt) < 5*time.Second {
+					return
 				}
-				logger.Info().Msg("Google Messages disconnected — attempting reconnect")
+				lastAttempt = time.Now()
+				g := a.GoogleStatus()
+				hasRefreshScript := strings.TrimSpace(os.Getenv("OPENMESSAGE_COOKIE_REFRESH_SCRIPT")) != ""
+				switch planGoogleReconnect(g, hasRefreshScript) {
+				case googleReconnectSkip:
+					return
+				case googleReconnectPark:
+					// Dead linked-device session with no way to auto-recover
+					// (no cookie-refresh script). Stop reconnecting so we don't
+					// hammer Google's auth endpoint every cycle; flag it so the
+					// UI prompts a manual re-pair. A successful re-pair clears
+					// the flag and reconnect resumes.
+					a.FlagGoogleNeedsRepair()
+					return
+				case googleReconnectRefresh:
+					// Cookies expired but a refresh script is configured: refresh
+					// then reconnect, even if the session was flagged for repair.
+					logger.Info().Msg("Google auth expired - refreshing Chrome cookies before reconnect")
+					ctx, cancel := context.WithTimeout(context.Background(), googleCookieRefreshTimeout)
+					err := refreshGoogleSessionCookies(ctx)
+					cancel()
+					if err != nil {
+						logger.Warn().Err(err).Msg("Google cookie refresh before reconnect failed")
+					} else {
+						logger.Info().Msg("Refreshed Google cookies before reconnect")
+					}
+					a.ClearGoogleRepairFlag()
+				case googleReconnectRetry:
+					// Ordinary transient disconnect — just reconnect.
+				}
+				logger.Info().Str("trigger", trigger).Msg("Google Messages disconnected - attempting reconnect")
 				if err := a.ReconnectGoogleMessages(); err != nil {
+					a.HandleGoogleAuthExpiredError(err)
 					logger.Warn().Err(err).Msg("Google Messages reconnect attempt failed")
+				}
+			}
+			for {
+				select {
+				case <-ticker.C:
+					attemptReconnect("timer")
+				case <-googleReconnectNow:
+					attemptReconnect("status-change")
 				}
 			}
 		}()
@@ -360,17 +403,14 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 	)
 	tools.Register(mcpSrv, a)
 
-	var sseSrv http.Handler
+	var mcpHTTPHandler http.Handler
 	if opts.mcpSSE {
-		sseSrv = mcpserver.NewSSEServer(mcpSrv,
-			mcpserver.WithBaseURL(baseURL),
-			mcpserver.WithStaticBasePath("/mcp"),
-		)
+		mcpHTTPHandler = newMCPHTTPHandler(mcpSrv, baseURL)
 	}
 
 	googleStatus := func() any {
 		if isDemo {
-			return app.GoogleStatusSnapshot{Connected: true, Paired: true, NeedsPairing: false}
+			return app.GoogleStatusSnapshot{Connected: true, Paired: true, NeedsPairing: false, PhoneResponding: true}
 		}
 		return a.GoogleStatus()
 	}
@@ -382,23 +422,26 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 	if httpEnabled {
 		httpHandler := http.Handler(nil)
 		if opts.web {
-			httpHandler = web.APIHandlerWithOptions(a.Store, nil, logger, sseSrv, web.APIOptions{
-				Client:               a.GetClient,
-				Events:               events,
-				IdentityName:         identityName,
-				IsConnected:          isConnected,
-				GoogleStatus:         googleStatus,
-				RecordGoogleSend:     a.RecordGoogleSendOutcome,
-				ReconnectGoogle:      a.ReconnectGoogleMessages,
-				Unpair:               a.Unpair,
-				WhatsAppStatus:       func() any { return a.WhatsAppStatus() },
-				ConnectWhatsApp:      a.StartWhatsAppConnect,
-				UnpairWhatsApp:       a.UnpairWhatsApp,
-				SignalStatus:         func() any { return a.SignalStatus() },
-				ConnectSignal:        a.StartSignalConnect,
-				ReplaySignalRecovery: a.ReplaySignalRecoveryQueue,
-				UnpairSignal:         a.UnpairSignal,
-				LeaveWhatsAppGroup:   a.LeaveWhatsAppGroup,
+			httpHandler = web.APIHandlerWithOptions(a.Store, nil, logger, mcpHTTPHandler, web.APIOptions{
+				Client:                a.GetClient,
+				Events:                events,
+				IdentityName:          identityName,
+				IsConnected:           isConnected,
+				GoogleStatus:          googleStatus,
+				RecordGoogleSend:      a.RecordGoogleSendOutcome,
+				RecordGoogleSendError: a.RecordGoogleSendError,
+				GooglePhoneResponding: a.GooglePhoneResponding,
+				MarkGoogleAuthExpired: a.HandleGoogleAuthExpiredError,
+				ReconnectGoogle:       a.ReconnectGoogleMessages,
+				Unpair:                a.Unpair,
+				WhatsAppStatus:        func() any { return a.WhatsAppStatus() },
+				ConnectWhatsApp:       a.StartWhatsAppConnect,
+				UnpairWhatsApp:        a.UnpairWhatsApp,
+				SignalStatus:          func() any { return a.SignalStatus() },
+				ConnectSignal:         a.StartSignalConnect,
+				ReplaySignalRecovery:  a.ReplaySignalRecoveryQueue,
+				UnpairSignal:          a.UnpairSignal,
+				LeaveWhatsAppGroup:    a.LeaveWhatsAppGroup,
 				WhatsAppQRCode: func() (any, error) {
 					return a.WhatsAppQRCode()
 				},
@@ -420,11 +463,7 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 				SyncGoogleContacts:    a.SyncGoogleContacts,
 			})
 		} else {
-			mux := http.NewServeMux()
-			if sseSrv != nil {
-				mux.Handle("/mcp/", sseSrv)
-			}
-			httpHandler = mux
+			httpHandler = web.ProtectLocalControl(mcpHTTPHandler)
 		}
 
 		ln, err := net.Listen("tcp", listenAddr)
@@ -474,6 +513,18 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 	<-sigCh
 	logger.Info().Msg("Shutting down")
 	return nil
+}
+
+func newMCPHTTPHandler(mcpSrv *mcpserver.MCPServer, baseURL string) http.Handler {
+	streamableSrv := mcpserver.NewStreamableHTTPServer(mcpSrv, mcpserver.WithEndpointPath("/mcp"))
+	sseSrv := mcpserver.NewSSEServer(mcpSrv,
+		mcpserver.WithBaseURL(baseURL),
+		mcpserver.WithStaticBasePath("/mcp"),
+	)
+	mux := http.NewServeMux()
+	mux.Handle("/mcp", streamableSrv)
+	mux.Handle("/mcp/", sseSrv)
+	return mux
 }
 
 // telemetrySnapshot extracts the minimal pairing-status data sent in heartbeats.
@@ -583,6 +634,73 @@ func startupBackfillMode() string {
 	default:
 		return "auto"
 	}
+}
+
+const googleCookieRefreshTimeout = 20 * time.Second
+
+func googleStatusNeedsCookieRefresh(g app.GoogleStatusSnapshot) bool {
+	return g.AuthExpired || app.IsGoogleAuthExpiredError(fmt.Errorf("%s", g.LastError))
+}
+
+// googleReconnectAction is the reconnect watchdog's decision for a Google
+// Messages session that is currently disconnected.
+type googleReconnectAction int
+
+const (
+	googleReconnectSkip    googleReconnectAction = iota // connected, unpaired, or awaiting first-time pairing
+	googleReconnectRefresh                              // cookies expired and a refresh script is available
+	googleReconnectPark                                 // dead session, no automated recovery — wait for manual re-pair
+	googleReconnectRetry                                // ordinary transient disconnect
+)
+
+// planGoogleReconnect decides what the reconnect watchdog should do for a
+// disconnected Google Messages session. It is pure so the back-off behaviour
+// can be unit-tested without driving the live loop.
+//
+// Key invariant: a session whose cookies have expired is only retried
+// automatically when a cookie-refresh script is configured. Without one (e.g.
+// the macOS app) a reconnect just 401s again, so we park and let the UI prompt
+// a manual re-pair instead of spinning a reconnect storm against Google's auth
+// endpoint — the failure docs/agent-runbook.md warns about.
+func planGoogleReconnect(g app.GoogleStatusSnapshot, hasRefreshScript bool) googleReconnectAction {
+	if !g.Paired || g.Connected || g.NeedsPairing {
+		return googleReconnectSkip
+	}
+	if googleStatusNeedsCookieRefresh(g) {
+		if hasRefreshScript {
+			return googleReconnectRefresh
+		}
+		return googleReconnectPark
+	}
+	if g.NeedsRepair {
+		return googleReconnectPark
+	}
+	return googleReconnectRetry
+}
+
+var refreshGoogleSessionCookies = func(ctx context.Context) error {
+	script := strings.TrimSpace(os.Getenv("OPENMESSAGE_COOKIE_REFRESH_SCRIPT"))
+	if script == "" {
+		return nil
+	}
+	if _, err := os.Stat(script); err != nil {
+		return fmt.Errorf("refresh script unavailable at %s: %w", script, err)
+	}
+
+	cmd := exec.CommandContext(ctx, script, "--quiet", "--no-backup")
+	cmd.Env = os.Environ()
+	output, err := cmd.CombinedOutput()
+	if ctx.Err() != nil {
+		return fmt.Errorf("refresh Google cookies timed out after %s", googleCookieRefreshTimeout)
+	}
+	if err != nil {
+		detail := strings.TrimSpace(string(output))
+		if detail == "" {
+			return fmt.Errorf("refresh Google cookies: %w", err)
+		}
+		return fmt.Errorf("refresh Google cookies: %w: %s", err, detail)
+	}
+	return nil
 }
 
 func macOSNotificationsEnabled(interactive bool) bool {

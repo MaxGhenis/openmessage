@@ -2,6 +2,7 @@ package web
 
 import (
 	"crypto/rand"
+	"database/sql"
 	"embed"
 	"encoding/hex"
 	"encoding/json"
@@ -38,6 +39,8 @@ var staticFS embed.FS
 // while keeping a runaway POST from exhausting memory.
 const maxUploadBytes = 128 << 20
 
+const maxTranscriptRequestBytes = db.MaxTranscriptBytes + db.MaxTranscriptModelBytes + 4096
+
 // APIHandler creates the HTTP handler with JSON API routes and static file serving.
 // The client may be nil (disconnected state).
 // mcpHandler is an optional http.Handler for the MCP SSE endpoint (mounted at /mcp/).
@@ -57,6 +60,9 @@ type APIOptions struct {
 	IsConnected           StatusChecker
 	GoogleStatus          func() any
 	RecordGoogleSend      func(success bool) // tracks Google send outcomes for stuck-session detection
+	RecordGoogleSendError func(error)        // tracks auth/dead-session send errors for needs_repair
+	GooglePhoneResponding func() bool
+	MarkGoogleAuthExpired func(error) bool
 	ReconnectGoogle       func() error
 	Unpair                UnpairFunc
 	WhatsAppStatus        func() any
@@ -71,6 +77,7 @@ type APIOptions struct {
 	SignalQRCode          func() (any, error)
 	WhatsAppAvatar        func(conversationID string) ([]byte, string, error)
 	FetchLinkPreview      LinkPreviewFetcher
+	FetchLinkPreviewImage LinkPreviewImageFetcher
 	SendWhatsAppText      func(conversationID, body, replyToID string) (*db.Message, error)
 	SendWhatsAppReaction  func(conversationID, messageID, emoji, action string) error
 	SendSignalText        func(conversationID, body, replyToID string) (*db.Message, error)
@@ -94,6 +101,7 @@ type SearchResult struct {
 	UnreadCount     int    `json:"UnreadCount"`
 	SourcePlatform  string `json:"source_platform,omitempty"`
 	DisplayProtocol string `json:"display_protocol,omitempty"`
+	IsFavorite      bool   `json:"is_favorite,omitempty"`
 	UnifiedID       string `json:"unified_id,omitempty"`
 	UnifiedName     string `json:"unified_name,omitempty"`
 	Preview         string `json:"preview,omitempty"`
@@ -153,6 +161,27 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		if opts.RecordGoogleSend != nil {
 			opts.RecordGoogleSend(success)
 		}
+	}
+	recordGoogleSendError := func(err error) {
+		if opts.RecordGoogleSendError != nil {
+			opts.RecordGoogleSendError(err)
+		}
+	}
+	googlePhoneResponding := func() bool {
+		if opts.GooglePhoneResponding == nil {
+			return true
+		}
+		return opts.GooglePhoneResponding()
+	}
+	markGoogleAuthExpired := func(err error) bool {
+		if opts.MarkGoogleAuthExpired == nil {
+			return false
+		}
+		marked := opts.MarkGoogleAuthExpired(err)
+		if marked {
+			publishStatus(currentConnected())
+		}
+		return marked
 	}
 	// Per-platform data-freshness, used to catch "zombie" bridges that report
 	// connected=true while no longer actually syncing (the connection flag
@@ -417,9 +446,146 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		}
 		return msg, nil
 	}
+	linkPreviewService := NewLinkPreviewService(logger)
 	fetchLinkPreview := opts.FetchLinkPreview
 	if fetchLinkPreview == nil {
-		fetchLinkPreview = NewLinkPreviewService(logger).Fetch
+		fetchLinkPreview = linkPreviewService.Fetch
+	}
+	fetchLinkPreviewImage := opts.FetchLinkPreviewImage
+	if fetchLinkPreviewImage == nil {
+		fetchLinkPreviewImage = linkPreviewService.FetchImage
+	}
+	sendMediaBytes := func(w http.ResponseWriter, convID string, data []byte, filename, mimeType, caption, replyToID string) {
+		if isSignalConversation(convID) {
+			msg, err := sendSignalMedia(convID, data, filename, mimeType, caption, replyToID)
+			switch {
+			case errors.Is(err, errSignalMediaUnavailable):
+				httpError(w, err.Error(), 501)
+				return
+			case errors.Is(err, errSignalLocalStore):
+				httpError(w, "message sent remotely but failed to update local store: "+err.Error(), 500)
+				return
+			case err != nil:
+				httpError(w, err.Error(), 502)
+				return
+			}
+			publishMessages(convID)
+			publishConversations()
+			writeJSON(w, map[string]any{
+				"message_id": msg.MessageID,
+				"status":     "SUCCESS",
+				"success":    true,
+			})
+			return
+		}
+		if isWhatsAppConversation(convID) {
+			msg, err := sendWhatsAppMedia(convID, data, filename, mimeType, caption, replyToID)
+			switch {
+			case errors.Is(err, errWhatsAppMediaUnavailable):
+				httpError(w, err.Error(), 501)
+				return
+			case errors.Is(err, errWhatsAppLocalStore):
+				httpError(w, "message sent remotely but failed to update local store: "+err.Error(), 500)
+				return
+			case err != nil:
+				httpError(w, err.Error(), 502)
+				return
+			}
+			publishMessages(convID)
+			publishConversations()
+			writeJSON(w, map[string]any{
+				"message_id": msg.MessageID,
+				"status":     "SUCCESS",
+				"success":    true,
+			})
+			return
+		}
+		cli := getClient()
+		if cli == nil {
+			httpError(w, app.ErrNotConnected, 503)
+			return
+		}
+
+		media, err := cli.GM.UploadMedia(data, filename, mimeType)
+		if err != nil {
+			if !markGoogleAuthExpired(err) {
+				recordGoogleSendError(err)
+			}
+			httpError(w, googleAPIErrorMessage("upload media", err), 502)
+			return
+		}
+
+		conv, err := cli.GM.GetConversation(convID)
+		if err != nil {
+			if !markGoogleAuthExpired(err) {
+				recordGoogleSendError(err)
+			}
+			httpError(w, googleAPIErrorMessage("get conversation", err), 502)
+			return
+		}
+
+		myParticipantID, simPayload := app.ExtractSIMAndParticipant(conv)
+		payload := app.BuildSendMediaPayload(convID, media, myParticipantID, simPayload)
+
+		logger.Info().
+			Str("conv_id", convID).
+			Str("mime", mimeType).
+			Str("filename", filename).
+			Int("size", len(data)).
+			Msg("Sending media message")
+
+		resp, err := cli.GM.SendMessage(payload)
+		if err != nil {
+			if !markGoogleAuthExpired(err) {
+				recordGoogleSendError(err)
+			}
+			httpError(w, googleAPIErrorMessage("send message", err), 502)
+			return
+		}
+		success := resp.GetStatus() == gmproto.SendMessageResponse_SUCCESS
+		if !success {
+			now := time.Now().UnixMilli()
+			_ = recordOutgoingMessage(&db.Message{
+				MessageID:      payload.TmpID,
+				ConversationID: convID,
+				Body:           "",
+				IsFromMe:       true,
+				TimestampMS:    now,
+				Status:         "OUTGOING_FAILED:" + resp.GetStatus().String(),
+				MediaID:        media.MediaID,
+				MimeType:       media.MimeType,
+				DecryptionKey:  hex.EncodeToString(media.DecryptionKey),
+			}, "")
+			publishMessages(convID)
+			publishConversations()
+			if googlePhoneResponding() {
+				recordGoogleSend(false)
+			}
+			httpError(w, googleSendRejectedMessage(resp.GetStatus().String(), googlePhoneResponding()), 502)
+			return
+		}
+		recordGoogleSend(true)
+		now := time.Now().UnixMilli()
+		if err := recordOutgoingMessage(&db.Message{
+			MessageID:      payload.TmpID,
+			ConversationID: convID,
+			Body:           "",
+			IsFromMe:       true,
+			TimestampMS:    now,
+			Status:         "OUTGOING_SENDING",
+			MediaID:        media.MediaID,
+			MimeType:       media.MimeType,
+			DecryptionKey:  hex.EncodeToString(media.DecryptionKey),
+		}, ""); err != nil {
+			httpError(w, "message sent remotely but failed to update local store: "+err.Error(), 500)
+			return
+		}
+		publishMessages(convID)
+		publishConversations()
+		writeJSON(w, map[string]any{
+			"status":  resp.GetStatus().String(),
+			"success": success,
+		})
 	}
 
 	mux.HandleFunc("/api/events", func(w http.ResponseWriter, r *http.Request) {
@@ -523,6 +689,43 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			}
 			convo, err := store.GetConversation(convID)
 			if err != nil {
+				httpError(w, "get conversation: "+err.Error(), 500)
+				return
+			}
+			publishConversations()
+			writeJSON(w, convo)
+			return
+		}
+		if action == "favorite" {
+			if r.Method != http.MethodPost && r.Method != http.MethodPatch {
+				httpError(w, "method not allowed", 405)
+				return
+			}
+			var req struct {
+				Favorite *bool `json:"favorite"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				httpError(w, "invalid JSON: "+err.Error(), 400)
+				return
+			}
+			if req.Favorite == nil {
+				httpError(w, "favorite is required", 400)
+				return
+			}
+			if err := store.SetConversationFavorite(convID, *req.Favorite); err != nil {
+				if errors.Is(err, sql.ErrNoRows) {
+					httpError(w, "conversation not found", 404)
+					return
+				}
+				httpError(w, "set favorite: "+err.Error(), 500)
+				return
+			}
+			convo, err := store.GetConversation(convID)
+			if err != nil {
+				if errors.Is(err, sql.ErrNoRows) {
+					httpError(w, "conversation not found", 404)
+					return
+				}
 				httpError(w, "get conversation: "+err.Error(), 500)
 				return
 			}
@@ -796,6 +999,131 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		writeJSON(w, map[string]any{"synced": count})
 	})
 
+	mux.HandleFunc("/api/people", func(w http.ResponseWriter, r *http.Request) {
+		people, err := store.ListMessagedPeople()
+		if err != nil {
+			httpError(w, "list people: "+err.Error(), 500)
+			return
+		}
+		metaMap, _ := store.GetContactMetaMap()
+		now := time.Now().UnixMilli()
+		q := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("q")))
+		out := make([]*personPayload, 0, len(people))
+		for _, p := range people {
+			if q != "" && !strings.Contains(strings.ToLower(p.Name), q) {
+				match := false
+				for _, num := range p.Numbers {
+					if strings.Contains(num, q) {
+						match = true
+						break
+					}
+				}
+				if !match {
+					continue
+				}
+			}
+			out = append(out, buildPersonPayload(p, metaMap[p.Key], now))
+		}
+		writeJSON(w, out)
+	})
+
+	// /api/people/{key} and /api/people/{key}/{action}
+	mux.HandleFunc("/api/people/", func(w http.ResponseWriter, r *http.Request) {
+		rest := strings.TrimPrefix(r.URL.Path, "/api/people/")
+		if rest == "" {
+			httpError(w, "person key required", 400)
+			return
+		}
+		parts := strings.SplitN(rest, "/", 2)
+		key, err := url.PathUnescape(parts[0])
+		if err != nil {
+			key = parts[0]
+		}
+		action := ""
+		if len(parts) > 1 {
+			action = parts[1]
+		}
+
+		person, err := store.PersonByKey(key)
+		if err != nil {
+			httpError(w, "lookup person: "+err.Error(), 500)
+			return
+		}
+		if person == nil {
+			httpError(w, "person not found", 404)
+			return
+		}
+		displayName := person.Name
+
+		// Mutating sub-actions must be POST; only the detail view
+		// (action == "") may be GET, matching the sibling routes that 405.
+		if action != "" && r.Method != http.MethodPost {
+			httpError(w, "method not allowed", 405)
+			return
+		}
+
+		switch action {
+		case "tags":
+			var req struct {
+				Tags []string `json:"tags"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				httpError(w, "invalid JSON: "+err.Error(), 400)
+				return
+			}
+			if err := store.SetContactTags(key, displayName, req.Tags); err != nil {
+				httpError(w, "set tags: "+err.Error(), 500)
+				return
+			}
+		case "reach-out":
+			var req struct {
+				Days int `json:"days"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				httpError(w, "invalid JSON: "+err.Error(), 400)
+				return
+			}
+			if err := store.SetContactReachOut(key, displayName, req.Days); err != nil {
+				httpError(w, "set reach-out: "+err.Error(), 500)
+				return
+			}
+		case "summary":
+			// Regenerate the relationship summary from message history.
+			msgs, err := store.PersonMessages(person.ConversationIDs)
+			if err != nil {
+				httpError(w, "load messages: "+err.Error(), 500)
+				return
+			}
+			summary := story.RelationshipSummary(msgs, displayName, time.Local)
+			if err := store.SetContactSummary(key, displayName, summary, time.Now().UnixMilli()); err != nil {
+				httpError(w, "save summary: "+err.Error(), 500)
+				return
+			}
+		case "":
+			// GET detail — fall through below.
+		default:
+			httpError(w, "not found", 404)
+			return
+		}
+
+		// Build the (possibly updated) detail payload.
+		meta, _ := store.GetContactMeta(key)
+		msgs, _ := store.PersonMessages(person.ConversationIDs)
+		// Generate a summary on first view if none cached yet.
+		if meta != nil && meta.Summary == "" && len(msgs) > 0 {
+			meta.Summary = story.RelationshipSummary(msgs, displayName, time.Local)
+			meta.SummaryAt = time.Now().UnixMilli()
+			_ = store.SetContactSummary(key, displayName, meta.Summary, meta.SummaryAt)
+		}
+		payload := buildPersonPayload(person, meta, time.Now().UnixMilli())
+		payload.MessageCount = len(story.FilterRealMessages(msgs))
+		if meta != nil {
+			payload.Summary = meta.Summary
+			payload.SummaryAt = meta.SummaryAt
+		}
+		writeJSON(w, payload)
+	})
+
 	mux.HandleFunc("/api/schedule", func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
@@ -958,7 +1286,6 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		writeJSON(w, sm)
 	})
 
-
 	mux.HandleFunc("/api/search", func(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query().Get("q")
 		if q == "" {
@@ -1038,7 +1365,40 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			writeJSON(w, map[string]any{})
 			return
 		}
+		if strings.TrimSpace(preview.ImageURL) != "" {
+			preview = cloneLinkPreview(preview)
+			preview.ImageURL = "/api/link-preview-image?url=" + url.QueryEscape(preview.ImageURL)
+		}
 		writeJSON(w, preview)
+	})
+
+	mux.HandleFunc("/api/link-preview-image", func(w http.ResponseWriter, r *http.Request) {
+		rawURL := r.URL.Query().Get("url")
+		if rawURL == "" {
+			httpError(w, "query parameter 'url' is required", 400)
+			return
+		}
+		data, contentType, err := fetchLinkPreviewImage(r.Context(), rawURL)
+		if err != nil {
+			switch {
+			case errors.Is(err, ErrNoLinkPreview):
+				httpError(w, "link preview image unavailable", 404)
+				return
+			case errors.Is(err, ErrInvalidLinkPreviewURL), errors.Is(err, ErrBlockedLinkPreviewURL):
+				httpError(w, err.Error(), 400)
+				return
+			default:
+				httpError(w, "link preview image: "+err.Error(), 502)
+				return
+			}
+		}
+		if strings.TrimSpace(contentType) == "" {
+			contentType = http.DetectContentType(data)
+		}
+		w.Header().Set("Content-Type", contentType)
+		w.Header().Set("Cache-Control", "private, max-age=86400")
+		w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+		_, _ = w.Write(data)
 	})
 
 	mux.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
@@ -1111,6 +1471,9 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		// Fetch conversation to get SIM and participant info
 		conv, err := cli.GM.GetConversation(req.ConversationID)
 		if err != nil {
+			if !markGoogleAuthExpired(err) {
+				recordGoogleSendError(err)
+			}
 			httpError(w, googleAPIErrorMessage("get conversation", err), 502)
 			return
 		}
@@ -1127,6 +1490,9 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 
 		resp, err := cli.GM.SendMessage(payload)
 		if err != nil {
+			if !markGoogleAuthExpired(err) {
+				recordGoogleSendError(err)
+			}
 			httpError(w, googleAPIErrorMessage("send message", err), 502)
 			return
 		}
@@ -1149,8 +1515,10 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			}, "")
 			publishMessages(req.ConversationID)
 			publishConversations()
-			recordGoogleSend(false)
-			httpError(w, googleSendRejectedMessage(resp.GetStatus().String()), 502)
+			if googlePhoneResponding() {
+				recordGoogleSend(false)
+			}
+			httpError(w, googleSendRejectedMessage(resp.GetStatus().String(), googlePhoneResponding()), 502)
 			return
 		}
 		recordGoogleSend(true)
@@ -1174,6 +1542,101 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			"status":  resp.GetStatus().String(),
 			"success": success,
 		})
+	})
+
+	mux.HandleFunc("/api/gifs", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			httpError(w, "method not allowed", 405)
+			return
+		}
+		limit := queryIntClamped(r, "limit", defaultGIFSearchLimit, maxGIFSearchResults)
+		page := queryIntClamped(r, "page", 1, 1000)
+		results, err := searchKlipyGIFs(r.Context(), r.URL.Query().Get("q"), limit, page)
+		if err != nil {
+			if errors.Is(err, errGIFProviderNotConfigured) {
+				httpError(w, err.Error(), 501)
+				return
+			}
+			httpError(w, err.Error(), 502)
+			return
+		}
+		for i := range results {
+			results[i].PreviewURL = proxyGIFPreviewURL(results[i].PreviewURL)
+		}
+		writeJSON(w, map[string]any{
+			"results":  results,
+			"page":     page,
+			"has_more": len(results) >= limit,
+		})
+	})
+
+	mux.HandleFunc("/api/gifs/trending", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			httpError(w, "method not allowed", 405)
+			return
+		}
+		limit := queryIntClamped(r, "limit", defaultGIFSearchLimit, maxGIFSearchResults)
+		page := queryIntClamped(r, "page", 1, 1000)
+		results, err := searchKlipyGIFs(r.Context(), defaultGIFSearchQuery, limit, page)
+		if err != nil {
+			if errors.Is(err, errGIFProviderNotConfigured) {
+				httpError(w, err.Error(), 501)
+				return
+			}
+			httpError(w, err.Error(), 502)
+			return
+		}
+		for i := range results {
+			results[i].PreviewURL = proxyGIFPreviewURL(results[i].PreviewURL)
+		}
+		writeJSON(w, map[string]any{
+			"results":  results,
+			"page":     page,
+			"has_more": len(results) >= limit,
+		})
+	})
+
+	mux.HandleFunc("/api/gifs/preview", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			httpError(w, "method not allowed", 405)
+			return
+		}
+		data, _, mimeType, err := downloadGIFMedia(r.Context(), r.URL.Query().Get("url"), maxGIFPreviewBytes)
+		if err != nil {
+			httpError(w, err.Error(), 400)
+			return
+		}
+		w.Header().Set("Cache-Control", "private, max-age=3600")
+		w.Header().Set("Content-Type", mimeType)
+		_, _ = w.Write(data)
+	})
+
+	mux.HandleFunc("/api/send-gif", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			httpError(w, "method not allowed", 405)
+			return
+		}
+		var req struct {
+			ConversationID string `json:"conversation_id"`
+			URL            string `json:"url"`
+			Caption        string `json:"caption"`
+			ReplyToID      string `json:"reply_to_id"`
+		}
+		if err := json.NewDecoder(io.LimitReader(r.Body, 64<<10)).Decode(&req); err != nil {
+			httpError(w, "invalid JSON: "+err.Error(), 400)
+			return
+		}
+		convID := strings.TrimSpace(req.ConversationID)
+		if convID == "" {
+			httpError(w, "conversation_id is required", 400)
+			return
+		}
+		data, filename, mimeType, err := downloadGIFMedia(r.Context(), req.URL, maxGIFSendBytes)
+		if err != nil {
+			httpError(w, err.Error(), 400)
+			return
+		}
+		sendMediaBytes(w, convID, data, filename, mimeType, strings.TrimSpace(req.Caption), strings.TrimSpace(req.ReplyToID))
 	})
 
 	mux.HandleFunc("/api/send-media", func(w http.ResponseWriter, r *http.Request) {
@@ -1227,128 +1690,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		if mime == "" {
 			mime = "application/octet-stream"
 		}
-		if isSignalConversation(convID) {
-			msg, err := sendSignalMedia(convID, data, header.Filename, mime, caption, replyToID)
-			switch {
-			case errors.Is(err, errSignalMediaUnavailable):
-				httpError(w, err.Error(), 501)
-				return
-			case errors.Is(err, errSignalLocalStore):
-				httpError(w, "message sent remotely but failed to update local store: "+err.Error(), 500)
-				return
-			case err != nil:
-				httpError(w, err.Error(), 502)
-				return
-			}
-			publishMessages(convID)
-			publishConversations()
-			writeJSON(w, map[string]any{
-				"message_id": msg.MessageID,
-				"status":     "SUCCESS",
-				"success":    true,
-			})
-			return
-		}
-		if isWhatsAppConversation(convID) {
-			msg, err := sendWhatsAppMedia(convID, data, header.Filename, mime, caption, replyToID)
-			switch {
-			case errors.Is(err, errWhatsAppMediaUnavailable):
-				httpError(w, err.Error(), 501)
-				return
-			case errors.Is(err, errWhatsAppLocalStore):
-				httpError(w, "message sent remotely but failed to update local store: "+err.Error(), 500)
-				return
-			case err != nil:
-				httpError(w, err.Error(), 502)
-				return
-			}
-			publishMessages(convID)
-			publishConversations()
-			writeJSON(w, map[string]any{
-				"message_id": msg.MessageID,
-				"status":     "SUCCESS",
-				"success":    true,
-			})
-			return
-		}
-		cli := getClient()
-		if cli == nil {
-			httpError(w, app.ErrNotConnected, 503)
-			return
-		}
-
-		// Upload media via libgm
-		media, err := cli.GM.UploadMedia(data, header.Filename, mime)
-		if err != nil {
-			httpError(w, googleAPIErrorMessage("upload media", err), 502)
-			return
-		}
-
-		// Get SIM and participant info
-		conv, err := cli.GM.GetConversation(convID)
-		if err != nil {
-			httpError(w, googleAPIErrorMessage("get conversation", err), 502)
-			return
-		}
-
-		myParticipantID, simPayload := app.ExtractSIMAndParticipant(conv)
-
-		payload := app.BuildSendMediaPayload(convID, media, myParticipantID, simPayload)
-
-		logger.Info().
-			Str("conv_id", convID).
-			Str("mime", mime).
-			Str("filename", header.Filename).
-			Int("size", len(data)).
-			Msg("Sending media message")
-
-		resp, err := cli.GM.SendMessage(payload)
-		if err != nil {
-			httpError(w, googleAPIErrorMessage("send message", err), 502)
-			return
-		}
-		success := resp.GetStatus() == gmproto.SendMessageResponse_SUCCESS
-		if !success {
-			now := time.Now().UnixMilli()
-			_ = recordOutgoingMessage(&db.Message{
-				MessageID:      payload.TmpID,
-				ConversationID: convID,
-				Body:           "",
-				IsFromMe:       true,
-				TimestampMS:    now,
-				Status:         "OUTGOING_FAILED:" + resp.GetStatus().String(),
-				MediaID:        media.MediaID,
-				MimeType:       media.MimeType,
-				DecryptionKey:  hex.EncodeToString(media.DecryptionKey),
-			}, "")
-			publishMessages(convID)
-			publishConversations()
-			recordGoogleSend(false)
-			httpError(w, googleSendRejectedMessage(resp.GetStatus().String()), 502)
-			return
-		}
-		recordGoogleSend(true)
-		now := time.Now().UnixMilli()
-		if err := recordOutgoingMessage(&db.Message{
-			MessageID:      payload.TmpID,
-			ConversationID: convID,
-			Body:           "",
-			IsFromMe:       true,
-			TimestampMS:    now,
-			Status:         "OUTGOING_SENDING",
-			MediaID:        media.MediaID,
-			MimeType:       media.MimeType,
-			DecryptionKey:  hex.EncodeToString(media.DecryptionKey),
-		}, ""); err != nil {
-			httpError(w, "message sent remotely but failed to update local store: "+err.Error(), 500)
-			return
-		}
-		publishMessages(convID)
-		publishConversations()
-		writeJSON(w, map[string]any{
-			"status":  resp.GetStatus().String(),
-			"success": success,
-		})
+		sendMediaBytes(w, convID, data, header.Filename, mime, caption, replyToID)
 	})
 
 	mux.HandleFunc("/api/media/", func(w http.ResponseWriter, r *http.Request) {
@@ -1415,6 +1757,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		}
 		data, err := cli.GM.DownloadMedia(msg.MediaID, key)
 		if err != nil {
+			markGoogleAuthExpired(err)
 			httpError(w, googleAPIErrorMessage("download media", err), 502)
 			return
 		}
@@ -1480,12 +1823,16 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		if req.ConversationID != "" {
 			if conv, err := cli.GM.GetConversation(req.ConversationID); err == nil {
 				_, sim = app.ExtractSIMAndParticipant(conv)
+			} else if markGoogleAuthExpired(err) {
+				httpError(w, googleAPIErrorMessage("get conversation", err), 502)
+				return
 			}
 		}
 
 		payload := app.BuildReactionPayload(req.MessageID, req.Emoji, req.Action, sim)
 		resp, err := cli.GM.SendReaction(payload)
 		if err != nil {
+			markGoogleAuthExpired(err)
 			httpError(w, googleAPIErrorMessage("send reaction", err), 502)
 			return
 		}
@@ -1499,12 +1846,18 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			httpError(w, "method not allowed", 405)
 			return
 		}
+		r.Body = http.MaxBytesReader(w, r.Body, maxTranscriptRequestBytes)
 		var req struct {
 			MessageID  string  `json:"message_id"`
 			Transcript *string `json:"transcript"`
 			Model      *string `json:"model,omitempty"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			var tooLarge *http.MaxBytesError
+			if errors.As(err, &tooLarge) {
+				httpError(w, fmt.Sprintf("transcript request too large (limit %d bytes)", maxTranscriptRequestBytes), http.StatusRequestEntityTooLarge)
+				return
+			}
 			httpError(w, "invalid JSON: "+err.Error(), 400)
 			return
 		}
@@ -1514,6 +1867,10 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		}
 		if req.Transcript == nil {
 			httpError(w, "transcript required", 400)
+			return
+		}
+		if err := db.ValidateMessageTranscript(*req.Transcript, req.Model); err != nil {
+			httpError(w, err.Error(), http.StatusRequestEntityTooLarge)
 			return
 		}
 		if err := store.SetMessageTranscript(req.MessageID, *req.Transcript, req.Model); err != nil {
@@ -1565,6 +1922,9 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			Numbers: app.NewContactNumbers([]string{req.PhoneNumber}),
 		})
 		if err != nil {
+			if !markGoogleAuthExpired(err) {
+				recordGoogleSendError(err)
+			}
 			httpError(w, googleAPIErrorMessage("failed to get/create conversation", err), 502)
 			return
 		}
@@ -1726,6 +2086,9 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		// Use the same send logic as /api/send
 		conv, err := cli.GM.GetConversation(draft.ConversationID)
 		if err != nil {
+			if !markGoogleAuthExpired(err) {
+				recordGoogleSendError(err)
+			}
 			httpError(w, googleAPIErrorMessage("get conversation", err), 502)
 			return
 		}
@@ -1741,6 +2104,9 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 
 		resp, err := cli.GM.SendMessage(payload)
 		if err != nil {
+			if !markGoogleAuthExpired(err) {
+				recordGoogleSendError(err)
+			}
 			httpError(w, googleAPIErrorMessage("send message", err), 502)
 			return
 		}
@@ -1757,8 +2123,10 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			}, "")
 			publishMessages(draft.ConversationID)
 			publishConversations()
-			recordGoogleSend(false)
-			httpError(w, googleSendRejectedMessage(resp.GetStatus().String()), 502)
+			if googlePhoneResponding() {
+				recordGoogleSend(false)
+			}
+			httpError(w, googleSendRejectedMessage(resp.GetStatus().String(), googlePhoneResponding()), 502)
 			return
 		}
 		recordGoogleSend(true)
@@ -1915,6 +2283,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			return
 		}
 		if err := opts.BackfillPhone(req.PhoneNumber); err != nil {
+			markGoogleAuthExpired(err)
 			httpError(w, googleAPIErrorMessage("backfill phone", err), 502)
 			return
 		}
@@ -1941,6 +2310,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			return
 		}
 		if err := opts.ReconnectGoogle(); err != nil {
+			markGoogleAuthExpired(err)
 			httpError(w, googleAPIErrorMessage("reconnect google messages", err), 502)
 			return
 		}
@@ -2197,11 +2567,11 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		staticHandler.ServeHTTP(w, r)
 	}))
 
-	// Wrap the mux to intercept /mcp/ requests before the mux's catch-all
+	// Wrap the mux to intercept MCP requests before the mux's catch-all.
 	var handler http.Handler = mux
 	if mcpHandler != nil {
 		handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if strings.HasPrefix(r.URL.Path, "/mcp/") {
+			if r.URL.Path == "/mcp" || strings.HasPrefix(r.URL.Path, "/mcp/") {
 				mcpHandler.ServeHTTP(w, r)
 				return
 			}
@@ -2209,21 +2579,29 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		})
 	}
 
-	// Guard the HTTP API against cross-origin / DNS-rebinding abuse. The server
+	// Guard local control surfaces against cross-origin / DNS-rebinding abuse. The server
 	// binds to 127.0.0.1, but that does NOT stop a malicious web page the user
-	// visits from POSTing to http://127.0.0.1:<port>/api/... (multipart and
-	// body-less POSTs are CORS "simple requests" with no preflight) — which
-	// could drive-by send messages or unpair accounts. Requiring a loopback
-	// Host and (when present) a loopback Origin/Referer closes that vector
-	// without affecting the native app, whose requests are same-origin.
+	// visits from talking to http://127.0.0.1:<port>/api/... or /mcp/... .
+	// Requiring a loopback Host and, when present, a same-origin loopback
+	// Origin/Referer closes that vector without affecting native app requests.
+	return ProtectLocalControl(handler)
+}
+
+// ProtectLocalControl rejects cross-origin browser access to local control
+// surfaces such as /api/* and /mcp/*.
+func ProtectLocalControl(handler http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasPrefix(r.URL.Path, "/api/") && !isLocalAPIRequest(r) {
+		if isProtectedLocalPath(r.URL.Path) && !isLocalControlRequest(r) {
 			httpError(w, "forbidden: API requests must originate from the local OpenMessage app", http.StatusForbidden)
 			return
 		}
 		setSecurityHeaders(w)
 		handler.ServeHTTP(w, r)
 	})
+}
+
+func isProtectedLocalPath(path string) bool {
+	return strings.HasPrefix(path, "/api/") || path == "/mcp" || strings.HasPrefix(path, "/mcp/")
 }
 
 // setSecurityHeaders adds defense-in-depth headers. The UI relies on
@@ -2260,33 +2638,91 @@ func isLoopbackHost(hostname string) bool {
 	return false
 }
 
-// isLocalAPIRequest validates that an /api/ request originates from the local
-// app rather than a cross-origin web page: the Host must be loopback (defends
-// DNS rebinding), and any Origin/Referer the browser attached must be loopback
-// too (defends drive-by cross-origin POSTs). Same-origin GETs carry no Origin
-// and pass; the native WKWebView is same-origin on 127.0.0.1 and passes.
-func isLocalAPIRequest(r *http.Request) bool {
-	host := r.Host
-	if h, _, err := net.SplitHostPort(host); err == nil {
-		host = h
-	}
-	// An absent Host header is treated as non-local: browsers always send
-	// one, so an empty value only ever comes from a hand-rolled client —
-	// which must not slip past the loopback check by omission.
-	if host == "" || !isLoopbackHost(host) {
+// isLocalControlRequest validates that a protected local request originates
+// from OpenMessage itself rather than a cross-origin browser page: Host must
+// be loopback, and Origin/Referer must be the same local scheme and port.
+func isLocalControlRequest(r *http.Request) bool {
+	reqOrigin, ok := localRequestOrigin(r)
+	if !ok {
 		return false
 	}
 	origin := r.Header.Get("Origin")
 	if origin == "" {
 		origin = r.Header.Get("Referer")
 	}
-	if origin != "" {
-		u, err := url.Parse(origin)
-		if err != nil || !isLoopbackHost(u.Hostname()) {
-			return false
-		}
+	if origin == "" {
+		return true
 	}
-	return true
+	headerOrigin, ok := parseLocalOrigin(origin)
+	return ok && headerOrigin == reqOrigin
+}
+
+type localOrigin struct {
+	Scheme string
+	Port   string
+}
+
+func localRequestOrigin(r *http.Request) (localOrigin, bool) {
+	host, port, ok := splitHostPortDefault(r.Host, requestDefaultPort(r))
+	// An absent Host header is treated as non-local: browsers always send
+	// one, so an empty value only ever comes from a hand-rolled client —
+	// which must not slip past the loopback check by omission.
+	if !ok || host == "" || !isLoopbackHost(host) {
+		return localOrigin{}, false
+	}
+	return localOrigin{Scheme: requestScheme(r), Port: port}, true
+}
+
+func parseLocalOrigin(raw string) (localOrigin, bool) {
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme == "" {
+		return localOrigin{}, false
+	}
+	host, port, ok := splitHostPortDefault(u.Host, defaultPortForScheme(u.Scheme))
+	if !ok || !isLoopbackHost(host) {
+		return localOrigin{}, false
+	}
+	return localOrigin{Scheme: strings.ToLower(u.Scheme), Port: port}, true
+}
+
+func requestScheme(r *http.Request) string {
+	if r.TLS != nil {
+		return "https"
+	}
+	return "http"
+}
+
+func requestDefaultPort(r *http.Request) string {
+	return defaultPortForScheme(requestScheme(r))
+}
+
+func defaultPortForScheme(scheme string) string {
+	if strings.EqualFold(scheme, "https") {
+		return "443"
+	}
+	return "80"
+}
+
+func splitHostPortDefault(hostport, defaultPort string) (string, string, bool) {
+	hostport = strings.TrimSpace(hostport)
+	if hostport == "" {
+		return "", "", false
+	}
+	if host, port, err := net.SplitHostPort(hostport); err == nil {
+		if port == "" {
+			port = defaultPort
+		}
+		return host, port, true
+	}
+	u, err := url.Parse("//" + hostport)
+	if err != nil || u.Hostname() == "" {
+		return "", "", false
+	}
+	port := u.Port()
+	if port == "" {
+		port = defaultPort
+	}
+	return u.Hostname(), port, true
 }
 
 func mergeSearchResults(store *db.Store, msgs []*db.Message, convos []*db.Conversation, limit int) []SearchResult {
@@ -2427,6 +2863,7 @@ func searchResultForConversation(conv *db.Conversation, timestamp int64, preview
 		UnreadCount:     conv.UnreadCount,
 		SourcePlatform:  conv.SourcePlatform,
 		DisplayProtocol: conv.DisplayProtocol,
+		IsFavorite:      conv.IsFavorite,
 		Preview:         preview,
 	}
 	if identity, ok := unifiedIdentityForConversation(conv, identityIndex); ok {
@@ -2524,6 +2961,55 @@ func searchPreviewForMessage(msg *db.Message) string {
 	return ""
 }
 
+type personPayload struct {
+	Key             string   `json:"key"`
+	Name            string   `json:"name"`
+	Numbers         []string `json:"numbers"`
+	Platforms       []string `json:"platforms"`
+	LastContactedTS int64    `json:"last_contacted_ts"`
+	Tags            []string `json:"tags"`
+	ReachOutDays    int      `json:"reach_out_days"`
+	NextDueTS       int64    `json:"next_due_ts"`
+	Overdue         bool     `json:"overdue"`
+	MessageCount    int      `json:"message_count"`
+	Summary         string   `json:"summary"`
+	SummaryAt       int64    `json:"summary_at"`
+	ConversationIDs []string `json:"conversation_ids"`
+}
+
+func buildPersonPayload(p *db.Person, meta *db.ContactMeta, now int64) *personPayload {
+	pp := &personPayload{
+		Key:             p.Key,
+		Name:            p.Name,
+		Numbers:         p.Numbers,
+		Platforms:       p.Platforms,
+		LastContactedTS: p.LastContactedTS,
+		MessageCount:    p.MessageCount,
+		Tags:            []string{},
+		ConversationIDs: p.ConversationIDs,
+	}
+	if pp.ConversationIDs == nil {
+		pp.ConversationIDs = []string{}
+	}
+	if pp.Numbers == nil {
+		pp.Numbers = []string{}
+	}
+	if pp.Platforms == nil {
+		pp.Platforms = []string{}
+	}
+	if meta != nil {
+		if meta.Tags != nil {
+			pp.Tags = meta.Tags
+		}
+		pp.ReachOutDays = meta.ReachOutDays
+		if meta.ReachOutDays > 0 && p.LastContactedTS > 0 {
+			pp.NextDueTS = p.LastContactedTS + int64(meta.ReachOutDays)*86400000
+			pp.Overdue = now > pp.NextDueTS
+		}
+	}
+	return pp
+}
+
 func scheduledID() string {
 	b := make([]byte, 8)
 	_, _ = rand.Read(b)
@@ -2560,6 +3046,9 @@ func httpError(w http.ResponseWriter, msg string, code int) {
 }
 
 func googleAPIErrorMessage(action string, err error) string {
+	if app.IsGoogleAuthExpiredError(err) {
+		return "Google Messages session expired; refreshing and reconnecting. Try again in a few seconds."
+	}
 	if isGoogleNetworkError(err) {
 		return "Google Messages is offline. Check your internet connection, then try again."
 	}
@@ -2570,10 +3059,8 @@ func googleAPIErrorMessage(action string, err error) string {
 // Google send. UNKNOWN is what a silently-unlinked linked device returns on
 // every send, so the message points at re-pairing rather than leaving the
 // user with a bare status code.
-func googleSendRejectedMessage(status string) string {
-	return "send failed (Google Messages returned " + status + "). If this keeps happening your phone has " +
-		"likely unlinked OpenMessage — open Platforms → Google Messages → Pair again. " +
-		"Also confirm Messages is set as your phone's default SMS app."
+func googleSendRejectedMessage(status string, phoneResponding bool) string {
+	return app.GoogleSendRejectedMessage(status, phoneResponding)
 }
 
 func isGoogleNetworkError(err error) bool {

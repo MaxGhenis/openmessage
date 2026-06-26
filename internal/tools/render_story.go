@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"path/filepath"
 	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
@@ -21,7 +20,7 @@ func renderStoryTool() mcp.Tool {
 		mcp.WithDescription("Render a pre-built Story (title, summary, chapters with quotes) into a self-contained HTML visualization with data dashboards. The story JSON is provided by the caller; stats are computed from all messages with the person. Use this after agentically writing a story to produce the final HTML."),
 		mcp.WithString("name", mcp.Required(), mcp.Description("Person's name (for stats computation from all messages)")),
 		mcp.WithString("story_json", mcp.Required(), mcp.Description("JSON string of Story struct: {title, summary, chapters: [{title, content, period, quotes: [{sender, text, timestamp}]}]}")),
-		mcp.WithString("output_path", mcp.Required(), mcp.Description("File path to write the HTML output (e.g. /tmp/viz.html)")),
+		mcp.WithString("output_path", mcp.Required(), mcp.Description("Path to write the HTML output. Relative paths are written under OPENMESSAGES_EXPORT_DIR or ~/Documents/OpenMessage; set OPENMESSAGES_ALLOW_ANY_EXPORT_PATH=1 to allow arbitrary paths.")),
 		mcp.WithString("person1", mcp.Description("First person's display name (default: 'Max')")),
 		mcp.WithString("person2", mcp.Description("Second person's display name (default: matched name)")),
 		mcp.WithString("timezone", mcp.Description("Timezone for heatmap and dates (default: America/New_York)")),
@@ -51,6 +50,10 @@ func renderStoryHandler(a *app.App) server.ToolHandlerFunc {
 		outputPath := strArg(args, "output_path")
 		if outputPath == "" {
 			return errorResult("output_path is required"), nil
+		}
+		outputPath, err := resolveExportWritePath(outputPath)
+		if err != nil {
+			return errorResult(err.Error()), nil
 		}
 
 		// Parse story JSON
@@ -119,12 +122,24 @@ func renderStoryHandler(a *app.App) server.ToolHandlerFunc {
 			if err := json.Unmarshal([]byte(photoPathsJSON), &paths); err != nil {
 				return errorResult(fmt.Sprintf("invalid photo_paths JSON: %v", err)), nil
 			}
+			for i, path := range paths {
+				resolved, err := resolveExportReadPath(path)
+				if err != nil {
+					return errorResult(fmt.Sprintf("photo_paths[%d]: %v", i, err)), nil
+				}
+				paths[i] = resolved
+			}
 			photos, err := viz.EncodePhotosFromPaths(paths)
 			if err != nil {
 				return errorResult(fmt.Sprintf("encode photos: %v", err)), nil
 			}
 			config.Photos = photos
 		} else if photosDir != "" {
+			resolved, err := resolveExportReadPath(photosDir)
+			if err != nil {
+				return errorResult(fmt.Sprintf("photos_dir: %v", err)), nil
+			}
+			photosDir = resolved
 			maxPhotos := intArg(args, "max_photos", 20)
 			photos, err := viz.EncodePhotosFromDir(photosDir, maxPhotos)
 			if err != nil {
@@ -139,15 +154,8 @@ func renderStoryHandler(a *app.App) server.ToolHandlerFunc {
 			return errorResult(fmt.Sprintf("render HTML: %v", err)), nil
 		}
 
-		// Ensure output directory exists
-		if dir := filepath.Dir(outputPath); dir != "" {
-			if err := os.MkdirAll(dir, 0o755); err != nil {
-				return errorResult(fmt.Sprintf("create output dir: %v", err)), nil
-			}
-		}
-
 		// Write file
-		if err := os.WriteFile(outputPath, html, 0o644); err != nil {
+		if err := writePrivateExportFile(outputPath, html); err != nil {
 			return errorResult(fmt.Sprintf("write file: %v", err)), nil
 		}
 

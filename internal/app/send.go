@@ -50,6 +50,9 @@ func (a *App) SendTextToConversation(conversationID, body string) (*db.Conversat
 	case "sms":
 		gmConv, err := getGoogleConversationForSend(a, conversationID)
 		if err != nil {
+			if !a.HandleGoogleAuthExpiredError(err) {
+				a.RecordGoogleSendError(err)
+			}
 			return conv, nil, fmt.Errorf("get Google conversation: %w", err)
 		}
 		payload, err := buildGoogleTextPayload(gmConv, conversationID, body)
@@ -58,11 +61,16 @@ func (a *App) SendTextToConversation(conversationID, body string) (*db.Conversat
 		}
 		resp, err := sendGoogleTextPayload(a, payload)
 		if err != nil {
+			if !a.HandleGoogleAuthExpiredError(err) {
+				a.RecordGoogleSendError(err)
+			}
 			return conv, nil, fmt.Errorf("send Google message: %w", err)
 		}
 		if resp.GetStatus() != gmproto.SendMessageResponse_SUCCESS {
-			return conv, nil, fmt.Errorf("send Google message: %s", resp.GetStatus().String())
+			a.RecordGoogleSendOutcomeWithPhone(false, a.GooglePhoneResponding())
+			return conv, nil, fmt.Errorf("%s", GoogleSendRejectedMessage(resp.GetStatus().String(), a.GooglePhoneResponding()))
 		}
+		a.RecordGoogleSendOutcome(true)
 		msg := &db.Message{
 			MessageID:      payload.TmpID,
 			ConversationID: conversationID,
@@ -79,6 +87,20 @@ func (a *App) SendTextToConversation(conversationID, body string) (*db.Conversat
 	default:
 		return conv, nil, fmt.Errorf("sending is not supported for platform %s via OpenMessage yet", conv.SourcePlatform)
 	}
+}
+
+// GoogleSendRejectedMessage builds the user-facing error for a non-SUCCESS
+// Google send. UNKNOWN can mean either a temporarily unreachable phone or a
+// stale linked-device session; phone reachability lets us point at the right
+// recovery path.
+func GoogleSendRejectedMessage(status string, phoneResponding bool) string {
+	if !phoneResponding {
+		return "send failed (Google Messages returned " + status + "): your phone isn't responding to OpenMessage right now. " +
+			"Make sure your phone is on and connected to the internet, then try again."
+	}
+	return "send failed (Google Messages returned " + status + "). If this keeps happening your phone has " +
+		"likely unlinked OpenMessage - open Platforms -> Google Messages -> Pair again. " +
+		"Also confirm Messages is set as your phone's default SMS app."
 }
 
 func normalizeConversationPlatform(platform string) string {

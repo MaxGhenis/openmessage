@@ -55,6 +55,9 @@ func sendGroupMessageHandler(a *app.App) server.ToolHandlerFunc {
 			Numbers: app.NewContactNumbers(phones),
 		})
 		if err != nil {
+			if !a.HandleGoogleAuthExpiredError(err) {
+				a.RecordGoogleSendError(err)
+			}
 			return errorResult(fmt.Sprintf("failed to get/create group conversation: %v", err)), nil
 		}
 
@@ -66,13 +69,18 @@ func sendGroupMessageHandler(a *app.App) server.ToolHandlerFunc {
 		payload := app.BuildSendPayload(conv.GetConversationID(), message, "", "", nil)
 		resp, err := cli.GM.SendMessage(payload)
 		if err != nil {
+			if !a.HandleGoogleAuthExpiredError(err) {
+				a.RecordGoogleSendError(err)
+			}
 			return errorResult(fmt.Sprintf("failed to send group message: %v", err)), nil
 		}
 		// Surface a carrier/Google rejection instead of reporting success on a
 		// non-SUCCESS status (matches the 1:1 send path).
 		if resp.GetStatus() != gmproto.SendMessageResponse_SUCCESS {
-			return errorResult(fmt.Sprintf("failed to send group message: %s", resp.GetStatus().String())), nil
+			a.RecordGoogleSendOutcomeWithPhone(false, a.GooglePhoneResponding())
+			return errorResult(app.GoogleSendRejectedMessage(resp.GetStatus().String(), a.GooglePhoneResponding())), nil
 		}
+		a.RecordGoogleSendOutcome(true)
 
 		// Persist so the group send appears in local history (like 1:1 sends).
 		if err := a.Store.RecordOutgoingMessage(&db.Message{

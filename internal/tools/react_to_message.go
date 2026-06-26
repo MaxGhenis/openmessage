@@ -85,12 +85,14 @@ func reactToMessageHandler(a *app.App) server.ToolHandlerFunc {
 		case "", "sms":
 			gmConv, err := getGoogleReactionConversation(a, conversationID)
 			if err != nil {
+				a.HandleGoogleAuthExpiredError(err)
 				return errorResult(fmt.Sprintf("get conversation: %v", err)), nil
 			}
 			_, simPayload := app.ExtractSIMAndParticipant(gmConv)
 			payload := app.BuildReactionPayload(messageID, emoji, action, simPayload)
 			resp, err := sendGoogleReaction(a, payload)
 			if err != nil {
+				a.HandleGoogleAuthExpiredError(err)
 				return errorResult(fmt.Sprintf("failed to send reaction: %v", err)), nil
 			}
 			if !resp.GetSuccess() {

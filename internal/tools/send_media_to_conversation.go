@@ -118,21 +118,32 @@ func sendMediaToConversationHandler(a *app.App) server.ToolHandlerFunc {
 		case "", "sms":
 			media, err := uploadGoogleMedia(a, data, filename, mimeType)
 			if err != nil {
+				if !a.HandleGoogleAuthExpiredError(err) {
+					a.RecordGoogleSendError(err)
+				}
 				return errorResult(fmt.Sprintf("upload media: %v", err)), nil
 			}
 			gmConv, err := getGoogleConversation(a, conversationID)
 			if err != nil {
+				if !a.HandleGoogleAuthExpiredError(err) {
+					a.RecordGoogleSendError(err)
+				}
 				return errorResult(fmt.Sprintf("get conversation: %v", err)), nil
 			}
 			myParticipantID, simPayload := app.ExtractSIMAndParticipant(gmConv)
 			payload := app.BuildSendMediaPayload(conversationID, media, myParticipantID, simPayload)
 			resp, err := sendGoogleMediaMessage(a, payload)
 			if err != nil {
+				if !a.HandleGoogleAuthExpiredError(err) {
+					a.RecordGoogleSendError(err)
+				}
 				return errorResult(fmt.Sprintf("failed to send media: %v", err)), nil
 			}
 			if resp.GetStatus() != gmproto.SendMessageResponse_SUCCESS {
-				return errorResult(fmt.Sprintf("failed to send media: %s", resp.GetStatus().String())), nil
+				a.RecordGoogleSendOutcomeWithPhone(false, a.GooglePhoneResponding())
+				return errorResult(app.GoogleSendRejectedMessage(resp.GetStatus().String(), a.GooglePhoneResponding())), nil
 			}
+			a.RecordGoogleSendOutcome(true)
 			now := time.Now().UnixMilli()
 			msg := &db.Message{
 				MessageID:      payload.TmpID,

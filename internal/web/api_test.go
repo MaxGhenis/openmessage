@@ -231,6 +231,92 @@ func TestSetConversationNotificationMode(t *testing.T) {
 	}
 }
 
+func TestSetConversationFavorite(t *testing.T) {
+	ts := newTestServer(t)
+	if err := ts.store.UpsertConversation(&db.Conversation{
+		ConversationID: "c1",
+		Name:           "Alice",
+		LastMessageTS:  100,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := http.Post(ts.server.URL+"/api/conversations/c1/favorite", "application/json", strings.NewReader(`{"favorite":true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("got status %d, want 200: %s", resp.StatusCode, body)
+	}
+
+	var convo db.Conversation
+	if err := json.NewDecoder(resp.Body).Decode(&convo); err != nil {
+		t.Fatal(err)
+	}
+	if !convo.IsFavorite {
+		t.Fatal("response conversation should be favorite")
+	}
+
+	stored, err := ts.store.GetConversation("c1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !stored.IsFavorite {
+		t.Fatal("stored conversation should be favorite")
+	}
+}
+
+func TestSetConversationFavoriteMissingConversation(t *testing.T) {
+	ts := newTestServer(t)
+
+	resp, err := http.Post(ts.server.URL+"/api/conversations/missing/favorite", "application/json", strings.NewReader(`{"favorite":true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNotFound {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("got status %d, want 404: %s", resp.StatusCode, body)
+	}
+}
+
+func TestSetConversationFavoriteRequiresBoolean(t *testing.T) {
+	ts := newTestServer(t)
+	if err := ts.store.UpsertConversation(&db.Conversation{
+		ConversationID: "c1",
+		Name:           "Alice",
+		LastMessageTS:  100,
+		IsFavorite:     true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, body := range []string{`{}`, `{"favorite":null}`} {
+		resp, err := http.Post(ts.server.URL+"/api/conversations/c1/favorite", "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if resp.StatusCode != http.StatusBadRequest {
+			respBody, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			t.Fatalf("body %s got status %d, want 400: %s", body, resp.StatusCode, respBody)
+		}
+		resp.Body.Close()
+	}
+
+	stored, err := ts.store.GetConversation("c1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !stored.IsFavorite {
+		t.Fatal("invalid favorite requests should not clear stored favorite state")
+	}
+}
+
 func TestSetConversationNotificationModeRejectsInvalid(t *testing.T) {
 	ts := newTestServer(t)
 	if err := ts.store.UpsertConversation(&db.Conversation{
@@ -425,6 +511,60 @@ func TestSetTranscriptRequiresTranscriptField(t *testing.T) {
 	if resp.StatusCode != http.StatusBadRequest {
 		body, _ := io.ReadAll(resp.Body)
 		t.Fatalf("got status %d, want 400: %s", resp.StatusCode, body)
+	}
+}
+
+func TestSetTranscriptRejectsOversizedPayload(t *testing.T) {
+	ts := newTestServer(t)
+
+	tooLong := strings.Repeat("x", db.MaxTranscriptBytes+1)
+	payload, err := json.Marshal(map[string]string{
+		"message_id": "audio-1",
+		"transcript": tooLong,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.Post(ts.server.URL+"/api/transcript", "application/json", strings.NewReader(string(payload)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("got status %d, want 413: %s", resp.StatusCode, body)
+	}
+}
+
+func TestConversationTabMoveRejectsUnknownTargets(t *testing.T) {
+	ts := newTestServer(t)
+	if err := ts.store.UpsertConversation(&db.Conversation{
+		ConversationID: "conv-tab-1",
+		Name:           "Tab Target",
+		LastMessageTS:  1000,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := http.Post(ts.server.URL+"/api/conversations/conv-tab-1/tab", "application/json", strings.NewReader(`{"tab":"missing-tab"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("single move status = %d, want 400: %s", resp.StatusCode, body)
+	}
+
+	resp2, err := http.Post(ts.server.URL+"/api/conversations/move", "application/json", strings.NewReader(`{"ids":["conv-tab-1"],"tab":"missing-tab"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp2.Body.Close()
+	if resp2.StatusCode != http.StatusBadRequest {
+		body, _ := io.ReadAll(resp2.Body)
+		t.Fatalf("bulk move status = %d, want 400: %s", resp2.StatusCode, body)
 	}
 }
 
@@ -661,6 +801,7 @@ func TestSearchMessages(t *testing.T) {
 		Participants:   `[{"name":"Nathan","number":"+12675550100"}]`,
 		LastMessageTS:  200,
 		SourcePlatform: "sms",
+		IsFavorite:     true,
 	})
 	ts.store.UpsertMessage(&db.Message{
 		MessageID: "m1", ConversationID: "c1", Body: "lunch tomorrow?",
@@ -693,6 +834,9 @@ func TestSearchMessages(t *testing.T) {
 	}
 	if results[0].Name != "Nathan" {
 		t.Fatalf("got name %q, want Nathan", results[0].Name)
+	}
+	if !results[0].IsFavorite {
+		t.Fatal("search result should include favorite state")
 	}
 }
 
@@ -1595,6 +1739,17 @@ func TestGoogleNetworkErrorIsUserFacing(t *testing.T) {
 	}
 	if strings.Contains(got, "instantmessaging") || strings.Contains(got, "dial tcp") {
 		t.Fatalf("error leaked transport details: %q", got)
+	}
+}
+
+func TestGoogleAuthExpiredErrorIsUserFacing(t *testing.T) {
+	raw := "HTTP 401: 16: Request had invalid authentication credentials. Expected OAuth 2 access token, login cookie or other valid authentication credential."
+	got := googleAPIErrorMessage("get conversation", errors.New(raw))
+	if got != "Google Messages session expired; refreshing and reconnecting. Try again in a few seconds." {
+		t.Fatalf("error = %q", got)
+	}
+	if strings.Contains(got, "OAuth") || strings.Contains(got, "credential") || strings.Contains(got, "HTTP 401") {
+		t.Fatalf("error leaked auth details: %q", got)
 	}
 }
 
@@ -2665,6 +2820,12 @@ func TestLinkPreviewEndpoint(t *testing.T) {
 				Domain:      "example.com",
 			}, nil
 		},
+		FetchLinkPreviewImage: func(ctx context.Context, rawURL string) ([]byte, string, error) {
+			if rawURL != "https://cdn.example.com/story.png" {
+				t.Fatalf("unexpected image URL %q", rawURL)
+			}
+			return []byte("png-bytes"), "image/png", nil
+		},
 	})
 
 	resp, err := http.Get(ts.server.URL + "/api/link-preview?url=https%3A%2F%2Fexample.com%2Fstory")
@@ -2684,8 +2845,28 @@ func TestLinkPreviewEndpoint(t *testing.T) {
 	if preview.Title != "Example Story" {
 		t.Fatalf("got title %q", preview.Title)
 	}
-	if preview.ImageURL != "https://cdn.example.com/story.png" {
+	wantImageURL := "/api/link-preview-image?url=https%3A%2F%2Fcdn.example.com%2Fstory.png"
+	if preview.ImageURL != wantImageURL {
 		t.Fatalf("got image %q", preview.ImageURL)
+	}
+
+	imageResp, err := http.Get(ts.server.URL + preview.ImageURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer imageResp.Body.Close()
+	if imageResp.StatusCode != http.StatusOK {
+		t.Fatalf("image status = %d, want 200", imageResp.StatusCode)
+	}
+	if got := imageResp.Header.Get("Content-Type"); got != "image/png" {
+		t.Fatalf("image content type = %q, want image/png", got)
+	}
+	body, err := io.ReadAll(imageResp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) != "png-bytes" {
+		t.Fatalf("image body = %q", body)
 	}
 }
 
@@ -2880,16 +3061,121 @@ func TestAPIRejectsCrossOriginRequests(t *testing.T) {
 		t.Fatal("same-origin POST should not be forbidden")
 	}
 
-	// A loopback Origin is allowed.
+	// The exact same loopback Origin is allowed.
 	req3, _ := http.NewRequest("POST", ts.server.URL+"/api/backfill", strings.NewReader("{}"))
-	req3.Header.Set("Origin", "http://127.0.0.1:7007")
+	req3.Header.Set("Origin", ts.server.URL)
 	resp3, err := http.DefaultClient.Do(req3)
 	if err != nil {
 		t.Fatal(err)
 	}
 	resp3.Body.Close()
 	if resp3.StatusCode == http.StatusForbidden {
-		t.Fatal("loopback-origin POST should not be forbidden")
+		t.Fatal("same-origin loopback POST should not be forbidden")
+	}
+
+	// A different loopback port is still cross-origin and must be rejected.
+	req4, _ := http.NewRequest("POST", ts.server.URL+"/api/backfill", strings.NewReader("{}"))
+	req4.Header.Set("Origin", "http://127.0.0.1:1")
+	resp4, err := http.DefaultClient.Do(req4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp4.Body.Close()
+	if resp4.StatusCode != http.StatusForbidden {
+		t.Fatalf("other-loopback-origin POST: got %d, want 403", resp4.StatusCode)
+	}
+}
+
+func TestMCPRouteRejectsCrossOriginRequests(t *testing.T) {
+	store, err := db.New(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	mcpHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("mcp ok"))
+	})
+	h := APIHandlerWithOptions(store, nil, zerolog.Nop(), mcpHandler, APIOptions{})
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	req, _ := http.NewRequest("GET", srv.URL+"/mcp/sse", nil)
+	req.Header.Set("Origin", "http://evil.example.com")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("cross-origin MCP: got %d, want 403", resp.StatusCode)
+	}
+
+	req2, _ := http.NewRequest("GET", srv.URL+"/mcp/sse", nil)
+	req2.Header.Set("Origin", srv.URL)
+	resp2, err := http.DefaultClient.Do(req2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("same-origin MCP: got %d, want 200", resp2.StatusCode)
+	}
+
+	req3, _ := http.NewRequest("POST", srv.URL+"/mcp", nil)
+	req3.Header.Set("Origin", "http://evil.example.com")
+	resp3, err := http.DefaultClient.Do(req3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp3.Body.Close()
+	if resp3.StatusCode != http.StatusForbidden {
+		t.Fatalf("cross-origin MCP exact path: got %d, want 403", resp3.StatusCode)
+	}
+
+	req4, _ := http.NewRequest("POST", srv.URL+"/mcp", nil)
+	req4.Header.Set("Origin", srv.URL)
+	resp4, err := http.DefaultClient.Do(req4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp4.Body.Close()
+	if resp4.StatusCode != http.StatusOK {
+		t.Fatalf("same-origin MCP exact path: got %d, want 200", resp4.StatusCode)
+	}
+}
+
+func TestProtectLocalControlRejectsMCPOnlyCrossOriginRequests(t *testing.T) {
+	protected := ProtectLocalControl(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/mcp/sse" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	srv := httptest.NewServer(protected)
+	defer srv.Close()
+
+	req, _ := http.NewRequest("GET", srv.URL+"/mcp/sse", nil)
+	req.Header.Set("Origin", "http://evil.example.com")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("cross-origin MCP-only route: got %d, want 403", resp.StatusCode)
+	}
+
+	req2, _ := http.NewRequest("GET", srv.URL+"/mcp/sse", nil)
+	req2.Header.Set("Origin", srv.URL)
+	resp2, err := http.DefaultClient.Do(req2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("same-origin MCP-only route: got %d, want 200", resp2.StatusCode)
 	}
 }
 
@@ -3188,17 +3474,17 @@ func TestAPIGuardRejectsEmptyHost(t *testing.T) {
 	// the way a hand-rolled client omitting it would reach it.
 	r := httptest.NewRequest(http.MethodGet, "/api/conversations", nil)
 	r.Host = ""
-	if isLocalAPIRequest(r) {
+	if isLocalControlRequest(r) {
 		t.Fatal("request with empty Host must not pass the loopback guard")
 	}
 
 	r.Host = "127.0.0.1:7007"
-	if !isLocalAPIRequest(r) {
+	if !isLocalControlRequest(r) {
 		t.Fatal("loopback Host must pass the guard")
 	}
 
 	r.Host = "evil.example.com"
-	if isLocalAPIRequest(r) {
+	if isLocalControlRequest(r) {
 		t.Fatal("non-loopback Host must not pass the guard")
 	}
 }

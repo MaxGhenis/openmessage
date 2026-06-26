@@ -14,6 +14,11 @@ import (
 	"github.com/maxghenis/openmessage/internal/db"
 )
 
+const (
+	maxPhotoBytes      = 15 << 20
+	maxTotalPhotoBytes = 120 << 20
+)
+
 // Photo holds a photo's data URI and metadata for chronological placement.
 type Photo struct {
 	DataURI  string    `json:"data_uri"`
@@ -52,6 +57,9 @@ func EncodePhotosFromDir(dir string, maxPhotos int) ([]Photo, error) {
 		if e.IsDir() {
 			continue
 		}
+		if e.Type()&os.ModeSymlink != 0 {
+			continue
+		}
 		ext := strings.ToLower(filepath.Ext(e.Name()))
 		switch ext {
 		case ".jpg", ".jpeg", ".png", ".webp", ".gif":
@@ -82,7 +90,22 @@ func EncodePhotosFromPaths(paths []string) ([]Photo, error) {
 // base64 data URIs and dates parsed from filenames.
 func encodeFiles(paths []string) ([]Photo, error) {
 	var photos []Photo
+	totalBytes := int64(0)
 	for _, p := range paths {
+		info, err := os.Lstat(p)
+		if err != nil {
+			continue
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			continue
+		}
+		if info.Size() > maxPhotoBytes {
+			return nil, fmt.Errorf("%s exceeds %d bytes", p, maxPhotoBytes)
+		}
+		totalBytes += info.Size()
+		if totalBytes > maxTotalPhotoBytes {
+			return nil, fmt.Errorf("photos exceed %d bytes total", maxTotalPhotoBytes)
+		}
 		data, err := os.ReadFile(p)
 		if err != nil {
 			continue
@@ -120,8 +143,8 @@ func SortPhotosByDate(photos []Photo) {
 // Supports: IMG-20251211-WA0053.jpg (WhatsApp), IMG_20251211_123456.jpg,
 // 20251211_123456.jpg, photo_2025-12-11.jpg, etc.
 var datePatterns = []*regexp.Regexp{
-	regexp.MustCompile(`(\d{4})-(\d{2})-(\d{2})`),     // 2025-12-11
-	regexp.MustCompile(`(\d{4})(\d{2})(\d{2})`),        // 20251211
+	regexp.MustCompile(`(\d{4})-(\d{2})-(\d{2})`), // 2025-12-11
+	regexp.MustCompile(`(\d{4})(\d{2})(\d{2})`),   // 20251211
 }
 
 func parseDateFromFilename(name string) time.Time {
