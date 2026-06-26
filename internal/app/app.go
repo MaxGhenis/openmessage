@@ -221,6 +221,17 @@ func (a *App) ClearGoogleRepairFlag() {
 	a.googleNeedsRepair.Store(false)
 }
 
+// FlagGoogleNeedsRepair marks the Google Messages session as needing a manual
+// re-pair (cookies expired and no automated refresh is available), so the
+// reconnect watchdog stops retrying and the UI surfaces a "Re-pair" banner. The
+// status change is emitted only on the false->true transition to avoid
+// re-arming the watchdog in a loop.
+func (a *App) FlagGoogleNeedsRepair() {
+	if a.googleNeedsRepair.CompareAndSwap(false, true) {
+		a.emitStatusChange(a.Connected.Load())
+	}
+}
+
 // RecordGooglePhoneResponding tracks whether the paired Android phone is
 // currently answering Google Messages requests. This is distinct from
 // NeedsRepair: a non-responding phone may simply be off or offline.

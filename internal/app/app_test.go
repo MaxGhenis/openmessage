@@ -268,8 +268,8 @@ func TestHandleGoogleAuthExpiredErrorMarksDisconnected(t *testing.T) {
 	if !statusEmitted {
 		t.Fatal("expected status change event")
 	}
-	if a.googleNeedsRepair.Load() {
-		t.Fatal("auth expiry should clear repair flag and use reconnect flow")
+	if !a.googleNeedsRepair.Load() {
+		t.Fatal("auth expiry must NOT clear an existing repair flag: clearing it defeats the reconnect-watchdog back-off and storms Google's auth endpoint on platforms with no cookie-refresh script (e.g. macOS)")
 	}
 	if got := a.GoogleStatus().LastError; got != googleAuthExpiredStatusMessage {
 		t.Fatalf("last error = %q, want %q", got, googleAuthExpiredStatusMessage)

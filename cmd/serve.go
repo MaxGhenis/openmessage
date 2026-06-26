@@ -227,26 +227,33 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 				}
 				lastAttempt = time.Now()
 				g := a.GoogleStatus()
-				// Skip reconnect when sends prove the linked device needs a
-				// manual re-pair. Cookie-expiry 401s clear NeedsRepair and use
-				// the auth-refresh reconnect path below.
-				if !g.Paired || g.Connected || g.NeedsPairing || g.NeedsRepair {
+				hasRefreshScript := strings.TrimSpace(os.Getenv("OPENMESSAGE_COOKIE_REFRESH_SCRIPT")) != ""
+				switch planGoogleReconnect(g, hasRefreshScript) {
+				case googleReconnectSkip:
 					return
-				}
-				if googleStatusNeedsCookieRefresh(g) {
-					if strings.TrimSpace(os.Getenv("OPENMESSAGE_COOKIE_REFRESH_SCRIPT")) != "" {
-						logger.Info().Msg("Google auth expired - refreshing Chrome cookies before reconnect")
-						ctx, cancel := context.WithTimeout(context.Background(), googleCookieRefreshTimeout)
-						err := refreshGoogleSessionCookies(ctx)
-						cancel()
-						if err != nil {
-							logger.Warn().Err(err).Msg("Google cookie refresh before reconnect failed")
-						} else {
-							logger.Info().Msg("Refreshed Google cookies before reconnect")
-						}
+				case googleReconnectPark:
+					// Dead linked-device session with no way to auto-recover
+					// (no cookie-refresh script). Stop reconnecting so we don't
+					// hammer Google's auth endpoint every cycle; flag it so the
+					// UI prompts a manual re-pair. A successful re-pair clears
+					// the flag and reconnect resumes.
+					a.FlagGoogleNeedsRepair()
+					return
+				case googleReconnectRefresh:
+					// Cookies expired but a refresh script is configured: refresh
+					// then reconnect, even if the session was flagged for repair.
+					logger.Info().Msg("Google auth expired - refreshing Chrome cookies before reconnect")
+					ctx, cancel := context.WithTimeout(context.Background(), googleCookieRefreshTimeout)
+					err := refreshGoogleSessionCookies(ctx)
+					cancel()
+					if err != nil {
+						logger.Warn().Err(err).Msg("Google cookie refresh before reconnect failed")
 					} else {
-						logger.Info().Msg("Google auth expired - reconnecting without cookie refresh script")
+						logger.Info().Msg("Refreshed Google cookies before reconnect")
 					}
+					a.ClearGoogleRepairFlag()
+				case googleReconnectRetry:
+					// Ordinary transient disconnect — just reconnect.
 				}
 				logger.Info().Str("trigger", trigger).Msg("Google Messages disconnected - attempting reconnect")
 				if err := a.ReconnectGoogleMessages(); err != nil {
@@ -630,6 +637,42 @@ const googleCookieRefreshTimeout = 20 * time.Second
 
 func googleStatusNeedsCookieRefresh(g app.GoogleStatusSnapshot) bool {
 	return g.AuthExpired || app.IsGoogleAuthExpiredError(fmt.Errorf("%s", g.LastError))
+}
+
+// googleReconnectAction is the reconnect watchdog's decision for a Google
+// Messages session that is currently disconnected.
+type googleReconnectAction int
+
+const (
+	googleReconnectSkip    googleReconnectAction = iota // connected, unpaired, or awaiting first-time pairing
+	googleReconnectRefresh                              // cookies expired and a refresh script is available
+	googleReconnectPark                                 // dead session, no automated recovery — wait for manual re-pair
+	googleReconnectRetry                                // ordinary transient disconnect
+)
+
+// planGoogleReconnect decides what the reconnect watchdog should do for a
+// disconnected Google Messages session. It is pure so the back-off behaviour
+// can be unit-tested without driving the live loop.
+//
+// Key invariant: a session whose cookies have expired is only retried
+// automatically when a cookie-refresh script is configured. Without one (e.g.
+// the macOS app) a reconnect just 401s again, so we park and let the UI prompt
+// a manual re-pair instead of spinning a reconnect storm against Google's auth
+// endpoint — the failure docs/agent-runbook.md warns about.
+func planGoogleReconnect(g app.GoogleStatusSnapshot, hasRefreshScript bool) googleReconnectAction {
+	if !g.Paired || g.Connected || g.NeedsPairing {
+		return googleReconnectSkip
+	}
+	if googleStatusNeedsCookieRefresh(g) {
+		if hasRefreshScript {
+			return googleReconnectRefresh
+		}
+		return googleReconnectPark
+	}
+	if g.NeedsRepair {
+		return googleReconnectPark
+	}
+	return googleReconnectRetry
 }
 
 var refreshGoogleSessionCookies = func(ctx context.Context) error {

@@ -17,14 +17,18 @@ func IsGoogleAuthExpiredError(err error) bool {
 		strings.Contains(msg, "invalid authentication credentials")
 }
 
-// HandleGoogleAuthExpiredError marks Google disconnected for auth-expiry
-// errors so external watchdogs can refresh cookies and reconnect.
+// HandleGoogleAuthExpiredError marks Google disconnected for auth-expiry errors
+// so the reconnect watchdog can refresh cookies and reconnect. It deliberately
+// does NOT clear the needs-repair flag: whether an expired session is
+// recoverable depends on a cookie-refresh script being configured, and that
+// decision lives in the watchdog (see planGoogleReconnect). Clearing it here
+// would defeat the watchdog's back-off and, with no refresh script (e.g. the
+// macOS app), spin a reconnect storm against Google's auth endpoint.
 func (a *App) HandleGoogleAuthExpiredError(err error) bool {
 	if !IsGoogleAuthExpiredError(err) {
 		return false
 	}
 	a.Connected.Store(false)
-	a.ClearGoogleRepairFlag()
 	a.googleAuthExpired.Store(true)
 	a.setGoogleLastError(googleAuthExpiredStatusMessage)
 	a.emitStatusChange(false)
