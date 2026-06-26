@@ -33,6 +33,45 @@ async function expectLastMessageVisible(page) {
     .toBe(true);
 }
 
+async function rememberStableThreadNode(page) {
+  await page.locator('#messages-area .msg').first().waitFor();
+  await page.evaluate(() => {
+    const node = document.querySelector('#messages-area .msg');
+    if (!node) throw new Error('message node not found');
+    node.dataset.e2eStableThreadNode = 'true';
+    window.__openMessageStableThreadNode = node;
+  });
+}
+
+async function expectStableThreadNodeStillMounted(page) {
+  await expect
+    .poll(async () => page.evaluate(() => {
+      const node = window.__openMessageStableThreadNode;
+      return !!node && node.isConnected && node.dataset.e2eStableThreadNode === 'true';
+    }))
+    .toBe(true);
+}
+
+async function rememberStableSidebarRow(page, rowText) {
+  await page.locator('#conversation-list .convo-item').filter({ hasText: rowText }).first().waitFor();
+  await page.evaluate((text) => {
+    const rows = Array.from(document.querySelectorAll('#conversation-list .convo-item'));
+    const row = rows.find(el => el.textContent.includes(text));
+    if (!row) throw new Error('sidebar row not found');
+    row.dataset.e2eStableSidebarRow = 'true';
+    window.__openMessageStableSidebarRow = row;
+  }, rowText);
+}
+
+async function expectStableSidebarRowStillMounted(page) {
+  await expect
+    .poll(async () => page.evaluate(() => {
+      const row = window.__openMessageStableSidebarRow;
+      return !!row && row.isConnected && row.dataset.e2eStableSidebarRow === 'true';
+    }))
+    .toBe(true);
+}
+
 async function installFakeNotifications(page) {
   await page.evaluate(() => {
     const created = [];
@@ -752,6 +791,18 @@ test('sends a message through the compose box', async ({ page }) => {
   await expect(page.locator('#messages-area')).toContainText(outbound);
 });
 
+test('keeps existing thread nodes mounted after sending', async ({ page }) => {
+  const outbound = `Stable send ${Date.now()}`;
+
+  await openConversation(page, 'Sarah Chen');
+  await rememberStableThreadNode(page);
+  await page.locator('#compose-input').fill(outbound);
+  await page.locator('#send-btn').click();
+
+  await expect(page.locator('#messages-area')).toContainText(outbound);
+  await expectStableThreadNodeStillMounted(page);
+});
+
 test('sends a Signal text message through the compose box', async ({ page }) => {
   const outbound = `Signal outbound ${Date.now()}`;
 
@@ -1075,6 +1126,27 @@ test('refreshes the active thread from SSE invalidations', async ({ page, reques
   });
 
   await expect(page.locator('#messages-area')).toContainText(inbound);
+});
+
+test('keeps unchanged thread and sidebar nodes mounted for inbound live messages', async ({ page, request }) => {
+  const inbound = `Stable inbound ${Date.now()}`;
+
+  await openConversation(page, 'Sarah Chen');
+  await rememberStableThreadNode(page);
+  await rememberStableSidebarRow(page, 'Marcus Johnson');
+  await request.post('/_e2e/messages', {
+    data: {
+      body: inbound,
+      conversation_id: 'conv1',
+      sender_name: 'Sarah Chen',
+      sender_number: '+14155551234',
+    },
+  });
+
+  await expect(page.locator('#messages-area')).toContainText(inbound);
+  await expect(page.locator('#conversation-list .convo-item').filter({ hasText: 'Sarah Chen' }).first()).toContainText(inbound);
+  await expectStableThreadNodeStillMounted(page);
+  await expectStableSidebarRowStillMounted(page);
 });
 
 test('keeps the active thread pinned to the bottom for inbound live messages', async ({ page, request }) => {

