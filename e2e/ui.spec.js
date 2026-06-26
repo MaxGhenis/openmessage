@@ -1616,44 +1616,51 @@ test('narrow viewport uses single-pane flow with back button', async ({ page }) 
   await expect(page.locator('.sidebar')).toBeVisible();
 });
 
-test('service worker keeps APIs network-only and serves the shell offline', async ({ page, context }) => {
-  await page.evaluate(async () => {
-    for (const registration of await navigator.serviceWorker.getRegistrations()) {
-      await registration.unregister();
-    }
-    for (const key of await caches.keys()) {
-      await caches.delete(key);
-    }
-    await caches.open('openmessage-static-old-test');
-  });
-
-  await page.goto('/');
-  await page.evaluate(async () => {
-    await navigator.serviceWorker.ready;
-  });
-  await page.reload();
-  await expect
-    .poll(async () => page.evaluate(() => !!navigator.serviceWorker.controller))
-    .toBe(true);
-
-  const cacheKeys = await page.evaluate(async () => caches.keys());
-  expect(cacheKeys).toContain('openmessage-static-v1');
-  expect(cacheKeys).not.toContain('openmessage-static-old-test');
-
-  const apiCached = await page.evaluate(async () => {
-    const response = await fetch('/api/status');
-    if (!response.ok) return 'api-failed';
-    const cache = await caches.open('openmessage-static-v1');
-    return !!(await cache.match('/api/status'));
-  });
-  expect(apiCached).toBe(false);
-
-  await context.setOffline(true);
+test('service worker keeps APIs network-only and serves the shell offline', async ({ browser, baseURL }) => {
+  const context = await browser.newContext({ baseURL, serviceWorkers: 'allow' });
+  const page = await context.newPage();
   try {
-    await page.goto('/offline-shell-check', { waitUntil: 'domcontentloaded' });
-    await expect(page.locator('#app')).toBeVisible();
+    await page.goto('/');
+    await page.evaluate(async () => {
+      for (const registration of await navigator.serviceWorker.getRegistrations()) {
+        await registration.unregister();
+      }
+      for (const key of await caches.keys()) {
+        await caches.delete(key);
+      }
+      await caches.open('openmessage-static-old-test');
+    });
+
+    await page.goto('/');
+    await page.evaluate(async () => {
+      await navigator.serviceWorker.ready;
+    });
+    await page.reload();
+    await expect
+      .poll(async () => page.evaluate(() => !!navigator.serviceWorker.controller))
+      .toBe(true);
+
+    const cacheKeys = await page.evaluate(async () => caches.keys());
+    expect(cacheKeys).toContain('openmessage-static-v1');
+    expect(cacheKeys).not.toContain('openmessage-static-old-test');
+
+    const apiCached = await page.evaluate(async () => {
+      const response = await fetch('/api/status');
+      if (!response.ok) return 'api-failed';
+      const cache = await caches.open('openmessage-static-v1');
+      return !!(await cache.match('/api/status'));
+    });
+    expect(apiCached).toBe(false);
+
+    await context.setOffline(true);
+    try {
+      await page.goto('/offline-shell-check', { waitUntil: 'domcontentloaded' });
+      await expect(page.locator('#app')).toBeVisible();
+    } finally {
+      await context.setOffline(false);
+    }
   } finally {
-    await context.setOffline(false);
+    await context.close();
   }
 });
 
