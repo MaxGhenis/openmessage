@@ -652,10 +652,16 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 
 		resp, err := cli.GM.SendMessage(payload)
 		if err != nil {
-			if !markGoogleAuthExpired(err) {
+			authExpired := markGoogleAuthExpired(err)
+			if !authExpired {
 				recordGoogleSendError(err)
 			}
-			if googleSendErrorCanRetry(err) {
+			// The send POST was already attempted. Only an auth rejection proves the
+			// message was NOT dispatched, so release the claim to let a retry (after
+			// re-pair) send it. Any other error (network/timeout) is ambiguous: the
+			// message may have reached Google, so keep the claim and let a retry hit
+			// the dedup (409) instead of delivering a duplicate text.
+			if authExpired {
 				releaseIdempotentSend(idempotencyKey)
 			} else {
 				completeIdempotentSend(idempotencyKey, payload.TmpID, db.OutgoingSendStatusFailed)
@@ -1642,10 +1648,16 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 
 		resp, err := cli.GM.SendMessage(payload)
 		if err != nil {
-			if !markGoogleAuthExpired(err) {
+			authExpired := markGoogleAuthExpired(err)
+			if !authExpired {
 				recordGoogleSendError(err)
 			}
-			if googleSendErrorCanRetry(err) {
+			// The send POST was already attempted. Only an auth rejection proves the
+			// message was NOT dispatched, so release the claim to let a retry (after
+			// re-pair) send it. Any other error (network/timeout) is ambiguous: the
+			// message may have reached Google, so keep the claim and let a retry hit
+			// the dedup (409) instead of delivering a duplicate text.
+			if authExpired {
 				releaseIdempotentSend(idempotencyKey)
 			} else {
 				completeIdempotentSend(idempotencyKey, payload.TmpID, db.OutgoingSendStatusFailed)
@@ -3225,17 +3237,6 @@ func googleAPIErrorMessage(action string, err error) string {
 		return "Google Messages is offline. Check your internet connection, then try again."
 	}
 	return action + ": " + err.Error()
-}
-
-func googleSendErrorCanRetry(err error) bool {
-	if err == nil {
-		return false
-	}
-	if app.IsGoogleAuthExpiredError(err) || isGoogleNetworkError(err) {
-		return true
-	}
-	message := strings.ToLower(err.Error())
-	return strings.Contains(message, "not connected") || strings.Contains(message, "disconnected")
 }
 
 // googleSendRejectedMessage builds the user-facing error for a non-SUCCESS

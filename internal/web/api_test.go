@@ -1887,43 +1887,6 @@ func TestGoogleNetworkErrorIsUserFacing(t *testing.T) {
 	}
 }
 
-func TestGoogleSendErrorCanRetry(t *testing.T) {
-	tests := []struct {
-		name string
-		err  error
-		want bool
-	}{
-		{
-			name: "network",
-			err:  errors.New("Google Messages is offline. Check your internet connection, then try again."),
-			want: true,
-		},
-		{
-			name: "not connected",
-			err:  errors.New("not connected to Google Messages"),
-			want: true,
-		},
-		{
-			name: "auth expired",
-			err:  errors.New("HTTP 401: Request had invalid authentication credentials."),
-			want: true,
-		},
-		{
-			name: "non retryable",
-			err:  errors.New("send message: invalid recipient"),
-			want: false,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := googleSendErrorCanRetry(tt.err); got != tt.want {
-				t.Fatalf("googleSendErrorCanRetry() = %v, want %v", got, tt.want)
-			}
-		})
-	}
-}
-
 func TestGoogleAuthExpiredErrorIsUserFacing(t *testing.T) {
 	raw := "HTTP 401: 16: Request had invalid authentication credentials. Expected OAuth 2 access token, login cookie or other valid authentication credential."
 	got := googleAPIErrorMessage("get conversation", errors.New(raw))
