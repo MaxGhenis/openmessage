@@ -41,6 +41,20 @@ final class NotificationManager: NSObject, ObservableObject, UNUserNotificationC
         }
     }
 
+    private struct PlatformStatus: Decodable {
+        struct Google: Decodable {
+            let connected: Bool?
+            let paired: Bool?
+            let needs_repair: Bool?
+        }
+        struct WhatsApp: Decodable {
+            let connected: Bool?
+            let paired: Bool?
+        }
+        let google: Google?
+        let whatsapp: WhatsApp?
+    }
+
     private let logger = Logger(subsystem: "com.openmessage.app", category: "Notifications")
     private let defaults = UserDefaults.standard
     private let baseURL: URL
@@ -49,6 +63,11 @@ final class NotificationManager: NSObject, ObservableObject, UNUserNotificationC
     private var seenMessageIDs = Set<String>()
     private var seenMessageOrder: [String] = []
     private var preferenceEnabled: Bool
+    // Platform keys currently in a notified "needs attention" state, so we alert
+    // on the rising edge only (once per outage) and re-arm after recovery. The
+    // failure this guards against is a platform silently dying for days — the
+    // 15-day Google staleness that motivated this.
+    private var alertedBrokenPlatforms = Set<String>()
 
     private let recentConversationLimit = 50
     private let recentMessageLimit = 10
@@ -238,6 +257,9 @@ final class NotificationManager: NSObject, ObservableObject, UNUserNotificationC
 
             // Catch up after any reconnect or transport failure.
             await scanRecentConversations(notify: true)
+            // Safety net: also re-check platform health here, so a needs-repair
+            // flag that flips while our SSE stream is down isn't missed.
+            await checkPlatformHealth()
             try? await Task.sleep(for: reconnectDelay)
         }
     }
@@ -287,8 +309,69 @@ final class NotificationManager: NSObject, ObservableObject, UNUserNotificationC
         switch eventName {
         case "messages", "conversations":
             await scanRecentConversations(notify: true)
+        case "status":
+            await checkPlatformHealth()
         default:
             break
+        }
+    }
+
+    /// Alerts the user once when a messaging platform enters a state that needs
+    /// manual intervention (Google Messages flagged for re-pair, or WhatsApp
+    /// logged out) and won't self-heal. Re-arms after the platform recovers so
+    /// a later outage alerts again. Without this a platform can go dark for days
+    /// with no signal beyond a subtle in-app badge.
+    private func checkPlatformHealth() async {
+        guard preferenceEnabled else { return }
+        let status: PlatformStatus
+        do {
+            let (data, _) = try await URLSession.shared.data(from: apiURL(pathComponents: ["api", "status"]))
+            status = try JSONDecoder().decode(PlatformStatus.self, from: data)
+        } catch {
+            logger.debug("Health check fetch error: \(error)")
+            return
+        }
+
+        evaluatePlatformHealth(
+            key: "google",
+            broken: (status.google?.paired ?? false) && (status.google?.needs_repair ?? false),
+            title: "Google Messages needs attention",
+            body: "SMS/RCS sync stopped and couldn't auto-recover. Open OpenMessage to re-pair."
+        )
+        evaluatePlatformHealth(
+            key: "whatsapp",
+            broken: !(status.whatsapp?.paired ?? true),
+            title: "WhatsApp needs attention",
+            body: "WhatsApp was logged out. Open OpenMessage to scan the QR code and reconnect."
+        )
+    }
+
+    private func evaluatePlatformHealth(key: String, broken: Bool, title: String, body: String) {
+        if broken {
+            guard !alertedBrokenPlatforms.contains(key) else { return }
+            alertedBrokenPlatforms.insert(key)
+            sendHealthNotification(key: key, title: title, body: body)
+        } else {
+            alertedBrokenPlatforms.remove(key)
+        }
+    }
+
+    private func sendHealthNotification(key: String, title: String, body: String) {
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        content.sound = .default
+        content.userInfo = ["healthAlert": key]
+
+        let request = UNNotificationRequest(
+            identifier: "health-\(key)",
+            content: content,
+            trigger: nil
+        )
+        UNUserNotificationCenter.current().add(request) { error in
+            if let error {
+                self.logger.error("Failed to send health notification: \(error)")
+            }
         }
     }
 

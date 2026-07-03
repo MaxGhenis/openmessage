@@ -145,10 +145,14 @@ func TestIMessageSyncSupported(t *testing.T) {
 
 func TestRefreshGoogleSessionCookiesSkipsWhenUnconfigured(t *testing.T) {
 	t.Setenv("OPENMESSAGE_COOKIE_REFRESH_SCRIPT", "")
+	// Point the native refresh at an empty profile dir so NativeSupported()
+	// is false regardless of whether the CI host has a real Chrome profile;
+	// this test asserts the no-script, no-native path is a clean no-op.
+	t.Setenv("OPENMESSAGE_CHROME_PROFILE", t.TempDir())
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	if err := refreshGoogleSessionCookies(ctx); err != nil {
+	if err := refreshGoogleSessionCookies(ctx, ""); err != nil {
 		t.Fatalf("refreshGoogleSessionCookies(): %v", err)
 	}
 }
@@ -168,7 +172,7 @@ func TestRefreshGoogleSessionCookiesUsesEnvScript(t *testing.T) {
 	// spurious "timed out" failure.
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := refreshGoogleSessionCookies(ctx); err != nil {
+	if err := refreshGoogleSessionCookies(ctx, ""); err != nil {
 		t.Fatalf("refreshGoogleSessionCookies(): %v", err)
 	}
 
