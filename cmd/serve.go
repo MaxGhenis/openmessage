@@ -20,6 +20,7 @@ import (
 
 	"github.com/maxghenis/openmessage/internal/app"
 	"github.com/maxghenis/openmessage/internal/db"
+	"github.com/maxghenis/openmessage/internal/googlecookies"
 	"github.com/maxghenis/openmessage/internal/importer"
 	"github.com/maxghenis/openmessage/internal/notify"
 	"github.com/maxghenis/openmessage/internal/telemetry"
@@ -227,8 +228,7 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 				}
 				lastAttempt = time.Now()
 				g := a.GoogleStatus()
-				hasRefreshScript := strings.TrimSpace(os.Getenv("OPENMESSAGE_COOKIE_REFRESH_SCRIPT")) != ""
-				switch planGoogleReconnect(g, hasRefreshScript) {
+				switch planGoogleReconnect(g, canRefreshGoogleCookies()) {
 				case googleReconnectSkip:
 					return
 				case googleReconnectPark:
@@ -244,7 +244,7 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 					// then reconnect, even if the session was flagged for repair.
 					logger.Info().Msg("Google auth expired - refreshing Chrome cookies before reconnect")
 					ctx, cancel := context.WithTimeout(context.Background(), googleCookieRefreshTimeout)
-					err := refreshGoogleSessionCookies(ctx)
+					err := refreshGoogleSessionCookies(ctx, a.SessionPath)
 					cancel()
 					if err != nil {
 						logger.Warn().Err(err).Msg("Google cookie refresh before reconnect failed")
@@ -678,27 +678,53 @@ func planGoogleReconnect(g app.GoogleStatusSnapshot, hasRefreshScript bool) goog
 	return googleReconnectRetry
 }
 
-var refreshGoogleSessionCookies = func(ctx context.Context) error {
+// canRefreshGoogleCookies reports whether an expired Google session can be
+// recovered automatically — either via a configured external refresh script or
+// the built-in native refresh (macOS with a Chrome profile). When neither is
+// available (e.g. a Linux install with no script), planGoogleReconnect parks
+// the session and the UI prompts a manual re-pair instead of spinning 401s.
+func canRefreshGoogleCookies() bool {
+	if strings.TrimSpace(os.Getenv("OPENMESSAGE_COOKIE_REFRESH_SCRIPT")) != "" {
+		return true
+	}
+	return googlecookies.NativeSupported()
+}
+
+// refreshGoogleSessionCookies rewrites the Google cookies in sessionPath. It
+// prefers an explicitly configured OPENMESSAGE_COOKIE_REFRESH_SCRIPT (so the
+// operator can override the mechanism), otherwise falls back to the built-in
+// native refresh. Returning nil with no work done is fine — the caller
+// reconnects afterwards regardless.
+var refreshGoogleSessionCookies = func(ctx context.Context, sessionPath string) error {
 	script := strings.TrimSpace(os.Getenv("OPENMESSAGE_COOKIE_REFRESH_SCRIPT"))
-	if script == "" {
+	if script != "" {
+		if _, err := os.Stat(script); err != nil {
+			return fmt.Errorf("refresh script unavailable at %s: %w", script, err)
+		}
+		cmd := exec.CommandContext(ctx, script, "--quiet", "--no-backup")
+		cmd.Env = os.Environ()
+		output, err := cmd.CombinedOutput()
+		if ctx.Err() != nil {
+			return fmt.Errorf("refresh Google cookies timed out after %s", googleCookieRefreshTimeout)
+		}
+		if err != nil {
+			detail := strings.TrimSpace(string(output))
+			if detail == "" {
+				return fmt.Errorf("refresh Google cookies: %w", err)
+			}
+			return fmt.Errorf("refresh Google cookies: %w: %s", err, detail)
+		}
 		return nil
 	}
-	if _, err := os.Stat(script); err != nil {
-		return fmt.Errorf("refresh script unavailable at %s: %w", script, err)
-	}
 
-	cmd := exec.CommandContext(ctx, script, "--quiet", "--no-backup")
-	cmd.Env = os.Environ()
-	output, err := cmd.CombinedOutput()
-	if ctx.Err() != nil {
-		return fmt.Errorf("refresh Google cookies timed out after %s", googleCookieRefreshTimeout)
+	if !googlecookies.NativeSupported() {
+		return nil
 	}
-	if err != nil {
-		detail := strings.TrimSpace(string(output))
-		if detail == "" {
-			return fmt.Errorf("refresh Google cookies: %w", err)
+	if err := googlecookies.Refresh(ctx, googlecookies.DefaultChromeProfile(), sessionPath); err != nil {
+		if ctx.Err() != nil {
+			return fmt.Errorf("refresh Google cookies timed out after %s", googleCookieRefreshTimeout)
 		}
-		return fmt.Errorf("refresh Google cookies: %w: %s", err, detail)
+		return fmt.Errorf("refresh Google cookies: %w", err)
 	}
 	return nil
 }
