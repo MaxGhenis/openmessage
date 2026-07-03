@@ -101,6 +101,37 @@ Key facts:
 6. On confirmation the session saves to the app dir; relaunch the app and sends
    work. Wipe the cookie file afterwards.
 
+### Self-healing (as of #74) — try this before any manual cookie surgery
+
+The macOS app now **refreshes expired Google cookies in-process** and
+reconnects on its own. When the reconnect watchdog sees an expired session
+(`auth token: HTTP 401`) it reads the user's signed-in Chrome cookies, rewrites
+`auth_data.cookies` in `session.json`, and reconnects — no re-pair, no script.
+Implemented in `internal/googlecookies` (darwin-only; keychain → PBKDF2 →
+AES-128-CBC, handles the Chrome 130+ `SHA256(host)` prefix, snapshots the
+cookie DB + WAL for freshness). `refreshGoogleSessionCookies` prefers an
+explicit `OPENMESSAGE_COOKIE_REFRESH_SCRIPT` if set, else this native path;
+`canRefreshGoogleCookies()` gates whether the watchdog refreshes or parks.
+
+So the **first** thing to try when SMS is dead is nothing — wait ~15s for the
+watchdog. If it hasn't recovered, the cookies are genuinely gone from Chrome
+(user signed out of Google there) or the device link was revoked; only then
+fall back to the manual re-pair recipe above. The app also now posts a **health
+notification** (once, on the rising edge) when Google flips to `needs_repair` or
+WhatsApp logs out, so a dead platform can't sit silent for days.
+
+Prereq: the app must be **non-sandboxed** (it is — `OpenMessage.entitlements`
+is hardened-runtime only) so the backend can read Chrome's cookie DB and the
+`Chrome Safe Storage` keychain item. First keychain read may prompt once;
+Always Allow persists it.
+
+**Root cause of the repeated deaths (fixed in #73):** the `MaxGhenis/gmessages`
+fork was frozen at its 2026-03-02 base and missed upstream's 2026-05-05
+`libgm/longpoll: retry on network error when refreshing auth token`. Without it
+a single transient network blip during a scheduled token refresh permanently
+killed the session. Keep the fork rebased on upstream. The durable
+architectural fix (move SMS/RCS onto an Android companion) is issue #75.
+
 ### Don't over-reconnect
 
 Connecting/disconnecting the Google web session many times in a short window
