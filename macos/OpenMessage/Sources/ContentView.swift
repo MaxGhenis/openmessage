@@ -180,29 +180,17 @@ struct WebViewContainer: NSViewRepresentable {
 
     final class Coordinator: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
         static let handlerName = "openmessageNotifications"
-        private static let openPlatformsScript = "if (typeof openWhatsAppOverlay === 'function') { openWhatsAppOverlay().catch(err => console.error('Failed to open platforms from native settings:', err)); }"
 
         var backend: BackendManager
         var notifications: NotificationManager
         var contacts: ContactsManager
         weak var webView: WKWebView?
-        private var shouldOpenPlatformsAfterLoad = false
 
         init(backend: BackendManager, notifications: NotificationManager, contacts: ContactsManager) {
             self.backend = backend
             self.notifications = notifications
             self.contacts = contacts
             super.init()
-            NotificationCenter.default.addObserver(
-                self,
-                selector: #selector(handleOpenPlatformsNotification),
-                name: .openPlatformsRequested,
-                object: nil
-            )
-        }
-
-        deinit {
-            NotificationCenter.default.removeObserver(self)
         }
 
         func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
@@ -250,14 +238,12 @@ struct WebViewContainer: NSViewRepresentable {
             decisionHandler(.allow)
         }
 
+        @MainActor
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-            guard shouldOpenPlatformsAfterLoad else { return }
-            shouldOpenPlatformsAfterLoad = false
-            openPlatforms()
-        }
-
-        @objc private func handleOpenPlatformsNotification() {
-            openPlatforms()
+            // Deliver any Platforms-overlay request that arrived while no
+            // interactive page existed (window closed, pairing screen, or
+            // mid-load) — the bridge holds the pending flag.
+            WebViewBridge.shared.webViewDidFinishLoad()
         }
 
         private func resolve<T: Encodable>(requestID: String, payload: T) {
@@ -301,17 +287,5 @@ struct WebViewContainer: NSViewRepresentable {
             webView.evaluateJavaScript("window.__openMessageResolveNativeNotifications(\(requestJSON), null);")
         }
 
-        private func openPlatforms() {
-            NSApp.activate(ignoringOtherApps: true)
-            guard let webView else {
-                shouldOpenPlatformsAfterLoad = true
-                return
-            }
-            if webView.isLoading {
-                shouldOpenPlatformsAfterLoad = true
-                return
-            }
-            webView.evaluateJavaScript(Self.openPlatformsScript)
-        }
     }
 }
