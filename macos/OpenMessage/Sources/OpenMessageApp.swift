@@ -40,9 +40,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, @unchecked Sendable {
     }
 }
 
-extension Notification.Name {
-    static let openPlatformsRequested = Notification.Name("OpenMessageOpenPlatformsRequested")
-}
 
 @MainActor
 private final class SettingsViewModel: ObservableObject {
@@ -564,8 +561,10 @@ private struct AppSettingsView: View {
 
     private func openPlatformsInMainWindow() {
         openMainWindow()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-            NotificationCenter.default.post(name: .openPlatformsRequested, object: nil)
-        }
+        // Direct call, not a NotificationCenter post: if the main window was
+        // closed there is no coordinator alive to observe a notification, and
+        // a fixed delay races window creation. The bridge remembers the
+        // request and delivers it once the web view finishes loading.
+        WebViewBridge.shared.requestOpenPlatforms()
     }
 }

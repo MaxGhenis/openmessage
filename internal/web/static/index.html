@@ -13600,6 +13600,13 @@ body::after {
     showThreadFeedback('Back online. Queued messages will send when their route is connected.');
   });
 
+  // Native macOS app bridge. The Swift wrapper opens the Platforms overlay via
+  // evaluateJavaScript from Settings ("Pair in inbox") and the menu-bar alert.
+  // Everything in this file lives inside an IIFE, so the function must be
+  // exported explicitly — without this the native call's typeof guard sees
+  // undefined and silently does nothing.
+  window.openWhatsAppOverlay = openWhatsAppOverlay;
+
   if (navigator.webdriver) {
     window.__openMessageTestHooks = {
       updateLoadedMessage(messageID, patch = {}) {

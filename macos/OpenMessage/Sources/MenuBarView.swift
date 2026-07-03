@@ -25,8 +25,7 @@ struct MenuBarView: View {
                 Divider()
                 Button {
                     openWindow(id: "main")
-                    NSApp.activate(ignoringOtherApps: true)
-                    NotificationCenter.default.post(name: .openPlatformsRequested, object: nil)
+                    WebViewBridge.shared.requestOpenPlatforms()
                 } label: {
                     HStack(alignment: .top, spacing: 8) {
                         Image(systemName: "exclamationmark.triangle.fill")

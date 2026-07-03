@@ -100,6 +100,18 @@ test.beforeEach(async ({ page, request }) => {
   await page.goto('/');
 });
 
+test('native bridge global window.openWhatsAppOverlay opens the platforms overlay', async ({ page }) => {
+  // The macOS wrapper's "Pair in inbox" / menu-bar alert buttons call this via
+  // evaluateJavaScript. The app script is an IIFE, so the function must be
+  // explicitly exported on window — a missing export fails silently in the
+  // native app (the button "does nothing"), which is exactly what this guards.
+  await expect
+    .poll(async () => page.evaluate(() => typeof window.openWhatsAppOverlay))
+    .toBe('function');
+  await page.evaluate(() => window.openWhatsAppOverlay());
+  await expect(page.locator('#wa-overlay.show h2')).toHaveText('Platforms');
+});
+
 test('loads the seeded conversation list and thread view', async ({ page }) => {
   await expect(page.locator('#connection-banner.disconnected')).toHaveCount(0);
   await expect
