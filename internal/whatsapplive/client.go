@@ -209,7 +209,11 @@ func (b *Bridge) initClientLocked() error {
 		container.Close()
 		return fmt.Errorf("load WhatsApp device store: %w", err)
 	}
-	cli := whatsmeow.NewClient(deviceStore, waLog.Noop)
+	// Route whatsmeow's internal logs through the bridge logger. Pairing
+	// failures in particular (code-pair notification decrypt, stream errors)
+	// are log-only — with a Noop logger they are invisible and a failed pair
+	// just silently returns to idle.
+	cli := whatsmeow.NewClient(deviceStore, waLog.Zerolog(b.logger.With().Str("component", "whatsmeow").Logger()))
 	cli.EnableAutoReconnect = true
 	cli.InitialAutoReconnect = true
 	cli.AddEventHandler(b.handleEvent)
