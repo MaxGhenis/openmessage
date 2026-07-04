@@ -62,6 +62,14 @@ func (a *App) StartWhatsAppConnect() error {
 	return nil
 }
 
+func (a *App) PairWhatsAppPhone(phone string) (string, error) {
+	bridge, err := a.ensureWhatsApp()
+	if err != nil {
+		return "", fmt.Errorf("init WhatsApp bridge: %w", err)
+	}
+	return bridge.PairPhone(phone)
+}
+
 func (a *App) UnpairWhatsApp() error {
 	bridge, err := a.ensureWhatsApp()
 	if err != nil {

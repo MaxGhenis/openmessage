@@ -100,6 +100,54 @@ test.beforeEach(async ({ page, request }) => {
   await page.goto('/');
 });
 
+test('links WhatsApp with a phone number pairing code when unpaired', async ({ page }) => {
+  // Force the no-local-session state via the status route so the overlay's
+  // own refresh + polling see it consistently (the e2e server's global stub
+  // reports connected+paired, which hides the pair-code affordance).
+  await page.route('**/api/whatsapp/status', async route => {
+    await route.fulfill({
+      json: { connected: false, paired: false, pairing: false, qr_available: false },
+    });
+  });
+  await page.route('**/api/whatsapp/pair-code', async route => {
+    await route.fulfill({
+      json: { code: 'E2EPAIR1', status: { connected: false, paired: false, pairing: true, qr_available: false } },
+    });
+  });
+  await openPlatforms(page);
+  await expect(page.locator('#wa-pair-code')).toBeVisible();
+
+  await page.locator('#wa-pair-code-toggle').click();
+  await expect(page.locator('#wa-pair-code-form')).toBeVisible();
+  await page.locator('#wa-pair-code-input').fill('+16505551234');
+  await page.locator('#wa-pair-code-btn').click();
+
+  // The UI renders the 8-char code dash-split like WhatsApp shows it.
+  await expect(page.locator('#wa-pair-code-result')).toBeVisible();
+  await expect(page.locator('#wa-pair-code-value')).toHaveText('E2EP-AIR1');
+});
+
+test('hides the WhatsApp pair-code affordance while a session is paired', async ({ page }) => {
+  // Default e2e-server status is connected+paired.
+  await openPlatforms(page);
+  await expect(page.locator('#wa-pair-code')).toBeHidden();
+});
+
+test('explains an expired WhatsApp pairing window instead of a raw timeout error', async ({ page }) => {
+  await page.route('**/api/whatsapp/status', async route => {
+    await route.fulfill({
+      json: {
+        connected: false, paired: false, pairing: false,
+        qr_available: false, qr_event: 'timeout', last_error: 'timeout',
+      },
+    });
+  });
+  await openPlatforms(page);
+  await expect(page.locator('#wa-helper')).toContainText('pairing window expired');
+  // The raw "timeout" string must not surface as an error banner.
+  await expect(page.locator('#wa-error')).toBeHidden();
+});
+
 test('native bridge global window.openWhatsAppOverlay opens the platforms overlay', async ({ page }) => {
   // The macOS wrapper's "Pair in inbox" / menu-bar alert buttons call this via
   // evaluateJavaScript. The app script is an IIFE, so the function must be

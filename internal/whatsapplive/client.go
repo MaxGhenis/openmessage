@@ -349,6 +349,69 @@ func (b *Bridge) Connect() error {
 	return nil
 }
 
+// pairPhoneDisplayName is shown on the phone as the linked device name.
+const pairPhoneDisplayName = "OpenMessage (macOS)"
+
+// PairPhone begins phone-number pairing: it connects the unpaired client and
+// asks WhatsApp for an 8-character linking code the user types into their phone
+// (WhatsApp > Linked devices > "Link with phone number instead"). Unlike the QR
+// flow this has no ~2-minute scan window and needs no camera, so it survives
+// coordination delays and can be driven from a text surface. Pairing completes
+// over the same connection through the normal PairSuccess -> Connected events.
+// phone must be in international format (a leading + is fine; it is stripped).
+func (b *Bridge) PairPhone(phone string) (string, error) {
+	b.mu.Lock()
+	if err := b.recoverPersistedSessionLocked(); err != nil {
+		b.mu.Unlock()
+		return "", err
+	}
+	if b.client == nil {
+		b.mu.Unlock()
+		return "", fmt.Errorf("WhatsApp client unavailable")
+	}
+	if b.client.Store.ID != nil {
+		b.mu.Unlock()
+		return "", fmt.Errorf("WhatsApp is already paired")
+	}
+	cli := b.client
+	needConnect := !clientIsConnected(cli)
+	b.lastError = ""
+	b.pairing = true
+	b.connecting = true
+	b.qr = QRSnapshot{}
+	b.mu.Unlock()
+	b.emitStatusChange()
+
+	clearPairingState := func(msg string) {
+		b.mu.Lock()
+		if b.client == cli {
+			b.pairing = false
+			b.connecting = false
+			b.lastError = msg
+		}
+		b.mu.Unlock()
+		b.emitStatusChange()
+	}
+
+	if needConnect {
+		if err := connectClient(cli); err != nil && !errors.Is(err, whatsmeow.ErrAlreadyConnected) {
+			clearPairingState(err.Error())
+			return "", fmt.Errorf("connect WhatsApp: %w", err)
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	code, err := cli.PairPhone(ctx, phone, true, whatsmeow.PairClientChrome, pairPhoneDisplayName)
+	if err != nil {
+		clearPairingState(err.Error())
+		return "", fmt.Errorf("request WhatsApp pairing code: %w", err)
+	}
+	// Leave pairing=true: handlePairSuccess / handleConnected clear it once the
+	// user enters the code on their phone.
+	return code, nil
+}
+
 func (b *Bridge) runConnect(cli *whatsmeow.Client) {
 	if err := connectClient(cli); err != nil {
 		b.logger.Warn().Err(err).Msg("WhatsApp connect failed")

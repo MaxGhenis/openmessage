@@ -90,6 +90,7 @@ type APIOptions struct {
 	Unpair                UnpairFunc
 	WhatsAppStatus        func() any
 	ConnectWhatsApp       func() error
+	PairWhatsAppPhone     func(phone string) (string, error)
 	UnpairWhatsApp        func() error
 	SignalStatus          func() any
 	ConnectSignal         func() error
@@ -2595,6 +2596,36 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		}
 		publishStatus(currentConnected())
 		writeJSON(w, opts.WhatsAppStatus())
+	})
+
+	mux.HandleFunc("/api/whatsapp/pair-code", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			httpError(w, "method not allowed", 405)
+			return
+		}
+		if opts.PairWhatsAppPhone == nil || opts.WhatsAppStatus == nil {
+			httpError(w, "whatsapp live bridge not available", 404)
+			return
+		}
+		var body struct {
+			Phone string `json:"phone"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			httpError(w, "invalid request body", 400)
+			return
+		}
+		phone := strings.TrimSpace(body.Phone)
+		if phone == "" {
+			httpError(w, "phone number is required (international format, e.g. +15551234567)", 400)
+			return
+		}
+		code, err := opts.PairWhatsAppPhone(phone)
+		if err != nil {
+			httpError(w, "whatsapp pairing code: "+err.Error(), 502)
+			return
+		}
+		publishStatus(currentConnected())
+		writeJSON(w, map[string]any{"code": code, "status": opts.WhatsAppStatus()})
 	})
 
 	mux.HandleFunc("/api/whatsapp/qr", func(w http.ResponseWriter, r *http.Request) {

@@ -2139,6 +2139,85 @@ func TestWhatsAppConnectRoute(t *testing.T) {
 	}
 }
 
+func TestWhatsAppPairCodeRoute(t *testing.T) {
+	var gotPhone string
+	ts := newTestServerWithOptions(t, APIOptions{
+		PairWhatsAppPhone: func(phone string) (string, error) {
+			gotPhone = phone
+			return "ABCD1234", nil
+		},
+		WhatsAppStatus: func() any {
+			return map[string]any{"pairing": true}
+		},
+	})
+
+	resp, err := http.Post(ts.server.URL+"/api/whatsapp/pair-code", "application/json", strings.NewReader(`{"phone":"+16505551234"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		t.Fatalf("got status %d, want 200", resp.StatusCode)
+	}
+	if gotPhone != "+16505551234" {
+		t.Fatalf("handler got phone %q, want %q", gotPhone, "+16505551234")
+	}
+	var payload map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload["code"] != "ABCD1234" {
+		t.Fatalf("code = %#v, want ABCD1234", payload["code"])
+	}
+	status, ok := payload["status"].(map[string]any)
+	if !ok || status["pairing"] != true {
+		t.Fatalf("unexpected status payload: %#v", payload["status"])
+	}
+}
+
+func TestWhatsAppPairCodeRouteRejectsBadRequests(t *testing.T) {
+	ts := newTestServerWithOptions(t, APIOptions{
+		PairWhatsAppPhone: func(phone string) (string, error) {
+			t.Fatal("handler must not be called")
+			return "", nil
+		},
+		WhatsAppStatus: func() any { return map[string]any{} },
+	})
+
+	// Missing phone.
+	resp, err := http.Post(ts.server.URL+"/api/whatsapp/pair-code", "application/json", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 400 {
+		t.Fatalf("missing phone: got status %d, want 400", resp.StatusCode)
+	}
+
+	// Wrong method.
+	getResp, err := http.Get(ts.server.URL + "/api/whatsapp/pair-code")
+	if err != nil {
+		t.Fatal(err)
+	}
+	getResp.Body.Close()
+	if getResp.StatusCode != 405 {
+		t.Fatalf("GET: got status %d, want 405", getResp.StatusCode)
+	}
+}
+
+func TestWhatsAppPairCodeRouteUnavailableWithoutBridge(t *testing.T) {
+	ts := newTestServerWithOptions(t, APIOptions{})
+	resp, err := http.Post(ts.server.URL+"/api/whatsapp/pair-code", "application/json", strings.NewReader(`{"phone":"+16505551234"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 404 {
+		t.Fatalf("got status %d, want 404", resp.StatusCode)
+	}
+}
+
 func TestSignalConnectRoute(t *testing.T) {
 	called := false
 	ts := newTestServerWithOptions(t, APIOptions{
