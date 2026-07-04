@@ -349,8 +349,12 @@ func (b *Bridge) Connect() error {
 	return nil
 }
 
-// pairPhoneDisplayName is shown on the phone as the linked device name.
-const pairPhoneDisplayName = "OpenMessage (macOS)"
+// pairPhoneDisplayName is the linked-device name sent during phone pairing.
+// WhatsApp's server validates this against a `Browser (OS)` allowlist and
+// returns "400 bad-request" for anything it doesn't recognize (e.g. a product
+// name like "OpenMessage"), so it must be a real browser/OS pair. It matches
+// PairClientChrome below and is what shows on the phone's linked-devices list.
+const pairPhoneDisplayName = "Chrome (macOS)"
 
 // PairPhone begins phone-number pairing: it connects the unpaired client and
 // asks WhatsApp for an 8-character linking code the user types into their phone
@@ -1143,6 +1147,17 @@ func (b *Bridge) handleEvent(raw any) {
 
 func (b *Bridge) handleConnected() {
 	b.mu.Lock()
+	// An unpaired connection is only the transport we use to drive QR / phone-
+	// code pairing — it is not a usable session. Keep the pairing state (and the
+	// pairing affordance in the UI) alive until PairSuccess sets Store.ID; a
+	// premature connected=true would flip the UI to "Connected" and hide the
+	// code the user still needs to enter.
+	if b.client != nil && b.client.Store != nil && b.client.Store.ID == nil {
+		b.connecting = false
+		b.mu.Unlock()
+		b.emitStatusChange()
+		return
+	}
 	b.connected = true
 	b.connecting = false
 	b.pairing = false
