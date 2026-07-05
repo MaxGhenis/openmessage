@@ -580,6 +580,72 @@ html, body {
   color: var(--accent-strong);
 }
 
+.wa-pair-code {
+  margin-top: 10px;
+}
+
+.wa-linktext-btn {
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--accent-strong);
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+  text-decoration: underline;
+}
+
+.wa-linktext-btn:hover {
+  color: var(--accent);
+}
+
+.wa-pair-code-form {
+  margin-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.wa-pair-code-input {
+  flex: 1 1 180px;
+  min-width: 160px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.02);
+  color: var(--text-primary);
+  font: inherit;
+}
+
+.wa-pair-code-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.wa-pair-code-result {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 12px 14px;
+  border-radius: 12px;
+  border: 1px solid var(--accent-strong);
+  background: var(--accent-dim);
+}
+
+.wa-pair-code-label {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.wa-pair-code-value {
+  font-size: 26px;
+  font-weight: 700;
+  letter-spacing: 4px;
+  font-variant-numeric: tabular-nums;
+  color: var(--accent-strong);
+  user-select: all;
+}
+
 .wa-error {
   display: none;
   margin-top: 0;
@@ -5372,6 +5438,20 @@ body::after {
                 <button class="new-msg-go wa-connect-btn" id="wa-connect-btn">Connect WhatsApp</button>
                 <button class="wa-reset-btn" id="wa-reset-btn" type="button">Reset</button>
               </div>
+              <div class="wa-pair-code" id="wa-pair-code">
+                <button class="wa-linktext-btn" id="wa-pair-code-toggle" type="button">Can't scan? Link with a phone number instead</button>
+                <div class="wa-pair-code-form" id="wa-pair-code-form" hidden>
+                  <p class="wa-helper">Enter your WhatsApp number in international format, then on your phone open WhatsApp &rarr; Linked devices &rarr; Link a device &rarr; <strong>Link with phone number instead</strong>, and type the code shown here.</p>
+                  <div class="wa-actions-row">
+                    <input class="wa-pair-code-input" id="wa-pair-code-input" type="tel" inputmode="tel" placeholder="+1 650 555 1234" autocomplete="tel">
+                    <button class="new-msg-go wa-connect-btn" id="wa-pair-code-btn" type="button">Get code</button>
+                  </div>
+                  <div class="wa-pair-code-result" id="wa-pair-code-result" hidden>
+                    <span class="wa-pair-code-label">Enter this code on your phone:</span>
+                    <span class="wa-pair-code-value" id="wa-pair-code-value"></span>
+                  </div>
+                </div>
+              </div>
               <div class="new-msg-error wa-error" id="wa-error"></div>
             </div>
             <div class="wa-section">
@@ -5720,6 +5800,13 @@ body::after {
   const $waQRCodeCaption = document.getElementById('wa-qr-caption');
   const $waConnectBtn = document.getElementById('wa-connect-btn');
   const $waResetBtn = document.getElementById('wa-reset-btn');
+  const $waPairCodeSection = document.getElementById('wa-pair-code');
+  const $waPairCodeToggle = document.getElementById('wa-pair-code-toggle');
+  const $waPairCodeForm = document.getElementById('wa-pair-code-form');
+  const $waPairCodeInput = document.getElementById('wa-pair-code-input');
+  const $waPairCodeBtn = document.getElementById('wa-pair-code-btn');
+  const $waPairCodeResult = document.getElementById('wa-pair-code-result');
+  const $waPairCodeValue = document.getElementById('wa-pair-code-value');
   const $waError = document.getElementById('wa-error');
   const $signalStatusPill = document.getElementById('signal-status-pill');
   const $signalHelper = document.getElementById('signal-helper');
@@ -12120,6 +12207,8 @@ body::after {
       $waStatusPill.classList.add('error');
     }
 
+    const waPairingExpired = !whatsAppStatus.connected && !whatsAppStatus.pairing
+      && (whatsAppStatus.qr_event === 'timeout' || whatsAppStatus.last_error === 'timeout');
     if (whatsAppStatus.connected) {
       const identity = whatsAppStatus.push_name || whatsAppStatus.account_jid || 'your paired account';
       $waHelper.textContent = `Live sync is active for ${identity}. Incoming WhatsApp messages, typing updates, and text replies should now flow through OpenMessage immediately.`;
@@ -12130,6 +12219,8 @@ body::after {
       $waHelper.textContent = 'Scan the QR code below from WhatsApp on your phone: Settings -> Linked Devices -> Link a Device.';
     } else if (whatsAppStatus.paired) {
       $waHelper.textContent = 'This WhatsApp account is already paired locally. Reconnect to resume live WhatsApp sync.';
+    } else if (waPairingExpired) {
+      $waHelper.textContent = 'The pairing window expired before your phone confirmed. Click Connect WhatsApp for a fresh QR code, or link with a phone number below (no scanning needed).';
     } else {
       $waHelper.textContent = 'Link a WhatsApp companion device for live WhatsApp sync, typing updates, and text replies inside OpenMessage.';
     }
@@ -12146,7 +12237,18 @@ body::after {
       $waQRCodeCaption.textContent = '';
     }
 
-    if (whatsAppStatus.last_error && !whatsAppStatus.pairing) {
+    // Phone-number pairing only applies while there is no local session.
+    if ($waPairCodeSection) {
+      $waPairCodeSection.hidden = whatsAppStatus.connected || whatsAppStatus.paired;
+    }
+    if (whatsAppStatus.connected && $waPairCodeResult) {
+      $waPairCodeResult.hidden = true;
+      if ($waPairCodeValue) $waPairCodeValue.textContent = '';
+    }
+
+    // "timeout" as a raw error string is cryptic; the expired-state helper
+    // text above already explains it.
+    if (whatsAppStatus.last_error && !whatsAppStatus.pairing && !waPairingExpired) {
       showWhatsAppError(whatsAppStatus.last_error);
     }
 
@@ -12501,6 +12603,43 @@ body::after {
       applyAppStatus({ ...appStatus, whatsapp: status || {} });
     } catch (err) {
       showWhatsAppError(err.message || 'Failed to reset WhatsApp pairing');
+    }
+  }
+
+  function toggleWhatsAppPairCodeForm() {
+    if (!$waPairCodeForm) return;
+    $waPairCodeForm.hidden = !$waPairCodeForm.hidden;
+    if (!$waPairCodeForm.hidden && $waPairCodeInput) {
+      setTimeout(() => $waPairCodeInput.focus(), 60);
+    }
+  }
+
+  async function requestWhatsAppPairCode() {
+    clearWhatsAppError();
+    const phone = ($waPairCodeInput ? $waPairCodeInput.value : '').trim();
+    if (!phone) {
+      showWhatsAppError('Enter your WhatsApp number in international format, e.g. +15551234567.');
+      return;
+    }
+    if ($waPairCodeBtn) { $waPairCodeBtn.disabled = true; $waPairCodeBtn.textContent = 'Requesting…'; }
+    try {
+      const payload = await postJSON('/api/whatsapp/pair-code', { phone });
+      if (payload && payload.status) {
+        applyAppStatus({ ...appStatus, whatsapp: payload.status });
+      }
+      if (payload && payload.code && $waPairCodeValue && $waPairCodeResult) {
+        // WhatsApp shows the code in two dash-separated halves; mirror that.
+        const code = String(payload.code);
+        $waPairCodeValue.textContent = code.length === 8 ? `${code.slice(0, 4)}-${code.slice(4)}` : code;
+        $waPairCodeResult.hidden = false;
+        startWhatsAppPolling();
+      } else {
+        showWhatsAppError('WhatsApp did not return a pairing code. Try again.');
+      }
+    } catch (err) {
+      showWhatsAppError(err.message || 'Failed to request a WhatsApp pairing code');
+    } finally {
+      if ($waPairCodeBtn) { $waPairCodeBtn.disabled = false; $waPairCodeBtn.textContent = 'Get code'; }
     }
   }
 
@@ -13527,6 +13666,9 @@ body::after {
   if ($waClose) $waClose.addEventListener('click', closeWhatsAppOverlay);
   if ($waConnectBtn) $waConnectBtn.addEventListener('click', () => { connectWhatsAppBridge().catch(err => showWhatsAppError(err.message || 'Failed to connect WhatsApp')); });
   if ($waResetBtn) $waResetBtn.addEventListener('click', () => { resetWhatsAppBridge().catch(err => showWhatsAppError(err.message || 'Failed to reset WhatsApp')); });
+  if ($waPairCodeToggle) $waPairCodeToggle.addEventListener('click', toggleWhatsAppPairCodeForm);
+  if ($waPairCodeBtn) $waPairCodeBtn.addEventListener('click', () => { requestWhatsAppPairCode().catch(err => showWhatsAppError(err.message || 'Failed to request pairing code')); });
+  if ($waPairCodeInput) $waPairCodeInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); requestWhatsAppPairCode().catch(err => showWhatsAppError(err.message || 'Failed to request pairing code')); } });
   if ($signalConnectBtn) $signalConnectBtn.addEventListener('click', () => { connectSignalBridge().catch(err => showSignalError(err.message || 'Failed to connect Signal')); });
   if ($signalResetBtn) $signalResetBtn.addEventListener('click', () => { resetSignalBridge().catch(err => showSignalError(err.message || 'Failed to reset Signal')); });
   if ($gmReconnectBtn) $gmReconnectBtn.addEventListener('click', () => {

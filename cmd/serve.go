@@ -436,6 +436,7 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 				Unpair:                a.Unpair,
 				WhatsAppStatus:        func() any { return a.WhatsAppStatus() },
 				ConnectWhatsApp:       a.StartWhatsAppConnect,
+				PairWhatsAppPhone:     a.PairWhatsAppPhone,
 				UnpairWhatsApp:        a.UnpairWhatsApp,
 				SignalStatus:          func() any { return a.SignalStatus() },
 				ConnectSignal:         a.StartSignalConnect,

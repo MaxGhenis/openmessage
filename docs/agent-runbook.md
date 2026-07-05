@@ -141,6 +141,41 @@ Connecting/disconnecting the Google web session many times in a short window
 valid session. The fix is to **stop and let it cool down** (minutes up to ~1h),
 not to hammer reconnect. Sends may land in brief connected windows meanwhile.
 
+## WhatsApp linking (QR and phone-number code)
+
+Hard-won facts from the 2026-07-03/04 re-pair ordeal:
+
+- **Passkey-protected accounts can't use phone-number code linking.** If the
+  account has a WhatsApp passkey, the server accepts the typed code
+  (`companion_finish` returns ok) and then sends `passkey_prologue_request` —
+  a WebAuthn challenge only the user's real authenticator can answer. The
+  phone shows "Couldn't link device"; the desktop used to idle silently
+  (whatsmeow logged "Unhandled notification"). The bridge now surfaces a
+  clear "account is protected by a passkey — scan the QR code instead" error
+  via `events.PairPasskeyRequest`. QR linking does **not** involve the
+  passkey step (the camera scan is the verification).
+- **Code + QR windows are short.** Pairing codes expire in ~2 minutes;
+  QR refs rotate ~20–60s within a ~3-minute session that ends silently
+  (`qr_event: "timeout"`). Generate the code / show the QR only when the
+  user's phone is already on the entry/scanner screen.
+- **"Couldn't link device. Try again later." on every QR scan = WhatsApp
+  refusing, not our bug.** Two causes: (a) zombie companion entries from
+  failed attempts eating the 4-device limit — have the user clear stale
+  entries in WhatsApp → Linked Devices; (b) a temporary linking throttle
+  after repeated failed attempts — stop retrying for a few hours (hammering
+  extends it). If a single clean attempt after cleanup + cooldown still
+  fails, remove the WhatsApp passkey (Settings → Account → Passkeys), link,
+  re-add it.
+- **Debugging:** whatsmeow logs used to be discarded (`waLog.Noop`); they now
+  flow through the bridge logger (`component=whatsmeow`). Debug-level os_log
+  lines are NOT persisted — capture live with
+  `log stream --predicate 'subsystem == "com.openmessage.app"' --level debug`
+  **before** the attempt; `log show` after the fact only has warn/error.
+- **`go.work` gotcha:** the repo root had an untracked `go.work` whose
+  `use ../tmp/whatsmeow` silently overrode go.mod's whatsmeow pin for every
+  workspace-mode build (including `macos/build.sh`). If a dependency bump
+  mysteriously doesn't take, check `go.work`.
+
 ## signal-cli
 
 Require **signal-cli ≥ 0.14.5**. 0.14.1 throws

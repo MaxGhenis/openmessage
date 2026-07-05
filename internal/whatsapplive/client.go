@@ -50,8 +50,8 @@ var uploadMedia = func(cli *whatsmeow.Client, ctx context.Context, plaintext []b
 	return cli.Upload(ctx, plaintext, mediaType)
 }
 
-var downloadMediaWithPath = func(cli *whatsmeow.Client, ctx context.Context, directPath string, encFileHash, fileHash, mediaKey []byte, fileLength int, mediaType whatsmeow.MediaType, fileEncSHA256B64 string) ([]byte, error) {
-	return cli.DownloadMediaWithPath(ctx, directPath, encFileHash, fileHash, mediaKey, fileLength, mediaType, fileEncSHA256B64)
+var downloadMediaWithPath = func(cli *whatsmeow.Client, ctx context.Context, directPath string, encFileHash, fileHash, mediaKey []byte, mediaType whatsmeow.MediaType, mmsType string, allowNoHash bool) ([]byte, error) {
+	return cli.DownloadMediaWithPath(ctx, directPath, encFileHash, fileHash, mediaKey, mediaType, mmsType, allowNoHash)
 }
 
 var connectClient = func(cli *whatsmeow.Client) error {
@@ -209,7 +209,11 @@ func (b *Bridge) initClientLocked() error {
 		container.Close()
 		return fmt.Errorf("load WhatsApp device store: %w", err)
 	}
-	cli := whatsmeow.NewClient(deviceStore, waLog.Noop)
+	// Route whatsmeow's internal logs through the bridge logger. Pairing
+	// failures in particular (code-pair notification decrypt, stream errors)
+	// are log-only — with a Noop logger they are invisible and a failed pair
+	// just silently returns to idle.
+	cli := whatsmeow.NewClient(deviceStore, waLog.Zerolog(b.logger.With().Str("component", "whatsmeow").Logger()))
 	cli.EnableAutoReconnect = true
 	cli.InitialAutoReconnect = true
 	cli.AddEventHandler(b.handleEvent)
@@ -347,6 +351,73 @@ func (b *Bridge) Connect() error {
 	b.emitStatusChange()
 	launchConnect(b, cli)
 	return nil
+}
+
+// pairPhoneDisplayName is the linked-device name sent during phone pairing.
+// WhatsApp's server validates this against a `Browser (OS)` allowlist and
+// returns "400 bad-request" for anything it doesn't recognize (e.g. a product
+// name like "OpenMessage"), so it must be a real browser/OS pair. It matches
+// PairClientChrome below and is what shows on the phone's linked-devices list.
+const pairPhoneDisplayName = "Chrome (macOS)"
+
+// PairPhone begins phone-number pairing: it connects the unpaired client and
+// asks WhatsApp for an 8-character linking code the user types into their phone
+// (WhatsApp > Linked devices > "Link with phone number instead"). Unlike the QR
+// flow this has no ~2-minute scan window and needs no camera, so it survives
+// coordination delays and can be driven from a text surface. Pairing completes
+// over the same connection through the normal PairSuccess -> Connected events.
+// phone must be in international format (a leading + is fine; it is stripped).
+func (b *Bridge) PairPhone(phone string) (string, error) {
+	b.mu.Lock()
+	if err := b.recoverPersistedSessionLocked(); err != nil {
+		b.mu.Unlock()
+		return "", err
+	}
+	if b.client == nil {
+		b.mu.Unlock()
+		return "", fmt.Errorf("WhatsApp client unavailable")
+	}
+	if b.client.Store.ID != nil {
+		b.mu.Unlock()
+		return "", fmt.Errorf("WhatsApp is already paired")
+	}
+	cli := b.client
+	needConnect := !clientIsConnected(cli)
+	b.lastError = ""
+	b.pairing = true
+	b.connecting = true
+	b.qr = QRSnapshot{}
+	b.mu.Unlock()
+	b.emitStatusChange()
+
+	clearPairingState := func(msg string) {
+		b.mu.Lock()
+		if b.client == cli {
+			b.pairing = false
+			b.connecting = false
+			b.lastError = msg
+		}
+		b.mu.Unlock()
+		b.emitStatusChange()
+	}
+
+	if needConnect {
+		if err := connectClient(cli); err != nil && !errors.Is(err, whatsmeow.ErrAlreadyConnected) {
+			clearPairingState(err.Error())
+			return "", fmt.Errorf("connect WhatsApp: %w", err)
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	code, err := cli.PairPhone(ctx, phone, true, whatsmeow.PairClientChrome, pairPhoneDisplayName)
+	if err != nil {
+		clearPairingState(err.Error())
+		return "", fmt.Errorf("request WhatsApp pairing code: %w", err)
+	}
+	// Leave pairing=true: handlePairSuccess / handleConnected clear it once the
+	// user enters the code on their phone.
+	return code, nil
 }
 
 func (b *Bridge) runConnect(cli *whatsmeow.Client) {
@@ -919,7 +990,9 @@ func (b *Bridge) DownloadStoredMedia(msg *db.Message) ([]byte, string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	data, err := downloadMediaWithPath(cli, ctx, ref.DirectPath, fileEncSHA256, fileSHA256, mediaKey, int(ref.FileLength), mediaType, "")
+	// allowNoHash preserves the pre-upgrade lenient behavior for stored refs
+	// that lack a plaintext hash; when the hash is present it is verified.
+	data, err := downloadMediaWithPath(cli, ctx, ref.DirectPath, fileEncSHA256, fileSHA256, mediaKey, mediaType, "", len(fileSHA256) == 0)
 	if err != nil {
 		return nil, "", fmt.Errorf("download WhatsApp media: %w", err)
 	}
@@ -1061,6 +1134,14 @@ func (b *Bridge) handleEvent(raw any) {
 		b.handlePairSuccess(evt)
 	case *waevents.PairError:
 		b.handlePairError(evt.Error)
+	case *waevents.PairPasskeyRequest:
+		// The account has a passkey, and passkey-verified code linking needs a
+		// companion-side WebAuthn assertion we cannot produce (the passkey
+		// lives on the user's phone/keychain). Without this the pairing just
+		// idles out silently and the phone shows "couldn't link device".
+		b.handlePairError(fmt.Errorf("this WhatsApp account is protected by a passkey, which phone-number linking doesn't support yet — scan the QR code instead"))
+	case *waevents.PairPasskeyError:
+		b.handlePairError(fmt.Errorf("passkey pairing failed: %w", evt.Error))
 	case *waevents.QRScannedWithoutMultidevice:
 		b.handlePairError(fmt.Errorf("scan the QR code again after enabling multi-device support in WhatsApp"))
 	case *waevents.Message:
@@ -1080,6 +1161,17 @@ func (b *Bridge) handleEvent(raw any) {
 
 func (b *Bridge) handleConnected() {
 	b.mu.Lock()
+	// An unpaired connection is only the transport we use to drive QR / phone-
+	// code pairing — it is not a usable session. Keep the pairing state (and the
+	// pairing affordance in the UI) alive until PairSuccess sets Store.ID; a
+	// premature connected=true would flip the UI to "Connected" and hide the
+	// code the user still needs to enter.
+	if b.client != nil && b.client.Store != nil && b.client.Store.ID == nil {
+		b.connecting = false
+		b.mu.Unlock()
+		b.emitStatusChange()
+		return
+	}
 	b.connected = true
 	b.connecting = false
 	b.pairing = false

@@ -1962,7 +1962,7 @@ func TestBridgeDownloadStoredMediaUsesEncodedReference(t *testing.T) {
 	}()
 	clientIsConnected = func(_ *whatsmeow.Client) bool { return true }
 
-	downloadMediaWithPath = func(_ *whatsmeow.Client, _ context.Context, directPath string, encFileHash, fileHash, mediaKey []byte, fileLength int, mediaType whatsmeow.MediaType, _ string) ([]byte, error) {
+	downloadMediaWithPath = func(_ *whatsmeow.Client, _ context.Context, directPath string, encFileHash, fileHash, mediaKey []byte, mediaType whatsmeow.MediaType, _ string, allowNoHash bool) ([]byte, error) {
 		if directPath != "/mms/image" {
 			t.Fatalf("direct path = %q, want /mms/image", directPath)
 		}
@@ -1975,8 +1975,8 @@ func TestBridgeDownloadStoredMediaUsesEncodedReference(t *testing.T) {
 		if string(mediaKey) != string([]byte{0x01, 0x02}) {
 			t.Fatalf("media key = %x, want 0102", mediaKey)
 		}
-		if fileLength != 9 {
-			t.Fatalf("file length = %d, want 9", fileLength)
+		if allowNoHash {
+			t.Fatal("allowNoHash = true, want false when a plaintext hash is present")
 		}
 		if mediaType != whatsmeow.MediaImage {
 			t.Fatalf("media type = %v, want image", mediaType)

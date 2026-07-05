@@ -108,6 +108,9 @@ func main() {
 		WhatsAppStatus: func() any {
 			return map[string]any{"connected": true, "paired": true}
 		},
+		PairWhatsAppPhone: func(phone string) (string, error) {
+			return "E2EPAIR1", nil
+		},
 		SignalStatus: func() any {
 			return map[string]any{"connected": true, "paired": true, "account": "+15551234567"}
 		},
