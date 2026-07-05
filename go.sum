@@ -77,10 +77,14 @@ github.com/yosida95/uritemplate/v3 v3.0.2 h1:Ed3Oyj9yrmi9087+NczuL5BwkIc4wvTb5zI
 github.com/yosida95/uritemplate/v3 v3.0.2/go.mod h1:ILOh0sOhIJR3+L/8afwt/kE++YT040gmv5BQTMR2HP4=
 go.mau.fi/libsignal v0.2.1 h1:vRZG4EzTn70XY6Oh/pVKrQGuMHBkAWlGRC22/85m9L0=
 go.mau.fi/libsignal v0.2.1/go.mod h1:iVvjrHyfQqWajOUaMEsIfo3IqgVMrhWcPiiEzk7NgoU=
+go.mau.fi/libsignal v0.2.2 h1:QV+XdzQkm3x3aSG7FcqfGSZuFXz83pRZPBFaPygHbOU=
+go.mau.fi/libsignal v0.2.2/go.mod h1:CRlIQg2J8uYTfDFvNoO8/KcZjs5cey0vbc6oj/bssY0=
 go.mau.fi/util v0.9.10 h1:wzvz5iDHyqDXB8vgisD4d3SzucLXNM3iNY+1O1RoHtg=
 go.mau.fi/util v0.9.10/go.mod h1:YQOxySn+ZE3qSYqNxvyX7Yi3suA8YK17PS6QqBREW7A=
 go.mau.fi/whatsmeow v0.0.0-20260327181659-02ec817e7cf4 h1:E4A6eca9vMJQctC9DIfzUIg27TrJ8IrDHgkJwJ8WPUQ=
 go.mau.fi/whatsmeow v0.0.0-20260327181659-02ec817e7cf4/go.mod h1:mXCRFyPEPn4jqWz6Afirn8vY7DpHCPnlKq6I2cWwFHM=
+go.mau.fi/whatsmeow v0.0.0-20260630180629-b572e5bcb92b h1:ZUk1ErarDNpnbosXR/MeOz2gkqA4S1bh8zjaSRj7N+Y=
+go.mau.fi/whatsmeow v0.0.0-20260630180629-b572e5bcb92b/go.mod h1:9dmNTYZ/1pHjPw/bz+azBsGjAkcrZbqzMrKcvG5bJ8U=
 golang.org/x/crypto v0.53.0 h1:QZ4Muo8THX6CizN2vPPd5fBGHyogrdK9fG4wLPFUsto=
 golang.org/x/crypto v0.53.0/go.mod h1:DNLU434OwVakk9PzuwV8w62mAJpRJL3vsgcfp4Qnsio=
 golang.org/x/exp v0.0.0-20260611194520-c48552f49976 h1:X8Hz2ImujgbmetVuW+w2YkyZChE3cBpZi2P158rTG9M=

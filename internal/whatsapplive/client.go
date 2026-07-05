@@ -50,8 +50,8 @@ var uploadMedia = func(cli *whatsmeow.Client, ctx context.Context, plaintext []b
 	return cli.Upload(ctx, plaintext, mediaType)
 }
 
-var downloadMediaWithPath = func(cli *whatsmeow.Client, ctx context.Context, directPath string, encFileHash, fileHash, mediaKey []byte, fileLength int, mediaType whatsmeow.MediaType, fileEncSHA256B64 string) ([]byte, error) {
-	return cli.DownloadMediaWithPath(ctx, directPath, encFileHash, fileHash, mediaKey, fileLength, mediaType, fileEncSHA256B64)
+var downloadMediaWithPath = func(cli *whatsmeow.Client, ctx context.Context, directPath string, encFileHash, fileHash, mediaKey []byte, mediaType whatsmeow.MediaType, mmsType string, allowNoHash bool) ([]byte, error) {
+	return cli.DownloadMediaWithPath(ctx, directPath, encFileHash, fileHash, mediaKey, mediaType, mmsType, allowNoHash)
 }
 
 var connectClient = func(cli *whatsmeow.Client) error {
@@ -990,7 +990,9 @@ func (b *Bridge) DownloadStoredMedia(msg *db.Message) ([]byte, string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	data, err := downloadMediaWithPath(cli, ctx, ref.DirectPath, fileEncSHA256, fileSHA256, mediaKey, int(ref.FileLength), mediaType, "")
+	// allowNoHash preserves the pre-upgrade lenient behavior for stored refs
+	// that lack a plaintext hash; when the hash is present it is verified.
+	data, err := downloadMediaWithPath(cli, ctx, ref.DirectPath, fileEncSHA256, fileSHA256, mediaKey, mediaType, "", len(fileSHA256) == 0)
 	if err != nil {
 		return nil, "", fmt.Errorf("download WhatsApp media: %w", err)
 	}
@@ -1132,6 +1134,14 @@ func (b *Bridge) handleEvent(raw any) {
 		b.handlePairSuccess(evt)
 	case *waevents.PairError:
 		b.handlePairError(evt.Error)
+	case *waevents.PairPasskeyRequest:
+		// The account has a passkey, and passkey-verified code linking needs a
+		// companion-side WebAuthn assertion we cannot produce (the passkey
+		// lives on the user's phone/keychain). Without this the pairing just
+		// idles out silently and the phone shows "couldn't link device".
+		b.handlePairError(fmt.Errorf("this WhatsApp account is protected by a passkey, which phone-number linking doesn't support yet — scan the QR code instead"))
+	case *waevents.PairPasskeyError:
+		b.handlePairError(fmt.Errorf("passkey pairing failed: %w", evt.Error))
 	case *waevents.QRScannedWithoutMultidevice:
 		b.handlePairError(fmt.Errorf("scan the QR code again after enabling multi-device support in WhatsApp"))
 	case *waevents.Message:
