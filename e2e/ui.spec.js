@@ -657,6 +657,37 @@ test('starts a prefilled new message for members without a direct chat', async (
 
   await expect(page.locator('#new-msg-overlay')).toHaveClass(/show/);
   await expect(page.locator('#new-msg-phone')).toHaveValue('+14155550123');
+  // A WhatsApp group member starts a WhatsApp chat, not SMS.
+  await expect(page.locator('.new-msg-platform-chip[data-platform="whatsapp"]')).toHaveClass(/active/);
+  await expect(page.locator('#new-msg-go')).toHaveText('Start WhatsApp chat');
+});
+
+test('starts a new WhatsApp chat with a number from the platform picker', async ({ page }) => {
+  await page.locator('#new-msg-btn').click();
+  await expect(page.locator('#new-msg-overlay')).toHaveClass(/show/);
+  // The pencil button must open a clean dialog (no event-object prefill).
+  await expect(page.locator('#new-msg-phone')).toHaveValue('');
+  await expect(page.locator('.new-msg-platform-chip[data-platform="sms"]')).toHaveClass(/active/);
+
+  await page.locator('.new-msg-platform-chip[data-platform="whatsapp"]').click();
+  await expect(page.locator('#new-msg-helper')).toContainText('Starts a WhatsApp chat');
+  await page.locator('#new-msg-phone').fill('+1 415 555 9876');
+  await page.locator('#new-msg-go').click();
+
+  await expect(page.locator('#chat-header-name')).toHaveText('+14155559876');
+  await expect(page.locator('#chat-header-source')).toContainText('WhatsApp');
+  await expect(page.locator('#new-msg-overlay')).not.toHaveClass(/show/);
+});
+
+test('requires a country code for new WhatsApp and Signal chats', async ({ page }) => {
+  await page.locator('#new-msg-btn').click();
+  await page.locator('.new-msg-platform-chip[data-platform="signal"]').click();
+  await expect(page.locator('#new-msg-go')).toHaveText('Start Signal chat');
+  await page.locator('#new-msg-phone').fill('4155550123');
+  await page.locator('#new-msg-go').click();
+
+  await expect(page.locator('#new-msg-error')).toContainText('country code');
+  await expect(page.locator('#new-msg-overlay')).toHaveClass(/show/);
 });
 
 test('searches only within the active thread', async ({ page }) => {

@@ -286,6 +286,35 @@ html, body {
   border-color: var(--border-accent);
   box-shadow: 0 0 0 3px var(--accent-dim);
 }
+.new-msg-platforms {
+  display: flex;
+  gap: 6px;
+  margin-top: 10px;
+}
+
+.new-msg-platform-chip {
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--bg-elevated);
+  color: var(--text-secondary);
+  padding: 5px 12px;
+  cursor: pointer;
+  font-family: var(--font-sans);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.new-msg-platform-chip:hover:not(.active) {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.new-msg-platform-chip.active {
+  background: var(--accent);
+  color: var(--bg-deep);
+  border-color: transparent;
+}
+
 .new-msg-go {
   margin-top: 12px;
   width: 100%;
@@ -5460,6 +5489,11 @@ body::after {
           spellcheck="false"
         >
         <div class="new-msg-suggestions" id="new-msg-suggestions" role="listbox" hidden></div>
+        <div class="new-msg-platforms" id="new-msg-platforms" role="group" aria-label="Start the conversation on">
+          <button type="button" class="new-msg-platform-chip active" data-platform="sms" aria-pressed="true">SMS</button>
+          <button type="button" class="new-msg-platform-chip" data-platform="whatsapp" aria-pressed="false">WhatsApp</button>
+          <button type="button" class="new-msg-platform-chip" data-platform="signal" aria-pressed="false">Signal</button>
+        </div>
         <div class="new-msg-helper" id="new-msg-helper">New conversations start on SMS. If this number already exists on another route, choose it explicitly below.</div>
         <div class="new-msg-routes" id="new-msg-routes"></div>
         <button class="new-msg-go" id="new-msg-go">Start conversation</button>
@@ -7338,8 +7372,11 @@ body::after {
           }
           const number = row.dataset.messageNumber || '';
           if (!number) return;
+          const platform = sourcePlatformOf(activeConversation);
           closeContactPopover();
-          openNewMsg(number);
+          // Start the new chat on the group's own platform (a WhatsApp group
+          // member should get a WhatsApp chat), falling back to SMS.
+          openNewMsg(number, platform === 'whatsapp' || platform === 'signal' ? platform : 'sms');
         };
         row.addEventListener('click', () => { activate().catch(() => {}); });
         row.addEventListener('keydown', (event) => {
@@ -13781,6 +13818,39 @@ body::after {
   });
 
   // ─── New Message ───
+  const $newMsgPlatforms = document.getElementById('new-msg-platforms');
+  let newMsgPlatform = 'sms';
+
+  function newMessageStartLabel() {
+    if (newMsgPlatform === 'whatsapp') return 'Start WhatsApp chat';
+    if (newMsgPlatform === 'signal') return 'Start Signal chat';
+    return 'Start conversation';
+  }
+
+  function newMessagePlatformHelperText() {
+    if (newMsgPlatform === 'whatsapp' || newMsgPlatform === 'signal') {
+      const label = platformMeta(newMsgPlatform).label;
+      const status = newMsgPlatform === 'whatsapp' ? whatsAppStatus : signalStatus;
+      const pairedNote = (status.connected || status.paired)
+        ? ''
+        : ` ${label} is not paired yet — the thread opens now and sending works once it is.`;
+      return `Starts a ${label} chat. Include the country code, e.g. +14155551234.${pairedNote}`;
+    }
+    return 'New conversations start on SMS. If this number already exists on another route, choose it explicitly below.';
+  }
+
+  function setNewMsgPlatform(platform) {
+    newMsgPlatform = platform === 'whatsapp' || platform === 'signal' ? platform : 'sms';
+    if ($newMsgPlatforms) {
+      $newMsgPlatforms.querySelectorAll('.new-msg-platform-chip').forEach(chip => {
+        const active = chip.dataset.platform === newMsgPlatform;
+        chip.classList.toggle('active', active);
+        chip.setAttribute('aria-pressed', active ? 'true' : 'false');
+      });
+    }
+    updateNewMessageRoutes();
+  }
+
   function updateNewMessageRoutes() {
     const phone = $newMsgPhone.value.trim().replace(/[\s\-()]/g, '');
     const routes = matchingRoutesForPhone(phone);
@@ -13789,8 +13859,8 @@ body::after {
     if (!phone || !routes.length) {
       $newMsgRoutes.classList.remove('active');
       $newMsgRoutes.innerHTML = '';
-      $newMsgHelper.textContent = 'New conversations start on SMS. If this number already exists on another route, choose it explicitly below.';
-      $newMsgGo.textContent = 'Start conversation';
+      $newMsgHelper.textContent = newMessagePlatformHelperText();
+      $newMsgGo.textContent = newMessageStartLabel();
       return;
     }
 
@@ -13809,17 +13879,20 @@ body::after {
     }, '', 1);
   }
 
-  function openNewMsg(prefillNumber = '') {
+  function openNewMsg(prefillNumber = '', platform = 'sms') {
     $newMsgOverlay.classList.add('show');
-    $newMsgPhone.value = String(prefillNumber || '');
+    $newMsgPhone.value = typeof prefillNumber === 'string' ? prefillNumber : '';
     $newMsgError.style.display = 'none';
     $newMsgGo.disabled = false;
-    $newMsgGo.textContent = 'Start conversation';
-    $newMsgHelper.textContent = 'Type a name from your contacts, or paste a phone number.';
     $newMsgRoutes.classList.remove('active');
     $newMsgRoutes.innerHTML = '';
     hideSuggestions();
-    if ($newMsgPhone.value.trim()) updateNewMessageRoutes();
+    // Sets the chip state and refreshes helper text, button label, and the
+    // existing-routes panel for whatever number is prefilled.
+    setNewMsgPlatform(platform);
+    if (!$newMsgPhone.value.trim()) {
+      $newMsgHelper.textContent = 'Type a name from your contacts, or paste a phone number.';
+    }
     setTimeout(() => $newMsgPhone.focus(), 100);
   }
 
@@ -13954,7 +14027,12 @@ body::after {
     }
 
     const phone = raw.replace(/[\s\-()]/g, '');
-    const existingReplyRoute = preferredReplyRoute(matchingRoutesForPhone(phone));
+    // On an explicit WhatsApp/Signal pick, only reuse a same-platform route;
+    // otherwise keep the SMS default of preferring any existing reply route.
+    const matchingRoutes = matchingRoutesForPhone(phone);
+    const existingReplyRoute = newMsgPlatform === 'sms'
+      ? preferredReplyRoute(matchingRoutes)
+      : matchingRoutes.find(route => sourcePlatformOf(route) === newMsgPlatform) || null;
     if (existingReplyRoute) {
       closeNewMsg();
       await revealAndSelectConversation(existingReplyRoute);
@@ -13978,7 +14056,7 @@ body::after {
       const resp = await fetch(API + '/api/new-conversation', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ phone_number: phone }),
+        body: JSON.stringify({ phone_number: phone, platform: newMsgPlatform }),
         signal: controller.signal,
       });
       if (!resp.ok) {
@@ -14001,17 +14079,25 @@ body::after {
     } catch (err) {
       const isAbort = err && err.name === 'AbortError';
       $newMsgError.textContent = isAbort
-        ? 'Request timed out. Check that Google Messages is paired and try again.'
+        ? (newMsgPlatform === 'sms'
+          ? 'Request timed out. Check that Google Messages is paired and try again.'
+          : 'Request timed out. Try again.')
         : (userFacingErrorMessage(err, 'start-conversation') || 'Failed to start conversation');
       $newMsgError.style.display = 'block';
       $newMsgGo.disabled = false;
-      $newMsgGo.textContent = 'Start conversation';
+      $newMsgGo.textContent = newMessageStartLabel();
     } finally {
       clearTimeout(timeoutId);
     }
   }
 
-  $newMsgBtn.addEventListener('click', openNewMsg);
+  // Wrapped so the click event doesn't land in openNewMsg's prefill param.
+  $newMsgBtn.addEventListener('click', () => openNewMsg());
+  if ($newMsgPlatforms) {
+    $newMsgPlatforms.querySelectorAll('.new-msg-platform-chip').forEach(chip => {
+      chip.addEventListener('click', () => setNewMsgPlatform(chip.dataset.platform));
+    });
+  }
   if ($waClose) $waClose.addEventListener('click', closeWhatsAppOverlay);
   if ($waConnectBtn) $waConnectBtn.addEventListener('click', () => { connectWhatsAppBridge().catch(err => showWhatsAppError(err.message || 'Failed to connect WhatsApp')); });
   if ($waResetBtn) $waResetBtn.addEventListener('click', () => { resetWhatsAppBridge().catch(err => showWhatsAppError(err.message || 'Failed to reset WhatsApp')); });
