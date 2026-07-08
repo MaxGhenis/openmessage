@@ -1048,8 +1048,13 @@ html, body {
   margin-bottom: 8px;
 }
 
-.contact-popover-row,
-.contact-popover-participant {
+.contact-popover-subtitle {
+  color: var(--text-muted);
+  font-size: 12px;
+  margin: -4px 0 8px;
+}
+
+.contact-popover-row {
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -1066,6 +1071,106 @@ html, body {
 
 .contact-popover-number {
   overflow-wrap: anywhere;
+}
+
+.contact-popover-filter {
+  width: 100%;
+  margin-bottom: 8px;
+  padding: 7px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-elevated);
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 13px;
+}
+
+.contact-popover-filter:focus {
+  outline: none;
+  border-color: var(--accent, var(--text-secondary));
+}
+
+.contact-popover-members {
+  max-height: min(46vh, 380px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  margin: 0 -6px;
+  padding: 0 6px;
+}
+
+.contact-popover-member {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px;
+  border-top: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
+.contact-popover-member:first-child {
+  border-top: 0;
+}
+
+.contact-popover-member.clickable {
+  cursor: pointer;
+}
+
+.contact-popover-member.clickable:hover,
+.contact-popover-member.clickable:focus-visible {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.contact-popover-member-avatar {
+  position: relative;
+  width: 28px;
+  height: 28px;
+  border-radius: 9px;
+  flex-shrink: 0;
+  font-size: 11px;
+  font-weight: 600;
+  color: #ffffff;
+}
+
+.contact-popover-member-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.contact-popover-member-name {
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.contact-popover-member .contact-popover-number {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.contact-popover-member .contact-popover-copy {
+  flex-shrink: 0;
+}
+
+.contact-popover-empty {
+  color: var(--text-muted);
+  font-size: 13px;
+  padding: 6px 0;
+}
+
+.chat-header-status.members-link {
+  cursor: pointer;
+}
+
+.chat-header-status.members-link:hover {
+  color: var(--text-secondary);
+  text-decoration: underline;
 }
 
 .contact-popover-copy {
@@ -7033,49 +7138,257 @@ body::after {
     return String((participant && (participant.number || participant.phone || participant.email)) || '').trim();
   }
 
+  // Signal keys group members by ACI UUID rather than phone number; a UUID is
+  // an internal identifier, not something to display or copy.
+  const UUID_IDENTIFIER_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+  function looksLikeUuidIdentifier(value) {
+    return UUID_IDENTIFIER_RE.test(String(value || '').trim());
+  }
+
+  // Normalized identity keys for one participant, usable to match the same
+  // person across conversations: digit-normalized numbers/JIDs, plus raw
+  // lowercase UUIDs for Signal ACIs (never digit-normalize a UUID).
+  function participantMatchKeys(participant) {
+    const keys = new Set();
+    if (!participant) return keys;
+    [participant.number, participant.phone, participant.email, participant.id].forEach((value) => {
+      const raw = String(value || '').trim();
+      if (!raw) return;
+      if (looksLikeUuidIdentifier(raw)) {
+        keys.add(raw.toLowerCase());
+        return;
+      }
+      const head = raw.split('@')[0].split(':')[0];
+      [raw, head].forEach((candidate) => {
+        const norm = normalizeParticipantIdentifier(candidate);
+        if (norm) keys.add(norm);
+      });
+    });
+    return keys;
+  }
+
+  function selfParticipantKeys() {
+    const keys = new Set();
+    const add = (value) => {
+      for (const key of participantMatchKeys({ number: value })) keys.add(key);
+    };
+    if (whatsAppStatus && whatsAppStatus.account_jid) add(whatsAppStatus.account_jid);
+    if (signalStatus && signalStatus.account) add(signalStatus.account);
+    return keys;
+  }
+
+  function participantIsSelf(participant, selfKeys) {
+    if (!participant) return false;
+    if (participant.is_me || participant.isMe) return true;
+    if (!selfKeys || !selfKeys.size) return false;
+    for (const key of participantMatchKeys(participant)) {
+      if (selfKeys.has(key)) return true;
+    }
+    return false;
+  }
+
+  function memberDisplayNumber(participant) {
+    const raw = contactDisplayNumber(participant);
+    if (!raw || looksLikeUuidIdentifier(raw)) return '';
+    return raw;
+  }
+
+  // Group members as display entries: "You" pinned first, then named members
+  // alphabetically, then number-only members.
+  function groupMemberEntries(convo = activeConversation) {
+    if (!convo) return [];
+    const selfKeys = selfParticipantKeys();
+    const entries = conversationParticipants(convo)
+      .filter(Boolean)
+      .map((participant) => {
+        const number = memberDisplayNumber(participant);
+        const name = String(participant.name || '').trim();
+        const isSelf = participantIsSelf(participant, selfKeys);
+        const hasRealName = !!name && name !== number;
+        const label = isSelf ? 'You' : (hasRealName ? name : (number || name || 'Unknown member'));
+        return { participant, number, isSelf, hasRealName, label };
+      });
+    entries.sort((a, b) => {
+      if (a.isSelf !== b.isSelf) return a.isSelf ? -1 : 1;
+      if (a.hasRealName !== b.hasRealName) return a.hasRealName ? -1 : 1;
+      return a.label.localeCompare(b.label, undefined, { sensitivity: 'base', numeric: true });
+    });
+    return entries;
+  }
+
+  // Most recent direct conversation with this member on any platform, so the
+  // member list can jump straight to the 1:1 thread.
+  function directConversationForMember(entry) {
+    if (!entry || entry.isSelf) return null;
+    const keys = participantMatchKeys(entry.participant);
+    if (!keys.size) return null;
+    let best = null;
+    (allConversations || []).forEach((convo) => {
+      if (!convo || convo.IsGroup) return;
+      const matches = conversationParticipants(convo).some((p) => {
+        if (!p || p.is_me || p.isMe) return false;
+        for (const key of participantMatchKeys(p)) {
+          if (keys.has(key)) return true;
+        }
+        return false;
+      });
+      if (!matches) return;
+      if (!best || (convo.LastMessageTS || 0) > (best.LastMessageTS || 0)) best = convo;
+    });
+    return best;
+  }
+
   function closeContactPopover() {
     if (!$contactPopover) return;
     $contactPopover.hidden = true;
     $contactPopover.innerHTML = '';
     if ($chatHeaderName) $chatHeaderName.setAttribute('aria-expanded', 'false');
+    if ($chatHeaderStatus) $chatHeaderStatus.setAttribute('aria-expanded', 'false');
   }
 
-  function renderContactPopover() {
-    if (!$contactPopover || !activeConversation) return;
-    const participants = primaryContactParticipants(activeConversation);
-    const routes = activeConversation.IsGroup ? [activeConversation] : linkedRoutesForConversation(activeConversation);
-    const routePlatforms = distinctPlatforms(routes.map(displayPlatformForRoute));
-    const rows = participants.map((participant, index) => {
-      const name = String(participant.name || '').trim();
-      const number = contactDisplayNumber(participant);
-      const label = activeConversation.IsGroup ? (name || `Participant ${index + 1}`) : 'Phone';
-      return `
-        <div class="${activeConversation.IsGroup ? 'contact-popover-participant' : 'contact-popover-row'}">
-          <div>
-            ${activeConversation.IsGroup ? `<div class="contact-popover-name">${escapeHtml(label)}</div>` : ''}
-            <div class="contact-popover-number">${escapeHtml(number || 'No number stored')}</div>
-          </div>
-          ${number ? `<button type="button" class="contact-popover-copy" data-copy="${escapeHtml(number)}">Copy</button>` : ''}
-        </div>
-      `;
-    }).join('');
-    $contactPopover.innerHTML = `
-      <div class="contact-popover-name">${escapeHtml(activeConversation.Name || 'Unknown')}</div>
-      ${rows || '<div class="contact-popover-row"><span class="contact-popover-number">No contact number stored</span></div>'}
-      ${routePlatforms.length ? `<div class="contact-popover-routes">${routePlatforms.map(platform => platformBadgeHTML(platform)).join('')}</div>` : ''}
-    `;
-    $contactPopover.hidden = false;
-    if ($chatHeaderName) $chatHeaderName.setAttribute('aria-expanded', 'true');
-    $contactPopover.querySelectorAll('.contact-popover-copy').forEach(btn => {
+  function wireContactPopoverCopyButtons(scope, { closeOnCopy }) {
+    scope.querySelectorAll('.contact-popover-copy').forEach(btn => {
       btn.addEventListener('click', async (event) => {
         event.stopPropagation();
         const value = btn.dataset.copy || '';
         if (!value) return;
         await copyTextToClipboard(value);
         showThreadFeedback('Phone number copied.');
-        closeContactPopover();
+        if (closeOnCopy) closeContactPopover();
       });
     });
+  }
+
+  function groupMemberRowHTML(entry, index) {
+    const jumpTarget = directConversationForMember(entry);
+    const canMessage = !entry.isSelf && (jumpTarget || entry.number);
+    const actionTitle = jumpTarget
+      ? `Open chat with ${entry.label}`
+      : (canMessage ? `Message ${entry.label}` : '');
+    const numberLine = entry.number && entry.number !== entry.label
+      ? `<div class="contact-popover-number">${escapeHtml(entry.number)}</div>`
+      : '';
+    return `
+      <div
+        class="contact-popover-member${canMessage ? ' clickable' : ''}"
+        role="listitem"
+        data-member-index="${index}"
+        ${jumpTarget ? `data-jump-id="${escapeHtml(jumpTarget.ConversationID)}"` : ''}
+        ${!jumpTarget && canMessage ? `data-message-number="${escapeHtml(entry.number)}"` : ''}
+        ${canMessage ? `tabindex="0" title="${escapeHtml(actionTitle)}"` : ''}
+      >
+        ${avatarHTML({
+          name: entry.label,
+          numbers: entry.number ? [entry.number] : [],
+          className: 'contact-popover-member-avatar',
+          style: `background:${avatarColor(entry.label)}`,
+        })}
+        <div class="contact-popover-member-main">
+          <div class="contact-popover-member-name">${escapeHtml(entry.label)}</div>
+          ${numberLine}
+        </div>
+        ${entry.number ? `<button type="button" class="contact-popover-copy" data-copy="${escapeHtml(entry.number)}">Copy</button>` : ''}
+      </div>
+    `;
+  }
+
+  function renderGroupContactPopover() {
+    const entries = groupMemberEntries(activeConversation);
+    const total = entries.length;
+    const routePlatforms = distinctPlatforms([activeConversation].map(displayPlatformForRoute));
+    const showFilter = total > 8;
+    $contactPopover.setAttribute('aria-label', 'Group members');
+    $contactPopover.innerHTML = `
+      <div class="contact-popover-name">${escapeHtml(activeConversation.Name || 'Unknown')}</div>
+      <div class="contact-popover-subtitle">${total ? `${total} member${total === 1 ? '' : 's'}` : 'Group chat'}</div>
+      ${showFilter ? '<input type="search" class="contact-popover-filter" id="contact-popover-filter" placeholder="Search members..." aria-label="Search members" autocomplete="off">' : ''}
+      <div class="contact-popover-members" id="contact-popover-members" role="list" aria-label="Group members"></div>
+      ${routePlatforms.length ? `<div class="contact-popover-routes">${routePlatforms.map(platform => platformBadgeHTML(platform)).join('')}</div>` : ''}
+    `;
+    const $members = document.getElementById('contact-popover-members');
+    const renderList = (query = '') => {
+      if (!$members) return;
+      if (!total) {
+        $members.innerHTML = '<div class="contact-popover-empty">Member list is not available for this group yet.</div>';
+        return;
+      }
+      const q = query.trim().toLowerCase();
+      const visible = q
+        ? entries.filter(entry =>
+            entry.label.toLowerCase().includes(q)
+            || (entry.number || '').toLowerCase().includes(q)
+            || String(entry.participant.name || '').toLowerCase().includes(q))
+        : entries;
+      if (!visible.length) {
+        $members.innerHTML = '<div class="contact-popover-empty">No members match.</div>';
+        return;
+      }
+      $members.innerHTML = visible.map((entry, index) => groupMemberRowHTML(entry, index)).join('');
+      wireContactPopoverCopyButtons($members, { closeOnCopy: false });
+      $members.querySelectorAll('.contact-popover-member.clickable').forEach(row => {
+        const activate = async () => {
+          const jumpId = row.dataset.jumpId || '';
+          if (jumpId) {
+            const target = (allConversations || []).find(c => c && c.ConversationID === jumpId);
+            if (!target) return;
+            closeContactPopover();
+            await revealAndSelectConversation(target);
+            return;
+          }
+          const number = row.dataset.messageNumber || '';
+          if (!number) return;
+          closeContactPopover();
+          openNewMsg(number);
+        };
+        row.addEventListener('click', () => { activate().catch(() => {}); });
+        row.addEventListener('keydown', (event) => {
+          if (event.key === 'Enter' || event.key === ' ') {
+            event.preventDefault();
+            activate().catch(() => {});
+          }
+        });
+      });
+    };
+    renderList();
+    const $filter = document.getElementById('contact-popover-filter');
+    if ($filter) {
+      $filter.addEventListener('input', () => renderList($filter.value));
+    }
+  }
+
+  function renderContactPopover() {
+    if (!$contactPopover || !activeConversation) return;
+    if (activeConversation.IsGroup) {
+      renderGroupContactPopover();
+    } else {
+      const participants = primaryContactParticipants(activeConversation);
+      const routes = linkedRoutesForConversation(activeConversation);
+      const routePlatforms = distinctPlatforms(routes.map(displayPlatformForRoute));
+      $contactPopover.setAttribute('aria-label', 'Contact details');
+      const rows = participants.map((participant) => {
+        const number = contactDisplayNumber(participant);
+        return `
+          <div class="contact-popover-row">
+            <div>
+              <div class="contact-popover-number">${escapeHtml(number || 'No number stored')}</div>
+            </div>
+            ${number ? `<button type="button" class="contact-popover-copy" data-copy="${escapeHtml(number)}">Copy</button>` : ''}
+          </div>
+        `;
+      }).join('');
+      $contactPopover.innerHTML = `
+        <div class="contact-popover-name">${escapeHtml(activeConversation.Name || 'Unknown')}</div>
+        ${rows || '<div class="contact-popover-row"><span class="contact-popover-number">No contact number stored</span></div>'}
+        ${routePlatforms.length ? `<div class="contact-popover-routes">${routePlatforms.map(platform => platformBadgeHTML(platform)).join('')}</div>` : ''}
+      `;
+      wireContactPopoverCopyButtons($contactPopover, { closeOnCopy: true });
+    }
+    $contactPopover.hidden = false;
+    if ($chatHeaderName) $chatHeaderName.setAttribute('aria-expanded', 'true');
+    if ($chatHeaderStatus && $chatHeaderStatus.classList.contains('members-link')) {
+      $chatHeaderStatus.setAttribute('aria-expanded', 'true');
+    }
   }
 
   function toggleContactPopover() {
@@ -7782,10 +8095,30 @@ body::after {
       });
     }
     const details = [];
-    if (activeConversation.IsGroup) details.push('Group chat');
+    if (activeConversation.IsGroup) {
+      const memberCount = groupMemberEntries(activeConversation).length;
+      details.push(memberCount ? `${memberCount} member${memberCount === 1 ? '' : 's'}` : 'Group chat');
+    }
     const typingText = typingStatusText(activeConversation);
     $chatHeaderStatus.textContent = typingText || details.join(' • ');
     $chatHeaderStatus.classList.toggle('typing', !!typingText);
+    const membersLink = !!activeConversation.IsGroup;
+    $chatHeaderStatus.classList.toggle('members-link', membersLink);
+    if (membersLink) {
+      $chatHeaderStatus.setAttribute('role', 'button');
+      $chatHeaderStatus.setAttribute('tabindex', '0');
+      $chatHeaderStatus.setAttribute('aria-haspopup', 'dialog');
+      $chatHeaderStatus.setAttribute('title', 'View group members');
+      if (!$chatHeaderStatus.hasAttribute('aria-expanded')) {
+        $chatHeaderStatus.setAttribute('aria-expanded', $contactPopover && !$contactPopover.hidden ? 'true' : 'false');
+      }
+    } else {
+      $chatHeaderStatus.removeAttribute('role');
+      $chatHeaderStatus.removeAttribute('tabindex');
+      $chatHeaderStatus.removeAttribute('aria-haspopup');
+      $chatHeaderStatus.removeAttribute('title');
+      $chatHeaderStatus.removeAttribute('aria-expanded');
+    }
   }
 
   function refreshComposeRouteUI() {
@@ -11673,6 +12006,21 @@ body::after {
     });
   }
 
+  if ($chatHeaderStatus) {
+    $chatHeaderStatus.addEventListener('click', (event) => {
+      if (!activeConversation || !activeConversation.IsGroup) return;
+      event.stopPropagation();
+      toggleContactPopover();
+    });
+    $chatHeaderStatus.addEventListener('keydown', (event) => {
+      if (!activeConversation || !activeConversation.IsGroup) return;
+      if (event.key === 'Enter' || event.key === ' ') {
+        event.preventDefault();
+        toggleContactPopover();
+      }
+    });
+  }
+
   // ─── Attachments (paste + file picker) ───
   function renderAttachmentPreview(file) {
     $attachName.textContent = file.name || 'Attachment';
@@ -13061,7 +13409,7 @@ body::after {
     if ($threadSearchResults && !$threadSearchResults.hidden && !e.target.closest('.thread-search')) {
       clearThreadSearchResults();
     }
-    if ($contactPopover && !$contactPopover.hidden && !e.target.closest('.contact-popover') && !e.target.closest('#chat-header-name')) {
+    if ($contactPopover && !$contactPopover.hidden && !e.target.closest('.contact-popover') && !e.target.closest('#chat-header-name') && !e.target.closest('#chat-header-status')) {
       closeContactPopover();
     }
     if ($contextMenu && !$contextMenu.hidden && !e.target.closest('.context-menu') && !e.target.closest('.chat-header-action-btn') && !e.target.closest('#bulk-move-btn') && !e.target.closest('#schedule-btn')) {
@@ -13461,9 +13809,9 @@ body::after {
     }, '', 1);
   }
 
-  function openNewMsg() {
+  function openNewMsg(prefillNumber = '') {
     $newMsgOverlay.classList.add('show');
-    $newMsgPhone.value = '';
+    $newMsgPhone.value = String(prefillNumber || '');
     $newMsgError.style.display = 'none';
     $newMsgGo.disabled = false;
     $newMsgGo.textContent = 'Start conversation';
@@ -13471,6 +13819,7 @@ body::after {
     $newMsgRoutes.classList.remove('active');
     $newMsgRoutes.innerHTML = '';
     hideSuggestions();
+    if ($newMsgPhone.value.trim()) updateNewMessageRoutes();
     setTimeout(() => $newMsgPhone.focus(), 100);
   }
 
