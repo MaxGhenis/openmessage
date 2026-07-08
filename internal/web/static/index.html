@@ -13868,7 +13868,15 @@ body::after {
     $newMsgHelper.textContent = routeLabels.length > 1
       ? `This number already appears on ${routeLabels.join(' and ')}. Choose the route you want to reply from.`
       : `This number already has a ${routeLabels[0]} route.`;
-    $newMsgGo.textContent = replyRoute ? `Open ${platformMeta(displayPlatformForRoute(replyRoute)).label} route` : 'Start SMS conversation';
+    // The button mirrors what startNewConversation will actually do: open the
+    // picked platform's existing route if there is one, otherwise start a new
+    // thread on the picked platform.
+    const platformRoute = newMsgPlatform === 'sms'
+      ? replyRoute
+      : routes.find(route => sourcePlatformOf(route) === newMsgPlatform) || null;
+    $newMsgGo.textContent = platformRoute
+      ? `Open ${platformMeta(displayPlatformForRoute(platformRoute)).label} route`
+      : (newMsgPlatform === 'sms' ? 'Start SMS conversation' : newMessageStartLabel());
     $newMsgRoutes.classList.add('active');
     $newMsgRoutes.innerHTML = `<div class="new-msg-routes-caption">Existing routes</div>`;
     const routeHost = document.createElement('div');

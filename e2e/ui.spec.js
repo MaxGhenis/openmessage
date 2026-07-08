@@ -679,6 +679,17 @@ test('starts a new WhatsApp chat with a number from the platform picker', async 
   await expect(page.locator('#new-msg-overlay')).not.toHaveClass(/show/);
 });
 
+test('start button reflects the picked platform when other routes exist', async ({ page }) => {
+  await page.locator('#new-msg-btn').click();
+  await page.locator('#new-msg-phone').fill('+14155551234'); // Sarah Chen: SMS-only
+  // SMS pick opens the existing route.
+  await expect(page.locator('#new-msg-go')).toHaveText(/Open .+ route/);
+  // WhatsApp pick starts a new WhatsApp chat instead of opening the SMS route.
+  await page.locator('.new-msg-platform-chip[data-platform="whatsapp"]').click();
+  await expect(page.locator('#new-msg-go')).toHaveText('Start WhatsApp chat');
+  await expect(page.locator('#new-msg-routes')).toContainText('Existing routes');
+});
+
 test('requires a country code for new WhatsApp and Signal chats', async ({ page }) => {
   await page.locator('#new-msg-btn').click();
   await page.locator('.new-msg-platform-chip[data-platform="signal"]').click();
