@@ -2087,6 +2087,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		}
 		var req struct {
 			PhoneNumber string `json:"phone_number"`
+			Platform    string `json:"platform"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			httpError(w, "invalid JSON: "+err.Error(), 400)
@@ -2096,6 +2097,63 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			httpError(w, "phone_number is required", 400)
 			return
 		}
+		platform := strings.ToLower(strings.TrimSpace(req.Platform))
+		if platform == "" {
+			platform = "sms"
+		}
+
+		// WhatsApp and Signal route by explicit identifier (JID / E.164
+		// account), so the thread can be created locally without the platform
+		// being connected; the first send resolves the recipient. SMS goes
+		// through Google Messages, which owns conversation creation.
+		if platform == "whatsapp" || platform == "signal" {
+			number, err := normalizeInternationalNumber(req.PhoneNumber)
+			if err != nil {
+				httpError(w, err.Error(), 400)
+				return
+			}
+			convoID := "signal:" + number
+			if platform == "whatsapp" {
+				convoID = "whatsapp:" + strings.TrimPrefix(number, "+") + "@s.whatsapp.net"
+			}
+			if existing, err := store.GetConversation(convoID); err == nil && existing != nil {
+				writeJSON(w, map[string]any{
+					"conversation_id": existing.ConversationID,
+					"name":            existing.Name,
+				})
+				return
+			}
+			name := contactNameForNumber(store, number)
+			if name == "" {
+				name = number
+			}
+			participants, err := json.Marshal([]map[string]any{{"name": name, "number": number}})
+			if err != nil {
+				httpError(w, "encode participants: "+err.Error(), 500)
+				return
+			}
+			if err := store.UpsertConversation(&db.Conversation{
+				ConversationID: convoID,
+				Name:           name,
+				Participants:   string(participants),
+				LastMessageTS:  time.Now().UnixMilli(),
+				SourcePlatform: platform,
+			}); err != nil {
+				httpError(w, "create conversation: "+err.Error(), 500)
+				return
+			}
+			publishConversations()
+			writeJSON(w, map[string]any{
+				"conversation_id": convoID,
+				"name":            name,
+			})
+			return
+		}
+		if platform != "sms" {
+			httpError(w, "unsupported platform: "+platform, 400)
+			return
+		}
+
 		cli := getClient()
 		if cli == nil {
 			httpError(w, app.ErrNotConnected, 503)
@@ -3258,6 +3316,61 @@ func httpError(w http.ResponseWriter, msg string, code int) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	json.NewEncoder(w).Encode(map[string]string{"error": msg})
+}
+
+// normalizeInternationalNumber validates a user-entered number for platforms
+// that route by explicit E.164 identifier (WhatsApp JIDs, Signal accounts).
+// Google Messages resolves local formats server-side; WhatsApp and Signal
+// have no such resolution, so the country code must be explicit.
+func normalizeInternationalNumber(raw string) (string, error) {
+	trimmed := strings.TrimSpace(raw)
+	if !strings.HasPrefix(trimmed, "+") {
+		return "", errors.New("include the country code, e.g. +14155551234")
+	}
+	var digits strings.Builder
+	for _, r := range trimmed[1:] {
+		switch {
+		case r >= '0' && r <= '9':
+			digits.WriteRune(r)
+		case r == ' ' || r == '-' || r == '(' || r == ')' || r == '.':
+		default:
+			return "", errors.New("that doesn't look like a phone number")
+		}
+	}
+	number := digits.String()
+	if len(number) < 8 || len(number) > 15 {
+		return "", errors.New("include the country code, e.g. +14155551234")
+	}
+	return "+" + number, nil
+}
+
+// contactNameForNumber resolves a display name for a number from the contacts
+// table, falling back to names seen in conversation participants.
+func contactNameForNumber(store *db.Store, number string) string {
+	digits := strings.TrimPrefix(number, "+")
+	pick := func(contacts []*db.Contact, err error) string {
+		if err != nil {
+			return ""
+		}
+		for _, c := range contacts {
+			if c == nil {
+				continue
+			}
+			name := strings.TrimSpace(c.Name)
+			if name == "" || name == number || name == digits {
+				continue
+			}
+			if _, numErr := normalizeInternationalNumber(name); numErr == nil {
+				continue // a bare number posing as a name is not a name
+			}
+			return name
+		}
+		return ""
+	}
+	if name := pick(store.ListContacts(digits, 5)); name != "" {
+		return name
+	}
+	return pick(store.ListContactsFromConversations(digits, 5))
 }
 
 func googleAPIErrorMessage(action string, err error) string {

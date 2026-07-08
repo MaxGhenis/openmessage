@@ -3814,3 +3814,122 @@ func (zeroReader) Read(p []byte) (int, error) {
 	}
 	return len(p), nil
 }
+
+func TestNewConversationWhatsAppPlatform(t *testing.T) {
+	ts := newTestServer(t)
+
+	body := `{"phone_number":"+1 (415) 555-0123","platform":"whatsapp"}`
+	resp, err := http.Post(ts.server.URL+"/api/new-conversation", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+	var got struct {
+		ConversationID string `json:"conversation_id"`
+		Name           string `json:"name"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatal(err)
+	}
+	if got.ConversationID != "whatsapp:14155550123@s.whatsapp.net" {
+		t.Errorf("conversation_id = %q", got.ConversationID)
+	}
+	if got.Name != "+14155550123" {
+		t.Errorf("name = %q", got.Name)
+	}
+
+	conv, err := ts.store.GetConversation(got.ConversationID)
+	if err != nil || conv == nil {
+		t.Fatalf("conversation not stored: %v", err)
+	}
+	if conv.SourcePlatform != "whatsapp" {
+		t.Errorf("source_platform = %q", conv.SourcePlatform)
+	}
+	if !strings.Contains(conv.Participants, "+14155550123") {
+		t.Errorf("participants = %q", conv.Participants)
+	}
+
+	// Creating the same thread again reuses it rather than resetting it.
+	resp2, err := http.Post(ts.server.URL+"/api/new-conversation", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp2.Body.Close()
+	var got2 struct {
+		ConversationID string `json:"conversation_id"`
+	}
+	if err := json.NewDecoder(resp2.Body).Decode(&got2); err != nil {
+		t.Fatal(err)
+	}
+	if got2.ConversationID != got.ConversationID {
+		t.Errorf("second call returned %q, want %q", got2.ConversationID, got.ConversationID)
+	}
+}
+
+func TestNewConversationSignalPlatformUsesContactName(t *testing.T) {
+	ts := newTestServer(t)
+	if err := ts.store.UpsertContact(&db.Contact{ContactID: "c-ada", Name: "Ada Lovelace", Number: "+14155550777"}); err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := http.Post(ts.server.URL+"/api/new-conversation", "application/json",
+		strings.NewReader(`{"phone_number":"+14155550777","platform":"signal"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+	var got struct {
+		ConversationID string `json:"conversation_id"`
+		Name           string `json:"name"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatal(err)
+	}
+	if got.ConversationID != "signal:+14155550777" {
+		t.Errorf("conversation_id = %q", got.ConversationID)
+	}
+	if got.Name != "Ada Lovelace" {
+		t.Errorf("name = %q", got.Name)
+	}
+}
+
+func TestNewConversationPlatformValidation(t *testing.T) {
+	ts := newTestServer(t)
+
+	cases := []struct {
+		name string
+		body string
+		code int
+		want string
+	}{
+		{"missing country code", `{"phone_number":"4155550123","platform":"whatsapp"}`, 400, "country code"},
+		{"garbage number", `{"phone_number":"+not-a-number","platform":"signal"}`, 400, "phone number"},
+		{"unsupported platform", `{"phone_number":"+14155550123","platform":"telegram"}`, 400, "unsupported platform"},
+		{"sms without google client", `{"phone_number":"4155550123"}`, 503, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			resp, err := http.Post(ts.server.URL+"/api/new-conversation", "application/json", strings.NewReader(tc.body))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != tc.code {
+				t.Fatalf("expected %d, got %d", tc.code, resp.StatusCode)
+			}
+			if tc.want == "" {
+				return
+			}
+			raw, _ := io.ReadAll(resp.Body)
+			if !strings.Contains(string(raw), tc.want) {
+				t.Errorf("body %q does not mention %q", raw, tc.want)
+			}
+		})
+	}
+}
