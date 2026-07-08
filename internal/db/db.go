@@ -189,6 +189,12 @@ INSERT OR IGNORE INTO conversations (conversation_id, name, is_group, participan
 INSERT OR IGNORE INTO conversations (conversation_id, name, is_group, participants, last_message_ts, unread_count, source_platform) VALUES('wa2','Weekend Plans',1,'[{"name":"Mia Torres","number":"+12025557777"},{"name":"Noah Patel","number":"+13105558888"}]',1738957200000,0,'whatsapp');
 INSERT OR IGNORE INTO conversations (conversation_id, name, is_group, participants, last_message_ts, unread_count, source_platform) VALUES('wa3','Mia Torres',0,'[{"name":"Mia Torres","number":"+12025557777"}]',1738950000000,0,'whatsapp');
 
+-- Large WhatsApp group: exercises the group-members panel (member count,
+-- "You" pinned first, alphabetical sort, number-only members last, filter
+-- input above 8 members). Participant order is deliberately scrambled so the
+-- UI sort is observable.
+INSERT OR IGNORE INTO conversations (conversation_id, name, is_group, participants, last_message_ts, unread_count, source_platform) VALUES('wa4','Dolores Park Picnic',1,'[{"name":"Noah Patel","number":"+13105558888"},{"name":"+14155550123","number":"+14155550123"},{"name":"Mia Torres","number":"+12025557777"},{"name":"Me","number":"+15551234567","is_me":true},{"name":"Sarah Chen","number":"+14155551234"},{"name":"Rachel Green","number":"+16505553333"},{"name":"David Kim","number":"+14085557890"},{"name":"+12065550188","number":"+12065550188"},{"name":"Emily Park","number":"+13105553456"},{"name":"Marcus Johnson","number":"+12125559876"},{"name":"Alex Thompson","number":"+17185552222"},{"name":"Lisa Rodriguez","number":"+12025551111"}]',1738930800000,0,'whatsapp');
+
 -- Signal conversations. Signal contacts are keyed by ACI (account identifier)
 -- UUID rather than phone number — participants.number holds the ACI. Some
 -- contacts overlap with SMS/WhatsApp (Jordan Rivera) so the sidebar
@@ -238,6 +244,10 @@ INSERT OR IGNORE INTO messages (message_id, conversation_id, sender_name, sender
 
 INSERT OR IGNORE INTO messages (message_id, conversation_id, sender_name, sender_number, body, timestamp_ms, status, is_from_me, media_id, mime_type, decryption_key, reactions, reply_to_id, source_platform, source_id) VALUES('wa3a','wa3','Mia Torres','+12025557777','Hey, can you send me that article you mentioned?',1738944000000,'delivered',0,'','','','','','whatsapp','');
 INSERT OR IGNORE INTO messages (message_id, conversation_id, sender_name, sender_number, body, timestamp_ms, status, is_from_me, media_id, mime_type, decryption_key, reactions, reply_to_id, source_platform, source_id) VALUES('wa3b','wa3','Me','+15551234567','Just sent it! Let me know what you think',1738950000000,'delivered',1,'','','','','','whatsapp','');
+
+INSERT OR IGNORE INTO messages (message_id, conversation_id, sender_name, sender_number, body, timestamp_ms, status, is_from_me, media_id, mime_type, decryption_key, reactions, reply_to_id, source_platform, source_id) VALUES('wa4a','wa4','Mia Torres','+12025557777','Picnic is on for Sunday, usual spot by the palm trees',1738926000000,'delivered',0,'','','','','','whatsapp','');
+INSERT OR IGNORE INTO messages (message_id, conversation_id, sender_name, sender_number, body, timestamp_ms, status, is_from_me, media_id, mime_type, decryption_key, reactions, reply_to_id, source_platform, source_id) VALUES('wa4b','wa4','+14155550123','+14155550123','I can bring a cooler and blankets',1738928400000,'delivered',0,'','','','','','whatsapp','');
+INSERT OR IGNORE INTO messages (message_id, conversation_id, sender_name, sender_number, body, timestamp_ms, status, is_from_me, media_id, mime_type, decryption_key, reactions, reply_to_id, source_platform, source_id) VALUES('wa4c','wa4','Me','+15551234567','I will grab tacos on my way over',1738930800000,'delivered',1,'','','','','','whatsapp','');
 
 INSERT OR IGNORE INTO contacts VALUES('c1','Sarah Chen','+14155551234');
 INSERT OR IGNORE INTO contacts VALUES('c2','Marcus Johnson','+12125559876');

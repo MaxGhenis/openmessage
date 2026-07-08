@@ -512,13 +512,13 @@ func TestSeedDemo(t *testing.T) {
 		t.Fatalf("SeedDemo: %v", err)
 	}
 
-	// Should have 15 conversations (9 SMS + 3 WhatsApp + 3 Signal)
+	// Should have 16 conversations (9 SMS + 4 WhatsApp + 3 Signal)
 	convs, err := store.ListConversations(100)
 	if err != nil {
 		t.Fatalf("list conversations: %v", err)
 	}
-	if len(convs) != 15 {
-		t.Errorf("expected 15 conversations, got %d", len(convs))
+	if len(convs) != 16 {
+		t.Errorf("expected 16 conversations, got %d", len(convs))
 	}
 
 	// Should have 12 contacts (10 with phone numbers + 2 Signal ACIs)

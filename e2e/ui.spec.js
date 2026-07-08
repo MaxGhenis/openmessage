@@ -260,11 +260,11 @@ test('opens a deep-linked conversation from the URL', async ({ page }) => {
 test('shows platform badges and filters threads by source', async ({ page }) => {
   await expect(page.locator('#sidebar-source-filters')).toContainText('WhatsApp');
   await expect(page.locator('#sidebar-source-filters')).toContainText('Signal');
-  await expect(page.getByRole('button', { name: /WhatsApp 6/i })).toBeVisible();
+  await expect(page.getByRole('button', { name: /WhatsApp 7/i })).toBeVisible();
 
-  await page.getByRole('button', { name: /WhatsApp 6/i }).click();
+  await page.getByRole('button', { name: /WhatsApp 7/i }).click();
 
-  await expect(page.locator('#conversation-list .convo-item')).toHaveCount(6);
+  await expect(page.locator('#conversation-list .convo-item')).toHaveCount(7);
   await expect(page.locator('#conversation-list')).toContainText('Weekend Hiking Group');
   await expect(page.locator('#conversation-list')).toContainText('Lisa Rodriguez');
   await expect(page.locator('#conversation-list')).toContainText('Jordan Rivera');
@@ -454,7 +454,7 @@ test('lets you scroll the platforms screen when pairing cards expand', async ({ 
 test('lets you leave a WhatsApp group from the thread header', async ({ page }) => {
   page.on('dialog', (dialog) => dialog.accept());
 
-  await page.getByRole('button', { name: /WhatsApp 6/i }).click();
+  await page.getByRole('button', { name: /WhatsApp 7/i }).click();
   await openConversation(page, 'Weekend Hiking Group');
 
   await expect(page.locator('#chat-header-leave-group-btn')).toBeVisible();
@@ -462,7 +462,7 @@ test('lets you leave a WhatsApp group from the thread header', async ({ page }) 
 
   await expect(page.locator('#thread-feedback')).toContainText('Left WhatsApp group.');
   await expect(page.locator('#conversation-list')).not.toContainText('Weekend Hiking Group');
-  await expect(page.getByRole('button', { name: /WhatsApp 5/i })).toBeVisible();
+  await expect(page.getByRole('button', { name: /WhatsApp 6/i })).toBeVisible();
 });
 
 test('search matches conversations, participants, and updates platform chip counts', async ({ page }) => {
@@ -576,6 +576,87 @@ test('opens contact details from the thread header name', async ({ page }) => {
   await page.locator('#chat-header-name').click();
   await expect(page.locator('#contact-popover')).toBeVisible();
   await expect(page.locator('#contact-popover')).toContainText('+14155551234');
+});
+
+test('shows the group member count and member list from the header', async ({ page }) => {
+  // Weekend Plans rather than Weekend Hiking Group: the leave-group test
+  // earlier in this file removes the hiking group from the shared server.
+  await openConversation(page, 'Weekend Plans');
+
+  await expect(page.locator('#chat-header-status')).toHaveText('2 members');
+  await page.locator('#chat-header-status').click();
+  await expect(page.locator('#contact-popover')).toBeVisible();
+  await expect(page.locator('#contact-popover .contact-popover-subtitle')).toHaveText('2 members');
+
+  const names = page.locator('#contact-popover .contact-popover-member-name');
+  await expect(names).toHaveText(['Mia Torres', 'Noah Patel']);
+  await expect(page.locator('#contact-popover')).toContainText('+12025557777');
+  await expect(page.locator('#contact-popover .contact-popover-copy')).toHaveCount(2);
+  // Small groups skip the filter input.
+  await expect(page.locator('#contact-popover-filter')).toHaveCount(0);
+});
+
+test('hides Signal member UUIDs in the group member list', async ({ page }) => {
+  await openConversation(page, 'Climbing Crew');
+
+  await expect(page.locator('#chat-header-status')).toHaveText('3 members');
+  await page.locator('#chat-header-name').click();
+  await expect(page.locator('#contact-popover')).toBeVisible();
+
+  const names = page.locator('#contact-popover .contact-popover-member-name');
+  await expect(names).toHaveText(['Jordan Rivera', 'Priya Shah', 'Theo Nakamura']);
+  await expect(page.locator('#contact-popover')).not.toContainText('a1a98e48');
+  await expect(page.locator('#contact-popover .contact-popover-copy')).toHaveCount(0);
+});
+
+test('filters large group member lists and pins You first', async ({ page }) => {
+  await openConversation(page, 'Dolores Park Picnic');
+
+  await expect(page.locator('#chat-header-status')).toHaveText('12 members');
+  await page.locator('#chat-header-status').click();
+  await expect(page.locator('#contact-popover')).toBeVisible();
+
+  const names = page.locator('#contact-popover .contact-popover-member-name');
+  await expect(names).toHaveCount(12);
+  await expect(names.first()).toHaveText('You');
+  await expect(names.nth(1)).toHaveText('Alex Thompson');
+  // Number-only members sort after named members.
+  await expect(names.nth(10)).toHaveText('+12065550188');
+  await expect(names.nth(11)).toHaveText('+14155550123');
+
+  const filter = page.locator('#contact-popover-filter');
+  await expect(filter).toBeVisible();
+  await filter.fill('mia');
+  await expect(names).toHaveCount(1);
+  await expect(names.first()).toHaveText('Mia Torres');
+  await filter.fill('zzz');
+  await expect(page.locator('#contact-popover')).toContainText('No members match');
+});
+
+test('jumps to a direct chat from the group member list', async ({ page }) => {
+  await openConversation(page, 'Climbing Crew');
+
+  await page.locator('#chat-header-status').click();
+  await page
+    .locator('#contact-popover .contact-popover-member', { hasText: 'Priya Shah' })
+    .locator('.contact-popover-member-name')
+    .click();
+
+  await expect(page.locator('#chat-header-name')).toHaveText('Priya Shah');
+  await expect(page.locator('#contact-popover')).toBeHidden();
+});
+
+test('starts a prefilled new message for members without a direct chat', async ({ page }) => {
+  await openConversation(page, 'Dolores Park Picnic');
+
+  await page.locator('#chat-header-status').click();
+  await page
+    .locator('#contact-popover .contact-popover-member', { hasText: '+14155550123' })
+    .locator('.contact-popover-member-name')
+    .click();
+
+  await expect(page.locator('#new-msg-overlay')).toHaveClass(/show/);
+  await expect(page.locator('#new-msg-phone')).toHaveValue('+14155550123');
 });
 
 test('searches only within the active thread', async ({ page }) => {
