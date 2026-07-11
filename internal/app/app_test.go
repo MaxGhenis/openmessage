@@ -7,7 +7,11 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/maxghenis/openmessage/internal/client"
 	"github.com/rs/zerolog"
+	"go.mau.fi/mautrix-gmessages/pkg/libgm/events"
+	"go.mau.fi/mautrix-gmessages/pkg/libgm/gmproto"
+	"google.golang.org/protobuf/proto"
 )
 
 func TestNewDemoUsesIsolatedTempDataDir(t *testing.T) {
@@ -291,5 +295,104 @@ func TestHandleGoogleAuthExpiredErrorMarksDisconnected(t *testing.T) {
 func TestIsGoogleAuthExpiredErrorRecognizesFriendlyStatus(t *testing.T) {
 	if !IsGoogleAuthExpiredError(errors.New(googleAuthExpiredStatusMessage)) {
 		t.Fatal("expected friendly auth-expired status to be recognized")
+	}
+}
+
+func newGoogleCallbackTestApp(t *testing.T) *App {
+	t.Helper()
+	sessionPath := filepath.Join(t.TempDir(), "session.json")
+	if err := client.SaveSession(sessionPath, &client.SessionData{AuthDataJSON: []byte(`{}`)}); err != nil {
+		t.Fatalf("SaveSession(): %v", err)
+	}
+
+	a := &App{SessionPath: sessionPath, Logger: zerolog.Nop()}
+	// There is no exported callback-registration seam. An auth-less session makes
+	// Connect fail before network I/O while exposing the installed callback through
+	// the current public API. This is test setup, not a LoadAndConnect invariant.
+	if err := a.LoadAndConnect(); err == nil {
+		t.Fatal("auth-less callback fixture unexpectedly connected")
+	}
+	if a.GetClient() == nil || a.EventHandler == nil {
+		t.Fatal("current public API did not expose the installed Google callback")
+	}
+	return a
+}
+
+func TestGoogleEventCredentialClassificationAfterLoad(t *testing.T) {
+	// These classifications guard credentials across the Wave 1 supervisor refactor.
+	t.Run("ListenFatalError keeps credentials", func(t *testing.T) {
+		a := newGoogleCallbackTestApp(t)
+		installedClient := a.GetClient()
+		a.Connected.Store(true)
+
+		a.EventHandler.Handle(&events.ListenFatalError{Error: errors.New("temporary token refresh failure")})
+
+		if a.Connected.Load() {
+			t.Fatal("ListenFatalError must end the live connection")
+		}
+		if a.GetClient() != installedClient {
+			t.Fatal("ListenFatalError must keep the installed client for reconnect")
+		}
+		if _, err := os.Stat(a.SessionPath); err != nil {
+			t.Fatalf("ListenFatalError must keep the session file: %v", err)
+		}
+		status := a.GoogleStatus()
+		if !status.Paired || status.NeedsPairing || status.NeedsRepair {
+			t.Fatalf("ListenFatalError status = %+v, want paired transient disconnect", status)
+		}
+	})
+
+	t.Run("GaiaLoggedOut drops credentials and requires pairing", func(t *testing.T) {
+		a := newGoogleCallbackTestApp(t)
+		a.Connected.Store(true)
+
+		a.EventHandler.Handle(&events.GaiaLoggedOut{})
+
+		if a.Connected.Load() {
+			t.Fatal("GaiaLoggedOut must mark Google disconnected")
+		}
+		if a.GetClient() != nil {
+			t.Fatal("GaiaLoggedOut must drop the invalid client")
+		}
+		if _, err := os.Stat(a.SessionPath); !os.IsNotExist(err) {
+			t.Fatalf("GaiaLoggedOut session stat error = %v, want not exist", err)
+		}
+		status := a.GoogleStatus()
+		if status.Paired || !status.NeedsPairing {
+			t.Fatalf("GaiaLoggedOut status = %+v, want pairing required", status)
+		}
+	})
+}
+
+func TestGoogleEventCallbackRecoversPanics(t *testing.T) {
+	a := newGoogleCallbackTestApp(t)
+	a.Connected.Store(true)
+
+	panickingPathReached := false
+	a.EventHandler.OnSessionInvalid = func() {
+		panickingPathReached = true
+		panic("malformed Google event")
+	}
+
+	messageData, err := proto.Marshal(&gmproto.RPCMessageData{
+		Action:          gmproto.ActionType_GET_UPDATES,
+		UnencryptedData: []byte{0x72, 0x00},
+	})
+	if err != nil {
+		t.Fatalf("marshal GaiaLoggedOut fixture: %v", err)
+	}
+
+	// This public libgm receive path reaches the single callback wrapped for Wave 1.
+	a.GetClient().GM.HandleRPCMsg(&gmproto.IncomingRPCMessage{
+		ResponseID:  "panic-containment-fixture",
+		BugleRoute:  gmproto.BugleRoute_DataEvent,
+		MessageData: messageData,
+	})
+
+	if !panickingPathReached {
+		t.Fatal("GaiaLoggedOut fixture did not reach the panicking handler path")
+	}
+	if a.Connected.Load() {
+		t.Fatal("recovered callback panic must mark Google disconnected")
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"crypto/cipher"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -63,6 +64,25 @@ func encryptCookie(t *testing.T, value, host string, key []byte, withHostHash bo
 	return append([]byte("v10"), out...)
 }
 
+func TestDeriveKeyChromePBKDF2Vectors(t *testing.T) {
+	// Fixed Chrome vectors guard key derivation before Wave 1 changes credential storage.
+	tests := []struct {
+		iterations int
+		want       string
+	}{
+		{iterations: 1, want: "d7d4df19d842591632e8dfb427ab3474"},
+		{iterations: 1003, want: "01ab06dc67d036480129f3e40d53ca5f"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.want, func(t *testing.T) {
+			got := hex.EncodeToString(DeriveKey([]byte("test-secret"), tt.iterations))
+			if got != tt.want {
+				t.Fatalf("DeriveKey(iterations=%d) = %s, want %s", tt.iterations, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestDecryptCookieRoundTrip(t *testing.T) {
 	key := DeriveKey([]byte("test-secret"), 1003)
 	for _, withHash := range []bool{false, true} {
@@ -74,6 +94,21 @@ func TestDecryptCookieRoundTrip(t *testing.T) {
 		if got != "cookie-value-123" {
 			t.Fatalf("DecryptCookie(withHash=%v) = %q, want %q", withHash, got, "cookie-value-123")
 		}
+	}
+}
+
+func TestDecryptCookieV11(t *testing.T) {
+	// Cookie refresh must keep accepting Chrome's v11 envelope through Wave 1.
+	key := DeriveKey([]byte("test-secret"), 1003)
+	encrypted := encryptCookie(t, "cookie-value-123", ".google.com", key, true)
+	copy(encrypted[:3], "v11")
+
+	got, err := DecryptCookie(encrypted, ".google.com", key)
+	if err != nil {
+		t.Fatalf("DecryptCookie(v11): %v", err)
+	}
+	if got != "cookie-value-123" {
+		t.Fatalf("DecryptCookie(v11) = %q, want %q", got, "cookie-value-123")
 	}
 }
 
@@ -133,23 +168,59 @@ func TestUpdateSessionCookiesPreservesOtherFields(t *testing.T) {
 }
 
 func TestLoadChromeCookiesRequiresAllSessionCookies(t *testing.T) {
-	// A profile whose cookie DB has only a subset of the required cookies must
-	// fail loudly rather than write a half-valid session that 401s anyway.
-	dir := t.TempDir()
-	profile := filepath.Join(dir, "Default")
-	if err := os.MkdirAll(filepath.Join(profile, "Network"), 0o700); err != nil {
-		t.Fatalf("mkdir profile: %v", err)
-	}
-	key := DeriveKey([]byte("secret"), 1003)
-	writeCookieDB(t, filepath.Join(profile, "Network", "Cookies"), []dbCookie{
-		{".google.com", "SID", encryptCookie(t, "v", ".google.com", key, false)},
-		// OSID/HSID/SSID/APISID/SAPISID intentionally absent.
-	})
+	// Exact host/name requirements guard Wave 1 from persisting partial credentials.
+	secret := []byte("secret")
+	key := DeriveKey(secret, 1003)
 
-	_, err := LoadChromeCookies(profile, []byte("secret"))
-	if err == nil {
-		t.Fatal("expected error for missing required cookies, got nil")
+	for _, missing := range requiredCookies {
+		missing := missing
+		t.Run("missing "+missing.host+":"+missing.name, func(t *testing.T) {
+			profile := filepath.Join(t.TempDir(), "Default")
+			if err := os.MkdirAll(filepath.Join(profile, "Network"), 0o700); err != nil {
+				t.Fatalf("mkdir profile: %v", err)
+			}
+			rows := make([]dbCookie, 0, len(requiredCookies)-1)
+			for _, req := range requiredCookies {
+				if req == missing {
+					continue
+				}
+				rows = append(rows, dbCookie{req.host, req.name, encryptCookie(t, "val-"+req.name, req.host, key, true)})
+			}
+			writeCookieDB(t, filepath.Join(profile, "Network", "Cookies"), rows)
+
+			_, err := LoadChromeCookies(profile, secret)
+			wantErr := "missing required cookies: " + missing.host + ":" + missing.name
+			if err == nil || err.Error() != wantErr {
+				t.Fatalf("LoadChromeCookies() error = %v, want %q", err, wantErr)
+			}
+		})
 	}
+
+	t.Run("required name on wrong host", func(t *testing.T) {
+		profile := filepath.Join(t.TempDir(), "Default")
+		if err := os.MkdirAll(filepath.Join(profile, "Network"), 0o700); err != nil {
+			t.Fatalf("mkdir profile: %v", err)
+		}
+		rows := make([]dbCookie, 0, len(requiredCookies))
+		for _, req := range requiredCookies {
+			if req.name == "SID" {
+				continue
+			}
+			rows = append(rows, dbCookie{req.host, req.name, encryptCookie(t, "val-"+req.name, req.host, key, true)})
+		}
+		rows = append(rows, dbCookie{
+			host:      "accounts.google.com",
+			name:      "SID",
+			encrypted: encryptCookie(t, "wrong-host", "accounts.google.com", key, true),
+		})
+		writeCookieDB(t, filepath.Join(profile, "Network", "Cookies"), rows)
+
+		_, err := LoadChromeCookies(profile, secret)
+		const wantErr = "missing required cookies: .google.com:SID"
+		if err == nil || err.Error() != wantErr {
+			t.Fatalf("LoadChromeCookies() error = %v, want %q", err, wantErr)
+		}
+	})
 }
 
 func TestLoadChromeCookiesHappyPath(t *testing.T) {
@@ -177,5 +248,31 @@ func TestLoadChromeCookiesHappyPath(t *testing.T) {
 	}
 	if got["OSID"] != "val-OSID" {
 		t.Fatalf("OSID = %q, want %q", got["OSID"], "val-OSID")
+	}
+}
+
+func TestLoadChromeCookiesSelectsLinuxPBKDF2Iterations(t *testing.T) {
+	// Wave 1 credential handling must preserve selection of Chrome's Linux key.
+	profile := filepath.Join(t.TempDir(), "Default")
+	if err := os.MkdirAll(filepath.Join(profile, "Network"), 0o700); err != nil {
+		t.Fatalf("mkdir profile: %v", err)
+	}
+	secret := []byte("secret")
+	key := DeriveKey(secret, 1)
+	rows := make([]dbCookie, 0, len(requiredCookies))
+	for _, req := range requiredCookies {
+		rows = append(rows, dbCookie{req.host, req.name, encryptCookie(t, "linux-"+req.name, req.host, key, true)})
+	}
+	writeCookieDB(t, filepath.Join(profile, "Network", "Cookies"), rows)
+
+	got, err := LoadChromeCookies(profile, secret)
+	if err != nil {
+		t.Fatalf("LoadChromeCookies(): %v", err)
+	}
+	for _, req := range requiredCookies {
+		want := "linux-" + req.name
+		if got[req.name] != want {
+			t.Fatalf("%s = %q, want %q", req.name, got[req.name], want)
+		}
 	}
 }
