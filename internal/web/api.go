@@ -34,10 +34,12 @@ import (
 //go:embed static/*
 var staticFS embed.FS
 
-// maxUploadBytes bounds /api/send-media request bodies. 128MB sits above
-// every platform's attachment cap (Signal ~100MB, WhatsApp ~64MB, MMS ~1MB)
-// while keeping a runaway POST from exhausting memory.
-const maxUploadBytes = 128 << 20
+// maxUploadBytes bounds /api/send-media and /api/schedule-media request bodies.
+// 128MB sits above every platform's attachment cap (Signal ~100MB, WhatsApp
+// ~64MB, MMS ~1MB) while keeping a runaway POST from exhausting memory. It is a
+// var (not a const) only so tests can shrink it; it is never mutated in
+// production.
+var maxUploadBytes int64 = 128 << 20
 
 const maxTranscriptRequestBytes = db.MaxTranscriptBytes + db.MaxTranscriptModelBytes + 4096
 
@@ -1353,8 +1355,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			httpError(w, "method not allowed", 405)
 			return
 		}
-		if err := r.ParseMultipartForm(25 << 20); err != nil {
-			httpError(w, "invalid multipart form: "+err.Error(), 400)
+		if !parseBoundedMultipartForm(w, r) {
 			return
 		}
 		convID := strings.TrimSpace(r.FormValue("conversation_id"))
@@ -1377,24 +1378,13 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			httpError(w, "conversation not found", 400)
 			return
 		}
-		file, header, err := r.FormFile("file")
-		if err != nil {
-			httpError(w, "file is required: "+err.Error(), 400)
-			return
-		}
-		defer file.Close()
-		data, err := io.ReadAll(file)
-		if err != nil {
-			httpError(w, "read file: "+err.Error(), 500)
+		data, filename, mime, ok := readFormFile(w, r, "file")
+		if !ok {
 			return
 		}
 		if len(data) == 0 {
 			httpError(w, "file is empty", 400)
 			return
-		}
-		mime := header.Header.Get("Content-Type")
-		if mime == "" {
-			mime = "application/octet-stream"
 		}
 		sm := &db.ScheduledMessage{
 			ID:             scheduledID(),
@@ -1405,7 +1395,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			Status:         db.ScheduleStatusPending,
 			CreatedAt:      time.Now().UnixMilli(),
 			MediaData:      data,
-			MediaFilename:  header.Filename,
+			MediaFilename:  filename,
 			MediaMime:      mime,
 		}
 		if err := store.CreateScheduledMessage(sm); err != nil {
@@ -1823,19 +1813,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			httpError(w, "method not allowed", 405)
 			return
 		}
-		// Cap the whole request body: ParseMultipartForm's argument only
-		// bounds the in-memory portion (the rest spills to disk), and the
-		// attachment is read fully into memory below — without this cap a
-		// single oversized POST can OOM the backend and take every live
-		// sync down with it.
-		r.Body = http.MaxBytesReader(w, r.Body, maxUploadBytes)
-		if err := r.ParseMultipartForm(10 << 20); err != nil {
-			var tooLarge *http.MaxBytesError
-			if errors.As(err, &tooLarge) {
-				httpError(w, fmt.Sprintf("attachment too large (limit %d MB)", maxUploadBytes>>20), http.StatusRequestEntityTooLarge)
-				return
-			}
-			httpError(w, "invalid multipart form: "+err.Error(), 400)
+		if !parseBoundedMultipartForm(w, r) {
 			return
 		}
 
@@ -1852,29 +1830,11 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			return
 		}
 
-		file, header, err := r.FormFile("file")
-		if err != nil {
-			httpError(w, "file is required: "+err.Error(), 400)
+		data, filename, mime, ok := readFormFile(w, r, "file")
+		if !ok {
 			return
 		}
-		defer file.Close()
-
-		data, err := io.ReadAll(file)
-		if err != nil {
-			var tooLarge *http.MaxBytesError
-			if errors.As(err, &tooLarge) {
-				httpError(w, fmt.Sprintf("attachment too large (limit %d MB)", maxUploadBytes>>20), http.StatusRequestEntityTooLarge)
-				return
-			}
-			httpError(w, "read file: "+err.Error(), 500)
-			return
-		}
-
-		mime := header.Header.Get("Content-Type")
-		if mime == "" {
-			mime = "application/octet-stream"
-		}
-		sendMediaBytes(w, convID, data, header.Filename, mime, caption, replyToID, idempotencyKey)
+		sendMediaBytes(w, convID, data, filename, mime, caption, replyToID, idempotencyKey)
 	})
 
 	mux.HandleFunc("/api/media/", func(w http.ResponseWriter, r *http.Request) {
@@ -1905,9 +1865,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			if mimeType == "" {
 				mimeType = msg.MimeType
 			}
-			w.Header().Set("Content-Type", mimeType)
-			w.Header().Set("Cache-Control", "public, max-age=86400")
-			w.Write(data)
+			writeMediaResponse(w, data, "", mimeType)
 			return
 		}
 		if msg.SourcePlatform == "signal" || strings.HasPrefix(msg.MessageID, "signal:") || strings.HasPrefix(msg.MediaID, "signalatt:") {
@@ -1923,9 +1881,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			if mimeType == "" {
 				mimeType = msg.MimeType
 			}
-			w.Header().Set("Content-Type", mimeType)
-			w.Header().Set("Cache-Control", "public, max-age=86400")
-			w.Write(data)
+			writeMediaResponse(w, data, "", mimeType)
 			return
 		}
 		cli := getClient()
@@ -1945,9 +1901,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			httpError(w, googleAPIErrorMessage("download media", err), 502)
 			return
 		}
-		w.Header().Set("Content-Type", msg.MimeType)
-		w.Header().Set("Cache-Control", "public, max-age=86400")
-		w.Write(data)
+		writeMediaResponse(w, data, "", msg.MimeType)
 	})
 
 	mux.HandleFunc("/api/react", func(w http.ResponseWriter, r *http.Request) {
@@ -3316,6 +3270,147 @@ func httpError(w http.ResponseWriter, msg string, code int) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	json.NewEncoder(w).Encode(map[string]string{"error": msg})
+}
+
+func normalizeMIME(mimeType string) string {
+	m := strings.ToLower(strings.TrimSpace(mimeType))
+	if i := strings.IndexByte(m, ';'); i >= 0 {
+		m = strings.TrimSpace(m[:i])
+	}
+	return m
+}
+
+// isPassiveInlineMIME reports whether a media type can be rendered inline in a
+// browser with no risk of executing script. SVG and the HTML/XML family are
+// excluded because they can carry <script>; anything not positively recognized
+// is treated as unsafe and downloaded instead.
+func isPassiveInlineMIME(mimeType string) bool {
+	m := normalizeMIME(mimeType)
+	switch {
+	case m == "image/svg+xml":
+		return false
+	case strings.HasPrefix(m, "image/"),
+		strings.HasPrefix(m, "audio/"),
+		strings.HasPrefix(m, "video/"):
+		return true
+	case m == "application/pdf", m == "text/plain":
+		return true
+	default:
+		return false
+	}
+}
+
+// isActiveMIME reports whether a sniffed type could be interpreted as
+// script-bearing markup. It rejects a payload declared as a passive type whose
+// bytes actually sniff as active content (a spoofed image/png that is really
+// HTML).
+func isActiveMIME(mimeType string) bool {
+	switch normalizeMIME(mimeType) {
+	case "text/html", "application/xhtml+xml", "image/svg+xml", "text/xml", "application/xml":
+		return true
+	}
+	return false
+}
+
+// sanitizeMediaFilename strips path components, control characters, and
+// header-breaking characters so a filename can be placed in a quoted
+// Content-Disposition value. Non-ASCII bytes are replaced to keep the header
+// well-formed; the result is never empty.
+func sanitizeMediaFilename(name string) string {
+	name = strings.TrimSpace(name)
+	if i := strings.LastIndexAny(name, "/\\"); i >= 0 {
+		name = name[i+1:]
+	}
+	var b strings.Builder
+	for _, r := range name {
+		switch {
+		case r < 0x20 || r == 0x7f, r == '"' || r == '\\':
+			// drop
+		case r > 0x7f:
+			b.WriteByte('_')
+		default:
+			b.WriteRune(r)
+		}
+	}
+	out := strings.TrimSpace(b.String())
+	if out == "" {
+		return "attachment"
+	}
+	return out
+}
+
+// writeMediaResponse serves attachment bytes so a sender-controlled file cannot
+// execute script on the API origin. Only a passive allowlist (image/audio/video/
+// pdf/plain text, never SVG) is served inline with its real type; everything
+// else — HTML, SVG, XML, unknown — is forced to an inert octet-stream download.
+// nosniff, a sandbox CSP, and same-origin CORP apply to every media response as
+// defense in depth. This is the single choke point for /api/media/ serving.
+func writeMediaResponse(w http.ResponseWriter, data []byte, filename, declaredMIME string) {
+	resolved := normalizeMIME(declaredMIME)
+	if resolved == "" {
+		resolved = "application/octet-stream"
+	}
+	inline := isPassiveInlineMIME(resolved) && !isActiveMIME(http.DetectContentType(data))
+
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Content-Security-Policy", "sandbox; default-src 'none'")
+	w.Header().Set("Cross-Origin-Resource-Policy", "same-origin")
+	w.Header().Set("Cache-Control", "private, max-age=86400")
+
+	safe := sanitizeMediaFilename(filename)
+	if inline {
+		w.Header().Set("Content-Type", resolved)
+		w.Header().Set("Content-Disposition", `inline; filename="`+safe+`"`)
+	} else {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Content-Disposition", `attachment; filename="`+safe+`"`)
+	}
+	_, _ = w.Write(data)
+}
+
+// parseBoundedMultipartForm caps the request body before parsing a multipart
+// upload, so an oversized POST cannot exhaust memory/disk/WAL before the
+// attachment size is known (ParseMultipartForm's own argument only bounds the
+// in-memory portion). It writes a 413/400 response and returns false on failure.
+func parseBoundedMultipartForm(w http.ResponseWriter, r *http.Request) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, maxUploadBytes)
+	if err := r.ParseMultipartForm(10 << 20); err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			httpError(w, fmt.Sprintf("attachment too large (limit %d MB)", maxUploadBytes>>20), http.StatusRequestEntityTooLarge)
+			return false
+		}
+		httpError(w, "invalid multipart form: "+err.Error(), 400)
+		return false
+	}
+	return true
+}
+
+// readFormFile reads a named multipart file fully into memory, enforcing the
+// body cap installed by parseBoundedMultipartForm (which callers must invoke
+// first). It writes an error response and returns ok=false on failure.
+func readFormFile(w http.ResponseWriter, r *http.Request, field string) (data []byte, filename, mime string, ok bool) {
+	file, header, err := r.FormFile(field)
+	if err != nil {
+		httpError(w, "file is required: "+err.Error(), 400)
+		return nil, "", "", false
+	}
+	defer file.Close()
+	data, err = io.ReadAll(file)
+	if err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			httpError(w, fmt.Sprintf("attachment too large (limit %d MB)", maxUploadBytes>>20), http.StatusRequestEntityTooLarge)
+			return nil, "", "", false
+		}
+		httpError(w, "read file: "+err.Error(), 500)
+		return nil, "", "", false
+	}
+	mime = header.Header.Get("Content-Type")
+	if mime == "" {
+		mime = "application/octet-stream"
+	}
+	return data, header.Filename, mime, true
 }
 
 // normalizeInternationalNumber validates a user-entered number for platforms

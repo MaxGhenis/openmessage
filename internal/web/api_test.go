@@ -3933,3 +3933,106 @@ func TestNewConversationPlatformValidation(t *testing.T) {
 		})
 	}
 }
+
+// TestMediaResponseHardening verifies /api/media/ never serves sender-controlled
+// active content (HTML/SVG, or a payload spoofed as an image) in a way that can
+// execute script on the API origin. Passive media stays inline. (F5)
+func TestMediaResponseHardening(t *testing.T) {
+	png := append([]byte("\x89PNG\r\n\x1a\n"), make([]byte, 64)...)
+	html := []byte("<html><body><script>alert(1)</script></body></html>")
+	svg := []byte(`<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>`)
+
+	cases := []struct {
+		name       string
+		declared   string
+		body       []byte
+		wantInline bool
+		wantCT     string
+	}{
+		{"html served inert", "text/html", html, false, "application/octet-stream"},
+		{"svg served inert", "image/svg+xml", svg, false, "application/octet-stream"},
+		{"png stays inline", "image/png", png, true, "image/png"},
+		{"html spoofed as png served inert", "image/png", html, false, "application/octet-stream"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			body, declared := tc.body, tc.declared
+			ts := newTestServerWithOptions(t, APIOptions{
+				DownloadWhatsAppMedia: func(msg *db.Message) ([]byte, string, error) {
+					return body, declared, nil
+				},
+			})
+			if err := ts.store.UpsertConversation(&db.Conversation{ConversationID: "c1", Name: "A", LastMessageTS: 1}); err != nil {
+				t.Fatal(err)
+			}
+			if err := ts.store.UpsertMessage(&db.Message{
+				MessageID: "m1", ConversationID: "c1", MediaID: "wa:ref",
+				SourcePlatform: "whatsapp", MimeType: declared, TimestampMS: 1,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			resp, err := http.Get(ts.server.URL + "/api/media/m1")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != 200 {
+				b, _ := io.ReadAll(resp.Body)
+				t.Fatalf("status %d: %s", resp.StatusCode, b)
+			}
+			if got := resp.Header.Get("Content-Type"); got != tc.wantCT {
+				t.Errorf("Content-Type = %q, want %q", got, tc.wantCT)
+			}
+			wantDisp := "attachment"
+			if tc.wantInline {
+				wantDisp = "inline"
+			}
+			if disp := resp.Header.Get("Content-Disposition"); !strings.HasPrefix(disp, wantDisp) {
+				t.Errorf("Content-Disposition = %q, want prefix %q", disp, wantDisp)
+			}
+			if got := resp.Header.Get("X-Content-Type-Options"); got != "nosniff" {
+				t.Errorf("X-Content-Type-Options = %q, want nosniff", got)
+			}
+			if got := resp.Header.Get("Content-Security-Policy"); got != "sandbox; default-src 'none'" {
+				t.Errorf("Content-Security-Policy = %q", got)
+			}
+		})
+	}
+}
+
+// TestScheduleMediaRejectsOversizedUpload proves /api/schedule-media now bounds
+// its body before parsing (it previously read the whole file with io.ReadAll and
+// no cap). (F5)
+func TestScheduleMediaRejectsOversizedUpload(t *testing.T) {
+	orig := maxUploadBytes
+	maxUploadBytes = 512
+	defer func() { maxUploadBytes = orig }()
+
+	ts := newTestServer(t)
+	if err := ts.store.UpsertConversation(&db.Conversation{ConversationID: "c1", Name: "A", LastMessageTS: 1}); err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	_ = mw.WriteField("conversation_id", "c1")
+	_ = mw.WriteField("send_at", fmt.Sprint(time.Now().Add(time.Hour).UnixMilli()))
+	fw, err := mw.CreateFormFile("file", "big.bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fw.Write(make([]byte, 4096)); err != nil {
+		t.Fatal(err)
+	}
+	if err := mw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.Post(ts.server.URL+"/api/schedule-media", mw.FormDataContentType(), &buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status %d, want 413: %s", resp.StatusCode, b)
+	}
+}
