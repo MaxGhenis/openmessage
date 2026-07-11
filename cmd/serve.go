@@ -549,10 +549,7 @@ func RunDemo(logger zerolog.Logger) error {
 }
 
 func parseServeOptions(args []string) (serveOptions, error) {
-	opts := serveOptions{
-		web:    true,
-		mcpSSE: true,
-	}
+	opts := serveOptions{web: true}
 	transportFlagsSeen := false
 	enableExplicitTransportMode := func() {
 		if transportFlagsSeen {

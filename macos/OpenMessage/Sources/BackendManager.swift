@@ -164,7 +164,7 @@ final class BackendManager: ObservableObject {
         let path = binaryPath
         let dir = dataDir
         proc.executableURL = URL(fileURLWithPath: path)
-        proc.arguments = ["serve"]
+        proc.arguments = ["serve", "--web"]
         proc.currentDirectoryURL = URL(fileURLWithPath: dir, isDirectory: true)
         proc.environment = [
             "OPENMESSAGES_PORT": String(port),

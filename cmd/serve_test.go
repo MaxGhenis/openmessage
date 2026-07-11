@@ -208,7 +208,7 @@ func TestGoogleStatusNeedsCookieRefreshUsesExplicitAuthExpiredFlag(t *testing.T)
 }
 
 func TestParseServeOptions(t *testing.T) {
-	t.Run("defaults to normal serve", func(t *testing.T) {
+	t.Run("defaults to web only", func(t *testing.T) {
 		opts, err := parseServeOptions(nil)
 		if err != nil {
 			t.Fatalf("parseServeOptions(): %v", err)
@@ -216,8 +216,28 @@ func TestParseServeOptions(t *testing.T) {
 		if opts.demo {
 			t.Fatal("expected demo=false by default")
 		}
-		if !opts.web || !opts.mcpSSE || opts.mcpStdio {
+		if !opts.web || opts.mcpSSE || opts.mcpStdio {
 			t.Fatalf("unexpected default serve options: %+v", opts)
+		}
+	})
+
+	t.Run("MCP SSE flag enables MCP SSE only", func(t *testing.T) {
+		opts, err := parseServeOptions([]string{"--mcp-sse"})
+		if err != nil {
+			t.Fatalf("parseServeOptions(): %v", err)
+		}
+		if opts.web || !opts.mcpSSE || opts.mcpStdio {
+			t.Fatalf("unexpected serve options: %+v", opts)
+		}
+	})
+
+	t.Run("web and MCP SSE can be enabled together", func(t *testing.T) {
+		opts, err := parseServeOptions([]string{"--web", "--mcp-sse"})
+		if err != nil {
+			t.Fatalf("parseServeOptions(): %v", err)
+		}
+		if !opts.web || !opts.mcpSSE || opts.mcpStdio {
+			t.Fatalf("unexpected serve options: %+v", opts)
 		}
 	})
 
