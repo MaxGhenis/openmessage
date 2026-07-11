@@ -132,12 +132,8 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Build macOS app
-        run: |
-          xcodebuild \
-            -project OpenMessage/OpenMessage.xcodeproj \
-            -scheme OpenMessage \
-            -configuration Debug \
-            -destination 'platform=macOS' \
-            CODE_SIGNING_ALLOWED=NO \
-            build
+      - name: Build Swift package
+        run: swift build --package-path macos/OpenMessage
+
+      - name: Package macOS app
+        run: bash macos/build.sh
