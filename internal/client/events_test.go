@@ -143,9 +143,39 @@ func TestHandleMessage_BumpsConversationTimestamp(t *testing.T) {
 	}
 }
 
+func TestHandlePingFailed_EndsGenerationAfterThreeConsecutiveFailures(t *testing.T) {
+	var connectionLost, sessionInvalid int
+	handler := &EventHandler{
+		Logger: zerolog.Nop(),
+		OnConnectionLost: func() {
+			connectionLost++
+		},
+		OnSessionInvalid: func() {
+			sessionInvalid++
+		},
+	}
+
+	// libgm supplies the consecutive count; guard the exact threshold before the
+	// Wave 1 supervisor takes ownership of ending a connection generation.
+	for _, errorCount := range []int{1, 2, 3} {
+		handler.Handle(&events.PingFailed{ErrorCount: errorCount})
+		wantConnectionLost := 0
+		if errorCount == 3 {
+			wantConnectionLost = 1
+		}
+		if connectionLost != wantConnectionLost {
+			t.Fatalf("connection-lost callbacks after ErrorCount %d = %d, want %d", errorCount, connectionLost, wantConnectionLost)
+		}
+		if sessionInvalid != 0 {
+			t.Fatalf("session-invalid callbacks after ErrorCount %d = %d, want 0", errorCount, sessionInvalid)
+		}
+	}
+}
+
 func TestHandleRecoveryEvents_TriggerRealtimeGapCallback(t *testing.T) {
 	var reasons []string
 	var phoneResponding []bool
+	var sessionInvalid, connectionLost int
 	handler := &EventHandler{
 		Logger: zerolog.Nop(),
 		OnRealtimeGapRecovered: func(reason string) {
@@ -154,9 +184,23 @@ func TestHandleRecoveryEvents_TriggerRealtimeGapCallback(t *testing.T) {
 		OnPhoneRespondingChange: func(responding bool) {
 			phoneResponding = append(phoneResponding, responding)
 		},
+		OnSessionInvalid: func() {
+			sessionInvalid++
+		},
+		OnConnectionLost: func() {
+			connectionLost++
+		},
 	}
 
 	handler.Handle(&events.PhoneNotResponding{})
+	// Phone reachability is not credential validity. Keep this distinction when
+	// the Wave 1 supervisor assumes connection-lifecycle ownership.
+	if sessionInvalid != 0 {
+		t.Fatalf("session-invalid callbacks after PhoneNotResponding = %d, want 0", sessionInvalid)
+	}
+	if connectionLost != 0 {
+		t.Fatalf("connection-lost callbacks after PhoneNotResponding = %d, want 0", connectionLost)
+	}
 	handler.Handle(&events.ListenRecovered{})
 	handler.Handle(&events.PhoneRespondingAgain{})
 

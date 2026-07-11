@@ -1,6 +1,7 @@
 package client
 
 import (
+	"reflect"
 	"testing"
 
 	"go.mau.fi/mautrix-gmessages/pkg/libgm/gmproto"
@@ -20,39 +21,88 @@ func TestExtractMediaInfo_NoMedia(t *testing.T) {
 	}
 }
 
-func TestExtractMediaInfo_WithImage(t *testing.T) {
-	msg := &gmproto.Message{
-		MessageInfo: []*gmproto.MessageInfo{
-			{
-				ActionMessageID: strPtr("action-1"),
-				Data: &gmproto.MessageInfo_MediaContent{
-					MediaContent: &gmproto.MediaContent{
-						Format:        gmproto.MediaFormats_IMAGE_JPEG,
-						MediaID:       "mid-123",
-						MediaName:     "photo.jpg",
-						Size:          12345,
-						MimeType:      "image/jpeg",
-						DecryptionKey: []byte{0xde, 0xad, 0xbe, 0xef},
-					},
-				},
+func TestExtractMediaInfo_Characterization(t *testing.T) {
+	// Guard the exact media shape and fallbacks before the Wave 1 supervisor refactor.
+	tests := []struct {
+		name  string
+		media *gmproto.MediaContent
+		want  *MediaInfo
+	}{
+		{
+			name: "complete metadata",
+			media: &gmproto.MediaContent{
+				Format:                 gmproto.MediaFormats_IMAGE_JPEG,
+				MediaID:                "mid-123",
+				MediaName:              "photo.jpg",
+				Size:                   12345,
+				MimeType:               "image/jpeg",
+				DecryptionKey:          []byte{0xde, 0xad, 0xbe, 0xef},
+				ThumbnailMediaID:       "thumb-123",
+				ThumbnailDecryptionKey: []byte{0xca, 0xfe},
+				MediaData:              []byte{0x01, 0x02, 0x03},
+			},
+			want: &MediaInfo{
+				MediaID:                "mid-123",
+				MimeType:               "image/jpeg",
+				MediaName:              "photo.jpg",
+				DecryptionKey:          []byte{0xde, 0xad, 0xbe, 0xef},
+				Size:                   12345,
+				ThumbnailMediaID:       "thumb-123",
+				ThumbnailDecryptionKey: []byte{0xca, 0xfe},
+				InlineData:             []byte{0x01, 0x02, 0x03},
+			},
+		},
+		{
+			name: "thumbnail fallback",
+			media: &gmproto.MediaContent{
+				MimeType:               "image/webp",
+				DecryptionKey:          []byte{0xff},
+				ThumbnailMediaID:       "thumb-only",
+				ThumbnailDecryptionKey: []byte{0x10, 0x20},
+			},
+			want: &MediaInfo{
+				MediaID:                "thumb-only",
+				MimeType:               "image/webp",
+				DecryptionKey:          []byte{0x10, 0x20},
+				ThumbnailMediaID:       "thumb-only",
+				ThumbnailDecryptionKey: []byte{0x10, 0x20},
+			},
+		},
+		{
+			name: "image MIME inference",
+			media: &gmproto.MediaContent{
+				Format:  gmproto.MediaFormats_IMAGE_PNG,
+				MediaID: "image-without-mime",
+			},
+			want: &MediaInfo{
+				MediaID:  "image-without-mime",
+				MimeType: "image/jpeg",
+			},
+		},
+		{
+			name: "default MIME inference",
+			media: &gmproto.MediaContent{
+				Format:  gmproto.MediaFormats_VIDEO_MP4,
+				MediaID: "video-without-mime",
+			},
+			want: &MediaInfo{
+				MediaID:  "video-without-mime",
+				MimeType: "application/octet-stream",
 			},
 		},
 	}
-	info := ExtractMediaInfo(msg)
-	if info == nil {
-		t.Fatal("expected media info, got nil")
-	}
-	if info.MediaID != "mid-123" {
-		t.Errorf("expected MediaID 'mid-123', got %q", info.MediaID)
-	}
-	if info.MimeType != "image/jpeg" {
-		t.Errorf("expected MimeType 'image/jpeg', got %q", info.MimeType)
-	}
-	if info.MediaName != "photo.jpg" {
-		t.Errorf("expected MediaName 'photo.jpg', got %q", info.MediaName)
-	}
-	if len(info.DecryptionKey) != 4 {
-		t.Errorf("expected 4-byte key, got %d bytes", len(info.DecryptionKey))
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			msg := &gmproto.Message{
+				MessageInfo: []*gmproto.MessageInfo{{
+					Data: &gmproto.MessageInfo_MediaContent{MediaContent: tt.media},
+				}},
+			}
+			if got := ExtractMediaInfo(msg); !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("ExtractMediaInfo() = %+v, want %+v", got, tt.want)
+			}
+		})
 	}
 }
 
@@ -153,6 +203,50 @@ func TestExtractReplyToID_WithReply(t *testing.T) {
 	}
 	if id := ExtractReplyToID(msg); id != "original-msg-123" {
 		t.Errorf("expected 'original-msg-123', got %q", id)
+	}
+}
+
+func TestExtractSenderInfo_Characterization(t *testing.T) {
+	// Guard sender identity precedence and fallbacks before the Wave 1 supervisor refactor.
+	tests := []struct {
+		name        string
+		participant *gmproto.Participant
+		wantName    string
+		wantNumber  string
+	}{
+		{
+			name: "full name and ID number take precedence",
+			participant: &gmproto.Participant{
+				FullName:        "Ada Lovelace",
+				FirstName:       "Ada",
+				ID:              &gmproto.SmallInfo{Number: "+15551234567"},
+				FormattedNumber: "(555) 123-4567",
+			},
+			wantName:   "Ada Lovelace",
+			wantNumber: "+15551234567",
+		},
+		{
+			name: "first name and formatted number fall back",
+			participant: &gmproto.Participant{
+				FirstName:       "Ada",
+				ID:              &gmproto.SmallInfo{},
+				FormattedNumber: "(555) 123-4567",
+			},
+			wantName:   "Ada",
+			wantNumber: "(555) 123-4567",
+		},
+		{
+			name: "nil sender",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotName, gotNumber := ExtractSenderInfo(&gmproto.Message{SenderParticipant: tt.participant})
+			if gotName != tt.wantName || gotNumber != tt.wantNumber {
+				t.Fatalf("ExtractSenderInfo() = (%q, %q), want (%q, %q)", gotName, gotNumber, tt.wantName, tt.wantNumber)
+			}
+		})
 	}
 }
 
