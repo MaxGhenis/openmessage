@@ -1731,18 +1731,88 @@ func TestConnectRecoversPersistedSessionBeforeStartingPairing(t *testing.T) {
 	}
 }
 
-func TestConsumeQRTimeoutClearsConnecting(t *testing.T) {
+func TestConsumeQRRotatesCodesAndTimeoutReturnsToUnpairedState(t *testing.T) {
 	bridge := &Bridge{
 		connecting: true,
 		pairing:    true,
 	}
 
-	ch := make(chan whatsmeow.QRChannelItem, 1)
-	ch <- whatsmeow.QRChannelItem{Event: "timeout"}
+	type observedState struct {
+		qr         QRSnapshot
+		connecting bool
+		pairing    bool
+		lastError  string
+	}
+	var observed []observedState
+	bridge.callbacks.OnStatusChange = func() {
+		bridge.mu.RLock()
+		observed = append(observed, observedState{
+			qr:         bridge.qr,
+			connecting: bridge.connecting,
+			pairing:    bridge.pairing,
+			lastError:  bridge.lastError,
+		})
+		bridge.mu.RUnlock()
+		if len(observed) == 1 {
+			// consumeQR timestamps in milliseconds; cross a tick so rotation
+			// must visibly advance UpdatedAt.
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+
+	firstTimeout := 90 * time.Second
+	secondTimeout := 45 * time.Second
+	ch := make(chan whatsmeow.QRChannelItem, 3)
+	ch <- whatsmeow.QRChannelItem{
+		Event:   whatsmeow.QRChannelEventCode,
+		Code:    "first-code",
+		Timeout: firstTimeout,
+	}
+	ch <- whatsmeow.QRChannelItem{
+		Event:   whatsmeow.QRChannelEventCode,
+		Code:    "rotated-code",
+		Timeout: secondTimeout,
+	}
+	ch <- whatsmeow.QRChannelTimeout
 	close(ch)
 
 	bridge.consumeQR(ch)
 
+	if len(observed) != 3 {
+		t.Fatalf("observed %d QR states, want 3", len(observed))
+	}
+	for i, want := range []struct {
+		code    string
+		timeout time.Duration
+	}{
+		{code: "first-code", timeout: firstTimeout},
+		{code: "rotated-code", timeout: secondTimeout},
+	} {
+		state := observed[i]
+		if state.qr.Event != whatsmeow.QRChannelEventCode || state.qr.Code != want.code {
+			t.Fatalf("QR state %d = %+v, want code %q", i, state.qr, want.code)
+		}
+		delta := time.Duration(state.qr.ExpiresAt-state.qr.UpdatedAt) * time.Millisecond
+		if delta < want.timeout-time.Second || delta > want.timeout+time.Second {
+			t.Fatalf("QR state %d expiry delta = %v, want about %v", i, delta, want.timeout)
+		}
+		if !state.connecting || !state.pairing {
+			t.Fatalf("QR state %d ended pairing early: %+v", i, state)
+		}
+	}
+	if observed[1].qr.UpdatedAt <= observed[0].qr.UpdatedAt {
+		t.Fatalf("rotated QR UpdatedAt = %d, want after %d", observed[1].qr.UpdatedAt, observed[0].qr.UpdatedAt)
+	}
+	terminal := observed[2]
+	if terminal.qr.Event != whatsmeow.QRChannelTimeout.Event || terminal.qr.Code != "" || terminal.qr.ExpiresAt != 0 {
+		t.Fatalf("terminal QR state = %+v, want cleared timeout", terminal.qr)
+	}
+	if terminal.connecting || terminal.pairing || terminal.lastError != "timeout" {
+		t.Fatalf("terminal pairing state = %+v", terminal)
+	}
+
+	// QR rotation and expiry must return C5 to unpaired, not silently start a
+	// new attempt or leave a stale code available.
 	status := bridge.Status()
 	if status.Connecting {
 		t.Fatal("expected QR timeout to clear connecting state")
@@ -1752,6 +1822,9 @@ func TestConsumeQRTimeoutClearsConnecting(t *testing.T) {
 	}
 	if status.LastError != "timeout" {
 		t.Fatalf("last error = %q, want timeout", status.LastError)
+	}
+	if status.Paired || status.QRAvailable || status.QREvent != "timeout" {
+		t.Fatalf("expired QR did not return to unpaired state: %+v", status)
 	}
 }
 
