@@ -127,6 +127,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Guard against the stale root Xcode tree
+        run: |
+          if [ -e OpenMessage/OpenMessage.xcodeproj ] || [ -e OpenMessage/Info.plist ]; then
+            echo "::error::The stale root OpenMessage/ tree is back. The app is built from the SwiftPM package at macos/OpenMessage; delete the root OpenMessage/ directory."
+            exit 1
+          fi
+
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
