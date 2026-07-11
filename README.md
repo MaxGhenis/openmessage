@@ -51,12 +51,13 @@ The CLI accepts either a JSON cookie object or a full `curl` command for `messag
 ./openmessage serve
 ```
 
-This starts:
-- **Web UI** at [http://127.0.0.1:7007](http://127.0.0.1:7007)
-- **MCP Streamable HTTP endpoint** at `http://127.0.0.1:7007/mcp`
-- **MCP SSE endpoint** at `http://127.0.0.1:7007/mcp/sse`
+This starts the **Web UI** at [http://127.0.0.1:7007](http://127.0.0.1:7007). A bare `serve` is web-only.
 
-When `serve` is launched by an MCP client over pipes, it also serves MCP on stdio automatically.
+MCP transports require an explicit opt-in:
+
+- `./openmessage serve --mcp-sse` starts MCP Streamable HTTP and SSE without the web UI.
+- `./openmessage serve --web --mcp-sse` starts the web UI and both HTTP MCP endpoints.
+- `./openmessage serve --mcp-stdio` starts MCP over stdio for pipe-based clients.
 
 ### 3a. Optional: link WhatsApp or Signal
 
@@ -90,7 +91,7 @@ Add to `~/.mcp.json`:
   "mcpServers": {
     "openmessage": {
       "command": "/path/to/openmessage",
-      "args": ["serve"]
+      "args": ["serve", "--mcp-stdio"]
     }
   }
 }
@@ -98,7 +99,7 @@ Add to `~/.mcp.json`:
 
 Restart Claude Code. The MCP tools appear automatically.
 
-If a client connects to an already-running OpenMessage server instead of launching the binary, point it at:
+To let a client connect over HTTP, start OpenMessage with `--mcp-sse` (or `--web --mcp-sse` to keep the web UI), then point it at:
 
 - Streamable HTTP: `http://127.0.0.1:7007/mcp`
 - SSE: `http://127.0.0.1:7007/mcp/sse`
@@ -252,7 +253,7 @@ If you launch OpenMessage from the macOS app, launchd, systemd, or another super
 - Scheduled messages live in SQLite, are claimed atomically by the background scheduler, and retry when the target platform is temporarily disconnected
 - The web composer stores pending browser-side sends in local storage/IndexedDB and attaches idempotency keys to prevent duplicate delivery during retry
 - MCP tool handlers read from SQLite for queries and route sends through the same local runtime
-- MCP HTTP transport supports both Streamable HTTP at `/mcp` and SSE at `/mcp/sse`; stdio remains available when launched by an MCP client
+- MCP HTTP transport supports both Streamable HTTP at `/mcp` and SSE at `/mcp/sse` when enabled with `--mcp-sse`; stdio is available with `--mcp-stdio`
 - GIF and link-preview proxies validate remote URLs, cap downloads, and keep provider fetches inside the local backend
 - Auth tokens auto-refresh and persist to `session.json`; expired Google cookies can be refreshed by an optional script or surfaced as a guided re-pair flow
 
