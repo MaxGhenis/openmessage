@@ -62,6 +62,11 @@ func sendMediaToConversationTool() mcp.Tool {
 	)
 }
 
+// maxMediaUploadBytes bounds a single MCP media send. It mirrors the HTTP
+// upload cap so an MCP client cannot read an arbitrarily large local file fully
+// into memory and take the backend down.
+const maxMediaUploadBytes = 128 << 20
+
 func sendMediaToConversationHandler(a *app.App) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		args := req.GetArguments()
@@ -86,6 +91,13 @@ func sendMediaToConversationHandler(a *app.App) server.ToolHandlerFunc {
 			return errorResult(fmt.Sprintf("conversation %s not found", conversationID)), nil
 		}
 
+		if info, err := os.Stat(filePath); err != nil {
+			return errorResult(fmt.Sprintf("stat file: %v", err)), nil
+		} else if info.IsDir() {
+			return errorResult("file_path must point to a file"), nil
+		} else if info.Size() > maxMediaUploadBytes {
+			return errorResult(fmt.Sprintf("file too large (%d bytes; limit %d MB)", info.Size(), maxMediaUploadBytes>>20)), nil
+		}
 		data, err := os.ReadFile(filePath)
 		if err != nil {
 			return errorResult(fmt.Sprintf("read file: %v", err)), nil
