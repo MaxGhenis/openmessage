@@ -201,12 +201,17 @@ func TestStartReceiveLoopDropsSignalConnectionAfterRepeatedReceiveFailures(t *te
 	}
 
 	originalRun := runSignalCLI
+	originalVersionProbe := probeSignalCLIVersion
 	defer func() {
 		_ = bridge.Close()
 		bridge.commandMu.Lock()
 		runSignalCLI = originalRun
 		bridge.commandMu.Unlock()
+		probeSignalCLIVersion = originalVersionProbe
 	}()
+	probeSignalCLIVersion = func(context.Context) ([]byte, error) {
+		return []byte("signal-cli 0.14.5"), nil
+	}
 
 	var receiveCalls atomic.Int32
 	runSignalCLI = func(ctx context.Context, configDir string, args ...string) ([]byte, error) {
@@ -241,12 +246,17 @@ func TestStartReceiveLoopIgnoresIdleReceiveTimeouts(t *testing.T) {
 	}
 
 	originalRun := runSignalCLI
+	originalVersionProbe := probeSignalCLIVersion
 	defer func() {
 		_ = bridge.Close()
 		bridge.commandMu.Lock()
 		runSignalCLI = originalRun
 		bridge.commandMu.Unlock()
+		probeSignalCLIVersion = originalVersionProbe
 	}()
+	probeSignalCLIVersion = func(context.Context) ([]byte, error) {
+		return []byte("signal-cli 0.14.5"), nil
+	}
 
 	var receiveCalls atomic.Int32
 	runSignalCLI = func(ctx context.Context, configDir string, args ...string) ([]byte, error) {
@@ -1909,13 +1919,18 @@ func TestConnectEmitsSignalQRCodeAndStoresPairedAccount(t *testing.T) {
 
 	originalStartLink := startSignalLink
 	originalRun := runSignalCLI
+	originalVersionProbe := probeSignalCLIVersion
 	defer func() {
 		_ = bridge.Close()
 		bridge.commandMu.Lock()
 		runSignalCLI = originalRun
 		bridge.commandMu.Unlock()
+		probeSignalCLIVersion = originalVersionProbe
 		startSignalLink = originalStartLink
 	}()
+	probeSignalCLIVersion = func(context.Context) ([]byte, error) {
+		return []byte("signal-cli 0.14.5"), nil
+	}
 
 	releaseWait := make(chan struct{})
 	var callsMu sync.Mutex
