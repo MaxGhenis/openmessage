@@ -1,0 +1,122 @@
+name: GMessages Fork Drift
+
+on:
+  schedule:
+    - cron: "17 10 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  UPSTREAM_REPOSITORY: mautrix/gmessages
+  UPSTREAM_BRANCH: main
+  UPSTREAM_BASE: 3433cc07d5ea9522309adad3a8c92ed5b08dc11d
+  AUTH_REFRESH_RETRY_COMMIT: 0b54a8fe65207f81d353ffe63f4d2549c2eb7976
+  FORK_REPOSITORY: MaxGhenis/gmessages
+  FORK_MODULE: github.com/MaxGhenis/gmessages
+  FORK_BRANCH: main
+  FORK_VERSION: v0.2602.1-0.20260703132304-0e43542dfa0e
+  FORK_COMMIT: 0e43542dfa0e0b97e410f185a5842e8740106099
+  EXPECTED_PATCH_COUNT: "1"
+
+jobs:
+  drift:
+    name: Compare pinned fork with upstream
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out the recorded contract
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Match the recorded contract to go.mod
+        run: |
+          set -euo pipefail
+          expected="replace go.mau.fi/mautrix-gmessages => ${FORK_MODULE} ${FORK_VERSION}"
+          if ! grep -Fqx "${expected}" go.mod; then
+            echo "::error::go.mod must contain the recorded gmessages fork pin: ${expected}"
+            exit 1
+          fi
+          if [ "${FORK_VERSION##*-}" != "${FORK_COMMIT:0:12}" ]; then
+            echo "::error::Recorded fork version ${FORK_VERSION} does not identify ${FORK_COMMIT}."
+            exit 1
+          fi
+
+      - name: Record and verify fork topology
+        run: |
+          set -euo pipefail
+
+          git init --quiet gmessages
+          cd gmessages
+          git remote add upstream "https://github.com/${UPSTREAM_REPOSITORY}.git"
+          git remote add fork "https://github.com/${FORK_REPOSITORY}.git"
+          git fetch --quiet --no-tags upstream \
+            "+refs/heads/${UPSTREAM_BRANCH}:refs/remotes/upstream/${UPSTREAM_BRANCH}"
+          git fetch --quiet --no-tags fork \
+            "+refs/heads/${FORK_BRANCH}:refs/remotes/fork/${FORK_BRANCH}"
+
+          upstream_ref="refs/remotes/upstream/${UPSTREAM_BRANCH}"
+          for commit in "${UPSTREAM_BASE}" "${AUTH_REFRESH_RETRY_COMMIT}" "${FORK_COMMIT}"; do
+            if ! git cat-file -e "${commit}^{commit}"; then
+              echo "::error::Required gmessages contract commit ${commit} is not reachable from the fetched branches."
+              exit 1
+            fi
+          done
+
+          if ! git merge-base --is-ancestor "${AUTH_REFRESH_RETRY_COMMIT}" "${UPSTREAM_BASE}"; then
+            echo "::error::Recorded upstream base ${UPSTREAM_BASE} does not contain the required auth-refresh retry ${AUTH_REFRESH_RETRY_COMMIT}."
+            exit 1
+          fi
+
+          if ! git merge-base --is-ancestor "${UPSTREAM_BASE}" "${FORK_COMMIT}"; then
+            echo "::error::Pinned fork ${FORK_REPOSITORY}@${FORK_COMMIT} is not based on recorded upstream ${UPSTREAM_BASE}."
+            exit 1
+          fi
+
+          fork_parents="$(git show --no-patch --format='%P' "${FORK_COMMIT}")"
+          if [ "${fork_parents}" != "${UPSTREAM_BASE}" ]; then
+            echo "::error::Pinned fork ${FORK_REPOSITORY}@${FORK_COMMIT} has parent(s) ${fork_parents}, not the single recorded base ${UPSTREAM_BASE}."
+            exit 1
+          fi
+
+          actual_base="$(git merge-base "${FORK_COMMIT}" "${upstream_ref}")"
+          if [ "${actual_base}" != "${UPSTREAM_BASE}" ]; then
+            echo "::error::Pinned fork ${FORK_REPOSITORY}@${FORK_COMMIT} has merge base ${actual_base}, not recorded base ${UPSTREAM_BASE}."
+            exit 1
+          fi
+
+          patch_count="$(git rev-list --count "${UPSTREAM_BASE}..${FORK_COMMIT}")"
+          if [ "${patch_count}" -ne "${EXPECTED_PATCH_COUNT}" ]; then
+            echo "::error::Pinned fork ${FORK_REPOSITORY}@${FORK_COMMIT} carries ${patch_count} commits over ${UPSTREAM_BASE}; expected ${EXPECTED_PATCH_COUNT}."
+            exit 1
+          fi
+
+          upstream_head="$(git rev-parse "${upstream_ref}")"
+          upstream_ahead="$(git rev-list --count "${UPSTREAM_BASE}..${upstream_ref}")"
+          patch_set="$(git log --reverse --format='%H %s' "${UPSTREAM_BASE}..${FORK_COMMIT}")"
+
+          {
+            echo "## gmessages fork contract"
+            echo
+            echo "| Item | Commit |"
+            echo "| --- | --- |"
+            echo "| Fork pin | ${FORK_VERSION} ([\`${FORK_COMMIT}\`](https://github.com/${FORK_REPOSITORY}/commit/${FORK_COMMIT})) |"
+            echo "| Upstream base | [\`${UPSTREAM_BASE}\`](https://github.com/${UPSTREAM_REPOSITORY}/commit/${UPSTREAM_BASE}) |"
+            echo "| Required auth-refresh retry | [\`${AUTH_REFRESH_RETRY_COMMIT}\`](https://github.com/${UPSTREAM_REPOSITORY}/commit/${AUTH_REFRESH_RETRY_COMMIT}) |"
+            echo "| Current upstream head | [\`${upstream_head}\`](https://github.com/${UPSTREAM_REPOSITORY}/commit/${upstream_head}) |"
+            echo
+            echo "### Carried patch set (${patch_count})"
+            echo '```text'
+            echo "${patch_set}"
+            echo '```'
+            echo
+            echo "Upstream commits after the recorded base: **${upstream_ahead}**"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+          if [ "${upstream_ahead}" -ne 0 ]; then
+            git log --oneline "${UPSTREAM_BASE}..${upstream_ref}"
+            echo "::error title=gmessages fork is behind upstream::${FORK_REPOSITORY}@${FORK_COMMIT} is based on ${UPSTREAM_BASE}, but ${UPSTREAM_REPOSITORY}/${UPSTREAM_BRANCH}@${upstream_head} is ${upstream_ahead} commit(s) ahead. Rebase the carried patch and update the pin and recorded contract."
+            exit 1
+          fi
+
+          echo "${FORK_REPOSITORY}@${FORK_COMMIT} is one carried patch on current upstream base ${UPSTREAM_BASE}."
