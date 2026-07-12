@@ -82,6 +82,94 @@ func TestOutboxEnqueueIdempotencyAndConflict(t *testing.T) {
 	}
 }
 
+func TestOutboxEnqueueOutgoingMessageIsAtomicAndDeduplicated(t *testing.T) {
+	clock := newOutboxTestClock(outboxTestTimeMS)
+	store, repository := openOutboxTestRepository(t, clock.Now)
+	seedMessageIdentity(t, store, "identity-a", "account-a")
+	seedMessageConversation(t, store, "conversation-a", "account-a")
+	ctx := context.Background()
+
+	item := outboxTestItem("outgoing")
+	message := outboxTestOutgoingMessage(item, "hello from the durable outbox")
+	row, disposition, err := repository.EnqueueOutgoingMessage(ctx, item, message)
+	if err != nil {
+		t.Fatalf("EnqueueOutgoingMessage(): %v", err)
+	}
+	if disposition != EnqueueInserted || row.OutboxID != item.OutboxID {
+		t.Fatalf("EnqueueOutgoingMessage() = (%+v, %q), want inserted", row, disposition)
+	}
+	messageRepository, err := NewMessageRepository(store, clock.Now)
+	if err != nil {
+		t.Fatalf("NewMessageRepository(): %v", err)
+	}
+	gotMessage, err := messageRepository.GetMessage(ctx, item.LocalMessageID)
+	if err != nil {
+		t.Fatalf("GetMessage(): %v", err)
+	}
+	if gotMessage.Body != message.Body || gotMessage.Direction != MessageDirectionOutgoing ||
+		gotMessage.State != MessageStateActive || gotMessage.RemoteMessageID != message.RemoteMessageID ||
+		gotMessage.SenderIdentityID == nil || *gotMessage.SenderIdentityID != "identity-a" {
+		t.Fatalf("optimistic message = %+v, want %+v", gotMessage, message)
+	}
+	assertRowCount(t, store.db, "inbox", 0)
+
+	clock.Set(outboxTestTimeMS + 500)
+	duplicate := item
+	duplicate.OutboxID = "outbox-unused-duplicate"
+	duplicate.LocalMessageID = "message-unused-duplicate"
+	duplicate.TransportRequestID = "request-unused-duplicate"
+	duplicateRow, disposition, err := repository.EnqueueOutgoingMessage(ctx, duplicate, Message{})
+	if err != nil {
+		t.Fatalf("EnqueueOutgoingMessage(duplicate with invalid candidate): %v", err)
+	}
+	if disposition != EnqueueExisting || duplicateRow.OutboxID != item.OutboxID {
+		t.Fatalf("duplicate result = (%+v, %q), want original", duplicateRow, disposition)
+	}
+
+	conflict := duplicate
+	conflict.PayloadHash = "different-payload-hash"
+	if _, _, err := repository.EnqueueOutgoingMessage(ctx, conflict, Message{}); !errors.Is(err, ErrIdempotencyConflict) {
+		t.Fatalf("EnqueueOutgoingMessage(conflict) error = %v, want ErrIdempotencyConflict", err)
+	}
+
+	generic := outboxTestItem("generic-collision")
+	mustEnqueueOutbox(t, repository, generic)
+	if _, _, err := repository.EnqueueOutgoingMessage(
+		ctx,
+		generic,
+		outboxTestOutgoingMessage(generic, "missing optimistic pair"),
+	); !errors.Is(err, ErrInvalidMessage) {
+		t.Fatalf("EnqueueOutgoingMessage(generic collision) error = %v, want ErrInvalidMessage", err)
+	}
+	foreignPair := outboxTestItem("foreign-pair")
+	if _, _, err := repository.EnqueueOutgoingMessage(
+		ctx,
+		foreignPair,
+		outboxTestOutgoingMessage(foreignPair, "belongs to another request"),
+	); err != nil {
+		t.Fatalf("EnqueueOutgoingMessage(foreign pair): %v", err)
+	}
+	genericWithForeignMessage := outboxTestItem("generic-foreign-message")
+	genericWithForeignMessage.LocalMessageID = foreignPair.LocalMessageID
+	mustEnqueueOutbox(t, repository, genericWithForeignMessage)
+	if _, _, err := repository.EnqueueOutgoingMessage(
+		ctx,
+		genericWithForeignMessage,
+		outboxTestOutgoingMessage(genericWithForeignMessage, "candidate is not used"),
+	); !errors.Is(err, ErrInvalidMessage) {
+		t.Fatalf("EnqueueOutgoingMessage(foreign message collision) error = %v, want ErrInvalidMessage", err)
+	}
+
+	invalidItem := outboxTestItem("invalid-outgoing")
+	invalidMessage := outboxTestOutgoingMessage(invalidItem, "must roll back")
+	invalidMessage.State = MessageStateEdited
+	if _, _, err := repository.EnqueueOutgoingMessage(ctx, invalidItem, invalidMessage); !errors.Is(err, ErrInvalidMessage) {
+		t.Fatalf("EnqueueOutgoingMessage(invalid) error = %v, want ErrInvalidMessage", err)
+	}
+	assertRowCount(t, store.db, "outbox", 4)
+	assertRowCount(t, store.db, "messages", 2)
+}
+
 func TestOutboxLeaseDueRespectsScheduleRetryAndLiveLease(t *testing.T) {
 	clock := newOutboxTestClock(outboxTestTimeMS)
 	_, repository := openOutboxTestRepository(t, clock.Now)
@@ -444,6 +532,159 @@ func TestOutboxPhaseTransitionsRejectWrongSideOfCallBoundary(t *testing.T) {
 	}
 }
 
+func TestOutboxReleaseUnavailableReturnsLeaseToQueuedWithoutAttempt(t *testing.T) {
+	clock := newOutboxTestClock(outboxTestTimeMS)
+	_, repository := openOutboxTestRepository(t, clock.Now)
+	ctx := context.Background()
+	item := outboxTestItem("unavailable")
+	mustEnqueueOutbox(t, repository, item)
+	lease := mustLeaseOne(t, repository, LeaseRequest{
+		Owner: "worker", Now: clock.Now(), Duration: time.Minute, Limit: 1,
+	})
+	token := mustLeaseToken(t, lease)
+	if err := repository.ReleaseUnavailable(ctx, item.OutboxID, "stale-token"); !errors.Is(err, ErrLeaseLost) {
+		t.Fatalf("ReleaseUnavailable(stale token) error = %v, want ErrLeaseLost", err)
+	}
+	if err := repository.ReleaseUnavailable(ctx, item.OutboxID, token); err != nil {
+		t.Fatalf("ReleaseUnavailable(): %v", err)
+	}
+	queued, err := repository.FindByID(ctx, item.OutboxID)
+	if err != nil {
+		t.Fatalf("FindByID(): %v", err)
+	}
+	if queued.State != OutboxQueued || queued.AttemptCount != 0 || queued.LeaseToken != nil ||
+		queued.NextAttemptAtMS != nil || queued.TransportCalledAtMS != nil ||
+		queued.TransportRequestID != item.TransportRequestID {
+		t.Fatalf("released unavailable row = %+v", queued)
+	}
+}
+
+func TestOutboxMarkCalledNotDispatchedRecordsExplicitSafeRetry(t *testing.T) {
+	clock := newOutboxTestClock(outboxTestTimeMS)
+	_, repository := openOutboxTestRepository(t, clock.Now)
+	ctx := context.Background()
+	item := outboxTestItem("called-not-dispatched")
+	mustEnqueueOutbox(t, repository, item)
+	lease := mustLeaseOne(t, repository, LeaseRequest{
+		Owner: "worker", Now: clock.Now(), Duration: time.Minute, Limit: 1,
+	})
+	token := mustLeaseToken(t, lease)
+	if err := repository.MarkCalledNotDispatched(
+		ctx, item.OutboxID, token, "transient", "preflight", "not sent", clock.Now().Add(time.Minute),
+	); !errors.Is(err, ErrLeaseLost) {
+		t.Fatalf("MarkCalledNotDispatched(pre-call) error = %v, want ErrLeaseLost", err)
+	}
+	if err := repository.MarkTransportCalled(ctx, Attempt{OutboxID: item.OutboxID, LeaseToken: token}); err != nil {
+		t.Fatalf("MarkTransportCalled(): %v", err)
+	}
+	retryAt := clock.Now().Add(time.Minute)
+	if err := repository.MarkCalledNotDispatched(
+		ctx, item.OutboxID, token, "transient", "preflight", "transport proved no dispatch", retryAt,
+	); err != nil {
+		t.Fatalf("MarkCalledNotDispatched(): %v", err)
+	}
+	notDispatched, err := repository.FindByID(ctx, item.OutboxID)
+	if err != nil {
+		t.Fatalf("FindByID(): %v", err)
+	}
+	if notDispatched.State != OutboxNotDispatched || notDispatched.TransportCalledAtMS != nil ||
+		notDispatched.NextAttemptAtMS == nil || *notDispatched.NextAttemptAtMS != retryAt.UnixMilli() ||
+		notDispatched.TransportRequestID != item.TransportRequestID || notDispatched.AttemptCount != 1 {
+		t.Fatalf("called-not-dispatched row = %+v", notDispatched)
+	}
+	assertOutboxText(t, "error class", notDispatched.ErrorClass, "transient")
+	assertOutboxText(t, "error code", notDispatched.ErrorCode, "preflight")
+}
+
+func TestOutboxRetryNotDispatchedMakesRowDueWithSameRequestID(t *testing.T) {
+	clock := newOutboxTestClock(outboxTestTimeMS)
+	_, repository := openOutboxTestRepository(t, clock.Now)
+	ctx := context.Background()
+	item := outboxTestItem("manual-retry")
+	mustEnqueueOutbox(t, repository, item)
+	lease := mustLeaseOne(t, repository, LeaseRequest{
+		Owner: "worker", Now: clock.Now(), Duration: time.Minute, Limit: 1,
+	})
+	if err := repository.MarkNotDispatched(
+		ctx, item.OutboxID, mustLeaseToken(t, lease), "transient", "offline", "retry later", clock.Now().Add(time.Hour),
+	); err != nil {
+		t.Fatalf("MarkNotDispatched(): %v", err)
+	}
+	clock.Set(outboxTestTimeMS + 1_000)
+	if err := repository.RetryNotDispatched(ctx, item.OutboxID); err != nil {
+		t.Fatalf("RetryNotDispatched(): %v", err)
+	}
+	retryable, err := repository.FindByID(ctx, item.OutboxID)
+	if err != nil {
+		t.Fatalf("FindByID(): %v", err)
+	}
+	if retryable.State != OutboxNotDispatched || retryable.NextAttemptAtMS == nil ||
+		*retryable.NextAttemptAtMS != clock.Now().UnixMilli() ||
+		retryable.TransportRequestID != item.TransportRequestID || retryable.ErrorClass == nil ||
+		*retryable.ErrorClass != "transient" {
+		t.Fatalf("manual retry row = %+v", retryable)
+	}
+	queuedItem := outboxTestItem("manual-retry-wrong-state")
+	mustEnqueueOutbox(t, repository, queuedItem)
+	if err := repository.RetryNotDispatched(ctx, queuedItem.OutboxID); !errors.Is(err, ErrInvalidOutboxState) {
+		t.Fatalf("RetryNotDispatched(queued) error = %v, want ErrInvalidOutboxState", err)
+	}
+	if err := repository.RetryNotDispatched(ctx, "missing"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("RetryNotDispatched(missing) error = %v, want ErrNotFound", err)
+	}
+}
+
+func TestOutboxCancelAllowsOnlyQueuedOrNotDispatched(t *testing.T) {
+	clock := newOutboxTestClock(outboxTestTimeMS)
+	_, repository := openOutboxTestRepository(t, clock.Now)
+	ctx := context.Background()
+
+	queuedItem := outboxTestItem("cancel-queued")
+	mustEnqueueOutbox(t, repository, queuedItem)
+	if err := repository.Cancel(ctx, queuedItem.OutboxID); err != nil {
+		t.Fatalf("Cancel(queued): %v", err)
+	}
+	canceled, err := repository.FindByID(ctx, queuedItem.OutboxID)
+	if err != nil {
+		t.Fatalf("FindByID(canceled): %v", err)
+	}
+	if canceled.State != OutboxCanceled || canceled.NextAttemptAtMS != nil {
+		t.Fatalf("canceled queued row = %+v", canceled)
+	}
+	if err := repository.Cancel(ctx, queuedItem.OutboxID); !errors.Is(err, ErrInvalidOutboxState) {
+		t.Fatalf("Cancel(canceled) error = %v, want ErrInvalidOutboxState", err)
+	}
+
+	notDispatchedItem := outboxTestItem("cancel-not-dispatched")
+	mustEnqueueOutbox(t, repository, notDispatchedItem)
+	lease := mustLeaseOne(t, repository, LeaseRequest{
+		Owner: "worker", Now: clock.Now(), Duration: time.Minute, Limit: 1,
+	})
+	if err := repository.MarkNotDispatched(
+		ctx, notDispatchedItem.OutboxID, mustLeaseToken(t, lease), "transient", "offline", "retry later", clock.Now().Add(time.Hour),
+	); err != nil {
+		t.Fatalf("MarkNotDispatched(): %v", err)
+	}
+	if err := repository.Cancel(ctx, notDispatchedItem.OutboxID); err != nil {
+		t.Fatalf("Cancel(not dispatched): %v", err)
+	}
+
+	dispatchingItem := outboxTestItem("cancel-dispatching")
+	mustEnqueueOutbox(t, repository, dispatchingItem)
+	lease = mustLeaseOne(t, repository, LeaseRequest{
+		Owner: "worker", Now: clock.Now(), Duration: time.Minute, Limit: 1,
+	})
+	if lease.OutboxID != dispatchingItem.OutboxID {
+		t.Fatalf("LeaseDue(cancel dispatching) = %+v, want %q", lease, dispatchingItem.OutboxID)
+	}
+	if err := repository.Cancel(ctx, dispatchingItem.OutboxID); !errors.Is(err, ErrInvalidOutboxState) {
+		t.Fatalf("Cancel(dispatching) error = %v, want ErrInvalidOutboxState", err)
+	}
+	if err := repository.Cancel(ctx, "missing"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Cancel(missing) error = %v, want ErrNotFound", err)
+	}
+}
+
 func TestOutboxMigrationIsChecksummedAndStrict(t *testing.T) {
 	store, _ := openOutboxTestRepository(t, func() time.Time {
 		return time.UnixMilli(outboxTestTimeMS)
@@ -526,6 +767,21 @@ func outboxTestItem(id string) NewOutboxItem {
 		Operation:          "send_text",
 		LocalMessageID:     "message-" + id,
 		TransportRequestID: "request-" + id,
+	}
+}
+
+func outboxTestOutgoingMessage(item NewOutboxItem, body string) Message {
+	senderIdentityID := "identity-a"
+	return Message{
+		MessageID:        item.LocalMessageID,
+		ConversationID:   item.ConversationID,
+		AccountID:        item.AccountID,
+		RemoteMessageID:  item.TransportRequestID,
+		SenderIdentityID: &senderIdentityID,
+		Direction:        MessageDirectionOutgoing,
+		Body:             body,
+		State:            MessageStateActive,
+		OccurredAtMS:     outboxTestTimeMS,
 	}
 }
 

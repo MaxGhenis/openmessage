@@ -65,4 +65,8 @@ var (
 	// ErrLeaseLost means an outbox mutation no longer owns the row's active
 	// dispatch lease.
 	ErrLeaseLost = errors.New("outbox lease lost")
+
+	// ErrInvalidOutboxState means an outbox operation is not allowed from the
+	// row's current delivery state.
+	ErrInvalidOutboxState = errors.New("invalid outbox state transition")
 )

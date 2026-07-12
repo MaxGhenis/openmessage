@@ -1,0 +1,132 @@
+// Package messaging owns durable outbound message submission and delivery.
+package messaging
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/maxghenis/openmessage/internal/storage/sqlite"
+)
+
+// OutboxState is the platform-independent state of a durable outbound intent.
+type OutboxState = sqlite.OutboxState
+
+const (
+	OutboxQueued        = sqlite.OutboxQueued
+	OutboxDispatching   = sqlite.OutboxDispatching
+	OutboxNotDispatched = sqlite.OutboxNotDispatched
+	OutboxUncertain     = sqlite.OutboxUncertain
+	OutboxConfirmed     = sqlite.OutboxConfirmed
+	OutboxStoreFailed   = sqlite.OutboxStoreFailed
+	OutboxRejected      = sqlite.OutboxRejected
+	OutboxCanceled      = sqlite.OutboxCanceled
+)
+
+var (
+	// ErrIdempotencyConflict means the account-scoped key already names a
+	// different outbound intent.
+	ErrIdempotencyConflict = sqlite.ErrIdempotencyConflict
+
+	// ErrInvalidCommand means a submission is incomplete or inconsistent.
+	ErrInvalidCommand = errors.New("messaging: invalid command")
+
+	// ErrInvalidState means the requested delivery transition is unsafe from
+	// the intent's current state.
+	ErrInvalidState = errors.New("messaging: invalid outbox state")
+
+	// ErrNotImplemented marks API seams reserved for later rebuild items.
+	ErrNotImplemented = errors.New("messaging: not implemented")
+)
+
+type CommonCommand struct {
+	AccountID      string
+	ConversationID string
+	IdempotencyKey string
+	NotBefore      time.Time // zero means now
+}
+
+type SendTextCommand struct {
+	CommonCommand
+	Body             string
+	ReplyToMessageID string
+}
+
+type Submission struct {
+	OutboxID       string
+	LocalMessageID string
+	State          OutboxState
+	ScheduledFor   time.Time
+}
+
+type Delivery struct {
+	OutboxID        string
+	State           OutboxState
+	LocalMessageID  string
+	RemoteMessageID string
+	ErrorClass      string
+	ErrorCode       string
+	Warning         string
+}
+
+// TransportEcho is the transport-neutral correlation shape reserved for M5.
+type TransportEcho struct {
+	AccountID          string
+	TransportRequestID string
+	RemoteMessageID    string
+}
+
+// Timer is the one-shot timer seam used by Run and Wait.
+type Timer interface {
+	C() <-chan time.Time
+	Stop() bool
+}
+
+// Clock is MessageService's only source of time and timers.
+type Clock interface {
+	Now() time.Time
+	NewTimer(time.Duration) Timer
+}
+
+// IDSource supplies opaque durable IDs.
+type IDSource interface {
+	NewID() (string, error)
+}
+
+// IDSourceFunc adapts a function to IDSource.
+type IDSourceFunc func() (string, error)
+
+func (f IDSourceFunc) NewID() (string, error) { return f() }
+
+// CryptoIDSource produces 128-bit random hexadecimal IDs.
+type CryptoIDSource struct{}
+
+func (CryptoIDSource) NewID() (string, error) {
+	var value [16]byte
+	if _, err := rand.Read(value[:]); err != nil {
+		return "", fmt.Errorf("generate messaging ID: %w", err)
+	}
+	return hex.EncodeToString(value[:]), nil
+}
+
+// SystemClock is the production wall-clock implementation.
+type SystemClock struct{}
+
+func (SystemClock) Now() time.Time { return time.Now() }
+
+func (SystemClock) NewTimer(delay time.Duration) Timer {
+	return systemTimer{Timer: time.NewTimer(delay)}
+}
+
+type systemTimer struct{ *time.Timer }
+
+func (t systemTimer) C() <-chan time.Time { return t.Timer.C }
+
+// messageRepository is private so MessageService does not leak persistence
+// operations through its application-facing API.
+type messageRepository interface {
+	GetMessage(context.Context, string) (sqlite.Message, error)
+}
