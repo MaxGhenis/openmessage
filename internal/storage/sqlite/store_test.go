@@ -78,6 +78,8 @@ func TestOpenInitializesBlankDatabase(t *testing.T) {
 		"conversations",
 		"devices",
 		"identities",
+		"inbox",
+		"messages",
 		"people",
 		"person_identities",
 		"schema_migrations",
