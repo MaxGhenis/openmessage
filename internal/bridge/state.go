@@ -21,6 +21,19 @@ const (
 	StateStopping             State = "stopping"
 )
 
+// Policy contains every time and retry decision made by Supervisor. All
+// durations must be positive, MaxBackoff must be at least MinBackoff, and
+// MaxSameFingerprint must be positive.
+type Policy struct {
+	ConnectTimeout     time.Duration
+	ProbeEvery         time.Duration
+	ProbeTimeout       time.Duration
+	LivenessTimeout    time.Duration
+	MinBackoff         time.Duration
+	MaxBackoff         time.Duration
+	MaxSameFingerprint int
+}
+
 type Snapshot struct {
 	AccountID        string
 	Platform         Platform
