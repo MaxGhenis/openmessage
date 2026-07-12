@@ -114,6 +114,7 @@ func (p *BackfillProgress) snapshot() BackfillSnapshot {
 type App struct {
 	clientMu               sync.RWMutex
 	Client                 *client.Client
+	googleGeneration       *GoogleGeneration
 	Store                  *db.Store
 	EventHandler           *client.EventHandler
 	Logger                 zerolog.Logger
@@ -161,6 +162,8 @@ type App struct {
 	googleAuthExpired         atomic.Bool
 	googlePhoneResponding     atomic.Bool
 	googlePhoneRespondingSeen atomic.Bool
+	googleLifecycleMu         sync.RWMutex
+	googleLifecycleNotifier   GoogleLifecycleNotifier
 	tempDataDir               string
 	pendingMediaMu            sync.Mutex
 	pendingMedia              map[string]struct{}
@@ -205,7 +208,7 @@ func (a *App) RecordGoogleSendOutcomeWithPhone(success bool, phoneResponding boo
 		return
 	}
 	if a.googleSendFailures.Add(1) >= googleRepairThreshold {
-		a.googleNeedsRepair.Store(true)
+		a.markGoogleNeedsRepairAndPark(errGoogleSendsRepeatedlyFailed)
 	}
 }
 
@@ -214,7 +217,7 @@ func (a *App) RecordGoogleSendOutcomeWithPhone(success bool, phoneResponding boo
 // the session for re-pair; transient network errors should remain recoverable.
 func (a *App) RecordGoogleSendError(err error) {
 	if isGoogleAuthInvalid(err) {
-		a.googleNeedsRepair.Store(true)
+		a.markGoogleNeedsRepairAndPark(err)
 	}
 }
 

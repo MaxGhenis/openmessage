@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -11,6 +12,7 @@ import (
 	"runtime"
 	"runtime/debug"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -19,6 +21,8 @@ import (
 	"golang.org/x/term"
 
 	"github.com/maxghenis/openmessage/internal/app"
+	"github.com/maxghenis/openmessage/internal/bridge"
+	googleadapter "github.com/maxghenis/openmessage/internal/bridgeadapters/google"
 	"github.com/maxghenis/openmessage/internal/db"
 	"github.com/maxghenis/openmessage/internal/googlecookies"
 	"github.com/maxghenis/openmessage/internal/importer"
@@ -83,7 +87,6 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 	isDemo := app.DemoMode()
 
 	events := web.NewEventBroker()
-	googleReconnectNow := make(chan struct{}, 1)
 	isConnected := func() bool {
 		if isDemo {
 			return true
@@ -95,15 +98,7 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 	}
 	a.OnConversationsChange = events.PublishConversations
 	a.OnMessagesChange = events.PublishMessages
-	a.OnStatusChange = func(connected bool) {
-		publishOverallStatus()
-		if !connected {
-			select {
-			case googleReconnectNow <- struct{}{}:
-			default:
-			}
-		}
-	}
+	a.OnStatusChange = func(bool) { publishOverallStatus() }
 	a.OnTypingChange = events.PublishTyping
 	a.OnWhatsAppStatusChange = func() {
 		publishOverallStatus()
@@ -118,41 +113,70 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 	}
 	a.OnIncomingMessage = macNotifier.NotifyIncomingMessage
 
-	// Connect to Google Messages (skip in demo mode)
+	var googleLifecycle *googleadapter.Adapter
+	var googleSupervisor *bridge.Supervisor
+	var googleControl *googleSupervisorControl
+
+	// Google has one lifecycle owner. Transient retry, liveness probes,
+	// credential repair, and terminal parking all flow through this supervisor;
+	// the legacy Connected flag remains a UI projection only.
 	if !isDemo {
-		if err := a.LoadAndConnect(); err != nil {
-			logger.Warn().Err(err).Msg("Google Messages unavailable")
-		} else {
-			mode := startupBackfillMode()
-			runShallowBackfill := func() {
-				go func() {
-					if err := a.Backfill(); err != nil {
-						logger.Warn().Err(err).Msg("Backfill failed")
-					}
-				}()
+		googleLifecycle = googleadapter.New(googleAccountID, a, canRefreshGoogleCookies)
+		a.SetGoogleLifecycleNotifier(googleLifecycle)
+		repairer := newGoogleCredentialRepairer(
+			a.SessionPath,
+			canRefreshGoogleCookies,
+			refreshGoogleSessionCookies,
+			a.FlagGoogleNeedsRepair,
+			a.ClearGoogleRepairFlag,
+		)
+		newGoogleSupervisor := func() (*bridge.Supervisor, error) {
+			return bridge.NewSupervisor(
+				googleAccountID,
+				bridge.PlatformGoogle,
+				googleLifecycle,
+				googleSupervisorPolicy(),
+				googleWallClock{},
+				googleRandom{},
+				bridge.WithCredentialRepairer(repairer),
+			)
+		}
+		googleSupervisor, err = newGoogleSupervisor()
+		if err != nil {
+			return fmt.Errorf("init Google Messages supervisor: %w", err)
+		}
+		googleControl = newGoogleSupervisorControl(googleSupervisor, a.SessionPath, newGoogleSupervisor)
+		googleStartupCtx, cancelGoogleStartup := context.WithCancel(context.Background())
+		var googleStartupWG sync.WaitGroup
+		defer func() {
+			cancelGoogleStartup()
+			ctx, cancel := context.WithTimeout(context.Background(), googleSupervisorStopTimeout)
+			defer cancel()
+			if err := googleControl.Stop(ctx); err != nil {
+				logger.Warn().Err(err).Msg("Failed to stop Google Messages supervisor cleanly")
 			}
-			switch mode {
-			case "off":
-				logger.Info().Msg("Startup backfill disabled")
-			case "deep":
-				if a.StartDeepBackfill() {
-					logger.Info().Msg("Started deep startup backfill")
+			googleStartupWG.Wait()
+		}()
+
+		if a.GooglePaired() {
+			googleStartupWG.Add(1)
+			go func(supervisor *bridge.Supervisor) {
+				defer googleStartupWG.Done()
+				ctx, cancel := context.WithTimeout(googleStartupCtx, googleSupervisorPolicy().ConnectTimeout)
+				defer cancel()
+				startErr := supervisor.Start(ctx, bridge.StartRequest{})
+				waitErr := waitForGoogleOnline(ctx, supervisor)
+				if waitErr != nil {
+					logger.Warn().Err(errors.Join(startErr, waitErr)).Msg("Google Messages unavailable")
+					return
 				}
-			case "shallow":
-				runShallowBackfill()
-			default:
-				smsCount, err := a.Store.MessageCount("sms")
-				if err != nil {
-					logger.Warn().Err(err).Msg("Failed to inspect local SMS cache; falling back to shallow backfill")
-					runShallowBackfill()
-				} else if smsCount == 0 {
-					if a.StartDeepBackfill() {
-						logger.Info().Msg("No cached SMS history found; started deep startup backfill")
-					}
-				} else {
-					runShallowBackfill()
+				select {
+				case <-ctx.Done():
+					return
+				default:
 				}
-			}
+				startGoogleBackfill(a, logger)
+			}(googleSupervisor)
 		}
 	} else {
 		logger.Info().Msg("Demo mode — skipping phone connection")
@@ -208,67 +232,6 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 				}
 				if err := a.StartSignalConnect(); err != nil {
 					logger.Warn().Err(err).Msg("Signal reconnect attempt failed")
-				}
-			}
-		}()
-	}
-
-	// Google Messages reconnect watchdog. libgm has no auto-reconnect and the
-	// long-poll goroutine can die (panic, ping failure, transient fatal error)
-	// while the session stays valid. Without this, SMS silently freezes with
-	// Connected=true forever. Only reconnect a paired-but-disconnected session;
-	// skip when it genuinely needs re-pairing (session deleted) so we don't
-	// hammer a known-bad state.
-	if !isDemo {
-		go func() {
-			ticker := time.NewTicker(15 * time.Second)
-			defer ticker.Stop()
-			lastAttempt := time.Time{}
-			attemptReconnect := func(trigger string) {
-				if !lastAttempt.IsZero() && time.Since(lastAttempt) < 5*time.Second {
-					return
-				}
-				lastAttempt = time.Now()
-				g := a.GoogleStatus()
-				switch planGoogleReconnect(g, canRefreshGoogleCookies()) {
-				case googleReconnectSkip:
-					return
-				case googleReconnectPark:
-					// Dead linked-device session with no way to auto-recover
-					// (no cookie-refresh script). Stop reconnecting so we don't
-					// hammer Google's auth endpoint every cycle; flag it so the
-					// UI prompts a manual re-pair. A successful re-pair clears
-					// the flag and reconnect resumes.
-					a.FlagGoogleNeedsRepair()
-					return
-				case googleReconnectRefresh:
-					// Cookies expired but a refresh script is configured: refresh
-					// then reconnect, even if the session was flagged for repair.
-					logger.Info().Msg("Google auth expired - refreshing Chrome cookies before reconnect")
-					ctx, cancel := context.WithTimeout(context.Background(), googleCookieRefreshTimeout)
-					err := refreshGoogleSessionCookies(ctx, a.SessionPath)
-					cancel()
-					if err != nil {
-						logger.Warn().Err(err).Msg("Google cookie refresh before reconnect failed")
-					} else {
-						logger.Info().Msg("Refreshed Google cookies before reconnect")
-					}
-					a.ClearGoogleRepairFlag()
-				case googleReconnectRetry:
-					// Ordinary transient disconnect — just reconnect.
-				}
-				logger.Info().Str("trigger", trigger).Msg("Google Messages disconnected - attempting reconnect")
-				if err := a.ReconnectGoogleMessages(); err != nil {
-					a.HandleGoogleAuthExpiredError(err)
-					logger.Warn().Err(err).Msg("Google Messages reconnect attempt failed")
-				}
-			}
-			for {
-				select {
-				case <-ticker.C:
-					attemptReconnect("timer")
-				case <-googleReconnectNow:
-					attemptReconnect("status-change")
 				}
 			}
 		}()
@@ -416,6 +379,17 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 		}
 		return a.GoogleStatus()
 	}
+	recordGoogleSend := a.RecordGoogleSendOutcome
+	recordGoogleSendError := a.RecordGoogleSendError
+	markGoogleAuthExpired := a.HandleGoogleAuthExpiredError
+	reconnectGoogle := a.ReconnectGoogleMessages
+	unpairGoogle := a.Unpair
+	if googleControl != nil {
+		reconnectGoogle = googleControl.Reconnect
+		unpairGoogle = func() error {
+			return googleControl.StopAndUnpair(a.Unpair)
+		}
+	}
 
 	// Background loop that sends due scheduled ("send later") messages.
 	a.StartScheduler()
@@ -430,12 +404,12 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 				IdentityName:          identityName,
 				IsConnected:           isConnected,
 				GoogleStatus:          googleStatus,
-				RecordGoogleSend:      a.RecordGoogleSendOutcome,
-				RecordGoogleSendError: a.RecordGoogleSendError,
+				RecordGoogleSend:      recordGoogleSend,
+				RecordGoogleSendError: recordGoogleSendError,
 				GooglePhoneResponding: a.GooglePhoneResponding,
-				MarkGoogleAuthExpired: a.HandleGoogleAuthExpiredError,
-				ReconnectGoogle:       a.ReconnectGoogleMessages,
-				Unpair:                a.Unpair,
+				MarkGoogleAuthExpired: markGoogleAuthExpired,
+				ReconnectGoogle:       reconnectGoogle,
+				Unpair:                unpairGoogle,
 				WhatsAppStatus:        func() any { return a.WhatsAppStatus() },
 				ConnectWhatsApp:       a.StartWhatsAppConnect,
 				PairWhatsAppPhone:     a.PairWhatsAppPhone,
@@ -638,51 +612,11 @@ func startupBackfillMode() string {
 
 const googleCookieRefreshTimeout = 20 * time.Second
 
-func googleStatusNeedsCookieRefresh(g app.GoogleStatusSnapshot) bool {
-	return g.AuthExpired || app.IsGoogleAuthExpiredError(fmt.Errorf("%s", g.LastError))
-}
-
-// googleReconnectAction is the reconnect watchdog's decision for a Google
-// Messages session that is currently disconnected.
-type googleReconnectAction int
-
-const (
-	googleReconnectSkip    googleReconnectAction = iota // connected, unpaired, or awaiting first-time pairing
-	googleReconnectRefresh                              // cookies expired and a refresh script is available
-	googleReconnectPark                                 // dead session, no automated recovery — wait for manual re-pair
-	googleReconnectRetry                                // ordinary transient disconnect
-)
-
-// planGoogleReconnect decides what the reconnect watchdog should do for a
-// disconnected Google Messages session. It is pure so the back-off behaviour
-// can be unit-tested without driving the live loop.
-//
-// Key invariant: a session whose cookies have expired is only retried
-// automatically when a cookie-refresh script is configured. Without one (e.g.
-// the macOS app) a reconnect just 401s again, so we park and let the UI prompt
-// a manual re-pair instead of spinning a reconnect storm against Google's auth
-// endpoint — the failure docs/agent-runbook.md warns about.
-func planGoogleReconnect(g app.GoogleStatusSnapshot, hasRefreshScript bool) googleReconnectAction {
-	if !g.Paired || g.Connected || g.NeedsPairing {
-		return googleReconnectSkip
-	}
-	if googleStatusNeedsCookieRefresh(g) {
-		if hasRefreshScript {
-			return googleReconnectRefresh
-		}
-		return googleReconnectPark
-	}
-	if g.NeedsRepair {
-		return googleReconnectPark
-	}
-	return googleReconnectRetry
-}
-
 // canRefreshGoogleCookies reports whether an expired Google session can be
 // recovered automatically — either via a configured external refresh script or
 // the built-in native refresh (macOS with a Chrome profile). When neither is
-// available (e.g. a Linux install with no script), planGoogleReconnect parks
-// the session and the UI prompts a manual re-pair instead of spinning 401s.
+// available, the adapter classifies auth expiry as a blocked condition and the
+// existing needs_repair status prompts a manual re-pair instead of spinning.
 func canRefreshGoogleCookies() bool {
 	if strings.TrimSpace(os.Getenv("OPENMESSAGE_COOKIE_REFRESH_SCRIPT")) != "" {
 		return true
@@ -693,8 +627,8 @@ func canRefreshGoogleCookies() bool {
 // refreshGoogleSessionCookies rewrites the Google cookies in sessionPath. It
 // prefers an explicitly configured OPENMESSAGE_COOKIE_REFRESH_SCRIPT (so the
 // operator can override the mechanism), otherwise falls back to the built-in
-// native refresh. Returning nil with no work done is fine — the caller
-// reconnects afterwards regardless.
+// native refresh. The supervisor starts a new generation only after this
+// function succeeds.
 var refreshGoogleSessionCookies = func(ctx context.Context, sessionPath string) error {
 	script := strings.TrimSpace(os.Getenv("OPENMESSAGE_COOKIE_REFRESH_SCRIPT"))
 	if script != "" {
