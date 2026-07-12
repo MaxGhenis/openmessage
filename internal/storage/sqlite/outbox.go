@@ -52,17 +52,18 @@ const (
 // NewOutboxItem contains the caller-owned identity and intent fields for a new
 // durable outbound operation. A zero ScheduledFor means immediately eligible.
 type NewOutboxItem struct {
-	OutboxID           string
-	AccountID          string
-	ConversationID     string
-	Kind               OutboxKind
-	IdempotencyKey     string
-	PayloadHash        string
-	Operation          string
-	LocalMessageID     string
-	TransportRequestID string
-	ScheduledFor       time.Time
-	ScheduledForMS     int64
+	OutboxID            string
+	AccountID           string
+	ConversationID      string
+	Kind                OutboxKind
+	IdempotencyKey      string
+	PayloadHash         string
+	Operation           string
+	LocalMessageID      string
+	TransportRequestID  string
+	SendAgainOfOutboxID string
+	ScheduledFor        time.Time
+	ScheduledForMS      int64
 }
 
 // OutboxItem mirrors one row in outbox. Nullable database fields are pointers.
@@ -77,6 +78,7 @@ type OutboxItem struct {
 	State               OutboxState
 	LocalMessageID      *string
 	TransportRequestID  string
+	SendAgainOfOutboxID *string
 	ResultRemoteID      *string
 	ErrorClass          *string
 	ErrorCode           *string
@@ -159,6 +161,26 @@ func (r *OutboxRepository) Enqueue(
 	ctx context.Context,
 	item NewOutboxItem,
 ) (OutboxItem, EnqueueDisposition, error) {
+	return r.enqueue(ctx, item, nil)
+}
+
+// EnqueueOutgoingMessage atomically inserts an outbound intent and its
+// optimistic outgoing message. When the idempotency key already names the same
+// intent, it returns the existing outbox row without validating or writing the
+// candidate message.
+func (r *OutboxRepository) EnqueueOutgoingMessage(
+	ctx context.Context,
+	item NewOutboxItem,
+	message Message,
+) (OutboxItem, EnqueueDisposition, error) {
+	return r.enqueue(ctx, item, &message)
+}
+
+func (r *OutboxRepository) enqueue(
+	ctx context.Context,
+	item NewOutboxItem,
+	message *Message,
+) (OutboxItem, EnqueueDisposition, error) {
 	if err := validateNewOutboxItem(item); err != nil {
 		return OutboxItem{}, "", fmt.Errorf("enqueue outbox item: %w", err)
 	}
@@ -189,11 +211,12 @@ func (r *OutboxRepository) Enqueue(
 			state,
 			local_message_id,
 			transport_request_id,
+			send_again_of_outbox_id,
 			attempt_count,
 			scheduled_for_ms,
 			created_at_ms,
 			updated_at_ms
-		) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, 0, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, 0, ?, ?, ?)
 		ON CONFLICT(account_id, idempotency_key) DO NOTHING
 	`,
 		item.OutboxID,
@@ -205,6 +228,7 @@ func (r *OutboxRepository) Enqueue(
 		item.Operation,
 		nullableOutboxText(item.LocalMessageID),
 		item.TransportRequestID,
+		nullableOutboxText(item.SendAgainOfOutboxID),
 		scheduledForMS,
 		nowMS,
 		nowMS,
@@ -236,10 +260,11 @@ func (r *OutboxRepository) Enqueue(
 			SELECT `+outboxColumns+`
 			FROM outbox
 			WHERE account_id = ? AND idempotency_key = ?
-		`, item.AccountID, item.IdempotencyKey))
+			`, item.AccountID, item.IdempotencyKey))
 		if err == nil && (row.Operation != item.Operation ||
 			row.ConversationID != item.ConversationID ||
-			row.PayloadHash != item.PayloadHash) {
+			row.PayloadHash != item.PayloadHash ||
+			!optionalOutboxTextEqual(row.SendAgainOfOutboxID, item.SendAgainOfOutboxID)) {
 			return OutboxItem{}, "", fmt.Errorf(
 				"enqueue outbox item %q for account %q and idempotency key %q: %w",
 				item.OutboxID,
@@ -258,10 +283,82 @@ func (r *OutboxRepository) Enqueue(
 	if err != nil {
 		return OutboxItem{}, "", fmt.Errorf("enqueue outbox item %q: read effective row: %w", item.OutboxID, err)
 	}
+	if disposition == EnqueueInserted && message != nil {
+		if err := r.insertOutgoingMessage(ctx, tx, item, *message, nowMS); err != nil {
+			return OutboxItem{}, "", err
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		return OutboxItem{}, "", fmt.Errorf("enqueue outbox item %q: commit: %w", item.OutboxID, err)
 	}
 	return row, disposition, nil
+}
+
+func (r *OutboxRepository) insertOutgoingMessage(
+	ctx context.Context,
+	tx *sql.Tx,
+	item NewOutboxItem,
+	message Message,
+	nowMS int64,
+) error {
+	if message.Direction != MessageDirectionOutgoing {
+		return fmt.Errorf(
+			"enqueue outgoing message %q: %w: direction %q is not outgoing",
+			message.MessageID,
+			ErrInvalidMessage,
+			message.Direction,
+		)
+	}
+	if item.LocalMessageID == "" || message.MessageID != item.LocalMessageID {
+		return fmt.Errorf(
+			"enqueue outgoing message %q: %w: message ID does not match outbox local message ID %q",
+			message.MessageID,
+			ErrInvalidMessage,
+			item.LocalMessageID,
+		)
+	}
+	if message.AccountID != item.AccountID || message.ConversationID != item.ConversationID {
+		return fmt.Errorf(
+			"enqueue outgoing message %q: %w: message account/conversation does not match outbox intent",
+			message.MessageID,
+			ErrInvalidMessage,
+		)
+	}
+
+	_, err := tx.ExecContext(ctx, `
+		INSERT INTO messages (
+			message_id,
+			conversation_id,
+			account_id,
+			remote_message_id,
+			sender_identity_id,
+			direction,
+			body,
+			reply_to_remote_id,
+			state,
+			occurred_at_ms,
+			created_at_ms,
+			updated_at_ms
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`,
+		message.MessageID,
+		message.ConversationID,
+		message.AccountID,
+		message.RemoteMessageID,
+		message.SenderIdentityID,
+		message.Direction,
+		message.Body,
+		message.ReplyToRemoteID,
+		message.State,
+		message.OccurredAtMS,
+		nowMS,
+		nowMS,
+	)
+	if err == nil {
+		return nil
+	}
+	messageRepository := &MessageRepository{store: r.store, now: r.now}
+	return messageRepository.mapMessageWriteError(ctx, tx, message, err)
 }
 
 // LeaseDue atomically claims due queued, retryable, and explicitly eligible
@@ -416,6 +513,26 @@ func (r *OutboxRepository) MarkNotDispatched(
 	outboxID, leaseToken, class, code, detail string,
 	retryAt time.Time,
 ) error {
+	return r.markNotDispatched(ctx, outboxID, leaseToken, class, code, detail, retryAt, false)
+}
+
+// MarkCalledNotDispatched records a transport result that explicitly proves no
+// remote call occurred even though the conservative transport-call marker was
+// already committed. Crashes after that marker still recover as uncertain.
+func (r *OutboxRepository) MarkCalledNotDispatched(
+	ctx context.Context,
+	outboxID, leaseToken, class, code, detail string,
+	retryAt time.Time,
+) error {
+	return r.markNotDispatched(ctx, outboxID, leaseToken, class, code, detail, retryAt, true)
+}
+
+func (r *OutboxRepository) markNotDispatched(
+	ctx context.Context,
+	outboxID, leaseToken, class, code, detail string,
+	retryAt time.Time,
+	called bool,
+) error {
 	retryAtMS := retryAt.UnixMilli()
 	if retryAtMS <= 0 {
 		return fmt.Errorf("mark outbox item %q not dispatched: retry time is not positive", outboxID)
@@ -423,6 +540,12 @@ func (r *OutboxRepository) MarkNotDispatched(
 	nowMS, err := r.nowMS("mark outbox item not dispatched")
 	if err != nil {
 		return err
+	}
+	calledPredicate := "transport_called_at_ms IS NULL"
+	operation := "mark not dispatched"
+	if called {
+		calledPredicate = "transport_called_at_ms IS NOT NULL"
+		operation = "mark called not dispatched"
 	}
 	result, err := r.store.db.ExecContext(ctx, `
 		UPDATE outbox
@@ -439,7 +562,7 @@ func (r *OutboxRepository) MarkNotDispatched(
 		WHERE outbox_id = ?
 		  AND state = 'dispatching'
 		  AND lease_token = ?
-		  AND transport_called_at_ms IS NULL
+		  AND `+calledPredicate+`
 	`,
 		nullableOutboxText(class),
 		nullableOutboxText(code),
@@ -452,7 +575,95 @@ func (r *OutboxRepository) MarkNotDispatched(
 	if err != nil {
 		return fmt.Errorf("mark outbox item %q not dispatched: %w", outboxID, err)
 	}
-	return r.requireLeaseMutation(ctx, "mark not dispatched", outboxID, result)
+	return r.requireLeaseMutation(ctx, operation, outboxID, result)
+}
+
+// ReleaseUnavailable returns an uncalled dispatch lease to queued state and
+// defers it without consuming a transport attempt.
+func (r *OutboxRepository) ReleaseUnavailable(
+	ctx context.Context,
+	outboxID, leaseToken string,
+	retryAt time.Time,
+) error {
+	retryAtMS := retryAt.UnixMilli()
+	if retryAtMS <= 0 {
+		return fmt.Errorf("release unavailable outbox item %q: retry time is not positive", outboxID)
+	}
+	nowMS, err := r.nowMS("release unavailable outbox item")
+	if err != nil {
+		return err
+	}
+	result, err := r.store.db.ExecContext(ctx, `
+		UPDATE outbox
+		SET state = 'queued',
+			next_attempt_at_ms = ?,
+			lease_owner = NULL,
+			lease_token = NULL,
+			lease_expires_at_ms = NULL,
+			transport_called_at_ms = NULL,
+			updated_at_ms = ?
+		WHERE outbox_id = ?
+		  AND state = 'dispatching'
+		  AND lease_token = ?
+		  AND transport_called_at_ms IS NULL
+	`, retryAtMS, nowMS, outboxID, leaseToken)
+	if err != nil {
+		return fmt.Errorf("release unavailable outbox item %q: %w", outboxID, err)
+	}
+	return r.requireLeaseMutation(ctx, "release unavailable", outboxID, result)
+}
+
+// RetryNotDispatched makes one explicitly safe-to-retry row immediately due
+// while preserving its transport request identity.
+func (r *OutboxRepository) RetryNotDispatched(
+	ctx context.Context,
+	outboxID string,
+	now time.Time,
+) error {
+	dueAtMS := now.UnixMilli()
+	if dueAtMS <= 0 {
+		return fmt.Errorf("retry not-dispatched outbox item %q: current Unix time is not positive", outboxID)
+	}
+	updatedAtMS, err := r.nowMS("retry not-dispatched outbox item")
+	if err != nil {
+		return err
+	}
+	result, err := r.store.db.ExecContext(ctx, `
+		UPDATE outbox
+		SET state = 'queued',
+			error_class = NULL,
+			error_code = NULL,
+			error_detail = NULL,
+			next_attempt_at_ms = ?,
+			updated_at_ms = ?
+		WHERE outbox_id = ?
+		  AND state = 'not_dispatched'
+	`, dueAtMS, updatedAtMS, outboxID)
+	if err != nil {
+		return fmt.Errorf("retry not-dispatched outbox item %q: %w", outboxID, err)
+	}
+	return r.requireStateMutation(ctx, "retry not dispatched", outboxID, result)
+}
+
+// Cancel transitions pending work to a terminal canceled state. Active or
+// already-terminal rows are rejected so a transport call cannot race a cancel.
+func (r *OutboxRepository) Cancel(ctx context.Context, outboxID string) error {
+	nowMS, err := r.nowMS("cancel outbox item")
+	if err != nil {
+		return err
+	}
+	result, err := r.store.db.ExecContext(ctx, `
+		UPDATE outbox
+		SET state = 'canceled',
+			next_attempt_at_ms = NULL,
+			updated_at_ms = ?
+		WHERE outbox_id = ?
+		  AND state IN ('queued', 'not_dispatched')
+	`, nowMS, outboxID)
+	if err != nil {
+		return fmt.Errorf("cancel outbox item %q: %w", outboxID, err)
+	}
+	return r.requireStateMutation(ctx, "cancel", outboxID, result)
 }
 
 // MarkUncertain records an unknown outcome after the transport call boundary.
@@ -580,6 +791,23 @@ func (r *OutboxRepository) Confirm(
 	}
 	if err := r.requireLeaseMutationWithQueryer(ctx, tx, "confirm", confirmation.OutboxID, result); err != nil {
 		return err
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE messages
+		SET remote_message_id = ?,
+			updated_at_ms = ?
+		WHERE message_id = (
+			SELECT local_message_id
+			FROM outbox
+			WHERE outbox_id = ?
+		)
+	`, resultRemoteID, nowMS, confirmation.OutboxID); err != nil {
+		return fmt.Errorf(
+			"confirm outbox item %q: update optimistic message: %w: %w",
+			confirmation.OutboxID,
+			ErrInvalidMessage,
+			mapConstraintError(err),
+		)
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("confirm outbox item %q: commit: %w", confirmation.OutboxID, err)
@@ -749,6 +977,7 @@ const outboxColumns = `
 	state,
 	local_message_id,
 	transport_request_id,
+	send_again_of_outbox_id,
 	result_remote_id,
 	error_class,
 	error_code,
@@ -776,6 +1005,7 @@ func scanOutboxItem(row rowScanner) (OutboxItem, error) {
 		&item.State,
 		&item.LocalMessageID,
 		&item.TransportRequestID,
+		&item.SendAgainOfOutboxID,
 		&item.ResultRemoteID,
 		&item.ErrorClass,
 		&item.ErrorCode,
@@ -846,6 +1076,13 @@ func nullableOutboxText(value string) any {
 	return value
 }
 
+func optionalOutboxTextEqual(existing *string, candidate string) bool {
+	if existing == nil {
+		return candidate == ""
+	}
+	return *existing == candidate
+}
+
 func newOutboxLeaseToken() (string, error) {
 	var token [16]byte
 	if _, err := rand.Read(token[:]); err != nil {
@@ -868,6 +1105,33 @@ func (r *OutboxRepository) requireLeaseMutation(
 	result sql.Result,
 ) error {
 	return r.requireLeaseMutationWithQueryer(ctx, r.store.db, operation, outboxID, result)
+}
+
+func (r *OutboxRepository) requireStateMutation(
+	ctx context.Context,
+	operation, outboxID string,
+	result sql.Result,
+) error {
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("%s outbox item %q: read rows affected: %w", operation, outboxID, err)
+	}
+	if affected == 1 {
+		return nil
+	}
+	if affected != 0 {
+		return fmt.Errorf("%s outbox item %q: affected %d rows, want 1", operation, outboxID, affected)
+	}
+	var exists bool
+	if err := r.store.db.QueryRowContext(ctx, `
+		SELECT EXISTS (SELECT 1 FROM outbox WHERE outbox_id = ?)
+	`, outboxID).Scan(&exists); err != nil {
+		return fmt.Errorf("%s outbox item %q: inspect state: %w", operation, outboxID, err)
+	}
+	if !exists {
+		return notFound("outbox item", outboxID)
+	}
+	return fmt.Errorf("%s outbox item %q: %w", operation, outboxID, ErrInvalidOutboxState)
 }
 
 type outboxQueryer interface {

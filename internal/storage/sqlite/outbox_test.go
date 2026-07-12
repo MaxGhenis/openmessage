@@ -82,6 +82,165 @@ func TestOutboxEnqueueIdempotencyAndConflict(t *testing.T) {
 	}
 }
 
+func TestOutboxEnqueueOutgoingMessageIsAtomicAndDeduplicated(t *testing.T) {
+	clock := newOutboxTestClock(outboxTestTimeMS)
+	store, repository := openOutboxTestRepository(t, clock.Now)
+	seedMessageConversation(t, store, "conversation-a", "account-a")
+	ctx := context.Background()
+
+	item := outboxTestItem("outgoing")
+	message := outboxTestOutgoingMessage(item, "hello from the outbox")
+	row, disposition, err := repository.EnqueueOutgoingMessage(ctx, item, message)
+	if err != nil {
+		t.Fatalf("EnqueueOutgoingMessage(): %v", err)
+	}
+	if disposition != EnqueueInserted || row.OutboxID != item.OutboxID {
+		t.Fatalf("EnqueueOutgoingMessage() = (%+v, %q), want inserted", row, disposition)
+	}
+	messageRepository, err := NewMessageRepository(store, clock.Now)
+	if err != nil {
+		t.Fatalf("NewMessageRepository(): %v", err)
+	}
+	gotMessage, err := messageRepository.GetMessage(ctx, item.LocalMessageID)
+	if err != nil {
+		t.Fatalf("GetMessage(): %v", err)
+	}
+	if gotMessage.Body != message.Body || gotMessage.Direction != MessageDirectionOutgoing ||
+		gotMessage.RemoteMessageID != message.RemoteMessageID {
+		t.Fatalf("optimistic message = %+v, want %+v", gotMessage, message)
+	}
+
+	duplicate := item
+	duplicate.OutboxID = "outbox-unused-duplicate"
+	duplicate.LocalMessageID = "message-unused-duplicate"
+	duplicate.TransportRequestID = "request-unused-duplicate"
+	duplicateRow, disposition, err := repository.EnqueueOutgoingMessage(ctx, duplicate, Message{})
+	if err != nil {
+		t.Fatalf("EnqueueOutgoingMessage(duplicate with invalid candidate): %v", err)
+	}
+	if disposition != EnqueueExisting || duplicateRow.OutboxID != item.OutboxID {
+		t.Fatalf("duplicate result = (%+v, %q), want original", duplicateRow, disposition)
+	}
+	assertRowCount(t, store.db, "outbox", 1)
+	assertRowCount(t, store.db, "messages", 1)
+
+	invalidItem := outboxTestItem("invalid-outgoing")
+	invalidMessage := outboxTestOutgoingMessage(invalidItem, "must roll back")
+	invalidMessage.AccountID = "different-account"
+	if _, _, err := repository.EnqueueOutgoingMessage(ctx, invalidItem, invalidMessage); !errors.Is(err, ErrInvalidMessage) {
+		t.Fatalf("EnqueueOutgoingMessage(invalid) error = %v, want ErrInvalidMessage", err)
+	}
+	assertRowCount(t, store.db, "outbox", 1)
+	assertRowCount(t, store.db, "messages", 1)
+}
+
+func TestOutboxSendAgainLinkIsDurableAndIdempotent(t *testing.T) {
+	clock := newOutboxTestClock(outboxTestTimeMS)
+	store, repository := openOutboxTestRepository(t, clock.Now)
+	ctx := context.Background()
+	prior := mustEnqueueOutbox(t, repository, outboxTestItem("prior"))
+
+	replacement := outboxTestItem("replacement")
+	replacement.SendAgainOfOutboxID = prior.OutboxID
+	row := mustEnqueueOutbox(t, repository, replacement)
+	assertOutboxText(t, "send-again link", row.SendAgainOfOutboxID, prior.OutboxID)
+
+	otherPrior := mustEnqueueOutbox(t, repository, outboxTestItem("other-prior"))
+	conflict := replacement
+	conflict.OutboxID = "outbox-replacement-conflict"
+	conflict.TransportRequestID = "request-replacement-conflict"
+	conflict.SendAgainOfOutboxID = otherPrior.OutboxID
+	if _, _, err := repository.Enqueue(ctx, conflict); !errors.Is(err, ErrIdempotencyConflict) {
+		t.Fatalf("Enqueue(changed send-again link) error = %v, want ErrIdempotencyConflict", err)
+	}
+
+	orphan := outboxTestItem("orphan-link")
+	orphan.SendAgainOfOutboxID = "outbox-missing"
+	if _, _, err := repository.Enqueue(ctx, orphan); !errors.Is(err, ErrConstraintViolation) {
+		t.Fatalf("Enqueue(orphan send-again link) error = %v, want ErrConstraintViolation", err)
+	}
+	assertRowCount(t, store.db, "outbox", 3)
+}
+
+func TestOutboxConfirmUpdatesOptimisticMessageAtomically(t *testing.T) {
+	clock := newOutboxTestClock(outboxTestTimeMS)
+	store, repository := openOutboxTestRepository(t, clock.Now)
+	seedMessageConversation(t, store, "conversation-a", "account-a")
+	ctx := context.Background()
+
+	item := outboxTestItem("confirm-message")
+	message := outboxTestOutgoingMessage(item, "confirmed body")
+	if _, _, err := repository.EnqueueOutgoingMessage(ctx, item, message); err != nil {
+		t.Fatalf("EnqueueOutgoingMessage(): %v", err)
+	}
+	lease := mustLeaseOne(t, repository, LeaseRequest{
+		Owner: "worker", Now: clock.Now(), Duration: time.Minute, Limit: 1,
+	})
+	token := mustLeaseToken(t, lease)
+	if err := repository.MarkTransportCalled(ctx, Attempt{OutboxID: item.OutboxID, LeaseToken: token}); err != nil {
+		t.Fatalf("MarkTransportCalled(): %v", err)
+	}
+	if err := repository.Confirm(ctx, Confirmation{
+		OutboxID: item.OutboxID, LeaseToken: token, ResultRemoteID: "remote-confirmed",
+	}); err != nil {
+		t.Fatalf("Confirm(): %v", err)
+	}
+	confirmed, err := repository.FindByID(ctx, item.OutboxID)
+	if err != nil {
+		t.Fatalf("FindByID(): %v", err)
+	}
+	if confirmed.State != OutboxConfirmed {
+		t.Fatalf("confirmed state = %q, want %q", confirmed.State, OutboxConfirmed)
+	}
+	messageRepository, err := NewMessageRepository(store, clock.Now)
+	if err != nil {
+		t.Fatalf("NewMessageRepository(): %v", err)
+	}
+	gotMessage, err := messageRepository.GetMessage(ctx, item.LocalMessageID)
+	if err != nil {
+		t.Fatalf("GetMessage(): %v", err)
+	}
+	if gotMessage.RemoteMessageID != "remote-confirmed" {
+		t.Fatalf("confirmed message remote ID = %q, want remote-confirmed", gotMessage.RemoteMessageID)
+	}
+
+	conflictingItem := outboxTestItem("confirm-conflict")
+	conflictingMessage := outboxTestOutgoingMessage(conflictingItem, "conflicting body")
+	if _, _, err := repository.EnqueueOutgoingMessage(ctx, conflictingItem, conflictingMessage); err != nil {
+		t.Fatalf("EnqueueOutgoingMessage(conflict candidate): %v", err)
+	}
+	conflictingLease := mustLeaseOne(t, repository, LeaseRequest{
+		Owner: "worker", Now: clock.Now(), Duration: time.Minute, Limit: 1,
+	})
+	conflictingToken := mustLeaseToken(t, conflictingLease)
+	if err := repository.MarkTransportCalled(ctx, Attempt{
+		OutboxID: conflictingItem.OutboxID, LeaseToken: conflictingToken,
+	}); err != nil {
+		t.Fatalf("MarkTransportCalled(conflict candidate): %v", err)
+	}
+	if err := repository.Confirm(ctx, Confirmation{
+		OutboxID:       conflictingItem.OutboxID,
+		LeaseToken:     conflictingToken,
+		ResultRemoteID: "remote-confirmed",
+	}); !errors.Is(err, ErrConstraintViolation) {
+		t.Fatalf("Confirm(conflicting remote ID) error = %v, want ErrConstraintViolation", err)
+	}
+	rolledBack, err := repository.FindByID(ctx, conflictingItem.OutboxID)
+	if err != nil {
+		t.Fatalf("FindByID(conflict candidate): %v", err)
+	}
+	if rolledBack.State != OutboxDispatching || rolledBack.TransportCalledAtMS == nil {
+		t.Fatalf("failed confirm did not roll back outbox transition: %+v", rolledBack)
+	}
+	rolledBackMessage, err := messageRepository.GetMessage(ctx, conflictingItem.LocalMessageID)
+	if err != nil {
+		t.Fatalf("GetMessage(conflict candidate): %v", err)
+	}
+	if rolledBackMessage.RemoteMessageID != conflictingMessage.RemoteMessageID {
+		t.Fatalf("failed confirm changed message remote ID to %q", rolledBackMessage.RemoteMessageID)
+	}
+}
+
 func TestOutboxLeaseDueRespectsScheduleRetryAndLiveLease(t *testing.T) {
 	clock := newOutboxTestClock(outboxTestTimeMS)
 	_, repository := openOutboxTestRepository(t, clock.Now)
@@ -444,20 +603,176 @@ func TestOutboxPhaseTransitionsRejectWrongSideOfCallBoundary(t *testing.T) {
 	}
 }
 
+func TestOutboxReleaseUnavailableReturnsLeaseToQueuedWithoutAttempt(t *testing.T) {
+	clock := newOutboxTestClock(outboxTestTimeMS)
+	_, repository := openOutboxTestRepository(t, clock.Now)
+	ctx := context.Background()
+	item := outboxTestItem("unavailable")
+	mustEnqueueOutbox(t, repository, item)
+	lease := mustLeaseOne(t, repository, LeaseRequest{
+		Owner: "worker", Now: clock.Now(), Duration: time.Minute, Limit: 1,
+	})
+	retryAt := clock.Now().Add(30 * time.Second)
+	if err := repository.ReleaseUnavailable(ctx, item.OutboxID, mustLeaseToken(t, lease), retryAt); err != nil {
+		t.Fatalf("ReleaseUnavailable(): %v", err)
+	}
+	queued, err := repository.FindByID(ctx, item.OutboxID)
+	if err != nil {
+		t.Fatalf("FindByID(): %v", err)
+	}
+	if queued.State != OutboxQueued || queued.AttemptCount != 0 || queued.LeaseToken != nil ||
+		queued.NextAttemptAtMS == nil || *queued.NextAttemptAtMS != retryAt.UnixMilli() ||
+		queued.TransportRequestID != item.TransportRequestID {
+		t.Fatalf("released unavailable row = %+v", queued)
+	}
+	leasingEarly, err := repository.LeaseDue(ctx, LeaseRequest{
+		Owner: "worker", Now: clock.Now(), Duration: time.Minute, Limit: 1,
+	})
+	if err != nil {
+		t.Fatalf("LeaseDue(before retry): %v", err)
+	}
+	if len(leasingEarly) != 0 {
+		t.Fatalf("LeaseDue(before retry) = %+v, want none", leasingEarly)
+	}
+	clock.Set(retryAt.UnixMilli())
+	retried := mustLeaseOne(t, repository, LeaseRequest{
+		Owner: "worker", Now: clock.Now(), Duration: time.Minute, Limit: 1,
+	})
+	if retried.TransportRequestID != item.TransportRequestID || retried.AttemptCount != 0 {
+		t.Fatalf("re-leased unavailable row = %+v", retried)
+	}
+}
+
+func TestOutboxCalledNotDispatchedCanBeSafelyRetried(t *testing.T) {
+	clock := newOutboxTestClock(outboxTestTimeMS)
+	_, repository := openOutboxTestRepository(t, clock.Now)
+	ctx := context.Background()
+	item := outboxTestItem("called-not-dispatched")
+	mustEnqueueOutbox(t, repository, item)
+	lease := mustLeaseOne(t, repository, LeaseRequest{
+		Owner: "worker", Now: clock.Now(), Duration: time.Minute, Limit: 1,
+	})
+	token := mustLeaseToken(t, lease)
+	if err := repository.MarkTransportCalled(ctx, Attempt{OutboxID: item.OutboxID, LeaseToken: token}); err != nil {
+		t.Fatalf("MarkTransportCalled(): %v", err)
+	}
+	retryAt := clock.Now().Add(time.Minute)
+	if err := repository.MarkCalledNotDispatched(
+		ctx, item.OutboxID, token, "transient", "preflight", "transport proved no call", retryAt,
+	); err != nil {
+		t.Fatalf("MarkCalledNotDispatched(): %v", err)
+	}
+	notDispatched, err := repository.FindByID(ctx, item.OutboxID)
+	if err != nil {
+		t.Fatalf("FindByID(): %v", err)
+	}
+	if notDispatched.State != OutboxNotDispatched || notDispatched.TransportCalledAtMS != nil ||
+		notDispatched.NextAttemptAtMS == nil || *notDispatched.NextAttemptAtMS != retryAt.UnixMilli() ||
+		notDispatched.TransportRequestID != item.TransportRequestID {
+		t.Fatalf("called-not-dispatched row = %+v", notDispatched)
+	}
+	if notDispatched.AttemptCount != 1 {
+		t.Fatalf("called-not-dispatched attempt count = %d, want 1 boundary crossing", notDispatched.AttemptCount)
+	}
+}
+
+func TestOutboxRetryNotDispatchedAndCancelStateGuards(t *testing.T) {
+	clock := newOutboxTestClock(outboxTestTimeMS)
+	_, repository := openOutboxTestRepository(t, clock.Now)
+	ctx := context.Background()
+
+	retryItem := outboxTestItem("manual-retry")
+	mustEnqueueOutbox(t, repository, retryItem)
+	lease := mustLeaseOne(t, repository, LeaseRequest{
+		Owner: "worker", Now: clock.Now(), Duration: time.Minute, Limit: 1,
+	})
+	if err := repository.MarkNotDispatched(
+		ctx,
+		retryItem.OutboxID,
+		mustLeaseToken(t, lease),
+		"transient",
+		"offline",
+		"retry later",
+		clock.Now().Add(time.Hour),
+	); err != nil {
+		t.Fatalf("MarkNotDispatched(): %v", err)
+	}
+	if err := repository.RetryNotDispatched(ctx, retryItem.OutboxID, clock.Now()); err != nil {
+		t.Fatalf("RetryNotDispatched(): %v", err)
+	}
+	retryQueued, err := repository.FindByID(ctx, retryItem.OutboxID)
+	if err != nil {
+		t.Fatalf("FindByID(retry): %v", err)
+	}
+	if retryQueued.State != OutboxQueued || retryQueued.NextAttemptAtMS == nil ||
+		*retryQueued.NextAttemptAtMS != clock.Now().UnixMilli() ||
+		retryQueued.TransportRequestID != retryItem.TransportRequestID || retryQueued.ErrorClass != nil {
+		t.Fatalf("manual retry row = %+v", retryQueued)
+	}
+	if err := repository.RetryNotDispatched(ctx, retryItem.OutboxID, clock.Now()); !errors.Is(err, ErrInvalidOutboxState) {
+		t.Fatalf("RetryNotDispatched(queued) error = %v, want ErrInvalidOutboxState", err)
+	}
+
+	cancelItem := outboxTestItem("cancel")
+	mustEnqueueOutbox(t, repository, cancelItem)
+	if err := repository.Cancel(ctx, cancelItem.OutboxID); err != nil {
+		t.Fatalf("Cancel(): %v", err)
+	}
+	canceled, err := repository.FindByID(ctx, cancelItem.OutboxID)
+	if err != nil {
+		t.Fatalf("FindByID(canceled): %v", err)
+	}
+	if canceled.State != OutboxCanceled || canceled.NextAttemptAtMS != nil {
+		t.Fatalf("canceled row = %+v", canceled)
+	}
+	if err := repository.Cancel(ctx, cancelItem.OutboxID); !errors.Is(err, ErrInvalidOutboxState) {
+		t.Fatalf("Cancel(canceled) error = %v, want ErrInvalidOutboxState", err)
+	}
+	if err := repository.Cancel(ctx, "missing"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Cancel(missing) error = %v, want ErrNotFound", err)
+	}
+
+	dispatchingItem := outboxTestItem("cancel-dispatching")
+	mustEnqueueOutbox(t, repository, dispatchingItem)
+	dispatchingLease := mustLeaseOne(t, repository, LeaseRequest{
+		Owner: "worker", Now: clock.Now(), Duration: time.Minute, Limit: 1,
+	})
+	if dispatchingLease.OutboxID != retryItem.OutboxID && dispatchingLease.OutboxID != dispatchingItem.OutboxID {
+		t.Fatalf("unexpected leased row: %+v", dispatchingLease)
+	}
+	// The manually retried row may sort first. Claim again if necessary so the
+	// cancellation target is actively dispatching.
+	if dispatchingLease.OutboxID != dispatchingItem.OutboxID {
+		dispatchingLease = mustLeaseOne(t, repository, LeaseRequest{
+			Owner: "worker", Now: clock.Now(), Duration: time.Minute, Limit: 1,
+		})
+	}
+	if err := repository.Cancel(ctx, dispatchingItem.OutboxID); !errors.Is(err, ErrInvalidOutboxState) {
+		t.Fatalf("Cancel(dispatching) error = %v, want ErrInvalidOutboxState", err)
+	}
+}
+
 func TestOutboxMigrationIsChecksummedAndStrict(t *testing.T) {
 	store, _ := openOutboxTestRepository(t, func() time.Time {
 		return time.UnixMilli(outboxTestTimeMS)
 	})
-	if len(embeddedMigrations) != 5 {
-		t.Fatalf("embedded migrations = %d, want 5", len(embeddedMigrations))
+	if len(embeddedMigrations) != 6 {
+		t.Fatalf("embedded migrations = %d, want 6", len(embeddedMigrations))
 	}
-	assertPragmaInt(t, store.db, "user_version", 5)
+	assertPragmaInt(t, store.db, "user_version", len(embeddedMigrations))
 	ledger := readLedgerRow(t, store.db, 5)
 	if ledger.name != "outbox" {
 		t.Fatalf("migration 0005 name = %q, want outbox", ledger.name)
 	}
 	if ledger.checksum != embeddedMigrations[4].checksumSHA256 {
 		t.Fatalf("migration 0005 checksum = %q, want %q", ledger.checksum, embeddedMigrations[4].checksumSHA256)
+	}
+	linkLedger := readLedgerRow(t, store.db, 6)
+	if linkLedger.name != "outbox_send_again" {
+		t.Fatalf("migration 0006 name = %q, want outbox_send_again", linkLedger.name)
+	}
+	if linkLedger.checksum != embeddedMigrations[5].checksumSHA256 {
+		t.Fatalf("migration 0006 checksum = %q, want %q", linkLedger.checksum, embeddedMigrations[5].checksumSHA256)
 	}
 	var strict int
 	if err := store.db.QueryRow(`
@@ -526,6 +841,19 @@ func outboxTestItem(id string) NewOutboxItem {
 		Operation:          "send_text",
 		LocalMessageID:     "message-" + id,
 		TransportRequestID: "request-" + id,
+	}
+}
+
+func outboxTestOutgoingMessage(item NewOutboxItem, body string) Message {
+	return Message{
+		MessageID:       item.LocalMessageID,
+		ConversationID:  item.ConversationID,
+		AccountID:       item.AccountID,
+		RemoteMessageID: item.TransportRequestID,
+		Direction:       MessageDirectionOutgoing,
+		Body:            body,
+		State:           MessageStateActive,
+		OccurredAtMS:    outboxTestTimeMS,
 	}
 }
 
