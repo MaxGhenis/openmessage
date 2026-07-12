@@ -196,12 +196,11 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 				if !status.Paired || status.Connected || status.Pairing || status.Connecting {
 					continue
 				}
-				// Skip reconnect when the account needs manual re-pairing.
-				// Hammering signal-cli every 5s with a known-bad account
-				// wastes resources and produces noise in the logs. The UI
-				// will show the needs_reauth state so the user knows to
-				// open Platforms and re-pair.
-				if status.NeedsReauth {
+				// Skip terminal states that require manual remediation.
+				// Hammering signal-cli every 5s with a known-bad account or
+				// binary wastes resources and produces noise in the logs. The
+				// status payload tells the UI whether to re-pair or upgrade.
+				if status.NeedsReauth || status.UpgradeRequired {
 					continue
 				}
 				if err := a.StartSignalConnect(); err != nil {

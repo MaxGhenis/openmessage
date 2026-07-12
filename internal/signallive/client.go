@@ -32,13 +32,61 @@ const (
 	receiveTimeoutSeconds = 2
 	receiveMaxMessages    = 100
 	receiveFailureLimit   = 3
+	receivePoisonLimit    = 2
 	receiveRecoveryWindow = 30 * time.Second
 	reactionMatchWindow   = 15 * time.Second
 	sendTimeout           = 20 * time.Second
 	syncRequestTimeout    = 10 * time.Second
 	postLinkProbeTimeout  = 5 * time.Second
+	versionProbeTimeout   = 5 * time.Second
 	historySyncQuietAfter = 45 * time.Second
+
+	signalGetSenderPoisonFingerprint = "incoming_message_get_sender_content_null"
 )
+
+var minimumSignalCLIVersion = signalCLIVersion{major: 0, minor: 14, patch: 5}
+
+type signalCLIVersion struct {
+	major int
+	minor int
+	patch int
+}
+
+func parseSignalCLIVersion(output []byte) (signalCLIVersion, bool) {
+	for _, line := range strings.Split(string(output), "\n") {
+		fields := strings.Fields(sanitizeSignalOutput(line))
+		for i := 0; i+1 < len(fields); i++ {
+			if fields[i] != "signal-cli" {
+				continue
+			}
+			parts := strings.Split(fields[i+1], ".")
+			if len(parts) != 3 {
+				continue
+			}
+			major, majorErr := strconv.Atoi(parts[0])
+			minor, minorErr := strconv.Atoi(parts[1])
+			patch, patchErr := strconv.Atoi(parts[2])
+			if majorErr == nil && minorErr == nil && patchErr == nil {
+				return signalCLIVersion{major: major, minor: minor, patch: patch}, true
+			}
+		}
+	}
+	return signalCLIVersion{}, false
+}
+
+func (v signalCLIVersion) less(other signalCLIVersion) bool {
+	if v.major != other.major {
+		return v.major < other.major
+	}
+	if v.minor != other.minor {
+		return v.minor < other.minor
+	}
+	return v.patch < other.patch
+}
+
+func (v signalCLIVersion) String() string {
+	return fmt.Sprintf("%d.%d.%d", v.major, v.minor, v.patch)
+}
 
 func isSignalIdleReceiveTimeout(err error, timedOut bool, output []byte) bool {
 	if len(bytes.TrimSpace(output)) != 0 {
@@ -50,8 +98,18 @@ func isSignalIdleReceiveTimeout(err error, timedOut bool, output []byte) bool {
 var (
 	now = time.Now
 
-	signalCLILookPath = exec.LookPath
-	signalCLIStat     = os.Stat
+	signalCLILookPath     = exec.LookPath
+	signalCLIStat         = os.Stat
+	probeSignalCLIVersion = func(ctx context.Context) ([]byte, error) {
+		cmd := exec.CommandContext(ctx, signalCLIExecutable(), "--version")
+		tmpDir, cleanupTmp, tmpErr := newSignalRunTmpDir()
+		if tmpErr == nil {
+			cmd.Env = signalCLIEnv(os.Environ(), tmpDir)
+			defer cleanupTmp()
+		}
+		configureSignalCancel(cmd)
+		return cmd.CombinedOutput()
+	}
 
 	runSignalCLI = func(ctx context.Context, configDir string, args ...string) ([]byte, error) {
 		commandArgs := append([]string{"--config", configDir}, args...)
@@ -118,14 +176,15 @@ type Callbacks struct {
 }
 
 type StatusSnapshot struct {
-	Connected   bool   `json:"connected"`
-	Connecting  bool   `json:"connecting"`
-	Paired      bool   `json:"paired"`
-	Pairing     bool   `json:"pairing"`
-	Account     string `json:"account,omitempty"`
-	LastError   string `json:"last_error,omitempty"`
-	QRAvailable bool   `json:"qr_available"`
-	QRUpdatedAt int64  `json:"qr_updated_at,omitempty"`
+	Connected       bool   `json:"connected"`
+	Connecting      bool   `json:"connecting"`
+	Paired          bool   `json:"paired"`
+	Pairing         bool   `json:"pairing"`
+	Account         string `json:"account,omitempty"`
+	LastError       string `json:"last_error,omitempty"`
+	QRAvailable     bool   `json:"qr_available"`
+	QRUpdatedAt     int64  `json:"qr_updated_at,omitempty"`
+	UpgradeRequired bool   `json:"upgrade_required,omitempty"`
 	// NeedsReauth is set when signal-cli reports that the stored account is
 	// no longer registered / authorized (e.g. user re-registered Signal on a
 	// new phone, or the linked device was unlinked remotely). When true,
@@ -191,6 +250,10 @@ type Bridge struct {
 	// reconnect. While set, the reconnect ticker skips this bridge so we
 	// don't hammer signal-cli with a known-bad account every 5 seconds.
 	needsReauth bool
+	// upgradeRequired is a terminal receive state for an unsupported
+	// signal-cli version or its known poison-envelope crash. Automatic
+	// reconnects stay parked until a manual connect re-runs the version gate.
+	upgradeRequired bool
 
 	pairCancel    context.CancelFunc
 	receiveCancel context.CancelFunc
@@ -414,7 +477,7 @@ func signalCLIExecutable() string {
 
 func (b *Bridge) ConnectIfPaired() error {
 	b.mu.Lock()
-	if b.pairing || b.connecting || b.connected {
+	if b.pairing || b.connecting || b.connected || b.upgradeRequired {
 		b.mu.Unlock()
 		return nil
 	}
@@ -446,6 +509,7 @@ func (b *Bridge) Connect() error {
 		}
 		b.connecting = true
 		b.needsReauth = false
+		b.upgradeRequired = false
 		b.lastError = ""
 		account := b.account
 		b.mu.Unlock()
@@ -462,6 +526,7 @@ func (b *Bridge) Connect() error {
 	b.pairing = true
 	b.connecting = true
 	b.needsReauth = false
+	b.upgradeRequired = false
 	b.lastError = ""
 	b.qr = QRSnapshot{}
 	b.mu.Unlock()
@@ -485,6 +550,7 @@ func (b *Bridge) Unpair() error {
 	b.pairing = false
 	b.account = ""
 	b.needsReauth = false
+	b.upgradeRequired = false
 	b.lastError = ""
 	b.qr = QRSnapshot{}
 	b.historySync = struct {
@@ -506,16 +572,17 @@ func (b *Bridge) Status() StatusSnapshot {
 		account = b.firstStoredAccount()
 	}
 	snapshot := StatusSnapshot{
-		Connected:   b.connected,
-		Connecting:  b.connecting,
-		Paired:      account != "",
-		Pairing:     b.pairing,
-		Account:     account,
-		LastError:   b.lastError,
-		QRAvailable: b.qr.URI != "",
-		QRUpdatedAt: b.qr.UpdatedAt,
-		NeedsReauth: b.needsReauth,
-		HistorySync: b.historySyncSnapshotLocked(),
+		Connected:       b.connected,
+		Connecting:      b.connecting,
+		Paired:          account != "",
+		Pairing:         b.pairing,
+		Account:         account,
+		LastError:       b.lastError,
+		QRAvailable:     b.qr.URI != "",
+		QRUpdatedAt:     b.qr.UpdatedAt,
+		UpgradeRequired: b.upgradeRequired,
+		NeedsReauth:     b.needsReauth,
+		HistorySync:     b.historySyncSnapshotLocked(),
 	}
 	b.mu.RUnlock()
 	snapshot.ReceiveRecovery = b.receiveRecoveryStatus()
@@ -853,6 +920,7 @@ func (b *Bridge) startReceiveLoop(account string, requestSync bool) {
 		}
 	}()
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	b.mu.Lock()
 	if b.receiveCancel != nil {
 		b.receiveCancel()
@@ -861,6 +929,38 @@ func (b *Bridge) startReceiveLoop(account string, requestSync bool) {
 	token := b.receiveToken
 	b.receiveCancel = cancel
 	b.mu.Unlock()
+
+	versionCtx, versionCancel := context.WithTimeout(ctx, versionProbeTimeout)
+	versionOutput, versionErr := probeSignalCLIVersion(versionCtx)
+	versionCancel()
+	if ctx.Err() != nil {
+		b.mu.Lock()
+		if b.receiveToken == token {
+			b.receiveCancel = nil
+			b.connected = false
+			b.connecting = false
+		}
+		b.mu.Unlock()
+		return
+	}
+	version, versionDetected := parseSignalCLIVersion(versionOutput)
+	if versionDetected && version.less(minimumSignalCLIVersion) {
+		b.parkUpgradeRequired(token, fmt.Sprintf(
+			"signal-cli %s is below the required minimum %s; upgrade signal-cli to continue receiving messages",
+			version, minimumSignalCLIVersion,
+		))
+		return
+	}
+	if !versionDetected {
+		event := b.logger.Warn()
+		if versionErr != nil {
+			event = event.Err(versionErr)
+		}
+		if output := strings.TrimSpace(string(versionOutput)); output != "" {
+			event = event.Str("output", output)
+		}
+		event.Msg("Unable to detect signal-cli version; continuing receive without version gate")
+	}
 
 	probedAccount, err := b.probeAccount(ctx, account)
 	if err != nil || probedAccount == "" {
@@ -885,6 +985,7 @@ func (b *Bridge) startReceiveLoop(account string, requestSync bool) {
 	b.connected = true
 	b.connecting = false
 	b.needsReauth = false // successful connect clears any prior re-auth flag
+	b.upgradeRequired = false
 	b.lastError = ""
 	b.mu.Unlock()
 	b.emitStatusChange()
@@ -898,6 +999,8 @@ func (b *Bridge) startReceiveLoop(account string, requestSync bool) {
 	}
 
 	consecutiveFailures := 0
+	consecutivePoisonFailures := 0
+	lastPoisonFingerprint := ""
 	for {
 		select {
 		case <-ctx.Done():
@@ -928,6 +1031,8 @@ func (b *Bridge) startReceiveLoop(account string, requestSync bool) {
 		if err != nil {
 			if isSignalIdleReceiveTimeout(err, timedOut, output) {
 				consecutiveFailures = 0
+				consecutivePoisonFailures = 0
+				lastPoisonFingerprint = ""
 				continue
 			}
 			if isSignalAccountInvalid(err, output) {
@@ -949,8 +1054,25 @@ func (b *Bridge) startReceiveLoop(account string, requestSync bool) {
 				b.emitStatusChange()
 				return
 			}
+			poisonFingerprint := signalReceivePoisonFingerprint(err, output)
+			if poisonFingerprint == "" {
+				consecutivePoisonFailures = 0
+				lastPoisonFingerprint = ""
+			} else if poisonFingerprint == lastPoisonFingerprint {
+				consecutivePoisonFailures++
+			} else {
+				lastPoisonFingerprint = poisonFingerprint
+				consecutivePoisonFailures = 1
+			}
 			consecutiveFailures++
 			receiveErr := commandError("receive Signal messages", err, output)
+			if consecutivePoisonFailures >= receivePoisonLimit {
+				b.parkUpgradeRequired(token, fmt.Sprintf(
+					"signal-cli repeatedly failed in IncomingMessageHandler.getSender() because content is null; upgrade signal-cli to %s or newer",
+					minimumSignalCLIVersion,
+				))
+				return
+			}
 			if consecutiveFailures >= receiveFailureLimit {
 				b.logger.Warn().Err(receiveErr).Int("failures", consecutiveFailures).Msg("Signal receive polling repeatedly failed; forcing reconnect")
 				b.mu.Lock()
@@ -969,6 +1091,8 @@ func (b *Bridge) startReceiveLoop(account string, requestSync bool) {
 			continue
 		}
 		consecutiveFailures = 0
+		consecutivePoisonFailures = 0
+		lastPoisonFingerprint = ""
 		if len(bytes.TrimSpace(output)) == 0 {
 			continue
 		}
@@ -976,6 +1100,25 @@ func (b *Bridge) startReceiveLoop(account string, requestSync bool) {
 			b.logger.Debug().Err(err).Msg("Failed to process Signal receive payload")
 		}
 	}
+}
+
+func (b *Bridge) parkUpgradeRequired(token uint64, detail string) {
+	detail = strings.TrimSpace(detail)
+	b.mu.Lock()
+	if b.receiveToken != token {
+		b.mu.Unlock()
+		return
+	}
+	b.receiveCancel = nil
+	b.connected = false
+	b.connecting = false
+	b.needsReauth = false
+	b.upgradeRequired = true
+	b.lastError = detail
+	account := b.account
+	b.mu.Unlock()
+	b.logger.Warn().Str("account", account).Msg(detail)
+	b.emitStatusChange()
 }
 
 // maybeSweepTmp runs the crash-backstop sweeps at most once per
@@ -3155,6 +3298,16 @@ func isSignalAccountInvalid(err error, output []byte) bool {
 	return strings.Contains(text, "not registered") ||
 		strings.Contains(text, "authorization failed") ||
 		strings.Contains(text, "invalid account")
+}
+
+func signalReceivePoisonFingerprint(err error, output []byte) string {
+	text := strings.ToLower(cleanSignalCommandOutput(err, output))
+	text = strings.NewReplacer(`"`, "", `'`, "").Replace(text)
+	if strings.Contains(text, "getsender") &&
+		strings.Contains(text, "content is null") {
+		return signalGetSenderPoisonFingerprint
+	}
+	return ""
 }
 
 func uniqueStrings(items []string) []string {
