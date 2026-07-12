@@ -335,5 +335,8 @@ func UpdateSessionCookies(sessionPath string, cookies map[string]string) error {
 	if err := os.WriteFile(tmp, append(updated, '\n'), 0o600); err != nil {
 		return fmt.Errorf("write session: %w", err)
 	}
+	if err := os.Chmod(tmp, 0o600); err != nil {
+		return fmt.Errorf("secure session: %w", err)
+	}
 	return os.Rename(tmp, sessionPath)
 }
