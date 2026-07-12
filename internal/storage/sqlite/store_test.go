@@ -73,6 +73,7 @@ func TestOpenInitializesBlankDatabase(t *testing.T) {
 	}
 	wantTables := []string{
 		"accounts",
+		"attachments",
 		"conversation_participants",
 		"conversations",
 		"devices",
