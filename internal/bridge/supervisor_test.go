@@ -315,44 +315,99 @@ func TestSupervisorRateLimitedHonorsRetryAt(t *testing.T) {
 	}
 }
 
-func TestSupervisorRepeatedFingerprintOpensCircuit(t *testing.T) {
+func TestSupervisorRepeatedTransientFingerprintRecoversAfterCircuitThreshold(t *testing.T) {
 	clock := newSupervisorManualClock(supervisorTestEpoch)
 	policy := supervisorTestPolicy()
 	policy.MaxSameFingerprint = 3
-	lifecycle := &supervisorTestLifecycle{scripts: []supervisorStartScript{
-		{err: transientSupervisorError("same-poison")},
-		{err: transientSupervisorError("same-poison")},
-		{err: transientSupervisorError("same-poison")},
-	}}
-	random := &supervisorScriptedRandom{values: []int64{
-		int64(time.Second),
-		int64(2 * time.Second),
-	}}
+	const transientFailures = 6
+	recoveredRun := newSupervisorTestRun()
+	scripts := make([]supervisorStartScript, 0, transientFailures+1)
+	randomValues := make([]int64, 0, transientFailures)
+	for range transientFailures {
+		scripts = append(scripts, supervisorStartScript{
+			err: transientSupervisorError("connect_failed"),
+		})
+		randomValues = append(randomValues, int64(time.Second))
+	}
+	scripts = append(scripts, supervisorStartScript{run: recoveredRun})
+	lifecycle := &supervisorTestLifecycle{scripts: scripts}
+	random := &supervisorScriptedRandom{values: randomValues}
 	supervisor := newTestSupervisor(t, lifecycle, policy, clock, random)
 
 	if err := supervisorStart(t, supervisor, StartRequest{}); err == nil {
 		t.Fatal("Start() error = nil, want transient failure")
 	}
-	for generation := Generation(1); generation < 3; generation++ {
-		snapshot := awaitSupervisorSnapshot(t, supervisor, "pre-circuit backoff", func(snapshot Snapshot) bool {
+	for generation := Generation(1); generation <= transientFailures; generation++ {
+		snapshot := awaitSupervisorSnapshot(t, supervisor, "transient backoff", func(snapshot Snapshot) bool {
 			return snapshot.State == StateBackoff && snapshot.Generation == generation
 		})
+		if snapshot.ErrorClass != FailureTransient || snapshot.ErrorFingerprint != "connect_failed" {
+			t.Fatalf("generation %d snapshot = %+v, want transient connect_failed backoff", generation, snapshot)
+		}
 		clock.Advance(snapshot.RetryAt.Sub(clock.Now()))
 		awaitSupervisorStartCount(t, lifecycle, int(generation)+1)
 	}
-	blocked := awaitSupervisorSnapshot(t, supervisor, "open circuit", func(snapshot Snapshot) bool {
-		return snapshot.State == StateBlocked && snapshot.Generation == 3
+
+	recoveredRun.MarkReady()
+	online := awaitSupervisorSnapshot(t, supervisor, "automatic recovery", func(snapshot Snapshot) bool {
+		return snapshot.State == StateOnline && snapshot.Generation == transientFailures+1
 	})
-	if blocked.ErrorFingerprint != "same-poison" || blocked.ErrorClass != FailureTransient {
-		t.Fatalf("circuit snapshot = %+v", blocked)
+	if !online.RetryAt.IsZero() || online.ErrorClass != "" || online.ErrorFingerprint != "" {
+		t.Fatalf("recovered snapshot retains failure state: %+v", online)
 	}
-	if !blocked.RetryAt.IsZero() {
-		t.Fatalf("circuit RetryAt = %s, want zero", blocked.RetryAt)
+}
+
+func TestSupervisorRepeatedCredentialFingerprintStillOpensCircuit(t *testing.T) {
+	clock := newSupervisorManualClock(supervisorTestEpoch)
+	policy := supervisorTestPolicy()
+	policy.MaxSameFingerprint = 3
+	failure := OpError{
+		Class:       FailureCredentialsExpired,
+		Operation:   "start",
+		Fingerprint: "expired-cookie-set",
+	}
+	lifecycle := &supervisorTestLifecycle{scripts: []supervisorStartScript{
+		{err: failure},
+		{err: failure},
+		{err: failure},
+	}}
+	repairer := newSupervisorControlledRepairer()
+	supervisor := newTestSupervisor(
+		t,
+		lifecycle,
+		policy,
+		clock,
+		&supervisorScriptedRandom{},
+		WithCredentialRepairer(repairer),
+	)
+
+	if err := supervisorStart(t, supervisor, StartRequest{}); err == nil {
+		t.Fatal("Start() error = nil, want credentials-expired failure")
+	}
+	for generation := Generation(1); generation < Generation(policy.MaxSameFingerprint); generation++ {
+		call := receiveSupervisorValue(t, repairer.started, "credential repair start")
+		if call.failure.Fingerprint != failure.Fingerprint {
+			t.Fatalf("generation %d repair fingerprint = %q, want %q", generation, call.failure.Fingerprint, failure.Fingerprint)
+		}
+		sendSupervisorValue(t, repairer.responses, error(nil), "successful credential repair")
+		awaitSupervisorStartCount(t, lifecycle, int(generation)+1)
+	}
+
+	blocked := awaitSupervisorSnapshot(t, supervisor, "credential circuit", func(snapshot Snapshot) bool {
+		return snapshot.State == StateBlocked && snapshot.Generation == Generation(policy.MaxSameFingerprint)
+	})
+	if blocked.ErrorClass != FailureCredentialsExpired || blocked.ErrorFingerprint != failure.Fingerprint {
+		t.Fatalf("credential circuit snapshot = %+v", blocked)
+	}
+	select {
+	case call := <-repairer.started:
+		t.Fatalf("credential repair ran after circuit opened: %+v", call)
+	default:
 	}
 	clock.Advance(24 * time.Hour)
 	supervisorSync(t, supervisor)
-	if got := lifecycle.CallCount(); got != 3 {
-		t.Fatalf("starts after circuit opened = %d, want 3", got)
+	if got := lifecycle.CallCount(); got != policy.MaxSameFingerprint {
+		t.Fatalf("starts after credential circuit opened = %d, want %d", got, policy.MaxSameFingerprint)
 	}
 }
 

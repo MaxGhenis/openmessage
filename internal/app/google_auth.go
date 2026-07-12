@@ -29,9 +29,12 @@ func (a *App) HandleGoogleAuthExpiredError(err error) bool {
 		return false
 	}
 	a.Connected.Store(false)
-	a.googleAuthExpired.Store(true)
+	firstNotification := a.googleAuthExpired.CompareAndSwap(false, true)
 	a.setGoogleLastError(googleAuthExpiredStatusMessage)
 	a.emitStatusChange(false)
 	a.Logger.Warn().Err(err).Msg("Google auth expired; marking disconnected")
+	if firstNotification {
+		a.reportGoogleLifecycleError(err)
+	}
 	return true
 }

@@ -1136,7 +1136,7 @@ func (l *supervisorLoop) routeFailure(failure OpError) {
 	l.snapshot.RetryAt = time.Time{}
 	l.snapshot.LivenessDeadline = time.Time{}
 
-	if l.recordFingerprint(failure.Fingerprint) {
+	if l.recordFingerprint(failure.Class, failure.Fingerprint) {
 		l.snapshot.State = StateBlocked
 		l.publish()
 		return
@@ -1179,7 +1179,14 @@ func (l *supervisorLoop) routeFailure(failure OpError) {
 	}
 }
 
-func (l *supervisorLoop) recordFingerprint(fingerprint string) bool {
+func (l *supervisorLoop) recordFingerprint(class FailureClass, fingerprint string) bool {
+	// Connectivity failures are paced by bounded exponential backoff and must
+	// remain recoverable without user action, even when every attempt reports
+	// the same transport fingerprint. The circuit remains available for
+	// repeated non-transient failures such as an ineffective credential repair.
+	if class == FailureTransient {
+		return false
+	}
 	if fingerprint == "" {
 		l.sameFingerprint = ""
 		l.sameFailureCount = 0
