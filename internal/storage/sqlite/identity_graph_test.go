@@ -162,10 +162,10 @@ func openIdentityGraphTestStore(t *testing.T) *Store {
 		}
 	})
 
-	if len(embeddedMigrations) != 3 {
-		t.Fatalf("embedded migrations = %d, want 3", len(embeddedMigrations))
+	if len(embeddedMigrations) != 4 {
+		t.Fatalf("embedded migrations = %d, want 4", len(embeddedMigrations))
 	}
-	assertPragmaInt(t, store.db, "user_version", 3)
+	assertPragmaInt(t, store.db, "user_version", len(embeddedMigrations))
 	ledger := readLedgerRow(t, store.db, 2)
 	if ledger.name != "identity_graph" {
 		t.Fatalf("migration 0002 name = %q, want identity_graph", ledger.name)
