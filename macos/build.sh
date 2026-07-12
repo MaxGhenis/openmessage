@@ -7,7 +7,8 @@ BUILD_DIR="$SCRIPT_DIR/build"
 APP_NAME="OpenMessage"
 APP_BUNDLE="$BUILD_DIR/$APP_NAME.app"
 DMG_PATH="$BUILD_DIR/$APP_NAME.dmg"
-ENTITLEMENTS="$SCRIPT_DIR/OpenMessage.entitlements"
+APP_ENTITLEMENTS="$SCRIPT_DIR/OpenMessage.entitlements"
+HELPER_ENTITLEMENTS="$SCRIPT_DIR/OpenMessageHelper.entitlements"
 
 # ── Notarization config ──
 # Set these env vars to enable code signing + notarization:
@@ -97,12 +98,12 @@ if [ -n "$SIGN_IDENTITY" ]; then
     echo "   Signing with: $SIGN_IDENTITY"
     # Sign the Go binary first
     codesign --force --options runtime \
-        --entitlements "$ENTITLEMENTS" \
+        --entitlements "$HELPER_ENTITLEMENTS" \
         --sign "$SIGN_IDENTITY" \
         "$APP_BUNDLE/Contents/Resources/openmessage"
     # Sign the main app
     codesign --force --options runtime \
-        --entitlements "$ENTITLEMENTS" \
+        --entitlements "$APP_ENTITLEMENTS" \
         --sign "$SIGN_IDENTITY" \
         "$APP_BUNDLE"
 else

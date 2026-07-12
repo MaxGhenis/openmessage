@@ -290,14 +290,51 @@ func New(logger zerolog.Logger) (*App, error) {
 		}
 		return nil, fmt.Errorf("create data dir: %w", err)
 	}
+	if err := os.Chmod(dataDir, 0700); err != nil {
+		if tempDataDir != "" {
+			_ = os.RemoveAll(tempDataDir)
+		}
+		return nil, fmt.Errorf("secure data dir: %w", err)
+	}
 
 	dbPath := filepath.Join(dataDir, "messages.db")
+	sessionPath := filepath.Join(dataDir, "session.json")
+	whatsAppSessionPath := filepath.Join(dataDir, "whatsapp-session.db")
+	signalConfigPath := filepath.Join(dataDir, "signal-cli")
+	for _, path := range []string{
+		dbPath,
+		dbPath + "-wal",
+		dbPath + "-shm",
+		dbPath + "-journal",
+		sessionPath,
+		sessionPath + ".tmp",
+		whatsAppSessionPath,
+		whatsAppSessionPath + "-wal",
+		whatsAppSessionPath + "-shm",
+		whatsAppSessionPath + "-journal",
+	} {
+		if err := chmodIfExists(path, 0600); err != nil {
+			if tempDataDir != "" {
+				_ = os.RemoveAll(tempDataDir)
+			}
+			return nil, fmt.Errorf("secure state file %q: %w", path, err)
+		}
+	}
 	store, err := db.New(dbPath)
 	if err != nil {
 		if tempDataDir != "" {
 			_ = os.RemoveAll(tempDataDir)
 		}
 		return nil, fmt.Errorf("open db: %w", err)
+	}
+	for _, path := range []string{dbPath, dbPath + "-wal", dbPath + "-shm"} {
+		if err := chmodIfExists(path, 0600); err != nil {
+			store.Close()
+			if tempDataDir != "" {
+				_ = os.RemoveAll(tempDataDir)
+			}
+			return nil, fmt.Errorf("secure database file %q: %w", path, err)
+		}
 	}
 	if report, err := store.RepairLegacyArtifacts(); err != nil {
 		logger.Warn().Err(err).Msg("Failed to repair legacy message artifacts")
@@ -376,10 +413,6 @@ func New(logger zerolog.Logger) (*App, error) {
 			Msg("Demo mode — using isolated fake data")
 	}
 
-	sessionPath := filepath.Join(dataDir, "session.json")
-	whatsAppSessionPath := filepath.Join(dataDir, "whatsapp-session.db")
-	signalConfigPath := filepath.Join(dataDir, "signal-cli")
-
 	app := &App{
 		Store:               store,
 		Logger:              logger,
@@ -390,6 +423,13 @@ func New(logger zerolog.Logger) (*App, error) {
 		tempDataDir:         tempDataDir,
 	}
 	return app, nil
+}
+
+func chmodIfExists(path string, mode os.FileMode) error {
+	if err := os.Chmod(path, mode); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
 }
 
 func LocalIdentityName() string {

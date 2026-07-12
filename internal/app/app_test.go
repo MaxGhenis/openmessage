@@ -62,6 +62,58 @@ func TestNewDemoUsesIsolatedTempDataDir(t *testing.T) {
 	}
 }
 
+func TestNewEnforcesPrivateDataModes(t *testing.T) {
+	dataDir := filepath.Join(t.TempDir(), "data")
+	if err := os.MkdirAll(dataDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(): %v", err)
+	}
+	if err := os.Chmod(dataDir, 0o755); err != nil {
+		t.Fatalf("Chmod(data dir): %v", err)
+	}
+
+	for _, name := range []string{"messages.db", "session.json", "whatsapp-session.db"} {
+		path := filepath.Join(dataDir, name)
+		if err := os.WriteFile(path, nil, 0o644); err != nil {
+			t.Fatalf("WriteFile(%s): %v", name, err)
+		}
+		if err := os.Chmod(path, 0o644); err != nil {
+			t.Fatalf("Chmod(%s): %v", name, err)
+		}
+	}
+
+	t.Setenv("OPENMESSAGES_DATA_DIR", dataDir)
+	t.Setenv("OPENMESSAGES_DEMO", "0")
+	t.Setenv("OPENMESSAGES_APP_SANDBOX", "1")
+
+	a, err := New(zerolog.Nop())
+	if err != nil {
+		t.Fatalf("New(): %v", err)
+	}
+	defer a.Close()
+
+	if err := client.SaveSession(a.SessionPath, &client.SessionData{AuthDataJSON: []byte(`{}`)}); err != nil {
+		t.Fatalf("SaveSession(): %v", err)
+	}
+
+	for _, tc := range []struct {
+		path string
+		want os.FileMode
+	}{
+		{path: dataDir, want: 0o700},
+		{path: filepath.Join(dataDir, "messages.db"), want: 0o600},
+		{path: a.SessionPath, want: 0o600},
+		{path: a.WhatsAppSessionPath, want: 0o600},
+	} {
+		info, err := os.Stat(tc.path)
+		if err != nil {
+			t.Fatalf("Stat(%s): %v", tc.path, err)
+		}
+		if got := info.Mode().Perm(); got != tc.want {
+			t.Errorf("%s mode = %04o, want %04o", tc.path, got, tc.want)
+		}
+	}
+}
+
 func TestDemoModeEnvParsing(t *testing.T) {
 	t.Run("disabled when empty", func(t *testing.T) {
 		t.Setenv("OPENMESSAGES_DEMO", "")

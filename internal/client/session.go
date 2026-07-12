@@ -13,8 +13,12 @@ type SessionData struct {
 }
 
 func SaveSession(path string, data *SessionData) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0700); err != nil {
 		return fmt.Errorf("create dir: %w", err)
+	}
+	if err := os.Chmod(dir, 0700); err != nil {
+		return fmt.Errorf("secure dir: %w", err)
 	}
 	b, err := json.MarshalIndent(data, "", "  ")
 	if err != nil {
@@ -22,6 +26,9 @@ func SaveSession(path string, data *SessionData) error {
 	}
 	if err := os.WriteFile(path, b, 0600); err != nil {
 		return fmt.Errorf("write: %w", err)
+	}
+	if err := os.Chmod(path, 0600); err != nil {
+		return fmt.Errorf("secure: %w", err)
 	}
 	return nil
 }
