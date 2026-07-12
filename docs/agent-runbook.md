@@ -125,12 +125,28 @@ is hardened-runtime only) so the backend can read Chrome's cookie DB and the
 `Chrome Safe Storage` keychain item. First keychain read may prompt once;
 Always Allow persists it.
 
+### gmessages fork contract
+
 **Root cause of the repeated deaths (fixed in #73):** the `MaxGhenis/gmessages`
 fork was frozen at its 2026-03-02 base and missed upstream's 2026-05-05
-`libgm/longpoll: retry on network error when refreshing auth token`. Without it
-a single transient network blip during a scheduled token refresh permanently
-killed the session. Keep the fork rebased on upstream. The durable
-architectural fix (move SMS/RCS onto an Android companion) is issue #75.
+[`libgm/longpoll: retry on network error when refreshing auth token`](https://github.com/mautrix/gmessages/commit/0b54a8fe65207f81d353ffe63f4d2549c2eb7976).
+Without it, a single transient network blip during a scheduled token refresh
+permanently killed the session.
+
+The replacement in `go.mod` pins fork commit
+[`0e43542dfa0e`](https://github.com/MaxGhenis/gmessages/commit/0e43542dfa0e0b97e410f185a5842e8740106099).
+It is upstream `mautrix/gmessages` base
+[`3433cc07d5ea`](https://github.com/mautrix/gmessages/commit/3433cc07d5ea9522309adad3a8c92ed5b08dc11d),
+which contains the auth-refresh retry, plus exactly one carried patch:
+`Add ListConversationsWithCursor for paginated conversation listing`. That
+method is required by OpenMessage's backfill and reconciliation paths.
+
+**Keep the fork rebased on upstream.** The weekly
+`gmessages-fork-drift.yml` workflow records the base and patch set and fails as
+soon as upstream `main` advances. When rebasing, replay the single carried
+patch, verify the auth-refresh retry is still present, and update the fork pin
+and recorded SHAs together. The durable architectural fix (move SMS/RCS onto
+an Android companion) is issue #75.
 
 ### Don't over-reconnect
 
