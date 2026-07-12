@@ -39,8 +39,12 @@ type appliedMigration struct {
 //go:embed migrations/0001_storage_shell.sql
 var migration0001SQL string
 
+//go:embed migrations/0002_identity_graph.sql
+var migration0002SQL string
+
 var embeddedMigrations = []migration{
 	newMigration(1, "storage_shell", migration0001SQL, newStorageShellArguments),
+	newMigration(2, "identity_graph", migration0002SQL, nil),
 }
 
 func newMigration(

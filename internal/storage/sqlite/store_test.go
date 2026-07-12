@@ -71,7 +71,17 @@ func TestOpenInitializesBlankDatabase(t *testing.T) {
 	if err := rows.Close(); err != nil {
 		t.Fatalf("close user table rows: %v", err)
 	}
-	wantTables := []string{"schema_migrations", "store_metadata"}
+	wantTables := []string{
+		"accounts",
+		"conversation_participants",
+		"conversations",
+		"devices",
+		"identities",
+		"people",
+		"person_identities",
+		"schema_migrations",
+		"store_metadata",
+	}
 	if !slices.Equal(tables, wantTables) {
 		t.Fatalf("user tables = %v, want %v", tables, wantTables)
 	}
@@ -90,7 +100,7 @@ func TestOpenInitializesBlankDatabase(t *testing.T) {
 		}
 	}
 
-	ledger := readLedgerRow(t, store.db)
+	ledger := readLedgerRow(t, store.db, 1)
 	if ledger.version != 1 {
 		t.Errorf("ledger version = %d, want 1", ledger.version)
 	}
@@ -137,7 +147,8 @@ func TestOpenInitializesBlankDatabase(t *testing.T) {
 		t.Errorf("store created_at_ms = %d, want > 0", createdAtMS)
 	}
 
-	assertPragmaInt(t, store.db, "user_version", 1)
+	assertRowCount(t, store.db, "schema_migrations", len(embeddedMigrations))
+	assertPragmaInt(t, store.db, "user_version", len(embeddedMigrations))
 	assertPragmaInt(t, store.db, "application_id", applicationID)
 	assertPragmaInt(t, store.db, "foreign_keys", 1)
 	assertPragmaInt(t, store.db, "busy_timeout", busyTimeoutMS)
@@ -162,7 +173,7 @@ func TestOpenReopenIsIdempotent(t *testing.T) {
 		_ = first.Close()
 		t.Fatalf("first StoreInstanceID(): %v", err)
 	}
-	firstLedger := readLedgerRow(t, first.db)
+	firstLedger := readLedgerRows(t, first.db)
 	if err := first.Close(); err != nil {
 		t.Fatalf("first Close(): %v", err)
 	}
@@ -183,14 +194,14 @@ func TestOpenReopenIsIdempotent(t *testing.T) {
 	if secondID != firstID {
 		t.Errorf("instance ID changed on reopen: first %q, second %q", firstID, secondID)
 	}
-	secondLedger := readLedgerRow(t, second.db)
-	if secondLedger != firstLedger {
+	secondLedger := readLedgerRows(t, second.db)
+	if !slices.Equal(secondLedger, firstLedger) {
 		t.Errorf("migration ledger changed on reopen:\nfirst:  %+v\nsecond: %+v", firstLedger, secondLedger)
 	}
 
-	assertRowCount(t, second.db, "schema_migrations", 1)
+	assertRowCount(t, second.db, "schema_migrations", len(embeddedMigrations))
 	assertRowCount(t, second.db, "store_metadata", 1)
-	assertPragmaInt(t, second.db, "user_version", 1)
+	assertPragmaInt(t, second.db, "user_version", len(embeddedMigrations))
 }
 
 func TestOpenRejectsAppliedMigrationChecksumMismatch(t *testing.T) {
@@ -303,7 +314,7 @@ func TestConcurrentOpenInitializesOnce(t *testing.T) {
 	if finalID != instanceID {
 		t.Errorf("final instance ID = %q, concurrent ID = %q", finalID, instanceID)
 	}
-	assertRowCount(t, store.db, "schema_migrations", 1)
+	assertRowCount(t, store.db, "schema_migrations", len(embeddedMigrations))
 	assertRowCount(t, store.db, "store_metadata", 1)
 }
 
@@ -320,7 +331,7 @@ func TestFailedMigrationRollsBackDDLAndLedger(t *testing.T) {
 	})
 
 	testMigrations := append([]migration(nil), embeddedMigrations...)
-	testMigrations = append(testMigrations, newMigration(2, "broken", `
+	testMigrations = append(testMigrations, newMigration(len(testMigrations)+1, "broken", `
 		CREATE TABLE migration_should_rollback (id INTEGER) STRICT;
 		THIS IS NOT VALID SQL;
 	`, nil))
@@ -341,17 +352,18 @@ func TestFailedMigrationRollsBackDDLAndLedger(t *testing.T) {
 	if tableExists {
 		t.Error("failed migration left partial DDL behind")
 	}
-	assertRowCount(t, store.db, "schema_migrations", 1)
-	assertPragmaInt(t, store.db, "user_version", 1)
+	assertRowCount(t, store.db, "schema_migrations", len(embeddedMigrations))
+	assertPragmaInt(t, store.db, "user_version", len(embeddedMigrations))
 }
 
-func readLedgerRow(t *testing.T, db *sql.DB) ledgerRow {
+func readLedgerRow(t *testing.T, db *sql.DB, version int) ledgerRow {
 	t.Helper()
 	var row ledgerRow
 	if err := db.QueryRow(`
 		SELECT version, name, checksum_sha256, applied_at_ms, app_version, execution_ms
 		FROM schema_migrations
-	`).Scan(
+		WHERE version = ?
+	`, version).Scan(
 		&row.version,
 		&row.name,
 		&row.checksum,
@@ -362,6 +374,39 @@ func readLedgerRow(t *testing.T, db *sql.DB) ledgerRow {
 		t.Fatalf("read migration ledger row: %v", err)
 	}
 	return row
+}
+
+func readLedgerRows(t *testing.T, db *sql.DB) []ledgerRow {
+	t.Helper()
+	rows, err := db.Query(`
+		SELECT version, name, checksum_sha256, applied_at_ms, app_version, execution_ms
+		FROM schema_migrations
+		ORDER BY version
+	`)
+	if err != nil {
+		t.Fatalf("read migration ledger: %v", err)
+	}
+	defer rows.Close()
+
+	var ledger []ledgerRow
+	for rows.Next() {
+		var row ledgerRow
+		if err := rows.Scan(
+			&row.version,
+			&row.name,
+			&row.checksum,
+			&row.appliedAtMS,
+			&row.appVersion,
+			&row.executionMS,
+		); err != nil {
+			t.Fatalf("scan migration ledger row: %v", err)
+		}
+		ledger = append(ledger, row)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate migration ledger: %v", err)
+	}
+	return ledger
 }
 
 func assertRowCount(t *testing.T, db *sql.DB, table string, want int) {
