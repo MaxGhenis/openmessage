@@ -13,5 +13,10 @@ let package = Package(
                 .copy("Assets.xcassets"),
             ]
         ),
+        .testTarget(
+            name: "OpenMessageTests",
+            dependencies: [.target(name: "OpenMessage")],
+            path: "Tests/OpenMessageTests"
+        ),
     ]
 )

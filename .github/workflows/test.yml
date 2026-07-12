@@ -142,5 +142,13 @@ jobs:
       - name: Build Swift package
         run: swift build --package-path macos/OpenMessage
 
+      - name: Build Go backend for Swift smoke
+        run: GOWORK=off go build -o "$RUNNER_TEMP/openmessage" .
+
+      - name: Test Swift package
+        env:
+          OPENMESSAGE_BINARY: ${{ runner.temp }}/openmessage
+        run: swift test --package-path macos/OpenMessage
+
       - name: Package macOS app
         run: bash macos/build.sh

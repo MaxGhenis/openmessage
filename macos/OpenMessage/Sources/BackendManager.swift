@@ -27,8 +27,9 @@ final class BackendManager: ObservableObject {
     /// surfaces the per-platform problem so a dead bridge can't silently rot.
     @Published var platformAlert: String?
 
-    private var process: Process?
-    /// PID of a backend we adopted instead of spawning (process == nil). Tracked
+    private var launcher: BackendLauncherCore?
+    private let processSpawner: any BackendProcessSpawning
+    /// PID of a backend we adopted instead of spawning (launcher == nil). Tracked
     /// so stop()/quit can still terminate it — otherwise an orphan adopted on a
     /// later launch would be unkillable by the app.
     private var reusedBackendPID: pid_t?
@@ -50,7 +51,8 @@ final class BackendManager: ObservableObject {
     private var pendingRestartTask: Task<Void, Never>?
     private var healthyResetTask: Task<Void, Never>?
 
-    init() {
+    init(processSpawner: any BackendProcessSpawning = FoundationBackendProcessSpawner()) {
+        self.processSpawner = processSpawner
         // Standard Cmd-Q / app-menu "Quit" terminates via NSApplication without
         // going through the menu-bar button's stop(), which left the spawned
         // `serve` process reparented to launchd, holding the port and DB. Hook
@@ -160,70 +162,60 @@ final class BackendManager: ObservableObject {
         if reuseExistingBackendIfNeeded() {
             return
         }
-        let proc = Process()
         let path = binaryPath
         let dir = dataDir
-        proc.executableURL = URL(fileURLWithPath: path)
-        proc.arguments = ["serve", "--web"]
-        proc.currentDirectoryURL = URL(fileURLWithPath: dir, isDirectory: true)
-        proc.environment = [
-            "OPENMESSAGES_PORT": String(port),
-            "OPENMESSAGES_DATA_DIR": dir,
-            "OPENMESSAGES_LOG_LEVEL": "info",
-            "OPENMESSAGES_APP_SANDBOX": "1",
-            // The native app owns notifications when it wraps the backend:
-            // NotificationManager posts UNUserNotificationCenter banners off the
-            // SSE event stream, with tap-to-open and foreground suppression that
-            // the Go side can't do. Disable the backend's own osascript/
-            // terminal-notifier banners so a single inbound message doesn't fire
-            // two notifications. Bare `openmessage serve` in a terminal (no app,
-            // env var unset) still gets Go-side banners via its default logic.
-            "OPENMESSAGES_MACOS_NOTIFICATIONS": "0",
-            "HOME": NSHomeDirectory(),
-            "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
-        ]
+        let configuration = BackendLaunchConfiguration.application(
+            executablePath: path,
+            dataDirectory: dir,
+            port: port
+        )
+        let launcher = BackendLauncherCore(configuration: configuration, processSpawner: processSpawner)
+        self.launcher = launcher
         logger.info("Launching backend at \(path, privacy: .public) with data dir \(dir, privacy: .public)")
 
         let pipe = Pipe()
-        proc.standardOutput = pipe
-        proc.standardError = pipe
-
-        // Read output for logging. Mark the interpolation as .public so
-        // that diagnostic lines like "WhatsApp message fell through to
-        // [Unsupported message]" (with content_types field) can be read
-        // via `log show --predicate 'subsystem == "com.openmessage.app"'`
-        // without flipping the system-wide private_data flag.
-        pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
-            let data = handle.availableData
-            guard !data.isEmpty, let line = String(data: data, encoding: .utf8) else { return }
-            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-            self?.logger.info("\(trimmed, privacy: .public)")
-        }
-
-        proc.terminationHandler = { [weak self] proc in
-            let manager = self
-            let reason = proc.terminationReason == .uncaughtSignal ? "signal" : "exit"
-            let code = proc.terminationStatus
-            Task { @MainActor in
-                guard let manager else { return }
-                manager.logger.warning("Backend terminated via \(reason, privacy: .public) with code \(code)")
-                guard manager.process === proc else { return }
-                manager.process = nil
-                // Only react to crashes while we believed the backend was up. A
-                // deliberate stop()/quit clears `state` first, so this won't
-                // fight an intentional shutdown.
-                if manager.state == .running || manager.state == .starting {
-                    manager.handleUnexpectedTermination(code: code)
-                }
-            }
-        }
 
         do {
-            try proc.run()
-            process = proc
+            try launcher.launch { [weak self] proc in
+                proc.standardOutput = pipe
+                proc.standardError = pipe
+
+                // Read output for logging. Mark the interpolation as .public so
+                // that diagnostic lines like "WhatsApp message fell through to
+                // [Unsupported message]" (with content_types field) can be read
+                // via `log show --predicate 'subsystem == "com.openmessage.app"'`
+                // without flipping the system-wide private_data flag.
+                pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+                    let data = handle.availableData
+                    guard !data.isEmpty, let line = String(data: data, encoding: .utf8) else { return }
+                    let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                    self?.logger.info("\(trimmed, privacy: .public)")
+                }
+
+                proc.terminationHandler = { [weak self] proc in
+                    let manager = self
+                    let reason = proc.terminationReason == .uncaughtSignal ? "signal" : "exit"
+                    let code = proc.terminationStatus
+                    Task { @MainActor in
+                        guard let manager else { return }
+                        manager.logger.warning("Backend terminated via \(reason, privacy: .public) with code \(code)")
+                        guard manager.launcher?.process === proc else { return }
+                        manager.launcher = nil
+                        // Only react to crashes while we believed the backend was up. A
+                        // deliberate stop()/quit clears ownership first, so this won't
+                        // fight an intentional shutdown.
+                        if manager.state == .running || manager.state == .starting {
+                            manager.handleUnexpectedTermination(code: code)
+                        }
+                    }
+                }
+            }
             reusedBackendPID = nil
             startHealthCheck()
         } catch {
+            if self.launcher === launcher {
+                self.launcher = nil
+            }
             state = .error("Failed to launch backend: \(error.localizedDescription)")
             logger.error("Launch failed: \(error)")
         }
@@ -234,9 +226,9 @@ final class BackendManager: ObservableObject {
         guard !pids.isEmpty else { return false }
         for pid in pids {
             guard pid > 0 else { continue }
-            guard let command = commandLine(for: pid), isReusableBackendCommand(command) else { continue }
+            guard let command = commandLine(for: pid), commandMatcher.isReusableBackendCommand(command) else { continue }
             logger.info("Reusing existing backend pid \(pid): \(command, privacy: .public)")
-            process = nil
+            launcher = nil
             reusedBackendPID = pid
             startHealthCheck()
             return true
@@ -252,7 +244,7 @@ final class BackendManager: ObservableObject {
         for pid in pids {
             guard pid > 0 else { continue }
             guard let command = commandLine(for: pid) else { continue }
-            guard isOpenMessageBackendCommand(command) else { continue }
+            guard commandMatcher.isOpenMessageBackendCommand(command) else { continue }
 
             logger.warning("Stopping conflicting backend pid \(pid): \(command, privacy: .public)")
             _ = Darwin.kill(pid_t(pid), SIGTERM)
@@ -263,7 +255,7 @@ final class BackendManager: ObservableObject {
             waitForPortRelease()
             for pid in listeningPIDs(on: port) {
                 guard pid > 0 else { continue }
-                guard let command = commandLine(for: pid), isOpenMessageBackendCommand(command) else { continue }
+                guard let command = commandLine(for: pid), commandMatcher.isOpenMessageBackendCommand(command) else { continue }
                 logger.warning("Force stopping lingering backend pid \(pid): \(command, privacy: .public)")
                 _ = Darwin.kill(pid_t(pid), SIGKILL)
             }
@@ -271,23 +263,8 @@ final class BackendManager: ObservableObject {
         }
     }
 
-    private func isReusableBackendCommand(_ command: String) -> Bool {
-        command.contains("\(binaryPath) serve")
-    }
-
-    private func isOpenMessageBackendCommand(_ command: String) -> Bool {
-        let normalized = command.replacingOccurrences(of: "\\", with: "/")
-        if isReusableBackendCommand(normalized) {
-            return true
-        }
-        if normalized.contains("/usr/local/bin/openmessage serve") {
-            return true
-        }
-        return normalized.contains("/OpenMessage")
-            && (
-                normalized.contains(".app/Contents/Resources/openmessage serve")
-                || normalized.contains(".app/Contents/MacOS/openmessage-helper serve")
-            )
+    private var commandMatcher: BackendCommandMatcher {
+        BackendCommandMatcher(binaryPath: binaryPath)
     }
 
     private func waitForPortRelease() {
@@ -360,14 +337,14 @@ final class BackendManager: ObservableObject {
         healthCheckTask = nil
         connectionMonitorTask?.cancel()
         connectionMonitorTask = nil
-        if let process {
-            process.terminate()
+        if let launcher {
+            launcher.terminate()
         } else if let pid = reusedBackendPID {
             // We adopted this backend rather than spawning it, so there's no
             // Process handle — signal it by PID so it can still be stopped.
             _ = Darwin.kill(pid, SIGTERM)
         }
-        process = nil
+        launcher = nil
         reusedBackendPID = nil
         state = .stopped
     }
@@ -379,18 +356,16 @@ final class BackendManager: ObservableObject {
         cancelPendingRestart()
         healthCheckTask?.cancel()
         connectionMonitorTask?.cancel()
-        if let process, process.isRunning {
-            process.terminate()
-            let deadline = Date().addingTimeInterval(2)
-            while process.isRunning && Date() < deadline {
-                Thread.sleep(forTimeInterval: 0.05)
-            }
-            if process.isRunning {
-                _ = Darwin.kill(process.processIdentifier, SIGKILL)
+        if let launcher, launcher.process?.isRunning == true {
+            let result = launcher.terminateAndWait(timeout: 2)
+            if case .timedOut = result {
+                _ = launcher.forceTerminateAndWait(timeout: 0.5)
             }
         } else if let pid = reusedBackendPID {
             _ = Darwin.kill(pid, SIGTERM)
         }
+        launcher = nil
+        reusedBackendPID = nil
     }
 
     // ── Auto-restart plumbing ──
@@ -512,7 +487,7 @@ final class BackendManager: ObservableObject {
 
     /// Whether the backend is genuinely down (vs. briefly unreachable).
     private func backendProcessIsDead() -> Bool {
-        if let process {
+        if let process = launcher?.process {
             return !process.isRunning
         }
         // Adopted backend (no Process handle): dead if nothing is listening.
@@ -699,9 +674,6 @@ final class BackendManager: ObservableObject {
         }
     }
 
-    deinit {
-        process?.terminate()
-    }
 }
 
 /// Sendable holder so the AsyncStream's onTermination closure can reach the
