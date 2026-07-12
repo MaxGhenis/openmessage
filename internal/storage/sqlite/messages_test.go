@@ -542,10 +542,10 @@ func TestMessagesInboxMigrationIsChecksummedAndStrict(t *testing.T) {
 		t,
 		func() time.Time { return time.UnixMilli(messageTestTimeMS) },
 	)
-	if len(embeddedMigrations) != 4 {
-		t.Fatalf("embedded migrations = %d, want 4", len(embeddedMigrations))
+	if len(embeddedMigrations) != 5 {
+		t.Fatalf("embedded migrations = %d, want 5", len(embeddedMigrations))
 	}
-	assertPragmaInt(t, store.db, "user_version", 4)
+	assertPragmaInt(t, store.db, "user_version", len(embeddedMigrations))
 	ledger := readLedgerRow(t, store.db, 4)
 	if ledger.name != "messages_inbox" {
 		t.Fatalf("migration 0004 name = %q, want messages_inbox", ledger.name)

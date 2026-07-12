@@ -57,4 +57,12 @@ var (
 	// ErrInboxProjectionConflict means an already-processed inbox row was
 	// replayed with different message identity or normalized content.
 	ErrInboxProjectionConflict = errors.New("inbox projection conflict")
+
+	// ErrIdempotencyConflict means an existing account-scoped idempotency key
+	// names a different outbound intent.
+	ErrIdempotencyConflict = errors.New("outbox idempotency conflict")
+
+	// ErrLeaseLost means an outbox mutation no longer owns the row's active
+	// dispatch lease.
+	ErrLeaseLost = errors.New("outbox lease lost")
 )
