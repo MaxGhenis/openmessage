@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"time"
 
 	"github.com/maxghenis/openmessage/internal/storage/sqlite"
@@ -38,6 +39,10 @@ var (
 	// the intent's current state.
 	ErrInvalidState = errors.New("messaging: invalid outbox state")
 
+	// ErrUnsupported means the account bridge does not support the requested
+	// messaging operation.
+	ErrUnsupported = errors.New("messaging: operation unsupported by account bridge")
+
 	// ErrNotImplemented marks API seams reserved for later rebuild items.
 	ErrNotImplemented = errors.New("messaging: not implemented")
 )
@@ -52,6 +57,15 @@ type CommonCommand struct {
 type SendTextCommand struct {
 	CommonCommand
 	Body             string
+	ReplyToMessageID string
+}
+
+type SendMediaCommand struct {
+	CommonCommand
+	Content          io.Reader
+	Filename         string
+	MIME             string
+	Caption          string
 	ReplyToMessageID string
 }
 

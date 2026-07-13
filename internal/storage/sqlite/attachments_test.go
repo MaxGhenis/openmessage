@@ -90,6 +90,45 @@ func TestAttachmentRepositoryListsUnreferencedCandidates(t *testing.T) {
 	}
 }
 
+func TestAttachmentRepositoryTreatsQueuedOutboxBlobAsReferenced(t *testing.T) {
+	store, repository := openAttachmentTestRepository(t)
+	seedMessageAccount(t, store, "account-a", "test")
+	seedMessageIdentity(t, store, "identity-a", "account-a")
+	seedMessageConversation(t, store, "conversation-a", "account-a")
+	outbox, err := NewOutboxRepository(
+		store,
+		func() time.Time { return time.UnixMilli(attachmentTestTimeMS) },
+	)
+	if err != nil {
+		t.Fatalf("NewOutboxRepository(): %v", err)
+	}
+
+	queuedHash := strings.Repeat("4d", 32)
+	unreferencedHash := strings.Repeat("5e", 32)
+	item := outboxTestMediaItem("gc-reference")
+	attachment := outboxTestAttachment()
+	attachment.BlobHash = queuedHash
+	if _, _, err := outbox.EnqueueOutgoingMediaMessage(
+		context.Background(),
+		item,
+		outboxTestOutgoingMessage(item, "caption"),
+		attachment,
+	); err != nil {
+		t.Fatalf("EnqueueOutgoingMediaMessage(): %v", err)
+	}
+
+	got, err := repository.ListUnreferencedBlobHashes(
+		context.Background(),
+		[]string{queuedHash, unreferencedHash},
+	)
+	if err != nil {
+		t.Fatalf("ListUnreferencedBlobHashes(): %v", err)
+	}
+	if want := []string{unreferencedHash}; !slices.Equal(got, want) {
+		t.Fatalf("ListUnreferencedBlobHashes() = %v, want %v", got, want)
+	}
+}
+
 func TestAttachmentRepositoryMissingRowPreservesSentinel(t *testing.T) {
 	_, repository := openAttachmentTestRepository(t)
 
@@ -233,8 +272,8 @@ func openAttachmentTestRepository(t *testing.T) (*Store, *AttachmentRepository) 
 		}
 	})
 
-	if len(embeddedMigrations) != 5 {
-		t.Fatalf("embedded migrations = %d, want 5", len(embeddedMigrations))
+	if len(embeddedMigrations) != 6 {
+		t.Fatalf("embedded migrations = %d, want 6", len(embeddedMigrations))
 	}
 	assertPragmaInt(t, store.db, "user_version", len(embeddedMigrations))
 	ledger := readLedgerRow(t, store.db, 3)

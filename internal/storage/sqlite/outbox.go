@@ -92,6 +92,19 @@ type OutboxItem struct {
 	UpdatedAtMS         int64
 }
 
+// OutboxAttachment is the persisted blob metadata for one media outbox intent.
+// M2 stores exactly one attachment at ordinal zero. Enqueue stamps OutboxID,
+// Ordinal, and CreatedAtMS; GetOutboxAttachment populates every field.
+type OutboxAttachment struct {
+	OutboxID    string
+	BlobHash    string
+	MIME        string
+	Filename    string
+	Ordinal     int64
+	SizeBytes   int64
+	CreatedAtMS int64
+}
+
 // LeaseRequest controls one atomic due-row claim.
 type LeaseRequest struct {
 	Owner    string
@@ -159,7 +172,7 @@ func (r *OutboxRepository) Enqueue(
 	ctx context.Context,
 	item NewOutboxItem,
 ) (OutboxItem, EnqueueDisposition, error) {
-	return r.enqueue(ctx, item, nil)
+	return r.enqueue(ctx, item, nil, nil)
 }
 
 // EnqueueOutgoingMessage atomically inserts an outbound intent and its
@@ -171,16 +184,61 @@ func (r *OutboxRepository) EnqueueOutgoingMessage(
 	item NewOutboxItem,
 	message Message,
 ) (OutboxItem, EnqueueDisposition, error) {
-	return r.enqueue(ctx, item, &message)
+	return r.enqueue(ctx, item, &message, nil)
+}
+
+// EnqueueOutgoingMediaMessage atomically inserts a media intent, its
+// optimistic outgoing message, and its blob metadata. An idempotent replay
+// returns the existing intent only when its complete persisted pair exists.
+func (r *OutboxRepository) EnqueueOutgoingMediaMessage(
+	ctx context.Context,
+	item NewOutboxItem,
+	message Message,
+	attachment OutboxAttachment,
+) (OutboxItem, EnqueueDisposition, error) {
+	return r.enqueue(ctx, item, &message, &attachment)
+}
+
+// GetOutboxAttachment returns the ordinal-zero attachment for outboxID. A
+// missing row wraps database/sql.ErrNoRows so callers can use errors.Is.
+func (r *OutboxRepository) GetOutboxAttachment(
+	ctx context.Context,
+	outboxID string,
+) (OutboxAttachment, error) {
+	if strings.TrimSpace(outboxID) == "" {
+		return OutboxAttachment{}, fmt.Errorf("get outbox attachment: outbox ID is empty")
+	}
+
+	var attachment OutboxAttachment
+	if err := r.store.db.QueryRowContext(ctx, `
+		SELECT outbox_id, ordinal, blob_hash, size_bytes, mime, filename, created_at_ms
+		FROM outbox_attachments
+		WHERE outbox_id = ? AND ordinal = 0
+	`, outboxID).Scan(
+		&attachment.OutboxID,
+		&attachment.Ordinal,
+		&attachment.BlobHash,
+		&attachment.SizeBytes,
+		&attachment.MIME,
+		&attachment.Filename,
+		&attachment.CreatedAtMS,
+	); err != nil {
+		return OutboxAttachment{}, fmt.Errorf("get outbox attachment for outbox item %q: %w", outboxID, err)
+	}
+	return attachment, nil
 }
 
 func (r *OutboxRepository) enqueue(
 	ctx context.Context,
 	item NewOutboxItem,
 	message *Message,
+	attachment *OutboxAttachment,
 ) (OutboxItem, EnqueueDisposition, error) {
 	if err := validateNewOutboxItem(item); err != nil {
 		return OutboxItem{}, "", fmt.Errorf("enqueue outbox item: %w", err)
+	}
+	if err := validateOutboxAttachmentPair(item, attachment); err != nil {
+		return OutboxItem{}, "", fmt.Errorf("enqueue outbox item %q: %w", item.OutboxID, err)
 	}
 	nowMS, err := r.nowMS("enqueue outbox item")
 	if err != nil {
@@ -283,8 +341,18 @@ func (r *OutboxRepository) enqueue(
 			return OutboxItem{}, "", err
 		}
 	}
+	if disposition == EnqueueExisting && row.Kind == OutboxKindMedia {
+		if err := validateExistingOutboxAttachment(ctx, tx, row.OutboxID); err != nil {
+			return OutboxItem{}, "", err
+		}
+	}
 	if disposition == EnqueueInserted && message != nil {
 		if err := r.insertOutgoingMessage(ctx, tx, item, *message, nowMS); err != nil {
+			return OutboxItem{}, "", err
+		}
+	}
+	if disposition == EnqueueInserted && attachment != nil {
+		if err := r.insertOutboxAttachment(ctx, tx, item.OutboxID, *attachment, nowMS); err != nil {
 			return OutboxItem{}, "", err
 		}
 	}
@@ -292,6 +360,94 @@ func (r *OutboxRepository) enqueue(
 		return OutboxItem{}, "", fmt.Errorf("enqueue outbox item %q: commit: %w", item.OutboxID, err)
 	}
 	return row, disposition, nil
+}
+
+func (r *OutboxRepository) insertOutboxAttachment(
+	ctx context.Context,
+	tx *sql.Tx,
+	outboxID string,
+	attachment OutboxAttachment,
+	nowMS int64,
+) error {
+	_, err := tx.ExecContext(ctx, `
+		INSERT INTO outbox_attachments (
+			outbox_id,
+			ordinal,
+			blob_hash,
+			size_bytes,
+			mime,
+			filename,
+			created_at_ms
+		) VALUES (?, 0, ?, ?, ?, ?, ?)
+	`,
+		outboxID,
+		attachment.BlobHash,
+		attachment.SizeBytes,
+		attachment.MIME,
+		attachment.Filename,
+		nowMS,
+	)
+	if err != nil {
+		return fmt.Errorf(
+			"enqueue outbox attachment for outbox item %q: %w",
+			outboxID,
+			mapConstraintError(err),
+		)
+	}
+	return nil
+}
+
+func validateOutboxAttachmentPair(
+	item NewOutboxItem,
+	attachment *OutboxAttachment,
+) error {
+	if item.Kind == OutboxKindMedia && attachment == nil {
+		return fmt.Errorf("media kind requires an attachment")
+	}
+	if item.Kind != OutboxKindMedia && attachment != nil {
+		return fmt.Errorf("kind %q does not accept an attachment", item.Kind)
+	}
+	if attachment == nil {
+		return nil
+	}
+	if err := validateBlobHash(attachment.BlobHash); err != nil {
+		return err
+	}
+	if attachment.SizeBytes <= 0 {
+		return fmt.Errorf("outbox attachment size must be positive")
+	}
+	if strings.TrimSpace(attachment.MIME) == "" {
+		return fmt.Errorf("outbox attachment MIME type is empty")
+	}
+	return nil
+}
+
+func validateExistingOutboxAttachment(
+	ctx context.Context,
+	tx *sql.Tx,
+	outboxID string,
+) error {
+	var exists bool
+	if err := tx.QueryRowContext(ctx, `
+		SELECT EXISTS (
+			SELECT 1
+			FROM outbox_attachments
+			WHERE outbox_id = ? AND ordinal = 0
+		)
+	`, outboxID).Scan(&exists); err != nil {
+		return fmt.Errorf(
+			"enqueue outgoing media message for existing outbox item %q: inspect attachment: %w",
+			outboxID,
+			err,
+		)
+	}
+	if !exists {
+		return fmt.Errorf(
+			"enqueue outgoing media message for existing outbox item %q: attachment is missing",
+			outboxID,
+		)
+	}
+	return nil
 }
 
 func (r *OutboxRepository) insertOutgoingMessage(
