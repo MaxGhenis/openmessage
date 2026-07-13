@@ -1,0 +1,2 @@
+WARN  SendHelper - Failed to send delivery receipt, ignoring: org.whispersystems.signalservice.api.push.exceptions.PushNetworkException
+{"timestamp":1700000000123,"results":[{"recipientAddress":{"uuid":"a1a98e48-7fa6-402e-9f62-b687098fed68","number":"+15551234567"},"type":"SUCCESS"}]}

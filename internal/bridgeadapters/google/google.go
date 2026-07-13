@@ -1,6 +1,7 @@
 // Package google adapts the pinned libgm connection lifecycle to one
-// generation-owned bridge.Run. Legacy send/read/media operations continue to
-// use app.App.GetClient and are intentionally outside this adapter.
+// generation-owned bridge.Run. Legacy web operations continue to use
+// app.App.GetClient; durable media dispatch reaches that retained client
+// through the adapter shim in send.go.
 package google
 
 import (

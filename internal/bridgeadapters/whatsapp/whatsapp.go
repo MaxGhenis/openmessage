@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"runtime/debug"
 	"strings"
 	"sync"
@@ -24,17 +25,19 @@ type Adapter struct {
 	accountID string
 	host      *whatsapplive.Bridge
 
-	connect        func(context.Context) error
-	disconnect     func()
-	probe          func(context.Context) error
-	accountInfo    func() whatsapplive.AccountInfo
-	cooldown       func() time.Time
-	prepareQR      func(context.Context) (<-chan whatsmeow.QRChannelItem, error)
-	connectPairing func(context.Context) error
-	applyQR        func(whatsmeow.QRChannelItem) whatsapplive.QRSnapshot
-	pairPhone      func(context.Context, string) (string, error)
-	unpair         func() error
-	now            func() time.Time
+	connect          func(context.Context) error
+	disconnect       func()
+	probe            func(context.Context) error
+	accountInfo      func() whatsapplive.AccountInfo
+	cooldown         func() time.Time
+	prepareQR        func(context.Context) (<-chan whatsmeow.QRChannelItem, error)
+	connectPairing   func(context.Context) error
+	applyQR          func(whatsmeow.QRChannelItem) whatsapplive.QRSnapshot
+	pairPhone        func(context.Context, string) (string, error)
+	unpair           func() error
+	now              func() time.Time
+	mediaReady       func() bool
+	sendMediaRequest func(string, []byte, string, string, string, string, string) (string, time.Time, error)
 
 	mu       sync.Mutex
 	current  *run
@@ -59,6 +62,8 @@ func New(accountID string, host *whatsapplive.Bridge) *Adapter {
 		a.applyQR = host.ApplyQRItem
 		a.pairPhone = host.PairPhoneContext
 		a.unpair = host.Unpair
+		a.mediaReady = func() bool { return host.Status().Connected }
+		a.sendMediaRequest = host.SendMediaRequest
 		host.ObserveLifecycle(a.handleLifecycleEvent)
 	}
 	return a
@@ -78,6 +83,100 @@ func (a *Adapter) DeclaredCapabilities() bridge.CapabilitySet {
 		PairQR:            true,
 		PairPhone:         true,
 		MediaDownload:     true,
+	}
+}
+
+// SendMedia bridges the v2 request contract to the already-owned whatsmeow
+// transport. Readiness is checked without constructing or connecting a client.
+func (a *Adapter) SendMedia(ctx context.Context, req bridge.MediaRequest) (bridge.SendResult, error) {
+	if a == nil || a.mediaReady == nil || !a.mediaReady() || a.sendMediaRequest == nil {
+		return bridge.SendResult{}, whatsappMediaPreCallFailure(
+			"whatsapp_not_connected",
+			whatsmeow.ErrNotConnected,
+		)
+	}
+	if ctx == nil {
+		return bridge.SendResult{}, whatsappMediaPreCallFailure(
+			"whatsapp_media_context_missing",
+			errors.New("WhatsApp media send context is nil"),
+		)
+	}
+	if err := ctx.Err(); err != nil {
+		return bridge.SendResult{}, whatsappMediaPreCallFailure("whatsapp_media_context_done", err)
+	}
+	if req.Reader == nil {
+		return bridge.SendResult{}, whatsappMediaPreCallFailure(
+			"whatsapp_media_read_failed",
+			errors.New("WhatsApp media reader is nil"),
+		)
+	}
+	limit := req.Size + 1
+	if req.Size < 0 || limit <= 0 {
+		return bridge.SendResult{}, whatsappMediaPreCallFailure(
+			"whatsapp_media_size_mismatch",
+			fmt.Errorf("invalid WhatsApp media size %d", req.Size),
+		)
+	}
+	data, err := io.ReadAll(io.LimitReader(req.Reader, limit))
+	if err != nil {
+		return bridge.SendResult{}, whatsappMediaPreCallFailure(
+			"whatsapp_media_read_failed",
+			fmt.Errorf("read WhatsApp media: %w", err),
+		)
+	}
+	if int64(len(data)) != req.Size {
+		return bridge.SendResult{}, whatsappMediaPreCallFailure(
+			"whatsapp_media_size_mismatch",
+			fmt.Errorf("WhatsApp media reader returned %d bytes, want %d", len(data), req.Size),
+		)
+	}
+	if err := ctx.Err(); err != nil {
+		return bridge.SendResult{}, whatsappMediaPreCallFailure("whatsapp_media_context_done", err)
+	}
+
+	replyToID := ""
+	if req.ReplyTo != nil {
+		replyToID = req.ReplyTo.RemoteID
+	}
+	remoteID, acceptedAt, err := a.sendMediaRequest(
+		req.Conversation.RemoteID,
+		data,
+		req.Filename,
+		req.MIME,
+		req.Caption,
+		replyToID,
+		req.RequestID,
+	)
+	if err != nil {
+		// Deliberately no adapter-level lifecycle report: a media send failure
+		// must never retire a healthy receive generation (the C4/C5/C6 lesson).
+		// The transport core already routes genuinely reconnect-worthy failures
+		// through its internal reportConnectionError -> OnConnectionError chain,
+		// which carries the legacy ShouldReconnect guard.
+		failure := a.classifyError(err, "send_media", "whatsapp_send_media_failed")
+		if errors.Is(err, whatsapplive.ErrMediaNotDispatched) {
+			failure.Dispatch = bridge.DispatchNotCalled
+			if errors.Is(err, whatsmeow.ErrNotConnected) {
+				failure.Fingerprint = "whatsapp_not_connected"
+			}
+		}
+		return bridge.SendResult{}, failure
+	}
+
+	return bridge.SendResult{
+		RemoteMessageID: remoteID,
+		AcceptedAt:      acceptedAt,
+		EchoExpected:    false,
+	}, nil
+}
+
+func whatsappMediaPreCallFailure(fingerprint string, cause error) bridge.OpError {
+	return bridge.OpError{
+		Class:       bridge.FailureTransient,
+		Operation:   "send_media",
+		Fingerprint: fingerprint,
+		Dispatch:    bridge.DispatchNotCalled,
+		Cause:       cause,
 	}
 }
 
@@ -738,6 +837,7 @@ func (a *Adapter) Unpair(ctx context.Context, accountID string) error {
 var (
 	_ bridge.Adapter            = (*Adapter)(nil)
 	_ bridge.CapabilityDeclarer = (*Adapter)(nil)
+	_ bridge.MediaSender        = (*Adapter)(nil)
 	_ bridge.Pairer             = (*Adapter)(nil)
 	_ bridge.Run                = (*run)(nil)
 )

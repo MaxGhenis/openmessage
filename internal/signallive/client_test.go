@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -89,6 +91,427 @@ func TestBridgeSendTextRunsSignalCLI(t *testing.T) {
 	}
 	if msg.SourceID != strings.TrimPrefix(msg.MessageID, "signal:") {
 		t.Fatalf("source_id = %q, want trimmed message id", msg.SourceID)
+	}
+}
+
+func TestParseSignalMediaSendResultFixtures(t *testing.T) {
+	tests := []struct {
+		name          string
+		fixture       string
+		want          int64
+		wantErrText   string
+		wantAllFailed bool
+	}{
+		{
+			name:    "success",
+			fixture: "send-media-success.json",
+			want:    1700000000123,
+		},
+		{
+			name:          "all recipients failed",
+			fixture:       "send-media-all-recipients-failed.json",
+			want:          1700000000456,
+			wantErrText:   "UNREGISTERED_FAILURE",
+			wantAllFailed: true,
+		},
+		{
+			name:          "all recipients failed with invalid pre-key",
+			fixture:       "send-media-invalid-pre-key.json",
+			want:          1700000000555,
+			wantErrText:   "INVALID_PRE_KEY_FAILURE",
+			wantAllFailed: true,
+		},
+		{
+			// Mixed results return the timestamp ALONGSIDE the recipient error so
+			// callers can honor signal-cli's exit-0 semantics (>=1 success means
+			// the message went out).
+			name:        "mixed success and failure",
+			fixture:     "send-media-mixed-results.json",
+			want:        1700000000678,
+			wantErrText: "UNREGISTERED_FAILURE",
+		},
+		{
+			// signal-cli WARN/JVM stderr noise rides CombinedOutput around the JSON
+			// on fully successful sends; the decoder must fall back to a per-line
+			// scan instead of failing the whole send.
+			name:    "stderr noise around success JSON",
+			fixture: "send-media-stderr-noise.txt",
+			want:    1700000000123,
+		},
+		{
+			name:        "zero timestamp",
+			fixture:     "send-media-zero-timestamp.json",
+			wantErrText: "timestamp",
+		},
+		{
+			name:        "missing timestamp",
+			fixture:     "send-media-missing-timestamp.json",
+			wantErrText: "timestamp",
+		},
+		{
+			name:        "empty recipient results",
+			fixture:     "send-media-empty-results.json",
+			wantErrText: "recipient",
+		},
+		{
+			name:        "unparseable output",
+			fixture:     "send-media-unparseable.txt",
+			wantErrText: "JSON",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			output, err := os.ReadFile(filepath.Join("testdata", tc.fixture))
+			if err != nil {
+				t.Fatalf("read fixture: %v", err)
+			}
+			got, err := parseSignalMediaSendResult(output)
+			if tc.wantErrText != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErrText) {
+					t.Fatalf("parseSignalMediaSendResult() error = %v, want containing %q", err, tc.wantErrText)
+				}
+				if got := signalMediaAllRecipientsFailed(err); got != tc.wantAllFailed {
+					t.Fatalf("signalMediaAllRecipientsFailed() = %v, want %v for %v", got, tc.wantAllFailed, err)
+				}
+				if got != tc.want {
+					t.Fatalf("parseSignalMediaSendResult() timestamp = %d, want %d alongside error", got, tc.want)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseSignalMediaSendResult() error = %v", err)
+			}
+			if got != tc.want {
+				t.Fatalf("parseSignalMediaSendResult() = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestBridgeSendMediaRequestStreamsAttachmentAndRemovesTempFileOnSuccess(t *testing.T) {
+	bridge := &Bridge{
+		account:   "+15551230000",
+		connected: true,
+		configDir: t.TempDir(),
+		logger:    zerolog.Nop(),
+	}
+	content := []byte("streamed-png-bytes")
+	output, err := os.ReadFile(filepath.Join("testdata", "send-media-success.json"))
+	if err != nil {
+		t.Fatalf("read send result fixture: %v", err)
+	}
+
+	originalRun := runSignalCLI
+	defer func() { runSignalCLI = originalRun }()
+
+	var captured []string
+	var attachmentPath string
+	var attachmentContent []byte
+	runSignalCLI = func(ctx context.Context, configDir string, args ...string) ([]byte, error) {
+		captured = append([]string{}, args...)
+		for _, arg := range args {
+			if strings.HasPrefix(arg, "--attachment=") {
+				attachmentPath = strings.TrimPrefix(arg, "--attachment=")
+				attachmentContent, err = os.ReadFile(attachmentPath)
+				if err != nil {
+					return nil, err
+				}
+				break
+			}
+		}
+		return output, nil
+	}
+
+	timestamp, err := bridge.SendMediaRequest(
+		"signal:a1a98e48-7fa6-402e-9f62-b687098fed68",
+		bytes.NewBuffer(content),
+		int64(len(content)),
+		"photo.png",
+		"image/png",
+		"signal photo",
+		"",
+	)
+	if err != nil {
+		t.Fatalf("SendMediaRequest(): %v", err)
+	}
+	if timestamp != 1700000000123 {
+		t.Fatalf("SendMediaRequest() timestamp = %d, want 1700000000123", timestamp)
+	}
+	if !bytes.Equal(attachmentContent, content) {
+		t.Fatalf("streamed attachment = %q, want %q", attachmentContent, content)
+	}
+	if attachmentPath == "" {
+		t.Fatal("signal-cli received no anchored attachment path")
+	}
+	if _, err := os.Stat(attachmentPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("temporary attachment still exists after success: %v", err)
+	}
+	wantArgs := []string{
+		"--output=json",
+		"-a", "+15551230000",
+		"send",
+		"-m", "signal photo",
+		"--attachment=" + attachmentPath,
+		"a1a98e48-7fa6-402e-9f62-b687098fed68",
+	}
+	if !slices.Equal(captured, wantArgs) {
+		t.Fatalf("signal-cli args = %q, want %q", captured, wantArgs)
+	}
+}
+
+func TestBridgeSendMediaRequestClassifiesStructuredAndOpaqueFailures(t *testing.T) {
+	allFailed, err := os.ReadFile(filepath.Join("testdata", "send-media-all-recipients-failed.json"))
+	if err != nil {
+		t.Fatalf("read all-failed fixture: %v", err)
+	}
+	malformed, err := os.ReadFile(filepath.Join("testdata", "send-media-unparseable.txt"))
+	if err != nil {
+		t.Fatalf("read malformed fixture: %v", err)
+	}
+	tests := []struct {
+		name              string
+		output            []byte
+		commandErr        error
+		wantNotDispatched bool
+		wantDiagnostics   []string
+	}{
+		{
+			name:              "all recipients failed with nonzero exit",
+			output:            allFailed,
+			commandErr:        errors.New("exit status 1"),
+			wantNotDispatched: true,
+			wantDiagnostics:   []string{"exit status 1", "UNREGISTERED_FAILURE"},
+		},
+		{
+			name:            "malformed successful output",
+			output:          malformed,
+			wantDiagnostics: []string{"decode Signal media send JSON"},
+		},
+		{
+			name:            "opaque nonzero exit",
+			output:          []byte("signal-cli transport failed"),
+			commandErr:      errors.New("exit status 2"),
+			wantDiagnostics: []string{"exit status 2", "signal-cli transport failed"},
+		},
+		{
+			name:            "timeout despite all-failed output",
+			output:          allFailed,
+			commandErr:      context.DeadlineExceeded,
+			wantDiagnostics: []string{"context deadline exceeded", "UNREGISTERED_FAILURE"},
+		},
+	}
+
+	originalRun := runSignalCLI
+	defer func() { runSignalCLI = originalRun }()
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			bridge := &Bridge{
+				account:   "+15551230000",
+				connected: true,
+				configDir: t.TempDir(),
+				logger:    zerolog.Nop(),
+			}
+			var attachmentPath string
+			runSignalCLI = func(ctx context.Context, configDir string, args ...string) ([]byte, error) {
+				for _, arg := range args {
+					if strings.HasPrefix(arg, "--attachment=") {
+						attachmentPath = strings.TrimPrefix(arg, "--attachment=")
+						break
+					}
+				}
+				return tc.output, tc.commandErr
+			}
+
+			_, err := bridge.SendMediaRequest(
+				"signal:+15551234567",
+				strings.NewReader("png-bytes"),
+				int64(len("png-bytes")),
+				"photo.png",
+				"image/png",
+				"",
+				"",
+			)
+			if err == nil || !IsCommandError(err) {
+				t.Fatalf("SendMediaRequest() error = %v (%T), want CommandError", err, err)
+			}
+			if got := IsSendNotDispatchedError(err); got != tc.wantNotDispatched {
+				t.Fatalf("IsSendNotDispatchedError() = %v, want %v for %v", got, tc.wantNotDispatched, err)
+			}
+			for _, diagnostic := range tc.wantDiagnostics {
+				if !strings.Contains(err.Error(), diagnostic) {
+					t.Fatalf("SendMediaRequest() error = %q, want diagnostic %q", err, diagnostic)
+				}
+			}
+			if attachmentPath == "" {
+				t.Fatal("signal-cli received no attachment path")
+			}
+			if _, statErr := os.Stat(attachmentPath); !errors.Is(statErr, os.ErrNotExist) {
+				t.Fatalf("temporary attachment still exists after error: %v", statErr)
+			}
+		})
+	}
+}
+
+// signal-cli exits 0 on mixed per-recipient results (it only throws when no
+// recipient succeeded), and the pre-M2b legacy path treated exit 0 as a
+// successful send. A group send that reached most members must not surface as
+// a failure — per-recipient delivery gaps are M5 reconciliation's job.
+func TestBridgeSendMediaRequestSucceedsOnMixedRecipientResults(t *testing.T) {
+	mixed, err := os.ReadFile(filepath.Join("testdata", "send-media-mixed-results.json"))
+	if err != nil {
+		t.Fatalf("read mixed-results fixture: %v", err)
+	}
+	bridge := &Bridge{
+		account:   "+15551230000",
+		connected: true,
+		configDir: t.TempDir(),
+		logger:    zerolog.Nop(),
+	}
+
+	originalRun := runSignalCLI
+	defer func() { runSignalCLI = originalRun }()
+
+	var attachmentPath string
+	runSignalCLI = func(ctx context.Context, configDir string, args ...string) ([]byte, error) {
+		for _, arg := range args {
+			if strings.HasPrefix(arg, "--attachment=") {
+				attachmentPath = strings.TrimPrefix(arg, "--attachment=")
+				break
+			}
+		}
+		return mixed, nil // exit 0: signal-cli only throws when no recipient succeeded
+	}
+
+	timestamp, err := bridge.SendMediaRequest(
+		"signal:group-id",
+		strings.NewReader("png-bytes"),
+		int64(len("png-bytes")),
+		"photo.png",
+		"image/png",
+		"group photo",
+		"",
+	)
+	if err != nil {
+		t.Fatalf("SendMediaRequest() on mixed results = %v, want success", err)
+	}
+	if timestamp != 1700000000678 {
+		t.Fatalf("SendMediaRequest() timestamp = %d, want 1700000000678", timestamp)
+	}
+	if attachmentPath == "" {
+		t.Fatal("signal-cli received no attachment path")
+	}
+	if _, statErr := os.Stat(attachmentPath); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("temporary attachment still exists after mixed-result success: %v", statErr)
+	}
+}
+
+// Web-sent media rows persist the transport timestamp as their MessageID
+// ("signal:<ts>"). When history sync later replays the same send as a
+// SyncMessage.SentMessage transcript, the exact-identity match must dedupe it —
+// otherwise every web-sent media message appears twice after a re-pair.
+func TestSentMessageSyncDoesNotDuplicateWebSentMedia(t *testing.T) {
+	store, err := db.New(filepath.Join(t.TempDir(), "messages.db"))
+	if err != nil {
+		t.Fatalf("db.New(): %v", err)
+	}
+	defer store.Close()
+
+	bridge := &Bridge{
+		account:   "+15551230000",
+		connected: true,
+		configDir: t.TempDir(),
+		store:     store,
+		logger:    zerolog.Nop(),
+	}
+
+	success, err := os.ReadFile(filepath.Join("testdata", "send-media-success.json"))
+	if err != nil {
+		t.Fatalf("read success fixture: %v", err)
+	}
+	originalRun := runSignalCLI
+	defer func() { runSignalCLI = originalRun }()
+	runSignalCLI = func(context.Context, string, ...string) ([]byte, error) {
+		return success, nil
+	}
+
+	// Legacy web send with no caption: the persisted body is the attachment
+	// placeholder — the case the old body+drift heuristic couldn't be trusted on.
+	msg, err := bridge.SendMedia("signal:+15551234567", []byte("png-bytes"), "photo.png", "image/png", "", "")
+	if err != nil {
+		t.Fatalf("SendMedia(): %v", err)
+	}
+	if msg.MessageID != "signal:1700000000123" {
+		t.Fatalf("web-sent media MessageID = %q, want signal:1700000000123", msg.MessageID)
+	}
+	// The app layer persists the returned message; mirror it.
+	if err := store.UpsertMessage(msg); err != nil {
+		t.Fatalf("UpsertMessage(): %v", err)
+	}
+
+	// History sync replays the same send as a SentMessage transcript with the
+	// same sender timestamp.
+	payload := `{"account":"+15551230000","envelope":{"source":"+15551230000","sourceNumber":"+15551230000","timestamp":1700000000123,"syncMessage":{"sentMessage":{"destinationNumber":"+15551234567","timestamp":1700000000123,"message":"","attachments":[{"contentType":"image/png","id":"remote-attachment-1"}]}}}}`
+	if err := bridge.handleReceiveOutput("+15551230000", []byte(payload+"\n")); err != nil {
+		t.Fatalf("handleReceiveOutput(): %v", err)
+	}
+
+	msgs, err := store.GetMessagesByConversation("signal:+15551234567", 10)
+	if err != nil {
+		t.Fatalf("GetMessagesByConversation(): %v", err)
+	}
+	fromMe := 0
+	for _, m := range msgs {
+		if m != nil && m.IsFromMe {
+			fromMe++
+			if m.MessageID != msg.MessageID {
+				t.Fatalf("deduped MessageID = %q, want original %q", m.MessageID, msg.MessageID)
+			}
+		}
+	}
+	if fromMe != 1 {
+		t.Fatalf("outgoing rows after history-sync replay = %d, want exactly 1 (duplicate on re-pair)", fromMe)
+	}
+}
+
+func TestBridgeSendMediaRequestRejectsOversizeReaderBeforeCommand(t *testing.T) {
+	bridge := &Bridge{
+		account:   "+15551230000",
+		connected: true,
+		configDir: t.TempDir(),
+		logger:    zerolog.Nop(),
+	}
+
+	originalRun := runSignalCLI
+	defer func() { runSignalCLI = originalRun }()
+
+	called := false
+	runSignalCLI = func(context.Context, string, ...string) ([]byte, error) {
+		called = true
+		return nil, nil
+	}
+
+	_, err := bridge.SendMediaRequest(
+		"signal:+15551234567",
+		strings.NewReader("one byte too long"),
+		int64(len("one byte too lon")),
+		"attachment.bin",
+		"application/octet-stream",
+		"",
+		"",
+	)
+	if err == nil || !strings.Contains(err.Error(), "exceeds declared size") {
+		t.Fatalf("SendMediaRequest() error = %v, want declared-size error", err)
+	}
+	if called {
+		t.Fatal("signal-cli was called for an oversize reader")
+	}
+	entries, readErr := os.ReadDir(filepath.Join(bridge.configDir, "outgoing-attachments"))
+	if readErr != nil {
+		t.Fatalf("read outgoing attachment directory: %v", readErr)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("oversize reader left temporary attachments: %v", entries)
 	}
 }
 
@@ -1512,7 +1935,7 @@ func TestBridgeSendTextIncludesSignalQuoteArguments(t *testing.T) {
 	}
 }
 
-func TestBridgeSendMediaRunsSignalCLIAndReturnsLocalAttachmentMessage(t *testing.T) {
+func TestLegacySendMediaCharacterizationPreservesTransportAndLocalAttachment(t *testing.T) {
 	bridge := &Bridge{
 		account:   "+15551230000",
 		connected: true,
@@ -1523,11 +1946,15 @@ func TestBridgeSendMediaRunsSignalCLIAndReturnsLocalAttachmentMessage(t *testing
 
 	originalRun := runSignalCLI
 	defer func() { runSignalCLI = originalRun }()
+	output, err := os.ReadFile(filepath.Join("testdata", "send-media-success.json"))
+	if err != nil {
+		t.Fatalf("read send result fixture: %v", err)
+	}
 
 	var captured []string
 	runSignalCLI = func(ctx context.Context, configDir string, args ...string) ([]byte, error) {
 		captured = append([]string{configDir}, args...)
-		return []byte("ok"), nil
+		return output, nil
 	}
 
 	msg, err := bridge.SendMedia("signal:+15551234567", []byte("png-bytes"), "photo.png", "image/png", "signal photo", "")
@@ -1545,6 +1972,14 @@ func TestBridgeSendMediaRunsSignalCLIAndReturnsLocalAttachmentMessage(t *testing
 	if strings.Contains(got, " -a "+string(os.PathSeparator)) || strings.Contains(got, "send -m signal photo -a /") {
 		t.Fatalf("attachment passed as bare `-a path` — regression of the `No recipients given` bug: %q", got)
 	}
+	if len(captured) < 2 || captured[1] != "--output=json" {
+		t.Fatalf("signal-cli global JSON flag = %v, want --output=json before account/send args", captured)
+	}
+	if msg.MessageID != "signal:1700000000123" ||
+		msg.SourceID != "1700000000123" ||
+		msg.TimestampMS != 1700000000123 {
+		t.Fatalf("canonical legacy message identity = %+v, want signal-cli timestamp", msg)
+	}
 	if msg.SourcePlatform != "signal" {
 		t.Fatalf("source platform = %q, want signal", msg.SourcePlatform)
 	}
@@ -1553,6 +1988,22 @@ func TestBridgeSendMediaRunsSignalCLIAndReturnsLocalAttachmentMessage(t *testing
 	}
 	if !strings.HasPrefix(msg.MediaID, signalLocalAttachmentPrefix) {
 		t.Fatalf("media id = %q, want local signal attachment ref", msg.MediaID)
+	}
+	attachmentPath, err := decodeSignalLocalAttachmentRef(msg.MediaID)
+	if err != nil {
+		t.Fatalf("decode retained local attachment: %v", err)
+	}
+	wantArgs := []string{
+		bridge.configDir,
+		"--output=json",
+		"-a", "+15551230000",
+		"send",
+		"-m", "signal photo",
+		"--attachment=" + attachmentPath,
+		"+15551234567",
+	}
+	if !slices.Equal(captured, wantArgs) {
+		t.Fatalf("legacy signal-cli call = %q, want %q", captured, wantArgs)
 	}
 	if msg.SourceID != strings.TrimPrefix(msg.MessageID, "signal:") {
 		t.Fatalf("source_id = %q, want trimmed message id", msg.SourceID)
@@ -1584,11 +2035,15 @@ func TestBridgeSendMediaToACIRecipientKeepsRecipientArg(t *testing.T) {
 
 	originalRun := runSignalCLI
 	defer func() { runSignalCLI = originalRun }()
+	output, err := os.ReadFile(filepath.Join("testdata", "send-media-success.json"))
+	if err != nil {
+		t.Fatalf("read send result fixture: %v", err)
+	}
 
 	var captured []string
 	runSignalCLI = func(ctx context.Context, configDir string, args ...string) ([]byte, error) {
 		captured = append([]string{}, args...)
-		return []byte("ok"), nil
+		return output, nil
 	}
 
 	const aci = "a1a98e48-7fa6-402e-9f62-b687098fed68"

@@ -933,22 +933,106 @@ func (b *Bridge) SendMedia(conversationID string, data []byte, filename, mime, c
 	if len(data) == 0 {
 		return nil, errors.New("signal attachment is required")
 	}
-	account, err := b.usableAccount()
-	if err != nil {
-		return nil, err
-	}
-	target, isGroup, err := parseConversationTarget(conversationID)
-	if err != nil {
-		return nil, err
-	}
-
-	attachmentPath, err := b.writeLocalAttachment(data, filename)
+	result, err := b.sendMediaRequest(
+		conversationID,
+		bytes.NewReader(data),
+		int64(len(data)),
+		filename,
+		caption,
+		replyToID,
+		true,
+	)
 	if err != nil {
 		return nil, err
 	}
 
 	caption = strings.TrimSpace(caption)
-	args := []string{"-a", account, "send"}
+	body := caption
+	if body == "" {
+		body = signalAttachmentPlaceholder([]signalAttachment{{ContentType: mime}})
+	}
+	remoteID := strconv.FormatInt(result.timestampMS, 10)
+	messageID := "signal:" + remoteID
+	senderName := firstNonEmpty(os.Getenv("OPENMESSAGES_MY_NAME"), "Me")
+	msg := &db.Message{
+		MessageID:      messageID,
+		ConversationID: conversationID,
+		SenderName:     senderName,
+		SenderNumber:   result.account,
+		Body:           body,
+		TimestampMS:    result.timestampMS,
+		Status:         "sent",
+		IsFromMe:       true,
+		ReplyToID:      strings.TrimSpace(replyToID),
+		SourcePlatform: "signal",
+		SourceID:       remoteID,
+		MimeType:       strings.TrimSpace(mime),
+		MediaID:        encodeSignalLocalAttachmentRef(result.attachmentPath),
+	}
+	return msg, nil
+}
+
+// SendMediaRequest streams one attachment to signal-cli and returns Signal's
+// canonical outgoing identity. Signal uses the send timestamp as its message
+// ID; the durable request ID remains local dedupe metadata until reconciliation
+// can make uncertain retries safe.
+func (b *Bridge) SendMediaRequest(
+	conversationID string,
+	content io.Reader,
+	size int64,
+	filename, mime, caption, replyToID string,
+) (timestampMS int64, err error) {
+	result, err := b.sendMediaRequest(
+		conversationID,
+		content,
+		size,
+		filename,
+		caption,
+		replyToID,
+		false,
+	)
+	return result.timestampMS, err
+}
+
+type signalMediaRequestResult struct {
+	account        string
+	timestampMS    int64
+	attachmentPath string
+}
+
+// sendMediaRequest is shared by the durable adapter path and the retained web
+// path. The former removes its transport temp file on every outcome; the latter
+// retains the successful file because its db.Message MediaID still serves that
+// exact local attachment through the legacy download endpoint.
+func (b *Bridge) sendMediaRequest(
+	conversationID string,
+	content io.Reader,
+	size int64,
+	filename, caption, replyToID string,
+	retainOnSuccess bool,
+) (result signalMediaRequestResult, err error) {
+	account, err := b.usableAccount()
+	if err != nil {
+		return result, err
+	}
+	target, isGroup, err := parseConversationTarget(conversationID)
+	if err != nil {
+		return result, err
+	}
+
+	attachmentPath, err := b.writeLocalAttachmentReader(content, size, filename)
+	if err != nil {
+		return result, err
+	}
+	removeAttachment := true
+	defer func() {
+		if removeAttachment {
+			_ = os.Remove(attachmentPath)
+		}
+	}()
+
+	caption = strings.TrimSpace(caption)
+	args := []string{"--output=json", "-a", account, "send"}
 	if caption != "" {
 		args = append(args, "-m", caption)
 	}
@@ -961,8 +1045,7 @@ func (b *Bridge) SendMedia(conversationID string, data []byte, filename, mime, c
 	args = append(args, "--attachment="+attachmentPath)
 	quoteArgs, err := b.signalQuoteArgs(replyToID, account)
 	if err != nil {
-		_ = os.Remove(attachmentPath)
-		return nil, err
+		return result, err
 	}
 	args = append(args, quoteArgs...)
 	if isGroup {
@@ -974,36 +1057,136 @@ func (b *Bridge) SendMedia(conversationID string, data []byte, filename, mime, c
 	ctx, cancel := context.WithTimeout(context.Background(), sendTimeout)
 	defer cancel()
 	b.commandMu.Lock()
-	output, err := runSignalCLI(ctx, b.configDir, args...)
+	output, commandErr := runSignalCLI(ctx, b.configDir, args...)
 	b.commandMu.Unlock()
-	if err != nil {
-		_ = os.Remove(attachmentPath)
-		return nil, commandError("send Signal media", err, output)
+	timestampMS, resultErr := parseSignalMediaSendResult(output)
+	if commandErr != nil {
+		timedOut := errors.Is(commandErr, context.Canceled) ||
+			errors.Is(commandErr, context.DeadlineExceeded) ||
+			ctx.Err() != nil
+		if !timedOut && signalMediaAllRecipientsFailed(resultErr) {
+			return result, commandNotDispatchedError(
+				"send Signal media",
+				errors.Join(commandErr, resultErr),
+				output,
+			)
+		}
+		return result, commandError("send Signal media", commandErr, output)
+	}
+	if resultErr != nil {
+		if signalMediaAllRecipientsFailed(resultErr) {
+			return result, commandNotDispatchedError("send Signal media", resultErr, output)
+		}
+		var partial *signalMediaRecipientResultsError
+		if !errors.As(resultErr, &partial) || timestampMS <= 0 {
+			return result, commandError("parse Signal media send result", resultErr, output)
+		}
+		// Mixed per-recipient results with >=1 SUCCESS: signal-cli itself exits 0
+		// here (it only throws when no recipient succeeded), so the pre-M2b legacy
+		// path treated this as a successful send. The message went out with a real
+		// timestamp; per-recipient delivery gaps are M5 reconciliation's job.
+	}
+	result = signalMediaRequestResult{
+		account:        account,
+		timestampMS:    timestampMS,
+		attachmentPath: attachmentPath,
+	}
+	removeAttachment = !retainOnSuccess
+	return result, nil
+}
+
+type signalMediaSendResult struct {
+	Timestamp int64 `json:"timestamp"`
+	Results   []struct {
+		RecipientAddress json.RawMessage `json:"recipientAddress"`
+		Type             string          `json:"type"`
+	} `json:"results"`
+}
+
+// parseSignalMediaSendResult decodes signal-cli's --output=json send result
+// from CombinedOutput. The buffer can carry stderr noise (signal-cli WARN
+// lines, JVM notes) around the JSON object on a fully successful send, so a
+// whole-buffer decode falls back to a per-line scan for the object carrying a
+// timestamp — the same noise-tolerant convention parseSignalAccounts uses.
+// On mixed per-recipient results the timestamp is returned ALONGSIDE the
+// recipient-results error so callers can honor signal-cli's own exit-0
+// semantics (>=1 success means the message went out).
+func parseSignalMediaSendResult(output []byte) (int64, error) {
+	result, decodeErr := decodeSignalMediaSendJSON(output)
+	if decodeErr != nil {
+		return 0, decodeErr
+	}
+	if result.Timestamp <= 0 {
+		return 0, errors.New("Signal media send result has no valid timestamp")
+	}
+	if len(result.Results) == 0 {
+		return 0, errors.New("Signal media send result has no recipient results")
 	}
 
-	timestamp := now().UnixMilli()
-	body := caption
-	if body == "" {
-		body = signalAttachmentPlaceholder([]signalAttachment{{ContentType: mime}})
+	successCount := 0
+	failures := make([]string, 0, len(result.Results))
+	for index, recipient := range result.Results {
+		address := bytes.TrimSpace(recipient.RecipientAddress)
+		if len(address) == 0 || bytes.Equal(address, []byte("null")) {
+			return 0, fmt.Errorf("Signal media recipient result %d has no address", index)
+		}
+		resultType := strings.TrimSpace(recipient.Type)
+		switch resultType {
+		case "SUCCESS":
+			successCount++
+		case "NETWORK_FAILURE", "RATE_LIMIT_FAILURE", "UNREGISTERED_FAILURE",
+			"IDENTITY_FAILURE", "INVALID_PRE_KEY_FAILURE":
+			failures = append(failures, fmt.Sprintf("recipient %d: %s", index, resultType))
+		default:
+			if resultType == "" {
+				resultType = "missing result type"
+			}
+			return 0, fmt.Errorf("Signal media recipient result %d has unknown type %s", index, resultType)
+		}
 	}
-	messageID := localOutgoingMessageID(conversationID, timestamp, body)
-	senderName := firstNonEmpty(os.Getenv("OPENMESSAGES_MY_NAME"), "Me")
-	msg := &db.Message{
-		MessageID:      messageID,
-		ConversationID: conversationID,
-		SenderName:     senderName,
-		SenderNumber:   account,
-		Body:           body,
-		TimestampMS:    timestamp,
-		Status:         "sent",
-		IsFromMe:       true,
-		ReplyToID:      strings.TrimSpace(replyToID),
-		SourcePlatform: "signal",
-		SourceID:       strings.TrimPrefix(messageID, "signal:"),
-		MimeType:       strings.TrimSpace(mime),
-		MediaID:        encodeSignalLocalAttachmentRef(attachmentPath),
+	if len(failures) > 0 {
+		return result.Timestamp, &signalMediaRecipientResultsError{
+			failures:            failures,
+			allRecipientsFailed: successCount == 0,
+		}
 	}
-	return msg, nil
+	return result.Timestamp, nil
+}
+
+func decodeSignalMediaSendJSON(output []byte) (signalMediaSendResult, error) {
+	var result signalMediaSendResult
+	wholeErr := json.Unmarshal(output, &result)
+	if wholeErr == nil {
+		return result, nil
+	}
+	for _, line := range strings.Split(string(output), "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "{") {
+			continue
+		}
+		var candidate signalMediaSendResult
+		if err := json.Unmarshal([]byte(line), &candidate); err != nil {
+			continue
+		}
+		if candidate.Timestamp > 0 {
+			return candidate, nil
+		}
+	}
+	return result, fmt.Errorf("decode Signal media send JSON: %w", wholeErr)
+}
+
+type signalMediaRecipientResultsError struct {
+	failures            []string
+	allRecipientsFailed bool
+}
+
+func (e *signalMediaRecipientResultsError) Error() string {
+	return "Signal media send failed for " + strings.Join(e.failures, ", ")
+}
+
+func signalMediaAllRecipientsFailed(err error) bool {
+	var resultErr *signalMediaRecipientResultsError
+	return errors.As(err, &resultErr) && resultErr.allRecipientsFailed
 }
 
 func (b *Bridge) SendReaction(conversationID, targetMessageID, emoji, action string) error {
@@ -3094,12 +3277,26 @@ func (b *Bridge) matchLocalOutgoingMessage(conversationID, body string, timestam
 	if b == nil || b.store == nil {
 		return nil
 	}
-	body = strings.TrimSpace(body)
-	if body == "" {
-		return nil
-	}
 	msgs, err := b.store.GetMessagesByConversation(conversationID, 25)
 	if err != nil {
+		return nil
+	}
+	// Exact identity first: web-sent media rows persist the transport timestamp
+	// as their MessageID ("signal:<ts>"), and a SentMessage sync transcript
+	// carries that same sender timestamp — a deterministic match, stronger than
+	// the body+drift heuristic below and immune to caption/placeholder drift.
+	// Without this, every web-sent media message duplicates on history sync.
+	timestampID := "signal:" + strconv.FormatInt(timestamp, 10)
+	for _, msg := range msgs {
+		if msg == nil || !msg.IsFromMe || msg.SourcePlatform != "signal" {
+			continue
+		}
+		if msg.MessageID == timestampID {
+			return msg
+		}
+	}
+	body = strings.TrimSpace(body)
+	if body == "" {
 		return nil
 	}
 	var nearestDriftMS int64 = -1
@@ -3577,6 +3774,16 @@ func (b *Bridge) signalQuoteArgs(replyToID, account string) ([]string, error) {
 }
 
 func (b *Bridge) writeLocalAttachment(data []byte, filename string) (string, error) {
+	return b.writeLocalAttachmentReader(bytes.NewReader(data), int64(len(data)), filename)
+}
+
+func (b *Bridge) writeLocalAttachmentReader(content io.Reader, size int64, filename string) (string, error) {
+	if content == nil {
+		return "", errors.New("Signal attachment reader is required")
+	}
+	if size <= 0 {
+		return "", errors.New("Signal attachment size must be positive")
+	}
 	cacheDir := filepath.Join(b.configDir, "outgoing-attachments")
 	if err := os.MkdirAll(cacheDir, 0700); err != nil {
 		return "", fmt.Errorf("create Signal attachment cache: %w", err)
@@ -3589,11 +3796,28 @@ func (b *Bridge) writeLocalAttachment(data []byte, filename string) (string, err
 	if err != nil {
 		return "", fmt.Errorf("create Signal attachment temp file: %w", err)
 	}
-	defer file.Close()
-	if _, err := file.Write(data); err != nil {
-		_ = os.Remove(file.Name())
+	remove := true
+	defer func() {
+		_ = file.Close()
+		if remove {
+			_ = os.Remove(file.Name())
+		}
+	}()
+	written, err := io.Copy(file, io.LimitReader(content, size+1))
+	if err != nil {
 		return "", fmt.Errorf("write Signal attachment temp file: %w", err)
 	}
+	if written > size {
+		return "", fmt.Errorf("Signal attachment exceeds declared size %d", size)
+	}
+	if written < size {
+		return "", fmt.Errorf("Signal attachment ended at %d bytes; expected %d", written, size)
+	}
+	if err := file.Close(); err != nil {
+		_ = os.Remove(file.Name())
+		return "", fmt.Errorf("close Signal attachment temp file: %w", err)
+	}
+	remove = false
 	return file.Name(), nil
 }
 
@@ -3646,6 +3870,20 @@ func commandError(prefix string, err error, output []byte) error {
 	return &CommandError{message: fmt.Sprintf("%s: %s", prefix, cleanSignalCommandOutput(err, output))}
 }
 
+type signalSendNotDispatchedError struct {
+	err error
+}
+
+func (e *signalSendNotDispatchedError) Error() string { return e.err.Error() }
+
+func (e *signalSendNotDispatchedError) Unwrap() error { return e.err }
+
+func (*signalSendNotDispatchedError) SignalSendNotDispatched() {}
+
+func commandNotDispatchedError(prefix string, err error, output []byte) error {
+	return &signalSendNotDispatchedError{err: commandError(prefix, err, output)}
+}
+
 // NewCommandError builds a signal-cli command-failure marker carrying message as
 // its text. Production send paths use the internal commandError constructor;
 // this exported form lets callers and tests synthesize the exact marker that App
@@ -3657,6 +3895,15 @@ func NewCommandError(message string) *CommandError {
 func IsCommandError(err error) bool {
 	var commandErr *CommandError
 	return errors.As(err, &commandErr)
+}
+
+// IsSendNotDispatchedError reports whether a complete signal-cli result proves
+// that every recipient failed before any message was dispatched. The marker is
+// deliberately narrower than CommandError: mixed recipient results, malformed
+// output, and timeouts remain uncertain.
+func IsSendNotDispatchedError(err error) bool {
+	var marker interface{ SignalSendNotDispatched() }
+	return errors.As(err, &marker)
 }
 
 func IsAccountInvalidError(err error) bool {

@@ -1,9 +1,13 @@
 package signal
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"io"
 	"runtime"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -15,6 +19,223 @@ import (
 const signalAdapterTestTimeout = 2 * time.Second
 
 var signalAdapterTestEpoch = time.Date(2026, time.July, 13, 12, 0, 0, 0, time.UTC)
+
+func TestSendMediaRequiresReadyRetainedBridge(t *testing.T) {
+	tests := []struct {
+		name   string
+		poller poller
+	}{
+		{name: "nil retained bridge"},
+		{name: "not connected", poller: newFakePoller()},
+		{
+			name: "connected without account",
+			poller: &fakePoller{
+				started: make(chan *fakePollerRun, 1),
+				status:  signallive.StatusSnapshot{Connected: true},
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			adapter := &Adapter{accountID: "signal-primary", poller: tc.poller}
+			result, err := adapter.SendMedia(context.Background(), bridge.MediaRequest{
+				AccountID:    "signal-primary",
+				Conversation: bridge.ConversationRef{RemoteID: "signal:+15551234567"},
+				Reader:       strings.NewReader("media"),
+				Size:         int64(len("media")),
+			})
+			if result != (bridge.SendResult{}) {
+				t.Fatalf("SendMedia() result = %+v, want zero", result)
+			}
+			var operationError bridge.OpError
+			if !errors.As(err, &operationError) {
+				t.Fatalf("SendMedia() error = %v (%T), want bridge.OpError", err, err)
+			}
+			if operationError.Class != bridge.FailureTransient ||
+				operationError.Dispatch != bridge.DispatchNotCalled ||
+				operationError.Operation != "send_media" ||
+				operationError.Fingerprint != "signal_not_connected" {
+				t.Fatalf("SendMedia() OpError = %+v, want classified not-connected pre-call failure", operationError)
+			}
+			if fake, ok := tc.poller.(*fakePoller); ok && fake.mediaCallCount() != 0 {
+				t.Fatalf("SendMediaRequest calls = %d, want 0 while not ready", fake.mediaCallCount())
+			}
+		})
+	}
+}
+
+func TestSendMediaMapsRetainedTimestampAndRequest(t *testing.T) {
+	poller := newFakePoller()
+	poller.status = signallive.StatusSnapshot{
+		Connected: true,
+		Paired:    true,
+		Account:   "+15551230000",
+	}
+	poller.mediaTimestamp = 1700000000123
+	adapter := &Adapter{accountID: "signal-primary", poller: poller}
+	content := []byte("signal-media-content")
+
+	result, err := adapter.SendMedia(context.Background(), bridge.MediaRequest{
+		AccountID:    "signal-primary",
+		Conversation: bridge.ConversationRef{RemoteID: "signal:+15551234567"},
+		Reader:       bytes.NewReader(content),
+		Size:         int64(len(content)),
+		Filename:     "photo.png",
+		MIME:         "image/png",
+		Caption:      "signal photo",
+		ReplyTo:      &bridge.MessageRef{RemoteID: "signal:1700000000000"},
+		RequestID:    "local-dedupe-only",
+	})
+	if err != nil {
+		t.Fatalf("SendMedia() error = %v", err)
+	}
+	if result.RemoteMessageID != strconv.FormatInt(poller.mediaTimestamp, 10) ||
+		result.EchoExpected || !result.AcceptedAt.IsZero() {
+		t.Fatalf("SendMedia() result = %+v, want canonical timestamp ID without echo", result)
+	}
+	request := poller.lastMediaRequest()
+	if request.conversationID != "signal:+15551234567" ||
+		request.size != int64(len(content)) ||
+		request.filename != "photo.png" ||
+		request.mime != "image/png" ||
+		request.caption != "signal photo" ||
+		request.replyToID != "signal:1700000000000" ||
+		!bytes.Equal(request.content, content) {
+		t.Fatalf("retained SendMediaRequest = %+v, want mapped MediaRequest", request)
+	}
+}
+
+func TestSendMediaClassifiesPreCallAndCommandFailures(t *testing.T) {
+	tests := []struct {
+		name         string
+		err          error
+		wantDispatch bridge.DispatchCertainty
+	}{
+		{
+			name:         "local attachment preparation",
+			err:          errors.New("write Signal attachment temp file: disk full"),
+			wantDispatch: bridge.DispatchNotCalled,
+		},
+		{
+			name: "signal-cli command",
+			err:  signallive.NewCommandError("send Signal media: recipient is not registered"),
+		},
+		{
+			name: "structured all-recipient failure",
+			err: &fakeSignalSendNotDispatchedError{err: signallive.NewCommandError(
+				"send Signal media: every recipient failed",
+			)},
+			wantDispatch: bridge.DispatchNotCalled,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			poller := newFakePoller()
+			poller.status = signallive.StatusSnapshot{
+				Connected: true,
+				Paired:    true,
+				Account:   "+15551230000",
+			}
+			poller.mediaErr = tc.err
+			adapter := &Adapter{accountID: "signal-primary", poller: poller}
+
+			_, err := adapter.SendMedia(context.Background(), bridge.MediaRequest{
+				AccountID:    "signal-primary",
+				Conversation: bridge.ConversationRef{RemoteID: "signal:+15551234567"},
+				Reader:       strings.NewReader("media"),
+				Size:         int64(len("media")),
+			})
+			var operationError bridge.OpError
+			if !errors.As(err, &operationError) {
+				t.Fatalf("SendMedia() error = %v (%T), want bridge.OpError", err, err)
+			}
+			if operationError.Class != bridge.FailureTransient ||
+				operationError.Dispatch != tc.wantDispatch ||
+				operationError.Operation != "send_media" ||
+				operationError.Fingerprint != "signal_send_media_failed" ||
+				!errors.Is(operationError.Cause, tc.err) {
+				t.Fatalf("SendMedia() OpError = %+v, want transient classified failure with dispatch %q", operationError, tc.wantDispatch)
+			}
+			if got := poller.appliedCount(); got != 0 {
+				t.Fatalf("recipient/local send failure applied %d lifecycle transitions, want 0", got)
+			}
+		})
+	}
+}
+
+func TestSendMediaRoutesCommandFailuresThroughGuardedLifecycleReporting(t *testing.T) {
+	t.Run("recipient failure leaves receive generation running", func(t *testing.T) {
+		poller := newFakePoller()
+		poller.status = signallive.StatusSnapshot{
+			Connected: true,
+			Paired:    true,
+			Account:   "+15551230000",
+		}
+		poller.mediaErr = &fakeSignalSendNotDispatchedError{err: signallive.NewCommandError(
+			"send Signal media: user +15551234567 is not registered",
+		)}
+		adapter := &Adapter{accountID: "signal-primary", poller: poller}
+		run, err := adapter.Start(context.Background(), bridge.StartRequest{
+			AccountID:  "signal-primary",
+			Generation: 1,
+		}, nil)
+		if err != nil {
+			t.Fatalf("Start() error = %v", err)
+		}
+		receiveValue(t, poller.started, "retained poller start")
+		t.Cleanup(func() { stopAdapterRun(t, run) })
+
+		if _, err := adapter.SendMedia(context.Background(), bridge.MediaRequest{
+			Conversation: bridge.ConversationRef{RemoteID: "signal:+15551234567"},
+			Reader:       strings.NewReader("media"),
+			Size:         int64(len("media")),
+		}); err == nil {
+			t.Fatal("SendMedia() error = nil, want recipient command failure")
+		}
+		select {
+		case terminal := <-run.Done():
+			t.Fatalf("recipient media failure terminated receive generation: %v", terminal)
+		default:
+		}
+		if got := poller.appliedCount(); got != 0 {
+			t.Fatalf("recipient media failure applied %d lifecycle transitions, want 0", got)
+		}
+	})
+
+	t.Run("local account failure retires only transiently", func(t *testing.T) {
+		poller := newFakePoller()
+		poller.status = signallive.StatusSnapshot{
+			Connected: true,
+			Paired:    true,
+			Account:   "+15551230000",
+		}
+		poller.mediaErr = signallive.NewCommandError("send Signal media: authorization failed")
+		adapter := &Adapter{accountID: "signal-primary", poller: poller}
+		run, err := adapter.Start(context.Background(), bridge.StartRequest{
+			AccountID:  "signal-primary",
+			Generation: 1,
+		}, nil)
+		if err != nil {
+			t.Fatalf("Start() error = %v", err)
+		}
+		receiveValue(t, poller.started, "retained poller start")
+
+		if _, err := adapter.SendMedia(context.Background(), bridge.MediaRequest{
+			Conversation: bridge.ConversationRef{RemoteID: "signal:+15551234567"},
+			Reader:       strings.NewReader("media"),
+			Size:         int64(len("media")),
+		}); err == nil {
+			t.Fatal("SendMedia() error = nil, want local-account command failure")
+		}
+		terminal := receiveValue(t, run.Done(), "guarded media-send terminal")
+		assertOpError(t, terminal, bridge.FailureTransient, "signal_send_account_check")
+		if got := poller.appliedCount(); got != 1 {
+			t.Fatalf("local-account media failure status projections = %d, want one transient projection", got)
+		}
+	})
+}
 
 func TestRunTranslatesRetainedPollerSignals(t *testing.T) {
 	poller := newFakePoller()
@@ -486,15 +707,39 @@ func TestSupervisorLeavesExpiredPairingUnpairedWithoutReconnectChurn(t *testing.
 }
 
 type fakePoller struct {
-	mu           sync.Mutex
-	starts       int
-	runs         []*fakePollerRun
-	started      chan *fakePollerRun
-	startEntered chan struct{}
-	startRelease chan struct{}
-	applied      []signallive.PollerExit
-	fingerprint  string
+	mu             sync.Mutex
+	starts         int
+	runs           []*fakePollerRun
+	started        chan *fakePollerRun
+	startEntered   chan struct{}
+	startRelease   chan struct{}
+	applied        []signallive.PollerExit
+	fingerprint    string
+	status         signallive.StatusSnapshot
+	mediaCalls     []fakeMediaRequest
+	mediaTimestamp int64
+	mediaErr       error
 }
+
+type fakeMediaRequest struct {
+	conversationID string
+	content        []byte
+	size           int64
+	filename       string
+	mime           string
+	caption        string
+	replyToID      string
+}
+
+type fakeSignalSendNotDispatchedError struct {
+	err error
+}
+
+func (e *fakeSignalSendNotDispatchedError) Error() string { return e.err.Error() }
+
+func (e *fakeSignalSendNotDispatchedError) Unwrap() error { return e.err }
+
+func (*fakeSignalSendNotDispatchedError) SignalSendNotDispatched() {}
 
 func newFakePoller() *fakePoller {
 	return &fakePoller{started: make(chan *fakePollerRun, 16)}
@@ -532,7 +777,51 @@ func (p *fakePoller) StartPoller(ctx context.Context) (signallive.PollerRun, err
 	return run, nil
 }
 
-func (*fakePoller) Status() signallive.StatusSnapshot { return signallive.StatusSnapshot{} }
+func (p *fakePoller) Status() signallive.StatusSnapshot {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.status
+}
+
+func (p *fakePoller) SendMediaRequest(
+	conversationID string,
+	content io.Reader,
+	size int64,
+	filename, mime, caption, replyToID string,
+) (int64, error) {
+	data, readErr := io.ReadAll(content)
+	p.mu.Lock()
+	p.mediaCalls = append(p.mediaCalls, fakeMediaRequest{
+		conversationID: conversationID,
+		content:        data,
+		size:           size,
+		filename:       filename,
+		mime:           mime,
+		caption:        caption,
+		replyToID:      replyToID,
+	})
+	timestamp, sendErr := p.mediaTimestamp, p.mediaErr
+	p.mu.Unlock()
+	if readErr != nil {
+		return 0, readErr
+	}
+	return timestamp, sendErr
+}
+
+func (p *fakePoller) mediaCallCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.mediaCalls)
+}
+
+func (p *fakePoller) lastMediaRequest() fakeMediaRequest {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.mediaCalls) == 0 {
+		return fakeMediaRequest{}
+	}
+	return p.mediaCalls[len(p.mediaCalls)-1]
+}
 
 func (p *fakePoller) ApplyPollerFailure(exit signallive.PollerExit) {
 	p.mu.Lock()
