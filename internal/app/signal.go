@@ -34,43 +34,17 @@ func (a *App) ensureSignal() (*signallive.Bridge, error) {
 	return bridge, nil
 }
 
+// EnsureSignal initializes the retained Signal bridge without starting its
+// receive poller. Production connection ownership belongs to the Signal
+// bridge.Supervisor adapter.
+func (a *App) EnsureSignal() (*signallive.Bridge, error) {
+	return a.ensureSignal()
+}
+
 func (a *App) GetSignal() *signallive.Bridge {
 	a.signalMu.Lock()
 	defer a.signalMu.Unlock()
 	return a.Signal
-}
-
-func (a *App) LoadAndConnectSignal() error {
-	bridge, err := a.ensureSignal()
-	if err != nil {
-		return fmt.Errorf("init Signal bridge: %w", err)
-	}
-	if err := bridge.ConnectIfPaired(); err != nil {
-		return fmt.Errorf("connect Signal bridge: %w", err)
-	}
-	return nil
-}
-
-func (a *App) StartSignalConnect() error {
-	bridge, err := a.ensureSignal()
-	if err != nil {
-		return fmt.Errorf("init Signal bridge: %w", err)
-	}
-	if err := bridge.Connect(); err != nil {
-		return fmt.Errorf("connect Signal bridge: %w", err)
-	}
-	return nil
-}
-
-func (a *App) UnpairSignal() error {
-	bridge, err := a.ensureSignal()
-	if err != nil {
-		return fmt.Errorf("init Signal bridge: %w", err)
-	}
-	if err := bridge.Unpair(); err != nil {
-		return fmt.Errorf("unpair Signal bridge: %w", err)
-	}
-	return nil
 }
 
 func (a *App) SignalStatus() signallive.StatusSnapshot {
@@ -106,7 +80,11 @@ func (a *App) SendSignalText(conversationID, body, replyToID string) (*db.Messag
 	if err != nil {
 		return nil, fmt.Errorf("init Signal bridge: %w", err)
 	}
-	return bridge.SendText(conversationID, body, replyToID)
+	message, err := bridge.SendText(conversationID, body, replyToID)
+	if err != nil {
+		a.reportSignalLifecycleError(err)
+	}
+	return message, err
 }
 
 func (a *App) SendSignalMedia(conversationID string, data []byte, filename, mime, caption, replyToID string) (*db.Message, error) {
@@ -114,7 +92,11 @@ func (a *App) SendSignalMedia(conversationID string, data []byte, filename, mime
 	if err != nil {
 		return nil, fmt.Errorf("init Signal bridge: %w", err)
 	}
-	return bridge.SendMedia(conversationID, data, filename, mime, caption, replyToID)
+	message, err := bridge.SendMedia(conversationID, data, filename, mime, caption, replyToID)
+	if err != nil {
+		a.reportSignalLifecycleError(err)
+	}
+	return message, err
 }
 
 func (a *App) SendSignalReaction(conversationID, messageID, emoji, action string) error {
@@ -122,7 +104,11 @@ func (a *App) SendSignalReaction(conversationID, messageID, emoji, action string
 	if err != nil {
 		return fmt.Errorf("init Signal bridge: %w", err)
 	}
-	return bridge.SendReaction(conversationID, messageID, emoji, action)
+	err = bridge.SendReaction(conversationID, messageID, emoji, action)
+	if err != nil {
+		a.reportSignalLifecycleError(err)
+	}
+	return err
 }
 
 func (a *App) DownloadSignalMedia(msg *db.Message) ([]byte, string, error) {

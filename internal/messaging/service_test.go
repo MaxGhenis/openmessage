@@ -256,6 +256,7 @@ func TestPostCallTimeoutBecomesUncertainAndIsNotRedispatched(t *testing.T) {
 
 func TestTerminalFailuresAreRejected(t *testing.T) {
 	classes := []bridge.FailureClass{
+		bridge.FailureUnpaired,
 		bridge.FailureReauthRequired,
 		bridge.FailureUpgradeRequired,
 		bridge.FailureMisconfigured,

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -435,6 +436,156 @@ func TestSignalReceivePoisonConsecutiveCountResetsAfterIdlePoll(t *testing.T) {
 	})
 	if got := receiveCalls.Load(); got != 4 {
 		t.Fatalf("receive calls = %d, want 4 (poison, idle, poison, poison)", got)
+	}
+}
+
+func TestStartPollerPublishesRealReadyActivityAndJoinedDone(t *testing.T) {
+	bridge := &Bridge{
+		account:   "+15551230000",
+		configDir: t.TempDir(),
+		logger:    zerolog.Nop(),
+	}
+	var receiveCalls atomic.Int32
+	installSignalGateStubs(t, bridge,
+		func(context.Context) ([]byte, error) {
+			return []byte("signal-cli 0.14.5\n"), nil
+		},
+		func(ctx context.Context, _ string, args ...string) ([]byte, error) {
+			switch {
+			case hasSignalCLIArg(args, "listAccounts"):
+				return []byte(`[{"number":"+15551230000"}]`), nil
+			case hasSignalCLIArg(args, "receive"):
+				if receiveCalls.Add(1) == 1 {
+					return nil, context.DeadlineExceeded
+				}
+				<-ctx.Done()
+				return nil, ctx.Err()
+			default:
+				return []byte("[]"), nil
+			}
+		},
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	run, err := bridge.StartPoller(ctx)
+	if err != nil {
+		cancel()
+		t.Fatalf("StartPoller(): %v", err)
+	}
+	select {
+	case <-run.Ready():
+	case <-time.After(2 * time.Second):
+		cancel()
+		t.Fatal("poller did not become ready after account probe")
+	}
+
+	seenIdle := false
+	deadline := time.After(2 * time.Second)
+	for !seenIdle {
+		select {
+		case activity := <-run.Activity():
+			seenIdle = activity.Detail == "receive_idle"
+		case <-deadline:
+			cancel()
+			t.Fatal("poller did not publish completed receive activity")
+		}
+	}
+	cancel()
+	select {
+	case exit := <-run.Done():
+		if exit.Kind != "" || !errors.Is(exit.Err, context.Canceled) {
+			t.Fatalf("controlled poller exit = %+v, want canceled without failure class", exit)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("poller Done did not resolve after receive loop exit")
+	}
+	stopCtx, stopCancel := context.WithTimeout(context.Background(), time.Second)
+	defer stopCancel()
+	if err := run.Stop(stopCtx); err != nil {
+		t.Fatalf("PollerRun.Stop() after Done: %v", err)
+	}
+}
+
+func TestStartPollerClassifiesAccountInvalidAtInitialProbe(t *testing.T) {
+	bridge := &Bridge{
+		account:   "+15551230000",
+		configDir: t.TempDir(),
+		logger:    zerolog.Nop(),
+	}
+	installSignalGateStubs(t, bridge,
+		func(context.Context) ([]byte, error) {
+			return []byte("signal-cli 0.14.5\n"), nil
+		},
+		func(_ context.Context, _ string, args ...string) ([]byte, error) {
+			if hasSignalCLIArg(args, "listAccounts") {
+				return []byte("User +15551230000 is not registered."), errors.New("exit status 1")
+			}
+			return nil, nil
+		},
+	)
+
+	run, err := bridge.StartPoller(context.Background())
+	if err != nil {
+		t.Fatalf("StartPoller(): %v", err)
+	}
+	select {
+	case exit := <-run.Done():
+		if exit.Kind != PollerFailureReauth || exit.Fingerprint != SignalAccountInvalidFingerprint {
+			t.Fatalf("initial account-invalid exit = %+v, want reauth/%s", exit, SignalAccountInvalidFingerprint)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("account-invalid poller did not exit")
+	}
+	if status := bridge.Status(); !status.NeedsReauth || status.Connected || status.Connecting {
+		t.Fatalf("account-invalid status = %+v, want parked reauth", status)
+	}
+}
+
+func TestStartPollerClassifiesExpiredLinkAsUnpaired(t *testing.T) {
+	bridge := &Bridge{
+		configDir: t.TempDir(),
+		logger:    zerolog.Nop(),
+	}
+	originalStartLink := startSignalLink
+	originalRunSignalCLI := runSignalCLI
+	startSignalLink = func(context.Context, string) (io.ReadCloser, func() error, error) {
+		return io.NopCloser(strings.NewReader("sgnl://linkdevice?uuid=expired\n")), func() error {
+			return errors.New("Signal link QR expired")
+		}, nil
+	}
+	runSignalCLI = func(context.Context, string, ...string) ([]byte, error) {
+		return []byte("[]"), nil
+	}
+	t.Cleanup(func() {
+		_ = bridge.Close()
+		startSignalLink = originalStartLink
+		bridge.commandMu.Lock()
+		runSignalCLI = originalRunSignalCLI
+		bridge.commandMu.Unlock()
+	})
+
+	run, err := bridge.StartPoller(context.Background())
+	if err != nil {
+		t.Fatalf("StartPoller(): %v", err)
+	}
+	select {
+	case exit := <-run.Done():
+		if exit.Kind != PollerFailureUnpaired ||
+			exit.Operation != "pair" ||
+			exit.Fingerprint != SignalPairingIncompleteFingerprint {
+			t.Fatalf("expired pairing exit = %+v, want unpaired/%s", exit, SignalPairingIncompleteFingerprint)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("expired pairing did not resolve poller Done")
+	}
+	stopCtx, stopCancel := context.WithTimeout(context.Background(), time.Second)
+	defer stopCancel()
+	if err := run.Stop(stopCtx); err != nil {
+		t.Fatalf("PollerRun.Stop() after expired pairing: %v", err)
+	}
+	status := bridge.Status()
+	if status.Paired || status.Pairing || status.Connecting || status.QRAvailable {
+		t.Fatalf("expired pairing status = %+v, want idle unpaired", status)
 	}
 }
 

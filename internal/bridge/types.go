@@ -136,6 +136,7 @@ const (
 	FailureTransient          FailureClass = "transient"
 	FailureRateLimited        FailureClass = "rate_limited"
 	FailureCredentialsExpired FailureClass = "credentials_expired"
+	FailureUnpaired           FailureClass = "unpaired"
 	FailureReauthRequired     FailureClass = "reauth_required"
 	FailureUpgradeRequired    FailureClass = "upgrade_required"
 	FailureMisconfigured      FailureClass = "misconfigured"

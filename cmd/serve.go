@@ -23,6 +23,7 @@ import (
 	"github.com/maxghenis/openmessage/internal/app"
 	"github.com/maxghenis/openmessage/internal/bridge"
 	googleadapter "github.com/maxghenis/openmessage/internal/bridgeadapters/google"
+	signaladapter "github.com/maxghenis/openmessage/internal/bridgeadapters/signal"
 	whatsappadapter "github.com/maxghenis/openmessage/internal/bridgeadapters/whatsapp"
 	"github.com/maxghenis/openmessage/internal/db"
 	"github.com/maxghenis/openmessage/internal/googlecookies"
@@ -120,6 +121,8 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 	var googleControl *googleSupervisorControl
 	var whatsappSupervisor *bridge.Supervisor
 	var whatsappControl *whatsappSupervisorControl
+	var signalLifecycle *signaladapter.Adapter
+	var signalControl *signalSupervisorControl
 
 	// Google has one lifecycle owner. Transient retry, liveness probes,
 	// credential repair, and terminal parking all flow through this supervisor;
@@ -248,34 +251,57 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 	}
 
 	if !isDemo {
-		if err := a.LoadAndConnectSignal(); err != nil {
+		signalBridge, err := a.EnsureSignal()
+		if err != nil {
 			logger.Warn().Err(err).Msg("Signal live bridge unavailable")
+		} else {
+			signalLifecycle = signaladapter.New(signalAccountID, signalBridge)
+			a.SetSignalLifecycleNotifier(signalLifecycle)
+			newSignalSupervisor := func() (*bridge.Supervisor, error) {
+				return bridge.NewSupervisor(
+					signalAccountID,
+					bridge.PlatformSignal,
+					signalLifecycle,
+					signalSupervisorPolicy(),
+					signalWallClock{},
+					signalRandom{},
+				)
+			}
+			signalSupervisor, err := newSignalSupervisor()
+			if err != nil {
+				return fmt.Errorf("init Signal supervisor: %w", err)
+			}
+			signalControl = newSignalSupervisorControl(
+				signalSupervisor,
+				newSignalSupervisor,
+				signalLifecycle.InputFingerprint,
+			)
+			signalStartupCtx, cancelSignalStartup := context.WithCancel(context.Background())
+			var signalStartupWG sync.WaitGroup
+			defer func() {
+				cancelSignalStartup()
+				ctx, cancel := context.WithTimeout(context.Background(), signalSupervisorStopTimeout)
+				defer cancel()
+				if err := signalControl.Stop(ctx); err != nil {
+					logger.Warn().Err(err).Msg("Failed to stop Signal supervisor cleanly")
+				}
+				signalStartupWG.Wait()
+			}()
+
+			if signalBridge.Status().Paired {
+				signalStartupWG.Add(1)
+				go func() {
+					defer signalStartupWG.Done()
+					if err := signalSupervisor.Start(signalStartupCtx, bridge.StartRequest{}); err != nil &&
+						!errors.Is(err, context.Canceled) &&
+						!errors.Is(err, bridge.ErrSupervisorStopped) {
+						logger.Warn().Err(err).Msg("Signal live bridge unavailable")
+					}
+				}()
+			}
 		}
 	} else {
 		logger.Info().Msg("Demo mode — skipping Signal live bridge")
-	}
-
-	if !isDemo {
-		go func() {
-			ticker := time.NewTicker(5 * time.Second)
-			defer ticker.Stop()
-			for range ticker.C {
-				status := a.SignalStatus()
-				if !status.Paired || status.Connected || status.Pairing || status.Connecting {
-					continue
-				}
-				// Skip terminal states that require manual remediation.
-				// Hammering signal-cli every 5s with a known-bad account or
-				// binary wastes resources and produces noise in the logs. The
-				// status payload tells the UI whether to re-pair or upgrade.
-				if status.NeedsReauth || status.UpgradeRequired {
-					continue
-				}
-				if err := a.StartSignalConnect(); err != nil {
-					logger.Warn().Err(err).Msg("Signal reconnect attempt failed")
-				}
-			}
-		}()
 	}
 
 	// Sync WhatsApp and iMessage periodically (every 30s, incremental)
@@ -441,6 +467,14 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 			return whatsappControl.StopAndUnpair(a.UnpairWhatsApp)
 		}
 	}
+	var connectSignal func() error
+	var unpairSignal func() error
+	if signalControl != nil {
+		connectSignal = signalControl.Connect
+		unpairSignal = func() error {
+			return signalControl.StopAndUnpair(signalLifecycle.Unpair)
+		}
+	}
 
 	// Background loop that sends due scheduled ("send later") messages.
 	a.StartScheduler()
@@ -466,9 +500,9 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 				PairWhatsAppPhone:     pairWhatsAppPhone,
 				UnpairWhatsApp:        unpairWhatsApp,
 				SignalStatus:          func() any { return a.SignalStatus() },
-				ConnectSignal:         a.StartSignalConnect,
+				ConnectSignal:         connectSignal,
 				ReplaySignalRecovery:  a.ReplaySignalRecoveryQueue,
-				UnpairSignal:          a.UnpairSignal,
+				UnpairSignal:          unpairSignal,
 				LeaveWhatsAppGroup:    a.LeaveWhatsAppGroup,
 				WhatsAppQRCode: func() (any, error) {
 					return a.WhatsAppQRCode()

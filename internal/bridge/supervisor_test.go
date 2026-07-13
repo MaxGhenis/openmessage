@@ -590,6 +590,44 @@ func TestSupervisorTerminalFailuresRequireExplicitExit(t *testing.T) {
 	})
 }
 
+func TestSupervisorUnpairedFailureIdlesWithoutAutomaticRetry(t *testing.T) {
+	clock := newSupervisorManualClock(supervisorTestEpoch)
+	lifecycle := &supervisorTestLifecycle{scripts: []supervisorStartScript{{
+		err: OpError{
+			Class:       FailureUnpaired,
+			Operation:   "pair",
+			Fingerprint: "pairing_expired",
+			Cause:       errors.New("pairing expired"),
+		},
+	}}}
+	supervisor := newTestSupervisor(
+		t,
+		lifecycle,
+		supervisorTestPolicy(),
+		clock,
+		&supervisorScriptedRandom{},
+	)
+
+	if err := supervisorStart(t, supervisor, StartRequest{}); err == nil {
+		t.Fatal("Start() error = nil, want unpaired failure")
+	}
+	snapshot := supervisor.Snapshot()
+	if snapshot.State != StateUnpaired ||
+		snapshot.ErrorClass != FailureUnpaired ||
+		snapshot.ErrorFingerprint != "pairing_expired" ||
+		!snapshot.RetryAt.IsZero() {
+		t.Fatalf("unpaired snapshot = %+v", snapshot)
+	}
+	clock.Advance(24 * time.Hour)
+	supervisorSync(t, supervisor)
+	if got := lifecycle.CallCount(); got != 1 {
+		t.Fatalf("automatic starts while unpaired = %d, want 1", got)
+	}
+	if err := supervisorStart(t, supervisor, StartRequest{}); !errors.Is(err, ErrPairingNotAllowed) {
+		t.Fatalf("Start() while unpaired error = %v, want ErrPairingNotAllowed", err)
+	}
+}
+
 func TestSupervisorPairingIsSingleFlightAndExpiryDoesNotAutoPair(t *testing.T) {
 	clock := newSupervisorManualClock(supervisorTestEpoch)
 	lifecycle := &supervisorTestLifecycle{}

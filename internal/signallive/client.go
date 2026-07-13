@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha1"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -175,6 +176,128 @@ type Callbacks struct {
 	OnTypingChange        func(conversationID, senderName, senderNumber string, typing bool)
 }
 
+// PollerFailureKind is the transport-local terminal classification emitted by
+// the retained signal-cli receive poller. The bridge adapter translates these
+// values to bridge.FailureClass without making signallive depend on the generic
+// bridge package.
+type PollerFailureKind string
+
+const (
+	PollerFailureTransient PollerFailureKind = "transient"
+	PollerFailureReauth    PollerFailureKind = "reauth_required"
+	PollerFailureUpgrade   PollerFailureKind = "upgrade_required"
+	PollerFailureUnpaired  PollerFailureKind = "unpaired"
+)
+
+const (
+	SignalCLIVersionFingerprint        = "signal_cli_too_old"
+	SignalAccountInvalidFingerprint    = "signal_account_invalid"
+	SignalReceiveFailureFingerprint    = "signal_receive_failed"
+	SignalAccountProbeFingerprint      = "signal_account_probe_failed"
+	SignalReceivePanicFingerprint      = "signal_receive_panic"
+	SignalPairingIncompleteFingerprint = "signal_pairing_incomplete"
+)
+
+// PollerExit is the terminal result of exactly one retained poller lifecycle.
+// A zero Kind is a caller-requested stop.
+type PollerExit struct {
+	Kind        PollerFailureKind
+	Operation   string
+	Fingerprint string
+	Err         error
+}
+
+// PollerActivity is evidence that the retained receive machinery advanced.
+// Expected idle completions count: they prove signal-cli returned control to
+// the poller even when the account had no incoming messages.
+type PollerActivity struct {
+	At     time.Time
+	Detail string
+}
+
+// PollerRun is a token-bound view of one link/probe/receive generation. Done
+// resolves only after the existing link/receive goroutine has returned.
+type PollerRun interface {
+	Ready() <-chan struct{}
+	Activity() <-chan PollerActivity
+	Done() <-chan PollerExit
+	Stop(context.Context) error
+}
+
+type pollerRun struct {
+	ready       chan struct{}
+	activity    chan PollerActivity
+	done        chan PollerExit
+	stopped     chan struct{}
+	cancel      context.CancelFunc
+	readyOnce   sync.Once
+	finishOnce  sync.Once
+	stoppedOnce sync.Once
+}
+
+func newPollerRun(parent context.Context) (*pollerRun, context.Context) {
+	ctx, cancel := context.WithCancel(parent)
+	return &pollerRun{
+		ready:    make(chan struct{}),
+		activity: make(chan PollerActivity, 1),
+		done:     make(chan PollerExit, 1),
+		stopped:  make(chan struct{}),
+		cancel:   cancel,
+	}, ctx
+}
+
+func (r *pollerRun) Ready() <-chan struct{} { return r.ready }
+
+func (r *pollerRun) Activity() <-chan PollerActivity { return r.activity }
+
+func (r *pollerRun) Done() <-chan PollerExit { return r.done }
+
+func (r *pollerRun) Stop(ctx context.Context) error {
+	if ctx == nil {
+		return errors.New("signal poller: nil stop context")
+	}
+	r.cancel()
+	select {
+	case <-r.stopped:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (r *pollerRun) markReady() {
+	r.readyOnce.Do(func() { close(r.ready) })
+}
+
+func (r *pollerRun) beat(detail string) {
+	activity := PollerActivity{At: now(), Detail: detail}
+	select {
+	case r.activity <- activity:
+		return
+	default:
+	}
+	select {
+	case <-r.activity:
+	default:
+	}
+	select {
+	case r.activity <- activity:
+	default:
+	}
+}
+
+func (r *pollerRun) finish(exit PollerExit) {
+	r.finishOnce.Do(func() {
+		r.done <- exit
+		close(r.done)
+		close(r.activity)
+	})
+}
+
+func (r *pollerRun) markStopped() {
+	r.stoppedOnce.Do(func() { close(r.stopped) })
+}
+
 type StatusSnapshot struct {
 	Connected       bool   `json:"connected"`
 	Connecting      bool   `json:"connecting"`
@@ -247,8 +370,8 @@ type Bridge struct {
 	qr         QRSnapshot
 	// needsReauth is set when signal-cli reports the stored account is no
 	// longer registered / authorized. Cleared on successful pair or
-	// reconnect. While set, the reconnect ticker skips this bridge so we
-	// don't hammer signal-cli with a known-bad account every 5 seconds.
+	// reconnect. While set, the lifecycle reports reauth_required so the
+	// supervisor parks instead of retrying a known-bad account.
 	needsReauth bool
 	// upgradeRequired is a terminal receive state for an unsupported
 	// signal-cli version or its known poison-envelope crash. Automatic
@@ -535,12 +658,85 @@ func (b *Bridge) Connect() error {
 	return nil
 }
 
+// StartPoller starts one manual Signal lifecycle for bridge.Supervisor. It
+// preserves Connect's behavior: an existing account re-runs the version gate
+// and retained receive poller, while an unpaired account runs the existing QR
+// link flow and hands directly into that same poller after a successful scan.
+// The method returns after the tracked goroutine is admitted; signal-cli work
+// remains asynchronous.
+func (b *Bridge) StartPoller(ctx context.Context) (PollerRun, error) {
+	if ctx == nil {
+		return nil, errors.New("signal poller: nil start context")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	b.mu.Lock()
+	if b.account == "" {
+		b.account = b.firstStoredAccount()
+	}
+	if b.pairing || b.connecting || b.connected {
+		b.mu.Unlock()
+		return nil, errors.New("signal poller lifecycle is already active")
+	}
+
+	run, runCtx := newPollerRun(ctx)
+	account := b.account
+	b.connecting = true
+	b.needsReauth = false
+	b.upgradeRequired = false
+	b.lastError = ""
+	if account == "" {
+		b.pairing = true
+		b.pairCancel = run.cancel
+		b.qr = QRSnapshot{}
+	}
+	b.mu.Unlock()
+	b.emitStatusChange()
+
+	b.wg.Add(1)
+	go func() {
+		var exit PollerExit
+		if account == "" {
+			exit = b.runLinkPoller(runCtx, run)
+		} else {
+			exit = b.runReceiveLoop(runCtx, account, false, run)
+		}
+		// Done is the retained link/receive loop's terminal result. Metadata/WAL
+		// replay remains host-scoped, as before, and Bridge.Close joins it before
+		// App closes the store.
+		run.finish(exit)
+		b.wg.Done()
+		run.markStopped()
+	}()
+	return run, nil
+}
+
 func (b *Bridge) Unpair() error {
+	return b.UnpairContext(context.Background())
+}
+
+// UnpairContext bounds the join before signal-cli state is removed. The
+// context-free Unpair method remains for legacy callers.
+func (b *Bridge) UnpairContext(ctx context.Context) error {
+	if ctx == nil {
+		return errors.New("signal unpair: nil context")
+	}
 	b.cancelBackgroundWork(true)
 	// Wait for in-flight loops before removing the config dir: a draining
 	// receive poll may still be writing WAL/recovery files inside it, and
 	// RemoveAll on a directory that's being written to fails part-way.
-	b.wg.Wait()
+	joined := make(chan struct{})
+	go func() {
+		b.wg.Wait()
+		close(joined)
+	}()
+	select {
+	case <-joined:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 	if err := os.RemoveAll(b.configDir); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("remove Signal config dir: %w", err)
 	}
@@ -587,6 +783,71 @@ func (b *Bridge) Status() StatusSnapshot {
 	b.mu.RUnlock()
 	snapshot.ReceiveRecovery = b.receiveRecoveryStatus()
 	return snapshot
+}
+
+// InputFingerprint captures the paired account and signal-cli executable
+// identity used by a blocked generation. It is intentionally cheap and does
+// not execute signal-cli; a manual reconnect can therefore notice an upgraded
+// binary without creating a second lifecycle owner.
+func (b *Bridge) InputFingerprint() string {
+	hash := sha256.New()
+	_, _ = fmt.Fprintf(hash, "config=%s\n", b.configDir)
+	accountsPath := filepath.Join(b.configDir, "data", "accounts.json")
+	if data, err := os.ReadFile(accountsPath); err == nil {
+		_, _ = hash.Write(data)
+	} else {
+		_, _ = fmt.Fprintf(hash, "accounts_error=%v\n", err)
+	}
+	executable := signalCLIExecutable()
+	_, _ = fmt.Fprintf(hash, "executable=%s\n", executable)
+	if info, err := os.Stat(executable); err == nil {
+		_, _ = fmt.Fprintf(
+			hash,
+			"mode=%s\nsize=%d\nmtime=%d\n",
+			info.Mode(),
+			info.Size(),
+			info.ModTime().UnixNano(),
+		)
+	} else {
+		_, _ = fmt.Fprintf(hash, "executable_error=%v\n", err)
+	}
+	return "sha256:" + hex.EncodeToString(hash.Sum(nil))
+}
+
+// ApplyPollerFailure keeps the legacy Signal status projection aligned when a
+// send path, rather than the receive loop, terminates the active generation.
+// Cancellation/join remains the adapter's responsibility.
+func (b *Bridge) ApplyPollerFailure(exit PollerExit) {
+	if exit.Err == nil {
+		return
+	}
+	b.mu.Lock()
+	// Once the receive loop has established a terminal condition, a racing
+	// ordinary send failure cannot downgrade it and accidentally resume churn.
+	if b.upgradeRequired && exit.Kind != PollerFailureUpgrade {
+		b.mu.Unlock()
+		return
+	}
+	if b.needsReauth && exit.Kind == PollerFailureTransient {
+		b.mu.Unlock()
+		return
+	}
+	b.connected = false
+	b.connecting = false
+	b.lastError = exit.Err.Error()
+	switch exit.Kind {
+	case PollerFailureReauth:
+		b.needsReauth = true
+		b.upgradeRequired = false
+	case PollerFailureUpgrade:
+		b.needsReauth = false
+		b.upgradeRequired = true
+	case PollerFailureTransient:
+		b.needsReauth = false
+		b.upgradeRequired = false
+	}
+	b.mu.Unlock()
+	b.emitStatusChange()
 }
 
 func (b *Bridge) ReplayReceiveRecoveryQueue() error {
@@ -830,6 +1091,10 @@ func (b *Bridge) Close() error {
 }
 
 func (b *Bridge) runLink(ctx context.Context) {
+	_ = b.runLinkPoller(ctx, nil)
+}
+
+func (b *Bridge) runLinkPoller(ctx context.Context, run *pollerRun) PollerExit {
 	reader, wait, err := startSignalLink(ctx, b.configDir)
 	if err != nil {
 		b.mu.Lock()
@@ -839,7 +1104,12 @@ func (b *Bridge) runLink(ctx context.Context) {
 		b.pairCancel = nil
 		b.mu.Unlock()
 		b.emitStatusChange()
-		return
+		return PollerExit{
+			Kind:        PollerFailureUnpaired,
+			Operation:   "pair",
+			Fingerprint: SignalPairingIncompleteFingerprint,
+			Err:         err,
+		}
 	}
 	defer reader.Close()
 
@@ -856,6 +1126,9 @@ func (b *Bridge) runLink(ctx context.Context) {
 			}
 			b.mu.Unlock()
 			b.emitStatusChange()
+			if run != nil {
+				run.beat("pairing_qr")
+			}
 			continue
 		}
 		if strings.TrimSpace(line) != "" {
@@ -897,29 +1170,41 @@ func (b *Bridge) runLink(ctx context.Context) {
 	b.mu.Unlock()
 	b.emitStatusChange()
 	if account != "" {
-		b.startReceiveLoop(account, true)
+		return b.runReceiveLoop(ctx, account, true, run)
+	}
+	if ctx.Err() != nil {
+		return PollerExit{Err: ctx.Err()}
+	}
+	detail := strings.TrimSpace(b.Status().LastError)
+	if detail == "" {
+		detail = "Signal pairing did not produce a linked account"
+	}
+	return PollerExit{
+		Kind:        PollerFailureUnpaired,
+		Operation:   "pair",
+		Fingerprint: SignalPairingIncompleteFingerprint,
+		Err:         errors.New(detail),
 	}
 }
 
 func (b *Bridge) startReceiveLoop(account string, requestSync bool) {
+	_ = b.runReceiveLoop(context.Background(), account, requestSync, nil)
+}
+
+func (b *Bridge) runReceiveLoop(
+	parent context.Context,
+	account string,
+	requestSync bool,
+	run *pollerRun,
+) (exit PollerExit) {
 	// A panic while parsing an attacker-influenced envelope (unchecked indexes
 	// into attachments/reactions/quotes) would otherwise kill this goroutine
-	// and leave connected=true — Signal silently freezes. Recover, reset the
-	// connection state, and let the reconnect watchdog re-spawn the loop.
-	defer func() {
-		if r := recover(); r != nil {
-			b.logger.Error().
-				Interface("panic", r).
-				Bytes("stack", debug.Stack()).
-				Msg("Recovered from panic in Signal receive loop")
-			b.mu.Lock()
-			b.connected = false
-			b.connecting = false
-			b.mu.Unlock()
-			b.emitStatusChange()
-		}
-	}()
-	ctx, cancel := context.WithCancel(context.Background())
+	// and leave connected=true — Signal silently freezes. Recover and report a
+	// typed transient exit so the supervisor owns the eventual retry.
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
 	b.mu.Lock()
 	if b.receiveCancel != nil {
@@ -929,6 +1214,32 @@ func (b *Bridge) startReceiveLoop(account string, requestSync bool) {
 	token := b.receiveToken
 	b.receiveCancel = cancel
 	b.mu.Unlock()
+
+	defer func() {
+		if r := recover(); r != nil {
+			b.logger.Error().
+				Interface("panic", r).
+				Bytes("stack", debug.Stack()).
+				Msg("Recovered from panic in Signal receive loop")
+			b.mu.Lock()
+			b.connected = false
+			b.connecting = false
+			b.lastError = fmt.Sprintf("panic in Signal receive loop: %v", r)
+			b.mu.Unlock()
+			b.emitStatusChange()
+			exit = PollerExit{
+				Kind:        PollerFailureTransient,
+				Operation:   "receive",
+				Fingerprint: SignalReceivePanicFingerprint,
+				Err:         fmt.Errorf("panic in Signal receive loop: %v", r),
+			}
+		}
+		b.mu.Lock()
+		if b.receiveToken == token {
+			b.receiveCancel = nil
+		}
+		b.mu.Unlock()
+	}()
 
 	versionCtx, versionCancel := context.WithTimeout(ctx, versionProbeTimeout)
 	versionOutput, versionErr := probeSignalCLIVersion(versionCtx)
@@ -941,15 +1252,21 @@ func (b *Bridge) startReceiveLoop(account string, requestSync bool) {
 			b.connecting = false
 		}
 		b.mu.Unlock()
-		return
+		return PollerExit{Err: ctx.Err()}
 	}
 	version, versionDetected := parseSignalCLIVersion(versionOutput)
 	if versionDetected && version.less(minimumSignalCLIVersion) {
-		b.parkUpgradeRequired(token, fmt.Sprintf(
+		detail := fmt.Sprintf(
 			"signal-cli %s is below the required minimum %s; upgrade signal-cli to continue receiving messages",
 			version, minimumSignalCLIVersion,
-		))
-		return
+		)
+		b.parkUpgradeRequired(token, detail)
+		return PollerExit{
+			Kind:        PollerFailureUpgrade,
+			Operation:   "version_gate",
+			Fingerprint: SignalCLIVersionFingerprint,
+			Err:         errors.New(detail),
+		}
 	}
 	if !versionDetected {
 		event := b.logger.Warn()
@@ -964,9 +1281,12 @@ func (b *Bridge) startReceiveLoop(account string, requestSync bool) {
 
 	probedAccount, err := b.probeAccount(ctx, account)
 	if err != nil || probedAccount == "" {
+		accountInvalid := (err == nil && probedAccount == "") || isSignalAccountInvalid(err, nil)
 		b.mu.Lock()
 		b.connected = false
 		b.connecting = false
+		b.needsReauth = accountInvalid
+		b.upgradeRequired = false
 		if err != nil {
 			b.lastError = err.Error()
 		} else {
@@ -977,7 +1297,20 @@ func (b *Bridge) startReceiveLoop(account string, requestSync bool) {
 		}
 		b.mu.Unlock()
 		b.emitStatusChange()
-		return
+		if accountInvalid {
+			return PollerExit{
+				Kind:        PollerFailureReauth,
+				Operation:   "probe_account",
+				Fingerprint: SignalAccountInvalidFingerprint,
+				Err:         errors.New(b.Status().LastError),
+			}
+		}
+		return PollerExit{
+			Kind:        PollerFailureTransient,
+			Operation:   "probe_account",
+			Fingerprint: SignalAccountProbeFingerprint,
+			Err:         err,
+		}
 	}
 
 	b.mu.Lock()
@@ -989,6 +1322,10 @@ func (b *Bridge) startReceiveLoop(account string, requestSync bool) {
 	b.lastError = ""
 	b.mu.Unlock()
 	b.emitStatusChange()
+	if run != nil {
+		run.beat("account_probe")
+		run.markReady()
+	}
 	b.goTracked(func() { b.refreshMetadataAndReplay(probedAccount) })
 	if requestSync {
 		b.beginHistorySync()
@@ -1013,7 +1350,7 @@ func (b *Bridge) startReceiveLoop(account string, requestSync bool) {
 			}
 			b.mu.Unlock()
 			b.emitStatusChange()
-			return
+			return PollerExit{Err: ctx.Err()}
 		default:
 		}
 
@@ -1033,14 +1370,17 @@ func (b *Bridge) startReceiveLoop(account string, requestSync bool) {
 				consecutiveFailures = 0
 				consecutivePoisonFailures = 0
 				lastPoisonFingerprint = ""
+				if run != nil {
+					run.beat("receive_idle")
+				}
 				continue
 			}
 			if isSignalAccountInvalid(err, output) {
 				// Signal-side says the account is no longer registered /
 				// authorized. Don't clear b.account — we want the UI to
 				// know *which* account needs re-pairing. Instead flip
-				// needsReauth so the reconnect ticker stops retrying and
-				// the UI surfaces a clear "re-pair Signal" banner.
+				// needsReauth so the supervisor parks and the UI surfaces a
+				// clear "re-pair Signal" banner.
 				b.mu.Lock()
 				if b.receiveToken == token {
 					b.receiveCancel = nil
@@ -1052,7 +1392,12 @@ func (b *Bridge) startReceiveLoop(account string, requestSync bool) {
 				b.logger.Warn().Str("account", b.account).Msg("Signal account needs re-pairing (signal-cli reports unregistered/unauthorized)")
 				b.mu.Unlock()
 				b.emitStatusChange()
-				return
+				return PollerExit{
+					Kind:        PollerFailureReauth,
+					Operation:   "receive",
+					Fingerprint: SignalAccountInvalidFingerprint,
+					Err:         commandError("receive Signal messages", err, output),
+				}
 			}
 			poisonFingerprint := signalReceivePoisonFingerprint(err, output)
 			if poisonFingerprint == "" {
@@ -1067,11 +1412,17 @@ func (b *Bridge) startReceiveLoop(account string, requestSync bool) {
 			consecutiveFailures++
 			receiveErr := commandError("receive Signal messages", err, output)
 			if consecutivePoisonFailures >= receivePoisonLimit {
-				b.parkUpgradeRequired(token, fmt.Sprintf(
+				detail := fmt.Sprintf(
 					"signal-cli repeatedly failed in IncomingMessageHandler.getSender() because content is null; upgrade signal-cli to %s or newer",
 					minimumSignalCLIVersion,
-				))
-				return
+				)
+				b.parkUpgradeRequired(token, detail)
+				return PollerExit{
+					Kind:        PollerFailureUpgrade,
+					Operation:   "receive",
+					Fingerprint: signalGetSenderPoisonFingerprint,
+					Err:         errors.New(detail),
+				}
 			}
 			if consecutiveFailures >= receiveFailureLimit {
 				b.logger.Warn().Err(receiveErr).Int("failures", consecutiveFailures).Msg("Signal receive polling repeatedly failed; forcing reconnect")
@@ -1084,7 +1435,12 @@ func (b *Bridge) startReceiveLoop(account string, requestSync bool) {
 				b.lastError = cleanSignalCommandOutput(err, output)
 				b.mu.Unlock()
 				b.emitStatusChange()
-				return
+				return PollerExit{
+					Kind:        PollerFailureTransient,
+					Operation:   "receive",
+					Fingerprint: SignalReceiveFailureFingerprint,
+					Err:         receiveErr,
+				}
 			}
 			b.logger.Debug().Err(receiveErr).Int("failures", consecutiveFailures).Msg("Signal receive polling failed")
 			time.Sleep(500 * time.Millisecond)
@@ -1093,6 +1449,13 @@ func (b *Bridge) startReceiveLoop(account string, requestSync bool) {
 		consecutiveFailures = 0
 		consecutivePoisonFailures = 0
 		lastPoisonFingerprint = ""
+		if run != nil {
+			detail := "receive_poll"
+			if len(bytes.TrimSpace(output)) != 0 {
+				detail = "receive_batch"
+			}
+			run.beat(detail)
+		}
 		if len(bytes.TrimSpace(output)) == 0 {
 			continue
 		}
@@ -2280,16 +2643,12 @@ func (b *Bridge) cancelBackgroundWork(clearPairQR bool) {
 func (b *Bridge) usableAccount() (string, error) {
 	b.mu.RLock()
 	account := b.account
-	connected := b.connected
 	b.mu.RUnlock()
 	if account == "" {
 		account = b.firstStoredAccount()
 	}
 	if account == "" {
 		return "", errors.New("signal is not paired")
-	}
-	if !connected {
-		_ = b.ConnectIfPaired()
 	}
 	return account, nil
 }
@@ -3274,8 +3633,48 @@ func extractSignalLinkURI(line string) string {
 	return strings.TrimSpace(line[idx:])
 }
 
+// CommandError identifies a signal-cli subprocess failure. App-level send
+// wrappers use this marker to notify the lifecycle owner without turning local
+// validation, file, or database errors into reconnects.
+type CommandError struct {
+	message string
+}
+
+func (e *CommandError) Error() string { return e.message }
+
 func commandError(prefix string, err error, output []byte) error {
-	return fmt.Errorf("%s: %s", prefix, cleanSignalCommandOutput(err, output))
+	return &CommandError{message: fmt.Sprintf("%s: %s", prefix, cleanSignalCommandOutput(err, output))}
+}
+
+// NewCommandError builds a signal-cli command-failure marker carrying message as
+// its text. Production send paths use the internal commandError constructor;
+// this exported form lets callers and tests synthesize the exact marker that App
+// send wrappers hand to the lifecycle owner via ReportError.
+func NewCommandError(message string) *CommandError {
+	return &CommandError{message: message}
+}
+
+func IsCommandError(err error) bool {
+	var commandErr *CommandError
+	return errors.As(err, &commandErr)
+}
+
+func IsAccountInvalidError(err error) bool {
+	return isSignalAccountInvalid(err, nil)
+}
+
+// IsSendAccountInvalidError reports whether a signal-cli *send* failure
+// unambiguously indicts the local account's own credentials rather than the
+// message recipient. signal-cli reports an unregistered recipient with the same
+// "not registered" phrasing it uses for an unregistered local account, so send
+// paths must NOT treat that phrase as a local-account fault: the account-scoped
+// receive probe (probe_account -> PollerFailureReauth) is the authoritative
+// detector and parks reauth on its own within seconds. "authorization failed"
+// and "invalid account" name the local account/credentials and never a
+// recipient, so they stay safe to act on from a send. See isSignalAccountInvalid
+// for the broader receive/probe matcher that also accepts "not registered".
+func IsSendAccountInvalidError(err error) bool {
+	return isSignalSendAccountInvalid(err, nil)
 }
 
 func cleanSignalCommandOutput(err error, output []byte) string {
@@ -3297,6 +3696,16 @@ func isSignalAccountInvalid(err error, output []byte) bool {
 	text := strings.ToLower(cleanSignalCommandOutput(err, output))
 	return strings.Contains(text, "not registered") ||
 		strings.Contains(text, "authorization failed") ||
+		strings.Contains(text, "invalid account")
+}
+
+// isSignalSendAccountInvalid is the send-context subset of isSignalAccountInvalid:
+// it matches only the phrases that unambiguously indict the local account and
+// omits "not registered", which a send commonly reports for an unregistered
+// *recipient*. Keep this list a strict subset of isSignalAccountInvalid.
+func isSignalSendAccountInvalid(err error, output []byte) bool {
+	text := strings.ToLower(cleanSignalCommandOutput(err, output))
+	return strings.Contains(text, "authorization failed") ||
 		strings.Contains(text, "invalid account")
 }
 

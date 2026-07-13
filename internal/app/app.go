@@ -166,6 +166,8 @@ type App struct {
 	googlePhoneRespondingSeen atomic.Bool
 	googleLifecycleMu         sync.RWMutex
 	googleLifecycleNotifier   GoogleLifecycleNotifier
+	signalLifecycleMu         sync.RWMutex
+	signalLifecycleNotifier   SignalLifecycleNotifier
 	tempDataDir               string
 	pendingMediaMu            sync.Mutex
 	pendingMedia              map[string]struct{}
