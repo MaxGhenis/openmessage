@@ -145,8 +145,13 @@ func (r *AttachmentRepository) ListUnreferencedBlobHashes(
 		}
 
 		rows, err := r.store.db.QueryContext(ctx, `
-			SELECT DISTINCT blob_hash
-			FROM attachments
+			WITH referenced (blob_hash) AS (
+				SELECT blob_hash FROM attachments
+				UNION
+				SELECT blob_hash FROM outbox_attachments
+			)
+			SELECT blob_hash
+			FROM referenced
 			WHERE blob_hash IN (`+placeholders+`)
 		`, arguments...)
 		if err != nil {

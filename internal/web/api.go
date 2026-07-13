@@ -27,6 +27,7 @@ import (
 	"github.com/maxghenis/openmessage/internal/app"
 	"github.com/maxghenis/openmessage/internal/client"
 	"github.com/maxghenis/openmessage/internal/db"
+	"github.com/maxghenis/openmessage/internal/messaging"
 	"github.com/maxghenis/openmessage/internal/story"
 	"github.com/maxghenis/openmessage/internal/whatsapplive"
 )
@@ -39,7 +40,7 @@ var staticFS embed.FS
 // ~64MB, MMS ~1MB) while keeping a runaway POST from exhausting memory. It is a
 // var (not a const) only so tests can shrink it; it is never mutated in
 // production.
-var maxUploadBytes int64 = 128 << 20
+var maxUploadBytes int64 = messaging.DefaultMaxMediaBytes
 
 const maxTranscriptRequestBytes = db.MaxTranscriptBytes + db.MaxTranscriptModelBytes + 4096
 

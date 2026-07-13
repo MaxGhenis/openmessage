@@ -2,9 +2,11 @@ package sqlite
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"path/filepath"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -168,6 +170,231 @@ func TestOutboxEnqueueOutgoingMessageIsAtomicAndDeduplicated(t *testing.T) {
 	}
 	assertRowCount(t, store.db, "outbox", 4)
 	assertRowCount(t, store.db, "messages", 2)
+}
+
+func TestOutboxEnqueueOutgoingMediaMessageRoundTripAndDeduplicates(t *testing.T) {
+	clock := newOutboxTestClock(outboxTestTimeMS)
+	store, repository := openOutboxTestRepository(t, clock.Now)
+	seedMessageIdentity(t, store, "identity-a", "account-a")
+	seedMessageConversation(t, store, "conversation-a", "account-a")
+	ctx := context.Background()
+
+	item := outboxTestMediaItem("media")
+	message := outboxTestOutgoingMessage(item, "photo caption")
+	attachment := outboxTestAttachment()
+	row, disposition, err := repository.EnqueueOutgoingMediaMessage(ctx, item, message, attachment)
+	if err != nil {
+		t.Fatalf("EnqueueOutgoingMediaMessage(): %v", err)
+	}
+	if disposition != EnqueueInserted || row.OutboxID != item.OutboxID {
+		t.Fatalf("EnqueueOutgoingMediaMessage() = (%+v, %q), want inserted", row, disposition)
+	}
+
+	got, err := repository.GetOutboxAttachment(ctx, item.OutboxID)
+	if err != nil {
+		t.Fatalf("GetOutboxAttachment(): %v", err)
+	}
+	want := attachment
+	want.OutboxID = item.OutboxID
+	want.Ordinal = 0
+	want.CreatedAtMS = outboxTestTimeMS
+	if got != want {
+		t.Fatalf("GetOutboxAttachment() = %+v, want %+v", got, want)
+	}
+
+	messageRepository, err := NewMessageRepository(store, clock.Now)
+	if err != nil {
+		t.Fatalf("NewMessageRepository(): %v", err)
+	}
+	gotMessage, err := messageRepository.GetMessage(ctx, item.LocalMessageID)
+	if err != nil {
+		t.Fatalf("GetMessage(): %v", err)
+	}
+	if gotMessage.Body != message.Body {
+		t.Fatalf("optimistic media message body = %q, want caption %q", gotMessage.Body, message.Body)
+	}
+
+	clock.Set(outboxTestTimeMS + 500)
+	duplicate := item
+	duplicate.OutboxID = "outbox-unused-media-duplicate"
+	duplicate.LocalMessageID = "message-unused-media-duplicate"
+	duplicate.TransportRequestID = "request-unused-media-duplicate"
+	duplicateRow, disposition, err := repository.EnqueueOutgoingMediaMessage(
+		ctx,
+		duplicate,
+		Message{},
+		attachment,
+	)
+	if err != nil {
+		t.Fatalf("EnqueueOutgoingMediaMessage(duplicate): %v", err)
+	}
+	if disposition != EnqueueExisting || duplicateRow.OutboxID != item.OutboxID {
+		t.Fatalf("duplicate result = (%+v, %q), want original", duplicateRow, disposition)
+	}
+	assertRowCount(t, store.db, "outbox", 1)
+	assertRowCount(t, store.db, "messages", 1)
+	assertRowCount(t, store.db, "outbox_attachments", 1)
+
+	if _, err := repository.GetOutboxAttachment(ctx, "missing"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("GetOutboxAttachment(missing) error = %v, want sql.ErrNoRows", err)
+	}
+}
+
+func TestOutboxEnqueueOutgoingMediaMessageRollsBackAttachmentInsertFailure(t *testing.T) {
+	clock := newOutboxTestClock(outboxTestTimeMS)
+	store, repository := openOutboxTestRepository(t, clock.Now)
+	seedMessageIdentity(t, store, "identity-a", "account-a")
+	seedMessageConversation(t, store, "conversation-a", "account-a")
+	mustExec(t, store.db, `
+		CREATE TRIGGER fail_outbox_attachment_insert
+		BEFORE INSERT ON outbox_attachments
+		BEGIN
+			SELECT RAISE(ABORT, 'injected outbox attachment failure');
+		END
+	`)
+
+	item := outboxTestMediaItem("atomic-failure")
+	_, _, err := repository.EnqueueOutgoingMediaMessage(
+		context.Background(),
+		item,
+		outboxTestOutgoingMessage(item, "must roll back"),
+		outboxTestAttachment(),
+	)
+	if err == nil {
+		t.Fatal("EnqueueOutgoingMediaMessage() succeeded, want injected attachment failure")
+	}
+	assertRowCount(t, store.db, "outbox", 0)
+	assertRowCount(t, store.db, "messages", 0)
+	assertRowCount(t, store.db, "outbox_attachments", 0)
+}
+
+func TestOutboxEnqueueValidatesMediaAttachmentPair(t *testing.T) {
+	clock := newOutboxTestClock(outboxTestTimeMS)
+	store, repository := openOutboxTestRepository(t, clock.Now)
+	seedMessageIdentity(t, store, "identity-a", "account-a")
+	seedMessageConversation(t, store, "conversation-a", "account-a")
+	ctx := context.Background()
+
+	tests := []struct {
+		name    string
+		enqueue func() error
+	}{
+		{
+			name: "media without attachment",
+			enqueue: func() error {
+				item := outboxTestMediaItem("missing-attachment")
+				_, _, err := repository.EnqueueOutgoingMessage(
+					ctx,
+					item,
+					outboxTestOutgoingMessage(item, "caption"),
+				)
+				return err
+			},
+		},
+		{
+			name: "text with attachment",
+			enqueue: func() error {
+				item := outboxTestItem("text-attachment")
+				_, _, err := repository.EnqueueOutgoingMediaMessage(
+					ctx,
+					item,
+					outboxTestOutgoingMessage(item, "body"),
+					outboxTestAttachment(),
+				)
+				return err
+			},
+		},
+		{
+			name: "invalid blob hash",
+			enqueue: func() error {
+				item := outboxTestMediaItem("invalid-hash")
+				attachment := outboxTestAttachment()
+				attachment.BlobHash = "not-a-sha256"
+				_, _, err := repository.EnqueueOutgoingMediaMessage(
+					ctx, item, outboxTestOutgoingMessage(item, "caption"), attachment,
+				)
+				return err
+			},
+		},
+		{
+			name: "nonpositive size",
+			enqueue: func() error {
+				item := outboxTestMediaItem("invalid-size")
+				attachment := outboxTestAttachment()
+				attachment.SizeBytes = 0
+				_, _, err := repository.EnqueueOutgoingMediaMessage(
+					ctx, item, outboxTestOutgoingMessage(item, "caption"), attachment,
+				)
+				return err
+			},
+		},
+		{
+			name: "empty MIME",
+			enqueue: func() error {
+				item := outboxTestMediaItem("invalid-mime")
+				attachment := outboxTestAttachment()
+				attachment.MIME = " \t"
+				_, _, err := repository.EnqueueOutgoingMediaMessage(
+					ctx, item, outboxTestOutgoingMessage(item, "caption"), attachment,
+				)
+				return err
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if err := test.enqueue(); err == nil {
+				t.Fatal("enqueue succeeded, want validation error")
+			}
+		})
+	}
+	assertRowCount(t, store.db, "outbox", 0)
+	assertRowCount(t, store.db, "messages", 0)
+	assertRowCount(t, store.db, "outbox_attachments", 0)
+}
+
+func TestOutboxAttachmentCascadesAndExistingMediaRequiresAttachment(t *testing.T) {
+	clock := newOutboxTestClock(outboxTestTimeMS)
+	store, repository := openOutboxTestRepository(t, clock.Now)
+	seedMessageIdentity(t, store, "identity-a", "account-a")
+	seedMessageConversation(t, store, "conversation-a", "account-a")
+	ctx := context.Background()
+
+	item := outboxTestMediaItem("cascade")
+	if _, _, err := repository.EnqueueOutgoingMediaMessage(
+		ctx,
+		item,
+		outboxTestOutgoingMessage(item, "caption"),
+		outboxTestAttachment(),
+	); err != nil {
+		t.Fatalf("EnqueueOutgoingMediaMessage(): %v", err)
+	}
+	assertRowCount(t, store.db, "outbox_attachments", 1)
+	mustExec(t, store.db, `DELETE FROM outbox WHERE outbox_id = ?`, item.OutboxID)
+	assertRowCount(t, store.db, "outbox_attachments", 0)
+
+	item = outboxTestMediaItem("missing-existing-attachment")
+	if _, _, err := repository.EnqueueOutgoingMediaMessage(
+		ctx,
+		item,
+		outboxTestOutgoingMessage(item, "caption"),
+		outboxTestAttachment(),
+	); err != nil {
+		t.Fatalf("EnqueueOutgoingMediaMessage(second): %v", err)
+	}
+	mustExec(t, store.db, `DELETE FROM outbox_attachments WHERE outbox_id = ?`, item.OutboxID)
+	duplicate := item
+	duplicate.OutboxID = "outbox-unused-missing-existing-attachment"
+	duplicate.LocalMessageID = "message-unused-missing-existing-attachment"
+	duplicate.TransportRequestID = "request-unused-missing-existing-attachment"
+	if _, _, err := repository.EnqueueOutgoingMediaMessage(
+		ctx,
+		duplicate,
+		Message{},
+		outboxTestAttachment(),
+	); err == nil {
+		t.Fatal("EnqueueOutgoingMediaMessage(existing without attachment) succeeded")
+	}
 }
 
 func TestOutboxLeaseDueRespectsScheduleRetryAndLiveLease(t *testing.T) {
@@ -689,10 +916,10 @@ func TestOutboxMigrationIsChecksummedAndStrict(t *testing.T) {
 	store, _ := openOutboxTestRepository(t, func() time.Time {
 		return time.UnixMilli(outboxTestTimeMS)
 	})
-	if len(embeddedMigrations) != 5 {
-		t.Fatalf("embedded migrations = %d, want 5", len(embeddedMigrations))
+	if len(embeddedMigrations) != 6 {
+		t.Fatalf("embedded migrations = %d, want 6", len(embeddedMigrations))
 	}
-	assertPragmaInt(t, store.db, "user_version", 5)
+	assertPragmaInt(t, store.db, "user_version", 6)
 	ledger := readLedgerRow(t, store.db, 5)
 	if ledger.name != "outbox" {
 		t.Fatalf("migration 0005 name = %q, want outbox", ledger.name)
@@ -710,6 +937,98 @@ func TestOutboxMigrationIsChecksummedAndStrict(t *testing.T) {
 	}
 	if strict != 1 {
 		t.Fatalf("outbox strict = %d, want 1", strict)
+	}
+}
+
+func TestOutboxAttachmentsMigrationAppliesToBlankAndExistingV5Database(t *testing.T) {
+	t.Run("blank", func(t *testing.T) {
+		store, err := Open(filepath.Join(t.TempDir(), "store.sqlite3"))
+		if err != nil {
+			t.Fatalf("Open(): %v", err)
+		}
+		t.Cleanup(func() {
+			if err := store.Close(); err != nil {
+				t.Errorf("Close(): %v", err)
+			}
+		})
+		assertOutboxAttachmentsMigration(t, store)
+	})
+
+	t.Run("existing v5", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "store.sqlite3")
+		db, err := sql.Open("sqlite", storeDSN(path))
+		if err != nil {
+			t.Fatalf("sql.Open(): %v", err)
+		}
+		if err := db.Ping(); err != nil {
+			_ = db.Close()
+			t.Fatalf("Ping(): %v", err)
+		}
+		if err := enableWAL(context.Background(), db); err != nil {
+			_ = db.Close()
+			t.Fatalf("enableWAL(): %v", err)
+		}
+		if err := verifyConnectionPragmas(context.Background(), db); err != nil {
+			_ = db.Close()
+			t.Fatalf("verifyConnectionPragmas(): %v", err)
+		}
+		if err := runMigrations(context.Background(), db, embeddedMigrations[:5]); err != nil {
+			_ = db.Close()
+			t.Fatalf("runMigrations(v5): %v", err)
+		}
+		before := readLedgerRows(t, db)
+		if len(before) != 5 {
+			_ = db.Close()
+			t.Fatalf("v5 ledger rows = %d, want 5", len(before))
+		}
+		if err := db.Close(); err != nil {
+			t.Fatalf("close v5 database: %v", err)
+		}
+
+		store, err := Open(path)
+		if err != nil {
+			t.Fatalf("Open(v5): %v", err)
+		}
+		t.Cleanup(func() {
+			if err := store.Close(); err != nil {
+				t.Errorf("Close(): %v", err)
+			}
+		})
+		after := readLedgerRows(t, store.db)
+		if len(after) != 6 {
+			t.Fatalf("migrated ledger rows = %d, want 6", len(after))
+		}
+		if !slices.Equal(after[:5], before) {
+			t.Fatalf("migrations 0001-0005 changed:\nbefore: %+v\nafter:  %+v", before, after[:5])
+		}
+		assertOutboxAttachmentsMigration(t, store)
+	})
+}
+
+func assertOutboxAttachmentsMigration(t *testing.T, store *Store) {
+	t.Helper()
+	assertPragmaInt(t, store.db, "user_version", 6)
+	ledger := readLedgerRow(t, store.db, 6)
+	if ledger.name != "outbox_attachments" {
+		t.Fatalf("migration 0006 name = %q, want outbox_attachments", ledger.name)
+	}
+	if ledger.checksum != embeddedMigrations[5].checksumSHA256 {
+		t.Fatalf(
+			"migration 0006 checksum = %q, want %q",
+			ledger.checksum,
+			embeddedMigrations[5].checksumSHA256,
+		)
+	}
+	var strict int
+	if err := store.db.QueryRow(`
+		SELECT strict
+		FROM pragma_table_list
+		WHERE schema = 'main' AND name = 'outbox_attachments'
+	`).Scan(&strict); err != nil {
+		t.Fatalf("read outbox_attachments STRICT flag: %v", err)
+	}
+	if strict != 1 {
+		t.Fatalf("outbox_attachments strict = %d, want 1", strict)
 	}
 }
 
@@ -767,6 +1086,22 @@ func outboxTestItem(id string) NewOutboxItem {
 		Operation:          "send_text",
 		LocalMessageID:     "message-" + id,
 		TransportRequestID: "request-" + id,
+	}
+}
+
+func outboxTestMediaItem(id string) NewOutboxItem {
+	item := outboxTestItem(id)
+	item.Kind = OutboxKindMedia
+	item.Operation = "send_media"
+	return item
+}
+
+func outboxTestAttachment() OutboxAttachment {
+	return OutboxAttachment{
+		BlobHash:  "abababababababababababababababababababababababababababababababab",
+		SizeBytes: 42,
+		MIME:      "image/png",
+		Filename:  "photo.png",
 	}
 }
 

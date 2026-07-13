@@ -1,15 +1,20 @@
 package messaging
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
+	"io"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/maxghenis/openmessage/internal/bridge"
+	"github.com/maxghenis/openmessage/internal/storage/blob"
 	"github.com/maxghenis/openmessage/internal/storage/sqlite"
 )
 
@@ -361,6 +366,291 @@ func TestDuplicateSendTextReturnsSameSubmissionAndDispatchesOnce(t *testing.T) {
 	}
 }
 
+func TestSendMediaWritesBlobAndDurableRows(t *testing.T) {
+	clock := newManualClock(messagingTestTime)
+	store := openMessagingTestStore(t, clock.Now())
+	blobs, blobRoot := newMessagingTestBlobStore(t)
+	registry := newScriptedRegistry("media-platform", nil)
+	registry.setMediaSender(&scriptedMediaSender{})
+	service := newMessagingTestServiceWithBlobs(t, store, registry, blobs, clock)
+	content := []byte("durable media content")
+
+	submission := mustSendMedia(t, service, SendMediaCommand{
+		CommonCommand: testCommonCommand("key-media-happy"),
+		Content:       bytes.NewReader(content),
+		Filename:      "  photo.test  ",
+		MIME:          "  application/x-openmessage-test  ",
+		Caption:       "a durable caption",
+	})
+
+	item := mustOutboxItem(t, service, submission.OutboxID)
+	if item.Kind != sqlite.OutboxKindMedia || item.Operation != mediaOperation ||
+		item.LocalMessageID == nil || *item.LocalMessageID != submission.LocalMessageID {
+		t.Fatalf("media outbox item = %+v", item)
+	}
+	message, err := service.messages.GetMessage(context.Background(), submission.LocalMessageID)
+	if err != nil {
+		t.Fatalf("GetMessage(): %v", err)
+	}
+	if message.Body != "a durable caption" || message.Direction != sqlite.MessageDirectionOutgoing ||
+		message.RemoteMessageID != item.TransportRequestID || message.ReplyToRemoteID != nil {
+		t.Fatalf("optimistic media message = %+v", message)
+	}
+	attachment, err := service.outbox.GetOutboxAttachment(context.Background(), submission.OutboxID)
+	if err != nil {
+		t.Fatalf("GetOutboxAttachment(): %v", err)
+	}
+	wantHash := fmt.Sprintf("%x", sha256.Sum256(content))
+	if attachment.OutboxID != submission.OutboxID || attachment.Ordinal != 0 ||
+		attachment.BlobHash != wantHash || attachment.SizeBytes != int64(len(content)) ||
+		attachment.MIME != "application/x-openmessage-test" || attachment.Filename != "photo.test" {
+		t.Fatalf("outbox attachment = %+v", attachment)
+	}
+	reader, err := blobs.Open(blob.BlobRef{Hash: attachment.BlobHash})
+	if err != nil {
+		t.Fatalf("Open(blob): %v", err)
+	}
+	gotContent, readErr := io.ReadAll(reader)
+	closeErr := reader.Close()
+	if readErr != nil || closeErr != nil {
+		t.Fatalf("read blob = %v, close = %v", readErr, closeErr)
+	}
+	if !bytes.Equal(gotContent, content) {
+		t.Fatalf("blob content = %q, want %q", gotContent, content)
+	}
+	if files := messagingBlobFiles(t, blobRoot); len(files) != 1 {
+		t.Fatalf("blob files = %v, want one", files)
+	}
+}
+
+func TestDuplicateSendMediaReturnsSameSubmissionAndOneDurableSet(t *testing.T) {
+	clock := newManualClock(messagingTestTime)
+	store := openMessagingTestStore(t, clock.Now())
+	blobs, blobRoot := newMessagingTestBlobStore(t)
+	registry := newScriptedRegistry("media-deduplicate", nil)
+	registry.setMediaSender(&scriptedMediaSender{})
+	service := newMessagingTestServiceWithBlobs(t, store, registry, blobs, clock)
+	content := []byte("deduplicate this attachment")
+	command := func(mime, filename string) SendMediaCommand {
+		return SendMediaCommand{
+			CommonCommand: testCommonCommand("key-media-same"),
+			Content:       bytes.NewReader(content),
+			Filename:      filename,
+			MIME:          mime,
+			Caption:       "same caption",
+		}
+	}
+
+	first := mustSendMedia(t, service, command(" image/test ", " image.bin "))
+	second := mustSendMedia(t, service, command("image/test", "image.bin"))
+	if first != second {
+		t.Fatalf("duplicate media submissions differ: first=%+v second=%+v", first, second)
+	}
+	if files := messagingBlobFiles(t, blobRoot); len(files) != 1 {
+		t.Fatalf("duplicate media left blob files %v, want one", files)
+	}
+	if _, err := service.outbox.FindByID(context.Background(), "id-004"); !errors.Is(err, sqlite.ErrNotFound) {
+		t.Fatalf("duplicate candidate outbox error = %v, want ErrNotFound", err)
+	}
+	if _, err := service.messages.GetMessage(context.Background(), "id-005"); !errors.Is(err, sqlite.ErrNotFound) {
+		t.Fatalf("duplicate candidate message error = %v, want ErrNotFound", err)
+	}
+}
+
+func TestSendMediaIdempotencyConflictCoversCaptionAndFilename(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*SendMediaCommand)
+	}{
+		{name: "caption", mutate: func(cmd *SendMediaCommand) { cmd.Caption = "changed caption" }},
+		{name: "filename", mutate: func(cmd *SendMediaCommand) { cmd.Filename = "changed.bin" }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			clock := newManualClock(messagingTestTime)
+			store := openMessagingTestStore(t, clock.Now())
+			blobs, _ := newMessagingTestBlobStore(t)
+			registry := newScriptedRegistry("media-conflict", nil)
+			registry.setMediaSender(&scriptedMediaSender{})
+			service := newMessagingTestServiceWithBlobs(t, store, registry, blobs, clock)
+			content := []byte("same content")
+			command := SendMediaCommand{
+				CommonCommand: testCommonCommand("key-media-conflict"),
+				Content:       bytes.NewReader(content),
+				Filename:      "original.bin",
+				MIME:          "application/test",
+				Caption:       "original caption",
+			}
+			mustSendMedia(t, service, command)
+
+			test.mutate(&command)
+			command.Content = bytes.NewReader(content)
+			if _, err := service.SendMedia(context.Background(), command); !errors.Is(err, ErrIdempotencyConflict) {
+				t.Fatalf("SendMedia(changed %s) error = %v, want ErrIdempotencyConflict", test.name, err)
+			}
+		})
+	}
+}
+
+func TestSendMediaRejectsTooLargeAndEmptyContent(t *testing.T) {
+	tests := []struct {
+		name    string
+		content []byte
+		max     int64
+	}{
+		{name: "too large", content: []byte("12345"), max: 4},
+		{name: "empty", content: nil, max: 4},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			clock := newManualClock(messagingTestTime)
+			store := openMessagingTestStore(t, clock.Now())
+			blobs, blobRoot := newMessagingTestBlobStore(t)
+			registry := newScriptedRegistry("media-size", nil)
+			registry.setMediaSender(&scriptedMediaSender{})
+			service := newMessagingTestServiceWithBlobs(t, store, registry, blobs, clock)
+			service.maxMediaBytes = test.max
+
+			_, err := service.SendMedia(context.Background(), SendMediaCommand{
+				CommonCommand: testCommonCommand("key-media-size"),
+				Content:       bytes.NewReader(test.content),
+				MIME:          "application/test",
+			})
+			if !errors.Is(err, ErrInvalidCommand) {
+				t.Fatalf("SendMedia() error = %v, want ErrInvalidCommand", err)
+			}
+			if _, err := service.outbox.FindByID(context.Background(), "id-001"); !errors.Is(err, sqlite.ErrNotFound) {
+				t.Fatalf("invalid media outbox error = %v, want ErrNotFound", err)
+			}
+			if test.name == "too large" {
+				if files := messagingBlobFiles(t, blobRoot); len(files) != 0 {
+					t.Fatalf("oversize media left blob files: %v", files)
+				}
+			}
+		})
+	}
+}
+
+func TestSendMediaCapabilityGatePrecedesBlobAndConversationWork(t *testing.T) {
+	clock := newManualClock(messagingTestTime)
+	store := openMessagingTestStore(t, clock.Now())
+	blobs, blobRoot := newMessagingTestBlobStore(t)
+	service := newMessagingTestServiceWithBlobs(
+		t,
+		store,
+		newScriptedRegistry("media-unsupported", nil),
+		blobs,
+		clock,
+	)
+	content := []byte("must not be consumed")
+	reader := bytes.NewReader(content)
+	command := SendMediaCommand{
+		CommonCommand: CommonCommand{
+			AccountID:      "account-1",
+			ConversationID: "missing-conversation",
+			IdempotencyKey: "key-media-unsupported",
+		},
+		Content: reader,
+		MIME:    "application/test",
+	}
+
+	if _, err := service.SendMedia(context.Background(), command); !errors.Is(err, ErrUnsupported) {
+		t.Fatalf("SendMedia(unsupported) error = %v, want ErrUnsupported", err)
+	}
+	if reader.Len() != len(content) {
+		t.Fatalf("unsupported SendMedia consumed %d bytes, want 0", len(content)-reader.Len())
+	}
+	if files := messagingBlobFiles(t, blobRoot); len(files) != 0 {
+		t.Fatalf("unsupported SendMedia left blob files: %v", files)
+	}
+	if _, err := service.outbox.FindByID(context.Background(), "id-001"); !errors.Is(err, sqlite.ErrNotFound) {
+		t.Fatalf("unsupported media outbox error = %v, want ErrNotFound", err)
+	}
+}
+
+func TestSendMediaDefaultsMIMEAndAllowsEmptyCaption(t *testing.T) {
+	clock := newManualClock(messagingTestTime)
+	store := openMessagingTestStore(t, clock.Now())
+	blobs, _ := newMessagingTestBlobStore(t)
+	registry := newScriptedRegistry("media-defaults", nil)
+	registry.setMediaSender(&scriptedMediaSender{})
+	service := newMessagingTestServiceWithBlobs(t, store, registry, blobs, clock)
+
+	submission := mustSendMedia(t, service, SendMediaCommand{
+		CommonCommand: testCommonCommand("key-media-defaults"),
+		Content:       bytes.NewReader([]byte("content")),
+		Filename:      "  no-caption.bin  ",
+		MIME:          " \t ",
+	})
+	attachment, err := service.outbox.GetOutboxAttachment(context.Background(), submission.OutboxID)
+	if err != nil {
+		t.Fatalf("GetOutboxAttachment(): %v", err)
+	}
+	if attachment.MIME != "application/octet-stream" || attachment.Filename != "no-caption.bin" {
+		t.Fatalf("normalized attachment = %+v", attachment)
+	}
+	message, err := service.messages.GetMessage(context.Background(), submission.LocalMessageID)
+	if err != nil {
+		t.Fatalf("GetMessage(): %v", err)
+	}
+	if message.Body != "" {
+		t.Fatalf("empty caption body = %q, want empty", message.Body)
+	}
+}
+
+func TestSendMediaValidatesContentAndFilename(t *testing.T) {
+	tests := []struct {
+		name     string
+		content  io.Reader
+		filename string
+	}{
+		{name: "nil content", content: nil},
+		{name: "filename too long", content: bytes.NewReader([]byte("x")), filename: strings.Repeat("x", 513)},
+		{name: "filename contains NUL", content: bytes.NewReader([]byte("x")), filename: "bad\x00name"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			clock := newManualClock(messagingTestTime)
+			store := openMessagingTestStore(t, clock.Now())
+			blobs, blobRoot := newMessagingTestBlobStore(t)
+			registry := newScriptedRegistry("media-validation", nil)
+			registry.setMediaSender(&scriptedMediaSender{})
+			service := newMessagingTestServiceWithBlobs(t, store, registry, blobs, clock)
+
+			_, err := service.SendMedia(context.Background(), SendMediaCommand{
+				CommonCommand: testCommonCommand("key-media-validation"),
+				Content:       test.content,
+				Filename:      test.filename,
+			})
+			if !errors.Is(err, ErrInvalidCommand) {
+				t.Fatalf("SendMedia() error = %v, want ErrInvalidCommand", err)
+			}
+			if files := messagingBlobFiles(t, blobRoot); len(files) != 0 {
+				t.Fatalf("invalid command left blob files: %v", files)
+			}
+		})
+	}
+}
+
+func TestSendMediaWithoutBlobStoreReturnsConfigurationError(t *testing.T) {
+	clock := newManualClock(messagingTestTime)
+	store := openMessagingTestStore(t, clock.Now())
+	registry := newScriptedRegistry("media-no-blob-store", nil)
+	registry.setMediaSender(&scriptedMediaSender{})
+	service, err := NewMessageService(store, registry, nil, clock, &sequentialIDs{})
+	if err != nil {
+		t.Fatalf("NewMessageService(nil blobs): %v", err)
+	}
+
+	_, err = service.SendMedia(context.Background(), SendMediaCommand{
+		CommonCommand: testCommonCommand("key-media-no-blob-store"),
+		Content:       bytes.NewReader([]byte("content")),
+	})
+	if err == nil || !strings.Contains(err.Error(), "blob store is not configured") {
+		t.Fatalf("SendMedia(nil blobs) error = %v, want configuration error", err)
+	}
+}
+
 func TestCancelAndDeferredAPIs(t *testing.T) {
 	clock := newManualClock(messagingTestTime)
 	store := openMessagingTestStore(t, clock.Now())
@@ -443,11 +733,57 @@ func (s *scriptedTextSender) snapshotRequests() []bridge.TextRequest {
 	return append([]bridge.TextRequest(nil), s.requests...)
 }
 
+type scriptedMediaSender struct {
+	mu       sync.Mutex
+	steps    []sendStep
+	requests []bridge.MediaRequest
+	onSend   func()
+}
+
+func (s *scriptedMediaSender) SendMedia(
+	_ context.Context,
+	request bridge.MediaRequest,
+) (bridge.SendResult, error) {
+	content, readErr := io.ReadAll(request.Reader)
+	request.Reader = bytes.NewReader(content)
+
+	s.mu.Lock()
+	s.requests = append(s.requests, request)
+	var step sendStep
+	if len(s.steps) > 0 {
+		step = s.steps[0]
+		s.steps = s.steps[1:]
+	}
+	onSend := s.onSend
+	s.mu.Unlock()
+	if onSend != nil {
+		onSend()
+	}
+	if readErr != nil {
+		return bridge.SendResult{}, readErr
+	}
+	return step.result, step.err
+}
+
+func (s *scriptedMediaSender) requestCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.requests)
+}
+
+func (s *scriptedMediaSender) snapshotRequests() []bridge.MediaRequest {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]bridge.MediaRequest(nil), s.requests...)
+}
+
 type scriptedRegistry struct {
-	mu        sync.Mutex
-	platform  bridge.Platform
-	sender    bridge.TextSender
-	available bool
+	mu                sync.Mutex
+	platform          bridge.Platform
+	sender            bridge.TextSender
+	media             bridge.MediaSender
+	mediaSendDeclared bool
+	available         bool
 }
 
 func newScriptedRegistry(platform bridge.Platform, sender bridge.TextSender) *scriptedRegistry {
@@ -457,6 +793,19 @@ func newScriptedRegistry(platform bridge.Platform, sender bridge.TextSender) *sc
 func (r *scriptedRegistry) setAvailable(available bool) {
 	r.mu.Lock()
 	r.available = available
+	r.mu.Unlock()
+}
+
+func (r *scriptedRegistry) setMediaSender(sender bridge.MediaSender) {
+	r.mu.Lock()
+	r.media = sender
+	r.mediaSendDeclared = sender != nil
+	r.mu.Unlock()
+}
+
+func (r *scriptedRegistry) setMediaSendDeclared(declared bool) {
+	r.mu.Lock()
+	r.mediaSendDeclared = declared
 	r.mu.Unlock()
 }
 
@@ -486,22 +835,36 @@ func (r *scriptedRegistry) Acquire(
 	if accountID != "account-1" || !r.available {
 		return nil, fmt.Errorf("%w: %s", bridge.ErrAccountNotRegistered, accountID)
 	}
-	if capability != bridge.CapabilityTextSend || r.sender == nil {
-		return nil, bridge.ErrCapabilityUnavailable
-	}
-	return &bridge.DispatchLease{
+	lease := &bridge.DispatchLease{
 		AccountID:  accountID,
 		Platform:   r.platform,
 		Generation: 7,
 		Ctx:        ctx,
-		Text:       r.sender,
-	}, nil
+	}
+	switch capability {
+	case bridge.CapabilityTextSend:
+		if r.sender == nil {
+			return nil, bridge.ErrCapabilityUnavailable
+		}
+		lease.Text = r.sender
+	case bridge.CapabilityMediaSend:
+		if r.media == nil {
+			return nil, bridge.ErrCapabilityUnavailable
+		}
+		lease.Media = r.media
+	default:
+		return nil, bridge.ErrCapabilityUnavailable
+	}
+	return lease, nil
 }
 
 func (r *scriptedRegistry) Capabilities(accountID string) bridge.CapabilitySet {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return bridge.CapabilitySet{TextSend: accountID == "account-1" && r.sender != nil}
+	return bridge.CapabilitySet{
+		TextSend:  accountID == "account-1" && r.sender != nil,
+		MediaSend: accountID == "account-1" && r.mediaSendDeclared,
+	}
 }
 
 type sequentialIDs struct {
@@ -546,11 +909,42 @@ func newMessagingTestService(
 	clock Clock,
 ) *MessageService {
 	t.Helper()
-	service, err := NewMessageService(store, registry, clock, &sequentialIDs{})
+	blobs, _ := newMessagingTestBlobStore(t)
+	return newMessagingTestServiceWithBlobs(t, store, registry, blobs, clock)
+}
+
+func newMessagingTestServiceWithBlobs(
+	t *testing.T,
+	store *sqlite.Store,
+	registry bridge.Registry,
+	blobs *blob.BlobStore,
+	clock Clock,
+) *MessageService {
+	t.Helper()
+	service, err := NewMessageService(store, registry, blobs, clock, &sequentialIDs{})
 	if err != nil {
 		t.Fatalf("NewMessageService(): %v", err)
 	}
 	return service
+}
+
+func newMessagingTestBlobStore(t *testing.T) (*blob.BlobStore, string) {
+	t.Helper()
+	root := filepath.Join(t.TempDir(), "blobs")
+	store, err := blob.New(root)
+	if err != nil {
+		t.Fatalf("blob.New(): %v", err)
+	}
+	return store, root
+}
+
+func messagingBlobFiles(t *testing.T, root string) []string {
+	t.Helper()
+	files, err := filepath.Glob(filepath.Join(root, "*", "*"))
+	if err != nil {
+		t.Fatalf("Glob(blob files): %v", err)
+	}
+	return files
 }
 
 func openMessagingTestStore(t *testing.T, now time.Time) *sqlite.Store {
@@ -607,6 +1001,15 @@ func mustSendText(t *testing.T, service *MessageService, command SendTextCommand
 	submission, err := service.SendText(context.Background(), command)
 	if err != nil {
 		t.Fatalf("SendText(): %v", err)
+	}
+	return submission
+}
+
+func mustSendMedia(t *testing.T, service *MessageService, command SendMediaCommand) Submission {
+	t.Helper()
+	submission, err := service.SendMedia(context.Background(), command)
+	if err != nil {
+		t.Fatalf("SendMedia(): %v", err)
 	}
 	return submission
 }

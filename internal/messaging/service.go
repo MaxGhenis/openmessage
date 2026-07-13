@@ -12,11 +12,16 @@ import (
 	"time"
 
 	"github.com/maxghenis/openmessage/internal/bridge"
+	"github.com/maxghenis/openmessage/internal/storage/blob"
 	"github.com/maxghenis/openmessage/internal/storage/sqlite"
 )
 
+// DefaultMaxMediaBytes is the default hard cap for one outgoing attachment.
+const DefaultMaxMediaBytes int64 = 128 << 20
+
 const (
 	textOperation       = "send_text"
+	mediaOperation      = "send_media"
 	defaultLeaseTime    = 30 * time.Second
 	defaultFinalizeTime = 5 * time.Second
 	defaultRetryDelay   = 5 * time.Second
@@ -25,20 +30,22 @@ const (
 	workerOwner         = "message-service"
 )
 
-// MessageService owns text intent submission and durable dispatch. Concrete
+// MessageService owns message intent submission and durable dispatch. Concrete
 // platform selection remains behind bridge.Registry.
 type MessageService struct {
 	store    *sqlite.Store
 	outbox   *sqlite.OutboxRepository
 	messages messageRepository
 	bridges  bridge.Registry
+	blobs    *blob.BlobStore
 	clock    Clock
 	ids      IDSource
 
-	leaseTime  time.Duration
-	retryDelay time.Duration
-	pollDelay  time.Duration
-	batchLimit int
+	leaseTime     time.Duration
+	retryDelay    time.Duration
+	pollDelay     time.Duration
+	maxMediaBytes int64
+	batchLimit    int
 
 	wake chan struct{}
 
@@ -46,11 +53,12 @@ type MessageService struct {
 	changed  chan struct{}
 }
 
-// NewMessageService constructs the text service over an existing SQLite
+// NewMessageService constructs the message service over an existing SQLite
 // store. The caller retains ownership of the store and registry.
 func NewMessageService(
 	store *sqlite.Store,
 	bridges bridge.Registry,
+	blobs *blob.BlobStore,
 	clock Clock,
 	ids IDSource,
 ) (*MessageService, error) {
@@ -75,18 +83,20 @@ func NewMessageService(
 		return nil, fmt.Errorf("create message service messages: %w", err)
 	}
 	return &MessageService{
-		store:      store,
-		outbox:     outbox,
-		messages:   messages,
-		bridges:    bridges,
-		clock:      clock,
-		ids:        ids,
-		leaseTime:  defaultLeaseTime,
-		retryDelay: defaultRetryDelay,
-		pollDelay:  defaultPollDelay,
-		batchLimit: defaultBatchLimit,
-		wake:       make(chan struct{}, 1),
-		changed:    make(chan struct{}),
+		store:         store,
+		outbox:        outbox,
+		messages:      messages,
+		bridges:       bridges,
+		blobs:         blobs,
+		clock:         clock,
+		ids:           ids,
+		leaseTime:     defaultLeaseTime,
+		retryDelay:    defaultRetryDelay,
+		pollDelay:     defaultPollDelay,
+		maxMediaBytes: DefaultMaxMediaBytes,
+		batchLimit:    defaultBatchLimit,
+		wake:          make(chan struct{}, 1),
+		changed:       make(chan struct{}),
 	}, nil
 }
 
@@ -173,6 +183,137 @@ func (s *MessageService) SendText(
 	})
 	if err != nil {
 		return Submission{}, fmt.Errorf("send text: %w", err)
+	}
+
+	submission := submissionFromItem(item)
+	if disposition == sqlite.EnqueueInserted {
+		s.signalChange()
+		s.signalWake()
+	}
+	return submission, nil
+}
+
+// SendMedia stores an attachment before atomically creating its optimistic
+// outgoing message, durable outbox intent, and blob metadata reference.
+func (s *MessageService) SendMedia(
+	ctx context.Context,
+	cmd SendMediaCommand,
+) (Submission, error) {
+	if ctx == nil {
+		return Submission{}, fmt.Errorf("send media: context is nil")
+	}
+	if err := validateSendMediaCommand(&cmd); err != nil {
+		return Submission{}, err
+	}
+	if !s.bridges.Capabilities(cmd.AccountID).MediaSend {
+		return Submission{}, ErrUnsupported
+	}
+
+	conversation, err := s.store.GetConversation(cmd.ConversationID)
+	if err != nil {
+		return Submission{}, fmt.Errorf("send media: read conversation: %w", err)
+	}
+	if conversation.AccountID != cmd.AccountID {
+		return Submission{}, fmt.Errorf(
+			"%w: conversation %q belongs to account %q, not %q",
+			ErrInvalidCommand,
+			cmd.ConversationID,
+			conversation.AccountID,
+			cmd.AccountID,
+		)
+	}
+
+	var replyToRemoteID *string
+	if cmd.ReplyToMessageID != "" {
+		reply, err := s.messages.GetMessage(ctx, cmd.ReplyToMessageID)
+		if err != nil {
+			return Submission{}, fmt.Errorf("send media: read reply target: %w", err)
+		}
+		if reply.AccountID != cmd.AccountID || reply.ConversationID != cmd.ConversationID {
+			return Submission{}, fmt.Errorf(
+				"%w: reply target %q is outside conversation %q",
+				ErrInvalidCommand,
+				cmd.ReplyToMessageID,
+				cmd.ConversationID,
+			)
+		}
+		replyToRemoteID = &reply.RemoteMessageID
+	}
+
+	if s.blobs == nil {
+		return Submission{}, fmt.Errorf("send media: blob store is not configured")
+	}
+	ref, err := s.blobs.Put(ctx, cmd.Content, cmd.MIME, s.maxMediaBytes)
+	if err != nil {
+		var tooLarge *blob.ErrTooLarge
+		if errors.As(err, &tooLarge) {
+			return Submission{}, fmt.Errorf(
+				"%w: attachment too large (limit %d MB)",
+				ErrInvalidCommand,
+				tooLarge.Max/(1<<20),
+			)
+		}
+		return Submission{}, fmt.Errorf("send media: store blob: %w", err)
+	}
+	if ref.Size == 0 {
+		// Rejecting after Put is intentional: Content is a stream, so emptiness is
+		// only known once read. The residue is a single constant zero-byte blob
+		// (the empty-content hash) with no durable outbox/message row referencing
+		// it — content-addressed, so all empty attempts converge on that one file,
+		// and it is swept by the unreferenced-blob GC.
+		return Submission{}, fmt.Errorf("%w: attachment is empty", ErrInvalidCommand)
+	}
+
+	outboxID, localMessageID, requestID, err := s.newSubmissionIDs()
+	if err != nil {
+		return Submission{}, err
+	}
+	now := s.clock.Now()
+	scheduledFor := cmd.NotBefore
+	if scheduledFor.IsZero() {
+		scheduledFor = now
+	}
+	payloadHash, err := mediaPayloadHash(
+		ref.Hash,
+		ref.Size,
+		cmd.MIME,
+		cmd.Filename,
+		cmd.Caption,
+		cmd.ReplyToMessageID,
+	)
+	if err != nil {
+		return Submission{}, fmt.Errorf("send media: hash payload: %w", err)
+	}
+
+	item, disposition, err := s.outbox.EnqueueOutgoingMediaMessage(ctx, sqlite.NewOutboxItem{
+		OutboxID:           outboxID,
+		AccountID:          cmd.AccountID,
+		ConversationID:     cmd.ConversationID,
+		Kind:               sqlite.OutboxKindMedia,
+		IdempotencyKey:     cmd.IdempotencyKey,
+		PayloadHash:        payloadHash,
+		Operation:          mediaOperation,
+		LocalMessageID:     localMessageID,
+		TransportRequestID: requestID,
+		ScheduledFor:       scheduledFor,
+	}, sqlite.Message{
+		MessageID:       localMessageID,
+		ConversationID:  cmd.ConversationID,
+		AccountID:       cmd.AccountID,
+		RemoteMessageID: requestID,
+		Direction:       sqlite.MessageDirectionOutgoing,
+		Body:            cmd.Caption,
+		ReplyToRemoteID: replyToRemoteID,
+		State:           sqlite.MessageStateActive,
+		OccurredAtMS:    now.UnixMilli(),
+	}, sqlite.OutboxAttachment{
+		BlobHash:  ref.Hash,
+		SizeBytes: ref.Size,
+		MIME:      cmd.MIME,
+		Filename:  cmd.Filename,
+	})
+	if err != nil {
+		return Submission{}, fmt.Errorf("send media: %w", err)
 	}
 
 	submission := submissionFromItem(item)
@@ -295,10 +436,10 @@ func (s *MessageService) newSubmissionIDs() (string, string, string, error) {
 	for i := range values {
 		value, err := s.ids.NewID()
 		if err != nil {
-			return "", "", "", fmt.Errorf("send text: generate durable ID: %w", err)
+			return "", "", "", fmt.Errorf("send message: generate durable ID: %w", err)
 		}
 		if strings.TrimSpace(value) == "" {
-			return "", "", "", fmt.Errorf("send text: ID source returned an empty ID")
+			return "", "", "", fmt.Errorf("send message: ID source returned an empty ID")
 		}
 		values[i] = value
 	}
@@ -326,11 +467,71 @@ func validateSendTextCommand(cmd SendTextCommand) error {
 	return nil
 }
 
+func validateSendMediaCommand(cmd *SendMediaCommand) error {
+	if cmd == nil {
+		return fmt.Errorf("%w: media command is nil", ErrInvalidCommand)
+	}
+	checks := []struct {
+		name  string
+		value string
+	}{
+		{name: "account ID", value: cmd.AccountID},
+		{name: "conversation ID", value: cmd.ConversationID},
+		{name: "idempotency key", value: cmd.IdempotencyKey},
+	}
+	for _, check := range checks {
+		if strings.TrimSpace(check.value) == "" {
+			return fmt.Errorf("%w: %s is empty", ErrInvalidCommand, check.name)
+		}
+	}
+	if cmd.Content == nil {
+		return fmt.Errorf("%w: content is nil", ErrInvalidCommand)
+	}
+	cmd.MIME = strings.TrimSpace(cmd.MIME)
+	if cmd.MIME == "" {
+		cmd.MIME = "application/octet-stream"
+	}
+	cmd.Filename = strings.TrimSpace(cmd.Filename)
+	if len(cmd.Filename) > 512 {
+		return fmt.Errorf("%w: filename exceeds 512 bytes", ErrInvalidCommand)
+	}
+	if strings.ContainsRune(cmd.Filename, '\x00') {
+		return fmt.Errorf("%w: filename contains NUL", ErrInvalidCommand)
+	}
+	if !cmd.NotBefore.IsZero() && cmd.NotBefore.UnixMilli() <= 0 {
+		return fmt.Errorf("%w: scheduled Unix time is not positive", ErrInvalidCommand)
+	}
+	return nil
+}
+
 func textPayloadHash(body, replyToMessageID string) (string, error) {
 	payload, err := json.Marshal(struct {
 		Body             string `json:"body"`
 		ReplyToMessageID string `json:"reply_to_message_id,omitempty"`
 	}{Body: body, ReplyToMessageID: replyToMessageID})
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(payload)
+	return hex.EncodeToString(sum[:]), nil
+}
+
+func mediaPayloadHash(
+	blobHash string,
+	size int64,
+	mime string,
+	filename string,
+	caption string,
+	replyToMessageID string,
+) (string, error) {
+	payload, err := json.Marshal(struct {
+		BlobHash         string `json:"blob_hash"`
+		Size             int64  `json:"size"`
+		MIME             string `json:"mime"`
+		Filename         string `json:"filename"`
+		Caption          string `json:"caption,omitempty"`
+		ReplyToMessageID string `json:"reply_to_message_id,omitempty"`
+	}{blobHash, size, mime, filename, caption, replyToMessageID})
 	if err != nil {
 		return "", err
 	}
