@@ -3,6 +3,7 @@ package cmd
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -14,7 +15,31 @@ import (
 	"time"
 
 	mcpserver "github.com/mark3labs/mcp-go/server"
+	"github.com/rs/zerolog"
+
+	"github.com/maxghenis/openmessage/internal/whatsapplive"
 )
+
+func TestInitializeWhatsAppForServeSkipsSupervisorOnInitializationError(t *testing.T) {
+	var logs bytes.Buffer
+	logger := zerolog.New(&logs)
+	initErr := errors.New("unable to open WhatsApp database")
+
+	whatsappBridge, initialized := initializeWhatsAppForServe(logger, func() (*whatsapplive.Bridge, error) {
+		return nil, initErr
+	})
+
+	if initialized {
+		t.Fatal("expected WhatsApp supervisor wiring to be skipped")
+	}
+	if whatsappBridge != nil {
+		t.Fatal("expected no WhatsApp bridge after initialization failure")
+	}
+	logOutput := logs.String()
+	if !strings.Contains(logOutput, "WhatsApp live bridge unavailable") || !strings.Contains(logOutput, initErr.Error()) {
+		t.Fatalf("warning log = %q, want unavailable message and initialization error", logOutput)
+	}
+}
 
 func TestHTTPServerSurvivesIndependently(t *testing.T) {
 	// Mirrors the RunServe architecture: HTTP server in a goroutine

@@ -37,3 +37,4 @@ output/
 /genviz
 /cc.json
 /.tmp-*.sql
+.gitnexus

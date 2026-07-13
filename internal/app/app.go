@@ -112,21 +112,21 @@ func (p *BackfillProgress) snapshot() BackfillSnapshot {
 }
 
 type App struct {
-	clientMu               sync.RWMutex
-	Client                 *client.Client
-	googleGeneration       *GoogleGeneration
-	Store                  *db.Store
-	EventHandler           *client.EventHandler
-	Logger                 zerolog.Logger
-	DataDir                string
-	SessionPath            string
-	WhatsAppSessionPath    string
-	SignalConfigPath       string
+	clientMu            sync.RWMutex
+	Client              *client.Client
+	googleGeneration    *GoogleGeneration
+	Store               *db.Store
+	EventHandler        *client.EventHandler
+	Logger              zerolog.Logger
+	DataDir             string
+	SessionPath         string
+	WhatsAppSessionPath string
+	SignalConfigPath    string
 	// sendTextOverride lets tests substitute the scheduler's send. Nil in prod.
 	sendTextOverride func(conversationID, body, replyToID string) (*db.Message, error)
 	// sendMediaOverride lets tests substitute the scheduler's media send. Nil in prod.
-	sendMediaOverride func(conversationID string, data []byte, filename, mime, caption, replyToID string) (*db.Message, error)
-	Connected         atomic.Bool
+	sendMediaOverride      func(conversationID string, data []byte, filename, mime, caption, replyToID string) (*db.Message, error)
+	Connected              atomic.Bool
 	OnConversationsChange  func()
 	OnIncomingMessage      func(*db.Message)
 	OnMessagesChange       func(string)
@@ -137,22 +137,24 @@ type App struct {
 
 	// gmClient is used by backfill methods. If nil, it's derived from Client.GM.
 	// Set this field directly in tests to inject a mock.
-	gmClient         GMClient
-	BackfillProgress BackfillProgress
-	backfillRunning  atomic.Bool
-	reconcileRunning atomic.Bool
-	avatarSyncMu     sync.Mutex
-	avatarSyncOnce   sync.Once
-	avatarSyncWG     sync.WaitGroup
-	avatarSyncClosed bool
-	avatarSyncQueue  chan db.ContactAvatarCandidate
-	avatarSyncStop   chan struct{}
-	whatsAppMu       sync.Mutex
-	WhatsApp         *whatsapplive.Bridge
-	signalMu         sync.Mutex
-	Signal           *signallive.Bridge
-	statusMu         sync.Mutex
-	googleLastError  string
+	gmClient                  GMClient
+	BackfillProgress          BackfillProgress
+	backfillRunning           atomic.Bool
+	reconcileRunning          atomic.Bool
+	avatarSyncMu              sync.Mutex
+	avatarSyncOnce            sync.Once
+	avatarSyncWG              sync.WaitGroup
+	avatarSyncClosed          bool
+	avatarSyncQueue           chan db.ContactAvatarCandidate
+	avatarSyncStop            chan struct{}
+	whatsAppMu                sync.Mutex
+	WhatsApp                  *whatsapplive.Bridge
+	whatsAppLifecycleMu       sync.RWMutex
+	whatsAppLifecycleNotifier WhatsAppLifecycleNotifier
+	signalMu                  sync.Mutex
+	Signal                    *signallive.Bridge
+	statusMu                  sync.Mutex
+	googleLastError           string
 	// A lapsed Google Messages linked-device session keeps reporting
 	// Connected=true while every send comes back UNKNOWN (the phone has
 	// silently unlinked us). Count consecutive non-SUCCESS Google sends so

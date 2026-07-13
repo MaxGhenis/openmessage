@@ -19,6 +19,7 @@ func (a *App) ensureWhatsApp() (*whatsapplive.Bridge, error) {
 		OnConversationsChange: a.emitConversationsChange,
 		OnIncomingMessage:     a.OnIncomingMessage,
 		OnMessagesChange:      a.emitMessagesChange,
+		OnConnectionError:     a.reportWhatsAppLifecycleError,
 		OnStatusChange: func() {
 			if a.OnWhatsAppStatusChange != nil {
 				a.OnWhatsAppStatusChange()
@@ -38,6 +39,13 @@ func (a *App) GetWhatsApp() *whatsapplive.Bridge {
 	a.whatsAppMu.Lock()
 	defer a.whatsAppMu.Unlock()
 	return a.WhatsApp
+}
+
+// InitializeWhatsApp constructs the legacy operation surface without starting
+// a transport. Runtime connection and pairing ownership belongs to the bridge
+// supervisor assembled by cmd.
+func (a *App) InitializeWhatsApp() (*whatsapplive.Bridge, error) {
+	return a.ensureWhatsApp()
 }
 
 func (a *App) LoadAndConnectWhatsApp() error {

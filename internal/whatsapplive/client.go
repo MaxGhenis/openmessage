@@ -39,8 +39,21 @@ const avatarCacheTTL = 30 * time.Minute
 const unavailablePlaceholderRepairCooldown = 30 * time.Minute
 const maxUnavailablePlaceholderRepairs = 25
 const recentlyLeftGroupTTL = 6 * time.Hour
+const unpairRemoteTimeout = 10 * time.Second
+const unpairStoreTimeout = 10 * time.Second
 
 var ErrProfilePhotoNotFound = errors.New("whatsapp profile photo not found")
+
+var ErrTemporaryBanActive = errors.New("whatsapp temporary ban is still active")
+
+const whatsappRuntimeStateSchema = `
+CREATE TABLE IF NOT EXISTS openmessage_whatsapp_runtime_state (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    blocked_until_ns INTEGER NOT NULL DEFAULT 0
+);
+INSERT OR IGNORE INTO openmessage_whatsapp_runtime_state (singleton, blocked_until_ns)
+VALUES (1, 0);
+`
 
 var sendTextMessage = func(cli *whatsmeow.Client, ctx context.Context, to watypes.JID, message *waE2E.Message, extra ...whatsmeow.SendRequestExtra) (whatsmeow.SendResponse, error) {
 	return cli.SendMessage(ctx, to, message, extra...)
@@ -56,6 +69,22 @@ var downloadMediaWithPath = func(cli *whatsmeow.Client, ctx context.Context, dir
 
 var connectClient = func(cli *whatsmeow.Client) error {
 	return cli.Connect()
+}
+
+var connectClientContext = func(ctx context.Context, cli *whatsmeow.Client) error {
+	return cli.ConnectContext(ctx)
+}
+
+var logoutClient = func(ctx context.Context, cli *whatsmeow.Client) error {
+	return cli.Logout(ctx)
+}
+
+var deleteClientStore = func(ctx context.Context, cli *whatsmeow.Client) error {
+	return cli.Store.Delete(ctx)
+}
+
+var sendClientKeepAlive = func(ctx context.Context, cli *whatsmeow.Client) (bool, bool) {
+	return cli.DangerousInternals().SendKeepAlive(ctx)
 }
 
 var launchConnect = func(b *Bridge, cli *whatsmeow.Client) {
@@ -110,8 +139,50 @@ type Callbacks struct {
 	OnConversationsChange func()
 	OnIncomingMessage     func(*db.Message)
 	OnMessagesChange      func(string)
+	OnConnectionError     func(error)
 	OnStatusChange        func()
 	OnTypingChange        func(conversationID, senderName, senderNumber string, typing bool)
+}
+
+// TemporaryBanError prevents every connection and pairing entry point from
+// touching the network while a server-provided temporary ban is active.
+// RetryAt is an absolute, durably stored deadline.
+type TemporaryBanError struct {
+	RetryAt time.Time
+}
+
+func (e *TemporaryBanError) Error() string {
+	return fmt.Sprintf("%s until %s", ErrTemporaryBanActive, e.RetryAt.Format(time.RFC3339Nano))
+}
+
+func (e *TemporaryBanError) Is(target error) bool {
+	return target == ErrTemporaryBanActive
+}
+
+// LifecycleEvent is the generation-safe event boundary consumed by the
+// supervisor adapter. Raw is the real whatsmeow event. Paired is captured from
+// the exact client that emitted Raw after the legacy status projection has
+// been updated. PersistenceError is non-nil when a TemporaryBan could not be
+// made durable; callers must park rather than risk an early reconnect.
+type LifecycleEvent struct {
+	Raw              any
+	Paired           bool
+	At               time.Time
+	RetryAt          time.Time
+	PersistenceError error
+}
+
+type lifecycleObservation struct {
+	id       uint64
+	callback func(LifecycleEvent)
+}
+
+// AccountInfo is the paired identity needed to build supervisor start and
+// pairing results without exposing the underlying whatsmeow client.
+type AccountInfo struct {
+	Paired   bool
+	JID      string
+	PushName string
 }
 
 type StatusSnapshot struct {
@@ -171,6 +242,16 @@ type Bridge struct {
 
 	container *sqlstore.Container
 	client    *whatsmeow.Client
+	// clientGeneration changes whenever resetClientLocked installs a new
+	// whatsmeow client. Event handler closures capture it so callbacks from a
+	// retired client can never affect or terminate the replacement generation.
+	clientGeneration uint64
+	observation      lifecycleObservation
+	nextObserverID   uint64
+
+	runtimeMu    sync.Mutex
+	runtimeDB    *sql.DB
+	blockedUntil time.Time
 
 	connected                 bool
 	connecting                bool
@@ -191,6 +272,10 @@ func New(sessionPath string, store *db.Store, logger zerolog.Logger, callbacks C
 		recentlyLeftGroups: make(map[string]time.Time),
 	}
 	if err := bridge.initClientLocked(); err != nil {
+		return nil, err
+	}
+	if err := bridge.initRuntimeState(); err != nil {
+		_ = bridge.Close()
 		return nil, err
 	}
 	return bridge, nil
@@ -214,11 +299,47 @@ func (b *Bridge) initClientLocked() error {
 	// are log-only — with a Noop logger they are invisible and a failed pair
 	// just silently returns to idle.
 	cli := whatsmeow.NewClient(deviceStore, waLog.Zerolog(b.logger.With().Str("component", "whatsmeow").Logger()))
-	cli.EnableAutoReconnect = true
-	cli.InitialAutoReconnect = true
-	cli.AddEventHandler(b.handleEvent)
+	// The bridge Supervisor is the sole reconnect owner. In addition to the
+	// normal reconnect toggles, DisableLoginAutoReconnect prevents whatsmeow's
+	// implicit 515 reconnect after pairing from becoming a second owner.
+	cli.EnableAutoReconnect = false
+	cli.InitialAutoReconnect = false
+	cli.DisableLoginAutoReconnect = true
+	b.clientGeneration++
+	clientGeneration := b.clientGeneration
+	cli.AddEventHandler(func(raw any) {
+		b.handleClientEvent(cli, clientGeneration, raw)
+	})
 	b.container = container
 	b.client = cli
+	return nil
+}
+
+func (b *Bridge) initRuntimeState() error {
+	database, err := sql.Open("sqlite", sessionStoreDSN(b.sessionPath))
+	if err != nil {
+		return fmt.Errorf("open WhatsApp runtime state: %w", err)
+	}
+	database.SetMaxOpenConns(1)
+	if _, err = database.ExecContext(context.Background(), whatsappRuntimeStateSchema); err != nil {
+		_ = database.Close()
+		return fmt.Errorf("initialize WhatsApp runtime state: %w", err)
+	}
+	var blockedUntilNS int64
+	if err = database.QueryRowContext(
+		context.Background(),
+		`SELECT blocked_until_ns FROM openmessage_whatsapp_runtime_state WHERE singleton = 1`,
+	).Scan(&blockedUntilNS); err != nil {
+		_ = database.Close()
+		return fmt.Errorf("load WhatsApp runtime state: %w", err)
+	}
+
+	b.runtimeMu.Lock()
+	b.runtimeDB = database
+	if blockedUntilNS > 0 {
+		b.blockedUntil = time.Unix(0, blockedUntilNS)
+	}
+	b.runtimeMu.Unlock()
 	return nil
 }
 
@@ -252,6 +373,78 @@ func isWindowsAbsolutePath(path string) bool {
 		path[2] == '/'
 }
 
+// TemporaryBanDeadline returns the greatest absolute ban deadline observed by
+// this bridge, including the value loaded from a previous process.
+func (b *Bridge) TemporaryBanDeadline() time.Time {
+	b.runtimeMu.Lock()
+	defer b.runtimeMu.Unlock()
+	return b.blockedUntil
+}
+
+func (b *Bridge) temporaryBanError(now time.Time) error {
+	retryAt := b.TemporaryBanDeadline()
+	if retryAt.IsZero() || !now.Before(retryAt) {
+		return nil
+	}
+	return &TemporaryBanError{RetryAt: retryAt}
+}
+
+func (b *Bridge) persistTemporaryBan(at time.Time, duration time.Duration) (time.Time, error) {
+	b.runtimeMu.Lock()
+	defer b.runtimeMu.Unlock()
+
+	retryAt := b.blockedUntil
+	if duration > 0 {
+		candidate := at.Add(duration)
+		if candidate.After(retryAt) {
+			retryAt = candidate
+			// Update memory before durable storage. If the write fails, every
+			// entry point in this process still stays parked and the observer
+			// receives PersistenceError so the supervisor cannot retry.
+			b.blockedUntil = candidate
+		}
+	}
+	if retryAt.IsZero() || b.runtimeDB == nil {
+		return retryAt, nil
+	}
+	if _, err := b.runtimeDB.ExecContext(
+		context.Background(),
+		`UPDATE openmessage_whatsapp_runtime_state
+		 SET blocked_until_ns = CASE
+		     WHEN blocked_until_ns < ? THEN ?
+		     ELSE blocked_until_ns
+		 END
+		 WHERE singleton = 1`,
+		retryAt.UnixNano(),
+		retryAt.UnixNano(),
+	); err != nil {
+		return retryAt, fmt.Errorf("persist WhatsApp temporary ban deadline: %w", err)
+	}
+	return retryAt, nil
+}
+
+// ObserveLifecycle installs the one active supervisor lifecycle observer and
+// binds it to the current client generation. The returned removal function is
+// idempotent with respect to replacement: it cannot clear a newer observer.
+func (b *Bridge) ObserveLifecycle(callback func(LifecycleEvent)) func() {
+	b.mu.Lock()
+	b.nextObserverID++
+	id := b.nextObserverID
+	b.observation = lifecycleObservation{
+		id:       id,
+		callback: callback,
+	}
+	b.mu.Unlock()
+
+	return func() {
+		b.mu.Lock()
+		if b.observation.id == id {
+			b.observation = lifecycleObservation{}
+		}
+		b.mu.Unlock()
+	}
+}
+
 func (b *Bridge) resetClientLocked() error {
 	if b.client != nil {
 		b.client.Disconnect()
@@ -270,10 +463,22 @@ func (b *Bridge) recoverPersistedSessionLocked() error {
 	if err := b.initClientLocked(); err != nil {
 		return err
 	}
-	if b.client == nil || b.client.Store == nil || b.client.Store.ID != nil {
+	if b.client == nil || b.client.Store == nil {
 		return nil
 	}
-	return b.resetClientLocked()
+	if b.client.Store.Deleted {
+		return b.resetClientLocked()
+	}
+	if b.client.Store.ID != nil {
+		return nil
+	}
+	// A clean unpaired device must keep its identity for the active pairing
+	// observation. Reset only when the database proves a paired identity was
+	// persisted after this in-memory store was created.
+	if deviceStore := b.pairedDeviceStoreLocked(); deviceStore != nil {
+		return b.resetClientLocked()
+	}
+	return nil
 }
 
 func (b *Bridge) pairedDeviceStoreLocked() *wastore.Device {
@@ -295,6 +500,9 @@ func (b *Bridge) pairedDeviceStoreLocked() *wastore.Device {
 }
 
 func (b *Bridge) ConnectIfPaired() error {
+	if err := b.temporaryBanError(time.Now()); err != nil {
+		return err
+	}
 	b.mu.Lock()
 	if err := b.recoverPersistedSessionLocked(); err != nil {
 		b.mu.Unlock()
@@ -314,6 +522,9 @@ func (b *Bridge) ConnectIfPaired() error {
 }
 
 func (b *Bridge) Connect() error {
+	if err := b.temporaryBanError(time.Now()); err != nil {
+		return err
+	}
 	b.mu.Lock()
 	if err := b.recoverPersistedSessionLocked(); err != nil {
 		b.mu.Unlock()
@@ -353,6 +564,250 @@ func (b *Bridge) Connect() error {
 	return nil
 }
 
+// ConnectPaired synchronously starts one paired transport connection using the
+// caller-owned context. It never launches a goroutine; the supervisor adapter
+// is responsible for tracking the worker and joining it during Stop.
+func (b *Bridge) ConnectPaired(ctx context.Context) error {
+	if ctx == nil {
+		return errors.New("connect WhatsApp: nil context")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := b.temporaryBanError(time.Now()); err != nil {
+		return err
+	}
+
+	b.mu.Lock()
+	if err := b.recoverPersistedSessionLocked(); err != nil {
+		b.mu.Unlock()
+		return err
+	}
+	if b.client == nil || b.client.Store == nil || b.client.Store.ID == nil {
+		b.mu.Unlock()
+		return whatsmeow.ErrNotLoggedIn
+	}
+	if b.pairing || b.connecting {
+		b.mu.Unlock()
+		return errors.New("WhatsApp connection is already in progress")
+	}
+	if clientIsConnected(b.client) {
+		b.mu.Unlock()
+		return whatsmeow.ErrAlreadyConnected
+	}
+	cli := b.client
+	b.connected = false
+	b.connecting = true
+	b.pairing = false
+	b.lastError = ""
+	b.mu.Unlock()
+	b.emitStatusChange()
+
+	if err := connectClientContext(ctx, cli); err != nil {
+		b.finishConnectError(cli, err)
+		return err
+	}
+	return nil
+}
+
+// PrepareQRPairing installs whatsmeow's QR listener before the pairing
+// transport is connected. It changes only pairing status and never calls
+// Connect; ConnectPairing is the sole synchronous network entry point.
+func (b *Bridge) PrepareQRPairing(ctx context.Context) (<-chan whatsmeow.QRChannelItem, error) {
+	if ctx == nil {
+		return nil, errors.New("prepare WhatsApp QR pairing: nil context")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := b.temporaryBanError(time.Now()); err != nil {
+		return nil, err
+	}
+
+	b.mu.Lock()
+	if err := b.recoverPersistedSessionLocked(); err != nil {
+		b.mu.Unlock()
+		return nil, err
+	}
+	if b.client == nil || b.client.Store == nil {
+		b.mu.Unlock()
+		return nil, errors.New("WhatsApp client unavailable")
+	}
+	if b.client.Store.ID != nil {
+		b.mu.Unlock()
+		return nil, errors.New("WhatsApp is already paired")
+	}
+	if b.pairing || b.connecting || clientIsConnected(b.client) {
+		b.mu.Unlock()
+		return nil, errors.New("WhatsApp pairing is already in progress")
+	}
+	qrChan, err := b.client.GetQRChannel(ctx)
+	if err != nil {
+		b.lastError = err.Error()
+		b.mu.Unlock()
+		b.emitStatusChange()
+		return nil, fmt.Errorf("start WhatsApp pairing: %w", err)
+	}
+	b.pairing = true
+	b.connecting = true
+	b.lastError = ""
+	b.qr = QRSnapshot{}
+	b.mu.Unlock()
+	b.emitStatusChange()
+	return qrChan, nil
+}
+
+// ConnectPairing synchronously connects a pairing transport prepared by
+// PrepareQRPairing. PairPhoneContext performs the equivalent preparation for
+// phone-code pairing itself.
+func (b *Bridge) ConnectPairing(ctx context.Context) error {
+	if ctx == nil {
+		return errors.New("connect WhatsApp pairing transport: nil context")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := b.temporaryBanError(time.Now()); err != nil {
+		return err
+	}
+
+	b.mu.RLock()
+	cli := b.client
+	pairing := b.pairing
+	paired := cli != nil && cli.Store != nil && cli.Store.ID != nil
+	b.mu.RUnlock()
+	if cli == nil {
+		return errors.New("WhatsApp client unavailable")
+	}
+	if paired {
+		return errors.New("WhatsApp is already paired")
+	}
+	if !pairing {
+		return errors.New("WhatsApp pairing was not prepared")
+	}
+	if clientIsConnected(cli) {
+		return whatsmeow.ErrAlreadyConnected
+	}
+	if err := connectClientContext(ctx, cli); err != nil {
+		b.finishConnectError(cli, err)
+		return err
+	}
+	return nil
+}
+
+func (b *Bridge) finishConnectError(cli *whatsmeow.Client, err error) {
+	b.logger.Warn().Err(err).Msg("WhatsApp connect failed")
+	b.mu.Lock()
+	if b.client == cli {
+		b.connected = false
+		b.connecting = false
+		b.lastError = err.Error()
+		if b.client.Store == nil || b.client.Store.ID == nil {
+			b.pairing = false
+		}
+	}
+	b.mu.Unlock()
+	b.emitStatusChange()
+}
+
+// ApplyQRItem updates the unchanged legacy QR/status projection for one item
+// consumed by the supervisor-owned pairing worker.
+func (b *Bridge) ApplyQRItem(item whatsmeow.QRChannelItem) QRSnapshot {
+	now := time.Now()
+	snap := QRSnapshot{
+		Event:     item.Event,
+		UpdatedAt: now.UnixMilli(),
+	}
+	if item.Timeout > 0 {
+		snap.ExpiresAt = now.Add(item.Timeout).UnixMilli()
+	}
+	if item.Error != nil {
+		snap.Error = item.Error.Error()
+	}
+	if item.Event == whatsmeow.QRChannelEventCode {
+		snap.Code = item.Code
+	}
+
+	b.mu.Lock()
+	switch item.Event {
+	case whatsmeow.QRChannelEventCode:
+		b.qr = snap
+	default:
+		b.qr = snap
+		b.pairing = false
+		b.connecting = false
+		if snap.Error != "" {
+			b.lastError = snap.Error
+		} else if item.Event != whatsmeow.QRChannelSuccess.Event {
+			b.lastError = item.Event
+		}
+	}
+	b.mu.Unlock()
+	b.emitStatusChange()
+	return snap
+}
+
+// DisconnectTransport disconnects only the current socket. It deliberately
+// leaves the session database and a still-unpaired pairing affordance intact.
+func (b *Bridge) DisconnectTransport() {
+	b.mu.RLock()
+	cli := b.client
+	b.mu.RUnlock()
+	if cli != nil {
+		cli.Disconnect()
+	}
+	b.mu.Lock()
+	if b.client == cli {
+		b.connected = false
+		b.connecting = false
+		if cli == nil || cli.Store == nil || cli.Store.ID != nil {
+			b.pairing = false
+		}
+	}
+	b.mu.Unlock()
+	b.emitStatusChange()
+}
+
+// ProbeKeepAlive performs a real WhatsApp websocket keepalive IQ and waits for
+// the server response. No cached boolean is treated as liveness evidence.
+func (b *Bridge) ProbeKeepAlive(ctx context.Context) error {
+	if ctx == nil {
+		return errors.New("probe WhatsApp: nil context")
+	}
+	b.mu.RLock()
+	cli := b.client
+	paired := cli != nil && cli.Store != nil && cli.Store.ID != nil
+	b.mu.RUnlock()
+	if !paired {
+		return whatsmeow.ErrNotLoggedIn
+	}
+	ok, shouldContinue := sendClientKeepAlive(ctx, cli)
+	if ok {
+		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if !shouldContinue {
+		return errors.New("WhatsApp keepalive stopped because the transport ended")
+	}
+	return errors.New("WhatsApp keepalive timed out")
+}
+
+func (b *Bridge) PairedAccount() AccountInfo {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	deviceStore := b.pairedDeviceStoreLocked()
+	if deviceStore == nil {
+		return AccountInfo{}
+	}
+	return AccountInfo{
+		Paired:   true,
+		JID:      deviceStore.ID.String(),
+		PushName: strings.TrimSpace(deviceStore.PushName),
+	}
+}
+
 // pairPhoneDisplayName is the linked-device name sent during phone pairing.
 // WhatsApp's server validates this against a `Browser (OS)` allowlist and
 // returns "400 bad-request" for anything it doesn't recognize (e.g. a product
@@ -368,6 +823,9 @@ const pairPhoneDisplayName = "Chrome (macOS)"
 // over the same connection through the normal PairSuccess -> Connected events.
 // phone must be in international format (a leading + is fine; it is stripped).
 func (b *Bridge) PairPhone(phone string) (string, error) {
+	if err := b.temporaryBanError(time.Now()); err != nil {
+		return "", err
+	}
 	b.mu.Lock()
 	if err := b.recoverPersistedSessionLocked(); err != nil {
 		b.mu.Unlock()
@@ -380,6 +838,10 @@ func (b *Bridge) PairPhone(phone string) (string, error) {
 	if b.client.Store.ID != nil {
 		b.mu.Unlock()
 		return "", fmt.Errorf("WhatsApp is already paired")
+	}
+	if b.pairing || b.connecting {
+		b.mu.Unlock()
+		return "", errors.New("WhatsApp pairing is already in progress")
 	}
 	cli := b.client
 	needConnect := !clientIsConnected(cli)
@@ -420,6 +882,74 @@ func (b *Bridge) PairPhone(phone string) (string, error) {
 	return code, nil
 }
 
+// PairPhoneContext is the cancelable supervisor-owned phone-code path. The
+// legacy PairPhone method above intentionally retains its concrete protocol
+// call for the F7 compatibility contract.
+func (b *Bridge) PairPhoneContext(ctx context.Context, phone string) (string, error) {
+	if ctx == nil {
+		return "", errors.New("pair WhatsApp phone: nil context")
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	if err := b.temporaryBanError(time.Now()); err != nil {
+		return "", err
+	}
+
+	b.mu.Lock()
+	if err := b.recoverPersistedSessionLocked(); err != nil {
+		b.mu.Unlock()
+		return "", err
+	}
+	if b.client == nil || b.client.Store == nil {
+		b.mu.Unlock()
+		return "", errors.New("WhatsApp client unavailable")
+	}
+	if b.client.Store.ID != nil {
+		b.mu.Unlock()
+		return "", errors.New("WhatsApp is already paired")
+	}
+	if b.pairing || b.connecting {
+		b.mu.Unlock()
+		return "", errors.New("WhatsApp pairing is already in progress")
+	}
+	cli := b.client
+	needConnect := !clientIsConnected(cli)
+	b.lastError = ""
+	b.pairing = true
+	b.connecting = true
+	b.qr = QRSnapshot{}
+	b.mu.Unlock()
+	b.emitStatusChange()
+
+	clearPairingState := func(message string) {
+		b.mu.Lock()
+		if b.client == cli {
+			b.pairing = false
+			b.connecting = false
+			b.lastError = message
+		}
+		b.mu.Unlock()
+		b.emitStatusChange()
+	}
+
+	if needConnect {
+		if err := connectClientContext(ctx, cli); err != nil && !errors.Is(err, whatsmeow.ErrAlreadyConnected) {
+			clearPairingState(err.Error())
+			return "", fmt.Errorf("connect WhatsApp: %w", err)
+		}
+	}
+
+	pairCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	code, err := cli.PairPhone(pairCtx, phone, true, whatsmeow.PairClientChrome, pairPhoneDisplayName)
+	if err != nil {
+		clearPairingState(err.Error())
+		return "", fmt.Errorf("request WhatsApp pairing code: %w", err)
+	}
+	return code, nil
+}
+
 func (b *Bridge) runConnect(cli *whatsmeow.Client) {
 	if err := connectClient(cli); err != nil {
 		b.logger.Warn().Err(err).Msg("WhatsApp connect failed")
@@ -438,36 +968,7 @@ func (b *Bridge) runConnect(cli *whatsmeow.Client) {
 
 func (b *Bridge) consumeQR(ch <-chan whatsmeow.QRChannelItem) {
 	for item := range ch {
-		snap := QRSnapshot{
-			Event:     item.Event,
-			UpdatedAt: time.Now().UnixMilli(),
-		}
-		if item.Timeout > 0 {
-			snap.ExpiresAt = time.Now().Add(item.Timeout).UnixMilli()
-		}
-		if item.Error != nil {
-			snap.Error = item.Error.Error()
-		}
-		if item.Event == whatsmeow.QRChannelEventCode {
-			snap.Code = item.Code
-		}
-
-		b.mu.Lock()
-		switch item.Event {
-		case whatsmeow.QRChannelEventCode:
-			b.qr = snap
-		default:
-			b.qr = snap
-			b.pairing = false
-			b.connecting = false
-			if snap.Error != "" {
-				b.lastError = snap.Error
-			} else if item.Event != whatsmeow.QRChannelSuccess.Event {
-				b.lastError = item.Event
-			}
-		}
-		b.mu.Unlock()
-		b.emitStatusChange()
+		b.ApplyQRItem(item)
 	}
 }
 
@@ -477,14 +978,33 @@ func (b *Bridge) Unpair() error {
 	b.mu.RUnlock()
 
 	if cli != nil && cli.Store != nil && cli.Store.ID != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		if clientIsConnected(cli) {
-			if err := cli.Logout(ctx); err != nil {
+		remoteCtx, cancelRemote := context.WithTimeout(context.Background(), unpairRemoteTimeout)
+		connected := clientIsConnected(cli)
+		if !connected {
+			err := connectClientContext(remoteCtx, cli)
+			if err != nil && !errors.Is(err, whatsmeow.ErrAlreadyConnected) {
+				b.logger.Warn().Err(err).Msg("WhatsApp reconnect for logout failed; clearing local session anyway")
+			} else {
+				connected = true
+			}
+		}
+		if connected {
+			if err := logoutClient(remoteCtx, cli); err != nil {
 				b.logger.Warn().Err(err).Msg("WhatsApp logout failed; clearing local session anyway")
 			}
-		} else if err := cli.Store.Delete(ctx); err != nil {
-			b.logger.Warn().Err(err).Msg("Failed to clear WhatsApp session store")
+		}
+		cancelRemote()
+
+		// Logout clears the device store after the server confirms the unlink.
+		// If reconnect or logout failed, force the documented local fallback so
+		// callers can still re-pair without retaining stale credentials.
+		if cli.Store.ID != nil {
+			cli.Disconnect()
+			storeCtx, cancelStore := context.WithTimeout(context.Background(), unpairStoreTimeout)
+			if err := deleteClientStore(storeCtx, cli); err != nil {
+				b.logger.Warn().Err(err).Msg("Failed to clear WhatsApp session store")
+			}
+			cancelStore()
 		}
 	}
 
@@ -524,14 +1044,13 @@ func (b *Bridge) Status() StatusSnapshot {
 	return status
 }
 
-func (b *Bridge) ensureSendClient(wait time.Duration, reason string) (*whatsmeow.Client, error) {
+func (b *Bridge) ensureSendClient() (*whatsmeow.Client, error) {
 	if cli := b.currentSendClient(); cli != nil {
 		return cli, nil
 	}
-	if err := b.beginReconnect(reason, false); err != nil {
-		return nil, err
-	}
-	return b.waitForConnectedClient(wait)
+	err := whatsmeow.ErrNotConnected
+	b.reportConnectionError(err)
+	return nil, err
 }
 
 func (b *Bridge) currentSendClient() *whatsmeow.Client {
@@ -543,75 +1062,21 @@ func (b *Bridge) currentSendClient() *whatsmeow.Client {
 	return b.client
 }
 
-func (b *Bridge) beginReconnect(reason string, force bool) error {
-	b.mu.Lock()
-	if err := b.recoverPersistedSessionLocked(); err != nil {
-		b.mu.Unlock()
-		return err
-	}
-	if b.client == nil || b.client.Store == nil || b.client.Store.ID == nil {
-		b.mu.Unlock()
-		return errors.New("whatsapp live sync is not connected")
-	}
-	if !force && b.connected && clientIsConnected(b.client) {
-		b.mu.Unlock()
-		return nil
-	}
-	if b.connecting {
-		b.mu.Unlock()
-		return nil
-	}
-	cli := b.client
-	b.connected = false
-	b.connecting = true
-	b.pairing = false
-	if reason != "" {
-		b.lastError = reason
-	}
-	b.mu.Unlock()
-	b.emitStatusChange()
-	launchConnect(b, cli)
-	return nil
-}
-
-func (b *Bridge) waitForConnectedClient(wait time.Duration) (*whatsmeow.Client, error) {
-	deadline := time.Now().Add(wait)
-	for {
-		b.mu.RLock()
-		cli := b.client
-		connected := b.connected && clientIsConnected(cli)
-		connecting := b.connecting
-		lastError := b.lastError
-		paired := cli != nil && cli.Store != nil && cli.Store.ID != nil
-		b.mu.RUnlock()
-
-		if connected && cli != nil {
-			return cli, nil
-		}
-		if !paired {
-			if lastError != "" {
-				return nil, errors.New(lastError)
-			}
-			return nil, errors.New("whatsapp live sync is not connected")
-		}
-		if time.Now().After(deadline) {
-			if lastError != "" {
-				return nil, fmt.Errorf("whatsapp reconnect: %s", lastError)
-			}
-			if connecting {
-				return nil, errors.New("whatsapp reconnect timed out")
-			}
-			return nil, errors.New("whatsapp live sync is not connected")
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-}
-
-func shouldReconnectWhatsAppSend(err error) bool {
+// ShouldReconnect reports whether an operation failure means the active
+// transport generation must be retired. It never performs the reconnect.
+func ShouldReconnect(err error) bool {
 	if err == nil {
 		return false
 	}
-	if errors.Is(err, context.DeadlineExceeded) {
+	if errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, whatsmeow.ErrNotConnected) ||
+		errors.Is(err, whatsmeow.ErrNotLoggedIn) ||
+		errors.Is(err, whatsmeow.ErrMessageTimedOut) ||
+		errors.Is(err, wastore.ErrDeviceDeleted) {
+		return true
+	}
+	var disconnected *whatsmeow.DisconnectedError
+	if errors.As(err, &disconnected) {
 		return true
 	}
 	msg := strings.ToLower(strings.TrimSpace(err.Error()))
@@ -619,6 +1084,14 @@ func shouldReconnectWhatsAppSend(err error) bool {
 		strings.Contains(msg, "connection closed") ||
 		strings.Contains(msg, "websocket") ||
 		strings.Contains(msg, "not connected")
+}
+
+func shouldReconnectWhatsAppSend(err error) bool { return ShouldReconnect(err) }
+
+func (b *Bridge) reportConnectionError(err error) {
+	if err != nil && ShouldReconnect(err) && b.callbacks.OnConnectionError != nil {
+		b.callbacks.OnConnectionError(err)
+	}
 }
 
 func (b *Bridge) QRCode() (QRSnapshot, error) {
@@ -643,7 +1116,6 @@ func (b *Bridge) UsesLiveSession() bool {
 
 func (b *Bridge) Close() error {
 	b.mu.Lock()
-	defer b.mu.Unlock()
 	if b.client != nil {
 		b.client.Disconnect()
 		b.client = nil
@@ -651,12 +1123,21 @@ func (b *Bridge) Close() error {
 	b.connected = false
 	b.connecting = false
 	b.pairing = false
+	var errs []error
 	if b.container != nil {
-		err := b.container.Close()
+		errs = append(errs, b.container.Close())
 		b.container = nil
-		return err
 	}
-	return nil
+	b.observation = lifecycleObservation{}
+	b.mu.Unlock()
+
+	b.runtimeMu.Lock()
+	if b.runtimeDB != nil {
+		errs = append(errs, b.runtimeDB.Close())
+		b.runtimeDB = nil
+	}
+	b.runtimeMu.Unlock()
+	return errors.Join(errs...)
 }
 
 func (b *Bridge) SendText(conversationID, body, replyToID string) (*db.Message, error) {
@@ -670,7 +1151,7 @@ func (b *Bridge) SendText(conversationID, body, replyToID string) (*db.Message, 
 		return nil, err
 	}
 
-	cli, err := b.ensureSendClient(15*time.Second, "reconnecting WhatsApp before send")
+	cli, err := b.ensureSendClient()
 	if err != nil {
 		return nil, err
 	}
@@ -683,11 +1164,7 @@ func (b *Bridge) SendText(conversationID, body, replyToID string) (*db.Message, 
 		ID: reqID,
 	})
 	if err != nil {
-		if shouldReconnectWhatsAppSend(err) {
-			if reconnectErr := b.beginReconnect("WhatsApp send timed out; reconnecting", true); reconnectErr != nil {
-				b.logger.Debug().Err(reconnectErr).Msg("Failed to start WhatsApp reconnect after send error")
-			}
-		}
+		b.reportConnectionError(err)
 		return nil, fmt.Errorf("send WhatsApp message: %w", err)
 	}
 
@@ -741,7 +1218,7 @@ func (b *Bridge) SendMedia(conversationID string, data []byte, filename, mime, c
 		return nil, err
 	}
 
-	cli, err := b.ensureSendClient(30*time.Second, "reconnecting WhatsApp before media send")
+	cli, err := b.ensureSendClient()
 	if err != nil {
 		return nil, err
 	}
@@ -751,11 +1228,7 @@ func (b *Bridge) SendMedia(conversationID string, data []byte, filename, mime, c
 
 	upload, err := uploadMedia(cli, uploadCtx, data, mediaType)
 	if err != nil {
-		if shouldReconnectWhatsAppSend(err) {
-			if reconnectErr := b.beginReconnect("WhatsApp media upload timed out; reconnecting", true); reconnectErr != nil {
-				b.logger.Debug().Err(reconnectErr).Msg("Failed to start WhatsApp reconnect after media upload error")
-			}
-		}
+		b.reportConnectionError(err)
 		return nil, fmt.Errorf("upload WhatsApp media: %w", err)
 	}
 	reqID := cli.GenerateMessageID()
@@ -766,11 +1239,7 @@ func (b *Bridge) SendMedia(conversationID string, data []byte, filename, mime, c
 		ID: reqID,
 	})
 	if err != nil {
-		if shouldReconnectWhatsAppSend(err) {
-			if reconnectErr := b.beginReconnect("WhatsApp media send timed out; reconnecting", true); reconnectErr != nil {
-				b.logger.Debug().Err(reconnectErr).Msg("Failed to start WhatsApp reconnect after media send error")
-			}
-		}
+		b.reportConnectionError(err)
 		return nil, fmt.Errorf("send WhatsApp media: %w", err)
 	}
 
@@ -862,7 +1331,7 @@ func (b *Bridge) SendReaction(conversationID, targetMessageID, emoji, action str
 		return errors.New("whatsapp reaction target id is unavailable")
 	}
 
-	cli, err := b.ensureSendClient(15*time.Second, "reconnecting WhatsApp before reaction")
+	cli, err := b.ensureSendClient()
 	if err != nil {
 		return err
 	}
@@ -879,11 +1348,7 @@ func (b *Bridge) SendReaction(conversationID, targetMessageID, emoji, action str
 		ID: reqID,
 	})
 	if err != nil {
-		if shouldReconnectWhatsAppSend(err) {
-			if reconnectErr := b.beginReconnect("WhatsApp reaction timed out; reconnecting", true); reconnectErr != nil {
-				b.logger.Debug().Err(reconnectErr).Msg("Failed to start WhatsApp reconnect after reaction error")
-			}
-		}
+		b.reportConnectionError(err)
 		return fmt.Errorf("send WhatsApp reaction: %w", err)
 	}
 
@@ -917,7 +1382,7 @@ func (b *Bridge) LeaveGroup(conversationID string) error {
 		return errors.New("conversation is not a WhatsApp group")
 	}
 
-	cli, err := b.ensureSendClient(30*time.Second, "reconnecting WhatsApp before leaving group")
+	cli, err := b.ensureSendClient()
 	if err != nil {
 		return err
 	}
@@ -926,11 +1391,7 @@ func (b *Bridge) LeaveGroup(conversationID string) error {
 	defer cancel()
 
 	if err := leaveGroup(cli, ctx, chatJID); err != nil {
-		if shouldReconnectWhatsAppSend(err) {
-			if reconnectErr := b.beginReconnect("WhatsApp leave group timed out; reconnecting", true); reconnectErr != nil {
-				b.logger.Debug().Err(reconnectErr).Msg("Failed to start WhatsApp reconnect after leave-group error")
-			}
-		}
+		b.reportConnectionError(err)
 		return fmt.Errorf("leave WhatsApp group: %w", err)
 	}
 
@@ -1113,7 +1574,55 @@ func (b *Bridge) ProfilePhoto(conversationID string) ([]byte, string, error) {
 	return data, mime, nil
 }
 
+// handleClientEvent fences callbacks by the concrete whatsmeow client and its
+// local generation. Temporary-ban persistence happens before either the
+// compatibility status projection or the supervisor observer is notified.
+func (b *Bridge) handleClientEvent(source *whatsmeow.Client, generation uint64, raw any) {
+	b.mu.RLock()
+	current := source == nil || (b.client == source && b.clientGeneration == generation)
+	b.mu.RUnlock()
+	if !current {
+		return
+	}
+
+	at := time.Now()
+	var retryAt time.Time
+	var persistenceErr error
+	if event, ok := raw.(*waevents.TemporaryBan); ok && event != nil {
+		retryAt, persistenceErr = b.persistTemporaryBan(at, event.Expire)
+	}
+
+	b.applyEvent(raw)
+
+	b.mu.RLock()
+	// Re-check after applying the event because a concurrent explicit unpair
+	// may have replaced the client while the compatibility handler ran.
+	current = source == nil || (b.client == source && b.clientGeneration == generation)
+	paired := source != nil && source.Store != nil && source.Store.ID != nil
+	if source == nil {
+		paired = b.client != nil && b.client.Store != nil && b.client.Store.ID != nil
+	}
+	observer := b.observation.callback
+	b.mu.RUnlock()
+	if !current || observer == nil {
+		return
+	}
+	observer(LifecycleEvent{
+		Raw:              raw,
+		Paired:           paired,
+		At:               at,
+		RetryAt:          retryAt,
+		PersistenceError: persistenceErr,
+	})
+}
+
+// handleEvent remains the characterization-test entry point. Production
+// whatsmeow callbacks always use handleClientEvent with a source generation.
 func (b *Bridge) handleEvent(raw any) {
+	b.handleClientEvent(nil, 0, raw)
+}
+
+func (b *Bridge) applyEvent(raw any) {
 	switch evt := raw.(type) {
 	case *waevents.Connected:
 		b.handleConnected()
@@ -1121,7 +1630,6 @@ func (b *Bridge) handleEvent(raw any) {
 		b.handleDisconnected("")
 	case *waevents.LoggedOut:
 		b.handleDisconnected(evt.PermanentDisconnectDescription())
-		go b.reinitializeAfterLogout()
 	case *waevents.StreamReplaced:
 		b.handleDisconnected("stream replaced")
 	case *waevents.ClientOutdated:
@@ -1130,6 +1638,11 @@ func (b *Bridge) handleEvent(raw any) {
 		b.handleDisconnected(evt.PermanentDisconnectDescription())
 	case *waevents.TemporaryBan:
 		b.handleDisconnected(evt.PermanentDisconnectDescription())
+	case *waevents.ManualLoginReconnect:
+		// DisableLoginAutoReconnect turns whatsmeow's implicit 515 reconnect
+		// into this event. The adapter decides whether pairing is handing off or
+		// an active lifecycle generation must be retired and retried.
+		b.handleDisconnected("WhatsApp requested a supervised login reconnect")
 	case *waevents.PairSuccess:
 		b.handlePairSuccess(evt)
 	case *waevents.PairError:
@@ -1221,18 +1734,6 @@ func (b *Bridge) handlePairError(err error) {
 	b.qr = QRSnapshot{}
 	if err != nil {
 		b.lastError = err.Error()
-	}
-	b.mu.Unlock()
-	b.emitStatusChange()
-}
-
-func (b *Bridge) reinitializeAfterLogout() {
-	b.mu.Lock()
-	if err := b.resetClientLocked(); err != nil {
-		b.lastError = err.Error()
-		b.mu.Unlock()
-		b.emitStatusChange()
-		return
 	}
 	b.mu.Unlock()
 	b.emitStatusChange()

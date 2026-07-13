@@ -503,7 +503,7 @@ func TestBridgeSendTextBuildsOutgoingWhatsAppMessage(t *testing.T) {
 	}
 }
 
-func TestBridgeSendTextReconnectsStaleClientBeforeSend(t *testing.T) {
+func TestBridgeSendTextNotifiesSupervisorForStaleClient(t *testing.T) {
 	ownJID := watypes.NewJID("15551230000", watypes.DefaultUserServer)
 	bridge := &Bridge{
 		connected: true,
@@ -515,59 +515,33 @@ func TestBridgeSendTextReconnectsStaleClientBeforeSend(t *testing.T) {
 		},
 	}
 
-	originalSend := sendTextMessage
 	originalConnect := connectClient
 	originalIsConnected := clientIsConnected
-	originalLaunch := launchConnect
 	defer func() {
-		sendTextMessage = originalSend
 		connectClient = originalConnect
 		clientIsConnected = originalIsConnected
-		launchConnect = originalLaunch
 	}()
 
-	var wireConnected bool
 	var connectCalls int
-	var sendCalls int
-	clientIsConnected = func(_ *whatsmeow.Client) bool {
-		return wireConnected
-	}
-	launchConnect = func(b *Bridge, cli *whatsmeow.Client) {
-		b.runConnect(cli)
-	}
+	clientIsConnected = func(_ *whatsmeow.Client) bool { return false }
 	connectClient = func(_ *whatsmeow.Client) error {
 		connectCalls++
-		bridge.mu.Lock()
-		wireConnected = true
-		bridge.connected = true
-		bridge.connecting = false
-		bridge.lastError = ""
-		bridge.mu.Unlock()
 		return nil
 	}
-	sendTextMessage = func(_ *whatsmeow.Client, _ context.Context, _ watypes.JID, _ *waE2E.Message, extra ...whatsmeow.SendRequestExtra) (whatsmeow.SendResponse, error) {
-		sendCalls++
-		return whatsmeow.SendResponse{
-			ID:        watypes.MessageID(extra[0].ID),
-			Timestamp: time.UnixMilli(1700000000999),
-		}, nil
+	var notified error
+	bridge.callbacks.OnConnectionError = func(err error) {
+		notified = err
 	}
 
-	msg, err := bridge.SendText("whatsapp:15551234567@s.whatsapp.net", "hello after reconnect", "")
-	if err != nil {
-		t.Fatalf("SendText(): %v", err)
+	_, err := bridge.SendText("whatsapp:15551234567@s.whatsapp.net", "hello after reconnect", "")
+	if !errors.Is(err, whatsmeow.ErrNotConnected) {
+		t.Fatalf("SendText() error = %v, want ErrNotConnected", err)
 	}
-	if connectCalls != 1 {
-		t.Fatalf("connect calls = %d, want 1", connectCalls)
+	if connectCalls != 0 {
+		t.Fatalf("connect calls = %d, want 0", connectCalls)
 	}
-	if sendCalls != 1 {
-		t.Fatalf("send calls = %d, want 1", sendCalls)
-	}
-	if msg.Body != "hello after reconnect" {
-		t.Fatalf("body = %q, want hello after reconnect", msg.Body)
-	}
-	if !bridge.Status().Connected {
-		t.Fatal("expected bridge status to report connected after reconnect")
+	if !errors.Is(notified, whatsmeow.ErrNotConnected) {
+		t.Fatalf("notified error = %v, want ErrNotConnected", notified)
 	}
 }
 
@@ -803,7 +777,7 @@ func TestHandleGroupInfoOwnJoinClearsSuppressionAndRestoresGroup(t *testing.T) {
 	}
 }
 
-func TestBridgeSendTextTimeoutStartsReconnect(t *testing.T) {
+func TestBridgeSendTextTimeoutNotifiesSupervisorWithoutReconnect(t *testing.T) {
 	ownJID := watypes.NewJID("15551230000", watypes.DefaultUserServer)
 	bridge := &Bridge{
 		connected: true,
@@ -818,29 +792,20 @@ func TestBridgeSendTextTimeoutStartsReconnect(t *testing.T) {
 	originalSend := sendTextMessage
 	originalConnect := connectClient
 	originalIsConnected := clientIsConnected
-	originalLaunch := launchConnect
 	defer func() {
 		sendTextMessage = originalSend
 		connectClient = originalConnect
 		clientIsConnected = originalIsConnected
-		launchConnect = originalLaunch
 	}()
 
-	var wireConnected = true
-	reconnectStarted := make(chan struct{}, 1)
-	clientIsConnected = func(_ *whatsmeow.Client) bool {
-		return wireConnected
-	}
-	launchConnect = func(b *Bridge, cli *whatsmeow.Client) {
-		b.runConnect(cli)
-	}
+	var connectCalls int
+	clientIsConnected = func(_ *whatsmeow.Client) bool { return true }
 	connectClient = func(_ *whatsmeow.Client) error {
-		select {
-		case reconnectStarted <- struct{}{}:
-		default:
-		}
+		connectCalls++
 		return nil
 	}
+	var notified error
+	bridge.callbacks.OnConnectionError = func(err error) { notified = err }
 	sendTextMessage = func(_ *whatsmeow.Client, _ context.Context, _ watypes.JID, _ *waE2E.Message, extra ...whatsmeow.SendRequestExtra) (whatsmeow.SendResponse, error) {
 		_ = extra
 		return whatsmeow.SendResponse{}, context.DeadlineExceeded
@@ -850,21 +815,15 @@ func TestBridgeSendTextTimeoutStartsReconnect(t *testing.T) {
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("SendText() error = %v, want context deadline exceeded", err)
 	}
-	select {
-	case <-reconnectStarted:
-	case <-time.After(time.Second):
-		t.Fatal("expected reconnect to start after send timeout")
+	if connectCalls != 0 {
+		t.Fatalf("connect calls = %d, want 0", connectCalls)
 	}
-	status := bridge.Status()
-	if !status.Connecting {
-		t.Fatal("expected bridge to report reconnecting after send timeout")
-	}
-	if status.Connected {
-		t.Fatal("did not expect bridge to remain connected after send timeout")
+	if !errors.Is(notified, context.DeadlineExceeded) {
+		t.Fatalf("notified error = %v, want context deadline exceeded", notified)
 	}
 }
 
-func TestBridgeSendMediaUploadTimeoutStartsReconnect(t *testing.T) {
+func TestBridgeSendMediaUploadTimeoutNotifiesSupervisorWithoutReconnect(t *testing.T) {
 	ownJID := watypes.NewJID("15551230000", watypes.DefaultUserServer)
 	bridge := &Bridge{
 		connected: true,
@@ -879,26 +838,20 @@ func TestBridgeSendMediaUploadTimeoutStartsReconnect(t *testing.T) {
 	originalUpload := uploadMedia
 	originalConnect := connectClient
 	originalIsConnected := clientIsConnected
-	originalLaunch := launchConnect
 	defer func() {
 		uploadMedia = originalUpload
 		connectClient = originalConnect
 		clientIsConnected = originalIsConnected
-		launchConnect = originalLaunch
 	}()
 
-	reconnectStarted := make(chan struct{}, 1)
+	var connectCalls int
 	clientIsConnected = func(_ *whatsmeow.Client) bool { return true }
-	launchConnect = func(b *Bridge, cli *whatsmeow.Client) {
-		b.runConnect(cli)
-	}
 	connectClient = func(_ *whatsmeow.Client) error {
-		select {
-		case reconnectStarted <- struct{}{}:
-		default:
-		}
+		connectCalls++
 		return nil
 	}
+	var notified error
+	bridge.callbacks.OnConnectionError = func(err error) { notified = err }
 	uploadMedia = func(_ *whatsmeow.Client, _ context.Context, _ []byte, _ whatsmeow.MediaType) (whatsmeow.UploadResponse, error) {
 		return whatsmeow.UploadResponse{}, context.DeadlineExceeded
 	}
@@ -907,17 +860,11 @@ func TestBridgeSendMediaUploadTimeoutStartsReconnect(t *testing.T) {
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("SendMedia() error = %v, want context deadline exceeded", err)
 	}
-	select {
-	case <-reconnectStarted:
-	case <-time.After(time.Second):
-		t.Fatal("expected reconnect to start after media upload timeout")
+	if connectCalls != 0 {
+		t.Fatalf("connect calls = %d, want 0", connectCalls)
 	}
-	status := bridge.Status()
-	if !status.Connecting {
-		t.Fatal("expected bridge to report reconnecting after media upload timeout")
-	}
-	if status.Connected {
-		t.Fatal("did not expect bridge to remain connected after media upload timeout")
+	if !errors.Is(notified, context.DeadlineExceeded) {
+		t.Fatalf("notified error = %v, want context deadline exceeded", notified)
 	}
 }
 
@@ -1826,6 +1773,142 @@ func TestConsumeQRRotatesCodesAndTimeoutReturnsToUnpairedState(t *testing.T) {
 	if status.Paired || status.QRAvailable || status.QREvent != "timeout" {
 		t.Fatalf("expired QR did not return to unpaired state: %+v", status)
 	}
+}
+
+func TestUnpairReconnectsBeforeLogout(t *testing.T) {
+	bridge := newPairedBridgeForUnpairTest(t)
+
+	originalConnectContext := connectClientContext
+	originalLogout := logoutClient
+	originalDeleteStore := deleteClientStore
+	originalIsConnected := clientIsConnected
+	defer func() {
+		connectClientContext = originalConnectContext
+		logoutClient = originalLogout
+		deleteClientStore = originalDeleteStore
+		clientIsConnected = originalIsConnected
+	}()
+
+	clientIsConnected = func(*whatsmeow.Client) bool { return false }
+	var calls []string
+	var connectDeadline time.Time
+	connectClientContext = func(ctx context.Context, cli *whatsmeow.Client) error {
+		if cli != bridge.client {
+			t.Fatal("connect received a different client")
+		}
+		var ok bool
+		connectDeadline, ok = ctx.Deadline()
+		if !ok || time.Until(connectDeadline) <= 0 || time.Until(connectDeadline) > unpairRemoteTimeout {
+			t.Fatalf("connect context deadline = %v, want a live %v bound", connectDeadline, unpairRemoteTimeout)
+		}
+		calls = append(calls, "connect")
+		return nil
+	}
+	logoutClient = func(ctx context.Context, cli *whatsmeow.Client) error {
+		if cli != bridge.client {
+			t.Fatal("logout received a different client")
+		}
+		logoutDeadline, ok := ctx.Deadline()
+		if !ok || !logoutDeadline.Equal(connectDeadline) {
+			t.Fatalf("logout deadline = %v, want connect deadline %v", logoutDeadline, connectDeadline)
+		}
+		calls = append(calls, "logout")
+		cli.Store.ID = nil // Match whatsmeow.Logout's successful local cleanup.
+		return nil
+	}
+	deleteClientStore = func(context.Context, *whatsmeow.Client) error {
+		calls = append(calls, "delete")
+		return nil
+	}
+
+	if err := bridge.Unpair(); err != nil {
+		t.Fatalf("Unpair(): %v", err)
+	}
+	if got := strings.Join(calls, ","); got != "connect,logout" {
+		t.Fatalf("calls = %q, want connect,logout", got)
+	}
+	if status := bridge.Status(); status.Paired {
+		t.Fatalf("status after Unpair() = %+v, want unpaired", status)
+	}
+}
+
+func TestUnpairFallsBackToLocalDeleteAfterRemoteFailure(t *testing.T) {
+	originalConnectContext := connectClientContext
+	originalLogout := logoutClient
+	originalDeleteStore := deleteClientStore
+	originalIsConnected := clientIsConnected
+	defer func() {
+		connectClientContext = originalConnectContext
+		logoutClient = originalLogout
+		deleteClientStore = originalDeleteStore
+		clientIsConnected = originalIsConnected
+	}()
+
+	clientIsConnected = func(*whatsmeow.Client) bool { return false }
+	remoteErr := errors.New("remote unavailable")
+	tests := []struct {
+		name       string
+		connectErr error
+		logoutErr  error
+		wantCalls  string
+	}{
+		{
+			name:       "connect fails",
+			connectErr: remoteErr,
+			wantCalls:  "connect,delete",
+		},
+		{
+			name:      "logout fails",
+			logoutErr: remoteErr,
+			wantCalls: "connect,logout,delete",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			bridge := newPairedBridgeForUnpairTest(t)
+			var calls []string
+			connectClientContext = func(context.Context, *whatsmeow.Client) error {
+				calls = append(calls, "connect")
+				return tt.connectErr
+			}
+			logoutClient = func(context.Context, *whatsmeow.Client) error {
+				calls = append(calls, "logout")
+				return tt.logoutErr
+			}
+			deleteClientStore = func(ctx context.Context, cli *whatsmeow.Client) error {
+				deadline, ok := ctx.Deadline()
+				if !ok || time.Until(deadline) <= 0 || time.Until(deadline) > unpairStoreTimeout {
+					t.Fatalf("store context deadline = %v, want a live %v bound", deadline, unpairStoreTimeout)
+				}
+				calls = append(calls, "delete")
+				cli.Store.ID = nil
+				return nil
+			}
+
+			if err := bridge.Unpair(); err != nil {
+				t.Fatalf("Unpair(): %v", err)
+			}
+			if got := strings.Join(calls, ","); got != tt.wantCalls {
+				t.Fatalf("calls = %q, want %q", got, tt.wantCalls)
+			}
+		})
+	}
+}
+
+func newPairedBridgeForUnpairTest(t *testing.T) *Bridge {
+	t.Helper()
+	bridge, err := New(filepath.Join(t.TempDir(), "whatsapp-session.db"), nil, zerolog.Nop(), Callbacks{})
+	if err != nil {
+		t.Fatalf("New(): %v", err)
+	}
+	t.Cleanup(func() {
+		if err := bridge.Close(); err != nil {
+			t.Errorf("Close(): %v", err)
+		}
+	})
+	jid := watypes.NewJID("15551230000", watypes.DefaultUserServer)
+	bridge.client.Store.ID = &jid
+	return bridge
 }
 
 func TestBridgeSendMediaBuildsOutgoingWhatsAppMessage(t *testing.T) {

@@ -23,6 +23,7 @@ import (
 	"github.com/maxghenis/openmessage/internal/app"
 	"github.com/maxghenis/openmessage/internal/bridge"
 	googleadapter "github.com/maxghenis/openmessage/internal/bridgeadapters/google"
+	whatsappadapter "github.com/maxghenis/openmessage/internal/bridgeadapters/whatsapp"
 	"github.com/maxghenis/openmessage/internal/db"
 	"github.com/maxghenis/openmessage/internal/googlecookies"
 	"github.com/maxghenis/openmessage/internal/importer"
@@ -30,6 +31,7 @@ import (
 	"github.com/maxghenis/openmessage/internal/telemetry"
 	"github.com/maxghenis/openmessage/internal/tools"
 	"github.com/maxghenis/openmessage/internal/web"
+	"github.com/maxghenis/openmessage/internal/whatsapplive"
 )
 
 type serveOptions struct {
@@ -116,6 +118,8 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 	var googleLifecycle *googleadapter.Adapter
 	var googleSupervisor *bridge.Supervisor
 	var googleControl *googleSupervisorControl
+	var whatsappSupervisor *bridge.Supervisor
+	var whatsappControl *whatsappSupervisorControl
 
 	// Google has one lifecycle owner. Transient retry, liveness probes,
 	// credential repair, and terminal parking all flow through this supervisor;
@@ -183,8 +187,61 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 	}
 
 	if !isDemo {
-		if err := a.LoadAndConnectWhatsApp(); err != nil {
-			logger.Warn().Err(err).Msg("WhatsApp live bridge unavailable")
+		whatsappBridge, initialized := initializeWhatsAppForServe(logger, a.InitializeWhatsApp)
+		if initialized {
+			whatsappLifecycle := whatsappadapter.New(whatsappAccountID, whatsappBridge)
+			a.SetWhatsAppLifecycleNotifier(whatsappLifecycle)
+			newWhatsAppSupervisor := func(initial bridge.State) (*bridge.Supervisor, error) {
+				return bridge.NewSupervisor(
+					whatsappAccountID,
+					bridge.PlatformWhatsApp,
+					whatsappLifecycle,
+					whatsappSupervisorPolicy(),
+					whatsappWallClock{},
+					whatsappRandom{},
+					bridge.WithPairer(whatsappLifecycle),
+					bridge.WithInitialState(initial),
+				)
+			}
+			initialState := bridge.StateUnpaired
+			if whatsappBridge.PairedAccount().Paired {
+				initialState = bridge.StateStopped
+			}
+			whatsappSupervisor, err = newWhatsAppSupervisor(initialState)
+			if err != nil {
+				return fmt.Errorf("init WhatsApp supervisor: %w", err)
+			}
+			whatsappControl = newWhatsAppSupervisorControl(
+				whatsappSupervisor,
+				newWhatsAppSupervisor,
+				func() bool { return whatsappBridge.PairedAccount().Paired },
+			)
+			whatsappStartupCtx, cancelWhatsAppStartup := context.WithCancel(context.Background())
+			var whatsappStartupWG sync.WaitGroup
+			defer func() {
+				cancelWhatsAppStartup()
+				ctx, cancel := context.WithTimeout(context.Background(), whatsappSupervisorStopTimeout)
+				defer cancel()
+				if err := whatsappControl.Stop(ctx); err != nil {
+					logger.Warn().Err(err).Msg("WhatsApp supervisor stop timed out; waiting for generation teardown")
+					// App.Close runs after this defer. Wait without a deadline so the
+					// whatsmeow session store is never closed under a live generation.
+					_ = whatsappControl.Stop(context.Background())
+				}
+				whatsappStartupWG.Wait()
+			}()
+
+			if initialState == bridge.StateStopped {
+				whatsappStartupWG.Add(1)
+				go func(supervisor *bridge.Supervisor) {
+					defer whatsappStartupWG.Done()
+					ctx, cancel := context.WithTimeout(whatsappStartupCtx, whatsappSupervisorPolicy().ConnectTimeout)
+					defer cancel()
+					if err := supervisor.Start(ctx, bridge.StartRequest{}); err != nil {
+						logger.Warn().Err(err).Msg("WhatsApp live bridge unavailable")
+					}
+				}(whatsappSupervisor)
+			}
 		}
 	} else {
 		logger.Info().Msg("Demo mode — skipping WhatsApp live bridge")
@@ -196,22 +253,6 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 		}
 	} else {
 		logger.Info().Msg("Demo mode — skipping Signal live bridge")
-	}
-
-	if !isDemo {
-		go func() {
-			ticker := time.NewTicker(5 * time.Second)
-			defer ticker.Stop()
-			for range ticker.C {
-				status := a.WhatsAppStatus()
-				if !status.Paired || status.Connected || status.Pairing || status.Connecting {
-					continue
-				}
-				if err := a.StartWhatsAppConnect(); err != nil {
-					logger.Warn().Err(err).Msg("WhatsApp reconnect attempt failed")
-				}
-			}
-		}()
 	}
 
 	if !isDemo {
@@ -390,6 +431,16 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 			return googleControl.StopAndUnpair(a.Unpair)
 		}
 	}
+	connectWhatsApp := a.StartWhatsAppConnect
+	pairWhatsAppPhone := a.PairWhatsAppPhone
+	unpairWhatsApp := a.UnpairWhatsApp
+	if whatsappControl != nil {
+		connectWhatsApp = whatsappControl.Reconnect
+		pairWhatsAppPhone = whatsappControl.PairPhone
+		unpairWhatsApp = func() error {
+			return whatsappControl.StopAndUnpair(a.UnpairWhatsApp)
+		}
+	}
 
 	// Background loop that sends due scheduled ("send later") messages.
 	a.StartScheduler()
@@ -411,9 +462,9 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 				ReconnectGoogle:       reconnectGoogle,
 				Unpair:                unpairGoogle,
 				WhatsAppStatus:        func() any { return a.WhatsAppStatus() },
-				ConnectWhatsApp:       a.StartWhatsAppConnect,
-				PairWhatsAppPhone:     a.PairWhatsAppPhone,
-				UnpairWhatsApp:        a.UnpairWhatsApp,
+				ConnectWhatsApp:       connectWhatsApp,
+				PairWhatsAppPhone:     pairWhatsAppPhone,
+				UnpairWhatsApp:        unpairWhatsApp,
 				SignalStatus:          func() any { return a.SignalStatus() },
 				ConnectSignal:         a.StartSignalConnect,
 				ReplaySignalRecovery:  a.ReplaySignalRecoveryQueue,
@@ -490,6 +541,18 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 	<-sigCh
 	logger.Info().Msg("Shutting down")
 	return nil
+}
+
+func initializeWhatsAppForServe(
+	logger zerolog.Logger,
+	initialize func() (*whatsapplive.Bridge, error),
+) (*whatsapplive.Bridge, bool) {
+	whatsappBridge, err := initialize()
+	if err != nil {
+		logger.Warn().Err(err).Msg("WhatsApp live bridge unavailable")
+		return nil, false
+	}
+	return whatsappBridge, true
 }
 
 func newMCPHTTPHandler(mcpSrv *mcpserver.MCPServer, baseURL string) http.Handler {
