@@ -431,7 +431,8 @@ func retryableFailure(class bridge.FailureClass) bool {
 
 func terminalFailure(class bridge.FailureClass) bool {
 	switch class {
-	case bridge.FailureReauthRequired,
+	case bridge.FailureUnpaired,
+		bridge.FailureReauthRequired,
 		bridge.FailureUpgradeRequired,
 		bridge.FailureMisconfigured,
 		bridge.FailureUnsupported:

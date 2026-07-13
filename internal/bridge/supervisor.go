@@ -1124,7 +1124,7 @@ func (l *supervisorLoop) handlePairResult(result pairingResult) {
 
 func (l *supervisorLoop) routeFailure(failure OpError) {
 	switch failure.Class {
-	case FailureTransient, FailureRateLimited, FailureCredentialsExpired,
+	case FailureTransient, FailureRateLimited, FailureCredentialsExpired, FailureUnpaired,
 		FailureReauthRequired, FailureUpgradeRequired, FailureMisconfigured,
 		FailureUnsupported:
 	default:
@@ -1135,6 +1135,18 @@ func (l *supervisorLoop) routeFailure(failure OpError) {
 	l.snapshot.ErrorFingerprint = failure.Fingerprint
 	l.snapshot.RetryAt = time.Time{}
 	l.snapshot.LivenessDeadline = time.Time{}
+	if failure.Class == FailureUnpaired {
+		// A lifecycle can discover that no linked account exists (notably an
+		// expired QR attempt). This is intentionally idle until an explicit
+		// user action; it is neither reconnect backoff nor a blocked circuit.
+		l.resetFailureHistory()
+		l.lastFailure = failure
+		l.snapshot.ErrorClass = failure.Class
+		l.snapshot.ErrorFingerprint = failure.Fingerprint
+		l.snapshot.State = StateUnpaired
+		l.publish()
+		return
+	}
 
 	if l.recordFingerprint(failure.Class, failure.Fingerprint) {
 		l.snapshot.State = StateBlocked
