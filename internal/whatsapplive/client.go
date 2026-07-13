@@ -2,6 +2,7 @@ package whatsapplive
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/base64"
 	"encoding/hex"
@@ -45,6 +46,11 @@ const unpairStoreTimeout = 10 * time.Second
 var ErrProfilePhotoNotFound = errors.New("whatsapp profile photo not found")
 
 var ErrTemporaryBanActive = errors.New("whatsapp temporary ban is still active")
+
+// ErrMediaNotDispatched marks failures that happened before whatsmeow's send
+// call. Callers may safely retry those failures without treating the attempt as
+// an ambiguous dispatch.
+var ErrMediaNotDispatched = errors.New("whatsapp media was not dispatched")
 
 const whatsappRuntimeStateSchema = `
 CREATE TABLE IF NOT EXISTS openmessage_whatsapp_runtime_state (
@@ -1203,24 +1209,89 @@ func (b *Bridge) SendText(conversationID, body, replyToID string) (*db.Message, 
 	}, nil
 }
 
+type sendMediaResult struct {
+	remoteID  string
+	timestamp time.Time
+	upload    whatsmeow.UploadResponse
+	client    *whatsmeow.Client
+	caption   string
+	replyToID string
+}
+
+// SendMediaRequest sends media with a stable caller-owned request ID and
+// returns the transport identity used by the v2 dispatch path.
+func (b *Bridge) SendMediaRequest(conversationID string, data []byte, filename, mime, caption, replyToID, requestID string) (remoteID string, ts time.Time, err error) {
+	result, err := b.sendMediaRequest(
+		conversationID,
+		data,
+		filename,
+		mime,
+		caption,
+		replyToID,
+		deriveMediaRequestID(requestID),
+		true,
+	)
+	if err != nil {
+		return "", time.Time{}, err
+	}
+	return result.remoteID, result.timestamp, nil
+}
+
 func (b *Bridge) SendMedia(conversationID string, data []byte, filename, mime, caption, replyToID string) (*db.Message, error) {
+	// Both APIs share the rich core because the legacy wrapper must retain the
+	// upload metadata used to assemble its persisted db.Message. An empty ID
+	// preserves its single GenerateMessageID call at the pre-send boundary.
+	result, err := b.sendMediaRequest(conversationID, data, filename, mime, caption, replyToID, "", false)
+	if err != nil {
+		return nil, err
+	}
+	senderName := "Me"
+	senderNumber := ""
+	if result.client.Store != nil {
+		if push := strings.TrimSpace(result.client.Store.PushName); push != "" {
+			senderName = push
+		}
+		if result.client.Store.ID != nil {
+			senderNumber = jidToPhone(*result.client.Store.ID)
+		}
+	}
+
+	return &db.Message{
+		MessageID:      "whatsapp:" + result.remoteID,
+		ConversationID: conversationID,
+		SenderName:     senderName,
+		SenderNumber:   senderNumber,
+		Body:           result.caption,
+		TimestampMS:    result.timestamp.UnixMilli(),
+		Status:         "sent",
+		IsFromMe:       true,
+		MediaID:        encodeStoredMediaRef(storedMediaRefFromUpload(result.upload)),
+		MimeType:       mime,
+		DecryptionKey:  encodeBytes(result.upload.MediaKey),
+		ReplyToID:      result.replyToID,
+		SourcePlatform: "whatsapp",
+		SourceID:       result.remoteID,
+	}, nil
+}
+
+func (b *Bridge) sendMediaRequest(conversationID string, data []byte, filename, mime, caption, replyToID string, requestID watypes.MessageID, markPreDispatch bool) (sendMediaResult, error) {
 	if conversationID == "" || len(data) == 0 {
-		return nil, errors.New("conversation_id and file are required")
+		return sendMediaResult{}, markMediaNotDispatched(errors.New("conversation_id and file are required"), markPreDispatch)
 	}
 	caption = strings.TrimSpace(caption)
 	replyToID = normalizeReplyToID(replyToID)
 	chatJID, err := parseConversationJID(conversationID)
 	if err != nil {
-		return nil, err
+		return sendMediaResult{}, markMediaNotDispatched(err, markPreDispatch)
 	}
 	mediaType, err := mediaTypeForMIME(mime)
 	if err != nil {
-		return nil, err
+		return sendMediaResult{}, markMediaNotDispatched(err, markPreDispatch)
 	}
 
 	cli, err := b.ensureSendClient()
 	if err != nil {
-		return nil, err
+		return sendMediaResult{}, markMediaNotDispatched(err, markPreDispatch)
 	}
 
 	uploadCtx, cancelUpload := context.WithTimeout(context.Background(), 90*time.Second)
@@ -1229,56 +1300,63 @@ func (b *Bridge) SendMedia(conversationID string, data []byte, filename, mime, c
 	upload, err := uploadMedia(cli, uploadCtx, data, mediaType)
 	if err != nil {
 		b.reportConnectionError(err)
-		return nil, fmt.Errorf("upload WhatsApp media: %w", err)
+		return sendMediaResult{}, markMediaNotDispatched(fmt.Errorf("upload WhatsApp media: %w", err), markPreDispatch)
 	}
-	reqID := cli.GenerateMessageID()
+	if requestID == "" {
+		requestID = cli.GenerateMessageID()
+	}
 	sendCtx, cancelSend := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancelSend()
 
 	resp, err := sendTextMessage(cli, sendCtx, chatJID, outgoingMediaMessage(upload, mime, filename, mediaType, caption, replyToID), whatsmeow.SendRequestExtra{
-		ID: reqID,
+		ID: requestID,
 	})
 	if err != nil {
 		b.reportConnectionError(err)
-		return nil, fmt.Errorf("send WhatsApp media: %w", err)
+		return sendMediaResult{}, fmt.Errorf("send WhatsApp media: %w", err)
 	}
 
-	now := time.Now().UnixMilli()
+	acceptedAt := time.Now()
 	if !resp.Timestamp.IsZero() {
-		now = resp.Timestamp.UnixMilli()
+		acceptedAt = resp.Timestamp
 	}
 	messageID := string(resp.ID)
 	if messageID == "" {
-		messageID = string(reqID)
+		messageID = string(requestID)
 	}
 
-	senderName := "Me"
-	senderNumber := ""
-	if cli.Store != nil {
-		if push := strings.TrimSpace(cli.Store.PushName); push != "" {
-			senderName = push
-		}
-		if cli.Store.ID != nil {
-			senderNumber = jidToPhone(*cli.Store.ID)
-		}
-	}
-
-	return &db.Message{
-		MessageID:      "whatsapp:" + messageID,
-		ConversationID: conversationID,
-		SenderName:     senderName,
-		SenderNumber:   senderNumber,
-		Body:           caption,
-		TimestampMS:    now,
-		Status:         "sent",
-		IsFromMe:       true,
-		MediaID:        encodeStoredMediaRef(storedMediaRefFromUpload(upload)),
-		MimeType:       mime,
-		DecryptionKey:  encodeBytes(upload.MediaKey),
-		ReplyToID:      replyToID,
-		SourcePlatform: "whatsapp",
-		SourceID:       messageID,
+	return sendMediaResult{
+		remoteID:  messageID,
+		timestamp: acceptedAt,
+		upload:    upload,
+		client:    cli,
+		caption:   caption,
+		replyToID: replyToID,
 	}, nil
+}
+
+func deriveMediaRequestID(requestID string) watypes.MessageID {
+	digest := sha256.Sum256([]byte(requestID))
+	return whatsmeow.WebMessageIDPrefix + strings.ToUpper(hex.EncodeToString(digest[:9]))
+}
+
+type mediaNotDispatchedError struct {
+	cause error
+}
+
+func markMediaNotDispatched(err error, mark bool) error {
+	if !mark || err == nil || errors.Is(err, ErrMediaNotDispatched) {
+		return err
+	}
+	return mediaNotDispatchedError{cause: err}
+}
+
+func (e mediaNotDispatchedError) Error() string { return e.cause.Error() }
+
+func (e mediaNotDispatchedError) Unwrap() error { return e.cause }
+
+func (e mediaNotDispatchedError) Is(target error) bool {
+	return target == ErrMediaNotDispatched
 }
 
 func (b *Bridge) SendReaction(conversationID, targetMessageID, emoji, action string) error {

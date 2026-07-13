@@ -1,12 +1,15 @@
 // Package signal adapts one retained signallive signal-cli poller lifecycle to
-// bridge.Run. Legacy send, media, reaction, recovery, and QR/status paths stay
-// on signallive.Bridge; this adapter owns only connect/reconnect/park.
+// bridge.Run and durable media dispatch. Legacy send, media, reaction,
+// recovery, and QR/status paths remain on signallive.Bridge.
 package signal
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -16,6 +19,7 @@ import (
 
 type poller interface {
 	StartPoller(context.Context) (signallive.PollerRun, error)
+	SendMediaRequest(string, io.Reader, int64, string, string, string, string) (int64, error)
 	Status() signallive.StatusSnapshot
 	ApplyPollerFailure(signallive.PollerExit)
 	InputFingerprint() string
@@ -52,6 +56,79 @@ func (a *Adapter) DeclaredCapabilities() bridge.CapabilitySet {
 		Reactions:     true,
 		PairQR:        true,
 		MediaDownload: true,
+	}
+}
+
+func (a *Adapter) SendMedia(
+	ctx context.Context,
+	req bridge.MediaRequest,
+) (bridge.SendResult, error) {
+	if ctx == nil {
+		return bridge.SendResult{}, bridge.OpError{
+			Class:       bridge.FailureTransient,
+			Operation:   "send_media",
+			Fingerprint: "signal_send_media_context_missing",
+			Dispatch:    bridge.DispatchNotCalled,
+			Cause:       errors.New("Signal media send context is nil"),
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return bridge.SendResult{}, bridge.OpError{
+			Class:       bridge.FailureTransient,
+			Operation:   "send_media",
+			Fingerprint: "signal_send_media_context_done",
+			Dispatch:    bridge.DispatchNotCalled,
+			Cause:       err,
+		}
+	}
+	if a == nil || a.poller == nil {
+		return bridge.SendResult{}, signalNotConnectedError()
+	}
+	status := a.poller.Status()
+	if !status.Connected || strings.TrimSpace(status.Account) == "" {
+		return bridge.SendResult{}, signalNotConnectedError()
+	}
+
+	replyToID := ""
+	if req.ReplyTo != nil {
+		replyToID = req.ReplyTo.RemoteID
+	}
+	timestampMS, err := a.poller.SendMediaRequest(
+		req.Conversation.RemoteID,
+		req.Reader,
+		req.Size,
+		req.Filename,
+		req.MIME,
+		req.Caption,
+		replyToID,
+	)
+	if err != nil {
+		a.ReportError(err)
+		failure := bridge.OpError{
+			Class:       bridge.FailureTransient,
+			Operation:   "send_media",
+			Fingerprint: "signal_send_media_failed",
+			Cause:       err,
+		}
+		if !signallive.IsCommandError(err) || signallive.IsSendNotDispatchedError(err) {
+			failure.Dispatch = bridge.DispatchNotCalled
+		}
+		return bridge.SendResult{}, failure
+	}
+
+	return bridge.SendResult{
+		RemoteMessageID: strconv.FormatInt(timestampMS, 10),
+		EchoExpected:    false,
+	}, nil
+}
+
+func signalNotConnectedError() bridge.OpError {
+	return bridge.OpError{
+		Class:       bridge.FailureTransient,
+		Operation:   "send_media",
+		Fingerprint: "signal_not_connected",
+		Dispatch:    bridge.DispatchNotCalled,
+		Cause:       errors.New("Signal is not connected"),
 	}
 }
 
@@ -485,5 +562,6 @@ func (r *run) recordActivity(activity signallive.PollerActivity) {
 var (
 	_ bridge.Adapter            = (*Adapter)(nil)
 	_ bridge.CapabilityDeclarer = (*Adapter)(nil)
+	_ bridge.MediaSender        = (*Adapter)(nil)
 	_ bridge.Run                = (*run)(nil)
 )
