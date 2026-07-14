@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -394,6 +395,449 @@ func TestOutboxAttachmentCascadesAndExistingMediaRequiresAttachment(t *testing.T
 		outboxTestAttachment(),
 	); err == nil {
 		t.Fatal("EnqueueOutgoingMediaMessage(existing without attachment) succeeded")
+	}
+}
+
+func TestOutboxEnqueueReactionRoundTripsAndDeduplicates(t *testing.T) {
+	clock := newOutboxTestClock(outboxTestTimeMS)
+	store, repository := openOutboxTestRepository(t, clock.Now)
+	seedMessageConversation(t, store, "conversation-a", "account-a")
+	seedOutboxTestMessage(t, store, "target-a", "account-a", "conversation-a")
+	ctx := context.Background()
+
+	item := outboxTestReactionItem("reaction")
+	reaction := OutboxReaction{
+		TargetMessageID: "target-a",
+		Emoji:           "👍",
+		Action:          "add",
+	}
+	row, disposition, err := repository.EnqueueReaction(ctx, item, reaction)
+	if err != nil {
+		t.Fatalf("EnqueueReaction(): %v", err)
+	}
+	if disposition != EnqueueInserted || row.OutboxID != item.OutboxID || row.LocalMessageID != nil {
+		t.Fatalf("EnqueueReaction() = (%+v, %q), want message-less inserted row", row, disposition)
+	}
+	got, err := repository.GetOutboxReaction(ctx, item.OutboxID)
+	if err != nil {
+		t.Fatalf("GetOutboxReaction(): %v", err)
+	}
+	want := reaction
+	want.OutboxID = item.OutboxID
+	want.CreatedAtMS = outboxTestTimeMS
+	if got != want {
+		t.Fatalf("GetOutboxReaction() = %+v, want %+v", got, want)
+	}
+	assertRowCount(t, store.db, "messages", 1)
+
+	clock.Set(outboxTestTimeMS + 500)
+	duplicate := item
+	duplicate.OutboxID = "outbox-unused-reaction-duplicate"
+	duplicate.TransportRequestID = "request-unused-reaction-duplicate"
+	duplicateRow, disposition, err := repository.EnqueueReaction(ctx, duplicate, reaction)
+	if err != nil {
+		t.Fatalf("EnqueueReaction(duplicate): %v", err)
+	}
+	if disposition != EnqueueExisting || duplicateRow.OutboxID != item.OutboxID {
+		t.Fatalf("duplicate result = (%+v, %q), want original", duplicateRow, disposition)
+	}
+	assertRowCount(t, store.db, "outbox", 1)
+	assertRowCount(t, store.db, "outbox_reactions", 1)
+
+	conflict := duplicate
+	conflict.OutboxID = "outbox-reaction-conflict"
+	conflict.TransportRequestID = "request-reaction-conflict"
+	conflict.PayloadHash = "different-reaction-hash"
+	if _, _, err := repository.EnqueueReaction(ctx, conflict, reaction); !errors.Is(err, ErrIdempotencyConflict) {
+		t.Fatalf("EnqueueReaction(conflict) error = %v, want ErrIdempotencyConflict", err)
+	}
+
+	mustExec(t, store.db, `DELETE FROM outbox_reactions WHERE outbox_id = ?`, item.OutboxID)
+	missingPair := duplicate
+	missingPair.OutboxID = "outbox-unused-missing-reaction"
+	missingPair.TransportRequestID = "request-unused-missing-reaction"
+	if _, _, err := repository.EnqueueReaction(ctx, missingPair, reaction); err == nil {
+		t.Fatal("EnqueueReaction(existing without side row) succeeded")
+	}
+	if _, err := repository.GetOutboxReaction(ctx, "missing"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("GetOutboxReaction(missing) error = %v, want sql.ErrNoRows", err)
+	}
+}
+
+func TestOutboxEnqueueReadReceiptRoundTripsAndSkipsCursorOnReplay(t *testing.T) {
+	clock := newOutboxTestClock(outboxTestTimeMS)
+	store, repository := openOutboxTestRepository(t, clock.Now)
+	seedMessageConversation(t, store, "conversation-a", "account-a")
+	seedOutboxTestDevice(t, store, "device-a", "account-a")
+	seedOutboxTestMessage(t, store, "target-a", "account-a", "conversation-a")
+	ctx := context.Background()
+
+	item := outboxTestReadItem("read")
+	receipt := OutboxReadReceipt{
+		DeviceID:          "device-a",
+		LastReadMessageID: "target-a",
+		ReadAtMS:          outboxTestTimeMS - 100,
+	}
+	targetID := "target-a"
+	cursor := ReadCursor{
+		AccountID:         "account-a",
+		DeviceID:          "device-a",
+		ConversationID:    "conversation-a",
+		LastReadMessageID: &targetID,
+		LastReadAtMS:      receipt.ReadAtMS,
+		UpdatedAtMS:       outboxTestTimeMS,
+	}
+	row, disposition, err := repository.EnqueueReadReceipt(ctx, item, receipt, cursor)
+	if err != nil {
+		t.Fatalf("EnqueueReadReceipt(): %v", err)
+	}
+	if disposition != EnqueueInserted || row.OutboxID != item.OutboxID || row.LocalMessageID != nil {
+		t.Fatalf("EnqueueReadReceipt() = (%+v, %q), want message-less inserted row", row, disposition)
+	}
+	gotReceipt, err := repository.GetOutboxReadReceipt(ctx, item.OutboxID)
+	if err != nil {
+		t.Fatalf("GetOutboxReadReceipt(): %v", err)
+	}
+	wantReceipt := receipt
+	wantReceipt.OutboxID = item.OutboxID
+	wantReceipt.CreatedAtMS = outboxTestTimeMS
+	if gotReceipt != wantReceipt {
+		t.Fatalf("GetOutboxReadReceipt() = %+v, want %+v", gotReceipt, wantReceipt)
+	}
+	gotCursor, err := store.GetReadCursor("device-a", "conversation-a")
+	if err != nil {
+		t.Fatalf("GetReadCursor(): %v", err)
+	}
+	if gotCursor.LastReadMessageID == nil || *gotCursor.LastReadMessageID != targetID ||
+		gotCursor.LastReadAtMS != receipt.ReadAtMS || gotCursor.UpdatedAtMS != cursor.UpdatedAtMS {
+		t.Fatalf("GetReadCursor() = %+v, want %+v", gotCursor, cursor)
+	}
+
+	clock.Set(outboxTestTimeMS + 500)
+	duplicate := item
+	duplicate.OutboxID = "outbox-unused-read-duplicate"
+	duplicate.TransportRequestID = "request-unused-read-duplicate"
+	candidateCursor := cursor
+	candidateCursor.LastReadAtMS += 10_000
+	candidateCursor.UpdatedAtMS += 10_000
+	duplicateRow, disposition, err := repository.EnqueueReadReceipt(
+		ctx,
+		duplicate,
+		receipt,
+		candidateCursor,
+	)
+	if err != nil {
+		t.Fatalf("EnqueueReadReceipt(duplicate): %v", err)
+	}
+	if disposition != EnqueueExisting || duplicateRow.OutboxID != item.OutboxID {
+		t.Fatalf("duplicate result = (%+v, %q), want original", duplicateRow, disposition)
+	}
+	unchangedCursor, err := store.GetReadCursor("device-a", "conversation-a")
+	if err != nil {
+		t.Fatalf("GetReadCursor(after replay): %v", err)
+	}
+	if unchangedCursor.LastReadAtMS != cursor.LastReadAtMS || unchangedCursor.UpdatedAtMS != cursor.UpdatedAtMS {
+		t.Fatalf("replay changed cursor: got %+v, want %+v", unchangedCursor, cursor)
+	}
+	assertRowCount(t, store.db, "outbox", 1)
+	assertRowCount(t, store.db, "outbox_read_receipts", 1)
+	assertRowCount(t, store.db, "read_cursors", 1)
+
+	conflict := duplicate
+	conflict.OutboxID = "outbox-read-conflict"
+	conflict.TransportRequestID = "request-read-conflict"
+	conflict.PayloadHash = "different-read-hash"
+	if _, _, err := repository.EnqueueReadReceipt(ctx, conflict, receipt, cursor); !errors.Is(err, ErrIdempotencyConflict) {
+		t.Fatalf("EnqueueReadReceipt(conflict) error = %v, want ErrIdempotencyConflict", err)
+	}
+
+	mustExec(t, store.db, `DELETE FROM outbox_read_receipts WHERE outbox_id = ?`, item.OutboxID)
+	missingPair := duplicate
+	missingPair.OutboxID = "outbox-unused-missing-read-receipt"
+	missingPair.TransportRequestID = "request-unused-missing-read-receipt"
+	if _, _, err := repository.EnqueueReadReceipt(ctx, missingPair, receipt, cursor); err == nil {
+		t.Fatal("EnqueueReadReceipt(existing without side row) succeeded")
+	}
+	if _, err := repository.GetOutboxReadReceipt(ctx, "missing"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("GetOutboxReadReceipt(missing) error = %v, want sql.ErrNoRows", err)
+	}
+}
+
+func TestOutboxCarrierInsertsAreAtomic(t *testing.T) {
+	t.Run("reaction side row", func(t *testing.T) {
+		clock := newOutboxTestClock(outboxTestTimeMS)
+		store, repository := openOutboxTestRepository(t, clock.Now)
+		seedMessageConversation(t, store, "conversation-a", "account-a")
+		seedOutboxTestMessage(t, store, "target-a", "account-a", "conversation-a")
+		mustExec(t, store.db, `
+			CREATE TRIGGER fail_outbox_reaction_insert
+			BEFORE INSERT ON outbox_reactions
+			BEGIN
+				SELECT RAISE(ABORT, 'injected reaction carrier failure');
+			END
+		`)
+		_, _, err := repository.EnqueueReaction(
+			context.Background(),
+			outboxTestReactionItem("atomic-reaction"),
+			OutboxReaction{TargetMessageID: "target-a", Emoji: "❤️", Action: "add"},
+		)
+		if err == nil {
+			t.Fatal("EnqueueReaction() succeeded, want injected side-row failure")
+		}
+		assertRowCount(t, store.db, "outbox", 0)
+		assertRowCount(t, store.db, "outbox_reactions", 0)
+		assertRowCount(t, store.db, "messages", 1)
+	})
+
+	t.Run("read cursor", func(t *testing.T) {
+		clock := newOutboxTestClock(outboxTestTimeMS)
+		store, repository := openOutboxTestRepository(t, clock.Now)
+		seedMessageConversation(t, store, "conversation-a", "account-a")
+		seedOutboxTestDevice(t, store, "device-a", "account-a")
+		seedOutboxTestMessage(t, store, "target-a", "account-a", "conversation-a")
+		mustExec(t, store.db, `
+			CREATE TRIGGER fail_read_cursor_insert
+			BEFORE INSERT ON read_cursors
+			BEGIN
+				SELECT RAISE(ABORT, 'injected read cursor failure');
+			END
+		`)
+		targetID := "target-a"
+		_, _, err := repository.EnqueueReadReceipt(
+			context.Background(),
+			outboxTestReadItem("atomic-read"),
+			OutboxReadReceipt{
+				DeviceID: "device-a", LastReadMessageID: targetID, ReadAtMS: outboxTestTimeMS,
+			},
+			ReadCursor{
+				AccountID: "account-a", DeviceID: "device-a", ConversationID: "conversation-a",
+				LastReadMessageID: &targetID, LastReadAtMS: outboxTestTimeMS, UpdatedAtMS: outboxTestTimeMS,
+			},
+		)
+		if err == nil {
+			t.Fatal("EnqueueReadReceipt() succeeded, want injected cursor failure")
+		}
+		assertRowCount(t, store.db, "outbox", 0)
+		assertRowCount(t, store.db, "outbox_read_receipts", 0)
+		assertRowCount(t, store.db, "read_cursors", 0)
+	})
+}
+
+func TestOutboxValidatesReactionAndReadCarrierPairing(t *testing.T) {
+	clock := newOutboxTestClock(outboxTestTimeMS)
+	store, repository := openOutboxTestRepository(t, clock.Now)
+	seedMessageConversation(t, store, "conversation-a", "account-a")
+	seedOutboxTestDevice(t, store, "device-a", "account-a")
+	seedOutboxTestMessage(t, store, "target-a", "account-a", "conversation-a")
+	ctx := context.Background()
+	targetID := "target-a"
+	reaction := OutboxReaction{TargetMessageID: targetID, Emoji: "👍", Action: "add"}
+	receipt := OutboxReadReceipt{DeviceID: "device-a", LastReadMessageID: targetID, ReadAtMS: outboxTestTimeMS}
+	cursor := ReadCursor{
+		AccountID: "account-a", DeviceID: "device-a", ConversationID: "conversation-a",
+		LastReadMessageID: &targetID, LastReadAtMS: outboxTestTimeMS, UpdatedAtMS: outboxTestTimeMS,
+	}
+
+	tests := []struct {
+		name    string
+		enqueue func() error
+	}{
+		{
+			name: "reaction without reaction carrier",
+			enqueue: func() error {
+				_, _, err := repository.Enqueue(ctx, outboxTestReactionItem("missing-reaction"))
+				return err
+			},
+		},
+		{
+			name: "text with reaction carrier",
+			enqueue: func() error {
+				_, _, err := repository.EnqueueReaction(ctx, outboxTestItem("text-reaction"), reaction)
+				return err
+			},
+		},
+		{
+			name: "read without receipt carrier",
+			enqueue: func() error {
+				_, _, err := repository.Enqueue(ctx, outboxTestReadItem("missing-receipt"))
+				return err
+			},
+		},
+		{
+			name: "text with receipt carrier",
+			enqueue: func() error {
+				_, _, err := repository.EnqueueReadReceipt(ctx, outboxTestItem("text-receipt"), receipt, cursor)
+				return err
+			},
+		},
+		{
+			name: "reaction with attachment carrier",
+			enqueue: func() error {
+				item := outboxTestReactionItem("reaction-attachment")
+				_, _, err := repository.enqueue(ctx, item, nil, enqueueCarriers{
+					attachment: &OutboxAttachment{
+						BlobHash: strings.Repeat("a", 64), SizeBytes: 1, MIME: "image/png",
+					},
+					reaction: &reaction,
+				})
+				return err
+			},
+		},
+		{
+			name: "read with reaction carrier",
+			enqueue: func() error {
+				item := outboxTestReadItem("read-reaction")
+				_, _, err := repository.enqueue(ctx, item, nil, enqueueCarriers{
+					reaction:    &reaction,
+					readReceipt: &receipt,
+					readCursor:  &cursor,
+				})
+				return err
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if err := test.enqueue(); err == nil {
+				t.Fatal("enqueue succeeded, want carrier-pairing error")
+			}
+		})
+	}
+	assertRowCount(t, store.db, "outbox", 0)
+}
+
+func TestOutboxReactionAndReadReceiptForeignKeys(t *testing.T) {
+	tests := []struct {
+		name    string
+		enqueue func(*testing.T, *Store, *OutboxRepository) error
+	}{
+		{
+			name: "unknown reaction target",
+			enqueue: func(t *testing.T, _ *Store, repository *OutboxRepository) error {
+				_, _, err := repository.EnqueueReaction(
+					context.Background(), outboxTestReactionItem("unknown-target"),
+					OutboxReaction{TargetMessageID: "missing", Emoji: "👍", Action: "add"},
+				)
+				return err
+			},
+		},
+		{
+			name: "unknown read target",
+			enqueue: func(t *testing.T, _ *Store, repository *OutboxRepository) error {
+				targetID := "missing"
+				_, _, err := repository.EnqueueReadReceipt(
+					context.Background(), outboxTestReadItem("unknown-read-target"),
+					OutboxReadReceipt{DeviceID: "device-a", LastReadMessageID: targetID, ReadAtMS: outboxTestTimeMS},
+					ReadCursor{
+						AccountID: "account-a", DeviceID: "device-a", ConversationID: "conversation-a",
+						LastReadMessageID: &targetID, LastReadAtMS: outboxTestTimeMS, UpdatedAtMS: outboxTestTimeMS,
+					},
+				)
+				return err
+			},
+		},
+		{
+			name: "unknown device",
+			enqueue: func(t *testing.T, _ *Store, repository *OutboxRepository) error {
+				targetID := "target-a"
+				_, _, err := repository.EnqueueReadReceipt(
+					context.Background(), outboxTestReadItem("unknown-device"),
+					OutboxReadReceipt{DeviceID: "missing", LastReadMessageID: targetID, ReadAtMS: outboxTestTimeMS},
+					ReadCursor{
+						AccountID: "account-a", DeviceID: "missing", ConversationID: "conversation-a",
+						LastReadMessageID: &targetID, LastReadAtMS: outboxTestTimeMS, UpdatedAtMS: outboxTestTimeMS,
+					},
+				)
+				return err
+			},
+		},
+		{
+			name: "cross-conversation cursor target",
+			enqueue: func(t *testing.T, store *Store, repository *OutboxRepository) error {
+				seedMessageConversation(t, store, "conversation-other", "account-a")
+				seedOutboxTestMessage(t, store, "target-other", "account-a", "conversation-other")
+				targetID := "target-other"
+				_, _, err := repository.EnqueueReadReceipt(
+					context.Background(), outboxTestReadItem("cross-conversation"),
+					OutboxReadReceipt{DeviceID: "device-a", LastReadMessageID: targetID, ReadAtMS: outboxTestTimeMS},
+					ReadCursor{
+						AccountID: "account-a", DeviceID: "device-a", ConversationID: "conversation-a",
+						LastReadMessageID: &targetID, LastReadAtMS: outboxTestTimeMS, UpdatedAtMS: outboxTestTimeMS,
+					},
+				)
+				return err
+			},
+		},
+		{
+			name: "cross-account device",
+			enqueue: func(t *testing.T, store *Store, repository *OutboxRepository) error {
+				seedMessageAccount(t, store, "account-b", "test-b")
+				seedOutboxTestDevice(t, store, "device-b", "account-b")
+				targetID := "target-a"
+				_, _, err := repository.EnqueueReadReceipt(
+					context.Background(), outboxTestReadItem("cross-account"),
+					OutboxReadReceipt{DeviceID: "device-b", LastReadMessageID: targetID, ReadAtMS: outboxTestTimeMS},
+					ReadCursor{
+						AccountID: "account-a", DeviceID: "device-b", ConversationID: "conversation-a",
+						LastReadMessageID: &targetID, LastReadAtMS: outboxTestTimeMS, UpdatedAtMS: outboxTestTimeMS,
+					},
+				)
+				return err
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			clock := newOutboxTestClock(outboxTestTimeMS)
+			store, repository := openOutboxTestRepository(t, clock.Now)
+			seedMessageConversation(t, store, "conversation-a", "account-a")
+			seedOutboxTestDevice(t, store, "device-a", "account-a")
+			seedOutboxTestMessage(t, store, "target-a", "account-a", "conversation-a")
+			if err := test.enqueue(t, store, repository); !errors.Is(err, ErrConstraintViolation) {
+				t.Fatalf("enqueue error = %v, want ErrConstraintViolation", err)
+			}
+			assertRowCount(t, store.db, "outbox", 0)
+			assertRowCount(t, store.db, "outbox_reactions", 0)
+			assertRowCount(t, store.db, "outbox_read_receipts", 0)
+		})
+	}
+}
+
+func TestOutboxConfirmWithoutResultRequiresCalledActiveLease(t *testing.T) {
+	clock := newOutboxTestClock(outboxTestTimeMS)
+	_, repository := openOutboxTestRepository(t, clock.Now)
+	ctx := context.Background()
+	item := mustEnqueueOutbox(t, repository, outboxTestItem("confirm-without-result"))
+	lease := mustLeaseOne(t, repository, LeaseRequest{
+		Owner: "worker", Now: clock.Now(), Duration: time.Minute, Limit: 1,
+	})
+	token := mustLeaseToken(t, lease)
+
+	if err := repository.ConfirmWithoutResult(ctx, item.OutboxID, token); !errors.Is(err, ErrLeaseLost) {
+		t.Fatalf("ConfirmWithoutResult(pre-call) error = %v, want ErrLeaseLost", err)
+	}
+	if err := repository.MarkTransportCalled(ctx, Attempt{OutboxID: item.OutboxID, LeaseToken: token}); err != nil {
+		t.Fatalf("MarkTransportCalled(): %v", err)
+	}
+	if err := repository.Confirm(ctx, Confirmation{OutboxID: item.OutboxID, LeaseToken: token}); err == nil {
+		t.Fatal("Confirm(empty result ID) succeeded")
+	}
+	if err := repository.ConfirmWithoutResult(ctx, item.OutboxID, "stale-token"); !errors.Is(err, ErrLeaseLost) {
+		t.Fatalf("ConfirmWithoutResult(stale token) error = %v, want ErrLeaseLost", err)
+	}
+	if err := repository.ConfirmWithoutResult(ctx, item.OutboxID, token); err != nil {
+		t.Fatalf("ConfirmWithoutResult(): %v", err)
+	}
+	confirmed, err := repository.FindByID(ctx, item.OutboxID)
+	if err != nil {
+		t.Fatalf("FindByID(): %v", err)
+	}
+	if confirmed.State != OutboxConfirmed || confirmed.ResultRemoteID != nil ||
+		confirmed.LeaseOwner != nil || confirmed.LeaseToken != nil ||
+		confirmed.LeaseExpiresAtMS != nil || confirmed.TransportCalledAtMS != nil ||
+		confirmed.ErrorClass != nil || confirmed.ErrorCode != nil || confirmed.ErrorDetail != nil {
+		t.Fatalf("confirmed without-result row = %+v", confirmed)
 	}
 }
 
@@ -916,10 +1360,10 @@ func TestOutboxMigrationIsChecksummedAndStrict(t *testing.T) {
 	store, _ := openOutboxTestRepository(t, func() time.Time {
 		return time.UnixMilli(outboxTestTimeMS)
 	})
-	if len(embeddedMigrations) != 6 {
-		t.Fatalf("embedded migrations = %d, want 6", len(embeddedMigrations))
+	if len(embeddedMigrations) != 7 {
+		t.Fatalf("embedded migrations = %d, want 7", len(embeddedMigrations))
 	}
-	assertPragmaInt(t, store.db, "user_version", 6)
+	assertPragmaInt(t, store.db, "user_version", 7)
 	ledger := readLedgerRow(t, store.db, 5)
 	if ledger.name != "outbox" {
 		t.Fatalf("migration 0005 name = %q, want outbox", ledger.name)
@@ -995,8 +1439,8 @@ func TestOutboxAttachmentsMigrationAppliesToBlankAndExistingV5Database(t *testin
 			}
 		})
 		after := readLedgerRows(t, store.db)
-		if len(after) != 6 {
-			t.Fatalf("migrated ledger rows = %d, want 6", len(after))
+		if len(after) != 7 {
+			t.Fatalf("migrated ledger rows = %d, want 7", len(after))
 		}
 		if !slices.Equal(after[:5], before) {
 			t.Fatalf("migrations 0001-0005 changed:\nbefore: %+v\nafter:  %+v", before, after[:5])
@@ -1007,7 +1451,7 @@ func TestOutboxAttachmentsMigrationAppliesToBlankAndExistingV5Database(t *testin
 
 func assertOutboxAttachmentsMigration(t *testing.T, store *Store) {
 	t.Helper()
-	assertPragmaInt(t, store.db, "user_version", 6)
+	assertPragmaInt(t, store.db, "user_version", 7)
 	ledger := readLedgerRow(t, store.db, 6)
 	if ledger.name != "outbox_attachments" {
 		t.Fatalf("migration 0006 name = %q, want outbox_attachments", ledger.name)
@@ -1029,6 +1473,82 @@ func assertOutboxAttachmentsMigration(t *testing.T, store *Store) {
 	}
 	if strict != 1 {
 		t.Fatalf("outbox_attachments strict = %d, want 1", strict)
+	}
+}
+
+func TestReactionsReadMigrationAppliesToBlankAndReopens(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "store.sqlite3")
+	first, err := Open(path)
+	if err != nil {
+		t.Fatalf("first Open(): %v", err)
+	}
+	assertReactionsReadMigration(t, first)
+	firstLedger := readLedgerRows(t, first.db)
+	if err := first.Close(); err != nil {
+		t.Fatalf("first Close(): %v", err)
+	}
+
+	second, err := Open(path)
+	if err != nil {
+		t.Fatalf("second Open(): %v", err)
+	}
+	t.Cleanup(func() {
+		if err := second.Close(); err != nil {
+			t.Errorf("second Close(): %v", err)
+		}
+	})
+	assertReactionsReadMigration(t, second)
+	secondLedger := readLedgerRows(t, second.db)
+	if !slices.Equal(secondLedger, firstLedger) {
+		t.Fatalf("migration ledger changed on reopen:\nfirst:  %+v\nsecond: %+v", firstLedger, secondLedger)
+	}
+}
+
+func assertReactionsReadMigration(t *testing.T, store *Store) {
+	t.Helper()
+	assertPragmaInt(t, store.db, "user_version", 7)
+	ledger := readLedgerRow(t, store.db, 7)
+	if ledger.name != "reactions_read" {
+		t.Fatalf("migration 0007 name = %q, want reactions_read", ledger.name)
+	}
+	if ledger.checksum != embeddedMigrations[6].checksumSHA256 {
+		t.Fatalf(
+			"migration 0007 checksum = %q, want %q",
+			ledger.checksum,
+			embeddedMigrations[6].checksumSHA256,
+		)
+	}
+	for _, table := range []string{"outbox_reactions", "outbox_read_receipts", "read_cursors"} {
+		var strict int
+		if err := store.db.QueryRow(`
+			SELECT strict
+			FROM pragma_table_list
+			WHERE schema = 'main' AND name = ?
+		`, table).Scan(&strict); err != nil {
+			t.Fatalf("read %s STRICT flag: %v", table, err)
+		}
+		if strict != 1 {
+			t.Fatalf("%s strict = %d, want 1", table, strict)
+		}
+	}
+	for _, index := range []string{
+		"messages_conversation_message_uq",
+		"outbox_reactions_target_idx",
+		"outbox_read_receipts_message_idx",
+		"read_cursors_conversation_idx",
+	} {
+		var exists bool
+		if err := store.db.QueryRow(`
+			SELECT EXISTS (
+				SELECT 1 FROM sqlite_schema
+				WHERE type = 'index' AND name = ?
+			)
+		`, index).Scan(&exists); err != nil {
+			t.Fatalf("inspect migration index %q: %v", index, err)
+		}
+		if !exists {
+			t.Fatalf("migration index %q is missing", index)
+		}
 	}
 }
 
@@ -1096,6 +1616,22 @@ func outboxTestMediaItem(id string) NewOutboxItem {
 	return item
 }
 
+func outboxTestReactionItem(id string) NewOutboxItem {
+	item := outboxTestItem(id)
+	item.Kind = OutboxKindReaction
+	item.Operation = "reaction"
+	item.LocalMessageID = ""
+	return item
+}
+
+func outboxTestReadItem(id string) NewOutboxItem {
+	item := outboxTestItem(id)
+	item.Kind = OutboxKindRead
+	item.Operation = "read_receipt"
+	item.LocalMessageID = ""
+	return item
+}
+
 func outboxTestAttachment() OutboxAttachment {
 	return OutboxAttachment{
 		BlobHash:  "abababababababababababababababababababababababababababababababab",
@@ -1118,6 +1654,50 @@ func outboxTestOutgoingMessage(item NewOutboxItem, body string) Message {
 		State:            MessageStateActive,
 		OccurredAtMS:     outboxTestTimeMS,
 	}
+}
+
+func seedOutboxTestDevice(t *testing.T, store *Store, deviceID, accountID string) {
+	t.Helper()
+	mustRepositoryWrite(t, "seed UpsertDevice", store.UpsertDevice(Device{
+		DeviceID:    deviceID,
+		AccountID:   accountID,
+		Kind:        DeviceKindLocalInstallation,
+		State:       DeviceStateActive,
+		CreatedAtMS: outboxTestTimeMS,
+		UpdatedAtMS: outboxTestTimeMS,
+	}))
+}
+
+func seedOutboxTestMessage(
+	t *testing.T,
+	store *Store,
+	messageID, accountID, conversationID string,
+) {
+	t.Helper()
+	mustExec(t, store.db, `
+		INSERT INTO messages (
+			message_id,
+			conversation_id,
+			account_id,
+			remote_message_id,
+			sender_identity_id,
+			direction,
+			body,
+			reply_to_remote_id,
+			state,
+			occurred_at_ms,
+			created_at_ms,
+			updated_at_ms
+		) VALUES (?, ?, ?, ?, NULL, 'incoming', '', NULL, 'active', ?, ?, ?)
+	`,
+		messageID,
+		conversationID,
+		accountID,
+		"remote-"+messageID,
+		outboxTestTimeMS-1_000,
+		outboxTestTimeMS,
+		outboxTestTimeMS,
+	)
 }
 
 func mustEnqueueOutbox(

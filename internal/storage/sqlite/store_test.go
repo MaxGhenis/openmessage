@@ -82,8 +82,11 @@ func TestOpenInitializesBlankDatabase(t *testing.T) {
 		"messages",
 		"outbox",
 		"outbox_attachments",
+		"outbox_reactions",
+		"outbox_read_receipts",
 		"people",
 		"person_identities",
+		"read_cursors",
 		"schema_migrations",
 		"store_metadata",
 	}

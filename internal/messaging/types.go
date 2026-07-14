@@ -10,6 +10,7 @@ import (
 	"io"
 	"time"
 
+	"github.com/maxghenis/openmessage/internal/bridge"
 	"github.com/maxghenis/openmessage/internal/storage/sqlite"
 )
 
@@ -67,6 +68,20 @@ type SendMediaCommand struct {
 	MIME             string
 	Caption          string
 	ReplyToMessageID string
+}
+
+type SendReactionCommand struct {
+	CommonCommand
+	TargetMessageID string
+	Emoji           string
+	Action          bridge.ReactionAction // empty means ReactionAdd
+}
+
+type MarkReadCommand struct {
+	CommonCommand
+	DeviceID          string
+	LastReadMessageID string
+	LastReadAt        time.Time // zero means clock.Now()
 }
 
 type Submission struct {

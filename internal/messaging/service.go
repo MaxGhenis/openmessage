@@ -22,6 +22,8 @@ const DefaultMaxMediaBytes int64 = 128 << 20
 const (
 	textOperation       = "send_text"
 	mediaOperation      = "send_media"
+	reactionOperation   = "reaction"
+	readOperation       = "read_receipt"
 	defaultLeaseTime    = 30 * time.Second
 	defaultFinalizeTime = 5 * time.Second
 	defaultRetryDelay   = 5 * time.Second
@@ -324,6 +326,211 @@ func (s *MessageService) SendMedia(
 	return submission, nil
 }
 
+// SendReaction creates a durable reaction intent without projecting a local
+// message row. An identical account-scoped idempotent submission returns the
+// original durable identity.
+func (s *MessageService) SendReaction(
+	ctx context.Context,
+	cmd SendReactionCommand,
+) (Submission, error) {
+	if ctx == nil {
+		return Submission{}, fmt.Errorf("send reaction: context is nil")
+	}
+	if err := validateSendReactionCommand(&cmd); err != nil {
+		return Submission{}, err
+	}
+	if !s.bridges.Capabilities(cmd.AccountID).Reactions {
+		return Submission{}, ErrUnsupported
+	}
+
+	conversation, err := s.store.GetConversation(cmd.ConversationID)
+	if err != nil {
+		return Submission{}, fmt.Errorf("send reaction: read conversation: %w", err)
+	}
+	if conversation.AccountID != cmd.AccountID {
+		return Submission{}, fmt.Errorf(
+			"%w: conversation %q belongs to account %q, not %q",
+			ErrInvalidCommand,
+			cmd.ConversationID,
+			conversation.AccountID,
+			cmd.AccountID,
+		)
+	}
+
+	target, err := s.messages.GetMessage(ctx, cmd.TargetMessageID)
+	if err != nil {
+		return Submission{}, fmt.Errorf("send reaction: read target: %w", err)
+	}
+	if target.AccountID != cmd.AccountID || target.ConversationID != cmd.ConversationID {
+		return Submission{}, fmt.Errorf(
+			"%w: reaction target %q is outside conversation %q",
+			ErrInvalidCommand,
+			cmd.TargetMessageID,
+			cmd.ConversationID,
+		)
+	}
+	// Reactions cannot target a deleted message. MarkRead deliberately permits
+	// deleted cursor targets because deletion does not undo that the user read it.
+	if target.State == sqlite.MessageStateDeleted {
+		return Submission{}, fmt.Errorf(
+			"%w: reaction target %q is deleted",
+			ErrInvalidCommand,
+			cmd.TargetMessageID,
+		)
+	}
+
+	outboxID, _, requestID, err := s.newSubmissionIDs()
+	if err != nil {
+		return Submission{}, err
+	}
+	now := s.clock.Now()
+	scheduledFor := cmd.NotBefore
+	if scheduledFor.IsZero() {
+		scheduledFor = now
+	}
+	payloadHash, err := reactionPayloadHash(cmd.TargetMessageID, cmd.Emoji, cmd.Action)
+	if err != nil {
+		return Submission{}, fmt.Errorf("send reaction: hash payload: %w", err)
+	}
+
+	item, disposition, err := s.outbox.EnqueueReaction(ctx, sqlite.NewOutboxItem{
+		OutboxID:           outboxID,
+		AccountID:          cmd.AccountID,
+		ConversationID:     cmd.ConversationID,
+		Kind:               sqlite.OutboxKindReaction,
+		IdempotencyKey:     cmd.IdempotencyKey,
+		PayloadHash:        payloadHash,
+		Operation:          reactionOperation,
+		TransportRequestID: requestID,
+		ScheduledFor:       scheduledFor,
+	}, sqlite.OutboxReaction{
+		TargetMessageID: cmd.TargetMessageID,
+		Emoji:           cmd.Emoji,
+		Action:          string(cmd.Action),
+	})
+	if err != nil {
+		return Submission{}, fmt.Errorf("send reaction: %w", err)
+	}
+
+	submission := submissionFromItem(item)
+	if disposition == sqlite.EnqueueInserted {
+		s.signalChange()
+		s.signalWake()
+	}
+	return submission, nil
+}
+
+// MarkRead atomically records the device cursor and creates its durable
+// outbound receipt intent. The cursor remains advanced even if dispatch later
+// reaches a terminal failure.
+func (s *MessageService) MarkRead(
+	ctx context.Context,
+	cmd MarkReadCommand,
+) (Submission, error) {
+	if ctx == nil {
+		return Submission{}, fmt.Errorf("mark read: context is nil")
+	}
+	if err := validateMarkReadCommand(cmd); err != nil {
+		return Submission{}, err
+	}
+	if !s.bridges.Capabilities(cmd.AccountID).ReadReceipts {
+		return Submission{}, ErrUnsupported
+	}
+
+	conversation, err := s.store.GetConversation(cmd.ConversationID)
+	if err != nil {
+		return Submission{}, fmt.Errorf("mark read: read conversation: %w", err)
+	}
+	if conversation.AccountID != cmd.AccountID {
+		return Submission{}, fmt.Errorf(
+			"%w: conversation %q belongs to account %q, not %q",
+			ErrInvalidCommand,
+			cmd.ConversationID,
+			conversation.AccountID,
+			cmd.AccountID,
+		)
+	}
+
+	target, err := s.messages.GetMessage(ctx, cmd.LastReadMessageID)
+	if err != nil {
+		return Submission{}, fmt.Errorf("mark read: read cursor target: %w", err)
+	}
+	if target.AccountID != cmd.AccountID || target.ConversationID != cmd.ConversationID {
+		return Submission{}, fmt.Errorf(
+			"%w: read cursor target %q is outside conversation %q",
+			ErrInvalidCommand,
+			cmd.LastReadMessageID,
+			cmd.ConversationID,
+		)
+	}
+	// Unlike reactions, a read cursor may name a deleted message: deletion does
+	// not regress the user's durable read position.
+	device, err := s.store.GetDevice(cmd.DeviceID)
+	if err != nil {
+		return Submission{}, fmt.Errorf("mark read: read device: %w", err)
+	}
+	if device.AccountID != cmd.AccountID {
+		return Submission{}, fmt.Errorf(
+			"%w: device %q belongs to account %q, not %q",
+			ErrInvalidCommand,
+			cmd.DeviceID,
+			device.AccountID,
+			cmd.AccountID,
+		)
+	}
+
+	outboxID, _, requestID, err := s.newSubmissionIDs()
+	if err != nil {
+		return Submission{}, err
+	}
+	now := s.clock.Now()
+	if cmd.LastReadAt.IsZero() {
+		cmd.LastReadAt = now
+	}
+	scheduledFor := cmd.NotBefore
+	if scheduledFor.IsZero() {
+		scheduledFor = now
+	}
+	payloadHash, err := readPayloadHash(cmd.DeviceID, cmd.LastReadMessageID)
+	if err != nil {
+		return Submission{}, fmt.Errorf("mark read: hash payload: %w", err)
+	}
+	lastReadMessageID := cmd.LastReadMessageID
+
+	item, disposition, err := s.outbox.EnqueueReadReceipt(ctx, sqlite.NewOutboxItem{
+		OutboxID:           outboxID,
+		AccountID:          cmd.AccountID,
+		ConversationID:     cmd.ConversationID,
+		Kind:               sqlite.OutboxKindRead,
+		IdempotencyKey:     cmd.IdempotencyKey,
+		PayloadHash:        payloadHash,
+		Operation:          readOperation,
+		TransportRequestID: requestID,
+		ScheduledFor:       scheduledFor,
+	}, sqlite.OutboxReadReceipt{
+		DeviceID:          cmd.DeviceID,
+		LastReadMessageID: cmd.LastReadMessageID,
+		ReadAtMS:          cmd.LastReadAt.UnixMilli(),
+	}, sqlite.ReadCursor{
+		AccountID:         cmd.AccountID,
+		DeviceID:          cmd.DeviceID,
+		ConversationID:    cmd.ConversationID,
+		LastReadMessageID: &lastReadMessageID,
+		LastReadAtMS:      cmd.LastReadAt.UnixMilli(),
+		UpdatedAtMS:       now.UnixMilli(),
+	})
+	if err != nil {
+		return Submission{}, fmt.Errorf("mark read: %w", err)
+	}
+
+	submission := submissionFromItem(item)
+	if disposition == sqlite.EnqueueInserted {
+		s.signalChange()
+		s.signalWake()
+	}
+	return submission, nil
+}
+
 // Get returns the current durable delivery state.
 func (s *MessageService) Get(ctx context.Context, outboxID string) (Delivery, error) {
 	if ctx == nil {
@@ -504,6 +711,70 @@ func validateSendMediaCommand(cmd *SendMediaCommand) error {
 	return nil
 }
 
+func validateSendReactionCommand(cmd *SendReactionCommand) error {
+	if cmd == nil {
+		return fmt.Errorf("%w: reaction command is nil", ErrInvalidCommand)
+	}
+	checks := []struct {
+		name  string
+		value string
+	}{
+		{name: "account ID", value: cmd.AccountID},
+		{name: "conversation ID", value: cmd.ConversationID},
+		{name: "idempotency key", value: cmd.IdempotencyKey},
+		{name: "target message ID", value: cmd.TargetMessageID},
+	}
+	for _, check := range checks {
+		if strings.TrimSpace(check.value) == "" {
+			return fmt.Errorf("%w: %s is empty", ErrInvalidCommand, check.name)
+		}
+	}
+	cmd.Emoji = strings.TrimSpace(cmd.Emoji)
+	if cmd.Emoji == "" {
+		return fmt.Errorf("%w: emoji is empty", ErrInvalidCommand)
+	}
+	if len(cmd.Emoji) > 64 {
+		return fmt.Errorf("%w: emoji exceeds 64 bytes", ErrInvalidCommand)
+	}
+	if cmd.Action == "" {
+		cmd.Action = bridge.ReactionAdd
+	}
+	switch cmd.Action {
+	case bridge.ReactionAdd, bridge.ReactionRemove, bridge.ReactionSwitch:
+	default:
+		return fmt.Errorf("%w: reaction action %q is invalid", ErrInvalidCommand, cmd.Action)
+	}
+	if !cmd.NotBefore.IsZero() && cmd.NotBefore.UnixMilli() <= 0 {
+		return fmt.Errorf("%w: scheduled Unix time is not positive", ErrInvalidCommand)
+	}
+	return nil
+}
+
+func validateMarkReadCommand(cmd MarkReadCommand) error {
+	checks := []struct {
+		name  string
+		value string
+	}{
+		{name: "account ID", value: cmd.AccountID},
+		{name: "conversation ID", value: cmd.ConversationID},
+		{name: "idempotency key", value: cmd.IdempotencyKey},
+		{name: "device ID", value: cmd.DeviceID},
+		{name: "last read message ID", value: cmd.LastReadMessageID},
+	}
+	for _, check := range checks {
+		if strings.TrimSpace(check.value) == "" {
+			return fmt.Errorf("%w: %s is empty", ErrInvalidCommand, check.name)
+		}
+	}
+	if !cmd.LastReadAt.IsZero() && cmd.LastReadAt.UnixMilli() <= 0 {
+		return fmt.Errorf("%w: last-read Unix time is not positive", ErrInvalidCommand)
+	}
+	if !cmd.NotBefore.IsZero() && cmd.NotBefore.UnixMilli() <= 0 {
+		return fmt.Errorf("%w: scheduled Unix time is not positive", ErrInvalidCommand)
+	}
+	return nil
+}
+
 func textPayloadHash(body, replyToMessageID string) (string, error) {
 	payload, err := json.Marshal(struct {
 		Body             string `json:"body"`
@@ -532,6 +803,44 @@ func mediaPayloadHash(
 		Caption          string `json:"caption,omitempty"`
 		ReplyToMessageID string `json:"reply_to_message_id,omitempty"`
 	}{blobHash, size, mime, filename, caption, replyToMessageID})
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(payload)
+	return hex.EncodeToString(sum[:]), nil
+}
+
+func reactionPayloadHash(
+	targetMessageID string,
+	emoji string,
+	action bridge.ReactionAction,
+) (string, error) {
+	payload, err := json.Marshal(struct {
+		TargetMessageID string                `json:"target_message_id"`
+		Emoji           string                `json:"emoji"`
+		Action          bridge.ReactionAction `json:"action"`
+	}{
+		TargetMessageID: targetMessageID,
+		Emoji:           emoji,
+		Action:          action,
+	})
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(payload)
+	return hex.EncodeToString(sum[:]), nil
+}
+
+func readPayloadHash(deviceID, lastReadMessageID string) (string, error) {
+	// ReadAt is intentionally excluded: the idempotent intent is the device's
+	// cursor position, so a replay at a later wall-clock time remains identical.
+	payload, err := json.Marshal(struct {
+		DeviceID          string `json:"device_id"`
+		LastReadMessageID string `json:"last_read_message_id"`
+	}{
+		DeviceID:          deviceID,
+		LastReadMessageID: lastReadMessageID,
+	})
 	if err != nil {
 		return "", err
 	}
