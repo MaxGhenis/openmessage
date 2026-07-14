@@ -159,6 +159,27 @@ type Confirmation struct {
 	TransportResultID string
 }
 
+// ReconcileRequest identifies one accepted transport request and its
+// authoritative remote result without requiring an active dispatch lease.
+type ReconcileRequest struct {
+	AccountID          string
+	TransportRequestID string
+	ResultRemoteID     string
+}
+
+// ReconcileOutcome describes whether a transport result changed durable
+// state. A missing correlation row and an inapplicable result are distinct so
+// callers can observe the storage decision without treating either as an
+// error.
+type ReconcileOutcome string
+
+const (
+	ReconcileOutcomeReconciled ReconcileOutcome = "reconciled"
+	ReconcileOutcomeEnriched   ReconcileOutcome = "enriched"
+	ReconcileOutcomeNoop       ReconcileOutcome = "noop"
+	ReconcileOutcomeNotFound   ReconcileOutcome = "notfound"
+)
+
 // RecoveredLeases reports how expired dispatch leases were classified.
 type RecoveredLeases struct {
 	NotDispatched int
@@ -850,7 +871,7 @@ func validateExistingOutgoingPair(
 		message.ConversationID != item.ConversationID ||
 		message.Direction != MessageDirectionOutgoing ||
 		message.State != MessageStateActive ||
-		message.RemoteMessageID != item.TransportRequestID {
+		!isRequestBoundOrConfirmedRemoteID(message.RemoteMessageID, item) {
 		return fmt.Errorf(
 			"enqueue outgoing message for existing outbox item %q: %w: message %q is not its active request-bound outgoing pair",
 			item.OutboxID,
@@ -861,9 +882,22 @@ func validateExistingOutgoingPair(
 	return nil
 }
 
-// LeaseDue atomically claims due queued, retryable, and explicitly eligible
-// uncertain rows. Uncertain rows produced by recovery have no next-attempt time
-// and therefore are never auto-leased.
+// isRequestBoundOrConfirmedRemoteID accepts the message's remote id in both of
+// its legitimate lifetimes: the placeholder transport_request_id it is born
+// with, and the confirmed result id the reconcile repoint moves it to. Without
+// the second arm, an idempotent replay AFTER delivery (the exact case the
+// idempotency key exists for -- a lost API response, client retries the same
+// key) would spuriously fail pair validation on any platform whose real remote
+// id differs from the request id (Signal at Confirm time, Google at echo time).
+func isRequestBoundOrConfirmedRemoteID(remoteMessageID string, item OutboxItem) bool {
+	if remoteMessageID == item.TransportRequestID {
+		return true
+	}
+	return item.ResultRemoteID != nil && remoteMessageID == *item.ResultRemoteID
+}
+
+// LeaseDue atomically claims due queued and retryable rows. An uncertain row is
+// structurally ineligible regardless of its next-attempt value.
 func (r *OutboxRepository) LeaseDue(
 	ctx context.Context,
 	req LeaseRequest,
@@ -896,10 +930,7 @@ func (r *OutboxRepository) LeaseDue(
 		SELECT outbox_id
 		FROM outbox
 		WHERE scheduled_for_ms <= ?
-		  AND (
-			state IN ('queued', 'not_dispatched')
-			OR (state = 'uncertain' AND next_attempt_at_ms IS NOT NULL)
-		  )
+		  AND state IN ('queued', 'not_dispatched')
 		  AND (next_attempt_at_ms IS NULL OR next_attempt_at_ms <= ?)
 		  AND (lease_expires_at_ms IS NULL OR lease_expires_at_ms <= ?)
 		ORDER BY COALESCE(next_attempt_at_ms, scheduled_for_ms), created_at_ms, outbox_id
@@ -937,10 +968,7 @@ func (r *OutboxRepository) LeaseDue(
 				updated_at_ms = ?
 			WHERE outbox_id = ?
 			  AND scheduled_for_ms <= ?
-			  AND (
-				state IN ('queued', 'not_dispatched')
-				OR (state = 'uncertain' AND next_attempt_at_ms IS NOT NULL)
-			  )
+			  AND state IN ('queued', 'not_dispatched')
 			  AND (next_attempt_at_ms IS NULL OR next_attempt_at_ms <= ?)
 			  AND (lease_expires_at_ms IS NULL OR lease_expires_at_ms <= ?)
 		`, req.Owner, token, expiresAtMS, nowMS, id, nowMS, nowMS, nowMS)
@@ -1311,8 +1339,290 @@ func (r *OutboxRepository) Confirm(
 	if err := r.requireLeaseMutationWithQueryer(ctx, tx, "confirm", confirmation.OutboxID, result); err != nil {
 		return err
 	}
+
+	var (
+		accountID          string
+		conversationID     string
+		localMessageID     sql.NullString
+		transportRequestID string
+	)
+	if err := tx.QueryRowContext(ctx, `
+		SELECT account_id, conversation_id, local_message_id, transport_request_id
+		FROM outbox
+		WHERE outbox_id = ?
+	`, confirmation.OutboxID).Scan(
+		&accountID,
+		&conversationID,
+		&localMessageID,
+		&transportRequestID,
+	); err != nil {
+		return fmt.Errorf(
+			"confirm outbox item %q: read local message identity: %w",
+			confirmation.OutboxID,
+			err,
+		)
+	}
+	if localMessageID.Valid {
+		if err := r.repointLocalMessage(
+			ctx,
+			tx,
+			accountID,
+			conversationID,
+			localMessageID.String,
+			transportRequestID,
+			resultRemoteID,
+		); err != nil {
+			return fmt.Errorf("confirm outbox item %q: %w", confirmation.OutboxID, err)
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("confirm outbox item %q: commit: %w", confirmation.OutboxID, err)
+	}
+	return nil
+}
+
+// ReconcileConfirm applies an accepted transport result without requiring a
+// dispatch lease. The account-scoped transport request ID is the sole
+// correlation key.
+func (r *OutboxRepository) ReconcileConfirm(
+	ctx context.Context,
+	req ReconcileRequest,
+) (ReconcileOutcome, error) {
+	checks := []struct {
+		name  string
+		value string
+	}{
+		{name: "account ID", value: req.AccountID},
+		{name: "transport request ID", value: req.TransportRequestID},
+		{name: "remote result ID", value: req.ResultRemoteID},
+	}
+	for _, check := range checks {
+		if strings.TrimSpace(check.value) == "" {
+			return "", fmt.Errorf("reconcile transport result: %s is empty", check.name)
+		}
+	}
+
+	tx, err := r.store.db.BeginTx(ctx, nil)
+	if err != nil {
+		return "", fmt.Errorf("reconcile transport result: begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	var (
+		outboxID                string
+		conversationID          string
+		state                   OutboxState
+		localMessageID          sql.NullString
+		persistedResultRemoteID sql.NullString
+		localRemoteMessageID    sql.NullString
+	)
+	err = tx.QueryRowContext(ctx, `
+		SELECT
+			o.outbox_id,
+			o.conversation_id,
+			o.state,
+			o.local_message_id,
+			o.result_remote_id,
+			m.remote_message_id
+		FROM outbox AS o
+		LEFT JOIN messages AS m ON m.message_id = o.local_message_id
+		WHERE o.account_id = ? AND o.transport_request_id = ?
+	`, req.AccountID, req.TransportRequestID).Scan(
+		&outboxID,
+		&conversationID,
+		&state,
+		&localMessageID,
+		&persistedResultRemoteID,
+		&localRemoteMessageID,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ReconcileOutcomeNotFound, nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("reconcile transport result: read correlated outbox item: %w", err)
+	}
+
+	switch state {
+	case OutboxUncertain, OutboxStoreFailed:
+		nowMS, err := r.nowMS("reconcile transport result")
+		if err != nil {
+			return "", err
+		}
+		result, err := tx.ExecContext(ctx, `
+			UPDATE outbox
+			SET state = 'confirmed',
+				result_remote_id = ?,
+				error_class = NULL,
+				error_code = NULL,
+				error_detail = NULL,
+				next_attempt_at_ms = NULL,
+				updated_at_ms = ?
+			WHERE outbox_id = ?
+			  AND state IN ('uncertain', 'store_failed')
+		`, req.ResultRemoteID, nowMS, outboxID)
+		if err != nil {
+			return "", fmt.Errorf("reconcile outbox item %q: confirm: %w", outboxID, err)
+		}
+		if err := requireSingleReconcileMutation(result, outboxID); err != nil {
+			return "", err
+		}
+		if localMessageID.Valid &&
+			localRemoteMessageID.Valid &&
+			localRemoteMessageID.String == req.TransportRequestID &&
+			req.ResultRemoteID != req.TransportRequestID {
+			if err := r.repointLocalMessage(
+				ctx,
+				tx,
+				req.AccountID,
+				conversationID,
+				localMessageID.String,
+				req.TransportRequestID,
+				req.ResultRemoteID,
+			); err != nil {
+				return "", fmt.Errorf("reconcile outbox item %q: %w", outboxID, err)
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			return "", fmt.Errorf("reconcile outbox item %q: commit: %w", outboxID, err)
+		}
+		return ReconcileOutcomeReconciled, nil
+
+	case OutboxConfirmed:
+		if persistedResultRemoteID.Valid && persistedResultRemoteID.String == req.ResultRemoteID {
+			return ReconcileOutcomeNoop, nil
+		}
+		if !localMessageID.Valid ||
+			!localRemoteMessageID.Valid ||
+			localRemoteMessageID.String != req.TransportRequestID ||
+			req.ResultRemoteID == req.TransportRequestID {
+			return ReconcileOutcomeNoop, nil
+		}
+
+		nowMS, err := r.nowMS("reconcile transport result")
+		if err != nil {
+			return "", err
+		}
+		result, err := tx.ExecContext(ctx, `
+			UPDATE outbox
+			SET result_remote_id = ?,
+				error_class = NULL,
+				error_code = NULL,
+				error_detail = NULL,
+				updated_at_ms = ?
+			WHERE outbox_id = ?
+			  AND state = 'confirmed'
+			  AND result_remote_id = transport_request_id
+		`, req.ResultRemoteID, nowMS, outboxID)
+		if err != nil {
+			return "", fmt.Errorf("reconcile outbox item %q: enrich: %w", outboxID, err)
+		}
+		affected, err := result.RowsAffected()
+		if err != nil {
+			return "", fmt.Errorf(
+				"reconcile outbox item %q: read enrich rows affected: %w",
+				outboxID,
+				err,
+			)
+		}
+		if affected == 0 {
+			return ReconcileOutcomeNoop, nil
+		}
+		if affected != 1 {
+			return "", fmt.Errorf(
+				"reconcile outbox item %q: enrich affected %d rows, want 1",
+				outboxID,
+				affected,
+			)
+		}
+		if err := r.repointLocalMessage(
+			ctx,
+			tx,
+			req.AccountID,
+			conversationID,
+			localMessageID.String,
+			req.TransportRequestID,
+			req.ResultRemoteID,
+		); err != nil {
+			return "", fmt.Errorf("reconcile outbox item %q: %w", outboxID, err)
+		}
+		if err := tx.Commit(); err != nil {
+			return "", fmt.Errorf("reconcile outbox item %q: commit enrichment: %w", outboxID, err)
+		}
+		return ReconcileOutcomeEnriched, nil
+
+	default:
+		return ReconcileOutcomeNoop, nil
+	}
+}
+
+func requireSingleReconcileMutation(result sql.Result, outboxID string) error {
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf(
+			"reconcile outbox item %q: read confirm rows affected: %w",
+			outboxID,
+			err,
+		)
+	}
+	if affected != 1 {
+		return fmt.Errorf(
+			"reconcile outbox item %q: confirm affected %d rows, want 1",
+			outboxID,
+			affected,
+		)
+	}
+	return nil
+}
+
+func (r *OutboxRepository) repointLocalMessage(
+	ctx context.Context,
+	tx *sql.Tx,
+	accountID, conversationID, localMessageID, transportRequestID, realID string,
+) error {
+	if realID == transportRequestID {
+		return nil
+	}
+	nowMS, err := r.nowMS("repoint local message")
+	if err != nil {
+		return err
+	}
+
+	var collisionMessageID string
+	err = tx.QueryRowContext(ctx, `
+		SELECT message_id
+		FROM messages
+		WHERE account_id = ?
+		  AND conversation_id = ?
+		  AND remote_message_id = ?
+	`, accountID, conversationID, realID).Scan(&collisionMessageID)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("repoint local message %q: read remote-ID collision: %w", localMessageID, err)
+	}
+	if err == nil && collisionMessageID != localMessageID {
+		if _, err := tx.ExecContext(ctx, `
+			DELETE FROM messages
+			WHERE message_id = ?
+		`, collisionMessageID); err != nil {
+			return fmt.Errorf(
+				"repoint local message %q: delete echo duplicate %q: %w",
+				localMessageID,
+				collisionMessageID,
+				mapConstraintError(err),
+			)
+		}
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE messages
+		SET remote_message_id = ?,
+			updated_at_ms = ?
+		WHERE message_id = ?
+	`, realID, nowMS, localMessageID); err != nil {
+		return fmt.Errorf(
+			"repoint local message %q: update remote ID: %w",
+			localMessageID,
+			mapConstraintError(err),
+		)
 	}
 	return nil
 }
@@ -1441,6 +1751,32 @@ func (r *OutboxRepository) FindByID(
 		return OutboxItem{}, fmt.Errorf("find outbox item %q: %w", outboxID, err)
 	}
 	return item, nil
+}
+
+// FindStoreFailedDue returns a deterministic bounded batch of accepted
+// results whose local confirmation still needs repair.
+func (r *OutboxRepository) FindStoreFailedDue(
+	ctx context.Context,
+	limit int,
+) ([]OutboxItem, error) {
+	if limit <= 0 {
+		return nil, fmt.Errorf("find store-failed outbox items: limit must be positive")
+	}
+	rows, err := r.store.db.QueryContext(ctx, `
+		SELECT `+outboxColumns+`
+		FROM outbox
+		WHERE state = 'store_failed'
+		ORDER BY updated_at_ms, outbox_id
+		LIMIT ?
+	`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("find store-failed outbox items: query: %w", err)
+	}
+	items, err := collectRows(rows, scanOutboxItem)
+	if err != nil {
+		return nil, fmt.Errorf("find store-failed outbox items: scan: %w", err)
+	}
+	return items, nil
 }
 
 // FindByTransportRequestID returns the account-scoped row carrying the stable

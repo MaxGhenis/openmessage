@@ -31,6 +31,9 @@ func (s *MessageService) Run(ctx context.Context) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		if _, err := s.reconcileStoreFailedDue(ctx, s.batchLimit); err != nil {
+			return fmt.Errorf("run message service: reconcile store-failed deliveries: %w", err)
+		}
 		if _, err := s.DispatchDue(ctx, s.batchLimit); err != nil {
 			return fmt.Errorf("run message service: %w", err)
 		}
