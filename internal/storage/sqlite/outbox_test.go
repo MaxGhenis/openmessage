@@ -1360,10 +1360,10 @@ func TestOutboxMigrationIsChecksummedAndStrict(t *testing.T) {
 	store, _ := openOutboxTestRepository(t, func() time.Time {
 		return time.UnixMilli(outboxTestTimeMS)
 	})
-	if len(embeddedMigrations) != 7 {
-		t.Fatalf("embedded migrations = %d, want 7", len(embeddedMigrations))
+	if len(embeddedMigrations) != 8 {
+		t.Fatalf("embedded migrations = %d, want 8", len(embeddedMigrations))
 	}
-	assertPragmaInt(t, store.db, "user_version", 7)
+	assertPragmaInt(t, store.db, "user_version", 8)
 	ledger := readLedgerRow(t, store.db, 5)
 	if ledger.name != "outbox" {
 		t.Fatalf("migration 0005 name = %q, want outbox", ledger.name)
@@ -1439,8 +1439,8 @@ func TestOutboxAttachmentsMigrationAppliesToBlankAndExistingV5Database(t *testin
 			}
 		})
 		after := readLedgerRows(t, store.db)
-		if len(after) != 7 {
-			t.Fatalf("migrated ledger rows = %d, want 7", len(after))
+		if len(after) != 8 {
+			t.Fatalf("migrated ledger rows = %d, want 8", len(after))
 		}
 		if !slices.Equal(after[:5], before) {
 			t.Fatalf("migrations 0001-0005 changed:\nbefore: %+v\nafter:  %+v", before, after[:5])
@@ -1451,7 +1451,7 @@ func TestOutboxAttachmentsMigrationAppliesToBlankAndExistingV5Database(t *testin
 
 func assertOutboxAttachmentsMigration(t *testing.T, store *Store) {
 	t.Helper()
-	assertPragmaInt(t, store.db, "user_version", 7)
+	assertPragmaInt(t, store.db, "user_version", 8)
 	ledger := readLedgerRow(t, store.db, 6)
 	if ledger.name != "outbox_attachments" {
 		t.Fatalf("migration 0006 name = %q, want outbox_attachments", ledger.name)
@@ -1506,7 +1506,7 @@ func TestReactionsReadMigrationAppliesToBlankAndReopens(t *testing.T) {
 
 func assertReactionsReadMigration(t *testing.T, store *Store) {
 	t.Helper()
-	assertPragmaInt(t, store.db, "user_version", 7)
+	assertPragmaInt(t, store.db, "user_version", 8)
 	ledger := readLedgerRow(t, store.db, 7)
 	if ledger.name != "reactions_read" {
 		t.Fatalf("migration 0007 name = %q, want reactions_read", ledger.name)

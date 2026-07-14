@@ -60,8 +60,9 @@ type Message struct {
 // MessageProjection couples a normalized message to the durable inbox frame
 // from which it was decoded.
 type MessageProjection struct {
-	InboxID string
-	Message Message
+	InboxID     string
+	Message     Message
+	Attachments []MessageAttachment
 }
 
 // MessageRepository owns durable inbox ingestion and normalized projection.
@@ -289,6 +290,42 @@ func (r *MessageRepository) ProjectMessage(
 	}
 	if err := r.upsertMessage(ctx, tx, message, nowMS); err != nil {
 		return err
+	}
+	attachmentMessageID := message.MessageID
+	if len(projection.Attachments) > 0 {
+		// upsertMessage preserves the first local message_id on a natural-key
+		// conflict. Resolve that effective parent inside this transaction so a
+		// duplicate inbound frame cannot point attachments at a discarded ID.
+		if err := tx.QueryRowContext(ctx, `
+			SELECT message_id
+			FROM messages
+			WHERE account_id = ?
+			  AND conversation_id = ?
+			  AND remote_message_id = ?
+		`, message.AccountID, message.ConversationID, message.RemoteMessageID).Scan(
+			&attachmentMessageID,
+		); err != nil {
+			return fmt.Errorf(
+				"project message %q: resolve attachment parent: %w",
+				message.MessageID,
+				err,
+			)
+		}
+	}
+	attachmentRepository := &MessageAttachmentRepository{store: r.store, now: r.now}
+	for _, attachment := range projection.Attachments {
+		// Normalized bridge attachments do not carry a local message ID. Bind
+		// every row to the parent selected by this projection rather than
+		// trusting caller-supplied attachment ownership.
+		attachment.MessageID = attachmentMessageID
+		if err := attachmentRepository.RecordInboundAttachment(ctx, tx, attachment); err != nil {
+			return fmt.Errorf(
+				"project message %q: record attachment ordinal %d: %w",
+				message.MessageID,
+				attachment.Ordinal,
+				err,
+			)
+		}
 	}
 
 	result, err := tx.ExecContext(ctx, `

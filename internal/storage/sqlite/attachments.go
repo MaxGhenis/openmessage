@@ -149,6 +149,8 @@ func (r *AttachmentRepository) ListUnreferencedBlobHashes(
 				SELECT blob_hash FROM attachments
 				UNION
 				SELECT blob_hash FROM outbox_attachments
+				UNION
+				SELECT blob_hash FROM message_attachments WHERE blob_hash IS NOT NULL
 			)
 			SELECT blob_hash
 			FROM referenced
