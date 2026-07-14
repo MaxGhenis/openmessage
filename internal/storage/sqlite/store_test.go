@@ -79,6 +79,7 @@ func TestOpenInitializesBlankDatabase(t *testing.T) {
 		"devices",
 		"identities",
 		"inbox",
+		"message_attachments",
 		"messages",
 		"outbox",
 		"outbox_attachments",

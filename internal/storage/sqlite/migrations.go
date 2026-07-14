@@ -57,6 +57,9 @@ var migration0006SQL string
 //go:embed migrations/0007_reactions_read.sql
 var migration0007SQL string
 
+//go:embed migrations/0008_message_attachments.sql
+var migration0008SQL string
+
 var embeddedMigrations = []migration{
 	newMigration(1, "storage_shell", migration0001SQL, newStorageShellArguments),
 	newMigration(2, "identity_graph", migration0002SQL, nil),
@@ -65,6 +68,7 @@ var embeddedMigrations = []migration{
 	newMigration(5, "outbox", migration0005SQL, nil),
 	newMigration(6, "outbox_attachments", migration0006SQL, nil),
 	newMigration(7, "reactions_read", migration0007SQL, nil),
+	newMigration(8, "message_attachments", migration0008SQL, nil),
 }
 
 func newMigration(

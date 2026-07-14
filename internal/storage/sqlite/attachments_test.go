@@ -129,6 +129,56 @@ func TestAttachmentRepositoryTreatsQueuedOutboxBlobAsReferenced(t *testing.T) {
 	}
 }
 
+func TestAttachmentRepositoryTreatsDownloadedMessageBlobAsReferenced(t *testing.T) {
+	store, repository := openAttachmentTestRepository(t)
+	seedMessageAccount(t, store, "account-a", "test")
+	seedMessageConversation(t, store, "conversation-a", "account-a")
+	seedOutboxTestMessage(t, store, "message-inbound-media", "account-a", "conversation-a")
+	messageAttachments, err := NewMessageAttachmentRepository(
+		store,
+		func() time.Time { return time.UnixMilli(attachmentTestTimeMS) },
+	)
+	if err != nil {
+		t.Fatalf("NewMessageAttachmentRepository(): %v", err)
+	}
+	tx, err := store.db.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("begin message attachment transaction: %v", err)
+	}
+	defer tx.Rollback()
+	for ordinal := range int64(2) {
+		if err := messageAttachments.RecordInboundAttachment(context.Background(), tx, MessageAttachment{
+			MessageID: "message-inbound-media",
+			Ordinal:   ordinal,
+			MIME:      "application/octet-stream",
+		}); err != nil {
+			t.Fatalf("RecordInboundAttachment(%d): %v", ordinal, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit message attachments: %v", err)
+	}
+
+	downloadedHash := strings.Repeat("6f", 32)
+	pendingCandidate := strings.Repeat("7a", 32)
+	orphanHash := strings.Repeat("8b", 32)
+	if err := messageAttachments.MarkDownloaded(
+		context.Background(), "message-inbound-media", 0, downloadedHash, 10, "image/png",
+	); err != nil {
+		t.Fatalf("MarkDownloaded(): %v", err)
+	}
+	got, err := repository.ListUnreferencedBlobHashes(
+		context.Background(),
+		[]string{downloadedHash, pendingCandidate, orphanHash},
+	)
+	if err != nil {
+		t.Fatalf("ListUnreferencedBlobHashes(): %v", err)
+	}
+	if want := []string{pendingCandidate, orphanHash}; !slices.Equal(got, want) {
+		t.Fatalf("ListUnreferencedBlobHashes() = %v, want %v", got, want)
+	}
+}
+
 func TestAttachmentRepositoryMissingRowPreservesSentinel(t *testing.T) {
 	_, repository := openAttachmentTestRepository(t)
 
@@ -272,8 +322,8 @@ func openAttachmentTestRepository(t *testing.T) (*Store, *AttachmentRepository) 
 		}
 	})
 
-	if len(embeddedMigrations) != 7 {
-		t.Fatalf("embedded migrations = %d, want 7", len(embeddedMigrations))
+	if len(embeddedMigrations) != 8 {
+		t.Fatalf("embedded migrations = %d, want 8", len(embeddedMigrations))
 	}
 	assertPragmaInt(t, store.db, "user_version", len(embeddedMigrations))
 	ledger := readLedgerRow(t, store.db, 3)

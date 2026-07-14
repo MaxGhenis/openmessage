@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -418,6 +419,196 @@ func TestProjectMessageRollsBackMessageWhenInboxMarkFails(t *testing.T) {
 	assertInboxUnprocessed(t, store, inbox.InboxID)
 }
 
+func TestProjectMessagePersistsAttachmentsInProjectionTransaction(t *testing.T) {
+	clock := newMessageTestClock(messageTestTimeMS)
+	store, repository := openMessageTestRepository(t, clock.Now)
+	seedMessageProjectionGraph(t, store)
+	inbox := messageTestInbox("inbox-attachment", "account-a", "event-attachment", []byte("frame"))
+	if _, err := repository.AppendInbox(context.Background(), inbox); err != nil {
+		t.Fatalf("AppendInbox(): %v", err)
+	}
+	message := messageTestMessage(
+		"message-attachment", "conversation-a", "account-a", "remote-attachment", pointer("identity-a"),
+	)
+	size := int64(321)
+	attachment := MessageAttachment{
+		MessageID: message.MessageID,
+		Ordinal:   0,
+		RemoteID:  "remote-media-1",
+		RemoteRef: []byte("opaque-ref"),
+		Filename:  "photo.png",
+		MIME:      "image/png",
+		SizeBytes: &size,
+	}
+	if err := repository.ProjectMessage(context.Background(), MessageProjection{
+		InboxID:     inbox.InboxID,
+		Message:     message,
+		Attachments: []MessageAttachment{attachment},
+	}); err != nil {
+		t.Fatalf("ProjectMessage(): %v", err)
+	}
+
+	attachmentRepository, err := NewMessageAttachmentRepository(store, clock.Now)
+	if err != nil {
+		t.Fatalf("NewMessageAttachmentRepository(): %v", err)
+	}
+	got, err := attachmentRepository.GetForDownload(context.Background(), message.MessageID, 0)
+	if err != nil {
+		t.Fatalf("GetForDownload(): %v", err)
+	}
+	if got.AccountID != "account-a" || got.State != "pending" || got.BlobHash != nil ||
+		got.RemoteID != attachment.RemoteID || !bytes.Equal(got.RemoteRef, attachment.RemoteRef) ||
+		got.Filename != attachment.Filename || got.MIME != attachment.MIME ||
+		got.SizeBytes == nil || *got.SizeBytes != size {
+		t.Fatalf("projected attachment = %+v, want %+v", got, attachment)
+	}
+	assertInboxProcessedAt(t, store, inbox.InboxID, messageTestTimeMS)
+}
+
+func TestProjectMessageRollsBackWhenAttachmentInsertFails(t *testing.T) {
+	clock := newMessageTestClock(messageTestTimeMS)
+	store, repository := openMessageTestRepository(t, clock.Now)
+	seedMessageProjectionGraph(t, store)
+	inbox := messageTestInbox("inbox-attachment-rollback", "account-a", "event-attachment-rollback", []byte("frame"))
+	if _, err := repository.AppendInbox(context.Background(), inbox); err != nil {
+		t.Fatalf("AppendInbox(): %v", err)
+	}
+	mustExec(t, store.db, `
+		CREATE TRIGGER fail_message_attachment_insert
+		BEFORE INSERT ON message_attachments
+		BEGIN
+			SELECT RAISE(ABORT, 'injected message attachment failure');
+		END
+	`)
+	message := messageTestMessage(
+		"message-attachment-rollback", "conversation-a", "account-a", "remote-attachment-rollback", pointer("identity-a"),
+	)
+	err := repository.ProjectMessage(context.Background(), MessageProjection{
+		InboxID: inbox.InboxID,
+		Message: message,
+		Attachments: []MessageAttachment{{
+			MessageID: message.MessageID,
+			Ordinal:   0,
+			MIME:      "image/png",
+		}},
+	})
+	if err == nil {
+		t.Fatal("ProjectMessage() succeeded, want injected attachment failure")
+	}
+	assertRowCount(t, store.db, "messages", 0)
+	assertRowCount(t, store.db, "message_attachments", 0)
+	assertInboxUnprocessed(t, store, inbox.InboxID)
+}
+
+func TestProjectMessageAttachmentReplayPreservesDownloadedBlob(t *testing.T) {
+	clock := newMessageTestClock(messageTestTimeMS)
+	store, repository := openMessageTestRepository(t, clock.Now)
+	seedMessageProjectionGraph(t, store)
+	message := messageTestMessage(
+		"message-attachment-replay", "conversation-a", "account-a", "remote-attachment-replay", pointer("identity-a"),
+	)
+
+	firstInbox := messageTestInbox("inbox-attachment-first", "account-a", "event-attachment-first", []byte("first"))
+	if _, err := repository.AppendInbox(context.Background(), firstInbox); err != nil {
+		t.Fatalf("AppendInbox(first): %v", err)
+	}
+	firstSize := int64(10)
+	first := MessageAttachment{
+		MessageID: message.MessageID,
+		Ordinal:   0,
+		RemoteID:  "remote-first",
+		RemoteRef: []byte("ref-first"),
+		Filename:  "first.png",
+		MIME:      "image/png",
+		SizeBytes: &firstSize,
+	}
+	firstProjection := MessageProjection{InboxID: firstInbox.InboxID, Message: message, Attachments: []MessageAttachment{first}}
+	if err := repository.ProjectMessage(context.Background(), firstProjection); err != nil {
+		t.Fatalf("ProjectMessage(first): %v", err)
+	}
+
+	clock.Set(messageTestTimeMS + 100)
+	secondInbox := messageTestInbox("inbox-attachment-second", "account-a", "event-attachment-second", []byte("second"))
+	if _, err := repository.AppendInbox(context.Background(), secondInbox); err != nil {
+		t.Fatalf("AppendInbox(second): %v", err)
+	}
+	secondSize := int64(20)
+	second := MessageAttachment{
+		MessageID: message.MessageID,
+		Ordinal:   0,
+		RemoteID:  "remote-second",
+		RemoteRef: []byte("ref-second"),
+		Filename:  "second.jpg",
+		MIME:      "image/jpeg",
+		SizeBytes: &secondSize,
+	}
+	duplicateMessage := message
+	duplicateMessage.MessageID = "message-attachment-replay-discarded"
+	if err := repository.ProjectMessage(context.Background(), MessageProjection{
+		InboxID: secondInbox.InboxID, Message: duplicateMessage, Attachments: []MessageAttachment{second},
+	}); err != nil {
+		t.Fatalf("ProjectMessage(pending replay): %v", err)
+	}
+	attachmentRepository, err := NewMessageAttachmentRepository(store, clock.Now)
+	if err != nil {
+		t.Fatalf("NewMessageAttachmentRepository(): %v", err)
+	}
+	pending, err := attachmentRepository.GetForDownload(context.Background(), message.MessageID, 0)
+	if err != nil {
+		t.Fatalf("GetForDownload(pending replay): %v", err)
+	}
+	if pending.RemoteID != second.RemoteID || !bytes.Equal(pending.RemoteRef, second.RemoteRef) ||
+		pending.Filename != second.Filename || pending.MIME != second.MIME ||
+		pending.SizeBytes == nil || *pending.SizeBytes != secondSize {
+		t.Fatalf("pending replay attachment = %+v, want refreshed metadata %+v", pending, second)
+	}
+
+	blobHash := strings.Repeat("3c", 32)
+	clock.Set(messageTestTimeMS + 200)
+	if err := attachmentRepository.MarkDownloaded(
+		context.Background(), message.MessageID, 0, blobHash, 30, "image/webp",
+	); err != nil {
+		t.Fatalf("MarkDownloaded(): %v", err)
+	}
+
+	clock.Set(messageTestTimeMS + 300)
+	thirdInbox := messageTestInbox("inbox-attachment-third", "account-a", "event-attachment-third", []byte("third"))
+	if _, err := repository.AppendInbox(context.Background(), thirdInbox); err != nil {
+		t.Fatalf("AppendInbox(third): %v", err)
+	}
+	thirdSize := int64(40)
+	third := MessageAttachment{
+		MessageID: message.MessageID,
+		Ordinal:   0,
+		RemoteID:  "remote-third",
+		RemoteRef: []byte("ref-third"),
+		Filename:  "third.txt",
+		MIME:      "text/plain",
+		SizeBytes: &thirdSize,
+	}
+	thirdProjection := MessageProjection{InboxID: thirdInbox.InboxID, Message: message, Attachments: []MessageAttachment{third}}
+	if err := repository.ProjectMessage(context.Background(), thirdProjection); err != nil {
+		t.Fatalf("ProjectMessage(downloaded replay): %v", err)
+	}
+	clock.Set(messageTestTimeMS + 400)
+	if err := repository.ProjectMessage(context.Background(), MessageProjection{
+		InboxID: thirdInbox.InboxID, Message: message, Attachments: []MessageAttachment{first},
+	}); err != nil {
+		t.Fatalf("ProjectMessage(processed replay): %v", err)
+	}
+
+	downloaded, err := attachmentRepository.GetForDownload(context.Background(), message.MessageID, 0)
+	if err != nil {
+		t.Fatalf("GetForDownload(downloaded replay): %v", err)
+	}
+	if downloaded.State != "downloaded" || downloaded.BlobHash == nil || *downloaded.BlobHash != blobHash ||
+		downloaded.RemoteID != second.RemoteID || !bytes.Equal(downloaded.RemoteRef, second.RemoteRef) ||
+		downloaded.Filename != second.Filename || downloaded.MIME != "image/webp" ||
+		downloaded.SizeBytes == nil || *downloaded.SizeBytes != 30 {
+		t.Fatalf("downloaded replay attachment = %+v, want downloaded row preserved", downloaded)
+	}
+}
+
 func TestProjectMessageMapsSQLiteOwnershipFailures(t *testing.T) {
 	store, repository := openMessageTestRepository(
 		t,
@@ -542,8 +733,8 @@ func TestMessagesInboxMigrationIsChecksummedAndStrict(t *testing.T) {
 		t,
 		func() time.Time { return time.UnixMilli(messageTestTimeMS) },
 	)
-	if len(embeddedMigrations) != 7 {
-		t.Fatalf("embedded migrations = %d, want 7", len(embeddedMigrations))
+	if len(embeddedMigrations) != 8 {
+		t.Fatalf("embedded migrations = %d, want 8", len(embeddedMigrations))
 	}
 	assertPragmaInt(t, store.db, "user_version", len(embeddedMigrations))
 	ledger := readLedgerRow(t, store.db, 4)
