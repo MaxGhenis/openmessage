@@ -651,6 +651,473 @@ func TestSendMediaWithoutBlobStoreReturnsConfigurationError(t *testing.T) {
 	}
 }
 
+func TestSendReactionValidatesCommand(t *testing.T) {
+	clock := newManualClock(messagingTestTime)
+	store := openMessagingTestStore(t, clock.Now())
+	registry := newScriptedRegistry("reaction-validation", nil)
+	registry.setReactionSender(&scriptedReactionSender{})
+	service := newMessagingTestService(t, store, registry, clock)
+
+	tests := []struct {
+		name   string
+		mutate func(*SendReactionCommand)
+	}{
+		{name: "empty emoji", mutate: func(cmd *SendReactionCommand) { cmd.Emoji = " \t " }},
+		{name: "emoji too long", mutate: func(cmd *SendReactionCommand) { cmd.Emoji = strings.Repeat("x", 65) }},
+		{name: "bad action", mutate: func(cmd *SendReactionCommand) { cmd.Action = bridge.ReactionAction("toggle") }},
+		{name: "empty target", mutate: func(cmd *SendReactionCommand) { cmd.TargetMessageID = " " }},
+		{name: "invalid schedule", mutate: func(cmd *SendReactionCommand) { cmd.NotBefore = time.UnixMilli(0) }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			command := SendReactionCommand{
+				CommonCommand:   testCommonCommand("key-reaction-validation-" + test.name),
+				TargetMessageID: "target-message",
+				Emoji:           "👍",
+				Action:          bridge.ReactionAdd,
+			}
+			test.mutate(&command)
+
+			if _, err := service.SendReaction(context.Background(), command); !errors.Is(err, ErrInvalidCommand) {
+				t.Fatalf("SendReaction() error = %v, want ErrInvalidCommand", err)
+			}
+		})
+	}
+}
+
+func TestMarkReadValidatesCommand(t *testing.T) {
+	clock := newManualClock(messagingTestTime)
+	store := openMessagingTestStore(t, clock.Now())
+	registry := newScriptedRegistry("read-validation", nil)
+	registry.setReadReceiptSender(&scriptedReadReceiptSender{})
+	service := newMessagingTestService(t, store, registry, clock)
+
+	tests := []struct {
+		name   string
+		mutate func(*MarkReadCommand)
+	}{
+		{name: "empty device", mutate: func(cmd *MarkReadCommand) { cmd.DeviceID = " " }},
+		{name: "empty target", mutate: func(cmd *MarkReadCommand) { cmd.LastReadMessageID = "\t" }},
+		{name: "invalid read time", mutate: func(cmd *MarkReadCommand) { cmd.LastReadAt = time.UnixMilli(0) }},
+		{name: "invalid schedule", mutate: func(cmd *MarkReadCommand) { cmd.NotBefore = time.UnixMilli(0) }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			command := MarkReadCommand{
+				CommonCommand:     testCommonCommand("key-read-validation-" + test.name),
+				DeviceID:          "device-1",
+				LastReadMessageID: "target-message",
+				LastReadAt:        clock.Now(),
+			}
+			test.mutate(&command)
+
+			if _, err := service.MarkRead(context.Background(), command); !errors.Is(err, ErrInvalidCommand) {
+				t.Fatalf("MarkRead() error = %v, want ErrInvalidCommand", err)
+			}
+		})
+	}
+}
+
+func TestReactionAndReadCapabilityGatesPrecedeGraphWork(t *testing.T) {
+	clock := newManualClock(messagingTestTime)
+	store := openMessagingTestStore(t, clock.Now())
+	service := newMessagingTestService(
+		t,
+		store,
+		newScriptedRegistry("unsupported-intents", nil),
+		clock,
+	)
+
+	if _, err := service.SendReaction(context.Background(), SendReactionCommand{
+		CommonCommand: CommonCommand{
+			AccountID:      "account-1",
+			ConversationID: "missing-conversation",
+			IdempotencyKey: "key-reaction-unsupported",
+		},
+		TargetMessageID: "missing-message",
+		Emoji:           "👍",
+	}); !errors.Is(err, ErrUnsupported) {
+		t.Fatalf("SendReaction(unsupported) error = %v, want ErrUnsupported", err)
+	}
+	if _, err := service.MarkRead(context.Background(), MarkReadCommand{
+		CommonCommand: CommonCommand{
+			AccountID:      "account-1",
+			ConversationID: "missing-conversation",
+			IdempotencyKey: "key-read-unsupported",
+		},
+		DeviceID:          "missing-device",
+		LastReadMessageID: "missing-message",
+	}); !errors.Is(err, ErrUnsupported) {
+		t.Fatalf("MarkRead(unsupported) error = %v, want ErrUnsupported", err)
+	}
+}
+
+func TestMarkReadChecksTargetBeforeDevice(t *testing.T) {
+	clock := newManualClock(messagingTestTime)
+	store := openMessagingTestStore(t, clock.Now())
+	registry := newScriptedRegistry("read-check-order", nil)
+	registry.setReadReceiptSender(&scriptedReadReceiptSender{})
+	service := newMessagingTestService(t, store, registry, clock)
+
+	_, err := service.MarkRead(context.Background(), MarkReadCommand{
+		CommonCommand:     testCommonCommand("key-read-check-order"),
+		DeviceID:          "missing-device",
+		LastReadMessageID: "missing-message",
+	})
+	if !errors.Is(err, sqlite.ErrNotFound) || !strings.Contains(err.Error(), "read cursor target") {
+		t.Fatalf("MarkRead(missing target and device) error = %v, want target not-found first", err)
+	}
+}
+
+func TestReactionAndReadPayloadHashesCoverIntentFields(t *testing.T) {
+	reaction, err := reactionPayloadHash("target-a", "👍", bridge.ReactionAdd)
+	if err != nil {
+		t.Fatalf("reactionPayloadHash(): %v", err)
+	}
+	for _, candidate := range []struct {
+		target string
+		emoji  string
+		action bridge.ReactionAction
+	}{
+		{target: "target-b", emoji: "👍", action: bridge.ReactionAdd},
+		{target: "target-a", emoji: "🔥", action: bridge.ReactionAdd},
+		{target: "target-a", emoji: "👍", action: bridge.ReactionRemove},
+	} {
+		got, hashErr := reactionPayloadHash(candidate.target, candidate.emoji, candidate.action)
+		if hashErr != nil {
+			t.Fatalf("reactionPayloadHash(candidate): %v", hashErr)
+		}
+		if got == reaction {
+			t.Fatalf("reaction hash did not cover candidate %+v", candidate)
+		}
+	}
+
+	read, err := readPayloadHash("device-a", "message-a")
+	if err != nil {
+		t.Fatalf("readPayloadHash(): %v", err)
+	}
+	for _, candidate := range [][2]string{{"device-b", "message-a"}, {"device-a", "message-b"}} {
+		got, hashErr := readPayloadHash(candidate[0], candidate[1])
+		if hashErr != nil {
+			t.Fatalf("readPayloadHash(candidate): %v", hashErr)
+		}
+		if got == read {
+			t.Fatalf("read hash did not cover device/message %q/%q", candidate[0], candidate[1])
+		}
+	}
+}
+
+func TestSendReactionWritesDurableIntentWithoutMessageProjection(t *testing.T) {
+	clock := newManualClock(messagingTestTime)
+	store := openMessagingTestStore(t, clock.Now())
+	registry := newScriptedRegistry("reaction-submit", nil)
+	registry.setReactionSender(&scriptedReactionSender{})
+	service := newMessagingTestService(t, store, registry, clock)
+	target := mustSendText(t, service, SendTextCommand{
+		CommonCommand: testCommonCommand("key-reaction-target"),
+		Body:          "react to me",
+	})
+
+	submission := mustSendReaction(t, service, SendReactionCommand{
+		CommonCommand:   testCommonCommand("key-reaction-submit"),
+		TargetMessageID: target.LocalMessageID,
+		Emoji:           "  👍  ",
+	})
+	item := mustOutboxItem(t, service, submission.OutboxID)
+	if item.Kind != sqlite.OutboxKindReaction || item.Operation != reactionOperation ||
+		item.LocalMessageID != nil || submission.LocalMessageID != "" {
+		t.Fatalf("reaction outbox item = %+v, submission = %+v", item, submission)
+	}
+	reaction, err := service.outbox.GetOutboxReaction(context.Background(), submission.OutboxID)
+	if err != nil {
+		t.Fatalf("GetOutboxReaction(): %v", err)
+	}
+	if reaction.TargetMessageID != target.LocalMessageID || reaction.Emoji != "👍" ||
+		reaction.Action != string(bridge.ReactionAdd) || reaction.CreatedAtMS != clock.Now().UnixMilli() {
+		t.Fatalf("outbox reaction = %+v", reaction)
+	}
+	if _, err := service.messages.GetMessage(context.Background(), "id-005"); !errors.Is(err, sqlite.ErrNotFound) {
+		t.Fatalf("reaction candidate message error = %v, want ErrNotFound", err)
+	}
+}
+
+func TestSendReactionDeduplicatesAndHashesEmojiAndAction(t *testing.T) {
+	clock := newManualClock(messagingTestTime)
+	store := openMessagingTestStore(t, clock.Now())
+	registry := newScriptedRegistry("reaction-dedup", nil)
+	registry.setReactionSender(&scriptedReactionSender{})
+	service := newMessagingTestService(t, store, registry, clock)
+	target := mustSendText(t, service, SendTextCommand{
+		CommonCommand: testCommonCommand("key-reaction-dedup-target"),
+		Body:          "target",
+	})
+	command := SendReactionCommand{
+		CommonCommand:   testCommonCommand("key-reaction-dedup"),
+		TargetMessageID: target.LocalMessageID,
+		Emoji:           "🔥",
+		Action:          bridge.ReactionAdd,
+	}
+
+	first := mustSendReaction(t, service, command)
+	second := mustSendReaction(t, service, command)
+	if first != second {
+		t.Fatalf("duplicate reaction submissions differ: first=%+v second=%+v", first, second)
+	}
+	if _, err := service.outbox.FindByID(context.Background(), "id-007"); !errors.Is(err, sqlite.ErrNotFound) {
+		t.Fatalf("duplicate candidate reaction error = %v, want ErrNotFound", err)
+	}
+
+	for _, mutate := range []func(*SendReactionCommand){
+		func(cmd *SendReactionCommand) { cmd.Emoji = "👍" },
+		func(cmd *SendReactionCommand) { cmd.Action = bridge.ReactionRemove },
+	} {
+		conflict := command
+		mutate(&conflict)
+		if _, err := service.SendReaction(context.Background(), conflict); !errors.Is(err, ErrIdempotencyConflict) {
+			t.Fatalf("SendReaction(conflict) error = %v, want ErrIdempotencyConflict", err)
+		}
+	}
+}
+
+func TestSendReactionKeepsRapidToggleAsTwoOrderedIntents(t *testing.T) {
+	clock := newManualClock(messagingTestTime)
+	store := openMessagingTestStore(t, clock.Now())
+	registry := newScriptedRegistry("reaction-toggle", nil)
+	registry.setReactionSender(&scriptedReactionSender{})
+	service := newMessagingTestService(t, store, registry, clock)
+	target := mustSendText(t, service, SendTextCommand{
+		CommonCommand: testCommonCommand("key-reaction-toggle-target"),
+		Body:          "target",
+	})
+
+	add := mustSendReaction(t, service, SendReactionCommand{
+		CommonCommand:   testCommonCommand("key-reaction-add"),
+		TargetMessageID: target.LocalMessageID,
+		Emoji:           "👍",
+		Action:          bridge.ReactionAdd,
+	})
+	clock.Advance(time.Millisecond)
+	remove := mustSendReaction(t, service, SendReactionCommand{
+		CommonCommand:   testCommonCommand("key-reaction-remove"),
+		TargetMessageID: target.LocalMessageID,
+		Emoji:           "👍",
+		Action:          bridge.ReactionRemove,
+	})
+	addItem := mustOutboxItem(t, service, add.OutboxID)
+	removeItem := mustOutboxItem(t, service, remove.OutboxID)
+	if add.OutboxID == remove.OutboxID || addItem.CreatedAtMS >= removeItem.CreatedAtMS ||
+		addItem.State != sqlite.OutboxQueued || removeItem.State != sqlite.OutboxQueued {
+		t.Fatalf("toggle intents = (%+v, %+v), want two ordered queued rows", addItem, removeItem)
+	}
+}
+
+func TestSendReactionRejectsConversationAndTargetOwnershipViolations(t *testing.T) {
+	clock := newManualClock(messagingTestTime)
+	store := openMessagingTestStore(t, clock.Now())
+	seedSecondMessagingAccount(t, store, clock.Now())
+	registry := newScriptedRegistry("reaction-ownership", nil)
+	registry.setReactionSender(&scriptedReactionSender{})
+	service := newMessagingTestService(t, store, registry, clock)
+	foreignTarget := seedMessagingMessage(t, store, clock, sqlite.Message{
+		MessageID:       "foreign-message",
+		ConversationID:  "conversation-2",
+		AccountID:       "account-2",
+		RemoteMessageID: "remote-foreign-message",
+		Direction:       sqlite.MessageDirectionIncoming,
+		Body:            "foreign",
+		State:           sqlite.MessageStateActive,
+		OccurredAtMS:    clock.Now().UnixMilli(),
+	})
+
+	_, err := service.SendReaction(context.Background(), SendReactionCommand{
+		CommonCommand: CommonCommand{
+			AccountID:      "account-1",
+			ConversationID: "conversation-2",
+			IdempotencyKey: "key-reaction-foreign-conversation",
+		},
+		TargetMessageID: foreignTarget,
+		Emoji:           "👍",
+	})
+	if !errors.Is(err, ErrInvalidCommand) {
+		t.Fatalf("SendReaction(foreign conversation) error = %v, want ErrInvalidCommand", err)
+	}
+
+	_, err = service.SendReaction(context.Background(), SendReactionCommand{
+		CommonCommand:   testCommonCommand("key-reaction-foreign-target"),
+		TargetMessageID: foreignTarget,
+		Emoji:           "👍",
+	})
+	if !errors.Is(err, ErrInvalidCommand) {
+		t.Fatalf("SendReaction(foreign target) error = %v, want ErrInvalidCommand", err)
+	}
+}
+
+func TestReactionRejectsDeletedTargetButReadAllowsDeletedCursorTarget(t *testing.T) {
+	clock := newManualClock(messagingTestTime)
+	store := openMessagingTestStore(t, clock.Now())
+	registry := newScriptedRegistry("deleted-target", nil)
+	registry.setReactionSender(&scriptedReactionSender{})
+	registry.setReadReceiptSender(&scriptedReadReceiptSender{})
+	service := newMessagingTestService(t, store, registry, clock)
+	target := mustSendText(t, service, SendTextCommand{
+		CommonCommand: testCommonCommand("key-deleted-target"),
+		Body:          "delete me",
+	})
+	markMessagingMessageDeleted(t, store, clock, target.LocalMessageID)
+	seedMessagingDevice(t, store, "device-1", "account-1", clock.Now())
+
+	if _, err := service.SendReaction(context.Background(), SendReactionCommand{
+		CommonCommand:   testCommonCommand("key-deleted-reaction"),
+		TargetMessageID: target.LocalMessageID,
+		Emoji:           "👍",
+	}); !errors.Is(err, ErrInvalidCommand) {
+		t.Fatalf("SendReaction(deleted target) error = %v, want ErrInvalidCommand", err)
+	}
+	read := mustMarkRead(t, service, MarkReadCommand{
+		CommonCommand:     testCommonCommand("key-deleted-read"),
+		DeviceID:          "device-1",
+		LastReadMessageID: target.LocalMessageID,
+	})
+	if read.State != OutboxQueued {
+		t.Fatalf("MarkRead(deleted target) = %+v, want queued", read)
+	}
+}
+
+func TestMarkReadWritesReceiptAndMonotoneCursorWithoutMessageProjection(t *testing.T) {
+	clock := newManualClock(messagingTestTime)
+	store := openMessagingTestStore(t, clock.Now())
+	seedMessagingDevice(t, store, "device-1", "account-1", clock.Now())
+	registry := newScriptedRegistry("read-submit", nil)
+	registry.setReadReceiptSender(&scriptedReadReceiptSender{})
+	service := newMessagingTestService(t, store, registry, clock)
+	target := mustSendText(t, service, SendTextCommand{
+		CommonCommand: testCommonCommand("key-read-target"),
+		Body:          "read me",
+	})
+
+	submission := mustMarkRead(t, service, MarkReadCommand{
+		CommonCommand:     testCommonCommand("key-read-submit"),
+		DeviceID:          "device-1",
+		LastReadMessageID: target.LocalMessageID,
+	})
+	item := mustOutboxItem(t, service, submission.OutboxID)
+	if item.Kind != sqlite.OutboxKindRead || item.Operation != readOperation ||
+		item.LocalMessageID != nil || submission.LocalMessageID != "" {
+		t.Fatalf("read outbox item = %+v, submission = %+v", item, submission)
+	}
+	receipt, err := service.outbox.GetOutboxReadReceipt(context.Background(), submission.OutboxID)
+	if err != nil {
+		t.Fatalf("GetOutboxReadReceipt(): %v", err)
+	}
+	if receipt.DeviceID != "device-1" || receipt.LastReadMessageID != target.LocalMessageID ||
+		receipt.ReadAtMS != clock.Now().UnixMilli() || receipt.CreatedAtMS != clock.Now().UnixMilli() {
+		t.Fatalf("outbox read receipt = %+v", receipt)
+	}
+	cursor, err := store.GetReadCursor("device-1", "conversation-1")
+	if err != nil {
+		t.Fatalf("GetReadCursor(): %v", err)
+	}
+	if cursor.AccountID != "account-1" || cursor.LastReadMessageID == nil ||
+		*cursor.LastReadMessageID != target.LocalMessageID || cursor.LastReadAtMS != clock.Now().UnixMilli() ||
+		cursor.UpdatedAtMS != clock.Now().UnixMilli() {
+		t.Fatalf("read cursor = %+v", cursor)
+	}
+	if _, err := service.messages.GetMessage(context.Background(), "id-005"); !errors.Is(err, sqlite.ErrNotFound) {
+		t.Fatalf("read candidate message error = %v, want ErrNotFound", err)
+	}
+}
+
+func TestMarkReadDeduplicatesSameCursorWithReadAtExcluded(t *testing.T) {
+	clock := newManualClock(messagingTestTime)
+	store := openMessagingTestStore(t, clock.Now())
+	seedMessagingDevice(t, store, "device-1", "account-1", clock.Now())
+	registry := newScriptedRegistry("read-dedup", nil)
+	registry.setReadReceiptSender(&scriptedReadReceiptSender{})
+	service := newMessagingTestService(t, store, registry, clock)
+	target := mustSendText(t, service, SendTextCommand{
+		CommonCommand: testCommonCommand("key-read-dedup-target"),
+		Body:          "target",
+	})
+	command := MarkReadCommand{
+		CommonCommand:     testCommonCommand("key-read-dedup"),
+		DeviceID:          "device-1",
+		LastReadMessageID: target.LocalMessageID,
+		LastReadAt:        clock.Now(),
+	}
+
+	first := mustMarkRead(t, service, command)
+	clock.Advance(time.Minute)
+	command.LastReadAt = clock.Now()
+	second := mustMarkRead(t, service, command)
+	if first != second {
+		t.Fatalf("duplicate read submissions differ: first=%+v second=%+v", first, second)
+	}
+	receipt, err := service.outbox.GetOutboxReadReceipt(context.Background(), first.OutboxID)
+	if err != nil {
+		t.Fatalf("GetOutboxReadReceipt(): %v", err)
+	}
+	if receipt.ReadAtMS != messagingTestTime.UnixMilli() {
+		t.Fatalf("deduplicated receipt read_at_ms = %d, want original %d", receipt.ReadAtMS, messagingTestTime.UnixMilli())
+	}
+	cursor, err := store.GetReadCursor("device-1", "conversation-1")
+	if err != nil {
+		t.Fatalf("GetReadCursor(): %v", err)
+	}
+	if cursor.LastReadAtMS != messagingTestTime.UnixMilli() || cursor.UpdatedAtMS != messagingTestTime.UnixMilli() {
+		t.Fatalf("deduplicated cursor changed = %+v, want original timestamps", cursor)
+	}
+}
+
+func TestMarkReadRejectsMissingAndCrossAccountDeviceAndForeignTarget(t *testing.T) {
+	clock := newManualClock(messagingTestTime)
+	store := openMessagingTestStore(t, clock.Now())
+	seedSecondMessagingAccount(t, store, clock.Now())
+	seedMessagingDevice(t, store, "device-1", "account-1", clock.Now())
+	seedMessagingDevice(t, store, "device-2", "account-2", clock.Now())
+	registry := newScriptedRegistry("read-ownership", nil)
+	registry.setReadReceiptSender(&scriptedReadReceiptSender{})
+	service := newMessagingTestService(t, store, registry, clock)
+	localTarget := mustSendText(t, service, SendTextCommand{
+		CommonCommand: testCommonCommand("key-read-local-target"),
+		Body:          "local",
+	})
+	foreignTarget := seedMessagingMessage(t, store, clock, sqlite.Message{
+		MessageID:       "foreign-read-message",
+		ConversationID:  "conversation-2",
+		AccountID:       "account-2",
+		RemoteMessageID: "remote-foreign-read-message",
+		Direction:       sqlite.MessageDirectionIncoming,
+		Body:            "foreign",
+		State:           sqlite.MessageStateActive,
+		OccurredAtMS:    clock.Now().UnixMilli(),
+	})
+
+	tests := []struct {
+		name     string
+		deviceID string
+		targetID string
+	}{
+		{name: "missing device", deviceID: "missing-device", targetID: localTarget.LocalMessageID},
+		{name: "cross-account device", deviceID: "device-2", targetID: localTarget.LocalMessageID},
+		{name: "foreign target", deviceID: "device-1", targetID: foreignTarget},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := service.MarkRead(context.Background(), MarkReadCommand{
+				CommonCommand:     testCommonCommand("key-read-ownership-" + test.name),
+				DeviceID:          test.deviceID,
+				LastReadMessageID: test.targetID,
+			})
+			if err == nil {
+				t.Fatal("MarkRead() succeeded, want ownership/not-found error")
+			}
+			if test.name != "missing device" && !errors.Is(err, ErrInvalidCommand) {
+				t.Fatalf("MarkRead() error = %v, want ErrInvalidCommand", err)
+			}
+		})
+	}
+}
+
 func TestCancelAndDeferredAPIs(t *testing.T) {
 	clock := newManualClock(messagingTestTime)
 	store := openMessagingTestStore(t, clock.Now())
@@ -777,13 +1244,97 @@ func (s *scriptedMediaSender) snapshotRequests() []bridge.MediaRequest {
 	return append([]bridge.MediaRequest(nil), s.requests...)
 }
 
+type scriptedReactionSender struct {
+	mu       sync.Mutex
+	steps    []sendStep
+	requests []bridge.ReactionRequest
+	onSend   func()
+}
+
+func (s *scriptedReactionSender) SendReaction(
+	_ context.Context,
+	request bridge.ReactionRequest,
+) (bridge.SendResult, error) {
+	s.mu.Lock()
+	s.requests = append(s.requests, request)
+	var step sendStep
+	if len(s.steps) > 0 {
+		step = s.steps[0]
+		s.steps = s.steps[1:]
+	}
+	onSend := s.onSend
+	s.mu.Unlock()
+	if onSend != nil {
+		onSend()
+	}
+	return step.result, step.err
+}
+
+func (s *scriptedReactionSender) requestCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.requests)
+}
+
+func (s *scriptedReactionSender) snapshotRequests() []bridge.ReactionRequest {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]bridge.ReactionRequest(nil), s.requests...)
+}
+
+type readReceiptStep struct {
+	err error
+}
+
+type scriptedReadReceiptSender struct {
+	mu       sync.Mutex
+	steps    []readReceiptStep
+	requests []bridge.ReadReceiptRequest
+	onSend   func()
+}
+
+func (s *scriptedReadReceiptSender) MarkRead(
+	_ context.Context,
+	request bridge.ReadReceiptRequest,
+) error {
+	s.mu.Lock()
+	s.requests = append(s.requests, request)
+	var step readReceiptStep
+	if len(s.steps) > 0 {
+		step = s.steps[0]
+		s.steps = s.steps[1:]
+	}
+	onSend := s.onSend
+	s.mu.Unlock()
+	if onSend != nil {
+		onSend()
+	}
+	return step.err
+}
+
+func (s *scriptedReadReceiptSender) requestCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.requests)
+}
+
+func (s *scriptedReadReceiptSender) snapshotRequests() []bridge.ReadReceiptRequest {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]bridge.ReadReceiptRequest(nil), s.requests...)
+}
+
 type scriptedRegistry struct {
-	mu                sync.Mutex
-	platform          bridge.Platform
-	sender            bridge.TextSender
-	media             bridge.MediaSender
-	mediaSendDeclared bool
-	available         bool
+	mu                   sync.Mutex
+	platform             bridge.Platform
+	sender               bridge.TextSender
+	media                bridge.MediaSender
+	reaction             bridge.ReactionSender
+	readReceipt          bridge.ReadReceiptSender
+	mediaSendDeclared    bool
+	reactionsDeclared    bool
+	readReceiptsDeclared bool
+	available            bool
 }
 
 func newScriptedRegistry(platform bridge.Platform, sender bridge.TextSender) *scriptedRegistry {
@@ -806,6 +1357,32 @@ func (r *scriptedRegistry) setMediaSender(sender bridge.MediaSender) {
 func (r *scriptedRegistry) setMediaSendDeclared(declared bool) {
 	r.mu.Lock()
 	r.mediaSendDeclared = declared
+	r.mu.Unlock()
+}
+
+func (r *scriptedRegistry) setReactionSender(sender bridge.ReactionSender) {
+	r.mu.Lock()
+	r.reaction = sender
+	r.reactionsDeclared = sender != nil
+	r.mu.Unlock()
+}
+
+func (r *scriptedRegistry) setReactionsDeclared(declared bool) {
+	r.mu.Lock()
+	r.reactionsDeclared = declared
+	r.mu.Unlock()
+}
+
+func (r *scriptedRegistry) setReadReceiptSender(sender bridge.ReadReceiptSender) {
+	r.mu.Lock()
+	r.readReceipt = sender
+	r.readReceiptsDeclared = sender != nil
+	r.mu.Unlock()
+}
+
+func (r *scriptedRegistry) setReadReceiptsDeclared(declared bool) {
+	r.mu.Lock()
+	r.readReceiptsDeclared = declared
 	r.mu.Unlock()
 }
 
@@ -852,6 +1429,16 @@ func (r *scriptedRegistry) Acquire(
 			return nil, bridge.ErrCapabilityUnavailable
 		}
 		lease.Media = r.media
+	case bridge.CapabilityReactions:
+		if r.reaction == nil {
+			return nil, bridge.ErrCapabilityUnavailable
+		}
+		lease.Reaction = r.reaction
+	case bridge.CapabilityReadReceipts:
+		if r.readReceipt == nil {
+			return nil, bridge.ErrCapabilityUnavailable
+		}
+		lease.ReadReceipt = r.readReceipt
 	default:
 		return nil, bridge.ErrCapabilityUnavailable
 	}
@@ -862,8 +1449,10 @@ func (r *scriptedRegistry) Capabilities(accountID string) bridge.CapabilitySet {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return bridge.CapabilitySet{
-		TextSend:  accountID == "account-1" && r.sender != nil,
-		MediaSend: accountID == "account-1" && r.mediaSendDeclared,
+		TextSend:     accountID == "account-1" && r.sender != nil,
+		MediaSend:    accountID == "account-1" && r.mediaSendDeclared,
+		Reactions:    accountID == "account-1" && r.reactionsDeclared,
+		ReadReceipts: accountID == "account-1" && r.readReceiptsDeclared,
 	}
 }
 
@@ -1014,6 +1603,24 @@ func mustSendMedia(t *testing.T, service *MessageService, command SendMediaComma
 	return submission
 }
 
+func mustSendReaction(t *testing.T, service *MessageService, command SendReactionCommand) Submission {
+	t.Helper()
+	submission, err := service.SendReaction(context.Background(), command)
+	if err != nil {
+		t.Fatalf("SendReaction(): %v", err)
+	}
+	return submission
+}
+
+func mustMarkRead(t *testing.T, service *MessageService, command MarkReadCommand) Submission {
+	t.Helper()
+	submission, err := service.MarkRead(context.Background(), command)
+	if err != nil {
+		t.Fatalf("MarkRead(): %v", err)
+	}
+	return submission
+}
+
 func mustDelivery(t *testing.T, service *MessageService, outboxID string) Delivery {
 	t.Helper()
 	delivery, err := service.Get(context.Background(), outboxID)
@@ -1030,4 +1637,107 @@ func mustOutboxItem(t *testing.T, service *MessageService, outboxID string) sqli
 		t.Fatalf("FindByID(%q): %v", outboxID, err)
 	}
 	return item
+}
+
+func seedMessagingDevice(
+	t *testing.T,
+	store *sqlite.Store,
+	deviceID string,
+	accountID string,
+	now time.Time,
+) {
+	t.Helper()
+	if err := store.UpsertDevice(sqlite.Device{
+		DeviceID:    deviceID,
+		AccountID:   accountID,
+		Kind:        sqlite.DeviceKindLocalInstallation,
+		DisplayName: "Test device",
+		State:       sqlite.DeviceStateActive,
+		IsCurrent:   true,
+		CreatedAtMS: now.UnixMilli(),
+		UpdatedAtMS: now.UnixMilli(),
+	}); err != nil {
+		t.Fatalf("UpsertDevice(%q): %v", deviceID, err)
+	}
+}
+
+func seedSecondMessagingAccount(t *testing.T, store *sqlite.Store, now time.Time) {
+	t.Helper()
+	nowMS := now.UnixMilli()
+	if err := store.UpsertAccount(sqlite.Account{
+		AccountID:   "account-2",
+		BridgeKey:   "scripted",
+		DisplayName: "Second account",
+		Mode:        sqlite.AccountModeLive,
+		Enabled:     true,
+		ConfigJSON:  `{}`,
+		CreatedAtMS: nowMS,
+		UpdatedAtMS: nowMS,
+	}); err != nil {
+		t.Fatalf("UpsertAccount(account-2): %v", err)
+	}
+	if err := store.UpsertConversation(sqlite.Conversation{
+		ConversationID:       "conversation-2",
+		AccountID:            "account-2",
+		RemoteConversationID: "remote-conversation-2",
+		Kind:                 sqlite.ConversationKindDirect,
+		Title:                "Second conversation",
+		NotificationMode:     sqlite.NotificationModeAll,
+		MetadataJSON:         `{}`,
+		CreatedAtMS:          nowMS,
+		UpdatedAtMS:          nowMS,
+	}); err != nil {
+		t.Fatalf("UpsertConversation(conversation-2): %v", err)
+	}
+}
+
+func seedMessagingMessage(
+	t *testing.T,
+	store *sqlite.Store,
+	clock Clock,
+	message sqlite.Message,
+) string {
+	t.Helper()
+	repository, err := sqlite.NewMessageRepository(store, clock.Now)
+	if err != nil {
+		t.Fatalf("NewMessageRepository(): %v", err)
+	}
+	inboxID := "inbox-" + message.MessageID + "-" + string(message.State)
+	if _, err := repository.AppendInbox(context.Background(), sqlite.InboxRecord{
+		InboxID:      inboxID,
+		AccountID:    message.AccountID,
+		Generation:   1,
+		DedupeKey:    inboxID,
+		Codec:        "test.frame",
+		CodecVersion: 1,
+		Payload:      []byte("frame"),
+	}); err != nil {
+		t.Fatalf("AppendInbox(%q): %v", inboxID, err)
+	}
+	if err := repository.ProjectMessage(context.Background(), sqlite.MessageProjection{
+		InboxID: inboxID,
+		Message: message,
+	}); err != nil {
+		t.Fatalf("ProjectMessage(%q): %v", message.MessageID, err)
+	}
+	return message.MessageID
+}
+
+func markMessagingMessageDeleted(
+	t *testing.T,
+	store *sqlite.Store,
+	clock Clock,
+	messageID string,
+) {
+	t.Helper()
+	repository, err := sqlite.NewMessageRepository(store, clock.Now)
+	if err != nil {
+		t.Fatalf("NewMessageRepository(): %v", err)
+	}
+	message, err := repository.GetMessage(context.Background(), messageID)
+	if err != nil {
+		t.Fatalf("GetMessage(%q): %v", messageID, err)
+	}
+	message.State = sqlite.MessageStateDeleted
+	seedMessagingMessage(t, store, clock, message)
 }

@@ -90,6 +90,10 @@ func (s *MessageService) DispatchDue(ctx context.Context, limit int) (int, error
 			dispatchErr = s.dispatchTextLease(ctx, lease)
 		case sqlite.OutboxKindMedia:
 			dispatchErr = s.dispatchMediaLease(ctx, lease)
+		case sqlite.OutboxKindReaction:
+			dispatchErr = s.dispatchReactionLease(ctx, lease)
+		case sqlite.OutboxKindRead:
+			dispatchErr = s.dispatchReadLease(ctx, lease)
 		default:
 			dispatchErr = s.releaseUnavailable(ctx, lease.OutboxItem, fmt.Errorf(
 				"message dispatcher does not handle outbox kind %q",
@@ -404,6 +408,317 @@ func (s *MessageService) dispatchMediaLease(ctx context.Context, outboxLease sql
 	}
 	s.signalChange()
 	return nil
+}
+
+func (s *MessageService) dispatchReactionLease(ctx context.Context, outboxLease sqlite.Lease) error {
+	item := outboxLease.OutboxItem
+	if item.LeaseToken == nil {
+		return fmt.Errorf("dispatch outbox item %q: storage returned no lease token", item.OutboxID)
+	}
+
+	dispatchLease, err := s.bridges.Acquire(ctx, item.AccountID, bridge.CapabilityReactions)
+	if err != nil {
+		if errors.Is(err, bridge.ErrCapabilityUnavailable) &&
+			!s.bridges.Capabilities(item.AccountID).Reactions {
+			return s.rejectPreCall(
+				ctx,
+				item,
+				string(bridge.FailureUnsupported),
+				"reactions_unsupported",
+				err,
+			)
+		}
+		if releaseErr := s.releaseUnavailable(ctx, item, err); releaseErr != nil {
+			return releaseErr
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		return nil
+	}
+	if dispatchLease == nil || dispatchLease.Reaction == nil {
+		if dispatchLease != nil {
+			dispatchLease.Close()
+		}
+		return s.releaseUnavailable(ctx, item, bridge.ErrCapabilityUnavailable)
+	}
+	defer dispatchLease.Close()
+
+	reaction, err := s.outbox.GetOutboxReaction(ctx, item.OutboxID)
+	if err != nil {
+		return s.markPreCallFailure(
+			ctx,
+			item,
+			string(bridge.FailureTransient),
+			"load_reaction",
+			err,
+			s.clock.Now().Add(s.retryDelay),
+		)
+	}
+	target, code, err := s.targetRefForLease(ctx, item, reaction.TargetMessageID)
+	if err != nil {
+		return s.markPreCallFailure(
+			ctx,
+			item,
+			string(bridge.FailureTransient),
+			code,
+			err,
+			s.clock.Now().Add(s.retryDelay),
+		)
+	}
+	conversation, err := s.store.GetConversation(item.ConversationID)
+	if err != nil {
+		return s.markPreCallFailure(
+			ctx,
+			item,
+			string(bridge.FailureTransient),
+			"load_conversation",
+			err,
+			s.clock.Now().Add(s.retryDelay),
+		)
+	}
+	if conversation.AccountID != item.AccountID {
+		return s.markPreCallFailure(
+			ctx,
+			item,
+			string(bridge.FailureTransient),
+			"load_conversation",
+			fmt.Errorf("conversation %q belongs to account %q", item.ConversationID, conversation.AccountID),
+			s.clock.Now().Add(s.retryDelay),
+		)
+	}
+
+	if err := s.outbox.MarkTransportCalled(ctx, sqlite.Attempt{
+		OutboxID:             item.OutboxID,
+		LeaseToken:           *item.LeaseToken,
+		AttemptToken:         item.OutboxID + ":" + *item.LeaseToken,
+		ConnectionGeneration: uint64(dispatchLease.Generation),
+		StartedAt:            s.clock.Now(),
+	}); err != nil {
+		if ctx.Err() != nil {
+			return errors.Join(ctx.Err(), s.releaseUnavailable(ctx, item, err))
+		}
+		return fmt.Errorf("dispatch outbox item %q: mark transport called: %w", item.OutboxID, err)
+	}
+	s.signalChange()
+
+	result, sendErr := dispatchLease.Reaction.SendReaction(ctx, bridge.ReactionRequest{
+		AccountID: item.AccountID,
+		Conversation: bridge.ConversationRef{
+			RemoteID: conversation.RemoteConversationID,
+		},
+		Target:    target,
+		Emoji:     reaction.Emoji,
+		Action:    bridge.ReactionAction(reaction.Action),
+		RequestID: item.TransportRequestID,
+	})
+	mutationCtx, cancel := s.storageMutationContext(ctx)
+	defer cancel()
+	if sendErr != nil {
+		return s.recordSendError(mutationCtx, item, sendErr, reactionOperation)
+	}
+	if strings.TrimSpace(result.RemoteMessageID) == "" {
+		// Legacy web/api.go reaction dispatch returns only a success boolean, so
+		// an empty remote result is a valid confirmation for this operation.
+		if err := s.outbox.ConfirmWithoutResult(
+			mutationCtx,
+			item.OutboxID,
+			*item.LeaseToken,
+		); err != nil {
+			return fmt.Errorf(
+				"dispatch outbox item %q: confirm reaction without result: %w",
+				item.OutboxID,
+				err,
+			)
+		}
+		s.signalChange()
+		return nil
+	}
+
+	confirmation := sqlite.Confirmation{
+		OutboxID:       item.OutboxID,
+		LeaseToken:     *item.LeaseToken,
+		ResultRemoteID: result.RemoteMessageID,
+	}
+	if err := s.outbox.Confirm(mutationCtx, confirmation); err != nil {
+		storeErr := s.outbox.MarkStoreFailed(
+			mutationCtx,
+			item.OutboxID,
+			*item.LeaseToken,
+			result.RemoteMessageID,
+			err.Error(),
+		)
+		if storeErr != nil {
+			return fmt.Errorf(
+				"dispatch outbox item %q: confirm: %w",
+				item.OutboxID,
+				errors.Join(err, storeErr),
+			)
+		}
+	}
+	s.signalChange()
+	return nil
+}
+
+func (s *MessageService) dispatchReadLease(ctx context.Context, outboxLease sqlite.Lease) error {
+	item := outboxLease.OutboxItem
+	if item.LeaseToken == nil {
+		return fmt.Errorf("dispatch outbox item %q: storage returned no lease token", item.OutboxID)
+	}
+
+	dispatchLease, err := s.bridges.Acquire(ctx, item.AccountID, bridge.CapabilityReadReceipts)
+	if err != nil {
+		if errors.Is(err, bridge.ErrCapabilityUnavailable) &&
+			!s.bridges.Capabilities(item.AccountID).ReadReceipts {
+			return s.rejectPreCall(
+				ctx,
+				item,
+				string(bridge.FailureUnsupported),
+				"read_receipts_unsupported",
+				err,
+			)
+		}
+		if releaseErr := s.releaseUnavailable(ctx, item, err); releaseErr != nil {
+			return releaseErr
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		return nil
+	}
+	if dispatchLease == nil || dispatchLease.ReadReceipt == nil {
+		if dispatchLease != nil {
+			dispatchLease.Close()
+		}
+		return s.releaseUnavailable(ctx, item, bridge.ErrCapabilityUnavailable)
+	}
+	defer dispatchLease.Close()
+
+	receipt, err := s.outbox.GetOutboxReadReceipt(ctx, item.OutboxID)
+	if err != nil {
+		return s.markPreCallFailure(
+			ctx,
+			item,
+			string(bridge.FailureTransient),
+			"load_read_receipt",
+			err,
+			s.clock.Now().Add(s.retryDelay),
+		)
+	}
+	target, code, err := s.targetRefForLease(ctx, item, receipt.LastReadMessageID)
+	if err != nil {
+		return s.markPreCallFailure(
+			ctx,
+			item,
+			string(bridge.FailureTransient),
+			code,
+			err,
+			s.clock.Now().Add(s.retryDelay),
+		)
+	}
+	conversation, err := s.store.GetConversation(item.ConversationID)
+	if err != nil {
+		return s.markPreCallFailure(
+			ctx,
+			item,
+			string(bridge.FailureTransient),
+			"load_conversation",
+			err,
+			s.clock.Now().Add(s.retryDelay),
+		)
+	}
+	if conversation.AccountID != item.AccountID {
+		return s.markPreCallFailure(
+			ctx,
+			item,
+			string(bridge.FailureTransient),
+			"load_conversation",
+			fmt.Errorf("conversation %q belongs to account %q", item.ConversationID, conversation.AccountID),
+			s.clock.Now().Add(s.retryDelay),
+		)
+	}
+
+	if err := s.outbox.MarkTransportCalled(ctx, sqlite.Attempt{
+		OutboxID:             item.OutboxID,
+		LeaseToken:           *item.LeaseToken,
+		AttemptToken:         item.OutboxID + ":" + *item.LeaseToken,
+		ConnectionGeneration: uint64(dispatchLease.Generation),
+		StartedAt:            s.clock.Now(),
+	}); err != nil {
+		if ctx.Err() != nil {
+			return errors.Join(ctx.Err(), s.releaseUnavailable(ctx, item, err))
+		}
+		return fmt.Errorf("dispatch outbox item %q: mark transport called: %w", item.OutboxID, err)
+	}
+	s.signalChange()
+
+	sendErr := dispatchLease.ReadReceipt.MarkRead(ctx, bridge.ReadReceiptRequest{
+		AccountID: item.AccountID,
+		Conversation: bridge.ConversationRef{
+			RemoteID: conversation.RemoteConversationID,
+		},
+		Messages: []bridge.MessageRef{target},
+		ReadAt:   time.UnixMilli(receipt.ReadAtMS),
+	})
+	mutationCtx, cancel := s.storageMutationContext(ctx)
+	defer cancel()
+	if sendErr != nil {
+		return s.recordSendError(mutationCtx, item, sendErr, readOperation)
+	}
+	if err := s.outbox.ConfirmWithoutResult(
+		mutationCtx,
+		item.OutboxID,
+		*item.LeaseToken,
+	); err != nil {
+		return fmt.Errorf(
+			"dispatch outbox item %q: confirm read without result: %w",
+			item.OutboxID,
+			err,
+		)
+	}
+	s.signalChange()
+	return nil
+}
+
+func (s *MessageService) targetRefForLease(
+	ctx context.Context,
+	item sqlite.OutboxItem,
+	targetMessageID string,
+) (bridge.MessageRef, string, error) {
+	target, err := s.messages.GetMessage(ctx, targetMessageID)
+	if err != nil {
+		return bridge.MessageRef{}, "load_target", err
+	}
+	if target.AccountID != item.AccountID || target.ConversationID != item.ConversationID {
+		return bridge.MessageRef{}, "load_target", fmt.Errorf(
+			"target message does not match outbox account/conversation",
+		)
+	}
+
+	authorID := ""
+	if target.SenderIdentityID != nil {
+		identity, err := s.store.GetIdentity(*target.SenderIdentityID)
+		if err != nil {
+			return bridge.MessageRef{}, "load_target_author", err
+		}
+		if identity.AccountID != item.AccountID {
+			return bridge.MessageRef{}, "load_target_author", fmt.Errorf(
+				"target author %q belongs to account %q",
+				identity.IdentityID,
+				identity.AccountID,
+			)
+		}
+		authorID = identity.CanonicalValue
+	}
+	// A nil sender marks an outgoing message authored by self, so an empty
+	// transport-neutral AuthorID preserves that distinction for adapter shims.
+	// Until echo reconciliation, an outgoing target's RemoteID remains its
+	// stable transport request ID.
+	return bridge.MessageRef{
+		RemoteID: target.RemoteMessageID,
+		AuthorID: authorID,
+		SentAt:   time.UnixMilli(target.OccurredAtMS),
+	}, "", nil
 }
 
 func (s *MessageService) messageForLease(

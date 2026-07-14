@@ -105,6 +105,27 @@ type OutboxAttachment struct {
 	CreatedAtMS int64
 }
 
+// OutboxReaction is the persisted payload for one reaction intent. Enqueue
+// stamps OutboxID and CreatedAtMS; GetOutboxReaction populates every field.
+type OutboxReaction struct {
+	OutboxID        string
+	TargetMessageID string
+	Emoji           string
+	Action          string
+	CreatedAtMS     int64
+}
+
+// OutboxReadReceipt is the persisted payload for one read-receipt intent.
+// Enqueue stamps OutboxID and CreatedAtMS; GetOutboxReadReceipt populates every
+// field.
+type OutboxReadReceipt struct {
+	OutboxID          string
+	DeviceID          string
+	LastReadMessageID string
+	ReadAtMS          int64
+	CreatedAtMS       int64
+}
+
 // LeaseRequest controls one atomic due-row claim.
 type LeaseRequest struct {
 	Owner    string
@@ -150,6 +171,13 @@ type OutboxRepository struct {
 	now   func() time.Time
 }
 
+type enqueueCarriers struct {
+	attachment  *OutboxAttachment
+	reaction    *OutboxReaction
+	readReceipt *OutboxReadReceipt
+	readCursor  *ReadCursor
+}
+
 // NewOutboxRepository creates an outbox repository. The clock is required so
 // all storage-owned timestamps are deterministic in tests.
 func NewOutboxRepository(
@@ -172,7 +200,7 @@ func (r *OutboxRepository) Enqueue(
 	ctx context.Context,
 	item NewOutboxItem,
 ) (OutboxItem, EnqueueDisposition, error) {
-	return r.enqueue(ctx, item, nil, nil)
+	return r.enqueue(ctx, item, nil, enqueueCarriers{})
 }
 
 // EnqueueOutgoingMessage atomically inserts an outbound intent and its
@@ -184,7 +212,7 @@ func (r *OutboxRepository) EnqueueOutgoingMessage(
 	item NewOutboxItem,
 	message Message,
 ) (OutboxItem, EnqueueDisposition, error) {
-	return r.enqueue(ctx, item, &message, nil)
+	return r.enqueue(ctx, item, &message, enqueueCarriers{})
 }
 
 // EnqueueOutgoingMediaMessage atomically inserts a media intent, its
@@ -196,7 +224,33 @@ func (r *OutboxRepository) EnqueueOutgoingMediaMessage(
 	message Message,
 	attachment OutboxAttachment,
 ) (OutboxItem, EnqueueDisposition, error) {
-	return r.enqueue(ctx, item, &message, &attachment)
+	return r.enqueue(ctx, item, &message, enqueueCarriers{attachment: &attachment})
+}
+
+// EnqueueReaction atomically inserts a message-less reaction intent and its
+// typed carrier row. An idempotent replay requires the persisted pair to
+// remain intact.
+func (r *OutboxRepository) EnqueueReaction(
+	ctx context.Context,
+	item NewOutboxItem,
+	reaction OutboxReaction,
+) (OutboxItem, EnqueueDisposition, error) {
+	return r.enqueue(ctx, item, nil, enqueueCarriers{reaction: &reaction})
+}
+
+// EnqueueReadReceipt atomically inserts a message-less read-receipt intent,
+// its typed carrier row, and the monotone local read cursor. An idempotent
+// replay validates the carrier but deliberately does not update the cursor.
+func (r *OutboxRepository) EnqueueReadReceipt(
+	ctx context.Context,
+	item NewOutboxItem,
+	receipt OutboxReadReceipt,
+	cursor ReadCursor,
+) (OutboxItem, EnqueueDisposition, error) {
+	return r.enqueue(ctx, item, nil, enqueueCarriers{
+		readReceipt: &receipt,
+		readCursor:  &cursor,
+	})
 }
 
 // GetOutboxAttachment returns the ordinal-zero attachment for outboxID. A
@@ -228,16 +282,78 @@ func (r *OutboxRepository) GetOutboxAttachment(
 	return attachment, nil
 }
 
+// GetOutboxReaction returns the typed reaction payload for outboxID. A
+// missing row wraps database/sql.ErrNoRows so callers can use errors.Is.
+func (r *OutboxRepository) GetOutboxReaction(
+	ctx context.Context,
+	outboxID string,
+) (OutboxReaction, error) {
+	if strings.TrimSpace(outboxID) == "" {
+		return OutboxReaction{}, fmt.Errorf("get outbox reaction: outbox ID is empty")
+	}
+
+	var reaction OutboxReaction
+	if err := r.store.db.QueryRowContext(ctx, `
+		SELECT outbox_id, target_message_id, emoji, action, created_at_ms
+		FROM outbox_reactions
+		WHERE outbox_id = ?
+	`, outboxID).Scan(
+		&reaction.OutboxID,
+		&reaction.TargetMessageID,
+		&reaction.Emoji,
+		&reaction.Action,
+		&reaction.CreatedAtMS,
+	); err != nil {
+		return OutboxReaction{}, fmt.Errorf(
+			"get outbox reaction for outbox item %q: %w",
+			outboxID,
+			err,
+		)
+	}
+	return reaction, nil
+}
+
+// GetOutboxReadReceipt returns the typed read-receipt payload for outboxID. A
+// missing row wraps database/sql.ErrNoRows so callers can use errors.Is.
+func (r *OutboxRepository) GetOutboxReadReceipt(
+	ctx context.Context,
+	outboxID string,
+) (OutboxReadReceipt, error) {
+	if strings.TrimSpace(outboxID) == "" {
+		return OutboxReadReceipt{}, fmt.Errorf("get outbox read receipt: outbox ID is empty")
+	}
+
+	var receipt OutboxReadReceipt
+	if err := r.store.db.QueryRowContext(ctx, `
+		SELECT outbox_id, device_id, last_read_message_id, read_at_ms, created_at_ms
+		FROM outbox_read_receipts
+		WHERE outbox_id = ?
+	`, outboxID).Scan(
+		&receipt.OutboxID,
+		&receipt.DeviceID,
+		&receipt.LastReadMessageID,
+		&receipt.ReadAtMS,
+		&receipt.CreatedAtMS,
+	); err != nil {
+		return OutboxReadReceipt{}, fmt.Errorf(
+			"get outbox read receipt for outbox item %q: %w",
+			outboxID,
+			err,
+		)
+	}
+	return receipt, nil
+}
+
 func (r *OutboxRepository) enqueue(
 	ctx context.Context,
 	item NewOutboxItem,
 	message *Message,
-	attachment *OutboxAttachment,
+	carriers enqueueCarriers,
 ) (OutboxItem, EnqueueDisposition, error) {
 	if err := validateNewOutboxItem(item); err != nil {
 		return OutboxItem{}, "", fmt.Errorf("enqueue outbox item: %w", err)
 	}
-	if err := validateOutboxAttachmentPair(item, attachment); err != nil {
+	if err := validateOutboxAttachmentPair(item, carriers); err != nil {
 		return OutboxItem{}, "", fmt.Errorf("enqueue outbox item %q: %w", item.OutboxID, err)
 	}
 	nowMS, err := r.nowMS("enqueue outbox item")
@@ -346,13 +462,36 @@ func (r *OutboxRepository) enqueue(
 			return OutboxItem{}, "", err
 		}
 	}
+	if disposition == EnqueueExisting && row.Kind == OutboxKindReaction {
+		if err := validateExistingOutboxReaction(ctx, tx, row.OutboxID); err != nil {
+			return OutboxItem{}, "", err
+		}
+	}
+	if disposition == EnqueueExisting && row.Kind == OutboxKindRead {
+		if err := validateExistingOutboxReadReceipt(ctx, tx, row.OutboxID); err != nil {
+			return OutboxItem{}, "", err
+		}
+	}
 	if disposition == EnqueueInserted && message != nil {
 		if err := r.insertOutgoingMessage(ctx, tx, item, *message, nowMS); err != nil {
 			return OutboxItem{}, "", err
 		}
 	}
-	if disposition == EnqueueInserted && attachment != nil {
-		if err := r.insertOutboxAttachment(ctx, tx, item.OutboxID, *attachment, nowMS); err != nil {
+	if disposition == EnqueueInserted && carriers.attachment != nil {
+		if err := r.insertOutboxAttachment(ctx, tx, item.OutboxID, *carriers.attachment, nowMS); err != nil {
+			return OutboxItem{}, "", err
+		}
+	}
+	if disposition == EnqueueInserted && carriers.reaction != nil {
+		if err := r.insertOutboxReaction(ctx, tx, item.OutboxID, *carriers.reaction, nowMS); err != nil {
+			return OutboxItem{}, "", err
+		}
+	}
+	if disposition == EnqueueInserted && carriers.readReceipt != nil {
+		if err := r.insertOutboxReadReceipt(ctx, tx, item.OutboxID, *carriers.readReceipt, nowMS); err != nil {
+			return OutboxItem{}, "", err
+		}
+		if err := r.store.upsertReadCursorTx(ctx, tx, *carriers.readCursor); err != nil {
 			return OutboxItem{}, "", err
 		}
 	}
@@ -397,27 +536,120 @@ func (r *OutboxRepository) insertOutboxAttachment(
 	return nil
 }
 
+func (r *OutboxRepository) insertOutboxReaction(
+	ctx context.Context,
+	tx *sql.Tx,
+	outboxID string,
+	reaction OutboxReaction,
+	nowMS int64,
+) error {
+	_, err := tx.ExecContext(ctx, `
+		INSERT INTO outbox_reactions (
+			outbox_id,
+			target_message_id,
+			emoji,
+			action,
+			created_at_ms
+		) VALUES (?, ?, ?, ?, ?)
+	`,
+		outboxID,
+		reaction.TargetMessageID,
+		reaction.Emoji,
+		reaction.Action,
+		nowMS,
+	)
+	if err != nil {
+		return fmt.Errorf(
+			"enqueue outbox reaction for outbox item %q: %w",
+			outboxID,
+			mapConstraintError(err),
+		)
+	}
+	return nil
+}
+
+func (r *OutboxRepository) insertOutboxReadReceipt(
+	ctx context.Context,
+	tx *sql.Tx,
+	outboxID string,
+	receipt OutboxReadReceipt,
+	nowMS int64,
+) error {
+	_, err := tx.ExecContext(ctx, `
+		INSERT INTO outbox_read_receipts (
+			outbox_id,
+			device_id,
+			last_read_message_id,
+			read_at_ms,
+			created_at_ms
+		) VALUES (?, ?, ?, ?, ?)
+	`,
+		outboxID,
+		receipt.DeviceID,
+		receipt.LastReadMessageID,
+		receipt.ReadAtMS,
+		nowMS,
+	)
+	if err != nil {
+		return fmt.Errorf(
+			"enqueue outbox read receipt for outbox item %q: %w",
+			outboxID,
+			mapConstraintError(err),
+		)
+	}
+	return nil
+}
+
 func validateOutboxAttachmentPair(
 	item NewOutboxItem,
-	attachment *OutboxAttachment,
+	carriers enqueueCarriers,
 ) error {
-	if item.Kind == OutboxKindMedia && attachment == nil {
-		return fmt.Errorf("media kind requires an attachment")
+	switch item.Kind {
+	case OutboxKindMedia:
+		if carriers.attachment == nil {
+			return fmt.Errorf("media kind requires an attachment")
+		}
+		if carriers.reaction != nil || carriers.readReceipt != nil || carriers.readCursor != nil {
+			return fmt.Errorf("media kind accepts only an attachment carrier")
+		}
+	case OutboxKindReaction:
+		if carriers.reaction == nil {
+			return fmt.Errorf("reaction kind requires a reaction carrier")
+		}
+		if carriers.attachment != nil || carriers.readReceipt != nil || carriers.readCursor != nil {
+			return fmt.Errorf("reaction kind accepts only a reaction carrier")
+		}
+	case OutboxKindRead:
+		if carriers.readReceipt == nil {
+			return fmt.Errorf("read kind requires a read-receipt carrier")
+		}
+		if carriers.readCursor == nil {
+			return fmt.Errorf("read kind requires a read cursor")
+		}
+		if carriers.attachment != nil || carriers.reaction != nil {
+			return fmt.Errorf("read kind accepts only a read-receipt carrier")
+		}
+	default:
+		if carriers.attachment != nil {
+			return fmt.Errorf("kind %q does not accept an attachment", item.Kind)
+		}
+		if carriers.reaction != nil {
+			return fmt.Errorf("kind %q does not accept a reaction carrier", item.Kind)
+		}
+		if carriers.readReceipt != nil || carriers.readCursor != nil {
+			return fmt.Errorf("kind %q does not accept a read-receipt carrier", item.Kind)
+		}
 	}
-	if item.Kind != OutboxKindMedia && attachment != nil {
-		return fmt.Errorf("kind %q does not accept an attachment", item.Kind)
-	}
-	if attachment == nil {
-		return nil
-	}
-	if err := validateBlobHash(attachment.BlobHash); err != nil {
-		return err
-	}
-	if attachment.SizeBytes <= 0 {
-		return fmt.Errorf("outbox attachment size must be positive")
-	}
-	if strings.TrimSpace(attachment.MIME) == "" {
-		return fmt.Errorf("outbox attachment MIME type is empty")
+	if carriers.attachment != nil {
+		if err := validateBlobHash(carriers.attachment.BlobHash); err != nil {
+			return err
+		}
+		if carriers.attachment.SizeBytes <= 0 {
+			return fmt.Errorf("outbox attachment size must be positive")
+		}
+		if strings.TrimSpace(carriers.attachment.MIME) == "" {
+			return fmt.Errorf("outbox attachment MIME type is empty")
+		}
 	}
 	return nil
 }
@@ -444,6 +676,62 @@ func validateExistingOutboxAttachment(
 	if !exists {
 		return fmt.Errorf(
 			"enqueue outgoing media message for existing outbox item %q: attachment is missing",
+			outboxID,
+		)
+	}
+	return nil
+}
+
+func validateExistingOutboxReaction(
+	ctx context.Context,
+	tx *sql.Tx,
+	outboxID string,
+) error {
+	var exists bool
+	if err := tx.QueryRowContext(ctx, `
+		SELECT EXISTS (
+			SELECT 1
+			FROM outbox_reactions
+			WHERE outbox_id = ?
+		)
+	`, outboxID).Scan(&exists); err != nil {
+		return fmt.Errorf(
+			"enqueue reaction for existing outbox item %q: inspect reaction: %w",
+			outboxID,
+			err,
+		)
+	}
+	if !exists {
+		return fmt.Errorf(
+			"enqueue reaction for existing outbox item %q: reaction is missing",
+			outboxID,
+		)
+	}
+	return nil
+}
+
+func validateExistingOutboxReadReceipt(
+	ctx context.Context,
+	tx *sql.Tx,
+	outboxID string,
+) error {
+	var exists bool
+	if err := tx.QueryRowContext(ctx, `
+		SELECT EXISTS (
+			SELECT 1
+			FROM outbox_read_receipts
+			WHERE outbox_id = ?
+		)
+	`, outboxID).Scan(&exists); err != nil {
+		return fmt.Errorf(
+			"enqueue read receipt for existing outbox item %q: inspect receipt: %w",
+			outboxID,
+			err,
+		)
+	}
+	if !exists {
+		return fmt.Errorf(
+			"enqueue read receipt for existing outbox item %q: receipt is missing",
 			outboxID,
 		)
 	}
@@ -941,6 +1229,39 @@ func (r *OutboxRepository) Reject(
 		return fmt.Errorf("reject outbox item %q: %w", outboxID, err)
 	}
 	return r.requireLeaseMutation(ctx, "reject", outboxID, result)
+}
+
+// ConfirmWithoutResult terminally confirms an active called lease whose
+// operation yields no remote result identity.
+func (r *OutboxRepository) ConfirmWithoutResult(
+	ctx context.Context,
+	outboxID, leaseToken string,
+) error {
+	nowMS, err := r.nowMS("confirm outbox item without result")
+	if err != nil {
+		return err
+	}
+	result, err := r.store.db.ExecContext(ctx, `
+		UPDATE outbox
+		SET state = 'confirmed',
+			error_class = NULL,
+			error_code = NULL,
+			error_detail = NULL,
+			next_attempt_at_ms = NULL,
+			lease_owner = NULL,
+			lease_token = NULL,
+			lease_expires_at_ms = NULL,
+			transport_called_at_ms = NULL,
+			updated_at_ms = ?
+		WHERE outbox_id = ?
+		  AND state = 'dispatching'
+		  AND lease_token = ?
+		  AND transport_called_at_ms IS NOT NULL
+	`, nowMS, outboxID, leaseToken)
+	if err != nil {
+		return fmt.Errorf("confirm outbox item %q without result: %w", outboxID, err)
+	}
+	return r.requireLeaseMutation(ctx, "confirm without result", outboxID, result)
 }
 
 // Confirm atomically records a known remote result for the active called
