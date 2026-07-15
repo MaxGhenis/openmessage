@@ -1,0 +1,981 @@
+/* ==========================================================================
+   OpenMessage — marketing site (v2 relaunch draft)
+   Design system: cool-paper neutral + a settled-green state legend.
+   Color is never decoration — a saturated hue means a real machine state.
+   Type is a human/machine duality: grotesque for people, mono for facts.
+   ========================================================================== */
+
+/* --- Tokens: light (default) -------------------------------------------- */
+:root {
+  --paper: #f3f5f4;
+  --surface: #ffffff;
+  --surface-sunk: #eef1ef;
+  --ink: #14181a;
+  --ink-soft: #3d4744;
+  --muted: #6a7671;
+  --line: #e2e6e3;
+  --line-strong: #d2d7d3;
+
+  /* State legend — the only saturated colors on the page. */
+  --confirmed: #0e7a55; /* settled green: confirmed / connected / trusted */
+  --confirmed-ink: #ffffff; /* text on a confirmed fill */
+  --confirmed-wash: rgba(14, 122, 85, 0.1);
+  --held: #9a6412; /* amber: the honest "might have" / parked */
+  --held-wash: rgba(154, 100, 18, 0.12);
+
+  --node-face: var(--surface);
+
+  --font-sans: "Hanken Grotesk Variable", system-ui, -apple-system, sans-serif;
+  --font-mono: "JetBrains Mono Variable", ui-monospace, "SF Mono", Menlo, monospace;
+
+  --wrap: 1080px;
+  --gutter: 3rem;
+  --radius: 16px;
+  --radius-sm: 10px;
+
+  --shadow-cta: 0 1px 2px rgba(14, 122, 85, 0.28), 0 12px 30px -14px rgba(14, 122, 85, 0.5);
+  --shadow-lift: 0 1px 0 var(--line), 0 24px 60px -40px rgba(12, 16, 19, 0.4);
+
+  color-scheme: light;
+}
+
+/* --- Tokens: dark -------------------------------------------------------- */
+/* Follow the system when the visitor hasn't chosen, then let an explicit
+   choice win in either direction. */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme]) {
+    --paper: #0c1013;
+    --surface: #121a1e;
+    --surface-sunk: #0f1519;
+    --ink: #e7ece9;
+    --ink-soft: #adb8b3;
+    --muted: #7d8a85;
+    --line: #212b2f;
+    --line-strong: #2f3b3f;
+
+    --confirmed: #40c08e;
+    --confirmed-ink: #05130d;
+    --confirmed-wash: rgba(64, 192, 142, 0.12);
+    --held: #e0a64b;
+    --held-wash: rgba(224, 166, 75, 0.14);
+
+    --node-face: #0c1013;
+
+    --shadow-cta: 0 1px 2px rgba(0, 0, 0, 0.4), 0 14px 34px -16px rgba(64, 192, 142, 0.45);
+    --shadow-lift: 0 0 0 1px var(--line), 0 30px 70px -46px rgba(0, 0, 0, 0.8);
+
+    color-scheme: dark;
+  }
+}
+
+:root[data-theme="dark"] {
+  --paper: #0c1013;
+  --surface: #121a1e;
+  --surface-sunk: #0f1519;
+  --ink: #e7ece9;
+  --ink-soft: #adb8b3;
+  --muted: #7d8a85;
+  --line: #212b2f;
+  --line-strong: #2f3b3f;
+
+  --confirmed: #40c08e;
+  --confirmed-ink: #05130d;
+  --confirmed-wash: rgba(64, 192, 142, 0.12);
+  --held: #e0a64b;
+  --held-wash: rgba(224, 166, 75, 0.14);
+
+  --node-face: #0c1013;
+
+  --shadow-cta: 0 1px 2px rgba(0, 0, 0, 0.4), 0 14px 34px -16px rgba(64, 192, 142, 0.45);
+  --shadow-lift: 0 0 0 1px var(--line), 0 30px 70px -46px rgba(0, 0, 0, 0.8);
+
+  color-scheme: dark;
+}
+
+/* --- Reset / base -------------------------------------------------------- */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  scroll-behavior: smooth;
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--font-sans);
+  font-size: 1.0625rem;
+  line-height: 1.65;
+  font-weight: 420;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+  font-synthesis: none;
+  overflow-x: clip; /* never let a wide child scroll the page sideways */
+}
+
+h1,
+h2,
+h3 {
+  margin: 0;
+  font-weight: 680;
+  letter-spacing: -0.02em;
+  line-height: 1.05;
+  text-wrap: balance;
+}
+
+p {
+  margin: 0;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+svg {
+  display: block;
+}
+
+::selection {
+  background: var(--confirmed-wash);
+  color: var(--ink);
+}
+
+:focus-visible {
+  outline: 2px solid var(--confirmed);
+  outline-offset: 3px;
+  border-radius: 4px;
+}
+
+/* --- Layout -------------------------------------------------------------- */
+.wrap {
+  width: min(100% - (2 * var(--gutter)), var(--wrap));
+  margin-inline: auto;
+}
+
+.measure {
+  max-width: 62ch;
+}
+
+/* --- Header -------------------------------------------------------------- */
+.masthead {
+  position: sticky;
+  top: 0;
+  z-index: 50;
+  background: color-mix(in srgb, var(--paper) 82%, transparent);
+  -webkit-backdrop-filter: saturate(1.4) blur(14px);
+  backdrop-filter: saturate(1.4) blur(14px);
+  border-bottom: 1px solid transparent;
+  transition: border-color 0.25s ease, background 0.25s ease;
+}
+
+.masthead.is-stuck {
+  border-bottom-color: var(--line);
+}
+
+.masthead__inner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  height: 68px;
+}
+
+/* Wordmark: a status dot (the confirmed light) + the name. The mark IS the
+   thesis — a system whose whole point is honest status. */
+.wordmark {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.6rem;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  font-size: 1.06rem;
+  color: var(--ink);
+}
+
+.wordmark__dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--confirmed);
+  box-shadow: 0 0 0 4px var(--confirmed-wash);
+  flex: none;
+}
+
+.nav {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.nav__link {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.5rem 0.75rem;
+  border-radius: var(--radius-sm);
+  color: var(--ink-soft);
+  font-size: 0.94rem;
+  font-weight: 500;
+  transition: color 0.2s ease, background 0.2s ease;
+}
+
+.nav__link:hover {
+  color: var(--ink);
+  background: var(--surface-sunk);
+}
+
+.nav__link svg {
+  width: 18px;
+  height: 18px;
+}
+
+.icon-btn {
+  display: inline-grid;
+  place-items: center;
+  width: 40px;
+  height: 40px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--ink-soft);
+  cursor: pointer;
+  transition: color 0.2s ease, border-color 0.2s ease, background 0.2s ease;
+}
+
+.icon-btn:hover {
+  color: var(--ink);
+  border-color: var(--line-strong);
+}
+
+.icon-btn svg {
+  width: 18px;
+  height: 18px;
+}
+
+.icon-btn .sun {
+  display: none;
+}
+
+:root[data-theme="dark"] .icon-btn .sun {
+  display: block;
+}
+
+:root[data-theme="dark"] .icon-btn .moon {
+  display: none;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme]) .icon-btn .sun {
+    display: block;
+  }
+  :root:not([data-theme]) .icon-btn .moon {
+    display: none;
+  }
+}
+
+/* --- Buttons / links ----------------------------------------------------- */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.6rem;
+  padding: 0.85rem 1.35rem;
+  border-radius: var(--radius-sm);
+  font-weight: 600;
+  font-size: 1rem;
+  letter-spacing: -0.01em;
+  cursor: pointer;
+  border: 1px solid transparent;
+  transition: transform 0.18s ease, box-shadow 0.2s ease, background 0.2s ease,
+    border-color 0.2s ease, color 0.2s ease;
+}
+
+.btn svg {
+  width: 18px;
+  height: 18px;
+}
+
+/* Primary CTA is the confirmed color: getting the app is the settled,
+   trustworthy state. */
+.btn--primary {
+  background: var(--confirmed);
+  color: var(--confirmed-ink);
+  box-shadow: var(--shadow-cta);
+}
+
+.btn--primary:hover {
+  transform: translateY(-1px);
+}
+
+.btn--ghost {
+  background: transparent;
+  color: var(--ink);
+  border-color: var(--line-strong);
+}
+
+.btn--ghost:hover {
+  background: var(--surface);
+  border-color: var(--muted);
+}
+
+.textlink {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  color: var(--ink-soft);
+  font-weight: 500;
+  transition: color 0.2s ease, gap 0.2s ease;
+}
+
+.textlink svg {
+  width: 17px;
+  height: 17px;
+}
+
+.textlink .arrow {
+  transition: transform 0.2s ease;
+}
+
+.textlink:hover {
+  color: var(--ink);
+}
+
+.textlink:hover .arrow {
+  transform: translateX(3px);
+}
+
+/* --- Skip link ----------------------------------------------------------- */
+.skip:focus {
+  left: 1rem !important;
+  top: 1rem;
+  z-index: 100;
+  width: auto;
+  padding: 0.6rem 1rem;
+  background: var(--confirmed);
+  color: var(--confirmed-ink);
+  border-radius: var(--radius-sm);
+  font-weight: 600;
+}
+
+/* --- Mono treatments (machine voice) ------------------------------------ */
+.mono {
+  font-family: var(--font-mono);
+  font-feature-settings: "ss01", "cv01";
+}
+
+/* "Send again" is a real control the copy names — set it as one. */
+.ctrl {
+  padding: 0.08em 0.42em;
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  background: var(--surface);
+  font-size: 0.9em;
+  color: var(--ink);
+  white-space: nowrap;
+}
+
+/* A machine-state chip: a real state name in the machine's own voice. */
+.state {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  padding: 0.16rem 0.55rem 0.16rem 0.5rem;
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  background: var(--surface);
+  font-family: var(--font-mono);
+  font-size: 0.82em;
+  font-weight: 500;
+  letter-spacing: -0.01em;
+  color: var(--ink-soft);
+  white-space: nowrap;
+}
+
+.state::before {
+  content: "";
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  border: 1.5px solid var(--muted);
+  flex: none;
+}
+
+.state--confirmed {
+  color: var(--confirmed);
+  border-color: color-mix(in srgb, var(--confirmed) 40%, var(--line-strong));
+  background: var(--confirmed-wash);
+}
+
+.state--confirmed::before {
+  background: var(--confirmed);
+  border-color: var(--confirmed);
+}
+
+.state--held {
+  color: var(--held);
+  border-color: color-mix(in srgb, var(--held) 42%, var(--line-strong));
+  background: var(--held-wash);
+}
+
+.state--held::before {
+  background: var(--held);
+  border-color: var(--held);
+}
+
+/* --- Hero ---------------------------------------------------------------- */
+.hero {
+  padding-top: clamp(2.5rem, 6.5vw, 5rem);
+  padding-bottom: clamp(3.5rem, 8vw, 6rem);
+}
+
+.hero__title {
+  font-size: clamp(2.9rem, 8.4vw, 5.6rem);
+  line-height: 0.98;
+  letter-spacing: -0.035em;
+  font-weight: 700;
+}
+
+.hero__title .line {
+  display: block;
+}
+
+/* The third clause is the point — quietly emphasized by the confirmed color,
+   because "Yours" is the settled state the whole product delivers. */
+.hero__title .yours {
+  color: var(--confirmed);
+}
+
+.hero__sub {
+  margin-top: 1.6rem;
+  max-width: 46ch;
+  font-size: clamp(1.1rem, 1.7vw, 1.32rem);
+  line-height: 1.5;
+  font-weight: 440;
+  color: var(--ink-soft);
+}
+
+.hero__sub .nowrap {
+  white-space: nowrap;
+}
+
+.hero__cta {
+  margin-top: 2rem;
+  display: flex;
+  align-items: center;
+  gap: 1.4rem;
+  flex-wrap: wrap;
+}
+
+.hero__meta {
+  margin-top: 1rem;
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+/* --- The send rail (the signature) --------------------------------------
+   A message advancing through the real outbox states. Bare on the page, not
+   framed — the motif is woven into the fabric, per the brief. It reveals once
+   on load; reduced-motion shows the resolved (confirmed) state statically. */
+.rail {
+  margin-top: clamp(2.25rem, 5vw, 3.5rem);
+  padding-top: 1.75rem;
+  border-top: 1px solid var(--line);
+}
+
+.rail__track {
+  position: relative;
+  height: 12px;
+}
+
+.rail__line,
+.rail__fill {
+  position: absolute;
+  top: 50%;
+  height: 1.5px;
+  transform: translateY(-50%);
+  border-radius: 2px;
+}
+
+.rail__line {
+  left: 0;
+  right: 0;
+  background: var(--line-strong);
+}
+
+.rail__fill {
+  left: 0;
+  width: 100%;
+  background: linear-gradient(90deg, var(--muted), var(--confirmed));
+  transform-origin: left center;
+}
+
+.rail__stops {
+  position: absolute;
+  inset: 0;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.rail__stop {
+  position: relative;
+  display: flex;
+  justify-content: center;
+}
+
+.rail__node {
+  width: 13px;
+  height: 13px;
+  border-radius: 50%;
+  background: var(--node-face);
+  border: 1.5px solid var(--muted);
+  position: relative;
+  z-index: 1;
+}
+
+/* Resolved (default / reduced-motion) state: the message got through. */
+.rail__stop.is-queued .rail__node {
+  background: var(--muted);
+  border-color: var(--muted);
+}
+
+.rail__stop.is-sent .rail__node {
+  background: var(--ink-soft);
+  border-color: var(--ink-soft);
+}
+
+.rail__stop.is-confirmed .rail__node {
+  background: var(--confirmed);
+  border-color: var(--confirmed);
+  box-shadow: 0 0 0 5px var(--confirmed-wash);
+}
+
+.rail__label {
+  position: absolute;
+  top: calc(100% + 0.7rem);
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  letter-spacing: -0.01em;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.rail__stop.is-confirmed .rail__label {
+  color: var(--confirmed);
+}
+
+.rail__stop:first-child .rail__label {
+  left: 0;
+}
+
+.rail__stop:last-child .rail__label {
+  right: 0;
+}
+
+/* Animated reveal: draw the fill and light the nodes in sequence. */
+.js-motion .rail .rail__fill {
+  transform: scaleX(0);
+  animation: rail-fill 1.7s cubic-bezier(0.65, 0, 0.35, 1) 0.15s forwards;
+}
+
+.js-motion .rail .rail__stop .rail__node {
+  background: var(--node-face);
+  border-color: var(--line-strong);
+  box-shadow: none;
+}
+
+.js-motion .rail .rail__stop.is-queued .rail__node {
+  animation: node-settle 0.5s ease 0.2s forwards;
+  --settle-bg: var(--muted);
+}
+
+.js-motion .rail .rail__stop.is-sent .rail__node {
+  animation: node-settle 0.5s ease 0.85s forwards;
+  --settle-bg: var(--ink-soft);
+}
+
+.js-motion .rail .rail__stop.is-confirmed .rail__node {
+  animation: node-confirm 0.6s ease 1.55s forwards;
+}
+
+.js-motion .rail .rail__label {
+  opacity: 0;
+  animation: label-in 0.4s ease forwards;
+}
+
+.js-motion .rail .rail__stop.is-queued .rail__label {
+  animation-delay: 0.25s;
+}
+.js-motion .rail .rail__stop.is-sent .rail__label {
+  animation-delay: 0.9s;
+}
+.js-motion .rail .rail__stop.is-confirmed .rail__label {
+  animation-delay: 1.6s;
+}
+
+@keyframes rail-fill {
+  to {
+    transform: scaleX(1);
+  }
+}
+
+@keyframes node-settle {
+  to {
+    background: var(--settle-bg);
+    border-color: var(--settle-bg);
+  }
+}
+
+@keyframes node-confirm {
+  0% {
+    background: var(--node-face);
+    border-color: var(--line-strong);
+    box-shadow: 0 0 0 0 var(--confirmed-wash);
+  }
+  60% {
+    box-shadow: 0 0 0 9px transparent;
+  }
+  to {
+    background: var(--confirmed);
+    border-color: var(--confirmed);
+    box-shadow: 0 0 0 5px var(--confirmed-wash);
+  }
+}
+
+@keyframes label-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* --- Features (the spine) ------------------------------------------------
+   Four properties threaded onto one vertical line — the hero rail turned to
+   run down the page ("one place"). Each mono eyebrow names the REAL subsystem
+   that makes the promise true: outbox, supervisor, sqlite, mcp. */
+.features {
+  padding-block: clamp(2rem, 5vw, 3.5rem);
+}
+
+.feature {
+  display: grid;
+  grid-template-columns: 190px minmax(0, 1fr);
+  gap: 1.5rem;
+  padding-block: clamp(2.75rem, 5.5vw, 4.25rem);
+}
+
+.feature + .feature {
+  border-top: 1px solid var(--line);
+}
+
+.feature__marker {
+  position: relative;
+  padding-left: 1.75rem;
+}
+
+/* The spine line: each marker draws a full-height 1px line at the node's x,
+   so consecutive markers join into one continuous thread. */
+.feature__marker::before {
+  content: "";
+  position: absolute;
+  left: 5px;
+  top: calc(-1 * clamp(2.75rem, 5.5vw, 4.25rem) - 1px);
+  bottom: calc(-1 * clamp(2.75rem, 5.5vw, 4.25rem));
+  width: 1.5px;
+  background: var(--line);
+}
+
+.feature:first-child .feature__marker::before {
+  top: 0.55rem;
+}
+
+.feature:last-child .feature__marker::before {
+  bottom: auto;
+  height: 0.55rem;
+}
+
+.feature__node {
+  position: absolute;
+  left: 0;
+  top: 0.35rem;
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+  background: var(--node-face);
+  border: 1.5px solid var(--muted);
+  z-index: 1;
+}
+
+.feature__tag {
+  font-family: var(--font-mono);
+  font-size: 0.86rem;
+  color: var(--muted);
+  letter-spacing: -0.01em;
+}
+
+.feature__body {
+  min-width: 0; /* allow the grid cell to shrink so the artifact can scroll */
+  max-width: 60ch;
+}
+
+.feature__title {
+  font-size: clamp(1.6rem, 3.1vw, 2.35rem);
+  letter-spacing: -0.025em;
+  font-weight: 660;
+}
+
+.feature__text {
+  margin-top: 1.1rem;
+  color: var(--ink-soft);
+  font-size: 1.08rem;
+  line-height: 1.62;
+}
+
+/* The two clipped sentences at the end of the trust copy, given weight. */
+.feature__text .clincher {
+  color: var(--ink);
+  font-weight: 560;
+}
+
+/* Inline machine-states quoted by the copy itself. */
+.chips {
+  margin-top: 1.5rem;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.55rem;
+  align-items: center;
+}
+
+.chips__label {
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  color: var(--muted);
+  margin-right: 0.15rem;
+}
+
+/* A pending line the copy owner still owes — clearly marked as draft, never
+   mistakable for finished copy. */
+.pending {
+  margin-top: 1.5rem;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.5rem 0.8rem;
+  border: 1px dashed var(--line-strong);
+  border-radius: var(--radius-sm);
+  font-family: var(--font-mono);
+  font-size: 0.82rem;
+  color: var(--muted);
+  background: var(--surface-sunk);
+}
+
+.pending::before {
+  content: "//";
+  color: var(--held);
+  font-weight: 600;
+}
+
+/* The concrete artifact for "local-first": the actual file on your machine. */
+.artifact {
+  margin-top: 1.5rem;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.7rem;
+  padding: 0.6rem 0.85rem;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  box-shadow: var(--shadow-lift);
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+  color: var(--ink-soft);
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+.artifact__key {
+  color: var(--muted);
+}
+
+.artifact__path {
+  color: var(--ink);
+  white-space: nowrap;
+}
+
+.artifact__path .file {
+  color: var(--confirmed);
+}
+
+/* --- Closing band -------------------------------------------------------- */
+.closer {
+  margin-block: clamp(1rem, 4vw, 2rem) clamp(4rem, 8vw, 6.5rem);
+}
+
+.closer__inner {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+  box-shadow: var(--shadow-lift);
+  padding: clamp(2.25rem, 5vw, 3.5rem);
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1.75rem;
+}
+
+.closer__title {
+  font-size: clamp(1.5rem, 3vw, 2.1rem);
+  letter-spacing: -0.025em;
+  max-width: 20ch;
+}
+
+.closer__title .yours {
+  color: var(--confirmed);
+}
+
+.closer__actions {
+  display: flex;
+  align-items: center;
+  gap: 1.3rem;
+  flex-wrap: wrap;
+}
+
+/* --- Footer -------------------------------------------------------------- */
+.foot {
+  border-top: 1px solid var(--line);
+  padding-block: 2.5rem 3.5rem;
+}
+
+.foot__inner {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1.25rem;
+}
+
+.foot__links {
+  display: flex;
+  align-items: center;
+  gap: 1.5rem;
+}
+
+.foot__links a {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  color: var(--muted);
+  font-size: 0.94rem;
+  transition: color 0.2s ease;
+}
+
+.foot__links a:hover {
+  color: var(--ink);
+}
+
+.foot__links svg {
+  width: 17px;
+  height: 17px;
+}
+
+.foot__note {
+  color: var(--muted);
+  font-size: 0.86rem;
+}
+
+/* --- Scroll reveal ------------------------------------------------------
+   Content is visible by default; only hidden-then-revealed when motion is
+   allowed (js-motion is set pre-paint). No JS / reduced motion => visible. */
+.js-motion .reveal {
+  opacity: 0;
+  transform: translateY(16px);
+  transition: opacity 0.7s ease, transform 0.7s ease;
+}
+
+.js-motion .reveal.is-in {
+  opacity: 1;
+  transform: none;
+}
+
+/* --- Responsive ---------------------------------------------------------- */
+@media (max-width: 760px) {
+  :root {
+    --gutter: 1.4rem;
+  }
+
+  .feature {
+    grid-template-columns: 1fr;
+    gap: 0.9rem;
+  }
+
+  /* Collapse the spine on mobile: marker becomes an inline row above the copy. */
+  .feature__marker {
+    padding-left: 0;
+    display: flex;
+    align-items: center;
+    gap: 0.65rem;
+  }
+
+  .feature__marker::before {
+    display: none;
+  }
+
+  .feature__node {
+    position: static;
+    top: 0;
+  }
+
+  .nav__link--github span {
+    display: none;
+  }
+
+  .closer__inner {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+}
+
+@media (max-width: 420px) {
+  .hero__cta {
+    gap: 1rem;
+  }
+  .btn {
+    width: 100%;
+  }
+  .hero__cta .textlink {
+    margin-inline: auto;
+  }
+}
+
+/* --- Reduced motion ------------------------------------------------------ */
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+  .reveal {
+    opacity: 1;
+    transform: none;
+  }
+}

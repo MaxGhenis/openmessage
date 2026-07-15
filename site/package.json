@@ -1,20 +1,17 @@
 {
   "name": "openmessage-site",
   "private": true,
+  "type": "module",
   "scripts": {
-    "dev": "next dev",
-    "build": "next build",
-    "start": "next start"
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview --port 4180"
   },
   "dependencies": {
-    "@vercel/blob": "^2.3.3",
-    "next": "16.2.2",
-    "react": "19.2.4",
-    "react-dom": "19.2.4"
+    "@fontsource-variable/hanken-grotesk": "^5.2.5",
+    "@fontsource-variable/jetbrains-mono": "^5.2.5"
   },
   "devDependencies": {
-    "@tailwindcss/postcss": "4.2.2",
-    "postcss": "8.5.8",
-    "tailwindcss": "4.2.2"
+    "vite": "^6.3.5"
   }
 }

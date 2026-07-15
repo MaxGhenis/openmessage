@@ -1,0 +1,10 @@
+<svg width="512" height="512" viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="OpenMessage">
+  <rect width="512" height="512" rx="116" fill="#0c1013"/>
+  <rect x="3" y="3" width="506" height="506" rx="113" fill="none" stroke="#2f3b3f" stroke-width="6"/>
+  <!-- The send rail: queued -> sent -> confirmed. The mark is the thesis. -->
+  <line x1="150" y1="256" x2="358" y2="256" stroke="#4a565b" stroke-width="13" stroke-linecap="round"/>
+  <circle cx="150" cy="256" r="19" fill="#0c1013" stroke="#7d8a85" stroke-width="13"/>
+  <circle cx="254" cy="256" r="22" fill="#aeb8b4"/>
+  <circle cx="362" cy="256" r="72" fill="#40c08e" fill-opacity="0.16"/>
+  <circle cx="362" cy="256" r="46" fill="#40c08e"/>
+</svg>
