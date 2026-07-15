@@ -4,7 +4,9 @@
 package signal
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -12,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/maxghenis/openmessage/internal/bridge"
 	"github.com/maxghenis/openmessage/internal/signallive"
@@ -22,10 +25,31 @@ type poller interface {
 	SendTextRequest(string, string, string) (int64, error)
 	SendReactionRequest(string, string, string, string, string) error
 	SendMediaRequest(string, io.Reader, int64, string, string, string, string) (int64, error)
+	DownloadMediaRef(string, string, string, string, string, bool) ([]byte, string, error)
 	Status() signallive.StatusSnapshot
 	ApplyPollerFailure(signallive.PollerExit)
 	InputFingerprint() string
 	UnpairContext(context.Context) error
+}
+
+// signalDownloadOpaqueV1 is the Signal-owned Wave-4 -> M4b wire contract.
+// The Wave-4 Signal decoder MUST pack conversation_id for every remote
+// attachment: getAttachment needs a recipient or group target, while
+// bridge.MediaDownloader intentionally carries no conversation argument.
+// No v2 decoder writes remote_ref yet, so this adapter is unit-testable but the
+// production path remains inert until Wave-4 ingest starts packing this shape.
+type signalDownloadOpaqueV1 struct {
+	Version        int    `json:"v"`
+	Kind           string `json:"kind"`
+	AttachmentID   string `json:"att_id"`
+	Path           string `json:"path"`
+	ConversationID string `json:"conversation_id"`
+}
+
+type decodedSignalDownloadRef struct {
+	payload signalDownloadOpaqueV1
+	target  string
+	isGroup bool
 }
 
 // Adapter owns Signal connection generations while retaining signallive's
@@ -244,6 +268,169 @@ func (a *Adapter) SendMedia(
 		RemoteMessageID: strconv.FormatInt(timestampMS, 10),
 		EchoExpected:    false,
 	}, nil
+}
+
+// DownloadMedia adapts Signal's retained fully-buffered attachment downloader
+// to bridge.MediaStream. This forfeits true streaming, matching the retained
+// signal-cli boundary until a future transport exposes a streaming response.
+func (a *Adapter) DownloadMedia(
+	ctx context.Context,
+	accountID string,
+	ref bridge.MediaRef,
+) (bridge.MediaStream, error) {
+	_ = accountID // Logical registry ID; the ready status owns the Signal account.
+	if ctx == nil {
+		return bridge.MediaStream{}, bridge.OpError{
+			Class:       bridge.FailureTransient,
+			Operation:   "download_media",
+			Fingerprint: "signal_download_media_context_missing",
+			Cause:       errors.New("Signal media download context is nil"),
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return bridge.MediaStream{}, bridge.OpError{
+			Class:       bridge.FailureTransient,
+			Operation:   "download_media",
+			Fingerprint: "signal_download_media_context_done",
+			Cause:       err,
+		}
+	}
+	if a == nil || a.poller == nil {
+		return bridge.MediaStream{}, signalDownloadNotConnectedError()
+	}
+	status := a.poller.Status()
+	account := strings.TrimSpace(status.Account)
+	if !status.Connected || account == "" {
+		return bridge.MediaStream{}, signalDownloadNotConnectedError()
+	}
+
+	decoded, err := decodeSignalDownloadOpaque(ref.Opaque)
+	if err != nil {
+		return bridge.MediaStream{}, err
+	}
+	data, transportMIME, err := a.poller.DownloadMediaRef(
+		account,
+		decoded.payload.Kind,
+		decoded.payload.AttachmentID,
+		decoded.payload.Path,
+		decoded.target,
+		decoded.isGroup,
+	)
+	if err != nil {
+		// Preserve C6: ReportError only acts on unambiguous local-account
+		// CommandErrors and never widens recipient/network failures into receive
+		// lifecycle transitions.
+		a.ReportError(err)
+		return bridge.MediaStream{}, bridge.OpError{
+			Class:       bridge.FailureTransient,
+			Operation:   "download_media",
+			Fingerprint: "signal_download_media_failed",
+			Cause:       err,
+		}
+	}
+
+	return bridge.MediaStream{
+		ReadCloser: io.NopCloser(bytes.NewReader(data)),
+		Size:       int64(len(data)),
+		Filename:   ref.Filename,
+		MIME:       firstNonEmpty(transportMIME, ref.MIME),
+	}, nil
+}
+
+func decodeSignalDownloadOpaque(raw []byte) (decodedSignalDownloadRef, error) {
+	if !utf8.Valid(raw) {
+		return decodedSignalDownloadRef{}, signalDownloadOpaqueError(
+			"signal_download_media_opaque_invalid_utf8",
+			errors.New("Signal media Opaque is not valid UTF-8"),
+		)
+	}
+	var payload signalDownloadOpaqueV1
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return decodedSignalDownloadRef{}, signalDownloadOpaqueError(
+			"signal_download_media_opaque_malformed",
+			fmt.Errorf("decode Signal media Opaque JSON: %w", err),
+		)
+	}
+	if payload.Version != 1 {
+		return decodedSignalDownloadRef{}, signalDownloadOpaqueError(
+			"opaque_version_unsupported",
+			fmt.Errorf("unsupported Signal media Opaque version %d", payload.Version),
+		)
+	}
+	if payload.Kind == "" {
+		return decodedSignalDownloadRef{}, signalDownloadOpaqueError(
+			"signal_download_media_kind_missing",
+			errors.New("Signal media Opaque requires kind"),
+		)
+	}
+
+	switch payload.Kind {
+	case "remote":
+		payload.AttachmentID = strings.TrimSpace(payload.AttachmentID)
+		payload.ConversationID = strings.TrimSpace(payload.ConversationID)
+		if payload.AttachmentID == "" || payload.ConversationID == "" {
+			return decodedSignalDownloadRef{}, signalDownloadOpaqueError(
+				"signal_download_media_remote_missing_field",
+				errors.New("Signal remote media Opaque requires att_id and conversation_id"),
+			)
+		}
+		target, isGroup, err := signallive.ParseConversationTarget(payload.ConversationID)
+		if err != nil {
+			return decodedSignalDownloadRef{}, signalDownloadOpaqueError(
+				"signal_download_media_conversation_invalid",
+				fmt.Errorf("parse Signal media conversation_id: %w", err),
+			)
+		}
+		return decodedSignalDownloadRef{
+			payload: payload,
+			target:  target,
+			isGroup: isGroup,
+		}, nil
+	case "local":
+		if strings.TrimSpace(payload.Path) == "" {
+			return decodedSignalDownloadRef{}, signalDownloadOpaqueError(
+				"signal_download_media_local_missing_field",
+				errors.New("Signal local media Opaque requires path"),
+			)
+		}
+		return decodedSignalDownloadRef{payload: payload}, nil
+	default:
+		return decodedSignalDownloadRef{}, signalDownloadOpaqueError(
+			"signal_download_media_kind_unsupported",
+			fmt.Errorf("unsupported Signal media Opaque kind %q", payload.Kind),
+		)
+	}
+}
+
+// Structural Opaque failures are terminal unsupported errors: retrying the
+// same persisted bytes can never make invalid UTF-8/JSON or missing fields
+// decodable. Each structural category has its own fingerprint; version skew
+// uses the cross-platform opaque_version_unsupported contract.
+func signalDownloadOpaqueError(fingerprint string, cause error) bridge.OpError {
+	return bridge.OpError{
+		Class:       bridge.FailureUnsupported,
+		Operation:   "download_media",
+		Fingerprint: fingerprint,
+		Cause:       cause,
+	}
+}
+
+func signalDownloadNotConnectedError() bridge.OpError {
+	return bridge.OpError{
+		Class:       bridge.FailureTransient,
+		Operation:   "download_media",
+		Fingerprint: "signal_not_connected",
+		Cause:       errors.New("Signal is not connected"),
+	}
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if value = strings.TrimSpace(value); value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func signalNotConnectedError(operation string) bridge.OpError {
@@ -689,5 +876,6 @@ var (
 	_ bridge.TextSender         = (*Adapter)(nil)
 	_ bridge.ReactionSender     = (*Adapter)(nil)
 	_ bridge.MediaSender        = (*Adapter)(nil)
+	_ bridge.MediaDownloader    = (*Adapter)(nil)
 	_ bridge.Run                = (*run)(nil)
 )

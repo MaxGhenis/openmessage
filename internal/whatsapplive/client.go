@@ -150,6 +150,12 @@ type storedMediaRef struct {
 	FileLength    uint64 `json:"file_length,omitempty"`
 }
 
+// StoredMediaRef is an exported alias solely so the lifecycle adapter can
+// pass its platform-owned Opaque fields into DownloadMediaRef. The wire codec
+// remains in bridgeadapters/whatsapp; this type is only the retained transport
+// input that already backed legacy stored-media downloads.
+type StoredMediaRef = storedMediaRef
+
 type Callbacks struct {
 	OnConversationsChange func()
 	OnIncomingMessage     func(*db.Message)
@@ -1670,6 +1676,59 @@ func (b *Bridge) DownloadStoredMedia(msg *db.Message) ([]byte, string, error) {
 		return nil, "", fmt.Errorf("download WhatsApp media: %w", err)
 	}
 	return data, msg.MimeType, nil
+}
+
+// DownloadMediaRef is the store-free counterpart to DownloadStoredMedia. It
+// accepts the ref-shaped fields supplied by the lifecycle adapter and reuses
+// the same remote/local transport helpers without loading a legacy db.Message.
+func (b *Bridge) DownloadMediaRef(kind string, ref storedMediaRef, mediaKeyHex, mime, localRef string) ([]byte, string, error) {
+	switch kind {
+	case "local":
+		return downloadLocalWhatsAppMedia(localRef, mime)
+	case "remote":
+		// Continue below.
+	default:
+		return nil, "", fmt.Errorf("unsupported WhatsApp media ref kind %q", kind)
+	}
+
+	mediaType, err := mediaTypeForMIME(mime)
+	if err != nil {
+		return nil, "", err
+	}
+	mediaKey, err := decodeHexBytes(mediaKeyHex)
+	if err != nil {
+		return nil, "", fmt.Errorf("invalid WhatsApp media key: %w", err)
+	}
+	fileEncSHA256, err := decodeHexBytes(ref.FileEncSHA256)
+	if err != nil {
+		return nil, "", fmt.Errorf("invalid WhatsApp media enc hash: %w", err)
+	}
+	fileSHA256, err := decodeHexBytes(ref.FileSHA256)
+	if err != nil {
+		return nil, "", fmt.Errorf("invalid WhatsApp media hash: %w", err)
+	}
+
+	b.mu.RLock()
+	cli := b.client
+	connected := b.connected
+	b.mu.RUnlock()
+	if cli == nil || !connected || !clientIsConnected(cli) {
+		return nil, "", errors.New("whatsapp live sync is not connected")
+	}
+	if ref.DirectPath == "" {
+		return nil, "", errors.New("whatsapp media is missing a download path")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	// An empty plaintext hash is an intentional legacy-compatible mode. The
+	// adapter preserves that distinction from the versioned Opaque payload.
+	data, err := downloadMediaWithPath(cli, ctx, ref.DirectPath, fileEncSHA256, fileSHA256, mediaKey, mediaType, "", len(fileSHA256) == 0)
+	if err != nil {
+		return nil, "", fmt.Errorf("download WhatsApp media: %w", err)
+	}
+	return data, mime, nil
 }
 
 func downloadLocalWhatsAppMedia(mediaID, currentMIME string) ([]byte, string, error) {

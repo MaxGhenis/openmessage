@@ -1302,6 +1302,10 @@ type fakePoller struct {
 	mediaCalls     []fakeMediaRequest
 	mediaTimestamp int64
 	mediaErr       error
+	downloadCalls  []fakeDownloadRequest
+	downloadData   []byte
+	downloadMIME   string
+	downloadErr    error
 }
 
 type fakeTextRequest struct {
@@ -1326,6 +1330,15 @@ type fakeMediaRequest struct {
 	mime           string
 	caption        string
 	replyToID      string
+}
+
+type fakeDownloadRequest struct {
+	account      string
+	kind         string
+	attachmentID string
+	path         string
+	target       string
+	isGroup      bool
 }
 
 type fakeSignalSendNotDispatchedError struct {
@@ -1476,6 +1489,40 @@ func (p *fakePoller) lastMediaRequest() fakeMediaRequest {
 		return fakeMediaRequest{}
 	}
 	return p.mediaCalls[len(p.mediaCalls)-1]
+}
+
+func (p *fakePoller) DownloadMediaRef(
+	account, kind, attachmentID, path, target string,
+	isGroup bool,
+) ([]byte, string, error) {
+	p.mu.Lock()
+	p.downloadCalls = append(p.downloadCalls, fakeDownloadRequest{
+		account:      account,
+		kind:         kind,
+		attachmentID: attachmentID,
+		path:         path,
+		target:       target,
+		isGroup:      isGroup,
+	})
+	data := append([]byte(nil), p.downloadData...)
+	mimeType, err := p.downloadMIME, p.downloadErr
+	p.mu.Unlock()
+	return data, mimeType, err
+}
+
+func (p *fakePoller) downloadCallCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.downloadCalls)
+}
+
+func (p *fakePoller) lastDownloadRequest() fakeDownloadRequest {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.downloadCalls) == 0 {
+		return fakeDownloadRequest{}
+	}
+	return p.downloadCalls[len(p.downloadCalls)-1]
 }
 
 func (p *fakePoller) ApplyPollerFailure(exit signallive.PollerExit) {
