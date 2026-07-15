@@ -633,9 +633,130 @@ func (s *MessageService) SendAgain(
 	return Submission{}, fmt.Errorf("send again: %w", ErrNotImplemented)
 }
 
-// ObserveTransportEcho is reserved for the M5 reconciliation path.
-func (s *MessageService) ObserveTransportEcho(context.Context, TransportEcho) error {
-	return fmt.Errorf("observe transport echo: %w", ErrNotImplemented)
+// ObserveTransportEcho correlates an accepted transport result to an existing
+// durable intent. Missing and inapplicable echoes are successful no-ops.
+// ObserveTransportEcho reconciles on the caller's context deliberately (no
+// detached mutation context): echoes are at-least-once and reconciliation is
+// idempotent, so a canceled write is simply replayed by the next delivery —
+// unlike dispatch finalization, where losing the write loses real state.
+func (s *MessageService) ObserveTransportEcho(ctx context.Context, echo TransportEcho) error {
+	if ctx == nil {
+		return fmt.Errorf("observe transport echo: context is nil")
+	}
+	checks := []struct {
+		name  string
+		value string
+	}{
+		{name: "account ID", value: echo.AccountID},
+		{name: "transport request ID", value: echo.TransportRequestID},
+		{name: "remote message ID", value: echo.RemoteMessageID},
+	}
+	for _, check := range checks {
+		if strings.TrimSpace(check.value) == "" {
+			return fmt.Errorf("%w: %s is empty", ErrInvalidCommand, check.name)
+		}
+	}
+
+	outcome, err := s.outbox.ReconcileConfirm(ctx, sqlite.ReconcileRequest{
+		AccountID:          echo.AccountID,
+		TransportRequestID: echo.TransportRequestID,
+		ResultRemoteID:     echo.RemoteMessageID,
+	})
+	if err != nil {
+		return fmt.Errorf("observe transport echo: %w", err)
+	}
+	switch outcome {
+	case sqlite.ReconcileOutcomeNotFound, sqlite.ReconcileOutcomeNoop:
+		return nil
+	case sqlite.ReconcileOutcomeReconciled, sqlite.ReconcileOutcomeEnriched:
+		s.signalChange()
+		return nil
+	default:
+		return fmt.Errorf("observe transport echo: unexpected reconcile outcome %q", outcome)
+	}
+}
+
+// RepairStoreFailed re-drives local confirmation for a result the transport
+// already accepted. It never sends the intent again.
+func (s *MessageService) RepairStoreFailed(
+	ctx context.Context,
+	outboxID string,
+) (Delivery, error) {
+	if ctx == nil {
+		return Delivery{}, fmt.Errorf("repair store-failed delivery: context is nil")
+	}
+	if strings.TrimSpace(outboxID) == "" {
+		return Delivery{}, fmt.Errorf("repair store-failed delivery: outbox ID is empty")
+	}
+	item, err := s.outbox.FindByID(ctx, outboxID)
+	if err != nil {
+		return Delivery{}, fmt.Errorf("repair store-failed delivery: %w", err)
+	}
+	current := deliveryFromItem(item)
+	if item.State != sqlite.OutboxStoreFailed {
+		return current, fmt.Errorf(
+			"%w: cannot repair outbox item %q from %q",
+			ErrInvalidState,
+			outboxID,
+			item.State,
+		)
+	}
+	if item.ResultRemoteID == nil || strings.TrimSpace(*item.ResultRemoteID) == "" {
+		return current, fmt.Errorf(
+			"repair store-failed delivery %q: persisted remote result ID is missing",
+			outboxID,
+		)
+	}
+
+	if _, err := s.outbox.ReconcileConfirm(ctx, sqlite.ReconcileRequest{
+		AccountID:          item.AccountID,
+		TransportRequestID: item.TransportRequestID,
+		ResultRemoteID:     *item.ResultRemoteID,
+	}); err != nil {
+		return current, fmt.Errorf("repair store-failed delivery %q: %w", outboxID, err)
+	}
+	s.signalChange()
+	return s.Get(ctx, outboxID)
+}
+
+func (s *MessageService) reconcileStoreFailedDue(ctx context.Context, limit int) (int, error) {
+	if ctx == nil {
+		return 0, fmt.Errorf("reconcile store-failed deliveries: context is nil")
+	}
+	if limit <= 0 {
+		return 0, fmt.Errorf("reconcile store-failed deliveries: limit must be positive")
+	}
+	items, err := s.outbox.FindStoreFailedDue(ctx, limit)
+	if err != nil {
+		return 0, fmt.Errorf("find store-failed deliveries: %w", err)
+	}
+
+	reconciled := 0
+	for _, item := range items {
+		if err := ctx.Err(); err != nil {
+			return reconciled, err
+		}
+		if item.ResultRemoteID == nil || strings.TrimSpace(*item.ResultRemoteID) == "" {
+			continue
+		}
+		outcome, err := s.outbox.ReconcileConfirm(ctx, sqlite.ReconcileRequest{
+			AccountID:          item.AccountID,
+			TransportRequestID: item.TransportRequestID,
+			ResultRemoteID:     *item.ResultRemoteID,
+		})
+		if err != nil {
+			// A row that still cannot be repaired remains store_failed for a
+			// later bounded pass or explicit repair.
+			continue
+		}
+		if outcome == sqlite.ReconcileOutcomeReconciled || outcome == sqlite.ReconcileOutcomeEnriched {
+			reconciled++
+		}
+	}
+	if reconciled > 0 {
+		s.signalChange()
+	}
+	return reconciled, nil
 }
 
 func (s *MessageService) newSubmissionIDs() (string, string, string, error) {

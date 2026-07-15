@@ -841,6 +841,526 @@ func TestOutboxConfirmWithoutResultRequiresCalledActiveLease(t *testing.T) {
 	}
 }
 
+func TestOutboxReconcileConfirmMergesCollisionAndPreservesLocalAnchor(t *testing.T) {
+	clock := newOutboxTestClock(outboxTestTimeMS)
+	store, repository := openOutboxTestRepository(t, clock.Now)
+	seedMessageIdentity(t, store, "identity-a", "account-a")
+	seedMessageConversation(t, store, "conversation-a", "account-a")
+	ctx := context.Background()
+
+	item := outboxTestItem("reconcile-collision")
+	mustEnqueueOutgoingOutbox(t, repository, item, "optimistic body")
+	lease := mustLeaseOne(t, repository, LeaseRequest{
+		Owner: "worker", Now: clock.Now(), Duration: time.Minute, Limit: 1,
+	})
+	token := mustLeaseToken(t, lease)
+	if err := repository.MarkTransportCalled(ctx, Attempt{
+		OutboxID: item.OutboxID, LeaseToken: token,
+	}); err != nil {
+		t.Fatalf("MarkTransportCalled(): %v", err)
+	}
+	if err := repository.MarkUncertain(
+		ctx,
+		item.OutboxID,
+		token,
+		"timeout",
+		"deadline",
+		"outcome unknown",
+	); err != nil {
+		t.Fatalf("MarkUncertain(): %v", err)
+	}
+
+	const echoMessageID = "message-echo-duplicate"
+	seedOutboxTestMessage(t, store, echoMessageID, item.AccountID, item.ConversationID)
+	realID := "remote-" + echoMessageID
+
+	dependent := outboxTestReactionItem("reconcile-local-anchor")
+	if _, disposition, err := repository.EnqueueReaction(ctx, dependent, OutboxReaction{
+		TargetMessageID: item.LocalMessageID,
+		Emoji:           "thumbs-up",
+		Action:          "add",
+	}); err != nil {
+		t.Fatalf("EnqueueReaction(dependent): %v", err)
+	} else if disposition != EnqueueInserted {
+		t.Fatalf("EnqueueReaction(dependent) disposition = %q, want %q", disposition, EnqueueInserted)
+	}
+
+	clock.Set(outboxTestTimeMS + 1_000)
+	outcome, err := repository.ReconcileConfirm(ctx, ReconcileRequest{
+		AccountID:          item.AccountID,
+		TransportRequestID: item.TransportRequestID,
+		ResultRemoteID:     realID,
+	})
+	if err != nil {
+		t.Fatalf("ReconcileConfirm(): %v", err)
+	}
+	if outcome != ReconcileOutcome("reconciled") {
+		t.Fatalf("ReconcileConfirm() outcome = %q, want reconciled", outcome)
+	}
+
+	reconciled, err := repository.FindByID(ctx, item.OutboxID)
+	if err != nil {
+		t.Fatalf("FindByID(reconciled): %v", err)
+	}
+	if reconciled.State != OutboxConfirmed || reconciled.ResultRemoteID == nil ||
+		*reconciled.ResultRemoteID != realID || reconciled.ErrorClass != nil ||
+		reconciled.ErrorCode != nil || reconciled.ErrorDetail != nil {
+		t.Fatalf("reconciled row = %+v", reconciled)
+	}
+
+	messages, err := NewMessageRepository(store, clock.Now)
+	if err != nil {
+		t.Fatalf("NewMessageRepository(): %v", err)
+	}
+	survivor, err := messages.GetMessage(ctx, item.LocalMessageID)
+	if err != nil {
+		t.Fatalf("GetMessage(local survivor): %v", err)
+	}
+	if survivor.RemoteMessageID != realID {
+		t.Fatalf("local survivor remote ID = %q, want %q", survivor.RemoteMessageID, realID)
+	}
+	if _, err := messages.GetMessage(ctx, echoMessageID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("GetMessage(echo duplicate) error = %v, want ErrNotFound", err)
+	}
+	carrier, err := repository.GetOutboxReaction(ctx, dependent.OutboxID)
+	if err != nil {
+		t.Fatalf("GetOutboxReaction(dependent): %v", err)
+	}
+	if carrier.TargetMessageID != item.LocalMessageID {
+		t.Fatalf("dependent target = %q, want local survivor %q", carrier.TargetMessageID, item.LocalMessageID)
+	}
+	var survivorID string
+	if err := store.db.QueryRowContext(ctx, `
+		SELECT message_id
+		FROM messages
+		WHERE account_id = ? AND conversation_id = ? AND remote_message_id = ?
+	`, item.AccountID, item.ConversationID, realID).Scan(&survivorID); err != nil {
+		t.Fatalf("read survivor by remote ID: %v", err)
+	}
+	if survivorID != item.LocalMessageID {
+		t.Fatalf("remote-ID survivor = %q, want %q", survivorID, item.LocalMessageID)
+	}
+
+	duplicate, err := repository.ReconcileConfirm(ctx, ReconcileRequest{
+		AccountID:          item.AccountID,
+		TransportRequestID: item.TransportRequestID,
+		ResultRemoteID:     realID,
+	})
+	if err != nil {
+		t.Fatalf("ReconcileConfirm(duplicate): %v", err)
+	}
+	if duplicate != ReconcileOutcome("noop") {
+		t.Fatalf("ReconcileConfirm(duplicate) outcome = %q, want noop", duplicate)
+	}
+	foreign, err := repository.ReconcileConfirm(ctx, ReconcileRequest{
+		AccountID:          item.AccountID,
+		TransportRequestID: item.TransportRequestID,
+		ResultRemoteID:     "remote-foreign",
+	})
+	if err != nil {
+		t.Fatalf("ReconcileConfirm(foreign): %v", err)
+	}
+	if foreign != ReconcileOutcome("noop") {
+		t.Fatalf("ReconcileConfirm(foreign) outcome = %q, want noop", foreign)
+	}
+	unchanged, err := messages.GetMessage(ctx, item.LocalMessageID)
+	if err != nil {
+		t.Fatalf("GetMessage(after foreign echo): %v", err)
+	}
+	if unchanged.RemoteMessageID != realID {
+		t.Fatalf("message remote ID after foreign echo = %q, want %q", unchanged.RemoteMessageID, realID)
+	}
+}
+
+func TestOutboxReconcileConfirmEnrichesPlaceholderAndLeavesDispatchOwnerInCharge(t *testing.T) {
+	clock := newOutboxTestClock(outboxTestTimeMS)
+	store, repository := openOutboxTestRepository(t, clock.Now)
+	seedMessageIdentity(t, store, "identity-a", "account-a")
+	seedMessageConversation(t, store, "conversation-a", "account-a")
+	ctx := context.Background()
+
+	provisional := outboxTestItem("reconcile-enrich")
+	mustEnqueueOutgoingOutbox(t, repository, provisional, "provisional body")
+	lease := mustLeaseOne(t, repository, LeaseRequest{
+		Owner: "worker", Now: clock.Now(), Duration: time.Minute, Limit: 1,
+	})
+	token := mustLeaseToken(t, lease)
+	if err := repository.MarkTransportCalled(ctx, Attempt{
+		OutboxID: provisional.OutboxID, LeaseToken: token,
+	}); err != nil {
+		t.Fatalf("MarkTransportCalled(provisional): %v", err)
+	}
+	if err := repository.Confirm(ctx, Confirmation{
+		OutboxID:       provisional.OutboxID,
+		LeaseToken:     token,
+		ResultRemoteID: provisional.TransportRequestID,
+	}); err != nil {
+		t.Fatalf("Confirm(provisional): %v", err)
+	}
+
+	const permanentID = "remote-permanent"
+	outcome, err := repository.ReconcileConfirm(ctx, ReconcileRequest{
+		AccountID:          provisional.AccountID,
+		TransportRequestID: provisional.TransportRequestID,
+		ResultRemoteID:     permanentID,
+	})
+	if err != nil {
+		t.Fatalf("ReconcileConfirm(enrich): %v", err)
+	}
+	if outcome != ReconcileOutcome("enriched") {
+		t.Fatalf("ReconcileConfirm(enrich) outcome = %q, want enriched", outcome)
+	}
+	confirmed, err := repository.FindByID(ctx, provisional.OutboxID)
+	if err != nil {
+		t.Fatalf("FindByID(enriched): %v", err)
+	}
+	if confirmed.State != OutboxConfirmed || confirmed.ResultRemoteID == nil ||
+		*confirmed.ResultRemoteID != permanentID {
+		t.Fatalf("enriched row = %+v", confirmed)
+	}
+	messages, err := NewMessageRepository(store, clock.Now)
+	if err != nil {
+		t.Fatalf("NewMessageRepository(): %v", err)
+	}
+	enrichedMessage, err := messages.GetMessage(ctx, provisional.LocalMessageID)
+	if err != nil {
+		t.Fatalf("GetMessage(enriched): %v", err)
+	}
+	if enrichedMessage.RemoteMessageID != permanentID {
+		t.Fatalf("enriched message remote ID = %q, want %q", enrichedMessage.RemoteMessageID, permanentID)
+	}
+
+	racing := outboxTestItem("reconcile-dispatching")
+	mustEnqueueOutgoingOutbox(t, repository, racing, "racing body")
+	lease = mustLeaseOne(t, repository, LeaseRequest{
+		Owner: "lease-owner", Now: clock.Now(), Duration: time.Minute, Limit: 1,
+	})
+	token = mustLeaseToken(t, lease)
+	if err := repository.MarkTransportCalled(ctx, Attempt{
+		OutboxID: racing.OutboxID, LeaseToken: token,
+	}); err != nil {
+		t.Fatalf("MarkTransportCalled(racing): %v", err)
+	}
+	racedOutcome, err := repository.ReconcileConfirm(ctx, ReconcileRequest{
+		AccountID:          racing.AccountID,
+		TransportRequestID: racing.TransportRequestID,
+		ResultRemoteID:     "remote-racing",
+	})
+	if err != nil {
+		t.Fatalf("ReconcileConfirm(dispatching): %v", err)
+	}
+	if racedOutcome != ReconcileOutcome("noop") {
+		t.Fatalf("ReconcileConfirm(dispatching) outcome = %q, want noop", racedOutcome)
+	}
+	stillDispatching, err := repository.FindByID(ctx, racing.OutboxID)
+	if err != nil {
+		t.Fatalf("FindByID(dispatching): %v", err)
+	}
+	if stillDispatching.State != OutboxDispatching || stillDispatching.LeaseToken == nil ||
+		*stillDispatching.LeaseToken != token {
+		t.Fatalf("dispatching row changed during echo = %+v", stillDispatching)
+	}
+	if err := repository.Confirm(ctx, Confirmation{
+		OutboxID: racing.OutboxID, LeaseToken: token, ResultRemoteID: "remote-racing",
+	}); err != nil {
+		t.Fatalf("Confirm(lease owner): %v", err)
+	}
+	replayed, err := repository.ReconcileConfirm(ctx, ReconcileRequest{
+		AccountID:          racing.AccountID,
+		TransportRequestID: racing.TransportRequestID,
+		ResultRemoteID:     "remote-racing",
+	})
+	if err != nil {
+		t.Fatalf("ReconcileConfirm(after lease confirm): %v", err)
+	}
+	if replayed != ReconcileOutcome("noop") {
+		t.Fatalf("ReconcileConfirm(after lease confirm) outcome = %q, want noop", replayed)
+	}
+
+	missing, err := repository.ReconcileConfirm(ctx, ReconcileRequest{
+		AccountID:          provisional.AccountID,
+		TransportRequestID: "request-missing",
+		ResultRemoteID:     "remote-missing",
+	})
+	if err != nil {
+		t.Fatalf("ReconcileConfirm(missing): %v", err)
+	}
+	if missing != ReconcileOutcome("notfound") {
+		t.Fatalf("ReconcileConfirm(missing) outcome = %q, want notfound", missing)
+	}
+}
+
+func TestOutboxReconcileConfirmRepairsStoreFailedAndNoopsTerminalStates(t *testing.T) {
+	clock := newOutboxTestClock(outboxTestTimeMS)
+	store, repository := openOutboxTestRepository(t, clock.Now)
+	seedMessageIdentity(t, store, "identity-a", "account-a")
+	seedMessageConversation(t, store, "conversation-a", "account-a")
+	ctx := context.Background()
+
+	failed := outboxTestItem("reconcile-store-failed")
+	mustEnqueueOutgoingOutbox(t, repository, failed, "store-failed body")
+	lease := mustLeaseOne(t, repository, LeaseRequest{
+		Owner: "worker", Now: clock.Now(), Duration: time.Minute, Limit: 1,
+	})
+	token := mustLeaseToken(t, lease)
+	if err := repository.MarkTransportCalled(ctx, Attempt{
+		OutboxID: failed.OutboxID, LeaseToken: token,
+	}); err != nil {
+		t.Fatalf("MarkTransportCalled(store failed): %v", err)
+	}
+	const resultID = "remote-store-failed"
+	if err := repository.MarkStoreFailed(ctx, failed.OutboxID, token, resultID, "local write failed"); err != nil {
+		t.Fatalf("MarkStoreFailed(): %v", err)
+	}
+	outcome, err := repository.ReconcileConfirm(ctx, ReconcileRequest{
+		AccountID:          failed.AccountID,
+		TransportRequestID: failed.TransportRequestID,
+		ResultRemoteID:     resultID,
+	})
+	if err != nil {
+		t.Fatalf("ReconcileConfirm(store failed): %v", err)
+	}
+	if outcome != ReconcileOutcome("reconciled") {
+		t.Fatalf("ReconcileConfirm(store failed) outcome = %q, want reconciled", outcome)
+	}
+	repaired, err := repository.FindByID(ctx, failed.OutboxID)
+	if err != nil {
+		t.Fatalf("FindByID(repaired): %v", err)
+	}
+	if repaired.State != OutboxConfirmed || repaired.ResultRemoteID == nil ||
+		*repaired.ResultRemoteID != resultID || repaired.ErrorClass != nil ||
+		repaired.ErrorCode != nil || repaired.ErrorDetail != nil {
+		t.Fatalf("repaired row = %+v", repaired)
+	}
+	messages, err := NewMessageRepository(store, clock.Now)
+	if err != nil {
+		t.Fatalf("NewMessageRepository(): %v", err)
+	}
+	repairedMessage, err := messages.GetMessage(ctx, failed.LocalMessageID)
+	if err != nil {
+		t.Fatalf("GetMessage(repaired): %v", err)
+	}
+	if repairedMessage.RemoteMessageID != resultID {
+		t.Fatalf("repaired message remote ID = %q, want %q", repairedMessage.RemoteMessageID, resultID)
+	}
+
+	terminalCases := []struct {
+		name       string
+		transition func(OutboxItem) error
+		wantState  OutboxState
+	}{
+		{
+			name: "queued",
+			transition: func(OutboxItem) error {
+				return nil
+			},
+			wantState: OutboxQueued,
+		},
+		{
+			name: "canceled",
+			transition: func(item OutboxItem) error {
+				return repository.Cancel(ctx, item.OutboxID)
+			},
+			wantState: OutboxCanceled,
+		},
+	}
+	for _, test := range terminalCases {
+		t.Run(test.name, func(t *testing.T) {
+			item := outboxTestItem("reconcile-noop-" + test.name)
+			mustEnqueueOutgoingOutbox(t, repository, item, test.name+" body")
+			current, err := repository.FindByID(ctx, item.OutboxID)
+			if err != nil {
+				t.Fatalf("FindByID(before transition): %v", err)
+			}
+			if err := test.transition(current); err != nil {
+				t.Fatalf("transition: %v", err)
+			}
+			got, err := repository.ReconcileConfirm(ctx, ReconcileRequest{
+				AccountID:          item.AccountID,
+				TransportRequestID: item.TransportRequestID,
+				ResultRemoteID:     "remote-anomalous-" + test.name,
+			})
+			if err != nil {
+				t.Fatalf("ReconcileConfirm(): %v", err)
+			}
+			if got != ReconcileOutcome("noop") {
+				t.Fatalf("ReconcileConfirm() outcome = %q, want noop", got)
+			}
+			unchanged, err := repository.FindByID(ctx, item.OutboxID)
+			if err != nil {
+				t.Fatalf("FindByID(after echo): %v", err)
+			}
+			if unchanged.State != test.wantState {
+				t.Fatalf("state after echo = %q, want %q", unchanged.State, test.wantState)
+			}
+			message, err := messages.GetMessage(ctx, item.LocalMessageID)
+			if err != nil {
+				t.Fatalf("GetMessage(after echo): %v", err)
+			}
+			if message.RemoteMessageID != item.TransportRequestID {
+				t.Fatalf("message remote ID after echo = %q, want %q", message.RemoteMessageID, item.TransportRequestID)
+			}
+		})
+	}
+}
+
+func TestOutboxFindStoreFailedDueIsBoundedOrderedAndStateFiltered(t *testing.T) {
+	clock := newOutboxTestClock(outboxTestTimeMS)
+	_, repository := openOutboxTestRepository(t, clock.Now)
+	ctx := context.Background()
+
+	items := []NewOutboxItem{
+		outboxTestItem("store-a"),
+		outboxTestItem("store-b"),
+		outboxTestItem("store-c"),
+	}
+	for _, item := range items {
+		mustEnqueueOutbox(t, repository, item)
+	}
+	leases, err := repository.LeaseDue(ctx, LeaseRequest{
+		Owner: "worker", Now: clock.Now(), Duration: time.Minute, Limit: len(items),
+	})
+	if err != nil {
+		t.Fatalf("LeaseDue(store failed candidates): %v", err)
+	}
+	if len(leases) != len(items) {
+		t.Fatalf("LeaseDue(store failed candidates) = %d leases, want %d", len(leases), len(items))
+	}
+	leasesByID := make(map[string]OutboxItem, len(leases))
+	for _, lease := range leases {
+		leasesByID[lease.OutboxID] = lease.OutboxItem
+		if err := repository.MarkTransportCalled(ctx, Attempt{
+			OutboxID: lease.OutboxID, LeaseToken: mustLeaseToken(t, lease.OutboxItem),
+		}); err != nil {
+			t.Fatalf("MarkTransportCalled(%q): %v", lease.OutboxID, err)
+		}
+	}
+
+	clock.Set(outboxTestTimeMS + 100)
+	for _, id := range []string{"outbox-store-c", "outbox-store-a"} {
+		lease := leasesByID[id]
+		if err := repository.MarkStoreFailed(
+			ctx,
+			id,
+			mustLeaseToken(t, lease),
+			"remote-"+id,
+			"store failed",
+		); err != nil {
+			t.Fatalf("MarkStoreFailed(%q): %v", id, err)
+		}
+	}
+	clock.Set(outboxTestTimeMS + 200)
+	lease := leasesByID["outbox-store-b"]
+	if err := repository.MarkStoreFailed(
+		ctx,
+		lease.OutboxID,
+		mustLeaseToken(t, lease),
+		"remote-"+lease.OutboxID,
+		"store failed",
+	); err != nil {
+		t.Fatalf("MarkStoreFailed(%q): %v", lease.OutboxID, err)
+	}
+
+	confirmedInput := outboxTestItem("store-filter-confirmed")
+	mustEnqueueOutbox(t, repository, confirmedInput)
+	confirmedLease := mustLeaseOne(t, repository, LeaseRequest{
+		Owner: "worker", Now: clock.Now(), Duration: time.Minute, Limit: 1,
+	})
+	confirmedToken := mustLeaseToken(t, confirmedLease)
+	if err := repository.MarkTransportCalled(ctx, Attempt{
+		OutboxID: confirmedInput.OutboxID, LeaseToken: confirmedToken,
+	}); err != nil {
+		t.Fatalf("MarkTransportCalled(confirmed filter): %v", err)
+	}
+	if err := repository.Confirm(ctx, Confirmation{
+		OutboxID:       confirmedInput.OutboxID,
+		LeaseToken:     confirmedToken,
+		ResultRemoteID: confirmedInput.TransportRequestID,
+	}); err != nil {
+		t.Fatalf("Confirm(filter): %v", err)
+	}
+	mustEnqueueOutbox(t, repository, outboxTestItem("store-filter-queued"))
+
+	bounded, err := repository.FindStoreFailedDue(ctx, 2)
+	if err != nil {
+		t.Fatalf("FindStoreFailedDue(2): %v", err)
+	}
+	wantBounded := []string{"outbox-store-a", "outbox-store-c"}
+	if got := outboxIDs(bounded); !slices.Equal(got, wantBounded) {
+		t.Fatalf("FindStoreFailedDue(2) IDs = %v, want %v", got, wantBounded)
+	}
+
+	all, err := repository.FindStoreFailedDue(ctx, 10)
+	if err != nil {
+		t.Fatalf("FindStoreFailedDue(10): %v", err)
+	}
+	wantAll := []string{"outbox-store-a", "outbox-store-c", "outbox-store-b"}
+	if got := outboxIDs(all); !slices.Equal(got, wantAll) {
+		t.Fatalf("FindStoreFailedDue(10) IDs = %v, want %v", got, wantAll)
+	}
+	for _, item := range all {
+		if item.State != OutboxStoreFailed {
+			t.Fatalf("FindStoreFailedDue() returned state %q for %q", item.State, item.OutboxID)
+		}
+	}
+	if _, err := repository.FindStoreFailedDue(ctx, 0); err == nil {
+		t.Fatal("FindStoreFailedDue(0) succeeded")
+	}
+}
+
+func TestOutboxLeaseDueNeverClaimsArtificiallyArmedUncertainRow(t *testing.T) {
+	clock := newOutboxTestClock(outboxTestTimeMS)
+	store, repository := openOutboxTestRepository(t, clock.Now)
+	ctx := context.Background()
+	item := mustEnqueueOutbox(t, repository, outboxTestItem("armed-uncertain"))
+	lease := mustLeaseOne(t, repository, LeaseRequest{
+		Owner: "worker", Now: clock.Now(), Duration: time.Minute, Limit: 1,
+	})
+	token := mustLeaseToken(t, lease)
+	if err := repository.MarkTransportCalled(ctx, Attempt{
+		OutboxID: item.OutboxID, LeaseToken: token,
+	}); err != nil {
+		t.Fatalf("MarkTransportCalled(): %v", err)
+	}
+	if err := repository.MarkUncertain(ctx, item.OutboxID, token, "timeout", "deadline", "unknown"); err != nil {
+		t.Fatalf("MarkUncertain(): %v", err)
+	}
+
+	artificialNextAttemptMS := clock.Now().Add(time.Second).UnixMilli()
+	if _, err := store.db.ExecContext(ctx, `
+		UPDATE outbox
+		SET next_attempt_at_ms = ?
+		WHERE outbox_id = ? AND state = 'uncertain'
+	`, artificialNextAttemptMS, item.OutboxID); err != nil {
+		t.Fatalf("artificially arm uncertain row: %v", err)
+	}
+	armed, err := repository.FindByID(ctx, item.OutboxID)
+	if err != nil {
+		t.Fatalf("FindByID(armed uncertain): %v", err)
+	}
+	if armed.State != OutboxUncertain || armed.NextAttemptAtMS == nil ||
+		*armed.NextAttemptAtMS != artificialNextAttemptMS {
+		t.Fatalf("artificially armed row = %+v", armed)
+	}
+
+	leases, err := repository.LeaseDue(ctx, LeaseRequest{
+		Owner: "worker-later", Now: clock.Now().Add(time.Hour), Duration: time.Minute, Limit: 1,
+	})
+	if err != nil {
+		t.Fatalf("LeaseDue(artificially armed uncertain): %v", err)
+	}
+	if len(leases) != 0 {
+		t.Fatalf("LeaseDue(artificially armed uncertain) = %+v, want none", leases)
+	}
+	unchanged, err := repository.FindByID(ctx, item.OutboxID)
+	if err != nil {
+		t.Fatalf("FindByID(after LeaseDue): %v", err)
+	}
+	if unchanged.State != OutboxUncertain {
+		t.Fatalf("state after LeaseDue = %q, want %q", unchanged.State, OutboxUncertain)
+	}
+}
+
 func TestOutboxLeaseDueRespectsScheduleRetryAndLiveLease(t *testing.T) {
 	clock := newOutboxTestClock(outboxTestTimeMS)
 	_, repository := openOutboxTestRepository(t, clock.Now)
@@ -1714,6 +2234,40 @@ func mustEnqueueOutbox(
 		t.Fatalf("Enqueue(%q) disposition = %q, want %q", item.OutboxID, disposition, EnqueueInserted)
 	}
 	return row
+}
+
+func mustEnqueueOutgoingOutbox(
+	t *testing.T,
+	repository *OutboxRepository,
+	item NewOutboxItem,
+	body string,
+) OutboxItem {
+	t.Helper()
+	row, disposition, err := repository.EnqueueOutgoingMessage(
+		context.Background(),
+		item,
+		outboxTestOutgoingMessage(item, body),
+	)
+	if err != nil {
+		t.Fatalf("EnqueueOutgoingMessage(%q): %v", item.OutboxID, err)
+	}
+	if disposition != EnqueueInserted {
+		t.Fatalf(
+			"EnqueueOutgoingMessage(%q) disposition = %q, want %q",
+			item.OutboxID,
+			disposition,
+			EnqueueInserted,
+		)
+	}
+	return row
+}
+
+func outboxIDs(items []OutboxItem) []string {
+	ids := make([]string, len(items))
+	for index, item := range items {
+		ids[index] = item.OutboxID
+	}
+	return ids
 }
 
 func mustLeaseOne(

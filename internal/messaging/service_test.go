@@ -1147,8 +1147,8 @@ func TestCancelAndDeferredAPIs(t *testing.T) {
 	if _, err := service.SendAgain(context.Background(), submission.OutboxID, "new-key"); !errors.Is(err, ErrNotImplemented) {
 		t.Fatalf("SendAgain() error = %v, want ErrNotImplemented", err)
 	}
-	if err := service.ObserveTransportEcho(context.Background(), TransportEcho{}); !errors.Is(err, ErrNotImplemented) {
-		t.Fatalf("ObserveTransportEcho() error = %v, want ErrNotImplemented", err)
+	if err := service.ObserveTransportEcho(context.Background(), TransportEcho{}); !errors.Is(err, ErrInvalidCommand) {
+		t.Fatalf("ObserveTransportEcho() error = %v, want ErrInvalidCommand", err)
 	}
 }
 
