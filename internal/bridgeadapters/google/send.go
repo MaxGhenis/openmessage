@@ -33,6 +33,14 @@ var reactionSendClientFor = func(cli *client.Client) reactionSendClient {
 	return cli.GM
 }
 
+type readSendClient interface {
+	MarkRead(conversationID, messageID string) error
+}
+
+var readSendClientFor = func(cli *client.Client) readSendClient {
+	return cli.GM
+}
+
 type mediaSendClient interface {
 	UploadMedia(data []byte, filename, mime string) (*gmproto.MediaContent, error)
 	GetConversation(conversationID string) (*gmproto.Conversation, error)
@@ -218,6 +226,46 @@ func (a *Adapter) SendReaction(
 	// Reaction dispatch confirms an empty result via ConfirmWithoutResult;
 	// there is no reaction-message ID or echo-reconciliation consumer.
 	return bridge.SendResult{}, nil
+}
+
+// MarkRead advances the remote Google Messages read cursor through the
+// connected libgm client retained by the lifecycle-owned App generation.
+func (a *Adapter) MarkRead(ctx context.Context, req bridge.ReadReceiptRequest) error {
+	if a == nil || a.host == nil || !a.host.Connected.Load() {
+		return notConnectedReadError()
+	}
+	cli := a.host.GetClient()
+	if cli == nil || cli.GM == nil {
+		return notConnectedReadError()
+	}
+	transport := readSendClientFor(cli)
+	if transport == nil {
+		return notConnectedReadError()
+	}
+	if ctx == nil {
+		return preDispatchReadError(
+			"google_mark_read_context_invalid",
+			errors.New("Google mark-read context is nil"),
+		)
+	}
+	if err := ctx.Err(); err != nil {
+		return preDispatchReadError("google_mark_read_context_done", err)
+	}
+	if len(req.Messages) == 0 {
+		return preDispatchReadError(
+			"google_mark_read_no_messages",
+			errors.New("Google mark-read request has no messages"),
+		)
+	}
+
+	messageID := req.Messages[len(req.Messages)-1].RemoteID
+	if err := transport.MarkRead(req.Conversation.RemoteID, messageID); err != nil {
+		return a.classifyReadTransportError(
+			fmt.Errorf("mark Google conversation read: %w", err),
+			"google_mark_read_failed",
+		)
+	}
+	return nil
 }
 
 // SendMedia adapts the durable media outbox request to the connected libgm
@@ -464,6 +512,36 @@ func (a *Adapter) classifyReactionTransportError(
 	return failure
 }
 
+func notConnectedReadError() bridge.OpError {
+	return bridge.OpError{
+		Class:       bridge.FailureTransient,
+		Operation:   "mark_read",
+		Fingerprint: "google_not_connected",
+		Dispatch:    bridge.DispatchNotCalled,
+		Cause:       errors.New("Google Messages is not connected"),
+	}
+}
+
+func preDispatchReadError(fingerprint string, cause error) bridge.OpError {
+	return bridge.OpError{
+		Class:       bridge.FailureTransient,
+		Operation:   "mark_read",
+		Fingerprint: fingerprint,
+		Dispatch:    bridge.DispatchNotCalled,
+		Cause:       cause,
+	}
+}
+
+func (a *Adapter) classifyReadTransportError(err error, fingerprint string) bridge.OpError {
+	failure := a.classifyTransportError(err, "mark_read", fingerprint)
+	// Deliberate idempotent-read divergence: even after libgm's transport call,
+	// repeating a read receipt is harmless, so failures stay retryable as
+	// DispatchNotCalled instead of becoming uncertain like text/media sends.
+	failure.Dispatch = bridge.DispatchNotCalled
+	a.reportIfAuthIndicting(failure)
+	return failure
+}
+
 func notConnectedMediaError() bridge.OpError {
 	return bridge.OpError{
 		Class:       bridge.FailureTransient,
@@ -513,4 +591,5 @@ func (a *Adapter) reportIfAuthIndicting(failure bridge.OpError) {
 
 var _ bridge.TextSender = (*Adapter)(nil)
 var _ bridge.ReactionSender = (*Adapter)(nil)
+var _ bridge.ReadReceiptSender = (*Adapter)(nil)
 var _ bridge.MediaSender = (*Adapter)(nil)

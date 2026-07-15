@@ -39,6 +39,7 @@ type Adapter struct {
 	mediaReady          func() bool // Shared connection gate; it does no media-specific work.
 	sendTextRequest     func(string, string, string, string) (string, time.Time, error)
 	sendReactionRequest func(string, string, string, string, string, string) error
+	markReadRequest     func(string, []string, string, time.Time) error
 	sendMediaRequest    func(string, []byte, string, string, string, string, string) (string, time.Time, error)
 
 	mu       sync.Mutex
@@ -67,6 +68,7 @@ func New(accountID string, host *whatsapplive.Bridge) *Adapter {
 		a.mediaReady = func() bool { return host.Status().Connected }
 		a.sendTextRequest = host.SendTextRequest
 		a.sendReactionRequest = host.SendReactionRequest
+		a.markReadRequest = host.MarkReadRequest
 		a.sendMediaRequest = host.SendMediaRequest
 		host.ObserveLifecycle(a.handleLifecycleEvent)
 	}
@@ -204,6 +206,67 @@ func whatsappReactionPreCallFailure(fingerprint string, cause error) bridge.OpEr
 }
 
 var _ bridge.ReactionSender = (*Adapter)(nil)
+
+// MarkRead bridges the v2 read-receipt request to the already-owned whatsmeow
+// transport. Readiness is checked without constructing or connecting a client.
+func (a *Adapter) MarkRead(ctx context.Context, req bridge.ReadReceiptRequest) error {
+	if a == nil || a.mediaReady == nil || !a.mediaReady() || a.markReadRequest == nil {
+		return whatsappReadPreCallFailure(
+			"whatsapp_not_connected",
+			whatsmeow.ErrNotConnected,
+		)
+	}
+	if ctx == nil {
+		return whatsappReadPreCallFailure(
+			"whatsapp_mark_read_context_missing",
+			errors.New("WhatsApp mark-read context is nil"),
+		)
+	}
+	if err := ctx.Err(); err != nil {
+		return whatsappReadPreCallFailure("whatsapp_mark_read_context_done", err)
+	}
+	if len(req.Messages) == 0 {
+		return whatsappReadPreCallFailure(
+			"whatsapp_mark_read_no_messages",
+			errors.New("WhatsApp mark-read request has no messages"),
+		)
+	}
+
+	messageIDs := make([]string, len(req.Messages))
+	for i, message := range req.Messages {
+		messageIDs[i] = message.RemoteID
+	}
+	err := a.markReadRequest(
+		req.Conversation.RemoteID,
+		messageIDs,
+		req.Messages[0].AuthorID,
+		req.ReadAt,
+	)
+	if err != nil {
+		// Deliberately no adapter-level lifecycle report: the retained core owns
+		// reconnect reporting through its guarded reportConnectionError path.
+		failure := a.classifyError(err, "mark_read", "whatsapp_mark_read_failed")
+		// Deliberate idempotent-read divergence: even after whatsmeow's transport
+		// call, repeating a read receipt is harmless. Preserve every retryable
+		// class as DispatchNotCalled instead of uncertain; terminal classes are
+		// still rejected by their classification before certainty is consulted.
+		failure.Dispatch = bridge.DispatchNotCalled
+		return failure
+	}
+	return nil
+}
+
+func whatsappReadPreCallFailure(fingerprint string, cause error) bridge.OpError {
+	return bridge.OpError{
+		Class:       bridge.FailureTransient,
+		Operation:   "mark_read",
+		Fingerprint: fingerprint,
+		Dispatch:    bridge.DispatchNotCalled,
+		Cause:       cause,
+	}
+}
+
+var _ bridge.ReadReceiptSender = (*Adapter)(nil)
 
 // SendMedia bridges the v2 request contract to the already-owned whatsmeow
 // transport. Readiness is checked without constructing or connecting a client.
