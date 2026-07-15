@@ -1489,6 +1489,280 @@ func TestOutboxLeaseDueRespectsScheduleRetryAndLiveLease(t *testing.T) {
 	}
 }
 
+func TestOutboxEarliestDueReturnsMinimumLeaseOrderingKey(t *testing.T) {
+	clock := newOutboxTestClock(outboxTestTimeMS)
+	_, repository := openOutboxTestRepository(t, clock.Now)
+	ctx := context.Background()
+	now := clock.Now()
+
+	earliest, ok, err := repository.EarliestDue(ctx)
+	if err != nil {
+		t.Fatalf("EarliestDue(empty): %v", err)
+	}
+	if ok || !earliest.IsZero() {
+		t.Fatalf("EarliestDue(empty) = (%v, %t), want (zero, false)", earliest, ok)
+	}
+
+	futureAt := now.Add(10 * time.Second)
+	future := outboxTestItem("earliest-future")
+	future.ScheduledFor = futureAt
+	mustEnqueueOutbox(t, repository, future)
+	earliest, ok, err = repository.EarliestDue(ctx)
+	if err != nil {
+		t.Fatalf("EarliestDue(only future): %v", err)
+	}
+	if !ok || !earliest.Equal(futureAt) {
+		t.Fatalf("EarliestDue(only future) = (%v, %t), want (%v, true)", earliest, ok, futureAt)
+	}
+
+	retry := outboxTestItem("earliest-retry")
+	mustEnqueueOutbox(t, repository, retry)
+	retryLease := mustLeaseOne(t, repository, LeaseRequest{
+		Owner: "worker-retry", Now: now, Duration: time.Minute, Limit: 1,
+	})
+	retryAt := now.Add(5 * time.Second)
+	if err := repository.MarkNotDispatched(
+		ctx,
+		retry.OutboxID,
+		mustLeaseToken(t, retryLease),
+		"transient",
+		"offline",
+		"retry later",
+		retryAt,
+	); err != nil {
+		t.Fatalf("MarkNotDispatched(): %v", err)
+	}
+	earliest, ok, err = repository.EarliestDue(ctx)
+	if err != nil {
+		t.Fatalf("EarliestDue(retry and future): %v", err)
+	}
+	if !ok || !earliest.Equal(retryAt) {
+		t.Fatalf("EarliestDue(retry and future) = (%v, %t), want (%v, true)", earliest, ok, retryAt)
+	}
+
+	dueAt := now.Add(-time.Second)
+	due := outboxTestItem("earliest-due")
+	due.ScheduledFor = dueAt
+	mustEnqueueOutbox(t, repository, due)
+	earliest, ok, err = repository.EarliestDue(ctx)
+	if err != nil {
+		t.Fatalf("EarliestDue(due, retry, and future): %v", err)
+	}
+	if !ok || !earliest.Equal(dueAt) {
+		t.Fatalf("EarliestDue(due, retry, and future) = (%v, %t), want (%v, true)", earliest, ok, dueAt)
+	}
+}
+
+func TestOutboxListPendingReturnsCancelableRowsDueOrderedWithSummarySources(t *testing.T) {
+	clock := newOutboxTestClock(outboxTestTimeMS)
+	store, repository := openOutboxTestRepository(t, clock.Now)
+	ctx := context.Background()
+	now := clock.Now()
+
+	seedMessageIdentity(t, store, "identity-a", "account-a")
+	seedMessageConversation(t, store, "conversation-a", "account-a")
+	seedMessageConversation(t, store, "conversation-b", "account-a")
+	seedMessageAccount(t, store, "account-b", "test-b")
+	seedMessageConversation(t, store, "conversation-c", "account-b")
+	seedOutboxTestMessage(t, store, "target-reaction", "account-b", "conversation-c")
+	seedOutboxTestDevice(t, store, "device-a", "account-a")
+	seedOutboxTestMessage(t, store, "target-read", "account-a", "conversation-a")
+
+	confirmed := outboxTestItem("list-confirmed")
+	mustEnqueueOutbox(t, repository, confirmed)
+	confirmedLease := mustLeaseOne(t, repository, LeaseRequest{
+		Owner: "worker-confirmed", Now: now, Duration: time.Minute, Limit: 1,
+	})
+	confirmedToken := mustLeaseToken(t, confirmedLease)
+	if err := repository.MarkTransportCalled(ctx, Attempt{
+		OutboxID: confirmed.OutboxID, LeaseToken: confirmedToken,
+	}); err != nil {
+		t.Fatalf("MarkTransportCalled(confirmed): %v", err)
+	}
+	if err := repository.ConfirmWithoutResult(ctx, confirmed.OutboxID, confirmedToken); err != nil {
+		t.Fatalf("ConfirmWithoutResult(): %v", err)
+	}
+
+	canceled := outboxTestItem("list-canceled")
+	mustEnqueueOutbox(t, repository, canceled)
+	if err := repository.Cancel(ctx, canceled.OutboxID); err != nil {
+		t.Fatalf("Cancel(): %v", err)
+	}
+
+	reaction := outboxTestReactionItem("list-reaction")
+	reaction.AccountID = "account-b"
+	reaction.ConversationID = "conversation-c"
+	reaction.ScheduledFor = now.Add(-2 * time.Minute)
+	if _, disposition, err := repository.EnqueueReaction(ctx, reaction, OutboxReaction{
+		TargetMessageID: "target-reaction",
+		Emoji:           "👍",
+		Action:          "add",
+	}); err != nil {
+		t.Fatalf("EnqueueReaction(): %v", err)
+	} else if disposition != EnqueueInserted {
+		t.Fatalf("EnqueueReaction() disposition = %q, want %q", disposition, EnqueueInserted)
+	}
+	reactionLease := mustLeaseOne(t, repository, LeaseRequest{
+		Owner: "worker-reaction", Now: now, Duration: time.Minute, Limit: 1,
+	})
+	retryAt := now.Add(5 * time.Minute)
+	if err := repository.MarkNotDispatched(
+		ctx,
+		reaction.OutboxID,
+		mustLeaseToken(t, reactionLease),
+		"transient",
+		"offline",
+		"bridge unavailable",
+		retryAt,
+	); err != nil {
+		t.Fatalf("MarkNotDispatched(reaction): %v", err)
+	}
+
+	dueText := outboxTestItem("list-due-text")
+	dueText.ScheduledFor = now.Add(-time.Minute)
+	mustEnqueueOutgoingOutbox(t, repository, dueText, "due text body")
+
+	media := outboxTestMediaItem("list-media")
+	media.ConversationID = "conversation-b"
+	media.ScheduledFor = now.Add(10 * time.Minute)
+	attachment := outboxTestAttachment()
+	if _, disposition, err := repository.EnqueueOutgoingMediaMessage(
+		ctx,
+		media,
+		outboxTestOutgoingMessage(media, "media caption"),
+		attachment,
+	); err != nil {
+		t.Fatalf("EnqueueOutgoingMediaMessage(): %v", err)
+	} else if disposition != EnqueueInserted {
+		t.Fatalf("EnqueueOutgoingMediaMessage() disposition = %q, want %q", disposition, EnqueueInserted)
+	}
+
+	read := outboxTestReadItem("list-read")
+	read.ScheduledFor = now.Add(20 * time.Minute)
+	targetID := "target-read"
+	if _, disposition, err := repository.EnqueueReadReceipt(
+		ctx,
+		read,
+		OutboxReadReceipt{
+			DeviceID:          "device-a",
+			LastReadMessageID: targetID,
+			ReadAtMS:          now.Add(-time.Second).UnixMilli(),
+		},
+		ReadCursor{
+			AccountID:         "account-a",
+			DeviceID:          "device-a",
+			ConversationID:    "conversation-a",
+			LastReadMessageID: &targetID,
+			LastReadAtMS:      now.Add(-time.Second).UnixMilli(),
+			UpdatedAtMS:       now.UnixMilli(),
+		},
+	); err != nil {
+		t.Fatalf("EnqueueReadReceipt(): %v", err)
+	} else if disposition != EnqueueInserted {
+		t.Fatalf("EnqueueReadReceipt() disposition = %q, want %q", disposition, EnqueueInserted)
+	}
+
+	futureText := outboxTestItem("list-future-text")
+	futureText.ScheduledFor = now.Add(30 * time.Minute)
+	mustEnqueueOutgoingOutbox(t, repository, futureText, "future text body")
+
+	rows, err := repository.ListPending(ctx, ListPendingParams{Limit: 20})
+	if err != nil {
+		t.Fatalf("ListPending(): %v", err)
+	}
+	wantIDs := []string{
+		dueText.OutboxID,
+		reaction.OutboxID,
+		media.OutboxID,
+		read.OutboxID,
+		futureText.OutboxID,
+	}
+	gotIDs := make([]string, len(rows))
+	for i, row := range rows {
+		gotIDs[i] = row.OutboxID
+	}
+	if !slices.Equal(gotIDs, wantIDs) {
+		t.Fatalf("ListPending() IDs = %v, want %v", gotIDs, wantIDs)
+	}
+	for _, row := range rows {
+		if row.State != OutboxQueued && row.State != OutboxNotDispatched {
+			t.Fatalf("ListPending() returned non-cancelable row = %+v", row)
+		}
+		if row.ScheduledForMS <= 0 || row.CreatedAtMS != now.UnixMilli() {
+			t.Fatalf("ListPending() timing fields = %+v", row)
+		}
+	}
+
+	if rows[0].Body == nil || *rows[0].Body != "due text body" ||
+		rows[0].MediaFile != nil || rows[0].MediaMIME != nil || rows[0].Emoji != nil {
+		t.Fatalf("text summary sources = %+v", rows[0])
+	}
+	if rows[1].State != OutboxNotDispatched || rows[1].NextAttemptAtMS == nil ||
+		*rows[1].NextAttemptAtMS != retryAt.UnixMilli() || rows[1].AttemptCount != 0 ||
+		rows[1].ErrorClass == nil || *rows[1].ErrorClass != "transient" ||
+		rows[1].ErrorCode == nil || *rows[1].ErrorCode != "offline" ||
+		rows[1].Emoji == nil || *rows[1].Emoji != "👍" || rows[1].Body != nil {
+		t.Fatalf("not-dispatched reaction row = %+v", rows[1])
+	}
+	if rows[2].Body == nil || *rows[2].Body != "media caption" ||
+		rows[2].MediaFile == nil || *rows[2].MediaFile != attachment.Filename ||
+		rows[2].MediaMIME == nil || *rows[2].MediaMIME != attachment.MIME || rows[2].Emoji != nil {
+		t.Fatalf("media summary sources = %+v", rows[2])
+	}
+	if rows[3].Kind != OutboxKindRead || rows[3].Body != nil || rows[3].MediaFile != nil ||
+		rows[3].MediaMIME != nil || rows[3].Emoji != nil {
+		t.Fatalf("read summary sources = %+v", rows[3])
+	}
+	if rows[4].Body == nil || *rows[4].Body != "future text body" {
+		t.Fatalf("future text summary sources = %+v", rows[4])
+	}
+
+	accountRows, err := repository.ListPending(ctx, ListPendingParams{
+		AccountID: "account-a",
+		Limit:     2,
+	})
+	if err != nil {
+		t.Fatalf("ListPending(account, limit): %v", err)
+	}
+	if len(accountRows) != 2 {
+		t.Fatalf("ListPending(account, limit) returned %d rows, want 2: %+v", len(accountRows), accountRows)
+	}
+	if got := []string{accountRows[0].OutboxID, accountRows[1].OutboxID}; !slices.Equal(got, []string{dueText.OutboxID, media.OutboxID}) {
+		t.Fatalf("ListPending(account, limit) IDs = %v", got)
+	}
+
+	reactionRows, err := repository.ListPending(ctx, ListPendingParams{
+		ConversationID: "conversation-c",
+		Limit:          20,
+	})
+	if err != nil {
+		t.Fatalf("ListPending(conversation): %v", err)
+	}
+	if len(reactionRows) != 1 || reactionRows[0].OutboxID != reaction.OutboxID {
+		t.Fatalf("ListPending(conversation) = %+v, want only %q", reactionRows, reaction.OutboxID)
+	}
+
+	conversationRows, err := repository.ListPending(ctx, ListPendingParams{
+		AccountID:      "account-a",
+		ConversationID: "conversation-a",
+		Limit:          20,
+	})
+	if err != nil {
+		t.Fatalf("ListPending(account, conversation): %v", err)
+	}
+	conversationIDs := make([]string, len(conversationRows))
+	for i, row := range conversationRows {
+		conversationIDs[i] = row.OutboxID
+	}
+	if want := []string{dueText.OutboxID, read.OutboxID, futureText.OutboxID}; !slices.Equal(conversationIDs, want) {
+		t.Fatalf("ListPending(account, conversation) IDs = %v, want %v", conversationIDs, want)
+	}
+
+	if _, err := repository.ListPending(ctx, ListPendingParams{}); err == nil {
+		t.Fatal("ListPending(non-positive limit) succeeded")
+	}
+}
+
 func TestOutboxPreCallExpiredLeaseRetriesAndStaleTokenLoses(t *testing.T) {
 	clock := newOutboxTestClock(outboxTestTimeMS)
 	_, repository := openOutboxTestRepository(t, clock.Now)

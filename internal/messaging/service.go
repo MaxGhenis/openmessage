@@ -28,9 +28,36 @@ const (
 	defaultFinalizeTime = 5 * time.Second
 	defaultRetryDelay   = 5 * time.Second
 	defaultPollDelay    = time.Second
+	defaultMaxPollDelay = 30 * time.Second
 	defaultBatchLimit   = 32
+	maxListPending      = 500
+	summaryMaxRunes     = 120
 	workerOwner         = "message-service"
 )
+
+// ListPendingQuery selects pending, cancelable deliveries in due order.
+type ListPendingQuery struct {
+	AccountID      string
+	ConversationID string
+	Limit          int
+}
+
+// PendingDelivery is the application-facing preview of one queued or
+// not-dispatched durable intent.
+type PendingDelivery struct {
+	OutboxID       string
+	AccountID      string
+	ConversationID string
+	Kind           sqlite.OutboxKind
+	State          OutboxState
+	ScheduledFor   time.Time
+	NextAttemptAt  time.Time
+	AttemptCount   int64
+	CreatedAt      time.Time
+	Summary        string
+	ErrorClass     string
+	ErrorCode      string
+}
 
 // MessageService owns message intent submission and durable dispatch. Concrete
 // platform selection remains behind bridge.Registry.
@@ -46,6 +73,7 @@ type MessageService struct {
 	leaseTime     time.Duration
 	retryDelay    time.Duration
 	pollDelay     time.Duration
+	maxPollDelay  time.Duration
 	maxMediaBytes int64
 	batchLimit    int
 
@@ -95,6 +123,7 @@ func NewMessageService(
 		leaseTime:     defaultLeaseTime,
 		retryDelay:    defaultRetryDelay,
 		pollDelay:     defaultPollDelay,
+		maxPollDelay:  defaultMaxPollDelay,
 		maxMediaBytes: DefaultMaxMediaBytes,
 		batchLimit:    defaultBatchLimit,
 		wake:          make(chan struct{}, 1),
@@ -544,6 +573,93 @@ func (s *MessageService) Get(ctx context.Context, outboxID string) (Delivery, er
 		return Delivery{}, fmt.Errorf("get delivery: %w", err)
 	}
 	return deliveryFromItem(item), nil
+}
+
+// ListPending returns queued and not-dispatched deliveries in storage due
+// order. The result is exactly the set that remains safe to cancel.
+func (s *MessageService) ListPending(
+	ctx context.Context,
+	q ListPendingQuery,
+) ([]PendingDelivery, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("list pending deliveries: context is nil")
+	}
+	if q.Limit <= 0 {
+		return nil, fmt.Errorf("list pending deliveries: limit must be positive")
+	}
+	if q.Limit > maxListPending {
+		q.Limit = maxListPending
+	}
+	rows, err := s.outbox.ListPending(ctx, sqlite.ListPendingParams{
+		AccountID:      q.AccountID,
+		ConversationID: q.ConversationID,
+		Limit:          q.Limit,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("list pending deliveries: %w", err)
+	}
+
+	deliveries := make([]PendingDelivery, 0, len(rows))
+	for _, row := range rows {
+		delivery := PendingDelivery{
+			OutboxID:       row.OutboxID,
+			AccountID:      row.AccountID,
+			ConversationID: row.ConversationID,
+			Kind:           row.Kind,
+			State:          row.State,
+			ScheduledFor:   time.UnixMilli(row.ScheduledForMS),
+			AttemptCount:   row.AttemptCount,
+			CreatedAt:      time.UnixMilli(row.CreatedAtMS),
+			Summary:        pendingSummary(row),
+			ErrorClass:     stringValue(row.ErrorClass),
+			ErrorCode:      stringValue(row.ErrorCode),
+		}
+		if row.NextAttemptAtMS != nil {
+			delivery.NextAttemptAt = time.UnixMilli(*row.NextAttemptAtMS)
+		}
+		deliveries = append(deliveries, delivery)
+	}
+	return deliveries, nil
+}
+
+func pendingSummary(row sqlite.PendingRow) string {
+	var summary string
+	switch row.Kind {
+	case sqlite.OutboxKindText:
+		summary = stringValue(row.Body)
+	case sqlite.OutboxKindMedia:
+		summary = stringValue(row.MediaFile)
+		if summary == "" {
+			summary = "media"
+		}
+		if caption := stringValue(row.Body); caption != "" {
+			summary += ": " + caption
+		}
+	case sqlite.OutboxKindReaction:
+		summary = stringValue(row.Emoji)
+	case sqlite.OutboxKindRead:
+		return ""
+	}
+	runes := []rune(summary)
+	if len(runes) > summaryMaxRunes {
+		return string(runes[:summaryMaxRunes])
+	}
+	return summary
+}
+
+func (s *MessageService) nextPollDelay(ctx context.Context) time.Duration {
+	earliest, ok, err := s.outbox.EarliestDue(ctx)
+	if err != nil || !ok {
+		return s.maxPollDelay
+	}
+	delay := earliest.Sub(s.clock.Now())
+	if delay < s.pollDelay {
+		return s.pollDelay
+	}
+	if delay > s.maxPollDelay {
+		return s.maxPollDelay
+	}
+	return delay
 }
 
 // Wait blocks until the intent reaches a user-actionable or terminal state.

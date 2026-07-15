@@ -94,6 +94,24 @@ type OutboxItem struct {
 	UpdatedAtMS         int64
 }
 
+// ListPendingParams scopes a deterministic pending-outbox read. Empty account
+// and conversation IDs leave their respective dimensions unfiltered.
+type ListPendingParams struct {
+	AccountID      string
+	ConversationID string
+	Limit          int
+}
+
+// PendingRow embeds the durable outbox row and carries nullable sources used
+// by the messaging layer to build kind-specific summaries.
+type PendingRow struct {
+	OutboxItem
+	Body      *string
+	MediaFile *string
+	MediaMIME *string
+	Emoji     *string
+}
+
 // OutboxAttachment is the persisted blob metadata for one media outbox intent.
 // M2 stores exactly one attachment at ordinal zero. Enqueue stamps OutboxID,
 // Ordinal, and CreatedAtMS; GetOutboxAttachment populates every field.
@@ -903,6 +921,69 @@ func isRequestBoundOrConfirmedRemoteID(remoteMessageID string, item OutboxItem) 
 		return true
 	}
 	return item.ResultRemoteID != nil && remoteMessageID == *item.ResultRemoteID
+}
+
+// EarliestDue returns the wall-clock time at which the earliest queued or
+// not-dispatched row becomes leaseable, or ok=false when none exist.
+func (r *OutboxRepository) EarliestDue(ctx context.Context) (time.Time, bool, error) {
+	var earliestMS sql.NullInt64
+	if err := r.store.db.QueryRowContext(ctx, `
+		SELECT MIN(COALESCE(next_attempt_at_ms, scheduled_for_ms))
+		FROM outbox
+		WHERE state IN ('queued','not_dispatched')
+	`).Scan(&earliestMS); err != nil {
+		return time.Time{}, false, fmt.Errorf("find earliest due outbox item: %w", err)
+	}
+	if !earliestMS.Valid {
+		return time.Time{}, false, nil
+	}
+	return time.UnixMilli(earliestMS.Int64), true, nil
+}
+
+// ListPending returns exactly the cancelable outbox set, ordered by the same
+// due key used by LeaseDue and enriched with nullable per-kind summary data.
+func (r *OutboxRepository) ListPending(
+	ctx context.Context,
+	p ListPendingParams,
+) ([]PendingRow, error) {
+	if p.Limit <= 0 {
+		return nil, fmt.Errorf("list pending outbox items: limit must be positive")
+	}
+
+	query := `
+		SELECT ` + prefixedOutboxColumns("o") + `,
+			m.body,
+			oa.filename,
+			oa.mime,
+			orx.emoji
+		FROM outbox o
+		LEFT JOIN messages m ON m.message_id = o.local_message_id
+		LEFT JOIN outbox_attachments oa ON oa.outbox_id = o.outbox_id AND oa.ordinal = 0
+		LEFT JOIN outbox_reactions orx ON orx.outbox_id = o.outbox_id
+		WHERE o.state IN ('queued','not_dispatched')`
+	args := make([]any, 0, 3)
+	if p.AccountID != "" {
+		query += ` AND o.account_id = ?`
+		args = append(args, p.AccountID)
+	}
+	if p.ConversationID != "" {
+		query += ` AND o.conversation_id = ?`
+		args = append(args, p.ConversationID)
+	}
+	query += `
+		ORDER BY COALESCE(o.next_attempt_at_ms, o.scheduled_for_ms), o.created_at_ms, o.outbox_id
+		LIMIT ?`
+	args = append(args, p.Limit)
+
+	rows, err := r.store.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list pending outbox items: query: %w", err)
+	}
+	items, err := collectRows(rows, scanPendingRow)
+	if err != nil {
+		return nil, fmt.Errorf("list pending outbox items: scan: %w", err)
+	}
+	return items, nil
 }
 
 // LeaseDue atomically claims due queued and retryable rows. An uncertain row is
@@ -1838,6 +1919,46 @@ const outboxColumns = `
 	next_attempt_at_ms,
 	created_at_ms,
 	updated_at_ms`
+
+func prefixedOutboxColumns(alias string) string {
+	columns := strings.TrimSpace(outboxColumns)
+	return alias + "." + strings.ReplaceAll(columns, "\n\t", "\n\t"+alias+".")
+}
+
+func scanPendingRow(row rowScanner) (PendingRow, error) {
+	var pending PendingRow
+	err := row.Scan(
+		&pending.OutboxID,
+		&pending.AccountID,
+		&pending.ConversationID,
+		&pending.Kind,
+		&pending.IdempotencyKey,
+		&pending.PayloadHash,
+		&pending.Operation,
+		&pending.State,
+		&pending.LocalMessageID,
+		&pending.TransportRequestID,
+		&pending.SendAgainOfOutboxID,
+		&pending.ResultRemoteID,
+		&pending.ErrorClass,
+		&pending.ErrorCode,
+		&pending.ErrorDetail,
+		&pending.AttemptCount,
+		&pending.LeaseOwner,
+		&pending.LeaseToken,
+		&pending.LeaseExpiresAtMS,
+		&pending.TransportCalledAtMS,
+		&pending.ScheduledForMS,
+		&pending.NextAttemptAtMS,
+		&pending.CreatedAtMS,
+		&pending.UpdatedAtMS,
+		&pending.Body,
+		&pending.MediaFile,
+		&pending.MediaMIME,
+		&pending.Emoji,
+	)
+	return pending, err
+}
 
 func scanOutboxItem(row rowScanner) (OutboxItem, error) {
 	var item OutboxItem

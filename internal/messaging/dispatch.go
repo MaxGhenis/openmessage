@@ -38,7 +38,7 @@ func (s *MessageService) Run(ctx context.Context) error {
 			return fmt.Errorf("run message service: %w", err)
 		}
 
-		timer := s.clock.NewTimer(s.pollDelay)
+		timer := s.clock.NewTimer(s.nextPollDelay(ctx))
 		select {
 		case <-ctx.Done():
 			timer.Stop()
