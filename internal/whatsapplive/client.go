@@ -70,6 +70,10 @@ var sendTextMessage = func(cli *whatsmeow.Client, ctx context.Context, to watype
 	return cli.SendMessage(ctx, to, message, extra...)
 }
 
+var markReadMessages = func(cli *whatsmeow.Client, ctx context.Context, ids []watypes.MessageID, timestamp time.Time, chat, sender watypes.JID, receiptTypeExtra ...watypes.ReceiptType) error {
+	return cli.MarkRead(ctx, ids, timestamp, chat, sender, receiptTypeExtra...)
+}
+
 var uploadMedia = func(cli *whatsmeow.Client, ctx context.Context, plaintext []byte, mediaType whatsmeow.MediaType) (whatsmeow.UploadResponse, error) {
 	return cli.Upload(ctx, plaintext, mediaType)
 }
@@ -1406,6 +1410,42 @@ func (e sendNotDispatchedError) Unwrap() error { return e.cause }
 
 func (e sendNotDispatchedError) Is(target error) bool {
 	return target == ErrSendNotDispatched
+}
+
+// MarkReadRequest sends read receipts from v2 request data without loading
+// locally stored messages.
+func (b *Bridge) MarkReadRequest(conversationID string, messageIDs []string, senderID string, readAt time.Time) error {
+	if len(messageIDs) == 0 {
+		return markSendNotDispatched(errors.New("at least one WhatsApp message ID is required"), true)
+	}
+
+	chatJID, err := parseConversationJID(conversationID)
+	if err != nil {
+		return markSendNotDispatched(err, true)
+	}
+	chatJID = b.normalizeConversationJID(chatJID)
+
+	ids := make([]watypes.MessageID, len(messageIDs))
+	for i, messageID := range messageIDs {
+		ids[i] = watypes.MessageID(messageID)
+	}
+	senderJID := watypes.EmptyJID
+	if strings.TrimSpace(senderID) != "" {
+		senderJID = b.canonicalJID(parseWhatsAppSenderJID(senderID))
+	}
+
+	cli, err := b.ensureSendClient()
+	if err != nil {
+		return markSendNotDispatched(err, true)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+
+	if err := markReadMessages(cli, ctx, ids, readAt, chatJID, senderJID); err != nil {
+		b.reportConnectionError(err)
+		return fmt.Errorf("mark WhatsApp messages read: %w", err)
+	}
+	return nil
 }
 
 // SendReactionRequest sends a reaction from the v2 request data without

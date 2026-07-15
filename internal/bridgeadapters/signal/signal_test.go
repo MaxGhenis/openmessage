@@ -28,6 +28,28 @@ func TestAdapterImplementsReactionSender(t *testing.T) {
 	var _ bridge.ReactionSender = (*Adapter)(nil)
 }
 
+func TestAdapterDoesNotImplementReadReceiptSender(t *testing.T) {
+	var adapter bridge.Adapter = (*Adapter)(nil)
+	if _, ok := adapter.(bridge.ReadReceiptSender); ok {
+		t.Fatal("Signal adapter unexpectedly implements bridge.ReadReceiptSender")
+	}
+}
+
+func TestRegistryKeepsSignalReadReceiptsUndeclared(t *testing.T) {
+	const accountID = "signal-primary"
+
+	registry := bridge.NewRegistry()
+	if err := registry.Register(New(accountID, nil)); err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+	if _, ok := registry.Snapshot(accountID); !ok {
+		t.Fatal("registered Signal account was not discovered")
+	}
+	if got := registry.Capabilities(accountID).ReadReceipts; got {
+		t.Fatal("Signal ReadReceipts capability = true, want false")
+	}
+}
+
 func TestSendTextRequiresReadyRetainedBridge(t *testing.T) {
 	tests := []struct {
 		name   string

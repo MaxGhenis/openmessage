@@ -52,6 +52,9 @@ func (a *Adapter) AccountID() string { return a.accountID }
 func (a *Adapter) Platform() bridge.Platform { return bridge.PlatformSignal }
 
 func (a *Adapter) DeclaredCapabilities() bridge.CapabilitySet {
+	// ReadReceipts deliberately remains undeclared. A 1:1 signal-cli
+	// sendReceipt adapter is deferred to a follow-up because sendReceipt has no
+	// --group-id and group receipt semantics cannot yet be served honestly.
 	return bridge.CapabilitySet{
 		TextSend:      true,
 		MediaSend:     true,
