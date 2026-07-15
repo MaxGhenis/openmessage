@@ -20,6 +20,61 @@ import (
 
 var messagingTestTime = time.Date(2026, time.July, 12, 12, 0, 0, 0, time.UTC)
 
+func TestNextPollDelayClampsToDueWindow(t *testing.T) {
+	tests := []struct {
+		name            string
+		enqueue         bool
+		notBeforeOffset time.Duration
+		want            time.Duration
+	}{
+		{name: "far future", enqueue: true, notBeforeOffset: 6 * time.Hour, want: defaultMaxPollDelay},
+		{name: "near future", enqueue: true, notBeforeOffset: 2 * time.Second, want: 2 * time.Second},
+		{name: "overdue", enqueue: true, notBeforeOffset: -time.Second, want: defaultPollDelay},
+		{name: "empty", want: defaultMaxPollDelay},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			clock := newManualClock(messagingTestTime)
+			store := openMessagingTestStore(t, clock.Now())
+			service := newMessagingTestService(
+				t,
+				store,
+				newScriptedRegistry("poll-delay", &scriptedTextSender{}),
+				clock,
+			)
+			if test.enqueue {
+				command := SendTextCommand{
+					CommonCommand: testCommonCommand("key-poll-delay"),
+					Body:          "wake at the right time",
+				}
+				command.NotBefore = clock.Now().Add(test.notBeforeOffset)
+				mustSendText(t, service, command)
+			}
+
+			if got := service.nextPollDelay(context.Background()); got != test.want {
+				t.Fatalf("nextPollDelay() = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
+func TestNextPollDelayUsesCeilingOnReadError(t *testing.T) {
+	clock := newManualClock(messagingTestTime)
+	store := openMessagingTestStore(t, clock.Now())
+	service := newMessagingTestService(
+		t,
+		store,
+		newScriptedRegistry("poll-read-error", &scriptedTextSender{}),
+		clock,
+	)
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close(): %v", err)
+	}
+	if got := service.nextPollDelay(context.Background()); got != defaultMaxPollDelay {
+		t.Fatalf("nextPollDelay(read error) = %v, want %v", got, defaultMaxPollDelay)
+	}
+}
+
 func TestUnavailableTextReturnsToQueuedWithoutAttempt(t *testing.T) {
 	for _, platform := range []bridge.Platform{"scripted-alpha", "future-platform"} {
 		t.Run(string(platform), func(t *testing.T) {
@@ -57,6 +112,47 @@ func TestUnavailableTextReturnsToQueuedWithoutAttempt(t *testing.T) {
 				t.Fatalf("available delivery = %+v, want confirmed", got)
 			}
 		})
+	}
+}
+
+func TestOfflineConsumesZeroAttemptsAcrossCycles(t *testing.T) {
+	clock := newManualClock(messagingTestTime)
+	store := openMessagingTestStore(t, clock.Now())
+	sender := &scriptedTextSender{steps: []sendStep{{
+		result: bridge.SendResult{RemoteMessageID: "remote-after-offline-cycles"},
+	}}}
+	registry := newScriptedRegistry("offline-cycles", sender)
+	service := newMessagingTestService(t, store, registry, clock)
+	submission := mustSendText(t, service, SendTextCommand{
+		CommonCommand: testCommonCommand("key-offline-cycles"),
+		Body:          "wait without spending attempts",
+	})
+
+	for cycle := 1; cycle <= 5; cycle++ {
+		processed, err := service.DispatchDue(context.Background(), 8)
+		if err != nil || processed != 1 {
+			t.Fatalf("DispatchDue(offline cycle %d) = %d, %v; want 1, nil", cycle, processed, err)
+		}
+		row := mustOutboxItem(t, service, submission.OutboxID)
+		if row.State != sqlite.OutboxQueued || row.AttemptCount != 0 || row.NextAttemptAtMS != nil {
+			t.Fatalf("offline row after cycle %d = %+v, want queued/attempt=0/no next-attempt", cycle, row)
+		}
+		if got := sender.requestCount(); got != 0 {
+			t.Fatalf("offline send count after cycle %d = %d, want 0", cycle, got)
+		}
+		clock.Advance(time.Minute)
+	}
+
+	registry.setAvailable(true)
+	if processed, err := service.DispatchDue(context.Background(), 8); err != nil || processed != 1 {
+		t.Fatalf("DispatchDue(available) = %d, %v; want 1, nil", processed, err)
+	}
+	row := mustOutboxItem(t, service, submission.OutboxID)
+	if row.State != sqlite.OutboxConfirmed || row.AttemptCount != 1 {
+		t.Fatalf("available row = %+v, want confirmed with one attempt", row)
+	}
+	if got := sender.requestCount(); got != 1 {
+		t.Fatalf("available send count = %d, want 1", got)
 	}
 }
 
@@ -155,6 +251,147 @@ func TestRetryableNotDispatchedReusesTransportRequestID(t *testing.T) {
 			if len(requests) != 2 || requests[0].RequestID == "" ||
 				requests[0].RequestID != requests[1].RequestID {
 				t.Fatalf("request IDs = %+v, want same stable ID", requests)
+			}
+		})
+	}
+}
+
+func TestListPendingSurfacesNotDispatchedErrorState(t *testing.T) {
+	clock := newManualClock(messagingTestTime)
+	store := openMessagingTestStore(t, clock.Now())
+	sender := &scriptedTextSender{steps: []sendStep{{
+		err: bridge.OpError{
+			Class:     bridge.FailureTransient,
+			Operation: "prepare_pending",
+			Dispatch:  bridge.DispatchNotCalled,
+			Cause:     errors.New("failed before remote dispatch"),
+		},
+	}}}
+	registry := newScriptedRegistry("pending-error", sender)
+	registry.setAvailable(true)
+	service := newMessagingTestService(t, store, registry, clock)
+	submission := mustSendText(t, service, SendTextCommand{
+		CommonCommand: testCommonCommand("key-list-pending-error"),
+		Body:          "retry this message later",
+	})
+
+	if processed, err := service.DispatchDue(context.Background(), 1); err != nil || processed != 1 {
+		t.Fatalf("DispatchDue() = %d, %v; want 1, nil", processed, err)
+	}
+	pending, err := service.ListPending(context.Background(), ListPendingQuery{Limit: 10})
+	if err != nil {
+		t.Fatalf("ListPending(): %v", err)
+	}
+	if len(pending) != 1 {
+		t.Fatalf("ListPending() returned %d rows, want 1: %+v", len(pending), pending)
+	}
+	got := pending[0]
+	if got.OutboxID != submission.OutboxID ||
+		got.AccountID != "account-1" ||
+		got.ConversationID != "conversation-1" ||
+		got.Kind != sqlite.OutboxKindText ||
+		got.State != OutboxNotDispatched ||
+		!got.ScheduledFor.Equal(clock.Now()) ||
+		!got.NextAttemptAt.Equal(clock.Now().Add(defaultRetryDelay)) ||
+		got.AttemptCount != 1 ||
+		!got.CreatedAt.Equal(clock.Now()) ||
+		got.Summary != "retry this message later" ||
+		got.ErrorClass != string(bridge.FailureTransient) ||
+		got.ErrorCode != "prepare_pending" {
+		t.Fatalf("ListPending() row = %+v, want populated not_dispatched error surface", got)
+	}
+}
+
+func TestListPendingValidatesQuery(t *testing.T) {
+	clock := newManualClock(messagingTestTime)
+	store := openMessagingTestStore(t, clock.Now())
+	service := newMessagingTestService(
+		t,
+		store,
+		newScriptedRegistry("list-validation", &scriptedTextSender{}),
+		clock,
+	)
+	if _, err := service.ListPending(nil, ListPendingQuery{Limit: 1}); err == nil {
+		t.Fatal("ListPending(nil context) succeeded, want error")
+	}
+	if _, err := service.ListPending(context.Background(), ListPendingQuery{}); err == nil {
+		t.Fatal("ListPending(zero limit) succeeded, want error")
+	}
+	if got, err := service.ListPending(
+		context.Background(),
+		ListPendingQuery{Limit: maxListPending + 1},
+	); err != nil || len(got) != 0 {
+		t.Fatalf("ListPending(clamped empty query) = %+v, %v; want empty, nil", got, err)
+	}
+}
+
+func TestPendingSummaryKindsAndRuneSafeTruncation(t *testing.T) {
+	stringPointer := func(value string) *string { return &value }
+	tests := []struct {
+		name string
+		row  sqlite.PendingRow
+		want string
+	}{
+		{
+			name: "text",
+			row: sqlite.PendingRow{
+				OutboxItem: sqlite.OutboxItem{Kind: sqlite.OutboxKindText},
+				Body:       stringPointer("message preview"),
+			},
+			want: "message preview",
+		},
+		{
+			name: "media filename and caption",
+			row: sqlite.PendingRow{
+				OutboxItem: sqlite.OutboxItem{Kind: sqlite.OutboxKindMedia},
+				Body:       stringPointer("caption preview"),
+				MediaFile:  stringPointer("photo.jpg"),
+			},
+			want: "photo.jpg: caption preview",
+		},
+		{
+			name: "media fallback",
+			row: sqlite.PendingRow{
+				OutboxItem: sqlite.OutboxItem{Kind: sqlite.OutboxKindMedia},
+			},
+			want: "media",
+		},
+		{
+			name: "media fallback and caption",
+			row: sqlite.PendingRow{
+				OutboxItem: sqlite.OutboxItem{Kind: sqlite.OutboxKindMedia},
+				Body:       stringPointer("caption preview"),
+			},
+			want: "media: caption preview",
+		},
+		{
+			name: "reaction",
+			row: sqlite.PendingRow{
+				OutboxItem: sqlite.OutboxItem{Kind: sqlite.OutboxKindReaction},
+				Emoji:      stringPointer("👍"),
+			},
+			want: "👍",
+		},
+		{
+			name: "read",
+			row: sqlite.PendingRow{
+				OutboxItem: sqlite.OutboxItem{Kind: sqlite.OutboxKindRead},
+			},
+			want: "",
+		},
+		{
+			name: "rune safe truncation",
+			row: sqlite.PendingRow{
+				OutboxItem: sqlite.OutboxItem{Kind: sqlite.OutboxKindText},
+				Body:       stringPointer(strings.Repeat("世", summaryMaxRunes+1)),
+			},
+			want: strings.Repeat("世", summaryMaxRunes),
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := pendingSummary(test.row); got != test.want {
+				t.Fatalf("pendingSummary() = %q, want %q", got, test.want)
 			}
 		})
 	}
@@ -331,6 +568,55 @@ func TestNewServiceOverSameStoreDispatchesQueuedText(t *testing.T) {
 	requests := sender.snapshotRequests()
 	if len(requests) != 1 || requests[0].Body != "survive service restart" {
 		t.Fatalf("request after restart = %+v", requests)
+	}
+}
+
+func TestNewServiceOverSameStoreRecoversFarFutureText(t *testing.T) {
+	clock := newManualClock(messagingTestTime)
+	store := openMessagingTestStore(t, clock.Now())
+	first := newMessagingTestService(
+		t,
+		store,
+		newScriptedRegistry("future-before-restart", &scriptedTextSender{}),
+		clock,
+	)
+	command := SendTextCommand{
+		CommonCommand: testCommonCommand("key-future-restart"),
+		Body:          "survive until the future",
+	}
+	command.NotBefore = clock.Now().Add(6 * time.Hour)
+	submission := mustSendText(t, first, command)
+
+	sender := &scriptedTextSender{steps: []sendStep{{
+		result: bridge.SendResult{RemoteMessageID: "remote-future-restart"},
+	}}}
+	available := newScriptedRegistry("future-after-restart", sender)
+	available.setAvailable(true)
+	restarted := newMessagingTestService(t, store, available, clock)
+
+	before := mustOutboxItem(t, restarted, submission.OutboxID)
+	if before.State != sqlite.OutboxQueued ||
+		before.ScheduledForMS != command.NotBefore.UnixMilli() ||
+		before.AttemptCount != 0 {
+		t.Fatalf("future row after restart = %+v, want queued with preserved schedule and zero attempts", before)
+	}
+	if processed, err := restarted.DispatchDue(context.Background(), 4); err != nil || processed != 0 {
+		t.Fatalf("DispatchDue(before due) = %d, %v; want 0, nil", processed, err)
+	}
+	if got := sender.requestCount(); got != 0 {
+		t.Fatalf("send count before due = %d, want 0", got)
+	}
+
+	clock.Advance(6*time.Hour + time.Millisecond)
+	if processed, err := restarted.DispatchDue(context.Background(), 4); err != nil || processed != 1 {
+		t.Fatalf("DispatchDue(after due) = %d, %v; want 1, nil", processed, err)
+	}
+	after := mustOutboxItem(t, restarted, submission.OutboxID)
+	if after.State != sqlite.OutboxConfirmed || after.AttemptCount != 1 {
+		t.Fatalf("future row after dispatch = %+v, want confirmed with one attempt", after)
+	}
+	if got := sender.requestCount(); got != 1 {
+		t.Fatalf("send count after due = %d, want 1", got)
 	}
 }
 
@@ -1149,6 +1435,109 @@ func TestCancelAndDeferredAPIs(t *testing.T) {
 	}
 	if err := service.ObserveTransportEcho(context.Background(), TransportEcho{}); !errors.Is(err, ErrInvalidCommand) {
 		t.Fatalf("ObserveTransportEcho() error = %v, want ErrInvalidCommand", err)
+	}
+}
+
+func TestCancelFarFutureRowPreventsDispatchAfterDue(t *testing.T) {
+	clock := newManualClock(messagingTestTime)
+	store := openMessagingTestStore(t, clock.Now())
+	sender := &scriptedTextSender{steps: []sendStep{{
+		result: bridge.SendResult{RemoteMessageID: "remote-canceled-future"},
+	}}}
+	registry := newScriptedRegistry("cancel-future", sender)
+	registry.setAvailable(true)
+	service := newMessagingTestService(t, store, registry, clock)
+	command := SendTextCommand{
+		CommonCommand: testCommonCommand("key-cancel-future"),
+		Body:          "cancel before the future",
+	}
+	command.NotBefore = clock.Now().Add(6 * time.Hour)
+	submission := mustSendText(t, service, command)
+	if row := mustOutboxItem(t, service, submission.OutboxID); row.State != sqlite.OutboxQueued {
+		t.Fatalf("future row before cancel = %+v, want queued", row)
+	}
+
+	canceled, err := service.Cancel(context.Background(), submission.OutboxID)
+	if err != nil || canceled.State != OutboxCanceled {
+		t.Fatalf("Cancel(future) = %+v, %v; want canceled, nil", canceled, err)
+	}
+	clock.Advance(6*time.Hour + time.Millisecond)
+	if processed, err := service.DispatchDue(context.Background(), 1); err != nil || processed != 0 {
+		t.Fatalf("DispatchDue(canceled after due) = %d, %v; want 0, nil", processed, err)
+	}
+	row := mustOutboxItem(t, service, submission.OutboxID)
+	if row.State != sqlite.OutboxCanceled || row.AttemptCount != 0 {
+		t.Fatalf("canceled row after due = %+v, want canceled with zero attempts", row)
+	}
+	if got := sender.requestCount(); got != 0 {
+		t.Fatalf("canceled send count = %d, want 0", got)
+	}
+}
+
+func TestCancelRaceWithDispatchSettlesExactlyOnce(t *testing.T) {
+	clock := newManualClock(messagingTestTime)
+	store := openMessagingTestStore(t, clock.Now())
+	sender := &scriptedTextSender{steps: []sendStep{{
+		result: bridge.SendResult{RemoteMessageID: "remote-cancel-race"},
+	}}}
+	registry := newScriptedRegistry("cancel-race", sender)
+	registry.setAvailable(true)
+	service := newMessagingTestService(t, store, registry, clock)
+	submission := mustSendText(t, service, SendTextCommand{
+		CommonCommand: testCommonCommand("key-cancel-race"),
+		Body:          "cancel or dispatch once",
+	})
+
+	start := make(chan struct{})
+	var wait sync.WaitGroup
+	var canceled Delivery
+	var cancelErr error
+	var processed int
+	var dispatchErr error
+	wait.Add(2)
+	go func() {
+		defer wait.Done()
+		<-start
+		canceled, cancelErr = service.Cancel(context.Background(), submission.OutboxID)
+	}()
+	go func() {
+		defer wait.Done()
+		<-start
+		processed, dispatchErr = service.DispatchDue(context.Background(), 1)
+	}()
+	close(start)
+	wait.Wait()
+
+	if dispatchErr != nil {
+		t.Fatalf("DispatchDue(racing cancel) error = %v", dispatchErr)
+	}
+	row := mustOutboxItem(t, service, submission.OutboxID)
+	switch row.State {
+	case sqlite.OutboxCanceled:
+		if cancelErr != nil || canceled.State != OutboxCanceled || processed != 0 ||
+			row.AttemptCount != 0 || sender.requestCount() != 0 {
+			t.Fatalf(
+				"cancel-won outcome = delivery %+v, cancel err %v, processed %d, row %+v, sends %d",
+				canceled,
+				cancelErr,
+				processed,
+				row,
+				sender.requestCount(),
+			)
+		}
+	case sqlite.OutboxConfirmed:
+		if !errors.Is(cancelErr, ErrInvalidState) || processed != 1 ||
+			row.AttemptCount != 1 || sender.requestCount() != 1 {
+			t.Fatalf(
+				"dispatch-won outcome = cancel err %v, processed %d, row %+v, sends %d",
+				cancelErr,
+				processed,
+				row,
+				sender.requestCount(),
+			)
+		}
+	default:
+		t.Fatalf("racing cancel left outbox row in %q: %+v", row.State, row)
 	}
 }
 
