@@ -3346,6 +3346,14 @@ func parseConversationTarget(conversationID string) (target string, isGroup bool
 	return
 }
 
+// ParseConversationTarget exposes the retained Signal conversation parser to
+// lifecycle adapters that must turn a Wave-4 media remote_ref into the exact
+// getAttachment recipient/group arguments. Keep parsing centralized here so
+// send and download paths cannot drift on signal:/signal-group: semantics.
+func ParseConversationTarget(conversationID string) (target string, isGroup bool, err error) {
+	return parseConversationTarget(conversationID)
+}
+
 func signalConversationID(address, groupID string) string {
 	if groupID = strings.TrimSpace(groupID); groupID != "" {
 		return "signal-group:" + groupID
@@ -3827,12 +3835,58 @@ func (b *Bridge) DownloadMedia(msg *db.Message) ([]byte, string, error) {
 	if err != nil {
 		return nil, "", err
 	}
-
-	args := []string{"-a", account, "getAttachment", "--id", attachmentID}
 	target, isGroup, err := parseConversationTarget(msg.ConversationID)
 	if err != nil {
 		return nil, "", err
 	}
+	data, err := b.downloadSignalAttachment(account, attachmentID, target, isGroup)
+	if err != nil {
+		return nil, "", err
+	}
+	return data, msg.MimeType, nil
+}
+
+// DownloadMediaRef is the store-free retained entry point used by the M4b
+// lifecycle adapter. Signal's transport reports no MIME, so the adapter falls
+// back to bridge.MediaRef.MIME after this returns an empty MIME string.
+func (b *Bridge) DownloadMediaRef(
+	account, kind, attachmentID, path, target string,
+	isGroup bool,
+) ([]byte, string, error) {
+	switch strings.TrimSpace(kind) {
+	case "local":
+		if strings.TrimSpace(path) == "" {
+			return nil, "", errors.New("Signal local attachment path is required")
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil, "", fmt.Errorf("read local Signal attachment: %w", err)
+		}
+		return data, "", nil
+	case "remote":
+		account = strings.TrimSpace(account)
+		attachmentID = strings.TrimSpace(attachmentID)
+		target = strings.TrimSpace(target)
+		if account == "" || attachmentID == "" || target == "" {
+			return nil, "", errors.New("Signal remote attachment account, id, and target are required")
+		}
+		data, err := b.downloadSignalAttachment(account, attachmentID, target, isGroup)
+		if err != nil {
+			return nil, "", err
+		}
+		return data, "", nil
+	default:
+		return nil, "", fmt.Errorf("unsupported Signal attachment kind %q", kind)
+	}
+}
+
+// downloadSignalAttachment is the store-free signal-cli getAttachment core
+// shared by the legacy db.Message downloader and the ref-shaped M4b path.
+func (b *Bridge) downloadSignalAttachment(
+	account, attachmentID, target string,
+	isGroup bool,
+) ([]byte, error) {
+	args := []string{"-a", account, "getAttachment", "--id", attachmentID}
 	if isGroup {
 		args = append(args, "--group-id", target)
 	} else {
@@ -3845,20 +3899,20 @@ func (b *Bridge) DownloadMedia(msg *db.Message) ([]byte, string, error) {
 	output, err := runSignalCLI(ctx, b.configDir, args...)
 	b.commandMu.Unlock()
 	if err != nil {
-		return nil, "", commandError("download Signal attachment", err, output)
+		return nil, commandError("download Signal attachment", err, output)
 	}
 	payload := strings.TrimSpace(string(output))
 	if payload == "" {
-		return nil, "", errors.New("signal attachment is empty")
+		return nil, errors.New("signal attachment is empty")
 	}
 	data, err := base64.StdEncoding.DecodeString(payload)
 	if err != nil {
 		data, err = base64.RawStdEncoding.DecodeString(payload)
 		if err != nil {
-			return nil, "", fmt.Errorf("decode Signal attachment: %w", err)
+			return nil, fmt.Errorf("decode Signal attachment: %w", err)
 		}
 	}
-	return data, msg.MimeType, nil
+	return data, nil
 }
 
 func (b *Bridge) signalQuoteArgs(replyToID, account string) ([]string, error) {

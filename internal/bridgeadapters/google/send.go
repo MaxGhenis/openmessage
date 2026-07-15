@@ -1,12 +1,16 @@
 package google
 
 import (
+	"bytes"
 	"context"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"math"
 	"strings"
+	"unicode/utf8"
 
 	"go.mau.fi/mautrix-gmessages/pkg/libgm/gmproto"
 
@@ -39,6 +43,98 @@ type readSendClient interface {
 
 var readSendClientFor = func(cli *client.Client) readSendClient {
 	return cli.GM
+}
+
+type downloadClient interface {
+	DownloadMedia(mediaID string, key []byte) ([]byte, string, error)
+}
+
+type downloadClientFunc func(mediaID string, key []byte) ([]byte, string, error)
+
+func (f downloadClientFunc) DownloadMedia(mediaID string, key []byte) ([]byte, string, error) {
+	return f(mediaID, key)
+}
+
+var downloadClientFor = func(cli *client.Client) downloadClient {
+	if cli == nil || cli.GM == nil {
+		return nil
+	}
+	// The pinned libgm fork exposes DownloadMedia(string, []byte)
+	// ([]byte, error), with no MIME result. Adapt that actual return shape to
+	// the lifecycle seam; the shim consequently falls back to MediaRef.MIME.
+	return downloadClientFunc(func(mediaID string, key []byte) ([]byte, string, error) {
+		data, err := cli.GM.DownloadMedia(mediaID, key)
+		return data, "", err
+	})
+}
+
+// googleDownloadOpaqueV1 is Google's versioned Wave-4-to-M4b wire contract.
+// The future Google decoder must pack these transport inputs into
+// message_attachments.remote_ref. No decoder does so yet, so this shim is
+// unit-testable but remains production-inert until Wave-4 ingest lands.
+type googleDownloadOpaqueV1 struct {
+	V             int    `json:"v"`
+	MediaID       string `json:"media_id"`
+	DecryptionKey string `json:"decryption_key"`
+}
+
+type googleDownloadRef struct {
+	mediaID string
+	key     []byte
+}
+
+func decodeGoogleDownloadOpaque(opaque []byte) (googleDownloadRef, error) {
+	if !utf8.Valid(opaque) {
+		return googleDownloadRef{}, unsupportedGoogleOpaqueError(
+			"google_opaque_malformed",
+			errors.New("Google media opaque payload is not valid UTF-8"),
+		)
+	}
+	var payload googleDownloadOpaqueV1
+	if err := json.Unmarshal(opaque, &payload); err != nil {
+		return googleDownloadRef{}, unsupportedGoogleOpaqueError(
+			"google_opaque_malformed",
+			fmt.Errorf("decode Google media opaque payload: %w", err),
+		)
+	}
+	if payload.V != 1 {
+		return googleDownloadRef{}, unsupportedGoogleOpaqueError(
+			"opaque_version_unsupported",
+			fmt.Errorf("Google media opaque version %d is unsupported", payload.V),
+		)
+	}
+	if strings.TrimSpace(payload.MediaID) == "" {
+		return googleDownloadRef{}, unsupportedGoogleOpaqueError(
+			"google_opaque_media_id_missing",
+			errors.New("Google media opaque payload has no media_id"),
+		)
+	}
+	if payload.DecryptionKey == "" {
+		return googleDownloadRef{}, unsupportedGoogleOpaqueError(
+			"google_opaque_decryption_key_missing",
+			errors.New("Google media opaque payload has no decryption_key"),
+		)
+	}
+	key, err := hex.DecodeString(payload.DecryptionKey)
+	if err != nil {
+		return googleDownloadRef{}, unsupportedGoogleOpaqueError(
+			"google_opaque_decryption_key_invalid",
+			fmt.Errorf("decode Google media decryption key: %w", err),
+		)
+	}
+	return googleDownloadRef{mediaID: payload.MediaID, key: key}, nil
+}
+
+// Structural opaque failures are terminal unsupported errors: remote_ref is
+// immutable input, so retrying the same malformed or incomplete payload can
+// never make the download succeed.
+func unsupportedGoogleOpaqueError(fingerprint string, cause error) bridge.OpError {
+	return bridge.OpError{
+		Class:       bridge.FailureUnsupported,
+		Operation:   "download_media",
+		Fingerprint: fingerprint,
+		Cause:       cause,
+	}
 }
 
 type mediaSendClient interface {
@@ -266,6 +362,57 @@ func (a *Adapter) MarkRead(ctx context.Context, req bridge.ReadReceiptRequest) e
 		)
 	}
 	return nil
+}
+
+// DownloadMedia adapts Google's versioned remote media reference to the
+// connected libgm client retained by the lifecycle-owned App generation.
+func (a *Adapter) DownloadMedia(
+	ctx context.Context,
+	accountID string,
+	ref bridge.MediaRef,
+) (bridge.MediaStream, error) {
+	if a == nil || a.host == nil || !a.host.Connected.Load() {
+		return bridge.MediaStream{}, notConnectedDownloadError()
+	}
+	cli := a.host.GetClient()
+	if cli == nil || cli.GM == nil {
+		return bridge.MediaStream{}, notConnectedDownloadError()
+	}
+	transport := downloadClientFor(cli)
+	if transport == nil {
+		return bridge.MediaStream{}, notConnectedDownloadError()
+	}
+	if ctx == nil {
+		return bridge.MediaStream{}, preDownloadError(
+			"google_download_context_invalid",
+			errors.New("Google media download context is nil"),
+		)
+	}
+	if err := ctx.Err(); err != nil {
+		return bridge.MediaStream{}, preDownloadError("google_download_context_done", err)
+	}
+
+	decoded, err := decodeGoogleDownloadOpaque(ref.Opaque)
+	if err != nil {
+		return bridge.MediaStream{}, err
+	}
+	data, transportMIME, err := transport.DownloadMedia(decoded.mediaID, decoded.key)
+	if err != nil {
+		return bridge.MediaStream{}, a.classifyDownloadTransportError(
+			fmt.Errorf("download Google media: %w", err),
+			"google_media_download_failed",
+		)
+	}
+
+	// libgm's retained downloader is fully buffered. This NopCloser adaptation
+	// intentionally forfeits true streaming until the transport exposes a
+	// reader, while still guaranteeing every nil-error result has a ReadCloser.
+	return bridge.MediaStream{
+		ReadCloser: io.NopCloser(bytes.NewReader(data)),
+		Size:       int64(len(data)),
+		Filename:   ref.Filename,
+		MIME:       firstNonEmpty(transportMIME, ref.MIME),
+	}, nil
 }
 
 // SendMedia adapts the durable media outbox request to the connected libgm
@@ -542,6 +689,33 @@ func (a *Adapter) classifyReadTransportError(err error, fingerprint string) brid
 	return failure
 }
 
+func notConnectedDownloadError() bridge.OpError {
+	return bridge.OpError{
+		Class:       bridge.FailureTransient,
+		Operation:   "download_media",
+		Fingerprint: "google_not_connected",
+		Cause:       errors.New("Google Messages is not connected"),
+	}
+}
+
+func preDownloadError(fingerprint string, cause error) bridge.OpError {
+	return bridge.OpError{
+		Class:       bridge.FailureTransient,
+		Operation:   "download_media",
+		Fingerprint: fingerprint,
+		Cause:       cause,
+	}
+}
+
+func (a *Adapter) classifyDownloadTransportError(err error, fingerprint string) bridge.OpError {
+	failure := a.classifyTransportError(err, "download_media", fingerprint)
+	// Downloads are idempotent reads. The media service simply retries on a
+	// later request, so the send-path Dispatch certainty does not apply here.
+	failure.Dispatch = ""
+	a.reportIfAuthIndicting(failure)
+	return failure
+}
+
 func notConnectedMediaError() bridge.OpError {
 	return bridge.OpError{
 		Class:       bridge.FailureTransient,
@@ -589,7 +763,17 @@ func (a *Adapter) reportIfAuthIndicting(failure bridge.OpError) {
 	}
 }
 
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
+}
+
 var _ bridge.TextSender = (*Adapter)(nil)
 var _ bridge.ReactionSender = (*Adapter)(nil)
 var _ bridge.ReadReceiptSender = (*Adapter)(nil)
 var _ bridge.MediaSender = (*Adapter)(nil)
+var _ bridge.MediaDownloader = (*Adapter)(nil)

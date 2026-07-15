@@ -41,6 +41,7 @@ type Adapter struct {
 	sendReactionRequest func(string, string, string, string, string, string) error
 	markReadRequest     func(string, []string, string, time.Time) error
 	sendMediaRequest    func(string, []byte, string, string, string, string, string) (string, time.Time, error)
+	downloadMediaRef    func(string, whatsapplive.StoredMediaRef, string, string, string) ([]byte, string, error)
 
 	mu       sync.Mutex
 	current  *run
@@ -70,6 +71,7 @@ func New(accountID string, host *whatsapplive.Bridge) *Adapter {
 		a.sendReactionRequest = host.SendReactionRequest
 		a.markReadRequest = host.MarkReadRequest
 		a.sendMediaRequest = host.SendMediaRequest
+		a.downloadMediaRef = host.DownloadMediaRef
 		host.ObserveLifecycle(a.handleLifecycleEvent)
 	}
 	return a
