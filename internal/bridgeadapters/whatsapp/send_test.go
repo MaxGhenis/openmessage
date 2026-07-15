@@ -18,6 +18,241 @@ func TestAdapterImplementsMediaSender(t *testing.T) {
 	var _ bridge.MediaSender = (*Adapter)(nil)
 }
 
+func TestAdapterImplementsTextSender(t *testing.T) {
+	var _ bridge.TextSender = (*Adapter)(nil)
+}
+
+func TestSendTextRequiresReadyTransportWithoutLifecycleAction(t *testing.T) {
+	var connectCalls, sendCalls int
+	a := &Adapter{
+		accountID: "whatsapp-primary",
+		connect: func(context.Context) error {
+			connectCalls++
+			return nil
+		},
+		mediaReady: func() bool { return false },
+		sendTextRequest: func(string, string, string, string) (string, time.Time, error) {
+			sendCalls++
+			return "", time.Time{}, nil
+		},
+	}
+
+	result, err := a.SendText(context.Background(), bridge.TextRequest{})
+	if result != (bridge.SendResult{}) {
+		t.Fatalf("SendText() result = %+v, want zero result", result)
+	}
+	failure, ok := asOpError(err)
+	if !ok {
+		t.Fatalf("SendText() error = %T %v, want bridge.OpError", err, err)
+	}
+	if failure.Class != bridge.FailureTransient ||
+		failure.Dispatch != bridge.DispatchNotCalled ||
+		failure.Operation != "send_text" ||
+		failure.Fingerprint != "whatsapp_not_connected" ||
+		!errors.Is(failure.Cause, whatsmeow.ErrNotConnected) {
+		t.Fatalf("SendText() failure = %+v, want classified not-connected pre-call failure", failure)
+	}
+	if connectCalls != 0 {
+		t.Fatalf("connect calls = %d, want zero", connectCalls)
+	}
+	if sendCalls != 0 {
+		t.Fatalf("transport send calls = %d, want zero", sendCalls)
+	}
+}
+
+func TestSendTextContextGuardsRunBeforeTransport(t *testing.T) {
+	tests := []struct {
+		name            string
+		ctx             context.Context
+		wantFingerprint string
+		wantCause       error
+	}{
+		{
+			name:            "nil context",
+			ctx:             nil,
+			wantFingerprint: "whatsapp_text_context_missing",
+		},
+		{
+			name:            "done context",
+			ctx:             canceledTextSendContext(),
+			wantFingerprint: "whatsapp_text_context_done",
+			wantCause:       context.Canceled,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var sendCalls int
+			a := &Adapter{
+				mediaReady: func() bool { return true },
+				sendTextRequest: func(string, string, string, string) (string, time.Time, error) {
+					sendCalls++
+					return "unexpected", time.Time{}, nil
+				},
+			}
+
+			_, err := a.SendText(test.ctx, bridge.TextRequest{})
+			failure, ok := asOpError(err)
+			if !ok || failure.Class != bridge.FailureTransient ||
+				failure.Dispatch != bridge.DispatchNotCalled ||
+				failure.Operation != "send_text" ||
+				failure.Fingerprint != test.wantFingerprint {
+				t.Fatalf("SendText() error = %v, want context pre-call failure %q", err, test.wantFingerprint)
+			}
+			if test.wantCause != nil && !errors.Is(failure.Cause, test.wantCause) {
+				t.Fatalf("SendText() cause = %v, want %v", failure.Cause, test.wantCause)
+			}
+			if sendCalls != 0 {
+				t.Fatalf("transport send calls = %d, want zero", sendCalls)
+			}
+		})
+	}
+}
+
+func canceledTextSendContext() context.Context {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	return ctx
+}
+
+func TestSendTextSuccessMapping(t *testing.T) {
+	acceptedAt := time.Date(2026, time.July, 13, 15, 4, 5, 0, time.UTC)
+	var gotConversationID, gotBody, gotReplyToID, gotRequestID string
+	a := &Adapter{
+		accountID:  "whatsapp-primary",
+		mediaReady: func() bool { return true },
+		sendTextRequest: func(conversationID, body, replyToID, requestID string) (string, time.Time, error) {
+			gotConversationID = conversationID
+			gotBody = body
+			gotReplyToID = replyToID
+			gotRequestID = requestID
+			return "derived-whatsapp-message-id", acceptedAt, nil
+		},
+	}
+
+	result, err := a.SendText(context.Background(), bridge.TextRequest{
+		AccountID: "whatsapp-primary",
+		Conversation: bridge.ConversationRef{
+			RemoteID: "whatsapp:15551234567@s.whatsapp.net",
+		},
+		Body:      "hello from v2",
+		ReplyTo:   &bridge.MessageRef{RemoteID: "whatsapp:reply-123"},
+		RequestID: "outbox-request-123",
+	})
+	if err != nil {
+		t.Fatalf("SendText() error = %v", err)
+	}
+	if result != (bridge.SendResult{
+		RemoteMessageID: "derived-whatsapp-message-id",
+		AcceptedAt:      acceptedAt,
+		EchoExpected:    false,
+	}) {
+		t.Fatalf("SendText() result = %+v, want derived remote ID and transport timestamp", result)
+	}
+	if gotConversationID != "whatsapp:15551234567@s.whatsapp.net" ||
+		gotBody != "hello from v2" ||
+		gotReplyToID != "whatsapp:reply-123" ||
+		gotRequestID != "outbox-request-123" {
+		t.Fatalf("SendTextRequest args = conversation=%q body=%q reply=%q request=%q",
+			gotConversationID, gotBody, gotReplyToID, gotRequestID)
+	}
+}
+
+func TestSendTextTransportErrorClassification(t *testing.T) {
+	tests := []struct {
+		name            string
+		err             error
+		wantDispatch    bridge.DispatchCertainty
+		wantFingerprint string
+	}{
+		{
+			name:            "connection disappeared before transport call",
+			err:             fmt.Errorf("%w: %w", whatsapplive.ErrSendNotDispatched, whatsmeow.ErrNotConnected),
+			wantDispatch:    bridge.DispatchNotCalled,
+			wantFingerprint: "whatsapp_not_connected",
+		},
+		{
+			name:            "validation failed before dispatch",
+			err:             fmt.Errorf("%w: invalid WhatsApp conversation", whatsapplive.ErrSendNotDispatched),
+			wantDispatch:    bridge.DispatchNotCalled,
+			wantFingerprint: "whatsapp_send_text_failed",
+		},
+		{
+			name:            "send returned not connected is uncertain",
+			err:             fmt.Errorf("send WhatsApp message: %w", whatsmeow.ErrNotConnected),
+			wantDispatch:    "",
+			wantFingerprint: "whatsapp_send_text_failed",
+		},
+		{
+			name:            "ambiguous send error is uncertain",
+			err:             errors.New("websocket closed while awaiting response"),
+			wantDispatch:    "",
+			wantFingerprint: "whatsapp_send_text_failed",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			a := &Adapter{
+				mediaReady: func() bool { return true },
+				sendTextRequest: func(string, string, string, string) (string, time.Time, error) {
+					return "", time.Time{}, test.err
+				},
+			}
+
+			_, err := a.SendText(context.Background(), bridge.TextRequest{})
+			failure, ok := asOpError(err)
+			if !ok || failure.Class != bridge.FailureTransient ||
+				failure.Dispatch != test.wantDispatch ||
+				failure.Operation != "send_text" ||
+				failure.Fingerprint != test.wantFingerprint ||
+				!errors.Is(failure.Cause, test.err) {
+				t.Fatalf("SendText() error = %v, want dispatch=%q fingerprint=%q",
+					err, test.wantDispatch, test.wantFingerprint)
+			}
+		})
+	}
+}
+
+// The adapter shim must never forward a text-send failure into the lifecycle.
+// Reconnect-worthy transport errors are already reported from the retained
+// core through its guarded reportConnectionError -> OnConnectionError chain.
+func TestSendTextFailureDoesNotRetireReceiveGeneration(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		err  error
+	}{
+		{"ambiguous send failure", errors.New("ambiguous send failure")},
+		{"not connected", fmt.Errorf("send WhatsApp message: %w", whatsmeow.ErrNotConnected)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ready := make(chan struct{})
+			close(ready)
+			r := &run{
+				ready:     ready,
+				finish:    make(chan error, 1),
+				admitting: true,
+			}
+			a := &Adapter{
+				current:    r,
+				mediaReady: func() bool { return true },
+				sendTextRequest: func(string, string, string, string) (string, time.Time, error) {
+					return "", time.Time{}, test.err
+				},
+			}
+
+			_, err := a.SendText(context.Background(), bridge.TextRequest{})
+			returnedFailure, ok := asOpError(err)
+			if !ok || !errors.Is(returnedFailure.Cause, test.err) {
+				t.Fatalf("SendText() error = %v, want classified transport failure", err)
+			}
+			select {
+			case reported := <-r.finish:
+				t.Fatalf("SendText() retired the receive generation with %v", reported)
+			default:
+			}
+		})
+	}
+}
+
 func TestSendMediaRequiresReadyTransportWithoutLifecycleAction(t *testing.T) {
 	var connectCalls, sendCalls int
 	a := &Adapter{
@@ -184,7 +419,7 @@ func TestSendMediaTransportErrorClassification(t *testing.T) {
 	}{
 		{
 			name:            "connection disappeared before transport call",
-			err:             fmt.Errorf("%w: %w", whatsapplive.ErrMediaNotDispatched, whatsmeow.ErrNotConnected),
+			err:             fmt.Errorf("%w: %w", whatsapplive.ErrSendNotDispatched, whatsmeow.ErrNotConnected),
 			wantClass:       bridge.FailureTransient,
 			wantDispatch:    bridge.DispatchNotCalled,
 			wantFingerprint: "whatsapp_not_connected",
@@ -198,7 +433,7 @@ func TestSendMediaTransportErrorClassification(t *testing.T) {
 		},
 		{
 			name:            "upload failed before dispatch",
-			err:             fmt.Errorf("%w: upload WhatsApp media: storage unavailable", whatsapplive.ErrMediaNotDispatched),
+			err:             fmt.Errorf("%w: upload WhatsApp media: storage unavailable", whatsapplive.ErrSendNotDispatched),
 			wantClass:       bridge.FailureTransient,
 			wantDispatch:    bridge.DispatchNotCalled,
 			wantFingerprint: "whatsapp_send_media_failed",

@@ -50,6 +50,7 @@ func TestParseSignalAccountsAcceptsJSONPhoneNumbers(t *testing.T) {
 }
 
 func TestBridgeSendTextRunsSignalCLI(t *testing.T) {
+	t.Setenv("OPENMESSAGES_MY_NAME", "")
 	bridge := &Bridge{
 		account:   "+15551230000",
 		connected: true,
@@ -77,29 +78,252 @@ func TestBridgeSendTextRunsSignalCLI(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SendText(): %v", err)
 	}
-	if got := strings.Join(captured[1:], " "); !strings.Contains(got, "-a +15551230000 send -m hello from signal +15551234567") {
-		t.Fatalf("unexpected signal-cli args: %q", got)
+	wantArgs := []string{
+		"-a", "+15551230000",
+		"send",
+		"-m", "hello from signal",
+		"+15551234567",
 	}
-	if msg.ConversationID != "signal:+15551234567" {
-		t.Fatalf("conversation id = %q", msg.ConversationID)
+	if !slices.Equal(captured[1:], wantArgs) {
+		t.Fatalf("legacy signal-cli args = %q, want %q", captured[1:], wantArgs)
 	}
-	if msg.Status != "sent" || !msg.IsFromMe {
-		t.Fatalf("unexpected outgoing message %+v", msg)
-	}
-	if msg.ReplyToID != "signal:quoted" {
-		t.Fatalf("reply_to_id = %q", msg.ReplyToID)
-	}
-	if msg.SourceID != strings.TrimPrefix(msg.MessageID, "signal:") {
-		t.Fatalf("source_id = %q, want trimmed message id", msg.SourceID)
+	if msg.MessageID != "signal:local:ff9f0accc4bd325d662c082170f55eea5c1f550d" ||
+		msg.SourceID != "local:ff9f0accc4bd325d662c082170f55eea5c1f550d" ||
+		msg.ConversationID != "signal:+15551234567" ||
+		msg.SenderName != "Me" ||
+		msg.SenderNumber != "+15551230000" ||
+		msg.Body != "hello from signal" ||
+		msg.TimestampMS != 1700000000123 ||
+		msg.Status != "sent" ||
+		!msg.IsFromMe ||
+		msg.ReplyToID != "signal:quoted" ||
+		msg.SourcePlatform != "signal" {
+		t.Fatalf("legacy SendText() message = %+v, want fabricated local identity and unchanged db.Message form", msg)
 	}
 }
 
-func TestParseSignalMediaSendResultFixtures(t *testing.T) {
+func TestBridgeSendTextRequestRunsJSONSendAndReturnsSignalTimestamp(t *testing.T) {
+	success, err := os.ReadFile(filepath.Join("testdata", "send-media-success.json"))
+	if err != nil {
+		t.Fatalf("read success fixture: %v", err)
+	}
+	tests := []struct {
+		name           string
+		conversationID string
+		wantTargetArgs []string
+	}{
+		{
+			name:           "recipient",
+			conversationID: "signal:+15551234567",
+			wantTargetArgs: []string{"+15551234567"},
+		},
+		{
+			name:           "group",
+			conversationID: "signal-group:test-group",
+			wantTargetArgs: []string{"--group-id", "test-group"},
+		},
+	}
+
+	originalRun := runSignalCLI
+	defer func() { runSignalCLI = originalRun }()
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			bridge := &Bridge{
+				account:   "+15551230000",
+				connected: true,
+				configDir: t.TempDir(),
+				logger:    zerolog.Nop(),
+			}
+			var captured []string
+			runSignalCLI = func(ctx context.Context, configDir string, args ...string) ([]byte, error) {
+				captured = append([]string{}, args...)
+				return success, nil
+			}
+
+			timestamp, err := bridge.SendTextRequest(tc.conversationID, "  hello from durable Signal  ", "")
+			if err != nil {
+				t.Fatalf("SendTextRequest(): %v", err)
+			}
+			if timestamp != 1700000000123 {
+				t.Fatalf("SendTextRequest() timestamp = %d, want 1700000000123", timestamp)
+			}
+			wantArgs := []string{
+				"--output=json",
+				"-a", "+15551230000",
+				"send",
+				"-m", "hello from durable Signal",
+			}
+			wantArgs = append(wantArgs, tc.wantTargetArgs...)
+			if !slices.Equal(captured, wantArgs) {
+				t.Fatalf("signal-cli args = %q, want %q", captured, wantArgs)
+			}
+		})
+	}
+}
+
+func TestBridgeSendTextRequestIncludesSignalQuoteArguments(t *testing.T) {
+	dataDir := t.TempDir()
+	store, err := db.New(filepath.Join(dataDir, "messages.db"))
+	if err != nil {
+		t.Fatalf("db.New(): %v", err)
+	}
+	defer store.Close()
+
+	const conversationID = "signal:+15551234567"
+	if err := store.UpsertMessage(&db.Message{
+		MessageID:      "signal:reply-1",
+		ConversationID: conversationID,
+		SenderName:     "Taylor",
+		SenderNumber:   "+15551234567",
+		Body:           "quoted body",
+		TimestampMS:    1700000000123,
+		SourcePlatform: "signal",
+	}); err != nil {
+		t.Fatalf("seed reply target: %v", err)
+	}
+	success, err := os.ReadFile(filepath.Join("testdata", "send-media-success.json"))
+	if err != nil {
+		t.Fatalf("read success fixture: %v", err)
+	}
+	bridge := &Bridge{
+		account:   "+15551230000",
+		connected: true,
+		configDir: t.TempDir(),
+		store:     store,
+		logger:    zerolog.Nop(),
+	}
+
+	originalRun := runSignalCLI
+	defer func() { runSignalCLI = originalRun }()
+	var captured []string
+	runSignalCLI = func(ctx context.Context, configDir string, args ...string) ([]byte, error) {
+		captured = append([]string{}, args...)
+		return success, nil
+	}
+
+	if _, err := bridge.SendTextRequest(conversationID, "replying", "signal:reply-1"); err != nil {
+		t.Fatalf("SendTextRequest(): %v", err)
+	}
+	wantArgs := []string{
+		"--output=json",
+		"-a", "+15551230000",
+		"send",
+		"-m", "replying",
+		"--quote-timestamp", "1700000000123",
+		"--quote-author", "+15551234567",
+		"--quote-message", "quoted body",
+		"+15551234567",
+	}
+	if !slices.Equal(captured, wantArgs) {
+		t.Fatalf("signal-cli args = %q, want %q", captured, wantArgs)
+	}
+}
+
+func TestBridgeSendTextRequestClassifiesStructuredAndOpaqueFailures(t *testing.T) {
+	allFailed, err := os.ReadFile(filepath.Join("testdata", "send-media-all-recipients-failed.json"))
+	if err != nil {
+		t.Fatalf("read all-failed fixture: %v", err)
+	}
+	malformed, err := os.ReadFile(filepath.Join("testdata", "send-media-unparseable.txt"))
+	if err != nil {
+		t.Fatalf("read malformed fixture: %v", err)
+	}
+	tests := []struct {
+		name              string
+		output            []byte
+		commandErr        error
+		wantNotDispatched bool
+		wantDiagnostics   []string
+	}{
+		{
+			name:              "all recipients failed with nonzero exit",
+			output:            allFailed,
+			commandErr:        errors.New("exit status 1"),
+			wantNotDispatched: true,
+			wantDiagnostics:   []string{"exit status 1", "UNREGISTERED_FAILURE"},
+		},
+		{
+			name:            "malformed successful output",
+			output:          malformed,
+			wantDiagnostics: []string{"decode Signal media send JSON"},
+		},
+		{
+			name:            "opaque nonzero exit",
+			output:          []byte("signal-cli transport failed"),
+			commandErr:      errors.New("exit status 2"),
+			wantDiagnostics: []string{"exit status 2", "signal-cli transport failed"},
+		},
+		{
+			name:            "timeout despite all-failed output",
+			output:          allFailed,
+			commandErr:      context.DeadlineExceeded,
+			wantDiagnostics: []string{"context deadline exceeded", "UNREGISTERED_FAILURE"},
+		},
+	}
+
+	originalRun := runSignalCLI
+	defer func() { runSignalCLI = originalRun }()
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			bridge := &Bridge{
+				account:   "+15551230000",
+				connected: true,
+				configDir: t.TempDir(),
+				logger:    zerolog.Nop(),
+			}
+			runSignalCLI = func(ctx context.Context, configDir string, args ...string) ([]byte, error) {
+				return tc.output, tc.commandErr
+			}
+
+			_, err := bridge.SendTextRequest("signal:+15551234567", "hello", "")
+			if err == nil || !IsCommandError(err) {
+				t.Fatalf("SendTextRequest() error = %v (%T), want CommandError", err, err)
+			}
+			if got := IsSendNotDispatchedError(err); got != tc.wantNotDispatched {
+				t.Fatalf("IsSendNotDispatchedError() = %v, want %v for %v", got, tc.wantNotDispatched, err)
+			}
+			for _, diagnostic := range tc.wantDiagnostics {
+				if !strings.Contains(err.Error(), diagnostic) {
+					t.Fatalf("SendTextRequest() error = %q, want diagnostic %q", err, diagnostic)
+				}
+			}
+		})
+	}
+}
+
+func TestBridgeSendTextRequestSucceedsOnMixedRecipientResults(t *testing.T) {
+	mixed, err := os.ReadFile(filepath.Join("testdata", "send-media-mixed-results.json"))
+	if err != nil {
+		t.Fatalf("read mixed-results fixture: %v", err)
+	}
+	bridge := &Bridge{
+		account:   "+15551230000",
+		connected: true,
+		configDir: t.TempDir(),
+		logger:    zerolog.Nop(),
+	}
+
+	originalRun := runSignalCLI
+	defer func() { runSignalCLI = originalRun }()
+	runSignalCLI = func(ctx context.Context, configDir string, args ...string) ([]byte, error) {
+		return mixed, nil
+	}
+
+	timestamp, err := bridge.SendTextRequest("signal-group:test-group", "hello group", "")
+	if err != nil {
+		t.Fatalf("SendTextRequest() on mixed results = %v, want success", err)
+	}
+	if timestamp != 1700000000678 {
+		t.Fatalf("SendTextRequest() timestamp = %d, want 1700000000678", timestamp)
+	}
+}
+
+func TestParseSignalSendResultPreservesMediaFixtures(t *testing.T) {
 	tests := []struct {
 		name          string
 		fixture       string
 		want          int64
-		wantErrText   string
+		wantErr       string
 		wantAllFailed bool
 	}{
 		{
@@ -111,24 +335,24 @@ func TestParseSignalMediaSendResultFixtures(t *testing.T) {
 			name:          "all recipients failed",
 			fixture:       "send-media-all-recipients-failed.json",
 			want:          1700000000456,
-			wantErrText:   "UNREGISTERED_FAILURE",
+			wantErr:       "Signal media send failed for recipient 0: UNREGISTERED_FAILURE, recipient 1: NETWORK_FAILURE",
 			wantAllFailed: true,
 		},
 		{
 			name:          "all recipients failed with invalid pre-key",
 			fixture:       "send-media-invalid-pre-key.json",
 			want:          1700000000555,
-			wantErrText:   "INVALID_PRE_KEY_FAILURE",
+			wantErr:       "Signal media send failed for recipient 0: INVALID_PRE_KEY_FAILURE",
 			wantAllFailed: true,
 		},
 		{
 			// Mixed results return the timestamp ALONGSIDE the recipient error so
 			// callers can honor signal-cli's exit-0 semantics (>=1 success means
 			// the message went out).
-			name:        "mixed success and failure",
-			fixture:     "send-media-mixed-results.json",
-			want:        1700000000678,
-			wantErrText: "UNREGISTERED_FAILURE",
+			name:    "mixed success and failure",
+			fixture: "send-media-mixed-results.json",
+			want:    1700000000678,
+			wantErr: "Signal media send failed for recipient 1: UNREGISTERED_FAILURE",
 		},
 		{
 			// signal-cli WARN/JVM stderr noise rides CombinedOutput around the JSON
@@ -139,24 +363,24 @@ func TestParseSignalMediaSendResultFixtures(t *testing.T) {
 			want:    1700000000123,
 		},
 		{
-			name:        "zero timestamp",
-			fixture:     "send-media-zero-timestamp.json",
-			wantErrText: "timestamp",
+			name:    "zero timestamp",
+			fixture: "send-media-zero-timestamp.json",
+			wantErr: "Signal media send result has no valid timestamp",
 		},
 		{
-			name:        "missing timestamp",
-			fixture:     "send-media-missing-timestamp.json",
-			wantErrText: "timestamp",
+			name:    "missing timestamp",
+			fixture: "send-media-missing-timestamp.json",
+			wantErr: "Signal media send result has no valid timestamp",
 		},
 		{
-			name:        "empty recipient results",
-			fixture:     "send-media-empty-results.json",
-			wantErrText: "recipient",
+			name:    "empty recipient results",
+			fixture: "send-media-empty-results.json",
+			wantErr: "Signal media send result has no recipient results",
 		},
 		{
-			name:        "unparseable output",
-			fixture:     "send-media-unparseable.txt",
-			wantErrText: "JSON",
+			name:    "unparseable output",
+			fixture: "send-media-unparseable.txt",
+			wantErr: "decode Signal media send JSON: invalid character 's' looking for beginning of value",
 		},
 	}
 
@@ -166,24 +390,24 @@ func TestParseSignalMediaSendResultFixtures(t *testing.T) {
 			if err != nil {
 				t.Fatalf("read fixture: %v", err)
 			}
-			got, err := parseSignalMediaSendResult(output)
-			if tc.wantErrText != "" {
-				if err == nil || !strings.Contains(err.Error(), tc.wantErrText) {
-					t.Fatalf("parseSignalMediaSendResult() error = %v, want containing %q", err, tc.wantErrText)
+			got, err := parseSignalSendResult(output)
+			if tc.wantErr != "" {
+				if err == nil || err.Error() != tc.wantErr {
+					t.Fatalf("parseSignalSendResult() error = %v, want %q", err, tc.wantErr)
 				}
-				if got := signalMediaAllRecipientsFailed(err); got != tc.wantAllFailed {
-					t.Fatalf("signalMediaAllRecipientsFailed() = %v, want %v for %v", got, tc.wantAllFailed, err)
+				if got := signalSendAllRecipientsFailed(err); got != tc.wantAllFailed {
+					t.Fatalf("signalSendAllRecipientsFailed() = %v, want %v for %v", got, tc.wantAllFailed, err)
 				}
 				if got != tc.want {
-					t.Fatalf("parseSignalMediaSendResult() timestamp = %d, want %d alongside error", got, tc.want)
+					t.Fatalf("parseSignalSendResult() timestamp = %d, want %d alongside error", got, tc.want)
 				}
 				return
 			}
 			if err != nil {
-				t.Fatalf("parseSignalMediaSendResult() error = %v", err)
+				t.Fatalf("parseSignalSendResult() error = %v", err)
 			}
 			if got != tc.want {
-				t.Fatalf("parseSignalMediaSendResult() = %d, want %d", got, tc.want)
+				t.Fatalf("parseSignalSendResult() = %d, want %d", got, tc.want)
 			}
 		})
 	}

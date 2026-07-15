@@ -19,6 +19,7 @@ import (
 
 type poller interface {
 	StartPoller(context.Context) (signallive.PollerRun, error)
+	SendTextRequest(string, string, string) (int64, error)
 	SendMediaRequest(string, io.Reader, int64, string, string, string, string) (int64, error)
 	Status() signallive.StatusSnapshot
 	ApplyPollerFailure(signallive.PollerExit)
@@ -59,6 +60,69 @@ func (a *Adapter) DeclaredCapabilities() bridge.CapabilitySet {
 	}
 }
 
+// SendText adapts a durable text request to signal-cli's structured send path.
+// Signal's canonical identity is the returned timestamp; RequestID remains
+// local-dedupe metadata, so an uncertain retry can duplicate until M5
+// reconciliation makes that retry safe.
+func (a *Adapter) SendText(
+	ctx context.Context,
+	req bridge.TextRequest,
+) (bridge.SendResult, error) {
+	if ctx == nil {
+		return bridge.SendResult{}, bridge.OpError{
+			Class:       bridge.FailureTransient,
+			Operation:   "send_text",
+			Fingerprint: "signal_send_text_context_missing",
+			Dispatch:    bridge.DispatchNotCalled,
+			Cause:       errors.New("Signal text send context is nil"),
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return bridge.SendResult{}, bridge.OpError{
+			Class:       bridge.FailureTransient,
+			Operation:   "send_text",
+			Fingerprint: "signal_send_text_context_done",
+			Dispatch:    bridge.DispatchNotCalled,
+			Cause:       err,
+		}
+	}
+	if a == nil || a.poller == nil {
+		return bridge.SendResult{}, signalNotConnectedError("send_text")
+	}
+	status := a.poller.Status()
+	if !status.Connected || strings.TrimSpace(status.Account) == "" {
+		return bridge.SendResult{}, signalNotConnectedError("send_text")
+	}
+
+	replyToID := ""
+	if req.ReplyTo != nil {
+		replyToID = req.ReplyTo.RemoteID
+	}
+	timestampMS, err := a.poller.SendTextRequest(
+		req.Conversation.RemoteID,
+		req.Body,
+		replyToID,
+	)
+	if err != nil {
+		a.ReportError(err)
+		failure := bridge.OpError{
+			Class:       bridge.FailureTransient,
+			Operation:   "send_text",
+			Fingerprint: "signal_send_text_failed",
+			Cause:       err,
+		}
+		if !signallive.IsCommandError(err) || signallive.IsSendNotDispatchedError(err) {
+			failure.Dispatch = bridge.DispatchNotCalled
+		}
+		return bridge.SendResult{}, failure
+	}
+
+	return bridge.SendResult{
+		RemoteMessageID: strconv.FormatInt(timestampMS, 10),
+		EchoExpected:    false,
+	}, nil
+}
+
 func (a *Adapter) SendMedia(
 	ctx context.Context,
 	req bridge.MediaRequest,
@@ -82,11 +146,11 @@ func (a *Adapter) SendMedia(
 		}
 	}
 	if a == nil || a.poller == nil {
-		return bridge.SendResult{}, signalNotConnectedError()
+		return bridge.SendResult{}, signalNotConnectedError("send_media")
 	}
 	status := a.poller.Status()
 	if !status.Connected || strings.TrimSpace(status.Account) == "" {
-		return bridge.SendResult{}, signalNotConnectedError()
+		return bridge.SendResult{}, signalNotConnectedError("send_media")
 	}
 
 	replyToID := ""
@@ -122,10 +186,10 @@ func (a *Adapter) SendMedia(
 	}, nil
 }
 
-func signalNotConnectedError() bridge.OpError {
+func signalNotConnectedError(operation string) bridge.OpError {
 	return bridge.OpError{
 		Class:       bridge.FailureTransient,
-		Operation:   "send_media",
+		Operation:   operation,
 		Fingerprint: "signal_not_connected",
 		Dispatch:    bridge.DispatchNotCalled,
 		Cause:       errors.New("Signal is not connected"),
@@ -562,6 +626,7 @@ func (r *run) recordActivity(activity signallive.PollerActivity) {
 var (
 	_ bridge.Adapter            = (*Adapter)(nil)
 	_ bridge.CapabilityDeclarer = (*Adapter)(nil)
+	_ bridge.TextSender         = (*Adapter)(nil)
 	_ bridge.MediaSender        = (*Adapter)(nil)
 	_ bridge.Run                = (*run)(nil)
 )

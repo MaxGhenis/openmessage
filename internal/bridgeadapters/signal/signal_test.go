@@ -20,6 +20,283 @@ const signalAdapterTestTimeout = 2 * time.Second
 
 var signalAdapterTestEpoch = time.Date(2026, time.July, 13, 12, 0, 0, 0, time.UTC)
 
+func TestAdapterImplementsTextSender(t *testing.T) {
+	var _ bridge.TextSender = (*Adapter)(nil)
+}
+
+func TestSendTextRequiresReadyRetainedBridge(t *testing.T) {
+	tests := []struct {
+		name   string
+		poller poller
+	}{
+		{name: "nil retained bridge"},
+		{name: "not connected", poller: newFakePoller()},
+		{
+			name: "connected without account",
+			poller: &fakePoller{
+				started: make(chan *fakePollerRun, 1),
+				status:  signallive.StatusSnapshot{Connected: true},
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			adapter := &Adapter{accountID: "signal-primary", poller: tc.poller}
+			result, err := adapter.SendText(context.Background(), bridge.TextRequest{
+				AccountID:    "signal-primary",
+				Conversation: bridge.ConversationRef{RemoteID: "signal:+15551234567"},
+				Body:         "hello",
+			})
+			if result != (bridge.SendResult{}) {
+				t.Fatalf("SendText() result = %+v, want zero", result)
+			}
+			var operationError bridge.OpError
+			if !errors.As(err, &operationError) {
+				t.Fatalf("SendText() error = %v (%T), want bridge.OpError", err, err)
+			}
+			if operationError.Class != bridge.FailureTransient ||
+				operationError.Dispatch != bridge.DispatchNotCalled ||
+				operationError.Operation != "send_text" ||
+				operationError.Fingerprint != "signal_not_connected" {
+				t.Fatalf("SendText() OpError = %+v, want classified not-connected pre-call failure", operationError)
+			}
+			if fake, ok := tc.poller.(*fakePoller); ok && fake.textCallCount() != 0 {
+				t.Fatalf("SendTextRequest calls = %d, want 0 while not ready", fake.textCallCount())
+			}
+		})
+	}
+}
+
+func TestSendTextRejectsInvalidContextBeforeTransport(t *testing.T) {
+	tests := []struct {
+		name            string
+		context         func() context.Context
+		wantFingerprint string
+	}{
+		{
+			name:            "nil context",
+			context:         func() context.Context { return nil },
+			wantFingerprint: "signal_send_text_context_missing",
+		},
+		{
+			name: "done context",
+			context: func() context.Context {
+				ctx, cancel := context.WithCancel(context.Background())
+				cancel()
+				return ctx
+			},
+			wantFingerprint: "signal_send_text_context_done",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			poller := newFakePoller()
+			poller.status = signallive.StatusSnapshot{Connected: true, Account: "+15551230000"}
+			adapter := &Adapter{accountID: "signal-primary", poller: poller}
+
+			_, err := adapter.SendText(tc.context(), bridge.TextRequest{Body: "hello"})
+			var operationError bridge.OpError
+			if !errors.As(err, &operationError) ||
+				operationError.Class != bridge.FailureTransient ||
+				operationError.Dispatch != bridge.DispatchNotCalled ||
+				operationError.Operation != "send_text" ||
+				operationError.Fingerprint != tc.wantFingerprint {
+				t.Fatalf("SendText() error = %v, want pre-call context failure %q", err, tc.wantFingerprint)
+			}
+			if got := poller.textCallCount(); got != 0 {
+				t.Fatalf("SendTextRequest calls = %d, want 0 after context failure", got)
+			}
+		})
+	}
+}
+
+func TestSendTextMapsRetainedTimestampAndRequest(t *testing.T) {
+	poller := newFakePoller()
+	poller.status = signallive.StatusSnapshot{
+		Connected: true,
+		Paired:    true,
+		Account:   "+15551230000",
+	}
+	poller.textTimestamp = 1700000000123
+	adapter := &Adapter{accountID: "signal-primary", poller: poller}
+
+	result, err := adapter.SendText(context.Background(), bridge.TextRequest{
+		AccountID:    "signal-primary",
+		Conversation: bridge.ConversationRef{RemoteID: "signal:+15551234567"},
+		Body:         "hello from durable Signal",
+		ReplyTo:      &bridge.MessageRef{RemoteID: "signal:1700000000000"},
+		RequestID:    "local-dedupe-only",
+	})
+	if err != nil {
+		t.Fatalf("SendText() error = %v", err)
+	}
+	if result.RemoteMessageID != strconv.FormatInt(poller.textTimestamp, 10) ||
+		result.EchoExpected || !result.AcceptedAt.IsZero() {
+		t.Fatalf("SendText() result = %+v, want canonical timestamp ID without echo", result)
+	}
+	request := poller.lastTextRequest()
+	if request.conversationID != "signal:+15551234567" ||
+		request.body != "hello from durable Signal" ||
+		request.replyToID != "signal:1700000000000" {
+		t.Fatalf("retained SendTextRequest = %+v, want mapped TextRequest", request)
+	}
+}
+
+func TestSendTextClassifiesPreCallAndCommandFailures(t *testing.T) {
+	tests := []struct {
+		name         string
+		err          error
+		wantDispatch bridge.DispatchCertainty
+	}{
+		{
+			name:         "local validation",
+			err:          errors.New("Signal message body is required"),
+			wantDispatch: bridge.DispatchNotCalled,
+		},
+		{
+			name: "signal-cli command",
+			err:  signallive.NewCommandError("send Signal message: recipient is not registered"),
+		},
+		{
+			name: "structured all-recipient failure",
+			err: &fakeSignalSendNotDispatchedError{err: signallive.NewCommandError(
+				"send Signal message: every recipient failed",
+			)},
+			wantDispatch: bridge.DispatchNotCalled,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			poller := newFakePoller()
+			poller.status = signallive.StatusSnapshot{
+				Connected: true,
+				Paired:    true,
+				Account:   "+15551230000",
+			}
+			poller.textErr = tc.err
+			adapter := &Adapter{accountID: "signal-primary", poller: poller}
+
+			_, err := adapter.SendText(context.Background(), bridge.TextRequest{
+				AccountID:    "signal-primary",
+				Conversation: bridge.ConversationRef{RemoteID: "signal:+15551234567"},
+				Body:         "hello",
+			})
+			var operationError bridge.OpError
+			if !errors.As(err, &operationError) {
+				t.Fatalf("SendText() error = %v (%T), want bridge.OpError", err, err)
+			}
+			if operationError.Class != bridge.FailureTransient ||
+				operationError.Dispatch != tc.wantDispatch ||
+				operationError.Operation != "send_text" ||
+				operationError.Fingerprint != "signal_send_text_failed" ||
+				!errors.Is(operationError.Cause, tc.err) {
+				t.Fatalf("SendText() OpError = %+v, want transient classified failure with dispatch %q", operationError, tc.wantDispatch)
+			}
+			if got := poller.appliedCount(); got != 0 {
+				t.Fatalf("recipient/local send failure applied %d lifecycle transitions, want 0", got)
+			}
+		})
+	}
+}
+
+// A text send can fail on a recipient, an identity change, or the network;
+// none indict the local account or widen ReportError's C6 matcher.
+func TestSendTextDoesNotWidenGuardedLifecycleReporting(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+	}{
+		{
+			name: "unregistered recipient",
+			err:  signallive.NewCommandError("send Signal message: user +15551234567 is not registered"),
+		},
+		{
+			name: "untrusted identity",
+			err:  signallive.NewCommandError("send Signal message: Untrusted identity key for +15551234567"),
+		},
+		{
+			name: "network blip",
+			err:  signallive.NewCommandError("send Signal message: Connection reset by peer"),
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			poller := newFakePoller()
+			poller.status = signallive.StatusSnapshot{
+				Connected: true,
+				Paired:    true,
+				Account:   "+15551230000",
+			}
+			poller.textErr = tc.err
+			adapter := &Adapter{accountID: "signal-primary", poller: poller}
+			run, err := adapter.Start(context.Background(), bridge.StartRequest{
+				AccountID:  "signal-primary",
+				Generation: 1,
+			}, nil)
+			if err != nil {
+				t.Fatalf("Start() error = %v", err)
+			}
+			receiveValue(t, poller.started, "retained poller start")
+			t.Cleanup(func() { stopAdapterRun(t, run) })
+
+			if _, err := adapter.SendText(context.Background(), bridge.TextRequest{
+				Conversation: bridge.ConversationRef{RemoteID: "signal:+15551234567"},
+				Body:         "hello",
+			}); err == nil {
+				t.Fatal("SendText() error = nil, want scripted command failure")
+			}
+			current := adapter.currentRun()
+			if current == nil || !current.admitCallback() {
+				t.Fatal("non-account text failure closed callback admission on the receive generation")
+			}
+			current.callbacks.Done()
+			select {
+			case terminal := <-run.Done():
+				t.Fatalf("non-account text failure terminated receive generation: %v", terminal)
+			default:
+			}
+			if got := poller.appliedCount(); got != 0 {
+				t.Fatalf("non-account text failure applied %d lifecycle transitions, want 0", got)
+			}
+		})
+	}
+}
+
+func TestSendTextRoutesLocalAccountFailureThroughGuardedLifecycleReporting(t *testing.T) {
+	poller := newFakePoller()
+	poller.status = signallive.StatusSnapshot{
+		Connected: true,
+		Paired:    true,
+		Account:   "+15551230000",
+	}
+	poller.textErr = signallive.NewCommandError("send Signal message: authorization failed")
+	adapter := &Adapter{accountID: "signal-primary", poller: poller}
+	run, err := adapter.Start(context.Background(), bridge.StartRequest{
+		AccountID:  "signal-primary",
+		Generation: 1,
+	}, nil)
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	receiveValue(t, poller.started, "retained poller start")
+
+	if _, err := adapter.SendText(context.Background(), bridge.TextRequest{
+		Conversation: bridge.ConversationRef{RemoteID: "signal:+15551234567"},
+		Body:         "hello",
+	}); err == nil {
+		t.Fatal("SendText() error = nil, want local-account command failure")
+	}
+	terminal := receiveValue(t, run.Done(), "guarded text-send terminal")
+	assertOpError(t, terminal, bridge.FailureTransient, "signal_send_account_check")
+	if got := poller.appliedCount(); got != 1 {
+		t.Fatalf("local-account text failure status projections = %d, want one transient projection", got)
+	}
+}
+
 func TestSendMediaRequiresReadyRetainedBridge(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -716,9 +993,18 @@ type fakePoller struct {
 	applied        []signallive.PollerExit
 	fingerprint    string
 	status         signallive.StatusSnapshot
+	textCalls      []fakeTextRequest
+	textTimestamp  int64
+	textErr        error
 	mediaCalls     []fakeMediaRequest
 	mediaTimestamp int64
 	mediaErr       error
+}
+
+type fakeTextRequest struct {
+	conversationID string
+	body           string
+	replyToID      string
 }
 
 type fakeMediaRequest struct {
@@ -781,6 +1067,33 @@ func (p *fakePoller) Status() signallive.StatusSnapshot {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.status
+}
+
+func (p *fakePoller) SendTextRequest(conversationID, body, replyToID string) (int64, error) {
+	p.mu.Lock()
+	p.textCalls = append(p.textCalls, fakeTextRequest{
+		conversationID: conversationID,
+		body:           body,
+		replyToID:      replyToID,
+	})
+	timestamp, err := p.textTimestamp, p.textErr
+	p.mu.Unlock()
+	return timestamp, err
+}
+
+func (p *fakePoller) textCallCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.textCalls)
+}
+
+func (p *fakePoller) lastTextRequest() fakeTextRequest {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.textCalls) == 0 {
+		return fakeTextRequest{}
+	}
+	return p.textCalls[len(p.textCalls)-1]
 }
 
 func (p *fakePoller) SendMediaRequest(

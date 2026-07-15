@@ -929,6 +929,71 @@ func (b *Bridge) SendText(conversationID, body, replyToID string) (*db.Message, 
 	return msg, nil
 }
 
+// SendTextRequest sends one text message through signal-cli's structured JSON
+// path and returns Signal's canonical outgoing identity. Signal uses the send
+// timestamp as its message ID; the durable request ID remains local dedupe
+// metadata until reconciliation can make uncertain retries safe.
+func (b *Bridge) SendTextRequest(conversationID, body, replyToID string) (timestampMS int64, err error) {
+	body = strings.TrimSpace(body)
+	if body == "" {
+		return 0, errors.New("signal message body is required")
+	}
+
+	account, err := b.usableAccount()
+	if err != nil {
+		return 0, err
+	}
+	target, isGroup, err := parseConversationTarget(conversationID)
+	if err != nil {
+		return 0, err
+	}
+
+	args := []string{"--output=json", "-a", account, "send", "-m", body}
+	quoteArgs, err := b.signalQuoteArgs(replyToID, account)
+	if err != nil {
+		return 0, err
+	}
+	args = append(args, quoteArgs...)
+	if isGroup {
+		args = append(args, "--group-id", target)
+	} else {
+		args = append(args, target)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), sendTimeout)
+	defer cancel()
+	b.commandMu.Lock()
+	output, commandErr := runSignalCLI(ctx, b.configDir, args...)
+	b.commandMu.Unlock()
+	timestampMS, resultErr := parseSignalSendResult(output)
+	if commandErr != nil {
+		timedOut := errors.Is(commandErr, context.Canceled) ||
+			errors.Is(commandErr, context.DeadlineExceeded) ||
+			ctx.Err() != nil
+		if !timedOut && signalSendAllRecipientsFailed(resultErr) {
+			return 0, commandNotDispatchedError(
+				"send Signal message",
+				errors.Join(commandErr, resultErr),
+				output,
+			)
+		}
+		return 0, commandError("send Signal message", commandErr, output)
+	}
+	if resultErr != nil {
+		if signalSendAllRecipientsFailed(resultErr) {
+			return 0, commandNotDispatchedError("send Signal message", resultErr, output)
+		}
+		var partial *signalSendRecipientResultsError
+		if !errors.As(resultErr, &partial) || timestampMS <= 0 {
+			return 0, commandError("parse Signal text send result", resultErr, output)
+		}
+		// Mixed per-recipient results with >=1 SUCCESS: signal-cli exits 0
+		// because the message went out. Per-recipient delivery gaps are M5
+		// reconciliation's job.
+	}
+	return timestampMS, nil
+}
+
 func (b *Bridge) SendMedia(conversationID string, data []byte, filename, mime, caption, replyToID string) (*db.Message, error) {
 	if len(data) == 0 {
 		return nil, errors.New("signal attachment is required")
@@ -1059,12 +1124,12 @@ func (b *Bridge) sendMediaRequest(
 	b.commandMu.Lock()
 	output, commandErr := runSignalCLI(ctx, b.configDir, args...)
 	b.commandMu.Unlock()
-	timestampMS, resultErr := parseSignalMediaSendResult(output)
+	timestampMS, resultErr := parseSignalSendResult(output)
 	if commandErr != nil {
 		timedOut := errors.Is(commandErr, context.Canceled) ||
 			errors.Is(commandErr, context.DeadlineExceeded) ||
 			ctx.Err() != nil
-		if !timedOut && signalMediaAllRecipientsFailed(resultErr) {
+		if !timedOut && signalSendAllRecipientsFailed(resultErr) {
 			return result, commandNotDispatchedError(
 				"send Signal media",
 				errors.Join(commandErr, resultErr),
@@ -1074,10 +1139,10 @@ func (b *Bridge) sendMediaRequest(
 		return result, commandError("send Signal media", commandErr, output)
 	}
 	if resultErr != nil {
-		if signalMediaAllRecipientsFailed(resultErr) {
+		if signalSendAllRecipientsFailed(resultErr) {
 			return result, commandNotDispatchedError("send Signal media", resultErr, output)
 		}
-		var partial *signalMediaRecipientResultsError
+		var partial *signalSendRecipientResultsError
 		if !errors.As(resultErr, &partial) || timestampMS <= 0 {
 			return result, commandError("parse Signal media send result", resultErr, output)
 		}
@@ -1095,7 +1160,7 @@ func (b *Bridge) sendMediaRequest(
 	return result, nil
 }
 
-type signalMediaSendResult struct {
+type signalSendResult struct {
 	Timestamp int64 `json:"timestamp"`
 	Results   []struct {
 		RecipientAddress json.RawMessage `json:"recipientAddress"`
@@ -1103,7 +1168,7 @@ type signalMediaSendResult struct {
 	} `json:"results"`
 }
 
-// parseSignalMediaSendResult decodes signal-cli's --output=json send result
+// parseSignalSendResult decodes signal-cli's --output=json send result
 // from CombinedOutput. The buffer can carry stderr noise (signal-cli WARN
 // lines, JVM notes) around the JSON object on a fully successful send, so a
 // whole-buffer decode falls back to a per-line scan for the object carrying a
@@ -1111,8 +1176,8 @@ type signalMediaSendResult struct {
 // On mixed per-recipient results the timestamp is returned ALONGSIDE the
 // recipient-results error so callers can honor signal-cli's own exit-0
 // semantics (>=1 success means the message went out).
-func parseSignalMediaSendResult(output []byte) (int64, error) {
-	result, decodeErr := decodeSignalMediaSendJSON(output)
+func parseSignalSendResult(output []byte) (int64, error) {
+	result, decodeErr := decodeSignalSendJSON(output)
 	if decodeErr != nil {
 		return 0, decodeErr
 	}
@@ -1145,7 +1210,7 @@ func parseSignalMediaSendResult(output []byte) (int64, error) {
 		}
 	}
 	if len(failures) > 0 {
-		return result.Timestamp, &signalMediaRecipientResultsError{
+		return result.Timestamp, &signalSendRecipientResultsError{
 			failures:            failures,
 			allRecipientsFailed: successCount == 0,
 		}
@@ -1153,8 +1218,8 @@ func parseSignalMediaSendResult(output []byte) (int64, error) {
 	return result.Timestamp, nil
 }
 
-func decodeSignalMediaSendJSON(output []byte) (signalMediaSendResult, error) {
-	var result signalMediaSendResult
+func decodeSignalSendJSON(output []byte) (signalSendResult, error) {
+	var result signalSendResult
 	wholeErr := json.Unmarshal(output, &result)
 	if wholeErr == nil {
 		return result, nil
@@ -1164,7 +1229,7 @@ func decodeSignalMediaSendJSON(output []byte) (signalMediaSendResult, error) {
 		if !strings.HasPrefix(line, "{") {
 			continue
 		}
-		var candidate signalMediaSendResult
+		var candidate signalSendResult
 		if err := json.Unmarshal([]byte(line), &candidate); err != nil {
 			continue
 		}
@@ -1175,17 +1240,17 @@ func decodeSignalMediaSendJSON(output []byte) (signalMediaSendResult, error) {
 	return result, fmt.Errorf("decode Signal media send JSON: %w", wholeErr)
 }
 
-type signalMediaRecipientResultsError struct {
+type signalSendRecipientResultsError struct {
 	failures            []string
 	allRecipientsFailed bool
 }
 
-func (e *signalMediaRecipientResultsError) Error() string {
+func (e *signalSendRecipientResultsError) Error() string {
 	return "Signal media send failed for " + strings.Join(e.failures, ", ")
 }
 
-func signalMediaAllRecipientsFailed(err error) bool {
-	var resultErr *signalMediaRecipientResultsError
+func signalSendAllRecipientsFailed(err error) bool {
+	var resultErr *signalSendRecipientResultsError
 	return errors.As(err, &resultErr) && resultErr.allRecipientsFailed
 }
 

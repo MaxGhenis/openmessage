@@ -36,7 +36,8 @@ type Adapter struct {
 	pairPhone        func(context.Context, string) (string, error)
 	unpair           func() error
 	now              func() time.Time
-	mediaReady       func() bool
+	mediaReady       func() bool // Shared connection gate; it does no media-specific work.
+	sendTextRequest  func(string, string, string, string) (string, time.Time, error)
 	sendMediaRequest func(string, []byte, string, string, string, string, string) (string, time.Time, error)
 
 	mu       sync.Mutex
@@ -63,6 +64,7 @@ func New(accountID string, host *whatsapplive.Bridge) *Adapter {
 		a.pairPhone = host.PairPhoneContext
 		a.unpair = host.Unpair
 		a.mediaReady = func() bool { return host.Status().Connected }
+		a.sendTextRequest = host.SendTextRequest
 		a.sendMediaRequest = host.SendMediaRequest
 		host.ObserveLifecycle(a.handleLifecycleEvent)
 	}
@@ -85,6 +87,68 @@ func (a *Adapter) DeclaredCapabilities() bridge.CapabilitySet {
 		MediaDownload:     true,
 	}
 }
+
+// SendText bridges the v2 request contract to the already-owned whatsmeow
+// transport. Readiness is checked without constructing or connecting a client.
+func (a *Adapter) SendText(ctx context.Context, req bridge.TextRequest) (bridge.SendResult, error) {
+	if a == nil || a.mediaReady == nil || !a.mediaReady() || a.sendTextRequest == nil {
+		return bridge.SendResult{}, whatsappTextPreCallFailure(
+			"whatsapp_not_connected",
+			whatsmeow.ErrNotConnected,
+		)
+	}
+	if ctx == nil {
+		return bridge.SendResult{}, whatsappTextPreCallFailure(
+			"whatsapp_text_context_missing",
+			errors.New("WhatsApp text send context is nil"),
+		)
+	}
+	if err := ctx.Err(); err != nil {
+		return bridge.SendResult{}, whatsappTextPreCallFailure("whatsapp_text_context_done", err)
+	}
+
+	replyToID := ""
+	if req.ReplyTo != nil {
+		replyToID = req.ReplyTo.RemoteID
+	}
+	remoteID, acceptedAt, err := a.sendTextRequest(
+		req.Conversation.RemoteID,
+		req.Body,
+		replyToID,
+		req.RequestID,
+	)
+	if err != nil {
+		// Deliberately no adapter-level lifecycle report: the retained transport
+		// core owns reconnect reporting through its guarded reportConnectionError
+		// -> OnConnectionError chain.
+		failure := a.classifyError(err, "send_text", "whatsapp_send_text_failed")
+		if errors.Is(err, whatsapplive.ErrSendNotDispatched) {
+			failure.Dispatch = bridge.DispatchNotCalled
+			if errors.Is(err, whatsmeow.ErrNotConnected) {
+				failure.Fingerprint = "whatsapp_not_connected"
+			}
+		}
+		return bridge.SendResult{}, failure
+	}
+
+	return bridge.SendResult{
+		RemoteMessageID: remoteID,
+		AcceptedAt:      acceptedAt,
+		EchoExpected:    false,
+	}, nil
+}
+
+func whatsappTextPreCallFailure(fingerprint string, cause error) bridge.OpError {
+	return bridge.OpError{
+		Class:       bridge.FailureTransient,
+		Operation:   "send_text",
+		Fingerprint: fingerprint,
+		Dispatch:    bridge.DispatchNotCalled,
+		Cause:       cause,
+	}
+}
+
+var _ bridge.TextSender = (*Adapter)(nil)
 
 // SendMedia bridges the v2 request contract to the already-owned whatsmeow
 // transport. Readiness is checked without constructing or connecting a client.
@@ -154,7 +218,7 @@ func (a *Adapter) SendMedia(ctx context.Context, req bridge.MediaRequest) (bridg
 		// through its internal reportConnectionError -> OnConnectionError chain,
 		// which carries the legacy ShouldReconnect guard.
 		failure := a.classifyError(err, "send_media", "whatsapp_send_media_failed")
-		if errors.Is(err, whatsapplive.ErrMediaNotDispatched) {
+		if errors.Is(err, whatsapplive.ErrSendNotDispatched) {
 			failure.Dispatch = bridge.DispatchNotCalled
 			if errors.Is(err, whatsmeow.ErrNotConnected) {
 				failure.Fingerprint = "whatsapp_not_connected"
