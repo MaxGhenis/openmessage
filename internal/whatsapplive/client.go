@@ -1408,6 +1408,51 @@ func (e sendNotDispatchedError) Is(target error) bool {
 	return target == ErrSendNotDispatched
 }
 
+// SendReactionRequest sends a reaction from the v2 request data without
+// loading or updating the locally stored target message.
+func (b *Bridge) SendReactionRequest(conversationID, targetRemoteID, targetAuthorID, emoji, action, requestID string) error {
+	chatJID, err := parseConversationJID(conversationID)
+	if err != nil {
+		return markSendNotDispatched(err, true)
+	}
+	chatJID = b.normalizeConversationJID(chatJID)
+
+	targetSenderJID := watypes.EmptyJID
+	if strings.TrimSpace(targetAuthorID) != "" {
+		targetSenderJID = b.canonicalJID(parseWhatsAppSenderJID(targetAuthorID))
+	}
+
+	reactionText := emoji
+	switch action {
+	case "remove":
+		reactionText = ""
+	case "switch":
+		// WhatsApp has no distinct switch action: sending the new emoji
+		// overwrites the actor's existing reaction, just like an add.
+		reactionText = emoji
+	}
+	reqID := deriveWebMessageID(requestID)
+
+	cli, err := b.ensureSendClient()
+	if err != nil {
+		return markSendNotDispatched(err, true)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+
+	_, err = sendTextMessage(cli, ctx, chatJID, cli.BuildReaction(
+		chatJID,
+		targetSenderJID,
+		watypes.MessageID(targetRemoteID),
+		reactionText,
+	), whatsmeow.SendRequestExtra{ID: reqID})
+	if err != nil {
+		b.reportConnectionError(err)
+		return fmt.Errorf("send WhatsApp reaction: %w", err)
+	}
+	return nil
+}
+
 func (b *Bridge) SendReaction(conversationID, targetMessageID, emoji, action string) error {
 	targetMessageID = strings.TrimSpace(targetMessageID)
 	if targetMessageID == "" {

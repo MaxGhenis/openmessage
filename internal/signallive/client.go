@@ -1254,6 +1254,70 @@ func signalSendAllRecipientsFailed(err error) bool {
 	return errors.As(err, &resultErr) && resultErr.allRecipientsFailed
 }
 
+// SendReactionRequest sends a reaction using only the durable request's remote
+// references. Unlike the legacy SendReaction path, it neither reads nor updates
+// locally stored message state.
+func (b *Bridge) SendReactionRequest(
+	conversationID, targetRemoteID, targetAuthorID, emoji, action string,
+) error {
+	targetRemoteID = strings.TrimSpace(targetRemoteID)
+	if targetRemoteID == "" {
+		return errors.New("signal target message is required")
+	}
+	emoji = strings.TrimSpace(emoji)
+	if emoji == "" {
+		return errors.New("signal reaction emoji is required")
+	}
+	action = strings.ToLower(strings.TrimSpace(action))
+	if action == "" {
+		action = "add"
+	}
+
+	account, err := b.usableAccount()
+	if err != nil {
+		return err
+	}
+	recipient, isGroup, err := parseConversationTarget(conversationID)
+	if err != nil {
+		return err
+	}
+	targetAuthor := strings.TrimSpace(targetAuthorID)
+	if targetAuthor == "" {
+		// An empty author identifies a message sent by this account.
+		targetAuthor = account
+	}
+
+	args := []string{
+		"-a", account,
+		"sendReaction",
+		"-e", emoji,
+		"-a", targetAuthor,
+		"-t", targetRemoteID,
+	}
+	if action == "remove" {
+		args = append(args, "-r")
+	}
+	// Signal has no native switch action: sending the new emoji without -r
+	// overwrites the account's existing reaction.
+	if isGroup {
+		args = append(args, "--group-id", recipient)
+	} else {
+		args = append(args, recipient)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), sendTimeout)
+	defer cancel()
+	b.commandMu.Lock()
+	output, err := runSignalCLI(ctx, b.configDir, args...)
+	b.commandMu.Unlock()
+	if err != nil {
+		// There is no structured reaction result that can prove a signal-cli
+		// boundary failure was not dispatched, so it remains uncertain.
+		return commandError("send Signal reaction", err, output)
+	}
+	return nil
+}
+
 func (b *Bridge) SendReaction(conversationID, targetMessageID, emoji, action string) error {
 	targetMessageID = strings.TrimSpace(targetMessageID)
 	if targetMessageID == "" {

@@ -24,6 +24,15 @@ var textSendClientFor = func(cli *client.Client) textSendClient {
 	return cli.GM
 }
 
+type reactionSendClient interface {
+	GetConversation(conversationID string) (*gmproto.Conversation, error)
+	SendReaction(payload *gmproto.SendReactionRequest) (*gmproto.SendReactionResponse, error)
+}
+
+var reactionSendClientFor = func(cli *client.Client) reactionSendClient {
+	return cli.GM
+}
+
 type mediaSendClient interface {
 	UploadMedia(data []byte, filename, mime string) (*gmproto.MediaContent, error)
 	GetConversation(conversationID string) (*gmproto.Conversation, error)
@@ -127,6 +136,88 @@ func (a *Adapter) SendText(
 		RemoteMessageID: payload.GetTmpID(),
 		EchoExpected:    true,
 	}, nil
+}
+
+// SendReaction adapts a durable reaction request to the connected libgm
+// client retained by the lifecycle-owned App generation.
+func (a *Adapter) SendReaction(
+	ctx context.Context,
+	req bridge.ReactionRequest,
+) (bridge.SendResult, error) {
+	if a == nil || a.host == nil || !a.host.Connected.Load() {
+		return bridge.SendResult{}, notConnectedReactionError()
+	}
+	cli := a.host.GetClient()
+	if cli == nil || cli.GM == nil {
+		return bridge.SendResult{}, notConnectedReactionError()
+	}
+	transport := reactionSendClientFor(cli)
+	if transport == nil {
+		return bridge.SendResult{}, notConnectedReactionError()
+	}
+	if ctx == nil {
+		return bridge.SendResult{}, preDispatchReactionError(
+			"google_reaction_context_invalid",
+			errors.New("Google reaction send context is nil"),
+		)
+	}
+	if err := ctx.Err(); err != nil {
+		return bridge.SendResult{}, preDispatchReactionError("google_reaction_context_done", err)
+	}
+
+	conversation, err := transport.GetConversation(req.Conversation.RemoteID)
+	if err != nil {
+		failure := a.classifyReactionTransportError(
+			fmt.Errorf("get Google conversation: %w", err),
+			"google_conversation_get_failed",
+			bridge.DispatchNotCalled,
+		)
+		return bridge.SendResult{}, failure
+	}
+	if conversation == nil {
+		failure := a.classifyReactionTransportError(
+			errors.New("get Google conversation: transport returned no conversation"),
+			"google_conversation_get_failed",
+			bridge.DispatchNotCalled,
+		)
+		return bridge.SendResult{}, failure
+	}
+	_, sim := app.ExtractSIMAndParticipant(conversation)
+	payload := app.BuildReactionPayload(
+		req.Target.RemoteID,
+		req.Emoji,
+		string(req.Action),
+		sim,
+	)
+	response, err := transport.SendReaction(payload)
+	if err != nil {
+		failure := a.classifyReactionTransportError(
+			fmt.Errorf("send Google reaction: %w", err),
+			"google_reaction_send_failed",
+			"",
+		)
+		return bridge.SendResult{}, failure
+	}
+	if !response.GetSuccess() {
+		// A rejected response proves the connection is healthy enough to
+		// respond; this must not touch the receive lifecycle. A nil response
+		// also has GetSuccess false and is equally safe to retry.
+		cause := errors.New("Google reaction send was rejected")
+		if response == nil {
+			cause = errors.New("send Google reaction: transport returned no response")
+		}
+		return bridge.SendResult{}, bridge.OpError{
+			Class:       bridge.FailureTransient,
+			Operation:   "send_reaction",
+			Fingerprint: "google_reaction_rejected",
+			Dispatch:    bridge.DispatchNotCalled,
+			Cause:       cause,
+		}
+	}
+
+	// Reaction dispatch confirms an empty result via ConfirmWithoutResult;
+	// there is no reaction-message ID or echo-reconciliation consumer.
+	return bridge.SendResult{}, nil
 }
 
 // SendMedia adapts the durable media outbox request to the connected libgm
@@ -342,6 +433,37 @@ func (a *Adapter) classifyTextTransportError(
 	return failure
 }
 
+func notConnectedReactionError() bridge.OpError {
+	return bridge.OpError{
+		Class:       bridge.FailureTransient,
+		Operation:   "send_reaction",
+		Fingerprint: "google_not_connected",
+		Dispatch:    bridge.DispatchNotCalled,
+		Cause:       errors.New("Google Messages is not connected"),
+	}
+}
+
+func preDispatchReactionError(fingerprint string, cause error) bridge.OpError {
+	return bridge.OpError{
+		Class:       bridge.FailureTransient,
+		Operation:   "send_reaction",
+		Fingerprint: fingerprint,
+		Dispatch:    bridge.DispatchNotCalled,
+		Cause:       cause,
+	}
+}
+
+func (a *Adapter) classifyReactionTransportError(
+	err error,
+	fingerprint string,
+	dispatch bridge.DispatchCertainty,
+) bridge.OpError {
+	failure := a.classifyTransportError(err, "send_reaction", fingerprint)
+	failure.Dispatch = dispatch
+	a.reportIfAuthIndicting(failure)
+	return failure
+}
+
 func notConnectedMediaError() bridge.OpError {
 	return bridge.OpError{
 		Class:       bridge.FailureTransient,
@@ -390,4 +512,5 @@ func (a *Adapter) reportIfAuthIndicting(failure bridge.OpError) {
 }
 
 var _ bridge.TextSender = (*Adapter)(nil)
+var _ bridge.ReactionSender = (*Adapter)(nil)
 var _ bridge.MediaSender = (*Adapter)(nil)

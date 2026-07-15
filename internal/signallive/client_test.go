@@ -1979,7 +1979,136 @@ func TestHandleReceiveOutputAppliesSentSyncSignalGroupEditWithoutDestination(t *
 	}
 }
 
-func TestBridgeSendReactionRunsSignalCLIAndUpdatesLocalState(t *testing.T) {
+func TestBridgeSendReactionRequestMapsActionsWithoutStoredState(t *testing.T) {
+	tests := []struct {
+		name   string
+		action string
+		wantR  bool
+	}{
+		{name: "add", action: "add"},
+		{name: "remove", action: "remove", wantR: true},
+		{name: "switch", action: "switch"},
+	}
+
+	originalRun := runSignalCLI
+	defer func() { runSignalCLI = originalRun }()
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			bridge := &Bridge{
+				account:   "+15551230000",
+				connected: true,
+				configDir: t.TempDir(),
+				logger:    zerolog.Nop(),
+			}
+			var captured []string
+			runSignalCLI = func(ctx context.Context, configDir string, args ...string) ([]byte, error) {
+				captured = append([]string(nil), args...)
+				return []byte("ok"), nil
+			}
+
+			err := bridge.SendReactionRequest(
+				"signal:+15551234567",
+				"1700000000123",
+				"+15551234567",
+				"😂",
+				tc.action,
+			)
+			if err != nil {
+				t.Fatalf("SendReactionRequest(): %v", err)
+			}
+			want := []string{
+				"-a", "+15551230000",
+				"sendReaction",
+				"-e", "😂",
+				"-a", "+15551234567",
+				"-t", "1700000000123",
+			}
+			if tc.wantR {
+				want = append(want, "-r")
+			}
+			want = append(want, "+15551234567")
+			if !slices.Equal(captured, want) {
+				t.Fatalf("signal-cli args = %q, want %q", captured, want)
+			}
+			if slices.Contains(captured, "--output=json") || slices.Contains(captured, "--output") {
+				t.Fatalf("reaction requested unused structured output: %q", captured)
+			}
+		})
+	}
+}
+
+func TestBridgeSendReactionRequestMapsEmptyAuthorToSelfForGroup(t *testing.T) {
+	bridge := &Bridge{
+		account:   "+15551230000",
+		connected: true,
+		configDir: t.TempDir(),
+		logger:    zerolog.Nop(),
+	}
+
+	originalRun := runSignalCLI
+	defer func() { runSignalCLI = originalRun }()
+	var captured []string
+	runSignalCLI = func(ctx context.Context, configDir string, args ...string) ([]byte, error) {
+		captured = append([]string(nil), args...)
+		return []byte("ok"), nil
+	}
+
+	if err := bridge.SendReactionRequest(
+		"signal-group:test-group",
+		"1700000000123",
+		"",
+		"👍",
+		"switch",
+	); err != nil {
+		t.Fatalf("SendReactionRequest(): %v", err)
+	}
+	want := []string{
+		"-a", "+15551230000",
+		"sendReaction",
+		"-e", "👍",
+		"-a", "+15551230000",
+		"-t", "1700000000123",
+		"--group-id", "test-group",
+	}
+	if !slices.Equal(captured, want) {
+		t.Fatalf("signal-cli args = %q, want self-authored group target %q", captured, want)
+	}
+}
+
+func TestBridgeSendReactionRequestSeparatesPreCallAndCommandFailures(t *testing.T) {
+	bridge := &Bridge{
+		account:   "+15551230000",
+		connected: true,
+		configDir: t.TempDir(),
+		logger:    zerolog.Nop(),
+	}
+
+	originalRun := runSignalCLI
+	defer func() { runSignalCLI = originalRun }()
+	calls := 0
+	runSignalCLI = func(context.Context, string, ...string) ([]byte, error) {
+		calls++
+		return nil, errors.New("exit status 1")
+	}
+
+	err := bridge.SendReactionRequest("invalid-conversation", "1700000000123", "", "👍", "add")
+	if err == nil || IsCommandError(err) || IsSendNotDispatchedError(err) {
+		t.Fatalf("pre-call error = %v (%T), want unmarked validation error", err, err)
+	}
+	if calls != 0 {
+		t.Fatalf("signal-cli calls after pre-call failure = %d, want 0", calls)
+	}
+
+	err = bridge.SendReactionRequest("signal:+15551234567", "1700000000123", "", "👍", "add")
+	if err == nil || !IsCommandError(err) || IsSendNotDispatchedError(err) {
+		t.Fatalf("send-boundary error = %v (%T), want uncertain CommandError", err, err)
+	}
+	if calls != 1 {
+		t.Fatalf("signal-cli calls after send-boundary failure = %d, want 1", calls)
+	}
+}
+
+func TestLegacySendReactionCharacterizationPreservesTransportAndLocalState(t *testing.T) {
 	dataDir := t.TempDir()
 	store, err := db.New(filepath.Join(dataDir, "messages.db"))
 	if err != nil {
