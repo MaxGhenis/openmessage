@@ -733,8 +733,8 @@ func TestMessagesInboxMigrationIsChecksummedAndStrict(t *testing.T) {
 		t,
 		func() time.Time { return time.UnixMilli(messageTestTimeMS) },
 	)
-	if len(embeddedMigrations) != 8 {
-		t.Fatalf("embedded migrations = %d, want 8", len(embeddedMigrations))
+	if len(embeddedMigrations) != 9 {
+		t.Fatalf("embedded migrations = %d, want 9", len(embeddedMigrations))
 	}
 	assertPragmaInt(t, store.db, "user_version", len(embeddedMigrations))
 	ledger := readLedgerRow(t, store.db, 4)

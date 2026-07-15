@@ -83,8 +83,8 @@ func TestMessageAttachmentsMigrationAppliesToBlankAndExistingV7AndReopens(t *tes
 			}
 		})
 		after := readLedgerRows(t, store.db)
-		if len(after) != 8 {
-			t.Fatalf("migrated ledger rows = %d, want 8", len(after))
+		if len(after) != 9 {
+			t.Fatalf("migrated ledger rows = %d, want 9", len(after))
 		}
 		if !slices.Equal(after[:7], before) {
 			t.Fatalf("migrations 0001-0007 changed:\nbefore: %+v\nafter:  %+v", before, after[:7])
@@ -252,10 +252,10 @@ func TestMessageAttachmentRowsCascadeWithMessageDeletion(t *testing.T) {
 
 func assertMessageAttachmentsMigration(t *testing.T, store *Store) {
 	t.Helper()
-	if len(embeddedMigrations) != 8 {
-		t.Fatalf("embedded migrations = %d, want 8", len(embeddedMigrations))
+	if len(embeddedMigrations) != 9 {
+		t.Fatalf("embedded migrations = %d, want 9", len(embeddedMigrations))
 	}
-	assertPragmaInt(t, store.db, "user_version", 8)
+	assertPragmaInt(t, store.db, "user_version", 9)
 	ledger := readLedgerRow(t, store.db, 8)
 	if ledger.name != "message_attachments" {
 		t.Fatalf("migration 0008 name = %q, want message_attachments", ledger.name)

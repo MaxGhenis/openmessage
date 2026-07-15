@@ -85,6 +85,66 @@ func TestOutboxEnqueueIdempotencyAndConflict(t *testing.T) {
 	}
 }
 
+func TestOutboxSendAgainLinkRoundTripsAndClearsWhenPredecessorDeleted(t *testing.T) {
+	clock := newOutboxTestClock(outboxTestTimeMS)
+	store, repository := openOutboxTestRepository(t, clock.Now)
+	ctx := context.Background()
+
+	predecessor := outboxTestItem("send-again-predecessor")
+	mustEnqueueOutbox(t, repository, predecessor)
+
+	successor := outboxTestItem("send-again-successor")
+	successor.SendAgainOfOutboxID = predecessor.OutboxID
+	inserted, disposition, err := repository.Enqueue(ctx, successor)
+	if err != nil {
+		t.Fatalf("Enqueue(successor): %v", err)
+	}
+	if disposition != EnqueueInserted {
+		t.Fatalf("Enqueue(successor) disposition = %q, want %q", disposition, EnqueueInserted)
+	}
+	assertOutboxText(
+		t,
+		"inserted send_again_of_outbox_id",
+		inserted.SendAgainOfOutboxID,
+		predecessor.OutboxID,
+	)
+
+	found, err := repository.FindByID(ctx, successor.OutboxID)
+	if err != nil {
+		t.Fatalf("FindByID(successor): %v", err)
+	}
+	assertOutboxText(
+		t,
+		"scanned send_again_of_outbox_id",
+		found.SendAgainOfOutboxID,
+		predecessor.OutboxID,
+	)
+
+	if _, err := store.db.ExecContext(ctx, `DELETE FROM outbox WHERE outbox_id = ?`, predecessor.OutboxID); err != nil {
+		t.Fatalf("delete predecessor: %v", err)
+	}
+	found, err = repository.FindByID(ctx, successor.OutboxID)
+	if err != nil {
+		t.Fatalf("FindByID(successor after predecessor delete): %v", err)
+	}
+	if found.SendAgainOfOutboxID != nil {
+		t.Fatalf("send_again_of_outbox_id after predecessor delete = %v, want nil", found.SendAgainOfOutboxID)
+	}
+}
+
+func TestOutboxEnqueueRejectsBlankSendAgainLink(t *testing.T) {
+	_, repository := openOutboxTestRepository(t, func() time.Time {
+		return time.UnixMilli(outboxTestTimeMS)
+	})
+	item := outboxTestItem("blank-send-again-link")
+	item.SendAgainOfOutboxID = " \t "
+
+	if _, _, err := repository.Enqueue(context.Background(), item); err == nil ||
+		!strings.Contains(err.Error(), "send again predecessor outbox ID is empty") {
+		t.Fatalf("Enqueue(blank send-again link) error = %v", err)
+	}
+}
+
 func TestOutboxEnqueueOutgoingMessageIsAtomicAndDeduplicated(t *testing.T) {
 	clock := newOutboxTestClock(outboxTestTimeMS)
 	store, repository := openOutboxTestRepository(t, clock.Now)
@@ -1880,10 +1940,10 @@ func TestOutboxMigrationIsChecksummedAndStrict(t *testing.T) {
 	store, _ := openOutboxTestRepository(t, func() time.Time {
 		return time.UnixMilli(outboxTestTimeMS)
 	})
-	if len(embeddedMigrations) != 8 {
-		t.Fatalf("embedded migrations = %d, want 8", len(embeddedMigrations))
+	if len(embeddedMigrations) != 9 {
+		t.Fatalf("embedded migrations = %d, want 9", len(embeddedMigrations))
 	}
-	assertPragmaInt(t, store.db, "user_version", 8)
+	assertPragmaInt(t, store.db, "user_version", 9)
 	ledger := readLedgerRow(t, store.db, 5)
 	if ledger.name != "outbox" {
 		t.Fatalf("migration 0005 name = %q, want outbox", ledger.name)
@@ -1901,6 +1961,169 @@ func TestOutboxMigrationIsChecksummedAndStrict(t *testing.T) {
 	}
 	if strict != 1 {
 		t.Fatalf("outbox strict = %d, want 1", strict)
+	}
+}
+
+func TestOutboxSendAgainMigrationAppliesToBlankAndExistingV8DatabaseWithRows(t *testing.T) {
+	t.Run("blank", func(t *testing.T) {
+		store, err := Open(filepath.Join(t.TempDir(), "store.sqlite3"))
+		if err != nil {
+			t.Fatalf("Open(): %v", err)
+		}
+		t.Cleanup(func() {
+			if err := store.Close(); err != nil {
+				t.Errorf("Close(): %v", err)
+			}
+		})
+		assertOutboxSendAgainMigration(t, store)
+	})
+
+	t.Run("existing v8 with rows", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "store.sqlite3")
+		db, err := sql.Open("sqlite", storeDSN(path))
+		if err != nil {
+			t.Fatalf("sql.Open(): %v", err)
+		}
+		if err := db.Ping(); err != nil {
+			_ = db.Close()
+			t.Fatalf("Ping(): %v", err)
+		}
+		if err := enableWAL(context.Background(), db); err != nil {
+			_ = db.Close()
+			t.Fatalf("enableWAL(): %v", err)
+		}
+		if err := verifyConnectionPragmas(context.Background(), db); err != nil {
+			_ = db.Close()
+			t.Fatalf("verifyConnectionPragmas(): %v", err)
+		}
+		if err := runMigrations(context.Background(), db, embeddedMigrations[:8]); err != nil {
+			_ = db.Close()
+			t.Fatalf("runMigrations(v8): %v", err)
+		}
+		mustExec(t, db, `
+			INSERT INTO accounts (account_id, bridge_key, created_at_ms, updated_at_ms)
+			VALUES ('account-existing-v8', 'test', ?, ?)
+		`, outboxTestTimeMS, outboxTestTimeMS)
+		mustExec(t, db, `
+			INSERT INTO outbox (
+				outbox_id,
+				account_id,
+				conversation_id,
+				kind,
+				idempotency_key,
+				payload_hash,
+				operation,
+				state,
+				transport_request_id,
+				attempt_count,
+				scheduled_for_ms,
+				created_at_ms,
+				updated_at_ms
+			) VALUES (?, ?, ?, 'text', ?, ?, 'send_text', 'uncertain', ?, 1, ?, ?, ?)
+		`,
+			"outbox-existing-v8",
+			"account-existing-v8",
+			"conversation-existing-v8",
+			"idempotency-existing-v8",
+			"payload-existing-v8",
+			"request-existing-v8",
+			outboxTestTimeMS,
+			outboxTestTimeMS,
+			outboxTestTimeMS,
+		)
+		before := readLedgerRows(t, db)
+		if len(before) != 8 {
+			_ = db.Close()
+			t.Fatalf("v8 ledger rows = %d, want 8", len(before))
+		}
+		if err := db.Close(); err != nil {
+			t.Fatalf("close v8 database: %v", err)
+		}
+
+		store, err := Open(path)
+		if err != nil {
+			t.Fatalf("Open(v8): %v", err)
+		}
+		t.Cleanup(func() {
+			if err := store.Close(); err != nil {
+				t.Errorf("Close(): %v", err)
+			}
+		})
+		after := readLedgerRows(t, store.db)
+		if len(after) != 9 {
+			t.Fatalf("migrated ledger rows = %d, want 9", len(after))
+		}
+		if !slices.Equal(after[:8], before) {
+			t.Fatalf("migrations 0001-0008 changed:\nbefore: %+v\nafter:  %+v", before, after[:8])
+		}
+		assertOutboxSendAgainMigration(t, store)
+		var sendAgainOf sql.NullString
+		if err := store.db.QueryRow(`
+			SELECT send_again_of_outbox_id
+			FROM outbox
+			WHERE outbox_id = 'outbox-existing-v8'
+		`).Scan(&sendAgainOf); err != nil {
+			t.Fatalf("read existing v8 outbox row: %v", err)
+		}
+		if sendAgainOf.Valid {
+			t.Fatalf("existing v8 send_again_of_outbox_id = %q, want NULL", sendAgainOf.String)
+		}
+		var foreignKeyViolations int
+		if err := store.db.QueryRow(`SELECT count(*) FROM pragma_foreign_key_check`).Scan(&foreignKeyViolations); err != nil {
+			t.Fatalf("PRAGMA foreign_key_check: %v", err)
+		}
+		if foreignKeyViolations != 0 {
+			t.Fatalf("PRAGMA foreign_key_check returned %d violations, want 0", foreignKeyViolations)
+		}
+	})
+}
+
+func assertOutboxSendAgainMigration(t *testing.T, store *Store) {
+	t.Helper()
+	assertPragmaInt(t, store.db, "user_version", 9)
+	ledger := readLedgerRow(t, store.db, 9)
+	if ledger.name != "outbox_send_again" {
+		t.Fatalf("migration 0009 name = %q, want outbox_send_again", ledger.name)
+	}
+	if ledger.checksum != embeddedMigrations[8].checksumSHA256 {
+		t.Fatalf(
+			"migration 0009 checksum = %q, want %q",
+			ledger.checksum,
+			embeddedMigrations[8].checksumSHA256,
+		)
+	}
+
+	var columnType string
+	var notNull int
+	var defaultValue sql.NullString
+	var primaryKey int
+	if err := store.db.QueryRow(`
+		SELECT type, "notnull", dflt_value, pk
+		FROM pragma_table_info('outbox')
+		WHERE name = 'send_again_of_outbox_id'
+	`).Scan(&columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+		t.Fatalf("inspect send_again_of_outbox_id: %v", err)
+	}
+	if columnType != "TEXT" || notNull != 0 || defaultValue.Valid || primaryKey != 0 {
+		t.Fatalf(
+			"send_again_of_outbox_id schema = type %q, notnull %d, default %v, pk %d",
+			columnType,
+			notNull,
+			defaultValue,
+			primaryKey,
+		)
+	}
+
+	var partial int
+	if err := store.db.QueryRow(`
+		SELECT partial
+		FROM pragma_index_list('outbox')
+		WHERE name = 'outbox_send_again_of_idx'
+	`).Scan(&partial); err != nil {
+		t.Fatalf("inspect outbox_send_again_of_idx: %v", err)
+	}
+	if partial != 1 {
+		t.Fatalf("outbox_send_again_of_idx partial = %d, want 1", partial)
 	}
 }
 
@@ -1959,8 +2182,8 @@ func TestOutboxAttachmentsMigrationAppliesToBlankAndExistingV5Database(t *testin
 			}
 		})
 		after := readLedgerRows(t, store.db)
-		if len(after) != 8 {
-			t.Fatalf("migrated ledger rows = %d, want 8", len(after))
+		if len(after) != 9 {
+			t.Fatalf("migrated ledger rows = %d, want 9", len(after))
 		}
 		if !slices.Equal(after[:5], before) {
 			t.Fatalf("migrations 0001-0005 changed:\nbefore: %+v\nafter:  %+v", before, after[:5])
@@ -1971,7 +2194,7 @@ func TestOutboxAttachmentsMigrationAppliesToBlankAndExistingV5Database(t *testin
 
 func assertOutboxAttachmentsMigration(t *testing.T, store *Store) {
 	t.Helper()
-	assertPragmaInt(t, store.db, "user_version", 8)
+	assertPragmaInt(t, store.db, "user_version", 9)
 	ledger := readLedgerRow(t, store.db, 6)
 	if ledger.name != "outbox_attachments" {
 		t.Fatalf("migration 0006 name = %q, want outbox_attachments", ledger.name)
@@ -2026,7 +2249,7 @@ func TestReactionsReadMigrationAppliesToBlankAndReopens(t *testing.T) {
 
 func assertReactionsReadMigration(t *testing.T, store *Store) {
 	t.Helper()
-	assertPragmaInt(t, store.db, "user_version", 8)
+	assertPragmaInt(t, store.db, "user_version", 9)
 	ledger := readLedgerRow(t, store.db, 7)
 	if ledger.name != "reactions_read" {
 		t.Fatalf("migration 0007 name = %q, want reactions_read", ledger.name)

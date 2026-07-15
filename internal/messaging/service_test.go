@@ -1144,8 +1144,8 @@ func TestCancelAndDeferredAPIs(t *testing.T) {
 	if processed, err := service.DispatchDue(context.Background(), 1); err != nil || processed != 0 {
 		t.Fatalf("DispatchDue(canceled) = %d, %v", processed, err)
 	}
-	if _, err := service.SendAgain(context.Background(), submission.OutboxID, "new-key"); !errors.Is(err, ErrNotImplemented) {
-		t.Fatalf("SendAgain() error = %v, want ErrNotImplemented", err)
+	if _, err := service.SendAgain(context.Background(), submission.OutboxID, "new-key"); !errors.Is(err, ErrInvalidState) {
+		t.Fatalf("SendAgain(canceled) error = %v, want ErrInvalidState", err)
 	}
 	if err := service.ObserveTransportEcho(context.Background(), TransportEcho{}); !errors.Is(err, ErrInvalidCommand) {
 		t.Fatalf("ObserveTransportEcho() error = %v, want ErrInvalidCommand", err)

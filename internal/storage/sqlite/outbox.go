@@ -52,17 +52,18 @@ const (
 // NewOutboxItem contains the caller-owned identity and intent fields for a new
 // durable outbound operation. A zero ScheduledFor means immediately eligible.
 type NewOutboxItem struct {
-	OutboxID           string
-	AccountID          string
-	ConversationID     string
-	Kind               OutboxKind
-	IdempotencyKey     string
-	PayloadHash        string
-	Operation          string
-	LocalMessageID     string
-	TransportRequestID string
-	ScheduledFor       time.Time
-	ScheduledForMS     int64
+	OutboxID            string
+	AccountID           string
+	ConversationID      string
+	Kind                OutboxKind
+	IdempotencyKey      string
+	PayloadHash         string
+	Operation           string
+	LocalMessageID      string
+	TransportRequestID  string
+	SendAgainOfOutboxID string
+	ScheduledFor        time.Time
+	ScheduledForMS      int64
 }
 
 // OutboxItem mirrors one row in outbox. Nullable database fields are pointers.
@@ -77,6 +78,7 @@ type OutboxItem struct {
 	State               OutboxState
 	LocalMessageID      *string
 	TransportRequestID  string
+	SendAgainOfOutboxID *string
 	ResultRemoteID      *string
 	ErrorClass          *string
 	ErrorCode           *string
@@ -404,11 +406,12 @@ func (r *OutboxRepository) enqueue(
 			state,
 			local_message_id,
 			transport_request_id,
+			send_again_of_outbox_id,
 			attempt_count,
 			scheduled_for_ms,
 			created_at_ms,
 			updated_at_ms
-		) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, 0, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, 0, ?, ?, ?)
 		ON CONFLICT(account_id, idempotency_key) DO NOTHING
 	`,
 		item.OutboxID,
@@ -420,6 +423,7 @@ func (r *OutboxRepository) enqueue(
 		item.Operation,
 		nullableOutboxText(item.LocalMessageID),
 		item.TransportRequestID,
+		nullableOutboxText(item.SendAgainOfOutboxID),
 		scheduledForMS,
 		nowMS,
 		nowMS,
@@ -452,9 +456,14 @@ func (r *OutboxRepository) enqueue(
 			FROM outbox
 			WHERE account_id = ? AND idempotency_key = ?
 		`, item.AccountID, item.IdempotencyKey))
+		// The SendAgain link is part of an intent's identity: reusing one
+		// idempotency key against two different predecessors (whose payloads may
+		// hash identically) must conflict loudly, not silently return the first
+		// successor.
 		if err == nil && (row.Operation != item.Operation ||
 			row.ConversationID != item.ConversationID ||
-			row.PayloadHash != item.PayloadHash) {
+			row.PayloadHash != item.PayloadHash ||
+			!sameSendAgainLink(row.SendAgainOfOutboxID, item.SendAgainOfOutboxID)) {
 			return OutboxItem{}, "", fmt.Errorf(
 				"enqueue outbox item %q for account %q and idempotency key %q: %w",
 				item.OutboxID,
@@ -1815,6 +1824,7 @@ const outboxColumns = `
 	state,
 	local_message_id,
 	transport_request_id,
+	send_again_of_outbox_id,
 	result_remote_id,
 	error_class,
 	error_code,
@@ -1842,6 +1852,7 @@ func scanOutboxItem(row rowScanner) (OutboxItem, error) {
 		&item.State,
 		&item.LocalMessageID,
 		&item.TransportRequestID,
+		&item.SendAgainOfOutboxID,
 		&item.ResultRemoteID,
 		&item.ErrorClass,
 		&item.ErrorCode,
@@ -1877,6 +1888,9 @@ func validateNewOutboxItem(item NewOutboxItem) error {
 			return fmt.Errorf("%s is empty", check.name)
 		}
 	}
+	if item.SendAgainOfOutboxID != "" && strings.TrimSpace(item.SendAgainOfOutboxID) == "" {
+		return fmt.Errorf("send again predecessor outbox ID is empty")
+	}
 	switch item.Kind {
 	case OutboxKindText, OutboxKindMedia, OutboxKindReaction, OutboxKindRead:
 	default:
@@ -1910,6 +1924,15 @@ func nullableOutboxText(value string) any {
 		return nil
 	}
 	return value
+}
+
+// sameSendAgainLink compares a stored nullable link against an incoming
+// command's link, where the empty string means "no link" (stored as NULL).
+func sameSendAgainLink(stored *string, incoming string) bool {
+	if stored == nil {
+		return incoming == ""
+	}
+	return *stored == incoming
 }
 
 func newOutboxLeaseToken() (string, error) {

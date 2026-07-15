@@ -623,14 +623,143 @@ func (s *MessageService) RetryNotDispatched(
 	return s.Get(ctx, outboxID)
 }
 
-// SendAgain is reserved for M5, where the new intent can be durably linked to
-// the ambiguous or rejected prior intent.
+// SendAgain creates a new text or media intent from the durable payload of an
+// uncertain or rejected predecessor. The predecessor remains unchanged. A late
+// echo may confirm the predecessor between the state read and the enqueue;
+// that is the same accepted outcome as the echo arriving a moment after the
+// resend (both delivered) — the user explicitly chose to resend a
+// maybe-delivered message, and the two intents stay distinct rows.
 func (s *MessageService) SendAgain(
-	context.Context,
-	string,
-	string,
+	ctx context.Context,
+	outboxID string,
+	newIdempotencyKey string,
 ) (Submission, error) {
-	return Submission{}, fmt.Errorf("send again: %w", ErrNotImplemented)
+	if ctx == nil {
+		return Submission{}, fmt.Errorf("send again: context is nil")
+	}
+	item, err := s.outbox.FindByID(ctx, outboxID)
+	if err != nil {
+		return Submission{}, fmt.Errorf("send again: read prior outbox item: %w", err)
+	}
+	if item.State != sqlite.OutboxUncertain && item.State != sqlite.OutboxRejected {
+		return Submission{}, fmt.Errorf(
+			"%w: cannot send again outbox item %q from %q",
+			ErrInvalidState,
+			outboxID,
+			item.State,
+		)
+	}
+	if item.Kind != sqlite.OutboxKindText && item.Kind != sqlite.OutboxKindMedia {
+		return Submission{}, fmt.Errorf(
+			"%w: cannot send again outbox item %q of kind %q",
+			ErrInvalidState,
+			outboxID,
+			item.Kind,
+		)
+	}
+	if strings.TrimSpace(newIdempotencyKey) == "" {
+		return Submission{}, fmt.Errorf("%w: new idempotency key is empty", ErrInvalidCommand)
+	}
+	if newIdempotencyKey == item.IdempotencyKey {
+		return Submission{}, fmt.Errorf(
+			"%w: new idempotency key must differ from the prior key",
+			ErrInvalidCommand,
+		)
+	}
+	if item.LocalMessageID == nil || strings.TrimSpace(*item.LocalMessageID) == "" {
+		return Submission{}, fmt.Errorf(
+			"send again: prior outbox item %q has no local message",
+			outboxID,
+		)
+	}
+	message, err := s.messages.GetMessage(ctx, *item.LocalMessageID)
+	if err != nil {
+		return Submission{}, fmt.Errorf("send again: read prior local message: %w", err)
+	}
+	if message.State == sqlite.MessageStateDeleted {
+		return Submission{}, fmt.Errorf(
+			"%w: prior message %q is deleted",
+			ErrInvalidCommand,
+			message.MessageID,
+		)
+	}
+
+	newOutboxID, newLocalMessageID, newRequestID, err := s.newSubmissionIDs()
+	if err != nil {
+		return Submission{}, err
+	}
+	now := s.clock.Now()
+	newItem := sqlite.NewOutboxItem{
+		OutboxID:            newOutboxID,
+		AccountID:           item.AccountID,
+		ConversationID:      item.ConversationID,
+		Kind:                item.Kind,
+		IdempotencyKey:      newIdempotencyKey,
+		LocalMessageID:      newLocalMessageID,
+		TransportRequestID:  newRequestID,
+		ScheduledFor:        now,
+		SendAgainOfOutboxID: item.OutboxID,
+	}
+	newMessage := sqlite.Message{
+		MessageID:       newLocalMessageID,
+		ConversationID:  item.ConversationID,
+		AccountID:       item.AccountID,
+		RemoteMessageID: newRequestID,
+		Direction:       sqlite.MessageDirectionOutgoing,
+		Body:            message.Body,
+		ReplyToRemoteID: message.ReplyToRemoteID,
+		State:           sqlite.MessageStateActive,
+		OccurredAtMS:    now.UnixMilli(),
+	}
+	replyToRemoteID := stringValue(message.ReplyToRemoteID)
+
+	var resent sqlite.OutboxItem
+	var disposition sqlite.EnqueueDisposition
+	switch item.Kind {
+	case sqlite.OutboxKindText:
+		newItem.Operation = textOperation
+		newItem.PayloadHash, err = textPayloadHash(message.Body, replyToRemoteID)
+		if err != nil {
+			return Submission{}, fmt.Errorf("send again: hash text payload: %w", err)
+		}
+		resent, disposition, err = s.outbox.EnqueueOutgoingMessage(ctx, newItem, newMessage)
+	case sqlite.OutboxKindMedia:
+		attachment, attachmentErr := s.outbox.GetOutboxAttachment(ctx, item.OutboxID)
+		if attachmentErr != nil {
+			return Submission{}, fmt.Errorf("send again: read prior media attachment: %w", attachmentErr)
+		}
+		newItem.Operation = mediaOperation
+		newItem.PayloadHash, err = mediaPayloadHash(
+			attachment.BlobHash,
+			attachment.SizeBytes,
+			attachment.MIME,
+			attachment.Filename,
+			message.Body,
+			replyToRemoteID,
+		)
+		if err != nil {
+			return Submission{}, fmt.Errorf("send again: hash media payload: %w", err)
+		}
+		resent, disposition, err = s.outbox.EnqueueOutgoingMediaMessage(
+			ctx,
+			newItem,
+			newMessage,
+			sqlite.OutboxAttachment{
+				BlobHash:  attachment.BlobHash,
+				SizeBytes: attachment.SizeBytes,
+				MIME:      attachment.MIME,
+				Filename:  attachment.Filename,
+			},
+		)
+	}
+	if err != nil {
+		return Submission{}, fmt.Errorf("send again: enqueue reconstructed intent: %w", err)
+	}
+	if disposition == sqlite.EnqueueInserted {
+		s.signalChange()
+		s.signalWake()
+	}
+	return submissionFromItem(resent), nil
 }
 
 // ObserveTransportEcho correlates an accepted transport result to an existing
