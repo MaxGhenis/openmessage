@@ -47,10 +47,15 @@ var ErrProfilePhotoNotFound = errors.New("whatsapp profile photo not found")
 
 var ErrTemporaryBanActive = errors.New("whatsapp temporary ban is still active")
 
-// ErrMediaNotDispatched marks failures that happened before whatsmeow's send
+// ErrSendNotDispatched marks failures that happened before whatsmeow's send
 // call. Callers may safely retry those failures without treating the attempt as
 // an ambiguous dispatch.
-var ErrMediaNotDispatched = errors.New("whatsapp media was not dispatched")
+var ErrSendNotDispatched = errors.New("whatsapp send was not dispatched")
+
+// ErrMediaNotDispatched is a forward-compat alias for the pre-rename exported
+// symbol; no in-tree caller remains, but removing an exported marker would be
+// a gratuitous API break.
+var ErrMediaNotDispatched = ErrSendNotDispatched
 
 const whatsappRuntimeStateSchema = `
 CREATE TABLE IF NOT EXISTS openmessage_whatsapp_runtime_state (
@@ -1146,66 +1151,110 @@ func (b *Bridge) Close() error {
 	return errors.Join(errs...)
 }
 
+type sendTextResult struct {
+	remoteID  string
+	timestamp time.Time
+	client    *whatsmeow.Client
+	body      string
+	replyToID string
+}
+
+// SendTextRequest sends text with a stable caller-owned request ID and returns
+// the transport identity used by the v2 dispatch path.
+func (b *Bridge) SendTextRequest(conversationID, body, replyToID, requestID string) (remoteID string, ts time.Time, err error) {
+	result, err := b.sendTextRequest(
+		conversationID,
+		body,
+		replyToID,
+		deriveWebMessageID(requestID),
+		true,
+	)
+	if err != nil {
+		return "", time.Time{}, err
+	}
+	return result.remoteID, result.timestamp, nil
+}
+
 func (b *Bridge) SendText(conversationID, body, replyToID string) (*db.Message, error) {
-	body = strings.TrimSpace(body)
-	if conversationID == "" || body == "" {
-		return nil, errors.New("conversation_id and body are required")
-	}
-
-	chatJID, err := parseConversationJID(conversationID)
+	// An empty ID preserves the legacy GenerateMessageID call at the pre-send
+	// boundary. The v2 request path supplies its stable derived ID instead.
+	result, err := b.sendTextRequest(conversationID, body, replyToID, "", false)
 	if err != nil {
 		return nil, err
-	}
-
-	cli, err := b.ensureSendClient()
-	if err != nil {
-		return nil, err
-	}
-
-	reqID := cli.GenerateMessageID()
-	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
-	defer cancel()
-
-	resp, err := sendTextMessage(cli, ctx, chatJID, outgoingTextMessage(body, replyToID), whatsmeow.SendRequestExtra{
-		ID: reqID,
-	})
-	if err != nil {
-		b.reportConnectionError(err)
-		return nil, fmt.Errorf("send WhatsApp message: %w", err)
-	}
-
-	now := time.Now().UnixMilli()
-	if !resp.Timestamp.IsZero() {
-		now = resp.Timestamp.UnixMilli()
-	}
-	messageID := string(resp.ID)
-	if messageID == "" {
-		messageID = string(reqID)
 	}
 
 	senderName := "Me"
 	senderNumber := ""
-	if cli.Store != nil {
-		if push := strings.TrimSpace(cli.Store.PushName); push != "" {
+	if result.client.Store != nil {
+		if push := strings.TrimSpace(result.client.Store.PushName); push != "" {
 			senderName = push
 		}
-		if cli.Store.ID != nil {
-			senderNumber = jidToPhone(*cli.Store.ID)
+		if result.client.Store.ID != nil {
+			senderNumber = jidToPhone(*result.client.Store.ID)
 		}
 	}
 
 	return &db.Message{
-		MessageID:      "whatsapp:" + messageID,
+		MessageID:      "whatsapp:" + result.remoteID,
 		ConversationID: conversationID,
 		SenderName:     senderName,
 		SenderNumber:   senderNumber,
-		Body:           body,
-		TimestampMS:    now,
+		Body:           result.body,
+		TimestampMS:    result.timestamp.UnixMilli(),
 		Status:         "sent",
 		IsFromMe:       true,
-		ReplyToID:      normalizeReplyToID(replyToID),
+		ReplyToID:      result.replyToID,
 		SourcePlatform: "whatsapp",
-		SourceID:       messageID,
+		SourceID:       result.remoteID,
+	}, nil
+}
+
+func (b *Bridge) sendTextRequest(conversationID, body, replyToID string, requestID watypes.MessageID, markPreDispatch bool) (sendTextResult, error) {
+	body = strings.TrimSpace(body)
+	if conversationID == "" || body == "" {
+		return sendTextResult{}, markSendNotDispatched(errors.New("conversation_id and body are required"), markPreDispatch)
+	}
+	replyToID = normalizeReplyToID(replyToID)
+
+	chatJID, err := parseConversationJID(conversationID)
+	if err != nil {
+		return sendTextResult{}, markSendNotDispatched(err, markPreDispatch)
+	}
+
+	cli, err := b.ensureSendClient()
+	if err != nil {
+		return sendTextResult{}, markSendNotDispatched(err, markPreDispatch)
+	}
+
+	if requestID == "" {
+		requestID = cli.GenerateMessageID()
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+
+	resp, err := sendTextMessage(cli, ctx, chatJID, outgoingTextMessage(body, replyToID), whatsmeow.SendRequestExtra{
+		ID: requestID,
+	})
+	if err != nil {
+		b.reportConnectionError(err)
+		return sendTextResult{}, fmt.Errorf("send WhatsApp message: %w", err)
+	}
+
+	acceptedAt := time.Now()
+	if !resp.Timestamp.IsZero() {
+		acceptedAt = resp.Timestamp
+	}
+	messageID := string(resp.ID)
+	if messageID == "" {
+		messageID = string(requestID)
+	}
+
+	return sendTextResult{
+		remoteID:  messageID,
+		timestamp: acceptedAt,
+		client:    cli,
+		body:      body,
+		replyToID: replyToID,
 	}, nil
 }
 
@@ -1228,7 +1277,7 @@ func (b *Bridge) SendMediaRequest(conversationID string, data []byte, filename, 
 		mime,
 		caption,
 		replyToID,
-		deriveMediaRequestID(requestID),
+		deriveWebMessageID(requestID),
 		true,
 	)
 	if err != nil {
@@ -1276,22 +1325,22 @@ func (b *Bridge) SendMedia(conversationID string, data []byte, filename, mime, c
 
 func (b *Bridge) sendMediaRequest(conversationID string, data []byte, filename, mime, caption, replyToID string, requestID watypes.MessageID, markPreDispatch bool) (sendMediaResult, error) {
 	if conversationID == "" || len(data) == 0 {
-		return sendMediaResult{}, markMediaNotDispatched(errors.New("conversation_id and file are required"), markPreDispatch)
+		return sendMediaResult{}, markSendNotDispatched(errors.New("conversation_id and file are required"), markPreDispatch)
 	}
 	caption = strings.TrimSpace(caption)
 	replyToID = normalizeReplyToID(replyToID)
 	chatJID, err := parseConversationJID(conversationID)
 	if err != nil {
-		return sendMediaResult{}, markMediaNotDispatched(err, markPreDispatch)
+		return sendMediaResult{}, markSendNotDispatched(err, markPreDispatch)
 	}
 	mediaType, err := mediaTypeForMIME(mime)
 	if err != nil {
-		return sendMediaResult{}, markMediaNotDispatched(err, markPreDispatch)
+		return sendMediaResult{}, markSendNotDispatched(err, markPreDispatch)
 	}
 
 	cli, err := b.ensureSendClient()
 	if err != nil {
-		return sendMediaResult{}, markMediaNotDispatched(err, markPreDispatch)
+		return sendMediaResult{}, markSendNotDispatched(err, markPreDispatch)
 	}
 
 	uploadCtx, cancelUpload := context.WithTimeout(context.Background(), 90*time.Second)
@@ -1300,7 +1349,7 @@ func (b *Bridge) sendMediaRequest(conversationID string, data []byte, filename, 
 	upload, err := uploadMedia(cli, uploadCtx, data, mediaType)
 	if err != nil {
 		b.reportConnectionError(err)
-		return sendMediaResult{}, markMediaNotDispatched(fmt.Errorf("upload WhatsApp media: %w", err), markPreDispatch)
+		return sendMediaResult{}, markSendNotDispatched(fmt.Errorf("upload WhatsApp media: %w", err), markPreDispatch)
 	}
 	if requestID == "" {
 		requestID = cli.GenerateMessageID()
@@ -1335,28 +1384,28 @@ func (b *Bridge) sendMediaRequest(conversationID string, data []byte, filename, 
 	}, nil
 }
 
-func deriveMediaRequestID(requestID string) watypes.MessageID {
+func deriveWebMessageID(requestID string) watypes.MessageID {
 	digest := sha256.Sum256([]byte(requestID))
 	return whatsmeow.WebMessageIDPrefix + strings.ToUpper(hex.EncodeToString(digest[:9]))
 }
 
-type mediaNotDispatchedError struct {
+type sendNotDispatchedError struct {
 	cause error
 }
 
-func markMediaNotDispatched(err error, mark bool) error {
-	if !mark || err == nil || errors.Is(err, ErrMediaNotDispatched) {
+func markSendNotDispatched(err error, mark bool) error {
+	if !mark || err == nil || errors.Is(err, ErrSendNotDispatched) {
 		return err
 	}
-	return mediaNotDispatchedError{cause: err}
+	return sendNotDispatchedError{cause: err}
 }
 
-func (e mediaNotDispatchedError) Error() string { return e.cause.Error() }
+func (e sendNotDispatchedError) Error() string { return e.cause.Error() }
 
-func (e mediaNotDispatchedError) Unwrap() error { return e.cause }
+func (e sendNotDispatchedError) Unwrap() error { return e.cause }
 
-func (e mediaNotDispatchedError) Is(target error) bool {
-	return target == ErrMediaNotDispatched
+func (e sendNotDispatchedError) Is(target error) bool {
+	return target == ErrSendNotDispatched
 }
 
 func (b *Bridge) SendReaction(conversationID, targetMessageID, emoji, action string) error {

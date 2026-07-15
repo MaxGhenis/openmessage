@@ -166,7 +166,7 @@ func TestLegacySendMediaUploadErrorContractIsPreserved(t *testing.T) {
 	if err.Error() != "upload WhatsApp media: legacy upload failure" {
 		t.Fatalf("SendMedia() error text = %q, want unchanged legacy text", err.Error())
 	}
-	if errors.Is(err, ErrMediaNotDispatched) {
+	if errors.Is(err, ErrSendNotDispatched) {
 		t.Fatalf("legacy SendMedia() error gained the v2-only marker: %v", err)
 	}
 }

@@ -15,6 +15,352 @@ import (
 	"github.com/maxghenis/openmessage/internal/client"
 )
 
+func TestSendTextNotConnectedIsClassifiedPreCall(t *testing.T) {
+	host := newTestApp(t)
+	a := New("google-primary", host, func() bool { return true })
+	a.newClient = func() (*client.Client, transportClient, error) {
+		t.Fatal("SendText must not construct a Google transport")
+		return nil, nil, nil
+	}
+
+	result, err := a.SendText(context.Background(), bridge.TextRequest{
+		AccountID: "google-primary",
+		Conversation: bridge.ConversationRef{
+			RemoteID: "conversation-id",
+		},
+		Body:      "hello",
+		RequestID: "request-id",
+	})
+	if result != (bridge.SendResult{}) {
+		t.Fatalf("result = %+v, want zero value", result)
+	}
+	failure := requireTextOpError(t, err)
+	if failure.Class != bridge.FailureTransient ||
+		failure.Dispatch != bridge.DispatchNotCalled ||
+		failure.Operation != "send_text" ||
+		failure.Fingerprint != "google_not_connected" {
+		t.Fatalf("failure = %+v, want transient pre-call google_not_connected", failure)
+	}
+}
+
+func TestSendTextContextGuardsAreClassifiedPreCall(t *testing.T) {
+	tests := []struct {
+		name        string
+		ctx         context.Context
+		fingerprint string
+	}{
+		{
+			name:        "nil",
+			ctx:         nil,
+			fingerprint: "google_text_context_invalid",
+		},
+		{
+			name: "done",
+			ctx: func() context.Context {
+				ctx, cancel := context.WithCancel(context.Background())
+				cancel()
+				return ctx
+			}(),
+			fingerprint: "google_text_context_done",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fake := &fakeTextSendClient{}
+			a := newTextSendTestAdapter(t, fake)
+
+			_, err := a.SendText(test.ctx, bridge.TextRequest{})
+			failure := requireTextOpError(t, err)
+			if failure.Class != bridge.FailureTransient ||
+				failure.Dispatch != bridge.DispatchNotCalled ||
+				failure.Operation != "send_text" ||
+				failure.Fingerprint != test.fingerprint {
+				t.Fatalf("failure = %+v, want transient pre-call %s", failure, test.fingerprint)
+			}
+			if fake.conversationCalls != 0 || fake.sendCalls != 0 {
+				t.Fatalf("transport calls = (conversation %d, send %d), want (0, 0)",
+					fake.conversationCalls, fake.sendCalls)
+			}
+		})
+	}
+}
+
+func TestSendTextSuccessUsesStablePayloadAndMapsResult(t *testing.T) {
+	sim := &gmproto.SIMPayload{Two: 7, SIMNumber: 2}
+	conversation := &gmproto.Conversation{
+		ConversationID: "remote-conversation",
+		Participants: []*gmproto.Participant{{
+			ID:         &gmproto.SmallInfo{Number: "+15551234567"},
+			IsMe:       true,
+			SimPayload: sim,
+		}},
+	}
+	fake := &fakeTextSendClient{
+		conversationResult: conversation,
+		sendResult: &gmproto.SendMessageResponse{
+			Status: gmproto.SendMessageResponse_SUCCESS,
+		},
+	}
+	a := newTextSendTestAdapter(t, fake)
+
+	result, err := a.SendText(context.Background(), bridge.TextRequest{
+		AccountID: "google-primary",
+		Conversation: bridge.ConversationRef{
+			RemoteID: "remote-conversation",
+		},
+		Body:      "hello from the durable outbox",
+		ReplyTo:   &bridge.MessageRef{RemoteID: "reply-id"},
+		RequestID: "transport-request-id",
+	})
+	if err != nil {
+		t.Fatalf("SendText() error = %v", err)
+	}
+	if result.RemoteMessageID != "transport-request-id" || !result.EchoExpected || !result.AcceptedAt.IsZero() {
+		t.Fatalf("result = %+v, want stable TmpID, echo expected, and zero AcceptedAt", result)
+	}
+	if fake.conversationID != "remote-conversation" || fake.conversationCalls != 1 {
+		t.Fatalf("GetConversation = (%q, %d calls), want (remote-conversation, 1 call)",
+			fake.conversationID, fake.conversationCalls)
+	}
+	if fake.sendCalls != 1 || fake.sent == nil {
+		t.Fatalf("SendMessage = (%d calls, payload %p), want one non-nil payload", fake.sendCalls, fake.sent)
+	}
+	payload := fake.sent
+	if payload.GetTmpID() != "transport-request-id" ||
+		payload.GetMessagePayload().GetTmpID() != "transport-request-id" ||
+		payload.GetMessagePayload().GetTmpID2() != "transport-request-id" {
+		t.Fatalf("payload TmpIDs = (%q, %q, %q), want transport-request-id in all positions",
+			payload.GetTmpID(), payload.GetMessagePayload().GetTmpID(), payload.GetMessagePayload().GetTmpID2())
+	}
+	if payload.GetConversationID() != "remote-conversation" ||
+		payload.GetMessagePayload().GetConversationID() != "remote-conversation" {
+		t.Fatalf("payload conversation IDs = (%q, %q), want remote-conversation",
+			payload.GetConversationID(), payload.GetMessagePayload().GetConversationID())
+	}
+	if payload.GetMessagePayload().GetParticipantID() != "+15551234567" || payload.GetSIMPayload() != sim {
+		t.Fatalf("payload routing = participant %q SIM %p, want +15551234567 and %p",
+			payload.GetMessagePayload().GetParticipantID(), payload.GetSIMPayload(), sim)
+	}
+	infos := payload.GetMessagePayload().GetMessageInfo()
+	if len(infos) != 1 || infos[0].GetMessageContent().GetContent() != "hello from the durable outbox" {
+		t.Fatalf("payload MessageInfo = %+v, want request body", infos)
+	}
+	if payload.GetReply().GetMessageID() != "reply-id" {
+		t.Fatalf("payload reply ID = %q, want reply-id", payload.GetReply().GetMessageID())
+	}
+}
+
+func TestSendTextConversationFailuresAreClassifiedNotCalled(t *testing.T) {
+	tests := []struct {
+		name        string
+		fake        *fakeTextSendClient
+		wantClass   bridge.FailureClass
+		fingerprint string
+	}{
+		{
+			name: "transport error",
+			fake: &fakeTextSendClient{
+				conversationErr: errors.New("conversation unavailable"),
+			},
+			wantClass:   bridge.FailureTransient,
+			fingerprint: "google_conversation_get_failed",
+		},
+		{
+			name:        "nil conversation",
+			fake:        &fakeTextSendClient{},
+			wantClass:   bridge.FailureTransient,
+			fingerprint: "google_conversation_get_failed",
+		},
+		{
+			name: "auth expiry",
+			fake: &fakeTextSendClient{
+				conversationErr: errors.New("HTTP 401: invalid authentication credentials"),
+			},
+			wantClass:   bridge.FailureCredentialsExpired,
+			fingerprint: "google_auth_expired",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			a := newTextSendTestAdapter(t, test.fake)
+			_, err := a.SendText(context.Background(), bridge.TextRequest{
+				Conversation: bridge.ConversationRef{RemoteID: "conversation-id"},
+				Body:         "hello",
+				RequestID:    "request-id",
+			})
+			failure := requireTextOpError(t, err)
+			if failure.Class != test.wantClass || failure.Dispatch != bridge.DispatchNotCalled ||
+				failure.Operation != "send_text" || failure.Fingerprint != test.fingerprint {
+				t.Fatalf("failure = %+v, want class %q pre-call %s", failure, test.wantClass, test.fingerprint)
+			}
+			if test.fake.sendCalls != 0 {
+				t.Fatalf("SendMessage calls = %d, want 0", test.fake.sendCalls)
+			}
+		})
+	}
+}
+
+func TestSendTextSendFailuresAreClassifiedUncertain(t *testing.T) {
+	tests := []struct {
+		name string
+		fake *fakeTextSendClient
+	}{
+		{
+			name: "transport error",
+			fake: &fakeTextSendClient{
+				conversationResult: &gmproto.Conversation{},
+				sendErr:            errors.New("transport timeout"),
+			},
+		},
+		{
+			name: "nil response",
+			fake: &fakeTextSendClient{
+				conversationResult: &gmproto.Conversation{},
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			a := newTextSendTestAdapter(t, test.fake)
+			_, err := a.SendText(context.Background(), bridge.TextRequest{
+				Conversation: bridge.ConversationRef{RemoteID: "conversation-id"},
+				Body:         "hello",
+				RequestID:    "request-id",
+			})
+			failure := requireTextOpError(t, err)
+			if failure.Class != bridge.FailureTransient || failure.Dispatch != "" ||
+				failure.Operation != "send_text" || failure.Fingerprint != "google_text_send_failed" {
+				t.Fatalf("failure = %+v, want ambiguous transient google_text_send_failed", failure)
+			}
+			if test.fake.sendCalls != 1 {
+				t.Fatalf("SendMessage calls = %d, want 1", test.fake.sendCalls)
+			}
+		})
+	}
+}
+
+func TestSendTextTransientAndRejectedFailuresDoNotRetireGeneration(t *testing.T) {
+	tests := []struct {
+		name        string
+		fake        *fakeTextSendClient
+		dispatch    bridge.DispatchCertainty
+		fingerprint string
+	}{
+		{
+			name: "ambiguous transport error",
+			fake: &fakeTextSendClient{
+				conversationResult: &gmproto.Conversation{},
+				sendErr:            errors.New("transport timeout"),
+			},
+			dispatch:    "",
+			fingerprint: "google_text_send_failed",
+		},
+		{
+			name: "nil response",
+			fake: &fakeTextSendClient{
+				conversationResult: &gmproto.Conversation{},
+			},
+			dispatch:    "",
+			fingerprint: "google_text_send_failed",
+		},
+		{
+			name: "rejected status",
+			fake: &fakeTextSendClient{
+				conversationResult: &gmproto.Conversation{},
+				sendResult: &gmproto.SendMessageResponse{
+					Status: gmproto.SendMessageResponse_UNKNOWN,
+				},
+			},
+			dispatch:    bridge.DispatchNotCalled,
+			fingerprint: "google_text_send_rejected",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			host := newTestApp(t)
+			transport := &fakeTransport{}
+			a := newTestAdapter(t, host, transport)
+			run, err := a.Start(context.Background(), bridge.StartRequest{
+				AccountID:  "google-primary",
+				Generation: 1,
+			}, nil)
+			if err != nil {
+				t.Fatalf("Start() error = %v", err)
+			}
+			transport.emit(&gmproto.Conversation{ConversationID: "ready"})
+			<-run.Ready()
+
+			installTextSendClient(t, host.GetClient(), test.fake)
+			_, err = a.SendText(context.Background(), bridge.TextRequest{
+				Conversation: bridge.ConversationRef{RemoteID: "conversation-id"},
+				Body:         "hello",
+				RequestID:    "request-id",
+			})
+			failure := requireTextOpError(t, err)
+			if failure.Class != bridge.FailureTransient || failure.Dispatch != test.dispatch ||
+				failure.Operation != "send_text" || failure.Fingerprint != test.fingerprint {
+				t.Fatalf("failure = %+v, want transient %q dispatch %q", failure, test.fingerprint, test.dispatch)
+			}
+			if !host.Connected.Load() {
+				t.Fatal("text send failure marked the connected receive generation lost")
+			}
+			select {
+			case terminal := <-run.Done():
+				t.Fatalf("text send failure retired the receive generation with %v", terminal)
+			default:
+			}
+			if host.GoogleStatus().NeedsRepair {
+				t.Fatal("text send failure parked the Google lifecycle")
+			}
+		})
+	}
+}
+
+func TestSendTextAuthExpiryStillReportsToLifecycle(t *testing.T) {
+	host := newTestApp(t)
+	transport := &fakeTransport{}
+	a := newTestAdapter(t, host, transport)
+	run, err := a.Start(context.Background(), bridge.StartRequest{
+		AccountID:  "google-primary",
+		Generation: 1,
+	}, nil)
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	transport.emit(&gmproto.Conversation{ConversationID: "ready"})
+	<-run.Ready()
+
+	fake := &fakeTextSendClient{
+		conversationResult: &gmproto.Conversation{},
+		sendErr:            errors.New("google returned http 401 for send"),
+	}
+	installTextSendClient(t, host.GetClient(), fake)
+
+	_, err = a.SendText(context.Background(), bridge.TextRequest{
+		Conversation: bridge.ConversationRef{RemoteID: "conversation-id"},
+		Body:         "hello",
+		RequestID:    "request-id",
+	})
+	failure := requireTextOpError(t, err)
+	if failure.Fingerprint != "google_auth_expired" {
+		t.Fatalf("failure = %+v, want google_auth_expired classification", failure)
+	}
+	select {
+	case terminal := <-run.Done():
+		terminalFailure, ok := asOpError(terminal)
+		if !ok || (terminalFailure.Class != bridge.FailureCredentialsExpired &&
+			terminalFailure.Class != bridge.FailureUpgradeRequired) {
+			t.Fatalf("terminal = %v, want credentials_expired/upgrade_required", terminal)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("auth-expired text send failure did not reach the lifecycle owner")
+	}
+}
+
 func TestSendMediaNotConnectedIsClassifiedPreCall(t *testing.T) {
 	host := newTestApp(t)
 	a := New("google-primary", host, func() bool { return true })
@@ -510,6 +856,65 @@ func TestSendMediaCaptionFailureRemainsAmbiguousAfterMediaSuccess(t *testing.T) 
 			}
 		})
 	}
+}
+
+func newTextSendTestAdapter(t *testing.T, fake *fakeTextSendClient) *Adapter {
+	t.Helper()
+	host := newTestApp(t)
+	legacy := newLegacyClient(t)
+	generation := host.BeginGoogleGeneration(legacy)
+	t.Cleanup(generation.Release)
+	host.Connected.Store(true)
+	installTextSendClient(t, legacy, fake)
+	return New("google-primary", host, func() bool { return true })
+}
+
+func installTextSendClient(t *testing.T, want *client.Client, fake textSendClient) {
+	t.Helper()
+	previous := textSendClientFor
+	textSendClientFor = func(got *client.Client) textSendClient {
+		if got != want {
+			t.Fatalf("text client source = %p, want App.GetClient() %p", got, want)
+		}
+		return fake
+	}
+	t.Cleanup(func() { textSendClientFor = previous })
+}
+
+func requireTextOpError(t *testing.T, err error) bridge.OpError {
+	t.Helper()
+	if err == nil {
+		t.Fatal("SendText() error = nil, want classified failure")
+	}
+	failure, ok := asOpError(err)
+	if !ok {
+		t.Fatalf("SendText() error = %T %v, want bridge.OpError", err, err)
+	}
+	return failure
+}
+
+type fakeTextSendClient struct {
+	conversationResult *gmproto.Conversation
+	conversationErr    error
+	sendResult         *gmproto.SendMessageResponse
+	sendErr            error
+
+	conversationCalls int
+	conversationID    string
+	sendCalls         int
+	sent              *gmproto.SendMessageRequest
+}
+
+func (f *fakeTextSendClient) GetConversation(conversationID string) (*gmproto.Conversation, error) {
+	f.conversationCalls++
+	f.conversationID = conversationID
+	return f.conversationResult, f.conversationErr
+}
+
+func (f *fakeTextSendClient) SendMessage(payload *gmproto.SendMessageRequest) (*gmproto.SendMessageResponse, error) {
+	f.sendCalls++
+	f.sent = payload
+	return f.sendResult, f.sendErr
 }
 
 func newMediaSendTestAdapter(t *testing.T, fake *fakeMediaSendClient) *Adapter {

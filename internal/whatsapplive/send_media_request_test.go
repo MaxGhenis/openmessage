@@ -15,20 +15,31 @@ import (
 	watypes "go.mau.fi/whatsmeow/types"
 )
 
-func TestDeriveMediaRequestID(t *testing.T) {
+func TestDeriveWebMessageIDPreservesMediaDerivationBytes(t *testing.T) {
 	const requestID = "outbox-request-123"
 	const want = "3EB05F7E578787F3196B49"
 
-	if got := deriveMediaRequestID(requestID); got != want {
-		t.Fatalf("deriveMediaRequestID(%q) = %q, want %q", requestID, got, want)
+	if got := deriveWebMessageID(requestID); !bytes.Equal([]byte(got), []byte(want)) {
+		t.Fatalf("deriveWebMessageID(%q) bytes = %x, want pre-rename bytes %x", requestID, []byte(got), []byte(want))
 	}
-	if got := deriveMediaRequestID(requestID); got != want {
-		t.Fatalf("second deriveMediaRequestID(%q) = %q, want deterministic %q", requestID, got, want)
+	if got := deriveWebMessageID(requestID); got != want {
+		t.Fatalf("second deriveWebMessageID(%q) = %q, want deterministic %q", requestID, got, want)
 	}
-	if got := deriveMediaRequestID(requestID + "-different"); got == want {
+	if got := deriveWebMessageID(requestID + "-different"); got == want {
 		t.Fatalf("different request ID derived %q, want a distinct transport ID", got)
 	}
 	assertWhatsAppWebMessageID(t, want)
+}
+
+func TestErrMediaNotDispatchedAliasesErrSendNotDispatched(t *testing.T) {
+	if ErrMediaNotDispatched != ErrSendNotDispatched {
+		t.Fatal("ErrMediaNotDispatched must preserve identity with ErrSendNotDispatched")
+	}
+	want := errors.New("pre-send failure")
+	err := markSendNotDispatched(want, true)
+	if !errors.Is(err, ErrSendNotDispatched) || !errors.Is(err, ErrMediaNotDispatched) || !errors.Is(err, want) {
+		t.Fatalf("marked error = %v, want send marker, media compatibility alias, and cause", err)
+	}
 }
 
 func TestSendMediaRequestUsesDerivedIDAndReturnsTransportResult(t *testing.T) {
@@ -175,7 +186,7 @@ func TestSendMediaRequestMarksOnlyPreDispatchFailures(t *testing.T) {
 			"",
 			"request-1",
 		)
-		if !errors.Is(err, want) || !errors.Is(err, ErrMediaNotDispatched) {
+		if !errors.Is(err, want) || !errors.Is(err, ErrSendNotDispatched) {
 			t.Fatalf("SendMediaRequest() error = %v, want upload cause and not-dispatched marker", err)
 		}
 		if err.Error() != "upload WhatsApp media: upload unavailable" {
@@ -214,7 +225,7 @@ func TestSendMediaRequestMarksOnlyPreDispatchFailures(t *testing.T) {
 		if !errors.Is(err, want) {
 			t.Fatalf("SendMediaRequest() error = %v, want send cause", err)
 		}
-		if errors.Is(err, ErrMediaNotDispatched) {
+		if errors.Is(err, ErrSendNotDispatched) {
 			t.Fatalf("SendMediaRequest() error = %v, ambiguous send must not claim no dispatch", err)
 		}
 		if err.Error() != "send WhatsApp media: send acknowledgement lost" {

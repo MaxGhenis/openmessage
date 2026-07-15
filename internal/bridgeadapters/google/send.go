@@ -15,6 +15,15 @@ import (
 	"github.com/maxghenis/openmessage/internal/client"
 )
 
+type textSendClient interface {
+	GetConversation(conversationID string) (*gmproto.Conversation, error)
+	SendMessage(payload *gmproto.SendMessageRequest) (*gmproto.SendMessageResponse, error)
+}
+
+var textSendClientFor = func(cli *client.Client) textSendClient {
+	return cli.GM
+}
+
 type mediaSendClient interface {
 	UploadMedia(data []byte, filename, mime string) (*gmproto.MediaContent, error)
 	GetConversation(conversationID string) (*gmproto.Conversation, error)
@@ -23,6 +32,101 @@ type mediaSendClient interface {
 
 var mediaSendClientFor = func(cli *client.Client) mediaSendClient {
 	return cli.GM
+}
+
+// SendText adapts the durable text outbox request to the connected libgm
+// client retained by the lifecycle-owned App generation.
+func (a *Adapter) SendText(
+	ctx context.Context,
+	req bridge.TextRequest,
+) (bridge.SendResult, error) {
+	if a == nil || a.host == nil || !a.host.Connected.Load() {
+		return bridge.SendResult{}, notConnectedTextError()
+	}
+	cli := a.host.GetClient()
+	if cli == nil || cli.GM == nil {
+		return bridge.SendResult{}, notConnectedTextError()
+	}
+	transport := textSendClientFor(cli)
+	if transport == nil {
+		return bridge.SendResult{}, notConnectedTextError()
+	}
+	if ctx == nil {
+		return bridge.SendResult{}, preDispatchTextError(
+			"google_text_context_invalid",
+			errors.New("Google text send context is nil"),
+		)
+	}
+	if err := ctx.Err(); err != nil {
+		return bridge.SendResult{}, preDispatchTextError("google_text_context_done", err)
+	}
+
+	conversation, err := transport.GetConversation(req.Conversation.RemoteID)
+	if err != nil {
+		failure := a.classifyTextTransportError(
+			fmt.Errorf("get Google conversation: %w", err),
+			"google_conversation_get_failed",
+			bridge.DispatchNotCalled,
+		)
+		return bridge.SendResult{}, failure
+	}
+	if conversation == nil {
+		failure := a.classifyTextTransportError(
+			errors.New("get Google conversation: transport returned no conversation"),
+			"google_conversation_get_failed",
+			bridge.DispatchNotCalled,
+		)
+		return bridge.SendResult{}, failure
+	}
+	participantID, sim := app.ExtractSIMAndParticipant(conversation)
+	replyToID := ""
+	if req.ReplyTo != nil {
+		replyToID = req.ReplyTo.RemoteID
+	}
+	payload := app.BuildSendPayloadWithTmpID(
+		req.Conversation.RemoteID,
+		req.Body,
+		replyToID,
+		participantID,
+		sim,
+		req.RequestID,
+	)
+	response, err := transport.SendMessage(payload)
+	if err != nil {
+		failure := a.classifyTextTransportError(
+			fmt.Errorf("send Google text: %w", err),
+			"google_text_send_failed",
+			"",
+		)
+		return bridge.SendResult{}, failure
+	}
+	if response == nil {
+		failure := a.classifyTextTransportError(
+			errors.New("send Google text: transport returned no response"),
+			"google_text_send_failed",
+			"",
+		)
+		return bridge.SendResult{}, failure
+	}
+	if response.GetStatus() != gmproto.SendMessageResponse_SUCCESS {
+		// A rejected status proves the connection is healthy enough to respond;
+		// this must not touch the receive lifecycle.
+		return bridge.SendResult{}, bridge.OpError{
+			Class:       bridge.FailureTransient,
+			Operation:   "send_text",
+			Fingerprint: "google_text_send_rejected",
+			Dispatch:    bridge.DispatchNotCalled,
+			Cause: fmt.Errorf(
+				"Google text send returned %s",
+				response.GetStatus().String(),
+			),
+		}
+	}
+
+	return bridge.SendResult{
+		RemoteMessageID: payload.GetTmpID(),
+		EchoExpected:    true,
+	}, nil
 }
 
 // SendMedia adapts the durable media outbox request to the connected libgm
@@ -207,6 +311,37 @@ func (a *Adapter) SendMedia(
 	}, nil
 }
 
+func notConnectedTextError() bridge.OpError {
+	return bridge.OpError{
+		Class:       bridge.FailureTransient,
+		Operation:   "send_text",
+		Fingerprint: "google_not_connected",
+		Dispatch:    bridge.DispatchNotCalled,
+		Cause:       errors.New("Google Messages is not connected"),
+	}
+}
+
+func preDispatchTextError(fingerprint string, cause error) bridge.OpError {
+	return bridge.OpError{
+		Class:       bridge.FailureTransient,
+		Operation:   "send_text",
+		Fingerprint: fingerprint,
+		Dispatch:    bridge.DispatchNotCalled,
+		Cause:       cause,
+	}
+}
+
+func (a *Adapter) classifyTextTransportError(
+	err error,
+	fingerprint string,
+	dispatch bridge.DispatchCertainty,
+) bridge.OpError {
+	failure := a.classifyTransportError(err, "send_text", fingerprint)
+	failure.Dispatch = dispatch
+	a.reportIfAuthIndicting(failure)
+	return failure
+}
+
 func notConnectedMediaError() bridge.OpError {
 	return bridge.OpError{
 		Class:       bridge.FailureTransient,
@@ -254,4 +389,5 @@ func (a *Adapter) reportIfAuthIndicting(failure bridge.OpError) {
 	}
 }
 
+var _ bridge.TextSender = (*Adapter)(nil)
 var _ bridge.MediaSender = (*Adapter)(nil)
