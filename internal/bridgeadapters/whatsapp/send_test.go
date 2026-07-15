@@ -22,6 +22,17 @@ func TestAdapterImplementsTextSender(t *testing.T) {
 	var _ bridge.TextSender = (*Adapter)(nil)
 }
 
+func TestAdapterImplementsReactionSender(t *testing.T) {
+	var _ bridge.ReactionSender = (*Adapter)(nil)
+}
+
+func TestNewWiresReactionRequestSeam(t *testing.T) {
+	a := New("whatsapp-primary", &whatsapplive.Bridge{})
+	if a.sendReactionRequest == nil {
+		t.Fatal("New() did not wire the retained SendReactionRequest method")
+	}
+}
+
 func TestSendTextRequiresReadyTransportWithoutLifecycleAction(t *testing.T) {
 	var connectCalls, sendCalls int
 	a := &Adapter{
@@ -247,6 +258,238 @@ func TestSendTextFailureDoesNotRetireReceiveGeneration(t *testing.T) {
 			select {
 			case reported := <-r.finish:
 				t.Fatalf("SendText() retired the receive generation with %v", reported)
+			default:
+			}
+		})
+	}
+}
+
+func TestSendReactionRequiresReadyTransportWithoutLifecycleAction(t *testing.T) {
+	var connectCalls, sendCalls int
+	a := &Adapter{
+		accountID: "whatsapp-primary",
+		connect: func(context.Context) error {
+			connectCalls++
+			return nil
+		},
+		mediaReady: func() bool { return false },
+		sendReactionRequest: func(string, string, string, string, string, string) error {
+			sendCalls++
+			return nil
+		},
+	}
+
+	result, err := a.SendReaction(context.Background(), bridge.ReactionRequest{})
+	if result != (bridge.SendResult{}) {
+		t.Fatalf("SendReaction() result = %+v, want zero result", result)
+	}
+	failure, ok := asOpError(err)
+	if !ok {
+		t.Fatalf("SendReaction() error = %T %v, want bridge.OpError", err, err)
+	}
+	if failure.Class != bridge.FailureTransient ||
+		failure.Dispatch != bridge.DispatchNotCalled ||
+		failure.Operation != "send_reaction" ||
+		failure.Fingerprint != "whatsapp_not_connected" ||
+		!errors.Is(failure.Cause, whatsmeow.ErrNotConnected) {
+		t.Fatalf("SendReaction() failure = %+v, want classified not-connected pre-call failure", failure)
+	}
+	if connectCalls != 0 {
+		t.Fatalf("connect calls = %d, want zero", connectCalls)
+	}
+	if sendCalls != 0 {
+		t.Fatalf("transport send calls = %d, want zero", sendCalls)
+	}
+}
+
+func TestSendReactionContextGuardsRunBeforeTransport(t *testing.T) {
+	tests := []struct {
+		name            string
+		ctx             context.Context
+		wantFingerprint string
+		wantCause       error
+	}{
+		{
+			name:            "nil context",
+			ctx:             nil,
+			wantFingerprint: "whatsapp_reaction_context_missing",
+		},
+		{
+			name:            "done context",
+			ctx:             canceledTextSendContext(),
+			wantFingerprint: "whatsapp_reaction_context_done",
+			wantCause:       context.Canceled,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var sendCalls int
+			a := &Adapter{
+				mediaReady: func() bool { return true },
+				sendReactionRequest: func(string, string, string, string, string, string) error {
+					sendCalls++
+					return nil
+				},
+			}
+
+			_, err := a.SendReaction(test.ctx, bridge.ReactionRequest{})
+			failure, ok := asOpError(err)
+			if !ok || failure.Class != bridge.FailureTransient ||
+				failure.Dispatch != bridge.DispatchNotCalled ||
+				failure.Operation != "send_reaction" ||
+				failure.Fingerprint != test.wantFingerprint {
+				t.Fatalf("SendReaction() error = %v, want context pre-call failure %q", err, test.wantFingerprint)
+			}
+			if test.wantCause != nil && !errors.Is(failure.Cause, test.wantCause) {
+				t.Fatalf("SendReaction() cause = %v, want %v", failure.Cause, test.wantCause)
+			}
+			if sendCalls != 0 {
+				t.Fatalf("transport send calls = %d, want zero", sendCalls)
+			}
+		})
+	}
+}
+
+func TestSendReactionSuccessAndActionMapping(t *testing.T) {
+	tests := []struct {
+		name       string
+		action     bridge.ReactionAction
+		wantAction string
+		authorID   string
+	}{
+		{name: "add", action: bridge.ReactionAdd, wantAction: "add", authorID: "+15557654321"},
+		{name: "remove", action: bridge.ReactionRemove, wantAction: "remove", authorID: "+15557654321"},
+		{name: "switch", action: bridge.ReactionSwitch, wantAction: "switch", authorID: "+15557654321"},
+		{name: "empty author remains self target", action: bridge.ReactionAdd, wantAction: "add"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var gotConversationID, gotTargetRemoteID, gotTargetAuthorID, gotEmoji, gotAction, gotRequestID string
+			a := &Adapter{
+				accountID:  "whatsapp-primary",
+				mediaReady: func() bool { return true },
+				sendReactionRequest: func(conversationID, targetRemoteID, targetAuthorID, emoji, action, requestID string) error {
+					gotConversationID = conversationID
+					gotTargetRemoteID = targetRemoteID
+					gotTargetAuthorID = targetAuthorID
+					gotEmoji = emoji
+					gotAction = action
+					gotRequestID = requestID
+					return nil
+				},
+			}
+
+			result, err := a.SendReaction(context.Background(), bridge.ReactionRequest{
+				AccountID: "whatsapp-primary",
+				Conversation: bridge.ConversationRef{
+					RemoteID: "whatsapp:120363019999999999@g.us",
+				},
+				Target: bridge.MessageRef{
+					RemoteID: "target-remote-id",
+					AuthorID: test.authorID,
+				},
+				Emoji:     "🔥",
+				Action:    test.action,
+				RequestID: "outbox-reaction-123",
+			})
+			if err != nil {
+				t.Fatalf("SendReaction() error = %v", err)
+			}
+			if result != (bridge.SendResult{}) {
+				t.Fatalf("SendReaction() result = %+v, want empty result for ConfirmWithoutResult", result)
+			}
+			if gotConversationID != "whatsapp:120363019999999999@g.us" ||
+				gotTargetRemoteID != "target-remote-id" ||
+				gotTargetAuthorID != test.authorID ||
+				gotEmoji != "🔥" ||
+				gotAction != test.wantAction ||
+				gotRequestID != "outbox-reaction-123" {
+				t.Fatalf("SendReactionRequest args = conversation=%q target=%q author=%q emoji=%q action=%q request=%q",
+					gotConversationID, gotTargetRemoteID, gotTargetAuthorID, gotEmoji, gotAction, gotRequestID)
+			}
+		})
+	}
+}
+
+func TestSendReactionTransportErrorClassification(t *testing.T) {
+	tests := []struct {
+		name         string
+		err          error
+		wantDispatch bridge.DispatchCertainty
+	}{
+		{
+			name:         "pre-send failure is safe to retry",
+			err:          fmt.Errorf("%w: %w", whatsapplive.ErrSendNotDispatched, whatsmeow.ErrNotConnected),
+			wantDispatch: bridge.DispatchNotCalled,
+		},
+		{
+			name:         "send-boundary failure stays uncertain",
+			err:          fmt.Errorf("send WhatsApp reaction: %w", whatsmeow.ErrNotConnected),
+			wantDispatch: "",
+		},
+		{
+			name:         "ambiguous acknowledgement failure stays uncertain",
+			err:          errors.New("reaction acknowledgement lost"),
+			wantDispatch: "",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			a := &Adapter{
+				mediaReady: func() bool { return true },
+				sendReactionRequest: func(string, string, string, string, string, string) error {
+					return test.err
+				},
+			}
+
+			_, err := a.SendReaction(context.Background(), bridge.ReactionRequest{})
+			failure, ok := asOpError(err)
+			if !ok || failure.Class != bridge.FailureTransient ||
+				failure.Dispatch != test.wantDispatch ||
+				failure.Operation != "send_reaction" ||
+				failure.Fingerprint != "whatsapp_reaction_failed" ||
+				!errors.Is(failure.Cause, test.err) {
+				t.Fatalf("SendReaction() error = %v, want dispatch=%q reaction failure", err, test.wantDispatch)
+			}
+		})
+	}
+}
+
+// The retained transport core owns its guarded reconnect report. The adapter
+// shim must not independently retire the active receive generation for either
+// a known disconnect or an otherwise ambiguous reaction failure.
+func TestSendReactionFailureDoesNotRetireReceiveGeneration(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		err  error
+	}{
+		{"ambiguous send failure", errors.New("ambiguous reaction send failure")},
+		{"not connected", fmt.Errorf("send WhatsApp reaction: %w", whatsmeow.ErrNotConnected)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ready := make(chan struct{})
+			close(ready)
+			r := &run{
+				ready:     ready,
+				finish:    make(chan error, 1),
+				admitting: true,
+			}
+			a := &Adapter{
+				current:    r,
+				mediaReady: func() bool { return true },
+				sendReactionRequest: func(string, string, string, string, string, string) error {
+					return test.err
+				},
+			}
+
+			_, err := a.SendReaction(context.Background(), bridge.ReactionRequest{})
+			returnedFailure, ok := asOpError(err)
+			if !ok || !errors.Is(returnedFailure.Cause, test.err) {
+				t.Fatalf("SendReaction() error = %v, want classified transport failure", err)
+			}
+			select {
+			case reported := <-r.finish:
+				t.Fatalf("SendReaction() retired the receive generation with %v", reported)
 			default:
 			}
 		})

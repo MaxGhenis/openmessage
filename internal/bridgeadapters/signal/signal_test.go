@@ -24,6 +24,10 @@ func TestAdapterImplementsTextSender(t *testing.T) {
 	var _ bridge.TextSender = (*Adapter)(nil)
 }
 
+func TestAdapterImplementsReactionSender(t *testing.T) {
+	var _ bridge.ReactionSender = (*Adapter)(nil)
+}
+
 func TestSendTextRequiresReadyRetainedBridge(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -294,6 +298,281 @@ func TestSendTextRoutesLocalAccountFailureThroughGuardedLifecycleReporting(t *te
 	assertOpError(t, terminal, bridge.FailureTransient, "signal_send_account_check")
 	if got := poller.appliedCount(); got != 1 {
 		t.Fatalf("local-account text failure status projections = %d, want one transient projection", got)
+	}
+}
+
+func TestSendReactionRequiresReadyRetainedBridge(t *testing.T) {
+	tests := []struct {
+		name   string
+		poller poller
+	}{
+		{name: "nil retained bridge"},
+		{name: "not connected", poller: newFakePoller()},
+		{
+			name: "connected without account",
+			poller: &fakePoller{
+				started: make(chan *fakePollerRun, 1),
+				status:  signallive.StatusSnapshot{Connected: true},
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			adapter := &Adapter{accountID: "signal-primary", poller: tc.poller}
+			result, err := adapter.SendReaction(context.Background(), bridge.ReactionRequest{
+				AccountID:    "signal-primary",
+				Conversation: bridge.ConversationRef{RemoteID: "signal:+15551234567"},
+				Target:       bridge.MessageRef{RemoteID: "1700000000123"},
+				Emoji:        "👍",
+				Action:       bridge.ReactionAdd,
+			})
+			if result != (bridge.SendResult{}) {
+				t.Fatalf("SendReaction() result = %+v, want zero", result)
+			}
+			var operationError bridge.OpError
+			if !errors.As(err, &operationError) {
+				t.Fatalf("SendReaction() error = %v (%T), want bridge.OpError", err, err)
+			}
+			if operationError.Class != bridge.FailureTransient ||
+				operationError.Dispatch != bridge.DispatchNotCalled ||
+				operationError.Operation != "send_reaction" ||
+				operationError.Fingerprint != "signal_not_connected" {
+				t.Fatalf("SendReaction() OpError = %+v, want classified not-connected pre-call failure", operationError)
+			}
+			if fake, ok := tc.poller.(*fakePoller); ok && fake.reactionCallCount() != 0 {
+				t.Fatalf("SendReactionRequest calls = %d, want 0 while not ready", fake.reactionCallCount())
+			}
+		})
+	}
+}
+
+func TestSendReactionRejectsInvalidContextBeforeTransport(t *testing.T) {
+	tests := []struct {
+		name            string
+		context         func() context.Context
+		wantFingerprint string
+	}{
+		{
+			name:            "nil context",
+			context:         func() context.Context { return nil },
+			wantFingerprint: "signal_send_reaction_context_missing",
+		},
+		{
+			name: "done context",
+			context: func() context.Context {
+				ctx, cancel := context.WithCancel(context.Background())
+				cancel()
+				return ctx
+			},
+			wantFingerprint: "signal_send_reaction_context_done",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			poller := newFakePoller()
+			poller.status = signallive.StatusSnapshot{Connected: true, Account: "+15551230000"}
+			adapter := &Adapter{accountID: "signal-primary", poller: poller}
+
+			_, err := adapter.SendReaction(tc.context(), bridge.ReactionRequest{})
+			var operationError bridge.OpError
+			if !errors.As(err, &operationError) ||
+				operationError.Class != bridge.FailureTransient ||
+				operationError.Dispatch != bridge.DispatchNotCalled ||
+				operationError.Operation != "send_reaction" ||
+				operationError.Fingerprint != tc.wantFingerprint {
+				t.Fatalf("SendReaction() error = %v, want pre-call context failure %q", err, tc.wantFingerprint)
+			}
+			if got := poller.reactionCallCount(); got != 0 {
+				t.Fatalf("SendReactionRequest calls = %d, want 0 after context failure", got)
+			}
+		})
+	}
+}
+
+func TestSendReactionMapsAllActionsAndReturnsEmptyResult(t *testing.T) {
+	for _, action := range []bridge.ReactionAction{
+		bridge.ReactionAdd,
+		bridge.ReactionRemove,
+		bridge.ReactionSwitch,
+	} {
+		t.Run(string(action), func(t *testing.T) {
+			poller := newFakePoller()
+			poller.status = signallive.StatusSnapshot{
+				Connected: true,
+				Paired:    true,
+				Account:   "+15551230000",
+			}
+			adapter := &Adapter{accountID: "signal-primary", poller: poller}
+
+			result, err := adapter.SendReaction(context.Background(), bridge.ReactionRequest{
+				AccountID:    "signal-primary",
+				Conversation: bridge.ConversationRef{RemoteID: "signal-group:test-group"},
+				Target: bridge.MessageRef{
+					RemoteID: "1700000000123",
+					AuthorID: "+15551234567",
+				},
+				Emoji:     "👍",
+				Action:    action,
+				RequestID: "local-dedupe-only",
+			})
+			if err != nil {
+				t.Fatalf("SendReaction() error = %v", err)
+			}
+			if result != (bridge.SendResult{}) {
+				t.Fatalf("SendReaction() result = %+v, want empty ConfirmWithoutResult mapping", result)
+			}
+			request := poller.lastReactionRequest()
+			if request.conversationID != "signal-group:test-group" ||
+				request.targetRemoteID != "1700000000123" ||
+				request.targetAuthorID != "+15551234567" ||
+				request.emoji != "👍" ||
+				request.action != string(action) {
+				t.Fatalf("retained SendReactionRequest = %+v, want mapped ReactionRequest", request)
+			}
+		})
+	}
+}
+
+func TestSendReactionClassifiesPreCallAndCommandFailures(t *testing.T) {
+	tests := []struct {
+		name         string
+		err          error
+		wantDispatch bridge.DispatchCertainty
+	}{
+		{
+			name:         "local validation",
+			err:          errors.New("signal target message is required"),
+			wantDispatch: bridge.DispatchNotCalled,
+		},
+		{
+			name: "signal-cli command",
+			err:  signallive.NewCommandError("send Signal reaction: transport failed"),
+		},
+		{
+			name: "proven not dispatched",
+			err: &fakeSignalSendNotDispatchedError{err: signallive.NewCommandError(
+				"send Signal reaction: not dispatched",
+			)},
+			wantDispatch: bridge.DispatchNotCalled,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			poller := newFakePoller()
+			poller.status = signallive.StatusSnapshot{
+				Connected: true,
+				Paired:    true,
+				Account:   "+15551230000",
+			}
+			poller.reactionErr = tc.err
+			adapter := &Adapter{accountID: "signal-primary", poller: poller}
+
+			_, err := adapter.SendReaction(context.Background(), bridge.ReactionRequest{})
+			var operationError bridge.OpError
+			if !errors.As(err, &operationError) {
+				t.Fatalf("SendReaction() error = %v (%T), want bridge.OpError", err, err)
+			}
+			if operationError.Class != bridge.FailureTransient ||
+				operationError.Dispatch != tc.wantDispatch ||
+				operationError.Operation != "send_reaction" ||
+				operationError.Fingerprint != "signal_reaction_failed" ||
+				!errors.Is(operationError.Cause, tc.err) {
+				t.Fatalf("SendReaction() OpError = %+v, want transient classified failure with dispatch %q", operationError, tc.wantDispatch)
+			}
+			if got := poller.appliedCount(); got != 0 {
+				t.Fatalf("recipient/local reaction failure applied %d lifecycle transitions, want 0", got)
+			}
+		})
+	}
+}
+
+func TestSendReactionDoesNotWidenGuardedLifecycleReporting(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+	}{
+		{
+			name: "unregistered recipient",
+			err:  signallive.NewCommandError("send Signal reaction: user +15551234567 is not registered"),
+		},
+		{
+			name: "untrusted identity",
+			err:  signallive.NewCommandError("send Signal reaction: Untrusted identity key for +15551234567"),
+		},
+		{
+			name: "network blip",
+			err:  signallive.NewCommandError("send Signal reaction: Connection reset by peer"),
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			poller := newFakePoller()
+			poller.status = signallive.StatusSnapshot{
+				Connected: true,
+				Paired:    true,
+				Account:   "+15551230000",
+			}
+			poller.reactionErr = tc.err
+			adapter := &Adapter{accountID: "signal-primary", poller: poller}
+			run, err := adapter.Start(context.Background(), bridge.StartRequest{
+				AccountID:  "signal-primary",
+				Generation: 1,
+			}, nil)
+			if err != nil {
+				t.Fatalf("Start() error = %v", err)
+			}
+			receiveValue(t, poller.started, "retained poller start")
+			t.Cleanup(func() { stopAdapterRun(t, run) })
+
+			if _, err := adapter.SendReaction(context.Background(), bridge.ReactionRequest{}); err == nil {
+				t.Fatal("SendReaction() error = nil, want scripted command failure")
+			}
+			current := adapter.currentRun()
+			if current == nil || !current.admitCallback() {
+				t.Fatal("non-account reaction failure closed callback admission on the receive generation")
+			}
+			current.callbacks.Done()
+			select {
+			case terminal := <-run.Done():
+				t.Fatalf("non-account reaction failure terminated receive generation: %v", terminal)
+			default:
+			}
+			if got := poller.appliedCount(); got != 0 {
+				t.Fatalf("non-account reaction failure applied %d lifecycle transitions, want 0", got)
+			}
+		})
+	}
+}
+
+func TestSendReactionRoutesLocalAccountFailureThroughGuardedLifecycleReporting(t *testing.T) {
+	poller := newFakePoller()
+	poller.status = signallive.StatusSnapshot{
+		Connected: true,
+		Paired:    true,
+		Account:   "+15551230000",
+	}
+	poller.reactionErr = signallive.NewCommandError("send Signal reaction: authorization failed")
+	adapter := &Adapter{accountID: "signal-primary", poller: poller}
+	run, err := adapter.Start(context.Background(), bridge.StartRequest{
+		AccountID:  "signal-primary",
+		Generation: 1,
+	}, nil)
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	receiveValue(t, poller.started, "retained poller start")
+
+	if _, err := adapter.SendReaction(context.Background(), bridge.ReactionRequest{}); err == nil {
+		t.Fatal("SendReaction() error = nil, want local-account command failure")
+	}
+	terminal := receiveValue(t, run.Done(), "guarded reaction-send terminal")
+	assertOpError(t, terminal, bridge.FailureTransient, "signal_send_account_check")
+	if got := poller.appliedCount(); got != 1 {
+		t.Fatalf("local-account reaction failure status projections = %d, want one transient projection", got)
 	}
 }
 
@@ -996,6 +1275,8 @@ type fakePoller struct {
 	textCalls      []fakeTextRequest
 	textTimestamp  int64
 	textErr        error
+	reactionCalls  []fakeReactionRequest
+	reactionErr    error
 	mediaCalls     []fakeMediaRequest
 	mediaTimestamp int64
 	mediaErr       error
@@ -1005,6 +1286,14 @@ type fakeTextRequest struct {
 	conversationID string
 	body           string
 	replyToID      string
+}
+
+type fakeReactionRequest struct {
+	conversationID string
+	targetRemoteID string
+	targetAuthorID string
+	emoji          string
+	action         string
 }
 
 type fakeMediaRequest struct {
@@ -1094,6 +1383,37 @@ func (p *fakePoller) lastTextRequest() fakeTextRequest {
 		return fakeTextRequest{}
 	}
 	return p.textCalls[len(p.textCalls)-1]
+}
+
+func (p *fakePoller) SendReactionRequest(
+	conversationID, targetRemoteID, targetAuthorID, emoji, action string,
+) error {
+	p.mu.Lock()
+	p.reactionCalls = append(p.reactionCalls, fakeReactionRequest{
+		conversationID: conversationID,
+		targetRemoteID: targetRemoteID,
+		targetAuthorID: targetAuthorID,
+		emoji:          emoji,
+		action:         action,
+	})
+	err := p.reactionErr
+	p.mu.Unlock()
+	return err
+}
+
+func (p *fakePoller) reactionCallCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.reactionCalls)
+}
+
+func (p *fakePoller) lastReactionRequest() fakeReactionRequest {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.reactionCalls) == 0 {
+		return fakeReactionRequest{}
+	}
+	return p.reactionCalls[len(p.reactionCalls)-1]
 }
 
 func (p *fakePoller) SendMediaRequest(

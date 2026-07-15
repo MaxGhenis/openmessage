@@ -361,6 +361,355 @@ func TestSendTextAuthExpiryStillReportsToLifecycle(t *testing.T) {
 	}
 }
 
+func TestSendReactionNotConnectedIsClassifiedPreCall(t *testing.T) {
+	host := newTestApp(t)
+	legacy := newLegacyClient(t)
+	generation := host.BeginGoogleGeneration(legacy)
+	t.Cleanup(generation.Release)
+	fake := &fakeReactionSendClient{}
+	installReactionSendClient(t, legacy, fake)
+	a := New("google-primary", host, func() bool { return true })
+	a.newClient = func() (*client.Client, transportClient, error) {
+		t.Fatal("SendReaction must not construct a Google transport")
+		return nil, nil, nil
+	}
+
+	result, err := a.SendReaction(context.Background(), bridge.ReactionRequest{
+		AccountID: "google-primary",
+		Conversation: bridge.ConversationRef{
+			RemoteID: "conversation-id",
+		},
+		Target: bridge.MessageRef{RemoteID: "target-id"},
+		Emoji:  "👍",
+		Action: bridge.ReactionAdd,
+	})
+	if result != (bridge.SendResult{}) {
+		t.Fatalf("result = %+v, want zero value", result)
+	}
+	failure := requireReactionOpError(t, err)
+	if failure.Class != bridge.FailureTransient ||
+		failure.Dispatch != bridge.DispatchNotCalled ||
+		failure.Operation != "send_reaction" ||
+		failure.Fingerprint != "google_not_connected" {
+		t.Fatalf("failure = %+v, want transient pre-call google_not_connected", failure)
+	}
+	if fake.conversationCalls != 0 || fake.sendCalls != 0 {
+		t.Fatalf("transport calls = (conversation %d, send %d), want (0, 0)",
+			fake.conversationCalls, fake.sendCalls)
+	}
+}
+
+func TestSendReactionContextGuardsAreClassifiedPreCall(t *testing.T) {
+	tests := []struct {
+		name        string
+		ctx         context.Context
+		fingerprint string
+	}{
+		{
+			name:        "nil",
+			ctx:         nil,
+			fingerprint: "google_reaction_context_invalid",
+		},
+		{
+			name: "done",
+			ctx: func() context.Context {
+				ctx, cancel := context.WithCancel(context.Background())
+				cancel()
+				return ctx
+			}(),
+			fingerprint: "google_reaction_context_done",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fake := &fakeReactionSendClient{}
+			a := newReactionSendTestAdapter(t, fake)
+
+			_, err := a.SendReaction(test.ctx, bridge.ReactionRequest{})
+			failure := requireReactionOpError(t, err)
+			if failure.Class != bridge.FailureTransient ||
+				failure.Dispatch != bridge.DispatchNotCalled ||
+				failure.Operation != "send_reaction" ||
+				failure.Fingerprint != test.fingerprint {
+				t.Fatalf("failure = %+v, want transient pre-call %s", failure, test.fingerprint)
+			}
+			if fake.conversationCalls != 0 || fake.sendCalls != 0 {
+				t.Fatalf("transport calls = (conversation %d, send %d), want (0, 0)",
+					fake.conversationCalls, fake.sendCalls)
+			}
+		})
+	}
+}
+
+func TestSendReactionSuccessMapsNativeActionsAndReturnsEmptyResult(t *testing.T) {
+	tests := []struct {
+		name       string
+		action     bridge.ReactionAction
+		wantAction gmproto.SendReactionRequest_Action
+	}{
+		{name: "add", action: bridge.ReactionAdd, wantAction: gmproto.SendReactionRequest_ADD},
+		{name: "remove", action: bridge.ReactionRemove, wantAction: gmproto.SendReactionRequest_REMOVE},
+		{name: "switch", action: bridge.ReactionSwitch, wantAction: gmproto.SendReactionRequest_SWITCH},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			sim := &gmproto.SIMPayload{Two: 7, SIMNumber: 2}
+			fake := &fakeReactionSendClient{
+				conversationResult: &gmproto.Conversation{
+					ConversationID: "remote-conversation",
+					Participants: []*gmproto.Participant{{
+						ID:         &gmproto.SmallInfo{Number: "+15551234567"},
+						IsMe:       true,
+						SimPayload: sim,
+					}},
+				},
+				sendResult: &gmproto.SendReactionResponse{Success: true},
+			}
+			a := newReactionSendTestAdapter(t, fake)
+
+			result, err := a.SendReaction(context.Background(), bridge.ReactionRequest{
+				AccountID: "google-primary",
+				Conversation: bridge.ConversationRef{
+					RemoteID: "remote-conversation",
+				},
+				// Empty AuthorID is the cross-platform self-target representation.
+				// Google routes reactions by remote message ID and SIM, so it must
+				// neither reject nor invent an author identifier for this case.
+				Target: bridge.MessageRef{RemoteID: "target-message-id", AuthorID: ""},
+				Emoji:  "🫡",
+				Action: test.action,
+			})
+			if err != nil {
+				t.Fatalf("SendReaction() error = %v", err)
+			}
+			if result != (bridge.SendResult{}) {
+				t.Fatalf("result = %+v, want empty result for ConfirmWithoutResult", result)
+			}
+			if fake.conversationCalls != 1 || fake.conversationID != "remote-conversation" {
+				t.Fatalf("GetConversation = (%d calls, %q), want (1, remote-conversation)",
+					fake.conversationCalls, fake.conversationID)
+			}
+			if fake.sendCalls != 1 || fake.sent == nil {
+				t.Fatalf("SendReaction = (%d calls, payload %p), want one non-nil payload",
+					fake.sendCalls, fake.sent)
+			}
+			if fake.sent.GetMessageID() != "target-message-id" ||
+				fake.sent.GetReactionData().GetUnicode() != "🫡" ||
+				fake.sent.GetAction() != test.wantAction ||
+				fake.sent.GetSIMPayload() != sim {
+				t.Fatalf("payload = %+v, want target/emoji/action %s/original SIM", fake.sent, test.wantAction)
+			}
+		})
+	}
+}
+
+func TestSendReactionConversationFailuresAreClassifiedNotCalled(t *testing.T) {
+	tests := []struct {
+		name string
+		fake *fakeReactionSendClient
+	}{
+		{
+			name: "transport error",
+			fake: &fakeReactionSendClient{
+				conversationErr: errors.New("conversation unavailable"),
+			},
+		},
+		{
+			name: "nil conversation",
+			fake: &fakeReactionSendClient{},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			a := newReactionSendTestAdapter(t, test.fake)
+			_, err := a.SendReaction(context.Background(), bridge.ReactionRequest{
+				Conversation: bridge.ConversationRef{RemoteID: "conversation-id"},
+				Target:       bridge.MessageRef{RemoteID: "target-id"},
+				Emoji:        "👍",
+				Action:       bridge.ReactionAdd,
+			})
+			failure := requireReactionOpError(t, err)
+			if failure.Class != bridge.FailureTransient || failure.Dispatch != bridge.DispatchNotCalled ||
+				failure.Operation != "send_reaction" || failure.Fingerprint != "google_conversation_get_failed" {
+				t.Fatalf("failure = %+v, want transient pre-call google_conversation_get_failed", failure)
+			}
+			if test.fake.sendCalls != 0 {
+				t.Fatalf("SendReaction calls = %d, want 0", test.fake.sendCalls)
+			}
+		})
+	}
+}
+
+func TestSendReactionSendFailureIsClassifiedUncertain(t *testing.T) {
+	fake := &fakeReactionSendClient{
+		conversationResult: &gmproto.Conversation{},
+		sendErr:            errors.New("transport timeout"),
+	}
+	a := newReactionSendTestAdapter(t, fake)
+
+	_, err := a.SendReaction(context.Background(), bridge.ReactionRequest{
+		Conversation: bridge.ConversationRef{RemoteID: "conversation-id"},
+		Target:       bridge.MessageRef{RemoteID: "target-id"},
+		Emoji:        "👍",
+		Action:       bridge.ReactionAdd,
+	})
+	failure := requireReactionOpError(t, err)
+	if failure.Class != bridge.FailureTransient || failure.Dispatch != "" ||
+		failure.Operation != "send_reaction" || failure.Fingerprint != "google_reaction_send_failed" {
+		t.Fatalf("failure = %+v, want ambiguous transient google_reaction_send_failed", failure)
+	}
+	if fake.sendCalls != 1 {
+		t.Fatalf("SendReaction calls = %d, want 1", fake.sendCalls)
+	}
+}
+
+func TestSendReactionRejectedIsClassifiedNotCalled(t *testing.T) {
+	tests := []struct {
+		name     string
+		response *gmproto.SendReactionResponse
+	}{
+		{name: "success false", response: &gmproto.SendReactionResponse{}},
+		{name: "nil response", response: nil},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fake := &fakeReactionSendClient{
+				conversationResult: &gmproto.Conversation{},
+				sendResult:         test.response,
+			}
+			a := newReactionSendTestAdapter(t, fake)
+
+			_, err := a.SendReaction(context.Background(), bridge.ReactionRequest{
+				Conversation: bridge.ConversationRef{RemoteID: "conversation-id"},
+				Target:       bridge.MessageRef{RemoteID: "target-id"},
+				Emoji:        "👍",
+				Action:       bridge.ReactionAdd,
+			})
+			failure := requireReactionOpError(t, err)
+			if failure.Class != bridge.FailureTransient || failure.Dispatch != bridge.DispatchNotCalled ||
+				failure.Operation != "send_reaction" || failure.Fingerprint != "google_reaction_rejected" {
+				t.Fatalf("failure = %+v, want transient pre-call google_reaction_rejected", failure)
+			}
+		})
+	}
+}
+
+func TestSendReactionTransientAndRejectedFailuresDoNotRetireGeneration(t *testing.T) {
+	tests := []struct {
+		name        string
+		fake        *fakeReactionSendClient
+		dispatch    bridge.DispatchCertainty
+		fingerprint string
+	}{
+		{
+			name: "ambiguous transport error",
+			fake: &fakeReactionSendClient{
+				conversationResult: &gmproto.Conversation{},
+				sendErr:            errors.New("transport timeout"),
+			},
+			dispatch:    "",
+			fingerprint: "google_reaction_send_failed",
+		},
+		{
+			name: "rejected response",
+			fake: &fakeReactionSendClient{
+				conversationResult: &gmproto.Conversation{},
+				sendResult:         &gmproto.SendReactionResponse{},
+			},
+			dispatch:    bridge.DispatchNotCalled,
+			fingerprint: "google_reaction_rejected",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			host := newTestApp(t)
+			transport := &fakeTransport{}
+			a := newTestAdapter(t, host, transport)
+			run, err := a.Start(context.Background(), bridge.StartRequest{
+				AccountID:  "google-primary",
+				Generation: 1,
+			}, nil)
+			if err != nil {
+				t.Fatalf("Start() error = %v", err)
+			}
+			t.Cleanup(func() { stopRun(t, run) })
+			transport.emit(&gmproto.Conversation{ConversationID: "ready"})
+			<-run.Ready()
+
+			installReactionSendClient(t, host.GetClient(), test.fake)
+			_, err = a.SendReaction(context.Background(), bridge.ReactionRequest{
+				Conversation: bridge.ConversationRef{RemoteID: "conversation-id"},
+				Target:       bridge.MessageRef{RemoteID: "target-id"},
+				Emoji:        "👍",
+				Action:       bridge.ReactionAdd,
+			})
+			failure := requireReactionOpError(t, err)
+			if failure.Class != bridge.FailureTransient || failure.Dispatch != test.dispatch ||
+				failure.Operation != "send_reaction" || failure.Fingerprint != test.fingerprint {
+				t.Fatalf("failure = %+v, want transient %q dispatch %q", failure, test.fingerprint, test.dispatch)
+			}
+			if !host.Connected.Load() {
+				t.Fatal("reaction failure marked the connected receive generation lost")
+			}
+			select {
+			case terminal := <-run.Done():
+				t.Fatalf("reaction failure retired the receive generation with %v", terminal)
+			default:
+			}
+			if host.GoogleStatus().NeedsRepair {
+				t.Fatal("reaction failure parked the Google lifecycle")
+			}
+		})
+	}
+}
+
+func TestSendReactionAuthExpiryStillReportsToLifecycle(t *testing.T) {
+	host := newTestApp(t)
+	transport := &fakeTransport{}
+	a := newTestAdapter(t, host, transport)
+	run, err := a.Start(context.Background(), bridge.StartRequest{
+		AccountID:  "google-primary",
+		Generation: 1,
+	}, nil)
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	transport.emit(&gmproto.Conversation{ConversationID: "ready"})
+	<-run.Ready()
+
+	fake := &fakeReactionSendClient{
+		conversationResult: &gmproto.Conversation{},
+		sendErr:            errors.New("google returned http 401 for reaction send"),
+	}
+	installReactionSendClient(t, host.GetClient(), fake)
+
+	_, err = a.SendReaction(context.Background(), bridge.ReactionRequest{
+		Conversation: bridge.ConversationRef{RemoteID: "conversation-id"},
+		Target:       bridge.MessageRef{RemoteID: "target-id"},
+		Emoji:        "👍",
+		Action:       bridge.ReactionAdd,
+	})
+	failure := requireReactionOpError(t, err)
+	if failure.Fingerprint != "google_auth_expired" || failure.Dispatch != "" {
+		t.Fatalf("failure = %+v, want ambiguous google_auth_expired classification", failure)
+	}
+	select {
+	case terminal := <-run.Done():
+		terminalFailure, ok := asOpError(terminal)
+		if !ok || (terminalFailure.Class != bridge.FailureCredentialsExpired &&
+			terminalFailure.Class != bridge.FailureUpgradeRequired) {
+			t.Fatalf("terminal = %v, want credentials_expired/upgrade_required", terminal)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("auth-expired reaction failure did not reach the lifecycle owner")
+	}
+}
+
 func TestSendMediaNotConnectedIsClassifiedPreCall(t *testing.T) {
 	host := newTestApp(t)
 	a := New("google-primary", host, func() bool { return true })
@@ -912,6 +1261,65 @@ func (f *fakeTextSendClient) GetConversation(conversationID string) (*gmproto.Co
 }
 
 func (f *fakeTextSendClient) SendMessage(payload *gmproto.SendMessageRequest) (*gmproto.SendMessageResponse, error) {
+	f.sendCalls++
+	f.sent = payload
+	return f.sendResult, f.sendErr
+}
+
+func newReactionSendTestAdapter(t *testing.T, fake *fakeReactionSendClient) *Adapter {
+	t.Helper()
+	host := newTestApp(t)
+	legacy := newLegacyClient(t)
+	generation := host.BeginGoogleGeneration(legacy)
+	t.Cleanup(generation.Release)
+	host.Connected.Store(true)
+	installReactionSendClient(t, legacy, fake)
+	return New("google-primary", host, func() bool { return true })
+}
+
+func installReactionSendClient(t *testing.T, want *client.Client, fake reactionSendClient) {
+	t.Helper()
+	previous := reactionSendClientFor
+	reactionSendClientFor = func(got *client.Client) reactionSendClient {
+		if got != want {
+			t.Fatalf("reaction client source = %p, want App.GetClient() %p", got, want)
+		}
+		return fake
+	}
+	t.Cleanup(func() { reactionSendClientFor = previous })
+}
+
+func requireReactionOpError(t *testing.T, err error) bridge.OpError {
+	t.Helper()
+	if err == nil {
+		t.Fatal("SendReaction() error = nil, want classified failure")
+	}
+	failure, ok := asOpError(err)
+	if !ok {
+		t.Fatalf("SendReaction() error = %T %v, want bridge.OpError", err, err)
+	}
+	return failure
+}
+
+type fakeReactionSendClient struct {
+	conversationResult *gmproto.Conversation
+	conversationErr    error
+	sendResult         *gmproto.SendReactionResponse
+	sendErr            error
+
+	conversationCalls int
+	conversationID    string
+	sendCalls         int
+	sent              *gmproto.SendReactionRequest
+}
+
+func (f *fakeReactionSendClient) GetConversation(conversationID string) (*gmproto.Conversation, error) {
+	f.conversationCalls++
+	f.conversationID = conversationID
+	return f.conversationResult, f.conversationErr
+}
+
+func (f *fakeReactionSendClient) SendReaction(payload *gmproto.SendReactionRequest) (*gmproto.SendReactionResponse, error) {
 	f.sendCalls++
 	f.sent = payload
 	return f.sendResult, f.sendErr

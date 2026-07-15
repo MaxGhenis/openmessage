@@ -20,6 +20,7 @@ import (
 type poller interface {
 	StartPoller(context.Context) (signallive.PollerRun, error)
 	SendTextRequest(string, string, string) (int64, error)
+	SendReactionRequest(string, string, string, string, string) error
 	SendMediaRequest(string, io.Reader, int64, string, string, string, string) (int64, error)
 	Status() signallive.StatusSnapshot
 	ApplyPollerFailure(signallive.PollerExit)
@@ -121,6 +122,62 @@ func (a *Adapter) SendText(
 		RemoteMessageID: strconv.FormatInt(timestampMS, 10),
 		EchoExpected:    false,
 	}, nil
+}
+
+// SendReaction adapts a durable reaction request to Signal's store-free
+// signal-cli path. Reactions intentionally confirm without a remote result ID.
+func (a *Adapter) SendReaction(
+	ctx context.Context,
+	req bridge.ReactionRequest,
+) (bridge.SendResult, error) {
+	if ctx == nil {
+		return bridge.SendResult{}, bridge.OpError{
+			Class:       bridge.FailureTransient,
+			Operation:   "send_reaction",
+			Fingerprint: "signal_send_reaction_context_missing",
+			Dispatch:    bridge.DispatchNotCalled,
+			Cause:       errors.New("Signal reaction send context is nil"),
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return bridge.SendResult{}, bridge.OpError{
+			Class:       bridge.FailureTransient,
+			Operation:   "send_reaction",
+			Fingerprint: "signal_send_reaction_context_done",
+			Dispatch:    bridge.DispatchNotCalled,
+			Cause:       err,
+		}
+	}
+	if a == nil || a.poller == nil {
+		return bridge.SendResult{}, signalNotConnectedError("send_reaction")
+	}
+	status := a.poller.Status()
+	if !status.Connected || strings.TrimSpace(status.Account) == "" {
+		return bridge.SendResult{}, signalNotConnectedError("send_reaction")
+	}
+
+	err := a.poller.SendReactionRequest(
+		req.Conversation.RemoteID,
+		req.Target.RemoteID,
+		req.Target.AuthorID,
+		req.Emoji,
+		string(req.Action),
+	)
+	if err != nil {
+		a.ReportError(err)
+		failure := bridge.OpError{
+			Class:       bridge.FailureTransient,
+			Operation:   "send_reaction",
+			Fingerprint: "signal_reaction_failed",
+			Cause:       err,
+		}
+		if !signallive.IsCommandError(err) || signallive.IsSendNotDispatchedError(err) {
+			failure.Dispatch = bridge.DispatchNotCalled
+		}
+		return bridge.SendResult{}, failure
+	}
+
+	return bridge.SendResult{}, nil
 }
 
 func (a *Adapter) SendMedia(
@@ -627,6 +684,7 @@ var (
 	_ bridge.Adapter            = (*Adapter)(nil)
 	_ bridge.CapabilityDeclarer = (*Adapter)(nil)
 	_ bridge.TextSender         = (*Adapter)(nil)
+	_ bridge.ReactionSender     = (*Adapter)(nil)
 	_ bridge.MediaSender        = (*Adapter)(nil)
 	_ bridge.Run                = (*run)(nil)
 )

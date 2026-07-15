@@ -25,20 +25,21 @@ type Adapter struct {
 	accountID string
 	host      *whatsapplive.Bridge
 
-	connect          func(context.Context) error
-	disconnect       func()
-	probe            func(context.Context) error
-	accountInfo      func() whatsapplive.AccountInfo
-	cooldown         func() time.Time
-	prepareQR        func(context.Context) (<-chan whatsmeow.QRChannelItem, error)
-	connectPairing   func(context.Context) error
-	applyQR          func(whatsmeow.QRChannelItem) whatsapplive.QRSnapshot
-	pairPhone        func(context.Context, string) (string, error)
-	unpair           func() error
-	now              func() time.Time
-	mediaReady       func() bool // Shared connection gate; it does no media-specific work.
-	sendTextRequest  func(string, string, string, string) (string, time.Time, error)
-	sendMediaRequest func(string, []byte, string, string, string, string, string) (string, time.Time, error)
+	connect             func(context.Context) error
+	disconnect          func()
+	probe               func(context.Context) error
+	accountInfo         func() whatsapplive.AccountInfo
+	cooldown            func() time.Time
+	prepareQR           func(context.Context) (<-chan whatsmeow.QRChannelItem, error)
+	connectPairing      func(context.Context) error
+	applyQR             func(whatsmeow.QRChannelItem) whatsapplive.QRSnapshot
+	pairPhone           func(context.Context, string) (string, error)
+	unpair              func() error
+	now                 func() time.Time
+	mediaReady          func() bool // Shared connection gate; it does no media-specific work.
+	sendTextRequest     func(string, string, string, string) (string, time.Time, error)
+	sendReactionRequest func(string, string, string, string, string, string) error
+	sendMediaRequest    func(string, []byte, string, string, string, string, string) (string, time.Time, error)
 
 	mu       sync.Mutex
 	current  *run
@@ -65,6 +66,7 @@ func New(accountID string, host *whatsapplive.Bridge) *Adapter {
 		a.unpair = host.Unpair
 		a.mediaReady = func() bool { return host.Status().Connected }
 		a.sendTextRequest = host.SendTextRequest
+		a.sendReactionRequest = host.SendReactionRequest
 		a.sendMediaRequest = host.SendMediaRequest
 		host.ObserveLifecycle(a.handleLifecycleEvent)
 	}
@@ -149,6 +151,59 @@ func whatsappTextPreCallFailure(fingerprint string, cause error) bridge.OpError 
 }
 
 var _ bridge.TextSender = (*Adapter)(nil)
+
+// SendReaction bridges the v2 reaction request to the existing whatsmeow
+// transport without loading or updating the legacy stored reaction target.
+func (a *Adapter) SendReaction(ctx context.Context, req bridge.ReactionRequest) (bridge.SendResult, error) {
+	if a == nil || a.mediaReady == nil || !a.mediaReady() || a.sendReactionRequest == nil {
+		return bridge.SendResult{}, whatsappReactionPreCallFailure(
+			"whatsapp_not_connected",
+			whatsmeow.ErrNotConnected,
+		)
+	}
+	if ctx == nil {
+		return bridge.SendResult{}, whatsappReactionPreCallFailure(
+			"whatsapp_reaction_context_missing",
+			errors.New("WhatsApp reaction send context is nil"),
+		)
+	}
+	if err := ctx.Err(); err != nil {
+		return bridge.SendResult{}, whatsappReactionPreCallFailure("whatsapp_reaction_context_done", err)
+	}
+
+	err := a.sendReactionRequest(
+		req.Conversation.RemoteID,
+		req.Target.RemoteID,
+		req.Target.AuthorID,
+		req.Emoji,
+		string(req.Action),
+		req.RequestID,
+	)
+	if err != nil {
+		// Deliberately no adapter-level lifecycle report. The retained core's
+		// guarded reportConnectionError path owns reconnect-worthy failures.
+		failure := a.classifyError(err, "send_reaction", "whatsapp_reaction_failed")
+		if errors.Is(err, whatsapplive.ErrSendNotDispatched) {
+			failure.Dispatch = bridge.DispatchNotCalled
+		}
+		return bridge.SendResult{}, failure
+	}
+
+	// Reaction dispatch intentionally confirms without a transport result.
+	return bridge.SendResult{}, nil
+}
+
+func whatsappReactionPreCallFailure(fingerprint string, cause error) bridge.OpError {
+	return bridge.OpError{
+		Class:       bridge.FailureTransient,
+		Operation:   "send_reaction",
+		Fingerprint: fingerprint,
+		Dispatch:    bridge.DispatchNotCalled,
+		Cause:       cause,
+	}
+}
+
+var _ bridge.ReactionSender = (*Adapter)(nil)
 
 // SendMedia bridges the v2 request contract to the already-owned whatsmeow
 // transport. Readiness is checked without constructing or connecting a client.
