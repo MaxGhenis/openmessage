@@ -57,8 +57,9 @@ type Message struct {
 	UpdatedAtMS      int64
 }
 
-// MessageProjection couples a normalized message to the durable inbox frame
-// from which it was decoded.
+// MessageProjection describes a normalized message and its attachments.
+// ProjectMessage requires InboxID to identify the durable frame from which the
+// message was decoded; ImportMessage ignores InboxID for historical imports.
 type MessageProjection struct {
 	InboxID     string
 	Message     Message
@@ -228,6 +229,71 @@ func (r *MessageRepository) GetMessageByRemote(
 		)
 	}
 	return message, nil
+}
+
+// ImportMessage atomically upserts a historical normalized message by remote
+// ID and records its attachments without requiring or modifying an inbox row.
+func (r *MessageRepository) ImportMessage(
+	ctx context.Context,
+	projection MessageProjection,
+) error {
+	message := projection.Message
+	tx, err := r.store.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("import message %q: begin transaction: %w", message.MessageID, err)
+	}
+	defer tx.Rollback()
+
+	nowMS, err := r.nowMS("import message")
+	if err != nil {
+		return err
+	}
+	if err := r.upsertMessage(ctx, tx, message, nowMS); err != nil {
+		return err
+	}
+	attachmentMessageID := message.MessageID
+	if len(projection.Attachments) > 0 {
+		// upsertMessage preserves the first local message_id on a natural-key
+		// conflict. Resolve that effective parent inside this transaction so a
+		// repeated import cannot point attachments at a discarded ID.
+		if err := tx.QueryRowContext(ctx, `
+			SELECT message_id
+			FROM messages
+			WHERE account_id = ?
+			  AND conversation_id = ?
+			  AND remote_message_id = ?
+		`, message.AccountID, message.ConversationID, message.RemoteMessageID).Scan(
+			&attachmentMessageID,
+		); err != nil {
+			return fmt.Errorf(
+				"import message %q: resolve attachment parent: %w",
+				message.MessageID,
+				err,
+			)
+		}
+	}
+	attachmentRepository := &MessageAttachmentRepository{store: r.store, now: r.now}
+	for _, attachment := range projection.Attachments {
+		// Historical bridge attachments do not carry a trusted v2 message ID.
+		// Bind every row to the parent selected by this import.
+		attachment.MessageID = attachmentMessageID
+		if err := attachmentRepository.RecordInboundAttachment(ctx, tx, attachment); err != nil {
+			return fmt.Errorf(
+				"import message %q: record attachment ordinal %d: %w",
+				message.MessageID,
+				attachment.Ordinal,
+				err,
+			)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		if isSQLiteConstraint(err) {
+			return invalidMessageConstraintError(nil, err, "commit message import")
+		}
+		return fmt.Errorf("import message %q: commit: %w", message.MessageID, err)
+	}
+	return nil
 }
 
 // ProjectMessage atomically upserts a normalized message by remote ID and

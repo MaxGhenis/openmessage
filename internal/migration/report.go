@@ -1,0 +1,197 @@
+// Package migration transforms the legacy OpenMessage store into the merged
+// v2 SQLite schema. It is intentionally one-shot and never opens the legacy
+// database through internal/db, whose constructor performs writes.
+package migration
+
+import "errors"
+
+const (
+	// ReportFormat is the machine-readable integrity report schema version.
+	ReportFormat = 1
+	// SampleMessagesPerPlatform is the deterministic spot-check sample size.
+	SampleMessagesPerPlatform = 5
+)
+
+var (
+	// ErrSource marks an unsupported, ambiguous, or unreadable legacy source.
+	ErrSource = errors.New("legacy migration source error")
+	// ErrTransform marks a failure while constructing the staged v2 store.
+	ErrTransform = errors.New("legacy migration transform error")
+	// ErrValidation marks a completed transform that failed integrity gates.
+	ErrValidation = errors.New("legacy migration validation error")
+)
+
+// Report is the pre-registered cutover evidence emitted by migrate and
+// migrate --check. Maps have stable JSON ordering under encoding/json.
+type Report struct {
+	Format            int                               `json:"format"`
+	OK                bool                              `json:"ok"`
+	Check             bool                              `json:"check"`
+	Source            SourceReport                      `json:"source"`
+	Target            TargetReport                      `json:"target"`
+	TableCounts       map[string]TableReconciliation    `json:"table_counts"`
+	PlatformCounts    map[string]PlatformReconciliation `json:"platform_counts"`
+	Identities        IdentityReport                    `json:"identities"`
+	Schedule          ScheduleReport                    `json:"schedule"`
+	ReadState         ReadStateReport                   `json:"read_state"`
+	Dropped           DroppedDimensions                 `json:"dropped_dimensions"`
+	SignalLocalRows   int64                             `json:"signal_local_rows"`
+	Media             MediaReport                       `json:"media"`
+	MessageCollisions []MessageCollision                `json:"message_collisions"`
+	SampledHashes     []SampledHash                     `json:"sampled_hashes"`
+	Validation        ValidationReport                  `json:"validation"`
+	Warnings          []string                          `json:"warnings"`
+}
+
+type SourceReport struct {
+	Path              string               `json:"path"`
+	DatabasePath      string               `json:"database_path"`
+	SchemaFingerprint string               `json:"schema_fingerprint"`
+	SchemaUserVersion int64                `json:"schema_user_version"`
+	QuickCheck        string               `json:"quick_check"`
+	SHA256Before      string               `json:"sha256_before"`
+	SHA256After       string               `json:"sha256_after"`
+	Unchanged         bool                 `json:"unchanged"`
+	Files             []SourceFileEvidence `json:"files"`
+}
+
+// SourceFileEvidence records content and mutation-relevant metadata for the
+// SQLite database family. WAL and shared-memory sidecars are part of the
+// source evidence because a stopped legacy WAL store may retain both.
+type SourceFileEvidence struct {
+	Role               string `json:"role"`
+	Path               string `json:"path"`
+	ExistsBefore       bool   `json:"exists_before"`
+	ExistsAfter        bool   `json:"exists_after"`
+	SizeBefore         int64  `json:"size_before"`
+	SizeAfter          int64  `json:"size_after"`
+	SHA256Before       string `json:"sha256_before,omitempty"`
+	SHA256After        string `json:"sha256_after,omitempty"`
+	ModeBefore         string `json:"mode_before,omitempty"`
+	ModeAfter          string `json:"mode_after,omitempty"`
+	ModifiedAtNSBefore int64  `json:"modified_at_ns_before,omitempty"`
+	ModifiedAtNSAfter  int64  `json:"modified_at_ns_after,omitempty"`
+	Unchanged          bool   `json:"unchanged"`
+}
+
+type TargetReport struct {
+	Path               string           `json:"path"`
+	DatabasePath       string           `json:"database_path"`
+	StoreInstanceID    string           `json:"store_instance_id"`
+	SchemaVersion      int64            `json:"schema_version"`
+	MigrationChecksums []string         `json:"migration_checksums"`
+	Counts             map[string]int64 `json:"counts"`
+	Published          bool             `json:"published"`
+}
+
+type TableReconciliation struct {
+	Legacy              int64   `json:"legacy"`
+	V2                  int64   `json:"v2"`
+	Reconciled          int64   `json:"reconciled"`
+	ReconciliationRatio float64 `json:"reconciliation_ratio"`
+	Disposition         string  `json:"disposition,omitempty"`
+}
+
+type PlatformReconciliation struct {
+	AccountID           string  `json:"account_id"`
+	Legacy              int64   `json:"legacy"`
+	V2                  int64   `json:"v2"`
+	ReconciliationRatio float64 `json:"reconciliation_ratio"`
+}
+
+type IdentityReport struct {
+	Created             int64            `json:"created"`
+	PeopleCreated       int64            `json:"people_created"`
+	LinksByProvenance   map[string]int64 `json:"links_by_provenance"`
+	UnunifiedIdentities int64            `json:"ununified_identities"`
+}
+
+type ScheduleReport struct {
+	LegacyTotal        int64            `json:"legacy_total"`
+	ByStatus           map[string]int64 `json:"by_status"`
+	PendingToOutbox    int64            `json:"pending_to_outbox"`
+	PendingMedia       int64            `json:"pending_media"`
+	SkippedSent        int64            `json:"skipped_sent"`
+	SkippedCanceled    int64            `json:"skipped_canceled"`
+	SkippedFailed      int64            `json:"skipped_failed"`
+	AmbiguousSending   int64            `json:"ambiguous_sending"`
+	OptimisticOnlyRows int64            `json:"optimistic_only_rows"`
+}
+
+type ReadStateReport struct {
+	LossyWarning                 string `json:"lossy_warning"`
+	ConversationsWithUnreadCount int64  `json:"conversations_with_unread_count"`
+	CursorsCreated               int64  `json:"cursors_created"`
+}
+
+type DroppedDimensions struct {
+	ReactionsBearingMessages  int64 `json:"reactions_bearing_messages"`
+	TranscriptBearingMessages int64 `json:"transcript_bearing_messages"`
+	ContactAvatars            int64 `json:"contact_avatars"`
+	Drafts                    int64 `json:"drafts"`
+	ContactMetaCRM            int64 `json:"contact_meta_crm"`
+	OutgoingSendKeys          int64 `json:"outgoing_send_keys"`
+	Tabs                      int64 `json:"tabs"`
+}
+
+type MediaReport struct {
+	LegacyAttachments             int64 `json:"legacy_attachments"`
+	PendingAttachments            int64 `json:"pending_attachments"`
+	WhatsAppUnresolvable          int64 `json:"whatsapp_unresolvable"`
+	SignalUnresolvable            int64 `json:"signal_unresolvable"`
+	SignalLocalAttachments        int64 `json:"signal_local_attachments"`
+	UnsupportedArchiveAttachments int64 `json:"unsupported_archive_attachments"`
+	ScheduledBlobsVerified        int64 `json:"scheduled_blobs_verified"`
+}
+
+type MessageCollision struct {
+	AccountID        string   `json:"account_id"`
+	ConversationID   string   `json:"legacy_conversation_id"`
+	RemoteMessageID  string   `json:"remote_message_id"`
+	LegacyMessageIDs []string `json:"legacy_message_ids"`
+}
+
+type SampledHash struct {
+	Platform        string `json:"platform"`
+	LegacyMessageID string `json:"legacy_message_id"`
+	V2MessageID     string `json:"v2_message_id"`
+	ExpectedSHA256  string `json:"expected_sha256"`
+	ActualSHA256    string `json:"actual_sha256"`
+	Matched         bool   `json:"matched"`
+}
+
+type ValidationReport struct {
+	QuickCheck           string                `json:"quick_check"`
+	ForeignKeyViolations []ForeignKeyViolation `json:"foreign_key_check"`
+	Orphans              OrphanReport          `json:"orphans"`
+	CountsMatched        bool                  `json:"counts_matched"`
+	SampledHashesMatched bool                  `json:"sampled_hashes_matched"`
+	BlobReferencesValid  bool                  `json:"blob_references_valid"`
+	SourceUnchanged      bool                  `json:"source_unchanged"`
+	Passed               bool                  `json:"passed"`
+}
+
+type ForeignKeyViolation struct {
+	Table      string `json:"table"`
+	RowID      *int64 `json:"rowid,omitempty"`
+	Parent     string `json:"parent"`
+	Constraint int64  `json:"constraint"`
+}
+
+type OrphanReport struct {
+	MessageConversations     int64 `json:"message_conversations"`
+	MessageSenders           int64 `json:"message_senders"`
+	ConversationParticipants int64 `json:"conversation_participants"`
+	MessageAttachments       int64 `json:"message_attachments"`
+	OutboxAccounts           int64 `json:"outbox_accounts"`
+	OutboxConversations      int64 `json:"outbox_conversations"`
+	OutboxAttachments        int64 `json:"outbox_attachments"`
+	ReadCursorMessages       int64 `json:"read_cursor_messages"`
+}
+
+func reconciliationRatio(reconciled, legacy int64) float64 {
+	if legacy == 0 {
+		return 1
+	}
+	return float64(reconciled) / float64(legacy)
+}
