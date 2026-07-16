@@ -119,6 +119,7 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 	var googleLifecycle *googleadapter.Adapter
 	var googleSupervisor *bridge.Supervisor
 	var googleControl *googleSupervisorControl
+	var whatsappLifecycle *whatsappadapter.Adapter
 	var whatsappSupervisor *bridge.Supervisor
 	var whatsappControl *whatsappSupervisorControl
 	var signalLifecycle *signaladapter.Adapter
@@ -192,7 +193,7 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 	if !isDemo {
 		whatsappBridge, initialized := initializeWhatsAppForServe(logger, a.InitializeWhatsApp)
 		if initialized {
-			whatsappLifecycle := whatsappadapter.New(whatsappAccountID, whatsappBridge)
+			whatsappLifecycle = whatsappadapter.New(whatsappAccountID, whatsappBridge)
 			a.SetWhatsAppLifecycleNotifier(whatsappLifecycle)
 			newWhatsAppSupervisor := func(initial bridge.State) (*bridge.Supervisor, error) {
 				return bridge.NewSupervisor(
@@ -302,6 +303,25 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 		}
 	} else {
 		logger.Info().Msg("Demo mode — skipping Signal live bridge")
+	}
+
+	var stack *v2Stack
+	if v2SendEnabled() && !isDemo {
+		stack, err = newV2Stack(v2StackDeps{
+			Logger:   logger,
+			DataDir:  app.DefaultDataDir(),
+			Google:   googleLifecycle,
+			WhatsApp: whatsappLifecycle,
+			Signal:   signalLifecycle,
+		})
+		if err != nil {
+			return fmt.Errorf("init v2 send stack: %w", err)
+		}
+		stopV2Stack := stack.Start(context.Background())
+		defer stopV2Stack()
+		logger.Info().Msg("V2 send stack enabled")
+	} else {
+		logger.Info().Msg("V2 send stack disabled (flag off or demo mode)")
 	}
 
 	// Sync WhatsApp and iMessage periodically (every 30s, incremental)
@@ -532,6 +552,12 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 		if err != nil {
 			return fmt.Errorf("listen on %s: %w", listenAddr, err)
 		}
+		srv := &http.Server{
+			Handler:           httpHandler,
+			ReadHeaderTimeout: 10 * time.Second,
+			IdleTimeout:       120 * time.Second,
+			MaxHeaderBytes:    1 << 20,
+		}
 		go func() {
 			if opts.web {
 				logger.Info().Str("addr", listenAddr).Msg("Web UI available at " + baseURL)
@@ -539,7 +565,7 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 			if opts.mcpSSE {
 				logger.Info().Str("addr", listenAddr).Msg("MCP SSE available at " + baseURL + "/mcp/sse")
 			}
-			if err := http.Serve(ln, httpHandler); err != nil {
+			if err := srv.Serve(ln); err != nil {
 				logger.Error().Err(err).Msg("HTTP server error")
 			}
 		}()

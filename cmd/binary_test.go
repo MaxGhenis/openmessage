@@ -195,6 +195,65 @@ func TestBuiltBinaryDemoServesSeededDataWithoutTouchingConfiguredDataDir(t *test
 	}
 }
 
+func TestBuiltBinaryV2FlagOffDoesNotCreateV2Directory(t *testing.T) {
+	binary, dataDir := buildTestBinary(t)
+
+	cmd := exec.Command(binary, "serve", "--mcp-stdio")
+	cmd.Env = append(
+		os.Environ(),
+		"OPENMESSAGES_DATA_DIR="+dataDir,
+		"OPENMESSAGES_V2_SEND=0",
+		"OPENMESSAGES_DEMO=0",
+		"OPENMESSAGES_APP_SANDBOX=1",
+		"OPENMESSAGES_MACOS_NOTIFICATIONS=0",
+		"OPENMESSAGES_LOG_LEVEL=info",
+		"OPENMESSAGE_TELEMETRY=0",
+	)
+	cmd.Stdin = strings.NewReader("")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("serve --mcp-stdio: %v\n%s", err, output)
+	}
+	if !strings.Contains(string(output), "Starting MCP stdio transport") {
+		t.Fatalf("serve did not reach MCP stdio startup:\n%s", output)
+	}
+
+	if _, err := os.Stat(filepath.Join(dataDir, "v2")); !os.IsNotExist(err) {
+		t.Fatalf("flag OFF created v2 directory or returned unexpected error: %v", err)
+	}
+}
+
+func TestBuiltBinaryDemoSkipsV2StackWhenFlagOn(t *testing.T) {
+	binary, dataDir := buildTestBinary(t)
+
+	cmd := exec.Command(binary, "serve", "--demo", "--mcp-stdio")
+	cmd.Env = append(
+		os.Environ(),
+		"OPENMESSAGES_DATA_DIR="+dataDir,
+		"OPENMESSAGES_V2_SEND=1",
+		"OPENMESSAGES_APP_SANDBOX=1",
+		"OPENMESSAGES_MACOS_NOTIFICATIONS=0",
+		"OPENMESSAGES_LOG_LEVEL=info",
+		"OPENMESSAGE_TELEMETRY=0",
+	)
+	cmd.Stdin = strings.NewReader("")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("serve --demo --mcp-stdio: %v\n%s", err, output)
+	}
+	if !strings.Contains(string(output), "Starting MCP stdio transport") {
+		t.Fatalf("demo serve did not reach MCP stdio startup:\n%s", output)
+	}
+
+	entries, err := os.ReadDir(dataDir)
+	if err != nil {
+		t.Fatalf("ReadDir(%q): %v", dataDir, err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("flag ON created %d entries in configured data dir during demo", len(entries))
+	}
+}
+
 func reserveTCPPort(t *testing.T) string {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
