@@ -728,6 +728,67 @@ func TestProjectMessageAllowsNilSystemSender(t *testing.T) {
 	}
 }
 
+func TestGetMessageByRemoteUsesAccountScopedNaturalKey(t *testing.T) {
+	store, repository := openMessageTestRepository(
+		t,
+		func() time.Time { return time.UnixMilli(messageTestTimeMS) },
+	)
+	seedMessageProjectionGraph(t, store)
+	inbox := messageTestInbox("inbox-remote-lookup", "account-a", "event-remote-lookup", []byte("frame"))
+	if _, err := repository.AppendInbox(context.Background(), inbox); err != nil {
+		t.Fatalf("AppendInbox(): %v", err)
+	}
+	message := messageTestMessage(
+		"message-remote-lookup",
+		"conversation-a",
+		"account-a",
+		"remote-message-lookup",
+		nil,
+	)
+	if err := repository.ProjectMessage(context.Background(), MessageProjection{
+		InboxID: inbox.InboxID,
+		Message: message,
+	}); err != nil {
+		t.Fatalf("ProjectMessage(): %v", err)
+	}
+
+	got, err := repository.GetMessageByRemote(
+		context.Background(),
+		message.AccountID,
+		message.ConversationID,
+		message.RemoteMessageID,
+	)
+	if err != nil {
+		t.Fatalf("GetMessageByRemote(): %v", err)
+	}
+	if got.MessageID != message.MessageID || got.Body != message.Body {
+		t.Fatalf("GetMessageByRemote() = %+v, want message %q", got, message.MessageID)
+	}
+
+	for _, test := range []struct {
+		name           string
+		accountID      string
+		conversationID string
+		remoteID       string
+	}{
+		{name: "other account", accountID: "account-b", conversationID: message.ConversationID, remoteID: message.RemoteMessageID},
+		{name: "other conversation", accountID: message.AccountID, conversationID: "conversation-b", remoteID: message.RemoteMessageID},
+		{name: "other remote", accountID: message.AccountID, conversationID: message.ConversationID, remoteID: "missing"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := repository.GetMessageByRemote(
+				context.Background(),
+				test.accountID,
+				test.conversationID,
+				test.remoteID,
+			)
+			if !errors.Is(err, ErrNotFound) {
+				t.Fatalf("GetMessageByRemote() error = %v, want ErrNotFound", err)
+			}
+		})
+	}
+}
+
 func TestMessagesInboxMigrationIsChecksummedAndStrict(t *testing.T) {
 	store, _ := openMessageTestRepository(
 		t,

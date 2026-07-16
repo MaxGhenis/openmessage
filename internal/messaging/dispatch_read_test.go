@@ -204,9 +204,7 @@ func TestDuplicateReadReturnsSameSubmissionAndDispatchesOnce(t *testing.T) {
 	first := mustMarkDispatchRead(t, service, command)
 	command.LastReadAt = clock.Now().Add(time.Minute)
 	second := mustMarkDispatchRead(t, service, command)
-	if first != second {
-		t.Fatalf("duplicate read submissions differ: first=%+v second=%+v", first, second)
-	}
+	assertDeduplicatedSubmission(t, first, second)
 	if processed, err := service.DispatchDue(context.Background(), 4); err != nil || processed != 1 {
 		t.Fatalf("DispatchDue(duplicate read) = %d, %v; want 1, nil", processed, err)
 	}

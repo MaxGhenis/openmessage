@@ -227,9 +227,7 @@ func TestDuplicateReactionReturnsSameSubmissionAndDispatchesOnce(t *testing.T) {
 
 	first := mustSendDispatchReaction(t, service, command)
 	second := mustSendDispatchReaction(t, service, command)
-	if first != second {
-		t.Fatalf("duplicate reaction submissions differ: first=%+v second=%+v", first, second)
-	}
+	assertDeduplicatedSubmission(t, first, second)
 	if processed, err := service.DispatchDue(context.Background(), 4); err != nil || processed != 1 {
 		t.Fatalf("DispatchDue(duplicate reaction) = %d, %v; want 1, nil", processed, err)
 	}

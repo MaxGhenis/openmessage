@@ -79,6 +79,7 @@ type UnpairFunc func() error
 
 // APIOptions holds optional callbacks for the API handler.
 type APIOptions struct {
+	V2                    *V2Options
 	Client                func() *client.Client
 	Events                *EventBroker
 	EventHeartbeat        time.Duration
@@ -150,6 +151,7 @@ func APIHandler(store *db.Store, cli *client.Client, logger zerolog.Logger, mcpH
 
 func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.Logger, mcpHandler http.Handler, opts APIOptions) http.Handler {
 	mux := http.NewServeMux()
+	registerV1Routes(mux, store, logger, opts.V2)
 	diagnosticsStartedAt := time.Now()
 	getClient := func() *client.Client {
 		if opts.Client != nil {
@@ -268,6 +270,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 	statusPayload := func(connected bool) map[string]any {
 		payload := map[string]any{
 			"connected": connected,
+			"v2_send":   opts.V2 != nil,
 		}
 		if strings.TrimSpace(opts.IdentityName) != "" {
 			payload["identity_name"] = strings.TrimSpace(opts.IdentityName)
@@ -1853,6 +1856,16 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			httpError(w, "no media for this message", 404)
 			return
 		}
+		if strings.HasPrefix(msg.MediaID, "v2blob:") {
+			if opts.V2 == nil || opts.V2.Blobs == nil {
+				httpError(w, "v2 media not available", 404)
+				return
+			}
+			if err := writeV2BlobMediaResponse(w, opts.V2.Blobs, msg); err != nil {
+				httpError(w, "v2 media not available", 404)
+			}
+			return
+		}
 		if msg.SourcePlatform == "whatsapp" || strings.HasPrefix(msg.MessageID, "whatsapp:") || strings.HasPrefix(msg.MediaID, "wa:") {
 			if opts.DownloadWhatsAppMedia == nil {
 				httpError(w, "whatsapp media not available", 404)
@@ -2178,6 +2191,15 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		if err := store.MarkConversationRead(req.ConversationID); err != nil {
 			httpError(w, "mark read: "+err.Error(), 500)
 			return
+		}
+		if opts.V2 != nil {
+			nowMS := time.Now().UnixMilli()
+			if err := mirrorV2ReadCursor(r.Context(), store, opts.V2.V2Store, req.ConversationID, nowMS); err != nil {
+				logger.Warn().
+					Err(err).
+					Str("conv_id", req.ConversationID).
+					Msg("Failed to mirror legacy read cursor into v2 store")
+			}
 		}
 		publishConversations()
 		writeJSON(w, map[string]string{"status": "ok"})

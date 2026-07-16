@@ -216,9 +216,7 @@ func TestSendAgainIdempotencyUsesNewKeyAndLinksEachDeliberateIntent(t *testing.T
 	if err != nil {
 		t.Fatalf("SendAgain(replay): %v", err)
 	}
-	if replay != first {
-		t.Fatalf("same-key replay = %+v, want %+v", replay, first)
-	}
+	assertDeduplicatedSubmission(t, first, replay)
 	second, err := service.SendAgain(context.Background(), original.OutboxID, "key-send-again-second")
 	if err != nil {
 		t.Fatalf("SendAgain(second key): %v", err)

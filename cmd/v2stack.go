@@ -8,7 +8,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/rs/zerolog"
 
@@ -16,19 +15,13 @@ import (
 	googleadapter "github.com/maxghenis/openmessage/internal/bridgeadapters/google"
 	signaladapter "github.com/maxghenis/openmessage/internal/bridgeadapters/signal"
 	whatsappadapter "github.com/maxghenis/openmessage/internal/bridgeadapters/whatsapp"
+	"github.com/maxghenis/openmessage/internal/db"
 	"github.com/maxghenis/openmessage/internal/media"
 	"github.com/maxghenis/openmessage/internal/messaging"
 	"github.com/maxghenis/openmessage/internal/storage/blob"
 	"github.com/maxghenis/openmessage/internal/storage/sqlite"
+	"github.com/maxghenis/openmessage/internal/v2wire"
 )
-
-// localDeviceID derives the per-account local-installation device id.
-// devices.device_id is a GLOBAL primary key (0002) and UpsertDevice conflicts
-// on it alone, so a constant id would let the second account silently steal
-// the first account's device row and break its read_cursors composite FK.
-func localDeviceID(accountID string) string {
-	return "local-primary:" + accountID
-}
 
 type v2StackDeps struct {
 	Logger  zerolog.Logger
@@ -48,6 +41,7 @@ type v2Stack struct {
 	Service  *messaging.MessageService
 	Media    *media.Service
 
+	outbox *sqlite.OutboxRepository
 	logger zerolog.Logger
 }
 
@@ -115,6 +109,10 @@ func newV2Stack(deps v2StackDeps) (_ *v2Stack, resultErr error) {
 	if err != nil {
 		return nil, fmt.Errorf("configure v2 send stack: create message service: %w", err)
 	}
+	outbox, err := sqlite.NewOutboxRepository(store, clock.Now)
+	if err != nil {
+		return nil, fmt.Errorf("configure v2 send stack: create projector outbox: %w", err)
+	}
 	mediaService, err := media.NewService(store, registry, blobs, clock)
 	if err != nil {
 		return nil, fmt.Errorf("configure v2 send stack: create media service: %w", err)
@@ -127,17 +125,35 @@ func newV2Stack(deps v2StackDeps) (_ *v2Stack, resultErr error) {
 		Registry: registry,
 		Service:  service,
 		Media:    mediaService,
+		outbox:   outbox,
 		logger:   deps.Logger,
 	}, nil
 }
 
-func (s *v2Stack) Start(ctx context.Context) (stop func()) {
+func (s *v2Stack) Start(ctx context.Context, legacy *db.Store, events v2wire.EventPublisher) (stop func()) {
 	runCtx, cancel := context.WithCancel(ctx)
-	done := make(chan struct{})
+	projector := &v2wire.Projector{
+		V2Store: s.Store,
+		Outbox:  s.outbox,
+		Legacy:  legacy,
+		Blobs:   s.Blobs,
+		Events:  events,
+		Service: s.Service,
+		Logger:  s.logger,
+	}
+
+	var runWG sync.WaitGroup
+	runWG.Add(2)
 	go func() {
-		defer close(done)
+		defer runWG.Done()
 		if err := s.Service.Run(runCtx); err != nil && !errors.Is(err, context.Canceled) {
 			s.logger.Error().Err(err).Msg("V2 message dispatcher stopped")
+		}
+	}()
+	go func() {
+		defer runWG.Done()
+		if err := projector.Run(runCtx); err != nil && !errors.Is(err, context.Canceled) {
+			s.logger.Error().Err(err).Msg("V2 legacy projector stopped")
 		}
 	}()
 
@@ -145,34 +161,10 @@ func (s *v2Stack) Start(ctx context.Context) (stop func()) {
 	return func() {
 		stopOnce.Do(func() {
 			cancel()
-			<-done
+			runWG.Wait()
 			if err := s.Store.Close(); err != nil {
 				s.logger.Warn().Err(err).Msg("Failed to close v2 message store")
 			}
 		})
 	}
-}
-
-func ensureLocalDevice(store *sqlite.Store, accountID string) error {
-	if store == nil {
-		return fmt.Errorf("ensure local device: store is nil")
-	}
-	if strings.TrimSpace(accountID) == "" {
-		return fmt.Errorf("ensure local device: account ID is empty")
-	}
-
-	nowMS := time.Now().UnixMilli()
-	if err := store.UpsertDevice(sqlite.Device{
-		DeviceID:    localDeviceID(accountID),
-		AccountID:   accountID,
-		Kind:        sqlite.DeviceKindLocalInstallation,
-		DisplayName: "OpenMessage",
-		State:       sqlite.DeviceStateActive,
-		IsCurrent:   true,
-		CreatedAtMS: nowMS,
-		UpdatedAtMS: nowMS,
-	}); err != nil {
-		return fmt.Errorf("ensure local device for account %q: %w", accountID, err)
-	}
-	return nil
 }

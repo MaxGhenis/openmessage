@@ -36,6 +36,9 @@ var (
 	// ErrInvalidCommand means a submission is incomplete or inconsistent.
 	ErrInvalidCommand = errors.New("messaging: invalid command")
 
+	// ErrTooLarge means an attachment exceeded the configured hard byte cap.
+	ErrTooLarge = errors.New("messaging: attachment exceeds size limit")
+
 	// ErrInvalidState means the requested delivery transition is unsafe from
 	// the intent's current state.
 	ErrInvalidState = errors.New("messaging: invalid outbox state")
@@ -89,6 +92,7 @@ type Submission struct {
 	LocalMessageID string
 	State          OutboxState
 	ScheduledFor   time.Time
+	Deduplicated   bool
 }
 
 type Delivery struct {

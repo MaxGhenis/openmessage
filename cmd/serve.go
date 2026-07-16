@@ -317,7 +317,7 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 		if err != nil {
 			return fmt.Errorf("init v2 send stack: %w", err)
 		}
-		stopV2Stack := stack.Start(context.Background())
+		stopV2Stack := stack.Start(context.Background(), a.Store, events)
 		defer stopV2Stack()
 		logger.Info().Msg("V2 send stack enabled")
 	} else {
@@ -499,11 +499,23 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 	// Background loop that sends due scheduled ("send later") messages.
 	a.StartScheduler()
 
+	var v2Options *web.V2Options
+	if stack != nil {
+		v2Options = &web.V2Options{
+			Service:  stack.Service,
+			Media:    stack.Media,
+			V2Store:  stack.Store,
+			Blobs:    stack.Blobs,
+			Registry: stack.Registry,
+		}
+	}
+
 	httpEnabled := opts.web || opts.mcpSSE
 	if httpEnabled {
 		httpHandler := http.Handler(nil)
 		if opts.web {
 			httpHandler = web.APIHandlerWithOptions(a.Store, nil, logger, mcpHTTPHandler, web.APIOptions{
+				V2:                    v2Options,
 				Client:                a.GetClient,
 				Events:                events,
 				IdentityName:          identityName,
