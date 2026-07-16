@@ -986,6 +986,43 @@ func (r *OutboxRepository) ListPending(
 	return items, nil
 }
 
+// ListConfirmedSince returns confirmed outbox rows updated strictly after the
+// watermark, ordered deterministically and enriched with nullable per-kind
+// payload data.
+func (r *OutboxRepository) ListConfirmedSince(
+	ctx context.Context,
+	sinceMS int64,
+	limit int,
+) ([]PendingRow, error) {
+	if limit <= 0 {
+		return nil, fmt.Errorf("list confirmed outbox items: limit must be positive")
+	}
+
+	rows, err := r.store.db.QueryContext(ctx, `
+		SELECT `+prefixedOutboxColumns("o")+`,
+			m.body,
+			oa.filename,
+			oa.mime,
+			orx.emoji
+		FROM outbox o
+		LEFT JOIN messages m ON m.message_id = o.local_message_id
+		LEFT JOIN outbox_attachments oa ON oa.outbox_id = o.outbox_id AND oa.ordinal = 0
+		LEFT JOIN outbox_reactions orx ON orx.outbox_id = o.outbox_id
+		WHERE o.state = 'confirmed'
+		  AND o.updated_at_ms > ?
+		ORDER BY o.updated_at_ms, o.outbox_id
+		LIMIT ?
+	`, sinceMS, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list confirmed outbox items: query: %w", err)
+	}
+	items, err := collectRows(rows, scanPendingRow)
+	if err != nil {
+		return nil, fmt.Errorf("list confirmed outbox items: scan: %w", err)
+	}
+	return items, nil
+}
+
 // LeaseDue atomically claims due queued and retryable rows. An uncertain row is
 // structurally ineligible regardless of its next-attempt value.
 func (r *OutboxRepository) LeaseDue(

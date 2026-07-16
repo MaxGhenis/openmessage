@@ -14,7 +14,8 @@ import (
 	googleadapter "github.com/maxghenis/openmessage/internal/bridgeadapters/google"
 	signaladapter "github.com/maxghenis/openmessage/internal/bridgeadapters/signal"
 	whatsappadapter "github.com/maxghenis/openmessage/internal/bridgeadapters/whatsapp"
-	"github.com/maxghenis/openmessage/internal/storage/sqlite"
+	"github.com/maxghenis/openmessage/internal/db"
+	"github.com/maxghenis/openmessage/internal/web"
 )
 
 func TestV2SendEnabled(t *testing.T) {
@@ -205,7 +206,13 @@ func TestV2StackStopJoinsRunAndClosesStore(t *testing.T) {
 		t.Fatalf("newV2Stack(): %v", err)
 	}
 
-	stop := stack.Start(context.Background())
+	legacy, err := db.New(filepath.Join(t.TempDir(), "legacy.sqlite3"))
+	if err != nil {
+		t.Fatalf("db.New(): %v", err)
+	}
+	defer legacy.Close()
+
+	stop := stack.Start(context.Background(), legacy, web.NewEventBroker())
 	stopped := make(chan struct{})
 	go func() {
 		stop()
@@ -222,57 +229,6 @@ func TestV2StackStopJoinsRunAndClosesStore(t *testing.T) {
 	}
 }
 
-func TestEnsureLocalDevice(t *testing.T) {
-	store, err := sqlite.Open(filepath.Join(t.TempDir(), "store.sqlite3"))
-	if err != nil {
-		t.Fatalf("sqlite.Open(): %v", err)
-	}
-	defer store.Close()
-
-	now := time.Now().UnixMilli()
-	if err := store.UpsertAccount(sqlite.Account{
-		AccountID:   "test-account",
-		BridgeKey:   "test",
-		Mode:        sqlite.AccountModeLive,
-		Enabled:     true,
-		ConfigJSON:  "{}",
-		CreatedAtMS: now,
-		UpdatedAtMS: now,
-	}); err != nil {
-		t.Fatalf("UpsertAccount(): %v", err)
-	}
-
-	if err := ensureLocalDevice(store, "test-account"); err != nil {
-		t.Fatalf("ensureLocalDevice(): %v", err)
-	}
-	if err := ensureLocalDevice(store, "test-account"); err != nil {
-		t.Fatalf("ensureLocalDevice() second call: %v", err)
-	}
-
-	device, err := store.GetDevice(localDeviceID("test-account"))
-	if err != nil {
-		t.Fatalf("GetDevice(): %v", err)
-	}
-	if device.DeviceID != localDeviceID("test-account") {
-		t.Errorf("DeviceID = %q, want %q", device.DeviceID, localDeviceID("test-account"))
-	}
-	if device.AccountID != "test-account" {
-		t.Errorf("AccountID = %q, want test-account", device.AccountID)
-	}
-	if device.Kind != sqlite.DeviceKindLocalInstallation {
-		t.Errorf("Kind = %q, want %q", device.Kind, sqlite.DeviceKindLocalInstallation)
-	}
-	if device.State != sqlite.DeviceStateActive {
-		t.Errorf("State = %q, want %q", device.State, sqlite.DeviceStateActive)
-	}
-	if !device.IsCurrent {
-		t.Error("IsCurrent = false, want true")
-	}
-	if device.CreatedAtMS <= 0 || device.UpdatedAtMS < device.CreatedAtMS {
-		t.Errorf("invalid device timestamps: created=%d updated=%d", device.CreatedAtMS, device.UpdatedAtMS)
-	}
-}
-
 func assertPrivateDirectory(t *testing.T, path string) {
 	t.Helper()
 	info, err := os.Stat(path)
@@ -284,57 +240,5 @@ func assertPrivateDirectory(t *testing.T, path string) {
 	}
 	if got := info.Mode().Perm(); got != 0o700 {
 		t.Fatalf("mode for %q = %#o, want 0700", path, got)
-	}
-}
-
-// Two accounts must each get their own local device row: devices.device_id is
-// a GLOBAL primary key and UpsertDevice conflicts on it alone, so a constant
-// device id would let the second account silently steal the first account's
-// row and break its read_cursors composite FK. This test fails under the
-// constant-id design.
-func TestEnsureLocalDevicePerAccountRowsCoexist(t *testing.T) {
-	store, err := sqlite.Open(filepath.Join(t.TempDir(), "store.sqlite3"))
-	if err != nil {
-		t.Fatalf("sqlite.Open(): %v", err)
-	}
-	defer store.Close()
-
-	now := time.Now().UnixMilli()
-	for _, accountID := range []string{"google-primary", "signal-primary"} {
-		if err := store.UpsertAccount(sqlite.Account{
-			AccountID: accountID, BridgeKey: accountID, Mode: sqlite.AccountModeLive,
-			Enabled: true, ConfigJSON: "{}", CreatedAtMS: now, UpdatedAtMS: now,
-		}); err != nil {
-			t.Fatalf("UpsertAccount(%s): %v", accountID, err)
-		}
-		if err := ensureLocalDevice(store, accountID); err != nil {
-			t.Fatalf("ensureLocalDevice(%s): %v", accountID, err)
-		}
-	}
-
-	for _, accountID := range []string{"google-primary", "signal-primary"} {
-		device, err := store.GetDevice(localDeviceID(accountID))
-		if err != nil {
-			t.Fatalf("GetDevice(%s): %v", accountID, err)
-		}
-		if device.AccountID != accountID {
-			t.Fatalf("device for %s has AccountID %q (row stolen)", accountID, device.AccountID)
-		}
-		// The composite-FK write that the constant-id design breaks: a read
-		// cursor for each account's own device must succeed.
-		if err := store.UpsertConversation(sqlite.Conversation{
-			ConversationID: "conv-" + accountID, AccountID: accountID,
-			RemoteConversationID: "remote-" + accountID, Kind: sqlite.ConversationKindDirect,
-			Title: accountID, NotificationMode: sqlite.NotificationModeAll,
-			MetadataJSON: "{}", CreatedAtMS: now, UpdatedAtMS: now,
-		}); err != nil {
-			t.Fatalf("UpsertConversation(%s): %v", accountID, err)
-		}
-		if err := store.UpsertReadCursor(sqlite.ReadCursor{
-			AccountID: accountID, DeviceID: localDeviceID(accountID),
-			ConversationID: "conv-" + accountID, LastReadAtMS: 0, UpdatedAtMS: now,
-		}); err != nil {
-			t.Fatalf("UpsertReadCursor(%s): %v", accountID, err)
-		}
 	}
 }

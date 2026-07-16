@@ -75,6 +75,58 @@ func TestNextPollDelayUsesCeilingOnReadError(t *testing.T) {
 	}
 }
 
+func TestChangesBroadcastsMutationsAndRotates(t *testing.T) {
+	clock := newManualClock(messagingTestTime)
+	store := openMessagingTestStore(t, clock.Now())
+	service := newMessagingTestService(
+		t,
+		store,
+		newScriptedRegistry("changes", &scriptedTextSender{}),
+		clock,
+	)
+
+	first := service.Changes()
+	second := service.Changes()
+	if first != second {
+		t.Fatal("Changes() returned different channels before a mutation")
+	}
+
+	command := SendTextCommand{
+		CommonCommand: testCommonCommand("key-changes"),
+		Body:          "broadcast this mutation",
+	}
+	mustSendText(t, service, command)
+	for observer, changes := range map[string]<-chan struct{}{
+		"first":  first,
+		"second": second,
+	} {
+		select {
+		case <-changes:
+		default:
+			t.Fatalf("%s Changes() observer was not notified", observer)
+		}
+	}
+
+	rotated := service.Changes()
+	if rotated == first {
+		t.Fatal("Changes() did not rotate its channel after a mutation")
+	}
+	select {
+	case <-rotated:
+		t.Fatal("replacement Changes() channel is already closed")
+	default:
+	}
+
+	// An idempotent replay does not mutate durable state and must not produce a
+	// second change notification.
+	mustSendText(t, service, command)
+	select {
+	case <-rotated:
+		t.Fatal("idempotent replay notified Changes()")
+	default:
+	}
+}
+
 func TestUnavailableTextReturnsToQueuedWithoutAttempt(t *testing.T) {
 	for _, platform := range []bridge.Platform{"scripted-alpha", "future-platform"} {
 		t.Run(string(platform), func(t *testing.T) {
@@ -636,9 +688,7 @@ func TestDuplicateSendTextReturnsSameSubmissionAndDispatchesOnce(t *testing.T) {
 
 	first := mustSendText(t, service, command)
 	second := mustSendText(t, service, command)
-	if first != second {
-		t.Fatalf("duplicate submissions differ: first=%+v second=%+v", first, second)
-	}
+	assertDeduplicatedSubmission(t, first, second)
 	if processed, err := service.DispatchDue(context.Background(), 4); err != nil || processed != 1 {
 		t.Fatalf("DispatchDue() = %d, %v", processed, err)
 	}
@@ -729,9 +779,7 @@ func TestDuplicateSendMediaReturnsSameSubmissionAndOneDurableSet(t *testing.T) {
 
 	first := mustSendMedia(t, service, command(" image/test ", " image.bin "))
 	second := mustSendMedia(t, service, command("image/test", "image.bin"))
-	if first != second {
-		t.Fatalf("duplicate media submissions differ: first=%+v second=%+v", first, second)
-	}
+	assertDeduplicatedSubmission(t, first, second)
 	if files := messagingBlobFiles(t, blobRoot); len(files) != 1 {
 		t.Fatalf("duplicate media left blob files %v, want one", files)
 	}
@@ -802,8 +850,15 @@ func TestSendMediaRejectsTooLargeAndEmptyContent(t *testing.T) {
 				Content:       bytes.NewReader(test.content),
 				MIME:          "application/test",
 			})
-			if !errors.Is(err, ErrInvalidCommand) {
-				t.Fatalf("SendMedia() error = %v, want ErrInvalidCommand", err)
+			wantErr := ErrInvalidCommand
+			if test.name == "too large" {
+				wantErr = ErrTooLarge
+			}
+			if !errors.Is(err, wantErr) {
+				t.Fatalf("SendMedia() error = %v, want %v", err, wantErr)
+			}
+			if test.name == "too large" && errors.Is(err, ErrInvalidCommand) {
+				t.Fatalf("SendMedia() error = %v, must not classify oversize content as ErrInvalidCommand", err)
 			}
 			if _, err := service.outbox.FindByID(context.Background(), "id-001"); !errors.Is(err, sqlite.ErrNotFound) {
 				t.Fatalf("invalid media outbox error = %v, want ErrNotFound", err)
@@ -1146,9 +1201,7 @@ func TestSendReactionDeduplicatesAndHashesEmojiAndAction(t *testing.T) {
 
 	first := mustSendReaction(t, service, command)
 	second := mustSendReaction(t, service, command)
-	if first != second {
-		t.Fatalf("duplicate reaction submissions differ: first=%+v second=%+v", first, second)
-	}
+	assertDeduplicatedSubmission(t, first, second)
 	if _, err := service.outbox.FindByID(context.Background(), "id-007"); !errors.Is(err, sqlite.ErrNotFound) {
 		t.Fatalf("duplicate candidate reaction error = %v, want ErrNotFound", err)
 	}
@@ -1335,9 +1388,7 @@ func TestMarkReadDeduplicatesSameCursorWithReadAtExcluded(t *testing.T) {
 	clock.Advance(time.Minute)
 	command.LastReadAt = clock.Now()
 	second := mustMarkRead(t, service, command)
-	if first != second {
-		t.Fatalf("duplicate read submissions differ: first=%+v second=%+v", first, second)
-	}
+	assertDeduplicatedSubmission(t, first, second)
 	receipt, err := service.outbox.GetOutboxReadReceipt(context.Background(), first.OutboxID)
 	if err != nil {
 		t.Fatalf("GetOutboxReadReceipt(): %v", err)
@@ -2008,6 +2059,20 @@ func mustMarkRead(t *testing.T, service *MessageService, command MarkReadCommand
 		t.Fatalf("MarkRead(): %v", err)
 	}
 	return submission
+}
+
+func assertDeduplicatedSubmission(t *testing.T, inserted, replay Submission) {
+	t.Helper()
+	if inserted.Deduplicated {
+		t.Fatalf("inserted submission = %+v, want Deduplicated false", inserted)
+	}
+	if !replay.Deduplicated {
+		t.Fatalf("replayed submission = %+v, want Deduplicated true", replay)
+	}
+	replay.Deduplicated = false
+	if replay != inserted {
+		t.Fatalf("replayed submission identity differs: inserted=%+v replay=%+v", inserted, replay)
+	}
 }
 
 func mustDelivery(t *testing.T, service *MessageService, outboxID string) Delivery {

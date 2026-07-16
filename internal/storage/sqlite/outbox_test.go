@@ -1763,6 +1763,161 @@ func TestOutboxListPendingReturnsCancelableRowsDueOrderedWithSummarySources(t *t
 	}
 }
 
+func TestOutboxListConfirmedSinceReturnsJoinedRowsInWatermarkOrder(t *testing.T) {
+	clock := newOutboxTestClock(outboxTestTimeMS)
+	store, repository := openOutboxTestRepository(t, clock.Now)
+	ctx := context.Background()
+
+	seedMessageIdentity(t, store, "identity-a", "account-a")
+	seedMessageConversation(t, store, "conversation-a", "account-a")
+	seedOutboxTestDevice(t, store, "device-a", "account-a")
+	seedOutboxTestMessage(t, store, "target-a", "account-a", "conversation-a")
+
+	confirm := func(outboxID string, atMS int64, withoutResult bool) {
+		t.Helper()
+		lease := mustLeaseOne(t, repository, LeaseRequest{
+			Owner: "worker-" + outboxID,
+			Now:   clock.Now(), Duration: time.Minute, Limit: 1,
+		})
+		if lease.OutboxID != outboxID {
+			t.Fatalf("LeaseDue() returned %q, want %q", lease.OutboxID, outboxID)
+		}
+		token := mustLeaseToken(t, lease)
+		if err := repository.MarkTransportCalled(ctx, Attempt{
+			OutboxID: outboxID, LeaseToken: token,
+		}); err != nil {
+			t.Fatalf("MarkTransportCalled(%q): %v", outboxID, err)
+		}
+		clock.Set(atMS)
+		if withoutResult {
+			if err := repository.ConfirmWithoutResult(ctx, outboxID, token); err != nil {
+				t.Fatalf("ConfirmWithoutResult(%q): %v", outboxID, err)
+			}
+			return
+		}
+		if err := repository.Confirm(ctx, Confirmation{
+			OutboxID: outboxID, LeaseToken: token, ResultRemoteID: "remote-" + outboxID,
+		}); err != nil {
+			t.Fatalf("Confirm(%q): %v", outboxID, err)
+		}
+	}
+
+	boundaryMS := outboxTestTimeMS + 100
+	oldText := outboxTestItem("confirmed-boundary")
+	mustEnqueueOutgoingOutbox(t, repository, oldText, "boundary body")
+	confirm(oldText.OutboxID, boundaryMS, false)
+
+	confirmedMS := boundaryMS + 100
+	media := outboxTestMediaItem("confirmed-a-media")
+	attachment := outboxTestAttachment()
+	if _, disposition, err := repository.EnqueueOutgoingMediaMessage(
+		ctx,
+		media,
+		outboxTestOutgoingMessage(media, "media caption"),
+		attachment,
+	); err != nil {
+		t.Fatalf("EnqueueOutgoingMediaMessage(): %v", err)
+	} else if disposition != EnqueueInserted {
+		t.Fatalf("EnqueueOutgoingMediaMessage() disposition = %q, want %q", disposition, EnqueueInserted)
+	}
+	confirm(media.OutboxID, confirmedMS, false)
+
+	reaction := outboxTestReactionItem("confirmed-b-reaction")
+	if _, disposition, err := repository.EnqueueReaction(ctx, reaction, OutboxReaction{
+		TargetMessageID: "target-a",
+		Emoji:           "👍",
+		Action:          "add",
+	}); err != nil {
+		t.Fatalf("EnqueueReaction(): %v", err)
+	} else if disposition != EnqueueInserted {
+		t.Fatalf("EnqueueReaction() disposition = %q, want %q", disposition, EnqueueInserted)
+	}
+	confirm(reaction.OutboxID, confirmedMS, true)
+
+	read := outboxTestReadItem("confirmed-c-read")
+	targetID := "target-a"
+	if _, disposition, err := repository.EnqueueReadReceipt(
+		ctx,
+		read,
+		OutboxReadReceipt{
+			DeviceID:          "device-a",
+			LastReadMessageID: targetID,
+			ReadAtMS:          confirmedMS,
+		},
+		ReadCursor{
+			AccountID:         "account-a",
+			DeviceID:          "device-a",
+			ConversationID:    "conversation-a",
+			LastReadMessageID: &targetID,
+			LastReadAtMS:      confirmedMS,
+			UpdatedAtMS:       confirmedMS,
+		},
+	); err != nil {
+		t.Fatalf("EnqueueReadReceipt(): %v", err)
+	} else if disposition != EnqueueInserted {
+		t.Fatalf("EnqueueReadReceipt() disposition = %q, want %q", disposition, EnqueueInserted)
+	}
+	confirm(read.OutboxID, confirmedMS, true)
+
+	text := outboxTestItem("confirmed-d-text")
+	mustEnqueueOutgoingOutbox(t, repository, text, "confirmed text body")
+	confirm(text.OutboxID, confirmedMS, false)
+
+	queued := outboxTestItem("confirmed-filter-queued")
+	mustEnqueueOutgoingOutbox(t, repository, queued, "not confirmed")
+
+	rows, err := repository.ListConfirmedSince(ctx, boundaryMS, 20)
+	if err != nil {
+		t.Fatalf("ListConfirmedSince(): %v", err)
+	}
+	wantIDs := []string{media.OutboxID, reaction.OutboxID, read.OutboxID, text.OutboxID}
+	gotIDs := make([]string, len(rows))
+	for i, row := range rows {
+		gotIDs[i] = row.OutboxID
+		if row.State != OutboxConfirmed || row.UpdatedAtMS != confirmedMS {
+			t.Fatalf("ListConfirmedSince() row = %+v, want confirmed at %d", row, confirmedMS)
+		}
+	}
+	if !slices.Equal(gotIDs, wantIDs) {
+		t.Fatalf("ListConfirmedSince() IDs = %v, want %v", gotIDs, wantIDs)
+	}
+	if rows[0].Body == nil || *rows[0].Body != "media caption" ||
+		rows[0].MediaFile == nil || *rows[0].MediaFile != attachment.Filename ||
+		rows[0].MediaMIME == nil || *rows[0].MediaMIME != attachment.MIME || rows[0].Emoji != nil {
+		t.Fatalf("confirmed media sources = %+v", rows[0])
+	}
+	if rows[1].Kind != OutboxKindReaction || rows[1].Emoji == nil || *rows[1].Emoji != "👍" ||
+		rows[1].Body != nil || rows[1].ResultRemoteID != nil {
+		t.Fatalf("confirmed reaction sources = %+v", rows[1])
+	}
+	if rows[2].Kind != OutboxKindRead || rows[2].Body != nil || rows[2].MediaFile != nil ||
+		rows[2].MediaMIME != nil || rows[2].Emoji != nil || rows[2].ResultRemoteID != nil {
+		t.Fatalf("confirmed read sources = %+v", rows[2])
+	}
+	if rows[3].Kind != OutboxKindText || rows[3].Body == nil || *rows[3].Body != "confirmed text body" ||
+		rows[3].MediaFile != nil || rows[3].Emoji != nil || rows[3].ResultRemoteID == nil {
+		t.Fatalf("confirmed text sources = %+v", rows[3])
+	}
+
+	limited, err := repository.ListConfirmedSince(ctx, boundaryMS, 2)
+	if err != nil {
+		t.Fatalf("ListConfirmedSince(limit): %v", err)
+	}
+	if got := []string{limited[0].OutboxID, limited[1].OutboxID}; !slices.Equal(got, wantIDs[:2]) {
+		t.Fatalf("ListConfirmedSince(limit) IDs = %v, want %v", got, wantIDs[:2])
+	}
+	strict, err := repository.ListConfirmedSince(ctx, confirmedMS, 20)
+	if err != nil {
+		t.Fatalf("ListConfirmedSince(strict watermark): %v", err)
+	}
+	if len(strict) != 0 {
+		t.Fatalf("ListConfirmedSince(strict watermark) = %+v, want empty", strict)
+	}
+	if _, err := repository.ListConfirmedSince(ctx, boundaryMS, 0); err == nil {
+		t.Fatal("ListConfirmedSince(non-positive limit) succeeded")
+	}
+}
+
 func TestOutboxPreCallExpiredLeaseRetriesAndStaleTokenLoses(t *testing.T) {
 	clock := newOutboxTestClock(outboxTestTimeMS)
 	_, repository := openOutboxTestRepository(t, clock.Now)

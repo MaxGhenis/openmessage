@@ -216,7 +216,7 @@ func (s *MessageService) SendText(
 		return Submission{}, fmt.Errorf("send text: %w", err)
 	}
 
-	submission := submissionFromItem(item)
+	submission := submissionFromItem(item, disposition)
 	if disposition == sqlite.EnqueueInserted {
 		s.signalChange()
 		s.signalWake()
@@ -279,9 +279,10 @@ func (s *MessageService) SendMedia(
 		var tooLarge *blob.ErrTooLarge
 		if errors.As(err, &tooLarge) {
 			return Submission{}, fmt.Errorf(
-				"%w: attachment too large (limit %d MB)",
-				ErrInvalidCommand,
+				"%w: attachment too large (limit %d MB): %v",
+				ErrTooLarge,
 				tooLarge.Max/(1<<20),
+				tooLarge,
 			)
 		}
 		return Submission{}, fmt.Errorf("send media: store blob: %w", err)
@@ -347,7 +348,7 @@ func (s *MessageService) SendMedia(
 		return Submission{}, fmt.Errorf("send media: %w", err)
 	}
 
-	submission := submissionFromItem(item)
+	submission := submissionFromItem(item, disposition)
 	if disposition == sqlite.EnqueueInserted {
 		s.signalChange()
 		s.signalWake()
@@ -441,7 +442,7 @@ func (s *MessageService) SendReaction(
 		return Submission{}, fmt.Errorf("send reaction: %w", err)
 	}
 
-	submission := submissionFromItem(item)
+	submission := submissionFromItem(item, disposition)
 	if disposition == sqlite.EnqueueInserted {
 		s.signalChange()
 		s.signalWake()
@@ -552,7 +553,7 @@ func (s *MessageService) MarkRead(
 		return Submission{}, fmt.Errorf("mark read: %w", err)
 	}
 
-	submission := submissionFromItem(item)
+	submission := submissionFromItem(item, disposition)
 	if disposition == sqlite.EnqueueInserted {
 		s.signalChange()
 		s.signalWake()
@@ -875,7 +876,7 @@ func (s *MessageService) SendAgain(
 		s.signalChange()
 		s.signalWake()
 	}
-	return submissionFromItem(resent), nil
+	return submissionFromItem(resent, disposition), nil
 }
 
 // ObserveTransportEcho correlates an accepted transport result to an existing
@@ -1214,12 +1215,13 @@ func readPayloadHash(deviceID, lastReadMessageID string) (string, error) {
 	return hex.EncodeToString(sum[:]), nil
 }
 
-func submissionFromItem(item sqlite.OutboxItem) Submission {
+func submissionFromItem(item sqlite.OutboxItem, disposition sqlite.EnqueueDisposition) Submission {
 	return Submission{
 		OutboxID:       item.OutboxID,
 		LocalMessageID: stringValue(item.LocalMessageID),
 		State:          item.State,
 		ScheduledFor:   time.UnixMilli(item.ScheduledForMS),
+		Deduplicated:   disposition == sqlite.EnqueueExisting,
 	}
 }
 
@@ -1273,6 +1275,12 @@ func (s *MessageService) changeChannel() <-chan struct{} {
 	s.changeMu.Lock()
 	defer s.changeMu.Unlock()
 	return s.changed
+}
+
+// Changes returns the current delivery-change broadcast channel. The channel
+// closes on the next change; callers must call Changes again after it closes.
+func (s *MessageService) Changes() <-chan struct{} {
+	return s.changeChannel()
 }
 
 func contextError(err error) bool {

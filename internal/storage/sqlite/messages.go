@@ -192,6 +192,44 @@ func (r *MessageRepository) GetMessage(
 	return message, nil
 }
 
+// GetMessageByRemote returns the normalized message selected by the same
+// account-scoped natural key used by ProjectMessage. This is useful to recover
+// the effective local message ID after a projection collides with a row that
+// was already stored for the same remote message.
+func (r *MessageRepository) GetMessageByRemote(
+	ctx context.Context,
+	accountID string,
+	conversationID string,
+	remoteMessageID string,
+) (Message, error) {
+	message, err := scanMessage(r.store.db.QueryRowContext(ctx, `
+		SELECT `+messageColumns+`
+		FROM messages
+		WHERE account_id = ?
+		  AND conversation_id = ?
+		  AND remote_message_id = ?
+	`, accountID, conversationID, remoteMessageID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return Message{}, fmt.Errorf(
+			"message for account %q, conversation %q, and remote ID %q: %w",
+			accountID,
+			conversationID,
+			remoteMessageID,
+			ErrNotFound,
+		)
+	}
+	if err != nil {
+		return Message{}, fmt.Errorf(
+			"get message for account %q, conversation %q, and remote ID %q: %w",
+			accountID,
+			conversationID,
+			remoteMessageID,
+			err,
+		)
+	}
+	return message, nil
+}
+
 // ProjectMessage atomically upserts a normalized message by remote ID and
 // marks its source inbox row processed. A replay of an already-processed inbox
 // row returns without writing either timestamp.
