@@ -96,6 +96,27 @@ func TestBuiltBinaryRejectsSendGroupNoArgs(t *testing.T) {
 	}
 }
 
+func TestBuiltBinaryBackupUsesPreflightExitCode(t *testing.T) {
+	binary, dataDir := buildTestBinary(t)
+
+	command := exec.Command(binary, "backup")
+	command.Env = append(os.Environ(), "OPENMESSAGES_DATA_DIR="+dataDir)
+	output, err := command.CombinedOutput()
+	if err == nil {
+		t.Fatal("backup succeeded without messages.db")
+	}
+	exitErr, ok := err.(*exec.ExitError)
+	if !ok {
+		t.Fatalf("backup error type = %T, want *exec.ExitError: %v", err, err)
+	}
+	if exitErr.ExitCode() != 3 {
+		t.Fatalf("backup exit code = %d, want 3\n%s", exitErr.ExitCode(), output)
+	}
+	if !strings.Contains(string(output), "legacy database not found") {
+		t.Fatalf("backup error is not actionable:\n%s", output)
+	}
+}
+
 func TestBuiltBinaryDemoServesSeededDataWithoutTouchingConfiguredDataDir(t *testing.T) {
 	binary, dataDir := buildTestBinary(t)
 	port := reserveTCPPort(t)
