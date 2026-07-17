@@ -27,6 +27,7 @@ import (
 	"github.com/maxghenis/openmessage/internal/app"
 	"github.com/maxghenis/openmessage/internal/client"
 	"github.com/maxghenis/openmessage/internal/db"
+	"github.com/maxghenis/openmessage/internal/media"
 	"github.com/maxghenis/openmessage/internal/messaging"
 	"github.com/maxghenis/openmessage/internal/story"
 	"github.com/maxghenis/openmessage/internal/whatsapplive"
@@ -3303,38 +3304,6 @@ func normalizeMIME(mimeType string) string {
 	return m
 }
 
-// isPassiveInlineMIME reports whether a media type can be rendered inline in a
-// browser with no risk of executing script. SVG and the HTML/XML family are
-// excluded because they can carry <script>; anything not positively recognized
-// is treated as unsafe and downloaded instead.
-func isPassiveInlineMIME(mimeType string) bool {
-	m := normalizeMIME(mimeType)
-	switch {
-	case m == "image/svg+xml":
-		return false
-	case strings.HasPrefix(m, "image/"),
-		strings.HasPrefix(m, "audio/"),
-		strings.HasPrefix(m, "video/"):
-		return true
-	case m == "application/pdf", m == "text/plain":
-		return true
-	default:
-		return false
-	}
-}
-
-// isActiveMIME reports whether a sniffed type could be interpreted as
-// script-bearing markup. It rejects a payload declared as a passive type whose
-// bytes actually sniff as active content (a spoofed image/png that is really
-// HTML).
-func isActiveMIME(mimeType string) bool {
-	switch normalizeMIME(mimeType) {
-	case "text/html", "application/xhtml+xml", "image/svg+xml", "text/xml", "application/xml":
-		return true
-	}
-	return false
-}
-
 // sanitizeMediaFilename strips path components, control characters, and
 // header-breaking characters so a filename can be placed in a quoted
 // Content-Disposition value. Non-ASCII bytes are replaced to keep the header
@@ -3373,7 +3342,7 @@ func writeMediaResponse(w http.ResponseWriter, data []byte, filename, declaredMI
 	if resolved == "" {
 		resolved = "application/octet-stream"
 	}
-	inline := isPassiveInlineMIME(resolved) && !isActiveMIME(http.DetectContentType(data))
+	inline := media.ServingDisposition(resolved, data) == media.DispositionInline
 
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Content-Security-Policy", "sandbox; default-src 'none'")

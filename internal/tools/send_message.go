@@ -44,19 +44,28 @@ var (
 	}
 )
 
-func sendMessageTool() mcp.Tool {
-	return mcp.NewTool("send_message",
-		mcp.WithDescription("Send a direct text message across supported platforms. Defaults to SMS/RCS when no platform is specified."),
+func sendMessageTool(v2Enabled ...bool) mcp.Tool {
+	description := "Send a direct text message across supported platforms. Defaults to SMS/RCS when no platform is specified."
+	options := []mcp.ToolOption{
+		mcp.WithDescription(description),
 		mcp.WithString("phone_number", mcp.Description("Legacy alias for recipient. For SMS/RCS use a phone number with country code (e.g., +15551234567).")),
 		mcp.WithString("recipient", mcp.Description("Recipient identifier. Use a phone number for SMS/RCS or Signal, and a phone number or WhatsApp JID for WhatsApp.")),
 		mcp.WithString("platform", mcp.Description("Target platform: sms, rcs, whatsapp, or signal. Defaults to sms.")),
 		mcp.WithString("message", mcp.Required(), mcp.Description("Message text to send")),
+	}
+	if v2Requested(v2Enabled) {
+		options[0] = mcp.WithDescription(description + v2DeliveryDescription)
+		options = append(options, mcp.WithString("idempotency_key", mcp.Description(v2IdempotencyDescription)))
+	}
+	options = append(options,
 		mcp.WithDestructiveHintAnnotation(false),
 		mcp.WithIdempotentHintAnnotation(false),
 	)
+	return mcp.NewTool("send_message", options...)
 }
 
-func sendMessageHandler(a *app.App) server.ToolHandlerFunc {
+func sendMessageHandler(a *app.App, v2Options ...*V2Dependencies) server.ToolHandlerFunc {
+	v2 := activeV2(v2Options)
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		args := req.GetArguments()
 		recipient := firstNonEmpty(strings.TrimSpace(strArg(args, "recipient")), strings.TrimSpace(strArg(args, "phone_number")))
@@ -75,6 +84,12 @@ func sendMessageHandler(a *app.App) server.ToolHandlerFunc {
 			conversationID, name, number, isGroup, err := canonicalWhatsAppDirectConversation(recipient)
 			if err != nil {
 				return errorResult(err.Error()), nil
+			}
+			if v2 != nil {
+				if err := ensureDirectConversationExists(a, conversationID, "whatsapp", name, number, isGroup, time.Now().UnixMilli()); err != nil {
+					return errorResult(fmt.Sprintf("failed to persist conversation: %v", err)), nil
+				}
+				return submitV2Text(ctx, a, v2, args, conversationID, message), nil
 			}
 			msg, err := sendWhatsAppText(a, conversationID, message, "")
 			if err != nil {
@@ -100,6 +115,12 @@ func sendMessageHandler(a *app.App) server.ToolHandlerFunc {
 			conversationID, name, number, isGroup, err := canonicalSignalDirectConversation(recipient)
 			if err != nil {
 				return errorResult(err.Error()), nil
+			}
+			if v2 != nil {
+				if err := ensureDirectConversationExists(a, conversationID, "signal", name, number, isGroup, time.Now().UnixMilli()); err != nil {
+					return errorResult(fmt.Sprintf("failed to persist conversation: %v", err)), nil
+				}
+				return submitV2Text(ctx, a, v2, args, conversationID, message), nil
 			}
 			msg, err := sendSignalText(a, conversationID, message, "")
 			if err != nil {
@@ -141,6 +162,9 @@ func sendMessageHandler(a *app.App) server.ToolHandlerFunc {
 			}
 			if err := upsertGoogleConversation(a, conv); err != nil {
 				return errorResult(fmt.Sprintf("failed to persist conversation: %v", err)), nil
+			}
+			if v2 != nil {
+				return submitV2Text(ctx, a, v2, args, conv.GetConversationID(), message), nil
 			}
 			myParticipantID, simPayload := app.ExtractSIMAndParticipant(conv)
 			payload := app.BuildSendPayload(conv.GetConversationID(), message, "", myParticipantID, simPayload)

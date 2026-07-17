@@ -15,17 +15,40 @@ import (
 	"github.com/maxghenis/openmessage/internal/db"
 )
 
-func sendGroupMessageTool() mcp.Tool {
-	return mcp.NewTool("send_group_message",
-		mcp.WithDescription("Send a text message to a group conversation (MMS group). Creates the group if it doesn't exist."),
+var getOrCreateGoogleGroupConversationV2 = func(a *app.App, phones []string) (*gmproto.Conversation, error) {
+	cli := a.GetClient()
+	if cli == nil {
+		return nil, fmt.Errorf(app.ErrNotConnected)
+	}
+	response, err := cli.GM.GetOrCreateConversation(&gmproto.GetOrCreateConversationRequest{
+		Numbers: app.NewContactNumbers(phones),
+	})
+	if err != nil {
+		return nil, err
+	}
+	return response.GetConversation(), nil
+}
+
+func sendGroupMessageTool(v2Enabled ...bool) mcp.Tool {
+	description := "Send a text message to a group conversation (MMS group). Creates the group if it doesn't exist."
+	options := []mcp.ToolOption{
+		mcp.WithDescription(description),
 		mcp.WithString("phone_numbers", mcp.Required(), mcp.Description(`JSON array of phone numbers with country code, e.g. ["+15551234567", "+15559876543"]`)),
 		mcp.WithString("message", mcp.Required(), mcp.Description("Message text to send")),
+	}
+	if v2Requested(v2Enabled) {
+		options[0] = mcp.WithDescription(description + v2DeliveryDescription)
+		options = append(options, mcp.WithString("idempotency_key", mcp.Description(v2IdempotencyDescription)))
+	}
+	options = append(options,
 		mcp.WithDestructiveHintAnnotation(false),
 		mcp.WithIdempotentHintAnnotation(false),
 	)
+	return mcp.NewTool("send_group_message", options...)
 }
 
-func sendGroupMessageHandler(a *app.App) server.ToolHandlerFunc {
+func sendGroupMessageHandler(a *app.App, v2Options ...*V2Dependencies) server.ToolHandlerFunc {
+	v2 := activeV2(v2Options)
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		args := req.GetArguments()
 		phonesRaw := strArg(args, "phone_numbers")
@@ -44,6 +67,22 @@ func sendGroupMessageHandler(a *app.App) server.ToolHandlerFunc {
 		}
 		if len(phones) < 2 {
 			return errorResult("phone_numbers must contain at least 2 numbers for a group message"), nil
+		}
+		if v2 != nil {
+			conv, err := getOrCreateGoogleGroupConversationV2(a, phones)
+			if err != nil {
+				if !a.HandleGoogleAuthExpiredError(err) {
+					a.RecordGoogleSendError(err)
+				}
+				return errorResult(fmt.Sprintf("failed to get/create group conversation: %v", err)), nil
+			}
+			if conv == nil {
+				return errorResult("no conversation returned"), nil
+			}
+			if err := upsertGoogleConversation(a, conv); err != nil {
+				return errorResult(fmt.Sprintf("failed to persist conversation: %v", err)), nil
+			}
+			return submitV2Text(ctx, a, v2, args, conv.GetConversationID(), message), nil
 		}
 
 		cli := a.GetClient()
