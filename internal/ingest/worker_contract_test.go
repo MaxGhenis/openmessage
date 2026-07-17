@@ -3,6 +3,7 @@ package ingest
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -10,6 +11,32 @@ import (
 	"github.com/maxghenis/openmessage/internal/messaging"
 	"github.com/maxghenis/openmessage/internal/storage/sqlite"
 )
+
+func TestNewWorkerUsesOnlyConfiguredDecoders(t *testing.T) {
+	store, err := sqlite.Open(filepath.Join(t.TempDir(), "explicit-decoders.sqlite3"))
+	if err != nil {
+		t.Fatalf("sqlite.Open(): %v", err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Errorf("Store.Close(): %v", err)
+		}
+	})
+	messages, err := sqlite.NewMessageRepository(store, time.Now)
+	if err != nil {
+		t.Fatalf("NewMessageRepository(): %v", err)
+	}
+	worker, err := NewWorker(WorkerConfig{
+		Store:    store,
+		Messages: messages,
+	})
+	if err != nil {
+		t.Fatalf("NewWorker(): %v", err)
+	}
+	if got := len(worker.decoders); got != 0 {
+		t.Fatalf("NewWorker() registered %d implicit decoders, want none", got)
+	}
+}
 
 func TestWorkerOnlyFirstMessageRoutesEchoAndAdditionalMessagesImport(t *testing.T) {
 	recorder := &i01EchoRecorder{}

@@ -362,6 +362,9 @@ type Bridge struct {
 	configDir string
 	callbacks Callbacks
 
+	ingressObserver   func(account string, line []byte, resolvedSource string, resolvedDestination string)
+	ingressObserverID uint64
+
 	connected  bool
 	connecting bool
 	pairing    bool
@@ -553,6 +556,76 @@ type signalQuotedMessage struct {
 type signalTypingMessage struct {
 	Action    string           `json:"action"`
 	GroupInfo *signalGroupInfo `json:"groupInfo"`
+}
+
+// Envelope is the pure signal-cli receive envelope shared by the retained
+// legacy receiver and the v2 durable decoder. The alias deliberately keeps a
+// single JSON shape instead of maintaining a second field-by-field parser.
+type Envelope = signalEnvelope
+
+// DataMessage, SentMessage, Reaction, and Attachment expose the nested pure
+// envelope values needed by the v2 decoder without moving transport behavior
+// out of signallive.
+type DataMessage = signalDataMessage
+type SentMessage = signalSentMessage
+type Reaction = signalReaction
+type Attachment = signalAttachment
+
+// ObserveIngress installs the one pre-dispatch Signal receive observer. A
+// later registration supersedes an earlier one; the returned function only
+// removes the registration it created.
+func (b *Bridge) ObserveIngress(observer func(account string, line []byte, resolvedSource string, resolvedDestination string)) func() {
+	if b == nil {
+		return func() {}
+	}
+	b.mu.Lock()
+	b.ingressObserverID++
+	registrationID := b.ingressObserverID
+	b.ingressObserver = observer
+	b.mu.Unlock()
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			b.mu.Lock()
+			if b.ingressObserverID == registrationID {
+				b.ingressObserver = nil
+			}
+			b.mu.Unlock()
+		})
+	}
+}
+
+func (b *Bridge) observeIngress(account string, line []byte, resolvedSource string, resolvedDestination string) {
+	if b == nil {
+		return
+	}
+	b.mu.RLock()
+	observer := b.ingressObserver
+	b.mu.RUnlock()
+	if observer == nil {
+		return
+	}
+	line = bytes.Clone(line)
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			b.logger.Warn().
+				Interface("panic", recovered).
+				Bytes("stack", debug.Stack()).
+				Msg("Recovered from panic in Signal ingress observer")
+		}
+	}()
+	observer(account, line, resolvedSource, resolvedDestination)
+}
+
+// ReportIngressError lets the lifecycle adapter log an isolated durable-tee
+// failure through the bridge's configured logger without coupling signallive
+// to the generic bridge package.
+func (b *Bridge) ReportIngressError(err error) {
+	if b == nil || err == nil {
+		return
+	}
+	b.logger.Warn().Err(err).Msg("Signal durable ingress tee failed; legacy receive continued")
 }
 
 func New(configDir string, store *db.Store, logger zerolog.Logger, callbacks Callbacks) (*Bridge, error) {
@@ -1969,26 +2042,19 @@ func (b *Bridge) processReceiveLine(account string, rawLine []byte, allowRecover
 	if line[0] != '{' {
 		return true, nil
 	}
-	var payload signalReceivePayload
-	if err := json.Unmarshal(line, &payload); err != nil {
+	payloadAccount, env, err := ParseReceiveEnvelope(account, line)
+	if err != nil {
 		if allowRecovery {
 			b.recordReceiveRecoveryIssue(account, line, "unmarshal_failed", err)
 		}
 		return false, nil
 	}
-	env := payload.Envelope
-	payloadAccount := strings.TrimSpace(payload.Account)
-	if payload.Result != nil {
-		if payloadAccount == "" {
-			payloadAccount = strings.TrimSpace(payload.Result.Account)
-		}
-		if env.Timestamp == 0 && env.Source == "" && env.SourceNumber == "" && env.SourceUUID == "" && env.SourceServiceID == "" && env.DataMessage == nil && env.EditMessage == nil && env.SyncMessage == nil && env.TypingMessage == nil {
-			env = payload.Result.Envelope
-		}
+	resolvedSource := b.resolveContactAddressAtCapture(signalEnvelopeSource(&env))
+	resolvedDestination := ""
+	if env.SyncMessage != nil {
+		resolvedDestination = b.resolveContactAddressAtCapture(signalSentTarget(env.SyncMessage.SentMessage))
 	}
-	if payloadAccount == "" {
-		payloadAccount = account
-	}
+	b.observeIngress(payloadAccount, line, resolvedSource, resolvedDestination)
 	if reason := signalEnvelopeRecoveryReason(&env); reason != "" {
 		if allowRecovery {
 			b.recordReceiveRecoveryIssue(payloadAccount, line, reason, nil)
@@ -2023,6 +2089,30 @@ func (b *Bridge) processReceiveLine(account string, rawLine []byte, allowRecover
 		}
 	}
 	return true, nil
+}
+
+// ParseReceiveEnvelope decodes the exact receive payload shape used by
+// processReceiveLine, including signal-cli's result-envelope fallback. It is
+// pure so durable decoders can share the retained receiver's JSON contract.
+func ParseReceiveEnvelope(fallbackAccount string, line []byte) (string, Envelope, error) {
+	var payload signalReceivePayload
+	if err := json.Unmarshal(line, &payload); err != nil {
+		return "", Envelope{}, err
+	}
+	env := payload.Envelope
+	payloadAccount := strings.TrimSpace(payload.Account)
+	if payload.Result != nil {
+		if payloadAccount == "" {
+			payloadAccount = strings.TrimSpace(payload.Result.Account)
+		}
+		if env.Timestamp == 0 && env.Source == "" && env.SourceNumber == "" && env.SourceUUID == "" && env.SourceServiceID == "" && env.DataMessage == nil && env.EditMessage == nil && env.SyncMessage == nil && env.TypingMessage == nil {
+			env = payload.Result.Envelope
+		}
+	}
+	if payloadAccount == "" {
+		payloadAccount = fallbackAccount
+	}
+	return payloadAccount, env, nil
 }
 
 func (b *Bridge) recordReceiveRecoveryIssue(account string, rawLine []byte, reason string, err error) {
@@ -3079,6 +3169,24 @@ func (b *Bridge) resolveContactAddress(value string) string {
 	return value
 }
 
+// resolveContactAddressAtCapture resolves only from the already-loaded contact
+// cache. Unlike resolveContactAddress, it must not refresh contacts: capture is
+// on the durable tee boundary, where running signal-cli or mutating legacy
+// state would make observation change receive behavior.
+func (b *Bridge) resolveContactAddressAtCapture(value string) string {
+	value = normalizeSignalAddress(value)
+	if value == "" {
+		return ""
+	}
+	if strings.HasPrefix(value, "+") {
+		return value
+	}
+	b.mu.RLock()
+	resolved := normalizeSignalAddress(b.contactByACI[value])
+	b.mu.RUnlock()
+	return resolved
+}
+
 func (b *Bridge) refreshContacts() {
 	if b == nil {
 		return
@@ -3361,6 +3469,12 @@ func signalConversationID(address, groupID string) string {
 	return "signal:" + normalizeSignalAddress(address)
 }
 
+// SignalConversationID exposes the retained conversation-id mapping as a pure
+// helper for the durable decoder.
+func SignalConversationID(address, groupID string) string {
+	return signalConversationID(address, groupID)
+}
+
 func normalizeSignalAddress(value string) string {
 	return strings.TrimSpace(value)
 }
@@ -3538,6 +3652,12 @@ func signalReactionTargetAuthor(reaction *signalReaction, account string) string
 	)
 }
 
+// ReactionTargetAuthor applies the retained nested/legacy reaction target
+// precedence without duplicating it in the durable decoder.
+func ReactionTargetAuthor(reaction *Reaction, account string) string {
+	return signalReactionTargetAuthor(reaction, account)
+}
+
 func signalReactionTargetTimestamp(reaction *signalReaction) int64 {
 	if reaction == nil {
 		return 0
@@ -3546,6 +3666,11 @@ func signalReactionTargetTimestamp(reaction *signalReaction) int64 {
 		return reaction.TargetSentTimestamp
 	}
 	return reaction.Target.Timestamp
+}
+
+// ReactionTargetTimestamp applies the retained reaction timestamp fallback.
+func ReactionTargetTimestamp(reaction *Reaction) int64 {
+	return signalReactionTargetTimestamp(reaction)
 }
 
 func signalEnvelopeSource(env *signalEnvelope) string {
@@ -3560,6 +3685,11 @@ func signalEnvelopeSource(env *signalEnvelope) string {
 	)
 }
 
+// EnvelopeSource applies the retained E.164/service-id source precedence.
+func EnvelopeSource(env *Envelope) string {
+	return signalEnvelopeSource(env)
+}
+
 func signalSentTarget(sent *signalSentMessage) string {
 	if sent == nil {
 		return ""
@@ -3571,6 +3701,11 @@ func signalSentTarget(sent *signalSentMessage) string {
 		strings.TrimSpace(sent.DestinationServiceID),
 		strings.TrimSpace(sent.Destination),
 	)
+}
+
+// SentTarget applies the retained destination precedence for sync transcripts.
+func SentTarget(sent *SentMessage) string {
+	return signalSentTarget(sent)
 }
 
 func signalEditGroupInfo(edit *signalEditMessage) *signalGroupInfo {
@@ -3668,6 +3803,11 @@ func (m *signalDataMessage) displayBody() string {
 	})
 }
 
+// DisplayBody applies the retained visible-body/placeholder semantics.
+func (m *signalDataMessage) DisplayBody() string {
+	return m.displayBody()
+}
+
 func (m *signalSentMessage) displayBody() string {
 	if m == nil {
 		return signalUnsupportedMessagePlaceholder
@@ -3693,6 +3833,11 @@ func (m *signalSentMessage) displayBody() string {
 		HasAdminDelete:     signalRawMessagePresent(m.AdminDelete),
 		HasGroupUpdate:     signalIsGroupUpdate(m.GroupInfo),
 	})
+}
+
+// DisplayBody applies the retained sent-message body/placeholder semantics.
+func (m *signalSentMessage) DisplayBody() string {
+	return m.displayBody()
 }
 
 func signalUnsupportedContentPlaceholder(attachments []signalAttachment, flags signalUnsupportedContentFlags) string {
@@ -4181,6 +4326,12 @@ func addressesMatch(a, b string) bool {
 	a = normalizeSignalAddress(a)
 	b = normalizeSignalAddress(b)
 	return a != "" && b != "" && strings.EqualFold(a, b)
+}
+
+// AddressesMatch exposes the retained Signal address comparison to the pure
+// durable decoder.
+func AddressesMatch(a, b string) bool {
+	return addressesMatch(a, b)
 }
 
 func firstNonEmpty(values ...string) string {

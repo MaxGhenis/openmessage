@@ -13,14 +13,17 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
 	"github.com/maxghenis/openmessage/internal/bridge"
+	"github.com/maxghenis/openmessage/internal/ingest"
 	"github.com/maxghenis/openmessage/internal/signallive"
 )
 
 type poller interface {
+	ObserveIngress(func(account string, line []byte, resolvedSource string, resolvedDestination string)) func()
 	StartPoller(context.Context) (signallive.PollerRun, error)
 	SendTextRequest(string, string, string) (int64, error)
 	SendReactionRequest(string, string, string, string, string) error
@@ -55,8 +58,9 @@ type decodedSignalDownloadRef struct {
 // Adapter owns Signal connection generations while retaining signallive's
 // existing signal-cli receive loop and all legacy operation paths.
 type Adapter struct {
-	accountID string
-	poller    poller
+	accountID       string
+	poller          poller
+	ingressFailures atomic.Uint64
 
 	mu       sync.Mutex
 	current  *run
@@ -487,14 +491,56 @@ func (a *Adapter) Start(
 	a.starting = true
 	a.mu.Unlock()
 	installed := false
+	var unregisterIngress func()
 	defer func() {
 		if installed {
 			return
+		}
+		if unregisterIngress != nil {
+			unregisterIngress()
 		}
 		a.mu.Lock()
 		a.starting = false
 		a.mu.Unlock()
 	}()
+
+	unregisterIngress = a.poller.ObserveIngress(func(
+		account string,
+		line []byte,
+		resolvedSource string,
+		resolvedDestination string,
+	) {
+		if sink == nil {
+			return
+		}
+		record, ephemeral, err := ingest.BuildSignalIngress(
+			req.AccountID,
+			req.Generation,
+			account,
+			line,
+			resolvedSource,
+			resolvedDestination,
+			time.Now(),
+		)
+		if err != nil {
+			a.recordIngressFailure(err)
+			return
+		}
+		if ephemeral != nil {
+			if err := sink.EmitEphemeral(context.Background(), *ephemeral); err != nil {
+				a.recordIngressFailure(err)
+			}
+			return
+		}
+		if record != nil {
+			if err := sink.AppendIngress(context.Background(), *record); err != nil {
+				a.recordIngressFailure(err)
+			}
+		}
+	})
+	if unregisterIngress == nil {
+		unregisterIngress = func() {}
+	}
 
 	pollerRun, err := a.poller.StartPoller(ctx)
 	if err != nil {
@@ -514,6 +560,7 @@ func (a *Adapter) Start(
 		request:      req,
 		sink:         sink,
 		poller:       pollerRun,
+		unregister:   unregisterIngress,
 		ready:        pollerRun.Ready(),
 		done:         make(chan error, 1),
 		stopped:      make(chan struct{}),
@@ -529,6 +576,16 @@ func (a *Adapter) Start(
 
 	go r.coordinate(ctx)
 	return r, nil
+}
+
+func (a *Adapter) recordIngressFailure(err error) {
+	if a == nil || err == nil || errors.Is(err, bridge.ErrStaleGeneration) {
+		return
+	}
+	a.ingressFailures.Add(1)
+	if reporter, ok := a.poller.(interface{ ReportIngressError(error) }); ok {
+		reporter.ReportIngressError(err)
+	}
 }
 
 // ReportError lets unchanged App-level signal-cli send paths surface a local
@@ -671,14 +728,15 @@ func classifyPollerExit(exit signallive.PollerExit) error {
 }
 
 type run struct {
-	adapter *Adapter
-	request bridge.StartRequest
-	sink    bridge.ConnectionSink
-	poller  signallive.PollerRun
-	ready   <-chan struct{}
-	done    chan error
-	stopped chan struct{}
-	finish  chan struct{}
+	adapter    *Adapter
+	request    bridge.StartRequest
+	sink       bridge.ConnectionSink
+	poller     signallive.PollerRun
+	unregister func()
+	ready      <-chan struct{}
+	done       chan error
+	stopped    chan struct{}
+	finish     chan struct{}
 
 	finishOnce sync.Once
 	terminalMu sync.Mutex
@@ -772,6 +830,9 @@ func (r *run) coordinate(ctx context.Context) {
 	}
 
 	r.closeAdmission()
+	if r.unregister != nil {
+		r.unregister()
+	}
 	// Poller.Done reports the retained receive/link loop's exit. Stop is its
 	// token-bound join; host-scoped metadata remains joined by Bridge.Close.
 	_ = r.poller.Stop(context.Background())
