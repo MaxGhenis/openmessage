@@ -112,6 +112,37 @@ type PendingRow struct {
 	Emoji     *string
 }
 
+// CarryableIntent is the complete, self-contained payload needed to recreate
+// one provably-unsent outgoing message in a freshly migrated store. The
+// account-scoped remote conversation ID is the cross-store natural key; the
+// old conversation primary key is retained only for operator-facing reports.
+// MessagePresent distinguishes a missing optimistic row from a legitimate
+// empty body, while empty blob fields identify a missing media carrier.
+type CarryableIntent struct {
+	OutboxItem
+	RemoteConversationID string
+	Body                 string
+	ReplyToRemoteID      *string
+	MessageOccurredAtMS  int64
+	MessagePresent       bool
+	BlobHash             string
+	BlobSizeBytes        int64
+	MIME                 string
+	Filename             string
+}
+
+// CarryReviewIntent identifies a maybe-sent row that cutover must report and
+// must never enqueue automatically.
+type CarryReviewIntent struct {
+	OutboxID             string
+	AccountID            string
+	ConversationID       string
+	RemoteConversationID string
+	Kind                 OutboxKind
+	State                OutboxState
+	IdempotencyKey       string
+}
+
 // OutboxAttachment is the persisted blob metadata for one media outbox intent.
 // M2 stores exactly one attachment at ordinal zero. Enqueue stamps OutboxID,
 // Ordinal, and CreatedAtMS; GetOutboxAttachment populates every field.
@@ -938,6 +969,86 @@ func (r *OutboxRepository) EarliestDue(ctx context.Context) (time.Time, bool, er
 		return time.Time{}, false, nil
 	}
 	return time.UnixMilli(earliestMS.Int64), true, nil
+}
+
+// ListCarryable returns every provably-unsent outgoing intent with the full
+// message/media payload required to enqueue it in another store. It is
+// intentionally unbounded: cutover is an offline, all-or-reported operation,
+// so silently truncating the carry set would lose durable work.
+func (r *OutboxRepository) ListCarryable(ctx context.Context) ([]CarryableIntent, error) {
+	rows, err := r.store.db.QueryContext(ctx, `
+		SELECT `+prefixedOutboxColumns("o")+`,
+			c.remote_conversation_id,
+			m.message_id,
+			m.body,
+			m.reply_to_remote_id,
+			m.occurred_at_ms,
+			oa.blob_hash,
+			oa.size_bytes,
+			oa.mime,
+			oa.filename
+		FROM outbox o
+		LEFT JOIN conversations c
+			ON c.account_id = o.account_id AND c.conversation_id = o.conversation_id
+		LEFT JOIN messages m
+			ON m.message_id = o.local_message_id
+			AND m.account_id = o.account_id
+			AND m.conversation_id = o.conversation_id
+		LEFT JOIN outbox_attachments oa
+			ON oa.outbox_id = o.outbox_id AND oa.ordinal = 0
+		WHERE o.state IN ('queued', 'not_dispatched')
+		ORDER BY o.created_at_ms, o.outbox_id
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("list carryable outbox items: query: %w", err)
+	}
+	items, err := collectRows(rows, scanCarryableIntent)
+	if err != nil {
+		return nil, fmt.Errorf("list carryable outbox items: scan: %w", err)
+	}
+	return items, nil
+}
+
+// ListCarryReview returns the nonterminal states whose transport outcome may
+// be known or unknown but is never provably unsent. This separate enumerator
+// keeps ListCarryable's safety contract exact while giving cutover complete
+// operator-facing evidence for uncertain, in-flight, and store-failed rows.
+func (r *OutboxRepository) ListCarryReview(ctx context.Context) ([]CarryReviewIntent, error) {
+	rows, err := r.store.db.QueryContext(ctx, `
+		SELECT
+			o.outbox_id,
+			o.account_id,
+			o.conversation_id,
+			COALESCE(c.remote_conversation_id, ''),
+			o.kind,
+			o.state,
+			o.idempotency_key
+		FROM outbox o
+		LEFT JOIN conversations c
+			ON c.account_id = o.account_id AND c.conversation_id = o.conversation_id
+		WHERE o.state IN ('uncertain', 'dispatching', 'store_failed')
+		ORDER BY o.created_at_ms, o.outbox_id
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("list carry-review outbox items: query: %w", err)
+	}
+	items, err := collectRows(rows, func(row rowScanner) (CarryReviewIntent, error) {
+		var item CarryReviewIntent
+		err := row.Scan(
+			&item.OutboxID,
+			&item.AccountID,
+			&item.ConversationID,
+			&item.RemoteConversationID,
+			&item.Kind,
+			&item.State,
+			&item.IdempotencyKey,
+		)
+		return item, err
+	})
+	if err != nil {
+		return nil, fmt.Errorf("list carry-review outbox items: scan: %w", err)
+	}
+	return items, nil
 }
 
 // ListPending returns exactly the cancelable outbox set, ordered by the same
@@ -1995,6 +2106,71 @@ func scanPendingRow(row rowScanner) (PendingRow, error) {
 		&pending.Emoji,
 	)
 	return pending, err
+}
+
+func scanCarryableIntent(row rowScanner) (CarryableIntent, error) {
+	var (
+		intent               CarryableIntent
+		remoteConversationID sql.NullString
+		messageID            sql.NullString
+		body                 sql.NullString
+		replyToRemoteID      sql.NullString
+		messageOccurredAtMS  sql.NullInt64
+		blobHash             sql.NullString
+		blobSizeBytes        sql.NullInt64
+		mime                 sql.NullString
+		filename             sql.NullString
+	)
+	err := row.Scan(
+		&intent.OutboxID,
+		&intent.AccountID,
+		&intent.ConversationID,
+		&intent.Kind,
+		&intent.IdempotencyKey,
+		&intent.PayloadHash,
+		&intent.Operation,
+		&intent.State,
+		&intent.LocalMessageID,
+		&intent.TransportRequestID,
+		&intent.SendAgainOfOutboxID,
+		&intent.ResultRemoteID,
+		&intent.ErrorClass,
+		&intent.ErrorCode,
+		&intent.ErrorDetail,
+		&intent.AttemptCount,
+		&intent.LeaseOwner,
+		&intent.LeaseToken,
+		&intent.LeaseExpiresAtMS,
+		&intent.TransportCalledAtMS,
+		&intent.ScheduledForMS,
+		&intent.NextAttemptAtMS,
+		&intent.CreatedAtMS,
+		&intent.UpdatedAtMS,
+		&remoteConversationID,
+		&messageID,
+		&body,
+		&replyToRemoteID,
+		&messageOccurredAtMS,
+		&blobHash,
+		&blobSizeBytes,
+		&mime,
+		&filename,
+	)
+	if err != nil {
+		return CarryableIntent{}, err
+	}
+	intent.RemoteConversationID = remoteConversationID.String
+	intent.MessagePresent = messageID.Valid
+	intent.Body = body.String
+	if replyToRemoteID.Valid {
+		intent.ReplyToRemoteID = &replyToRemoteID.String
+	}
+	intent.MessageOccurredAtMS = messageOccurredAtMS.Int64
+	intent.BlobHash = blobHash.String
+	intent.BlobSizeBytes = blobSizeBytes.Int64
+	intent.MIME = mime.String
+	intent.Filename = filename.String
+	return intent, nil
 }
 
 func scanOutboxItem(row rowScanner) (OutboxItem, error) {
