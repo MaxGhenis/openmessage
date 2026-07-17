@@ -337,6 +337,14 @@ func (a *Adapter) DownloadMedia(
 	}, nil
 }
 
+// ValidateDownloadOpaque reports whether raw is a well-formed v1 download Opaque this
+// adapter can decode. It is the exported round-trip check the Wave-4
+// migration uses to prove the refs it packs will unpack here.
+func ValidateDownloadOpaque(raw []byte) error {
+	_, err := decodeSignalDownloadOpaque(raw)
+	return err
+}
+
 func decodeSignalDownloadOpaque(raw []byte) (decodedSignalDownloadRef, error) {
 	if !utf8.Valid(raw) {
 		return decodedSignalDownloadRef{}, signalDownloadOpaqueError(

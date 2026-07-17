@@ -157,6 +157,169 @@ func TestAppendInboxMapsSQLiteConstraints(t *testing.T) {
 	assertRowCount(t, store.db, "inbox", 0)
 }
 
+func TestImportMessageSupportsBothDirectionsWithoutInbox(t *testing.T) {
+	store, repository := openMessageTestRepository(
+		t,
+		func() time.Time { return time.UnixMilli(messageTestTimeMS) },
+	)
+	seedMessageProjectionGraph(t, store)
+
+	incoming := messageTestMessage(
+		"message-import-incoming",
+		"conversation-a",
+		"account-a",
+		"remote-import-incoming",
+		pointer("identity-a"),
+	)
+	if err := repository.ImportMessage(context.Background(), MessageProjection{
+		InboxID: "inbox-that-does-not-exist",
+		Message: incoming,
+	}); err != nil {
+		t.Fatalf("ImportMessage(incoming): %v", err)
+	}
+
+	outgoing := messageTestMessage(
+		"message-import-outgoing",
+		"conversation-a",
+		"account-a",
+		"remote-import-outgoing",
+		nil,
+	)
+	outgoing.Direction = MessageDirectionOutgoing
+	outgoing.Body = "historical outgoing message"
+	if err := repository.ImportMessage(context.Background(), MessageProjection{
+		Message: outgoing,
+	}); err != nil {
+		t.Fatalf("ImportMessage(outgoing): %v", err)
+	}
+
+	assertRowCount(t, store.db, "inbox", 0)
+	assertRowCount(t, store.db, "messages", 2)
+	for _, want := range []Message{incoming, outgoing} {
+		got, err := repository.GetMessage(context.Background(), want.MessageID)
+		if err != nil {
+			t.Fatalf("GetMessage(%q): %v", want.MessageID, err)
+		}
+		if got.Direction != want.Direction ||
+			got.Body != want.Body ||
+			!optionalStringEqual(got.SenderIdentityID, want.SenderIdentityID) ||
+			got.CreatedAtMS != messageTestTimeMS ||
+			got.UpdatedAtMS != messageTestTimeMS {
+			t.Fatalf("imported message = %+v, want normalized fields from %+v", got, want)
+		}
+	}
+}
+
+func TestImportMessageIsIdempotentByRemoteIDAndPersistsAttachments(t *testing.T) {
+	clock := newMessageTestClock(messageTestTimeMS)
+	store, repository := openMessageTestRepository(t, clock.Now)
+	seedMessageProjectionGraph(t, store)
+
+	message := messageTestMessage(
+		"message-import-original",
+		"conversation-a",
+		"account-a",
+		"remote-import-shared",
+		pointer("identity-a"),
+	)
+	firstSize := int64(123)
+	firstAttachment := MessageAttachment{
+		MessageID: "caller-supplied-parent-is-ignored",
+		Ordinal:   0,
+		RemoteID:  "remote-media-first",
+		RemoteRef: []byte("opaque-first"),
+		Filename:  "first.png",
+		MIME:      "image/png",
+		SizeBytes: &firstSize,
+	}
+	if err := repository.ImportMessage(context.Background(), MessageProjection{
+		Message:     message,
+		Attachments: []MessageAttachment{firstAttachment},
+	}); err != nil {
+		t.Fatalf("ImportMessage(first): %v", err)
+	}
+
+	clock.Set(messageTestTimeMS + 100)
+	updated := message
+	updated.MessageID = "message-import-discarded"
+	updated.Body = "edited historical body"
+	updated.ReplyToRemoteID = pointer("remote-parent")
+	updated.State = MessageStateEdited
+	updated.OccurredAtMS++
+	secondSize := int64(456)
+	secondAttachment := MessageAttachment{
+		MessageID: "another-untrusted-parent",
+		Ordinal:   0,
+		RemoteID:  "remote-media-second",
+		RemoteRef: []byte("opaque-second"),
+		Filename:  "second.jpg",
+		MIME:      "image/jpeg",
+		SizeBytes: &secondSize,
+	}
+	if err := repository.ImportMessage(context.Background(), MessageProjection{
+		InboxID:     "still-not-required",
+		Message:     updated,
+		Attachments: []MessageAttachment{secondAttachment},
+	}); err != nil {
+		t.Fatalf("ImportMessage(upsert): %v", err)
+	}
+
+	assertRowCount(t, store.db, "messages", 1)
+	assertRowCount(t, store.db, "message_attachments", 1)
+	got, err := repository.GetMessage(context.Background(), message.MessageID)
+	if err != nil {
+		t.Fatalf("GetMessage(): %v", err)
+	}
+	if got.MessageID != message.MessageID ||
+		got.Body != updated.Body ||
+		got.State != MessageStateEdited ||
+		got.ReplyToRemoteID == nil ||
+		*got.ReplyToRemoteID != *updated.ReplyToRemoteID ||
+		got.CreatedAtMS != messageTestTimeMS ||
+		got.UpdatedAtMS != messageTestTimeMS+100 {
+		t.Fatalf("upserted imported message = %+v, want stable ID/creation and updated content", got)
+	}
+
+	attachmentRepository, err := NewMessageAttachmentRepository(store, clock.Now)
+	if err != nil {
+		t.Fatalf("NewMessageAttachmentRepository(): %v", err)
+	}
+	attachment, err := attachmentRepository.GetForDownload(
+		context.Background(), message.MessageID, secondAttachment.Ordinal,
+	)
+	if err != nil {
+		t.Fatalf("GetForDownload(): %v", err)
+	}
+	if attachment.MessageID != message.MessageID ||
+		attachment.State != "pending" ||
+		attachment.BlobHash != nil ||
+		attachment.RemoteID != secondAttachment.RemoteID ||
+		!bytes.Equal(attachment.RemoteRef, secondAttachment.RemoteRef) ||
+		attachment.Filename != secondAttachment.Filename ||
+		attachment.MIME != secondAttachment.MIME ||
+		attachment.SizeBytes == nil ||
+		*attachment.SizeBytes != secondSize {
+		t.Fatalf("imported attachment = %+v, want refreshed metadata %+v", attachment, secondAttachment)
+	}
+
+	clock.Set(messageTestTimeMS + 200)
+	if err := repository.ImportMessage(context.Background(), MessageProjection{Message: updated}); err != nil {
+		t.Fatalf("ImportMessage(idempotent replay): %v", err)
+	}
+	replayed, err := repository.GetMessage(context.Background(), message.MessageID)
+	if err != nil {
+		t.Fatalf("GetMessage() after replay: %v", err)
+	}
+	if replayed.UpdatedAtMS != messageTestTimeMS+100 {
+		t.Fatalf(
+			"idempotent replay updated_at_ms = %d, want unchanged %d",
+			replayed.UpdatedAtMS,
+			messageTestTimeMS+100,
+		)
+	}
+	assertRowCount(t, store.db, "inbox", 0)
+}
+
 func TestProjectMessageIsIdempotentByRemoteID(t *testing.T) {
 	clock := newMessageTestClock(messageTestTimeMS)
 	store, repository := openMessageTestRepository(t, clock.Now)

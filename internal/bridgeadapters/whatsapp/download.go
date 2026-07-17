@@ -38,6 +38,14 @@ func marshalWhatsAppMediaOpaqueV1(payload whatsappMediaOpaqueV1) ([]byte, error)
 	return json.Marshal(payload)
 }
 
+// ValidateDownloadOpaque reports whether raw is a well-formed v1 download Opaque this
+// adapter can decode. It is the exported round-trip check the Wave-4
+// migration uses to prove the refs it packs will unpack here.
+func ValidateDownloadOpaque(raw []byte) error {
+	_, err := unmarshalWhatsAppMediaOpaque(raw)
+	return err
+}
+
 func unmarshalWhatsAppMediaOpaque(raw []byte) (whatsappMediaOpaqueV1, error) {
 	var payload whatsappMediaOpaqueV1
 	if !utf8.Valid(raw) {
