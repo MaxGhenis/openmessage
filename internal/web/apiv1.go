@@ -36,9 +36,10 @@ type V2Options struct {
 }
 
 type v1API struct {
-	legacy *db.Store
-	logger zerolog.Logger
-	v2     *V2Options
+	legacy  *db.Store
+	logger  zerolog.Logger
+	v2      *V2Options
+	primary bool
 }
 
 type v1SubmissionResponse struct {
@@ -74,8 +75,8 @@ type v1PendingResponse struct {
 	ErrorCode      string                `json:"error_code,omitempty"`
 }
 
-func registerV1Routes(mux *http.ServeMux, legacy *db.Store, logger zerolog.Logger, v2 *V2Options) {
-	api := &v1API{legacy: legacy, logger: logger, v2: v2}
+func registerV1Routes(mux *http.ServeMux, legacy *db.Store, logger zerolog.Logger, v2 *V2Options, primary bool) {
+	api := &v1API{legacy: legacy, logger: logger, v2: v2, primary: primary}
 
 	mux.HandleFunc("POST /api/v1/outbox/messages", api.submitText)
 	mux.HandleFunc("POST /api/v1/outbox/media", api.submitMedia)
@@ -143,13 +144,19 @@ func (a *v1API) submitText(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	submission, err := v2wire.SubmitText(r.Context(), a.v2Deps(), v2wire.TextInput{
+	input := v2wire.TextInput{
 		ConversationID: conversationID,
 		Body:           request.Body,
 		ReplyToID:      strings.TrimSpace(request.ReplyToID),
 		IdempotencyKey: idempotencyKey,
 		NotBefore:      notBefore,
-	})
+	}
+	var submission messaging.Submission
+	if a.primary {
+		submission, err = v2wire.SubmitTextV2(r.Context(), a.nativeDeps(), input)
+	} else {
+		submission, err = v2wire.SubmitText(r.Context(), a.v2Deps(), input)
+	}
 	if err != nil {
 		a.writeError(w, err)
 		return
@@ -198,7 +205,7 @@ func (a *v1API) submitMedia(w http.ResponseWriter, r *http.Request) {
 		mimeType = "application/octet-stream"
 	}
 
-	submission, err := v2wire.SubmitMedia(r.Context(), a.v2Deps(), v2wire.MediaInput{
+	input := v2wire.MediaInput{
 		ConversationID: conversationID,
 		Content:        file,
 		Filename:       header.Filename,
@@ -207,7 +214,13 @@ func (a *v1API) submitMedia(w http.ResponseWriter, r *http.Request) {
 		ReplyToID:      strings.TrimSpace(r.FormValue("reply_to_id")),
 		IdempotencyKey: idempotencyKey,
 		NotBefore:      notBefore,
-	})
+	}
+	var submission messaging.Submission
+	if a.primary {
+		submission, err = v2wire.SubmitMediaV2(r.Context(), a.nativeDeps(), input)
+	} else {
+		submission, err = v2wire.SubmitMedia(r.Context(), a.v2Deps(), input)
+	}
 	if err != nil {
 		a.writeError(w, err)
 		return
@@ -393,8 +406,17 @@ func (a *v1API) v2Deps() v2wire.Deps {
 	}
 }
 
+func (a *v1API) nativeDeps() v2wire.NativeDeps {
+	return v2wire.NativeDeps{
+		V2:       a.v2.V2Store,
+		Service:  a.v2.Service,
+		Registry: a.v2.Registry,
+	}
+}
+
 func (a *v1API) submitDependenciesAvailable(w http.ResponseWriter) bool {
-	if a.legacy != nil && a.v2.Service != nil && a.v2.V2Store != nil && a.v2.Registry != nil {
+	legacyAvailable := a.primary || a.legacy != nil
+	if legacyAvailable && a.v2.Service != nil && a.v2.V2Store != nil && a.v2.Registry != nil {
 		return true
 	}
 	a.internalUnavailable(w, "v2 submission dependencies are not configured")

@@ -21,7 +21,8 @@ func getConversationTool() mcp.Tool {
 	)
 }
 
-func getConversationHandler(a *app.App) server.ToolHandlerFunc {
+func getConversationHandler(a *app.App, configured ...Options) server.ToolHandlerFunc {
+	options := resolvedOptions(a, configured)
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		args := req.GetArguments()
 		convID := strArg(args, "conversation_id")
@@ -30,12 +31,14 @@ func getConversationHandler(a *app.App) server.ToolHandlerFunc {
 		}
 		limit := intArg(args, "limit", 50)
 
-		msgs, err := a.Store.GetMessagesByConversation(convID, limit)
+		// In v2-primary the conversation list emits v2 ids, so this "read a
+		// thread" tool must resolve against the same store the ids came from.
+		msgs, err := options.Reads.GetMessagesByConversation(convID, limit)
 		if err != nil {
 			return errorResult(fmt.Sprintf("query failed: %v", err)), nil
 		}
 
-		conv, convErr := a.Store.GetConversation(convID)
+		conv, convErr := options.Reads.GetConversation(convID)
 
 		if len(msgs) == 0 {
 			return structuredResult(map[string]any{

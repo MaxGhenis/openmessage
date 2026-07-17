@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"fmt"
+	"math"
 	"strings"
 	"time"
 
@@ -23,7 +24,8 @@ func listConversationsTool() mcp.Tool {
 	)
 }
 
-func listConversationsHandler(a *app.App) server.ToolHandlerFunc {
+func listConversationsHandler(a *app.App, configured ...Options) server.ToolHandlerFunc {
+	options := resolvedOptions(a, configured)
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		args := req.GetArguments()
 		limit := intArg(args, "limit", 20)
@@ -31,10 +33,30 @@ func listConversationsHandler(a *app.App) server.ToolHandlerFunc {
 
 		var convs []*db.Conversation
 		var err error
-		if platform != "" {
+		if !options.V2Primary && platform != "" {
 			convs, err = a.Store.ListConversationsByPlatform(platform, limit)
-		} else {
+		} else if !options.V2Primary {
 			convs, err = a.Store.ListConversations(limit)
+		} else if platform == "" {
+			convs, err = options.Reads.ListConversations(limit)
+		} else if limit <= 0 {
+			convs = []*db.Conversation{}
+		} else {
+			// ReadSource intentionally mirrors only the canonical legacy methods;
+			// filter the v2 cross-account recency result here rather than widening
+			// the cutover seam with a platform-specific convenience query.
+			var candidates []*db.Conversation
+			candidates, err = options.Reads.ListConversations(math.MaxInt)
+			if err == nil {
+				for _, conversation := range candidates {
+					if conversation != nil && normalizedPlatform(conversation.SourcePlatform) == normalizedPlatform(platform) {
+						convs = append(convs, conversation)
+						if len(convs) >= limit {
+							break
+						}
+					}
+				}
+			}
 		}
 		if err != nil {
 			return errorResult(fmt.Sprintf("query failed: %v", err)), nil

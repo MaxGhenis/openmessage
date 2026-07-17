@@ -411,6 +411,63 @@ func TestListConversationsByRecencyScopesOrdersAndBreaksTies(t *testing.T) {
 	assertRepositoryEqual(t, "recency ordered conversations", got, want)
 }
 
+func TestListConversationsByRecencyAllAccountsMergesOrdersAndLimits(t *testing.T) {
+	store := openRepositoryTestStore(t)
+	accountA := repositoryTestAccount("account-a")
+	accountA.BridgeKey = "google_messages"
+	accountB := repositoryTestAccount("account-b")
+	accountB.BridgeKey = "whatsmeow"
+	mustRepositoryWrite(t, "UpsertAccount A", store.UpsertAccount(accountA))
+	mustRepositoryWrite(t, "UpsertAccount B", store.UpsertAccount(accountB))
+
+	conversation := func(id, accountID string, recency int64) Conversation {
+		return Conversation{
+			ConversationID:       id,
+			AccountID:            accountID,
+			RemoteConversationID: "remote-" + id,
+			Kind:                 ConversationKindDirect,
+			Title:                id,
+			NotificationMode:     NotificationModeAll,
+			LastMessageAtMS:      recency,
+			MetadataJSON:         `{}`,
+			CreatedAtMS:          repositoryTestTimeMS,
+			UpdatedAtMS:          repositoryTestTimeMS,
+		}
+	}
+	for _, item := range []Conversation{
+		conversation("conversation-old-a", accountA.AccountID, 100),
+		conversation("conversation-new-b", accountB.AccountID, 400),
+		conversation("conversation-tie-b", accountB.AccountID, 300),
+		conversation("conversation-tie-a", accountA.AccountID, 300),
+		conversation("conversation-middle-a", accountA.AccountID, 200),
+	} {
+		mustRepositoryWrite(t, "UpsertConversation", store.UpsertConversation(item))
+	}
+
+	got, err := store.ListConversationsByRecencyAllAccounts(4)
+	mustRepositoryRead(t, "ListConversationsByRecencyAllAccounts", err)
+	wantIDs := []string{
+		"conversation-new-b",
+		"conversation-tie-a",
+		"conversation-tie-b",
+		"conversation-middle-a",
+	}
+	if len(got) != len(wantIDs) {
+		t.Fatalf("cross-account conversations = %d, want %d: %+v", len(got), len(wantIDs), got)
+	}
+	for i, wantID := range wantIDs {
+		if got[i].ConversationID != wantID {
+			t.Fatalf("cross-account conversation %d = %q, want %q", i, got[i].ConversationID, wantID)
+		}
+	}
+
+	empty, err := store.ListConversationsByRecencyAllAccounts(0)
+	mustRepositoryRead(t, "ListConversationsByRecencyAllAccounts zero limit", err)
+	if len(empty) != 0 {
+		t.Fatalf("zero-limit cross-account conversations = %+v, want empty", empty)
+	}
+}
+
 func TestReplaceConversationParticipantsRejectsInvalidBatchesAtomically(t *testing.T) {
 	store := openRepositoryTestStore(t)
 	accountA := repositoryTestAccount("account-a")

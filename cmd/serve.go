@@ -30,8 +30,10 @@ import (
 	"github.com/maxghenis/openmessage/internal/importer"
 	"github.com/maxghenis/openmessage/internal/ingest"
 	"github.com/maxghenis/openmessage/internal/notify"
+	"github.com/maxghenis/openmessage/internal/readsource"
 	"github.com/maxghenis/openmessage/internal/telemetry"
 	"github.com/maxghenis/openmessage/internal/tools"
+	"github.com/maxghenis/openmessage/internal/v2read"
 	"github.com/maxghenis/openmessage/internal/web"
 	"github.com/maxghenis/openmessage/internal/whatsapplive"
 )
@@ -105,6 +107,15 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 	restoreEnv := configureServeEnv(opts)
 	defer restoreEnv()
 
+	isDemo := app.DemoMode()
+	v2Mode, err := resolveV2RuntimeMode(isDemo, app.DefaultDataDir())
+	if err != nil {
+		return err
+	}
+	v2Primary := v2Mode.Primary
+	v2Send := v2Mode.Send
+	v2Ingest := v2Mode.Ingest
+
 	a, err := app.New(logger)
 	if err != nil {
 		return fmt.Errorf("init app: %w", err)
@@ -122,9 +133,6 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 	}
 	listenAddr := net.JoinHostPort(host, port)
 	baseURL := "http://" + net.JoinHostPort(publicHost(host), port)
-	isDemo := app.DemoMode()
-	v2Send := v2SendEnabled()
-	v2Ingest := v2IngestEnabled()
 
 	events := web.NewEventBroker()
 	isConnected := func() bool {
@@ -173,7 +181,7 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 		if v2Send || v2Ingest {
 			stack, err = newV2Stack(v2StackDeps{
 				Logger:  logger,
-				DataDir: app.DefaultDataDir(),
+				DataDir: a.DataDir,
 				Google:  googleLifecycle,
 			})
 			if err != nil {
@@ -390,8 +398,9 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 	}
 
 	if stack != nil {
-		stopV2Stack = stack.Start(context.Background(), a.Store, events)
+		stopV2Stack = stack.Start(context.Background(), a.Store, events, v2Primary)
 		logger.Info().
+			Bool("primary", v2Primary).
 			Bool("send", v2Send).
 			Bool("ingest", v2Ingest).
 			Msg("V2 stack enabled")
@@ -520,6 +529,14 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 		}
 	}()
 
+	var reads readsource.ReadSource = a.Store
+	if v2Primary {
+		if stack == nil {
+			return errors.New("v2-primary selected but the v2 stack is unavailable")
+		}
+		reads = v2read.New(stack.Store)
+	}
+
 	// Create MCP server
 	mcpSrv := mcpserver.NewMCPServer(
 		"openmessage",
@@ -530,7 +547,15 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 	if !v2Send {
 		v2SendStack = nil
 	}
-	tools.Register(mcpSrv, a, mcpV2Dependencies(v2SendStack)...)
+	var mcpV2 *tools.V2Dependencies
+	if dependencies := mcpV2Dependencies(v2SendStack); len(dependencies) > 0 {
+		mcpV2 = dependencies[0]
+	}
+	tools.RegisterWithOptions(mcpSrv, a, tools.Options{
+		Reads:     reads,
+		V2Primary: v2Primary,
+		V2:        mcpV2,
+	})
 
 	var mcpHTTPHandler http.Handler
 	if opts.mcpSSE {
@@ -574,7 +599,7 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 	}
 
 	// Background loop that sends due scheduled ("send later") messages.
-	a.StartScheduler()
+	startLegacyScheduler(v2Primary, a.StartScheduler)
 
 	v2Options := v2SendWebOptions(stack, v2Send)
 	v2IngestCounters := v2IngestCountersProvider(stack)
@@ -586,6 +611,8 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 			httpHandler = web.APIHandlerWithOptions(a.Store, nil, logger, mcpHTTPHandler, web.APIOptions{
 				V2:                    v2Options,
 				V2IngestCounters:      v2IngestCounters,
+				Reads:                 reads,
+				V2Primary:             v2Primary,
 				Client:                a.GetClient,
 				Events:                events,
 				IdentityName:          identityName,

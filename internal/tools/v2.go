@@ -21,10 +21,11 @@ import (
 // tools. A nil/disabled value leaves their legacy descriptors and handlers
 // untouched.
 type V2Dependencies struct {
-	Enabled  bool
-	Service  *messaging.MessageService
-	V2Store  *sqlite.Store
-	Registry bridge.Registry
+	Enabled   bool
+	V2Primary bool
+	Service   *messaging.MessageService
+	V2Store   *sqlite.Store
+	Registry  bridge.Registry
 }
 
 const v2DeliveryDescription = " With v2 sending enabled, this waits for a settled delivery result. Every result includes outbox_id and idempotency_key. If settled is false (the wait was interrupted or the app is retrying automatically), the message is still durably queued and the app finishes sending it in the background: never send it again in response. An uncertain result means the transport may have accepted the message; do not retry automatically. Send again only as a deliberate new intent, reusing the returned idempotency_key when repeating the exact same send after a lost response."
@@ -51,11 +52,22 @@ func (v *V2Dependencies) submitDeps(a *app.App) v2wire.Deps {
 	}
 }
 
+func (v *V2Dependencies) nativeDeps() v2wire.NativeDeps {
+	return v2wire.NativeDeps{
+		V2:       v.V2Store,
+		Service:  v.Service,
+		Registry: v.Registry,
+	}
+}
+
 func (v *V2Dependencies) submitText(
 	ctx context.Context,
 	a *app.App,
 	input v2wire.TextInput,
 ) (messaging.Submission, error) {
+	if v.V2Primary {
+		return v2wire.SubmitTextV2(ctx, v.nativeDeps(), input)
+	}
 	return v2wire.SubmitText(ctx, v.submitDeps(a), input)
 }
 
@@ -64,6 +76,9 @@ func (v *V2Dependencies) submitMedia(
 	a *app.App,
 	input v2wire.MediaInput,
 ) (messaging.Submission, error) {
+	if v.V2Primary {
+		return v2wire.SubmitMediaV2(ctx, v.nativeDeps(), input)
+	}
 	return v2wire.SubmitMedia(ctx, v.submitDeps(a), input)
 }
 

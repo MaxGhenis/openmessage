@@ -10,6 +10,7 @@ import (
 	"github.com/mark3labs/mcp-go/server"
 
 	"github.com/maxghenis/openmessage/internal/app"
+	"github.com/maxghenis/openmessage/internal/db"
 )
 
 func getMessagesTool() mcp.Tool {
@@ -24,7 +25,8 @@ func getMessagesTool() mcp.Tool {
 	)
 }
 
-func getMessagesHandler(a *app.App) server.ToolHandlerFunc {
+func getMessagesHandler(a *app.App, configured ...Options) server.ToolHandlerFunc {
+	options := resolvedOptions(a, configured)
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		args := req.GetArguments()
 		phone := strArg(args, "phone_number")
@@ -46,7 +48,24 @@ func getMessagesHandler(a *app.App) server.ToolHandlerFunc {
 			beforeMS = t.Add(24*time.Hour - time.Millisecond).UnixMilli()
 		}
 
-		msgs, err := a.Store.GetMessages(phone, afterMS, beforeMS, limit)
+		var (
+			msgs []*db.Message
+			err  error
+		)
+		if options.V2Primary {
+			// v2 has no separate unscoped-list query. An empty substring query is
+			// deliberately LIKE '%%', with the same filters and recency ordering.
+			msgs, err = options.Reads.SearchMessagesFiltered("", db.SearchFilter{
+				Phone:   phone,
+				SinceMS: afterMS,
+				UntilMS: beforeMS,
+				Limit:   limit,
+			})
+		} else {
+			// Keep the legacy call exact: unlike filtered search, GetMessages does
+			// not add message_id as a timestamp tie-breaker.
+			msgs, err = a.Store.GetMessages(phone, afterMS, beforeMS, limit)
+		}
 		if err != nil {
 			return errorResult(fmt.Sprintf("query failed: %v", err)), nil
 		}

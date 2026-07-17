@@ -1,6 +1,7 @@
 package web
 
 import (
+	"context"
 	"crypto/rand"
 	"database/sql"
 	"embed"
@@ -30,6 +31,8 @@ import (
 	"github.com/maxghenis/openmessage/internal/ingest"
 	"github.com/maxghenis/openmessage/internal/media"
 	"github.com/maxghenis/openmessage/internal/messaging"
+	"github.com/maxghenis/openmessage/internal/readsource"
+	"github.com/maxghenis/openmessage/internal/storage/sqlite"
 	"github.com/maxghenis/openmessage/internal/story"
 	"github.com/maxghenis/openmessage/internal/whatsapplive"
 )
@@ -83,6 +86,8 @@ type UnpairFunc func() error
 type APIOptions struct {
 	V2                    *V2Options
 	V2IngestCounters      func() map[string]ingest.CounterSnapshot
+	Reads                 readsource.ReadSource
+	V2Primary             bool
 	Client                func() *client.Client
 	Events                *EventBroker
 	EventHeartbeat        time.Duration
@@ -154,7 +159,11 @@ func APIHandler(store *db.Store, cli *client.Client, logger zerolog.Logger, mcpH
 
 func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.Logger, mcpHandler http.Handler, opts APIOptions) http.Handler {
 	mux := http.NewServeMux()
-	registerV1Routes(mux, store, logger, opts.V2)
+	reads := opts.Reads
+	if reads == nil {
+		reads = store
+	}
+	registerV1Routes(mux, store, logger, opts.V2, opts.V2Primary)
 	diagnosticsStartedAt := time.Now()
 	getClient := func() *client.Client {
 		if opts.Client != nil {
@@ -231,7 +240,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		if freshnessValue != nil && time.Since(freshnessComputed) < 30*time.Second {
 			return freshnessValue
 		}
-		stats, err := store.PlatformStats()
+		stats, err := reads.PlatformStats()
 		if err != nil {
 			return freshnessValue // keep last good value on error
 		}
@@ -380,22 +389,22 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		msgCounts := map[string]int{}
 		latestByPlatform := map[string]int64{}
 
-		totalConversations, err := store.ConversationCount("")
+		totalConversations, err := reads.ConversationCount("")
 		if err == nil {
 			payload["conversation_count"] = totalConversations
 		}
-		totalMessages, err := store.MessageCount("")
+		totalMessages, err := reads.MessageCount("")
 		if err == nil {
 			payload["message_count"] = totalMessages
 		}
 		for _, platform := range platforms {
-			if count, err := store.ConversationCount(platform); err == nil && count > 0 {
+			if count, err := reads.ConversationCount(platform); err == nil && count > 0 {
 				convCounts[platform] = count
 			}
-			if count, err := store.MessageCount(platform); err == nil && count > 0 {
+			if count, err := reads.MessageCount(platform); err == nil && count > 0 {
 				msgCounts[platform] = count
 			}
-			if latest, err := store.LatestTimestamp(platform); err == nil && latest > 0 {
+			if latest, err := reads.LatestTimestamp(platform); err == nil && latest > 0 {
 				latestByPlatform[platform] = latest
 			}
 		}
@@ -796,7 +805,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 
 	mux.HandleFunc("/api/conversations", func(w http.ResponseWriter, r *http.Request) {
 		limit := queryIntClamped(r, "limit", 50, 500)
-		convos, err := store.ListConversations(limit)
+		convos, err := reads.ListConversations(limit)
 		if err != nil {
 			httpError(w, "list conversations: "+err.Error(), 500)
 			return
@@ -804,8 +813,10 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		if convos == nil {
 			convos = []*db.Conversation{}
 		}
-		enrichUnifiedConversationIdentities(store, convos)
-		if err := enrichConversationPreviews(store, convos); err != nil {
+		if !opts.V2Primary {
+			enrichUnifiedConversationIdentities(store, convos)
+		}
+		if err := enrichConversationPreviews(reads, convos); err != nil {
 			httpError(w, "conversation previews: "+err.Error(), 500)
 			return
 		}
@@ -919,7 +930,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 				return
 			}
 			limit := queryIntClamped(r, "limit", 50, 100)
-			msgs, err := store.SearchMessagesFiltered(q, db.SearchFilter{
+			msgs, err := reads.SearchMessagesFiltered(q, db.SearchFilter{
 				ConversationID: convID,
 				Limit:          limit,
 			})
@@ -943,7 +954,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 				httpError(w, "message_id is required", 400)
 				return
 			}
-			msgs, err := store.GetMessagesAroundMessage(convID, messageID, queryIntClamped(r, "before", 40, 200), queryIntClamped(r, "after", 40, 200))
+			msgs, err := reads.GetMessagesAroundMessage(convID, messageID, queryIntClamped(r, "before", 40, 200), queryIntClamped(r, "after", 40, 200))
 			if err != nil {
 				if errors.Is(err, db.ErrMessageNotFound) {
 					httpError(w, "message not found", 404)
@@ -982,11 +993,11 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		var err error
 		switch {
 		case afterMS > 0:
-			msgs, err = store.GetMessagesByConversationAfter(convID, afterMS, afterID, limit)
+			msgs, err = reads.GetMessagesByConversationAfter(convID, afterMS, afterID, limit)
 		case beforeMS > 0:
-			msgs, err = store.GetMessagesByConversationBefore(convID, beforeMS, beforeID, limit)
+			msgs, err = reads.GetMessagesByConversationBefore(convID, beforeMS, beforeID, limit)
 		default:
-			msgs, err = store.GetMessagesByConversation(convID, limit)
+			msgs, err = reads.GetMessagesByConversation(convID, limit)
 		}
 		if err != nil {
 			httpError(w, "get messages: "+err.Error(), 500)
@@ -1431,17 +1442,24 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			return
 		}
 		limit := queryIntClamped(r, "limit", 50, 500)
-		msgs, err := store.SearchMessages(q, "", limit)
+		msgs, err := reads.SearchMessagesFiltered(q, db.SearchFilter{Limit: limit})
 		if err != nil {
 			httpError(w, "search: "+err.Error(), 500)
 			return
 		}
-		convos, err := store.SearchConversationsByMetadata(q, limit)
-		if err != nil {
-			httpError(w, "search: "+err.Error(), 500)
-			return
+		var (
+			convos        []*db.Conversation
+			identityStore *db.Store
+		)
+		if !opts.V2Primary {
+			convos, err = store.SearchConversationsByMetadata(q, limit)
+			if err != nil {
+				httpError(w, "search: "+err.Error(), 500)
+				return
+			}
+			identityStore = store
 		}
-		results := mergeSearchResults(store, msgs, convos, limit)
+		results := mergeSearchResults(reads, identityStore, msgs, convos, limit)
 		writeJSON(w, results)
 	})
 
@@ -1542,6 +1560,10 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 	mux.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			httpError(w, "method not allowed", 405)
+			return
+		}
+		if opts.V2Primary {
+			httpError(w, "v2 primary: use /api/v1/outbox", http.StatusConflict)
 			return
 		}
 		var req struct {
@@ -1796,6 +1818,10 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			httpError(w, "method not allowed", 405)
 			return
 		}
+		if opts.V2Primary {
+			httpError(w, "v2 primary: use /api/v1/outbox", http.StatusConflict)
+			return
+		}
 		var req struct {
 			ConversationID string `json:"conversation_id"`
 			URL            string `json:"url"`
@@ -1830,6 +1856,10 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			httpError(w, "method not allowed", 405)
 			return
 		}
+		if opts.V2Primary {
+			httpError(w, "v2 primary: use /api/v1/outbox", http.StatusConflict)
+			return
+		}
 		if !parseBoundedMultipartForm(w, r) {
 			return
 		}
@@ -1858,6 +1888,17 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		msgID := strings.TrimPrefix(r.URL.Path, "/api/media/")
 		if msgID == "" {
 			httpError(w, "message_id required", 400)
+			return
+		}
+		if opts.V2Primary {
+			if opts.V2 == nil || opts.V2.V2Store == nil || opts.V2.Media == nil {
+				httpError(w, "v2 media not available", http.StatusServiceUnavailable)
+				return
+			}
+			if err := writeV2MessageMediaResponse(r.Context(), w, opts.V2, msgID); err != nil {
+				code, message := v1ErrorResponse(err)
+				httpError(w, message, code)
+			}
 			return
 		}
 		msg, err := store.GetMessageByID(msgID)
@@ -2240,6 +2281,10 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			httpError(w, "method not allowed", 405)
 			return
 		}
+		if opts.V2Primary {
+			httpError(w, "v2 primary: use /api/v1/outbox", http.StatusConflict)
+			return
+		}
 		var req struct {
 			DraftID string `json:"draft_id"`
 			Body    string `json:"body"`
@@ -2410,6 +2455,10 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 	})
 
 	mux.HandleFunc("/api/stats/", func(w http.ResponseWriter, r *http.Request) {
+		if opts.V2Primary {
+			httpError(w, "stats are unavailable in v2-primary mode", 409)
+			return
+		}
 		convID := strings.TrimPrefix(r.URL.Path, "/api/stats/")
 		if convID == "" {
 			httpError(w, "conversation_id required", 400)
@@ -2429,6 +2478,10 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 	})
 
 	mux.HandleFunc("/api/story/", func(w http.ResponseWriter, r *http.Request) {
+		if opts.V2Primary {
+			httpError(w, "story generation is unavailable in v2-primary mode", 409)
+			return
+		}
 		convID := strings.TrimPrefix(r.URL.Path, "/api/story/")
 		if convID == "" {
 			httpError(w, "conversation_id required", 400)
@@ -2988,10 +3041,13 @@ func splitHostPortDefault(hostport, defaultPort string) (string, string, bool) {
 	return u.Hostname(), port, true
 }
 
-func mergeSearchResults(store *db.Store, msgs []*db.Message, convos []*db.Conversation, limit int) []SearchResult {
+func mergeSearchResults(reads readsource.ReadSource, identityStore *db.Store, msgs []*db.Message, convos []*db.Conversation, limit int) []SearchResult {
 	results := make([]SearchResult, 0, limit)
 	seen := make(map[string]struct{}, limit)
-	identityIndex := loadUnifiedIdentityIndex(store)
+	var identityIndex map[string]unifiedConversationIdentity
+	if identityStore != nil {
+		identityIndex = loadUnifiedIdentityIndex(identityStore)
+	}
 
 	appendResult := func(result SearchResult) {
 		if _, ok := seen[result.ConversationID]; ok {
@@ -3002,7 +3058,7 @@ func mergeSearchResults(store *db.Store, msgs []*db.Message, convos []*db.Conver
 	}
 
 	for _, msg := range msgs {
-		conv, err := store.GetConversation(msg.ConversationID)
+		conv, err := reads.GetConversation(msg.ConversationID)
 		if err != nil || conv == nil {
 			continue
 		}
@@ -3014,7 +3070,7 @@ func mergeSearchResults(store *db.Store, msgs []*db.Message, convos []*db.Conver
 			continue
 		}
 		preview := ""
-		msgs, err := store.GetMessagesByConversation(conv.ConversationID, 1)
+		msgs, err := reads.GetMessagesByConversation(conv.ConversationID, 1)
 		if err == nil && len(msgs) > 0 {
 			preview = searchPreviewForMessage(msgs[0])
 		}
@@ -3053,7 +3109,7 @@ type conversationParticipant struct {
 	IsMeCamel bool   `json:"isMe"`
 }
 
-func enrichConversationPreviews(store *db.Store, convos []*db.Conversation) error {
+func enrichConversationPreviews(reads readsource.ReadSource, convos []*db.Conversation) error {
 	ids := make([]string, 0, len(convos))
 	for _, conv := range convos {
 		if conv == nil {
@@ -3061,7 +3117,7 @@ func enrichConversationPreviews(store *db.Store, convos []*db.Conversation) erro
 		}
 		ids = append(ids, conv.ConversationID)
 	}
-	previews, err := store.LatestConversationPreviews(ids)
+	previews, err := reads.LatestConversationPreviews(ids)
 	if err != nil {
 		return err
 	}
@@ -3277,6 +3333,37 @@ func scheduledID() string {
 	b := make([]byte, 8)
 	_, _ = rand.Read(b)
 	return "sched:" + hex.EncodeToString(b)
+}
+
+func writeV2MessageMediaResponse(
+	ctx context.Context,
+	w http.ResponseWriter,
+	v2 *V2Options,
+	messageID string,
+) error {
+	messages, err := sqlite.NewMessageRepository(v2.V2Store, time.Now)
+	if err != nil {
+		return err
+	}
+	message, err := messages.GetMessage(ctx, messageID)
+	if err != nil {
+		return err
+	}
+	descriptor, err := v2.Media.Resolve(ctx, media.DownloadCommand{
+		AccountID: message.AccountID,
+		MessageID: message.MessageID,
+		Ordinal:   0,
+	})
+	if err != nil {
+		return err
+	}
+	reader, err := v2.Media.Open(descriptor.Ref)
+	if err != nil {
+		return err
+	}
+	defer reader.Close()
+	writeDescriptorMediaResponse(w, reader, descriptor)
+	return nil
 }
 
 func writeJSON(w http.ResponseWriter, v any) {

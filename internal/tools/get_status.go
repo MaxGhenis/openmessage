@@ -13,6 +13,13 @@ import (
 	"github.com/maxghenis/openmessage/internal/whatsapplive"
 )
 
+type platformStatSummary struct {
+	Platform         string `json:"platform"`
+	Count            int    `json:"count"`
+	LatestMS         int64  `json:"latest_ms"`
+	LatestReceivedMS int64  `json:"latest_received_ms"`
+}
+
 var (
 	googleStatus = func(a *app.App) app.GoogleStatusSnapshot {
 		return a.GoogleStatus()
@@ -33,9 +40,26 @@ func getStatusTool() mcp.Tool {
 	)
 }
 
-func getStatusHandler(a *app.App) server.ToolHandlerFunc {
+func getStatusHandler(a *app.App, configured ...Options) server.ToolHandlerFunc {
+	options := resolvedOptions(a, configured)
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		var sb strings.Builder
+		var storedPlatforms []platformStatSummary
+		if options.V2Primary {
+			stats, err := options.Reads.PlatformStats()
+			if err != nil {
+				return errorResult(fmt.Sprintf("query serving store status: %v", err)), nil
+			}
+			storedPlatforms = make([]platformStatSummary, 0, len(stats))
+			for _, stat := range stats {
+				storedPlatforms = append(storedPlatforms, platformStatSummary{
+					Platform:         stat.Platform,
+					Count:            stat.Count,
+					LatestMS:         stat.LatestMS,
+					LatestReceivedMS: stat.LatestRecvMS,
+				})
+			}
+		}
 
 		google := googleStatus(a)
 		whatsApp := whatsAppStatus(a)
@@ -87,13 +111,28 @@ func getStatusHandler(a *app.App) server.ToolHandlerFunc {
 			fmt.Fprintf(&sb, "  Last error: %s\n", signal.LastError)
 		}
 
+		if options.V2Primary {
+			sb.WriteString("\nServing store (v2):\n")
+			if len(storedPlatforms) == 0 {
+				sb.WriteString("  No messages stored\n")
+			} else {
+				for _, stat := range storedPlatforms {
+					fmt.Fprintf(&sb, "  %s: %d messages\n", stat.Platform, stat.Count)
+				}
+			}
+		}
+
 		fmt.Fprintf(&sb, "Data dir: %s\n", a.DataDir)
-		return structuredResult(map[string]any{
+		payload := map[string]any{
 			"overall_connected": overallConnected,
 			"google":            google,
 			"whatsapp":          whatsApp,
 			"signal":            signal,
 			"data_dir":          a.DataDir,
-		}, sb.String()), nil
+		}
+		if options.V2Primary {
+			payload["stored_platforms"] = storedPlatforms
+		}
+		return structuredResult(payload, sb.String()), nil
 	}
 }
