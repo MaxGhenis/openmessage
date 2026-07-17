@@ -332,6 +332,9 @@ func (s *v2Stack) Start(
 	if !v2Primary {
 		runnerCount++
 	}
+	if v2Primary {
+		runnerCount++
+	}
 	runWG.Add(runnerCount)
 	go func() {
 		defer runWG.Done()
@@ -359,6 +362,22 @@ func (s *v2Stack) Start(
 			defer runWG.Done()
 			if err := projector.Run(runCtx); err != nil && !errors.Is(err, context.Canceled) {
 				s.logger.Error().Err(err).Msg("V2 legacy projector stopped")
+			}
+		}()
+	}
+	if v2Primary {
+		notifier := &v2wire.PrimaryNotifier{
+			Sources: []func() <-chan struct{}{
+				s.Service.Changes,
+				s.worker.Changes,
+			},
+			Events: events,
+			Logger: s.logger,
+		}
+		go func() {
+			defer runWG.Done()
+			if err := notifier.Run(runCtx); err != nil && !errors.Is(err, context.Canceled) {
+				s.logger.Error().Err(err).Msg("V2 primary notifier stopped")
 			}
 		}()
 	}

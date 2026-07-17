@@ -7,6 +7,7 @@ import (
 	"runtime/debug"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -67,6 +68,9 @@ type Worker struct {
 	decoders map[string]registeredDecoder
 	work     chan workItem
 	running  atomic.Bool
+
+	changeMu sync.Mutex
+	changed  chan struct{}
 }
 
 // NewWorker validates and copies its explicitly configured decoder
@@ -124,6 +128,7 @@ func NewWorker(config WorkerConfig) (*Worker, error) {
 		now:      config.Now,
 		decoders: decoders,
 		work:     make(chan workItem, config.QueueCapacity),
+		changed:  make(chan struct{}),
 	}, nil
 }
 
@@ -165,6 +170,25 @@ func (w *Worker) enqueue(item workItem) {
 	}
 }
 
+func (w *Worker) signalChange() {
+	w.changeMu.Lock()
+	close(w.changed)
+	w.changed = make(chan struct{})
+	w.changeMu.Unlock()
+}
+
+func (w *Worker) changeChannel() <-chan struct{} {
+	w.changeMu.Lock()
+	defer w.changeMu.Unlock()
+	return w.changed
+}
+
+// Changes returns the current ingest-change broadcast channel. The channel
+// closes on the next change; callers must call Changes again after it closes.
+func (w *Worker) Changes() <-chan struct{} {
+	return w.changeChannel()
+}
+
 func (w *Worker) drain(ctx context.Context) {
 	var records []sqlite.InboxRecord
 	err := retryTransient(ctx, func() error {
@@ -178,11 +202,17 @@ func (w *Worker) drain(ctx context.Context) {
 		}
 		return
 	}
+	changed := false
 	for _, record := range records {
 		if ctx.Err() != nil {
 			return
 		}
-		w.handleRecord(ctx, record.InboxID, rawIngressRecord(record))
+		if w.handleRecord(ctx, record.InboxID, rawIngressRecord(record)) {
+			changed = true
+		}
+	}
+	if changed {
+		w.signalChange()
 	}
 }
 
@@ -202,9 +232,10 @@ func (w *Worker) handleRecord(
 	ctx context.Context,
 	inboxID string,
 	record bridge.RawIngressRecord,
-) {
+) (changed bool) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
+			changed = false
 			w.markQuarantined(ctx, inboxID, record, fmt.Errorf(
 				"ingest frame panic: %v\n%s",
 				recovered,
@@ -214,11 +245,14 @@ func (w *Worker) handleRecord(
 	}()
 
 	err := retryTransient(ctx, func() error {
-		return w.processRecord(ctx, inboxID, record)
+		var err error
+		changed, err = w.processRecordResult(ctx, inboxID, record)
+		return err
 	})
 	if err == nil || ctx.Err() != nil {
-		return
+		return changed
 	}
+	changed = false
 
 	var stale staleReplayError
 	if errors.As(err, &stale) {
@@ -229,13 +263,13 @@ func (w *Worker) handleRecord(
 			Str("inbox_id", inboxID).
 			Str("codec", record.Codec).
 			Msg("Ignored stale ingest replay")
-		return
+		return false
 	}
 
 	var deterministic quarantineError
 	if errors.As(err, &deterministic) {
 		w.markQuarantined(ctx, inboxID, record, deterministic.cause)
-		return
+		return false
 	}
 
 	var exhausted transientExhaustedError
@@ -246,10 +280,11 @@ func (w *Worker) handleRecord(
 			Str("inbox_id", inboxID).
 			Str("codec", record.Codec).
 			Msg("Ingest projection exhausted transient retries; leaving frame unprocessed")
-		return
+		return false
 	}
 
 	w.markQuarantined(ctx, inboxID, record, err)
+	return false
 }
 
 func (w *Worker) markQuarantined(
@@ -286,23 +321,33 @@ func (w *Worker) processRecord(
 	inboxID string,
 	record bridge.RawIngressRecord,
 ) error {
+	_, err := w.processRecordResult(ctx, inboxID, record)
+	return err
+}
+
+func (w *Worker) processRecordResult(
+	ctx context.Context,
+	inboxID string,
+	record bridge.RawIngressRecord,
+) (bool, error) {
 	registration, exists := w.decoders[record.Codec]
 	if !exists {
-		return quarantine(fmt.Errorf("unknown ingress codec %q", record.Codec))
+		return false, quarantine(fmt.Errorf("unknown ingress codec %q", record.Codec))
 	}
 	events, err := decodeSafely(ctx, registration.decoder, record)
 	if err != nil {
-		return quarantine(err)
+		return false, quarantine(err)
 	}
 	for index := range events {
 		events[index].AccountID = record.AccountID
 		events[index].SourceInboxID = inboxID
 		if err := validateDecodedEvent(events[index]); err != nil {
-			return quarantine(fmt.Errorf("decoded event %d: %w", index, err))
+			return false, quarantine(fmt.Errorf("decoded event %d: %w", index, err))
 		}
 	}
 	w.counters.account(record.AccountID).decodedEvents.Add(uint64(len(events)))
-	return classifyApplyError(w.applyEvents(ctx, registration.platform, record, inboxID, events))
+	changed, err := w.applyEvents(ctx, registration.platform, record, inboxID, events)
+	return changed, classifyApplyError(err)
 }
 
 func decodeSafely(
@@ -372,15 +417,17 @@ func (w *Worker) applyEvents(
 	record bridge.RawIngressRecord,
 	inboxID string,
 	events []bridge.Event,
-) error {
+) (bool, error) {
 	accountID := record.AccountID
+	changed := false
 	for _, event := range events {
 		if event.Kind != bridge.EventConversation {
 			continue
 		}
 		if _, err := w.refreshConversation(accountID, platform, *event.Conversation); err != nil {
-			return err
+			return false, err
 		}
+		changed = true
 	}
 
 	messageCount := 0
@@ -398,27 +445,28 @@ func (w *Worker) applyEvents(
 			messageCount == 0,
 		)
 		if err != nil {
-			return err
+			return false, err
 		}
 		if messageCount == 0 {
 			if err := w.messages.ProjectMessage(ctx, projection); err != nil {
-				return err
+				return false, err
 			}
 			projected = true
 			w.counters.account(accountID).projected.Add(1)
 		} else {
 			if err := w.messages.ImportMessage(ctx, projection); err != nil {
-				return err
+				return false, err
 			}
 			w.counters.account(accountID).imported.Add(1)
 		}
+		changed = true
 		// Conversation rows are never re-upserted from message frames, so
 		// recency advances through this targeted monotone bump instead.
 		if err := w.store.BumpConversationRecency(
 			projection.Message.ConversationID,
 			projection.Message.OccurredAtMS,
 		); err != nil {
-			return err
+			return false, err
 		}
 		messageCount++
 	}
@@ -429,7 +477,7 @@ func (w *Worker) applyEvents(
 		}
 		mutation := *event.MessageMutation
 		if strings.TrimSpace(mutation.RemoteMessageID) == "" {
-			return fmt.Errorf("message mutation remote ID is empty")
+			return false, fmt.Errorf("message mutation remote ID is empty")
 		}
 		conversation, remoteConversationID, err := w.existingConversation(
 			accountID,
@@ -443,7 +491,7 @@ func (w *Worker) applyEvents(
 			// canonical would-be PK without creating a conversation row.
 			conversationID = v2keys.DeriveID("conversation", accountID, remoteConversationID)
 		} else if err != nil {
-			return err
+			return false, err
 		}
 		updated, err := w.messages.ApplyMessageMutation(
 			ctx,
@@ -455,10 +503,11 @@ func (w *Worker) applyEvents(
 			inboxID,
 		)
 		if err != nil {
-			return err
+			return false, err
 		}
 		if updated {
 			w.counters.account(accountID).mutations.Add(1)
+			changed = true
 		} else {
 			w.logger.Debug().
 				Str("account_id", accountID).
@@ -491,10 +540,11 @@ func (w *Worker) applyEvents(
 		}
 		applied, err := w.advanceReadCursor(ctx, accountID, platform, *event.Receipt)
 		if err != nil {
-			return err
+			return false, err
 		}
 		if applied {
 			w.counters.account(accountID).receiptsSelf.Add(1)
+			changed = true
 		} else {
 			// The conversation or local device is not known yet. That is an
 			// ordering gap, not a defect: drop the cursor advance benignly
@@ -505,10 +555,10 @@ func (w *Worker) applyEvents(
 
 	if !projected {
 		if err := w.messages.MarkInboxProcessed(ctx, inboxID, accountID); err != nil {
-			return err
+			return false, err
 		}
 	}
-	return nil
+	return changed, nil
 }
 
 func (w *Worker) refreshConversation(
