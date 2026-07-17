@@ -431,3 +431,58 @@ func TestR5StatsAndStoryUnavailableInV2Primary(t *testing.T) {
 		}
 	}
 }
+
+func TestPRAScheduleAndStatusInV2Primary(t *testing.T) {
+	legacy, err := db.New(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = legacy.Close() })
+	handler := APIHandlerWithOptions(legacy, nil, zerolog.Nop(), nil, APIOptions{
+		Reads:     newRoutingReadSource(),
+		V2Primary: true,
+	})
+
+	// /api/status exposes the flip signal the composer keys on.
+	statusRec := httptest.NewRecorder()
+	handler.ServeHTTP(statusRec, httptest.NewRequest(http.MethodGet, "http://127.0.0.1/api/status", nil))
+	var status map[string]any
+	if err := json.NewDecoder(statusRec.Result().Body).Decode(&status); err != nil {
+		t.Fatalf("decode status: %v", err)
+	}
+	if status["v2_primary"] != true {
+		t.Fatalf("status v2_primary = %#v, want true", status["v2_primary"])
+	}
+
+	// The scheduled-send black hole is closed: writing routes must 409 in
+	// v2-primary rather than silently persist a legacy row nothing drains.
+	for _, tc := range []struct {
+		method, path, body, ctype string
+	}{
+		{http.MethodPost, "http://127.0.0.1/api/schedule", `{"conversation_id":"c","body":"b","send_at":9999999999999}`, "application/json"},
+		{http.MethodDelete, "http://127.0.0.1/api/schedule/some-id", "", ""},
+	} {
+		req := httptest.NewRequest(tc.method, tc.path, strings.NewReader(tc.body))
+		if tc.ctype != "" {
+			req.Header.Set("Content-Type", tc.ctype)
+		}
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if got := rec.Result().StatusCode; got != http.StatusConflict {
+			t.Fatalf("%s %s = %d, want 409 in v2-primary", tc.method, tc.path, got)
+		}
+	}
+	// No legacy scheduled row was written by the refused POST.
+	if list, err := legacy.ListScheduledMessages("c"); err != nil {
+		t.Fatalf("ListScheduledMessages: %v", err)
+	} else if len(list) != 0 {
+		t.Fatalf("legacy scheduled rows = %d, want 0 (nothing persisted in v2-primary)", len(list))
+	}
+
+	// GET returns empty (not an error) so the pre-tray UI shows nothing.
+	getRec := httptest.NewRecorder()
+	handler.ServeHTTP(getRec, httptest.NewRequest(http.MethodGet, "http://127.0.0.1/api/schedule?conversation_id=c", nil))
+	if got := getRec.Result().StatusCode; got != http.StatusOK {
+		t.Fatalf("GET /api/schedule = %d, want 200 (empty list) in v2-primary", got)
+	}
+}

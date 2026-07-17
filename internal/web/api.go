@@ -288,7 +288,8 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		}
 		payload := map[string]any{
 			"connected": connected,
-			"v2_send":   opts.V2 != nil,
+			"v2_send":    opts.V2 != nil,
+			"v2_primary": opts.V2Primary,
 			"v2_ingest": map[string]any{
 				"enabled":     opts.V2IngestCounters != nil,
 				"per_account": v2IngestPerAccount,
@@ -1288,6 +1289,13 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 	mux.HandleFunc("/api/schedule", func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
+			// Post-migration the legacy scheduled_messages table is meaningless
+			// (v2 scheduling lives in the outbox), so return empty rather than
+			// erroring — the pre-PR-D scheduled panel shows nothing.
+			if opts.V2Primary {
+				writeJSON(w, []*db.ScheduledMessage{})
+				return
+			}
 			convID := strings.TrimSpace(r.URL.Query().Get("conversation_id"))
 			if convID == "" {
 				httpError(w, "conversation_id is required", 400)
@@ -1303,6 +1311,13 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			}
 			writeJSON(w, list)
 		case http.MethodPost:
+			// The legacy scheduler does not run in v2-primary, so a legacy
+			// scheduled row would never be drained. Fail loud instead of
+			// silently losing the send; v2 scheduling goes through the outbox.
+			if opts.V2Primary {
+				httpError(w, "v2 primary: use /api/v1/outbox", http.StatusConflict)
+				return
+			}
 			var req struct {
 				ConversationID string `json:"conversation_id"`
 				Body           string `json:"body"`
@@ -1352,6 +1367,10 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			httpError(w, "method not allowed", 405)
 			return
 		}
+		if opts.V2Primary {
+			httpError(w, "v2 primary: use /api/v1/outbox", http.StatusConflict)
+			return
+		}
 		id := strings.TrimPrefix(r.URL.Path, "/api/schedule/")
 		if id == "" {
 			httpError(w, "scheduled message id required", 400)
@@ -1381,6 +1400,10 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 	mux.HandleFunc("/api/schedule-media", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			httpError(w, "method not allowed", 405)
+			return
+		}
+		if opts.V2Primary {
+			httpError(w, "v2 primary: use /api/v1/outbox", http.StatusConflict)
 			return
 		}
 		if !parseBoundedMultipartForm(w, r) {
