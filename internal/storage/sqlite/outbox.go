@@ -2017,6 +2017,37 @@ func (r *OutboxRepository) FindStoreFailedDue(
 	return items, nil
 }
 
+// LatestStateForLocalMessage returns the delivery state of the most recent
+// outbox row for an optimistic outgoing message, so a read surface can show
+// its send lifecycle. ok is false when the message has no outbox row (a
+// received message, or one whose send predates the outbox). When SendAgain has
+// linked several attempts to one local message, the newest row wins.
+func (r *OutboxRepository) LatestStateForLocalMessage(
+	ctx context.Context,
+	accountID, localMessageID string,
+) (state OutboxState, ok bool, err error) {
+	var value string
+	scanErr := r.store.db.QueryRowContext(ctx, `
+		SELECT state
+		FROM outbox
+		WHERE account_id = ? AND local_message_id = ?
+		ORDER BY created_at_ms DESC, outbox_id DESC
+		LIMIT 1
+	`, accountID, localMessageID).Scan(&value)
+	if errors.Is(scanErr, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	if scanErr != nil {
+		return "", false, fmt.Errorf(
+			"outbox state for message %q (account %q): %w",
+			localMessageID,
+			accountID,
+			scanErr,
+		)
+	}
+	return OutboxState(value), true, nil
+}
+
 // FindByTransportRequestID returns the account-scoped row carrying the stable
 // request ID supplied to the transport.
 func (r *OutboxRepository) FindByTransportRequestID(

@@ -161,6 +161,13 @@ func (s *Source) mapMessage(
 	if message.ReplyToRemoteID != nil {
 		dto.ReplyToID = *message.ReplyToRemoteID
 	}
+	if dto.IsFromMe {
+		status, err := s.sendStatusForMessage(message)
+		if err != nil {
+			return nil, err
+		}
+		dto.Status = status
+	}
 	attachment, ok, err := s.messageAttachment(context.Background(), message.MessageID)
 	if err != nil {
 		return nil, err
@@ -190,4 +197,40 @@ func (s *Source) messageAttachment(
 		)
 	}
 	return attachment, true, nil
+}
+
+// sendStatusForMessage maps an outgoing message's most recent outbox delivery
+// state onto the legacy status vocabulary the web UI already renders
+// (sending/sent/failed). It is deliberately honest per the durable-send
+// contract: queued/dispatching/not_dispatched/uncertain all read as "sending"
+// — never "failed" — because none of them is a settled failure and an
+// ambiguous send must not be shown as failed. store_failed reads "sent"
+// (the transport delivered; only the local record needs repair). Terminal
+// rejected/canceled read "failed". A message with no outbox row (received, or
+// pre-outbox) carries no status.
+func (s *Source) sendStatusForMessage(message sqlite.Message) (string, error) {
+	if strings.TrimSpace(message.MessageID) == "" {
+		return "", nil
+	}
+	state, ok, err := s.outbox.LatestStateForLocalMessage(
+		context.Background(),
+		message.AccountID,
+		message.MessageID,
+	)
+	if err != nil {
+		return "", fmt.Errorf("map message %q send status: %w", message.MessageID, err)
+	}
+	if !ok {
+		return "", nil
+	}
+	switch state {
+	case sqlite.OutboxQueued, sqlite.OutboxDispatching, sqlite.OutboxNotDispatched, sqlite.OutboxUncertain:
+		return db.OutgoingSendStatusSending, nil
+	case sqlite.OutboxConfirmed, sqlite.OutboxStoreFailed:
+		return db.OutgoingSendStatusSent, nil
+	case sqlite.OutboxRejected, sqlite.OutboxCanceled:
+		return db.OutgoingSendStatusFailed, nil
+	default:
+		return "", nil
+	}
 }
