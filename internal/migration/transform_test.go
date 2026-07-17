@@ -19,6 +19,7 @@ import (
 	whatsappadapter "github.com/maxghenis/openmessage/internal/bridgeadapters/whatsapp"
 	legacydb "github.com/maxghenis/openmessage/internal/db"
 	"github.com/maxghenis/openmessage/internal/storage/blob"
+	"github.com/maxghenis/openmessage/internal/v2keys"
 	"github.com/maxghenis/openmessage/internal/whatsappmedia"
 )
 
@@ -142,7 +143,7 @@ func TestDeterministicID(t *testing.T) {
 	t.Parallel()
 
 	const want = "5b66e34164c6cc052fd1dd40eb5975be"
-	got := deriveID(
+	got := v2keys.DeriveID(
 		"message",
 		"google-primary",
 		"sms-conversation\x1fgoogle-server-1",
@@ -150,7 +151,7 @@ func TestDeterministicID(t *testing.T) {
 	if got != want {
 		t.Fatalf("deriveID() = %q, want %q", got, want)
 	}
-	if again := deriveID("message", "google-primary", "sms-conversation\x1fgoogle-server-1"); again != got {
+	if again := v2keys.DeriveID("message", "google-primary", "sms-conversation\x1fgoogle-server-1"); again != got {
 		t.Fatalf("deriveID() was not repeatable: first %q, second %q", got, again)
 	}
 	if len(got) != 32 || strings.ToLower(got) != got {
@@ -159,10 +160,10 @@ func TestDeterministicID(t *testing.T) {
 	if _, err := hex.DecodeString(got); err != nil {
 		t.Fatalf("deriveID() = %q, want lowercase hex: %v", got, err)
 	}
-	if got == deriveID("message", "signal-primary", "sms-conversation\x1fgoogle-server-1") {
+	if got == v2keys.DeriveID("message", "signal-primary", "sms-conversation\x1fgoogle-server-1") {
 		t.Fatal("deriveID() did not include account_id")
 	}
-	if got == deriveID("conversation", "google-primary", "sms-conversation\x1fgoogle-server-1") {
+	if got == v2keys.DeriveID("conversation", "google-primary", "sms-conversation\x1fgoogle-server-1") {
 		t.Fatal("deriveID() did not include entity")
 	}
 }
@@ -605,7 +606,7 @@ func assertFixtureMessages(t *testing.T, database *sql.DB) {
 			legacyConversation: "sms-conversation", accountID: "google-primary",
 			remoteID: "google-server-1", body: "google incoming media", direction: "incoming",
 			occurredAt:       fixtureBaseMS + 1_000,
-			senderIdentityID: deriveID("identity", "google-primary", "e164\x1f+15550100001"),
+			senderIdentityID: v2keys.DeriveID("identity", "google-primary", "e164\x1f+15550100001"),
 		},
 		{
 			legacyConversation: "sms-conversation", accountID: "google-primary",
@@ -616,7 +617,7 @@ func assertFixtureMessages(t *testing.T, database *sql.DB) {
 			legacyConversation: "whatsapp:fixture-group@g.us", accountID: "whatsapp-primary",
 			remoteID: "wa-source-1", body: "whatsapp incoming media", direction: "incoming",
 			occurredAt:       fixtureBaseMS + 3_000,
-			senderIdentityID: deriveID("identity", "whatsapp-primary", "jid\x1f15550100002@s.whatsapp.net"),
+			senderIdentityID: v2keys.DeriveID("identity", "whatsapp-primary", "jid\x1f15550100002@s.whatsapp.net"),
 		},
 		{
 			legacyConversation: "whatsapp:fixture-group@g.us", accountID: "whatsapp-primary",
@@ -627,7 +628,7 @@ func assertFixtureMessages(t *testing.T, database *sql.DB) {
 			legacyConversation: "signal:+16505550100", accountID: "signal-primary",
 			remoteID: "1700000001000", body: "signal incoming media", direction: "incoming",
 			occurredAt:       fixtureBaseMS + 5_000,
-			senderIdentityID: deriveID("identity", "signal-primary", "e164\x1f+16505550100"),
+			senderIdentityID: v2keys.DeriveID("identity", "signal-primary", "e164\x1f+16505550100"),
 		},
 		{
 			legacyConversation: "signal:+16505550100", accountID: "signal-primary",
@@ -636,10 +637,10 @@ func assertFixtureMessages(t *testing.T, database *sql.DB) {
 		},
 	}
 	for _, want := range wants {
-		messageID := deriveID(
+		messageID := v2keys.DeriveID(
 			"message", want.accountID, want.legacyConversation+"\x1f"+want.remoteID,
 		)
-		conversationID := deriveID("conversation", want.accountID, want.legacyConversation)
+		conversationID := v2keys.DeriveID("conversation", want.accountID, want.legacyConversation)
 		var gotConversationID, gotAccountID, remoteID, body, direction, state string
 		var replyTo, sender sql.NullString
 		var occurredAt, createdAt, updatedAt int64
@@ -705,7 +706,7 @@ func assertFixtureAttachments(t *testing.T, database *sql.DB, whatsAppRef string
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			messageID := deriveID(
+			messageID := v2keys.DeriveID(
 				"message", test.accountID,
 				test.legacyConversation+"\x1f"+test.remoteMessageID,
 			)
@@ -784,12 +785,12 @@ func assertFixtureSchedules(t *testing.T, database *sql.DB, blobRoot string, sch
 		{"scheduled-pending-media", "whatsapp-primary", "whatsapp:fixture-group@g.us", "media", fixtureBaseMS + 200_000},
 	}
 	for _, want := range wants {
-		outboxID := deriveID("outbox", want.accountID, want.id)
-		requestID := deriveID("transport_request", want.accountID, want.id)
-		messageID := deriveID(
+		outboxID := v2keys.DeriveID("outbox", want.accountID, want.id)
+		requestID := v2keys.DeriveID("transport_request", want.accountID, want.id)
+		messageID := v2keys.DeriveID(
 			"message", want.accountID, want.legacyConversation+"\x1f"+requestID,
 		)
-		conversationID := deriveID("conversation", want.accountID, want.legacyConversation)
+		conversationID := v2keys.DeriveID("conversation", want.accountID, want.legacyConversation)
 		var gotOutboxID, accountID, gotConversationID, kind, idempotencyKey, state string
 		var localMessageID, transportRequestID string
 		var scheduledFor, attempts int64
@@ -821,8 +822,8 @@ func assertFixtureSchedules(t *testing.T, database *sql.DB, blobRoot string, sch
 			t.Errorf("outbox contains %d rows for skipped schedule %q", got, skipped)
 		}
 	}
-	sendingRequestID := deriveID("transport_request", "signal-primary", "scheduled-sending")
-	sendingMessageID := deriveID(
+	sendingRequestID := v2keys.DeriveID("transport_request", "signal-primary", "scheduled-sending")
+	sendingMessageID := v2keys.DeriveID(
 		"message", "signal-primary", "signal:+16505550100\x1f"+sendingRequestID,
 	)
 	var sendingBody, sendingDirection string
@@ -831,7 +832,7 @@ func assertFixtureSchedules(t *testing.T, database *sql.DB, blobRoot string, sch
 		t.Errorf("ambiguous sending optimistic row = %q/%q", sendingBody, sendingDirection)
 	}
 
-	mediaOutboxID := deriveID("outbox", "whatsapp-primary", "scheduled-pending-media")
+	mediaOutboxID := v2keys.DeriveID("outbox", "whatsapp-primary", "scheduled-pending-media")
 	var hash, mime, filename string
 	var size int64
 	mustNoError(t, database.QueryRow(`
@@ -860,11 +861,11 @@ func assertFixtureSchedules(t *testing.T, database *sql.DB, blobRoot string, sch
 func assertFixtureReadCursors(t *testing.T, database *sql.DB) {
 	t.Helper()
 
-	smsConversationID := deriveID("conversation", "google-primary", "sms-conversation")
-	smsDeviceID := deriveID(
+	smsConversationID := v2keys.DeriveID("conversation", "google-primary", "sms-conversation")
+	smsDeviceID := v2keys.DeriveID(
 		"device", "google-primary", "google-primary\x1flocal",
 	)
-	smsLastReadMessageID := deriveID(
+	smsLastReadMessageID := v2keys.DeriveID(
 		"message", "google-primary", "sms-conversation\x1fgoogle-server-1",
 	)
 	var lastRead sql.NullString
@@ -878,8 +879,8 @@ func assertFixtureReadCursors(t *testing.T, database *sql.DB) {
 	}
 
 	aciConversation := "signal:" + fixtureSignalACI
-	aciConversationID := deriveID("conversation", "signal-primary", aciConversation)
-	signalDeviceID := deriveID("device", "signal-primary", "signal-primary\x1flocal")
+	aciConversationID := v2keys.DeriveID("conversation", "signal-primary", aciConversation)
+	signalDeviceID := v2keys.DeriveID("device", "signal-primary", "signal-primary\x1flocal")
 	mustNoError(t, database.QueryRow(`
 		SELECT last_read_message_id, last_read_at_ms
 		FROM read_cursors WHERE device_id = ? AND conversation_id = ?

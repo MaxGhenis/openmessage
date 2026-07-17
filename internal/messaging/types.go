@@ -28,6 +28,16 @@ const (
 	OutboxCanceled      = sqlite.OutboxCanceled
 )
 
+// EchoOutcome is what observing a transport echo did to durable send state.
+type EchoOutcome = sqlite.ReconcileOutcome
+
+const (
+	EchoReconciled = sqlite.ReconcileOutcomeReconciled
+	EchoEnriched   = sqlite.ReconcileOutcomeEnriched
+	EchoNoop       = sqlite.ReconcileOutcomeNoop
+	EchoNotFound   = sqlite.ReconcileOutcomeNotFound
+)
+
 var (
 	// ErrIdempotencyConflict means the account-scoped key already names a
 	// different outbound intent.
