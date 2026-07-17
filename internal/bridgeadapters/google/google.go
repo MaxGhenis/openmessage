@@ -579,6 +579,9 @@ func (r *run) teeIngress(evt any, receivedAt time.Time) {
 
 func (r *run) recordIngressError(evt any, err error) {
 	r.adapter.ingressErrors.Add(1)
+	if recorder, ok := r.sink.(interface{ RecordIngressError(string) }); ok && recorder != nil {
+		recorder.RecordIngressError(r.request.AccountID)
+	}
 	r.adapter.host.Logger.Warn().
 		Err(err).
 		Str("account_id", r.request.AccountID).

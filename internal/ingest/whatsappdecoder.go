@@ -354,7 +354,6 @@ func (d *WhatsAppDecoder) decodeReceipt(
 		return nil, nil
 	}
 	actor := whatsAppIdentity(envelope.SenderJID, "", self)
-	actor.IsSelf = self
 	return []bridge.Event{{
 		Kind: bridge.EventReceipt,
 		Receipt: &bridge.ReceiptEvent{

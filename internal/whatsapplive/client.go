@@ -2004,6 +2004,14 @@ func (b *Bridge) hasIngressObserver() bool {
 }
 
 func (b *Bridge) captureMessageIngress(evt *waevents.Message, chatJID watypes.JID) {
+	// Capture is strictly additive observation: a panic anywhere in the
+	// capture body must not reach the whatsmeow callback or skip the legacy
+	// handling that follows it.
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			b.logIngressCaptureError("message", fmt.Errorf("capture panic: %v", recovered))
+		}
+	}()
 	if !b.hasIngressObserver() {
 		return
 	}
@@ -2046,6 +2054,14 @@ func (b *Bridge) captureMessageIngress(evt *waevents.Message, chatJID watypes.JI
 }
 
 func (b *Bridge) captureReceiptIngress(evt *waevents.Receipt) {
+	// Capture is strictly additive observation: a panic anywhere in the
+	// capture body must not reach the whatsmeow callback or skip the legacy
+	// handling that follows it.
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			b.logIngressCaptureError("receipt", fmt.Errorf("capture panic: %v", recovered))
+		}
+	}()
 	if !b.hasIngressObserver() {
 		return
 	}
@@ -2079,6 +2095,14 @@ func (b *Bridge) captureReceiptIngress(evt *waevents.Receipt) {
 }
 
 func (b *Bridge) captureHistorySyncIngress(evt *waevents.HistorySync) {
+	// Capture is strictly additive observation: a panic anywhere in the
+	// capture body must not reach the whatsmeow callback or skip the legacy
+	// handling that follows it.
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			b.logIngressCaptureError("history_sync", fmt.Errorf("capture panic: %v", recovered))
+		}
+	}()
 	if evt == nil || evt.Data == nil || !b.hasIngressObserver() {
 		return
 	}

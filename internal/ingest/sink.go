@@ -35,6 +35,13 @@ type Sink struct {
 
 var _ bridge.ConnectionSink = (*Sink)(nil)
 
+// RecordIngressError counts a capture or append fault surfaced by a transport
+// adapter. The frame itself was logged and dropped at the transport edge; the
+// counter keeps /api/status honest about ingest losses.
+func (s *Sink) RecordIngressError(accountID string) {
+	s.counters.account(accountID).appendErrors.Add(1)
+}
+
 // NewSink constructs a storage-backed ConnectionSink.
 func NewSink(config SinkConfig) (*Sink, error) {
 	if config.Messages == nil {

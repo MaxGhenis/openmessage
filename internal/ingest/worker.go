@@ -481,6 +481,13 @@ func (w *Worker) applyEvents(
 			w.counters.account(accountID).receiptsDropped.Add(1)
 			continue
 		}
+		// Only read-class self receipts advance the read cursor. A delivered
+		// acknowledgement for an outgoing message says nothing about what the
+		// local user has read.
+		if event.Receipt.Status != "read" {
+			w.counters.account(accountID).receiptsDropped.Add(1)
+			continue
+		}
 		applied, err := w.advanceReadCursor(ctx, accountID, platform, *event.Receipt)
 		if err != nil {
 			return err

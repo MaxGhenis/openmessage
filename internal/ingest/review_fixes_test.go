@@ -191,3 +191,42 @@ func TestWorkerSelfReceiptBeforeConversationIsBenign(t *testing.T) {
 	}
 	workerPathAssertAllProcessed(t, harness.messages)
 }
+
+// Delivered-class self receipts acknowledge outgoing delivery; they say
+// nothing about what the local user has read, so they must not advance the
+// read cursor.
+func TestWorkerDeliveredSelfReceiptDoesNotAdvanceReadCursor(t *testing.T) {
+	harness := newWorkerPathHarness(t, bridge.PlatformWhatsApp, map[string][]bridge.Event{
+		"delivered-self": {{
+			Kind: bridge.EventReceipt,
+			Receipt: &bridge.ReceiptEvent{
+				RemoteConversationID: "whatsapp:15551234567@s.whatsapp.net",
+				RemoteMessageIDs:     []string{"delivered-ack"},
+				Actor:                bridge.IdentityRef{IsSelf: true},
+				Status:               "delivered",
+				OccurredAt:           time.UnixMilli(workerPathNowMS - 50),
+			},
+		}},
+	})
+
+	harness.process(t, "delivered-self")
+
+	snapshot := harness.worker.Counters().Snapshot(workerPathAccountID)
+	if snapshot.ReceiptsDropped != 1 || snapshot.ReceiptsSelf != 0 || snapshot.Quarantined != 0 {
+		t.Fatalf("delivered self-receipt counters = %+v, want dropped=1 self=0", snapshot)
+	}
+	workerPathAssertAllProcessed(t, harness.messages)
+}
+
+func TestSinkRecordIngressErrorCountsPerAccount(t *testing.T) {
+	counters := &Counters{}
+	sink := &Sink{counters: counters}
+	sink.RecordIngressError("account-err")
+	sink.RecordIngressError("account-err")
+	if got := counters.Snapshot("account-err").AppendErrors; got != 2 {
+		t.Fatalf("AppendErrors = %d, want 2", got)
+	}
+	if got := counters.Snapshot("account-other").AppendErrors; got != 0 {
+		t.Fatalf("other-account AppendErrors = %d, want 0", got)
+	}
+}
