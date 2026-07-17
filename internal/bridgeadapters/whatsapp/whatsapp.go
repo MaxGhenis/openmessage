@@ -42,6 +42,8 @@ type Adapter struct {
 	markReadRequest     func(string, []string, string, time.Time) error
 	sendMediaRequest    func(string, []byte, string, string, string, string, string) (string, time.Time, error)
 	downloadMediaRef    func(string, whatsapplive.StoredMediaRef, string, string, string) ([]byte, string, error)
+	observeIngress      func(func(whatsapplive.IngressFrame)) func()
+	logIngressError     func(error, string, uint64)
 
 	mu       sync.Mutex
 	current  *run
@@ -72,6 +74,8 @@ func New(accountID string, host *whatsapplive.Bridge) *Adapter {
 		a.markReadRequest = host.MarkReadRequest
 		a.sendMediaRequest = host.SendMediaRequest
 		a.downloadMediaRef = host.DownloadMediaRef
+		a.observeIngress = host.ObserveIngress
+		a.logIngressError = host.LogIngressError
 		host.ObserveLifecycle(a.handleLifecycleEvent)
 	}
 	return a
@@ -430,6 +434,9 @@ func (a *Adapter) Start(
 	a.current = r
 	a.starting = false
 	a.mu.Unlock()
+	if a.observeIngress != nil {
+		r.removeIngress = a.observeIngress(r.handleIngress)
+	}
 
 	go r.coordinate()
 	go r.connect()
@@ -653,6 +660,9 @@ type run struct {
 	readyOnce  sync.Once
 	finishOnce sync.Once
 
+	removeIngress     func()
+	removeIngressOnce sync.Once
+
 	admissionMu sync.Mutex
 	admitting   bool
 	callbacks   sync.WaitGroup
@@ -702,6 +712,7 @@ func (r *run) coordinate() {
 	}
 
 	r.closeAdmission()
+	r.unregisterIngress()
 	r.cancel()
 	r.adapter.disconnect()
 	r.workers.Wait()
@@ -710,6 +721,14 @@ func (r *run) coordinate() {
 	r.done <- terminal
 	close(r.done)
 	close(r.stopped)
+}
+
+func (r *run) unregisterIngress() {
+	r.removeIngressOnce.Do(func() {
+		if r.removeIngress != nil {
+			r.removeIngress()
+		}
+	})
 }
 
 func (r *run) requestFinish(err error) {
@@ -733,6 +752,39 @@ func (r *run) admitCallback() bool {
 	}
 	r.callbacks.Add(1)
 	return true
+}
+
+type ingressErrorRecorder interface {
+	RecordIngressError(accountID string)
+}
+
+func (r *run) handleIngress(frame whatsapplive.IngressFrame) {
+	if !r.admitCallback() {
+		return
+	}
+	defer r.callbacks.Done()
+	if r.sink == nil {
+		return
+	}
+
+	err := r.sink.AppendIngress(context.Background(), bridge.RawIngressRecord{
+		AccountID:    r.request.AccountID,
+		Generation:   r.request.Generation,
+		DedupeKey:    frame.DedupeKey,
+		Codec:        whatsapplive.IngressCodec,
+		CodecVersion: whatsapplive.IngressCodecVersion,
+		ReceivedAt:   frame.ReceivedAt,
+		Payload:      frame.Payload,
+	})
+	if err == nil || errors.Is(err, bridge.ErrStaleGeneration) {
+		return
+	}
+	if recorder, ok := r.sink.(ingressErrorRecorder); ok {
+		recorder.RecordIngressError(r.request.AccountID)
+	}
+	if r.adapter.logIngressError != nil {
+		r.adapter.logIngressError(err, r.request.AccountID, uint64(r.request.Generation))
+	}
 }
 
 func (r *run) handleEvent(event whatsapplive.LifecycleEvent) {

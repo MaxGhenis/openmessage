@@ -208,11 +208,14 @@ func newV2Stack(deps v2StackDeps) (_ *v2Stack, resultErr error) {
 		EchoObserver: service,
 		Counters:     counters,
 		Logger:       deps.Logger,
-		Decoders: []ingest.DecoderRegistration{{
-			Codec:    ingest.GoogleCodec,
-			Platform: bridge.PlatformGoogle,
-			Decoder:  ingest.NewGoogleDecoder(counters),
-		}},
+		Decoders: []ingest.DecoderRegistration{
+			{
+				Codec:    ingest.GoogleCodec,
+				Platform: bridge.PlatformGoogle,
+				Decoder:  ingest.NewGoogleDecoder(counters),
+			},
+			ingest.NewWhatsAppDecoderRegistration(),
+		},
 	})
 	if err != nil {
 		return nil, fmt.Errorf("configure v2 stack: create ingest worker: %w", err)

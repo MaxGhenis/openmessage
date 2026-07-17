@@ -43,6 +43,13 @@ const recentlyLeftGroupTTL = 6 * time.Hour
 const unpairRemoteTimeout = 10 * time.Second
 const unpairStoreTimeout = 10 * time.Second
 
+// IngressCodec is the durable WhatsApp capture codec consumed by the v2
+// ingest worker.
+const IngressCodec = "whatsapp.event"
+
+// IngressCodecVersion is the current version of IngressCodec envelopes.
+const IngressCodecVersion uint32 = 1
+
 var ErrProfilePhotoNotFound = errors.New("whatsapp profile photo not found")
 
 var ErrTemporaryBanActive = errors.New("whatsapp temporary ban is still active")
@@ -198,6 +205,46 @@ type lifecycleObservation struct {
 	callback func(LifecycleEvent)
 }
 
+// IngressFrame is a fully captured WhatsApp transport envelope. Payload owns
+// no whatsmeow pointers and is safe to persist after the callback returns.
+type IngressFrame struct {
+	DedupeKey  string
+	ReceivedAt time.Time
+	Payload    []byte
+}
+
+type ingressObservation struct {
+	id       uint64
+	callback func(IngressFrame)
+}
+
+type whatsappMessageIngressEnvelope struct {
+	Kind        string            `json:"kind"`
+	ChatJID     string            `json:"chat_jid"`
+	SenderJID   string            `json:"sender_jid"`
+	MessageID   string            `json:"message_id"`
+	TimestampMS int64             `json:"timestamp_ms"`
+	IsFromMe    bool              `json:"is_from_me"`
+	IsGroup     bool              `json:"is_group"`
+	PushName    string            `json:"push_name"`
+	Mentions    map[string]string `json:"mentions"`
+	ProtoB64    []byte            `json:"proto_b64"`
+}
+
+type whatsappReceiptIngressEnvelope struct {
+	Kind        string   `json:"kind"`
+	ChatJID     string   `json:"chat_jid"`
+	SenderJID   string   `json:"sender_jid"`
+	ReceiptType string   `json:"receipt_type"`
+	MessageIDs  []string `json:"message_ids"`
+	TimestampMS int64    `json:"timestamp_ms"`
+}
+
+type whatsappHistorySyncIngressEnvelope struct {
+	Kind     string `json:"kind"`
+	ProtoB64 []byte `json:"proto_b64"`
+}
+
 // AccountInfo is the paired identity needed to build supervisor start and
 // pairing results without exposing the underlying whatsmeow client.
 type AccountInfo struct {
@@ -266,9 +313,11 @@ type Bridge struct {
 	// clientGeneration changes whenever resetClientLocked installs a new
 	// whatsmeow client. Event handler closures capture it so callbacks from a
 	// retired client can never affect or terminate the replacement generation.
-	clientGeneration uint64
-	observation      lifecycleObservation
-	nextObserverID   uint64
+	clientGeneration      uint64
+	observation           lifecycleObservation
+	ingressObservation    ingressObservation
+	nextObserverID        uint64
+	nextIngressObserverID uint64
 
 	runtimeMu    sync.Mutex
 	runtimeDB    *sql.DB
@@ -464,6 +513,40 @@ func (b *Bridge) ObserveLifecycle(callback func(LifecycleEvent)) func() {
 		}
 		b.mu.Unlock()
 	}
+}
+
+// ObserveIngress installs the one active durable-ingress observer. The
+// returned removal function cannot clear an observer that replaced it.
+func (b *Bridge) ObserveIngress(callback func(IngressFrame)) func() {
+	b.mu.Lock()
+	b.nextIngressObserverID++
+	id := b.nextIngressObserverID
+	b.ingressObservation = ingressObservation{
+		id:       id,
+		callback: callback,
+	}
+	b.mu.Unlock()
+
+	return func() {
+		b.mu.Lock()
+		if b.ingressObservation.id == id {
+			b.ingressObservation = ingressObservation{}
+		}
+		b.mu.Unlock()
+	}
+}
+
+// LogIngressError records an adapter-side append failure without feeding it
+// back into the retained WhatsApp receive path.
+func (b *Bridge) LogIngressError(err error, accountID string, generation uint64) {
+	if err == nil {
+		return
+	}
+	b.logger.Warn().
+		Err(err).
+		Str("account_id", strings.TrimSpace(accountID)).
+		Uint64("generation", generation).
+		Msg("Failed to append WhatsApp ingress frame")
 }
 
 func (b *Bridge) resetClientLocked() error {
@@ -1893,6 +1976,212 @@ func (b *Bridge) handleEvent(raw any) {
 	b.handleClientEvent(nil, 0, raw)
 }
 
+func (b *Bridge) emitIngress(frame IngressFrame) {
+	b.mu.RLock()
+	observer := b.ingressObservation.callback
+	b.mu.RUnlock()
+	if observer == nil {
+		return
+	}
+	frame.Payload = cloneBytes(frame.Payload)
+	func() {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				b.logger.Warn().
+					Str("panic", fmt.Sprint(recovered)).
+					Msg("Recovered panic in WhatsApp ingress observer")
+			}
+		}()
+		observer(frame)
+	}()
+}
+
+func (b *Bridge) hasIngressObserver() bool {
+	b.mu.RLock()
+	hasObserver := b.ingressObservation.callback != nil
+	b.mu.RUnlock()
+	return hasObserver
+}
+
+func (b *Bridge) captureMessageIngress(evt *waevents.Message, chatJID watypes.JID) {
+	// Capture is strictly additive observation: a panic anywhere in the
+	// capture body must not reach the whatsmeow callback or skip the legacy
+	// handling that follows it.
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			b.logIngressCaptureError("message", fmt.Errorf("capture panic: %v", recovered))
+		}
+	}()
+	if !b.hasIngressObserver() {
+		return
+	}
+	receivedAt := time.Now()
+	protoBytes, err := proto.Marshal(evt.Message)
+	if err != nil {
+		b.logIngressCaptureError("message", err)
+		return
+	}
+
+	senderJID := b.canonicalJID(evt.Info.Sender).String()
+	mentionMessage := evt.Message
+	if protocolMessage := extractProtocolMessage(evt.Message); protocolMessage != nil &&
+		protocolMessage.GetType() == waE2E.ProtocolMessage_MESSAGE_EDIT &&
+		protocolMessage.GetEditedMessage() != nil {
+		mentionMessage = protocolMessage.GetEditedMessage()
+	}
+	mentions := b.captureMentionLabels(mentionMessage, chatJID)
+	payload, err := json.Marshal(whatsappMessageIngressEnvelope{
+		Kind:        "message",
+		ChatJID:     chatJID.String(),
+		SenderJID:   senderJID,
+		MessageID:   string(evt.Info.ID),
+		TimestampMS: evt.Info.Timestamp.UnixMilli(),
+		IsFromMe:    evt.Info.IsFromMe,
+		IsGroup:     evt.Info.IsGroup,
+		PushName:    evt.Info.PushName,
+		Mentions:    mentions,
+		ProtoB64:    protoBytes,
+	})
+	if err != nil {
+		b.logIngressCaptureError("message", err)
+		return
+	}
+	b.emitIngress(IngressFrame{
+		DedupeKey:  "msg:" + string(evt.Info.ID) + ":" + ingressHash8(protoBytes),
+		ReceivedAt: receivedAt,
+		Payload:    payload,
+	})
+}
+
+func (b *Bridge) captureReceiptIngress(evt *waevents.Receipt) {
+	// Capture is strictly additive observation: a panic anywhere in the
+	// capture body must not reach the whatsmeow callback or skip the legacy
+	// handling that follows it.
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			b.logIngressCaptureError("receipt", fmt.Errorf("capture panic: %v", recovered))
+		}
+	}()
+	if !b.hasIngressObserver() {
+		return
+	}
+	receivedAt := time.Now()
+	// canonicalJID, not normalizeConversationJID: the latter merges legacy
+	// conversation aliases as a side effect, and the legacy receipt path never
+	// touches conversation JIDs. Capture must observe, never mutate.
+	chatJID := b.canonicalJID(evt.Chat)
+	senderJID := b.canonicalJID(evt.Sender)
+	messageIDs := make([]string, len(evt.MessageIDs))
+	for index, id := range evt.MessageIDs {
+		messageIDs[index] = string(id)
+	}
+	payload, err := json.Marshal(whatsappReceiptIngressEnvelope{
+		Kind:        "receipt",
+		ChatJID:     chatJID.String(),
+		SenderJID:   senderJID.String(),
+		ReceiptType: ingressReceiptType(evt.Type),
+		MessageIDs:  messageIDs,
+		TimestampMS: evt.Timestamp.UnixMilli(),
+	})
+	if err != nil {
+		b.logIngressCaptureError("receipt", err)
+		return
+	}
+	b.emitIngress(IngressFrame{
+		DedupeKey:  "rcpt:" + ingressHash8(payload),
+		ReceivedAt: receivedAt,
+		Payload:    payload,
+	})
+}
+
+func (b *Bridge) captureHistorySyncIngress(evt *waevents.HistorySync) {
+	// Capture is strictly additive observation: a panic anywhere in the
+	// capture body must not reach the whatsmeow callback or skip the legacy
+	// handling that follows it.
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			b.logIngressCaptureError("history_sync", fmt.Errorf("capture panic: %v", recovered))
+		}
+	}()
+	if evt == nil || evt.Data == nil || !b.hasIngressObserver() {
+		return
+	}
+	receivedAt := time.Now()
+	protoBytes, err := proto.Marshal(evt.Data)
+	if err != nil {
+		b.logIngressCaptureError("history_sync", err)
+		return
+	}
+	payload, err := json.Marshal(whatsappHistorySyncIngressEnvelope{
+		Kind:     "history_sync",
+		ProtoB64: protoBytes,
+	})
+	if err != nil {
+		b.logIngressCaptureError("history_sync", err)
+		return
+	}
+	b.emitIngress(IngressFrame{
+		DedupeKey:  "hist:" + ingressHash8(payload),
+		ReceivedAt: receivedAt,
+		Payload:    payload,
+	})
+}
+
+func (b *Bridge) captureMentionLabels(msg *waE2E.Message, chatJID watypes.JID) map[string]string {
+	mentions := make(map[string]string)
+	ctx := messageContextInfo(msg)
+	if ctx == nil || len(ctx.GetMentionedJID()) == 0 {
+		return mentions
+	}
+	var convo *db.Conversation
+	if b.store != nil {
+		convo, _ = b.store.GetConversation(waConversationID(chatJID))
+	}
+	for _, raw := range ctx.GetMentionedJID() {
+		jid, err := watypes.ParseJID(strings.TrimSpace(raw))
+		if err != nil {
+			continue
+		}
+		label := b.whatsAppMentionLabel(jid, convo)
+		if label == "" {
+			continue
+		}
+		jid = jid.ToNonAD()
+		if !jid.IsEmpty() {
+			mentions[jid.String()] = label
+		}
+		canonical := b.canonicalJID(jid)
+		if !canonical.IsEmpty() {
+			mentions[canonical.String()] = label
+		}
+	}
+	return mentions
+}
+
+func ingressReceiptType(receiptType watypes.ReceiptType) string {
+	switch receiptType {
+	case watypes.ReceiptTypeDelivered:
+		return "delivered"
+	case watypes.ReceiptTypeReadSelf:
+		return "read_self"
+	case watypes.ReceiptTypePlayedSelf:
+		return "played_self"
+	case watypes.ReceiptTypeServerError:
+		return "server_error"
+	default:
+		return strings.ReplaceAll(string(receiptType), "-", "_")
+	}
+}
+
+func ingressHash8(payload []byte) string {
+	sum := sha256.Sum256(payload)
+	return hex.EncodeToString(sum[:4])
+}
+
+func (b *Bridge) logIngressCaptureError(kind string, err error) {
+	b.logger.Warn().Err(err).Str("kind", kind).Msg("Failed to capture WhatsApp ingress frame")
+}
+
 func (b *Bridge) applyEvent(raw any) {
 	switch evt := raw.(type) {
 	case *waevents.Connected:
@@ -1937,6 +2226,7 @@ func (b *Bridge) applyEvent(raw any) {
 	case *waevents.GroupInfo:
 		b.handleGroupInfo(evt)
 	case *waevents.HistorySync:
+		b.captureHistorySyncIngress(evt)
 		b.handleHistorySync(evt)
 	default:
 		b.logger.Debug().Type("type", evt).Msg("Unhandled WhatsApp event")
@@ -2016,7 +2306,7 @@ func (b *Bridge) handlePairError(err error) {
 // silently dropped, leaving edited text stale and deleted messages present
 // forever. Returns true if the event was an edit/revoke (and thus consumed).
 func (b *Bridge) handleProtocolMessage(evt *waevents.Message) bool {
-	pm := unwrapWhatsAppMessage(evt.Message).GetProtocolMessage()
+	pm := extractProtocolMessage(evt.Message)
 	if pm == nil {
 		return false
 	}
@@ -2074,6 +2364,19 @@ func (b *Bridge) handleMessage(evt *waevents.Message) {
 		return
 	}
 	chatJID := b.normalizeConversationJID(evt.Info.Chat)
+	b.captureMessageIngress(evt, chatJID)
+	b.handleLegacyMessage(evt, chatJID)
+}
+
+func (b *Bridge) handleMessageWithoutIngress(evt *waevents.Message) {
+	if evt == nil || evt.Message == nil {
+		return
+	}
+	chatJID := b.normalizeConversationJID(evt.Info.Chat)
+	b.handleLegacyMessage(evt, chatJID)
+}
+
+func (b *Bridge) handleLegacyMessage(evt *waevents.Message, chatJID watypes.JID) {
 	if evt.Info.IsGroup && b.shouldSuppressLeftGroup(waConversationID(chatJID)) {
 		return
 	}
@@ -2088,7 +2391,7 @@ func (b *Bridge) handleMessage(evt *waevents.Message) {
 	// which we could then feed through handleReactionMessage. For now we
 	// just drop them quietly with a debug log so they don't render as
 	// [Unsupported message] on every reaction in a community thread.
-	if unwrapWhatsAppMessage(evt.Message).GetEncReactionMessage() != nil {
+	if hasEncryptedReactionMessage(evt.Message) {
 		b.logger.Debug().
 			Str("msg_id", string(evt.Info.ID)).
 			Str("chat", evt.Info.Chat.String()).
@@ -2211,6 +2514,7 @@ func (b *Bridge) handleReceipt(evt *waevents.Receipt) {
 	if evt == nil || len(evt.MessageIDs) == 0 {
 		return
 	}
+	b.captureReceiptIngress(evt)
 	nextStatus, ok := receiptStatus(evt.Type)
 	if !ok {
 		return
@@ -2365,7 +2669,7 @@ func (b *Bridge) handleHistorySync(evt *waevents.HistorySync) {
 				b.logger.Debug().Err(err).Msg("Failed to parse WhatsApp history sync message")
 				continue
 			}
-			b.handleMessage(msgEvt)
+			b.handleMessageWithoutIngress(msgEvt)
 		}
 	}
 }
@@ -3342,6 +3646,12 @@ func extractStoredMediaRef(msg *waE2E.Message) (storedMediaRef, []byte, string, 
 	}
 }
 
+// ExtractStoredMediaRef exposes the retained pure media-reference extractor
+// to transport decoders without duplicating WhatsApp proto handling.
+func ExtractStoredMediaRef(msg *waE2E.Message) (StoredMediaRef, []byte, string, bool) {
+	return extractStoredMediaRef(msg)
+}
+
 func encodeBytes(value []byte) string {
 	if len(value) == 0 {
 		return ""
@@ -3571,6 +3881,12 @@ func extractMessageBody(msg *waE2E.Message) string {
 	}
 }
 
+// ExtractMessageBody exposes the retained pure message-body extractor to
+// transport decoders.
+func ExtractMessageBody(msg *waE2E.Message) string {
+	return extractMessageBody(msg)
+}
+
 // locationMessagePlaceholder returns a human-readable body for a LocationMessage,
 // or "" if the message isn't a location. Prefers the name, then the address,
 // then a generic [Location] placeholder. Coordinates are omitted since they're
@@ -3670,12 +3986,59 @@ func extractReactionMessage(msg *waE2E.Message) *waE2E.ReactionMessage {
 	return msg.GetReactionMessage()
 }
 
+// ExtractReactionMessage exposes the retained pure reaction extractor to
+// transport decoders.
+func ExtractReactionMessage(msg *waE2E.Message) *waE2E.ReactionMessage {
+	return extractReactionMessage(msg)
+}
+
 func extractReplyToID(msg *waE2E.Message) string {
 	ctx := messageContextInfo(msg)
 	if ctx == nil || strings.TrimSpace(ctx.GetStanzaID()) == "" {
 		return ""
 	}
 	return "whatsapp:" + strings.TrimSpace(ctx.GetStanzaID())
+}
+
+// ExtractReplyToID exposes the retained pure reply extractor to transport
+// decoders.
+func ExtractReplyToID(msg *waE2E.Message) string {
+	return extractReplyToID(msg)
+}
+
+// ExtractMentionedJIDs returns the WhatsApp JIDs declared by the message's
+// retained ContextInfo extractor.
+func ExtractMentionedJIDs(msg *waE2E.Message) []string {
+	ctx := messageContextInfo(msg)
+	if ctx == nil {
+		return nil
+	}
+	return append([]string(nil), ctx.GetMentionedJID()...)
+}
+
+func extractProtocolMessage(msg *waE2E.Message) *waE2E.ProtocolMessage {
+	msg = unwrapWhatsAppMessage(msg)
+	if msg == nil {
+		return nil
+	}
+	return msg.GetProtocolMessage()
+}
+
+// ExtractProtocolMessage exposes pure protocol-message unwrapping to
+// transport decoders.
+func ExtractProtocolMessage(msg *waE2E.Message) *waE2E.ProtocolMessage {
+	return extractProtocolMessage(msg)
+}
+
+func hasEncryptedReactionMessage(msg *waE2E.Message) bool {
+	msg = unwrapWhatsAppMessage(msg)
+	return msg != nil && msg.GetEncReactionMessage() != nil
+}
+
+// HasEncryptedReactionMessage reports whether msg contains the encrypted
+// reaction form that the retained bridge cannot decode yet.
+func HasEncryptedReactionMessage(msg *waE2E.Message) bool {
+	return hasEncryptedReactionMessage(msg)
 }
 
 func (b *Bridge) messageMentionsOwnAccount(msg *waE2E.Message) bool {

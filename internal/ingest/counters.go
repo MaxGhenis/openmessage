@@ -21,6 +21,7 @@ type CounterSnapshot struct {
 	EmptyStubsSkipped uint64 `json:"empty_stubs_skipped"`
 	ReceiptsSelf      uint64 `json:"receipts_self"`
 	ReceiptsDropped   uint64 `json:"receipts_dropped"`
+	AppendErrors      uint64 `json:"append_errors"`
 	Quarantined       uint64 `json:"quarantined"`
 	StaleReplays      uint64 `json:"stale_replays"`
 	EchoReconciled    uint64 `json:"echo_reconciled"`
@@ -43,6 +44,7 @@ type accountCounters struct {
 	emptyStubsSkipped atomic.Uint64
 	receiptsSelf      atomic.Uint64
 	receiptsDropped   atomic.Uint64
+	appendErrors      atomic.Uint64
 	quarantined       atomic.Uint64
 	staleReplays      atomic.Uint64
 	echoReconciled    atomic.Uint64
@@ -122,6 +124,7 @@ func snapshotCounters(c *accountCounters) CounterSnapshot {
 		EmptyStubsSkipped: c.emptyStubsSkipped.Load(),
 		ReceiptsSelf:      c.receiptsSelf.Load(),
 		ReceiptsDropped:   c.receiptsDropped.Load(),
+		AppendErrors:     c.appendErrors.Load(),
 		Quarantined:       c.quarantined.Load(),
 		StaleReplays:      c.staleReplays.Load(),
 		EchoReconciled:    c.echoReconciled.Load(),
