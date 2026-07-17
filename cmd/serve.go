@@ -28,6 +28,7 @@ import (
 	"github.com/maxghenis/openmessage/internal/db"
 	"github.com/maxghenis/openmessage/internal/googlecookies"
 	"github.com/maxghenis/openmessage/internal/importer"
+	"github.com/maxghenis/openmessage/internal/ingest"
 	"github.com/maxghenis/openmessage/internal/notify"
 	"github.com/maxghenis/openmessage/internal/telemetry"
 	"github.com/maxghenis/openmessage/internal/tools"
@@ -64,6 +65,15 @@ func v2SendWebOptions(stack *v2Stack, enabled bool) *web.V2Options {
 		V2Store:  stack.Store,
 		Blobs:    stack.Blobs,
 		Registry: stack.Registry,
+	}
+}
+
+func v2IngestCountersProvider(stack *v2Stack) func() map[string]ingest.CounterSnapshot {
+	if stack == nil {
+		return nil
+	}
+	return func() map[string]ingest.CounterSnapshot {
+		return stack.Counters.PerAccount()
 	}
 }
 
@@ -567,6 +577,7 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 	a.StartScheduler()
 
 	v2Options := v2SendWebOptions(stack, v2Send)
+	v2IngestCounters := v2IngestCountersProvider(stack)
 
 	httpEnabled := opts.web || opts.mcpSSE
 	if httpEnabled {
@@ -574,6 +585,7 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 		if opts.web {
 			httpHandler = web.APIHandlerWithOptions(a.Store, nil, logger, mcpHTTPHandler, web.APIOptions{
 				V2:                    v2Options,
+				V2IngestCounters:      v2IngestCounters,
 				Client:                a.GetClient,
 				Events:                events,
 				IdentityName:          identityName,

@@ -1,16 +1,21 @@
 //go:build livetransport
 
 // Package livetransport is the manual live-verification harness for the v2
-// send pipeline (T1-T3 text, T5a reactions, T5b read receipts, M2b media).
-// It drives the REAL transports against the operator's own live pairing state
-// and sends ONLY to self-recipient threads. It never runs in CI (build tag)
-// and must only run with the OpenMessage app quit (session safety) and with
-// the operator's explicit go-ahead.
+// send and ingest pipelines. It drives the REAL transports against the
+// operator's own live pairing state. The ingest verification is passive and
+// never sends; the send verification sends ONLY to self-recipient threads.
+// Neither runs in CI (build tag), and both require the OpenMessage app to be
+// quit so the harness has sole ownership of the live sessions. The send test
+// additionally requires the operator's explicit go-ahead.
 //
 // Run:
 //
 //	GOWORK=off go test -tags livetransport -run TestLiveSelfSendVerification \
 //	  -v -count=1 -timeout 10m ./internal/livetransport/
+//
+//	LIVE_PLATFORMS=google GOWORK=off go test -tags livetransport \
+//	  -run TestLiveIngestVerification -v -count=1 -timeout 10m \
+//	  ./internal/livetransport/
 package livetransport
 
 import (
@@ -27,31 +32,48 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/rs/zerolog"
+	watypes "go.mau.fi/whatsmeow/types"
 
 	"github.com/maxghenis/openmessage/internal/app"
 	"github.com/maxghenis/openmessage/internal/bridge"
 	googleadapter "github.com/maxghenis/openmessage/internal/bridgeadapters/google"
 	signaladapter "github.com/maxghenis/openmessage/internal/bridgeadapters/signal"
+	whatsappadapter "github.com/maxghenis/openmessage/internal/bridgeadapters/whatsapp"
+	"github.com/maxghenis/openmessage/internal/ingest"
 	"github.com/maxghenis/openmessage/internal/messaging"
 	"github.com/maxghenis/openmessage/internal/storage/blob"
 	"github.com/maxghenis/openmessage/internal/storage/sqlite"
 )
 
 const (
-	liveDataDirEnv        = "OPENMESSAGES_DATA_DIR"
-	googleAccountID       = "google-primary"
-	signalAccountID       = "signal-primary"
+	liveDataDirEnv               = "OPENMESSAGES_DATA_DIR"
+	googleAccountID              = "google-primary"
+	whatsappAccountID            = "whatsapp-primary"
+	signalAccountID              = "signal-primary"
 	defaultGoogleSelfConvRemote  = "1770"  // live self-thread (canonical, per /api/new-conversation)
 	defaultGoogleAnchorMessageID = "85269" // real anchor message sent via the legacy path
-	signalSelfConvRemote  = "signal:+16506303657"
-	onlineWait            = 90 * time.Second
-	settleWait            = 60 * time.Second
+	signalSelfConvRemote         = "signal:+16506303657"
+	onlineWait                   = 90 * time.Second
+	settleWait                   = 60 * time.Second
+	ingestWait                   = 2 * time.Minute
 )
+
+type liveIngestTransport struct {
+	name                   string
+	accountID              string
+	bridgeKey              string
+	displayName            string
+	platform               bridge.Platform
+	adapter                bridge.Adapter
+	codec                  string
+	selfRemoteConversation string
+}
 
 type wallClock struct{}
 
@@ -79,6 +101,379 @@ func livePolicy() bridge.Policy {
 		MaxBackoff:         30 * time.Second,
 		MaxSameFingerprint: 3,
 	}
+}
+
+// TestLiveIngestVerification is deliberately receive-only. Selecting a
+// platform means the operator expects its real receive path to produce a
+// message-bearing frame during ingestWait. Google normally does this during
+// startup sync; idle WhatsApp and Signal accounts need a genuinely inbound or
+// history frame and may otherwise remain at zero.
+func TestLiveIngestVerification(t *testing.T) {
+	selected := liveIngestPlatforms(t)
+	dataDir := os.Getenv(liveDataDirEnv)
+	if dataDir == "" {
+		dataDir = filepath.Join(os.Getenv("HOME"), "Library", "Application Support", "OpenMessage")
+		os.Setenv(liveDataDirEnv, dataDir)
+	}
+	if selected["google"] {
+		if _, err := os.Stat(filepath.Join(dataDir, "session.json")); err != nil {
+			t.Fatalf("live Google data dir not found or unpaired: %v", err)
+		}
+	}
+
+	logger := zerolog.New(zerolog.ConsoleWriter{Out: os.Stderr}).With().Timestamp().Logger()
+	a, err := app.New(logger)
+	if err != nil {
+		t.Fatalf("app.New(): %v", err)
+	}
+	defer a.Close()
+
+	transports := make([]liveIngestTransport, 0, len(selected))
+	if selected["google"] {
+		adapter := googleadapter.New(googleAccountID, a, func() bool { return false })
+		a.SetGoogleLifecycleNotifier(adapter)
+		transports = append(transports, liveIngestTransport{
+			name:                   "google",
+			accountID:              googleAccountID,
+			bridgeKey:              "google_messages",
+			displayName:            "Google Messages",
+			platform:               bridge.PlatformGoogle,
+			adapter:                adapter,
+			codec:                  ingest.GoogleCodec,
+			selfRemoteConversation: envOr("LIVE_GOOGLE_CONV", defaultGoogleSelfConvRemote),
+		})
+	}
+	if selected["whatsapp"] {
+		whatsappBridge, err := a.InitializeWhatsApp()
+		if err != nil {
+			t.Fatalf("InitializeWhatsApp(): %v", err)
+		}
+		paired := whatsappBridge.PairedAccount()
+		if !paired.Paired {
+			t.Fatal("WhatsApp is selected in LIVE_PLATFORMS but is not paired")
+		}
+		selfConversation := os.Getenv("LIVE_WHATSAPP_CONV")
+		if selfConversation == "" {
+			jid, err := watypes.ParseJID(paired.JID)
+			if err != nil {
+				t.Fatalf("parse paired WhatsApp JID %q: %v", paired.JID, err)
+			}
+			selfConversation = "whatsapp:" + jid.ToNonAD().String()
+		}
+		adapter := whatsappadapter.New(whatsappAccountID, whatsappBridge)
+		a.SetWhatsAppLifecycleNotifier(adapter)
+		transports = append(transports, liveIngestTransport{
+			name:                   "whatsapp",
+			accountID:              whatsappAccountID,
+			bridgeKey:              "whatsmeow",
+			displayName:            "WhatsApp",
+			platform:               bridge.PlatformWhatsApp,
+			adapter:                adapter,
+			codec:                  ingest.WhatsAppCodec,
+			selfRemoteConversation: selfConversation,
+		})
+	}
+	if selected["signal"] {
+		signalBridge, err := a.EnsureSignal()
+		if err != nil {
+			t.Fatalf("EnsureSignal(): %v", err)
+		}
+		signalStatus := signalBridge.Status()
+		if !signalStatus.Paired {
+			t.Fatal("Signal is selected in LIVE_PLATFORMS but is not paired")
+		}
+		defaultSelfConversation := signalSelfConvRemote
+		if strings.TrimSpace(signalStatus.Account) != "" {
+			defaultSelfConversation = "signal:" + strings.TrimSpace(signalStatus.Account)
+		}
+		adapter := signaladapter.New(signalAccountID, signalBridge)
+		a.SetSignalLifecycleNotifier(adapter)
+		transports = append(transports, liveIngestTransport{
+			name:                   "signal",
+			accountID:              signalAccountID,
+			bridgeKey:              "signal_cli",
+			displayName:            "Signal",
+			platform:               bridge.PlatformSignal,
+			adapter:                adapter,
+			codec:                  ingest.SignalJSONRPCCodec,
+			selfRemoteConversation: envOr("LIVE_SIGNAL_CONV", defaultSelfConversation),
+		})
+	}
+
+	tempDir := t.TempDir()
+	storePath := filepath.Join(tempDir, "v2.sqlite")
+	store, err := sqlite.Open(storePath)
+	if err != nil {
+		t.Fatalf("sqlite.Open(): %v", err)
+	}
+	defer store.Close()
+	blobs, err := blob.New(filepath.Join(tempDir, "blobs"))
+	if err != nil {
+		t.Fatalf("blob.New(): %v", err)
+	}
+	registry := bridge.NewRegistry()
+	nowMS := time.Now().UnixMilli()
+	for _, transport := range transports {
+		seedLiveAccount(t, store, nowMS, transport)
+		if err := registry.Register(transport.adapter); err != nil {
+			t.Fatalf("register %s adapter: %v", transport.name, err)
+		}
+	}
+	service, err := messaging.NewMessageService(
+		store,
+		registry,
+		blobs,
+		messaging.SystemClock{},
+		messaging.CryptoIDSource{},
+	)
+	if err != nil {
+		t.Fatalf("NewMessageService(): %v", err)
+	}
+	messages, err := sqlite.NewMessageRepository(store, time.Now)
+	if err != nil {
+		t.Fatalf("NewMessageRepository(): %v", err)
+	}
+	counters := &ingest.Counters{}
+	worker, err := ingest.NewWorker(ingest.WorkerConfig{
+		Store:        store,
+		Messages:     messages,
+		EchoObserver: service,
+		Counters:     counters,
+		Logger:       logger,
+		Decoders: []ingest.DecoderRegistration{
+			{
+				Codec:    ingest.GoogleCodec,
+				Platform: bridge.PlatformGoogle,
+				Decoder:  ingest.NewGoogleDecoder(counters),
+			},
+			ingest.NewWhatsAppDecoderRegistration(),
+			{
+				Codec:    ingest.SignalJSONRPCCodec,
+				Platform: bridge.PlatformSignal,
+				Decoder:  ingest.NewSignalDecoder(),
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("ingest.NewWorker(): %v", err)
+	}
+	sink, err := ingest.NewSink(ingest.SinkConfig{
+		Messages: messages,
+		Worker:   worker,
+		Counters: counters,
+	})
+	if err != nil {
+		t.Fatalf("ingest.NewSink(): %v", err)
+	}
+	workerCtx, cancelWorker := context.WithCancel(context.Background())
+	workerDone := make(chan error, 1)
+	go func() { workerDone <- worker.Run(workerCtx) }()
+	defer func() {
+		cancelWorker()
+		if err := <-workerDone; err != nil {
+			t.Errorf("ingest worker stopped: %v", err)
+		}
+	}()
+
+	supervisors := make(map[string]*bridge.Supervisor, len(transports))
+	for _, transport := range transports {
+		supervisor, err := bridge.NewSupervisor(
+			transport.accountID,
+			transport.platform,
+			transport.adapter,
+			livePolicy(),
+			wallClock{},
+			wallRandom{},
+			bridge.WithConnectionSink(sink),
+		)
+		if err != nil {
+			t.Fatalf("%s NewSupervisor(): %v", transport.name, err)
+		}
+		supervisors[transport.name] = supervisor
+		defer stopSupervisor(t, supervisor, transport.name)
+	}
+	for _, transport := range transports {
+		startSupervisor(t, supervisors[transport.name], transport.name)
+	}
+	for _, transport := range transports {
+		if !waitOnline(t, supervisors[transport.name], transport.name) {
+			t.Fatalf("selected %s transport did not come online", transport.name)
+		}
+	}
+
+	raw := openRawV2Store(t, storePath)
+	defer raw.Close()
+	deadline := time.Now().Add(ingestWait)
+	pending := make(map[string]liveIngestTransport, len(transports))
+	for _, transport := range transports {
+		pending[transport.accountID] = transport
+	}
+	for len(pending) > 0 && time.Now().Before(deadline) {
+		for accountID, transport := range pending {
+			snapshot := counters.Snapshot(accountID)
+			if snapshot.Quarantined != 0 {
+				t.Fatalf("%s ingest quarantined frames while waiting: %+v", transport.name, snapshot)
+			}
+			if snapshot.Appended == 0 || snapshot.Projected == 0 {
+				continue
+			}
+			projectedRows, err := countLiveIngestMessages(
+				raw,
+				transport.accountID,
+				transport.selfRemoteConversation,
+			)
+			if err != nil {
+				t.Fatalf("count %s self-thread messages while waiting: %v", transport.name, err)
+			}
+			if projectedRows > 0 {
+				t.Logf(
+					"INGEST [%s] counters ready with %d self-thread rows: %+v",
+					transport.name,
+					projectedRows,
+					snapshot,
+				)
+				delete(pending, accountID)
+			}
+		}
+		if len(pending) > 0 {
+			time.Sleep(500 * time.Millisecond)
+		}
+	}
+	if len(pending) > 0 {
+		for _, transport := range pending {
+			projectedRows, err := countLiveIngestMessages(raw, transport.accountID, transport.selfRemoteConversation)
+			t.Logf(
+				"INGEST [%s] timed out with counters=%+v self_thread_rows=%d query_error=%v",
+				transport.name,
+				counters.Snapshot(transport.accountID),
+				projectedRows,
+				err,
+			)
+		}
+		t.Fatalf("selected live ingest platforms did not append and project a self-thread row within %s", ingestWait)
+	}
+
+	for _, transport := range transports {
+		snapshot := counters.Snapshot(transport.accountID)
+		if snapshot.Quarantined != 0 {
+			t.Fatalf("%s ingest quarantined = %d, want 0", transport.name, snapshot.Quarantined)
+		}
+		var inboxRows int
+		if err := raw.QueryRowContext(
+			context.Background(),
+			`SELECT COUNT(*) FROM inbox WHERE account_id = ? AND codec = ?`,
+			transport.accountID,
+			transport.codec,
+		).Scan(&inboxRows); err != nil {
+			t.Fatalf("count %s inbox rows: %v", transport.name, err)
+		}
+		if inboxRows == 0 {
+			t.Fatalf("%s appended counters advanced without an inbox row using codec %q", transport.name, transport.codec)
+		}
+
+		projectedRows, err := countLiveIngestMessages(
+			raw,
+			transport.accountID,
+			transport.selfRemoteConversation,
+		)
+		if err != nil {
+			t.Fatalf("count %s self-thread messages: %v", transport.name, err)
+		}
+		if projectedRows == 0 {
+			t.Fatalf(
+				"%s projected no messages for live self-thread %q (counters=%+v)",
+				transport.name,
+				transport.selfRemoteConversation,
+				snapshot,
+			)
+		}
+		t.Logf(
+			"INGEST [%s] verified inbox=%d self_thread_messages=%d quarantined=0",
+			transport.name,
+			inboxRows,
+			projectedRows,
+		)
+	}
+}
+
+func liveIngestPlatforms(t *testing.T) map[string]bool {
+	t.Helper()
+	raw := strings.TrimSpace(os.Getenv("LIVE_PLATFORMS"))
+	if raw == "" {
+		t.Skip("set LIVE_PLATFORMS=google,whatsapp,signal to select passive ingest legs")
+	}
+	selected := make(map[string]bool)
+	for _, field := range strings.FieldsFunc(raw, func(r rune) bool {
+		return r == ',' || r == ' ' || r == '\t' || r == '\n'
+	}) {
+		name := strings.ToLower(strings.TrimSpace(field))
+		switch name {
+		case "all":
+			selected["google"] = true
+			selected["whatsapp"] = true
+			selected["signal"] = true
+		case "google", "whatsapp", "signal":
+			selected[name] = true
+		default:
+			t.Fatalf("LIVE_PLATFORMS contains unsupported platform %q", field)
+		}
+	}
+	if len(selected) == 0 {
+		t.Fatal("LIVE_PLATFORMS selected no platforms")
+	}
+	return selected
+}
+
+func seedLiveAccount(t *testing.T, store *sqlite.Store, nowMS int64, transport liveIngestTransport) {
+	t.Helper()
+	if err := store.UpsertAccount(sqlite.Account{
+		AccountID:   transport.accountID,
+		BridgeKey:   transport.bridgeKey,
+		DisplayName: transport.displayName,
+		Mode:        sqlite.AccountModeLive,
+		Enabled:     true,
+		ConfigJSON:  `{}`,
+		CreatedAtMS: nowMS,
+		UpdatedAtMS: nowMS,
+	}); err != nil {
+		t.Fatalf("UpsertAccount(%s): %v", transport.accountID, err)
+	}
+}
+
+func openRawV2Store(t *testing.T, dbPath string) *sql.DB {
+	t.Helper()
+	query := make(url.Values)
+	query.Add("_pragma", "busy_timeout(5000)")
+	query.Add("_pragma", "foreign_keys(ON)")
+	raw, err := sql.Open("sqlite", (&url.URL{
+		Scheme:   "file",
+		Path:     filepath.ToSlash(dbPath),
+		RawQuery: query.Encode(),
+	}).String())
+	if err != nil {
+		t.Fatalf("open raw v2 store: %v", err)
+	}
+	if err := raw.PingContext(context.Background()); err != nil {
+		raw.Close()
+		t.Fatalf("ping raw v2 store: %v", err)
+	}
+	return raw
+}
+
+func countLiveIngestMessages(raw *sql.DB, accountID, remoteConversationID string) (int, error) {
+	var count int
+	err := raw.QueryRowContext(
+		context.Background(),
+		`SELECT COUNT(*)
+		 FROM messages AS m
+		 JOIN conversations AS c
+		   ON c.account_id = m.account_id
+		  AND c.conversation_id = m.conversation_id
+		 WHERE m.account_id = ? AND c.remote_conversation_id = ?`,
+		accountID,
+		remoteConversationID,
+	).Scan(&count)
+	return count, err
 }
 
 func TestLiveSelfSendVerification(t *testing.T) {

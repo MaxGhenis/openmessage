@@ -9,12 +9,14 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 
 	"github.com/rs/zerolog"
 
 	"github.com/maxghenis/openmessage/internal/db"
+	"github.com/maxghenis/openmessage/internal/ingest"
 	"github.com/maxghenis/openmessage/internal/media"
 	"github.com/maxghenis/openmessage/internal/messaging"
 	"github.com/maxghenis/openmessage/internal/storage/blob"
@@ -84,6 +86,66 @@ func TestStatusReportsV2SendAvailability(t *testing.T) {
 			}
 			if got, ok := payload["v2_send"].(bool); !ok || got != test.want {
 				t.Fatalf("v2_send = %#v, want %t", payload["v2_send"], test.want)
+			}
+		})
+	}
+}
+
+func TestStatusReportsV2IngestCounters(t *testing.T) {
+	tests := []struct {
+		name           string
+		provider       func() map[string]ingest.CounterSnapshot
+		wantEnabled    bool
+		wantPerAccount map[string]ingest.CounterSnapshot
+	}{
+		{
+			name:           "disabled",
+			wantPerAccount: map[string]ingest.CounterSnapshot{},
+		},
+		{
+			name: "enabled",
+			provider: func() map[string]ingest.CounterSnapshot {
+				return map[string]ingest.CounterSnapshot{
+					"google:primary": {
+						Appended:      7,
+						DecodedEvents: 6,
+						Projected:     5,
+						Quarantined:   1,
+					},
+				}
+			},
+			wantEnabled: true,
+			wantPerAccount: map[string]ingest.CounterSnapshot{
+				"google:primary": {
+					Appended:      7,
+					DecodedEvents: 6,
+					Projected:     5,
+					Quarantined:   1,
+				},
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ts := newV1RecorderHarness(t, APIOptions{V2IngestCounters: test.provider})
+			resp := ts.do(t, httptest.NewRequest(http.MethodGet, "http://127.0.0.1/api/status", nil))
+			defer resp.Body.Close()
+
+			var payload struct {
+				V2Ingest struct {
+					Enabled    bool                              `json:"enabled"`
+					PerAccount map[string]ingest.CounterSnapshot `json:"per_account"`
+				} `json:"v2_ingest"`
+			}
+			if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+				t.Fatal(err)
+			}
+			if payload.V2Ingest.Enabled != test.wantEnabled {
+				t.Fatalf("v2_ingest.enabled = %t, want %t", payload.V2Ingest.Enabled, test.wantEnabled)
+			}
+			if !reflect.DeepEqual(payload.V2Ingest.PerAccount, test.wantPerAccount) {
+				t.Fatalf("v2_ingest.per_account = %#v, want %#v", payload.V2Ingest.PerAccount, test.wantPerAccount)
 			}
 		})
 	}
