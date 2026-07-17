@@ -3,7 +3,9 @@ package cmd
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -12,7 +14,63 @@ import (
 
 	"github.com/maxghenis/openmessage/internal/app"
 	"github.com/maxghenis/openmessage/internal/db"
+	"github.com/maxghenis/openmessage/internal/readsource"
+	"github.com/maxghenis/openmessage/internal/storage/sqlite"
+	"github.com/maxghenis/openmessage/internal/v2read"
 )
+
+type commandReadSession struct {
+	Reads     readsource.ReadSource
+	DataDir   string
+	StorePath string
+	close     func()
+}
+
+func (s *commandReadSession) Close() {
+	if s != nil && s.close != nil {
+		s.close()
+	}
+}
+
+func openCommandReadSource(
+	logger zerolog.Logger,
+	banner io.Writer,
+) (*commandReadSession, error) {
+	dataDir := app.DefaultDataDir()
+	mode, err := resolveV2RuntimeMode(app.DemoMode(), dataDir)
+	if err != nil {
+		return nil, err
+	}
+	if mode.Primary {
+		storePath := filepath.Join(dataDir, "v2", "store.sqlite3")
+		store, err := sqlite.Open(storePath)
+		if err != nil {
+			return nil, fmt.Errorf("open v2 read store %q: %w", storePath, err)
+		}
+		if banner != nil {
+			fmt.Fprintln(banner, "reading v2 store")
+		}
+		return &commandReadSession{
+			Reads:     v2read.New(store),
+			DataDir:   dataDir,
+			StorePath: storePath,
+			close: func() {
+				_ = store.Close()
+			},
+		}, nil
+	}
+
+	a, err := app.New(logger)
+	if err != nil {
+		return nil, fmt.Errorf("init app: %w", err)
+	}
+	return &commandReadSession{
+		Reads:     a.Store,
+		DataDir:   a.DataDir,
+		StorePath: filepath.Join(a.DataDir, "messages.db"),
+		close:     a.Close,
+	}, nil
+}
 
 // RunRead handles "openmessage read <query> [--limit N] [--phone NUMBER] [--json]".
 //
@@ -49,13 +107,13 @@ func RunRead(logger zerolog.Logger, args ...string) error {
 	}
 	asJSON := hasFlag(rest, "--json")
 
-	a, err := app.New(logger)
+	session, err := openCommandReadSource(logger, os.Stderr)
 	if err != nil {
-		return fmt.Errorf("init app: %w", err)
+		return err
 	}
-	defer a.Close()
+	defer session.Close()
 
-	msgs, err := a.Store.SearchMessagesFiltered(query, filter)
+	msgs, err := session.Reads.SearchMessagesFiltered(query, filter)
 	if err != nil {
 		return fmt.Errorf("search failed: %w", err)
 	}

@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"time"
@@ -10,13 +11,47 @@ import (
 
 	"github.com/maxghenis/openmessage/internal/app"
 	"github.com/maxghenis/openmessage/internal/db"
+	"github.com/maxghenis/openmessage/internal/readsource"
 )
 
+// Options selects the canonical read source and optional durable-send seam.
+// Zero-value options preserve the legacy-primary behavior.
+type Options struct {
+	Reads     readsource.ReadSource
+	V2Primary bool
+	V2        *V2Dependencies
+}
+
 func Register(s *server.MCPServer, a *app.App, v2 ...*V2Dependencies) {
-	configuredV2 := activeV2(v2)
-	s.AddTool(getMessagesTool(), getMessagesHandler(a))
-	s.AddTool(getConversationTool(), getConversationHandler(a))
-	s.AddTool(searchMessagesTool(), searchMessagesHandler(a))
+	var configuredV2 *V2Dependencies
+	if len(v2) > 0 {
+		configuredV2 = v2[0]
+	}
+	RegisterWithOptions(s, a, Options{Reads: a.Store, V2: configuredV2})
+}
+
+// RegisterWithOptions registers the MCP surface against an explicit serving
+// store. Register remains as the compatibility entry point for legacy callers.
+func RegisterWithOptions(s *server.MCPServer, a *app.App, options Options) {
+	if options.Reads == nil {
+		options.Reads = a.Store
+	}
+	configuredV2 := activeV2([]*V2Dependencies{options.V2})
+	v2Primary := options.V2Primary
+	if configuredV2 != nil && configuredV2.V2Primary {
+		v2Primary = true
+	}
+	if configuredV2 != nil && v2Primary != configuredV2.V2Primary {
+		configuredCopy := *configuredV2
+		configuredCopy.V2Primary = v2Primary
+		configuredV2 = &configuredCopy
+	}
+	options.V2Primary = v2Primary
+	options.V2 = configuredV2
+
+	s.AddTool(getMessagesTool(), getMessagesHandler(a, options))
+	s.AddTool(getConversationTool(), getConversationHandler(a, options))
+	s.AddTool(searchMessagesTool(), searchMessagesHandler(a, options))
 	if configuredV2 == nil {
 		s.AddTool(sendMessageTool(), sendMessageHandler(a))
 		s.AddTool(sendToConversationTool(), sendToConversationHandler(a))
@@ -28,26 +63,48 @@ func Register(s *server.MCPServer, a *app.App, v2 ...*V2Dependencies) {
 	}
 	s.AddTool(reactToMessageTool(), reactToMessageHandler(a))
 	s.AddTool(setMessageTranscriptTool(), setMessageTranscriptHandler(a))
-	s.AddTool(listConversationsTool(), listConversationsHandler(a))
+	s.AddTool(listConversationsTool(), listConversationsHandler(a, options))
 	s.AddTool(listContactsTool(), listContactsHandler(a))
 	s.AddTool(resolveContactRoutesTool(), resolveContactRoutesHandler(a))
-	s.AddTool(getStatusTool(), getStatusHandler(a))
+	s.AddTool(getStatusTool(), getStatusHandler(a, options))
 	s.AddTool(draftMessageTool(), draftMessageHandler(a))
 	s.AddTool(downloadMediaTool(), downloadMediaHandler(a))
 	s.AddTool(importMessagesTool(), importMessagesHandler(a))
-	s.AddTool(getPersonMessagesTool(), getPersonMessagesHandler(a))
-	s.AddTool(conversationStatsTool(), conversationStatsHandler(a))
-	s.AddTool(generateStoryTool(), generateStoryHandler(a))
-	s.AddTool(personStatsTool(), personStatsHandler(a))
-	s.AddTool(generatePersonStoryTool(), generatePersonStoryHandler(a))
-	s.AddTool(generateVizTool(), generateVizHandler(a))
-	s.AddTool(getPersonMessagesRangeTool(), getPersonMessagesRangeHandler(a))
-	s.AddTool(renderStoryTool(), renderStoryHandler(a))
+	s.AddTool(getPersonMessagesTool(), unavailableInV2Primary(v2Primary, getPersonMessagesHandler(a)))
+	s.AddTool(conversationStatsTool(), unavailableInV2Primary(v2Primary, conversationStatsHandler(a)))
+	s.AddTool(generateStoryTool(), unavailableInV2Primary(v2Primary, generateStoryHandler(a)))
+	s.AddTool(personStatsTool(), unavailableInV2Primary(v2Primary, personStatsHandler(a)))
+	s.AddTool(generatePersonStoryTool(), unavailableInV2Primary(v2Primary, generatePersonStoryHandler(a)))
+	s.AddTool(generateVizTool(), unavailableInV2Primary(v2Primary, generateVizHandler(a)))
+	s.AddTool(getPersonMessagesRangeTool(), unavailableInV2Primary(v2Primary, getPersonMessagesRangeHandler(a)))
+	s.AddTool(renderStoryTool(), unavailableInV2Primary(v2Primary, renderStoryHandler(a)))
 	if configuredV2 == nil {
 		s.AddTool(sendGroupMessageTool(), sendGroupMessageHandler(a))
 	} else {
 		s.AddTool(sendGroupMessageTool(true), sendGroupMessageHandler(a, configuredV2))
 	}
+}
+
+const unavailableWhileV2Serving = "not available while v2 is the serving store"
+
+func unavailableInV2Primary(primary bool, legacy server.ToolHandlerFunc) server.ToolHandlerFunc {
+	if !primary {
+		return legacy
+	}
+	return func(context.Context, mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		return errorResult(unavailableWhileV2Serving), nil
+	}
+}
+
+func resolvedOptions(a *app.App, configured []Options) Options {
+	options := Options{Reads: a.Store}
+	if len(configured) > 0 {
+		options = configured[0]
+		if options.Reads == nil {
+			options.Reads = a.Store
+		}
+	}
+	return options
 }
 
 func strArg(args map[string]any, key string) string {

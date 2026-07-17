@@ -210,6 +210,227 @@ func TestImportMessageSupportsBothDirectionsWithoutInbox(t *testing.T) {
 	}
 }
 
+func TestListMessagesByConversationPaginationAndAround(t *testing.T) {
+	store, repository := openMessageTestRepository(
+		t,
+		func() time.Time { return time.UnixMilli(messageTestTimeMS) },
+	)
+	seedMessageAccount(t, store, "account-a", "google_messages")
+	seedMessageAccount(t, store, "account-b", "whatsmeow")
+	seedMessageConversation(t, store, "conversation-a", "account-a")
+	seedMessageConversation(t, store, "conversation-b", "account-b")
+
+	importMessage := func(id, conversationID, accountID string, occurredAtMS int64) {
+		t.Helper()
+		message := messageTestMessage(id, conversationID, accountID, "remote-"+id, nil)
+		message.OccurredAtMS = occurredAtMS
+		if err := repository.ImportMessage(context.Background(), MessageProjection{Message: message}); err != nil {
+			t.Fatalf("ImportMessage(%q): %v", id, err)
+		}
+	}
+	for _, item := range []struct {
+		id string
+		ts int64
+	}{
+		{id: "message-old", ts: 100},
+		{id: "message-tie-a", ts: 200},
+		{id: "message-tie-b", ts: 200},
+		{id: "message-new", ts: 300},
+		{id: "message-newest", ts: 400},
+	} {
+		importMessage(item.id, "conversation-a", "account-a", item.ts)
+	}
+	importMessage("message-other", "conversation-b", "account-b", 1_000)
+
+	assertIDs := func(name string, got []Message, want ...string) {
+		t.Helper()
+		if len(got) != len(want) {
+			t.Fatalf("%s IDs = %d rows %+v, want %d %v", name, len(got), got, len(want), want)
+		}
+		for i, wantID := range want {
+			if got[i].MessageID != wantID {
+				t.Fatalf("%s ID %d = %q, want %q", name, i, got[i].MessageID, wantID)
+			}
+		}
+	}
+
+	latest, err := repository.ListMessagesByConversation(
+		context.Background(), "conversation-a", 0, "", 3,
+	)
+	if err != nil {
+		t.Fatalf("ListMessagesByConversation(latest): %v", err)
+	}
+	assertIDs("latest", latest, "message-newest", "message-new", "message-tie-b")
+
+	before, err := repository.ListMessagesByConversation(
+		context.Background(), "conversation-a", 200, "message-tie-b", 10,
+	)
+	if err != nil {
+		t.Fatalf("ListMessagesByConversation(before cursor): %v", err)
+	}
+	assertIDs("before cursor", before, "message-tie-a", "message-old")
+
+	strictlyBefore, err := repository.ListMessagesByConversation(
+		context.Background(), "conversation-a", 200, "", 10,
+	)
+	if err != nil {
+		t.Fatalf("ListMessagesByConversation(before timestamp): %v", err)
+	}
+	assertIDs("before timestamp", strictlyBefore, "message-old")
+
+	after, err := repository.ListMessagesByConversationAfter(
+		context.Background(), "conversation-a", 200, "message-tie-a", 10,
+	)
+	if err != nil {
+		t.Fatalf("ListMessagesByConversationAfter(cursor): %v", err)
+	}
+	assertIDs("after cursor", after, "message-tie-b", "message-new", "message-newest")
+
+	strictlyAfter, err := repository.ListMessagesByConversationAfter(
+		context.Background(), "conversation-a", 200, "", 10,
+	)
+	if err != nil {
+		t.Fatalf("ListMessagesByConversationAfter(timestamp): %v", err)
+	}
+	assertIDs("after timestamp", strictlyAfter, "message-new", "message-newest")
+
+	around, err := repository.ListMessagesAroundMessage(
+		context.Background(), "conversation-a", "message-tie-b", 2, 2,
+	)
+	if err != nil {
+		t.Fatalf("ListMessagesAroundMessage(): %v", err)
+	}
+	assertIDs(
+		"around",
+		around,
+		"message-old",
+		"message-tie-a",
+		"message-tie-b",
+		"message-new",
+		"message-newest",
+	)
+
+	for _, test := range []struct {
+		name           string
+		conversationID string
+		messageID      string
+	}{
+		{name: "missing anchor", conversationID: "conversation-a", messageID: "missing"},
+		{name: "wrong conversation", conversationID: "conversation-b", messageID: "message-tie-b"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := repository.ListMessagesAroundMessage(
+				context.Background(), test.conversationID, test.messageID, 1, 1,
+			)
+			if !errors.Is(err, ErrNotFound) {
+				t.Fatalf("ListMessagesAroundMessage() error = %v, want ErrNotFound", err)
+			}
+		})
+	}
+}
+
+func TestSearchMessagesLIKEFiltersAndOrdersDeterministically(t *testing.T) {
+	store, repository := openMessageTestRepository(
+		t,
+		func() time.Time { return time.UnixMilli(messageTestTimeMS) },
+	)
+	seedMessageAccount(t, store, "account-a", "google_messages")
+	seedMessageAccount(t, store, "account-b", "whatsmeow")
+	seedMessageConversation(t, store, "conversation-a", "account-a")
+	seedMessageConversation(t, store, "conversation-a-other", "account-a")
+	seedMessageConversation(t, store, "conversation-b", "account-b")
+
+	identities := []Identity{
+		repositoryTestIdentity("alice-a", "account-a", "+15550000001"),
+		repositoryTestIdentity("bob-a", "account-a", "+15550000002"),
+		repositoryTestIdentity("alice-b", "account-b", "+15550000001"),
+	}
+	for _, identity := range identities {
+		mustRepositoryWrite(t, "UpsertIdentity", store.UpsertIdentity(identity))
+	}
+
+	importMessage := func(id, conversationID, accountID, body, senderID string, occurredAtMS int64) {
+		t.Helper()
+		message := messageTestMessage(
+			id,
+			conversationID,
+			accountID,
+			"remote-"+id,
+			pointer(senderID),
+		)
+		message.Body = body
+		message.OccurredAtMS = occurredAtMS
+		if err := repository.ImportMessage(context.Background(), MessageProjection{Message: message}); err != nil {
+			t.Fatalf("ImportMessage(%q): %v", id, err)
+		}
+	}
+	importMessage("message-old", "conversation-a", "account-a", "Needle oldest", "alice-a", 100)
+	importMessage("message-middle", "conversation-a", "account-a", "needle middle", "bob-a", 200)
+	importMessage("message-new", "conversation-a", "account-a", "NEEDLE newest", "alice-a", 300)
+	importMessage("message-other-conversation", "conversation-a-other", "account-a", "needle elsewhere", "alice-a", 400)
+	importMessage("message-other-account", "conversation-b", "account-b", "needle cross-account", "alice-b", 500)
+	importMessage("message-no-match", "conversation-b", "account-b", "haystack", "alice-b", 600)
+
+	assertSearch := func(name string, query SearchQuery, want ...string) {
+		t.Helper()
+		got, err := repository.SearchMessages(context.Background(), "needle", query)
+		if err != nil {
+			t.Fatalf("%s SearchMessages(): %v", name, err)
+		}
+		if len(got) != len(want) {
+			t.Fatalf("%s results = %+v, want IDs %v", name, got, want)
+		}
+		for i, wantID := range want {
+			if got[i].MessageID != wantID {
+				t.Fatalf("%s result %d = %q, want %q", name, i, got[i].MessageID, wantID)
+			}
+		}
+	}
+
+	assertSearch(
+		"global limit",
+		SearchQuery{Limit: 3},
+		"message-other-account",
+		"message-other-conversation",
+		"message-new",
+	)
+	assertSearch(
+		"account",
+		SearchQuery{AccountID: "account-a", Limit: 10},
+		"message-other-conversation",
+		"message-new",
+		"message-middle",
+		"message-old",
+	)
+	assertSearch(
+		"conversation",
+		SearchQuery{ConversationID: "conversation-a", Limit: 10},
+		"message-new",
+		"message-middle",
+		"message-old",
+	)
+	assertSearch(
+		"sender canonical value",
+		SearchQuery{SenderCanonicalValue: "+15550000001", Limit: 10},
+		"message-other-account",
+		"message-other-conversation",
+		"message-new",
+		"message-old",
+	)
+	assertSearch(
+		"time range",
+		SearchQuery{SinceMS: 150, UntilMS: 350, Limit: 10},
+		"message-new",
+		"message-middle",
+	)
+	assertSearch(
+		"reversed time range",
+		SearchQuery{SinceMS: 350, UntilMS: 150, Limit: 10},
+		"message-new",
+		"message-middle",
+	)
+}
+
 func TestImportMessageIsIdempotentByRemoteIDAndPersistsAttachments(t *testing.T) {
 	clock := newMessageTestClock(messageTestTimeMS)
 	store, repository := openMessageTestRepository(t, clock.Now)

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -55,6 +56,18 @@ type Message struct {
 	OccurredAtMS     int64
 	CreatedAtMS      int64
 	UpdatedAtMS      int64
+}
+
+// SearchQuery narrows a bounded message-body LIKE query. Zero values leave a
+// field unconstrained, and a non-positive Limit uses the legacy default of 20.
+// SenderCanonicalValue corresponds to db.SearchFilter.Phone at the read seam.
+type SearchQuery struct {
+	AccountID            string
+	ConversationID       string
+	SenderCanonicalValue string
+	SinceMS              int64
+	UntilMS              int64
+	Limit                int
 }
 
 // MessageProjection describes a normalized message and its attachments.
@@ -280,6 +293,231 @@ func (r *MessageRepository) GetMessageByRemote(
 		)
 	}
 	return message, nil
+}
+
+// ListMessagesByConversation returns a newest-first page. beforeMS == 0
+// selects the latest page; otherwise beforeID is the deterministic tie cursor.
+func (r *MessageRepository) ListMessagesByConversation(
+	ctx context.Context,
+	conversationID string,
+	beforeMS int64,
+	beforeID string,
+	limit int,
+) ([]Message, error) {
+	if limit <= 0 {
+		return []Message{}, nil
+	}
+	query := `
+		SELECT ` + messageColumns + `
+		FROM messages
+		WHERE conversation_id = ?
+		ORDER BY occurred_at_ms DESC, message_id DESC
+		LIMIT ?
+	`
+	args := []any{conversationID, limit}
+	if beforeMS > 0 {
+		query = `
+			SELECT ` + messageColumns + `
+			FROM messages
+			WHERE conversation_id = ? AND occurred_at_ms < ?
+			ORDER BY occurred_at_ms DESC, message_id DESC
+			LIMIT ?
+		`
+		args = []any{conversationID, beforeMS, limit}
+		if beforeID != "" {
+			query = `
+				SELECT ` + messageColumns + `
+				FROM messages
+				WHERE conversation_id = ?
+				  AND (occurred_at_ms < ? OR (occurred_at_ms = ? AND message_id < ?))
+				ORDER BY occurred_at_ms DESC, message_id DESC
+				LIMIT ?
+			`
+			args = []any{conversationID, beforeMS, beforeMS, beforeID, limit}
+		}
+	}
+	rows, err := r.store.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list messages for conversation %q: %w", conversationID, err)
+	}
+	messages, err := collectRows(rows, scanMessage)
+	if err != nil {
+		return nil, fmt.Errorf("list messages for conversation %q: %w", conversationID, err)
+	}
+	return messages, nil
+}
+
+// ListMessagesByConversationAfter returns an oldest-first page after the
+// supplied timestamp and optional deterministic tie cursor.
+func (r *MessageRepository) ListMessagesByConversationAfter(
+	ctx context.Context,
+	conversationID string,
+	afterMS int64,
+	afterID string,
+	limit int,
+) ([]Message, error) {
+	if limit <= 0 {
+		return []Message{}, nil
+	}
+	query := `
+		SELECT ` + messageColumns + `
+		FROM messages
+		WHERE conversation_id = ? AND occurred_at_ms > ?
+		ORDER BY occurred_at_ms ASC, message_id ASC
+		LIMIT ?
+	`
+	args := []any{conversationID, afterMS, limit}
+	if afterID != "" {
+		query = `
+			SELECT ` + messageColumns + `
+			FROM messages
+			WHERE conversation_id = ?
+			  AND (occurred_at_ms > ? OR (occurred_at_ms = ? AND message_id > ?))
+			ORDER BY occurred_at_ms ASC, message_id ASC
+			LIMIT ?
+		`
+		args = []any{conversationID, afterMS, afterMS, afterID, limit}
+	}
+	rows, err := r.store.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list messages after cursor for conversation %q: %w", conversationID, err)
+	}
+	messages, err := collectRows(rows, scanMessage)
+	if err != nil {
+		return nil, fmt.Errorf("list messages after cursor for conversation %q: %w", conversationID, err)
+	}
+	return messages, nil
+}
+
+// ListMessagesAroundMessage returns the anchor and its neighboring messages in
+// chronological order. Missing anchors and cross-conversation anchors wrap
+// ErrNotFound.
+func (r *MessageRepository) ListMessagesAroundMessage(
+	ctx context.Context,
+	conversationID string,
+	messageID string,
+	before int,
+	after int,
+) ([]Message, error) {
+	if before < 0 {
+		before = 0
+	}
+	if after < 0 {
+		after = 0
+	}
+	if before == 0 {
+		before = 40
+	}
+	if after == 0 {
+		after = 40
+	}
+
+	anchor, err := r.GetMessage(ctx, messageID)
+	if err != nil {
+		return nil, err
+	}
+	if anchor.ConversationID != conversationID {
+		return nil, fmt.Errorf("message %q in conversation %q: %w", messageID, conversationID, ErrNotFound)
+	}
+
+	beforeRows, err := r.store.db.QueryContext(ctx, `
+		SELECT `+messageColumns+`
+		FROM messages
+		WHERE conversation_id = ?
+		  AND (occurred_at_ms < ? OR (occurred_at_ms = ? AND message_id < ?))
+		ORDER BY occurred_at_ms DESC, message_id DESC
+		LIMIT ?
+	`, conversationID, anchor.OccurredAtMS, anchor.OccurredAtMS, anchor.MessageID, before)
+	if err != nil {
+		return nil, fmt.Errorf("list messages before %q: %w", messageID, err)
+	}
+	beforeMessages, err := collectRows(beforeRows, scanMessage)
+	if err != nil {
+		return nil, fmt.Errorf("list messages before %q: %w", messageID, err)
+	}
+
+	afterRows, err := r.store.db.QueryContext(ctx, `
+		SELECT `+messageColumns+`
+		FROM messages
+		WHERE conversation_id = ?
+		  AND (occurred_at_ms > ? OR (occurred_at_ms = ? AND message_id > ?))
+		ORDER BY occurred_at_ms ASC, message_id ASC
+		LIMIT ?
+	`, conversationID, anchor.OccurredAtMS, anchor.OccurredAtMS, anchor.MessageID, after)
+	if err != nil {
+		return nil, fmt.Errorf("list messages after %q: %w", messageID, err)
+	}
+	afterMessages, err := collectRows(afterRows, scanMessage)
+	if err != nil {
+		return nil, fmt.Errorf("list messages after %q: %w", messageID, err)
+	}
+
+	result := make([]Message, 0, len(beforeMessages)+1+len(afterMessages))
+	for i := len(beforeMessages) - 1; i >= 0; i-- {
+		result = append(result, beforeMessages[i])
+	}
+	result = append(result, anchor)
+	result = append(result, afterMessages...)
+	return result, nil
+}
+
+// SearchMessages performs the R5 substring-compatible LIKE scan. FTS and
+// relevance ranking are intentionally deferred; rows are ordered by recency
+// with message ID as a deterministic tie-breaker.
+func (r *MessageRepository) SearchMessages(
+	ctx context.Context,
+	query string,
+	filter SearchQuery,
+) ([]Message, error) {
+	if filter.Limit <= 0 {
+		filter.Limit = 20
+	}
+	if filter.SinceMS > 0 && filter.UntilMS > 0 && filter.UntilMS < filter.SinceMS {
+		filter.SinceMS, filter.UntilMS = filter.UntilMS, filter.SinceMS
+	}
+
+	conditions := []string{"m.body LIKE '%' || ? || '%'"}
+	args := []any{query}
+	if filter.AccountID != "" {
+		conditions = append(conditions, "m.account_id = ?")
+		args = append(args, filter.AccountID)
+	}
+	if filter.ConversationID != "" {
+		conditions = append(conditions, "m.conversation_id = ?")
+		args = append(args, filter.ConversationID)
+	}
+	if filter.SenderCanonicalValue != "" {
+		conditions = append(conditions, "i.canonical_value = ?")
+		args = append(args, filter.SenderCanonicalValue)
+	}
+	if filter.SinceMS > 0 {
+		conditions = append(conditions, "m.occurred_at_ms >= ?")
+		args = append(args, filter.SinceMS)
+	}
+	if filter.UntilMS > 0 {
+		conditions = append(conditions, "m.occurred_at_ms <= ?")
+		args = append(args, filter.UntilMS)
+	}
+	args = append(args, filter.Limit)
+
+	statement := `
+		SELECT ` + prefixedMessageColumns("m") + `
+		FROM messages AS m
+		LEFT JOIN identities AS i
+		  ON i.account_id = m.account_id AND i.identity_id = m.sender_identity_id
+		WHERE ` + strings.Join(conditions, " AND ") + `
+		ORDER BY m.occurred_at_ms DESC, m.message_id DESC
+		LIMIT ?
+	`
+	rows, err := r.store.db.QueryContext(ctx, statement, args...)
+	if err != nil {
+		return nil, fmt.Errorf("search messages: %w", err)
+	}
+	messages, err := collectRows(rows, scanMessage)
+	if err != nil {
+		return nil, fmt.Errorf("search messages: %w", err)
+	}
+	return messages, nil
 }
 
 // ImportMessage atomically upserts a historical normalized message by remote
@@ -626,6 +864,21 @@ const messageColumns = `
 	occurred_at_ms,
 	created_at_ms,
 	updated_at_ms`
+
+func prefixedMessageColumns(alias string) string {
+	return alias + `.message_id,
+	` + alias + `.conversation_id,
+	` + alias + `.account_id,
+	` + alias + `.remote_message_id,
+	` + alias + `.sender_identity_id,
+	` + alias + `.direction,
+	` + alias + `.body,
+	` + alias + `.reply_to_remote_id,
+	` + alias + `.state,
+	` + alias + `.occurred_at_ms,
+	` + alias + `.created_at_ms,
+	` + alias + `.updated_at_ms`
+}
 
 func scanMessage(row rowScanner) (Message, error) {
 	var message Message

@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"path/filepath"
@@ -17,7 +18,9 @@ import (
 	whatsappadapter "github.com/maxghenis/openmessage/internal/bridgeadapters/whatsapp"
 	"github.com/maxghenis/openmessage/internal/db"
 	"github.com/maxghenis/openmessage/internal/ingest"
+	"github.com/maxghenis/openmessage/internal/messaging"
 	"github.com/maxghenis/openmessage/internal/storage/sqlite"
+	"github.com/maxghenis/openmessage/internal/v2wire"
 	"github.com/maxghenis/openmessage/internal/web"
 )
 
@@ -88,6 +91,178 @@ func TestV2IngestEnabled(t *testing.T) {
 				t.Fatalf("v2IngestEnabled() = %t, want %t for %q", got, tt.want, tt.value)
 			}
 		})
+	}
+}
+
+func TestV2PrimaryEnabled(t *testing.T) {
+	tests := []struct {
+		name  string
+		value string
+		want  bool
+	}{
+		{name: "empty", value: "", want: false},
+		{name: "zero", value: "0", want: false},
+		{name: "unknown", value: "enabled", want: false},
+		{name: "one", value: "1", want: true},
+		{name: "true", value: "true", want: true},
+		{name: "yes", value: "yes", want: true},
+		{name: "on", value: "on", want: true},
+		{name: "case and whitespace insensitive", value: "  TrUe\t", want: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("OPENMESSAGES_V2_PRIMARY", tt.value)
+			if got := v2PrimaryEnabled(); got != tt.want {
+				t.Fatalf("v2PrimaryEnabled() = %t, want %t for %q", got, tt.want, tt.value)
+			}
+		})
+	}
+}
+
+func TestResolveV2RuntimeMode(t *testing.T) {
+	tests := []struct {
+		name          string
+		demo          bool
+		primary       string
+		send          string
+		ingest        string
+		createStore   bool
+		want          v2RuntimeMode
+		errorContains string
+	}{
+		{
+			name: "legacy primary defaults unchanged",
+			want: v2RuntimeMode{},
+		},
+		{
+			name: "legacy primary preserves independent send",
+			send: "1",
+			want: v2RuntimeMode{Send: true},
+		},
+		{
+			name:   "legacy primary preserves independent ingest",
+			ingest: "1",
+			want:   v2RuntimeMode{Ingest: true},
+		},
+		{
+			name:          "primary rejects demo",
+			demo:          true,
+			primary:       "1",
+			errorContains: "OPENMESSAGES_V2_PRIMARY is not available in demo mode",
+		},
+		{
+			name:          "primary rejects explicit send off",
+			primary:       "1",
+			send:          "0",
+			errorContains: "OPENMESSAGES_V2_PRIMARY requires v2 send and ingest; unset OPENMESSAGES_V2_SEND=0/OPENMESSAGES_V2_INGEST=0",
+		},
+		{
+			name:          "primary rejects explicit ingest off",
+			primary:       "1",
+			ingest:        "0",
+			errorContains: "OPENMESSAGES_V2_PRIMARY requires v2 send and ingest; unset OPENMESSAGES_V2_SEND=0/OPENMESSAGES_V2_INGEST=0",
+		},
+		{
+			name:          "primary refuses an absent migrated store",
+			primary:       "1",
+			errorContains: "v2-primary selected but no migrated store at ",
+		},
+		{
+			name:        "primary implies send and ingest",
+			primary:     "1",
+			createStore: true,
+			want:        v2RuntimeMode{Primary: true, Send: true, Ingest: true},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dataDir := t.TempDir()
+			t.Setenv("OPENMESSAGES_V2_PRIMARY", tt.primary)
+			t.Setenv("OPENMESSAGES_V2_SEND", tt.send)
+			t.Setenv("OPENMESSAGES_V2_INGEST", tt.ingest)
+			if tt.createStore {
+				v2Dir := filepath.Join(dataDir, "v2")
+				if err := os.MkdirAll(v2Dir, 0o700); err != nil {
+					t.Fatalf("create v2 dir: %v", err)
+				}
+				store, err := sqlite.Open(filepath.Join(v2Dir, "store.sqlite3"))
+				if err != nil {
+					t.Fatalf("create v2 store: %v", err)
+				}
+				if err := store.Close(); err != nil {
+					t.Fatalf("close v2 store: %v", err)
+				}
+			}
+
+			got, err := resolveV2RuntimeMode(tt.demo, dataDir)
+			if tt.errorContains != "" {
+				if err == nil {
+					t.Fatalf("resolveV2RuntimeMode() succeeded, want error containing %q", tt.errorContains)
+				}
+				if !strings.Contains(err.Error(), tt.errorContains) {
+					t.Fatalf("resolveV2RuntimeMode() error = %q, want %q", err, tt.errorContains)
+				}
+				if strings.Contains(tt.name, "absent migrated store") {
+					wantPath := filepath.Join(dataDir, "v2", "store.sqlite3")
+					if !strings.Contains(err.Error(), wantPath) || !strings.Contains(err.Error(), "run: openmessage migrate") {
+						t.Fatalf("absent-store error = %q, want path %q and migrate command", err, wantPath)
+					}
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("resolveV2RuntimeMode(): %v", err)
+			}
+			if got != tt.want {
+				t.Fatalf("resolveV2RuntimeMode() = %+v, want %+v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestResolveV2RuntimeModeRejectsNonRegularStoreWithoutReplacingIt(t *testing.T) {
+	dataDir := t.TempDir()
+	storePath := filepath.Join(dataDir, "v2", "store.sqlite3")
+	if err := os.MkdirAll(storePath, 0o700); err != nil {
+		t.Fatalf("create directory at store path: %v", err)
+	}
+	t.Setenv("OPENMESSAGES_V2_PRIMARY", "1")
+	t.Setenv("OPENMESSAGES_V2_SEND", "")
+	t.Setenv("OPENMESSAGES_V2_INGEST", "")
+
+	_, err := resolveV2RuntimeMode(false, dataDir)
+	if err == nil || !strings.Contains(err.Error(), "no migrated store") ||
+		!strings.Contains(err.Error(), "run: openmessage migrate") {
+		t.Fatalf("resolveV2RuntimeMode() error = %v", err)
+	}
+	info, statErr := os.Stat(storePath)
+	if statErr != nil {
+		t.Fatalf("stat sentinel after refusal: %v", statErr)
+	}
+	if !info.IsDir() {
+		t.Fatalf("non-regular store sentinel was replaced: mode=%v", info.Mode())
+	}
+}
+
+func TestLegacySchedulerGuard(t *testing.T) {
+	if !shouldStartLegacyScheduler(false) {
+		t.Fatal("legacy-primary must start the legacy scheduler")
+	}
+	if shouldStartLegacyScheduler(true) {
+		t.Fatal("v2-primary must not start the legacy scheduler")
+	}
+
+	starts := 0
+	start := func() { starts++ }
+	startLegacyScheduler(false, start)
+	if starts != 1 {
+		t.Fatalf("legacy-primary scheduler starts = %d, want 1", starts)
+	}
+	startLegacyScheduler(true, start)
+	if starts != 1 {
+		t.Fatalf("v2-primary scheduler starts = %d, want unchanged at 1", starts)
 	}
 }
 
@@ -302,7 +477,7 @@ func TestV2StackFreshGoogleIngressReachesWorker(t *testing.T) {
 		t.Fatalf("db.New(): %v", err)
 	}
 	defer legacy.Close()
-	stop := stack.Start(context.Background(), legacy, web.NewEventBroker())
+	stop := stack.Start(context.Background(), legacy, web.NewEventBroker(), false)
 	defer stop()
 
 	if err := stack.Sink.AppendIngress(context.Background(), bridge.RawIngressRecord{
@@ -346,7 +521,7 @@ func TestV2StackStopJoinsRunAndClosesStore(t *testing.T) {
 	}
 	defer legacy.Close()
 
-	stop := stack.Start(context.Background(), legacy, web.NewEventBroker())
+	stop := stack.Start(context.Background(), legacy, web.NewEventBroker(), false)
 	stopped := make(chan struct{})
 	go func() {
 		stop()
@@ -361,6 +536,154 @@ func TestV2StackStopJoinsRunAndClosesStore(t *testing.T) {
 	if _, err := stack.Store.ListAccounts(); err == nil {
 		t.Fatal("v2 store remains usable after stack stop")
 	}
+}
+
+func TestV2PrimaryStackDoesNotStartLegacyProjector(t *testing.T) {
+	var logs bytes.Buffer
+	stack, err := newV2Stack(v2StackDeps{
+		Logger:  zerolog.New(&logs),
+		DataDir: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("newV2Stack(): %v", err)
+	}
+
+	// A nil legacy store makes Projector.Run fail synchronously. If the
+	// v2-primary branch accidentally starts it, the runner logs that failure
+	// before Stop joins all goroutines.
+	stop := stack.Start(context.Background(), nil, web.NewEventBroker(), true)
+	stop()
+	if strings.Contains(logs.String(), "V2 legacy projector stopped") {
+		t.Fatalf("v2-primary started the legacy projector:\n%s", logs.String())
+	}
+}
+
+func TestLegacyPrimaryStackStillStartsLegacyProjector(t *testing.T) {
+	var logs bytes.Buffer
+	stack, err := newV2Stack(v2StackDeps{
+		Logger:  zerolog.New(&logs),
+		DataDir: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("newV2Stack(): %v", err)
+	}
+
+	// The nil legacy store is a sentinel: the legacy-primary projector must
+	// start, reject it, and log before Stop joins the runners.
+	stop := stack.Start(context.Background(), nil, web.NewEventBroker(), false)
+	stop()
+	if !strings.Contains(logs.String(), "V2 legacy projector stopped") {
+		t.Fatalf("legacy-primary did not start the legacy projector:\n%s", logs.String())
+	}
+}
+
+func TestV2PrimaryStackRunsWorkerAndDispatcherWithoutProjector(t *testing.T) {
+	stack, err := newV2Stack(v2StackDeps{
+		Logger:  zerolog.Nop(),
+		DataDir: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("newV2Stack(): %v", err)
+	}
+	adapter := &v2PrimaryTextAdapter{requests: make(chan bridge.TextRequest, 1)}
+	if err := stack.RegisterAdapter(adapter); err != nil {
+		stack.Store.Close()
+		t.Fatalf("RegisterAdapter(): %v", err)
+	}
+	nowMS := time.Now().UnixMilli()
+	if err := stack.Store.UpsertConversation(sqlite.Conversation{
+		ConversationID:       "v2-primary-conversation",
+		AccountID:            adapter.AccountID(),
+		RemoteConversationID: "remote-v2-primary-conversation",
+		Kind:                 sqlite.ConversationKindDirect,
+		Title:                "V2 primary",
+		NotificationMode:     sqlite.NotificationModeAll,
+		MetadataJSON:         "{}",
+		CreatedAtMS:          nowMS,
+		UpdatedAtMS:          nowMS,
+	}); err != nil {
+		stack.Store.Close()
+		t.Fatalf("UpsertConversation(): %v", err)
+	}
+	submission, err := v2wire.SubmitTextV2(context.Background(), v2wire.NativeDeps{
+		V2: stack.Store, Service: stack.Service, Registry: stack.Registry,
+	}, v2wire.TextInput{
+		ConversationID: "v2-primary-conversation",
+		Body:           "dispatch while primary",
+		IdempotencyKey: "v2-primary-dispatch",
+	})
+	if err != nil {
+		stack.Store.Close()
+		t.Fatalf("SubmitTextV2(): %v", err)
+	}
+
+	stop := stack.Start(context.Background(), nil, web.NewEventBroker(), true)
+	defer stop()
+	if err := stack.Sink.AppendIngress(context.Background(), bridge.RawIngressRecord{
+		AccountID:    adapter.AccountID(),
+		Generation:   1,
+		DedupeKey:    "v2-primary-malformed",
+		Codec:        ingest.GoogleCodec,
+		CodecVersion: ingest.GoogleCodecVersion,
+		ReceivedAt:   time.Now(),
+		Payload:      []byte("{"),
+	}); err != nil {
+		t.Fatalf("AppendIngress(): %v", err)
+	}
+
+	var sent *bridge.TextRequest
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if sent == nil {
+			select {
+			case request := <-adapter.requests:
+				sent = &request
+			default:
+			}
+		}
+		delivery, deliveryErr := stack.Service.Get(context.Background(), submission.OutboxID)
+		quarantined := stack.Counters.Snapshot(adapter.AccountID()).Quarantined == 1
+		if sent != nil && deliveryErr == nil && delivery.State == messaging.OutboxConfirmed && quarantined {
+			if sent.Body != "dispatch while primary" ||
+				sent.Conversation.RemoteID != "remote-v2-primary-conversation" {
+				t.Fatalf("dispatched request = %+v", *sent)
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	delivery, deliveryErr := stack.Service.Get(context.Background(), submission.OutboxID)
+	t.Fatalf(
+		"v2-primary runners did not settle: sent=%v delivery=%+v err=%v counters=%+v",
+		sent != nil,
+		delivery,
+		deliveryErr,
+		stack.Counters.Snapshot(adapter.AccountID()),
+	)
+}
+
+type v2PrimaryTextAdapter struct {
+	requests chan bridge.TextRequest
+}
+
+func (*v2PrimaryTextAdapter) AccountID() string         { return googleAccountID }
+func (*v2PrimaryTextAdapter) Platform() bridge.Platform { return bridge.PlatformGoogle }
+func (*v2PrimaryTextAdapter) Start(
+	context.Context,
+	bridge.StartRequest,
+	bridge.ConnectionSink,
+) (bridge.Run, error) {
+	return nil, nil
+}
+func (a *v2PrimaryTextAdapter) SendText(
+	_ context.Context,
+	request bridge.TextRequest,
+) (bridge.SendResult, error) {
+	a.requests <- request
+	return bridge.SendResult{
+		RemoteMessageID: "remote-v2-primary-message",
+		EchoExpected:    false,
+	}, nil
 }
 
 func assertPrivateDirectory(t *testing.T, path string) {

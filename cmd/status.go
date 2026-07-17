@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"text/tabwriter"
@@ -12,7 +11,6 @@ import (
 
 	"github.com/rs/zerolog"
 
-	"github.com/maxghenis/openmessage/internal/app"
 	"github.com/maxghenis/openmessage/internal/db"
 )
 
@@ -25,13 +23,13 @@ import (
 func RunStatus(logger zerolog.Logger, args ...string) error {
 	asJSON := hasFlag(args, "--json")
 
-	a, err := app.New(logger)
+	session, err := openCommandReadSource(logger, os.Stderr)
 	if err != nil {
-		return fmt.Errorf("init app: %w", err)
+		return err
 	}
-	defer a.Close()
+	defer session.Close()
 
-	stats, err := a.Store.PlatformStats()
+	stats, err := session.Reads.PlatformStats()
 	if err != nil {
 		return fmt.Errorf("platform stats: %w", err)
 	}
@@ -46,10 +44,10 @@ func RunStatus(logger zerolog.Logger, args ...string) error {
 		}
 	}
 
-	dbPath := filepath.Join(a.DataDir, "messages.db")
+	dbPath := session.StorePath
 
 	if asJSON {
-		return writeStatusJSON(dbPath, a.DataDir, total, stats)
+		return writeStatusJSON(dbPath, session.DataDir, total, stats)
 	}
 
 	fmt.Printf("OpenMessage store — %s\n", dbPath)

@@ -41,6 +41,109 @@ func TestInitializeWhatsAppForServeSkipsSupervisorOnInitializationError(t *testi
 	}
 }
 
+func TestRunServeV2PrimaryFailsFast(t *testing.T) {
+	tests := []struct {
+		name          string
+		args          []string
+		send          string
+		ingest        string
+		errorContains string
+	}{
+		{
+			name:          "demo mode",
+			args:          []string{"--demo", "--mcp-stdio"},
+			errorContains: "OPENMESSAGES_V2_PRIMARY is not available in demo mode",
+		},
+		{
+			name:          "explicit send conflict",
+			args:          []string{"--mcp-stdio"},
+			send:          "0",
+			errorContains: "OPENMESSAGES_V2_PRIMARY requires v2 send and ingest",
+		},
+		{
+			name:          "explicit ingest conflict",
+			args:          []string{"--mcp-stdio"},
+			ingest:        "0",
+			errorContains: "OPENMESSAGES_V2_PRIMARY requires v2 send and ingest",
+		},
+		{
+			name:          "migrated store absent",
+			args:          []string{"--mcp-stdio"},
+			errorContains: "run: openmessage migrate",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dataDir := t.TempDir()
+			t.Setenv("OPENMESSAGES_DATA_DIR", dataDir)
+			t.Setenv("OPENMESSAGES_DEMO", "0")
+			t.Setenv("OPENMESSAGES_V2_PRIMARY", "1")
+			t.Setenv("OPENMESSAGES_V2_SEND", tt.send)
+			t.Setenv("OPENMESSAGES_V2_INGEST", tt.ingest)
+			t.Setenv("OPENMESSAGES_APP_SANDBOX", "1")
+			t.Setenv("OPENMESSAGES_MACOS_NOTIFICATIONS", "0")
+			t.Setenv("OPENMESSAGE_TELEMETRY", "0")
+
+			err := RunServe(zerolog.Nop(), tt.args...)
+			if err == nil {
+				t.Fatal("RunServe() succeeded, want startup error")
+			}
+			if !strings.Contains(err.Error(), tt.errorContains) {
+				t.Fatalf("RunServe() error = %q, want %q", err, tt.errorContains)
+			}
+			if tt.name == "migrated store absent" {
+				wantPath := filepath.Join(dataDir, "v2", "store.sqlite3")
+				if !strings.Contains(err.Error(), wantPath) {
+					t.Fatalf("RunServe() error = %q, want store path %q", err, wantPath)
+				}
+				if _, statErr := os.Stat(filepath.Join(dataDir, "v2")); !os.IsNotExist(statErr) {
+					t.Fatalf("absent-store refusal created v2 state: %v", statErr)
+				}
+				if _, statErr := os.Stat(filepath.Join(dataDir, "messages.db")); !os.IsNotExist(statErr) {
+					t.Fatalf("absent-store refusal touched the legacy store: %v", statErr)
+				}
+			}
+		})
+	}
+}
+
+func TestRunServeV2PrimaryRejectsCorruptPresentStoreWithoutFallback(t *testing.T) {
+	dataDir := t.TempDir()
+	v2Dir := filepath.Join(dataDir, "v2")
+	if err := os.MkdirAll(v2Dir, 0o700); err != nil {
+		t.Fatalf("create v2 dir: %v", err)
+	}
+	storePath := filepath.Join(v2Dir, "store.sqlite3")
+	corrupt := []byte("not a sqlite database")
+	if err := os.WriteFile(storePath, corrupt, 0o600); err != nil {
+		t.Fatalf("write corrupt store: %v", err)
+	}
+	t.Setenv("OPENMESSAGES_DATA_DIR", dataDir)
+	t.Setenv("OPENMESSAGES_DEMO", "0")
+	t.Setenv("OPENMESSAGES_V2_PRIMARY", "1")
+	t.Setenv("OPENMESSAGES_V2_SEND", "")
+	t.Setenv("OPENMESSAGES_V2_INGEST", "")
+	t.Setenv("OPENMESSAGES_APP_SANDBOX", "1")
+	t.Setenv("OPENMESSAGES_MACOS_NOTIFICATIONS", "0")
+	t.Setenv("OPENMESSAGE_TELEMETRY", "0")
+
+	err := RunServe(zerolog.Nop(), "--mcp-stdio")
+	if err == nil || !strings.Contains(err.Error(), "init v2 stack") {
+		t.Fatalf("RunServe() error = %v, want corrupt v2 store startup failure", err)
+	}
+	got, readErr := os.ReadFile(storePath)
+	if readErr != nil {
+		t.Fatalf("read corrupt sentinel: %v", readErr)
+	}
+	if !bytes.Equal(got, corrupt) {
+		t.Fatalf("corrupt v2 store was replaced: got %q, want %q", got, corrupt)
+	}
+	if _, statErr := os.Stat(filepath.Join(v2Dir, "blobs")); !os.IsNotExist(statErr) {
+		t.Fatalf("corrupt-store refusal continued into v2 blob setup: %v", statErr)
+	}
+}
+
 func TestHTTPServerSurvivesIndependently(t *testing.T) {
 	// Mirrors the RunServe architecture: HTTP server in a goroutine
 	// stays alive even when the "main" blocking call returns.

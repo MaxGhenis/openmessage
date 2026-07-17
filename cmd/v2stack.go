@@ -60,12 +60,79 @@ func v2IngestEnabled() bool {
 	return v2FlagEnabled("OPENMESSAGES_V2_INGEST")
 }
 
+func v2PrimaryEnabled() bool {
+	return v2FlagEnabled("OPENMESSAGES_V2_PRIMARY")
+}
+
 func v2FlagEnabled(name string) bool {
 	switch strings.ToLower(strings.TrimSpace(os.Getenv(name))) {
 	case "1", "true", "yes", "on":
 		return true
 	default:
 		return false
+	}
+}
+
+type v2RuntimeMode struct {
+	Primary bool
+	Send    bool
+	Ingest  bool
+}
+
+func resolveV2RuntimeMode(isDemo bool, dataDir string) (v2RuntimeMode, error) {
+	mode := v2RuntimeMode{
+		Primary: v2PrimaryEnabled(),
+		Send:    v2SendEnabled(),
+		Ingest:  v2IngestEnabled(),
+	}
+	if !mode.Primary {
+		return mode, nil
+	}
+	if isDemo {
+		return v2RuntimeMode{}, errors.New("OPENMESSAGES_V2_PRIMARY is not available in demo mode")
+	}
+	if v2FlagExplicitlyDisabled("OPENMESSAGES_V2_SEND") ||
+		v2FlagExplicitlyDisabled("OPENMESSAGES_V2_INGEST") {
+		return v2RuntimeMode{}, errors.New("OPENMESSAGES_V2_PRIMARY requires v2 send and ingest; unset OPENMESSAGES_V2_SEND=0/OPENMESSAGES_V2_INGEST=0")
+	}
+
+	storePath := filepath.Join(dataDir, "v2", "store.sqlite3")
+	info, err := os.Stat(storePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return v2RuntimeMode{}, fmt.Errorf("v2-primary selected but no migrated store at %s; run: openmessage migrate", storePath)
+		}
+		return v2RuntimeMode{}, fmt.Errorf("v2-primary selected but cannot access migrated store at %s: %w", storePath, err)
+	}
+	if !info.Mode().IsRegular() {
+		return v2RuntimeMode{}, fmt.Errorf("v2-primary selected but no migrated store at %s; run: openmessage migrate", storePath)
+	}
+
+	mode.Send = true
+	mode.Ingest = true
+	return mode, nil
+}
+
+func v2FlagExplicitlyDisabled(name string) bool {
+	value, ok := os.LookupEnv(name)
+	if !ok {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "0", "false", "no", "off":
+		return true
+	default:
+		return false
+	}
+}
+
+func shouldStartLegacyScheduler(v2Primary bool) bool {
+	return !v2Primary
+}
+
+func startLegacyScheduler(v2Primary bool, start func()) {
+	if shouldStartLegacyScheduler(v2Primary) && start != nil {
+		start()
 	}
 }
 
@@ -252,20 +319,20 @@ func newV2Stack(deps v2StackDeps) (_ *v2Stack, resultErr error) {
 	return stack, nil
 }
 
-func (s *v2Stack) Start(ctx context.Context, legacy *db.Store, events v2wire.EventPublisher) (stop func()) {
+func (s *v2Stack) Start(
+	ctx context.Context,
+	legacy *db.Store,
+	events v2wire.EventPublisher,
+	v2Primary bool,
+) (stop func()) {
 	runCtx, cancel := context.WithCancel(ctx)
-	projector := &v2wire.Projector{
-		V2Store: s.Store,
-		Outbox:  s.outbox,
-		Legacy:  legacy,
-		Blobs:   s.Blobs,
-		Events:  events,
-		Service: s.Service,
-		Logger:  s.logger,
-	}
 
 	var runWG sync.WaitGroup
-	runWG.Add(3)
+	runnerCount := 2
+	if !v2Primary {
+		runnerCount++
+	}
+	runWG.Add(runnerCount)
 	go func() {
 		defer runWG.Done()
 		if err := s.worker.Run(runCtx); err != nil && !errors.Is(err, context.Canceled) {
@@ -278,12 +345,23 @@ func (s *v2Stack) Start(ctx context.Context, legacy *db.Store, events v2wire.Eve
 			s.logger.Error().Err(err).Msg("V2 message dispatcher stopped")
 		}
 	}()
-	go func() {
-		defer runWG.Done()
-		if err := projector.Run(runCtx); err != nil && !errors.Is(err, context.Canceled) {
-			s.logger.Error().Err(err).Msg("V2 legacy projector stopped")
+	if !v2Primary {
+		projector := &v2wire.Projector{
+			V2Store: s.Store,
+			Outbox:  s.outbox,
+			Legacy:  legacy,
+			Blobs:   s.Blobs,
+			Events:  events,
+			Service: s.Service,
+			Logger:  s.logger,
 		}
-	}()
+		go func() {
+			defer runWG.Done()
+			if err := projector.Run(runCtx); err != nil && !errors.Is(err, context.Canceled) {
+				s.logger.Error().Err(err).Msg("V2 legacy projector stopped")
+			}
+		}()
+	}
 
 	var stopOnce sync.Once
 	return func() {
