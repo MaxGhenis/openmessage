@@ -67,6 +67,13 @@ func (s *MessageService) DispatchDue(ctx context.Context, limit int) (int, error
 		Limit:    limit,
 	})
 	if err != nil {
+		// Shutdown can race the lease transaction: database/sql auto-rolls-back
+		// a transaction whose context is canceled, so the subsequent commit
+		// fails. No lease was handed out, so this is a clean stop rather than a
+		// dispatch fault. Surface the cancellation itself.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return 0, ctxErr
+		}
 		return 0, fmt.Errorf("lease due messages: %w", err)
 	}
 
