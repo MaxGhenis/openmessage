@@ -215,6 +215,11 @@ func newV2Stack(deps v2StackDeps) (_ *v2Stack, resultErr error) {
 				Decoder:  ingest.NewGoogleDecoder(counters),
 			},
 			ingest.NewWhatsAppDecoderRegistration(),
+			{
+				Codec:    ingest.SignalJSONRPCCodec,
+				Platform: bridge.PlatformSignal,
+				Decoder:  ingest.NewSignalDecoder(),
+			},
 		},
 	})
 	if err != nil {

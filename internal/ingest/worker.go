@@ -40,7 +40,8 @@ type WorkerConfig struct {
 	Logger        zerolog.Logger
 	Now           func() time.Time
 	QueueCapacity int
-	Decoders      []DecoderRegistration
+	// Decoders explicitly defines the codecs this worker can project.
+	Decoders []DecoderRegistration
 }
 
 type registeredDecoder struct {
@@ -68,8 +69,8 @@ type Worker struct {
 	running  atomic.Bool
 }
 
-// NewWorker validates and copies its decoder registry. Run starts no work
-// until explicitly invoked by the owner.
+// NewWorker validates and copies its explicitly configured decoder
+// registrations. Run starts no work until explicitly invoked by the owner.
 func NewWorker(config WorkerConfig) (*Worker, error) {
 	if config.Store == nil {
 		return nil, fmt.Errorf("create ingest worker: store is nil")

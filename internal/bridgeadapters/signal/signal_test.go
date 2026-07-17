@@ -3,6 +3,7 @@ package signal
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"runtime"
@@ -874,6 +875,208 @@ func TestRunTranslatesRetainedPollerSignals(t *testing.T) {
 	}
 }
 
+func TestAdapterRegistersIngressBeforeStartPollerAndUnregistersAtTerminal(t *testing.T) {
+	poller := newFakePoller()
+	poller.startAccount = "+15551230000"
+	poller.startLine = []byte(`{"account":"+15551230000","envelope":{"sourceServiceId":"9f4b50e3-ebf2-413c-a856-161756a6161a","timestamp":1700000000123,"dataMessage":{"timestamp":1700000000123,"message":"startup WAL"}}}`)
+	poller.startResolvedSource = "+15551234567"
+	adapter := &Adapter{accountID: "signal-primary", poller: poller}
+	sink := &recordingSink{ingress: make(chan bridge.RawIngressRecord, 1)}
+
+	run, err := adapter.Start(context.Background(), bridge.StartRequest{
+		AccountID:  "signal-primary",
+		Generation: 17,
+	}, sink)
+	if err != nil {
+		t.Fatalf("Start(): %v", err)
+	}
+	record := receiveValue(t, sink.ingress, "startup Signal ingress")
+	if record.AccountID != "signal-primary" || record.Generation != 17 ||
+		record.Codec != "signal.jsonrpc" || record.CodecVersion != 1 {
+		t.Fatalf("startup ingress = %+v, want stamped generation and Signal codec", record)
+	}
+	var frame struct {
+		Line                json.RawMessage `json:"line"`
+		ResolvedSource      string          `json:"resolved_source"`
+		ResolvedDestination string          `json:"resolved_destination"`
+	}
+	if err := json.Unmarshal(record.Payload, &frame); err != nil {
+		t.Fatalf("json.Unmarshal(Signal frame): %v", err)
+	}
+	if !bytes.Equal(frame.Line, poller.startLine) || frame.ResolvedSource != "+15551234567" ||
+		frame.ResolvedDestination != "" {
+		t.Fatalf("captured frame = %+v, want raw line plus canonical source", frame)
+	}
+	if record.DedupeKey != "env:9f4b50e3-ebf2-413c-a856-161756a6161a:1700000000123" {
+		t.Fatalf("dedupe key = %q, want raw ACI identity", record.DedupeKey)
+	}
+
+	poller.mu.Lock()
+	order := append([]string(nil), poller.startOrder...)
+	poller.mu.Unlock()
+	if len(order) < 2 || order[0] != "observe" || order[1] != "start" {
+		t.Fatalf("poller order = %v, want observer registered before StartPoller", order)
+	}
+
+	stopAdapterRun(t, run)
+	poller.mu.Lock()
+	observer := poller.ingress
+	unregistered := poller.unregistered
+	poller.mu.Unlock()
+	if observer != nil || unregistered != 1 {
+		t.Fatalf("terminal observer = %v unregister calls = %d, want cleared exactly once", observer != nil, unregistered)
+	}
+}
+
+func TestAdapterRoutesTypingOnlyIngressToEphemeralSink(t *testing.T) {
+	poller := newFakePoller()
+	poller.startAccount = "+15551230000"
+	poller.startLine = []byte(`{"account":"+15551230000","envelope":{"sourceNumber":"+15551234567","timestamp":1700000000123,"typingMessage":{"action":"started"}}}`)
+	adapter := &Adapter{accountID: "signal-primary", poller: poller}
+	sink := &recordingSink{
+		ingress:   make(chan bridge.RawIngressRecord, 1),
+		ephemeral: make(chan bridge.EphemeralEvent, 1),
+	}
+
+	run, err := adapter.Start(context.Background(), bridge.StartRequest{
+		AccountID:  "signal-primary",
+		Generation: 23,
+	}, sink)
+	if err != nil {
+		t.Fatalf("Start(): %v", err)
+	}
+	t.Cleanup(func() { stopAdapterRun(t, run) })
+	event := receiveValue(t, sink.ephemeral, "Signal typing event")
+	if event.AccountID != "signal-primary" || event.Generation != 23 ||
+		event.Typing == nil || event.Typing.RemoteConversationID != "signal:+15551234567" {
+		t.Fatalf("typing event = %+v, want stamped ephemeral Signal event", event)
+	}
+	select {
+	case record := <-sink.ingress:
+		t.Fatalf("typing-only envelope appended durable ingress: %+v", record)
+	default:
+	}
+}
+
+func TestAdapterIngressFailureDoesNotTerminateGeneration(t *testing.T) {
+	poller := newFakePoller()
+	poller.startAccount = "+15551230000"
+	poller.startLine = []byte(`{"account":"+15551230000","envelope":{"source":"+15551234567","timestamp":1700000000123,"dataMessage":{"timestamp":1700000000123,"message":"legacy continues"}}}`)
+	adapter := &Adapter{accountID: "signal-primary", poller: poller}
+	wantErr := errors.New("durable sink unavailable")
+	sink := &recordingSink{
+		ingress:   make(chan bridge.RawIngressRecord, 1),
+		appendErr: wantErr,
+	}
+
+	run, err := adapter.Start(context.Background(), bridge.StartRequest{
+		AccountID:  "signal-primary",
+		Generation: 31,
+	}, sink)
+	if err != nil {
+		t.Fatalf("Start(): %v", err)
+	}
+	t.Cleanup(func() { stopAdapterRun(t, run) })
+	receiveValue(t, sink.ingress, "failed durable append")
+	if got := adapter.ingressFailures.Load(); got != 1 {
+		t.Fatalf("ingress failure count = %d, want 1", got)
+	}
+	poller.mu.Lock()
+	reported := append([]error(nil), poller.ingressErrors...)
+	poller.mu.Unlock()
+	if len(reported) != 1 || !errors.Is(reported[0], wantErr) {
+		t.Fatalf("reported ingress errors = %v, want %v", reported, wantErr)
+	}
+	select {
+	case terminal := <-run.Done():
+		t.Fatalf("ingress failure terminated generation: %v", terminal)
+	default:
+	}
+}
+
+func TestAdapterStartFailureUnregistersIngress(t *testing.T) {
+	poller := newFakePoller()
+	poller.startErr = errors.New("poller start failed")
+	adapter := &Adapter{accountID: "signal-primary", poller: poller}
+
+	run, err := adapter.Start(context.Background(), bridge.StartRequest{
+		AccountID:  "signal-primary",
+		Generation: 1,
+	}, &recordingSink{})
+	if run != nil {
+		t.Fatalf("Start() run = %T, want nil", run)
+	}
+	assertOpError(t, err, bridge.FailureTransient, "signal_start_failed")
+	poller.mu.Lock()
+	observer := poller.ingress
+	unregistered := poller.unregistered
+	poller.mu.Unlock()
+	if observer != nil || unregistered != 1 {
+		t.Fatalf("failed-start observer = %v unregister calls = %d, want cleared once", observer != nil, unregistered)
+	}
+}
+
+func TestStaleSignalIngressCallbackIsBenignAtGenerationFence(t *testing.T) {
+	poller := newFakePoller()
+	adapter := &Adapter{accountID: "signal-primary", poller: poller}
+	clock := newManualClock(signalAdapterTestEpoch)
+	downstream := &recordingSink{ingress: make(chan bridge.RawIngressRecord, 2)}
+	supervisor, err := bridge.NewSupervisor(
+		"signal-primary",
+		bridge.PlatformSignal,
+		adapter,
+		signalSupervisorTestPolicy(),
+		clock,
+		midpointRandom{},
+		bridge.WithConnectionSink(downstream),
+	)
+	if err != nil {
+		t.Fatalf("NewSupervisor(): %v", err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), signalAdapterTestTimeout)
+		defer cancel()
+		if err := supervisor.Stop(ctx); err != nil {
+			t.Errorf("Supervisor.Stop(): %v", err)
+		}
+	})
+
+	startSupervisor(t, supervisor)
+	firstRun := readyNextGeneration(t, supervisor, poller, 1)
+	poller.mu.Lock()
+	oldObserver := poller.ingressHistory[0]
+	poller.mu.Unlock()
+	firstRun.complete(signallive.PollerExit{
+		Kind:        signallive.PollerFailureTransient,
+		Operation:   "receive",
+		Fingerprint: signallive.SignalReceiveFailureFingerprint,
+		Err:         errors.New("retry generation"),
+	})
+	backoff := awaitSnapshot(t, supervisor, "generation one backoff", func(snapshot bridge.Snapshot) bool {
+		return snapshot.State == bridge.StateBackoff && snapshot.Generation == 1
+	})
+	clock.Advance(backoff.RetryAt.Sub(clock.Now()))
+	readyNextGeneration(t, supervisor, poller, 2)
+
+	oldObserver(
+		"+15551230000",
+		[]byte(`{"account":"+15551230000","envelope":{"source":"+15551234567","timestamp":1700000000123,"dataMessage":{"timestamp":1700000000123,"message":"late generation one"}}}`),
+		"",
+		"",
+	)
+	select {
+	case record := <-downstream.ingress:
+		t.Fatalf("stale generation reached downstream sink: %+v", record)
+	case <-time.After(25 * time.Millisecond):
+	}
+	if got := adapter.ingressFailures.Load(); got != 0 {
+		t.Fatalf("benign stale callback counted as ingress failure: %d", got)
+	}
+	if snapshot := supervisor.Snapshot(); snapshot.State != bridge.StateOnline || snapshot.Generation != 2 {
+		t.Fatalf("snapshot after stale callback = %+v, want online generation 2", snapshot)
+	}
+}
+
 func TestAdapterStartIsSingleFlight(t *testing.T) {
 	poller := newFakePoller()
 	poller.startEntered = make(chan struct{}, 1)
@@ -1285,27 +1488,38 @@ func TestSupervisorLeavesExpiredPairingUnpairedWithoutReconnectChurn(t *testing.
 }
 
 type fakePoller struct {
-	mu             sync.Mutex
-	starts         int
-	runs           []*fakePollerRun
-	started        chan *fakePollerRun
-	startEntered   chan struct{}
-	startRelease   chan struct{}
-	applied        []signallive.PollerExit
-	fingerprint    string
-	status         signallive.StatusSnapshot
-	textCalls      []fakeTextRequest
-	textTimestamp  int64
-	textErr        error
-	reactionCalls  []fakeReactionRequest
-	reactionErr    error
-	mediaCalls     []fakeMediaRequest
-	mediaTimestamp int64
-	mediaErr       error
-	downloadCalls  []fakeDownloadRequest
-	downloadData   []byte
-	downloadMIME   string
-	downloadErr    error
+	mu                       sync.Mutex
+	ingressID                uint64
+	ingress                  func(account string, line []byte, resolvedSource string, resolvedDestination string)
+	ingressHistory           []func(account string, line []byte, resolvedSource string, resolvedDestination string)
+	unregistered             int
+	startAccount             string
+	startLine                []byte
+	startResolvedSource      string
+	startResolvedDestination string
+	startOrder               []string
+	startErr                 error
+	ingressErrors            []error
+	starts                   int
+	runs                     []*fakePollerRun
+	started                  chan *fakePollerRun
+	startEntered             chan struct{}
+	startRelease             chan struct{}
+	applied                  []signallive.PollerExit
+	fingerprint              string
+	status                   signallive.StatusSnapshot
+	textCalls                []fakeTextRequest
+	textTimestamp            int64
+	textErr                  error
+	reactionCalls            []fakeReactionRequest
+	reactionErr              error
+	mediaCalls               []fakeMediaRequest
+	mediaTimestamp           int64
+	mediaErr                 error
+	downloadCalls            []fakeDownloadRequest
+	downloadData             []byte
+	downloadMIME             string
+	downloadErr              error
 }
 
 type fakeTextRequest struct {
@@ -1355,12 +1569,52 @@ func newFakePoller() *fakePoller {
 	return &fakePoller{started: make(chan *fakePollerRun, 16)}
 }
 
+func (p *fakePoller) ObserveIngress(observer func(
+	account string,
+	line []byte,
+	resolvedSource string,
+	resolvedDestination string,
+)) func() {
+	p.mu.Lock()
+	p.ingressID++
+	registrationID := p.ingressID
+	p.ingress = observer
+	p.ingressHistory = append(p.ingressHistory, observer)
+	p.startOrder = append(p.startOrder, "observe")
+	p.mu.Unlock()
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			p.mu.Lock()
+			p.unregistered++
+			if p.ingressID == registrationID {
+				p.ingress = nil
+			}
+			p.mu.Unlock()
+		})
+	}
+}
+
 func (p *fakePoller) StartPoller(ctx context.Context) (signallive.PollerRun, error) {
 	p.mu.Lock()
 	p.starts++
 	entered := p.startEntered
 	release := p.startRelease
+	observer := p.ingress
+	startAccount := p.startAccount
+	startLine := bytes.Clone(p.startLine)
+	startResolvedSource := p.startResolvedSource
+	startResolvedDestination := p.startResolvedDestination
+	startErr := p.startErr
+	p.startOrder = append(p.startOrder, "start")
 	p.mu.Unlock()
+	if observer != nil && len(startLine) > 0 {
+		observer(startAccount, startLine, startResolvedSource, startResolvedDestination)
+	}
+	if startErr != nil {
+		return nil, startErr
+	}
 	if entered != nil {
 		select {
 		case entered <- struct{}{}:
@@ -1385,6 +1639,12 @@ func (p *fakePoller) StartPoller(ctx context.Context) (signallive.PollerRun, err
 		return nil, ctx.Err()
 	}
 	return run, nil
+}
+
+func (p *fakePoller) ReportIngressError(err error) {
+	p.mu.Lock()
+	p.ingressErrors = append(p.ingressErrors, err)
+	p.mu.Unlock()
 }
 
 func (p *fakePoller) Status() signallive.StatusSnapshot {
@@ -1628,12 +1888,26 @@ type recordedBeat struct {
 }
 
 type recordingSink struct {
-	beats chan recordedBeat
+	beats        chan recordedBeat
+	ingress      chan bridge.RawIngressRecord
+	ephemeral    chan bridge.EphemeralEvent
+	appendErr    error
+	ephemeralErr error
 }
 
-func (*recordingSink) AppendIngress(context.Context, bridge.RawIngressRecord) error { return nil }
+func (s *recordingSink) AppendIngress(_ context.Context, record bridge.RawIngressRecord) error {
+	if s.ingress != nil {
+		s.ingress <- record
+	}
+	return s.appendErr
+}
 
-func (*recordingSink) EmitEphemeral(context.Context, bridge.EphemeralEvent) error { return nil }
+func (s *recordingSink) EmitEphemeral(_ context.Context, event bridge.EphemeralEvent) error {
+	if s.ephemeral != nil {
+		s.ephemeral <- event
+	}
+	return s.ephemeralErr
+}
 
 func (s *recordingSink) Beat(generation bridge.Generation, at time.Time, detail string) {
 	s.beats <- recordedBeat{generation: generation, at: at, detail: detail}

@@ -18,6 +18,7 @@ import (
 	"github.com/rs/zerolog"
 
 	"github.com/maxghenis/openmessage/internal/db"
+	"github.com/maxghenis/openmessage/internal/storage/sqlite"
 )
 
 func TestQRCodeRendersDataURL(t *testing.T) {
@@ -994,6 +995,247 @@ func TestDrainReceiveWALRecoversPendingBatch(t *testing.T) {
 	msgs, _ := store.GetMessagesByConversation("signal:+15551234567", 10)
 	if len(msgs) != 2 {
 		t.Fatalf("want 2 replayed messages, got %d: %+v", len(msgs), msgs)
+	}
+}
+
+func TestDrainReceiveWALReteesIngressReplay(t *testing.T) {
+	store, err := db.New(filepath.Join(t.TempDir(), "messages.db"))
+	if err != nil {
+		t.Fatalf("db.New(): %v", err)
+	}
+	defer store.Close()
+
+	bridge := &Bridge{store: store, logger: zerolog.Nop(), configDir: t.TempDir()}
+	payload := []byte(`{"account":"+15551230000","envelope":{"source":"+15551234567","timestamp":1700000000111,"dataMessage":{"timestamp":1700000000111,"message":"replayed"}}}`)
+	var observedAccounts []string
+	var observedLines [][]byte
+	unregister := bridge.ObserveIngress(func(account string, line []byte, _ string, _ string) {
+		observedAccounts = append(observedAccounts, account)
+		observedLines = append(observedLines, bytes.Clone(line))
+	})
+	defer unregister()
+
+	if processed, err := bridge.processReceiveLine("+15551230000", payload, false); err != nil || !processed {
+		t.Fatalf("processReceiveLine(live) = (%v, %v), want (true, nil)", processed, err)
+	}
+	if err := appendReceiveWAL(bridge.receiveWALPath(), "+15551230000", append(bytes.Clone(payload), '\n')); err != nil {
+		t.Fatalf("appendReceiveWAL(): %v", err)
+	}
+	bridge.drainReceiveWAL("+15551230000")
+
+	if len(observedLines) != 2 {
+		t.Fatalf("ingress observer calls = %d, want live + WAL replay", len(observedLines))
+	}
+	for index := range observedLines {
+		if observedAccounts[index] != "+15551230000" || !bytes.Equal(observedLines[index], payload) {
+			t.Fatalf("observer[%d] = (%q, %s), want resolved account and byte-identical line", index, observedAccounts[index], observedLines[index])
+		}
+	}
+	messages, err := store.GetMessagesByConversation("signal:+15551234567", 10)
+	if err != nil {
+		t.Fatalf("GetMessagesByConversation(): %v", err)
+	}
+	if len(messages) != 1 {
+		t.Fatalf("legacy messages after replay = %d, want one", len(messages))
+	}
+}
+
+func TestProcessReceiveLineCapturesResolvedContactAddresses(t *testing.T) {
+	store, err := db.New(filepath.Join(t.TempDir(), "messages.db"))
+	if err != nil {
+		t.Fatalf("db.New(): %v", err)
+	}
+	defer store.Close()
+
+	const (
+		account        = "+15551230000"
+		sourceACI      = "9f4b50e3-ebf2-413c-a856-161756a6161a"
+		resolvedSource = "+15551234567"
+		destinationACI = "7a81fd95-20f1-4437-86e2-d5c93ba18851"
+		resolvedTarget = "+15557654321"
+	)
+	bridge := &Bridge{
+		store:     store,
+		logger:    zerolog.Nop(),
+		configDir: t.TempDir(),
+		contactByACI: map[string]string{
+			sourceACI:      resolvedSource,
+			destinationACI: resolvedTarget,
+		},
+	}
+	type observation struct {
+		account             string
+		line                []byte
+		resolvedSource      string
+		resolvedDestination string
+	}
+	var observations []observation
+	unregister := bridge.ObserveIngress(func(account string, line []byte, resolvedSource string, resolvedDestination string) {
+		observations = append(observations, observation{
+			account:             account,
+			line:                bytes.Clone(line),
+			resolvedSource:      resolvedSource,
+			resolvedDestination: resolvedDestination,
+		})
+	})
+	defer unregister()
+
+	incoming := []byte(`{"account":"+15551230000","envelope":{"sourceName":"Taylor","sourceServiceId":"9f4b50e3-ebf2-413c-a856-161756a6161a","timestamp":1700000000123,"dataMessage":{"timestamp":1700000000123,"message":"incoming"}}}`)
+	outgoing := []byte(`{"account":"+15551230000","envelope":{"timestamp":1700000000222,"syncMessage":{"sentMessage":{"timestamp":1700000000222,"message":"outgoing","destinationServiceId":"7a81fd95-20f1-4437-86e2-d5c93ba18851"}}}}`)
+	for _, line := range [][]byte{incoming, outgoing} {
+		processed, err := bridge.processReceiveLine(account, line, false)
+		if err != nil || !processed {
+			t.Fatalf("processReceiveLine() = (%v, %v), want (true, nil)", processed, err)
+		}
+	}
+
+	if len(observations) != 2 {
+		t.Fatalf("observations = %d, want 2", len(observations))
+	}
+	wants := []observation{
+		{account: account, line: incoming, resolvedSource: resolvedSource},
+		{account: account, line: outgoing, resolvedDestination: resolvedTarget},
+	}
+	for index, want := range wants {
+		got := observations[index]
+		if got.account != want.account || !bytes.Equal(got.line, want.line) ||
+			got.resolvedSource != want.resolvedSource || got.resolvedDestination != want.resolvedDestination {
+			t.Fatalf("observation[%d] = %+v, want %+v", index, got, want)
+		}
+	}
+}
+
+func TestResolveContactAddressAtCaptureIsReadOnly(t *testing.T) {
+	const aci = "9f4b50e3-ebf2-413c-a856-161756a6161a"
+	contacts := map[string]string{aci: "+15551234567"}
+	bridge := &Bridge{contactByACI: contacts}
+	originalRunSignalCLI := runSignalCLI
+	defer func() { runSignalCLI = originalRunSignalCLI }()
+	commandCalls := 0
+	runSignalCLI = func(context.Context, string, ...string) ([]byte, error) {
+		commandCalls++
+		return []byte(`[{"number":"+15557654321","uuid":"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}]`), nil
+	}
+
+	tests := []struct {
+		name  string
+		value string
+		want  string
+	}{
+		{name: "absent", want: ""},
+		{name: "e164", value: "+15550000000", want: "+15550000000"},
+		{name: "cached ACI", value: aci, want: "+15551234567"},
+		{name: "unresolved ACI", value: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", want: ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := bridge.resolveContactAddressAtCapture(tc.value); got != tc.want {
+				t.Fatalf("resolveContactAddressAtCapture(%q) = %q, want %q", tc.value, got, tc.want)
+			}
+		})
+	}
+	if len(contacts) != 1 || contacts[aci] != "+15551234567" {
+		t.Fatalf("contact cache mutated during capture resolution: %+v", contacts)
+	}
+	if commandCalls != 0 {
+		t.Fatalf("capture resolution ran signal-cli %d times, want no commands", commandCalls)
+	}
+}
+
+func TestProcessReceiveLineCapturesBeforeRecoveryGuard(t *testing.T) {
+	bridge := &Bridge{logger: zerolog.Nop(), configDir: t.TempDir()}
+	payload := []byte(`{"account":"+15551230000","envelope":{"sourceName":"Taylor","timestamp":1700000000123,"dataMessage":{"timestamp":1700000000123,"message":"missing source"}}}`)
+	v2Store, err := sqlite.Open(filepath.Join(t.TempDir(), "v2.sqlite3"))
+	if err != nil {
+		t.Fatalf("sqlite.Open(): %v", err)
+	}
+	defer v2Store.Close()
+	if err := v2Store.UpsertAccount(sqlite.Account{
+		AccountID:   "signal-primary",
+		BridgeKey:   "signal_cli",
+		Mode:        sqlite.AccountModeLive,
+		Enabled:     true,
+		ConfigJSON:  `{}`,
+		CreatedAtMS: 1_700_000_000_000,
+		UpdatedAtMS: 1_700_000_000_000,
+	}); err != nil {
+		t.Fatalf("UpsertAccount(): %v", err)
+	}
+	messages, err := sqlite.NewMessageRepository(v2Store, func() time.Time {
+		return time.UnixMilli(1_700_000_000_000)
+	})
+	if err != nil {
+		t.Fatalf("NewMessageRepository(): %v", err)
+	}
+	var observedAccount string
+	var observedLine []byte
+	var appendErr error
+	unregister := bridge.ObserveIngress(func(account string, line []byte, _ string, _ string) {
+		observedAccount = account
+		observedLine = bytes.Clone(line)
+		_, appendErr = messages.AppendInbox(context.Background(), sqlite.InboxRecord{
+			InboxID:      "missing-source-inbox",
+			AccountID:    "signal-primary",
+			Generation:   1,
+			DedupeKey:    "missing-source-envelope",
+			Codec:        "signal.jsonrpc",
+			CodecVersion: 1,
+			Payload:      bytes.Clone(line),
+		})
+	})
+	defer unregister()
+
+	processed, err := bridge.processReceiveLine("+15550000000", payload, false)
+	if err != nil {
+		t.Fatalf("processReceiveLine(): %v", err)
+	}
+	if processed {
+		t.Fatal("processReceiveLine() processed missing-source envelope, want legacy quarantine")
+	}
+	if observedAccount != "+15551230000" || !bytes.Equal(observedLine, payload) {
+		t.Fatalf("observer = (%q, %s), want resolved account and captured recovery line", observedAccount, observedLine)
+	}
+	if appendErr != nil {
+		t.Fatalf("AppendInbox() from pre-recovery observer: %v", appendErr)
+	}
+	unprocessed, err := messages.Unprocessed(context.Background())
+	if err != nil {
+		t.Fatalf("Unprocessed(): %v", err)
+	}
+	if len(unprocessed) != 1 || unprocessed[0].InboxID != "missing-source-inbox" ||
+		!bytes.Equal(unprocessed[0].Payload, payload) {
+		t.Fatalf("durable recovery frame = %+v, want one byte-identical inbox row", unprocessed)
+	}
+}
+
+func TestProcessReceiveLineRecoversIngressObserverPanicAndPreservesLegacy(t *testing.T) {
+	store, err := db.New(filepath.Join(t.TempDir(), "messages.db"))
+	if err != nil {
+		t.Fatalf("db.New(): %v", err)
+	}
+	defer store.Close()
+
+	bridge := &Bridge{store: store, logger: zerolog.Nop(), configDir: t.TempDir()}
+	payload := []byte(`{"account":"+15551230000","envelope":{"source":"+15551234567","sourceName":"Taylor","timestamp":1700000000123,"dataMessage":{"timestamp":1700000000123,"message":"legacy survives"}}}`)
+	unregister := bridge.ObserveIngress(func(_ string, line []byte, _ string, _ string) {
+		line[0] = 'X'
+		panic("sink panic")
+	})
+	defer unregister()
+
+	processed, err := bridge.processReceiveLine("+15551230000", payload, false)
+	if err != nil || !processed {
+		t.Fatalf("processReceiveLine() = (%v, %v), want (true, nil)", processed, err)
+	}
+	if payload[0] != '{' {
+		t.Fatalf("observer mutated receive line: %q", payload)
+	}
+	messages, err := store.GetMessagesByConversation("signal:+15551234567", 10)
+	if err != nil {
+		t.Fatalf("GetMessagesByConversation(): %v", err)
+	}
+	if len(messages) != 1 || messages[0].Body != "legacy survives" {
+		t.Fatalf("legacy messages after observer panic = %+v, want stored message", messages)
 	}
 }
 
