@@ -2050,7 +2050,10 @@ func (b *Bridge) captureReceiptIngress(evt *waevents.Receipt) {
 		return
 	}
 	receivedAt := time.Now()
-	chatJID := b.normalizeConversationJID(evt.Chat)
+	// canonicalJID, not normalizeConversationJID: the latter merges legacy
+	// conversation aliases as a side effect, and the legacy receipt path never
+	// touches conversation JIDs. Capture must observe, never mutate.
+	chatJID := b.canonicalJID(evt.Chat)
 	senderJID := b.canonicalJID(evt.Sender)
 	messageIDs := make([]string, len(evt.MessageIDs))
 	for index, id := range evt.MessageIDs {

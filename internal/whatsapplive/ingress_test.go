@@ -406,3 +406,69 @@ func TestExtractMentionedJIDsReturnsIndependentSlice(t *testing.T) {
 		t.Fatalf("returned mentions alias proto storage: %v", original)
 	}
 }
+
+// Receipt capture must observe the canonical chat JID without mutating the
+// legacy store: normalizeConversationJID merges conversation aliases (deleting
+// the @lid row) as a side effect, and the legacy receipt path never touched
+// conversation JIDs. A receipt for an @lid chat therefore must leave the
+// legacy @lid conversation row exactly where it was.
+func TestReceiptIngressCaptureDoesNotMergeLegacyConversations(t *testing.T) {
+	store, err := db.New(":memory:")
+	if err != nil {
+		t.Fatalf("db.New(): %v", err)
+	}
+	defer store.Close()
+
+	chatLID := watypes.NewJID("134149377675280", watypes.HiddenUserServer)
+	chatPN := watypes.NewJID("15551230002", watypes.DefaultUserServer)
+	ownJID := watypes.NewJID("15550009999", watypes.DefaultUserServer)
+	lidConversationID := waConversationID(chatLID)
+	if err := store.UpsertConversation(&db.Conversation{
+		ConversationID: lidConversationID,
+		Name:           "LID alias thread",
+		Participants:   `[]`,
+		SourcePlatform: "whatsapp",
+	}); err != nil {
+		t.Fatalf("seed @lid conversation: %v", err)
+	}
+
+	bridge := &Bridge{
+		store: store,
+		client: &whatsmeow.Client{Store: &wastore.Device{
+			ID: &ownJID,
+			LIDs: &testLIDStore{
+				NoopStore: wastore.NoopStore{},
+				lidToPN: map[string]watypes.JID{
+					chatLID.String(): chatPN,
+				},
+			},
+		}},
+	}
+	var frame IngressFrame
+	bridge.ObserveIngress(func(captured IngressFrame) { frame = captured })
+	bridge.handleReceipt(&waevents.Receipt{
+		MessageSource: watypes.MessageSource{Chat: chatLID, Sender: chatLID},
+		MessageIDs:    []watypes.MessageID{"receipt-target"},
+		Timestamp:     time.UnixMilli(1775003001000),
+		Type:          watypes.ReceiptTypeRead,
+	})
+
+	var envelope whatsappReceiptIngressEnvelope
+	if err := json.Unmarshal(frame.Payload, &envelope); err != nil {
+		t.Fatalf("json.Unmarshal(): %v", err)
+	}
+	if envelope.ChatJID != chatPN.String() {
+		t.Fatalf("captured chat_jid = %q, want canonical %q", envelope.ChatJID, chatPN.String())
+	}
+
+	survived, err := store.GetConversation(lidConversationID)
+	if err != nil {
+		t.Fatalf("GetConversation(@lid): %v", err)
+	}
+	if survived == nil {
+		t.Fatal("legacy @lid conversation row was merged away by receipt capture")
+	}
+	if survived.Name != "LID alias thread" {
+		t.Fatalf("legacy @lid conversation mutated: %+v", survived)
+	}
+}
