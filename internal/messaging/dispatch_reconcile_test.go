@@ -37,7 +37,7 @@ func TestObserveTransportEchoConfirmsUncertainAndRepointsMessage(t *testing.T) {
 	}
 
 	const realID = "remote-reconciled"
-	if err := service.ObserveTransportEcho(context.Background(), TransportEcho{
+	if _, err := service.ObserveTransportEcho(context.Background(), TransportEcho{
 		AccountID:          item.AccountID,
 		TransportRequestID: item.TransportRequestID,
 		RemoteMessageID:    realID,
@@ -89,7 +89,7 @@ func TestObserveTransportEchoCollisionKeepsOptimisticFKAnchor(t *testing.T) {
 	if got := mustDelivery(t, service, submission.OutboxID).State; got != OutboxUncertain {
 		t.Fatalf("delivery before echo = %q, want uncertain", got)
 	}
-	if err := service.ObserveTransportEcho(context.Background(), TransportEcho{
+	if _, err := service.ObserveTransportEcho(context.Background(), TransportEcho{
 		AccountID:          item.AccountID,
 		TransportRequestID: item.TransportRequestID,
 		RemoteMessageID:    realID,
@@ -138,7 +138,7 @@ func TestObserveTransportEchoEnrichesPlaceholderConfirmation(t *testing.T) {
 	}
 
 	const permanentID = "remote-permanent"
-	if err := service.ObserveTransportEcho(context.Background(), TransportEcho{
+	if _, err := service.ObserveTransportEcho(context.Background(), TransportEcho{
 		AccountID:          item.AccountID,
 		TransportRequestID: item.TransportRequestID,
 		RemoteMessageID:    permanentID,
@@ -177,7 +177,7 @@ func TestObserveTransportEchoNoOpsNeverCreateOrCorrupt(t *testing.T) {
 			{AccountID: item.AccountID, TransportRequestID: item.TransportRequestID, RemoteMessageID: "remote-foreign"},
 			{AccountID: item.AccountID, TransportRequestID: "missing-request", RemoteMessageID: "remote-orphan"},
 		} {
-			if err := service.ObserveTransportEcho(context.Background(), echo); err != nil {
+			if _, err := service.ObserveTransportEcho(context.Background(), echo); err != nil {
 				t.Fatalf("ObserveTransportEcho(%+v): %v", echo, err)
 			}
 		}
@@ -215,7 +215,7 @@ func TestObserveTransportEchoNoOpsNeverCreateOrCorrupt(t *testing.T) {
 		if got := mustDelivery(t, service, submission.OutboxID).State; got != OutboxRejected {
 			t.Fatalf("delivery before echo = %q, want rejected", got)
 		}
-		if err := service.ObserveTransportEcho(context.Background(), TransportEcho{
+		if _, err := service.ObserveTransportEcho(context.Background(), TransportEcho{
 			AccountID: item.AccountID, TransportRequestID: item.TransportRequestID, RemoteMessageID: "remote-rejected",
 		}); err != nil {
 			t.Fatalf("ObserveTransportEcho(rejected): %v", err)
@@ -243,7 +243,7 @@ func TestObserveTransportEchoNoOpsNeverCreateOrCorrupt(t *testing.T) {
 		if _, err := service.Cancel(context.Background(), submission.OutboxID); err != nil {
 			t.Fatalf("Cancel(): %v", err)
 		}
-		if err := service.ObserveTransportEcho(context.Background(), TransportEcho{
+		if _, err := service.ObserveTransportEcho(context.Background(), TransportEcho{
 			AccountID: item.AccountID, TransportRequestID: item.TransportRequestID, RemoteMessageID: "remote-canceled",
 		}); err != nil {
 			t.Fatalf("ObserveTransportEcho(canceled): %v", err)
@@ -279,7 +279,7 @@ func TestObserveTransportEchoDuringDispatchingDefersToLeaseOwner(t *testing.T) {
 		messageErr    error
 	)
 	sender.onSend = func() {
-		echoErr = service.ObserveTransportEcho(context.Background(), TransportEcho{
+		_, echoErr = service.ObserveTransportEcho(context.Background(), TransportEcho{
 			AccountID: item.AccountID, TransportRequestID: item.TransportRequestID, RemoteMessageID: realID,
 		})
 		during, duringErr = service.Get(context.Background(), submission.OutboxID)
@@ -303,7 +303,7 @@ func TestObserveTransportEchoDuringDispatchingDefersToLeaseOwner(t *testing.T) {
 	if got := mustReconcileMessage(t, service, submission.LocalMessageID).RemoteMessageID; got != realID {
 		t.Fatalf("message after lease confirmation = %q, want %q", got, realID)
 	}
-	if err := service.ObserveTransportEcho(context.Background(), TransportEcho{
+	if _, err := service.ObserveTransportEcho(context.Background(), TransportEcho{
 		AccountID: item.AccountID, TransportRequestID: item.TransportRequestID, RemoteMessageID: realID,
 	}); err != nil {
 		t.Fatalf("ObserveTransportEcho(replay): %v", err)
@@ -452,7 +452,7 @@ func TestSendTextReplayAfterEchoRepointReturnsOriginalSubmission(t *testing.T) {
 	}
 
 	const permanentID = "remote-permanent-echo"
-	if err := service.ObserveTransportEcho(context.Background(), TransportEcho{
+	if _, err := service.ObserveTransportEcho(context.Background(), TransportEcho{
 		AccountID:          item.AccountID,
 		TransportRequestID: item.TransportRequestID,
 		RemoteMessageID:    permanentID,

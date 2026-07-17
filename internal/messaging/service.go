@@ -885,9 +885,12 @@ func (s *MessageService) SendAgain(
 // detached mutation context): echoes are at-least-once and reconciliation is
 // idempotent, so a canceled write is simply replayed by the next delivery —
 // unlike dispatch finalization, where losing the write loses real state.
-func (s *MessageService) ObserveTransportEcho(ctx context.Context, echo TransportEcho) error {
+func (s *MessageService) ObserveTransportEcho(
+	ctx context.Context,
+	echo TransportEcho,
+) (EchoOutcome, error) {
 	if ctx == nil {
-		return fmt.Errorf("observe transport echo: context is nil")
+		return "", fmt.Errorf("observe transport echo: context is nil")
 	}
 	checks := []struct {
 		name  string
@@ -899,7 +902,7 @@ func (s *MessageService) ObserveTransportEcho(ctx context.Context, echo Transpor
 	}
 	for _, check := range checks {
 		if strings.TrimSpace(check.value) == "" {
-			return fmt.Errorf("%w: %s is empty", ErrInvalidCommand, check.name)
+			return "", fmt.Errorf("%w: %s is empty", ErrInvalidCommand, check.name)
 		}
 	}
 
@@ -909,16 +912,16 @@ func (s *MessageService) ObserveTransportEcho(ctx context.Context, echo Transpor
 		ResultRemoteID:     echo.RemoteMessageID,
 	})
 	if err != nil {
-		return fmt.Errorf("observe transport echo: %w", err)
+		return "", fmt.Errorf("observe transport echo: %w", err)
 	}
 	switch outcome {
 	case sqlite.ReconcileOutcomeNotFound, sqlite.ReconcileOutcomeNoop:
-		return nil
+		return outcome, nil
 	case sqlite.ReconcileOutcomeReconciled, sqlite.ReconcileOutcomeEnriched:
 		s.signalChange()
-		return nil
+		return outcome, nil
 	default:
-		return fmt.Errorf("observe transport echo: unexpected reconcile outcome %q", outcome)
+		return "", fmt.Errorf("observe transport echo: unexpected reconcile outcome %q", outcome)
 	}
 }
 

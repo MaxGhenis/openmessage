@@ -10,13 +10,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/maxghenis/openmessage/internal/storage/blob"
 	"github.com/maxghenis/openmessage/internal/storage/sqlite"
+	"github.com/maxghenis/openmessage/internal/v2keys"
 	"github.com/maxghenis/openmessage/internal/whatsappmedia"
 )
 
@@ -66,11 +66,7 @@ var platformAccounts = map[string]accountSpec{
 	},
 }
 
-type identityKey struct {
-	AccountID string
-	Kind      string
-	Canonical string
-}
+type identityKey = v2keys.Identity
 
 type identityCandidate struct {
 	Key         identityKey
@@ -304,7 +300,7 @@ func buildTransformState(dataset legacyDataset, report *Report) (*transformState
 		state.accounts[account.Platform] = account
 		plan := &conversationPlan{
 			Legacy: legacy, Account: account,
-			V2ID: deriveID("conversation", account.AccountID, legacy.ID),
+			V2ID: v2keys.DeriveID("conversation", account.AccountID, legacy.ID),
 		}
 		var participants []legacyParticipant
 		if err := json.Unmarshal([]byte(legacy.ParticipantsJSON), &participants); err != nil {
@@ -378,7 +374,7 @@ func buildTransformState(dataset legacyDataset, report *Report) (*transformState
 		}
 		plan := unifiedContactPlan{
 			Legacy:   legacy,
-			PersonID: deriveID("person", "", legacy.ID),
+			PersonID: v2keys.DeriveID("person", "", legacy.ID),
 		}
 		var identifiers []unifiedIdentifier
 		if err := json.Unmarshal([]byte(legacy.IdentifiersJSON), &identifiers); err != nil {
@@ -428,7 +424,7 @@ func writeAccounts(target *sqlite.Store, state *transformState) error {
 		}); err != nil {
 			return fmt.Errorf("upsert %s account: %w", platform, err)
 		}
-		deviceID := deriveID("device", account.AccountID, account.AccountID+"\x1flocal")
+		deviceID := v2keys.DeriveID("device", account.AccountID, account.AccountID+"\x1flocal")
 		if err := target.UpsertDevice(sqlite.Device{
 			DeviceID: deviceID, AccountID: account.AccountID,
 			Kind: sqlite.DeviceKindLocalInstallation, DisplayName: "OpenMessage",
@@ -513,7 +509,7 @@ func writeConversations(target *sqlite.Store, state *transformState) error {
 		}
 		if err := target.UpsertConversation(sqlite.Conversation{
 			ConversationID: plan.V2ID, AccountID: plan.Account.AccountID,
-			RemoteConversationID: normalizeRemoteConversationID(plan.Account.Platform, plan.Legacy.ID),
+			RemoteConversationID: v2keys.NormalizeRemoteConversationID(plan.Account.Platform, plan.Legacy.ID),
 			Kind:                 kind, Title: plan.Legacy.Name, NotificationMode: notification,
 			IsFavorite: plan.Legacy.IsFavorite, ArchivedAtMS: archivedAt,
 			LastMessageAtMS: lastMessageAt, MetadataJSON: "{}",
@@ -552,7 +548,7 @@ func writeHistory(
 	for _, legacy := range dataset.messages {
 		conversation := state.conversations[legacy.ConversationID]
 		remoteID := deriveRemoteMessageID(legacy)
-		messageID := deriveID(
+		messageID := v2keys.DeriveID(
 			"message", conversation.Account.AccountID,
 			legacy.ConversationID+"\x1f"+remoteID,
 		)
@@ -569,7 +565,11 @@ func writeHistory(
 
 		var senderID *string
 		if !legacy.IsFromMe && strings.TrimSpace(legacy.SenderNumber) != "" {
-			key, err := identityKeyFor(conversation.Account, legacy.SenderNumber)
+			key, err := v2keys.IdentityKey(
+				conversation.Account.AccountID,
+				conversation.Account.Platform,
+				legacy.SenderNumber,
+			)
 			if err != nil {
 				return fmt.Errorf("message %q sender identity: %w", legacy.ID, err)
 			}
@@ -656,8 +656,8 @@ func writeScheduled(
 		if createdAt <= 0 {
 			createdAt = state.baseTimestampMS
 		}
-		requestID := deriveID("transport_request", conversation.Account.AccountID, scheduled.ID)
-		localMessageID := deriveID(
+		requestID := v2keys.DeriveID("transport_request", conversation.Account.AccountID, scheduled.ID)
+		localMessageID := v2keys.DeriveID(
 			"message", conversation.Account.AccountID,
 			scheduled.ConversationID+"\x1f"+requestID,
 		)
@@ -688,7 +688,7 @@ func writeScheduled(
 		}
 
 		item := sqlite.NewOutboxItem{
-			OutboxID:  deriveID("outbox", conversation.Account.AccountID, scheduled.ID),
+			OutboxID:  v2keys.DeriveID("outbox", conversation.Account.AccountID, scheduled.ID),
 			AccountID: conversation.Account.AccountID, ConversationID: conversation.V2ID,
 			IdempotencyKey: scheduled.ID, LocalMessageID: localMessageID,
 			TransportRequestID: requestID, ScheduledForMS: scheduled.SendAtMS,
@@ -793,7 +793,7 @@ func writeReadCursors(
 			lastReadID = &value
 			lastReadAt = positions[index].At
 		}
-		deviceID := deriveID(
+		deviceID := v2keys.DeriveID(
 			"device", conversation.Account.AccountID,
 			conversation.Account.AccountID+"\x1flocal",
 		)
@@ -906,7 +906,7 @@ func addIdentity(
 	isSelf bool,
 	priority int,
 ) (identityKey, error) {
-	key, err := identityKeyFor(account, raw)
+	key, err := v2keys.IdentityKey(account.AccountID, account.Platform, raw)
 	if err != nil {
 		return identityKey{}, err
 	}
@@ -926,50 +926,8 @@ func addIdentity(
 	return key, nil
 }
 
-var signalACI = regexp.MustCompile(`(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
-
-func identityKeyFor(account accountSpec, raw string) (identityKey, error) {
-	value := strings.TrimSpace(raw)
-	if value == "" {
-		return identityKey{}, fmt.Errorf("identity value is empty")
-	}
-	kind := "username"
-	canonical := value
-	switch {
-	case strings.HasPrefix(value, "+"):
-		var digits strings.Builder
-		for _, character := range value[1:] {
-			if character >= '0' && character <= '9' {
-				digits.WriteRune(character)
-			}
-		}
-		if digits.Len() == 0 {
-			return identityKey{}, fmt.Errorf("invalid E.164 identity %q", value)
-		}
-		kind = "e164"
-		canonical = "+" + digits.String()
-	case account.Platform == "signal" && signalACI.MatchString(value):
-		kind = "signal_aci"
-		canonical = strings.ToLower(value)
-	case strings.Contains(value, "@") && account.Platform == "whatsapp":
-		kind = "jid"
-		canonical = strings.ToLower(value)
-	case strings.Contains(value, "@"):
-		kind = "email"
-		canonical = strings.ToLower(value)
-	case strings.HasPrefix(value, "legacy-participant:"):
-		kind = "legacy_participant"
-	}
-	return identityKey{AccountID: account.AccountID, Kind: kind, Canonical: canonical}, nil
-}
-
 func identityID(key identityKey) string {
-	return deriveID("identity", key.AccountID, key.Kind+"\x1f"+key.Canonical)
-}
-
-func deriveID(entity, accountID, naturalKey string) string {
-	sum := sha256.Sum256([]byte(entity + "\x1f" + accountID + "\x1f" + naturalKey))
-	return hex.EncodeToString(sum[:])[:32]
+	return v2keys.DeriveID("identity", key.AccountID, key.Kind+"\x1f"+key.Canonical)
 }
 
 func deriveRemoteMessageID(message legacyMessage) string {
@@ -1011,20 +969,6 @@ func accountForPlatform(platform string) (accountSpec, error) {
 		return accountSpec{}, fmt.Errorf("unsupported legacy source_platform %q", platform)
 	}
 	return account, nil
-}
-
-func normalizeRemoteConversationID(platform, legacyID string) string {
-	value := strings.TrimSpace(legacyID)
-	if platform != "signal" {
-		return value
-	}
-	if strings.HasPrefix(value, "signal-group:") {
-		return "signal-group:" + strings.TrimSpace(strings.TrimPrefix(value, "signal-group:"))
-	}
-	if strings.HasPrefix(value, "signal:") {
-		return "signal:" + strings.TrimSpace(strings.TrimPrefix(value, "signal:"))
-	}
-	return value
 }
 
 func minLegacyTimestamp(dataset legacyDataset) int64 {

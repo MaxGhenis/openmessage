@@ -174,6 +174,57 @@ func (r *MessageRepository) Unprocessed(ctx context.Context) ([]InboxRecord, err
 	return records, nil
 }
 
+// MarkInboxProcessed removes a durable frame from the worker's unprocessed
+// queue without deleting its payload. Repeated calls, including calls for a
+// row that is already processed or does not exist for the account, succeed.
+func (r *MessageRepository) MarkInboxProcessed(
+	ctx context.Context,
+	inboxID string,
+	accountID string,
+) error {
+	nowMS, err := r.nowMS("mark inbox processed")
+	if err != nil {
+		return err
+	}
+	return markInboxProcessed(ctx, r.store.db, inboxID, accountID, nowMS)
+}
+
+type inboxProcessExecer interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}
+
+func markInboxProcessed(
+	ctx context.Context,
+	execer inboxProcessExecer,
+	inboxID string,
+	accountID string,
+	processedAtMS int64,
+) error {
+	_, err := execer.ExecContext(ctx, `
+		UPDATE inbox
+		SET processed_at_ms = ?
+		WHERE inbox_id = ? AND account_id = ? AND processed_at_ms IS NULL
+	`, processedAtMS, inboxID, accountID)
+	if err == nil {
+		return nil
+	}
+	if isSQLiteConstraint(err) {
+		return fmt.Errorf(
+			"mark inbox %q for account %q processed: %w: %w",
+			inboxID,
+			accountID,
+			ErrInvalidInboxRecord,
+			mapConstraintError(err),
+		)
+	}
+	return fmt.Errorf(
+		"mark inbox %q for account %q processed: %w",
+		inboxID,
+		accountID,
+		err,
+	)
+}
+
 // GetMessage returns the normalized message with messageID.
 func (r *MessageRepository) GetMessage(
 	ctx context.Context,
