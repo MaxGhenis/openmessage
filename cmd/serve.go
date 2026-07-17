@@ -42,6 +42,18 @@ type serveOptions struct {
 	mcpStdio bool
 }
 
+func mcpV2Dependencies(stack *v2Stack) []*tools.V2Dependencies {
+	if stack == nil {
+		return nil
+	}
+	return []*tools.V2Dependencies{{
+		Enabled:  true,
+		Service:  stack.Service,
+		V2Store:  stack.Store,
+		Registry: stack.Registry,
+	}}
+}
+
 // buildVersion is the version string baked in at build time. SetVersion is
 // called from main() with the value of main.version (set via -ldflags).
 var buildVersion = "dev"
@@ -453,7 +465,7 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 		buildVersion,
 		mcpserver.WithToolCapabilities(true),
 	)
-	tools.Register(mcpSrv, a)
+	tools.Register(mcpSrv, a, mcpV2Dependencies(stack)...)
 
 	var mcpHTTPHandler http.Handler
 	if opts.mcpSSE {

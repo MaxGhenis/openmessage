@@ -12,13 +12,20 @@ import (
 	"github.com/maxghenis/openmessage/internal/db"
 )
 
-func Register(s *server.MCPServer, a *app.App) {
+func Register(s *server.MCPServer, a *app.App, v2 ...*V2Dependencies) {
+	configuredV2 := activeV2(v2)
 	s.AddTool(getMessagesTool(), getMessagesHandler(a))
 	s.AddTool(getConversationTool(), getConversationHandler(a))
 	s.AddTool(searchMessagesTool(), searchMessagesHandler(a))
-	s.AddTool(sendMessageTool(), sendMessageHandler(a))
-	s.AddTool(sendToConversationTool(), sendToConversationHandler(a))
-	s.AddTool(sendMediaToConversationTool(), sendMediaToConversationHandler(a))
+	if configuredV2 == nil {
+		s.AddTool(sendMessageTool(), sendMessageHandler(a))
+		s.AddTool(sendToConversationTool(), sendToConversationHandler(a))
+		s.AddTool(sendMediaToConversationTool(), sendMediaToConversationHandler(a))
+	} else {
+		s.AddTool(sendMessageTool(true), sendMessageHandler(a, configuredV2))
+		s.AddTool(sendToConversationTool(true), sendToConversationHandler(a, configuredV2))
+		s.AddTool(sendMediaToConversationTool(true), sendMediaToConversationHandler(a, configuredV2))
+	}
 	s.AddTool(reactToMessageTool(), reactToMessageHandler(a))
 	s.AddTool(setMessageTranscriptTool(), setMessageTranscriptHandler(a))
 	s.AddTool(listConversationsTool(), listConversationsHandler(a))
@@ -36,7 +43,11 @@ func Register(s *server.MCPServer, a *app.App) {
 	s.AddTool(generateVizTool(), generateVizHandler(a))
 	s.AddTool(getPersonMessagesRangeTool(), getPersonMessagesRangeHandler(a))
 	s.AddTool(renderStoryTool(), renderStoryHandler(a))
-	s.AddTool(sendGroupMessageTool(), sendGroupMessageHandler(a))
+	if configuredV2 == nil {
+		s.AddTool(sendGroupMessageTool(), sendGroupMessageHandler(a))
+	} else {
+		s.AddTool(sendGroupMessageTool(true), sendGroupMessageHandler(a, configuredV2))
+	}
 }
 
 func strArg(args map[string]any, key string) string {
