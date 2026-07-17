@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -15,6 +16,8 @@ import (
 	signaladapter "github.com/maxghenis/openmessage/internal/bridgeadapters/signal"
 	whatsappadapter "github.com/maxghenis/openmessage/internal/bridgeadapters/whatsapp"
 	"github.com/maxghenis/openmessage/internal/db"
+	"github.com/maxghenis/openmessage/internal/ingest"
+	"github.com/maxghenis/openmessage/internal/storage/sqlite"
 	"github.com/maxghenis/openmessage/internal/web"
 )
 
@@ -48,6 +51,41 @@ func TestV2SendEnabled(t *testing.T) {
 			}
 			if got := v2SendEnabled(); got != tt.want {
 				t.Fatalf("v2SendEnabled() = %t, want %t for %q", got, tt.want, tt.value)
+			}
+		})
+	}
+}
+
+func TestV2IngestEnabled(t *testing.T) {
+	tests := []struct {
+		name  string
+		value string
+		unset bool
+		want  bool
+	}{
+		{name: "unset", unset: true, want: false},
+		{name: "zero", value: "0", want: false},
+		{name: "false", value: "false", want: false},
+		{name: "no", value: "no", want: false},
+		{name: "off", value: "off", want: false},
+		{name: "unknown", value: "enabled", want: false},
+		{name: "one", value: "1", want: true},
+		{name: "true", value: "true", want: true},
+		{name: "yes", value: "yes", want: true},
+		{name: "on", value: "on", want: true},
+		{name: "case and whitespace insensitive", value: "  TrUe\t", want: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("OPENMESSAGES_V2_INGEST", tt.value)
+			if tt.unset {
+				if err := os.Unsetenv("OPENMESSAGES_V2_INGEST"); err != nil {
+					t.Fatalf("unset OPENMESSAGES_V2_INGEST: %v", err)
+				}
+			}
+			if got := v2IngestEnabled(); got != tt.want {
+				t.Fatalf("v2IngestEnabled() = %t, want %t for %q", got, tt.want, tt.value)
 			}
 		})
 	}
@@ -138,8 +176,12 @@ func TestNewV2StackAllowsEmptyAdapterRegistry(t *testing.T) {
 	}
 	defer stack.Store.Close()
 
-	if stack.Store == nil || stack.Blobs == nil || stack.Registry == nil || stack.Service == nil || stack.Media == nil {
+	if stack.Store == nil || stack.Blobs == nil || stack.Registry == nil || stack.Service == nil ||
+		stack.Media == nil || stack.Sink == nil || stack.Counters == nil || stack.worker == nil {
 		t.Fatalf("newV2Stack() returned incomplete stack: %+v", stack)
+	}
+	if stack.worker.Counters() != stack.Counters {
+		t.Fatal("newV2Stack() did not expose the worker's shared ingest counters")
 	}
 	for _, accountID := range []string{googleAccountID, whatsappAccountID, signalAccountID} {
 		if _, ok := stack.Registry.Snapshot(accountID); ok {
@@ -179,12 +221,14 @@ func TestNewV2StackRegistersConcreteLifecycleAdapters(t *testing.T) {
 	defer stack.Store.Close()
 
 	for _, want := range []struct {
-		accountID string
-		platform  bridge.Platform
+		accountID   string
+		platform    bridge.Platform
+		bridgeKey   string
+		displayName string
 	}{
-		{accountID: googleAccountID, platform: bridge.PlatformGoogle},
-		{accountID: whatsappAccountID, platform: bridge.PlatformWhatsApp},
-		{accountID: signalAccountID, platform: bridge.PlatformSignal},
+		{accountID: googleAccountID, platform: bridge.PlatformGoogle, bridgeKey: "google_messages", displayName: "Google Messages"},
+		{accountID: whatsappAccountID, platform: bridge.PlatformWhatsApp, bridgeKey: "whatsmeow", displayName: "WhatsApp"},
+		{accountID: signalAccountID, platform: bridge.PlatformSignal, bridgeKey: "signal_cli", displayName: "Signal"},
 	} {
 		snapshot, ok := stack.Registry.Snapshot(want.accountID)
 		if !ok {
@@ -194,7 +238,97 @@ func TestNewV2StackRegistersConcreteLifecycleAdapters(t *testing.T) {
 		if snapshot.Platform != want.platform {
 			t.Errorf("registry platform for %q = %q, want %q", want.accountID, snapshot.Platform, want.platform)
 		}
+		account, err := stack.Store.GetAccount(want.accountID)
+		if err != nil {
+			t.Errorf("GetAccount(%q): %v", want.accountID, err)
+			continue
+		}
+		if account.BridgeKey != want.bridgeKey || account.DisplayName != want.displayName ||
+			account.Mode != sqlite.AccountModeLive || !account.Enabled || account.ConfigJSON != "{}" {
+			t.Errorf("bootstrapped account %q = %+v", want.accountID, account)
+		}
 	}
+}
+
+func TestV2StackRegisterAdapterPreservesExistingAccount(t *testing.T) {
+	stack, err := newV2Stack(v2StackDeps{
+		Logger:  zerolog.Nop(),
+		DataDir: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("newV2Stack(): %v", err)
+	}
+	defer stack.Store.Close()
+
+	remoteID := "remote-google-account"
+	existing := sqlite.Account{
+		AccountID:       googleAccountID,
+		BridgeKey:       "preserve-this-bridge",
+		RemoteAccountID: &remoteID,
+		DisplayName:     "Preserve this name",
+		Mode:            sqlite.AccountModeArchive,
+		Enabled:         false,
+		ConfigJSON:      `{"preserve":true}`,
+		CreatedAtMS:     111,
+		UpdatedAtMS:     222,
+	}
+	if err := stack.Store.UpsertAccount(existing); err != nil {
+		t.Fatalf("UpsertAccount(): %v", err)
+	}
+	if err := stack.RegisterAdapter(googleadapter.New(googleAccountID, nil, func() bool { return false })); err != nil {
+		t.Fatalf("RegisterAdapter(): %v", err)
+	}
+	got, err := stack.Store.GetAccount(googleAccountID)
+	if err != nil {
+		t.Fatalf("GetAccount(): %v", err)
+	}
+	if !reflect.DeepEqual(got, existing) {
+		t.Fatalf("RegisterAdapter() changed existing account\n got: %+v\nwant: %+v", got, existing)
+	}
+}
+
+func TestV2StackFreshGoogleIngressReachesWorker(t *testing.T) {
+	stack, err := newV2Stack(v2StackDeps{
+		Logger:  zerolog.Nop(),
+		DataDir: t.TempDir(),
+		Google:  googleadapter.New(googleAccountID, nil, func() bool { return false }),
+	})
+	if err != nil {
+		t.Fatalf("newV2Stack(): %v", err)
+	}
+
+	legacy, err := db.New(filepath.Join(t.TempDir(), "legacy.sqlite3"))
+	if err != nil {
+		t.Fatalf("db.New(): %v", err)
+	}
+	defer legacy.Close()
+	stop := stack.Start(context.Background(), legacy, web.NewEventBroker())
+	defer stop()
+
+	if err := stack.Sink.AppendIngress(context.Background(), bridge.RawIngressRecord{
+		AccountID:    googleAccountID,
+		Generation:   1,
+		DedupeKey:    "fresh-google-malformed",
+		Codec:        ingest.GoogleCodec,
+		CodecVersion: ingest.GoogleCodecVersion,
+		ReceivedAt:   time.Now(),
+		Payload:      []byte("{"),
+	}); err != nil {
+		t.Fatalf("AppendIngress() on fresh stack: %v", err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		snapshot := stack.Counters.Snapshot(googleAccountID)
+		if snapshot.Quarantined == 1 {
+			if snapshot.Appended != 1 {
+				t.Fatalf("ingest counters after quarantine = %+v", snapshot)
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("malformed fresh-stack frame was not quarantined: %+v", stack.Counters.Snapshot(googleAccountID))
 }
 
 func TestV2StackStopJoinsRunAndClosesStore(t *testing.T) {

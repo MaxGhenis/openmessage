@@ -1,8 +1,14 @@
 package google
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"database/sql"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -11,10 +17,13 @@ import (
 	"go.mau.fi/mautrix-gmessages/pkg/libgm"
 	"go.mau.fi/mautrix-gmessages/pkg/libgm/events"
 	"go.mau.fi/mautrix-gmessages/pkg/libgm/gmproto"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/maxghenis/openmessage/internal/app"
 	"github.com/maxghenis/openmessage/internal/bridge"
 	"github.com/maxghenis/openmessage/internal/client"
+	"github.com/maxghenis/openmessage/internal/ingest"
+	"github.com/maxghenis/openmessage/internal/storage/sqlite"
 )
 
 func TestEventFailureClassification(t *testing.T) {
@@ -395,6 +404,361 @@ func TestPhoneUnreachableSurvivesRepeatedLivenessWindowsAndRecovers(t *testing.T
 	}
 }
 
+func TestIngressTeeMessageFramesUseContentHash(t *testing.T) {
+	host := newTestApp(t)
+	fake := &fakeTransport{}
+	a := newTestAdapter(t, host, fake)
+	sink := &recordingSink{}
+	run, err := a.Start(context.Background(), bridge.StartRequest{
+		AccountID:  "google-primary",
+		Generation: 7,
+	}, sink)
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	t.Cleanup(func() { stopRun(t, run) })
+
+	message := &gmproto.Message{
+		MessageID:      "message-1",
+		ConversationID: "conversation-1",
+		Timestamp:      1_234_000,
+	}
+	frame := &libgm.WrappedMessage{Message: message, IsOld: false}
+	fake.emit(frame)
+	fake.emit(frame)
+
+	changed := proto.Clone(message).(*gmproto.Message)
+	changed.MessageStatus = &gmproto.MessageStatus{SubCode: 1}
+	fake.emit(&libgm.WrappedMessage{Message: changed, IsOld: false})
+
+	records := sink.ingressRecords()
+	if len(records) != 3 {
+		t.Fatalf("AppendIngress calls = %d, want 3", len(records))
+	}
+	first := records[0]
+	if first.AccountID != "google-primary" || first.Generation != 7 {
+		t.Fatalf("frame ownership = (%q, %d), want (google-primary, 7)", first.AccountID, first.Generation)
+	}
+	if first.Codec != "google.protobuf" || first.CodecVersion != 1 {
+		t.Fatalf("codec = %q v%d, want google.protobuf v1", first.Codec, first.CodecVersion)
+	}
+	if first.ReceivedAt.IsZero() {
+		t.Fatal("ReceivedAt was not stamped at the tee")
+	}
+
+	var envelope struct {
+		Kind  string `json:"kind"`
+		Proto []byte `json:"proto_b64"`
+		IsOld *bool  `json:"is_old"`
+	}
+	if err := json.Unmarshal(first.Payload, &envelope); err != nil {
+		t.Fatalf("decode message envelope: %v", err)
+	}
+	if envelope.Kind != "message" || envelope.IsOld == nil || *envelope.IsOld {
+		t.Fatalf("message envelope metadata = kind %q is_old %v", envelope.Kind, envelope.IsOld)
+	}
+	var roundTrip gmproto.Message
+	if err := proto.Unmarshal(envelope.Proto, &roundTrip); err != nil {
+		t.Fatalf("unmarshal teed message proto: %v", err)
+	}
+	if !proto.Equal(&roundTrip, message) {
+		t.Fatalf("teed proto = %v, want %v", &roundTrip, message)
+	}
+	digest := sha256.Sum256(envelope.Proto)
+	wantKey := "msg:message-1:" + hex.EncodeToString(digest[:4])
+	if first.DedupeKey != wantKey {
+		t.Fatalf("dedupe key = %q, want %q", first.DedupeKey, wantKey)
+	}
+	if records[1].DedupeKey != first.DedupeKey || !bytes.Equal(records[1].Payload, first.Payload) {
+		t.Fatal("an exact frame replay did not produce the same dedupe key and payload")
+	}
+	if records[2].DedupeKey == first.DedupeKey {
+		t.Fatal("same MessageID with changed status content reused the replay dedupe key")
+	}
+}
+
+func TestIngressTeeThroughRealSinkDedupesExactFrames(t *testing.T) {
+	host := newTestApp(t)
+	storePath := filepath.Join(t.TempDir(), "v2.sqlite3")
+	store, err := sqlite.Open(storePath)
+	if err != nil {
+		t.Fatalf("sqlite.Open(): %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	now := time.Now
+	nowMS := now().UnixMilli()
+	if err := store.UpsertAccount(sqlite.Account{
+		AccountID:   "google-primary",
+		BridgeKey:   "google_messages",
+		DisplayName: "Google Messages",
+		Mode:        sqlite.AccountModeLive,
+		Enabled:     true,
+		ConfigJSON:  "{}",
+		CreatedAtMS: nowMS,
+		UpdatedAtMS: nowMS,
+	}); err != nil {
+		t.Fatalf("UpsertAccount(): %v", err)
+	}
+	messages, err := sqlite.NewMessageRepository(store, now)
+	if err != nil {
+		t.Fatalf("NewMessageRepository(): %v", err)
+	}
+	counters := &ingest.Counters{}
+	worker, err := ingest.NewWorker(ingest.WorkerConfig{
+		Store:    store,
+		Messages: messages,
+		Counters: counters,
+		Logger:   zerolog.Nop(),
+		Decoders: []ingest.DecoderRegistration{{
+			Codec:    ingest.GoogleCodec,
+			Platform: bridge.PlatformGoogle,
+			Decoder:  ingest.NewGoogleDecoder(counters),
+		}},
+	})
+	if err != nil {
+		t.Fatalf("NewWorker(): %v", err)
+	}
+	sink, err := ingest.NewSink(ingest.SinkConfig{
+		Messages: messages,
+		Worker:   worker,
+		Counters: counters,
+	})
+	if err != nil {
+		t.Fatalf("NewSink(): %v", err)
+	}
+	workerCtx, cancelWorker := context.WithCancel(context.Background())
+	workerDone := make(chan error, 1)
+	go func() { workerDone <- worker.Run(workerCtx) }()
+	t.Cleanup(func() {
+		cancelWorker()
+		select {
+		case runErr := <-workerDone:
+			if runErr != nil {
+				t.Errorf("Worker.Run(): %v", runErr)
+			}
+		case <-time.After(time.Second):
+			t.Error("Worker.Run() did not stop")
+		}
+	})
+
+	fake := &fakeTransport{}
+	a := newTestAdapter(t, host, fake)
+	run, err := a.Start(context.Background(), bridge.StartRequest{
+		AccountID:  "google-primary",
+		Generation: 21,
+	}, sink)
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	t.Cleanup(func() { stopRun(t, run) })
+
+	message := &gmproto.Message{
+		MessageID:      "real-sink-message",
+		ConversationID: "real-sink-conversation",
+		Timestamp:      1_750_000_000_000_000,
+		MessageStatus:  &gmproto.MessageStatus{Status: gmproto.MessageStatusType_INCOMING_COMPLETE},
+		SenderParticipant: &gmproto.Participant{
+			FullName: "Ada",
+			ID:       &gmproto.SmallInfo{Number: "+15551234567"},
+		},
+		MessageInfo: []*gmproto.MessageInfo{{
+			Data: &gmproto.MessageInfo_MessageContent{
+				MessageContent: &gmproto.MessageContent{Content: "same body"},
+			},
+		}},
+	}
+	frame := &libgm.WrappedMessage{Message: message}
+	fake.emit(frame)
+	fake.emit(frame)
+	changed := proto.Clone(message).(*gmproto.Message)
+	changed.MessageStatus.SubCode = 1
+	fake.emit(&libgm.WrappedMessage{Message: changed})
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		snapshot := counters.Snapshot("google-primary")
+		if snapshot.Appended == 2 && snapshot.Deduped == 1 && snapshot.Projected >= 2 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	snapshot := counters.Snapshot("google-primary")
+	if snapshot.Appended != 2 || snapshot.Deduped != 1 || snapshot.Projected < 2 {
+		t.Fatalf("real sink counters = %+v", snapshot)
+	}
+
+	inspection, err := sql.Open("sqlite", storePath)
+	if err != nil {
+		t.Fatalf("sql.Open(): %v", err)
+	}
+	defer inspection.Close()
+	for table, want := range map[string]int{"inbox": 2, "messages": 1} {
+		var got int
+		if err := inspection.QueryRow("SELECT COUNT(*) FROM " + table).Scan(&got); err != nil {
+			t.Fatalf("count %s: %v", table, err)
+		}
+		if got != want {
+			t.Fatalf("%s rows = %d, want %d", table, got, want)
+		}
+	}
+}
+
+func TestIngressTeeConversationEnvelope(t *testing.T) {
+	host := newTestApp(t)
+	fake := &fakeTransport{}
+	a := newTestAdapter(t, host, fake)
+	sink := &recordingSink{}
+	run, err := a.Start(context.Background(), bridge.StartRequest{
+		AccountID:  "google-primary",
+		Generation: 4,
+	}, sink)
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	t.Cleanup(func() { stopRun(t, run) })
+
+	conversation := &gmproto.Conversation{
+		ConversationID: "conversation-1",
+		Name:           "Family",
+		IsGroupChat:    true,
+	}
+	fake.emit(conversation)
+
+	records := sink.ingressRecords()
+	if len(records) != 1 {
+		t.Fatalf("AppendIngress calls = %d, want 1", len(records))
+	}
+	var envelope struct {
+		Kind  string          `json:"kind"`
+		Proto []byte          `json:"proto_b64"`
+		IsOld json.RawMessage `json:"is_old"`
+	}
+	if err := json.Unmarshal(records[0].Payload, &envelope); err != nil {
+		t.Fatalf("decode conversation envelope: %v", err)
+	}
+	if envelope.Kind != "conversation" {
+		t.Fatalf("envelope kind = %q, want conversation", envelope.Kind)
+	}
+	if envelope.IsOld != nil {
+		t.Fatalf("conversation envelope unexpectedly included is_old: %s", envelope.IsOld)
+	}
+	var roundTrip gmproto.Conversation
+	if err := proto.Unmarshal(envelope.Proto, &roundTrip); err != nil {
+		t.Fatalf("unmarshal teed conversation proto: %v", err)
+	}
+	if !proto.Equal(&roundTrip, conversation) {
+		t.Fatalf("teed proto = %v, want %v", &roundTrip, conversation)
+	}
+	digest := sha256.Sum256(envelope.Proto)
+	wantKey := "conv:conversation-1:" + hex.EncodeToString(digest[:4])
+	if records[0].DedupeKey != wantKey {
+		t.Fatalf("dedupe key = %q, want %q", records[0].DedupeKey, wantKey)
+	}
+}
+
+func TestIngressTeeRoutesTypingButNotLifecycleEvents(t *testing.T) {
+	host := newTestApp(t)
+	fake := &fakeTransport{}
+	a := newTestAdapter(t, host, fake)
+	sink := &recordingSink{}
+	run, err := a.Start(context.Background(), bridge.StartRequest{
+		AccountID:  "google-primary",
+		Generation: 9,
+	}, sink)
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	t.Cleanup(func() { stopRun(t, run) })
+
+	fake.emit(&gmproto.TypingData{
+		ConversationID: "conversation-typing",
+		User:           &gmproto.User{Number: "+15551234567"},
+		Type:           gmproto.TypingTypes_STARTED_TYPING,
+	})
+	fake.emit(&events.PhoneRespondingAgain{})
+
+	if records := sink.ingressRecords(); len(records) != 0 {
+		t.Fatalf("durable ingress records = %d, want 0 for typing/lifecycle events", len(records))
+	}
+	ephemeral := sink.ephemeralEvents()
+	if len(ephemeral) != 1 {
+		t.Fatalf("EmitEphemeral calls = %d, want 1", len(ephemeral))
+	}
+	got := ephemeral[0]
+	if got.AccountID != "google-primary" || got.Generation != 9 || got.Typing == nil {
+		t.Fatalf("ephemeral ownership/payload = %#v", got)
+	}
+	if got.Typing.RemoteConversationID != "conversation-typing" ||
+		got.Typing.Actor.Raw != "+15551234567" || !got.Typing.Typing {
+		t.Fatalf("typing payload = %#v", got.Typing)
+	}
+}
+
+func TestIngressTeeAppendErrorDoesNotInterruptLegacyHandler(t *testing.T) {
+	host := newTestApp(t)
+	legacyHandled := 0
+	host.OnConversationsChange = func() { legacyHandled++ }
+	fake := &fakeTransport{}
+	a := newTestAdapter(t, host, fake)
+	sink := &recordingSink{appendErr: errors.New("inbox unavailable")}
+	run, err := a.Start(context.Background(), bridge.StartRequest{
+		AccountID:  "google-primary",
+		Generation: 12,
+	}, sink)
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	t.Cleanup(func() { stopRun(t, run) })
+
+	fake.emit(&gmproto.Conversation{ConversationID: "legacy-still-runs", Name: "Legacy"})
+
+	if legacyHandled != 1 {
+		t.Fatalf("legacy conversation callbacks = %d, want 1", legacyHandled)
+	}
+	if got := a.IngressErrorCount(); got != 1 {
+		t.Fatalf("recorded ingress errors = %d, want 1", got)
+	}
+	if records := sink.ingressRecords(); len(records) != 1 {
+		t.Fatalf("AppendIngress calls = %d, want 1", len(records))
+	}
+	select {
+	case terminal := <-run.Done():
+		t.Fatalf("tee error ended the generation: %v", terminal)
+	default:
+	}
+}
+
+func TestIngressTeeAppendPanicDoesNotInterruptLegacyHandler(t *testing.T) {
+	host := newTestApp(t)
+	legacyHandled := 0
+	host.OnConversationsChange = func() { legacyHandled++ }
+	fake := &fakeTransport{}
+	a := newTestAdapter(t, host, fake)
+	sink := &recordingSink{appendPanic: "inbox panic"}
+	run, err := a.Start(context.Background(), bridge.StartRequest{
+		AccountID:  "google-primary",
+		Generation: 13,
+	}, sink)
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	t.Cleanup(func() { stopRun(t, run) })
+
+	fake.emit(&gmproto.Conversation{ConversationID: "legacy-survives-panic", Name: "Legacy"})
+
+	if legacyHandled != 1 {
+		t.Fatalf("legacy conversation callbacks = %d, want 1", legacyHandled)
+	}
+	if got := a.IngressErrorCount(); got != 1 {
+		t.Fatalf("recorded ingress errors = %d, want 1", got)
+	}
+	select {
+	case terminal := <-run.Done():
+		t.Fatalf("tee panic ended the generation: %v", terminal)
+	default:
+	}
+}
+
 func newTestApp(t *testing.T) *app.App {
 	t.Helper()
 	t.Setenv("OPENMESSAGES_DATA_DIR", t.TempDir())
@@ -523,13 +887,32 @@ func (f *fakeTransport) probeCount() int {
 }
 
 type recordingSink struct {
-	mu    sync.Mutex
-	beats int
+	mu           sync.Mutex
+	beats        int
+	records      []bridge.RawIngressRecord
+	ephemeral    []bridge.EphemeralEvent
+	appendErr    error
+	appendPanic  any
+	ephemeralErr error
 }
 
-func (*recordingSink) AppendIngress(context.Context, bridge.RawIngressRecord) error { return nil }
+func (s *recordingSink) AppendIngress(_ context.Context, record bridge.RawIngressRecord) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	record.Payload = bytes.Clone(record.Payload)
+	s.records = append(s.records, record)
+	if s.appendPanic != nil {
+		panic(s.appendPanic)
+	}
+	return s.appendErr
+}
 
-func (*recordingSink) EmitEphemeral(context.Context, bridge.EphemeralEvent) error { return nil }
+func (s *recordingSink) EmitEphemeral(_ context.Context, event bridge.EphemeralEvent) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ephemeral = append(s.ephemeral, event)
+	return s.ephemeralErr
+}
 
 func (s *recordingSink) Beat(bridge.Generation, time.Time, string) {
 	s.mu.Lock()
@@ -542,4 +925,21 @@ func (s *recordingSink) beatCount() int {
 	count := s.beats
 	s.mu.Unlock()
 	return count
+}
+
+func (s *recordingSink) ingressRecords() []bridge.RawIngressRecord {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	records := make([]bridge.RawIngressRecord, len(s.records))
+	for i, record := range s.records {
+		record.Payload = bytes.Clone(record.Payload)
+		records[i] = record
+	}
+	return records
+}
+
+func (s *recordingSink) ephemeralEvents() []bridge.EphemeralEvent {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]bridge.EphemeralEvent(nil), s.ephemeral...)
 }

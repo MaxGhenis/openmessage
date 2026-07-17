@@ -6,12 +6,14 @@ package google
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"os"
 	"runtime/debug"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.mau.fi/mautrix-gmessages/pkg/libgm"
@@ -21,6 +23,7 @@ import (
 	"github.com/maxghenis/openmessage/internal/app"
 	"github.com/maxghenis/openmessage/internal/bridge"
 	"github.com/maxghenis/openmessage/internal/client"
+	"github.com/maxghenis/openmessage/internal/ingest"
 )
 
 type transportClient interface {
@@ -43,6 +46,8 @@ type Adapter struct {
 	mu       sync.Mutex
 	current  *run
 	starting bool
+
+	ingressErrors atomic.Uint64
 }
 
 func New(accountID string, host *app.App, canRepair func() bool) *Adapter {
@@ -65,6 +70,15 @@ func (a *Adapter) DeclaredCapabilities() bridge.CapabilitySet {
 		PairQR:            true,
 		MediaDownload:     true,
 	}
+}
+
+// IngressErrorCount returns the number of Google tee failures absorbed by
+// this one-account adapter while preserving legacy event delivery.
+func (a *Adapter) IngressErrorCount() uint64 {
+	if a == nil {
+		return 0
+	}
+	return a.ingressErrors.Load()
 }
 
 func (a *Adapter) loadClient() (*client.Client, transportClient, error) {
@@ -485,6 +499,7 @@ func (r *run) handleEvent(evt any) {
 		})
 	}
 
+	r.teeIngress(evt, eventAt)
 	r.generation.Handler.Handle(evt)
 	if failure, terminal := r.classifyEvent(evt); terminal {
 		if failure.Class == bridge.FailureCredentialsExpired ||
@@ -493,6 +508,88 @@ func (r *run) handleEvent(evt any) {
 		}
 		r.requestFinish(failure)
 	}
+}
+
+func (r *run) teeIngress(evt any, receivedAt time.Time) {
+	if r.sink == nil {
+		return
+	}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			r.recordIngressError(evt, fmt.Errorf(
+				"panic in Google ingest tee: %v\n%s",
+				recovered,
+				debug.Stack(),
+			))
+		}
+	}()
+
+	var err error
+	switch event := evt.(type) {
+	case *libgm.WrappedMessage:
+		var payload, protoBytes []byte
+		payload, protoBytes, err = ingest.MarshalGoogleMessageFrame(event)
+		if err == nil {
+			err = r.sink.AppendIngress(context.Background(), bridge.RawIngressRecord{
+				AccountID:    r.request.AccountID,
+				Generation:   r.request.Generation,
+				DedupeKey:    googleIngressDedupeKey("msg", event.GetMessageID(), protoBytes),
+				Codec:        ingest.GoogleCodec,
+				CodecVersion: ingest.GoogleCodecVersion,
+				ReceivedAt:   receivedAt,
+				Payload:      payload,
+			})
+		}
+	case *gmproto.Conversation:
+		var payload, protoBytes []byte
+		payload, protoBytes, err = ingest.MarshalGoogleConversationFrame(event)
+		if err == nil {
+			err = r.sink.AppendIngress(context.Background(), bridge.RawIngressRecord{
+				AccountID:    r.request.AccountID,
+				Generation:   r.request.Generation,
+				DedupeKey:    googleIngressDedupeKey("conv", event.GetConversationID(), protoBytes),
+				Codec:        ingest.GoogleCodec,
+				CodecVersion: ingest.GoogleCodecVersion,
+				ReceivedAt:   receivedAt,
+				Payload:      payload,
+			})
+		}
+	case *gmproto.TypingData:
+		number := event.GetUser().GetNumber()
+		err = r.sink.EmitEphemeral(context.Background(), bridge.EphemeralEvent{
+			AccountID:  r.request.AccountID,
+			Generation: r.request.Generation,
+			Typing: &bridge.TypingEvent{
+				RemoteConversationID: event.GetConversationID(),
+				Actor: bridge.IdentityRef{
+					Raw:       number,
+					Canonical: number,
+				},
+				Typing: event.GetType() == gmproto.TypingTypes_STARTED_TYPING,
+			},
+		})
+	default:
+		return
+	}
+	if err == nil {
+		return
+	}
+	r.recordIngressError(evt, err)
+}
+
+func (r *run) recordIngressError(evt any, err error) {
+	r.adapter.ingressErrors.Add(1)
+	r.adapter.host.Logger.Warn().
+		Err(err).
+		Str("account_id", r.request.AccountID).
+		Uint64("generation", uint64(r.request.Generation)).
+		Type("event_type", evt).
+		Msg("Google ingest tee failed; continuing legacy event handling")
+}
+
+func googleIngressDedupeKey(kind, remoteID string, protoBytes []byte) string {
+	digest := sha256.Sum256(protoBytes)
+	return fmt.Sprintf("%s:%s:%x", kind, remoteID, digest[:4])
 }
 
 func (r *run) classifyEvent(evt any) (bridge.OpError, bool) {

@@ -54,6 +54,19 @@ func mcpV2Dependencies(stack *v2Stack) []*tools.V2Dependencies {
 	}}
 }
 
+func v2SendWebOptions(stack *v2Stack, enabled bool) *web.V2Options {
+	if stack == nil || !enabled {
+		return nil
+	}
+	return &web.V2Options{
+		Service:  stack.Service,
+		Media:    stack.Media,
+		V2Store:  stack.Store,
+		Blobs:    stack.Blobs,
+		Registry: stack.Registry,
+	}
+}
+
 // buildVersion is the version string baked in at build time. SetVersion is
 // called from main() with the value of main.version (set via -ldflags).
 var buildVersion = "dev"
@@ -100,6 +113,8 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 	listenAddr := net.JoinHostPort(host, port)
 	baseURL := "http://" + net.JoinHostPort(publicHost(host), port)
 	isDemo := app.DemoMode()
+	v2Send := v2SendEnabled()
+	v2Ingest := v2IngestEnabled()
 
 	events := web.NewEventBroker()
 	isConnected := func() bool {
@@ -136,6 +151,8 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 	var whatsappControl *whatsappSupervisorControl
 	var signalLifecycle *signaladapter.Adapter
 	var signalControl *signalSupervisorControl
+	var stack *v2Stack
+	var stopV2Stack func()
 
 	// Google has one lifecycle owner. Transient retry, liveness probes,
 	// credential repair, and terminal parking all flow through this supervisor;
@@ -143,6 +160,24 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 	if !isDemo {
 		googleLifecycle = googleadapter.New(googleAccountID, a, canRefreshGoogleCookies)
 		a.SetGoogleLifecycleNotifier(googleLifecycle)
+		if v2Send || v2Ingest {
+			stack, err = newV2Stack(v2StackDeps{
+				Logger:  logger,
+				DataDir: app.DefaultDataDir(),
+				Google:  googleLifecycle,
+			})
+			if err != nil {
+				return fmt.Errorf("init v2 stack: %w", err)
+			}
+			stopV2Stack = func() {
+				if err := stack.Store.Close(); err != nil {
+					logger.Warn().Err(err).Msg("Failed to close unstarted v2 message store")
+				}
+			}
+			defer func() { stopV2Stack() }()
+		} else {
+			logger.Info().Msg("V2 stack disabled (flags off)")
+		}
 		repairer := newGoogleCredentialRepairer(
 			a.SessionPath,
 			canRefreshGoogleCookies,
@@ -151,6 +186,12 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 			a.ClearGoogleRepairFlag,
 		)
 		newGoogleSupervisor := func() (*bridge.Supervisor, error) {
+			supervisorOptions := []bridge.SupervisorOption{
+				bridge.WithCredentialRepairer(repairer),
+			}
+			if stack != nil {
+				supervisorOptions = append(supervisorOptions, bridge.WithConnectionSink(stack.Sink))
+			}
 			return bridge.NewSupervisor(
 				googleAccountID,
 				bridge.PlatformGoogle,
@@ -158,7 +199,7 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 				googleSupervisorPolicy(),
 				googleWallClock{},
 				googleRandom{},
-				bridge.WithCredentialRepairer(repairer),
+				supervisorOptions...,
 			)
 		}
 		googleSupervisor, err = newGoogleSupervisor()
@@ -207,7 +248,19 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 		if initialized {
 			whatsappLifecycle = whatsappadapter.New(whatsappAccountID, whatsappBridge)
 			a.SetWhatsAppLifecycleNotifier(whatsappLifecycle)
+			if stack != nil {
+				if err := stack.RegisterAdapter(whatsappLifecycle); err != nil {
+					return fmt.Errorf("register WhatsApp adapter with v2 stack: %w", err)
+				}
+			}
 			newWhatsAppSupervisor := func(initial bridge.State) (*bridge.Supervisor, error) {
+				supervisorOptions := []bridge.SupervisorOption{
+					bridge.WithPairer(whatsappLifecycle),
+					bridge.WithInitialState(initial),
+				}
+				if stack != nil {
+					supervisorOptions = append(supervisorOptions, bridge.WithConnectionSink(stack.Sink))
+				}
 				return bridge.NewSupervisor(
 					whatsappAccountID,
 					bridge.PlatformWhatsApp,
@@ -215,8 +268,7 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 					whatsappSupervisorPolicy(),
 					whatsappWallClock{},
 					whatsappRandom{},
-					bridge.WithPairer(whatsappLifecycle),
-					bridge.WithInitialState(initial),
+					supervisorOptions...,
 				)
 			}
 			initialState := bridge.StateUnpaired
@@ -270,7 +322,16 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 		} else {
 			signalLifecycle = signaladapter.New(signalAccountID, signalBridge)
 			a.SetSignalLifecycleNotifier(signalLifecycle)
+			if stack != nil {
+				if err := stack.RegisterAdapter(signalLifecycle); err != nil {
+					return fmt.Errorf("register Signal adapter with v2 stack: %w", err)
+				}
+			}
 			newSignalSupervisor := func() (*bridge.Supervisor, error) {
+				var supervisorOptions []bridge.SupervisorOption
+				if stack != nil {
+					supervisorOptions = append(supervisorOptions, bridge.WithConnectionSink(stack.Sink))
+				}
 				return bridge.NewSupervisor(
 					signalAccountID,
 					bridge.PlatformSignal,
@@ -278,6 +339,7 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 					signalSupervisorPolicy(),
 					signalWallClock{},
 					signalRandom{},
+					supervisorOptions...,
 				)
 			}
 			signalSupervisor, err := newSignalSupervisor()
@@ -317,23 +379,12 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 		logger.Info().Msg("Demo mode — skipping Signal live bridge")
 	}
 
-	var stack *v2Stack
-	if v2SendEnabled() && !isDemo {
-		stack, err = newV2Stack(v2StackDeps{
-			Logger:   logger,
-			DataDir:  app.DefaultDataDir(),
-			Google:   googleLifecycle,
-			WhatsApp: whatsappLifecycle,
-			Signal:   signalLifecycle,
-		})
-		if err != nil {
-			return fmt.Errorf("init v2 send stack: %w", err)
-		}
-		stopV2Stack := stack.Start(context.Background(), a.Store, events)
-		defer stopV2Stack()
-		logger.Info().Msg("V2 send stack enabled")
-	} else {
-		logger.Info().Msg("V2 send stack disabled (flag off or demo mode)")
+	if stack != nil {
+		stopV2Stack = stack.Start(context.Background(), a.Store, events)
+		logger.Info().
+			Bool("send", v2Send).
+			Bool("ingest", v2Ingest).
+			Msg("V2 stack enabled")
 	}
 
 	// Sync WhatsApp and iMessage periodically (every 30s, incremental)
@@ -465,7 +516,11 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 		buildVersion,
 		mcpserver.WithToolCapabilities(true),
 	)
-	tools.Register(mcpSrv, a, mcpV2Dependencies(stack)...)
+	v2SendStack := stack
+	if !v2Send {
+		v2SendStack = nil
+	}
+	tools.Register(mcpSrv, a, mcpV2Dependencies(v2SendStack)...)
 
 	var mcpHTTPHandler http.Handler
 	if opts.mcpSSE {
@@ -511,16 +566,7 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 	// Background loop that sends due scheduled ("send later") messages.
 	a.StartScheduler()
 
-	var v2Options *web.V2Options
-	if stack != nil {
-		v2Options = &web.V2Options{
-			Service:  stack.Service,
-			Media:    stack.Media,
-			V2Store:  stack.Store,
-			Blobs:    stack.Blobs,
-			Registry: stack.Registry,
-		}
-	}
+	v2Options := v2SendWebOptions(stack, v2Send)
 
 	httpEnabled := opts.web || opts.mcpSSE
 	if httpEnabled {

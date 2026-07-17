@@ -784,7 +784,12 @@ func (w *Worker) messageProjection(
 	}
 
 	var senderIdentityID *string
-	if direction != sqlite.MessageDirectionOutgoing && !event.Sender.IsSelf {
+	// A transport may deliver a message whose sender carries only a display
+	// name (group RCS puts the number in the conversation roster, not the
+	// message). Legacy stores that as an empty sender rather than dropping the
+	// message; the v2 path degrades the same way — project with a null sender
+	// instead of quarantining real content on an unresolvable identity.
+	if direction != sqlite.MessageDirectionOutgoing && !event.Sender.IsSelf && identityRaw(event.Sender) != "" {
 		identity, identityErr := w.resolveIdentity(accountID, platform, event.Sender)
 		if identityErr != nil {
 			return sqlite.MessageProjection{}, identityErr

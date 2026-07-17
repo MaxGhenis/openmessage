@@ -27,6 +27,8 @@ func TestCountersAreAtomicAndAccountScoped(t *testing.T) {
 	}
 	wait.Wait()
 	counters.account("account-b").ephemeral.Add(1)
+	counters.account("account-b").tapbackMessages.Add(2)
+	counters.account("account-b").emptyStubsSkipped.Add(3)
 
 	want := uint64(workers * increments)
 	accountA := counters.Snapshot("account-a")
@@ -34,8 +36,9 @@ func TestCountersAreAtomicAndAccountScoped(t *testing.T) {
 		t.Fatalf("account-a snapshot = %+v, want appended=%d decoded_events=%d", accountA, want, 2*want)
 	}
 	accountB := counters.Snapshot("account-b")
-	if accountB.Ephemeral != 1 || accountB.Appended != 0 {
-		t.Fatalf("account-b snapshot = %+v, want only one ephemeral event", accountB)
+	if accountB.Ephemeral != 1 || accountB.TapbackMessages != 2 || accountB.EmptyStubsSkipped != 3 ||
+		accountB.Appended != 0 {
+		t.Fatalf("account-b snapshot = %+v, want additive ingest counters", accountB)
 	}
 	if missing := counters.Snapshot("missing"); missing != (CounterSnapshot{}) {
 		t.Fatalf("missing account snapshot = %+v, want zero value", missing)
