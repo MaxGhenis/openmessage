@@ -223,3 +223,26 @@ briefly show "reconnecting" before it settles (see throttling note above).
   `/api/conversations/<id>/messages`. Don't re-send a user's real message as a
   "test" (duplicate risk on `UNKNOWN`, which is ambiguous about whether it sent);
   if you must test connectivity, get explicit per-send permission.
+- For the ingest cutover checklist, run the [ingest smoke](#ingest-smoke)
+  before switching readers.
+
+### Ingest smoke
+
+Read `curl -s http://127.0.0.1:7007/api/status | jq '.v2_ingest'`. A healthy
+enabled stack reports `enabled: true`; under `per_account`, `appended` grows as
+receive frames arrive, message-bearing frames advance `projected`, and
+`quarantined` remains `0`. An idle WhatsApp or Signal account can legitimately
+stay at zero until a new inbound/history frame arrives.
+
+The manual receive-only check is:
+
+```sh
+LIVE_PLATFORMS=google GOWORK=off go test -tags livetransport \
+  -run TestLiveIngestVerification -v -count=1 -timeout 10m \
+  ./internal/livetransport/
+```
+
+It sends nothing. Add `whatsapp` or `signal` to the comma-separated
+`LIVE_PLATFORMS` list only when that platform will receive a real frame within
+the test deadline; use `LIVE_GOOGLE_CONV`, `LIVE_WHATSAPP_CONV`, or
+`LIVE_SIGNAL_CONV` to override the expected self-thread remote ID.

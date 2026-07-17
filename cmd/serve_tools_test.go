@@ -3,6 +3,8 @@ package cmd
 import (
 	"testing"
 
+	"github.com/rs/zerolog"
+
 	"github.com/maxghenis/openmessage/internal/bridge"
 	"github.com/maxghenis/openmessage/internal/messaging"
 	"github.com/maxghenis/openmessage/internal/storage/sqlite"
@@ -65,5 +67,38 @@ func TestV2SendWebOptionsRequiresSendFlag(t *testing.T) {
 	}
 	if got.Service != service || got.V2Store != store || got.Registry != registry {
 		t.Fatal("v2SendWebOptions(stack, true) did not preserve stack dependencies")
+	}
+}
+
+func TestV2IngestCountersProviderRequiresStack(t *testing.T) {
+	if got := v2IngestCountersProvider(nil); got != nil {
+		t.Fatal("v2IngestCountersProvider(nil) returned an enabled provider")
+	}
+
+	stack, err := newV2Stack(v2StackDeps{
+		Logger:  zerolog.Nop(),
+		DataDir: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("newV2Stack(): %v", err)
+	}
+	t.Cleanup(func() {
+		if err := stack.Store.Close(); err != nil {
+			t.Errorf("close v2 store: %v", err)
+		}
+	})
+
+	provider := v2IngestCountersProvider(stack)
+	if provider == nil {
+		t.Fatal("v2IngestCountersProvider(stack) returned nil")
+	}
+	if got := provider(); got == nil || len(got) != 0 {
+		t.Fatalf("provider() = %#v, want an empty per-account snapshot", got)
+	}
+
+	stack.Sink.RecordIngressError("signal:primary")
+	got := provider()
+	if snapshot, ok := got["signal:primary"]; !ok || snapshot.AppendErrors != 1 {
+		t.Fatalf("provider() = %#v, want live signal:primary append_errors=1", got)
 	}
 }

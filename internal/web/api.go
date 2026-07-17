@@ -27,6 +27,7 @@ import (
 	"github.com/maxghenis/openmessage/internal/app"
 	"github.com/maxghenis/openmessage/internal/client"
 	"github.com/maxghenis/openmessage/internal/db"
+	"github.com/maxghenis/openmessage/internal/ingest"
 	"github.com/maxghenis/openmessage/internal/media"
 	"github.com/maxghenis/openmessage/internal/messaging"
 	"github.com/maxghenis/openmessage/internal/story"
@@ -81,6 +82,7 @@ type UnpairFunc func() error
 // APIOptions holds optional callbacks for the API handler.
 type APIOptions struct {
 	V2                    *V2Options
+	V2IngestCounters      func() map[string]ingest.CounterSnapshot
 	Client                func() *client.Client
 	Events                *EventBroker
 	EventHeartbeat        time.Duration
@@ -269,9 +271,19 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 	}
 
 	statusPayload := func(connected bool) map[string]any {
+		v2IngestPerAccount := map[string]ingest.CounterSnapshot{}
+		if opts.V2IngestCounters != nil {
+			if snapshots := opts.V2IngestCounters(); snapshots != nil {
+				v2IngestPerAccount = snapshots
+			}
+		}
 		payload := map[string]any{
 			"connected": connected,
 			"v2_send":   opts.V2 != nil,
+			"v2_ingest": map[string]any{
+				"enabled":     opts.V2IngestCounters != nil,
+				"per_account": v2IngestPerAccount,
+			},
 		}
 		if strings.TrimSpace(opts.IdentityName) != "" {
 			payload["identity_name"] = strings.TrimSpace(opts.IdentityName)
