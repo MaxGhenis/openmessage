@@ -41,3 +41,29 @@ func TestMCPV2Dependencies(t *testing.T) {
 		t.Fatal("mcpV2Dependencies(stack) did not preserve the registry pointer")
 	}
 }
+
+func TestV2SendWebOptionsRequiresSendFlag(t *testing.T) {
+	if got := v2SendWebOptions(nil, true); got != nil {
+		t.Fatal("v2SendWebOptions(nil, true) returned enabled options")
+	}
+
+	service := &messaging.MessageService{}
+	store := &sqlite.Store{}
+	registry := bridge.NewRegistry()
+	stack := &v2Stack{
+		Service:  service,
+		Store:    store,
+		Registry: registry,
+	}
+	if got := v2SendWebOptions(stack, false); got != nil {
+		t.Fatal("v2SendWebOptions(stack, false) enabled v2 send routes")
+	}
+
+	got := v2SendWebOptions(stack, true)
+	if got == nil {
+		t.Fatal("v2SendWebOptions(stack, true) returned nil")
+	}
+	if got.Service != service || got.V2Store != store || got.Registry != registry {
+		t.Fatal("v2SendWebOptions(stack, true) did not preserve stack dependencies")
+	}
+}

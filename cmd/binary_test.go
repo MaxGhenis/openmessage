@@ -203,6 +203,7 @@ func TestBuiltBinaryV2FlagOffDoesNotCreateV2Directory(t *testing.T) {
 		os.Environ(),
 		"OPENMESSAGES_DATA_DIR="+dataDir,
 		"OPENMESSAGES_V2_SEND=0",
+		"OPENMESSAGES_V2_INGEST=0",
 		"OPENMESSAGES_DEMO=0",
 		"OPENMESSAGES_APP_SANDBOX=1",
 		"OPENMESSAGES_MACOS_NOTIFICATIONS=0",
@@ -223,6 +224,35 @@ func TestBuiltBinaryV2FlagOffDoesNotCreateV2Directory(t *testing.T) {
 	}
 }
 
+func TestBuiltBinaryV2IngestFlagCreatesV2Directory(t *testing.T) {
+	binary, dataDir := buildTestBinary(t)
+
+	cmd := exec.Command(binary, "serve", "--mcp-stdio")
+	cmd.Env = append(
+		os.Environ(),
+		"OPENMESSAGES_DATA_DIR="+dataDir,
+		"OPENMESSAGES_V2_SEND=0",
+		"OPENMESSAGES_V2_INGEST=1",
+		"OPENMESSAGES_DEMO=0",
+		"OPENMESSAGES_APP_SANDBOX=1",
+		"OPENMESSAGES_MACOS_NOTIFICATIONS=0",
+		"OPENMESSAGES_LOG_LEVEL=info",
+		"OPENMESSAGE_TELEMETRY=0",
+	)
+	cmd.Stdin = strings.NewReader("")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("serve --mcp-stdio: %v\n%s", err, output)
+	}
+	if !strings.Contains(string(output), "Starting MCP stdio transport") {
+		t.Fatalf("serve did not reach MCP stdio startup:\n%s", output)
+	}
+
+	if _, err := os.Stat(filepath.Join(dataDir, "v2", "store.sqlite3")); err != nil {
+		t.Fatalf("ingest flag did not create the v2 store: %v", err)
+	}
+}
+
 func TestBuiltBinaryDemoSkipsV2StackWhenFlagOn(t *testing.T) {
 	binary, dataDir := buildTestBinary(t)
 
@@ -231,6 +261,7 @@ func TestBuiltBinaryDemoSkipsV2StackWhenFlagOn(t *testing.T) {
 		os.Environ(),
 		"OPENMESSAGES_DATA_DIR="+dataDir,
 		"OPENMESSAGES_V2_SEND=1",
+		"OPENMESSAGES_V2_INGEST=1",
 		"OPENMESSAGES_APP_SANDBOX=1",
 		"OPENMESSAGES_MACOS_NOTIFICATIONS=0",
 		"OPENMESSAGES_LOG_LEVEL=info",
