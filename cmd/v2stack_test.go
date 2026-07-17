@@ -558,6 +558,37 @@ func TestV2PrimaryStackDoesNotStartLegacyProjector(t *testing.T) {
 	}
 }
 
+func TestV2PrimaryStackStartsPrimaryNotifier(t *testing.T) {
+	stack, err := newV2Stack(v2StackDeps{
+		Logger:  zerolog.Nop(),
+		DataDir: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("newV2Stack(): %v", err)
+	}
+
+	events := web.NewEventBroker()
+	subscriptionID, published := events.Subscribe()
+	defer events.Unsubscribe(subscriptionID)
+
+	stop := stack.Start(context.Background(), nil, events, true)
+	defer stop()
+
+	for _, want := range []web.StreamEvent{
+		{Type: web.EventTypeMessages},
+		{Type: web.EventTypeConversations},
+	} {
+		select {
+		case got := <-published:
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("primary notifier event = %+v, want %+v", got, want)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatalf("timed out waiting for primary notifier event %+v", want)
+		}
+	}
+}
+
 func TestLegacyPrimaryStackStillStartsLegacyProjector(t *testing.T) {
 	var logs bytes.Buffer
 	stack, err := newV2Stack(v2StackDeps{
