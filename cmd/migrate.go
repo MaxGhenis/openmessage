@@ -596,8 +596,11 @@ func writeHumanMigrationReport(writer io.Writer, report migration.Report) {
 		report.Schedule.PendingToOutbox, report.Schedule.PendingMedia,
 		report.Schedule.AmbiguousSending, report.Schedule.SkippedSent,
 		report.Schedule.SkippedCanceled, report.Schedule.SkippedFailed)
-	fmt.Fprintf(writer, "Dropped (counted): reactions=%d transcripts=%d avatars=%d drafts=%d contact_meta(CRM)=%d outgoing_send_keys=%d tabs=%d\n",
-		report.Dropped.ReactionsBearingMessages,
+	fmt.Fprintf(writer, "Reactions: messages=%d seeded_messages=%d seeded_rows=%d malformed=%d unmappable=%d\n",
+		report.Reactions.MessagesWithReactions, report.Reactions.MessagesSeeded,
+		report.Reactions.RowsSeeded, report.Dropped.MalformedReactions,
+		report.Dropped.UnmappableReactions)
+	fmt.Fprintf(writer, "Dropped (counted): transcripts=%d avatars=%d drafts=%d contact_meta(CRM)=%d outgoing_send_keys=%d tabs=%d\n",
 		report.Dropped.TranscriptBearingMessages,
 		report.Dropped.ContactAvatars,
 		report.Dropped.Drafts,

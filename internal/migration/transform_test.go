@@ -13,13 +13,16 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	googleadapter "github.com/maxghenis/openmessage/internal/bridgeadapters/google"
 	signaladapter "github.com/maxghenis/openmessage/internal/bridgeadapters/signal"
 	whatsappadapter "github.com/maxghenis/openmessage/internal/bridgeadapters/whatsapp"
 	legacydb "github.com/maxghenis/openmessage/internal/db"
 	"github.com/maxghenis/openmessage/internal/storage/blob"
+	"github.com/maxghenis/openmessage/internal/storage/sqlite"
 	"github.com/maxghenis/openmessage/internal/v2keys"
+	"github.com/maxghenis/openmessage/internal/v2read"
 	"github.com/maxghenis/openmessage/internal/whatsappmedia"
 )
 
@@ -136,6 +139,106 @@ func TestTransformReadsHotWALWithoutMutatingSourceFamily(t *testing.T) {
 	}
 	if _, err := os.Lstat(stagedStore + legacySnapshotSuffix); !os.IsNotExist(err) {
 		t.Fatalf("migration left private source snapshot behind: %v", err)
+	}
+}
+
+func TestMigratedGoogleSelfReactionConvergesWithLiveSnapshot(t *testing.T) {
+	root := t.TempDir()
+	fixture := buildMigrationFixture(t, root)
+	legacy, err := sql.Open("sqlite", fixture.sourcePath)
+	mustNoError(t, err)
+	_, err = legacy.Exec(`UPDATE messages SET reactions = ? WHERE message_id = 'google-server-2'`,
+		`[{"emoji":"🔥","count":1,"actors":["+15550009999"]}]`)
+	mustNoError(t, err)
+	mustNoError(t, legacy.Close())
+	staged := filepath.Join(root, "convergence.sqlite3")
+	report, err := Transform(context.Background(), Options{
+		SourcePath: fixture.sourcePath, TempStorePath: staged,
+		TempBlobPath: filepath.Join(root, "convergence-blobs"),
+		TargetPath:   filepath.Join(root, "target"), TargetStorePath: filepath.Join(root, "target", "store.sqlite3"),
+		Check: true,
+	})
+	mustNoError(t, err)
+	if report.Reactions.RowsSeeded != 2 {
+		t.Fatalf("seeded rows = %d, want fixture reaction plus Google self reaction", report.Reactions.RowsSeeded)
+	}
+	store, err := sqlite.Open(staged)
+	mustNoError(t, err)
+	defer store.Close()
+	repository, err := sqlite.NewReactionRepository(store, func() time.Time { return time.UnixMilli(fixtureBaseMS + 20_000) })
+	mustNoError(t, err)
+	messageID := v2keys.DeriveID("message", "google-primary", "sms-conversation\x1fgoogle-server-2")
+	changes, err := repository.ReplaceEmbeddedReactions(context.Background(), messageID, "google-primary",
+		v2keys.DeriveID("conversation", "google-primary", "sms-conversation"),
+		[]sqlite.ReactionSnapshotEntry{{ReactorKey: "self", ReactorIsSelf: true, ReactorLabel: "me", Emoji: "🔥"}},
+		fixtureBaseMS+20_000)
+	mustNoError(t, err)
+	if changes.Removed != 0 {
+		t.Fatalf("first live snapshot changes = %+v, want no removal", changes)
+	}
+	changes, err = repository.ReplaceEmbeddedReactions(context.Background(), messageID, "google-primary",
+		v2keys.DeriveID("conversation", "google-primary", "sms-conversation"),
+		[]sqlite.ReactionSnapshotEntry{{ReactorKey: "self", ReactorIsSelf: true, ReactorLabel: "me", Emoji: "🔥"}},
+		fixtureBaseMS+20_001)
+	mustNoError(t, err)
+	if changes.Applied != 0 || changes.Removed != 0 {
+		t.Fatalf("second live snapshot changes = %+v, want semantic no-op", changes)
+	}
+	rows, err := repository.ReactionsForMessages(context.Background(), []string{messageID})
+	mustNoError(t, err)
+	if len(rows[messageID]) != 1 {
+		t.Fatalf("active rows after live snapshot = %+v, want one converged row", rows[messageID])
+	}
+}
+
+func TestMigratedReactionServeParityPreservesOrderAndPinsCountDegradation(t *testing.T) {
+	const conversationID = "serve-reaction-parity"
+	root := t.TempDir()
+	legacyPath := filepath.Join(root, "legacy.sqlite3")
+	legacy, err := legacydb.New(legacyPath)
+	mustNoError(t, err)
+	mustNoError(t, legacy.UpsertConversation(&legacydb.Conversation{ConversationID: conversationID, Name: "Serve parity", Participants: `[]`, LastMessageTS: fixtureBaseMS + 3, SourcePlatform: "sms"}))
+	wants := map[string]string{
+		"multi":    `[{"emoji":"🔥","count":1,"actors":["+15550000001"]},{"emoji":"👍","count":1,"actors":["+15550000002"]},{"emoji":"😂","count":1,"actors":["+15550000003"]}]`,
+		"collapse": `[{"emoji":"👍","count":3}]`,
+		"surplus":  `[{"emoji":"❤️","count":4,"actors":["+15550000004","+15550000005"]}]`,
+	}
+	index := 0
+	for id, reactions := range wants {
+		index++
+		mustNoError(t, legacy.UpsertMessage(&legacydb.Message{MessageID: id, ConversationID: conversationID, SenderName: "Sender", SenderNumber: "+15559999999", Body: id, TimestampMS: fixtureBaseMS + int64(index), SourcePlatform: "sms", Reactions: reactions}))
+	}
+	legacyRows, err := legacy.GetMessagesByConversation(conversationID, 10)
+	mustNoError(t, err)
+	legacyServed := map[string]string{}
+	for _, message := range legacyRows {
+		legacyServed[message.MessageID] = message.Reactions
+	}
+	mustNoError(t, legacy.Close())
+
+	staged := filepath.Join(root, "staged.sqlite3")
+	report, err := Transform(context.Background(), Options{SourcePath: legacyPath, TempStorePath: staged, TempBlobPath: filepath.Join(root, "blobs"), TargetPath: filepath.Join(root, "target"), TargetStorePath: filepath.Join(root, "target", "store.sqlite3"), Check: true})
+	mustNoError(t, err)
+	if report.Reactions.ActorlessCountCollapsed != 2 || report.Reactions.ActorCountSurplusDropped != 2 {
+		t.Fatalf("reaction degradation report = %+v, want collapse=2 surplus=2", report.Reactions)
+	}
+	store, err := sqlite.Open(staged)
+	mustNoError(t, err)
+	defer store.Close()
+	served, err := v2read.New(store).GetMessagesByConversation(v2keys.DeriveID("conversation", "google-primary", conversationID), 10)
+	mustNoError(t, err)
+	got := map[string]string{}
+	for _, message := range served {
+		got[message.SourceID] = message.Reactions
+	}
+	if got["multi"] != wants["multi"] || got["multi"] != legacyServed["multi"] {
+		t.Fatalf("multi-emoji served JSON = %s, want byte parity %s (legacy=%s)", got["multi"], wants["multi"], legacyServed["multi"])
+	}
+	if got["collapse"] != `[{"emoji":"👍","count":1}]` {
+		t.Fatalf("actorless collapse served JSON = %s, want count 1", got["collapse"])
+	}
+	if got["surplus"] != `[{"emoji":"❤️","count":2,"actors":["+15550000004","+15550000005"]}]` {
+		t.Fatalf("surplus served JSON = %s, want actor-count 2", got["surplus"])
 	}
 }
 
@@ -426,7 +529,7 @@ func assertFixtureReport(t *testing.T, report Report, sourceHash string) {
 		"accounts": 5, "devices": 5, "people": 1, "person_identities": 2,
 		"conversations": 6, "inbox": 0, "messages": 14,
 		"message_attachments": 3, "outbox": 2, "outbox_attachments": 1,
-		"read_cursors": 6, "reactions": 0, "reaction_snapshot_fences": 0,
+		"read_cursors": 6, "reactions": 1, "reaction_snapshot_fences": 0,
 	}
 	for table, want := range wantTargetCounts {
 		if got := report.Target.Counts[table]; got != want {
@@ -468,12 +571,15 @@ func assertFixtureReport(t *testing.T, report Report, sourceHash string) {
 		t.Errorf("read state report = %+v", report.ReadState)
 	}
 	wantDropped := DroppedDimensions{
-		ReactionsBearingMessages: 1, TranscriptBearingMessages: 1,
-		ContactAvatars: 1, Drafts: 1, ContactMetaCRM: 1,
+		TranscriptBearingMessages: 1,
+		ContactAvatars:            1, Drafts: 1, ContactMetaCRM: 1,
 		OutgoingSendKeys: 1, Tabs: 1,
 	}
 	if !reflect.DeepEqual(report.Dropped, wantDropped) {
 		t.Errorf("dropped dimensions = %+v, want %+v", report.Dropped, wantDropped)
+	}
+	if report.Reactions.MessagesWithReactions != 1 || report.Reactions.MessagesSeeded != 1 || report.Reactions.RowsSeeded != 1 {
+		t.Errorf("reaction report = %+v, want one bearing message and one seeded row", report.Reactions)
 	}
 	if report.SignalLocalRows != 1 {
 		t.Errorf("signal local rows = %d, want 1", report.SignalLocalRows)
@@ -498,7 +604,7 @@ func assertFixtureReport(t *testing.T, report Report, sourceHash string) {
 		t.Errorf("validation report = %+v", report.Validation)
 	}
 	for _, required := range []string{
-		"legacy read state was lossy", "reactions", "transcripts", "contact avatars",
+		"legacy read state was lossy", "transcripts", "contact avatars",
 		"drafts", "IMPORTANT: 1 contact_meta CRM", "outgoing_send_keys", "custom tabs",
 		"ambiguous in-flight scheduled sends",
 	} {
@@ -666,6 +772,19 @@ func assertFixtureMessages(t *testing.T, database *sql.DB) {
 		if sender.Valid != (want.senderIdentityID != "") || sender.String != want.senderIdentityID {
 			t.Errorf("message %s sender_identity_id = %+v, want %q", messageID, sender, want.senderIdentityID)
 		}
+	}
+	var reactorKey, emoji, state string
+	var occurredAt int64
+	mustNoError(t, database.QueryRow(`
+		SELECT reactor_key, emoji, state, occurred_at_ms
+		FROM reactions
+		WHERE message_id = ?
+	`, v2keys.DeriveID("message", "google-primary", "sms-conversation\x1fgoogle-server-1")).Scan(
+		&reactorKey, &emoji, &state, &occurredAt,
+	))
+	wantReactor := v2keys.DeriveID("identity", "google-primary", "e164\x1f+15550100001")
+	if reactorKey != wantReactor || emoji != "👍" || state != "active" || occurredAt != fixtureBaseMS+1_000 {
+		t.Errorf("seeded reaction = %q/%q/%q/%d, want %q/👍/active/%d", reactorKey, emoji, state, occurredAt, wantReactor, fixtureBaseMS+1_000)
 	}
 	if got := mustQueryInt64(t, database, `SELECT COUNT(*) FROM inbox`); got != 0 {
 		t.Errorf("inbox rows = %d, want ImportMessage to leave historical inbox empty", got)

@@ -198,8 +198,6 @@ func fillTableReconciliations(
 		name  string
 		count int64
 	}{
-		// RR-2 flips the reactions V2 value to the seeded count.
-		{"reactions", dataset.dropped.ReactionsBearingMessages},
 		{"transcripts", dataset.dropped.TranscriptBearingMessages},
 		{"contact_avatars", dataset.dropped.ContactAvatars},
 		{"drafts", dataset.dropped.Drafts},
@@ -213,9 +211,13 @@ func fillTableReconciliations(
 		{"unmappable_messages", dataset.dropped.UnmappableMessages},
 		{"malformed_participants", dataset.dropped.MalformedParticipants},
 		{"unmappable_unified_contacts", dataset.dropped.UnmappableUnifiedContacts},
+		{"reaction_messages_dropped_with_parent", dataset.dropped.ReactionMessagesDroppedWithParent},
 	} {
 		add(dropped.name, dropped.count, 0, dropped.count, "dropped_with_count")
 	}
+	add("reactions", report.Reactions.RowsPlannable, report.Target.Counts["reactions"],
+		report.Reactions.RowsSeeded,
+		"row_grained; see reaction collapse/surplus/dedup/drop counters")
 }
 
 func fillPlatformReconciliations(
@@ -334,8 +336,10 @@ func countsMatch(
 		report.Target.Counts["outbox"] != dataset.scheduleByStatus["pending"] ||
 		report.Target.Counts["outbox_attachments"] != state.expectedPendingMedia ||
 		report.Target.Counts["read_cursors"] != state.expectedCursors ||
-		// RR-2 flips reactions to the seeded count.
-		report.Target.Counts["reactions"] != 0 ||
+		report.Target.Counts["reactions"] != report.Reactions.RowsSeeded ||
+		report.Reactions.MessagesWithReactions != report.Reactions.MessagesSeeded+
+			report.Dropped.MalformedReactions+
+			report.Dropped.UnmappableReactions+report.Dropped.ReactionMessagesDroppedWithParent ||
 		report.Target.Counts["reaction_snapshot_fences"] != 0 ||
 		report.Target.Counts["inbox"] != 0 {
 		return false

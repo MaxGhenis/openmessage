@@ -34,6 +34,7 @@ type Report struct {
 	Identities        IdentityReport                    `json:"identities"`
 	Schedule          ScheduleReport                    `json:"schedule"`
 	ReadState         ReadStateReport                   `json:"read_state"`
+	Reactions         ReactionReport                    `json:"reactions"`
 	Dropped           DroppedDimensions                 `json:"dropped_dimensions"`
 	SignalLocalRows   int64                             `json:"signal_local_rows"`
 	Media             MediaReport                       `json:"media"`
@@ -41,6 +42,18 @@ type Report struct {
 	SampledHashes     []SampledHash                     `json:"sampled_hashes"`
 	Validation        ValidationReport                  `json:"validation"`
 	Warnings          []string                          `json:"warnings"`
+}
+
+type ReactionReport struct {
+	MessagesWithReactions     int64 `json:"messages_with_reactions"`
+	MessagesSeeded            int64 `json:"messages_seeded"`
+	MessagesFullyDeduplicated int64 `json:"messages_fully_deduplicated"`
+	RowsPlannable             int64 `json:"rows_plannable"`
+	RowsSeeded                int64 `json:"rows_seeded"`
+	ActorlessCountCollapsed   int64 `json:"actorless_count_collapsed"`
+	ActorCountSurplusDropped  int64 `json:"actor_count_surplus_dropped"`
+	DuplicateRowsDropped      int64 `json:"duplicate_rows_dropped"`
+	SeedConflicts             int64 `json:"seed_conflicts"`
 }
 
 type SourceReport struct {
@@ -153,6 +166,13 @@ type DroppedDimensions struct {
 	// UnmappableUnifiedContacts counts unified contacts whose identifiers were
 	// empty or not the expected JSON array; dropped with a count.
 	UnmappableUnifiedContacts int64 `json:"unmappable_unified_contacts"`
+	// MalformedReactions counts reaction-bearing messages whose JSON could not
+	// be decoded or contained no usable emoji entries. The message still moves.
+	MalformedReactions int64 `json:"malformed_reactions"`
+	// UnmappableReactions counts reaction-bearing messages with reactor tokens
+	// that cannot be converted to the platform's live-ingest identity key.
+	UnmappableReactions               int64 `json:"unmappable_reactions"`
+	ReactionMessagesDroppedWithParent int64 `json:"reaction_messages_dropped_with_parent"`
 }
 
 type MediaReport struct {

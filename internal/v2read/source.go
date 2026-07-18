@@ -18,6 +18,7 @@ type Source struct {
 	messages    *sqlite.MessageRepository
 	attachments *sqlite.MessageAttachmentRepository
 	outbox      *sqlite.OutboxRepository
+	reactions   *sqlite.ReactionRepository
 }
 
 // New constructs a v2 canonical read source. A nil store is retained as an
@@ -31,11 +32,12 @@ func New(store *sqlite.Store) *Source {
 	source.messages, _ = sqlite.NewMessageRepository(store, time.Now)
 	source.attachments, _ = sqlite.NewMessageAttachmentRepository(store, time.Now)
 	source.outbox, _ = sqlite.NewOutboxRepository(store, time.Now)
+	source.reactions, _ = sqlite.NewReactionRepository(store, time.Now)
 	return source
 }
 
 func (s *Source) ready() error {
-	if s == nil || s.store == nil || s.messages == nil || s.attachments == nil || s.outbox == nil {
+	if s == nil || s.store == nil || s.messages == nil || s.attachments == nil || s.outbox == nil || s.reactions == nil {
 		return fmt.Errorf("v2 read source: store is nil")
 	}
 	return nil

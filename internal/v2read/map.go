@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/maxghenis/openmessage/internal/db"
@@ -15,6 +16,12 @@ import (
 type participantDTO struct {
 	Name   string `json:"name"`
 	Number string `json:"number"`
+}
+
+type reactionDTO struct {
+	Emoji  string   `json:"emoji"`
+	Count  int      `json:"count"`
+	Actors []string `json:"actors,omitempty"`
 }
 
 func platformForBridgeKey(bridgeKey string) string {
@@ -113,9 +120,17 @@ func (s *Source) mapMessages(
 	if err != nil {
 		return nil, fmt.Errorf("map messages: %w", err)
 	}
+	messageIDs := make([]string, 0, len(messages))
+	for _, message := range messages {
+		messageIDs = append(messageIDs, message.MessageID)
+	}
+	reactions, err := s.reactions.ReactionsForMessages(context.Background(), messageIDs)
+	if err != nil {
+		return nil, fmt.Errorf("map messages: load reactions: %w", err)
+	}
 	mapped := make([]*db.Message, 0, len(messages))
 	for _, message := range messages {
-		dto, err := s.mapMessage(message, accounts)
+		dto, err := s.mapMessage(message, accounts, reactions[message.MessageID])
 		if err != nil {
 			return nil, err
 		}
@@ -127,6 +142,7 @@ func (s *Source) mapMessages(
 func (s *Source) mapMessage(
 	message sqlite.Message,
 	accounts map[string]sqlite.Account,
+	reactionRows []sqlite.ReactionRow,
 ) (*db.Message, error) {
 	account, ok := accounts[message.AccountID]
 	if !ok {
@@ -145,6 +161,11 @@ func (s *Source) mapMessage(
 		SourcePlatform: platformForBridgeKey(account.BridgeKey),
 		SourceID:       message.RemoteMessageID,
 	}
+	reactionJSON, err := mapReactions(reactionRows)
+	if err != nil {
+		return nil, fmt.Errorf("map message %q reactions: %w", message.MessageID, err)
+	}
+	dto.Reactions = reactionJSON
 	if message.SenderIdentityID != nil {
 		identity, err := s.store.GetIdentity(*message.SenderIdentityID)
 		if err != nil {
@@ -177,6 +198,57 @@ func (s *Source) mapMessage(
 		dto.MimeType = attachment.MIME
 	}
 	return dto, nil
+}
+
+func mapReactions(rows []sqlite.ReactionRow) (string, error) {
+	if len(rows) == 0 {
+		return "", nil
+	}
+	type group struct {
+		dto   reactionDTO
+		first int64
+		seen  map[string]struct{}
+	}
+	groups := map[string]*group{}
+	for _, row := range rows {
+		item := groups[row.Emoji]
+		if item == nil {
+			item = &group{dto: reactionDTO{Emoji: row.Emoji}, first: row.OccurredAtMS, seen: map[string]struct{}{}}
+			groups[row.Emoji] = item
+		}
+		actor := row.ReactorLabel
+		if row.ReactorIsSelf {
+			actor = "me"
+		} else if row.ReactorCanonical != "" {
+			actor = row.ReactorCanonical
+		}
+		if actor != "" {
+			if _, ok := item.seen[actor]; !ok {
+				item.seen[actor] = struct{}{}
+				item.dto.Actors = append(item.dto.Actors, actor)
+			}
+		}
+		item.dto.Count++
+	}
+	ordered := make([]*group, 0, len(groups))
+	for _, item := range groups {
+		ordered = append(ordered, item)
+	}
+	sort.Slice(ordered, func(i, j int) bool {
+		if ordered[i].first != ordered[j].first {
+			return ordered[i].first < ordered[j].first
+		}
+		return ordered[i].dto.Emoji < ordered[j].dto.Emoji
+	})
+	dtos := make([]reactionDTO, 0, len(ordered))
+	for _, item := range ordered {
+		dtos = append(dtos, item.dto)
+	}
+	encoded, err := json.Marshal(dtos)
+	if err != nil {
+		return "", err
+	}
+	return string(encoded), nil
 }
 
 func (s *Source) messageAttachment(

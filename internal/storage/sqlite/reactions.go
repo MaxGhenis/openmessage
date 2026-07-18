@@ -464,6 +464,36 @@ func (r *ReactionRepository) SeedReaction(
 	return nil
 }
 
+// SeedReactions writes a migration batch atomically. It delegates every row to
+// SeedReaction so the binding first-wins/no-snapshot-fence contract has one
+// implementation.
+func (r *ReactionRepository) SeedReactions(
+	ctx context.Context,
+	reactions []ReactionApply,
+) (int64, error) {
+	tx, err := r.store.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("seed reactions: begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+	var before, after int64
+	if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM reactions").Scan(&before); err != nil {
+		return 0, fmt.Errorf("seed reactions: count before: %w", err)
+	}
+	for _, reaction := range reactions {
+		if err := r.SeedReaction(ctx, tx, reaction); err != nil {
+			return 0, err
+		}
+	}
+	if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM reactions").Scan(&after); err != nil {
+		return 0, fmt.Errorf("seed reactions: count after: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("seed reactions: commit: %w", err)
+	}
+	return after - before, nil
+}
+
 // ReactionsForMessages loads active reactions for a batch of messages in a
 // stable order suitable for deterministic legacy-shape aggregation.
 func (r *ReactionRepository) ReactionsForMessages(

@@ -119,6 +119,10 @@ type expectedMessage struct {
 	MediaID  string
 }
 
+type reactionPlan struct {
+	Row sqlite.ReactionApply
+}
+
 type scheduledBlob struct {
 	OutboxID string
 	Ref      blob.BlobRef
@@ -141,6 +145,7 @@ type transformState struct {
 	expectedCursors           int64
 	expectedPendingMedia      int64
 	scheduledBlobs            []scheduledBlob
+	reactions                 []reactionPlan
 }
 
 // Transform creates and validates a complete staged v2 store using only
@@ -195,6 +200,7 @@ func Transform(ctx context.Context, options Options) (report Report, returnErr e
 		return report, err
 	}
 	report.Dropped = dataset.dropped
+	report.Reactions.MessagesWithReactions = dataset.reactionsBearingMessages
 	report.SignalLocalRows = dataset.signalLocalRows
 	report.ReadState = ReadStateReport{
 		LossyWarning:                 "legacy read state was lossy",
@@ -207,11 +213,6 @@ func Transform(ctx context.Context, options Options) (report Report, returnErr e
 	if err != nil {
 		return report, fmt.Errorf("%w: plan transform: %v", ErrSource, err)
 	}
-	// Warnings render after planning: buildTransformState contributes dropped
-	// dimensions of its own (for example unparseable participant rosters), and
-	// a warning pass before it would silently omit them.
-	appendRequiredWarnings(&report)
-
 	target, err := sqlite.Open(options.TempStorePath)
 	if err != nil {
 		return report, fmt.Errorf("%w: initialize merged v2 schema: %v", ErrTransform, err)
@@ -235,6 +236,10 @@ func Transform(ctx context.Context, options Options) (report Report, returnErr e
 	if err != nil {
 		return report, fmt.Errorf("%w: initialize message importer: %v", ErrTransform, err)
 	}
+	reactionRepository, err := sqlite.NewReactionRepository(target, now)
+	if err != nil {
+		return report, fmt.Errorf("%w: initialize reaction importer: %v", ErrTransform, err)
+	}
 	outboxRepository, err := sqlite.NewOutboxRepository(target, now)
 	if err != nil {
 		return report, fmt.Errorf("%w: initialize outbox importer: %v", ErrTransform, err)
@@ -255,6 +260,12 @@ func Transform(ctx context.Context, options Options) (report Report, returnErr e
 	if err := writeHistory(ctx, messageRepository, dataset, state, &clockMS, &report); err != nil {
 		return report, fmt.Errorf("%w: %v", ErrTransform, err)
 	}
+	if err := writeReactions(ctx, reactionRepository, state, &report); err != nil {
+		return report, fmt.Errorf("%w: %v", ErrTransform, err)
+	}
+	// Warnings render after reaction planning and writing, which contribute
+	// degradation counters just like participant planning does.
+	appendRequiredWarnings(&report)
 	if err := writeScheduled(
 		ctx, messageRepository, outboxRepository, blobs, dataset, state, &clockMS, &report,
 	); err != nil {
@@ -360,6 +371,8 @@ func buildTransformState(dataset legacyDataset, report *Report) (*transformState
 		}
 	}
 
+	planLegacyReactions(dataset, state, report)
+
 	if len(dataset.contacts) > 0 {
 		account, _ := accountForPlatform("sms")
 		state.accounts[account.Platform] = account
@@ -422,6 +435,173 @@ func buildTransformState(dataset legacyDataset, report *Report) (*transformState
 		state.unified = append(state.unified, plan)
 	}
 	return state, nil
+}
+
+type legacyReaction struct {
+	Emoji  string   `json:"emoji"`
+	Count  int      `json:"count"`
+	Actors []string `json:"actors,omitempty"`
+}
+
+func planLegacyReactions(dataset legacyDataset, state *transformState, report *Report) {
+	ownNumbers := map[string]map[string]struct{}{}
+	for _, message := range dataset.messages {
+		platform, number := normalizeLegacyPlatform(message.Platform), strings.TrimSpace(message.SenderNumber)
+		if message.IsFromMe && isE164(number) {
+			if ownNumbers[platform] == nil {
+				ownNumbers[platform] = map[string]struct{}{}
+			}
+			ownNumbers[platform][number] = struct{}{}
+		}
+	}
+	for _, message := range dataset.messages {
+		raw := strings.TrimSpace(message.Reactions)
+		if raw == "" || raw == "null" || raw == "[]" {
+			continue
+		}
+		var entries []legacyReaction
+		if err := json.Unmarshal([]byte(raw), &entries); err != nil {
+			report.Dropped.MalformedReactions++
+			continue
+		}
+		conversation := state.conversations[message.ConversationID]
+		if conversation == nil {
+			continue
+		}
+		messageID := v2keys.DeriveID("message", conversation.Account.AccountID,
+			message.ConversationID+"\x1f"+deriveRemoteMessageID(message))
+		seen := map[string]struct{}{}
+		messageMalformed, messageUnmappable := false, false
+		before := len(state.reactions)
+		for entryIndex, entry := range entries {
+			emoji := strings.TrimSpace(entry.Emoji)
+			if emoji == "" {
+				messageMalformed = true
+				continue
+			}
+			actors := entry.Actors
+			if len(actors) == 0 && entry.Count > 0 {
+				actors = []string{""}
+				report.Reactions.ActorlessCountCollapsed += int64(max(entry.Count-1, 0))
+			}
+			report.Reactions.RowsPlannable += int64(len(actors))
+			if len(entry.Actors) > 0 && entry.Count > len(entry.Actors) {
+				report.Reactions.ActorCountSurplusDropped += int64(entry.Count - len(entry.Actors))
+			}
+			for _, actor := range actors {
+				actor = strings.TrimSpace(actor)
+				row := sqlite.ReactionApply{
+					AccountID: conversation.Account.AccountID, ConversationID: conversation.V2ID,
+					MessageID: messageID, Emoji: emoji, OccurredAtMS: message.TimestampMS + int64(entryIndex),
+				}
+				platform := conversation.Account.Platform
+				normalizedActor := normalizeLegacyReactionActor(platform, actor)
+				switch {
+				case strings.EqualFold(actor, "me") || isOwnReactionActor(platform, actor, normalizedActor, ownNumbers[platform]):
+					row.ReactorKey, row.ReactorIsSelf, row.ReactorLabel = "self", true, "me"
+				case actor == "":
+					row.ReactorKey = "anon:" + emoji
+				default:
+					// Live ingest resolves non-self Google participant numbers and
+					// WhatsApp/Signal actor tokens through this exact IdentityKey path;
+					// using it here makes a post-cutover frame hit the seeded PK.
+					key, err := addIdentity(state, conversation.Account, normalizedActor, "", false, 5)
+					if err != nil {
+						messageUnmappable = true
+						continue
+					}
+					id := identityID(key)
+					row.ReactorKey, row.ReactorIdentityID, row.ReactorLabel = id, &id, ""
+				}
+				if _, exists := seen[row.ReactorKey]; exists {
+					report.Reactions.DuplicateRowsDropped++
+					continue
+				}
+				seen[row.ReactorKey] = struct{}{}
+				state.reactions = append(state.reactions, reactionPlan{Row: row})
+			}
+		}
+		if messageMalformed {
+			report.Dropped.MalformedReactions++
+		}
+		if messageUnmappable {
+			report.Dropped.UnmappableReactions++
+		}
+		if len(state.reactions) > before {
+			report.Reactions.MessagesSeeded++
+			report.Reactions.RowsSeeded += int64(len(state.reactions) - before)
+		} else if !messageMalformed && !messageUnmappable {
+			report.Reactions.MessagesFullyDeduplicated++
+		}
+	}
+}
+
+func isE164(value string) bool {
+	if len(value) < 2 || value[0] != '+' {
+		return false
+	}
+	for _, char := range value[1:] {
+		if char < '0' || char > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func normalizeLegacyReactionActor(platform, actor string) string {
+	actor = strings.TrimSpace(actor)
+	// Cross-reference whatsAppIdentity in whatsappdecoder.go: canonical user
+	// JIDs become E.164 before IdentityKey on live ingest.
+	if platform == "whatsapp" {
+		const suffix = "@s.whatsapp.net"
+		if strings.HasSuffix(strings.ToLower(actor), suffix) {
+			user := actor[:len(actor)-len(suffix)]
+			allDigits := user != ""
+			for _, char := range user {
+				if char < '0' || char > '9' {
+					allDigits = false
+					break
+				}
+			}
+			if allDigits {
+				return "+" + user
+			}
+		}
+	}
+	return actor
+}
+
+func isOwnReactionActor(platform, raw, normalized string, own map[string]struct{}) bool {
+	if _, ok := own[normalized]; ok {
+		return true
+	}
+	if platform == "whatsapp" {
+		user := strings.SplitN(strings.TrimSpace(raw), "@", 2)[0]
+		_, ok := own["+"+user]
+		return ok
+	}
+	return false
+}
+
+func writeReactions(
+	ctx context.Context,
+	repository *sqlite.ReactionRepository,
+	state *transformState,
+	report *Report,
+) error {
+	rows := make([]sqlite.ReactionApply, 0, len(state.reactions))
+	for _, planned := range state.reactions {
+		rows = append(rows, planned.Row)
+	}
+	seeded, err := repository.SeedReactions(ctx, rows)
+	if err != nil {
+		return fmt.Errorf("seed legacy reactions: %w", err)
+	}
+	if seeded != report.Reactions.RowsSeeded {
+		report.Reactions.SeedConflicts += report.Reactions.RowsSeeded - seeded
+		report.Warnings = append(report.Warnings, fmt.Sprintf("reaction seeding inserted %d of %d planned rows; validation will diagnose message-key collisions", seeded, report.Reactions.RowsSeeded))
+	}
+	return nil
 }
 
 func writeAccounts(target *sqlite.Store, state *transformState) error {
@@ -1028,8 +1208,11 @@ func scheduleReport(dataset legacyDataset) ScheduleReport {
 
 func appendRequiredWarnings(report *Report) {
 	report.Warnings = append(report.Warnings, report.ReadState.LossyWarning)
-	if count := report.Dropped.ReactionsBearingMessages; count > 0 {
-		report.Warnings = append(report.Warnings, fmt.Sprintf("%d messages with reactions were counted and dropped: merged v2 has no reaction read model", count))
+	if count := report.Dropped.MalformedReactions; count > 0 {
+		report.Warnings = append(report.Warnings, fmt.Sprintf("%d messages had malformed reactions JSON and migrated without all reactions", count))
+	}
+	if count := report.Dropped.UnmappableReactions; count > 0 {
+		report.Warnings = append(report.Warnings, fmt.Sprintf("%d messages had unmappable reaction entries and migrated without all reactions", count))
 	}
 	if count := report.Dropped.TranscriptBearingMessages; count > 0 {
 		report.Warnings = append(report.Warnings, fmt.Sprintf("%d messages with transcripts were counted and dropped: merged v2 has no transcript columns", count))

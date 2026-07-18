@@ -688,8 +688,8 @@ func assertR5IntegrityReport(
 		report.Schedule.SkippedFailed != 0 || report.Schedule.OptimisticOnlyRows != 1 {
 		t.Errorf("schedule report = %+v", report.Schedule)
 	}
-	if report.Dropped.ReactionsBearingMessages != 1 {
-		t.Errorf("reactions-bearing messages = %d, want 1", report.Dropped.ReactionsBearingMessages)
+	if report.Reactions.MessagesWithReactions != 1 || report.Reactions.MessagesSeeded != 1 || report.Reactions.RowsSeeded != 1 {
+		t.Errorf("reaction report = %+v, want one seeded reaction", report.Reactions)
 	}
 	if report.ReadState.ConversationsWithUnreadCount != 1 || report.ReadState.LossyWarning == "" {
 		t.Errorf("read-state report = %+v", report.ReadState)
@@ -800,6 +800,9 @@ func assertR5ReadParity(t *testing.T, reads *v2read.Source, fixture r5LegacyFixt
 			)
 			if got.MessageID != wantMessageID {
 				t.Errorf("message ID mapping %q = %q, want %q", expected.LegacyID, got.MessageID, wantMessageID)
+			}
+			if expected.LegacyID == "google-r5-empty-source" && got.Reactions != `[{"emoji":"👍","count":1}]` {
+				t.Errorf("message reaction parity %q = %q", expected.LegacyID, got.Reactions)
 			}
 			if !expected.FromMe && (got.SenderNumber != expected.SenderValue || got.SenderName != expected.SenderName) {
 				t.Errorf("message sender parity %q = %q/%q, want %q/%q",
