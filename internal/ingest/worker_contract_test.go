@@ -26,15 +26,44 @@ func TestNewWorkerUsesOnlyConfiguredDecoders(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewMessageRepository(): %v", err)
 	}
+	reactions, err := sqlite.NewReactionRepository(store, time.Now)
+	if err != nil {
+		t.Fatalf("NewReactionRepository(): %v", err)
+	}
+	if _, err := NewWorker(WorkerConfig{
+		Store: store, Messages: messages,
+	}); err == nil {
+		t.Fatal("NewWorker() without reaction repository succeeded")
+	}
 	worker, err := NewWorker(WorkerConfig{
-		Store:    store,
-		Messages: messages,
+		Store:     store,
+		Messages:  messages,
+		Reactions: reactions,
 	})
 	if err != nil {
 		t.Fatalf("NewWorker(): %v", err)
 	}
 	if got := len(worker.decoders); got != 0 {
 		t.Fatalf("NewWorker() registered %d implicit decoders, want none", got)
+	}
+}
+
+func TestPrepareReactionSnapshotEntryTrimsAndSkipsEmptyEmoji(t *testing.T) {
+	worker := &Worker{}
+	entry, ok, err := worker.prepareReactionSnapshotEntry(
+		"account", bridge.PlatformGoogle, bridge.ReactionEvent{Emoji: "  👍  "},
+	)
+	if err != nil || !ok {
+		t.Fatalf("prepare padded snapshot reaction = (%+v, %v, %v), want stored entry", entry, ok, err)
+	}
+	if entry.Emoji != "👍" || entry.ReactorKey != "anon:👍" {
+		t.Fatalf("prepared padded snapshot reaction = %+v, want trimmed emoji and key", entry)
+	}
+	entry, ok, err = worker.prepareReactionSnapshotEntry(
+		"account", bridge.PlatformGoogle, bridge.ReactionEvent{Emoji: " \t "},
+	)
+	if err != nil || ok || entry != (sqlite.ReactionSnapshotEntry{}) {
+		t.Fatalf("prepare whitespace-only snapshot reaction = (%+v, %v, %v), want skipped", entry, ok, err)
 	}
 }
 
@@ -136,6 +165,54 @@ func TestWorkerContainsApplyPanicAndContinues(t *testing.T) {
 	})
 	if _, err := i01GetMessage(harness.messages, "panic-message"); !errors.Is(err, sqlite.ErrNotFound) {
 		t.Fatalf("panicking message lookup error = %v, want ErrNotFound", err)
+	}
+	i01AssertNoPending(t, harness.messages)
+}
+
+func TestWorkerWhitespaceSnapshotReactionIsSkippedWithoutQuarantine(t *testing.T) {
+	const remoteMessageID = "reaction-error-message"
+	decoder := i01DecoderFunc(func(
+		_ context.Context,
+		_ bridge.RawIngressRecord,
+	) ([]bridge.Event, error) {
+		events := i01OutgoingMessageEvents(remoteMessageID, "message survives reaction error", "")
+		events = append(events, bridge.Event{
+			Kind: bridge.EventReaction,
+			Reaction: &bridge.ReactionEvent{
+				RemoteConversationID:  i01RemoteConversationID,
+				TargetRemoteMessageID: remoteMessageID,
+				Actor:                 bridge.IdentityRef{IsSelf: true},
+				Emoji:                 "",
+				Action:                bridge.ReactionAdd,
+				OccurredAt:            i01TestTime,
+			},
+		})
+		return events, nil
+	})
+	harness := i01NewHarness(t, decoder, nil)
+	i01StartWorker(t, harness.worker)
+	i01MustAppend(t, harness.sink, i01IngressRecord(
+		"reaction-error:message",
+		[]byte("reaction-error"),
+	))
+
+	i01WaitFor(t, "whitespace reaction skipped after message projection", func() bool {
+		pending, err := harness.messages.Unprocessed(context.Background())
+		return err == nil && len(pending) == 0
+	})
+	message, err := i01GetMessage(harness.messages, remoteMessageID)
+	if err != nil {
+		t.Fatalf("GetMessageByRemote(projected before reaction error): %v", err)
+	}
+	if message.Body != "message survives reaction error" {
+		t.Fatalf("projected message body = %q", message.Body)
+	}
+	if rows := activeReactionRows(t, harness.worker.reactions, message.MessageID); len(rows) != 0 {
+		t.Fatalf("active reactions after failed apply = %+v, want none", rows)
+	}
+	snapshot := harness.counters.Snapshot(i01AccountID)
+	if snapshot.Projected != 1 || snapshot.Quarantined != 0 || snapshot.ReactionsApplied != 0 || snapshot.ReactionsRemoved != 0 {
+		t.Fatalf("whitespace snapshot reaction counters = %+v", snapshot)
 	}
 	i01AssertNoPending(t, harness.messages)
 }

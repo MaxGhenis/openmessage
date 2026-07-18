@@ -16,7 +16,9 @@ type CounterSnapshot struct {
 	Projected         uint64 `json:"projected"`
 	Imported          uint64 `json:"imported"`
 	Mutations         uint64 `json:"mutations"`
-	ReactionsDropped  uint64 `json:"reactions_dropped"`
+	ReactionsApplied  uint64 `json:"reactions_applied"`
+	ReactionsRemoved  uint64 `json:"reactions_removed"`
+	ReactionsOrphaned uint64 `json:"reactions_orphaned"`
 	TapbackMessages   uint64 `json:"tapback_messages"`
 	EmptyStubsSkipped uint64 `json:"empty_stubs_skipped"`
 	ReceiptsSelf      uint64 `json:"receipts_self"`
@@ -39,7 +41,9 @@ type accountCounters struct {
 	projected         atomic.Uint64
 	imported          atomic.Uint64
 	mutations         atomic.Uint64
-	reactionsDropped  atomic.Uint64
+	reactionsApplied  atomic.Uint64
+	reactionsRemoved  atomic.Uint64
+	reactionsOrphaned atomic.Uint64
 	tapbackMessages   atomic.Uint64
 	emptyStubsSkipped atomic.Uint64
 	receiptsSelf      atomic.Uint64
@@ -119,12 +123,14 @@ func snapshotCounters(c *accountCounters) CounterSnapshot {
 		Projected:         c.projected.Load(),
 		Imported:          c.imported.Load(),
 		Mutations:         c.mutations.Load(),
-		ReactionsDropped:  c.reactionsDropped.Load(),
+		ReactionsApplied:  c.reactionsApplied.Load(),
+		ReactionsRemoved:  c.reactionsRemoved.Load(),
+		ReactionsOrphaned: c.reactionsOrphaned.Load(),
 		TapbackMessages:   c.tapbackMessages.Load(),
 		EmptyStubsSkipped: c.emptyStubsSkipped.Load(),
 		ReceiptsSelf:      c.receiptsSelf.Load(),
 		ReceiptsDropped:   c.receiptsDropped.Load(),
-		AppendErrors:     c.appendErrors.Load(),
+		AppendErrors:      c.appendErrors.Load(),
 		Quarantined:       c.quarantined.Load(),
 		StaleReplays:      c.staleReplays.Load(),
 		EchoReconciled:    c.echoReconciled.Load(),

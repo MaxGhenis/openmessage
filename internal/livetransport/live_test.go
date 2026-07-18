@@ -233,10 +233,15 @@ func TestLiveIngestVerification(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewMessageRepository(): %v", err)
 	}
+	reactions, err := sqlite.NewReactionRepository(store, time.Now)
+	if err != nil {
+		t.Fatalf("NewReactionRepository(): %v", err)
+	}
 	counters := &ingest.Counters{}
 	worker, err := ingest.NewWorker(ingest.WorkerConfig{
 		Store:        store,
 		Messages:     messages,
+		Reactions:    reactions,
 		EchoObserver: service,
 		Counters:     counters,
 		Logger:       logger,

@@ -419,14 +419,14 @@ func assertFixtureReport(t *testing.T, report Report, sourceHash string) {
 			t.Errorf("source file evidence did not reconcile: %+v", file)
 		}
 	}
-	if report.Target.SchemaVersion != 9 || len(report.Target.MigrationChecksums) != 9 {
-		t.Fatalf("target schema = version %d with %d checksums, want version 9 with 9 checksums", report.Target.SchemaVersion, len(report.Target.MigrationChecksums))
+	if report.Target.SchemaVersion != 10 || len(report.Target.MigrationChecksums) != 10 {
+		t.Fatalf("target schema = version %d with %d checksums, want version 10 with 10 checksums", report.Target.SchemaVersion, len(report.Target.MigrationChecksums))
 	}
 	wantTargetCounts := map[string]int64{
 		"accounts": 5, "devices": 5, "people": 1, "person_identities": 2,
 		"conversations": 6, "inbox": 0, "messages": 14,
 		"message_attachments": 3, "outbox": 2, "outbox_attachments": 1,
-		"read_cursors": 6,
+		"read_cursors": 6, "reactions": 0, "reaction_snapshot_fences": 0,
 	}
 	for table, want := range wantTargetCounts {
 		if got := report.Target.Counts[table]; got != want {

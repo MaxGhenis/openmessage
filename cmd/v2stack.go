@@ -268,10 +268,15 @@ func newV2Stack(deps v2StackDeps) (_ *v2Stack, resultErr error) {
 	if err != nil {
 		return nil, fmt.Errorf("configure v2 stack: create ingest message repository: %w", err)
 	}
+	reactions, err := sqlite.NewReactionRepository(store, clock.Now)
+	if err != nil {
+		return nil, fmt.Errorf("configure v2 stack: create ingest reaction repository: %w", err)
+	}
 	counters := &ingest.Counters{}
 	worker, err := ingest.NewWorker(ingest.WorkerConfig{
 		Store:        store,
 		Messages:     messages,
+		Reactions:    reactions,
 		EchoObserver: service,
 		Counters:     counters,
 		Logger:       deps.Logger,

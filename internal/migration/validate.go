@@ -19,8 +19,11 @@ import (
 var targetCountTables = []string{
 	"accounts", "devices", "identities", "people", "person_identities",
 	"conversations", "conversation_participants", "inbox", "messages",
-	"message_attachments", "outbox", "outbox_attachments", "read_cursors",
+	"message_attachments", "outbox", "outbox_attachments", "reactions", "reaction_snapshot_fences",
+	"read_cursors",
 }
+
+const migration0010Checksum = "dfab4551335d92045cb895e5b2c781f4f57216bbc428a705fc26bbdd474db0b1"
 
 func checkpointAndSyncSQLite(ctx context.Context, path string) error {
 	database, err := sql.Open("sqlite", path)
@@ -148,7 +151,8 @@ func validateTarget(
 	countsMatched := countsMatch(dataset, state, report, actualHistory, actualScheduled, actualHistoryByPlatform)
 	report.Validation.CountsMatched = countsMatched
 	report.Validation.Passed = quick == "ok" &&
-		report.Target.SchemaVersion == 9 && len(report.Target.MigrationChecksums) == 9 &&
+		report.Target.SchemaVersion == 10 && len(report.Target.MigrationChecksums) == 10 &&
+		report.Target.MigrationChecksums[9] == migration0010Checksum &&
 		len(fkViolations) == 0 && orphanTotal(orphans) == 0 &&
 		countsMatched && report.Validation.SampledHashesMatched &&
 		report.Validation.BlobReferencesValid && report.Validation.SourceUnchanged &&
@@ -194,6 +198,7 @@ func fillTableReconciliations(
 		name  string
 		count int64
 	}{
+		// RR-2 flips the reactions V2 value to the seeded count.
 		{"reactions", dataset.dropped.ReactionsBearingMessages},
 		{"transcripts", dataset.dropped.TranscriptBearingMessages},
 		{"contact_avatars", dataset.dropped.ContactAvatars},
@@ -329,6 +334,9 @@ func countsMatch(
 		report.Target.Counts["outbox"] != dataset.scheduleByStatus["pending"] ||
 		report.Target.Counts["outbox_attachments"] != state.expectedPendingMedia ||
 		report.Target.Counts["read_cursors"] != state.expectedCursors ||
+		// RR-2 flips reactions to the seeded count.
+		report.Target.Counts["reactions"] != 0 ||
+		report.Target.Counts["reaction_snapshot_fences"] != 0 ||
 		report.Target.Counts["inbox"] != 0 {
 		return false
 	}
