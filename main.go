@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/rs/zerolog"
@@ -32,7 +33,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "  thread <name|number|conversation_id> [--limit N] [--since YYYY-MM-DD] [--until YYYY-MM-DD] [--json] - Print a full conversation chronologically")
 		fmt.Fprintln(os.Stderr, "  threads [--limit N] [--json]             - List recent conversations (find an id/name for thread)")
 		fmt.Fprintln(os.Stderr, "  status [--json]                          - Show per-platform message counts and sync freshness")
-		fmt.Fprintln(os.Stderr, "  send <conversation_id> <msg>              - Send text to an existing conversation across supported platforms")
+		fmt.Fprintln(os.Stderr, "  send <conversation_id> <msg> [--not-before-ms N] [--idempotency-key K] - Send text to an existing conversation")
 		fmt.Fprintln(os.Stderr, "  send-group <phone1,phone2,...> <msg>       - Send group message (MMS)")
 		fmt.Fprintln(os.Stderr, "  import gchat <groups-dir> [--email you@]  - Import Google Chat Takeout")
 		fmt.Fprintln(os.Stderr, "  import gchat-conversation <messages.json> - Import single GChat conversation")
@@ -72,10 +73,39 @@ func main() {
 		err = cmd.RunStatus(logger, os.Args[2:]...)
 	case "send":
 		if len(os.Args) < 4 {
-			fmt.Fprintln(os.Stderr, "Usage: openmessage send <conversation_id> <message>")
+			fmt.Fprintln(os.Stderr, "Usage: openmessage send <conversation_id> <message> [--not-before-ms N] [--idempotency-key K]")
 			os.Exit(1)
 		}
-		err = cmd.RunSend(logger, os.Args[2], os.Args[3])
+		var notBeforeMS *int64
+		var idempotencyKey string
+		for index := 4; index < len(os.Args); index += 2 {
+			if index+1 >= len(os.Args) {
+				err = fmt.Errorf("send option %s requires a value", os.Args[index])
+				break
+			}
+			switch os.Args[index] {
+			case "--not-before-ms":
+				value, parseErr := strconv.ParseInt(os.Args[index+1], 10, 64)
+				if parseErr != nil {
+					err = fmt.Errorf("--not-before-ms must be an integer: %w", parseErr)
+					break
+				}
+				notBeforeMS = &value
+			case "--idempotency-key":
+				idempotencyKey = os.Args[index+1]
+			default:
+				err = fmt.Errorf("unknown send option %s", os.Args[index])
+			}
+			if err != nil {
+				break
+			}
+		}
+		if err != nil {
+			break
+		}
+		err = cmd.RunSendWithOptions(logger, os.Args[2], os.Args[3], cmd.SendOptions{
+			NotBeforeMS: notBeforeMS, IdempotencyKey: idempotencyKey,
+		})
 	case "send-group":
 		if len(os.Args) < 4 {
 			fmt.Fprintln(os.Stderr, "Usage: openmessage send-group <phone1,phone2,...> <message>")
@@ -102,6 +132,9 @@ func main() {
 	}
 
 	if err != nil {
+		if instruction := cmd.OperatorInstruction(err); instruction != "" {
+			fmt.Fprintln(os.Stderr, instruction)
+		}
 		if exitCode := cmd.ExitCode(err); exitCode != 1 {
 			logger.Error().Err(err).Msg("Command failed")
 			os.Exit(exitCode)
