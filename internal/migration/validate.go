@@ -201,6 +201,13 @@ func fillTableReconciliations(
 		{"contact_meta", dataset.dropped.ContactMetaCRM},
 		{"outgoing_send_keys", dataset.dropped.OutgoingSendKeys},
 		{"tabs", dataset.dropped.Tabs},
+		{"malformed_messages", dataset.dropped.MalformedMessages},
+		{"orphaned_messages", dataset.dropped.OrphanedMessages},
+		{"platform_mismatch_messages", dataset.dropped.PlatformMismatchMessages},
+		{"non_positive_timestamp_messages", dataset.dropped.NonPositiveTimestampMessages},
+		{"unmappable_messages", dataset.dropped.UnmappableMessages},
+		{"malformed_participants", dataset.dropped.MalformedParticipants},
+		{"unmappable_unified_contacts", dataset.dropped.UnmappableUnifiedContacts},
 	} {
 		add(dropped.name, dropped.count, 0, dropped.count, "dropped_with_count")
 	}
