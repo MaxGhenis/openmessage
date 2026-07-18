@@ -164,10 +164,15 @@ final class BackendManager: ObservableObject {
         }
         let path = binaryPath
         let dir = dataDir
+        // R8 operator lever: `defaults write com.openmessage.app V2Primary -bool true`
+        // routes the backend at the migrated v2 store; deleting the key rolls back
+        // to the legacy store on next launch (the legacy source is never modified).
+        let v2Primary = UserDefaults.standard.bool(forKey: "V2Primary")
         let configuration = BackendLaunchConfiguration.application(
             executablePath: path,
             dataDirectory: dir,
-            port: port
+            port: port,
+            v2Primary: v2Primary
         )
         let launcher = BackendLauncherCore(configuration: configuration, processSpawner: processSpawner)
         self.launcher = launcher
