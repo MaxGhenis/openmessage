@@ -89,13 +89,14 @@ type legacyDataset struct {
 	unified       []legacyUnifiedContact
 	scheduled     []legacyScheduledMessage
 
-	tableCounts      map[string]int64
-	scheduleByStatus map[string]int64
-	platformMessages map[string]int64
-	dropped          DroppedDimensions
-	signalLocalRows  int64
-	unreadRows       int64
-	mediaRows        int64
+	tableCounts              map[string]int64
+	scheduleByStatus         map[string]int64
+	platformMessages         map[string]int64
+	dropped                  DroppedDimensions
+	signalLocalRows          int64
+	unreadRows               int64
+	mediaRows                int64
+	reactionsBearingMessages int64
 }
 
 var requiredLegacyColumns = map[string][]string{
@@ -290,7 +291,7 @@ func loadLegacyRows(ctx context.Context, database *sql.DB, dataset *legacyDatase
 		if strings.TrimSpace(row.Reactions) != "" &&
 			strings.TrimSpace(row.Reactions) != "null" &&
 			strings.TrimSpace(row.Reactions) != "[]" {
-			dataset.dropped.ReactionsBearingMessages++
+			dataset.reactionsBearingMessages++
 		}
 		if strings.TrimSpace(row.Transcript) != "" || row.TranscribedAtMS != 0 ||
 			strings.TrimSpace(row.TranscriptModel) != "" {
@@ -422,6 +423,10 @@ func validateLegacyRelationships(dataset *legacyDataset) error {
 	// (legacy raw = kept + dropped, with the drop reported separately).
 	dropMessage := func(message legacyMessage, counter *int64) {
 		*counter++
+		rawReactions := strings.TrimSpace(message.Reactions)
+		if rawReactions != "" && rawReactions != "null" && rawReactions != "[]" {
+			dataset.dropped.ReactionMessagesDroppedWithParent++
+		}
 		dataset.platformMessages[normalizeLegacyPlatform(message.Platform)]--
 		if strings.TrimSpace(message.MediaID) != "" {
 			dataset.mediaRows--

@@ -43,6 +43,9 @@ func TestTransformDropsDegenerateLegacyRowsWithCounts(t *testing.T) {
 	// Message with a valid id but a non-positive timestamp.
 	exec(`INSERT INTO messages (message_id, conversation_id, body, timestamp_ms, source_platform)
 	      VALUES ('degenerate-zero-ts', 'sms-conversation', 'no time', 0, 'sms')`)
+	// A malformed reactions payload degrades only reactions; its message moves.
+	exec(`INSERT INTO messages (message_id, conversation_id, body, timestamp_ms, source_platform, reactions)
+	      VALUES ('degenerate-bad-reactions', 'sms-conversation', 'valid message', ?, 'sms', '{oops')`, fixtureBaseMS+51_500)
 	// Conversation with empty-string participants (must migrate, no roster,
 	// silently) and one with malformed participants JSON (must migrate,
 	// counted).
@@ -71,7 +74,8 @@ func TestTransformDropsDegenerateLegacyRowsWithCounts(t *testing.T) {
 	dropped := report.Dropped
 	if dropped.MalformedMessages != 1 || dropped.OrphanedMessages != 1 ||
 		dropped.PlatformMismatchMessages != 1 || dropped.NonPositiveTimestampMessages != 1 ||
-		dropped.MalformedParticipants != 1 || dropped.UnmappableUnifiedContacts != 1 {
+		dropped.MalformedParticipants != 1 || dropped.UnmappableUnifiedContacts != 1 ||
+		dropped.MalformedReactions != 1 {
 		t.Fatalf("dropped dimensions = %+v, want exactly one of each degenerate class", dropped)
 	}
 
@@ -94,6 +98,7 @@ func TestTransformDropsDegenerateLegacyRowsWithCounts(t *testing.T) {
 		"non-positive timestamp",
 		"unparseable participants",
 		"unmappable identifiers",
+		"malformed reactions JSON",
 	} {
 		if !strings.Contains(warned, fragment) {
 			t.Fatalf("warnings missing %q:\n%s", fragment, warned)

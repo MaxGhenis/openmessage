@@ -3,6 +3,7 @@ package ingest
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"path/filepath"
@@ -20,7 +21,10 @@ import (
 
 	"github.com/maxghenis/openmessage/internal/bridge"
 	whatsappadapter "github.com/maxghenis/openmessage/internal/bridgeadapters/whatsapp"
+	legacydb "github.com/maxghenis/openmessage/internal/db"
+	"github.com/maxghenis/openmessage/internal/migration"
 	"github.com/maxghenis/openmessage/internal/storage/sqlite"
+	"github.com/maxghenis/openmessage/internal/v2keys"
 )
 
 const (
@@ -619,6 +623,116 @@ func TestWhatsAppReactionDeltasApplySwitchRemoveAndOrphanThroughWorker(t *testin
 	i01AssertNoPending(t, harness.messages)
 }
 
+func TestWhatsAppMigratedReactionsConvergeWithLiveDecoderAndWorker(t *testing.T) {
+	const (
+		accountID          = "whatsapp-primary"
+		conversationRemote = "whatsapp:" + waCanonicalChatJID
+		contactTarget      = "wa-contact-target"
+		selfTarget         = "wa-self-target"
+		ownJID             = "14155550300@s.whatsapp.net"
+	)
+	root := t.TempDir()
+	legacyPath := filepath.Join(root, "legacy.sqlite3")
+	legacy, err := legacydb.New(legacyPath)
+	if err != nil {
+		t.Fatalf("legacydb.New(): %v", err)
+	}
+	if err := legacy.UpsertConversation(&legacydb.Conversation{ConversationID: conversationRemote, Name: "WA convergence", Participants: `[]`, LastMessageTS: waTimestampMS, SourcePlatform: "whatsapp"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, message := range []*legacydb.Message{
+		{MessageID: "whatsapp:" + contactTarget, ConversationID: conversationRemote, SenderName: "Grace", SenderNumber: waSenderJID, Body: "contact target", TimestampMS: waTimestampMS, SourcePlatform: "whatsapp", Reactions: `[{"emoji":"👍","count":1,"actors":["` + waSenderJID + `"]}]`},
+		{MessageID: "whatsapp:" + selfTarget, ConversationID: conversationRemote, SenderName: "Grace", SenderNumber: waSenderJID, Body: "self target", TimestampMS: waTimestampMS + 1, SourcePlatform: "whatsapp", Reactions: `[{"emoji":"🔥","count":1,"actors":["` + ownJID + `"]}]`},
+		{MessageID: "whatsapp:own-number-evidence", ConversationID: conversationRemote, SenderName: "Me", SenderNumber: "+14155550300", Body: "own number evidence", TimestampMS: waTimestampMS - 1, IsFromMe: true, SourcePlatform: "whatsapp"},
+	} {
+		if err := legacy.UpsertMessage(message); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	staged := filepath.Join(root, "staged.sqlite3")
+	report, err := migration.Transform(context.Background(), migration.Options{SourcePath: legacyPath, TempStorePath: staged, TempBlobPath: filepath.Join(root, "blobs"), TargetPath: filepath.Join(root, "target"), TargetStorePath: filepath.Join(root, "target", "store.sqlite3"), Check: true})
+	if err != nil {
+		t.Fatalf("migration.Transform(): %v (report=%+v)", err, report)
+	}
+	store, err := sqlite.Open(staged)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Errorf("close store: %v", err)
+		}
+	})
+	messages, err := sqlite.NewMessageRepository(store, func() time.Time { return waWorkerNow })
+	if err != nil {
+		t.Fatal(err)
+	}
+	harness := newWhatsAppWorkerHarnessForStore(t, staged, store, messages)
+
+	conversation, err := store.GetConversationByRemote(accountID, conversationRemote)
+	if err != nil {
+		t.Fatal(err)
+	}
+	messageID := func(remote string) string {
+		return v2keys.DeriveID("message", accountID, conversationRemote+"\x1f"+remote)
+	}
+	contactKey := v2keys.DeriveID("identity", accountID, "e164\x1f+14155550200")
+	assertReactionDBRow(t, staged, messageID(contactTarget), contactKey, 0, "", "👍", 1)
+	assertReactionDBRow(t, staged, messageID(selfTarget), "self", 1, "me", "🔥", 1)
+
+	appendReaction := func(label, target, emoji, sender string, fromMe bool, at int64) {
+		envelope := waBaseMessageEnvelope()
+		envelope.ChatJID, envelope.SenderJID, envelope.MessageID = waCanonicalChatJID, sender, "migration-reaction-"+label
+		envelope.TimestampMS, envelope.IsFromMe = at, fromMe
+		record, bytes := waMessageRecord(t, envelope, &waE2E.Message{ReactionMessage: &waE2E.ReactionMessage{Key: &waCommon.MessageKey{ID: proto.String(target)}, Text: proto.String(emoji)}})
+		record.AccountID, record.DedupeKey, record.ReceivedAt = accountID, "migration-reaction:"+label+":"+waHash8(bytes), waWorkerNow
+		if err := harness.sink.AppendIngress(context.Background(), record); err != nil {
+			t.Fatal(err)
+		}
+	}
+	appendReaction("contact", contactTarget, "❤️", waSenderJID, false, waTimestampMS+100)
+	appendReaction("self", selfTarget, "😂", ownJID, true, waTimestampMS+101)
+	i01WaitFor(t, "migrated WhatsApp reactions applied", func() bool { return harness.counters.Snapshot(accountID).ReactionsApplied == 2 })
+	assertReactionDBRow(t, staged, messageID(contactTarget), contactKey, 0, "", "❤️", 1)
+	assertReactionDBRow(t, staged, messageID(selfTarget), "self", 1, "me", "😂", 1)
+	_ = conversation
+}
+
+func assertReactionDBRow(t *testing.T, path, messageID, key string, isSelf int, label, emoji string, count int) {
+	t.Helper()
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var gotCount int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM reactions WHERE message_id = ? AND reactor_key = ?`, messageID, key).Scan(&gotCount); err != nil {
+		t.Fatal(err)
+	}
+	if gotCount != count {
+		t.Fatalf("reaction (%s, %s) rows = %d, want %d", messageID, key, gotCount, count)
+	}
+	var total int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM reactions WHERE message_id = ?`, messageID).Scan(&total); err != nil {
+		t.Fatal(err)
+	}
+	if total != count {
+		t.Fatalf("all reaction rows for message %s = %d, want exactly %d converged row", messageID, total, count)
+	}
+	var gotSelf int
+	var gotLabel, gotEmoji string
+	if err := db.QueryRow(`SELECT reactor_is_self, reactor_label, emoji FROM reactions WHERE message_id = ? AND reactor_key = ?`, messageID, key).Scan(&gotSelf, &gotLabel, &gotEmoji); err != nil {
+		t.Fatal(err)
+	}
+	if gotSelf != isSelf || gotLabel != label || gotEmoji != emoji {
+		t.Fatalf("reaction row = self=%d label=%q emoji=%q, want %d/%q/%q", gotSelf, gotLabel, gotEmoji, isSelf, label, emoji)
+	}
+}
+
 func TestWhatsAppIngressDedupeUsesMessageIDAndProtoHash(t *testing.T) {
 	harness := newWhatsAppWorkerHarness(t)
 	envelope := waBaseMessageEnvelope()
@@ -780,6 +894,12 @@ func newWhatsAppWorkerHarness(t *testing.T) *whatsAppWorkerHarness {
 	if err != nil {
 		t.Fatalf("NewMessageRepository(): %v", err)
 	}
+	return newWhatsAppWorkerHarnessForStore(t, path, store, messages)
+}
+
+func newWhatsAppWorkerHarnessForStore(t *testing.T, path string, store *sqlite.Store, messages *sqlite.MessageRepository) *whatsAppWorkerHarness {
+	t.Helper()
+	now := func() time.Time { return waWorkerNow }
 	reactions, err := sqlite.NewReactionRepository(store, now)
 	if err != nil {
 		t.Fatalf("NewReactionRepository(): %v", err)

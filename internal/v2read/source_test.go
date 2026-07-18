@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/maxghenis/openmessage/internal/bridge"
 	"github.com/maxghenis/openmessage/internal/db"
 	"github.com/maxghenis/openmessage/internal/readsource"
 	"github.com/maxghenis/openmessage/internal/storage/sqlite"
@@ -95,6 +96,34 @@ func TestSourceMapsConversationAndMessagesToLegacyDTOs(t *testing.T) {
 		OccurredAtMS:    300,
 	}
 	importSourceMessage(t, messages, outgoing)
+	reactions, err := sqlite.NewReactionRepository(store, func() time.Time { return time.UnixMilli(sourceTestTimeMS) })
+	if err != nil {
+		t.Fatalf("NewReactionRepository(): %v", err)
+	}
+	for _, reaction := range []sqlite.ReactionApply{
+		{
+			AccountID: "google-account", ConversationID: "conversation-google", MessageID: incoming.MessageID,
+			ReactorKey: identity.IdentityID, ReactorIdentityID: stringPointer(identity.IdentityID),
+			ReactorLabel: identity.RawValue, Emoji: "👍", Action: bridge.ReactionAdd, OccurredAtMS: 201,
+		},
+		{
+			AccountID: "google-account", ConversationID: "conversation-google", MessageID: incoming.MessageID,
+			ReactorKey: "self", ReactorIsSelf: true, ReactorLabel: "me",
+			Emoji: "❤️", Action: bridge.ReactionAdd, OccurredAtMS: 202,
+		},
+		{
+			AccountID: "google-account", ConversationID: "conversation-google", MessageID: incoming.MessageID,
+			ReactorKey: "removed", ReactorLabel: "gone", Emoji: "😂", Action: bridge.ReactionAdd, OccurredAtMS: 203,
+		},
+		{
+			AccountID: "google-account", ConversationID: "conversation-google", MessageID: incoming.MessageID,
+			ReactorKey: "removed", ReactorLabel: "gone", Action: bridge.ReactionRemove, OccurredAtMS: 204,
+		},
+	} {
+		if _, err := reactions.ApplyReaction(context.Background(), reaction); err != nil {
+			t.Fatalf("ApplyReaction(%q): %v", reaction.ReactorKey, err)
+		}
+	}
 
 	conversation, err := source.GetConversation("conversation-google")
 	if err != nil {
@@ -158,7 +187,7 @@ func TestSourceMapsConversationAndMessagesToLegacyDTOs(t *testing.T) {
 		gotIncoming.MediaID != "v2msg:message-incoming:0" ||
 		gotIncoming.MimeType != "image/png" ||
 		gotIncoming.Status != "" ||
-		gotIncoming.Reactions != "" {
+		gotIncoming.Reactions != `[{"emoji":"👍","count":1,"actors":["+15550000001"]},{"emoji":"❤️","count":1,"actors":["me"]}]` {
 		t.Fatalf("mapped incoming = %+v", gotIncoming)
 	}
 }

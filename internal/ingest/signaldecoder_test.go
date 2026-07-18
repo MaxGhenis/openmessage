@@ -743,6 +743,84 @@ func TestSignalReactionDeltasResolveLocalAliasAndSelfEchoIdempotently(t *testing
 	}
 }
 
+func TestSignalMigratedReactionsConvergeWithLiveDecoderAndWorker(t *testing.T) {
+	const (
+		e164Actor  = "+15551234567"
+		aciActor   = "11111111-2222-3333-4444-555555555555"
+		e164Target = "1700000000999"
+		aciTarget  = "1700000001999"
+	)
+	root := t.TempDir()
+	legacyPath := filepath.Join(root, "legacy.sqlite3")
+	legacy, err := legacydb.New(legacyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, conversation := range []*legacydb.Conversation{
+		{ConversationID: "signal:" + e164Actor, Name: "E164", Participants: `[]`, LastMessageTS: 1_700_000_001_999, SourcePlatform: "signal"},
+		{ConversationID: "signal:" + aciActor, Name: "ACI", Participants: `[]`, LastMessageTS: 1_700_000_002_999, SourcePlatform: "signal"},
+	} {
+		if err := legacy.UpsertConversation(conversation); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, message := range []*legacydb.Message{
+		{MessageID: "signal:" + e164Target, ConversationID: "signal:" + e164Actor, SenderName: "Me", SenderNumber: signalSelf, Body: "E164 target", TimestampMS: 1_700_000_000_999, IsFromMe: true, SourcePlatform: "signal", Reactions: `[{"emoji":"👍","count":1,"actors":["` + e164Actor + `"]}]`},
+		{MessageID: "signal:" + aciTarget, ConversationID: "signal:" + aciActor, SenderName: "Me", SenderNumber: signalSelf, Body: "ACI target", TimestampMS: 1_700_000_001_999, IsFromMe: true, SourcePlatform: "signal", Reactions: `[{"emoji":"🔥","count":1,"actors":["` + aciActor + `"]}]`},
+	} {
+		if err := legacy.UpsertMessage(message); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	staged := filepath.Join(root, "staged.sqlite3")
+	report, err := migration.Transform(context.Background(), migration.Options{SourcePath: legacyPath, TempStorePath: staged, TempBlobPath: filepath.Join(root, "blobs"), TargetPath: filepath.Join(root, "target"), TargetStorePath: filepath.Join(root, "target", "store.sqlite3"), Check: true})
+	if err != nil {
+		t.Fatalf("migration.Transform(): %v (report=%+v)", err, report)
+	}
+	store, err := sqlite.Open(staged)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Errorf("close store: %v", err)
+		}
+	})
+	messages, err := sqlite.NewMessageRepository(store, func() time.Time { return signalDecoderReceivedAt })
+	if err != nil {
+		t.Fatal(err)
+	}
+	harness := newSignalWorkerHarnessForStore(t, staged, store, messages)
+	harness.start(t)
+
+	keyFor := func(kind, canonical string) string {
+		return v2keys.DeriveID("identity", signalDecoderAccountID, kind+"\x1f"+canonical)
+	}
+	e164Key, aciKey := keyFor("e164", e164Actor), keyFor("signal_aci", aciActor)
+	messageID := func(conversation, remote string) string {
+		return v2keys.DeriveID("message", signalDecoderAccountID, conversation+"\x1f"+remote)
+	}
+	aciMessageID := messageID("signal:"+aciActor, aciTarget)
+	assertReactionDBRow(t, staged, messageID("signal:"+e164Actor, e164Target), e164Key, 0, "", "👍", 1)
+	assertReactionDBRow(t, staged, aciMessageID, aciKey, 0, "", "🔥", 1)
+
+	for label, line := range map[string]string{
+		"e164": `{"account":"+15551230000","envelope":{"sourceNumber":"+15551234567","sourceName":"Taylor","timestamp":1700000003123,"dataMessage":{"timestamp":1700000003123,"reaction":{"emoji":"❤️","target":{"timestamp":1700000000999,"authorNumber":"+15551230000"}}}}}`,
+		"aci":  `{"account":"+15551230000","envelope":{"sourceServiceId":"11111111-2222-3333-4444-555555555555","sourceName":"ACI Taylor","timestamp":1700000004123,"dataMessage":{"timestamp":1700000004123,"reaction":{"emoji":"😂","target":{"timestamp":1700000001999,"authorNumber":"+15551230000"}}}}}`,
+	} {
+		if err := harness.sink.AppendIngress(context.Background(), mustBuildSignalRecord(t, []byte(line))); err != nil {
+			t.Fatalf("AppendIngress(%s): %v", label, err)
+		}
+	}
+	waitSignalCondition(t, "migrated Signal reactions applied", func() bool { return harness.counters.Snapshot(signalDecoderAccountID).ReactionsApplied == 2 })
+	assertReactionDBRow(t, staged, messageID("signal:"+e164Actor, e164Target), e164Key, 0, "", "❤️", 1)
+	assertReactionDBRow(t, staged, aciMessageID, aciKey, 0, "", "😂", 1)
+}
+
 func TestSignalMigrationOutputConvergesWithLiveDecoder(t *testing.T) {
 	const (
 		remoteConversationID = "signal:+16505550100"
