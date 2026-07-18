@@ -11,6 +11,12 @@ import (
 )
 
 func RunSendGroup(logger zerolog.Logger, phones []string, message string) error {
+	return runSendGroupWithDeps(defaultSendGroupCommandDeps(func(phones []string, message string) error {
+		return runLegacySendGroup(logger, phones, message)
+	}), phones, message)
+}
+
+func runLegacySendGroup(logger zerolog.Logger, phones []string, message string) error {
 	a, err := app.New(logger)
 	if err != nil {
 		return fmt.Errorf("init app: %w", err)
