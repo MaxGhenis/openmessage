@@ -5779,6 +5779,7 @@ body::after {
   let nativeNotificationState = null;
   let pendingDeepLinkConversationID = conversationIDFromURL();
   let appStatus = { connected: false, google: {}, whatsapp: {}, signal: {}, backfill: {}, identity_name: '' };
+  const state = { v2Primary: null };
   let browserOnline = browserReportsOnline();
   let networkIssueDetected = false;
   let googleStatus = {
@@ -5984,6 +5985,7 @@ body::after {
   let replyToMsg = null; // {MessageID, SenderName, Body}
   let forwardMessage = null;
   let forwarding = false;
+  const forwardSendKeys = new Map();
   const composeTextByConversation = new Map();
   let contextMenuState = null;
   let threadSearchTimer = 0;
@@ -8159,6 +8161,11 @@ body::after {
   }
 
   function refreshComposeRouteUI() {
+    if ($composeGifBtn) {
+      // The v2 outbox has no GIF send path; keep this hidden in primary until Wave 4.
+      $composeGifBtn.hidden = state.v2Primary !== false;
+    }
+    if (state.v2Primary === true) closeComposeGifPanel();
     if (!activeConversation) {
       $composeInput.disabled = false;
       if ($composeEmojiBtn) $composeEmojiBtn.disabled = false;
@@ -8848,6 +8855,7 @@ body::after {
   function closeForwardDialog() {
     forwardMessage = null;
     forwarding = false;
+    forwardSendKeys.clear();
     if (!$forwardOverlay) return;
     $forwardOverlay.hidden = true;
     if ($forwardSearch) {
@@ -8896,6 +8904,12 @@ body::after {
         btn.disabled = forwarding;
       });
     }
+  }
+
+  function forwardSendKey(targetID, kind) {
+    const lookup = JSON.stringify([targetID, kind]);
+    if (!forwardSendKeys.has(lookup)) forwardSendKeys.set(lookup, queuedSendID());
+    return forwardSendKeys.get(lookup);
   }
 
   function renderForwardTargets() {
@@ -8956,6 +8970,7 @@ body::after {
       showThreadFeedback('Nothing to forward from this message.');
       return;
     }
+    forwardSendKeys.clear();
     forwardMessage = message;
     if ($forwardPreview) $forwardPreview.textContent = forwardPreviewText(message);
     if ($forwardOverlay) $forwardOverlay.hidden = false;
@@ -8989,6 +9004,10 @@ body::after {
       setForwardStatus(offlineFeedbackMessage('send'), true);
       return;
     }
+    if (state.v2Primary === null) {
+      setForwardStatus('Sending is starting up — try again.', true);
+      return;
+    }
     if (!conversationSupportsOutbound(targetConvo)) {
       setForwardStatus(routeUnavailableMessage('forward messages', targetConvo), true);
       return;
@@ -9008,29 +9027,42 @@ body::after {
     try {
       if (message.MediaID) {
         const { blob, mime } = await mediaBlobForForward(message);
-        const form = new FormData();
-        form.append('conversation_id', targetID);
-        form.append('file', blob, forwardFilename(message, mime));
         const captionedWhatsAppMedia = targetPlatform === 'whatsapp' && !mime.toLowerCase().startsWith('audio/');
         const captionedMedia = captionedWhatsAppMedia || targetPlatform === 'signal';
-        if (body && captionedMedia) {
-          form.append('caption', body);
-        }
-        const mediaResponse = await fetch('/api/send-media', { method: 'POST', body: form });
-        if (!mediaResponse.ok) {
-          throw new Error(await responseError(mediaResponse));
+        if (state.v2Primary) {
+          const file = new File([blob], forwardFilename(message, mime), { type: mime });
+          await submitV2Media(targetID, file, captionedMedia ? body : '', '', forwardSendKey(targetID, 'media'));
+        } else {
+          const form = new FormData();
+          form.append('conversation_id', targetID);
+          form.append('file', blob, forwardFilename(message, mime));
+          if (body && captionedMedia) {
+            form.append('caption', body);
+          }
+          const mediaResponse = await fetch('/api/send-media', { method: 'POST', body: form });
+          if (!mediaResponse.ok) {
+            throw new Error(await responseError(mediaResponse));
+          }
         }
         if (body && !captionedMedia) {
+          if (state.v2Primary) {
+            await submitV2Text(targetID, body, '', forwardSendKey(targetID, 'text'));
+          } else {
+            await postJSON('/api/send', {
+              conversation_id: targetID,
+              message: body,
+            });
+          }
+        }
+      } else if (body) {
+        if (state.v2Primary) {
+          await submitV2Text(targetID, body, '', forwardSendKey(targetID, 'text'));
+        } else {
           await postJSON('/api/send', {
             conversation_id: targetID,
             message: body,
           });
         }
-      } else if (body) {
-        await postJSON('/api/send', {
-          conversation_id: targetID,
-          message: body,
-        });
       } else {
         throw new Error('Nothing to forward from this message.');
       }
@@ -9089,7 +9121,7 @@ body::after {
       return '<span class="msg-status status-failed" title="Failed">!</span>';
     }
     // Sent/complete (default for outgoing)
-    if (s.includes('COMPLETE') || s.includes('OUTGOING')) {
+    if ((state.v2Primary === true && s === 'SENT') || s.includes('COMPLETE') || s.includes('OUTGOING')) {
       return '<span class="msg-status status-sent" title="Sent">\u2713</span>';
     }
     return '';
@@ -9198,6 +9230,50 @@ body::after {
     } catch (err) {
       throw err instanceof Error ? err : new Error(String(err || 'Request failed'));
     }
+  }
+
+  async function v2SubmissionError(response, media = false) {
+    let message = '';
+    if (response.status === 409) message = 'That message conflicts with another send.';
+    if (response.status === 501) message = "This conversation can't send right now.";
+    if (response.status === 422) message = "Can't reply to that message.";
+    if (response.status === 503) message = 'Sending is starting up — try again.';
+    if (media && response.status === 413) message = 'That file is too large.';
+    if (message) {
+      // Keep mapped v2 responses out of the legacy reconnect classifier so
+      // their exact guidance is shown and manual retry reuses the queued key.
+      return new Error(message);
+    }
+    const error = new Error(await responseError(response));
+    error.status = response.status;
+    return error;
+  }
+
+  async function submitV2Text(convId, body, replyToId, key) {
+    const response = await fetch(API + '/api/v1/outbox/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        conversation_id: convId,
+        body,
+        reply_to_id: replyToId,
+        idempotency_key: key,
+      }),
+    });
+    if (!response.ok) throw await v2SubmissionError(response);
+    return response.json();
+  }
+
+  async function submitV2Media(convId, file, caption, replyToId, key) {
+    const form = new FormData();
+    form.append('conversation_id', convId);
+    form.append('file', file, file.name || 'attachment');
+    form.append('caption', caption || '');
+    form.append('reply_to_id', replyToId || '');
+    form.append('idempotency_key', key);
+    const response = await fetch(API + '/api/v1/outbox/media', { method: 'POST', body: form });
+    if (!response.ok) throw await v2SubmissionError(response, true);
+    return response.json();
   }
 
   function normalizeQueuedSend(raw) {
@@ -9592,6 +9668,15 @@ body::after {
   }
 
   async function sendQueuedItem(item) {
+    if (state.v2Primary && item.type === 'media') {
+      const file = await pendingSendFile(item);
+      await submitV2Media(item.conversation_id, file, item.body, item.reply_to_id, item.id);
+      return;
+    }
+    if (state.v2Primary && item.type === 'text') {
+      await submitV2Text(item.conversation_id, item.body, item.reply_to_id, item.id);
+      return;
+    }
     if (item.type === 'gif') {
       await postQueuedJSON('/api/send-gif', {
         conversation_id: item.conversation_id,
@@ -9636,7 +9721,7 @@ body::after {
   }
 
   async function flushQueuedSends() {
-    if (pendingSendFlushInProgress || browserIsOffline()) return;
+    if (pendingSendFlushInProgress || browserIsOffline() || state.v2Primary === null) return;
     pendingSendFlushInProgress = true;
     let sentAny = false;
     try {
@@ -10429,6 +10514,7 @@ body::after {
       msg.MimeType || '',
       msg.Body || '',
       sourcePlatformOf(msg),
+      state.v2Primary === true && String(msg.Status || '').toUpperCase() === 'SENT' ? 'v2-sent' : '',
     ].join(':');
   }
 
@@ -13189,8 +13275,16 @@ body::after {
   async function checkStatus() {
     try {
       const status = await fetchJSON('/api/status');
+      const v2PrimaryChanged = state.v2Primary !== (status.v2_primary === true);
+      state.v2Primary = status.v2_primary === true;
       browserOnline = browserReportsOnline();
       applyAppStatus(status);
+      if (v2PrimaryChanged) {
+        refreshComposeRouteUI();
+        if (activeConvoId && loadedMessages.length) {
+          renderLoadedMessages({ previousScrollTop: $messagesArea.scrollTop });
+        }
+      }
     } catch {
       browserOnline = browserReportsOnline();
       applyAppStatus({ connected: false });
@@ -14242,6 +14336,7 @@ body::after {
     .then(() => syncNotificationButton())
     .catch(err => console.error('Failed to initialize native notifications:', err));
   renderEmptyState();
+  refreshComposeRouteUI();
   if ($selectToggleBtn) $selectToggleBtn.addEventListener('click', toggleSelectionMode);
   if ($bulkCancelBtn) $bulkCancelBtn.addEventListener('click', exitSelectionMode);
   if ($bulkMoveBtn) $bulkMoveBtn.addEventListener('click', openBulkMoveMenu);
