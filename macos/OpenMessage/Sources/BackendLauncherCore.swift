@@ -54,10 +54,10 @@ struct BackendLaunchConfiguration: Equatable, Sendable {
         dataDirectory: String,
         port: Int,
         homeDirectory: String = NSHomeDirectory(),
+        v2Primary: Bool = false,
         additionalEnvironment: [String: String] = [:]
     ) -> BackendLaunchConfiguration {
-        var environment = additionalEnvironment
-        environment.merge([
+        var canonical = [
             "OPENMESSAGES_PORT": String(port),
             "OPENMESSAGES_DATA_DIR": dataDirectory,
             "OPENMESSAGES_LOG_LEVEL": "info",
@@ -65,7 +65,17 @@ struct BackendLaunchConfiguration: Equatable, Sendable {
             "OPENMESSAGES_MACOS_NOTIFICATIONS": "0",
             "HOME": homeDirectory,
             "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
-        ]) { _, canonical in canonical }
+        ]
+        if v2Primary {
+            // Operator lever for the R8 cutover: the backend selects the
+            // migrated v2 store only when this env var is set, and it refuses
+            // to start in primary mode if <dataDir>/v2 is missing, so setting
+            // it on an unmigrated install fails loudly rather than silently
+            // serving an empty store. Rollback = clear the defaults key.
+            canonical["OPENMESSAGES_V2_PRIMARY"] = "1"
+        }
+        var environment = additionalEnvironment
+        environment.merge(canonical) { _, canonical in canonical }
 
         let dataDirectoryURL = URL(fileURLWithPath: dataDirectory, isDirectory: true)
         return BackendLaunchConfiguration(

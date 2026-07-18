@@ -37,6 +37,30 @@ final class BackendLaunchConfigurationTests: XCTestCase {
         )
     }
 
+    func testV2PrimaryLeverAddsExactlyOneEnvironmentVariable() {
+        let base = BackendLaunchConfiguration.application(
+            executablePath: "/Applications/OpenMessage.app/Contents/Resources/openmessage",
+            dataDirectory: "/Users/example/Library/Application Support/OpenMessage",
+            port: 8123,
+            homeDirectory: "/Users/example"
+        )
+        let primary = BackendLaunchConfiguration.application(
+            executablePath: "/Applications/OpenMessage.app/Contents/Resources/openmessage",
+            dataDirectory: "/Users/example/Library/Application Support/OpenMessage",
+            port: 8123,
+            homeDirectory: "/Users/example",
+            v2Primary: true
+        )
+
+        // Default stays byte-identical to the shipped contract: the lever off
+        // must not perturb the environment in any way.
+        XCTAssertNil(base.environment["OPENMESSAGES_V2_PRIMARY"])
+        XCTAssertEqual(primary.environment["OPENMESSAGES_V2_PRIMARY"], "1")
+        var expected = base.environment
+        expected["OPENMESSAGES_V2_PRIMARY"] = "1"
+        XCTAssertEqual(primary.environment, expected)
+    }
+
     func testAdditionalEnvironmentIsExplicitWithoutOverridingCanonicalFields() {
         let configuration = BackendLaunchConfiguration.application(
             executablePath: "/tmp/openmessage",
