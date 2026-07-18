@@ -107,20 +107,26 @@ func TestStatusReportsV2IngestCounters(t *testing.T) {
 			provider: func() map[string]ingest.CounterSnapshot {
 				return map[string]ingest.CounterSnapshot{
 					"google:primary": {
-						Appended:      7,
-						DecodedEvents: 6,
-						Projected:     5,
-						Quarantined:   1,
+						Appended:          7,
+						DecodedEvents:     6,
+						Projected:         5,
+						ReactionsApplied:  4,
+						ReactionsRemoved:  3,
+						ReactionsOrphaned: 2,
+						Quarantined:       1,
 					},
 				}
 			},
 			wantEnabled: true,
 			wantPerAccount: map[string]ingest.CounterSnapshot{
 				"google:primary": {
-					Appended:      7,
-					DecodedEvents: 6,
-					Projected:     5,
-					Quarantined:   1,
+					Appended:          7,
+					DecodedEvents:     6,
+					Projected:         5,
+					ReactionsApplied:  4,
+					ReactionsRemoved:  3,
+					ReactionsOrphaned: 2,
+					Quarantined:       1,
 				},
 			},
 		},
@@ -131,6 +137,10 @@ func TestStatusReportsV2IngestCounters(t *testing.T) {
 			ts := newV1RecorderHarness(t, APIOptions{V2IngestCounters: test.provider})
 			resp := ts.do(t, httptest.NewRequest(http.MethodGet, "http://127.0.0.1/api/status", nil))
 			defer resp.Body.Close()
+			body, err := io.ReadAll(resp.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
 
 			var payload struct {
 				V2Ingest struct {
@@ -138,7 +148,7 @@ func TestStatusReportsV2IngestCounters(t *testing.T) {
 					PerAccount map[string]ingest.CounterSnapshot `json:"per_account"`
 				} `json:"v2_ingest"`
 			}
-			if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+			if err := json.Unmarshal(body, &payload); err != nil {
 				t.Fatal(err)
 			}
 			if payload.V2Ingest.Enabled != test.wantEnabled {
@@ -147,7 +157,34 @@ func TestStatusReportsV2IngestCounters(t *testing.T) {
 			if !reflect.DeepEqual(payload.V2Ingest.PerAccount, test.wantPerAccount) {
 				t.Fatalf("v2_ingest.per_account = %#v, want %#v", payload.V2Ingest.PerAccount, test.wantPerAccount)
 			}
+			if test.wantEnabled {
+				assertReactionCounterJSONNames(t, body, "google:primary")
+			}
 		})
+	}
+}
+
+func assertReactionCounterJSONNames(t *testing.T, body []byte, accountID string) {
+	t.Helper()
+	var payload struct {
+		V2Ingest struct {
+			PerAccount map[string]map[string]json.RawMessage `json:"per_account"`
+		} `json:"v2_ingest"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatal(err)
+	}
+	counters, ok := payload.V2Ingest.PerAccount[accountID]
+	if !ok {
+		t.Fatalf("v2_ingest.per_account missing %q", accountID)
+	}
+	for _, key := range []string{"reactions_applied", "reactions_removed", "reactions_orphaned"} {
+		if _, ok := counters[key]; !ok {
+			t.Errorf("v2_ingest.per_account[%q] missing JSON counter %q", accountID, key)
+		}
+	}
+	if _, ok := counters["reactions_dropped"]; ok {
+		t.Errorf("v2_ingest.per_account[%q] retained retired JSON counter %q", accountID, "reactions_dropped")
 	}
 }
 

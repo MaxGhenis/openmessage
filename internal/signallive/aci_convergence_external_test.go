@@ -131,11 +131,16 @@ func TestSignalCaptureReplayDedupeSurvivesContactResolutionDrift(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewMessageRepository(): %v", err)
 	}
+	reactions, err := sqlite.NewReactionRepository(v2Store, func() time.Time { return now })
+	if err != nil {
+		t.Fatalf("NewReactionRepository(): %v", err)
+	}
 	counters := &ingest.Counters{}
 	worker, err := ingest.NewWorker(ingest.WorkerConfig{
-		Store:    v2Store,
-		Messages: messages,
-		Counters: counters,
+		Store:     v2Store,
+		Messages:  messages,
+		Reactions: reactions,
+		Counters:  counters,
 	})
 	if err != nil {
 		t.Fatalf("NewWorker(): %v", err)

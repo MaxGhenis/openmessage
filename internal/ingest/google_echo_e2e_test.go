@@ -143,6 +143,204 @@ func TestGoogleEchoUnknownTmpIDsAreSuccessfulNoops(t *testing.T) {
 	}
 }
 
+func TestGoogleEmbeddedReactionSnapshotsReconcileAbsenceAndStaleReplay(t *testing.T) {
+	const (
+		remoteMessageID  = "google-reaction-target"
+		alice            = "+15550000001"
+		bob              = "+15550000002"
+		localParticipant = "+15550000003"
+	)
+	harness := newGoogleEchoHarness(t, nil)
+	withReactions := func(
+		occurredAt time.Time,
+		reactions ...*gmproto.ReactionEntry,
+	) *gmproto.Message {
+		message := googleEchoMessage(
+			remoteMessageID,
+			"",
+			"Google reaction target",
+			false,
+			occurredAt,
+		)
+		message.Reactions = reactions
+		return message
+	}
+	fullSnapshot := func(occurredAt time.Time) *gmproto.Message {
+		return withReactions(
+			occurredAt,
+			&gmproto.ReactionEntry{
+				Data:           &gmproto.ReactionData{Unicode: "👍"},
+				ParticipantIDs: []string{alice, bob},
+			},
+			&gmproto.ReactionEntry{
+				Data:           &gmproto.ReactionData{Unicode: "❤️"},
+				ParticipantIDs: []string{localParticipant},
+			},
+		)
+	}
+
+	harness.appendMessage(t, fullSnapshot(googleEchoNow))
+	harness.waitFor(t, "initial Google reaction snapshot", func(snapshot CounterSnapshot) bool {
+		return snapshot.Projected == 1 && snapshot.ReactionsApplied == 3
+	})
+	target, err := harness.messages.GetMessageByRemote(
+		context.Background(),
+		googleEchoAccountID,
+		googleEchoConversationID,
+		remoteMessageID,
+	)
+	if err != nil {
+		t.Fatalf("GetMessageByRemote(Google reaction target): %v", err)
+	}
+	rows := activeReactionRows(t, harness.reactions, target.MessageID)
+	if len(rows) != 3 {
+		t.Fatalf("initial Google reaction rows = %+v, want three", rows)
+	}
+	assertReactionByCanonical(t, rows, map[string]string{
+		alice: "👍", bob: "👍", localParticipant: "❤️",
+	})
+	if got := countSQLiteRows(t, harness.storePath, `
+		SELECT COUNT(*)
+		FROM reactions
+		WHERE message_id = ?
+		  AND reactor_key = 'self'
+	`, target.MessageID); got != 0 {
+		t.Fatalf("Google self-key reaction rows = %d, want participant identity key", got)
+	}
+
+	// Google identifies the local reactor by participant number, not "self";
+	// a re-delivery must still converge to one row for that participant.
+	harness.clock.Set(googleEchoNow.Add(time.Minute))
+	harness.appendMessage(t, fullSnapshot(googleEchoNow.Add(time.Minute)))
+	harness.waitFor(t, "idempotent Google own-reaction re-delivery", func(snapshot CounterSnapshot) bool {
+		return snapshot.Projected == 2 && snapshot.ReactionsApplied == 3 && snapshot.ReactionsRemoved == 0
+	})
+	rows = activeReactionRows(t, harness.reactions, target.MessageID)
+	assertReactionByCanonical(t, rows, map[string]string{
+		alice: "👍", bob: "👍", localParticipant: "❤️",
+	})
+
+	harness.clock.Set(googleEchoNow.Add(2 * time.Minute))
+	harness.appendMessage(t, withReactions(
+		googleEchoNow.Add(2*time.Minute),
+		&gmproto.ReactionEntry{
+			Data:           &gmproto.ReactionData{Unicode: "👍"},
+			ParticipantIDs: []string{alice},
+		},
+	))
+	harness.waitFor(t, "Google reaction removal by absence", func(snapshot CounterSnapshot) bool {
+		return snapshot.Projected == 3 && snapshot.ReactionsApplied == 3 && snapshot.ReactionsRemoved == 2
+	})
+	assertSingleActiveReaction(t, harness.reactions, target.MessageID, "👍", alice, false)
+	if got := countSQLiteRows(t, harness.storePath, `
+		SELECT COUNT(*)
+		FROM reactions
+		WHERE message_id = ? AND state = 'removed'
+	`, target.MessageID); got != 2 {
+		t.Fatalf("Google reaction tombstones = %d, want two removals by absence", got)
+	}
+
+	harness.clock.Set(googleEchoNow.Add(3 * time.Minute))
+	harness.appendMessage(t, withReactions(
+		googleEchoNow.Add(3*time.Minute),
+		&gmproto.ReactionEntry{
+			Data:           &gmproto.ReactionData{Unicode: "😂"},
+			ParticipantIDs: []string{alice},
+		},
+	))
+	harness.waitFor(t, "Google reaction emoji switch", func(snapshot CounterSnapshot) bool {
+		return snapshot.Projected == 4 && snapshot.ReactionsApplied == 4 && snapshot.ReactionsRemoved == 2
+	})
+	assertSingleActiveReaction(t, harness.reactions, target.MessageID, "😂", alice, false)
+
+	// The inbox stores receipt order from the injected clock. A later-drained
+	// frame with an older receipt sequence must not overwrite the current set.
+	harness.clock.Set(googleEchoNow.Add(150 * time.Second))
+	harness.appendMessage(t, withReactions(
+		googleEchoNow.Add(3*time.Minute),
+		&gmproto.ReactionEntry{
+			Data:           &gmproto.ReactionData{Unicode: "😂"},
+			ParticipantIDs: []string{bob},
+		},
+	))
+	harness.waitFor(t, "stale Google reaction snapshot processing", func(snapshot CounterSnapshot) bool {
+		return snapshot.Projected == 5
+	})
+	assertSingleActiveReaction(t, harness.reactions, target.MessageID, "😂", alice, false)
+	if snapshot := harness.counters.Snapshot(googleEchoAccountID); snapshot.ReactionsApplied != 4 || snapshot.ReactionsRemoved != 2 || snapshot.Quarantined != 0 {
+		t.Fatalf("Google stale snapshot counters = %+v", snapshot)
+	}
+}
+
+func TestGoogleTapbackReactionIsCountedOrphanNotQuarantined(t *testing.T) {
+	harness := newGoogleEchoHarness(t, nil)
+	message := googleEchoMessage(
+		"google-tapback-message",
+		"",
+		`Liked "a quoted message"`,
+		false,
+		googleEchoNow,
+	)
+	harness.appendMessage(t, message)
+	harness.waitFor(t, "Google tapback orphan", func(snapshot CounterSnapshot) bool {
+		return snapshot.Projected == 1 && snapshot.ReactionsOrphaned == 1
+	})
+	snapshot := harness.counters.Snapshot(googleEchoAccountID)
+	if snapshot.TapbackMessages != 1 || snapshot.Quarantined != 0 ||
+		snapshot.ReactionsApplied != 0 || snapshot.ReactionsRemoved != 0 {
+		t.Fatalf("Google tapback counters = %+v", snapshot)
+	}
+	i01AssertNoPending(t, harness.messages)
+}
+
+func TestGoogleReactionSnapshotBindsToRepointedOutgoingMessage(t *testing.T) {
+	harness := newGoogleEchoHarness(t, nil)
+	submission, requestID := harness.enqueueAndConfirm(
+		t,
+		"reaction-repoint",
+		"outgoing Google reaction target",
+	)
+	message := googleEchoMessage(
+		"google-reaction-repointed",
+		requestID,
+		"outgoing Google reaction target",
+		true,
+		googleEchoNow.Add(time.Minute),
+	)
+	message.Reactions = []*gmproto.ReactionEntry{{
+		Data:           &gmproto.ReactionData{Unicode: "👍"},
+		ParticipantIDs: []string{"+15550000005"},
+	}}
+	harness.appendMessage(t, message)
+	harness.waitFor(t, "Google reaction on repointed outgoing message", func(snapshot CounterSnapshot) bool {
+		return snapshot.Projected == 1 && snapshot.ReactionsApplied == 1
+	})
+
+	target, err := harness.messages.GetMessageByRemote(
+		context.Background(),
+		googleEchoAccountID,
+		googleEchoConversationID,
+		"google-reaction-repointed",
+	)
+	if err != nil {
+		t.Fatalf("GetMessageByRemote(repointed reaction target): %v", err)
+	}
+	if target.MessageID != submission.LocalMessageID {
+		t.Fatalf("repointed target ID = %q, want local ID %q", target.MessageID, submission.LocalMessageID)
+	}
+	assertSingleActiveReaction(
+		t,
+		harness.reactions,
+		submission.LocalMessageID,
+		"👍",
+		"+15550000005",
+		false,
+	)
+	if snapshot := harness.counters.Snapshot(googleEchoAccountID); snapshot.Quarantined != 0 {
+		t.Fatalf("Google reaction repoint counters = %+v", snapshot)
+	}
+}
+
 func TestGoogleIngestDoesNotFeedLegacyProjector(t *testing.T) {
 	harness := newGoogleEchoHarness(t, nil)
 	legacy, err := db.New(filepath.Join(t.TempDir(), "legacy.sqlite3"))
@@ -151,15 +349,20 @@ func TestGoogleIngestDoesNotFeedLegacyProjector(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = legacy.Close() })
 
-	harness.appendMessage(t, googleEchoMessage(
+	message := googleEchoMessage(
 		"google-inbound-no-feedback",
 		"",
 		"inbound must stay v2-only",
 		false,
 		googleEchoNow.Add(4*time.Minute),
-	))
+	)
+	message.Reactions = []*gmproto.ReactionEntry{{
+		Data:           &gmproto.ReactionData{Unicode: "👍"},
+		ParticipantIDs: []string{"+15550000004"},
+	}}
+	harness.appendMessage(t, message)
 	harness.waitFor(t, "inbound projection", func(snapshot CounterSnapshot) bool {
-		return snapshot.Projected == 1
+		return snapshot.Projected == 1 && snapshot.ReactionsApplied == 1
 	})
 	if got := harness.countOutboxRows(t); got != 0 {
 		t.Fatalf("outbox rows after inbound ingest = %d, want zero", got)
@@ -293,6 +496,7 @@ type googleEchoHarness struct {
 	store     *sqlite.Store
 	storePath string
 	messages  *sqlite.MessageRepository
+	reactions *sqlite.ReactionRepository
 	service   *messaging.MessageService
 	sink      *Sink
 	worker    *Worker
@@ -331,6 +535,10 @@ func newGoogleEchoHarness(t *testing.T, decoder bridge.Decoder) *googleEchoHarne
 	if err != nil {
 		t.Fatalf("NewMessageRepository(): %v", err)
 	}
+	reactions, err := sqlite.NewReactionRepository(store, clock.Now)
+	if err != nil {
+		t.Fatalf("NewReactionRepository(): %v", err)
+	}
 	counters := &Counters{}
 	if decoder == nil {
 		decoder = NewGoogleDecoder(counters)
@@ -338,6 +546,7 @@ func newGoogleEchoHarness(t *testing.T, decoder bridge.Decoder) *googleEchoHarne
 	worker, err := NewWorker(WorkerConfig{
 		Store:        store,
 		Messages:     messages,
+		Reactions:    reactions,
 		EchoObserver: service,
 		Counters:     counters,
 		Logger:       zerolog.Nop(),
@@ -368,6 +577,7 @@ func newGoogleEchoHarness(t *testing.T, decoder bridge.Decoder) *googleEchoHarne
 		store:     store,
 		storePath: storePath,
 		messages:  messages,
+		reactions: reactions,
 		service:   service,
 		sink:      sink,
 		worker:    worker,
@@ -707,6 +917,12 @@ func (c *googleEchoClock) Now() time.Time {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.now
+}
+
+func (c *googleEchoClock) Set(now time.Time) {
+	c.mu.Lock()
+	c.now = now
+	c.mu.Unlock()
 }
 
 func (c *googleEchoClock) NewTimer(delay time.Duration) messaging.Timer {

@@ -415,6 +415,12 @@ func decodeSignalReaction(
 	if reaction.IsRemove {
 		action = bridge.ReactionRemove
 	}
+	emoji := strings.TrimSpace(reaction.Emoji)
+	if !reaction.IsRemove && emoji == "" {
+		// Out-of-contract signal-cli frame: removals are explicit via isRemove.
+		// WhatsApp's empty-emoji=remove convention does not apply here.
+		return nil
+	}
 	return &bridge.Event{
 		Kind: bridge.EventReaction,
 		Reaction: &bridge.ReactionEvent{
@@ -425,7 +431,7 @@ func decodeSignalReaction(
 				Name:   strings.TrimSpace(actorName),
 				IsSelf: actorIsSelf,
 			},
-			Emoji:      strings.TrimSpace(reaction.Emoji),
+			Emoji:      emoji,
 			Action:     action,
 			OccurredAt: time.UnixMilli(timestamp),
 		},

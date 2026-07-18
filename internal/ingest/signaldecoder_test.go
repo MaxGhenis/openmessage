@@ -369,6 +369,10 @@ func TestSignalDecoderSkipsNonProjectingEnvelopes(t *testing.T) {
 			line: `{"account":"+15551230000","envelope":{"sourceNumber":"+15551234567","timestamp":1700000000123}}`,
 		},
 		{
+			name: "empty emoji non-remove reaction",
+			line: `{"account":"+15551230000","envelope":{"sourceNumber":"+15551234567","timestamp":1700000000123,"dataMessage":{"reaction":{"emoji":"","targetSentTimestamp":1700000000999,"targetAuthorNumber":"+15551230000"}}}}`,
+		},
+		{
 			name: "missing inbound source",
 			line: `{"account":"+15551230000","envelope":{"timestamp":1700000000123,"dataMessage":{"timestamp":1700000000123,"message":"quarantined by legacy"}}}`,
 		},
@@ -408,6 +412,23 @@ func TestSignalDecoderSkipsNonProjectingEnvelopes(t *testing.T) {
 				t.Fatalf("Decode() = %+v, want %d events", events, test.wantEvents)
 			}
 		})
+	}
+}
+
+func TestSignalWorkerDoesNotQuarantineEmptyEmojiNonRemoveReaction(t *testing.T) {
+	harness := newSignalWorkerHarness(t, "empty-reaction.sqlite3")
+	harness.start(t)
+	record := mustBuildSignalRecord(t, []byte(`{"account":"+15551230000","envelope":{"sourceNumber":"+15551234567","timestamp":1700000000123,"dataMessage":{"reaction":{"emoji":"   ","targetSentTimestamp":1700000000999,"targetAuthorNumber":"+15551230000"}}}}`))
+	if err := harness.sink.AppendIngress(context.Background(), record); err != nil {
+		t.Fatalf("AppendIngress(): %v", err)
+	}
+	waitSignalCondition(t, "Signal empty-emoji reaction processed", func() bool {
+		pending, err := harness.messages.Unprocessed(context.Background())
+		return err == nil && len(pending) == 0
+	})
+	snapshot := harness.counters.Snapshot(signalDecoderAccountID)
+	if snapshot.Quarantined != 0 || snapshot.ReactionsApplied != 0 || snapshot.ReactionsRemoved != 0 {
+		t.Fatalf("Signal empty-emoji reaction counters = %+v, want no quarantine or reaction changes", snapshot)
 	}
 }
 
@@ -650,6 +671,78 @@ func TestSignalOutgoingAliasConvergesThroughRealDecoderAndWorker(t *testing.T) {
 	}
 }
 
+func TestSignalReactionDeltasResolveLocalAliasAndSelfEchoIdempotently(t *testing.T) {
+	const (
+		remoteConversationID = "signal:+15551234567"
+		conversationID       = "signal-reaction-conversation"
+		targetTimestamp      = int64(1_700_000_000_999)
+		targetMessageID      = "signal-reaction-target"
+	)
+	harness := newSignalWorkerHarness(t, "reaction-alias.sqlite3")
+	seedSignalConversation(t, harness.store, conversationID, remoteConversationID)
+	alias := v2keys.SignalLocalAlias(remoteConversationID, targetTimestamp)
+	seedSignalMessage(
+		t,
+		harness.messages,
+		targetMessageID,
+		conversationID,
+		alias,
+		"migrated local target",
+		targetTimestamp,
+	)
+	harness.start(t)
+
+	appendLine := func(label, line string) bridge.RawIngressRecord {
+		t.Helper()
+		record := mustBuildSignalRecord(t, []byte(line))
+		if err := harness.sink.AppendIngress(context.Background(), record); err != nil {
+			t.Fatalf("AppendIngress(%s): %v", label, err)
+		}
+		return record
+	}
+
+	appendLine("inbound add", `{"account":"+15551230000","envelope":{"sourceNumber":"+15551234567","sourceName":"Taylor","timestamp":1700000003123,"dataMessage":{"timestamp":1700000003123,"reaction":{"emoji":"👍","target":{"timestamp":1700000000999,"authorNumber":"+15551230000"}}}}}`)
+	waitSignalCondition(t, "Signal inbound reaction add through local alias", func() bool {
+		return harness.counters.Snapshot(signalDecoderAccountID).ReactionsApplied == 1
+	})
+	assertSingleActiveReaction(t, harness.reactions, targetMessageID, "👍", "+15551234567", false)
+
+	appendLine("inbound remove", `{"account":"+15551230000","envelope":{"sourceNumber":"+15551234567","sourceName":"Taylor","timestamp":1700000004123,"dataMessage":{"timestamp":1700000004123,"reaction":{"emoji":"👍","target":{"timestamp":1700000000999,"authorNumber":"+15551230000"},"isRemove":true}}}}`)
+	waitSignalCondition(t, "Signal inbound reaction remove", func() bool {
+		return harness.counters.Snapshot(signalDecoderAccountID).ReactionsRemoved == 1
+	})
+	assertNoActiveReactions(t, harness.reactions, targetMessageID)
+
+	selfRecord := appendLine("sent self add", `{"account":"+15551230000","envelope":{"sourceNumber":"+15551230000","timestamp":1700000005123,"syncMessage":{"sentMessage":{"timestamp":1700000005123,"destinationNumber":"+15551234567","reaction":{"emoji":"🔥","targetSentTimestamp":1700000000999,"targetAuthorNumber":"+15551230000"}}}}}`)
+	waitSignalCondition(t, "Signal sent self-reaction echo", func() bool {
+		return harness.counters.Snapshot(signalDecoderAccountID).ReactionsApplied == 2
+	})
+	assertSingleActiveReaction(t, harness.reactions, targetMessageID, "🔥", "", true)
+
+	// Replaying the same durable echo must converge on the same self row.
+	if err := harness.sink.AppendIngress(context.Background(), selfRecord); err != nil {
+		t.Fatalf("AppendIngress(sent self replay): %v", err)
+	}
+	waitSignalCondition(t, "Signal sent self-reaction replay", func() bool {
+		snapshot := harness.counters.Snapshot(signalDecoderAccountID)
+		return snapshot.Deduped == 1 && snapshot.DecodedEvents == 4
+	})
+	assertSingleActiveReaction(t, harness.reactions, targetMessageID, "🔥", "", true)
+
+	appendLine("orphan", `{"account":"+15551230000","envelope":{"sourceNumber":"+15551234567","sourceName":"Taylor","timestamp":1700000006123,"dataMessage":{"timestamp":1700000006123,"reaction":{"emoji":"😂","target":{"timestamp":1700000000888,"authorNumber":"+15551230000"}}}}}`)
+	waitSignalCondition(t, "Signal orphan reaction", func() bool {
+		return harness.counters.Snapshot(signalDecoderAccountID).ReactionsOrphaned == 1
+	})
+	snapshot := harness.counters.Snapshot(signalDecoderAccountID)
+	if snapshot.ReactionsApplied != 2 || snapshot.ReactionsRemoved != 1 ||
+		snapshot.ReactionsOrphaned != 1 || snapshot.Quarantined != 0 {
+		t.Fatalf("Signal reaction counters = %+v", snapshot)
+	}
+	if got := countSignalReactionRows(t, harness.path, targetMessageID); got != 2 {
+		t.Fatalf("Signal reaction rows = %d, want one actor tombstone plus one self row", got)
+	}
+}
+
 func TestSignalMigrationOutputConvergesWithLiveDecoder(t *testing.T) {
 	const (
 		remoteConversationID = "signal:+16505550100"
@@ -772,13 +865,14 @@ func TestSignalMigrationOutputConvergesWithLiveDecoder(t *testing.T) {
 }
 
 type signalWorkerHarness struct {
-	path     string
-	store    *sqlite.Store
-	messages *sqlite.MessageRepository
-	counters *Counters
-	worker   *Worker
-	sink     *Sink
-	started  bool
+	path      string
+	store     *sqlite.Store
+	messages  *sqlite.MessageRepository
+	reactions *sqlite.ReactionRepository
+	counters  *Counters
+	worker    *Worker
+	sink      *Sink
+	started   bool
 }
 
 func newSignalWorkerHarness(t *testing.T, filename string) *signalWorkerHarness {
@@ -820,12 +914,20 @@ func newSignalWorkerHarnessForStore(
 ) *signalWorkerHarness {
 	t.Helper()
 	counters := &Counters{}
+	reactions, err := sqlite.NewReactionRepository(
+		store,
+		func() time.Time { return signalDecoderReceivedAt },
+	)
+	if err != nil {
+		t.Fatalf("NewReactionRepository(): %v", err)
+	}
 	worker, err := NewWorker(WorkerConfig{
-		Store:    store,
-		Messages: messages,
-		Counters: counters,
-		Logger:   zerolog.Nop(),
-		Now:      func() time.Time { return signalDecoderReceivedAt },
+		Store:     store,
+		Messages:  messages,
+		Reactions: reactions,
+		Counters:  counters,
+		Logger:    zerolog.Nop(),
+		Now:       func() time.Time { return signalDecoderReceivedAt },
 		Decoders: []DecoderRegistration{{
 			Codec:    SignalJSONRPCCodec,
 			Platform: bridge.PlatformSignal,
@@ -849,7 +951,8 @@ func newSignalWorkerHarnessForStore(
 	}
 	return &signalWorkerHarness{
 		path: path, store: store, messages: messages,
-		counters: counters, worker: worker, sink: sink,
+		reactions: reactions,
+		counters:  counters, worker: worker, sink: sink,
 	}
 }
 
@@ -988,6 +1091,24 @@ func countSignalRows(t *testing.T, path, table string) int {
 	query := "SELECT COUNT(*) FROM " + table + " WHERE account_id = ?"
 	if err := database.QueryRow(query, signalDecoderAccountID).Scan(&count); err != nil {
 		t.Fatalf("count %s: %v", table, err)
+	}
+	return count
+}
+
+func countSignalReactionRows(t *testing.T, path, messageID string) int {
+	t.Helper()
+	database, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("sql.Open(reactions): %v", err)
+	}
+	defer database.Close()
+	var count int
+	if err := database.QueryRow(`
+		SELECT COUNT(*)
+		FROM reactions
+		WHERE message_id = ?
+	`, messageID).Scan(&count); err != nil {
+		t.Fatalf("count reactions: %v", err)
 	}
 	return count
 }

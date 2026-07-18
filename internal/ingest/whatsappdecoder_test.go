@@ -492,6 +492,133 @@ func TestWhatsAppHistorySyncWorkerProjectsFirstAndImportsSecond(t *testing.T) {
 	i01AssertNoPending(t, harness.messages)
 }
 
+func TestWhatsAppReactionDeltasApplySwitchRemoveAndOrphanThroughWorker(t *testing.T) {
+	harness := newWhatsAppWorkerHarness(t)
+	appendFrame := func(
+		label string,
+		envelope whatsAppFrameEnvelope,
+		message *waE2E.Message,
+	) bridge.RawIngressRecord {
+		t.Helper()
+		record, protoBytes := waMessageRecord(t, envelope, message)
+		record.AccountID = waWorkerAccountID
+		record.DedupeKey = "reaction:" + label + ":" + waHash8(protoBytes)
+		record.ReceivedAt = waWorkerNow.Add(time.Duration(envelope.TimestampMS-waTimestampMS) * time.Millisecond)
+		if err := harness.sink.AppendIngress(context.Background(), record); err != nil {
+			t.Fatalf("AppendIngress(%s): %v", label, err)
+		}
+		return record
+	}
+
+	targetEnvelope := waBaseMessageEnvelope()
+	targetEnvelope.MessageID = "reaction-target"
+	appendFrame(
+		"target",
+		targetEnvelope,
+		&waE2E.Message{Conversation: proto.String("react to this")},
+	)
+	i01WaitFor(t, "WhatsApp reaction target projection", func() bool {
+		return harness.counters.Snapshot(waWorkerAccountID).Projected == 1
+	})
+	conversation, err := harness.store.GetConversationByRemote(
+		waWorkerAccountID,
+		"whatsapp:"+waCanonicalChatJID,
+	)
+	if err != nil {
+		t.Fatalf("GetConversationByRemote(): %v", err)
+	}
+	target, err := harness.messages.GetMessageByRemote(
+		context.Background(),
+		waWorkerAccountID,
+		conversation.ConversationID,
+		"reaction-target",
+	)
+	if err != nil {
+		t.Fatalf("GetMessageByRemote(reaction target): %v", err)
+	}
+
+	reactionFrame := func(
+		label string,
+		targetID string,
+		emoji string,
+		occurredAtMS int64,
+		fromMe bool,
+	) bridge.RawIngressRecord {
+		envelope := waBaseMessageEnvelope()
+		envelope.MessageID = "reaction-envelope-" + label
+		envelope.TimestampMS = occurredAtMS
+		envelope.IsFromMe = fromMe
+		return appendFrame(label, envelope, &waE2E.Message{ReactionMessage: &waE2E.ReactionMessage{
+			Key:  &waCommon.MessageKey{ID: proto.String(targetID)},
+			Text: proto.String(emoji),
+		}})
+	}
+
+	changes := harness.worker.Changes()
+	reactionFrame("add", "reaction-target", "👍", waTimestampMS+100, false)
+	i01WaitFor(t, "WhatsApp reaction add", func() bool {
+		return harness.counters.Snapshot(waWorkerAccountID).ReactionsApplied == 1
+	})
+	assertWorkerChangeClosed(t, changes, "WhatsApp reaction add")
+	assertSingleActiveReaction(t, harness.reactions, target.MessageID, "👍", "+14155550200", false)
+
+	// WhatsApp represents a switch as another add delta by the same reactor.
+	reactionFrame("switch", "reaction-target", "❤️", waTimestampMS+200, false)
+	i01WaitFor(t, "WhatsApp reaction switch", func() bool {
+		return harness.counters.Snapshot(waWorkerAccountID).ReactionsApplied == 2
+	})
+	assertSingleActiveReaction(t, harness.reactions, target.MessageID, "❤️", "+14155550200", false)
+
+	reactionFrame("remove", "reaction-target", "", waTimestampMS+300, false)
+	i01WaitFor(t, "WhatsApp reaction removal", func() bool {
+		return harness.counters.Snapshot(waWorkerAccountID).ReactionsRemoved == 1
+	})
+	assertNoActiveReactions(t, harness.reactions, target.MessageID)
+	if got := i01QueryInt64(t, harness.path, `
+		SELECT COUNT(*)
+		FROM reactions
+		WHERE message_id = ? AND state = 'removed' AND emoji = '❤️'
+	`, target.MessageID); got != 1 {
+		t.Fatalf("retained WhatsApp tombstones = %d, want 1", got)
+	}
+
+	// A late WAL-drain add that predates the removal must not resurrect it.
+	reactionFrame("stale-add", "reaction-target", "😂", waTimestampMS+250, false)
+	i01WaitFor(t, "WhatsApp stale reaction frame processing", func() bool {
+		pending, err := harness.messages.Unprocessed(context.Background())
+		return err == nil && len(pending) == 0
+	})
+	assertNoActiveReactions(t, harness.reactions, target.MessageID)
+	snapshot := harness.counters.Snapshot(waWorkerAccountID)
+	if snapshot.ReactionsApplied != 2 || snapshot.ReactionsRemoved != 1 {
+		t.Fatalf("counters after stale reaction = %+v, want applied=2 removed=1", snapshot)
+	}
+
+	selfRecord := reactionFrame("self", "reaction-target", "🔥", waTimestampMS+400, true)
+	i01WaitFor(t, "WhatsApp self-reaction echo", func() bool {
+		return harness.counters.Snapshot(waWorkerAccountID).ReactionsApplied == 3
+	})
+	assertSingleActiveReaction(t, harness.reactions, target.MessageID, "🔥", "", true)
+	if err := harness.sink.AppendIngress(context.Background(), selfRecord); err != nil {
+		t.Fatalf("AppendIngress(self reaction replay): %v", err)
+	}
+	i01WaitFor(t, "WhatsApp self-reaction replay", func() bool {
+		snapshot := harness.counters.Snapshot(waWorkerAccountID)
+		return snapshot.Deduped == 1 && snapshot.DecodedEvents == 7
+	})
+	assertSingleActiveReaction(t, harness.reactions, target.MessageID, "🔥", "", true)
+
+	reactionFrame("orphan", "missing-reaction-target", "👍", waTimestampMS+500, false)
+	i01WaitFor(t, "WhatsApp orphan reaction", func() bool {
+		return harness.counters.Snapshot(waWorkerAccountID).ReactionsOrphaned == 1
+	})
+	snapshot = harness.counters.Snapshot(waWorkerAccountID)
+	if snapshot.Quarantined != 0 {
+		t.Fatalf("orphan reaction counters = %+v, want no quarantine", snapshot)
+	}
+	i01AssertNoPending(t, harness.messages)
+}
+
 func TestWhatsAppIngressDedupeUsesMessageIDAndProtoHash(t *testing.T) {
 	harness := newWhatsAppWorkerHarness(t)
 	envelope := waBaseMessageEnvelope()
@@ -615,12 +742,13 @@ func TestWhatsAppDecoderRejectsMalformedBoundaries(t *testing.T) {
 }
 
 type whatsAppWorkerHarness struct {
-	path     string
-	store    *sqlite.Store
-	messages *sqlite.MessageRepository
-	counters *Counters
-	worker   *Worker
-	sink     *Sink
+	path      string
+	store     *sqlite.Store
+	messages  *sqlite.MessageRepository
+	reactions *sqlite.ReactionRepository
+	counters  *Counters
+	worker    *Worker
+	sink      *Sink
 }
 
 func newWhatsAppWorkerHarness(t *testing.T) *whatsAppWorkerHarness {
@@ -652,14 +780,19 @@ func newWhatsAppWorkerHarness(t *testing.T) *whatsAppWorkerHarness {
 	if err != nil {
 		t.Fatalf("NewMessageRepository(): %v", err)
 	}
+	reactions, err := sqlite.NewReactionRepository(store, now)
+	if err != nil {
+		t.Fatalf("NewReactionRepository(): %v", err)
+	}
 	counters := &Counters{}
 	worker, err := NewWorker(WorkerConfig{
-		Store:    store,
-		Messages: messages,
-		Counters: counters,
-		Logger:   zerolog.Nop(),
-		Now:      now,
-		Decoders: []DecoderRegistration{NewWhatsAppDecoderRegistration()},
+		Store:     store,
+		Messages:  messages,
+		Reactions: reactions,
+		Counters:  counters,
+		Logger:    zerolog.Nop(),
+		Now:       now,
+		Decoders:  []DecoderRegistration{NewWhatsAppDecoderRegistration()},
 	})
 	if err != nil {
 		t.Fatalf("NewWorker(): %v", err)
@@ -667,12 +800,13 @@ func newWhatsAppWorkerHarness(t *testing.T) *whatsAppWorkerHarness {
 	sink := i01NewSink(t, messages, worker, counters, "whatsapp-inbox")
 	i01StartWorker(t, worker)
 	return &whatsAppWorkerHarness{
-		path:     path,
-		store:    store,
-		messages: messages,
-		counters: counters,
-		worker:   worker,
-		sink:     sink,
+		path:      path,
+		store:     store,
+		messages:  messages,
+		reactions: reactions,
+		counters:  counters,
+		worker:    worker,
+		sink:      sink,
 	}
 }
 

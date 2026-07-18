@@ -36,6 +36,7 @@ type DecoderRegistration struct {
 type WorkerConfig struct {
 	Store         *sqlite.Store
 	Messages      *sqlite.MessageRepository
+	Reactions     *sqlite.ReactionRepository
 	EchoObserver  EchoObserver
 	Counters      *Counters
 	Logger        zerolog.Logger
@@ -56,18 +57,26 @@ type workItem struct {
 	replay  bool
 }
 
+type googleReactionSnapshot struct {
+	accountID      string
+	conversationID string
+	messageID      string
+	entries        []sqlite.ReactionSnapshotEntry
+}
+
 // Worker drains durable inbox records and applies normalized events without
 // touching the legacy store.
 type Worker struct {
-	store    *sqlite.Store
-	messages *sqlite.MessageRepository
-	echoes   EchoObserver
-	counters *Counters
-	logger   zerolog.Logger
-	now      func() time.Time
-	decoders map[string]registeredDecoder
-	work     chan workItem
-	running  atomic.Bool
+	store     *sqlite.Store
+	messages  *sqlite.MessageRepository
+	reactions *sqlite.ReactionRepository
+	echoes    EchoObserver
+	counters  *Counters
+	logger    zerolog.Logger
+	now       func() time.Time
+	decoders  map[string]registeredDecoder
+	work      chan workItem
+	running   atomic.Bool
 
 	changeMu sync.Mutex
 	changed  chan struct{}
@@ -81,6 +90,9 @@ func NewWorker(config WorkerConfig) (*Worker, error) {
 	}
 	if config.Messages == nil {
 		return nil, fmt.Errorf("create ingest worker: message repository is nil")
+	}
+	if config.Reactions == nil {
+		return nil, fmt.Errorf("create ingest worker: reaction repository is nil")
 	}
 	if config.Counters == nil {
 		config.Counters = &Counters{}
@@ -120,15 +132,16 @@ func NewWorker(config WorkerConfig) (*Worker, error) {
 	}
 
 	return &Worker{
-		store:    config.Store,
-		messages: config.Messages,
-		echoes:   config.EchoObserver,
-		counters: config.Counters,
-		logger:   config.Logger,
-		now:      config.Now,
-		decoders: decoders,
-		work:     make(chan workItem, config.QueueCapacity),
-		changed:  make(chan struct{}),
+		store:     config.Store,
+		messages:  config.Messages,
+		reactions: config.Reactions,
+		echoes:    config.EchoObserver,
+		counters:  config.Counters,
+		logger:    config.Logger,
+		now:       config.Now,
+		decoders:  decoders,
+		work:      make(chan workItem, config.QueueCapacity),
+		changed:   make(chan struct{}),
 	}, nil
 }
 
@@ -252,6 +265,7 @@ func (w *Worker) handleRecord(
 	if err == nil || ctx.Err() != nil {
 		return changed
 	}
+	partialChanged := changed
 	changed = false
 
 	var stale staleReplayError
@@ -269,7 +283,7 @@ func (w *Worker) handleRecord(
 	var deterministic quarantineError
 	if errors.As(err, &deterministic) {
 		w.markQuarantined(ctx, inboxID, record, deterministic.cause)
-		return false
+		return partialChanged
 	}
 
 	var exhausted transientExhaustedError
@@ -280,11 +294,11 @@ func (w *Worker) handleRecord(
 			Str("inbox_id", inboxID).
 			Str("codec", record.Codec).
 			Msg("Ingest projection exhausted transient retries; leaving frame unprocessed")
-		return false
+		return partialChanged
 	}
 
 	w.markQuarantined(ctx, inboxID, record, err)
-	return false
+	return partialChanged
 }
 
 func (w *Worker) markQuarantined(
@@ -420,6 +434,8 @@ func (w *Worker) applyEvents(
 ) (bool, error) {
 	accountID := record.AccountID
 	changed := false
+	googleSnapshots := make(map[string]*googleReactionSnapshot)
+	googleSnapshotOrder := make([]string, 0)
 	for _, event := range events {
 		if event.Kind != bridge.EventConversation {
 			continue
@@ -459,6 +475,22 @@ func (w *Worker) applyEvents(
 			}
 			w.counters.account(accountID).imported.Add(1)
 		}
+		if platform == bridge.PlatformGoogle {
+			// Message upserts preserve the first local primary key on a remote-key
+			// conflict (including an optimistic outgoing row repointed by the echo
+			// observer). Recover that effective parent before binding the embedded
+			// snapshot; projection.MessageID is only the would-be derived key.
+			effective, err := w.messages.GetMessageByRemote(
+				ctx,
+				projection.Message.AccountID,
+				projection.Message.ConversationID,
+				projection.Message.RemoteMessageID,
+			)
+			if err != nil {
+				return false, err
+			}
+			projection.Message.MessageID = effective.MessageID
+		}
 		changed = true
 		// Conversation rows are never re-upserted from message frames, so
 		// recency advances through this targeted monotone bump instead.
@@ -467,6 +499,21 @@ func (w *Worker) applyEvents(
 			projection.Message.OccurredAtMS,
 		); err != nil {
 			return false, err
+		}
+		if platform == bridge.PlatformGoogle {
+			key := reactionRemoteTargetKey(
+				platform,
+				event.Message.RemoteConversationID,
+				event.Message.RemoteMessageID,
+			)
+			if _, exists := googleSnapshots[key]; !exists {
+				googleSnapshotOrder = append(googleSnapshotOrder, key)
+			}
+			googleSnapshots[key] = &googleReactionSnapshot{
+				accountID:      projection.Message.AccountID,
+				conversationID: projection.Message.ConversationID,
+				messageID:      projection.Message.MessageID,
+			}
 		}
 		messageCount++
 	}
@@ -517,9 +564,102 @@ func (w *Worker) applyEvents(
 		}
 	}
 
-	for _, event := range events {
-		if event.Kind == bridge.EventReaction {
-			w.counters.account(accountID).reactionsDropped.Add(1)
+	if platform == bridge.PlatformGoogle {
+		for _, event := range events {
+			if event.Kind != bridge.EventReaction {
+				continue
+			}
+			reaction := *event.Reaction
+			key := reactionRemoteTargetKey(
+				platform,
+				reaction.RemoteConversationID,
+				reaction.TargetRemoteMessageID,
+			)
+			snapshot, exists := googleSnapshots[key]
+			if strings.TrimSpace(reaction.TargetRemoteMessageID) == "" || !exists {
+				w.countOrphanReaction(accountID, inboxID, reaction)
+				continue
+			}
+			entry, ok, err := w.prepareReactionSnapshotEntry(accountID, platform, reaction)
+			if err != nil {
+				return changed, err
+			}
+			if !ok {
+				continue
+			}
+			snapshot.entries = append(snapshot.entries, entry)
+		}
+
+		sourceSeqMS := record.ReceivedAt.UnixMilli()
+		if sourceSeqMS <= 0 {
+			return changed, fmt.Errorf("reaction snapshot source sequence is not positive")
+		}
+		for _, key := range googleSnapshotOrder {
+			snapshot := googleSnapshots[key]
+			changes, err := w.reactions.ReplaceEmbeddedReactions(
+				ctx,
+				snapshot.messageID,
+				snapshot.accountID,
+				snapshot.conversationID,
+				snapshot.entries,
+				sourceSeqMS,
+			)
+			if err != nil {
+				return changed, err
+			}
+			if changes.Applied > 0 {
+				w.counters.account(accountID).reactionsApplied.Add(uint64(changes.Applied))
+			}
+			if changes.Removed > 0 {
+				w.counters.account(accountID).reactionsRemoved.Add(uint64(changes.Removed))
+			}
+			if changes.Applied > 0 || changes.Removed > 0 {
+				changed = true
+			}
+		}
+	} else {
+		for _, event := range events {
+			if event.Kind != bridge.EventReaction {
+				continue
+			}
+			reaction := *event.Reaction
+			target, found, err := w.resolveReactionTarget(
+				ctx,
+				accountID,
+				platform,
+				reaction,
+			)
+			if err != nil {
+				return changed, err
+			}
+			if !found {
+				w.countOrphanReaction(accountID, inboxID, reaction)
+				continue
+			}
+			apply, err := w.prepareReactionApply(
+				accountID,
+				platform,
+				target,
+				reaction,
+				record.ReceivedAt.UnixMilli(),
+			)
+			if err != nil {
+				return changed, err
+			}
+			applied, err := w.reactions.ApplyReaction(ctx, apply)
+			if err != nil {
+				return changed, err
+			}
+			if !applied {
+				continue
+			}
+			switch reaction.Action {
+			case bridge.ReactionRemove:
+				w.counters.account(accountID).reactionsRemoved.Add(1)
+			default:
+				w.counters.account(accountID).reactionsApplied.Add(1)
+			}
+			changed = true
 		}
 	}
 
@@ -763,6 +903,175 @@ func identityRaw(reference bridge.IdentityRef) string {
 		raw = strings.TrimSpace(reference.Canonical)
 	}
 	return raw
+}
+
+type preparedReactionActor struct {
+	key        string
+	identityID *string
+	isSelf     bool
+	label      string
+}
+
+func (w *Worker) prepareReactionActor(
+	accountID string,
+	platform bridge.Platform,
+	reference bridge.IdentityRef,
+	emoji string,
+) (preparedReactionActor, error) {
+	if reference.IsSelf {
+		return preparedReactionActor{
+			key:    "self",
+			isSelf: true,
+			label:  "me",
+		}, nil
+	}
+	if identityRaw(reference) == "" {
+		// On the delta path, an anonymous remove with an empty emoji derives
+		// "anon:" and cannot correlate with an earlier "anon:<emoji>" add. This
+		// is acceptable: well-formed WhatsApp/Signal frames carry an actor, while
+		// Google snapshots remove absent reactors without using this key.
+		return preparedReactionActor{key: "anon:" + emoji}, nil
+	}
+	identity, err := w.resolveIdentity(accountID, platform, reference)
+	if err != nil {
+		return preparedReactionActor{}, err
+	}
+	identityID := identity.IdentityID
+	return preparedReactionActor{
+		key:        identityID,
+		identityID: &identityID,
+	}, nil
+}
+
+func (w *Worker) prepareReactionSnapshotEntry(
+	accountID string,
+	platform bridge.Platform,
+	reaction bridge.ReactionEvent,
+) (sqlite.ReactionSnapshotEntry, bool, error) {
+	emoji := strings.TrimSpace(reaction.Emoji)
+	if emoji == "" {
+		return sqlite.ReactionSnapshotEntry{}, false, nil
+	}
+	actor, err := w.prepareReactionActor(accountID, platform, reaction.Actor, emoji)
+	if err != nil {
+		return sqlite.ReactionSnapshotEntry{}, false, err
+	}
+	return sqlite.ReactionSnapshotEntry{
+		ReactorKey:        actor.key,
+		ReactorIdentityID: actor.identityID,
+		ReactorIsSelf:     actor.isSelf,
+		ReactorLabel:      actor.label,
+		Emoji:             emoji,
+	}, true, nil
+}
+
+func (w *Worker) prepareReactionApply(
+	accountID string,
+	platform bridge.Platform,
+	target sqlite.Message,
+	reaction bridge.ReactionEvent,
+	sourceSeqMS int64,
+) (sqlite.ReactionApply, error) {
+	actor, err := w.prepareReactionActor(accountID, platform, reaction.Actor, reaction.Emoji)
+	if err != nil {
+		return sqlite.ReactionApply{}, err
+	}
+	occurredAtMS := reaction.OccurredAt.UnixMilli()
+	if occurredAtMS <= 0 {
+		return sqlite.ReactionApply{}, fmt.Errorf("reaction occurrence time is not positive")
+	}
+	if sourceSeqMS <= 0 {
+		return sqlite.ReactionApply{}, fmt.Errorf("reaction source sequence is not positive")
+	}
+	return sqlite.ReactionApply{
+		AccountID:         accountID,
+		ConversationID:    target.ConversationID,
+		MessageID:         target.MessageID,
+		ReactorKey:        actor.key,
+		ReactorIdentityID: actor.identityID,
+		ReactorIsSelf:     actor.isSelf,
+		ReactorLabel:      actor.label,
+		Emoji:             reaction.Emoji,
+		Action:            reaction.Action,
+		OccurredAtMS:      occurredAtMS,
+		SourceSeqMS:       sourceSeqMS,
+	}, nil
+}
+
+func (w *Worker) resolveReactionTarget(
+	ctx context.Context,
+	accountID string,
+	platform bridge.Platform,
+	reaction bridge.ReactionEvent,
+) (sqlite.Message, bool, error) {
+	conversation, remoteConversationID, err := w.existingConversation(
+		accountID,
+		platform,
+		reaction.RemoteConversationID,
+	)
+	if errors.Is(err, sqlite.ErrNotFound) {
+		return sqlite.Message{}, false, nil
+	}
+	if err != nil {
+		return sqlite.Message{}, false, err
+	}
+	targetRemoteID := strings.TrimSpace(reaction.TargetRemoteMessageID)
+	target, err := w.messages.GetMessageByRemote(
+		ctx,
+		accountID,
+		conversation.ConversationID,
+		targetRemoteID,
+	)
+	if err == nil {
+		return target, true, nil
+	}
+	if !errors.Is(err, sqlite.ErrNotFound) {
+		return sqlite.Message{}, false, err
+	}
+	if platform != bridge.PlatformSignal {
+		return sqlite.Message{}, false, nil
+	}
+
+	timestamp, err := strconv.ParseInt(targetRemoteID, 10, 64)
+	if err != nil {
+		return sqlite.Message{}, false, nil
+	}
+	alias := v2keys.SignalLocalAlias(remoteConversationID, timestamp)
+	target, err = w.messages.GetMessageByRemote(
+		ctx,
+		accountID,
+		conversation.ConversationID,
+		alias,
+	)
+	if errors.Is(err, sqlite.ErrNotFound) {
+		return sqlite.Message{}, false, nil
+	}
+	if err != nil {
+		return sqlite.Message{}, false, err
+	}
+	return target, true, nil
+}
+
+func (w *Worker) countOrphanReaction(
+	accountID string,
+	inboxID string,
+	reaction bridge.ReactionEvent,
+) {
+	w.counters.account(accountID).reactionsOrphaned.Add(1)
+	w.logger.Debug().
+		Str("account_id", accountID).
+		Str("inbox_id", inboxID).
+		Str("remote_message_id", reaction.TargetRemoteMessageID).
+		Msg("Ignored reaction for missing message")
+}
+
+func reactionRemoteTargetKey(
+	platform bridge.Platform,
+	remoteConversationID string,
+	remoteMessageID string,
+) string {
+	return v2keys.NormalizeRemoteConversationID(string(platform), remoteConversationID) +
+		"\x1f" + strings.TrimSpace(remoteMessageID)
 }
 
 func (w *Worker) messageProjection(

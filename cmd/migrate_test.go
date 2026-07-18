@@ -364,7 +364,7 @@ func successfulTestTransform(
 			},
 			Target: migration.TargetReport{
 				Path: options.TargetPath, DatabasePath: options.TargetStorePath,
-				SchemaVersion: 9,
+				SchemaVersion: 10,
 			},
 			TableCounts: map[string]migration.TableReconciliation{
 				"messages": {

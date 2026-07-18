@@ -36,10 +36,11 @@ func (d *workerPathDecoder) Decode(
 }
 
 type workerPathHarness struct {
-	store    *sqlite.Store
-	messages *sqlite.MessageRepository
-	worker   *Worker
-	nextID   int
+	store     *sqlite.Store
+	messages  *sqlite.MessageRepository
+	reactions *sqlite.ReactionRepository
+	worker    *Worker
+	nextID    int
 }
 
 func newWorkerPathHarness(
@@ -73,11 +74,16 @@ func newWorkerPathHarness(
 	if err != nil {
 		t.Fatalf("NewMessageRepository(): %v", err)
 	}
+	reactions, err := sqlite.NewReactionRepository(store, now)
+	if err != nil {
+		t.Fatalf("NewReactionRepository(): %v", err)
+	}
 	worker, err := NewWorker(WorkerConfig{
-		Store:    store,
-		Messages: messages,
-		Counters: &Counters{},
-		Now:      now,
+		Store:     store,
+		Messages:  messages,
+		Reactions: reactions,
+		Counters:  &Counters{},
+		Now:       now,
 		Decoders: []DecoderRegistration{{
 			Codec:    workerPathCodec,
 			Platform: platform,
@@ -90,9 +96,10 @@ func newWorkerPathHarness(
 		t.Fatalf("NewWorker(): %v", err)
 	}
 	return &workerPathHarness{
-		store:    store,
-		messages: messages,
-		worker:   worker,
+		store:     store,
+		messages:  messages,
+		reactions: reactions,
+		worker:    worker,
 	}
 }
 

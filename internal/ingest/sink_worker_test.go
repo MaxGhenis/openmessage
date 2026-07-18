@@ -397,9 +397,17 @@ func i01NewWorker(
 	echoes EchoObserver,
 ) *Worker {
 	t.Helper()
+	reactions, err := sqlite.NewReactionRepository(
+		store,
+		func() time.Time { return i01TestTime },
+	)
+	if err != nil {
+		t.Fatalf("sqlite.NewReactionRepository(): %v", err)
+	}
 	worker, err := NewWorker(WorkerConfig{
 		Store:        store,
 		Messages:     messages,
+		Reactions:    reactions,
 		EchoObserver: echoes,
 		Counters:     counters,
 		Logger:       zerolog.Nop(),

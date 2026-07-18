@@ -503,12 +503,17 @@ func TestIngressTeeThroughRealSinkDedupesExactFrames(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewMessageRepository(): %v", err)
 	}
+	reactions, err := sqlite.NewReactionRepository(store, now)
+	if err != nil {
+		t.Fatalf("NewReactionRepository(): %v", err)
+	}
 	counters := &ingest.Counters{}
 	worker, err := ingest.NewWorker(ingest.WorkerConfig{
-		Store:    store,
-		Messages: messages,
-		Counters: counters,
-		Logger:   zerolog.Nop(),
+		Store:     store,
+		Messages:  messages,
+		Reactions: reactions,
+		Counters:  counters,
+		Logger:    zerolog.Nop(),
 		Decoders: []ingest.DecoderRegistration{{
 			Codec:    ingest.GoogleCodec,
 			Platform: bridge.PlatformGoogle,
