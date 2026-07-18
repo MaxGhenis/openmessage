@@ -132,6 +132,27 @@ type DroppedDimensions struct {
 	ContactMetaCRM            int64 `json:"contact_meta_crm"`
 	OutgoingSendKeys          int64 `json:"outgoing_send_keys"`
 	Tabs                      int64 `json:"tabs"`
+	// MalformedMessages counts legacy message rows with no message_id — no
+	// stable identity or content to migrate, dropped rather than aborting.
+	MalformedMessages int64 `json:"malformed_messages"`
+	// OrphanedMessages counts messages whose conversation row no longer exists
+	// (already unreachable in the legacy app); dropped with a count.
+	OrphanedMessages int64 `json:"orphaned_messages"`
+	// PlatformMismatchMessages counts messages whose platform disagrees with
+	// their conversation's platform; dropped with a count.
+	PlatformMismatchMessages int64 `json:"platform_mismatch_messages"`
+	// NonPositiveTimestampMessages counts messages with a non-positive
+	// timestamp_ms (placeholder rows with no usable time); dropped with a count.
+	NonPositiveTimestampMessages int64 `json:"non_positive_timestamp_messages"`
+	// UnmappableMessages counts messages that map to an empty remote id;
+	// dropped with a count.
+	UnmappableMessages int64 `json:"unmappable_messages"`
+	// MalformedParticipants counts conversations whose participants JSON could
+	// not be parsed; the conversation migrated with no participant roster.
+	MalformedParticipants int64 `json:"malformed_participants"`
+	// UnmappableUnifiedContacts counts unified contacts whose identifiers were
+	// empty or not the expected JSON array; dropped with a count.
+	UnmappableUnifiedContacts int64 `json:"unmappable_unified_contacts"`
 }
 
 type MediaReport struct {

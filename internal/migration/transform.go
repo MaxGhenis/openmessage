@@ -202,12 +202,15 @@ func Transform(ctx context.Context, options Options) (report Report, returnErr e
 	}
 	report.Schedule = scheduleReport(dataset)
 	report.Media.LegacyAttachments = dataset.mediaRows
-	appendRequiredWarnings(&report)
 
 	state, err := buildTransformState(dataset, &report)
 	if err != nil {
 		return report, fmt.Errorf("%w: plan transform: %v", ErrSource, err)
 	}
+	// Warnings render after planning: buildTransformState contributes dropped
+	// dimensions of its own (for example unparseable participant rosters), and
+	// a warning pass before it would silently omit them.
+	appendRequiredWarnings(&report)
 
 	target, err := sqlite.Open(options.TempStorePath)
 	if err != nil {
@@ -302,9 +305,17 @@ func buildTransformState(dataset legacyDataset, report *Report) (*transformState
 			Legacy: legacy, Account: account,
 			V2ID: v2keys.DeriveID("conversation", account.AccountID, legacy.ID),
 		}
+		// A real legacy store carries conversations with an empty-string or
+		// malformed participants column. Those are unparseable JSON, but the
+		// conversation itself (and its messages) is fine — migrate it with no
+		// participants rather than aborting the whole cutover on a degraded
+		// roster. Empty is silent; malformed is counted for the operator.
 		var participants []legacyParticipant
-		if err := json.Unmarshal([]byte(legacy.ParticipantsJSON), &participants); err != nil {
-			return nil, fmt.Errorf("conversation %q participants JSON: %w", legacy.ID, err)
+		if trimmed := strings.TrimSpace(legacy.ParticipantsJSON); trimmed != "" {
+			if err := json.Unmarshal([]byte(trimmed), &participants); err != nil {
+				participants = nil
+				report.Dropped.MalformedParticipants++
+			}
 		}
 		seen := map[identityKey]bool{}
 		for index, participant := range participants {
@@ -1037,6 +1048,27 @@ func appendRequiredWarnings(report *Report) {
 	}
 	if count := report.Dropped.Tabs; count > 0 {
 		report.Warnings = append(report.Warnings, fmt.Sprintf("%d custom tabs were counted and dropped", count))
+	}
+	if count := report.Dropped.MalformedMessages; count > 0 {
+		report.Warnings = append(report.Warnings, fmt.Sprintf("%d malformed legacy messages (no message_id) were counted and dropped", count))
+	}
+	if count := report.Dropped.OrphanedMessages; count > 0 {
+		report.Warnings = append(report.Warnings, fmt.Sprintf("%d messages referencing a missing conversation (already unreachable in the legacy app) were counted and dropped", count))
+	}
+	if count := report.Dropped.PlatformMismatchMessages; count > 0 {
+		report.Warnings = append(report.Warnings, fmt.Sprintf("%d messages whose platform disagreed with their conversation were counted and dropped", count))
+	}
+	if count := report.Dropped.NonPositiveTimestampMessages; count > 0 {
+		report.Warnings = append(report.Warnings, fmt.Sprintf("%d messages with a non-positive timestamp were counted and dropped", count))
+	}
+	if count := report.Dropped.UnmappableMessages; count > 0 {
+		report.Warnings = append(report.Warnings, fmt.Sprintf("%d messages that map to an empty remote id were counted and dropped", count))
+	}
+	if count := report.Dropped.MalformedParticipants; count > 0 {
+		report.Warnings = append(report.Warnings, fmt.Sprintf("%d conversations had unparseable participants and migrated with no roster", count))
+	}
+	if count := report.Dropped.UnmappableUnifiedContacts; count > 0 {
+		report.Warnings = append(report.Warnings, fmt.Sprintf("%d unified contacts had unmappable identifiers and were counted and dropped", count))
 	}
 	if count := report.Schedule.AmbiguousSending; count > 0 {
 		report.Warnings = append(report.Warnings, fmt.Sprintf("%d ambiguous in-flight scheduled sends were not auto-resent; optimistic messages were preserved for verify/SendAgain", count))

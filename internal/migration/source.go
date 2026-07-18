@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -196,7 +197,7 @@ func loadLegacySource(
 	if err := loadLegacyRows(ctx, database, &dataset); err != nil {
 		return legacyDataset{}, SourceReport{}, fmt.Errorf("%w: %v", ErrSource, err)
 	}
-	if err := validateLegacyRelationships(dataset); err != nil {
+	if err := validateLegacyRelationships(&dataset); err != nil {
 		return legacyDataset{}, SourceReport{}, fmt.Errorf("%w: %v", ErrSource, err)
 	}
 
@@ -242,11 +243,19 @@ func loadLegacyRows(ctx context.Context, database *sql.DB, dataset *legacyDatase
 		return fmt.Errorf("read conversations: %w", err)
 	}
 
+	// COALESCE every scanned column: a real legacy store can carry NULLs in
+	// columns the clean-slate schema treats as non-null (observed: SMS rows with
+	// a NULL message_id), and scanning NULL into a Go string/int fails outright.
+	// Coalescing lets the scan succeed so the row can be classified rather than
+	// aborting the entire migration.
 	rows, err = database.QueryContext(ctx, `
-		SELECT message_id, conversation_id, sender_name, sender_number, body,
-		       timestamp_ms, status, is_from_me, mentions_me, media_id, mime_type,
-		       decryption_key, reactions, reply_to_id, source_platform, source_id,
-		       transcript, transcribed_at, transcript_model
+		SELECT COALESCE(message_id, ''), COALESCE(conversation_id, ''),
+		       COALESCE(sender_name, ''), COALESCE(sender_number, ''), COALESCE(body, ''),
+		       COALESCE(timestamp_ms, 0), COALESCE(status, ''), COALESCE(is_from_me, 0),
+		       COALESCE(mentions_me, 0), COALESCE(media_id, ''), COALESCE(mime_type, ''),
+		       COALESCE(decryption_key, ''), COALESCE(reactions, ''), COALESCE(reply_to_id, ''),
+		       COALESCE(source_platform, ''), COALESCE(source_id, ''),
+		       COALESCE(transcript, ''), COALESCE(transcribed_at, 0), COALESCE(transcript_model, '')
 		FROM messages
 		ORDER BY source_platform, conversation_id, timestamp_ms, message_id
 	`)
@@ -264,6 +273,13 @@ func loadLegacyRows(ctx context.Context, database *sql.DB, dataset *legacyDatase
 		); err != nil {
 			rows.Close()
 			return fmt.Errorf("scan message: %w", err)
+		}
+		// A row with no message_id has no stable identity or content to migrate
+		// (observed: empty-body, zero-timestamp SMS placeholder rows). Drop it
+		// with a count rather than minting a bogus id or failing the migration.
+		if strings.TrimSpace(row.ID) == "" {
+			dataset.dropped.MalformedMessages++
+			continue
 		}
 		dataset.messages = append(dataset.messages, row)
 		platform := normalizeLegacyPlatform(row.Platform)
@@ -319,6 +335,17 @@ func loadLegacyRows(ctx context.Context, database *sql.DB, dataset *legacyDatase
 			rows.Close()
 			return fmt.Errorf("scan unified contact: %w", err)
 		}
+		// A real legacy store can carry unified_contacts whose identifiers
+		// column is not the expected JSON array (observed: a bare number under
+		// an older schema). Such a person cannot be mapped to any identity, so
+		// drop it with a count rather than aborting; messages and conversations
+		// migrate independently of the person-unification graph.
+		var identifiers []unifiedIdentifier
+		if trimmed := strings.TrimSpace(row.IdentifiersJSON); trimmed == "" ||
+			json.Unmarshal([]byte(trimmed), &identifiers) != nil || len(identifiers) == 0 {
+			dataset.dropped.UnmappableUnifiedContacts++
+			continue
+		}
 		dataset.unified = append(dataset.unified, row)
 	}
 	if err := closeRows(rows); err != nil {
@@ -371,7 +398,7 @@ func loadLegacyRows(ctx context.Context, database *sql.DB, dataset *legacyDatase
 	return nil
 }
 
-func validateLegacyRelationships(dataset legacyDataset) error {
+func validateLegacyRelationships(dataset *legacyDataset) error {
 	conversations := make(map[string]string, len(dataset.conversations))
 	for _, conversation := range dataset.conversations {
 		if strings.TrimSpace(conversation.ID) == "" {
@@ -383,31 +410,53 @@ func validateLegacyRelationships(dataset legacyDataset) error {
 		}
 		conversations[conversation.ID] = platform
 	}
-	for _, message := range dataset.messages {
-		if strings.TrimSpace(message.ID) == "" {
-			return fmt.Errorf("message has an empty primary key")
+	// A real legacy store accumulates messages the app can no longer surface —
+	// rows whose conversation was deleted, placeholder rows with no timestamp,
+	// platform-inconsistent rows. Migrating one is impossible, but a single bad
+	// row must not abort the whole cutover, so they are filtered here and
+	// counted for the operator rather than raised as a fatal error. The retained
+	// slice is what everything downstream (transform, count reconciliation)
+	// sees, so the accounting stays exact: legacy total = migrated + dropped.
+	// dropMessage removes a message's contribution to the scan-time aggregates
+	// so the per-platform and attachment reconciliations count only kept rows
+	// (legacy raw = kept + dropped, with the drop reported separately).
+	dropMessage := func(message legacyMessage, counter *int64) {
+		*counter++
+		dataset.platformMessages[normalizeLegacyPlatform(message.Platform)]--
+		if strings.TrimSpace(message.MediaID) != "" {
+			dataset.mediaRows--
 		}
+	}
+	kept := dataset.messages[:0:0]
+	for _, message := range dataset.messages {
 		platform := normalizeLegacyPlatform(message.Platform)
 		if _, err := accountForPlatform(platform); err != nil {
 			return err
 		}
+		if strings.TrimSpace(message.ID) == "" {
+			dropMessage(message, &dataset.dropped.MalformedMessages)
+			continue
+		}
 		conversationPlatform, ok := conversations[message.ConversationID]
 		if !ok {
-			return fmt.Errorf("message %q references missing conversation %q", message.ID, message.ConversationID)
+			dropMessage(message, &dataset.dropped.OrphanedMessages)
+			continue
 		}
 		if platform != conversationPlatform {
-			return fmt.Errorf(
-				"message %q platform %q does not match conversation %q platform %q",
-				message.ID, platform, message.ConversationID, conversationPlatform,
-			)
+			dropMessage(message, &dataset.dropped.PlatformMismatchMessages)
+			continue
 		}
 		if message.TimestampMS <= 0 {
-			return fmt.Errorf("message %q has non-positive timestamp_ms %d", message.ID, message.TimestampMS)
+			dropMessage(message, &dataset.dropped.NonPositiveTimestampMessages)
+			continue
 		}
 		if strings.TrimSpace(deriveRemoteMessageID(message)) == "" {
-			return fmt.Errorf("message %q maps to an empty remote_message_id", message.ID)
+			dropMessage(message, &dataset.dropped.UnmappableMessages)
+			continue
 		}
+		kept = append(kept, message)
 	}
+	dataset.messages = kept
 	for _, scheduled := range dataset.scheduled {
 		if strings.TrimSpace(scheduled.ID) == "" {
 			return fmt.Errorf("scheduled message has an empty primary key")
