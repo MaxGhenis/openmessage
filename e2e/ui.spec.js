@@ -1000,6 +1000,38 @@ test('sends a message through the compose box', async ({ page }) => {
   await expect(page.locator('#messages-area')).toContainText(outbound);
 });
 
+test('maps durable outbox states to honest tray labels and actions', async ({ page }) => {
+  await page.waitForFunction(() => window.__openMessageTestHooks?.outboxRowView);
+  const views = await page.evaluate(() => {
+    const now = 1_700_000_000_000;
+    const view = window.__openMessageTestHooks.outboxRowView;
+    return {
+      scheduled: view({ state: 'queued', scheduled_for_ms: now + 60_000 }, now),
+      queued: view({ state: 'queued', scheduled_for_ms: now }, now),
+      dispatching: view({ state: 'dispatching', scheduled_for_ms: now }, now),
+      retrying: view({ state: 'not_dispatched', next_attempt_at_ms: now + 60_000 }, now),
+      uncertain: view({ state: 'uncertain', scheduled_for_ms: now }, now),
+      repairing: view({ state: 'store_failed', scheduled_for_ms: now }, now),
+      confirmed: view({ state: 'confirmed' }, now),
+      rejected: view({ state: 'rejected' }, now),
+      canceled: view({ state: 'canceled' }, now),
+    };
+  });
+
+  expect(views.scheduled).toMatchObject({ visible: true, group: 'scheduled', label: 'Scheduled', action: 'cancel' });
+  expect(views.queued).toMatchObject({ visible: true, group: 'inflight', label: 'Sending…', action: 'cancel' });
+  expect(views.dispatching).toMatchObject({ visible: true, group: 'inflight', label: 'Sending…', action: '' });
+  expect(views.retrying).toMatchObject({ visible: true, label: 'Retrying…', action: 'cancel' });
+  expect(views.retrying.guidance).toContain('retries automatically');
+  expect(views.uncertain).toMatchObject({ visible: true, label: 'Sent — unconfirmed', action: 'send-again' });
+  expect(views.uncertain.guidance).toContain('may create a duplicate');
+  expect(views.repairing).toMatchObject({ visible: true, label: 'Repairing…', action: 'repair' });
+  expect(views.repairing.guidance).toContain('transport accepted');
+  for (const terminal of [views.confirmed, views.rejected, views.canceled]) {
+    expect(terminal.visible).toBe(false);
+  }
+});
+
 test('keeps existing thread nodes mounted after sending', async ({ page }) => {
   const outbound = `Stable send ${Date.now()}`;
 

@@ -354,6 +354,179 @@ func TestListPendingSurfacesNotDispatchedErrorState(t *testing.T) {
 	}
 }
 
+func TestListPendingSurfacesEveryTrayStateInDueOrder(t *testing.T) {
+	clock := newManualClock(messagingTestTime)
+	store := openMessagingTestStore(t, clock.Now())
+	service := newMessagingTestService(
+		t,
+		store,
+		newScriptedRegistry("pending-states", &scriptedTextSender{}),
+		clock,
+	)
+	ctx := context.Background()
+
+	send := func(name, body string, offset time.Duration) Submission {
+		t.Helper()
+		command := SendTextCommand{
+			CommonCommand: testCommonCommand("key-list-pending-" + name),
+			Body:          body,
+		}
+		command.NotBefore = clock.Now().Add(offset)
+		return mustSendText(t, service, command)
+	}
+	lease := func(submission Submission) (sqlite.OutboxItem, string) {
+		t.Helper()
+		leases, err := service.outbox.LeaseDue(ctx, sqlite.LeaseRequest{
+			Owner:    "worker-" + submission.OutboxID,
+			Now:      clock.Now(),
+			Duration: time.Minute,
+			Limit:    1,
+		})
+		if err != nil {
+			t.Fatalf("LeaseDue(%q): %v", submission.OutboxID, err)
+		}
+		if len(leases) != 1 || leases[0].OutboxID != submission.OutboxID ||
+			leases[0].LeaseToken == nil {
+			t.Fatalf("LeaseDue(%q) = %+v, want one matching lease", submission.OutboxID, leases)
+		}
+		return leases[0].OutboxItem, *leases[0].LeaseToken
+	}
+	markCalled := func(submission Submission, token string) {
+		t.Helper()
+		if err := service.outbox.MarkTransportCalled(ctx, sqlite.Attempt{
+			OutboxID:   submission.OutboxID,
+			LeaseToken: token,
+		}); err != nil {
+			t.Fatalf("MarkTransportCalled(%q): %v", submission.OutboxID, err)
+		}
+	}
+
+	confirmed := send("confirmed", "confirmed summary", -8*time.Minute)
+	_, confirmedToken := lease(confirmed)
+	markCalled(confirmed, confirmedToken)
+	if err := service.outbox.ConfirmWithoutResult(ctx, confirmed.OutboxID, confirmedToken); err != nil {
+		t.Fatalf("ConfirmWithoutResult(): %v", err)
+	}
+	canceled := send("canceled", "canceled summary", -7*time.Minute)
+	if _, err := service.Cancel(ctx, canceled.OutboxID); err != nil {
+		t.Fatalf("Cancel(): %v", err)
+	}
+	rejected := send("rejected", "rejected summary", -6*time.Minute)
+	_, rejectedToken := lease(rejected)
+	if err := service.outbox.Reject(
+		ctx,
+		rejected.OutboxID,
+		rejectedToken,
+		"permanent",
+		"invalid",
+		"rejected",
+	); err != nil {
+		t.Fatalf("Reject(): %v", err)
+	}
+
+	dispatching := send("dispatching", "dispatching summary", -5*time.Minute)
+	lease(dispatching)
+	uncertain := send("uncertain", "uncertain summary", -4*time.Minute)
+	_, uncertainToken := lease(uncertain)
+	markCalled(uncertain, uncertainToken)
+	if err := service.outbox.MarkUncertain(
+		ctx,
+		uncertain.OutboxID,
+		uncertainToken,
+		"timeout",
+		"deadline",
+		"outcome unknown",
+	); err != nil {
+		t.Fatalf("MarkUncertain(): %v", err)
+	}
+	storeFailed := send("store-failed", "store failed summary", -3*time.Minute)
+	_, storeFailedToken := lease(storeFailed)
+	markCalled(storeFailed, storeFailedToken)
+	if err := service.outbox.MarkStoreFailed(
+		ctx,
+		storeFailed.OutboxID,
+		storeFailedToken,
+		"remote-store-failed",
+		"local write failed",
+	); err != nil {
+		t.Fatalf("MarkStoreFailed(): %v", err)
+	}
+	notDispatched := send("not-dispatched", "not dispatched summary", -2*time.Minute)
+	_, notDispatchedToken := lease(notDispatched)
+	markCalled(notDispatched, notDispatchedToken)
+	retryAt := clock.Now().Add(5 * time.Minute)
+	if err := service.outbox.MarkCalledNotDispatched(
+		ctx,
+		notDispatched.OutboxID,
+		notDispatchedToken,
+		"transient",
+		"offline",
+		"retry later",
+		retryAt,
+	); err != nil {
+		t.Fatalf("MarkCalledNotDispatched(): %v", err)
+	}
+	queued := send("queued", "queued summary", 10*time.Minute)
+
+	pending, err := service.ListPending(ctx, ListPendingQuery{Limit: 20})
+	if err != nil {
+		t.Fatalf("ListPending(): %v", err)
+	}
+	wantIDs := []string{
+		dispatching.OutboxID,
+		uncertain.OutboxID,
+		storeFailed.OutboxID,
+		notDispatched.OutboxID,
+		queued.OutboxID,
+	}
+	wantStates := []OutboxState{
+		OutboxDispatching,
+		OutboxUncertain,
+		OutboxStoreFailed,
+		OutboxNotDispatched,
+		OutboxQueued,
+	}
+	wantSummaries := []string{
+		"dispatching summary",
+		"uncertain summary",
+		"store failed summary",
+		"not dispatched summary",
+		"queued summary",
+	}
+	if len(pending) != len(wantIDs) {
+		t.Fatalf("ListPending() returned %d rows, want %d: %+v", len(pending), len(wantIDs), pending)
+	}
+	for i, delivery := range pending {
+		if delivery.OutboxID != wantIDs[i] || delivery.State != wantStates[i] ||
+			delivery.Summary != wantSummaries[i] ||
+			delivery.AccountID != "account-1" || delivery.ConversationID != "conversation-1" ||
+			delivery.Kind != sqlite.OutboxKindText || !delivery.CreatedAt.Equal(clock.Now()) {
+			t.Fatalf("ListPending() row %d = %+v", i, delivery)
+		}
+	}
+	if pending[0].AttemptCount != 0 || !pending[0].NextAttemptAt.IsZero() ||
+		pending[1].AttemptCount != 1 || pending[1].ErrorClass != "timeout" ||
+		pending[1].ErrorCode != "deadline" || !pending[1].NextAttemptAt.IsZero() ||
+		pending[2].AttemptCount != 1 || !pending[2].NextAttemptAt.IsZero() ||
+		pending[3].AttemptCount != 1 || pending[3].ErrorClass != "transient" ||
+		pending[3].ErrorCode != "offline" || !pending[3].NextAttemptAt.Equal(retryAt) ||
+		pending[4].AttemptCount != 0 || !pending[4].NextAttemptAt.IsZero() {
+		t.Fatalf("ListPending() state-specific fields = %+v", pending)
+	}
+	wantScheduled := []time.Time{
+		clock.Now().Add(-5 * time.Minute),
+		clock.Now().Add(-4 * time.Minute),
+		clock.Now().Add(-3 * time.Minute),
+		clock.Now().Add(-2 * time.Minute),
+		clock.Now().Add(10 * time.Minute),
+	}
+	for i, delivery := range pending {
+		if !delivery.ScheduledFor.Equal(wantScheduled[i]) {
+			t.Fatalf("ListPending() row %d ScheduledFor = %v, want %v", i, delivery.ScheduledFor, wantScheduled[i])
+		}
+	}
+}
+
 func TestListPendingValidatesQuery(t *testing.T) {
 	clock := newManualClock(messagingTestTime)
 	store := openMessagingTestStore(t, clock.Now())
