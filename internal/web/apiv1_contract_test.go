@@ -202,6 +202,15 @@ func TestV1OutboxA3ContractMatrix(t *testing.T) {
 		if ambiguous.State != messaging.OutboxUncertain || ambiguous.Warning == "" {
 			t.Fatalf("post-call timeout delivery = %+v, want uncertain warning", ambiguous)
 		}
+		listed := h.request(t, http.MethodGet, "/api/v1/outbox?limit=10", "", nil)
+		assertA3Status(t, listed, http.StatusOK)
+		pending := decodeA3JSON[[]v1PendingResponse](t, listed.body)
+		if len(pending) != 1 || pending[0].OutboxID != original.OutboxID ||
+			pending[0].State != messaging.OutboxUncertain || pending[0].Summary != "maybe delivered" ||
+			pending[0].AttemptCount != 1 || pending[0].ErrorClass != string(bridge.FailureTransient) ||
+			pending[0].ErrorCode != "send_text" {
+			t.Fatalf("GET pending uncertain = %+v, want the reviewable original", pending)
+		}
 
 		replay := h.postText(t, "a3-uncertain-key", "maybe delivered")
 		assertA3Status(t, replay, http.StatusOK)

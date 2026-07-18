@@ -35,15 +35,15 @@ const (
 	workerOwner         = "message-service"
 )
 
-// ListPendingQuery selects pending, cancelable deliveries in due order.
+// ListPendingQuery selects outbox-tray deliveries in deterministic due order.
 type ListPendingQuery struct {
 	AccountID      string
 	ConversationID string
 	Limit          int
 }
 
-// PendingDelivery is the application-facing preview of one queued or
-// not-dispatched durable intent.
+// PendingDelivery is the application-facing preview of one durable intent
+// that remains visible in the outbox tray.
 type PendingDelivery struct {
 	OutboxID       string
 	AccountID      string
@@ -576,8 +576,8 @@ func (s *MessageService) Get(ctx context.Context, outboxID string) (Delivery, er
 	return deliveryFromItem(item), nil
 }
 
-// ListPending returns queued and not-dispatched deliveries in storage due
-// order. The result is exactly the set that remains safe to cancel.
+// ListPending returns every outbox-tray delivery in deterministic storage due
+// order. State-specific APIs decide which follow-up actions are safe.
 func (s *MessageService) ListPending(
 	ctx context.Context,
 	q ListPendingQuery,

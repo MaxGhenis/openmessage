@@ -3243,6 +3243,230 @@ body::after {
   color: var(--text-primary);
 }
 
+.outbox-toggle-btn {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 10px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--bg-elevated);
+  color: var(--text-secondary);
+  font-family: var(--font-sans);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.16s ease, color 0.16s ease, border-color 0.16s ease;
+}
+
+.outbox-toggle-btn:hover,
+.outbox-toggle-btn[aria-expanded="true"] {
+  background: var(--accent-dim);
+  border-color: var(--border-accent);
+  color: var(--text-primary);
+}
+
+.outbox-toggle-btn[hidden],
+.outbox-count[hidden],
+.outbox-tray[hidden] {
+  display: none;
+}
+
+.outbox-count {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: var(--accent);
+  color: #ffffff;
+  font-size: 10px;
+  line-height: 1;
+}
+
+.outbox-tray {
+  flex: 0 0 auto;
+  max-height: min(54vh, 480px);
+  margin: 0 12px 8px;
+  padding: 12px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: var(--panel-strong);
+  box-shadow: var(--shadow-soft);
+  position: relative;
+  z-index: 2;
+}
+
+.outbox-tray-header,
+.outbox-row-head,
+.outbox-row-state,
+.outbox-row-meta {
+  display: flex;
+  align-items: center;
+}
+
+.outbox-tray-header {
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+
+.outbox-tray-title {
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--text-primary);
+}
+
+.outbox-tray-close {
+  width: 26px;
+  height: 26px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.outbox-tray-close:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.outbox-tray-status {
+  min-height: 0;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.outbox-tray-status:not(:empty) {
+  margin-bottom: 8px;
+}
+
+.outbox-tray-status.error {
+  color: #ff6b6b;
+}
+
+.outbox-group + .outbox-group {
+  margin-top: 14px;
+}
+
+.outbox-group-title {
+  margin: 0 2px 6px;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.outbox-list {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.outbox-row {
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--bg-elevated);
+}
+
+.outbox-row-head {
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.outbox-row-copy {
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.outbox-row-summary {
+  overflow: hidden;
+  color: var(--text-primary);
+  font-size: 13px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.outbox-row-conversation,
+.outbox-row-guidance,
+.outbox-row-meta {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.outbox-row-conversation {
+  margin-top: 1px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.outbox-row-state {
+  flex-wrap: wrap;
+  gap: 4px 7px;
+  margin-top: 7px;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.outbox-row-state strong {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.outbox-row-guidance {
+  margin-top: 4px;
+  line-height: 1.4;
+}
+
+.outbox-row-meta {
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  margin-top: 6px;
+}
+
+.outbox-row-action {
+  flex: 0 0 auto;
+  padding: 6px 9px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--bg-surface);
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.outbox-row-action:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.outbox-row-action:disabled {
+  cursor: wait;
+  opacity: 0.6;
+}
+
+.outbox-empty {
+  padding: 18px 8px;
+  color: var(--text-muted);
+  font-size: 12px;
+  text-align: center;
+}
+
 /* ─── Bulk action bar ─── */
 .bulk-bar {
   display: flex;
@@ -5457,8 +5681,19 @@ body::after {
     </div>
     <div class="sidebar-tabs-row">
       <div class="sidebar-tabs" id="sidebar-tabs"></div>
+      <button class="outbox-toggle-btn" id="outbox-toggle-btn" type="button" aria-controls="outbox-tray" aria-expanded="false" title="Open outbox" hidden>
+        Outbox <span class="outbox-count" id="outbox-count" hidden>0</span>
+      </button>
       <button class="select-toggle-btn" id="select-toggle-btn" type="button" title="Select threads to organize" aria-label="Select threads to organize">Select</button>
     </div>
+    <section class="outbox-tray" id="outbox-tray" aria-labelledby="outbox-tray-title" hidden>
+      <div class="outbox-tray-header">
+        <h2 class="outbox-tray-title" id="outbox-tray-title">Outbox</h2>
+        <button class="outbox-tray-close" id="outbox-tray-close" type="button" aria-label="Close outbox">&times;</button>
+      </div>
+      <div class="outbox-tray-status" id="outbox-tray-status" role="status" aria-live="polite"></div>
+      <div id="outbox-tray-content"></div>
+    </section>
     <div class="favorites-rail" id="favorites-rail" aria-label="Favorite threads" hidden></div>
     <div class="bulk-bar" id="bulk-bar" hidden>
       <span class="bulk-count" id="bulk-count">0 selected</span>
@@ -5754,6 +5989,8 @@ body::after {
   const NOTIFICATION_MODE_ALL = 'all';
   const NOTIFICATION_MODE_MENTIONS = 'mentions';
   const NOTIFICATION_MODE_MUTED = 'muted';
+  const OUTBOX_VISIBLE_STATES = new Set(['queued', 'dispatching', 'not_dispatched', 'uncertain', 'store_failed']);
+  const OUTBOX_SEND_KINDS = new Set(['text', 'media']);
   let activeConvoId = null;
   let conversations = [];
   let allConversations = [];
@@ -5765,6 +6002,11 @@ body::after {
   let selectionMode = false;
   const selectedIds = new Set();
   let conversationsRefreshTimer = null;
+  let outboxRefreshTimer = null;
+  let outboxRequestID = 0;
+  let outboxRows = [];
+  const scheduledV2IntentKeys = new Map();
+  const sendAgainKeys = new Map();
   let eventSource = null;
   let threadFeedbackTimer = null;
   let fallbackConversationsTimer = null;
@@ -5850,6 +6092,12 @@ body::after {
   const $convoList = document.getElementById('conversation-list');
   const $sourceFilters = document.getElementById('sidebar-source-filters');
   const $sidebarTabs = document.getElementById('sidebar-tabs');
+  const $outboxToggleBtn = document.getElementById('outbox-toggle-btn');
+  const $outboxCount = document.getElementById('outbox-count');
+  const $outboxTray = document.getElementById('outbox-tray');
+  const $outboxTrayClose = document.getElementById('outbox-tray-close');
+  const $outboxTrayStatus = document.getElementById('outbox-tray-status');
+  const $outboxTrayContent = document.getElementById('outbox-tray-content');
   const $selectToggleBtn = document.getElementById('select-toggle-btn');
   const $bulkBar = document.getElementById('bulk-bar');
   const $bulkCount = document.getElementById('bulk-count');
@@ -9249,31 +9497,64 @@ body::after {
     return error;
   }
 
-  async function submitV2Text(convId, body, replyToId, key) {
+  async function submitV2Text(convId, body, replyToId, key, notBeforeMS = 0) {
+    const payload = {
+      conversation_id: convId,
+      body,
+      reply_to_id: replyToId,
+      idempotency_key: key,
+    };
+    if (Number.isFinite(notBeforeMS) && notBeforeMS > 0) {
+      payload.not_before_ms = notBeforeMS;
+    }
     const response = await fetch(API + '/api/v1/outbox/messages', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        conversation_id: convId,
-        body,
-        reply_to_id: replyToId,
-        idempotency_key: key,
-      }),
+      body: JSON.stringify(payload),
     });
     if (!response.ok) throw await v2SubmissionError(response);
     return response.json();
   }
 
-  async function submitV2Media(convId, file, caption, replyToId, key) {
+  async function submitV2Media(convId, file, caption, replyToId, key, notBeforeMS = 0) {
     const form = new FormData();
     form.append('conversation_id', convId);
     form.append('file', file, file.name || 'attachment');
     form.append('caption', caption || '');
     form.append('reply_to_id', replyToId || '');
     form.append('idempotency_key', key);
+    if (Number.isFinite(notBeforeMS) && notBeforeMS > 0) {
+      form.append('not_before_ms', String(notBeforeMS));
+    }
     const response = await fetch(API + '/api/v1/outbox/media', { method: 'POST', body: form });
     if (!response.ok) throw await v2SubmissionError(response, true);
     return response.json();
+  }
+
+  function freshV2IdempotencyKey() {
+    if (globalThis.crypto && typeof globalThis.crypto.randomUUID === 'function') {
+      return globalThis.crypto.randomUUID();
+    }
+    return queuedSendID();
+  }
+
+  function scheduledV2Intent(conversationID, sendAt, text, file, replyId) {
+    const fingerprint = JSON.stringify({
+      conversation_id: conversationID,
+      body: text,
+      reply_to_id: replyId,
+      not_before_ms: sendAt,
+      file: file ? {
+        name: file.name || '',
+        size: Number(file.size || 0),
+        type: file.type || '',
+        last_modified: Number(file.lastModified || 0),
+      } : null,
+    });
+    if (!scheduledV2IntentKeys.has(fingerprint)) {
+      scheduledV2IntentKeys.set(fingerprint, freshV2IdempotencyKey());
+    }
+    return { fingerprint, key: scheduledV2IntentKeys.get(fingerprint) };
   }
 
   function normalizeQueuedSend(raw) {
@@ -9831,6 +10112,7 @@ body::after {
 
   function refreshFromStreamReconnect() {
     checkStatus();
+    scheduleOutboxRefresh(0);
     if (!$searchInput.value.trim()) {
       loadConversations();
     }
@@ -9918,6 +10200,7 @@ body::after {
     renderPlatformFilters(tabConvos);
     const visibleConvos = filterConversationsByPlatform(tabConvos);
     conversations = visibleConvos;
+    if (state.v2Primary === true) renderOutboxTray();
     if (!visibleConvos.length) {
       $convoList.innerHTML = '';
       let emptyMsg = isSearch ? 'No results found' : 'No conversations yet';
@@ -11502,6 +11785,55 @@ body::after {
       showThreadFeedback('Pick a time at least a moment in the future.');
       return;
     }
+    if (state.v2Primary === null) {
+      showThreadFeedback('Sending is starting up — try again.');
+      return;
+    }
+
+    if (state.v2Primary === true) {
+      const sendConvoId = activeConvoId;
+      const rawText = $composeInput.value;
+      const scheduledFile = pendingFile ? pendingFile.file : null;
+      const scheduledReply = replyToMsg;
+      const replyId = scheduledReply ? scheduledReply.MessageID : '';
+      try {
+        const intent = scheduledV2Intent(sendConvoId, sendAt, text, scheduledFile, replyId);
+        if (hasMedia) {
+          await submitV2Media(sendConvoId, scheduledFile, text, replyId, intent.key, sendAt);
+        } else {
+          await submitV2Text(sendConvoId, text, replyId, intent.key, sendAt);
+        }
+        if (scheduledV2IntentKeys.get(intent.fingerprint) === intent.key) {
+          scheduledV2IntentKeys.delete(intent.fingerprint);
+        }
+
+        const sameConversation = activeConvoId === sendConvoId;
+        const sameCompose = sameConversation
+          && $composeInput.value === rawText
+          && (pendingFile && pendingFile.file ? pendingFile.file : null) === scheduledFile
+          && replyToMsg === scheduledReply;
+        if (composeTextByConversation.get(sendConvoId) === rawText) {
+          composeTextByConversation.delete(sendConvoId);
+        }
+        if (sameCompose) {
+          $composeInput.value = '';
+          rememberComposeText(sendConvoId, '');
+          if (scheduledFile) clearAttachment();
+          if (scheduledReply) clearReply();
+          hideScheduleCustom();
+          autoResize();
+        }
+        if (sameConversation) {
+          showThreadFeedback(`Scheduled for ${formatScheduledWhen(sendAt)}.`);
+        }
+        loadOutboxRows();
+        return;
+      } catch (err) {
+        showThreadFeedback(err.message || 'Failed to schedule message.');
+        return;
+      }
+    }
+
     const replyId = replyToMsg ? replyToMsg.MessageID : '';
     try {
       if (hasMedia) {
@@ -11583,6 +11915,278 @@ body::after {
       await fetch(API + `/api/schedule/${encodeURIComponent(id)}`, { method: 'DELETE' });
     } catch (err) { /* ignore */ }
     loadScheduledMessages(activeConvoId);
+  }
+
+  // The v2 tray is a read-through view of the durable outbox. It deliberately
+  // omits terminal rows and non-message intents; confirmed sends live in the
+  // thread, while reactions/read receipts remain outside this surface.
+  function outboxRowView(row, now = Date.now()) {
+    const stateName = String(row && row.state || '').trim().toLowerCase();
+    const scheduledForMS = Number(row && row.scheduled_for_ms || 0);
+    const nextAttemptMS = Number(row && row.next_attempt_at_ms || 0);
+    const scheduled = stateName === 'queued' && scheduledForMS > now;
+    const view = {
+      visible: OUTBOX_VISIBLE_STATES.has(stateName),
+      group: scheduled ? 'scheduled' : 'inflight',
+      label: '',
+      guidance: '',
+      action: '',
+      actionLabel: '',
+      actionTitle: '',
+      timeMS: nextAttemptMS > 0 ? nextAttemptMS : scheduledForMS,
+      timePrefix: nextAttemptMS > 0 ? 'Next attempt' : 'Queued',
+    };
+
+    switch (stateName) {
+      case 'queued':
+        view.label = scheduled ? 'Scheduled' : 'Sending…';
+        view.guidance = scheduled
+          ? 'Waiting in the outbox until the scheduled time.'
+          : 'The app owns this send; do not resend it.';
+        view.action = 'cancel';
+        view.actionLabel = 'Cancel';
+        view.actionTitle = scheduled ? 'Cancel scheduled send' : 'Cancel queued send';
+        if (scheduled) view.timePrefix = 'For';
+        break;
+      case 'dispatching':
+        view.label = 'Sending…';
+        view.guidance = 'The send is in progress; do not resend it.';
+        break;
+      case 'not_dispatched':
+        view.label = 'Retrying…';
+        view.guidance = 'The app retries automatically; do not resend it.';
+        view.action = 'cancel';
+        view.actionLabel = 'Cancel';
+        view.actionTitle = 'Cancel this automatically retrying send';
+        break;
+      case 'uncertain':
+        view.label = 'Sent — unconfirmed';
+        view.guidance = 'It may have been delivered. Sending again is a deliberate new intent and may create a duplicate.';
+        view.action = 'send-again';
+        view.actionLabel = 'Send again (may duplicate)';
+        view.actionTitle = 'The first send may have arrived; send a deliberate new message with duplicate risk';
+        break;
+      case 'store_failed':
+        view.label = 'Repairing…';
+        view.guidance = 'The transport accepted this send. The app is repairing its local record; do not resend.';
+        view.action = 'repair';
+        view.actionLabel = 'Repair';
+        view.actionTitle = 'Repair the local record without sending again';
+        break;
+      default:
+        view.visible = false;
+    }
+    return view;
+  }
+
+  function visibleOutboxRows() {
+    return outboxRows.filter(row => {
+      const kind = String(row && row.kind || '').trim().toLowerCase();
+      const stateName = String(row && row.state || '').trim().toLowerCase();
+      return OUTBOX_SEND_KINDS.has(kind) && OUTBOX_VISIBLE_STATES.has(stateName);
+    });
+  }
+
+  function setOutboxStatus(message = '', isError = false) {
+    if (!$outboxTrayStatus) return;
+    $outboxTrayStatus.textContent = message;
+    $outboxTrayStatus.classList.toggle('error', !!message && isError);
+  }
+
+  function outboxConversationLabel(row) {
+    const conversationID = String(row && row.conversation_id || '').trim();
+    const conversation = conversationByID(conversationID);
+    return String(conversation && conversation.Name || conversationID || 'Unknown conversation');
+  }
+
+  function outboxRowHTML(row, now) {
+    const view = outboxRowView(row, now);
+    const summary = String(row && row.summary || '').trim()
+      || (String(row && row.kind || '').toLowerCase() === 'media' ? 'Attachment' : 'Message');
+    const time = view.timeMS > 0
+      ? `${view.timePrefix} ${formatScheduledWhen(view.timeMS)}`
+      : '';
+    const attemptCount = Number(row && row.attempt_count || 0);
+    const errorClass = String(row && row.error_class || '').trim();
+    const metadata = [];
+    if (attemptCount > 0) {
+      metadata.push(`${attemptCount} attempt${attemptCount === 1 ? '' : 's'}`);
+    }
+    if (errorClass) metadata.push(`Error class: ${errorClass}`);
+    const action = view.action
+      ? `<button class="outbox-row-action" type="button" data-outbox-id="${escapeHtml(row.outbox_id)}" data-action="${escapeHtml(view.action)}" title="${escapeHtml(view.actionTitle)}">${escapeHtml(view.actionLabel)}</button>`
+      : '';
+    return `<article class="outbox-row" data-outbox-id="${escapeHtml(row.outbox_id)}" data-state="${escapeHtml(row.state)}">
+      <div class="outbox-row-head">
+        <div class="outbox-row-copy">
+          <div class="outbox-row-summary" title="${escapeHtml(summary)}">${escapeHtml(summary)}</div>
+          <div class="outbox-row-conversation">${escapeHtml(outboxConversationLabel(row))}</div>
+        </div>
+        ${action}
+      </div>
+      <div class="outbox-row-state"><strong>${escapeHtml(view.label)}</strong>${time ? `<span>${escapeHtml(time)}</span>` : ''}</div>
+      <div class="outbox-row-guidance">${escapeHtml(view.guidance)}</div>
+      ${metadata.length ? `<div class="outbox-row-meta">${metadata.map(item => `<span>${escapeHtml(item)}</span>`).join('')}</div>` : ''}
+    </article>`;
+  }
+
+  function outboxGroupHTML(title, key, rows, now) {
+    if (!rows.length) return '';
+    return `<section class="outbox-group" data-group="${escapeHtml(key)}">
+      <h3 class="outbox-group-title">${escapeHtml(title)} · ${rows.length}</h3>
+      <div class="outbox-list">${rows.map(row => outboxRowHTML(row, now)).join('')}</div>
+    </section>`;
+  }
+
+  function renderOutboxTray() {
+    const rows = visibleOutboxRows();
+    if ($outboxToggleBtn) {
+      const expanded = $outboxToggleBtn.getAttribute('aria-expanded') === 'true';
+      $outboxToggleBtn.title = expanded
+        ? 'Close outbox'
+        : (rows.length ? `Open outbox (${rows.length} pending)` : 'Open outbox');
+      $outboxToggleBtn.setAttribute(
+        'aria-label',
+        expanded
+          ? `Close outbox, ${rows.length} pending sends`
+          : (rows.length ? `Outbox, ${rows.length} pending sends` : 'Outbox, no pending sends')
+      );
+    }
+    if ($outboxCount) {
+      $outboxCount.textContent = rows.length > 99 ? '99+' : String(rows.length);
+      $outboxCount.hidden = rows.length === 0;
+    }
+    if (!$outboxTrayContent) return;
+
+    const now = Date.now();
+    const scheduled = [];
+    const inflight = [];
+    rows.forEach(row => {
+      const view = outboxRowView(row, now);
+      (view.group === 'scheduled' ? scheduled : inflight).push(row);
+    });
+    $outboxTrayContent.innerHTML = rows.length
+      ? outboxGroupHTML('Scheduled', 'scheduled', scheduled, now)
+        + outboxGroupHTML('In flight', 'inflight', inflight, now)
+      : '<div class="outbox-empty">Nothing queued or unsettled.</div>';
+    $outboxTrayContent.querySelectorAll('.outbox-row-action').forEach(button => {
+      button.addEventListener('click', () => {
+        performOutboxAction(button.dataset.outboxId, button.dataset.action, button);
+      });
+    });
+  }
+
+  async function loadOutboxRows() {
+    if (state.v2Primary !== true) return [];
+    const requestID = ++outboxRequestID;
+    if ($outboxTray && !$outboxTray.hidden && !outboxRows.length) {
+      setOutboxStatus('Loading…');
+    }
+    try {
+      const response = await fetchJSON('/api/v1/outbox?limit=500');
+      if (requestID !== outboxRequestID || state.v2Primary !== true) return [];
+      outboxRows = Array.isArray(response) ? response : [];
+      setOutboxStatus('');
+      renderOutboxTray();
+      return outboxRows;
+    } catch (err) {
+      if (requestID !== outboxRequestID || state.v2Primary !== true) return [];
+      setOutboxStatus(userFacingErrorMessage(err, 'load outbox') || "Couldn't load the outbox.", true);
+      renderOutboxTray();
+      return outboxRows;
+    }
+  }
+
+  function scheduleOutboxRefresh(delay = 80) {
+    if (state.v2Primary !== true) return;
+    clearTimeout(outboxRefreshTimer);
+    outboxRefreshTimer = setTimeout(() => {
+      outboxRefreshTimer = null;
+      loadOutboxRows();
+    }, delay);
+  }
+
+  function closeOutboxTray(restoreFocus = false) {
+    const wasOpen = !!($outboxTray && !$outboxTray.hidden);
+    if ($outboxTray) $outboxTray.hidden = true;
+    if ($outboxToggleBtn) {
+      $outboxToggleBtn.setAttribute('aria-expanded', 'false');
+      $outboxToggleBtn.title = visibleOutboxRows().length
+        ? `Open outbox (${visibleOutboxRows().length} pending)`
+        : 'Open outbox';
+    }
+    if (restoreFocus && wasOpen && $outboxToggleBtn && !$outboxToggleBtn.hidden) {
+      $outboxToggleBtn.focus();
+    }
+  }
+
+  function toggleOutboxTray() {
+    if (state.v2Primary !== true || !$outboxTray) return;
+    const opening = $outboxTray.hidden;
+    $outboxTray.hidden = !opening;
+    if ($outboxToggleBtn) $outboxToggleBtn.setAttribute('aria-expanded', opening ? 'true' : 'false');
+    if (opening) {
+      renderOutboxTray();
+      loadOutboxRows();
+    }
+  }
+
+  function syncOutboxMode() {
+    const enabled = state.v2Primary === true;
+    if ($outboxToggleBtn) $outboxToggleBtn.hidden = !enabled;
+    if (!enabled) {
+      clearTimeout(outboxRefreshTimer);
+      outboxRefreshTimer = null;
+      outboxRequestID++;
+      outboxRows = [];
+      scheduledV2IntentKeys.clear();
+      sendAgainKeys.clear();
+      closeOutboxTray();
+      setOutboxStatus('');
+      renderOutboxTray();
+      return;
+    }
+    renderOutboxTray();
+    scheduleOutboxRefresh(0);
+  }
+
+  async function performOutboxAction(outboxID, action, button) {
+    const row = outboxRows.find(item => item && item.outbox_id === outboxID);
+    const view = outboxRowView(row);
+    if (!row || !view.visible || view.action !== action || !button || button.disabled) {
+      scheduleOutboxRefresh(0);
+      return;
+    }
+
+    button.disabled = true;
+    let successMessage = '';
+    let actionError = null;
+    try {
+      if (action === 'cancel') {
+        await postJSON(`/api/v1/outbox/${encodeURIComponent(outboxID)}/cancel`, {});
+        successMessage = 'Canceled.';
+      } else if (action === 'send-again') {
+        if (!sendAgainKeys.has(outboxID)) {
+          sendAgainKeys.set(outboxID, freshV2IdempotencyKey());
+        }
+        await postJSON(`/api/v1/outbox/${encodeURIComponent(outboxID)}/send-again`, {
+          idempotency_key: sendAgainKeys.get(outboxID),
+        });
+        sendAgainKeys.delete(outboxID);
+        successMessage = 'New send queued. The original may still arrive.';
+      } else if (action === 'repair') {
+        await postJSON(`/api/v1/outbox/${encodeURIComponent(outboxID)}/repair`, {});
+        successMessage = 'Local repair requested. This does not resend.';
+      }
+    } catch (err) {
+      actionError = err;
+    }
+    await loadOutboxRows();
+    if (actionError) {
+      setOutboxStatus(userFacingErrorMessage(actionError, 'update outbox') || "Couldn't update that send.", true);
+    } else if (successMessage) {
+      setOutboxStatus(successMessage);
+    }
   }
 
   function showScheduleCustom() {
@@ -13280,6 +13884,7 @@ body::after {
       browserOnline = browserReportsOnline();
       applyAppStatus(status);
       if (v2PrimaryChanged) {
+        syncOutboxMode();
         refreshComposeRouteUI();
         if (activeConvoId && loadedMessages.length) {
           renderLoadedMessages({ previousScrollTop: $messagesArea.scrollTop });
@@ -13328,6 +13933,7 @@ body::after {
     fallbackStatusTimer = setInterval(checkStatus, 10000);
     fallbackConversationsTimer = setInterval(() => {
       if (!$searchInput.value.trim()) loadConversations();
+      scheduleOutboxRefresh();
     }, 5000);
     fallbackThreadTimer = setInterval(() => {
       if (activeConvoId && threadSearchMode !== 'centered') loadMessages(activeConvoId, {poll: true});
@@ -13377,12 +13983,14 @@ body::after {
     source.addEventListener('conversations', () => {
       markHealthy();
       scheduleConversationsRefresh();
+      scheduleOutboxRefresh();
     });
     source.addEventListener('messages', (evt) => {
       markHealthy();
       const payload = parseStreamEvent(evt.data);
       scheduleConversationsRefresh();
       scheduleThreadRefresh(payload.conversation_id || '');
+      scheduleOutboxRefresh();
       maybeNotifyIncomingMessage(payload.conversation_id || '');
     });
     source.addEventListener('drafts', (evt) => {
@@ -13815,6 +14423,7 @@ body::after {
       e.preventDefault();
       // Close the context menu if open
       if ($contextMenu && !$contextMenu.hidden) { closeContextMenu(); return; }
+      if ($outboxTray && !$outboxTray.hidden) { closeOutboxTray(true); return; }
       // Close the forward dialog if open
       if ($forwardOverlay && !$forwardOverlay.hidden) {
         if (!forwarding) closeForwardDialog();
@@ -14218,6 +14827,8 @@ body::after {
   if ($downloadDiagnosticsBtn) $downloadDiagnosticsBtn.addEventListener('click', () => { downloadDiagnostics().catch(err => showThreadFeedback(err.message || 'Failed to export diagnostics')); });
   if ($reportIssueBtn) $reportIssueBtn.addEventListener('click', () => { reportIssue().catch(err => showThreadFeedback(err.message || 'Failed to prepare issue report')); });
   if ($notifBtn) $notifBtn.addEventListener('click', () => { toggleNotifications().catch(err => console.error('Failed to toggle notifications:', err)); });
+  if ($outboxToggleBtn) $outboxToggleBtn.addEventListener('click', toggleOutboxTray);
+  if ($outboxTrayClose) $outboxTrayClose.addEventListener('click', () => closeOutboxTray(true));
   if ($connectionBannerAction) $connectionBannerAction.addEventListener('click', () => {
     handleLaunchAction($connectionBannerAction.dataset.action).catch(err => showThreadFeedback(err.message || 'Action failed'));
   });
@@ -14275,6 +14886,7 @@ body::after {
     if (activeConvoId) {
       loadMessages(activeConvoId, {poll: true});
     }
+    scheduleOutboxRefresh(0);
     scheduleQueuedSendFlush(0);
     showThreadFeedback('Back online. Queued messages will send when their route is connected.');
   });
@@ -14317,6 +14929,9 @@ body::after {
       },
       lastStatusRenderSig() {
         return lastStatusRenderSig;
+      },
+      outboxRowView(row, now) {
+        return outboxRowView(row, now);
       },
     };
   }

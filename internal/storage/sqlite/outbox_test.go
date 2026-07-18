@@ -1553,7 +1553,7 @@ func TestOutboxEarliestDueReturnsMinimumLeaseOrderingKey(t *testing.T) {
 	}
 }
 
-func TestOutboxListPendingReturnsCancelableRowsDueOrderedWithSummarySources(t *testing.T) {
+func TestOutboxListPendingReturnsTrayRowsDueOrderedWithSummarySources(t *testing.T) {
 	clock := newOutboxTestClock(outboxTestTimeMS)
 	store, repository := openOutboxTestRepository(t, clock.Now)
 	ctx := context.Background()
@@ -1587,6 +1587,77 @@ func TestOutboxListPendingReturnsCancelableRowsDueOrderedWithSummarySources(t *t
 	mustEnqueueOutbox(t, repository, canceled)
 	if err := repository.Cancel(ctx, canceled.OutboxID); err != nil {
 		t.Fatalf("Cancel(): %v", err)
+	}
+
+	rejected := outboxTestItem("list-rejected")
+	mustEnqueueOutbox(t, repository, rejected)
+	rejectedLease := mustLeaseOne(t, repository, LeaseRequest{
+		Owner: "worker-rejected", Now: now, Duration: time.Minute, Limit: 1,
+	})
+	if err := repository.Reject(
+		ctx,
+		rejected.OutboxID,
+		mustLeaseToken(t, rejectedLease),
+		"permanent",
+		"invalid",
+		"rejected",
+	); err != nil {
+		t.Fatalf("Reject(): %v", err)
+	}
+
+	dispatching := outboxTestItem("list-dispatching")
+	dispatching.ScheduledFor = now.Add(-45 * time.Second)
+	mustEnqueueOutgoingOutbox(t, repository, dispatching, "dispatching body")
+	dispatchingLease := mustLeaseOne(t, repository, LeaseRequest{
+		Owner: "worker-dispatching", Now: now, Duration: time.Minute, Limit: 1,
+	})
+	if dispatchingLease.OutboxID != dispatching.OutboxID {
+		t.Fatalf("LeaseDue(dispatching) ID = %q, want %q", dispatchingLease.OutboxID, dispatching.OutboxID)
+	}
+
+	uncertain := outboxTestItem("list-uncertain")
+	uncertain.ScheduledFor = now.Add(-30 * time.Second)
+	mustEnqueueOutgoingOutbox(t, repository, uncertain, "uncertain body")
+	uncertainLease := mustLeaseOne(t, repository, LeaseRequest{
+		Owner: "worker-uncertain", Now: now, Duration: time.Minute, Limit: 1,
+	})
+	uncertainToken := mustLeaseToken(t, uncertainLease)
+	if err := repository.MarkTransportCalled(ctx, Attempt{
+		OutboxID: uncertain.OutboxID, LeaseToken: uncertainToken,
+	}); err != nil {
+		t.Fatalf("MarkTransportCalled(uncertain): %v", err)
+	}
+	if err := repository.MarkUncertain(
+		ctx,
+		uncertain.OutboxID,
+		uncertainToken,
+		"timeout",
+		"deadline",
+		"outcome unknown",
+	); err != nil {
+		t.Fatalf("MarkUncertain(): %v", err)
+	}
+
+	storeFailed := outboxTestItem("list-store-failed")
+	storeFailed.ScheduledFor = now.Add(-15 * time.Second)
+	mustEnqueueOutgoingOutbox(t, repository, storeFailed, "store failed body")
+	storeFailedLease := mustLeaseOne(t, repository, LeaseRequest{
+		Owner: "worker-store-failed", Now: now, Duration: time.Minute, Limit: 1,
+	})
+	storeFailedToken := mustLeaseToken(t, storeFailedLease)
+	if err := repository.MarkTransportCalled(ctx, Attempt{
+		OutboxID: storeFailed.OutboxID, LeaseToken: storeFailedToken,
+	}); err != nil {
+		t.Fatalf("MarkTransportCalled(store failed): %v", err)
+	}
+	if err := repository.MarkStoreFailed(
+		ctx,
+		storeFailed.OutboxID,
+		storeFailedToken,
+		"remote-store-failed",
+		"local write failed",
+	); err != nil {
+		t.Fatalf("MarkStoreFailed(): %v", err)
 	}
 
 	reaction := outboxTestReactionItem("list-reaction")
@@ -1672,6 +1743,9 @@ func TestOutboxListPendingReturnsCancelableRowsDueOrderedWithSummarySources(t *t
 	}
 	wantIDs := []string{
 		dueText.OutboxID,
+		dispatching.OutboxID,
+		uncertain.OutboxID,
+		storeFailed.OutboxID,
 		reaction.OutboxID,
 		media.OutboxID,
 		read.OutboxID,
@@ -1684,9 +1758,16 @@ func TestOutboxListPendingReturnsCancelableRowsDueOrderedWithSummarySources(t *t
 	if !slices.Equal(gotIDs, wantIDs) {
 		t.Fatalf("ListPending() IDs = %v, want %v", gotIDs, wantIDs)
 	}
+	trayStates := map[OutboxState]bool{
+		OutboxQueued:        true,
+		OutboxDispatching:   true,
+		OutboxNotDispatched: true,
+		OutboxUncertain:     true,
+		OutboxStoreFailed:   true,
+	}
 	for _, row := range rows {
-		if row.State != OutboxQueued && row.State != OutboxNotDispatched {
-			t.Fatalf("ListPending() returned non-cancelable row = %+v", row)
+		if !trayStates[row.State] {
+			t.Fatalf("ListPending() returned terminal row = %+v", row)
 		}
 		if row.ScheduledForMS <= 0 || row.CreatedAtMS != now.UnixMilli() {
 			t.Fatalf("ListPending() timing fields = %+v", row)
@@ -1697,24 +1778,40 @@ func TestOutboxListPendingReturnsCancelableRowsDueOrderedWithSummarySources(t *t
 		rows[0].MediaFile != nil || rows[0].MediaMIME != nil || rows[0].Emoji != nil {
 		t.Fatalf("text summary sources = %+v", rows[0])
 	}
-	if rows[1].State != OutboxNotDispatched || rows[1].NextAttemptAtMS == nil ||
-		*rows[1].NextAttemptAtMS != retryAt.UnixMilli() || rows[1].AttemptCount != 0 ||
-		rows[1].ErrorClass == nil || *rows[1].ErrorClass != "transient" ||
-		rows[1].ErrorCode == nil || *rows[1].ErrorCode != "offline" ||
-		rows[1].Emoji == nil || *rows[1].Emoji != "👍" || rows[1].Body != nil {
-		t.Fatalf("not-dispatched reaction row = %+v", rows[1])
+	if rows[1].State != OutboxDispatching || rows[1].AttemptCount != 0 ||
+		rows[1].NextAttemptAtMS != nil || rows[1].Body == nil || *rows[1].Body != "dispatching body" {
+		t.Fatalf("dispatching row = %+v", rows[1])
 	}
-	if rows[2].Body == nil || *rows[2].Body != "media caption" ||
-		rows[2].MediaFile == nil || *rows[2].MediaFile != attachment.Filename ||
-		rows[2].MediaMIME == nil || *rows[2].MediaMIME != attachment.MIME || rows[2].Emoji != nil {
-		t.Fatalf("media summary sources = %+v", rows[2])
+	if rows[2].State != OutboxUncertain || rows[2].AttemptCount != 1 ||
+		rows[2].NextAttemptAtMS != nil || rows[2].ErrorClass == nil ||
+		*rows[2].ErrorClass != "timeout" || rows[2].ErrorCode == nil ||
+		*rows[2].ErrorCode != "deadline" || rows[2].Body == nil || *rows[2].Body != "uncertain body" {
+		t.Fatalf("uncertain row = %+v", rows[2])
 	}
-	if rows[3].Kind != OutboxKindRead || rows[3].Body != nil || rows[3].MediaFile != nil ||
-		rows[3].MediaMIME != nil || rows[3].Emoji != nil {
-		t.Fatalf("read summary sources = %+v", rows[3])
+	if rows[3].State != OutboxStoreFailed || rows[3].AttemptCount != 1 ||
+		rows[3].NextAttemptAtMS != nil || rows[3].ResultRemoteID == nil ||
+		*rows[3].ResultRemoteID != "remote-store-failed" || rows[3].Body == nil ||
+		*rows[3].Body != "store failed body" {
+		t.Fatalf("store-failed row = %+v", rows[3])
 	}
-	if rows[4].Body == nil || *rows[4].Body != "future text body" {
-		t.Fatalf("future text summary sources = %+v", rows[4])
+	if rows[4].State != OutboxNotDispatched || rows[4].NextAttemptAtMS == nil ||
+		*rows[4].NextAttemptAtMS != retryAt.UnixMilli() || rows[4].AttemptCount != 0 ||
+		rows[4].ErrorClass == nil || *rows[4].ErrorClass != "transient" ||
+		rows[4].ErrorCode == nil || *rows[4].ErrorCode != "offline" ||
+		rows[4].Emoji == nil || *rows[4].Emoji != "👍" || rows[4].Body != nil {
+		t.Fatalf("not-dispatched reaction row = %+v", rows[4])
+	}
+	if rows[5].Body == nil || *rows[5].Body != "media caption" ||
+		rows[5].MediaFile == nil || *rows[5].MediaFile != attachment.Filename ||
+		rows[5].MediaMIME == nil || *rows[5].MediaMIME != attachment.MIME || rows[5].Emoji != nil {
+		t.Fatalf("media summary sources = %+v", rows[5])
+	}
+	if rows[6].Kind != OutboxKindRead || rows[6].Body != nil || rows[6].MediaFile != nil ||
+		rows[6].MediaMIME != nil || rows[6].Emoji != nil {
+		t.Fatalf("read summary sources = %+v", rows[6])
+	}
+	if rows[7].Body == nil || *rows[7].Body != "future text body" {
+		t.Fatalf("future text summary sources = %+v", rows[7])
 	}
 
 	accountRows, err := repository.ListPending(ctx, ListPendingParams{
@@ -1727,7 +1824,7 @@ func TestOutboxListPendingReturnsCancelableRowsDueOrderedWithSummarySources(t *t
 	if len(accountRows) != 2 {
 		t.Fatalf("ListPending(account, limit) returned %d rows, want 2: %+v", len(accountRows), accountRows)
 	}
-	if got := []string{accountRows[0].OutboxID, accountRows[1].OutboxID}; !slices.Equal(got, []string{dueText.OutboxID, media.OutboxID}) {
+	if got := []string{accountRows[0].OutboxID, accountRows[1].OutboxID}; !slices.Equal(got, []string{dueText.OutboxID, dispatching.OutboxID}) {
 		t.Fatalf("ListPending(account, limit) IDs = %v", got)
 	}
 
@@ -1754,7 +1851,14 @@ func TestOutboxListPendingReturnsCancelableRowsDueOrderedWithSummarySources(t *t
 	for i, row := range conversationRows {
 		conversationIDs[i] = row.OutboxID
 	}
-	if want := []string{dueText.OutboxID, read.OutboxID, futureText.OutboxID}; !slices.Equal(conversationIDs, want) {
+	if want := []string{
+		dueText.OutboxID,
+		dispatching.OutboxID,
+		uncertain.OutboxID,
+		storeFailed.OutboxID,
+		read.OutboxID,
+		futureText.OutboxID,
+	}; !slices.Equal(conversationIDs, want) {
 		t.Fatalf("ListPending(account, conversation) IDs = %v, want %v", conversationIDs, want)
 	}
 

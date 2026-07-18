@@ -94,8 +94,8 @@ type OutboxItem struct {
 	UpdatedAtMS         int64
 }
 
-// ListPendingParams scopes a deterministic pending-outbox read. Empty account
-// and conversation IDs leave their respective dimensions unfiltered.
+// ListPendingParams scopes a deterministic outbox-tray read. Empty account and
+// conversation IDs leave their respective dimensions unfiltered.
 type ListPendingParams struct {
 	AccountID      string
 	ConversationID string
@@ -1051,8 +1051,9 @@ func (r *OutboxRepository) ListCarryReview(ctx context.Context) ([]CarryReviewIn
 	return items, nil
 }
 
-// ListPending returns exactly the cancelable outbox set, ordered by the same
-// due key used by LeaseDue and enriched with nullable per-kind summary data.
+// ListPending returns every outbox-tray row, ordered by its due key and enriched
+// with nullable per-kind summary data. Some returned states are not cancelable
+// or automatically retryable.
 func (r *OutboxRepository) ListPending(
 	ctx context.Context,
 	p ListPendingParams,
@@ -1071,7 +1072,7 @@ func (r *OutboxRepository) ListPending(
 		LEFT JOIN messages m ON m.message_id = o.local_message_id
 		LEFT JOIN outbox_attachments oa ON oa.outbox_id = o.outbox_id AND oa.ordinal = 0
 		LEFT JOIN outbox_reactions orx ON orx.outbox_id = o.outbox_id
-		WHERE o.state IN ('queued','not_dispatched')`
+		WHERE o.state IN ('queued','dispatching','not_dispatched','uncertain','store_failed')`
 	args := make([]any, 0, 3)
 	if p.AccountID != "" {
 		query += ` AND o.account_id = ?`
