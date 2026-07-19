@@ -49,6 +49,8 @@ var maxUploadBytes int64 = messaging.DefaultMaxMediaBytes
 
 const maxTranscriptRequestBytes = db.MaxTranscriptBytes + db.MaxTranscriptModelBytes + 4096
 
+const sseWriteTimeout = 5 * time.Second
+
 func normalizeSendIdempotencyKey(raw string) (string, error) {
 	key := strings.TrimSpace(raw)
 	if key == "" {
@@ -84,6 +86,7 @@ type UnpairFunc func() error
 
 // APIOptions holds optional callbacks for the API handler.
 type APIOptions struct {
+	Auth                  *ControlAuth
 	V2                    *V2Options
 	V2IngestCounters      func() map[string]ingest.CounterSnapshot
 	Reads                 readsource.ReadSource
@@ -287,7 +290,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			}
 		}
 		payload := map[string]any{
-			"connected": connected,
+			"connected":  connected,
 			"v2_send":    opts.V2 != nil,
 			"v2_primary": opts.V2Primary,
 			"v2_ingest": map[string]any{
@@ -764,7 +767,11 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		w.Header().Set("Connection", "keep-alive")
 		w.Header().Set("X-Accel-Buffering", "no")
 
-		subID, ch := opts.Events.Subscribe()
+		subID, ch, ok := opts.Events.TrySubscribe()
+		if !ok {
+			httpError(w, "too many event stream subscribers", http.StatusServiceUnavailable)
+			return
+		}
 		defer opts.Events.Unsubscribe(subID)
 
 		connected := currentConnected()
@@ -2601,7 +2608,11 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 	})
 
 	mux.HandleFunc("/api/status", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, statusPayload(currentConnected()))
+		payload := statusPayload(currentConnected())
+		if opts.Auth != nil {
+			payload["auth"] = opts.Auth.Status()
+		}
+		writeJSON(w, payload)
 	})
 
 	mux.HandleFunc("/api/diagnostics", func(w http.ResponseWriter, r *http.Request) {
@@ -2922,6 +2933,9 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 	// visits from talking to http://127.0.0.1:<port>/api/... or /mcp/... .
 	// Requiring a loopback Host and, when present, a same-origin loopback
 	// Origin/Referer closes that vector without affecting native app requests.
+	if opts.Auth != nil {
+		handler = opts.Auth.Handler(handler)
+	}
 	return ProtectLocalControl(handler)
 }
 
@@ -2934,6 +2948,9 @@ func ProtectLocalControl(handler http.Handler) http.Handler {
 			return
 		}
 		setSecurityHeaders(w)
+		if isProtectedLocalPath(r.URL.Path) {
+			w.Header().Set("Cross-Origin-Resource-Policy", "same-origin")
+		}
 		handler.ServeHTTP(w, r)
 	})
 }
@@ -3395,6 +3412,9 @@ func writeJSON(w http.ResponseWriter, v any) {
 }
 
 func writeSSEEvent(w http.ResponseWriter, evt StreamEvent) error {
+	// Bound writes so a half-open client cannot retain an event subscriber
+	// until the operating system's TCP retransmit timeout expires.
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(sseWriteTimeout))
 	data, err := json.Marshal(evt)
 	if err != nil {
 		return err

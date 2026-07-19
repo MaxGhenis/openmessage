@@ -12,6 +12,7 @@ const (
 
 	subscriberChannelBuffer = 8
 	subscriberMaxPending    = 128
+	maxEventSubscribers     = 32
 )
 
 // StreamEvent is a small invalidation payload pushed to connected browsers.
@@ -148,7 +149,21 @@ func NewEventBroker() *EventBroker {
 func (b *EventBroker) Subscribe() (int, <-chan StreamEvent) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	return b.subscribeLocked()
+}
 
+func (b *EventBroker) TrySubscribe() (int, <-chan StreamEvent, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if len(b.subscribers) >= maxEventSubscribers {
+		return 0, nil, false
+	}
+
+	id, ch := b.subscribeLocked()
+	return id, ch, true
+}
+
+func (b *EventBroker) subscribeLocked() (int, <-chan StreamEvent) {
 	id := b.nextID
 	b.nextID++
 	sub := newEventSubscriber()

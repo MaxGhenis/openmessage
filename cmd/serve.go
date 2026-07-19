@@ -606,9 +606,14 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 
 	httpEnabled := opts.web || opts.mcpSSE
 	if httpEnabled {
+		controlAuth, err := web.NewControlAuth(a.DataDir, logger)
+		if err != nil {
+			return fmt.Errorf("initialize local control authentication: %w", err)
+		}
 		httpHandler := http.Handler(nil)
 		if opts.web {
 			httpHandler = web.APIHandlerWithOptions(a.Store, nil, logger, mcpHTTPHandler, web.APIOptions{
+				Auth:                  controlAuth,
 				V2:                    v2Options,
 				V2IngestCounters:      v2IngestCounters,
 				Reads:                 reads,
@@ -654,7 +659,7 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 				SyncGoogleContacts:    a.SyncGoogleContacts,
 			})
 		} else {
-			httpHandler = web.ProtectLocalControl(mcpHTTPHandler)
+			httpHandler = web.ProtectLocalControl(controlAuth.Handler(mcpHTTPHandler))
 		}
 
 		ln, err := net.Listen("tcp", listenAddr)
@@ -670,6 +675,7 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 		go func() {
 			if opts.web {
 				logger.Info().Str("addr", listenAddr).Msg("Web UI available at " + baseURL)
+				fmt.Fprintf(os.Stderr, "Open this single-use URL to authorize the web UI (it redirects without exposing the control token):\n%s\n", controlAuth.BootstrapURL(baseURL))
 			}
 			if opts.mcpSSE {
 				logger.Info().Str("addr", listenAddr).Msg("MCP SSE available at " + baseURL + "/mcp/sse")
