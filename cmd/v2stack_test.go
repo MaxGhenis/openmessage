@@ -539,9 +539,11 @@ func TestV2StackStopJoinsRunAndClosesStore(t *testing.T) {
 }
 
 func TestV2PrimaryStackDoesNotStartLegacyProjector(t *testing.T) {
+	// The stack's runner goroutines share this writer, and bytes.Buffer is not
+	// safe for concurrent writes.
 	var logs bytes.Buffer
 	stack, err := newV2Stack(v2StackDeps{
-		Logger:  zerolog.New(&logs),
+		Logger:  zerolog.New(zerolog.SyncWriter(&logs)),
 		DataDir: t.TempDir(),
 	})
 	if err != nil {
@@ -590,9 +592,11 @@ func TestV2PrimaryStackStartsPrimaryNotifier(t *testing.T) {
 }
 
 func TestLegacyPrimaryStackStillStartsLegacyProjector(t *testing.T) {
+	// The stack's runner goroutines share this writer, and bytes.Buffer is not
+	// safe for concurrent writes.
 	var logs bytes.Buffer
 	stack, err := newV2Stack(v2StackDeps{
-		Logger:  zerolog.New(&logs),
+		Logger:  zerolog.New(zerolog.SyncWriter(&logs)),
 		DataDir: t.TempDir(),
 	})
 	if err != nil {
