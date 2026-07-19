@@ -55,6 +55,7 @@ func (s *Source) accountIndex() (map[string]sqlite.Account, error) {
 func (s *Source) mapConversation(
 	conversation sqlite.Conversation,
 	accounts map[string]sqlite.Account,
+	unreadCount int,
 ) (*db.Conversation, error) {
 	account, ok := accounts[conversation.AccountID]
 	if !ok {
@@ -68,16 +69,21 @@ func (s *Source) mapConversation(
 	if err != nil {
 		return nil, err
 	}
+	tab := ""
+	if conversation.ArchivedAtMS != nil {
+		tab = db.TabArchive
+	}
 	return &db.Conversation{
 		ConversationID:   conversation.ConversationID,
 		Name:             conversation.Title,
 		IsGroup:          conversation.Kind == sqlite.ConversationKindGroup,
 		Participants:     participants,
 		LastMessageTS:    conversation.LastMessageAtMS,
-		UnreadCount:      0,
+		UnreadCount:      unreadCount,
 		SourcePlatform:   platformForBridgeKey(account.BridgeKey),
 		IsFavorite:       conversation.IsFavorite,
 		NotificationMode: string(conversation.NotificationMode),
+		Tab:              tab,
 	}, nil
 }
 

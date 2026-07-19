@@ -6315,6 +6315,14 @@ body::after {
     return normalizePlatform(entity.SourcePlatform || entity.source_platform);
   }
 
+  function isGoogleSourcePlatform(platform) {
+    return platform === 'google' || platform === 'sms';
+  }
+
+  function queuedTransportPlatform(sourcePlatform) {
+    return isGoogleSourcePlatform(sourcePlatform) ? 'sms' : sourcePlatform;
+  }
+
   function displayProtocolOf(entity) {
     const raw = String((entity && (entity.DisplayProtocol || entity.display_protocol)) || '').trim().toUpperCase();
     if (raw === 'RCS') return 'RCS';
@@ -7083,7 +7091,7 @@ body::after {
   function conversationSupportsOutbound(convo) {
     if (!convo) return false;
     const platform = sourcePlatformOf(convo);
-    return platform === 'sms'
+    return isGoogleSourcePlatform(platform)
       || (platform === 'whatsapp' && whatsAppStatus.connected)
       || (platform === 'signal' && signalStatus.connected);
   }
@@ -7091,7 +7099,7 @@ body::after {
   function conversationCanSendNow(convo) {
     if (!convo) return false;
     const platform = sourcePlatformOf(convo);
-    if (platform === 'sms') return googleStatus.connected && !googleStatus.needs_repair;
+    if (isGoogleSourcePlatform(platform)) return googleStatus.connected && !googleStatus.needs_repair;
     if (platform === 'whatsapp') return whatsAppStatus.connected;
     if (platform === 'signal') return signalStatus.connected;
     return false;
@@ -7100,7 +7108,7 @@ body::after {
   function conversationCanQueueOutbound(convo) {
     if (!convo) return false;
     const platform = sourcePlatformOf(convo);
-    if (platform === 'sms') {
+    if (isGoogleSourcePlatform(platform)) {
       return googleStatus.connected || (googleStatus.paired && !googleStatus.needs_pairing);
     }
     if (platform === 'whatsapp') {
@@ -7118,7 +7126,7 @@ body::after {
 
   function conversationSupportsMediaOutbound(convo) {
     return !!convo && (
-      sourcePlatformOf(convo) === 'sms'
+      isGoogleSourcePlatform(sourcePlatformOf(convo))
       || (sourcePlatformOf(convo) === 'whatsapp' && whatsAppStatus.connected)
       || (sourcePlatformOf(convo) === 'signal' && signalStatus.connected)
     );
@@ -7127,7 +7135,7 @@ body::after {
   function conversationCanQueueMediaOutbound(convo) {
     if (!convo) return false;
     const platform = sourcePlatformOf(convo);
-    if (platform === 'sms') {
+    if (isGoogleSourcePlatform(platform)) {
       return googleStatus.connected || (googleStatus.paired && !googleStatus.needs_pairing);
     }
     if (platform === 'whatsapp') {
@@ -8791,22 +8799,45 @@ body::after {
       || null;
   }
 
-  function applyConversationPatch(conversationID, patch, fallbackConvo = null) {
+  function applyConversationPatch(conversationID, patch, fallbackConvo = null, aliasConversationID = '') {
+    const fallbackConversationID = fallbackConvo && fallbackConvo.ConversationID;
+    const matchesConversation = (convo) => convo && (
+      convo.ConversationID === conversationID
+      || (aliasConversationID && convo.ConversationID === aliasConversationID)
+      || (fallbackConversationID && convo.ConversationID === fallbackConversationID)
+    );
+    const patchConversationList = (items) => {
+      let canonical = null;
+      let canonicalIndex = -1;
+      const patched = [];
+      (items || []).forEach((convo) => {
+        if (!matchesConversation(convo)) {
+          patched.push(convo);
+          return;
+        }
+        if (!canonical) {
+          canonical = Object.assign({}, convo, patch, { ConversationID: conversationID });
+          canonicalIndex = patched.length;
+          patched.push(canonical);
+          return;
+        }
+        canonical = Object.assign(canonical, convo, patch, { ConversationID: conversationID });
+        patched[canonicalIndex] = canonical;
+      });
+      return { items: patched, canonical };
+    };
+
     let patchedAllConversations = false;
-    allConversations = allConversations.map((convo) => {
-      if (!convo || convo.ConversationID !== conversationID) return convo;
-      patchedAllConversations = true;
-      return Object.assign(convo, patch);
-    });
-    conversations = conversations.map((convo) => {
-      if (!convo || convo.ConversationID !== conversationID) return convo;
-      return Object.assign(convo, patch);
-    });
+    const patchedAll = patchConversationList(allConversations);
+    allConversations = patchedAll.items;
+    patchedAllConversations = !!patchedAll.canonical;
+    conversations = patchConversationList(conversations).items;
     if (!patchedAllConversations && fallbackConvo && conversationFavoriteOf(Object.assign({}, fallbackConvo, patch))) {
-      allConversations.push(Object.assign({}, fallbackConvo, patch));
+      allConversations.push(Object.assign({}, fallbackConvo, patch, { ConversationID: conversationID }));
     }
-    if (activeConversation && activeConversation.ConversationID === conversationID) {
-      activeConversation = Object.assign(activeConversation, patch);
+    if (matchesConversation(activeConversation)) {
+      activeConversation = Object.assign(activeConversation, patch, { ConversationID: conversationID });
+      activeConvoId = conversationID;
     }
   }
 
@@ -8887,9 +8918,16 @@ body::after {
       IsFavorite: isFavorite,
       is_favorite: isFavorite,
     };
-    applyConversationPatch(convo.ConversationID, patch, Object.assign({}, convo, updated));
+    const updatedConversationID = updated && updated.ConversationID;
+    const canonicalConversationID = updatedConversationID || convo.ConversationID;
+    applyConversationPatch(
+      canonicalConversationID,
+      patch,
+      Object.assign({}, convo, updated, { ConversationID: canonicalConversationID }),
+      convo.ConversationID
+    );
     await renderConversationListPreservingSearch();
-    if (activeConversation && activeConversation.ConversationID === convo.ConversationID) {
+    if (activeConversation && activeConversation.ConversationID === canonicalConversationID) {
       refreshConversationChrome();
     }
   }
@@ -9738,6 +9776,14 @@ body::after {
       .sort((a, b) => a.timestamp_ms - b.timestamp_ms || a.id.localeCompare(b.id));
   }
 
+  function renderedMessagePlatformForConversation(conversationID, fallbackPlatform) {
+    const message = loadedMessages.find(item => item
+      && !item._pendingSend
+      && String(item.ConversationID || '') === String(conversationID || '')
+      && (item.SourcePlatform || item.source_platform));
+    return message ? sourcePlatformOf(message) : normalizePlatform(fallbackPlatform);
+  }
+
   function queuedSendMessage(item) {
     const failed = item.status === 'failed';
     const hasMediaPreview = item.type === 'media' || item.type === 'gif';
@@ -9751,7 +9797,7 @@ body::after {
       MediaID: hasMediaPreview ? `pending:${item.id}` : '',
       MimeType: item.type === 'gif' ? (item.mime_type || 'image/gif') : (item.type === 'media' ? item.mime_type : ''),
       ReplyToID: item.reply_to_id,
-      SourcePlatform: item.platform,
+      SourcePlatform: renderedMessagePlatformForConversation(item.conversation_id, item.platform),
       _pendingSend: true,
       _pendingSendItem: item,
       _pendingFileName: item.file_name,
@@ -11641,7 +11687,7 @@ body::after {
         const mediaItem = {
           id: queuedSendID(),
           conversation_id: sendConvoId,
-          platform: activePlatform,
+          platform: queuedTransportPlatform(activePlatform),
           type: 'media',
           body: sendsCaptionedMedia ? text : '',
           reply_to_id: (activePlatform === 'whatsapp' || activePlatform === 'signal') ? replyToID : '',
@@ -11657,7 +11703,7 @@ body::after {
         const textItem = {
           id: queuedSendID(),
           conversation_id: sendConvoId,
-          platform: activePlatform,
+          platform: queuedTransportPlatform(activePlatform),
           type: 'text',
           body: text,
           reply_to_id: replyToID,
@@ -12647,7 +12693,7 @@ body::after {
 	      const gifItem = {
 	        id: queuedSendID(),
 	        conversation_id: sendConvoId,
-	        platform: activePlatform,
+	        platform: queuedTransportPlatform(activePlatform),
 	        type: 'gif',
 	        body: supportsMediaCaption ? text : '',
 	        reply_to_id: supportsMediaCaption ? replyToID : '',
@@ -12664,7 +12710,7 @@ body::after {
 	        const textItem = {
 	          id: queuedSendID(),
 	          conversation_id: sendConvoId,
-	          platform: activePlatform,
+	          platform: queuedTransportPlatform(activePlatform),
 	          type: 'text',
 	          body: text,
 	          reply_to_id: replyToID,

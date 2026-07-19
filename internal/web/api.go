@@ -34,6 +34,8 @@ import (
 	"github.com/maxghenis/openmessage/internal/readsource"
 	"github.com/maxghenis/openmessage/internal/storage/sqlite"
 	"github.com/maxghenis/openmessage/internal/story"
+	"github.com/maxghenis/openmessage/internal/v2keys"
+	"github.com/maxghenis/openmessage/internal/v2read"
 	"github.com/maxghenis/openmessage/internal/whatsapplive"
 )
 
@@ -840,6 +842,16 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		}
 		action := parts[len(parts)-1]
 		convID := strings.Join(parts[:len(parts)-1], "/")
+		legacyConvID, v2ConvID := convID, convID
+		if action == "notification-mode" || action == "favorite" || action == "tab" {
+			var resolveErr error
+			legacyConvID, v2ConvID, resolveErr = resolveConversationMutationIDs(store, opts.V2, convID)
+			if resolveErr != nil {
+				logger.Error().Err(resolveErr).Str("conversation_id", convID).Msg("Failed to resolve conversation mutation IDs")
+				httpError(w, "resolve conversation: "+resolveErr.Error(), 500)
+				return
+			}
+		}
 		if action == "notification-mode" {
 			if r.Method != http.MethodPost && r.Method != http.MethodPatch {
 				httpError(w, "method not allowed", 405)
@@ -852,17 +864,31 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 				httpError(w, "invalid JSON: "+err.Error(), 400)
 				return
 			}
-			if err := store.SetConversationNotificationMode(convID, req.NotificationMode); err != nil {
+			if err := store.SetConversationNotificationMode(legacyConvID, req.NotificationMode); err != nil {
 				httpError(w, "set notification mode: "+err.Error(), 400)
 				return
 			}
-			convo, err := store.GetConversation(convID)
+			if opts.V2 != nil && opts.V2.V2Store != nil {
+				err := opts.V2.V2Store.SetConversationNotificationMode(r.Context(), v2ConvID, sqlite.NotificationMode(req.NotificationMode))
+				if err != nil {
+					if errors.Is(err, sqlite.ErrNotFound) {
+						logger.Debug().Str("conversation_id", v2ConvID).Msg("Skipping notification mode for missing v2 conversation")
+					} else {
+						logger.Error().Err(err).Str("conversation_id", v2ConvID).Msg("Failed to set v2 conversation notification mode")
+						if opts.V2Primary {
+							httpError(w, "set v2 notification mode: "+err.Error(), 500)
+							return
+						}
+					}
+				}
+			}
+			convo, err := store.GetConversation(legacyConvID)
 			if err != nil {
 				httpError(w, "get conversation: "+err.Error(), 500)
 				return
 			}
 			publishConversations()
-			writeJSON(w, convo)
+			writeConversationMutationResponse(w, convo, v2ConvID, opts)
 			return
 		}
 		if action == "favorite" {
@@ -881,7 +907,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 				httpError(w, "favorite is required", 400)
 				return
 			}
-			if err := store.SetConversationFavorite(convID, *req.Favorite); err != nil {
+			if err := store.SetConversationFavorite(legacyConvID, *req.Favorite); err != nil {
 				if errors.Is(err, sql.ErrNoRows) {
 					httpError(w, "conversation not found", 404)
 					return
@@ -889,7 +915,21 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 				httpError(w, "set favorite: "+err.Error(), 500)
 				return
 			}
-			convo, err := store.GetConversation(convID)
+			if opts.V2 != nil && opts.V2.V2Store != nil {
+				err := opts.V2.V2Store.SetConversationFavorite(r.Context(), v2ConvID, *req.Favorite)
+				if err != nil {
+					if errors.Is(err, sqlite.ErrNotFound) {
+						logger.Debug().Str("conversation_id", v2ConvID).Msg("Skipping favorite for missing v2 conversation")
+					} else {
+						logger.Error().Err(err).Str("conversation_id", v2ConvID).Msg("Failed to set v2 conversation favorite")
+						if opts.V2Primary {
+							httpError(w, "set v2 favorite: "+err.Error(), 500)
+							return
+						}
+					}
+				}
+			}
+			convo, err := store.GetConversation(legacyConvID)
 			if err != nil {
 				if errors.Is(err, sql.ErrNoRows) {
 					httpError(w, "conversation not found", 404)
@@ -899,7 +939,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 				return
 			}
 			publishConversations()
-			writeJSON(w, convo)
+			writeConversationMutationResponse(w, convo, v2ConvID, opts)
 			return
 		}
 		if action == "tab" {
@@ -914,17 +954,36 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 				httpError(w, "invalid JSON: "+err.Error(), 400)
 				return
 			}
-			if err := store.SetConversationTab(convID, req.Tab); err != nil {
+			if err := store.SetConversationTab(legacyConvID, req.Tab); err != nil {
 				httpError(w, "set tab: "+err.Error(), 400)
 				return
 			}
-			convo, err := store.GetConversation(convID)
+			if opts.V2 != nil && opts.V2.V2Store != nil {
+				var archivedAtMS *int64
+				if strings.TrimSpace(req.Tab) == db.TabArchive {
+					value := time.Now().UnixMilli()
+					archivedAtMS = &value
+				}
+				err := opts.V2.V2Store.SetConversationArchived(r.Context(), v2ConvID, archivedAtMS)
+				if err != nil {
+					if errors.Is(err, sqlite.ErrNotFound) {
+						logger.Debug().Str("conversation_id", v2ConvID).Msg("Skipping archive state for missing v2 conversation")
+					} else {
+						logger.Error().Err(err).Str("conversation_id", v2ConvID).Msg("Failed to set v2 conversation archive state")
+						if opts.V2Primary {
+							httpError(w, "set v2 archive state: "+err.Error(), 500)
+							return
+						}
+					}
+				}
+			}
+			convo, err := store.GetConversation(legacyConvID)
 			if err != nil {
 				httpError(w, "get conversation: "+err.Error(), 500)
 				return
 			}
 			publishConversations()
-			writeJSON(w, convo)
+			writeConversationMutationResponse(w, convo, v2ConvID, opts)
 			return
 		}
 		if action == "search" {
@@ -1035,9 +1094,46 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			httpError(w, "ids is required", 400)
 			return
 		}
-		if err := store.SetConversationsTab(req.IDs, req.Tab); err != nil {
+		legacyIDs := req.IDs
+		v2IDs := make([]string, 0, len(req.IDs))
+		if opts.V2 != nil && opts.V2.V2Store != nil {
+			legacyIDs = make([]string, 0, len(req.IDs))
+			for _, id := range req.IDs {
+				legacyID, v2ID, err := resolveConversationMutationIDs(store, opts.V2, id)
+				if err != nil {
+					logger.Error().Err(err).Str("conversation_id", id).Msg("Failed to resolve bulk conversation mutation IDs")
+					httpError(w, "resolve conversation: "+err.Error(), 500)
+					return
+				}
+				legacyIDs = append(legacyIDs, legacyID)
+				v2IDs = append(v2IDs, v2ID)
+			}
+		}
+		if err := store.SetConversationsTab(legacyIDs, req.Tab); err != nil {
 			httpError(w, "move conversations: "+err.Error(), 400)
 			return
+		}
+		if opts.V2 != nil && opts.V2.V2Store != nil {
+			var archivedAtMS *int64
+			if strings.TrimSpace(req.Tab) == db.TabArchive {
+				value := time.Now().UnixMilli()
+				archivedAtMS = &value
+			}
+			for _, v2ID := range v2IDs {
+				err := opts.V2.V2Store.SetConversationArchived(r.Context(), v2ID, archivedAtMS)
+				if err != nil {
+					if errors.Is(err, sqlite.ErrNotFound) {
+						logger.Debug().Str("conversation_id", v2ID).Msg("Skipping bulk move for missing v2 conversation")
+						continue
+					}
+					logger.Error().Err(err).Str("conversation_id", v2ID).Msg("Failed to move v2 conversation")
+					if opts.V2Primary {
+						httpError(w, "move v2 conversation: "+err.Error(), 500)
+						return
+					}
+					continue
+				}
+			}
 		}
 		publishConversations()
 		writeJSON(w, map[string]any{"moved": len(req.IDs), "tab": strings.TrimSpace(req.Tab)})
@@ -3703,6 +3799,66 @@ func queryIntClamped(r *http.Request, key string, def, max int) int {
 		n = max
 	}
 	return n
+}
+
+// resolveConversationMutationIDs accepts either API-era legacy IDs or v2 IDs
+// and returns the matching pair. The derivation mirrors migration and the e2e
+// primary lane so every mutation handler uses one translation path.
+func resolveConversationMutationIDs(legacy *db.Store, v2 *V2Options, handlerID string) (string, string, error) {
+	if v2 == nil || v2.V2Store == nil {
+		return handlerID, handlerID, nil
+	}
+	if conversation, err := v2.V2Store.GetConversation(handlerID); err == nil {
+		legacyID := strings.TrimSpace(conversation.RemoteConversationID)
+		if legacyID == "" {
+			return "", "", fmt.Errorf("v2 conversation %q has no remote conversation ID", handlerID)
+		}
+		return legacyID, handlerID, nil
+	} else if !errors.Is(err, sqlite.ErrNotFound) {
+		return "", "", err
+	}
+	conversation, err := legacy.GetConversation(handlerID)
+	if err != nil {
+		return "", "", err
+	}
+	return handlerID, derivedV2ConversationID(conversation), nil
+}
+
+func derivedV2ConversationID(conversation *db.Conversation) string {
+	accountID := "google-primary"
+	switch strings.ToLower(strings.TrimSpace(conversation.SourcePlatform)) {
+	case "whatsapp":
+		accountID = "whatsapp-primary"
+	case "signal":
+		accountID = "signal-primary"
+	case "gchat":
+		accountID = "gchat-archive"
+	case "imessage":
+		accountID = "imessage-archive"
+	}
+	return v2keys.DeriveID("conversation", accountID, conversation.ConversationID)
+}
+
+func writeConversationMutationResponse(w http.ResponseWriter, legacyConversation *db.Conversation, v2ConversationID string, opts APIOptions) {
+	if opts.V2Primary {
+		reads := opts.Reads
+		if reads == nil && opts.V2 != nil && opts.V2.V2Store != nil {
+			reads = v2read.New(opts.V2.V2Store)
+		}
+		if reads != nil {
+			if conversation, err := reads.GetConversation(v2ConversationID); err == nil {
+				writeJSON(w, conversation)
+				return
+			}
+		}
+		if legacyConversation != nil {
+			fallback := *legacyConversation
+			fallback.ConversationID = v2ConversationID
+			writeJSON(w, &fallback)
+			return
+		}
+	}
+	writeJSON(w, legacyConversation)
 }
 
 // staleDaysThreshold is how many whole days a platform's latest message may

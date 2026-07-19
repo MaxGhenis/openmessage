@@ -1,4 +1,5 @@
 const { test, expect } = require('@playwright/test');
+const crypto = require('crypto');
 
 const hikingDraft = 'Count me in for Saturday! Lands End trail looks clear — 62°F and sunny. Want me to bring snacks?';
 
@@ -12,16 +13,28 @@ const primaryRegressionSpecs = new Set([
   // observe (and in several cases cannot resolve) the mutation.
   'lets you leave a WhatsApp group from the thread header',
   'starts a new WhatsApp chat with a number from the platform picker',
-  'favorites conversations from the header and row context menu',
-  'keeps global search active when favoriting a search result',
   'new message surfaces existing routes for the same number',
   'forwards text and media messages',
-  'lets you mute a thread from the header notification menu',
-  'supports mentions-only notifications from the conversation context menu',
   // Draft display/deletion still use the legacy fixture successfully, but the
   // primary router intentionally rejects /api/drafts/send in favor of v2 outbox.
   'sends an AI draft from the thread banner',
+  // PRIMARY REGRESSION: legacy messages.mentions_me is read during migration,
+  // but the v2 messages schema has no mention field and import drops the flag.
+  'supports mentions-only notifications from the conversation context menu',
 ]);
+const primaryRegressionReasons = new Map([
+  [
+    'supports mentions-only notifications from the conversation context menu',
+    'PRIMARY REGRESSION: legacy messages.mentions_me is dropped because the v2 messages schema has no mention field',
+  ],
+]);
+
+function primaryConversationID(legacyID, accountID = 'google-primary') {
+  return crypto.createHash('sha256')
+    .update(`conversation\x1f${accountID}\x1f${legacyID}`)
+    .digest('hex')
+    .slice(0, 32);
+}
 
 async function openConversation(page, name) {
   await page.locator('#conversation-list .convo-name').getByText(name, { exact: true }).first().click();
@@ -57,7 +70,13 @@ async function expectLastMessageVisible(page) {
 async function rememberStableThreadNode(page) {
   await page.locator('#messages-area .msg').first().waitFor();
   await page.evaluate(() => {
-    const node = document.querySelector('#messages-area .msg');
+    // Tag the NEWEST pre-existing message: the durable store accumulates
+    // messages across specs, so the oldest node can be legitimately evicted
+    // from the tail render window by the very send under test. The newest
+    // node stays in-window, so its survival isolates the property we pin:
+    // sending must reconcile, not re-create, existing DOM.
+    const nodes = document.querySelectorAll('#messages-area .msg');
+    const node = nodes[nodes.length - 1];
     if (!node) throw new Error('message node not found');
     node.dataset.e2eStableThreadNode = 'true';
     window.__openMessageStableThreadNode = node;
@@ -113,7 +132,8 @@ async function installFakeNotifications(page) {
 test.beforeEach(async ({ page, request }, testInfo) => {
   test.fixme(
     primaryRegressionSpecs.has(testInfo.title),
-    'PRIMARY REGRESSION: the v2-primary product does not currently preserve this user-facing contract',
+    primaryRegressionReasons.get(testInfo.title)
+      || 'PRIMARY REGRESSION: the v2-primary product does not currently preserve this user-facing contract',
   );
   await request.post('/_e2e/drafts', {
     data: {
@@ -123,6 +143,11 @@ test.beforeEach(async ({ page, request }, testInfo) => {
     },
   });
   await page.goto('/');
+});
+
+test.afterEach(async ({ request }) => {
+  await request.post(`/api/conversations/${primaryConversationID('conv1')}/favorite`, { data: { favorite: false } });
+  await request.post(`/api/conversations/${primaryConversationID('conv2')}/favorite`, { data: { favorite: false } });
 });
 
 test('links WhatsApp with a phone number pairing code when unpaired', async ({ page }) => {
@@ -819,8 +844,8 @@ test('keeps sidebar search and tabs tightly stacked', async ({ page }) => {
 });
 
 test('favorites conversations from the header and row context menu', async ({ page, request }) => {
-  await request.post('/api/conversations/conv1/favorite', { data: { favorite: false } });
-  await request.post('/api/conversations/conv2/favorite', { data: { favorite: false } });
+  await request.post(`/api/conversations/${primaryConversationID('conv1')}/favorite`, { data: { favorite: false } });
+  await request.post(`/api/conversations/${primaryConversationID('conv2')}/favorite`, { data: { favorite: false } });
   await request.post('/api/mark-read', { data: { conversation_id: 'conv2' } });
   await page.reload();
 
@@ -831,7 +856,7 @@ test('favorites conversations from the header and row context menu', async ({ pa
       body: `Favorite badge check ${Date.now()}`,
       sender_name: 'Marcus Johnson',
       sender_number: '+12125559876',
-      timestamp_ms: 1738956601000,
+      timestamp_ms: Date.now(),
     },
   });
 
@@ -874,10 +899,11 @@ test('favorites conversations from the header and row context menu', async ({ pa
   await expect(page.locator('#chat-header-name')).toHaveText('Sarah Chen');
   await page.locator('#chat-header-favorite-btn').click();
   await expect(page.locator('#favorites-rail .favorite-chip[title="Sarah Chen"]')).toHaveCount(0);
+
 });
 
 test('keeps global search active when favoriting a search result', async ({ page, request }) => {
-  await request.post('/api/conversations/conv2/favorite', { data: { favorite: false } });
+  await request.post(`/api/conversations/${primaryConversationID('conv2')}/favorite`, { data: { favorite: false } });
   await page.reload();
 
   await page.locator('#search-input').fill('Marcus');

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"time"
 
 	moderncsqlite "modernc.org/sqlite"
 )
@@ -696,6 +697,41 @@ func (s *Store) GetConversation(conversationID string) (Conversation, error) {
 		return Conversation{}, fmt.Errorf("get conversation %q: %w", conversationID, err)
 	}
 	return conversation, nil
+}
+
+// SetConversationNotificationMode updates the local notification policy.
+func (s *Store) SetConversationNotificationMode(ctx context.Context, conversationID string, mode NotificationMode) error {
+	return s.updateConversationAttributes(ctx, conversationID,
+		"notification_mode = ?, updated_at_ms = MAX(updated_at_ms + 1, ?)", mode, time.Now().UnixMilli())
+}
+
+// SetConversationFavorite updates the local favorite state.
+func (s *Store) SetConversationFavorite(ctx context.Context, conversationID string, favorite bool) error {
+	return s.updateConversationAttributes(ctx, conversationID,
+		"is_favorite = ?, updated_at_ms = MAX(updated_at_ms + 1, ?)", favorite, time.Now().UnixMilli())
+}
+
+// SetConversationArchived updates the local archive timestamp. Nil restores
+// the conversation to the inbox.
+func (s *Store) SetConversationArchived(ctx context.Context, conversationID string, archivedAtMS *int64) error {
+	return s.updateConversationAttributes(ctx, conversationID,
+		"archived_at_ms = ?, updated_at_ms = MAX(updated_at_ms + 1, ?)", archivedAtMS, time.Now().UnixMilli())
+}
+
+func (s *Store) updateConversationAttributes(ctx context.Context, conversationID, assignments string, args ...any) error {
+	args = append(args, conversationID)
+	result, err := s.db.ExecContext(ctx, "UPDATE conversations SET "+assignments+" WHERE conversation_id = ?", args...)
+	if err != nil {
+		return fmt.Errorf("update conversation %q: %w", conversationID, mapConstraintError(err))
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("update conversation %q rows affected: %w", conversationID, err)
+	}
+	if rows == 0 {
+		return notFound("conversation", conversationID)
+	}
+	return nil
 }
 
 // GetConversationByRemote returns a conversation by the same account-scoped
