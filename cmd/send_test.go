@@ -9,10 +9,15 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/maxghenis/openmessage/internal/web"
 )
 
 type sendRoundTripper func(*http.Request) (*http.Response, error)
@@ -371,6 +376,78 @@ func TestRunSendRealTransportSequence(t *testing.T) {
 	}
 	if got := strings.Join(sequence, ","); got != "GET /api/status,POST /api/v1/outbox/messages,GET /api/v1/outbox/real-out" {
 		t.Fatalf("sequence = %s", got)
+	}
+}
+
+func TestCLIControlTokenHeaderPresentAndAbsent(t *testing.T) {
+	dir := t.TempDir()
+	if got := loadCLIControlToken(dir); got != "" {
+		t.Fatalf("missing token = %q", got)
+	}
+	if err := os.WriteFile(filepath.Join(dir, web.ControlTokenFile), []byte("secret-token\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := loadCLIControlToken(dir); got != "secret-token" {
+		t.Fatalf("loaded token = %q", got)
+	}
+	for _, tt := range []struct{ name, token, want string }{{"present", "secret-token", "Bearer secret-token"}, {"absent", "", ""}} {
+		t.Run(tt.name, func(t *testing.T) {
+			seen := 0
+			client := &http.Client{Transport: sendRoundTripper(func(req *http.Request) (*http.Response, error) {
+				seen++
+				if got := req.Header.Get("Authorization"); got != tt.want {
+					t.Fatalf("Authorization = %q, want %q", got, tt.want)
+				}
+				switch req.URL.Path {
+				case "/api/status":
+					return sendJSONResponse(200, `{"v2_primary":true}`), nil
+				case "/api/v1/outbox/messages":
+					return sendJSONResponse(200, `{"outbox_id":"out-1","state":"queued"}`), nil
+				case "/api/v1/outbox/out-1":
+					return sendJSONResponse(200, `{"outbox_id":"out-1","state":"confirmed"}`), nil
+				default:
+					t.Fatalf("unexpected path %s", req.URL.Path)
+					return nil, nil
+				}
+			})}
+			deps := sendCommandDeps{client: client, baseURL: "http://127.0.0.1", controlToken: tt.token, newKey: func() (string, error) { return "key", nil }, output: io.Discard, legacySend: func(string, string) error { t.Fatal("legacy path"); return nil }}
+			if err := runSendWithDeps(context.Background(), deps, "conv", "hello", nil); err != nil {
+				t.Fatal(err)
+			}
+			if seen != 3 {
+				t.Fatalf("requests = %d, want 3", seen)
+			}
+		})
+	}
+}
+
+func TestRunSendUsesDaemonDataDirControlToken(t *testing.T) {
+	serverDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(serverDir, web.ControlTokenFile), []byte("server-token\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var authenticated []string
+	client := &http.Client{Transport: sendRoundTripper(func(req *http.Request) (*http.Response, error) {
+		authenticated = append(authenticated, req.Header.Get("Authorization"))
+		switch req.URL.Path {
+		case "/api/status":
+			return sendJSONResponse(200, fmt.Sprintf(`{"v2_primary":true,"auth":{"data_dir":%q}}`, serverDir)), nil
+		case "/api/v1/outbox/messages":
+			return sendJSONResponse(200, `{"outbox_id":"out-1","state":"queued"}`), nil
+		case "/api/v1/outbox/out-1":
+			return sendJSONResponse(200, `{"outbox_id":"out-1","state":"confirmed"}`), nil
+		default:
+			t.Fatalf("unexpected path %s", req.URL.Path)
+			return nil, nil
+		}
+	})}
+	deps := sendCommandDeps{client: client, baseURL: "http://127.0.0.1", controlToken: "cli-default-token", newKey: func() (string, error) { return "key", nil }, output: io.Discard, legacySend: func(string, string) error { t.Fatal("legacy path"); return nil }}
+	if err := runSendWithDeps(context.Background(), deps, "conv", "hello", nil); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"Bearer cli-default-token", "Bearer server-token", "Bearer server-token"}
+	if !reflect.DeepEqual(authenticated, want) {
+		t.Fatalf("Authorization headers = %#v, want %#v", authenticated, want)
 	}
 }
 

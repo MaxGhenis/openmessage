@@ -65,6 +65,28 @@ func TestEventSubscriberCollapsePreservesLatestStatusAndGlobalRefreshes(t *testi
 	}
 }
 
+func TestEventBrokerRejectsNewestSubscriberAtLimit(t *testing.T) {
+	b := NewEventBroker()
+	ids := make([]int, 0, maxEventSubscribers)
+	for i := 0; i < maxEventSubscribers; i++ {
+		id, _, ok := b.TrySubscribe()
+		if !ok {
+			t.Fatalf("subscriber %d rejected before limit", i)
+		}
+		ids = append(ids, id)
+	}
+	if _, _, ok := b.TrySubscribe(); ok {
+		t.Fatal("subscriber above limit accepted")
+	}
+	b.Unsubscribe(ids[0])
+	if _, _, ok := b.TrySubscribe(); !ok {
+		t.Fatal("subscriber rejected after slot released")
+	}
+	for _, id := range ids[1:] {
+		b.Unsubscribe(id)
+	}
+}
+
 func TestEventBrokerOverflowFallsBackToGlobalRefresh(t *testing.T) {
 	broker := NewEventBroker()
 	id, ch := broker.Subscribe()

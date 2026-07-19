@@ -73,6 +73,11 @@ func newE2EServer(logger zerolog.Logger) (_ *e2eServer, cleanup func(), resultEr
 	if err != nil {
 		return nil, nil, err
 	}
+	controlAuth, err := web.NewControlAuth(dataDir, logger)
+	if err != nil {
+		_ = os.RemoveAll(dataDir)
+		return nil, nil, err
+	}
 	legacyPath := filepath.Join(dataDir, "messages.db")
 	store, err := db.New(legacyPath)
 	if err != nil {
@@ -188,6 +193,7 @@ func newE2EServer(logger zerolog.Logger) (_ *e2eServer, cleanup func(), resultEr
 		mime: "image/png",
 	})
 	base := web.APIHandlerWithOptions(store, nil, logger, nil, web.APIOptions{
+		Auth:      controlAuth,
 		Reads:     v2read.New(v2Store),
 		V2Primary: true,
 		V2: &web.V2Options{

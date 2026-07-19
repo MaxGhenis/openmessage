@@ -12,26 +12,30 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/maxghenis/openmessage/internal/app"
+	"github.com/maxghenis/openmessage/internal/web"
 )
 
 type sendCommandDeps struct {
-	mode       func() (v2RuntimeMode, error)
-	client     *http.Client
-	baseURL    string
-	newKey     func() (string, error)
-	output     io.Writer
-	legacySend func(conversationID, message string) error
+	mode         func() (v2RuntimeMode, error)
+	client       *http.Client
+	baseURL      string
+	newKey       func() (string, error)
+	output       io.Writer
+	legacySend   func(conversationID, message string) error
+	controlToken string
 }
 
 type sendGroupCommandDeps struct {
-	mode       func() (v2RuntimeMode, error)
-	client     *http.Client
-	baseURL    string
-	legacySend func(phones []string, message string) error
+	mode         func() (v2RuntimeMode, error)
+	client       *http.Client
+	baseURL      string
+	legacySend   func(phones []string, message string) error
+	controlToken string
 }
 
 type outboxSubmission struct {
@@ -54,11 +58,12 @@ func defaultSendCommandDeps(legacy func(string, string) error) sendCommandDeps {
 		mode: func() (v2RuntimeMode, error) {
 			return resolveV2RuntimeMode(app.DemoMode(), app.DefaultDataDir())
 		},
-		client:     &http.Client{Timeout: 10 * time.Second},
-		baseURL:    localAPIBaseURL(),
-		newKey:     newCLIIdempotencyKey,
-		output:     os.Stdout,
-		legacySend: legacy,
+		client:       &http.Client{Timeout: 10 * time.Second},
+		baseURL:      localAPIBaseURL(),
+		newKey:       newCLIIdempotencyKey,
+		output:       os.Stdout,
+		legacySend:   legacy,
+		controlToken: loadCLIControlToken(app.DefaultDataDir()),
 	}
 }
 
@@ -67,9 +72,10 @@ func defaultSendGroupCommandDeps(legacy func([]string, string) error) sendGroupC
 		mode: func() (v2RuntimeMode, error) {
 			return resolveV2RuntimeMode(app.DemoMode(), app.DefaultDataDir())
 		},
-		client:     &http.Client{Timeout: 10 * time.Second},
-		baseURL:    localAPIBaseURL(),
-		legacySend: legacy,
+		client:       &http.Client{Timeout: 10 * time.Second},
+		baseURL:      localAPIBaseURL(),
+		legacySend:   legacy,
+		controlToken: loadCLIControlToken(app.DefaultDataDir()),
 	}
 }
 
@@ -92,7 +98,7 @@ func runSendWithDeps(ctx context.Context, deps sendCommandDeps, conversationID, 
 		deps.output = os.Stdout
 	}
 
-	status, reachable, err := probeV2Status(ctx, deps.client, deps.baseURL)
+	status, reachable, err := probeV2Status(ctx, deps.client, deps.baseURL, deps.controlToken)
 	if err != nil {
 		if reachable {
 			return fmt.Errorf("check running OpenMessage mode: %w", err)
@@ -106,6 +112,7 @@ func runSendWithDeps(ctx context.Context, deps sendCommandDeps, conversationID, 
 		}
 		return deps.legacySend(conversationID, message)
 	}
+	deps.controlToken = controlTokenFromDaemonStatus(status, deps.controlToken)
 	if !status.V2Send && !status.V2Primary {
 		return deps.legacySend(conversationID, message)
 	}
@@ -131,6 +138,7 @@ func runSendWithDeps(ctx context.Context, deps sendCommandDeps, conversationID, 
 		return err
 	}
 	request.Header.Set("Content-Type", "application/json")
+	attachControlToken(request, deps.controlToken)
 	response, err := deps.client.Do(request)
 	if err != nil {
 		return ambiguousSendError(key, err)
@@ -156,7 +164,7 @@ func runSendWithDeps(ctx context.Context, deps sendCommandDeps, conversationID, 
 		when := time.UnixMilli(submission.ScheduledForMS).Format(time.RFC3339)
 		fmt.Fprintf(deps.output, "scheduled; the app will send it at %s (%d ms). Do not resend.\n", when, submission.ScheduledForMS)
 	}
-	delivery, err := getOutboxDelivery(ctx, deps.client, deps.baseURL, submission.OutboxID)
+	delivery, err := getOutboxDelivery(ctx, deps.client, deps.baseURL, submission.OutboxID, deps.controlToken)
 	if err != nil {
 		if !scheduled {
 			fmt.Fprintf(deps.output, "queued; app continues in the background. Do not resend. Replay-check with the same idempotency key: %s\n", key)
@@ -169,13 +177,24 @@ func runSendWithDeps(ctx context.Context, deps sendCommandDeps, conversationID, 
 type v2DaemonStatus struct {
 	V2Send    bool `json:"v2_send"`
 	V2Primary bool `json:"v2_primary"`
+	Auth      struct {
+		DataDir string `json:"data_dir"`
+	} `json:"auth"`
 }
 
-func probeV2Status(ctx context.Context, client *http.Client, baseURL string) (v2DaemonStatus, bool, error) {
+func controlTokenFromDaemonStatus(status v2DaemonStatus, fallback string) string {
+	if strings.TrimSpace(status.Auth.DataDir) == "" {
+		return fallback
+	}
+	return loadCLIControlToken(status.Auth.DataDir)
+}
+
+func probeV2Status(ctx context.Context, client *http.Client, baseURL, token string) (v2DaemonStatus, bool, error) {
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/api/status", nil)
 	if err != nil {
 		return v2DaemonStatus{}, false, err
 	}
+	attachControlToken(request, token)
 	response, err := client.Do(request)
 	if err != nil {
 		return v2DaemonStatus{}, false, err
@@ -187,11 +206,12 @@ func probeV2Status(ctx context.Context, client *http.Client, baseURL string) (v2
 	return status, true, nil
 }
 
-func getOutboxDelivery(ctx context.Context, client *http.Client, baseURL, id string) (outboxDelivery, error) {
+func getOutboxDelivery(ctx context.Context, client *http.Client, baseURL, id, token string) (outboxDelivery, error) {
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/api/v1/outbox/"+id, nil)
 	if err != nil {
 		return outboxDelivery{}, err
 	}
+	attachControlToken(request, token)
 	response, err := client.Do(request)
 	if err != nil {
 		return outboxDelivery{}, err
@@ -311,6 +331,20 @@ func newCLIIdempotencyKey() (string, error) {
 	}, "-"), nil
 }
 
+func loadCLIControlToken(dataDir string) string {
+	b, err := os.ReadFile(filepath.Join(dataDir, web.ControlTokenFile))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(b))
+}
+
+func attachControlToken(request *http.Request, token string) {
+	if token != "" {
+		request.Header.Set("Authorization", "Bearer "+token)
+	}
+}
+
 func runSendGroupWithDeps(deps sendGroupCommandDeps, phones []string, message string) error {
 	if deps.client == nil {
 		deps.client = &http.Client{Timeout: 10 * time.Second}
@@ -318,7 +352,7 @@ func runSendGroupWithDeps(deps sendGroupCommandDeps, phones []string, message st
 	if deps.baseURL == "" {
 		deps.baseURL = localAPIBaseURL()
 	}
-	status, reachable, err := probeV2Status(context.Background(), deps.client, deps.baseURL)
+	status, reachable, err := probeV2Status(context.Background(), deps.client, deps.baseURL, deps.controlToken)
 	if err != nil {
 		if reachable {
 			return fmt.Errorf("check running OpenMessage mode: %w", err)
