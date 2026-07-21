@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -19,6 +20,26 @@ import (
 const realisticSignalGetSenderPoison = `WARN  IncomingMessageHandler - Failed to handle incoming message
 java.lang.NullPointerException: Cannot invoke "org.asamk.signal.manager.storage.recipients.RecipientId.getSender()" because "content" is null
 	at org.asamk.signal.manager.helper.IncomingMessageHandler.getSender(IncomingMessageHandler.java:412)`
+
+// syncBuffer protects test log access because the bridge's tmp-sweep goroutine,
+// started by maybeSweepTmp, can write while the test reads. zerolog.SyncWriter
+// only serializes writers, so it would not protect the test's String read.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
 
 func TestSignalCLIVersionProbeUsesExactCommandAndPrivateTemp(t *testing.T) {
 	t.Setenv("TMPDIR", t.TempDir())
@@ -224,7 +245,7 @@ func TestSignalCLIVersionGateFailsOpenWithWarning(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			var log bytes.Buffer
+			var log syncBuffer
 			bridge := &Bridge{
 				account:   "+15551230000",
 				configDir: t.TempDir(),
