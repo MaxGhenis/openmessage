@@ -280,7 +280,28 @@ func DemoMode() bool {
 	}
 }
 
+// New opens the app state for store-owning entrypoints — the daemon and
+// one-shot commands that may write (send, import) — and runs the startup
+// repair sweeps that clean legacy artifacts out of messages.db.
 func New(logger zerolog.Logger) (*App, error) {
+	return newApp(logger, true)
+}
+
+// NewClient opens the app state exactly like New — same data-dir resolution
+// and permission hardening, same store open (including schema migration) —
+// but skips the startup repair sweeps, the only write-y startup step beyond
+// the SQLite open itself. Per-session client processes use it: MCP hosts
+// spawn one `serve --mcp-stdio` per session, so with many sessions open the
+// daemon's live messages.db would otherwise absorb N concurrent repair-sweep
+// write bursts at every session start. The daemon still repairs on each of
+// its own startups via New, so the sweeps run once per daemon lifecycle
+// instead of once per client process. Demo mode still seeds its isolated
+// per-process temp store.
+func NewClient(logger zerolog.Logger) (*App, error) {
+	return newApp(logger, false)
+}
+
+func newApp(logger zerolog.Logger, runRepairSweeps bool) (*App, error) {
 	dataDir := DefaultDataDir()
 	tempDataDir := ""
 	if DemoMode() {
@@ -343,6 +364,42 @@ func New(logger zerolog.Logger) (*App, error) {
 			return nil, fmt.Errorf("secure database file %q: %w", path, err)
 		}
 	}
+	if runRepairSweeps {
+		repairStartupArtifacts(logger, store)
+	}
+
+	// Seed demo data
+	if DemoMode() {
+		if err := store.SeedDemo(); err != nil {
+			store.Close()
+			if tempDataDir != "" {
+				_ = os.RemoveAll(tempDataDir)
+			}
+			return nil, fmt.Errorf("seed demo data: %w", err)
+		}
+		logger.Info().
+			Str("data_dir", dataDir).
+			Str("db", dbPath).
+			Msg("Demo mode — using isolated fake data")
+	}
+
+	app := &App{
+		Store:               store,
+		Logger:              logger,
+		DataDir:             dataDir,
+		SessionPath:         sessionPath,
+		WhatsAppSessionPath: whatsAppSessionPath,
+		SignalConfigPath:    signalConfigPath,
+		tempDataDir:         tempDataDir,
+	}
+	return app, nil
+}
+
+// repairStartupArtifacts runs the write-y startup repair sweeps that clean
+// legacy artifacts out of the store. Every sweep is idempotent and
+// best-effort: failures are logged, never fatal. Only store-owning
+// entrypoints (New) run them; per-session clients (NewClient) must not.
+func repairStartupArtifacts(logger zerolog.Logger, store *db.Store) {
 	if report, err := store.RepairLegacyArtifacts(); err != nil {
 		logger.Warn().Err(err).Msg("Failed to repair legacy message artifacts")
 	} else {
@@ -404,32 +461,6 @@ func New(logger zerolog.Logger) (*App, error) {
 				Msg("Repaired legacy WhatsApp media placeholders from local desktop store")
 		}
 	}
-
-	// Seed demo data
-	if DemoMode() {
-		if err := store.SeedDemo(); err != nil {
-			store.Close()
-			if tempDataDir != "" {
-				_ = os.RemoveAll(tempDataDir)
-			}
-			return nil, fmt.Errorf("seed demo data: %w", err)
-		}
-		logger.Info().
-			Str("data_dir", dataDir).
-			Str("db", dbPath).
-			Msg("Demo mode — using isolated fake data")
-	}
-
-	app := &App{
-		Store:               store,
-		Logger:              logger,
-		DataDir:             dataDir,
-		SessionPath:         sessionPath,
-		WhatsAppSessionPath: whatsAppSessionPath,
-		SignalConfigPath:    signalConfigPath,
-		tempDataDir:         tempDataDir,
-	}
-	return app, nil
 }
 
 func chmodIfExists(path string, mode os.FileMode) error {

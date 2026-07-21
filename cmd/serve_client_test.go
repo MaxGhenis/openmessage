@@ -13,6 +13,8 @@ import (
 
 	"github.com/rs/zerolog"
 
+	"github.com/maxghenis/openmessage/internal/app"
+	"github.com/maxghenis/openmessage/internal/db"
 	"github.com/maxghenis/openmessage/internal/localapi"
 	"github.com/maxghenis/openmessage/internal/storage/sqlite"
 	"github.com/maxghenis/openmessage/internal/web"
@@ -221,6 +223,89 @@ func TestRunServeMCPClientAdoptsDaemonDataDir(t *testing.T) {
 	// The adopted directory now holds the client's read store.
 	if _, err := os.Stat(filepath.Join(daemonDataDir, "messages.db")); err != nil {
 		t.Fatalf("client did not open the store in the adopted dir: %v", err)
+	}
+}
+
+// seedLegacyReactionPlaceholder writes the canonical RepairLegacyArtifacts
+// trigger — a WhatsApp "[Reaction]" placeholder row — into the data dir's
+// legacy store, then closes it. Store-owning startup (app.New) deletes the
+// row; repair-free client opens (app.NewClient) must leave it in place.
+func seedLegacyReactionPlaceholder(t *testing.T, dataDir string) {
+	t.Helper()
+	store, err := db.New(filepath.Join(dataDir, "messages.db"))
+	if err != nil {
+		t.Fatalf("db.New(): %v", err)
+	}
+	defer store.Close()
+	if err := store.UpsertConversation(&db.Conversation{
+		ConversationID: "whatsapp:group@g.us",
+		Name:           "Group",
+		IsGroup:        true,
+		LastMessageTS:  3000,
+		SourcePlatform: "whatsapp",
+	}); err != nil {
+		t.Fatalf("UpsertConversation(): %v", err)
+	}
+	if err := store.UpsertMessage(&db.Message{
+		MessageID:      "whatsapp:reaction-placeholder",
+		ConversationID: "whatsapp:group@g.us",
+		Body:           "[Reaction]",
+		TimestampMS:    3000,
+		SourcePlatform: "whatsapp",
+		SourceID:       "reaction-placeholder",
+	}); err != nil {
+		t.Fatalf("UpsertMessage(): %v", err)
+	}
+}
+
+func legacyReactionPlaceholderPresent(t *testing.T, dataDir string) bool {
+	t.Helper()
+	store, err := db.New(filepath.Join(dataDir, "messages.db"))
+	if err != nil {
+		t.Fatalf("db.New(): %v", err)
+	}
+	defer store.Close()
+	m, err := store.GetMessageByID("whatsapp:reaction-placeholder")
+	if err != nil {
+		t.Fatalf("GetMessageByID(): %v", err)
+	}
+	return m != nil
+}
+
+// TestRunServeMCPClientDoesNotRepairStore pins the repair-free client open:
+// MCP hosts spawn one `serve --mcp-stdio` process per session, and the daemon
+// repairs the shared live store on its own startup — so the per-session
+// client shape must not replay the startup repair sweeps against it. A
+// store-owning open (app.New) run afterwards must repair the same row,
+// proving the seed genuinely triggers a sweep (the client assertion cannot
+// pass vacuously).
+func TestRunServeMCPClientDoesNotRepairStore(t *testing.T) {
+	dataDir := t.TempDir()
+	setClientModeTestEnv(t, dataDir)
+	seedLegacyReactionPlaceholder(t, dataDir)
+
+	var logs bytes.Buffer
+	if err := RunServe(zerolog.New(&logs), "--mcp-stdio"); err != nil {
+		t.Fatalf("RunServe(--mcp-stdio): %v\n%s", err, logs.String())
+	}
+	if !strings.Contains(logs.String(), "MCP client mode") {
+		t.Fatalf("client mode was not engaged:\n%s", logs.String())
+	}
+	if !legacyReactionPlaceholderPresent(t, dataDir) {
+		t.Fatal("MCP client mode ran the startup repair sweeps: the legacy reaction placeholder was repaired away")
+	}
+
+	// Contrast: app.New — the store-owning open the daemon runs at startup —
+	// must repair the row. Called directly rather than through a full daemon
+	// RunServe, whose transport stack keeps background goroutines holding the
+	// store briefly past return and races this verification open.
+	daemonApp, err := app.New(zerolog.Nop())
+	if err != nil {
+		t.Fatalf("app.New(): %v", err)
+	}
+	daemonApp.Close()
+	if legacyReactionPlaceholderPresent(t, dataDir) {
+		t.Fatal("app.New left the legacy reaction placeholder unrepaired (the client assertion above may be vacuous)")
 	}
 }
 

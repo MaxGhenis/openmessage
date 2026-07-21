@@ -783,9 +783,10 @@ const clientProbeTimeout = 3 * time.Second
 // the v2 dispatcher/ingest stack, sync loops, schedulers, or telemetry:
 // exactly one process (the app daemon) may own live platform connections,
 // because WhatsApp and signal-cli treat a second concurrent login as
-// credential theft and kill the session. Reads come from the local store;
-// sends and reactions route through the daemon's local HTTP API, mirroring
-// the CLI send path.
+// credential theft and kill the session. Reads come from the local store,
+// opened repair-free (app.NewClient) because the daemon owns the startup
+// repair sweeps; sends and reactions route through the daemon's local HTTP
+// API, mirroring the CLI send path.
 func runServeMCPClient(logger zerolog.Logger, opts serveOptions) error {
 	// Probe before opening any store: daemon truth decides the read mode and,
 	// when OPENMESSAGES_DATA_DIR is unset, which data directory this client
@@ -812,8 +813,8 @@ func runServeMCPClient(logger zerolog.Logger, opts serveOptions) error {
 	// Read mode. Daemon truth applies only when the daemon serves this same
 	// data directory; otherwise the environment decides, preserving the
 	// CLI's fail-fast diagnostics for invalid flag combinations. All
-	// refusals happen before app.New so a refused startup leaves no state
-	// behind.
+	// refusals happen before the store opens so a refused startup leaves no
+	// state behind.
 	dataDir := app.DefaultDataDir()
 	v2Primary := false
 	if daemonUp && daemonDataDir != "" && samePath(daemonDataDir, dataDir) {
@@ -845,7 +846,11 @@ func runServeMCPClient(logger zerolog.Logger, opts serveOptions) error {
 		}()
 	}
 
-	a, err := app.New(logger)
+	// NewClient, not New: MCP hosts spawn one of these processes per session,
+	// and the daemon already repairs the shared store on its own startup —
+	// N per-session repair sweeps against the live messages.db would be
+	// redundant concurrent write bursts.
+	a, err := app.NewClient(logger)
 	if err != nil {
 		return fmt.Errorf("init app: %w", err)
 	}

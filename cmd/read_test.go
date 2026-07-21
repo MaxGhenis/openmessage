@@ -172,3 +172,41 @@ func TestParseDayBound(t *testing.T) {
 		t.Error("expected error for invalid date")
 	}
 }
+
+// TestOpenCommandReadSourceLegacyDoesNotRepairStore pins the read-only
+// contract of the one-shot CLI reader behind `read` and `status`: opening the
+// legacy store for reads must not run the startup repair sweeps against the
+// live store it shares with the running app. (The app.New contrast leg of
+// TestRunServeMCPClientDoesNotRepairStore proves the same seeded row does
+// trigger a sweep under a store-owning open, so this cannot pass vacuously.)
+func TestOpenCommandReadSourceLegacyDoesNotRepairStore(t *testing.T) {
+	dataDir := t.TempDir()
+	t.Setenv("OPENMESSAGES_DATA_DIR", dataDir)
+	t.Setenv("OPENMESSAGES_DEMO", "0")
+	t.Setenv("OPENMESSAGES_APP_SANDBOX", "1")
+	t.Setenv("OPENMESSAGES_V2_PRIMARY", "0")
+	t.Setenv("OPENMESSAGES_V2_SEND", "0")
+	t.Setenv("OPENMESSAGES_V2_INGEST", "0")
+
+	seedLegacyReactionPlaceholder(t, dataDir)
+
+	var banner bytes.Buffer
+	session, err := openCommandReadSource(zerolog.Nop(), &banner)
+	if err != nil {
+		t.Fatalf("openCommandReadSource(): %v", err)
+	}
+	conversation, err := session.Reads.GetConversation("whatsapp:group@g.us")
+	if err != nil {
+		session.Close()
+		t.Fatalf("GetConversation(): %v", err)
+	}
+	if conversation == nil {
+		session.Close()
+		t.Fatal("seeded conversation not readable through the session")
+	}
+	session.Close()
+
+	if !legacyReactionPlaceholderPresent(t, dataDir) {
+		t.Fatal("openCommandReadSource ran the startup repair sweeps: the legacy reaction placeholder was repaired away")
+	}
+}

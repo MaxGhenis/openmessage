@@ -42,8 +42,10 @@ before touching anything. The traps that cost the most:
 
 ## Local CLI (read-only, no transports)
 
-These commands open the store directly and start no live transports, so they
-work in a one-shot terminal session without pairing or Full Disk Access:
+These commands open the store directly (repair-free, via `app.NewClient` — no
+startup repair writes to the shared live store) and start no live transports,
+so they work in a one-shot terminal session without pairing or Full Disk
+Access:
 
 ```bash
 openmessage read "<query>" [--limit N] [--phone NUMBER] [--since YYYY-MM-DD] [--until YYYY-MM-DD] [--json]
@@ -80,6 +82,9 @@ processes sharing WhatsApp/signal-cli credentials log each other out). Reads
 come from the local store (v2 when the daemon reports v2-primary for the same
 data dir); sends, reactions, and `get_status` route through the running
 daemon's HTTP API (`internal/localapi`) with the CLI's daemon-truth semantics.
+The client opens the store via `app.NewClient`, which skips the startup repair
+sweeps — those stay daemon-owned, so N concurrent sessions don't each burst
+repair writes into the live `messages.db`.
 `--transports` / `--no-transports` override the default per shape. See
 [docs/agent-runbook.md](docs/agent-runbook.md) ("MCP serving") for the failure
 mode this prevents and the `~/.mcp.json` recipe.
