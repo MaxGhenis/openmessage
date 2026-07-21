@@ -253,6 +253,42 @@ func TestDaemonSendMessageResolvesPlatformsWithoutTransports(t *testing.T) {
 		}
 	})
 
+	t.Run("sms never matches digits straddling two participant numbers", func(t *testing.T) {
+		store, err := db.New(":memory:")
+		if err != nil {
+			t.Fatalf("create db: %v", err)
+		}
+		t.Cleanup(func() { store.Close() })
+		// Concatenated participant digits are 1650555010|0123456789, which
+		// contains the target 6505550100 straddling the two numbers — yet
+		// neither participant is the target line. A substring match over
+		// joined digits would send to this wrong conversation.
+		if err := store.UpsertConversation(&db.Conversation{
+			ConversationID: "conv-straddle",
+			Name:           "Wrong people",
+			Participants:   `[{"name":"A","number":"+1650555010"},{"name":"B","number":"+0123456789"}]`,
+			SourcePlatform: "sms",
+		}); err != nil {
+			t.Fatalf("seed conversation: %v", err)
+		}
+		withReads := options
+		withReads.Reads = store
+		handler := daemonSendMessageHandler(withReads)
+
+		req := mcp.CallToolRequest{}
+		req.Params.Arguments = map[string]any{
+			"recipient": "+16505550100",
+			"message":   "hi",
+		}
+		result, err := handler(context.Background(), req)
+		if err != nil {
+			t.Fatalf("handler: %v", err)
+		}
+		if !result.IsError {
+			t.Fatal("straddling digit sequence must not resolve to a conversation")
+		}
+	})
+
 	t.Run("sms with existing conversation", func(t *testing.T) {
 		store, err := db.New(":memory:")
 		if err != nil {

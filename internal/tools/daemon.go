@@ -2,6 +2,7 @@ package tools
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -421,8 +422,12 @@ func daemonReactToMessageHandler(options Options) server.ToolHandlerFunc {
 }
 
 // findDirectSMSConversation scans recent conversations for a non-group
-// SMS/RCS thread whose participants include the phone number. Matching is by
-// digit suffix so +1 (650) 555-0100, 6505550100, and +16505550100 all meet.
+// SMS/RCS thread with one participant whose number matches the phone.
+// Matching compares each participant's number individually by digit suffix
+// (so +1 (650) 555-0100, 6505550100, and +16505550100 all meet) — never a
+// substring search over concatenated participant digits, which could match a
+// sequence straddling two different numbers and route the send to the wrong
+// person.
 func findDirectSMSConversation(reads readsource.ReadSource, phone string) (*db.Conversation, error) {
 	if reads == nil {
 		return nil, fmt.Errorf("no read source available")
@@ -442,19 +447,37 @@ func findDirectSMSConversation(reads readsource.ReadSource, phone string) (*db.C
 		if conversation == nil || conversation.IsGroup {
 			continue
 		}
-		platform := normalizedPlatform(conversation.SourcePlatform)
-		if platform != "sms" {
+		if normalizedPlatform(conversation.SourcePlatform) != "sms" {
 			continue
 		}
-		participantDigits := digitsOnly(conversation.Participants)
-		if participantDigits == "" {
+		var participants []struct {
+			Number string `json:"number"`
+			Phone  string `json:"phone"`
+		}
+		if err := json.Unmarshal([]byte(conversation.Participants), &participants); err != nil {
 			continue
 		}
-		if strings.Contains(participantDigits, digits) {
-			return conversation, nil
+		for _, participant := range participants {
+			if phoneDigitsMatch(digits, firstNonEmpty(participant.Number, participant.Phone)) {
+				return conversation, nil
+			}
 		}
 	}
 	return nil, nil
+}
+
+// phoneDigitsMatch reports whether a stored participant number denotes the
+// same line as the wanted digits (already trimmed to the last 10). One side
+// may carry a country prefix the other lacks, so the shorter digit string
+// must be a suffix of the longer; a 7-digit floor keeps short fragments from
+// matching everything.
+func phoneDigitsMatch(wantedDigits, participantNumber string) bool {
+	participantDigits := digitsOnly(participantNumber)
+	if len(participantDigits) < 7 || len(wantedDigits) < 7 {
+		return false
+	}
+	return strings.HasSuffix(participantDigits, wantedDigits) ||
+		strings.HasSuffix(wantedDigits, participantDigits)
 }
 
 // daemonGetStatusHandler serves get_status in client mode: daemon truth when
