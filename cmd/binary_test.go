@@ -209,6 +209,9 @@ func TestBuiltBinaryV2FlagOffDoesNotCreateV2Directory(t *testing.T) {
 		"OPENMESSAGES_MACOS_NOTIFICATIONS=0",
 		"OPENMESSAGES_LOG_LEVEL=info",
 		"OPENMESSAGE_TELEMETRY=0",
+		// Hermetic daemon probe for the MCP client shape: never reach a
+		// real daemon that may be running on the test machine.
+		"OPENMESSAGES_PORT=0",
 	)
 	cmd.Stdin = strings.NewReader("")
 	output, err := cmd.CombinedOutput()
@@ -224,10 +227,46 @@ func TestBuiltBinaryV2FlagOffDoesNotCreateV2Directory(t *testing.T) {
 	}
 }
 
-func TestBuiltBinaryV2IngestFlagCreatesV2Directory(t *testing.T) {
+// TestBuiltBinaryMCPStdioClientShapeStartsNoTransports is the end-to-end
+// regression test for the MCP fratricide bug: the per-session `serve
+// --mcp-stdio` spawn must not initialize any transport state — a second
+// process reusing the daemon's WhatsApp device credentials or signal-cli
+// account logs the daemon out.
+func TestBuiltBinaryMCPStdioClientShapeStartsNoTransports(t *testing.T) {
 	binary, dataDir := buildTestBinary(t)
 
 	cmd := exec.Command(binary, "serve", "--mcp-stdio")
+	cmd.Env = append(
+		os.Environ(),
+		"OPENMESSAGES_DATA_DIR="+dataDir,
+		"OPENMESSAGES_DEMO=0",
+		"OPENMESSAGES_APP_SANDBOX=1",
+		"OPENMESSAGES_MACOS_NOTIFICATIONS=0",
+		"OPENMESSAGES_LOG_LEVEL=info",
+		"OPENMESSAGE_TELEMETRY=0",
+		"OPENMESSAGES_PORT=0",
+	)
+	cmd.Stdin = strings.NewReader("")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("serve --mcp-stdio: %v\n%s", err, output)
+	}
+	if !strings.Contains(string(output), "MCP client mode") {
+		t.Fatalf("client mode was not engaged:\n%s", output)
+	}
+	for _, forbidden := range []string{"whatsapp-session.db", "signal-cli", "v2"} {
+		if _, err := os.Stat(filepath.Join(dataDir, forbidden)); !os.IsNotExist(err) {
+			t.Errorf("client shape created transport state %q (stat err = %v)\n%s", forbidden, err, output)
+		}
+	}
+}
+
+func TestBuiltBinaryV2IngestFlagCreatesV2Directory(t *testing.T) {
+	binary, dataDir := buildTestBinary(t)
+
+	// --transports keeps this the daemon shape: the MCP-stdio-only client
+	// shape intentionally never provisions the v2 stack.
+	cmd := exec.Command(binary, "serve", "--mcp-stdio", "--transports")
 	cmd.Env = append(
 		os.Environ(),
 		"OPENMESSAGES_DATA_DIR="+dataDir,
@@ -242,7 +281,7 @@ func TestBuiltBinaryV2IngestFlagCreatesV2Directory(t *testing.T) {
 	cmd.Stdin = strings.NewReader("")
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		t.Fatalf("serve --mcp-stdio: %v\n%s", err, output)
+		t.Fatalf("serve --mcp-stdio --transports: %v\n%s", err, output)
 	}
 	if !strings.Contains(string(output), "Starting MCP stdio transport") {
 		t.Fatalf("serve did not reach MCP stdio startup:\n%s", output)

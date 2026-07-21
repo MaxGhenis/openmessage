@@ -84,6 +84,9 @@ func TestRunServeV2PrimaryFailsFast(t *testing.T) {
 			t.Setenv("OPENMESSAGES_APP_SANDBOX", "1")
 			t.Setenv("OPENMESSAGES_MACOS_NOTIFICATIONS", "0")
 			t.Setenv("OPENMESSAGE_TELEMETRY", "0")
+			// Keep the client shape's daemon probe hermetic: never reach a
+			// real daemon that may be running on the test machine.
+			t.Setenv("OPENMESSAGES_PORT", "0")
 
 			err := RunServe(zerolog.Nop(), tt.args...)
 			if err == nil {
@@ -109,38 +112,62 @@ func TestRunServeV2PrimaryFailsFast(t *testing.T) {
 }
 
 func TestRunServeV2PrimaryRejectsCorruptPresentStoreWithoutFallback(t *testing.T) {
-	dataDir := t.TempDir()
-	v2Dir := filepath.Join(dataDir, "v2")
-	if err := os.MkdirAll(v2Dir, 0o700); err != nil {
-		t.Fatalf("create v2 dir: %v", err)
+	tests := []struct {
+		name           string
+		args           []string
+		errorContains  string
+		wantNoLegacyDB bool
+	}{
+		// Daemon shape (explicit transports): the full v2 stack refuses.
+		{name: "daemon shape", args: []string{"--mcp-stdio", "--transports"}, errorContains: "init v2 stack"},
+		// MCP client shape: the read-store attach refuses before app init,
+		// so the refusal leaves no legacy store behind either.
+		{name: "client shape", args: []string{"--mcp-stdio"}, errorContains: "open v2 read store", wantNoLegacyDB: true},
 	}
-	storePath := filepath.Join(v2Dir, "store.sqlite3")
-	corrupt := []byte("not a sqlite database")
-	if err := os.WriteFile(storePath, corrupt, 0o600); err != nil {
-		t.Fatalf("write corrupt store: %v", err)
-	}
-	t.Setenv("OPENMESSAGES_DATA_DIR", dataDir)
-	t.Setenv("OPENMESSAGES_DEMO", "0")
-	t.Setenv("OPENMESSAGES_V2_PRIMARY", "1")
-	t.Setenv("OPENMESSAGES_V2_SEND", "")
-	t.Setenv("OPENMESSAGES_V2_INGEST", "")
-	t.Setenv("OPENMESSAGES_APP_SANDBOX", "1")
-	t.Setenv("OPENMESSAGES_MACOS_NOTIFICATIONS", "0")
-	t.Setenv("OPENMESSAGE_TELEMETRY", "0")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dataDir := t.TempDir()
+			v2Dir := filepath.Join(dataDir, "v2")
+			if err := os.MkdirAll(v2Dir, 0o700); err != nil {
+				t.Fatalf("create v2 dir: %v", err)
+			}
+			storePath := filepath.Join(v2Dir, "store.sqlite3")
+			corrupt := []byte("not a sqlite database")
+			if err := os.WriteFile(storePath, corrupt, 0o600); err != nil {
+				t.Fatalf("write corrupt store: %v", err)
+			}
+			t.Setenv("OPENMESSAGES_DATA_DIR", dataDir)
+			t.Setenv("OPENMESSAGES_DEMO", "0")
+			t.Setenv("OPENMESSAGES_V2_PRIMARY", "1")
+			t.Setenv("OPENMESSAGES_V2_SEND", "")
+			t.Setenv("OPENMESSAGES_V2_INGEST", "")
+			t.Setenv("OPENMESSAGES_APP_SANDBOX", "1")
+			t.Setenv("OPENMESSAGES_MACOS_NOTIFICATIONS", "0")
+			t.Setenv("OPENMESSAGE_TELEMETRY", "0")
+			// Keep the client shape's daemon probe hermetic: never reach a
+			// real daemon that may be running on the test machine.
+			t.Setenv("OPENMESSAGES_PORT", "0")
 
-	err := RunServe(zerolog.Nop(), "--mcp-stdio")
-	if err == nil || !strings.Contains(err.Error(), "init v2 stack") {
-		t.Fatalf("RunServe() error = %v, want corrupt v2 store startup failure", err)
-	}
-	got, readErr := os.ReadFile(storePath)
-	if readErr != nil {
-		t.Fatalf("read corrupt sentinel: %v", readErr)
-	}
-	if !bytes.Equal(got, corrupt) {
-		t.Fatalf("corrupt v2 store was replaced: got %q, want %q", got, corrupt)
-	}
-	if _, statErr := os.Stat(filepath.Join(v2Dir, "blobs")); !os.IsNotExist(statErr) {
-		t.Fatalf("corrupt-store refusal continued into v2 blob setup: %v", statErr)
+			err := RunServe(zerolog.Nop(), tt.args...)
+			if err == nil || !strings.Contains(err.Error(), tt.errorContains) {
+				t.Fatalf("RunServe() error = %v, want corrupt v2 store startup failure containing %q", err, tt.errorContains)
+			}
+			got, readErr := os.ReadFile(storePath)
+			if readErr != nil {
+				t.Fatalf("read corrupt sentinel: %v", readErr)
+			}
+			if !bytes.Equal(got, corrupt) {
+				t.Fatalf("corrupt v2 store was replaced: got %q, want %q", got, corrupt)
+			}
+			if _, statErr := os.Stat(filepath.Join(v2Dir, "blobs")); !os.IsNotExist(statErr) {
+				t.Fatalf("corrupt-store refusal continued into v2 blob setup: %v", statErr)
+			}
+			if tt.wantNoLegacyDB {
+				if _, statErr := os.Stat(filepath.Join(dataDir, "messages.db")); !os.IsNotExist(statErr) {
+					t.Fatalf("corrupt-store refusal touched the legacy store: %v", statErr)
+				}
+			}
+		})
 	}
 }
 

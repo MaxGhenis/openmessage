@@ -43,6 +43,75 @@ GET /api/search?q=<term>
 Outgoing message rows carry a `Status`: `OUTGOING_SENDING` → `OUTGOING_SENT`/
 `OUTGOING_DELIVERED`, or `OUTGOING_FAILED:<STATUS>` when a send is rejected.
 
+## MCP serving — exactly one process may own live transports
+
+**The failure mode (empirically confirmed 2026-07-20):** `openmessage serve
+--mcp-stdio` used to start the **full transport stack** — the Google,
+WhatsApp, and Signal supervisors auto-started in every serve mode. MCP hosts
+(Claude Code via `~/.mcp.json`, Claude Desktop) spawn one such process **per
+session**, each connecting with the **same WhatsApp device credentials and
+signal-cli account as the running app**. WhatsApp treats that as a second
+device login and kills the session — a fresh pairing at 20:40:41 was dead with
+`401: logged out from another device` by 20:41:07, seconds after two Claude
+MCP processes spawned. Concurrent signal-cli pollers likewise corrupt/deauth
+Signal (the 2026-07-13 WhatsApp logout and Signal's `needs_reauth` death were
+this same fratricide). `instance.lock` never protected against this — only
+`backup` and `migrate` honor it.
+
+**The fix: MCP client mode.** `serve --mcp-stdio` with no other transport
+(the exact shape MCP hosts spawn) is now a **transportless client** of the
+running app:
+
+- **Zero transport supervisors, zero dispatchers, zero sync loops, zero
+  schedulers, zero telemetry.** The app daemon owns all of those. Regression
+  tests: `TestRunServeMCPStdioStartsZeroTransportSupervisors` (cmd) and
+  `TestBuiltBinaryMCPStdioClientShapeStartsNoTransports` (binary-level).
+- **Reads stay local** (store attach, WAL-safe). At startup the client probes
+  the daemon (`/api/status`); if the daemon serves the same data dir and
+  reports v2-primary, the client reads the v2 store. With the daemon down it
+  falls back to `OPENMESSAGES_V2_*` env exactly like `openmessage read`.
+  If `OPENMESSAGES_DATA_DIR` is unset, the client adopts the data dir the
+  daemon reports — set it explicitly in the MCP config anyway (see below).
+- **Sends/reactions route through the daemon** (`/api/v1/outbox` on v2,
+  `/api/send`+`/api/react` on legacy), like the CLI has done since PR #140,
+  with the same do-not-resend idempotency contract. With the app closed,
+  send tools return an actionable "start the OpenMessage app" error — they
+  never fall back to opening their own connections.
+- Escape hatches: `--transports` forces the old standalone full-stack stdio
+  behavior (only for machines where the MCP process is the *only* OpenMessage
+  process, ever); `--no-transports` strips transports from a **legacy-mode**
+  web/SSE shape (degraded debug instance: local reads work, sends fail with
+  "not connected"). On a **v2-primary** install a `--web --no-transports`
+  process refuses to start — the v2 read path there needs the dispatcher
+  stack — so use the MCP client shape or `openmessage read` for store access
+  instead.
+
+**MCP config (`~/.mcp.json`) for a macOS app install:**
+
+```json
+"openmessage": {
+  "command": "/usr/local/bin/openmessage",
+  "args": ["serve", "--mcp-stdio"],
+  "env": {
+    "OPENMESSAGES_DATA_DIR": "/Users/<user>/Library/Application Support/OpenMessage",
+    "OPENMESSAGES_V2_PRIMARY": "1"
+  }
+}
+```
+
+Pin `OPENMESSAGES_DATA_DIR` to the app's dir so reads, the control token, and
+daemon-truth detection all line up (two-data-dirs trap above). On a migrated
+(v2-primary) install, also set `OPENMESSAGES_V2_PRIMARY=1` — the legacy
+`messages.db` froze at cutover, and this keeps MCP reads on the v2 store even
+when the app is closed or predates the `auth.data_dir` status field (drop the
+line on a non-migrated install). Keep the PATH binary in lockstep with the
+installed app — both open the same SQLite stores and a version-skewed binary
+can migrate the schema under the older one.
+
+**Never** configure MCP to run `serve --web`, `serve --mcp-sse`, or
+`serve ... --transports` alongside the app: those are daemon shapes and will
+fight the app for the WhatsApp/Signal sessions exactly as described above.
+
 ## Pairing & the "zombie session"
 
 **Symptom:** sends fail with `OUTGOING_FAILED:UNKNOWN`; `/api/status` shows

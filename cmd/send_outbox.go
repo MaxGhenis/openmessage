@@ -1,23 +1,19 @@
 package cmd
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/maxghenis/openmessage/internal/app"
-	"github.com/maxghenis/openmessage/internal/web"
+	"github.com/maxghenis/openmessage/internal/localapi"
 )
 
 type sendCommandDeps struct {
@@ -38,20 +34,13 @@ type sendGroupCommandDeps struct {
 	controlToken string
 }
 
-type outboxSubmission struct {
-	OutboxID       string `json:"outbox_id"`
-	State          string `json:"state"`
-	ScheduledForMS int64  `json:"scheduled_for_ms"`
-	Deduplicated   bool   `json:"deduplicated"`
-}
-
-type outboxDelivery struct {
-	OutboxID        string `json:"outbox_id"`
-	State           string `json:"state"`
-	RemoteMessageID string `json:"remote_message_id"`
-	ErrorClass      string `json:"error_class"`
-	Warning         string `json:"warning"`
-}
+// outboxSubmission and outboxDelivery are the CLI's names for the shared
+// local API wire types.
+type (
+	outboxSubmission = localapi.Submission
+	outboxDelivery   = localapi.Delivery
+	v2DaemonStatus   = localapi.DaemonStatus
+)
 
 func defaultSendCommandDeps(legacy func(string, string) error) sendCommandDeps {
 	return sendCommandDeps{
@@ -80,11 +69,15 @@ func defaultSendGroupCommandDeps(legacy func([]string, string) error) sendGroupC
 }
 
 func localAPIBaseURL() string {
-	port := strings.TrimSpace(os.Getenv("OPENMESSAGES_PORT"))
-	if port == "" {
-		port = "7007"
+	return localapi.DefaultBaseURL()
+}
+
+func (deps sendCommandDeps) daemonClient() *localapi.Client {
+	return &localapi.Client{
+		BaseURL: deps.baseURL,
+		HTTP:    deps.client,
+		Token:   deps.controlToken,
 	}
-	return "http://" + net.JoinHostPort("127.0.0.1", port)
 }
 
 func runSendWithDeps(ctx context.Context, deps sendCommandDeps, conversationID, message string, notBeforeMS *int64) error {
@@ -98,7 +91,8 @@ func runSendWithDeps(ctx context.Context, deps sendCommandDeps, conversationID, 
 		deps.output = os.Stdout
 	}
 
-	status, reachable, err := probeV2Status(ctx, deps.client, deps.baseURL, deps.controlToken)
+	daemon := deps.daemonClient()
+	status, reachable, err := daemon.Status(ctx)
 	if err != nil {
 		if reachable {
 			return fmt.Errorf("check running OpenMessage mode: %w", err)
@@ -112,7 +106,7 @@ func runSendWithDeps(ctx context.Context, deps sendCommandDeps, conversationID, 
 		}
 		return deps.legacySend(conversationID, message)
 	}
-	deps.controlToken = controlTokenFromDaemonStatus(status, deps.controlToken)
+	daemon.Token = controlTokenFromDaemonStatus(status, deps.controlToken)
 	if !status.V2Send && !status.V2Primary {
 		return deps.legacySend(conversationID, message)
 	}
@@ -123,35 +117,17 @@ func runSendWithDeps(ctx context.Context, deps sendCommandDeps, conversationID, 
 	if err != nil {
 		return err
 	}
-	payload := struct {
-		ConversationID string `json:"conversation_id"`
-		Body           string `json:"body"`
-		IdempotencyKey string `json:"idempotency_key"`
-		NotBeforeMS    *int64 `json:"not_before_ms,omitempty"`
-	}{conversationID, message, key, notBeforeMS}
-	body, err := json.Marshal(payload)
+	submission, err := daemon.SubmitText(ctx, localapi.TextSubmission{
+		ConversationID: conversationID,
+		Body:           message,
+		IdempotencyKey: key,
+		NotBeforeMS:    notBeforeMS,
+	})
 	if err != nil {
-		return fmt.Errorf("encode outbox submission: %w", err)
-	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, deps.baseURL+"/api/v1/outbox/messages", bytes.NewReader(body))
-	if err != nil {
-		return err
-	}
-	request.Header.Set("Content-Type", "application/json")
-	attachControlToken(request, deps.controlToken)
-	response, err := deps.client.Do(request)
-	if err != nil {
-		return ambiguousSendError(key, err)
-	}
-	var submission outboxSubmission
-	if err := decodeCLIResponse(response, &submission); err != nil {
-		if isDeterministicRejection(err) {
+		if localapi.IsDeterministicRejection(err) {
 			return deterministicRejectionError(err)
 		}
 		return ambiguousSendError(key, err)
-	}
-	if submission.OutboxID == "" {
-		return ambiguousSendError(key, fmt.Errorf("submission response omitted outbox_id"))
 	}
 
 	fmt.Fprintf(deps.output, "outbox_id=%s state=%s idempotency_key=%s deduplicated=%t", submission.OutboxID, submission.State, key, submission.Deduplicated)
@@ -164,7 +140,7 @@ func runSendWithDeps(ctx context.Context, deps sendCommandDeps, conversationID, 
 		when := time.UnixMilli(submission.ScheduledForMS).Format(time.RFC3339)
 		fmt.Fprintf(deps.output, "scheduled; the app will send it at %s (%d ms). Do not resend.\n", when, submission.ScheduledForMS)
 	}
-	delivery, err := getOutboxDelivery(ctx, deps.client, deps.baseURL, submission.OutboxID, deps.controlToken)
+	delivery, err := daemon.Delivery(ctx, submission.OutboxID)
 	if err != nil {
 		if !scheduled {
 			fmt.Fprintf(deps.output, "queued; app continues in the background. Do not resend. Replay-check with the same idempotency key: %s\n", key)
@@ -174,14 +150,6 @@ func runSendWithDeps(ctx context.Context, deps sendCommandDeps, conversationID, 
 	return writeCLIDelivery(deps.output, delivery, key, scheduled)
 }
 
-type v2DaemonStatus struct {
-	V2Send    bool `json:"v2_send"`
-	V2Primary bool `json:"v2_primary"`
-	Auth      struct {
-		DataDir string `json:"data_dir"`
-	} `json:"auth"`
-}
-
 func controlTokenFromDaemonStatus(status v2DaemonStatus, fallback string) string {
 	if strings.TrimSpace(status.Auth.DataDir) == "" {
 		return fallback
@@ -189,75 +157,8 @@ func controlTokenFromDaemonStatus(status v2DaemonStatus, fallback string) string
 	return loadCLIControlToken(status.Auth.DataDir)
 }
 
-func probeV2Status(ctx context.Context, client *http.Client, baseURL, token string) (v2DaemonStatus, bool, error) {
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/api/status", nil)
-	if err != nil {
-		return v2DaemonStatus{}, false, err
-	}
-	attachControlToken(request, token)
-	response, err := client.Do(request)
-	if err != nil {
-		return v2DaemonStatus{}, false, err
-	}
-	var status v2DaemonStatus
-	if err := decodeCLIResponse(response, &status); err != nil {
-		return v2DaemonStatus{}, true, err
-	}
-	return status, true, nil
-}
-
-func getOutboxDelivery(ctx context.Context, client *http.Client, baseURL, id, token string) (outboxDelivery, error) {
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/api/v1/outbox/"+id, nil)
-	if err != nil {
-		return outboxDelivery{}, err
-	}
-	attachControlToken(request, token)
-	response, err := client.Do(request)
-	if err != nil {
-		return outboxDelivery{}, err
-	}
-	var delivery outboxDelivery
-	err = decodeCLIResponse(response, &delivery)
-	return delivery, err
-}
-
-func decodeCLIResponse(response *http.Response, target any) error {
-	defer response.Body.Close()
-	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		body, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
-		return &cliResponseError{StatusCode: response.StatusCode, Body: strings.TrimSpace(string(body))}
-	}
-	if err := json.NewDecoder(response.Body).Decode(target); err != nil {
-		return fmt.Errorf("decode local API response: %w", err)
-	}
-	return nil
-}
-
-type cliResponseError struct {
-	StatusCode int
-	Body       string
-}
-
-func (e *cliResponseError) Error() string {
-	return fmt.Sprintf("local API returned HTTP %d: %s", e.StatusCode, e.Body)
-}
-
-func isDeterministicRejection(err error) bool {
-	var responseErr *cliResponseError
-	if !errors.As(err, &responseErr) {
-		return false
-	}
-	switch responseErr.StatusCode {
-	case http.StatusBadRequest, http.StatusNotFound, http.StatusConflict, http.StatusRequestEntityTooLarge, http.StatusUnprocessableEntity:
-		return true
-	default:
-		return false
-	}
-}
-
 func deterministicRejectionError(err error) error {
-	var responseErr *cliResponseError
-	if errors.As(err, &responseErr) && responseErr.StatusCode == http.StatusConflict {
+	if responseErr, ok := localapi.AsResponseError(err); ok && responseErr.StatusCode == http.StatusConflict {
 		return fmt.Errorf("send rejected: %s; this key already carries different content; use a new key to send this message", responseErr.Body)
 	}
 	return fmt.Errorf("send rejected: %w", err)
@@ -332,17 +233,7 @@ func newCLIIdempotencyKey() (string, error) {
 }
 
 func loadCLIControlToken(dataDir string) string {
-	b, err := os.ReadFile(filepath.Join(dataDir, web.ControlTokenFile))
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(string(b))
-}
-
-func attachControlToken(request *http.Request, token string) {
-	if token != "" {
-		request.Header.Set("Authorization", "Bearer "+token)
-	}
+	return localapi.LoadControlToken(dataDir)
 }
 
 func runSendGroupWithDeps(deps sendGroupCommandDeps, phones []string, message string) error {
@@ -352,7 +243,8 @@ func runSendGroupWithDeps(deps sendGroupCommandDeps, phones []string, message st
 	if deps.baseURL == "" {
 		deps.baseURL = localAPIBaseURL()
 	}
-	status, reachable, err := probeV2Status(context.Background(), deps.client, deps.baseURL, deps.controlToken)
+	daemon := &localapi.Client{BaseURL: deps.baseURL, HTTP: deps.client, Token: deps.controlToken}
+	status, reachable, err := daemon.Status(context.Background())
 	if err != nil {
 		if reachable {
 			return fmt.Errorf("check running OpenMessage mode: %w", err)
