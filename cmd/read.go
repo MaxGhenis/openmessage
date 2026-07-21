@@ -60,7 +60,10 @@ func openCommandReadSource(
 		}, nil
 	}
 
-	a, err := app.New(logger)
+	// NewClient, not New: read and status are advertised as read-only
+	// commands, and the daemon owns the startup repair sweeps — a one-shot
+	// reader must not write to the live store it shares with the running app.
+	a, err := app.NewClient(logger)
 	if err != nil {
 		return nil, fmt.Errorf("init app: %w", err)
 	}

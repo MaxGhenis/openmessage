@@ -72,6 +72,16 @@ running app:
   falls back to `OPENMESSAGES_V2_*` env exactly like `openmessage read`.
   If `OPENMESSAGES_DATA_DIR` is unset, the client adopts the data dir the
   daemon reports — set it explicitly in the MCP config anyway (see below).
+- **The store opens repair-free** (`app.NewClient`): the startup repair
+  sweeps (legacy artifacts, contentless recency, tapbacks, empty stubs,
+  WhatsApp media placeholders) run only in store-owning entrypoints
+  (`app.New` — the daemon and write-capable CLI commands). One client spawns
+  per Claude session, so dozens of concurrent sessions must not each burst
+  repair writes into the live `messages.db`. The read-only CLI
+  (`read`/`status`) opens the legacy store the same way. Regression tests:
+  `TestNewClientPerformsNoStoreWrites` (internal/app),
+  `TestRunServeMCPClientDoesNotRepairStore` and
+  `TestOpenCommandReadSourceLegacyDoesNotRepairStore` (cmd).
 - **Sends/reactions route through the daemon** (`/api/v1/outbox` on v2,
   `/api/send`+`/api/react` on legacy), like the CLI has done since PR #140,
   with the same do-not-resend idempotency contract. With the app closed,
