@@ -418,6 +418,32 @@ func TestDaemonGetStatus(t *testing.T) {
 		}
 	})
 
+	t.Run("answering-but-erroring daemon is not reported as closed", func(t *testing.T) {
+		mux := http.NewServeMux()
+		mux.HandleFunc("/api/status", func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, "control token rejected", http.StatusUnauthorized)
+		})
+		a := testApp(t)
+		options := Options{Reads: a.Store, Daemon: daemonClientFor(t, mux)}
+		handler := daemonGetStatusHandler(a, options)
+
+		result, err := handler(context.Background(), mcp.CallToolRequest{})
+		if err != nil {
+			t.Fatalf("handler: %v", err)
+		}
+		payload := structuredMap(t, result)
+		if payload["daemon_reachable"] != true {
+			t.Fatalf("payload = %v", payload)
+		}
+		text := resultText(t, result)
+		if strings.Contains(text, "NOT RUNNING") {
+			t.Fatalf("an answering daemon must not be reported as closed: %q", text)
+		}
+		if !strings.Contains(text, "ANSWERING but status unavailable") {
+			t.Fatalf("status text = %q", text)
+		}
+	})
+
 	t.Run("daemon down reports local-only mode", func(t *testing.T) {
 		a := testApp(t)
 		options := Options{Reads: a.Store, Daemon: deadDaemonClient()}

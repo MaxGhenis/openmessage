@@ -178,6 +178,52 @@ func TestRunServeMCPClientAdoptsDaemonTruth(t *testing.T) {
 	}
 }
 
+// TestRunServeMCPClientAdoptsDaemonDataDir verifies that with no
+// OPENMESSAGES_DATA_DIR pinned, the client adopts the data directory the
+// running daemon reports, so an env-less MCP spawn serves the app's store
+// instead of the stale CLI-default directory.
+func TestRunServeMCPClientAdoptsDaemonDataDir(t *testing.T) {
+	daemonDataDir := t.TempDir()
+
+	daemon := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{
+			"connected": true,
+			"auth":      map[string]any{"data_dir": daemonDataDir},
+		})
+	}))
+	defer daemon.Close()
+	daemonURL, err := url.Parse(daemon.URL)
+	if err != nil {
+		t.Fatalf("parse daemon URL: %v", err)
+	}
+
+	// setClientModeTestEnv pins OPENMESSAGES_DATA_DIR (t.Setenv registers the
+	// restore); the unset afterwards is what this test is about. If adoption
+	// regresses, app.New would fall through to the real CLI-default dir, so
+	// fail fast on the log assertion rather than writing there.
+	setClientModeTestEnv(t, t.TempDir())
+	t.Setenv("OPENMESSAGES_PORT", daemonURL.Port())
+	if err := os.Unsetenv("OPENMESSAGES_DATA_DIR"); err != nil {
+		t.Fatalf("unset data dir: %v", err)
+	}
+
+	var logs bytes.Buffer
+	if err := RunServe(zerolog.New(&logs), "--mcp-stdio"); err != nil {
+		t.Fatalf("RunServe(--mcp-stdio): %v\n%s", err, logs.String())
+	}
+	logOutput := logs.String()
+	if !strings.Contains(logOutput, "adopted the running app's data directory") {
+		t.Fatalf("data dir adoption did not happen:\n%s", logOutput)
+	}
+	if !strings.Contains(logOutput, daemonDataDir) {
+		t.Fatalf("adopted dir was not the daemon's:\n%s", logOutput)
+	}
+	// The adopted directory now holds the client's read store.
+	if _, err := os.Stat(filepath.Join(daemonDataDir, "messages.db")); err != nil {
+		t.Fatalf("client did not open the store in the adopted dir: %v", err)
+	}
+}
+
 // TestControlTokenFileConstantsAgree pins the localapi copy of the control
 // token filename to the web package's authoritative constant.
 func TestControlTokenFileConstantsAgree(t *testing.T) {

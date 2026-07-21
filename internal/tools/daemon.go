@@ -487,8 +487,20 @@ func daemonGetStatusHandler(a *app.App, options Options) server.ToolHandlerFunc 
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		raw, err := daemon.RawStatus(ctx)
 		if err != nil {
+			// A ResponseError means something answered on the daemon port but
+			// refused or garbled the status request — that is not the same as
+			// "the app is closed", so say so.
+			reachable := false
+			if _, ok := localapi.AsResponseError(err); ok {
+				reachable = true
+			}
 			var sb strings.Builder
-			sb.WriteString("OpenMessage app: NOT RUNNING\n")
+			if reachable {
+				fmt.Fprintf(&sb, "OpenMessage app: ANSWERING but status unavailable (%v)\n", err)
+				sb.WriteString("Something is listening on the daemon port but did not return a usable status document. If this persists, check the app version and the control token (OPENMESSAGES_DATA_DIR must point at the app's data directory).\n")
+			} else {
+				sb.WriteString("OpenMessage app: NOT RUNNING\n")
+			}
 			sb.WriteString("This MCP server runs in transportless client mode: local reads (search, conversations, history) work from the store, but sends and live platform status require the app. Start the OpenMessage app to send.\n")
 			if stats, statsErr := options.Reads.PlatformStats(); statsErr == nil {
 				sb.WriteString("\nStored messages by platform:\n")
@@ -503,7 +515,7 @@ func daemonGetStatusHandler(a *app.App, options Options) server.ToolHandlerFunc 
 			fmt.Fprintf(&sb, "\nData dir: %s\n", a.DataDir)
 			return structuredResult(map[string]any{
 				"mcp_mode":         "client",
-				"daemon_reachable": false,
+				"daemon_reachable": reachable,
 				"data_dir":         a.DataDir,
 				"probe_error":      err.Error(),
 			}, sb.String()), nil

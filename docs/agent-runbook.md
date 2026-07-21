@@ -79,7 +79,12 @@ running app:
   never fall back to opening their own connections.
 - Escape hatches: `--transports` forces the old standalone full-stack stdio
   behavior (only for machines where the MCP process is the *only* OpenMessage
-  process, ever); `--no-transports` strips transports from any other shape.
+  process, ever); `--no-transports` strips transports from a **legacy-mode**
+  web/SSE shape (degraded debug instance: local reads work, sends fail with
+  "not connected"). On a **v2-primary** install a `--web --no-transports`
+  process refuses to start — the v2 read path there needs the dispatcher
+  stack — so use the MCP client shape or `openmessage read` for store access
+  instead.
 
 **MCP config (`~/.mcp.json`) for a macOS app install:**
 
