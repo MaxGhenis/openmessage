@@ -71,6 +71,19 @@ openmessage import imessage                     # reads ~/Library/Messages/chat.
 openmessage import whatsapp /path/to/chat.txt --name "Your Name"
 ```
 
+### MCP serving modes
+
+`serve --mcp-stdio` (the shape MCP hosts spawn per session) runs as a
+**transportless client**: it starts zero transport supervisors, dispatchers,
+sync loops, or schedulers — the app daemon owns all live connections (two
+processes sharing WhatsApp/signal-cli credentials log each other out). Reads
+come from the local store (v2 when the daemon reports v2-primary for the same
+data dir); sends, reactions, and `get_status` route through the running
+daemon's HTTP API (`internal/localapi`) with the CLI's daemon-truth semantics.
+`--transports` / `--no-transports` override the default per shape. See
+[docs/agent-runbook.md](docs/agent-runbook.md) ("MCP serving") for the failure
+mode this prevents and the `~/.mcp.json` recipe.
+
 ### MCP tools
 
 24 tools registered (see internal/tools/tools.go Register for the authoritative list):

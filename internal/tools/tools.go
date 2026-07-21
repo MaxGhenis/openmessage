@@ -11,6 +11,7 @@ import (
 
 	"github.com/maxghenis/openmessage/internal/app"
 	"github.com/maxghenis/openmessage/internal/db"
+	"github.com/maxghenis/openmessage/internal/localapi"
 	"github.com/maxghenis/openmessage/internal/readsource"
 )
 
@@ -20,6 +21,13 @@ type Options struct {
 	Reads     readsource.ReadSource
 	V2Primary bool
 	V2        *V2Dependencies
+
+	// Daemon switches the send-path tools into transportless client mode:
+	// this process holds no live platform connections, and every send,
+	// reaction, and live-status read is routed at the running app's local
+	// HTTP API. Mutually exclusive with V2 (client mode never runs its own
+	// dispatcher).
+	Daemon *localapi.Client
 }
 
 func Register(s *server.MCPServer, a *app.App, v2 ...*V2Dependencies) {
@@ -52,21 +60,34 @@ func RegisterWithOptions(s *server.MCPServer, a *app.App, options Options) {
 	s.AddTool(getMessagesTool(), getMessagesHandler(a, options))
 	s.AddTool(getConversationTool(), getConversationHandler(a, options))
 	s.AddTool(searchMessagesTool(), searchMessagesHandler(a, options))
-	if configuredV2 == nil {
+	switch {
+	case options.Daemon != nil:
+		s.AddTool(sendMessageTool(true), daemonSendMessageHandler(options))
+		s.AddTool(sendToConversationTool(true), daemonSendToConversationHandler(options))
+		s.AddTool(sendMediaToConversationTool(true), daemonSendMediaToConversationHandler(options))
+	case configuredV2 == nil:
 		s.AddTool(sendMessageTool(), sendMessageHandler(a))
 		s.AddTool(sendToConversationTool(), sendToConversationHandler(a))
 		s.AddTool(sendMediaToConversationTool(), sendMediaToConversationHandler(a))
-	} else {
+	default:
 		s.AddTool(sendMessageTool(true), sendMessageHandler(a, configuredV2))
 		s.AddTool(sendToConversationTool(true), sendToConversationHandler(a, configuredV2))
 		s.AddTool(sendMediaToConversationTool(true), sendMediaToConversationHandler(a, configuredV2))
 	}
-	s.AddTool(reactToMessageTool(), reactToMessageHandler(a))
+	if options.Daemon != nil {
+		s.AddTool(reactToMessageTool(), daemonReactToMessageHandler(options))
+	} else {
+		s.AddTool(reactToMessageTool(), reactToMessageHandler(a))
+	}
 	s.AddTool(setMessageTranscriptTool(), setMessageTranscriptHandler(a))
 	s.AddTool(listConversationsTool(), listConversationsHandler(a, options))
 	s.AddTool(listContactsTool(), listContactsHandler(a))
 	s.AddTool(resolveContactRoutesTool(), resolveContactRoutesHandler(a))
-	s.AddTool(getStatusTool(), getStatusHandler(a, options))
+	if options.Daemon != nil {
+		s.AddTool(getStatusTool(), daemonGetStatusHandler(a, options))
+	} else {
+		s.AddTool(getStatusTool(), getStatusHandler(a, options))
+	}
 	s.AddTool(draftMessageTool(), draftMessageHandler(a))
 	s.AddTool(downloadMediaTool(), downloadMediaHandler(a))
 	s.AddTool(importMessagesTool(), importMessagesHandler(a))
@@ -78,9 +99,12 @@ func RegisterWithOptions(s *server.MCPServer, a *app.App, options Options) {
 	s.AddTool(generateVizTool(), unavailableInV2Primary(v2Primary, generateVizHandler(a)))
 	s.AddTool(getPersonMessagesRangeTool(), unavailableInV2Primary(v2Primary, getPersonMessagesRangeHandler(a)))
 	s.AddTool(renderStoryTool(), unavailableInV2Primary(v2Primary, renderStoryHandler(a)))
-	if configuredV2 == nil {
+	switch {
+	case options.Daemon != nil:
+		s.AddTool(sendGroupMessageTool(true), daemonSendGroupMessageHandler())
+	case configuredV2 == nil:
 		s.AddTool(sendGroupMessageTool(), sendGroupMessageHandler(a))
-	} else {
+	default:
 		s.AddTool(sendGroupMessageTool(true), sendGroupMessageHandler(a, configuredV2))
 	}
 }

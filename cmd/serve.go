@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"runtime"
 	"runtime/debug"
 	"strings"
@@ -29,8 +30,10 @@ import (
 	"github.com/maxghenis/openmessage/internal/googlecookies"
 	"github.com/maxghenis/openmessage/internal/importer"
 	"github.com/maxghenis/openmessage/internal/ingest"
+	"github.com/maxghenis/openmessage/internal/localapi"
 	"github.com/maxghenis/openmessage/internal/notify"
 	"github.com/maxghenis/openmessage/internal/readsource"
+	"github.com/maxghenis/openmessage/internal/storage/sqlite"
 	"github.com/maxghenis/openmessage/internal/telemetry"
 	"github.com/maxghenis/openmessage/internal/tools"
 	"github.com/maxghenis/openmessage/internal/v2read"
@@ -43,6 +46,32 @@ type serveOptions struct {
 	web      bool
 	mcpSSE   bool
 	mcpStdio bool
+
+	// transportsSet/transportsOn record an explicit --transports or
+	// --no-transports override. When unset, transports follow the serve
+	// shape: any daemon-like shape runs them, the MCP-stdio-only client
+	// shape does not.
+	transportsSet bool
+	transportsOn  bool
+}
+
+// mcpClientShape reports the per-session MCP spawn shape: stdio as the only
+// enabled transport. Claude and other MCP hosts spawn one such process per
+// session, so this shape must never own live platform connections — a second
+// process holding the same WhatsApp device credentials or signal-cli account
+// logs the real daemon out ("401: logged out from another device").
+func (o serveOptions) mcpClientShape() bool {
+	return o.mcpStdio && !o.web && !o.mcpSSE
+}
+
+// transportsEnabled reports whether this process may start transport
+// supervisors and the other daemon-only subsystems (v2 dispatcher, sync
+// loops, scheduler, telemetry).
+func (o serveOptions) transportsEnabled() bool {
+	if o.transportsSet {
+		return o.transportsOn
+	}
+	return !o.mcpClientShape()
 }
 
 func mcpV2Dependencies(stack *v2Stack) []*tools.V2Dependencies {
@@ -108,6 +137,18 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 	defer restoreEnv()
 
 	isDemo := app.DemoMode()
+
+	// The MCP-stdio-only shape serves one Claude/MCP session and must never
+	// run its own transport stack: it would connect with the same WhatsApp
+	// device credentials and signal-cli account as the real daemon and log
+	// it out. It becomes a transportless client of the running app instead.
+	// Demo mode keeps the legacy path (it never starts transports anyway),
+	// and --transports explicitly opts a standalone stdio deployment back in.
+	if !isDemo && opts.mcpClientShape() && !opts.transportsEnabled() {
+		return runServeMCPClient(logger, opts)
+	}
+	transports := opts.transportsEnabled()
+
 	v2Mode, err := resolveV2RuntimeMode(isDemo, app.DefaultDataDir())
 	if err != nil {
 		return err
@@ -175,7 +216,7 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 	// Google has one lifecycle owner. Transient retry, liveness probes,
 	// credential repair, and terminal parking all flow through this supervisor;
 	// the legacy Connected flag remains a UI projection only.
-	if !isDemo {
+	if !isDemo && transports {
 		googleLifecycle = googleadapter.New(googleAccountID, a, canRefreshGoogleCookies)
 		a.SetGoogleLifecycleNotifier(googleLifecycle)
 		if v2Send || v2Ingest {
@@ -257,11 +298,13 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 				startGoogleBackfill(a, logger)
 			}(googleSupervisor)
 		}
-	} else {
+	} else if isDemo {
 		logger.Info().Msg("Demo mode — skipping phone connection")
+	} else {
+		logger.Info().Msg("Transports disabled — skipping phone connection")
 	}
 
-	if !isDemo {
+	if !isDemo && transports {
 		whatsappBridge, initialized := initializeWhatsAppForServe(logger, a.InitializeWhatsApp)
 		if initialized {
 			whatsappLifecycle = whatsappadapter.New(whatsappAccountID, whatsappBridge)
@@ -329,11 +372,13 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 				}(whatsappSupervisor)
 			}
 		}
-	} else {
+	} else if isDemo {
 		logger.Info().Msg("Demo mode — skipping WhatsApp live bridge")
+	} else {
+		logger.Info().Msg("Transports disabled — skipping WhatsApp live bridge")
 	}
 
-	if !isDemo {
+	if !isDemo && transports {
 		signalBridge, err := a.EnsureSignal()
 		if err != nil {
 			logger.Warn().Err(err).Msg("Signal live bridge unavailable")
@@ -393,8 +438,10 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 				}()
 			}
 		}
-	} else {
+	} else if isDemo {
 		logger.Info().Msg("Demo mode — skipping Signal live bridge")
+	} else {
+		logger.Info().Msg("Transports disabled — skipping Signal live bridge")
 	}
 
 	if stack != nil {
@@ -470,14 +517,16 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 		}()
 		syncLocalPlatforms()
 	}
-	go func() {
-		safeSync()
-		ticker := time.NewTicker(30 * time.Second)
-		defer ticker.Stop()
-		for range ticker.C {
+	if transports {
+		go func() {
 			safeSync()
-		}
-	}()
+			ticker := time.NewTicker(30 * time.Second)
+			defer ticker.Stop()
+			for range ticker.C {
+				safeSync()
+			}
+		}()
+	}
 
 	// Belt-and-suspenders: periodically force a full Signal Desktop rescan
 	// so any drift that slipped past both the live signal-cli WebSocket AND
@@ -517,17 +566,19 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 			events.PublishMessages("")
 		}
 	}
-	go func() {
-		// First full rescan 2 minutes after startup so a crash-restart
-		// cycle doesn't hammer the DB immediately, then every 30 minutes.
-		time.Sleep(2 * time.Minute)
-		safeFullSignalSync()
-		ticker := time.NewTicker(30 * time.Minute)
-		defer ticker.Stop()
-		for range ticker.C {
+	if transports {
+		go func() {
+			// First full rescan 2 minutes after startup so a crash-restart
+			// cycle doesn't hammer the DB immediately, then every 30 minutes.
+			time.Sleep(2 * time.Minute)
 			safeFullSignalSync()
-		}
-	}()
+			ticker := time.NewTicker(30 * time.Minute)
+			defer ticker.Stop()
+			for range ticker.C {
+				safeFullSignalSync()
+			}
+		}()
+	}
 
 	var reads readsource.ReadSource = a.Store
 	if v2Primary {
@@ -598,8 +649,12 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 		}
 	}
 
-	// Background loop that sends due scheduled ("send later") messages.
-	startLegacyScheduler(v2Primary, a.StartScheduler)
+	// Background loop that sends due scheduled ("send later") messages. Only
+	// the transport-owning daemon may run it: a second scheduler over the
+	// same store double-sends every due message.
+	if transports {
+		startLegacyScheduler(v2Primary, a.StartScheduler)
+	}
 
 	v2Options := v2SendWebOptions(stack, v2Send)
 	v2IngestCounters := v2IngestCountersProvider(stack)
@@ -700,8 +755,9 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 	}
 
 	// Send anonymous heartbeat (opt-in only, off by default).
-	// Enable with `OPENMESSAGE_TELEMETRY=1`. Skipped in demo mode.
-	if !isDemo && os.Getenv("OPENMESSAGE_TELEMETRY") == "1" {
+	// Enable with `OPENMESSAGE_TELEMETRY=1`. Skipped in demo mode and in
+	// transportless processes (one heartbeat per install, not per client).
+	if !isDemo && transports && os.Getenv("OPENMESSAGE_TELEMETRY") == "1" {
 		go func() {
 			tc := telemetry.New(app.DefaultDataDir(), buildVersion, true)
 			ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
@@ -716,6 +772,119 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 	<-sigCh
 	logger.Info().Msg("Shutting down")
 	return nil
+}
+
+// clientProbeTimeout bounds the startup daemon probe in MCP client mode so a
+// hung daemon cannot stall MCP initialization.
+const clientProbeTimeout = 3 * time.Second
+
+// runServeMCPClient serves the MCP-stdio-only shape as a transportless client
+// of the running OpenMessage daemon. It never starts transport supervisors,
+// the v2 dispatcher/ingest stack, sync loops, schedulers, or telemetry:
+// exactly one process (the app daemon) may own live platform connections,
+// because WhatsApp and signal-cli treat a second concurrent login as
+// credential theft and kill the session. Reads come from the local store;
+// sends and reactions route through the daemon's local HTTP API, mirroring
+// the CLI send path.
+func runServeMCPClient(logger zerolog.Logger, opts serveOptions) error {
+	// Probe before opening any store: daemon truth decides the read mode and,
+	// when OPENMESSAGES_DATA_DIR is unset, which data directory this client
+	// serves. The probe token comes from the pre-adoption data dir; the
+	// daemon may report the authoritative dir in its status payload.
+	daemon := localapi.NewClient("", localapi.LoadControlToken(app.DefaultDataDir()))
+	probeCtx, cancelProbe := context.WithTimeout(context.Background(), clientProbeTimeout)
+	status, _, probeErr := daemon.Status(probeCtx)
+	cancelProbe()
+	daemonUp := probeErr == nil
+
+	daemonDataDir := ""
+	if daemonUp {
+		daemonDataDir = strings.TrimSpace(status.Auth.DataDir)
+		if _, pinned := os.LookupEnv("OPENMESSAGES_DATA_DIR"); !pinned && daemonDataDir != "" {
+			if info, err := os.Stat(daemonDataDir); err == nil && info.IsDir() {
+				_ = os.Setenv("OPENMESSAGES_DATA_DIR", daemonDataDir)
+				logger.Info().Str("data_dir", daemonDataDir).Msg("MCP client mode: adopted the running app's data directory")
+			}
+		}
+		daemon.Token = controlTokenFromDaemonStatus(status, daemon.Token)
+	}
+
+	// Read mode. Daemon truth applies only when the daemon serves this same
+	// data directory; otherwise the environment decides, preserving the
+	// CLI's fail-fast diagnostics for invalid flag combinations. All
+	// refusals happen before app.New so a refused startup leaves no state
+	// behind.
+	dataDir := app.DefaultDataDir()
+	v2Primary := false
+	if daemonUp && daemonDataDir != "" && samePath(daemonDataDir, dataDir) {
+		v2Primary = status.V2Primary
+	} else {
+		mode, err := resolveV2RuntimeMode(false, dataDir)
+		if err != nil {
+			return err
+		}
+		v2Primary = mode.Primary
+	}
+	var v2Store *sqlite.Store
+	if v2Primary {
+		v2StorePath := filepath.Join(dataDir, "v2", "store.sqlite3")
+		// The daemon owns v2 provisioning; a client must attach to an
+		// existing store, never create one.
+		if _, err := os.Stat(v2StorePath); err != nil {
+			return fmt.Errorf("v2-primary reads selected but no migrated store at %s: %w", v2StorePath, err)
+		}
+		opened, err := sqlite.Open(v2StorePath)
+		if err != nil {
+			return fmt.Errorf("open v2 read store %q: %w", v2StorePath, err)
+		}
+		v2Store = opened
+		defer func() {
+			if err := v2Store.Close(); err != nil {
+				logger.Warn().Err(err).Msg("Failed to close v2 read store")
+			}
+		}()
+	}
+
+	a, err := app.New(logger)
+	if err != nil {
+		return fmt.Errorf("init app: %w", err)
+	}
+	defer a.Close()
+
+	var reads readsource.ReadSource = a.Store
+	if v2Store != nil {
+		reads = v2read.New(v2Store)
+	}
+
+	mcpSrv := mcpserver.NewMCPServer(
+		"openmessage",
+		buildVersion,
+		mcpserver.WithToolCapabilities(true),
+	)
+	tools.RegisterWithOptions(mcpSrv, a, tools.Options{
+		Reads:     reads,
+		V2Primary: v2Primary,
+		Daemon:    daemon,
+	})
+
+	logger.Info().
+		Bool("daemon_running", daemonUp).
+		Bool("v2_primary_reads", v2Primary).
+		Str("data_dir", a.DataDir).
+		Msg("MCP client mode: transports disabled; sends route through the running app")
+	logger.Info().Msg("Starting MCP stdio transport")
+	return mcpserver.ServeStdio(mcpSrv)
+}
+
+// samePath reports whether two paths name the same directory, tolerating
+// symlinks and cosmetic differences.
+func samePath(a, b string) bool {
+	if filepath.Clean(a) == filepath.Clean(b) {
+		return true
+	}
+	infoA, errA := os.Stat(a)
+	infoB, errB := os.Stat(b)
+	return errA == nil && errB == nil && os.SameFile(infoA, infoB)
 }
 
 func initializeWhatsAppForServe(
@@ -796,6 +965,12 @@ func parseServeOptions(args []string) (serveOptions, error) {
 		case "--no-mcp-stdio":
 			enableExplicitTransportMode()
 			opts.mcpStdio = false
+		case "--transports":
+			opts.transportsSet = true
+			opts.transportsOn = true
+		case "--no-transports":
+			opts.transportsSet = true
+			opts.transportsOn = false
 		case "":
 		default:
 			return serveOptions{}, fmt.Errorf("unknown serve option: %s", arg)
