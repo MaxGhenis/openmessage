@@ -21,6 +21,12 @@ func (s *MessageService) Run(ctx context.Context) error {
 	}
 	recovered, err := s.outbox.RecoverExpiredLeases(ctx, s.clock.Now())
 	if err != nil {
+		// Cancellation mid-query surfaces as a driver interrupt, not
+		// context.Canceled, so a shutdown race would read as a startup fault.
+		// As in DispatchDue's lease path, surface the cancellation itself.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
 		return fmt.Errorf("run message service: recover expired leases: %w", err)
 	}
 	if recovered.NotDispatched > 0 || recovered.Uncertain > 0 {
@@ -32,9 +38,15 @@ func (s *MessageService) Run(ctx context.Context) error {
 			return err
 		}
 		if _, err := s.reconcileStoreFailedDue(ctx, s.batchLimit); err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
 			return fmt.Errorf("run message service: reconcile store-failed deliveries: %w", err)
 		}
 		if _, err := s.DispatchDue(ctx, s.batchLimit); err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
 			return fmt.Errorf("run message service: %w", err)
 		}
 

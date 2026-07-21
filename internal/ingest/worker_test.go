@@ -3,6 +3,7 @@ package ingest
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/maxghenis/openmessage/internal/bridge"
 )
@@ -86,9 +87,12 @@ func TestWorkerChangesDoesNotBroadcastForQuarantinedOrNoopDrain(t *testing.T) {
 
 func assertWorkerChangeClosed(t *testing.T, changes <-chan struct{}, description string) {
 	t.Helper()
+	// The worker broadcasts after the drain pass that advanced the counters a
+	// caller waited on, so closure is guaranteed but not yet observable; block
+	// rather than snapshot.
 	select {
 	case <-changes:
-	default:
+	case <-time.After(10 * time.Second):
 		t.Fatalf("Changes() channel remained open after %s", description)
 	}
 }

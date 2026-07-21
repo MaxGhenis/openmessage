@@ -549,12 +549,22 @@ func i01WaitFor(t *testing.T, description string, ready func() bool) {
 
 func i01AssertNoPending(t *testing.T, messages *sqlite.MessageRepository) {
 	t.Helper()
-	pending, err := messages.Unprocessed(context.Background())
-	if err != nil {
-		t.Fatalf("Unprocessed(): %v", err)
-	}
-	if len(pending) != 0 {
-		t.Fatalf("unprocessed frames = %d, want 0", len(pending))
+	// Worker counters advance before MarkInboxProcessed commits, so a caller
+	// that just observed a counter can race the final inbox write; wait for the
+	// drain rather than reading it once.
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		pending, err := messages.Unprocessed(context.Background())
+		if err != nil {
+			t.Fatalf("Unprocessed(): %v", err)
+		}
+		if len(pending) == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("unprocessed frames = %d after drain deadline, want 0", len(pending))
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 
