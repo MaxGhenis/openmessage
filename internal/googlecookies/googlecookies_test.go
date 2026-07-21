@@ -167,7 +167,7 @@ func TestUpdateSessionCookiesPreservesOtherFields(t *testing.T) {
 	}
 }
 
-func TestLoadChromeCookiesRequiresAllSessionCookies(t *testing.T) {
+func TestLoadChromeCookiesRequiresAllAccountCookies(t *testing.T) {
 	// Exact host/name requirements guard Wave 1 from persisting partial credentials.
 	secret := []byte("secret")
 	key := DeriveKey(secret, 1003)
@@ -223,9 +223,8 @@ func TestLoadChromeCookiesRequiresAllSessionCookies(t *testing.T) {
 	})
 }
 
-func TestLoadChromeCookiesHappyPath(t *testing.T) {
-	dir := t.TempDir()
-	profile := filepath.Join(dir, "Default")
+func TestLoadChromeCookiesDoesNotRequireMessagesOSID(t *testing.T) {
+	profile := filepath.Join(t.TempDir(), "Default")
 	if err := os.MkdirAll(filepath.Join(profile, "Network"), 0o700); err != nil {
 		t.Fatalf("mkdir profile: %v", err)
 	}
@@ -235,8 +234,36 @@ func TestLoadChromeCookiesHappyPath(t *testing.T) {
 	for _, req := range requiredCookies {
 		rows = append(rows, dbCookie{req.host, req.name, encryptCookie(t, "val-"+req.name, req.host, key, true)})
 	}
+	writeCookieDB(t, filepath.Join(profile, "Network", "Cookies"), rows)
+
+	got, err := LoadChromeCookies(profile, secret)
+	if err != nil {
+		t.Fatalf("LoadChromeCookies(): %v", err)
+	}
+	if _, exists := got["OSID"]; exists {
+		t.Fatalf("OSID = %q, want absent when no Chrome host provides it", got["OSID"])
+	}
+}
+
+func TestLoadChromeCookiesHappyPath(t *testing.T) {
+	dir := t.TempDir()
+	profile := filepath.Join(dir, "Default")
+	if err := os.MkdirAll(filepath.Join(profile, "Network"), 0o700); err != nil {
+		t.Fatalf("mkdir profile: %v", err)
+	}
+	secret := []byte("secret")
+	key := DeriveKey(secret, 1003)
+	rows := make([]dbCookie, 0, len(requiredCookies)+3)
+	for _, req := range requiredCookies {
+		rows = append(rows, dbCookie{req.host, req.name, encryptCookie(t, "val-"+req.name, req.host, key, true)})
+	}
 	// A duplicate SID on a lower-priority host must not shadow the .google.com one.
 	rows = append(rows, dbCookie{"accounts.google.com", "SID", encryptCookie(t, "wrong", "accounts.google.com", key, true)})
+	// A Messages OSID is preferred over a same-name account cookie when present.
+	rows = append(rows,
+		dbCookie{".google.com", "OSID", encryptCookie(t, "account-osid", ".google.com", key, true)},
+		dbCookie{"messages.google.com", "OSID", encryptCookie(t, "messages-osid", "messages.google.com", key, true)},
+	)
 	writeCookieDB(t, filepath.Join(profile, "Network", "Cookies"), rows)
 
 	got, err := LoadChromeCookies(profile, secret)
@@ -246,8 +273,38 @@ func TestLoadChromeCookiesHappyPath(t *testing.T) {
 	if got["SID"] != "val-SID" {
 		t.Fatalf("SID = %q, want %q (host priority not applied)", got["SID"], "val-SID")
 	}
-	if got["OSID"] != "val-OSID" {
-		t.Fatalf("OSID = %q, want %q", got["OSID"], "val-OSID")
+	if got["OSID"] != "messages-osid" {
+		t.Fatalf("OSID = %q, want %q", got["OSID"], "messages-osid")
+	}
+}
+
+func TestLoadChromeCookiesEqualPriorityHostsUseLexicographicOrder(t *testing.T) {
+	profile := filepath.Join(t.TempDir(), "Default")
+	if err := os.MkdirAll(filepath.Join(profile, "Network"), 0o700); err != nil {
+		t.Fatalf("mkdir profile: %v", err)
+	}
+	secret := []byte("secret")
+	key := DeriveKey(secret, 1003)
+	rows := make([]dbCookie, 0, len(requiredCookies)+2)
+	for _, req := range requiredCookies {
+		rows = append(rows, dbCookie{req.host, req.name, encryptCookie(t, "val-"+req.name, req.host, key, true)})
+	}
+	// Insert mail first so SQLite's explicit ordering, not insertion order,
+	// makes docs.google.com the stable winner at equal host priority.
+	rows = append(rows,
+		dbCookie{"mail.google.com", "OSID", encryptCookie(t, "mail-osid", "mail.google.com", key, true)},
+		dbCookie{"docs.google.com", "OSID", encryptCookie(t, "docs-osid", "docs.google.com", key, true)},
+	)
+	writeCookieDB(t, filepath.Join(profile, "Network", "Cookies"), rows)
+
+	for i := 0; i < 5; i++ {
+		got, err := LoadChromeCookies(profile, secret)
+		if err != nil {
+			t.Fatalf("LoadChromeCookies() run %d: %v", i, err)
+		}
+		if got["OSID"] != "docs-osid" {
+			t.Fatalf("LoadChromeCookies() run %d OSID = %q, want %q", i, got["OSID"], "docs-osid")
+		}
 	}
 }
 

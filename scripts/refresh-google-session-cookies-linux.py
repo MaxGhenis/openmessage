@@ -23,7 +23,6 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 
 REQUIRED_COOKIES = {
-    ("messages.google.com", "OSID"),
     (".google.com", "SID"),
     (".google.com", "HSID"),
     (".google.com", "SSID"),
@@ -132,6 +131,7 @@ def load_chrome_cookies(profile: Path, secret: bytes) -> tuple[dict[str, str], i
         from cookies
         where host_key in ('.google.com','messages.google.com','accounts.google.com')
            or host_key like '%.google.com'
+        order by host_key, name
         """
     ).fetchall()
 
@@ -214,7 +214,7 @@ def main() -> int:
         print(f"decrypt_iterations: {iterations}")
         print(f"decrypted_cookies: {decrypted}")
         print(f"decrypt_failures: {failed}")
-        print("required_present: APISID,HSID,OSID,SAPISID,SID,SSID")
+        print("required_present: APISID,HSID,SAPISID,SID,SSID")
     return 0
 
 

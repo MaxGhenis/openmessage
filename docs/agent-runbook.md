@@ -180,24 +180,48 @@ Key facts:
 6. On confirmation the session saves to the app dir; relaunch the app and sends
    work. Wipe the cookie file afterwards.
 
-### Self-healing (as of #74) — try this before any manual cookie surgery
+### Self-healing (as of #74; requirements fixed 2026-07-20) — try this before any manual cookie surgery
 
-The macOS app now **refreshes expired Google cookies in-process** and
-reconnects on its own. When the reconnect watchdog sees an expired session
-(`auth token: HTTP 401`) it reads the user's signed-in Chrome cookies, rewrites
-`auth_data.cookies` in `session.json`, and reconnects — no re-pair, no script.
-Implemented in `internal/googlecookies` (darwin-only; keychain → PBKDF2 →
-AES-128-CBC, handles the Chrome 130+ `SHA256(host)` prefix, snapshots the
-cookie DB + WAL for freshness). `refreshGoogleSessionCookies` prefers an
-explicit `OPENMESSAGE_COOKIE_REFRESH_SCRIPT` if set, else this native path;
+The macOS app **refreshes expired Google cookies in-process** and reconnects
+on its own. When the reconnect watchdog sees an expired session
+(`auth token: HTTP 401` / `SESSION_COOKIE_INVALID`) it reads the user's
+signed-in Chrome cookies, rewrites `auth_data.cookies` in `session.json`, and
+reconnects — no re-pair, no script. Implemented in `internal/googlecookies`
+(darwin-only; keychain → PBKDF2 → AES-128-CBC, handles the Chrome 130+
+`SHA256(host)` prefix, snapshots the cookie DB + WAL for freshness).
+`refreshGoogleSessionCookies` prefers an explicit
+`OPENMESSAGE_COOKIE_REFRESH_SCRIPT` if set, else this native path;
 `canRefreshGoogleCookies()` gates whether the watchdog refreshes or parks.
 
-So the **first** thing to try when SMS is dead is nothing — wait ~15s for the
-watchdog. If it hasn't recovered, the cookies are genuinely gone from Chrome
-(user signed out of Google there) or the device link was revoked; only then
-fall back to the manual re-pair recipe above. The app also now posts a **health
-notification** (once, on the rising edge) when Google flips to `needs_repair` or
-WhatsApp logs out, so a dead platform can't sit silent for days.
+**Cookie requirements (the 2026-07-20 fix):** a Google-account libgm session
+authenticates with the five `.google.com` account cookies
+(SID/HSID/SSID/APISID/SAPISID) + SAPISIDHASH — proven live against both
+`/web/config` and the RegisterRefresh RPC. A `messages.google.com:OSID`
+service cookie exists **only** if the user has opened Messages-for-web in that
+Chrome profile; it is preferred when present but **never required**. (Before
+the fix, refresh hard-required it, so on profiles that never visited
+messages.google.com every repair failed with `missing required cookies:
+messages.google.com:OSID` and the app looped in `needs_repair` forever — a
+re-pair bought minutes, then died again.)
+
+**Expected steady-state:** Google invalidates replayed browser-cookie
+snapshots after ~14 minutes of Chrome concurrently advancing the same account
+session (measured 2026-07-20: 14 clean minutes of 200s, then
+`SESSION_COOKIE_INVALID`; fresh-pair sessions died in ~3-4 min). The healthy
+pattern is therefore a **heal cycle**: connected → cookie 401 → watchdog
+refresh from Chrome → reconnect, repeating every ~15 min with sub-minute dips.
+Rotated cookies are also persisted to `session.json` (throttled, ~5 min) so a
+restart resumes from fresh values instead of pair-time snapshots.
+
+An `auth_expired` session with its device link intact revives by cookie
+rewrite alone — **do not re-pair** for `needs_repair`; that resets nothing the
+refresh can't fix and risks pairing throttles. So the **first** thing to try
+when SMS is dead is nothing — wait ~15-60s for the watchdog. If it hasn't
+recovered, the cookies are genuinely gone from Chrome (user signed out of
+Google there) or the device link was revoked; only then fall back to the
+manual re-pair recipe above. The app also posts a **health notification**
+(once, on the rising edge) when Google flips to `needs_repair` or WhatsApp
+logs out, so a dead platform can't sit silent for days.
 
 Prereq: the app must be **non-sandboxed** (it is — `OpenMessage.entitlements`
 is hardened-runtime only) so the backend can read Chrome's cookie DB and the
