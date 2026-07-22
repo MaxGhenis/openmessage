@@ -1,9 +1,12 @@
 package client
 
 import (
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/rs/zerolog"
 	"go.mau.fi/mautrix-gmessages/pkg/libgm"
@@ -29,6 +32,8 @@ type EventHandler struct {
 	Logger                   zerolog.Logger
 	SessionPath              string
 	Client                   *Client
+	Now                      func() time.Time
+	PersistCookiesEvery      time.Duration
 	OnConversationsChange    func()
 	OnSessionInvalid         OnSessionInvalid
 	OnConnectionLost         OnConnectionLost
@@ -39,6 +44,10 @@ type EventHandler struct {
 	OnTypingChange           func(conversationID, senderName, senderNumber string, typing bool)
 	OnGoogleAvatarCandidates func([]db.ContactAvatarCandidate)
 	OnPhoneRespondingChange  func(bool)
+
+	cookieSaveMu     sync.Mutex
+	lastCookieSaveAt time.Time
+	lastCookieHash   [32]byte
 }
 
 func (h *EventHandler) Handle(rawEvt any) {
@@ -106,6 +115,11 @@ func (h *EventHandler) Handle(rawEvt any) {
 		h.handleTyping(evt)
 	default:
 		h.Logger.Debug().Type("type", evt).Msg("Unhandled event")
+	}
+
+	switch rawEvt.(type) {
+	case *libgm.WrappedMessage, *gmproto.Conversation, *events.ListenRecovered, *events.ClientReady:
+		h.maybePersistRotatedCookies()
 	}
 }
 
@@ -380,7 +394,10 @@ func (h *EventHandler) handleAuthRefresh() {
 	if h.Client == nil || h.SessionPath == "" {
 		return
 	}
+	authData := h.Client.GM.AuthData
+	authData.CookiesLock.RLock()
 	sessionData, err := h.Client.SessionData()
+	authData.CookiesLock.RUnlock()
 	if err != nil {
 		h.Logger.Error().Err(err).Msg("Failed to get session data for save")
 		return
@@ -390,4 +407,52 @@ func (h *EventHandler) handleAuthRefresh() {
 		return
 	}
 	h.Logger.Debug().Msg("Saved refreshed auth token")
+}
+
+func (h *EventHandler) maybePersistRotatedCookies() {
+	if h.Client == nil || h.SessionPath == "" {
+		return
+	}
+
+	now := time.Now()
+	if h.Now != nil {
+		now = h.Now()
+	}
+	interval := h.PersistCookiesEvery
+	if interval == 0 {
+		interval = 5 * time.Minute
+	}
+
+	h.cookieSaveMu.Lock()
+	defer h.cookieSaveMu.Unlock()
+	if !h.lastCookieSaveAt.IsZero() && now.Sub(h.lastCookieSaveAt) < interval {
+		return
+	}
+	h.lastCookieSaveAt = now
+
+	authData := h.Client.GM.AuthData
+	authData.CookiesLock.RLock()
+	cookiesJSON, err := json.Marshal(authData.Cookies)
+	if err != nil {
+		authData.CookiesLock.RUnlock()
+		h.Logger.Warn().Err(err).Msg("Failed to marshal rotated Google cookies")
+		return
+	}
+	cookieHash := sha256.Sum256(cookiesJSON)
+	if cookieHash == h.lastCookieHash {
+		authData.CookiesLock.RUnlock()
+		return
+	}
+	sessionData, err := h.Client.SessionData()
+	authData.CookiesLock.RUnlock()
+	if err != nil {
+		h.Logger.Warn().Err(err).Msg("Failed to get session data for rotated cookie save")
+		return
+	}
+	if err := SaveSession(h.SessionPath, sessionData); err != nil {
+		h.Logger.Warn().Err(err).Msg("Failed to persist rotated Google cookies")
+		return
+	}
+	h.lastCookieHash = cookieHash
+	h.Logger.Debug().Msg("persisted rotated Google cookies")
 }

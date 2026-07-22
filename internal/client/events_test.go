@@ -1,7 +1,11 @@
 package client
 
 import (
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/rs/zerolog"
 	"go.mau.fi/mautrix-gmessages/pkg/libgm"
@@ -218,6 +222,80 @@ func TestHandleRecoveryEvents_TriggerRealtimeGapCallback(t *testing.T) {
 	}
 	if phoneResponding[0] != false || phoneResponding[1] != true {
 		t.Fatalf("phone responding callbacks = %v, want [false true]", phoneResponding)
+	}
+}
+
+func TestMaybePersistRotatedCookies(t *testing.T) {
+	authData := libgm.NewAuthData()
+	authData.SetCookies(map[string]string{"SID": "initial"})
+	gmClient := libgm.NewClient(authData, nil, zerolog.Nop())
+	now := time.Date(2026, time.July, 20, 12, 0, 0, 0, time.UTC)
+	sessionPath := filepath.Join(t.TempDir(), "session.json")
+	handler := &EventHandler{
+		Logger:              zerolog.Nop(),
+		SessionPath:         sessionPath,
+		Client:              &Client{GM: gmClient, Logger: zerolog.Nop()},
+		Now:                 func() time.Time { return now },
+		PersistCookiesEvery: 5 * time.Minute,
+	}
+
+	handler.Handle(&events.ListenRecovered{})
+	assertSavedCookie := func(want string) {
+		t.Helper()
+		sessionData, err := LoadSession(sessionPath)
+		if err != nil {
+			t.Fatalf("LoadSession(): %v", err)
+		}
+		var savedAuth struct {
+			Cookies map[string]string `json:"cookies"`
+		}
+		if err := json.Unmarshal(sessionData.AuthDataJSON, &savedAuth); err != nil {
+			t.Fatalf("unmarshal saved auth data: %v", err)
+		}
+		if savedAuth.Cookies["SID"] != want {
+			t.Fatalf("saved SID = %q, want %q", savedAuth.Cookies["SID"], want)
+		}
+	}
+	assertSavedCookie("initial")
+
+	firstSentinel := time.Unix(1, 0)
+	if err := os.Chtimes(sessionPath, firstSentinel, firstSentinel); err != nil {
+		t.Fatalf("set first sentinel mtime: %v", err)
+	}
+	now = now.Add(time.Minute)
+	handler.Handle(&events.ListenRecovered{})
+	info, err := os.Stat(sessionPath)
+	if err != nil {
+		t.Fatalf("stat throttled session: %v", err)
+	}
+	if !info.ModTime().Equal(firstSentinel) {
+		t.Fatalf("throttled event rewrote session: mtime = %v, want %v", info.ModTime(), firstSentinel)
+	}
+
+	authData.SetCookies(map[string]string{"SID": "rotated"})
+	now = now.Add(5 * time.Minute)
+	handler.Handle(&events.ListenRecovered{})
+	assertSavedCookie("rotated")
+	info, err = os.Stat(sessionPath)
+	if err != nil {
+		t.Fatalf("stat rotated session: %v", err)
+	}
+	if info.ModTime().Equal(firstSentinel) {
+		t.Fatal("changed cookies did not rewrite session after throttle window")
+	}
+
+	secondSentinel := time.Unix(2, 0)
+	if err := os.Chtimes(sessionPath, secondSentinel, secondSentinel); err != nil {
+		t.Fatalf("set second sentinel mtime: %v", err)
+	}
+	now = now.Add(6 * time.Minute)
+	handler.Handle(&events.ListenRecovered{})
+	info, err = os.Stat(sessionPath)
+	if err != nil {
+		t.Fatalf("stat unchanged session: %v", err)
+	}
+	if !info.ModTime().Equal(secondSentinel) {
+		t.Fatalf("unchanged cookies rewrote session: mtime = %v, want %v", info.ModTime(), secondSentinel)
 	}
 }
 

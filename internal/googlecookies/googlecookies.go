@@ -1,13 +1,16 @@
 // Package googlecookies refreshes the Google account cookies inside
 // OpenMessage's session.json from a local Chrome profile.
 //
-// Google Messages web sessions authenticate with Google account cookies that
+// Google-account libgm sessions authenticate with five .google.com account
+// cookies (SID, HSID, SSID, APISID, and SAPISID) plus SAPISIDHASH. The cookies
 // rotate roughly every 30 minutes. When the backend has been offline long
 // enough (laptop asleep, travel), the stored cookies expire and every token
-// refresh returns HTTP 401 — the session looks dead, but the phone-side
-// device link is usually still intact. Rewriting auth_data.cookies with fresh
-// values from the user's signed-in Chrome profile and reconnecting revives it
-// with no re-pairing.
+// refresh returns HTTP 401 — the session looks dead, but the phone-side device
+// link is usually still intact. Rewriting auth_data.cookies with fresh values
+// from the user's signed-in Chrome profile and reconnecting revives it with no
+// re-pairing. A messages.google.com OSID cookie exists only when the user has
+// used Messages for web in that Chrome profile; it is carried when present but
+// is never required.
 //
 // This is the native (in-process) equivalent of
 // scripts/refresh-google-session-cookies-{linux,macos}.py, so app installs
@@ -38,7 +41,6 @@ type requiredCookie struct {
 }
 
 var requiredCookies = []requiredCookie{
-	{"messages.google.com", "OSID"},
 	{".google.com", "SID"},
 	{".google.com", "HSID"},
 	{".google.com", "SSID"},
@@ -130,7 +132,8 @@ func DecryptCookie(encrypted []byte, host string, key []byte) (string, error) {
 
 // LoadChromeCookies reads the profile's cookie DB and returns the decrypted
 // Google cookies, trying both known PBKDF2 iteration counts and keeping the
-// best-scoring result. It fails if any required session cookie is missing.
+// best-scoring result. The five .google.com account cookies are required;
+// messages.google.com cookies such as OSID are carried only when present.
 func LoadChromeCookies(profile string, secret []byte) (map[string]string, error) {
 	dbCopy, cleanup, err := snapshotCookieDB(profile)
 	if err != nil {
@@ -292,7 +295,8 @@ func readCookieRows(dbPath string) ([]cookieRow, error) {
 		select host_key, name, encrypted_value, value
 		from cookies
 		where host_key in ('.google.com','messages.google.com','accounts.google.com')
-		   or host_key like '%.google.com'`)
+		   or host_key like '%.google.com'
+		order by host_key, name`)
 	if err != nil {
 		return nil, fmt.Errorf("query cookies: %w", err)
 	}
