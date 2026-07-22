@@ -1,7 +1,9 @@
 package cmd
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -9,6 +11,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/rs/zerolog"
 
 	"github.com/maxghenis/openmessage/internal/bridge"
 )
@@ -64,6 +68,7 @@ func TestGoogleSupervisorCredentialRepairControlsGenerationStart(t *testing.T) {
 				},
 				func() { flagCalls.Add(1) },
 				func() { clearCalls.Add(1) },
+				zerolog.Nop(),
 			)
 			supervisor, err := bridge.NewSupervisor(
 				googleAccountID,
@@ -187,6 +192,7 @@ func TestGoogleCredentialRepairCooldownPacesTooSoonRepair(t *testing.T) {
 	clock := &googleCredentialRepairTestClock{}
 	var refreshMu sync.Mutex
 	var refreshTimes []time.Time
+	var logs bytes.Buffer
 	repairer := &googleCredentialRepairer{
 		sessionPath: "session.json",
 		canRepair:   func() bool { return true },
@@ -198,6 +204,7 @@ func TestGoogleCredentialRepairCooldownPacesTooSoonRepair(t *testing.T) {
 		},
 		minInterval: minInterval,
 		now:         clock.Now,
+		logger:      zerolog.New(&logs),
 	}
 
 	if err := repairer.RepairCredentials(context.Background(), "", bridge.OpError{}); err != nil {
@@ -221,6 +228,21 @@ func TestGoogleCredentialRepairCooldownPacesTooSoonRepair(t *testing.T) {
 	}
 	if got := repairer.PacedRepairCount(); got != 1 {
 		t.Fatalf("paced repair count = %d, want 1", got)
+	}
+	// Pacing is the fast-cookie-revocation signal, so it must not be silent in
+	// production: a delayed repair logs the wait and the running total.
+	var logged map[string]any
+	if err := json.Unmarshal([]byte(logs.String()), &logged); err != nil {
+		t.Fatalf("parse paced repair log %q: %v", logs.String(), err)
+	}
+	if level, _ := logged["level"].(string); level != "warn" {
+		t.Fatalf("paced repair log level = %v, want warn", logged["level"])
+	}
+	if total, _ := logged["paced_total"].(float64); total != 1 {
+		t.Fatalf("paced repair log paced_total = %v, want 1", logged["paced_total"])
+	}
+	if _, ok := logged["wait"]; !ok {
+		t.Fatalf("paced repair log has no wait field: %v", logged)
 	}
 }
 

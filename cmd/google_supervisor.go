@@ -64,6 +64,7 @@ type googleCredentialRepairer struct {
 	clearRepair func()
 	minInterval time.Duration
 	now         func() time.Time
+	logger      zerolog.Logger
 
 	mu           sync.Mutex
 	paceGate     chan struct{}
@@ -77,7 +78,8 @@ func newGoogleCredentialRepairer(
 	refresh func(context.Context, string) error,
 	flagRepair func(),
 	clearRepair func(),
-) bridge.CredentialRepairer {
+	logger zerolog.Logger,
+) *googleCredentialRepairer {
 	return &googleCredentialRepairer{
 		sessionPath: sessionPath,
 		canRepair:   canRepair,
@@ -85,6 +87,7 @@ func newGoogleCredentialRepairer(
 		flagRepair:  flagRepair,
 		clearRepair: clearRepair,
 		minInterval: googleCredentialRepairMinInterval(),
+		logger:      logger,
 	}
 }
 
@@ -97,6 +100,11 @@ func googleCredentialRepairMinInterval() time.Duration {
 	return interval
 }
 
+// PacedRepairCount reports how many automatic Google credential repairs were
+// delayed to honour the minimum repair interval. It stays 0 through the healthy
+// ~15-minute heal cycle; a climbing count is the production signal that
+// something is revoking the imported cookies within minutes. Also logged as it
+// happens and surfaced as google.repairs_paced in /api/status.
 func (r *googleCredentialRepairer) PacedRepairCount() uint64 {
 	return r.pacedCount.Load()
 }
@@ -145,7 +153,13 @@ func (r *googleCredentialRepairer) waitForRepairCooldown(ctx context.Context) er
 	elapsed := now.Sub(lastRepairAt)
 	if r.minInterval > 0 && !lastRepairAt.IsZero() && elapsed < r.minInterval {
 		wait := r.minInterval - elapsed
-		r.pacedCount.Add(1)
+		paced := r.pacedCount.Add(1)
+		r.logger.Warn().
+			Dur("wait", wait).
+			Dur("since_last_repair", elapsed).
+			Dur("min_interval", r.minInterval).
+			Uint64("paced_total", paced).
+			Msg("Delaying Google credential repair — repairs requested faster than the minimum interval (cookies may be revoked within minutes)")
 
 		select {
 		case <-time.After(wait):

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -296,6 +297,81 @@ func TestMaybePersistRotatedCookies(t *testing.T) {
 	}
 	if !info.ModTime().Equal(secondSentinel) {
 		t.Fatalf("unchanged cookies rewrote session: mtime = %v, want %v", info.ModTime(), secondSentinel)
+	}
+}
+
+// A failed cookie save must retry well before the full persist interval (a
+// transient failure should not cost ~5 minutes of durability) while still
+// being throttled, and must leave the change-detect hash alone so the pending
+// rotation is not silently dropped.
+func TestMaybePersistRotatedCookiesRetriesFailedSave(t *testing.T) {
+	authData := libgm.NewAuthData()
+	authData.SetCookies(map[string]string{"SID": "initial"})
+	gmClient := libgm.NewClient(authData, nil, zerolog.Nop())
+	now := time.Date(2026, time.July, 22, 12, 0, 0, 0, time.UTC)
+
+	// A regular file where the session's parent directory belongs makes every
+	// save fail with ENOTDIR, deterministically and without depending on file
+	// permissions (which root would ignore). Removing it lets a retry succeed.
+	dir := t.TempDir()
+	blocker := filepath.Join(dir, "blocked")
+	if err := os.WriteFile(blocker, []byte("not a directory"), 0o600); err != nil {
+		t.Fatalf("write blocker: %v", err)
+	}
+	sessionPath := filepath.Join(blocker, "session.json")
+
+	const interval = 5 * time.Minute
+	retryAfter := interval / cookieSaveRetryDivisor
+	var logs strings.Builder
+	handler := &EventHandler{
+		Logger:              zerolog.New(&logs),
+		SessionPath:         sessionPath,
+		Client:              &Client{GM: gmClient, Logger: zerolog.Nop()},
+		Now:                 func() time.Time { return now },
+		PersistCookiesEvery: interval,
+	}
+	saveAttempts := func() int {
+		return strings.Count(logs.String(), "Failed to persist rotated Google cookies")
+	}
+
+	handler.Handle(&events.ListenRecovered{})
+	if got := saveAttempts(); got != 1 {
+		t.Fatalf("failed save attempts after first event = %d, want 1", got)
+	}
+
+	// Still inside the shortened window: a retry must not fire per event.
+	now = now.Add(retryAfter / 2)
+	handler.Handle(&events.ListenRecovered{})
+	if got := saveAttempts(); got != 1 {
+		t.Fatalf("failed save attempts inside retry window = %d, want 1", got)
+	}
+
+	// The shortened window has elapsed, far short of the full interval.
+	now = now.Add(retryAfter / 2)
+	handler.Handle(&events.ListenRecovered{})
+	if got := saveAttempts(); got != 2 {
+		t.Fatalf("failed save attempts after retry window = %d, want 2", got)
+	}
+
+	if err := os.Remove(blocker); err != nil {
+		t.Fatalf("clear blocker: %v", err)
+	}
+	now = now.Add(retryAfter)
+	handler.Handle(&events.ListenRecovered{})
+	sessionData, err := LoadSession(sessionPath)
+	if err != nil {
+		t.Fatalf("LoadSession() after recovered save: %v", err)
+	}
+	var savedAuth struct {
+		Cookies map[string]string `json:"cookies"`
+	}
+	if err := json.Unmarshal(sessionData.AuthDataJSON, &savedAuth); err != nil {
+		t.Fatalf("unmarshal saved auth data: %v", err)
+	}
+	// The failures must not have recorded the cookie hash; otherwise this save
+	// would have been skipped as "unchanged" and the rotation lost.
+	if savedAuth.Cookies["SID"] != "initial" {
+		t.Fatalf("saved SID = %q, want %q", savedAuth.Cookies["SID"], "initial")
 	}
 }
 

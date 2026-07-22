@@ -217,6 +217,35 @@ func TestGooglePhoneRespondingStatus(t *testing.T) {
 	}
 }
 
+func TestGoogleRepairsPacedStatus(t *testing.T) {
+	a := &App{}
+	a.SessionPath = filepath.Join(t.TempDir(), "session.json")
+	if err := os.WriteFile(a.SessionPath, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Client mode and demo installs never build a repairer; they must report 0
+	// rather than panic on the missing counter.
+	if got := a.GoogleStatus().RepairsPaced; got != 0 {
+		t.Fatalf("RepairsPaced without a counter = %d, want 0", got)
+	}
+
+	var paced uint64
+	a.SetGoogleRepairPaceCounter(func() uint64 { return paced })
+	if got := a.GoogleStatus().RepairsPaced; got != 0 {
+		t.Fatalf("RepairsPaced with an idle counter = %d, want 0", got)
+	}
+	paced = 3
+	if got := a.GoogleStatus().RepairsPaced; got != 3 {
+		t.Fatalf("RepairsPaced = %d, want 3", got)
+	}
+
+	a.SetGoogleRepairPaceCounter(nil)
+	if got := a.GoogleStatus().RepairsPaced; got != 0 {
+		t.Fatalf("RepairsPaced after clearing the counter = %d, want 0", got)
+	}
+}
+
 func TestPhoneOfflineFailuresDoNotMarkGoogleForRepair(t *testing.T) {
 	a := &App{}
 	a.SessionPath = filepath.Join(t.TempDir(), "session.json")

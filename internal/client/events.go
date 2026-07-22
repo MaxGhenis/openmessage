@@ -46,9 +46,15 @@ type EventHandler struct {
 	OnPhoneRespondingChange  func(bool)
 
 	cookieSaveMu     sync.Mutex
-	lastCookieSaveAt time.Time
+	nextCookieSaveAt time.Time
 	lastCookieHash   [32]byte
 }
+
+// cookieSaveRetryDivisor shortens the cookie-persist throttle after a failed
+// save. A transient failure then costs a fraction of the interval instead of a
+// full one, while a persistent failure still cannot turn every inbound event
+// into a write attempt.
+const cookieSaveRetryDivisor = 10
 
 func (h *EventHandler) Handle(rawEvt any) {
 	switch evt := rawEvt.(type) {
@@ -425,15 +431,24 @@ func (h *EventHandler) maybePersistRotatedCookies() {
 
 	h.cookieSaveMu.Lock()
 	defer h.cookieSaveMu.Unlock()
-	if !h.lastCookieSaveAt.IsZero() && now.Sub(h.lastCookieSaveAt) < interval {
+	if !h.nextCookieSaveAt.IsZero() && now.Before(h.nextCookieSaveAt) {
 		return
 	}
-	h.lastCookieSaveAt = now
+	// The throttle covers every outcome, not just a successful save: these
+	// events arrive per message, so an unthrottled failure path would marshal
+	// and rewrite the session on each one. Failures instead come back after
+	// interval/cookieSaveRetryDivisor and leave lastCookieHash untouched, so
+	// the retry still sees the pending rotation and a transient error does not
+	// cost a full interval of durability.
+	h.nextCookieSaveAt = now.Add(interval)
+	retryAt := now.Add(interval / cookieSaveRetryDivisor)
 
 	authData := h.Client.GM.AuthData
 	authData.CookiesLock.RLock()
 	cookiesJSON, err := json.Marshal(authData.Cookies)
 	if err != nil {
+		// Keeps the full interval on purpose: a marshal failure is deterministic
+		// for these cookies, so an early retry only repeats it.
 		authData.CookiesLock.RUnlock()
 		h.Logger.Warn().Err(err).Msg("Failed to marshal rotated Google cookies")
 		return
@@ -446,10 +461,12 @@ func (h *EventHandler) maybePersistRotatedCookies() {
 	sessionData, err := h.Client.SessionData()
 	authData.CookiesLock.RUnlock()
 	if err != nil {
+		h.nextCookieSaveAt = retryAt
 		h.Logger.Warn().Err(err).Msg("Failed to get session data for rotated cookie save")
 		return
 	}
 	if err := SaveSession(h.SessionPath, sessionData); err != nil {
+		h.nextCookieSaveAt = retryAt
 		h.Logger.Warn().Err(err).Msg("Failed to persist rotated Google cookies")
 		return
 	}
