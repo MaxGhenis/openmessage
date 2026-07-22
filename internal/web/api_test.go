@@ -1751,6 +1751,54 @@ func TestGetStatus(t *testing.T) {
 	}
 }
 
+// A paced credential repair means Google cookies are being revoked faster than
+// the repair floor. /api/status is where support (and the runbook) look for it,
+// and a healthy install must not carry the noise.
+func TestGetStatusIncludesGooglePacedRepairs(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		paced   uint64
+		wantKey bool
+	}{
+		{name: "paced repairs surface", paced: 7, wantKey: true},
+		{name: "idle repairer stays quiet", paced: 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ts := newTestServerWithOptions(t, APIOptions{
+				GoogleStatus: func() any {
+					return app.GoogleStatusSnapshot{
+						Connected:    true,
+						Paired:       true,
+						RepairsPaced: tc.paced,
+					}
+				},
+			})
+
+			resp, err := http.Get(ts.server.URL + "/api/status")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+
+			var status map[string]any
+			if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
+				t.Fatal(err)
+			}
+			google, ok := status["google"].(map[string]any)
+			if !ok {
+				t.Fatalf("expected google status object, got %#v", status["google"])
+			}
+			paced, present := google["repairs_paced"]
+			if present != tc.wantKey {
+				t.Fatalf("google.repairs_paced present = %v, want %v (payload %#v)", present, tc.wantKey, google)
+			}
+			if tc.wantKey && paced != float64(tc.paced) {
+				t.Fatalf("google.repairs_paced = %#v, want %d", paced, tc.paced)
+			}
+		})
+	}
+}
+
 func TestGetStatusIncludesWhatsAppSnapshot(t *testing.T) {
 	ts := newTestServerWithOptions(t, APIOptions{
 		WhatsAppStatus: func() any {

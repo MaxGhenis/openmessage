@@ -78,6 +78,9 @@ func getStatusHandler(a *app.App, configured ...Options) server.ToolHandlerFunc 
 		fmt.Fprintf(&sb, "  Paired: %v\n", google.Paired)
 		fmt.Fprintf(&sb, "  Needs pairing: %v\n", google.NeedsPairing)
 		fmt.Fprintf(&sb, "  Phone responding: %v\n", google.PhoneResponding)
+		if google.RepairsPaced > 0 {
+			fmt.Fprintf(&sb, "  Repairs paced: %d (cookie repairs delayed by the min-interval floor)\n", google.RepairsPaced)
+		}
 		if google.LastError != "" {
 			fmt.Fprintf(&sb, "  Last error: %s\n", google.LastError)
 		}

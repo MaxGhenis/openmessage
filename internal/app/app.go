@@ -166,6 +166,8 @@ type App struct {
 	googlePhoneRespondingSeen atomic.Bool
 	googleLifecycleMu         sync.RWMutex
 	googleLifecycleNotifier   GoogleLifecycleNotifier
+	googleRepairPaceMu        sync.RWMutex
+	googleRepairPaceCount     func() uint64
 	signalLifecycleMu         sync.RWMutex
 	signalLifecycleNotifier   SignalLifecycleNotifier
 	tempDataDir               string
@@ -188,6 +190,11 @@ type GoogleStatusSnapshot struct {
 	// PhoneResponding is false after libgm reports PhoneNotResponding. Before
 	// such an event is observed, unknown is treated as healthy.
 	PhoneResponding bool `json:"phone_responding"`
+	// RepairsPaced counts automatic credential repairs the supervisor delayed
+	// to honour the minimum repair interval. 0 through the healthy ~15-minute
+	// heal cycle; a climbing count means cookies are being revoked within
+	// minutes, which the pacing floor is throttling rather than hiding.
+	RepairsPaced uint64 `json:"repairs_paced,omitempty"`
 }
 
 // googleRepairThreshold is how many consecutive failed Google sends (with no
@@ -751,7 +758,30 @@ func (a *App) GoogleStatus() GoogleStatusSnapshot {
 		LastError:       lastError,
 		AuthExpired:     a.googleAuthExpired.Load(),
 		PhoneResponding: a.GooglePhoneResponding(),
+		RepairsPaced:    a.GoogleRepairsPaced(),
 	}
+}
+
+// SetGoogleRepairPaceCounter installs the supervisor's paced-repair counter so
+// status surfaces can report it. Only the transport-owning daemon builds a
+// credential repairer; everyone else (client mode, demo) reports 0.
+func (a *App) SetGoogleRepairPaceCounter(count func() uint64) {
+	a.googleRepairPaceMu.Lock()
+	a.googleRepairPaceCount = count
+	a.googleRepairPaceMu.Unlock()
+}
+
+// GoogleRepairsPaced reports how many automatic Google credential repairs have
+// been delayed by the minimum-repair-interval floor. See
+// GoogleStatusSnapshot.RepairsPaced.
+func (a *App) GoogleRepairsPaced() uint64 {
+	a.googleRepairPaceMu.RLock()
+	count := a.googleRepairPaceCount
+	a.googleRepairPaceMu.RUnlock()
+	if count == nil {
+		return 0
+	}
+	return count()
 }
 
 func (a *App) AnyConnected() bool {

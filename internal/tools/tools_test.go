@@ -572,8 +572,9 @@ func TestGetStatus(t *testing.T) {
 	originalSignalStatus := signalStatus
 	googleStatus = func(*app.App) app.GoogleStatusSnapshot {
 		return app.GoogleStatusSnapshot{
-			Connected: false,
-			Paired:    true,
+			Connected:    false,
+			Paired:       true,
+			RepairsPaced: 4,
 		}
 	}
 	whatsAppStatus = func(*app.App) whatsapplive.StatusSnapshot {
@@ -618,9 +619,36 @@ func TestGetStatus(t *testing.T) {
 	if !strings.Contains(text, "signal-cli unavailable") {
 		t.Errorf("expected Signal last error, got: %s", text)
 	}
+	// Paced repairs are the fast-cookie-revocation signal, so a non-zero count
+	// has to be visible without reading the structured payload.
+	if !strings.Contains(text, "Repairs paced: 4") {
+		t.Errorf("expected paced repair count, got: %s", text)
+	}
 	payload := structuredMap(t, result)
 	if payload["overall_connected"] != true {
 		t.Fatalf("expected overall_connected=true, got %#v", payload["overall_connected"])
+	}
+}
+
+func TestGetStatusOmitsPacedRepairsWhenIdle(t *testing.T) {
+	a := testApp(t)
+	a.DataDir = t.TempDir()
+
+	originalGoogleStatus := googleStatus
+	googleStatus = func(*app.App) app.GoogleStatusSnapshot {
+		return app.GoogleStatusSnapshot{Connected: true, Paired: true}
+	}
+	t.Cleanup(func() { googleStatus = originalGoogleStatus })
+
+	handler := getStatusHandler(a)
+	req := mcp.CallToolRequest{}
+	req.Params.Arguments = map[string]any{}
+	result, err := handler(context.Background(), req)
+	if err != nil {
+		t.Fatalf("handler error: %v", err)
+	}
+	if text := result.Content[0].(mcp.TextContent).Text; strings.Contains(text, "Repairs paced") {
+		t.Errorf("healthy status should not mention paced repairs, got: %s", text)
 	}
 }
 

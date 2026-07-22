@@ -211,7 +211,24 @@ session (measured 2026-07-20: 14 clean minutes of 200s, then
 pattern is therefore a **heal cycle**: connected → cookie 401 → watchdog
 refresh from Chrome → reconnect, repeating every ~15 min with sub-minute dips.
 Rotated cookies are also persisted to `session.json` (throttled, ~5 min) so a
-restart resumes from fresh values instead of pair-time snapshots.
+restart resumes from fresh values instead of pair-time snapshots. That write is
+atomic (temp file + fsync + rename), so a crash mid-save can never truncate the
+paired credentials; a failed save retries at a tenth of the interval instead of
+waiting a full one.
+
+**Is revocation running fast?** Automatic repairs are paced to at least
+`OPENMESSAGE_REPAIR_MIN_INTERVAL` (default 90s). Every delayed repair logs
+`Delaying Google credential repair` (with `wait` and `paced_total`) and bumps
+`google.repairs_paced` in `/api/status`:
+
+```bash
+curl -s http://127.0.0.1:7007/api/status | jq '.google.repairs_paced'
+```
+
+Absent/0 is the healthy ~15-minute heal cycle. A climbing count means repairs
+are being requested faster than the floor — i.e. something is revoking the
+imported cookies within minutes, which pacing throttles but does not fix. Read
+it before concluding a heal loop is "just slow".
 
 An `auth_expired` session with its device link intact revives by cookie
 rewrite alone — **do not re-pair** for `needs_repair`; that resets nothing the
@@ -322,6 +339,7 @@ briefly show "reconnecting" before it settles (see throttling note above).
 
 - `curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:7007/` → 200
 - `/api/status` → `google/whatsapp/signal` connection + `google.needs_repair`
+  (and `google.repairs_paced`, which should stay 0/absent)
 - A real send shows `OUTGOING_DELIVERED` in
   `/api/conversations/<id>/messages`. Don't re-send a user's real message as a
   "test" (duplicate risk on `UNKNOWN`, which is ambiguous about whether it sent);

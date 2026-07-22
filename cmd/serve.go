@@ -243,7 +243,11 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 			refreshGoogleSessionCookies,
 			a.FlagGoogleNeedsRepair,
 			a.ClearGoogleRepairFlag,
+			logger,
 		)
+		// Paced repairs are the fast-cookie-revocation signal; publish the count
+		// so /api/status and get_status show churn instead of it being silent.
+		a.SetGoogleRepairPaceCounter(repairer.PacedRepairCount)
 		newGoogleSupervisor := func() (*bridge.Supervisor, error) {
 			supervisorOptions := []bridge.SupervisorOption{
 				bridge.WithCredentialRepairer(repairer),
