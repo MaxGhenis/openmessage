@@ -120,6 +120,213 @@ func TestGoogleSupervisorCredentialRepairControlsGenerationStart(t *testing.T) {
 	}
 }
 
+func TestGoogleCredentialRepairMinInterval(t *testing.T) {
+	tests := []struct {
+		name  string
+		value string
+		want  time.Duration
+	}{
+		{
+			name: "unset",
+			want: googleCredentialRepairDefaultMinInterval,
+		},
+		{
+			name:  "invalid",
+			value: "soon",
+			want:  googleCredentialRepairDefaultMinInterval,
+		},
+		{
+			name:  "non-positive",
+			value: "0s",
+			want:  googleCredentialRepairDefaultMinInterval,
+		},
+		{
+			name:  "configured",
+			value: "5m",
+			want:  5 * time.Minute,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(googleCredentialRepairMinIntervalEnv, tc.value)
+			if got := googleCredentialRepairMinInterval(); got != tc.want {
+				t.Fatalf("googleCredentialRepairMinInterval() = %s, want %s", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestGoogleCredentialRepairCooldownFirstRepairProceedsImmediately(t *testing.T) {
+	clock := &googleCredentialRepairTestClock{}
+	var refreshCalls atomic.Int32
+	repairer := &googleCredentialRepairer{
+		sessionPath: "session.json",
+		canRepair:   func() bool { return true },
+		refresh: func(context.Context, string) error {
+			refreshCalls.Add(1)
+			return nil
+		},
+		minInterval: time.Hour,
+		now:         clock.Now,
+	}
+
+	if err := repairer.RepairCredentials(context.Background(), "", bridge.OpError{}); err != nil {
+		t.Fatalf("RepairCredentials() error = %v", err)
+	}
+	if got := refreshCalls.Load(); got != 1 {
+		t.Fatalf("refresh calls = %d, want 1", got)
+	}
+	if got := repairer.PacedRepairCount(); got != 0 {
+		t.Fatalf("paced repair count = %d, want 0", got)
+	}
+}
+
+func TestGoogleCredentialRepairCooldownPacesTooSoonRepair(t *testing.T) {
+	const minInterval = 50 * time.Millisecond
+	clock := &googleCredentialRepairTestClock{}
+	var refreshMu sync.Mutex
+	var refreshTimes []time.Time
+	repairer := &googleCredentialRepairer{
+		sessionPath: "session.json",
+		canRepair:   func() bool { return true },
+		refresh: func(context.Context, string) error {
+			refreshMu.Lock()
+			refreshTimes = append(refreshTimes, clock.Now())
+			refreshMu.Unlock()
+			return nil
+		},
+		minInterval: minInterval,
+		now:         clock.Now,
+	}
+
+	if err := repairer.RepairCredentials(context.Background(), "", bridge.OpError{}); err != nil {
+		t.Fatalf("first RepairCredentials() error = %v", err)
+	}
+	repairer.mu.Lock()
+	firstRepairAt := repairer.lastRepairAt
+	repairer.mu.Unlock()
+
+	if err := repairer.RepairCredentials(context.Background(), "", bridge.OpError{}); err != nil {
+		t.Fatalf("second RepairCredentials() error = %v", err)
+	}
+	refreshMu.Lock()
+	gotRefreshTimes := append([]time.Time(nil), refreshTimes...)
+	refreshMu.Unlock()
+	if len(gotRefreshTimes) != 2 {
+		t.Fatalf("refresh calls = %d, want 2", len(gotRefreshTimes))
+	}
+	if elapsed := gotRefreshTimes[1].Sub(firstRepairAt); elapsed < minInterval {
+		t.Fatalf("second refresh elapsed from first repair = %s, want >= %s", elapsed, minInterval)
+	}
+	if got := repairer.PacedRepairCount(); got != 1 {
+		t.Fatalf("paced repair count = %d, want 1", got)
+	}
+}
+
+func TestGoogleCredentialRepairCooldownAfterIntervalProceedsImmediately(t *testing.T) {
+	const minInterval = time.Minute
+	clock := &googleCredentialRepairTestClock{}
+	var refreshCalls atomic.Int32
+	repairer := &googleCredentialRepairer{
+		sessionPath: "session.json",
+		canRepair:   func() bool { return true },
+		refresh: func(context.Context, string) error {
+			refreshCalls.Add(1)
+			return nil
+		},
+		minInterval: minInterval,
+		now:         clock.Now,
+	}
+
+	if err := repairer.RepairCredentials(context.Background(), "", bridge.OpError{}); err != nil {
+		t.Fatalf("first RepairCredentials() error = %v", err)
+	}
+	clock.Advance(minInterval)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := repairer.RepairCredentials(ctx, "", bridge.OpError{}); err != nil {
+		t.Fatalf("second RepairCredentials() after interval error = %v", err)
+	}
+	if got := refreshCalls.Load(); got != 2 {
+		t.Fatalf("refresh calls = %d, want 2", got)
+	}
+	if got := repairer.PacedRepairCount(); got != 0 {
+		t.Fatalf("paced repair count = %d, want 0", got)
+	}
+}
+
+func TestGoogleCredentialRepairCooldownCancellationDoesNotFlagOrRefresh(t *testing.T) {
+	clock := &googleCredentialRepairTestClock{}
+	var refreshCalls atomic.Int32
+	var flagCalls atomic.Int32
+	repairer := &googleCredentialRepairer{
+		sessionPath: "session.json",
+		canRepair:   func() bool { return true },
+		refresh: func(context.Context, string) error {
+			refreshCalls.Add(1)
+			return nil
+		},
+		flagRepair:  func() { flagCalls.Add(1) },
+		minInterval: time.Hour,
+		now:         clock.Now,
+	}
+
+	if err := repairer.RepairCredentials(context.Background(), "", bridge.OpError{}); err != nil {
+		t.Fatalf("first RepairCredentials() error = %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- repairer.RepairCredentials(ctx, "", bridge.OpError{})
+	}()
+	awaitGooglePacedRepairCount(t, repairer, 1)
+	if got := refreshCalls.Load(); got != 1 {
+		t.Fatalf("refresh calls before cancellation = %d, want 1", got)
+	}
+
+	queuedBaseCtx, queuedCancel := context.WithCancel(context.Background())
+	queuedCtx := &googleRepairObservedContext{
+		Context:    queuedBaseCtx,
+		doneCalled: make(chan struct{}),
+	}
+	queuedErrCh := make(chan error, 1)
+	go func() {
+		queuedErrCh <- repairer.RepairCredentials(queuedCtx, "", bridge.OpError{})
+	}()
+	select {
+	case <-queuedCtx.doneCalled:
+	case <-time.After(time.Second):
+		t.Fatal("queued RepairCredentials() did not begin waiting for admission")
+	}
+	queuedCancel()
+	select {
+	case err := <-queuedErrCh:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("queued RepairCredentials() error = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("queued RepairCredentials() did not return after cancellation")
+	}
+
+	cancel()
+
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("RepairCredentials() error = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("RepairCredentials() did not return after cancellation")
+	}
+	if got := refreshCalls.Load(); got != 1 {
+		t.Fatalf("refresh calls after cancellation = %d, want 1", got)
+	}
+	if got := flagCalls.Load(); got != 0 {
+		t.Fatalf("needs_repair flag calls = %d, want 0", got)
+	}
+}
+
 func TestGoogleSupervisorManualReconnectUsesOwnedCommands(t *testing.T) {
 	sessionPath := filepath.Join(t.TempDir(), "session.json")
 	if err := os.WriteFile(sessionPath, []byte("session-v1"), 0o600); err != nil {
@@ -334,6 +541,51 @@ func awaitGoogleSupervisorGenerationState(
 				wantGeneration,
 				snapshot,
 			)
+		case <-ticker.C:
+		}
+	}
+}
+
+type googleCredentialRepairTestClock struct {
+	offset atomic.Int64
+}
+
+type googleRepairObservedContext struct {
+	context.Context
+	doneCalled chan struct{}
+	once       sync.Once
+}
+
+func (c *googleRepairObservedContext) Done() <-chan struct{} {
+	c.once.Do(func() { close(c.doneCalled) })
+	return c.Context.Done()
+}
+
+func (c *googleCredentialRepairTestClock) Now() time.Time {
+	return time.Now().Add(time.Duration(c.offset.Load()))
+}
+
+func (c *googleCredentialRepairTestClock) Advance(delta time.Duration) {
+	c.offset.Add(int64(delta))
+}
+
+func awaitGooglePacedRepairCount(
+	t *testing.T,
+	repairer *googleCredentialRepairer,
+	want uint64,
+) {
+	t.Helper()
+	deadline := time.NewTimer(time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if got := repairer.PacedRepairCount(); got == want {
+			return
+		}
+		select {
+		case <-deadline.C:
+			t.Fatalf("paced repair count = %d, want %d", repairer.PacedRepairCount(), want)
 		case <-ticker.C:
 		}
 	}

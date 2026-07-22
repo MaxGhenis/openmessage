@@ -8,6 +8,7 @@ import (
 	"math/rand"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -19,7 +20,12 @@ import (
 const (
 	googleAccountID             = "google-primary"
 	googleSupervisorStopTimeout = 30 * time.Second
+	// Ninety seconds rate-limits minutes-scale cookie-revocation churn while
+	// remaining transparent to legitimate expiry, measured at >= about 14 minutes.
+	googleCredentialRepairDefaultMinInterval = 90 * time.Second
 )
+
+const googleCredentialRepairMinIntervalEnv = "OPENMESSAGE_REPAIR_MIN_INTERVAL"
 
 func googleSupervisorPolicy() bridge.Policy {
 	return bridge.Policy{
@@ -56,6 +62,13 @@ type googleCredentialRepairer struct {
 	refresh     func(context.Context, string) error
 	flagRepair  func()
 	clearRepair func()
+	minInterval time.Duration
+	now         func() time.Time
+
+	mu           sync.Mutex
+	paceGate     chan struct{}
+	lastRepairAt time.Time
+	pacedCount   atomic.Uint64
 }
 
 func newGoogleCredentialRepairer(
@@ -71,7 +84,83 @@ func newGoogleCredentialRepairer(
 		refresh:     refresh,
 		flagRepair:  flagRepair,
 		clearRepair: clearRepair,
+		minInterval: googleCredentialRepairMinInterval(),
 	}
+}
+
+func googleCredentialRepairMinInterval() time.Duration {
+	value := os.Getenv(googleCredentialRepairMinIntervalEnv)
+	interval, err := time.ParseDuration(value)
+	if value == "" || err != nil || interval <= 0 {
+		return googleCredentialRepairDefaultMinInterval
+	}
+	return interval
+}
+
+func (r *googleCredentialRepairer) PacedRepairCount() uint64 {
+	return r.pacedCount.Load()
+}
+
+func (r *googleCredentialRepairer) repairNow() time.Time {
+	if r.now != nil {
+		return r.now()
+	}
+	return time.Now()
+}
+
+func (r *googleCredentialRepairer) acquireRepairCooldown(
+	ctx context.Context,
+) (func(), error) {
+	r.mu.Lock()
+	if r.paceGate == nil {
+		r.paceGate = make(chan struct{}, 1)
+		r.paceGate <- struct{}{}
+	}
+	paceGate := r.paceGate
+	r.mu.Unlock()
+
+	select {
+	case <-paceGate:
+		if err := ctx.Err(); err != nil {
+			paceGate <- struct{}{}
+			return nil, err
+		}
+		return func() { paceGate <- struct{}{} }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func (r *googleCredentialRepairer) waitForRepairCooldown(ctx context.Context) error {
+	release, err := r.acquireRepairCooldown(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+
+	r.mu.Lock()
+	now := r.repairNow()
+	lastRepairAt := r.lastRepairAt
+	r.mu.Unlock()
+	elapsed := now.Sub(lastRepairAt)
+	if r.minInterval > 0 && !lastRepairAt.IsZero() && elapsed < r.minInterval {
+		wait := r.minInterval - elapsed
+		r.pacedCount.Add(1)
+
+		select {
+		case <-time.After(wait):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+	}
+
+	r.mu.Lock()
+	r.lastRepairAt = r.repairNow()
+	r.mu.Unlock()
+	return nil
 }
 
 func (r *googleCredentialRepairer) RepairCredentials(
@@ -79,6 +168,10 @@ func (r *googleCredentialRepairer) RepairCredentials(
 	_ string,
 	_ bridge.OpError,
 ) error {
+	if err := r.waitForRepairCooldown(ctx); err != nil {
+		return err
+	}
+
 	if r.canRepair == nil || !r.canRepair() || r.refresh == nil {
 		if r.flagRepair != nil {
 			r.flagRepair()
