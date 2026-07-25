@@ -172,7 +172,8 @@ Key facts:
      (the signed-in profile; `Local State` maps profiles → accounts). Build a
      `name=value; name=value; …` header from `.google.com` / `messages.google.com`
      cookies and write it to a `0600` file.
-   - **Cookies rotate roughly every 30 minutes** → extract fresh **immediately**
+   - **Cookies go stale on the order of tens of minutes** (observed; the exact
+     cadence is not established) → extract fresh **immediately**
      before pairing, or `pair --google` returns HTTP 401.
 4. `pair --google` prints `EMOJI: <emoji>`. The user taps that emoji in Google
    Messages **on the phone** (notification shade, or profile → Device pairing)
@@ -265,11 +266,13 @@ rewrite alone — **do not re-pair** for `needs_repair`; that resets nothing the
 refresh can't fix and risks pairing throttles. So the **first** thing to try
 when SMS is dead is nothing — wait ~2-3 min for the watchdog (the one observed
 live heal took 2m20s; under-waiting funnels you into the re-pair this section
-warns against). If it hasn't recovered, first re-check the running binary
-(above), then whether Chrome still holds the five `.google.com` account
-cookies — if they are genuinely gone (user signed out of Google there) or the
-device link was revoked, only then fall back to the
-manual re-pair recipe above. The app also posts a **health notification**
+warns against). If it hasn't recovered, **read the actual repair and reconnect
+errors before deciding to re-pair** — the causes are broader than "the cookies
+are gone": Chrome/keychain/profile access, missing or undecryptable cookies, a
+session-file write failure, network or server rejection, or a genuinely revoked
+device link. Re-check the running binary (above) and whether Chrome still holds
+the five `.google.com` account cookies first; only once those are ruled out
+fall back to the manual re-pair recipe above. The app also posts a **health notification**
 (once, on the rising edge) when Google flips to `needs_repair` or WhatsApp
 logs out, so a dead platform can't sit silent for days.
 
