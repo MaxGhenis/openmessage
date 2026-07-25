@@ -152,3 +152,31 @@ jobs:
 
       - name: Package macOS app
         run: bash macos/build.sh
+
+      - name: Verify dev build cannot shadow the installed app
+        run: |
+          # A default (non-RELEASE) build must NOT claim com.openmessage.app —
+          # that id collision let stale builds win LaunchServices resolution and
+          # caused two live outages. See docs/agent-runbook.md "Bundle-id shadowing".
+          id=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' \
+                 macos/build/OpenMessage.app/Contents/Info.plist)
+          echo "Dev build bundle id: $id"
+          if [ "$id" != "com.openmessage.app.dev" ]; then
+            echo "::error::Default build has bundle id '$id', expected com.openmessage.app.dev."
+            exit 1
+          fi
+
+      - name: Verify RELEASE=1 restores the shippable identity
+        run: |
+          RELEASE=1 bash macos/build.sh >/dev/null
+          id=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' \
+                 macos/build/OpenMessage.app/Contents/Info.plist)
+          echo "Release build bundle id: $id"
+          if [ "$id" != "com.openmessage.app" ]; then
+            echo "::error::RELEASE=1 build has bundle id '$id', expected com.openmessage.app."
+            exit 1
+          fi
+          test -f macos/build/OpenMessage.dmg || {
+            echo "::error::RELEASE=1 build did not emit macos/build/OpenMessage.dmg."
+            exit 1
+          }
