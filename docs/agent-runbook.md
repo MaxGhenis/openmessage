@@ -381,13 +381,73 @@ hardened the UI to ignore redundant status pushes.)
 
 ## Deploying a new build to a live install
 
+**`RELEASE=1` is required.** Without it `build.sh` stamps the dev bundle id
+(`com.openmessage.app.dev`) on purpose — see [bundle-id
+shadowing](#bundle-id-shadowing--only-one-app-may-claim-comopenmessageapp).
+Copying a dev-id build into `/Applications` would silently orphan the
+`defaults write com.openmessage.app V2Primary` lever and the notification grant.
+
 ```
-DEVELOPER_ID="Developer ID Application: Max Ghenis (8VB5UKQZC6)" ./macos/build.sh
+RELEASE=1 DEVELOPER_ID="Developer ID Application: Max Ghenis (8VB5UKQZC6)" ./macos/build.sh
 osascript -e 'quit app "OpenMessage"'      # fully quit; `open -a` on a running app won't relaunch it
 rm -rf /Applications/OpenMessage.app && cp -R macos/build/OpenMessage.app /Applications/
 xattr -cr /Applications/OpenMessage.app
 open -a OpenMessage
 ```
+
+Confirm the deployed bundle kept the release id:
+
+```
+/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' /Applications/OpenMessage.app/Contents/Info.plist
+# -> com.openmessage.app   (NOT ...app.dev)
+```
+
+**Building from a nested `.claude/worktrees/*` checkout needs `GOWORK=off`.**
+Go walks up, finds `~/openmessage/go.work`, and resolves the main module to the
+parent — `go build .` then fails with "main module … does not contain package
+…/.claude/worktrees/<name>". Prefix the build with `GOWORK=off`.
+
+## Bundle-id shadowing — only one .app may claim `com.openmessage.app`
+
+LaunchServices resolves "OpenMessage" (Spotlight, Dock, `open -a OpenMessage`,
+notification clicks) to *any* registered bundle declaring
+`CFBundleIdentifier = com.openmessage.app`. Every build output, backup, and
+Xcode archive used to declare it, so a stale build could be launched instead of
+the installed app. This caused two outages; on 2026-07-25 a build predating the
+self-heal OSID fix (PR #148) latched Google Messages in `needs_repair` for
+~10.5h (06:54 → ~17:20).
+
+Two fixes that **don't** work — verified 2026-07-25:
+
+- `lsregister -u <path>` is **not durable**. Any LaunchServices rescan
+  re-registers the bundle; a forced rescan brought all 14 straight back.
+- Renaming `Foo.app` → `Foo.app.disabled` does nothing. LaunchServices
+  registers on bundle *structure*, not the `.app` extension — it re-registered
+  every renamed bundle at its new path.
+
+What works:
+
+- **Build outputs:** `build.sh` stamps `com.openmessage.app.dev` unless
+  `RELEASE=1`, so a dev build structurally cannot win resolution.
+- **Backups/archives kept on disk:** rename `Contents/Info.plist` →
+  `Contents/Info.plist.disabled`. With no `Info.plist` LaunchServices can't read
+  a bundle id. Lossless and reversible; see `~/openmessage-ROLLBACK-README.md`
+  for the restore recipe.
+
+Audit (should print exactly `/Applications/OpenMessage.app`):
+
+```
+/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -dump \
+ | awk '/^[[:space:]]*path:[[:space:]]/ { p=$0; sub(/^[[:space:]]*path:[[:space:]]*/,"",p); sub(/ \(0x[0-9a-f]*\)$/,"",p) }
+        /^[[:space:]]*identifier:[[:space:]]/ { id=$0; sub(/^[[:space:]]*identifier:[[:space:]]*/,"",id);
+        if (id=="com.openmessage.app") print p; p="" }' | sort -u
+```
+
+Note `mdfind "kMDItemCFBundleIdentifier == 'com.openmessage.app'"` is **not** a
+reliable audit — Spotlight keeps stale metadata for neutralized bundles and
+skips dot-directories entirely (two hidden rollback bundles were found only by
+a forced `lsregister -R -f`). Filter the `lsregister` dump by `identifier:` as
+above.
 
 The user's data and pairing **persist** — they live in the data dir, not in the
 `.app` bundle. A fresh restart re-establishes the Google long-poll, which can
