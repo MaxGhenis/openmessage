@@ -204,12 +204,40 @@ messages.google.com every repair failed with `missing required cookies:
 messages.google.com:OSID` and the app looped in `needs_repair` forever — a
 re-pair bought minutes, then died again.)
 
-**Expected steady-state:** Google invalidates replayed browser-cookie
-snapshots after ~14 minutes of Chrome concurrently advancing the same account
-session (measured 2026-07-20: 14 clean minutes of 200s, then
-`SESSION_COOKIE_INVALID`; fresh-pair sessions died in ~3-4 min). The healthy
-pattern is therefore a **heal cycle**: connected → cookie 401 → watchdog
-refresh from Chrome → reconnect, repeating every ~15 min with sub-minute dips.
+**Expected steady-state — check WHICH BINARY first.** Before diagnosing any
+latched `needs_repair`, confirm the running backend is the fixed build:
+
+```bash
+RUNBIN=$(ps -o command= -p "$(lsof -nP -iTCP:7007 -sTCP:LISTEN -t | head -1)" | awk '{print $1}')
+echo "$RUNBIN"; strings "$RUNBIN" | grep -c 'persisted rotated Google cookies'   # 0 = pre-fix build
+```
+
+**This is the single highest-yield check** — it has explained two multi-hour
+outages (2026-07-22 and 2026-07-25, the latter ~10.5h). Many `.app` bundles on
+a dev machine share `CFBundleIdentifier com.openmessage.app` (stale worktree
+builds, dated backups, the R8 rollback copy), so LaunchServices can resolve
+Spotlight/Dock/`open -a OpenMessage`/notification clicks to a **pre-fix**
+build, which then latches `needs_repair` exactly like the original bug. Verify
+the resolution and always launch by explicit path:
+
+```bash
+osascript -e 'tell application "Finder" to get POSIX path of (application file id "com.openmessage.app" as alias)'
+open /Applications/OpenMessage.app
+```
+
+Note the app's `BackendManager` **reuses an already-running backend** on the
+port, so quitting the GUI is not enough — kill the stale backend process too,
+or the new GUI simply adopts it.
+
+**Observed lifetimes vary by regime; there is no known fixed timer.** An
+out-of-band probe replaying a *copy* of the session (2026-07-20, n=1) got
+`SESSION_COOKIE_INVALID` after ~14 minutes with Chrome active, and fresh-pair
+sessions died in ~3-4 min. The live app is far more stable: one cookie expiry
+in a 15h watch on 7/21, and none attributable to the fixed build since. Why
+lifetimes differ is **not established** — do not treat any interval as a law.
+Healthy looks like: mostly connected, with rare `auth_expired` dips that
+self-heal in ~2-3 min via Chrome cookie import. Minutes-scale heal churn is
+**not** normal — check `google.repairs_paced` (below).
 Rotated cookies are also persisted to `session.json` (throttled, ~5 min) so a
 restart resumes from fresh values instead of pair-time snapshots. That write is
 atomic (temp file + fsync + rename), so a crash mid-save can never truncate the
@@ -225,7 +253,9 @@ waiting a full one.
 curl -s http://127.0.0.1:7007/api/status | jq '.google.repairs_paced'
 ```
 
-Absent/0 is the healthy ~15-minute heal cycle. A climbing count means repairs
+Absent/0 is healthy — genuine expiries are rare (hours-to-days apart in
+observed data), so a paced count of zero is the norm, not a sign of trouble.
+A climbing count means repairs
 are being requested faster than the floor — i.e. something is revoking the
 imported cookies within minutes, which pacing throttles but does not fix. Read
 it before concluding a heal loop is "just slow".
@@ -233,9 +263,12 @@ it before concluding a heal loop is "just slow".
 An `auth_expired` session with its device link intact revives by cookie
 rewrite alone — **do not re-pair** for `needs_repair`; that resets nothing the
 refresh can't fix and risks pairing throttles. So the **first** thing to try
-when SMS is dead is nothing — wait ~15-60s for the watchdog. If it hasn't
-recovered, the cookies are genuinely gone from Chrome (user signed out of
-Google there) or the device link was revoked; only then fall back to the
+when SMS is dead is nothing — wait ~2-3 min for the watchdog (the one observed
+live heal took 2m20s; under-waiting funnels you into the re-pair this section
+warns against). If it hasn't recovered, first re-check the running binary
+(above), then whether Chrome still holds the five `.google.com` account
+cookies — if they are genuinely gone (user signed out of Google there) or the
+device link was revoked, only then fall back to the
 manual re-pair recipe above. The app also posts a **health notification**
 (once, on the rising edge) when Google flips to `needs_repair` or WhatsApp
 logs out, so a dead platform can't sit silent for days.
