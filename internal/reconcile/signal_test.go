@@ -587,6 +587,72 @@ func TestSignalRespectsSinceTimestamp(t *testing.T) {
 	}
 }
 
+func TestSignalFallbackKeyAndSkipReasons(t *testing.T) {
+	ctx := context.Background()
+	legacy, v2 := openSignalStores(t)
+	seedLegacySignalConversation(t, legacy, testOutgoingTimestamp)
+	seedLegacySignalMessage(t, legacy, db.Message{
+		MessageID:      "signal:zero-timestamp",
+		ConversationID: testSignalConversation,
+		Body:           "invalid timestamp",
+		TimestampMS:    0,
+		IsFromMe:       true,
+		SourcePlatform: signalPlatform,
+		SourceID:       "key-with-invalid-timestamp",
+	})
+	seedLegacySignalMessage(t, legacy, db.Message{
+		MessageID:      "signal:",
+		ConversationID: testSignalConversation,
+		Body:           "missing remote key",
+		TimestampMS:    testIncomingTimestamp,
+		IsFromMe:       true,
+		SourcePlatform: signalPlatform,
+	})
+	seedLegacySignalMessage(t, legacy, db.Message{
+		MessageID:      "signal:fallback-remote-key",
+		ConversationID: testSignalConversation,
+		Body:           "fallback source",
+		TimestampMS:    testOutgoingTimestamp,
+		IsFromMe:       true,
+		SourcePlatform: signalPlatform,
+	})
+
+	report, err := Signal(ctx, Options{
+		Legacy: legacy,
+		V2:     v2,
+		Logger: zerolog.Nop(),
+	})
+	if err != nil {
+		t.Fatalf("Signal(): %v", err)
+	}
+	if report.MessagesScanned != 3 || report.MessagesImported != 1 ||
+		report.Skipped != 2 ||
+		report.SkipReasons[skipNonPositiveTimestamp] != 1 ||
+		report.SkipReasons[skipMissingMessageKey] != 1 {
+		t.Fatalf("report = %+v", report)
+	}
+	conversation, err := v2.GetConversationByRemote(
+		signalAccountID,
+		testSignalConversation,
+	)
+	if err != nil {
+		t.Fatalf("GetConversationByRemote(): %v", err)
+	}
+	repository := newSignalMessageRepository(t, v2)
+	message, err := repository.GetMessageByRemote(
+		ctx,
+		signalAccountID,
+		conversation.ConversationID,
+		"fallback-remote-key",
+	)
+	if err != nil {
+		t.Fatalf("GetMessageByRemote(fallback): %v", err)
+	}
+	if message.Body != "fallback source" {
+		t.Fatalf("fallback message = %+v", message)
+	}
+}
+
 func TestSignalDoesNotLinkSelfIdentityAsDirectPeer(t *testing.T) {
 	legacy, v2 := openSignalStores(t)
 	seedLegacySignalConversation(t, legacy, testIncomingTimestamp)
