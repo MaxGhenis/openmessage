@@ -122,6 +122,28 @@ func (s *Store) ListDirectConversationsWithoutParticipants() ([]Conversation, er
 	return conversations, nil
 }
 
+// CountDistinctInboundSenders returns how many distinct sender identities have
+// sent an inbound message in a conversation. Two or more is positive evidence
+// that the thread is not a 1:1 — the one signal available for platforms whose
+// remote conversation ID is opaque about shape (Google Messages).
+func (s *Store) CountDistinctInboundSenders(conversationID string) (int, error) {
+	var count int
+	if err := s.db.QueryRowContext(
+		context.Background(),
+		`SELECT COUNT(DISTINCT sender_identity_id)
+		 FROM messages
+		 WHERE conversation_id = ?
+		   AND direction = 'incoming'
+		   AND sender_identity_id IS NOT NULL`,
+		conversationID,
+	).Scan(&count); err != nil {
+		return 0, fmt.Errorf(
+			"count distinct inbound senders for conversation %q: %w", conversationID, err,
+		)
+	}
+	return count, nil
+}
+
 // LatestInboundSenderIdentityID returns the sender identity of the most
 // recent inbound message in a conversation, or ok=false when the
 // conversation has no attributed inbound messages.

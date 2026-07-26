@@ -93,6 +93,20 @@ func (w *Worker) backfillOneDirectConversation(
 	conversation sqlite.Conversation,
 	platform bridge.Platform,
 ) (bool, error) {
+	// A remote ID that does not itself confirm "direct" (an opaque Google thread
+	// id) leaves group-ness unknown. Naming such a thread after one sender would
+	// render a group as a 1:1 with whoever spoke, so require the only evidence
+	// available: exactly one distinct inbound sender. Multi-sender threads are
+	// left for the ConversationEvent that carries the real roster.
+	if _, confirmed := conversationKindForRemoteID(platform, conversation.RemoteConversationID); !confirmed {
+		senders, err := w.store.CountDistinctInboundSenders(conversation.ConversationID)
+		if err != nil {
+			return false, err
+		}
+		if senders > 1 {
+			return false, nil
+		}
+	}
 	if identityID, ok, err := w.store.LatestInboundSenderIdentityID(
 		conversation.ConversationID,
 	); err != nil {

@@ -2,6 +2,7 @@ package ingest
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	"github.com/maxghenis/openmessage/internal/storage/sqlite"
@@ -246,4 +247,83 @@ func seedBackfillIdentity(
 		t.Fatalf("UpsertIdentity(%q): %v", identityID, err)
 	}
 	return identity
+}
+
+// Google thread ids are opaque about shape, so a multi-sender thread must not be
+// given a single "peer" — that would render a group as a 1:1 with whoever spoke
+// most recently. Verified against a real store: every bare Google thread there
+// had exactly one inbound sender, so this guard is what keeps the one that
+// doesn't from being mislabeled.
+func TestBackfillDirectParticipantsSkipsMultiSenderOpaqueThread(t *testing.T) {
+	harness := newSignalWorkerHarness(t, "backfill-multi-sender.sqlite3")
+	if err := harness.store.UpsertAccount(sqlite.Account{
+		AccountID:   "google-primary",
+		BridgeKey:   "google_messages",
+		DisplayName: "Google",
+		Mode:        sqlite.AccountModeLive,
+		Enabled:     true,
+		ConfigJSON:  `{}`,
+		CreatedAtMS: signalDecoderReceivedAt.UnixMilli(),
+		UpdatedAtMS: signalDecoderReceivedAt.UnixMilli(),
+	}); err != nil {
+		t.Fatalf("UpsertAccount(): %v", err)
+	}
+	conversationID := v2keys.DeriveID("conversation", "google-primary", "4242")
+	seedBackfillConversation(t, harness, sqlite.Conversation{
+		ConversationID:       conversationID,
+		AccountID:            "google-primary",
+		RemoteConversationID: "4242",
+		Kind:                 sqlite.ConversationKindDirect,
+		NotificationMode:     sqlite.NotificationModeAll,
+		LastMessageAtMS:      1700000000000,
+	})
+	for index, sender := range []struct{ id, number, name string }{
+		{"identity-rcs-1", "+15558880001", "First Sender"},
+		{"identity-rcs-2", "+15558880002", "Second Sender"},
+	} {
+		identity := sqlite.Identity{
+			IdentityID:     sender.id,
+			AccountID:      "google-primary",
+			Kind:           sqlite.IdentityKind("e164"),
+			CanonicalValue: sender.number,
+			RawValue:       sender.number,
+			DisplayName:    sender.name,
+			MetadataJSON:   `{}`,
+			CreatedAtMS:    signalDecoderReceivedAt.UnixMilli(),
+			UpdatedAtMS:    signalDecoderReceivedAt.UnixMilli(),
+		}
+		if err := harness.store.UpsertIdentity(identity); err != nil {
+			t.Fatalf("UpsertIdentity(%q): %v", sender.id, err)
+		}
+		if err := harness.messages.ImportMessage(context.Background(), sqlite.MessageProjection{
+			Message: sqlite.Message{
+				MessageID:        fmt.Sprintf("multi-sender-%d", index),
+				ConversationID:   conversationID,
+				AccountID:        "google-primary",
+				RemoteMessageID:  fmt.Sprintf("remote-multi-%d", index),
+				SenderIdentityID: &identity.IdentityID,
+				Direction:        sqlite.MessageDirectionIncoming,
+				Body:             "group traffic",
+				State:            sqlite.MessageStateActive,
+				OccurredAtMS:     1700000000000 + int64(index),
+			},
+		}); err != nil {
+			t.Fatalf("ImportMessage(%d): %v", index, err)
+		}
+	}
+
+	report, err := harness.worker.BackfillDirectParticipants()
+	if err != nil {
+		t.Fatalf("BackfillDirectParticipants(): %v", err)
+	}
+	if report.Linked != 0 || report.Unresolved != 1 {
+		t.Fatalf("report = %+v, want the multi-sender opaque thread left unresolved", report)
+	}
+	participants, err := harness.store.ListParticipants(conversationID)
+	if err != nil {
+		t.Fatalf("ListParticipants(): %v", err)
+	}
+	if len(participants) != 0 {
+		t.Fatalf("participants = %+v, want none picked from a multi-sender thread", participants)
+	}
 }
