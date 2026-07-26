@@ -12,9 +12,12 @@
 - Recorded and committed the task constraints at the start.
 - Implemented and focused-tested the Signal reconciliation library, including key parity, idempotence, preexisting twins, dry-run behavior, and the worker alias contract.
 - Implemented and focused-tested the guarded `v2 reconcile-signal` command on the isolation branch.
+- Reapplied the preserved library and command commits to the requested branch.
+- Added focused-tested read-only open paths for both stores so dry-runs cannot migrate or otherwise modify database files.
 
 ## Next
 
-- Reapply the preserved library and command commits to the requested branch.
+- Tighten account, identity, participant, and live-replay integrity behavior from review.
+- Finish the command's default-path, read-only, error-wrapping, and partial-report behavior.
 - Run the required build and full focused test suite.
 - Write the final report output file and mark this document complete.

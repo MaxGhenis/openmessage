@@ -60,6 +60,56 @@ func Open(path string) (*Store, error) {
 	return &Store{db: db}, nil
 }
 
+// OpenReadOnly opens an existing store without changing journal mode or
+// running schema migrations. The read-only DSN and query_only pragma provide
+// independent guards against accidental writes in maintenance dry runs.
+func OpenReadOnly(path string) (*Store, error) {
+	if strings.TrimSpace(path) == "" {
+		return nil, fmt.Errorf("open read-only sqlite store: path is empty")
+	}
+	db, err := sql.Open("sqlite", readOnlyStoreDSN(path))
+	if err != nil {
+		return nil, fmt.Errorf("open read-only sqlite store: %w", err)
+	}
+	db.SetMaxOpenConns(1)
+	closeWithError := func(openErr error) (*Store, error) {
+		_ = db.Close()
+		return nil, openErr
+	}
+
+	ctx := context.Background()
+	if err := db.PingContext(ctx); err != nil {
+		return closeWithError(fmt.Errorf("open read-only sqlite store connection: %w", err))
+	}
+	checks := []struct {
+		pragma string
+		want   int
+	}{
+		{pragma: "query_only", want: 1},
+		{pragma: "foreign_keys", want: 1},
+		{pragma: "busy_timeout", want: busyTimeoutMS},
+	}
+	for _, check := range checks {
+		var got int
+		if err := db.QueryRowContext(ctx, "PRAGMA "+check.pragma).Scan(&got); err != nil {
+			return closeWithError(fmt.Errorf(
+				"verify read-only sqlite %s pragma: %w",
+				check.pragma,
+				err,
+			))
+		}
+		if got != check.want {
+			return closeWithError(fmt.Errorf(
+				"verify read-only sqlite %s pragma: got %d, want %d",
+				check.pragma,
+				got,
+				check.want,
+			))
+		}
+	}
+	return &Store{db: db}, nil
+}
+
 // Close closes the store's database connections.
 func (s *Store) Close() error {
 	return s.db.Close()
@@ -93,6 +143,24 @@ func storeDSN(path string) string {
 	// after acquiring SQLite's write reservation.
 	query.Set("_txlock", "immediate")
 
+	return (&url.URL{
+		Scheme:   "file",
+		Path:     normalizedPath,
+		RawQuery: query.Encode(),
+	}).String()
+}
+
+func readOnlyStoreDSN(path string) string {
+	normalizedPath := strings.ReplaceAll(path, `\`, "/")
+	if isWindowsAbsolutePath(normalizedPath) {
+		normalizedPath = "/" + normalizedPath
+	}
+
+	query := make(url.Values)
+	query.Set("mode", "ro")
+	query.Add("_pragma", fmt.Sprintf("busy_timeout(%d)", busyTimeoutMS))
+	query.Add("_pragma", "foreign_keys(ON)")
+	query.Add("_pragma", "query_only(ON)")
 	return (&url.URL{
 		Scheme:   "file",
 		Path:     normalizedPath,
