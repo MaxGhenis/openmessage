@@ -43,6 +43,71 @@ GET /api/search?q=<term>
 Outgoing message rows carry a `Status`: `OUTGOING_SENDING` → `OUTGOING_SENT`/
 `OUTGOING_DELIVERED`, or `OUTGOING_FAILED:<STATUS>` when a send is rejected.
 
+### Message JSON field names — the epoch-0 trap
+
+The legacy message DTO marshals **Go field names**, not snake_case, for its core
+fields, and snake_case only where a tag says so:
+
+```
+MessageID  ConversationID  SenderName  SenderNumber  Body  TimestampMS
+Status  IsFromMe  MediaID  MimeType  Reactions  ReplyToID
+source_platform  source_id  mentions_me  transcript
+```
+
+**`TimestampMS` — capital M, capital S, no underscore.** A reader that looks for
+`timestamp_ms` or `TimestampMs` silently gets `0`, and formatting epoch 0
+renders every message as **1969-12-31 19:00 ET ("Wed 19:00")**. That is not a
+data bug and not a Signal bug: an entire thread showing one identical
+placeholder timestamp means the reader used the wrong key. Check the raw JSON
+before chasing the bridge:
+
+```bash
+curl -s "http://127.0.0.1:7007/api/conversations/<id>/messages?limit=1" | jq '.[0]|keys'
+```
+
+The web UI reads `TimestampMS` throughout, so these names are a stable contract
+— don't "fix" them by renaming.
+
+## v2 cutover: conversation IDs re-key (issue #155)
+
+On a **v2-primary** install the API serves the v2 store, where a conversation's
+primary key is a derived 32-hex hash (`v2keys.DeriveID("conversation", account,
+remoteID)`) — **not** the legacy id. The legacy form is preserved as
+`conversations.remote_conversation_id` (`signal:+1555…`, `signal-group:<b64>=`,
+a WhatsApp JID, a Google thread id).
+
+Consequence, and the shape of the 7/26 incident: an agent stores
+`signal:+1555…` on Friday while the app reads legacy-primary, the app restarts
+into v2-primary over the weekend, and every read of that stored id returns `[]`
+— the thread looks deleted while its rows sit safely under the hash key. The
+fix (this PR) makes v2 reads accept **either** key: unknown ids fall back to a
+`remote_conversation_id` lookup across accounts, and the returned DTO always
+carries the canonical v2 id. Prefer storing the **v2 id** for anything durable;
+the alias exists so old references keep working.
+
+Two more cutover artifacts worth knowing:
+
+- **Only the Google decoder emits `ConversationEvent` frames.** Signal and
+  WhatsApp conversations are minted from message frames, which carry no kind and
+  no roster. Before this PR that meant post-cutover Signal/WhatsApp **groups
+  were stored as `direct`**, and 1:1 threads had **no participants and no
+  title** — they listed as blank rows with `Participants: "[]"`. The projector
+  now infers kind from the remote ID (authoritative for Signal/WhatsApp,
+  never guessed for opaque Google thread ids) and links the direct peer; a
+  daemon-startup sweep repairs rows that predate the fix.
+- **`/api/status` freshness only measures the ACTIVE read source.** Running
+  v2-primary, a stalled v2 ingest projection is invisible there — the legacy
+  path can keep ingesting for days while readers see nothing new, and every
+  per-platform row still reports `behind_days: 0`. This is not hypothetical: the
+  Signal projection stalled from Thu 7/23 to Sat 7/25 while legacy kept writing.
+  Each platform entry now also carries `legacy_latest_ms`, `projection_lag_ms`,
+  and `projection_stalled` (plus a top-level `projection_stalled`), so read
+  those before trusting freshness on a migrated install:
+
+```bash
+curl -s http://127.0.0.1:7007/api/status | jq '.freshness'
+```
+
 ## MCP serving — exactly one process may own live transports
 
 **The failure mode (empirically confirmed 2026-07-20):** `openmessage serve

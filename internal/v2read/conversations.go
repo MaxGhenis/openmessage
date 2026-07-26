@@ -34,11 +34,13 @@ func (s *Source) ListConversations(limit int) ([]*db.Conversation, error) {
 }
 
 // GetConversation returns one v2 conversation as the canonical legacy DTO.
+// The id may be a v2 conversation ID or a legacy remote conversation ID; the
+// returned DTO always carries the canonical v2 ID.
 func (s *Source) GetConversation(id string) (*db.Conversation, error) {
 	if err := s.ready(); err != nil {
 		return nil, err
 	}
-	conversation, err := s.store.GetConversation(id)
+	conversation, err := s.store.GetConversation(s.resolveConversationID(id))
 	if errors.Is(err, sqlite.ErrNotFound) {
 		return nil, sql.ErrNoRows
 	}

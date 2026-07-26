@@ -341,6 +341,19 @@ func (s *v2Stack) Start(
 		runnerCount++
 	}
 	runWG.Add(runnerCount)
+	// Repair direct conversations that message-frame projection minted without
+	// participants (#155) before any reader can observe them nameless. Additive
+	// and idempotent, so it is safe on every start; the daemon owns it, exactly
+	// like the legacy startup repair sweeps.
+	if report, err := s.worker.BackfillDirectParticipants(); err != nil {
+		s.logger.Warn().Err(err).Msg("Failed to backfill direct-conversation participants")
+	} else if report.Linked > 0 || report.Unresolved > 0 {
+		s.logger.Info().
+			Int("scanned", report.Scanned).
+			Int("linked", report.Linked).
+			Int("unresolved", report.Unresolved).
+			Msg("Backfilled participants for direct conversations missing them")
+	}
 	go func() {
 		defer runWG.Done()
 		if err := s.worker.Run(runCtx); err != nil && !errors.Is(err, context.Canceled) {
