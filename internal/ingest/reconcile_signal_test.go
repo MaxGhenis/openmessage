@@ -96,9 +96,10 @@ func TestSignalReconciledOutgoingAliasIsFoundByWorkerBareTimestampPath(t *testin
 
 	// Historical import uses the wall clock. Give the real replay a later clock
 	// so its update satisfies the store's monotonic timestamp constraints.
+	replayNow := time.UnixMilli(reconciled.UpdatedAtMS + 1)
 	liveMessages, err := sqlite.NewMessageRepository(
 		harness.store,
-		func() time.Time { return time.Now().Add(time.Hour) },
+		func() time.Time { return replayNow },
 	)
 	if err != nil {
 		t.Fatalf("NewMessageRepository(live replay): %v", err)
