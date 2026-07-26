@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"os"
@@ -59,6 +60,10 @@ func TestReconcileSignalRefusesWhenBackendProbeResponds(t *testing.T) {
 			t.Fatal("v2 store opened while backend probe reported running")
 			return nil, nil
 		},
+		openV2ReadOnly: func(string) (*sqlite.Store, error) {
+			t.Fatal("read-only v2 store opened while backend probe reported running")
+			return nil, nil
+		},
 		reconcile: func(context.Context, reconcile.Options) (reconcile.Report, error) {
 			t.Fatal("reconciler called while backend probe reported running")
 			return reconcile.Report{}, nil
@@ -109,6 +114,16 @@ func TestReconcileSignalRefusesWhenBackendProbeResponds(t *testing.T) {
 
 func TestReconcileSignalParsesFlagsAndEmitsOneJSONReport(t *testing.T) {
 	sourceDir := newReconcileSourceFixture(t, true)
+	legacyPath := filepath.Join(sourceDir, legacyDatabaseName)
+	v2Path := filepath.Join(sourceDir, "v2", v2StoreName)
+	legacyBefore, err := os.ReadFile(legacyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v2Before, err := os.ReadFile(v2Path)
+	if err != nil {
+		t.Fatal(err)
+	}
 	deps := reconcileSignalDependencies{
 		now:      func() time.Time { return time.Date(2026, 7, 26, 12, 0, 0, 0, time.UTC) },
 		version:  "test-version",
@@ -117,8 +132,12 @@ func TestReconcileSignalParsesFlagsAndEmitsOneJSONReport(t *testing.T) {
 		httpClient: &http.Client{Transport: reconcileRoundTripperFunc(func(*http.Request) (*http.Response, error) {
 			return nil, syscall.ECONNREFUSED
 		})},
-		openLegacy: db.New,
-		openV2:     sqlite.Open,
+		openLegacy: db.OpenReadOnly,
+		openV2: func(string) (*sqlite.Store, error) {
+			t.Fatal("writable v2 store opened for a dry run")
+			return nil, nil
+		},
+		openV2ReadOnly: sqlite.OpenReadOnly,
 	}
 	want := reconcile.Report{
 		DryRun:                 true,
@@ -155,7 +174,7 @@ func TestReconcileSignalParsesFlagsAndEmitsOneJSONReport(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	err := runReconcileSignalCommand(
+	err = runReconcileSignalCommand(
 		context.Background(),
 		zerolog.Nop(),
 		[]string{
@@ -194,6 +213,143 @@ func TestReconcileSignalParsesFlagsAndEmitsOneJSONReport(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "Signal reconciliation dry run complete") {
 		t.Fatalf("human dry-run report missing from stderr: %s", stderr.String())
+	}
+	legacyAfter, err := os.ReadFile(legacyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v2After, err := os.ReadFile(v2Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(legacyBefore, legacyAfter) || !bytes.Equal(v2Before, v2After) {
+		t.Fatal("dry run changed a message store")
+	}
+}
+
+func TestDefaultReconcileSignalDataDir(t *testing.T) {
+	t.Run("macOS app directory", func(t *testing.T) {
+		t.Setenv("OPENMESSAGES_DATA_DIR", "")
+		home := filepath.Join(t.TempDir(), "home")
+		t.Setenv("HOME", home)
+
+		want := filepath.Join(home, "Library", "Application Support", "OpenMessage")
+		if got := defaultReconcileSignalDataDir(); got != want {
+			t.Fatalf("defaultReconcileSignalDataDir() = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("environment override", func(t *testing.T) {
+		override := filepath.Join(t.TempDir(), "explicit data")
+		t.Setenv("OPENMESSAGES_DATA_DIR", override)
+
+		if got := defaultReconcileSignalDataDir(); got != override {
+			t.Fatalf("defaultReconcileSignalDataDir() = %q, want %q", got, override)
+		}
+	})
+}
+
+func TestReconcileSignalPartialFailureEmitsReportWithoutCompletion(t *testing.T) {
+	sourceDir := newReconcileSourceFixture(t, true)
+	sentinel := errors.New("injected reconciliation failure")
+	deps := reconcileSignalDependencies{
+		now:      func() time.Time { return time.Date(2026, 7, 26, 12, 0, 0, 0, time.UTC) },
+		version:  "test-version",
+		commit:   "test-commit",
+		probeURL: "http://127.0.0.1:7007/api/status",
+		httpClient: &http.Client{Transport: reconcileRoundTripperFunc(func(*http.Request) (*http.Response, error) {
+			return nil, syscall.ECONNREFUSED
+		})},
+		openLegacy: db.OpenReadOnly,
+		openV2: func(string) (*sqlite.Store, error) {
+			t.Fatal("writable v2 store opened for a dry run")
+			return nil, nil
+		},
+		openV2ReadOnly: sqlite.OpenReadOnly,
+		reconcile: func(
+			context.Context,
+			reconcile.Options,
+		) (reconcile.Report, error) {
+			return reconcile.Report{
+				DryRun:           true,
+				MessagesScanned:  3,
+				MessagesImported: 2,
+				SkipReasons:      map[string]int{},
+			}, sentinel
+		},
+	}
+
+	var stdout, stderr bytes.Buffer
+	err := runReconcileSignalCommand(
+		context.Background(),
+		zerolog.Nop(),
+		[]string{"--from", sourceDir, "--dry-run"},
+		deps,
+		&stdout,
+		&stderr,
+	)
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("runReconcileSignalCommand() error = %v, want wrapped sentinel", err)
+	}
+	if got := ExitCode(err); got != reconcileRunExitCode {
+		t.Fatalf("ExitCode = %d, want %d", got, reconcileRunExitCode)
+	}
+	var report reconcile.Report
+	if decodeErr := json.Unmarshal(stdout.Bytes(), &report); decodeErr != nil {
+		t.Fatalf("decode partial report: %v\n%s", decodeErr, stdout.String())
+	}
+	if report.MessagesScanned != 3 || report.MessagesImported != 2 {
+		t.Fatalf("partial report = %+v", report)
+	}
+	if !strings.Contains(stderr.String(), "Signal reconciliation failed") {
+		t.Fatalf("failure missing from stderr: %s", stderr.String())
+	}
+	if strings.Contains(stderr.String(), "complete") {
+		t.Fatalf("stderr contradicts partial failure: %s", stderr.String())
+	}
+}
+
+func TestReconcileSignalUsesWritableV2ForRepair(t *testing.T) {
+	sourceDir := newReconcileSourceFixture(t, true)
+	var writableOpened bool
+	deps := reconcileSignalDependencies{
+		now:      func() time.Time { return time.Date(2026, 7, 26, 12, 0, 0, 0, time.UTC) },
+		version:  "test-version",
+		commit:   "test-commit",
+		probeURL: "http://127.0.0.1:7007/api/status",
+		httpClient: &http.Client{Transport: reconcileRoundTripperFunc(func(*http.Request) (*http.Response, error) {
+			return nil, syscall.ECONNREFUSED
+		})},
+		openLegacy: db.OpenReadOnly,
+		openV2: func(path string) (*sqlite.Store, error) {
+			writableOpened = true
+			return sqlite.Open(path)
+		},
+		openV2ReadOnly: func(string) (*sqlite.Store, error) {
+			t.Fatal("read-only v2 store opened for a repair")
+			return nil, nil
+		},
+		reconcile: func(
+			context.Context,
+			reconcile.Options,
+		) (reconcile.Report, error) {
+			return reconcile.Report{SkipReasons: map[string]int{}}, nil
+		},
+	}
+
+	var stdout, stderr bytes.Buffer
+	if err := runReconcileSignalCommand(
+		context.Background(),
+		zerolog.Nop(),
+		[]string{"--from", sourceDir},
+		deps,
+		&stdout,
+		&stderr,
+	); err != nil {
+		t.Fatalf("runReconcileSignalCommand(): %v\nstderr:\n%s", err, stderr.String())
+	}
+	if !writableOpened {
+		t.Fatal("repair did not open the writable v2 store")
 	}
 }
 

@@ -16,9 +16,9 @@
 - Added focused-tested read-only open paths for both stores so dry-runs cannot migrate or otherwise modify database files.
 - Tightened the reconciliation preflight and projections: it now requires the existing Signal account, never creates transport state, treats sender names only as display metadata, derives group behavior from the remote ID, avoids self participants, and preserves accurate partial counts.
 - Replaced the direct alias-helper assertion with an end-to-end Signal replay through the real sink, decoder, and worker, proving one durable row survives under the local alias.
+- Finished the command safety contract: the macOS app directory is the default, legacy is always read-only, dry-run opens v2 read-only, wrapped causes remain inspectable, and partial failures do not emit a contradictory completion message.
 
 ## Next
 
-- Finish the command's default-path, read-only, error-wrapping, and partial-report behavior.
 - Run the required build and full focused test suite.
 - Write the final report output file and mark this document complete.

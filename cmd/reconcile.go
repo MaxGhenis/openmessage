@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -51,14 +52,15 @@ type reconcileSignalFunc func(
 ) (reconcile.Report, error)
 
 type reconcileSignalDependencies struct {
-	now        func() time.Time
-	version    string
-	commit     string
-	probeURL   string
-	httpClient *http.Client
-	openLegacy func(string) (*db.Store, error)
-	openV2     func(string) (*sqlite.Store, error)
-	reconcile  reconcileSignalFunc
+	now            func() time.Time
+	version        string
+	commit         string
+	probeURL       string
+	httpClient     *http.Client
+	openLegacy     func(string) (*db.Store, error)
+	openV2         func(string) (*sqlite.Store, error)
+	openV2ReadOnly func(string) (*sqlite.Store, error)
+	reconcile      reconcileSignalFunc
 }
 
 type reconcileSignalResult struct {
@@ -106,7 +108,7 @@ func runReconcileSignalCommand(
 		fmt.Fprintln(stderr, "  the reconciliation report is JSON on stdout; human guidance is on stderr")
 	}
 
-	options := reconcileSignalCommandOptions{sourceDir: app.DefaultDataDir()}
+	options := reconcileSignalCommandOptions{sourceDir: defaultReconcileSignalDataDir()}
 	var since string
 	var explicitJSON bool
 	fs.StringVar(&options.sourceDir, "from", options.sourceDir, "OpenMessage data directory")
@@ -119,7 +121,7 @@ func runReconcileSignalCommand(
 		}
 		commandErr := newReconcileSignalError(
 			reconcileSourceExitCode,
-			"parse reconcile-signal options: %v",
+			"parse reconcile-signal options: %w",
 			err,
 		)
 		return writeReconcileSignalFailure(stdout, stderr, commandErr)
@@ -137,7 +139,7 @@ func runReconcileSignalCommand(
 	if err != nil {
 		commandErr := newReconcileSignalError(
 			reconcileSourceExitCode,
-			"parse --since: %v",
+			"parse --since: %w",
 			err,
 		)
 		return writeReconcileSignalFailure(stdout, stderr, commandErr)
@@ -149,11 +151,13 @@ func runReconcileSignalCommand(
 		if err := json.NewEncoder(stdout).Encode(result.report); err != nil {
 			return newReconcileSignalError(
 				reconcileRunExitCode,
-				"write Signal reconciliation report: %v",
+				"write Signal reconciliation report: %w",
 				err,
 			)
 		}
-		writeHumanReconcileSignalReport(stderr, result.report)
+		if commandErr == nil {
+			writeHumanReconcileSignalReport(stderr, result.report)
+		}
 	} else if commandErr != nil {
 		return writeReconcileSignalFailure(stdout, stderr, commandErr)
 	}
@@ -176,10 +180,22 @@ func defaultReconcileSignalDependencies() reconcileSignalDependencies {
 				return http.ErrUseLastResponse
 			},
 		},
-		openLegacy: db.New,
-		openV2:     sqlite.Open,
-		reconcile:  reconcile.Signal,
+		openLegacy:     db.OpenReadOnly,
+		openV2:         sqlite.Open,
+		openV2ReadOnly: sqlite.OpenReadOnly,
+		reconcile:      reconcile.Signal,
 	}
+}
+
+func defaultReconcileSignalDataDir() string {
+	if dataDir := os.Getenv("OPENMESSAGES_DATA_DIR"); strings.TrimSpace(dataDir) != "" {
+		return dataDir
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || strings.TrimSpace(home) == "" {
+		return app.DefaultDataDir()
+	}
+	return filepath.Join(home, "Library", "Application Support", "OpenMessage")
 }
 
 func executeReconcileSignal(
@@ -195,7 +211,7 @@ func executeReconcileSignal(
 		)
 	}
 	if deps.now == nil || deps.httpClient == nil || deps.openLegacy == nil ||
-		deps.openV2 == nil || deps.reconcile == nil {
+		deps.openV2 == nil || deps.openV2ReadOnly == nil || deps.reconcile == nil {
 		return result, newReconcileSignalError(
 			reconcileRunExitCode,
 			"Signal reconciliation dependencies are incomplete",
@@ -206,7 +222,7 @@ func executeReconcileSignal(
 	if err != nil {
 		return result, newReconcileSignalError(
 			reconcileSourceExitCode,
-			"resolve OpenMessage data directory %q: %v",
+			"resolve OpenMessage data directory %q: %w",
 			options.sourceDir,
 			err,
 		)
@@ -241,7 +257,7 @@ func executeReconcileSignal(
 		}
 		return result, newReconcileSignalError(
 			reconcileLockExitCode,
-			"acquire OpenMessage instance lock %s: %v",
+			"acquire OpenMessage instance lock %s: %w",
 			lockPath,
 			err,
 		)
@@ -250,7 +266,7 @@ func executeReconcileSignal(
 		if closeErr := lock.Close(); closeErr != nil && resultErr == nil {
 			resultErr = newReconcileSignalError(
 				reconcileRunExitCode,
-				"release OpenMessage instance lock: %v",
+				"release OpenMessage instance lock: %w",
 				closeErr,
 			)
 		}
@@ -260,7 +276,7 @@ func executeReconcileSignal(
 	if probeErr != nil {
 		return result, newReconcileSignalError(
 			reconcileLockExitCode,
-			"cannot safely rule out a running OpenMessage backend at %s: %v; stop the backend and retry",
+			"cannot safely rule out a running OpenMessage backend at %s: %w; stop the backend and retry",
 			deps.probeURL,
 			probeErr,
 		)
@@ -277,7 +293,7 @@ func executeReconcileSignal(
 	if err != nil {
 		return result, newReconcileSignalError(
 			reconcileSourceExitCode,
-			"open legacy database %s: %v",
+			"open legacy database %s: %w",
 			legacyPath,
 			err,
 		)
@@ -286,16 +302,20 @@ func executeReconcileSignal(
 		if closeErr := legacy.Close(); closeErr != nil && resultErr == nil {
 			resultErr = newReconcileSignalError(
 				reconcileRunExitCode,
-				"close legacy database: %v",
+				"close legacy database: %w",
 				closeErr,
 			)
 		}
 	}()
-	v2, err := deps.openV2(v2Path)
+	openV2 := deps.openV2
+	if options.dryRun {
+		openV2 = deps.openV2ReadOnly
+	}
+	v2, err := openV2(v2Path)
 	if err != nil {
 		return result, newReconcileSignalError(
 			reconcileSourceExitCode,
-			"open v2 database %s: %v",
+			"open v2 database %s: %w",
 			v2Path,
 			err,
 		)
@@ -304,7 +324,7 @@ func executeReconcileSignal(
 		if closeErr := v2.Close(); closeErr != nil && resultErr == nil {
 			resultErr = newReconcileSignalError(
 				reconcileRunExitCode,
-				"close v2 database: %v",
+				"close v2 database: %w",
 				closeErr,
 			)
 		}
@@ -321,7 +341,7 @@ func executeReconcileSignal(
 	if reconcileErr != nil {
 		return result, newReconcileSignalError(
 			reconcileRunExitCode,
-			"reconcile Signal history: %v",
+			"reconcile Signal history: %w",
 			reconcileErr,
 		)
 	}
@@ -341,7 +361,7 @@ func requireRegularReconcileStore(description string, path string) error {
 		}
 		return newReconcileSignalError(
 			reconcileSourceExitCode,
-			"inspect %s %s: %v",
+			"inspect %s %s: %w",
 			description,
 			path,
 			err,
@@ -371,7 +391,7 @@ func writeReconcileSignalFailure(
 	if err := json.NewEncoder(stdout).Encode(output); err != nil {
 		return newReconcileSignalError(
 			reconcileRunExitCode,
-			"write Signal reconciliation error report: %v",
+			"write Signal reconciliation error report: %w",
 			err,
 		)
 	}
