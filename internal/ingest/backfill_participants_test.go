@@ -111,7 +111,7 @@ func TestBackfillDirectParticipantsLinksPeerFromRemoteID(t *testing.T) {
 // would fabricate a 1:1 out of whoever spoke first.
 func TestBackfillDirectParticipantsFixesMislabeledGroupWithoutInventingPeer(t *testing.T) {
 	harness := newSignalWorkerHarness(t, "backfill-mislabeled-group.sqlite3")
-	const remoteID = "signal-group:h1wtWjqi48wR9p16z4QkwBDswcy6RgSH88TepsyOT00="
+	const remoteID = "signal-group:dGVzdEdyb3VwSWRGb3JCYWNrZmlsbFJlZ3Jlc3Npb24x="
 	conversationID := v2keys.DeriveID("conversation", signalDecoderAccountID, remoteID)
 	seedBackfillConversation(t, harness, sqlite.Conversation{
 		ConversationID:       conversationID,
