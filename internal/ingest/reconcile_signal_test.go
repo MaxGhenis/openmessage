@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"testing"
+	"time"
 
 	"github.com/rs/zerolog"
 
@@ -80,22 +81,70 @@ func TestSignalReconciledOutgoingAliasIsFoundByWorkerBareTimestampPath(t *testin
 	if err != nil {
 		t.Fatalf("GetMessageByRemote(alias): %v", err)
 	}
+	wantMessageID := v2keys.DeriveID(
+		"message",
+		signalDecoderAccountID,
+		remoteConversationID+"\x1f"+alias,
+	)
+	if reconciled.MessageID != wantMessageID {
+		t.Fatalf(
+			"reconciled message ID = %q, want %q",
+			reconciled.MessageID,
+			wantMessageID,
+		)
+	}
 
-	bareTimestamp := strconv.FormatInt(timestamp, 10)
-	resolved, err := harness.worker.signalOutgoingRemoteID(
+	// Historical import uses the wall clock. Give the real replay a later clock
+	// so its update satisfies the store's monotonic timestamp constraints.
+	liveMessages, err := sqlite.NewMessageRepository(
+		harness.store,
+		func() time.Time { return time.Now().Add(time.Hour) },
+	)
+	if err != nil {
+		t.Fatalf("NewMessageRepository(live replay): %v", err)
+	}
+	liveHarness := newSignalWorkerHarnessForStore(
+		t,
+		harness.path,
+		harness.store,
+		liveMessages,
+	)
+	liveHarness.start(t)
+	line := []byte(`{"account":"+15551230000","envelope":{"sourceNumber":"+15551230000","timestamp":1700000006000,"syncMessage":{"sentMessage":{"timestamp":1700000006000,"destinationServiceId":"7a81fd95-20f1-4437-86e2-d5c93ba18851","message":"live outgoing replay"}}}}`)
+	record := mustBuildSignalRecordWithResolutions(t, line, "", "+16505550100")
+	if err := liveHarness.sink.AppendIngress(ctx, record); err != nil {
+		t.Fatalf("AppendIngress(live replay): %v", err)
+	}
+	waitSignalCondition(t, "reconciled Signal outgoing live convergence", func() bool {
+		message, err := liveMessages.GetMessageByRemote(
+			ctx,
+			signalDecoderAccountID,
+			conversation.ConversationID,
+			alias,
+		)
+		return err == nil && message.Body == "live outgoing replay" &&
+			liveHarness.counters.Snapshot(signalDecoderAccountID).Projected == 1
+	})
+
+	converged, err := liveMessages.GetMessageByRemote(
 		ctx,
 		signalDecoderAccountID,
 		conversation.ConversationID,
-		remoteConversationID,
-		bareTimestamp,
+		alias,
 	)
 	if err != nil {
-		t.Fatalf("signalOutgoingRemoteID(): %v", err)
+		t.Fatalf("GetMessageByRemote(converged alias): %v", err)
 	}
-	if resolved != alias {
-		t.Fatalf("signalOutgoingRemoteID() = %q, want reconciled alias %q", resolved, alias)
+	if converged.MessageID != wantMessageID || converged.RemoteMessageID != alias {
+		t.Fatalf(
+			"converged message = %+v, want preserved PK %q and alias %q",
+			converged,
+			wantMessageID,
+			alias,
+		)
 	}
-	if _, err := harness.messages.GetMessageByRemote(
+	bareTimestamp := strconv.FormatInt(timestamp, 10)
+	if _, err := liveMessages.GetMessageByRemote(
 		ctx,
 		signalDecoderAccountID,
 		conversation.ConversationID,
@@ -103,10 +152,10 @@ func TestSignalReconciledOutgoingAliasIsFoundByWorkerBareTimestampPath(t *testin
 	); !errors.Is(err, sqlite.ErrNotFound) {
 		t.Fatalf("bare-timestamp lookup error = %v, want ErrNotFound", err)
 	}
+	if got := countSignalRows(t, harness.path, "inbox"); got != 1 {
+		t.Fatalf("inbox rows = %d, want one durable live replay", got)
+	}
 	if got := countSignalRows(t, harness.path, "messages"); got != 1 {
 		t.Fatalf("message rows = %d, want one converged reconciled row", got)
-	}
-	if reconciled.RemoteMessageID != alias {
-		t.Fatalf("reconciled remote message ID = %q, want %q", reconciled.RemoteMessageID, alias)
 	}
 }

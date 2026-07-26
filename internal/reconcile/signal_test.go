@@ -341,8 +341,8 @@ func TestSignalDryRunWritesNothing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListAccounts(): %v", err)
 	}
-	if len(accounts) != 0 {
-		t.Fatalf("dry run created accounts: %+v", accounts)
+	if len(accounts) != 1 || accounts[0].AccountID != signalAccountID {
+		t.Fatalf("dry run changed accounts: %+v", accounts)
 	}
 	participants, err := v2.ListParticipants(conversationID)
 	if err != nil {
@@ -350,6 +350,290 @@ func TestSignalDryRunWritesNothing(t *testing.T) {
 	}
 	if len(participants) != 0 {
 		t.Fatalf("dry run created participants: %+v", participants)
+	}
+}
+
+func TestSignalRequiresExistingSignalAccount(t *testing.T) {
+	legacy, v2 := openSignalStoresWithoutAccount(t)
+
+	report, err := Signal(context.Background(), Options{
+		Legacy: legacy,
+		V2:     v2,
+		Logger: zerolog.Nop(),
+	})
+	if !errors.Is(err, sqlite.ErrNotFound) {
+		t.Fatalf("Signal() error = %v, want wrapped ErrNotFound", err)
+	}
+	if report.ConversationsScanned != 0 || report.MessagesImported != 0 {
+		t.Fatalf("report after missing account = %+v", report)
+	}
+	accounts, listErr := v2.ListAccounts()
+	if listErr != nil {
+		t.Fatalf("ListAccounts(): %v", listErr)
+	}
+	if len(accounts) != 0 {
+		t.Fatalf("reconcile created transport account: %+v", accounts)
+	}
+}
+
+func TestSignalRejectsWrongAccountBridge(t *testing.T) {
+	legacy, v2 := openSignalStoresWithoutAccount(t)
+	if err := v2.UpsertAccount(sqlite.Account{
+		AccountID:   signalAccountID,
+		BridgeKey:   "not_signal",
+		Mode:        sqlite.AccountModeLive,
+		Enabled:     true,
+		ConfigJSON:  "{}",
+		CreatedAtMS: testIncomingTimestamp,
+		UpdatedAtMS: testIncomingTimestamp,
+	}); err != nil {
+		t.Fatalf("UpsertAccount(): %v", err)
+	}
+
+	_, err := Signal(context.Background(), Options{
+		Legacy: legacy,
+		V2:     v2,
+		Logger: zerolog.Nop(),
+	})
+	if err == nil || !strings.Contains(err.Error(), `want "signal_cli"`) {
+		t.Fatalf("Signal() error = %v, want bridge-key mismatch", err)
+	}
+}
+
+func TestSignalGroupPrefixPreventsPeerLinkAndNameOnlyIdentity(t *testing.T) {
+	const (
+		groupRemoteID = "signal-group:ZmFrZS1ncm91cA=="
+		groupMessage  = "group-name-only"
+	)
+	ctx := context.Background()
+	legacy, v2 := openSignalStores(t)
+	if err := legacy.UpsertConversation(&db.Conversation{
+		ConversationID: groupRemoteID,
+		Name:           "Signal Group",
+		LastMessageTS:  testIncomingTimestamp,
+		SourcePlatform: signalPlatform,
+	}); err != nil {
+		t.Fatalf("UpsertConversation(): %v", err)
+	}
+	sourceID := v2keys.SignalIncomingSourceID(
+		groupRemoteID,
+		"transport-source-without-number",
+		testIncomingTimestamp,
+	)
+	seedLegacySignalMessage(t, legacy, db.Message{
+		MessageID:      groupMessage,
+		ConversationID: groupRemoteID,
+		SenderName:     "Display Name Only",
+		Body:           "group history",
+		TimestampMS:    testIncomingTimestamp,
+		SourcePlatform: signalPlatform,
+		SourceID:       sourceID,
+	})
+	const existingConversationID = "preexisting-misclassified-group"
+	if err := v2.UpsertConversation(sqlite.Conversation{
+		ConversationID:       existingConversationID,
+		AccountID:            signalAccountID,
+		RemoteConversationID: groupRemoteID,
+		Kind:                 sqlite.ConversationKindDirect,
+		Title:                "Existing Signal Group",
+		NotificationMode:     sqlite.NotificationModeAll,
+		LastMessageAtMS:      testIncomingTimestamp,
+		MetadataJSON:         "{}",
+		CreatedAtMS:          testIncomingTimestamp,
+		UpdatedAtMS:          testIncomingTimestamp,
+	}); err != nil {
+		t.Fatalf("UpsertConversation(): %v", err)
+	}
+
+	report, err := Signal(ctx, Options{
+		Legacy: legacy,
+		V2:     v2,
+		Logger: zerolog.Nop(),
+	})
+	if err != nil {
+		t.Fatalf("Signal(): %v", err)
+	}
+	if report.MessagesImported != 1 {
+		t.Fatalf("report = %+v", report)
+	}
+	repository := newSignalMessageRepository(t, v2)
+	message, err := repository.GetMessageByRemote(
+		ctx,
+		signalAccountID,
+		existingConversationID,
+		sourceID,
+	)
+	if err != nil {
+		t.Fatalf("GetMessageByRemote(): %v", err)
+	}
+	if message.SenderIdentityID != nil {
+		t.Fatalf("name-only sender created identity link: %+v", message)
+	}
+	participants, err := v2.ListParticipants(existingConversationID)
+	if err != nil {
+		t.Fatalf("ListParticipants(): %v", err)
+	}
+	if len(participants) != 0 {
+		t.Fatalf("group remote ID gained direct peer participant: %+v", participants)
+	}
+	identities, err := v2.ListIdentities(signalAccountID)
+	if err != nil {
+		t.Fatalf("ListIdentities(): %v", err)
+	}
+	if len(identities) != 0 {
+		t.Fatalf("name-only sender created identities: %+v", identities)
+	}
+}
+
+func TestSignalCountsDeferredMediaWhenConversationIDIsMissing(t *testing.T) {
+	legacy, v2 := openSignalStores(t)
+	if err := legacy.UpsertConversation(&db.Conversation{
+		ConversationID: "",
+		Name:           "Malformed Signal Thread",
+		LastMessageTS:  testIncomingTimestamp,
+		SourcePlatform: signalPlatform,
+	}); err != nil {
+		t.Fatalf("UpsertConversation(): %v", err)
+	}
+	seedLegacySignalMessage(t, legacy, db.Message{
+		MessageID:      "signal:missing-conversation",
+		ConversationID: "",
+		Body:           "[Photo]",
+		TimestampMS:    testIncomingTimestamp,
+		MediaID:        "legacy-media-ref",
+		SourcePlatform: signalPlatform,
+		SourceID:       "malformed-thread-message",
+	})
+
+	report, err := Signal(context.Background(), Options{
+		Legacy: legacy,
+		V2:     v2,
+		Logger: zerolog.Nop(),
+	})
+	if err != nil {
+		t.Fatalf("Signal(): %v", err)
+	}
+	if report.MessagesScanned != 1 || report.MediaDeferred != 1 ||
+		report.MessagesImported != 0 || report.Skipped != 1 ||
+		report.SkipReasons[skipMissingConversationID] != 1 {
+		t.Fatalf("report = %+v", report)
+	}
+}
+
+func TestSignalRespectsSinceTimestamp(t *testing.T) {
+	ctx := context.Background()
+	legacy, v2 := openSignalStores(t)
+	seedLegacySignalConversation(t, legacy, testOutgoingTimestamp)
+	seedLegacySignalMessage(t, legacy, db.Message{
+		MessageID:      "signal:before-since",
+		ConversationID: testSignalConversation,
+		SenderNumber:   testSignalPeer,
+		Body:           "too old",
+		TimestampMS:    testIncomingTimestamp,
+		SourcePlatform: signalPlatform,
+		SourceID: v2keys.SignalIncomingSourceID(
+			testSignalConversation,
+			testSignalPeer,
+			testIncomingTimestamp,
+		),
+	})
+	afterSourceID := v2keys.SignalIncomingSourceID(
+		testSignalConversation,
+		testSignalPeer,
+		testOutgoingTimestamp,
+	)
+	seedLegacySignalMessage(t, legacy, db.Message{
+		MessageID:      "signal:at-since",
+		ConversationID: testSignalConversation,
+		SenderNumber:   testSignalPeer,
+		Body:           "included",
+		TimestampMS:    testOutgoingTimestamp,
+		SourcePlatform: signalPlatform,
+		SourceID:       afterSourceID,
+	})
+
+	report, err := Signal(ctx, Options{
+		Legacy:  legacy,
+		V2:      v2,
+		SinceMS: testOutgoingTimestamp,
+		Logger:  zerolog.Nop(),
+	})
+	if err != nil {
+		t.Fatalf("Signal(): %v", err)
+	}
+	if report.MessagesScanned != 1 || report.MessagesImported != 1 {
+		t.Fatalf("report = %+v", report)
+	}
+	conversation, err := v2.GetConversationByRemote(
+		signalAccountID,
+		testSignalConversation,
+	)
+	if err != nil {
+		t.Fatalf("GetConversationByRemote(): %v", err)
+	}
+	repository := newSignalMessageRepository(t, v2)
+	stored, err := repository.ListMessagesByConversation(
+		ctx,
+		conversation.ConversationID,
+		0,
+		"",
+		10,
+	)
+	if err != nil {
+		t.Fatalf("ListMessagesByConversation(): %v", err)
+	}
+	if len(stored) != 1 || stored[0].RemoteMessageID != afterSourceID {
+		t.Fatalf("stored messages = %+v", stored)
+	}
+}
+
+func TestSignalDoesNotLinkSelfIdentityAsDirectPeer(t *testing.T) {
+	legacy, v2 := openSignalStores(t)
+	seedLegacySignalConversation(t, legacy, testIncomingTimestamp)
+	key, err := v2keys.IdentityKey(signalAccountID, signalPlatform, testSignalPeer)
+	if err != nil {
+		t.Fatalf("IdentityKey(): %v", err)
+	}
+	identityID := v2keys.DeriveID(
+		"identity",
+		signalAccountID,
+		key.Kind+"\x1f"+key.Canonical,
+	)
+	if err := v2.UpsertIdentity(sqlite.Identity{
+		IdentityID:     identityID,
+		AccountID:      signalAccountID,
+		Kind:           sqlite.IdentityKind(key.Kind),
+		CanonicalValue: key.Canonical,
+		RawValue:       testSignalPeer,
+		DisplayName:    "Self",
+		IsSelf:         true,
+		MetadataJSON:   "{}",
+		CreatedAtMS:    testIncomingTimestamp,
+		UpdatedAtMS:    testIncomingTimestamp,
+	}); err != nil {
+		t.Fatalf("UpsertIdentity(): %v", err)
+	}
+
+	if _, err := Signal(context.Background(), Options{
+		Legacy: legacy,
+		V2:     v2,
+		Logger: zerolog.Nop(),
+	}); err != nil {
+		t.Fatalf("Signal(): %v", err)
+	}
+	conversation, err := v2.GetConversationByRemote(
+		signalAccountID,
+		testSignalConversation,
+	)
+	if err != nil {
+		t.Fatalf("GetConversationByRemote(): %v", err)
+	}
+	participants, err := v2.ListParticipants(conversation.ConversationID)
+	if err != nil {
+		t.Fatalf("ListParticipants(): %v", err)
+	}
+	if len(participants) != 0 {
+		t.Fatalf("self identity was linked as direct peer: %+v", participants)
 	}
 }
 
@@ -372,6 +656,13 @@ func legacySignalSourceID(
 }
 
 func openSignalStores(t *testing.T) (*db.Store, *sqlite.Store) {
+	t.Helper()
+	legacy, v2 := openSignalStoresWithoutAccount(t)
+	seedSignalAccount(t, v2, testIncomingTimestamp)
+	return legacy, v2
+}
+
+func openSignalStoresWithoutAccount(t *testing.T) (*db.Store, *sqlite.Store) {
 	t.Helper()
 	legacy, err := db.New(filepath.Join(t.TempDir(), "messages.db"))
 	if err != nil {

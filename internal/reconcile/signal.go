@@ -74,6 +74,18 @@ func Signal(ctx context.Context, opts Options) (Report, error) {
 	if opts.SinceMS < 0 {
 		return report, fmt.Errorf("reconcile Signal: since timestamp %d is negative", opts.SinceMS)
 	}
+	account, err := opts.V2.GetAccount(signalAccountID)
+	if err != nil {
+		return report, fmt.Errorf("reconcile Signal: resolve Signal account: %w", err)
+	}
+	if account.BridgeKey != signalBridgeKey {
+		return report, fmt.Errorf(
+			"reconcile Signal: account %q has bridge key %q, want %q",
+			signalAccountID,
+			account.BridgeKey,
+			signalBridgeKey,
+		)
+	}
 
 	messages, err := sqlite.NewMessageRepository(opts.V2, time.Now)
 	if err != nil {
@@ -91,7 +103,6 @@ func Signal(ctx context.Context, opts Options) (Report, error) {
 	if nowMS <= 0 {
 		nowMS = 1
 	}
-	accountReady := false
 	knownMessages := make(map[string]struct{})
 
 	for _, legacyConversation := range legacyConversations {
@@ -119,8 +130,11 @@ func Signal(ctx context.Context, opts Options) (Report, error) {
 			legacyConversation.ConversationID,
 		)
 		if strings.TrimSpace(remoteConversationID) == "" {
-			for range legacyMessages {
+			for _, legacyMessage := range legacyMessages {
 				report.MessagesScanned++
+				if strings.TrimSpace(legacyMessage.MediaID) != "" {
+					report.MediaDeferred++
+				}
 				report.skip(skipMissingConversationID)
 			}
 			continue
@@ -132,7 +146,6 @@ func Signal(ctx context.Context, opts Options) (Report, error) {
 			legacyMessages,
 			remoteConversationID,
 			nowMS,
-			&accountReady,
 		)
 		if err != nil {
 			return report, err
@@ -141,7 +154,7 @@ func Signal(ctx context.Context, opts Options) (Report, error) {
 			report.ConversationsCreated++
 		}
 
-		if conversation.Kind == sqlite.ConversationKindDirect {
+		if signalConversationKind(remoteConversationID) == sqlite.ConversationKindDirect {
 			if err := ensureDirectPeer(
 				opts,
 				conversation,
@@ -183,6 +196,7 @@ func Signal(ctx context.Context, opts Options) (Report, error) {
 			alreadyPresent := false
 			for _, candidate := range existingRemoteMessageIDs(
 				legacyMessage,
+				remoteConversationID,
 				remoteMessageID,
 			) {
 				candidateKey := conversation.ConversationID + "\x1f" + candidate
@@ -212,6 +226,7 @@ func Signal(ctx context.Context, opts Options) (Report, error) {
 				}
 			}
 			if alreadyPresent {
+				knownMessages[naturalKey] = struct{}{}
 				report.MessagesAlreadyPresent++
 				if !opts.DryRun {
 					if err := opts.V2.BumpConversationRecency(
@@ -285,6 +300,8 @@ func Signal(ctx context.Context, opts Options) (Report, error) {
 						err,
 					)
 				}
+				knownMessages[naturalKey] = struct{}{}
+				report.MessagesImported++
 				if err := opts.V2.BumpConversationRecency(
 					conversation.ConversationID,
 					legacyMessage.TimestampMS,
@@ -295,9 +312,10 @@ func Signal(ctx context.Context, opts Options) (Report, error) {
 						err,
 					)
 				}
+			} else {
+				knownMessages[naturalKey] = struct{}{}
+				report.MessagesImported++
 			}
-			knownMessages[naturalKey] = struct{}{}
-			report.MessagesImported++
 		}
 	}
 
@@ -322,7 +340,6 @@ func resolveConversation(
 	legacyMessages []*db.Message,
 	remoteConversationID string,
 	nowMS int64,
-	accountReady *bool,
 ) (sqlite.Conversation, bool, error) {
 	conversation, err := opts.V2.GetConversationByRemote(
 		signalAccountID,
@@ -344,10 +361,6 @@ func resolveConversation(
 		legacyMessages,
 		nowMS,
 	)
-	kind := sqlite.ConversationKindDirect
-	if strings.HasPrefix(remoteConversationID, "signal-group:") {
-		kind = sqlite.ConversationKindGroup
-	}
 	conversation = sqlite.Conversation{
 		ConversationID: v2keys.DeriveID(
 			"conversation",
@@ -356,7 +369,7 @@ func resolveConversation(
 		),
 		AccountID:            signalAccountID,
 		RemoteConversationID: remoteConversationID,
-		Kind:                 kind,
+		Kind:                 signalConversationKind(remoteConversationID),
 		Title:                legacyConversation.Name,
 		NotificationMode:     sqlite.NotificationModeAll,
 		LastMessageAtMS:      lastMessageAtMS,
@@ -366,16 +379,6 @@ func resolveConversation(
 	}
 	if opts.DryRun {
 		return conversation, true, nil
-	}
-	if !*accountReady {
-		if err := ensureSignalAccount(opts.V2, createdAtMS); err != nil {
-			return sqlite.Conversation{}, false, fmt.Errorf(
-				"reconcile Signal conversation %q: %w",
-				legacyConversation.ConversationID,
-				err,
-			)
-		}
-		*accountReady = true
 	}
 	if err := opts.V2.UpsertConversation(conversation); err != nil {
 		return sqlite.Conversation{}, false, fmt.Errorf(
@@ -400,25 +403,11 @@ func resolveConversation(
 	return effective, true, nil
 }
 
-func ensureSignalAccount(store *sqlite.Store, atMS int64) error {
-	if _, err := store.GetAccount(signalAccountID); err == nil {
-		return nil
-	} else if !errors.Is(err, sqlite.ErrNotFound) {
-		return fmt.Errorf("resolve Signal account: %w", err)
+func signalConversationKind(remoteConversationID string) sqlite.ConversationKind {
+	if strings.HasPrefix(remoteConversationID, "signal-group:") {
+		return sqlite.ConversationKindGroup
 	}
-	if err := store.UpsertAccount(sqlite.Account{
-		AccountID:   signalAccountID,
-		BridgeKey:   signalBridgeKey,
-		DisplayName: "Signal",
-		Mode:        sqlite.AccountModeLive,
-		Enabled:     true,
-		ConfigJSON:  "{}",
-		CreatedAtMS: atMS,
-		UpdatedAtMS: atMS,
-	}); err != nil {
-		return fmt.Errorf("create Signal account: %w", err)
-	}
-	return nil
+	return sqlite.ConversationKindDirect
 }
 
 func ensureDirectPeer(
@@ -443,6 +432,13 @@ func ensureDirectPeer(
 	if err != nil {
 		return err
 	}
+	identity, err := opts.V2.GetIdentity(identityID)
+	if err == nil && identity.IsSelf {
+		return nil
+	}
+	if err != nil && !errors.Is(err, sqlite.ErrNotFound) {
+		return err
+	}
 	if opts.DryRun {
 		return nil
 	}
@@ -465,36 +461,27 @@ func resolveInboundSender(
 	if message.IsFromMe {
 		return nil, true, nil
 	}
-	candidates := []string{message.SenderNumber, message.SenderName}
-	hadCandidate := false
-	for _, raw := range candidates {
-		raw = strings.TrimSpace(raw)
-		if raw == "" {
-			continue
-		}
-		hadCandidate = true
-		key, err := v2keys.IdentityKey(signalAccountID, signalPlatform, raw)
-		if err != nil {
-			continue
-		}
-		identityID, err := resolveIdentity(
-			opts,
-			key,
-			raw,
-			message.SenderName,
-			atMS,
-		)
-		if err != nil {
-			return nil, false, err
-		}
-		return &identityID, true, nil
-	}
+	raw := strings.TrimSpace(message.SenderNumber)
 	// Live ingest preserves inbound messages whose transport supplies no usable
 	// sender, so historical repair degrades to a null sender in the same way.
-	if !hadCandidate {
+	if raw == "" {
 		return nil, true, nil
 	}
-	return nil, false, nil
+	key, err := v2keys.IdentityKey(signalAccountID, signalPlatform, raw)
+	if err != nil {
+		return nil, false, nil
+	}
+	identityID, err := resolveIdentity(
+		opts,
+		key,
+		raw,
+		message.SenderName,
+		atMS,
+	)
+	if err != nil {
+		return nil, false, err
+	}
+	return &identityID, true, nil
 }
 
 func resolveIdentity(
@@ -586,9 +573,16 @@ func deriveRemoteMessageID(message *db.Message) string {
 // existingRemoteMessageIDs keeps the legacy source ID canonical while
 // recognizing an older live projection that may have retained Signal's bare
 // outgoing timestamp before a local alias existed to converge onto.
-func existingRemoteMessageIDs(message *db.Message, canonical string) []string {
+func existingRemoteMessageIDs(
+	message *db.Message,
+	remoteConversationID string,
+	canonical string,
+) []string {
 	keys := []string{canonical}
 	if !message.IsFromMe || message.TimestampMS <= 0 {
+		return keys
+	}
+	if canonical != v2keys.SignalLocalAlias(remoteConversationID, message.TimestampMS) {
 		return keys
 	}
 	bareTimestamp := strconv.FormatInt(message.TimestampMS, 10)
