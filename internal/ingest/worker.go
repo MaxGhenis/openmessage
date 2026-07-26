@@ -821,11 +821,18 @@ func (w *Worker) ensureMessageConversation(
 			return sqlite.Conversation{}, "", err
 		}
 	}
+	// Message events carry no kind, so infer it from the remote ID where that
+	// is authoritative (Signal/WhatsApp); otherwise keep the direct default and
+	// let a ConversationEvent correct it.
+	kind := sqlite.ConversationKindDirect
+	if inferred, ok := conversationKindForRemoteID(platform, remoteID); ok {
+		kind = inferred
+	}
 	conversation = sqlite.Conversation{
 		ConversationID:       v2keys.DeriveID("conversation", accountID, remoteID),
 		AccountID:            accountID,
 		RemoteConversationID: remoteID,
-		Kind:                 sqlite.ConversationKindDirect,
+		Kind:                 kind,
 		NotificationMode:     sqlite.NotificationModeAll,
 		LastMessageAtMS:      occurredAtMS,
 		MetadataJSON:         "{}",
@@ -1162,6 +1169,15 @@ func (w *Worker) messageProjection(
 			return sqlite.MessageProjection{}, identityErr
 		}
 		senderIdentityID = &identity.IdentityID
+		if err := w.ensureDirectPeerParticipant(conversation, identity); err != nil {
+			return sqlite.MessageProjection{}, err
+		}
+	} else if conversation.Kind == sqlite.ConversationKindDirect {
+		if err := w.ensureDirectPeerFromRemoteID(
+			accountID, platform, conversation, remoteConversationID,
+		); err != nil {
+			return sqlite.MessageProjection{}, err
+		}
 	}
 
 	var replyToRemoteID *string
