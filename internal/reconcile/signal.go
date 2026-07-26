@@ -25,7 +25,6 @@ const (
 	skipMissingConversationID = "missing_conversation_id"
 	skipMissingMessageKey     = "missing_message_key"
 	skipNonPositiveTimestamp  = "non_positive_timestamp"
-	skipInvalidSenderIdentity = "invalid_sender_identity"
 )
 
 // Options supplies the two local stores and bounds one Signal reconciliation.
@@ -243,7 +242,7 @@ func Signal(ctx context.Context, opts Options) (Report, error) {
 				continue
 			}
 
-			senderIdentityID, usable, err := resolveInboundSender(
+			senderIdentityID, err := resolveInboundSender(
 				opts,
 				legacyMessage,
 				legacyMessage.TimestampMS,
@@ -254,10 +253,6 @@ func Signal(ctx context.Context, opts Options) (Report, error) {
 					legacyMessage.MessageID,
 					err,
 				)
-			}
-			if !usable {
-				report.skip(skipInvalidSenderIdentity)
-				continue
 			}
 			replyToRemoteID, err := resolveReplyRemoteID(
 				opts.Legacy,
@@ -346,7 +341,34 @@ func resolveConversation(
 		remoteConversationID,
 	)
 	if err == nil {
-		return conversation, false, nil
+		kind := signalConversationKind(remoteConversationID)
+		if conversation.Kind == kind {
+			return conversation, false, nil
+		}
+		conversation.Kind = kind
+		conversation.UpdatedAtMS = maxInt64(conversation.UpdatedAtMS, nowMS)
+		if opts.DryRun {
+			return conversation, false, nil
+		}
+		if err := opts.V2.UpsertConversation(conversation); err != nil {
+			return sqlite.Conversation{}, false, fmt.Errorf(
+				"reconcile Signal conversation %q: correct v2 kind: %w",
+				legacyConversation.ConversationID,
+				err,
+			)
+		}
+		effective, err := opts.V2.GetConversationByRemote(
+			signalAccountID,
+			remoteConversationID,
+		)
+		if err != nil {
+			return sqlite.Conversation{}, false, fmt.Errorf(
+				"reconcile Signal conversation %q: reload corrected conversation: %w",
+				legacyConversation.ConversationID,
+				err,
+			)
+		}
+		return effective, false, nil
 	}
 	if !errors.Is(err, sqlite.ErrNotFound) {
 		return sqlite.Conversation{}, false, fmt.Errorf(
@@ -457,19 +479,19 @@ func resolveInboundSender(
 	opts Options,
 	message *db.Message,
 	atMS int64,
-) (*string, bool, error) {
+) (*string, error) {
 	if message.IsFromMe {
-		return nil, true, nil
+		return nil, nil
 	}
 	raw := strings.TrimSpace(message.SenderNumber)
 	// Live ingest preserves inbound messages whose transport supplies no usable
 	// sender, so historical repair degrades to a null sender in the same way.
 	if raw == "" {
-		return nil, true, nil
+		return nil, nil
 	}
 	key, err := v2keys.IdentityKey(signalAccountID, signalPlatform, raw)
 	if err != nil {
-		return nil, false, nil
+		return nil, nil
 	}
 	identityID, err := resolveIdentity(
 		opts,
@@ -479,9 +501,9 @@ func resolveInboundSender(
 		atMS,
 	)
 	if err != nil {
-		return nil, false, err
+		return nil, err
 	}
-	return &identityID, true, nil
+	return &identityID, nil
 }
 
 func resolveIdentity(

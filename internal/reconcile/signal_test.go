@@ -400,10 +400,11 @@ func TestSignalRejectsWrongAccountBridge(t *testing.T) {
 	}
 }
 
-func TestSignalGroupPrefixPreventsPeerLinkAndNameOnlyIdentity(t *testing.T) {
+func TestSignalGroupPrefixCorrectsKindAndDegradesUnusableSenders(t *testing.T) {
 	const (
-		groupRemoteID = "signal-group:ZmFrZS1ncm91cA=="
-		groupMessage  = "group-name-only"
+		groupRemoteID      = "signal-group:ZmFrZS1ncm91cA=="
+		nameOnlyMessage    = "group-name-only"
+		invalidPeerMessage = "group-invalid-peer"
 	)
 	ctx := context.Background()
 	legacy, v2 := openSignalStores(t)
@@ -421,13 +422,28 @@ func TestSignalGroupPrefixPreventsPeerLinkAndNameOnlyIdentity(t *testing.T) {
 		testIncomingTimestamp,
 	)
 	seedLegacySignalMessage(t, legacy, db.Message{
-		MessageID:      groupMessage,
+		MessageID:      nameOnlyMessage,
 		ConversationID: groupRemoteID,
 		SenderName:     "Display Name Only",
 		Body:           "group history",
 		TimestampMS:    testIncomingTimestamp,
 		SourcePlatform: signalPlatform,
 		SourceID:       sourceID,
+	})
+	invalidPeerSourceID := v2keys.SignalIncomingSourceID(
+		groupRemoteID,
+		"+",
+		testOutgoingTimestamp,
+	)
+	seedLegacySignalMessage(t, legacy, db.Message{
+		MessageID:      invalidPeerMessage,
+		ConversationID: groupRemoteID,
+		SenderName:     "Malformed Peer",
+		SenderNumber:   "+",
+		Body:           "valid history with unusable sender",
+		TimestampMS:    testOutgoingTimestamp,
+		SourcePlatform: signalPlatform,
+		SourceID:       invalidPeerSourceID,
 	})
 	const existingConversationID = "preexisting-misclassified-group"
 	if err := v2.UpsertConversation(sqlite.Conversation{
@@ -453,21 +469,30 @@ func TestSignalGroupPrefixPreventsPeerLinkAndNameOnlyIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Signal(): %v", err)
 	}
-	if report.MessagesImported != 1 {
+	if report.MessagesImported != 2 || report.Skipped != 0 {
 		t.Fatalf("report = %+v", report)
 	}
-	repository := newSignalMessageRepository(t, v2)
-	message, err := repository.GetMessageByRemote(
-		ctx,
-		signalAccountID,
-		existingConversationID,
-		sourceID,
-	)
+	corrected, err := v2.GetConversation(existingConversationID)
 	if err != nil {
-		t.Fatalf("GetMessageByRemote(): %v", err)
+		t.Fatalf("GetConversation(): %v", err)
 	}
-	if message.SenderIdentityID != nil {
-		t.Fatalf("name-only sender created identity link: %+v", message)
+	if corrected.Kind != sqlite.ConversationKindGroup {
+		t.Fatalf("corrected conversation kind = %q, want group", corrected.Kind)
+	}
+	repository := newSignalMessageRepository(t, v2)
+	for _, remoteMessageID := range []string{sourceID, invalidPeerSourceID} {
+		message, err := repository.GetMessageByRemote(
+			ctx,
+			signalAccountID,
+			existingConversationID,
+			remoteMessageID,
+		)
+		if err != nil {
+			t.Fatalf("GetMessageByRemote(%q): %v", remoteMessageID, err)
+		}
+		if message.SenderIdentityID != nil {
+			t.Fatalf("unusable sender created identity link: %+v", message)
+		}
 	}
 	participants, err := v2.ListParticipants(existingConversationID)
 	if err != nil {
