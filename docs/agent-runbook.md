@@ -172,8 +172,9 @@ Key facts:
      (the signed-in profile; `Local State` maps profiles → accounts). Build a
      `name=value; name=value; …` header from `.google.com` / `messages.google.com`
      cookies and write it to a `0600` file.
-   - **Cookies rotate roughly every 30 minutes** → extract fresh **immediately**
-     before pairing, or `pair --google` returns HTTP 401.
+   - **Extract cookies immediately before pairing** — pairing with an older
+     extract has returned HTTP 401 (the staleness threshold is not
+     established; don't rely on any grace window).
 4. `pair --google` prints `EMOJI: <emoji>`. The user taps that emoji in Google
    Messages **on the phone** (notification shade, or profile → Device pairing)
    to confirm. The Gaia client init can time out once — just retry.
@@ -204,19 +205,61 @@ messages.google.com every repair failed with `missing required cookies:
 messages.google.com:OSID` and the app looped in `needs_repair` forever — a
 re-pair bought minutes, then died again.)
 
-**Expected steady-state:** Google invalidates replayed browser-cookie
-snapshots after ~14 minutes of Chrome concurrently advancing the same account
-session (measured 2026-07-20: 14 clean minutes of 200s, then
-`SESSION_COOKIE_INVALID`; fresh-pair sessions died in ~3-4 min). The healthy
-pattern is therefore a **heal cycle**: connected → cookie 401 → watchdog
-refresh from Chrome → reconnect, repeating every ~15 min with sub-minute dips.
+**Expected steady-state — check WHICH BINARY first.** Before diagnosing any
+latched `needs_repair`, confirm the running backend is the fixed build:
+
+```bash
+RUNBIN=$(ps -o command= -p "$(lsof -nP -iTCP:7007 -sTCP:LISTEN -t | head -1)" | awk '{print $1}')
+echo "$RUNBIN"; strings "$RUNBIN" | grep -c 'persisted rotated Google cookies'   # 0 = pre-fix build
+```
+
+**This is the single highest-yield check** — it has explained both stale-build
+outages so far (2026-07-22, ~11 min latched; 2026-07-25, 06:54→13:21 local,
+~6h26m). Many `.app` bundles on
+a dev machine share `CFBundleIdentifier com.openmessage.app` (stale worktree
+builds, dated backups, the R8 rollback copy), so LaunchServices can resolve
+Spotlight/Dock/`open -a OpenMessage`/notification clicks to a **pre-fix**
+build, which then latches `needs_repair` exactly like the original bug. Verify
+the resolution and always launch by explicit path:
+
+```bash
+osascript -e 'tell application "Finder" to get POSIX path of (application file id "com.openmessage.app" as alias)'
+open /Applications/OpenMessage.app
+```
+
+Stale-listener hazard (observed 2026-07-25): after quitting the GUI and
+launching `/Applications/OpenMessage.app`, port 7007 was **still served by the
+old bundle's backend**. (`BackendManager` has adopt/stop logic for existing
+backends — `BackendManager.swift` "Reusing existing backend pid" / "Stopping
+conflicting backend pid" — but with two same-ID bundles the outcome was a stale
+listener.) After any relaunch, verify the listener is the binary you intended
+and that the old PID exited:
+
+```bash
+ps -o pid=,command= -p "$(lsof -nP -iTCP:7007 -sTCP:LISTEN -t | head -1)"
+```
+
+**Observed lifetimes vary by regime; there is no known fixed timer.** An
+out-of-band probe replaying a *copy* of the session (2026-07-20, n=1) got
+`SESSION_COOKIE_INVALID` after ~14 minutes with Chrome active; fresh-pair
+sessions died in ~3-4 min (observed 4×, one account, 2026-07-19). On fixed
+builds, observed `auth_expired` episodes were 7/21 08:58, 7/22 16:12, 7/23
+09:56, and 7/28 21:58 — roughly 0-2/day on this one account — **each
+self-healing in ≤~2.5 min** (three cleared within a 60s sample). The two long
+latches (7/22 11:21, ~11 min; 7/25 06:54→13:21, ~6h26m) both occurred while
+**pre-fix builds** were running and ended when a fixed binary was
+deployed/launched. Why lifetimes differ is **not established** — do not treat
+any interval as a law. Healthy looks like: mostly connected, with rare
+`auth_expired` dips that self-heal in ~1-2.5 min via Chrome cookie import.
+Minutes-scale heal churn is **not** normal — check `google.repairs_paced`
+(below).
 Rotated cookies are also persisted to `session.json` (throttled, ~5 min) so a
 restart resumes from fresh values instead of pair-time snapshots. That write is
 atomic (temp file + fsync + rename), so a crash mid-save can never truncate the
 paired credentials; a failed save retries at a tenth of the interval instead of
 waiting a full one.
 
-**Is revocation running fast?** Automatic repairs are paced to at least
+**The repair pacing counter.** Automatic repairs are paced to at least
 `OPENMESSAGE_REPAIR_MIN_INTERVAL` (default 90s). Every delayed repair logs
 `Delaying Google credential repair` (with `wait` and `paced_total`) and bumps
 `google.repairs_paced` in `/api/status`:
@@ -225,18 +268,33 @@ waiting a full one.
 curl -s http://127.0.0.1:7007/api/status | jq '.google.repairs_paced'
 ```
 
-Absent/0 is the healthy ~15-minute heal cycle. A climbing count means repairs
-are being requested faster than the floor — i.e. something is revoking the
-imported cookies within minutes, which pacing throttles but does not fix. Read
-it before concluding a heal loop is "just slow".
+The counter records exactly one thing: **how many repair requests were delayed
+by the floor**. A climbing count proves requests arrived faster than the
+configured interval — it does not identify why (could be fast revocation, a
+crash/reconnect loop, or repeated manual reconnects). It cannot clear the
+session healthy either: a single failed repair parks the supervisor in Blocked
+with the counter still at 0. For context, observed expiries on fixed builds
+were ~0-2/day (one account).
+
+To see *why* a repair failed: the refresh error is currently **returned but
+never logged** — the native path emits no log line, and the supervisor
+discards the error detail (`handleRepairResult` sets Blocked without logging
+it) — so the only way to observe it today is to reproduce it directly: run
+`scripts/refresh-google-session-cookies-macos.py` manually and read its error
+output. (A fix to log the repair failure is chipped.)
 
 An `auth_expired` session with its device link intact revives by cookie
 rewrite alone — **do not re-pair** for `needs_repair`; that resets nothing the
 refresh can't fix and risks pairing throttles. So the **first** thing to try
-when SMS is dead is nothing — wait ~15-60s for the watchdog. If it hasn't
-recovered, the cookies are genuinely gone from Chrome (user signed out of
-Google there) or the device link was revoked; only then fall back to the
-manual re-pair recipe above. The app also posts a **health notification**
+when SMS is dead is nothing — wait ~2-3 min for the watchdog (the one observed
+live heal took 2m20s; under-waiting funnels you into the re-pair this section
+warns against). If it hasn't recovered, **read the actual repair and reconnect
+errors before deciding to re-pair** — the causes are broader than "the cookies
+are gone": Chrome/keychain/profile access, missing or undecryptable cookies, a
+session-file write failure, network or server rejection, or a genuinely revoked
+device link. Re-check the running binary (above) and whether Chrome still holds
+the five `.google.com` account cookies first; only once those are ruled out
+fall back to the manual re-pair recipe above. The app also posts a **health notification**
 (once, on the rising edge) when Google flips to `needs_repair` or WhatsApp
 logs out, so a dead platform can't sit silent for days.
 
