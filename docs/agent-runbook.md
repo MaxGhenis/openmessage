@@ -259,7 +259,7 @@ atomic (temp file + fsync + rename), so a crash mid-save can never truncate the
 paired credentials; a failed save retries at a tenth of the interval instead of
 waiting a full one.
 
-**Is revocation running fast?** Automatic repairs are paced to at least
+**The repair pacing counter.** Automatic repairs are paced to at least
 `OPENMESSAGE_REPAIR_MIN_INTERVAL` (default 90s). Every delayed repair logs
 `Delaying Google credential repair` (with `wait` and `paced_total`) and bumps
 `google.repairs_paced` in `/api/status`:
@@ -268,16 +268,20 @@ waiting a full one.
 curl -s http://127.0.0.1:7007/api/status | jq '.google.repairs_paced'
 ```
 
-Absent/0 is healthy — observed expiries on fixed builds were ~0-2/day (one
-account), so a paced count of zero is the norm, not a sign of trouble. A
-climbing count proves only that **repair requests arrived faster than the
-configured floor** — the counter does not identify why (could be fast
-revocation, a crash/reconnect loop, or repeated manual reconnects). Note the
-supervisor currently **discards the repair error detail** on failure
-(`handleRepairResult` sets Blocked without logging it), so to see *why* a
-repair failed, capture the app's log stream during an attempt
-(`log stream --predicate 'subsystem == "com.openmessage.app"' --info`) or run
-`scripts/refresh-google-session-cookies-macos.py` manually and read its error.
+The counter records exactly one thing: **how many repair requests were delayed
+by the floor**. A climbing count proves requests arrived faster than the
+configured interval — it does not identify why (could be fast revocation, a
+crash/reconnect loop, or repeated manual reconnects). It cannot clear the
+session healthy either: a single failed repair parks the supervisor in Blocked
+with the counter still at 0. For context, observed expiries on fixed builds
+were ~0-2/day (one account).
+
+To see *why* a repair failed: the refresh error is currently **returned but
+never logged** — the native path emits no log line, and the supervisor
+discards the error detail (`handleRepairResult` sets Blocked without logging
+it) — so the only way to observe it today is to reproduce it directly: run
+`scripts/refresh-google-session-cookies-macos.py` manually and read its error
+output. (A fix to log the repair failure is chipped.)
 
 An `auth_expired` session with its device link intact revives by cookie
 rewrite alone — **do not re-pair** for `needs_repair`; that resets nothing the
