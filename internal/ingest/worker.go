@@ -715,7 +715,8 @@ func (w *Worker) refreshConversation(
 		role        sqlite.ParticipantRole
 	}
 	prepared := make([]preparedParticipant, 0, len(event.Participants))
-	seenIdentities := make(map[string]struct{}, len(event.Participants))
+	seenIdentities := make(map[string]int, len(event.Participants))
+	deduplicated := 0
 	for _, participant := range event.Participants {
 		raw := identityRaw(participant.Identity)
 		key, keyErr := v2keys.IdentityKey(accountID, string(platform), raw)
@@ -723,26 +724,40 @@ func (w *Worker) refreshConversation(
 			return sqlite.Conversation{}, keyErr
 		}
 		naturalKey := key.Kind + "\x1f" + key.Canonical
-		if _, duplicate := seenIdentities[naturalKey]; duplicate {
-			// Google conversation snapshots can list the same identity twice
-			// (observed live 2026-08-01: the account's own number appeared
-			// twice in three group rosters). Identical natural key means
-			// identical identity, so keep the first entry — erroring here
-			// quarantines the whole snapshot and permanently drops the
-			// conversation's roster/title updates.
-			w.logger.Warn().
-				Str("account_id", accountID).
-				Str("remote_conversation_id", remoteID).
-				Str("identity", key.Canonical).
-				Msg("Skipping duplicated conversation participant")
-			continue
-		}
-		seenIdentities[naturalKey] = struct{}{}
 		role, roleErr := participantRole(participant.Role)
 		if roleErr != nil {
 			return sqlite.Conversation{}, roleErr
 		}
+		if index, duplicate := seenIdentities[naturalKey]; duplicate {
+			// Google conversation snapshots can list the same identity twice
+			// (observed live 2026-08-01: three group rosters carried the
+			// account's own number both as the self entry and as a plain
+			// member). Identical natural key means identical identity, so a
+			// state-agreeing duplicate is benign: keep the first entry and
+			// fold in IsSelf (same OR semantics as ensureIdentity). Only
+			// duplicates that disagree on membership state (role/active) are
+			// ambiguous enough to refuse the snapshot.
+			kept := &prepared[index]
+			if kept.role != role || kept.participant.Active != participant.Active {
+				return sqlite.Conversation{}, fmt.Errorf(
+					"conversation participant identity %q is duplicated with conflicting state",
+					key.Canonical,
+				)
+			}
+			kept.participant.Identity.IsSelf = kept.participant.Identity.IsSelf ||
+				participant.Identity.IsSelf
+			deduplicated++
+			continue
+		}
+		seenIdentities[naturalKey] = len(prepared)
 		prepared = append(prepared, preparedParticipant{participant: participant, role: role})
+	}
+	if deduplicated > 0 {
+		w.logger.Warn().
+			Str("account_id", accountID).
+			Str("remote_conversation_id", remoteID).
+			Int("deduplicated", deduplicated).
+			Msg("Deduplicated conversation snapshot participants")
 	}
 	nowMS, err := w.nowMS()
 	if err != nil {
