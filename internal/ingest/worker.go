@@ -724,10 +724,18 @@ func (w *Worker) refreshConversation(
 		}
 		naturalKey := key.Kind + "\x1f" + key.Canonical
 		if _, duplicate := seenIdentities[naturalKey]; duplicate {
-			return sqlite.Conversation{}, fmt.Errorf(
-				"conversation participant identity %q is duplicated",
-				key.Canonical,
-			)
+			// Google conversation snapshots can list the same identity twice
+			// (observed live 2026-08-01: the account's own number appeared
+			// twice in three group rosters). Identical natural key means
+			// identical identity, so keep the first entry — erroring here
+			// quarantines the whole snapshot and permanently drops the
+			// conversation's roster/title updates.
+			w.logger.Warn().
+				Str("account_id", accountID).
+				Str("remote_conversation_id", remoteID).
+				Str("identity", key.Canonical).
+				Msg("Skipping duplicated conversation participant")
+			continue
 		}
 		seenIdentities[naturalKey] = struct{}{}
 		role, roleErr := participantRole(participant.Role)
