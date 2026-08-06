@@ -88,6 +88,8 @@ func RegisterWithOptions(s *server.MCPServer, a *app.App, options Options) {
 	} else {
 		s.AddTool(getStatusTool(), getStatusHandler(a, options))
 	}
+	s.AddTool(startGooglePairingTool(), startGooglePairingHandler(a))
+	s.AddTool(completeGooglePairingTool(), completeGooglePairingHandler(a))
 	s.AddTool(draftMessageTool(), draftMessageHandler(a))
 	s.AddTool(downloadMediaTool(), downloadMediaHandler(a))
 	s.AddTool(importMessagesTool(), importMessagesHandler(a))
