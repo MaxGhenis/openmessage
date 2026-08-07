@@ -45,23 +45,34 @@ var (
 )
 
 func sendMessageTool(v2Enabled ...bool) mcp.Tool {
-	description := "Send a direct text message across supported platforms. Defaults to SMS/RCS when no platform is specified."
+	description := "Send a direct text message on ONE explicit platform. Defaults to SMS/RCS when no platform is specified. The requested platform is a hard contract: if it cannot send, the tool fails with the reason and queues nothing — it never falls back to a different platform."
 	options := []mcp.ToolOption{
 		mcp.WithDescription(description),
 		mcp.WithString("phone_number", mcp.Description("Legacy alias for recipient. For SMS/RCS use a phone number with country code (e.g., +15551234567).")),
 		mcp.WithString("recipient", mcp.Description("Recipient identifier. Use a phone number for SMS/RCS or Signal, and a phone number or WhatsApp JID for WhatsApp.")),
-		mcp.WithString("platform", mcp.Description("Target platform: sms, rcs, whatsapp, or signal. Defaults to sms.")),
+		mcp.WithString("platform", mcp.Description("Target platform: sms (covers RCS), whatsapp, or signal. Defaults to sms. imessage is import/read-only — OpenMessage cannot send iMessages.")),
 		mcp.WithString("message", mcp.Required(), mcp.Description("Message text to send")),
 	}
 	if v2Requested(v2Enabled) {
 		options[0] = mcp.WithDescription(description + v2DeliveryDescription)
 		options = append(options, mcp.WithString("idempotency_key", mcp.Description(v2IdempotencyDescription)))
+		options = withSendControlOptions(options, true)
 	}
 	options = append(options,
 		mcp.WithDestructiveHintAnnotation(false),
 		mcp.WithIdempotentHintAnnotation(false),
 	)
 	return mcp.NewTool("send_message", options...)
+}
+
+// unsupportedSendPlatformResult is the hard-contract refusal for platforms
+// OpenMessage cannot send on. The channel is part of the instruction, so the
+// error never suggests silently substituting another platform.
+func unsupportedSendPlatformResult(platform string) *mcp.CallToolResult {
+	if platform == "imessage" {
+		return errorResult("imessage is import/read-only: OpenMessage cannot send iMessages. Nothing was queued. If this recipient should get the message on a different platform, that is your call to make explicitly (resolve_contact_routes lists their sendable routes).")
+	}
+	return errorResult(fmt.Sprintf("unsupported platform %q (supported: sms, whatsapp, signal). Nothing was queued.", platform))
 }
 
 func sendMessageHandler(a *app.App, v2Options ...*V2Dependencies) server.ToolHandlerFunc {
@@ -206,7 +217,7 @@ func sendMessageHandler(a *app.App, v2Options ...*V2Dependencies) server.ToolHan
 				"message":      summarizeMessage(storedMsg),
 			}, fmt.Sprintf("Message sent to %s: %s", firstNonEmpty(conv.GetName(), recipient), message)), nil
 		default:
-			return errorResult(fmt.Sprintf("unsupported platform %q (supported: sms, whatsapp, signal)", platform)), nil
+			return unsupportedSendPlatformResult(platform), nil
 		}
 	}
 }

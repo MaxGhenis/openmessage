@@ -12,11 +12,16 @@ import (
 
 	"github.com/maxghenis/openmessage/internal/app"
 	"github.com/maxghenis/openmessage/internal/db"
+	"github.com/maxghenis/openmessage/internal/sendcap"
 )
 
 type resolvedRoute struct {
 	Conversation conversationSummary `json:"conversation"`
 	Sendable     bool                `json:"sendable"`
+	// SendableReason explains a sendable:false route (platform down,
+	// adapter unregistered, read-only platform, daemon unreachable) so
+	// agents can distinguish "fix the platform" from "pick another route".
+	SendableReason string `json:"sendable_reason,omitempty"`
 }
 
 type resolvedRouteMatch struct {
@@ -60,7 +65,8 @@ func resolveContactRoutesTool() mcp.Tool {
 	)
 }
 
-func resolveContactRoutesHandler(a *app.App) server.ToolHandlerFunc {
+func resolveContactRoutesHandler(a *app.App, configured ...Options) server.ToolHandlerFunc {
+	options := resolvedOptions(a, configured)
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		args := req.GetArguments()
 		query := strings.TrimSpace(strArg(args, "query"))
@@ -85,7 +91,7 @@ func resolveContactRoutesHandler(a *app.App) server.ToolHandlerFunc {
 			return errorResult(fmt.Sprintf("resolve routes: %v", err)), nil
 		}
 
-		matches := buildResolvedRouteMatches(a, convos, limit)
+		matches := buildResolvedRouteMatches(a, options, ctx, convos, limit)
 		if len(matches) == 0 {
 			return structuredResult(map[string]any{
 				"query":   query,
@@ -196,14 +202,13 @@ func findRouteConversations(a *app.App, query string, limit int) ([]*db.Conversa
 	return results, nil
 }
 
-func buildResolvedRouteMatches(a *app.App, convos []*db.Conversation, limit int) []resolvedRouteMatch {
+func buildResolvedRouteMatches(a *app.App, options Options, ctx context.Context, convos []*db.Conversation, limit int) []resolvedRouteMatch {
 	if len(convos) == 0 {
 		return nil
 	}
 
 	identityIndex := loadRouteIdentityIndex(a.Store)
-	whatsAppConnected := whatsAppStatus(a).Connected
-	signalConnected := signalStatus(a).Connected
+	capabilities := routeSendCapabilities(ctx, a, options)
 
 	type routeBucket struct {
 		MatchID       string
@@ -240,9 +245,11 @@ func buildResolvedRouteMatches(a *app.App, convos []*db.Conversation, limit int)
 		if bucket.ParticipantID == "" {
 			bucket.ParticipantID = participantID
 		}
+		sendable, reason := routeSupportsOutbound(conv, capabilities)
 		bucket.Routes = append(bucket.Routes, resolvedRoute{
-			Conversation: summarizeConversation(conv),
-			Sendable:     routeSupportsOutbound(conv, whatsAppConnected, signalConnected),
+			Conversation:   summarizeConversation(conv),
+			Sendable:       sendable,
+			SendableReason: reason,
 		})
 	}
 
@@ -354,19 +361,70 @@ func platformOrderIndex(platform string) int {
 	}
 }
 
-func routeSupportsOutbound(conv *db.Conversation, whatsAppConnected, signalConnected bool) bool {
-	if conv == nil {
-		return false
+// routeSendCapabilities resolves the per-platform send capability the route
+// list is judged against. Client mode asks the daemon — the process that
+// actually sends — so this tool, get_status, and send-time enforcement all
+// answer from the same source (the 2026-08-05 incident had three surfaces
+// giving three different answers). Standalone mode computes locally.
+func routeSendCapabilities(ctx context.Context, a *app.App, options Options) map[string]sendcap.Capability {
+	if options.Daemon == nil {
+		return localSendCapability(a, options.V2)
 	}
-	switch normalizedPlatform(conv.SourcePlatform) {
-	case "sms":
-		return true
-	case "whatsapp":
-		return whatsAppConnected
-	case "signal":
-		return signalConnected
+	status, reachable, err := options.Daemon.Status(ctx)
+	if err != nil {
+		reason := "the OpenMessage app is not running; sends require it"
+		if reachable {
+			reason = fmt.Sprintf("the OpenMessage app answered but its status was unusable (%v)", err)
+		}
+		unavailable := sendcap.Capability{Reason: reason}
+		return map[string]sendcap.Capability{
+			sendcap.PlatformSMS:      unavailable,
+			sendcap.PlatformWhatsApp: unavailable,
+			sendcap.PlatformSignal:   unavailable,
+		}
+	}
+	if status.Send == nil {
+		// Older daemon without the send block: keep the pre-capability
+		// behavior (sms assumed sendable, whatsapp/signal not) but say why.
+		return map[string]sendcap.Capability{
+			sendcap.PlatformSMS: {Available: true},
+			sendcap.PlatformWhatsApp: {
+				Reason: "the running app predates per-platform send capability reporting; whatsapp sendability is unknown",
+			},
+			sendcap.PlatformSignal: {
+				Reason: "the running app predates per-platform send capability reporting; signal sendability is unknown",
+			},
+		}
+	}
+	capabilities := make(map[string]sendcap.Capability, len(status.Send))
+	for platform, capability := range status.Send {
+		capabilities[platform] = sendcap.Capability{
+			Available: capability.Available,
+			Queueable: capability.Queueable,
+			Reason:    capability.Reason,
+		}
+	}
+	return capabilities
+}
+
+// routeSupportsOutbound reports whether one conversation's platform can send
+// right now, with the reason when it cannot.
+func routeSupportsOutbound(conv *db.Conversation, capabilities map[string]sendcap.Capability) (bool, string) {
+	if conv == nil {
+		return false, ""
+	}
+	platform := normalizedPlatform(conv.SourcePlatform)
+	switch platform {
+	case "sms", "whatsapp", "signal":
+		capability, known := capabilities[platform]
+		if !known {
+			return false, "send capability unknown for this platform"
+		}
+		return capability.Available, capability.Reason
+	case "imessage":
+		return false, "imessage is import/read-only; OpenMessage cannot send iMessages"
 	default:
-		return false
+		return false, fmt.Sprintf("%s conversations are import/read-only in OpenMessage", platform)
 	}
 }
 

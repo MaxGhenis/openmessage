@@ -682,15 +682,20 @@ func TestResolveContactRoutesPrefersSMSThread(t *testing.T) {
 		t.Fatalf("seed unified contact: %v", err)
 	}
 
+	originalGoogleStatus := googleStatus
 	originalWhatsAppStatus := whatsAppStatus
 	originalSignalStatus := signalStatus
+	googleStatus = func(*app.App) app.GoogleStatusSnapshot {
+		return app.GoogleStatusSnapshot{Connected: true, Paired: true, PhoneResponding: true}
+	}
 	whatsAppStatus = func(*app.App) whatsapplive.StatusSnapshot {
-		return whatsapplive.StatusSnapshot{Connected: true}
+		return whatsapplive.StatusSnapshot{Connected: true, Paired: true}
 	}
 	signalStatus = func(*app.App) signallive.StatusSnapshot {
 		return signallive.StatusSnapshot{}
 	}
 	t.Cleanup(func() {
+		googleStatus = originalGoogleStatus
 		whatsAppStatus = originalWhatsAppStatus
 		signalStatus = originalSignalStatus
 	})

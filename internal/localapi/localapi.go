@@ -18,8 +18,10 @@ import (
 	"net"
 	"net/http"
 	"net/textproto"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -70,14 +72,39 @@ func NewClient(baseURL, token string) *Client {
 	}
 }
 
+// PlatformSendCapability mirrors one entry of the daemon's /api/status "send"
+// block: whether a send on that platform is expected to dispatch promptly,
+// with the daemon's reason when it is not. Queueable marks a self-healing
+// outage where a durable send is still accepted and waits.
+type PlatformSendCapability struct {
+	Available bool   `json:"available"`
+	Queueable bool   `json:"queueable"`
+	Reason    string `json:"reason,omitempty"`
+}
+
 // DaemonStatus is the subset of /api/status used for daemon-truth decisions.
 type DaemonStatus struct {
 	Connected bool `json:"connected"`
 	V2Send    bool `json:"v2_send"`
 	V2Primary bool `json:"v2_primary"`
-	Auth      struct {
+	// Send is keyed by send platform ("sms", "whatsapp", "signal"). Nil on
+	// daemons older than the send-capability block; callers must treat a
+	// missing map as "unknown", not as "available".
+	Send map[string]PlatformSendCapability `json:"send"`
+	Auth struct {
 		DataDir string `json:"data_dir"`
 	} `json:"auth"`
+}
+
+// SendCapabilityFor reports the daemon's send capability for a platform. The
+// second result is false when the daemon did not publish a send block (older
+// daemon) or does not know the platform — unknown, not unavailable.
+func (s DaemonStatus) SendCapabilityFor(platform string) (PlatformSendCapability, bool) {
+	if s.Send == nil {
+		return PlatformSendCapability{}, false
+	}
+	capability, ok := s.Send[platform]
+	return capability, ok
 }
 
 // SendsViaOutbox reports whether the daemon expects sends on the durable
@@ -113,6 +140,11 @@ type TextSubmission struct {
 	ReplyToID      string `json:"reply_to_id,omitempty"`
 	IdempotencyKey string `json:"idempotency_key"`
 	NotBeforeMS    *int64 `json:"not_before_ms,omitempty"`
+	// TTLMS bounds how long the daemon may hold the send before canceling it
+	// as expired instead of transmitting stale. Nil means no expiry.
+	TTLMS *int64 `json:"ttl_ms,omitempty"`
+	// Force bypasses the daemon's near-duplicate guard for a deliberate resend.
+	Force bool `json:"force,omitempty"`
 }
 
 // MediaSubmission is a durable media send routed at POST /api/v1/outbox/media.
@@ -125,6 +157,7 @@ type MediaSubmission struct {
 	ReplyToID      string
 	IdempotencyKey string
 	NotBeforeMS    *int64
+	TTLMS          *int64
 	Content        io.Reader
 }
 
@@ -134,18 +167,43 @@ type Submission struct {
 	LocalMessageID string `json:"local_message_id"`
 	State          string `json:"state"`
 	ScheduledForMS int64  `json:"scheduled_for_ms"`
+	ExpiresAtMS    int64  `json:"expires_at_ms,omitempty"`
 	Deduplicated   bool   `json:"deduplicated"`
 }
 
-// Delivery mirrors the daemon's v1 delivery response.
+// Delivery mirrors the daemon's v1 delivery response. AccountID,
+// ConversationID, Platform, ExpiresAtMS, and Expired are empty against
+// daemons older than the truthful-send-states change.
 type Delivery struct {
 	OutboxID        string `json:"outbox_id"`
+	AccountID       string `json:"account_id"`
+	ConversationID  string `json:"conversation_id"`
+	Platform        string `json:"platform"`
 	State           string `json:"state"`
 	LocalMessageID  string `json:"local_message_id"`
 	RemoteMessageID string `json:"remote_message_id"`
 	ErrorClass      string `json:"error_class"`
 	ErrorCode       string `json:"error_code"`
 	Warning         string `json:"warning"`
+	ExpiresAtMS     int64  `json:"expires_at_ms"`
+	Expired         bool   `json:"expired"`
+}
+
+// PendingDelivery mirrors one row of the daemon's GET /api/v1/outbox response.
+type PendingDelivery struct {
+	OutboxID       string `json:"outbox_id"`
+	AccountID      string `json:"account_id"`
+	ConversationID string `json:"conversation_id"`
+	Kind           string `json:"kind"`
+	State          string `json:"state"`
+	ScheduledForMS int64  `json:"scheduled_for_ms"`
+	NextAttemptMS  *int64 `json:"next_attempt_at_ms"`
+	ExpiresAtMS    int64  `json:"expires_at_ms"`
+	AttemptCount   int64  `json:"attempt_count"`
+	CreatedAtMS    int64  `json:"created_at_ms"`
+	Summary        string `json:"summary"`
+	ErrorClass     string `json:"error_class"`
+	ErrorCode      string `json:"error_code"`
 }
 
 // Settled reports whether the delivery reached a state the dispatcher will
@@ -229,6 +287,9 @@ func multipartMediaBody(submission MediaSubmission) (io.ReadCloser, string) {
 		if submission.NotBeforeMS != nil {
 			fields["not_before_ms"] = fmt.Sprintf("%d", *submission.NotBeforeMS)
 		}
+		if submission.TTLMS != nil {
+			fields["ttl_ms"] = fmt.Sprintf("%d", *submission.TTLMS)
+		}
 		for name, value := range fields {
 			if value == "" {
 				continue
@@ -269,6 +330,38 @@ func multipartMediaBody(submission MediaSubmission) (io.ReadCloser, string) {
 func (c *Client) Delivery(ctx context.Context, outboxID string) (Delivery, error) {
 	var delivery Delivery
 	if _, err := c.getJSON(ctx, "/api/v1/outbox/"+outboxID, &delivery); err != nil {
+		return Delivery{}, err
+	}
+	return delivery, nil
+}
+
+// ListPending fetches the daemon's outbox tray, optionally scoped to one
+// conversation.
+func (c *Client) ListPending(ctx context.Context, conversationID string, limit int) ([]PendingDelivery, error) {
+	query := url.Values{}
+	if strings.TrimSpace(conversationID) != "" {
+		query.Set("conversation_id", strings.TrimSpace(conversationID))
+	}
+	if limit > 0 {
+		query.Set("limit", strconv.Itoa(limit))
+	}
+	path := "/api/v1/outbox"
+	if encoded := query.Encode(); encoded != "" {
+		path += "?" + encoded
+	}
+	var pending []PendingDelivery
+	if _, err := c.getJSON(ctx, path, &pending); err != nil {
+		return nil, err
+	}
+	return pending, nil
+}
+
+// CancelDelivery cancels one queued or retrying outbox item on the daemon.
+// The daemon refuses (HTTP 409) once the intent crossed the transport
+// boundary; the returned delivery reflects the post-cancel state.
+func (c *Client) CancelDelivery(ctx context.Context, outboxID string) (Delivery, error) {
+	var delivery Delivery
+	if err := c.postJSON(ctx, "/api/v1/outbox/"+url.PathEscape(outboxID)+"/cancel", struct{}{}, &delivery); err != nil {
 		return Delivery{}, err
 	}
 	return delivery, nil

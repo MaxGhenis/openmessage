@@ -64,6 +64,10 @@ type NewOutboxItem struct {
 	SendAgainOfOutboxID string
 	ScheduledFor        time.Time
 	ScheduledForMS      int64
+	// ExpiresAtMS is a hard send window: an intent that has not crossed the
+	// transport boundary by this wall-clock time is canceled instead of
+	// transmitted stale. Zero means the intent never expires.
+	ExpiresAtMS int64
 }
 
 // OutboxItem mirrors one row in outbox. Nullable database fields are pointers.
@@ -90,6 +94,7 @@ type OutboxItem struct {
 	TransportCalledAtMS *int64
 	ScheduledForMS      int64
 	NextAttemptAtMS     *int64
+	ExpiresAtMS         *int64
 	CreatedAtMS         int64
 	UpdatedAtMS         int64
 }
@@ -458,9 +463,10 @@ func (r *OutboxRepository) enqueue(
 			send_again_of_outbox_id,
 			attempt_count,
 			scheduled_for_ms,
+			expires_at_ms,
 			created_at_ms,
 			updated_at_ms
-		) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, 0, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, 0, ?, ?, ?, ?)
 		ON CONFLICT(account_id, idempotency_key) DO NOTHING
 	`,
 		item.OutboxID,
@@ -474,6 +480,7 @@ func (r *OutboxRepository) enqueue(
 		item.TransportRequestID,
 		nullableOutboxText(item.SendAgainOfOutboxID),
 		scheduledForMS,
+		nullableOutboxMS(item.ExpiresAtMS),
 		nowMS,
 		nowMS,
 	)
@@ -1172,9 +1179,10 @@ func (r *OutboxRepository) LeaseDue(
 		  AND state IN ('queued', 'not_dispatched')
 		  AND (next_attempt_at_ms IS NULL OR next_attempt_at_ms <= ?)
 		  AND (lease_expires_at_ms IS NULL OR lease_expires_at_ms <= ?)
+		  AND (expires_at_ms IS NULL OR expires_at_ms > ?)
 		ORDER BY COALESCE(next_attempt_at_ms, scheduled_for_ms), created_at_ms, outbox_id
 		LIMIT ?
-	`, nowMS, nowMS, nowMS, req.Limit)
+	`, nowMS, nowMS, nowMS, nowMS, req.Limit)
 	if err != nil {
 		return nil, fmt.Errorf("lease due outbox items: select candidates: %w", err)
 	}
@@ -1210,7 +1218,8 @@ func (r *OutboxRepository) LeaseDue(
 			  AND state IN ('queued', 'not_dispatched')
 			  AND (next_attempt_at_ms IS NULL OR next_attempt_at_ms <= ?)
 			  AND (lease_expires_at_ms IS NULL OR lease_expires_at_ms <= ?)
-		`, req.Owner, token, expiresAtMS, nowMS, id, nowMS, nowMS, nowMS)
+			  AND (expires_at_ms IS NULL OR expires_at_ms > ?)
+		`, req.Owner, token, expiresAtMS, nowMS, id, nowMS, nowMS, nowMS, nowMS)
 		if err != nil {
 			return nil, fmt.Errorf("lease outbox item %q: update: %w", id, err)
 		}
@@ -1400,6 +1409,136 @@ func (r *OutboxRepository) RetryNotDispatched(
 
 // Cancel transitions pending work to a terminal canceled state. Active or
 // already-terminal rows are rejected so a transport call cannot race a cancel.
+// TTLErrorClass and TTLErrorCode mark an intent canceled by CancelExpired
+// rather than by an explicit user action. Readers use them to report "expired
+// unsent" instead of a bare cancellation.
+const (
+	TTLErrorClass = "ttl"
+	TTLErrorCode  = "send_window_expired"
+)
+
+// CancelExpired cancels every intent whose send window closed before it
+// crossed the transport boundary. Only pre-transport states are eligible:
+// dispatching, uncertain, and terminal rows are left untouched because the
+// transport may already own them. Returns the canceled outbox IDs.
+func (r *OutboxRepository) CancelExpired(ctx context.Context, now time.Time) ([]string, error) {
+	nowMS := now.UnixMilli()
+	if nowMS <= 0 {
+		return nil, fmt.Errorf("cancel expired outbox items: current Unix time is not positive")
+	}
+
+	tx, err := r.store.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("cancel expired outbox items: begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	rows, err := tx.QueryContext(ctx, `
+		SELECT outbox_id
+		FROM outbox
+		WHERE state IN ('queued', 'not_dispatched')
+		  AND expires_at_ms IS NOT NULL
+		  AND expires_at_ms <= ?
+		ORDER BY expires_at_ms, outbox_id
+	`, nowMS)
+	if err != nil {
+		return nil, fmt.Errorf("cancel expired outbox items: select candidates: %w", err)
+	}
+	ids, err := collectRows(rows, func(row rowScanner) (string, error) {
+		var id string
+		err := row.Scan(&id)
+		return id, err
+	})
+	if err != nil {
+		return nil, fmt.Errorf("cancel expired outbox items: scan candidates: %w", err)
+	}
+	if len(ids) == 0 {
+		return nil, tx.Commit()
+	}
+
+	for _, id := range ids {
+		result, err := tx.ExecContext(ctx, `
+			UPDATE outbox
+			SET state = 'canceled',
+				error_class = ?,
+				error_code = ?,
+				error_detail = 'send window expired before the message reached the transport; it was NOT sent',
+				next_attempt_at_ms = NULL,
+				updated_at_ms = ?
+			WHERE outbox_id = ?
+			  AND state IN ('queued', 'not_dispatched')
+			  AND expires_at_ms IS NOT NULL
+			  AND expires_at_ms <= ?
+		`, TTLErrorClass, TTLErrorCode, nowMS, id, nowMS)
+		if err != nil {
+			return nil, fmt.Errorf("cancel expired outbox item %q: %w", id, err)
+		}
+		if _, err := result.RowsAffected(); err != nil {
+			return nil, fmt.Errorf("cancel expired outbox item %q: read rows affected: %w", id, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("cancel expired outbox items: commit: %w", err)
+	}
+	return ids, nil
+}
+
+// RecentTextIntent is one prior text send used by the near-duplicate guard.
+type RecentTextIntent struct {
+	OutboxID       string
+	IdempotencyKey string
+	State          OutboxState
+	Body           string
+	CreatedAtMS    int64
+}
+
+// ListRecentTextIntents returns text intents created at or after sinceMS in
+// one conversation, newest first, excluding states proven not to have sent
+// (rejected, canceled). Everything else — queued, dispatching, retrying,
+// uncertain, and confirmed — did or still may reach the recipient, so a
+// near-duplicate submission against any of them deserves the guard.
+func (r *OutboxRepository) ListRecentTextIntents(
+	ctx context.Context,
+	accountID string,
+	conversationID string,
+	sinceMS int64,
+	limit int,
+) ([]RecentTextIntent, error) {
+	if limit <= 0 {
+		return nil, fmt.Errorf("list recent text intents: limit must be positive")
+	}
+	rows, err := r.store.db.QueryContext(ctx, `
+		SELECT o.outbox_id, o.idempotency_key, o.state, COALESCE(m.body, ''), o.created_at_ms
+		FROM outbox o
+		LEFT JOIN messages m ON m.message_id = o.local_message_id
+		WHERE o.account_id = ?
+		  AND o.conversation_id = ?
+		  AND o.kind = 'text'
+		  AND o.created_at_ms >= ?
+		  AND o.state NOT IN ('rejected', 'canceled')
+		ORDER BY o.created_at_ms DESC, o.outbox_id DESC
+		LIMIT ?
+	`, accountID, conversationID, sinceMS, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list recent text intents: query: %w", err)
+	}
+	intents, err := collectRows(rows, func(row rowScanner) (RecentTextIntent, error) {
+		var intent RecentTextIntent
+		err := row.Scan(
+			&intent.OutboxID,
+			&intent.IdempotencyKey,
+			&intent.State,
+			&intent.Body,
+			&intent.CreatedAtMS,
+		)
+		return intent, err
+	})
+	if err != nil {
+		return nil, fmt.Errorf("list recent text intents: scan: %w", err)
+	}
+	return intents, nil
+}
+
 func (r *OutboxRepository) Cancel(ctx context.Context, outboxID string) error {
 	nowMS, err := r.nowMS("cancel outbox item")
 	if err != nil {
@@ -2097,6 +2236,7 @@ const outboxColumns = `
 	transport_called_at_ms,
 	scheduled_for_ms,
 	next_attempt_at_ms,
+	expires_at_ms,
 	created_at_ms,
 	updated_at_ms`
 
@@ -2130,6 +2270,7 @@ func scanPendingRow(row rowScanner) (PendingRow, error) {
 		&pending.TransportCalledAtMS,
 		&pending.ScheduledForMS,
 		&pending.NextAttemptAtMS,
+		&pending.ExpiresAtMS,
 		&pending.CreatedAtMS,
 		&pending.UpdatedAtMS,
 		&pending.Body,
@@ -2176,6 +2317,7 @@ func scanCarryableIntent(row rowScanner) (CarryableIntent, error) {
 		&intent.TransportCalledAtMS,
 		&intent.ScheduledForMS,
 		&intent.NextAttemptAtMS,
+		&intent.ExpiresAtMS,
 		&intent.CreatedAtMS,
 		&intent.UpdatedAtMS,
 		&remoteConversationID,
@@ -2230,6 +2372,7 @@ func scanOutboxItem(row rowScanner) (OutboxItem, error) {
 		&item.TransportCalledAtMS,
 		&item.ScheduledForMS,
 		&item.NextAttemptAtMS,
+		&item.ExpiresAtMS,
 		&item.CreatedAtMS,
 		&item.UpdatedAtMS,
 	)
@@ -2268,6 +2411,9 @@ func validateNewOutboxItem(item NewOutboxItem) error {
 	if !item.ScheduledFor.IsZero() && item.ScheduledForMS != 0 {
 		return fmt.Errorf("ScheduledFor and ScheduledForMS are both set")
 	}
+	if item.ExpiresAtMS < 0 {
+		return fmt.Errorf("expiry time is negative")
+	}
 	return nil
 }
 
@@ -2287,6 +2433,13 @@ func scheduledForMilliseconds(item NewOutboxItem, nowMS int64) (int64, error) {
 
 func nullableOutboxText(value string) any {
 	if value == "" {
+		return nil
+	}
+	return value
+}
+
+func nullableOutboxMS(value int64) any {
+	if value == 0 {
 		return nil
 	}
 	return value

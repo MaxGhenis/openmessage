@@ -28,6 +28,8 @@ type TextInput struct {
 	ReplyToID      string
 	IdempotencyKey string
 	NotBefore      time.Time
+	TTL            time.Duration
+	Force          bool
 }
 
 type MediaInput struct {
@@ -39,6 +41,7 @@ type MediaInput struct {
 	ReplyToID      string
 	IdempotencyKey string
 	NotBefore      time.Time
+	TTL            time.Duration
 }
 
 // SubmitText mirrors only the graph needed by the durable service, rejects
@@ -79,6 +82,8 @@ func SubmitText(ctx context.Context, deps Deps, input TextInput) (messaging.Subm
 			ConversationID: conversationID,
 			IdempotencyKey: input.IdempotencyKey,
 			NotBefore:      input.NotBefore,
+			TTL:            input.TTL,
+			Force:          input.Force,
 		},
 		Body:             input.Body,
 		ReplyToMessageID: replyToMessageID,
@@ -121,6 +126,7 @@ func SubmitMedia(ctx context.Context, deps Deps, input MediaInput) (messaging.Su
 			ConversationID: conversationID,
 			IdempotencyKey: input.IdempotencyKey,
 			NotBefore:      input.NotBefore,
+			TTL:            input.TTL,
 		},
 		Content:          input.Content,
 		Filename:         input.Filename,

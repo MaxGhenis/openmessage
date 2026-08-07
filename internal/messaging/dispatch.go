@@ -37,6 +37,12 @@ func (s *MessageService) Run(ctx context.Context) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		if err := s.cancelExpiredDue(ctx); err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
+			return fmt.Errorf("run message service: cancel expired intents: %w", err)
+		}
 		if _, err := s.reconcileStoreFailedDue(ctx, s.batchLimit); err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return ctxErr
@@ -873,6 +879,21 @@ func (s *MessageService) releaseUntouched(ctx context.Context, leases []sqlite.L
 
 func (s *MessageService) storageMutationContext(ctx context.Context) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.WithoutCancel(ctx), defaultFinalizeTime)
+}
+
+// cancelExpiredDue sweeps intents whose send window closed before dispatch.
+// Running ahead of DispatchDue in every loop iteration means an expired
+// intent can never be leased first: LeaseDue independently excludes expired
+// rows, so the sweep and the lease agree even under races.
+func (s *MessageService) cancelExpiredDue(ctx context.Context) error {
+	canceled, err := s.outbox.CancelExpired(ctx, s.clock.Now())
+	if err != nil {
+		return err
+	}
+	if len(canceled) > 0 {
+		s.signalChange()
+	}
+	return nil
 }
 
 func (s *MessageService) recordSendError(

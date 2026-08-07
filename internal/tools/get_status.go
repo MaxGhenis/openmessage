@@ -9,6 +9,7 @@ import (
 	"github.com/mark3labs/mcp-go/server"
 
 	"github.com/maxghenis/openmessage/internal/app"
+	"github.com/maxghenis/openmessage/internal/sendcap"
 	"github.com/maxghenis/openmessage/internal/signallive"
 	"github.com/maxghenis/openmessage/internal/whatsapplive"
 )
@@ -34,10 +35,33 @@ var (
 
 func getStatusTool() mcp.Tool {
 	return mcp.NewTool("get_status",
-		mcp.WithDescription("Get connection and pairing status for Google Messages, WhatsApp, and Signal"),
+		mcp.WithDescription("Get connection, pairing, and per-platform SEND capability for Google Messages (SMS/RCS), WhatsApp, and Signal. \"Connected\" alone does not mean a platform can send — check the send capability block before submitting a time-sensitive message; a platform can receive while its send path is unavailable."),
 		mcp.WithReadOnlyHintAnnotation(true),
 		mcp.WithDestructiveHintAnnotation(false),
 	)
+}
+
+// appendSendCapabilityText renders the per-platform send block in a fixed
+// platform order.
+func appendSendCapabilityText(sb *strings.Builder, capabilities map[string]sendcap.Capability) {
+	if len(capabilities) == 0 {
+		return
+	}
+	sb.WriteString("\nSend capability (can a send submitted NOW dispatch promptly?):\n")
+	for _, platform := range []string{sendcap.PlatformSMS, sendcap.PlatformWhatsApp, sendcap.PlatformSignal} {
+		capability, ok := capabilities[platform]
+		if !ok {
+			continue
+		}
+		switch {
+		case capability.Available:
+			fmt.Fprintf(sb, "  %s: available\n", platform)
+		case capability.Queueable:
+			fmt.Fprintf(sb, "  %s: DEGRADED (sends queue, not transmit) — %s\n", platform, firstNonEmpty(capability.Reason, "reason unknown"))
+		default:
+			fmt.Fprintf(sb, "  %s: UNAVAILABLE — %s\n", platform, firstNonEmpty(capability.Reason, "reason unknown"))
+		}
+	}
 }
 
 func getStatusHandler(a *app.App, configured ...Options) server.ToolHandlerFunc {
@@ -114,6 +138,9 @@ func getStatusHandler(a *app.App, configured ...Options) server.ToolHandlerFunc 
 			fmt.Fprintf(&sb, "  Last error: %s\n", signal.LastError)
 		}
 
+		sendCapabilities := localSendCapability(a, options.V2)
+		appendSendCapabilityText(&sb, sendCapabilities)
+
 		if options.V2Primary {
 			sb.WriteString("\nServing store (v2):\n")
 			if len(storedPlatforms) == 0 {
@@ -131,6 +158,7 @@ func getStatusHandler(a *app.App, configured ...Options) server.ToolHandlerFunc 
 			"google":            google,
 			"whatsapp":          whatsApp,
 			"signal":            signal,
+			"send":              sendCapabilities,
 			"data_dir":          a.DataDir,
 		}
 		if options.V2Primary {
