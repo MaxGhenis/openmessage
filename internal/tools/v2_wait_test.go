@@ -173,27 +173,31 @@ func TestV2SendRejectedIsSettledWithNoRetryGuidance(t *testing.T) {
 	}
 }
 
-func TestV2DeliveryTextAndOKForRepairAndCancelStates(t *testing.T) {
-	storeFailed := messaging.Delivery{
+func TestSendResultTextAndOKForRepairAndCancelStates(t *testing.T) {
+	storeFailed := sendOutcome{Delivery: messaging.Delivery{
 		OutboxID:        "outbox-repair",
 		State:           messaging.OutboxStoreFailed,
 		RemoteMessageID: "remote-repair",
+	}}
+	if !sendTransmitted(storeFailed.Delivery.State) {
+		t.Fatal("store_failed means the transport accepted the send; transmitted must be true")
 	}
-	if !v2DeliveryOK(storeFailed.State) {
-		t.Fatal("store_failed means the transport delivered; ok must be true")
-	}
-	text := v2DeliveryText(storeFailed)
+	text := sendResultText(storeFailed)
 	for _, fragment := range []string{"transport accepted", "repaired automatically", "Do not resend"} {
 		if !strings.Contains(text, fragment) {
 			t.Fatalf("store_failed text missing %q: %q", fragment, text)
 		}
 	}
-
-	canceled := messaging.Delivery{OutboxID: "outbox-canceled", State: messaging.OutboxCanceled}
-	if v2DeliveryOK(canceled.State) {
-		t.Fatal("canceled must not report ok")
+	// The word "delivery" must never be claimed on bare transport acceptance.
+	if strings.Contains(strings.ToLower(text), "delivery confirmed") {
+		t.Fatalf("store_failed text claims delivery: %q", text)
 	}
-	if got := v2DeliveryText(canceled); !strings.Contains(got, "canceled") {
+
+	canceled := sendOutcome{Delivery: messaging.Delivery{OutboxID: "outbox-canceled", State: messaging.OutboxCanceled}}
+	if sendTransmitted(canceled.Delivery.State) {
+		t.Fatal("canceled must not report transmitted")
+	}
+	if got := sendResultText(canceled); !strings.Contains(got, "NOT SENT") {
 		t.Fatalf("canceled text = %q", got)
 	}
 }

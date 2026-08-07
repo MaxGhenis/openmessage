@@ -125,8 +125,13 @@ func TestDaemonSendToConversationDeterministicRejection(t *testing.T) {
 	}
 	payload := structuredMap(t, result)
 	message, _ := payload["error"].(string)
-	if !strings.Contains(message, "send rejected by the app") {
-		t.Fatalf("rejection message = %q", message)
+	// A 404 must explain that the daemon could not resolve the conversation
+	// and that nothing was queued — a bare "HTTP 404" reads like a transport
+	// bug (2026-08-05: WhatsApp sends 404ing while status showed connected).
+	for _, fragment := range []string{"send rejected", "could not resolve conversation", "NOT queued", "resolve_contact_routes"} {
+		if !strings.Contains(message, fragment) {
+			t.Fatalf("rejection message missing %q: %q", fragment, message)
+		}
 	}
 }
 

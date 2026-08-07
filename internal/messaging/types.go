@@ -59,13 +59,48 @@ var (
 
 	// ErrNotImplemented marks API seams reserved for later rebuild items.
 	ErrNotImplemented = errors.New("messaging: not implemented")
+
+	// ErrDuplicateSend means a near-identical text was already submitted to
+	// the same conversation moments ago and the new submission did not carry
+	// Force. The wrapped DuplicateSendError names the prior intent.
+	ErrDuplicateSend = errors.New("messaging: near-duplicate send blocked")
 )
+
+// DuplicateSendError reports the prior intent that triggered the
+// near-duplicate guard so callers can decide between waiting, canceling the
+// prior send, or forcing this one.
+type DuplicateSendError struct {
+	PriorOutboxID       string
+	PriorState          OutboxState
+	PriorIdempotencyKey string
+	PriorAgeMS          int64
+}
+
+func (e *DuplicateSendError) Error() string {
+	return fmt.Sprintf(
+		"messaging: near-duplicate send blocked: a very similar message was submitted to this conversation %s ago (outbox %s, state %s); if this is intentional, resubmit with force",
+		(time.Duration(e.PriorAgeMS) * time.Millisecond).Round(time.Second),
+		e.PriorOutboxID,
+		e.PriorState,
+	)
+}
+
+func (e *DuplicateSendError) Unwrap() error { return ErrDuplicateSend }
 
 type CommonCommand struct {
 	AccountID      string
 	ConversationID string
 	IdempotencyKey string
 	NotBefore      time.Time // zero means now
+
+	// TTL bounds how long the intent may wait to cross the transport
+	// boundary, measured from the later of submission and NotBefore. An
+	// intent still queued when the window closes is canceled instead of
+	// transmitted stale. Zero means the intent never expires.
+	TTL time.Duration
+
+	// Force bypasses the near-duplicate guard for a deliberate resend.
+	Force bool
 }
 
 type SendTextCommand struct {
@@ -102,17 +137,27 @@ type Submission struct {
 	LocalMessageID string
 	State          OutboxState
 	ScheduledFor   time.Time
+	ExpiresAt      time.Time // zero means the intent never expires
 	Deduplicated   bool
 }
 
 type Delivery struct {
 	OutboxID        string
+	AccountID       string
+	ConversationID  string
 	State           OutboxState
 	LocalMessageID  string
 	RemoteMessageID string
 	ErrorClass      string
 	ErrorCode       string
 	Warning         string
+	ExpiresAt       time.Time // zero means the intent never expires
+}
+
+// Expired reports whether the delivery was canceled by its send window
+// closing rather than by an explicit cancel.
+func (d Delivery) Expired() bool {
+	return d.State == OutboxCanceled && d.ErrorClass == sqlite.TTLErrorClass
 }
 
 // TransportEcho is the transport-neutral correlation shape reserved for M5.

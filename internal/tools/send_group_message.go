@@ -39,6 +39,7 @@ func sendGroupMessageTool(v2Enabled ...bool) mcp.Tool {
 	if v2Requested(v2Enabled) {
 		options[0] = mcp.WithDescription(description + v2DeliveryDescription)
 		options = append(options, mcp.WithString("idempotency_key", mcp.Description(v2IdempotencyDescription)))
+		options = withSendControlOptions(options, true)
 	}
 	options = append(options,
 		mcp.WithDestructiveHintAnnotation(false),

@@ -91,7 +91,7 @@ mode this prevents and the `~/.mcp.json` recipe.
 
 ### MCP tools
 
-24 tools registered (see internal/tools/tools.go Register for the authoritative list):
+26 tools registered (see internal/tools/tools.go Register for the authoritative list):
 - `get_messages`, `get_conversation`, `search_messages` — cross-platform by default
 - `list_conversations` — optional `source_platform` filter (sms, gchat, imessage, whatsapp)
 - `get_person_messages` — all messages with a person across all platforms
@@ -104,6 +104,27 @@ mode this prevents and the `~/.mcp.json` recipe.
 - `generate_viz` — self-contained HTML visualization combining data dashboards + narrative (see below)
 - `render_story` — render a pre-built Story JSON into HTML viz; supports `photo_paths` (curated list) or `photos_dir`
 - `send_message`, `draft_message`, `download_media`, `list_contacts`, `get_status`
+- `list_outbox`, `cancel_outbox` — durable-send custody: see what is still queued/retrying, stop a stale send before it transmits
+
+### Send truthfulness (2026-08-05 incident)
+
+A send result's `transport_state` is `queued` (has NOT left the machine),
+`transmitted` (transport accepted it — NOT proof of delivery), `delivered`
+(delivery receipt observed), `uncertain`, `failed`, or `canceled`;
+`settled`/`transmitted` are true only on transport acknowledgment, and the
+result names the `platform` used and `conversation_id` written to. Sends
+default to a 10-minute send window (`ttl_seconds`, env
+`OPENMESSAGES_SEND_TTL_SECONDS`; 0 = never expire) — a message still queued
+when the window closes cancels as expired instead of transmitting stale.
+Near-identical resends to the same conversation within ~10 minutes are
+blocked unless `force=true`. `wait_for_transmit=true` holds the call (up to
+`wait_seconds`, max 120) until the transport acknowledges. The requested
+platform is a hard contract: an unsendable platform fails with the reason
+and queues nothing — there is never a silent fallback to another channel.
+`get_status` and `/api/status` publish per-platform send capability
+(`send.{sms,whatsapp,signal}`), which is what `resolve_contact_routes`
+sendability and send-time enforcement both read; `connected`/`v2_send` alone
+never imply a platform can send.
 
 ### HTTP API
 

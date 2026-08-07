@@ -662,6 +662,7 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 
 	v2Options := v2SendWebOptions(stack, v2Send)
 	v2IngestCounters := v2IngestCountersProvider(stack)
+	sendCapability := sendCapabilityProvider(a, stack, transports)
 
 	httpEnabled := opts.web || opts.mcpSSE
 	if httpEnabled {
@@ -675,6 +676,7 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 				Auth:                  controlAuth,
 				V2:                    v2Options,
 				V2IngestCounters:      v2IngestCounters,
+				SendCapability:        sendCapability,
 				Reads:                 reads,
 				V2Primary:             v2Primary,
 				Client:                a.GetClient,
