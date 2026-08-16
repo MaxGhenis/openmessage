@@ -566,3 +566,86 @@ func workerPathAssertAllProcessed(t *testing.T, messages *sqlite.MessageReposito
 		t.Fatalf("unprocessed inbox records = %+v, want none", records)
 	}
 }
+
+// TestWorkerPathsUpdatedAtClampedOnSkewedConversationCreate is a regression
+// test for issue #167. A Google Messages frame sometimes arrives with a future
+// provider timestamp. When that message is the first in a conversation,
+// ensureMessageConversation writes created_at_ms = future_ms. Any subsequent
+// write that sets updated_at_ms = nowMS (where nowMS < future_ms) violates the
+// schema CHECK (updated_at_ms >= created_at_ms) and was previously quarantined.
+// The fix clamps updated_at_ms = max(nowMS, created_at_ms) at the write site.
+func TestWorkerPathsUpdatedAtClampedOnSkewedConversationCreate(t *testing.T) {
+	const (
+		remoteConversationID = "skew-test-conversation"
+		remoteMessageID      = "skew-test-message"
+		// Simulate a provider timestamp 50 seconds ahead of the worker clock.
+		skewedFutureMS = workerPathNowMS + 50_000
+	)
+
+	harness := newWorkerPathHarness(t, bridge.PlatformGoogle, map[string][]bridge.Event{
+		// Step 1: a message whose OccurredAt is in the future relative to nowMS.
+		// applyEvents → messageProjection → ensureMessageConversation creates the
+		// conversation with CreatedAtMS = skewedFutureMS.
+		"future-message": {{
+			Kind: bridge.EventMessage,
+			Message: &bridge.MessageEvent{
+				RemoteConversationID: remoteConversationID,
+				RemoteMessageID:      remoteMessageID,
+				Sender:               bridge.IdentityRef{Raw: "+15550000001", Name: "Skew Contact"},
+				Direction:            "incoming",
+				Body:                 "message from the future",
+				OccurredAt:           time.UnixMilli(skewedFutureMS),
+			},
+		}},
+		// Step 2: a conversation snapshot processed at nowMS.
+		// refreshConversation reads the existing row (CreatedAtMS=skewedFutureMS)
+		// and would set UpdatedAtMS = nowMS < CreatedAtMS → CHECK violation → quarantine.
+		// The fix clamps UpdatedAtMS to CreatedAtMS instead.
+		"conversation-snapshot": {{
+			Kind: bridge.EventConversation,
+			Conversation: &bridge.ConversationEvent{
+				RemoteConversationID: remoteConversationID,
+				Kind:                 "direct",
+				Title:                "Skew Test",
+				Participants: []bridge.Participant{{
+					Identity: bridge.IdentityRef{
+						Raw:  "+15550000001",
+						Name: "Skew Contact",
+					},
+					Role:   "member",
+					Active: true,
+				}},
+			},
+		}},
+	})
+
+	harness.process(t, "future-message")
+	harness.process(t, "conversation-snapshot")
+
+	// The conversation snapshot must be stored, not quarantined.
+	storedConversation, err := harness.store.GetConversationByRemote(workerPathAccountID, remoteConversationID)
+	if err != nil {
+		t.Fatalf("GetConversationByRemote(): %v — conversation frame must be stored, not quarantined", err)
+	}
+	// updated_at_ms must be clamped to created_at_ms (skewedFutureMS), not nowMS.
+	if storedConversation.UpdatedAtMS < storedConversation.CreatedAtMS {
+		t.Fatalf(
+			"updated_at_ms=%d < created_at_ms=%d — clamp did not fire",
+			storedConversation.UpdatedAtMS,
+			storedConversation.CreatedAtMS,
+		)
+	}
+
+	snapshot := harness.worker.Counters().Snapshot(workerPathAccountID)
+	if snapshot.Quarantined != 0 {
+		t.Fatalf(
+			"quarantined=%d, want 0 — clock-skew updated_at must not quarantine the frame",
+			snapshot.Quarantined,
+		)
+	}
+	if snapshot.UpdatedAtClamped == 0 {
+		t.Fatalf("updated_at_clamped=0, want >0 — skew clamp must be counted")
+	}
+
+	workerPathAssertAllProcessed(t, harness.messages)
+}

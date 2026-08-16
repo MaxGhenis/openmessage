@@ -32,6 +32,9 @@ type CounterSnapshot struct {
 	EchoNotFound      uint64 `json:"echo_notfound"`
 	EchoErrors        uint64 `json:"echo_errors"`
 	Ephemeral         uint64 `json:"ephemeral"`
+	// UpdatedAtClamped counts writes where updated_at_ms was clamped up to
+	// created_at_ms to satisfy the CHECK constraint (provider clock skew).
+	UpdatedAtClamped uint64 `json:"updated_at_clamped"`
 }
 
 type accountCounters struct {
@@ -57,6 +60,7 @@ type accountCounters struct {
 	echoNotFound      atomic.Uint64
 	echoErrors        atomic.Uint64
 	ephemeral         atomic.Uint64
+	updatedAtClamped  atomic.Uint64
 }
 
 // Counters owns atomic ingest counters partitioned by account. Its zero value
@@ -139,5 +143,6 @@ func snapshotCounters(c *accountCounters) CounterSnapshot {
 		EchoNotFound:      c.echoNotFound.Load(),
 		EchoErrors:        c.echoErrors.Load(),
 		Ephemeral:         c.ephemeral.Load(),
+		UpdatedAtClamped:  c.updatedAtClamped.Load(),
 	}
 }

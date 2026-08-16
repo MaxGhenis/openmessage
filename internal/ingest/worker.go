@@ -795,6 +795,19 @@ func (w *Worker) refreshConversation(
 		conversation.Title = event.Title
 		conversation.RemoteRevision = optionalTrimmed(event.RemoteRevision)
 		conversation.UpdatedAtMS = nowMS
+		if conversation.UpdatedAtMS < conversation.CreatedAtMS {
+			// Provider clock skew: the frame's effective wall time is behind the
+			// row's creation timestamp. Clamp to satisfy CHECK (updated_at_ms >=
+			// created_at_ms) and record the skew for observability.
+			w.logger.Warn().
+				Str("account_id", accountID).
+				Str("remote_conversation_id", remoteID).
+				Int64("created_at_ms", conversation.CreatedAtMS).
+				Int64("updated_at_ms", nowMS).
+				Msg("Clamped conversation updated_at_ms to created_at_ms: clock skew")
+			w.counters.account(accountID).updatedAtClamped.Add(1)
+			conversation.UpdatedAtMS = conversation.CreatedAtMS
+		}
 	}
 	if err := w.store.UpsertConversation(conversation); err != nil {
 		return sqlite.Conversation{}, err
@@ -913,6 +926,18 @@ func (w *Worker) resolveIdentity(
 		}
 		identity.IsSelf = identity.IsSelf || reference.IsSelf
 		identity.UpdatedAtMS = nowMS
+		if identity.UpdatedAtMS < identity.CreatedAtMS {
+			// Defensive clamp: system clock went backward since identity was
+			// created. Satisfies CHECK (updated_at_ms >= created_at_ms).
+			w.logger.Warn().
+				Str("account_id", accountID).
+				Str("identity_id", identity.IdentityID).
+				Int64("created_at_ms", identity.CreatedAtMS).
+				Int64("updated_at_ms", nowMS).
+				Msg("Clamped identity updated_at_ms to created_at_ms: clock skew")
+			w.counters.account(accountID).updatedAtClamped.Add(1)
+			identity.UpdatedAtMS = identity.CreatedAtMS
+		}
 	}
 	if err := w.store.UpsertIdentity(identity); err != nil {
 		return sqlite.Identity{}, err
