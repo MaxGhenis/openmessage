@@ -18,6 +18,41 @@ HELPER_ENTITLEMENTS="$SCRIPT_DIR/OpenMessageHelper.entitlements"
 #   APP_PASSWORD    - app-specific password from appleid.apple.com
 SIGN_IDENTITY="${DEVELOPER_ID:-}"
 
+# ── Bundle identity: dev builds must never shadow the installed app ──
+# Every OpenMessage .app that declares CFBundleIdentifier com.openmessage.app is
+# a candidate when LaunchServices resolves "OpenMessage" (Spotlight, Dock,
+# `open -a OpenMessage`, notification clicks). Stale build outputs sharing the
+# release id have twice caused the wrong binary to launch — most recently
+# 2026-07-25, when a build predating the Google self-heal OSID fix (PR #148)
+# latched Google Messages in needs_repair for ~10.5h.
+#
+# So: plain `./macos/build.sh` produces a *dev* bundle id that can never win
+# that resolution. Shippable builds must opt in explicitly:
+#
+#     RELEASE=1 ./macos/build.sh
+#
+# Note the data dir is NOT bundle-id-scoped (BackendManager.swift hardcodes
+# ~/Library/Application Support/OpenMessage), so a dev build still reads the
+# same store. What IS id-scoped: UserDefaults (the `defaults write
+# com.openmessage.app V2Primary` lever), the notification grant, and the
+# sandbox container.
+# Both the id AND the name must differ in dev mode: LaunchServices resolves
+# id-based launches (notification clicks, `open -b`) by CFBundleIdentifier,
+# but name-based launches (`open -a OpenMessage`, Spotlight) by the registered
+# name, which comes from CFBundleName/CFBundleDisplayName — NOT the .app
+# filename (verified: a bundle renamed on disk still registered as
+# "OpenMessage" from its plist). Stamping only the id would leave dev builds
+# winning `open -a OpenMessage`.
+RELEASE_BUILD="${RELEASE:-0}"
+if [ "$RELEASE_BUILD" = "1" ]; then
+    BUNDLE_ID="com.openmessage.app"
+    BUNDLE_NAME="OpenMessage"
+else
+    BUNDLE_ID="com.openmessage.app.dev"
+    BUNDLE_NAME="OpenMessage (dev)"
+    DMG_PATH="$BUILD_DIR/$APP_NAME-dev.dmg"
+fi
+
 # Detect version from git tag (or VERSION env override). Falls back to "dev".
 VERSION="${VERSION:-$(git -C "$ROOT_DIR" describe --tags --always --dirty 2>/dev/null || echo dev)}"
 echo "==> Version: $VERSION"
@@ -65,8 +100,18 @@ cp "$SWIFT_BIN" "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
 cp "$SCRIPT_DIR/build/openmessage" "$APP_BUNDLE/Contents/Resources/openmessage"
 chmod +x "$APP_BUNDLE/Contents/Resources/openmessage"
 
-# Copy Info.plist
+# Copy Info.plist, then stamp the bundle identity for this build mode.
+# Stamped BEFORE codesigning so the signature seals the final plist.
 cp "$SCRIPT_DIR/OpenMessage/Sources/Info.plist" "$APP_BUNDLE/Contents/Info.plist"
+plist_set() { # key type value — Set with Add fallback
+    /usr/libexec/PlistBuddy -c "Set :$1 $3" "$APP_BUNDLE/Contents/Info.plist" 2>/dev/null || \
+        /usr/libexec/PlistBuddy -c "Add :$1 $2 $3" "$APP_BUNDLE/Contents/Info.plist"
+}
+plist_set CFBundleIdentifier string "$BUNDLE_ID"
+plist_set CFBundleName string "$BUNDLE_NAME"
+plist_set CFBundleDisplayName string "$BUNDLE_NAME"
+echo "   Bundle id: $BUNDLE_ID"
+echo "   Bundle name: $BUNDLE_NAME"
 
 # Generate and copy app icon
 ICON_SRC="$SCRIPT_DIR/OpenMessage/Sources/Assets.xcassets/AppIcon.appiconset"
@@ -119,7 +164,11 @@ echo "   Size: $(du -sh "$APP_BUNDLE" | cut -f1)"
 
 # ── Create DMG ──
 echo "==> Creating DMG..."
-rm -f "$DMG_PATH"
+# Remove BOTH mode variants, not just the current one: a dev build must not
+# leave last week's OpenMessage.dmg sitting in build/ looking shippable
+# (and vice versa) — uploading a stale DMG is the exact mistake this whole
+# bundle-identity scheme exists to prevent.
+rm -f "$BUILD_DIR/$APP_NAME.dmg" "$BUILD_DIR/$APP_NAME-dev.dmg"
 hdiutil create -volname "$APP_NAME" -srcfolder "$APP_BUNDLE" -ov -format UDZO "$DMG_PATH" 2>&1 | tail -1
 echo "   DMG: $(du -h "$DMG_PATH" | cut -f1)"
 
@@ -168,10 +217,34 @@ else
     echo "   To sign + notarize, set: DEVELOPER_ID (e.g. \"Developer ID Application: Max Ghenis (8VB5UKQZC6)\")"
 fi
 
+# ── Keep the build output out of LaunchServices ──
+# Belt-and-braces alongside the dev bundle id. Note this alone is NOT durable:
+# any LaunchServices rescan re-registers the bundle, so it narrows the window
+# rather than closing it. The dev bundle id above is what actually closes it.
+LSREGISTER=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
+if [ -x "$LSREGISTER" ]; then
+    "$LSREGISTER" -u "$APP_BUNDLE" >/dev/null 2>&1 || true
+fi
+
 echo ""
 echo "==> Done!"
 echo "   App: $APP_BUNDLE"
 echo "   DMG: $DMG_PATH"
+echo "   Bundle id: $BUNDLE_ID"
+if [ "$RELEASE_BUILD" != "1" ]; then
+    echo ""
+    echo "   ┌─────────────────────────────────────────────────────────────┐"
+    echo "   │  DEV BUILD — bundle id com.openmessage.app.dev              │"
+    echo "   │  Deliberately cannot shadow /Applications/OpenMessage.app.  │"
+    echo "   │  Do NOT ship this or copy it over the installed app.        │"
+    echo "   │  For a shippable build:  RELEASE=1 ./macos/build.sh         │"
+    echo "   └─────────────────────────────────────────────────────────────┘"
+fi
 echo ""
 echo "To run:  open $APP_BUNDLE"
-echo "To install: cp -R $APP_BUNDLE /Applications/"
+if [ "$RELEASE_BUILD" = "1" ]; then
+    echo "To install: cp -R $APP_BUNDLE /Applications/"
+else
+    echo "To install: rebuild with RELEASE=1 first — installing this dev-id"
+    echo "            bundle would orphan the V2Primary lever + notification grant."
+fi

@@ -144,7 +144,22 @@ curl -s -o /dev/null -w "%{http_code}" https://openmessage.ai
 
 This builds: Go universal binary (arm64+amd64) → Swift app → .app bundle → .dmg
 
-To install locally:
+**Dev builds get a distinct bundle identity.** Plain `./macos/build.sh` stamps
+`com.openmessage.app.dev`, names the bundle `OpenMessage (dev)`, and emits
+`OpenMessage-dev.dmg`, so a stale build can never shadow the installed app in
+LaunchServices — by id or by name (this caused two live outages —
+see [docs/agent-runbook.md](docs/agent-runbook.md) "Bundle-id shadowing").
+Anything installable or shippable **must** set `RELEASE=1`:
+
+```bash
+RELEASE=1 ./macos/build.sh
+```
+
+Building from a nested `.claude/worktrees/*` checkout also needs `GOWORK=off`
+(Go otherwise finds `~/openmessage/go.work` and resolves the main module to the
+parent).
+
+To install locally (requires `RELEASE=1` above):
 ```bash
 cp -R macos/build/OpenMessage.app /Applications/ && xattr -cr /Applications/OpenMessage.app
 ```
