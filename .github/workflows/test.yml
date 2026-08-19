@@ -158,25 +158,43 @@ jobs:
           # A default (non-RELEASE) build must NOT claim com.openmessage.app —
           # that id collision let stale builds win LaunchServices resolution and
           # caused two live outages. See docs/agent-runbook.md "Bundle-id shadowing".
-          id=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' \
-                 macos/build/OpenMessage.app/Contents/Info.plist)
-          echo "Dev build bundle id: $id"
+          # The NAME must differ too: `open -a OpenMessage` resolves by the
+          # registered name (CFBundleName/CFBundleDisplayName), not the id.
+          plist=macos/build/OpenMessage.app/Contents/Info.plist
+          id=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$plist")
+          name=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleName' "$plist")
+          echo "Dev build bundle id: $id, name: $name"
           if [ "$id" != "com.openmessage.app.dev" ]; then
             echo "::error::Default build has bundle id '$id', expected com.openmessage.app.dev."
+            exit 1
+          fi
+          if [ "$name" != "OpenMessage (dev)" ]; then
+            echo "::error::Default build has CFBundleName '$name', expected 'OpenMessage (dev)' — a dev build named 'OpenMessage' can still win 'open -a OpenMessage'."
             exit 1
           fi
 
       - name: Verify RELEASE=1 restores the shippable identity
         run: |
           RELEASE=1 bash macos/build.sh >/dev/null
-          id=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' \
-                 macos/build/OpenMessage.app/Contents/Info.plist)
-          echo "Release build bundle id: $id"
+          plist=macos/build/OpenMessage.app/Contents/Info.plist
+          id=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$plist")
+          name=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleName' "$plist")
+          echo "Release build bundle id: $id, name: $name"
           if [ "$id" != "com.openmessage.app" ]; then
             echo "::error::RELEASE=1 build has bundle id '$id', expected com.openmessage.app."
+            exit 1
+          fi
+          if [ "$name" != "OpenMessage" ]; then
+            echo "::error::RELEASE=1 build has CFBundleName '$name', expected 'OpenMessage'."
             exit 1
           fi
           test -f macos/build/OpenMessage.dmg || {
             echo "::error::RELEASE=1 build did not emit macos/build/OpenMessage.dmg."
             exit 1
           }
+          # The rebuild must also have cleared the dev DMG — a stale
+          # OpenMessage-dev.dmg next to OpenMessage.dmg invites mixups.
+          if [ -f macos/build/OpenMessage-dev.dmg ]; then
+            echo "::error::Stale OpenMessage-dev.dmg survived the RELEASE=1 rebuild."
+            exit 1
+          fi

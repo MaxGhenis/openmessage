@@ -36,13 +36,20 @@ SIGN_IDENTITY="${DEVELOPER_ID:-}"
 # same store. What IS id-scoped: UserDefaults (the `defaults write
 # com.openmessage.app V2Primary` lever), the notification grant, and the
 # sandbox container.
+# Both the id AND the name must differ in dev mode: LaunchServices resolves
+# id-based launches (notification clicks, `open -b`) by CFBundleIdentifier,
+# but name-based launches (`open -a OpenMessage`, Spotlight) by the registered
+# name, which comes from CFBundleName/CFBundleDisplayName — NOT the .app
+# filename (verified: a bundle renamed on disk still registered as
+# "OpenMessage" from its plist). Stamping only the id would leave dev builds
+# winning `open -a OpenMessage`.
 RELEASE_BUILD="${RELEASE:-0}"
 if [ "$RELEASE_BUILD" = "1" ]; then
     BUNDLE_ID="com.openmessage.app"
-    BUNDLE_DISPLAY_NAME="OpenMessage"
+    BUNDLE_NAME="OpenMessage"
 else
     BUNDLE_ID="com.openmessage.app.dev"
-    BUNDLE_DISPLAY_NAME="OpenMessage (dev)"
+    BUNDLE_NAME="OpenMessage (dev)"
     DMG_PATH="$BUILD_DIR/$APP_NAME-dev.dmg"
 fi
 
@@ -94,14 +101,17 @@ cp "$SCRIPT_DIR/build/openmessage" "$APP_BUNDLE/Contents/Resources/openmessage"
 chmod +x "$APP_BUNDLE/Contents/Resources/openmessage"
 
 # Copy Info.plist, then stamp the bundle identity for this build mode.
+# Stamped BEFORE codesigning so the signature seals the final plist.
 cp "$SCRIPT_DIR/OpenMessage/Sources/Info.plist" "$APP_BUNDLE/Contents/Info.plist"
-/usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $BUNDLE_ID" "$APP_BUNDLE/Contents/Info.plist"
-if /usr/libexec/PlistBuddy -c "Print :CFBundleDisplayName" "$APP_BUNDLE/Contents/Info.plist" >/dev/null 2>&1; then
-    /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName $BUNDLE_DISPLAY_NAME" "$APP_BUNDLE/Contents/Info.plist"
-else
-    /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string $BUNDLE_DISPLAY_NAME" "$APP_BUNDLE/Contents/Info.plist"
-fi
+plist_set() { # key type value — Set with Add fallback
+    /usr/libexec/PlistBuddy -c "Set :$1 $3" "$APP_BUNDLE/Contents/Info.plist" 2>/dev/null || \
+        /usr/libexec/PlistBuddy -c "Add :$1 $2 $3" "$APP_BUNDLE/Contents/Info.plist"
+}
+plist_set CFBundleIdentifier string "$BUNDLE_ID"
+plist_set CFBundleName string "$BUNDLE_NAME"
+plist_set CFBundleDisplayName string "$BUNDLE_NAME"
 echo "   Bundle id: $BUNDLE_ID"
+echo "   Bundle name: $BUNDLE_NAME"
 
 # Generate and copy app icon
 ICON_SRC="$SCRIPT_DIR/OpenMessage/Sources/Assets.xcassets/AppIcon.appiconset"
@@ -154,7 +164,11 @@ echo "   Size: $(du -sh "$APP_BUNDLE" | cut -f1)"
 
 # ── Create DMG ──
 echo "==> Creating DMG..."
-rm -f "$DMG_PATH"
+# Remove BOTH mode variants, not just the current one: a dev build must not
+# leave last week's OpenMessage.dmg sitting in build/ looking shippable
+# (and vice versa) — uploading a stale DMG is the exact mistake this whole
+# bundle-identity scheme exists to prevent.
+rm -f "$BUILD_DIR/$APP_NAME.dmg" "$BUILD_DIR/$APP_NAME-dev.dmg"
 hdiutil create -volname "$APP_NAME" -srcfolder "$APP_BUNDLE" -ov -format UDZO "$DMG_PATH" 2>&1 | tail -1
 echo "   DMG: $(du -h "$DMG_PATH" | cut -f1)"
 

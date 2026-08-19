@@ -144,9 +144,10 @@ curl -s -o /dev/null -w "%{http_code}" https://openmessage.ai
 
 This builds: Go universal binary (arm64+amd64) → Swift app → .app bundle → .dmg
 
-**Dev builds get a distinct bundle id.** Plain `./macos/build.sh` stamps
-`com.openmessage.app.dev` and emits `OpenMessage-dev.dmg`, so a stale build can
-never shadow the installed app in LaunchServices (this caused two live outages —
+**Dev builds get a distinct bundle identity.** Plain `./macos/build.sh` stamps
+`com.openmessage.app.dev`, names the bundle `OpenMessage (dev)`, and emits
+`OpenMessage-dev.dmg`, so a stale build can never shadow the installed app in
+LaunchServices — by id or by name (this caused two live outages —
 see [docs/agent-runbook.md](docs/agent-runbook.md) "Bundle-id shadowing").
 Anything installable or shippable **must** set `RELEASE=1`:
 

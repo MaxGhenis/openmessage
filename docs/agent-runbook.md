@@ -427,12 +427,27 @@ Two fixes that **don't** work — verified 2026-07-25:
 
 What works:
 
-- **Build outputs:** `build.sh` stamps `com.openmessage.app.dev` unless
-  `RELEASE=1`, so a dev build structurally cannot win resolution.
+- **Build outputs:** unless `RELEASE=1`, `build.sh` stamps
+  `com.openmessage.app.dev` **and** names the bundle `OpenMessage (dev)`
+  (`CFBundleName` + `CFBundleDisplayName`). Both matter: id-based launches
+  (notification clicks, `open -b`) resolve by `CFBundleIdentifier`, but
+  name-based launches (`open -a OpenMessage`, Spotlight) resolve by the
+  registered *name*, which comes from the plist — **not** the `.app`
+  filename (a bundle renamed on disk still registered as "OpenMessage" from
+  its plist). With both stamped, neither launch path can land on a dev build.
 - **Backups/archives kept on disk:** rename `Contents/Info.plist` →
   `Contents/Info.plist.disabled`. With no `Info.plist` LaunchServices can't read
   a bundle id. Lossless and reversible; see `~/openmessage-ROLLBACK-README.md`
   for the restore recipe.
+
+**Sharp edge — don't run a dev GUI on the live machine.** Because the dev id
+differs, macOS no longer dedupes it against the installed app: launching a dev
+build alongside it starts a real second GUI. That GUI *adopts* the daemon
+already listening on port 7007 (`BackendManager.reuseExistingBackendIfNeeded`
+— transport-safe, it won't spawn a competing stack), but its stop path
+SIGTERMs the adopted PID — **quitting the dev GUI kills the live backend out
+from under the installed app.** If that happens, relaunch the installed app.
+Tracked with the other dev-id-scoped traps in issue #165.
 
 Audit (should print exactly `/Applications/OpenMessage.app`):
 

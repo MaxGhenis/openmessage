@@ -122,12 +122,13 @@ jobs:
 
       - name: Verify release bundle identity
         run: |
-          id=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' \
-                 macos/build/OpenMessage.app/Contents/Info.plist)
-          echo "Built bundle id: $id"
-          if [ "$id" != "com.openmessage.app" ]; then
-            echo "::error::Release build has bundle id '$id', expected com.openmessage.app."
-            echo "::error::RELEASE=1 was not honored — refusing to ship a dev-id build."
+          plist=macos/build/OpenMessage.app/Contents/Info.plist
+          id=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$plist")
+          name=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleName' "$plist")
+          echo "Built bundle id: $id, name: $name"
+          if [ "$id" != "com.openmessage.app" ] || [ "$name" != "OpenMessage" ]; then
+            echo "::error::Release build has id '$id' / name '$name', expected com.openmessage.app / OpenMessage."
+            echo "::error::RELEASE=1 was not honored — refusing to ship a dev-identity build."
             exit 1
           fi
           test -f macos/build/OpenMessage.dmg || {
