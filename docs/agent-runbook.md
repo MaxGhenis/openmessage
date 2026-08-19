@@ -379,6 +379,39 @@ poll — a crash loop that flaps the Signal `connected` flag every few seconds a
 makes the whole UI flicker. `brew upgrade signal-cli` fixes it. (PR #41 also
 hardened the UI to ignore redundant status pushes.)
 
+### Signal `needs_reauth` — read the fingerprint before believing the park
+
+`needs_reauth: true` is the bridge's **interpretation** of a signal-cli error,
+not server truth. Three live episodes (2026-07-20, 2026-07-24, 2026-08-06)
+parked a **valid** link for 12–22h because one boot-time `listAccounts` came up
+empty (signal-cli racing its own account bootstrap logs
+`Ignoring <number>: User is not registered.` and exits 0) and the bridge
+latched a permanent park; a single `POST /api/signal/connect` reconnected in
+~5s each time. The bridge now classifies with corroboration instead:
+
+- The receive-start probe **retries in-generation** (3 attempts, paced),
+  then checks `data/accounts.json`. Probe empty but accounts.json still lists
+  the account → **transient** exit (`signal_account_probe_empty`), retried on
+  supervisor backoff — no park, no `needs_reauth`.
+- Only 3 **consecutive generations** of that disagreement park, under
+  `signal_account_unreadable` — and that park **self-retests every 15 min**
+  (one local `RetryBlocked`; log line "Signal reauth park retest"), so a
+  lingering false park heals without manual intervention.
+- Server-backed evidence still parks fast and stays parked:
+  a receive-loop "not registered" / "authorization failed" needs 2
+  consecutive confirmations (seconds), then parks under
+  `signal_account_invalid` with **no** automatic retest. Probe empty with
+  accounts.json **also** empty parks immediately (`signal_account_invalid`).
+
+Debugging a parked Signal: check `/api/status` and the supervisor fingerprint
+before recommending a re-pair. `signal_account_unreadable` → local read
+problem, wait for the retest or `POST /api/signal/connect`; verify contention
+first (`pgrep -fl signal-cli`, `lsof` on the config dir — see the MCP
+fratricide section above). `signal_account_invalid` from `receive` → genuine
+server-side unlink, re-pair is real. **Never unpair to "fix" a park**: unpair
+`os.RemoveAll`s the signal-cli dir including CDN-expired media — permanent
+loss.
+
 ## Deploying a new build to a live install
 
 ```

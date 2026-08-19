@@ -528,17 +528,20 @@ func TestStartPollerPublishesRealReadyActivityAndJoinedDone(t *testing.T) {
 }
 
 func TestStartPollerClassifiesAccountInvalidAtInitialProbe(t *testing.T) {
+	shrinkAccountProbeRetryDelays(t)
 	bridge := &Bridge{
 		account:   "+15551230000",
 		configDir: t.TempDir(),
 		logger:    zerolog.Nop(),
 	}
+	var probeCalls atomic.Int32
 	installSignalGateStubs(t, bridge,
 		func(context.Context) ([]byte, error) {
 			return []byte("signal-cli 0.14.5\n"), nil
 		},
 		func(_ context.Context, _ string, args ...string) ([]byte, error) {
 			if hasSignalCLIArg(args, "listAccounts") {
+				probeCalls.Add(1)
 				return []byte("User +15551230000 is not registered."), errors.New("exit status 1")
 			}
 			return nil, nil
@@ -557,8 +560,333 @@ func TestStartPollerClassifiesAccountInvalidAtInitialProbe(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("account-invalid poller did not exit")
 	}
+	// Nothing on disk corroborates a link (no accounts.json), so the park is
+	// immediate — but only after every in-generation retry came up invalid.
+	if got := probeCalls.Load(); got != int32(len(accountProbeRetryDelays)+1) {
+		t.Fatalf("account probe attempts = %d, want %d", got, len(accountProbeRetryDelays)+1)
+	}
 	if status := bridge.Status(); !status.NeedsReauth || status.Connected || status.Connecting {
 		t.Fatalf("account-invalid status = %+v, want parked reauth", status)
+	}
+}
+
+// shrinkAccountProbeRetryDelays makes the in-generation probe retries
+// immediate so classification tests stay fast. Register it before
+// installSignalGateStubs: cleanups run LIFO, so the stub cleanup joins the
+// bridge's goroutines (Close) before the delays are restored here.
+func shrinkAccountProbeRetryDelays(t *testing.T) {
+	t.Helper()
+	original := accountProbeRetryDelays
+	accountProbeRetryDelays = []time.Duration{time.Millisecond, time.Millisecond}
+	t.Cleanup(func() { accountProbeRetryDelays = original })
+}
+
+func writeSignalAccountsFixture(t *testing.T, configDir, account string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Join(configDir, "data"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	payload := []byte(`[{"number":"` + account + `"}]`)
+	if err := os.WriteFile(filepath.Join(configDir, "data", "accounts.json"), payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestStartPollerRetriesEmptyAccountProbeBeforeConnecting(t *testing.T) {
+	shrinkAccountProbeRetryDelays(t)
+	bridge := &Bridge{
+		account:   "+15551230000",
+		configDir: t.TempDir(),
+		logger:    zerolog.Nop(),
+	}
+	var probeCalls atomic.Int32
+	installSignalGateStubs(t, bridge,
+		func(context.Context) ([]byte, error) {
+			return []byte("signal-cli 0.14.5\n"), nil
+		},
+		func(ctx context.Context, _ string, args ...string) ([]byte, error) {
+			switch {
+			case hasSignalCLIArg(args, "listAccounts"):
+				if probeCalls.Add(1) == 1 {
+					// Boot race: signal-cli exits 0 with zero accounts while
+					// its own account bootstrap is still settling.
+					return []byte("[]"), nil
+				}
+				return []byte(`[{"number":"+15551230000"}]`), nil
+			case hasSignalCLIArg(args, "receive"):
+				<-ctx.Done()
+				return nil, ctx.Err()
+			default:
+				return []byte("[]"), nil
+			}
+		},
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	run, err := bridge.StartPoller(ctx)
+	if err != nil {
+		t.Fatalf("StartPoller(): %v", err)
+	}
+	select {
+	case <-run.Ready():
+	case <-time.After(2 * time.Second):
+		t.Fatal("poller did not become ready after retried account probe")
+	}
+	if got := probeCalls.Load(); got != 2 {
+		t.Fatalf("account probe calls = %d, want 2 (one empty, one success)", got)
+	}
+	status := bridge.Status()
+	if !status.Connected || status.NeedsReauth || status.LastError != "" {
+		t.Fatalf("post-retry status = %+v, want connected without reauth", status)
+	}
+	cancel()
+	select {
+	case <-run.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("poller did not exit after cancel")
+	}
+}
+
+func TestStartPollerEmptyProbeWithStoredAccountStaysTransientUntilStreakParks(t *testing.T) {
+	shrinkAccountProbeRetryDelays(t)
+	configDir := t.TempDir()
+	writeSignalAccountsFixture(t, configDir, "+15551230000")
+	bridge := &Bridge{
+		account:   "+15551230000",
+		configDir: configDir,
+		logger:    zerolog.Nop(),
+	}
+	installSignalGateStubs(t, bridge,
+		func(context.Context) ([]byte, error) {
+			return []byte("signal-cli 0.14.5\n"), nil
+		},
+		func(_ context.Context, _ string, args ...string) ([]byte, error) {
+			return []byte("[]"), nil
+		},
+	)
+
+	runGeneration := func(generation int) PollerExit {
+		t.Helper()
+		run, err := bridge.StartPoller(context.Background())
+		if err != nil {
+			t.Fatalf("generation %d StartPoller(): %v", generation, err)
+		}
+		select {
+		case exit := <-run.Done():
+			return exit
+		case <-time.After(2 * time.Second):
+			t.Fatalf("generation %d did not exit", generation)
+			return PollerExit{}
+		}
+	}
+
+	for generation := 1; generation < accountUnreadableStreakLimit; generation++ {
+		exit := runGeneration(generation)
+		if exit.Kind != PollerFailureTransient || exit.Fingerprint != SignalAccountProbeEmptyFingerprint {
+			t.Fatalf(
+				"generation %d exit = %+v, want transient/%s",
+				generation, exit, SignalAccountProbeEmptyFingerprint,
+			)
+		}
+		if status := bridge.Status(); status.NeedsReauth {
+			t.Fatalf("generation %d parked reauth early: %+v", generation, status)
+		}
+	}
+	exit := runGeneration(accountUnreadableStreakLimit)
+	if exit.Kind != PollerFailureReauth || exit.Fingerprint != SignalAccountUnreadableFingerprint {
+		t.Fatalf("streak-limit exit = %+v, want reauth/%s", exit, SignalAccountUnreadableFingerprint)
+	}
+	if status := bridge.Status(); !status.NeedsReauth || !status.Paired || status.Connected {
+		t.Fatalf("streak-limit status = %+v, want parked reauth on a still-paired account", status)
+	}
+}
+
+func TestStartPollerEmptyProbeStreakResetsAfterSuccessfulProbe(t *testing.T) {
+	shrinkAccountProbeRetryDelays(t)
+	configDir := t.TempDir()
+	writeSignalAccountsFixture(t, configDir, "+15551230000")
+	bridge := &Bridge{
+		account:   "+15551230000",
+		configDir: configDir,
+		logger:    zerolog.Nop(),
+	}
+	var probeHealthy atomic.Bool
+	installSignalGateStubs(t, bridge,
+		func(context.Context) ([]byte, error) {
+			return []byte("signal-cli 0.14.5\n"), nil
+		},
+		func(ctx context.Context, _ string, args ...string) ([]byte, error) {
+			switch {
+			case hasSignalCLIArg(args, "listAccounts"):
+				if probeHealthy.Load() {
+					return []byte(`[{"number":"+15551230000"}]`), nil
+				}
+				return []byte("[]"), nil
+			case hasSignalCLIArg(args, "receive"):
+				<-ctx.Done()
+				return nil, ctx.Err()
+			default:
+				return []byte("[]"), nil
+			}
+		},
+	)
+
+	runEmptyGeneration := func(label string) PollerExit {
+		t.Helper()
+		run, err := bridge.StartPoller(context.Background())
+		if err != nil {
+			t.Fatalf("%s StartPoller(): %v", label, err)
+		}
+		select {
+		case exit := <-run.Done():
+			return exit
+		case <-time.After(2 * time.Second):
+			t.Fatalf("%s generation did not exit", label)
+			return PollerExit{}
+		}
+	}
+
+	if exit := runEmptyGeneration("first empty"); exit.Kind != PollerFailureTransient {
+		t.Fatalf("first empty exit = %+v, want transient", exit)
+	}
+
+	probeHealthy.Store(true)
+	ctx, cancel := context.WithCancel(context.Background())
+	run, err := bridge.StartPoller(ctx)
+	if err != nil {
+		cancel()
+		t.Fatalf("healthy StartPoller(): %v", err)
+	}
+	select {
+	case <-run.Ready():
+	case <-time.After(2 * time.Second):
+		cancel()
+		t.Fatal("healthy generation did not become ready")
+	}
+	cancel()
+	select {
+	case <-run.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("healthy generation did not exit after cancel")
+	}
+
+	// The successful probe reset the streak: the same number of empty
+	// generations that would previously have parked must stay transient.
+	probeHealthy.Store(false)
+	for generation := 1; generation < accountUnreadableStreakLimit; generation++ {
+		exit := runEmptyGeneration("post-reset empty")
+		if exit.Kind != PollerFailureTransient || exit.Fingerprint != SignalAccountProbeEmptyFingerprint {
+			t.Fatalf(
+				"post-reset generation %d exit = %+v, want transient/%s",
+				generation, exit, SignalAccountProbeEmptyFingerprint,
+			)
+		}
+	}
+	if status := bridge.Status(); status.NeedsReauth {
+		t.Fatalf("post-reset status = %+v, want no reauth park before a fresh streak completes", status)
+	}
+}
+
+func TestReceiveAccountInvalidGlitchDoesNotParkReauth(t *testing.T) {
+	bridge := &Bridge{
+		account:   "+15551230000",
+		configDir: t.TempDir(),
+		logger:    zerolog.Nop(),
+	}
+	var receiveCalls atomic.Int32
+	recoveredReceiveSeen := make(chan struct{})
+	var recoveredOnce sync.Once
+	installSignalGateStubs(t, bridge,
+		func(context.Context) ([]byte, error) {
+			return []byte("signal-cli 0.14.5\n"), nil
+		},
+		func(_ context.Context, _ string, args ...string) ([]byte, error) {
+			switch {
+			case hasSignalCLIArg(args, "listAccounts"):
+				return []byte(`[{"number":"+15551230000"}]`), nil
+			case hasSignalCLIArg(args, "receive"):
+				if receiveCalls.Add(1) == 1 {
+					// One glitched invocation reports the account invalid.
+					return []byte("User +15551230000 is not registered."), errors.New("exit status 1")
+				}
+				recoveredOnce.Do(func() { close(recoveredReceiveSeen) })
+				return nil, context.DeadlineExceeded
+			default:
+				return []byte("[]"), nil
+			}
+		},
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	run, err := bridge.StartPoller(ctx)
+	if err != nil {
+		t.Fatalf("StartPoller(): %v", err)
+	}
+	select {
+	case <-recoveredReceiveSeen:
+	case <-time.After(3 * time.Second):
+		t.Fatal("receive did not continue past a single account-invalid glitch")
+	}
+	status := bridge.Status()
+	if !status.Connected || status.NeedsReauth {
+		t.Fatalf("post-glitch status = %+v, want still connected without reauth", status)
+	}
+	cancel()
+	select {
+	case exit := <-run.Done():
+		if exit.Kind != "" || !errors.Is(exit.Err, context.Canceled) {
+			t.Fatalf("post-glitch exit = %+v, want plain cancellation", exit)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("poller did not exit after cancel")
+	}
+}
+
+func TestReceiveAccountInvalidConsecutiveFailuresParkReauth(t *testing.T) {
+	bridge := &Bridge{
+		account:   "+15551230000",
+		configDir: t.TempDir(),
+		logger:    zerolog.Nop(),
+	}
+	var receiveCalls atomic.Int32
+	installSignalGateStubs(t, bridge,
+		func(context.Context) ([]byte, error) {
+			return []byte("signal-cli 0.14.5\n"), nil
+		},
+		func(_ context.Context, _ string, args ...string) ([]byte, error) {
+			switch {
+			case hasSignalCLIArg(args, "listAccounts"):
+				return []byte(`[{"number":"+15551230000"}]`), nil
+			case hasSignalCLIArg(args, "receive"):
+				receiveCalls.Add(1)
+				return []byte("User +15551230000 is not registered."), errors.New("exit status 1")
+			default:
+				return []byte("[]"), nil
+			}
+		},
+	)
+
+	run, err := bridge.StartPoller(context.Background())
+	if err != nil {
+		t.Fatalf("StartPoller(): %v", err)
+	}
+	select {
+	case exit := <-run.Done():
+		if exit.Kind != PollerFailureReauth ||
+			exit.Operation != "receive" ||
+			exit.Fingerprint != SignalAccountInvalidFingerprint {
+			t.Fatalf("consecutive account-invalid exit = %+v, want reauth/%s", exit, SignalAccountInvalidFingerprint)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("consecutive account-invalid receive did not park")
+	}
+	if got := receiveCalls.Load(); got != receiveAccountInvalidLimit {
+		t.Fatalf("receive attempts before park = %d, want %d", got, receiveAccountInvalidLimit)
+	}
+	if status := bridge.Status(); !status.NeedsReauth || status.Connected {
+		t.Fatalf("consecutive account-invalid status = %+v, want parked reauth", status)
 	}
 }
 
