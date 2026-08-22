@@ -8,7 +8,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/rs/zerolog"
+
 	"github.com/maxghenis/openmessage/internal/bridge"
+	"github.com/maxghenis/openmessage/internal/signallive"
 )
 
 func TestSignalSupervisorControlConnectStartsOnceAndActiveDuplicateIsNoop(t *testing.T) {
@@ -104,6 +107,51 @@ func TestSignalSupervisorControlBlockedCommandsRetryAndAcceptChangedInputs(t *te
 	control.mu.Unlock()
 	if gotFingerprint != "signal-input-v2" {
 		t.Fatalf("remembered input fingerprint = %q, want %q", gotFingerprint, "signal-input-v2")
+	}
+}
+
+func TestSignalSupervisorControlParkRetestRetriesOnlyUnreadablePark(t *testing.T) {
+	lifecycle := &signalControlTestLifecycle{}
+	supervisor := newSignalControlTestSupervisor(t, lifecycle)
+	control := newSignalSupervisorControl(supervisor, nil, func() string { return "signal-input-v1" })
+	t.Cleanup(func() { stopSignalControlForTest(t, control) })
+	control.StartParkRetest(20*time.Millisecond, zerolog.Nop())
+
+	if err := control.Connect(); err != nil {
+		t.Fatalf("initial Connect() error = %v", err)
+	}
+	awaitSignalSupervisorGenerationState(t, supervisor, bridge.StateOnline, 1)
+
+	// A park whose only evidence was local (signal-cli unable to read an
+	// account that accounts.json still lists) must heal on the paced retest
+	// without any manual /api/signal/connect.
+	lifecycle.Run(0).Fail(bridge.OpError{
+		Class:       bridge.FailureReauthRequired,
+		Operation:   "probe_account",
+		Fingerprint: signallive.SignalAccountUnreadableFingerprint,
+		Cause:       errors.New("signal-cli cannot read the linked Signal account"),
+	})
+	awaitSignalSupervisorGenerationState(t, supervisor, bridge.StateOnline, 2)
+	if got := lifecycle.StartCount(); got != 2 {
+		t.Fatalf("lifecycle starts after unreadable-park retest = %d, want 2", got)
+	}
+
+	// A server-backed reauth park stays user-owned: no retest tick may retry
+	// it, no matter how many elapse.
+	lifecycle.Run(1).Fail(bridge.OpError{
+		Class:       bridge.FailureReauthRequired,
+		Operation:   "receive",
+		Fingerprint: signallive.SignalAccountInvalidFingerprint,
+		Cause:       errors.New("account is not registered"),
+	})
+	awaitSignalSupervisorGenerationState(t, supervisor, bridge.StateBlocked, 2)
+	time.Sleep(200 * time.Millisecond)
+	snapshot := awaitSignalSupervisorGenerationState(t, supervisor, bridge.StateBlocked, 2)
+	if snapshot.ErrorFingerprint != signallive.SignalAccountInvalidFingerprint {
+		t.Fatalf("blocked fingerprint = %q, want %q", snapshot.ErrorFingerprint, signallive.SignalAccountInvalidFingerprint)
+	}
+	if got := lifecycle.StartCount(); got != 2 {
+		t.Fatalf("lifecycle starts after genuine reauth park = %d, want 2 (no automatic retry)", got)
 	}
 }
 
