@@ -382,12 +382,31 @@ hardened the UI to ignore redundant status pushes.)
 ### Signal `needs_reauth` — read the fingerprint before believing the park
 
 `needs_reauth: true` is the bridge's **interpretation** of a signal-cli error,
-not server truth. Three live episodes (2026-07-20, 2026-07-24, 2026-08-06)
-parked a **valid** link for 12–22h because one boot-time `listAccounts` came up
-empty (signal-cli racing its own account bootstrap logs
-`Ignoring <number>: User is not registered.` and exits 0) and the bridge
-latched a permanent park; a single `POST /api/signal/connect` reconnected in
-~5s each time. The bridge now classifies with corroboration instead:
+not necessarily server truth. Three live episodes (2026-07-20, 2026-07-24,
+2026-08-06) parked a **valid** link for 12–22h because one boot-time
+`listAccounts` came up empty and the bridge latched a permanent park; a single
+`POST /api/signal/connect` reconnected in ~5s each time.
+
+**Why an empty `listAccounts` is ambiguous** (mechanism verified live
+2026-08-23 on signal-cli 0.14.5 with `--verbose --verbose`): `listAccounts` is
+not a pure local read. signal-cli loads every account in `accounts.json`, and
+the load runs its own account check (`AccountHelper.checkAccountState`) — a
+**server round-trip** while the stored account is marked registered. Any
+failure there makes signal-cli print one `WARN … Ignoring <number>: …` /
+`Failed to load <number>: …` line and report **zero accounts with exit 0**:
+
+- **Transient check failure** (network not up at login-time autostart, server
+  hiccup): the account file keeps `"registered": true`, so the next probe can
+  succeed — this is the false-park shape the episodes above match.
+- **Genuine deregistration**: the server answers the check with
+  `DeviceDeregisteredException: device was deregistered` → `[403]
+  Authorization failed! (AccountCheckException)`, and signal-cli **persists
+  `"registered": false`** into `data/<account>`. From then on every load
+  throws `NotRegisteredException` *before* any network call — the park is
+  real and only a re-link fixes it (observed live 2026-08-23; flipping the
+  flag back to true just reproduced the 403 and re-persisted false).
+
+The bridge classifies with corroboration instead of trusting one probe:
 
 - The receive-start probe **retries in-generation** (3 attempts, paced),
   then checks `data/accounts.json`. Probe empty but accounts.json still lists
@@ -395,22 +414,43 @@ latched a permanent park; a single `POST /api/signal/connect` reconnected in
   supervisor backoff — no park, no `needs_reauth`.
 - Only 3 **consecutive generations** of that disagreement park, under
   `signal_account_unreadable` — and that park **self-retests every 15 min**
-  (one local `RetryBlocked`; log line "Signal reauth park retest"), so a
-  lingering false park heals without manual intervention.
-- Server-backed evidence still parks fast and stays parked:
+  (one `RetryBlocked`; log line "Signal reauth park retest"), so a lingering
+  transient park heals without manual intervention. While signal-cli still
+  considers the account registered each retest costs one light server check;
+  after a persisted `"registered": false` the retests fail locally with zero
+  network traffic, so a genuinely deregistered account is never hammered. The
+  streak count in `last_error` grows by one per retest — a large number means
+  the park has been standing for hours, not that anything is thrashing.
+- Server-confirmed evidence still parks fast and stays parked:
   a receive-loop "not registered" / "authorization failed" needs 2
   consecutive confirmations (seconds), then parks under
   `signal_account_invalid` with **no** automatic retest. Probe empty with
   accounts.json **also** empty parks immediately (`signal_account_invalid`).
 
-Debugging a parked Signal: check `/api/status` and the supervisor fingerprint
-before recommending a re-pair. `signal_account_unreadable` → local read
-problem, wait for the retest or `POST /api/signal/connect`; verify contention
-first (`pgrep -fl signal-cli`, `lsof` on the config dir — see the MCP
-fratricide section above). `signal_account_invalid` from `receive` → genuine
-server-side unlink, re-pair is real. **Never unpair to "fix" a park**: unpair
-`os.RemoveAll`s the signal-cli dir including CDN-expired media — permanent
-loss.
+Debugging a parked Signal — check, in order:
+
+1. `/api/status` fingerprint/error. `signal_account_invalid` from `receive` →
+   server-confirmed unlink; re-pair is real.
+2. Contention: `pgrep -fl signal-cli`, `lsof` on the config dir (see the MCP
+   fratricide section above).
+3. The persisted server verdict:
+   `jq .registered "$DATADIR/signal-cli/data/<account-file>"` — **`false`
+   means the server rejected the device** (genuine; only a re-link fixes it);
+   `true` with an `signal_account_unreadable` park means transient check
+   failures — wait for the retest or fire `POST /api/signal/connect`.
+4. To see the verdict live (only while the app's Signal supervisor is parked
+   and no signal-cli process is running):
+   `signal-cli --verbose --verbose --config "$DATADIR/signal-cli" listAccounts`
+   — genuine shows `DeviceDeregisteredException` + `[403] Authorization
+   failed!`; transient shows an IO-flavored "Error while checking account"
+   with `registered` still true afterwards.
+
+**Never unpair to "fix" a park**: unpair `os.RemoveAll`s the signal-cli dir
+including CDN-expired media — permanent loss. Before a *genuine* re-link, back
+up the whole `signal-cli/` dir first and restore the media subdirs
+(`attachments`, `avatars`, `stickers`, `outgoing-attachments`) — not `data/` —
+after the new link (recipe proven 2026-07-20; backups live under
+`<datadir>/app-backups/`).
 
 ## Deploying a new build to a live install
 
