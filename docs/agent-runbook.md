@@ -298,6 +298,31 @@ fall back to the manual re-pair recipe above. The app also posts a **health noti
 (once, on the rising edge) when Google flips to `needs_repair` or WhatsApp
 logs out, so a dead platform can't sit silent for days.
 
+> **⚠️ The self-heal can loop silently forever, and a re-pair may only buy
+> minutes (observed 2026-07-19 on a live macOS install; tracked in
+> [#108](https://github.com/MaxGhenis/openmessage/issues/108), design fix in
+> [#75](https://github.com/MaxGhenis/openmessage/issues/75)).** Two symptoms
+> that look like the happy path but are not:
+> - **`/api/status` stuck at `google.needs_repair:true` + `last_error:
+>   "…session cookie expired; refreshing and reconnecting…"` for minutes.** The
+>   watchdog is *trying* but cannot succeed: if the user's Chrome has **zero
+>   `messages.google.com` cookies** (they've never opened Messages-for-web
+>   there), there is no Messages session cookie to refresh *from*, so the
+>   self-heal spins indefinitely. Check with
+>   `sqlite3 "file:$HOME/Library/Application Support/Google/Chrome/Default/Cookies?mode=ro&immutable=1" "SELECT COUNT(*) FROM cookies WHERE host_key LIKE '%messages.google.com%'"`.
+>   Core `.google.com` auth cookies being valid does **not** rescue this.
+> - **A fresh re-pair connects, then dies in ~3–4 minutes** back to the same
+>   loop. So `google.connected:true` right after a re-pair is **not** proof of
+>   a fix — watch it for **≥5 minutes** before believing it. (`connected:true`
+>   held 160 s twice during that incident and was not durable.) An
+>   *immediately*-dropping re-pair instead (auth-expires within seconds, HMAC
+>   flood) usually means `session.json` was not cleared from **both** dirs
+>   first — see the recipe above.
+>
+> When you hit this, the durable fix is **not** more re-pairs (they don't hold)
+> — it is the Android-companion redesign in #75, or a code fix to the
+> session-refresh lifecycle in `internal/client` / `internal/googlecookies`.
+
 Prereq: the app must be **non-sandboxed** (it is — `OpenMessage.entitlements`
 is hardened-runtime only) so the backend can read Chrome's cookie DB and the
 `Chrome Safe Storage` keychain item. First keychain read may prompt once;
@@ -533,3 +558,40 @@ It sends nothing. Add `whatsapp` or `signal` to the comma-separated
 `LIVE_PLATFORMS` list only when that platform will receive a real frame within
 the test deadline; use `LIVE_GOOGLE_CONV`, `LIVE_WHATSAPP_CONV`, or
 `LIVE_SIGNAL_CONV` to override the expected self-thread remote ID.
+
+## R8 / v2-primary cutover — operator traps (macOS)
+
+The v2 store is selected by a per-install flag, not a code change. `defaults
+write com.openmessage.app V2Primary -bool true` adds `OPENMESSAGES_V2_PRIMARY=1`
+to the backend launch env (the Swift wrapper's env is a fixed map, so
+`launchctl setenv` can't reach it); deleting the key rolls back on next launch
+(the legacy source store is never modified). The following cost real time on a
+live cutover (2026-07-18) and are not obvious:
+
+- **A stale sandbox container hijacks `defaults`.** If an *older* sandboxed
+  build ever ran, `~/Library/Containers/com.openmessage.app/` exists and the
+  `defaults` CLI reads/writes **there**, while the current (non-sandboxed) app
+  reads `~/Library/Preferences/com.openmessage.app.plist`. So `defaults write …
+  V2Primary` "succeeds" but the app never sees it. Set the key through the real
+  domain instead — `CFPreferencesSetAppValue("V2Primary", kCFBooleanTrue,
+  "com.openmessage.app")` + `CFPreferencesAppSynchronize(...)` — and verify with
+  `CFPreferencesCopyAppValue` **and** by dumping the running backend's env
+  (`ps eww <backend-pid> | tr ' ' '\n' | grep V2_PRIMARY`). Don't trust
+  `defaults read`.
+- **`killall cfprefsd` can discard an unflushed write.** After setting the key,
+  let it flush; relaunch the app rather than restarting the prefs daemon
+  underneath it.
+- **`macos/build.sh` picks the Swift product with `find .build -name
+  OpenMessage` (first match).** With stale caches this is nondeterministic and
+  can bundle an old binary. Clean-build (`rm -rf macos/OpenMessage/.build
+  macos/build`) before deploying a cutover build.
+- **Short Swift string literals are inline-encoded and invisible to `strings`.**
+  A 9-byte constant like `V2Primary` won't show up in a `strings`/byte-scan of
+  the binary even when it's compiled in. To confirm a build actually contains
+  the lever, grep for a longer marker such as the env var name
+  (`OPENMESSAGES_V2_PRIMARY`, ≥16 bytes), which is stored as a normal C string.
+
+To confirm the flip took: `GET http://127.0.0.1:<port>/api/status` reports
+`v2_primary:true` / `v2_send:true` / `v2_ingest.enabled:true`, and the running
+backend env contains `OPENMESSAGES_V2_PRIMARY=1`. Rollback is `defaults delete`
+(via the same real domain) or removing the key, then relaunch.
