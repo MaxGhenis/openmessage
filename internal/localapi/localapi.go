@@ -325,6 +325,33 @@ type LegacySendResult struct {
 	Success   bool   `json:"success"`
 }
 
+// NewConversationResult is the daemon's /api/new-conversation response.
+type NewConversationResult struct {
+	ConversationID string `json:"conversation_id"`
+	Name           string `json:"name"`
+}
+
+// NewConversation asks the daemon to create-or-resolve a 1:1 conversation for
+// phoneNumber on the given platform. For SMS the daemon delegates to Google
+// Messages' GetOrCreateConversation on its live libgm client — the
+// transportless MCP process must never open its own libgm client, so this hop
+// is the only safe way to initiate a brand-new SMS thread from a client
+// process.
+func (c *Client) NewConversation(ctx context.Context, phoneNumber, platform string) (NewConversationResult, error) {
+	payload := struct {
+		PhoneNumber string `json:"phone_number"`
+		Platform    string `json:"platform"`
+	}{phoneNumber, platform}
+	var result NewConversationResult
+	if err := c.postJSON(ctx, "/api/new-conversation", payload, &result); err != nil {
+		return NewConversationResult{}, err
+	}
+	if strings.TrimSpace(result.ConversationID) == "" {
+		return NewConversationResult{}, fmt.Errorf("new-conversation response omitted conversation_id")
+	}
+	return result, nil
+}
+
 // LegacySendText routes a text send through the daemon's legacy /api/send
 // surface. Only valid against daemons running with v2 send disabled; a
 // v2-primary daemon rejects this route deterministically.
