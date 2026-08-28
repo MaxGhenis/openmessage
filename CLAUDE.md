@@ -12,7 +12,7 @@ Local-first universal message database with built-in MCP server. Ingests message
 │   ├── db/           SQLite store (conversations, messages, contacts, unified_contacts, drafts)
 │   ├── importer/     Multi-platform import adapters (gchat, imessage, whatsapp)
 │   ├── story/        Stats computation + narrative story generation
-│   ├── tools/        MCP tools (24 tools)
+│   ├── tools/        MCP tools (26 tools)
 │   ├── viz/          Relationship visualization renderer (self-contained HTML)
 │   └── web/          HTTP API + embedded React UI
 ├── macos/            Swift macOS app wrapper
@@ -91,7 +91,7 @@ mode this prevents and the `~/.mcp.json` recipe.
 
 ### MCP tools
 
-24 tools registered (see internal/tools/tools.go Register for the authoritative list):
+26 tools registered (see internal/tools/tools.go Register for the authoritative list):
 - `get_messages`, `get_conversation`, `search_messages` — cross-platform by default
 - `list_conversations` — optional `source_platform` filter (sms, gchat, imessage, whatsapp)
 - `get_person_messages` — all messages with a person across all platforms
@@ -104,6 +104,7 @@ mode this prevents and the `~/.mcp.json` recipe.
 - `generate_viz` — self-contained HTML visualization combining data dashboards + narrative (see below)
 - `render_story` — render a pre-built Story JSON into HTML viz; supports `photo_paths` (curated list) or `photos_dir`
 - `send_message`, `draft_message`, `download_media`, `list_contacts`, `get_status`
+- `start_google_pairing` / `complete_google_pairing` — Google Account (Gaia) pairing from browser cookies, for headless installs where the QR flow's interactive terminal is unavailable. Gaia pairing blocks until the user taps a confirmation emoji on their phone, so it is split in two: `start_google_pairing` returns the emoji plus an opaque `pairing_handle` immediately (the emoji has to be shown *before* anyone waits), and `complete_google_pairing` takes that handle and waits for the tap. Handles are single-use and live in a server-side registry with a 10 minute TTL, because libgm's `PairingSession` holds a client-bound private key and cannot round-trip through the caller.
 
 ### HTTP API
 
