@@ -798,10 +798,8 @@ func importSyntheticV2Message(v2Store *sqlite.Store, legacy *db.Store, msg *db.M
 	return conversationID, messageID, nil
 }
 
-// withSyntheticReadReceipts adapts the receipt fixture to the v2-primary read
-// seam. V2 receipt ingest persists a read cursor, while the legacy DTO exposed
-// to the current UI still carries per-message Status; keep that compatibility
-// projection test-local instead of writing the legacy message store only.
+// withSyntheticReadReceipts preserves fixture-only outgoing delivery status.
+// The durable v2 cursor models thread read state, not remote per-message status.
 func withSyntheticReadReceipts(next http.Handler, receipts *sync.Map) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet || !strings.Contains(r.URL.Path, "/messages") {

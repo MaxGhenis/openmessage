@@ -21,6 +21,8 @@ import (
 	"github.com/maxghenis/openmessage/internal/messaging"
 	"github.com/maxghenis/openmessage/internal/storage/blob"
 	"github.com/maxghenis/openmessage/internal/storage/sqlite"
+	"github.com/maxghenis/openmessage/internal/v2keys"
+	"github.com/maxghenis/openmessage/internal/v2read"
 	"github.com/maxghenis/openmessage/internal/v2wire"
 )
 
@@ -369,6 +371,82 @@ func TestMarkReadBestEffortWritesV2Cursor(t *testing.T) {
 	}
 	if cursor.LastReadAtMS <= 0 || cursor.UpdatedAtMS <= 0 {
 		t.Fatalf("cursor timestamps = %+v, want positive", cursor)
+	}
+}
+
+func TestMarkReadClearsV2PrimaryUnreadCount(t *testing.T) {
+	v2Store, err := sqlite.Open(filepath.Join(t.TempDir(), "v2.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = v2Store.Close() })
+	nowMS := time.Now().UnixMilli()
+	accountID := "google-primary"
+	legacyConversationID := "google-unread-thread"
+	v2ConversationID := v2keys.DeriveID("conversation", accountID, legacyConversationID)
+	if err := v2Store.UpsertAccount(sqlite.Account{
+		AccountID: accountID, BridgeKey: "google_messages", DisplayName: "Google",
+		Mode: sqlite.AccountModeLive, Enabled: true, ConfigJSON: `{}`,
+		CreatedAtMS: nowMS, UpdatedAtMS: nowMS,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := v2Store.UpsertDevice(sqlite.Device{
+		DeviceID: "migrated-current-device", AccountID: accountID,
+		Kind: sqlite.DeviceKindLocalInstallation, State: sqlite.DeviceStateActive, IsCurrent: true,
+		CreatedAtMS: nowMS, UpdatedAtMS: nowMS,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := v2Store.UpsertConversation(sqlite.Conversation{
+		ConversationID: v2ConversationID, AccountID: accountID,
+		RemoteConversationID: legacyConversationID, Kind: sqlite.ConversationKindDirect,
+		Title: "Unread", NotificationMode: sqlite.NotificationModeAll,
+		LastMessageAtMS: nowMS - 100, MetadataJSON: `{}`,
+		CreatedAtMS: nowMS, UpdatedAtMS: nowMS,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	messages, err := sqlite.NewMessageRepository(v2Store, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := messages.ImportMessage(context.Background(), sqlite.MessageProjection{Message: sqlite.Message{
+		MessageID: "incoming-unread", ConversationID: v2ConversationID, AccountID: accountID,
+		RemoteMessageID: "remote-unread", Direction: sqlite.MessageDirectionIncoming,
+		Body: "unread", State: sqlite.MessageStateActive, OccurredAtMS: nowMS - 100,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := v2Store.UpsertReadCursor(sqlite.ReadCursor{
+		AccountID: accountID, DeviceID: "migrated-current-device",
+		ConversationID: v2ConversationID, LastReadAtMS: nowMS - 200, UpdatedAtMS: nowMS,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	ts := newV1RecorderHarness(t, APIOptions{V2: &V2Options{V2Store: v2Store}})
+	if err := ts.store.UpsertConversation(&db.Conversation{
+		ConversationID: legacyConversationID, Name: "Unread", SourcePlatform: "sms", UnreadCount: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	reads := v2read.New(v2Store)
+	before, err := reads.GetConversation(v2ConversationID)
+	if err != nil || before.UnreadCount != 1 {
+		t.Fatalf("v2 primary before mark-read = (%+v, %v), want unread 1", before, err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/api/mark-read", bytes.NewBufferString(`{"conversation_id":"google-unread-thread"}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp := ts.do(t, req)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("mark-read status = %d, want 200; body=%s", resp.StatusCode, raw)
+	}
+	after, err := reads.GetConversation(v2ConversationID)
+	if err != nil || after.UnreadCount != 0 {
+		t.Fatalf("v2 primary after mark-read = (%+v, %v), want unread 0", after, err)
 	}
 }
 

@@ -11,6 +11,7 @@ import (
 
 	"github.com/maxghenis/openmessage/internal/db"
 	"github.com/maxghenis/openmessage/internal/storage/sqlite"
+	"github.com/maxghenis/openmessage/internal/v2keys"
 )
 
 const (
@@ -259,14 +260,45 @@ func MirrorReadCursor(
 	if atMS <= 0 {
 		return errors.New("mirror read cursor: timestamp must be positive")
 	}
-	accountID, conversationID, err := MirrorConversation(legacy, v2, legacyConversationID)
+	accountID, err := AccountForConversation(legacy, legacyConversationID)
 	if err != nil {
 		return err
 	}
+	platform := strings.TrimSuffix(accountBridgeKey(accountID), "_messages")
+	remoteID := v2keys.NormalizeRemoteConversationID(platform, legacyConversationID)
+	conversation, err := v2.GetConversationByRemote(accountID, remoteID)
+	if errors.Is(err, sqlite.ErrNotFound) {
+		var conversationID string
+		accountID, conversationID, err = MirrorConversation(legacy, v2, legacyConversationID)
+		if err != nil {
+			return err
+		}
+		conversation, err = v2.GetConversation(conversationID)
+	}
+	if err != nil {
+		return fmt.Errorf("load v2 read conversation %q: %w", legacyConversationID, err)
+	}
+	deviceID := ""
+	devices, err := v2.ListDevices(accountID)
+	if err != nil {
+		return fmt.Errorf("list local devices for account %q: %w", accountID, err)
+	}
+	for _, device := range devices {
+		if device.Kind == sqlite.DeviceKindLocalInstallation && device.IsCurrent {
+			deviceID = device.DeviceID
+			break
+		}
+	}
+	if deviceID == "" {
+		if err := ensureLocalDevice(v2, accountID, atMS); err != nil {
+			return err
+		}
+		deviceID = localDeviceID(accountID)
+	}
 	if err := v2.UpsertReadCursor(sqlite.ReadCursor{
 		AccountID:         accountID,
-		DeviceID:          localDeviceID(accountID),
-		ConversationID:    conversationID,
+		DeviceID:          deviceID,
+		ConversationID:    conversation.ConversationID,
 		LastReadMessageID: nil,
 		LastReadAtMS:      atMS,
 		UpdatedAtMS:       atMS,

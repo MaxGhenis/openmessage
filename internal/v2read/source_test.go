@@ -24,6 +24,7 @@ var _ readsource.ReadSource = (*Source)(nil)
 
 func TestSourceMapsConversationAndMessagesToLegacyDTOs(t *testing.T) {
 	store, messages, source := openSourceTestStore(t)
+	archivedAtMS := sourceTestTimeMS
 	seedSourceAccount(t, store, "google-account", "google_messages")
 	seedSourceConversation(t, store, sqlite.Conversation{
 		ConversationID:       "conversation-google",
@@ -33,6 +34,7 @@ func TestSourceMapsConversationAndMessagesToLegacyDTOs(t *testing.T) {
 		Title:                "Byte-exact group",
 		NotificationMode:     sqlite.NotificationModeMuted,
 		IsFavorite:           true,
+		ArchivedAtMS:         &archivedAtMS,
 		LastMessageAtMS:      300,
 	})
 	identity := sqlite.Identity{
@@ -136,8 +138,8 @@ func TestSourceMapsConversationAndMessagesToLegacyDTOs(t *testing.T) {
 		conversation.SourcePlatform != "sms" ||
 		!conversation.IsFavorite ||
 		conversation.NotificationMode != "muted" ||
-		conversation.UnreadCount != 0 ||
-		conversation.Tab != "" {
+		conversation.UnreadCount != 1 ||
+		conversation.Tab != db.TabArchive {
 		t.Fatalf("mapped conversation = %+v", conversation)
 	}
 	if _, err := source.GetConversation("missing"); !errors.Is(err, sql.ErrNoRows) {
@@ -189,6 +191,64 @@ func TestSourceMapsConversationAndMessagesToLegacyDTOs(t *testing.T) {
 		gotIncoming.Status != "" ||
 		gotIncoming.Reactions != `[{"emoji":"👍","count":1,"actors":["+15550000001"]},{"emoji":"❤️","count":1,"actors":["me"]}]` {
 		t.Fatalf("mapped incoming = %+v", gotIncoming)
+	}
+	for _, message := range gotMessages {
+		if message.SourcePlatform != conversation.SourcePlatform {
+			t.Fatalf("conversation source_platform = %q, message %q source_platform = %q; want identical labels", conversation.SourcePlatform, message.MessageID, message.SourcePlatform)
+		}
+	}
+}
+
+func TestSourceDerivesUnreadFromCurrentDeviceCursor(t *testing.T) {
+	store, messages, source := openSourceTestStore(t)
+	seedSourceAccount(t, store, "google-account", "google_messages")
+	seedSourceConversation(t, store, sqlite.Conversation{
+		ConversationID: "conversation-unread", AccountID: "google-account",
+		RemoteConversationID: "remote-unread", Kind: sqlite.ConversationKindDirect,
+		Title: "Unread", NotificationMode: sqlite.NotificationModeAll, LastMessageAtMS: 350,
+	})
+	if err := store.UpsertDevice(sqlite.Device{
+		DeviceID: "current-device", AccountID: "google-account",
+		Kind: sqlite.DeviceKindLocalInstallation, State: sqlite.DeviceStateActive,
+		IsCurrent: true, CreatedAtMS: sourceTestTimeMS, UpdatedAtMS: sourceTestTimeMS,
+	}); err != nil {
+		t.Fatalf("UpsertDevice(): %v", err)
+	}
+	for _, message := range []sqlite.Message{
+		{MessageID: "incoming-read", RemoteMessageID: "remote-read", Direction: sqlite.MessageDirectionIncoming, OccurredAtMS: 100},
+		{MessageID: "incoming-unread", RemoteMessageID: "remote-unread", Direction: sqlite.MessageDirectionIncoming, OccurredAtMS: 300},
+		{MessageID: "outgoing-newer", RemoteMessageID: "remote-outgoing", Direction: sqlite.MessageDirectionOutgoing, OccurredAtMS: 350},
+	} {
+		message.ConversationID = "conversation-unread"
+		message.AccountID = "google-account"
+		message.State = sqlite.MessageStateActive
+		importSourceMessage(t, messages, message)
+	}
+	if err := store.UpsertReadCursor(sqlite.ReadCursor{
+		AccountID: "google-account", DeviceID: "current-device",
+		ConversationID: "conversation-unread", LastReadAtMS: 200, UpdatedAtMS: sourceTestTimeMS,
+	}); err != nil {
+		t.Fatalf("UpsertReadCursor(200): %v", err)
+	}
+	conversation, err := source.GetConversation("conversation-unread")
+	if err != nil {
+		t.Fatalf("GetConversation(before mark read): %v", err)
+	}
+	if conversation.UnreadCount != 1 {
+		t.Fatalf("UnreadCount before mark read = %d, want 1", conversation.UnreadCount)
+	}
+	if err := store.UpsertReadCursor(sqlite.ReadCursor{
+		AccountID: "google-account", DeviceID: "current-device",
+		ConversationID: "conversation-unread", LastReadAtMS: 400, UpdatedAtMS: sourceTestTimeMS + 1,
+	}); err != nil {
+		t.Fatalf("UpsertReadCursor(400): %v", err)
+	}
+	conversation, err = source.GetConversation("conversation-unread")
+	if err != nil {
+		t.Fatalf("GetConversation(after mark read): %v", err)
+	}
+	if conversation.UnreadCount != 0 {
+		t.Fatalf("UnreadCount after mark read = %d, want 0", conversation.UnreadCount)
 	}
 }
 
@@ -401,13 +461,13 @@ func TestSourceStatsCountsLatestAndPreviewsPageAllMessages(t *testing.T) {
 		MIME:      "video/mp4",
 	})
 
-	wantSMSMessages := sourceMessagePageSize + 1
+	wantGoogleMessages := sourceMessagePageSize + 1
 	for _, test := range []struct {
 		platform string
 		want     int
 	}{
-		{platform: "", want: wantSMSMessages + 1},
-		{platform: "sms", want: wantSMSMessages},
+		{platform: "", want: wantGoogleMessages + 1},
+		{platform: "sms", want: wantGoogleMessages},
 		{platform: "whatsapp", want: 1},
 		{platform: "signal", want: 0},
 	} {
@@ -436,12 +496,12 @@ func TestSourceStatsCountsLatestAndPreviewsPageAllMessages(t *testing.T) {
 			t.Fatalf("ConversationCount(%q) = %d, want %d", test.platform, got, test.want)
 		}
 	}
-	latestSMS, err := source.LatestTimestamp("sms")
+	latestGoogle, err := source.LatestTimestamp("sms")
 	if err != nil {
 		t.Fatalf("LatestTimestamp(sms): %v", err)
 	}
-	if latestSMS != int64(sourceMessagePageSize+1) {
-		t.Fatalf("LatestTimestamp(sms) = %d, want %d", latestSMS, sourceMessagePageSize+1)
+	if latestGoogle != int64(sourceMessagePageSize+1) {
+		t.Fatalf("LatestTimestamp(sms) = %d, want %d", latestGoogle, sourceMessagePageSize+1)
 	}
 	latestMissing, err := source.LatestTimestamp("signal")
 	if err != nil {
@@ -459,7 +519,7 @@ func TestSourceStatsCountsLatestAndPreviewsPageAllMessages(t *testing.T) {
 		{Platform: "whatsapp", Count: 1, LatestMS: 2_000, LatestRecvMS: 2_000},
 		{
 			Platform:     "sms",
-			Count:        wantSMSMessages,
+			Count:        wantGoogleMessages,
 			LatestMS:     int64(sourceMessagePageSize + 1),
 			LatestRecvMS: int64(sourceMessagePageSize),
 		},

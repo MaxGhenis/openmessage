@@ -5,7 +5,10 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 )
+
+const unreadConversationQueryBatchSize = 500
 
 // ReadCursor is the latest device-scoped read position for one conversation.
 // LastReadMessageID may be nil for imported cursors that only approximate a
@@ -128,4 +131,77 @@ func (s *Store) GetReadCursor(deviceID, conversationID string) (ReadCursor, erro
 		)
 	}
 	return cursor, nil
+}
+
+// UnreadCountsForConversations derives unread state for a conversation batch
+// from the current local device's cursor. A missing cursor is equivalent to a
+// cursor at zero, so every incoming message in that conversation is unread.
+func (s *Store) UnreadCountsForConversations(
+	ctx context.Context,
+	conversationIDs []string,
+) (map[string]int, error) {
+	result := make(map[string]int)
+	if len(conversationIDs) == 0 {
+		return result, nil
+	}
+
+	unique := make([]string, 0, len(conversationIDs))
+	seen := make(map[string]struct{}, len(conversationIDs))
+	for _, conversationID := range conversationIDs {
+		if _, exists := seen[conversationID]; exists {
+			continue
+		}
+		seen[conversationID] = struct{}{}
+		unique = append(unique, conversationID)
+	}
+	for start := 0; start < len(unique); start += unreadConversationQueryBatchSize {
+		end := min(start+unreadConversationQueryBatchSize, len(unique))
+		batch := unique[start:end]
+		placeholders := strings.TrimSuffix(strings.Repeat("?,", len(batch)), ",")
+		arguments := make([]any, len(batch))
+		for index, conversationID := range batch {
+			arguments[index] = conversationID
+		}
+
+		rows, err := s.db.QueryContext(ctx, `
+			WITH current_cursors AS (
+				SELECT r.conversation_id, MAX(r.last_read_at_ms) AS last_read_at_ms
+				FROM read_cursors AS r
+				JOIN devices AS d
+				  ON d.account_id = r.account_id
+				 AND d.device_id = r.device_id
+				WHERE d.is_current = 1
+				  AND r.conversation_id IN (`+placeholders+`)
+				GROUP BY r.conversation_id
+			)
+			SELECT m.conversation_id, COUNT(*)
+			FROM messages AS m
+			LEFT JOIN current_cursors AS c
+			  ON c.conversation_id = m.conversation_id
+			WHERE m.conversation_id IN (`+placeholders+`)
+			  AND m.direction = 'incoming'
+			  AND m.occurred_at_ms > COALESCE(c.last_read_at_ms, 0)
+			GROUP BY m.conversation_id
+		`, append(arguments, arguments...)...)
+		if err != nil {
+			return nil, fmt.Errorf("list unread counts for conversations: %w", err)
+		}
+		for rows.Next() {
+			var conversationID string
+			var count int
+			if err := rows.Scan(&conversationID, &count); err != nil {
+				_ = rows.Close()
+				return nil, fmt.Errorf("scan unread count for conversations: %w", err)
+			}
+			result[conversationID] = count
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return nil, fmt.Errorf("iterate unread counts for conversations: %w", err)
+		}
+		if err := rows.Close(); err != nil {
+			return nil, fmt.Errorf("close unread counts for conversations: %w", err)
+		}
+	}
+	return result, nil
 }

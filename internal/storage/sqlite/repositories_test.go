@@ -1,11 +1,62 @@
 package sqlite
 
 import (
+	"context"
 	"errors"
 	"path/filepath"
 	"reflect"
 	"testing"
 )
+
+func TestConversationAttributeMutations(t *testing.T) {
+	store := openRepositoryTestStore(t)
+	mustRepositoryWrite(t, "UpsertAccount", store.UpsertAccount(repositoryTestAccount("account-a")))
+	conversation := Conversation{
+		ConversationID: "conversation-a", AccountID: "account-a", RemoteConversationID: "remote-a",
+		Kind: ConversationKindDirect, NotificationMode: NotificationModeAll, MetadataJSON: `{}`,
+		CreatedAtMS: repositoryTestTimeMS, UpdatedAtMS: repositoryTestTimeMS,
+	}
+	mustRepositoryWrite(t, "UpsertConversation", store.UpsertConversation(conversation))
+
+	ctx := context.Background()
+	mustRepositoryWrite(t, "SetConversationNotificationMode", store.SetConversationNotificationMode(ctx, conversation.ConversationID, NotificationModeMentions))
+	afterMode, err := store.GetConversation(conversation.ConversationID)
+	mustRepositoryRead(t, "GetConversation after notification mode", err)
+	if afterMode.NotificationMode != NotificationModeMentions || afterMode.UpdatedAtMS <= conversation.UpdatedAtMS {
+		t.Fatalf("notification mutation = %+v", afterMode)
+	}
+
+	mustRepositoryWrite(t, "SetConversationFavorite", store.SetConversationFavorite(ctx, conversation.ConversationID, true))
+	afterFavorite, err := store.GetConversation(conversation.ConversationID)
+	mustRepositoryRead(t, "GetConversation after favorite", err)
+	if !afterFavorite.IsFavorite || afterFavorite.UpdatedAtMS < afterMode.UpdatedAtMS {
+		t.Fatalf("favorite mutation = %+v", afterFavorite)
+	}
+
+	archivedAt := repositoryTestTimeMS + 100
+	mustRepositoryWrite(t, "SetConversationArchived", store.SetConversationArchived(ctx, conversation.ConversationID, &archivedAt))
+	afterArchive, err := store.GetConversation(conversation.ConversationID)
+	mustRepositoryRead(t, "GetConversation after archive", err)
+	if afterArchive.ArchivedAtMS == nil || *afterArchive.ArchivedAtMS != archivedAt || afterArchive.UpdatedAtMS < afterFavorite.UpdatedAtMS {
+		t.Fatalf("archive mutation = %+v", afterArchive)
+	}
+	mustRepositoryWrite(t, "SetConversationArchived(nil)", store.SetConversationArchived(ctx, conversation.ConversationID, nil))
+	afterUnarchive, err := store.GetConversation(conversation.ConversationID)
+	mustRepositoryRead(t, "GetConversation after unarchive", err)
+	if afterUnarchive.ArchivedAtMS != nil {
+		t.Fatalf("unarchive mutation = %+v", afterUnarchive)
+	}
+
+	assertRepositoryNotFound(t, "SetConversationNotificationMode missing", func() error {
+		return store.SetConversationNotificationMode(ctx, "missing", NotificationModeMuted)
+	})
+	assertRepositoryNotFound(t, "SetConversationFavorite missing", func() error {
+		return store.SetConversationFavorite(ctx, "missing", true)
+	})
+	assertRepositoryNotFound(t, "SetConversationArchived missing", func() error {
+		return store.SetConversationArchived(ctx, "missing", &archivedAt)
+	})
+}
 
 const repositoryTestTimeMS int64 = 1_800_000_000_000
 

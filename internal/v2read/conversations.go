@@ -1,6 +1,7 @@
 package v2read
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -22,9 +23,17 @@ func (s *Source) ListConversations(limit int) ([]*db.Conversation, error) {
 	if err != nil {
 		return nil, fmt.Errorf("list conversations: %w", err)
 	}
+	conversationIDs := make([]string, 0, len(conversations))
+	for _, conversation := range conversations {
+		conversationIDs = append(conversationIDs, conversation.ConversationID)
+	}
+	unreadCounts, err := s.store.UnreadCountsForConversations(context.Background(), conversationIDs)
+	if err != nil {
+		return nil, fmt.Errorf("list conversations: %w", err)
+	}
 	mapped := make([]*db.Conversation, 0, len(conversations))
 	for _, conversation := range conversations {
-		dto, err := s.mapConversation(conversation, accounts)
+		dto, err := s.mapConversation(conversation, accounts, unreadCounts[conversation.ConversationID])
 		if err != nil {
 			return nil, err
 		}
@@ -49,5 +58,9 @@ func (s *Source) GetConversation(id string) (*db.Conversation, error) {
 	if err != nil {
 		return nil, fmt.Errorf("get conversation %q: %w", id, err)
 	}
-	return s.mapConversation(conversation, accounts)
+	unreadCounts, err := s.store.UnreadCountsForConversations(context.Background(), []string{id})
+	if err != nil {
+		return nil, fmt.Errorf("get conversation %q: %w", id, err)
+	}
+	return s.mapConversation(conversation, accounts, unreadCounts[id])
 }
