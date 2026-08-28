@@ -79,10 +79,21 @@ func RegisterWithOptions(s *server.MCPServer, a *app.App, options Options) {
 	} else {
 		s.AddTool(reactToMessageTool(), reactToMessageHandler(a))
 	}
+	switch {
+	case options.Daemon != nil:
+		s.AddTool(listOutboxTool(), daemonListOutboxHandler(options))
+		s.AddTool(cancelOutboxTool(), daemonCancelOutboxHandler(options))
+	case configuredV2 != nil:
+		s.AddTool(listOutboxTool(), v2ListOutboxHandler(configuredV2))
+		s.AddTool(cancelOutboxTool(), v2CancelOutboxHandler(configuredV2))
+	default:
+		s.AddTool(listOutboxTool(), outboxUnavailableHandler())
+		s.AddTool(cancelOutboxTool(), outboxUnavailableHandler())
+	}
 	s.AddTool(setMessageTranscriptTool(), setMessageTranscriptHandler(a))
 	s.AddTool(listConversationsTool(), listConversationsHandler(a, options))
 	s.AddTool(listContactsTool(), listContactsHandler(a))
-	s.AddTool(resolveContactRoutesTool(), resolveContactRoutesHandler(a))
+	s.AddTool(resolveContactRoutesTool(), resolveContactRoutesHandler(a, options))
 	if options.Daemon != nil {
 		s.AddTool(getStatusTool(), daemonGetStatusHandler(a, options))
 	} else {

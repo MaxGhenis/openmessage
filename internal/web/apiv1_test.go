@@ -259,6 +259,7 @@ func TestV1ErrorStatusMapping(t *testing.T) {
 		wantMessage string
 	}{
 		{name: "idempotency conflict", err: messaging.ErrIdempotencyConflict, wantStatus: http.StatusConflict},
+		{name: "near-duplicate blocked", err: &messaging.DuplicateSendError{PriorOutboxID: "outbox-prior", PriorState: messaging.OutboxQueued}, wantStatus: http.StatusConflict},
 		{name: "invalid command", err: messaging.ErrInvalidCommand, wantStatus: http.StatusBadRequest},
 		{name: "invalid state", err: messaging.ErrInvalidState, wantStatus: http.StatusConflict},
 		{name: "platform", err: v2wire.ErrPlatformNotSendable, wantStatus: http.StatusNotImplemented},

@@ -66,6 +66,7 @@ func sendMediaToConversationTool(v2Enabled ...bool) mcp.Tool {
 	if v2Requested(v2Enabled) {
 		options[0] = mcp.WithDescription(description + v2DeliveryDescription)
 		options = append(options, mcp.WithString("idempotency_key", mcp.Description(v2IdempotencyDescription)))
+		options = withSendControlOptions(options, false)
 	}
 	options = append(options,
 		mcp.WithDestructiveHintAnnotation(false),
@@ -228,22 +229,39 @@ func submitV2MediaFile(
 	if err != nil {
 		return errorResult(err.Error())
 	}
+	ttl, err := parseSendTTL(args)
+	if err != nil {
+		return errorResult(err.Error())
+	}
+	wait, err := parseSendWaitOptions(args)
+	if err != nil {
+		return errorResult(err.Error())
+	}
+	conversationID := strArg(args, "conversation_id")
+	platform := v2.sendPlatform(a, conversationID)
+	if failure := checkPlatformSendable(localSendCapability(a, v2), platform); failure != nil {
+		return failure
+	}
 	submission, err := v2.submitMedia(ctx, a, v2wire.MediaInput{
-		ConversationID: strArg(args, "conversation_id"),
+		ConversationID: conversationID,
 		Content:        file,
 		Filename:       filename,
 		MIME:           mimeType,
 		Caption:        caption,
 		ReplyToID:      replyToID,
 		IdempotencyKey: key,
+		TTL:            ttl,
 	})
 	if err != nil {
 		if errors.Is(err, messaging.ErrTooLarge) {
 			return errorResult(fmt.Sprintf("file too large (limit %d MB)", maxMediaUploadBytes>>20))
 		}
+		if errors.Is(err, v2wire.ErrPlatformNotSendable) {
+			return platformUnavailableResult(firstNonEmpty(platform, "the requested platform"), err.Error())
+		}
 		return errorResult(fmt.Sprintf("failed to submit media: %v", err))
 	}
-	return waitForV2Delivery(ctx, v2, submission, key)
+	return waitForV2Delivery(ctx, a, v2, submission, key, platform, conversationID, wait)
 }
 
 func detectMediaMimeType(filename string, data []byte, explicit string) string {

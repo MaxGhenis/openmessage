@@ -32,6 +32,7 @@ import (
 	"github.com/maxghenis/openmessage/internal/media"
 	"github.com/maxghenis/openmessage/internal/messaging"
 	"github.com/maxghenis/openmessage/internal/readsource"
+	"github.com/maxghenis/openmessage/internal/sendcap"
 	"github.com/maxghenis/openmessage/internal/storage/sqlite"
 	"github.com/maxghenis/openmessage/internal/story"
 	"github.com/maxghenis/openmessage/internal/whatsapplive"
@@ -84,11 +85,21 @@ type StatusChecker func() bool
 // UnpairFunc deletes the session and disconnects.
 type UnpairFunc func() error
 
+// SendPlatformCapability reports whether one platform's SEND path is expected
+// to dispatch promptly. It is deliberately distinct from "connected": a
+// paired-but-disconnected transport still receives sends into the durable
+// outbox, where they wait — exactly the condition agents must see before
+// submitting time-sensitive messages. The computation lives in
+// internal/sendcap so the daemon status block and the MCP client's send-time
+// enforcement answer identically.
+type SendPlatformCapability = sendcap.Capability
+
 // APIOptions holds optional callbacks for the API handler.
 type APIOptions struct {
 	Auth                  *ControlAuth
 	V2                    *V2Options
 	V2IngestCounters      func() map[string]ingest.CounterSnapshot
+	SendCapability        func() map[string]SendPlatformCapability
 	Reads                 readsource.ReadSource
 	V2Primary             bool
 	Client                func() *client.Client
@@ -309,6 +320,9 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		}
 		if opts.SignalStatus != nil {
 			payload["signal"] = opts.SignalStatus()
+		}
+		if opts.SendCapability != nil {
+			payload["send"] = opts.SendCapability()
 		}
 		if opts.BackfillStatus != nil {
 			payload["backfill"] = opts.BackfillStatus()

@@ -122,6 +122,53 @@ can migrate the schema under the older one.
 `serve ... --transports` alongside the app: those are daemon shapes and will
 fight the app for the WhatsApp/Signal sessions exactly as described above.
 
+## Send states are transport truth (post 2026-08-05 incident)
+
+On 2026-08-05 a send reported as `{ok:true, settled:true, state:"confirmed"}`
+did not reach the recipient until ~15 hours later, seconds behind a manual
+day-of retry — a double-text. The send surface now reports transport truth
+and gives agents custody of queued sends:
+
+- **`transport_state`** in every durable send result: `queued` (the message
+  has NOT left this machine), `transmitted` (the platform transport accepted
+  it — a remote message ID exists, but that is NOT proof the recipient got
+  it), `delivered` (a delivery/read receipt was observed in the store),
+  `uncertain`, `failed`, `canceled`. `settled` and `transmitted` are true
+  only on transport acknowledgment; `uncertain` is reported as
+  settled:false + uncertain:true. Results carry the `platform` actually used
+  and the `conversation_id` written to.
+- **Send window (TTL).** MCP sends default to a 10-minute window
+  (`ttl_seconds` per call; installation default via
+  `OPENMESSAGES_SEND_TTL_SECONDS`; 0 disables). A send still queued when the
+  window closes is canceled (`expired: true`) instead of transmitting stale.
+  The daemon HTTP API takes `ttl_ms` on the outbox submit routes.
+- **Near-duplicate guard.** A text nearly identical to one submitted to the
+  same conversation within ~10 minutes is refused (HTTP 409 /
+  `near_duplicate_blocked`) naming the prior outbox item; pass `force=true`
+  for a deliberate repeat. Same-key replays (the documented lost-response
+  retry) bypass the guard and hit idempotent dedup instead.
+- **`wait_for_transmit: true`** holds the tool call (bounded by
+  `wait_seconds`, default 25, max 120) through auto-retrying states until
+  the transport acknowledges, so an agent can report truthfully in one call.
+- **`list_outbox` / `cancel_outbox`** show and stop queued sends. Cancel
+  only works before the transport boundary (queued/not_dispatched).
+- **Per-platform send capability** is published at `/api/status` under
+  `send.{sms,whatsapp,signal}` (`available` / `queueable` / `reason`) and
+  rendered by `get_status`. `connected: true` and `v2_send: true` do NOT
+  mean a platform can send — the WhatsApp connection can be up for receiving
+  while sends fail. Hard-down platforms (unpaired, adapter unregistered,
+  auth revoked) are refused at send time with the same reason
+  `resolve_contact_routes` shows; transient disconnects (`queueable`) still
+  queue, truthfully reported and bounded by the TTL.
+- **No silent channel substitution.** The requested platform is a hard
+  contract; `send_to_conversation` accepts a `platform` argument that fails
+  on mismatch instead of sending. A 404 on a send now says the daemon could
+  not resolve the conversation in its serving store (the 2026-08-05
+  WhatsApp shape) rather than a bare "not found".
+
+The old incident guidance — verify in-thread with a fresh timestamp before
+reporting "sent" — still applies verbatim to anything beyond `delivered`.
+
 ## Pairing & the "zombie session"
 
 **Symptom:** sends fail with `OUTGOING_FAILED:UNKNOWN`; `/api/status` shows

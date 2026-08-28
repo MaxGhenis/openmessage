@@ -250,12 +250,17 @@ func TestSendAgainSameKeyAcrossDifferentPredecessorsConflicts(t *testing.T) {
 	service := newMessagingTestService(t, store, registry, clock)
 
 	const identicalBody = "identical payload either way"
+	firstCommand := testCommonCommand("key-cross-predecessor-one")
 	first := mustSendText(t, service, SendTextCommand{
-		CommonCommand: testCommonCommand("key-cross-predecessor-one"),
+		CommonCommand: firstCommand,
 		Body:          identicalBody,
 	})
+	// The second identical submission is deliberate test setup; Force bypasses
+	// the near-duplicate guard exactly as a deliberate user resend would.
+	secondCommand := testCommonCommand("key-cross-predecessor-two")
+	secondCommand.Force = true
 	second := mustSendText(t, service, SendTextCommand{
-		CommonCommand: testCommonCommand("key-cross-predecessor-two"),
+		CommonCommand: secondCommand,
 		Body:          identicalBody,
 	})
 	if processed, err := service.DispatchDue(context.Background(), 2); err != nil || processed != 2 {
