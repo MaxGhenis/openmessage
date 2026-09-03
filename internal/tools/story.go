@@ -324,9 +324,9 @@ func getPersonMessagesRangeTool() mcp.Tool {
 	return mcp.NewTool("get_person_messages_range",
 		mcp.WithDescription("Get messages with a person within a date range across all platforms. Returns chronological messages formatted as '[YYYY-MM-DD HH:MM] sender: body'. Useful for deep-diving into specific periods of a relationship."),
 		mcp.WithString("name", mcp.Required(), mcp.Description("Person's name to search for (case-insensitive partial match)")),
-		mcp.WithString("after", mcp.Required(), mcp.Description("Start date (ISO-8601, e.g. '2024-01-01')")),
-		mcp.WithString("before", mcp.Required(), mcp.Description("End date (ISO-8601, e.g. '2024-03-31')")),
-		mcp.WithNumber("limit", mcp.Description("Max messages to return (default 500)")),
+		mcp.WithString("after", mcp.Required(), mcp.Description("Start date (YYYY-MM-DD, local time, e.g. '2024-01-01')")),
+		mcp.WithString("before", mcp.Required(), mcp.Description("End date (YYYY-MM-DD, local time, inclusive to end of day, e.g. '2024-03-31')")),
+		mcp.WithNumber("limit", mcp.Description("Max messages to return (default 500, max 2000)")),
 		mcp.WithReadOnlyHintAnnotation(true),
 		mcp.WithDestructiveHintAnnotation(false),
 	)
@@ -348,21 +348,18 @@ func getPersonMessagesRangeHandler(a *app.App, configured ...Options) server.Too
 		if beforeStr == "" {
 			return errorResult("before is required"), nil
 		}
-		limit := intArg(args, "limit", 500)
+		limit := clampLimit(intArg(args, "limit", 500), maxPersonMessagesRangeLimit)
 
-		afterTime, err := time.Parse("2006-01-02", afterStr)
+		// Same parser as the CLI and /api/search/messages, so one date string
+		// selects the same local-time window on every surface.
+		afterMS, err := db.ParseDayBound(afterStr, false)
 		if err != nil {
 			return errorResult(fmt.Sprintf("invalid 'after' date %q: %v", afterStr, err)), nil
 		}
-		beforeTime, err := time.Parse("2006-01-02", beforeStr)
+		beforeMS, err := db.ParseDayBound(beforeStr, true)
 		if err != nil {
 			return errorResult(fmt.Sprintf("invalid 'before' date %q: %v", beforeStr, err)), nil
 		}
-		// Include the full end date
-		beforeTime = beforeTime.Add(24*time.Hour - time.Millisecond)
-
-		afterMS := afterTime.UnixMilli()
-		beforeMS := beforeTime.UnixMilli()
 
 		// Find matching conversation IDs (reuse collectPersonMessages logic)
 		convIDs, convNames, err := findPersonConversations(options.Reads, name)

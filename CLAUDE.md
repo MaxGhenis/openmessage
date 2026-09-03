@@ -107,7 +107,9 @@ mode this prevents and the `~/.mcp.json` recipe.
 
 On a v2-primary install the message-read tools (including `get_person_messages`
 and `get_person_messages_range`) serve the v2 store through the canonical read
-seam. The stats/story/viz tools (`conversation_stats`, `generate_story`,
+seam; their `limit` is capped (500 and 2,000) because the v2 batch path fans
+out per matching conversation. Date arguments are YYYY-MM-DD in local time on
+every surface (CLI, HTTP, MCP) via `db.ParseDayBound`. The stats/story/viz tools (`conversation_stats`, `generate_story`,
 `person_stats`, `generate_person_story`, `generate_viz`, `render_story`) still
 load full histories from the legacy store, which froze at cutover, so they
 return an error naming the working read tools instead.

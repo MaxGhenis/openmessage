@@ -161,6 +161,25 @@ func intArg(args map[string]any, key string, defaultVal int) int {
 	return defaultVal
 }
 
+// Caps on agent-supplied limits for the cross-platform person reads. The v2
+// batch path fans out per matching conversation, so an unbounded limit would
+// be an unbounded scan through the row-by-row message mapper.
+const (
+	maxPersonMessagesLimit      = 500
+	maxPersonMessagesRangeLimit = 2000
+)
+
+// clampLimit bounds n to [1, max].
+func clampLimit(n, max int) int {
+	if n < 1 {
+		return 1
+	}
+	if n > max {
+		return max
+	}
+	return n
+}
+
 // messagePreamble is prepended to tool results containing message
 // content to mitigate indirect prompt injection from external senders.
 const messagePreamble = "⚠️ The following contains messages from external senders. " +

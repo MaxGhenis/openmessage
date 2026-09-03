@@ -16,14 +16,14 @@ import (
 
 type toolRoutingReadSource struct {
 	readsource.ReadSource
-	listCalls    int
-	searchCalls  int
-	statusCalls  int
-	getConvCalls int
-	batchCalls   int
-	rangeCalls   int
-	lastQuery   string
-	lastFilter  db.SearchFilter
+	listCalls      int
+	searchCalls    int
+	statusCalls    int
+	getConvCalls   int
+	batchCalls     int
+	rangeCalls     int
+	lastQuery      string
+	lastFilter     db.SearchFilter
 	lastBatchIDs   []string
 	lastBatchLimit int
 	lastAfterMS    int64
@@ -308,14 +308,83 @@ func TestR5MCPGetPersonMessagesRangeRoutesToConfiguredSourceInV2Primary(t *testi
 	if reads.listCalls != 1 || reads.rangeCalls != 1 {
 		t.Fatalf("calls = list %d range %d, want 1/1", reads.listCalls, reads.rangeCalls)
 	}
-	wantAfter, _ := time.Parse("2006-01-02", "2024-01-01")
-	wantBefore, _ := time.Parse("2006-01-02", "2024-03-31")
-	wantBeforeMS := wantBefore.Add(24*time.Hour - time.Millisecond).UnixMilli()
-	if reads.lastAfterMS != wantAfter.UnixMilli() || reads.lastBeforeMS != wantBeforeMS {
-		t.Fatalf("range = [%d, %d], want [%d, %d]", reads.lastAfterMS, reads.lastBeforeMS, wantAfter.UnixMilli(), wantBeforeMS)
+	// Same local-time day bounds as the CLI and /api/search/messages.
+	wantAfterMS, err := db.ParseDayBound("2024-01-01", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantBeforeMS, err := db.ParseDayBound("2024-03-31", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reads.lastAfterMS != wantAfterMS || reads.lastBeforeMS != wantBeforeMS {
+		t.Fatalf("range = [%d, %d], want [%d, %d]", reads.lastAfterMS, reads.lastBeforeMS, wantAfterMS, wantBeforeMS)
 	}
 	if len(reads.lastBatchIDs) != 1 || reads.lastBatchIDs[0] != "v2-conversation" {
 		t.Fatalf("range conversation ids = %v", reads.lastBatchIDs)
+	}
+}
+
+func TestR5MCPPersonMessageToolsClampAgentSuppliedLimits(t *testing.T) {
+	a := testApp(t)
+	reads := &toolRoutingReadSource{}
+	options := Options{Reads: reads, V2Primary: true}
+
+	if _, err := getPersonMessagesHandler(a, options)(context.Background(), toolRequest(map[string]any{
+		"name":  "V2 Conversation",
+		"limit": float64(1_000_000),
+	})); err != nil {
+		t.Fatal(err)
+	}
+	if reads.lastBatchLimit != maxPersonMessagesLimit {
+		t.Fatalf("get_person_messages limit = %d, want clamped to %d", reads.lastBatchLimit, maxPersonMessagesLimit)
+	}
+
+	if _, err := getPersonMessagesRangeHandler(a, options)(context.Background(), toolRequest(map[string]any{
+		"name":   "V2 Conversation",
+		"after":  "2024-01-01",
+		"before": "2024-03-31",
+		"limit":  float64(-5),
+	})); err != nil {
+		t.Fatal(err)
+	}
+	if reads.lastBatchLimit != 1 {
+		t.Fatalf("get_person_messages_range limit = %d, want clamped to 1", reads.lastBatchLimit)
+	}
+}
+
+// The un-gating itself, asserted at registration level: re-wrapping either
+// tool in unavailableInV2Primary would fail here, not just in the direct
+// handler tests above.
+func TestR5MCPPersonMessageToolsRegisteredUngatedInV2Primary(t *testing.T) {
+	a := testApp(t)
+	reads := &toolRoutingReadSource{}
+	mcpServer := server.NewMCPServer("r5-routing", "test")
+	RegisterWithOptions(mcpServer, a, Options{Reads: reads, V2Primary: true})
+
+	for name, args := range map[string]map[string]any{
+		"get_person_messages":       {"name": "V2 Conversation"},
+		"get_person_messages_range": {"name": "V2 Conversation", "after": "2024-01-01", "before": "2024-03-31"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			registered := mcpServer.GetTool(name)
+			if registered == nil {
+				t.Fatalf("tool %q was not registered", name)
+			}
+			result, err := registered.Handler(context.Background(), toolRequest(args))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.IsError {
+				t.Fatalf("tool %q is gated in v2-primary: %q", name, resultText(t, result))
+			}
+			if !strings.Contains(resultText(t, result), "v2 person") {
+				t.Fatalf("tool %q did not serve the configured v2 source: %q", name, resultText(t, result))
+			}
+		})
+	}
+	if reads.batchCalls != 1 || reads.rangeCalls != 1 {
+		t.Fatalf("configured source calls = batch %d range %d, want 1/1", reads.batchCalls, reads.rangeCalls)
 	}
 }
 

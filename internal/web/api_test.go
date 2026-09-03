@@ -959,6 +959,7 @@ func TestSearchMessagesEndpointValidation(t *testing.T) {
 
 	for _, path := range []string{
 		"/api/search/messages",
+		"/api/search/messages?q=%20%20",
 		"/api/search/messages?q=x&since=not-a-date",
 		"/api/search/messages?q=x&until=not-a-date",
 	} {
@@ -970,6 +971,15 @@ func TestSearchMessagesEndpointValidation(t *testing.T) {
 		if resp.StatusCode != 400 {
 			t.Fatalf("%s: got status %d, want 400", path, resp.StatusCode)
 		}
+	}
+
+	resp, err := http.Post(ts.server.URL+"/api/search/messages?q=x", "application/json", strings.NewReader("{}"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 405 {
+		t.Fatalf("POST: got status %d, want 405", resp.StatusCode)
 	}
 }
 

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -74,6 +75,19 @@ func (s *routingReadSource) GetMessagesAroundMessage(conversationID, messageID s
 func (s *routingReadSource) SearchMessagesFiltered(query string, filter db.SearchFilter) ([]*db.Message, error) {
 	s.calls["search"]++
 	return []*db.Message{routingMessage("search from v2")}, nil
+}
+
+func (s *routingReadSource) SearchConversationsByMetadata(query string, limit int) ([]*db.Conversation, error) {
+	s.calls["conversation_search"]++
+	if !strings.Contains(strings.ToLower(query), "alice") {
+		return nil, nil
+	}
+	return []*db.Conversation{{
+		ConversationID: "v2-conversation",
+		Name:           "V2 Alice",
+		LastMessageTS:  200,
+		SourcePlatform: "sms",
+	}}, nil
 }
 
 func (s *routingReadSource) PlatformStats() ([]db.PlatformStat, error) {
@@ -288,6 +302,45 @@ func TestR5SearchMatchesConversationNamesInV2Primary(t *testing.T) {
 	}
 	if len(results) != 1 || results[0].ConversationID != "v2-conversation" || results[0].Name != "V2 Alice" {
 		t.Fatalf("results = %#v, want the V2 Alice conversation via name matching", results)
+	}
+	if reads.calls["conversation_search"] != 1 {
+		t.Fatalf("SearchConversationsByMetadata calls = %d, want 1 (bounded seam, not a ListConversations scan)", reads.calls["conversation_search"])
+	}
+	if reads.calls["list"] != 0 {
+		t.Fatalf("/api/search listed %d conversation pages; name matching must not scan the list", reads.calls["list"])
+	}
+}
+
+// failingConversationSearchSource makes the metadata match fail so the test
+// can prove message hits still render instead of a 500.
+type failingConversationSearchSource struct {
+	*routingReadSource
+}
+
+func (s *failingConversationSearchSource) SearchConversationsByMetadata(query string, limit int) ([]*db.Conversation, error) {
+	return nil, errors.New("map conversation: account is missing")
+}
+
+func TestR5SearchDegradesToMessageHitsWhenMetadataMatchFails(t *testing.T) {
+	legacy, err := db.New(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = legacy.Close() })
+
+	reads := &failingConversationSearchSource{routingReadSource: newRoutingReadSource()}
+	handler := APIHandlerWithOptions(legacy, nil, zerolog.Nop(), nil, APIOptions{
+		Reads:     reads,
+		V2Primary: true,
+	})
+
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "http://127.0.0.1/api/search?q=alice", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 with message hits; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), "search from v2") {
+		t.Fatalf("message hits missing from degraded search: %s", recorder.Body.String())
 	}
 }
 

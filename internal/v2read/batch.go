@@ -52,29 +52,37 @@ func (s *Source) batchMessages(
 		resolved = append(resolved, id)
 	}
 
+	// Prune to the newest limit after every conversation so the working set
+	// never exceeds 2×limit however many conversations match.
 	var merged []sqlite.Message
 	for _, conversationID := range resolved {
 		rows, err := s.conversationMessagesInRange(conversationID, afterMS, beforeMS, limit)
 		if err != nil {
 			return nil, err
 		}
-		merged = append(merged, rows...)
+		merged = keepNewest(append(merged, rows...), limit)
 	}
 
-	// Keep the newest limit across the set, then present ascending.
-	sort.Slice(merged, func(i, j int) bool {
-		if merged[i].OccurredAtMS != merged[j].OccurredAtMS {
-			return merged[i].OccurredAtMS > merged[j].OccurredAtMS
-		}
-		return merged[i].MessageID > merged[j].MessageID
-	})
-	if len(merged) > limit {
-		merged = merged[:limit]
-	}
+	// Present ascending.
 	for i, j := 0, len(merged)-1; i < j; i, j = i+1, j-1 {
 		merged[i], merged[j] = merged[j], merged[i]
 	}
 	return s.mapMessages(merged)
+}
+
+// keepNewest orders messages newest-first by (occurred_at_ms, message_id) —
+// the legacy store's tiebreak — and truncates to limit.
+func keepNewest(messages []sqlite.Message, limit int) []sqlite.Message {
+	sort.Slice(messages, func(i, j int) bool {
+		if messages[i].OccurredAtMS != messages[j].OccurredAtMS {
+			return messages[i].OccurredAtMS > messages[j].OccurredAtMS
+		}
+		return messages[i].MessageID > messages[j].MessageID
+	})
+	if len(messages) > limit {
+		messages = messages[:limit]
+	}
+	return messages
 }
 
 // conversationMessagesInRange collects up to limit newest-first rows for one

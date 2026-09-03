@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 
 	moderncsqlite "modernc.org/sqlite"
 )
@@ -781,6 +782,49 @@ func (s *Store) ListConversationsByRecencyAllAccounts(limit int) ([]Conversation
 		conversations = conversations[:limit]
 	}
 	return conversations, nil
+}
+
+// SearchConversationsByName returns conversations whose title, or whose
+// participants' display names or canonical addresses, contain query as a
+// case-insensitive substring — newest first, at most limit rows. It is the
+// bounded v2 counterpart of the legacy metadata search: the match runs in SQL
+// so callers map only the hits instead of every conversation.
+func (s *Store) SearchConversationsByName(query string, limit int) ([]Conversation, error) {
+	if limit <= 0 || strings.TrimSpace(query) == "" {
+		return []Conversation{}, nil
+	}
+	pattern := "%" + escapeLikePattern(query) + "%"
+	rows, err := s.db.QueryContext(
+		context.Background(),
+		"SELECT "+conversationColumns+`
+		 FROM conversations
+		 WHERE title LIKE ? ESCAPE '\'
+		    OR conversation_id IN (
+		        SELECT cp.conversation_id
+		        FROM conversation_participants cp
+		        JOIN identities i ON i.identity_id = cp.identity_id
+		        WHERE cp.display_name LIKE ? ESCAPE '\'
+		           OR i.display_name LIKE ? ESCAPE '\'
+		           OR i.canonical_value LIKE ? ESCAPE '\'
+		    )
+		 ORDER BY last_message_at_ms DESC, conversation_id
+		 LIMIT ?`,
+		pattern, pattern, pattern, pattern, limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("search conversations by name: %w", err)
+	}
+	conversations, err := collectRows(rows, scanConversation)
+	if err != nil {
+		return nil, fmt.Errorf("search conversations by name: %w", err)
+	}
+	return conversations, nil
+}
+
+// escapeLikePattern makes user text match literally inside a LIKE pattern
+// that declares '\' as its escape character.
+func escapeLikePattern(text string) string {
+	return strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(text)
 }
 
 func scanConversation(row rowScanner) (Conversation, error) {
