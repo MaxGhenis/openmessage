@@ -908,9 +908,13 @@ func assertR5HTTPSurfaces(
 	if conversations.Code != http.StatusOK {
 		t.Fatalf("HTTP list conversations = %d: %s", conversations.Code, conversations.Body.String())
 	}
+	// The scripted Google ingest frame reuses the fixture thread's remote id
+	// with a sender who is not that thread's peer. Google thread ids are
+	// device-local, so the projector treats the sender as authoritative and
+	// files the message in its own thread rather than the fixture's 1:1.
 	var conversationPayload []*db.Conversation
 	if err := json.Unmarshal(conversations.Body.Bytes(), &conversationPayload); err != nil ||
-		len(conversationPayload) != fixture.ConversationCount {
+		len(conversationPayload) != fixture.ConversationCount+1 {
 		t.Fatalf("HTTP conversation payload = %d, %v: %s", len(conversationPayload), err, conversations.Body.String())
 	}
 

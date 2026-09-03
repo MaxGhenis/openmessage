@@ -29,6 +29,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "  demo                                     - Start a seeded fake-data UI with live transports disabled")
 		fmt.Fprintln(os.Stderr, "  backup [--to dir] [--json]               - Create a verified legacy migration backup and manifest")
 		fmt.Fprintln(os.Stderr, "  migrate [--check] [--from dir] [--to dir] [--json] - Transform the legacy store into a validated v2 store")
+		fmt.Fprintln(os.Stderr, "  repair google-idspace --since <RFC3339|unix-ms> [--apply] [--json] - Re-file v2 rows misrouted by a Google device id-space reset (dry run by default)")
 		fmt.Fprintln(os.Stderr, "  read <query> [--limit N] [--phone X] [--since YYYY-MM-DD] [--until YYYY-MM-DD] [--json] - Search the local store")
 		fmt.Fprintln(os.Stderr, "  thread <name|number|conversation_id> [--limit N] [--since YYYY-MM-DD] [--until YYYY-MM-DD] [--json] - Print a full conversation chronologically")
 		fmt.Fprintln(os.Stderr, "  threads [--limit N] [--json]             - List recent conversations (find an id/name for thread)")
@@ -55,6 +56,8 @@ func main() {
 		err = cmd.RunBackup(logger, os.Args[2:]...)
 	case "migrate":
 		err = cmd.RunMigrate(logger, os.Args[2:]...)
+	case "repair":
+		err = cmd.RunRepair(logger, os.Args[2:]...)
 	case "read", "search":
 		if len(os.Args) < 3 {
 			fmt.Fprintln(os.Stderr, "Usage: openmessage read <query> [--limit N] [--phone NUMBER] [--json]")
