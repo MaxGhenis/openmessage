@@ -74,8 +74,10 @@ func getPersonMessagesHandler(a *app.App, configured ...Options) server.ToolHand
 		var sb strings.Builder
 		sb.WriteString(messagePreamble)
 		fmt.Fprintf(&sb, "Messages with '%s' across %d conversation(s):\n", name, len(matchingConvIDs))
-		if capped {
-			fmt.Fprintf(&sb, "(limit capped at %d on the v2 store — the newest %d messages are shown)\n", maxPersonMessagesLimit, limit)
+		// Only when the read actually hit the cap: a complete result must not
+		// tell the agent to re-query.
+		if capped && len(msgs) >= limit {
+			fmt.Fprintf(&sb, "(limit capped at %d on the v2 store — only the newest %d messages are shown)\n", maxPersonMessagesLimit, len(msgs))
 		}
 		sb.WriteString("\n")
 

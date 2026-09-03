@@ -384,8 +384,10 @@ func getPersonMessagesRangeHandler(a *app.App, configured ...Options) server.Too
 		var sb strings.Builder
 		fmt.Fprintf(&sb, "Messages with '%s' from %s to %s (%d messages from %d conversation(s): %s)\n\n",
 			name, afterStr, beforeStr, len(deduped), len(convNames), strings.Join(convNames, ", "))
-		if capped {
-			fmt.Fprintf(&sb, "Note: limit capped at %d on the v2 store; these are the newest messages in the window — narrow the range for complete coverage.\n\n", maxPersonMessagesRangeLimit)
+		// Only when the read actually hit the cap (pre-dedup count): a window
+		// that was fully covered must not tell the agent to narrow it.
+		if capped && len(msgs) >= limit {
+			fmt.Fprintf(&sb, "Note: limit capped at %d on the v2 store and the window holds more; only the newest messages are shown — narrow the range for complete coverage.\n\n", maxPersonMessagesRangeLimit)
 		}
 		sb.WriteString(messagePreamble)
 
