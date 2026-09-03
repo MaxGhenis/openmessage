@@ -255,6 +255,30 @@ type SearchFilter struct {
 	Limit          int    // max rows (<=0 → 20)
 }
 
+// ParseDayBound parses a since/until value into a millisecond timestamp for
+// SearchFilter. It accepts a bare date (YYYY-MM-DD), a date-time, or RFC3339,
+// all in local time. An empty string returns 0 (no bound). When endOfDay is
+// true, a bare date resolves to 23:59:59.999 so that "until 2026-05-28"
+// includes all of that day rather than stopping at midnight.
+func ParseDayBound(s string, endOfDay bool) (int64, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, nil
+	}
+	if t, err := time.ParseInLocation("2006-01-02", s, time.Local); err == nil {
+		if endOfDay {
+			t = t.Add(24*time.Hour - time.Millisecond)
+		}
+		return t.UnixMilli(), nil
+	}
+	for _, layout := range []string{"2006-01-02 15:04", "2006-01-02T15:04", time.RFC3339} {
+		if t, err := time.ParseInLocation(layout, s, time.Local); err == nil {
+			return t.UnixMilli(), nil
+		}
+	}
+	return 0, fmt.Errorf("invalid date %q (use YYYY-MM-DD)", s)
+}
+
 func (s *Store) SearchMessages(query, phoneNumber string, limit int) ([]*Message, error) {
 	return s.SearchMessagesFiltered(query, SearchFilter{Phone: phoneNumber, Limit: limit})
 }

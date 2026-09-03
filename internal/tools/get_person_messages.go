@@ -21,7 +21,8 @@ func getPersonMessagesTool() mcp.Tool {
 	)
 }
 
-func getPersonMessagesHandler(a *app.App) server.ToolHandlerFunc {
+func getPersonMessagesHandler(a *app.App, configured ...Options) server.ToolHandlerFunc {
+	options := resolvedOptions(a, configured)
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		args := req.GetArguments()
 		name := strArg(args, "name")
@@ -31,7 +32,7 @@ func getPersonMessagesHandler(a *app.App) server.ToolHandlerFunc {
 		limit := intArg(args, "limit", 50)
 
 		// Find all conversations that mention this person
-		allConvs, err := a.Store.ListConversations(1000)
+		allConvs, err := options.Reads.ListConversations(1000)
 		if err != nil {
 			return errorResult(fmt.Sprintf("list conversations: %v", err)), nil
 		}
@@ -64,7 +65,7 @@ func getPersonMessagesHandler(a *app.App) server.ToolHandlerFunc {
 		}
 
 		// Batch fetch all messages in one query
-		msgs, err := a.Store.GetMessagesByConversations(matchingConvIDs, limit)
+		msgs, err := options.Reads.GetMessagesByConversations(matchingConvIDs, limit)
 		if err != nil {
 			return errorResult(fmt.Sprintf("get messages: %v", err)), nil
 		}

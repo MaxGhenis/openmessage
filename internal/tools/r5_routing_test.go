@@ -20,8 +20,14 @@ type toolRoutingReadSource struct {
 	searchCalls  int
 	statusCalls  int
 	getConvCalls int
+	batchCalls   int
+	rangeCalls   int
 	lastQuery   string
 	lastFilter  db.SearchFilter
+	lastBatchIDs   []string
+	lastBatchLimit int
+	lastAfterMS    int64
+	lastBeforeMS   int64
 }
 
 func (s *toolRoutingReadSource) ListConversations(limit int) ([]*db.Conversation, error) {
@@ -67,6 +73,36 @@ func (s *toolRoutingReadSource) GetMessagesByConversation(conversationID string,
 
 func (s *toolRoutingReadSource) GetConversation(id string) (*db.Conversation, error) {
 	return &db.Conversation{ConversationID: id, Name: "V2 Thread", SourcePlatform: "sms"}, nil
+}
+
+func (s *toolRoutingReadSource) GetMessagesByConversations(conversationIDs []string, limit int) ([]*db.Message, error) {
+	s.batchCalls++
+	s.lastBatchIDs = conversationIDs
+	s.lastBatchLimit = limit
+	return []*db.Message{{
+		MessageID:      "v2-person-message",
+		ConversationID: "v2-conversation",
+		SenderName:     "V2 Alice",
+		Body:           "v2 person body",
+		TimestampMS:    200,
+		SourcePlatform: "sms",
+	}}, nil
+}
+
+func (s *toolRoutingReadSource) GetMessagesByConversationsRange(conversationIDs []string, afterMS, beforeMS int64, limit int) ([]*db.Message, error) {
+	s.rangeCalls++
+	s.lastBatchIDs = conversationIDs
+	s.lastBatchLimit = limit
+	s.lastAfterMS = afterMS
+	s.lastBeforeMS = beforeMS
+	return []*db.Message{{
+		MessageID:      "v2-person-range-message",
+		ConversationID: "v2-conversation",
+		SenderName:     "V2 Alice",
+		Body:           "v2 person range body",
+		TimestampMS:    200,
+		SourcePlatform: "sms",
+	}}, nil
 }
 
 func TestR5MCPReadHandlersUseConfiguredSource(t *testing.T) {
@@ -196,8 +232,6 @@ func TestR5MCPPersonStoryAndVizToolsUnavailableInV2Primary(t *testing.T) {
 	RegisterWithOptions(mcpServer, a, Options{Reads: a.Store, V2Primary: true})
 
 	for _, name := range []string{
-		"get_person_messages",
-		"get_person_messages_range",
 		"conversation_stats",
 		"generate_story",
 		"person_stats",
@@ -217,10 +251,71 @@ func TestR5MCPPersonStoryAndVizToolsUnavailableInV2Primary(t *testing.T) {
 			if !result.IsError {
 				t.Fatalf("tool %q did not return an MCP error", name)
 			}
-			if got := resultText(t, result); got != "not available while v2 is the serving store" {
+			got := resultText(t, result)
+			if got != unavailableWhileV2Serving {
 				t.Fatalf("tool %q error = %q", name, got)
 			}
+			// The error must point agents at the tools that DO serve v2
+			// reads, not dead-end them.
+			for _, alternative := range []string{"get_person_messages", "search_messages", "get_messages"} {
+				if !strings.Contains(got, alternative) {
+					t.Fatalf("tool %q error does not name alternative %q: %q", name, alternative, got)
+				}
+			}
 		})
+	}
+}
+
+func TestR5MCPGetPersonMessagesRoutesToConfiguredSourceInV2Primary(t *testing.T) {
+	a := testApp(t)
+	reads := &toolRoutingReadSource{}
+	options := Options{Reads: reads, V2Primary: true}
+
+	result, err := getPersonMessagesHandler(a, options)(context.Background(), toolRequest(map[string]any{
+		"name":  "V2 Conversation",
+		"limit": float64(25),
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.IsError || !strings.Contains(resultText(t, result), "v2 person body") {
+		t.Fatalf("unexpected result: %#v", result)
+	}
+	if reads.listCalls != 1 || reads.batchCalls != 1 {
+		t.Fatalf("calls = list %d batch %d, want 1/1", reads.listCalls, reads.batchCalls)
+	}
+	if len(reads.lastBatchIDs) != 1 || reads.lastBatchIDs[0] != "v2-conversation" || reads.lastBatchLimit != 25 {
+		t.Fatalf("batch args = %v limit %d", reads.lastBatchIDs, reads.lastBatchLimit)
+	}
+}
+
+func TestR5MCPGetPersonMessagesRangeRoutesToConfiguredSourceInV2Primary(t *testing.T) {
+	a := testApp(t)
+	reads := &toolRoutingReadSource{}
+	options := Options{Reads: reads, V2Primary: true}
+
+	result, err := getPersonMessagesRangeHandler(a, options)(context.Background(), toolRequest(map[string]any{
+		"name":   "V2 Conversation",
+		"after":  "2024-01-01",
+		"before": "2024-03-31",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.IsError || !strings.Contains(resultText(t, result), "v2 person range body") {
+		t.Fatalf("unexpected result: %#v", result)
+	}
+	if reads.listCalls != 1 || reads.rangeCalls != 1 {
+		t.Fatalf("calls = list %d range %d, want 1/1", reads.listCalls, reads.rangeCalls)
+	}
+	wantAfter, _ := time.Parse("2006-01-02", "2024-01-01")
+	wantBefore, _ := time.Parse("2006-01-02", "2024-03-31")
+	wantBeforeMS := wantBefore.Add(24*time.Hour - time.Millisecond).UnixMilli()
+	if reads.lastAfterMS != wantAfter.UnixMilli() || reads.lastBeforeMS != wantBeforeMS {
+		t.Fatalf("range = [%d, %d], want [%d, %d]", reads.lastAfterMS, reads.lastBeforeMS, wantAfter.UnixMilli(), wantBeforeMS)
+	}
+	if len(reads.lastBatchIDs) != 1 || reads.lastBatchIDs[0] != "v2-conversation" {
+		t.Fatalf("range conversation ids = %v", reads.lastBatchIDs)
 	}
 }
 

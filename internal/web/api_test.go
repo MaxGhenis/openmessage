@@ -906,6 +906,90 @@ func TestSearchRequiresQuery(t *testing.T) {
 	}
 }
 
+func TestSearchMessagesEndpointReturnsRawMessageRows(t *testing.T) {
+	ts := newTestServer(t)
+
+	ts.store.UpsertConversation(&db.Conversation{
+		ConversationID: "c1",
+		Name:           "Nathan",
+		LastMessageTS:  200,
+		SourcePlatform: "sms",
+	})
+	ts.store.UpsertMessage(&db.Message{
+		MessageID: "m1", ConversationID: "c1", Body: "lunch tomorrow?",
+		SenderName: "Nathan", TimestampMS: 100,
+	})
+	ts.store.UpsertMessage(&db.Message{
+		MessageID: "m2", ConversationID: "c1", Body: "sure!",
+		TimestampMS: 200,
+	})
+
+	resp, err := http.Get(ts.server.URL + "/api/search/messages?q=lunch")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("got status %d, want 200", resp.StatusCode)
+	}
+
+	// The contract is raw message DTOs — the same field names as
+	// /api/conversations/<id>/messages (MessageID, Body, TimestampMS…), not
+	// the conversation summaries /api/search returns.
+	var rows []map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&rows); err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("got %d rows, want 1", len(rows))
+	}
+	if rows[0]["MessageID"] != "m1" || rows[0]["Body"] != "lunch tomorrow?" {
+		t.Fatalf("row = %#v", rows[0])
+	}
+	if ts, ok := rows[0]["TimestampMS"].(float64); !ok || int64(ts) != 100 {
+		t.Fatalf("TimestampMS = %#v, want 100", rows[0]["TimestampMS"])
+	}
+	if _, ok := rows[0]["ConversationID"]; !ok {
+		t.Fatalf("row lacks ConversationID: %#v", rows[0])
+	}
+}
+
+func TestSearchMessagesEndpointValidation(t *testing.T) {
+	ts := newTestServer(t)
+
+	for _, path := range []string{
+		"/api/search/messages",
+		"/api/search/messages?q=x&since=not-a-date",
+		"/api/search/messages?q=x&until=not-a-date",
+	} {
+		resp, err := http.Get(ts.server.URL + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != 400 {
+			t.Fatalf("%s: got status %d, want 400", path, resp.StatusCode)
+		}
+	}
+}
+
+func TestSearchMessagesEndpointReturnsEmptyArrayNotNull(t *testing.T) {
+	ts := newTestServer(t)
+
+	resp, err := http.Get(ts.server.URL + "/api/search/messages?q=nothing-matches-this")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(string(raw)) != "[]" {
+		t.Fatalf("empty result body = %q, want []", raw)
+	}
+}
+
 func TestConversationThreadSearchRoute(t *testing.T) {
 	ts := newTestServer(t)
 

@@ -13,6 +13,7 @@ import (
 
 	"github.com/maxghenis/openmessage/internal/app"
 	"github.com/maxghenis/openmessage/internal/db"
+	"github.com/maxghenis/openmessage/internal/readsource"
 	"github.com/maxghenis/openmessage/internal/story"
 )
 
@@ -331,7 +332,8 @@ func getPersonMessagesRangeTool() mcp.Tool {
 	)
 }
 
-func getPersonMessagesRangeHandler(a *app.App) server.ToolHandlerFunc {
+func getPersonMessagesRangeHandler(a *app.App, configured ...Options) server.ToolHandlerFunc {
+	options := resolvedOptions(a, configured)
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		args := req.GetArguments()
 		name := strArg(args, "name")
@@ -363,7 +365,7 @@ func getPersonMessagesRangeHandler(a *app.App) server.ToolHandlerFunc {
 		beforeMS := beforeTime.UnixMilli()
 
 		// Find matching conversation IDs (reuse collectPersonMessages logic)
-		convIDs, convNames, err := findPersonConversations(a, name)
+		convIDs, convNames, err := findPersonConversations(options.Reads, name)
 		if err != nil {
 			return errorResult(err.Error()), nil
 		}
@@ -371,7 +373,7 @@ func getPersonMessagesRangeHandler(a *app.App) server.ToolHandlerFunc {
 			return textResult(fmt.Sprintf("No conversations found with '%s'.", name)), nil
 		}
 
-		msgs, err := a.Store.GetMessagesByConversationsRange(convIDs, afterMS, beforeMS, limit)
+		msgs, err := options.Reads.GetMessagesByConversationsRange(convIDs, afterMS, beforeMS, limit)
 		if err != nil {
 			return errorResult(fmt.Sprintf("get messages: %v", err)), nil
 		}
@@ -405,8 +407,8 @@ func getPersonMessagesRangeHandler(a *app.App) server.ToolHandlerFunc {
 
 // findPersonConversations returns matching conversation IDs and display names
 // for a person. Extracted from collectPersonMessages for reuse.
-func findPersonConversations(a *app.App, name string) ([]string, []string, error) {
-	allConvs, err := a.Store.ListConversations(1000)
+func findPersonConversations(reads readsource.ReadSource, name string) ([]string, []string, error) {
+	allConvs, err := reads.ListConversations(1000)
 	if err != nil {
 		return nil, nil, fmt.Errorf("list conversations: %v", err)
 	}
@@ -435,7 +437,7 @@ func findPersonConversations(a *app.App, name string) ([]string, []string, error
 // all messages, deduplicates cross-platform duplicates, and returns them sorted
 // chronologically. Also returns conversation display names for context.
 func collectPersonMessages(a *app.App, name string) ([]*db.Message, []string, error) {
-	matchingConvIDs, convNames, err := findPersonConversations(a, name)
+	matchingConvIDs, convNames, err := findPersonConversations(a.Store, name)
 	if err != nil {
 		return nil, nil, err
 	}

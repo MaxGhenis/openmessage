@@ -1487,16 +1487,60 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			convos        []*db.Conversation
 			identityStore *db.Store
 		)
-		if !opts.V2Primary {
+		if opts.V2Primary {
+			// The metadata query below is legacy-schema SQL; on v2 match
+			// conversation names/participants from the canonical read source
+			// so searching a person's name still finds their threads even
+			// when the name never appears in message text.
+			convos, err = searchConversationsByName(reads, q, limit)
+		} else {
 			convos, err = store.SearchConversationsByMetadata(q, limit)
-			if err != nil {
-				httpError(w, "search: "+err.Error(), 500)
-				return
-			}
 			identityStore = store
+		}
+		if err != nil {
+			httpError(w, "search: "+err.Error(), 500)
+			return
 		}
 		results := mergeSearchResults(reads, identityStore, msgs, convos, limit)
 		writeJSON(w, results)
+	})
+
+	// Message-level search: returns raw message rows (MessageID / Body /
+	// TimestampMS…, the same DTO as /api/conversations/<id>/messages) rather
+	// than the conversation summaries /api/search produces. This is the HTTP
+	// twin of the search_messages MCP tool, for agents and scripts.
+	mux.HandleFunc("/api/search/messages", func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query().Get("q")
+		if q == "" {
+			httpError(w, "query parameter 'q' is required", 400)
+			return
+		}
+		sinceMS, err := db.ParseDayBound(r.URL.Query().Get("since"), false)
+		if err != nil {
+			httpError(w, "since: "+err.Error(), 400)
+			return
+		}
+		untilMS, err := db.ParseDayBound(r.URL.Query().Get("until"), true)
+		if err != nil {
+			httpError(w, "until: "+err.Error(), 400)
+			return
+		}
+		filter := db.SearchFilter{
+			Phone:          strings.TrimSpace(r.URL.Query().Get("phone")),
+			ConversationID: strings.TrimSpace(r.URL.Query().Get("conversation_id")),
+			SinceMS:        sinceMS,
+			UntilMS:        untilMS,
+			Limit:          queryIntClamped(r, "limit", 50, 500),
+		}
+		msgs, err := reads.SearchMessagesFiltered(q, filter)
+		if err != nil {
+			httpError(w, "search: "+err.Error(), 500)
+			return
+		}
+		if msgs == nil {
+			msgs = []*db.Message{}
+		}
+		writeJSON(w, msgs)
 	})
 
 	mux.HandleFunc("/api/avatar", func(w http.ResponseWriter, r *http.Request) {
@@ -3085,6 +3129,36 @@ func splitHostPortDefault(hostport, defaultPort string) (string, string, bool) {
 		port = defaultPort
 	}
 	return u.Hostname(), port, true
+}
+
+// searchConversationsByName is the v2 counterpart of the legacy
+// SearchConversationsByMetadata: a case-insensitive substring match over
+// conversation names and participants from the canonical read source. The
+// legacy query's sender/contact joins have no v2 seam, so this covers the
+// name/participants clauses only — enough to find a thread by person name.
+func searchConversationsByName(reads readsource.ReadSource, query string, limit int) ([]*db.Conversation, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	all, err := reads.ListConversations(1000)
+	if err != nil {
+		return nil, err
+	}
+	needle := strings.ToLower(query)
+	matches := make([]*db.Conversation, 0, limit)
+	for _, conv := range all {
+		if conv == nil {
+			continue
+		}
+		if strings.Contains(strings.ToLower(conv.Name), needle) ||
+			strings.Contains(strings.ToLower(conv.Participants), needle) {
+			matches = append(matches, conv)
+			if len(matches) == limit {
+				break
+			}
+		}
+	}
+	return matches, nil
 }
 
 func mergeSearchResults(reads readsource.ReadSource, identityStore *db.Store, msgs []*db.Message, convos []*db.Conversation, limit int) []SearchResult {

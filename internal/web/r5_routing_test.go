@@ -164,6 +164,7 @@ func TestR5CanonicalReadRoutesUseConfiguredSource(t *testing.T) {
 		{name: "around", path: "/api/conversations/v2-conversation/messages-around?message_id=v2-message", wantBody: "around from v2", wantCall: "around"},
 		{name: "thread search", path: "/api/conversations/v2-conversation/search?q=search", wantBody: "search from v2", wantCall: "search"},
 		{name: "global search", path: "/api/search?q=search", wantBody: "search from v2", wantCall: "search"},
+		{name: "message search", path: "/api/search/messages?q=search", wantBody: "search from v2", wantCall: "search"},
 	}
 
 	for _, test := range tests {
@@ -188,6 +189,105 @@ func TestR5CanonicalReadRoutesUseConfiguredSource(t *testing.T) {
 
 	if reads.calls["previews"] == 0 {
 		t.Fatal("conversation previews did not use configured read source")
+	}
+}
+
+// searchFilterCapturingSource records the filter /api/search/messages builds
+// from its query parameters.
+type searchFilterCapturingSource struct {
+	readsource.ReadSource
+	lastQuery  string
+	lastFilter db.SearchFilter
+}
+
+func (s *searchFilterCapturingSource) SearchMessagesFiltered(query string, filter db.SearchFilter) ([]*db.Message, error) {
+	s.lastQuery = query
+	s.lastFilter = filter
+	return nil, nil
+}
+
+func TestR5MessageSearchPlumbsFilterParameters(t *testing.T) {
+	legacy, err := db.New(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = legacy.Close() })
+
+	reads := &searchFilterCapturingSource{}
+	handler := APIHandlerWithOptions(legacy, nil, zerolog.Nop(), nil, APIOptions{
+		Reads:     reads,
+		V2Primary: true,
+	})
+
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(
+		http.MethodGet,
+		"http://127.0.0.1/api/search/messages?q=hello&phone=%2B15551230000&conversation_id=c9&limit=7&since=2024-01-01&until=2024-03-31",
+		nil,
+	))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", recorder.Code, recorder.Body.String())
+	}
+	if reads.lastQuery != "hello" {
+		t.Fatalf("query = %q", reads.lastQuery)
+	}
+	wantSince, err := db.ParseDayBound("2024-01-01", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantUntil, err := db.ParseDayBound("2024-03-31", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := db.SearchFilter{
+		Phone:          "+15551230000",
+		ConversationID: "c9",
+		SinceMS:        wantSince,
+		UntilMS:        wantUntil,
+		Limit:          7,
+	}
+	if reads.lastFilter != want {
+		t.Fatalf("filter = %#v, want %#v", reads.lastFilter, want)
+	}
+	if wantUntil <= wantSince {
+		t.Fatalf("until %d not after since %d", wantUntil, wantSince)
+	}
+}
+
+// noMessageHitsSource returns no message hits so /api/search results can only
+// come from conversation-metadata matching.
+type noMessageHitsSource struct {
+	*routingReadSource
+}
+
+func (s *noMessageHitsSource) SearchMessagesFiltered(query string, filter db.SearchFilter) ([]*db.Message, error) {
+	return nil, nil
+}
+
+func TestR5SearchMatchesConversationNamesInV2Primary(t *testing.T) {
+	legacy, err := db.New(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = legacy.Close() })
+
+	reads := &noMessageHitsSource{routingReadSource: newRoutingReadSource()}
+	handler := APIHandlerWithOptions(legacy, nil, zerolog.Nop(), nil, APIOptions{
+		Reads:     reads,
+		V2Primary: true,
+	})
+
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "http://127.0.0.1/api/search?q=alice", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", recorder.Code, recorder.Body.String())
+	}
+	var results []SearchResult
+	if err := json.NewDecoder(recorder.Body).Decode(&results); err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 || results[0].ConversationID != "v2-conversation" || results[0].Name != "V2 Alice" {
+		t.Fatalf("results = %#v, want the V2 Alice conversation via name matching", results)
 	}
 }
 

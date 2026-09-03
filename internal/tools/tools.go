@@ -91,13 +91,13 @@ func RegisterWithOptions(s *server.MCPServer, a *app.App, options Options) {
 	s.AddTool(draftMessageTool(), draftMessageHandler(a))
 	s.AddTool(downloadMediaTool(), downloadMediaHandler(a))
 	s.AddTool(importMessagesTool(), importMessagesHandler(a))
-	s.AddTool(getPersonMessagesTool(), unavailableInV2Primary(v2Primary, getPersonMessagesHandler(a)))
+	s.AddTool(getPersonMessagesTool(), getPersonMessagesHandler(a, options))
+	s.AddTool(getPersonMessagesRangeTool(), getPersonMessagesRangeHandler(a, options))
 	s.AddTool(conversationStatsTool(), unavailableInV2Primary(v2Primary, conversationStatsHandler(a)))
 	s.AddTool(generateStoryTool(), unavailableInV2Primary(v2Primary, generateStoryHandler(a)))
 	s.AddTool(personStatsTool(), unavailableInV2Primary(v2Primary, personStatsHandler(a)))
 	s.AddTool(generatePersonStoryTool(), unavailableInV2Primary(v2Primary, generatePersonStoryHandler(a)))
 	s.AddTool(generateVizTool(), unavailableInV2Primary(v2Primary, generateVizHandler(a)))
-	s.AddTool(getPersonMessagesRangeTool(), unavailableInV2Primary(v2Primary, getPersonMessagesRangeHandler(a)))
 	s.AddTool(renderStoryTool(), unavailableInV2Primary(v2Primary, renderStoryHandler(a)))
 	switch {
 	case options.Daemon != nil:
@@ -109,7 +109,16 @@ func RegisterWithOptions(s *server.MCPServer, a *app.App, options Options) {
 	}
 }
 
-const unavailableWhileV2Serving = "not available while v2 is the serving store"
+// unavailableWhileV2Serving explains the gate on the stats/story/viz tools:
+// they load complete conversation histories from the legacy store, which froze
+// at the v2 cutover, and the v2 read path maps messages row-by-row (identity,
+// attachment, send-status lookups per message) — pathological at full-history
+// scale. The error names the tools that DO serve v2 reads so agents don't
+// dead-end here.
+const unavailableWhileV2Serving = "not available while v2 is the serving store: " +
+	"this tool still reads the legacy store, which froze at the v2 cutover. " +
+	"To read messages, use get_person_messages, get_person_messages_range, " +
+	"search_messages, or get_messages instead."
 
 func unavailableInV2Primary(primary bool, legacy server.ToolHandlerFunc) server.ToolHandlerFunc {
 	if !primary {
