@@ -53,14 +53,23 @@ func (s *Source) batchMessages(
 	}
 
 	// Prune to the newest limit after every conversation so the working set
-	// never exceeds 2×limit however many conversations match.
+	// never exceeds 2×limit, and once it is full use the oldest kept row as
+	// the floor for later conversations: only rows at least that new can
+	// still enter the result, so their walks stop at the first page that
+	// drops below it. Ties at the floor are fetched and settled by keepNewest.
 	var merged []sqlite.Message
+	floorMS := afterMS
 	for _, conversationID := range resolved {
-		rows, err := s.conversationMessagesInRange(conversationID, afterMS, beforeMS, limit)
+		rows, err := s.conversationMessagesInRange(conversationID, floorMS, beforeMS, limit)
 		if err != nil {
 			return nil, err
 		}
 		merged = keepNewest(append(merged, rows...), limit)
+		if len(merged) == limit {
+			if oldest := merged[len(merged)-1].OccurredAtMS; oldest > floorMS {
+				floorMS = oldest
+			}
+		}
 	}
 
 	// Present ascending.
@@ -102,6 +111,7 @@ func (s *Source) conversationMessagesInRange(
 	collected := make([]sqlite.Message, 0, min(limit, sourceMessagePageSize))
 	for len(collected) < limit {
 		pageSize := min(limit-len(collected), sourceMessagePageSize)
+		s.batchPageQueries.Add(1)
 		page, err := s.messages.ListMessagesByConversation(
 			context.Background(), conversationID, cursorMS, cursorID, pageSize,
 		)

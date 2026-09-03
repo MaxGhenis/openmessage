@@ -348,7 +348,7 @@ func getPersonMessagesRangeHandler(a *app.App, configured ...Options) server.Too
 		if beforeStr == "" {
 			return errorResult("before is required"), nil
 		}
-		limit := clampLimit(intArg(args, "limit", 500), maxPersonMessagesRangeLimit)
+		limit, capped := personReadLimit(intArg(args, "limit", 500), maxPersonMessagesRangeLimit, options.V2Primary)
 
 		// Same parser as the CLI and /api/search/messages, so one date string
 		// selects the same local-time window on every surface.
@@ -384,10 +384,14 @@ func getPersonMessagesRangeHandler(a *app.App, configured ...Options) server.Too
 		var sb strings.Builder
 		fmt.Fprintf(&sb, "Messages with '%s' from %s to %s (%d messages from %d conversation(s): %s)\n\n",
 			name, afterStr, beforeStr, len(deduped), len(convNames), strings.Join(convNames, ", "))
+		if capped {
+			fmt.Fprintf(&sb, "Note: limit capped at %d on the v2 store; these are the newest messages in the window — narrow the range for complete coverage.\n\n", maxPersonMessagesRangeLimit)
+		}
 		sb.WriteString(messagePreamble)
 
 		for _, m := range deduped {
-			ts := time.UnixMilli(m.TimestampMS).UTC().Format("2006-01-02 15:04")
+			// Local time, matching the local-time window bounds above.
+			ts := time.UnixMilli(m.TimestampMS).Format("2006-01-02 15:04")
 			sender := m.SenderName
 			if m.IsFromMe {
 				sender = "me"

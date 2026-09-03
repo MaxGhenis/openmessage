@@ -323,33 +323,63 @@ func TestR5MCPGetPersonMessagesRangeRoutesToConfiguredSourceInV2Primary(t *testi
 	if len(reads.lastBatchIDs) != 1 || reads.lastBatchIDs[0] != "v2-conversation" {
 		t.Fatalf("range conversation ids = %v", reads.lastBatchIDs)
 	}
+	// Rows are labelled in the same local time the window was parsed in.
+	wantStamp := "[" + time.UnixMilli(200).Format("2006-01-02 15:04") + "]"
+	if !strings.Contains(resultText(t, result), wantStamp) {
+		t.Fatalf("range output lacks local-time stamp %q: %q", wantStamp, resultText(t, result))
+	}
 }
 
-func TestR5MCPPersonMessageToolsClampAgentSuppliedLimits(t *testing.T) {
+func TestR5MCPPersonMessageToolsCapAgentSuppliedLimitsOnV2Only(t *testing.T) {
 	a := testApp(t)
 	reads := &toolRoutingReadSource{}
-	options := Options{Reads: reads, V2Primary: true}
+	v2 := Options{Reads: reads, V2Primary: true}
 
-	if _, err := getPersonMessagesHandler(a, options)(context.Background(), toolRequest(map[string]any{
+	result, err := getPersonMessagesHandler(a, v2)(context.Background(), toolRequest(map[string]any{
 		"name":  "V2 Conversation",
 		"limit": float64(1_000_000),
-	})); err != nil {
+	}))
+	if err != nil {
 		t.Fatal(err)
 	}
 	if reads.lastBatchLimit != maxPersonMessagesLimit {
-		t.Fatalf("get_person_messages limit = %d, want clamped to %d", reads.lastBatchLimit, maxPersonMessagesLimit)
+		t.Fatalf("v2 get_person_messages limit = %d, want capped to %d", reads.lastBatchLimit, maxPersonMessagesLimit)
+	}
+	if !strings.Contains(resultText(t, result), "limit capped at 500") {
+		t.Fatalf("capped get_person_messages did not say so: %q", resultText(t, result))
 	}
 
-	if _, err := getPersonMessagesRangeHandler(a, options)(context.Background(), toolRequest(map[string]any{
+	result, err = getPersonMessagesRangeHandler(a, v2)(context.Background(), toolRequest(map[string]any{
 		"name":   "V2 Conversation",
 		"after":  "2024-01-01",
 		"before": "2024-03-31",
-		"limit":  float64(-5),
-	})); err != nil {
+		"limit":  float64(1_000_000),
+	}))
+	if err != nil {
 		t.Fatal(err)
 	}
-	if reads.lastBatchLimit != 1 {
-		t.Fatalf("get_person_messages_range limit = %d, want clamped to 1", reads.lastBatchLimit)
+	if reads.lastBatchLimit != maxPersonMessagesRangeLimit {
+		t.Fatalf("v2 get_person_messages_range limit = %d, want capped to %d", reads.lastBatchLimit, maxPersonMessagesRangeLimit)
+	}
+	if !strings.Contains(resultText(t, result), "limit capped at 2000") {
+		t.Fatalf("capped get_person_messages_range did not say so: %q", resultText(t, result))
+	}
+
+	// Legacy-primary keeps the caller's value: the single-query store bounds
+	// its own work and never truncated before.
+	legacy := Options{Reads: reads}
+	result, err = getPersonMessagesHandler(a, legacy)(context.Background(), toolRequest(map[string]any{
+		"name":  "V2 Conversation",
+		"limit": float64(1_000_000),
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reads.lastBatchLimit != 1_000_000 {
+		t.Fatalf("legacy get_person_messages limit = %d, want the caller's 1000000", reads.lastBatchLimit)
+	}
+	if strings.Contains(resultText(t, result), "capped") {
+		t.Fatalf("legacy get_person_messages claimed a cap: %q", resultText(t, result))
 	}
 }
 

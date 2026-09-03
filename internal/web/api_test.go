@@ -895,14 +895,15 @@ func TestSearchIncludesConversationMetadataMatches(t *testing.T) {
 func TestSearchRequiresQuery(t *testing.T) {
 	ts := newTestServer(t)
 
-	resp, err := http.Get(ts.server.URL + "/api/search")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != 400 {
-		t.Fatalf("got status %d, want 400", resp.StatusCode)
+	for _, path := range []string{"/api/search", "/api/search?q=%20%20"} {
+		resp, err := http.Get(ts.server.URL + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != 400 {
+			t.Fatalf("%s: got status %d, want 400", path, resp.StatusCode)
+		}
 	}
 }
 

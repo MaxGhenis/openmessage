@@ -29,7 +29,7 @@ func getPersonMessagesHandler(a *app.App, configured ...Options) server.ToolHand
 		if name == "" {
 			return errorResult("name is required"), nil
 		}
-		limit := clampLimit(intArg(args, "limit", 50), maxPersonMessagesLimit)
+		limit, capped := personReadLimit(intArg(args, "limit", 50), maxPersonMessagesLimit, options.V2Primary)
 
 		// Find all conversations that mention this person
 		allConvs, err := options.Reads.ListConversations(1000)
@@ -73,7 +73,11 @@ func getPersonMessagesHandler(a *app.App, configured ...Options) server.ToolHand
 		// Group messages by conversation for display
 		var sb strings.Builder
 		sb.WriteString(messagePreamble)
-		fmt.Fprintf(&sb, "Messages with '%s' across %d conversation(s):\n\n", name, len(matchingConvIDs))
+		fmt.Fprintf(&sb, "Messages with '%s' across %d conversation(s):\n", name, len(matchingConvIDs))
+		if capped {
+			fmt.Fprintf(&sb, "(limit capped at %d on the v2 store — the newest %d messages are shown)\n", maxPersonMessagesLimit, limit)
+		}
+		sb.WriteString("\n")
 
 		currentConv := ""
 		totalMsgs := 0

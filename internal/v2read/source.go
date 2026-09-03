@@ -4,6 +4,7 @@ package v2read
 
 import (
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"github.com/maxghenis/openmessage/internal/readsource"
@@ -19,6 +20,10 @@ type Source struct {
 	attachments *sqlite.MessageAttachmentRepository
 	outbox      *sqlite.OutboxRepository
 	reactions   *sqlite.ReactionRepository
+
+	// batchPageQueries counts the page reads issued by the batch walks so
+	// tests can bound the read work, not just the result.
+	batchPageQueries atomic.Int64
 }
 
 // New constructs a v2 canonical read source. A nil store is retained as an

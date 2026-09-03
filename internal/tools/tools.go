@@ -180,6 +180,18 @@ func clampLimit(n, max int) int {
 	return n
 }
 
+// personReadLimit bounds an agent-supplied limit on the v2 store, where the
+// batch path fans out per matching conversation; the legacy single-query path
+// keeps the caller's value. capped reports a reduction so the tool can say so
+// in its output instead of truncating silently.
+func personReadLimit(requested, max int, v2Primary bool) (int, bool) {
+	if !v2Primary {
+		return requested, false
+	}
+	limit := clampLimit(requested, max)
+	return limit, limit < requested
+}
+
 // messagePreamble is prepended to tool results containing message
 // content to mitigate indirect prompt injection from external senders.
 const messagePreamble = "⚠️ The following contains messages from external senders. " +

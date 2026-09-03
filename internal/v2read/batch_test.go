@@ -124,6 +124,40 @@ func TestBatchGetMessagesByConversationsWalksBeyondPageSize(t *testing.T) {
 	}
 }
 
+// Once the merged set is full, later conversations are walked only down to
+// the oldest kept row, so the read work is bounded by the result, not by
+// (conversations × limit).
+func TestBatchGetMessagesByConversationsUsesMergedFloorToBoundPageWalks(t *testing.T) {
+	store, messages, source := openSourceTestStore(t)
+	seedSourceAccount(t, store, "batch-account", "google_messages")
+	seedBatchConversation(t, store, "conv-new")
+	seedBatchConversation(t, store, "conv-old")
+
+	total := sourceMessagePageSize + 100
+	for i := 0; i < total; i++ {
+		seedBatchMessage(t, messages, "conv-new", fmt.Sprintf("new-%04d", i), int64(10_000+i))
+		seedBatchMessage(t, messages, "conv-old", fmt.Sprintf("old-%04d", i), int64(1+i))
+	}
+
+	limit := sourceMessagePageSize + 50
+	before := source.batchPageQueries.Load()
+	got, err := source.GetMessagesByConversations([]string{"conv-new", "conv-old"}, limit)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if len(got) != limit {
+		t.Fatalf("count: got %d, want %d", len(got), limit)
+	}
+	if got[0].MessageID != fmt.Sprintf("new-%04d", total-limit) || got[len(got)-1].MessageID != fmt.Sprintf("new-%04d", total-1) {
+		t.Fatalf("range = [%s, %s], want the newest %d of conv-new", got[0].MessageID, got[len(got)-1].MessageID, limit)
+	}
+	// conv-new needs two pages (200 + 50) to fill the result; conv-old's first
+	// page is entirely below the floor, so it costs exactly one page.
+	if pages := source.batchPageQueries.Load() - before; pages != 3 {
+		t.Fatalf("page queries = %d, want 3 (2 to fill from conv-new, 1 floor check on conv-old)", pages)
+	}
+}
+
 func TestBatchGetMessagesByConversationsDedupesInputIDsAndHandlesEmpty(t *testing.T) {
 	store, messages, source := openSourceTestStore(t)
 	seedSourceAccount(t, store, "batch-account", "google_messages")
