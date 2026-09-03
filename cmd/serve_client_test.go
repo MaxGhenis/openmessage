@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/rs/zerolog"
@@ -23,6 +24,28 @@ import (
 // TestServeOptionsTransportMatrix pins which serve shapes may own live
 // platform connections. The MCP-stdio-only shape is the per-Claude-session
 // spawn and must default to transportless client mode.
+
+// lockedBuffer is a bytes.Buffer that is safe to share with the goroutines
+// RunServe's daemon shape leaves running after it returns (legacy sync loops,
+// the scheduler): they keep logging while the test reads the output, which
+// the race detector otherwise reports against whatever test runs next.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
 func TestServeOptionsTransportMatrix(t *testing.T) {
 	tests := []struct {
 		name           string
@@ -80,7 +103,7 @@ func TestRunServeMCPStdioStartsZeroTransportSupervisors(t *testing.T) {
 	dataDir := t.TempDir()
 	setClientModeTestEnv(t, dataDir)
 
-	var logs bytes.Buffer
+	var logs lockedBuffer
 	if err := RunServe(zerolog.New(&logs), "--mcp-stdio"); err != nil {
 		t.Fatalf("RunServe(--mcp-stdio): %v\n%s", err, logs.String())
 	}
@@ -111,7 +134,7 @@ func TestRunServeMCPStdioStartsZeroTransportSupervisors(t *testing.T) {
 	// above against silently passing because the fixtures changed.
 	daemonDataDir := t.TempDir()
 	setClientModeTestEnv(t, daemonDataDir)
-	var daemonLogs bytes.Buffer
+	var daemonLogs lockedBuffer
 	if err := RunServe(zerolog.New(&daemonLogs), "--mcp-stdio", "--transports"); err != nil {
 		t.Fatalf("RunServe(--mcp-stdio --transports): %v\n%s", err, daemonLogs.String())
 	}
@@ -162,7 +185,7 @@ func TestRunServeMCPClientAdoptsDaemonTruth(t *testing.T) {
 	setClientModeTestEnv(t, dataDir)
 	t.Setenv("OPENMESSAGES_PORT", daemonURL.Port())
 
-	var logs bytes.Buffer
+	var logs lockedBuffer
 	if err := RunServe(zerolog.New(&logs), "--mcp-stdio"); err != nil {
 		t.Fatalf("RunServe(--mcp-stdio): %v\n%s", err, logs.String())
 	}
@@ -209,7 +232,7 @@ func TestRunServeMCPClientAdoptsDaemonDataDir(t *testing.T) {
 		t.Fatalf("unset data dir: %v", err)
 	}
 
-	var logs bytes.Buffer
+	var logs lockedBuffer
 	if err := RunServe(zerolog.New(&logs), "--mcp-stdio"); err != nil {
 		t.Fatalf("RunServe(--mcp-stdio): %v\n%s", err, logs.String())
 	}
@@ -284,7 +307,7 @@ func TestRunServeMCPClientDoesNotRepairStore(t *testing.T) {
 	setClientModeTestEnv(t, dataDir)
 	seedLegacyReactionPlaceholder(t, dataDir)
 
-	var logs bytes.Buffer
+	var logs lockedBuffer
 	if err := RunServe(zerolog.New(&logs), "--mcp-stdio"); err != nil {
 		t.Fatalf("RunServe(--mcp-stdio): %v\n%s", err, logs.String())
 	}
