@@ -47,7 +47,6 @@ func (b *syncBuffer) String() string {
 // TestServeOptionsTransportMatrix pins which serve shapes may own live
 // platform connections. The MCP-stdio-only shape is the per-Claude-session
 // spawn and must default to transportless client mode.
-
 func TestServeOptionsTransportMatrix(t *testing.T) {
 	tests := []struct {
 		name           string
