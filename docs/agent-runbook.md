@@ -286,8 +286,9 @@ Key facts:
      (the signed-in profile; `Local State` maps profiles → accounts). Build a
      `name=value; name=value; …` header from `.google.com` / `messages.google.com`
      cookies and write it to a `0600` file.
-   - **Cookies rotate roughly every 30 minutes** → extract fresh **immediately**
-     before pairing, or `pair --google` returns HTTP 401.
+   - **Extract cookies immediately before pairing** — pairing with an older
+     extract has returned HTTP 401 (the staleness threshold is not
+     established; don't rely on any grace window).
 4. `pair --google` prints `EMOJI: <emoji>`. The user taps that emoji in Google
    Messages **on the phone** (notification shade, or profile → Device pairing)
    to confirm. The Gaia client init can time out once — just retry.
@@ -318,19 +319,61 @@ messages.google.com every repair failed with `missing required cookies:
 messages.google.com:OSID` and the app looped in `needs_repair` forever — a
 re-pair bought minutes, then died again.)
 
-**Expected steady-state:** Google invalidates replayed browser-cookie
-snapshots after ~14 minutes of Chrome concurrently advancing the same account
-session (measured 2026-07-20: 14 clean minutes of 200s, then
-`SESSION_COOKIE_INVALID`; fresh-pair sessions died in ~3-4 min). The healthy
-pattern is therefore a **heal cycle**: connected → cookie 401 → watchdog
-refresh from Chrome → reconnect, repeating every ~15 min with sub-minute dips.
+**Expected steady-state — check WHICH BINARY first.** Before diagnosing any
+latched `needs_repair`, confirm the running backend is the fixed build:
+
+```bash
+RUNBIN=$(ps -o command= -p "$(lsof -nP -iTCP:7007 -sTCP:LISTEN -t | head -1)" | awk '{print $1}')
+echo "$RUNBIN"; strings "$RUNBIN" | grep -c 'persisted rotated Google cookies'   # 0 = pre-fix build
+```
+
+**This is the single highest-yield check** — it has explained both stale-build
+outages so far (2026-07-22, ~11 min latched; 2026-07-25, 06:54→13:21 local,
+~6h26m). Many `.app` bundles on
+a dev machine share `CFBundleIdentifier com.openmessage.app` (stale worktree
+builds, dated backups, the R8 rollback copy), so LaunchServices can resolve
+Spotlight/Dock/`open -a OpenMessage`/notification clicks to a **pre-fix**
+build, which then latches `needs_repair` exactly like the original bug. Verify
+the resolution and always launch by explicit path:
+
+```bash
+osascript -e 'tell application "Finder" to get POSIX path of (application file id "com.openmessage.app" as alias)'
+open /Applications/OpenMessage.app
+```
+
+Stale-listener hazard (observed 2026-07-25): after quitting the GUI and
+launching `/Applications/OpenMessage.app`, port 7007 was **still served by the
+old bundle's backend**. (`BackendManager` has adopt/stop logic for existing
+backends — `BackendManager.swift` "Reusing existing backend pid" / "Stopping
+conflicting backend pid" — but with two same-ID bundles the outcome was a stale
+listener.) After any relaunch, verify the listener is the binary you intended
+and that the old PID exited:
+
+```bash
+ps -o pid=,command= -p "$(lsof -nP -iTCP:7007 -sTCP:LISTEN -t | head -1)"
+```
+
+**Observed lifetimes vary by regime; there is no known fixed timer.** An
+out-of-band probe replaying a *copy* of the session (2026-07-20, n=1) got
+`SESSION_COOKIE_INVALID` after ~14 minutes with Chrome active; fresh-pair
+sessions died in ~3-4 min (observed 4×, one account, 2026-07-19). On fixed
+builds, observed `auth_expired` episodes were 7/21 08:58, 7/22 16:12, 7/23
+09:56, and 7/28 21:58 — roughly 0-2/day on this one account — **each
+self-healing in ≤~2.5 min** (three cleared within a 60s sample). The two long
+latches (7/22 11:21, ~11 min; 7/25 06:54→13:21, ~6h26m) both occurred while
+**pre-fix builds** were running and ended when a fixed binary was
+deployed/launched. Why lifetimes differ is **not established** — do not treat
+any interval as a law. Healthy looks like: mostly connected, with rare
+`auth_expired` dips that self-heal in ~1-2.5 min via Chrome cookie import.
+Minutes-scale heal churn is **not** normal — check `google.repairs_paced`
+(below).
 Rotated cookies are also persisted to `session.json` (throttled, ~5 min) so a
 restart resumes from fresh values instead of pair-time snapshots. That write is
 atomic (temp file + fsync + rename), so a crash mid-save can never truncate the
 paired credentials; a failed save retries at a tenth of the interval instead of
 waiting a full one.
 
-**Is revocation running fast?** Automatic repairs are paced to at least
+**The repair pacing counter.** Automatic repairs are paced to at least
 `OPENMESSAGE_REPAIR_MIN_INTERVAL` (default 90s). Every delayed repair logs
 `Delaying Google credential repair` (with `wait` and `paced_total`) and bumps
 `google.repairs_paced` in `/api/status`:
@@ -339,18 +382,33 @@ waiting a full one.
 curl -s http://127.0.0.1:7007/api/status | jq '.google.repairs_paced'
 ```
 
-Absent/0 is the healthy ~15-minute heal cycle. A climbing count means repairs
-are being requested faster than the floor — i.e. something is revoking the
-imported cookies within minutes, which pacing throttles but does not fix. Read
-it before concluding a heal loop is "just slow".
+The counter records exactly one thing: **how many repair requests were delayed
+by the floor**. A climbing count proves requests arrived faster than the
+configured interval — it does not identify why (could be fast revocation, a
+crash/reconnect loop, or repeated manual reconnects). It cannot clear the
+session healthy either: a single failed repair parks the supervisor in Blocked
+with the counter still at 0. For context, observed expiries on fixed builds
+were ~0-2/day (one account).
+
+To see *why* a repair failed: the refresh error is currently **returned but
+never logged** — the native path emits no log line, and the supervisor
+discards the error detail (`handleRepairResult` sets Blocked without logging
+it) — so the only way to observe it today is to reproduce it directly: run
+`scripts/refresh-google-session-cookies-macos.py` manually and read its error
+output. (A fix to log the repair failure is chipped.)
 
 An `auth_expired` session with its device link intact revives by cookie
 rewrite alone — **do not re-pair** for `needs_repair`; that resets nothing the
 refresh can't fix and risks pairing throttles. So the **first** thing to try
-when SMS is dead is nothing — wait ~15-60s for the watchdog. If it hasn't
-recovered, the cookies are genuinely gone from Chrome (user signed out of
-Google there) or the device link was revoked; only then fall back to the
-manual re-pair recipe above. The app also posts a **health notification**
+when SMS is dead is nothing — wait ~2-3 min for the watchdog (the one observed
+live heal took 2m20s; under-waiting funnels you into the re-pair this section
+warns against). If it hasn't recovered, **read the actual repair and reconnect
+errors before deciding to re-pair** — the causes are broader than "the cookies
+are gone": Chrome/keychain/profile access, missing or undecryptable cookies, a
+session-file write failure, network or server rejection, or a genuinely revoked
+device link. Re-check the running binary (above) and whether Chrome still holds
+the five `.google.com` account cookies first; only once those are ruled out
+fall back to the manual re-pair recipe above. The app also posts a **health notification**
 (once, on the rising edge) when Google flips to `needs_repair` or WhatsApp
 logs out, so a dead platform can't sit silent for days.
 
@@ -435,15 +493,123 @@ poll — a crash loop that flaps the Signal `connected` flag every few seconds a
 makes the whole UI flicker. `brew upgrade signal-cli` fixes it. (PR #41 also
 hardened the UI to ignore redundant status pushes.)
 
+### Signal `needs_reauth` — read the fingerprint before believing the park
+
+`needs_reauth: true` is the bridge's **interpretation** of a signal-cli error,
+not server truth. Three live episodes (2026-07-20, 2026-07-24, 2026-08-06)
+parked a **valid** link for 12–22h because one boot-time `listAccounts` came up
+empty (signal-cli racing its own account bootstrap logs
+`Ignoring <number>: User is not registered.` and exits 0) and the bridge
+latched a permanent park; a single `POST /api/signal/connect` reconnected in
+~5s each time. The bridge now classifies with corroboration instead:
+
+- The receive-start probe **retries in-generation** (3 attempts, paced),
+  then checks `data/accounts.json`. Probe empty but accounts.json still lists
+  the account → **transient** exit (`signal_account_probe_empty`), retried on
+  supervisor backoff — no park, no `needs_reauth`.
+- Only 3 **consecutive generations** of that disagreement park, under
+  `signal_account_unreadable` — and that park **self-retests every 15 min**
+  (one local `RetryBlocked`; log line "Signal reauth park retest"), so a
+  lingering false park heals without manual intervention.
+- Server-backed evidence still parks fast and stays parked:
+  a receive-loop "not registered" / "authorization failed" needs 2
+  consecutive confirmations (seconds), then parks under
+  `signal_account_invalid` with **no** automatic retest. Probe empty with
+  accounts.json **also** empty parks immediately (`signal_account_invalid`).
+
+Debugging a parked Signal: check `/api/status` and the supervisor fingerprint
+before recommending a re-pair. `signal_account_unreadable` → local read
+problem, wait for the retest or `POST /api/signal/connect`; verify contention
+first (`pgrep -fl signal-cli`, `lsof` on the config dir — see the MCP
+fratricide section above). `signal_account_invalid` from `receive` → genuine
+server-side unlink, re-pair is real. **Never unpair to "fix" a park**: unpair
+`os.RemoveAll`s the signal-cli dir including CDN-expired media — permanent
+loss.
+
 ## Deploying a new build to a live install
 
+**`RELEASE=1` is required.** Without it `build.sh` stamps the dev bundle id
+(`com.openmessage.app.dev`) on purpose — see [bundle-id
+shadowing](#bundle-id-shadowing--only-one-app-may-claim-comopenmessageapp).
+Copying a dev-id build into `/Applications` would silently orphan the
+`defaults write com.openmessage.app V2Primary` lever and the notification grant.
+
 ```
-DEVELOPER_ID="Developer ID Application: Max Ghenis (8VB5UKQZC6)" ./macos/build.sh
+RELEASE=1 DEVELOPER_ID="Developer ID Application: Max Ghenis (8VB5UKQZC6)" ./macos/build.sh
 osascript -e 'quit app "OpenMessage"'      # fully quit; `open -a` on a running app won't relaunch it
 rm -rf /Applications/OpenMessage.app && cp -R macos/build/OpenMessage.app /Applications/
 xattr -cr /Applications/OpenMessage.app
 open -a OpenMessage
 ```
+
+Confirm the deployed bundle kept the release id:
+
+```
+/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' /Applications/OpenMessage.app/Contents/Info.plist
+# -> com.openmessage.app   (NOT ...app.dev)
+```
+
+**Building from a nested `.claude/worktrees/*` checkout needs `GOWORK=off`.**
+Go walks up, finds `~/openmessage/go.work`, and resolves the main module to the
+parent — `go build .` then fails with "main module … does not contain package
+…/.claude/worktrees/<name>". Prefix the build with `GOWORK=off`.
+
+## Bundle-id shadowing — only one .app may claim `com.openmessage.app`
+
+LaunchServices resolves "OpenMessage" (Spotlight, Dock, `open -a OpenMessage`,
+notification clicks) to *any* registered bundle declaring
+`CFBundleIdentifier = com.openmessage.app`. Every build output, backup, and
+Xcode archive used to declare it, so a stale build could be launched instead of
+the installed app. This caused two outages; on 2026-07-25 a build predating the
+self-heal OSID fix (PR #148) latched Google Messages in `needs_repair` for
+~10.5h (06:54 → ~17:20).
+
+Two fixes that **don't** work — verified 2026-07-25:
+
+- `lsregister -u <path>` is **not durable**. Any LaunchServices rescan
+  re-registers the bundle; a forced rescan brought all 14 straight back.
+- Renaming `Foo.app` → `Foo.app.disabled` does nothing. LaunchServices
+  registers on bundle *structure*, not the `.app` extension — it re-registered
+  every renamed bundle at its new path.
+
+What works:
+
+- **Build outputs:** unless `RELEASE=1`, `build.sh` stamps
+  `com.openmessage.app.dev` **and** names the bundle `OpenMessage (dev)`
+  (`CFBundleName` + `CFBundleDisplayName`). Both matter: id-based launches
+  (notification clicks, `open -b`) resolve by `CFBundleIdentifier`, but
+  name-based launches (`open -a OpenMessage`, Spotlight) resolve by the
+  registered *name*, which comes from the plist — **not** the `.app`
+  filename (a bundle renamed on disk still registered as "OpenMessage" from
+  its plist). With both stamped, neither launch path can land on a dev build.
+- **Backups/archives kept on disk:** rename `Contents/Info.plist` →
+  `Contents/Info.plist.disabled`. With no `Info.plist` LaunchServices can't read
+  a bundle id. Lossless and reversible; see `~/openmessage-ROLLBACK-README.md`
+  for the restore recipe.
+
+**Sharp edge — don't run a dev GUI on the live machine.** Because the dev id
+differs, macOS no longer dedupes it against the installed app: launching a dev
+build alongside it starts a real second GUI. That GUI *adopts* the daemon
+already listening on port 7007 (`BackendManager.reuseExistingBackendIfNeeded`
+— transport-safe, it won't spawn a competing stack), but its stop path
+SIGTERMs the adopted PID — **quitting the dev GUI kills the live backend out
+from under the installed app.** If that happens, relaunch the installed app.
+Tracked with the other dev-id-scoped traps in issue #165.
+
+Audit (should print exactly `/Applications/OpenMessage.app`):
+
+```
+/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -dump \
+ | awk '/^[[:space:]]*path:[[:space:]]/ { p=$0; sub(/^[[:space:]]*path:[[:space:]]*/,"",p); sub(/ \(0x[0-9a-f]*\)$/,"",p) }
+        /^[[:space:]]*identifier:[[:space:]]/ { id=$0; sub(/^[[:space:]]*identifier:[[:space:]]*/,"",id);
+        if (id=="com.openmessage.app") print p; p="" }' | sort -u
+```
+
+Note `mdfind "kMDItemCFBundleIdentifier == 'com.openmessage.app'"` is **not** a
+reliable audit — Spotlight keeps stale metadata for neutralized bundles and
+skips dot-directories entirely (two hidden rollback bundles were found only by
+a forced `lsregister -R -f`). Filter the `lsregister` dump by `identifier:` as
+above.
 
 The user's data and pairing **persist** — they live in the data dir, not in the
 `.app` bundle. A fresh restart re-establishes the Google long-poll, which can

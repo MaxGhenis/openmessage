@@ -8,13 +8,24 @@ import (
 	"sync"
 	"time"
 
+	"github.com/rs/zerolog"
+
 	"github.com/maxghenis/openmessage/internal/bridge"
+	"github.com/maxghenis/openmessage/internal/signallive"
 )
 
 const (
 	signalAccountID                = "signal-primary"
 	signalSupervisorStopTimeout    = 30 * time.Second
 	signalSupervisorCommandTimeout = 30 * time.Second
+
+	// signalParkRetestInterval paces the automatic retest of a reauth park
+	// whose only evidence was local (signal_account_unreadable: signal-cli
+	// could not read an account that accounts.json still lists). The retest
+	// is one supervisor RetryBlocked — a local listAccounts probe that either
+	// reconnects or re-parks — so the cadence can stay slow and still bound a
+	// false park to minutes instead of the 12-22h outages observed live.
+	signalParkRetestInterval = 15 * time.Minute
 )
 
 func signalSupervisorPolicy() bridge.Policy {
@@ -59,6 +70,10 @@ type signalSupervisorControl struct {
 	supervisorStopped bool
 	stopping          bool
 	closed            bool
+
+	retestOnce     sync.Once
+	retestStopOnce sync.Once
+	retestStop     chan struct{}
 }
 
 func newSignalSupervisorControl(
@@ -75,7 +90,64 @@ func newSignalSupervisorControl(
 		newSupervisor:    newSupervisor,
 		inputFingerprint: inputFingerprint,
 		lastFingerprint:  fingerprint,
+		retestStop:       make(chan struct{}),
 	}
+}
+
+// StartParkRetest launches the paced retest loop for the one Signal park that
+// is allowed to heal itself: StateBlocked with reauth_required and the
+// signal_account_unreadable fingerprint, which the bridge only reaches on
+// local evidence (listAccounts persistently empty while accounts.json still
+// lists a linked account — the boot-race false park observed live 2026-07-24
+// and 2026-08-06). Every other park stays user-owned: server-backed reauth
+// (signal_account_invalid), upgrade gates, and pairing failures are never
+// retried automatically, and nothing here ever unpairs. The loop stops with
+// Stop; a no-op interval disables it.
+func (c *signalSupervisorControl) StartParkRetest(interval time.Duration, logger zerolog.Logger) {
+	if c == nil || interval <= 0 {
+		return
+	}
+	c.retestOnce.Do(func() {
+		go func() {
+			ticker := time.NewTicker(interval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-c.retestStop:
+					return
+				case <-ticker.C:
+					c.maybeRetestPark(logger)
+				}
+			}
+		}()
+	})
+}
+
+func (c *signalSupervisorControl) maybeRetestPark(logger zerolog.Logger) {
+	c.mu.Lock()
+	if c.closed || c.stopping || c.supervisorStopped {
+		c.mu.Unlock()
+		return
+	}
+	supervisor := c.supervisor
+	c.mu.Unlock()
+
+	snapshot := supervisor.Snapshot()
+	if snapshot.State != bridge.StateBlocked ||
+		snapshot.ErrorClass != bridge.FailureReauthRequired ||
+		snapshot.ErrorFingerprint != signallive.SignalAccountUnreadableFingerprint {
+		return
+	}
+	logger.Info().
+		Str("fingerprint", snapshot.ErrorFingerprint).
+		Msg("Signal reauth park retest: re-probing blocked supervisor")
+	if err := c.Connect(); err != nil {
+		logger.Warn().Err(err).Msg("Signal reauth park retest failed; will retry on next tick")
+	}
+}
+
+func (c *signalSupervisorControl) stopParkRetest() {
+	c.retestStopOnce.Do(func() { close(c.retestStop) })
 }
 
 // Connect admits one user-owned start/retry. All automatic retry remains in
@@ -247,6 +319,7 @@ func (c *signalSupervisorControl) Stop(ctx context.Context) error {
 	if ctx == nil {
 		return errors.New("Signal supervisor control: nil stop context")
 	}
+	c.stopParkRetest()
 	c.mu.Lock()
 	if c.supervisor == nil {
 		c.closed = true

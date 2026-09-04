@@ -42,6 +42,28 @@ const (
 	versionProbeTimeout   = 5 * time.Second
 	historySyncQuietAfter = 45 * time.Second
 
+	// receiveAccountInvalidLimit is how many consecutive receive attempts must
+	// report an account-invalid error ("not registered" / "authorization
+	// failed" / "invalid account") before the generation parks reauth. Receive
+	// errors are server-backed evidence, so the bar stays low — a genuinely
+	// unlinked account fails every attempt and still parks within seconds —
+	// but a single glitched invocation can no longer latch a permanent park.
+	receiveAccountInvalidLimit = 2
+
+	// accountProbeAttemptTimeout bounds one listAccounts invocation inside the
+	// receive-start probe. The probe used to run on the bare generation
+	// context; a signal-cli hang (account-db contention) would stall the
+	// generation instead of failing an attempt that the retry loop can pace.
+	accountProbeAttemptTimeout = 30 * time.Second
+
+	// accountUnreadableStreakLimit is how many consecutive generations the
+	// local account probe must stay empty — while accounts.json still lists a
+	// linked account — before the bridge parks reauth under
+	// SignalAccountUnreadableFingerprint. One empty probe is routine at boot
+	// (signal-cli races its own account bootstrap); a persistent
+	// listAccounts/accounts.json disagreement is real and must still surface.
+	accountUnreadableStreakLimit = 3
+
 	signalGetSenderPoisonFingerprint = "incoming_message_get_sender_content_null"
 )
 
@@ -98,6 +120,12 @@ func isSignalIdleReceiveTimeout(err error, timedOut bool, output []byte) bool {
 
 var (
 	now = time.Now
+
+	// accountProbeRetryDelays paces the in-generation listAccounts retries: a
+	// probe that races signal-cli's own account bootstrap at boot (observed
+	// live 2026-07-24 and 2026-08-06: exit 0, zero accounts, link intact)
+	// usually recovers within seconds. Swapped by tests to keep them fast.
+	accountProbeRetryDelays = []time.Duration{2 * time.Second, 4 * time.Second}
 
 	signalCLILookPath     = exec.LookPath
 	signalCLIStat         = os.Stat
@@ -196,6 +224,21 @@ const (
 	SignalAccountProbeFingerprint      = "signal_account_probe_failed"
 	SignalReceivePanicFingerprint      = "signal_receive_panic"
 	SignalPairingIncompleteFingerprint = "signal_pairing_incomplete"
+
+	// SignalAccountProbeEmptyFingerprint marks a transient generation exit
+	// where listAccounts succeeded but reported no accounts while
+	// accounts.json still lists a linked one. The supervisor retries it on
+	// ordinary backoff; it never trips the non-transient circuit.
+	SignalAccountProbeEmptyFingerprint = "signal_account_probe_empty"
+
+	// SignalAccountUnreadableFingerprint marks the reauth park reached only
+	// after accountUnreadableStreakLimit consecutive generations of the probe
+	// disagreeing with accounts.json. Unlike SignalAccountInvalidFingerprint
+	// (server-backed receive failures, or an account missing from disk too)
+	// its only evidence is local, so the cmd-layer park retest is allowed to
+	// re-probe it periodically instead of waiting forever for a manual
+	// /api/signal/connect.
+	SignalAccountUnreadableFingerprint = "signal_account_unreadable"
 )
 
 // PollerExit is the terminal result of exactly one retained poller lifecycle.
@@ -311,9 +354,13 @@ type StatusSnapshot struct {
 	// NeedsReauth is set when signal-cli reports that the stored account is
 	// no longer registered / authorized (e.g. user re-registered Signal on a
 	// new phone, or the linked device was unlinked remotely). When true,
-	// automatic reconnects should stop — the user has to visit Platforms and
+	// automatic reconnects stop — the user has to visit Platforms and
 	// re-pair manually. The UI should surface this prominently; otherwise
-	// Signal silently stops receiving with no indication.
+	// Signal silently stops receiving with no indication. The one exception
+	// is the signal_account_unreadable park, whose only evidence is local
+	// (signal-cli could not read an account that accounts.json still lists):
+	// the cmd-layer park retest re-probes that state on a slow cadence, so a
+	// transient false park heals without a manual /api/signal/connect.
 	NeedsReauth     bool                   `json:"needs_reauth,omitempty"`
 	HistorySync     *HistorySyncSnapshot   `json:"history_sync,omitempty"`
 	ReceiveRecovery *ReceiveRecoveryStatus `json:"receive_recovery,omitempty"`
@@ -380,6 +427,13 @@ type Bridge struct {
 	// signal-cli version or its known poison-envelope crash. Automatic
 	// reconnects stay parked until a manual connect re-runs the version gate.
 	upgradeRequired bool
+	// probeEmptyStreak counts consecutive receive generations whose local
+	// account probe stayed empty (or reported account-invalid text) while
+	// accounts.json still listed a linked account. It gates the
+	// signal_account_unreadable reauth park: one boot-time race must not park
+	// a valid link, but a persistent listAccounts/accounts.json disagreement
+	// still surfaces needs_reauth. Reset by a successful probe or an unpair.
+	probeEmptyStreak int
 
 	pairCancel    context.CancelFunc
 	receiveCancel context.CancelFunc
@@ -820,6 +874,7 @@ func (b *Bridge) UnpairContext(ctx context.Context) error {
 	b.account = ""
 	b.needsReauth = false
 	b.upgradeRequired = false
+	b.probeEmptyStreak = 0
 	b.lastError = ""
 	b.qr = QRSnapshot{}
 	b.historySync = struct {
@@ -1664,38 +1719,19 @@ func (b *Bridge) runReceiveLoop(
 		event.Msg("Unable to detect signal-cli version; continuing receive without version gate")
 	}
 
-	probedAccount, err := b.probeAccount(ctx, account)
-	if err != nil || probedAccount == "" {
-		accountInvalid := (err == nil && probedAccount == "") || isSignalAccountInvalid(err, nil)
+	probedAccount, probeErr := b.probeAccountWithRetry(ctx, account, run)
+	if ctx.Err() != nil {
 		b.mu.Lock()
-		b.connected = false
-		b.connecting = false
-		b.needsReauth = accountInvalid
-		b.upgradeRequired = false
-		if err != nil {
-			b.lastError = err.Error()
-		} else {
-			b.lastError = "Signal account is not paired"
-		}
 		if b.receiveToken == token {
 			b.receiveCancel = nil
+			b.connected = false
+			b.connecting = false
 		}
 		b.mu.Unlock()
-		b.emitStatusChange()
-		if accountInvalid {
-			return PollerExit{
-				Kind:        PollerFailureReauth,
-				Operation:   "probe_account",
-				Fingerprint: SignalAccountInvalidFingerprint,
-				Err:         errors.New(b.Status().LastError),
-			}
-		}
-		return PollerExit{
-			Kind:        PollerFailureTransient,
-			Operation:   "probe_account",
-			Fingerprint: SignalAccountProbeFingerprint,
-			Err:         err,
-		}
+		return PollerExit{Err: ctx.Err()}
+	}
+	if probeErr != nil || probedAccount == "" {
+		return b.classifyFailedAccountProbe(token, probeErr)
 	}
 
 	b.mu.Lock()
@@ -1704,6 +1740,7 @@ func (b *Bridge) runReceiveLoop(
 	b.connecting = false
 	b.needsReauth = false // successful connect clears any prior re-auth flag
 	b.upgradeRequired = false
+	b.probeEmptyStreak = 0
 	b.lastError = ""
 	b.mu.Unlock()
 	b.emitStatusChange()
@@ -1722,6 +1759,7 @@ func (b *Bridge) runReceiveLoop(
 
 	consecutiveFailures := 0
 	consecutivePoisonFailures := 0
+	consecutiveAccountInvalid := 0
 	lastPoisonFingerprint := ""
 	for {
 		select {
@@ -1754,6 +1792,7 @@ func (b *Bridge) runReceiveLoop(
 			if isSignalIdleReceiveTimeout(err, timedOut, output) {
 				consecutiveFailures = 0
 				consecutivePoisonFailures = 0
+				consecutiveAccountInvalid = 0
 				lastPoisonFingerprint = ""
 				if run != nil {
 					run.beat("receive_idle")
@@ -1762,7 +1801,25 @@ func (b *Bridge) runReceiveLoop(
 			}
 			if isSignalAccountInvalid(err, output) {
 				// Signal-side says the account is no longer registered /
-				// authorized. Don't clear b.account — we want the UI to
+				// authorized. That is server-backed evidence, but one glitched
+				// invocation must not latch a permanent park: require
+				// receiveAccountInvalidLimit consecutive confirmations. A
+				// genuinely unlinked account fails every attempt the same way
+				// and still parks within seconds.
+				consecutiveAccountInvalid++
+				if consecutiveAccountInvalid < receiveAccountInvalidLimit {
+					consecutiveFailures++
+					consecutivePoisonFailures = 0
+					lastPoisonFingerprint = ""
+					b.logger.Warn().
+						Err(commandError("receive Signal messages", err, output)).
+						Int("confirmations", consecutiveAccountInvalid).
+						Int("required", receiveAccountInvalidLimit).
+						Msg("Signal receive reported an invalid account; retrying once before parking reauth")
+					time.Sleep(500 * time.Millisecond)
+					continue
+				}
+				// Don't clear b.account — we want the UI to
 				// know *which* account needs re-pairing. Instead flip
 				// needsReauth so the supervisor parks and the UI surfaces a
 				// clear "re-pair Signal" banner.
@@ -1784,6 +1841,7 @@ func (b *Bridge) runReceiveLoop(
 					Err:         commandError("receive Signal messages", err, output),
 				}
 			}
+			consecutiveAccountInvalid = 0
 			poisonFingerprint := signalReceivePoisonFingerprint(err, output)
 			if poisonFingerprint == "" {
 				consecutivePoisonFailures = 0
@@ -1833,6 +1891,7 @@ func (b *Bridge) runReceiveLoop(
 		}
 		consecutiveFailures = 0
 		consecutivePoisonFailures = 0
+		consecutiveAccountInvalid = 0
 		lastPoisonFingerprint = ""
 		if run != nil {
 			detail := "receive_poll"
@@ -1848,6 +1907,131 @@ func (b *Bridge) runReceiveLoop(
 			b.logger.Debug().Err(err).Msg("Failed to process Signal receive payload")
 		}
 	}
+}
+
+// probeAccountWithRetry runs the local listAccounts probe up to
+// len(accountProbeRetryDelays)+1 times before letting the caller classify the
+// failure. A signal-cli invocation that races the JVM's own account bootstrap
+// at backend boot can transiently report zero accounts (MultiAccountManager
+// logs "Ignoring <number>: User is not registered." and exits 0) even though
+// the stored link is intact — observed live on 2026-07-24 and 2026-08-06,
+// where one boot-time empty probe parked the bridge in needs_reauth for
+// 12-22h while a manual reconnect succeeded in seconds. Retrying inside the
+// generation keeps that transient from ever reaching the terminal classifier.
+// Returns ctx.Err() as the error when the generation is cancelled mid-retry.
+func (b *Bridge) probeAccountWithRetry(
+	ctx context.Context,
+	account string,
+	run *pollerRun,
+) (string, error) {
+	var probedAccount string
+	var probeErr error
+	for attempt := 0; ; attempt++ {
+		attemptCtx, cancelAttempt := context.WithTimeout(ctx, accountProbeAttemptTimeout)
+		probedAccount, probeErr = b.probeAccount(attemptCtx, account)
+		cancelAttempt()
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
+		if probeErr == nil && probedAccount != "" {
+			return probedAccount, nil
+		}
+		if attempt >= len(accountProbeRetryDelays) {
+			return probedAccount, probeErr
+		}
+		event := b.logger.Warn().Int("attempt", attempt+1)
+		if probeErr != nil {
+			event = event.Err(probeErr)
+		}
+		event.Msg("Signal account probe came up empty; retrying before classifying")
+		if run != nil {
+			run.beat("account_probe_retry")
+		}
+		timer := time.NewTimer(accountProbeRetryDelays[attempt])
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return "", ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+// classifyFailedAccountProbe turns an exhausted account probe into the
+// generation's terminal exit. The probe is local-only evidence — listAccounts
+// never consults the Signal server — so an empty or account-invalid result
+// can prove at most "signal-cli cannot see the account right now", never "the
+// server unlinked this device". Parking reauth therefore needs corroboration:
+//
+//   - accounts.json no longer lists any account: the link is locally gone, so
+//     the pre-existing immediate reauth park stands.
+//   - accounts.json still lists an account: count one strike and exit
+//     transient so supervisor backoff retries a fresh generation. Only
+//     accountUnreadableStreakLimit consecutive generations of the same
+//     disagreement park reauth, under SignalAccountUnreadableFingerprint so
+//     the cmd-layer park retest may re-probe it periodically.
+//
+// A probe error without account-invalid text stays a plain transient exit,
+// exactly as before. Nothing here ever unpairs: unpair deletes signal-cli
+// state (including CDN-expired media) and remains a manual-only action.
+func (b *Bridge) classifyFailedAccountProbe(token uint64, probeErr error) PollerExit {
+	locallyInvalid := probeErr == nil || isSignalAccountInvalid(probeErr, nil)
+	storedAccount := ""
+	if locallyInvalid {
+		storedAccount = b.firstStoredAccount()
+	}
+
+	b.mu.Lock()
+	b.connected = false
+	b.connecting = false
+	b.upgradeRequired = false
+	exit := PollerExit{Operation: "probe_account"}
+	switch {
+	case !locallyInvalid:
+		b.needsReauth = false
+		b.lastError = probeErr.Error()
+		exit.Kind = PollerFailureTransient
+		exit.Fingerprint = SignalAccountProbeFingerprint
+		exit.Err = probeErr
+	case storedAccount == "":
+		b.needsReauth = true
+		if probeErr != nil {
+			b.lastError = probeErr.Error()
+		} else {
+			b.lastError = "Signal account is not paired"
+		}
+		exit.Kind = PollerFailureReauth
+		exit.Fingerprint = SignalAccountInvalidFingerprint
+		exit.Err = errors.New(b.lastError)
+	default:
+		b.probeEmptyStreak++
+		if b.probeEmptyStreak >= accountUnreadableStreakLimit {
+			b.needsReauth = true
+			b.lastError = fmt.Sprintf(
+				"signal-cli cannot read the linked Signal account %s after %d consecutive attempts; the paced park retest will keep re-probing it",
+				storedAccount, b.probeEmptyStreak,
+			)
+			exit.Kind = PollerFailureReauth
+			exit.Fingerprint = SignalAccountUnreadableFingerprint
+			exit.Err = errors.New(b.lastError)
+		} else {
+			b.needsReauth = false
+			if probeErr != nil {
+				b.lastError = probeErr.Error()
+			} else {
+				b.lastError = "signal-cli reported no linked Signal account; retrying"
+			}
+			exit.Kind = PollerFailureTransient
+			exit.Fingerprint = SignalAccountProbeEmptyFingerprint
+			exit.Err = errors.New(b.lastError)
+		}
+	}
+	if b.receiveToken == token {
+		b.receiveCancel = nil
+	}
+	b.mu.Unlock()
+	b.emitStatusChange()
+	return exit
 }
 
 func (b *Bridge) parkUpgradeRequired(token uint64, detail string) {
@@ -4244,10 +4428,12 @@ func IsAccountInvalidError(err error) bool {
 // "not registered" phrasing it uses for an unregistered local account, so send
 // paths must NOT treat that phrase as a local-account fault: the account-scoped
 // receive probe (probe_account -> PollerFailureReauth) is the authoritative
-// detector and parks reauth on its own within seconds. "authorization failed"
-// and "invalid account" name the local account/credentials and never a
-// recipient, so they stay safe to act on from a send. See isSignalAccountInvalid
-// for the broader receive/probe matcher that also accepts "not registered".
+// detector and — after its in-generation retries and accounts.json
+// corroboration — still parks a genuinely missing account within seconds.
+// "authorization failed" and "invalid account" name the local
+// account/credentials and never a recipient, so they stay safe to act on from
+// a send. See isSignalAccountInvalid for the broader receive/probe matcher
+// that also accepts "not registered".
 func IsSendAccountInvalidError(err error) bool {
 	return isSignalSendAccountInvalid(err, nil)
 }

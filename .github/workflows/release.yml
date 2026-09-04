@@ -109,11 +109,32 @@ jobs:
 
       - name: Build macOS app + DMG
         env:
+          # RELEASE=1 is required: without it build.sh deliberately stamps the
+          # dev bundle id (com.openmessage.app.dev) and emits OpenMessage-dev.dmg,
+          # so a stale dev build can never shadow the installed app in
+          # LaunchServices. Shipping artifacts must carry the real id.
+          RELEASE: "1"
           DEVELOPER_ID: ${{ secrets.DEVELOPER_ID }}
           AC_USERNAME: ${{ secrets.AC_USERNAME }}
           AC_PASSWORD: ${{ secrets.AC_PASSWORD }}
           AC_TEAM_ID: ${{ secrets.AC_TEAM_ID }}
         run: bash macos/build.sh
+
+      - name: Verify release bundle identity
+        run: |
+          plist=macos/build/OpenMessage.app/Contents/Info.plist
+          id=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$plist")
+          name=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleName' "$plist")
+          echo "Built bundle id: $id, name: $name"
+          if [ "$id" != "com.openmessage.app" ] || [ "$name" != "OpenMessage" ]; then
+            echo "::error::Release build has id '$id' / name '$name', expected com.openmessage.app / OpenMessage."
+            echo "::error::RELEASE=1 was not honored — refusing to ship a dev-identity build."
+            exit 1
+          fi
+          test -f macos/build/OpenMessage.dmg || {
+            echo "::error::macos/build/OpenMessage.dmg missing (dev builds emit OpenMessage-dev.dmg)."
+            exit 1
+          }
 
       - name: Verify notarization
         if: ${{ env.HAS_CERT == 'true' }}
