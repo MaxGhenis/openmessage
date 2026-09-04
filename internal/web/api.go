@@ -277,6 +277,12 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 				out[key] = entry
 			}
 		}
+		// Freshness above reads only the ACTIVE read source. Running v2-primary
+		// with the legacy store still open, that hides a stalled projection: the
+		// legacy path can keep ingesting for days while v2 (what readers see)
+		// receives nothing, and every per-platform row still looks fresh. Publish
+		// the per-platform gap so the divergence is observable (#155).
+		addProjectionLag(out, keyFor, store, reads, opts.V2Primary)
 		freshnessValue = out
 		freshnessComputed = time.Now()
 		return out
@@ -3715,4 +3721,83 @@ func daysBehind(older, newer int64) int {
 		return 0
 	}
 	return int(time.UnixMilli(newer).Sub(time.UnixMilli(older)).Hours() / 24)
+}
+
+// projectionLagFloorMS is how far the active read source may trail the legacy
+// store before the gap is worth reporting. Live ingest is a two-writer race
+// (legacy path and v2 projection commit independently), so seconds of
+// disagreement are normal; a real projection stall shows up as minutes.
+const projectionLagFloorMS = int64(5 * 60 * 1000)
+
+// addProjectionLag annotates each per-platform freshness entry with how far the
+// active read source trails the legacy store, and stamps a top-level
+// `projection_stalled` flag when any platform is behind. Only meaningful in
+// v2-primary: there the API serves the v2 store while the legacy store keeps
+// its own copy of the same live traffic, so comparing them detects a stalled
+// ingest projection that per-platform freshness alone cannot see (#155).
+//
+// A nil legacy store, a non-v2-primary daemon, or reads that ARE the legacy
+// store leave the payload untouched.
+func addProjectionLag(
+	out map[string]any,
+	keyFor map[string]string,
+	legacy *db.Store,
+	reads readsource.ReadSource,
+	v2Primary bool,
+) {
+	if !v2Primary || legacy == nil || out == nil {
+		return
+	}
+	if sameSource, ok := reads.(*db.Store); ok && sameSource == legacy {
+		return
+	}
+	legacyStats, err := legacy.PlatformStats()
+	if err != nil {
+		return
+	}
+	legacyLatest := map[string]int64{}
+	for _, st := range legacyStats {
+		key := keyFor[st.Platform]
+		if key == "" {
+			continue
+		}
+		if st.LatestMS > legacyLatest[key] {
+			legacyLatest[key] = st.LatestMS
+		}
+	}
+	stalled := false
+	for key, latest := range legacyLatest {
+		entry, ok := out[key].(map[string]any)
+		if !ok {
+			// The read source has no rows at all for a platform the legacy store
+			// does have — the most severe form of the stall, so surface it rather
+			// than dropping it.
+			if latest > 0 {
+				out[key] = map[string]any{
+					"latest_ms":          int64(0),
+					"latest_received_ms": int64(0),
+					"behind_days":        0,
+					"stale":              false,
+					"legacy_latest_ms":   latest,
+					"projection_lag_ms":  latest,
+					"projection_stalled": true,
+				}
+				stalled = true
+			}
+			continue
+		}
+		readsLatest, _ := entry["latest_ms"].(int64)
+		lag := latest - readsLatest
+		if lag < 0 {
+			lag = 0
+		}
+		entry["legacy_latest_ms"] = latest
+		entry["projection_lag_ms"] = lag
+		entry["projection_stalled"] = lag > projectionLagFloorMS
+		if lag > projectionLagFloorMS {
+			stalled = true
+		}
+		out[key] = entry
+	}
+	out["projection_stalled"] = stalled
 }

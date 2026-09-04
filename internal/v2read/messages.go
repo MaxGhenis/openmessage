@@ -36,7 +36,7 @@ func (s *Source) getMessagesBefore(
 		return nil, err
 	}
 	messages, err := s.messages.ListMessagesByConversation(
-		context.Background(), conversationID, beforeMS, beforeID, limit,
+		context.Background(), s.resolveConversationID(conversationID), beforeMS, beforeID, limit,
 	)
 	if err != nil {
 		return nil, err
@@ -55,7 +55,7 @@ func (s *Source) GetMessagesByConversationAfter(
 		return nil, err
 	}
 	messages, err := s.messages.ListMessagesByConversationAfter(
-		context.Background(), conversationID, afterMS, afterID, limit,
+		context.Background(), s.resolveConversationID(conversationID), afterMS, afterID, limit,
 	)
 	if err != nil {
 		return nil, err
@@ -74,7 +74,7 @@ func (s *Source) GetMessagesAroundMessage(
 		return nil, err
 	}
 	messages, err := s.messages.ListMessagesAroundMessage(
-		context.Background(), conversationID, messageID, before, after,
+		context.Background(), s.resolveConversationID(conversationID), messageID, before, after,
 	)
 	if errors.Is(err, sqlite.ErrNotFound) {
 		return nil, db.ErrMessageNotFound

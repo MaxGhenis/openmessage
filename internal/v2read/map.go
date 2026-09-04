@@ -64,13 +64,24 @@ func (s *Source) mapConversation(
 			conversation.AccountID,
 		)
 	}
-	participants, err := s.participantsJSON(conversation.ConversationID)
+	infos, err := s.participantInfos(conversation.ConversationID)
 	if err != nil {
 		return nil, err
 	}
+	participants, err := participantsJSON(conversation.ConversationID, infos)
+	if err != nil {
+		return nil, err
+	}
+	name := conversation.Title
+	if name == "" && conversation.Kind != sqlite.ConversationKindGroup {
+		// Direct conversations have no title of their own; the legacy DTO
+		// names them after the remote peer, so v2 reads must too or 1:1
+		// threads render blank and unfindable in every conversation list.
+		name = directPeerName(infos)
+	}
 	return &db.Conversation{
 		ConversationID:   conversation.ConversationID,
-		Name:             conversation.Title,
+		Name:             name,
 		IsGroup:          conversation.Kind == sqlite.ConversationKindGroup,
 		Participants:     participants,
 		LastMessageTS:    conversation.LastMessageAtMS,
@@ -81,16 +92,21 @@ func (s *Source) mapConversation(
 	}, nil
 }
 
-func (s *Source) participantsJSON(conversationID string) (string, error) {
+type participantInfo struct {
+	dto    participantDTO
+	isSelf bool
+}
+
+func (s *Source) participantInfos(conversationID string) ([]participantInfo, error) {
 	participants, err := s.store.ListParticipants(conversationID)
 	if err != nil {
-		return "", fmt.Errorf("map conversation %q participants: %w", conversationID, err)
+		return nil, fmt.Errorf("map conversation %q participants: %w", conversationID, err)
 	}
-	dtos := make([]participantDTO, 0, len(participants))
+	infos := make([]participantInfo, 0, len(participants))
 	for _, participant := range participants {
 		identity, err := s.store.GetIdentity(participant.IdentityID)
 		if err != nil {
-			return "", fmt.Errorf(
+			return nil, fmt.Errorf(
 				"map conversation %q participant %q: %w",
 				conversationID,
 				participant.IdentityID,
@@ -101,16 +117,45 @@ func (s *Source) participantsJSON(conversationID string) (string, error) {
 		if name == "" {
 			name = identity.DisplayName
 		}
-		dtos = append(dtos, participantDTO{
-			Name:   name,
-			Number: identity.CanonicalValue,
+		infos = append(infos, participantInfo{
+			dto: participantDTO{
+				Name:   name,
+				Number: identity.CanonicalValue,
+			},
+			isSelf: identity.IsSelf,
 		})
+	}
+	return infos, nil
+}
+
+func participantsJSON(conversationID string, infos []participantInfo) (string, error) {
+	dtos := make([]participantDTO, 0, len(infos))
+	for _, info := range infos {
+		dtos = append(dtos, info.dto)
 	}
 	encoded, err := json.Marshal(dtos)
 	if err != nil {
 		return "", fmt.Errorf("map conversation %q participants: %w", conversationID, err)
 	}
 	return string(encoded), nil
+}
+
+// directPeerName picks the display name for a direct conversation from its
+// remote peer, preferring the peer's name and falling back to the canonical
+// address so the thread is at least addressable by number.
+func directPeerName(infos []participantInfo) string {
+	for _, info := range infos {
+		if info.isSelf {
+			continue
+		}
+		if name := strings.TrimSpace(info.dto.Name); name != "" {
+			return name
+		}
+		if number := strings.TrimSpace(info.dto.Number); number != "" {
+			return number
+		}
+	}
+	return ""
 }
 
 func (s *Source) mapMessages(
