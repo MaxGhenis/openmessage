@@ -963,6 +963,7 @@ func TestSearchMessagesEndpointValidation(t *testing.T) {
 		"/api/search/messages?q=%20%20",
 		"/api/search/messages?q=x&since=not-a-date",
 		"/api/search/messages?q=x&until=not-a-date",
+		"/api/search/messages?q=x&since=2024-03-31&until=2024-01-01",
 	} {
 		resp, err := http.Get(ts.server.URL + path)
 		if err != nil {

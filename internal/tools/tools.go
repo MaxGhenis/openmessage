@@ -2,6 +2,7 @@ package tools
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -180,16 +181,54 @@ func clampLimit(n, max int) int {
 	return n
 }
 
-// personReadLimit bounds an agent-supplied limit on the v2 store, where the
-// batch path fans out per matching conversation; the legacy single-query path
-// keeps the caller's value. capped reports a reduction so the tool can say so
-// in its output instead of truncating silently.
+// personReadLimit bounds an agent-supplied limit. On the v2 store it caps at
+// max because the batch path fans out per matching conversation. The legacy
+// single-query path keeps the caller's value above a floor of 1: SQLite reads
+// a negative LIMIT as "no limit", and intArg can produce one from an
+// out-of-range number, so an unfloored value would dump entire histories.
+// capped reports a reduction so the tool can say so instead of truncating
+// silently.
 func personReadLimit(requested, max int, v2Primary bool) (int, bool) {
 	if !v2Primary {
+		if requested < 1 {
+			return 1, false
+		}
 		return requested, false
 	}
 	limit := clampLimit(requested, max)
 	return limit, limit < requested
+}
+
+// personConversationLabel names a conversation for person-tool output: its
+// title, else the first non-self participant's name or number (v2 maps
+// titleless direct threads with Name "" and the peer only in Participants),
+// else the id.
+func personConversationLabel(c *db.Conversation) string {
+	if c == nil {
+		return ""
+	}
+	if name := strings.TrimSpace(c.Name); name != "" {
+		return name
+	}
+	var participants []struct {
+		Name   string `json:"name"`
+		Number string `json:"number"`
+		IsMe   bool   `json:"is_me"`
+	}
+	if err := json.Unmarshal([]byte(c.Participants), &participants); err == nil {
+		for _, participant := range participants {
+			if participant.IsMe {
+				continue
+			}
+			if name := strings.TrimSpace(participant.Name); name != "" {
+				return name
+			}
+			if number := strings.TrimSpace(participant.Number); number != "" {
+				return number
+			}
+		}
+	}
+	return c.ConversationID
 }
 
 // messagePreamble is prepended to tool results containing message

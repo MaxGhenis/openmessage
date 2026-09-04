@@ -1524,6 +1524,12 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			httpError(w, "until: "+err.Error(), 400)
 			return
 		}
+		// The legacy store swaps a reversed window and v2 passes it through;
+		// reject it so both stores answer identically.
+		if sinceMS > 0 && untilMS > 0 && sinceMS > untilMS {
+			httpError(w, "since must not be after until", 400)
+			return
+		}
 		filter := db.SearchFilter{
 			Phone:          strings.TrimSpace(r.URL.Query().Get("phone")),
 			ConversationID: strings.TrimSpace(r.URL.Query().Get("conversation_id")),

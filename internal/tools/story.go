@@ -326,7 +326,7 @@ func getPersonMessagesRangeTool() mcp.Tool {
 		mcp.WithString("name", mcp.Required(), mcp.Description("Person's name to search for (case-insensitive partial match)")),
 		mcp.WithString("after", mcp.Required(), mcp.Description("Start date (YYYY-MM-DD, local time, e.g. '2024-01-01')")),
 		mcp.WithString("before", mcp.Required(), mcp.Description("End date (YYYY-MM-DD, local time, inclusive to end of day, e.g. '2024-03-31')")),
-		mcp.WithNumber("limit", mcp.Description("Max messages to return (default 500, max 2000)")),
+		mcp.WithNumber("limit", mcp.Description("Max messages to return (default 500; capped at 2000 on the v2 store)")),
 		mcp.WithReadOnlyHintAnnotation(true),
 		mcp.WithDestructiveHintAnnotation(false),
 	)
@@ -430,7 +430,7 @@ func findPersonConversations(reads readsource.ReadSource, name string) ([]string
 			if platform == "" {
 				platform = "sms"
 			}
-			convNames = append(convNames, fmt.Sprintf("%s [%s]", c.Name, platform))
+			convNames = append(convNames, fmt.Sprintf("%s [%s]", personConversationLabel(c), platform))
 		}
 	}
 	return matchingConvIDs, convNames, nil

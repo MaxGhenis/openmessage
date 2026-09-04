@@ -40,6 +40,14 @@ func (s *toolRoutingReadSource) ListConversations(limit int) ([]*db.Conversation
 		Name:           "V2 Conversation",
 		SourcePlatform: "sms",
 		LastMessageTS:  200,
+	}, {
+		// A titleless direct thread exactly as v2 maps them: Name "" and the
+		// peer present only in the Participants JSON.
+		ConversationID: "v2-direct",
+		Name:           "",
+		Participants:   `[{"name":"V2 Alice","number":"+15551230000"},{"name":"Me","number":"+15550009999","is_me":true}]`,
+		SourcePlatform: "whatsapp",
+		LastMessageTS:  100,
 	}}, nil
 }
 
@@ -82,7 +90,7 @@ func (s *toolRoutingReadSource) GetMessagesByConversations(conversationIDs []str
 	s.batchCalls++
 	s.lastBatchIDs = conversationIDs
 	s.lastBatchLimit = limit
-	return fakePersonMessages("v2-person-message", "v2 person body", s.batchFill), nil
+	return fakePersonMessages(conversationIDs[0], "v2-person-message", "v2 person body", s.batchFill), nil
 }
 
 func (s *toolRoutingReadSource) GetMessagesByConversationsRange(conversationIDs []string, afterMS, beforeMS int64, limit int) ([]*db.Message, error) {
@@ -91,13 +99,13 @@ func (s *toolRoutingReadSource) GetMessagesByConversationsRange(conversationIDs 
 	s.lastBatchLimit = limit
 	s.lastAfterMS = afterMS
 	s.lastBeforeMS = beforeMS
-	return fakePersonMessages("v2-person-range-message", "v2 person range body", s.rangeFill), nil
+	return fakePersonMessages(conversationIDs[0], "v2-person-range-message", "v2 person range body", s.rangeFill), nil
 }
 
 // fakePersonMessages returns one message shaped like the routing fakes, or
 // count distinct messages (ids, bodies, and timestamps all differ so the
 // range tool's near-duplicate filter keeps them all).
-func fakePersonMessages(id, body string, count int) []*db.Message {
+func fakePersonMessages(conversationID, id, body string, count int) []*db.Message {
 	if count < 1 {
 		count = 1
 	}
@@ -105,7 +113,7 @@ func fakePersonMessages(id, body string, count int) []*db.Message {
 	for i := 0; i < count; i++ {
 		message := &db.Message{
 			MessageID:      id,
-			ConversationID: "v2-conversation",
+			ConversationID: conversationID,
 			SenderName:     "V2 Alice",
 			Body:           body,
 			TimestampMS:    200,
@@ -416,6 +424,55 @@ func TestR5MCPPersonMessageToolsCapAgentSuppliedLimitsOnV2Only(t *testing.T) {
 	}
 	if strings.Contains(text, "capped") {
 		t.Fatalf("legacy get_person_messages claimed a cap: %q", text)
+	}
+	// ...but never a negative one: SQLite reads a negative LIMIT as no limit.
+	for name, handler := range map[string]server.ToolHandlerFunc{
+		"get_person_messages":       getPersonMessagesHandler(a, Options{Reads: reads}),
+		"get_person_messages_range": getPersonMessagesRangeHandler(a, Options{Reads: reads}),
+	} {
+		args := map[string]any{"name": "V2 Conversation", "after": "2024-01-01", "before": "2024-03-31", "limit": float64(-1)}
+		call(t, handler, args)
+		if reads.lastBatchLimit != 1 {
+			t.Fatalf("legacy %s passed limit %d through; want floor 1", name, reads.lastBatchLimit)
+		}
+	}
+}
+
+// Real v2 direct threads have no title — the peer lives only in Participants.
+// The person tools must match on that and label the thread by the peer.
+func TestR5MCPPersonToolsMatchTitlelessDirectThreadsByParticipant(t *testing.T) {
+	a := testApp(t)
+	reads := &toolRoutingReadSource{}
+	options := Options{Reads: reads, V2Primary: true}
+
+	result, err := getPersonMessagesHandler(a, options)(context.Background(), toolRequest(map[string]any{"name": "v2 alice"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.IsError {
+		t.Fatalf("unexpected tool error: %q", resultText(t, result))
+	}
+	if len(reads.lastBatchIDs) != 1 || reads.lastBatchIDs[0] != "v2-direct" {
+		t.Fatalf("participant match selected %v, want [v2-direct]", reads.lastBatchIDs)
+	}
+	if text := resultText(t, result); !strings.Contains(text, "--- V2 Alice [whatsapp] (ID: v2-direct) ---") {
+		t.Fatalf("titleless thread not labelled by its peer: %q", text)
+	}
+
+	result, err = getPersonMessagesRangeHandler(a, options)(context.Background(), toolRequest(map[string]any{
+		"name": "v2 alice", "after": "2024-01-01", "before": "2024-03-31",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.IsError {
+		t.Fatalf("unexpected tool error: %q", resultText(t, result))
+	}
+	if len(reads.lastBatchIDs) != 1 || reads.lastBatchIDs[0] != "v2-direct" {
+		t.Fatalf("range participant match selected %v, want [v2-direct]", reads.lastBatchIDs)
+	}
+	if text := resultText(t, result); !strings.Contains(text, "V2 Alice [whatsapp]") {
+		t.Fatalf("range header does not label the titleless thread by its peer: %q", text)
 	}
 }
 

@@ -15,7 +15,7 @@ func getPersonMessagesTool() mcp.Tool {
 	return mcp.NewTool("get_person_messages",
 		mcp.WithDescription("Get all messages with a person across all platforms (SMS, Google Chat, iMessage, WhatsApp). Searches by name or identifier."),
 		mcp.WithString("name", mcp.Required(), mcp.Description("Person's name to search for (case-insensitive partial match)")),
-		mcp.WithNumber("limit", mcp.Description("Maximum messages to return (default 50, max 500)")),
+		mcp.WithNumber("limit", mcp.Description("Maximum messages to return (default 50; capped at 500 on the v2 store)")),
 		mcp.WithReadOnlyHintAnnotation(true),
 		mcp.WithDestructiveHintAnnotation(false),
 	)
@@ -59,7 +59,7 @@ func getPersonMessagesHandler(a *app.App, configured ...Options) server.ToolHand
 					if platform == "" {
 						platform = "sms"
 					}
-					convMap[id] = &struct{ name, platform string }{c.Name, platform}
+					convMap[id] = &struct{ name, platform string }{personConversationLabel(c), platform}
 				}
 			}
 		}
