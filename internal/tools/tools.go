@@ -200,9 +200,11 @@ func personReadLimit(requested, max int, v2Primary bool) (int, bool) {
 }
 
 // personConversationLabel names a conversation for person-tool output: its
-// title, else the first non-self participant's name or number (v2 maps
-// titleless direct threads with Name "" and the peer only in Participants),
-// else the id.
+// title when it has one; otherwise a direct thread is named after its peer
+// (v2 maps titleless direct threads with Name "" and the peer only in
+// Participants) and a group is labelled as a group from its members — never
+// after one arbitrary member, which would present the group as that
+// person's 1:1 thread. With nothing to go on, the id.
 func personConversationLabel(c *db.Conversation) string {
 	if c == nil {
 		return ""
@@ -215,18 +217,30 @@ func personConversationLabel(c *db.Conversation) string {
 		Number string `json:"number"`
 		IsMe   bool   `json:"is_me"`
 	}
-	if err := json.Unmarshal([]byte(c.Participants), &participants); err == nil {
-		for _, participant := range participants {
-			if participant.IsMe {
-				continue
-			}
-			if name := strings.TrimSpace(participant.Name); name != "" {
-				return name
-			}
-			if number := strings.TrimSpace(participant.Number); number != "" {
-				return number
-			}
+	_ = json.Unmarshal([]byte(c.Participants), &participants)
+	var others []string
+	for _, participant := range participants {
+		if participant.IsMe {
+			continue
 		}
+		if name := strings.TrimSpace(participant.Name); name != "" {
+			others = append(others, name)
+		} else if number := strings.TrimSpace(participant.Number); number != "" {
+			others = append(others, number)
+		}
+	}
+	switch {
+	case c.IsGroup && len(others) > 0:
+		const shown = 3
+		label := "Group: " + strings.Join(others[:min(len(others), shown)], ", ")
+		if len(others) > shown {
+			label += fmt.Sprintf(" +%d more", len(others)-shown)
+		}
+		return label
+	case c.IsGroup:
+		return "Group " + c.ConversationID
+	case len(others) > 0:
+		return others[0]
 	}
 	return c.ConversationID
 }
