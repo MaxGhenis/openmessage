@@ -40,12 +40,32 @@ func seedSearchFixture(t *testing.T, store *sqlite.Store) {
 	}); err != nil {
 		t.Fatalf("UpsertIdentity(): %v", err)
 	}
+	if err := store.UpsertIdentity(sqlite.Identity{
+		IdentityID:     "identity-self",
+		AccountID:      "search-account",
+		Kind:           sqlite.IdentityKind("e164"),
+		CanonicalValue: "+15550009999",
+		RawValue:       "+15550009999",
+		DisplayName:    "Me",
+		IsSelf:         true,
+		MetadataJSON:   `{}`,
+		CreatedAtMS:    sourceTestTimeMS,
+		UpdatedAtMS:    sourceTestTimeMS,
+	}); err != nil {
+		t.Fatalf("UpsertIdentity(self): %v", err)
+	}
 	if err := store.ReplaceConversationParticipants("conversation-direct", []sqlite.ConversationParticipant{{
 		AccountID:      "search-account",
 		ConversationID: "conversation-direct",
 		IdentityID:     "identity-alice",
 		Role:           sqlite.ParticipantRoleMember,
 		DisplayName:    "Ali (nickname)",
+		IsActive:       true,
+	}, {
+		AccountID:      "search-account",
+		ConversationID: "conversation-direct",
+		IdentityID:     "identity-self",
+		Role:           sqlite.ParticipantRoleMember,
 		IsActive:       true,
 	}}); err != nil {
 		t.Fatalf("ReplaceConversationParticipants(): %v", err)
@@ -69,6 +89,13 @@ func TestSearchConversationsByMetadataMatchesTitleParticipantsAndAddresses(t *te
 			assertConversationIDs(t, got, "conversation-direct")
 			if !strings.Contains(got[0].Participants, "Ali (nickname)") {
 				t.Fatalf("direct conversation participants = %q, want the matched peer", got[0].Participants)
+			}
+			// The account owner is flagged so readers can tell it from the peer.
+			if !strings.Contains(got[0].Participants, `"name":"Me","number":"+15550009999","is_me":true`) {
+				t.Fatalf("self participant not flagged is_me: %q", got[0].Participants)
+			}
+			if strings.Contains(got[0].Participants, `"Ali (nickname)","number":"+15550000001","is_me"`) {
+				t.Fatalf("peer participant wrongly flagged is_me: %q", got[0].Participants)
 			}
 		})
 	}

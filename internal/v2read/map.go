@@ -13,9 +13,12 @@ import (
 	"github.com/maxghenis/openmessage/internal/storage/sqlite"
 )
 
+// participantDTO mirrors the legacy participants JSON, including the
+// is_me flag readers use to tell the account owner from the peer.
 type participantDTO struct {
 	Name   string `json:"name"`
 	Number string `json:"number"`
+	IsMe   bool   `json:"is_me,omitempty"`
 }
 
 type reactionDTO struct {
@@ -121,6 +124,7 @@ func (s *Source) participantInfos(conversationID string) ([]participantInfo, err
 			dto: participantDTO{
 				Name:   name,
 				Number: identity.CanonicalValue,
+				IsMe:   identity.IsSelf,
 			},
 			isSelf: identity.IsSelf,
 		})
