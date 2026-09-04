@@ -37,8 +37,16 @@ but misses WAL-only (recent) writes. **Prefer the running app's HTTP API**
 GET /api/status
 GET /api/conversations?limit=500
 GET /api/conversations/<conversation_id>/messages?limit=N
-GET /api/search?q=<term>
+GET /api/search?q=<term>            # conversation summaries (one row per thread)
+GET /api/search/messages?q=<term>   # raw message rows (MessageID/Body/TimestampMS…)
 ```
+
+**`/api/search` returns conversation-level results** (`ConversationID`, `Name`,
+`Participants`, `preview`) for the web UI's search box — parsing message fields
+out of it silently yields nothing. For message hits use `/api/search/messages`,
+which returns the same DTO as `/api/conversations/<id>/messages` and accepts
+`phone`, `conversation_id`, `since`/`until` (YYYY-MM-DD, local; `until`
+inclusive to end of day), and `limit` (default 50, max 500).
 
 Outgoing message rows carry a `Status`: `OUTGOING_SENDING` → `OUTGOING_SENT`/
 `OUTGOING_DELIVERED`, or `OUTGOING_FAILED:<STATUS>` when a send is rejected.

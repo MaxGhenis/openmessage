@@ -105,12 +105,33 @@ mode this prevents and the `~/.mcp.json` recipe.
 - `render_story` — render a pre-built Story JSON into HTML viz; supports `photo_paths` (curated list) or `photos_dir`
 - `send_message`, `draft_message`, `download_media`, `list_contacts`, `get_status`
 
+On a v2-primary install the message-read tools (including `get_person_messages`
+and `get_person_messages_range`) serve the v2 store through the canonical read
+seam; on v2 their `limit` is capped (500 and 2,000, and the output says when
+the cap applied) because the v2 batch path fans out per matching conversation,
+while the legacy single-query path keeps the caller's value above a floor of 1
+(a negative SQLite LIMIT means no limit). Date arguments are YYYY-MM-DD in
+local time on every surface (CLI, HTTP, MCP) via `db.ParseDayBound`, and the
+range tool labels rows in that same local time. The stats/story/viz tools
+(`conversation_stats`, `generate_story`,
+`person_stats`, `generate_person_story`, `generate_viz`, `render_story`) still
+load full histories from the legacy store, which froze at cutover, so they
+return an error naming the working read tools instead.
+
 ### HTTP API
 
 - `GET /api/stats/{conversation_id}` — conversation statistics JSON
 - `GET /api/story/{conversation_id}?style=intimate&api_key=...` — generated story JSON
 - `GET /api/conversations?limit=50` — list all conversations (all platforms)
-- `GET /api/search?q=...` — search across all platforms
+- `GET /api/search?q=...` — **conversation-level** search: one row per matching
+  conversation (`ConversationID`/`Name`/`Participants`/`preview`), matched by
+  message text and by conversation name/participants. This feeds the web UI's
+  search box — it does not return message rows.
+- `GET /api/search/messages?q=...` — **message-level** search: raw message DTOs
+  (`MessageID`/`Body`/`TimestampMS`…, same shape as
+  `/api/conversations/<id>/messages`), the HTTP twin of the `search_messages`
+  MCP tool. Optional `phone`, `conversation_id`, `since`/`until` (YYYY-MM-DD,
+  local time, `until` inclusive to end of day), `limit` (default 50, max 500).
 
 ### Schema
 

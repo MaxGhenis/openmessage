@@ -1472,7 +1472,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 	})
 
 	mux.HandleFunc("/api/search", func(w http.ResponseWriter, r *http.Request) {
-		q := r.URL.Query().Get("q")
+		q := strings.TrimSpace(r.URL.Query().Get("q"))
 		if q == "" {
 			httpError(w, "query parameter 'q' is required", 400)
 			return
@@ -1483,20 +1483,69 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			httpError(w, "search: "+err.Error(), 500)
 			return
 		}
-		var (
-			convos        []*db.Conversation
-			identityStore *db.Store
-		)
+		var identityStore *db.Store
 		if !opts.V2Primary {
-			convos, err = store.SearchConversationsByMetadata(q, limit)
-			if err != nil {
-				httpError(w, "search: "+err.Error(), 500)
-				return
-			}
 			identityStore = store
+		}
+		// Name/participant matches so searching a person finds their threads
+		// even when the name never appears in message text. Message hits
+		// still render if this fails — one unmappable conversation must not
+		// blank the search box.
+		convos, err := reads.SearchConversationsByMetadata(q, limit)
+		if err != nil {
+			logger.Warn().Err(err).Msg("conversation metadata search failed; serving message hits only")
+			convos = nil
 		}
 		results := mergeSearchResults(reads, identityStore, msgs, convos, limit)
 		writeJSON(w, results)
+	})
+
+	// Message-level search: returns raw message rows (MessageID / Body /
+	// TimestampMS…, the same DTO as /api/conversations/<id>/messages) rather
+	// than the conversation summaries /api/search produces. This is the HTTP
+	// twin of the search_messages MCP tool, for agents and scripts.
+	mux.HandleFunc("/api/search/messages", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			httpError(w, "method not allowed", 405)
+			return
+		}
+		q := strings.TrimSpace(r.URL.Query().Get("q"))
+		if q == "" {
+			httpError(w, "query parameter 'q' is required", 400)
+			return
+		}
+		sinceMS, err := db.ParseDayBound(r.URL.Query().Get("since"), false)
+		if err != nil {
+			httpError(w, "since: "+err.Error(), 400)
+			return
+		}
+		untilMS, err := db.ParseDayBound(r.URL.Query().Get("until"), true)
+		if err != nil {
+			httpError(w, "until: "+err.Error(), 400)
+			return
+		}
+		// The legacy store swaps a reversed window and v2 passes it through;
+		// reject it so both stores answer identically.
+		if sinceMS > 0 && untilMS > 0 && sinceMS > untilMS {
+			httpError(w, "since must not be after until", 400)
+			return
+		}
+		filter := db.SearchFilter{
+			Phone:          strings.TrimSpace(r.URL.Query().Get("phone")),
+			ConversationID: strings.TrimSpace(r.URL.Query().Get("conversation_id")),
+			SinceMS:        sinceMS,
+			UntilMS:        untilMS,
+			Limit:          queryIntClamped(r, "limit", 50, 500),
+		}
+		msgs, err := reads.SearchMessagesFiltered(q, filter)
+		if err != nil {
+			httpError(w, "search: "+err.Error(), 500)
+			return
+		}
+		if msgs == nil {
+			msgs = []*db.Message{}
+		}
+		writeJSON(w, msgs)
 	})
 
 	mux.HandleFunc("/api/avatar", func(w http.ResponseWriter, r *http.Request) {

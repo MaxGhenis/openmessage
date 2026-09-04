@@ -976,6 +976,17 @@ func assertR5MCPReadSurfaces(
 		{name: "get_messages", args: map[string]any{"limit": float64(100)}, want: "r5 google ingest projected"},
 		{name: "search_messages", args: map[string]any{"query": r5SharedSearchToken, "limit": float64(50)}, want: r5SharedSearchToken},
 		{name: "get_status", args: map[string]any{}, want: "Serving store (v2)"},
+		// The person tools un-gated for v2: matched by the migrated title and
+		// served through the tool → v2read batch seam against the real store.
+		// (The ingest-projected frame is routed by sender identity since #176
+		// and may land in a minted thread, so target a migrated row instead.)
+		{name: "get_person_messages", args: map[string]any{"name": fixture.Conversations[0].Name, "limit": float64(50)}, want: "google second incoming byte-exact"},
+		{name: "get_person_messages_range", args: map[string]any{
+			"name":   fixture.Conversations[0].Name,
+			"after":  time.UnixMilli(fixture.BaseMS).Add(-24 * time.Hour).Format("2006-01-02"),
+			"before": time.UnixMilli(fixture.BaseMS).Add(24 * time.Hour).Format("2006-01-02"),
+			"limit":  float64(50),
+		}, want: "google incoming media"},
 	}
 	for _, check := range checks {
 		registered := server.GetTool(check.name)

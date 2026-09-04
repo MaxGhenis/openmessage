@@ -2,6 +2,7 @@ package tools
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -16,12 +17,20 @@ import (
 
 type toolRoutingReadSource struct {
 	readsource.ReadSource
-	listCalls    int
-	searchCalls  int
-	statusCalls  int
-	getConvCalls int
-	lastQuery   string
-	lastFilter  db.SearchFilter
+	listCalls      int
+	searchCalls    int
+	statusCalls    int
+	getConvCalls   int
+	batchCalls     int
+	rangeCalls     int
+	batchFill      int // >0: GetMessagesByConversations returns this many rows
+	rangeFill      int // >0: GetMessagesByConversationsRange returns this many rows
+	lastQuery      string
+	lastFilter     db.SearchFilter
+	lastBatchIDs   []string
+	lastBatchLimit int
+	lastAfterMS    int64
+	lastBeforeMS   int64
 }
 
 func (s *toolRoutingReadSource) ListConversations(limit int) ([]*db.Conversation, error) {
@@ -31,6 +40,14 @@ func (s *toolRoutingReadSource) ListConversations(limit int) ([]*db.Conversation
 		Name:           "V2 Conversation",
 		SourcePlatform: "sms",
 		LastMessageTS:  200,
+	}, {
+		// A titleless direct thread exactly as v2 maps them: Name "" and the
+		// peer present only in the Participants JSON.
+		ConversationID: "v2-direct",
+		Name:           "",
+		Participants:   `[{"name":"V2 Alice","number":"+15551230000"},{"name":"Me","number":"+15550009999","is_me":true}]`,
+		SourcePlatform: "whatsapp",
+		LastMessageTS:  100,
 	}}, nil
 }
 
@@ -69,6 +86,49 @@ func (s *toolRoutingReadSource) GetConversation(id string) (*db.Conversation, er
 	return &db.Conversation{ConversationID: id, Name: "V2 Thread", SourcePlatform: "sms"}, nil
 }
 
+func (s *toolRoutingReadSource) GetMessagesByConversations(conversationIDs []string, limit int) ([]*db.Message, error) {
+	s.batchCalls++
+	s.lastBatchIDs = conversationIDs
+	s.lastBatchLimit = limit
+	return fakePersonMessages(conversationIDs[0], "v2-person-message", "v2 person body", s.batchFill), nil
+}
+
+func (s *toolRoutingReadSource) GetMessagesByConversationsRange(conversationIDs []string, afterMS, beforeMS int64, limit int) ([]*db.Message, error) {
+	s.rangeCalls++
+	s.lastBatchIDs = conversationIDs
+	s.lastBatchLimit = limit
+	s.lastAfterMS = afterMS
+	s.lastBeforeMS = beforeMS
+	return fakePersonMessages(conversationIDs[0], "v2-person-range-message", "v2 person range body", s.rangeFill), nil
+}
+
+// fakePersonMessages returns one message shaped like the routing fakes, or
+// count distinct messages (ids, bodies, and timestamps all differ so the
+// range tool's near-duplicate filter keeps them all).
+func fakePersonMessages(conversationID, id, body string, count int) []*db.Message {
+	if count < 1 {
+		count = 1
+	}
+	messages := make([]*db.Message, 0, count)
+	for i := 0; i < count; i++ {
+		message := &db.Message{
+			MessageID:      id,
+			ConversationID: conversationID,
+			SenderName:     "V2 Alice",
+			Body:           body,
+			TimestampMS:    200,
+			SourcePlatform: "sms",
+		}
+		if i > 0 {
+			message.MessageID = fmt.Sprintf("%s-%d", id, i)
+			message.Body = fmt.Sprintf("%s %d", body, i)
+			message.TimestampMS = 200 + int64(i)*10_000
+		}
+		messages = append(messages, message)
+	}
+	return messages
+}
+
 func TestR5MCPReadHandlersUseConfiguredSource(t *testing.T) {
 	a := testApp(t)
 	reads := &toolRoutingReadSource{}
@@ -90,7 +150,8 @@ func TestR5MCPReadHandlersUseConfiguredSource(t *testing.T) {
 	t.Run("get messages", func(t *testing.T) {
 		result, err := getMessagesHandler(a, options)(context.Background(), toolRequest(map[string]any{
 			"phone_number": "+15551230000",
-			"after":        "1970-01-01",
+			"after":        "2024-01-01",
+			"before":       "2024-03-31",
 			"limit":        float64(12),
 		}))
 		if err != nil {
@@ -101,6 +162,18 @@ func TestR5MCPReadHandlersUseConfiguredSource(t *testing.T) {
 		}
 		if reads.lastQuery != "" || reads.lastFilter.Phone != "+15551230000" || reads.lastFilter.Limit != 12 {
 			t.Fatalf("get_messages filter = %#v, query=%q", reads.lastFilter, reads.lastQuery)
+		}
+		// Same local-time day bounds as every other surface.
+		wantSince, err := db.ParseDayBound("2024-01-01", false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		wantUntil, err := db.ParseDayBound("2024-03-31", true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if reads.lastFilter.SinceMS != wantSince || reads.lastFilter.UntilMS != wantUntil {
+			t.Fatalf("get_messages window = [%d, %d], want [%d, %d]", reads.lastFilter.SinceMS, reads.lastFilter.UntilMS, wantSince, wantUntil)
 		}
 	})
 
@@ -196,8 +269,6 @@ func TestR5MCPPersonStoryAndVizToolsUnavailableInV2Primary(t *testing.T) {
 	RegisterWithOptions(mcpServer, a, Options{Reads: a.Store, V2Primary: true})
 
 	for _, name := range []string{
-		"get_person_messages",
-		"get_person_messages_range",
 		"conversation_stats",
 		"generate_story",
 		"person_stats",
@@ -217,10 +288,223 @@ func TestR5MCPPersonStoryAndVizToolsUnavailableInV2Primary(t *testing.T) {
 			if !result.IsError {
 				t.Fatalf("tool %q did not return an MCP error", name)
 			}
-			if got := resultText(t, result); got != "not available while v2 is the serving store" {
+			got := resultText(t, result)
+			if got != unavailableWhileV2Serving {
 				t.Fatalf("tool %q error = %q", name, got)
 			}
+			// The error must point agents at the tools that DO serve v2
+			// reads, not dead-end them.
+			for _, alternative := range []string{"get_person_messages", "search_messages", "get_messages"} {
+				if !strings.Contains(got, alternative) {
+					t.Fatalf("tool %q error does not name alternative %q: %q", name, alternative, got)
+				}
+			}
 		})
+	}
+}
+
+func TestR5MCPGetPersonMessagesRoutesToConfiguredSourceInV2Primary(t *testing.T) {
+	a := testApp(t)
+	reads := &toolRoutingReadSource{}
+	options := Options{Reads: reads, V2Primary: true}
+
+	result, err := getPersonMessagesHandler(a, options)(context.Background(), toolRequest(map[string]any{
+		"name":  "V2 Conversation",
+		"limit": float64(25),
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.IsError || !strings.Contains(resultText(t, result), "v2 person body") {
+		t.Fatalf("unexpected result: %#v", result)
+	}
+	if reads.listCalls != 1 || reads.batchCalls != 1 {
+		t.Fatalf("calls = list %d batch %d, want 1/1", reads.listCalls, reads.batchCalls)
+	}
+	if len(reads.lastBatchIDs) != 1 || reads.lastBatchIDs[0] != "v2-conversation" || reads.lastBatchLimit != 25 {
+		t.Fatalf("batch args = %v limit %d", reads.lastBatchIDs, reads.lastBatchLimit)
+	}
+}
+
+func TestR5MCPGetPersonMessagesRangeRoutesToConfiguredSourceInV2Primary(t *testing.T) {
+	a := testApp(t)
+	reads := &toolRoutingReadSource{}
+	options := Options{Reads: reads, V2Primary: true}
+
+	result, err := getPersonMessagesRangeHandler(a, options)(context.Background(), toolRequest(map[string]any{
+		"name":   "V2 Conversation",
+		"after":  "2024-01-01",
+		"before": "2024-03-31",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.IsError || !strings.Contains(resultText(t, result), "v2 person range body") {
+		t.Fatalf("unexpected result: %#v", result)
+	}
+	if reads.listCalls != 1 || reads.rangeCalls != 1 {
+		t.Fatalf("calls = list %d range %d, want 1/1", reads.listCalls, reads.rangeCalls)
+	}
+	// Same local-time day bounds as the CLI and /api/search/messages.
+	wantAfterMS, err := db.ParseDayBound("2024-01-01", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantBeforeMS, err := db.ParseDayBound("2024-03-31", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reads.lastAfterMS != wantAfterMS || reads.lastBeforeMS != wantBeforeMS {
+		t.Fatalf("range = [%d, %d], want [%d, %d]", reads.lastAfterMS, reads.lastBeforeMS, wantAfterMS, wantBeforeMS)
+	}
+	if len(reads.lastBatchIDs) != 1 || reads.lastBatchIDs[0] != "v2-conversation" {
+		t.Fatalf("range conversation ids = %v", reads.lastBatchIDs)
+	}
+	// Rows are labelled in the same local time the window was parsed in.
+	wantStamp := "[" + time.UnixMilli(200).Format("2006-01-02 15:04") + "]"
+	if !strings.Contains(resultText(t, result), wantStamp) {
+		t.Fatalf("range output lacks local-time stamp %q: %q", wantStamp, resultText(t, result))
+	}
+}
+
+func TestR5MCPPersonMessageToolsCapAgentSuppliedLimitsOnV2Only(t *testing.T) {
+	a := testApp(t)
+	reads := &toolRoutingReadSource{}
+	v2 := Options{Reads: reads, V2Primary: true}
+
+	call := func(t *testing.T, handler server.ToolHandlerFunc, args map[string]any) string {
+		t.Helper()
+		result, err := handler(context.Background(), toolRequest(args))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if result.IsError {
+			t.Fatalf("unexpected tool error: %q", resultText(t, result))
+		}
+		return resultText(t, result)
+	}
+	personArgs := map[string]any{"name": "V2 Conversation", "limit": float64(1_000_000)}
+	rangeArgs := map[string]any{"name": "V2 Conversation", "after": "2024-01-01", "before": "2024-03-31", "limit": float64(1_000_000)}
+
+	// v2, read fills the cap: limit is capped and the output says so.
+	reads.batchFill = maxPersonMessagesLimit
+	text := call(t, getPersonMessagesHandler(a, v2), personArgs)
+	if reads.lastBatchLimit != maxPersonMessagesLimit {
+		t.Fatalf("v2 get_person_messages limit = %d, want capped to %d", reads.lastBatchLimit, maxPersonMessagesLimit)
+	}
+	if !strings.Contains(text, "limit capped at 500") || !strings.Contains(text, "only the newest 500 messages") {
+		t.Fatalf("truncated get_person_messages did not say so: %q", text)
+	}
+	reads.rangeFill = maxPersonMessagesRangeLimit
+	text = call(t, getPersonMessagesRangeHandler(a, v2), rangeArgs)
+	if reads.lastBatchLimit != maxPersonMessagesRangeLimit {
+		t.Fatalf("v2 get_person_messages_range limit = %d, want capped to %d", reads.lastBatchLimit, maxPersonMessagesRangeLimit)
+	}
+	if !strings.Contains(text, "limit capped at 2000") {
+		t.Fatalf("truncated get_person_messages_range did not say so: %q", text)
+	}
+
+	// v2, result smaller than the cap: complete, so no notice that would
+	// send the agent back for slices it already has.
+	reads.batchFill, reads.rangeFill = 1, 1
+	for name, text := range map[string]string{
+		"get_person_messages":       call(t, getPersonMessagesHandler(a, v2), personArgs),
+		"get_person_messages_range": call(t, getPersonMessagesRangeHandler(a, v2), rangeArgs),
+	} {
+		if strings.Contains(text, "capped") {
+			t.Fatalf("%s warned about a cap on a complete result: %q", name, text)
+		}
+	}
+
+	// Legacy-primary keeps the caller's value: the single-query store bounds
+	// its own work and never truncated before.
+	text = call(t, getPersonMessagesHandler(a, Options{Reads: reads}), personArgs)
+	if reads.lastBatchLimit != 1_000_000 {
+		t.Fatalf("legacy get_person_messages limit = %d, want the caller's 1000000", reads.lastBatchLimit)
+	}
+	if strings.Contains(text, "capped") {
+		t.Fatalf("legacy get_person_messages claimed a cap: %q", text)
+	}
+	// ...but never a negative one: SQLite reads a negative LIMIT as no limit.
+	for name, handler := range map[string]server.ToolHandlerFunc{
+		"get_person_messages":       getPersonMessagesHandler(a, Options{Reads: reads}),
+		"get_person_messages_range": getPersonMessagesRangeHandler(a, Options{Reads: reads}),
+	} {
+		args := map[string]any{"name": "V2 Conversation", "after": "2024-01-01", "before": "2024-03-31", "limit": float64(-1)}
+		call(t, handler, args)
+		if reads.lastBatchLimit != 1 {
+			t.Fatalf("legacy %s passed limit %d through; want floor 1", name, reads.lastBatchLimit)
+		}
+	}
+}
+
+// Real v2 direct threads have no title — the peer lives only in Participants.
+// The person tools must match on that and label the thread by the peer.
+func TestR5MCPPersonToolsMatchTitlelessDirectThreadsByParticipant(t *testing.T) {
+	a := testApp(t)
+	reads := &toolRoutingReadSource{}
+	options := Options{Reads: reads, V2Primary: true}
+
+	result, err := getPersonMessagesHandler(a, options)(context.Background(), toolRequest(map[string]any{"name": "v2 alice"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.IsError {
+		t.Fatalf("unexpected tool error: %q", resultText(t, result))
+	}
+	if len(reads.lastBatchIDs) != 1 || reads.lastBatchIDs[0] != "v2-direct" {
+		t.Fatalf("participant match selected %v, want [v2-direct]", reads.lastBatchIDs)
+	}
+	if text := resultText(t, result); !strings.Contains(text, "--- V2 Alice [whatsapp] (ID: v2-direct) ---") {
+		t.Fatalf("titleless thread not labelled by its peer: %q", text)
+	}
+
+	result, err = getPersonMessagesRangeHandler(a, options)(context.Background(), toolRequest(map[string]any{
+		"name": "v2 alice", "after": "2024-01-01", "before": "2024-03-31",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.IsError {
+		t.Fatalf("unexpected tool error: %q", resultText(t, result))
+	}
+	if len(reads.lastBatchIDs) != 1 || reads.lastBatchIDs[0] != "v2-direct" {
+		t.Fatalf("range participant match selected %v, want [v2-direct]", reads.lastBatchIDs)
+	}
+	if text := resultText(t, result); !strings.Contains(text, "V2 Alice [whatsapp]") {
+		t.Fatalf("range header does not label the titleless thread by its peer: %q", text)
+	}
+}
+
+func TestR5MCPPersonMessageToolsRegisteredUngatedInV2Primary(t *testing.T) {
+	a := testApp(t)
+	reads := &toolRoutingReadSource{}
+	mcpServer := server.NewMCPServer("r5-routing", "test")
+	RegisterWithOptions(mcpServer, a, Options{Reads: reads, V2Primary: true})
+
+	for name, args := range map[string]map[string]any{
+		"get_person_messages":       {"name": "V2 Conversation"},
+		"get_person_messages_range": {"name": "V2 Conversation", "after": "2024-01-01", "before": "2024-03-31"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			registered := mcpServer.GetTool(name)
+			if registered == nil {
+				t.Fatalf("tool %q was not registered", name)
+			}
+			result, err := registered.Handler(context.Background(), toolRequest(args))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.IsError {
+				t.Fatalf("tool %q is gated in v2-primary: %q", name, resultText(t, result))
+			}
+			if !strings.Contains(resultText(t, result), "v2 person") {
+				t.Fatalf("tool %q did not serve the configured v2 source: %q", name, resultText(t, result))
+			}
+		})
+	}
+	if reads.batchCalls != 1 || reads.rangeCalls != 1 {
+		t.Fatalf("configured source calls = batch %d range %d, want 1/1", reads.batchCalls, reads.rangeCalls)
 	}
 }
 

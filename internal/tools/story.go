@@ -13,6 +13,7 @@ import (
 
 	"github.com/maxghenis/openmessage/internal/app"
 	"github.com/maxghenis/openmessage/internal/db"
+	"github.com/maxghenis/openmessage/internal/readsource"
 	"github.com/maxghenis/openmessage/internal/story"
 )
 
@@ -323,15 +324,16 @@ func getPersonMessagesRangeTool() mcp.Tool {
 	return mcp.NewTool("get_person_messages_range",
 		mcp.WithDescription("Get messages with a person within a date range across all platforms. Returns chronological messages formatted as '[YYYY-MM-DD HH:MM] sender: body'. Useful for deep-diving into specific periods of a relationship."),
 		mcp.WithString("name", mcp.Required(), mcp.Description("Person's name to search for (case-insensitive partial match)")),
-		mcp.WithString("after", mcp.Required(), mcp.Description("Start date (ISO-8601, e.g. '2024-01-01')")),
-		mcp.WithString("before", mcp.Required(), mcp.Description("End date (ISO-8601, e.g. '2024-03-31')")),
-		mcp.WithNumber("limit", mcp.Description("Max messages to return (default 500)")),
+		mcp.WithString("after", mcp.Required(), mcp.Description("Start date (YYYY-MM-DD, local time, e.g. '2024-01-01')")),
+		mcp.WithString("before", mcp.Required(), mcp.Description("End date (YYYY-MM-DD, local time, inclusive to end of day, e.g. '2024-03-31')")),
+		mcp.WithNumber("limit", mcp.Description("Max messages to return (default 500; capped at 2000 on the v2 store)")),
 		mcp.WithReadOnlyHintAnnotation(true),
 		mcp.WithDestructiveHintAnnotation(false),
 	)
 }
 
-func getPersonMessagesRangeHandler(a *app.App) server.ToolHandlerFunc {
+func getPersonMessagesRangeHandler(a *app.App, configured ...Options) server.ToolHandlerFunc {
+	options := resolvedOptions(a, configured)
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		args := req.GetArguments()
 		name := strArg(args, "name")
@@ -346,24 +348,21 @@ func getPersonMessagesRangeHandler(a *app.App) server.ToolHandlerFunc {
 		if beforeStr == "" {
 			return errorResult("before is required"), nil
 		}
-		limit := intArg(args, "limit", 500)
+		limit, capped := personReadLimit(intArg(args, "limit", 500), maxPersonMessagesRangeLimit, options.V2Primary)
 
-		afterTime, err := time.Parse("2006-01-02", afterStr)
+		// Same parser as the CLI and /api/search/messages, so one date string
+		// selects the same local-time window on every surface.
+		afterMS, err := db.ParseDayBound(afterStr, false)
 		if err != nil {
 			return errorResult(fmt.Sprintf("invalid 'after' date %q: %v", afterStr, err)), nil
 		}
-		beforeTime, err := time.Parse("2006-01-02", beforeStr)
+		beforeMS, err := db.ParseDayBound(beforeStr, true)
 		if err != nil {
 			return errorResult(fmt.Sprintf("invalid 'before' date %q: %v", beforeStr, err)), nil
 		}
-		// Include the full end date
-		beforeTime = beforeTime.Add(24*time.Hour - time.Millisecond)
-
-		afterMS := afterTime.UnixMilli()
-		beforeMS := beforeTime.UnixMilli()
 
 		// Find matching conversation IDs (reuse collectPersonMessages logic)
-		convIDs, convNames, err := findPersonConversations(a, name)
+		convIDs, convNames, err := findPersonConversations(options.Reads, name)
 		if err != nil {
 			return errorResult(err.Error()), nil
 		}
@@ -371,7 +370,7 @@ func getPersonMessagesRangeHandler(a *app.App) server.ToolHandlerFunc {
 			return textResult(fmt.Sprintf("No conversations found with '%s'.", name)), nil
 		}
 
-		msgs, err := a.Store.GetMessagesByConversationsRange(convIDs, afterMS, beforeMS, limit)
+		msgs, err := options.Reads.GetMessagesByConversationsRange(convIDs, afterMS, beforeMS, limit)
 		if err != nil {
 			return errorResult(fmt.Sprintf("get messages: %v", err)), nil
 		}
@@ -385,10 +384,16 @@ func getPersonMessagesRangeHandler(a *app.App) server.ToolHandlerFunc {
 		var sb strings.Builder
 		fmt.Fprintf(&sb, "Messages with '%s' from %s to %s (%d messages from %d conversation(s): %s)\n\n",
 			name, afterStr, beforeStr, len(deduped), len(convNames), strings.Join(convNames, ", "))
+		// Only when the read actually hit the cap (pre-dedup count): a window
+		// that was fully covered must not tell the agent to narrow it.
+		if capped && len(msgs) >= limit {
+			fmt.Fprintf(&sb, "Note: limit capped at %d on the v2 store and the window holds more; only the newest messages are shown — narrow the range for complete coverage.\n\n", maxPersonMessagesRangeLimit)
+		}
 		sb.WriteString(messagePreamble)
 
 		for _, m := range deduped {
-			ts := time.UnixMilli(m.TimestampMS).UTC().Format("2006-01-02 15:04")
+			// Local time, matching the local-time window bounds above.
+			ts := time.UnixMilli(m.TimestampMS).Format("2006-01-02 15:04")
 			sender := m.SenderName
 			if m.IsFromMe {
 				sender = "me"
@@ -405,8 +410,8 @@ func getPersonMessagesRangeHandler(a *app.App) server.ToolHandlerFunc {
 
 // findPersonConversations returns matching conversation IDs and display names
 // for a person. Extracted from collectPersonMessages for reuse.
-func findPersonConversations(a *app.App, name string) ([]string, []string, error) {
-	allConvs, err := a.Store.ListConversations(1000)
+func findPersonConversations(reads readsource.ReadSource, name string) ([]string, []string, error) {
+	allConvs, err := reads.ListConversations(1000)
 	if err != nil {
 		return nil, nil, fmt.Errorf("list conversations: %v", err)
 	}
@@ -425,7 +430,7 @@ func findPersonConversations(a *app.App, name string) ([]string, []string, error
 			if platform == "" {
 				platform = "sms"
 			}
-			convNames = append(convNames, fmt.Sprintf("%s [%s]", c.Name, platform))
+			convNames = append(convNames, fmt.Sprintf("%s [%s]", personConversationLabel(c), platform))
 		}
 	}
 	return matchingConvIDs, convNames, nil
@@ -435,7 +440,7 @@ func findPersonConversations(a *app.App, name string) ([]string, []string, error
 // all messages, deduplicates cross-platform duplicates, and returns them sorted
 // chronologically. Also returns conversation display names for context.
 func collectPersonMessages(a *app.App, name string) ([]*db.Message, []string, error) {
-	matchingConvIDs, convNames, err := findPersonConversations(a, name)
+	matchingConvIDs, convNames, err := findPersonConversations(a.Store, name)
 	if err != nil {
 		return nil, nil, err
 	}

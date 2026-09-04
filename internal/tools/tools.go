@@ -2,6 +2,7 @@ package tools
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -91,13 +92,13 @@ func RegisterWithOptions(s *server.MCPServer, a *app.App, options Options) {
 	s.AddTool(draftMessageTool(), draftMessageHandler(a))
 	s.AddTool(downloadMediaTool(), downloadMediaHandler(a))
 	s.AddTool(importMessagesTool(), importMessagesHandler(a))
-	s.AddTool(getPersonMessagesTool(), unavailableInV2Primary(v2Primary, getPersonMessagesHandler(a)))
+	s.AddTool(getPersonMessagesTool(), getPersonMessagesHandler(a, options))
+	s.AddTool(getPersonMessagesRangeTool(), getPersonMessagesRangeHandler(a, options))
 	s.AddTool(conversationStatsTool(), unavailableInV2Primary(v2Primary, conversationStatsHandler(a)))
 	s.AddTool(generateStoryTool(), unavailableInV2Primary(v2Primary, generateStoryHandler(a)))
 	s.AddTool(personStatsTool(), unavailableInV2Primary(v2Primary, personStatsHandler(a)))
 	s.AddTool(generatePersonStoryTool(), unavailableInV2Primary(v2Primary, generatePersonStoryHandler(a)))
 	s.AddTool(generateVizTool(), unavailableInV2Primary(v2Primary, generateVizHandler(a)))
-	s.AddTool(getPersonMessagesRangeTool(), unavailableInV2Primary(v2Primary, getPersonMessagesRangeHandler(a)))
 	s.AddTool(renderStoryTool(), unavailableInV2Primary(v2Primary, renderStoryHandler(a)))
 	switch {
 	case options.Daemon != nil:
@@ -109,7 +110,16 @@ func RegisterWithOptions(s *server.MCPServer, a *app.App, options Options) {
 	}
 }
 
-const unavailableWhileV2Serving = "not available while v2 is the serving store"
+// unavailableWhileV2Serving explains the gate on the stats/story/viz tools:
+// they load complete conversation histories from the legacy store, which froze
+// at the v2 cutover, and the v2 read path maps messages row-by-row (identity,
+// attachment, send-status lookups per message) — pathological at full-history
+// scale. The error names the tools that DO serve v2 reads so agents don't
+// dead-end here.
+const unavailableWhileV2Serving = "not available while v2 is the serving store: " +
+	"this tool still reads the legacy store, which froze at the v2 cutover. " +
+	"To read messages, use get_person_messages, get_person_messages_range, " +
+	"search_messages, or get_messages instead."
 
 func unavailableInV2Primary(primary bool, legacy server.ToolHandlerFunc) server.ToolHandlerFunc {
 	if !primary {
@@ -150,6 +160,89 @@ func intArg(args map[string]any, key string, defaultVal int) int {
 		}
 	}
 	return defaultVal
+}
+
+// Caps on agent-supplied limits for the cross-platform person reads. The v2
+// batch path fans out per matching conversation, so an unbounded limit would
+// be an unbounded scan through the row-by-row message mapper.
+const (
+	maxPersonMessagesLimit      = 500
+	maxPersonMessagesRangeLimit = 2000
+)
+
+// clampLimit bounds n to [1, max].
+func clampLimit(n, max int) int {
+	if n < 1 {
+		return 1
+	}
+	if n > max {
+		return max
+	}
+	return n
+}
+
+// personReadLimit bounds an agent-supplied limit. On the v2 store it caps at
+// max because the batch path fans out per matching conversation. The legacy
+// single-query path keeps the caller's value above a floor of 1: SQLite reads
+// a negative LIMIT as "no limit", and intArg can produce one from an
+// out-of-range number, so an unfloored value would dump entire histories.
+// capped reports a reduction so the tool can say so instead of truncating
+// silently.
+func personReadLimit(requested, max int, v2Primary bool) (int, bool) {
+	if !v2Primary {
+		if requested < 1 {
+			return 1, false
+		}
+		return requested, false
+	}
+	limit := clampLimit(requested, max)
+	return limit, limit < requested
+}
+
+// personConversationLabel names a conversation for person-tool output: its
+// title when it has one; otherwise a direct thread is named after its peer
+// (v2 maps titleless direct threads with Name "" and the peer only in
+// Participants) and a group is labelled as a group from its members — never
+// after one arbitrary member, which would present the group as that
+// person's 1:1 thread. With nothing to go on, the id.
+func personConversationLabel(c *db.Conversation) string {
+	if c == nil {
+		return ""
+	}
+	if name := strings.TrimSpace(c.Name); name != "" {
+		return name
+	}
+	var participants []struct {
+		Name   string `json:"name"`
+		Number string `json:"number"`
+		IsMe   bool   `json:"is_me"`
+	}
+	_ = json.Unmarshal([]byte(c.Participants), &participants)
+	var others []string
+	for _, participant := range participants {
+		if participant.IsMe {
+			continue
+		}
+		if name := strings.TrimSpace(participant.Name); name != "" {
+			others = append(others, name)
+		} else if number := strings.TrimSpace(participant.Number); number != "" {
+			others = append(others, number)
+		}
+	}
+	switch {
+	case c.IsGroup && len(others) > 0:
+		const shown = 3
+		label := "Group: " + strings.Join(others[:min(len(others), shown)], ", ")
+		if len(others) > shown {
+			label += fmt.Sprintf(" +%d more", len(others)-shown)
+		}
+		return label
+	case c.IsGroup:
+		return "Group " + c.ConversationID
+	case len(others) > 0:
+		return others[0]
+	}
+	return c.ConversationID
 }
 
 // messagePreamble is prepended to tool results containing message
