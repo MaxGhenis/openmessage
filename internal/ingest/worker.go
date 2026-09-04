@@ -452,7 +452,7 @@ func (w *Worker) applyEvents(
 		if event.Kind != bridge.EventMessage {
 			continue
 		}
-		projection, err := w.messageProjection(
+		projection, duplicateOf, err := w.messageProjection(
 			ctx,
 			accountID,
 			platform,
@@ -462,6 +462,27 @@ func (w *Worker) applyEvents(
 		)
 		if err != nil {
 			return false, err
+		}
+		if duplicateOf != nil {
+			// A re-delivery under a re-keyed remote ID: the message already
+			// exists in its thread under the old ID. Do not project a second
+			// row, but let the frame's reaction snapshot refresh the original.
+			if platform == bridge.PlatformGoogle {
+				key := reactionRemoteTargetKey(
+					platform,
+					event.Message.RemoteConversationID,
+					event.Message.RemoteMessageID,
+				)
+				if _, exists := googleSnapshots[key]; !exists {
+					googleSnapshotOrder = append(googleSnapshotOrder, key)
+				}
+				googleSnapshots[key] = &googleReactionSnapshot{
+					accountID:      duplicateOf.AccountID,
+					conversationID: duplicateOf.ConversationID,
+					messageID:      duplicateOf.MessageID,
+				}
+			}
+			continue
 		}
 		if messageCount == 0 {
 			if err := w.messages.ProjectMessage(ctx, projection); err != nil {
@@ -765,13 +786,29 @@ func (w *Worker) refreshConversation(
 	}
 
 	conversation, err := w.store.GetConversationByRemote(accountID, remoteID)
+	if platform == bridge.PlatformGoogle {
+		// Google remote IDs are device-local and re-key on a phone swap or
+		// restore; trust the event's roster over the stored numeric binding.
+		conversation, err = w.googleConversationEventTarget(
+			accountID,
+			platform,
+			event,
+			remoteID,
+			conversation,
+			err,
+		)
+	}
 	if errors.Is(err, sqlite.ErrNotFound) {
 		kind, kindErr := conversationKind(event.Kind, sqlite.ConversationKindDirect)
 		if kindErr != nil {
 			return sqlite.Conversation{}, kindErr
 		}
+		conversationID, mintErr := w.mintConversationID(accountID, remoteID)
+		if mintErr != nil {
+			return sqlite.Conversation{}, mintErr
+		}
 		conversation = sqlite.Conversation{
-			ConversationID:       v2keys.DeriveID("conversation", accountID, remoteID),
+			ConversationID:       conversationID,
 			AccountID:            accountID,
 			RemoteConversationID: remoteID,
 			Kind:                 kind,
@@ -851,8 +888,12 @@ func (w *Worker) ensureMessageConversation(
 	if inferred, ok := conversationKindForRemoteID(platform, remoteID); ok {
 		kind = inferred
 	}
+	conversationID, err := w.mintConversationID(accountID, remoteID)
+	if err != nil {
+		return sqlite.Conversation{}, "", err
+	}
 	conversation = sqlite.Conversation{
-		ConversationID:       v2keys.DeriveID("conversation", accountID, remoteID),
+		ConversationID:       conversationID,
 		AccountID:            accountID,
 		RemoteConversationID: remoteID,
 		Kind:                 kind,
@@ -1111,19 +1152,19 @@ func (w *Worker) messageProjection(
 	inboxID string,
 	event bridge.MessageEvent,
 	routeEcho bool,
-) (sqlite.MessageProjection, error) {
+) (sqlite.MessageProjection, *sqlite.Message, error) {
 	direction, err := messageDirection(event.Direction)
 	if err != nil {
-		return sqlite.MessageProjection{}, err
+		return sqlite.MessageProjection{}, nil, err
 	}
 	remoteMessageID := strings.TrimSpace(event.RemoteMessageID)
 	if remoteMessageID == "" {
-		return sqlite.MessageProjection{}, fmt.Errorf("message remote ID is empty")
+		return sqlite.MessageProjection{}, nil, fmt.Errorf("message remote ID is empty")
 	}
 
 	if routeEcho && strings.TrimSpace(event.ClientRequestID) != "" && direction == sqlite.MessageDirectionOutgoing {
 		if w.echoes == nil {
-			return sqlite.MessageProjection{}, fmt.Errorf("echo observer is unavailable")
+			return sqlite.MessageProjection{}, nil, fmt.Errorf("echo observer is unavailable")
 		}
 		outcome, err := w.echoes.ObserveTransportEcho(ctx, messaging.TransportEcho{
 			AccountID:          accountID,
@@ -1155,16 +1196,44 @@ func (w *Worker) messageProjection(
 
 	occurredAtMS := event.OccurredAt.UnixMilli()
 	if occurredAtMS <= 0 {
-		return sqlite.MessageProjection{}, fmt.Errorf("message occurrence time is not positive")
+		return sqlite.MessageProjection{}, nil, fmt.Errorf("message occurrence time is not positive")
 	}
-	conversation, remoteConversationID, err := w.ensureMessageConversation(
-		accountID,
-		platform,
-		event.RemoteConversationID,
-		occurredAtMS,
-	)
+	// A transport may deliver a message whose sender carries only a display
+	// name (group RCS puts the number in the conversation roster, not the
+	// message). Legacy stores that as an empty sender rather than dropping the
+	// message; the v2 path degrades the same way — project with a null sender
+	// instead of quarantining real content on an unresolvable identity.
+	var senderIdentity *sqlite.Identity
+	if direction != sqlite.MessageDirectionOutgoing && !event.Sender.IsSelf && identityRaw(event.Sender) != "" {
+		identity, identityErr := w.resolveIdentity(accountID, platform, event.Sender)
+		if identityErr != nil {
+			return sqlite.MessageProjection{}, nil, identityErr
+		}
+		senderIdentity = &identity
+	}
+
+	var conversation sqlite.Conversation
+	var remoteConversationID string
+	if platform == bridge.PlatformGoogle && senderIdentity != nil {
+		// Google thread ids are device-local; the sender, not the id, decides
+		// which direct thread an inbound message belongs to.
+		conversation, remoteConversationID, err = w.googleIncomingConversation(
+			accountID,
+			platform,
+			event.RemoteConversationID,
+			*senderIdentity,
+			occurredAtMS,
+		)
+	} else {
+		conversation, remoteConversationID, err = w.ensureMessageConversation(
+			accountID,
+			platform,
+			event.RemoteConversationID,
+			occurredAtMS,
+		)
+	}
 	if err != nil {
-		return sqlite.MessageProjection{}, err
+		return sqlite.MessageProjection{}, nil, err
 	}
 
 	if platform == bridge.PlatformSignal && direction == sqlite.MessageDirectionOutgoing {
@@ -1176,30 +1245,51 @@ func (w *Worker) messageProjection(
 			remoteMessageID,
 		)
 		if err != nil {
-			return sqlite.MessageProjection{}, err
+			return sqlite.MessageProjection{}, nil, err
 		}
 	}
 
 	var senderIdentityID *string
-	// A transport may deliver a message whose sender carries only a display
-	// name (group RCS puts the number in the conversation roster, not the
-	// message). Legacy stores that as an empty sender rather than dropping the
-	// message; the v2 path degrades the same way — project with a null sender
-	// instead of quarantining real content on an unresolvable identity.
-	if direction != sqlite.MessageDirectionOutgoing && !event.Sender.IsSelf && identityRaw(event.Sender) != "" {
-		identity, identityErr := w.resolveIdentity(accountID, platform, event.Sender)
-		if identityErr != nil {
-			return sqlite.MessageProjection{}, identityErr
-		}
-		senderIdentityID = &identity.IdentityID
-		if err := w.ensureDirectPeerParticipant(conversation, identity); err != nil {
-			return sqlite.MessageProjection{}, err
+	if senderIdentity != nil {
+		senderIdentityID = &senderIdentity.IdentityID
+		if err := w.ensureDirectPeerParticipant(conversation, *senderIdentity); err != nil {
+			return sqlite.MessageProjection{}, nil, err
 		}
 	} else if conversation.Kind == sqlite.ConversationKindDirect {
 		if err := w.ensureDirectPeerFromRemoteID(
 			accountID, platform, conversation, remoteConversationID,
 		); err != nil {
-			return sqlite.MessageProjection{}, err
+			return sqlite.MessageProjection{}, nil, err
+		}
+	}
+
+	if platform == bridge.PlatformGoogle && strings.TrimSpace(event.Body) != "" {
+		// After a device ID-space reset the phone re-serves stored history
+		// under fresh remote ids; the natural key cannot dedupe that, so match
+		// on content within the thread the message now resolves to.
+		duplicate, found, dupErr := w.messages.FindMessageContentDuplicate(
+			ctx,
+			accountID,
+			conversation.ConversationID,
+			remoteMessageID,
+			direction,
+			senderIdentityID,
+			occurredAtMS,
+			event.Body,
+		)
+		if dupErr != nil {
+			return sqlite.MessageProjection{}, nil, dupErr
+		}
+		if found {
+			w.counters.account(accountID).contentDupesSkipped.Add(1)
+			w.logger.Info().
+				Str("account_id", accountID).
+				Str("inbox_id", inboxID).
+				Str("conversation_id", conversation.ConversationID).
+				Str("remote_message_id", remoteMessageID).
+				Str("duplicate_of_remote_message_id", duplicate.RemoteMessageID).
+				Msg("ingest: skipped re-delivered message already stored under another remote id")
+			return sqlite.MessageProjection{}, &duplicate, nil
 		}
 	}
 
@@ -1236,7 +1326,7 @@ func (w *Worker) messageProjection(
 			OccurredAtMS:     occurredAtMS,
 		},
 		Attachments: attachments,
-	}, nil
+	}, nil, nil
 }
 
 func (w *Worker) signalOutgoingRemoteID(

@@ -32,31 +32,39 @@ type CounterSnapshot struct {
 	EchoNotFound      uint64 `json:"echo_notfound"`
 	EchoErrors        uint64 `json:"echo_errors"`
 	Ephemeral         uint64 `json:"ephemeral"`
+	// RemoteRebinds counts Google remote conversation ids whose thread binding
+	// moved because participant identity contradicted the stored numeric id
+	// (device ID-space reset). ContentDupesSkipped counts re-delivered messages
+	// dropped because identical content already existed under another remote id.
+	RemoteRebinds       uint64 `json:"remote_rebinds"`
+	ContentDupesSkipped uint64 `json:"content_dupes_skipped"`
 }
 
 type accountCounters struct {
-	appended          atomic.Uint64
-	deduped           atomic.Uint64
-	decodedEvents     atomic.Uint64
-	projected         atomic.Uint64
-	imported          atomic.Uint64
-	mutations         atomic.Uint64
-	reactionsApplied  atomic.Uint64
-	reactionsRemoved  atomic.Uint64
-	reactionsOrphaned atomic.Uint64
-	tapbackMessages   atomic.Uint64
-	emptyStubsSkipped atomic.Uint64
-	receiptsSelf      atomic.Uint64
-	receiptsDropped   atomic.Uint64
-	appendErrors      atomic.Uint64
-	quarantined       atomic.Uint64
-	staleReplays      atomic.Uint64
-	echoReconciled    atomic.Uint64
-	echoEnriched      atomic.Uint64
-	echoNoop          atomic.Uint64
-	echoNotFound      atomic.Uint64
-	echoErrors        atomic.Uint64
-	ephemeral         atomic.Uint64
+	appended            atomic.Uint64
+	deduped             atomic.Uint64
+	decodedEvents       atomic.Uint64
+	projected           atomic.Uint64
+	imported            atomic.Uint64
+	mutations           atomic.Uint64
+	reactionsApplied    atomic.Uint64
+	reactionsRemoved    atomic.Uint64
+	reactionsOrphaned   atomic.Uint64
+	tapbackMessages     atomic.Uint64
+	emptyStubsSkipped   atomic.Uint64
+	receiptsSelf        atomic.Uint64
+	receiptsDropped     atomic.Uint64
+	appendErrors        atomic.Uint64
+	quarantined         atomic.Uint64
+	staleReplays        atomic.Uint64
+	echoReconciled      atomic.Uint64
+	echoEnriched        atomic.Uint64
+	echoNoop            atomic.Uint64
+	echoNotFound        atomic.Uint64
+	echoErrors          atomic.Uint64
+	ephemeral           atomic.Uint64
+	remoteRebinds       atomic.Uint64
+	contentDupesSkipped atomic.Uint64
 }
 
 // Counters owns atomic ingest counters partitioned by account. Its zero value
@@ -117,27 +125,29 @@ func snapshotCounters(c *accountCounters) CounterSnapshot {
 		return CounterSnapshot{}
 	}
 	return CounterSnapshot{
-		Appended:          c.appended.Load(),
-		Deduped:           c.deduped.Load(),
-		DecodedEvents:     c.decodedEvents.Load(),
-		Projected:         c.projected.Load(),
-		Imported:          c.imported.Load(),
-		Mutations:         c.mutations.Load(),
-		ReactionsApplied:  c.reactionsApplied.Load(),
-		ReactionsRemoved:  c.reactionsRemoved.Load(),
-		ReactionsOrphaned: c.reactionsOrphaned.Load(),
-		TapbackMessages:   c.tapbackMessages.Load(),
-		EmptyStubsSkipped: c.emptyStubsSkipped.Load(),
-		ReceiptsSelf:      c.receiptsSelf.Load(),
-		ReceiptsDropped:   c.receiptsDropped.Load(),
-		AppendErrors:      c.appendErrors.Load(),
-		Quarantined:       c.quarantined.Load(),
-		StaleReplays:      c.staleReplays.Load(),
-		EchoReconciled:    c.echoReconciled.Load(),
-		EchoEnriched:      c.echoEnriched.Load(),
-		EchoNoop:          c.echoNoop.Load(),
-		EchoNotFound:      c.echoNotFound.Load(),
-		EchoErrors:        c.echoErrors.Load(),
-		Ephemeral:         c.ephemeral.Load(),
+		Appended:            c.appended.Load(),
+		Deduped:             c.deduped.Load(),
+		DecodedEvents:       c.decodedEvents.Load(),
+		Projected:           c.projected.Load(),
+		Imported:            c.imported.Load(),
+		Mutations:           c.mutations.Load(),
+		ReactionsApplied:    c.reactionsApplied.Load(),
+		ReactionsRemoved:    c.reactionsRemoved.Load(),
+		ReactionsOrphaned:   c.reactionsOrphaned.Load(),
+		TapbackMessages:     c.tapbackMessages.Load(),
+		EmptyStubsSkipped:   c.emptyStubsSkipped.Load(),
+		ReceiptsSelf:        c.receiptsSelf.Load(),
+		ReceiptsDropped:     c.receiptsDropped.Load(),
+		AppendErrors:        c.appendErrors.Load(),
+		Quarantined:         c.quarantined.Load(),
+		StaleReplays:        c.staleReplays.Load(),
+		EchoReconciled:      c.echoReconciled.Load(),
+		EchoEnriched:        c.echoEnriched.Load(),
+		EchoNoop:            c.echoNoop.Load(),
+		EchoNotFound:        c.echoNotFound.Load(),
+		EchoErrors:          c.echoErrors.Load(),
+		Ephemeral:           c.ephemeral.Load(),
+		RemoteRebinds:       c.remoteRebinds.Load(),
+		ContentDupesSkipped: c.contentDupesSkipped.Load(),
 	}
 }

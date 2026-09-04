@@ -108,6 +108,55 @@ Two more cutover artifacts worth knowing:
 curl -s http://127.0.0.1:7007/api/status | jq '.freshness'
 ```
 
+## Google thread ids are device-local: phone swaps re-key everything
+
+Google Messages conversation and message ids are the phone's own row ids, not
+account-level identifiers. A new phone, factory reset, or backup restore starts
+a fresh id space: the same person's thread arrives under a new numeric id, and
+that id can equal the id an unrelated thread had on the old phone. The
+signature of a restore is message ids that *increase as the message gets
+older* (history was inserted newest-first) with live messages continuing the
+counter from wherever the restore stopped.
+
+What that did on 2026-09-03 (phone replaced ~Aug 19; re-pair connected the new
+device at 16:03): every new-space frame whose id collided with an old-space
+row was appended into that unrelated thread (a campaign text from a new number
+landed in a named contact's thread; shortcode promos landed in "Alex Barnett"),
+re-served history duplicated because the remote message id changed too, and
+once ConversationEvents arrived they overwrote the colliding row's title and
+roster ("United Airlines" became "Miro"). The legacy `messages.db` took the
+same writes through its own path.
+
+The projector now treats participant identity as the authority for Google
+frames: an inbound message whose sender is not the bound direct thread's peer
+moves the id to the sender's thread (minting one if needed); a
+ConversationEvent whose roster contradicts the bound row re-binds by roster;
+re-delivered content (same direction, sender, millisecond, body) is skipped.
+Displaced rows keep their history under `displaced:<id>:<conversation_id>` and
+are re-linked by peer when their thread shows up under its new id. Watch
+`v2_ingest.per_account.<account>.remote_rebinds` and `content_dupes_skipped`
+in `/api/status` — a burst right after a re-pair is the fix working, not a
+fault.
+
+**Repairing history after a reset** (daemon must be down — the command takes
+the instance lock and refuses while `/api/status` answers; park the watchdog
+first):
+
+```bash
+OPENMESSAGES_DATA_DIR="$HOME/Library/Application Support/OpenMessage" \
+  openmessage repair google-idspace --since <RFC3339 or unix-ms of the re-pair> \
+  --reference /path/to/pre-incident/store.sqlite3 --report repair.json          # dry run
+# review, then add --apply (copies v2/store.sqlite3* to v2/repair-backups/<stamp>/ first)
+```
+
+`--since` is the row *creation* time from which rows are suspect. `--reference`
+is any copy of `v2/store.sqlite3` taken before the reset (the app-support dir
+snapshots agents take before support work are exactly this); without it the
+repair still re-files messages but cannot restore overwritten titles/rosters.
+Outgoing-only windows are reported as `ambiguous` and left in place: a
+message frame carries no recipient, so nothing proves where an outbound text
+belongs until the thread's ConversationEvent re-binds the id.
+
 ## MCP serving — exactly one process may own live transports
 
 **The failure mode (empirically confirmed 2026-07-20):** `openmessage serve
