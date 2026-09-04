@@ -978,7 +978,9 @@ func assertR5MCPReadSurfaces(
 		{name: "get_status", args: map[string]any{}, want: "Serving store (v2)"},
 		// The person tools un-gated for v2: matched by the migrated title and
 		// served through the tool → v2read batch seam against the real store.
-		{name: "get_person_messages", args: map[string]any{"name": fixture.Conversations[0].Name, "limit": float64(50)}, want: "r5 google ingest projected"},
+		// (The ingest-projected frame is routed by sender identity since #176
+		// and may land in a minted thread, so target a migrated row instead.)
+		{name: "get_person_messages", args: map[string]any{"name": fixture.Conversations[0].Name, "limit": float64(50)}, want: "google second incoming byte-exact"},
 		{name: "get_person_messages_range", args: map[string]any{
 			"name":   fixture.Conversations[0].Name,
 			"after":  time.UnixMilli(fixture.BaseMS).Add(-24 * time.Hour).Format("2006-01-02"),
