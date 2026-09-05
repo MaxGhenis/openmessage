@@ -122,8 +122,9 @@ var (
 	now = time.Now
 
 	// accountProbeRetryDelays paces the in-generation listAccounts retries: a
-	// probe that races signal-cli's own account bootstrap at boot (observed
-	// live 2026-07-24 and 2026-08-06: exit 0, zero accounts, link intact)
+	// transient failure of signal-cli's per-account check (network not up at
+	// login-time autostart, a server hiccup) reports zero accounts with exit 0
+	// (observed live 2026-07-24 and 2026-08-06: empty probe, link intact) and
 	// usually recovers within seconds. Swapped by tests to keep them fast.
 	accountProbeRetryDelays = []time.Duration{2 * time.Second, 4 * time.Second}
 
@@ -235,9 +236,13 @@ const (
 	// after accountUnreadableStreakLimit consecutive generations of the probe
 	// disagreeing with accounts.json. Unlike SignalAccountInvalidFingerprint
 	// (server-backed receive failures, or an account missing from disk too)
-	// its only evidence is local, so the cmd-layer park retest is allowed to
-	// re-probe it periodically instead of waiting forever for a manual
-	// /api/signal/connect.
+	// its evidence is an ambiguous empty listAccounts — a transient failure
+	// of signal-cli's account check looks identical to a deregistered device
+	// — so the cmd-layer park retest is allowed to re-probe it periodically
+	// instead of waiting forever for a manual /api/signal/connect. A genuine
+	// deregistration stays cheap under that retest: signal-cli persists
+	// "registered": false after the server 403, and every later probe fails
+	// locally without network traffic.
 	SignalAccountUnreadableFingerprint = "signal_account_unreadable"
 )
 
@@ -1909,15 +1914,19 @@ func (b *Bridge) runReceiveLoop(
 	}
 }
 
-// probeAccountWithRetry runs the local listAccounts probe up to
+// probeAccountWithRetry runs the listAccounts probe up to
 // len(accountProbeRetryDelays)+1 times before letting the caller classify the
-// failure. A signal-cli invocation that races the JVM's own account bootstrap
-// at backend boot can transiently report zero accounts (MultiAccountManager
-// logs "Ignoring <number>: User is not registered." and exits 0) even though
-// the stored link is intact — observed live on 2026-07-24 and 2026-08-06,
-// where one boot-time empty probe parked the bridge in needs_reauth for
-// 12-22h while a manual reconnect succeeded in seconds. Retrying inside the
-// generation keeps that transient from ever reaching the terminal classifier.
+// failure. listAccounts is not a pure local read: signal-cli loads every
+// account listed in accounts.json and runs its own account check
+// (AccountHelper.checkAccountState), which performs a server round-trip while
+// the stored account is still marked registered. Any failure of that load —
+// transient network trouble at login-time autostart just as much as a real
+// server rejection — makes signal-cli print a "Ignoring <number>: …" /
+// "Failed to load <number>: …" warning and report zero accounts with exit 0
+// (verified live 2026-08-23 with --verbose). One such empty probe parked the
+// bridge in needs_reauth for 12-22h on 2026-07-24 and 2026-08-06 while a
+// manual reconnect succeeded in seconds. Retrying inside the generation keeps
+// a transient check failure from ever reaching the terminal classifier.
 // Returns ctx.Err() as the error when the generation is cancelled mid-retry.
 func (b *Bridge) probeAccountWithRetry(
 	ctx context.Context,
@@ -1958,10 +1967,14 @@ func (b *Bridge) probeAccountWithRetry(
 }
 
 // classifyFailedAccountProbe turns an exhausted account probe into the
-// generation's terminal exit. The probe is local-only evidence — listAccounts
-// never consults the Signal server — so an empty or account-invalid result
-// can prove at most "signal-cli cannot see the account right now", never "the
-// server unlinked this device". Parking reauth therefore needs corroboration:
+// generation's terminal exit. An empty listAccounts is ambiguous evidence:
+// signal-cli reports zero accounts (exit 0) for a transient failure of its
+// per-account load check exactly as it does for a server-confirmed
+// deregistration (a 403 there persists "registered": false into the account
+// file, after which every later load throws NotRegisteredException before any
+// network call — both observed live 2026-08-23). The probe output alone
+// cannot distinguish "couldn't check the account this instant" from "the
+// server unlinked this device", so parking reauth needs corroboration:
 //
 //   - accounts.json no longer lists any account: the link is locally gone, so
 //     the pre-existing immediate reauth park stands.
