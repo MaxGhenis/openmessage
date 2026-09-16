@@ -1766,8 +1766,8 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			return
 		}
 		simLabel := ""
-		if chosenSIM != nil {
-			simLabel = chosenSIM.Label()
+		if chosenSIM != nil && len(app.ConversationSIMs(conv)) > 1 {
+			simLabel = chosenSIM.Label() // dual-SIM only: single-SIM threads stay unlabelled
 		}
 
 		payload := app.BuildSendPayloadWithTmpID(req.ConversationID, req.Message, req.ReplyToID, myParticipantID, simPayload, idempotencyKey)
@@ -3483,24 +3483,18 @@ func writeV2MessageMediaResponse(
 }
 
 // annotateSIMLabels fills Message.SIM on dual-SIM Google threads so the web UI
-// can show which card each message belongs to (see internal/sim).
+// can show which card each message belongs to (see sim.AnnotateMessages).
 func annotateSIMLabels(reads readsource.ReadSource, msgs []*db.Message) {
-	if reads == nil || len(msgs) == 0 {
+	if reads == nil {
 		return
 	}
-	labeler := sim.NewLabeler(func(conversationID string) string {
+	sim.AnnotateMessages(msgs, func(conversationID string) string {
 		conv, err := reads.GetConversation(conversationID)
 		if err != nil || conv == nil || (conv.SourcePlatform != "" && conv.SourcePlatform != "sms") {
 			return ""
 		}
 		return conv.Participants
 	}, app.SIMs)
-	for _, m := range msgs {
-		if m == nil || (m.SourcePlatform != "" && m.SourcePlatform != "sms") {
-			continue
-		}
-		m.SIM = labeler.Label(m.ConversationID, m.IsFromMe, m.SenderNumber)
-	}
 }
 
 func writeJSON(w http.ResponseWriter, v any) {

@@ -438,9 +438,10 @@ repair fails with `missing required cookies` and the app loops in
 defaults write com.openmessage.app ChromeProfile "Profile 3"   # bare dir name or absolute path
 ```
 
-The app passes it to the backend as `OPENMESSAGE_CHROME_PROFILE` (the CLI and
-the refresh scripts honour the same variable); a bare name resolves under the
-Chrome user-data dir. The same choice is exposed in the app: Settings ->
+The app passes it to the backend as `OPENMESSAGE_CHROME_PROFILE`; the CLI and
+`scripts/refresh-google-session-cookies-{macos,linux}.py` honour the same
+variable with the same rule: a bare name resolves under the Chrome user-data
+dir, a path is used as is. The same choice is exposed in the app: Settings ->
 Platforms -> "Google account cookies from" (only shown when Chrome has more
 than one profile; changing it restarts the backend). Remove with
 `defaults delete com.openmessage.app ChromeProfile`.
@@ -461,24 +462,41 @@ How OpenMessage handles it (`internal/sim`):
 - **Default send SIM = `defaultOutgoingID`.** Before this, sends used the
   *first* `is_me` participant, whose order is arbitrary - on dual-SIM the
   message could leave from the wrong card. `app.ExtractSIMAndParticipant`
-  now honours the phone's default.
+  now honours the phone's default, on every send path (text, media,
+  reactions, scheduler, v2 adapter).
 - **Choosing a SIM.** `send_message` / `send_to_conversation` (MCP, both the
   in-process and transportless-client shapes) and `POST /api/send` accept
-  `sim`: a slot (`"1"`, `"2"`), the card's own number, or its carrier name.
-  Unknown values fail with the available cards listed. The reply names the
-  card used ("sent ... from SIM 2 (+1 555 010 0001)"). The web composer shows
-  a SIM toggle on dual-SIM threads only.
-- **Reading.** On dual-SIM threads every message row gets a display-only
-  `sim` label (MCP `messages[].sim`, HTTP message DTOs, `[SIM 2 (...)]` on
-  formatted lines, a badge in the web UI); `get_conversation` lists the
-  thread's cards with the default marked. Single-SIM threads stay unlabelled.
-  The labels come from the conversation's stored participants JSON
-  (`sim`/`sim_default` on `is_me` entries), which the daemon writes as it
-  (re)stores conversations - rows last stored by an older build show slots
-  without numbers until they are refreshed by a conversation event, the
-  post-connect reconcile, or a history sync.
+  `sim`: a slot (`"1"`, `"2"`), a self participant id, the card's carrier
+  name, or its own number - exact digits, or a suffix of **at least 7
+  digits** (a one-digit typo fails instead of picking a card; carrier is
+  matched before number so `O2` never lands on a number ending in 2).
+  Unknown values fail with the available cards listed. On a dual-SIM thread
+  the reply names the card used ("sent ... from SIM 2 (+1 555 ...)");
+  single-SIM threads say nothing. **On a v2-primary install `sim` is
+  rejected** (the outbox does not carry it yet) rather than silently sending
+  from the default card, and the web composer hides its toggle there.
+- **Web composer.** The SIM toggle appears on dual-SIM threads only and
+  sends `sim` **only after the user clicks it**; untouched, the daemon uses
+  the phone's live default (the stored default may be stale).
+- **Reading.** On dual-SIM threads message rows get a display-only `sim`
+  label (MCP `messages[].sim`, HTTP message DTOs, `[...]` on formatted
+  lines, a badge in the web UI). Outgoing messages are labelled by the card
+  whose number sent them: `SIM 2 (...)`. Incoming messages are labelled
+  `thread default: SIM 2 (...)` - the protocol does not report the receiving
+  card, so this is the thread's default, not a fact about the message, and
+  changing the default on the phone relabels the thread's history. Rows
+  stored before slots were recorded (no `sim_default`) do not label incoming
+  messages at all rather than guess. `get_conversation` lists the thread's
+  cards with the recorded default marked. The labels come from the stored
+  participants JSON (`sim`/`sim_default` on `is_me` entries), written by the
+  daemon as it (re)stores conversations (conversation events, the
+  post-connect reconcile, history sync); the daemon enriches them with slot
+  and carrier from the phone's Settings event.
 - `/api/status` -> `google.sims` lists the cards (slot, number, carrier)
-  once the phone has sent its Settings event this session.
+  once the phone has sent its Settings event this session; the registry is
+  cleared on unpair.
+- `POST /api/send` now also returns `message_id` (the send's tmp id, which
+  the stored row uses), so `LegacySendResult.MessageID` is populated.
 
 ### gmessages fork contract
 

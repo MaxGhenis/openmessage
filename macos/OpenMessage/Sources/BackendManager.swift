@@ -156,11 +156,35 @@ final class BackendManager: ObservableObject {
         }
     }
 
-    /// Stop, then start again once the old process has let go of the port.
+    private var restartInFlight = false
+
+    /// Stop, wait for the old process to actually exit (so it has let go of
+    /// the port and the SQLite files), then start again. Coalesces: a second
+    /// call while one is in flight is a no-op, so quick successive setting
+    /// changes never produce overlapping backends. Waits off the main thread
+    /// by polling the PID rather than blocking on the launcher.
     func restart() {
+        if restartInFlight { return }
+        restartInFlight = true
+        let pid: pid_t? = launcher?.process.map(\.processIdentifier) ?? reusedBackendPID
         stop()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
-            self?.start()
+        Task.detached { [weak self] in
+            if let pid, pid > 0 {
+                var waited = 0
+                while Darwin.kill(pid, 0) == 0, waited < 50 { // up to ~5s
+                    try? await Task.sleep(for: .milliseconds(100))
+                    waited += 1
+                }
+                if Darwin.kill(pid, 0) == 0 {
+                    _ = Darwin.kill(pid, SIGKILL)
+                    try? await Task.sleep(for: .milliseconds(200))
+                }
+            }
+            await MainActor.run {
+                guard let self else { return }
+                self.restartInFlight = false
+                self.start()
+            }
         }
     }
 

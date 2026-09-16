@@ -2122,6 +2122,7 @@ html, body {
 .msg-sim { display: inline-block; margin-left: 6px; padding: 0 5px; border-radius: 6px; font-size: 10px; font-weight: 700; letter-spacing: 0.02em; background: rgba(128,128,128,0.18); vertical-align: middle; }
 .msg-sim.sim-1 { background: rgba(52, 168, 83, 0.22); }
 .msg-sim.sim-2 { background: rgba(66, 133, 244, 0.22); }
+.msg-sim.msg-sim-default { opacity: 0.7; font-weight: 500; } /* thread default, not a fact about the message */
 .schedule-btn svg { width: 20px; height: 20px; }
 .schedule-btn:hover:not(:disabled) { background: var(--bg-hover); color: var(--text-primary); }
 .schedule-btn:disabled { opacity: 0.4; cursor: default; }
@@ -11755,15 +11756,10 @@ body::after {
     return slots;
   }
 
-  // "+15550100001" -> "+1 555 010 0001" so two cards are telling apart at a
-  // glance. Only 9-digit numbers (optionally with +48) are regrouped; other
-  // formats are shown as stored rather than guessed at.
+  // Shown as stored: regrouping digits is country-specific and a wrong split
+  // is worse than none. The number is what tells two cards apart.
   function formatSIMNumber(number) {
-    const raw = String(number || '').replace(/\s+/g, '');
-    const m = raw.match(/^(\+48)?(\d{9})$/);
-    if (!m) return raw;
-    const local = m[2].replace(/(\d{3})(?=\d)/g, '$1 ');
-    return m[1] ? `${m[1]} ${local}` : local;
+    return String(number || '').trim();
   }
 
   // Always carries the number: slot numbers alone are hard to tell apart.
@@ -11776,15 +11772,31 @@ body::after {
     return `${simShortLabel(slot)}${slot.isDefault ? ' - thread default' : ''}`;
   }
 
-  function selectedSIM(convoID, convo) {
-    const slots = conversationSIMs(convo);
-    if (!slots.length) return null;
+  function conversationSIMsSelectable(convo) {
+    // The v2 outbox does not carry a SIM choice yet: the daemon would ignore
+    // it, so the toggle must not exist there rather than lie.
+    if (state.v2Primary) return [];
+    return conversationSIMs(convo);
+  }
+
+  // The user's explicit pick for this thread, or null when they never
+  // clicked: then no `sim` is sent and the daemon uses the phone's live
+  // default (the stored default may be stale).
+  function chosenSIM(convoID, convo) {
+    const slots = conversationSIMsSelectable(convo);
     const chosen = simChoiceByConversation.get(convoID);
-    return slots.find(s => chosen && (String(s.slot) === chosen || s.number === chosen)) || slots.find(s => s.isDefault) || slots[0];
+    if (!slots.length || !chosen) return null;
+    return slots.find(s => String(s.slot) === chosen || s.number === chosen) || null;
+  }
+
+  function selectedSIM(convoID, convo) {
+    const slots = conversationSIMsSelectable(convo);
+    if (!slots.length) return null;
+    return chosenSIM(convoID, convo) || slots.find(s => s.isDefault) || slots[0];
   }
 
   function selectedSIMSelector(convoID, convo) {
-    const slot = selectedSIM(convoID, convo);
+    const slot = chosenSIM(convoID, convo);
     if (!slot) return '';
     // Prefer the slot number; fall back to the SIM's number when unknown.
     return slot.slot ? String(slot.slot) : slot.number;
@@ -11792,14 +11804,17 @@ body::after {
 
   function refreshSIMButton(convo) {
     if (!$simBtn) return;
-    const slots = conversationSIMs(convo);
+    const slots = conversationSIMsSelectable(convo);
     if (!slots.length || !convo) {
       $simBtn.classList.remove('visible', 'sim-1', 'sim-2');
       return;
     }
     const slot = selectedSIM(convo.ConversationID, convo);
+    const explicit = !!chosenSIM(convo.ConversationID, convo);
     $simBtn.textContent = simShortLabel(slot);
-    $simBtn.title = `Sending from ${simLongLabel(slot)}. Click to switch.`;
+    $simBtn.title = explicit
+      ? `Sending from ${simLongLabel(slot)}. Click to switch.`
+      : `Phone default (${simLongLabel(slot)} as last seen). Click to pick a SIM explicitly.`;
     $simBtn.classList.remove('sim-1', 'sim-2');
     if (slot.slot === 1 || slot.slot === 2) $simBtn.classList.add(`sim-${slot.slot}`);
     $simBtn.classList.add('visible');
@@ -11808,7 +11823,7 @@ body::after {
   if ($simBtn) {
     $simBtn.addEventListener('click', () => {
       if (!activeConversation) return;
-      const slots = conversationSIMs(activeConversation);
+      const slots = conversationSIMsSelectable(activeConversation);
       if (slots.length < 2) return;
       const current = selectedSIM(activeConvoId, activeConversation);
       // conversationSIMs() builds fresh objects each call: compare by identity fields.
@@ -11821,15 +11836,20 @@ body::after {
   }
 
   function formatSIMBadge(message) {
-    // Backend label: "SIM 2 (+15550100001, Orange)" - show slot and number.
-    const label = String(message && message.sim || '');
-    if (!label) return '';
+    // Backend label: "SIM 2 (+15550100001, Orange)" for outgoing, or
+    // "thread default: SIM 2 (...)" for incoming (the protocol does not say
+    // which card received a message; that is the thread's default card).
+    const raw = String(message && message.sim || '');
+    if (!raw) return '';
+    const threadDefault = /^thread default:\s*/i.test(raw);
+    const label = raw.replace(/^thread default:\s*/i, '');
     const m = label.match(/^SIM\s*(\d+)?\s*(?:\(([^,)]+)(?:,\s*([^)]+))?\))?/i);
     const slot = m && m[1] ? Number(m[1]) : 0;
     const number = m && m[2] ? m[2].trim() : '';
     const short = escapeHtml(simShortLabel({slot, number}));
-    const cls = slot === 1 || slot === 2 ? ` sim-${slot}` : '';
-    return `<span class="msg-sim${cls}" title="${escapeHtml(message.IsFromMe ? 'Sent from ' + label : 'Thread on ' + label)}">${short}</span>`;
+    const cls = (slot === 1 || slot === 2 ? ` sim-${slot}` : '') + (threadDefault ? ' msg-sim-default' : '');
+    const title = threadDefault ? `Thread default card: ${label} (the receiving card is not reported)` : `Sent from ${label}`;
+    return `<span class="msg-sim${cls}" title="${escapeHtml(title)}">${short}</span>`;
   }
 
   function autoResize() {

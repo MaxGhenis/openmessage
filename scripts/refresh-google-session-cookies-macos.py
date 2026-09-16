@@ -52,11 +52,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--profile",
-        default=os.environ.get(
-            "OPENMESSAGE_CHROME_PROFILE",
-            str(home / "Library/Application Support/Google/Chrome/Default"),
+        default=os.environ.get("OPENMESSAGE_CHROME_PROFILE", "Default"),
+        help=(
+            "Chrome profile: a bare directory name such as 'Profile 3' (resolved "
+            "under the Chrome user-data dir, like the app does) or a full path"
         ),
-        help="Chrome profile directory containing Network/Cookies",
     )
     parser.add_argument(
         "--session",
@@ -68,7 +68,19 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--quiet", action="store_true", help="only print errors")
     parser.add_argument("--no-backup", action="store_true", help="do not write a session backup")
-    return parser.parse_args()
+    args = parser.parse_args()
+    args.profile = resolve_profile(args.profile, home / "Library/Application Support/Google/Chrome")
+    return args
+
+
+def resolve_profile(value: str, user_data_dir: Path) -> str:
+    """Match the app's OPENMESSAGE_CHROME_PROFILE rules: a bare profile
+    directory name resolves under Chrome's user-data dir; paths pass through."""
+    value = (value or "").strip() or "Default"
+    expanded = os.path.expanduser(value)
+    if os.path.isabs(expanded) or os.sep in expanded:
+        return expanded
+    return str(user_data_dir / value)
 
 
 def chrome_safe_storage_secret() -> bytes:

@@ -210,3 +210,68 @@ func TestSendTextToConversationGoogleAuthErrorMarksDisconnected(t *testing.T) {
 		t.Fatalf("last error = %q, want %q", got, googleAuthExpiredStatusMessage)
 	}
 }
+
+// dualSIMSendConversation is a thread with two self participants whose
+// order puts the non-default card first, as live data does.
+func dualSIMSendConversation(id string) *gmproto.Conversation {
+	return &gmproto.Conversation{
+		ConversationID:    id,
+		DefaultOutgoingID: "1207",
+		Participants: []*gmproto.Participant{
+			{ID: &gmproto.SmallInfo{Number: "+15550100002", ParticipantID: "1208"}, IsMe: true, SimPayload: &gmproto.SIMPayload{Two: 1, SIMNumber: 1}},
+			{ID: &gmproto.SmallInfo{Number: "+15550100001", ParticipantID: "1207"}, IsMe: true, SimPayload: &gmproto.SIMPayload{Two: 1, SIMNumber: 2}},
+			{ID: &gmproto.SmallInfo{Number: "+15550100099", ParticipantID: "1275"}},
+		},
+	}
+}
+
+func TestSendTextToConversationFromSIMPicksCardAndRecordsSender(t *testing.T) {
+	a := testSendApp(t)
+	if err := a.Store.UpsertConversation(&db.Conversation{ConversationID: "sms-dual", Name: "Taylor", LastMessageTS: time.Now().UnixMilli()}); err != nil {
+		t.Fatalf("seed conversation: %v", err)
+	}
+	originalGetGoogleConversation := getGoogleConversationForSend
+	originalSendGoogleTextPayload := sendGoogleTextPayload
+	var sent []*gmproto.SendMessageRequest
+	getGoogleConversationForSend = func(_ *App, conversationID string) (*gmproto.Conversation, error) {
+		return dualSIMSendConversation(conversationID), nil
+	}
+	sendGoogleTextPayload = func(_ *App, payload *gmproto.SendMessageRequest) (*gmproto.SendMessageResponse, error) {
+		sent = append(sent, payload)
+		return &gmproto.SendMessageResponse{Status: gmproto.SendMessageResponse_SUCCESS}, nil
+	}
+	t.Cleanup(func() {
+		getGoogleConversationForSend = originalGetGoogleConversation
+		sendGoogleTextPayload = originalSendGoogleTextPayload
+	})
+
+	// No selector: the phone's default card (DefaultOutgoingID), not the first
+	// self participant.
+	_, msg, err := a.SendTextToConversationFromSIM("sms-dual", "hi", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := sent[0].GetMessagePayload().GetParticipantID(); got != "+15550100001" || sent[0].GetSIMPayload().GetSIMNumber() != 2 {
+		t.Fatalf("default send used participant %q / slot %d, want +15550100001 / 2", got, sent[0].GetSIMPayload().GetSIMNumber())
+	}
+	if msg.SenderNumber != "+15550100001" || msg.SIM != "SIM 2 (+15550100001)" {
+		t.Fatalf("recorded sender = %q, label = %q", msg.SenderNumber, msg.SIM)
+	}
+
+	// Explicit slot.
+	_, msg, err = a.SendTextToConversationFromSIM("sms-dual", "hi", "1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := sent[1].GetMessagePayload().GetParticipantID(); got != "+15550100002" || sent[1].GetSIMPayload().GetSIMNumber() != 1 {
+		t.Fatalf("explicit send used participant %q / slot %d, want +15550100002 / 1", got, sent[1].GetSIMPayload().GetSIMNumber())
+	}
+	if msg.SIM != "SIM 1 (+15550100002)" {
+		t.Fatalf("label = %q", msg.SIM)
+	}
+
+	// Unknown selector fails before anything is sent.
+	if _, _, err := a.SendTextToConversationFromSIM("sms-dual", "hi", "3"); err == nil || len(sent) != 2 {
+		t.Fatalf("unknown SIM: err=%v sent=%d", err, len(sent))
+	}
+}

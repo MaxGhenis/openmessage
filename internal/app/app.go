@@ -647,6 +647,7 @@ func (a *App) Unpair() error {
 	if err := os.Remove(a.SessionPath); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("remove session: %w", err)
 	}
+	SIMs.Reset() // a re-pair may be a different phone; forget its cards
 	a.Logger.Info().Msg("Unpaired — session deleted")
 	return nil
 }

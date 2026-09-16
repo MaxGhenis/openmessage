@@ -18,6 +18,8 @@ import (
 	"sync"
 
 	"go.mau.fi/mautrix-gmessages/pkg/libgm/gmproto"
+
+	"github.com/maxghenis/openmessage/internal/db"
 )
 
 // Slot is one SIM card as seen through a conversation's self participants.
@@ -78,6 +80,17 @@ func (r *Registry) SetCards(cards []*gmproto.SIMCard) {
 	r.mu.Unlock()
 }
 
+// Reset forgets the phone's SIM cards, e.g. on unpair, so a re-pair with a
+// different phone never shows the previous phone's carriers.
+func (r *Registry) Reset() {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	r.cards = nil
+	r.mu.Unlock()
+}
+
 // Cards returns the SIM cards last reported by the phone.
 func (r *Registry) Cards() []*gmproto.SIMCard {
 	if r == nil {
@@ -135,8 +148,10 @@ func FromConversation(conv *gmproto.Conversation, reg *Registry) []Slot {
 			continue
 		}
 		s := Slot{
-			Slot:          int(p.GetSimPayload().GetSIMNumber()),
-			Number:        firstNonEmpty(p.GetID().GetNumber(), p.GetFormattedNumber()),
+			Slot: int(p.GetSimPayload().GetSIMNumber()),
+			// ID.Number only: it doubles as the send participant ID, which the
+			// pre-existing send path always took from this field.
+			Number:        p.GetID().GetNumber(),
 			ParticipantID: p.GetID().GetParticipantID(),
 			payload:       p.GetSimPayload(),
 		}
@@ -161,8 +176,8 @@ func FromConversation(conv *gmproto.Conversation, reg *Registry) []Slot {
 
 // Select picks the SIM a send should leave from. selector may be empty (the
 // thread's default), a slot number ("1", "2", "sim2"), the SIM's phone number
-// (digits compared, so "+1 555 010 0001" and "15550100001" both match), or a
-// self participant ID. It returns the send participant ID in the same form
+// a carrier name, or the SIM's phone number - exact digits, or a suffix of at
+// least 7 digits so a one-digit typo fails instead of picking a card. It returns the send participant ID in the same form
 // existing sends use (the self participant's number field) and the matching
 // SIMPayload. With no self participants at all it falls back to the
 // conversation-level SIM card, as before.
@@ -195,6 +210,11 @@ func Select(conv *gmproto.Conversation, selector string, reg *Registry) (partici
 	return pick.Number, pick.payload, pick, nil
 }
 
+// minNumberSuffixDigits is the shortest number fragment that may select a
+// SIM by suffix: anything shorter (a typo like "3") would silently pick a card
+// instead of failing.
+const minNumberSuffixDigits = 7
+
 func match(slots []Slot, selector string) *Slot {
 	lower := strings.ToLower(selector)
 	if n, ok := parseSlotNumber(lower); ok {
@@ -203,27 +223,33 @@ func match(slots []Slot, selector string) *Slot {
 				return &slots[i]
 			}
 		}
-		// Slot numbers unknown (single-SIM payloads): allow positional pick.
-		if n >= 1 && n <= len(slots) && allSlotsUnknown(slots) {
-			return &slots[n-1]
-		}
 	}
 	for i := range slots {
 		if slots[i].ParticipantID != "" && slots[i].ParticipantID == selector {
 			return &slots[i]
 		}
 	}
-	want := digits(selector)
-	if want != "" {
-		for i := range slots {
-			if have := digits(slots[i].Number); have != "" && (have == want || strings.HasSuffix(have, want) || strings.HasSuffix(want, have)) {
-				return &slots[i]
-			}
-		}
-	}
+	// Carrier before number: "O2" must not fall through to a number ending in 2.
 	for i := range slots {
 		if slots[i].Carrier != "" && strings.EqualFold(slots[i].Carrier, selector) {
 			return &slots[i]
+		}
+	}
+	want := digits(selector)
+	if want == "" {
+		return nil
+	}
+	for i := range slots {
+		if have := digits(slots[i].Number); have != "" && have == want {
+			return &slots[i]
+		}
+	}
+	if len(want) >= minNumberSuffixDigits {
+		for i := range slots {
+			have := digits(slots[i].Number)
+			if have != "" && (strings.HasSuffix(have, want) || strings.HasSuffix(want, have)) {
+				return &slots[i]
+			}
 		}
 	}
 	return nil
@@ -235,15 +261,6 @@ func parseSlotNumber(s string) (int, bool) {
 		return n, true
 	}
 	return 0, false
-}
-
-func allSlotsUnknown(slots []Slot) bool {
-	for _, s := range slots {
-		if s.Slot != 0 {
-			return false
-		}
-	}
-	return true
 }
 
 func hasDefault(slots []Slot) bool {
@@ -330,45 +347,70 @@ func SlotsFromParticipantsJSON(participantsJSON string) []Slot {
 		}
 		out = append(out, Slot{Slot: p.Slot, Number: p.Number, ParticipantID: p.ID, IsDefault: p.IsDefault})
 	}
-	if len(out) > 0 && !hasDefault(out) {
-		out[0].IsDefault = true
-	}
+	// Unlike FromConversation, no default is invented here: a stored row
+	// without sim_default predates slot recording, and participant order is
+	// arbitrary, so guessing would mislabel incoming messages.
 	sortSlots(out)
 	return out
 }
 
-// AttributeMessage says which SIM a stored message belongs to: for outgoing
-// messages the self participant whose number sent it, for incoming messages
-// the thread's default SIM. The bool is false when the thread has one SIM or
-// none - callers should then omit the label rather than state the obvious.
-func AttributeMessage(slots []Slot, isFromMe bool, senderNumber string) (Slot, bool) {
+// Attribution says how a message was tied to a SIM.
+type Attribution int
+
+const (
+	// NotAttributed: single-SIM thread, or nothing reliable to go on.
+	NotAttributed Attribution = iota
+	// SentFrom: an outgoing message whose sender number is one of the cards.
+	SentFrom
+	// ThreadDefault: an incoming message; the protocol does not say which
+	// card received it, so this is the thread's default card, not a fact
+	// about the message.
+	ThreadDefault
+)
+
+// AttributeMessage says which SIM a stored message belongs to. Outgoing
+// messages are matched by sender number. Incoming messages get the thread's
+// recorded default (ThreadDefault) - never a guess: with no recorded default
+// they stay unattributed. Single-SIM threads are never attributed.
+func AttributeMessage(slots []Slot, isFromMe bool, senderNumber string) (Slot, Attribution) {
 	if len(slots) < 2 {
-		return Slot{}, false
+		return Slot{}, NotAttributed
 	}
 	if isFromMe {
 		want := digits(senderNumber)
 		for _, s := range slots {
 			if want != "" && digits(s.Number) == want {
-				return s, true
+				return s, SentFrom
 			}
 		}
+		return Slot{}, NotAttributed
 	}
 	for _, s := range slots {
 		if s.IsDefault {
-			return s, true
+			return s, ThreadDefault
 		}
 	}
-	return slots[0], true
+	return Slot{}, NotAttributed
+}
+
+// MessageLabel renders an attribution for display: the card's label for
+// outgoing messages, and "thread default: ..." for incoming ones so readers
+// (including agents) do not take it for the receiving card.
+func MessageLabel(slot Slot, how Attribution) string {
+	switch how {
+	case SentFrom:
+		return slot.Label()
+	case ThreadDefault:
+		return "thread default: " + slot.Label()
+	default:
+		return ""
+	}
 }
 
 // LabelFor returns the SIM label for one stored message given the thread's
 // participants JSON, or "" when the thread is not dual-SIM.
 func LabelFor(participantsJSON string, isFromMe bool, senderNumber string) string {
-	slot, ok := AttributeMessage(SlotsFromParticipantsJSON(participantsJSON), isFromMe, senderNumber)
-	if !ok {
-		return ""
-	}
-	return slot.Label()
+	return MessageLabel(AttributeMessage(SlotsFromParticipantsJSON(participantsJSON), isFromMe, senderNumber))
 }
 
 // Labeler labels messages across conversations, caching each thread's slots.
@@ -423,9 +465,22 @@ func (l *Labeler) Label(conversationID string, isFromMe bool, senderNumber strin
 		l.reg.Enrich(slots)
 		l.cache[conversationID] = slots
 	}
-	slot, ok := AttributeMessage(slots, isFromMe, senderNumber)
-	if !ok {
-		return ""
+	return MessageLabel(AttributeMessage(slots, isFromMe, senderNumber))
+}
+
+// AnnotateMessages fills Message.SIM for Google messages on dual-SIM threads.
+// lookup returns a conversation's stored participants JSON ("" when unknown
+// or not a Google thread); reg may be nil. Shared by the MCP tools and the
+// HTTP API so both label identically.
+func AnnotateMessages(msgs []*db.Message, lookup func(conversationID string) string, reg *Registry) {
+	if lookup == nil || len(msgs) == 0 {
+		return
 	}
-	return slot.Label()
+	labeler := NewLabeler(lookup, reg)
+	for _, m := range msgs {
+		if m == nil || (m.SourcePlatform != "" && m.SourcePlatform != "sms") {
+			continue
+		}
+		m.SIM = labeler.Label(m.ConversationID, m.IsFromMe, m.SenderNumber)
+	}
 }

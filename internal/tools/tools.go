@@ -329,26 +329,29 @@ func formatMessageLine(m *db.Message) string {
 // simArgDescription documents the optional SIM selector on Google send tools.
 const simArgDescription = "Dual-SIM phones only: which SIM to send from - a slot number (\"1\", \"2\"), the SIM's own phone number, or its carrier name. Omit to use the SIM the thread already uses on the phone. Reads label each message with its SIM on dual-SIM threads."
 
-// annotateSIMLabels fills Message.SIM for messages on dual-SIM Google threads
-// so tool output can say which SIM each message belongs to. Threads with one
-// SIM stay unlabelled. Reads only from the store the messages came from.
+// rejectSIMOnOutbox refuses an explicit SIM choice on the v2 outbox, which
+// does not carry one yet: failing loudly beats returning ok and sending from
+// the thread's default card. Nil when no SIM was requested.
+func rejectSIMOnOutbox(args map[string]any) *mcp.CallToolResult {
+	if strings.TrimSpace(strArg(args, "sim")) == "" {
+		return nil
+	}
+	return errorResult("sim is not supported on this install yet (v2 outbox sends always use the thread's default SIM); omit sim to send from the default card")
+}
+
+// annotateSIMLabels fills Message.SIM on dual-SIM Google threads (see
+// sim.AnnotateMessages). Reads only from the store the messages came from.
 func annotateSIMLabels(reads readsource.ReadSource, msgs []*db.Message) {
-	if reads == nil || len(msgs) == 0 {
+	if reads == nil {
 		return
 	}
-	labeler := sim.NewLabeler(func(conversationID string) string {
+	sim.AnnotateMessages(msgs, func(conversationID string) string {
 		conv, err := reads.GetConversation(conversationID)
 		if err != nil || conv == nil || (conv.SourcePlatform != "" && conv.SourcePlatform != "sms") {
 			return ""
 		}
 		return conv.Participants
 	}, app.SIMs)
-	for _, m := range msgs {
-		if m == nil || (m.SourcePlatform != "" && m.SourcePlatform != "sms") {
-			continue
-		}
-		m.SIM = labeler.Label(m.ConversationID, m.IsFromMe, m.SenderNumber)
-	}
 }
 
 func errorResult(msg string) *mcp.CallToolResult {

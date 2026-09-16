@@ -360,6 +360,12 @@ private struct AppSettingsView: View {
                     ForEach(profiles) { profile in
                         Text(profile.label).tag(profile.directory)
                     }
+                    // A value set via `defaults write` (absolute path, or a
+                    // profile Chrome no longer lists) must still be selectable,
+                    // or SwiftUI shows an empty selection and warns.
+                    if !backend.chromeProfile.isEmpty, !profiles.contains(where: { $0.directory == backend.chromeProfile }) {
+                        Text("Custom: \(backend.chromeProfile)").tag(backend.chromeProfile)
+                    }
                 }
                 .pickerStyle(.menu)
 
