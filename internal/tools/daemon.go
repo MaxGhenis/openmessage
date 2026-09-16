@@ -197,7 +197,7 @@ func daemonLegacySendText(
 	if err != nil {
 		return errorResult(err.Error())
 	}
-	result, err := daemon.LegacySendText(ctx, conversationID, body, "", key)
+	result, err := daemon.LegacySendTextFromSIM(ctx, conversationID, body, "", key, strArg(args, "sim"))
 	if err != nil {
 		if localapi.IsDeterministicRejection(err) {
 			return errorResult(fmt.Sprintf("send rejected by the app: %v", err))
@@ -207,13 +207,18 @@ func daemonLegacySendText(
 		}
 		return daemonAmbiguousResult(key, err)
 	}
+	text := fmt.Sprintf("Message sent via the running OpenMessage app (message %s).", result.MessageID)
+	if result.SIM != "" {
+		text = fmt.Sprintf("Message sent via the running OpenMessage app from %s (message %s).", result.SIM, result.MessageID)
+	}
 	return structuredResult(map[string]any{
 		"ok":              true,
 		"message_id":      result.MessageID,
 		"conversation_id": conversationID,
 		"idempotency_key": key,
 		"via":             "app",
-	}, fmt.Sprintf("Message sent via the running OpenMessage app (message %s).", result.MessageID))
+		"sim":             result.SIM,
+	}, text)
 }
 
 func daemonSendToConversationHandler(options Options) server.ToolHandlerFunc {

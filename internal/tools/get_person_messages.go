@@ -69,6 +69,7 @@ func getPersonMessagesHandler(a *app.App, configured ...Options) server.ToolHand
 		if err != nil {
 			return errorResult(fmt.Sprintf("get messages: %v", err)), nil
 		}
+		annotateSIMLabels(options.Reads, msgs)
 
 		// Group messages by conversation for display
 		var sb strings.Builder

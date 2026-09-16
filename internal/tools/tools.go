@@ -14,6 +14,7 @@ import (
 	"github.com/maxghenis/openmessage/internal/db"
 	"github.com/maxghenis/openmessage/internal/localapi"
 	"github.com/maxghenis/openmessage/internal/readsource"
+	"github.com/maxghenis/openmessage/internal/sim"
 )
 
 // Options selects the canonical read source and optional durable-send seam.
@@ -317,7 +318,37 @@ func formatMessageLine(m *db.Message) string {
 		direction = "→"
 	}
 	display := formatMessageBody(m.Body, m.MediaID, m.MimeType, m.MessageID, m.Transcript)
-	return fmt.Sprintf("[%s] %s %s: «%s»", ts, direction, resolveSender(m), display)
+	line := fmt.Sprintf("[%s] %s %s: «%s»", ts, direction, resolveSender(m), display)
+	if m.SIM != "" {
+		// Dual-SIM threads: say which card sent (→) or holds (←) the message.
+		line += " [" + m.SIM + "]"
+	}
+	return line
+}
+
+// simArgDescription documents the optional SIM selector on Google send tools.
+const simArgDescription = "Dual-SIM phones only: which SIM to send from - a slot number (\"1\", \"2\"), the SIM's own phone number, or its carrier name. Omit to use the SIM the thread already uses on the phone. Reads label each message with its SIM on dual-SIM threads."
+
+// annotateSIMLabels fills Message.SIM for messages on dual-SIM Google threads
+// so tool output can say which SIM each message belongs to. Threads with one
+// SIM stay unlabelled. Reads only from the store the messages came from.
+func annotateSIMLabels(reads readsource.ReadSource, msgs []*db.Message) {
+	if reads == nil || len(msgs) == 0 {
+		return
+	}
+	labeler := sim.NewLabeler(func(conversationID string) string {
+		conv, err := reads.GetConversation(conversationID)
+		if err != nil || conv == nil || (conv.SourcePlatform != "" && conv.SourcePlatform != "sms") {
+			return ""
+		}
+		return conv.Participants
+	}, app.SIMs)
+	for _, m := range msgs {
+		if m == nil || (m.SourcePlatform != "" && m.SourcePlatform != "sms") {
+			continue
+		}
+		m.SIM = labeler.Label(m.ConversationID, m.IsFromMe, m.SenderNumber)
+	}
 }
 
 func errorResult(msg string) *mcp.CallToolResult {
@@ -356,6 +387,7 @@ type messageSummary struct {
 	SourcePlatform string `json:"source_platform"`
 	SourceID       string `json:"source_id,omitempty"`
 	DisplayText    string `json:"display_text,omitempty"`
+	SIM            string `json:"sim,omitempty"`
 }
 
 type contactSummary struct {
@@ -399,6 +431,7 @@ func summarizeMessage(m *db.Message) messageSummary {
 		ReplyToID:      m.ReplyToID,
 		SourcePlatform: normalizedPlatform(m.SourcePlatform),
 		SourceID:       m.SourceID,
+		SIM:            m.SIM,
 		DisplayText:    formatMessageBody(m.Body, m.MediaID, m.MimeType, m.MessageID, m.Transcript),
 	}
 }

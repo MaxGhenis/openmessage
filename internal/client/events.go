@@ -14,6 +14,7 @@ import (
 	"go.mau.fi/mautrix-gmessages/pkg/libgm/gmproto"
 
 	"github.com/maxghenis/openmessage/internal/db"
+	"github.com/maxghenis/openmessage/internal/sim"
 )
 
 // OnSessionInvalid is called when the session is genuinely dead (server-side
@@ -44,6 +45,8 @@ type EventHandler struct {
 	OnTypingChange           func(conversationID, senderName, senderNumber string, typing bool)
 	OnGoogleAvatarCandidates func([]db.ContactAvatarCandidate)
 	OnPhoneRespondingChange  func(bool)
+	// SIMs receives the phone's SIM cards from Settings events (may be nil).
+	SIMs *sim.Registry
 
 	cookieSaveMu     sync.Mutex
 	nextCookieSaveAt time.Time
@@ -64,6 +67,8 @@ func (h *EventHandler) Handle(rawEvt any) {
 		h.handleMessage(evt)
 	case *gmproto.Conversation:
 		h.handleConversation(evt)
+	case *gmproto.Settings:
+		h.handleSettings(evt)
 	case *events.AuthTokenRefreshed:
 		h.handleAuthRefresh()
 	case *events.PairSuccessful:
@@ -258,46 +263,7 @@ func (h *EventHandler) handleConversation(conv *gmproto.Conversation) {
 }
 
 func (h *EventHandler) storeConversation(conv *gmproto.Conversation) bool {
-	participantsJSON := "[]"
-	var avatarCandidates []db.ContactAvatarCandidate
-	if ps := conv.GetParticipants(); len(ps) > 0 {
-		type pInfo struct {
-			Name      string `json:"name"`
-			Number    string `json:"number"`
-			IsMe      bool   `json:"is_me,omitempty"`
-			ID        string `json:"id,omitempty"` // participant ID, used to resolve reaction actors to names
-			ContactID string `json:"contact_id,omitempty"`
-		}
-		var infos []pInfo
-		for _, p := range ps {
-			info := pInfo{
-				Name:      p.GetFullName(),
-				IsMe:      p.GetIsMe(),
-				ContactID: p.GetContactID(),
-			}
-			if id := p.GetID(); id != nil {
-				info.Number = id.GetNumber()
-				info.ID = id.GetParticipantID()
-			}
-			if info.Number == "" {
-				info.Number = p.GetFormattedNumber()
-			}
-			if !info.IsMe {
-				avatarCandidates = append(avatarCandidates, db.ContactAvatarCandidate{
-					SourcePlatform: "sms",
-					ParticipantID:  info.ID,
-					ContactID:      info.ContactID,
-					PhoneNumber:    info.Number,
-					DisplayName:    info.Name,
-					Source:         "live",
-				})
-			}
-			infos = append(infos, info)
-		}
-		if b, err := json.Marshal(infos); err == nil {
-			participantsJSON = string(b)
-		}
-	}
+	participantsJSON, avatarCandidates := BuildParticipantsJSON(conv, "live")
 
 	unread := 0
 	if conv.GetUnread() {
@@ -322,6 +288,16 @@ func (h *EventHandler) storeConversation(conv *gmproto.Conversation) bool {
 	}
 	h.Logger.Debug().Str("conv_id", dbConv.ConversationID).Str("name", dbConv.Name).Msg("Stored conversation")
 	return true
+}
+
+// handleSettings records the phone's SIM cards (carrier, number, slot) so
+// send replies and message labels can name them.
+func (h *EventHandler) handleSettings(evt *gmproto.Settings) {
+	if evt == nil || h.SIMs == nil || len(evt.GetSIMCards()) == 0 {
+		return
+	}
+	h.SIMs.SetCards(evt.GetSIMCards())
+	h.Logger.Info().Int("sim_cards", len(evt.GetSIMCards())).Msg("Received SIM cards from phone settings")
 }
 
 func (h *EventHandler) handleTyping(evt *gmproto.TypingData) {

@@ -2113,6 +2113,15 @@ html, body {
 
 /* ─── Scheduled (send-later) messages ─── */
 .schedule-btn { background: transparent; border: 0; color: var(--text-muted); cursor: pointer; padding: 8px; border-radius: 10px; display: inline-flex; align-items: center; justify-content: center; }
+/* Dual-SIM: which card the next message leaves from (hidden on single-SIM threads). */
+.sim-btn { background: transparent; border: 1px solid var(--border); color: var(--text-muted); cursor: pointer; padding: 4px 8px; border-radius: 10px; font-size: 12px; font-weight: 600; white-space: nowrap; display: none; align-items: center; gap: 4px; }
+.sim-btn.visible { display: inline-flex; }
+.sim-btn:hover { background: var(--bg-hover); color: var(--text-primary); }
+.sim-btn.sim-1 { border-color: rgba(52, 168, 83, 0.6); }
+.sim-btn.sim-2 { border-color: rgba(66, 133, 244, 0.6); }
+.msg-sim { display: inline-block; margin-left: 6px; padding: 0 5px; border-radius: 6px; font-size: 10px; font-weight: 700; letter-spacing: 0.02em; background: rgba(128,128,128,0.18); vertical-align: middle; }
+.msg-sim.sim-1 { background: rgba(52, 168, 83, 0.22); }
+.msg-sim.sim-2 { background: rgba(66, 133, 244, 0.22); }
 .schedule-btn svg { width: 20px; height: 20px; }
 .schedule-btn:hover:not(:disabled) { background: var(--bg-hover); color: var(--text-primary); }
 .schedule-btn:disabled { opacity: 0.4; cursor: default; }
@@ -5941,6 +5950,7 @@ body::after {
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M8 14s1.5 2 4 2 4-2 4-2"/><line x1="9" y1="9" x2="9.01" y2="9"/><line x1="15" y1="9" x2="15.01" y2="9"/></svg>
         </button>
         <textarea class="compose-input" id="compose-input" placeholder="Write a message..." rows="1" aria-label="Message"></textarea>
+        <button class="sim-btn" id="sim-btn" type="button" title="Choose the SIM to send from" aria-label="Choose the SIM to send from"></button>
         <button class="schedule-btn" id="schedule-btn" title="Schedule send" aria-label="Schedule send" disabled>
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15 14"/></svg>
         </button>
@@ -9584,6 +9594,7 @@ body::after {
       type,
       body: String(raw.body || ''),
       reply_to_id: String(raw.reply_to_id || ''),
+      sim: String(raw.sim || ''),
       file_name: String(raw.file_name || ''),
       mime_type: String(raw.mime_type || ''),
       file_size: Number(raw.file_size || 0),
@@ -9988,6 +9999,7 @@ body::after {
       conversation_id: item.conversation_id,
       message: item.body,
       reply_to_id: item.reply_to_id || undefined,
+      sim: item.sim || undefined,
       idempotency_key: item.id,
     });
   }
@@ -10471,6 +10483,7 @@ body::after {
     $chatHeader.style.display = 'flex';
     $messagesArea.style.display = 'flex';
     $composeBar.style.display = 'flex';
+    refreshSIMButton(convo);
 
     const avatarRefs = conversationAvatarRefs(convo);
     renderAvatarElement($chatHeaderAvatar, {
@@ -10796,6 +10809,7 @@ body::after {
       msg.MediaID || '',
       msg.MimeType || '',
       msg.Body || '',
+      msg.sim || '',
       sourcePlatformOf(msg),
       state.v2Primary === true && String(msg.Status || '').toUpperCase() === 'SENT' ? 'v2-sent' : '',
     ].join(':');
@@ -11054,7 +11068,7 @@ body::after {
     }
 
     const failedQueuedSend = message._pendingSend && message._pendingSendItem && message._pendingSendItem.status === 'failed';
-    html += `<div class="msg-time">${formatMessageTime(message.TimestampMS)}${message.IsFromMe ? formatStatusIndicator(message.Status) : ''}${failedQueuedSend ? '<button type="button" class="msg-retry-send">Retry</button>' : ''}</div>`;
+    html += `<div class="msg-time">${formatMessageTime(message.TimestampMS)}${message.IsFromMe ? formatStatusIndicator(message.Status) : ''}${formatSIMBadge(message)}${failedQueuedSend ? '<button type="button" class="msg-retry-send">Retry</button>' : ''}</div>`;
     const pendingActionDisabled = message._pendingSend ? 'disabled' : '';
     html += `<div class="msg-actions">`;
     if (failedQueuedSend) {
@@ -11661,6 +11675,7 @@ body::after {
           type: 'text',
           body: text,
           reply_to_id: replyToID,
+          sim: activePlatform === 'sms' ? selectedSIMSelector(sendConvoId, sendConversation) : '',
           timestamp_ms: Date.now() + (queuedItems.length ? 1 : 0),
           status: 'pending',
         };
@@ -11715,6 +11730,90 @@ body::after {
   function restoreComposeText(convoId) {
     $composeInput.value = composeTextByConversation.get(convoId) || '';
     autoResize();
+  }
+
+  // ── Dual-SIM ───────────────────────────────────────────────────────────
+  // Google threads on a dual-SIM phone list two "me" participants, one per
+  // card (`sim` = slot, `sim_default` = the card the phone uses for the
+  // thread). The composer shows a toggle only for those threads; the choice
+  // is remembered per conversation and rides along on /api/send as `sim`.
+  const $simBtn = document.getElementById('sim-btn');
+  const simChoiceByConversation = new Map();
+
+  function conversationSIMs(convo) {
+    if (!convo || sourcePlatformOf(convo) !== 'sms') return [];
+    const mine = conversationParticipants(convo).filter(p => p && p.is_me);
+    if (mine.length < 2) return [];
+    const slots = mine.map(p => ({
+      slot: Number(p.sim || 0),
+      number: String(p.number || ''),
+      id: String(p.id || ''),
+      isDefault: !!p.sim_default,
+    }));
+    if (!slots.some(s => s.isDefault)) slots[0].isDefault = true;
+    slots.sort((a, b) => (a.slot || 99) - (b.slot || 99));
+    return slots;
+  }
+
+  function simShortLabel(slot) {
+    return slot.slot ? `SIM ${slot.slot}` : 'SIM';
+  }
+
+  function simLongLabel(slot) {
+    return `${simShortLabel(slot)}${slot.number ? ` (${slot.number})` : ''}${slot.isDefault ? ' - thread default' : ''}`;
+  }
+
+  function selectedSIM(convoID, convo) {
+    const slots = conversationSIMs(convo);
+    if (!slots.length) return null;
+    const chosen = simChoiceByConversation.get(convoID);
+    return slots.find(s => chosen && (String(s.slot) === chosen || s.number === chosen)) || slots.find(s => s.isDefault) || slots[0];
+  }
+
+  function selectedSIMSelector(convoID, convo) {
+    const slot = selectedSIM(convoID, convo);
+    if (!slot) return '';
+    // Prefer the slot number; fall back to the SIM's number when unknown.
+    return slot.slot ? String(slot.slot) : slot.number;
+  }
+
+  function refreshSIMButton(convo) {
+    if (!$simBtn) return;
+    const slots = conversationSIMs(convo);
+    if (!slots.length || !convo) {
+      $simBtn.classList.remove('visible', 'sim-1', 'sim-2');
+      return;
+    }
+    const slot = selectedSIM(convo.ConversationID, convo);
+    $simBtn.textContent = simShortLabel(slot);
+    $simBtn.title = `Sending from ${simLongLabel(slot)}. Click to switch.`;
+    $simBtn.classList.remove('sim-1', 'sim-2');
+    if (slot.slot === 1 || slot.slot === 2) $simBtn.classList.add(`sim-${slot.slot}`);
+    $simBtn.classList.add('visible');
+  }
+
+  if ($simBtn) {
+    $simBtn.addEventListener('click', () => {
+      if (!activeConversation) return;
+      const slots = conversationSIMs(activeConversation);
+      if (slots.length < 2) return;
+      const current = selectedSIM(activeConvoId, activeConversation);
+      const idx = slots.findIndex(s => s === current);
+      const next = slots[(idx + 1) % slots.length];
+      simChoiceByConversation.set(activeConvoId, next.slot ? String(next.slot) : next.number);
+      refreshSIMButton(activeConversation);
+      showThreadFeedback(`Next message goes out from ${simLongLabel(next)}.`);
+    });
+  }
+
+  function formatSIMBadge(message) {
+    const label = String(message && message.sim || '');
+    if (!label) return '';
+    const m = label.match(/^SIM\s*(\d+)/i);
+    const slot = m ? Number(m[1]) : 0;
+    const short = slot ? `SIM ${slot}` : 'SIM';
+    const cls = slot === 1 || slot === 2 ? ` sim-${slot}` : '';
+    return `<span class="msg-sim${cls}" title="${escapeHtml(message.IsFromMe ? 'Sent from ' + label : 'Thread on ' + label)}">${short}</span>`;
   }
 
   function autoResize() {

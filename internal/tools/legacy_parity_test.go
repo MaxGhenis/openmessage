@@ -26,12 +26,12 @@ func TestLegacySendToolDescriptorParity(t *testing.T) {
 		{
 			name: "send_message",
 			tool: sendMessageTool(),
-			want: `{"annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":true},"description":"Send a direct text message across supported platforms. Defaults to SMS/RCS when no platform is specified.","inputSchema":{"type":"object","properties":{"message":{"description":"Message text to send","type":"string"},"phone_number":{"description":"Legacy alias for recipient. For SMS/RCS use a phone number with country code (e.g., +15551234567).","type":"string"},"platform":{"description":"Target platform: sms, rcs, whatsapp, or signal. Defaults to sms.","type":"string"},"recipient":{"description":"Recipient identifier. Use a phone number for SMS/RCS or Signal, and a phone number or WhatsApp JID for WhatsApp.","type":"string"}},"required":["message"]},"name":"send_message"}`,
+			want: `{"annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":true},"description":"Send a direct text message across supported platforms. Defaults to SMS/RCS when no platform is specified.","inputSchema":{"type":"object","properties":{"message":{"description":"Message text to send","type":"string"},"phone_number":{"description":"Legacy alias for recipient. For SMS/RCS use a phone number with country code (e.g., +15551234567).","type":"string"},"platform":{"description":"Target platform: sms, rcs, whatsapp, or signal. Defaults to sms.","type":"string"},"recipient":{"description":"Recipient identifier. Use a phone number for SMS/RCS or Signal, and a phone number or WhatsApp JID for WhatsApp.","type":"string"},"sim":{"description":"Dual-SIM phones only: which SIM to send from - a slot number (\"1\", \"2\"), the SIM's own phone number, or its carrier name. Omit to use the SIM the thread already uses on the phone. Reads label each message with its SIM on dual-SIM threads.","type":"string"}},"required":["message"]},"name":"send_message"}`,
 		},
 		{
 			name: "send_to_conversation",
 			tool: sendToConversationTool(),
-			want: `{"annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":true},"description":"Send a text message to an existing conversation by conversation ID across supported platforms","inputSchema":{"type":"object","properties":{"conversation_id":{"description":"Existing conversation ID from list_conversations or get_conversation","type":"string"},"message":{"description":"Message text to send","type":"string"}},"required":["conversation_id","message"]},"name":"send_to_conversation"}`,
+			want: `{"annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":true},"description":"Send a text message to an existing conversation by conversation ID across supported platforms","inputSchema":{"type":"object","properties":{"conversation_id":{"description":"Existing conversation ID from list_conversations or get_conversation","type":"string"},"message":{"description":"Message text to send","type":"string"},"sim":{"description":"Dual-SIM phones only: which SIM to send from - a slot number (\"1\", \"2\"), the SIM's own phone number, or its carrier name. Omit to use the SIM the thread already uses on the phone. Reads label each message with its SIM on dual-SIM threads.","type":"string"}},"required":["conversation_id","message"]},"name":"send_to_conversation"}`,
 		},
 		{
 			name: "send_media_to_conversation",
@@ -98,7 +98,7 @@ func TestV2SendToolDescriptorsExplainIdempotencyAndUncertainDelivery(t *testing.
 func TestRegisterNilOrDisabledV2UsesLegacySendToolsAndHandler(t *testing.T) {
 	originalSend := sendTextToConversation
 	legacyCalls := 0
-	sendTextToConversation = func(_ *app.App, conversationID, body string) (conversationSummary, messageSummary, error) {
+	sendTextToConversation = func(_ *app.App, conversationID, body, _ string) (conversationSummary, messageSummary, error) {
 		legacyCalls++
 		return conversationSummary{
 				ConversationID: conversationID,
@@ -212,7 +212,7 @@ func TestLegacySendMessageExchangeParity(t *testing.T) {
 func TestLegacySendToConversationExchangeParity(t *testing.T) {
 	a := testApp(t)
 	original := sendTextToConversation
-	sendTextToConversation = func(_ *app.App, conversationID, body string) (conversationSummary, messageSummary, error) {
+	sendTextToConversation = func(_ *app.App, conversationID, body, _ string) (conversationSummary, messageSummary, error) {
 		if conversationID != "signal:legacy-thread" || body != "hello thread" {
 			t.Fatalf("legacy send args = (%q, %q)", conversationID, body)
 		}

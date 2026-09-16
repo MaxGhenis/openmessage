@@ -744,7 +744,7 @@ func TestSendToConversationSignal(t *testing.T) {
 
 	originalSendTextToConversation := sendTextToConversation
 	called := false
-	sendTextToConversation = func(_ *app.App, conversationID, body string) (conversationSummary, messageSummary, error) {
+	sendTextToConversation = func(_ *app.App, conversationID, body, _ string) (conversationSummary, messageSummary, error) {
 		called = true
 		if conversationID != "signal:group-1" {
 			t.Fatalf("conversationID = %q, want signal:group-1", conversationID)

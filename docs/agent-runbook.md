@@ -425,6 +425,61 @@ is hardened-runtime only) so the backend can read Chrome's cookie DB and the
 `Chrome Safe Storage` keychain item. First keychain read may prompt once;
 Always Allow persists it.
 
+**Multi-profile Chrome: point the refresh at the right profile.** The native
+refresh reads Chrome's `Default` profile unless told otherwise. On a machine
+with many Chrome profiles the Google account that owns Messages is often in
+`Profile N`, and `Default` may hold no Google account at all - then every
+repair fails with `missing required cookies` and the app loops in
+`needs_repair` exactly like the pre-fix bug. Find the profile in
+`~/Library/Application Support/Google/Chrome/Local State`
+(`profile.info_cache.<dir>.user_name`) and set it once:
+
+```bash
+defaults write com.openmessage.app ChromeProfile "Profile 3"   # bare dir name or absolute path
+```
+
+The app passes it to the backend as `OPENMESSAGE_CHROME_PROFILE` (the CLI and
+the refresh scripts honour the same variable); a bare name resolves under the
+Chrome user-data dir. The same choice is exposed in the app: Settings ->
+Platforms -> "Google account cookies from" (only shown when Chrome has more
+than one profile; changing it restarts the backend). Remove with
+`defaults delete com.openmessage.app ChromeProfile`.
+
+### Dual-SIM phones
+
+A dual-SIM phone shows up in the libgm protocol as **two `is_me` participants
+per conversation**, one per card, each with its own `simPayload` (slot number)
+and phone number; `Conversation.defaultOutgoingID` names the one the phone
+would send from. Messages carry no SIM field: an outgoing message's
+`sender_number` is the card it left from, and an incoming message is
+attributed to the thread's default card (the protocol does not say which card
+received it). `Settings.SIMCards` adds carrier names, keyed by the same
+participant IDs.
+
+How OpenMessage handles it (`internal/sim`):
+
+- **Default send SIM = `defaultOutgoingID`.** Before this, sends used the
+  *first* `is_me` participant, whose order is arbitrary - on dual-SIM the
+  message could leave from the wrong card. `app.ExtractSIMAndParticipant`
+  now honours the phone's default.
+- **Choosing a SIM.** `send_message` / `send_to_conversation` (MCP, both the
+  in-process and transportless-client shapes) and `POST /api/send` accept
+  `sim`: a slot (`"1"`, `"2"`), the card's own number, or its carrier name.
+  Unknown values fail with the available cards listed. The reply names the
+  card used ("sent ... from SIM 2 (+1 555 010 0001)"). The web composer shows
+  a SIM toggle on dual-SIM threads only.
+- **Reading.** On dual-SIM threads every message row gets a display-only
+  `sim` label (MCP `messages[].sim`, HTTP message DTOs, `[SIM 2 (...)]` on
+  formatted lines, a badge in the web UI); `get_conversation` lists the
+  thread's cards with the default marked. Single-SIM threads stay unlabelled.
+  The labels come from the conversation's stored participants JSON
+  (`sim`/`sim_default` on `is_me` entries), which the daemon writes as it
+  (re)stores conversations - rows last stored by an older build show slots
+  without numbers until they are refreshed by a conversation event, the
+  post-connect reconcile, or a history sync.
+- `/api/status` -> `google.sims` lists the cards (slot, number, carrier)
+  once the phone has sent its Settings event this session.
+
 ### gmessages fork contract
 
 **Root cause of the repeated deaths (fixed in #73):** the `MaxGhenis/gmessages`

@@ -26,6 +26,7 @@ func (a *App) BeginGoogleGeneration(cli *client.Client) *GoogleGeneration {
 		Logger:      a.Logger,
 		SessionPath: a.SessionPath,
 		Client:      cli,
+		SIMs:        SIMs,
 		OnConversationsChange: func() {
 			a.emitConversationsChange()
 		},

@@ -9,6 +9,7 @@ import (
 	"github.com/mark3labs/mcp-go/server"
 
 	"github.com/maxghenis/openmessage/internal/app"
+	"github.com/maxghenis/openmessage/internal/sim"
 )
 
 func getConversationTool() mcp.Tool {
@@ -39,6 +40,7 @@ func getConversationHandler(a *app.App, configured ...Options) server.ToolHandle
 		}
 
 		conv, convErr := options.Reads.GetConversation(convID)
+		annotateSIMLabels(options.Reads, msgs)
 
 		if len(msgs) == 0 {
 			return structuredResult(map[string]any{
@@ -58,6 +60,11 @@ func getConversationHandler(a *app.App, configured ...Options) server.ToolHandle
 			fmt.Fprintf(&sb, "Conversation: %s (ID: %s, platform: %s)\n", conv.Name, conv.ConversationID, platform)
 			if conv.IsGroup {
 				sb.WriteString("Type: Group\n")
+			}
+			if slots := sim.SlotsFromParticipantsJSON(conv.Participants); len(slots) > 1 && platform == "sms" {
+				// Dual-SIM thread: name the cards so a send can pick one via `sim`.
+				app.SIMs.Enrich(slots)
+				fmt.Fprintf(&sb, "SIMs: %s\n", sim.Describe(slots))
 			}
 			sb.WriteString("---\n")
 		}

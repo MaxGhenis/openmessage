@@ -323,18 +323,27 @@ type LegacySendResult struct {
 	MessageID string `json:"message_id"`
 	Status    string `json:"status"`
 	Success   bool   `json:"success"`
+	// SIM names the card the daemon sent from on dual-SIM phones ("" otherwise).
+	SIM string `json:"sim,omitempty"`
 }
 
 // LegacySendText routes a text send through the daemon's legacy /api/send
 // surface. Only valid against daemons running with v2 send disabled; a
 // v2-primary daemon rejects this route deterministically.
 func (c *Client) LegacySendText(ctx context.Context, conversationID, message, replyToID, idempotencyKey string) (LegacySendResult, error) {
+	return c.LegacySendTextFromSIM(ctx, conversationID, message, replyToID, idempotencyKey, "")
+}
+
+// LegacySendTextFromSIM is LegacySendText with an explicit SIM choice (slot,
+// number, or carrier; "" = the thread's default) for dual-SIM phones.
+func (c *Client) LegacySendTextFromSIM(ctx context.Context, conversationID, message, replyToID, idempotencyKey, sim string) (LegacySendResult, error) {
 	payload := struct {
 		ConversationID string `json:"conversation_id"`
 		Message        string `json:"message"`
 		ReplyToID      string `json:"reply_to_id,omitempty"`
 		IdempotencyKey string `json:"idempotency_key,omitempty"`
-	}{conversationID, message, replyToID, idempotencyKey}
+		SIM            string `json:"sim,omitempty"`
+	}{conversationID, message, replyToID, idempotencyKey, sim}
 	var result LegacySendResult
 	if err := c.postJSON(ctx, "/api/send", payload, &result); err != nil {
 		return LegacySendResult{}, err

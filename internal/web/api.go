@@ -32,6 +32,7 @@ import (
 	"github.com/maxghenis/openmessage/internal/media"
 	"github.com/maxghenis/openmessage/internal/messaging"
 	"github.com/maxghenis/openmessage/internal/readsource"
+	"github.com/maxghenis/openmessage/internal/sim"
 	"github.com/maxghenis/openmessage/internal/storage/sqlite"
 	"github.com/maxghenis/openmessage/internal/story"
 	"github.com/maxghenis/openmessage/internal/whatsapplive"
@@ -955,6 +956,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			if msgs == nil {
 				msgs = []*db.Message{}
 			}
+			annotateSIMLabels(reads, msgs)
 			writeJSON(w, msgs)
 			return
 		}
@@ -980,6 +982,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			if msgs == nil {
 				msgs = []*db.Message{}
 			}
+			annotateSIMLabels(reads, msgs)
 			writeJSON(w, msgs)
 			return
 		}
@@ -1020,6 +1023,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		if msgs == nil {
 			msgs = []*db.Message{}
 		}
+		annotateSIMLabels(reads, msgs)
 		writeJSON(w, msgs)
 	})
 
@@ -1545,6 +1549,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		if msgs == nil {
 			msgs = []*db.Message{}
 		}
+		annotateSIMLabels(reads, msgs)
 		writeJSON(w, msgs)
 	})
 
@@ -1655,6 +1660,9 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			ConversationID string `json:"conversation_id"`
 			Message        string `json:"message"`
 			ReplyToID      string `json:"reply_to_id,omitempty"`
+			// SIM picks the card to send from on dual-SIM phones: slot ("1",
+			// "2"), the SIM's number, or carrier. Empty = the thread's default.
+			SIM            string `json:"sim,omitempty"`
 			IdempotencyKey string `json:"idempotency_key,omitempty"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -1751,7 +1759,16 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			return
 		}
 
-		myParticipantID, simPayload := app.ExtractSIMAndParticipant(conv)
+		myParticipantID, simPayload, chosenSIM, err := app.SelectSIM(conv, req.SIM)
+		if err != nil {
+			releaseIdempotentSend(idempotencyKey)
+			httpError(w, err.Error(), 400)
+			return
+		}
+		simLabel := ""
+		if chosenSIM != nil {
+			simLabel = chosenSIM.Label()
+		}
 
 		payload := app.BuildSendPayloadWithTmpID(req.ConversationID, req.Message, req.ReplyToID, myParticipantID, simPayload, idempotencyKey)
 
@@ -1759,6 +1776,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			Str("conv_id", req.ConversationID).
 			Str("participant_id", myParticipantID).
 			Bool("has_sim", simPayload != nil).
+			Str("sim", simLabel).
 			Msg("Sending message")
 
 		resp, err := cli.GM.SendMessage(payload)
@@ -1812,6 +1830,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		if err := recordOutgoingMessage(&db.Message{
 			MessageID:      payload.TmpID,
 			ConversationID: req.ConversationID,
+			SenderNumber:   myParticipantID, // the sending SIM's number, as the phone echoes it
 			Body:           req.Message,
 			IsFromMe:       true,
 			TimestampMS:    now,
@@ -1826,8 +1845,10 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		publishMessages(req.ConversationID)
 		publishConversations()
 		writeJSON(w, map[string]any{
-			"status":  resp.GetStatus().String(),
-			"success": success,
+			"message_id": payload.TmpID,
+			"status":     resp.GetStatus().String(),
+			"success":    success,
+			"sim":        simLabel,
 		})
 	})
 
@@ -3459,6 +3480,27 @@ func writeV2MessageMediaResponse(
 	defer reader.Close()
 	writeDescriptorMediaResponse(w, reader, descriptor)
 	return nil
+}
+
+// annotateSIMLabels fills Message.SIM on dual-SIM Google threads so the web UI
+// can show which card each message belongs to (see internal/sim).
+func annotateSIMLabels(reads readsource.ReadSource, msgs []*db.Message) {
+	if reads == nil || len(msgs) == 0 {
+		return
+	}
+	labeler := sim.NewLabeler(func(conversationID string) string {
+		conv, err := reads.GetConversation(conversationID)
+		if err != nil || conv == nil || (conv.SourcePlatform != "" && conv.SourcePlatform != "sms") {
+			return ""
+		}
+		return conv.Participants
+	}, app.SIMs)
+	for _, m := range msgs {
+		if m == nil || (m.SourcePlatform != "" && m.SourcePlatform != "sms") {
+			continue
+		}
+		m.SIM = labeler.Label(m.ConversationID, m.IsFromMe, m.SenderNumber)
+	}
 }
 
 func writeJSON(w http.ResponseWriter, v any) {
