@@ -11755,12 +11755,25 @@ body::after {
     return slots;
   }
 
+  // "+15550100001" -> "+1 555 010 0001" so two cards are telling apart at a
+  // glance. Only 9-digit numbers (optionally with +48) are regrouped; other
+  // formats are shown as stored rather than guessed at.
+  function formatSIMNumber(number) {
+    const raw = String(number || '').replace(/\s+/g, '');
+    const m = raw.match(/^(\+48)?(\d{9})$/);
+    if (!m) return raw;
+    const local = m[2].replace(/(\d{3})(?=\d)/g, '$1 ');
+    return m[1] ? `${m[1]} ${local}` : local;
+  }
+
+  // Always carries the number: slot numbers alone are hard to tell apart.
   function simShortLabel(slot) {
-    return slot.slot ? `SIM ${slot.slot}` : 'SIM';
+    const head = slot.slot ? `SIM ${slot.slot}` : 'SIM';
+    return slot.number ? `${head} \u00b7 ${formatSIMNumber(slot.number)}` : head;
   }
 
   function simLongLabel(slot) {
-    return `${simShortLabel(slot)}${slot.number ? ` (${slot.number})` : ''}${slot.isDefault ? ' - thread default' : ''}`;
+    return `${simShortLabel(slot)}${slot.isDefault ? ' - thread default' : ''}`;
   }
 
   function selectedSIM(convoID, convo) {
@@ -11798,7 +11811,8 @@ body::after {
       const slots = conversationSIMs(activeConversation);
       if (slots.length < 2) return;
       const current = selectedSIM(activeConvoId, activeConversation);
-      const idx = slots.findIndex(s => s === current);
+      // conversationSIMs() builds fresh objects each call: compare by identity fields.
+      const idx = slots.findIndex(s => current && s.slot === current.slot && s.number === current.number);
       const next = slots[(idx + 1) % slots.length];
       simChoiceByConversation.set(activeConvoId, next.slot ? String(next.slot) : next.number);
       refreshSIMButton(activeConversation);
@@ -11807,11 +11821,13 @@ body::after {
   }
 
   function formatSIMBadge(message) {
+    // Backend label: "SIM 2 (+15550100001, Orange)" - show slot and number.
     const label = String(message && message.sim || '');
     if (!label) return '';
-    const m = label.match(/^SIM\s*(\d+)/i);
-    const slot = m ? Number(m[1]) : 0;
-    const short = slot ? `SIM ${slot}` : 'SIM';
+    const m = label.match(/^SIM\s*(\d+)?\s*(?:\(([^,)]+)(?:,\s*([^)]+))?\))?/i);
+    const slot = m && m[1] ? Number(m[1]) : 0;
+    const number = m && m[2] ? m[2].trim() : '';
+    const short = escapeHtml(simShortLabel({slot, number}));
     const cls = slot === 1 || slot === 2 ? ` sim-${slot}` : '';
     return `<span class="msg-sim${cls}" title="${escapeHtml(message.IsFromMe ? 'Sent from ' + label : 'Thread on ' + label)}">${short}</span>`;
   }
