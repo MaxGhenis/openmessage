@@ -464,9 +464,10 @@ How OpenMessage handles it (`internal/sim`):
   message could leave from the wrong card. `app.ExtractSIMAndParticipant`
   now honours the phone's default, on every send path (text, media,
   reactions, scheduler, v2 adapter).
-- **Choosing a SIM.** `send_message` / `send_to_conversation` (MCP, both the
-  in-process and transportless-client shapes) and `POST /api/send` accept
-  `sim`: a slot (`"1"`, `"2"`), a self participant id, the card's carrier
+- **Choosing a SIM.** `send_message`, `send_to_conversation`,
+  `send_media_to_conversation` and `react_to_message` (MCP, both the
+  in-process and transportless-client shapes) and `POST /api/send`,
+  `/api/send-media` (JSON and multipart) and `/api/react` accept `sim`: a slot (`"1"`, `"2"`), a self participant id, the card's carrier
   name, or its own number - exact digits, or a suffix of **at least 7
   digits** (a one-digit typo fails instead of picking a card; carrier is
   matched before number so `O2` never lands on a number ending in 2).
@@ -476,8 +477,9 @@ How OpenMessage handles it (`internal/sim`):
   rejected** (the outbox does not carry it yet) rather than silently sending
   from the default card, and the web composer hides its toggle there.
 - **Web composer.** The SIM toggle appears on dual-SIM threads only and
-  sends `sim` **only after the user clicks it**; untouched, the daemon uses
-  the phone's live default (the stored default may be stale).
+  sends `sim` (for text and attachments) **only after the user clicks it**;
+  untouched, the daemon uses the phone's live default (the stored default
+  may be stale).
 - **Reading.** On dual-SIM threads message rows get a display-only `sim`
   label (MCP `messages[].sim`, HTTP message DTOs, `[...]` on formatted
   lines, a badge in the web UI). Outgoing messages are labelled by the card

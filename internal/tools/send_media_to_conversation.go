@@ -62,6 +62,7 @@ func sendMediaToConversationTool(v2Enabled ...bool) mcp.Tool {
 		mcp.WithString("caption", mcp.Description("Optional caption for platforms that support media captions")),
 		mcp.WithString("mime_type", mcp.Description("Optional MIME type override, for example image/png")),
 		mcp.WithString("reply_to_id", mcp.Description("Optional message ID to reply to when the platform supports media replies")),
+		mcp.WithString("sim", mcp.Description(simArgDescription)),
 	}
 	if v2Requested(v2Enabled) {
 		options[0] = mcp.WithDescription(description + v2DeliveryDescription)
@@ -112,6 +113,9 @@ func sendMediaToConversationHandler(a *app.App, v2Options ...*V2Dependencies) se
 			return errorResult(fmt.Sprintf("file too large (%d bytes; limit %d MB)", info.Size(), maxMediaUploadBytes>>20)), nil
 		}
 		if v2 != nil {
+			if failure := rejectSIMOnOutbox(args); failure != nil {
+				return failure, nil
+			}
 			return submitV2MediaFile(ctx, a, v2, args, filePath, mimeType, caption, replyToID), nil
 		}
 		data, err := os.ReadFile(filePath)
@@ -158,7 +162,10 @@ func sendMediaToConversationHandler(a *app.App, v2Options ...*V2Dependencies) se
 				}
 				return errorResult(fmt.Sprintf("get conversation: %v", err)), nil
 			}
-			myParticipantID, simPayload := app.ExtractSIMAndParticipant(gmConv)
+			myParticipantID, simPayload, chosenSIM, err := app.SelectSIM(gmConv, strArg(args, "sim"))
+			if err != nil {
+				return errorResult(err.Error()), nil
+			}
 			payload := app.BuildSendMediaPayload(conversationID, media, myParticipantID, simPayload)
 			resp, err := sendGoogleMediaMessage(a, payload)
 			if err != nil {
@@ -176,6 +183,7 @@ func sendMediaToConversationHandler(a *app.App, v2Options ...*V2Dependencies) se
 			msg := &db.Message{
 				MessageID:      payload.TmpID,
 				ConversationID: conversationID,
+				SenderNumber:   myParticipantID, // the sending SIM's number
 				Body:           "",
 				IsFromMe:       true,
 				TimestampMS:    now,
@@ -186,6 +194,9 @@ func sendMediaToConversationHandler(a *app.App, v2Options ...*V2Dependencies) se
 			}
 			if err := a.Store.RecordOutgoingMessage(msg, ""); err != nil {
 				return errorResult(fmt.Sprintf("failed to persist sent message: %v", err)), nil
+			}
+			if chosenSIM != nil && len(app.ConversationSIMs(gmConv)) > 1 {
+				return textResult(fmt.Sprintf("Media sent to %s (%s) from %s: %s", conversationName(conv), conversationID, chosenSIM.Label(), filename)), nil
 			}
 			return textResult(fmt.Sprintf("Media sent to %s (%s): %s", conversationName(conv), conversationID, filename)), nil
 		default:

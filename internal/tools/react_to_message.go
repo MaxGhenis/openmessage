@@ -42,6 +42,7 @@ func reactToMessageTool() mcp.Tool {
 		mcp.WithString("message_id", mcp.Required(), mcp.Description("Target message ID")),
 		mcp.WithString("emoji", mcp.Required(), mcp.Description("Emoji reaction to apply")),
 		mcp.WithString("action", mcp.Description("Optional action: add, remove, or switch. Defaults to add.")),
+		mcp.WithString("sim", mcp.Description(simArgDescription)),
 		mcp.WithDestructiveHintAnnotation(false),
 		mcp.WithIdempotentHintAnnotation(false),
 	)
@@ -88,7 +89,10 @@ func reactToMessageHandler(a *app.App) server.ToolHandlerFunc {
 				a.HandleGoogleAuthExpiredError(err)
 				return errorResult(fmt.Sprintf("get conversation: %v", err)), nil
 			}
-			_, simPayload := app.ExtractSIMAndParticipant(gmConv)
+			_, simPayload, _, err := app.SelectSIM(gmConv, strArg(args, "sim"))
+			if err != nil {
+				return errorResult(err.Error()), nil
+			}
 			payload := app.BuildReactionPayload(messageID, emoji, action, simPayload)
 			resp, err := sendGoogleReaction(a, payload)
 			if err != nil {

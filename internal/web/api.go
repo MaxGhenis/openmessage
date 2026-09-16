@@ -588,7 +588,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 	if fetchLinkPreviewImage == nil {
 		fetchLinkPreviewImage = linkPreviewService.FetchImage
 	}
-	sendMediaBytes := func(w http.ResponseWriter, convID string, data []byte, filename, mimeType, caption, replyToID, idempotencyKey string) {
+	sendMediaBytes := func(w http.ResponseWriter, convID string, data []byte, filename, mimeType, caption, replyToID, idempotencyKey, simSelector string) {
 		proceed, handled := claimIdempotentSend(w, idempotencyKey, convID)
 		if !handled || !proceed {
 			return
@@ -680,7 +680,16 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			return
 		}
 
-		myParticipantID, simPayload := app.ExtractSIMAndParticipant(conv)
+		myParticipantID, simPayload, chosenSIM, err := app.SelectSIM(conv, simSelector)
+		if err != nil {
+			releaseIdempotentSend(idempotencyKey)
+			httpError(w, err.Error(), 400)
+			return
+		}
+		mediaSIMLabel := ""
+		if chosenSIM != nil && len(app.ConversationSIMs(conv)) > 1 {
+			mediaSIMLabel = chosenSIM.Label() // dual-SIM only
+		}
 		payload := app.BuildSendMediaPayloadWithTmpID(convID, media, myParticipantID, simPayload, idempotencyKey)
 
 		logger.Info().
@@ -737,6 +746,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		if err := recordOutgoingMessage(&db.Message{
 			MessageID:      payload.TmpID,
 			ConversationID: convID,
+			SenderNumber:   myParticipantID, // the sending SIM's number
 			Body:           "",
 			IsFromMe:       true,
 			TimestampMS:    now,
@@ -753,8 +763,10 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		publishMessages(convID)
 		publishConversations()
 		writeJSON(w, map[string]any{
-			"status":  resp.GetStatus().String(),
-			"success": success,
+			"message_id": payload.TmpID,
+			"status":     resp.GetStatus().String(),
+			"success":    success,
+			"sim":        mediaSIMLabel,
 		})
 	}
 
@@ -1934,6 +1946,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			Caption        string `json:"caption"`
 			ReplyToID      string `json:"reply_to_id"`
 			IdempotencyKey string `json:"idempotency_key"`
+			SIM            string `json:"sim,omitempty"` // dual-SIM: slot, number, or carrier
 		}
 		if err := json.NewDecoder(io.LimitReader(r.Body, 64<<10)).Decode(&req); err != nil {
 			httpError(w, "invalid JSON: "+err.Error(), 400)
@@ -1954,7 +1967,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			httpError(w, err.Error(), 400)
 			return
 		}
-		sendMediaBytes(w, convID, data, filename, mimeType, strings.TrimSpace(req.Caption), strings.TrimSpace(req.ReplyToID), idempotencyKey)
+		sendMediaBytes(w, convID, data, filename, mimeType, strings.TrimSpace(req.Caption), strings.TrimSpace(req.ReplyToID), idempotencyKey, strings.TrimSpace(req.SIM))
 	})
 
 	mux.HandleFunc("/api/send-media", func(w http.ResponseWriter, r *http.Request) {
@@ -1987,7 +2000,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		if !ok {
 			return
 		}
-		sendMediaBytes(w, convID, data, filename, mime, caption, replyToID, idempotencyKey)
+		sendMediaBytes(w, convID, data, filename, mime, caption, replyToID, idempotencyKey, strings.TrimSpace(r.FormValue("sim")))
 	})
 
 	mux.HandleFunc("/api/media/", func(w http.ResponseWriter, r *http.Request) {
@@ -2087,7 +2100,8 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			ConversationID string `json:"conversation_id"`
 			MessageID      string `json:"message_id"`
 			Emoji          string `json:"emoji"`
-			Action         string `json:"action"` // "add", "remove", "switch"; default "add"
+			Action         string `json:"action"`        // "add", "remove", "switch"; default "add"
+			SIM            string `json:"sim,omitempty"` // dual-SIM: slot, number, or carrier
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			httpError(w, "invalid JSON: "+err.Error(), 400)
@@ -2134,11 +2148,19 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		var sim *gmproto.SIMPayload
 		if req.ConversationID != "" {
 			if conv, err := cli.GM.GetConversation(req.ConversationID); err == nil {
-				_, sim = app.ExtractSIMAndParticipant(conv)
+				var selectErr error
+				_, sim, _, selectErr = app.SelectSIM(conv, req.SIM)
+				if selectErr != nil {
+					httpError(w, selectErr.Error(), 400)
+					return
+				}
 			} else if markGoogleAuthExpired(err) {
 				httpError(w, googleAPIErrorMessage("get conversation", err), 502)
 				return
 			}
+		} else if strings.TrimSpace(req.SIM) != "" {
+			httpError(w, "sim requires conversation_id", 400)
+			return
 		}
 
 		payload := app.BuildReactionPayload(req.MessageID, req.Emoji, req.Action, sim)

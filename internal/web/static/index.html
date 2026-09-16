@@ -9988,6 +9988,7 @@ body::after {
       form.append('file', file, item.file_name || file.name || 'attachment');
       if (item.reply_to_id) form.append('reply_to_id', item.reply_to_id);
       if (item.body) form.append('caption', item.body);
+      if (item.sim) form.append('sim', item.sim);
       const resp = await fetch(API + '/api/send-media', { method: 'POST', body: form });
       if (!resp.ok) {
         const err = new Error(await responseError(resp));
@@ -11663,6 +11664,7 @@ body::after {
           file_name: file.name || 'attachment',
           mime_type: file.type || 'application/octet-stream',
           file_size: file.size || 0,
+          sim: activePlatform === 'sms' ? selectedSIMSelector(sendConvoId, sendConversation) : '',
           timestamp_ms: Date.now(),
           status: 'pending',
         };
