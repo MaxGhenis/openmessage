@@ -557,3 +557,66 @@ func TestHandleTyping_ResolvesParticipantName(t *testing.T) {
 		t.Fatal("typing = false, want true")
 	}
 }
+
+// The phone's echo regularly arrives while the send RPC is still in flight,
+// i.e. before the send path has written its tmp_ placeholder. The cleanup
+// must catch a placeholder that lands after the echo, or the thread shows the
+// message twice - once delivered, once forever "sending".
+func TestHandleMessage_RemovesTmpPlaceholderWrittenAfterEcho(t *testing.T) {
+	store, err := db.New(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	originalDelays := tmpPlaceholderRetryDelays
+	tmpPlaceholderRetryDelays = []time.Duration{20 * time.Millisecond, 60 * time.Millisecond}
+	t.Cleanup(func() { tmpPlaceholderRetryDelays = originalDelays })
+
+	changed := make(chan string, 4)
+	handler := &EventHandler{
+		Store:            store,
+		Logger:           zerolog.Nop(),
+		OnMessagesChange: func(conversationID string) { changed <- conversationID },
+	}
+
+	handler.handleMessage(&libgm.WrappedMessage{
+		Message: &gmproto.Message{
+			MessageID:      "real_late",
+			ConversationID: "c9",
+			Timestamp:      2000 * 1000,
+			TmpID:          "tmp_late",
+			SenderParticipant: &gmproto.Participant{
+				IsMe: true, FullName: "Me", ID: &gmproto.SmallInfo{Number: "+15550100001"},
+			},
+			MessageInfo: []*gmproto.MessageInfo{{
+				Data: &gmproto.MessageInfo_MessageContent{MessageContent: &gmproto.MessageContent{Content: "delivered"}},
+			}},
+		},
+	})
+	<-changed // the echo itself
+
+	// Placeholder written after the echo, as the send path does once the RPC returns.
+	if err := store.RecordOutgoingMessage(&db.Message{
+		MessageID: "tmp_late", ConversationID: "c9", Body: "delivered", IsFromMe: true, TimestampMS: 2001, Status: "OUTGOING_SENDING",
+	}, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case conv := <-changed:
+		if conv != "c9" {
+			t.Fatalf("republished %q, want c9", conv)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("late placeholder was never cleaned up")
+	}
+	if got, err := store.GetMessageByID("tmp_late"); err != nil {
+		t.Fatal(err)
+	} else if got != nil {
+		t.Fatalf("tmp_late should have been removed by the retried cleanup, got %+v", got)
+	}
+	if got, err := store.GetMessageByID("real_late"); err != nil || got == nil {
+		t.Fatalf("echoed message must stay: %v %v", got, err)
+	}
+}

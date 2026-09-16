@@ -224,9 +224,7 @@ func (h *EventHandler) handleMessage(evt *libgm.WrappedMessage) {
 	// exact tmp_ placeholder we stored at send time to avoid duplicates.
 	if dbMsg.IsFromMe {
 		if tmpID := msg.GetTmpID(); tmpID != "" && tmpID != dbMsg.MessageID {
-			if err := h.Store.DeleteMessageByID(tmpID); err == nil {
-				h.Logger.Debug().Str("tmp_id", tmpID).Str("conv_id", dbMsg.ConversationID).Msg("Cleaned up tmp message")
-			}
+			h.cleanupTmpPlaceholder(tmpID, dbMsg.ConversationID)
 		}
 	}
 
@@ -251,6 +249,38 @@ func (h *EventHandler) handleMessage(evt *libgm.WrappedMessage) {
 	if h.OnConversationsChange != nil {
 		h.OnConversationsChange()
 	}
+}
+
+// tmpPlaceholderRetryDelays spaces out the retried deletes of a tmp_ row after
+// its echo arrived. The echo regularly lands during the send RPC, i.e. before
+// the send path has written the placeholder (observed: 246 ms early), so a
+// single immediate delete finds nothing and the thread shows the message
+// twice - once delivered, once forever "sending".
+var tmpPlaceholderRetryDelays = []time.Duration{500 * time.Millisecond, 2 * time.Second, 8 * time.Second}
+
+// cleanupTmpPlaceholder deletes the tmp_ row for an echoed send now and again
+// after each retry delay, so a placeholder written after the echo is still
+// removed; the thread is republished when a late delete actually hits.
+func (h *EventHandler) cleanupTmpPlaceholder(tmpID, conversationID string) {
+	deleted, err := h.Store.DeleteMessageByIDIfExists(tmpID)
+	if err == nil && deleted {
+		h.Logger.Debug().Str("tmp_id", tmpID).Str("conv_id", conversationID).Msg("Cleaned up tmp message")
+		return
+	}
+	go func() {
+		for _, delay := range tmpPlaceholderRetryDelays {
+			time.Sleep(delay)
+			deleted, err := h.Store.DeleteMessageByIDIfExists(tmpID)
+			if err != nil || !deleted {
+				continue
+			}
+			h.Logger.Debug().Str("tmp_id", tmpID).Str("conv_id", conversationID).Dur("after", delay).Msg("Cleaned up late tmp message")
+			if h.OnMessagesChange != nil {
+				h.OnMessagesChange(conversationID)
+			}
+			return
+		}
+	}()
 }
 
 func (h *EventHandler) handleConversation(conv *gmproto.Conversation) {
