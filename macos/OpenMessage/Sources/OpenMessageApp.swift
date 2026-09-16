@@ -89,6 +89,8 @@ private final class SettingsViewModel: ObservableObject {
     @Published var notificationState = NotificationManager.BridgeState(supported: true, enabled: true, permission: "default")
     @Published var feedback = ""
     @Published var isRefreshing = false
+    /// Chrome profiles found on this Mac, for the cookie-refresh picker.
+    @Published var chromeProfiles: [ChromeProfile] = []
 
     private let baseURL: URL
 
@@ -100,6 +102,7 @@ private final class SettingsViewModel: ObservableObject {
         isRefreshing = true
         defer { isRefreshing = false }
         notificationState = await notifications.bridgeState()
+        chromeProfiles = ChromeProfiles.installed()
 
         do {
             let (data, response) = try await URLSession.shared.data(from: endpoint("api/status"))
@@ -304,6 +307,8 @@ private struct AppSettingsView: View {
                 }
             }
 
+            chromeProfileRow
+
             platformRow(
                 title: "WhatsApp",
                 subtitle: "Live linked-device sync, media, typing, and replies",
@@ -337,6 +342,32 @@ private struct AppSettingsView: View {
             settingsFooter
         }
         .padding(22)
+    }
+
+    /// Which Chrome profile the Google cookie self-heal reads from. Only
+    /// meaningful with more than one profile; single-profile installs keep
+    /// the implicit "Default".
+    @ViewBuilder
+    private var chromeProfileRow: some View {
+        let profiles = model.chromeProfiles
+        if profiles.count > 1 {
+            VStack(alignment: .leading, spacing: 6) {
+                Picker("Google account cookies from", selection: Binding(
+                    get: { backend.chromeProfile },
+                    set: { backend.chromeProfile = $0 }
+                )) {
+                    Text("Chrome \u{2192} Default profile").tag("")
+                    ForEach(profiles) { profile in
+                        Text(profile.label).tag(profile.directory)
+                    }
+                }
+                .pickerStyle(.menu)
+
+                Text("When Google expires the session, OpenMessage re-reads cookies from this signed-in Chrome profile instead of asking you to pair again. Pick the profile signed in to the account your phone's Messages uses.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+        }
     }
 
     private var notificationsTab: some View {

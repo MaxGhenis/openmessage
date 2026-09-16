@@ -134,6 +134,36 @@ final class BackendManager: ObservableObject {
         URL(string: "http://127.0.0.1:\(port)")!
     }
 
+    /// UserDefaults key behind the Google cookie self-heal's Chrome profile
+    /// choice. Empty/unset means Chrome's "Default" profile.
+    static let chromeProfileDefaultsKey = "ChromeProfile"
+
+    /// The Chrome profile directory (or absolute path) the backend reads
+    /// Google cookies from when a session expires. Setting it restarts the
+    /// backend so the new value reaches the process environment.
+    var chromeProfile: String {
+        get { UserDefaults.standard.string(forKey: Self.chromeProfileDefaultsKey) ?? "" }
+        set {
+            let trimmed = newValue.trimmingCharacters(in: .whitespaces)
+            if trimmed == chromeProfile { return }
+            if trimmed.isEmpty {
+                UserDefaults.standard.removeObject(forKey: Self.chromeProfileDefaultsKey)
+            } else {
+                UserDefaults.standard.set(trimmed, forKey: Self.chromeProfileDefaultsKey)
+            }
+            logger.info("Chrome profile for cookie refresh set to \(trimmed.isEmpty ? "Default" : trimmed, privacy: .public); restarting backend")
+            restart()
+        }
+    }
+
+    /// Stop, then start again once the old process has let go of the port.
+    func restart() {
+        stop()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
+            self?.start()
+        }
+    }
+
     /// User- or lifecycle-initiated start. Resets the auto-restart budget so a
     /// deliberate (re)start always gets the full retry allowance, then launches.
     func start() {
@@ -168,11 +198,16 @@ final class BackendManager: ObservableObject {
         // routes the backend at the migrated v2 store; deleting the key rolls back
         // to the legacy store on next launch (the legacy source is never modified).
         let v2Primary = UserDefaults.standard.bool(forKey: "V2Primary")
+        // Cookie self-heal lever: `defaults write com.openmessage.app ChromeProfile "Profile 3"`
+        // points the Google cookie refresh at the Chrome profile signed in to the
+        // account that owns Messages; unset means Chrome's "Default" profile.
+        let chromeProfile = UserDefaults.standard.string(forKey: Self.chromeProfileDefaultsKey)
         let configuration = BackendLaunchConfiguration.application(
             executablePath: path,
             dataDirectory: dir,
             port: port,
-            v2Primary: v2Primary
+            v2Primary: v2Primary,
+            chromeProfile: chromeProfile
         )
         let launcher = BackendLauncherCore(configuration: configuration, processSpawner: processSpawner)
         self.launcher = launcher
