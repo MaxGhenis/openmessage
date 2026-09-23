@@ -36,10 +36,26 @@ const (
 
 	signalTmpSweepInterval = 10 * time.Minute
 
-	// legacyLibsignalMaxAge gates the one-time system temp dir sweep. A day
-	// is far older than any live signal-cli process while young enough to
-	// recover a runaway leak quickly.
-	legacyLibsignalMaxAge = 24 * time.Hour
+	// libsignalTmpMaxAge gates the system temp dir sweep. It is deliberately
+	// the same as signalRunTmpMaxAge: a libsignal* dir in the system temp dir
+	// belongs to a signal-cli invocation exactly as a run-* dir under
+	// signalTmpRoot() does, so the same "older than any live run" rule is the
+	// correct one, and any longer gate is only a delay.
+	//
+	// This was 24h, on the assumption that defense 1 above made the system
+	// temp dir a historical concern and this sweep a backstop for upgrades.
+	// That assumption does not hold for the GraalVM Linux-native signal-cli
+	// build: a native image has no launcher script to read SIGNAL_CLI_OPTS,
+	// and it bakes java.io.tmpdir at build time, so it ignores TMPDIR too.
+	// Both halves of signalCLIEnv are inert against it and every invocation
+	// extracts into the real system temp dir.
+	//
+	// With that build, 24h made this the slowest reclaim path rather than a
+	// backstop: leaks accumulated faster than the oldest one aged out. A
+	// deployment leaking ~185MiB per invocation (the native image bundles far
+	// more than the ~21MB above) filled a 954GB pool in 23 hours without the
+	// gate ever opening once.
+	libsignalTmpMaxAge = signalRunTmpMaxAge
 
 	signalTmpSweepEnvVar = "OPENMESSAGES_SIGNAL_TMP_SWEEP"
 )
@@ -111,23 +127,24 @@ func sweepSignalTmpRoot(logger zerolog.Logger, maxAge time.Duration) {
 	}
 }
 
-// sweepLegacyLibsignalTemp clears libsignal* dirs that earlier OpenMessage
-// versions leaked into the system temp dir (issue #27). Only dirs beyond
-// legacyLibsignalMaxAge are touched: anything that old cannot belong to a
-// live signal-cli run, and libsignal re-extracts on demand if another app
-// somehow still references one.
-func sweepLegacyLibsignalTemp(logger zerolog.Logger) {
+// sweepSystemLibsignalTemp clears libsignal* dirs left in the system temp
+// dir (issue #27) -- by earlier OpenMessage versions, and by any signal-cli
+// build that ignores the confinement signalCLIEnv sets (see
+// libsignalTmpMaxAge). Only dirs beyond libsignalTmpMaxAge are touched:
+// anything that old cannot belong to a live signal-cli run, and libsignal
+// re-extracts on demand if another app somehow still references one.
+func sweepSystemLibsignalTemp(logger zerolog.Logger) {
 	if signalTmpSweepDisabled() {
 		return
 	}
-	removed, bytes := sweepDirEntries(os.TempDir(), legacyLibsignalMaxAge, func(name string) bool {
+	removed, bytes := sweepDirEntries(os.TempDir(), libsignalTmpMaxAge, func(name string) bool {
 		return strings.HasPrefix(name, "libsignal")
 	})
 	if removed > 0 {
 		logger.Warn().
 			Int("dirs", removed).
 			Str("reclaimed", humanBytes(bytes)).
-			Msg("Removed libsignal temp dirs leaked by earlier versions (see issue #27)")
+			Msg("Removed libsignal temp dirs left in the system temp dir (see issue #27)")
 	}
 }
 
