@@ -2364,6 +2364,7 @@ test('service worker keeps APIs network-only and serves the shell offline', asyn
         await caches.delete(key);
       }
       await caches.open('openmessage-static-old-test');
+      await caches.open('openmessage-static-v1');
     });
 
     await page.goto('/');
@@ -2376,13 +2377,14 @@ test('service worker keeps APIs network-only and serves the shell offline', asyn
       .toBe(true);
 
     const cacheKeys = await page.evaluate(async () => caches.keys());
-    expect(cacheKeys).toContain('openmessage-static-v1');
+    expect(cacheKeys).toContain('openmessage-static-v2');
+    expect(cacheKeys).not.toContain('openmessage-static-v1');
     expect(cacheKeys).not.toContain('openmessage-static-old-test');
 
     const apiCached = await page.evaluate(async () => {
       const response = await fetch('/api/status');
       if (!response.ok) return 'api-failed';
-      const cache = await caches.open('openmessage-static-v1');
+      const cache = await caches.open('openmessage-static-v2');
       return !!(await cache.match('/api/status'));
     });
     expect(apiCached).toBe(false);
