@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -275,12 +276,38 @@ func daemonSendMessageHandler(options Options) server.ToolHandlerFunc {
 			if err != nil {
 				return errorResult(fmt.Sprintf("resolve SMS conversation: %v", err)), nil
 			}
-			if conversation == nil {
-				return errorResult(fmt.Sprintf(
-					"no existing SMS conversation with %s. In transportless client mode, starting a brand-new SMS thread requires the OpenMessage app (send the first message there); replies to existing threads work here — use resolve_contact_routes to find the conversation, then send_to_conversation.", recipient,
-				)), nil
+			if conversation != nil {
+				conversationID = conversation.ConversationID
+			} else {
+				// No local thread yet — delegate creation to the daemon,
+				// which owns the sole live libgm connection. Probe the
+				// daemon first so a "not running" or auth failure surfaces
+				// the same actionable message the send path uses.
+				if _, failure := daemonStatusOrResult(ctx, daemon); failure != nil {
+					return failure, nil
+				}
+				created, err := daemon.NewConversation(ctx, recipient, "sms")
+				if err != nil {
+					if resp, ok := localapi.AsResponseError(err); ok {
+						switch resp.StatusCode {
+						case http.StatusServiceUnavailable:
+							return errorResult(fmt.Sprintf(
+								"Google Messages is not connected in the OpenMessage app (re-pair Google Messages, then retry): %v", err,
+							)), nil
+						case http.StatusBadGateway:
+							return errorResult(fmt.Sprintf(
+								"the app's Google Messages call failed while creating the SMS thread: %v", err,
+							)), nil
+						}
+						if localapi.IsDeterministicRejection(err) {
+							return errorResult(fmt.Sprintf("create SMS thread rejected by the app: %v", err)), nil
+						}
+						return errorResult(fmt.Sprintf("the app could not create the SMS thread: %v", err)), nil
+					}
+					return errorResult(fmt.Sprintf("failed to reach the app to create the SMS thread: %v", err)), nil
+				}
+				conversationID = created.ConversationID
 			}
-			conversationID = conversation.ConversationID
 		default:
 			return errorResult(fmt.Sprintf("unsupported platform %q (supported: sms, whatsapp, signal)", platform)), nil
 		}
