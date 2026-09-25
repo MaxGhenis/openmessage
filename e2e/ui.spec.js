@@ -1825,6 +1825,65 @@ test('sends a WhatsApp image attachment through the compose box', async ({ page 
   await expect(latestMessage.locator('.msg-media-loading')).toHaveCount(0);
 });
 
+for (const failure of [
+  { name: 'missing', status: 404, contentType: 'text/plain', body: 'Attachment unavailable' },
+  { name: 'server error', status: 500, contentType: 'text/plain', body: 'Unable to fetch attachment' },
+  { name: 'malformed', status: 200, contentType: 'application/pdf', body: '%PDF-1.4\ninvalid PDF' },
+]) {
+  test(`keeps the conversation in place with a ${failure.name} PDF`, async ({ page, context }) => {
+    const conversationID = await page.evaluate(async () => {
+      const conversations = await (await fetch('/api/conversations?limit=200')).json();
+      return conversations.find(conversation => conversation.Name === 'Paged Thread').ConversationID;
+    });
+    let pdfMessageID;
+    await page.route(`**/api/conversations/${conversationID}/messages?*`, async route => {
+      const response = await route.fetch();
+      const messages = await response.json();
+      if (!pdfMessageID && messages.length) {
+        pdfMessageID = messages[Math.floor(messages.length / 2)].MessageID;
+      }
+      const message = messages.find(candidate => candidate.MessageID === pdfMessageID);
+      if (message) {
+        message.MediaID = 'unavailable-pdf';
+        message.MimeType = 'application/pdf';
+      }
+      await route.fulfill({ response, json: messages });
+    });
+    let mediaRequests = 0;
+    await context.route('**/api/media/**', async route => {
+      mediaRequests++;
+      await route.fulfill({ status: failure.status, contentType: failure.contentType, body: failure.body });
+    });
+
+    await openConversation(page, 'Paged Thread');
+    await expect(page.locator('#messages-area .msg')).toHaveCount(100);
+    await expectThreadNearBottom(page);
+    await expect(page.locator('#messages-area iframe, #messages-area embed, #messages-area object')).toHaveCount(0);
+    expect(mediaRequests).toBe(0);
+
+    await openConversation(page, 'Sarah Chen');
+    await openConversation(page, 'Paged Thread');
+    await expectThreadNearBottom(page);
+    expect(mediaRequests).toBe(0);
+
+    // Opening a broken PDF is an explicit action in a separate tab. It must
+    // not change the reader's position in the original conversation.
+    const card = page.locator('#messages-area .msg-attachment-card');
+    await expect(card).toHaveAttribute('href', `/api/media/${encodeURIComponent(pdfMessageID)}`);
+    await card.scrollIntoViewIfNeeded();
+    const scrollTop = await page.locator('#messages-area').evaluate(el => el.scrollTop);
+    const [popup] = await Promise.all([page.waitForEvent('popup'), card.click()]);
+    await expect.poll(() => mediaRequests).toBe(1);
+    await expect.poll(() => page.locator('#messages-area').evaluate(el => el.scrollTop)).toBe(scrollTop);
+    await popup.close();
+    await openConversation(page, 'Sarah Chen');
+    await openConversation(page, 'Paged Thread');
+    await expectThreadNearBottom(page);
+    await expectLastMessageVisible(page);
+    expect(mediaRequests).toBe(1);
+  });
+}
+
 test('renders a sent PDF attachment as an openable file card', async ({ page }) => {
   const jordanRow = page.locator('#conversation-list > .convo-item').filter({
     has: page.locator('.convo-name').getByText('Jordan Rivera', { exact: true }),
@@ -1843,10 +1902,10 @@ test('renders a sent PDF attachment as an openable file card', async ({ page }) 
 
   await expect(page.locator('#attach-preview')).not.toHaveClass(/active/);
   const latestMessage = page.locator('#messages-area .msg').last();
-  const preview = latestMessage.locator('iframe.msg-pdf-preview');
-  await expect(preview).toHaveAttribute('data-pdf-src', /\/api\/media\//);
-  await expect(preview).toHaveAttribute('src', /^blob:.*#toolbar=0&navpanes=0&view=FitH$/);
-  const card = latestMessage.locator('.msg-document-preview > .msg-attachment-card').last();
+  await expect(latestMessage.locator('iframe, embed, object')).toHaveCount(0);
+  const card = latestMessage.locator('.msg-attachment-card').last();
+  await expect(card).toHaveAttribute('target', '_blank');
+  await expect(card).toHaveAttribute('rel', 'noopener noreferrer');
   await expect(card).toContainText('PDF');
   await expect(card).toContainText('application/pdf');
   await expect(card).toHaveAttribute('href', /\/api\/media\//);
