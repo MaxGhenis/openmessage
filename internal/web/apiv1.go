@@ -47,17 +47,23 @@ type v1SubmissionResponse struct {
 	LocalMessageID string                `json:"local_message_id"`
 	State          messaging.OutboxState `json:"state"`
 	ScheduledForMS int64                 `json:"scheduled_for_ms"`
+	ExpiresAtMS    int64                 `json:"expires_at_ms,omitempty"`
 	Deduplicated   bool                  `json:"deduplicated"`
 }
 
 type v1DeliveryResponse struct {
 	OutboxID        string                `json:"outbox_id"`
+	AccountID       string                `json:"account_id,omitempty"`
+	ConversationID  string                `json:"conversation_id,omitempty"`
+	Platform        string                `json:"platform,omitempty"`
 	State           messaging.OutboxState `json:"state"`
 	LocalMessageID  string                `json:"local_message_id,omitempty"`
 	RemoteMessageID string                `json:"remote_message_id,omitempty"`
 	ErrorClass      string                `json:"error_class,omitempty"`
 	ErrorCode       string                `json:"error_code,omitempty"`
 	Warning         string                `json:"warning,omitempty"`
+	ExpiresAtMS     int64                 `json:"expires_at_ms,omitempty"`
+	Expired         bool                  `json:"expired,omitempty"`
 }
 
 type v1PendingResponse struct {
@@ -68,6 +74,7 @@ type v1PendingResponse struct {
 	State          messaging.OutboxState `json:"state"`
 	ScheduledForMS int64                 `json:"scheduled_for_ms"`
 	NextAttemptMS  *int64                `json:"next_attempt_at_ms,omitempty"`
+	ExpiresAtMS    int64                 `json:"expires_at_ms,omitempty"`
 	AttemptCount   int64                 `json:"attempt_count"`
 	CreatedAtMS    int64                 `json:"created_at_ms"`
 	Summary        string                `json:"summary"`
@@ -120,6 +127,8 @@ func (a *v1API) submitText(w http.ResponseWriter, r *http.Request) {
 		ReplyToID      string `json:"reply_to_id,omitempty"`
 		IdempotencyKey string `json:"idempotency_key"`
 		NotBeforeMS    *int64 `json:"not_before_ms,omitempty"`
+		TTLMS          *int64 `json:"ttl_ms,omitempty"`
+		Force          bool   `json:"force,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
 		httpError(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
@@ -140,6 +149,11 @@ func (a *v1API) submitText(w http.ResponseWriter, r *http.Request) {
 		httpError(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	ttl, err := validateOptionalTTL(request.TTLMS)
+	if err != nil {
+		httpError(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 	if !a.submitDependenciesAvailable(w) {
 		return
 	}
@@ -150,6 +164,8 @@ func (a *v1API) submitText(w http.ResponseWriter, r *http.Request) {
 		ReplyToID:      strings.TrimSpace(request.ReplyToID),
 		IdempotencyKey: idempotencyKey,
 		NotBefore:      notBefore,
+		TTL:            ttl,
+		Force:          request.Force,
 	}
 	var submission messaging.Submission
 	if a.primary {
@@ -190,6 +206,11 @@ func (a *v1API) submitMedia(w http.ResponseWriter, r *http.Request) {
 		httpError(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	ttl, err := parseOptionalTTL(r.FormValue("ttl_ms"))
+	if err != nil {
+		httpError(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 	if !a.submitDependenciesAvailable(w) {
 		return
 	}
@@ -214,6 +235,7 @@ func (a *v1API) submitMedia(w http.ResponseWriter, r *http.Request) {
 		ReplyToID:      strings.TrimSpace(r.FormValue("reply_to_id")),
 		IdempotencyKey: idempotencyKey,
 		NotBefore:      notBefore,
+		TTL:            ttl,
 	}
 	var submission messaging.Submission
 	if a.primary {
@@ -257,7 +279,7 @@ func (a *v1API) getDelivery(w http.ResponseWriter, r *http.Request) {
 		a.writeError(w, err)
 		return
 	}
-	writeJSON(w, deliveryResponse(delivery))
+	writeJSON(w, a.deliveryResponse(delivery))
 }
 
 func (a *v1API) cancel(w http.ResponseWriter, r *http.Request) {
@@ -285,7 +307,7 @@ func (a *v1API) deliveryAction(
 		a.writeError(w, err)
 		return
 	}
-	writeJSON(w, deliveryResponse(delivery))
+	writeJSON(w, a.deliveryResponse(delivery))
 }
 
 func (a *v1API) v2Cancel(ctx context.Context, id string) (messaging.Delivery, error) {
@@ -448,6 +470,8 @@ func v1ErrorResponse(err error) (int, string) {
 	switch {
 	case errors.Is(err, v2wire.ErrReplyTargetUnavailable):
 		return http.StatusUnprocessableEntity, "reply_target_unavailable"
+	case errors.Is(err, messaging.ErrDuplicateSend):
+		return http.StatusConflict, err.Error()
 	case errors.Is(err, messaging.ErrIdempotencyConflict):
 		return http.StatusConflict, err.Error()
 	case errors.Is(err, messaging.ErrInvalidState):
@@ -501,6 +525,28 @@ func parseOptionalSchedule(raw string) (time.Time, error) {
 	return validateOptionalSchedule(&value)
 }
 
+func validateOptionalTTL(ttlMS *int64) (time.Duration, error) {
+	if ttlMS == nil {
+		return 0, nil
+	}
+	if *ttlMS < 0 {
+		return 0, errors.New("ttl_ms must not be negative")
+	}
+	return time.Duration(*ttlMS) * time.Millisecond, nil
+}
+
+func parseOptionalTTL(raw string) (time.Duration, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0, nil
+	}
+	value, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("ttl_ms must be an integer")
+	}
+	return validateOptionalTTL(&value)
+}
+
 func normalizeRequiredV2IdempotencyKey(raw string) (string, error) {
 	key, err := normalizeSendIdempotencyKey(raw)
 	if err != nil {
@@ -513,24 +559,57 @@ func normalizeRequiredV2IdempotencyKey(raw string) (string, error) {
 }
 
 func submissionResponse(submission messaging.Submission) v1SubmissionResponse {
-	return v1SubmissionResponse{
+	response := v1SubmissionResponse{
 		OutboxID:       submission.OutboxID,
 		LocalMessageID: submission.LocalMessageID,
 		State:          submission.State,
 		ScheduledForMS: submission.ScheduledFor.UnixMilli(),
 		Deduplicated:   submission.Deduplicated,
 	}
+	if !submission.ExpiresAt.IsZero() {
+		response.ExpiresAtMS = submission.ExpiresAt.UnixMilli()
+	}
+	return response
 }
 
-func deliveryResponse(delivery messaging.Delivery) v1DeliveryResponse {
-	return v1DeliveryResponse{
+func (a *v1API) deliveryResponse(delivery messaging.Delivery) v1DeliveryResponse {
+	response := v1DeliveryResponse{
 		OutboxID:        delivery.OutboxID,
+		AccountID:       delivery.AccountID,
+		ConversationID:  delivery.ConversationID,
+		Platform:        a.accountPlatform(delivery.AccountID),
 		State:           delivery.State,
 		LocalMessageID:  delivery.LocalMessageID,
 		RemoteMessageID: delivery.RemoteMessageID,
 		ErrorClass:      delivery.ErrorClass,
 		ErrorCode:       delivery.ErrorCode,
 		Warning:         delivery.Warning,
+		Expired:         delivery.Expired(),
+	}
+	if !delivery.ExpiresAt.IsZero() {
+		response.ExpiresAtMS = delivery.ExpiresAt.UnixMilli()
+	}
+	return response
+}
+
+// accountPlatform maps a v2 account to the platform label agents use for
+// sends. The account's bridge key is the transport family ("google",
+// "whatsapp", "signal"); Google Messages carries SMS/RCS, reported here as
+// "sms" to match conversation source_platform values. RCS-vs-SMS is not
+// distinguishable at this layer and is deliberately not guessed.
+func (a *v1API) accountPlatform(accountID string) string {
+	if a.v2 == nil || a.v2.V2Store == nil || strings.TrimSpace(accountID) == "" {
+		return ""
+	}
+	account, err := a.v2.V2Store.GetAccount(accountID)
+	if err != nil {
+		return ""
+	}
+	switch account.BridgeKey {
+	case "google":
+		return "sms"
+	default:
+		return account.BridgeKey
 	}
 }
 
@@ -551,6 +630,9 @@ func pendingResponse(delivery messaging.PendingDelivery) v1PendingResponse {
 	if !delivery.NextAttemptAt.IsZero() {
 		nextAttemptMS := delivery.NextAttemptAt.UnixMilli()
 		response.NextAttemptMS = &nextAttemptMS
+	}
+	if !delivery.ExpiresAt.IsZero() {
+		response.ExpiresAtMS = delivery.ExpiresAt.UnixMilli()
 	}
 	return response
 }

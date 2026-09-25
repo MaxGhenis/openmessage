@@ -27,10 +27,6 @@ import (
 
 const daemonDownText = "the OpenMessage app isn't running, and this MCP server runs in transportless client mode (it never opens its own WhatsApp/Signal/Google connections — a second connection would log the app out). Start the OpenMessage app, then retry. Local reads (search, conversations, history) keep working without the app."
 
-// daemonSettleTimeout bounds how long a daemon-routed send waits for the
-// outbox item to settle before reporting the durable queued state.
-const daemonSettleTimeout = 25 * time.Second
-
 func daemonDownResult(err error) *mcp.CallToolResult {
 	if err != nil {
 		return errorResult(fmt.Sprintf("%s (probe error: %v)", daemonDownText, err))
@@ -61,8 +57,10 @@ func daemonStatusOrResult(ctx context.Context, daemon *localapi.Client) (localap
 }
 
 func deliveryFromLocalAPI(delivery localapi.Delivery) messaging.Delivery {
-	return messaging.Delivery{
+	converted := messaging.Delivery{
 		OutboxID:        delivery.OutboxID,
+		AccountID:       delivery.AccountID,
+		ConversationID:  delivery.ConversationID,
 		State:           messaging.OutboxState(delivery.State),
 		LocalMessageID:  delivery.LocalMessageID,
 		RemoteMessageID: delivery.RemoteMessageID,
@@ -70,6 +68,68 @@ func deliveryFromLocalAPI(delivery localapi.Delivery) messaging.Delivery {
 		ErrorCode:       delivery.ErrorCode,
 		Warning:         delivery.Warning,
 	}
+	if delivery.ExpiresAtMS > 0 {
+		converted.ExpiresAt = time.UnixMilli(delivery.ExpiresAtMS)
+	}
+	return converted
+}
+
+// daemonSendPlatform resolves the send platform for a conversation routed at
+// the daemon. Prefixed IDs are authoritative; otherwise the local read
+// source's conversation row decides.
+func daemonSendPlatform(reads readsource.ReadSource, conversationID string) string {
+	switch {
+	case strings.HasPrefix(conversationID, "whatsapp:"):
+		return "whatsapp"
+	case strings.HasPrefix(conversationID, "signal:"), strings.HasPrefix(conversationID, "signal-group:"):
+		return "signal"
+	}
+	if reads != nil {
+		if conversation, err := reads.GetConversation(conversationID); err == nil && conversation != nil {
+			return normalizedPlatform(conversation.SourcePlatform)
+		}
+	}
+	return ""
+}
+
+// daemonCheckPlatformSendable enforces the daemon's per-platform send
+// capability before submitting. A daemon that predates the capability block
+// (no "send" map) cannot be checked and passes through, as does a queueable
+// outage (transient disconnect) — the durable outbox plus TTL handles those.
+func daemonCheckPlatformSendable(status localapi.DaemonStatus, platform string) *mcp.CallToolResult {
+	if platform == "" {
+		return nil
+	}
+	capability, known := status.SendCapabilityFor(platform)
+	if !known || capability.Available || capability.Queueable {
+		return nil
+	}
+	return platformUnavailableResult(platform, capability.Reason)
+}
+
+// daemonRejectionResult renders a deterministic daemon refusal. A 404 on the
+// outbox submit route means the daemon's serving store could not resolve the
+// conversation — spelled out because a bare "HTTP 404: not found" reads like
+// a transport bug and has sent agents down the wrong path (2026-08-05:
+// WhatsApp sends 404ing while status showed the platform connected).
+func daemonRejectionResult(err error, conversationID, platform string) *mcp.CallToolResult {
+	if responseErr, ok := isDaemonDuplicateRejection(err); ok {
+		return daemonDuplicateBlockedResult(responseErr)
+	}
+	if responseErr, ok := localapi.AsResponseError(err); ok && responseErr.StatusCode == 404 {
+		platformNote := ""
+		if platform != "" {
+			platformNote = fmt.Sprintf(" The %s connection can be up for receiving while this send path has no usable conversation record.", platform)
+		}
+		return errorResult(fmt.Sprintf(
+			"send rejected: the app could not resolve conversation %q in its serving store (HTTP 404). The message was NOT queued.%s Use resolve_contact_routes to find a sendable route for this contact, or send the first message from the app.",
+			conversationID, platformNote,
+		))
+	}
+	if responseErr, ok := localapi.AsResponseError(err); ok && responseErr.StatusCode == 501 {
+		return platformUnavailableResult(firstNonEmpty(platform, "the requested platform"), responseErr.Body)
+	}
+	return errorResult(fmt.Sprintf("send rejected by the app: %v", err))
 }
 
 // daemonAmbiguousResult reports a send whose outcome the daemon may or may
@@ -92,96 +152,154 @@ func daemonAmbiguousResult(idempotencyKey string, cause error) *mcp.CallToolResu
 }
 
 // daemonSubmitTextAndWait submits one durable text send to the daemon outbox
-// and waits (bounded) for it to settle, mirroring the in-process v2 result
+// and waits (bounded) for its outcome, mirroring the in-process v2 result
 // contract so agents see identical semantics in both serve modes.
 func daemonSubmitTextAndWait(
 	ctx context.Context,
-	daemon *localapi.Client,
+	options Options,
 	args map[string]any,
 	conversationID string,
 	body string,
+	platform string,
 ) *mcp.CallToolResult {
+	daemon := options.Daemon
 	key, err := v2IdempotencyKey(args)
 	if err != nil {
 		return errorResult(err.Error())
 	}
-	submission, err := daemon.SubmitText(ctx, localapi.TextSubmission{
+	ttl, err := parseSendTTL(args)
+	if err != nil {
+		return errorResult(err.Error())
+	}
+	force, err := parseSendForce(args)
+	if err != nil {
+		return errorResult(err.Error())
+	}
+	wait, err := parseSendWaitOptions(args)
+	if err != nil {
+		return errorResult(err.Error())
+	}
+	submission := localapi.TextSubmission{
 		ConversationID: conversationID,
 		Body:           body,
 		IdempotencyKey: key,
-	})
+		Force:          force,
+	}
+	if ttl > 0 {
+		ttlMS := ttl.Milliseconds()
+		submission.TTLMS = &ttlMS
+	}
+	accepted, err := daemon.SubmitText(ctx, submission)
 	if err != nil {
 		if localapi.IsDeterministicRejection(err) {
-			return errorResult(fmt.Sprintf("send rejected by the app: %v", err))
+			return daemonRejectionResult(err, conversationID, platform)
 		}
 		return daemonAmbiguousResult(key, err)
 	}
-	return daemonWaitForDelivery(ctx, daemon, submission, key)
+	return daemonWaitForDelivery(ctx, options, accepted, key, platform, conversationID, wait)
+}
+
+// daemonAwaitOutcome polls the daemon until the send reaches a reportable
+// outcome or the wait window closes. With WaitForTransmit it holds through
+// auto-retrying not_dispatched states; otherwise those return immediately.
+// The bool reports whether any state was ever observed.
+func daemonAwaitOutcome(
+	ctx context.Context,
+	daemon *localapi.Client,
+	outboxID string,
+	wait sendWaitOptions,
+) (localapi.Delivery, bool, error) {
+	deadline := time.Now().Add(wait.Wait)
+	var last localapi.Delivery
+	var lastErr error
+	observed := false
+	for {
+		delivery, err := daemon.Delivery(ctx, outboxID)
+		if err == nil {
+			observed = true
+			last = delivery
+			lastErr = nil
+			state := messaging.OutboxState(delivery.State)
+			if sendSettled(state) || state == messaging.OutboxUncertain {
+				return last, true, nil
+			}
+			if state == messaging.OutboxNotDispatched && !wait.WaitForTransmit {
+				return last, true, nil
+			}
+		} else {
+			lastErr = err
+		}
+		if ctx.Err() != nil || !time.Now().Before(deadline) {
+			if observed {
+				return last, true, nil
+			}
+			if lastErr == nil {
+				lastErr = ctx.Err()
+			}
+			return localapi.Delivery{}, false, lastErr
+		}
+		select {
+		case <-ctx.Done():
+			if observed {
+				return last, true, nil
+			}
+			return localapi.Delivery{}, false, ctx.Err()
+		case <-time.After(250 * time.Millisecond):
+		}
+	}
 }
 
 func daemonWaitForDelivery(
 	ctx context.Context,
-	daemon *localapi.Client,
+	options Options,
 	submission localapi.Submission,
 	idempotencyKey string,
+	platform string,
+	conversationID string,
+	wait sendWaitOptions,
 ) *mcp.CallToolResult {
-	delivery, settled, err := daemon.WaitDelivery(ctx, submission.OutboxID, daemonSettleTimeout)
-	if err != nil {
+	delivery, observed, err := daemonAwaitOutcome(ctx, options.Daemon, submission.OutboxID, wait)
+	if !observed {
 		// The intent is durably queued on the daemon; only our view failed.
-		return v2InterruptedResult(
-			messaging.Submission{OutboxID: submission.OutboxID, Deduplicated: submission.Deduplicated},
-			idempotencyKey,
-			messaging.Delivery{},
-			err,
-		)
-	}
-	converted := deliveryFromLocalAPI(delivery)
-	if !settled {
-		payload := map[string]any{
-			"ok":              false,
-			"settled":         false,
-			"auto_retry":      true,
-			"outbox_id":       delivery.OutboxID,
-			"state":           delivery.State,
-			"deduplicated":    submission.Deduplicated,
-			"idempotency_key": idempotencyKey,
+		lastKnown := messaging.Delivery{
+			OutboxID:       submission.OutboxID,
+			ConversationID: conversationID,
+			State:          messaging.OutboxQueued,
+			LocalMessageID: submission.LocalMessageID,
 		}
-		if delivery.LocalMessageID != "" {
-			payload["local_message_id"] = delivery.LocalMessageID
+		if submission.ExpiresAtMS > 0 {
+			lastKnown.ExpiresAt = time.UnixMilli(submission.ExpiresAtMS)
 		}
+		outcome := sendOutcome{
+			Delivery:       lastKnown,
+			IdempotencyKey: idempotencyKey,
+			Deduplicated:   submission.Deduplicated,
+			Platform:       platform,
+			ConversationID: conversationID,
+		}
+		payload := buildSendPayload(outcome)
+		payload["wait_error"] = err.Error()
 		text := fmt.Sprintf(
-			"The send is durably queued on the app (outbox %s, state %s) and the app finishes sending it in the background. Do NOT send this message again. To repeat the exact same send deliberately, reuse idempotency_key %s.",
-			delivery.OutboxID, delivery.State, idempotencyKey,
+			"The send is durably queued on the app (outbox %s, state %s) and has NOT been confirmed as transmitted; this wait was interrupted (%v). The app keeps sending it in the background. Do NOT send this message again — check progress with list_outbox, or repeat the exact same send deliberately by reusing idempotency_key %s.",
+			lastKnown.OutboxID, lastKnown.State, err, idempotencyKey,
 		)
 		return structuredResult(payload, text)
 	}
 
-	settledState := converted.State != messaging.OutboxNotDispatched
-	payload := map[string]any{
-		"ok":               v2DeliveryOK(converted.State),
-		"settled":          settledState,
-		"outbox_id":        delivery.OutboxID,
-		"state":            delivery.State,
-		"deduplicated":     submission.Deduplicated,
-		"local_message_id": delivery.LocalMessageID,
-		"idempotency_key":  idempotencyKey,
+	converted := deliveryFromLocalAPI(delivery)
+	outcome := sendOutcome{
+		Delivery:          converted,
+		IdempotencyKey:    idempotencyKey,
+		Deduplicated:      submission.Deduplicated,
+		Platform:          firstNonEmpty(delivery.Platform, platform),
+		ConversationID:    conversationID,
+		WaitedForTransmit: wait.WaitForTransmit,
+		WaitExpired:       wait.WaitForTransmit && !sendTransmitted(converted.State),
 	}
-	if !settledState {
-		payload["auto_retry"] = true
+	if sendTransmitted(converted.State) {
+		outcome.Delivered = deliveryReceiptObserved(options.Reads, converted.RemoteMessageID)
 	}
-	if delivery.RemoteMessageID != "" {
-		payload["remote_message_id"] = delivery.RemoteMessageID
-	}
-	if delivery.ErrorClass != "" {
-		payload["error_class"] = delivery.ErrorClass
-	}
-	if delivery.ErrorCode != "" {
-		payload["error_code"] = delivery.ErrorCode
-	}
-	if delivery.Warning != "" {
-		payload["warning"] = delivery.Warning
-	}
-	return structuredResult(payload, v2DeliveryText(converted))
+	return sendOutcomeResult(outcome)
 }
 
 // daemonLegacySendText routes a text send through a legacy-mode daemon's
@@ -228,12 +346,24 @@ func daemonSendToConversationHandler(options Options) server.ToolHandlerFunc {
 		if message == "" {
 			return errorResult("message is required"), nil
 		}
+		platform := daemonSendPlatform(options.Reads, conversationID)
+		if requested := normalizeDirectSendPlatform(strArg(args, "platform")); strArg(args, "platform") != "" {
+			if platform != "" && requested != platform {
+				return platformMismatchResult(requested, platform, conversationID), nil
+			}
+			if platform == "" {
+				platform = requested
+			}
+		}
 		status, failure := daemonStatusOrResult(ctx, daemon)
 		if failure != nil {
 			return failure, nil
 		}
+		if failure := daemonCheckPlatformSendable(status, platform); failure != nil {
+			return failure, nil
+		}
 		if status.SendsViaOutbox() {
-			return daemonSubmitTextAndWait(ctx, daemon, args, conversationID, message), nil
+			return daemonSubmitTextAndWait(ctx, options, args, conversationID, message, platform), nil
 		}
 		return daemonLegacySendText(ctx, daemon, args, conversationID, message), nil
 	}
@@ -282,15 +412,18 @@ func daemonSendMessageHandler(options Options) server.ToolHandlerFunc {
 			}
 			conversationID = conversation.ConversationID
 		default:
-			return errorResult(fmt.Sprintf("unsupported platform %q (supported: sms, whatsapp, signal)", platform)), nil
+			return unsupportedSendPlatformResult(platform), nil
 		}
 
 		status, failure := daemonStatusOrResult(ctx, daemon)
 		if failure != nil {
 			return failure, nil
 		}
+		if failure := daemonCheckPlatformSendable(status, platform); failure != nil {
+			return failure, nil
+		}
 		if status.SendsViaOutbox() {
-			return daemonSubmitTextAndWait(ctx, daemon, args, conversationID, message), nil
+			return daemonSubmitTextAndWait(ctx, options, args, conversationID, message, platform), nil
 		}
 		return daemonLegacySendText(ctx, daemon, args, conversationID, message), nil
 	}
@@ -323,11 +456,23 @@ func daemonSendMediaToConversationHandler(options Options) server.ToolHandlerFun
 			return errorResult("file_path must point to a file"), nil
 		}
 
+		platform := daemonSendPlatform(options.Reads, conversationID)
 		status, failure := daemonStatusOrResult(ctx, daemon)
 		if failure != nil {
 			return failure, nil
 		}
+		if failure := daemonCheckPlatformSendable(status, platform); failure != nil {
+			return failure, nil
+		}
 		key, err := v2IdempotencyKey(args)
+		if err != nil {
+			return errorResult(err.Error()), nil
+		}
+		ttl, err := parseSendTTL(args)
+		if err != nil {
+			return errorResult(err.Error()), nil
+		}
+		wait, err := parseSendWaitOptions(args)
 		if err != nil {
 			return errorResult(err.Error()), nil
 		}
@@ -350,15 +495,19 @@ func daemonSendMediaToConversationHandler(options Options) server.ToolHandlerFun
 			IdempotencyKey: key,
 			Content:        file,
 		}
+		if ttl > 0 {
+			ttlMS := ttl.Milliseconds()
+			submission.TTLMS = &ttlMS
+		}
 		if status.SendsViaOutbox() {
 			outboxSubmission, err := daemon.SubmitMedia(ctx, submission)
 			if err != nil {
 				if localapi.IsDeterministicRejection(err) {
-					return errorResult(fmt.Sprintf("media send rejected by the app: %v", err)), nil
+					return daemonRejectionResult(err, conversationID, platform), nil
 				}
 				return daemonAmbiguousResult(key, err), nil
 			}
-			return daemonWaitForDelivery(ctx, daemon, outboxSubmission, key), nil
+			return daemonWaitForDelivery(ctx, options, outboxSubmission, key, platform, conversationID, wait), nil
 		}
 		result, err := daemon.LegacySendMedia(ctx, submission)
 		if err != nil {
@@ -543,8 +692,28 @@ func daemonGetStatusHandler(a *app.App, options Options) server.ToolHandlerFunc 
 		appendPlatform("Google Messages", "google")
 		appendPlatform("WhatsApp", "whatsapp")
 		appendPlatform("Signal", "signal")
+		if send, ok := raw["send"].(map[string]any); ok {
+			sb.WriteString("\nSend capability (daemon truth; \"connected\" above does NOT imply a platform can send):\n")
+			for _, platform := range []string{"sms", "whatsapp", "signal"} {
+				entry, ok := send[platform].(map[string]any)
+				if !ok {
+					continue
+				}
+				available, _ := entry["available"].(bool)
+				queueable, _ := entry["queueable"].(bool)
+				reason, _ := entry["reason"].(string)
+				switch {
+				case available:
+					fmt.Fprintf(&sb, "  %s: available\n", platform)
+				case queueable:
+					fmt.Fprintf(&sb, "  %s: DEGRADED (sends queue, not transmit) — %s\n", platform, firstNonEmpty(reason, "reason unknown"))
+				default:
+					fmt.Fprintf(&sb, "  %s: UNAVAILABLE — %s\n", platform, firstNonEmpty(reason, "reason unknown"))
+				}
+			}
+		}
 		if v2Primary, ok := raw["v2_primary"].(bool); ok {
-			fmt.Fprintf(&sb, "App v2 mode: primary=%v send=%v\n", v2Primary, raw["v2_send"])
+			fmt.Fprintf(&sb, "App v2 mode: primary=%v send=%v (v2_send is the send STACK flag, not per-platform capability — see the send capability block)\n", v2Primary, raw["v2_send"])
 		}
 		fmt.Fprintf(&sb, "Client data dir: %s\n", a.DataDir)
 		return structuredResult(map[string]any{

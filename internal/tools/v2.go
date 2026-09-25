@@ -7,12 +7,14 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
 
 	"github.com/maxghenis/openmessage/internal/app"
 	"github.com/maxghenis/openmessage/internal/bridge"
 	"github.com/maxghenis/openmessage/internal/messaging"
+	"github.com/maxghenis/openmessage/internal/readsource"
 	"github.com/maxghenis/openmessage/internal/storage/sqlite"
 	"github.com/maxghenis/openmessage/internal/v2wire"
 )
@@ -28,7 +30,7 @@ type V2Dependencies struct {
 	Registry  bridge.Registry
 }
 
-const v2DeliveryDescription = " With v2 sending enabled, this waits for a settled delivery result. Every result includes outbox_id and idempotency_key. If settled is false (the wait was interrupted or the app is retrying automatically), the message is still durably queued and the app finishes sending it in the background: never send it again in response. An uncertain result means the transport may have accepted the message; do not retry automatically. Send again only as a deliberate new intent, reusing the returned idempotency_key when repeating the exact same send after a lost response."
+const v2DeliveryDescription = " With v2 sending enabled, this reports truthful transport state: transport_state is queued (has NOT left this machine), transmitted (the platform transport accepted it — NOT proof of delivery), delivered (a delivery receipt was observed), uncertain, failed, or canceled. settled/transmitted are true only on transport acknowledgment; while they are false the message is still durably queued and the app keeps sending it in the background — never send it again in response. An uncertain result means the transport may have accepted the message; do not retry automatically. Results include the platform actually used and the conversation_id written to; there is never a silent fallback to another platform. Sends carry a default ~10-minute send window (ttl_seconds; 0 = never expire) after which a still-queued message cancels as expired instead of sending stale. Near-identical resends within a few minutes are blocked unless force=true. Set wait_for_transmit=true (with wait_seconds, max 120) to keep waiting for transport acknowledgment before returning. Reuse the returned idempotency_key only to replay the exact same send after a lost response."
 
 const v2IdempotencyDescription = "Optional retry key for the exact same send. Every result echoes the key in use; reuse the same key only when repeating a send whose response was lost. Omit it to mint a new intent."
 
@@ -128,6 +130,39 @@ func newMCPIdempotencyKey() (string, error) {
 	}, "-"), nil
 }
 
+// sendPlatform resolves the send platform for a conversation ID. Prefixed
+// IDs are authoritative; otherwise the serving store's conversation row
+// decides. Empty when unresolvable — the submit path still validates the
+// conversation, so an unknown platform never blocks a legitimate send.
+func (v *V2Dependencies) sendPlatform(a *app.App, conversationID string) string {
+	switch {
+	case strings.HasPrefix(conversationID, "whatsapp:"):
+		return "whatsapp"
+	case strings.HasPrefix(conversationID, "signal:"), strings.HasPrefix(conversationID, "signal-group:"):
+		return "signal"
+	}
+	if v.V2Primary && v.V2Store != nil {
+		conversation, err := v.V2Store.GetConversation(conversationID)
+		if err != nil {
+			return ""
+		}
+		account, err := v.V2Store.GetAccount(conversation.AccountID)
+		if err != nil {
+			return ""
+		}
+		if account.BridgeKey == "google" {
+			return "sms"
+		}
+		return account.BridgeKey
+	}
+	if a != nil && a.Store != nil {
+		if conversation, err := a.Store.GetConversation(conversationID); err == nil && conversation != nil {
+			return normalizedPlatform(conversation.SourcePlatform)
+		}
+	}
+	return ""
+}
+
 func submitV2Text(
 	ctx context.Context,
 	a *app.App,
@@ -140,15 +175,40 @@ func submitV2Text(
 	if err != nil {
 		return errorResult(err.Error())
 	}
+	ttl, err := parseSendTTL(args)
+	if err != nil {
+		return errorResult(err.Error())
+	}
+	force, err := parseSendForce(args)
+	if err != nil {
+		return errorResult(err.Error())
+	}
+	wait, err := parseSendWaitOptions(args)
+	if err != nil {
+		return errorResult(err.Error())
+	}
+	platform := v2.sendPlatform(a, conversationID)
+	if failure := checkPlatformSendable(localSendCapability(a, v2), platform); failure != nil {
+		return failure
+	}
 	submission, err := v2.submitText(ctx, a, v2wire.TextInput{
 		ConversationID: conversationID,
 		Body:           body,
 		IdempotencyKey: key,
+		TTL:            ttl,
+		Force:          force,
 	})
 	if err != nil {
+		var duplicate *messaging.DuplicateSendError
+		if errors.As(err, &duplicate) {
+			return duplicateBlockedResult(duplicate)
+		}
+		if errors.Is(err, v2wire.ErrPlatformNotSendable) {
+			return platformUnavailableResult(firstNonEmpty(platform, "the requested platform"), err.Error())
+		}
 		return errorResult(fmt.Sprintf("failed to submit message: %v", err))
 	}
-	return waitForV2Delivery(ctx, v2, submission, key)
+	return waitForV2Delivery(ctx, a, v2, submission, key, platform, conversationID, wait)
 }
 
 // waitForV2Delivery reports the durable send's outcome. The intent is already
@@ -158,109 +218,130 @@ func submitV2Text(
 // reported as non-settled statuses with explicit do-not-resend guidance.
 func waitForV2Delivery(
 	ctx context.Context,
+	a *app.App,
 	v2 *V2Dependencies,
 	submission messaging.Submission,
 	idempotencyKey string,
+	platform string,
+	conversationID string,
+	wait sendWaitOptions,
 ) *mcp.CallToolResult {
 	if v2.Service == nil {
 		return errorResult("v2 send service is unavailable")
 	}
-	delivery, err := v2.Service.Wait(ctx, submission.OutboxID)
-	if err != nil {
-		return v2InterruptedResult(submission, idempotencyKey, delivery, err)
+	waitCtx, cancel := context.WithTimeout(ctx, wait.Wait)
+	defer cancel()
+
+	var delivery messaging.Delivery
+	var waitErr error
+	for {
+		delivery, waitErr = v2.Service.Get(waitCtx, submission.OutboxID)
+		if waitErr != nil {
+			break
+		}
+		if sendSettled(delivery.State) || delivery.State == messaging.OutboxUncertain {
+			break
+		}
+		// not_dispatched is stable-but-retrying: report it unless the caller
+		// asked to hold out for transport acknowledgment.
+		if delivery.State == messaging.OutboxNotDispatched && !wait.WaitForTransmit {
+			break
+		}
+		changed := v2.Service.Changes()
+		select {
+		case <-waitCtx.Done():
+			waitErr = waitCtx.Err()
+		case <-changed:
+		case <-time.After(250 * time.Millisecond):
+		}
+		if waitErr != nil {
+			break
+		}
+	}
+	if waitErr != nil {
+		return v2InterruptedResult(a, v2, submission, idempotencyKey, platform, conversationID, waitErr)
 	}
 
-	settled := delivery.State != messaging.OutboxNotDispatched
-	payload := map[string]any{
-		"ok":               v2DeliveryOK(delivery.State),
-		"settled":          settled,
-		"outbox_id":        delivery.OutboxID,
-		"state":            delivery.State,
-		"deduplicated":     submission.Deduplicated,
-		"local_message_id": delivery.LocalMessageID,
-		"idempotency_key":  idempotencyKey,
+	outcome := sendOutcome{
+		Delivery:          delivery,
+		IdempotencyKey:    idempotencyKey,
+		Deduplicated:      submission.Deduplicated,
+		Platform:          platform,
+		ConversationID:    conversationID,
+		WaitedForTransmit: wait.WaitForTransmit,
 	}
-	if !settled {
-		payload["auto_retry"] = true
+	if sendTransmitted(delivery.State) {
+		outcome.Delivered = deliveryReceiptObserved(legacyReads(a), delivery.RemoteMessageID)
 	}
-	if delivery.RemoteMessageID != "" {
-		payload["remote_message_id"] = delivery.RemoteMessageID
-	}
-	if delivery.ErrorClass != "" {
-		payload["error_class"] = delivery.ErrorClass
-	}
-	if delivery.ErrorCode != "" {
-		payload["error_code"] = delivery.ErrorCode
-	}
-	if delivery.Warning != "" {
-		payload["warning"] = delivery.Warning
-	}
-
-	return structuredResult(payload, v2DeliveryText(delivery))
+	return sendOutcomeResult(outcome)
 }
 
-// v2InterruptedResult handles Wait ending before the delivery settled (request
-// context canceled or timed out, or a transient read failure). The durable row
-// is untouched by the interruption and the dispatcher runs on its own context,
-// so the send still completes in the background.
+// v2InterruptedResult handles the wait ending before the delivery settled
+// (request context canceled or timed out, or a transient read failure). The
+// durable row is untouched by the interruption and the dispatcher runs on its
+// own context, so the send still completes in the background — unless its
+// send window expires first.
 func v2InterruptedResult(
+	a *app.App,
+	v2 *V2Dependencies,
 	submission messaging.Submission,
 	idempotencyKey string,
-	lastKnown messaging.Delivery,
+	platform string,
+	conversationID string,
 	waitErr error,
 ) *mcp.CallToolResult {
-	outboxID := lastKnown.OutboxID
-	if outboxID == "" {
-		outboxID = submission.OutboxID
+	// Best-effort fresh read on a detached context: the wait's own context is
+	// typically the thing that just expired.
+	lastKnown := messaging.Delivery{
+		OutboxID:       submission.OutboxID,
+		ConversationID: conversationID,
+		State:          messaging.OutboxQueued,
+		LocalMessageID: submission.LocalMessageID,
+		ExpiresAt:      submission.ExpiresAt,
 	}
-	state := string(lastKnown.State)
-	if state == "" {
-		state = string(messaging.OutboxQueued)
+	if v2.Service != nil {
+		readCtx, cancel := context.WithTimeout(context.WithoutCancel(context.Background()), 2*time.Second)
+		if delivery, err := v2.Service.Get(readCtx, submission.OutboxID); err == nil {
+			lastKnown = delivery
+		}
+		cancel()
+		if sendSettled(lastKnown.State) || lastKnown.State == messaging.OutboxUncertain {
+			outcome := sendOutcome{
+				Delivery:       lastKnown,
+				IdempotencyKey: idempotencyKey,
+				Deduplicated:   submission.Deduplicated,
+				Platform:       platform,
+				ConversationID: conversationID,
+			}
+			if sendTransmitted(lastKnown.State) {
+				outcome.Delivered = deliveryReceiptObserved(legacyReads(a), lastKnown.RemoteMessageID)
+			}
+			return sendOutcomeResult(outcome)
+		}
 	}
-	payload := map[string]any{
-		"ok":              false,
-		"settled":         false,
-		"outbox_id":       outboxID,
-		"state":           state,
-		"deduplicated":    submission.Deduplicated,
-		"idempotency_key": idempotencyKey,
-		"wait_error":      waitErr.Error(),
+
+	outcome := sendOutcome{
+		Delivery:       lastKnown,
+		IdempotencyKey: idempotencyKey,
+		Deduplicated:   submission.Deduplicated,
+		Platform:       platform,
+		ConversationID: conversationID,
 	}
-	if lastKnown.LocalMessageID != "" {
-		payload["local_message_id"] = lastKnown.LocalMessageID
-	}
+	payload := buildSendPayload(outcome)
+	payload["wait_error"] = waitErr.Error()
 	text := fmt.Sprintf(
-		"The send is durably queued (outbox %s, state %s) and the app will finish sending it in the background; this wait was interrupted (%v) before the outcome settled. Do NOT send this message again. To repeat the exact same send deliberately, reuse idempotency_key %s.",
-		outboxID, state, waitErr, idempotencyKey,
+		"The send is durably queued (outbox %s, state %s) and has NOT been transmitted; this wait was interrupted (%v) before the outcome was known. The app keeps sending it in the background. Do NOT send this message again — check progress with list_outbox, or repeat the exact same send deliberately by reusing idempotency_key %s.",
+		lastKnown.OutboxID, lastKnown.State, waitErr, idempotencyKey,
 	)
 	return structuredResult(payload, text)
 }
 
-// v2DeliveryOK reports whether the message reached the transport. store_failed
-// means the transport accepted the send and only the local record needs repair,
-// which the dispatcher performs automatically.
-func v2DeliveryOK(state messaging.OutboxState) bool {
-	return state == messaging.OutboxConfirmed || state == messaging.OutboxStoreFailed
-}
-
-func v2DeliveryText(delivery messaging.Delivery) string {
-	switch delivery.State {
-	case messaging.OutboxConfirmed:
-		if delivery.RemoteMessageID != "" {
-			return fmt.Sprintf("Message delivery confirmed (outbox %s, remote message %s).", delivery.OutboxID, delivery.RemoteMessageID)
-		}
-		return fmt.Sprintf("Message delivery confirmed (outbox %s).", delivery.OutboxID)
-	case messaging.OutboxUncertain:
-		return fmt.Sprintf("Message delivery is uncertain (outbox %s): the transport may have accepted it. Do not retry automatically; send again only as a deliberate new intent.", delivery.OutboxID)
-	case messaging.OutboxNotDispatched:
-		return fmt.Sprintf("Delivery has not succeeded yet (outbox %s, error class %s). The app is retrying it automatically; do NOT send this message again.", delivery.OutboxID, firstNonEmpty(delivery.ErrorClass, "unknown"))
-	case messaging.OutboxStoreFailed:
-		return fmt.Sprintf("The transport accepted the message (outbox %s, remote message %s); the local record is being repaired automatically. Do not resend.", delivery.OutboxID, delivery.RemoteMessageID)
-	case messaging.OutboxRejected:
-		return fmt.Sprintf("Message delivery was rejected (outbox %s, error class %s). The app will not retry it; sending again creates a new message and may fail the same way.", delivery.OutboxID, firstNonEmpty(delivery.ErrorClass, "unknown"))
-	case messaging.OutboxCanceled:
-		return fmt.Sprintf("Message delivery was canceled (outbox %s).", delivery.OutboxID)
-	default:
-		return fmt.Sprintf("Message delivery settled as %s (outbox %s).", delivery.State, delivery.OutboxID)
+// legacyReads returns the legacy store for delivery-receipt lookups. Receipt
+// statuses (OUTGOING_DELIVERED, DELIVERED, READ) are recorded by the live
+// event handlers on the legacy store regardless of serving mode.
+func legacyReads(a *app.App) readsource.ReadSource {
+	if a == nil || a.Store == nil {
+		return nil
 	}
+	return a.Store
 }

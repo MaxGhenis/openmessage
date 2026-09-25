@@ -193,7 +193,7 @@ func writeCLIDelivery(output io.Writer, delivery outboxDelivery, key string, sch
 	fmt.Fprintf(output, "outbox_id=%s state=%s idempotency_key=%s\n", delivery.OutboxID, delivery.State, key)
 	switch delivery.State {
 	case "confirmed":
-		fmt.Fprintln(output, "message delivery confirmed")
+		fmt.Fprintln(output, "transmitted: the transport accepted the message. Transport acceptance is not delivery — verify in-thread before reporting it as sent.")
 	case "not_dispatched":
 		if !scheduled {
 			fmt.Fprintln(output, "queued; app retries automatically. Do not resend.")
