@@ -53,6 +53,9 @@ func parseNotificationMode(mode string) (string, error) {
 }
 
 func (s *Store) UpsertConversation(c *Conversation) error {
+	s.directoryMu.RLock()
+	defer s.directoryMu.RUnlock()
+	resolveDirectoryNames(c, nil, s.directoryNames)
 	if c.SourcePlatform == "" {
 		c.SourcePlatform = "sms"
 	}

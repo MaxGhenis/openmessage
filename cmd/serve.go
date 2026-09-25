@@ -161,6 +161,7 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 	if err != nil {
 		return fmt.Errorf("init app: %w", err)
 	}
+	a.ContactDirectoryDisabled = isDemo || v2Primary || !transports
 	defer a.Close()
 
 	interactiveTerminal := term.IsTerminal(int(os.Stdin.Fd()))
@@ -659,6 +660,9 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 	// same store double-sends every due message.
 	if transports {
 		startLegacyScheduler(v2Primary, a.StartScheduler)
+		if !isDemo && !v2Primary {
+			a.StartContactDirectorySync()
+		}
 	}
 
 	v2Options := v2SendWebOptions(stack, v2Send)
@@ -717,6 +721,7 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 				BackfillStatus:        func() any { return a.GetBackfillProgress() },
 				BackfillPhone:         a.BackfillConversationByPhone,
 				SyncGoogleContacts:    a.SyncGoogleContacts,
+				ContactSyncStatus:     func() any { return a.GetContactSyncStatus() },
 			})
 		} else {
 			httpHandler = web.ProtectLocalControl(controlAuth.Handler(mcpHTTPHandler))

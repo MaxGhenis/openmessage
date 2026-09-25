@@ -277,3 +277,45 @@ Debugging a live install (failing sends, re-pairing, the two-data-dir gotcha, si
 ## License
 
 MIT
+
+### Complete Google Contacts directory (optional, legacy read mode)
+
+Google Messages supplies a limited contact suggestion list. Names in existing
+threads often arrive independently through conversation updates; a successful
+Google Messages connection does not prove the whole address book was imported.
+
+To keep a complete directory, configure an authenticated Google Contacts MCP
+server exposing the `contacts_list` tool with Google People API `connections`,
+`nextPageToken`, and `totalItems` (or `totalPeople`) fields. For example,
+[google-contacts-mcp](https://github.com/domdomegg/google-contacts-mcp) supports
+this contract. Authorize that connector for the same Google account as the phone.
+OpenMessage calls only its read-only listing tool; OAuth stays in the connector.
+
+- `OPENMESSAGES_GOOGLE_CONTACTS_MCP_URL`: opt-in Streamable HTTP endpoint, such as
+  `http://127.0.0.1:3230/mcp`. HTTP requires a literal loopback IP; remote endpoints
+  require HTTPS. Redirects and credentials/query strings in the URL are rejected.
+- `OPENMESSAGES_GOOGLE_CONTACTS_MCP_TOKEN_FILE`: optional private (0600) file
+  containing a connector bearer token, if required. Do not put a token in the URL.
+- `OPENMESSAGES_CONTACTS_REFRESH_INTERVAL`: refresh interval, default `5m`,
+  minimum `1m`, maximum `24h`.
+
+The daemon imports immediately and on the interval, even when the phone is
+unavailable. All pages must arrive and agree with the reported total before a
+single transaction replaces the previous directory. Failures preserve that last
+complete snapshot. All returned phones, emails and organizations are retained;
+full dialable phone numbers become compose suggestions. Email-only records remain
+in the directory but do not create SMS routes or empty conversations.
+
+For existing SMS threads, unambiguous numbers replace blank/numeric names, and
+names supplied by the previous directory follow renames/deletions. Shared numbers
+are left unresolved. Custom titles and group titles are preserved, as are message
+history, phone-side contact IDs, read state and favorites. Later raw-number
+conversation snapshots also consult the directory.
+
+`GET /api/status` includes `contact_sync` with the source, running state, last
+attempt/success times, people/phone counts and refresh errors. `complete` describes
+the last successfully imported snapshot; inspect `last_error` and the success
+age as well. `POST /api/contacts/sync` performs a manual refresh. With no connector
+configured, the existing Google Messages suggestion fetch remains available and
+is not reported as a complete directory. Demo, client-only and v2-primary modes
+do not run the full-directory worker; v2 directory integration is future work.

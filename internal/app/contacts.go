@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"fmt"
 	"strings"
 
@@ -8,6 +9,10 @@ import (
 )
 
 func (a *App) StartGoogleContactSync() {
+	if a != nil && googleContactsMCPURL() != "" {
+		a.StartContactDirectorySync()
+		return
+	}
 	if a == nil || !googleAvatarSyncEnabled() {
 		return
 	}
@@ -30,6 +35,9 @@ func (a *App) StartGoogleContactSync() {
 }
 
 func (a *App) SyncGoogleContacts() (int, error) {
+	if googleContactsMCPURL() != "" {
+		return a.syncContactDirectory(context.Background())
+	}
 	gm := a.getGMClient()
 	if gm == nil {
 		return 0, fmt.Errorf("not connected to Google Messages")

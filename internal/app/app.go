@@ -112,6 +112,10 @@ func (p *BackfillProgress) snapshot() BackfillSnapshot {
 }
 
 type App struct {
+	// Set before starting transports; directory writes currently target legacy reads.
+	ContactDirectoryDisabled bool
+
+	contactDirectory    contactDirectoryState
 	clientMu            sync.RWMutex
 	Client              *client.Client
 	googleGeneration    *GoogleGeneration
@@ -870,6 +874,7 @@ func (a *App) GetBackfillProgress() BackfillSnapshot {
 }
 
 func (a *App) Close() {
+	a.stopContactDirectorySync()
 	a.StopGoogleAvatarSync()
 	if cli := a.GetClient(); cli != nil {
 		cli.GM.Disconnect()

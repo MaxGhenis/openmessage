@@ -128,6 +128,7 @@ func getStatusHandler(a *app.App, configured ...Options) server.ToolHandlerFunc 
 		fmt.Fprintf(&sb, "Data dir: %s\n", a.DataDir)
 		payload := map[string]any{
 			"overall_connected": overallConnected,
+			"contact_sync":      a.GetContactSyncStatus(),
 			"google":            google,
 			"whatsapp":          whatsApp,
 			"signal":            signal,

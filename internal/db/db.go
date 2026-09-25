@@ -4,13 +4,16 @@ import (
 	"database/sql"
 	"fmt"
 	"strings"
+	"sync"
 
 	_ "modernc.org/sqlite"
 )
 
 type Store struct {
-	db         *sql.DB
-	ftsEnabled bool
+	db             *sql.DB
+	ftsEnabled     bool
+	directoryMu    sync.RWMutex
+	directoryNames map[string]string
 }
 
 type Conversation struct {
@@ -129,6 +132,10 @@ func New(dsn string) (*Store, error) {
 	if err := s.migrate(); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("migrate: %w", err)
+	}
+	if err := s.loadContactDirectory(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("load contact directory: %w", err)
 	}
 	return s, nil
 }
@@ -325,6 +332,11 @@ func (s *Store) migrate() error {
 		contact_id TEXT PRIMARY KEY,
 		name TEXT NOT NULL DEFAULT '',
 		number TEXT NOT NULL DEFAULT ''
+	);
+
+	CREATE TABLE IF NOT EXISTS google_contact_directory (
+		resource_name TEXT PRIMARY KEY,
+		data_json TEXT NOT NULL
 	);
 
 	CREATE TABLE IF NOT EXISTS contact_avatars (

@@ -129,6 +129,7 @@ type APIOptions struct {
 	BackfillStatus        func() any         // returns a JSON-serializable backfill progress snapshot
 	BackfillPhone         func(string) error // targeted backfill for a single phone number
 	SyncGoogleContacts    func() (int, error)
+	ContactSyncStatus     func() any
 }
 
 type SearchResult struct {
@@ -309,6 +310,9 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		}
 		if opts.GoogleStatus != nil {
 			payload["google"] = opts.GoogleStatus()
+		}
+		if opts.ContactSyncStatus != nil {
+			payload["contact_sync"] = opts.ContactSyncStatus()
 		}
 		if opts.WhatsAppStatus != nil {
 			payload["whatsapp"] = opts.WhatsAppStatus()
