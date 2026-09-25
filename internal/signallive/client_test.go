@@ -50,6 +50,34 @@ func TestParseSignalAccountsAcceptsJSONPhoneNumbers(t *testing.T) {
 	}
 }
 
+// The probe reads CombinedOutput, so anything signal-cli writes to stderr
+// lands in the same buffer as its --output=json payload. This particular WARN
+// is emitted once receiving has stalled for a few days, which made the failure
+// self-latching in production: the stall produced the warning, the warning
+// broke the whole-buffer decode, the empty result parked the bridge on
+// needs_reauth, and a parked bridge never receives anything again. signal-cli
+// itself was healthy throughout -- the same command by hand returned the
+// account with exit status 0.
+func TestParseSignalAccountsSurvivesStderrNoiseBeforeJSON(t *testing.T) {
+	raw := []byte("WARN  AccountHelper - Messages have been last received 8 days ago. " +
+		"The Signal protocol expects that incoming messages are regularly received.\n" +
+		`[{"number":"+15551230000"}]` + "\n")
+	got := parseSignalAccounts(raw)
+	if len(got) != 1 || got[0] != "+15551230000" {
+		t.Fatalf("parseSignalAccounts() = %#v, want +15551230000 despite the WARN line", got)
+	}
+}
+
+func TestParseSignalAccountsSurvivesStderrNoiseAroundWrappedJSON(t *testing.T) {
+	raw := []byte("INFO  Manager - Starting up\n" +
+		`{"accounts":[{"number":"+16506303657"}],"version":2}` + "\n" +
+		"WARN  AccountHelper - Messages have been last received 8 days ago.\n")
+	got := parseSignalAccounts(raw)
+	if len(got) != 1 || got[0] != "+16506303657" {
+		t.Fatalf("parseSignalAccounts() = %#v, want +16506303657 despite surrounding noise", got)
+	}
+}
+
 func TestBridgeSendTextRunsSignalCLI(t *testing.T) {
 	t.Setenv("OPENMESSAGES_MY_NAME", "")
 	bridge := &Bridge{
