@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"fmt"
 	"math/rand"
 	"strings"
@@ -14,14 +15,14 @@ var (
 		if cli == nil {
 			return nil, fmt.Errorf(ErrNotConnected)
 		}
-		return cli.GM.GetConversation(conversationID)
+		return cli.GM.GetConversation(context.Background(), conversationID)
 	}
 	sendGoogleTextPayload = func(a *App, payload *gmproto.SendMessageRequest) (*gmproto.SendMessageResponse, error) {
 		cli := a.GetClient()
 		if cli == nil {
 			return nil, fmt.Errorf(ErrNotConnected)
 		}
-		return cli.GM.SendMessage(payload)
+		return cli.GM.SendMessage(context.Background(), payload)
 	}
 )
 

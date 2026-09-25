@@ -425,27 +425,46 @@ is hardened-runtime only) so the backend can read Chrome's cookie DB and the
 `Chrome Safe Storage` keychain item. First keychain read may prompt once;
 Always Allow persists it.
 
-### gmessages fork contract
+### Google Messages upstream dependency
 
-**Root cause of the repeated deaths (fixed in #73):** the `MaxGhenis/gmessages`
-fork was frozen at its 2026-03-02 base and missed upstream's 2026-05-05
+**Root cause of the repeated deaths (fixed in #73):** the previous library
+dependency was frozen at its 2026-03-02 base and missed upstream's 2026-05-05
 [`libgm/longpoll: retry on network error when refreshing auth token`](https://github.com/mautrix/gmessages/commit/0b54a8fe65207f81d353ffe63f4d2549c2eb7976).
 Without it, a single transient network blip during a scheduled token refresh
 permanently killed the session.
 
-The replacement in `go.mod` pins fork commit
-[`0e43542dfa0e`](https://github.com/MaxGhenis/gmessages/commit/0e43542dfa0e0b97e410f185a5842e8740106099).
-It is upstream `mautrix/gmessages` base
-[`3433cc07d5ea`](https://github.com/mautrix/gmessages/commit/3433cc07d5ea9522309adad3a8c92ed5b08dc11d),
-which contains the auth-refresh retry, plus exactly one carried patch:
-`Add ListConversationsWithCursor for paginated conversation listing`. That
-method is required by OpenMessage's backfill and reconciliation paths.
+The application now requires `go.mau.fi/mautrix-gmessages` directly, without a
+module replacement. The recorded upstream baseline is
+[`b0d61b4e1a4e`](https://github.com/mautrix/gmessages/commit/b0d61b4e1a4e94f0d5e6fedd43cadb80bd0a9e51).
 
-**Keep the fork rebased on upstream.** The weekly
-`gmessages-fork-drift.yml` workflow records the base and patch set and fails as
-soon as upstream `main` advances. When rebasing, replay the single carried
-patch, verify the auth-refresh retry is still present, and update the fork pin
-and recorded SHAs together. The durable architectural fix (move SMS/RCS onto
+**Integration is pending upstream library changes.** This baseline resolves
+publicly but does not yet expose `ListConversationsWithCursor` or the public
+cancelable `NotifyDittoActivity` used by the application. Compilation is
+expected to fail until those APIs are accepted upstream and the requirement is
+advanced. The upstream acknowledgement-worker lifecycle fix must also be
+included before deployment: disconnect must cancel and join pending ack work
+while retaining retries for active clients. Do not remove pagination, weaken
+cancellation, or restore a module replacement to bypass this integration gate.
+
+These APIs expose existing Google Messages capabilities to library consumers;
+they do not introduce new Google features or change authentication. Cursor
+listing retrieves subsequent conversation pages, and the liveness method checks
+that the phone can respond. The API proposal overlaps the older
+[cursor-listing contribution](https://github.com/mautrix/gmessages/pull/64).
+
+The update requires Go 1.26 and context-aware calls. The accompanying Whatsmeow
+update keeps database upgrade registration compatible with the shared util module.
+
+The `gmessages-upstream.yml` workflow checks that the requirement and recorded
+version agree, the commit is on canonical upstream, and the auth-refresh retry
+fix is included. It also reports new upstream commits for review. The module
+contract rejects all replacements for this dependency. Update the requirement,
+checksums, workflow revision and documentation together after the prerequisite
+changes are merged. Validate with `GOWORK=off`, a fresh module cache, and the
+public Go module proxy and checksum database, then run the full normal/race
+suites and startup/history-sync checks. Module resolution alone is not proof
+that the application compiles or that its runtime regressions are fixed.
+The durable architectural fix (move SMS/RCS onto
 an Android companion) is issue #75.
 
 ### Don't over-reconnect

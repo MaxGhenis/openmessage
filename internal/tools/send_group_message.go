@@ -20,7 +20,7 @@ var getOrCreateGoogleGroupConversationV2 = func(a *app.App, phones []string) (*g
 	if cli == nil {
 		return nil, fmt.Errorf(app.ErrNotConnected)
 	}
-	response, err := cli.GM.GetOrCreateConversation(&gmproto.GetOrCreateConversationRequest{
+	response, err := cli.GM.GetOrCreateConversation(context.Background(), &gmproto.GetOrCreateConversationRequest{
 		Numbers: app.NewContactNumbers(phones),
 	})
 	if err != nil {
@@ -90,7 +90,7 @@ func sendGroupMessageHandler(a *app.App, v2Options ...*V2Dependencies) server.To
 			return errorResult(app.ErrNotConnected), nil
 		}
 
-		convResp, err := cli.GM.GetOrCreateConversation(&gmproto.GetOrCreateConversationRequest{
+		convResp, err := cli.GM.GetOrCreateConversation(ctx, &gmproto.GetOrCreateConversationRequest{
 			Numbers: app.NewContactNumbers(phones),
 		})
 		if err != nil {
@@ -106,7 +106,7 @@ func sendGroupMessageHandler(a *app.App, v2Options ...*V2Dependencies) server.To
 		}
 
 		payload := app.BuildSendPayload(conv.GetConversationID(), message, "", "", nil)
-		resp, err := cli.GM.SendMessage(payload)
+		resp, err := cli.GM.SendMessage(ctx, payload)
 		if err != nil {
 			if !a.HandleGoogleAuthExpiredError(err) {
 				a.RecordGoogleSendError(err)

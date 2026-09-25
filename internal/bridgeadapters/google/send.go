@@ -20,8 +20,8 @@ import (
 )
 
 type textSendClient interface {
-	GetConversation(conversationID string) (*gmproto.Conversation, error)
-	SendMessage(payload *gmproto.SendMessageRequest) (*gmproto.SendMessageResponse, error)
+	GetConversation(ctx context.Context, conversationID string) (*gmproto.Conversation, error)
+	SendMessage(ctx context.Context, payload *gmproto.SendMessageRequest) (*gmproto.SendMessageResponse, error)
 }
 
 var textSendClientFor = func(cli *client.Client) textSendClient {
@@ -29,8 +29,8 @@ var textSendClientFor = func(cli *client.Client) textSendClient {
 }
 
 type reactionSendClient interface {
-	GetConversation(conversationID string) (*gmproto.Conversation, error)
-	SendReaction(payload *gmproto.SendReactionRequest) (*gmproto.SendReactionResponse, error)
+	GetConversation(ctx context.Context, conversationID string) (*gmproto.Conversation, error)
+	SendReaction(ctx context.Context, payload *gmproto.SendReactionRequest) (*gmproto.SendReactionResponse, error)
 }
 
 var reactionSendClientFor = func(cli *client.Client) reactionSendClient {
@@ -38,7 +38,7 @@ var reactionSendClientFor = func(cli *client.Client) reactionSendClient {
 }
 
 type readSendClient interface {
-	MarkRead(conversationID, messageID string) error
+	MarkRead(ctx context.Context, conversationID, messageID string) error
 }
 
 var readSendClientFor = func(cli *client.Client) readSendClient {
@@ -59,7 +59,7 @@ var downloadClientFor = func(cli *client.Client) downloadClient {
 	if cli == nil || cli.GM == nil {
 		return nil
 	}
-	// The pinned libgm fork exposes DownloadMedia(string, []byte)
+	// The libgm client exposes DownloadMedia(string, []byte)
 	// ([]byte, error), with no MIME result. Adapt that actual return shape to
 	// the lifecycle seam; the shim consequently falls back to MediaRef.MIME.
 	return downloadClientFunc(func(mediaID string, key []byte) ([]byte, string, error) {
@@ -147,8 +147,8 @@ func unsupportedGoogleOpaqueError(fingerprint string, cause error) bridge.OpErro
 
 type mediaSendClient interface {
 	UploadMedia(data []byte, filename, mime string) (*gmproto.MediaContent, error)
-	GetConversation(conversationID string) (*gmproto.Conversation, error)
-	SendMessage(payload *gmproto.SendMessageRequest) (*gmproto.SendMessageResponse, error)
+	GetConversation(ctx context.Context, conversationID string) (*gmproto.Conversation, error)
+	SendMessage(ctx context.Context, payload *gmproto.SendMessageRequest) (*gmproto.SendMessageResponse, error)
 }
 
 var mediaSendClientFor = func(cli *client.Client) mediaSendClient {
@@ -182,7 +182,7 @@ func (a *Adapter) SendText(
 		return bridge.SendResult{}, preDispatchTextError("google_text_context_done", err)
 	}
 
-	conversation, err := transport.GetConversation(req.Conversation.RemoteID)
+	conversation, err := transport.GetConversation(ctx, req.Conversation.RemoteID)
 	if err != nil {
 		failure := a.classifyTextTransportError(
 			fmt.Errorf("get Google conversation: %w", err),
@@ -212,7 +212,7 @@ func (a *Adapter) SendText(
 		sim,
 		req.RequestID,
 	)
-	response, err := transport.SendMessage(payload)
+	response, err := transport.SendMessage(ctx, payload)
 	if err != nil {
 		failure := a.classifyTextTransportError(
 			fmt.Errorf("send Google text: %w", err),
@@ -277,7 +277,7 @@ func (a *Adapter) SendReaction(
 		return bridge.SendResult{}, preDispatchReactionError("google_reaction_context_done", err)
 	}
 
-	conversation, err := transport.GetConversation(req.Conversation.RemoteID)
+	conversation, err := transport.GetConversation(ctx, req.Conversation.RemoteID)
 	if err != nil {
 		failure := a.classifyReactionTransportError(
 			fmt.Errorf("get Google conversation: %w", err),
@@ -301,7 +301,7 @@ func (a *Adapter) SendReaction(
 		string(req.Action),
 		sim,
 	)
-	response, err := transport.SendReaction(payload)
+	response, err := transport.SendReaction(ctx, payload)
 	if err != nil {
 		failure := a.classifyReactionTransportError(
 			fmt.Errorf("send Google reaction: %w", err),
@@ -363,7 +363,7 @@ func (a *Adapter) MarkRead(ctx context.Context, req bridge.ReadReceiptRequest) e
 	}
 
 	messageID := req.Messages[len(req.Messages)-1].RemoteID
-	if err := transport.MarkRead(req.Conversation.RemoteID, messageID); err != nil {
+	if err := transport.MarkRead(ctx, req.Conversation.RemoteID, messageID); err != nil {
 		return a.classifyReadTransportError(
 			fmt.Errorf("mark Google conversation read: %w", err),
 			"google_mark_read_failed",
@@ -493,7 +493,7 @@ func (a *Adapter) SendMedia(
 		)
 		return bridge.SendResult{}, failure
 	}
-	conversation, err := transport.GetConversation(req.Conversation.RemoteID)
+	conversation, err := transport.GetConversation(ctx, req.Conversation.RemoteID)
 	if err != nil {
 		failure := a.classifyMediaTransportError(
 			fmt.Errorf("get Google conversation: %w", err),
@@ -518,7 +518,7 @@ func (a *Adapter) SendMedia(
 		sim,
 		req.RequestID,
 	)
-	response, err := transport.SendMessage(payload)
+	response, err := transport.SendMessage(ctx, payload)
 	if err != nil {
 		failure := a.classifyMediaTransportError(
 			fmt.Errorf("send Google media: %w", err),
@@ -563,7 +563,7 @@ func (a *Adapter) SendMedia(
 			sim,
 			req.RequestID+":caption",
 		)
-		captionResponse, err := transport.SendMessage(captionPayload)
+		captionResponse, err := transport.SendMessage(ctx, captionPayload)
 		if err != nil {
 			failure := a.classifyMediaTransportError(
 				fmt.Errorf("send Google media caption: %w", err),

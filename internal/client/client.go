@@ -8,6 +8,7 @@ import (
 	"github.com/rs/zerolog"
 	"go.mau.fi/mautrix-gmessages/pkg/libgm"
 	"go.mau.fi/mautrix-gmessages/pkg/libgm/gmproto"
+	"go.mau.fi/util/exhttp"
 )
 
 type Client struct {
@@ -29,13 +30,13 @@ func NewFromSession(sessionData *SessionData, logger zerolog.Logger) (*Client, e
 		}
 	}
 
-	cli := libgm.NewClient(authData, pushKeys, logger)
+	cli := libgm.NewClient(authData, pushKeys, logger, exhttp.SensibleClientSettings)
 	return &Client{GM: cli, Logger: logger}, nil
 }
 
 func NewForPairing(logger zerolog.Logger) *Client {
 	authData := libgm.NewAuthData()
-	cli := libgm.NewClient(authData, nil, logger)
+	cli := libgm.NewClient(authData, nil, logger, exhttp.SensibleClientSettings)
 	return &Client{GM: cli, Logger: logger}
 }
 

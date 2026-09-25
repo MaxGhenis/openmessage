@@ -28,9 +28,9 @@ import (
 
 type transportClient interface {
 	SetEventHandler(libgm.EventHandler)
-	Connect() error
+	Connect(context.Context) error
 	Disconnect()
-	NotifyDittoActivity() (<-chan *libgm.IncomingRPCMessage, error)
+	NotifyDittoActivity(context.Context) error
 }
 
 type clientFactory func() (*client.Client, transportClient, error)
@@ -190,7 +190,7 @@ func (a *Adapter) Start(
 	installed = true
 	a.mu.Unlock()
 
-	if err := transport.Connect(); err != nil {
+	if err := transport.Connect(ctx); err != nil {
 		failure := a.classifyTransportError(err, "connect", "connect_failed")
 		r.applyFailureStatus(failure)
 		r.closeAdmission()
@@ -360,10 +360,8 @@ func (r *run) Probe(ctx context.Context) (bridge.Liveness, error) {
 	if ctx == nil {
 		return bridge.Liveness{}, errors.New("google probe: nil context")
 	}
-	response, err := r.transport.NotifyDittoActivity()
-	if err != nil {
-		failure := r.adapter.classifyTransportError(err, "probe", "google_probe_send_failed")
-		return bridge.Liveness{}, failure
+	if err := ctx.Err(); err != nil {
+		return bridge.Liveness{}, err
 	}
 	if liveness, activity := r.probeActivity(); liveness.Detail == "phone_not_responding" {
 		// NotifyDittoActivity is answered by the Android phone, not by the
@@ -372,15 +370,16 @@ func (r *run) Probe(ctx context.Context) (bridge.Liveness, error) {
 		// not turn a healthy linked-device generation into reconnect churn.
 		return liveness, nil
 	} else {
+		probeCtx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		response := make(chan error, 1)
+		go func() {
+			response <- r.transport.NotifyDittoActivity(probeCtx)
+		}()
 		select {
-		case _, ok := <-response:
-			if !ok {
-				return bridge.Liveness{}, bridge.OpError{
-					Class:       bridge.FailureTransient,
-					Operation:   "probe",
-					Fingerprint: "google_probe_response_closed",
-					Cause:       errors.New("Google liveness response closed"),
-				}
+		case err := <-response:
+			if err != nil {
+				return bridge.Liveness{}, r.adapter.classifyTransportError(err, "probe", "google_probe_send_failed")
 			}
 			return bridge.Liveness{AliveAt: time.Now(), Detail: "notify_ditto_activity"}, nil
 		case <-activity:

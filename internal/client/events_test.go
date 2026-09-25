@@ -12,6 +12,7 @@ import (
 	"go.mau.fi/mautrix-gmessages/pkg/libgm"
 	"go.mau.fi/mautrix-gmessages/pkg/libgm/events"
 	"go.mau.fi/mautrix-gmessages/pkg/libgm/gmproto"
+	"go.mau.fi/util/exhttp"
 
 	"github.com/maxghenis/openmessage/internal/db"
 )
@@ -229,7 +230,7 @@ func TestHandleRecoveryEvents_TriggerRealtimeGapCallback(t *testing.T) {
 func TestMaybePersistRotatedCookies(t *testing.T) {
 	authData := libgm.NewAuthData()
 	authData.SetCookies(map[string]string{"SID": "initial"})
-	gmClient := libgm.NewClient(authData, nil, zerolog.Nop())
+	gmClient := libgm.NewClient(authData, nil, zerolog.Nop(), exhttp.SensibleClientSettings)
 	now := time.Date(2026, time.July, 20, 12, 0, 0, 0, time.UTC)
 	sessionPath := filepath.Join(t.TempDir(), "session.json")
 	handler := &EventHandler{
@@ -307,7 +308,7 @@ func TestMaybePersistRotatedCookies(t *testing.T) {
 func TestMaybePersistRotatedCookiesRetriesFailedSave(t *testing.T) {
 	authData := libgm.NewAuthData()
 	authData.SetCookies(map[string]string{"SID": "initial"})
-	gmClient := libgm.NewClient(authData, nil, zerolog.Nop())
+	gmClient := libgm.NewClient(authData, nil, zerolog.Nop(), exhttp.SensibleClientSettings)
 	now := time.Date(2026, time.July, 22, 12, 0, 0, 0, time.UTC)
 
 	// A regular file where the session's parent directory belongs makes every

@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/user"
@@ -591,7 +592,7 @@ func (a *App) LoadAndConnect() error {
 		a.EventHandler.Handle(evt)
 	})
 
-	if err := cli.GM.Connect(); err != nil {
+	if err := cli.GM.Connect(context.Background()); err != nil {
 		a.setGoogleLastError(err.Error())
 		// A 401/UNAUTHENTICATED on connect or token refresh means the session
 		// is genuinely dead — the phone unlinked this device. Retrying can't

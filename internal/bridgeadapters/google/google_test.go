@@ -103,7 +103,7 @@ func TestAuthExpiredWithoutRepairIsBlocked(t *testing.T) {
 	}
 }
 
-func TestReadyUsesForkRealPingerSignal(t *testing.T) {
+func TestReadyUsesLibraryPingerSignal(t *testing.T) {
 	host := newTestApp(t)
 	fake := &fakeTransport{probeResponse: make(chan *libgm.IncomingRPCMessage, 1)}
 	a := newTestAdapter(t, host, fake)
@@ -126,7 +126,7 @@ func TestReadyUsesForkRealPingerSignal(t *testing.T) {
 	select {
 	case <-run.Ready():
 	case <-time.After(time.Second):
-		t.Fatal("Ready did not close after the fork's PhoneNotResponding pinger signal")
+		t.Fatal("Ready did not close after the library's PhoneNotResponding pinger signal")
 	}
 	if !host.Connected.Load() {
 		t.Fatal("compatibility Connected status was not published on readiness")
@@ -139,7 +139,7 @@ func TestReadyUsesForkRealPingerSignal(t *testing.T) {
 	}
 }
 
-func TestReadyUsesForkRealLongPollDataEvidence(t *testing.T) {
+func TestReadyUsesLibraryLongPollDataEvidence(t *testing.T) {
 	tests := []struct {
 		name  string
 		event any
@@ -338,6 +338,63 @@ func TestProbeWithoutProtocolActivityStillTimesOut(t *testing.T) {
 	}
 }
 
+func TestProbeCancelsTransportWaiterAfterProtocolActivity(t *testing.T) {
+	host := newTestApp(t)
+	fake := &fakeTransport{probeStarted: make(chan context.Context, 1), probeFinished: make(chan struct{}, 1)}
+	a := newTestAdapter(t, host, fake)
+	run, err := a.Start(context.Background(), bridge.StartRequest{AccountID: "google-primary", Generation: 1}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { stopRun(t, run) })
+	done := make(chan error, 1)
+	go func() {
+		_, err := run.Probe(context.Background())
+		done <- err
+	}()
+	var requestContext context.Context
+	select {
+	case requestContext = <-fake.probeStarted:
+	case <-time.After(time.Second):
+		t.Fatal("probe request did not start")
+	}
+	fake.emit(&events.NoDataReceived{})
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("protocol activity did not complete the probe")
+	}
+	select {
+	case <-requestContext.Done():
+	case <-time.After(time.Second):
+		t.Fatal("completed probe did not cancel its pending transport request")
+	}
+	select {
+	case <-fake.probeFinished:
+	case <-time.After(time.Second):
+		t.Fatal("transport request did not exit after cancellation")
+	}
+}
+
+func TestProbePreservesCredentialFailureClassification(t *testing.T) {
+	host := newTestApp(t)
+	fake := &fakeTransport{probeErr: errors.New("HTTP 401: invalid authentication credentials")}
+	a := newTestAdapter(t, host, fake)
+	run, err := a.Start(context.Background(), bridge.StartRequest{AccountID: "google-primary", Generation: 1}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { stopRun(t, run) })
+	_, err = run.Probe(context.Background())
+	failure, ok := asOpError(err)
+	if !ok || failure.Class != bridge.FailureCredentialsExpired {
+		t.Fatalf("probe failure = %v, want credentials_expired", err)
+	}
+}
+
 func TestPhoneUnreachableSurvivesRepeatedLivenessWindowsAndRecovers(t *testing.T) {
 	host := newTestApp(t)
 	fake := &fakeTransport{}
@@ -352,7 +409,7 @@ func TestPhoneUnreachableSurvivesRepeatedLivenessWindowsAndRecovers(t *testing.T
 	}
 	t.Cleanup(func() { stopRun(t, run) })
 
-	// The pinned fork emits this after its first ditto ping times out. It is
+	// The library emits this after its first ditto ping times out. It is
 	// readiness evidence for the linked-device session, but not evidence that
 	// the Android phone itself is reachable.
 	fake.emit(&events.PhoneNotResponding{})
@@ -365,8 +422,7 @@ func TestPhoneUnreachableSurvivesRepeatedLivenessWindowsAndRecovers(t *testing.T
 		t.Fatal("precondition: phone should be recorded as unreachable")
 	}
 
-	// Model three consecutive supervisor liveness windows. NotifyDittoActivity
-	// has no phone response in any window, but the known phone-off state keeps
+	// Model three consecutive supervisor liveness windows. The known phone-off state keeps
 	// the healthy generation alive instead of triggering reconnect churn.
 	for window := 1; window <= 3; window++ {
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
@@ -384,11 +440,11 @@ func TestPhoneUnreachableSurvivesRepeatedLivenessWindowsAndRecovers(t *testing.T
 		default:
 		}
 	}
-	if got := fake.probeCount(); got != 3 {
-		t.Fatalf("NotifyDittoActivity calls = %d, want 3", got)
+	if got := fake.probeCount(); got != 0 {
+		t.Fatalf("NotifyDittoActivity calls = %d, want 0 while phone is known offline", got)
 	}
 
-	// Because the generation and its callback remain installed, the fork's
+	// Because the generation and its callback remain installed, the library's
 	// recovery signal is still handled and renews liveness/reconciliation.
 	fake.emit(&events.PhoneRespondingAgain{})
 	if !host.GoogleStatus().PhoneResponding {
@@ -840,6 +896,8 @@ type fakeTransport struct {
 	probeResponse chan *libgm.IncomingRPCMessage
 	probeErr      error
 	probes        int
+	probeStarted  chan context.Context
+	probeFinished chan struct{}
 }
 
 func (f *fakeTransport) SetEventHandler(handler libgm.EventHandler) {
@@ -848,7 +906,7 @@ func (f *fakeTransport) SetEventHandler(handler libgm.EventHandler) {
 	f.mu.Unlock()
 }
 
-func (f *fakeTransport) Connect() error { return f.connectErr }
+func (f *fakeTransport) Connect(context.Context) error { return f.connectErr }
 
 func (f *fakeTransport) Disconnect() {
 	f.mu.Lock()
@@ -856,12 +914,29 @@ func (f *fakeTransport) Disconnect() {
 	f.mu.Unlock()
 }
 
-func (f *fakeTransport) NotifyDittoActivity() (<-chan *libgm.IncomingRPCMessage, error) {
+func (f *fakeTransport) NotifyDittoActivity(ctx context.Context) error {
 	f.mu.Lock()
 	f.probes++
 	response, err := f.probeResponse, f.probeErr
 	f.mu.Unlock()
-	return response, err
+	if f.probeStarted != nil {
+		f.probeStarted <- ctx
+	}
+	if f.probeFinished != nil {
+		defer func() { f.probeFinished <- struct{}{} }()
+	}
+	if err != nil {
+		return err
+	}
+	select {
+	case _, ok := <-response:
+		if !ok {
+			return libgm.ErrConnectionClosed
+		}
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (f *fakeTransport) emit(event any) {

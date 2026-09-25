@@ -81,7 +81,7 @@ func fetchAndCacheContacts(a *app.App) error {
 	if cli == nil {
 		return fmt.Errorf("not connected")
 	}
-	resp, err := cli.GM.ListContacts()
+	resp, err := cli.GM.ListContacts(context.Background())
 	if err != nil {
 		return err
 	}
