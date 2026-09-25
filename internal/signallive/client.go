@@ -704,9 +704,9 @@ func New(configDir string, store *db.Store, logger zerolog.Logger, callbacks Cal
 	go sweepSignalTmpRoot(logger, signalRunTmpMaxAge)
 	if bridge.account != "" {
 		// Only a paired install can have produced libsignal litter, so the
-		// legacy system-temp sweep stays scoped to installs that ran the
-		// bridge before per-run temp dirs existed.
-		go sweepLegacyLibsignalTemp(logger)
+		// system-temp sweep stays scoped to installs that have actually run
+		// signal-cli.
+		go sweepSystemLibsignalTemp(logger)
 	}
 	return bridge, nil
 }
@@ -2068,8 +2068,9 @@ func (b *Bridge) parkUpgradeRequired(token uint64, detail string) {
 
 // maybeSweepTmp runs the crash-backstop sweeps at most once per
 // signalTmpSweepInterval. Normal runs clean up after themselves, so the
-// app-tmp sweep usually finds nothing; the legacy sweep keeps reaping
-// system-temp dirs leaked by older builds as they age past the gate.
+// app-tmp sweep usually finds nothing; the system-temp sweep reaps libsignal
+// dirs that outlived the invocation that made them -- which, on a signal-cli
+// build that ignores the confinement, is every interrupted run.
 func (b *Bridge) maybeSweepTmp() {
 	b.mu.Lock()
 	due := now().Sub(b.lastTmpSweep) >= signalTmpSweepInterval
@@ -2080,7 +2081,7 @@ func (b *Bridge) maybeSweepTmp() {
 	if due {
 		b.goTracked(func() {
 			sweepSignalTmpRoot(b.logger, signalRunTmpMaxAge)
-			sweepLegacyLibsignalTemp(b.logger)
+			sweepSystemLibsignalTemp(b.logger)
 		})
 	}
 }
