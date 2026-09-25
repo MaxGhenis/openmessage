@@ -126,6 +126,9 @@ type MediaSubmission struct {
 	IdempotencyKey string
 	NotBeforeMS    *int64
 	Content        io.Reader
+	// SIM picks the card on dual-SIM phones (slot, number, or carrier); "" =
+	// the thread's default. Only the legacy /api/send-media route honours it.
+	SIM string
 }
 
 // Submission mirrors the daemon's v1 submission response.
@@ -225,6 +228,7 @@ func multipartMediaBody(submission MediaSubmission) (io.ReadCloser, string) {
 			"idempotency_key": submission.IdempotencyKey,
 			"caption":         submission.Caption,
 			"reply_to_id":     submission.ReplyToID,
+			"sim":             submission.SIM,
 		}
 		if submission.NotBeforeMS != nil {
 			fields["not_before_ms"] = fmt.Sprintf("%d", *submission.NotBeforeMS)
@@ -323,18 +327,27 @@ type LegacySendResult struct {
 	MessageID string `json:"message_id"`
 	Status    string `json:"status"`
 	Success   bool   `json:"success"`
+	// SIM names the card the daemon sent from on dual-SIM phones ("" otherwise).
+	SIM string `json:"sim,omitempty"`
 }
 
 // LegacySendText routes a text send through the daemon's legacy /api/send
 // surface. Only valid against daemons running with v2 send disabled; a
 // v2-primary daemon rejects this route deterministically.
 func (c *Client) LegacySendText(ctx context.Context, conversationID, message, replyToID, idempotencyKey string) (LegacySendResult, error) {
+	return c.LegacySendTextFromSIM(ctx, conversationID, message, replyToID, idempotencyKey, "")
+}
+
+// LegacySendTextFromSIM is LegacySendText with an explicit SIM choice (slot,
+// number, or carrier; "" = the thread's default) for dual-SIM phones.
+func (c *Client) LegacySendTextFromSIM(ctx context.Context, conversationID, message, replyToID, idempotencyKey, sim string) (LegacySendResult, error) {
 	payload := struct {
 		ConversationID string `json:"conversation_id"`
 		Message        string `json:"message"`
 		ReplyToID      string `json:"reply_to_id,omitempty"`
 		IdempotencyKey string `json:"idempotency_key,omitempty"`
-	}{conversationID, message, replyToID, idempotencyKey}
+		SIM            string `json:"sim,omitempty"`
+	}{conversationID, message, replyToID, idempotencyKey, sim}
 	var result LegacySendResult
 	if err := c.postJSON(ctx, "/api/send", payload, &result); err != nil {
 		return LegacySendResult{}, err
@@ -368,12 +381,19 @@ func (c *Client) LegacySendMedia(ctx context.Context, submission MediaSubmission
 // React routes a reaction through the daemon's /api/react surface, which
 // works in every daemon mode. Action is "add", "remove", or "switch".
 func (c *Client) React(ctx context.Context, conversationID, messageID, emoji, action string) error {
+	return c.ReactFromSIM(ctx, conversationID, messageID, emoji, action, "")
+}
+
+// ReactFromSIM is React with an explicit SIM choice for dual-SIM phones
+// (slot, number, or carrier; "" = the thread's default).
+func (c *Client) ReactFromSIM(ctx context.Context, conversationID, messageID, emoji, action, sim string) error {
 	payload := struct {
 		ConversationID string `json:"conversation_id"`
 		MessageID      string `json:"message_id"`
 		Emoji          string `json:"emoji"`
 		Action         string `json:"action"`
-	}{conversationID, messageID, emoji, action}
+		SIM            string `json:"sim,omitempty"`
+	}{conversationID, messageID, emoji, action, sim}
 	return c.postJSON(ctx, "/api/react", payload, &map[string]any{})
 }
 

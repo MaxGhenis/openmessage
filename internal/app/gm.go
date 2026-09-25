@@ -6,7 +6,14 @@ import (
 	"strings"
 
 	"go.mau.fi/mautrix-gmessages/pkg/libgm/gmproto"
+
+	"github.com/maxghenis/openmessage/internal/sim"
 )
+
+// SIMs remembers the SIM cards the phone reports in its Settings event so send
+// paths and labels can name carriers. One process serves one Google account,
+// so a package-level registry is enough; the Google event handler feeds it.
+var SIMs = &sim.Registry{}
 
 var (
 	getGoogleConversationForSend = func(a *App, conversationID string) (*gmproto.Conversation, error) {
@@ -48,23 +55,28 @@ func NewContactNumbers(phones []string) []*gmproto.ContactNumber {
 }
 
 // ExtractSIMAndParticipant finds the current user's participant ID and SIM
-// payload from a conversation, falling back to the conversation's SIM card.
-func ExtractSIMAndParticipant(conv *gmproto.Conversation) (participantID string, sim *gmproto.SIMPayload) {
-	for _, p := range conv.GetParticipants() {
-		if p.GetIsMe() {
-			if id := p.GetID(); id != nil {
-				participantID = id.GetNumber()
-			}
-			sim = p.GetSimPayload()
-			break
-		}
-	}
-	if sim == nil {
-		if sc := conv.GetSimCard(); sc != nil {
-			sim = sc.GetSIMData().GetSIMPayload()
-		}
-	}
+// payload from a conversation. On a dual-SIM phone every thread has two self
+// participants; the one named by Conversation.DefaultOutgoingID is the SIM the
+// phone itself would send from, so that is the default here too (the first
+// self participant when no default is reported). Falls back to the
+// conversation's SIM card when there is no self participant at all.
+func ExtractSIMAndParticipant(conv *gmproto.Conversation) (participantID string, payload *gmproto.SIMPayload) {
+	participantID, payload, _, _ = SelectSIM(conv, "")
 	return
+}
+
+// SelectSIM is ExtractSIMAndParticipant with an explicit SIM choice: a slot
+// number ("1", "2"), the SIM's phone number, a self participant ID, or a
+// carrier name. An empty selector picks the thread's default. The returned
+// slot (nil when the thread reports no self participants) tells the caller
+// which SIM was chosen so it can say so in its reply.
+func SelectSIM(conv *gmproto.Conversation, selector string) (participantID string, payload *gmproto.SIMPayload, chosen *sim.Slot, err error) {
+	return sim.Select(conv, selector, SIMs)
+}
+
+// ConversationSIMs lists the SIMs a conversation can send from, default first.
+func ConversationSIMs(conv *gmproto.Conversation) []sim.Slot {
+	return sim.FromConversation(conv, SIMs)
 }
 
 // BuildSendPayload constructs a SendMessageRequest matching the format used by

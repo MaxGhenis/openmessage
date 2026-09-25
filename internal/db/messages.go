@@ -645,6 +645,30 @@ func (s *Store) DeleteMessageByID(messageID string) error {
 	return tx.Commit()
 }
 
+// DeleteMessageByIDIfExists is DeleteMessageByID that also reports whether a
+// row was actually removed, so callers can retry a delete that raced ahead of
+// the row's insert (tmp_ send placeholders vs. the phone's echo).
+func (s *Store) DeleteMessageByIDIfExists(messageID string) (bool, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+
+	result, err := s.deleteMessages(tx, `message_id = ?`, messageID)
+	if err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	n, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
 // MessageCount returns the total number of messages, optionally filtered by source platform.
 func (s *Store) MessageCount(sourcePlatform string) (int, error) {
 	var count int

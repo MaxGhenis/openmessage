@@ -14,6 +14,7 @@ import (
 	"github.com/maxghenis/openmessage/internal/db"
 	"github.com/maxghenis/openmessage/internal/localapi"
 	"github.com/maxghenis/openmessage/internal/readsource"
+	"github.com/maxghenis/openmessage/internal/sim"
 )
 
 // Options selects the canonical read source and optional durable-send seam.
@@ -317,7 +318,40 @@ func formatMessageLine(m *db.Message) string {
 		direction = "→"
 	}
 	display := formatMessageBody(m.Body, m.MediaID, m.MimeType, m.MessageID, m.Transcript)
-	return fmt.Sprintf("[%s] %s %s: «%s»", ts, direction, resolveSender(m), display)
+	line := fmt.Sprintf("[%s] %s %s: «%s»", ts, direction, resolveSender(m), display)
+	if m.SIM != "" {
+		// Dual-SIM threads: say which card sent (→) or holds (←) the message.
+		line += " [" + m.SIM + "]"
+	}
+	return line
+}
+
+// simArgDescription documents the optional SIM selector on Google send tools.
+const simArgDescription = "Dual-SIM phones only: which SIM to send from - a slot number (\"1\", \"2\"), the SIM's own phone number, or its carrier name. Omit to use the SIM the thread already uses on the phone. Reads label each message with its SIM on dual-SIM threads."
+
+// rejectSIMOnOutbox refuses an explicit SIM choice on the v2 outbox, which
+// does not carry one yet: failing loudly beats returning ok and sending from
+// the thread's default card. Nil when no SIM was requested.
+func rejectSIMOnOutbox(args map[string]any) *mcp.CallToolResult {
+	if strings.TrimSpace(strArg(args, "sim")) == "" {
+		return nil
+	}
+	return errorResult("sim is not supported on this install yet (v2 outbox sends always use the thread's default SIM); omit sim to send from the default card")
+}
+
+// annotateSIMLabels fills Message.SIM on dual-SIM Google threads (see
+// sim.AnnotateMessages). Reads only from the store the messages came from.
+func annotateSIMLabels(reads readsource.ReadSource, msgs []*db.Message) {
+	if reads == nil {
+		return
+	}
+	sim.AnnotateMessages(msgs, func(conversationID string) string {
+		conv, err := reads.GetConversation(conversationID)
+		if err != nil || conv == nil || (conv.SourcePlatform != "" && conv.SourcePlatform != "sms") {
+			return ""
+		}
+		return conv.Participants
+	}, app.SIMs)
 }
 
 func errorResult(msg string) *mcp.CallToolResult {
@@ -356,6 +390,7 @@ type messageSummary struct {
 	SourcePlatform string `json:"source_platform"`
 	SourceID       string `json:"source_id,omitempty"`
 	DisplayText    string `json:"display_text,omitempty"`
+	SIM            string `json:"sim,omitempty"`
 }
 
 type contactSummary struct {
@@ -399,6 +434,7 @@ func summarizeMessage(m *db.Message) messageSummary {
 		ReplyToID:      m.ReplyToID,
 		SourcePlatform: normalizedPlatform(m.SourcePlatform),
 		SourceID:       m.SourceID,
+		SIM:            m.SIM,
 		DisplayText:    formatMessageBody(m.Body, m.MediaID, m.MimeType, m.MessageID, m.Transcript),
 	}
 }

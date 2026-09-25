@@ -8,6 +8,7 @@ import (
 	"go.mau.fi/mautrix-gmessages/pkg/libgm/gmproto"
 
 	"github.com/maxghenis/openmessage/internal/db"
+	"github.com/maxghenis/openmessage/internal/sim"
 )
 
 var (
@@ -20,6 +21,13 @@ var (
 )
 
 func (a *App) SendTextToConversation(conversationID, body string) (*db.Conversation, *db.Message, error) {
+	return a.SendTextToConversationFromSIM(conversationID, body, "")
+}
+
+// SendTextToConversationFromSIM is SendTextToConversation with an explicit
+// SIM choice for dual-SIM Google threads (slot, number, or carrier; "" = the
+// thread's default). The returned message's SIM label says which card sent it.
+func (a *App) SendTextToConversationFromSIM(conversationID, body, simSelector string) (*db.Conversation, *db.Message, error) {
 	conv, err := a.Store.GetConversation(conversationID)
 	if err != nil {
 		return nil, nil, fmt.Errorf("get conversation: %w", err)
@@ -55,7 +63,7 @@ func (a *App) SendTextToConversation(conversationID, body string) (*db.Conversat
 			}
 			return conv, nil, fmt.Errorf("get Google conversation: %w", err)
 		}
-		payload, err := buildGoogleTextPayload(gmConv, conversationID, body)
+		payload, chosenSIM, err := buildGoogleTextPayloadFromSIM(gmConv, conversationID, body, simSelector)
 		if err != nil {
 			return conv, nil, err
 		}
@@ -74,6 +82,7 @@ func (a *App) SendTextToConversation(conversationID, body string) (*db.Conversat
 		msg := &db.Message{
 			MessageID:      payload.TmpID,
 			ConversationID: conversationID,
+			SenderNumber:   payload.GetMessagePayload().GetParticipantID(), // the sending SIM's number
 			Body:           body,
 			IsFromMe:       true,
 			TimestampMS:    time.Now().UnixMilli(),
@@ -82,6 +91,9 @@ func (a *App) SendTextToConversation(conversationID, body string) (*db.Conversat
 		}
 		if err := a.Store.RecordOutgoingMessage(msg, ""); err != nil {
 			return conv, nil, fmt.Errorf("persist sent message: %w", err)
+		}
+		if chosenSIM != nil && len(ConversationSIMs(gmConv)) > 1 {
+			msg.SIM = chosenSIM.Label()
 		}
 		return conv, msg, nil
 	default:
@@ -115,9 +127,17 @@ func normalizeConversationPlatform(platform string) string {
 }
 
 func buildGoogleTextPayload(conv *gmproto.Conversation, conversationID, body string) (*gmproto.SendMessageRequest, error) {
+	payload, _, err := buildGoogleTextPayloadFromSIM(conv, conversationID, body, "")
+	return payload, err
+}
+
+func buildGoogleTextPayloadFromSIM(conv *gmproto.Conversation, conversationID, body, simSelector string) (*gmproto.SendMessageRequest, *sim.Slot, error) {
 	if conv == nil {
-		return nil, fmt.Errorf("get Google conversation: no conversation returned")
+		return nil, nil, fmt.Errorf("get Google conversation: no conversation returned")
 	}
-	myParticipantID, simPayload := ExtractSIMAndParticipant(conv)
-	return BuildSendPayload(conversationID, body, "", myParticipantID, simPayload), nil
+	myParticipantID, simPayload, chosen, err := SelectSIM(conv, simSelector)
+	if err != nil {
+		return nil, nil, err
+	}
+	return BuildSendPayload(conversationID, body, "", myParticipantID, simPayload), chosen, nil
 }

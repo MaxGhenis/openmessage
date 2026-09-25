@@ -52,6 +52,7 @@ func sendMessageTool(v2Enabled ...bool) mcp.Tool {
 		mcp.WithString("recipient", mcp.Description("Recipient identifier. Use a phone number for SMS/RCS or Signal, and a phone number or WhatsApp JID for WhatsApp.")),
 		mcp.WithString("platform", mcp.Description("Target platform: sms, rcs, whatsapp, or signal. Defaults to sms.")),
 		mcp.WithString("message", mcp.Required(), mcp.Description("Message text to send")),
+		mcp.WithString("sim", mcp.Description(simArgDescription)),
 	}
 	if v2Requested(v2Enabled) {
 		options[0] = mcp.WithDescription(description + v2DeliveryDescription)
@@ -166,7 +167,10 @@ func sendMessageHandler(a *app.App, v2Options ...*V2Dependencies) server.ToolHan
 			if v2 != nil {
 				return submitV2Text(ctx, a, v2, args, conv.GetConversationID(), message), nil
 			}
-			myParticipantID, simPayload := app.ExtractSIMAndParticipant(conv)
+			myParticipantID, simPayload, chosenSIM, err := app.SelectSIM(conv, strArg(args, "sim"))
+			if err != nil {
+				return errorResult(err.Error()), nil
+			}
 			payload := app.BuildSendPayload(conv.GetConversationID(), message, "", myParticipantID, simPayload)
 			resp, err := sendGoogleTextPayload(a, payload)
 			if err != nil {
@@ -184,6 +188,7 @@ func sendMessageHandler(a *app.App, v2Options ...*V2Dependencies) server.ToolHan
 			if err := a.Store.RecordOutgoingMessage(&db.Message{
 				MessageID:      payload.TmpID,
 				ConversationID: conv.GetConversationID(),
+				SenderNumber:   myParticipantID, // the sending SIM's number
 				Body:           message,
 				IsFromMe:       true,
 				TimestampMS:    now,
@@ -200,11 +205,16 @@ func sendMessageHandler(a *app.App, v2Options ...*V2Dependencies) server.ToolHan
 			if err != nil {
 				return errorResult(fmt.Sprintf("failed to load conversation: %v", err)), nil
 			}
+			text := fmt.Sprintf("Message sent to %s: %s", firstNonEmpty(conv.GetName(), recipient), message)
+			if chosenSIM != nil && len(app.ConversationSIMs(conv)) > 1 {
+				storedMsg.SIM = chosenSIM.Label()
+				text = fmt.Sprintf("Message sent to %s from %s: %s", firstNonEmpty(conv.GetName(), recipient), storedMsg.SIM, message)
+			}
 			return structuredResult(map[string]any{
 				"ok":           true,
 				"conversation": summarizeConversation(persistedConv),
 				"message":      summarizeMessage(storedMsg),
-			}, fmt.Sprintf("Message sent to %s: %s", firstNonEmpty(conv.GetName(), recipient), message)), nil
+			}, text), nil
 		default:
 			return errorResult(fmt.Sprintf("unsupported platform %q (supported: sms, whatsapp, signal)", platform)), nil
 		}

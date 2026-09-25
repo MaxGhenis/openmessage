@@ -101,6 +101,9 @@ func daemonSubmitTextAndWait(
 	conversationID string,
 	body string,
 ) *mcp.CallToolResult {
+	if failure := rejectSIMOnOutbox(args); failure != nil {
+		return failure
+	}
 	key, err := v2IdempotencyKey(args)
 	if err != nil {
 		return errorResult(err.Error())
@@ -197,7 +200,7 @@ func daemonLegacySendText(
 	if err != nil {
 		return errorResult(err.Error())
 	}
-	result, err := daemon.LegacySendText(ctx, conversationID, body, "", key)
+	result, err := daemon.LegacySendTextFromSIM(ctx, conversationID, body, "", key, strArg(args, "sim"))
 	if err != nil {
 		if localapi.IsDeterministicRejection(err) {
 			return errorResult(fmt.Sprintf("send rejected by the app: %v", err))
@@ -207,13 +210,18 @@ func daemonLegacySendText(
 		}
 		return daemonAmbiguousResult(key, err)
 	}
+	text := fmt.Sprintf("Message sent via the running OpenMessage app (message %s).", result.MessageID)
+	if result.SIM != "" {
+		text = fmt.Sprintf("Message sent via the running OpenMessage app from %s (message %s).", result.SIM, result.MessageID)
+	}
 	return structuredResult(map[string]any{
 		"ok":              true,
 		"message_id":      result.MessageID,
 		"conversation_id": conversationID,
 		"idempotency_key": key,
 		"via":             "app",
-	}, fmt.Sprintf("Message sent via the running OpenMessage app (message %s).", result.MessageID))
+		"sim":             result.SIM,
+	}, text)
 }
 
 func daemonSendToConversationHandler(options Options) server.ToolHandlerFunc {
@@ -349,8 +357,12 @@ func daemonSendMediaToConversationHandler(options Options) server.ToolHandlerFun
 			ReplyToID:      strArg(args, "reply_to_id"),
 			IdempotencyKey: key,
 			Content:        file,
+			SIM:            strArg(args, "sim"),
 		}
 		if status.SendsViaOutbox() {
+			if failure := rejectSIMOnOutbox(args); failure != nil {
+				return failure, nil
+			}
 			outboxSubmission, err := daemon.SubmitMedia(ctx, submission)
 			if err != nil {
 				if localapi.IsDeterministicRejection(err) {
@@ -370,13 +382,18 @@ func daemonSendMediaToConversationHandler(options Options) server.ToolHandlerFun
 			}
 			return daemonAmbiguousResult(key, err), nil
 		}
+		mediaText := fmt.Sprintf("Media sent via the running OpenMessage app (message %s): %s", result.MessageID, filename)
+		if result.SIM != "" {
+			mediaText = fmt.Sprintf("Media sent via the running OpenMessage app from %s (message %s): %s", result.SIM, result.MessageID, filename)
+		}
 		return structuredResult(map[string]any{
 			"ok":              true,
 			"message_id":      result.MessageID,
 			"conversation_id": conversationID,
 			"idempotency_key": key,
 			"via":             "app",
-		}, fmt.Sprintf("Media sent via the running OpenMessage app (message %s): %s", result.MessageID, filename)), nil
+			"sim":             result.SIM,
+		}, mediaText), nil
 	}
 }
 
@@ -405,7 +422,7 @@ func daemonReactToMessageHandler(options Options) server.ToolHandlerFunc {
 		if action == "" {
 			action = "add"
 		}
-		if err := daemon.React(ctx, conversationID, messageID, emoji, action); err != nil {
+		if err := daemon.ReactFromSIM(ctx, conversationID, messageID, emoji, action, strArg(args, "sim")); err != nil {
 			if responseErr, ok := localapi.AsResponseError(err); ok {
 				return errorResult(fmt.Sprintf("the app could not send the reaction: HTTP %d: %s", responseErr.StatusCode, responseErr.Body)), nil
 			}

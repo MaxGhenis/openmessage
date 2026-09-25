@@ -17,6 +17,7 @@ import (
 	"github.com/maxghenis/openmessage/internal/db"
 	"github.com/maxghenis/openmessage/internal/importer"
 	"github.com/maxghenis/openmessage/internal/signallive"
+	"github.com/maxghenis/openmessage/internal/sim"
 	"github.com/maxghenis/openmessage/internal/whatsapplive"
 )
 
@@ -195,6 +196,9 @@ type GoogleStatusSnapshot struct {
 	// heal cycle; a climbing count means cookies are being revoked within
 	// minutes, which the pacing floor is throttling rather than hiding.
 	RepairsPaced uint64 `json:"repairs_paced,omitempty"`
+	// SIMs lists the phone's SIM cards (slot, number, carrier) as reported by
+	// its Settings event; empty until the phone has sent settings this session.
+	SIMs []sim.Slot `json:"sims,omitempty"`
 }
 
 // googleRepairThreshold is how many consecutive failed Google sends (with no
@@ -528,6 +532,7 @@ func (a *App) LoadAndConnect() error {
 		Logger:      a.Logger,
 		SessionPath: a.SessionPath,
 		Client:      cli,
+		SIMs:        SIMs,
 		OnConversationsChange: func() {
 			a.emitConversationsChange()
 		},
@@ -642,6 +647,7 @@ func (a *App) Unpair() error {
 	if err := os.Remove(a.SessionPath); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("remove session: %w", err)
 	}
+	SIMs.Reset() // a re-pair may be a different phone; forget its cards
 	a.Logger.Info().Msg("Unpaired — session deleted")
 	return nil
 }
@@ -759,6 +765,7 @@ func (a *App) GoogleStatus() GoogleStatusSnapshot {
 		AuthExpired:     a.googleAuthExpired.Load(),
 		PhoneResponding: a.GooglePhoneResponding(),
 		RepairsPaced:    a.GoogleRepairsPaced(),
+		SIMs:            SIMs.Slots(),
 	}
 }
 

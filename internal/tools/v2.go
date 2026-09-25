@@ -136,6 +136,9 @@ func submitV2Text(
 	conversationID string,
 	body string,
 ) *mcp.CallToolResult {
+	if failure := rejectSIMOnOutbox(args); failure != nil {
+		return failure
+	}
 	key, err := v2IdempotencyKey(args)
 	if err != nil {
 		return errorResult(err.Error())

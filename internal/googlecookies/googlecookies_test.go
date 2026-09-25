@@ -333,3 +333,25 @@ func TestLoadChromeCookiesSelectsLinuxPBKDF2Iterations(t *testing.T) {
 		}
 	}
 }
+
+func TestResolveChromeProfile(t *testing.T) {
+	home := "/Users/example"
+	userData := filepath.Dir(defaultChromeProfileDir(home))
+	cases := []struct {
+		name, override, want string
+	}{
+		{"empty uses Default", "", defaultChromeProfileDir(home)},
+		{"bare name resolves under user data dir", "Profile 3", filepath.Join(userData, "Profile 3")},
+		{"bare name is trimmed", "  Profile 3  ", filepath.Join(userData, "Profile 3")},
+		{"absolute path passes through", "/tmp/chrome/Profile 9", "/tmp/chrome/Profile 9"},
+		{"tilde expands", "~/chrome/Default", filepath.Join(home, "chrome/Default")},
+		{"relative path with separator passes through", "chrome/Default", "chrome/Default"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := resolveChromeProfile(tc.override, home); got != tc.want {
+				t.Fatalf("resolveChromeProfile(%q) = %q, want %q", tc.override, got, tc.want)
+			}
+		})
+	}
+}

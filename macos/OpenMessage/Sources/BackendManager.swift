@@ -134,6 +134,60 @@ final class BackendManager: ObservableObject {
         URL(string: "http://127.0.0.1:\(port)")!
     }
 
+    /// UserDefaults key behind the Google cookie self-heal's Chrome profile
+    /// choice. Empty/unset means Chrome's "Default" profile.
+    static let chromeProfileDefaultsKey = "ChromeProfile"
+
+    /// The Chrome profile directory (or absolute path) the backend reads
+    /// Google cookies from when a session expires. Setting it restarts the
+    /// backend so the new value reaches the process environment.
+    var chromeProfile: String {
+        get { UserDefaults.standard.string(forKey: Self.chromeProfileDefaultsKey) ?? "" }
+        set {
+            let trimmed = newValue.trimmingCharacters(in: .whitespaces)
+            if trimmed == chromeProfile { return }
+            if trimmed.isEmpty {
+                UserDefaults.standard.removeObject(forKey: Self.chromeProfileDefaultsKey)
+            } else {
+                UserDefaults.standard.set(trimmed, forKey: Self.chromeProfileDefaultsKey)
+            }
+            logger.info("Chrome profile for cookie refresh set to \(trimmed.isEmpty ? "Default" : trimmed, privacy: .public); restarting backend")
+            restart()
+        }
+    }
+
+    private var restartInFlight = false
+
+    /// Stop, wait for the old process to actually exit (so it has let go of
+    /// the port and the SQLite files), then start again. Coalesces: a second
+    /// call while one is in flight is a no-op, so quick successive setting
+    /// changes never produce overlapping backends. Waits off the main thread
+    /// by polling the PID rather than blocking on the launcher.
+    func restart() {
+        if restartInFlight { return }
+        restartInFlight = true
+        let pid: pid_t? = launcher?.process.map(\.processIdentifier) ?? reusedBackendPID
+        stop()
+        Task.detached { [weak self] in
+            if let pid, pid > 0 {
+                var waited = 0
+                while Darwin.kill(pid, 0) == 0, waited < 50 { // up to ~5s
+                    try? await Task.sleep(for: .milliseconds(100))
+                    waited += 1
+                }
+                if Darwin.kill(pid, 0) == 0 {
+                    _ = Darwin.kill(pid, SIGKILL)
+                    try? await Task.sleep(for: .milliseconds(200))
+                }
+            }
+            await MainActor.run {
+                guard let self else { return }
+                self.restartInFlight = false
+                self.start()
+            }
+        }
+    }
+
     /// User- or lifecycle-initiated start. Resets the auto-restart budget so a
     /// deliberate (re)start always gets the full retry allowance, then launches.
     func start() {
@@ -168,11 +222,16 @@ final class BackendManager: ObservableObject {
         // routes the backend at the migrated v2 store; deleting the key rolls back
         // to the legacy store on next launch (the legacy source is never modified).
         let v2Primary = UserDefaults.standard.bool(forKey: "V2Primary")
+        // Cookie self-heal lever: `defaults write com.openmessage.app ChromeProfile "Profile 3"`
+        // points the Google cookie refresh at the Chrome profile signed in to the
+        // account that owns Messages; unset means Chrome's "Default" profile.
+        let chromeProfile = UserDefaults.standard.string(forKey: Self.chromeProfileDefaultsKey)
         let configuration = BackendLaunchConfiguration.application(
             executablePath: path,
             dataDirectory: dir,
             port: port,
-            v2Primary: v2Primary
+            v2Primary: v2Primary,
+            chromeProfile: chromeProfile
         )
         let launcher = BackendLauncherCore(configuration: configuration, processSpawner: processSpawner)
         self.launcher = launcher
