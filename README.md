@@ -18,7 +18,7 @@ Built on [mautrix/gmessages](https://github.com/mautrix/gmessages) (libgm) for t
 
 ### Prerequisites
 
-- **Go 1.22+** ([install](https://go.dev/dl/))
+- **Go 1.25+** ([install](https://go.dev/dl/); see `go.mod` for the build requirement)
 - **Google Messages** on your Android phone
 
 ### 1. Clone and build
