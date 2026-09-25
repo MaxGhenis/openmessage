@@ -2,13 +2,10 @@ package cmd
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
-	"net/http"
 	"os"
 	"os/signal"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -18,7 +15,6 @@ import (
 	"go.mau.fi/mautrix-gmessages/pkg/libgm"
 	"go.mau.fi/mautrix-gmessages/pkg/libgm/events"
 	"go.mau.fi/mautrix-gmessages/pkg/libgm/gmproto"
-	utilcurl "go.mau.fi/util/curl"
 	"golang.org/x/term"
 
 	"github.com/maxghenis/openmessage/internal/app"
@@ -129,6 +125,13 @@ func runQRPairing(logger zerolog.Logger, cli *client.Client, sessionPath string)
 	return pairErr
 }
 
+// parseGoogleCookiesInput is retained as a thin alias so the cookie-parsing
+// tests keep exercising the CLI's entry point; the implementation now lives in
+// internal/client so the MCP pairing tool shares it.
+func parseGoogleCookiesInput(raw string) (map[string]string, error) {
+	return client.ParseGoogleCookiesInput(raw)
+}
+
 func displayQR(url string) {
 	fmt.Println("\nScan this QR code with Google Messages:")
 	fmt.Println("(Settings > Device pairing > Pair a device)")
@@ -173,83 +176,18 @@ func resolvePairMode(args []string) (pairMode, string, error) {
 }
 
 func runGoogleAccountPairing(cli *client.Client, sessionPath, rawInput string) error {
-	cookies, err := parseGoogleCookiesInput(rawInput)
-	if err != nil {
-		return fmt.Errorf("parse Google cookies: %w", err)
-	}
-	cli.GM.AuthData.Cookies = cookies
-
 	fmt.Println("Starting Google account pairing...")
-	err = cli.GM.DoGaiaPairing(context.Background(), func(emoji string) {
+	err := client.PairWithGoogleCookies(context.Background(), cli, sessionPath, rawInput, func(emoji string) {
 		fmt.Println("EMOJI:", emoji)
 		fmt.Println("Tap this emoji in Google Messages on your phone.")
 	})
 	if err != nil {
-		return fmt.Errorf("google account pairing: %w", err)
-	}
-
-	sessionData, err := cli.SessionData()
-	if err != nil {
-		return fmt.Errorf("get session data: %w", err)
-	}
-	if err := client.SaveSession(sessionPath, sessionData); err != nil {
-		return fmt.Errorf("save session: %w", err)
+		return err
 	}
 	fmt.Println("\nPairing successful!")
 	fmt.Println("Session saved to", sessionPath)
 	fmt.Println("You can now run: openmessage serve")
 	return nil
-}
-
-func parseGoogleCookiesInput(raw string) (map[string]string, error) {
-	trimmed := strings.TrimSpace(raw)
-	if trimmed == "" {
-		return nil, fmt.Errorf("no cookies provided")
-	}
-
-	var cookieMap map[string]string
-	if strings.HasPrefix(trimmed, "{") {
-		if err := json.Unmarshal([]byte(trimmed), &cookieMap); err == nil && len(cookieMap) > 0 {
-			return cookieMap, nil
-		}
-	}
-
-	if strings.HasPrefix(trimmed, "curl ") {
-		parsed, err := utilcurl.Parse(trimmed)
-		if err != nil {
-			return nil, fmt.Errorf("parse cURL command: %w", err)
-		}
-		if cookies, err := parseCookieHeader(parsed.Header.Get("Cookie")); err == nil {
-			return cookies, nil
-		}
-		return nil, fmt.Errorf("cURL command did not include a Cookie header")
-	}
-
-	return parseCookieHeader(trimmed)
-}
-
-func parseCookieHeader(raw string) (map[string]string, error) {
-	header := strings.TrimSpace(raw)
-	if header == "" {
-		return nil, fmt.Errorf("no cookie header provided")
-	}
-	if strings.HasPrefix(strings.ToLower(header), "cookie:") {
-		header = strings.TrimSpace(header[len("cookie:"):])
-	}
-	req := &http.Request{Header: make(http.Header)}
-	req.Header.Set("Cookie", header)
-	parsed := map[string]string{}
-	for _, cookie := range req.Cookies() {
-		name := strings.TrimSpace(cookie.Name)
-		if name == "" {
-			continue
-		}
-		parsed[name] = cookie.Value
-	}
-	if len(parsed) == 0 {
-		return nil, fmt.Errorf("no cookies found")
-	}
-	return parsed, nil
 }
 
 // Ensure PairCallback type matches what libgm expects

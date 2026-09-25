@@ -141,6 +141,8 @@ To let a client connect over HTTP, start OpenMessage with `--mcp-sse` (or `--web
 | `list_contacts` | List/search contacts |
 | `resolve_contact_routes` | Resolve a person or phone number to the available SMS/WhatsApp/Signal routes |
 | `get_status` | Google Messages, WhatsApp, and Signal connection status |
+| `start_google_pairing` | Begin Google Account pairing from browser cookies — the headless alternative to the interactive QR flow. Returns the confirmation emoji and a pairing handle |
+| `complete_google_pairing` | Finish pairing once the user has tapped the emoji on their phone |
 | `download_media` | Return the local `/api/media/<message-id>` URL and metadata for an attachment |
 | `draft_message` | Save a draft for the local app to review/send later |
 | `import_messages` | Import Google Chat, iMessage, WhatsApp export, or Signal Desktop history |
