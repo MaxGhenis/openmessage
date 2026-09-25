@@ -12,7 +12,7 @@ Local-first universal message database with built-in MCP server. Ingests message
 │   ├── db/           SQLite store (conversations, messages, contacts, unified_contacts, drafts)
 │   ├── importer/     Multi-platform import adapters (gchat, imessage, whatsapp)
 │   ├── story/        Stats computation + narrative story generation
-│   ├── tools/        MCP tools (24 tools)
+│   ├── tools/        MCP tools (25 tools)
 │   ├── viz/          Relationship visualization renderer (self-contained HTML)
 │   └── web/          HTTP API + embedded React UI
 ├── macos/            Swift macOS app wrapper

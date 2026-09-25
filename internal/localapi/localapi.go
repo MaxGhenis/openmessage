@@ -377,6 +377,17 @@ func (c *Client) React(ctx context.Context, conversationID, messageID, emoji, ac
 	return c.postJSON(ctx, "/api/react", payload, &map[string]any{})
 }
 
+// MarkRead routes a mark-read through the daemon's /api/mark-read surface,
+// which works in every daemon mode. An empty messageID lets the daemon pick
+// the newest incoming message in the thread.
+func (c *Client) MarkRead(ctx context.Context, conversationID, messageID string) error {
+	payload := struct {
+		ConversationID string `json:"conversation_id"`
+		MessageID      string `json:"message_id,omitempty"`
+	}{conversationID, messageID}
+	return c.postJSON(ctx, "/api/mark-read", payload, &map[string]any{})
+}
+
 func (c *Client) postJSON(ctx context.Context, path string, payload any, target any) error {
 	body, err := json.Marshal(payload)
 	if err != nil {
