@@ -19,10 +19,25 @@ var openMu sync.Mutex
 // Store owns a connection pool for an OpenMessage SQLite database.
 type Store struct {
 	db *sql.DB
+
+	// readOnly marks a handle from OpenReadOnly: SQLite refuses every write
+	// through it (see IsReadOnlyError).
+	readOnly bool
+	// schemaVersion is the store's migration-ledger version at open.
+	schemaVersion int
 }
 
 // Open opens path, configures SQLite, and migrates the database to the latest
-// embedded schema version.
+// embedded schema version. It creates the database when path does not exist.
+//
+// Open is the owner-only, migrating open. It always takes SQLite's write
+// reservation (BEGIN IMMEDIATE) to decide whether a migration is pending, and
+// it applies every pending migration to the file. Only a process that owns
+// the store may call it: the app daemon, repair, the migrate transform, the
+// e2e server. A client that reads a store another process owns (the
+// transportless MCP client, openmessage read and status) must use
+// OpenReadOnly. Otherwise a newer client migrates the store under an older
+// daemon, which then refuses the newer ledger on restart.
 func Open(path string) (*Store, error) {
 	if strings.TrimSpace(path) == "" {
 		return nil, fmt.Errorf("open sqlite store: path is empty")
@@ -57,12 +72,23 @@ func Open(path string) (*Store, error) {
 		return nil, fmt.Errorf("migrate sqlite store: %w", err)
 	}
 
-	return &Store{db: db}, nil
+	return &Store{db: db, schemaVersion: len(embeddedMigrations)}, nil
 }
 
 // Close closes the store's database connections.
 func (s *Store) Close() error {
 	return s.db.Close()
+}
+
+// ReadOnly reports whether the store came from OpenReadOnly.
+func (s *Store) ReadOnly() bool {
+	return s.readOnly
+}
+
+// SchemaVersion returns the store's migration-ledger version as of open: this
+// build's latest version after Open, the on-disk version for OpenReadOnly.
+func (s *Store) SchemaVersion() int {
+	return s.schemaVersion
 }
 
 // StoreInstanceID returns the stable identifier assigned when the store was
@@ -79,11 +105,6 @@ func (s *Store) StoreInstanceID() (string, error) {
 }
 
 func storeDSN(path string) string {
-	normalizedPath := strings.ReplaceAll(path, `\`, "/")
-	if isWindowsAbsolutePath(normalizedPath) {
-		normalizedPath = "/" + normalizedPath
-	}
-
 	query := make(url.Values)
 	query.Add("_pragma", fmt.Sprintf("busy_timeout(%d)", busyTimeoutMS))
 	query.Add("_pragma", "foreign_keys(ON)")
@@ -92,6 +113,17 @@ func storeDSN(path string) string {
 	// database/sql transactions. Migration state is therefore rechecked only
 	// after acquiring SQLite's write reservation.
 	query.Set("_txlock", "immediate")
+
+	return fileURI(path, query)
+}
+
+// fileURI renders path as the file: URI modernc.org/sqlite opens with
+// SQLITE_OPEN_URI, carrying query as its parameters.
+func fileURI(path string, query url.Values) string {
+	normalizedPath := strings.ReplaceAll(path, `\`, "/")
+	if isWindowsAbsolutePath(normalizedPath) {
+		normalizedPath = "/" + normalizedPath
+	}
 
 	return (&url.URL{
 		Scheme:   "file",

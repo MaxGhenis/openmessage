@@ -790,11 +790,33 @@ const clientProbeTimeout = 3 * time.Second
 // the v2 dispatcher/ingest stack, sync loops, schedulers, or telemetry:
 // exactly one process (the app daemon) may own live platform connections,
 // because WhatsApp and signal-cli treat a second concurrent login as
-// credential theft and kill the session. Reads come from the local store,
-// opened repair-free (app.NewClient) because the daemon owns the startup
-// repair sweeps; sends and reactions route through the daemon's local HTTP
-// API, mirroring the CLI send path.
+// credential theft and kill the session. Reads come from the local stores
+// (see newMCPClientServer); sends and reactions route through the daemon's
+// local HTTP API, mirroring the CLI send path.
 func runServeMCPClient(logger zerolog.Logger, opts serveOptions) error {
+	mcpSrv, cleanup, err := newMCPClientServer(logger, opts)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+	logger.Info().Msg("Starting MCP stdio transport")
+	return mcpserver.ServeStdio(mcpSrv)
+}
+
+// newMCPClientServer builds the transportless client's MCP server without
+// serving it, so tests can drive its tools in-process. The caller must run
+// cleanup once the server is done.
+//
+// The v2 store, when it serves reads, is attached with sqlite.OpenReadOnly:
+// read-only and migration-free. The daemon is the only process that migrates
+// it. A client built with a newer migration therefore serves an older store
+// (down to sqlite.MinClientReadSchemaVersion) without changing it, and a
+// client older than the store refuses to start with an "update the binary"
+// error instead of misreading it. The legacy messages.db is opened
+// repair-free via app.NewClient, because the daemon owns the startup repair
+// sweeps; that open is not yet read-only (db.New still runs the legacy schema
+// migrate step).
+func newMCPClientServer(logger zerolog.Logger, _ serveOptions) (*mcpserver.MCPServer, func(), error) {
 	// Probe before opening any store: daemon truth decides the read mode and,
 	// when OPENMESSAGES_DATA_DIR is unset, which data directory this client
 	// serves. The probe token comes from the pre-adoption data dir; the
@@ -829,28 +851,36 @@ func runServeMCPClient(logger zerolog.Logger, opts serveOptions) error {
 	} else {
 		mode, err := resolveV2RuntimeMode(false, dataDir)
 		if err != nil {
-			return err
+			return nil, nil, err
 		}
 		v2Primary = mode.Primary
 	}
 	var v2Store *sqlite.Store
+	closeV2Store := func() {
+		if v2Store == nil {
+			return
+		}
+		if err := v2Store.Close(); err != nil {
+			logger.Warn().Err(err).Msg("Failed to close v2 read store")
+		}
+	}
 	if v2Primary {
 		v2StorePath := filepath.Join(dataDir, "v2", "store.sqlite3")
 		// The daemon owns v2 provisioning; a client must attach to an
 		// existing store, never create one.
 		if _, err := os.Stat(v2StorePath); err != nil {
-			return fmt.Errorf("v2-primary reads selected but no migrated store at %s: %w", v2StorePath, err)
+			return nil, nil, fmt.Errorf("v2-primary reads selected but no migrated store at %s: %w", v2StorePath, err)
 		}
-		opened, err := sqlite.Open(v2StorePath)
+		opened, info, err := openV2ReadStore(v2StorePath)
 		if err != nil {
-			return fmt.Errorf("open v2 read store %q: %w", v2StorePath, err)
+			return nil, nil, err
 		}
 		v2Store = opened
-		defer func() {
-			if err := v2Store.Close(); err != nil {
-				logger.Warn().Err(err).Msg("Failed to close v2 read store")
-			}
-		}()
+		logger.Info().
+			Str("store", v2StorePath).
+			Int("store_schema_version", info.SchemaVersion).
+			Int("build_schema_version", info.BuildSchemaVersion).
+			Msg("MCP client mode: attached to the v2 store read-only; the running app owns migrations")
 	}
 
 	// NewClient, not New: MCP hosts spawn one of these processes per session,
@@ -859,9 +889,13 @@ func runServeMCPClient(logger zerolog.Logger, opts serveOptions) error {
 	// redundant concurrent write bursts.
 	a, err := app.NewClient(logger)
 	if err != nil {
-		return fmt.Errorf("init app: %w", err)
+		closeV2Store()
+		return nil, nil, fmt.Errorf("init app: %w", err)
 	}
-	defer a.Close()
+	cleanup := func() {
+		a.Close()
+		closeV2Store()
+	}
 
 	var reads readsource.ReadSource = a.Store
 	if v2Store != nil {
@@ -884,8 +918,26 @@ func runServeMCPClient(logger zerolog.Logger, opts serveOptions) error {
 		Bool("v2_primary_reads", v2Primary).
 		Str("data_dir", a.DataDir).
 		Msg("MCP client mode: transports disabled; sends route through the running app")
-	logger.Info().Msg("Starting MCP stdio transport")
-	return mcpserver.ServeStdio(mcpSrv)
+	return mcpSrv, cleanup, nil
+}
+
+// openV2ReadStore attaches a client (the MCP client, openmessage read and
+// status) to the daemon-owned v2 store read-only, without migrating it. When
+// the store is newer than this binary, the error names the executable to
+// update, since MCP hosts often run a different openmessage than the app.
+func openV2ReadStore(storePath string) (*sqlite.Store, sqlite.ReadOnlyInfo, error) {
+	store, info, err := sqlite.OpenReadOnly(storePath)
+	if err == nil {
+		return store, info, nil
+	}
+	if errors.Is(err, sqlite.ErrSchemaNewer) {
+		executable, exeErr := os.Executable()
+		if exeErr != nil {
+			executable = "(unknown path)"
+		}
+		err = fmt.Errorf("%w (this binary: %s)", err, executable)
+	}
+	return nil, info, fmt.Errorf("open v2 read store %q: %w", storePath, err)
 }
 
 // samePath reports whether two paths name the same directory, tolerating
