@@ -2,11 +2,15 @@ package sqlite
 
 // Expiry-column behavior at the storage layer: CancelExpired's state scope
 // and the guarantee that post-transport states are never touched by the
-// sweep. The dispatcher-level behavior (lease exclusion, never transmitting
-// an expired intent) is covered in internal/messaging.
+// sweep. The transport-boundary gate (MarkTransportCalled canceling a leased,
+// uncalled row whose window closed) is covered in outbox_gate_test.go; the
+// dispatcher-level guarantee (lease exclusion plus that gate, so an expired
+// intent is never handed to the transport) is covered in internal/messaging.
 
 import (
 	"context"
+	"errors"
+	"reflect"
 	"testing"
 	"time"
 )
@@ -59,6 +63,11 @@ func TestCancelExpiredScope(t *testing.T) {
 	// even once its window closes: lease it, mark the transport called, and
 	// record uncertain — then shrink its window into the past.
 	crossed := mustEnqueueExpiry(t, repository, outboxExpiryItem("crossed", futureExpiry))
+	// Two rows still held by a live dispatch lease whose windows then close:
+	// one before its transport call, one after. The sweep must leave both to
+	// their lease owner.
+	leasedUncalled := mustEnqueueExpiry(t, repository, outboxExpiryItem("leased-uncalled", futureExpiry))
+	leasedCalled := mustEnqueueExpiry(t, repository, outboxExpiryItem("leased-called", futureExpiry))
 	leases, err := repository.LeaseDue(ctx, LeaseRequest{
 		Owner:    "expiry-test",
 		Now:      now,
@@ -68,17 +77,31 @@ func TestCancelExpiredScope(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LeaseDue(): %v", err)
 	}
-	var crossedLease *OutboxItem
+	var crossedLease, uncalledLease, calledLease *OutboxItem
 	for i := range leases {
-		if leases[i].OutboxID == crossed.OutboxID {
+		switch leases[i].OutboxID {
+		case crossed.OutboxID:
 			crossedLease = &leases[i].OutboxItem
-		}
-		if leases[i].OutboxID == expired.OutboxID {
+		case leasedUncalled.OutboxID:
+			uncalledLease = &leases[i].OutboxItem
+		case leasedCalled.OutboxID:
+			calledLease = &leases[i].OutboxItem
+		case expired.OutboxID:
 			t.Fatal("LeaseDue leased an expired item")
 		}
 	}
-	if crossedLease == nil {
-		t.Fatalf("crossed item was not leased; got %d leases", len(leases))
+	if crossedLease == nil || uncalledLease == nil || calledLease == nil {
+		t.Fatalf("crossed/leased-uncalled/leased-called were not all leased; got %d leases", len(leases))
+	}
+	calledAttempt := Attempt{
+		OutboxID:             leasedCalled.OutboxID,
+		LeaseToken:           *calledLease.LeaseToken,
+		AttemptToken:         leasedCalled.OutboxID + ":attempt",
+		ConnectionGeneration: 1,
+		StartedAt:            now,
+	}
+	if err := repository.MarkTransportCalled(ctx, calledAttempt); err != nil {
+		t.Fatalf("MarkTransportCalled(leased-called): %v", err)
 	}
 	if err := repository.MarkTransportCalled(ctx, Attempt{
 		OutboxID:             crossed.OutboxID,
@@ -92,16 +115,27 @@ func TestCancelExpiredScope(t *testing.T) {
 	if err := repository.MarkUncertain(ctx, crossed.OutboxID, *crossedLease.LeaseToken, "unknown", "timeout", "test"); err != nil {
 		t.Fatalf("MarkUncertain(): %v", err)
 	}
-	if _, err := repository.store.db.Exec(
-		`UPDATE outbox SET expires_at_ms = ? WHERE outbox_id = ?`, pastExpiry, crossed.OutboxID,
-	); err != nil {
-		t.Fatalf("shrink window: %v", err)
+	for _, id := range []string{crossed.OutboxID, leasedUncalled.OutboxID, leasedCalled.OutboxID} {
+		if _, err := repository.store.db.Exec(
+			`UPDATE outbox SET expires_at_ms = ? WHERE outbox_id = ?`, pastExpiry, id,
+		); err != nil {
+			t.Fatalf("shrink window of %s: %v", id, err)
+		}
+	}
+	leasedUncalledBefore, err := repository.FindByID(ctx, leasedUncalled.OutboxID)
+	if err != nil {
+		t.Fatalf("FindByID(leased-uncalled): %v", err)
+	}
+	leasedCalledBefore, err := repository.FindByID(ctx, leasedCalled.OutboxID)
+	if err != nil {
+		t.Fatalf("FindByID(leased-called): %v", err)
 	}
 
 	// Release the other leased rows back to queued so the sweep sees the
 	// realistic pre-dispatch states.
 	for i := range leases {
-		if leases[i].OutboxID == crossed.OutboxID {
+		switch leases[i].OutboxID {
+		case crossed.OutboxID, leasedUncalled.OutboxID, leasedCalled.OutboxID:
 			continue
 		}
 		if err := repository.ReleaseUnavailable(ctx, leases[i].OutboxID, *leases[i].LeaseToken); err != nil {
@@ -131,6 +165,30 @@ func TestCancelExpiredScope(t *testing.T) {
 	assertState(fresh.OutboxID, OutboxQueued)
 	assertState(unbounded.OutboxID, OutboxQueued)
 	assertState(crossed.OutboxID, OutboxUncertain)
+
+	// Both live-lease rows are untouched by the sweep, down to every field.
+	for _, want := range []OutboxItem{leasedUncalledBefore, leasedCalledBefore} {
+		got, err := repository.FindByID(ctx, want.OutboxID)
+		if err != nil {
+			t.Fatalf("FindByID(%s): %v", want.OutboxID, err)
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("sweep modified live-lease row %s:\n before %+v\n after  %+v", want.OutboxID, want, got)
+		}
+	}
+	// The lease owner cancels the uncalled one at its transport boundary
+	// instead; the called one may have been sent and stays with its owner.
+	if err := repository.MarkTransportCalled(ctx, Attempt{
+		OutboxID:   leasedUncalled.OutboxID,
+		LeaseToken: *uncalledLease.LeaseToken,
+	}); !errors.Is(err, ErrSendWindowExpired) {
+		t.Fatalf("MarkTransportCalled(leased-uncalled, window closed) = %v, want ErrSendWindowExpired", err)
+	}
+	assertState(leasedUncalled.OutboxID, OutboxCanceled)
+	if err := repository.MarkTransportCalled(ctx, calledAttempt); !errors.Is(err, ErrLeaseLost) {
+		t.Fatalf("MarkTransportCalled(leased-called again) = %v, want ErrLeaseLost", err)
+	}
+	assertState(leasedCalled.OutboxID, OutboxDispatching)
 
 	// The swept row carries the TTL markers so readers report "expired
 	// unsent" rather than a bare cancellation.

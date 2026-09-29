@@ -140,8 +140,12 @@ type TextSubmission struct {
 	ReplyToID      string `json:"reply_to_id,omitempty"`
 	IdempotencyKey string `json:"idempotency_key"`
 	NotBeforeMS    *int64 `json:"not_before_ms,omitempty"`
-	// TTLMS bounds how long the daemon may hold the send before canceling it
-	// as expired instead of transmitting stale. Nil means no expiry.
+	// TTLMS bounds how long the daemon may hold the send before handing it
+	// to the transport; a send not handed over when the window closes is
+	// canceled as expired instead of transmitting stale. Nil or 0 means no
+	// expiry; otherwise 1..86,400,000 (24 hours). The daemon rejects
+	// out-of-range values with 400 (daemons before that check validated only
+	// the sign, so callers must not rely on the daemon to bound the value).
 	TTLMS *int64 `json:"ttl_ms,omitempty"`
 	// Force bypasses the daemon's near-duplicate guard for a deliberate resend.
 	Force bool `json:"force,omitempty"`
@@ -157,7 +161,7 @@ type MediaSubmission struct {
 	ReplyToID      string
 	IdempotencyKey string
 	NotBeforeMS    *int64
-	TTLMS          *int64
+	TTLMS          *int64 // same contract as TextSubmission.TTLMS
 	Content        io.Reader
 }
 

@@ -3,6 +3,7 @@ package tools
 import (
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"strconv"
 	"strings"
@@ -47,12 +48,14 @@ const (
 // sendTTLEnvVar overrides the default send window for interactive MCP sends.
 const sendTTLEnvVar = "OPENMESSAGES_SEND_TTL_SECONDS"
 
-// defaultSendTTL is the interactive-send window: a message still queued this
-// long after submission is canceled instead of transmitted stale. Agents opt
-// out per send with ttl_seconds=0 (never expire) or choose another window.
+// defaultSendTTL is the interactive-send window: a message not yet handed to
+// the transport this long after submission is canceled instead of
+// transmitted stale. Agents opt out per send with ttl_seconds=0 (never
+// expire) or choose another window.
 const defaultSendTTL = 10 * time.Minute
 
-const maxSendTTL = 24 * time.Hour
+// maxSendTTL is the shared ceiling every TTL surface enforces.
+const maxSendTTL = messaging.MaxTTL
 
 // Wait bounds for the settle wait. The default matches the previous
 // daemon-routed behavior; the cap keeps one MCP call from hanging a session.
@@ -87,8 +90,17 @@ func parseSendWaitOptions(args map[string]any) (sendWaitOptions, error) {
 		if !ok {
 			return options, errors.New("wait_seconds must be a number")
 		}
+		// Validate and clamp in float64 before converting: an out-of-range
+		// float-to-Duration conversion is implementation-defined (on amd64 a
+		// huge value becomes a negative Duration).
+		if math.IsNaN(seconds) || math.IsInf(seconds, 0) {
+			return options, errors.New("wait_seconds must be a finite number")
+		}
 		if seconds < 0 {
 			return options, errors.New("wait_seconds must not be negative")
+		}
+		if seconds > maxSendWait.Seconds() {
+			seconds = maxSendWait.Seconds()
 		}
 		options.Wait = time.Duration(seconds * float64(time.Second))
 	}
@@ -101,29 +113,58 @@ func parseSendWaitOptions(args map[string]any) (sendWaitOptions, error) {
 // parseSendTTL resolves the send window for one submission: the explicit
 // ttl_seconds argument, else the OPENMESSAGES_SEND_TTL_SECONDS override,
 // else the interactive default. ttl_seconds=0 means the send never expires.
+// Both inputs go through messaging.TTLFromSeconds, which rejects NaN, ±Inf,
+// negative, over-24h, and positive sub-millisecond values before any
+// conversion and rounds an accepted window to whole milliseconds. Every
+// accepted positive window is therefore 1ms..24h on every GOARCH, and the
+// daemon path's ttl.Milliseconds() carries it exactly.
 func parseSendTTL(args map[string]any) (time.Duration, error) {
 	if raw, present := args["ttl_seconds"]; present {
 		seconds, ok := numberArg(raw)
 		if !ok {
 			return 0, errors.New("ttl_seconds must be a number")
 		}
-		if seconds < 0 {
-			return 0, errors.New("ttl_seconds must not be negative")
-		}
-		ttl := time.Duration(seconds * float64(time.Second))
-		if ttl > maxSendTTL {
-			return 0, fmt.Errorf("ttl_seconds must not exceed %d (24 hours)", int(maxSendTTL/time.Second))
+		ttl, err := messaging.TTLFromSeconds(seconds)
+		if err != nil {
+			return 0, namedTTLError("ttl_seconds", err)
 		}
 		return ttl, nil
 	}
 	if raw := strings.TrimSpace(os.Getenv(sendTTLEnvVar)); raw != "" {
 		seconds, err := strconv.ParseFloat(raw, 64)
-		if err != nil || seconds < 0 || time.Duration(seconds*float64(time.Second)) > maxSendTTL {
-			return 0, fmt.Errorf("%s must be a number of seconds between 0 and %d", sendTTLEnvVar, int(maxSendTTL/time.Second))
+		if err != nil {
+			return 0, fmt.Errorf(
+				"%s must be a number of seconds: 0 (never expire) or 0.001 to %d",
+				sendTTLEnvVar,
+				int64(maxSendTTL/time.Second),
+			)
 		}
-		return time.Duration(seconds * float64(time.Second)), nil
+		ttl, err := messaging.TTLFromSeconds(seconds)
+		if err != nil {
+			return 0, fmt.Errorf(
+				"%s must be a number of seconds: 0 (never expire) or 0.001 to %d (%s)",
+				sendTTLEnvVar,
+				int64(maxSendTTL/time.Second),
+				ttlErrorReason(err),
+			)
+		}
+		return ttl, nil
 	}
 	return defaultSendTTL, nil
+}
+
+// namedTTLError renders a shared-validator rejection with the agent-facing
+// field name ("ttl_seconds must not exceed 86400 (24 hours)").
+func namedTTLError(field string, err error) error {
+	return fmt.Errorf("%s %s", field, ttlErrorReason(err))
+}
+
+func ttlErrorReason(err error) string {
+	var invalid *messaging.InvalidTTLError
+	if errors.As(err, &invalid) {
+		return invalid.Reason
+	}
+	return err.Error()
 }
 
 func parseSendForce(args map[string]any) (bool, error) {
@@ -352,7 +393,7 @@ func sendOutcomeResult(o sendOutcome) *mcp.CallToolResult {
 func withSendControlOptions(options []mcp.ToolOption, includeForce bool) []mcp.ToolOption {
 	options = append(options,
 		mcp.WithNumber("ttl_seconds", mcp.Description(
-			"Send window in seconds: if the message is still queued when the window closes, it is canceled as expired instead of transmitting stale. Default 600 (10 minutes; installation override via OPENMESSAGES_SEND_TTL_SECONDS). 0 = never expire. Max 86400.",
+			"Send window in seconds, enforced up to the moment the message is handed to the transport: a message not yet handed over when the window closes (still queued, retrying, or waiting behind an earlier send) is canceled as expired instead of transmitting stale. Default 600 (10 minutes; installation override via OPENMESSAGES_SEND_TTL_SECONDS). 0 = never expire; otherwise 0.001 to 86400, rounded to the millisecond.",
 		)),
 		mcp.WithBoolean("wait_for_transmit", mcp.Description(
 			"Keep waiting (bounded by wait_seconds) until the transport acknowledges the send — or it fails terminally — instead of returning while it is queued or auto-retrying. Use this when you must report truthfully whether the message actually went out.",

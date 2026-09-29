@@ -186,6 +186,10 @@ func daemonSubmitTextAndWait(
 		Force:          force,
 	}
 	if ttl > 0 {
+		// Exact: parseSendTTL returns whole-millisecond windows of at least
+		// 1ms, so the daemon stamps the same window as the in-process path
+		// (pinned by TestQuickDaemonAndInProcessTTLAgree and
+		// TestDaemonSendCarriesMillisecondExactTTL).
 		ttlMS := ttl.Milliseconds()
 		submission.TTLMS = &ttlMS
 	}
@@ -496,6 +500,8 @@ func daemonSendMediaToConversationHandler(options Options) server.ToolHandlerFun
 			Content:        file,
 		}
 		if ttl > 0 {
+			// Exact for the same reason as the text path: parseSendTTL
+			// returns whole-millisecond windows of at least 1ms.
 			ttlMS := ttl.Milliseconds()
 			submission.TTLMS = &ttlMS
 		}

@@ -66,6 +66,13 @@ var (
 	// dispatch lease.
 	ErrLeaseLost = errors.New("outbox lease lost")
 
+	// ErrSendWindowExpired means MarkTransportCalled found the caller's leased,
+	// not-yet-called row past its send window. The same transaction has
+	// already durably canceled the row with TTLErrorClass/TTLErrorCode and
+	// cleared its lease, so the caller must not call the transport and has
+	// nothing to release.
+	ErrSendWindowExpired = errors.New("outbox send window expired before the transport call")
+
 	// ErrInvalidOutboxState means an outbox operation is not allowed from the
 	// row's current delivery state.
 	ErrInvalidOutboxState = errors.New("invalid outbox state transition")

@@ -94,9 +94,13 @@ type CommonCommand struct {
 	NotBefore      time.Time // zero means now
 
 	// TTL bounds how long the intent may wait to cross the transport
-	// boundary, measured from the later of submission and NotBefore. An
-	// intent still queued when the window closes is canceled instead of
-	// transmitted stale. Zero means the intent never expires.
+	// boundary, measured from the later of submission and NotBefore. Zero
+	// means the intent never expires. The window is enforced atomically at
+	// the transport boundary for every outbox kind (text, media, reaction,
+	// read receipt): an intent not yet handed to the transport when the
+	// window closes, including one leased and waiting behind an earlier send
+	// in its batch, is canceled as expired instead of transmitted stale.
+	// A nonzero TTL must be 1ms..MaxTTL (24h); see ValidateTTL.
 	TTL time.Duration
 
 	// Force bypasses the near-duplicate guard for a deliberate resend.

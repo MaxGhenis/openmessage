@@ -1143,7 +1143,10 @@ func (r *OutboxRepository) ListConfirmedSince(
 }
 
 // LeaseDue atomically claims due queued and retryable rows. An uncertain row is
-// structurally ineligible regardless of its next-attempt value.
+// structurally ineligible regardless of its next-attempt value, and a row
+// whose send window has closed (expires_at_ms <= now) is never leased. A
+// leased row's window can still close before its transport call; the
+// MarkTransportCalled gate enforces it again at that instant.
 func (r *OutboxRepository) LeaseDue(
 	ctx context.Context,
 	req LeaseRequest,
@@ -1251,6 +1254,20 @@ func (r *OutboxRepository) LeaseDue(
 // outcome must not be retried automatically. A dispatcher commits this marker
 // immediately before issuing the transport call, and the call consumes one
 // attempt.
+//
+// It is also the send-window gate. In one transaction, the marker commits
+// only while the caller's lease is live AND the row's send window is open
+// (expires_at_ms IS NULL OR expires_at_ms > now), using the same boundary as
+// LeaseDue and CancelExpired. If the caller still owns the not-yet-called row
+// (matching lease token) but its window has closed, the same transaction
+// cancels it as expired (TTLErrorClass/TTLErrorCode, lease cleared,
+// attempt_count unchanged) and the call returns ErrSendWindowExpired: the
+// transport must not be called. This closes the gap between leasing a batch
+// and reaching each item's transport call, during which earlier sends in the
+// batch can outlast a later item's window. The expiry branch does not require
+// a live lease: a matching token proves nobody re-leased the row, and a NULL
+// transport_called_at_ms proves nothing was sent. Otherwise the result is
+// ErrLeaseLost (or not-found) with the row unchanged.
 func (r *OutboxRepository) MarkTransportCalled(
 	ctx context.Context,
 	attempt Attempt,
@@ -1265,7 +1282,13 @@ func (r *OutboxRepository) MarkTransportCalled(
 	if err != nil {
 		return err
 	}
-	result, err := r.store.db.ExecContext(ctx, `
+	tx, err := r.store.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("mark transport called for outbox item %q: begin transaction: %w", attempt.OutboxID, err)
+	}
+	defer tx.Rollback()
+
+	result, err := tx.ExecContext(ctx, `
 		UPDATE outbox
 		SET transport_called_at_ms = ?,
 			attempt_count = attempt_count + 1,
@@ -1275,11 +1298,54 @@ func (r *OutboxRepository) MarkTransportCalled(
 		  AND lease_token = ?
 		  AND lease_expires_at_ms > ?
 		  AND transport_called_at_ms IS NULL
-	`, nowMS, nowMS, attempt.OutboxID, attempt.LeaseToken, nowMS)
+		  AND (expires_at_ms IS NULL OR expires_at_ms > ?)
+	`, nowMS, nowMS, attempt.OutboxID, attempt.LeaseToken, nowMS, nowMS)
 	if err != nil {
 		return fmt.Errorf("mark transport called for outbox item %q: %w", attempt.OutboxID, err)
 	}
-	return r.requireLeaseMutation(ctx, "mark transport called", attempt.OutboxID, result)
+	marked, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("mark transport called for outbox item %q: read rows affected: %w", attempt.OutboxID, err)
+	}
+	if marked == 1 {
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("mark transport called for outbox item %q: commit: %w", attempt.OutboxID, err)
+		}
+		return nil
+	}
+
+	canceled, err := tx.ExecContext(ctx, `
+		UPDATE outbox
+		SET state = 'canceled',
+			error_class = ?,
+			error_code = ?,
+			error_detail = ?,
+			next_attempt_at_ms = NULL,
+			lease_owner = NULL,
+			lease_token = NULL,
+			lease_expires_at_ms = NULL,
+			updated_at_ms = ?
+		WHERE outbox_id = ?
+		  AND state = 'dispatching'
+		  AND lease_token = ?
+		  AND transport_called_at_ms IS NULL
+		  AND expires_at_ms IS NOT NULL
+		  AND expires_at_ms <= ?
+	`, TTLErrorClass, TTLErrorCode, ttlErrorDetail, nowMS, attempt.OutboxID, attempt.LeaseToken, nowMS)
+	if err != nil {
+		return fmt.Errorf("cancel expired leased outbox item %q: %w", attempt.OutboxID, err)
+	}
+	expired, err := canceled.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("cancel expired leased outbox item %q: read rows affected: %w", attempt.OutboxID, err)
+	}
+	if expired == 1 {
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("cancel expired leased outbox item %q: commit: %w", attempt.OutboxID, err)
+		}
+		return fmt.Errorf("mark transport called for outbox item %q: %w", attempt.OutboxID, ErrSendWindowExpired)
+	}
+	return r.requireLeaseMutationWithQueryer(ctx, tx, "mark transport called", attempt.OutboxID, result)
 }
 
 // MarkNotDispatched records a pre-call failure and makes the row safe to retry
@@ -1407,20 +1473,25 @@ func (r *OutboxRepository) RetryNotDispatched(
 	return r.requireStateMutation(ctx, "retry not dispatched", outboxID, result)
 }
 
-// Cancel transitions pending work to a terminal canceled state. Active or
-// already-terminal rows are rejected so a transport call cannot race a cancel.
-// TTLErrorClass and TTLErrorCode mark an intent canceled by CancelExpired
-// rather than by an explicit user action. Readers use them to report "expired
+// TTLErrorClass and TTLErrorCode mark an intent canceled because its send
+// window closed (by CancelExpired or by the MarkTransportCalled gate) rather
+// than by an explicit user action. Readers use them to report "expired
 // unsent" instead of a bare cancellation.
 const (
 	TTLErrorClass = "ttl"
 	TTLErrorCode  = "send_window_expired"
 )
 
-// CancelExpired cancels every intent whose send window closed before it
-// crossed the transport boundary. Only pre-transport states are eligible:
-// dispatching, uncertain, and terminal rows are left untouched because the
-// transport may already own them. Returns the canceled outbox IDs.
+// ttlErrorDetail is the error_detail both expiry paths record.
+const ttlErrorDetail = "send window expired before the message reached the transport; it was NOT sent"
+
+// CancelExpired cancels every queued or not-dispatched intent whose send
+// window has closed (expires_at_ms <= now). Dispatching, uncertain, and
+// terminal rows are left untouched. A dispatching row whose transport has
+// not been called yet is canceled by its lease owner instead, at the
+// MarkTransportCalled gate; the sweep must not touch a live lease, because
+// doing so would turn the owner's MarkTransportCalled into ErrLeaseLost.
+// Returns the canceled outbox IDs.
 func (r *OutboxRepository) CancelExpired(ctx context.Context, now time.Time) ([]string, error) {
 	nowMS := now.UnixMilli()
 	if nowMS <= 0 {
@@ -1462,14 +1533,14 @@ func (r *OutboxRepository) CancelExpired(ctx context.Context, now time.Time) ([]
 			SET state = 'canceled',
 				error_class = ?,
 				error_code = ?,
-				error_detail = 'send window expired before the message reached the transport; it was NOT sent',
+				error_detail = ?,
 				next_attempt_at_ms = NULL,
 				updated_at_ms = ?
 			WHERE outbox_id = ?
 			  AND state IN ('queued', 'not_dispatched')
 			  AND expires_at_ms IS NOT NULL
 			  AND expires_at_ms <= ?
-		`, TTLErrorClass, TTLErrorCode, nowMS, id, nowMS)
+		`, TTLErrorClass, TTLErrorCode, ttlErrorDetail, nowMS, id, nowMS)
 		if err != nil {
 			return nil, fmt.Errorf("cancel expired outbox item %q: %w", id, err)
 		}
@@ -1539,6 +1610,8 @@ func (r *OutboxRepository) ListRecentTextIntents(
 	return intents, nil
 }
 
+// Cancel transitions pending work to a terminal canceled state. Active or
+// already-terminal rows are rejected so a transport call cannot race a cancel.
 func (r *OutboxRepository) Cancel(ctx context.Context, outboxID string) error {
 	nowMS, err := r.nowMS("cancel outbox item")
 	if err != nil {
