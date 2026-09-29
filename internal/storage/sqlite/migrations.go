@@ -223,6 +223,10 @@ func readAppliedMigrations(
 	return applied, true, nil
 }
 
+// validateDatabaseState is the owner's (migrating open's) compatibility rule.
+// A blank database is acceptable because the owner provisions it; otherwise
+// it is classifyLedger with a minimum of one, the same rule the read-only
+// client applies with MinClientReadSchemaVersion, so the two cannot drift.
 func validateDatabaseState(
 	ctx context.Context,
 	tx *sql.Tx,
@@ -233,30 +237,69 @@ func validateDatabaseState(
 	if !ledgerExists {
 		return validateBlankDatabase(ctx, tx)
 	}
-	if len(applied) == 0 {
-		return fmt.Errorf("migration ledger exists without migration 0001")
+	userVersion, gotApplicationID, err := readVersionPragmas(ctx, tx)
+	if err != nil {
+		return err
 	}
-	if len(applied) > len(migrations) {
-		return fmt.Errorf(
+	_, err = classifyLedger(ledgerSnapshot{
+		ledgerExists:  true,
+		applied:       applied,
+		userVersion:   userVersion,
+		applicationID: gotApplicationID,
+	}, migrations, 1)
+	return err
+}
+
+// ledgerSnapshot is everything the schema-compatibility rule reads from a
+// store, captured inside one read transaction.
+type ledgerSnapshot struct {
+	ledgerExists  bool
+	applied       []appliedMigration
+	userVersion   int
+	applicationID int
+}
+
+// classifyLedger is the pure schema-compatibility rule shared by the owner
+// (validateDatabaseState, minVersion 1) and the read-only client
+// (OpenReadOnly, MinClientReadSchemaVersion). It accepts only a ledger that is
+// a contiguous, name- and checksum-matching prefix of known whose last version
+// equals user_version, with this lineage's application_id, and returns that
+// version. Every other state returns a schemaError whose class is
+// ErrSchemaNewer (ledger longer than known), ErrSchemaTooOld (valid prefix
+// below minVersion), or ErrLedgerMismatch (anything else).
+func classifyLedger(snapshot ledgerSnapshot, known []migration, minVersion int) (int, error) {
+	if !snapshot.ledgerExists {
+		return 0, schemaErrorf(ErrLedgerMismatch, "database has no migration ledger")
+	}
+	applied := snapshot.applied
+	if len(applied) == 0 {
+		return 0, schemaErrorf(ErrLedgerMismatch, "migration ledger exists without migration 0001")
+	}
+	latest := applied[len(applied)-1].version
+	if len(applied) > len(known) {
+		return latest, schemaErrorf(
+			ErrSchemaNewer,
 			"database schema version %d is newer than supported version %d",
-			applied[len(applied)-1].version,
-			len(migrations),
+			latest,
+			len(known),
 		)
 	}
 
 	for i, recorded := range applied {
 		expectedVersion := i + 1
 		if recorded.version != expectedVersion {
-			return fmt.Errorf(
+			return 0, schemaErrorf(
+				ErrLedgerMismatch,
 				"migration ledger is not contiguous: got version %d at position %d, want %d",
 				recorded.version,
 				i,
 				expectedVersion,
 			)
 		}
-		expected := migrations[i]
+		expected := known[i]
 		if recorded.name != expected.name {
-			return fmt.Errorf(
+			return 0, schemaErrorf(
+				ErrLedgerMismatch,
 				"migration %04d name mismatch: recorded %q, embedded %q",
 				recorded.version,
 				recorded.name,
@@ -264,7 +307,8 @@ func validateDatabaseState(
 			)
 		}
 		if recorded.checksumSHA256 != expected.checksumSHA256 {
-			return fmt.Errorf(
+			return 0, schemaErrorf(
+				ErrLedgerMismatch,
 				"migration %04d %q: %w: recorded %s, embedded %s",
 				recorded.version,
 				recorded.name,
@@ -275,31 +319,41 @@ func validateDatabaseState(
 		}
 	}
 
-	var userVersion int
-	if err := tx.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&userVersion); err != nil {
-		return fmt.Errorf("read sqlite user_version: %w", err)
-	}
-	wantVersion := applied[len(applied)-1].version
-	if userVersion != wantVersion {
-		return fmt.Errorf(
+	if snapshot.userVersion != latest {
+		return 0, schemaErrorf(
+			ErrLedgerMismatch,
 			"sqlite user_version mismatch: got %d, migration ledger is at %d",
-			userVersion,
-			wantVersion,
+			snapshot.userVersion,
+			latest,
 		)
 	}
-
-	var gotApplicationID int
-	if err := tx.QueryRowContext(ctx, `PRAGMA application_id`).Scan(&gotApplicationID); err != nil {
-		return fmt.Errorf("read sqlite application_id: %w", err)
-	}
-	if gotApplicationID != applicationID {
-		return fmt.Errorf(
+	if snapshot.applicationID != applicationID {
+		return 0, schemaErrorf(
+			ErrLedgerMismatch,
 			"sqlite application_id mismatch: got %#x, want %#x",
-			gotApplicationID,
+			snapshot.applicationID,
 			applicationID,
 		)
 	}
-	return nil
+	if latest < minVersion {
+		return latest, schemaErrorf(
+			ErrSchemaTooOld,
+			"database schema version %d is older than the minimum version %d this reader supports",
+			latest,
+			minVersion,
+		)
+	}
+	return latest, nil
+}
+
+func readVersionPragmas(ctx context.Context, tx *sql.Tx) (userVersion, applicationID int, err error) {
+	if err := tx.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&userVersion); err != nil {
+		return 0, 0, fmt.Errorf("read sqlite user_version: %w", err)
+	}
+	if err := tx.QueryRowContext(ctx, `PRAGMA application_id`).Scan(&applicationID); err != nil {
+		return 0, 0, fmt.Errorf("read sqlite application_id: %w", err)
+	}
+	return userVersion, applicationID, nil
 }
 
 func validateBlankDatabase(ctx context.Context, tx *sql.Tx) error {
