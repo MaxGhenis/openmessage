@@ -20,8 +20,10 @@ import (
 	"github.com/maxghenis/openmessage/internal/bridge"
 	"github.com/maxghenis/openmessage/internal/db"
 	"github.com/maxghenis/openmessage/internal/messaging"
+	"github.com/maxghenis/openmessage/internal/signallive"
 	"github.com/maxghenis/openmessage/internal/storage/blob"
 	"github.com/maxghenis/openmessage/internal/storage/sqlite"
+	"github.com/maxghenis/openmessage/internal/whatsapplive"
 )
 
 func TestV2SendToConversationReturnsConfirmedDelivery(t *testing.T) {
@@ -85,7 +87,12 @@ func TestV2SendToConversationReturnsHonestUncertainDelivery(t *testing.T) {
 
 	payload := v2ToolPayload(t, result)
 	assertV2ToolBool(t, payload, "ok", false)
-	assertV2ToolBool(t, payload, "settled", true)
+	// An unknown outcome is NOT settled: reporting it settled invited agents
+	// to treat the send as finished. It is flagged uncertain instead.
+	assertV2ToolBool(t, payload, "settled", false)
+	assertV2ToolBool(t, payload, "transmitted", false)
+	assertV2ToolBool(t, payload, "uncertain", true)
+	assertV2ToolString(t, payload, "transport_state", "uncertain")
 	assertV2ToolString(t, payload, "state", string(messaging.OutboxUncertain))
 	assertV2ToolString(t, payload, "remote_message_id", "")
 	assertV2ToolString(t, payload, "idempotency_key", "mcp-uncertain-key")
@@ -419,8 +426,31 @@ type v2ToolHarness struct {
 	blobRoot string
 }
 
+// stubHealthyTransportStatus models all three platforms paired, connected,
+// and healthy for the duration of one test, so send-capability prechecks
+// exercise the durable pipeline rather than refusing at the door.
+func stubHealthyTransportStatus(t *testing.T) {
+	t.Helper()
+	originalGoogle, originalWhatsApp, originalSignal := googleStatus, whatsAppStatus, signalStatus
+	googleStatus = func(*app.App) app.GoogleStatusSnapshot {
+		return app.GoogleStatusSnapshot{Connected: true, Paired: true, PhoneResponding: true}
+	}
+	whatsAppStatus = func(*app.App) whatsapplive.StatusSnapshot {
+		return whatsapplive.StatusSnapshot{Connected: true, Paired: true}
+	}
+	signalStatus = func(*app.App) signallive.StatusSnapshot {
+		return signallive.StatusSnapshot{Connected: true, Paired: true}
+	}
+	t.Cleanup(func() {
+		googleStatus = originalGoogle
+		whatsAppStatus = originalWhatsApp
+		signalStatus = originalSignal
+	})
+}
+
 func newV2ToolHarness(t *testing.T, steps ...v2ToolSendStep) *v2ToolHarness {
 	t.Helper()
+	stubHealthyTransportStatus(t)
 	a := testApp(t)
 	if err := a.Store.UpsertConversation(&db.Conversation{
 		ConversationID: v2ToolConversationID,

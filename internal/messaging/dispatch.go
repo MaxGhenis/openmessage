@@ -37,6 +37,12 @@ func (s *MessageService) Run(ctx context.Context) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		if err := s.cancelExpiredDue(ctx); err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
+			return fmt.Errorf("run message service: cancel expired intents: %w", err)
+		}
 		if _, err := s.reconcileStoreFailedDue(ctx, s.batchLimit); err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return ctxErr
@@ -186,19 +192,9 @@ func (s *MessageService) dispatchTextLease(ctx context.Context, outboxLease sqli
 		)
 	}
 
-	if err := s.outbox.MarkTransportCalled(ctx, sqlite.Attempt{
-		OutboxID:             item.OutboxID,
-		LeaseToken:           *item.LeaseToken,
-		AttemptToken:         item.OutboxID + ":" + *item.LeaseToken,
-		ConnectionGeneration: uint64(dispatchLease.Generation),
-		StartedAt:            s.clock.Now(),
-	}); err != nil {
-		if ctx.Err() != nil {
-			return errors.Join(ctx.Err(), s.releaseUnavailable(ctx, item, err))
-		}
-		return fmt.Errorf("dispatch outbox item %q: mark transport called: %w", item.OutboxID, err)
+	if proceed, err := s.crossTransportBoundary(ctx, item, dispatchLease.Generation); !proceed {
+		return err
 	}
-	s.signalChange()
 
 	request := bridge.TextRequest{
 		AccountID: item.AccountID,
@@ -357,19 +353,9 @@ func (s *MessageService) dispatchMediaLease(ctx context.Context, outboxLease sql
 	}
 	defer reader.Close()
 
-	if err := s.outbox.MarkTransportCalled(ctx, sqlite.Attempt{
-		OutboxID:             item.OutboxID,
-		LeaseToken:           *item.LeaseToken,
-		AttemptToken:         item.OutboxID + ":" + *item.LeaseToken,
-		ConnectionGeneration: uint64(dispatchLease.Generation),
-		StartedAt:            s.clock.Now(),
-	}); err != nil {
-		if ctx.Err() != nil {
-			return errors.Join(ctx.Err(), s.releaseUnavailable(ctx, item, err))
-		}
-		return fmt.Errorf("dispatch outbox item %q: mark transport called: %w", item.OutboxID, err)
+	if proceed, err := s.crossTransportBoundary(ctx, item, dispatchLease.Generation); !proceed {
+		return err
 	}
-	s.signalChange()
 
 	request := bridge.MediaRequest{
 		AccountID: item.AccountID,
@@ -510,19 +496,9 @@ func (s *MessageService) dispatchReactionLease(ctx context.Context, outboxLease 
 		)
 	}
 
-	if err := s.outbox.MarkTransportCalled(ctx, sqlite.Attempt{
-		OutboxID:             item.OutboxID,
-		LeaseToken:           *item.LeaseToken,
-		AttemptToken:         item.OutboxID + ":" + *item.LeaseToken,
-		ConnectionGeneration: uint64(dispatchLease.Generation),
-		StartedAt:            s.clock.Now(),
-	}); err != nil {
-		if ctx.Err() != nil {
-			return errors.Join(ctx.Err(), s.releaseUnavailable(ctx, item, err))
-		}
-		return fmt.Errorf("dispatch outbox item %q: mark transport called: %w", item.OutboxID, err)
+	if proceed, err := s.crossTransportBoundary(ctx, item, dispatchLease.Generation); !proceed {
+		return err
 	}
-	s.signalChange()
 
 	result, sendErr := dispatchLease.Reaction.SendReaction(ctx, bridge.ReactionRequest{
 		AccountID: item.AccountID,
@@ -660,19 +636,9 @@ func (s *MessageService) dispatchReadLease(ctx context.Context, outboxLease sqli
 		)
 	}
 
-	if err := s.outbox.MarkTransportCalled(ctx, sqlite.Attempt{
-		OutboxID:             item.OutboxID,
-		LeaseToken:           *item.LeaseToken,
-		AttemptToken:         item.OutboxID + ":" + *item.LeaseToken,
-		ConnectionGeneration: uint64(dispatchLease.Generation),
-		StartedAt:            s.clock.Now(),
-	}); err != nil {
-		if ctx.Err() != nil {
-			return errors.Join(ctx.Err(), s.releaseUnavailable(ctx, item, err))
-		}
-		return fmt.Errorf("dispatch outbox item %q: mark transport called: %w", item.OutboxID, err)
+	if proceed, err := s.crossTransportBoundary(ctx, item, dispatchLease.Generation); !proceed {
+		return err
 	}
-	s.signalChange()
 
 	sendErr := dispatchLease.ReadReceipt.MarkRead(ctx, bridge.ReadReceiptRequest{
 		AccountID: item.AccountID,
@@ -700,6 +666,65 @@ func (s *MessageService) dispatchReadLease(ctx context.Context, outboxLease sqli
 	}
 	s.signalChange()
 	return nil
+}
+
+// crossTransportBoundary commits the transport-call marker for one leased
+// item, immediately before its transport call. proceed is true only when the
+// marker committed; the caller must then call the transport. Otherwise the
+// caller returns err and must not call the transport:
+//
+//   - The send window closed (sqlite.ErrSendWindowExpired): storage has
+//     already canceled the row as expired in the marker's transaction. This
+//     is a normal per-item outcome, so err is nil and the batch continues.
+//   - The lease expired before the marker (sqlite.ErrLeaseLost while the
+//     clock shows this lease past its expiry): the lease is recovered as the
+//     per-item check in DispatchDue does, and err is nil. Returning the lease
+//     loss would stop Run, and nothing restarts the dispatcher.
+//   - Any other failure (a genuine foreign lease loss, a storage fault)
+//     stays a dispatch error, as before.
+func (s *MessageService) crossTransportBoundary(
+	ctx context.Context,
+	item sqlite.OutboxItem,
+	generation bridge.Generation,
+) (proceed bool, err error) {
+	markErr := s.outbox.MarkTransportCalled(ctx, sqlite.Attempt{
+		OutboxID:             item.OutboxID,
+		LeaseToken:           *item.LeaseToken,
+		AttemptToken:         item.OutboxID + ":" + *item.LeaseToken,
+		ConnectionGeneration: uint64(generation),
+		StartedAt:            s.clock.Now(),
+	})
+	switch {
+	case markErr == nil:
+		s.signalChange()
+		return true, nil
+	case errors.Is(markErr, sqlite.ErrSendWindowExpired):
+		// The row is already terminal and its lease cleared: nothing to
+		// release.
+		s.signalChange()
+		return false, nil
+	case ctx.Err() != nil:
+		return false, errors.Join(ctx.Err(), s.releaseUnavailable(ctx, item, markErr))
+	case errors.Is(markErr, sqlite.ErrLeaseLost) &&
+		item.LeaseExpiresAtMS != nil &&
+		*item.LeaseExpiresAtMS <= s.clock.Now().UnixMilli():
+		mutationCtx, cancel := s.storageMutationContext(ctx)
+		defer cancel()
+		recovered, recoverErr := s.outbox.RecoverExpiredLeases(mutationCtx, s.clock.Now())
+		if recovered.NotDispatched > 0 || recovered.Uncertain > 0 {
+			s.signalChange()
+		}
+		if recoverErr != nil {
+			return false, fmt.Errorf(
+				"dispatch outbox item %q: recover lease expired before the transport call: %w",
+				item.OutboxID,
+				recoverErr,
+			)
+		}
+		return false, nil
+	default:
+		return false, fmt.Errorf("dispatch outbox item %q: mark transport called: %w", item.OutboxID, markErr)
+	}
 }
 
 func (s *MessageService) targetRefForLease(
@@ -873,6 +898,23 @@ func (s *MessageService) releaseUntouched(ctx context.Context, leases []sqlite.L
 
 func (s *MessageService) storageMutationContext(ctx context.Context) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.WithoutCancel(ctx), defaultFinalizeTime)
+}
+
+// cancelExpiredDue sweeps queued and not-dispatched intents whose send window
+// closed. It is cleanup, not the enforcement point: LeaseDue never leases an
+// expired row, and the MarkTransportCalled gate (crossTransportBoundary)
+// cancels a leased row whose window closed before its transport call. All
+// three split time at the same instant (expires_at_ms <= now is expired), so
+// the sweep only finalizes rows nobody is dispatching.
+func (s *MessageService) cancelExpiredDue(ctx context.Context) error {
+	canceled, err := s.outbox.CancelExpired(ctx, s.clock.Now())
+	if err != nil {
+		return err
+	}
+	if len(canceled) > 0 {
+		s.signalChange()
+	}
+	return nil
 }
 
 func (s *MessageService) recordSendError(

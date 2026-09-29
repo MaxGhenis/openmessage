@@ -64,6 +64,10 @@ type NewOutboxItem struct {
 	SendAgainOfOutboxID string
 	ScheduledFor        time.Time
 	ScheduledForMS      int64
+	// ExpiresAtMS is a hard send window: an intent that has not crossed the
+	// transport boundary by this wall-clock time is canceled instead of
+	// transmitted stale. Zero means the intent never expires.
+	ExpiresAtMS int64
 }
 
 // OutboxItem mirrors one row in outbox. Nullable database fields are pointers.
@@ -90,6 +94,7 @@ type OutboxItem struct {
 	TransportCalledAtMS *int64
 	ScheduledForMS      int64
 	NextAttemptAtMS     *int64
+	ExpiresAtMS         *int64
 	CreatedAtMS         int64
 	UpdatedAtMS         int64
 }
@@ -244,10 +249,70 @@ type OutboxRepository struct {
 }
 
 type enqueueCarriers struct {
-	attachment  *OutboxAttachment
-	reaction    *OutboxReaction
-	readReceipt *OutboxReadReceipt
-	readCursor  *ReadCursor
+	attachment    *OutboxAttachment
+	reaction      *OutboxReaction
+	readReceipt   *OutboxReadReceipt
+	readCursor    *ReadCursor
+	nearDuplicate *NearDuplicateCheck
+}
+
+// NearDuplicateCheck asks a text enqueue to refuse a genuinely new intent when
+// a recent intent in the same account and conversation matches it.
+//
+// The check runs inside the enqueue's write transaction, after the
+// idempotency-key lookup, and only when that lookup inserted a new row:
+//   - a replay of an existing key returns the stored intent (or conflicts on a
+//     changed payload) and never consults the check, so a sibling intent under
+//     another key can never block the documented safe retry;
+//   - every store connection begins write transactions with BEGIN IMMEDIATE
+//     (see storeDSN), so the candidate read and the insert hold SQLite's write
+//     reservation together. Two concurrent new intents, in one process or
+//     several, therefore cannot both pass the check.
+//
+// Matches runs while that write reservation is held: it must be pure (no
+// database access) and cheap.
+type NearDuplicateCheck struct {
+	// SinceMS is the oldest created_at_ms a candidate may have (inclusive).
+	SinceMS int64
+	// Limit caps how many of the newest candidates are compared.
+	Limit int
+	// Matches reports whether a candidate's body is a near-duplicate of the
+	// body being enqueued.
+	Matches func(priorBody string) bool
+}
+
+// NearDuplicateError names the prior intent that matched a NearDuplicateCheck.
+// The refused enqueue wrote nothing: its transaction was rolled back.
+type NearDuplicateError struct {
+	Prior RecentTextIntent
+}
+
+func (e *NearDuplicateError) Error() string {
+	return fmt.Sprintf(
+		"%v: matches outbox item %q (state %s)",
+		ErrNearDuplicate,
+		e.Prior.OutboxID,
+		e.Prior.State,
+	)
+}
+
+func (e *NearDuplicateError) Unwrap() error { return ErrNearDuplicate }
+
+func validateNearDuplicateCheck(item NewOutboxItem, message *Message, check *NearDuplicateCheck) error {
+	if check == nil {
+		return nil
+	}
+	switch {
+	case item.Kind != OutboxKindText || message == nil:
+		return fmt.Errorf("near-duplicate check applies only to text intents with a message")
+	case check.Limit <= 0:
+		return fmt.Errorf("near-duplicate check limit must be positive")
+	case check.SinceMS <= 0:
+		return fmt.Errorf("near-duplicate check window start must be positive")
+	case check.Matches == nil:
+		return fmt.Errorf("near-duplicate check matcher is nil")
+	}
+	return nil
 }
 
 // NewOutboxRepository creates an outbox repository. The clock is required so
@@ -285,6 +350,19 @@ func (r *OutboxRepository) EnqueueOutgoingMessage(
 	message Message,
 ) (OutboxItem, EnqueueDisposition, error) {
 	return r.enqueue(ctx, item, &message, enqueueCarriers{})
+}
+
+// EnqueueOutgoingMessageGuarded is EnqueueOutgoingMessage for a text intent
+// with an optional NearDuplicateCheck serialized with the insert. A nil check
+// behaves exactly like EnqueueOutgoingMessage. A refusal returns a
+// *NearDuplicateError (errors.Is ErrNearDuplicate) and writes nothing.
+func (r *OutboxRepository) EnqueueOutgoingMessageGuarded(
+	ctx context.Context,
+	item NewOutboxItem,
+	message Message,
+	check *NearDuplicateCheck,
+) (OutboxItem, EnqueueDisposition, error) {
+	return r.enqueue(ctx, item, &message, enqueueCarriers{nearDuplicate: check})
 }
 
 // EnqueueOutgoingMediaMessage atomically inserts a media intent, its
@@ -428,6 +506,9 @@ func (r *OutboxRepository) enqueue(
 	if err := validateOutboxAttachmentPair(item, carriers); err != nil {
 		return OutboxItem{}, "", fmt.Errorf("enqueue outbox item %q: %w", item.OutboxID, err)
 	}
+	if err := validateNearDuplicateCheck(item, message, carriers.nearDuplicate); err != nil {
+		return OutboxItem{}, "", fmt.Errorf("enqueue outbox item %q: %w", item.OutboxID, err)
+	}
 	nowMS, err := r.nowMS("enqueue outbox item")
 	if err != nil {
 		return OutboxItem{}, "", err
@@ -458,9 +539,10 @@ func (r *OutboxRepository) enqueue(
 			send_again_of_outbox_id,
 			attempt_count,
 			scheduled_for_ms,
+			expires_at_ms,
 			created_at_ms,
 			updated_at_ms
-		) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, 0, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, 0, ?, ?, ?, ?)
 		ON CONFLICT(account_id, idempotency_key) DO NOTHING
 	`,
 		item.OutboxID,
@@ -474,6 +556,7 @@ func (r *OutboxRepository) enqueue(
 		item.TransportRequestID,
 		nullableOutboxText(item.SendAgainOfOutboxID),
 		scheduledForMS,
+		nullableOutboxMS(item.ExpiresAtMS),
 		nowMS,
 		nowMS,
 	)
@@ -549,6 +632,32 @@ func (r *OutboxRepository) enqueue(
 	if disposition == EnqueueExisting && row.Kind == OutboxKindRead {
 		if err := validateExistingOutboxReadReceipt(ctx, tx, row.OutboxID); err != nil {
 			return OutboxItem{}, "", err
+		}
+	}
+	// The near-duplicate check runs only for a genuinely new intent: an
+	// existing key was resolved above (returned or conflicted) without
+	// consulting it. The candidate read happens inside this BEGIN IMMEDIATE
+	// transaction, so no other writer can insert a competing intent between
+	// the read and this commit. A refusal returns before commit; the deferred
+	// rollback discards the outbox row inserted above.
+	if disposition == EnqueueInserted && carriers.nearDuplicate != nil {
+		check := carriers.nearDuplicate
+		candidates, err := listRecentTextIntents(
+			ctx,
+			tx,
+			item.AccountID,
+			item.ConversationID,
+			check.SinceMS,
+			check.Limit,
+			item.OutboxID,
+		)
+		if err != nil {
+			return OutboxItem{}, "", fmt.Errorf("enqueue outbox item %q: near-duplicate check: %w", item.OutboxID, err)
+		}
+		for _, candidate := range candidates {
+			if check.Matches(candidate.Body) {
+				return OutboxItem{}, "", &NearDuplicateError{Prior: candidate}
+			}
 		}
 	}
 	if disposition == EnqueueInserted && message != nil {
@@ -1136,7 +1245,10 @@ func (r *OutboxRepository) ListConfirmedSince(
 }
 
 // LeaseDue atomically claims due queued and retryable rows. An uncertain row is
-// structurally ineligible regardless of its next-attempt value.
+// structurally ineligible regardless of its next-attempt value, and a row
+// whose send window has closed (expires_at_ms <= now) is never leased. A
+// leased row's window can still close before its transport call; the
+// MarkTransportCalled gate enforces it again at that instant.
 func (r *OutboxRepository) LeaseDue(
 	ctx context.Context,
 	req LeaseRequest,
@@ -1172,9 +1284,10 @@ func (r *OutboxRepository) LeaseDue(
 		  AND state IN ('queued', 'not_dispatched')
 		  AND (next_attempt_at_ms IS NULL OR next_attempt_at_ms <= ?)
 		  AND (lease_expires_at_ms IS NULL OR lease_expires_at_ms <= ?)
+		  AND (expires_at_ms IS NULL OR expires_at_ms > ?)
 		ORDER BY COALESCE(next_attempt_at_ms, scheduled_for_ms), created_at_ms, outbox_id
 		LIMIT ?
-	`, nowMS, nowMS, nowMS, req.Limit)
+	`, nowMS, nowMS, nowMS, nowMS, req.Limit)
 	if err != nil {
 		return nil, fmt.Errorf("lease due outbox items: select candidates: %w", err)
 	}
@@ -1210,7 +1323,8 @@ func (r *OutboxRepository) LeaseDue(
 			  AND state IN ('queued', 'not_dispatched')
 			  AND (next_attempt_at_ms IS NULL OR next_attempt_at_ms <= ?)
 			  AND (lease_expires_at_ms IS NULL OR lease_expires_at_ms <= ?)
-		`, req.Owner, token, expiresAtMS, nowMS, id, nowMS, nowMS, nowMS)
+			  AND (expires_at_ms IS NULL OR expires_at_ms > ?)
+		`, req.Owner, token, expiresAtMS, nowMS, id, nowMS, nowMS, nowMS, nowMS)
 		if err != nil {
 			return nil, fmt.Errorf("lease outbox item %q: update: %w", id, err)
 		}
@@ -1242,6 +1356,20 @@ func (r *OutboxRepository) LeaseDue(
 // outcome must not be retried automatically. A dispatcher commits this marker
 // immediately before issuing the transport call, and the call consumes one
 // attempt.
+//
+// It is also the send-window gate. In one transaction, the marker commits
+// only while the caller's lease is live AND the row's send window is open
+// (expires_at_ms IS NULL OR expires_at_ms > now), using the same boundary as
+// LeaseDue and CancelExpired. If the caller still owns the not-yet-called row
+// (matching lease token) but its window has closed, the same transaction
+// cancels it as expired (TTLErrorClass/TTLErrorCode, lease cleared,
+// attempt_count unchanged) and the call returns ErrSendWindowExpired: the
+// transport must not be called. This closes the gap between leasing a batch
+// and reaching each item's transport call, during which earlier sends in the
+// batch can outlast a later item's window. The expiry branch does not require
+// a live lease: a matching token proves nobody re-leased the row, and a NULL
+// transport_called_at_ms proves nothing was sent. Otherwise the result is
+// ErrLeaseLost (or not-found) with the row unchanged.
 func (r *OutboxRepository) MarkTransportCalled(
 	ctx context.Context,
 	attempt Attempt,
@@ -1256,7 +1384,13 @@ func (r *OutboxRepository) MarkTransportCalled(
 	if err != nil {
 		return err
 	}
-	result, err := r.store.db.ExecContext(ctx, `
+	tx, err := r.store.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("mark transport called for outbox item %q: begin transaction: %w", attempt.OutboxID, err)
+	}
+	defer tx.Rollback()
+
+	result, err := tx.ExecContext(ctx, `
 		UPDATE outbox
 		SET transport_called_at_ms = ?,
 			attempt_count = attempt_count + 1,
@@ -1266,11 +1400,54 @@ func (r *OutboxRepository) MarkTransportCalled(
 		  AND lease_token = ?
 		  AND lease_expires_at_ms > ?
 		  AND transport_called_at_ms IS NULL
-	`, nowMS, nowMS, attempt.OutboxID, attempt.LeaseToken, nowMS)
+		  AND (expires_at_ms IS NULL OR expires_at_ms > ?)
+	`, nowMS, nowMS, attempt.OutboxID, attempt.LeaseToken, nowMS, nowMS)
 	if err != nil {
 		return fmt.Errorf("mark transport called for outbox item %q: %w", attempt.OutboxID, err)
 	}
-	return r.requireLeaseMutation(ctx, "mark transport called", attempt.OutboxID, result)
+	marked, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("mark transport called for outbox item %q: read rows affected: %w", attempt.OutboxID, err)
+	}
+	if marked == 1 {
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("mark transport called for outbox item %q: commit: %w", attempt.OutboxID, err)
+		}
+		return nil
+	}
+
+	canceled, err := tx.ExecContext(ctx, `
+		UPDATE outbox
+		SET state = 'canceled',
+			error_class = ?,
+			error_code = ?,
+			error_detail = ?,
+			next_attempt_at_ms = NULL,
+			lease_owner = NULL,
+			lease_token = NULL,
+			lease_expires_at_ms = NULL,
+			updated_at_ms = ?
+		WHERE outbox_id = ?
+		  AND state = 'dispatching'
+		  AND lease_token = ?
+		  AND transport_called_at_ms IS NULL
+		  AND expires_at_ms IS NOT NULL
+		  AND expires_at_ms <= ?
+	`, TTLErrorClass, TTLErrorCode, ttlErrorDetail, nowMS, attempt.OutboxID, attempt.LeaseToken, nowMS)
+	if err != nil {
+		return fmt.Errorf("cancel expired leased outbox item %q: %w", attempt.OutboxID, err)
+	}
+	expired, err := canceled.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("cancel expired leased outbox item %q: read rows affected: %w", attempt.OutboxID, err)
+	}
+	if expired == 1 {
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("cancel expired leased outbox item %q: commit: %w", attempt.OutboxID, err)
+		}
+		return fmt.Errorf("mark transport called for outbox item %q: %w", attempt.OutboxID, ErrSendWindowExpired)
+	}
+	return r.requireLeaseMutationWithQueryer(ctx, tx, "mark transport called", attempt.OutboxID, result)
 }
 
 // MarkNotDispatched records a pre-call failure and makes the row safe to retry
@@ -1396,6 +1573,155 @@ func (r *OutboxRepository) RetryNotDispatched(
 		return fmt.Errorf("retry not-dispatched outbox item %q: %w", outboxID, err)
 	}
 	return r.requireStateMutation(ctx, "retry not dispatched", outboxID, result)
+}
+
+// TTLErrorClass and TTLErrorCode mark an intent canceled because its send
+// window closed (by CancelExpired or by the MarkTransportCalled gate) rather
+// than by an explicit user action. Readers use them to report "expired
+// unsent" instead of a bare cancellation.
+const (
+	TTLErrorClass = "ttl"
+	TTLErrorCode  = "send_window_expired"
+)
+
+// ttlErrorDetail is the error_detail both expiry paths record.
+const ttlErrorDetail = "send window expired before the message reached the transport; it was NOT sent"
+
+// CancelExpired cancels every queued or not-dispatched intent whose send
+// window has closed (expires_at_ms <= now). Dispatching, uncertain, and
+// terminal rows are left untouched. A dispatching row whose transport has
+// not been called yet is canceled by its lease owner instead, at the
+// MarkTransportCalled gate; the sweep must not touch a live lease, because
+// doing so would turn the owner's MarkTransportCalled into ErrLeaseLost.
+// Returns the canceled outbox IDs.
+func (r *OutboxRepository) CancelExpired(ctx context.Context, now time.Time) ([]string, error) {
+	nowMS := now.UnixMilli()
+	if nowMS <= 0 {
+		return nil, fmt.Errorf("cancel expired outbox items: current Unix time is not positive")
+	}
+
+	tx, err := r.store.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("cancel expired outbox items: begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	rows, err := tx.QueryContext(ctx, `
+		SELECT outbox_id
+		FROM outbox
+		WHERE state IN ('queued', 'not_dispatched')
+		  AND expires_at_ms IS NOT NULL
+		  AND expires_at_ms <= ?
+		ORDER BY expires_at_ms, outbox_id
+	`, nowMS)
+	if err != nil {
+		return nil, fmt.Errorf("cancel expired outbox items: select candidates: %w", err)
+	}
+	ids, err := collectRows(rows, func(row rowScanner) (string, error) {
+		var id string
+		err := row.Scan(&id)
+		return id, err
+	})
+	if err != nil {
+		return nil, fmt.Errorf("cancel expired outbox items: scan candidates: %w", err)
+	}
+	if len(ids) == 0 {
+		return nil, tx.Commit()
+	}
+
+	for _, id := range ids {
+		result, err := tx.ExecContext(ctx, `
+			UPDATE outbox
+			SET state = 'canceled',
+				error_class = ?,
+				error_code = ?,
+				error_detail = ?,
+				next_attempt_at_ms = NULL,
+				updated_at_ms = ?
+			WHERE outbox_id = ?
+			  AND state IN ('queued', 'not_dispatched')
+			  AND expires_at_ms IS NOT NULL
+			  AND expires_at_ms <= ?
+		`, TTLErrorClass, TTLErrorCode, ttlErrorDetail, nowMS, id, nowMS)
+		if err != nil {
+			return nil, fmt.Errorf("cancel expired outbox item %q: %w", id, err)
+		}
+		if _, err := result.RowsAffected(); err != nil {
+			return nil, fmt.Errorf("cancel expired outbox item %q: read rows affected: %w", id, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("cancel expired outbox items: commit: %w", err)
+	}
+	return ids, nil
+}
+
+// RecentTextIntent is one prior text send considered by the near-duplicate
+// check.
+type RecentTextIntent struct {
+	OutboxID       string
+	IdempotencyKey string
+	State          OutboxState
+	Body           string
+	CreatedAtMS    int64
+}
+
+// recentTextIntentQueryer is satisfied by *sql.Tx; the near-duplicate check
+// always reads its candidates inside the enqueue's write transaction.
+type recentTextIntentQueryer interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+}
+
+// listRecentTextIntents returns the newest limit text intents created at or
+// after sinceMS in one account and conversation, other than excludeOutboxID
+// (the row being enqueued), excluding states proven not to have sent
+// (rejected, canceled). Everything else — queued, dispatching, retrying,
+// uncertain, and confirmed — did or still may reach the recipient, so a
+// near-duplicate submission against any of them deserves the guard. Media
+// intents are never candidates: their captions are not text sends.
+func listRecentTextIntents(
+	ctx context.Context,
+	queryer recentTextIntentQueryer,
+	accountID string,
+	conversationID string,
+	sinceMS int64,
+	limit int,
+	excludeOutboxID string,
+) ([]RecentTextIntent, error) {
+	if limit <= 0 {
+		return nil, fmt.Errorf("list recent text intents: limit must be positive")
+	}
+	rows, err := queryer.QueryContext(ctx, `
+		SELECT o.outbox_id, o.idempotency_key, o.state, COALESCE(m.body, ''), o.created_at_ms
+		FROM outbox o
+		LEFT JOIN messages m ON m.message_id = o.local_message_id
+		WHERE o.account_id = ?
+		  AND o.conversation_id = ?
+		  AND o.kind = 'text'
+		  AND o.created_at_ms >= ?
+		  AND o.state NOT IN ('rejected', 'canceled')
+		  AND o.outbox_id <> ?
+		ORDER BY o.created_at_ms DESC, o.outbox_id DESC
+		LIMIT ?
+	`, accountID, conversationID, sinceMS, excludeOutboxID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list recent text intents: query: %w", err)
+	}
+	intents, err := collectRows(rows, func(row rowScanner) (RecentTextIntent, error) {
+		var intent RecentTextIntent
+		err := row.Scan(
+			&intent.OutboxID,
+			&intent.IdempotencyKey,
+			&intent.State,
+			&intent.Body,
+			&intent.CreatedAtMS,
+		)
+		return intent, err
+	})
+	if err != nil {
+		return nil, fmt.Errorf("list recent text intents: scan: %w", err)
+	}
+	return intents, nil
 }
 
 // Cancel transitions pending work to a terminal canceled state. Active or
@@ -2097,6 +2423,7 @@ const outboxColumns = `
 	transport_called_at_ms,
 	scheduled_for_ms,
 	next_attempt_at_ms,
+	expires_at_ms,
 	created_at_ms,
 	updated_at_ms`
 
@@ -2130,6 +2457,7 @@ func scanPendingRow(row rowScanner) (PendingRow, error) {
 		&pending.TransportCalledAtMS,
 		&pending.ScheduledForMS,
 		&pending.NextAttemptAtMS,
+		&pending.ExpiresAtMS,
 		&pending.CreatedAtMS,
 		&pending.UpdatedAtMS,
 		&pending.Body,
@@ -2176,6 +2504,7 @@ func scanCarryableIntent(row rowScanner) (CarryableIntent, error) {
 		&intent.TransportCalledAtMS,
 		&intent.ScheduledForMS,
 		&intent.NextAttemptAtMS,
+		&intent.ExpiresAtMS,
 		&intent.CreatedAtMS,
 		&intent.UpdatedAtMS,
 		&remoteConversationID,
@@ -2230,6 +2559,7 @@ func scanOutboxItem(row rowScanner) (OutboxItem, error) {
 		&item.TransportCalledAtMS,
 		&item.ScheduledForMS,
 		&item.NextAttemptAtMS,
+		&item.ExpiresAtMS,
 		&item.CreatedAtMS,
 		&item.UpdatedAtMS,
 	)
@@ -2268,6 +2598,9 @@ func validateNewOutboxItem(item NewOutboxItem) error {
 	if !item.ScheduledFor.IsZero() && item.ScheduledForMS != 0 {
 		return fmt.Errorf("ScheduledFor and ScheduledForMS are both set")
 	}
+	if item.ExpiresAtMS < 0 {
+		return fmt.Errorf("expiry time is negative")
+	}
 	return nil
 }
 
@@ -2287,6 +2620,13 @@ func scheduledForMilliseconds(item NewOutboxItem, nowMS int64) (int64, error) {
 
 func nullableOutboxText(value string) any {
 	if value == "" {
+		return nil
+	}
+	return value
+}
+
+func nullableOutboxMS(value int64) any {
+	if value == 0 {
 		return nil
 	}
 	return value

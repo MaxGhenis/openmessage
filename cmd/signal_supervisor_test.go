@@ -110,48 +110,78 @@ func TestSignalSupervisorControlBlockedCommandsRetryAndAcceptChangedInputs(t *te
 	}
 }
 
+// TestSignalSupervisorControlParkRetestRetriesOnlyUnreadablePark pins the
+// lockstep between the supervisor's paced park retest and send capability
+// tiering: a blocked Signal supervisor is retried automatically exactly when
+// its class is reauth_required and signallive.ParkRetestedAutomatically
+// accepts its fingerprint — the same predicate internal/sendcap uses to call
+// the park queueable ("re-checked automatically"). Every other park stays
+// user-owned no matter how many retest ticks elapse.
 func TestSignalSupervisorControlParkRetestRetriesOnlyUnreadablePark(t *testing.T) {
-	lifecycle := &signalControlTestLifecycle{}
-	supervisor := newSignalControlTestSupervisor(t, lifecycle)
-	control := newSignalSupervisorControl(supervisor, nil, func() string { return "signal-input-v1" })
-	t.Cleanup(func() { stopSignalControlForTest(t, control) })
-	control.StartParkRetest(20*time.Millisecond, zerolog.Nop())
-
-	if err := control.Connect(); err != nil {
-		t.Fatalf("initial Connect() error = %v", err)
+	tests := []struct {
+		name        string
+		class       bridge.FailureClass
+		fingerprint string
+	}{
+		{"unreadable reauth park", bridge.FailureReauthRequired, signallive.SignalAccountUnreadableFingerprint},
+		{"server-confirmed reauth park", bridge.FailureReauthRequired, signallive.SignalAccountInvalidFingerprint},
+		{"reauth with an upgrade fingerprint", bridge.FailureReauthRequired, signallive.SignalCLIVersionFingerprint},
+		{"reauth with the poison fingerprint", bridge.FailureReauthRequired, "incoming_message_get_sender_content_null"},
+		{"reauth with the unspecified placeholder", bridge.FailureReauthRequired, signallive.SignalParkUnspecifiedFingerprint},
+		{"reauth with an unknown fingerprint", bridge.FailureReauthRequired, "x"},
+		{"upgrade park", bridge.FailureUpgradeRequired, signallive.SignalCLIVersionFingerprint},
+		{"upgrade class with the unreadable fingerprint", bridge.FailureUpgradeRequired, signallive.SignalAccountUnreadableFingerprint},
 	}
-	awaitSignalSupervisorGenerationState(t, supervisor, bridge.StateOnline, 1)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			wantRetest := test.class == bridge.FailureReauthRequired &&
+				signallive.ParkRetestedAutomatically(test.fingerprint)
 
-	// A park whose only evidence was local (signal-cli unable to read an
-	// account that accounts.json still lists) must heal on the paced retest
-	// without any manual /api/signal/connect.
-	lifecycle.Run(0).Fail(bridge.OpError{
-		Class:       bridge.FailureReauthRequired,
-		Operation:   "probe_account",
-		Fingerprint: signallive.SignalAccountUnreadableFingerprint,
-		Cause:       errors.New("signal-cli cannot read the linked Signal account"),
-	})
-	awaitSignalSupervisorGenerationState(t, supervisor, bridge.StateOnline, 2)
-	if got := lifecycle.StartCount(); got != 2 {
-		t.Fatalf("lifecycle starts after unreadable-park retest = %d, want 2", got)
-	}
+			lifecycle := &signalControlTestLifecycle{}
+			supervisor := newSignalControlTestSupervisor(t, lifecycle)
+			control := newSignalSupervisorControl(supervisor, nil, func() string { return "signal-input-v1" })
+			t.Cleanup(func() { stopSignalControlForTest(t, control) })
+			control.StartParkRetest(20*time.Millisecond, zerolog.Nop())
 
-	// A server-backed reauth park stays user-owned: no retest tick may retry
-	// it, no matter how many elapse.
-	lifecycle.Run(1).Fail(bridge.OpError{
-		Class:       bridge.FailureReauthRequired,
-		Operation:   "receive",
-		Fingerprint: signallive.SignalAccountInvalidFingerprint,
-		Cause:       errors.New("account is not registered"),
-	})
-	awaitSignalSupervisorGenerationState(t, supervisor, bridge.StateBlocked, 2)
-	time.Sleep(200 * time.Millisecond)
-	snapshot := awaitSignalSupervisorGenerationState(t, supervisor, bridge.StateBlocked, 2)
-	if snapshot.ErrorFingerprint != signallive.SignalAccountInvalidFingerprint {
-		t.Fatalf("blocked fingerprint = %q, want %q", snapshot.ErrorFingerprint, signallive.SignalAccountInvalidFingerprint)
+			if err := control.Connect(); err != nil {
+				t.Fatalf("initial Connect() error = %v", err)
+			}
+			awaitSignalSupervisorGenerationState(t, supervisor, bridge.StateOnline, 1)
+
+			lifecycle.Run(0).Fail(bridge.OpError{
+				Class:       test.class,
+				Operation:   "probe_account",
+				Fingerprint: test.fingerprint,
+				Cause:       errors.New("signal park"),
+			})
+			if wantRetest {
+				// A park whose only evidence was local must heal on the paced
+				// retest without any manual /api/signal/connect.
+				awaitSignalSupervisorGenerationState(t, supervisor, bridge.StateOnline, 2)
+				if got := lifecycle.StartCount(); got != 2 {
+					t.Fatalf("lifecycle starts after retested park = %d, want 2", got)
+				}
+				return
+			}
+			awaitSignalSupervisorGenerationState(t, supervisor, bridge.StateBlocked, 1)
+			time.Sleep(200 * time.Millisecond) // ~10 retest ticks
+			snapshot := awaitSignalSupervisorGenerationState(t, supervisor, bridge.StateBlocked, 1)
+			if snapshot.ErrorFingerprint != test.fingerprint {
+				t.Fatalf("blocked fingerprint = %q, want %q", snapshot.ErrorFingerprint, test.fingerprint)
+			}
+			if got := lifecycle.StartCount(); got != 1 {
+				t.Fatalf("lifecycle starts after a user-owned park = %d, want 1 (no automatic retry)", got)
+			}
+		})
 	}
-	if got := lifecycle.StartCount(); got != 2 {
-		t.Fatalf("lifecycle starts after genuine reauth park = %d, want 2 (no automatic retry)", got)
+}
+
+func TestSignalParkRetestIntervalIsTheSharedConstant(t *testing.T) {
+	// sendcap quotes signallive.ParkRetestInterval in the account_recheck
+	// reason; the retest must run on that same cadence.
+	if signalParkRetestInterval != signallive.ParkRetestInterval {
+		t.Fatalf("signalParkRetestInterval = %s, want signallive.ParkRetestInterval %s", signalParkRetestInterval, signallive.ParkRetestInterval)
 	}
 }
 

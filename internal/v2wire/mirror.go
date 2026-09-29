@@ -321,6 +321,22 @@ func accountBridgeKey(accountID string) string {
 	}
 }
 
+// AccountIDForPlatform maps a send platform key ("sms", "whatsapp",
+// "signal") to the primary account ID the daemon registers adapters under.
+// Empty for unknown platforms.
+func AccountIDForPlatform(platform string) string {
+	switch platform {
+	case "sms", "rcs":
+		return googleAccountID
+	case "whatsapp":
+		return whatsappAccountID
+	case "signal":
+		return signalAccountID
+	default:
+		return ""
+	}
+}
+
 // localDeviceID is account-scoped because devices.device_id is a global
 // primary key. A constant ID lets mirroring a second account steal the first
 // account's device row and invalidates that account's read-cursor foreign key.

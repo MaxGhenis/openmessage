@@ -33,7 +33,23 @@ const (
 	maxListPending      = 500
 	summaryMaxRunes     = 120
 	workerOwner         = "message-service"
+
+	// Near-duplicate guard defaults: a guarded text whose body is this similar
+	// to one submitted to the same conversation within DefaultDuplicateWindow
+	// is blocked unless the command carries Force. 0.75 catches the incident
+	// shape ("lunch tomorrow…" resent as "lunch today…") while leaving short
+	// conversational repeats ("ok" / "ok!") alone. Only the newest
+	// duplicateCandidateLimit candidates are compared, over at most the first
+	// duplicateCompareMaxRunes normalized runes of each body, because the
+	// comparison runs while the enqueue holds SQLite's write reservation.
+	defaultDuplicateThreshold = 0.75
+	duplicateCandidateLimit   = 8
+	duplicateCompareMaxRunes  = 1000
 )
+
+// DefaultDuplicateWindow is how far back the near-duplicate guard looks for a
+// prior text in the same conversation, measured by submission time.
+const DefaultDuplicateWindow = 10 * time.Minute
 
 // ListPendingQuery selects outbox-tray deliveries in deterministic due order.
 type ListPendingQuery struct {
@@ -52,6 +68,7 @@ type PendingDelivery struct {
 	State          OutboxState
 	ScheduledFor   time.Time
 	NextAttemptAt  time.Time
+	ExpiresAt      time.Time // zero means the intent never expires
 	AttemptCount   int64
 	CreatedAt      time.Time
 	Summary        string
@@ -76,6 +93,9 @@ type MessageService struct {
 	maxPollDelay  time.Duration
 	maxMediaBytes int64
 	batchLimit    int
+
+	duplicateWindow    time.Duration
+	duplicateThreshold float64
 
 	wake chan struct{}
 
@@ -113,21 +133,23 @@ func NewMessageService(
 		return nil, fmt.Errorf("create message service messages: %w", err)
 	}
 	return &MessageService{
-		store:         store,
-		outbox:        outbox,
-		messages:      messages,
-		bridges:       bridges,
-		blobs:         blobs,
-		clock:         clock,
-		ids:           ids,
-		leaseTime:     defaultLeaseTime,
-		retryDelay:    defaultRetryDelay,
-		pollDelay:     defaultPollDelay,
-		maxPollDelay:  defaultMaxPollDelay,
-		maxMediaBytes: DefaultMaxMediaBytes,
-		batchLimit:    defaultBatchLimit,
-		wake:          make(chan struct{}, 1),
-		changed:       make(chan struct{}),
+		store:              store,
+		outbox:             outbox,
+		messages:           messages,
+		bridges:            bridges,
+		blobs:              blobs,
+		clock:              clock,
+		ids:                ids,
+		leaseTime:          defaultLeaseTime,
+		retryDelay:         defaultRetryDelay,
+		pollDelay:          defaultPollDelay,
+		maxPollDelay:       defaultMaxPollDelay,
+		maxMediaBytes:      DefaultMaxMediaBytes,
+		batchLimit:         defaultBatchLimit,
+		duplicateWindow:    DefaultDuplicateWindow,
+		duplicateThreshold: defaultDuplicateThreshold,
+		wake:               make(chan struct{}, 1),
+		changed:            make(chan struct{}),
 	}, nil
 }
 
@@ -185,12 +207,21 @@ func (s *MessageService) SendText(
 	if scheduledFor.IsZero() {
 		scheduledFor = now
 	}
+	expiresAtMS, err := expiryMilliseconds(cmd.CommonCommand, scheduledFor)
+	if err != nil {
+		return Submission{}, err
+	}
 	payloadHash, err := textPayloadHash(cmd.Body, cmd.ReplyToMessageID)
 	if err != nil {
 		return Submission{}, fmt.Errorf("send text: hash payload: %w", err)
 	}
 
-	item, disposition, err := s.outbox.EnqueueOutgoingMessage(ctx, sqlite.NewOutboxItem{
+	// The near-duplicate guard (when this command opts in) runs inside the
+	// enqueue transaction after the idempotency key is resolved: a replay of
+	// an existing key returns the stored intent before the guard is
+	// consulted, and concurrent new intents are serialized by SQLite's write
+	// reservation, so at most one of a set of near-duplicates is accepted.
+	item, disposition, err := s.outbox.EnqueueOutgoingMessageGuarded(ctx, sqlite.NewOutboxItem{
 		OutboxID:           outboxID,
 		AccountID:          cmd.AccountID,
 		ConversationID:     cmd.ConversationID,
@@ -201,6 +232,7 @@ func (s *MessageService) SendText(
 		LocalMessageID:     localMessageID,
 		TransportRequestID: requestID,
 		ScheduledFor:       scheduledFor,
+		ExpiresAtMS:        expiresAtMS,
 	}, sqlite.Message{
 		MessageID:       localMessageID,
 		ConversationID:  cmd.ConversationID,
@@ -211,8 +243,12 @@ func (s *MessageService) SendText(
 		ReplyToRemoteID: replyToRemoteID,
 		State:           sqlite.MessageStateActive,
 		OccurredAtMS:    now.UnixMilli(),
-	})
+	}, s.nearDuplicateCheck(cmd, now))
 	if err != nil {
+		var nearDuplicate *sqlite.NearDuplicateError
+		if errors.As(err, &nearDuplicate) {
+			return Submission{}, duplicateSendError(nearDuplicate.Prior, now)
+		}
 		return Submission{}, fmt.Errorf("send text: %w", err)
 	}
 
@@ -305,6 +341,10 @@ func (s *MessageService) SendMedia(
 	if scheduledFor.IsZero() {
 		scheduledFor = now
 	}
+	expiresAtMS, err := expiryMilliseconds(cmd.CommonCommand, scheduledFor)
+	if err != nil {
+		return Submission{}, err
+	}
 	payloadHash, err := mediaPayloadHash(
 		ref.Hash,
 		ref.Size,
@@ -328,6 +368,7 @@ func (s *MessageService) SendMedia(
 		LocalMessageID:     localMessageID,
 		TransportRequestID: requestID,
 		ScheduledFor:       scheduledFor,
+		ExpiresAtMS:        expiresAtMS,
 	}, sqlite.Message{
 		MessageID:       localMessageID,
 		ConversationID:  cmd.ConversationID,
@@ -418,6 +459,10 @@ func (s *MessageService) SendReaction(
 	if scheduledFor.IsZero() {
 		scheduledFor = now
 	}
+	expiresAtMS, err := expiryMilliseconds(cmd.CommonCommand, scheduledFor)
+	if err != nil {
+		return Submission{}, err
+	}
 	payloadHash, err := reactionPayloadHash(cmd.TargetMessageID, cmd.Emoji, cmd.Action)
 	if err != nil {
 		return Submission{}, fmt.Errorf("send reaction: hash payload: %w", err)
@@ -433,6 +478,7 @@ func (s *MessageService) SendReaction(
 		Operation:          reactionOperation,
 		TransportRequestID: requestID,
 		ScheduledFor:       scheduledFor,
+		ExpiresAtMS:        expiresAtMS,
 	}, sqlite.OutboxReaction{
 		TargetMessageID: cmd.TargetMessageID,
 		Emoji:           cmd.Emoji,
@@ -521,6 +567,10 @@ func (s *MessageService) MarkRead(
 	if scheduledFor.IsZero() {
 		scheduledFor = now
 	}
+	expiresAtMS, err := expiryMilliseconds(cmd.CommonCommand, scheduledFor)
+	if err != nil {
+		return Submission{}, err
+	}
 	payloadHash, err := readPayloadHash(cmd.DeviceID, cmd.LastReadMessageID)
 	if err != nil {
 		return Submission{}, fmt.Errorf("mark read: hash payload: %w", err)
@@ -537,6 +587,7 @@ func (s *MessageService) MarkRead(
 		Operation:          readOperation,
 		TransportRequestID: requestID,
 		ScheduledFor:       scheduledFor,
+		ExpiresAtMS:        expiresAtMS,
 	}, sqlite.OutboxReadReceipt{
 		DeviceID:          cmd.DeviceID,
 		LastReadMessageID: cmd.LastReadMessageID,
@@ -617,6 +668,9 @@ func (s *MessageService) ListPending(
 		}
 		if row.NextAttemptAtMS != nil {
 			delivery.NextAttemptAt = time.UnixMilli(*row.NextAttemptAtMS)
+		}
+		if row.ExpiresAtMS != nil {
+			delivery.ExpiresAt = time.UnixMilli(*row.ExpiresAtMS)
 		}
 		deliveries = append(deliveries, delivery)
 	}
@@ -746,6 +800,12 @@ func (s *MessageService) RetryNotDispatched(
 // that is the same accepted outcome as the echo arriving a moment after the
 // resend (both delivered) — the user explicitly chose to resend a
 // maybe-delivered message, and the two intents stay distinct rows.
+//
+// The new intent deliberately carries no send window (expires_at_ms NULL).
+// SendAgain is an explicit user action from the web UI outbox tray, and UI
+// sends carry no window either. Copying the predecessor's absolute expiry
+// would usually give a row born expired, because by the time a predecessor is
+// uncertain or rejected its window has typically closed.
 func (s *MessageService) SendAgain(
 	ctx context.Context,
 	outboxID string,
@@ -1008,6 +1068,161 @@ func (s *MessageService) reconcileStoreFailedDue(ctx context.Context, limit int)
 	return reconciled, nil
 }
 
+// expiryMilliseconds resolves a command's TTL against its effective schedule.
+// The window opens at the later of "now" and NotBefore so a scheduled send is
+// never born expired: ValidateTTL admits only 0 (no expiry) or 1ms..MaxTTL,
+// and any TTL of at least 1ms puts expires_at_ms at or after
+// scheduled_for_ms+1 for every sub-millisecond phase of scheduledFor.
+func expiryMilliseconds(cmd CommonCommand, scheduledFor time.Time) (int64, error) {
+	if err := ValidateTTL(cmd.TTL); err != nil {
+		return 0, err
+	}
+	if cmd.TTL == 0 {
+		return 0, nil
+	}
+	return scheduledFor.Add(cmd.TTL).UnixMilli(), nil
+}
+
+// nearDuplicateCheck builds the enqueue-time near-duplicate guard for cmd, or
+// nil when the guard does not apply: the command did not opt in
+// (GuardNearDuplicates), carries Force, or the service's window is disabled.
+// The check itself runs inside the enqueue transaction (see
+// sqlite.NearDuplicateCheck), so it is consulted only for a new idempotency
+// key and is atomic with the insert.
+func (s *MessageService) nearDuplicateCheck(cmd SendTextCommand, now time.Time) *sqlite.NearDuplicateCheck {
+	if !cmd.GuardNearDuplicates || cmd.Force || s.duplicateWindow <= 0 {
+		return nil
+	}
+	sinceMS := now.Add(-s.duplicateWindow).UnixMilli()
+	if sinceMS < 1 {
+		sinceMS = 1
+	}
+	body, threshold := cmd.Body, s.duplicateThreshold
+	return &sqlite.NearDuplicateCheck{
+		SinceMS: sinceMS,
+		Limit:   duplicateCandidateLimit,
+		Matches: func(prior string) bool { return textsNearDuplicate(body, prior, threshold) },
+	}
+}
+
+// duplicateSendError reports the prior intent that refused a guarded
+// submission. A prior stamped later than now (clock skew between processes
+// sharing one store) reports age zero rather than a negative age.
+func duplicateSendError(prior sqlite.RecentTextIntent, now time.Time) *DuplicateSendError {
+	ageMS := now.UnixMilli() - prior.CreatedAtMS
+	if ageMS < 0 {
+		ageMS = 0
+	}
+	return &DuplicateSendError{
+		PriorOutboxID:       prior.OutboxID,
+		PriorState:          prior.State,
+		PriorIdempotencyKey: prior.IdempotencyKey,
+		PriorAgeMS:          ageMS,
+	}
+}
+
+// guardSimilarity scores how alike two message bodies are for the
+// near-duplicate guard, in [0, 1]. Bodies are compared after case folding and
+// whitespace collapsing (normalizeGuardText). An empty normalized body scores
+// 0 against anything; equal non-empty normalized bodies score 1; otherwise the
+// score is 1 - levenshtein/longer length over at most the first
+// duplicateCompareMaxRunes normalized runes of each body. The truncation is
+// deliberate (it bounds the work done while the enqueue holds the write
+// reservation), so two long bodies that share their first
+// duplicateCompareMaxRunes normalized runes score 1 whatever follows.
+func guardSimilarity(a, b string) float64 {
+	ra, rb, score, decided := guardOperands(a, b)
+	if decided {
+		return score
+	}
+	return 1 - float64(levenshtein(ra, rb))/float64(max(len(ra), len(rb)))
+}
+
+// textsNearDuplicate reports whether two message bodies are the same message
+// for guard purposes: guardSimilarity(a, b) >= threshold, where an empty
+// normalized body never matches. It computes exactly that comparison with a
+// length prefilter: the edit distance is at least the length difference, so a
+// pair whose lengths alone rule out the threshold skips the quadratic
+// edit-distance computation.
+func textsNearDuplicate(a, b string, threshold float64) bool {
+	ra, rb, score, decided := guardOperands(a, b)
+	if decided {
+		return score > 0 && score >= threshold
+	}
+	longest := max(len(ra), len(rb))
+	lengthGap := len(ra) - len(rb)
+	if lengthGap < 0 {
+		lengthGap = -lengthGap
+	}
+	if 1-float64(lengthGap)/float64(longest) < threshold {
+		return false
+	}
+	return 1-float64(levenshtein(ra, rb))/float64(longest) >= threshold
+}
+
+// guardOperands normalizes two bodies for comparison. It decides the score
+// outright when either normalized body is empty (0) or both are equal (1);
+// otherwise it returns both as runes truncated to duplicateCompareMaxRunes,
+// each non-empty.
+func guardOperands(a, b string) (ra, rb []rune, score float64, decided bool) {
+	na, nb := normalizeGuardText(a), normalizeGuardText(b)
+	switch {
+	case na == "" || nb == "":
+		return nil, nil, 0, true
+	case na == nb:
+		return nil, nil, 1, true
+	}
+	return truncateGuardRunes(na), truncateGuardRunes(nb), 0, false
+}
+
+func truncateGuardRunes(value string) []rune {
+	runes := []rune(value)
+	if len(runes) > duplicateCompareMaxRunes {
+		runes = runes[:duplicateCompareMaxRunes]
+	}
+	return runes
+}
+
+func normalizeGuardText(value string) string {
+	return strings.Join(strings.Fields(strings.ToLower(value)), " ")
+}
+
+// levenshtein is the classic two-row edit distance over runes.
+func levenshtein(a, b []rune) int {
+	if len(a) == 0 {
+		return len(b)
+	}
+	if len(b) == 0 {
+		return len(a)
+	}
+	previous := make([]int, len(b)+1)
+	current := make([]int, len(b)+1)
+	for j := range previous {
+		previous[j] = j
+	}
+	for i := 1; i <= len(a); i++ {
+		current[0] = i
+		for j := 1; j <= len(b); j++ {
+			substitution := previous[j-1]
+			if a[i-1] != b[j-1] {
+				substitution++
+			}
+			insertion := current[j-1] + 1
+			deletion := previous[j] + 1
+			best := substitution
+			if insertion < best {
+				best = insertion
+			}
+			if deletion < best {
+				best = deletion
+			}
+			current[j] = best
+		}
+		previous, current = current, previous
+	}
+	return previous[len(b)]
+}
+
 func (s *MessageService) newSubmissionIDs() (string, string, string, error) {
 	values := make([]string, 3)
 	for i := range values {
@@ -1077,6 +1292,11 @@ func validateSendMediaCommand(cmd *SendMediaCommand) error {
 	}
 	if !cmd.NotBefore.IsZero() && cmd.NotBefore.UnixMilli() <= 0 {
 		return fmt.Errorf("%w: scheduled Unix time is not positive", ErrInvalidCommand)
+	}
+	// SendMedia writes the blob before it computes the expiry, so an
+	// out-of-range window is refused here, before that write.
+	if err := ValidateTTL(cmd.TTL); err != nil {
+		return err
 	}
 	return nil
 }
@@ -1219,26 +1439,38 @@ func readPayloadHash(deviceID, lastReadMessageID string) (string, error) {
 }
 
 func submissionFromItem(item sqlite.OutboxItem, disposition sqlite.EnqueueDisposition) Submission {
-	return Submission{
+	submission := Submission{
 		OutboxID:       item.OutboxID,
 		LocalMessageID: stringValue(item.LocalMessageID),
 		State:          item.State,
 		ScheduledFor:   time.UnixMilli(item.ScheduledForMS),
 		Deduplicated:   disposition == sqlite.EnqueueExisting,
 	}
+	if item.ExpiresAtMS != nil {
+		submission.ExpiresAt = time.UnixMilli(*item.ExpiresAtMS)
+	}
+	return submission
 }
 
 func deliveryFromItem(item sqlite.OutboxItem) Delivery {
 	delivery := Delivery{
 		OutboxID:        item.OutboxID,
+		AccountID:       item.AccountID,
+		ConversationID:  item.ConversationID,
 		State:           item.State,
 		LocalMessageID:  stringValue(item.LocalMessageID),
 		RemoteMessageID: stringValue(item.ResultRemoteID),
 		ErrorClass:      stringValue(item.ErrorClass),
 		ErrorCode:       stringValue(item.ErrorCode),
 	}
+	if item.ExpiresAtMS != nil {
+		delivery.ExpiresAt = time.UnixMilli(*item.ExpiresAtMS)
+	}
 	if item.State == sqlite.OutboxUncertain {
 		delivery.Warning = "delivery outcome is unknown"
+	}
+	if delivery.Expired() {
+		delivery.Warning = "the send window expired before the message reached the transport; it was NOT sent"
 	}
 	return delivery
 }

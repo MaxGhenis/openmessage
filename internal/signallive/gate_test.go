@@ -178,6 +178,9 @@ func TestSignalCLIVersionGateParksBelowMinimumBeforeAccountOrReceive(t *testing.
 	if !bytes.Contains(encodedStatus, []byte(`"upgrade_required":true`)) {
 		t.Fatalf("status JSON = %s, want upgrade_required=true", encodedStatus)
 	}
+	if status.ParkFingerprint != SignalCLIVersionFingerprint {
+		t.Fatalf("park_fingerprint = %q, want %q", status.ParkFingerprint, SignalCLIVersionFingerprint)
+	}
 	if got := versionCalls.Load(); got != 1 {
 		t.Fatalf("version probe calls = %d, want 1", got)
 	}
@@ -380,6 +383,9 @@ func TestRepeatedSignalReceivePoisonParksAtThresholdAndCannotAutoRestart(t *test
 	if got := receiveCalls.Load(); got != int32(receivePoisonLimit) {
 		t.Fatalf("receive calls at park = %d, want exact poison threshold %d", got, receivePoisonLimit)
 	}
+	if status.ParkFingerprint != signalGetSenderPoisonFingerprint {
+		t.Fatalf("poison park_fingerprint = %q, want %q", status.ParkFingerprint, signalGetSenderPoisonFingerprint)
+	}
 
 	versionBefore := versionCalls.Load()
 	receiveBefore := receiveCalls.Load()
@@ -565,8 +571,9 @@ func TestStartPollerClassifiesAccountInvalidAtInitialProbe(t *testing.T) {
 	if got := probeCalls.Load(); got != int32(len(accountProbeRetryDelays)+1) {
 		t.Fatalf("account probe attempts = %d, want %d", got, len(accountProbeRetryDelays)+1)
 	}
-	if status := bridge.Status(); !status.NeedsReauth || status.Connected || status.Connecting {
-		t.Fatalf("account-invalid status = %+v, want parked reauth", status)
+	if status := bridge.Status(); !status.NeedsReauth || status.Connected || status.Connecting ||
+		status.ParkFingerprint != SignalAccountInvalidFingerprint {
+		t.Fatalf("account-invalid status = %+v, want parked reauth under %s", status, SignalAccountInvalidFingerprint)
 	}
 }
 
@@ -697,8 +704,9 @@ func TestStartPollerEmptyProbeWithStoredAccountStaysTransientUntilStreakParks(t 
 	if exit.Kind != PollerFailureReauth || exit.Fingerprint != SignalAccountUnreadableFingerprint {
 		t.Fatalf("streak-limit exit = %+v, want reauth/%s", exit, SignalAccountUnreadableFingerprint)
 	}
-	if status := bridge.Status(); !status.NeedsReauth || !status.Paired || status.Connected {
-		t.Fatalf("streak-limit status = %+v, want parked reauth on a still-paired account", status)
+	if status := bridge.Status(); !status.NeedsReauth || !status.Paired || status.Connected ||
+		status.ParkFingerprint != exit.Fingerprint {
+		t.Fatalf("streak-limit status = %+v, want parked reauth on a still-paired account under %s", status, exit.Fingerprint)
 	}
 }
 
@@ -885,8 +893,9 @@ func TestReceiveAccountInvalidConsecutiveFailuresParkReauth(t *testing.T) {
 	if got := receiveCalls.Load(); got != receiveAccountInvalidLimit {
 		t.Fatalf("receive attempts before park = %d, want %d", got, receiveAccountInvalidLimit)
 	}
-	if status := bridge.Status(); !status.NeedsReauth || status.Connected {
-		t.Fatalf("consecutive account-invalid status = %+v, want parked reauth", status)
+	if status := bridge.Status(); !status.NeedsReauth || status.Connected ||
+		status.ParkFingerprint != SignalAccountInvalidFingerprint {
+		t.Fatalf("consecutive account-invalid status = %+v, want parked reauth under %s", status, SignalAccountInvalidFingerprint)
 	}
 }
 

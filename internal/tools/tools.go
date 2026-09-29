@@ -29,6 +29,16 @@ type Options struct {
 	// HTTP API. Mutually exclusive with V2 (client mode never runs its own
 	// dispatcher).
 	Daemon *localapi.Client
+
+	// TransportsEnabled reports whether this process owns live platform
+	// connections. In-process send capability (get_status, route discovery)
+	// computes from it exactly as the daemon's /api/status send block does,
+	// so `serve --no-transports` says no platform can send instead of
+	// reading a bridge nobody is driving. The zero value is the fail-safe
+	// "no transports"; cmd serve sets it from its transports flag, and the
+	// legacy entry points (Register, handlers built without Options) keep
+	// their historical transports-on assumption. Unused in client mode.
+	TransportsEnabled bool
 }
 
 func Register(s *server.MCPServer, a *app.App, v2 ...*V2Dependencies) {
@@ -36,7 +46,7 @@ func Register(s *server.MCPServer, a *app.App, v2 ...*V2Dependencies) {
 	if len(v2) > 0 {
 		configuredV2 = v2[0]
 	}
-	RegisterWithOptions(s, a, Options{Reads: a.Store, V2: configuredV2})
+	RegisterWithOptions(s, a, Options{Reads: a.Store, V2: configuredV2, TransportsEnabled: true})
 }
 
 // RegisterWithOptions registers the MCP surface against an explicit serving
@@ -80,10 +90,21 @@ func RegisterWithOptions(s *server.MCPServer, a *app.App, options Options) {
 	} else {
 		s.AddTool(reactToMessageTool(), reactToMessageHandler(a))
 	}
+	switch {
+	case options.Daemon != nil:
+		s.AddTool(listOutboxTool(), daemonListOutboxHandler(options))
+		s.AddTool(cancelOutboxTool(), daemonCancelOutboxHandler(options))
+	case configuredV2 != nil:
+		s.AddTool(listOutboxTool(), v2ListOutboxHandler(configuredV2))
+		s.AddTool(cancelOutboxTool(), v2CancelOutboxHandler(configuredV2))
+	default:
+		s.AddTool(listOutboxTool(), outboxUnavailableHandler())
+		s.AddTool(cancelOutboxTool(), outboxUnavailableHandler())
+	}
 	s.AddTool(setMessageTranscriptTool(), setMessageTranscriptHandler(a))
 	s.AddTool(listConversationsTool(), listConversationsHandler(a, options))
 	s.AddTool(listContactsTool(), listContactsHandler(a))
-	s.AddTool(resolveContactRoutesTool(), resolveContactRoutesHandler(a))
+	s.AddTool(resolveContactRoutesTool(), resolveContactRoutesHandler(a, options))
 	if options.Daemon != nil {
 		s.AddTool(getStatusTool(), daemonGetStatusHandler(a, options))
 	} else {
@@ -131,7 +152,9 @@ func unavailableInV2Primary(primary bool, legacy server.ToolHandlerFunc) server.
 }
 
 func resolvedOptions(a *app.App, configured []Options) Options {
-	options := Options{Reads: a.Store}
+	// A handler built without Options is the legacy in-process shape, which
+	// always owned its transports.
+	options := Options{Reads: a.Store, TransportsEnabled: true}
 	if len(configured) > 0 {
 		options = configured[0]
 		if options.Reads == nil {

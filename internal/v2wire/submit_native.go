@@ -58,10 +58,13 @@ func SubmitTextV2(
 	}
 	return deps.Service.SendText(ctx, messaging.SendTextCommand{
 		CommonCommand: messaging.CommonCommand{
-			AccountID:      conversation.AccountID,
-			ConversationID: conversation.ConversationID,
-			IdempotencyKey: input.IdempotencyKey,
-			NotBefore:      input.NotBefore,
+			AccountID:           conversation.AccountID,
+			ConversationID:      conversation.ConversationID,
+			IdempotencyKey:      input.IdempotencyKey,
+			NotBefore:           input.NotBefore,
+			TTL:                 input.TTL,
+			GuardNearDuplicates: input.GuardNearDuplicates,
+			Force:               input.Force,
 		},
 		Body:             input.Body,
 		ReplyToMessageID: replyToMessageID,
@@ -109,6 +112,7 @@ func SubmitMediaV2(
 			ConversationID: conversation.ConversationID,
 			IdempotencyKey: input.IdempotencyKey,
 			NotBefore:      input.NotBefore,
+			TTL:            input.TTL,
 		},
 		Content:          input.Content,
 		Filename:         input.Filename,

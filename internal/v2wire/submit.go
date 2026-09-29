@@ -28,6 +28,12 @@ type TextInput struct {
 	ReplyToID      string
 	IdempotencyKey string
 	NotBefore      time.Time
+	TTL            time.Duration
+	// GuardNearDuplicates and Force pass through to messaging.CommonCommand
+	// unchanged. v2wire is not an entry point and makes no guard-scope
+	// decision; each caller (MCP, HTTP, CLI via HTTP) sets them.
+	GuardNearDuplicates bool
+	Force               bool
 }
 
 type MediaInput struct {
@@ -39,6 +45,7 @@ type MediaInput struct {
 	ReplyToID      string
 	IdempotencyKey string
 	NotBefore      time.Time
+	TTL            time.Duration
 }
 
 // SubmitText mirrors only the graph needed by the durable service, rejects
@@ -75,10 +82,13 @@ func SubmitText(ctx context.Context, deps Deps, input TextInput) (messaging.Subm
 	}
 	return deps.Service.SendText(ctx, messaging.SendTextCommand{
 		CommonCommand: messaging.CommonCommand{
-			AccountID:      accountID,
-			ConversationID: conversationID,
-			IdempotencyKey: input.IdempotencyKey,
-			NotBefore:      input.NotBefore,
+			AccountID:           accountID,
+			ConversationID:      conversationID,
+			IdempotencyKey:      input.IdempotencyKey,
+			NotBefore:           input.NotBefore,
+			TTL:                 input.TTL,
+			GuardNearDuplicates: input.GuardNearDuplicates,
+			Force:               input.Force,
 		},
 		Body:             input.Body,
 		ReplyToMessageID: replyToMessageID,
@@ -121,6 +131,7 @@ func SubmitMedia(ctx context.Context, deps Deps, input MediaInput) (messaging.Su
 			ConversationID: conversationID,
 			IdempotencyKey: input.IdempotencyKey,
 			NotBefore:      input.NotBefore,
+			TTL:            input.TTL,
 		},
 		Content:          input.Content,
 		Filename:         input.Filename,

@@ -204,6 +204,12 @@ func CarryPendingOutbox(
 			TransportRequestID: intent.TransportRequestID,
 			ScheduledForMS:     intent.ScheduledForMS,
 		}
+		// A carried intent keeps its send window: if the window closed while
+		// the stores were cut over, the fresh store's expiry sweep cancels it
+		// instead of transmitting stale.
+		if intent.ExpiresAtMS != nil {
+			item.ExpiresAtMS = *intent.ExpiresAtMS
+		}
 		message := sqlite.Message{
 			MessageID:       *intent.LocalMessageID,
 			ConversationID:  conversation.ConversationID,

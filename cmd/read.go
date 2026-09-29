@@ -15,7 +15,6 @@ import (
 	"github.com/maxghenis/openmessage/internal/app"
 	"github.com/maxghenis/openmessage/internal/db"
 	"github.com/maxghenis/openmessage/internal/readsource"
-	"github.com/maxghenis/openmessage/internal/storage/sqlite"
 	"github.com/maxghenis/openmessage/internal/v2read"
 )
 
@@ -43,9 +42,12 @@ func openCommandReadSource(
 	}
 	if mode.Primary {
 		storePath := filepath.Join(dataDir, "v2", "store.sqlite3")
-		store, err := sqlite.Open(storePath)
+		// Read-only and migration-free: read and status are advertised as
+		// read-only commands, and the running app is the only process that
+		// migrates the v2 store it shares with them.
+		store, _, err := openV2ReadStore(storePath)
 		if err != nil {
-			return nil, fmt.Errorf("open v2 read store %q: %w", storePath, err)
+			return nil, err
 		}
 		if banner != nil {
 			fmt.Fprintln(banner, "reading v2 store")
@@ -62,7 +64,9 @@ func openCommandReadSource(
 
 	// NewClient, not New: read and status are advertised as read-only
 	// commands, and the daemon owns the startup repair sweeps — a one-shot
-	// reader must not write to the live store it shares with the running app.
+	// reader must not replay them against the live store it shares with the
+	// running app. Unlike the v2 branch above, this open is not yet
+	// read-only: db.New still runs the legacy schema migrate step.
 	a, err := app.NewClient(logger)
 	if err != nil {
 		return nil, fmt.Errorf("init app: %w", err)
