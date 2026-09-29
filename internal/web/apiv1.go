@@ -128,7 +128,11 @@ func (a *v1API) submitText(w http.ResponseWriter, r *http.Request) {
 		IdempotencyKey string `json:"idempotency_key"`
 		NotBeforeMS    *int64 `json:"not_before_ms,omitempty"`
 		TTLMS          *int64 `json:"ttl_ms,omitempty"`
-		Force          bool   `json:"force,omitempty"`
+		// GuardNearDuplicates opts this submission into the near-duplicate
+		// guard (see httpDuplicateGuard). Agent clients (MCP daemon mode,
+		// the CLI) send true; the web UI omits it.
+		GuardNearDuplicates bool `json:"guard_near_duplicates,omitempty"`
+		Force               bool `json:"force,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
 		httpError(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
@@ -159,13 +163,14 @@ func (a *v1API) submitText(w http.ResponseWriter, r *http.Request) {
 	}
 
 	input := v2wire.TextInput{
-		ConversationID: conversationID,
-		Body:           request.Body,
-		ReplyToID:      strings.TrimSpace(request.ReplyToID),
-		IdempotencyKey: idempotencyKey,
-		NotBefore:      notBefore,
-		TTL:            ttl,
-		Force:          request.Force,
+		ConversationID:      conversationID,
+		Body:                request.Body,
+		ReplyToID:           strings.TrimSpace(request.ReplyToID),
+		IdempotencyKey:      idempotencyKey,
+		NotBefore:           notBefore,
+		TTL:                 ttl,
+		GuardNearDuplicates: httpDuplicateGuard(request.GuardNearDuplicates),
+		Force:               request.Force,
 	}
 	var submission messaging.Submission
 	if a.primary {
@@ -458,7 +463,47 @@ func (a *v1API) internalUnavailable(w http.ResponseWriter, detail string) {
 	httpError(w, "v2_send_unavailable", http.StatusServiceUnavailable)
 }
 
+// httpDuplicateGuard is the single place that decides whether an HTTP text
+// submission runs the near-duplicate guard. Scope (d472 Variant A): only
+// submissions that ask for it are guarded. Agent clients (MCP daemon mode and
+// the CLI) send guard_near_duplicates:true; the web UI omits it, so a person
+// typing "ok" twice, or correcting "there at 7" to "there at 8", is never
+// blocked. Guarding every HTTP submission (Variant B) would change only this
+// function, plus a UI override for the structured 409.
+func httpDuplicateGuard(requested bool) bool {
+	return requested
+}
+
+// NearDuplicateErrorKind is the error_kind of the HTTP 409 a guarded text
+// submission receives when it is refused as a near-duplicate.
+// localapi.NearDuplicateErrorKind mirrors it for clients.
+const NearDuplicateErrorKind = "near_duplicate_blocked"
+
+// v1DuplicateConflictResponse is the structured 409 body for a near-duplicate
+// refusal. Error keeps the "near-duplicate" wording that clients predating
+// error_kind match on.
+type v1DuplicateConflictResponse struct {
+	Error               string `json:"error"`
+	ErrorKind           string `json:"error_kind"`
+	DuplicateOfOutboxID string `json:"duplicate_of_outbox_id"`
+	DuplicateState      string `json:"duplicate_state"`
+	DuplicateAgeMS      int64  `json:"duplicate_age_ms"`
+}
+
 func (a *v1API) writeError(w http.ResponseWriter, err error) {
+	var duplicate *messaging.DuplicateSendError
+	if errors.As(err, &duplicate) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_ = json.NewEncoder(w).Encode(v1DuplicateConflictResponse{
+			Error:               duplicate.Error(),
+			ErrorKind:           NearDuplicateErrorKind,
+			DuplicateOfOutboxID: duplicate.PriorOutboxID,
+			DuplicateState:      string(duplicate.PriorState),
+			DuplicateAgeMS:      duplicate.PriorAgeMS,
+		})
+		return
+	}
 	code, message := v1ErrorResponse(err)
 	if code == http.StatusInternalServerError {
 		a.logger.Error().Err(err).Msg("V2 API request failed")

@@ -249,10 +249,70 @@ type OutboxRepository struct {
 }
 
 type enqueueCarriers struct {
-	attachment  *OutboxAttachment
-	reaction    *OutboxReaction
-	readReceipt *OutboxReadReceipt
-	readCursor  *ReadCursor
+	attachment    *OutboxAttachment
+	reaction      *OutboxReaction
+	readReceipt   *OutboxReadReceipt
+	readCursor    *ReadCursor
+	nearDuplicate *NearDuplicateCheck
+}
+
+// NearDuplicateCheck asks a text enqueue to refuse a genuinely new intent when
+// a recent intent in the same account and conversation matches it.
+//
+// The check runs inside the enqueue's write transaction, after the
+// idempotency-key lookup, and only when that lookup inserted a new row:
+//   - a replay of an existing key returns the stored intent (or conflicts on a
+//     changed payload) and never consults the check, so a sibling intent under
+//     another key can never block the documented safe retry;
+//   - every store connection begins write transactions with BEGIN IMMEDIATE
+//     (see storeDSN), so the candidate read and the insert hold SQLite's write
+//     reservation together. Two concurrent new intents, in one process or
+//     several, therefore cannot both pass the check.
+//
+// Matches runs while that write reservation is held: it must be pure (no
+// database access) and cheap.
+type NearDuplicateCheck struct {
+	// SinceMS is the oldest created_at_ms a candidate may have (inclusive).
+	SinceMS int64
+	// Limit caps how many of the newest candidates are compared.
+	Limit int
+	// Matches reports whether a candidate's body is a near-duplicate of the
+	// body being enqueued.
+	Matches func(priorBody string) bool
+}
+
+// NearDuplicateError names the prior intent that matched a NearDuplicateCheck.
+// The refused enqueue wrote nothing: its transaction was rolled back.
+type NearDuplicateError struct {
+	Prior RecentTextIntent
+}
+
+func (e *NearDuplicateError) Error() string {
+	return fmt.Sprintf(
+		"%v: matches outbox item %q (state %s)",
+		ErrNearDuplicate,
+		e.Prior.OutboxID,
+		e.Prior.State,
+	)
+}
+
+func (e *NearDuplicateError) Unwrap() error { return ErrNearDuplicate }
+
+func validateNearDuplicateCheck(item NewOutboxItem, message *Message, check *NearDuplicateCheck) error {
+	if check == nil {
+		return nil
+	}
+	switch {
+	case item.Kind != OutboxKindText || message == nil:
+		return fmt.Errorf("near-duplicate check applies only to text intents with a message")
+	case check.Limit <= 0:
+		return fmt.Errorf("near-duplicate check limit must be positive")
+	case check.SinceMS <= 0:
+		return fmt.Errorf("near-duplicate check window start must be positive")
+	case check.Matches == nil:
+		return fmt.Errorf("near-duplicate check matcher is nil")
+	}
+	return nil
 }
 
 // NewOutboxRepository creates an outbox repository. The clock is required so
@@ -290,6 +350,19 @@ func (r *OutboxRepository) EnqueueOutgoingMessage(
 	message Message,
 ) (OutboxItem, EnqueueDisposition, error) {
 	return r.enqueue(ctx, item, &message, enqueueCarriers{})
+}
+
+// EnqueueOutgoingMessageGuarded is EnqueueOutgoingMessage for a text intent
+// with an optional NearDuplicateCheck serialized with the insert. A nil check
+// behaves exactly like EnqueueOutgoingMessage. A refusal returns a
+// *NearDuplicateError (errors.Is ErrNearDuplicate) and writes nothing.
+func (r *OutboxRepository) EnqueueOutgoingMessageGuarded(
+	ctx context.Context,
+	item NewOutboxItem,
+	message Message,
+	check *NearDuplicateCheck,
+) (OutboxItem, EnqueueDisposition, error) {
+	return r.enqueue(ctx, item, &message, enqueueCarriers{nearDuplicate: check})
 }
 
 // EnqueueOutgoingMediaMessage atomically inserts a media intent, its
@@ -433,6 +506,9 @@ func (r *OutboxRepository) enqueue(
 	if err := validateOutboxAttachmentPair(item, carriers); err != nil {
 		return OutboxItem{}, "", fmt.Errorf("enqueue outbox item %q: %w", item.OutboxID, err)
 	}
+	if err := validateNearDuplicateCheck(item, message, carriers.nearDuplicate); err != nil {
+		return OutboxItem{}, "", fmt.Errorf("enqueue outbox item %q: %w", item.OutboxID, err)
+	}
 	nowMS, err := r.nowMS("enqueue outbox item")
 	if err != nil {
 		return OutboxItem{}, "", err
@@ -556,6 +632,32 @@ func (r *OutboxRepository) enqueue(
 	if disposition == EnqueueExisting && row.Kind == OutboxKindRead {
 		if err := validateExistingOutboxReadReceipt(ctx, tx, row.OutboxID); err != nil {
 			return OutboxItem{}, "", err
+		}
+	}
+	// The near-duplicate check runs only for a genuinely new intent: an
+	// existing key was resolved above (returned or conflicted) without
+	// consulting it. The candidate read happens inside this BEGIN IMMEDIATE
+	// transaction, so no other writer can insert a competing intent between
+	// the read and this commit. A refusal returns before commit; the deferred
+	// rollback discards the outbox row inserted above.
+	if disposition == EnqueueInserted && carriers.nearDuplicate != nil {
+		check := carriers.nearDuplicate
+		candidates, err := listRecentTextIntents(
+			ctx,
+			tx,
+			item.AccountID,
+			item.ConversationID,
+			check.SinceMS,
+			check.Limit,
+			item.OutboxID,
+		)
+		if err != nil {
+			return OutboxItem{}, "", fmt.Errorf("enqueue outbox item %q: near-duplicate check: %w", item.OutboxID, err)
+		}
+		for _, candidate := range candidates {
+			if check.Matches(candidate.Body) {
+				return OutboxItem{}, "", &NearDuplicateError{Prior: candidate}
+			}
 		}
 	}
 	if disposition == EnqueueInserted && message != nil {
@@ -1483,7 +1585,8 @@ func (r *OutboxRepository) CancelExpired(ctx context.Context, now time.Time) ([]
 	return ids, nil
 }
 
-// RecentTextIntent is one prior text send used by the near-duplicate guard.
+// RecentTextIntent is one prior text send considered by the near-duplicate
+// check.
 type RecentTextIntent struct {
 	OutboxID       string
 	IdempotencyKey string
@@ -1492,22 +1595,32 @@ type RecentTextIntent struct {
 	CreatedAtMS    int64
 }
 
-// ListRecentTextIntents returns text intents created at or after sinceMS in
-// one conversation, newest first, excluding states proven not to have sent
+// recentTextIntentQueryer is satisfied by *sql.Tx; the near-duplicate check
+// always reads its candidates inside the enqueue's write transaction.
+type recentTextIntentQueryer interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+}
+
+// listRecentTextIntents returns the newest limit text intents created at or
+// after sinceMS in one account and conversation, other than excludeOutboxID
+// (the row being enqueued), excluding states proven not to have sent
 // (rejected, canceled). Everything else — queued, dispatching, retrying,
 // uncertain, and confirmed — did or still may reach the recipient, so a
-// near-duplicate submission against any of them deserves the guard.
-func (r *OutboxRepository) ListRecentTextIntents(
+// near-duplicate submission against any of them deserves the guard. Media
+// intents are never candidates: their captions are not text sends.
+func listRecentTextIntents(
 	ctx context.Context,
+	queryer recentTextIntentQueryer,
 	accountID string,
 	conversationID string,
 	sinceMS int64,
 	limit int,
+	excludeOutboxID string,
 ) ([]RecentTextIntent, error) {
 	if limit <= 0 {
 		return nil, fmt.Errorf("list recent text intents: limit must be positive")
 	}
-	rows, err := r.store.db.QueryContext(ctx, `
+	rows, err := queryer.QueryContext(ctx, `
 		SELECT o.outbox_id, o.idempotency_key, o.state, COALESCE(m.body, ''), o.created_at_ms
 		FROM outbox o
 		LEFT JOIN messages m ON m.message_id = o.local_message_id
@@ -1516,9 +1629,10 @@ func (r *OutboxRepository) ListRecentTextIntents(
 		  AND o.kind = 'text'
 		  AND o.created_at_ms >= ?
 		  AND o.state NOT IN ('rejected', 'canceled')
+		  AND o.outbox_id <> ?
 		ORDER BY o.created_at_ms DESC, o.outbox_id DESC
 		LIMIT ?
-	`, accountID, conversationID, sinceMS, limit)
+	`, accountID, conversationID, sinceMS, excludeOutboxID, limit)
 	if err != nil {
 		return nil, fmt.Errorf("list recent text intents: query: %w", err)
 	}

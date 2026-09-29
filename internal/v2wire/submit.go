@@ -29,7 +29,11 @@ type TextInput struct {
 	IdempotencyKey string
 	NotBefore      time.Time
 	TTL            time.Duration
-	Force          bool
+	// GuardNearDuplicates and Force pass through to messaging.CommonCommand
+	// unchanged. v2wire is not an entry point and makes no guard-scope
+	// decision; each caller (MCP, HTTP, CLI via HTTP) sets them.
+	GuardNearDuplicates bool
+	Force               bool
 }
 
 type MediaInput struct {
@@ -78,12 +82,13 @@ func SubmitText(ctx context.Context, deps Deps, input TextInput) (messaging.Subm
 	}
 	return deps.Service.SendText(ctx, messaging.SendTextCommand{
 		CommonCommand: messaging.CommonCommand{
-			AccountID:      accountID,
-			ConversationID: conversationID,
-			IdempotencyKey: input.IdempotencyKey,
-			NotBefore:      input.NotBefore,
-			TTL:            input.TTL,
-			Force:          input.Force,
+			AccountID:           accountID,
+			ConversationID:      conversationID,
+			IdempotencyKey:      input.IdempotencyKey,
+			NotBefore:           input.NotBefore,
+			TTL:                 input.TTL,
+			GuardNearDuplicates: input.GuardNearDuplicates,
+			Force:               input.Force,
 		},
 		Body:             input.Body,
 		ReplyToMessageID: replyToMessageID,

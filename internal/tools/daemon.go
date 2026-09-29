@@ -113,8 +113,8 @@ func daemonCheckPlatformSendable(status localapi.DaemonStatus, platform string) 
 // a transport bug and has sent agents down the wrong path (2026-08-05:
 // WhatsApp sends 404ing while status showed the platform connected).
 func daemonRejectionResult(err error, conversationID, platform string) *mcp.CallToolResult {
-	if responseErr, ok := isDaemonDuplicateRejection(err); ok {
-		return daemonDuplicateBlockedResult(responseErr)
+	if rejection, ok := localapi.AsNearDuplicateRejection(err); ok {
+		return daemonDuplicateBlockedResult(rejection)
 	}
 	if responseErr, ok := localapi.AsResponseError(err); ok && responseErr.StatusCode == 404 {
 		platformNote := ""
@@ -183,7 +183,10 @@ func daemonSubmitTextAndWait(
 		ConversationID: conversationID,
 		Body:           body,
 		IdempotencyKey: key,
-		Force:          force,
+		// MCP is an agent entry point: ask the daemon to guard this send
+		// against near-duplicates, exactly like the in-process path.
+		GuardNearDuplicates: true,
+		Force:               force,
 	}
 	if ttl > 0 {
 		ttlMS := ttl.Milliseconds()

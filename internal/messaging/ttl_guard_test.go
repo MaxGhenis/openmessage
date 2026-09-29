@@ -157,7 +157,7 @@ func TestNearDuplicateSendBlockedThenForced(t *testing.T) {
 	service := newMessagingTestService(t, store, registry, clock)
 
 	first := mustSendText(t, service, SendTextCommand{
-		CommonCommand: testCommonCommand("key-dup-first"),
+		CommonCommand: guardedCommonCommand("key-dup-first"),
 		Body:          "Lunch tomorrow at noon at Sfoglina?",
 	})
 
@@ -165,7 +165,7 @@ func TestNearDuplicateSendBlockedThenForced(t *testing.T) {
 	// later. Must be blocked with the prior intent named.
 	clock.Advance(2 * time.Minute)
 	_, err := service.SendText(context.Background(), SendTextCommand{
-		CommonCommand: testCommonCommand("key-dup-second"),
+		CommonCommand: guardedCommonCommand("key-dup-second"),
 		Body:          "Lunch today at noon at Sfoglina?",
 	})
 	if !errors.Is(err, ErrDuplicateSend) {
@@ -183,7 +183,7 @@ func TestNearDuplicateSendBlockedThenForced(t *testing.T) {
 	}
 
 	// Force is the explicit override for a deliberate repeat.
-	forced := testCommonCommand("key-dup-forced")
+	forced := guardedCommonCommand("key-dup-forced")
 	forced.Force = true
 	mustSendText(t, service, SendTextCommand{
 		CommonCommand: forced,
@@ -200,18 +200,18 @@ func TestNearDuplicateGuardScope(t *testing.T) {
 	seedConversation(t, store, "account-1", "conversation-2", clock.Now())
 
 	mustSendText(t, service, SendTextCommand{
-		CommonCommand: testCommonCommand("key-scope-first"),
+		CommonCommand: guardedCommonCommand("key-scope-first"),
 		Body:          "Lunch tomorrow at noon at Sfoglina?",
 	})
 
 	// A different message to the same conversation passes.
 	mustSendText(t, service, SendTextCommand{
-		CommonCommand: testCommonCommand("key-scope-different"),
+		CommonCommand: guardedCommonCommand("key-scope-different"),
 		Body:          "Completely unrelated: did you see the game?",
 	})
 
 	// The same message to a DIFFERENT conversation passes.
-	other := testCommonCommand("key-scope-other-conversation")
+	other := guardedCommonCommand("key-scope-other-conversation")
 	other.ConversationID = "conversation-2"
 	mustSendText(t, service, SendTextCommand{
 		CommonCommand: other,
@@ -220,18 +220,18 @@ func TestNearDuplicateGuardScope(t *testing.T) {
 
 	// Short conversational repeats pass ("ok" / "ok!").
 	mustSendText(t, service, SendTextCommand{
-		CommonCommand: testCommonCommand("key-scope-ok-1"),
+		CommonCommand: guardedCommonCommand("key-scope-ok-1"),
 		Body:          "ok",
 	})
 	mustSendText(t, service, SendTextCommand{
-		CommonCommand: testCommonCommand("key-scope-ok-2"),
+		CommonCommand: guardedCommonCommand("key-scope-ok-2"),
 		Body:          "ok!",
 	})
 
 	// Outside the window, the same body passes again.
 	clock.Advance(11 * time.Minute)
 	mustSendText(t, service, SendTextCommand{
-		CommonCommand: testCommonCommand("key-scope-after-window"),
+		CommonCommand: guardedCommonCommand("key-scope-after-window"),
 		Body:          "Lunch tomorrow at noon at Sfoglina?",
 	})
 }
@@ -243,13 +243,13 @@ func TestSameKeyReplayBypassesDuplicateGuard(t *testing.T) {
 	service := newMessagingTestService(t, store, registry, clock)
 
 	first := mustSendText(t, service, SendTextCommand{
-		CommonCommand: testCommonCommand("key-replay"),
+		CommonCommand: guardedCommonCommand("key-replay"),
 		Body:          "exact same send, lost response",
 	})
 	// Replaying with the SAME idempotency key is the documented safe retry
 	// and must reach enqueue-level deduplication, not the guard.
 	replay := mustSendText(t, service, SendTextCommand{
-		CommonCommand: testCommonCommand("key-replay"),
+		CommonCommand: guardedCommonCommand("key-replay"),
 		Body:          "exact same send, lost response",
 	})
 	if replay.OutboxID != first.OutboxID || !replay.Deduplicated {

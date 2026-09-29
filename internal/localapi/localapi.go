@@ -143,7 +143,13 @@ type TextSubmission struct {
 	// TTLMS bounds how long the daemon may hold the send before canceling it
 	// as expired instead of transmitting stale. Nil means no expiry.
 	TTLMS *int64 `json:"ttl_ms,omitempty"`
-	// Force bypasses the daemon's near-duplicate guard for a deliberate resend.
+	// GuardNearDuplicates asks the daemon to refuse this submission (HTTP 409,
+	// error_kind near_duplicate_blocked) when a near-identical text was
+	// submitted to the same conversation within the daemon's duplicate window.
+	// Agent entry points (MCP, the CLI) set it; the web UI does not. A daemon
+	// that predates the field ignores it and applies its own default.
+	GuardNearDuplicates bool `json:"guard_near_duplicates,omitempty"`
+	// Force bypasses the near-duplicate guard for a deliberate resend.
 	Force bool `json:"force,omitempty"`
 }
 
@@ -522,6 +528,67 @@ func decodeResponse(response *http.Response, target any) error {
 		return fmt.Errorf("decode local API response: %w", err)
 	}
 	return nil
+}
+
+// NearDuplicateErrorKind is the error_kind the daemon's v1 API stamps on the
+// HTTP 409 for a submission refused by the near-duplicate guard. It mirrors
+// web.NearDuplicateErrorKind; cmd tests assert the two are equal.
+const NearDuplicateErrorKind = "near_duplicate_blocked"
+
+// NearDuplicateRejection is the daemon refusing a text submission as a
+// near-duplicate of a recent send. Nothing was queued.
+type NearDuplicateRejection struct {
+	// Message is the daemon's error text.
+	Message string
+	// Structured reports whether the daemon sent the structured 409 body; the
+	// fields below are empty from daemons that predate it.
+	Structured          bool
+	DuplicateOfOutboxID string
+	DuplicateState      string
+	DuplicateAgeMS      int64
+}
+
+// AsNearDuplicateRejection reports whether err is the daemon's near-duplicate
+// refusal. It trusts the structured error_kind when the 409 body carries one,
+// and otherwise falls back to the "near-duplicate" wording older daemons put
+// in their plain {"error": ...} body.
+func AsNearDuplicateRejection(err error) (NearDuplicateRejection, bool) {
+	responseErr, ok := AsResponseError(err)
+	if !ok || responseErr.StatusCode != http.StatusConflict {
+		return NearDuplicateRejection{}, false
+	}
+	var body struct {
+		Error               string `json:"error"`
+		ErrorKind           string `json:"error_kind"`
+		DuplicateOfOutboxID string `json:"duplicate_of_outbox_id"`
+		DuplicateState      string `json:"duplicate_state"`
+		DuplicateAgeMS      int64  `json:"duplicate_age_ms"`
+	}
+	if json.Unmarshal([]byte(responseErr.Body), &body) == nil && body.ErrorKind != "" {
+		if body.ErrorKind != NearDuplicateErrorKind {
+			return NearDuplicateRejection{}, false
+		}
+		return NearDuplicateRejection{
+			Message:             firstNonEmptyString(body.Error, responseErr.Body),
+			Structured:          true,
+			DuplicateOfOutboxID: body.DuplicateOfOutboxID,
+			DuplicateState:      body.DuplicateState,
+			DuplicateAgeMS:      body.DuplicateAgeMS,
+		}, true
+	}
+	if !strings.Contains(responseErr.Body, "near-duplicate") {
+		return NearDuplicateRejection{}, false
+	}
+	return NearDuplicateRejection{Message: firstNonEmptyString(body.Error, responseErr.Body)}, true
+}
+
+func firstNonEmptyString(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 // ResponseError is a non-2xx local API response.

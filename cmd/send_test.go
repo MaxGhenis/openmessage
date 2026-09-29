@@ -67,7 +67,7 @@ func TestRunSendV2PrimaryUsesOutboxAPI(t *testing.T) {
 		})},
 		legacySend: func(string, string) error { t.Fatal("legacy send called"); return nil },
 	}
-	if err := runSendWithDeps(context.Background(), deps, "conv-1", "hello", &notBefore); err != nil {
+	if err := runSendWithDeps(context.Background(), deps, "conv-1", "hello", SendOptions{NotBeforeMS: &notBefore}); err != nil {
 		t.Fatal(err)
 	}
 	if got := strings.Join(requests, ","); got != "GET /api/status,POST /api/v1/outbox/messages,GET /api/v1/outbox/out-1" {
@@ -95,7 +95,7 @@ func TestRunSendAmbiguousSubmissionDoesNotRetry(t *testing.T) {
 		})},
 		legacySend: func(string, string) error { t.Fatal("legacy send called"); return nil },
 	}
-	err := runSendWithDeps(context.Background(), deps, "conv-1", "hello", nil)
+	err := runSendWithDeps(context.Background(), deps, "conv-1", "hello", SendOptions{})
 	if err == nil {
 		t.Fatal("expected ambiguous error")
 	}
@@ -124,7 +124,7 @@ func TestRunSendFallsBackToLegacyOutsideV2Primary(t *testing.T) {
 			return nil
 		},
 	}
-	if err := runSendWithDeps(context.Background(), deps, "conv-1", "hello", nil); err != nil {
+	if err := runSendWithDeps(context.Background(), deps, "conv-1", "hello", SendOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	if legacyCalls != 1 {
@@ -147,7 +147,7 @@ func TestRunSendDaemonNotV2PrimaryFallsBackToLegacy(t *testing.T) {
 		})},
 		legacySend: func(string, string) error { legacyCalls++; return nil },
 	}
-	if err := runSendWithDeps(context.Background(), deps, "conv-1", "hello", nil); err != nil {
+	if err := runSendWithDeps(context.Background(), deps, "conv-1", "hello", SendOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	if legacyCalls != 1 {
@@ -175,7 +175,7 @@ func TestRunSendDeduplicatedReplayIsSuccess(t *testing.T) {
 		})},
 		legacySend: func(string, string) error { t.Fatal("legacy send called"); return nil },
 	}
-	if err := runSendWithDeps(context.Background(), deps, "conv-1", "hello", nil); err != nil {
+	if err := runSendWithDeps(context.Background(), deps, "conv-1", "hello", SendOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(output.String(), "deduplicated=true") {
@@ -189,7 +189,7 @@ func TestRunSendV2PrimaryDaemonAbsentDoesNotConnect(t *testing.T) {
 		client:     &http.Client{Transport: sendRoundTripper(func(*http.Request) (*http.Response, error) { return nil, errors.New("connection refused") })},
 		legacySend: func(string, string) error { t.Fatal("legacy send called"); return nil },
 	}
-	err := runSendWithDeps(context.Background(), deps, "conv-1", "hello", nil)
+	err := runSendWithDeps(context.Background(), deps, "conv-1", "hello", SendOptions{})
 	if err == nil || !strings.Contains(err.Error(), "OpenMessage isn't running; start it to send") {
 		t.Fatalf("error = %v", err)
 	}
@@ -297,7 +297,7 @@ func TestRunSendRoutingCells(t *testing.T) {
 				})},
 				legacySend: func(string, string) error { legacyCalls++; return nil },
 			}
-			err := runSendWithDeps(context.Background(), deps, "conv", "hello", nil)
+			err := runSendWithDeps(context.Background(), deps, "conv", "hello", SendOptions{})
 			if tt.wantStop != (err != nil && strings.Contains(err.Error(), "OpenMessage isn't running")) {
 				t.Fatalf("error = %v", err)
 			}
@@ -329,7 +329,7 @@ func TestRunSendDeterministicRejections(t *testing.T) {
 				})},
 				legacySend: func(string, string) error { t.Fatal("legacy send called"); return nil },
 			}
-			err := runSendWithDeps(context.Background(), deps, "conv", "hello", nil)
+			err := runSendWithDeps(context.Background(), deps, "conv", "hello", SendOptions{})
 			if err == nil || !strings.Contains(err.Error(), "specific rejection") {
 				t.Fatalf("error = %v", err)
 			}
@@ -371,7 +371,7 @@ func TestRunSendRealTransportSequence(t *testing.T) {
 	}))
 	defer server.Close()
 	deps := sendCommandDeps{mode: func() (v2RuntimeMode, error) { return v2RuntimeMode{}, nil }, client: server.Client(), baseURL: server.URL, newKey: func() (string, error) { return "real-key", nil }, output: io.Discard, legacySend: func(string, string) error { t.Fatal("legacy"); return nil }}
-	if err := runSendWithDeps(context.Background(), deps, "conv", "hello", nil); err != nil {
+	if err := runSendWithDeps(context.Background(), deps, "conv", "hello", SendOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	if got := strings.Join(sequence, ","); got != "GET /api/status,POST /api/v1/outbox/messages,GET /api/v1/outbox/real-out" {
@@ -411,7 +411,7 @@ func TestCLIControlTokenHeaderPresentAndAbsent(t *testing.T) {
 				}
 			})}
 			deps := sendCommandDeps{client: client, baseURL: "http://127.0.0.1", controlToken: tt.token, newKey: func() (string, error) { return "key", nil }, output: io.Discard, legacySend: func(string, string) error { t.Fatal("legacy path"); return nil }}
-			if err := runSendWithDeps(context.Background(), deps, "conv", "hello", nil); err != nil {
+			if err := runSendWithDeps(context.Background(), deps, "conv", "hello", SendOptions{}); err != nil {
 				t.Fatal(err)
 			}
 			if seen != 3 {
@@ -442,7 +442,7 @@ func TestRunSendUsesDaemonDataDirControlToken(t *testing.T) {
 		}
 	})}
 	deps := sendCommandDeps{client: client, baseURL: "http://127.0.0.1", controlToken: "cli-default-token", newKey: func() (string, error) { return "key", nil }, output: io.Discard, legacySend: func(string, string) error { t.Fatal("legacy path"); return nil }}
-	if err := runSendWithDeps(context.Background(), deps, "conv", "hello", nil); err != nil {
+	if err := runSendWithDeps(context.Background(), deps, "conv", "hello", SendOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	want := []string{"Bearer cli-default-token", "Bearer server-token", "Bearer server-token"}
@@ -464,7 +464,7 @@ func TestRunSendRealTransportDoesNotRetry500(t *testing.T) {
 	}))
 	defer server.Close()
 	deps := sendCommandDeps{mode: func() (v2RuntimeMode, error) { return v2RuntimeMode{}, nil }, client: server.Client(), baseURL: server.URL, newKey: func() (string, error) { return "real-key", nil }, output: io.Discard, legacySend: func(string, string) error { t.Fatal("legacy"); return nil }}
-	err := runSendWithDeps(context.Background(), deps, "conv", "hello", nil)
+	err := runSendWithDeps(context.Background(), deps, "conv", "hello", SendOptions{})
 	if err == nil || !strings.Contains(err.Error(), "outcome is unknown") {
 		t.Fatalf("error = %v", err)
 	}

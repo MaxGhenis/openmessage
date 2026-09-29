@@ -34,16 +34,22 @@ const (
 	summaryMaxRunes     = 120
 	workerOwner         = "message-service"
 
-	// Near-duplicate guard defaults: a text whose body is this similar to one
-	// submitted to the same conversation within the window is blocked unless
-	// the command carries Force. 0.75 catches the incident shape ("lunch
-	// tomorrow…" resent as "lunch today…") while leaving short conversational
-	// repeats ("ok" / "ok!") alone.
-	defaultDuplicateWindow    = 10 * time.Minute
+	// Near-duplicate guard defaults: a guarded text whose body is this similar
+	// to one submitted to the same conversation within DefaultDuplicateWindow
+	// is blocked unless the command carries Force. 0.75 catches the incident
+	// shape ("lunch tomorrow…" resent as "lunch today…") while leaving short
+	// conversational repeats ("ok" / "ok!") alone. Only the newest
+	// duplicateCandidateLimit candidates are compared, over at most the first
+	// duplicateCompareMaxRunes normalized runes of each body, because the
+	// comparison runs while the enqueue holds SQLite's write reservation.
 	defaultDuplicateThreshold = 0.75
 	duplicateCandidateLimit   = 8
 	duplicateCompareMaxRunes  = 1000
 )
+
+// DefaultDuplicateWindow is how far back the near-duplicate guard looks for a
+// prior text in the same conversation, measured by submission time.
+const DefaultDuplicateWindow = 10 * time.Minute
 
 // ListPendingQuery selects outbox-tray deliveries in deterministic due order.
 type ListPendingQuery struct {
@@ -140,7 +146,7 @@ func NewMessageService(
 		maxPollDelay:       defaultMaxPollDelay,
 		maxMediaBytes:      DefaultMaxMediaBytes,
 		batchLimit:         defaultBatchLimit,
-		duplicateWindow:    defaultDuplicateWindow,
+		duplicateWindow:    DefaultDuplicateWindow,
 		duplicateThreshold: defaultDuplicateThreshold,
 		wake:               make(chan struct{}, 1),
 		changed:            make(chan struct{}),
@@ -205,15 +211,17 @@ func (s *MessageService) SendText(
 	if err != nil {
 		return Submission{}, err
 	}
-	if err := s.guardNearDuplicateText(ctx, cmd, now); err != nil {
-		return Submission{}, err
-	}
 	payloadHash, err := textPayloadHash(cmd.Body, cmd.ReplyToMessageID)
 	if err != nil {
 		return Submission{}, fmt.Errorf("send text: hash payload: %w", err)
 	}
 
-	item, disposition, err := s.outbox.EnqueueOutgoingMessage(ctx, sqlite.NewOutboxItem{
+	// The near-duplicate guard (when this command opts in) runs inside the
+	// enqueue transaction after the idempotency key is resolved: a replay of
+	// an existing key returns the stored intent before the guard is
+	// consulted, and concurrent new intents are serialized by SQLite's write
+	// reservation, so at most one of a set of near-duplicates is accepted.
+	item, disposition, err := s.outbox.EnqueueOutgoingMessageGuarded(ctx, sqlite.NewOutboxItem{
 		OutboxID:           outboxID,
 		AccountID:          cmd.AccountID,
 		ConversationID:     cmd.ConversationID,
@@ -235,8 +243,12 @@ func (s *MessageService) SendText(
 		ReplyToRemoteID: replyToRemoteID,
 		State:           sqlite.MessageStateActive,
 		OccurredAtMS:    now.UnixMilli(),
-	})
+	}, s.nearDuplicateCheck(cmd, now))
 	if err != nil {
+		var nearDuplicate *sqlite.NearDuplicateError
+		if errors.As(err, &nearDuplicate) {
+			return Submission{}, duplicateSendError(nearDuplicate.Prior, now)
+		}
 		return Submission{}, fmt.Errorf("send text: %w", err)
 	}
 
@@ -1053,78 +1065,104 @@ func expiryMilliseconds(cmd CommonCommand, scheduledFor time.Time) (int64, error
 	return scheduledFor.Add(cmd.TTL).UnixMilli(), nil
 }
 
-// guardNearDuplicateText blocks a text whose body is nearly identical to one
-// submitted to the same conversation inside the duplicate window, unless the
-// command carries Force. Same-key candidates are skipped: replaying the exact
-// send with its original idempotency key is the documented safe retry and is
-// resolved by enqueue-level deduplication, not the guard.
-func (s *MessageService) guardNearDuplicateText(
-	ctx context.Context,
-	cmd SendTextCommand,
-	now time.Time,
-) error {
-	if cmd.Force || s.duplicateWindow <= 0 {
+// nearDuplicateCheck builds the enqueue-time near-duplicate guard for cmd, or
+// nil when the guard does not apply: the command did not opt in
+// (GuardNearDuplicates), carries Force, or the service's window is disabled.
+// The check itself runs inside the enqueue transaction (see
+// sqlite.NearDuplicateCheck), so it is consulted only for a new idempotency
+// key and is atomic with the insert.
+func (s *MessageService) nearDuplicateCheck(cmd SendTextCommand, now time.Time) *sqlite.NearDuplicateCheck {
+	if !cmd.GuardNearDuplicates || cmd.Force || s.duplicateWindow <= 0 {
 		return nil
 	}
 	sinceMS := now.Add(-s.duplicateWindow).UnixMilli()
 	if sinceMS < 1 {
 		sinceMS = 1
 	}
-	recent, err := s.outbox.ListRecentTextIntents(
-		ctx,
-		cmd.AccountID,
-		cmd.ConversationID,
-		sinceMS,
-		duplicateCandidateLimit,
-	)
-	if err != nil {
-		return fmt.Errorf("send text: check for near-duplicates: %w", err)
+	body, threshold := cmd.Body, s.duplicateThreshold
+	return &sqlite.NearDuplicateCheck{
+		SinceMS: sinceMS,
+		Limit:   duplicateCandidateLimit,
+		Matches: func(prior string) bool { return textsNearDuplicate(body, prior, threshold) },
 	}
-	for _, intent := range recent {
-		if intent.IdempotencyKey == cmd.IdempotencyKey {
-			continue
-		}
-		if !textsNearDuplicate(cmd.Body, intent.Body, s.duplicateThreshold) {
-			continue
-		}
-		return &DuplicateSendError{
-			PriorOutboxID:       intent.OutboxID,
-			PriorState:          intent.State,
-			PriorIdempotencyKey: intent.IdempotencyKey,
-			PriorAgeMS:          now.UnixMilli() - intent.CreatedAtMS,
-		}
+}
+
+// duplicateSendError reports the prior intent that refused a guarded
+// submission. A prior stamped later than now (clock skew between processes
+// sharing one store) reports age zero rather than a negative age.
+func duplicateSendError(prior sqlite.RecentTextIntent, now time.Time) *DuplicateSendError {
+	ageMS := now.UnixMilli() - prior.CreatedAtMS
+	if ageMS < 0 {
+		ageMS = 0
 	}
-	return nil
+	return &DuplicateSendError{
+		PriorOutboxID:       prior.OutboxID,
+		PriorState:          prior.State,
+		PriorIdempotencyKey: prior.IdempotencyKey,
+		PriorAgeMS:          ageMS,
+	}
+}
+
+// guardSimilarity scores how alike two message bodies are for the
+// near-duplicate guard, in [0, 1]. Bodies are compared after case folding and
+// whitespace collapsing (normalizeGuardText). An empty normalized body scores
+// 0 against anything; equal non-empty normalized bodies score 1; otherwise the
+// score is 1 - levenshtein/longer length over at most the first
+// duplicateCompareMaxRunes normalized runes of each body. The truncation is
+// deliberate (it bounds the work done while the enqueue holds the write
+// reservation), so two long bodies that share their first
+// duplicateCompareMaxRunes normalized runes score 1 whatever follows.
+func guardSimilarity(a, b string) float64 {
+	ra, rb, score, decided := guardOperands(a, b)
+	if decided {
+		return score
+	}
+	return 1 - float64(levenshtein(ra, rb))/float64(max(len(ra), len(rb)))
 }
 
 // textsNearDuplicate reports whether two message bodies are the same message
-// for guard purposes: equal after whitespace/case normalization, or within
-// the similarity threshold by normalized Levenshtein distance.
+// for guard purposes: guardSimilarity(a, b) >= threshold, where an empty
+// normalized body never matches. It computes exactly that comparison with a
+// length prefilter: the edit distance is at least the length difference, so a
+// pair whose lengths alone rule out the threshold skips the quadratic
+// edit-distance computation.
 func textsNearDuplicate(a, b string, threshold float64) bool {
+	ra, rb, score, decided := guardOperands(a, b)
+	if decided {
+		return score > 0 && score >= threshold
+	}
+	longest := max(len(ra), len(rb))
+	lengthGap := len(ra) - len(rb)
+	if lengthGap < 0 {
+		lengthGap = -lengthGap
+	}
+	if 1-float64(lengthGap)/float64(longest) < threshold {
+		return false
+	}
+	return 1-float64(levenshtein(ra, rb))/float64(longest) >= threshold
+}
+
+// guardOperands normalizes two bodies for comparison. It decides the score
+// outright when either normalized body is empty (0) or both are equal (1);
+// otherwise it returns both as runes truncated to duplicateCompareMaxRunes,
+// each non-empty.
+func guardOperands(a, b string) (ra, rb []rune, score float64, decided bool) {
 	na, nb := normalizeGuardText(a), normalizeGuardText(b)
-	if na == "" || nb == "" {
-		return false
+	switch {
+	case na == "" || nb == "":
+		return nil, nil, 0, true
+	case na == nb:
+		return nil, nil, 1, true
 	}
-	if na == nb {
-		return true
+	return truncateGuardRunes(na), truncateGuardRunes(nb), 0, false
+}
+
+func truncateGuardRunes(value string) []rune {
+	runes := []rune(value)
+	if len(runes) > duplicateCompareMaxRunes {
+		runes = runes[:duplicateCompareMaxRunes]
 	}
-	ra, rb := []rune(na), []rune(nb)
-	if len(ra) > duplicateCompareMaxRunes {
-		ra = ra[:duplicateCompareMaxRunes]
-	}
-	if len(rb) > duplicateCompareMaxRunes {
-		rb = rb[:duplicateCompareMaxRunes]
-	}
-	longest := len(ra)
-	if len(rb) > longest {
-		longest = len(rb)
-	}
-	if longest == 0 {
-		return false
-	}
-	distance := levenshtein(ra, rb)
-	similarity := 1 - float64(distance)/float64(longest)
-	return similarity >= threshold
+	return runes
 }
 
 func normalizeGuardText(value string) string {
