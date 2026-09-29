@@ -73,13 +73,18 @@ func NewClient(baseURL, token string) *Client {
 }
 
 // PlatformSendCapability mirrors one entry of the daemon's /api/status "send"
-// block: whether a send on that platform is expected to dispatch promptly,
-// with the daemon's reason when it is not. Queueable marks a self-healing
-// outage where a durable send is still accepted and waits.
+// block (internal/sendcap.Capability; a test pins the two JSON shapes
+// together): whether a send on that platform is expected to dispatch
+// promptly, with the daemon's reason when it is not. Queueable marks a
+// self-healing outage where a durable send is still accepted and waits.
+// Condition is the daemon's typed cause (for example "account_recheck" or
+// "upgrade_required"); it is advisory — the tier always derives from
+// Available/Queueable — and absent on daemons older than it.
 type PlatformSendCapability struct {
 	Available bool   `json:"available"`
 	Queueable bool   `json:"queueable"`
 	Reason    string `json:"reason,omitempty"`
+	Condition string `json:"condition,omitempty"`
 }
 
 // DaemonStatus is the subset of /api/status used for daemon-truth decisions.

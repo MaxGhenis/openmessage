@@ -21,8 +21,8 @@ func TestComputeAllHealthy(t *testing.T) {
 	capabilities := Compute(healthyInputs())
 	for _, platform := range []string{PlatformSMS, PlatformWhatsApp, PlatformSignal} {
 		capability := capabilities[platform]
-		if !capability.Available || capability.Reason != "" {
-			t.Fatalf("%s = %+v, want available with no reason", platform, capability)
+		if !capability.Available || capability.Reason != "" || capability.Condition != "" {
+			t.Fatalf("%s = %+v, want available with no reason or condition", platform, capability)
 		}
 	}
 }
@@ -33,6 +33,9 @@ func TestComputeTransportsDisabledBlocksEverything(t *testing.T) {
 	for platform, capability := range Compute(inputs) {
 		if capability.Available || capability.Queueable || capability.Reason == "" {
 			t.Fatalf("%s = %+v, want hard-unavailable with reason", platform, capability)
+		}
+		if capability.Condition != ConditionNoTransports {
+			t.Fatalf("%s condition = %q, want %q", platform, capability.Condition, ConditionNoTransports)
 		}
 	}
 }
@@ -50,6 +53,9 @@ func TestComputeTiersSelfHealingVersusHardOutages(t *testing.T) {
 		if capability.Available || !capability.Queueable {
 			t.Fatalf("%s disconnected = %+v, want unavailable but queueable", platform, capability)
 		}
+		if capability.Condition != ConditionDisconnected {
+			t.Fatalf("%s disconnected condition = %q", platform, capability.Condition)
+		}
 	}
 
 	// Unpaired platforms are hard-unavailable: nothing will self-heal.
@@ -63,19 +69,22 @@ func TestComputeTiersSelfHealingVersusHardOutages(t *testing.T) {
 		if capability.Available || capability.Queueable {
 			t.Fatalf("%s unpaired = %+v, want hard-unavailable", platform, capability)
 		}
+		if capability.Condition != ConditionNotPaired {
+			t.Fatalf("%s unpaired condition = %q", platform, capability.Condition)
+		}
 	}
 }
 
 func TestComputeGoogleDegradedStates(t *testing.T) {
 	inputs := healthyInputs()
 	inputs.Google.NeedsRepair = true
-	if capability := Compute(inputs)[PlatformSMS]; capability.Available || capability.Queueable {
+	if capability := Compute(inputs)[PlatformSMS]; capability.Available || capability.Queueable || capability.Condition != ConditionNeedsRepair {
 		t.Fatalf("needs_repair = %+v, want hard-unavailable (sends keep failing)", capability)
 	}
 
 	inputs = healthyInputs()
 	inputs.Google.AuthExpired = true
-	if capability := Compute(inputs)[PlatformSMS]; capability.Available || capability.Queueable {
+	if capability := Compute(inputs)[PlatformSMS]; capability.Available || capability.Queueable || capability.Condition != ConditionAuthExpired {
 		t.Fatalf("auth_expired = %+v, want hard-unavailable", capability)
 	}
 
@@ -85,7 +94,7 @@ func TestComputeGoogleDegradedStates(t *testing.T) {
 	inputs = healthyInputs()
 	inputs.Google.PhoneResponding = false
 	capability := Compute(inputs)[PlatformSMS]
-	if capability.Available || !capability.Queueable || capability.Reason == "" {
+	if capability.Available || !capability.Queueable || capability.Reason == "" || capability.Condition != ConditionPhoneNotResponding {
 		t.Fatalf("phone_not_responding = %+v, want queueable with reason", capability)
 	}
 }
@@ -94,18 +103,10 @@ func TestComputeAdapterMissingIsHardUnavailable(t *testing.T) {
 	inputs := healthyInputs()
 	inputs.AdapterTextSend = func(platform string) bool { return platform != PlatformWhatsApp }
 	capabilities := Compute(inputs)
-	if capability := capabilities[PlatformWhatsApp]; capability.Available || capability.Queueable {
+	if capability := capabilities[PlatformWhatsApp]; capability.Available || capability.Queueable || capability.Condition != ConditionAdapterMissing {
 		t.Fatalf("adapter-missing whatsapp = %+v, want hard-unavailable (receive-only)", capability)
 	}
 	if !capabilities[PlatformSMS].Available || !capabilities[PlatformSignal].Available {
 		t.Fatalf("other platforms affected: %+v", capabilities)
-	}
-}
-
-func TestComputeSignalNeedsReauthIsHardUnavailable(t *testing.T) {
-	inputs := healthyInputs()
-	inputs.Signal.NeedsReauth = true
-	if capability := Compute(inputs)[PlatformSignal]; capability.Available || capability.Queueable {
-		t.Fatalf("needs_reauth = %+v, want hard-unavailable", capability)
 	}
 }

@@ -451,6 +451,15 @@ func deliveryReceiptObserved(reads readsource.ReadSource, remoteMessageID string
 // now. Nothing is queued; there is deliberately no cross-platform fallback —
 // the channel is part of the instruction.
 func platformUnavailableResult(platform, reason string) *mcp.CallToolResult {
+	return platformUnsendableResult(platform, sendcap.Capability{Reason: reason})
+}
+
+// platformUnsendableResult is platformUnavailableResult for a refusal that
+// came from a send capability: the structured payload also carries the typed
+// condition (for example relink_required or upgrade_required) when the
+// capability named one.
+func platformUnsendableResult(platform string, capability sendcap.Capability) *mcp.CallToolResult {
+	reason := capability.Reason
 	if reason == "" {
 		reason = "the platform cannot send right now"
 	}
@@ -458,13 +467,17 @@ func platformUnavailableResult(platform, reason string) *mcp.CallToolResult {
 		"Cannot send on %s: %s. The message was NOT queued. No fallback to another platform is attempted — the requested channel is part of the instruction. Use resolve_contact_routes to list this contact's sendable routes and choose one explicitly, or fix the platform and retry.",
 		platform, reason,
 	)
-	result := structuredResult(map[string]any{
+	payload := map[string]any{
 		"ok":         false,
 		"error":      text,
 		"error_kind": "platform_unsendable",
 		"platform":   platform,
 		"reason":     reason,
-	}, text)
+	}
+	if capability.Condition != "" {
+		payload["condition"] = string(capability.Condition)
+	}
+	result := structuredResult(payload, text)
 	result.IsError = true
 	return result
 }
@@ -540,12 +553,14 @@ func nearDuplicateBlockedResult(priorOutboxID, priorState string, priorAgeMS int
 	return result
 }
 
-// localSendCapability computes per-platform send capability for a process
-// that owns its own transports (standalone serve). Client mode uses daemon
-// truth instead.
-func localSendCapability(a *app.App, v2 *V2Dependencies) map[string]sendcap.Capability {
+// localSendCapability computes per-platform send capability in-process
+// (standalone serve). transportsEnabled must be false when this process holds
+// no live platform connections (serve --no-transports), so it answers
+// exactly like the daemon's /api/status send block for the same process.
+// Client mode uses daemon truth instead.
+func localSendCapability(a *app.App, v2 *V2Dependencies, transportsEnabled bool) map[string]sendcap.Capability {
 	inputs := sendcap.Inputs{
-		TransportsEnabled: true,
+		TransportsEnabled: transportsEnabled,
 		Google:            googleStatus(a),
 		WhatsApp:          whatsAppStatus(a),
 		Signal:            signalStatus(a),
@@ -563,18 +578,21 @@ func localSendCapability(a *app.App, v2 *V2Dependencies) map[string]sendcap.Capa
 }
 
 // checkPlatformSendable enforces route sendability at send time against a
-// capability map. Unknown platforms pass through (the submit path validates
-// them); missing maps mean "capability unknown", which must not block. A
-// queueable outage (transient disconnect) also passes: the durable outbox
-// exists exactly for that case, and the result reports queued/not-transmitted
-// truthfully with a TTL bounding staleness.
+// capability map, refusing exactly what sendcap.Classify calls unavailable —
+// the same classifier resolve_contact_routes uses, so a route listed as
+// unavailable is precisely a send this refuses. Unknown platforms pass
+// through (the submit path validates them); missing maps mean "capability
+// unknown", which must not block. A queueable outage (transient disconnect,
+// Signal's account_recheck park) also passes: the durable outbox exists
+// exactly for that case, and the result reports queued/not-transmitted
+// truthfully with a TTL, when the send has one, bounding staleness.
 func checkPlatformSendable(capabilities map[string]sendcap.Capability, platform string) *mcp.CallToolResult {
-	if capabilities == nil || platform == "" {
+	if platform == "" {
 		return nil
 	}
 	capability, known := capabilities[platform]
-	if !known || capability.Available || capability.Queueable {
+	if sendcap.Classify(capability, known) != sendcap.TierUnavailable {
 		return nil
 	}
-	return platformUnavailableResult(platform, capability.Reason)
+	return platformUnsendableResult(platform, capability)
 }

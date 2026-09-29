@@ -12,17 +12,37 @@ import (
 
 	"github.com/maxghenis/openmessage/internal/app"
 	"github.com/maxghenis/openmessage/internal/db"
+	"github.com/maxghenis/openmessage/internal/localapi"
 	"github.com/maxghenis/openmessage/internal/sendcap"
 )
 
 type resolvedRoute struct {
 	Conversation conversationSummary `json:"conversation"`
-	Sendable     bool                `json:"sendable"`
+	// Sendable is true exactly when SendCapability is "available": a send
+	// submitted now is expected to dispatch promptly.
+	Sendable bool `json:"sendable"`
+	// SendCapability is the route's send tier: available, queueable (a send
+	// is accepted but waits in the outbox), unavailable (sends are refused),
+	// unknown (the running app predates capability reporting, so neither
+	// this tool nor send-time checks can tell), or read_only (an
+	// import-only platform). It comes from the same sendcap.Classify that
+	// send-time enforcement uses, so "unavailable" here is exactly a send
+	// that would be refused.
+	SendCapability string `json:"send_capability"`
 	// SendableReason explains a sendable:false route (platform down,
-	// adapter unregistered, read-only platform, daemon unreachable) so
-	// agents can distinguish "fix the platform" from "pick another route".
+	// adapter unregistered, read-only platform, daemon unreachable,
+	// capability unknown) so agents can distinguish "fix the platform" from
+	// "pick another route".
 	SendableReason string `json:"sendable_reason,omitempty"`
 }
+
+// routeSendCapabilityReadOnly marks an import-only platform route; it sits
+// beside the sendcap tiers in resolvedRoute.SendCapability.
+const routeSendCapabilityReadOnly = "read_only"
+
+// olderDaemonCapabilityReason explains the unknown tier against a daemon
+// without the /api/status send block.
+const olderDaemonCapabilityReason = "the running app predates per-platform send capability reporting; sendability is unknown and send-time checks cannot verify it either"
 
 type resolvedRouteMatch struct {
 	MatchID                      string          `json:"match_id"`
@@ -57,7 +77,7 @@ type routeParticipant struct {
 
 func resolveContactRoutesTool() mcp.Tool {
 	return mcp.NewTool("resolve_contact_routes",
-		mcp.WithDescription("Resolve a person, phone number, or conversation name to existing conversation routes and the preferred reply route"),
+		mcp.WithDescription("Resolve a person, phone number, or conversation name to existing conversation routes and the preferred reply route. Each route reports send_capability: available (a send dispatches promptly; sendable=true), queueable (a send is accepted but waits in the outbox until the platform recovers), unavailable (sends are refused; sendable_reason says why), unknown (the running app predates capability reporting, so sendability cannot be verified), or read_only (import-only history). The preferred reply route is an available route (SMS first); only when no route is known-available does it fall back to a route whose capability is unknown, and it is never a queueable, unavailable, or read-only route."),
 		mcp.WithString("query", mcp.Required(), mcp.Description("Person name, phone number, email, or existing conversation name/ID")),
 		mcp.WithNumber("limit", mcp.Description("Maximum route matches to return (default 10)")),
 		mcp.WithReadOnlyHintAnnotation(true),
@@ -106,13 +126,7 @@ func resolveContactRoutesHandler(a *app.App, configured ...Options) server.ToolH
 			fmt.Fprintf(&sb, "- %s: ", match.DisplayName)
 			parts := make([]string, 0, len(match.Routes))
 			for _, route := range match.Routes {
-				label := route.Conversation.SourcePlatform
-				if route.Conversation.ConversationID == match.PreferredReplyConversationID {
-					label += " (preferred)"
-				} else if !route.Sendable {
-					label += " (history)"
-				}
-				parts = append(parts, label)
+				parts = append(parts, route.Conversation.SourcePlatform+routeLabelSuffix(route, match.PreferredReplyConversationID))
 			}
 			sb.WriteString(strings.Join(parts, ", "))
 			sb.WriteByte('\n')
@@ -208,7 +222,7 @@ func buildResolvedRouteMatches(a *app.App, options Options, ctx context.Context,
 	}
 
 	identityIndex := loadRouteIdentityIndex(a.Store)
-	capabilities := routeSendCapabilities(ctx, a, options)
+	capabilities, unknownReason := routeSendCapabilities(ctx, a, options)
 
 	type routeBucket struct {
 		MatchID       string
@@ -245,10 +259,11 @@ func buildResolvedRouteMatches(a *app.App, options Options, ctx context.Context,
 		if bucket.ParticipantID == "" {
 			bucket.ParticipantID = participantID
 		}
-		sendable, reason := routeSupportsOutbound(conv, capabilities)
+		state, reason := routeSupportsOutbound(conv, capabilities, unknownReason)
 		bucket.Routes = append(bucket.Routes, resolvedRoute{
 			Conversation:   summarizeConversation(conv),
-			Sendable:       sendable,
+			Sendable:       state == string(sendcap.TierAvailable),
+			SendCapability: state,
 			SendableReason: reason,
 		})
 	}
@@ -314,18 +329,48 @@ func resolveRouteBucketIdentity(conv *db.Conversation, identityIndex map[string]
 	return "participant:" + normalizeRouteIdentifier(participantID), "person", firstNonEmpty(displayName, participantID), "", participantID
 }
 
+// preferredReplyConversationID picks the reply route: an available SMS route,
+// then any available route, and only when nothing is known-available a
+// route whose capability is unknown (SMS first) — an older app cannot say,
+// and refusing to name any route would leave the agent nothing to try.
+// Queueable, unavailable, and read-only routes are never preferred.
 func preferredReplyConversationID(routes []resolvedRoute) string {
-	for _, route := range routes {
-		if route.Sendable && route.Conversation.SourcePlatform == "sms" {
-			return route.Conversation.ConversationID
+	for _, state := range []string{string(sendcap.TierAvailable), string(sendcap.TierUnknown)} {
+		for _, route := range routes {
+			if route.SendCapability == state && normalizedPlatform(route.Conversation.SourcePlatform) == "sms" {
+				return route.Conversation.ConversationID
+			}
 		}
-	}
-	for _, route := range routes {
-		if route.Sendable {
-			return route.Conversation.ConversationID
+		for _, route := range routes {
+			if route.SendCapability == state {
+				return route.Conversation.ConversationID
+			}
 		}
 	}
 	return ""
+}
+
+// routeLabelSuffix renders a route's tier in the text summary.
+func routeLabelSuffix(route resolvedRoute, preferredConversationID string) string {
+	preferred := route.Conversation.ConversationID == preferredConversationID
+	switch route.SendCapability {
+	case string(sendcap.TierAvailable):
+		if preferred {
+			return " (preferred)"
+		}
+		return ""
+	case string(sendcap.TierUnknown):
+		if preferred {
+			return " (preferred, send capability unknown)"
+		}
+		return " (send capability unknown)"
+	case string(sendcap.TierQueueable):
+		return " (queues only)"
+	case string(sendcap.TierUnavailable):
+		return " (unavailable)"
+	default:
+		return " (history)"
+	}
 }
 
 func sortResolvedRoutes(routes []resolvedRoute) {
@@ -365,10 +410,12 @@ func platformOrderIndex(platform string) int {
 // list is judged against. Client mode asks the daemon — the process that
 // actually sends — so this tool, get_status, and send-time enforcement all
 // answer from the same source (the 2026-08-05 incident had three surfaces
-// giving three different answers). Standalone mode computes locally.
-func routeSendCapabilities(ctx context.Context, a *app.App, options Options) map[string]sendcap.Capability {
+// giving three different answers). Standalone mode computes locally. The
+// second result explains platforms missing from the map (the unknown tier);
+// it is set when the daemon predates the send block, whose map is nil.
+func routeSendCapabilities(ctx context.Context, a *app.App, options Options) (map[string]sendcap.Capability, string) {
 	if options.Daemon == nil {
-		return localSendCapability(a, options.V2)
+		return localSendCapability(a, options.V2, options.TransportsEnabled), ""
 	}
 	status, reachable, err := options.Daemon.Status(ctx)
 	if err != nil {
@@ -376,55 +423,60 @@ func routeSendCapabilities(ctx context.Context, a *app.App, options Options) map
 		if reachable {
 			reason = fmt.Sprintf("the OpenMessage app answered but its status was unusable (%v)", err)
 		}
+		// Every send would be refused (the send path cannot reach the
+		// daemon either), so these are genuinely unavailable, not unknown.
 		unavailable := sendcap.Capability{Reason: reason}
 		return map[string]sendcap.Capability{
 			sendcap.PlatformSMS:      unavailable,
 			sendcap.PlatformWhatsApp: unavailable,
 			sendcap.PlatformSignal:   unavailable,
-		}
+		}, ""
 	}
+	return routeCapabilitiesFromDaemonStatus(status)
+}
+
+// routeCapabilitiesFromDaemonStatus converts a reachable daemon's status into
+// the route capability map, carrying every published field (the typed
+// condition included) through capabilityFromDaemon.
+func routeCapabilitiesFromDaemonStatus(status localapi.DaemonStatus) (map[string]sendcap.Capability, string) {
 	if status.Send == nil {
-		// Older daemon without the send block: keep the pre-capability
-		// behavior (sms assumed sendable, whatsapp/signal not) but say why.
-		return map[string]sendcap.Capability{
-			sendcap.PlatformSMS: {Available: true},
-			sendcap.PlatformWhatsApp: {
-				Reason: "the running app predates per-platform send capability reporting; whatsapp sendability is unknown",
-			},
-			sendcap.PlatformSignal: {
-				Reason: "the running app predates per-platform send capability reporting; signal sendability is unknown",
-			},
-		}
+		// Older daemon without the send block: sendability is unknown on
+		// every platform. Never invent availability — send-time enforcement
+		// treats this daemon as unknown too, and the two must agree.
+		return nil, olderDaemonCapabilityReason
 	}
 	capabilities := make(map[string]sendcap.Capability, len(status.Send))
 	for platform, capability := range status.Send {
-		capabilities[platform] = sendcap.Capability{
-			Available: capability.Available,
-			Queueable: capability.Queueable,
-			Reason:    capability.Reason,
-		}
+		capabilities[platform] = capabilityFromDaemon(capability)
 	}
-	return capabilities
+	return capabilities, ""
 }
 
-// routeSupportsOutbound reports whether one conversation's platform can send
-// right now, with the reason when it cannot.
-func routeSupportsOutbound(conv *db.Conversation, capabilities map[string]sendcap.Capability) (bool, string) {
+// routeSupportsOutbound classifies one conversation's route with
+// sendcap.Classify — the classifier send-time enforcement uses — and returns
+// the resolvedRoute.SendCapability value plus the reason for anything short
+// of available. unknownReason explains a platform missing from the map.
+func routeSupportsOutbound(conv *db.Conversation, capabilities map[string]sendcap.Capability, unknownReason string) (string, string) {
 	if conv == nil {
-		return false, ""
+		return routeSendCapabilityReadOnly, ""
 	}
 	platform := normalizedPlatform(conv.SourcePlatform)
 	switch platform {
 	case "sms", "whatsapp", "signal":
 		capability, known := capabilities[platform]
-		if !known {
-			return false, "send capability unknown for this platform"
+		state := sendcap.Classify(capability, known)
+		switch state {
+		case sendcap.TierAvailable:
+			return string(state), ""
+		case sendcap.TierUnknown:
+			return string(state), firstNonEmpty(unknownReason, "send capability unknown for this platform")
+		default:
+			return string(state), capability.Reason
 		}
-		return capability.Available, capability.Reason
 	case "imessage":
-		return false, "imessage is import/read-only; OpenMessage cannot send iMessages"
+		return routeSendCapabilityReadOnly, "imessage is import/read-only; OpenMessage cannot send iMessages"
 	default:
-		return false, fmt.Sprintf("%s conversations are import/read-only in OpenMessage", platform)
+		return routeSendCapabilityReadOnly, fmt.Sprintf("%s conversations are import/read-only in OpenMessage", platform)
 	}
 }
 

@@ -239,7 +239,7 @@ func submitV2MediaFile(
 	}
 	conversationID := strArg(args, "conversation_id")
 	platform := v2.sendPlatform(a, conversationID)
-	if failure := checkPlatformSendable(localSendCapability(a, v2), platform); failure != nil {
+	if failure := checkPlatformSendable(localSendCapability(a, v2, v2TransportsEnabled), platform); failure != nil {
 		return failure
 	}
 	submission, err := v2.submitMedia(ctx, a, v2wire.MediaInput{

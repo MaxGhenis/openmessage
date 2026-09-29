@@ -17,6 +17,7 @@ import (
 	"github.com/maxghenis/openmessage/internal/localapi"
 	"github.com/maxghenis/openmessage/internal/messaging"
 	"github.com/maxghenis/openmessage/internal/readsource"
+	"github.com/maxghenis/openmessage/internal/sendcap"
 )
 
 // Daemon-routed MCP handlers back the transportless "client mode" serve. The
@@ -92,19 +93,34 @@ func daemonSendPlatform(reads readsource.ReadSource, conversationID string) stri
 	return ""
 }
 
+// capabilityFromDaemon converts one entry of the daemon's /api/status send
+// block into the shared sendcap form, carrying every field (including the
+// typed condition) so nothing the daemon published is dropped on this hop.
+func capabilityFromDaemon(capability localapi.PlatformSendCapability) sendcap.Capability {
+	return sendcap.Capability{
+		Available: capability.Available,
+		Queueable: capability.Queueable,
+		Reason:    capability.Reason,
+		Condition: sendcap.Condition(capability.Condition),
+	}
+}
+
 // daemonCheckPlatformSendable enforces the daemon's per-platform send
-// capability before submitting. A daemon that predates the capability block
-// (no "send" map) cannot be checked and passes through, as does a queueable
-// outage (transient disconnect) — the durable outbox plus TTL handles those.
+// capability before submitting, refusing exactly what sendcap.Classify calls
+// unavailable (the classifier route discovery uses too). A daemon that
+// predates the capability block (no "send" map) cannot be checked and passes
+// through as unknown, as does a queueable outage (transient disconnect,
+// Signal's account_recheck park) — the durable outbox plus TTL handles those.
 func daemonCheckPlatformSendable(status localapi.DaemonStatus, platform string) *mcp.CallToolResult {
 	if platform == "" {
 		return nil
 	}
-	capability, known := status.SendCapabilityFor(platform)
-	if !known || capability.Available || capability.Queueable {
+	daemonCapability, known := status.SendCapabilityFor(platform)
+	capability := capabilityFromDaemon(daemonCapability)
+	if sendcap.Classify(capability, known) != sendcap.TierUnavailable {
 		return nil
 	}
-	return platformUnavailableResult(platform, capability.Reason)
+	return platformUnsendableResult(platform, capability)
 }
 
 // daemonRejectionResult renders a deterministic daemon refusal. A 404 on the
@@ -690,6 +706,17 @@ func daemonGetStatusHandler(a *app.App, options Options) server.ToolHandlerFunc 
 			connected, _ := platform["connected"].(bool)
 			paired, _ := platform["paired"].(bool)
 			fmt.Fprintf(&sb, "%s: connected=%v paired=%v", label, connected, paired)
+			// Park flags (Signal today) name WHICH terminal state is standing;
+			// they are absent on healthy platforms and older daemons.
+			if needsReauth, _ := platform["needs_reauth"].(bool); needsReauth {
+				sb.WriteString(" needs_reauth=true")
+			}
+			if upgradeRequired, _ := platform["upgrade_required"].(bool); upgradeRequired {
+				sb.WriteString(" upgrade_required=true")
+			}
+			if parkFingerprint, _ := platform["park_fingerprint"].(string); parkFingerprint != "" {
+				fmt.Fprintf(&sb, " park_fingerprint=%s", parkFingerprint)
+			}
 			if lastError, ok := platform["last_error"].(string); ok && lastError != "" {
 				fmt.Fprintf(&sb, " last_error=%q", lastError)
 			}
@@ -711,15 +738,16 @@ func daemonGetStatusHandler(a *app.App, options Options) server.ToolHandlerFunc 
 				available, _ := entry["available"].(bool)
 				queueable, _ := entry["queueable"].(bool)
 				reason, _ := entry["reason"].(string)
-				switch {
-				case available:
-					fmt.Fprintf(&sb, "  %s: available\n", platform)
-				case queueable:
-					fmt.Fprintf(&sb, "  %s: DEGRADED (sends queue, not transmit) — %s\n", platform, firstNonEmpty(reason, "reason unknown"))
-				default:
-					fmt.Fprintf(&sb, "  %s: UNAVAILABLE — %s\n", platform, firstNonEmpty(reason, "reason unknown"))
-				}
+				condition, _ := entry["condition"].(string)
+				sb.WriteString(sendCapabilityLine(platform, sendcap.Capability{
+					Available: available,
+					Queueable: queueable,
+					Reason:    reason,
+					Condition: sendcap.Condition(condition),
+				}))
 			}
+		} else {
+			sb.WriteString("\nSend capability: UNKNOWN — the running app predates per-platform send capability reporting, so neither this status nor send-time checks can tell whether a platform can send. Update the app to get it.\n")
 		}
 		if v2Primary, ok := raw["v2_primary"].(bool); ok {
 			fmt.Fprintf(&sb, "App v2 mode: primary=%v send=%v (v2_send is the send STACK flag, not per-platform capability — see the send capability block)\n", v2Primary, raw["v2_send"])
