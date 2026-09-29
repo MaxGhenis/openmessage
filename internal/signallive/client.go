@@ -242,9 +242,54 @@ const (
 	// instead of waiting forever for a manual /api/signal/connect. A genuine
 	// deregistration stays cheap under that retest: signal-cli persists
 	// "registered": false after the server 403, and every later probe fails
-	// locally without network traffic.
+	// locally without network traffic. ParkRetestedAutomatically is the one
+	// predicate that names this fingerprint for both the retest and the send
+	// capability tiering; StatusSnapshot.ParkFingerprint publishes it.
 	SignalAccountUnreadableFingerprint = "signal_account_unreadable"
+
+	// SignalParkUnspecifiedFingerprint stands in for a reauth or upgrade park
+	// whose exit carried no fingerprint, so a parked status always names one:
+	// StatusSnapshot.ParkFingerprint is non-empty exactly when needs_reauth or
+	// upgrade_required is set. No park site in this package emits an empty
+	// fingerprint; the placeholder keeps that invariant (and the fail-safe
+	// "not retested automatically" reading of it) if a caller ever does.
+	SignalParkUnspecifiedFingerprint = "signal_park_unspecified"
 )
+
+// ParkRetestInterval paces the automatic retest of a park that
+// ParkRetestedAutomatically accepts. The retest is one supervisor
+// RetryBlocked — a listAccounts probe that either reconnects or re-parks.
+// While signal-cli still considers the account registered, that probe
+// includes signal-cli's own account check against the server (one light
+// round-trip per retest); once a real deregistration has persisted
+// "registered": false, every retest fails locally with no network traffic.
+// Either way the cadence stays slow and bounds a false park to minutes
+// instead of the 12-22h outages observed live. cmd's Signal supervisor
+// control runs the retest on this interval and internal/sendcap quotes it in
+// the account_recheck send reason, so the two cannot drift apart.
+const ParkRetestInterval = 15 * time.Minute
+
+// ParkRetestedAutomatically reports whether a reauth park with this
+// fingerprint heals without the user: the cmd-layer park retest re-probes a
+// blocked reauth_required Signal supervisor exactly when this returns true,
+// and internal/sendcap reports such a park as queueable (account_recheck)
+// rather than hard-down for the same reason. Only
+// SignalAccountUnreadableFingerprint qualifies — its evidence is local and
+// ambiguous. Server-confirmed reauth (SignalAccountInvalidFingerprint), the
+// upgrade gates, empty or unknown fingerprints, and anything added later
+// stay user-owned until they are deliberately listed here.
+func ParkRetestedAutomatically(fingerprint string) bool {
+	return fingerprint == SignalAccountUnreadableFingerprint
+}
+
+// parkFingerprintFor normalizes a terminal exit fingerprint for
+// StatusSnapshot.ParkFingerprint.
+func parkFingerprintFor(fingerprint string) string {
+	if fingerprint == "" {
+		return SignalParkUnspecifiedFingerprint
+	}
+	return fingerprint
+}
 
 // PollerExit is the terminal result of exactly one retained poller lifecycle.
 // A zero Kind is a caller-requested stop.
@@ -366,7 +411,18 @@ type StatusSnapshot struct {
 	// (signal-cli could not read an account that accounts.json still lists):
 	// the cmd-layer park retest re-probes that state on a slow cadence, so a
 	// transient false park heals without a manual /api/signal/connect.
-	NeedsReauth     bool                   `json:"needs_reauth,omitempty"`
+	// ParkFingerprint says which park this is, and ParkRetestedAutomatically
+	// says whether it is the self-retesting one.
+	NeedsReauth bool `json:"needs_reauth,omitempty"`
+	// ParkFingerprint is the terminal exit fingerprint behind needs_reauth
+	// or upgrade_required (signal_account_unreadable, signal_account_invalid,
+	// signal_cli_too_old, the poison-envelope fingerprint, or
+	// SignalParkUnspecifiedFingerprint). It is non-empty exactly when one of
+	// those flags is set. For every park the receive loop raises it equals
+	// the fingerprint on that generation's PollerExit — the value the Signal
+	// adapter hands the supervisor as its blocked ErrorFingerprint — so
+	// /api/status can say which park is standing without log access.
+	ParkFingerprint string                 `json:"park_fingerprint,omitempty"`
 	HistorySync     *HistorySyncSnapshot   `json:"history_sync,omitempty"`
 	ReceiveRecovery *ReceiveRecoveryStatus `json:"receive_recovery,omitempty"`
 }
@@ -432,6 +488,10 @@ type Bridge struct {
 	// signal-cli version or its known poison-envelope crash. Automatic
 	// reconnects stay parked until a manual connect re-runs the version gate.
 	upgradeRequired bool
+	// parkFingerprint is the terminal fingerprint behind needsReauth or
+	// upgradeRequired, set at every park site and cleared wherever both flags
+	// clear (see StatusSnapshot.ParkFingerprint).
+	parkFingerprint string
 	// probeEmptyStreak counts consecutive receive generations whose local
 	// account probe stayed empty (or reported account-invalid text) while
 	// accounts.json still listed a linked account. It gates the
@@ -765,6 +825,7 @@ func (b *Bridge) Connect() error {
 		b.connecting = true
 		b.needsReauth = false
 		b.upgradeRequired = false
+		b.parkFingerprint = ""
 		b.lastError = ""
 		account := b.account
 		b.mu.Unlock()
@@ -782,6 +843,7 @@ func (b *Bridge) Connect() error {
 	b.connecting = true
 	b.needsReauth = false
 	b.upgradeRequired = false
+	b.parkFingerprint = ""
 	b.lastError = ""
 	b.qr = QRSnapshot{}
 	b.mu.Unlock()
@@ -818,6 +880,7 @@ func (b *Bridge) StartPoller(ctx context.Context) (PollerRun, error) {
 	b.connecting = true
 	b.needsReauth = false
 	b.upgradeRequired = false
+	b.parkFingerprint = ""
 	b.lastError = ""
 	if account == "" {
 		b.pairing = true
@@ -879,6 +942,7 @@ func (b *Bridge) UnpairContext(ctx context.Context) error {
 	b.account = ""
 	b.needsReauth = false
 	b.upgradeRequired = false
+	b.parkFingerprint = ""
 	b.probeEmptyStreak = 0
 	b.lastError = ""
 	b.qr = QRSnapshot{}
@@ -911,6 +975,7 @@ func (b *Bridge) Status() StatusSnapshot {
 		QRUpdatedAt:     b.qr.UpdatedAt,
 		UpgradeRequired: b.upgradeRequired,
 		NeedsReauth:     b.needsReauth,
+		ParkFingerprint: b.parkFingerprint,
 		HistorySync:     b.historySyncSnapshotLocked(),
 	}
 	b.mu.RUnlock()
@@ -972,12 +1037,15 @@ func (b *Bridge) ApplyPollerFailure(exit PollerExit) {
 	case PollerFailureReauth:
 		b.needsReauth = true
 		b.upgradeRequired = false
+		b.parkFingerprint = parkFingerprintFor(exit.Fingerprint)
 	case PollerFailureUpgrade:
 		b.needsReauth = false
 		b.upgradeRequired = true
+		b.parkFingerprint = parkFingerprintFor(exit.Fingerprint)
 	case PollerFailureTransient:
 		b.needsReauth = false
 		b.upgradeRequired = false
+		b.parkFingerprint = ""
 	}
 	b.mu.Unlock()
 	b.emitStatusChange()
@@ -1705,7 +1773,7 @@ func (b *Bridge) runReceiveLoop(
 			"signal-cli %s is below the required minimum %s; upgrade signal-cli to continue receiving messages",
 			version, minimumSignalCLIVersion,
 		)
-		b.parkUpgradeRequired(token, detail)
+		b.parkUpgradeRequired(token, SignalCLIVersionFingerprint, detail)
 		return PollerExit{
 			Kind:        PollerFailureUpgrade,
 			Operation:   "version_gate",
@@ -1745,6 +1813,7 @@ func (b *Bridge) runReceiveLoop(
 	b.connecting = false
 	b.needsReauth = false // successful connect clears any prior re-auth flag
 	b.upgradeRequired = false
+	b.parkFingerprint = ""
 	b.probeEmptyStreak = 0
 	b.lastError = ""
 	b.mu.Unlock()
@@ -1835,6 +1904,7 @@ func (b *Bridge) runReceiveLoop(
 				b.connected = false
 				b.connecting = false
 				b.needsReauth = true
+				b.parkFingerprint = SignalAccountInvalidFingerprint
 				b.lastError = cleanSignalCommandOutput(err, output)
 				b.logger.Warn().Str("account", b.account).Msg("Signal account needs re-pairing (signal-cli reports unregistered/unauthorized)")
 				b.mu.Unlock()
@@ -1864,7 +1934,7 @@ func (b *Bridge) runReceiveLoop(
 					"signal-cli repeatedly failed in IncomingMessageHandler.getSender() because content is null; upgrade signal-cli to %s or newer",
 					minimumSignalCLIVersion,
 				)
-				b.parkUpgradeRequired(token, detail)
+				b.parkUpgradeRequired(token, signalGetSenderPoisonFingerprint, detail)
 				return PollerExit{
 					Kind:        PollerFailureUpgrade,
 					Operation:   "receive",
@@ -2039,6 +2109,13 @@ func (b *Bridge) classifyFailedAccountProbe(token uint64, probeErr error) Poller
 			exit.Err = errors.New(b.lastError)
 		}
 	}
+	// upgradeRequired was cleared above, so needsReauth alone decides whether
+	// this exit left a park standing.
+	if b.needsReauth {
+		b.parkFingerprint = parkFingerprintFor(exit.Fingerprint)
+	} else {
+		b.parkFingerprint = ""
+	}
 	if b.receiveToken == token {
 		b.receiveCancel = nil
 	}
@@ -2047,7 +2124,10 @@ func (b *Bridge) classifyFailedAccountProbe(token uint64, probeErr error) Poller
 	return exit
 }
 
-func (b *Bridge) parkUpgradeRequired(token uint64, detail string) {
+// parkUpgradeRequired latches the upgrade park for the current generation.
+// fingerprint must be the one the caller returns on its PollerExit, so the
+// published park_fingerprint matches the supervisor's blocked fingerprint.
+func (b *Bridge) parkUpgradeRequired(token uint64, fingerprint, detail string) {
 	detail = strings.TrimSpace(detail)
 	b.mu.Lock()
 	if b.receiveToken != token {
@@ -2059,6 +2139,7 @@ func (b *Bridge) parkUpgradeRequired(token uint64, detail string) {
 	b.connecting = false
 	b.needsReauth = false
 	b.upgradeRequired = true
+	b.parkFingerprint = parkFingerprintFor(fingerprint)
 	b.lastError = detail
 	account := b.account
 	b.mu.Unlock()

@@ -22,15 +22,10 @@ const (
 	// signalParkRetestInterval paces the automatic retest of a reauth park
 	// whose evidence was an ambiguous empty probe (signal_account_unreadable:
 	// signal-cli could not load an account that accounts.json still lists).
-	// The retest is one supervisor RetryBlocked — a listAccounts probe that
-	// either reconnects or re-parks. While signal-cli still considers the
-	// account registered, that probe includes signal-cli's own account check
-	// against the server (one light round-trip per retest); once a real
-	// deregistration has persisted "registered": false, every retest fails
-	// locally with no network traffic. Either way the cadence stays slow and
-	// bounds a false park to minutes instead of the 12-22h outages observed
-	// live.
-	signalParkRetestInterval = 15 * time.Minute
+	// The cadence lives in signallive.ParkRetestInterval (see there for the
+	// cost of each retest) because internal/sendcap quotes it in the
+	// account_recheck send reason; one constant keeps the two in step.
+	signalParkRetestInterval = signallive.ParkRetestInterval
 )
 
 func signalSupervisorPolicy() bridge.Policy {
@@ -100,14 +95,18 @@ func newSignalSupervisorControl(
 }
 
 // StartParkRetest launches the paced retest loop for the one Signal park that
-// is allowed to heal itself: StateBlocked with reauth_required and the
-// signal_account_unreadable fingerprint, which the bridge only reaches on
-// ambiguous evidence (listAccounts persistently empty while accounts.json
-// still lists a linked account — the shape of the transient account-check
-// false parks observed live 2026-07-24 and 2026-08-06). Every other park
-// stays user-owned: server-confirmed reauth (signal_account_invalid), upgrade
-// gates, and pairing failures are never retried automatically, and nothing
-// here ever unpairs. The loop stops with Stop; a no-op interval disables it.
+// is allowed to heal itself: StateBlocked with reauth_required and a
+// fingerprint signallive.ParkRetestedAutomatically accepts (today only
+// signal_account_unreadable), which the bridge only reaches on ambiguous
+// evidence (listAccounts persistently empty while accounts.json still lists
+// a linked account — the shape of the transient account-check false parks
+// observed live 2026-07-24 and 2026-08-06). internal/sendcap reads the same
+// predicate to call that park queueable (account_recheck), so "re-checked
+// automatically" in a send reason is true exactly when this loop would
+// retry. Every other park stays user-owned: server-confirmed reauth
+// (signal_account_invalid), upgrade gates, and pairing failures are never
+// retried automatically, and nothing here ever unpairs. The loop stops with
+// Stop; a no-op interval disables it.
 func (c *signalSupervisorControl) StartParkRetest(interval time.Duration, logger zerolog.Logger) {
 	if c == nil || interval <= 0 {
 		return
@@ -140,7 +139,7 @@ func (c *signalSupervisorControl) maybeRetestPark(logger zerolog.Logger) {
 	snapshot := supervisor.Snapshot()
 	if snapshot.State != bridge.StateBlocked ||
 		snapshot.ErrorClass != bridge.FailureReauthRequired ||
-		snapshot.ErrorFingerprint != signallive.SignalAccountUnreadableFingerprint {
+		!signallive.ParkRetestedAutomatically(snapshot.ErrorFingerprint) {
 		return
 	}
 	logger.Info().
