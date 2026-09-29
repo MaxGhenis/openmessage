@@ -525,14 +525,23 @@ func parseOptionalSchedule(raw string) (time.Time, error) {
 	return validateOptionalSchedule(&value)
 }
 
+// validateOptionalTTL maps an optional ttl_ms to a send window: absent or 0
+// means no expiry, otherwise 1..86,400,000 ms (messaging.MaxTTL). The shared
+// validator checks bounds before multiplying, so a huge value is rejected
+// instead of wrapping into another window (2^58 ms would otherwise wrap to 0,
+// i.e. "never expire").
 func validateOptionalTTL(ttlMS *int64) (time.Duration, error) {
 	if ttlMS == nil {
 		return 0, nil
 	}
-	if *ttlMS < 0 {
-		return 0, errors.New("ttl_ms must not be negative")
+	ttl, err := messaging.TTLFromMilliseconds(*ttlMS)
+	if err != nil {
+		return 0, fmt.Errorf(
+			"ttl_ms must be between 0 (no expiry) and %d (24 hours)",
+			int64(messaging.MaxTTL/time.Millisecond),
+		)
 	}
-	return time.Duration(*ttlMS) * time.Millisecond, nil
+	return ttl, nil
 }
 
 func parseOptionalTTL(raw string) (time.Duration, error) {

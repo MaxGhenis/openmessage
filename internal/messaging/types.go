@@ -100,6 +100,7 @@ type CommonCommand struct {
 	// read receipt): an intent not yet handed to the transport when the
 	// window closes, including one leased and waiting behind an earlier send
 	// in its batch, is canceled as expired instead of transmitted stale.
+	// A nonzero TTL must be 1ms..MaxTTL (24h); see ValidateTTL.
 	TTL time.Duration
 
 	// Force bypasses the near-duplicate guard for a deliberate resend.

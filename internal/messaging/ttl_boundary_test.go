@@ -393,6 +393,61 @@ func TestReactionAndReadReceiptStampSendWindow(t *testing.T) {
 	}
 }
 
+// TestEveryKindRejectsOutOfRangeTTL: ValidateTTL runs for all four kinds
+// before anything durable is written.
+func TestEveryKindRejectsOutOfRangeTTL(t *testing.T) {
+	clock := newManualClock(messagingTestTime)
+	store := openMessagingTestStore(t, clock.Now())
+	seedDispatchDevice(t, store, "device-range", clock.Now())
+	target := mustProjectDispatchMessage(t, store, clock, sqlite.Message{
+		MessageID:       "message-range-target",
+		ConversationID:  "conversation-1",
+		AccountID:       "account-1",
+		RemoteMessageID: "remote-range-target",
+		Direction:       sqlite.MessageDirectionOutgoing,
+		Body:            "range target",
+		State:           sqlite.MessageStateActive,
+		OccurredAtMS:    clock.Now().UnixMilli(),
+	})
+	registry := newScriptedRegistry("range", &scriptedTextSender{})
+	registry.setMediaSender(&scriptedMediaSender{})
+	registry.setReactionSender(&scriptedReactionSender{})
+	registry.setReadReceiptSender(&scriptedReadReceiptSender{})
+	blobs, blobRoot := newMessagingTestBlobStore(t)
+	service := newMessagingTestServiceWithBlobs(t, store, registry, blobs, clock)
+
+	for i, ttl := range []time.Duration{-time.Second, 500 * time.Microsecond, MaxTTL + time.Millisecond} {
+		command := testCommonCommand(fmt.Sprintf("range-%d", i))
+		command.TTL = ttl
+		_, textErr := service.SendText(context.Background(), SendTextCommand{CommonCommand: command, Body: "range text"})
+		_, mediaErr := service.SendMedia(context.Background(), SendMediaCommand{
+			CommonCommand: command, Content: bytes.NewReader([]byte("range media")), Filename: "range.bin",
+		})
+		_, reactionErr := service.SendReaction(context.Background(), SendReactionCommand{
+			CommonCommand: command, TargetMessageID: target.MessageID, Emoji: "👍",
+		})
+		_, readErr := service.MarkRead(context.Background(), MarkReadCommand{
+			CommonCommand: command, DeviceID: "device-range", LastReadMessageID: target.MessageID,
+		})
+		for name, err := range map[string]error{"text": textErr, "media": mediaErr, "reaction": reactionErr, "read": readErr} {
+			var invalid *InvalidTTLError
+			if !errors.Is(err, ErrInvalidCommand) || !errors.As(err, &invalid) {
+				t.Errorf("%s with TTL %v: error = %v, want *InvalidTTLError", name, ttl, err)
+			}
+		}
+	}
+	pending, err := service.ListPending(context.Background(), ListPendingQuery{Limit: 10})
+	if err != nil {
+		t.Fatalf("ListPending(): %v", err)
+	}
+	if len(pending) != 0 {
+		t.Fatalf("rejected TTLs left %d outbox rows: %+v", len(pending), pending)
+	}
+	if files := messagingBlobFiles(t, blobRoot); len(files) != 0 {
+		t.Fatalf("rejected media TTL still wrote blobs: %v", files)
+	}
+}
+
 // ttlBatchCase is one generated dispatch history: a batch of text sends with
 // mixed windows, per-call transport durations (some longer than the 30s
 // lease), an optional slow bridge acquisition, and an idle gap first.

@@ -5,10 +5,14 @@ package web
 // /api/status per-platform send capability block.
 
 import (
+	"bytes"
 	"encoding/json"
+	"io"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -37,6 +41,79 @@ func TestOptionalTTLParsing(t *testing.T) {
 	}
 	if _, err := parseOptionalTTL("not-a-number"); err == nil {
 		t.Fatal("parseOptionalTTL accepted junk")
+	}
+
+	// Bounds are checked before multiplying into nanoseconds. Each of these
+	// used to be accepted: 2^58 ms wrapped to 0 (never expire), 2^58+1 ms to
+	// a 1ms window, and the larger ones to negative windows.
+	for _, raw := range []string{
+		"288230376151711744",  // 2^58
+		"288230376151711745",  // 2^58 + 1
+		"9223372036854775807", // MaxInt64
+		"9223372036855",
+		"86400001", // one past 24 hours
+		"-1",
+	} {
+		ttl, err := parseOptionalTTL(raw)
+		if err == nil {
+			t.Errorf("parseOptionalTTL(%s) = %v, nil; want rejected", raw, ttl)
+			continue
+		}
+		if !strings.Contains(err.Error(), "ttl_ms must be between 0 (no expiry) and 86400000") {
+			t.Errorf("parseOptionalTTL(%s) error = %q, want the ttl_ms range", raw, err)
+		}
+	}
+	accepted := map[string]time.Duration{
+		"0":        0, // explicit 0 is no expiry, same as absent
+		"1":        time.Millisecond,
+		"86400000": 24 * time.Hour,
+	}
+	for raw, want := range accepted {
+		if ttl, err := parseOptionalTTL(raw); err != nil || ttl != want {
+			t.Errorf("parseOptionalTTL(%s) = %v, %v; want %v, nil", raw, ttl, err, want)
+		}
+	}
+}
+
+// TestSubmitRejectsWrappingTTLWith400 drives both submit routes: an
+// out-of-range ttl_ms is a 400 naming the range, and it is refused before any
+// v2 dependency is touched (the dependencies here are deliberately empty).
+func TestSubmitRejectsWrappingTTLWith400(t *testing.T) {
+	ts := newV1RecorderHarness(t, APIOptions{V2: &V2Options{}})
+	for _, ttlMS := range []string{"288230376151711744", "86400001", "-5"} {
+		body := `{"conversation_id":"conversation-ttl","body":"hi","idempotency_key":"ttl-wrap-key","ttl_ms":` + ttlMS + `}`
+		textRequest := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/api/v1/outbox/messages", strings.NewReader(body))
+		textRequest.Header.Set("Content-Type", "application/json")
+
+		var form bytes.Buffer
+		writer := multipart.NewWriter(&form)
+		for field, value := range map[string]string{
+			"conversation_id": "conversation-ttl",
+			"idempotency_key": "ttl-wrap-media-key",
+			"ttl_ms":          ttlMS,
+		} {
+			if err := writer.WriteField(field, value); err != nil {
+				t.Fatalf("WriteField(%s): %v", field, err)
+			}
+		}
+		if err := writer.Close(); err != nil {
+			t.Fatalf("multipart close: %v", err)
+		}
+		mediaRequest := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/api/v1/outbox/media", &form)
+		mediaRequest.Header.Set("Content-Type", writer.FormDataContentType())
+
+		for route, request := range map[string]*http.Request{"text": textRequest, "media": mediaRequest} {
+			resp := ts.do(t, request)
+			raw, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Errorf("%s ttl_ms=%s: status = %d, want 400; body=%s", route, ttlMS, resp.StatusCode, raw)
+				continue
+			}
+			if !strings.Contains(string(raw), "ttl_ms must be between 0 (no expiry) and 86400000") {
+				t.Errorf("%s ttl_ms=%s: body = %s, want the ttl_ms range", route, ttlMS, raw)
+			}
+		}
 	}
 }
 

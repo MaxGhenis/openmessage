@@ -1058,10 +1058,12 @@ func (s *MessageService) reconcileStoreFailedDue(ctx context.Context, limit int)
 
 // expiryMilliseconds resolves a command's TTL against its effective schedule.
 // The window opens at the later of "now" and NotBefore so a scheduled send is
-// never born expired.
+// never born expired: ValidateTTL admits only 0 (no expiry) or 1ms..MaxTTL,
+// and any TTL of at least 1ms puts expires_at_ms at or after
+// scheduled_for_ms+1 for every sub-millisecond phase of scheduledFor.
 func expiryMilliseconds(cmd CommonCommand, scheduledFor time.Time) (int64, error) {
-	if cmd.TTL < 0 {
-		return 0, fmt.Errorf("%w: TTL is negative", ErrInvalidCommand)
+	if err := ValidateTTL(cmd.TTL); err != nil {
+		return 0, err
 	}
 	if cmd.TTL == 0 {
 		return 0, nil
@@ -1252,6 +1254,11 @@ func validateSendMediaCommand(cmd *SendMediaCommand) error {
 	}
 	if !cmd.NotBefore.IsZero() && cmd.NotBefore.UnixMilli() <= 0 {
 		return fmt.Errorf("%w: scheduled Unix time is not positive", ErrInvalidCommand)
+	}
+	// SendMedia writes the blob before it computes the expiry, so an
+	// out-of-range window is refused here, before that write.
+	if err := ValidateTTL(cmd.TTL); err != nil {
+		return err
 	}
 	return nil
 }
