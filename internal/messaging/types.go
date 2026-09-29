@@ -60,9 +60,12 @@ var (
 	// ErrNotImplemented marks API seams reserved for later rebuild items.
 	ErrNotImplemented = errors.New("messaging: not implemented")
 
-	// ErrDuplicateSend means a near-identical text was already submitted to
-	// the same conversation moments ago and the new submission did not carry
-	// Force. The wrapped DuplicateSendError names the prior intent.
+	// ErrDuplicateSend means a guarded text submission (GuardNearDuplicates
+	// set, Force not set) with a new idempotency key was refused because a
+	// near-identical text was submitted to the same conversation within the
+	// duplicate window. Nothing was written. The wrapping DuplicateSendError
+	// names the prior intent. A replay of an existing idempotency key never
+	// returns this error.
 	ErrDuplicateSend = errors.New("messaging: near-duplicate send blocked")
 )
 
@@ -103,7 +106,17 @@ type CommonCommand struct {
 	// A nonzero TTL must be 1ms..MaxTTL (24h); see ValidateTTL.
 	TTL time.Duration
 
-	// Force bypasses the near-duplicate guard for a deliberate resend.
+	// GuardNearDuplicates opts this submission into the near-duplicate guard.
+	// Only SendText consults it; media, reactions, read receipts, and
+	// SendAgain are never guarded. The zero value is unguarded, which is the
+	// safe failure mode for a caller that does not decide: each entry point
+	// sets it explicitly (MCP and the CLI on; HTTP only when the request
+	// carries guard_near_duplicates). The guard never applies to a replay of
+	// an existing idempotency key, which always resolves to the stored intent.
+	GuardNearDuplicates bool
+
+	// Force bypasses the near-duplicate guard for a deliberate resend. It is
+	// meaningful only together with GuardNearDuplicates.
 	Force bool
 }
 

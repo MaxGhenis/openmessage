@@ -3,6 +3,8 @@ package localapi
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -24,11 +26,12 @@ func TestSubmitTextSendsTTLAndForce(t *testing.T) {
 	client := NewClient(server.URL, "")
 	ttlMS := int64(600_000)
 	if _, err := client.SubmitText(context.Background(), TextSubmission{
-		ConversationID: "conversation-1",
-		Body:           "windowed",
-		IdempotencyKey: "key-1",
-		TTLMS:          &ttlMS,
-		Force:          true,
+		ConversationID:      "conversation-1",
+		Body:                "windowed",
+		IdempotencyKey:      "key-1",
+		TTLMS:               &ttlMS,
+		GuardNearDuplicates: true,
+		Force:               true,
 	}); err != nil {
 		t.Fatalf("SubmitText(): %v", err)
 	}
@@ -37,6 +40,79 @@ func TestSubmitTextSendsTTLAndForce(t *testing.T) {
 	}
 	if got, _ := received["force"].(bool); !got {
 		t.Fatalf("force = %v, want true", received["force"])
+	}
+	if got, _ := received["guard_near_duplicates"].(bool); !got {
+		t.Fatalf("guard_near_duplicates = %v, want true", received["guard_near_duplicates"])
+	}
+
+	// Unset flags are omitted, so a daemon applies its own defaults.
+	received = nil
+	if _, err := client.SubmitText(context.Background(), TextSubmission{
+		ConversationID: "conversation-1",
+		Body:           "plain",
+		IdempotencyKey: "key-2",
+	}); err != nil {
+		t.Fatalf("SubmitText(plain): %v", err)
+	}
+	for _, field := range []string{"guard_near_duplicates", "force", "ttl_ms"} {
+		if _, present := received[field]; present {
+			t.Fatalf("%s present in %v, want omitted", field, received)
+		}
+	}
+}
+
+func TestAsNearDuplicateRejection(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want NearDuplicateRejection
+		ok   bool
+	}{
+		{
+			name: "structured 409",
+			err:  &ResponseError{StatusCode: http.StatusConflict, Body: `{"error":"messaging: near-duplicate send blocked: …","error_kind":"near_duplicate_blocked","duplicate_of_outbox_id":"outbox-prior","duplicate_state":"queued","duplicate_age_ms":120000}`},
+			want: NearDuplicateRejection{
+				Message:             "messaging: near-duplicate send blocked: …",
+				Structured:          true,
+				DuplicateOfOutboxID: "outbox-prior",
+				DuplicateState:      "queued",
+				DuplicateAgeMS:      120_000,
+			},
+			ok: true,
+		},
+		{
+			name: "older daemon plain JSON 409",
+			err:  &ResponseError{StatusCode: http.StatusConflict, Body: `{"error":"messaging: near-duplicate send blocked: a very similar message…"}`},
+			want: NearDuplicateRejection{Message: "messaging: near-duplicate send blocked: a very similar message…"},
+			ok:   true,
+		},
+		{
+			name: "plain text 409",
+			err:  &ResponseError{StatusCode: http.StatusConflict, Body: "near-duplicate send blocked"},
+			want: NearDuplicateRejection{Message: "near-duplicate send blocked"},
+			ok:   true,
+		},
+		{
+			name: "error_kind is authoritative",
+			err:  &ResponseError{StatusCode: http.StatusConflict, Body: `{"error":"mentions near-duplicate","error_kind":"idempotency_conflict"}`},
+		},
+		{
+			name: "idempotency conflict",
+			err:  &ResponseError{StatusCode: http.StatusConflict, Body: `{"error":"outbox idempotency conflict"}`},
+		},
+		{
+			name: "not a conflict",
+			err:  &ResponseError{StatusCode: http.StatusBadRequest, Body: `{"error":"near-duplicate","error_kind":"near_duplicate_blocked"}`},
+		},
+		{name: "not a response error", err: errors.New("near-duplicate")},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, ok := AsNearDuplicateRejection(fmt.Errorf("wrapped: %w", test.err))
+			if ok != test.ok || got != test.want {
+				t.Fatalf("AsNearDuplicateRejection() = %+v, %v; want %+v, %v", got, ok, test.want, test.ok)
+			}
+		})
 	}
 }
 

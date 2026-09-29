@@ -80,7 +80,11 @@ func (deps sendCommandDeps) daemonClient() *localapi.Client {
 	}
 }
 
-func runSendWithDeps(ctx context.Context, deps sendCommandDeps, conversationID, message string, notBeforeMS *int64) error {
+func runSendWithDeps(ctx context.Context, deps sendCommandDeps, conversationID, message string, options SendOptions) error {
+	if options.IdempotencyKey != "" {
+		key := options.IdempotencyKey
+		deps.newKey = func() (string, error) { return key, nil }
+	}
 	if deps.client == nil {
 		deps.client = &http.Client{Timeout: 10 * time.Second}
 	}
@@ -121,7 +125,12 @@ func runSendWithDeps(ctx context.Context, deps sendCommandDeps, conversationID, 
 		ConversationID: conversationID,
 		Body:           message,
 		IdempotencyKey: key,
-		NotBeforeMS:    notBeforeMS,
+		NotBeforeMS:    options.NotBeforeMS,
+		// The CLI is an agent entry point (agents shell out to it), so its
+		// sends are guarded against near-duplicates like MCP sends; --force
+		// is the per-invocation override.
+		GuardNearDuplicates: true,
+		Force:               options.Force,
 	})
 	if err != nil {
 		if localapi.IsDeterministicRejection(err) {
@@ -157,7 +166,26 @@ func controlTokenFromDaemonStatus(status v2DaemonStatus, fallback string) string
 	return loadCLIControlToken(status.Auth.DataDir)
 }
 
+// deterministicRejectionError explains a daemon refusal that queued nothing.
+// HTTP 409 has two causes on the submit route, with opposite remedies: the
+// near-duplicate guard (rerun with --force; a new key would be refused
+// again) and an idempotency key already bound to different content (use a
+// new key).
 func deterministicRejectionError(err error) error {
+	if rejection, ok := localapi.AsNearDuplicateRejection(err); ok {
+		if rejection.Structured && rejection.DuplicateOfOutboxID != "" {
+			return fmt.Errorf(
+				"send rejected: blocked as a near-duplicate of outbox %s (state %s) submitted %s ago; nothing was queued; rerun with --force if this repeat is intended",
+				rejection.DuplicateOfOutboxID,
+				rejection.DuplicateState,
+				(time.Duration(rejection.DuplicateAgeMS) * time.Millisecond).Round(time.Second),
+			)
+		}
+		return fmt.Errorf(
+			"send rejected: blocked as a near-duplicate of a recent send (%s); nothing was queued; rerun with --force if this repeat is intended",
+			rejection.Message,
+		)
+	}
 	if responseErr, ok := localapi.AsResponseError(err); ok && responseErr.StatusCode == http.StatusConflict {
 		return fmt.Errorf("send rejected: %s; this key already carries different content; use a new key to send this message", responseErr.Body)
 	}

@@ -30,7 +30,7 @@ type V2Dependencies struct {
 	Registry  bridge.Registry
 }
 
-const v2DeliveryDescription = " With v2 sending enabled, this reports truthful transport state: transport_state is queued (has NOT left this machine), transmitted (the platform transport accepted it — NOT proof of delivery), delivered (a delivery receipt was observed), uncertain, failed, or canceled. settled/transmitted are true only on transport acknowledgment; while they are false the message is still durably queued and the app keeps sending it in the background — never send it again in response. An uncertain result means the transport may have accepted the message; do not retry automatically. Results include the platform actually used and the conversation_id written to; there is never a silent fallback to another platform. Sends carry a default ~10-minute send window (ttl_seconds; 0 = never expire) after which a still-queued message cancels as expired instead of sending stale. Near-identical resends within a few minutes are blocked unless force=true. Set wait_for_transmit=true (with wait_seconds, max 120) to keep waiting for transport acknowledgment before returning. Reuse the returned idempotency_key only to replay the exact same send after a lost response."
+const v2DeliveryDescription = " With v2 sending enabled, this reports truthful transport state: transport_state is queued (has NOT left this machine), transmitted (the platform transport accepted it — NOT proof of delivery), delivered (a delivery receipt was observed), uncertain, failed, or canceled. settled/transmitted are true only on transport acknowledgment; while they are false the message is still durably queued and the app keeps sending it in the background — never send it again in response. An uncertain result means the transport may have accepted the message; do not retry automatically. Results include the platform actually used and the conversation_id written to; there is never a silent fallback to another platform. Sends carry a default ~10-minute send window (ttl_seconds; 0 = never expire) after which a still-queued message cancels as expired instead of sending stale. Near-identical new sends to the same conversation within 10 minutes are blocked unless force=true; replaying an earlier send with its same idempotency_key is never blocked. Set wait_for_transmit=true (with wait_seconds, max 120) to keep waiting for transport acknowledgment before returning. Reuse the returned idempotency_key only to replay the exact same send after a lost response."
 
 const v2IdempotencyDescription = "Optional retry key for the exact same send. Every result echoes the key in use; reuse the same key only when repeating a send whose response was lost. Omit it to mint a new intent."
 
@@ -196,7 +196,10 @@ func submitV2Text(
 		Body:           body,
 		IdempotencyKey: key,
 		TTL:            ttl,
-		Force:          force,
+		// MCP is an agent entry point: its text sends are always guarded
+		// against near-duplicates; force is the per-call override.
+		GuardNearDuplicates: true,
+		Force:               force,
 	})
 	if err != nil {
 		var duplicate *messaging.DuplicateSendError

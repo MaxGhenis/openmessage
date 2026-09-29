@@ -58,12 +58,13 @@ func SubmitTextV2(
 	}
 	return deps.Service.SendText(ctx, messaging.SendTextCommand{
 		CommonCommand: messaging.CommonCommand{
-			AccountID:      conversation.AccountID,
-			ConversationID: conversation.ConversationID,
-			IdempotencyKey: input.IdempotencyKey,
-			NotBefore:      input.NotBefore,
-			TTL:            input.TTL,
-			Force:          input.Force,
+			AccountID:           conversation.AccountID,
+			ConversationID:      conversation.ConversationID,
+			IdempotencyKey:      input.IdempotencyKey,
+			NotBefore:           input.NotBefore,
+			TTL:                 input.TTL,
+			GuardNearDuplicates: input.GuardNearDuplicates,
+			Force:               input.Force,
 		},
 		Body:             input.Body,
 		ReplyToMessageID: replyToMessageID,

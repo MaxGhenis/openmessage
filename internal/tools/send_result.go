@@ -403,11 +403,18 @@ func withSendControlOptions(options []mcp.ToolOption, includeForce bool) []mcp.T
 		)),
 	)
 	if includeForce {
-		options = append(options, mcp.WithBoolean("force", mcp.Description(
-			"Bypass the near-duplicate guard: submit even though a very similar message was sent to this conversation within the last few minutes. Use only for a deliberate repeat.",
-		)))
+		options = append(options, mcp.WithBoolean("force", mcp.Description(forceArgumentDescription())))
 	}
 	return options
+}
+
+// forceArgumentDescription documents the force argument from the guard's
+// actual window so the tool text cannot drift from the service default.
+func forceArgumentDescription() string {
+	return fmt.Sprintf(
+		"Bypass the near-duplicate guard: submit even though a very similar message was submitted to this conversation within the last %d minutes. Use only for a deliberate repeat. The guard only refuses new sends: replaying an earlier send with its same idempotency_key always returns that send's result and never needs force.",
+		int(messaging.DefaultDuplicateWindow/time.Minute),
+	)
 }
 
 // messageByIDReader is the optional read-source capability used to check for
@@ -481,52 +488,56 @@ func platformMismatchResult(requested, actual, conversationID string) *mcp.CallT
 	return result
 }
 
-// duplicateBlockedResult surfaces the near-duplicate guard. Nothing was
-// queued, so an error result is safe (it cannot cause a double-send; it
-// prevents one).
+// duplicateBlockedResult surfaces the in-process near-duplicate guard. The
+// guard refuses only a new idempotency key (a replay of an existing key always
+// returns the original send) and the refused attempt wrote nothing, so an
+// error result is safe: it cannot cause a double-send; it prevents one.
 func duplicateBlockedResult(err *messaging.DuplicateSendError) *mcp.CallToolResult {
-	text := fmt.Sprintf(
-		"NOT QUEUED: a very similar message was submitted to this conversation %s ago (outbox %s, state %s) and may still reach the recipient. Sending this too would risk a double-text. Check that prior send first (list_outbox / get_conversation). If both messages are genuinely intended, resend with force=true.",
-		(time.Duration(err.PriorAgeMS) * time.Millisecond).Round(time.Second),
-		err.PriorOutboxID,
-		err.PriorState,
-	)
-	result := structuredResult(map[string]any{
-		"ok":                     false,
-		"error":                  text,
-		"error_kind":             "near_duplicate_blocked",
-		"duplicate_of_outbox_id": err.PriorOutboxID,
-		"duplicate_state":        string(err.PriorState),
-	}, text)
-	result.IsError = true
-	return result
+	return nearDuplicateBlockedResult(err.PriorOutboxID, string(err.PriorState), err.PriorAgeMS)
 }
 
-// daemonDuplicateBlockedResult recognizes the daemon's HTTP 409 for the
-// near-duplicate guard and renders the same guidance as the in-process path.
-func daemonDuplicateBlockedResult(responseErr *localapi.ResponseError) *mcp.CallToolResult {
+// daemonDuplicateBlockedResult renders the daemon's near-duplicate HTTP 409
+// with the same guidance and fields as the in-process path. A daemon that
+// predates the structured 409 names no prior intent, so its own error text is
+// quoted instead.
+func daemonDuplicateBlockedResult(rejection localapi.NearDuplicateRejection) *mcp.CallToolResult {
+	if rejection.Structured && rejection.DuplicateOfOutboxID != "" {
+		return nearDuplicateBlockedResult(
+			rejection.DuplicateOfOutboxID,
+			rejection.DuplicateState,
+			rejection.DuplicateAgeMS,
+		)
+	}
 	text := fmt.Sprintf(
-		"NOT QUEUED: the app blocked this as a near-duplicate of a message submitted moments ago that may still reach the recipient (%s). Check that prior send first (list_outbox / get_conversation). If both messages are genuinely intended, resend with force=true.",
-		responseErr.Body,
+		"NOT QUEUED: the app blocked this as a near-duplicate of a message submitted moments ago that has been sent or may still be sent (%s). Check that prior send first (list_outbox / get_conversation). If both messages are genuinely intended, resend with force=true; this attempt wrote nothing, so reusing its idempotency_key is safe.",
+		rejection.Message,
 	)
 	result := structuredResult(map[string]any{
 		"ok":         false,
 		"error":      text,
-		"error_kind": "near_duplicate_blocked",
+		"error_kind": localapi.NearDuplicateErrorKind,
 	}, text)
 	result.IsError = true
 	return result
 }
 
-func isDaemonDuplicateRejection(err error) (*localapi.ResponseError, bool) {
-	responseErr, ok := localapi.AsResponseError(err)
-	if !ok || responseErr.StatusCode != 409 {
-		return nil, false
-	}
-	if !strings.Contains(responseErr.Body, "near-duplicate") {
-		return nil, false
-	}
-	return responseErr, true
+func nearDuplicateBlockedResult(priorOutboxID, priorState string, priorAgeMS int64) *mcp.CallToolResult {
+	text := fmt.Sprintf(
+		"NOT QUEUED: a very similar message was submitted to this conversation %s ago (outbox %s, state %s); it has been sent or may still be sent. Sending this too would risk a double-text. Check that prior send first (list_outbox / get_conversation). If both messages are genuinely intended, resend with force=true; this attempt wrote nothing, so reusing its idempotency_key is safe.",
+		(time.Duration(priorAgeMS) * time.Millisecond).Round(time.Second),
+		priorOutboxID,
+		priorState,
+	)
+	result := structuredResult(map[string]any{
+		"ok":                     false,
+		"error":                  text,
+		"error_kind":             localapi.NearDuplicateErrorKind,
+		"duplicate_of_outbox_id": priorOutboxID,
+		"duplicate_state":        priorState,
+		"duplicate_age_ms":       priorAgeMS,
+	}, text)
+	result.IsError = true
+	return result
 }
 
 // localSendCapability computes per-platform send capability for a process

@@ -65,6 +65,11 @@ var (
 	// names a different outbound intent.
 	ErrIdempotencyConflict = errors.New("outbox idempotency conflict")
 
+	// ErrNearDuplicate means a guarded enqueue of a new text intent was
+	// refused because a recent intent in the same conversation matched it.
+	// The wrapping *NearDuplicateError names that prior intent.
+	ErrNearDuplicate = errors.New("outbox near-duplicate intent")
+
 	// ErrLeaseLost means an outbox mutation no longer owns the row's active
 	// dispatch lease.
 	ErrLeaseLost = errors.New("outbox lease lost")
