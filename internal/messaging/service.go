@@ -447,6 +447,10 @@ func (s *MessageService) SendReaction(
 	if scheduledFor.IsZero() {
 		scheduledFor = now
 	}
+	expiresAtMS, err := expiryMilliseconds(cmd.CommonCommand, scheduledFor)
+	if err != nil {
+		return Submission{}, err
+	}
 	payloadHash, err := reactionPayloadHash(cmd.TargetMessageID, cmd.Emoji, cmd.Action)
 	if err != nil {
 		return Submission{}, fmt.Errorf("send reaction: hash payload: %w", err)
@@ -462,6 +466,7 @@ func (s *MessageService) SendReaction(
 		Operation:          reactionOperation,
 		TransportRequestID: requestID,
 		ScheduledFor:       scheduledFor,
+		ExpiresAtMS:        expiresAtMS,
 	}, sqlite.OutboxReaction{
 		TargetMessageID: cmd.TargetMessageID,
 		Emoji:           cmd.Emoji,
@@ -550,6 +555,10 @@ func (s *MessageService) MarkRead(
 	if scheduledFor.IsZero() {
 		scheduledFor = now
 	}
+	expiresAtMS, err := expiryMilliseconds(cmd.CommonCommand, scheduledFor)
+	if err != nil {
+		return Submission{}, err
+	}
 	payloadHash, err := readPayloadHash(cmd.DeviceID, cmd.LastReadMessageID)
 	if err != nil {
 		return Submission{}, fmt.Errorf("mark read: hash payload: %w", err)
@@ -566,6 +575,7 @@ func (s *MessageService) MarkRead(
 		Operation:          readOperation,
 		TransportRequestID: requestID,
 		ScheduledFor:       scheduledFor,
+		ExpiresAtMS:        expiresAtMS,
 	}, sqlite.OutboxReadReceipt{
 		DeviceID:          cmd.DeviceID,
 		LastReadMessageID: cmd.LastReadMessageID,
@@ -778,6 +788,12 @@ func (s *MessageService) RetryNotDispatched(
 // that is the same accepted outcome as the echo arriving a moment after the
 // resend (both delivered) — the user explicitly chose to resend a
 // maybe-delivered message, and the two intents stay distinct rows.
+//
+// The new intent deliberately carries no send window (expires_at_ms NULL).
+// SendAgain is an explicit user action from the web UI outbox tray, and UI
+// sends carry no window either. Copying the predecessor's absolute expiry
+// would usually give a row born expired, because by the time a predecessor is
+// uncertain or rejected its window has typically closed.
 func (s *MessageService) SendAgain(
 	ctx context.Context,
 	outboxID string,
