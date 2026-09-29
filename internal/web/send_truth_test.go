@@ -99,7 +99,7 @@ func TestStatusReportsSendCapabilityBlock(t *testing.T) {
 			return map[string]SendPlatformCapability{
 				sendcap.PlatformSMS:      {Available: true},
 				sendcap.PlatformWhatsApp: {Available: false, Reason: "whatsapp is not paired"},
-				sendcap.PlatformSignal:   {Available: false, Queueable: true, Reason: "signal is disconnected; a send submitted now would wait in the outbox until it reconnects"},
+				sendcap.PlatformSignal:   {Available: false, Queueable: true, Reason: "signal-cli could not read the linked Signal account", Condition: sendcap.ConditionAccountRecheck},
 			}
 		},
 	})
@@ -125,5 +125,10 @@ func TestStatusReportsSendCapabilityBlock(t *testing.T) {
 	signal := payload.Send["signal"]
 	if signal.Available || !signal.Queueable {
 		t.Fatalf("signal = %+v, want unavailable but queueable", signal)
+	}
+	// The typed condition is published beside the tier (area G: it must
+	// survive the daemon hop for clients to tell Signal's parks apart).
+	if signal.Condition != sendcap.ConditionAccountRecheck {
+		t.Fatalf("signal condition = %q, want %q", signal.Condition, sendcap.ConditionAccountRecheck)
 	}
 }

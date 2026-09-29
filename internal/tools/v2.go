@@ -32,6 +32,12 @@ type V2Dependencies struct {
 
 const v2DeliveryDescription = " With v2 sending enabled, this reports truthful transport state: transport_state is queued (has NOT left this machine), transmitted (the platform transport accepted it — NOT proof of delivery), delivered (a delivery receipt was observed), uncertain, failed, or canceled. settled/transmitted are true only on transport acknowledgment; while they are false the message is still durably queued and the app keeps sending it in the background — never send it again in response. An uncertain result means the transport may have accepted the message; do not retry automatically. Results include the platform actually used and the conversation_id written to; there is never a silent fallback to another platform. Sends carry a default ~10-minute send window (ttl_seconds; 0 = never expire) after which a still-queued message cancels as expired instead of sending stale. Near-identical resends within a few minutes are blocked unless force=true. Set wait_for_transmit=true (with wait_seconds, max 120) to keep waiting for transport acknowledgment before returning. Reuse the returned idempotency_key only to replay the exact same send after a lost response."
 
+// v2TransportsEnabled is the transports flag the in-process v2 send paths
+// compute capability with. V2Dependencies exist only in a process that owns
+// its transports: cmd serve builds the v2 send stack only when transports
+// are on, and client mode (no transports) routes sends at the daemon instead.
+const v2TransportsEnabled = true
+
 const v2IdempotencyDescription = "Optional retry key for the exact same send. Every result echoes the key in use; reuse the same key only when repeating a send whose response was lost. Omit it to mint a new intent."
 
 func activeV2(options []*V2Dependencies) *V2Dependencies {
@@ -188,7 +194,7 @@ func submitV2Text(
 		return errorResult(err.Error())
 	}
 	platform := v2.sendPlatform(a, conversationID)
-	if failure := checkPlatformSendable(localSendCapability(a, v2), platform); failure != nil {
+	if failure := checkPlatformSendable(localSendCapability(a, v2, v2TransportsEnabled), platform); failure != nil {
 		return failure
 	}
 	submission, err := v2.submitText(ctx, a, v2wire.TextInput{

@@ -91,7 +91,10 @@ type UnpairFunc func() error
 // outbox, where they wait — exactly the condition agents must see before
 // submitting time-sensitive messages. The computation lives in
 // internal/sendcap so the daemon status block and the MCP client's send-time
-// enforcement answer identically.
+// enforcement answer identically. Each entry carries available / queueable /
+// reason plus a typed "condition" on every non-available result (for
+// example Signal's queueable "account_recheck" park versus its hard
+// "relink_required" and "upgrade_required" parks).
 type SendPlatformCapability = sendcap.Capability
 
 // APIOptions holds optional callbacks for the API handler.

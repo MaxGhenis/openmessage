@@ -611,6 +611,9 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 		Reads:     reads,
 		V2Primary: v2Primary,
 		V2:        mcpV2,
+		// In-process send capability must agree with this process's
+		// /api/status send block (sendCapabilityProvider below).
+		TransportsEnabled: transports,
 	})
 
 	var mcpHTTPHandler http.Handler

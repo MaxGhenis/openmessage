@@ -35,7 +35,7 @@ var (
 
 func getStatusTool() mcp.Tool {
 	return mcp.NewTool("get_status",
-		mcp.WithDescription("Get connection, pairing, and per-platform SEND capability for Google Messages (SMS/RCS), WhatsApp, and Signal. \"Connected\" alone does not mean a platform can send — check the send capability block before submitting a time-sensitive message; a platform can receive while its send path is unavailable."),
+		mcp.WithDescription("Get connection, pairing, and per-platform SEND capability for Google Messages (SMS/RCS), WhatsApp, and Signal. \"Connected\" alone does not mean a platform can send — check the send capability block before submitting a time-sensitive message; a platform can receive while its send path is unavailable. Every non-available platform names a typed condition: queueable ones (disconnected, phone_not_responding, account_recheck) accept a send that waits in the outbox; unavailable ones (not_paired, adapter_missing, auth_expired, needs_repair, relink_required, upgrade_required, no_transports) refuse it. A parked Signal also reports its park_fingerprint."),
 		mcp.WithReadOnlyHintAnnotation(true),
 		mcp.WithDestructiveHintAnnotation(false),
 	)
@@ -53,14 +53,27 @@ func appendSendCapabilityText(sb *strings.Builder, capabilities map[string]sendc
 		if !ok {
 			continue
 		}
-		switch {
-		case capability.Available:
-			fmt.Fprintf(sb, "  %s: available\n", platform)
-		case capability.Queueable:
-			fmt.Fprintf(sb, "  %s: DEGRADED (sends queue, not transmit) — %s\n", platform, firstNonEmpty(capability.Reason, "reason unknown"))
-		default:
-			fmt.Fprintf(sb, "  %s: UNAVAILABLE — %s\n", platform, firstNonEmpty(capability.Reason, "reason unknown"))
-		}
+		sb.WriteString(sendCapabilityLine(platform, capability))
+	}
+}
+
+// sendCapabilityLine renders one platform's send capability for both the
+// in-process and the daemon-routed get_status: the tier first, then the
+// typed condition in brackets so agents can branch on it without parsing
+// the reason.
+func sendCapabilityLine(platform string, capability sendcap.Capability) string {
+	condition := ""
+	if capability.Condition != "" {
+		condition = fmt.Sprintf(" [%s]", capability.Condition)
+	}
+	reason := firstNonEmpty(capability.Reason, "reason unknown")
+	switch sendcap.TierOf(capability) {
+	case sendcap.TierAvailable:
+		return fmt.Sprintf("  %s: available\n", platform)
+	case sendcap.TierQueueable:
+		return fmt.Sprintf("  %s: DEGRADED (sends queue, not transmit)%s — %s\n", platform, condition, reason)
+	default:
+		return fmt.Sprintf("  %s: UNAVAILABLE%s — %s\n", platform, condition, reason)
 	}
 }
 
@@ -134,11 +147,20 @@ func getStatusHandler(a *app.App, configured ...Options) server.ToolHandlerFunc 
 		if signal.Account != "" {
 			fmt.Fprintf(&sb, "  Account: %s\n", signal.Account)
 		}
+		if signal.NeedsReauth {
+			sb.WriteString("  Needs reauth: true\n")
+		}
+		if signal.UpgradeRequired {
+			sb.WriteString("  Upgrade required: true\n")
+		}
+		if signal.ParkFingerprint != "" {
+			fmt.Fprintf(&sb, "  Park fingerprint: %s\n", signal.ParkFingerprint)
+		}
 		if signal.LastError != "" {
 			fmt.Fprintf(&sb, "  Last error: %s\n", signal.LastError)
 		}
 
-		sendCapabilities := localSendCapability(a, options.V2)
+		sendCapabilities := localSendCapability(a, options.V2, options.TransportsEnabled)
 		appendSendCapabilityText(&sb, sendCapabilities)
 
 		if options.V2Primary {

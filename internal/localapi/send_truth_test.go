@@ -124,3 +124,18 @@ func TestSendCapabilityForDistinguishesUnknownFromUnavailable(t *testing.T) {
 		t.Fatal("platform missing from the send block must report unknown")
 	}
 }
+
+func TestDaemonStatusDecodesSendCondition(t *testing.T) {
+	var status DaemonStatus
+	raw := `{"send":{"signal":{"available":false,"queueable":true,"reason":"r","condition":"account_recheck"},"sms":{"available":true}}}`
+	if err := json.Unmarshal([]byte(raw), &status); err != nil {
+		t.Fatal(err)
+	}
+	signal, known := status.SendCapabilityFor("signal")
+	if !known || signal.Available || !signal.Queueable || signal.Reason != "r" || signal.Condition != "account_recheck" {
+		t.Fatalf("signal = %+v known=%v, want the queueable account_recheck entry with its condition", signal, known)
+	}
+	if sms, _ := status.SendCapabilityFor("sms"); !sms.Available || sms.Condition != "" {
+		t.Fatalf("sms = %+v, want available with no condition", sms)
+	}
+}

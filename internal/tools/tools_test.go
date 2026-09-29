@@ -733,6 +733,11 @@ func TestResolveContactRoutesPrefersSMSThread(t *testing.T) {
 	if match.Routes[0].Conversation.SourcePlatform != "sms" {
 		t.Fatalf("expected sms route first, got %#v", match.Routes)
 	}
+	for _, route := range match.Routes {
+		if route.SendCapability != "available" || !route.Sendable {
+			t.Fatalf("%s route = %+v, want send_capability=available and sendable", route.Conversation.SourcePlatform, route)
+		}
+	}
 }
 
 func TestSendToConversationSignal(t *testing.T) {
@@ -758,19 +763,19 @@ func TestSendToConversationSignal(t *testing.T) {
 			t.Fatalf("body = %q, want Hello from MCP", body)
 		}
 		return conversationSummary{
-				ConversationID: conversationID,
-				Name:           "Taylor",
-				SourcePlatform: "signal",
-				IsGroup:        true,
-				LastMessageTS:  now,
-			}, messageSummary{
-				MessageID:      "signal:out-1",
-				ConversationID: conversationID,
-				Body:           body,
-				TimestampMS:    now + 1,
-				IsFromMe:       true,
-				SourcePlatform: "signal",
-			}, nil
+			ConversationID: conversationID,
+			Name:           "Taylor",
+			SourcePlatform: "signal",
+			IsGroup:        true,
+			LastMessageTS:  now,
+		}, messageSummary{
+			MessageID:      "signal:out-1",
+			ConversationID: conversationID,
+			Body:           body,
+			TimestampMS:    now + 1,
+			IsFromMe:       true,
+			SourcePlatform: "signal",
+		}, nil
 	}
 	t.Cleanup(func() {
 		sendTextToConversation = originalSendTextToConversation
