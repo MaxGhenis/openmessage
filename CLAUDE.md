@@ -105,6 +105,11 @@ mode this prevents and the `~/.mcp.json` recipe.
 - `render_story` — render a pre-built Story JSON into HTML viz; supports `photo_paths` (curated list) or `photos_dir`
 - `send_message`, `draft_message`, `download_media`, `list_contacts`, `get_status`
 
+Optional API story generation uses `claude-sonnet-5-5` with medium effort and
+a 16,000-token limit when the caller supplies an Anthropic API key. Without a
+key, or if the API fails or refuses the request, it generates a local
+stats-and-quotes story. There is no environment override for the model.
+
 On a v2-primary install the message-read tools (including `get_person_messages`
 and `get_person_messages_range`) serve the v2 store through the canonical read
 seam; on v2 their `limit` is capped (500 and 2,000, and the output says when

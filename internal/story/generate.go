@@ -23,10 +23,10 @@ type Story struct {
 
 // Chapter is a thematic section of the story.
 type Chapter struct {
-	Title    string  `json:"title"`
-	Content  string  `json:"content"`
-	Quotes   []Quote `json:"quotes"`
-	Period   string  `json:"period"` // e.g. "2013-2015"
+	Title   string  `json:"title"`
+	Content string  `json:"content"`
+	Quotes  []Quote `json:"quotes"`
+	Period  string  `json:"period"` // e.g. "2013-2015"
 }
 
 // Quote is a notable message from the conversation.
@@ -213,6 +213,78 @@ func truncate(s string, maxLen int) string {
 	return string(runes[:maxLen-3]) + "..."
 }
 
+// Claude API settings for the optional narrative. Sonnet 5.5 defaults to
+// adaptive thinking when the request omits "thinking", and
+// thinking tokens count toward max_tokens, so the limit leaves room for
+// thinking plus the multi-chapter JSON reply. Sonnet 5.5 rejects non-default
+// temperature/top_p/top_k, disabled thinking, forced tool_choice, and
+// assistant prefill; the request sends none of them.
+const (
+	claudeStoryModel     = "claude-sonnet-5-5"
+	claudeStoryEffort    = "medium"
+	claudeStoryMaxTokens = 16000
+)
+
+// claudeAPIURL is the Messages API endpoint. Tests point it at a local server.
+var claudeAPIURL = "https://api.anthropic.com/v1/messages"
+
+// claudeStoryRequest builds the Messages API request body for a story prompt.
+func claudeStoryRequest(prompt string) map[string]any {
+	return map[string]any{
+		"model":      claudeStoryModel,
+		"max_tokens": claudeStoryMaxTokens,
+		"output_config": map[string]any{
+			"effort": claudeStoryEffort,
+		},
+		"messages": []map[string]string{
+			{"role": "user", "content": prompt},
+		},
+	}
+}
+
+// claudeMessage is the part of a Messages API response the story reads.
+type claudeMessage struct {
+	StopReason  string `json:"stop_reason"`
+	StopDetails *struct {
+		Category *string `json:"category"`
+	} `json:"stop_details"`
+	Content []claudeBlock `json:"content"`
+}
+
+// claudeBlock is one response content block. Thinking blocks carry their
+// (usually empty) text in a "thinking" field, so Text is empty for them.
+type claudeBlock struct {
+	Type string `json:"type"`
+	Text string `json:"text"`
+}
+
+// text returns the reply's text blocks joined in order. Blocks are read by
+// type, not position: the reply can open with thinking blocks (empty text by
+// default). A refusal or a reply cut off at max_tokens is an error, never a
+// partial story.
+func (m claudeMessage) text() (string, error) {
+	switch m.StopReason {
+	case "refusal":
+		category := "unspecified"
+		if m.StopDetails != nil && m.StopDetails.Category != nil {
+			category = *m.StopDetails.Category
+		}
+		return "", fmt.Errorf("API declined the request (stop_reason refusal, category %s)", category)
+	case "max_tokens":
+		return "", fmt.Errorf("API response truncated at max_tokens %d", claudeStoryMaxTokens)
+	}
+	var b strings.Builder
+	for _, block := range m.Content {
+		if block.Type == "text" {
+			b.WriteString(block.Text)
+		}
+	}
+	if b.Len() == 0 {
+		return "", fmt.Errorf("no text in API response (stop_reason %q)", m.StopReason)
+	}
+	return b.String(), nil
+}
+
 // generateWithClaude calls the Claude API to create a narrative story.
 func generateWithClaude(sampled []*db.Message, stats *Stats, config GenerateConfig) ([]Chapter, string, string, error) {
 	// Format messages for the prompt
@@ -271,16 +343,9 @@ Create 3-6 chapters that capture the emotional arc. Focus on themes, turning poi
 	)
 
 	// Call Claude API
-	body := map[string]any{
-		"model":      "claude-sonnet-4-5-20250929",
-		"max_tokens": 4096,
-		"messages": []map[string]string{
-			{"role": "user", "content": prompt},
-		},
-	}
-	bodyJSON, _ := json.Marshal(body)
+	bodyJSON, _ := json.Marshal(claudeStoryRequest(prompt))
 
-	req, err := http.NewRequest("POST", "https://api.anthropic.com/v1/messages", bytes.NewReader(bodyJSON))
+	req, err := http.NewRequest("POST", claudeAPIURL, bytes.NewReader(bodyJSON))
 	if err != nil {
 		return nil, "", "", err
 	}
@@ -299,21 +364,16 @@ Create 3-6 chapters that capture the emotional arc. Focus on themes, turning poi
 		return nil, "", "", fmt.Errorf("API returned %d: %s", resp.StatusCode, string(respBody))
 	}
 
-	var apiResp struct {
-		Content []struct {
-			Text string `json:"text"`
-		} `json:"content"`
-	}
+	var apiResp claudeMessage
 	if err := json.NewDecoder(resp.Body).Decode(&apiResp); err != nil {
 		return nil, "", "", fmt.Errorf("decode response: %w", err)
 	}
 
-	if len(apiResp.Content) == 0 {
-		return nil, "", "", fmt.Errorf("empty response from API")
-	}
-
 	// Parse the JSON from the response
-	text := apiResp.Content[0].Text
+	text, err := apiResp.text()
+	if err != nil {
+		return nil, "", "", err
+	}
 	// Extract JSON from possible markdown code block
 	if idx := strings.Index(text, "{"); idx >= 0 {
 		text = text[idx:]
