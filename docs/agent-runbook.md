@@ -187,6 +187,49 @@ can migrate the schema under the older one.
 `serve ... --transports` alongside the app: those are daemon shapes and will
 fight the app for the WhatsApp/Signal sessions exactly as described above.
 
+## The watchdog + staleness sentinel (Max's install)
+
+The app can die silently and take every platform's sync with it (2026-07-29:
+jetsam under memory pressure killed it at 19:56; nothing relaunched it and all
+three platforms were dark for two days). A launchd agent
+(`com.maxghenis.openmessage-watchdog`, script `~/dotfiles/bin/openmessage-watchdog`)
+now probes `/api/status` every 5 minutes and relaunches `OpenMessage.app` when
+the daemon is unreachable — after 2 consecutive failures (3 if the app process
+exists but is hung), throttled to one relaunch per 30 minutes so it can't
+trip Google's reconnect throttling. Log: `~/Library/Logs/openmessage-watchdog.log`.
+Verify it's loaded: `launchctl list | grep openmessage-watchdog`.
+
+While the daemon is up, the same script is a **staleness sentinel** for the
+"app up, platform silently dead" class. It posts a macOS notification (6h
+re-notify cooldown; alert-only — platform recovery stays owned by the in-app
+supervisors) on: a paired platform disconnected ≥15 min; `google.needs_repair`
+≥15 min; `repairs_paced ≥ 3`; `projection_stalled` (top-level or per-platform,
+live once PR #156 ships); a platform's `latest_received_ms` trailing the
+cross-platform newest by >48h; no messages on ANY platform for >24h; v2 ingest
+`quarantined > 0`; Signal `receive_recovery.pending_count ≥ 5`. The
+quarantine alert is not theoretical: on 2026-08-01 it surfaced three Google
+conversation snapshots quarantined over duplicated self-participants (fixed by
+deduping in `refreshConversation`, PR #160).
+
+Debugging note that cost an hour: **`log` is a zsh builtin** — in zsh scripts
+and shells, `log show`/`log stream` silently do nothing useful. Call
+`/usr/bin/log` explicitly. Also, the backend's stdout reaches os_log at info
+level via BackendManager, and info entries live in a short memory ring — a
+quarantine cause from hours ago is gone; capture live with `/usr/bin/log
+stream` or reproduce offline by replaying inbox frames through the worker in a
+package test (the frames persist in the v2 `inbox` table even after
+quarantine).
+
+**Before intentionally quitting the app** (re-pairing, long debugging), park it:
+
+```bash
+touch "$HOME/Library/Application Support/OpenMessage/watchdog-disabled"
+```
+
+and remove the flag when done. The watchdog also auto-skips while an
+`openmessage pair` process is running, but don't rely on that alone for
+multi-step procedures.
+
 ## Pairing & the "zombie session"
 
 **Symptom:** sends fail with `OUTGOING_FAILED:UNKNOWN`; `/api/status` shows
@@ -211,7 +254,8 @@ Key facts:
 
 ### Re-pair recipe (the one that works)
 
-1. `osascript -e 'quit app "OpenMessage"'`.
+1. Park the relaunch watchdog (section above), then
+   `osascript -e 'quit app "OpenMessage"'`.
 2. Force the native pairing screen by removing `session.json` from **both**
    data dirs (back them up first):
    `~/Library/Application Support/OpenMessage/session.json` **and**
