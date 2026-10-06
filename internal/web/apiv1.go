@@ -128,9 +128,11 @@ func (a *v1API) submitText(w http.ResponseWriter, r *http.Request) {
 		IdempotencyKey string `json:"idempotency_key"`
 		NotBeforeMS    *int64 `json:"not_before_ms,omitempty"`
 		TTLMS          *int64 `json:"ttl_ms,omitempty"`
-		// GuardNearDuplicates opts this submission into the near-duplicate
-		// guard (see httpDuplicateGuard). Agent clients (MCP daemon mode,
-		// the CLI) send true; the web UI omits it.
+		// GuardNearDuplicates is what agent clients (MCP daemon mode, the
+		// CLI) send to ask for the near-duplicate guard. This daemon guards
+		// every HTTP text submission whether or not it is set (see
+		// httpDuplicateGuard); it is still decoded so the request shape is
+		// documented in one place. Force is the only per-request override.
 		GuardNearDuplicates bool `json:"guard_near_duplicates,omitempty"`
 		Force               bool `json:"force,omitempty"`
 	}
@@ -464,14 +466,17 @@ func (a *v1API) internalUnavailable(w http.ResponseWriter, detail string) {
 }
 
 // httpDuplicateGuard is the single place that decides whether an HTTP text
-// submission runs the near-duplicate guard. Scope (d472 Variant A): only
-// submissions that ask for it are guarded. Agent clients (MCP daemon mode and
-// the CLI) send guard_near_duplicates:true; the web UI omits it, so a person
-// typing "ok" twice, or correcting "there at 7" to "there at 8", is never
-// blocked. Guarding every HTTP submission (Variant B) would change only this
-// function, plus a UI override for the structured 409.
+// submission runs the near-duplicate guard. Scope (d472 Variant B): every
+// HTTP text submission is guarded, and requested (the request's
+// guard_near_duplicates) is deliberately ignored. That covers the web UI
+// too: a person who sends "ok" twice, or corrects "there at 7" to
+// "there at 8", within the duplicate window gets the structured 409, and the
+// UI offers "Send anyway", which resubmits the same idempotency key with
+// force. Force is the only per-request override; a request cannot opt out by
+// omitting or clearing guard_near_duplicates. SendAgain and media are never
+// guarded (they do not reach this function).
 func httpDuplicateGuard(requested bool) bool {
-	return requested
+	return true
 }
 
 // NearDuplicateErrorKind is the error_kind of the HTTP 409 a guarded text

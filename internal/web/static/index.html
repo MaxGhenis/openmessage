@@ -1371,7 +1371,9 @@ html, body {
   font-size: 10px;
 }
 
-.msg-retry-send {
+.msg-retry-send,
+.msg-send-anyway,
+.msg-discard-send {
   margin-left: 6px;
   border: 0;
   background: transparent;
@@ -1383,8 +1385,22 @@ html, body {
   padding: 0;
 }
 
-.msg-retry-send:hover {
+.msg-retry-send:hover,
+.msg-send-anyway:hover,
+.msg-discard-send:hover {
   text-decoration: underline;
+}
+
+.msg-discard-send {
+  color: var(--text-muted);
+}
+
+/* A queued send the daemon held back as a near-duplicate of a recent send. */
+.msg-send-note {
+  margin-top: 4px;
+  font-size: 11px;
+  color: #dc503c;
+  text-align: right;
 }
 
 /* ─── Media (images, videos, audio) ─── */
@@ -6143,6 +6159,14 @@ body::after {
   const PENDING_SEND_MAX_ITEMS = 50;
   const PENDING_SEND_MAX_AGE_MS = 24 * 60 * 60 * 1000;
   const PENDING_SEND_CAPACITY_MESSAGE = 'Too many queued messages. Wait for some to send before adding more.';
+  // The daemon guards every text send against near-duplicates of a recent
+  // send to the same conversation and refuses a repeat with a structured 409
+  // (web.NearDuplicateErrorKind). The page is embedded in the daemon binary,
+  // so it matches only the structured kind, never older error wording.
+  const NEAR_DUPLICATE_ERROR_KIND = 'near_duplicate_blocked';
+  const NEAR_DUPLICATE_SEND_MESSAGE = 'Looks like a repeat of a message you just sent.';
+  const NEAR_DUPLICATE_FORWARD_PROMPT = 'This looks like a repeat of a message you just sent to that conversation. Forward it anyway?';
+  const NEAR_DUPLICATE_SCHEDULE_PROMPT = 'This looks like a repeat of a message you just sent to this conversation. Schedule it anyway?';
   let pendingSendQueue = [];
   let pendingSendFlushInProgress = false;
   let pendingSendFlushTimer = null;
@@ -9067,10 +9091,21 @@ body::after {
   function messageContextMenuItems(message) {
     const urls = extractMessageURLs(message && message.Body ? message.Body : '');
     const failedQueuedSend = message && message._pendingSend && message._pendingSendItem && message._pendingSendItem.status === 'failed';
+    // A near-duplicate hold is not a failure a plain retry can clear: the
+    // daemon refuses the same text again until the person chooses.
+    const heldAsRepeat = failedQueuedSend && queuedSendHeldAsRepeat(message._pendingSendItem);
     return [
-      failedQueuedSend ? {
+      failedQueuedSend && !heldAsRepeat ? {
         label: 'Retry send',
         action: 'retry-queued-send',
+      } : null,
+      heldAsRepeat ? {
+        label: 'Send anyway',
+        action: 'send-anyway-queued-send',
+      } : null,
+      heldAsRepeat ? {
+        label: "Don't send",
+        action: 'discard-queued-send',
       } : null,
       failedQueuedSend ? { type: 'divider' } : null,
       {
@@ -9294,7 +9329,7 @@ body::after {
         }
         if (body && !captionedMedia) {
           if (state.v2Primary) {
-            await submitV2Text(targetID, body, '', forwardSendKey(targetID, 'text'));
+            await submitV2TextConfirmingRepeat(targetID, body, '', forwardSendKey(targetID, 'text'), 0, NEAR_DUPLICATE_FORWARD_PROMPT);
           } else {
             await postJSON('/api/send', {
               conversation_id: targetID,
@@ -9304,7 +9339,7 @@ body::after {
         }
       } else if (body) {
         if (state.v2Primary) {
-          await submitV2Text(targetID, body, '', forwardSendKey(targetID, 'text'));
+          await submitV2TextConfirmingRepeat(targetID, body, '', forwardSendKey(targetID, 'text'), 0, NEAR_DUPLICATE_FORWARD_PROMPT);
         } else {
           await postJSON('/api/send', {
             conversation_id: targetID,
@@ -9480,7 +9515,28 @@ body::after {
     }
   }
 
+  async function v2NearDuplicateRefusal(response) {
+    if (response.status !== 409) return null;
+    let detail = null;
+    try {
+      detail = JSON.parse(await response.text());
+    } catch {
+      return null;
+    }
+    if (!detail || detail.error_kind !== NEAR_DUPLICATE_ERROR_KIND) return null;
+    // Not retryable: the same text is refused again until the person
+    // chooses "Send anyway" (force under the same idempotency key, which the
+    // refusal left unused) or drops it.
+    const error = new Error(NEAR_DUPLICATE_SEND_MESSAGE);
+    error.nearDuplicate = true;
+    error.priorOutboxID = String(detail.duplicate_of_outbox_id || '');
+    return error;
+  }
+
   async function v2SubmissionError(response, media = false) {
+    // A 409's body is read only here; every other 409 keeps the generic text.
+    const nearDuplicate = await v2NearDuplicateRefusal(response);
+    if (nearDuplicate) return nearDuplicate;
     let message = '';
     if (response.status === 409) message = 'That message conflicts with another send.';
     if (response.status === 501) message = "This conversation can't send right now.";
@@ -9497,7 +9553,9 @@ body::after {
     return error;
   }
 
-  async function submitV2Text(convId, body, replyToId, key, notBeforeMS = 0) {
+  // force is the person's explicit "Send anyway" after a near-duplicate
+  // refusal; ordinary sends never set it.
+  async function submitV2Text(convId, body, replyToId, key, notBeforeMS = 0, { force = false } = {}) {
     const payload = {
       conversation_id: convId,
       body,
@@ -9507,6 +9565,9 @@ body::after {
     if (Number.isFinite(notBeforeMS) && notBeforeMS > 0) {
       payload.not_before_ms = notBeforeMS;
     }
+    if (force) {
+      payload.force = true;
+    }
     const response = await fetch(API + '/api/v1/outbox/messages', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -9514,6 +9575,19 @@ body::after {
     });
     if (!response.ok) throw await v2SubmissionError(response);
     return response.json();
+  }
+
+  // For one-shot sends with no queued bubble to hold (forward, schedule): on
+  // a near-duplicate refusal, ask, and on yes resubmit the same intent (same
+  // idempotency key) with force. The refusal wrote nothing, so the key is
+  // unused. Declining rethrows the refusal for the caller to show.
+  async function submitV2TextConfirmingRepeat(convId, body, replyToId, key, notBeforeMS, prompt) {
+    try {
+      return await submitV2Text(convId, body, replyToId, key, notBeforeMS);
+    } catch (err) {
+      if (!err || !err.nearDuplicate || !window.confirm(prompt)) throw err;
+      return submitV2Text(convId, body, replyToId, key, notBeforeMS, { force: true });
+    }
   }
 
   async function submitV2Media(convId, file, caption, replyToId, key, notBeforeMS = 0) {
@@ -9595,6 +9669,12 @@ body::after {
       attempts: Number(raw.attempts || 0),
       next_attempt_at: Number(raw.next_attempt_at || 0),
       last_error: lastError,
+      // near_duplicate: the daemon held this text back as a repeat of a
+      // recent send; it waits for "Send anyway" or "Don't send".
+      near_duplicate: status === 'failed' && !!raw.near_duplicate,
+      // force: the person chose "Send anyway"; every later attempt under
+      // this idempotency key carries it.
+      force: !!raw.force,
     };
   }
 
@@ -9759,8 +9839,16 @@ body::after {
     };
   }
 
+  function queuedSendHeldAsRepeat(item) {
+    return !!(item && item.status === 'failed' && item.near_duplicate);
+  }
+
   function queuedTextConfirmedByMessage(item, message) {
     if (!item || item.type !== 'text' || item.status !== 'failed' || !message || message._pendingSend) return false;
+    // A held repeat, or a failed "Send anyway", is by definition a second
+    // copy of a recent identical send. That earlier send's echo is not this
+    // item's, so it must not prune the unsent bubble as sent.
+    if (item.near_duplicate || item.force) return false;
     if (!message.IsFromMe) return false;
     if (String(message.ConversationID || '') !== item.conversation_id) return false;
     if (normalizePlatform(message.SourcePlatform || item.platform) !== normalizePlatform(item.platform)) return false;
@@ -9955,7 +10043,7 @@ body::after {
       return;
     }
     if (state.v2Primary && item.type === 'text') {
-      await submitV2Text(item.conversation_id, item.body, item.reply_to_id, item.id);
+      await submitV2Text(item.conversation_id, item.body, item.reply_to_id, item.id, 0, { force: !!item.force });
       return;
     }
     if (item.type === 'gif') {
@@ -10014,7 +10102,8 @@ body::after {
           await removeQueuedSend(item.id);
           sentAny = true;
         } catch (err) {
-          const retryable = queuedSendErrorIsRetryable(err);
+          const nearDuplicate = !!(err && err.nearDuplicate);
+          const retryable = !nearDuplicate && queuedSendErrorIsRetryable(err);
           const attempts = Number(item.attempts || 0) + 1;
           const message = retryable
             ? queuedSendWaitingMessage(item)
@@ -10025,6 +10114,7 @@ body::after {
             wait_for_reconnect: retryable,
             next_attempt_at: 0,
             last_error: message,
+            near_duplicate: nearDuplicate,
           });
           if (!retryable && activeConvoId === item.conversation_id) {
             showThreadFeedback(message, 'send');
@@ -10066,6 +10156,42 @@ body::after {
     }
     showThreadFeedback('Retrying message...', 'send');
     await flushQueuedSends();
+  }
+
+  // "Send anyway" for a text the daemon held back as a near-duplicate. It
+  // resubmits under the SAME idempotency key (item.id) with force: the refusal
+  // inserted nothing, so the key is unused, and if this attempt's response is
+  // lost, the next flush replays the key and resolves to the one intent
+  // instead of creating a third copy.
+  async function sendAnywayQueuedSend(id) {
+    const item = findQueuedSend(id);
+    if (!item) {
+      showThreadFeedback('Queued message is no longer available.', 'send');
+      return;
+    }
+    const updated = updateQueuedSend(id, {
+      force: true,
+      near_duplicate: false,
+      status: 'pending',
+      wait_for_reconnect: false,
+      next_attempt_at: 0,
+      last_error: '',
+    }) || item;
+    if (!queuedSendCanFlush(updated)) {
+      showThreadFeedback(queuedSendWaitingMessage(updated), 'send');
+      return;
+    }
+    showThreadFeedback('Sending anyway...', 'send');
+    await flushQueuedSends();
+  }
+
+  // "Don't send" drops a held repeat. Nothing was queued on the daemon for
+  // it, so this only clears the local bubble. An item that is no longer held
+  // (for example, already resubmitted with "Send anyway") is left alone.
+  async function discardQueuedSend(id) {
+    if (!queuedSendHeldAsRepeat(findQueuedSend(id))) return;
+    await removeQueuedSend(id);
+    showThreadFeedback('Message not sent.', 'send');
   }
 
   function clearThreadFeedback() {
@@ -10798,6 +10924,7 @@ body::after {
       msg.Body || '',
       sourcePlatformOf(msg),
       state.v2Primary === true && String(msg.Status || '').toUpperCase() === 'SENT' ? 'v2-sent' : '',
+      queuedSendHeldAsRepeat(msg._pendingSendItem) ? 'held-repeat' : '',
     ].join(':');
   }
 
@@ -11054,10 +11181,19 @@ body::after {
     }
 
     const failedQueuedSend = message._pendingSend && message._pendingSendItem && message._pendingSendItem.status === 'failed';
-    html += `<div class="msg-time">${formatMessageTime(message.TimestampMS)}${message.IsFromMe ? formatStatusIndicator(message.Status) : ''}${failedQueuedSend ? '<button type="button" class="msg-retry-send">Retry</button>' : ''}</div>`;
+    const heldAsRepeat = failedQueuedSend && queuedSendHeldAsRepeat(message._pendingSendItem);
+    if (heldAsRepeat) {
+      html += `<div class="msg-send-note">${escapeHtml(message._pendingSendItem.last_error || NEAR_DUPLICATE_SEND_MESSAGE)}</div>`;
+    }
+    const failedSendControls = heldAsRepeat
+      ? '<button type="button" class="msg-send-anyway">Send anyway</button><button type="button" class="msg-discard-send">Don\'t send</button>'
+      : (failedQueuedSend ? '<button type="button" class="msg-retry-send">Retry</button>' : '');
+    html += `<div class="msg-time">${formatMessageTime(message.TimestampMS)}${message.IsFromMe ? formatStatusIndicator(message.Status) : ''}${failedSendControls}</div>`;
     const pendingActionDisabled = message._pendingSend ? 'disabled' : '';
     html += `<div class="msg-actions">`;
-    if (failedQueuedSend) {
+    if (heldAsRepeat) {
+      html += `<button class="action-send-anyway" title="Send anyway" aria-label="Send anyway"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg></button>`;
+    } else if (failedQueuedSend) {
       html += `<button class="action-retry-send" title="Retry send" aria-label="Retry send"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></svg></button>`;
     }
     html += `<button class="action-react" title="React" ${pendingActionDisabled}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M8 14s1.5 2 4 2 4-2 4-2"/><line x1="9" y1="9" x2="9.01" y2="9"/><line x1="15" y1="9" x2="15.01" y2="9"/></svg></button>`;
@@ -11084,6 +11220,24 @@ body::after {
         retryQueuedSend(message.MessageID).catch(err => {
           console.error('Failed to retry queued send:', err);
           showThreadFeedback(err.message || 'Failed to retry message.', 'send');
+        });
+      });
+    });
+    el.querySelectorAll('.msg-send-anyway, .action-send-anyway').forEach(button => {
+      button.addEventListener('click', (e) => {
+        e.stopPropagation();
+        sendAnywayQueuedSend(message.MessageID).catch(err => {
+          console.error('Failed to send held message anyway:', err);
+          showThreadFeedback(err.message || 'Failed to send message.', 'send');
+        });
+      });
+    });
+    el.querySelectorAll('.msg-discard-send').forEach(button => {
+      button.addEventListener('click', (e) => {
+        e.stopPropagation();
+        discardQueuedSend(message.MessageID).catch(err => {
+          console.error('Failed to discard held message:', err);
+          showThreadFeedback(err.message || 'Failed to discard message.', 'send');
         });
       });
     });
@@ -11801,7 +11955,7 @@ body::after {
         if (hasMedia) {
           await submitV2Media(sendConvoId, scheduledFile, text, replyId, intent.key, sendAt);
         } else {
-          await submitV2Text(sendConvoId, text, replyId, intent.key, sendAt);
+          await submitV2TextConfirmingRepeat(sendConvoId, text, replyId, intent.key, sendAt, NEAR_DUPLICATE_SCHEDULE_PROMPT);
         }
         if (scheduledV2IntentKeys.get(intent.fingerprint) === intent.key) {
           scheduledV2IntentKeys.delete(intent.fingerprint);
@@ -14216,6 +14370,14 @@ body::after {
           const urls = extractMessageURLs(message.Body || '');
           if (action === 'retry-queued-send') {
             await retryQueuedSend(message.MessageID);
+            return;
+          }
+          if (action === 'send-anyway-queued-send') {
+            await sendAnywayQueuedSend(message.MessageID);
+            return;
+          }
+          if (action === 'discard-queued-send') {
+            await discardQueuedSend(message.MessageID);
             return;
           }
           if (action === 'reply-message') {

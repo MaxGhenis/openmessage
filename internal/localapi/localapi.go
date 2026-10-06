@@ -155,8 +155,11 @@ type TextSubmission struct {
 	// GuardNearDuplicates asks the daemon to refuse this submission (HTTP 409,
 	// error_kind near_duplicate_blocked) when a near-identical text was
 	// submitted to the same conversation within the daemon's duplicate window.
-	// Agent entry points (MCP, the CLI) set it; the web UI does not. A daemon
-	// that predates the field ignores it and applies its own default.
+	// Agent entry points (MCP, the CLI) set it. A current daemon guards every
+	// text submission, the web UI's included, whether or not it is set; it is
+	// still sent so that a daemon which guards only opt-in submissions guards
+	// agent sends. A daemon that predates the field ignores it and applies its
+	// own default.
 	GuardNearDuplicates bool `json:"guard_near_duplicates,omitempty"`
 	// Force bypasses the near-duplicate guard for a deliberate resend.
 	Force bool `json:"force,omitempty"`

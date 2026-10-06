@@ -230,8 +230,9 @@ func TestGuardOffNeverBlocks(t *testing.T) {
 	store := openMessagingTestStore(t, clock.Now())
 	service := newMessagingTestService(t, store, newScriptedRegistry("dup-off", &scriptedTextSender{}), clock)
 
-	// testCommonCommand leaves GuardNearDuplicates at its zero value: the
-	// unguarded behavior of HTTP submissions that do not ask for the guard.
+	// testCommonCommand leaves GuardNearDuplicates at its zero value. Every
+	// production text entry point now sets it (d472 Variant B guards all HTTP
+	// text submissions), but the service must still honor the zero value.
 	for i := 0; i < 3; i++ {
 		mustSendText(t, service, SendTextCommand{
 			CommonCommand: testCommonCommand(fmt.Sprintf("key-off-%d", i)),

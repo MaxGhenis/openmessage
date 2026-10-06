@@ -110,9 +110,10 @@ type CommonCommand struct {
 	// Only SendText consults it; media, reactions, read receipts, and
 	// SendAgain are never guarded. The zero value is unguarded, which is the
 	// safe failure mode for a caller that does not decide: each entry point
-	// sets it explicitly (MCP and the CLI on; HTTP only when the request
-	// carries guard_near_duplicates). The guard never applies to a replay of
-	// an existing idempotency key, which always resolves to the stored intent.
+	// sets it explicitly (MCP in-process on; every HTTP text submission on,
+	// which covers the web UI, the CLI, and MCP daemon mode). The guard never
+	// applies to a replay of an existing idempotency key, which always
+	// resolves to the stored intent.
 	GuardNearDuplicates bool
 
 	// Force bypasses the near-duplicate guard for a deliberate resend. It is

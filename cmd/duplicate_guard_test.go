@@ -356,13 +356,14 @@ const (
 	guardMatrixOtherFailure  guardMatrixOutcome = "failed for another reason"
 )
 
-// TestNearDuplicateGuardEntryPointScope is the Variant A scope matrix, each
-// row driven through its real client code against one real daemon: agent
-// entry points (MCP daemon mode, the CLI) are refused as near-duplicates with
-// force as the override; the web UI's request shape and media are accepted.
-// (MCP in-process sends are guarded too, and SendAgain is never guarded; the
-// tools, web, and messaging packages cover those paths, which need no
-// cross-package client.)
+// TestNearDuplicateGuardEntryPointScope is the d472 Variant B scope matrix,
+// each row driven through its real client code against one real daemon:
+// every text entry point (MCP daemon mode, the CLI, the web UI's request
+// shape) is refused as a near-duplicate, with force as the override (the
+// UI's "Send anyway" resubmits the refused key with force); media is
+// accepted. (MCP in-process sends are guarded too, and SendAgain is never
+// guarded; the tools, web, and messaging packages cover those paths, which
+// need no cross-package client.)
 func TestNearDuplicateGuardEntryPointScope(t *testing.T) {
 	const prior = "Lunch tomorrow at noon at Sfoglina?"
 	const repeat = "Lunch today at noon at Sfoglina?"
@@ -401,15 +402,19 @@ func TestNearDuplicateGuardEntryPointScope(t *testing.T) {
 		},
 		{
 			name: "web ui request shape",
+			want: guardMatrixNearDuplicate,
+			send: func(t *testing.T, d *guardMatrixDaemon, priorOutboxID string) (guardMatrixOutcome, string) {
+				return d.webUISend(t, "ui-key", repeat, false, priorOutboxID)
+			},
+		},
+		{
+			name: "web ui send anyway",
 			want: guardMatrixAccepted,
-			send: func(t *testing.T, d *guardMatrixDaemon, _ string) (guardMatrixOutcome, string) {
-				status, body := d.postJSON(t, map[string]any{
-					"conversation_id": guardMatrixConversationID,
-					"body":            repeat,
-					"reply_to_id":     "",
-					"idempotency_key": "ui-key",
-				})
-				return httpMatrixOutcome(status), body
+			send: func(t *testing.T, d *guardMatrixDaemon, priorOutboxID string) (guardMatrixOutcome, string) {
+				if refused, detail := d.webUISend(t, "ui-key", repeat, false, priorOutboxID); refused != guardMatrixNearDuplicate {
+					return guardMatrixOtherFailure, "the unforced UI send was not refused first: " + detail
+				}
+				return d.webUISend(t, "ui-key", repeat, true, priorOutboxID)
 			},
 		},
 		{
@@ -475,6 +480,41 @@ func cliMatrixOutcome(err error, priorOutboxID string) (guardMatrixOutcome, stri
 	default:
 		return guardMatrixOtherFailure, err.Error()
 	}
+}
+
+// webUISend posts the web UI's submitV2Text request (an ordinary send carries
+// neither guard_near_duplicates nor force; "Send anyway" adds force:true under
+// the same idempotency key) and classifies the response the way index.html
+// does: only a 409 whose error_kind is near_duplicate_blocked and that names
+// the prior counts as a near-duplicate refusal.
+func (d *guardMatrixDaemon) webUISend(t *testing.T, key, body string, force bool, priorOutboxID string) (guardMatrixOutcome, string) {
+	t.Helper()
+	payload := map[string]any{
+		"conversation_id": guardMatrixConversationID,
+		"body":            body,
+		"reply_to_id":     "",
+		"idempotency_key": key,
+	}
+	if force {
+		payload["force"] = true
+	}
+	status, response := d.postJSON(t, payload)
+	return webUIMatrixOutcome(status, response, priorOutboxID)
+}
+
+func webUIMatrixOutcome(status int, body string, priorOutboxID string) (guardMatrixOutcome, string) {
+	switch status {
+	case http.StatusOK:
+		return guardMatrixAccepted, body
+	case http.StatusConflict:
+		var refusal map[string]any
+		if err := json.Unmarshal([]byte(body), &refusal); err == nil &&
+			refusal["error_kind"] == web.NearDuplicateErrorKind &&
+			refusal["duplicate_of_outbox_id"] == priorOutboxID {
+			return guardMatrixNearDuplicate, body
+		}
+	}
+	return guardMatrixOtherFailure, fmt.Sprintf("%d %s", status, body)
 }
 
 func httpMatrixOutcome(status int) guardMatrixOutcome {
