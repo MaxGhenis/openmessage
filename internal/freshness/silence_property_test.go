@@ -79,6 +79,7 @@ func (silenceCase) Generate(r *rand.Rand, _ int) reflect.Value {
 			MinEventsPerActiveDay:    float64(r.Intn(60)),
 			ExpectedActiveHoursLimit: 0.5 + 12*r.Float64(),
 			MaxSilence:               time.Duration(r.Int63n(int64(40 * time.Hour))),
+			LongSilence:              time.Duration(r.Int63n(int64(60 * time.Hour))),
 		}
 	}
 	now := last.Add(time.Duration(r.Int63n(int64(48*time.Hour))) - time.Hour)
@@ -131,22 +132,47 @@ func TestSilencePropertyBounds(t *testing.T) {
 	})
 }
 
-// A stall needs a judged baseline and at least as much silence as the
-// cheaper rule demands: the score can only reach the limit after that many
-// hours, or the cap after MaxSilence.
-func TestSilencePropertyStallNeedsBaselineAndSilence(t *testing.T) {
-	checkProperty(t, "stall preconditions", func(c silenceCase) bool {
+// Each rule fires only on its own preconditions: the profile score needs a
+// judged baseline and at least that many silent hours (the score can't exceed
+// them), MaxSilence needs a platform busy on its active days, and LongSilence
+// needs only the silence. Conversely, the length rules always fire once their
+// preconditions hold, so no platform can stay fresh forever.
+func TestSilencePropertyRulesFireExactlyOnTheirPreconditions(t *testing.T) {
+	checkProperty(t, "rule preconditions", func(c silenceCase) bool {
 		v := EvaluateSilence(c.Last, c.Baseline, c.Now, c.Loc, c.Cfg)
-		if !v.Stalled {
-			return v.Rule == ""
-		}
+		busy := v.BaselineActiveDays > 0 &&
+			float64(v.BaselineEvents)/float64(v.BaselineActiveDays) >= c.Cfg.MinEventsPerActiveDay
 		limitHours := time.Duration(c.Cfg.ExpectedActiveHoursLimit * float64(time.Hour))
-		floor := limitHours
-		if c.Cfg.MaxSilence > 0 && c.Cfg.MaxSilence < floor {
-			floor = c.Cfg.MaxSilence
+		switch v.Rule {
+		case "":
+			if v.Stalled {
+				return false
+			}
+		case RuleExpectedActivity:
+			if !v.Stalled || !v.Evaluated || v.Silence < limitHours-time.Millisecond {
+				return false
+			}
+		case RuleMaxSilence:
+			if !v.Stalled || !busy || v.Silence < c.Cfg.MaxSilence {
+				return false
+			}
+		case RuleLongSilence:
+			if !v.Stalled || v.Silence < c.Cfg.LongSilence {
+				return false
+			}
+		default:
+			return false
 		}
-		return v.Evaluated && v.Silence >= floor-time.Millisecond &&
-			(v.Rule == RuleExpectedActivity || v.Rule == RuleMaxSilence)
+		if v.Evaluated != (busy && v.BaselineActiveDays >= c.Cfg.MinActiveDays) {
+			return false
+		}
+		if c.Cfg.LongSilence > 0 && v.Silence >= c.Cfg.LongSilence && !v.Stalled {
+			return false
+		}
+		if busy && c.Cfg.MaxSilence > 0 && v.Silence >= c.Cfg.MaxSilence && !v.Stalled {
+			return false
+		}
+		return true
 	})
 }
 

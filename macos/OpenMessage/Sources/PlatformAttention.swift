@@ -93,7 +93,7 @@ struct PlatformAttention: Equatable {
 
     private static func silentSentence(_ item: PlatformAttention, hours: Int) -> String {
         let span = hours == 1 ? "1 hour" : "\(hours) hours"
-        let base = "\(item.name) has synced nothing for \(span), longer than usual."
+        let base = "\(item.name) has synced nothing for \(span)."
         if item.key == "google" {
             // Google Messages relays everything through the phone.
             return base + " Check that your phone is on and online; restarting it can fix this."

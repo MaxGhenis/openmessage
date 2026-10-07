@@ -101,31 +101,37 @@ func TestEvaluateSilenceMaxSilenceBoundsQuietHourOnset(t *testing.T) {
 	}
 }
 
-func TestEvaluateSilenceNeedsABaseline(t *testing.T) {
+// Without a trustworthy profile the length rules still apply, so a stall is
+// never invisible for good. (Review of PR #190: a thin baseline used to skip
+// every rule, so a light user's newest platform stayed fresh forever.)
+func TestEvaluateSilenceWithoutAProfileStillFlagsLongSilence(t *testing.T) {
 	loc := time.UTC
-	last := time.Date(2026, 9, 29, 12, 0, 0, 0, loc)
+	last := time.Date(2026, 10, 6, 1, 11, 0, 0, loc)
 	cfg := DefaultSilenceConfig
-	gap := 3 * 24 * time.Hour
 
 	cases := []struct {
 		name     string
 		baseline []time.Time
+		rule     string
+		after    time.Duration
 	}{
-		// A fresh pairing or the week after a long outage: too few days.
-		{"few active days", dailyTraffic(last, cfg.MinActiveDays-1, 0, 24, 5*time.Minute, loc)},
-		// A platform that carries a handful of messages a day: silence is
-		// ordinary there.
-		{"low volume", dailyTraffic(last, 14, 9, 14, time.Hour, loc)},
-		{"no baseline", nil},
+		// The days after a long outage: busy when active, too few days to
+		// trust the hourly profile. MaxSilence applies.
+		{"few active days", dailyTraffic(last, cfg.MinActiveDays-1, 0, 24, 5*time.Minute, loc), RuleMaxSilence, cfg.MaxSilence},
+		// A light user: ten events a day. Hours of silence mean nothing;
+		// three days do.
+		{"low volume", dailyTraffic(last, 14, 0, 10, time.Hour, loc), RuleLongSilence, cfg.LongSilence},
+		{"no baseline", nil, RuleLongSilence, cfg.LongSilence},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			verdict := EvaluateSilence(last, tc.baseline, last.Add(gap), loc, cfg)
-			if verdict.Evaluated || verdict.Stalled {
-				t.Fatalf("verdict = %+v, want not evaluated and not stalled", verdict)
+			before := EvaluateSilence(last, tc.baseline, last.Add(tc.after-time.Minute), loc, cfg)
+			if before.Evaluated || before.Stalled {
+				t.Fatalf("verdict just before %v = %+v, want not evaluated and not stalled", tc.after, before)
 			}
-			if verdict.Silence != gap {
-				t.Fatalf("silence = %v, want %v", verdict.Silence, gap)
+			at := EvaluateSilence(last, tc.baseline, last.Add(tc.after), loc, cfg)
+			if at.Evaluated || !at.Stalled || at.Rule != tc.rule {
+				t.Fatalf("verdict at %v = %+v, want not evaluated, stalled by %s", tc.after, at, tc.rule)
 			}
 		})
 	}

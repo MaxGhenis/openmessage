@@ -32,7 +32,7 @@ final class PlatformAttentionTests: XCTestCase {
         )
         XCTAssertEqual(
             PlatformAttention.alertText(for: items),
-            "Google Messages has synced nothing for 12 hours, longer than usual. Check that your phone is on and online; restarting it can fix this."
+            "Google Messages has synced nothing for 12 hours. Check that your phone is on and online; restarting it can fix this."
         )
         XCTAssertEqual(PlatformAttention.silentNotificationBody(items[0]), PlatformAttention.alertText(for: items))
     }
@@ -78,7 +78,7 @@ final class PlatformAttentionTests: XCTestCase {
         """)
         XCTAssertEqual(
             PlatformAttention.alertText(for: PlatformAttention.evaluate(status: json)),
-            "WhatsApp needs re-pairing — it has stopped syncing. Signal has synced nothing for 1 hour, longer than usual."
+            "WhatsApp needs re-pairing — it has stopped syncing. Signal has synced nothing for 1 hour."
         )
     }
 

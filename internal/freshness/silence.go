@@ -23,18 +23,25 @@ type SilenceConfig struct {
 	// silence itself and would make its unreached hours look quiet.
 	BaselineDays int
 	// MinActiveDays is how many local calendar days in the baseline must carry
-	// at least one event before silence is judged at all.
+	// at least one event before the hour-of-day profile is trusted.
 	MinActiveDays int
 	// MinEventsPerActiveDay is the average event count per active baseline day
-	// below which a platform is too quiet for silence to mean anything.
+	// below which a platform is too quiet for hours of silence to mean
+	// anything; only LongSilence applies to it.
 	MinEventsPerActiveDay float64
 	// ExpectedActiveHoursLimit flags a stall once the profile predicts activity
 	// in at least this many of the silent hours.
 	ExpectedActiveHoursLimit float64
 	// MaxSilence flags a stall after this long without events, whatever the
-	// profile predicts. It bounds detection when the silence starts in hours
-	// the profile rates as quiet.
+	// profile predicts, on a platform busy enough on its active days. It
+	// bounds detection when the silence starts in hours the profile rates as
+	// quiet, and covers the days after an outage, when there are too few
+	// active days to trust the profile.
 	MaxSilence time.Duration
+	// LongSilence flags a stall after this long without events whatever the
+	// baseline, so no platform can stay fresh forever: a quiet platform, or one
+	// with no baseline at all, still goes stale eventually. Zero disables it.
+	LongSilence time.Duration
 }
 
 // DefaultSilenceConfig is calibrated against the Google Messages ingest history
@@ -43,19 +50,22 @@ type SilenceConfig struct {
 // expected-active-hours score any ordinary quiet stretch reached was 5.0 and the
 // longest one lasted 12.1 hours, so neither rule fires on ordinary nights or
 // weekends. The incident reaches the limit at about 13:45 on 2026-10-06, 12.5
-// hours after the last frame.
+// hours after the last frame. LongSilence matches the relative rule's three
+// days.
 var DefaultSilenceConfig = SilenceConfig{
 	BaselineDays:             14,
 	MinActiveDays:            7,
 	MinEventsPerActiveDay:    20,
 	ExpectedActiveHoursLimit: 6,
 	MaxSilence:               16 * time.Hour,
+	LongSilence:              72 * time.Hour,
 }
 
 // Rules reported in SilenceVerdict.Rule.
 const (
 	RuleExpectedActivity = "expected_activity"
 	RuleMaxSilence       = "max_silence"
+	RuleLongSilence      = "long_silence"
 )
 
 // Profile holds, for each local hour of the day, the fraction of active
@@ -188,12 +198,14 @@ type SilenceVerdict struct {
 	ExpectedActiveHours float64
 	BaselineActiveDays  int
 	BaselineEvents      int
-	// Evaluated is false when there is no last event or the baseline is too
-	// thin to judge; Stalled is then always false.
+	// Evaluated reports whether the baseline was rich enough to trust the
+	// hour-of-day profile (MinActiveDays days averaging MinEventsPerActiveDay
+	// events). Without it only MaxSilence (for a platform busy on its active
+	// days) and LongSilence can flag a stall.
 	Evaluated bool
 	Stalled   bool
-	// Rule names the rule that flagged the stall: RuleExpectedActivity when
-	// the profile predicted enough activity, otherwise RuleMaxSilence.
+	// Rule names the rule that flagged the stall: RuleExpectedActivity,
+	// RuleMaxSilence or RuleLongSilence.
 	Rule string
 }
 
@@ -219,20 +231,19 @@ func EvaluateSilence(
 	verdict.BaselineActiveDays = profile.ActiveDays
 	verdict.BaselineEvents = profile.Events
 	verdict.ExpectedActiveHours = profile.ExpectedActiveHours(last, last.Add(verdict.Silence), loc)
-	if profile.ActiveDays < cfg.MinActiveDays || profile.ActiveDays == 0 {
-		return verdict
-	}
-	if float64(profile.Events)/float64(profile.ActiveDays) < cfg.MinEventsPerActiveDay {
-		return verdict
-	}
-	verdict.Evaluated = true
+	busy := profile.ActiveDays > 0 &&
+		float64(profile.Events)/float64(profile.ActiveDays) >= cfg.MinEventsPerActiveDay
+	verdict.Evaluated = busy && profile.ActiveDays >= cfg.MinActiveDays
 	switch {
-	case verdict.ExpectedActiveHours >= cfg.ExpectedActiveHoursLimit:
+	case verdict.Evaluated && verdict.ExpectedActiveHours >= cfg.ExpectedActiveHoursLimit:
 		verdict.Stalled = true
 		verdict.Rule = RuleExpectedActivity
-	case cfg.MaxSilence > 0 && verdict.Silence >= cfg.MaxSilence:
+	case busy && cfg.MaxSilence > 0 && verdict.Silence >= cfg.MaxSilence:
 		verdict.Stalled = true
 		verdict.Rule = RuleMaxSilence
+	case cfg.LongSilence > 0 && verdict.Silence >= cfg.LongSilence:
+		verdict.Stalled = true
+		verdict.Rule = RuleLongSilence
 	}
 	return verdict
 }

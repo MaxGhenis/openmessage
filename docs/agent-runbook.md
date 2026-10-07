@@ -203,10 +203,10 @@ judges how long the transport has delivered nothing against that platform's own
 baseline (`internal/freshness`): the hour-of-day profile of the 14 whole local
 days before the silence began, measured on v2 inbox receipts (each distinct
 frame, before decoding) or, without v2 ingest, on message timestamps. A silence is a
-stall when the profile expected activity in at least 6 of the silent hours, or
-after 16 hours regardless. It is judged only when the baseline has at least 7
-active days averaging 20 events, so a quiet or newly paired platform never
-trips it. A stall sets `stale: true` with `stale_reason: "silent"` ("behind",
+stall when the profile expected activity in at least 6 of the silent hours
+(trusted only with at least 7 active baseline days averaging 20 events), after
+16 hours on a platform averaging 20+ events on its active days, or after 72
+hours whatever the baseline, so no platform stays fresh forever. A stall sets `stale: true` with `stale_reason: "silent"` ("behind",
 the relative rule, takes precedence), and a top-level `silence_stalled`. The
 macOS app then says to check or restart the phone instead of "needs re-pairing",
 and posts one notification per episode (a reconnect during the same silence
