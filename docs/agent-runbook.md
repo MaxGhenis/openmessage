@@ -177,41 +177,54 @@ messages. And Google is usually the newest platform, so the relative
 `behind_days` rule can never flag it.
 
 **What 2026-10-06 showed.** The last Google frame reached the v2 inbox at
-01:11 EDT; nothing more arrived for 38 hours. The long-poll stayed up the whole
-time: pings were answered (`Phone responding again` after brief timeouts),
-extra `GET_UPDATES` calls were answered, and `Listen recovered` followed each
-network change. The phone was the part that stopped: after a full restart at
-15:29 on 10/7 it pushed messages sent from the phone on 10/6 at 07:12 and
-08:55. Google message ids are the phone's row ids (previous section), and the
-phone created rows 87881–88012 during the stall, about a day and a half of
-ordinary traffic; OpenMessage received 4 of those 132 ids. Pulling didn't help
-either: three app relaunches on 10/6 (each starts a shallow backfill) and six
-`Reconciling recent conversations` runs on 10/7 put none of the missing rows
-into `messages.db`. On this install the request/response calls themselves came
-back empty: after a relaunch at 15:56 on 10/7, with push working again, the
-startup backfill logged `Fetched conversations count=0` and a deep backfill
-scanned 3 folders and found 0 conversations, with no errors. That is a
-separate defect (libgm accepts a correctly typed but empty response; the
-cause is not established), and until it is fixed no pull can confirm or
-repair delivery. Do not re-pair for this; **restart the phone**. (Google Messages auto-updated on
-the phone at 02:07 on 10/6, an hour after the last frame; nothing on hand says
-whether that caused it. The same restart also cleared an unrelated IMS-stack
-SMS fault on that phone.)
+01:11 EDT; nothing more arrived for 38 hours. Apart from brief reconnects and
+three app relaunches on 10/6, the long-poll stayed up: pings were answered
+(`Phone responding again` after brief timeouts), extra `GET_UPDATES` calls
+were answered, and `Listen recovered` followed each network change. The phone
+was the part that stopped: after a full restart at 15:29 on 10/7 it pushed
+messages sent from the phone on 10/6 at 07:12 and 08:55. Google message ids
+are the phone's row ids (previous section). The phone created ids 87881–88004
+(124 ids) between the last relayed message (22:40 on 10/5) and 15:18 on 10/7,
+about what a day and a half of ordinary traffic produces, and OpenMessage
+received 4 of them. Pulling didn't help either: three app relaunches on 10/6
+(each starts a shallow backfill) and six `Reconciling recent conversations`
+runs on 10/7 put none of the missing rows into `messages.db`. On this install
+the request/response calls themselves came back empty: after a relaunch at
+15:56 on 10/7, with push working again, the startup backfill logged
+`Fetched conversations count=0` and a deep backfill scanned 3 folders and
+found 0 conversations, with no errors. That is a separate defect (libgm
+accepts a correctly typed but empty response; the cause is not established),
+and until it is fixed no pull can confirm or repair delivery. A phone restart
+ended the push stall; a re-pair was not tried and is not the first thing to
+try. (Google Messages auto-updated on the phone at 02:07 on 10/6, an hour
+after the last frame; nothing on hand says whether that caused it. The same
+restart also cleared a separate IMS-stack SMS fault on that phone, which on
+its own had not stopped RCS relaying from 10/3 to 10/5.)
 
 **Detection.** Each platform in `freshness` now carries a `silence` block that
 judges how long the transport has delivered nothing against that platform's own
 baseline (`internal/freshness`): the hour-of-day profile of the 14 whole local
-days before the silence began, measured on v2 inbox receipts (each distinct
-frame, before decoding) or, without v2 ingest, on message timestamps. A silence is a
-stall when the profile expected activity in at least 6 of the silent hours
-(trusted only with at least 7 active baseline days averaging 20 events), after
-16 hours on a platform averaging 20+ events on its active days, or after 72
-hours whatever the baseline, so no platform stays fresh forever. A stall sets `stale: true` with `stale_reason: "silent"` ("behind",
-the relative rule, takes precedence), and a top-level `silence_stalled`. The
-macOS app then says to check or restart the phone instead of "needs re-pairing",
-and posts one notification per episode (a reconnect during the same silence
-does not repeat it). If an activity query fails, the last verdict is kept and
-marked `carried_over`.
+days before the silence began. On a v2-primary daemon it reads v2 inbox
+receipts (each distinct message or conversation event a bridge hands to
+ingest, before decoding); when readers use the legacy store, it reads that
+store's incoming-message timestamps (outgoing rows don't count, so a failed
+send can't reset it). A silence is a stall when:
+
+- the profile expected activity in at least 6 of the silent hours, judged
+  only when the baseline has at least 7 active days and a median of at least
+  20 events per active day;
+- or 16 hours have passed on a platform with that median (even with fewer
+  active days, as after an outage);
+- or 72 hours have passed, whatever the baseline, so no platform stays fresh
+  forever.
+
+A stall sets `stale: true` with `stale_reason: "silent"` ("behind", the
+relative rule, takes precedence). The top-level `silence_stalled` is true when
+some platform's `stale_reason` is `"silent"`, so a platform dead and "behind"
+for weeks doesn't hold it. The macOS app says to check or restart the phone
+instead of "needs re-pairing", and posts one notification per silence episode;
+a reconnect or an app relaunch during the same silence does not repeat it. If
+an activity query fails, the last verdict is kept and marked `carried_over`.
 
 ```bash
 curl -s http://127.0.0.1:7007/api/status | jq '.freshness.google | {stale, stale_reason, silence}'
@@ -221,10 +234,11 @@ On the 80-day Google history of the install that hit this, the rule flags
 every silence longer than 16 hours once a baseline exists (the July and
 August outages among them) and no ordinary night or weekend since 9/4, when
 that history became continuous (the worst ordinary quiet stretch scored 5.0
-of the 6 needed). It
-would have flagged this stall at about 13:45 on 10/6. Silences that start in
-the day are flagged after about 8 hours, ones that start in the evening by the
-16-hour cap.
+of the 6 needed). It would have flagged this stall at about 13:45 on 10/6.
+Silences that start in the day are flagged after about 7–8 hours; ones that
+start in the evening after about 13–15 hours, with the 16-hour cap as the
+bound. A day that an outage covers only in part still counts in a later
+baseline and can delay a repeat detection by an hour or two.
 
 **What a stall leaves behind.** On a v2-primary install nothing re-fetches the
 messages a stall skipped: the startup backfill and recent reconcile write only

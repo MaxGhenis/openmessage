@@ -275,3 +275,58 @@ func TestBaselineRangeOnASkippedMidnight(t *testing.T) {
 		}
 	}
 }
+
+// One burst (a history sync after pairing) on an otherwise sparse platform
+// must not make it look busy: the volume gate uses the median day, so its
+// ordinary day-long gaps are not stalls; only LongSilence applies.
+// (Review of PR #190: a mean-based gate fired the 16 h cap daily.)
+func TestEvaluateSilenceIgnoresASingleBurstWhenJudgingVolume(t *testing.T) {
+	loc := time.UTC
+	last := time.Date(2026, 10, 6, 12, 0, 0, 0, loc)
+	baseline := dailyTraffic(last, 14, 12, 13, time.Hour, loc) // one event a day at noon
+	burstDay := time.Date(2026, 9, 30, 9, 0, 0, 0, loc)
+	for i := 0; i < 2000; i++ {
+		baseline = append(baseline, burstDay.Add(time.Duration(i)*time.Second))
+	}
+	cfg := DefaultSilenceConfig
+	day := EvaluateSilence(last, baseline, last.Add(cfg.MaxSilence+8*time.Hour), loc, cfg)
+	if day.Stalled || day.Evaluated || day.BaselineMedianDailyEvents != 1 {
+		t.Fatalf("verdict a day into silence = %+v, want not evaluated, not stalled, median 1", day)
+	}
+	long := EvaluateSilence(last, baseline, last.Add(cfg.LongSilence), loc, cfg)
+	if !long.Stalled || long.Rule != RuleLongSilence {
+		t.Fatalf("verdict at LongSilence = %+v, want stalled by %s", long, RuleLongSilence)
+	}
+}
+
+// A non-positive score limit must not turn a fresh event into a stall.
+func TestEvaluateSilenceNonPositiveLimitNeverFlagsAFreshEvent(t *testing.T) {
+	loc := time.UTC
+	last := time.Date(2026, 10, 6, 12, 0, 0, 0, loc)
+	baseline := dailyTraffic(last, 14, 0, 24, 5*time.Minute, loc)
+	for _, limit := range []float64{0, -1} {
+		cfg := DefaultSilenceConfig
+		cfg.ExpectedActiveHoursLimit = limit
+		if v := EvaluateSilence(last, baseline, last, loc, cfg); v.Stalled {
+			t.Fatalf("limit %v: fresh event verdict = %+v, want not stalled", limit, v)
+		}
+	}
+}
+
+// Integrating up to Go's maximum time terminates (Time.Add saturates there).
+func TestExpectedActiveHoursTerminatesNearMaxTime(t *testing.T) {
+	var full Profile
+	for hour := range full.Hours {
+		full.Hours[hour] = 1
+	}
+	maxTime := time.Unix(1<<63-1-62135596800, 999999999)
+	done := make(chan float64, 1)
+	go func() {
+		done <- full.ExpectedActiveHours(maxTime.Add(-time.Hour).Truncate(time.Second), maxTime, time.UTC)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("ExpectedActiveHours did not terminate near the maximum time")
+	}
+}

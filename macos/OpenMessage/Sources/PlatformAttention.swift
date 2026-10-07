@@ -11,10 +11,11 @@ struct PlatformAttention: Equatable {
         case needsRepair
         /// Connected, but nothing has arrived for longer than the platform's
         /// own recent traffic explains (`freshness.<key>.stale_reason ==
-        /// "silent"`). On 2026-10-06 Google Messages stayed connected and
-        /// phone-responding while the phone relayed nothing for 38 hours; a
-        /// phone restart, not a re-pair, brought it back. `since` is the
-        /// silence's last event (ms), which identifies the episode.
+        /// "silent"`). On 2026-10-06 the phone relayed nothing for 38 hours
+        /// while Google Messages reported connected and phone-responding,
+        /// apart from brief reconnects; a phone restart brought it back.
+        /// `since` is the silence's last event (ms), which identifies the
+        /// episode.
         case silent(hours: Int, since: Int64)
     }
 
@@ -105,9 +106,16 @@ struct PlatformAttention: Equatable {
 /// Decides which silent platforms to notify about: once per silence episode,
 /// identified by the episode's last event. A connection flap during the same
 /// outage (silent, then "needs repair" while disconnected, then silent again)
-/// does not re-notify; a new event followed by a new silence does.
+/// or an app relaunch (with the persisted state) does not re-notify; a new
+/// event followed by a new silence does.
 struct SilenceNotificationLatch {
-    private var notifiedEpisode: [String: Int64] = [:]
+    /// Platform key → the `since` of the last episode notified. Persist it
+    /// (see `NotificationManager`) so an app relaunch mid-outage stays quiet.
+    private(set) var notifiedEpisode: [String: Int64]
+
+    init(notifiedEpisode: [String: Int64] = [:]) {
+        self.notifiedEpisode = notifiedEpisode
+    }
 
     /// Silent items not yet notified for their current episode. Marks them
     /// notified.

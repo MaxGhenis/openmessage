@@ -29,13 +29,25 @@ func TestInboxActivityQueriesReadReceiptTimesByCodec(t *testing.T) {
 	appendAt(4_000, "signal-primary", "signal.jsonrpc")
 	appendAt(6_000, "google-primary", "google.alt")
 
-	latest, err := store.LatestInboxReceipts(context.Background())
+	latest, high, err := store.InboxReceiptsAfterRow(context.Background(), 0)
 	if err != nil {
-		t.Fatalf("LatestInboxReceipts(): %v", err)
+		t.Fatalf("InboxReceiptsAfterRow(0): %v", err)
 	}
 	want := map[string]int64{"google.protobuf": 5_000, "signal.jsonrpc": 4_000, "google.alt": 6_000}
-	if !reflect.DeepEqual(latest, want) {
-		t.Fatalf("LatestInboxReceipts() = %v, want %v", latest, want)
+	if !reflect.DeepEqual(latest, want) || high != 6 {
+		t.Fatalf("InboxReceiptsAfterRow(0) = %v, %d; want %v, 6", latest, high, want)
+	}
+	// Past the high-water mark only newer rows are read.
+	appendAt(8_000, "signal-primary", "signal.jsonrpc")
+	latest, high, err = store.InboxReceiptsAfterRow(context.Background(), 6)
+	if err != nil {
+		t.Fatalf("InboxReceiptsAfterRow(6): %v", err)
+	}
+	if want := map[string]int64{"signal.jsonrpc": 8_000}; !reflect.DeepEqual(latest, want) || high != 7 {
+		t.Fatalf("InboxReceiptsAfterRow(6) = %v, %d; want %v, 7", latest, high, want)
+	}
+	if latest, high, err := store.InboxReceiptsAfterRow(context.Background(), 7); err != nil || len(latest) != 0 || high != 7 {
+		t.Fatalf("InboxReceiptsAfterRow(7) = %v, %d, %v; want empty, 7", latest, high, err)
 	}
 
 	got, err := store.InboxReceiptsBetween(context.Background(), []string{"google.protobuf", "google.alt"}, 2_000, 6_000)

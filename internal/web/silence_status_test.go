@@ -92,8 +92,8 @@ func newStatusTestStore(t *testing.T) *db.Store {
 // The 2026-10-06 incident: Google ingest went silent at 01:11 for 38 hours.
 // Google was still the newest platform, so the relative rule kept it at
 // behind_days 0 and stale=false while /api/status reported connected and
-// phone_responding the whole time. Judged against its own baseline, eight
-// silent hours that are normally all active are a stall.
+// phone_responding apart from brief reconnects. Judged against its own
+// baseline, eight silent hours that are normally all active are a stall.
 func TestStatusFreshnessFlagsSilentGoogleIngest(t *testing.T) {
 	now := time.Now()
 	googleLast := now.Add(-8 * time.Hour)
@@ -184,6 +184,12 @@ func TestStatusFreshnessBehindOutranksSilent(t *testing.T) {
 	google := fresh["google"].(map[string]any)
 	if google["stale"] != false {
 		t.Fatalf("google entry = %v, want fresh", google)
+	}
+	// Signal's silence verdict is stalled but its reason is "behind", so the
+	// top-level flag stays clear: a platform dead for weeks must not hold it
+	// true while the live ones are fine. (Review of PR #190.)
+	if fresh["silence_stalled"] != false {
+		t.Fatalf("silence_stalled = %v, want false when only a behind platform is stalled", fresh["silence_stalled"])
 	}
 }
 

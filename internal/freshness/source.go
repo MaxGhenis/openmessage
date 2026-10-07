@@ -3,7 +3,9 @@ package freshness
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -29,18 +31,26 @@ type ActivitySource interface {
 
 // InboxStore is the slice of the v2 store an inbox activity source reads.
 type InboxStore interface {
-	LatestInboxReceipts(ctx context.Context) (map[string]int64, error)
+	InboxReceiptsAfterRow(ctx context.Context, afterRowID int64) (map[string]int64, int64, error)
 	InboxReceiptsBetween(ctx context.Context, codecs []string, fromMS, toMS int64) ([]int64, error)
 }
 
+// inboxRescanInterval is how often the inbox source rereads every row instead
+// of only the rows past its high-water mark, so a reused rowid or a deleted
+// row cannot leave its latest times wrong for long.
+const inboxRescanInterval = 6 * time.Hour
+
 // NewInboxActivity measures activity as v2 inbox receipt times: each distinct
-// frame a transport hands to ingest, message or not, before any decoding. That
-// is the earliest point at which "the platform delivered something" is
-// observable, so a stalled projection or a decoder quarantine does not read as
-// silence. A frame re-delivered with the same dedupe key keeps its first
-// receipt time, so a transport that only replays old frames reads as silent.
-// platformByCodec maps ingest codecs to status platform keys; codecs missing
-// from the map are ignored.
+// message or conversation event a transport hands to ingest, before decoding
+// or projection. That is the earliest point at which "the platform delivered
+// something" is observable, so a stalled projection or a decoder quarantine
+// does not read as silence. An event re-delivered with the same dedupe key
+// keeps its first receipt time, and events the bridges do not write to the
+// inbox (typing, presence, pings) never count. platformByCodec maps ingest
+// codecs to status platform keys; codecs missing from the map are ignored.
+//
+// Latest reads only rows appended since its previous call (a full rescan every
+// inboxRescanInterval), so its cost does not grow with the inbox.
 func NewInboxActivity(store InboxStore, platformByCodec map[string]string) ActivitySource {
 	codecs := map[string][]string{}
 	for codec, platform := range platformByCodec {
@@ -51,27 +61,58 @@ func NewInboxActivity(store InboxStore, platformByCodec map[string]string) Activ
 		}
 		codecs[platform] = append(codecs[platform], codec)
 	}
-	return inboxActivity{store: store, platformByCodec: platformByCodec, codecsByPlatform: codecs}
+	return &inboxActivity{
+		store:            store,
+		platformByCodec:  platformByCodec,
+		codecsByPlatform: codecs,
+		now:              time.Now,
+	}
 }
 
 type inboxActivity struct {
 	store            InboxStore
 	platformByCodec  map[string]string
 	codecsByPlatform map[string][]string
+	now              func() time.Time
+
+	mu          sync.Mutex
+	latestCodec map[string]int64
+	highWater   int64
+	scannedAt   time.Time
 }
 
-func (inboxActivity) Name() string { return SourceV2Inbox }
+func (*inboxActivity) Name() string { return SourceV2Inbox }
 
-func (s inboxActivity) Latest(ctx context.Context) (map[string]time.Time, error) {
+func (s *inboxActivity) Latest(ctx context.Context) (map[string]time.Time, error) {
 	if s.store == nil {
 		return nil, fmt.Errorf("inbox activity: store is nil")
 	}
-	byCodec, err := s.store.LatestInboxReceipts(ctx)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := s.now()
+	full := s.latestCodec == nil || now.Sub(s.scannedAt) >= inboxRescanInterval
+	after := s.highWater
+	if full {
+		after = 0
+	}
+	byCodec, highWater, err := s.store.InboxReceiptsAfterRow(ctx, after)
 	if err != nil {
 		return nil, fmt.Errorf("inbox activity: %w", err)
 	}
-	latest := map[string]time.Time{}
+	if full {
+		s.latestCodec = map[string]int64{}
+		s.scannedAt = now
+	}
 	for codec, ms := range byCodec {
+		if ms > s.latestCodec[codec] {
+			s.latestCodec[codec] = ms
+		}
+	}
+	if full || highWater > s.highWater {
+		s.highWater = highWater
+	}
+	latest := map[string]time.Time{}
+	for codec, ms := range s.latestCodec {
 		platform := s.platformByCodec[codec]
 		if platform == "" || ms <= 0 {
 			continue
@@ -84,7 +125,7 @@ func (s inboxActivity) Latest(ctx context.Context) (map[string]time.Time, error)
 	return latest, nil
 }
 
-func (s inboxActivity) Between(ctx context.Context, platform string, from, to time.Time) ([]time.Time, error) {
+func (s *inboxActivity) Between(ctx context.Context, platform string, from, to time.Time) ([]time.Time, error) {
 	if s.store == nil {
 		return nil, fmt.Errorf("inbox activity: store is nil")
 	}
@@ -102,16 +143,19 @@ func (s inboxActivity) Between(ctx context.Context, platform string, from, to ti
 // MessageStore is the slice of the legacy store a message activity source
 // reads.
 type MessageStore interface {
-	LatestMessageTimestamps(ctx context.Context) (map[string]int64, error)
-	MessageTimestampsBetween(ctx context.Context, platforms []string, fromMS, toMS int64) ([]int64, error)
+	LatestIncomingMessageTimestamp(ctx context.Context, platforms []string) (int64, error)
+	IncomingMessageTimestampsBetween(ctx context.Context, platforms []string, fromMS, toMS int64) ([]int64, error)
 }
 
-// NewMessageActivity measures activity as stored message timestamps, for
-// daemons without v2 ingest. Message timestamps are the sender's clock, not
-// receipt time: a message delivered now with an old timestamp does not count
-// as activity now, so a transport delivering only a delayed backlog can read
-// as silent. The v2 inbox source has no such gap. platformByStorage maps
-// storage platforms ("sms", "rcs", ...) to status platform keys.
+// NewMessageActivity measures activity as stored incoming-message timestamps,
+// for daemons whose readers use the legacy store. Only incoming messages count:
+// the app writes outgoing rows itself, so a send, even a failed one, must not
+// read as the platform delivering. Message timestamps are the sender's clock,
+// not receipt time, so a backlog delivered late counts at its original time:
+// it can make the current silence look longer and keep a platform flagged
+// until a message with a current timestamp arrives. The v2 inbox source has
+// receipt times and no such lag. platformByStorage maps storage platforms
+// ("sms", "rcs", ...) to status platform keys.
 func NewMessageActivity(store MessageStore, platformByStorage map[string]string) ActivitySource {
 	storage := map[string][]string{}
 	for stored, platform := range platformByStorage {
@@ -120,12 +164,14 @@ func NewMessageActivity(store MessageStore, platformByStorage map[string]string)
 		}
 		storage[platform] = append(storage[platform], stored)
 	}
-	return messageActivity{store: store, platformByStorage: platformByStorage, storageByPlatform: storage}
+	for _, stored := range storage {
+		sort.Strings(stored)
+	}
+	return messageActivity{store: store, storageByPlatform: storage}
 }
 
 type messageActivity struct {
 	store             MessageStore
-	platformByStorage map[string]string
 	storageByPlatform map[string][]string
 }
 
@@ -135,19 +181,14 @@ func (s messageActivity) Latest(ctx context.Context) (map[string]time.Time, erro
 	if s.store == nil {
 		return nil, fmt.Errorf("message activity: store is nil")
 	}
-	byStorage, err := s.store.LatestMessageTimestamps(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("message activity: %w", err)
-	}
 	latest := map[string]time.Time{}
-	for stored, ms := range byStorage {
-		platform := s.platformByStorage[stored]
-		if platform == "" || ms <= 0 {
-			continue
+	for platform, stored := range s.storageByPlatform {
+		ms, err := s.store.LatestIncomingMessageTimestamp(ctx, stored)
+		if err != nil {
+			return nil, fmt.Errorf("message activity %s: %w", platform, err)
 		}
-		at := time.UnixMilli(ms)
-		if at.After(latest[platform]) {
-			latest[platform] = at
+		if ms > 0 {
+			latest[platform] = time.UnixMilli(ms)
 		}
 	}
 	return latest, nil
@@ -161,7 +202,7 @@ func (s messageActivity) Between(ctx context.Context, platform string, from, to 
 	if len(stored) == 0 {
 		return nil, nil
 	}
-	rows, err := s.store.MessageTimestampsBetween(ctx, stored, from.UnixMilli(), to.UnixMilli())
+	rows, err := s.store.IncomingMessageTimestampsBetween(ctx, stored, from.UnixMilli(), to.UnixMilli())
 	if err != nil {
 		return nil, fmt.Errorf("message activity %s: %w", platform, err)
 	}

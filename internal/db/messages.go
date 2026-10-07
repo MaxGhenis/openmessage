@@ -820,36 +820,39 @@ func (s *Store) PlatformStats() ([]PlatformStat, error) {
 	return stats, rows.Err()
 }
 
-// LatestMessageTimestamps returns the newest stored message timestamp per
-// source platform. Freshness uses it as the activity clock on daemons without
-// v2 ingest.
-func (s *Store) LatestMessageTimestamps(ctx context.Context) (map[string]int64, error) {
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT source_platform, COALESCE(MAX(timestamp_ms), 0)
+// LatestIncomingMessageTimestamp returns the newest timestamp of an incoming
+// (not from me) message on any of the given source platforms, or 0. It walks
+// the timestamp index from the newest row and stops at the first match.
+// Freshness uses it as the activity clock on daemons without v2 ingest;
+// outgoing rows are skipped because the app writes them itself, so a send
+// (even a failed one) must not read as the platform delivering.
+func (s *Store) LatestIncomingMessageTimestamp(ctx context.Context, platforms []string) (int64, error) {
+	if len(platforms) == 0 {
+		return 0, nil
+	}
+	args := make([]any, 0, len(platforms))
+	for _, platform := range platforms {
+		args = append(args, platform)
+	}
+	var ts int64
+	err := s.db.QueryRowContext(ctx, `
+		SELECT timestamp_ms
 		FROM messages
-		GROUP BY source_platform
-	`)
-	if err != nil {
-		return nil, err
+		WHERE is_from_me = 0
+			AND source_platform IN (`+strings.TrimSuffix(strings.Repeat("?,", len(platforms)), ",")+`)
+		ORDER BY timestamp_ms DESC
+		LIMIT 1
+	`, args...).Scan(&ts)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, nil
 	}
-	defer rows.Close()
-	latest := map[string]int64{}
-	for rows.Next() {
-		var platform sql.NullString
-		var ts int64
-		if err := rows.Scan(&platform, &ts); err != nil {
-			return nil, err
-		}
-		latest[strings.TrimSpace(platform.String)] = ts
-	}
-	return latest, rows.Err()
+	return ts, err
 }
 
-// MessageTimestampsBetween returns the timestamps (ms, ascending) of messages
-// from the given source platforms inside [fromMS, toMS]. The timestamp index
-// bounds the scan to the window, so a two-week window stays cheap on a large
-// store.
-func (s *Store) MessageTimestampsBetween(ctx context.Context, platforms []string, fromMS, toMS int64) ([]int64, error) {
+// IncomingMessageTimestampsBetween returns the timestamps (ms, ascending) of
+// incoming messages from the given source platforms inside [fromMS, toMS].
+// The timestamp index bounds the scan to the window.
+func (s *Store) IncomingMessageTimestampsBetween(ctx context.Context, platforms []string, fromMS, toMS int64) ([]int64, error) {
 	if len(platforms) == 0 || toMS < fromMS {
 		return nil, nil
 	}
@@ -862,6 +865,7 @@ func (s *Store) MessageTimestampsBetween(ctx context.Context, platforms []string
 		SELECT timestamp_ms
 		FROM messages
 		WHERE timestamp_ms BETWEEN ? AND ?
+			AND is_from_me = 0
 			AND source_platform IN (`+strings.TrimSuffix(strings.Repeat("?,", len(platforms)), ",")+`)
 		ORDER BY timestamp_ms
 	`, args...)

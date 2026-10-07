@@ -101,10 +101,13 @@ func v2SendWebOptions(stack *v2Stack, enabled bool) *web.V2Options {
 }
 
 // freshnessActivitySource picks the clock /api/status judges platform silence
-// by. With v2 ingest running it is the inbox, where every transport frame lands
-// before decoding; without it, the legacy store's message timestamps.
-func freshnessActivitySource(stack *v2Stack, legacy *db.Store) freshness.ActivitySource {
-	if stack != nil && stack.Store != nil {
+// by, following where readers get their messages. On a v2-primary daemon that
+// is the v2 inbox, where transport events land before decoding. Otherwise
+// readers use the legacy store, which also takes rows that never pass through
+// the inbox (backfills, desktop imports), so its incoming-message timestamps
+// are the clock.
+func freshnessActivitySource(stack *v2Stack, legacy *db.Store, v2Primary bool) freshness.ActivitySource {
+	if v2Primary && stack != nil && stack.Store != nil {
 		return freshness.NewInboxActivity(stack.Store, map[string]string{
 			ingest.GoogleCodec:        "google",
 			whatsapplive.IngressCodec: "whatsapp",
@@ -699,7 +702,7 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 				Auth:                  controlAuth,
 				V2:                    v2Options,
 				V2IngestCounters:      v2IngestCounters,
-				Activity:              freshnessActivitySource(stack, a.Store),
+				Activity:              freshnessActivitySource(stack, a.Store, v2Primary),
 				Reads:                 reads,
 				V2Primary:             v2Primary,
 				Client:                a.GetClient,

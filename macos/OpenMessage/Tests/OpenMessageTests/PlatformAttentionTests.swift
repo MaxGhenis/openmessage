@@ -119,4 +119,14 @@ final class PlatformAttentionTests: XCTestCase {
         XCTAssertEqual(latch.newlySilent([google]), [google])
         XCTAssertEqual(latch.newlySilent([google, signal]), [signal])
     }
+
+    // The latch state survives a relaunch: restored from what was persisted,
+    // the same episode stays quiet. The 10/6 outage had three app relaunches.
+    func testSilenceLatchRestoredStateStaysQuietForTheSameEpisode() {
+        let silent = PlatformAttention(key: "google", name: "Google Messages", reason: .silent(hours: 7, since: 1_000))
+        var first = SilenceNotificationLatch()
+        XCTAssertEqual(first.newlySilent([silent]), [silent])
+        var relaunched = SilenceNotificationLatch(notifiedEpisode: first.notifiedEpisode)
+        XCTAssertEqual(relaunched.newlySilent([silent]), [])
+    }
 }

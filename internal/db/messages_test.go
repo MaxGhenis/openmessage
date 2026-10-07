@@ -1367,16 +1367,19 @@ func TestPlatformStats_Empty(t *testing.T) {
 	}
 }
 
-// Silence detection reads these on daemons without v2 ingest: the newest
-// timestamp per platform, and the timestamps inside a baseline window.
-func TestMessageActivityTimestamps(t *testing.T) {
+// Silence detection reads these on daemons whose readers use the legacy store:
+// the newest incoming timestamp, and incoming timestamps inside a window. The
+// app's own outgoing rows, including failed sends, never count.
+func TestIncomingMessageActivityTimestamps(t *testing.T) {
 	store := newTestStore(t)
+	ctx := context.Background()
 	msgs := []*Message{
 		{MessageID: "s1", ConversationID: "c1", Body: "a", TimestampMS: 1000, SourcePlatform: "sms"},
 		{MessageID: "s2", ConversationID: "c1", Body: "b", TimestampMS: 3000, SourcePlatform: "sms"},
 		{MessageID: "r1", ConversationID: "c2", Body: "c", TimestampMS: 2000, SourcePlatform: "rcs"},
 		{MessageID: "w1", ConversationID: "c3", Body: "d", TimestampMS: 2500, SourcePlatform: "whatsapp"},
-		{MessageID: "s3", ConversationID: "c1", Body: "e", TimestampMS: 9000, SourcePlatform: "sms"},
+		// A send Google rejected: stamped now by the app, not delivered.
+		{MessageID: "out1", ConversationID: "c1", Body: "e", TimestampMS: 9000, SourcePlatform: "sms", IsFromMe: true, Status: "OUTGOING_FAILED:FAILURE_2"},
 	}
 	for _, m := range msgs {
 		if err := store.UpsertMessage(m); err != nil {
@@ -1384,26 +1387,29 @@ func TestMessageActivityTimestamps(t *testing.T) {
 		}
 	}
 
-	latest, err := store.LatestMessageTimestamps(context.Background())
+	latest, err := store.LatestIncomingMessageTimestamp(ctx, []string{"sms", "rcs"})
 	if err != nil {
-		t.Fatalf("LatestMessageTimestamps: %v", err)
+		t.Fatalf("LatestIncomingMessageTimestamp: %v", err)
 	}
-	if latest["sms"] != 9000 || latest["rcs"] != 2000 || latest["whatsapp"] != 2500 {
-		t.Fatalf("LatestMessageTimestamps = %v", latest)
+	if latest != 3000 {
+		t.Fatalf("LatestIncomingMessageTimestamp(sms, rcs) = %d, want 3000 (the failed send at 9000 is not delivery)", latest)
+	}
+	if latest, err := store.LatestIncomingMessageTimestamp(ctx, []string{"signal"}); err != nil || latest != 0 {
+		t.Fatalf("LatestIncomingMessageTimestamp(signal) = %d, %v; want 0, nil", latest, err)
 	}
 
-	got, err := store.MessageTimestampsBetween(context.Background(), []string{"sms", "rcs"}, 1000, 3000)
+	got, err := store.IncomingMessageTimestampsBetween(ctx, []string{"sms", "rcs"}, 1000, 9000)
 	if err != nil {
-		t.Fatalf("MessageTimestampsBetween: %v", err)
+		t.Fatalf("IncomingMessageTimestampsBetween: %v", err)
 	}
 	if want := []int64{1000, 2000, 3000}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("MessageTimestampsBetween = %v, want %v (inclusive, ascending, whatsapp excluded)", got, want)
+		t.Fatalf("IncomingMessageTimestampsBetween = %v, want %v (inclusive, ascending, incoming only)", got, want)
 	}
-	if got, err := store.MessageTimestampsBetween(context.Background(), nil, 0, 10000); err != nil || len(got) != 0 {
-		t.Fatalf("MessageTimestampsBetween(no platforms) = %v, %v; want empty", got, err)
+	if got, err := store.IncomingMessageTimestampsBetween(ctx, nil, 0, 10000); err != nil || len(got) != 0 {
+		t.Fatalf("IncomingMessageTimestampsBetween(no platforms) = %v, %v; want empty", got, err)
 	}
-	if got, err := store.MessageTimestampsBetween(context.Background(), []string{"sms"}, 5000, 1000); err != nil || len(got) != 0 {
-		t.Fatalf("MessageTimestampsBetween(inverted) = %v, %v; want empty", got, err)
+	if got, err := store.IncomingMessageTimestampsBetween(ctx, []string{"sms"}, 5000, 1000); err != nil || len(got) != 0 {
+		t.Fatalf("IncomingMessageTimestampsBetween(inverted) = %v, %v; want empty", got, err)
 	}
 }
 

@@ -61,7 +61,8 @@ final class NotificationManager: NSObject, ObservableObject, UNUserNotificationC
     private var streamTask: Task<Void, Never>?
     private var healthTask: Task<Void, Never>?
     private var bootstrapTask: Task<Void, Never>?
-    private var silenceLatch = SilenceNotificationLatch()
+    private var silenceLatch: SilenceNotificationLatch
+    private let silenceLatchKey = "silenceNotifiedEpisodes"
     private var lastSeenTimestamps: [String: Int64] = [:]
     private var seenMessageIDs = Set<String>()
     private var seenMessageOrder: [String] = []
@@ -85,6 +86,10 @@ final class NotificationManager: NSObject, ObservableObject, UNUserNotificationC
             defaults.set(true, forKey: preferenceKey)
         }
         self.preferenceEnabled = defaults.bool(forKey: preferenceKey)
+        let stored = defaults.dictionary(forKey: silenceLatchKey) ?? [:]
+        self.silenceLatch = SilenceNotificationLatch(
+            notifiedEpisode: stored.compactMapValues { ($0 as? NSNumber)?.int64Value }
+        )
         super.init()
         UNUserNotificationCenter.current().delegate = self
     }
@@ -368,7 +373,11 @@ final class NotificationManager: NSObject, ObservableObject, UNUserNotificationC
             title: "WhatsApp needs attention",
             body: "WhatsApp was logged out. Open OpenMessage to scan the QR code and reconnect."
         )
-        for item in silenceLatch.newlySilent(attention) {
+        let newlySilent = silenceLatch.newlySilent(attention)
+        if !newlySilent.isEmpty {
+            defaults.set(silenceLatch.notifiedEpisode.mapValues { NSNumber(value: $0) }, forKey: silenceLatchKey)
+        }
+        for item in newlySilent {
             guard let body = PlatformAttention.silentNotificationBody(item) else { continue }
             sendHealthNotification(key: "\(item.key)-silent", title: "\(item.name) has gone quiet", body: body)
         }

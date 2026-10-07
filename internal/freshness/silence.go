@@ -5,13 +5,15 @@
 // newest platform by 3+ days") cannot see a stall on the platform that carries
 // most of the traffic: when Google Messages stops relaying, it is still the
 // newest platform, so it is never "behind". On 2026-10-06 Google ingest went
-// silent at 01:11 for 38 hours while /api/status reported connected=true,
-// phone_responding=true and stale=false the whole time. This package judges
-// silence against the platform's own baseline instead.
+// silent at 01:11 for 38 hours. Apart from brief reconnects and three app
+// relaunches, /api/status reported connected=true and phone_responding=true,
+// and stale=false throughout. This package judges silence against the
+// platform's own baseline instead.
 package freshness
 
 import (
 	"math"
+	"sort"
 	"time"
 )
 
@@ -25,9 +27,10 @@ type SilenceConfig struct {
 	// MinActiveDays is how many local calendar days in the baseline must carry
 	// at least one event before the hour-of-day profile is trusted.
 	MinActiveDays int
-	// MinEventsPerActiveDay is the average event count per active baseline day
+	// MinEventsPerActiveDay is the median event count per active baseline day
 	// below which a platform is too quiet for hours of silence to mean
-	// anything; only LongSilence applies to it.
+	// anything; only LongSilence applies to it. The median keeps one burst
+	// (a history sync after pairing) from making a sparse platform look busy.
 	MinEventsPerActiveDay float64
 	// ExpectedActiveHoursLimit flags a stall once the profile predicts activity
 	// in at least this many of the silent hours.
@@ -74,6 +77,8 @@ type Profile struct {
 	Hours      [24]float64
 	ActiveDays int
 	Events     int
+	// MedianDailyEvents is the median event count over active days.
+	MedianDailyEvents float64
 }
 
 // BaselineRange returns the half-open window [from, to) whose events build the
@@ -108,8 +113,9 @@ func startOfLocalDay(year int, month time.Month, day int, loc *time.Location) ti
 // BuildProfile builds the hour-of-day profile from the events inside
 // [from, to). Events outside the window are ignored. A day is active when it
 // carries at least one event; days without any event do not dilute the
-// profile, so an outage inside the window cannot teach the profile that the
-// outage hours are normally quiet.
+// profile, so a whole-day outage inside the window cannot teach the profile
+// that its hours are normally quiet. A day an outage covers only in part still
+// counts and lowers the other hours' fractions a little.
 func BuildProfile(events []time.Time, from, to time.Time, loc *time.Location) Profile {
 	if loc == nil {
 		loc = time.Local
@@ -120,6 +126,7 @@ func BuildProfile(events []time.Time, from, to time.Time, loc *time.Location) Pr
 		day   int
 	}
 	hoursByDay := map[dayKey]*[24]bool{}
+	eventsByDay := map[dayKey]int{}
 	var profile Profile
 	for _, event := range events {
 		if event.Before(from) || !event.Before(to) {
@@ -134,10 +141,21 @@ func BuildProfile(events []time.Time, from, to time.Time, loc *time.Location) Pr
 			hoursByDay[key] = hours
 		}
 		hours[local.Hour()] = true
+		eventsByDay[key]++
 	}
 	profile.ActiveDays = len(hoursByDay)
 	if profile.ActiveDays == 0 {
 		return profile
+	}
+	counts := make([]int, 0, len(eventsByDay))
+	for _, n := range eventsByDay {
+		counts = append(counts, n)
+	}
+	sort.Ints(counts)
+	if mid := len(counts) / 2; len(counts)%2 == 1 {
+		profile.MedianDailyEvents = float64(counts[mid])
+	} else {
+		profile.MedianDailyEvents = float64(counts[mid-1]+counts[mid]) / 2
 	}
 	for _, hours := range hoursByDay {
 		for hour, active := range hours {
@@ -184,6 +202,10 @@ func (p Profile) ExpectedActiveHours(from, to time.Time, loc *time.Location) flo
 		if next.After(to) {
 			next = to
 		}
+		if !next.After(cursor) {
+			// Time.Add saturates near Go's maximum time; stop rather than spin.
+			break
+		}
 		expected += next.Sub(cursor).Hours() * p.Hours[local.Hour()]
 		cursor = next
 	}
@@ -198,10 +220,13 @@ type SilenceVerdict struct {
 	ExpectedActiveHours float64
 	BaselineActiveDays  int
 	BaselineEvents      int
+	// BaselineMedianDailyEvents is the median event count over active
+	// baseline days; at MinEventsPerActiveDay or more the platform is busy.
+	BaselineMedianDailyEvents float64
 	// Evaluated reports whether the baseline was rich enough to trust the
-	// hour-of-day profile (MinActiveDays days averaging MinEventsPerActiveDay
-	// events). Without it only MaxSilence (for a platform busy on its active
-	// days) and LongSilence can flag a stall.
+	// hour-of-day profile: MinActiveDays active days and a busy median.
+	// Without it only MaxSilence (for a busy platform) and LongSilence can
+	// flag a stall.
 	Evaluated bool
 	Stalled   bool
 	// Rule names the rule that flagged the stall: RuleExpectedActivity,
@@ -231,11 +256,12 @@ func EvaluateSilence(
 	verdict.BaselineActiveDays = profile.ActiveDays
 	verdict.BaselineEvents = profile.Events
 	verdict.ExpectedActiveHours = profile.ExpectedActiveHours(last, last.Add(verdict.Silence), loc)
-	busy := profile.ActiveDays > 0 &&
-		float64(profile.Events)/float64(profile.ActiveDays) >= cfg.MinEventsPerActiveDay
+	verdict.BaselineMedianDailyEvents = profile.MedianDailyEvents
+	busy := profile.ActiveDays > 0 && profile.MedianDailyEvents >= cfg.MinEventsPerActiveDay
 	verdict.Evaluated = busy && profile.ActiveDays >= cfg.MinActiveDays
 	switch {
-	case verdict.Evaluated && verdict.ExpectedActiveHours >= cfg.ExpectedActiveHoursLimit:
+	case verdict.Evaluated && cfg.ExpectedActiveHoursLimit > 0 &&
+		verdict.ExpectedActiveHours >= cfg.ExpectedActiveHoursLimit:
 		verdict.Stalled = true
 		verdict.Rule = RuleExpectedActivity
 	case busy && cfg.MaxSilence > 0 && verdict.Silence >= cfg.MaxSilence:

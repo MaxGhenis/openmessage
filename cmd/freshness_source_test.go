@@ -13,19 +13,20 @@ import (
 	"github.com/maxghenis/openmessage/internal/whatsapplive"
 )
 
-// With v2 ingest running, silence is measured on the inbox, and every codec
-// the ingest worker decodes maps to its status platform; without it, on stored
-// message timestamps.
+// On a v2-primary daemon silence is measured on the v2 inbox, and each ingest
+// codec maps to its status platform. When readers use the legacy store, even
+// with v2 ingest running, it is measured on the legacy store's incoming
+// messages, since rows reach it that never pass through the inbox.
 func TestFreshnessActivitySourceMapsEveryIngestCodec(t *testing.T) {
-	if got := freshnessActivitySource(nil, nil); got != nil {
-		t.Fatalf("freshnessActivitySource(nil, nil) = %v, want nil", got)
+	if got := freshnessActivitySource(nil, nil, true); got != nil {
+		t.Fatalf("freshnessActivitySource(nil, nil, true) = %v, want nil", got)
 	}
 	legacy, err := db.New(":memory:")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer legacy.Close()
-	if got := freshnessActivitySource(nil, legacy); got == nil || got.Name() != freshness.SourceMessages {
+	if got := freshnessActivitySource(nil, legacy, false); got == nil || got.Name() != freshness.SourceMessages {
 		t.Fatalf("legacy-only source = %v, want %s", got, freshness.SourceMessages)
 	}
 
@@ -74,7 +75,10 @@ func TestFreshnessActivitySourceMapsEveryIngestCodec(t *testing.T) {
 		}
 	}
 
-	source := freshnessActivitySource(&v2Stack{Store: store}, legacy)
+	if got := freshnessActivitySource(&v2Stack{Store: store}, legacy, false); got == nil || got.Name() != freshness.SourceMessages {
+		t.Fatalf("v2 ingest without v2-primary = %v, want %s", got, freshness.SourceMessages)
+	}
+	source := freshnessActivitySource(&v2Stack{Store: store}, legacy, true)
 	if source == nil || source.Name() != freshness.SourceV2Inbox {
 		t.Fatalf("v2 source = %v, want %s", source, freshness.SourceV2Inbox)
 	}

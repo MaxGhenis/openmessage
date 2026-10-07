@@ -3899,7 +3899,8 @@ const silenceQueryTimeout = 5 * time.Second
 // addSilence annotates each per-platform freshness entry with a "silence"
 // block judging how long the platform has delivered nothing against its own
 // hour-of-day baseline (freshness.EvaluateSilence), folds a stall into
-// "stale"/"stale_reason", and stamps a top-level "silence_stalled". A nil
+// "stale"/"stale_reason", and stamps a top-level "silence_stalled" that is
+// true when some platform's stale_reason is "silent". A nil
 // source leaves the payload untouched. When a query fails, the platform keeps
 // the silence block from prev (the previous payload), marked
 // "carried_over", so a failing query cannot clear a stall that is still
@@ -3939,7 +3940,10 @@ func addSilence(
 		entry["stale"] = behind || stalled
 		entry["stale_reason"] = staleReason(behind, stalled)
 		out[platform] = entry
-		if stalled {
+		// Only platforms whose stale reason ends up "silent" count: a
+		// platform already "behind" (often unpaired or logged out for weeks)
+		// would otherwise hold silence_stalled true forever.
+		if entry["stale_reason"] == "silent" {
 			anyStalled = true
 		}
 	}
@@ -3985,18 +3989,19 @@ func addSilence(
 		}
 		verdict := freshness.EvaluateSilence(last, baseline.events, now, loc, cfg)
 		apply(platform, map[string]any{
-			"source":                      source.Name(),
-			"last_event_ms":               last.UnixMilli(),
-			"silent_ms":                   verdict.Silence.Milliseconds(),
-			"expected_active_hours":       freshness.RoundHours(verdict.ExpectedActiveHours),
-			"expected_active_hours_limit": cfg.ExpectedActiveHoursLimit,
-			"max_silent_ms":               cfg.MaxSilence.Milliseconds(),
-			"baseline_days":               cfg.BaselineDays,
-			"baseline_active_days":        verdict.BaselineActiveDays,
-			"baseline_events":             verdict.BaselineEvents,
-			"evaluated":                   verdict.Evaluated,
-			"stalled":                     verdict.Stalled,
-			"rule":                        verdict.Rule,
+			"source":                       source.Name(),
+			"last_event_ms":                last.UnixMilli(),
+			"silent_ms":                    verdict.Silence.Milliseconds(),
+			"expected_active_hours":        freshness.RoundHours(verdict.ExpectedActiveHours),
+			"expected_active_hours_limit":  cfg.ExpectedActiveHoursLimit,
+			"max_silent_ms":                cfg.MaxSilence.Milliseconds(),
+			"baseline_days":                cfg.BaselineDays,
+			"baseline_active_days":         verdict.BaselineActiveDays,
+			"baseline_events":              verdict.BaselineEvents,
+			"baseline_median_daily_events": verdict.BaselineMedianDailyEvents,
+			"evaluated":                    verdict.Evaluated,
+			"stalled":                      verdict.Stalled,
+			"rule":                         verdict.Rule,
 		}, verdict.Stalled)
 	}
 	out["silence_stalled"] = anyStalled

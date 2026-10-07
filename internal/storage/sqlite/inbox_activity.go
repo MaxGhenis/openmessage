@@ -6,32 +6,41 @@ import (
 	"strings"
 )
 
-// LatestInboxReceipts returns the newest inbox receipt time (ms) per codec.
-// Freshness reads it to tell how long each transport has been silent: the
-// inbox holds every frame a transport delivered, decoded or not.
-func (s *Store) LatestInboxReceipts(ctx context.Context) (map[string]int64, error) {
+// InboxReceiptsAfterRow returns, per codec, the newest receipt time (ms) among
+// inbox rows whose rowid exceeds afterRowID, and the largest rowid seen (or
+// afterRowID when there are none). Freshness calls it with its high-water mark
+// so each refresh reads only rows appended since the last one; afterRowID 0
+// scans everything. Nothing deletes inbox rows in normal operation, so new
+// rows get larger rowids; callers still rescan now and then in case one is
+// reused.
+func (s *Store) InboxReceiptsAfterRow(ctx context.Context, afterRowID int64) (map[string]int64, int64, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT codec, MAX(received_at_ms)
+		SELECT codec, MAX(received_at_ms), MAX(rowid)
 		FROM inbox
+		WHERE rowid > ?
 		GROUP BY codec
-	`)
+	`, afterRowID)
 	if err != nil {
-		return nil, fmt.Errorf("latest inbox receipts: %w", err)
+		return nil, 0, fmt.Errorf("inbox receipts after row: %w", err)
 	}
 	defer rows.Close()
 	latest := map[string]int64{}
+	maxRowID := afterRowID
 	for rows.Next() {
 		var codec string
-		var receivedAtMS int64
-		if err := rows.Scan(&codec, &receivedAtMS); err != nil {
-			return nil, fmt.Errorf("latest inbox receipts: scan: %w", err)
+		var receivedAtMS, rowID int64
+		if err := rows.Scan(&codec, &receivedAtMS, &rowID); err != nil {
+			return nil, 0, fmt.Errorf("inbox receipts after row: scan: %w", err)
 		}
 		latest[codec] = receivedAtMS
+		if rowID > maxRowID {
+			maxRowID = rowID
+		}
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("latest inbox receipts: %w", err)
+		return nil, 0, fmt.Errorf("inbox receipts after row: %w", err)
 	}
-	return latest, nil
+	return latest, maxRowID, nil
 }
 
 // InboxReceiptsBetween returns the receipt times (ms, ascending) of inbox
