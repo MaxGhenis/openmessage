@@ -3,6 +3,7 @@ package db
 import (
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -1362,6 +1363,46 @@ func TestPlatformStats_Empty(t *testing.T) {
 	}
 	if len(stats) != 0 {
 		t.Fatalf("empty store: got %d platforms, want 0", len(stats))
+	}
+}
+
+// Silence detection reads these on daemons without v2 ingest: the newest
+// timestamp per platform, and the timestamps inside a baseline window.
+func TestMessageActivityTimestamps(t *testing.T) {
+	store := newTestStore(t)
+	msgs := []*Message{
+		{MessageID: "s1", ConversationID: "c1", Body: "a", TimestampMS: 1000, SourcePlatform: "sms"},
+		{MessageID: "s2", ConversationID: "c1", Body: "b", TimestampMS: 3000, SourcePlatform: "sms"},
+		{MessageID: "r1", ConversationID: "c2", Body: "c", TimestampMS: 2000, SourcePlatform: "rcs"},
+		{MessageID: "w1", ConversationID: "c3", Body: "d", TimestampMS: 2500, SourcePlatform: "whatsapp"},
+		{MessageID: "s3", ConversationID: "c1", Body: "e", TimestampMS: 9000, SourcePlatform: "sms"},
+	}
+	for _, m := range msgs {
+		if err := store.UpsertMessage(m); err != nil {
+			t.Fatalf("insert %s: %v", m.MessageID, err)
+		}
+	}
+
+	latest, err := store.LatestMessageTimestamps()
+	if err != nil {
+		t.Fatalf("LatestMessageTimestamps: %v", err)
+	}
+	if latest["sms"] != 9000 || latest["rcs"] != 2000 || latest["whatsapp"] != 2500 {
+		t.Fatalf("LatestMessageTimestamps = %v", latest)
+	}
+
+	got, err := store.MessageTimestampsBetween([]string{"sms", "rcs"}, 1000, 3000)
+	if err != nil {
+		t.Fatalf("MessageTimestampsBetween: %v", err)
+	}
+	if want := []int64{1000, 2000, 3000}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("MessageTimestampsBetween = %v, want %v (inclusive, ascending, whatsapp excluded)", got, want)
+	}
+	if got, err := store.MessageTimestampsBetween(nil, 0, 10000); err != nil || len(got) != 0 {
+		t.Fatalf("MessageTimestampsBetween(no platforms) = %v, %v; want empty", got, err)
+	}
+	if got, err := store.MessageTimestampsBetween([]string{"sms"}, 5000, 1000); err != nil || len(got) != 0 {
+		t.Fatalf("MessageTimestampsBetween(inverted) = %v, %v; want empty", got, err)
 	}
 }
 

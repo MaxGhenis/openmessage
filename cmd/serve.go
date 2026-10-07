@@ -27,6 +27,7 @@ import (
 	signaladapter "github.com/maxghenis/openmessage/internal/bridgeadapters/signal"
 	whatsappadapter "github.com/maxghenis/openmessage/internal/bridgeadapters/whatsapp"
 	"github.com/maxghenis/openmessage/internal/db"
+	"github.com/maxghenis/openmessage/internal/freshness"
 	"github.com/maxghenis/openmessage/internal/googlecookies"
 	"github.com/maxghenis/openmessage/internal/importer"
 	"github.com/maxghenis/openmessage/internal/ingest"
@@ -97,6 +98,28 @@ func v2SendWebOptions(stack *v2Stack, enabled bool) *web.V2Options {
 		Blobs:    stack.Blobs,
 		Registry: stack.Registry,
 	}
+}
+
+// freshnessActivitySource picks the clock /api/status judges platform silence
+// by. With v2 ingest running it is the inbox, where every transport frame lands
+// before decoding; without it, the legacy store's message timestamps.
+func freshnessActivitySource(stack *v2Stack, legacy *db.Store) freshness.ActivitySource {
+	if stack != nil && stack.Store != nil {
+		return freshness.NewInboxActivity(stack.Store, map[string]string{
+			ingest.GoogleCodec:        "google",
+			whatsapplive.IngressCodec: "whatsapp",
+			ingest.SignalJSONRPCCodec: "signal",
+		})
+	}
+	if legacy != nil {
+		return freshness.NewMessageActivity(legacy, map[string]string{
+			"sms":      "google",
+			"rcs":      "google",
+			"whatsapp": "whatsapp",
+			"signal":   "signal",
+		})
+	}
+	return nil
 }
 
 func v2IngestCountersProvider(stack *v2Stack) func() map[string]ingest.CounterSnapshot {
@@ -676,6 +699,7 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 				Auth:                  controlAuth,
 				V2:                    v2Options,
 				V2IngestCounters:      v2IngestCounters,
+				Activity:              freshnessActivitySource(stack, a.Store),
 				Reads:                 reads,
 				V2Primary:             v2Primary,
 				Client:                a.GetClient,

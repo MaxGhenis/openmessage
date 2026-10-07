@@ -819,6 +819,56 @@ func (s *Store) PlatformStats() ([]PlatformStat, error) {
 	return stats, rows.Err()
 }
 
+// LatestMessageTimestamps returns the newest stored message timestamp per
+// source platform. Freshness uses it as the activity clock on daemons without
+// v2 ingest.
+func (s *Store) LatestMessageTimestamps() (map[string]int64, error) {
+	stats, err := s.PlatformStats()
+	if err != nil {
+		return nil, err
+	}
+	latest := make(map[string]int64, len(stats))
+	for _, st := range stats {
+		latest[st.Platform] = st.LatestMS
+	}
+	return latest, nil
+}
+
+// MessageTimestampsBetween returns the timestamps (ms, ascending) of messages
+// from the given source platforms inside [fromMS, toMS]. The timestamp index
+// bounds the scan to the window, so a two-week window stays cheap on a large
+// store.
+func (s *Store) MessageTimestampsBetween(platforms []string, fromMS, toMS int64) ([]int64, error) {
+	if len(platforms) == 0 || toMS < fromMS {
+		return nil, nil
+	}
+	args := make([]any, 0, len(platforms)+2)
+	args = append(args, fromMS, toMS)
+	for _, platform := range platforms {
+		args = append(args, platform)
+	}
+	rows, err := s.db.Query(`
+		SELECT timestamp_ms
+		FROM messages
+		WHERE timestamp_ms BETWEEN ? AND ?
+			AND source_platform IN (`+strings.TrimSuffix(strings.Repeat("?,", len(platforms)), ",")+`)
+		ORDER BY timestamp_ms
+	`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var timestamps []int64
+	for rows.Next() {
+		var ts int64
+		if err := rows.Scan(&ts); err != nil {
+			return nil, err
+		}
+		timestamps = append(timestamps, ts)
+	}
+	return timestamps, rows.Err()
+}
+
 func scanMessages(rows interface {
 	Next() bool
 	Scan(...any) error

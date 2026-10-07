@@ -110,7 +110,9 @@ Two more cutover artifacts worth knowing:
   Signal projection stalled from Thu 7/23 to Sat 7/25 while legacy kept writing.
   Each platform entry now also carries `legacy_latest_ms`, `projection_lag_ms`,
   and `projection_stalled` (plus a top-level `projection_stalled`), so read
-  those before trusting freshness on a migrated install:
+  those before trusting freshness on a migrated install. A transport that stops
+  delivering altogether shows in `silence` instead (see "Google Messages silent
+  while connected" below):
 
 ```bash
 curl -s http://127.0.0.1:7007/api/status | jq '.freshness'
@@ -164,6 +166,70 @@ repair still re-files messages but cannot restore overwritten titles/rosters.
 Outgoing-only windows are reported as `ambiguous` and left in place: a
 message frame carries no recipient, so nothing proves where an outbound text
 belongs until the thread's ConversationEvent re-binds the id.
+
+## Google Messages silent while "connected": the phone stopped relaying
+
+**Symptom:** no new SMS/RCS for hours while `/api/status` shows
+`google.connected: true`, `phone_responding: true`, no `needs_repair`, and
+`freshness.google.behind_days: 0`. `phone_responding` only turns false when
+libgm's ditto pings time out; it says nothing about whether the phone relays
+messages. And Google is usually the newest platform, so the relative
+`behind_days` rule can never flag it.
+
+**What 2026-10-06 showed.** The last Google frame reached the v2 inbox at
+01:11 EDT; nothing more arrived for 38 hours. The long-poll stayed up the whole
+time: pings were answered (`Phone responding again` after brief timeouts),
+extra `GET_UPDATES` calls were answered, and `Listen recovered` followed each
+network change. The phone was the part that stopped: after a full restart at
+15:29 on 10/7 it pushed messages sent from the phone on 10/6 at 07:12 and
+08:55. Google message ids are the phone's row ids (previous section), and the
+phone created rows 87881–88012 during the stall, about a day and a half of
+ordinary traffic; OpenMessage received 4 of those 132 ids. Pulling didn't help
+either: three app relaunches on 10/6 (each starts a shallow backfill) and six
+`Reconciling recent conversations` runs on 10/7 put none of the missing rows
+into `messages.db`, so a probe over the same session would have passed. Do
+not re-pair for this; **restart the phone**. (Google Messages auto-updated on
+the phone at 02:07 on 10/6, an hour after the last frame; nothing on hand says
+whether that caused it. The same restart also cleared an unrelated IMS-stack
+SMS fault on that phone.)
+
+**Detection.** Each platform in `freshness` now carries a `silence` block that
+judges how long the transport has delivered nothing against that platform's own
+baseline (`internal/freshness`): the hour-of-day profile of the 14 whole local
+days before the silence began, measured on v2 inbox receipts (every frame,
+before decoding) or, without v2 ingest, on message timestamps. A silence is a
+stall when the profile expected activity in at least 6 of the silent hours, or
+after 16 hours regardless. It is judged only when the baseline has at least 7
+active days averaging 20 events, so a quiet or newly paired platform never
+trips it. A stall sets `stale: true` with `stale_reason: "silent"` ("behind",
+the relative rule, takes precedence), and a top-level `silence_stalled`. The
+macOS app then says to check or restart the phone instead of "needs re-pairing",
+and posts one notification per episode.
+
+```bash
+curl -s http://127.0.0.1:7007/api/status | jq '.freshness.google | {stale, stale_reason, silence}'
+```
+
+On the 80-day Google history of the install that hit this, the rule flags
+every silence longer than 16 hours (the July and August outages among them)
+and no ordinary night or weekend since 9/4, when that history became
+continuous (the worst ordinary quiet stretch scored 5.0 of the 6 needed). It
+would have flagged this stall at about 13:45 on 10/6. Silences that start in
+the day are flagged after about 8 hours, ones that start in the evening by the
+16-hour cap.
+
+**What a stall leaves behind.** On a v2-primary install nothing re-fetches the
+messages a stall skipped: the startup backfill and recent reconcile write only
+the legacy `messages.db`, and v2 reads see only what the live long-poll
+delivers. Find the hole by the phone's row ids, which advance with every
+message on the phone:
+
+```bash
+sqlite3 -readonly "$HOME/Library/Application Support/OpenMessage/v2/store.sqlite3" \
+  "select cast(remote_message_id as integer) id, datetime(occurred_at_ms/1000,'unixepoch','localtime')
+   from messages where account_id='google-primary' and remote_message_id glob '[0-9]*'
+   order by occurred_at_ms desc limit 40"
+```
 
 ## MCP serving — exactly one process may own live transports
 

@@ -1,0 +1,93 @@
+import Foundation
+import XCTest
+@testable import OpenMessage
+
+final class PlatformAttentionTests: XCTestCase {
+    private func status(_ json: String) -> [String: Any] {
+        let data = Data(json.utf8)
+        return (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
+    }
+
+    // The 2026-10-06 shape: Google connected and phone-responding, newest
+    // platform (behind_days 0), and silent 12.6 hours, past its baseline. The
+    // alert points at the phone, not at re-pairing.
+    func testSilentGoogleAsksForThePhoneNotARepair() {
+        let json = status("""
+        {
+          "google": {"connected": true, "paired": true, "needs_pairing": false, "phone_responding": true},
+          "whatsapp": {"connected": false, "paired": false},
+          "signal": {"connected": false, "paired": false},
+          "freshness": {
+            "google": {"behind_days": 0, "stale": true, "stale_reason": "silent",
+                       "silence": {"silent_ms": 45232898, "stalled": true}},
+            "whatsapp": {"behind_days": 46, "stale": true, "stale_reason": "behind"},
+            "signal": {"behind_days": 48, "stale": true, "stale_reason": "behind"}
+          }
+        }
+        """)
+        let items = PlatformAttention.evaluate(status: json)
+        XCTAssertEqual(items, [PlatformAttention(key: "google", name: "Google Messages", reason: .silent(hours: 12))])
+        XCTAssertEqual(
+            PlatformAttention.alertText(for: items),
+            "Google Messages has synced nothing for 12 hours, longer than usual. Check that your phone is on and online; restarting it can fix this."
+        )
+        XCTAssertEqual(PlatformAttention.silentNotificationBody(items[0]), PlatformAttention.alertText(for: items))
+    }
+
+    func testBehindPlatformStillAsksForRepair() {
+        let json = status("""
+        {"google": {"connected": true, "paired": true},
+         "freshness": {"google": {"stale": true, "stale_reason": "behind"}}}
+        """)
+        XCTAssertEqual(
+            PlatformAttention.alertText(for: PlatformAttention.evaluate(status: json)),
+            "Google Messages needs re-pairing — it has stopped syncing."
+        )
+    }
+
+    // A backend from before stale_reason existed only says "stale".
+    func testStaleWithoutReasonReadsAsRepair() {
+        let json = status("""
+        {"google": {"connected": true, "paired": true},
+         "freshness": {"google": {"stale": true}}}
+        """)
+        XCTAssertEqual(PlatformAttention.evaluate(status: json).map(\.reason), [.needsRepair])
+    }
+
+    func testDisconnectedOrRepairFlagsNeedRepair() {
+        let json = status("""
+        {"google": {"connected": false, "paired": true},
+         "whatsapp": {"connected": true, "paired": true},
+         "signal": {"connected": false, "paired": false, "needs_reauth": true}}
+        """)
+        XCTAssertEqual(
+            PlatformAttention.evaluate(status: json).map(\.key),
+            ["google", "signal"]
+        )
+    }
+
+    func testRepairAndSilenceCombine() {
+        let json = status("""
+        {"google": {"connected": true, "paired": true},
+         "whatsapp": {"connected": false, "paired": true},
+         "signal": {"connected": true, "paired": true},
+         "freshness": {"signal": {"stale": true, "stale_reason": "silent", "silence": {"silent_ms": 1000}}}}
+        """)
+        XCTAssertEqual(
+            PlatformAttention.alertText(for: PlatformAttention.evaluate(status: json)),
+            "WhatsApp needs re-pairing — it has stopped syncing. Signal has synced nothing for 1 hour, longer than usual."
+        )
+    }
+
+    func testHealthyOrUnpairedPlatformsStayQuiet() {
+        let json = status("""
+        {"google": {"connected": true, "paired": true},
+         "whatsapp": {"connected": false, "paired": false},
+         "freshness": {"google": {"stale": false, "stale_reason": ""},
+                       "whatsapp": {"stale": true, "stale_reason": "silent", "silence": {"silent_ms": 99999999}}}}
+        """)
+        XCTAssertEqual(PlatformAttention.evaluate(status: json), [])
+        XCTAssertNil(PlatformAttention.alertText(for: []))
+        XCTAssertNil(PlatformAttention.evaluate(statusData: Data("not json".utf8)))
+    }
+}
