@@ -187,8 +187,13 @@ phone created rows 87881–88012 during the stall, about a day and a half of
 ordinary traffic; OpenMessage received 4 of those 132 ids. Pulling didn't help
 either: three app relaunches on 10/6 (each starts a shallow backfill) and six
 `Reconciling recent conversations` runs on 10/7 put none of the missing rows
-into `messages.db`, so a probe over the same session would have passed. Do
-not re-pair for this; **restart the phone**. (Google Messages auto-updated on
+into `messages.db`. On this install the request/response calls themselves came
+back empty: after a relaunch at 15:56 on 10/7, with push working again, the
+startup backfill logged `Fetched conversations count=0` and a deep backfill
+scanned 3 folders and found 0 conversations, with no errors. That is a
+separate defect (libgm accepts a correctly typed but empty response; the
+cause is not established), and until it is fixed no pull can confirm or
+repair delivery. Do not re-pair for this; **restart the phone**. (Google Messages auto-updated on
 the phone at 02:07 on 10/6, an hour after the last frame; nothing on hand says
 whether that caused it. The same restart also cleared an unrelated IMS-stack
 SMS fault on that phone.)
