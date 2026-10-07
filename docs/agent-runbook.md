@@ -211,9 +211,10 @@ curl -s http://127.0.0.1:7007/api/status | jq '.freshness.google | {stale, stale
 ```
 
 On the 80-day Google history of the install that hit this, the rule flags
-every silence longer than 16 hours (the July and August outages among them)
-and no ordinary night or weekend since 9/4, when that history became
-continuous (the worst ordinary quiet stretch scored 5.0 of the 6 needed). It
+every silence longer than 16 hours once a baseline exists (the July and
+August outages among them) and no ordinary night or weekend since 9/4, when
+that history became continuous (the worst ordinary quiet stretch scored 5.0
+of the 6 needed). It
 would have flagged this stall at about 13:45 on 10/6. Silences that start in
 the day are flagged after about 8 hours, ones that start in the evening by the
 16-hour cap.
