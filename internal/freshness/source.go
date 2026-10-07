@@ -33,10 +33,12 @@ type InboxStore interface {
 	InboxReceiptsBetween(ctx context.Context, codecs []string, fromMS, toMS int64) ([]int64, error)
 }
 
-// NewInboxActivity measures activity as v2 inbox receipt times: every frame a
-// transport hands to ingest, message or not, before any decoding. That is the
-// earliest point at which "the platform delivered something" is observable, so
-// a stalled projection or a decoder quarantine does not read as silence.
+// NewInboxActivity measures activity as v2 inbox receipt times: each distinct
+// frame a transport hands to ingest, message or not, before any decoding. That
+// is the earliest point at which "the platform delivered something" is
+// observable, so a stalled projection or a decoder quarantine does not read as
+// silence. A frame re-delivered with the same dedupe key keeps its first
+// receipt time, so a transport that only replays old frames reads as silent.
 // platformByCodec maps ingest codecs to status platform keys; codecs missing
 // from the map are ignored.
 func NewInboxActivity(store InboxStore, platformByCodec map[string]string) ActivitySource {
@@ -100,14 +102,15 @@ func (s inboxActivity) Between(ctx context.Context, platform string, from, to ti
 // MessageStore is the slice of the legacy store a message activity source
 // reads.
 type MessageStore interface {
-	LatestMessageTimestamps() (map[string]int64, error)
-	MessageTimestampsBetween(platforms []string, fromMS, toMS int64) ([]int64, error)
+	LatestMessageTimestamps(ctx context.Context) (map[string]int64, error)
+	MessageTimestampsBetween(ctx context.Context, platforms []string, fromMS, toMS int64) ([]int64, error)
 }
 
 // NewMessageActivity measures activity as stored message timestamps, for
 // daemons without v2 ingest. Message timestamps are the sender's clock, not
-// receipt time, so a late-delivered backlog counts at its original time; that
-// can only make a stall look shorter, never invent one. platformByStorage maps
+// receipt time: a message delivered now with an old timestamp does not count
+// as activity now, so a transport delivering only a delayed backlog can read
+// as silent. The v2 inbox source has no such gap. platformByStorage maps
 // storage platforms ("sms", "rcs", ...) to status platform keys.
 func NewMessageActivity(store MessageStore, platformByStorage map[string]string) ActivitySource {
 	storage := map[string][]string{}
@@ -128,11 +131,11 @@ type messageActivity struct {
 
 func (messageActivity) Name() string { return SourceMessages }
 
-func (s messageActivity) Latest(context.Context) (map[string]time.Time, error) {
+func (s messageActivity) Latest(ctx context.Context) (map[string]time.Time, error) {
 	if s.store == nil {
 		return nil, fmt.Errorf("message activity: store is nil")
 	}
-	byStorage, err := s.store.LatestMessageTimestamps()
+	byStorage, err := s.store.LatestMessageTimestamps(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("message activity: %w", err)
 	}
@@ -150,7 +153,7 @@ func (s messageActivity) Latest(context.Context) (map[string]time.Time, error) {
 	return latest, nil
 }
 
-func (s messageActivity) Between(_ context.Context, platform string, from, to time.Time) ([]time.Time, error) {
+func (s messageActivity) Between(ctx context.Context, platform string, from, to time.Time) ([]time.Time, error) {
 	if s.store == nil {
 		return nil, fmt.Errorf("message activity: store is nil")
 	}
@@ -158,7 +161,7 @@ func (s messageActivity) Between(_ context.Context, platform string, from, to ti
 	if len(stored) == 0 {
 		return nil, nil
 	}
-	rows, err := s.store.MessageTimestampsBetween(stored, from.UnixMilli(), to.UnixMilli())
+	rows, err := s.store.MessageTimestampsBetween(ctx, stored, from.UnixMilli(), to.UnixMilli())
 	if err != nil {
 		return nil, fmt.Errorf("message activity %s: %w", platform, err)
 	}

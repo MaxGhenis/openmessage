@@ -19,14 +19,17 @@ final class PlatformAttentionTests: XCTestCase {
           "signal": {"connected": false, "paired": false},
           "freshness": {
             "google": {"behind_days": 0, "stale": true, "stale_reason": "silent",
-                       "silence": {"silent_ms": 45232898, "stalled": true}},
+                       "silence": {"silent_ms": 45232898, "last_event_ms": 1791263467102, "stalled": true}},
             "whatsapp": {"behind_days": 46, "stale": true, "stale_reason": "behind"},
             "signal": {"behind_days": 48, "stale": true, "stale_reason": "behind"}
           }
         }
         """)
         let items = PlatformAttention.evaluate(status: json)
-        XCTAssertEqual(items, [PlatformAttention(key: "google", name: "Google Messages", reason: .silent(hours: 12))])
+        XCTAssertEqual(
+            items,
+            [PlatformAttention(key: "google", name: "Google Messages", reason: .silent(hours: 12, since: 1_791_263_467_102))]
+        )
         XCTAssertEqual(
             PlatformAttention.alertText(for: items),
             "Google Messages has synced nothing for 12 hours, longer than usual. Check that your phone is on and online; restarting it can fix this."
@@ -89,5 +92,31 @@ final class PlatformAttentionTests: XCTestCase {
         XCTAssertEqual(PlatformAttention.evaluate(status: json), [])
         XCTAssertNil(PlatformAttention.alertText(for: []))
         XCTAssertNil(PlatformAttention.evaluate(statusData: Data("not json".utf8)))
+    }
+
+    // One notification per silence episode. In the 10/6 outage Google flapped
+    // between connected and disconnected many times while silent; each
+    // reconnect must not notify again. (Review of PR #190.)
+    func testSilenceLatchNotifiesOncePerEpisode() {
+        let silent = PlatformAttention(key: "google", name: "Google Messages", reason: .silent(hours: 7, since: 1_000))
+        let later = PlatformAttention(key: "google", name: "Google Messages", reason: .silent(hours: 9, since: 1_000))
+        let flapping = PlatformAttention(key: "google", name: "Google Messages", reason: .needsRepair)
+        let nextEpisode = PlatformAttention(key: "google", name: "Google Messages", reason: .silent(hours: 7, since: 5_000))
+        var latch = SilenceNotificationLatch()
+
+        XCTAssertEqual(latch.newlySilent([silent]), [silent])
+        XCTAssertEqual(latch.newlySilent([later]), [])
+        XCTAssertEqual(latch.newlySilent([flapping]), [])
+        XCTAssertEqual(latch.newlySilent([]), [])
+        XCTAssertEqual(latch.newlySilent([later]), [])
+        XCTAssertEqual(latch.newlySilent([nextEpisode]), [nextEpisode])
+    }
+
+    func testSilenceLatchTracksPlatformsSeparately() {
+        let google = PlatformAttention(key: "google", name: "Google Messages", reason: .silent(hours: 7, since: 1_000))
+        let signal = PlatformAttention(key: "signal", name: "Signal", reason: .silent(hours: 20, since: 1_000))
+        var latch = SilenceNotificationLatch()
+        XCTAssertEqual(latch.newlySilent([google]), [google])
+        XCTAssertEqual(latch.newlySilent([google, signal]), [signal])
     }
 }

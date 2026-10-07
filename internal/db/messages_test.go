@@ -1,6 +1,7 @@
 package db
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"reflect"
@@ -1383,7 +1384,7 @@ func TestMessageActivityTimestamps(t *testing.T) {
 		}
 	}
 
-	latest, err := store.LatestMessageTimestamps()
+	latest, err := store.LatestMessageTimestamps(context.Background())
 	if err != nil {
 		t.Fatalf("LatestMessageTimestamps: %v", err)
 	}
@@ -1391,17 +1392,17 @@ func TestMessageActivityTimestamps(t *testing.T) {
 		t.Fatalf("LatestMessageTimestamps = %v", latest)
 	}
 
-	got, err := store.MessageTimestampsBetween([]string{"sms", "rcs"}, 1000, 3000)
+	got, err := store.MessageTimestampsBetween(context.Background(), []string{"sms", "rcs"}, 1000, 3000)
 	if err != nil {
 		t.Fatalf("MessageTimestampsBetween: %v", err)
 	}
 	if want := []int64{1000, 2000, 3000}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("MessageTimestampsBetween = %v, want %v (inclusive, ascending, whatsapp excluded)", got, want)
 	}
-	if got, err := store.MessageTimestampsBetween(nil, 0, 10000); err != nil || len(got) != 0 {
+	if got, err := store.MessageTimestampsBetween(context.Background(), nil, 0, 10000); err != nil || len(got) != 0 {
 		t.Fatalf("MessageTimestampsBetween(no platforms) = %v, %v; want empty", got, err)
 	}
-	if got, err := store.MessageTimestampsBetween([]string{"sms"}, 5000, 1000); err != nil || len(got) != 0 {
+	if got, err := store.MessageTimestampsBetween(context.Background(), []string{"sms"}, 5000, 1000); err != nil || len(got) != 0 {
 		t.Fatalf("MessageTimestampsBetween(inverted) = %v, %v; want empty", got, err)
 	}
 }

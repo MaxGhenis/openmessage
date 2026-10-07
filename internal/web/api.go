@@ -296,7 +296,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		// carries the most traffic: it is the newest platform, so it is never
 		// "behind". Judge each platform's silence against its own baseline too
 		// (2026-10-06: Google ingest silent 38h with stale=false throughout).
-		addSilence(out, opts.Activity, silenceBaselines, time.Now(), time.Local)
+		addSilence(out, opts.Activity, silenceBaselines, freshnessValue, time.Now(), time.Local)
 		freshnessValue = out
 		freshnessComputed = time.Now()
 		return out
@@ -3882,13 +3882,14 @@ func staleReason(behind, silent bool) string {
 }
 
 // silenceBaselineCache keeps each platform's baseline event times keyed by
-// the last event they end at. The baseline only changes when a new event
-// arrives, so a silent platform is re-judged every refresh without re-reading
-// two weeks of history.
+// the baseline window they cover. The window depends only on the local date
+// of the last event, so a platform is re-judged every refresh, and two weeks of
+// history are read at most once a day per platform.
 type silenceBaselineCache map[string]silenceBaseline
 
 type silenceBaseline struct {
-	last   time.Time
+	from   time.Time
+	to     time.Time
 	events []time.Time
 }
 
@@ -3899,39 +3900,23 @@ const silenceQueryTimeout = 5 * time.Second
 // block judging how long the platform has delivered nothing against its own
 // hour-of-day baseline (freshness.EvaluateSilence), folds a stall into
 // "stale"/"stale_reason", and stamps a top-level "silence_stalled". A nil
-// source or a failed query leaves the payload untouched.
+// source leaves the payload untouched. When a query fails, the platform keeps
+// the silence block from prev (the previous payload), marked
+// "carried_over", so a failing query cannot clear a stall that is still
+// going on.
 func addSilence(
 	out map[string]any,
 	source freshness.ActivitySource,
 	cache silenceBaselineCache,
+	prev map[string]any,
 	now time.Time,
 	loc *time.Location,
 ) {
 	if source == nil || out == nil {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), silenceQueryTimeout)
-	defer cancel()
-	latest, err := source.Latest(ctx)
-	if err != nil {
-		return
-	}
-	cfg := freshness.DefaultSilenceConfig
 	anyStalled := false
-	for platform, last := range latest {
-		baseline, ok := cache[platform]
-		if !ok || !baseline.last.Equal(last) {
-			from, to := freshness.BaselineRange(last, loc, cfg)
-			events, err := source.Between(ctx, platform, from, to)
-			if err != nil {
-				continue
-			}
-			baseline = silenceBaseline{last: last, events: events}
-			if cache != nil {
-				cache[platform] = baseline
-			}
-		}
-		verdict := freshness.EvaluateSilence(last, baseline.events, now, loc, cfg)
+	apply := func(platform string, block map[string]any, stalled bool) {
 		entry, ok := out[platform].(map[string]any)
 		if !ok {
 			entry = map[string]any{
@@ -3950,7 +3935,56 @@ func addSilence(
 		} else {
 			behind, _ = entry["stale"].(bool)
 		}
-		entry["silence"] = map[string]any{
+		entry["silence"] = block
+		entry["stale"] = behind || stalled
+		entry["stale_reason"] = staleReason(behind, stalled)
+		out[platform] = entry
+		if stalled {
+			anyStalled = true
+		}
+	}
+	carry := func(platform string) {
+		prevEntry, _ := prev[platform].(map[string]any)
+		block, _ := prevEntry["silence"].(map[string]any)
+		if block == nil {
+			return
+		}
+		carried := make(map[string]any, len(block)+1)
+		for key, value := range block {
+			carried[key] = value
+		}
+		carried["carried_over"] = true
+		stalled, _ := block["stalled"].(bool)
+		apply(platform, carried, stalled)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), silenceQueryTimeout)
+	defer cancel()
+	latest, err := source.Latest(ctx)
+	if err != nil {
+		for platform := range prev {
+			carry(platform)
+		}
+		out["silence_stalled"] = anyStalled
+		return
+	}
+	cfg := freshness.DefaultSilenceConfig
+	for platform, last := range latest {
+		from, to := freshness.BaselineRange(last, loc, cfg)
+		baseline, ok := cache[platform]
+		if !ok || !baseline.from.Equal(from) || !baseline.to.Equal(to) {
+			events, err := source.Between(ctx, platform, from, to)
+			if err != nil {
+				carry(platform)
+				continue
+			}
+			baseline = silenceBaseline{from: from, to: to, events: events}
+			if cache != nil {
+				cache[platform] = baseline
+			}
+		}
+		verdict := freshness.EvaluateSilence(last, baseline.events, now, loc, cfg)
+		apply(platform, map[string]any{
 			"source":                      source.Name(),
 			"last_event_ms":               last.UnixMilli(),
 			"silent_ms":                   verdict.Silence.Milliseconds(),
@@ -3963,13 +3997,7 @@ func addSilence(
 			"evaluated":                   verdict.Evaluated,
 			"stalled":                     verdict.Stalled,
 			"rule":                        verdict.Rule,
-		}
-		entry["stale"] = behind || verdict.Stalled
-		entry["stale_reason"] = staleReason(behind, verdict.Stalled)
-		out[platform] = entry
-		if verdict.Stalled {
-			anyStalled = true
-		}
+		}, verdict.Stalled)
 	}
 	out["silence_stalled"] = anyStalled
 }

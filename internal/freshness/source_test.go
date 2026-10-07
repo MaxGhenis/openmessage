@@ -88,11 +88,11 @@ type stubMessageStore struct {
 	platforms [][]string
 }
 
-func (s *stubMessageStore) LatestMessageTimestamps() (map[string]int64, error) {
+func (s *stubMessageStore) LatestMessageTimestamps(context.Context) (map[string]int64, error) {
 	return s.latest, nil
 }
 
-func (s *stubMessageStore) MessageTimestampsBetween(platforms []string, fromMS, toMS int64) ([]int64, error) {
+func (s *stubMessageStore) MessageTimestampsBetween(_ context.Context, platforms []string, fromMS, toMS int64) ([]int64, error) {
 	s.platforms = append(s.platforms, append([]string(nil), platforms...))
 	var out []int64
 	for _, platform := range platforms {

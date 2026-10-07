@@ -73,9 +73,26 @@ func BaselineRange(last time.Time, loc *time.Location, cfg SilenceConfig) (time.
 	if loc == nil {
 		loc = time.Local
 	}
-	local := last.In(loc)
-	to := time.Date(local.Year(), local.Month(), local.Day(), 0, 0, 0, 0, loc)
-	return to.AddDate(0, 0, -cfg.BaselineDays), to
+	year, month, day := last.In(loc).Date()
+	// Count days on the calendar, not by adding 24-hour spans, so a DST
+	// change inside the window never shifts its first day.
+	fromYear, fromMonth, fromDay := time.Date(year, month, day-cfg.BaselineDays, 12, 0, 0, 0, time.UTC).Date()
+	return startOfLocalDay(fromYear, fromMonth, fromDay, loc), startOfLocalDay(year, month, day, loc)
+}
+
+// startOfLocalDay returns the first instant of a local calendar day. Where a
+// DST change skips midnight (America/Santiago springs from 00:00 to 01:00),
+// time.Date may normalize the missing midnight into the previous day; the day
+// then starts where that zone period ends.
+func startOfLocalDay(year int, month time.Month, day int, loc *time.Location) time.Time {
+	midnight := time.Date(year, month, day, 0, 0, 0, 0, loc)
+	if y, m, d := midnight.Date(); y == year && m == month && d == day {
+		return midnight
+	}
+	if _, end := midnight.ZoneBounds(); !end.IsZero() {
+		return end
+	}
+	return midnight
 }
 
 // BuildProfile builds the hour-of-day profile from the events inside
@@ -140,14 +157,20 @@ func (p Profile) ExpectedActiveHours(from, to time.Time, loc *time.Location) flo
 	var expected float64
 	for cursor := from; cursor.Before(to); {
 		local := cursor.In(loc)
-		// Step to the next local hour boundary. Local minutes and seconds keep
-		// half-hour and 45-minute zones aligned to their own clock hours, and
-		// the step is always positive, so DST transitions cannot stall the loop.
+		// Step to the next local hour boundary or the next zone change,
+		// whichever comes first. Local minutes and seconds keep half-hour and
+		// 45-minute zones aligned to their own clock hours; stopping at zone
+		// changes keeps a DST jump off the hour (Chatham springs from 02:45 to
+		// 03:45) from crediting the far side of the jump to the near hour.
+		// Every step is positive, so the loop always ends.
 		toBoundary := time.Hour -
 			time.Duration(local.Minute())*time.Minute -
 			time.Duration(local.Second())*time.Second -
 			time.Duration(local.Nanosecond())
 		next := cursor.Add(toBoundary)
+		if _, zoneEnd := local.ZoneBounds(); !zoneEnd.IsZero() && zoneEnd.After(cursor) && zoneEnd.Before(next) {
+			next = zoneEnd
+		}
 		if next.After(to) {
 			next = to
 		}

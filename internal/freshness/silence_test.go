@@ -204,3 +204,68 @@ func TestExpectedActiveHoursAcrossDST(t *testing.T) {
 		}
 	}
 }
+
+// nextTransition returns the first zone change in loc after from.
+func nextTransition(t *testing.T, from time.Time, loc *time.Location) time.Time {
+	t.Helper()
+	_, end := from.In(loc).ZoneBounds()
+	if end.IsZero() {
+		t.Fatalf("%s has no zone change after %v", loc, from)
+	}
+	return end
+}
+
+// Chatham springs forward from 02:45 to 03:45, off the hour. The slice of
+// clock hour 2 ends at the jump; the 15 minutes after it belong to hour 3.
+// (Review of PR #190: a slice crossing the jump was credited wholly to hour 2.)
+func TestExpectedActiveHoursSplitsAtOffHourDSTJump(t *testing.T) {
+	loc := mustLoad(t, "Pacific/Chatham")
+	jump := nextTransition(t, time.Date(2026, 9, 20, 0, 0, 0, 0, loc), loc)
+	if got := jump.In(loc).Format("15:04"); got != "03:45" {
+		t.Fatalf("Chatham spring-forward lands at %s, want 03:45", got)
+	}
+	var profile Profile
+	profile.Hours[2] = 1                // hour 3 stays 0
+	from := jump.Add(-45 * time.Minute) // 02:00 local
+	to := jump.Add(15 * time.Minute)    // 04:00 local
+	if got := profile.ExpectedActiveHours(from, to, loc); math.Abs(got-0.75) > 1e-9 {
+		t.Fatalf("expected active hours across the jump = %v, want 0.75", got)
+	}
+	split := profile.ExpectedActiveHours(from, jump, loc) + profile.ExpectedActiveHours(jump, to, loc)
+	if math.Abs(split-0.75) > 1e-9 {
+		t.Fatalf("split at the jump = %v, want 0.75", split)
+	}
+}
+
+// Santiago springs forward at midnight, so the day it happens on starts at
+// 01:00. The baseline must still be exactly BaselineDays local dates.
+// (Review of PR #190: the missing midnight normalized into the previous day
+// and the window covered 15 dates.)
+func TestBaselineRangeOnASkippedMidnight(t *testing.T) {
+	loc := mustLoad(t, "America/Santiago")
+	var skipped time.Time
+	for day := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC); day.Year() == 2026; day = day.AddDate(0, 0, 1) {
+		y, m, d := day.Date()
+		if mid := time.Date(y, m, d, 0, 0, 0, 0, loc); mid.Day() != d {
+			skipped = time.Date(y, m, d, 12, 0, 0, 0, loc)
+			break
+		}
+	}
+	if skipped.IsZero() {
+		t.Fatal("found no skipped midnight in Santiago after 2026-08-01")
+	}
+	for _, last := range []time.Time{skipped, skipped.AddDate(0, 0, 3)} {
+		from, to := BaselineRange(last, loc, DefaultSilenceConfig)
+		if to.In(loc).Day() != last.In(loc).Day() || to.In(loc).Hour() > 1 {
+			t.Fatalf("to = %v, want the start of %v", to.In(loc), last.In(loc).Format("2006-01-02"))
+		}
+		dates := map[string]bool{}
+		for at := from; at.Before(to); at = at.Add(30 * time.Minute) {
+			dates[at.In(loc).Format("2006-01-02")] = true
+		}
+		if len(dates) != DefaultSilenceConfig.BaselineDays {
+			t.Fatalf("baseline for %v covers %d local dates (%v .. %v), want %d",
+				last.In(loc).Format("2006-01-02"), len(dates), from.In(loc), to.In(loc), DefaultSilenceConfig.BaselineDays)
+		}
+	}
+}

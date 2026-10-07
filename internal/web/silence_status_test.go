@@ -3,6 +3,7 @@ package web
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -203,24 +204,106 @@ func TestStatusFreshnessWithoutActivitySourceHasNoSilence(t *testing.T) {
 	}
 }
 
-// The baseline is read once per last event; re-judging a silent platform on
-// every refresh reuses it.
-func TestAddSilenceCachesBaselineUntilANewEvent(t *testing.T) {
-	now := time.Now()
-	last := now.Add(-3 * time.Hour)
+// The baseline window depends only on the date of the last event, so new
+// events on the same day reuse the cached baseline and a new day reads it once.
+func TestAddSilenceCachesBaselinePerWindow(t *testing.T) {
+	loc := time.UTC
+	last := time.Date(2026, 10, 6, 1, 11, 7, 0, loc)
 	activity := &stubActivity{events: map[string][]time.Time{"google": steadyTraffic(last)}}
 	cache := silenceBaselineCache{}
-	for i := 0; i < 3; i++ {
+	judge := func(now time.Time) map[string]any {
 		out := map[string]any{"google": map[string]any{"stale": false, "stale_reason": ""}}
-		addSilence(out, activity, cache, now.Add(time.Duration(i)*time.Minute), time.Local)
+		addSilence(out, activity, cache, nil, now, loc)
+		return out
+	}
+	for i := 0; i < 3; i++ {
+		judge(last.Add(time.Duration(i+1) * time.Hour))
 	}
 	if activity.calls != 1 {
-		t.Fatalf("baseline reads = %d, want 1", activity.calls)
+		t.Fatalf("baseline reads for one silence = %d, want 1", activity.calls)
 	}
-	activity.events["google"] = append(activity.events["google"], now)
-	out := map[string]any{"google": map[string]any{"stale": false, "stale_reason": ""}}
-	addSilence(out, activity, cache, now, time.Local)
+	activity.events["google"] = append(activity.events["google"], last.Add(10*time.Hour))
+	judge(last.Add(11 * time.Hour))
+	if activity.calls != 1 {
+		t.Fatalf("baseline reads after a same-day event = %d, want 1", activity.calls)
+	}
+	activity.events["google"] = append(activity.events["google"], last.Add(30*time.Hour))
+	judge(last.Add(31 * time.Hour))
 	if activity.calls != 2 {
-		t.Fatalf("baseline reads after a new event = %d, want 2", activity.calls)
+		t.Fatalf("baseline reads after a next-day event = %d, want 2", activity.calls)
+	}
+}
+
+// flakyActivity fails its queries on demand.
+type flakyActivity struct {
+	stubActivity
+	failLatest  bool
+	failBetween bool
+}
+
+func (f *flakyActivity) Latest(ctx context.Context) (map[string]time.Time, error) {
+	if f.failLatest {
+		return nil, errors.New("database is locked")
+	}
+	return f.stubActivity.Latest(ctx)
+}
+
+func (f *flakyActivity) Between(ctx context.Context, platform string, from, to time.Time) ([]time.Time, error) {
+	if f.failBetween {
+		return nil, errors.New("database is locked")
+	}
+	return f.stubActivity.Between(ctx, platform, from, to)
+}
+
+// A failing activity query must not clear a stall that is still going on: the
+// platform keeps its last verdict, marked carried_over. (Review of PR #190:
+// one query error turned an eight-hour stall back into stale=false.)
+func TestAddSilenceKeepsLastVerdictWhenQueriesFail(t *testing.T) {
+	loc := time.UTC
+	now := time.Date(2026, 10, 6, 14, 0, 0, 0, loc)
+	last := now.Add(-8 * time.Hour)
+	fresh := func() map[string]any {
+		return map[string]any{"google": map[string]any{"behind_days": 0, "stale": false, "stale_reason": ""}}
+	}
+	activity := &flakyActivity{stubActivity: stubActivity{events: map[string][]time.Time{"google": steadyTraffic(last)}}}
+
+	first := fresh()
+	addSilence(first, activity, silenceBaselineCache{}, nil, now, loc)
+	if first["google"].(map[string]any)["stale_reason"] != "silent" {
+		t.Fatalf("first verdict = %v, want a silent stall", first["google"])
+	}
+
+	for _, tc := range []struct {
+		name            string
+		latest, between bool
+	}{
+		{"latest fails", true, false},
+		{"baseline read fails", false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			activity.failLatest, activity.failBetween = tc.latest, tc.between
+			out := fresh()
+			// An empty cache forces the baseline read in the second case.
+			addSilence(out, activity, silenceBaselineCache{}, first, now.Add(time.Minute), loc)
+			google := out["google"].(map[string]any)
+			if google["stale"] != true || google["stale_reason"] != "silent" {
+				t.Fatalf("google after a failed query = %v, want the stall kept", google)
+			}
+			silence := google["silence"].(map[string]any)
+			if silence["carried_over"] != true || silence["stalled"] != true {
+				t.Fatalf("silence block = %v, want the previous stalled block marked carried_over", silence)
+			}
+			if out["silence_stalled"] != true {
+				t.Fatalf("silence_stalled = %v, want true", out["silence_stalled"])
+			}
+		})
+	}
+
+	// With no previous verdict there is nothing to keep, and nothing is invented.
+	activity.failLatest = true
+	out := fresh()
+	addSilence(out, activity, silenceBaselineCache{}, nil, now, loc)
+	if google := out["google"].(map[string]any); google["stale"] != false || google["silence"] != nil {
+		t.Fatalf("google with no previous verdict = %v, want untouched", google)
 	}
 }

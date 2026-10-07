@@ -11,13 +11,15 @@ import (
 )
 
 // Zones chosen for awkward clocks: DST in both hemispheres, half-hour and
-// 45-minute offsets, and Lord Howe's 30-minute DST shift.
+// 45-minute offsets, Lord Howe's 30-minute DST shift, Chatham's DST jump at
+// 02:45, and Santiago's DST change at midnight.
 var propertyZones = []string{
 	"UTC",
 	"America/New_York",
 	"Asia/Kolkata",
 	"Australia/Lord_Howe",
 	"Pacific/Chatham",
+	"America/Santiago",
 }
 
 // silenceCase is a random silence: a last event, a baseline that spills past
@@ -37,6 +39,13 @@ func (silenceCase) Generate(r *rand.Rand, _ int) reflect.Value {
 	}
 	start := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	last := start.Add(time.Duration(r.Int63n(int64(365 * 24 * time.Hour))))
+	// A third of the cases put the silence or its baseline across a DST
+	// change, where clock arithmetic breaks first.
+	if r.Intn(3) == 0 {
+		if _, change := last.In(loc).ZoneBounds(); !change.IsZero() {
+			last = change.Add(time.Duration(r.Int63n(int64(36*time.Hour))) - 18*time.Hour)
+		}
+	}
 
 	// Optionally confine traffic to a random set of clock hours so profiles
 	// are not uniformly flat.
@@ -199,13 +208,14 @@ func TestSilencePropertyNoSilenceNoStall(t *testing.T) {
 }
 
 // In zones without DST, shifting every timestamp by whole days changes
-// nothing but the reported last event.
+// nothing but the reported last event. The shift stays within ten years:
+// Kolkata's offset has been +05:30 since 1945 but was not before.
 func TestSilencePropertyWholeDayShiftInvariant(t *testing.T) {
 	checkProperty(t, "day shift", func(c silenceCase, days int16) bool {
 		if c.Loc.String() != "UTC" && c.Loc.String() != "Asia/Kolkata" {
 			return true
 		}
-		shift := time.Duration(days) * 24 * time.Hour
+		shift := time.Duration(int(days)%3650) * 24 * time.Hour
 		moved := make([]time.Time, len(c.Baseline))
 		for i, at := range c.Baseline {
 			moved[i] = at.Add(shift)

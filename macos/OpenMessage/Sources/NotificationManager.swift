@@ -60,6 +60,8 @@ final class NotificationManager: NSObject, ObservableObject, UNUserNotificationC
     private let baseURL: URL
     private var streamTask: Task<Void, Never>?
     private var healthTask: Task<Void, Never>?
+    private var bootstrapTask: Task<Void, Never>?
+    private var silenceLatch = SilenceNotificationLatch()
     private var lastSeenTimestamps: [String: Int64] = [:]
     private var seenMessageIDs = Set<String>()
     private var seenMessageOrder: [String] = []
@@ -89,12 +91,14 @@ final class NotificationManager: NSObject, ObservableObject, UNUserNotificationC
 
     func start() {
         stop()
-        Task {
+        bootstrapTask = Task {
             await startIfAllowed()
         }
     }
 
     func stop() {
+        bootstrapTask?.cancel()
+        bootstrapTask = nil
         streamTask?.cancel()
         streamTask = nil
         healthTask?.cancel()
@@ -207,6 +211,10 @@ final class NotificationManager: NSObject, ObservableObject, UNUserNotificationC
             return
         }
 
+        // stop() or a newer start() may have run while permission was pending.
+        guard !Task.isCancelled else { return }
+        streamTask?.cancel()
+        healthTask?.cancel()
         streamTask = Task {
             await primeBaseline()
             await runEventLoop()
@@ -360,14 +368,9 @@ final class NotificationManager: NSObject, ObservableObject, UNUserNotificationC
             title: "WhatsApp needs attention",
             body: "WhatsApp was logged out. Open OpenMessage to scan the QR code and reconnect."
         )
-        for platform in PlatformAttention.platforms {
-            let silent = attention.first { $0.key == platform.key }
-            evaluatePlatformHealth(
-                key: "\(platform.key)-silent",
-                broken: silent.flatMap(PlatformAttention.silentNotificationBody) != nil,
-                title: "\(platform.name) has gone quiet",
-                body: silent.flatMap(PlatformAttention.silentNotificationBody) ?? ""
-            )
+        for item in silenceLatch.newlySilent(attention) {
+            guard let body = PlatformAttention.silentNotificationBody(item) else { continue }
+            sendHealthNotification(key: "\(item.key)-silent", title: "\(item.name) has gone quiet", body: body)
         }
     }
 

@@ -1,6 +1,7 @@
 package db
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -822,23 +823,33 @@ func (s *Store) PlatformStats() ([]PlatformStat, error) {
 // LatestMessageTimestamps returns the newest stored message timestamp per
 // source platform. Freshness uses it as the activity clock on daemons without
 // v2 ingest.
-func (s *Store) LatestMessageTimestamps() (map[string]int64, error) {
-	stats, err := s.PlatformStats()
+func (s *Store) LatestMessageTimestamps(ctx context.Context) (map[string]int64, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT source_platform, COALESCE(MAX(timestamp_ms), 0)
+		FROM messages
+		GROUP BY source_platform
+	`)
 	if err != nil {
 		return nil, err
 	}
-	latest := make(map[string]int64, len(stats))
-	for _, st := range stats {
-		latest[st.Platform] = st.LatestMS
+	defer rows.Close()
+	latest := map[string]int64{}
+	for rows.Next() {
+		var platform sql.NullString
+		var ts int64
+		if err := rows.Scan(&platform, &ts); err != nil {
+			return nil, err
+		}
+		latest[strings.TrimSpace(platform.String)] = ts
 	}
-	return latest, nil
+	return latest, rows.Err()
 }
 
 // MessageTimestampsBetween returns the timestamps (ms, ascending) of messages
 // from the given source platforms inside [fromMS, toMS]. The timestamp index
 // bounds the scan to the window, so a two-week window stays cheap on a large
 // store.
-func (s *Store) MessageTimestampsBetween(platforms []string, fromMS, toMS int64) ([]int64, error) {
+func (s *Store) MessageTimestampsBetween(ctx context.Context, platforms []string, fromMS, toMS int64) ([]int64, error) {
 	if len(platforms) == 0 || toMS < fromMS {
 		return nil, nil
 	}
@@ -847,7 +858,7 @@ func (s *Store) MessageTimestampsBetween(platforms []string, fromMS, toMS int64)
 	for _, platform := range platforms {
 		args = append(args, platform)
 	}
-	rows, err := s.db.Query(`
+	rows, err := s.db.QueryContext(ctx, `
 		SELECT timestamp_ms
 		FROM messages
 		WHERE timestamp_ms BETWEEN ? AND ?

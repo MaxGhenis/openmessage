@@ -13,8 +13,9 @@ struct PlatformAttention: Equatable {
         /// own recent traffic explains (`freshness.<key>.stale_reason ==
         /// "silent"`). On 2026-10-06 Google Messages stayed connected and
         /// phone-responding while the phone relayed nothing for 38 hours; a
-        /// phone restart, not a re-pair, brought it back.
-        case silent(hours: Int)
+        /// phone restart, not a re-pair, brought it back. `since` is the
+        /// silence's last event (ms), which identifies the episode.
+        case silent(hours: Int, since: Int64)
     }
 
     let key: String
@@ -52,8 +53,11 @@ struct PlatformAttention: Equatable {
             if (fresh["stale_reason"] as? String) == "silent" {
                 let silence = fresh["silence"] as? [String: Any]
                 let silentMS = (silence?["silent_ms"] as? NSNumber)?.doubleValue ?? 0
+                let since = (silence?["last_event_ms"] as? NSNumber)?.int64Value ?? 0
                 let hours = max(1, Int(silentMS / 3_600_000))
-                return PlatformAttention(key: platform.key, name: platform.name, reason: .silent(hours: hours))
+                return PlatformAttention(
+                    key: platform.key, name: platform.name, reason: .silent(hours: hours, since: since)
+                )
             }
             return PlatformAttention(key: platform.key, name: platform.name, reason: .needsRepair)
         }
@@ -74,7 +78,7 @@ struct PlatformAttention: Equatable {
         default: sentences.append("\(repair.joined(separator: ", ")) need re-pairing — they have stopped syncing.")
         }
         for item in items {
-            if case let .silent(hours) = item.reason {
+            if case let .silent(hours, _) = item.reason {
                 sentences.append(silentSentence(item, hours: hours))
             }
         }
@@ -83,7 +87,7 @@ struct PlatformAttention: Equatable {
 
     /// Body of the one-time notification for a platform that went silent.
     static func silentNotificationBody(_ item: PlatformAttention) -> String? {
-        guard case let .silent(hours) = item.reason else { return nil }
+        guard case let .silent(hours, _) = item.reason else { return nil }
         return silentSentence(item, hours: hours)
     }
 
@@ -95,5 +99,24 @@ struct PlatformAttention: Equatable {
             return base + " Check that your phone is on and online; restarting it can fix this."
         }
         return base
+    }
+}
+
+/// Decides which silent platforms to notify about: once per silence episode,
+/// identified by the episode's last event. A connection flap during the same
+/// outage (silent, then "needs repair" while disconnected, then silent again)
+/// does not re-notify; a new event followed by a new silence does.
+struct SilenceNotificationLatch {
+    private var notifiedEpisode: [String: Int64] = [:]
+
+    /// Silent items not yet notified for their current episode. Marks them
+    /// notified.
+    mutating func newlySilent(_ items: [PlatformAttention]) -> [PlatformAttention] {
+        items.filter { item in
+            guard case let .silent(_, since) = item.reason else { return false }
+            if notifiedEpisode[item.key] == since { return false }
+            notifiedEpisode[item.key] = since
+            return true
+        }
     }
 }
