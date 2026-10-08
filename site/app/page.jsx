@@ -1,377 +1,549 @@
 import Image from "next/image";
+import { IconBrandApple } from "@tabler/icons-react";
 
-import { CommandBlock } from "../components/command-block";
+import { CopyCommand } from "../components/copy-command";
+import { Receipts } from "../components/receipts";
 import { SiteFooter } from "../components/site-footer";
 import { SiteHeader } from "../components/site-header";
-import { WaitlistForm } from "../components/waitlist-form";
+import { TwoReaders } from "../components/two-readers";
+import { UpdatesForm } from "../components/updates-form";
+import { DEMO_ARGS, DEMO_RESULT, DEMO_TOOL } from "../data/demo";
 import {
-  buildDownloadUrl,
-  claudeMcpCommand,
-  compareTable,
-  downloadUrl,
-  faqItems,
-  howItWorksPoints,
-  repoUrl,
-  setupColumns
-} from "../data/site-content";
+  CLAUDE_MCP_COMMAND,
+  DOWNLOAD_PATH,
+  MAIN_CHECKED_ON,
+  MAIN_STATS,
+  MCP,
+  MIN_MACOS,
+  RELEASE,
+  RELEASES_URL,
+  REPO_URL,
+  SENDING_TOOLS,
+  SITE_URL,
+  TOOL_COUNT,
+  TOOL_GROUPS
+} from "../data/facts";
+import {
+  commitsAheadOf,
+  formatDate,
+  formatMegabytes,
+  getLatestRelease,
+  getMainCommitTotal
+} from "../lib/release";
+import { clockTime, parseTranscript } from "../lib/transcript";
+import appScreenshot from "../public/screens/app-demo-sms.png";
 
-function ActionLink({ children, href, external = false, primary = false }) {
-  const className = primary
-    ? "inline-flex items-center justify-center rounded-full bg-[var(--accent)] px-6 py-3.5 text-sm font-semibold text-[var(--bg-deep)] transition-transform hover:-translate-y-0.5"
-    : "inline-flex items-center justify-center rounded-full border border-[var(--border)] bg-[color:rgba(8,13,24,0.72)] px-6 py-3.5 text-sm font-semibold text-[var(--text-primary)] transition-colors hover:border-[var(--border-strong)] hover:bg-[var(--bg-hover)]";
-  const props = external ? { rel: "noreferrer", target: "_blank" } : {};
+// Re-check GitHub for the latest release at most once an hour.
+export const revalidate = 3600;
 
+const ROUTE_LABELS = { sms: "SMS", whatsapp: "WhatsApp", signal: "Signal" };
+const DEMO_PERSON = DEMO_ARGS.name;
+
+function buildReaders() {
+  const { lines, messages } = parseTranscript(DEMO_RESULT);
+  const routes = Object.entries(ROUTE_LABELS).map(([platform, label]) => {
+    const direct = messages.filter(
+      (message) => message.platform === platform && message.conversationName === DEMO_PERSON
+    );
+    return {
+      platform,
+      label,
+      conversationId: direct[0].conversationId,
+      messages: direct.map((message) => ({
+        body: message.body,
+        mine: message.mine,
+        time: clockTime(message.timestamp)
+      }))
+    };
+  });
+  return { lines, routes };
+}
+
+function DownloadButton({ source }) {
   return (
-    <a href={href} className={className} {...props}>
-      {children}
+    <a className="btn btn--yours" href={`${DOWNLOAD_PATH}?source=${source}`}>
+      <IconBrandApple stroke={1.7} aria-hidden="true" />
+      Download for macOS
     </a>
   );
 }
 
-function SetupColumn({ column, index }) {
+export default async function HomePage() {
+  const [release, mainTotal] = await Promise.all([getLatestRelease(), getMainCommitTotal()]);
+  const { lines, routes } = buildReaders();
+  const releaseDate = formatDate(release.publishedAt);
+  const size = formatMegabytes(release.dmgBytes);
+  // The claims below were checked against RELEASE.tag. If GitHub reports a
+  // newer release, say so instead of describing it from memory.
+  const describesLatest = release.tag === RELEASE.tag;
+  // Live when GitHub answers; otherwise the count checked at MAIN_COMMIT.
+  const commitsAhead = describesLatest
+    ? (commitsAheadOf(mainTotal, MAIN_STATS.commitsAtRelease) ?? MAIN_STATS.commitsSinceRelease)
+    : null;
+  const toolNames = (names) =>
+    names.map((name, index) => (
+      <span key={name}>
+        {index > 0 && (index === names.length - 1 ? " and " : ", ")}
+        <code>{name}</code>
+      </span>
+    ));
+
+  const jsonLd = {
+    "@context": "https://schema.org",
+    "@type": "SoftwareApplication",
+    name: "OpenMessage",
+    url: SITE_URL,
+    applicationCategory: "CommunicationApplication",
+    operatingSystem: `macOS ${MIN_MACOS} or later`,
+    softwareVersion: release.version,
+    datePublished: release.publishedAt.slice(0, 10),
+    downloadUrl: `${SITE_URL}${DOWNLOAD_PATH}`,
+    offers: { "@type": "Offer", price: "0", priceCurrency: "USD" },
+    author: { "@type": "Person", name: "Max Ghenis", url: "https://maxghenis.com" },
+    codeRepository: REPO_URL
+  };
+
   return (
-    <section
-      className={`py-8 ${index === 0 ? "border-b border-[var(--border)] lg:border-b-0 lg:border-r lg:pr-8" : "lg:pl-8"}`}
-    >
-      <div className="text-[0.72rem] font-semibold uppercase tracking-[0.24em] text-[var(--accent-strong)]">
-        {column.eyebrow}
-      </div>
-      <h3 className="mt-4 text-[2rem] font-semibold tracking-[-0.05em] text-[var(--text-primary)]">
-        {column.title}
-      </h3>
-      <p className="mt-4 max-w-[34rem] text-base leading-7 text-[var(--text-secondary)]">
-        {column.body}
-      </p>
+    <>
+      <SiteHeader />
+      <main id="main">
+        <section className="hero">
+          <div className="wrap">
+            <h1 className="hero__title">
+              Your texts, WhatsApp and Signal in one SQLite database your agent can query
+            </h1>
+            <p className="hero__sub">
+              OpenMessage connects to Google Messages (SMS and RCS), WhatsApp and Signal, and keeps
+              your messages in SQLite on your Mac. A desktop app and a local MCP server read the
+              same file.
+            </p>
+            <div className="hero__cta">
+              <DownloadButton source="hero" />
+              <a href="#setup">Set it up in three steps</a>
+            </div>
+            <p className="hero__release">
+              Version {release.version}, released {releaseDate}
+              {size ? `. ${size}` : ""}. macOS {MIN_MACOS} or later. Free, with no account.
+            </p>
 
-      <div className="mt-7 grid gap-4">
-        {column.commands.map((command) => (
-          <CommandBlock key={command.label} label={command.label}>
-            {command.code}
-          </CommandBlock>
-        ))}
-      </div>
-    </section>
-  );
-}
-
-export default function HomePage() {
-  return (
-    <main className="relative z-[1] min-h-screen">
-      <SiteHeader overlay />
-
-      {/* Hero */}
-      <section className="relative overflow-hidden border-b border-[var(--border)]">
-        <div className="absolute inset-0 bg-[radial-gradient(circle_at_top_left,rgba(118,137,255,0.18),transparent_34%),radial-gradient(circle_at_75%_30%,rgba(118,137,255,0.1),transparent_24%)]" />
-        <div className="relative mx-auto max-w-[1520px] px-6 pb-16 pt-28 lg:px-10 lg:pb-24 lg:pt-34">
-          <div className="grid gap-12 lg:grid-cols-[minmax(0,480px)_minmax(0,1fr)] lg:items-center">
-            <div className="max-w-[28rem]">
-              <div className="animate-fade-up flex items-center gap-3">
-                <span className="rounded-full border border-[var(--border)] bg-[color:rgba(111,130,255,0.12)] px-3 py-1 text-[0.72rem] font-semibold uppercase tracking-[0.2em] text-[var(--accent-strong)]">
-                  Free &amp; open source
-                </span>
-              </div>
-              <h1 className="animate-fade-up mt-5 text-[clamp(2.6rem,5.5vw,4.4rem)] font-semibold leading-[0.94] tracking-[-0.06em] text-[var(--text-primary)] [animation-delay:60ms]">
-                Google Messages, WhatsApp, and Signal in one local inbox.
-              </h1>
-              <p className="animate-fade-up mt-6 text-lg leading-8 text-[var(--text-secondary)] [animation-delay:120ms]">
-                People stay grouped in the sidebar. Routes switch as tabs in the thread.
-                Search, media, notifications, and MCP all run on the same local runtime.
+            <div className="readers">
+              <TwoReaders
+                person={DEMO_PERSON}
+                call={`${DEMO_TOOL} ${JSON.stringify(DEMO_ARGS)}`}
+                routes={routes}
+                lines={lines}
+                initialRoute="whatsapp"
+              />
+              <p className="readers__caption">
+                Demo conversations that ship with the app; none of these people exist. The right
+                pane is the unedited result of <code>{DEMO_TOOL}</code> in version{" "}
+                {RELEASE.version}. The left pane lays out the same messages as a thread, one tab
+                per network.
               </p>
-
-              <div className="animate-fade-up mt-8 flex flex-col gap-4 sm:flex-row [animation-delay:220ms]">
-                <ActionLink href={buildDownloadUrl("hero_primary")} primary>
-                  Download for macOS
-                </ActionLink>
-                <ActionLink href={repoUrl} external>
-                  View the repo
-                </ActionLink>
-              </div>
-
-              <div className="animate-fade-up mt-8 flex flex-wrap items-center gap-x-5 gap-y-3 [animation-delay:300ms]">
-                <span className="text-[0.7rem] font-semibold uppercase tracking-[0.18em] text-[var(--text-muted)]">
-                  Live now
-                </span>
-                <div className="flex items-center gap-4 text-sm text-[var(--text-secondary)]">
-                  <span className="flex items-center gap-1.5">
-                    <span className="inline-block h-2 w-2 rounded-full bg-[#4285f4]" aria-hidden="true" />
-                    Google Messages
-                  </span>
-                  <span className="flex items-center gap-1.5">
-                    <span className="inline-block h-2 w-2 rounded-full bg-[#25d366]" aria-hidden="true" />
-                    WhatsApp
-                  </span>
-                  <span className="flex items-center gap-1.5">
-                    <span className="inline-block h-2 w-2 rounded-full bg-[#3a76f0]" aria-hidden="true" />
-                    Signal
-                  </span>
-                </div>
-              </div>
-            </div>
-
-            <div className="relative animate-fade-up [animation-delay:180ms]">
-              <div className="absolute right-[6%] top-[8%] hidden h-52 w-52 rounded-full bg-[var(--accent-glow)] blur-3xl lg:block" />
-              <div className="relative overflow-hidden rounded-[2.6rem] border border-[var(--border)] bg-[color:rgba(8,13,24,0.78)] shadow-[var(--panel-shadow)]">
-                <Image
-                  src="/hero-product-dark.png"
-                  alt="OpenMessage showing a people-first inbox with grouped routes and thread tabs"
-                  width={3200}
-                  height={1640}
-                  priority
-                  className="h-auto w-full"
-                />
-              </div>
+              <Receipts ids={["demoSeed", "untrustedPreamble"]} />
             </div>
           </div>
-        </div>
-      </section>
+        </section>
 
-      {/* Features — compact three-column grid */}
-      <section id="features" className="border-b border-[var(--border)]">
-        <div className="mx-auto max-w-[1520px] px-6 py-20 lg:px-10">
-          <div className="grid gap-10 md:grid-cols-3">
-            {[
-              {
-                title: "People-first multi-platform",
-                body: "Google Messages, WhatsApp, and Signal all land in one inbox, with one row per person and route tabs inside the thread."
-              },
-              {
-                title: "Local-first",
-                body: "Messages, contacts, and sessions stay on your machine. No cloud account required."
-              },
-              {
-                title: "Built-in MCP",
-                body: "Claude can search, draft, and send through the exact same local store you see in the app."
-              }
-            ].map((feature, idx) => (
-              <div key={feature.title} className="min-w-0 border-t border-[var(--border)] pt-6">
-                <div className="font-mono text-[0.78rem] font-medium tracking-[0.16em] text-[var(--accent-strong)]">
-                  {String(idx + 1).padStart(2, "0")}
-                </div>
-                <h2 className="mt-3 text-[1.35rem] font-semibold tracking-[-0.04em] text-[var(--text-primary)]">
-                  {feature.title}
-                </h2>
-                <p className="mt-3 text-base leading-7 text-[var(--text-secondary)]">
-                  {feature.body}
-                </p>
-              </div>
-            ))}
-          </div>
-        </div>
-      </section>
-
-      {/* MCP */}
-      <section id="ai" className="border-b border-[var(--border)]">
-        <div className="mx-auto max-w-[1520px] px-6 py-20 lg:px-10">
-          <div className="grid gap-12 lg:grid-cols-[minmax(0,520px)_minmax(0,1fr)] lg:items-center">
-            <div>
-              <div className="eyebrow">MCP</div>
-              <h2 className="mt-5 text-[clamp(2rem,3.5vw,3rem)] font-semibold leading-[0.95] tracking-[-0.06em] text-[var(--text-primary)]">
-                One runtime for the app and your assistant.
-              </h2>
-              <p className="mt-5 max-w-[34rem] text-base leading-7 text-[var(--text-secondary)]">
-                OpenMessage exposes the same local inbox to Claude over MCP. Search threads,
-                inspect contacts, draft replies, and send through the same route-aware state
-                you see in the desktop app.
+        <section className="section" id="agents" aria-labelledby="agents-title">
+          <div className="wrap section__grid">
+            <div className="section__head">
+              <h2 id="agents-title">{TOOL_COUNT} tools for your agent</h2>
+            </div>
+            <div className="section__body">
+              <p className="lead">
+                While the app is open, an MCP server runs on your Mac at{" "}
+                <code>
+                  {MCP.host}:{MCP.port}
+                </code>
+                . Any MCP client that speaks SSE can connect. For Claude Code:
               </p>
-            </div>
-            <div className="min-w-0 grid gap-6">
-              <div>
-                <CommandBlock label="Connect Claude">{claudeMcpCommand}</CommandBlock>
-              </div>
-              <div className="overflow-hidden rounded-[2rem] border border-[var(--border)] bg-[color:rgba(8,13,24,0.78)] shadow-[var(--panel-shadow)]">
-                <Image
-                  src="/hero-command-surface.png"
-                  alt="OpenMessage alongside Claude using MCP to search and draft messages"
-                  width={1800}
-                  height={1020}
-                  className="h-auto w-full"
-                />
-              </div>
-            </div>
-          </div>
-        </div>
-      </section>
+              <CopyCommand command={CLAUDE_MCP_COMMAND} label="the Claude Code command" />
+              <Receipts ids={["mcpPort", "mcpMount", "toolRegistry"]} />
 
-      {/* How it works */}
-      <section id="how-it-works" className="border-b border-[var(--border)]">
-        <div className="mx-auto max-w-[1520px] px-6 py-20 lg:px-10">
-          <div className="grid gap-14 lg:grid-cols-[minmax(0,420px)_minmax(0,1fr)]">
-            <div>
-              <div className="eyebrow">How it works</div>
-              <h2 className="mt-5 max-w-[24rem] text-[clamp(2rem,3.5vw,3rem)] font-semibold leading-[0.95] tracking-[-0.06em] text-[var(--text-primary)]">
-                Local routes. One message store.
-              </h2>
-              <p className="mt-5 max-w-[28rem] text-base leading-7 text-[var(--text-secondary)]">
-                Each platform syncs into the same local thread model, search index, notifications,
-                and MCP surface instead of hiding behind separate browser mirrors or desktop wrappers.
-              </p>
-              <div className="mt-7">
-                <ActionLink href="/blog/how-openmessage-added-whatsapp">
-                  Read the technical write-up
-                </ActionLink>
-              </div>
-            </div>
-
-            <div className="grid gap-8 md:grid-cols-3">
-              {howItWorksPoints.map((point) => (
-                <div key={point.title} className="border-t border-[var(--border)] pt-6">
-                  <h3 className="text-[1.22rem] font-semibold tracking-[-0.04em] text-[var(--text-primary)]">
-                    {point.title}
-                  </h3>
-                  <p className="mt-3 text-base leading-7 text-[var(--text-secondary)]">
-                    {point.body}
-                  </p>
-                </div>
-              ))}
-            </div>
-          </div>
-        </div>
-      </section>
-
-      {/* Compare */}
-      <section id="compare" className="border-b border-[var(--border)]">
-        <div className="mx-auto max-w-[1520px] px-6 py-20 lg:px-10">
-          <div className="eyebrow">Compare</div>
-          <h2 className="mt-5 max-w-[34rem] text-[clamp(2rem,3.5vw,3rem)] font-semibold leading-[0.95] tracking-[-0.06em] text-[var(--text-primary)]">
-            Local-first and AI-native, at no cost.
-          </h2>
-
-          <div className="mt-12 -mx-6 overflow-x-auto px-6 lg:mx-0 lg:px-0">
-            <table className="w-full min-w-[640px] border-collapse text-left text-sm">
-              <thead>
-                <tr className="border-b border-[var(--border)]">
-                  {compareTable.columns.map((col) => (
-                    <th
-                      key={col.key}
-                      className="px-4 py-4 text-[0.7rem] font-semibold uppercase tracking-[0.16em] text-[var(--text-muted)]"
-                    >
-                      {col.label}
-                    </th>
-                  ))}
-                </tr>
-              </thead>
-              <tbody>
-                {compareTable.rows.map((row) => (
-                  <tr
-                    key={row.product}
-                    className={`border-b border-[var(--border)] ${row.highlight ? "bg-[color:rgba(111,130,255,0.06)]" : ""}`}
-                  >
-                    <td className="px-4 py-5 align-top">
-                      <span
-                        className={`text-[1rem] font-semibold tracking-[-0.02em] ${row.highlight ? "text-[var(--accent-strong)]" : "text-[var(--text-primary)]"}`}
-                      >
-                        {row.product}
-                      </span>
-                    </td>
-                    <td className="px-4 py-5 align-top text-[var(--text-secondary)]">
-                      {row.platforms}
-                    </td>
-                    <td className="px-4 py-5 align-top text-[var(--text-secondary)]">
-                      {row.local}
-                    </td>
-                    <td className="px-4 py-5 align-top text-[var(--text-secondary)]">
-                      {row.mcp}
-                    </td>
-                    <td className="px-4 py-5 align-top text-[var(--text-secondary)]">
-                      {row.price}
-                    </td>
-                  </tr>
+              <div className="tools">
+                {TOOL_GROUPS.map((group) => (
+                  <div key={group.title}>
+                    <h3>{group.title}</h3>
+                    <ul>
+                      {group.tools.map((tool) => (
+                        <li key={tool}>{tool}</li>
+                      ))}
+                    </ul>
+                  </div>
                 ))}
-              </tbody>
-            </table>
-          </div>
-        </div>
-      </section>
+              </div>
 
-      {/* Setup */}
-      <section id="setup" className="border-b border-[var(--border)]">
-        <div className="mx-auto max-w-[1520px] px-6 py-20 lg:px-10">
-          <div className="eyebrow">Setup</div>
-          <h2 className="mt-5 max-w-[34rem] text-[clamp(2rem,3.5vw,3rem)] font-semibold leading-[0.95] tracking-[-0.06em] text-[var(--text-primary)]">
-            Native app or CLI — same product.
-          </h2>
-
-          <div className="mt-14 grid border-y border-[var(--border)] lg:grid-cols-2">
-            {setupColumns.map((column, index) => (
-              <SetupColumn key={column.title} column={column} index={index} />
-            ))}
-          </div>
-        </div>
-      </section>
-
-      {/* FAQ */}
-      <section id="faq" className="border-b border-[var(--border)]">
-        <div className="mx-auto max-w-[1520px] px-6 py-20 lg:px-10">
-          <div className="grid gap-14 lg:grid-cols-[minmax(0,420px)_minmax(0,1fr)]">
-            <div>
-              <div className="eyebrow">FAQ</div>
-              <h2 className="mt-5 max-w-[24rem] text-[clamp(2rem,3.5vw,3rem)] font-semibold leading-[0.95] tracking-[-0.06em] text-[var(--text-primary)]">
-                Common questions.
-              </h2>
-            </div>
-
-            <div className="grid gap-4">
-              {faqItems.map((item) => (
-                <details
-                  key={item.question}
-                  className="group rounded-[1.6rem] border border-[var(--border)] bg-[color:rgba(9,17,29,0.7)] px-6 py-5"
-                >
-                  <summary className="cursor-pointer list-none text-[1.05rem] font-semibold tracking-[-0.03em] text-[var(--text-primary)] marker:hidden">
-                    <span className="flex items-center justify-between gap-6">
-                      <span>{item.question}</span>
-                      <span className="text-[var(--text-muted)] transition-transform group-open:rotate-45">
-                        +
-                      </span>
-                    </span>
-                  </summary>
-                  <p className="mt-4 max-w-[44rem] text-base leading-7 text-[var(--text-secondary)]">
-                    {item.answer}
-                    {item.question === "Where can I read the technical details?" ? (
-                      <>
-                        {" "}
-                        <a
-                          href="/blog/how-openmessage-added-whatsapp"
-                          className="text-[var(--accent-strong)] transition-colors hover:text-[var(--text-primary)]"
-                        >
-                          Read the post.
-                        </a>
-                      </>
-                    ) : null}
+              <div className="facts">
+                <div className="fact">
+                  <h3>One call covers a person on every network</h3>
+                  <p>
+                    <code>get_person_messages</code> takes a name and returns that person&rsquo;s
+                    SMS, WhatsApp and Signal messages in one result, as above.{" "}
+                    <code>person_stats</code> summarizes the same history.
                   </p>
-                </details>
-              ))}
-            </div>
-          </div>
-        </div>
-      </section>
-
-      {/* CTA */}
-      <section id="updates" className="mx-auto max-w-[1520px] px-6 py-20 lg:px-10">
-        <div className="border-y border-[var(--border)] py-12">
-          <div className="grid gap-10 lg:grid-cols-[minmax(0,1fr)_minmax(340px,420px)] lg:items-start">
-            <div>
-              <div className="eyebrow">Launch updates</div>
-              <h2 className="mt-5 max-w-[30rem] text-[clamp(2rem,3.5vw,3rem)] font-semibold leading-[0.95] tracking-[-0.06em] text-[var(--text-primary)]">
-                Google Messages, WhatsApp, and Signal in one local desktop app.
-              </h2>
-              <p className="mt-5 max-w-[34rem] text-base leading-7 text-[var(--text-secondary)]">
-                Download the current build now, or leave an email if you want the next meaningful update without watching the repo every day.
-              </p>
-              <div className="mt-7 flex flex-col gap-4 sm:flex-row">
-                <ActionLink href={buildDownloadUrl("final_cta")} primary>
-                  Download OpenMessage
-                </ActionLink>
-                <ActionLink href={repoUrl} external>
-                  Read the code
-                </ActionLink>
+                </div>
+                <div className="fact">
+                  <h3>Drafts wait for you</h3>
+                  <p>
+                    <code>draft_message</code> leaves a draft in the app. You review it and send it
+                    yourself.
+                  </p>
+                  <Receipts ids={["draftTool"]} />
+                </div>
+                <div className="fact">
+                  <h3>Message text arrives marked as untrusted</h3>
+                  <p>
+                    Results that contain message text open with a warning that tells the model to
+                    ignore instructions inside message bodies.
+                  </p>
+                  <Receipts ids={["untrustedPreamble"]} />
+                </div>
               </div>
             </div>
-            <WaitlistForm />
           </div>
-        </div>
-      </section>
+        </section>
 
+        <section className="section" id="database" aria-labelledby="database-title">
+          <div className="wrap section__grid">
+            <div className="section__head">
+              <h2 id="database-title">A database you can open</h2>
+            </div>
+            <div className="section__body">
+              <p className="lead">
+                Messages from all three networks go into one file, <code>messages.db</code>, in{" "}
+                <code>~/Library/Application Support/OpenMessage</code>. Each row records the network
+                it came from.
+              </p>
+              <figure>
+                <pre className="command command__code" tabIndex={0}>
+                  <code>{`$ sqlite3 messages.db "SELECT source_platform, COUNT(*) FROM messages GROUP BY 1 ORDER BY 2 DESC;"
+sms|31
+whatsapp|12
+signal|11`}</code>
+                </pre>
+                <figcaption className="readers__caption">
+                  Run against the demo data in version {RELEASE.version}.
+                </figcaption>
+              </figure>
+              <Receipts ids={["dataFolder", "messagesDb", "sqliteDriver"]} />
+
+              <div className="facts">
+                <div className="fact">
+                  <h3>Search works offline</h3>
+                  <p>
+                    Message text is indexed with SQLite&rsquo;s FTS5, so search runs on your Mac
+                    with no network.
+                  </p>
+                  <Receipts ids={["searchIndex"]} />
+                </div>
+                <div className="fact">
+                  <h3>Older history can be imported</h3>
+                  <p>
+                    The command line and the <code>import_messages</code> tool load iMessage history
+                    from <code>chat.db</code> on your Mac, a Google Chat Takeout and a WhatsApp
+                    export. Imported iMessage and Google Chat threads are read-only: OpenMessage
+                    has no live connection to either.
+                  </p>
+                  <Receipts ids={["imessageImport", "importCommands"]} />
+                </div>
+                <div className="fact">
+                  <h3>Pairing sessions sit beside it</h3>
+                  <p>Each network&rsquo;s login lives in its own file in the same folder.</p>
+                  <Receipts ids={["sessionFiles"]} />
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section className="section" id="app" aria-labelledby="app-title">
+          <div className="wrap">
+            <div className="section__grid">
+              <div className="section__head">
+                <h2 id="app-title">The Mac app reads the same file</h2>
+              </div>
+              <div className="section__body">
+                <p className="lead">
+                  You read and reply on all three networks from one window, and can send
+                  attachments and reactions.
+                </p>
+                <p>
+                  When a person&rsquo;s name and number match on more than one network, the sidebar
+                  shows one row for them, with a tab per network in the thread.
+                </p>
+                <Receipts ids={["personRoutes"]} />
+              </div>
+            </div>
+            <figure className="shot">
+              <Image
+                className="shot__img"
+                src={appScreenshot}
+                alt="OpenMessage window. Jordan Rivera is selected in the sidebar of conversations. The thread shows four SMS messages, with tabs for SMS, WhatsApp and Signal above them."
+                sizes="(max-width: 72rem) 100vw, 67rem"
+                placeholder="empty"
+              />
+              <figcaption>The app running on its built-in demo data.</figcaption>
+            </figure>
+          </div>
+        </section>
+
+        <section className="section" id="risks" aria-labelledby="risks-title">
+          <div className="wrap section__grid">
+            <div className="section__head">
+              <h2 id="risks-title">What can go wrong</h2>
+            </div>
+            <div className="section__body">
+              <div className="facts">
+                <div className="fact">
+                  <h3>These are unofficial clients</h3>
+                  <p>
+                    OpenMessage reaches the three networks through open-source libraries that Google,
+                    WhatsApp and Signal do not support: mautrix-gmessages, whatsmeow and signal-cli.{" "}
+                    <a href="https://www.whatsapp.com/legal/terms-of-service" rel="noopener">
+                      WhatsApp&rsquo;s terms
+                    </a>{" "}
+                    forbid reverse engineering its service and let it suspend an account at any
+                    time. Pair accounts you could stand to lose.
+                  </p>
+                  <Receipts ids={["gmessagesLibrary", "whatsmeowLibrary", "signalCli"]} />
+                </div>
+                <div className="fact">
+                  <h3>Your agent can send as you</h3>
+                  <p>
+                    These tools send to other people: {toolNames(SENDING_TOOLS)}. OpenMessage
+                    does not ask you to confirm them. Keep your MCP client&rsquo;s
+                    permission prompt on for those tools, or have your agent use{" "}
+                    <code>draft_message</code>.
+                  </p>
+                  <p>
+                    &ldquo;Message sent&rdquo; in a result means the network accepted the message.
+                    Delivery and reading are later events that the result does not report.
+                  </p>
+                  <Receipts ids={["sendResult"]} />
+                </div>
+                <div className="fact">
+                  <h3>What your agent reads leaves your Mac</h3>
+                  <p>
+                    Text that a tool returns goes to the model running your agent. Incoming messages
+                    are also untrusted input: anyone can text you instructions aimed at that model.
+                    The warning on each result lowers that risk and does not remove it.
+                  </p>
+                </div>
+                <div className="fact">
+                  <h3>Anything running as you can reach it</h3>
+                  <p>
+                    The local server listens on <code>{MCP.host}</code> with no password, and the
+                    database is unencrypted SQLite. Other software running under your macOS account
+                    can call the server and read the file.
+                  </p>
+                  <Receipts ids={["mcpHost", "sqliteDriver"]} />
+                </div>
+                <div className="fact">
+                  <h3>Connections break when the networks change</h3>
+                  <p>
+                    A protocol change at Google, WhatsApp or Signal can stop a connection until a
+                    new version ships, and the app does not update itself. Version{" "}
+                    {RELEASE.version} cannot renew an expired Google Messages session, so you pair
+                    again when one lapses.
+                  </p>
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section className="section" id="status" aria-labelledby="status-title">
+          <div className="wrap section__grid">
+            <div className="section__head">
+              <h2 id="status-title">What ships today</h2>
+            </div>
+            <div className="section__body">
+              <p className="lead">
+                The download is version {release.version}, released {releaseDate}.
+                {commitsAhead !== null && commitsAhead > 0 && (
+                  <>
+                    {" "}
+                    The <code>main</code> branch is {commitsAhead} commits ahead of it.
+                  </>
+                )}
+              </p>
+              {!describesLatest && (
+                <p>
+                  This page was checked against version {RELEASE.version}. Version {release.version}{" "}
+                  is newer, so details here, including the agent setup command, can differ. The{" "}
+                  <a href={RELEASES_URL} rel="noopener">
+                    release notes
+                  </a>{" "}
+                  are current.
+                </p>
+              )}
+              {describesLatest && (
+                <>
+                  <p>Merged since version {RELEASE.version} and waiting for the next release:</p>
+                  <div className="facts">
+                    <div className="fact">
+                      <h3>Connections that reconnect themselves</h3>
+                      <p>
+                        A supervisor per network retries a dropped connection with jittered backoff,
+                        from 5 seconds up to 5 minutes, and can refresh an expired Google session
+                        from your local Chrome profile.
+                      </p>
+                      <Receipts ids={["supervisorStart", "supervisorBackoff", "googleRefresh"]} />
+                    </div>
+                    <div className="fact">
+                      <h3>Stall detection</h3>
+                      <p>
+                        The app compares each network&rsquo;s silence with its own recent traffic
+                        and flags one that has gone quiet for longer than that history explains.{" "}
+                        <code>openmessage status</code> shows how fresh each network&rsquo;s data
+                        is.
+                      </p>
+                      <Receipts ids={["silenceDefaults", "statusBehind"]} />
+                    </div>
+                    <div className="fact">
+                      <h3>A send outbox, behind a flag</h3>
+                      <p>
+                        With the flag on, a send is saved locally before it is attempted. A send
+                        whose outcome is unknown is parked as <code>uncertain</code> and is never
+                        retried automatically.
+                      </p>
+                      <Receipts ids={["outboxFlag", "outboxUncertain", "outboxLease"]} />
+                    </div>
+                  </div>
+                </>
+              )}
+
+              <div className="table-scroll">
+                <table className="ledger">
+                  <caption className="visually-hidden">Where OpenMessage runs</caption>
+                  <thead>
+                    <tr>
+                      <th scope="col">Where</th>
+                      <th scope="col">Status</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr>
+                      <th scope="row">Mac app</th>
+                      <td data-label="Status">
+                        macOS {MIN_MACOS} or later, Apple silicon and Intel
+                      </td>
+                    </tr>
+                    <tr>
+                      <th scope="row">Command line</th>
+                      <td data-label="Status">macOS and Linux builds</td>
+                    </tr>
+                    <tr>
+                      <th scope="row">SMS and RCS</th>
+                      <td data-label="Status">Through Google Messages on an Android phone</td>
+                    </tr>
+                    <tr>
+                      <th scope="row">iMessage</th>
+                      <td data-label="Status">Import only</td>
+                    </tr>
+                    <tr>
+                      <th scope="row">Windows, iOS, Android</th>
+                      <td data-label="Status">No app</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+
+              <Receipts ids={["minMacos", "imessageImport"]} />
+
+              <p>
+                Most commits are co-written with AI: {MAIN_STATS.commitsWithClaudeTrailer} of the{" "}
+                {MAIN_STATS.commits} on <code>main</code> carry a Claude co-author line, as of{" "}
+                {formatDate(`${MAIN_CHECKED_ON}T00:00:00Z`)}.
+              </p>
+            </div>
+          </div>
+        </section>
+
+        <section className="section" id="setup" aria-labelledby="setup-title">
+          <div className="wrap section__grid">
+            <div className="section__head">
+              <h2 id="setup-title">Set it up</h2>
+            </div>
+            <div className="section__body">
+              <ol className="steps">
+                <li>
+                  <div>
+                    <h3>Download the app</h3>
+                    <p>
+                      Open the disk image and drag OpenMessage to your Applications folder. You
+                      need macOS {MIN_MACOS} or later.
+                    </p>
+                    <p>
+                      <DownloadButton source="setup" />
+                    </p>
+                  </div>
+                </li>
+                <li>
+                  <div>
+                    <h3>Pair a network</h3>
+                    <p>
+                      The app shows a QR code for each network. Scan it from Google Messages on
+                      your Android phone, from WhatsApp, or from Signal, the way you would link a
+                      desktop client. If Google refuses the QR code, pair through your Google
+                      account instead; in version {RELEASE.version} that means pasting a request
+                      copied from your browser&rsquo;s developer tools.
+                    </p>
+                    <p>
+                      Signal needs <code>signal-cli</code> installed first:{" "}
+                      <code>brew install signal-cli</code>.
+                    </p>
+                    <Receipts ids={["signalCli"]} />
+                  </div>
+                </li>
+                <li>
+                  <div>
+                    <h3>Connect your agent</h3>
+                    <p>Add the server to Claude Code, then ask about your messages.</p>
+                    <CopyCommand command={CLAUDE_MCP_COMMAND} label="the Claude Code command" />
+                  </div>
+                </li>
+              </ol>
+              <p>
+                To look before you pair anything, run <code>openmessage demo</code> from a
+                command-line build. It starts the app on the demo conversations with every network
+                disconnected.
+              </p>
+              <Receipts ids={["demoMode"]} />
+            </div>
+          </div>
+        </section>
+
+        <section className="section" id="updates" aria-labelledby="updates-title">
+          <div className="wrap section__grid">
+            <div className="section__head">
+              <h2 id="updates-title">Hear about releases</h2>
+            </div>
+            <div className="section__body">
+              <p>
+                The app does not update itself. Leave an address to get an email when a release
+                ships, or watch{" "}
+                <a href={RELEASES_URL} rel="noopener">
+                  releases on GitHub
+                </a>
+                .
+              </p>
+              <UpdatesForm />
+              <p className="muted">
+                Addresses are stored encrypted and used only for OpenMessage release news. See the{" "}
+                <a href="/privacy">privacy page</a>.
+              </p>
+            </div>
+          </div>
+        </section>
+      </main>
       <SiteFooter />
-    </main>
+      <script
+        type="application/ld+json"
+        // "<" is escaped so no value can close the script element.
+        dangerouslySetInnerHTML={{ __html: JSON.stringify(jsonLd).replace(/</g, "\\u003c") }}
+      />
+    </>
   );
 }

@@ -1,63 +1,73 @@
-import { IBM_Plex_Mono, Public_Sans } from "next/font/google";
+import { Atkinson_Hyperlegible_Mono, Atkinson_Hyperlegible_Next } from "next/font/google";
 
-import { GoogleAnalytics } from "../components/google-analytics";
-import { getGoogleAnalyticsMeasurementId } from "../lib/analytics";
+import { SITE_URL } from "../data/facts";
 import "./globals.css";
 
-const sans = Public_Sans({
+// One family in two registers: Next for what people write, Mono for what the
+// agent and the database see. next/font downloads both at build time and serves
+// them from this origin, so the page makes no font request to Google.
+const sans = Atkinson_Hyperlegible_Next({
   subsets: ["latin"],
-  variable: "--font-sans",
-  display: "swap"
+  variable: "--font-atkinson",
+  display: "swap",
+  adjustFontFallback: false
 });
 
-const mono = IBM_Plex_Mono({
+const mono = Atkinson_Hyperlegible_Mono({
   subsets: ["latin"],
-  weight: ["400", "500"],
-  variable: "--font-mono",
-  display: "swap"
+  variable: "--font-atkinson-mono",
+  display: "swap",
+  adjustFontFallback: false
 });
+
+const title = "OpenMessage: a message database for your agent";
+const description =
+  "OpenMessage keeps your SMS, RCS, WhatsApp and Signal messages in one SQLite database on your Mac, with a desktop app and a local MCP server on the same file.";
 
 export const metadata = {
-  metadataBase: new URL("https://openmessage.ai"),
+  metadataBase: new URL(SITE_URL),
   title: {
-    default: "OpenMessage",
+    default: title,
     template: "%s | OpenMessage"
   },
-  description:
-    "Local-first messaging for Google Messages, WhatsApp, and Signal, with an AI-native control layer and local MCP access.",
+  description,
+  alternates: { canonical: "/" },
   openGraph: {
-    title: "OpenMessage",
-    description:
-      "One local workspace for Google Messages, WhatsApp, Signal, and AI-assisted messaging.",
-    url: "https://openmessage.ai",
+    title,
+    description,
+    url: SITE_URL,
     siteName: "OpenMessage",
-    images: [
-      {
-        url: "/hero-product-dark.png",
-        width: 1600,
-        height: 1100,
-        alt: "OpenMessage desktop workspace"
-      }
-    ],
     locale: "en_US",
     type: "website"
   },
   twitter: {
     card: "summary_large_image",
-    title: "OpenMessage",
-    description:
-      "Local-first messaging for Google Messages, WhatsApp, and Signal, with an AI-native control layer.",
-    images: ["/hero-product-dark.png"]
+    title,
+    description
   }
 };
 
-export default function RootLayout({ children }) {
-  const gaMeasurementId = getGoogleAnalyticsMeasurementId();
+export const viewport = {
+  themeColor: [
+    { media: "(prefers-color-scheme: light)", color: "#f4f6fa" },
+    { media: "(prefers-color-scheme: dark)", color: "#09111c" }
+  ]
+};
 
+// Applies a stored theme choice before first paint, so a visitor who chose
+// light on a dark system (or the reverse) never sees a flash of the other.
+const themeScript = `try{var t=localStorage.getItem("om-theme");if(t==="dark"||t==="light")document.documentElement.setAttribute("data-theme",t)}catch(e){}`;
+
+export default function RootLayout({ children }) {
   return (
-    <html lang="en" className={`${sans.variable} ${mono.variable}`}>
+    <html lang="en" className={`${sans.variable} ${mono.variable}`} suppressHydrationWarning>
+      <head>
+        <script dangerouslySetInnerHTML={{ __html: themeScript }} />
+      </head>
       <body>
-        <GoogleAnalytics measurementId={gaMeasurementId} />
+        <a className="skip" href="#main">
+          Skip to content
+        </a>
         {children}
       </body>
     </html>

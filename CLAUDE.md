@@ -18,8 +18,8 @@ Local-first universal message database with built-in MCP server. Ingests message
 ├── macos/            Swift macOS app wrapper
 │   ├── OpenMessage/  Swift package (BackendManager, PairingView, etc.)
 │   └── build.sh      Builds universal binary + .app + .dmg
-├── site/             Static website (deployed to openmessage.ai)
-└── vercel.json       Vercel config (root — NOT site/vercel.json)
+├── site/             Next.js website (deployed to openmessage.ai from site/)
+└── vercel.json       Guard only: makes a root deploy fail; the real config is site/vercel.json
 ```
 
 ## Supporting a live install (READ FIRST for support/debug tasks)
@@ -244,23 +244,31 @@ Messages and conversations have `source_platform` (sms/gchat/imessage/whatsapp/s
 
 ## Vercel deployment (openmessage.ai)
 
-**CRITICAL: Always deploy from the repo root**, not from `~` or any other directory. The `.vercel/project.json` links to the correct project/scope.
+The site is the Next.js app in `site/`. **Deploy from `site/` with the Vercel CLI.** Nothing deploys on a push: the Vercel project has no git integration.
 
-**Config lives at root `vercel.json`**, not `site/vercel.json`. The root config sets `outputDirectory: "site"` and `cleanUrls: true`. A `.vercelignore` excludes Go/Swift build artifacts.
+- `site/vercel.json` carries the build settings (`framework: nextjs`, bun install, bun build). The root `vercel.json` exists only to make a root deploy fail loudly; a root deploy cannot build the site.
+- The CLI uploads the working directory, not a commit. Deploy from a clean checkout of the commit you mean to ship.
+- **Scope: `max-ghenis-projects`** (personal account, NOT PolicyEngine).
+- Preview deployments share production's Blob store. **Never POST to `/api/waitlist` or `/api/heartbeat` on a preview.**
 
-**Scope: `max-ghenis-projects`** (personal account, NOT PolicyEngine).
-
-Deploy:
 ```bash
-cd /Users/maxghenis/openmessages && vercel --prod
+cd site
+vercel link --yes --project openmessage --scope max-ghenis-projects   # once per checkout
+bun install --frozen-lockfile && bun run test && bun run build        # same gates as CI
+vercel deploy --scope max-ghenis-projects                             # preview (behind Vercel login)
+vercel deploy --prod --scope max-ghenis-projects                      # production
 ```
 
-**Always verify after deploy:**
+**Verify after a production deploy:**
 ```bash
-curl -s -o /dev/null -w "%{http_code}" https://openmessage.ai
+curl -s -o /dev/null -w "%{http_code}\n" https://openmessage.ai
+curl -s https://openmessage.ai/api/heartbeat          # {"ok":true,"schema_version":1}
+curl -s -o /dev/null -w "%{http_code} %{redirect_url}\n" https://openmessage.ai/download
 ```
 
-**Domains:** `openmessage.ai` (primary) and `openmessages.ai` (alias), both on Cloudflare DNS → 76.76.21.21.
+Routes that must keep working: `POST /api/heartbeat` (shipped binaries post to it), `GET /download` (307 to the latest DMG), `POST /api/waitlist`, `/privacy`, `/blog` and both post slugs. See `site/README.md` for how site claims are tied to code and what to do when a release ships.
+
+**Domains:** `openmessage.ai` (primary) and `openmessages.ai` (301 to the primary), both on Cloudflare DNS → 76.76.21.21.
 
 ## Building the macOS app
 

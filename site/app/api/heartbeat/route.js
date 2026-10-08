@@ -1,16 +1,19 @@
-// Anonymous heartbeat receiver.
+// Usage heartbeat receiver.
 //
-// The OpenMessage app sends one POST per install per 24h with:
+// An OpenMessage process started with OPENMESSAGE_TELEMETRY=1 sends a POST with:
 //   { install_id, version, os, arch, platforms, sent_at, schema_version }
+// No shipped build sets that variable for the user, so most installs send
+// nothing.
 //
-// We only persist counts. Install IDs are written to Vercel Blob bucketed by
-// day so we can compute DAU without retaining individual identifiers long-term.
+// What is kept: one JSON record per install per UTC day, at
+// heartbeats/<day>/<install_id>.json in Vercel Blob. The record holds the random
+// install ID, version, OS, CPU architecture, which networks are paired, and the
+// time received. It holds no IP address, no user agent and no message data.
+// Records are pseudonymous (the same install ID recurs) and nothing deletes
+// them automatically. The privacy page says the same; change both together.
 //
 // Required env vars:
-//   BLOB_READ_WRITE_TOKEN   — Vercel Blob token (already set for waitlist)
-//
-// Telemetry is opt-in client-side. This endpoint accepts whatever is sent;
-// rate-limiting + per-install dedup is the client's responsibility.
+//   BLOB_READ_WRITE_TOKEN   — Vercel Blob token (shared with the waitlist)
 
 import { put } from "@vercel/blob";
 import { NextResponse } from "next/server";
@@ -64,6 +67,9 @@ export async function POST(request) {
       {
         access: "public",
         addRandomSuffix: false,
+        // A second launch on the same day replaces that day's record instead
+        // of failing the write.
+        allowOverwrite: true,
         contentType: "application/json",
       },
     );
