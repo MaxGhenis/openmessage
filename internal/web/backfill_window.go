@@ -12,7 +12,16 @@ import (
 	"time"
 )
 
-const backfillSinceFormats = "an RFC 3339 time, a YYYY-MM-DD local date, or Unix milliseconds"
+const (
+	backfillSinceFormats = "an RFC 3339 time, a YYYY-MM-DD local date, or Unix milliseconds"
+	// backfillBodyLimit bounds the request body; a larger body is rejected
+	// rather than truncated, since a cut-off body could read as empty and fall
+	// through to a full deep backfill.
+	backfillBodyLimit = 4096
+	// minBackfillSinceMS rejects millisecond values that are really Unix
+	// seconds: 1e11 ms is March 1973, while today's Unix seconds are ~1.8e9.
+	minBackfillSinceMS = int64(100_000_000_000)
+)
 
 // parseBackfillSince reads the optional window start of POST /api/backfill.
 // An empty body (the original deep-backfill call) reports windowed=false. A
@@ -24,9 +33,12 @@ func parseBackfillSince(r *http.Request, now time.Time) (time.Time, bool, error)
 	if r.Body == nil {
 		return time.Time{}, false, nil
 	}
-	body, err := io.ReadAll(io.LimitReader(r.Body, 4096))
+	body, err := io.ReadAll(io.LimitReader(r.Body, backfillBodyLimit+1))
 	if err != nil {
 		return time.Time{}, false, fmt.Errorf("read request body: %w", err)
+	}
+	if len(body) > backfillBodyLimit {
+		return time.Time{}, false, fmt.Errorf("request body exceeds %d bytes", backfillBodyLimit)
 	}
 	if len(bytes.TrimSpace(body)) == 0 {
 		return time.Time{}, false, nil
@@ -38,6 +50,9 @@ func parseBackfillSince(r *http.Request, now time.Time) (time.Time, bool, error)
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&request); err != nil {
 		return time.Time{}, false, fmt.Errorf("invalid JSON: %w", err)
+	}
+	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
+		return time.Time{}, false, errors.New("invalid JSON: unexpected data after the request object")
 	}
 	raw := bytes.TrimSpace(request.Since)
 	if len(raw) == 0 || string(raw) == "null" {
@@ -60,7 +75,7 @@ func parseBackfillSince(r *http.Request, now time.Time) (time.Time, bool, error)
 func parseBackfillSinceValue(raw json.RawMessage) (time.Time, error) {
 	var milliseconds int64
 	if err := json.Unmarshal(raw, &milliseconds); err == nil {
-		return time.UnixMilli(milliseconds), nil
+		return backfillSinceFromMilliseconds(milliseconds)
 	}
 	var text string
 	if err := json.Unmarshal(raw, &text); err != nil {
@@ -74,7 +89,17 @@ func parseBackfillSinceValue(raw json.RawMessage) (time.Time, error) {
 		return parsed, nil
 	}
 	if milliseconds, err := strconv.ParseInt(text, 10, 64); err == nil {
-		return time.UnixMilli(milliseconds), nil
+		return backfillSinceFromMilliseconds(milliseconds)
 	}
 	return time.Time{}, fmt.Errorf("since %q must be %s", text, backfillSinceFormats)
+}
+
+func backfillSinceFromMilliseconds(milliseconds int64) (time.Time, error) {
+	if milliseconds > 0 && milliseconds < minBackfillSinceMS {
+		return time.Time{}, fmt.Errorf(
+			"since %d is before 1973 as Unix milliseconds; Unix seconds must be multiplied by 1000",
+			milliseconds,
+		)
+	}
+	return time.UnixMilli(milliseconds), nil
 }
