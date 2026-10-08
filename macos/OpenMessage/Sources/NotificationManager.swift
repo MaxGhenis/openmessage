@@ -59,6 +59,10 @@ final class NotificationManager: NSObject, ObservableObject, UNUserNotificationC
     private let defaults = UserDefaults.standard
     private let baseURL: URL
     private var streamTask: Task<Void, Never>?
+    private var healthTask: Task<Void, Never>?
+    private var bootstrapTask: Task<Void, Never>?
+    private var silenceLatch: SilenceNotificationLatch
+    private let silenceLatchKey = "silenceNotifiedEpisodes"
     private var lastSeenTimestamps: [String: Int64] = [:]
     private var seenMessageIDs = Set<String>()
     private var seenMessageOrder: [String] = []
@@ -72,6 +76,7 @@ final class NotificationManager: NSObject, ObservableObject, UNUserNotificationC
     private let recentConversationLimit = 50
     private let recentMessageLimit = 10
     private let reconnectDelay: Duration = .seconds(2)
+    private let healthCheckInterval: Duration = .seconds(300)
     private let seenMessageCap = 500
     private let preferenceKey = "desktopNotificationsEnabled"
 
@@ -81,20 +86,25 @@ final class NotificationManager: NSObject, ObservableObject, UNUserNotificationC
             defaults.set(true, forKey: preferenceKey)
         }
         self.preferenceEnabled = defaults.bool(forKey: preferenceKey)
+        self.silenceLatch = SilenceNotificationLatch(storedValue: defaults.object(forKey: silenceLatchKey))
         super.init()
         UNUserNotificationCenter.current().delegate = self
     }
 
     func start() {
         stop()
-        Task {
+        bootstrapTask = Task {
             await startIfAllowed()
         }
     }
 
     func stop() {
+        bootstrapTask?.cancel()
+        bootstrapTask = nil
         streamTask?.cancel()
         streamTask = nil
+        healthTask?.cancel()
+        healthTask = nil
     }
 
     /// Helper that crosses the actor boundary returning only the Sendable
@@ -203,9 +213,22 @@ final class NotificationManager: NSObject, ObservableObject, UNUserNotificationC
             return
         }
 
+        // stop() or a newer start() may have run while permission was pending.
+        guard !Task.isCancelled else { return }
+        streamTask?.cancel()
+        healthTask?.cancel()
         streamTask = Task {
             await primeBaseline()
             await runEventLoop()
+        }
+        // A platform going silent changes no connection state, so no "status"
+        // event announces it. Re-check health on a timer as well.
+        healthTask = Task {
+            while !Task.isCancelled {
+                try? await Task.sleep(for: healthCheckInterval)
+                if Task.isCancelled { return }
+                await checkPlatformHealth()
+            }
         }
     }
 
@@ -317,16 +340,19 @@ final class NotificationManager: NSObject, ObservableObject, UNUserNotificationC
     }
 
     /// Alerts the user once when a messaging platform enters a state that needs
-    /// manual intervention (Google Messages flagged for re-pair, or WhatsApp
-    /// logged out) and won't self-heal. Re-arms after the platform recovers so
-    /// a later outage alerts again. Without this a platform can go dark for days
+    /// manual intervention (Google Messages flagged for re-pair, WhatsApp
+    /// logged out, or a paired platform silent for longer than its own traffic
+    /// explains) and won't self-heal. Re-arms after the platform recovers so a
+    /// later outage alerts again. Without this a platform can go dark for days
     /// with no signal beyond a subtle in-app badge.
     private func checkPlatformHealth() async {
         guard preferenceEnabled else { return }
         let status: PlatformStatus
+        let attention: [PlatformAttention]
         do {
             let (data, _) = try await URLSession.shared.data(from: apiURL(pathComponents: ["api", "status"]))
             status = try JSONDecoder().decode(PlatformStatus.self, from: data)
+            attention = PlatformAttention.evaluate(statusData: data) ?? []
         } catch {
             logger.debug("Health check fetch error: \(error)")
             return
@@ -344,6 +370,14 @@ final class NotificationManager: NSObject, ObservableObject, UNUserNotificationC
             title: "WhatsApp needs attention",
             body: "WhatsApp was logged out. Open OpenMessage to scan the QR code and reconnect."
         )
+        let newlySilent = silenceLatch.newlySilent(attention)
+        if !newlySilent.isEmpty {
+            defaults.set(silenceLatch.storedValue, forKey: silenceLatchKey)
+        }
+        for item in newlySilent {
+            guard let body = PlatformAttention.silentNotificationBody(item) else { continue }
+            sendHealthNotification(key: "\(item.key)-silent", title: "\(item.name) has gone quiet", body: body)
+        }
     }
 
     private func evaluatePlatformHealth(key: String, broken: Bool, title: String, body: String) {
