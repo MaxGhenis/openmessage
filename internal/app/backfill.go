@@ -133,6 +133,7 @@ func (a *App) deepBackfill() {
 	catchUp.progress = &a.BackfillProgress
 
 	a.BackfillProgress.reset()
+	a.BackfillProgress.setRun(BackfillTriggerDeep, 0)
 	defer a.BackfillProgress.finish()
 
 	a.Logger.Info().Msg("Starting deep backfill of all messages")
@@ -195,6 +196,42 @@ func (a *App) deepBackfill() {
 	a.emitMessagesChange("")
 }
 
+// Backfill triggers reported in BackfillSnapshot.Trigger.
+const (
+	BackfillTriggerDeep            = "deep"
+	BackfillTriggerWindow          = "window"
+	BackfillTriggerSilenceRecovery = "silence_recovery"
+)
+
+// GoogleWindowBackfillResult reports one window backfill run.
+type GoogleWindowBackfillResult struct {
+	Since      time.Time
+	Trigger    string
+	StartedAt  time.Time
+	FinishedAt time.Time
+	// Connected is false when no Google client was connected, so nothing ran.
+	Connected bool
+	// Aborted is set when the run stopped early because the client changed or
+	// disconnected, or Google rejected the session.
+	Aborted bool
+	// Listed counts the distinct conversations the folder listings returned,
+	// in the window or not. Zero means the phone listed nothing at all.
+	Listed int
+	// Conversations counts the listed conversations kept as in the window.
+	Conversations int
+	// Messages counts the messages fetched from those conversations.
+	Messages int
+	// EmptyConversations counts in-window conversations with a known last
+	// message time whose fetch returned no message at all. Their last message
+	// is inside the window, so a working fetch always returns it.
+	EmptyConversations int
+	// Errors counts failed listings and fetches (BackfillSnapshot.Errors).
+	Errors int
+	// HistoryTeed and HistoryTeeFailed count hand-offs to v2 ingest.
+	HistoryTeed      int
+	HistoryTeeFailed int
+}
+
 // StartGoogleWindowBackfill starts a guarded background re-fetch of every
 // Google message from since onward (see windowBackfill). It reports false when
 // a backfill or catch-up is already running.
@@ -202,8 +239,19 @@ func (a *App) StartGoogleWindowBackfill(since time.Time) bool {
 	if !a.beginBackfill() {
 		return false
 	}
-	go a.windowBackfill(since)
+	go a.windowBackfill(since, BackfillTriggerWindow)
 	return true
+}
+
+// RunGoogleWindowBackfill runs a window backfill from since on the calling
+// goroutine and returns its result. It takes the same guard as every other
+// backfill and reports false, without running, when one is already running.
+// trigger is recorded in BackfillSnapshot.Trigger.
+func (a *App) RunGoogleWindowBackfill(since time.Time, trigger string) (GoogleWindowBackfillResult, bool) {
+	if !a.beginBackfill() {
+		return GoogleWindowBackfillResult{}, false
+	}
+	return a.windowBackfill(since, trigger), true
 }
 
 // windowBackfill re-fetches the messages the phone holds from since onward,
@@ -213,25 +261,40 @@ func (a *App) StartGoogleWindowBackfill(since time.Time) bool {
 // live channel skipped (a phone that stopped relaying): unlike DeepBackfill it
 // does not re-fetch every message the phone has ever held, and unlike the
 // recent reconcile it does not stop at the newest message already stored, which
-// after the live channel resumes sits above the hole.
-func (a *App) windowBackfill(since time.Time) {
+// after the live channel resumes sits above the hole. The caller holds the
+// backfill guard; windowBackfill releases it.
+func (a *App) windowBackfill(since time.Time, trigger string) (result GoogleWindowBackfillResult) {
 	defer a.endBackfill()
+	result = GoogleWindowBackfillResult{Since: since, Trigger: trigger, StartedAt: time.Now()}
+	defer func() { result.FinishedAt = time.Now() }()
 
 	catchUp := a.beginGoogleCatchUp("window_backfill")
 	if catchUp == nil {
-		a.Logger.Error().Msg("Window backfill: client not connected")
-		return
+		a.Logger.Error().Str("trigger", trigger).Msg("Window backfill: client not connected")
+		return result
 	}
+	result.Connected = true
 	defer catchUp.finish()
 	catchUp.progress = &a.BackfillProgress
 
 	a.BackfillProgress.reset()
+	a.BackfillProgress.setRun(trigger, since.UnixMilli())
 	defer a.BackfillProgress.finish()
+	// Copy the run's counters into the result on every exit path.
+	defer func() {
+		progress := a.BackfillProgress.snapshot()
+		result.Conversations = progress.ConversationsFound
+		result.Messages = progress.MessagesFound
+		result.Errors = progress.Errors
+		result.HistoryTeed = progress.HistoryTeed
+		result.HistoryTeeFailed = progress.HistoryTeeFailed
+	}()
 
 	sinceMS := since.UnixMilli()
-	a.Logger.Info().Time("since", since).Msg("Starting window backfill")
+	a.Logger.Info().Time("since", since).Str("trigger", trigger).Msg("Starting window backfill")
 
 	inWindow := func(conv *gmproto.Conversation) bool {
+		result.Listed++
 		// LastMessageTimestamp is in microseconds; 0 means the phone did not
 		// say, so keep the conversation rather than risk skipping the hole.
 		last := conv.GetLastMessageTimestamp() / 1000
@@ -241,9 +304,10 @@ func (a *App) windowBackfill(since time.Time) {
 	for _, folder := range backfillFolders {
 		n, aborted := a.paginateFolder(catchUp, folder, seen, inWindow)
 		if aborted {
+			result.Aborted = true
 			a.emitConversationsChange()
 			a.emitMessagesChange("")
-			return
+			return result
 		}
 		a.BackfillProgress.add(0, 0, 0, 1)
 		a.Logger.Info().
@@ -257,23 +321,31 @@ func (a *App) windowBackfill(since time.Time) {
 		n, aborted := a.deepBackfillConversationWithToken(catchUp, convID, conv, sinceMS)
 		a.BackfillProgress.add(0, n, 0, 0)
 		if aborted {
+			result.Aborted = true
 			a.emitConversationsChange()
 			a.emitMessagesChange("")
-			return
+			return result
+		}
+		if n == 0 && conv.GetLastMessageTimestamp() > 0 {
+			result.EmptyConversations++
 		}
 	}
 
 	progress := a.BackfillProgress.snapshot()
 	a.Logger.Info().
 		Time("since", since).
+		Str("trigger", trigger).
+		Int("listed", result.Listed).
 		Int("conversations", progress.ConversationsFound).
 		Int("messages", progress.MessagesFound).
+		Int("empty_conversations", result.EmptyConversations).
 		Int("errors", progress.Errors).
 		Int("history_teed", progress.HistoryTeed).
 		Int("history_tee_failed", progress.HistoryTeeFailed).
 		Msg("Window backfill complete")
 	a.emitConversationsChange()
 	a.emitMessagesChange("")
+	return result
 }
 
 func (a *App) deepBackfillShouldAbort(clientToken any, phase string) bool {
