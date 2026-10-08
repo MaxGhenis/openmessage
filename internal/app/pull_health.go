@@ -62,12 +62,46 @@ type GooglePullHealthSnapshot struct {
 	Threshold             int  `json:"threshold"`
 }
 
+// googlePullDatalessCap bounds the data-less streak the recorder remembers;
+// consecutive_dataless saturates there.
+const googlePullDatalessCap = 1024
+
 type googlePullHealth struct {
 	mu       sync.Mutex
 	recorded bool
 	snap     GooglePullHealthSnapshot
 	counter  func() (int, error)
 	now      func() time.Time
+
+	// Pulls are sequenced when their result arrives, before the (unlocked)
+	// store count, and applied so that the final state depends only on that
+	// order, not on which recorder finishes first: an older result can't
+	// overwrite newer evidence or drop a concurrent data-less pull from the
+	// streak.
+	seq        uint64
+	appliedSeq uint64 // newest pull reflected in the last_* fields
+	countedSeq uint64 // newest counted pull with data or without
+	dataSeq    uint64 // newest counted pull that returned data
+	localSeq   uint64 // newest counted pull whose local count succeeded
+	// newestDataless and newestAccountSwitch describe the countedSeq pull.
+	newestDataless      bool
+	newestAccountSwitch bool
+	// dataless holds the sequence numbers of counted data-less pulls newer
+	// than dataSeq; its length is the streak.
+	dataless []uint64
+}
+
+type googlePullRecord struct {
+	seq           uint64
+	atMS          int64
+	trigger       string
+	folder        string
+	count         int
+	err           error
+	outcome       GooglePullOutcome
+	accountSwitch bool
+	counted       bool
+	local         int // -1 when not measured
 }
 
 // SetGoogleConversationCounter installs the active read source's Google
@@ -105,78 +139,60 @@ func classifyGooglePull(count int, err error) GooglePullOutcome {
 
 // recordGoogleListPull records a ListConversations pull. Only first pages of
 // INBOX count toward the health signal: other folders and later pages can be
-// empty legitimately.
-func (a *App) recordGoogleListPull(trigger string, folder gmproto.ListConversationsRequest_Folder, firstPage bool, resp *gmproto.ListConversationsResponse, err error) {
+// empty legitimately. clientToken identifies the client generation that made
+// the pull; results from a retired client are dropped.
+func (a *App) recordGoogleListPull(clientToken any, trigger string, folder gmproto.ListConversationsRequest_Folder, firstPage bool, resp *gmproto.ListConversationsResponse, err error) {
 	counted := firstPage && folder == gmproto.ListConversationsRequest_INBOX
-	a.recordGooglePull(trigger, folder.String(), len(resp.GetConversations()), err, counted)
+	a.recordGooglePull(clientToken, trigger, folder.String(), len(resp.GetConversations()), err, counted)
 }
 
 // recordGoogleLookupPull records a targeted conversation lookup, which should
 // always return a conversation.
-func (a *App) recordGoogleLookupPull(trigger string, conv *gmproto.Conversation, err error) {
+func (a *App) recordGoogleLookupPull(clientToken any, trigger string, conv *gmproto.Conversation, err error) {
 	found := 0
 	if conv != nil {
 		found = 1
 	}
-	a.recordGooglePull(trigger, "", found, err, true)
+	a.recordGooglePull(clientToken, trigger, "", found, err, true)
 }
 
-func (a *App) recordGooglePull(trigger, folder string, count int, err error, counted bool) {
-	outcome := classifyGooglePull(count, err)
-	var payloadErr *libgm.ResponsePayloadError
-	accountSwitch := errors.As(err, &payloadErr) && payloadErr.AccountSwitch
-	dataless := outcome == GooglePullEmpty || outcome == GooglePullNoPayload
-
-	// Count outside the lock: it reads a store.
-	local := -1
-	if counted && dataless {
-		local = a.countGoogleConversations()
+func (a *App) recordGooglePull(clientToken any, trigger, folder string, count int, err error, counted bool) {
+	if clientToken != nil && !a.backfillClientStillCurrent(clientToken) {
+		// A retired client's late answer (e.g. a payload-less expiry after a
+		// re-pair) says nothing about the current session.
+		a.Logger.Debug().Str("trigger", trigger).AnErr("error", err).Msg("Ignoring Google pull outcome from a retired client")
+		return
 	}
+	rec := googlePullRecord{
+		trigger: trigger,
+		folder:  folder,
+		count:   count,
+		err:     err,
+		outcome: classifyGooglePull(count, err),
+		counted: counted,
+		local:   -1,
+	}
+	var payloadErr *libgm.ResponsePayloadError
+	rec.accountSwitch = errors.As(err, &payloadErr) && payloadErr.AccountSwitch
+	dataless := rec.outcome == GooglePullEmpty || rec.outcome == GooglePullNoPayload
 
 	h := &a.googlePull
 	h.mu.Lock()
+	h.seq++
+	rec.seq = h.seq
 	now := time.Now
 	if h.now != nil {
 		now = h.now
 	}
-	nowMS := now().UnixMilli()
-	s := &h.snap
-	h.recorded = true
-	s.Threshold = googlePullEmptyThreshold
-	s.LastAttemptMS = nowMS
-	s.LastTrigger = trigger
-	s.LastFolder = folder
-	s.LastOutcome = outcome
-	s.LastCount = count
-	s.LastError = ""
-	if err != nil {
-		s.LastError = err.Error()
-	}
-	if outcome == GooglePullNoPayload {
-		s.AccountSwitch = accountSwitch
-	}
-	raised := false
-	if counted {
-		switch {
-		case outcome == GooglePullOK:
-			s.ConsecutiveDataless = 0
-			s.LastDataMS = nowMS
-			s.AccountSwitch = false
-			s.EmptyWithLocalHistory = false
-		case dataless:
-			s.ConsecutiveDataless++
-			if local >= 0 {
-				s.LocalConversations = local
-			}
-			was := s.EmptyWithLocalHistory
-			s.EmptyWithLocalHistory = s.LocalConversations >= googlePullEmptyThreshold
-			raised = s.EmptyWithLocalHistory && !was
-		}
-		// GooglePullError (transport, auth) is evidence of neither, so it
-		// leaves the signal where it was.
-	}
-	snap := *s
+	rec.atMS = now().UnixMilli()
 	h.mu.Unlock()
+
+	// Count outside the lock: it reads a store.
+	if counted && dataless {
+		rec.local = a.countGoogleConversations()
+	}
+
+	snap, raised, cleared := h.apply(rec)
 
 	evt := a.Logger.Info()
 	if dataless && counted {
@@ -184,7 +200,7 @@ func (a *App) recordGooglePull(trigger, folder string, count int, err error, cou
 	}
 	evt.Str("trigger", trigger).
 		Str("folder", folder).
-		Str("outcome", string(outcome)).
+		Str("outcome", string(rec.outcome)).
 		Int("count", count).
 		Int("consecutive_dataless", snap.ConsecutiveDataless).
 		Int("local_conversations", snap.LocalConversations).
@@ -199,9 +215,68 @@ func (a *App) recordGooglePull(trigger, folder string, count int, err error, cou
 			Bool("account_switch", snap.AccountSwitch).
 			Msg("Google pulls return no data while the store holds this account's conversations; catch-up is not working")
 	}
-	if raised || (counted && outcome == GooglePullOK) {
+	if raised || cleared {
 		a.emitStatusChange(a.Connected.Load())
 	}
+}
+
+// apply folds one sequenced pull into the health state. The result depends
+// only on the set of records and their sequence numbers, not on the order in
+// which apply is called.
+func (h *googlePullHealth) apply(rec googlePullRecord) (snap GooglePullHealthSnapshot, raised, cleared bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	s := &h.snap
+	was := s.EmptyWithLocalHistory
+	h.recorded = true
+	s.Threshold = googlePullEmptyThreshold
+
+	if rec.seq > h.appliedSeq {
+		h.appliedSeq = rec.seq
+		s.LastAttemptMS = rec.atMS
+		s.LastTrigger = rec.trigger
+		s.LastFolder = rec.folder
+		s.LastOutcome = rec.outcome
+		s.LastCount = rec.count
+		s.LastError = ""
+		if rec.err != nil {
+			s.LastError = rec.err.Error()
+		}
+	}
+
+	dataless := rec.outcome == GooglePullEmpty || rec.outcome == GooglePullNoPayload
+	// Transport and auth errors are evidence of neither data nor its absence,
+	// so they never move the signal or the streak.
+	if rec.counted && (dataless || rec.outcome == GooglePullOK) {
+		if rec.outcome == GooglePullOK {
+			if rec.seq > h.dataSeq {
+				h.dataSeq = rec.seq
+				s.LastDataMS = rec.atMS
+			}
+			kept := h.dataless[:0]
+			for _, q := range h.dataless {
+				if q > rec.seq {
+					kept = append(kept, q)
+				}
+			}
+			h.dataless = kept
+		} else if rec.seq > h.dataSeq && len(h.dataless) < googlePullDatalessCap {
+			h.dataless = append(h.dataless, rec.seq)
+		}
+		if dataless && rec.local >= 0 && rec.seq > h.localSeq {
+			h.localSeq = rec.seq
+			s.LocalConversations = rec.local
+		}
+		if rec.seq > h.countedSeq {
+			h.countedSeq = rec.seq
+			h.newestDataless = dataless
+			h.newestAccountSwitch = dataless && rec.accountSwitch
+		}
+	}
+	s.ConsecutiveDataless = len(h.dataless)
+	s.AccountSwitch = h.newestAccountSwitch
+	s.EmptyWithLocalHistory = h.newestDataless && s.LocalConversations >= googlePullEmptyThreshold
+	return *s, s.EmptyWithLocalHistory && !was, was && !s.EmptyWithLocalHistory
 }
 
 func (a *App) countGoogleConversations() int {

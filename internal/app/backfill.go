@@ -59,7 +59,7 @@ func (a *App) Backfill() error {
 	}
 	defer a.endBackfill()
 
-	gm := a.getGMClient()
+	gm, clientToken := a.currentBackfillClient()
 	if gm == nil {
 		return fmt.Errorf("client not connected")
 	}
@@ -67,7 +67,7 @@ func (a *App) Backfill() error {
 	a.Logger.Info().Msg("Starting backfill of conversations and messages")
 
 	resp, err := gm.ListConversationsWithCursor(100, gmproto.ListConversationsRequest_INBOX, nil)
-	a.recordGoogleListPull("backfill", gmproto.ListConversationsRequest_INBOX, true, resp, err)
+	a.recordGoogleListPull(clientToken, "backfill", gmproto.ListConversationsRequest_INBOX, true, resp, err)
 	if err != nil {
 		a.HandleGoogleAuthExpiredError(err)
 		return fmt.Errorf("list conversations: %w", err)
@@ -209,7 +209,7 @@ func (a *App) paginateFolder(gm GMClient, folder gmproto.ListConversationsReques
 			return found, true
 		}
 		resp, err := gm.ListConversationsWithCursor(100, folder, cursor)
-		a.recordGoogleListPull("deep", folder, cursor == nil, resp, err)
+		a.recordGoogleListPull(clientToken, "deep", folder, cursor == nil, resp, err)
 		if err != nil {
 			if a.abortBackfillForGoogleAuthError(err, "folders", fmt.Sprintf("list %s: %v", folder.String(), err)) {
 				return found, true
@@ -403,7 +403,7 @@ func (a *App) discoverFromContacts(gm GMClient, seen map[string]bool, clientToke
 // BackfillConversationByPhone looks up or creates a conversation for a specific
 // phone number, stores it, and deep-backfills all its messages.
 func (a *App) BackfillConversationByPhone(phone string) error {
-	gm := a.getGMClient()
+	gm, clientToken := a.currentBackfillClient()
 	if gm == nil {
 		return fmt.Errorf("client not connected")
 	}
@@ -411,7 +411,7 @@ func (a *App) BackfillConversationByPhone(phone string) error {
 	convResp, err := gm.GetOrCreateConversation(&gmproto.GetOrCreateConversationRequest{
 		Numbers: NewContactNumbers([]string{phone}),
 	})
-	a.recordGoogleLookupPull("targeted", convResp.GetConversation(), err)
+	a.recordGoogleLookupPull(clientToken, "targeted", convResp.GetConversation(), err)
 	if err != nil {
 		a.HandleGoogleAuthExpiredError(err)
 		return fmt.Errorf("get or create conversation: %w", err)
@@ -454,7 +454,7 @@ func (a *App) reconcileRecentConversations(reason string) {
 		Msg("Reconciling recent conversations")
 
 	resp, err := gm.ListConversationsWithCursor(recentReconcileConversationLimit, gmproto.ListConversationsRequest_INBOX, nil)
-	a.recordGoogleListPull("reconcile:"+reason, gmproto.ListConversationsRequest_INBOX, true, resp, err)
+	a.recordGoogleListPull(clientToken, "reconcile:"+reason, gmproto.ListConversationsRequest_INBOX, true, resp, err)
 	if err != nil {
 		if a.HandleGoogleAuthExpiredError(err) {
 			a.Logger.Warn().Err(err).Str("reason", reason).Msg("Recent reconcile aborted because Google auth expired")

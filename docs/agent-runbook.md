@@ -434,7 +434,7 @@ Without it, a single transient network blip during a scheduled token refresh
 permanently killed the session.
 
 The replacement in `go.mod` pins fork commit
-[`75d7eba8a868`](https://github.com/MaxGhenis/gmessages/commit/75d7eba8a868f9f359134aa1db4bd0244cb0cc23).
+[`1dc753f2084e`](https://github.com/MaxGhenis/gmessages/commit/1dc753f2084eedf8db3efb63a2ac3fecb1deecf1).
 It is upstream `mautrix/gmessages` base
 [`3433cc07d5ea`](https://github.com/mautrix/gmessages/commit/3433cc07d5ea9522309adad3a8c92ed5b08dc11d),
 which contains the auth-refresh retry, plus two carried patches, oldest first:
@@ -454,13 +454,15 @@ subjects) and fails as soon as upstream `main` advances. When rebasing, replay
 both carried patches, verify the auth-refresh retry is still present, and
 update the fork pin, `EXPECTED_PATCHES`, and recorded SHAs together. The pinned
 commit must be on the fork's `main`. `TestGMessagesForkRejectsPayloadlessResponses`
-fails if a rebase drops the second patch. The durable architectural fix (move
-SMS/RCS onto an Android companion) is issue #75.
+runs the pinned fork's own response-acceptance tests, so it fails if a rebase
+drops the second patch or keeps its exported names without the rejection. The
+durable architectural fix (move SMS/RCS onto an Android companion) is issue #75.
 
 ### Pulls that return nothing (phone switched to Google-account pairing)
 
-**Symptom (2026-10-06 to 10-08):** push works (new messages arrive,
-`phone_responding: true`), but every pull comes back empty. Startup backfill
+**Symptom (2026-10-06 to 10-08):** new messages still arrive
+(`freshness.google.latest_received_ms` keeps advancing) and
+`phone_responding` is `true`, but every pull comes back empty. Startup backfill
 logs `Fetched conversations count=0`, deep backfill reports
 `conversations_found=0, errors=0`, and `GetOrCreateConversation` /
 `GetConversation` return no conversation, so sends fail with "transport
@@ -482,9 +484,9 @@ account pairing, please log in to continue using SMS/RCS").
 
 - libgm logs `Phone answered a pending request without a response payload`
   and, 10 s later, `Phone never sent a response payload; failing the request`.
-  Both carry a `frame` object with the envelope shape and no content
-  (`message_type`, `f5`/`f8`/`f11` presence and lengths, `decoded_size`,
-  `unknown_len`, `account_switch`). Answers that arrive after their request
+  They carry the envelope shape and no content, as `frame` on the first and
+  `last_frame` on the second (`message_type`, `f5`/`f8`/`f11` presence and
+  lengths, `decoded_size`, `unknown_len`, `account_switch`). Answers that arrive after their request
   already finished are logged as `Received response with no pending request`.
 - Pulls fail with an error that matches `libgm.ErrNoResponsePayload`; deep
   backfill counts them in `errors`.
@@ -493,7 +495,10 @@ account pairing, please log in to continue using SMS/RCS").
   `empty_with_local_history: true` when the latest INBOX listing or targeted
   lookup returned no data while the store held at least `threshold` (10)
   Google conversations. `account_switch: true` means the phone sent the
-  account-switch notice. The next pull that returns data clears it.
+  account-switch notice. The next INBOX listing or targeted lookup that
+  returns data clears it; other folders, later pages and transport errors
+  leave it alone. The threshold is a heuristic: an account whose INBOX is
+  legitimately empty while archived threads remain would also raise it.
 
 ```bash
 curl -s http://127.0.0.1:7007/api/status | jq '.google.pull_health'

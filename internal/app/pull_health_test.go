@@ -74,7 +74,7 @@ func TestPullHealthAbsentBeforeFirstPull(t *testing.T) {
 // ~1,000 Google conversations.
 func TestEmptyInboxPullWithLocalHistoryRaisesSignal(t *testing.T) {
 	a := newPullHealthApp(t, 1044)
-	a.recordGoogleListPull("backfill", gmproto.ListConversationsRequest_INBOX, true, &gmproto.ListConversationsResponse{}, nil)
+	a.recordGoogleListPull(nil, "backfill", gmproto.ListConversationsRequest_INBOX, true, &gmproto.ListConversationsResponse{}, nil)
 	h := a.GooglePullHealth()
 	if h == nil || !h.EmptyWithLocalHistory || h.LastOutcome != GooglePullEmpty || h.LocalConversations != 1044 || h.ConsecutiveDataless != 1 {
 		t.Fatalf("health = %+v", h)
@@ -87,7 +87,7 @@ func TestEmptyInboxPullWithLocalHistoryRaisesSignal(t *testing.T) {
 
 func TestNoPayloadPullRaisesSignalAndKeepsAccountSwitch(t *testing.T) {
 	a := newPullHealthApp(t, 1044)
-	a.recordGoogleListPull("reconcile:listen_recovered", gmproto.ListConversationsRequest_INBOX, true, nil, noPayloadErr(true))
+	a.recordGoogleListPull(nil, "reconcile:listen_recovered", gmproto.ListConversationsRequest_INBOX, true, nil, noPayloadErr(true))
 	h := a.GooglePullHealth()
 	if !h.EmptyWithLocalHistory || h.LastOutcome != GooglePullNoPayload || !h.AccountSwitch || h.LastError == "" {
 		t.Fatalf("health = %+v", h)
@@ -96,7 +96,7 @@ func TestNoPayloadPullRaisesSignalAndKeepsAccountSwitch(t *testing.T) {
 
 func TestEmptyInboxBelowThresholdDoesNotRaiseSignal(t *testing.T) {
 	a := newPullHealthApp(t, googlePullEmptyThreshold-1)
-	a.recordGoogleListPull("backfill", gmproto.ListConversationsRequest_INBOX, true, nil, nil)
+	a.recordGoogleListPull(nil, "backfill", gmproto.ListConversationsRequest_INBOX, true, nil, nil)
 	if h := a.GooglePullHealth(); h.EmptyWithLocalHistory || h.ConsecutiveDataless != 1 {
 		t.Fatalf("health = %+v", h)
 	}
@@ -104,9 +104,9 @@ func TestEmptyInboxBelowThresholdDoesNotRaiseSignal(t *testing.T) {
 
 func TestOtherFoldersAndLaterPagesDoNotCount(t *testing.T) {
 	a := newPullHealthApp(t, 1044)
-	a.recordGoogleListPull("deep", gmproto.ListConversationsRequest_SPAM_BLOCKED, true, nil, nil)
-	a.recordGoogleListPull("deep", gmproto.ListConversationsRequest_ARCHIVE, true, nil, nil)
-	a.recordGoogleListPull("deep", gmproto.ListConversationsRequest_INBOX, false, nil, nil)
+	a.recordGoogleListPull(nil, "deep", gmproto.ListConversationsRequest_SPAM_BLOCKED, true, nil, nil)
+	a.recordGoogleListPull(nil, "deep", gmproto.ListConversationsRequest_ARCHIVE, true, nil, nil)
+	a.recordGoogleListPull(nil, "deep", gmproto.ListConversationsRequest_INBOX, false, nil, nil)
 	h := a.GooglePullHealth()
 	if h.EmptyWithLocalHistory || h.ConsecutiveDataless != 0 {
 		t.Fatalf("legitimately empty pulls counted: %+v", h)
@@ -118,12 +118,12 @@ func TestOtherFoldersAndLaterPagesDoNotCount(t *testing.T) {
 
 func TestDataClearsSignalAndTransportErrorsLeaveIt(t *testing.T) {
 	a := newPullHealthApp(t, 1044)
-	a.recordGoogleListPull("backfill", gmproto.ListConversationsRequest_INBOX, true, nil, noPayloadErr(true))
-	a.recordGoogleListPull("backfill", gmproto.ListConversationsRequest_INBOX, true, nil, errors.New("connection reset"))
+	a.recordGoogleListPull(nil, "backfill", gmproto.ListConversationsRequest_INBOX, true, nil, noPayloadErr(true))
+	a.recordGoogleListPull(nil, "backfill", gmproto.ListConversationsRequest_INBOX, true, nil, errors.New("connection reset"))
 	if h := a.GooglePullHealth(); !h.EmptyWithLocalHistory || h.ConsecutiveDataless != 1 || h.LastOutcome != GooglePullError {
 		t.Fatalf("a transport error changed the signal: %+v", h)
 	}
-	a.recordGoogleListPull("backfill", gmproto.ListConversationsRequest_INBOX, true, listResp(3), nil)
+	a.recordGoogleListPull(nil, "backfill", gmproto.ListConversationsRequest_INBOX, true, listResp(3), nil)
 	h := a.GooglePullHealth()
 	if h.EmptyWithLocalHistory || h.ConsecutiveDataless != 0 || h.AccountSwitch || h.LastDataMS == 0 {
 		t.Fatalf("data did not clear the signal: %+v", h)
@@ -132,11 +132,11 @@ func TestDataClearsSignalAndTransportErrorsLeaveIt(t *testing.T) {
 
 func TestLookupWithoutConversationCounts(t *testing.T) {
 	a := newPullHealthApp(t, 1044)
-	a.recordGoogleLookupPull("targeted", nil, nil)
+	a.recordGoogleLookupPull(nil, "targeted", nil, nil)
 	if h := a.GooglePullHealth(); !h.EmptyWithLocalHistory || h.LastOutcome != GooglePullEmpty {
 		t.Fatalf("health = %+v", h)
 	}
-	a.recordGoogleLookupPull("targeted", makeConv("c1", "x"), nil)
+	a.recordGoogleLookupPull(nil, "targeted", makeConv("c1", "x"), nil)
 	if h := a.GooglePullHealth(); h.EmptyWithLocalHistory || h.LastCount != 1 {
 		t.Fatalf("health = %+v", h)
 	}
@@ -149,7 +149,7 @@ func TestPullHealthFallsBackToLegacyStoreCount(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	a.recordGoogleListPull("backfill", gmproto.ListConversationsRequest_INBOX, true, nil, nil)
+	a.recordGoogleListPull(nil, "backfill", gmproto.ListConversationsRequest_INBOX, true, nil, nil)
 	if h := a.GooglePullHealth(); h.LocalConversations != googlePullEmptyThreshold || !h.EmptyWithLocalHistory {
 		t.Fatalf("health = %+v", h)
 	}
@@ -227,9 +227,9 @@ func TestPullHealthMatchesReferenceModel(t *testing.T) {
 				if e.count > 0 {
 					conv = makeConv("c", "x")
 				}
-				a.recordGoogleLookupPull("targeted", conv, e.err)
+				a.recordGoogleLookupPull(nil, "targeted", conv, e.err)
 			} else {
-				a.recordGoogleListPull("deep", e.folder, e.firstPage, listResp(e.count), e.err)
+				a.recordGoogleListPull(nil, "deep", e.folder, e.firstPage, listResp(e.count), e.err)
 			}
 		}
 		wantSignal, wantConsecutive := referenceSignal(events)
@@ -302,5 +302,135 @@ func TestTargetedBackfillRecordsLookup(t *testing.T) {
 	}
 	if h := a.GooglePullHealth(); h.LastTrigger != "targeted" || !h.EmptyWithLocalHistory || !h.AccountSwitch {
 		t.Fatalf("health = %+v", h)
+	}
+}
+
+// Review regression (PR 193 finding 2): an older data-less pull that is still
+// counting local conversations must not overwrite a later recovery.
+func TestOlderPullCannotOverwriteLaterRecovery(t *testing.T) {
+	a := newTestApp(t, &mockGMClient{})
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	done := make(chan struct{})
+	a.SetGoogleConversationCounter(func() (int, error) {
+		close(entered)
+		<-release
+		return 1044, nil
+	})
+	go func() {
+		defer close(done)
+		a.recordGoogleListPull(nil, "older-empty", gmproto.ListConversationsRequest_INBOX, true, nil, noPayloadErr(true))
+	}()
+	<-entered
+	a.recordGoogleListPull(nil, "later-recovery", gmproto.ListConversationsRequest_INBOX, true, listResp(1), nil)
+	close(release)
+	<-done
+	h := a.GooglePullHealth()
+	if h.EmptyWithLocalHistory || h.LastTrigger != "later-recovery" || h.ConsecutiveDataless != 0 || h.AccountSwitch || h.LastDataMS == 0 {
+		t.Fatalf("older pull overwrote the recovery: %+v", h)
+	}
+}
+
+// Two data-less pulls recorded concurrently both count toward the streak,
+// whichever finishes its store count first.
+func TestConcurrentDatalessPullsBothCount(t *testing.T) {
+	a := newTestApp(t, &mockGMClient{})
+	first := make(chan struct{})
+	release := make(chan struct{})
+	calls := 0
+	a.SetGoogleConversationCounter(func() (int, error) {
+		calls++
+		if calls == 1 {
+			close(first)
+			<-release
+		}
+		return 1044, nil
+	})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		a.recordGoogleListPull(nil, "older", gmproto.ListConversationsRequest_INBOX, true, nil, noPayloadErr(false))
+	}()
+	<-first
+	a.recordGoogleListPull(nil, "newer", gmproto.ListConversationsRequest_INBOX, true, nil, noPayloadErr(true))
+	close(release)
+	<-done
+	h := a.GooglePullHealth()
+	if h.ConsecutiveDataless != 2 || !h.EmptyWithLocalHistory || h.LastTrigger != "newer" || !h.AccountSwitch {
+		t.Fatalf("health = %+v", h)
+	}
+}
+
+// Invariant: the health state depends only on the pulls and their arrival
+// sequence, never on the order in which their recorders finish. Checked by
+// applying random record sets in sequence order and in a random permutation
+// and comparing the full snapshots.
+func TestPullHealthApplyOrderInvariance(t *testing.T) {
+	rng := rand.New(rand.NewSource(1008))
+	outcomes := []GooglePullOutcome{GooglePullOK, GooglePullEmpty, GooglePullNoPayload, GooglePullError}
+	for iter := 0; iter < 500; iter++ {
+		n := 1 + rng.Intn(10)
+		recs := make([]googlePullRecord, n)
+		for i := range recs {
+			o := outcomes[rng.Intn(len(outcomes))]
+			rec := googlePullRecord{
+				seq:     uint64(i + 1),
+				atMS:    int64(1000 + i),
+				trigger: fmt.Sprintf("t%d", i),
+				outcome: o,
+				counted: rng.Intn(4) != 0,
+				local:   []int{-1, 0, googlePullEmptyThreshold - 1, googlePullEmptyThreshold, 1044}[rng.Intn(5)],
+			}
+			if o == GooglePullOK {
+				rec.count = 1 + rng.Intn(3)
+			}
+			if o == GooglePullNoPayload {
+				rec.accountSwitch = rng.Intn(2) == 0
+				rec.err = noPayloadErr(rec.accountSwitch)
+			}
+			if o == GooglePullError {
+				rec.err = errors.New("transport")
+			}
+			recs[i] = rec
+		}
+		var inOrder, shuffled googlePullHealth
+		for _, r := range recs {
+			inOrder.apply(r)
+		}
+		for _, i := range rng.Perm(n) {
+			shuffled.apply(recs[i])
+		}
+		if inOrder.snap != shuffled.snap {
+			t.Fatalf("iter %d: apply order changed the result\nin order: %+v\nshuffled: %+v\nrecords: %+v", iter, inOrder.snap, shuffled.snap, recs)
+		}
+	}
+}
+
+// A retired client's late answer (for example a payload-less expiry that
+// fires after a re-pair) must not touch the current session's health.
+func TestPullFromRetiredClientIsIgnored(t *testing.T) {
+	current := &mockGMClient{}
+	a := newTestApp(t, current)
+	a.SetGoogleConversationCounter(func() (int, error) { return 1044, nil })
+	a.recordGoogleListPull(current, "backfill", gmproto.ListConversationsRequest_INBOX, true, listResp(2), nil)
+	retired := &mockGMClient{}
+	a.recordGoogleListPull(retired, "reconcile:old", gmproto.ListConversationsRequest_INBOX, true, nil, noPayloadErr(true))
+	h := a.GooglePullHealth()
+	if h.EmptyWithLocalHistory || h.LastTrigger != "backfill" || h.ConsecutiveDataless != 0 {
+		t.Fatalf("retired client's pull was recorded: %+v", h)
+	}
+}
+
+func TestDatalessStreakSaturates(t *testing.T) {
+	var h googlePullHealth
+	for i := 1; i <= googlePullDatalessCap+50; i++ {
+		h.apply(googlePullRecord{seq: uint64(i), outcome: GooglePullEmpty, counted: true, local: 1044})
+	}
+	if h.snap.ConsecutiveDataless != googlePullDatalessCap || !h.snap.EmptyWithLocalHistory {
+		t.Fatalf("snap = %+v", h.snap)
+	}
+	h.apply(googlePullRecord{seq: uint64(googlePullDatalessCap + 51), outcome: GooglePullOK, counted: true, count: 1, local: -1})
+	if h.snap.ConsecutiveDataless != 0 || h.snap.EmptyWithLocalHistory {
+		t.Fatalf("data did not clear a saturated streak: %+v", h.snap)
 	}
 }
