@@ -17,7 +17,9 @@ func TestIsEmptyStubMessage(t *testing.T) {
 		{"has media", &Message{MediaID: "m1", Status: "INCOMING_COMPLETE"}, false},
 		{"has reactions", &Message{Reactions: `[{"emoji":"❤️","count":1}]`, Status: "INCOMING_COMPLETE"}, false},
 		{"tombstone/system", &Message{Body: "", Status: "TOMBSTONE_ENCRYPTED"}, false},
-		{"unknown status", &Message{Body: "", Status: ""}, false},
+		{"no status recorded (imports)", &Message{Body: "", Status: ""}, false},
+		{"Google frame without MessageStatus", &Message{Body: "", Status: "unknown"}, true},
+		{"Google STATUS_UNKNOWN", &Message{Body: "", Status: "STATUS_UNKNOWN"}, true},
 		{"nil", nil, false},
 	}
 	for _, tc := range cases {
