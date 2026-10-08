@@ -1,9 +1,0 @@
-macos/
-cmd/
-internal/
-*.db
-session.json
-.build/
-go.mod
-go.sum
-openmessages

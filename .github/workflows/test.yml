@@ -107,18 +107,27 @@ jobs:
         working-directory: site
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The site tests read source files at the release tag and at a pinned
+          # main commit (site/data/facts.js), so they need history and tags.
+          fetch-depth: 0
 
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: npm
-          cache-dependency-path: site/package-lock.json
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.12
 
       - name: Install site dependencies
-        run: npm ci
+        run: bun install --frozen-lockfile
+
+      - name: Check site claims against the code
+        run: bun run test
 
       - name: Build marketing site
-        run: npm run build
+        run: bun run build
 
   macos-build:
     name: macOS App Build
