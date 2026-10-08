@@ -372,9 +372,9 @@ a copy ([testing a change](#testing-a-change)).
 ### Relaunching a dead or hung daemon
 
 A run first skips, logging why, if the `watchdog-disabled` flag exists
-([parking it](#parking-the-watchdog)), if any process's command line contains
-`openmessage pair`, or if `/Applications/OpenMessage.app` is missing. Skipped
-runs neither count nor reset anything. Otherwise it fetches
+([parking it](#parking-the-launchd-watchdog)), if any process's command line
+contains `openmessage pair`, or if `/Applications/OpenMessage.app` is missing.
+Skipped runs neither count nor reset anything. Otherwise it fetches
 `http://127.0.0.1:7007/api/status` with a 5 s timeout. The probe fails when the
 reply doesn't contain the string `"connected"`: connection refused, no answer
 within 5 s, or an error body. Any real status payload passes, even with every
@@ -386,14 +386,15 @@ up.
   so if the wrong build comes up, run the audit in [bundle-id
   shadowing](#bundle-id-shadowing--only-one-app-may-claim-comopenmessageapp).
 - **App process running** (a hung backend, or a backend that died and that the
-  app has stopped restarting): on the 3rd consecutive failure it asks the app
+  app did not restart: it restarts a backend it launched at most 3 times in a
+  row, and never one it reused): on the 3rd consecutive failure it asks the app
   to quit, sends `pkill -x OpenMessage` (SIGTERM) if the app is still running
   10 s later, waits 3 s, and relaunches. It never signals the
-  `openmessage serve` backend itself, and the relaunched app adopts an
-  OpenMessage backend still listening on 7007 instead of starting its own. If
-  a relaunch didn't help, check `lsof -nP -iTCP:7007 -sTCP:LISTEN`. This path
-  first ran on 2026-10-08 at 12:22, after the backend died under a running
-  app.
+  `openmessage serve` backend itself, and the relaunched app adopts its own
+  bundle's `openmessage serve` if one is still listening on 7007 instead of
+  starting another. If a relaunch didn't help, check `lsof -nP -iTCP:7007 -sTCP:LISTEN`.
+  This path first ran on 2026-10-08 at 12:22, after a reused backend died under
+  a running app.
 
 It relaunches at most once per 30 minutes, counted from its own last relaunch
 (manual restarts don't count), to stay clear of Google's reconnect throttling
@@ -438,9 +439,9 @@ in-app supervisors. It alerts on:
   silence alarm: it fired at 24, 30 and 36 h during the 2026-10-06 stall;
 - v2 ingest `quarantined` above 0, summed over accounts (key `quarantine`);
 - Signal `receive_recovery.pending_count >= 5` (key `signal_recovery`);
-- a paired, connected platform whose silence outlasts its own baseline (the
-  rule in [Google Messages silent while
-  "connected"](#google-messages-silent-while-connected-the-phone-stopped-relaying)).
+- a paired, connected platform whose silence outlasts its own baseline, by
+  the rule in
+  [Google Messages silent while "connected"](#google-messages-silent-while-connected-the-phone-stopped-relaying).
   How it is reported depends on the daemon:
   - A daemon with PR #190 publishes `freshness.<platform>.silence`. The app
     posts one `<platform> has gone quiet` notification per silence episode (if
@@ -456,7 +457,9 @@ in-app supervisors. It alerts on:
 
   To see which applies, run
   `curl -s http://127.0.0.1:7007/api/status | jq '.freshness.google.silence'`.
-  `null` means the daemon predates #190, and the watchdog's estimate and
+  With the daemon answering, `null` almost always means it predates #190 (a
+  #190 daemon also omits the block when Google has no recorded activity or its
+  first activity query fails), and then the watchdog's estimate and
   `all_quiet` are the only silence alarms.
 
 ### How alerts repeat
@@ -497,8 +500,9 @@ Consequences worth knowing:
   frames stay in the v2 `inbox` table, marked processed like frames that
   projected fine, and the cause is not stored (issue #161). Their inbox ids
   are only in the backend's `Quarantined ingest frame` log lines.
-- Quarantine alerts recur: they fired on 33 days between 2026-08-01 and 10-08.
-  The first surfaced three Google conversation snapshots quarantined over
+- Quarantine alerts recur: they appeared on 33 days between 2026-08-01 and
+  10-08, many of them 6-hourly repeats of one unchanged count. The first
+  surfaced three Google conversation snapshots quarantined over
   duplicated self-participants (fixed by deduping in `refreshConversation`,
   PR #160). The recent ones have no diagnosed cause.
 
@@ -525,7 +529,8 @@ and probes the live daemon. To exercise the staleness checks against a crafted
 payload, set `OPENMESSAGE_WATCHDOG_PORT` to a stub server that serves it at
 `/api/status`; the body must contain `"connected"`, or the run takes the
 relaunch path. Repeated dry runs of the relaunch path count past the threshold
-(`4/3`, `5/3`, …), because only a real relaunch resets the counter.
+(`4/3`, `5/3`, …), because only a real relaunch or an answered probe resets
+the counter.
 
 ### Reading the backend's os_log
 
@@ -554,10 +559,10 @@ feed them through a worker built with that codec's real decoder. Model it on
 harness in `worker_paths_test.go` uses a fake decoder. The frames that fail
 are the quarantined ones. No ready-made replay test exists.
 
-### Parking the watchdog
+### Parking the launchd watchdog
 
-**Before intentionally quitting the app** (re-pairing, deploying a build, long
-debugging), park the watchdog:
+**Before intentionally keeping the app down for more than a few minutes**
+(re-pairing, a slow deploy, long debugging), park the launchd watchdog:
 
 ```bash
 touch "$HOME/Library/Application Support/OpenMessage/watchdog-disabled"
@@ -573,7 +578,10 @@ has no frames from any platform between 08-20 18:55 and 09-03 16:03. If alerts
 seem to have stopped, `tail` the log first; a parked watchdog says so on every
 run. The watchdog also skips while an `openmessage pair` process is running,
 but that check matches any command line containing the string, so don't rely
-on it for multi-step procedures.
+on it for multi-step procedures. The quick deploy recipe below doesn't need
+parking if the app is back within a few minutes: with no app process, a
+relaunch takes two failed probes 5 minutes apart, and the watchdog skips while
+`/Applications/OpenMessage.app` is missing.
 
 ## Pairing & the "zombie session"
 
@@ -599,8 +607,9 @@ Key facts:
 
 ### Re-pair recipe (the one that works)
 
-1. Park the watchdog ([parking the watchdog](#parking-the-watchdog)); the flag
-   stops its relaunches and its alerts alike. Then
+1. Park the launchd watchdog
+   ([parking it](#parking-the-launchd-watchdog)); the flag stops its
+   relaunches and its alerts alike. Then
    `osascript -e 'quit app "OpenMessage"'`.
 2. Force the native pairing screen by removing `session.json` from **both**
    data dirs (back them up first):
@@ -635,7 +644,7 @@ Key facts:
    to confirm. The Gaia client init can time out once — just retry.
 6. On confirmation the session saves to the app dir; relaunch the app and sends
    work. Wipe the cookie file afterwards. Whatever the outcome, remove the
-   watchdog's `watchdog-disabled` flag.
+   launchd watchdog's `watchdog-disabled` flag.
 
 ### Self-healing (as of #74; requirements fixed 2026-07-20) — try this before any manual cookie surgery
 
