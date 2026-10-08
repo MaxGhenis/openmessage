@@ -167,6 +167,7 @@ type App struct {
 	googleLifecycleMu         sync.RWMutex
 	googleLifecycleNotifier   GoogleLifecycleNotifier
 	googleRepairPaceMu        sync.RWMutex
+	googlePull                googlePullHealth
 	googleRepairPaceCount     func() uint64
 	signalLifecycleMu         sync.RWMutex
 	signalLifecycleNotifier   SignalLifecycleNotifier
@@ -195,6 +196,11 @@ type GoogleStatusSnapshot struct {
 	// heal cycle; a climbing count means cookies are being revoked within
 	// minutes, which the pacing floor is throttling rather than hiding.
 	RepairsPaced uint64 `json:"repairs_paced,omitempty"`
+	// PullHealth reports recent catch-up pulls (conversation listings and
+	// targeted lookups). Its empty_with_local_history flag is set when pulls
+	// return no data while the store holds this account's conversations, the
+	// state push-only health checks can't see. Absent before the first pull.
+	PullHealth *GooglePullHealthSnapshot `json:"pull_health,omitempty"`
 }
 
 // googleRepairThreshold is how many consecutive failed Google sends (with no
@@ -759,6 +765,7 @@ func (a *App) GoogleStatus() GoogleStatusSnapshot {
 		AuthExpired:     a.googleAuthExpired.Load(),
 		PhoneResponding: a.GooglePhoneResponding(),
 		RepairsPaced:    a.GoogleRepairsPaced(),
+		PullHealth:      a.GooglePullHealth(),
 	}
 }
 

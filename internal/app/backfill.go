@@ -59,14 +59,15 @@ func (a *App) Backfill() error {
 	}
 	defer a.endBackfill()
 
-	cli := a.GetClient()
-	if cli == nil {
+	gm := a.getGMClient()
+	if gm == nil {
 		return fmt.Errorf("client not connected")
 	}
 
 	a.Logger.Info().Msg("Starting backfill of conversations and messages")
 
-	resp, err := cli.GM.ListConversations(100, gmproto.ListConversationsRequest_INBOX)
+	resp, err := gm.ListConversationsWithCursor(100, gmproto.ListConversationsRequest_INBOX, nil)
+	a.recordGoogleListPull("backfill", gmproto.ListConversationsRequest_INBOX, true, resp, err)
 	if err != nil {
 		a.HandleGoogleAuthExpiredError(err)
 		return fmt.Errorf("list conversations: %w", err)
@@ -81,7 +82,7 @@ func (a *App) Backfill() error {
 			continue
 		}
 
-		msgResp, err := cli.GM.FetchMessages(conv.GetConversationID(), 20, nil)
+		msgResp, err := gm.FetchMessages(conv.GetConversationID(), 20, nil)
 		if err != nil {
 			if a.HandleGoogleAuthExpiredError(err) {
 				return fmt.Errorf("fetch messages %s: %w", conv.GetConversationID(), err)
@@ -208,6 +209,7 @@ func (a *App) paginateFolder(gm GMClient, folder gmproto.ListConversationsReques
 			return found, true
 		}
 		resp, err := gm.ListConversationsWithCursor(100, folder, cursor)
+		a.recordGoogleListPull("deep", folder, cursor == nil, resp, err)
 		if err != nil {
 			if a.abortBackfillForGoogleAuthError(err, "folders", fmt.Sprintf("list %s: %v", folder.String(), err)) {
 				return found, true
@@ -409,6 +411,7 @@ func (a *App) BackfillConversationByPhone(phone string) error {
 	convResp, err := gm.GetOrCreateConversation(&gmproto.GetOrCreateConversationRequest{
 		Numbers: NewContactNumbers([]string{phone}),
 	})
+	a.recordGoogleLookupPull("targeted", convResp.GetConversation(), err)
 	if err != nil {
 		a.HandleGoogleAuthExpiredError(err)
 		return fmt.Errorf("get or create conversation: %w", err)
@@ -451,6 +454,7 @@ func (a *App) reconcileRecentConversations(reason string) {
 		Msg("Reconciling recent conversations")
 
 	resp, err := gm.ListConversationsWithCursor(recentReconcileConversationLimit, gmproto.ListConversationsRequest_INBOX, nil)
+	a.recordGoogleListPull("reconcile:"+reason, gmproto.ListConversationsRequest_INBOX, true, resp, err)
 	if err != nil {
 		if a.HandleGoogleAuthExpiredError(err) {
 			a.Logger.Warn().Err(err).Str("reason", reason).Msg("Recent reconcile aborted because Google auth expired")

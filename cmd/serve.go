@@ -592,6 +592,8 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 		}
 		reads = v2read.New(stack.Store)
 	}
+	// Pull health compares empty Google pulls against what readers can see.
+	a.SetGoogleConversationCounter(func() (int, error) { return reads.ConversationCount("sms") })
 
 	// Create MCP server
 	mcpSrv := mcpserver.NewMCPServer(

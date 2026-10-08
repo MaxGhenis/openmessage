@@ -434,19 +434,75 @@ Without it, a single transient network blip during a scheduled token refresh
 permanently killed the session.
 
 The replacement in `go.mod` pins fork commit
-[`0e43542dfa0e`](https://github.com/MaxGhenis/gmessages/commit/0e43542dfa0e0b97e410f185a5842e8740106099).
+[`75d7eba8a868`](https://github.com/MaxGhenis/gmessages/commit/75d7eba8a868f9f359134aa1db4bd0244cb0cc23).
 It is upstream `mautrix/gmessages` base
 [`3433cc07d5ea`](https://github.com/mautrix/gmessages/commit/3433cc07d5ea9522309adad3a8c92ed5b08dc11d),
-which contains the auth-refresh retry, plus exactly one carried patch:
-`Add ListConversationsWithCursor for paginated conversation listing`. That
-method is required by OpenMessage's backfill and reconciliation paths.
+which contains the auth-refresh retry, plus two carried patches, oldest first:
+
+1. `Add ListConversationsWithCursor for paginated conversation listing`. That
+   method is required by OpenMessage's backfill and reconciliation paths.
+2. `libgm: don't complete data requests with payload-less frames`. Read
+   actions (list/get conversations, messages, contacts, thumbnails) whose
+   answer arrives without the encrypted payload now wait up to 10 s for the
+   real response and then fail with `libgm.ErrNoResponsePayload` instead of
+   returning an empty success. See "Pulls that return nothing" below.
+   Upstream still has the old behaviour.
 
 **Keep the fork rebased on upstream.** The weekly
-`gmessages-fork-drift.yml` workflow records the base and patch set and fails as
-soon as upstream `main` advances. When rebasing, replay the single carried
-patch, verify the auth-refresh retry is still present, and update the fork pin
-and recorded SHAs together. The durable architectural fix (move SMS/RCS onto
-an Android companion) is issue #75.
+`gmessages-fork-drift.yml` workflow records the base and patch set (count and
+subjects) and fails as soon as upstream `main` advances. When rebasing, replay
+both carried patches, verify the auth-refresh retry is still present, and
+update the fork pin, `EXPECTED_PATCHES`, and recorded SHAs together. The pinned
+commit must be on the fork's `main`. `TestGMessagesForkRejectsPayloadlessResponses`
+fails if a rebase drops the second patch. The durable architectural fix (move
+SMS/RCS onto an Android companion) is issue #75.
+
+### Pulls that return nothing (phone switched to Google-account pairing)
+
+**Symptom (2026-10-06 to 10-08):** push works (new messages arrive,
+`phone_responding: true`), but every pull comes back empty. Startup backfill
+logs `Fetched conversations count=0`, deep backfill reports
+`conversations_found=0, errors=0`, and `GetOrCreateConversation` /
+`GetConversation` return no conversation, so sends fail with "transport
+returned no conversation". The account had ~1,040 Google conversations.
+
+**Cause, observed on the wire:** the phone had switched to Google-account
+(Gaia) pairing while OpenMessage's session is a QR (Bugle) pairing. The phone
+answers each data request (and each liveness ping) with exactly one frame of
+message type `GAIA_1` that carries only the field-11 account container (the
+Google account address) and no field-8 response payload. No real response
+follows. libgm used to hand that frame to the waiting request as a
+pre-allocated, empty response with a nil error. The same container arrives as
+`GET_UPDATES` frames, which libgm logs as `Got unknown event type` with
+`decrypted_data=EhMKE…` and turns into a synthetic `events.AccountChange`
+(upstream mautrix-gmessages reports this state as "You switched to Google
+account pairing, please log in to continue using SMS/RCS").
+
+**What you see now:**
+
+- libgm logs `Phone answered a pending request without a response payload`
+  and, 10 s later, `Phone never sent a response payload; failing the request`.
+  Both carry a `frame` object with the envelope shape and no content
+  (`message_type`, `f5`/`f8`/`f11` presence and lengths, `decoded_size`,
+  `unknown_len`, `account_switch`). Answers that arrive after their request
+  already finished are logged as `Received response with no pending request`.
+- Pulls fail with an error that matches `libgm.ErrNoResponsePayload`; deep
+  backfill counts them in `errors`.
+- `/api/status` → `google.pull_health` records the last pull (`last_trigger`,
+  `last_outcome` = `ok|empty|no_payload|error`, `last_error`) and raises
+  `empty_with_local_history: true` when the latest INBOX listing or targeted
+  lookup returned no data while the store held at least `threshold` (10)
+  Google conversations. `account_switch: true` means the phone sent the
+  account-switch notice. The next pull that returns data clears it.
+
+```bash
+curl -s http://127.0.0.1:7007/api/status | jq '.google.pull_health'
+```
+
+**Fix:** not a reconnect, a restart, or a cookie refresh (none change the
+phone's pairing mode). Either re-link OpenMessage with Google-account pairing
+(cookie method, re-pair recipe above), or switch the phone back to QR/device
+pairing in Google Messages → Device pairing. Both are the user's call.
 
 ### Don't over-reconnect
 
