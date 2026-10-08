@@ -1082,12 +1082,15 @@ session's browser id>]` (43 = GET_CONVERSATION) in step with every attempt.
 
 What is happening: the phone has Google-account ("Gaia") pairing turned on and
 answers every request from the QR-paired (Bugle) session without data while
-still pushing inbound updates. libgm hands back an empty conversation with no
-error (inferred from the phone log and libgm's code; the reply bytes were not
-captured), and turns the account container the phone sends at startup into
-`events.AccountChange{IsFake: true}`. It is not a stale or re-keyed thread id
-(that case is "Google thread ids are device-local" above): the same remote id
-keeps receiving.
+still pushing inbound updates. On 2026-10-08 an instrumented build traced the
+conversation-list, contacts and activity requests: each was answered by a
+single notice frame carrying only an account container (the Google account's
+address) and no response payload, and libgm completed the request with that
+empty reply and no error. A conversation lookup therefore comes back empty
+(inferred; the GET_CONVERSATION reply itself was not traced). libgm also turns
+that account container into `events.AccountChange{IsFake: true}`. It is not a
+stale or re-keyed thread id (that case is "Google thread ids are
+device-local" above): the same remote id keeps receiving.
 
 **Status field.** OpenMessage records that event for a QR-paired session:
 
@@ -1125,17 +1128,32 @@ an `error_detail` like `retry budget exhausted after 6 attempts; last failure
 transient [google_conversation_not_found]: …`. Not-connected failures
 (transient, fingerprint ending `_not_connected`) and `credentials_expired`
 failures are exempt: they refund the attempt and keep the 5 s cadence, so an
-offline platform or a cookie self-heal never exhausts a send. Outcomes that may
-have reached the transport (`uncertain`) never count and never become
-rejected. A row already at or over the cap is rejected before any transport
-call, so an old row with a huge `attempt_count` can never fire late. A
-`conversation_moved` failure rebinds the conversation to the new remote id and
-retries at once (still consuming an attempt). Rejected rows with class
-`retry_exhausted` or `reauth_required` stay in `GET /api/v1/outbox` for 24 h,
-until sent again, with `retry_exhausted` and `error_detail`. The tray labels
-them "Not sent" and offers **Send again**, which creates a new message (nothing
-was sent the first time). MCP sends report `NOT SENT: gave up after N attempts
-(…)`, and the CLI prints the reason.
+offline platform or a cookie self-heal never exhausts a send. A failure that
+may have reached the transport never consumes an attempt, so the budget never
+rejects it; a row that ends `uncertain` is never retried automatically and
+cannot be canceled (HTTP 409), only sent again deliberately. A row already at
+or over the cap is rejected before any transport call, so an old row with a
+huge `attempt_count` can never fire late. A `conversation_moved` failure
+rebinds the conversation to the new remote id and retries at once (still
+consuming an attempt). Rejected rows with class `retry_exhausted` or
+`reauth_required` stay in `GET /api/v1/outbox` for 24 h, until sent again,
+with `retry_exhausted` and `error_detail`. The tray labels them "Not sent" and
+offers **Send again**, which creates a new message (nothing was sent the first
+time). MCP sends report `NOT SENT: gave up after N attempts (…)` or, for a
+`reauth_required` refusal, `NOT SENT` with the re-link guidance; the CLI prints
+the reason.
+
+**A request the phone never answers.** The pinned libgm waits for a reply with
+no deadline, and the dispatcher sends one row at a time. On 2026-10-08 one
+unanswered conversation lookup left the stuck row in `dispatching` for hours
+and held up every platform's outbox; cancel is refused for a `dispatching` row
+(HTTP 409). After the app restarted, lease recovery moved it to `uncertain`
+(the transport had been called), so it ended as "uncertain, will not send"
+even though nothing was sent. The Google adapter now stops waiting before the
+dispatcher's 30 s lease runs out: a conversation lookup that times out
+(`google_conversation_get_timeout`) or a media upload that times out is a
+budgeted not-dispatched failure, and a SendMessage or reaction that times out
+is `uncertain`, because the phone may have acted on it.
 
 ## WhatsApp linking (QR and phone-number code)
 

@@ -288,10 +288,14 @@ func v2DeliveryText(delivery messaging.Delivery) string {
 // Google-account pairing while this session is QR-paired.
 const googleAccountPairingSwitchedFingerprint = "google_account_pairing_switched"
 
-// v2RejectedText explains a rejected delivery. The two cases an agent must
-// not misread get their own wording: the phone refusing a QR-paired session
-// (only a re-link fixes it, and re-pairing is the user's call) and a send the
-// dispatcher gave up on after its retry budget (never sent, never retried).
+// v2RejectedText explains a rejected delivery. The cases an agent must not
+// misread get their own wording: the phone refusing a QR-paired session (only
+// a re-link fixes it, and re-pairing is the user's call), a send the
+// dispatcher gave up on after its retry budget (never sent, never retried),
+// and any other reauth_required refusal. The last one is also the fallback
+// for the account switch when the detail does not carry its fingerprint: the
+// dispatcher stores a terminal failure's error text, which need not name it.
+// These are the rejections the web tray lists as "Not sent".
 func v2RejectedText(delivery messaging.Delivery) string {
 	detail := ""
 	if delivery.ErrorDetail != "" {
@@ -311,6 +315,11 @@ func v2RejectedText(delivery messaging.Delivery) string {
 		return fmt.Sprintf(
 			"NOT SENT: gave up after %s%s. Nothing was sent and it will not be retried. Send it again only if it is still wanted. Outbox %s.",
 			attempts, detail, delivery.OutboxID,
+		)
+	case delivery.ErrorClass == string(bridge.FailureReauthRequired):
+		return fmt.Sprintf(
+			"NOT SENT: the account must be re-linked before it can send%s. Nothing was sent and it will not be retried. Re-linking is the user's call; do not re-pair or reconnect on your own. Outbox %s.",
+			detail, delivery.OutboxID,
 		)
 	default:
 		text := fmt.Sprintf("Message delivery was rejected (outbox %s, error class %s). The app will not retry it; sending again creates a new message and may fail the same way.", delivery.OutboxID, firstNonEmpty(delivery.ErrorClass, "unknown"))

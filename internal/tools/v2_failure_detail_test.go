@@ -121,40 +121,73 @@ func TestV2DeliveryTextShowsTheLastFailure(t *testing.T) {
 	}
 }
 
-// TestV2DeliveryTextNotSentOnlyForRejected is exhaustive over states x
-// RetryExhausted x detail kinds: "NOT SENT" appears iff the delivery is
-// rejected and either gave up on its budget or was refused for the account
-// switch; "gave up" iff rejected, exhausted and not the account switch. In
-// particular an uncertain or retrying send is never described as not sent.
+// TestV2DeliveryTextNotSentOnlyForRejected is exhaustive over states x error
+// class x RetryExhausted x detail kinds x attempt counts: "NOT SENT" appears
+// iff the delivery is rejected and it gave up on its budget, was refused for
+// the account switch, or is any other reauth_required refusal (the rejections
+// the web tray lists as "Not sent"); "gave up" iff rejected, exhausted and
+// not the account switch; the re-link wording iff rejected and the account
+// switch or reauth_required. In particular an uncertain or retrying send is
+// never described as not sent, whatever its class or detail.
 func TestV2DeliveryTextNotSentOnlyForRejected(t *testing.T) {
 	details := []string{"", exhaustedDetail, switchedDetail, "send_text: transient: timeout"}
+	classes := []string{"", "retry_exhausted", "reauth_required", "transient", "misconfigured", "upgrade_required"}
 	for _, state := range allOutboxStates {
-		for _, exhausted := range []bool{false, true} {
-			for _, detail := range details {
-				for _, attempts := range []int64{0, 1, 6, 100} {
-					delivery := messaging.Delivery{
-						OutboxID:       "outbox-table",
-						State:          state,
-						ErrorDetail:    detail,
-						AttemptCount:   attempts,
-						RetryExhausted: exhausted,
-					}
-					text := v2DeliveryText(delivery)
-					switched := strings.Contains(detail, googleAccountPairingSwitchedFingerprint)
-					wantNotSent := state == messaging.OutboxRejected && (exhausted || switched)
-					if got := strings.HasPrefix(text, "NOT SENT"); got != wantNotSent {
-						t.Fatalf("%+v: NOT SENT = %v, want %v; text %q", delivery, got, wantNotSent, text)
-					}
-					wantGaveUp := state == messaging.OutboxRejected && exhausted && !switched
-					if got := strings.Contains(text, "gave up after"); got != wantGaveUp {
-						t.Fatalf("%+v: gave up = %v, want %v; text %q", delivery, got, wantGaveUp, text)
-					}
-					if state == messaging.OutboxUncertain && !strings.Contains(text, "may have accepted it") {
-						t.Fatalf("uncertain text lost its may-have-sent warning: %q", text)
+		for _, class := range classes {
+			for _, exhausted := range []bool{false, true} {
+				for _, detail := range details {
+					for _, attempts := range []int64{0, 1, 6, 100} {
+						delivery := messaging.Delivery{
+							OutboxID:       "outbox-table",
+							State:          state,
+							ErrorClass:     class,
+							ErrorDetail:    detail,
+							AttemptCount:   attempts,
+							RetryExhausted: exhausted,
+						}
+						text := v2DeliveryText(delivery)
+						rejected := state == messaging.OutboxRejected
+						switched := strings.Contains(detail, googleAccountPairingSwitchedFingerprint)
+						reauth := class == "reauth_required"
+						wantNotSent := rejected && (exhausted || switched || reauth)
+						if got := strings.HasPrefix(text, "NOT SENT"); got != wantNotSent {
+							t.Fatalf("%+v: NOT SENT = %v, want %v; text %q", delivery, got, wantNotSent, text)
+						}
+						wantGaveUp := rejected && exhausted && !switched
+						if got := strings.Contains(text, "gave up after"); got != wantGaveUp {
+							t.Fatalf("%+v: gave up = %v, want %v; text %q", delivery, got, wantGaveUp, text)
+						}
+						wantRelink := rejected && (switched || (reauth && !exhausted))
+						if got := strings.Contains(text, "do not re-pair or reconnect on your own"); got != wantRelink {
+							t.Fatalf("%+v: re-link guidance = %v, want %v; text %q", delivery, got, wantRelink, text)
+						}
+						if state == messaging.OutboxUncertain && !strings.Contains(text, "may have accepted it") {
+							t.Fatalf("uncertain text lost its may-have-sent warning: %q", text)
+						}
 					}
 				}
 			}
 		}
+	}
+}
+
+// TestV2DeliveryTextReauthWithoutFingerprintStillNamesTheRelink covers the
+// account switch when the stored detail does not carry the fingerprint (a
+// terminal failure's detail is its error text, which need not include it):
+// the agent still reads NOT SENT, the re-link, and that re-pairing is the
+// user's call.
+func TestV2DeliveryTextReauthWithoutFingerprintStillNamesTheRelink(t *testing.T) {
+	const detail = "send_text: reauth_required: the phone answers this QR-paired session without data"
+	text := v2DeliveryText(messaging.Delivery{
+		OutboxID:    "outbox-reauth",
+		State:       messaging.OutboxRejected,
+		ErrorClass:  "reauth_required",
+		ErrorCode:   "send_text",
+		ErrorDetail: detail,
+	})
+	want := "NOT SENT: the account must be re-linked before it can send (" + detail + "). Nothing was sent and it will not be retried. Re-linking is the user's call; do not re-pair or reconnect on your own. Outbox outbox-reauth."
+	if text != want {
+		t.Fatalf("reauth text = %q\nwant %q", text, want)
 	}
 }
 
@@ -260,6 +293,20 @@ func TestDaemonSendReportsFailureDetail(t *testing.T) {
 			wantSettled:  true,
 			wantAttempts: 1,
 			wantText:     []string{"NOT SENT", "Google-account pairing", "do not re-pair"},
+		},
+		{
+			name: "reauth required without the fingerprint",
+			delivery: map[string]any{
+				"outbox_id":     "out-reauth",
+				"state":         "rejected",
+				"error_class":   "reauth_required",
+				"error_code":    "send_text",
+				"error_detail":  "send_text: reauth_required: session refused",
+				"attempt_count": 1,
+			},
+			wantSettled:  true,
+			wantAttempts: 1,
+			wantText:     []string{"NOT SENT: the account must be re-linked", "do not re-pair"},
 		},
 		{
 			name: "retrying with a reason",

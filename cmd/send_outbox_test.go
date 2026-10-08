@@ -89,7 +89,15 @@ func TestRunSendRejectedReturnsTheDaemonsReason(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), detail) {
 		t.Fatalf("error = %v, want the daemon's reason", err)
 	}
-	if !strings.Contains(output.String(), "reason: "+detail) {
-		t.Fatalf("output:\n%s", output.String())
+	for _, line := range []string{
+		"not sent: the account must be re-linked before it can send; re-linking is the user's call",
+		"reason: " + detail,
+	} {
+		if !strings.Contains(output.String(), line+"\n") {
+			t.Fatalf("output missing %q:\n%s", line, output.String())
+		}
+	}
+	if strings.Contains(output.String(), "gave up") {
+		t.Fatalf("a reauth refusal is not a spent retry budget:\n%s", output.String())
 	}
 }

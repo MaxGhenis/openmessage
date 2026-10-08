@@ -211,12 +211,17 @@ func writeCLIDelivery(output io.Writer, delivery outboxDelivery, key string, sch
 	case "store_failed":
 		fmt.Fprintln(output, "transport accepted the message; the local record is being repaired automatically. Do not resend.")
 	case "rejected":
-		if delivery.RetryExhausted {
+		// The two rejections the web tray lists as "Not sent" get a plain
+		// first line, matching the MCP wording.
+		switch {
+		case delivery.RetryExhausted:
 			attempts := "exhausting its retry budget"
 			if delivery.AttemptCount > 0 {
 				attempts = fmt.Sprintf("%d attempts", delivery.AttemptCount)
 			}
 			fmt.Fprintf(output, "not sent: the app gave up after %s; nothing was sent\n", attempts)
+		case delivery.ErrorClass == "reauth_required":
+			fmt.Fprintln(output, "not sent: the account must be re-linked before it can send; re-linking is the user's call")
 		}
 		fmt.Fprintln(output, "delivery was rejected; the app will not retry it")
 		if delivery.ErrorDetail != "" {
