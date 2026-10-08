@@ -1061,6 +1061,11 @@ func (r *OutboxRepository) ListPending(
 	if p.Limit <= 0 {
 		return nil, fmt.Errorf("list pending outbox items: limit must be positive")
 	}
+	nowMS, err := r.nowMS("list pending outbox items")
+	if err != nil {
+		return nil, err
+	}
+	rejectedClause, args := trayRejectedClause(nowMS)
 
 	query := `
 		SELECT ` + prefixedOutboxColumns("o") + `,
@@ -1072,8 +1077,8 @@ func (r *OutboxRepository) ListPending(
 		LEFT JOIN messages m ON m.message_id = o.local_message_id
 		LEFT JOIN outbox_attachments oa ON oa.outbox_id = o.outbox_id AND oa.ordinal = 0
 		LEFT JOIN outbox_reactions orx ON orx.outbox_id = o.outbox_id
-		WHERE o.state IN ('queued','dispatching','not_dispatched','uncertain','store_failed')`
-	args := make([]any, 0, 3)
+		WHERE (o.state IN ('queued','dispatching','not_dispatched','uncertain','store_failed')
+			OR ` + rejectedClause + `)`
 	if p.AccountID != "" {
 		query += ` AND o.account_id = ?`
 		args = append(args, p.AccountID)
