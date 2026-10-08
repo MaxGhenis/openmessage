@@ -34,6 +34,18 @@ type Lifecycle interface {
 	Start(ctx context.Context, req StartRequest, sink ConnectionSink) (Run, error)
 }
 
+// IngressErrorRecorder is an optional ConnectionSink extension. An adapter
+// that captured a frame but could not hand it to the sink (an encode fault, a
+// failed durable append, a panic in its ingest tee) reports the loss here so it
+// is counted, not only logged. Adapters must not report ErrStaleGeneration:
+// that rejection is the generation fence retiring an old connection, not an
+// ingest fault. Any wrapper between an adapter and the durable sink must
+// forward this method, or the adapter's type assertion fails on the wrapper
+// and the count is lost.
+type IngressErrorRecorder interface {
+	RecordIngressError(accountID string)
+}
+
 type Run interface {
 	Ready() <-chan struct{} // closes only when usable for sends
 	Done() <-chan error     // one terminal result, then close

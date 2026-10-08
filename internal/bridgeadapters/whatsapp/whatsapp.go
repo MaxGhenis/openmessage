@@ -754,10 +754,6 @@ func (r *run) admitCallback() bool {
 	return true
 }
 
-type ingressErrorRecorder interface {
-	RecordIngressError(accountID string)
-}
-
 func (r *run) handleIngress(frame whatsapplive.IngressFrame) {
 	if !r.admitCallback() {
 		return
@@ -779,7 +775,7 @@ func (r *run) handleIngress(frame whatsapplive.IngressFrame) {
 	if err == nil || errors.Is(err, bridge.ErrStaleGeneration) {
 		return
 	}
-	if recorder, ok := r.sink.(ingressErrorRecorder); ok {
+	if recorder, ok := r.sink.(bridge.IngressErrorRecorder); ok {
 		recorder.RecordIngressError(r.request.AccountID)
 	}
 	if r.adapter.logIngressError != nil {
