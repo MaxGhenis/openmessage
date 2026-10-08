@@ -26,10 +26,17 @@ type EchoObserver interface {
 
 // DecoderRegistration binds a durable codec to both its pure decoder and the
 // platform needed for shared key derivation.
+//
+// History marks a codec whose frames were fetched on request (catch-up
+// replies) rather than received live. History frames only fill gaps: they
+// create a conversation only when its remote ID is unbound, insert a message
+// only when v2 lacks it, apply reactions only to messages they inserted, and
+// never update an existing row. History is supported for Google only.
 type DecoderRegistration struct {
 	Codec    string
 	Platform bridge.Platform
 	Decoder  bridge.Decoder
+	History  bool
 }
 
 // WorkerConfig configures the single-goroutine projection worker.
@@ -49,6 +56,7 @@ type WorkerConfig struct {
 type registeredDecoder struct {
 	platform bridge.Platform
 	decoder  bridge.Decoder
+	history  bool
 }
 
 type workItem struct {
@@ -125,9 +133,17 @@ func NewWorker(config WorkerConfig) (*Worker, error) {
 		if _, exists := decoders[codec]; exists {
 			return nil, fmt.Errorf("create ingest worker: duplicate decoder codec %q", codec)
 		}
+		if registration.History && registration.Platform != bridge.PlatformGoogle {
+			return nil, fmt.Errorf(
+				"create ingest worker: history codec %q is only supported for %q",
+				codec,
+				bridge.PlatformGoogle,
+			)
+		}
 		decoders[codec] = registeredDecoder{
 			platform: registration.Platform,
 			decoder:  registration.Decoder,
+			history:  registration.History,
 		}
 	}
 
@@ -360,7 +376,7 @@ func (w *Worker) processRecordResult(
 		}
 	}
 	w.counters.account(record.AccountID).decodedEvents.Add(uint64(len(events)))
-	changed, err := w.applyEvents(ctx, registration.platform, record, inboxID, events)
+	changed, err := w.applyEvents(ctx, registration.platform, registration.history, record, inboxID, events)
 	return changed, classifyApplyError(err)
 }
 
@@ -428,6 +444,7 @@ func validateDecodedEvent(event bridge.Event) error {
 func (w *Worker) applyEvents(
 	ctx context.Context,
 	platform bridge.Platform,
+	history bool,
 	record bridge.RawIngressRecord,
 	inboxID string,
 	events []bridge.Event,
@@ -440,8 +457,24 @@ func (w *Worker) applyEvents(
 		if event.Kind != bridge.EventConversation {
 			continue
 		}
+		if history {
+			// A fetched snapshot creates a thread v2 lacks; it never rewrites a
+			// bound thread's title or roster (the live channel owns updates, and
+			// re-applying snapshots on every reconcile would re-run the #176
+			// roster rebinding against the same data over and over).
+			_, _, err := w.existingConversation(accountID, platform, event.Conversation.RemoteConversationID)
+			if err == nil {
+				continue
+			}
+			if !errors.Is(err, sqlite.ErrNotFound) {
+				return false, err
+			}
+		}
 		if _, err := w.refreshConversation(accountID, platform, *event.Conversation); err != nil {
 			return false, err
+		}
+		if history {
+			w.counters.account(accountID).historyConversations.Add(1)
 		}
 		changed = true
 	}
@@ -451,6 +484,18 @@ func (w *Worker) applyEvents(
 	for _, event := range events {
 		if event.Kind != bridge.EventMessage {
 			continue
+		}
+		if history {
+			exists, err := w.historyMessageExists(ctx, accountID, platform, *event.Message)
+			if err != nil {
+				return false, err
+			}
+			if exists {
+				// Skip before projection so a re-fetch has no side effects: no
+				// identity rewrite, no #176 reroute, no echo reconcile.
+				w.counters.account(accountID).historyExisting.Add(1)
+				continue
+			}
 		}
 		projection, duplicateOf, err := w.messageProjection(
 			ctx,
@@ -464,6 +509,12 @@ func (w *Worker) applyEvents(
 			return false, err
 		}
 		if duplicateOf != nil {
+			if history {
+				// History never refreshes an existing row, including its
+				// reactions; the stored copy stays as the live channel left it.
+				w.counters.account(accountID).historyExisting.Add(1)
+				continue
+			}
 			// A re-delivery under a re-keyed remote ID: the message already
 			// exists in its thread under the old ID. Do not project a second
 			// row, but let the frame's reaction snapshot refresh the original.
@@ -484,7 +535,19 @@ func (w *Worker) applyEvents(
 			}
 			continue
 		}
-		if messageCount == 0 {
+		if history {
+			inserted, err := w.messages.InsertHistoricalMessage(ctx, projection)
+			if err != nil {
+				return false, err
+			}
+			if !inserted {
+				// Another row already holds this message's primary or natural
+				// key (for example under a thread a repair moved it to).
+				w.counters.account(accountID).historyExisting.Add(1)
+				continue
+			}
+			w.counters.account(accountID).historyImported.Add(1)
+		} else if messageCount == 0 {
 			if err := w.messages.ProjectMessage(ctx, projection); err != nil {
 				return false, err
 			}
@@ -598,6 +661,12 @@ func (w *Worker) applyEvents(
 			)
 			snapshot, exists := googleSnapshots[key]
 			if strings.TrimSpace(reaction.TargetRemoteMessageID) == "" || !exists {
+				if history {
+					// The target was skipped because v2 already had it (or the
+					// reaction is a tapback with no resolvable target); either
+					// way history has nothing to apply and nothing is lost.
+					continue
+				}
 				w.countOrphanReaction(accountID, inboxID, reaction)
 				continue
 			}
@@ -921,6 +990,45 @@ func (w *Worker) existingConversation(
 	}
 	conversation, err := w.store.GetConversationByRemote(accountID, remoteID)
 	return conversation, remoteID, err
+}
+
+// historyMessageExists reports whether v2 already holds the message a history
+// frame carries: under the message ID derived from its wire identity (wherever
+// a rebind or repair has since moved that row), or under its remote ID in the
+// thread its wire conversation ID is bound to (an outbox echo re-keys a local
+// send row to the remote ID while keeping its own message ID). A malformed
+// event reports false so messageProjection rejects it exactly as it would a
+// live frame.
+func (w *Worker) historyMessageExists(
+	ctx context.Context,
+	accountID string,
+	platform bridge.Platform,
+	event bridge.MessageEvent,
+) (bool, error) {
+	remoteMessageID := strings.TrimSpace(event.RemoteMessageID)
+	remoteConversationID := v2keys.NormalizeRemoteConversationID(string(platform), event.RemoteConversationID)
+	if remoteMessageID == "" || strings.TrimSpace(remoteConversationID) == "" {
+		return false, nil
+	}
+	derivedID := v2keys.DeriveID("message", accountID, remoteConversationID+"\x1f"+remoteMessageID)
+	if _, err := w.messages.GetMessage(ctx, derivedID); err == nil {
+		return true, nil
+	} else if !errors.Is(err, sqlite.ErrNotFound) {
+		return false, err
+	}
+	conversation, _, err := w.existingConversation(accountID, platform, event.RemoteConversationID)
+	if errors.Is(err, sqlite.ErrNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if _, err := w.messages.GetMessageByRemote(ctx, accountID, conversation.ConversationID, remoteMessageID); err == nil {
+		return true, nil
+	} else if !errors.Is(err, sqlite.ErrNotFound) {
+		return false, err
+	}
+	return false, nil
 }
 
 func (w *Worker) resolveIdentity(

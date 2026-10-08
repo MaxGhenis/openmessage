@@ -251,6 +251,12 @@ func TestLiveIngestVerification(t *testing.T) {
 				Platform: bridge.PlatformGoogle,
 				Decoder:  ingest.NewGoogleDecoder(counters),
 			},
+			{
+				Codec:    ingest.GoogleHistoryCodec,
+				Platform: bridge.PlatformGoogle,
+				Decoder:  ingest.NewGoogleDecoder(counters),
+				History:  true,
+			},
 			ingest.NewWhatsAppDecoderRegistration(),
 			{
 				Codec:    ingest.SignalJSONRPCCodec,
