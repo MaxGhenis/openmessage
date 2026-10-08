@@ -271,6 +271,32 @@ func TestLegacySendText(t *testing.T) {
 	}
 }
 
+func TestLegacySendTextFromSIMCarriesSelectorAndLabel(t *testing.T) {
+	var got map[string]any
+	client := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&got)
+		json.NewEncoder(w).Encode(map[string]any{"message_id": "m2", "status": "SUCCESS", "success": true, "sim": "SIM 2 (+15550100001)"})
+	}))
+	result, err := client.LegacySendTextFromSIM(context.Background(), "conv", "hi", "", "key", "2")
+	if err != nil {
+		t.Fatalf("LegacySendTextFromSIM: %v", err)
+	}
+	if got["sim"] != "2" {
+		t.Fatalf("request sim = %v, want \"2\"", got["sim"])
+	}
+	if result.SIM != "SIM 2 (+15550100001)" || result.MessageID != "m2" {
+		t.Fatalf("result = %+v", result)
+	}
+	// Plain LegacySendText must not send a sim field at all.
+	got = nil
+	if _, err := client.LegacySendText(context.Background(), "conv", "hi", "", "key"); err != nil {
+		t.Fatal(err)
+	}
+	if _, present := got["sim"]; present {
+		t.Fatalf("LegacySendText sent sim=%v", got["sim"])
+	}
+}
+
 func TestDefaultBaseURLHonorsPortEnv(t *testing.T) {
 	t.Setenv("OPENMESSAGES_PORT", "7100")
 	if got := DefaultBaseURL(); got != "http://127.0.0.1:7100" {

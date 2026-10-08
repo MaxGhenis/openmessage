@@ -644,46 +644,7 @@ func reconcileBatchReachedLocalBoundary(msgs []*gmproto.Message, localLatestTS i
 }
 
 func (a *App) storeConversation(conv *gmproto.Conversation) error {
-	participantsJSON := "[]"
-	var avatarCandidates []db.ContactAvatarCandidate
-	if ps := conv.GetParticipants(); len(ps) > 0 {
-		type pInfo struct {
-			Name      string `json:"name"`
-			Number    string `json:"number"`
-			IsMe      bool   `json:"is_me,omitempty"`
-			ID        string `json:"id,omitempty"` // participant ID, used to resolve reaction actors to names
-			ContactID string `json:"contact_id,omitempty"`
-		}
-		var infos []pInfo
-		for _, p := range ps {
-			info := pInfo{
-				Name:      p.GetFullName(),
-				IsMe:      p.GetIsMe(),
-				ContactID: p.GetContactID(),
-			}
-			if id := p.GetID(); id != nil {
-				info.Number = id.GetNumber()
-				info.ID = id.GetParticipantID()
-			}
-			if info.Number == "" {
-				info.Number = p.GetFormattedNumber()
-			}
-			if !info.IsMe {
-				avatarCandidates = append(avatarCandidates, db.ContactAvatarCandidate{
-					SourcePlatform: "sms",
-					ParticipantID:  info.ID,
-					ContactID:      info.ContactID,
-					PhoneNumber:    info.Number,
-					DisplayName:    info.Name,
-					Source:         "backfill",
-				})
-			}
-			infos = append(infos, info)
-		}
-		if b, err := json.Marshal(infos); err == nil {
-			participantsJSON = string(b)
-		}
-	}
+	participantsJSON, avatarCandidates := client.BuildParticipantsJSON(conv, "backfill")
 
 	unread := 0
 	if conv.GetUnread() {

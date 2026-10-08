@@ -11,8 +11,8 @@ import (
 )
 
 var (
-	sendTextToConversation = func(a *app.App, conversationID, body string) (conversationSummary, messageSummary, error) {
-		conv, msg, err := a.SendTextToConversation(conversationID, body)
+	sendTextToConversation = func(a *app.App, conversationID, body, simSelector string) (conversationSummary, messageSummary, error) {
+		conv, msg, err := a.SendTextToConversationFromSIM(conversationID, body, simSelector)
 		if err != nil {
 			return conversationSummary{}, messageSummary{}, err
 		}
@@ -26,6 +26,7 @@ func sendToConversationTool(v2Enabled ...bool) mcp.Tool {
 		mcp.WithDescription(description),
 		mcp.WithString("conversation_id", mcp.Required(), mcp.Description("Existing conversation ID from list_conversations or get_conversation")),
 		mcp.WithString("message", mcp.Required(), mcp.Description("Message text to send")),
+		mcp.WithString("sim", mcp.Description(simArgDescription)),
 	}
 	if v2Requested(v2Enabled) {
 		options[0] = mcp.WithDescription(description + v2DeliveryDescription)
@@ -55,15 +56,19 @@ func sendToConversationHandler(a *app.App, v2Options ...*V2Dependencies) server.
 			return submitV2Text(ctx, a, v2, args, conversationID, message), nil
 		}
 
-		conv, msg, err := sendTextToConversation(a, conversationID, message)
+		conv, msg, err := sendTextToConversation(a, conversationID, message, strArg(args, "sim"))
 		if err != nil {
 			return errorResult(fmt.Sprintf("failed to send: %v", err)), nil
 		}
 
+		text := fmt.Sprintf("Message sent to %s (%s): %s", conv.Name, conversationID, message)
+		if msg.SIM != "" {
+			text = fmt.Sprintf("Message sent to %s (%s) from %s: %s", conv.Name, conversationID, msg.SIM, message)
+		}
 		return structuredResult(map[string]any{
 			"ok":           true,
 			"conversation": conv,
 			"message":      msg,
-		}, fmt.Sprintf("Message sent to %s (%s): %s", conv.Name, conversationID, message)), nil
+		}, text), nil
 	}
 }

@@ -56,16 +56,37 @@ var hostPriority = map[string]int{
 
 // DefaultChromeProfile returns the Chrome profile directory to read cookies
 // from, honouring the same OPENMESSAGE_CHROME_PROFILE override as the
-// standalone refresh scripts.
+// standalone refresh scripts. The override may be an absolute profile
+// directory or a bare profile directory name ("Profile 3"), which resolves
+// against the platform's Chrome user-data dir - multi-profile Chrome installs
+// usually keep the Google account that owns Messages in a non-Default profile,
+// where the refresh would otherwise find no account cookies at all.
 func DefaultChromeProfile() string {
-	if p := strings.TrimSpace(os.Getenv("OPENMESSAGE_CHROME_PROFILE")); p != "" {
-		return p
-	}
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return ""
+		home = ""
 	}
-	return defaultChromeProfileDir(home)
+	return resolveChromeProfile(os.Getenv("OPENMESSAGE_CHROME_PROFILE"), home)
+}
+
+func resolveChromeProfile(override, home string) string {
+	override = strings.TrimSpace(override)
+	if override == "" {
+		if home == "" {
+			return ""
+		}
+		return defaultChromeProfileDir(home)
+	}
+	if filepath.IsAbs(override) || strings.HasPrefix(override, "~") || strings.ContainsRune(override, os.PathSeparator) {
+		if strings.HasPrefix(override, "~/") && home != "" {
+			override = filepath.Join(home, override[2:])
+		}
+		return override
+	}
+	if home == "" {
+		return override
+	}
+	return filepath.Join(filepath.Dir(defaultChromeProfileDir(home)), override)
 }
 
 // Refresh reads Google cookies from the Chrome profile and rewrites

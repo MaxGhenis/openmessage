@@ -61,6 +61,37 @@ final class BackendLaunchConfigurationTests: XCTestCase {
         XCTAssertEqual(primary.environment, expected)
     }
 
+    func testChromeProfileLeverAddsOnlyTheProfileVariable() {
+        let base = BackendLaunchConfiguration.application(
+            executablePath: "/tmp/openmessage",
+            dataDirectory: "/tmp/data",
+            port: 8123,
+            homeDirectory: "/Users/example"
+        )
+        let withProfile = BackendLaunchConfiguration.application(
+            executablePath: "/tmp/openmessage",
+            dataDirectory: "/tmp/data",
+            port: 8123,
+            homeDirectory: "/Users/example",
+            chromeProfile: "Profile 3"
+        )
+        let blank = BackendLaunchConfiguration.application(
+            executablePath: "/tmp/openmessage",
+            dataDirectory: "/tmp/data",
+            port: 8123,
+            homeDirectory: "/Users/example",
+            chromeProfile: "   "
+        )
+
+        XCTAssertNil(base.environment["OPENMESSAGE_CHROME_PROFILE"])
+        XCTAssertEqual(withProfile.environment["OPENMESSAGE_CHROME_PROFILE"], "Profile 3")
+        var expected = base.environment
+        expected["OPENMESSAGE_CHROME_PROFILE"] = "Profile 3"
+        XCTAssertEqual(withProfile.environment, expected)
+        // A blank value is the same as unset: never ship an empty override.
+        XCTAssertEqual(blank.environment, base.environment)
+    }
+
     func testAdditionalEnvironmentIsExplicitWithoutOverridingCanonicalFields() {
         let configuration = BackendLaunchConfiguration.application(
             executablePath: "/tmp/openmessage",

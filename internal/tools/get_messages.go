@@ -64,6 +64,7 @@ func getMessagesHandler(a *app.App, configured ...Options) server.ToolHandlerFun
 		if len(msgs) == 0 {
 			return textResult("No messages found."), nil
 		}
+		annotateSIMLabels(options.Reads, msgs)
 
 		var sb strings.Builder
 		sb.WriteString(messagePreamble)

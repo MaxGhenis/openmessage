@@ -2113,6 +2113,16 @@ html, body {
 
 /* ─── Scheduled (send-later) messages ─── */
 .schedule-btn { background: transparent; border: 0; color: var(--text-muted); cursor: pointer; padding: 8px; border-radius: 10px; display: inline-flex; align-items: center; justify-content: center; }
+/* Dual-SIM: which card the next message leaves from (hidden on single-SIM threads). */
+.sim-btn { background: transparent; border: 1px solid var(--border); color: var(--text-muted); cursor: pointer; padding: 4px 8px; border-radius: 10px; font-size: 12px; font-weight: 600; white-space: nowrap; display: none; align-items: center; gap: 4px; }
+.sim-btn.visible { display: inline-flex; }
+.sim-btn:hover { background: var(--bg-hover); color: var(--text-primary); }
+.sim-btn.sim-1 { border-color: rgba(52, 168, 83, 0.6); }
+.sim-btn.sim-2 { border-color: rgba(66, 133, 244, 0.6); }
+.msg-sim { display: inline-block; margin-left: 6px; padding: 0 5px; border-radius: 6px; font-size: 10px; font-weight: 700; letter-spacing: 0.02em; background: rgba(128,128,128,0.18); vertical-align: middle; }
+.msg-sim.sim-1 { background: rgba(52, 168, 83, 0.22); }
+.msg-sim.sim-2 { background: rgba(66, 133, 244, 0.22); }
+.msg-sim.msg-sim-default { opacity: 0.7; font-weight: 500; } /* thread default, not a fact about the message */
 .schedule-btn svg { width: 20px; height: 20px; }
 .schedule-btn:hover:not(:disabled) { background: var(--bg-hover); color: var(--text-primary); }
 .schedule-btn:disabled { opacity: 0.4; cursor: default; }
@@ -5941,6 +5951,7 @@ body::after {
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M8 14s1.5 2 4 2 4-2 4-2"/><line x1="9" y1="9" x2="9.01" y2="9"/><line x1="15" y1="9" x2="15.01" y2="9"/></svg>
         </button>
         <textarea class="compose-input" id="compose-input" placeholder="Write a message..." rows="1" aria-label="Message"></textarea>
+        <button class="sim-btn" id="sim-btn" type="button" title="Choose the SIM to send from" aria-label="Choose the SIM to send from"></button>
         <button class="schedule-btn" id="schedule-btn" title="Schedule send" aria-label="Schedule send" disabled>
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15 14"/></svg>
         </button>
@@ -9584,6 +9595,7 @@ body::after {
       type,
       body: String(raw.body || ''),
       reply_to_id: String(raw.reply_to_id || ''),
+      sim: String(raw.sim || ''),
       file_name: String(raw.file_name || ''),
       mime_type: String(raw.mime_type || ''),
       file_size: Number(raw.file_size || 0),
@@ -9976,6 +9988,7 @@ body::after {
       form.append('file', file, item.file_name || file.name || 'attachment');
       if (item.reply_to_id) form.append('reply_to_id', item.reply_to_id);
       if (item.body) form.append('caption', item.body);
+      if (item.sim) form.append('sim', item.sim);
       const resp = await fetch(API + '/api/send-media', { method: 'POST', body: form });
       if (!resp.ok) {
         const err = new Error(await responseError(resp));
@@ -9988,6 +10001,7 @@ body::after {
       conversation_id: item.conversation_id,
       message: item.body,
       reply_to_id: item.reply_to_id || undefined,
+      sim: item.sim || undefined,
       idempotency_key: item.id,
     });
   }
@@ -10471,6 +10485,7 @@ body::after {
     $chatHeader.style.display = 'flex';
     $messagesArea.style.display = 'flex';
     $composeBar.style.display = 'flex';
+    refreshSIMButton(convo);
 
     const avatarRefs = conversationAvatarRefs(convo);
     renderAvatarElement($chatHeaderAvatar, {
@@ -10796,6 +10811,7 @@ body::after {
       msg.MediaID || '',
       msg.MimeType || '',
       msg.Body || '',
+      msg.sim || '',
       sourcePlatformOf(msg),
       state.v2Primary === true && String(msg.Status || '').toUpperCase() === 'SENT' ? 'v2-sent' : '',
     ].join(':');
@@ -11054,7 +11070,7 @@ body::after {
     }
 
     const failedQueuedSend = message._pendingSend && message._pendingSendItem && message._pendingSendItem.status === 'failed';
-    html += `<div class="msg-time">${formatMessageTime(message.TimestampMS)}${message.IsFromMe ? formatStatusIndicator(message.Status) : ''}${failedQueuedSend ? '<button type="button" class="msg-retry-send">Retry</button>' : ''}</div>`;
+    html += `<div class="msg-time">${formatMessageTime(message.TimestampMS)}${message.IsFromMe ? formatStatusIndicator(message.Status) : ''}${formatSIMBadge(message)}${failedQueuedSend ? '<button type="button" class="msg-retry-send">Retry</button>' : ''}</div>`;
     const pendingActionDisabled = message._pendingSend ? 'disabled' : '';
     html += `<div class="msg-actions">`;
     if (failedQueuedSend) {
@@ -11648,6 +11664,7 @@ body::after {
           file_name: file.name || 'attachment',
           mime_type: file.type || 'application/octet-stream',
           file_size: file.size || 0,
+          sim: activePlatform === 'sms' ? selectedSIMSelector(sendConvoId, sendConversation) : '',
           timestamp_ms: Date.now(),
           status: 'pending',
         };
@@ -11661,6 +11678,7 @@ body::after {
           type: 'text',
           body: text,
           reply_to_id: replyToID,
+          sim: activePlatform === 'sms' ? selectedSIMSelector(sendConvoId, sendConversation) : '',
           timestamp_ms: Date.now() + (queuedItems.length ? 1 : 0),
           status: 'pending',
         };
@@ -11715,6 +11733,125 @@ body::after {
   function restoreComposeText(convoId) {
     $composeInput.value = composeTextByConversation.get(convoId) || '';
     autoResize();
+  }
+
+  // ── Dual-SIM ───────────────────────────────────────────────────────────
+  // Google threads on a dual-SIM phone list two "me" participants, one per
+  // card (`sim` = slot, `sim_default` = the card the phone uses for the
+  // thread). The composer shows a toggle only for those threads; the choice
+  // is remembered per conversation and rides along on /api/send as `sim`.
+  const $simBtn = document.getElementById('sim-btn');
+  const simChoiceByConversation = new Map();
+
+  function conversationSIMs(convo) {
+    if (!convo || sourcePlatformOf(convo) !== 'sms') return [];
+    const mine = conversationParticipants(convo).filter(p => p && p.is_me);
+    if (mine.length < 2) return [];
+    const slots = mine.map(p => ({
+      slot: Number(p.sim || 0),
+      number: String(p.number || ''),
+      id: String(p.id || ''),
+      isDefault: !!p.sim_default,
+    }));
+    if (!slots.some(s => s.isDefault)) slots[0].isDefault = true;
+    slots.sort((a, b) => (a.slot || 99) - (b.slot || 99));
+    return slots;
+  }
+
+  // Shown as stored: regrouping digits is country-specific and a wrong split
+  // is worse than none. The number is what tells two cards apart.
+  function formatSIMNumber(number) {
+    return String(number || '').trim();
+  }
+
+  // Always carries the number: slot numbers alone are hard to tell apart.
+  function simShortLabel(slot) {
+    const head = slot.slot ? `SIM ${slot.slot}` : 'SIM';
+    return slot.number ? `${head} \u00b7 ${formatSIMNumber(slot.number)}` : head;
+  }
+
+  function simLongLabel(slot) {
+    return `${simShortLabel(slot)}${slot.isDefault ? ' - thread default' : ''}`;
+  }
+
+  function conversationSIMsSelectable(convo) {
+    // The v2 outbox does not carry a SIM choice yet: the daemon would ignore
+    // it, so the toggle must not exist there rather than lie.
+    if (state.v2Primary) return [];
+    return conversationSIMs(convo);
+  }
+
+  // The user's explicit pick for this thread, or null when they never
+  // clicked: then no `sim` is sent and the daemon uses the phone's live
+  // default (the stored default may be stale).
+  function chosenSIM(convoID, convo) {
+    const slots = conversationSIMsSelectable(convo);
+    const chosen = simChoiceByConversation.get(convoID);
+    if (!slots.length || !chosen) return null;
+    return slots.find(s => String(s.slot) === chosen || s.number === chosen) || null;
+  }
+
+  function selectedSIM(convoID, convo) {
+    const slots = conversationSIMsSelectable(convo);
+    if (!slots.length) return null;
+    return chosenSIM(convoID, convo) || slots.find(s => s.isDefault) || slots[0];
+  }
+
+  function selectedSIMSelector(convoID, convo) {
+    const slot = chosenSIM(convoID, convo);
+    if (!slot) return '';
+    // Prefer the slot number; fall back to the SIM's number when unknown.
+    return slot.slot ? String(slot.slot) : slot.number;
+  }
+
+  function refreshSIMButton(convo) {
+    if (!$simBtn) return;
+    const slots = conversationSIMsSelectable(convo);
+    if (!slots.length || !convo) {
+      $simBtn.classList.remove('visible', 'sim-1', 'sim-2');
+      return;
+    }
+    const slot = selectedSIM(convo.ConversationID, convo);
+    const explicit = !!chosenSIM(convo.ConversationID, convo);
+    $simBtn.textContent = simShortLabel(slot);
+    $simBtn.title = explicit
+      ? `Sending from ${simLongLabel(slot)}. Click to switch.`
+      : `Phone default (${simLongLabel(slot)} as last seen). Click to pick a SIM explicitly.`;
+    $simBtn.classList.remove('sim-1', 'sim-2');
+    if (slot.slot === 1 || slot.slot === 2) $simBtn.classList.add(`sim-${slot.slot}`);
+    $simBtn.classList.add('visible');
+  }
+
+  if ($simBtn) {
+    $simBtn.addEventListener('click', () => {
+      if (!activeConversation) return;
+      const slots = conversationSIMsSelectable(activeConversation);
+      if (slots.length < 2) return;
+      const current = selectedSIM(activeConvoId, activeConversation);
+      // conversationSIMs() builds fresh objects each call: compare by identity fields.
+      const idx = slots.findIndex(s => current && s.slot === current.slot && s.number === current.number);
+      const next = slots[(idx + 1) % slots.length];
+      simChoiceByConversation.set(activeConvoId, next.slot ? String(next.slot) : next.number);
+      refreshSIMButton(activeConversation);
+      showThreadFeedback(`Next message goes out from ${simLongLabel(next)}.`);
+    });
+  }
+
+  function formatSIMBadge(message) {
+    // Backend label: "SIM 2 (+15550100001, Orange)" for outgoing, or
+    // "thread default: SIM 2 (...)" for incoming (the protocol does not say
+    // which card received a message; that is the thread's default card).
+    const raw = String(message && message.sim || '');
+    if (!raw) return '';
+    const threadDefault = /^thread default:\s*/i.test(raw);
+    const label = raw.replace(/^thread default:\s*/i, '');
+    const m = label.match(/^SIM\s*(\d+)?\s*(?:\(([^,)]+)(?:,\s*([^)]+))?\))?/i);
+    const slot = m && m[1] ? Number(m[1]) : 0;
+    const number = m && m[2] ? m[2].trim() : '';
+    const short = escapeHtml(simShortLabel({slot, number}));
+    const cls = (slot === 1 || slot === 2 ? ` sim-${slot}` : '') + (threadDefault ? ' msg-sim-default' : '');
+    const title = threadDefault ? `Thread default card: ${label} (the receiving card is not reported)` : `Sent from ${label}`;
+    return `<span class="msg-sim${cls}" title="${escapeHtml(title)}">${short}</span>`;
   }
 
   function autoResize() {

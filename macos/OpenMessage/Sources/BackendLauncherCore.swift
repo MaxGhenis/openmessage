@@ -55,6 +55,7 @@ struct BackendLaunchConfiguration: Equatable, Sendable {
         port: Int,
         homeDirectory: String = NSHomeDirectory(),
         v2Primary: Bool = false,
+        chromeProfile: String? = nil,
         additionalEnvironment: [String: String] = [:]
     ) -> BackendLaunchConfiguration {
         var canonical = [
@@ -73,6 +74,13 @@ struct BackendLaunchConfiguration: Equatable, Sendable {
             // it on an unmigrated install fails loudly rather than silently
             // serving an empty store. Rollback = clear the defaults key.
             canonical["OPENMESSAGES_V2_PRIMARY"] = "1"
+        }
+        if let chromeProfile, !chromeProfile.trimmingCharacters(in: .whitespaces).isEmpty {
+            // Operator lever for multi-profile Chrome installs: the Google
+            // cookie self-heal reads the "Default" profile unless told which
+            // profile holds the account that owns Messages. Accepts a bare
+            // profile directory name ("Profile 3") or an absolute path.
+            canonical["OPENMESSAGE_CHROME_PROFILE"] = chromeProfile
         }
         var environment = additionalEnvironment
         environment.merge(canonical) { _, canonical in canonical }

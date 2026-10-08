@@ -50,6 +50,10 @@ type Message struct {
 	Transcript      string `json:"transcript,omitempty"`
 	TranscribedAtMS int64  `json:"transcribed_at_ms,omitempty"`
 	TranscriptModel string `json:"transcript_model,omitempty"`
+	// SIM is a display-only label ("SIM 2 (+1 555 010 0001)") set at read time
+	// on dual-SIM Google threads: the SIM an outgoing message left from, or the
+	// thread's SIM for incoming ones. Not a column; see internal/sim.
+	SIM string `json:"sim,omitempty"`
 }
 
 type Contact struct {

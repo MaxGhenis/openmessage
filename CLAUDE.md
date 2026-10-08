@@ -104,6 +104,11 @@ mode this prevents and the `~/.mcp.json` recipe.
 - `generate_viz` — self-contained HTML visualization combining data dashboards + narrative (see below)
 - `render_story` — render a pre-built Story JSON into HTML viz; supports `photo_paths` (curated list) or `photos_dir`
 - `send_message`, `draft_message`, `download_media`, `list_contacts`, `get_status`
+- Dual-SIM phones: `send_message`, `send_to_conversation`, `send_media_to_conversation`
+  and `react_to_message` take an optional `sim`
+  (slot `"1"`/`"2"`, the card's number, or carrier); reads label each message
+  with its SIM on dual-SIM threads and `get_conversation` lists the thread's
+  cards. See [docs/agent-runbook.md](docs/agent-runbook.md) "Dual-SIM phones".
 
 On a v2-primary install the message-read tools (including `get_person_messages`
 and `get_person_messages_range`) serve the v2 store through the canonical read
