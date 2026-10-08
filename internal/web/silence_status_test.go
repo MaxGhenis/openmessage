@@ -425,3 +425,35 @@ func TestAddSilenceCarriedVerdictTracksTheSilence(t *testing.T) {
 		}
 	}
 }
+
+// The length rules a carried verdict re-applies honor MinBusyDays: a baseline
+// with too few active days only gets the 72 h floor, not the 16 h cap.
+func TestAddSilenceCarriedVerdictHonorsMinBusyDays(t *testing.T) {
+	loc := time.UTC
+	last := time.Date(2026, 10, 6, 1, 11, 0, 0, loc)
+	prev := map[string]any{"google": map[string]any{
+		"stale": false, "stale_reason": "",
+		"silence": map[string]any{
+			"source":                       freshness.SourceV2Inbox,
+			"last_event_ms":                last.UnixMilli(),
+			"silent_ms":                    int64(0),
+			"baseline_active_days":         freshness.DefaultSilenceConfig.MinBusyDays - 1,
+			"baseline_median_daily_events": float64(500),
+			"evaluated":                    false,
+			"stalled":                      false,
+			"rule":                         "",
+		},
+	}}
+	activity := &flakyActivity{failLatest: true}
+	for _, tc := range []struct {
+		after time.Duration
+		rule  string
+	}{{17 * time.Hour, ""}, {72 * time.Hour, freshness.RuleLongSilence}} {
+		out := map[string]any{"google": map[string]any{"stale": false, "stale_reason": ""}}
+		addSilence(out, activity, silenceBaselineCache{}, prev, last.Add(tc.after), loc)
+		s := out["google"].(map[string]any)["silence"].(map[string]any)
+		if s["carried_over"] != true || s["rule"] != tc.rule || s["stalled"] != (tc.rule != "") {
+			t.Fatalf("at +%v: carried silence = %v, want rule %q", tc.after, s, tc.rule)
+		}
+	}
+}

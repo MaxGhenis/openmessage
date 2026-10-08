@@ -354,3 +354,21 @@ func TestEvaluateSilenceNeedsSeveralDaysBeforeABurstCountsAsBusy(t *testing.T) {
 		t.Fatalf("verdict at LongSilence = %+v, want stalled by %s", long, RuleLongSilence)
 	}
 }
+
+// The default MinBusyDays is a boundary: three busy active days are enough
+// for the 16 h cap, two are not.
+func TestEvaluateSilenceBusyNeedsExactlyMinBusyDays(t *testing.T) {
+	loc := time.UTC
+	last := time.Date(2026, 10, 6, 21, 0, 0, 0, loc)
+	cfg := DefaultSilenceConfig
+	for _, tc := range []struct {
+		days    int
+		stalled bool
+	}{{2, false}, {3, true}} {
+		baseline := dailyTraffic(last, tc.days, 9, 21, 30*time.Minute, loc) // 24 events a day
+		v := EvaluateSilence(last, baseline, last.Add(cfg.MaxSilence), loc, cfg)
+		if v.Stalled != tc.stalled || (tc.stalled && v.Rule != RuleMaxSilence) {
+			t.Fatalf("%d busy days at MaxSilence: verdict = %+v, want stalled=%v by %s", tc.days, v, tc.stalled, RuleMaxSilence)
+		}
+	}
+}

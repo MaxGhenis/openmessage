@@ -204,3 +204,23 @@ func TestMessageActivityMergesStoragePlatforms(t *testing.T) {
 		t.Fatalf("queried platforms = %v, want %v", store.platforms, want)
 	}
 }
+
+// The legacy source ignores incoming rows stamped more than
+// futureSkewAllowance past now, so a skewed sender clock can't hide a silence.
+func TestMessageActivityIgnoresFutureStampedRows(t *testing.T) {
+	now := time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC)
+	store := &stubMessageStore{stamps: map[string][]int64{"sms": {
+		now.Add(-3 * time.Hour).UnixMilli(),
+		now.Add(futureSkewAllowance - time.Minute).UnixMilli(), // within the allowance
+		now.Add(2 * time.Hour).UnixMilli(),                     // skewed
+	}}}
+	source := NewMessageActivity(store, map[string]string{"sms": "google"}).(messageActivity)
+	source.now = func() time.Time { return now }
+	latest, err := source.Latest(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := now.Add(futureSkewAllowance - time.Minute); !latest["google"].Equal(want) {
+		t.Fatalf("Latest() = %v, want %v", latest["google"], want)
+	}
+}
