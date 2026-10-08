@@ -392,9 +392,9 @@ up.
   10 s later, waits 3 s, and relaunches. It never signals the
   `openmessage serve` backend itself, and the relaunched app adopts its own
   bundle's `openmessage serve` if one is still listening on 7007 instead of
-  starting another. If a relaunch didn't help, check `lsof -nP -iTCP:7007 -sTCP:LISTEN`.
-  This path first ran on 2026-10-08 at 12:22, after a reused backend died under
-  a running app.
+  starting another. If a relaunch didn't help, check
+  `lsof -nP -iTCP:7007 -sTCP:LISTEN`. This path first ran on 2026-10-08 at
+  12:22, after a reused backend died under a running app.
 
 It relaunches at most once per 30 minutes, counted from its own last relaunch
 (manual restarts don't count), to stay clear of Google's reconnect throttling
