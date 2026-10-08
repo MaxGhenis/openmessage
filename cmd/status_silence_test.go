@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"testing/quick"
 	"time"
@@ -530,8 +531,8 @@ func TestRunStatusSkipsSilenceInDemoMode(t *testing.T) {
 		frames:      stall1006Frames(loc),
 	})
 	session := openStatusSession(t, dataDir, true)
-	probed := false
-	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { probed = true }))
+	var probed atomic.Bool
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { probed.Store(true) }))
 	t.Cleanup(server.Close)
 	deps := statusDeps{
 		daemon: localapi.NewClient(server.URL, ""),
@@ -540,8 +541,8 @@ func TestRunStatusSkipsSilenceInDemoMode(t *testing.T) {
 		demo:   true,
 	}
 	raw := runStatusOutput(t, session, deps, true)
-	if strings.Contains(raw, "silence") || probed {
-		t.Fatalf("demo status = %s (probed %v), want no silence and no probe", raw, probed)
+	if strings.Contains(raw, "silence") || probed.Load() {
+		t.Fatalf("demo status = %s (probed %v), want no silence and no probe", raw, probed.Load())
 	}
 }
 
@@ -658,7 +659,8 @@ func compareSilence(t *testing.T, daemon, local map[string]any) {
 }
 
 // stubStatusActivity is an ActivitySource over fixed event times whose
-// baseline query can be made to fail.
+// baseline query can be made to fail. A failing query still returns its
+// rows, as a partial read might, so callers must discard them on the error.
 type stubStatusActivity struct {
 	events     map[string][]time.Time
 	betweenErr error
@@ -679,16 +681,13 @@ func (s stubStatusActivity) Latest(context.Context) (map[string]time.Time, error
 }
 
 func (s stubStatusActivity) Between(_ context.Context, platform string, from, to time.Time) ([]time.Time, error) {
-	if s.betweenErr != nil {
-		return nil, s.betweenErr
-	}
 	var out []time.Time
 	for _, at := range s.events[platform] {
 		if !at.Before(from) && !at.After(to) {
 			out = append(out, at)
 		}
 	}
-	return out, nil
+	return out, s.betweenErr
 }
 
 // Property: for any activity, clock and zone, the local verdict is
@@ -746,9 +745,10 @@ func TestRunStatusPassesAnyDaemonVerdictThrough(t *testing.T) {
 	seedStatusV2Store(t, dataDir, statusV2Seed{account: statusGoogleAccount, lastMessage: last, frames: []time.Time{last}})
 	session := openStatusSession(t, dataDir, true)
 
-	var block string
+	// The handler runs on the server's goroutine, so the block is atomic.
+	var served atomic.Value
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		io.WriteString(w, daemonStatusWithGoogleSilence(dataDir, block))
+		io.WriteString(w, daemonStatusWithGoogleSilence(dataDir, served.Load().(string)))
 	}))
 	t.Cleanup(server.Close)
 	deps := statusDeps{daemon: localapi.NewClient(server.URL, ""), now: func() time.Time { return last }}
@@ -763,7 +763,8 @@ func TestRunStatusPassesAnyDaemonVerdictThrough(t *testing.T) {
 			fields["carried_over"] = true
 		}
 		encoded, _ := json.Marshal(fields)
-		block = string(encoded)
+		block := string(encoded)
+		served.Store(block)
 
 		var got bytes.Buffer
 		status := decodeStatusJSON(t, runStatusOutput(t, session, deps, true))
