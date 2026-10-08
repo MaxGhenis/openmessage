@@ -57,6 +57,10 @@ type PendingDelivery struct {
 	Summary        string
 	ErrorClass     string
 	ErrorCode      string
+	ErrorDetail    string
+	// RetryExhausted marks a rejected intent that gave up after its retry
+	// budget; the tray keeps it visible so the user can send it again.
+	RetryExhausted bool
 }
 
 // MessageService owns message intent submission and durable dispatch. Concrete

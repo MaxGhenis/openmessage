@@ -211,6 +211,17 @@ type GoogleStatusSnapshot struct {
 	// PhoneResponding is false after libgm reports PhoneNotResponding. Before
 	// such an event is observed, unknown is treated as healthy.
 	PhoneResponding bool `json:"phone_responding"`
+	// AccountSwitched is set when the phone reports that Google Messages
+	// switched to Google-account pairing while this session is QR-paired.
+	// The phone then keeps pushing inbound updates but answers this
+	// session's requests (conversation lookups, sends) without data, so
+	// SMS/RCS sends cannot succeed until the session is re-linked with
+	// Google-account pairing or the phone is switched back.
+	AccountSwitched bool `json:"account_pairing_switched,omitempty"`
+	// SwitchedAccount is the Google account the phone reported, when known.
+	SwitchedAccount string `json:"switched_account,omitempty"`
+	// AccountSwitchedAtMS is when the switch was first observed (Unix ms).
+	AccountSwitchedAtMS int64 `json:"account_pairing_switched_at_ms,omitempty"`
 	// RepairsPaced counts automatic credential repairs the supervisor delayed
 	// to honour the minimum repair interval. 0 through the healthy ~15-minute
 	// heal cycle; a climbing count means cookies are being revoked within
