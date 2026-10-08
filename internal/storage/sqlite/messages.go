@@ -257,6 +257,39 @@ func (r *MessageRepository) GetMessage(
 	return message, nil
 }
 
+// RetireRemoteMessageID renames a message's remote message ID to retiredID so
+// the original ID is free for a different message. Google reuses message IDs
+// across device ID spaces, and a thread that continues across a phone swap can
+// receive a new message under an ID one of its old messages already holds; the
+// old message keeps its row, reactions and attachments under the retired ID.
+func (r *MessageRepository) RetireRemoteMessageID(
+	ctx context.Context,
+	accountID string,
+	messageID string,
+	retiredID string,
+) error {
+	if strings.TrimSpace(retiredID) == "" {
+		return fmt.Errorf("retire remote ID of message %q: retired ID is empty", messageID)
+	}
+	nowMS := r.now().UnixMilli()
+	result, err := r.store.db.ExecContext(ctx, `
+		UPDATE messages
+		SET remote_message_id = ?, updated_at_ms = MAX(updated_at_ms, ?)
+		WHERE account_id = ? AND message_id = ?
+	`, retiredID, nowMS, accountID, messageID)
+	if err != nil {
+		return fmt.Errorf("retire remote ID of message %q: %w", messageID, mapConstraintError(err))
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("retire remote ID of message %q: rows affected: %w", messageID, err)
+	}
+	if affected != 1 {
+		return fmt.Errorf("retire remote ID of message %q: %w", messageID, ErrNotFound)
+	}
+	return nil
+}
+
 // GetMessageByRemote returns the normalized message selected by the same
 // account-scoped natural key used by ProjectMessage. This is useful to recover
 // the effective local message ID after a projection collides with a row that

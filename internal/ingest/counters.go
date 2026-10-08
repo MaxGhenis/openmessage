@@ -38,6 +38,23 @@ type CounterSnapshot struct {
 	// dropped because identical content already existed under another remote id.
 	RemoteRebinds       uint64 `json:"remote_rebinds"`
 	ContentDupesSkipped uint64 `json:"content_dupes_skipped"`
+
+	// IDSpaceResets counts Google device ID-space resets detected: a wire id
+	// the phone had announced for one thread in the current ID space arrived
+	// naming a different one. RekeysDeclined counts frames whose roster matched
+	// only threads still live under their own ids (two groups with one
+	// membership, two 1:1 threads with one person), so the frame's id got its
+	// own thread instead of taking theirs. RekeysRecovered counts threads kept
+	// apart that way in a reset's opening minutes, before the reset was
+	// detected, and then merged into the thread they continue.
+	// RemoteMessageIDsRetired counts older messages whose Google message ID a
+	// different message reused in the same thread across an ID-space reset;
+	// each keeps its row under a displaced remote ID instead of being
+	// overwritten.
+	IDSpaceResets           uint64 `json:"idspace_resets"`
+	RekeysDeclined          uint64 `json:"rekeys_declined"`
+	RekeysRecovered         uint64 `json:"rekeys_recovered"`
+	RemoteMessageIDsRetired uint64 `json:"remote_message_ids_retired"`
 }
 
 type accountCounters struct {
@@ -65,6 +82,11 @@ type accountCounters struct {
 	ephemeral           atomic.Uint64
 	remoteRebinds       atomic.Uint64
 	contentDupesSkipped atomic.Uint64
+
+	idspaceResets           atomic.Uint64
+	rekeysDeclined          atomic.Uint64
+	rekeysRecovered         atomic.Uint64
+	remoteMessageIDsRetired atomic.Uint64
 }
 
 // Counters owns atomic ingest counters partitioned by account. Its zero value
@@ -149,5 +171,10 @@ func snapshotCounters(c *accountCounters) CounterSnapshot {
 		Ephemeral:           c.ephemeral.Load(),
 		RemoteRebinds:       c.remoteRebinds.Load(),
 		ContentDupesSkipped: c.contentDupesSkipped.Load(),
+
+		IDSpaceResets:           c.idspaceResets.Load(),
+		RekeysDeclined:          c.rekeysDeclined.Load(),
+		RekeysRecovered:         c.rekeysRecovered.Load(),
+		RemoteMessageIDsRetired: c.remoteMessageIDsRetired.Load(),
 	}
 }

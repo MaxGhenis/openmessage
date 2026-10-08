@@ -148,6 +148,27 @@ are re-linked by peer when their thread shows up under its new id. Watch
 in `/api/status` — a burst right after a re-pair is the fix working, not a
 fault.
 
+A roster match is not proof of a re-key: two groups with the same members, or
+two 1:1 threads with one person, are both live under their own ids. Until
+2026-10-08 ingest moved one's id onto the other, so the id and title flipped on
+every event and both threads' messages piled into one row. A thread now takes a
+new id only when its own id is dead: displaced by a collision, or announced by
+a ConversationEvent only in an earlier device ID space. ID spaces are counted
+per account (`accounts.remote_idspace_epoch`); a new one starts when an id the
+phone announced in the current space arrives naming a different thread. Group
+re-keys also need the title to match. A thread whose first messages arrive
+with no ConversationEvent is provisional; a second sender makes it a group, so
+it is not scattered across its members' 1:1 threads. A reset shows up as the
+first collision, and fresh ids that arrive before it (14 threads in the 36
+seconds before the first collision on 9/3) first get their own rows. When the
+reset is detected, rows minted that way in the previous 15 minutes are merged
+into the threads they continue. Google also reuses message ids across a reset; when a
+continued thread receives a new message under an old message's id, the old
+message keeps its row under `displaced:<id>:<message_id>`. Counters:
+`idspace_resets` (expect one per phone swap or restore), `rekeys_declined`
+(a thread kept apart from a live same-roster twin; steady trickle),
+`rekeys_recovered`, `remote_message_ids_retired`.
+
 **Repairing history after a reset** (daemon must be down — the command takes
 the instance lock and refuses while `/api/status` answers; park the watchdog
 first):
