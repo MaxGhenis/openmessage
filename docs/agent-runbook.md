@@ -336,6 +336,245 @@ can migrate the schema under the older one.
 `serve ... --transports` alongside the app: those are daemon shapes and will
 fight the app for the WhatsApp/Signal sessions exactly as described above.
 
+## The watchdog + staleness sentinel (Max's install)
+
+The app can die silently and take every platform's sync with it. On
+2026-07-29 it died at about 19:56 (probably jetsam during a day of
+memory-pressure kills; no crash report survives). Nothing relaunched it, and
+the v2 inbox received no frame from any platform from 19:50 that evening until
+23:46 on 7/31. Since then a launchd agent,
+`com.maxghenis.openmessage-watchdog`, has run
+`~/dotfiles/bin/openmessage-watchdog` every 5 minutes. It relaunches a dead or
+hung daemon, and it alerts when the daemon is up but a platform has gone
+quiet.
+
+This section follows the script's code on Max's local dotfiles `master` at
+`c30e106` (2026-10-08). The script's header comment summarizes the checks but
+is incomplete: it leaves out the inbox-read alert, the parse-error path and
+the `STATE`/`LOG` overrides, and it lists a top-level `projection_stalled`
+check that never fires (the daemon publishes that flag inside `freshness`).
+launchd runs the working-tree file, so editing it, or checking out another
+branch in `~/dotfiles`, changes live behavior within 5 minutes. Try changes on
+a copy ([testing a change](#testing-a-change)).
+
+- Log: `~/Library/Logs/openmessage-watchdog.log`.
+- Script stderr, including Python failures:
+  `~/Library/Logs/openmessage-watchdog-launchd.log`. Look there when the main
+  log shows probes and relaunches but no staleness lines. From 2026-09-15 to
+  09-20, `/usr/bin/python3` refused to run (an unaccepted Xcode license), every
+  staleness check was off, and the main log said nothing about it.
+- State: `~/.local/state/openmessage-watchdog/` holds `consecutive_fails`,
+  `last_action_epoch` (the relaunch throttle), the episode counters
+  `disc_<platform>` and `repair_google`, and one `alert_<key>` cooldown stamp
+  per alert (epoch seconds; deleting one re-arms that alert).
+- Loaded? `launchctl list | grep openmessage-watchdog`.
+
+### Relaunching a dead or hung daemon
+
+A run first skips, logging why, if the `watchdog-disabled` flag exists
+([parking it](#parking-the-watchdog)), if any process's command line contains
+`openmessage pair`, or if `/Applications/OpenMessage.app` is missing. Skipped
+runs neither count nor reset anything. Otherwise it fetches
+`http://127.0.0.1:7007/api/status` with a 5 s timeout. The probe fails when the
+reply doesn't contain the string `"connected"`: connection refused, no answer
+within 5 s, or an error body. Any real status payload passes, even with every
+platform down. The probe tests that the daemon answers, not that platforms are
+up.
+
+- **No app process** (`pgrep -x OpenMessage`, the Swift wrapper): on the 2nd
+  consecutive failure it runs `open -ga OpenMessage`. That launches by name,
+  so if the wrong build comes up, run the audit in [bundle-id
+  shadowing](#bundle-id-shadowing--only-one-app-may-claim-comopenmessageapp).
+- **App process running** (a hung backend, or a backend that died and that the
+  app has stopped restarting): on the 3rd consecutive failure it asks the app
+  to quit, sends `pkill -x OpenMessage` (SIGTERM) if the app is still running
+  10 s later, waits 3 s, and relaunches. It never signals the
+  `openmessage serve` backend itself, and the relaunched app adopts an
+  OpenMessage backend still listening on 7007 instead of starting its own. If
+  a relaunch didn't help, check `lsof -nP -iTCP:7007 -sTCP:LISTEN`. This path
+  first ran on 2026-10-08 at 12:22, after the backend died under a running
+  app.
+
+It relaunches at most once per 30 minutes, counted from its own last relaunch
+(manual restarts don't count), to stay clear of Google's reconnect throttling
+([don't over-reconnect](#dont-over-reconnect)). Every relaunch posts "Daemon
+was down - relaunched the app", in both cases; `quitting hung app` in the log
+tells them apart. The probe sends no control token. That works only while
+`/api/` auth is accept-and-log: if enforcement ships, every probe will fail.
+
+### Staleness alerts
+
+While the daemon answers, the script reads `/api/status` for the "app up,
+platform silently dead" class. It only alerts; platform recovery stays with the
+in-app supervisors. It alerts on:
+
+- a paired platform (`paired` true, `connected` false) on 3 consecutive runs
+  where the daemon answered. That is 10–15 minutes while the Mac is awake, and
+  longer across sleep, because launchd skips the runs that fall while it is
+  asleep;
+- `google.needs_repair` on 3 consecutive answered runs;
+- `google.repairs_paced >= 3` (key `repairs_paced`): at least three cookie
+  repairs since the daemon started had to wait out the daemon's own minimum
+  repair interval (90 s by default), so something is revoking the cookies
+  within minutes. The counter never resets while the daemon runs, so the alert
+  repeats until the daemon restarts, even after the churn stops;
+- `freshness.<platform>.projection_stalled` (key `proj_<platform>`; v2-primary
+  daemons only): the platform's newest message in the v2 read store is more
+  than 5 minutes older than its newest in the legacy store, or the read store
+  has no rows for a platform the legacy store has. It compares newest
+  timestamps, not ingest delay, so a gap left in the past keeps it true
+  indefinitely;
+- a platform's newest received message
+  (`freshness.<platform>.latest_received_ms`, or `latest_ms` if it has
+  received nothing) more than 48 h older than
+  `freshness.newest_ms` (key `behind_<platform>`). `newest_ms` is the newest
+  message of any kind on any stored platform, including the platform's own
+  sends. The premise is that traffic elsewhere proves the pipe works, but the
+  alert always says "while other platforms flow", even when the newer message
+  is the platform's own send. A platform with no rows in the read store never
+  trips this check; only `proj_<platform>` catches it;
+- no message, sent or received, on any platform for more than 24 h (key
+  `all_quiet`). With WhatsApp and Signal unlinked this works as a Google
+  silence alarm: it fired at 24, 30 and 36 h during the 2026-10-06 stall;
+- v2 ingest `quarantined` above 0, summed over accounts (key `quarantine`);
+- Signal `receive_recovery.pending_count >= 5` (key `signal_recovery`);
+- a paired, connected platform whose silence outlasts its own baseline (the
+  rule in [Google Messages silent while
+  "connected"](#google-messages-silent-while-connected-the-phone-stopped-relaying)).
+  How it is reported depends on the daemon:
+  - A daemon with PR #190 publishes `freshness.<platform>.silence`. The app
+    posts one `<platform> has gone quiet` notification per silence episode (if
+    its desktop notifications are on), and the chief-of-staff watcher
+    (`com.maxghenis.cos.openmessage-health-watch`) relays Google's verdict to
+    Max on Telegram. The watchdog only logs it, as a `note:` line on every run.
+  - On an older daemon with v2 ingest enabled, the watchdog computes Google's
+    verdict itself from `v2/store.sqlite3` (constants mirrored from
+    `internal/freshness`), marks the alert "(watchdog estimate)" (key
+    `silent_google`), and lists it first so that it leads the notification. If
+    it can't read the inbox, it raises `silence_check` instead, at normal
+    priority. It skips this whenever any platform publishes a `silence` block.
+
+  To see which applies, run
+  `curl -s http://127.0.0.1:7007/api/status | jq '.freshness.google.silence'`.
+  `null` means the daemon predates #190, and the watchdog's estimate and
+  `all_quiet` are the only silence alarms.
+
+### How alerts repeat
+
+Each run posts at most one macOS notification: its first fresh alert, plus
+"(+N more - see log)" when there are others. The log has each alert as
+`ALERT: …` and the notification as `NOTIFY: …`. A `NOTIFY:` line records the
+attempt, not that macOS showed it.
+
+- The disconnect and `needs_repair` alerts count consecutive answered runs and
+  notify once, when the count reaches 3, so one notification covers the whole
+  episode. The count resets on any answered run without the condition,
+  including one where the platform became unpaired or the status didn't parse,
+  so `reconnected: <platform>` and `google repair cleared` in the log don't
+  prove a recovery. Runs where the daemon is down, or where the watchdog
+  skips, leave the count where it was.
+- Every other alert has a 6-hour cooldown per key. While the condition holds,
+  the first answered run at least 6 hours after the key's last stamp alerts
+  again; runs in between log `suppressed (cooldown): <key>`. Every alert in a
+  run is stamped, not only the one the notification shows. Alerts that start
+  together therefore stay in lockstep, and one that is never first only ever
+  shows up as "+N more". Stamps aren't cleared when a condition clears, so a
+  recurrence within 6 hours stays silent.
+- If `/api/status` contains `"connected"` but isn't valid JSON, the run logs
+  `status parse error: …` and checks nothing else.
+
+Consequences worth knowing:
+
+- Only the disconnect and silence checks look at pairing. The trailing,
+  projection and Signal-recovery checks don't, so a platform left unlinked
+  keeps alerting. On 2026-10-08, with WhatsApp and Signal unlinked, the
+  notification every 6 hours read "signal projection stalled (+2 more - see
+  log)" (the other two are `behind_signal` and `behind_whatsapp`), and it can
+  hide a new alert raised in the same run.
+- `quarantined` is an in-memory counter that starts at zero whenever the
+  backend starts. Any backend restart (an app or watchdog relaunch, or the app
+  restarting `openmessage serve`) therefore stops the alert. The quarantined
+  frames stay in the v2 `inbox` table, marked processed like frames that
+  projected fine, and the cause is not stored (issue #161). Their inbox ids
+  are only in the backend's `Quarantined ingest frame` log lines.
+- Quarantine alerts recur: they fired on 33 days between 2026-08-01 and 10-08.
+  The first surfaced three Google conversation snapshots quarantined over
+  duplicated self-participants (fixed by deduping in `refreshConversation`,
+  PR #160). The recent ones have no diagnosed cause.
+
+### Testing a change
+
+`OPENMESSAGE_WATCHDOG_DRYRUN=1` logs decisions without relaunching or
+notifying, but it still writes state: `consecutive_fails`, the episode
+counters and the `alert_<key>` stamps (not the relaunch stamp). Run against
+the real state dir, it can swallow the next real alert: a stamped key stays
+quiet for 6 hours, and an episode counter pushed past 3 never alerts. Point
+`OPENMESSAGE_WATCHDOG_STATE` and `OPENMESSAGE_WATCHDOG_LOG` at a scratch
+directory and run a copy of the script:
+
+```bash
+d=$(mktemp -d)
+cp ~/dotfiles/bin/openmessage-watchdog "$d/wd"   # edit "$d/wd" to try a change
+OPENMESSAGE_WATCHDOG_DRYRUN=1 OPENMESSAGE_WATCHDOG_STATE="$d" \
+  OPENMESSAGE_WATCHDOG_LOG="$d/log" bash "$d/wd"
+cat "$d/log"
+```
+
+A dry run still obeys the real `watchdog-disabled` flag (its path is fixed)
+and probes the live daemon. To exercise the staleness checks against a crafted
+payload, set `OPENMESSAGE_WATCHDOG_PORT` to a stub server that serves it at
+`/api/status`; the body must contain `"connected"`, or the run takes the
+relaunch path. Repeated dry runs of the relaunch path count past the threshold
+(`4/3`, `5/3`, …), because only a real relaunch resets the counter.
+
+### Reading the backend's os_log
+
+**`log` is a zsh builtin** (this cost an hour). In non-interactive zsh
+(scripts, `zsh -c`, an agent's shell tool), `log show …` and `log stream …`
+hit the builtin and fail with `log:1: too many arguments` instead of reading
+the unified log. Interactive zsh on macOS disables the builtin in
+`/etc/zshrc`, which is why the same command works in Terminal. Call
+`/usr/bin/log` explicitly.
+
+The app pipes the backend's stdout and stderr (zerolog writes to stderr) into
+os_log under subsystem `com.openmessage.app`, category `Backend`, every line at
+Info level whatever its zerolog level. `log` shows only default-level entries
+unless asked (`log show` needs `--info`), and macOS keeps Info entries only in
+memory, so a quarantine cause from hours ago is gone. Capture live:
+
+```bash
+/usr/bin/log stream --level info \
+  --predicate 'subsystem == "com.openmessage.app" AND category == "Backend"'
+```
+
+To reproduce a quarantine offline, copy `v2/store.sqlite3` with its `-wal` and
+`-shm` files, take the account's frames from the window before the alert, and
+feed them through a worker built with that codec's real decoder. Model it on
+`newGoogleEchoHarness` in `internal/ingest/google_echo_e2e_test.go`; the
+harness in `worker_paths_test.go` uses a fake decoder. The frames that fail
+are the quarantined ones. No ready-made replay test exists.
+
+### Parking the watchdog
+
+**Before intentionally quitting the app** (re-pairing, deploying a build, long
+debugging), park the watchdog:
+
+```bash
+touch "$HOME/Library/Application Support/OpenMessage/watchdog-disabled"
+```
+
+While the flag exists, every run logs `skip: disable flag present` and exits:
+no probe, no relaunch, no watchdog alert. (The app's own silence notification
+and the chief-of-staff watcher don't read the flag.) Remove it when you're
+done, whatever the outcome. Nothing ages it out. A flag forgotten from
+2026-08-29 17:44 to 09-03 16:00 (1,278 consecutive skipped runs) silenced the
+6-hourly `all_quiet` alerts in the middle of a two-week outage: the v2 inbox
+has no frames from any platform between 08-20 18:55 and 09-03 16:03. If alerts
+seem to have stopped, `tail` the log first; a parked watchdog says so on every
+run. The watchdog also skips while an `openmessage pair` process is running,
+but that check matches any command line containing the string, so don't rely
+on it for multi-step procedures.
+
 ## Pairing & the "zombie session"
 
 **Symptom:** sends fail with `OUTGOING_FAILED:UNKNOWN`; `/api/status` shows
@@ -360,7 +599,9 @@ Key facts:
 
 ### Re-pair recipe (the one that works)
 
-1. `osascript -e 'quit app "OpenMessage"'`.
+1. Park the watchdog ([parking the watchdog](#parking-the-watchdog)); the flag
+   stops its relaunches and its alerts alike. Then
+   `osascript -e 'quit app "OpenMessage"'`.
 2. Force the native pairing screen by removing `session.json` from **both**
    data dirs (back them up first):
    `~/Library/Application Support/OpenMessage/session.json` **and**
@@ -389,11 +630,12 @@ Key facts:
    - **Extract cookies immediately before pairing** — pairing with an older
      extract has returned HTTP 401 (the staleness threshold is not
      established; don't rely on any grace window).
-4. `pair --google` prints `EMOJI: <emoji>`. The user taps that emoji in Google
+5. `pair --google` prints `EMOJI: <emoji>`. The user taps that emoji in Google
    Messages **on the phone** (notification shade, or profile → Device pairing)
    to confirm. The Gaia client init can time out once — just retry.
 6. On confirmation the session saves to the app dir; relaunch the app and sends
-   work. Wipe the cookie file afterwards.
+   work. Wipe the cookie file afterwards. Whatever the outcome, remove the
+   watchdog's `watchdog-disabled` flag.
 
 ### Self-healing (as of #74; requirements fixed 2026-07-20) — try this before any manual cookie surgery
 
