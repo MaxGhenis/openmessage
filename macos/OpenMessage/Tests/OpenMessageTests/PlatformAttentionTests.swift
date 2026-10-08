@@ -129,4 +129,77 @@ final class PlatformAttentionTests: XCTestCase {
         var relaunched = SilenceNotificationLatch(notifiedEpisode: first.notifiedEpisode)
         XCTAssertEqual(relaunched.newlySilent([silent]), [])
     }
+
+    // The 2026-10-04 shape: Google connected, newest platform, not stale, and
+    // RCS still flowing, but no incoming SMS for 25 hours.
+    func testStoppedSMSAsksForAPhoneRestart() {
+        let json = status("""
+        {"google": {"connected": true, "paired": true, "phone_responding": true},
+         "freshness": {"google": {"behind_days": 0, "stale": false,
+                                  "sms_path": {"stalled": true, "reason": "sms_silent_rcs_flowing",
+                                               "silent_ms": 90000000, "last_sms_ms": 1791058607000}},
+                       "sms_path_stalled": true}}
+        """)
+        let items = PlatformAttention.evaluate(status: json)
+        XCTAssertEqual(items, [PlatformAttention(
+            key: "google", name: "Google Messages", reason: .smsStopped(hours: 25, since: 1791058607000)
+        )])
+        XCTAssertEqual(
+            PlatformAttention.alertText(for: items),
+            "Your phone has received no SMS for 25 hours, longer than usual, while RCS still arrives, so texts and codes from non-RCS senders may not be getting through. Try restarting the phone."
+        )
+        XCTAssertEqual(PlatformAttention.smsStoppedNotificationBody(items[0]), PlatformAttention.alertText(for: items))
+        XCTAssertNil(PlatformAttention.silentNotificationBody(items[0]))
+    }
+
+    func testFlowingOrUnjudgedSMSPathNeedsNothing() {
+        for path in [#"{"stalled": false, "reason": "sms_recent"}"#,
+                     #"{"stalled": false, "reason": "within_usual_gap", "silent_ms": 100000000}"#,
+                     #"{"stalled": false, "reason": "rcs_quiet", "silent_ms": 200000000}"#,
+                     #"{"evaluated": false, "stalled": false, "reason": "thin_baseline"}"#] {
+            let json = status("""
+            {"google": {"connected": true, "paired": true},
+             "freshness": {"google": {"stale": false, "sms_path": \(path)}}}
+            """)
+            XCTAssertEqual(PlatformAttention.evaluate(status: json), [], path)
+        }
+    }
+
+    // A stale Google entry keeps its own reason: a re-pair or a silent relay
+    // explains missing SMS better than the SMS path does.
+    func testStaleGoogleOutranksTheSMSPath() {
+        let json = status("""
+        {"google": {"connected": true, "paired": true},
+         "freshness": {"google": {"stale": true, "stale_reason": "silent",
+                                  "silence": {"silent_ms": 45000000, "last_event_ms": 7},
+                                  "sms_path": {"stalled": true, "silent_ms": 90000000, "last_sms_ms": 5}}}}
+        """)
+        XCTAssertEqual(PlatformAttention.evaluate(status: json).map(\.reason), [.silent(hours: 12, since: 7)])
+    }
+
+    func testUnpairedGoogleIgnoresTheSMSPath() {
+        let json = status("""
+        {"google": {"connected": false, "paired": false},
+         "freshness": {"google": {"stale": false, "sms_path": {"stalled": true, "silent_ms": 90000000}}}}
+        """)
+        XCTAssertEqual(PlatformAttention.evaluate(status: json), [])
+    }
+
+    // One notification per SMS outage, kept apart from the relay-silence
+    // latch: Google can be SMS-stopped and then silent within one outage.
+    func testSMSLatchNotifiesOncePerEpisodeAndSeparatelyFromSilence() {
+        let stopped = PlatformAttention(key: "google", name: "Google Messages", reason: .smsStopped(hours: 25, since: 100))
+        let later = PlatformAttention(key: "google", name: "Google Messages", reason: .smsStopped(hours: 49, since: 100))
+        let next = PlatformAttention(key: "google", name: "Google Messages", reason: .smsStopped(hours: 24, since: 900))
+        let silent = PlatformAttention(key: "google", name: "Google Messages", reason: .silent(hours: 13, since: 500))
+        var smsLatch = SilenceNotificationLatch()
+        var silenceLatch = SilenceNotificationLatch()
+        XCTAssertEqual(smsLatch.newlyStoppedSMS([stopped]), [stopped])
+        XCTAssertEqual(smsLatch.newlyStoppedSMS([later]), [])
+        XCTAssertEqual(silenceLatch.newlySilent([silent]), [silent])
+        XCTAssertEqual(smsLatch.newlyStoppedSMS([silent]), [])
+        XCTAssertEqual(silenceLatch.newlySilent([stopped]), [])
+        XCTAssertEqual(smsLatch.newlyStoppedSMS([later]), [], "a relay silence in between does not re-arm the SMS episode")
+        XCTAssertEqual(smsLatch.newlyStoppedSMS([next]), [next])
+    }
 }

@@ -17,6 +17,13 @@ struct PlatformAttention: Equatable {
         /// `since` is the silence's last event (ms), which identifies the
         /// episode.
         case silent(hours: Int, since: Int64)
+        /// Google Messages is connected and not stale, and RCS keeps arriving,
+        /// but no incoming SMS for longer than this phone's usual gaps
+        /// (`freshness.google.sms_path.stalled`). From 2026-10-03 to 10-07 a
+        /// Pixel's IMS stack lost its SMS layer for four days while every
+        /// other check stayed green; a phone restart fixed it. `since` is the
+        /// last incoming SMS (ms), which identifies the episode.
+        case smsStopped(hours: Int, since: Int64)
     }
 
     let key: String
@@ -43,12 +50,24 @@ struct PlatformAttention: Equatable {
             if needsPairing || needsReauth || (paired && !connected) {
                 return PlatformAttention(key: platform.key, name: platform.name, reason: .needsRepair)
             }
+            let fresh = freshness?[platform.key] as? [String: Any]
+            let stale = (fresh?["stale"] as? Bool) ?? false
+            // Only Google publishes an SMS path, and only an otherwise healthy
+            // entry reads it: a stale platform's own reason explains more.
+            if paired, !stale,
+               let smsPath = fresh?["sms_path"] as? [String: Any],
+               (smsPath["stalled"] as? Bool) ?? false {
+                let silentMS = (smsPath["silent_ms"] as? NSNumber)?.doubleValue ?? 0
+                let since = (smsPath["last_sms_ms"] as? NSNumber)?.int64Value ?? 0
+                let hours = max(1, Int(silentMS / 3_600_000))
+                return PlatformAttention(
+                    key: platform.key, name: platform.name, reason: .smsStopped(hours: hours, since: since)
+                )
+            }
             // `connected` can stay true while a bridge has silently stopped
             // delivering. Trust freshness: a paired platform flagged stale
             // needs attention even while it reports connected.
-            guard paired,
-                  let fresh = freshness?[platform.key] as? [String: Any],
-                  (fresh["stale"] as? Bool) ?? false else {
+            guard paired, let fresh, stale else {
                 return nil
             }
             if (fresh["stale_reason"] as? String) == "silent" {
@@ -79,8 +98,13 @@ struct PlatformAttention: Equatable {
         default: sentences.append("\(repair.joined(separator: ", ")) need re-pairing — they have stopped syncing.")
         }
         for item in items {
-            if case let .silent(hours, _) = item.reason {
+            switch item.reason {
+            case let .silent(hours, _):
                 sentences.append(silentSentence(item, hours: hours))
+            case let .smsStopped(hours, _):
+                sentences.append(smsStoppedSentence(hours: hours))
+            case .needsRepair:
+                break
             }
         }
         return sentences.isEmpty ? nil : sentences.joined(separator: " ")
@@ -90,6 +114,18 @@ struct PlatformAttention: Equatable {
     static func silentNotificationBody(_ item: PlatformAttention) -> String? {
         guard case let .silent(hours, _) = item.reason else { return nil }
         return silentSentence(item, hours: hours)
+    }
+
+    /// Body of the one-time notification for a phone that stopped receiving SMS.
+    static func smsStoppedNotificationBody(_ item: PlatformAttention) -> String? {
+        guard case let .smsStopped(hours, _) = item.reason else { return nil }
+        return smsStoppedSentence(hours: hours)
+    }
+
+    private static func smsStoppedSentence(hours: Int) -> String {
+        let span = hours == 1 ? "1 hour" : "\(hours) hours"
+        return "Your phone has received no SMS for \(span), longer than usual, while RCS still arrives, "
+            + "so texts and codes from non-RCS senders may not be getting through. Try restarting the phone."
     }
 
     private static func silentSentence(_ item: PlatformAttention, hours: Int) -> String {
@@ -120,8 +156,28 @@ struct SilenceNotificationLatch {
     /// Silent items not yet notified for their current episode. Marks them
     /// notified.
     mutating func newlySilent(_ items: [PlatformAttention]) -> [PlatformAttention] {
+        newlyNotified(items) { reason in
+            if case let .silent(_, since) = reason { return since }
+            return nil
+        }
+    }
+
+    /// Stopped-SMS items not yet notified for their current episode. Keep a
+    /// separate latch for these: episodes are keyed by platform, and Google
+    /// can be silent and SMS-stopped in turn.
+    mutating func newlyStoppedSMS(_ items: [PlatformAttention]) -> [PlatformAttention] {
+        newlyNotified(items) { reason in
+            if case let .smsStopped(_, since) = reason { return since }
+            return nil
+        }
+    }
+
+    private mutating func newlyNotified(
+        _ items: [PlatformAttention],
+        episode: (PlatformAttention.Reason) -> Int64?
+    ) -> [PlatformAttention] {
         items.filter { item in
-            guard case let .silent(_, since) = item.reason else { return false }
+            guard let since = episode(item.reason) else { return false }
             if notifiedEpisode[item.key] == since { return false }
             notifiedEpisode[item.key] = since
             return true

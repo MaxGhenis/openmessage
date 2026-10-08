@@ -63,6 +63,8 @@ final class NotificationManager: NSObject, ObservableObject, UNUserNotificationC
     private var bootstrapTask: Task<Void, Never>?
     private var silenceLatch: SilenceNotificationLatch
     private let silenceLatchKey = "silenceNotifiedEpisodes"
+    private var smsLatch: SilenceNotificationLatch
+    private let smsLatchKey = "smsStoppedNotifiedEpisodes"
     private var lastSeenTimestamps: [String: Int64] = [:]
     private var seenMessageIDs = Set<String>()
     private var seenMessageOrder: [String] = []
@@ -89,6 +91,10 @@ final class NotificationManager: NSObject, ObservableObject, UNUserNotificationC
         let stored = defaults.dictionary(forKey: silenceLatchKey) ?? [:]
         self.silenceLatch = SilenceNotificationLatch(
             notifiedEpisode: stored.compactMapValues { ($0 as? NSNumber)?.int64Value }
+        )
+        let storedSMS = defaults.dictionary(forKey: smsLatchKey) ?? [:]
+        self.smsLatch = SilenceNotificationLatch(
+            notifiedEpisode: storedSMS.compactMapValues { ($0 as? NSNumber)?.int64Value }
         )
         super.init()
         UNUserNotificationCenter.current().delegate = self
@@ -344,8 +350,9 @@ final class NotificationManager: NSObject, ObservableObject, UNUserNotificationC
 
     /// Alerts the user once when a messaging platform enters a state that needs
     /// manual intervention (Google Messages flagged for re-pair, WhatsApp
-    /// logged out, or a paired platform silent for longer than its own traffic
-    /// explains) and won't self-heal. Re-arms after the platform recovers so a
+    /// logged out, a paired platform silent for longer than its own traffic
+    /// explains, or a phone that stopped receiving SMS while RCS flows) and
+    /// won't self-heal. Re-arms after the platform recovers so a
     /// later outage alerts again. Without this a platform can go dark for days
     /// with no signal beyond a subtle in-app badge.
     private func checkPlatformHealth() async {
@@ -380,6 +387,14 @@ final class NotificationManager: NSObject, ObservableObject, UNUserNotificationC
         for item in newlySilent {
             guard let body = PlatformAttention.silentNotificationBody(item) else { continue }
             sendHealthNotification(key: "\(item.key)-silent", title: "\(item.name) has gone quiet", body: body)
+        }
+        let newlyStoppedSMS = smsLatch.newlyStoppedSMS(attention)
+        if !newlyStoppedSMS.isEmpty {
+            defaults.set(smsLatch.notifiedEpisode.mapValues { NSNumber(value: $0) }, forKey: smsLatchKey)
+        }
+        for item in newlyStoppedSMS {
+            guard let body = PlatformAttention.smsStoppedNotificationBody(item) else { continue }
+            sendHealthNotification(key: "\(item.key)-sms", title: "Your phone stopped receiving SMS", body: body)
         }
     }
 
