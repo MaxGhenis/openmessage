@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
+	"go.mau.fi/mautrix-gmessages/pkg/libgm/events"
 
 	"github.com/maxghenis/openmessage/internal/client"
 	"github.com/maxghenis/openmessage/internal/db"
@@ -194,6 +195,12 @@ type App struct {
 	tempDataDir               string
 	pendingMediaMu            sync.Mutex
 	pendingMedia              map[string]struct{}
+	// googleAccountSwitch is the single source of truth for
+	// GoogleStatusSnapshot.AccountSwitched: the phone said Google Messages now
+	// uses Google-account pairing, so it refuses this QR-paired session's
+	// requests while still pushing inbound updates.
+	googleAccountSwitchMu sync.Mutex
+	googleAccountSwitch   googleAccountSwitchState
 }
 
 type GoogleStatusSnapshot struct {
@@ -304,6 +311,163 @@ func (a *App) GooglePhoneResponding() bool {
 		return true
 	}
 	return a.googlePhoneResponding.Load()
+}
+
+// googleAccountSwitchState records the phone's report that Google Messages
+// switched to Google-account pairing. sessionKey names the QR-paired session
+// the report was about, so a new pairing never inherits it.
+type googleAccountSwitchState struct {
+	switched   bool
+	account    string
+	at         time.Time
+	sessionKey string
+}
+
+// googleQRSessionKey identifies a QR-paired session by its browser device ID.
+// ok is false for a missing client or auth data and for a Google-account
+// session: the account-switch signal is only interpreted for QR sessions,
+// because whether Google-account sessions also receive it is unverified and a
+// false positive there would refuse every send on a correctly paired install.
+func googleQRSessionKey(cli *client.Client) (string, bool) {
+	if cli == nil || cli.GM == nil || cli.GM.AuthData == nil {
+		return "", false
+	}
+	auth := cli.GM.AuthData
+	if auth.IsGoogleAccount() {
+		return "", false
+	}
+	return auth.Browser.GetSourceID(), true
+}
+
+// applyGoogleAccountChange records one libgm AccountChange for the session
+// cli. Following the mautrix-gmessages connector (Enabled || IsFake), the
+// phone has switched when the event is enabled or was synthesized from an
+// account-container frame (IsFake); a real event with Enabled=false switches
+// it back. libgm calls it synchronously on its receive goroutine, before it
+// hands the response that carried the container to the waiting request, so
+// it only takes the flag's own short lock.
+func (a *App) applyGoogleAccountChange(cli *client.Client, evt *events.AccountChange) {
+	if evt == nil {
+		return
+	}
+	switched := evt.GetEnabled() || evt.IsFake
+	if !switched {
+		a.clearGoogleAccountSwitch("phone_reported_pairing_switched_back")
+		return
+	}
+	a.recordGoogleAccountSwitch(cli, evt.GetAccount(), "account_change_event")
+}
+
+// NoteGoogleAccountSwitch records that a send response from the session cli
+// carried the phone's Google-account switch. It is a no-op for a
+// Google-account session.
+func (a *App) NoteGoogleAccountSwitch(cli *client.Client, account string) {
+	a.recordGoogleAccountSwitch(cli, account, "send_response")
+}
+
+func (a *App) recordGoogleAccountSwitch(cli *client.Client, account, source string) {
+	key, ok := googleQRSessionKey(cli)
+	if !ok {
+		return
+	}
+	// A send that started on a replaced session can answer after another
+	// session was installed; its report must not overwrite that session's.
+	if installed := a.GetClient(); installed != nil && installed != cli {
+		if installedKey, qr := googleQRSessionKey(installed); !qr || installedKey != key {
+			return
+		}
+	}
+	account = strings.TrimSpace(account)
+	a.googleAccountSwitchMu.Lock()
+	previous := a.googleAccountSwitch
+	rising := !previous.switched || previous.sessionKey != key
+	changed := rising
+	if rising {
+		a.googleAccountSwitch = googleAccountSwitchState{
+			switched:   true,
+			account:    account,
+			at:         time.Now(),
+			sessionKey: key,
+		}
+	} else if account != "" && account != previous.account {
+		a.googleAccountSwitch.account = account
+		changed = true
+	}
+	a.googleAccountSwitchMu.Unlock()
+	if !changed {
+		return
+	}
+	if rising {
+		a.Logger.Warn().
+			Str("account", account).
+			Str("source", source).
+			Msg("Phone switched Google Messages to Google-account pairing; this QR-paired session still receives messages but cannot send")
+	}
+	a.emitStatusChange(a.Connected.Load())
+}
+
+// ClearGoogleAccountSwitch forgets the phone's account-switch report, e.g.
+// after the phone served this session (a real conversation or a successful
+// send) or after the session was unpaired or invalidated.
+func (a *App) ClearGoogleAccountSwitch() {
+	a.clearGoogleAccountSwitch("phone_served_session")
+}
+
+func (a *App) clearGoogleAccountSwitch(reason string) {
+	a.googleAccountSwitchMu.Lock()
+	previous := a.googleAccountSwitch
+	a.googleAccountSwitch = googleAccountSwitchState{}
+	a.googleAccountSwitchMu.Unlock()
+	if !previous.switched {
+		return
+	}
+	a.Logger.Info().
+		Str("reason", reason).
+		Msg("Google-account pairing switch cleared for this session")
+	a.emitStatusChange(a.Connected.Load())
+}
+
+// forgetGoogleAccountSwitchForNewSession clears a report about another
+// session before cli is installed: a new pairing (another browser ID, or a
+// Google-account session) never inherits it. Reinstalling the same session
+// keeps it, because the phone may not resend its account container on
+// reconnect; proof that the phone serves the session clears it instead.
+func (a *App) forgetGoogleAccountSwitchForNewSession(cli *client.Client) {
+	a.googleAccountSwitchMu.Lock()
+	previous := a.googleAccountSwitch
+	key, ok := googleQRSessionKey(cli)
+	stale := previous.switched && (!ok || key != previous.sessionKey)
+	if stale {
+		a.googleAccountSwitch = googleAccountSwitchState{}
+	}
+	a.googleAccountSwitchMu.Unlock()
+	if stale {
+		a.Logger.Info().Msg("Google-account pairing switch cleared: a different Google Messages session is being installed")
+		a.emitStatusChange(a.Connected.Load())
+	}
+}
+
+// GoogleAccountSwitch reports whether the phone said it switched Google
+// Messages to Google-account pairing for the installed QR-paired session,
+// and the Google account it named (empty when unknown).
+func (a *App) GoogleAccountSwitch() (bool, string) {
+	state := a.currentGoogleAccountSwitch()
+	return state.switched, state.account
+}
+
+func (a *App) currentGoogleAccountSwitch() googleAccountSwitchState {
+	a.googleAccountSwitchMu.Lock()
+	state := a.googleAccountSwitch
+	a.googleAccountSwitchMu.Unlock()
+	if !state.switched {
+		return googleAccountSwitchState{}
+	}
+	if cli := a.GetClient(); cli != nil {
+		if key, ok := googleQRSessionKey(cli); !ok || key != state.sessionKey {
+			return googleAccountSwitchState{}
+		}
+	}
+	return state
 }
 
 func DefaultDataDir() string {
@@ -561,6 +725,7 @@ func (a *App) LoadAndConnect() error {
 		a.setGoogleLastError(err.Error())
 		return fmt.Errorf("create client: %w", err)
 	}
+	a.forgetGoogleAccountSwitchForNewSession(cli)
 	a.setClient(cli)
 
 	a.EventHandler = &client.EventHandler{
@@ -600,8 +765,16 @@ func (a *App) LoadAndConnect() error {
 			a.emitStatusChange(false)
 			a.Logger.Warn().Msg("Google Messages connection lost; will attempt to reconnect")
 		},
+		OnAccountChange: func(evt *events.AccountChange) {
+			// A replaced client's late event must not describe the new one.
+			if a.GetClient() != cli {
+				return
+			}
+			a.applyGoogleAccountChange(cli, evt)
+		},
 		OnSessionInvalid: func() {
 			a.Connected.Store(false)
+			a.ClearGoogleAccountSwitch()
 			a.setClient(nil)
 			if err := os.Remove(a.SessionPath); err != nil && !os.IsNotExist(err) {
 				a.Logger.Warn().Err(err).Msg("Failed to remove invalidated Google Messages session")
@@ -673,6 +846,7 @@ func isGoogleAuthInvalid(err error) bool {
 // Unpair deletes the session file so the app can re-pair.
 func (a *App) Unpair() error {
 	a.Connected.Store(false)
+	a.ClearGoogleAccountSwitch()
 	a.setGoogleLastError("")
 	a.emitStatusChange(false)
 	if cli := a.GetClient(); cli != nil {
@@ -775,7 +949,7 @@ func (a *App) GoogleStatus() GoogleStatusSnapshot {
 	a.statusMu.Unlock()
 	connected := a.Connected.Load()
 	paired := a.GooglePaired()
-	return GoogleStatusSnapshot{
+	snapshot := GoogleStatusSnapshot{
 		Connected:    connected,
 		Paired:       paired,
 		NeedsPairing: !connected && !paired,
@@ -791,6 +965,15 @@ func (a *App) GoogleStatus() GoogleStatusSnapshot {
 		RepairsPaced:    a.GoogleRepairsPaced(),
 		PullHealth:      a.GooglePullHealth(),
 	}
+	// The account switch is reported independently of needs_repair: the
+	// session is not broken (inbound sync keeps working), the phone just
+	// refuses its requests until it is re-linked or switched back.
+	if switchState := a.currentGoogleAccountSwitch(); paired && switchState.switched {
+		snapshot.AccountSwitched = true
+		snapshot.SwitchedAccount = switchState.account
+		snapshot.AccountSwitchedAtMS = switchState.at.UnixMilli()
+	}
+	return snapshot
 }
 
 // SetGoogleRepairPaceCounter installs the supervisor's paced-repair counter so
