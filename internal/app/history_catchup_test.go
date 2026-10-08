@@ -216,26 +216,54 @@ func hcdNewV2(t *testing.T) *hcdV2 {
 
 func (v *hcdV2) stop() { v.stopOnce.Do(v.stopFn) }
 
-// drain waits until the worker has processed every inbox row. History frames
-// mark their row processed only after the insert, the reaction snapshot and
-// the recency bump (worker.go applyEvents), so an empty queue means every
-// history projection has committed. The worker is single-goroutine, so any
-// earlier live frame has finished too.
+// drain waits until the worker has settled: every inbox row is processed and
+// its counters have stopped moving. An empty unprocessed set alone is not
+// enough. A re-fetched frame is replayed from the worker's in-memory queue
+// without ever being an unprocessed row, and a counter is bumped just after
+// its row is marked processed; on a slow machine a test that read the counters
+// the moment the inbox emptied saw them a few frames short.
 func (v *hcdV2) drain(t *testing.T) {
 	t.Helper()
-	deadline := time.Now().Add(20 * time.Second)
+	const quiet = 15 // consecutive unchanged polls, 10 ms apart
+	deadline := time.Now().Add(30 * time.Second)
+	last := v.snapshot()
+	stable := 0
 	for {
 		pending, err := v.messages.Unprocessed(context.Background())
 		if err != nil {
 			t.Fatalf("Unprocessed(): %v", err)
 		}
-		if len(pending) == 0 {
-			return
+		current := v.snapshot()
+		if len(pending) == 0 && current == last {
+			stable++
+			if stable >= quiet {
+				return
+			}
+		} else {
+			stable = 0
+			last = current
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("v2 inbox still holds %d unprocessed frames after the drain deadline", len(pending))
+			t.Fatalf("v2 ingest did not settle before the deadline: %d unprocessed frames, counters %+v", len(pending), current)
 		}
-		time.Sleep(2 * time.Millisecond)
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// await waits for the worker's counters to satisfy done. Use it for counts
+// that come from replays, which the worker handles after the inbox is empty.
+func (v *hcdV2) await(t *testing.T, what string, done func(ingest.CounterSnapshot) bool) ingest.CounterSnapshot {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		current := v.snapshot()
+		if done(current) {
+			return current
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s; counters %+v", what, current)
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 
@@ -1442,7 +1470,7 @@ func TestHistoryDeepBackfillTwiceIsIdempotentInV2(t *testing.T) {
 			t.Errorf("inbox rows %d then %d, want %d both times", firstInbox, secondInbox, firstCalls)
 			ok = false
 		}
-		// Byte-identical re-fetches share the live/history dedupe key, so the
+		// A byte-identical re-fetch dedupes onto its own history row, so the
 		// second run is counted as history_deduped and appends nothing.
 		if second.HistoryAppended != first.HistoryAppended ||
 			second.HistoryDeduped-first.HistoryDeduped != uint64(secondCalls-firstCalls) {
@@ -1703,7 +1731,11 @@ func TestHistoryWindowBackfillFillsHoleBelowNewerMessages(t *testing.T) {
 	// the live frames, are appended. h-new-1 and h-new-2's changed copy are
 	// skipped as existing. The second run's 17 frames all dedupe onto their
 	// history rows and are replayed; its 13 messages are all found existing.
-	c := v2.snapshot()
+	// Replays are handled from the worker's queue after the inbox is empty,
+	// so wait for them (17 is well under the queue's capacity; none is dropped).
+	c := v2.await(t, "the second run's replays", func(s ingest.CounterSnapshot) bool {
+		return s.HistoryExisting-before.HistoryExisting >= 2+13
+	})
 	if got := c.HistoryAppended - before.HistoryAppended; got != 17 {
 		t.Errorf("history_appended +%d, want +17", got)
 	}
