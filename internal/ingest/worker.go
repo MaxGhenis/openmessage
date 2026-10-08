@@ -80,6 +80,9 @@ type Worker struct {
 
 	changeMu sync.Mutex
 	changed  chan struct{}
+
+	// recentDeclines feeds recoverPreResetDeclines (see idspace.go).
+	recentDeclines declineLog
 }
 
 // NewWorker validates and copies its explicitly configured decoder
@@ -484,6 +487,11 @@ func (w *Worker) applyEvents(
 			}
 			continue
 		}
+		if platform == bridge.PlatformGoogle {
+			if err := w.retireReusedRemoteMessageID(ctx, projection.Message); err != nil {
+				return false, err
+			}
+		}
 		if messageCount == 0 {
 			if err := w.messages.ProjectMessage(ctx, projection); err != nil {
 				return false, err
@@ -831,7 +839,11 @@ func (w *Worker) refreshConversation(
 		}
 		conversation.Title = event.Title
 		conversation.RemoteRevision = optionalTrimmed(event.RemoteRevision)
-		conversation.UpdatedAtMS = nowMS
+		// Never move updated_at backwards: a row minted from a message frame
+		// carries the phone's timestamp, which can lead this clock when the
+		// phone's clock runs ahead, and the schema requires updated_at_ms >=
+		// created_at_ms.
+		conversation.UpdatedAtMS = max(conversation.UpdatedAtMS, nowMS)
 	}
 	if err := w.store.UpsertConversation(conversation); err != nil {
 		return sqlite.Conversation{}, err
@@ -858,6 +870,13 @@ func (w *Worker) refreshConversation(
 	}
 	if err := w.store.ReplaceConversationParticipants(conversation.ConversationID, participants); err != nil {
 		return sqlite.Conversation{}, err
+	}
+	if platform == bridge.PlatformGoogle {
+		// The phone just announced this thread under remoteID: it is live in
+		// the current device ID space (see idspace.go).
+		if err := w.markGoogleConversationAnnounced(accountID, conversation.ConversationID); err != nil {
+			return sqlite.Conversation{}, err
+		}
 	}
 	return conversation, nil
 }
@@ -907,7 +926,21 @@ func (w *Worker) ensureMessageConversation(
 		return sqlite.Conversation{}, "", err
 	}
 	conversation, err = w.store.GetConversationByRemote(accountID, remoteID)
-	return conversation, remoteID, err
+	if err != nil {
+		return sqlite.Conversation{}, "", err
+	}
+	if platform == bridge.PlatformGoogle {
+		// No ConversationEvent has described this thread yet: it is
+		// provisional in the current device ID space (see idspace.go).
+		epoch, err := w.store.RemoteIDSpaceEpoch(accountID)
+		if err != nil {
+			return sqlite.Conversation{}, "", err
+		}
+		if err := w.store.MarkConversationProvisional(accountID, conversation.ConversationID, epoch); err != nil {
+			return sqlite.Conversation{}, "", err
+		}
+	}
+	return conversation, remoteID, nil
 }
 
 func (w *Worker) existingConversation(
