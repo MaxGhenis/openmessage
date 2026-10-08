@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -167,13 +168,13 @@ func (a *App) sendSMSMedia(conversationID string, data []byte, filename, mime, c
 	if err != nil {
 		return nil, fmt.Errorf("upload media: %w", err)
 	}
-	conv, err := cli.GM.GetConversation(conversationID)
+	conv, err := cli.GM.GetConversation(context.Background(), conversationID)
 	if err != nil {
 		return nil, fmt.Errorf("get conversation: %w", err)
 	}
 	myParticipantID, simPayload := ExtractSIMAndParticipant(conv)
 	payload := BuildSendMediaPayload(conversationID, media, myParticipantID, simPayload)
-	resp, err := cli.GM.SendMessage(payload)
+	resp, err := cli.GM.SendMessage(context.Background(), payload)
 	if err != nil {
 		return nil, fmt.Errorf("send message: %w", err)
 	}
@@ -239,13 +240,13 @@ func (a *App) sendSMSText(conversationID, body, replyToID string) (*db.Message, 
 	if cli == nil {
 		return nil, errors.New(ErrNotConnected)
 	}
-	conv, err := cli.GM.GetConversation(conversationID)
+	conv, err := cli.GM.GetConversation(context.Background(), conversationID)
 	if err != nil {
 		return nil, fmt.Errorf("get conversation: %w", err)
 	}
 	myParticipantID, simPayload := ExtractSIMAndParticipant(conv)
 	payload := BuildSendPayload(conversationID, body, replyToID, myParticipantID, simPayload)
-	resp, err := cli.GM.SendMessage(payload)
+	resp, err := cli.GM.SendMessage(context.Background(), payload)
 	if err != nil {
 		return nil, fmt.Errorf("send message: %w", err)
 	}

@@ -93,7 +93,7 @@ func runQRPairing(logger zerolog.Logger, cli *client.Client, sessionPath string)
 	}()
 
 	// Start login - shows first QR code
-	qrURL, err := cli.GM.StartLogin()
+	qrURL, err := cli.GM.StartLogin(context.Background())
 	if err != nil {
 		return fmt.Errorf("start login: %w", err)
 	}
@@ -180,24 +180,73 @@ func runGoogleAccountPairing(cli *client.Client, sessionPath, rawInput string) e
 	cli.GM.AuthData.Cookies = cookies
 
 	fmt.Println("Starting Google account pairing...")
-	err = cli.GM.DoGaiaPairing(context.Background(), func(emoji string) {
-		fmt.Println("EMOJI:", emoji)
-		fmt.Println("Tap this emoji in Google Messages on your phone.")
-	})
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	return completeGoogleAccountPairing(ctx, cli.GM, cli.SessionData, sessionPath, os.Stdout)
+}
+
+type googleAccountPairer interface {
+	StartGaiaPairing(context.Context, context.Context) (string, *libgm.PairingSession, error)
+	FinishGaiaPairing(context.Context, *libgm.PairingSession) (string, error)
+}
+
+func completeGoogleAccountPairing(ctx context.Context, pairer googleAccountPairer, sessionData func() (*client.SessionData, error), sessionPath string, output io.Writer) error {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("start google account pairing: %w", err)
+	}
+	// Use the split API so this one-shot command can save the session before
+	// disconnecting. DoGaiaPairing also starts an asynchronous reconnect.
+	// Upstream startup can wait for the first long poll without honoring ctx.
+	// Do not let that wait trap the CLI's signal handler. A buffered result lets
+	// a late startup return without blocking or continuing into Finish/save.
+	// This is one-shot CLI code: an upstream waiter that never returns is only
+	// released by process exit, so this wrapper must not be used by the daemon.
+	type startResult struct {
+		emoji   string
+		pairing *libgm.PairingSession
+		err     error
+	}
+	started := make(chan startResult, 1)
+	go func() {
+		emoji, pairing, err := pairer.StartGaiaPairing(ctx, ctx)
+		started <- startResult{emoji, pairing, err}
+	}()
+	var result startResult
+	select {
+	case <-ctx.Done():
+		return fmt.Errorf("start google account pairing: %w", ctx.Err())
+	case result = <-started:
+	}
+	// Cancellation wins even if both the context and result became ready.
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("start google account pairing: %w", err)
+	}
+	if result.err != nil {
+		return fmt.Errorf("start google account pairing: %w", result.err)
+	}
+	fmt.Fprintln(output, "EMOJI:", result.emoji)
+	fmt.Fprintln(output, "Tap this emoji in Google Messages on your phone.")
+	_, err := pairer.FinishGaiaPairing(ctx, result.pairing)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return fmt.Errorf("google account pairing: %w", ctxErr)
+	}
 	if err != nil {
 		return fmt.Errorf("google account pairing: %w", err)
 	}
 
-	sessionData, err := cli.SessionData()
+	data, err := sessionData()
 	if err != nil {
 		return fmt.Errorf("get session data: %w", err)
 	}
-	if err := client.SaveSession(sessionPath, sessionData); err != nil {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("google account pairing: %w", err)
+	}
+	if err := client.SaveSession(sessionPath, data); err != nil {
 		return fmt.Errorf("save session: %w", err)
 	}
-	fmt.Println("\nPairing successful!")
-	fmt.Println("Session saved to", sessionPath)
-	fmt.Println("You can now run: openmessage serve")
+	fmt.Fprintln(output, "\nPairing successful!")
+	fmt.Fprintln(output, "Session saved to", sessionPath)
+	fmt.Fprintln(output, "You can now run: openmessage serve")
 	return nil
 }
 

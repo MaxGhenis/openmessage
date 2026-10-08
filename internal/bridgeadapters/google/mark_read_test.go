@@ -297,7 +297,7 @@ type fakeReadSendClient struct {
 	messageID      string
 }
 
-func (f *fakeReadSendClient) MarkRead(conversationID, messageID string) error {
+func (f *fakeReadSendClient) MarkRead(ctx context.Context, conversationID, messageID string) error {
 	f.calls++
 	f.conversationID = conversationID
 	f.messageID = messageID

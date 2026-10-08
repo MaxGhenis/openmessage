@@ -1254,13 +1254,13 @@ type fakeTextSendClient struct {
 	sent              *gmproto.SendMessageRequest
 }
 
-func (f *fakeTextSendClient) GetConversation(conversationID string) (*gmproto.Conversation, error) {
+func (f *fakeTextSendClient) GetConversation(ctx context.Context, conversationID string) (*gmproto.Conversation, error) {
 	f.conversationCalls++
 	f.conversationID = conversationID
 	return f.conversationResult, f.conversationErr
 }
 
-func (f *fakeTextSendClient) SendMessage(payload *gmproto.SendMessageRequest) (*gmproto.SendMessageResponse, error) {
+func (f *fakeTextSendClient) SendMessage(ctx context.Context, payload *gmproto.SendMessageRequest) (*gmproto.SendMessageResponse, error) {
 	f.sendCalls++
 	f.sent = payload
 	return f.sendResult, f.sendErr
@@ -1313,13 +1313,13 @@ type fakeReactionSendClient struct {
 	sent              *gmproto.SendReactionRequest
 }
 
-func (f *fakeReactionSendClient) GetConversation(conversationID string) (*gmproto.Conversation, error) {
+func (f *fakeReactionSendClient) GetConversation(ctx context.Context, conversationID string) (*gmproto.Conversation, error) {
 	f.conversationCalls++
 	f.conversationID = conversationID
 	return f.conversationResult, f.conversationErr
 }
 
-func (f *fakeReactionSendClient) SendReaction(payload *gmproto.SendReactionRequest) (*gmproto.SendReactionResponse, error) {
+func (f *fakeReactionSendClient) SendReaction(ctx context.Context, payload *gmproto.SendReactionRequest) (*gmproto.SendReactionResponse, error) {
 	f.sendCalls++
 	f.sent = payload
 	return f.sendResult, f.sendErr
@@ -1384,12 +1384,12 @@ func (f *fakeMediaSendClient) UploadMedia(data []byte, filename, mime string) (*
 	return f.uploadResult, f.uploadErr
 }
 
-func (f *fakeMediaSendClient) GetConversation(conversationID string) (*gmproto.Conversation, error) {
+func (f *fakeMediaSendClient) GetConversation(ctx context.Context, conversationID string) (*gmproto.Conversation, error) {
 	f.conversationID = conversationID
 	return f.conversationResult, f.conversationErr
 }
 
-func (f *fakeMediaSendClient) SendMessage(payload *gmproto.SendMessageRequest) (*gmproto.SendMessageResponse, error) {
+func (f *fakeMediaSendClient) SendMessage(ctx context.Context, payload *gmproto.SendMessageRequest) (*gmproto.SendMessageResponse, error) {
 	f.sent = append(f.sent, payload)
 	index := len(f.sent) - 1
 	var result *gmproto.SendMessageResponse

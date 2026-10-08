@@ -601,7 +601,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 	if fetchLinkPreviewImage == nil {
 		fetchLinkPreviewImage = linkPreviewService.FetchImage
 	}
-	sendMediaBytes := func(w http.ResponseWriter, convID string, data []byte, filename, mimeType, caption, replyToID, idempotencyKey string) {
+	sendMediaBytes := func(ctx context.Context, w http.ResponseWriter, convID string, data []byte, filename, mimeType, caption, replyToID, idempotencyKey string) {
 		proceed, handled := claimIdempotentSend(w, idempotencyKey, convID)
 		if !handled || !proceed {
 			return
@@ -683,7 +683,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			return
 		}
 
-		conv, err := cli.GM.GetConversation(convID)
+		conv, err := cli.GM.GetConversation(ctx, convID)
 		if err != nil {
 			if !markGoogleAuthExpired(err) {
 				recordGoogleSendError(err)
@@ -703,7 +703,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			Int("size", len(data)).
 			Msg("Sending media message")
 
-		resp, err := cli.GM.SendMessage(payload)
+		resp, err := cli.GM.SendMessage(ctx, payload)
 		if err != nil {
 			authExpired := markGoogleAuthExpired(err)
 			if !authExpired {
@@ -1755,7 +1755,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			return
 		}
 		// Fetch conversation to get SIM and participant info
-		conv, err := cli.GM.GetConversation(req.ConversationID)
+		conv, err := cli.GM.GetConversation(r.Context(), req.ConversationID)
 		if err != nil {
 			if !markGoogleAuthExpired(err) {
 				recordGoogleSendError(err)
@@ -1775,7 +1775,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			Bool("has_sim", simPayload != nil).
 			Msg("Sending message")
 
-		resp, err := cli.GM.SendMessage(payload)
+		resp, err := cli.GM.SendMessage(r.Context(), payload)
 		if err != nil {
 			authExpired := markGoogleAuthExpired(err)
 			if !authExpired {
@@ -1947,7 +1947,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			httpError(w, err.Error(), 400)
 			return
 		}
-		sendMediaBytes(w, convID, data, filename, mimeType, strings.TrimSpace(req.Caption), strings.TrimSpace(req.ReplyToID), idempotencyKey)
+		sendMediaBytes(r.Context(), w, convID, data, filename, mimeType, strings.TrimSpace(req.Caption), strings.TrimSpace(req.ReplyToID), idempotencyKey)
 	})
 
 	mux.HandleFunc("/api/send-media", func(w http.ResponseWriter, r *http.Request) {
@@ -1980,7 +1980,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		if !ok {
 			return
 		}
-		sendMediaBytes(w, convID, data, filename, mime, caption, replyToID, idempotencyKey)
+		sendMediaBytes(r.Context(), w, convID, data, filename, mime, caption, replyToID, idempotencyKey)
 	})
 
 	mux.HandleFunc("/api/media/", func(w http.ResponseWriter, r *http.Request) {
@@ -2126,7 +2126,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		// Get SIM payload from conversation
 		var sim *gmproto.SIMPayload
 		if req.ConversationID != "" {
-			if conv, err := cli.GM.GetConversation(req.ConversationID); err == nil {
+			if conv, err := cli.GM.GetConversation(r.Context(), req.ConversationID); err == nil {
 				_, sim = app.ExtractSIMAndParticipant(conv)
 			} else if markGoogleAuthExpired(err) {
 				httpError(w, googleAPIErrorMessage("get conversation", err), 502)
@@ -2135,7 +2135,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		}
 
 		payload := app.BuildReactionPayload(req.MessageID, req.Emoji, req.Action, sim)
-		resp, err := cli.GM.SendReaction(payload)
+		resp, err := cli.GM.SendReaction(r.Context(), payload)
 		if err != nil {
 			markGoogleAuthExpired(err)
 			httpError(w, googleAPIErrorMessage("send reaction", err), 502)
@@ -2281,7 +2281,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			return
 		}
 
-		convResp, err := cli.GM.GetOrCreateConversation(&gmproto.GetOrCreateConversationRequest{
+		convResp, err := cli.GM.GetOrCreateConversation(r.Context(), &gmproto.GetOrCreateConversationRequest{
 			Numbers: app.NewContactNumbers([]string{req.PhoneNumber}),
 		})
 		if err != nil {
@@ -2460,7 +2460,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		}
 
 		// Use the same send logic as /api/send
-		conv, err := cli.GM.GetConversation(draft.ConversationID)
+		conv, err := cli.GM.GetConversation(r.Context(), draft.ConversationID)
 		if err != nil {
 			if !markGoogleAuthExpired(err) {
 				recordGoogleSendError(err)
@@ -2478,7 +2478,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			Str("draft_id", req.DraftID).
 			Msg("Sending draft message")
 
-		resp, err := cli.GM.SendMessage(payload)
+		resp, err := cli.GM.SendMessage(r.Context(), payload)
 		if err != nil {
 			if !markGoogleAuthExpired(err) {
 				recordGoogleSendError(err)

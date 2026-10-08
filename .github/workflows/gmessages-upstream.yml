@@ -1,0 +1,92 @@
+name: GMessages Upstream Dependency
+
+on:
+  schedule:
+    - cron: "17 10 * * 1"
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - go.mod
+      - go.sum
+      - gmessages_upstream_contract_test.go
+      - .github/workflows/gmessages-upstream.yml
+
+permissions:
+  contents: read
+
+env:
+  UPSTREAM_REPOSITORY: mautrix/gmessages
+  UPSTREAM_BRANCH: main
+  UPSTREAM_MODULE: go.mau.fi/mautrix-gmessages
+  UPSTREAM_VERSION: v0.2608.1-0.20260910090721-b0d61b4e1a4e
+  UPSTREAM_COMMIT: b0d61b4e1a4e94f0d5e6fedd43cadb80bd0a9e51
+  AUTH_REFRESH_RETRY_COMMIT: 0b54a8fe65207f81d353ffe63f4d2549c2eb7976
+
+jobs:
+  dependency:
+    name: Verify canonical upstream dependency
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out the dependency contract
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Verify the module contract and public checksums
+        env:
+          GOWORK: "off"
+          GOPROXY: https://proxy.golang.org
+          GOSUMDB: sum.golang.org
+          GOPRIVATE: ""
+          GONOPROXY: ""
+          GONOSUMDB: ""
+        run: |
+          set -euo pipefail
+          go test gmessages_upstream_contract_test.go
+          go mod download
+          go mod verify
+
+      - name: Verify upstream provenance and freshness
+        run: |
+          set -euo pipefail
+          git init --quiet gmessages
+          cd gmessages
+          git remote add upstream "https://github.com/${UPSTREAM_REPOSITORY}.git"
+          git fetch --quiet --no-tags upstream \
+            "+refs/heads/${UPSTREAM_BRANCH}:refs/remotes/upstream/${UPSTREAM_BRANCH}"
+          upstream_ref="refs/remotes/upstream/${UPSTREAM_BRANCH}"
+
+          for commit in "${UPSTREAM_COMMIT}" "${AUTH_REFRESH_RETRY_COMMIT}"; do
+            git cat-file -e "${commit}^{commit}"
+          done
+          if ! git merge-base --is-ancestor "${UPSTREAM_COMMIT}" "${upstream_ref}"; then
+            echo "::error::The recorded dependency is not on the canonical upstream branch."
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "${AUTH_REFRESH_RETRY_COMMIT}" "${UPSTREAM_COMMIT}"; then
+            echo "::error::The dependency is missing the required auth-refresh retry fix."
+            exit 1
+          fi
+          commit_time="$(TZ=UTC git show -s --format=%cd --date=format-local:%Y%m%d%H%M%S "${UPSTREAM_COMMIT}")"
+          if [[ "${UPSTREAM_VERSION}" != *".${commit_time}-${UPSTREAM_COMMIT:0:12}" ]]; then
+            echo "::error::The recorded pseudo-version does not match the upstream commit and timestamp."
+            exit 1
+          fi
+
+          upstream_head="$(git rev-parse "${upstream_ref}")"
+          upstream_ahead="$(git rev-list --count "${UPSTREAM_COMMIT}..${upstream_ref}")"
+          {
+            echo "## Google Messages upstream dependency"
+            echo
+            echo "Module: ${UPSTREAM_MODULE}@${UPSTREAM_VERSION}"
+            echo "Recorded upstream revision: ${UPSTREAM_COMMIT}"
+            echo "Current upstream revision: ${upstream_head}"
+            echo "Upstream commits since the recorded revision: ${upstream_ahead}"
+          } >> "${GITHUB_STEP_SUMMARY}"
+          if [ "${upstream_ahead}" -ne 0 ]; then
+            echo "::error::Upstream advanced; review the changes and update the dependency and recorded contract together."
+            exit 1
+          fi
