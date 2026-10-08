@@ -33,6 +33,12 @@ func TestInboxPayloadRetentionFromEnv(t *testing.T) {
 		{name: "negative", value: "-3", want: sqlite.DefaultInboxPayloadRetention, wantNote: "not a whole number"},
 		{name: "fraction", value: "1.5", want: sqlite.DefaultInboxPayloadRetention, wantNote: "not a whole number"},
 		{name: "word", value: "off", want: sqlite.DefaultInboxPayloadRetention, wantNote: "not a whole number"},
+		{name: "at cap", value: "36500", want: 36500 * day},
+		{name: "above cap", value: "36501", want: 36500 * day, wantNote: "above the 36500-day cap"},
+		// 106,752 days is the first count whose nanoseconds overflow int64.
+		{name: "duration overflow", value: "106752", want: 36500 * day, wantNote: "above the 36500-day cap"},
+		{name: "far past overflow", value: "999999999999", want: 36500 * day, wantNote: "above the 36500-day cap"},
+		{name: "integer overflow", value: "99999999999999999999999", want: sqlite.DefaultInboxPayloadRetention, wantNote: "not a whole number"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -54,6 +60,18 @@ func TestInboxPayloadRetentionFromEnv(t *testing.T) {
 			}
 			if got != 0 && got < sqlite.MinInboxPayloadRetention {
 				t.Fatalf("retention %s is below the floor", got)
+			}
+			// Whatever the value, the stack must start: a retention the pruner
+			// rejects would keep the daemon from coming up.
+			stack, err := newV2Stack(v2StackDeps{Logger: zerolog.Nop(), DataDir: t.TempDir()})
+			if err != nil {
+				t.Fatalf("newV2Stack() with %s=%q: %v", inboxRetentionEnv, tt.value, err)
+			}
+			if err := stack.Store.Close(); err != nil {
+				t.Fatalf("close store: %v", err)
+			}
+			if (stack.pruner != nil) != (got != 0) {
+				t.Fatalf("pruner configured = %t for retention %s", stack.pruner != nil, got)
 			}
 		})
 	}

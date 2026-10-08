@@ -23,7 +23,7 @@ var targetCountTables = []string{
 	"read_cursors",
 }
 
-const migration0011Checksum = "95ecd6607310400fed66927b038b41a59a34aa244a77370c3f589bed33ec8312"
+const migration0011Checksum = "095a60107459a72ccb58ebab64c860676d6e282de2d076fe9a4cff5b1cb27ef4"
 
 func checkpointAndSyncSQLite(ctx context.Context, path string) error {
 	database, err := sql.Open("sqlite", path)

@@ -69,16 +69,54 @@ func (h *retentionHarness) advance(d time.Duration) {
 
 func retentionInboxRow(t *testing.T, path, dedupeKey string) (payload []byte, processed, quarantined, pruned sql.NullInt64) {
 	t.Helper()
+	state := retentionInboxState(t, path, dedupeKey)
+	return state.payload, state.processed, state.quarantined, state.pruned
+}
+
+type retentionRowState struct {
+	payload                                 []byte
+	processed, applied, quarantined, pruned sql.NullInt64
+}
+
+func retentionInboxState(t *testing.T, path, dedupeKey string) retentionRowState {
+	t.Helper()
 	database := i01OpenInspector(t, path)
 	defer database.Close()
+	var state retentionRowState
 	if err := database.QueryRow(`
-		SELECT payload, processed_at_ms, quarantined_at_ms, payload_pruned_at_ms
+		SELECT payload, processed_at_ms, applied_at_ms, quarantined_at_ms, payload_pruned_at_ms
 		FROM inbox
 		WHERE account_id = ? AND dedupe_key = ?
-	`, i01AccountID, dedupeKey).Scan(&payload, &processed, &quarantined, &pruned); err != nil {
+	`, i01AccountID, dedupeKey).Scan(
+		&state.payload, &state.processed, &state.applied, &state.quarantined, &state.pruned,
+	); err != nil {
 		t.Fatalf("read inbox %q: %v", dedupeKey, err)
 	}
-	return payload, processed, quarantined, pruned
+	return state
+}
+
+// appendAppliedFrame stores a frame the worker has fully applied, without
+// running a worker.
+func appendAppliedFrame(t *testing.T, messages *sqlite.MessageRepository, inboxID, dedupeKey string, payload []byte) {
+	t.Helper()
+	ctx := context.Background()
+	if _, err := messages.AppendInbox(ctx, sqlite.InboxRecord{
+		InboxID:      inboxID,
+		AccountID:    i01AccountID,
+		Generation:   1,
+		DedupeKey:    dedupeKey,
+		Codec:        i01Codec,
+		CodecVersion: 1,
+		Payload:      payload,
+	}); err != nil {
+		t.Fatalf("AppendInbox(%s): %v", inboxID, err)
+	}
+	if err := messages.MarkInboxProcessed(ctx, inboxID, i01AccountID); err != nil {
+		t.Fatalf("MarkInboxProcessed(%s): %v", inboxID, err)
+	}
+	if err := messages.MarkInboxApplied(ctx, inboxID, i01AccountID); err != nil {
+		t.Fatalf("MarkInboxApplied(%s): %v", inboxID, err)
+	}
 }
 
 // End to end: a quarantined frame is durably marked and keeps its payload
@@ -114,9 +152,11 @@ func TestPrunedFrameReplayDedupesAndQuarantinedFrameKeepsPayload(t *testing.T) {
 	if !quarantined.Valid || quarantined.Int64 <= 0 {
 		t.Fatalf("quarantined_at_ms = %+v, want a durable quarantine mark", quarantined)
 	}
-	_, _, notQuarantined, _ := retentionInboxRow(t, harness.path, frame.DedupeKey)
-	if notQuarantined.Valid {
-		t.Fatalf("projected frame quarantined_at_ms = %d, want NULL", notQuarantined.Int64)
+	if state := retentionInboxState(t, harness.path, frame.DedupeKey); state.quarantined.Valid || !state.applied.Valid {
+		t.Fatalf("projected frame applied=%+v quarantined=%+v, want applied only", state.applied, state.quarantined)
+	}
+	if state := retentionInboxState(t, harness.path, "quarantine:retention"); state.applied.Valid {
+		t.Fatalf("quarantined frame applied_at_ms = %d, want NULL", state.applied.Int64)
 	}
 
 	harness.advance(sqlite.DefaultInboxPayloadRetention + retentionTestDay)
@@ -182,20 +222,7 @@ func TestPayloadPrunerPrunesInBatchesUntilDone(t *testing.T) {
 	const frames = 7
 	for i := 0; i < frames; i++ {
 		inboxID := fmt.Sprintf("inbox-batch-%d", i)
-		if _, err := harness.messages.AppendInbox(ctx, sqlite.InboxRecord{
-			InboxID:      inboxID,
-			AccountID:    i01AccountID,
-			Generation:   1,
-			DedupeKey:    "key-" + inboxID,
-			Codec:        i01Codec,
-			CodecVersion: 1,
-			Payload:      []byte("0123456789"),
-		}); err != nil {
-			t.Fatalf("AppendInbox(%s): %v", inboxID, err)
-		}
-		if err := harness.messages.MarkInboxProcessed(ctx, inboxID, i01AccountID); err != nil {
-			t.Fatalf("MarkInboxProcessed(%s): %v", inboxID, err)
-		}
+		appendAppliedFrame(t, harness.messages, inboxID, "key-"+inboxID, []byte("0123456789"))
 	}
 	harness.advance(sqlite.MinInboxPayloadRetention + time.Millisecond)
 
@@ -230,20 +257,7 @@ func TestPayloadPrunerRunPrunesAfterStartDelayAndStopsOnCancel(t *testing.T) {
 		return nil, nil
 	}))
 	ctx := context.Background()
-	if _, err := harness.messages.AppendInbox(ctx, sqlite.InboxRecord{
-		InboxID:      "inbox-run",
-		AccountID:    i01AccountID,
-		Generation:   1,
-		DedupeKey:    "key-run",
-		Codec:        i01Codec,
-		CodecVersion: 1,
-		Payload:      []byte("payload"),
-	}); err != nil {
-		t.Fatalf("AppendInbox(): %v", err)
-	}
-	if err := harness.messages.MarkInboxProcessed(ctx, "inbox-run", i01AccountID); err != nil {
-		t.Fatalf("MarkInboxProcessed(): %v", err)
-	}
+	appendAppliedFrame(t, harness.messages, "inbox-run", "key-run", []byte("payload"))
 	harness.advance(sqlite.DefaultInboxPayloadRetention + time.Millisecond)
 
 	pruner, err := NewPayloadPruner(PayloadPrunerConfig{
@@ -315,20 +329,7 @@ func TestPayloadPrunerRunSkipsPassesWhileHoldFileExists(t *testing.T) {
 		return nil, nil
 	}))
 	ctx := context.Background()
-	if _, err := harness.messages.AppendInbox(ctx, sqlite.InboxRecord{
-		InboxID:      "inbox-held",
-		AccountID:    i01AccountID,
-		Generation:   1,
-		DedupeKey:    "key-held",
-		Codec:        i01Codec,
-		CodecVersion: 1,
-		Payload:      []byte("payload"),
-	}); err != nil {
-		t.Fatalf("AppendInbox(): %v", err)
-	}
-	if err := harness.messages.MarkInboxProcessed(ctx, "inbox-held", i01AccountID); err != nil {
-		t.Fatalf("MarkInboxProcessed(): %v", err)
-	}
+	appendAppliedFrame(t, harness.messages, "inbox-held", "key-held", []byte("payload"))
 	harness.advance(sqlite.DefaultInboxPayloadRetention + time.Millisecond)
 
 	holdPath := filepath.Join(t.TempDir(), "inbox-retention-hold")
@@ -424,5 +425,243 @@ func TestPayloadPrunerTreatsAnUncheckableHoldFileAsHeld(t *testing.T) {
 	pruner.holdPath = ""
 	if pruner.held() {
 		t.Fatal("held() = true with no hold path, want false")
+	}
+}
+
+// A failed replay is counted, but it does not quarantine the stored frame:
+// the row holds the original delivery, which projected, not the bytes that
+// failed. The original still ages out.
+func TestFailedReplayDoesNotQuarantineTheStoredFrame(t *testing.T) {
+	decoder := i01DecoderFunc(func(
+		_ context.Context,
+		record bridge.RawIngressRecord,
+	) ([]bridge.Event, error) {
+		if string(record.Payload) == "undecodable" {
+			return nil, fmt.Errorf("scripted decoder failure")
+		}
+		return i01OutgoingMessageEvents("remote-replay", string(record.Payload), ""), nil
+	})
+	harness := newRetentionHarness(t, decoder)
+	i01StartWorker(t, harness.worker)
+
+	frame := i01IngressRecord("msg:remote-replay:hash", []byte("body"))
+	i01MustAppend(t, harness.sink, frame)
+	i01WaitFor(t, "projection", func() bool {
+		return retentionInboxState(t, harness.path, frame.DedupeKey).applied.Valid
+	})
+
+	i01MustAppend(t, harness.sink, i01IngressRecord(frame.DedupeKey, []byte("undecodable")))
+	i01WaitFor(t, "failed replay", func() bool {
+		return harness.counters.Snapshot(i01AccountID).Quarantined == 1
+	})
+	state := retentionInboxState(t, harness.path, frame.DedupeKey)
+	if state.quarantined.Valid || !state.applied.Valid || string(state.payload) != "body" {
+		t.Fatalf("stored frame after failed replay = %+v, want applied, unquarantined, payload intact", state)
+	}
+
+	harness.advance(sqlite.DefaultInboxPayloadRetention + retentionTestDay)
+	result, err := harness.messages.PruneInboxPayloads(context.Background(), sqlite.DefaultInboxPayloadRetention, 10)
+	if err != nil {
+		t.Fatalf("PruneInboxPayloads(): %v", err)
+	}
+	if result.Rows != 1 {
+		t.Fatalf("pruned rows = %d, want the stored frame to age out", result.Rows)
+	}
+}
+
+// A successful replay does not mark the stored frame applied either: the
+// replayed bytes are not the stored ones, so they cannot vouch for them.
+func TestReplayNeverMarksAnUnappliedFrameApplied(t *testing.T) {
+	decoder := i01DecoderFunc(func(
+		_ context.Context,
+		record bridge.RawIngressRecord,
+	) ([]bridge.Event, error) {
+		return i01OutgoingMessageEvents("remote-unapplied", string(record.Payload), ""), nil
+	})
+	harness := newRetentionHarness(t, decoder)
+	frame := i01IngressRecord("msg:remote-unapplied:hash", []byte("body"))
+	i01MustAppend(t, harness.sink, frame)
+
+	// Process the stored frame as a replay would: everything lands, but the
+	// applied mark belongs only to the frame's own first handling.
+	pending, err := harness.messages.Unprocessed(context.Background())
+	if err != nil || len(pending) != 1 {
+		t.Fatalf("Unprocessed() = %d rows, %v; want 1", len(pending), err)
+	}
+	harness.worker.handleRecord(context.Background(), pending[0].InboxID, rawIngressRecord(pending[0]), true)
+	state := retentionInboxState(t, harness.path, frame.DedupeKey)
+	if !state.processed.Valid || state.applied.Valid {
+		t.Fatalf("frame handled only as a replay = %+v, want processed and unapplied", state)
+	}
+
+	harness.advance(sqlite.DefaultInboxPayloadRetention + retentionTestDay)
+	result, err := harness.messages.PruneInboxPayloads(context.Background(), sqlite.DefaultInboxPayloadRetention, 10)
+	if err != nil {
+		t.Fatalf("PruneInboxPayloads(): %v", err)
+	}
+	if result.Rows != 0 {
+		t.Fatalf("pruned rows = %d, want the unapplied frame kept", result.Rows)
+	}
+}
+
+// twoMessageHarness drives one frame carrying two message events through
+// handleRecord, with a hook on the repository clock that can cancel the
+// worker's context partway through the frame.
+type twoMessageHarness struct {
+	*retentionHarness
+	calls atomic.Int64
+	hook  atomic.Pointer[func(call int64)]
+}
+
+func newTwoMessageHarness(t *testing.T) *twoMessageHarness {
+	t.Helper()
+	h := &twoMessageHarness{}
+	path := filepath.Join(t.TempDir(), "store.sqlite3")
+	store, err := sqlite.Open(path)
+	if err != nil {
+		t.Fatalf("sqlite.Open(): %v", err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Errorf("close store: %v", err)
+		}
+	})
+	i01SeedAccount(t, store)
+	nowMS := &atomic.Int64{}
+	nowMS.Store(i01TestTime.UnixMilli())
+	messages, err := sqlite.NewMessageRepository(store, func() time.Time {
+		call := h.calls.Add(1)
+		if hook := h.hook.Load(); hook != nil {
+			(*hook)(call)
+		}
+		return time.UnixMilli(nowMS.Load())
+	})
+	if err != nil {
+		t.Fatalf("sqlite.NewMessageRepository(): %v", err)
+	}
+	decoder := i01DecoderFunc(func(context.Context, bridge.RawIngressRecord) ([]bridge.Event, error) {
+		return append(
+			i01OutgoingMessageEvents("remote-first", "first", ""),
+			i01OutgoingMessageEvents("remote-second", "second", "")...,
+		), nil
+	})
+	counters := &Counters{}
+	worker := i01NewWorker(t, store, messages, counters, decoder, nil)
+	sink := i01NewSink(t, messages, worker, counters, "inbox-two")
+	h.retentionHarness = &retentionHarness{
+		i01Harness: &i01Harness{
+			path:     path,
+			store:    store,
+			messages: messages,
+			counters: counters,
+			worker:   worker,
+			sink:     sink,
+		},
+		nowMS: nowMS,
+	}
+	return h
+}
+
+// cancelOnCall returns a context that is cancelled when the repository clock
+// is read for the nth time from now: call 1 is the first message's
+// ProjectMessage, call 2 the second message's ImportMessage.
+func (h *twoMessageHarness) cancelOnCall(n int64) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(context.Background())
+	target := h.calls.Load() + n
+	hook := func(call int64) {
+		if call == target {
+			cancel()
+		}
+	}
+	h.hook.Store(&hook)
+	return ctx, cancel
+}
+
+func (h *twoMessageHarness) drain(t *testing.T, ctx context.Context) {
+	t.Helper()
+	pending, err := h.messages.Unprocessed(context.Background())
+	if err != nil {
+		t.Fatalf("Unprocessed(): %v", err)
+	}
+	for _, record := range pending {
+		h.worker.handleRecord(ctx, record.InboxID, rawIngressRecord(record), false)
+	}
+}
+
+// A worker that stops after the frame's first projection committed leaves the
+// frame processed, so no drain retries its second message. The frame was never
+// marked applied, so retention keeps the payload that still carries it. The
+// stop here is a cancelled context; a killed process leaves the same rows.
+func TestFrameInterruptedAfterProjectionKeepsItsPayload(t *testing.T) {
+	h := newTwoMessageHarness(t)
+	frame := i01IngressRecord("msg:two-messages", []byte("two messages"))
+	i01MustAppend(t, h.sink, frame)
+
+	ctx, cancel := h.cancelOnCall(2)
+	defer cancel()
+	h.drain(t, ctx)
+	h.hook.Store(nil)
+
+	if _, err := i01GetMessage(h.messages, "remote-first"); err != nil {
+		t.Fatalf("first message: %v, want projected before the stop", err)
+	}
+	if _, err := i01GetMessage(h.messages, "remote-second"); err == nil {
+		t.Fatal("second message projected; the stop did not interrupt the frame")
+	}
+	state := retentionInboxState(t, h.path, frame.DedupeKey)
+	if !state.processed.Valid || state.applied.Valid || state.quarantined.Valid {
+		t.Fatalf("interrupted frame = %+v, want processed, unapplied, unquarantined", state)
+	}
+	// The restart drain never sees a processed frame again.
+	h.drain(t, context.Background())
+	if _, err := i01GetMessage(h.messages, "remote-second"); err == nil {
+		t.Fatal("second message projected on the restart drain")
+	}
+
+	h.advance(1000 * retentionTestDay)
+	result, err := h.messages.PruneInboxPayloads(context.Background(), sqlite.MinInboxPayloadRetention, 10)
+	if err != nil {
+		t.Fatalf("PruneInboxPayloads(): %v", err)
+	}
+	state = retentionInboxState(t, h.path, frame.DedupeKey)
+	if result.Rows != 0 || state.pruned.Valid || string(state.payload) != "two messages" {
+		t.Fatalf("interrupted frame after retention: rows=%d state=%+v, want payload kept", result.Rows, state)
+	}
+}
+
+// A worker that stops before the projection commits leaves the frame
+// unprocessed: the next drain applies all of it, marks it applied, and it
+// then ages out normally.
+func TestFrameInterruptedBeforeProjectionIsAppliedByTheNextDrain(t *testing.T) {
+	h := newTwoMessageHarness(t)
+	frame := i01IngressRecord("msg:two-messages-early", []byte("two messages"))
+	i01MustAppend(t, h.sink, frame)
+
+	ctx, cancel := h.cancelOnCall(1)
+	defer cancel()
+	h.drain(t, ctx)
+	h.hook.Store(nil)
+
+	if state := retentionInboxState(t, h.path, frame.DedupeKey); state.processed.Valid || state.applied.Valid {
+		t.Fatalf("interrupted frame = %+v, want unprocessed and unapplied", state)
+	}
+	h.drain(t, context.Background())
+	for _, remoteID := range []string{"remote-first", "remote-second"} {
+		if _, err := i01GetMessage(h.messages, remoteID); err != nil {
+			t.Fatalf("%s after the restart drain: %v", remoteID, err)
+		}
+	}
+	state := retentionInboxState(t, h.path, frame.DedupeKey)
+	if !state.processed.Valid || !state.applied.Valid || state.quarantined.Valid {
+		t.Fatalf("retried frame = %+v, want processed and applied", state)
+	}
+
+	h.advance(sqlite.DefaultInboxPayloadRetention + retentionTestDay)
+	result, err := h.messages.PruneInboxPayloads(context.Background(), sqlite.DefaultInboxPayloadRetention, 10)
+	if err != nil {
+		t.Fatalf("PruneInboxPayloads(): %v", err)
+	}
+	if result.Rows != 1 {
+		t.Fatalf("pruned rows = %d, want the fully applied frame to age out", result.Rows)
 	}
 }

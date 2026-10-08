@@ -105,6 +105,14 @@ func TestInboxPayloadRetentionMigrationAppliesToBlankAndExistingV10Database(t *t
 			if record.QuarantinedAtMS != nil || record.PayloadPrunedAtMS != nil {
 				t.Errorf("%s retention columns = (%v, %v), want both NULL", want.inboxID, record.QuarantinedAtMS, record.PayloadPrunedAtMS)
 			}
+			// Frames processed before 0011 are backfilled as applied at their
+			// processing time; unprocessed frames stay unapplied.
+			switch {
+			case want.processed && (record.AppliedAtMS == nil || *record.AppliedAtMS != *record.ProcessedAtMS):
+				t.Errorf("%s applied_at_ms = %v, want processed_at_ms %d", want.inboxID, record.AppliedAtMS, *record.ProcessedAtMS)
+			case !want.processed && record.AppliedAtMS != nil:
+				t.Errorf("%s applied_at_ms = %d, want NULL", want.inboxID, *record.AppliedAtMS)
+			}
 		}
 	})
 }
@@ -124,7 +132,7 @@ func assertInboxPayloadRetentionMigration(t *testing.T, store *Store) {
 	}
 	// internal/migration pins the same checksum as an integrity gate on the
 	// staged store; editing the SQL must move both pins together.
-	const wantChecksum = "95ecd6607310400fed66927b038b41a59a34aa244a77370c3f589bed33ec8312"
+	const wantChecksum = "095a60107459a72ccb58ebab64c860676d6e282de2d076fe9a4cff5b1cb27ef4"
 	if ledger.checksum != wantChecksum {
 		t.Fatalf("migration 0011 checksum = %q, want pinned %q", ledger.checksum, wantChecksum)
 	}
@@ -145,7 +153,7 @@ func assertInboxPayloadRetentionMigration(t *testing.T, store *Store) {
 	if err := rows.Close(); err != nil {
 		t.Fatalf("close inbox columns: %v", err)
 	}
-	for _, column := range []string{"quarantined_at_ms", "payload_pruned_at_ms"} {
+	for _, column := range []string{"quarantined_at_ms", "applied_at_ms", "payload_pruned_at_ms"} {
 		notNull, exists := columns[column]
 		if !exists {
 			t.Fatalf("inbox column %q is missing", column)
@@ -182,8 +190,9 @@ func TestInboxRetentionColumnsEnforceTheirInvariants(t *testing.T) {
 	seedMessageAccount(t, store, "account-a", "google_messages")
 	insertRetentionTestFrame(t, store, retentionTestFrame{inboxID: "pending", receivedAtMS: 100, payload: []byte("p")})
 	insertRetentionTestFrame(t, store, retentionTestFrame{inboxID: "processed", receivedAtMS: 100, processedAtMS: ptr64(200), payload: []byte("p")})
-	insertRetentionTestFrame(t, store, retentionTestFrame{inboxID: "quarantined", receivedAtMS: 100, processedAtMS: ptr64(200), quarantinedAtMS: ptr64(200), payload: []byte("p")})
-	insertRetentionTestFrame(t, store, retentionTestFrame{inboxID: "pruned", receivedAtMS: 100, processedAtMS: ptr64(200), prunedAtMS: ptr64(300)})
+	insertRetentionTestFrame(t, store, retentionTestFrame{inboxID: "applied", receivedAtMS: 100, processedAtMS: ptr64(200), appliedAtMS: ptr64(200), payload: []byte("p")})
+	insertRetentionTestFrame(t, store, retentionTestFrame{inboxID: "quarantined", receivedAtMS: 100, processedAtMS: ptr64(200), appliedAtMS: ptr64(200), quarantinedAtMS: ptr64(200), payload: []byte("p")})
+	insertRetentionTestFrame(t, store, retentionTestFrame{inboxID: "pruned", receivedAtMS: 100, processedAtMS: ptr64(200), appliedAtMS: ptr64(200), prunedAtMS: ptr64(300)})
 
 	for _, test := range []struct {
 		name  string
@@ -191,12 +200,16 @@ func TestInboxRetentionColumnsEnforceTheirInvariants(t *testing.T) {
 	}{
 		{"quarantine an unprocessed frame", `UPDATE inbox SET quarantined_at_ms = 500 WHERE inbox_id = 'pending'`},
 		{"non-positive quarantine time", `UPDATE inbox SET quarantined_at_ms = 0 WHERE inbox_id = 'processed'`},
+		{"apply an unprocessed frame", `UPDATE inbox SET applied_at_ms = 500 WHERE inbox_id = 'pending'`},
+		{"non-positive applied time", `UPDATE inbox SET applied_at_ms = 0 WHERE inbox_id = 'processed'`},
 		{"prune an unprocessed frame", `UPDATE inbox SET payload = X'', payload_pruned_at_ms = 500 WHERE inbox_id = 'pending'`},
-		{"prune while keeping the payload", `UPDATE inbox SET payload_pruned_at_ms = 500 WHERE inbox_id = 'processed'`},
+		{"prune a processed frame that was never applied", `UPDATE inbox SET payload = X'', payload_pruned_at_ms = 500 WHERE inbox_id = 'processed'`},
+		{"prune while keeping the payload", `UPDATE inbox SET payload_pruned_at_ms = 500 WHERE inbox_id = 'applied'`},
 		{"prune a quarantined frame", `UPDATE inbox SET payload = X'', payload_pruned_at_ms = 500 WHERE inbox_id = 'quarantined'`},
-		{"non-positive prune time", `UPDATE inbox SET payload = X'', payload_pruned_at_ms = 0 WHERE inbox_id = 'processed'`},
+		{"non-positive prune time", `UPDATE inbox SET payload = X'', payload_pruned_at_ms = 0 WHERE inbox_id = 'applied'`},
 		{"quarantine a pruned frame", `UPDATE inbox SET quarantined_at_ms = 500 WHERE inbox_id = 'pruned'`},
 		{"restore a pruned frame's payload", `UPDATE inbox SET payload = X'01' WHERE inbox_id = 'pruned'`},
+		{"unapply a pruned frame", `UPDATE inbox SET applied_at_ms = NULL WHERE inbox_id = 'pruned'`},
 		{"unprocess a pruned frame", `UPDATE inbox SET processed_at_ms = NULL WHERE inbox_id = 'pruned'`},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -206,6 +219,8 @@ func TestInboxRetentionColumnsEnforceTheirInvariants(t *testing.T) {
 			}
 		})
 	}
+	// The one legal transition into pruned.
+	mustExec(t, store.db, `UPDATE inbox SET payload = X'', payload_pruned_at_ms = 500 WHERE inbox_id = 'applied'`)
 }
 
 func TestMarkInboxQuarantinedRecordsTheFrameAndKeepsItsPayload(t *testing.T) {
@@ -226,6 +241,9 @@ func TestMarkInboxQuarantinedRecordsTheFrameAndKeepsItsPayload(t *testing.T) {
 	for _, inboxID := range []string{"processed", "pruned"} {
 		if err := repository.MarkInboxProcessed(ctx, inboxID, "account-a"); err != nil {
 			t.Fatalf("MarkInboxProcessed(%s): %v", inboxID, err)
+		}
+		if err := repository.MarkInboxApplied(ctx, inboxID, "account-a"); err != nil {
+			t.Fatalf("MarkInboxApplied(%s): %v", inboxID, err)
 		}
 	}
 	clock.Set(retentionTestBaseMS + 61*retentionTestDayMS)
@@ -299,6 +317,7 @@ func TestPruneInboxPayloadsRejectsShortRetentionAndBadLimits(t *testing.T) {
 		inboxID:       "old",
 		receivedAtMS:  retentionTestBaseMS - 400*retentionTestDayMS,
 		processedAtMS: ptr64(retentionTestBaseMS - 400*retentionTestDayMS),
+		appliedAtMS:   ptr64(retentionTestBaseMS - 400*retentionTestDayMS),
 		payload:       []byte("old"),
 	})
 	ctx := context.Background()
@@ -342,6 +361,9 @@ func TestPrunedInboxFrameStillDedupesAndValidatesReplays(t *testing.T) {
 	projection := MessageProjection{InboxID: inbox.InboxID, Message: message}
 	if err := repository.ProjectMessage(ctx, projection); err != nil {
 		t.Fatalf("ProjectMessage(first): %v", err)
+	}
+	if err := repository.MarkInboxApplied(ctx, inbox.InboxID, "account-a"); err != nil {
+		t.Fatalf("MarkInboxApplied(): %v", err)
 	}
 	projected, err := repository.GetMessage(ctx, message.MessageID)
 	if err != nil {
@@ -428,6 +450,11 @@ func (retentionCase) Generate(r *rand.Rand, _ int) reflect.Value {
 				processedAt = now
 			}
 			frame.processedAtMS = &processedAt
+			// Most processed frames were fully applied; some were quarantined
+			// or interrupted, and a few carry both marks.
+			if r.Intn(5) != 0 {
+				frame.appliedAtMS = ptr64(processedAt)
+			}
 			if r.Intn(6) == 0 {
 				frame.quarantinedAtMS = ptr64(processedAt)
 			}
@@ -443,10 +470,11 @@ func (retentionCase) Generate(r *rand.Rand, _ int) reflect.Value {
 	})
 }
 
-// retentionEligible is the reference rule: processed, never quarantined, not
-// already pruned, and both processed and received before the cutoff.
+// retentionEligible is the reference rule: fully applied, never quarantined,
+// not already pruned, and both processed and received before the cutoff.
 func retentionEligible(frame retentionTestFrame, cutoffMS int64) bool {
 	return frame.processedAtMS != nil &&
+		frame.appliedAtMS != nil &&
 		frame.quarantinedAtMS == nil &&
 		frame.prunedAtMS == nil &&
 		*frame.processedAtMS < cutoffMS &&
@@ -457,7 +485,8 @@ func retentionEligible(frame retentionTestFrame, cutoffMS int64) bool {
 // and batch size, and it holds these invariants:
 //   - rows are never added or deleted, and only payload and
 //     payload_pruned_at_ms ever change;
-//   - unprocessed, quarantined, and in-window frames keep their payloads;
+//   - unprocessed, unapplied, quarantined, and in-window frames keep their
+//     payloads;
 //   - reported rows and bytes equal what was emptied;
 //   - an earlier pass prunes a subset of a later pass;
 //   - a repeated pass prunes nothing (idempotence).
@@ -533,7 +562,8 @@ func TestPruneInboxPayloadsMatchesReferenceRuleProperty(t *testing.T) {
 					t.Errorf("eligible frame %s kept its payload", frame.inboxID)
 					return false
 				}
-				if frame.processedAtMS == nil || frame.quarantinedAtMS != nil || frame.receivedAtMS >= cutoffMS {
+				if frame.processedAtMS == nil || frame.appliedAtMS == nil ||
+					frame.quarantinedAtMS != nil || frame.receivedAtMS >= cutoffMS {
 					t.Errorf("frame %s violates a pruning invariant", frame.inboxID)
 					return false
 				}
@@ -559,6 +589,7 @@ type retentionTestFrame struct {
 	inboxID         string
 	receivedAtMS    int64
 	processedAtMS   *int64
+	appliedAtMS     *int64
 	quarantinedAtMS *int64
 	prunedAtMS      *int64
 	payload         []byte
@@ -573,14 +604,16 @@ func insertRetentionTestFrame(t *testing.T, store *Store, frame retentionTestFra
 	mustExec(t, store.db, `
 		INSERT INTO inbox (
 			inbox_id, account_id, generation, dedupe_key, codec, codec_version,
-			received_at_ms, payload, processed_at_ms, quarantined_at_ms, payload_pruned_at_ms
-		) VALUES (?, 'account-a', 1, ?, 'test.frame', 1, ?, ?, ?, ?, ?)
+			received_at_ms, payload, processed_at_ms, applied_at_ms, quarantined_at_ms,
+			payload_pruned_at_ms
+		) VALUES (?, 'account-a', 1, ?, 'test.frame', 1, ?, ?, ?, ?, ?, ?)
 	`,
 		frame.inboxID,
 		"key-"+frame.inboxID,
 		frame.receivedAtMS,
 		payload,
 		frame.processedAtMS,
+		frame.appliedAtMS,
 		frame.quarantinedAtMS,
 		frame.prunedAtMS,
 	)
@@ -649,4 +682,83 @@ func prunedInboxIDs(records []InboxRecord) map[string]bool {
 
 func ptr64(value int64) *int64 {
 	return &value
+}
+
+func TestMarkInboxAppliedStampsOnlyProcessedFramesOnce(t *testing.T) {
+	clock := newMessageTestClock(retentionTestBaseMS)
+	store, repository := openMessageTestRepository(t, clock.Now)
+	seedMessageAccount(t, store, "account-a", "google_messages")
+	ctx := context.Background()
+	for _, inboxID := range []string{"pending", "processed"} {
+		if _, err := repository.AppendInbox(ctx, messageTestInbox(inboxID, "account-a", "key-"+inboxID, []byte("p"))); err != nil {
+			t.Fatalf("AppendInbox(%s): %v", inboxID, err)
+		}
+	}
+	if err := repository.MarkInboxProcessed(ctx, "processed", "account-a"); err != nil {
+		t.Fatalf("MarkInboxProcessed(): %v", err)
+	}
+
+	clock.Set(retentionTestBaseMS + 1_000)
+	for _, call := range []struct{ inboxID, accountID string }{
+		{"pending", "account-a"},
+		{"processed", "account-b"},
+		{"missing", "account-a"},
+	} {
+		if err := repository.MarkInboxApplied(ctx, call.inboxID, call.accountID); err != nil {
+			t.Fatalf("MarkInboxApplied(%s, %s): %v", call.inboxID, call.accountID, err)
+		}
+	}
+	if pending := readInboxRecord(t, store, "pending"); pending.ProcessedAtMS != nil || pending.AppliedAtMS != nil {
+		t.Fatalf("unprocessed frame changed: %+v", pending)
+	}
+	if processed := readInboxRecord(t, store, "processed"); processed.AppliedAtMS != nil {
+		t.Fatalf("another account's call applied the frame at %d", *processed.AppliedAtMS)
+	}
+
+	if err := repository.MarkInboxApplied(ctx, "processed", "account-a"); err != nil {
+		t.Fatalf("MarkInboxApplied(processed): %v", err)
+	}
+	clock.Set(retentionTestBaseMS + 9_000)
+	if err := repository.MarkInboxApplied(ctx, "processed", "account-a"); err != nil {
+		t.Fatalf("MarkInboxApplied(processed, repeat): %v", err)
+	}
+	processed := readInboxRecord(t, store, "processed")
+	if processed.AppliedAtMS == nil || *processed.AppliedAtMS != retentionTestBaseMS+1_000 {
+		t.Fatalf("applied_at_ms = %v, want the first mark %d", processed.AppliedAtMS, retentionTestBaseMS+1_000)
+	}
+	if *processed.ProcessedAtMS != retentionTestBaseMS {
+		t.Fatalf("processed_at_ms moved to %d", *processed.ProcessedAtMS)
+	}
+}
+
+// Processed is not applied: a frame that left the queue but whose events were
+// never all applied keeps its payload however old it gets.
+func TestProcessedButUnappliedFrameIsNeverPruned(t *testing.T) {
+	clock := newMessageTestClock(retentionTestBaseMS)
+	store, repository := openMessageTestRepository(t, clock.Now)
+	seedMessageAccount(t, store, "account-a", "google_messages")
+	ctx := context.Background()
+	for _, inboxID := range []string{"interrupted", "applied"} {
+		if _, err := repository.AppendInbox(ctx, messageTestInbox(inboxID, "account-a", "key-"+inboxID, []byte("payload"))); err != nil {
+			t.Fatalf("AppendInbox(%s): %v", inboxID, err)
+		}
+		if err := repository.MarkInboxProcessed(ctx, inboxID, "account-a"); err != nil {
+			t.Fatalf("MarkInboxProcessed(%s): %v", inboxID, err)
+		}
+	}
+	if err := repository.MarkInboxApplied(ctx, "applied", "account-a"); err != nil {
+		t.Fatalf("MarkInboxApplied(): %v", err)
+	}
+
+	clock.Set(retentionTestBaseMS + 1_000*retentionTestDayMS)
+	result := pruneAllInboxPayloads(t, repository, MinInboxPayloadRetention, 10)
+	if result.Rows != 1 {
+		t.Fatalf("pruned rows = %d, want only the applied frame", result.Rows)
+	}
+	if interrupted := readInboxRecord(t, store, "interrupted"); string(interrupted.Payload) != "payload" || interrupted.PayloadPrunedAtMS != nil {
+		t.Fatalf("unapplied frame was pruned: %+v", interrupted)
+	}
+	if applied := readInboxRecord(t, store, "applied"); len(applied.Payload) != 0 || applied.PayloadPrunedAtMS == nil {
+		t.Fatalf("applied frame kept its payload: %+v", applied)
+	}
 }

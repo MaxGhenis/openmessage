@@ -31,10 +31,10 @@ type InboxPruneResult struct {
 // is the only record of what the frame carried.
 //
 // A frame that is already processed keeps its processed_at_ms and gains the
-// mark: a deduplicated replay that fails, or a frame whose message projection
-// committed before a later event in it failed. A pruned frame has no payload
-// left to keep and is left unchanged. Repeated calls keep the first mark, and
-// a missing row is a no-op, as with MarkInboxProcessed.
+// mark; that is a frame whose message projection committed before a later
+// event in it failed. A pruned frame has no payload left to keep and is left
+// unchanged. Repeated calls keep the first mark, and a missing row is a
+// no-op, as with MarkInboxProcessed.
 func (r *MessageRepository) MarkInboxQuarantined(
 	ctx context.Context,
 	inboxID string,
@@ -52,37 +52,69 @@ func (r *MessageRepository) MarkInboxQuarantined(
 		  AND account_id = ?
 		  AND payload_pruned_at_ms IS NULL
 	`, nowMS, nowMS, inboxID, accountID)
+	return inboxMarkError(err, "quarantined", inboxID, accountID)
+}
+
+// MarkInboxApplied records that the worker applied every event of a processed
+// frame. Until then the frame's payload is never pruned: processing only says
+// the frame left the queue, which its first message projection does before
+// the rest of the frame is applied. Repeated calls keep the first mark; an
+// unprocessed or missing row is a no-op.
+func (r *MessageRepository) MarkInboxApplied(
+	ctx context.Context,
+	inboxID string,
+	accountID string,
+) error {
+	nowMS, err := r.nowMS("mark inbox applied")
+	if err != nil {
+		return err
+	}
+	_, err = r.store.db.ExecContext(ctx, `
+		UPDATE inbox
+		SET applied_at_ms = ?
+		WHERE inbox_id = ?
+		  AND account_id = ?
+		  AND processed_at_ms IS NOT NULL
+		  AND applied_at_ms IS NULL
+	`, nowMS, inboxID, accountID)
+	return inboxMarkError(err, "applied", inboxID, accountID)
+}
+
+func inboxMarkError(err error, state, inboxID, accountID string) error {
 	if err == nil {
 		return nil
 	}
 	if isSQLiteConstraint(err) {
 		return fmt.Errorf(
-			"mark inbox %q for account %q quarantined: %w: %w",
+			"mark inbox %q for account %q %s: %w: %w",
 			inboxID,
 			accountID,
+			state,
 			ErrInvalidInboxRecord,
 			mapConstraintError(err),
 		)
 	}
 	return fmt.Errorf(
-		"mark inbox %q for account %q quarantined: %w",
+		"mark inbox %q for account %q %s: %w",
 		inboxID,
 		accountID,
+		state,
 		err,
 	)
 }
 
-// PruneInboxPayloads empties the payloads of at most limit frames that were
-// processed more than retention ago and were never quarantined, oldest first,
-// in one transaction. Callers loop until a batch prunes fewer than limit rows.
+// PruneInboxPayloads empties the payloads of at most limit frames that the
+// worker fully applied, never quarantined, and processed more than retention
+// ago, oldest first, in one transaction. Callers loop until a batch prunes
+// fewer than limit rows.
 //
 // Only payload and payload_pruned_at_ms change. The row keeps its dedupe key,
 // so a replayed frame still collapses onto it instead of projecting again, and
-// rows are never deleted, so rowids stay monotonic. Unprocessed and
-// quarantined frames are never touched. Processing never precedes receipt,
-// so every frame received inside the retention window keeps its payload; the
-// query checks received_at_ms as well so that holds even without the schema
-// constraint.
+// rows are never deleted, so rowids stay monotonic. Unprocessed, quarantined,
+// and processed-but-unapplied frames are never touched. Processing never
+// precedes receipt, so every frame received inside the retention window keeps
+// its payload; the query checks received_at_ms as well so that holds even
+// without the schema constraint.
 func (r *MessageRepository) PruneInboxPayloads(
 	ctx context.Context,
 	retention time.Duration,
@@ -120,7 +152,7 @@ func (r *MessageRepository) PruneInboxPayloads(
 	rows, err := tx.QueryContext(ctx, `
 		SELECT inbox_id, length(payload)
 		FROM inbox
-		WHERE processed_at_ms IS NOT NULL
+		WHERE applied_at_ms IS NOT NULL
 		  AND quarantined_at_ms IS NULL
 		  AND payload_pruned_at_ms IS NULL
 		  AND processed_at_ms < ?
@@ -148,7 +180,7 @@ func (r *MessageRepository) PruneInboxPayloads(
 		SET payload = X'',
 		    payload_pruned_at_ms = ?
 		WHERE inbox_id = ?
-		  AND processed_at_ms IS NOT NULL
+		  AND applied_at_ms IS NOT NULL
 		  AND quarantined_at_ms IS NULL
 		  AND payload_pruned_at_ms IS NULL
 		  AND processed_at_ms < ?

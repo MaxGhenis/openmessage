@@ -26,11 +26,13 @@ const (
 	MessageStateDeleted MessageState = "deleted"
 )
 
-// InboxRecord is one durable, undecoded transport frame. ReceivedAtMS,
-// ProcessedAtMS, QuarantinedAtMS, and PayloadPrunedAtMS are populated on
-// reads; AppendInbox stamps ReceivedAtMS with the repository's injected clock
-// and always stores the other three as NULL.
+// InboxRecord is one durable, undecoded transport frame. ReceivedAtMS and the
+// four state timestamps after Payload are populated on reads; AppendInbox
+// stamps ReceivedAtMS with the repository's injected clock and always stores
+// the state timestamps as NULL.
 //
+// ProcessedAtMS takes the frame out of the worker's queue. AppliedAtMS says
+// the worker applied every event in it, and QuarantinedAtMS that it gave up.
 // A non-nil PayloadPrunedAtMS means retention emptied Payload; the row and its
 // dedupe key remain (see PruneInboxPayloads).
 type InboxRecord struct {
@@ -44,6 +46,7 @@ type InboxRecord struct {
 	Payload           []byte
 	ProcessedAtMS     *int64
 	QuarantinedAtMS   *int64
+	AppliedAtMS       *int64
 	PayloadPrunedAtMS *int64
 }
 
@@ -842,6 +845,7 @@ const inboxColumns = `
 	payload,
 	processed_at_ms,
 	quarantined_at_ms,
+	applied_at_ms,
 	payload_pruned_at_ms`
 
 func scanInboxRecord(row rowScanner) (InboxRecord, error) {
@@ -857,6 +861,7 @@ func scanInboxRecord(row rowScanner) (InboxRecord, error) {
 		&record.Payload,
 		&record.ProcessedAtMS,
 		&record.QuarantinedAtMS,
+		&record.AppliedAtMS,
 		&record.PayloadPrunedAtMS,
 	)
 	return record, err

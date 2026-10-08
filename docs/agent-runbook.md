@@ -262,17 +262,44 @@ its `(account_id, dedupe_key)`, and its timestamps are kept for the life of
 the store: the key is what makes a re-delivered or re-fetched frame collapse
 onto the original instead of projecting again, and keeping every row keeps
 rowids monotonic. Only the payload bytes age out. Once a day (first pass ~2
-minutes after start) the daemon empties the payload of every frame that was
-**processed more than 60 days ago and never quarantined**, and stamps
-`payload_pruned_at_ms`. It works in batches of 500, each in its own short
-transaction. MCP clients and the read-only CLI never prune.
+minutes after start) the daemon empties the payload of every frame that the
+worker **fully applied, never quarantined, and processed more than 60 days
+ago**, and stamps `payload_pruned_at_ms`. It works in batches of 500, each in
+its own short transaction. MCP clients and the read-only CLI never prune.
 
-- **Quarantined frames keep their payload indefinitely.** The worker now stamps
-  `quarantined_at_ms` when it gives up on a frame, and whatever in that frame
-  failed to project survives only in its payload, so these rows are the
-  evidence to replay through the worker in a package test. Frames quarantined
-  before migration 0011 were never marked (they look processed) and age out
-  like any other processed frame.
+Three timestamps say what happened to a frame:
+
+| Column | Set when | Payload |
+|---|---|---|
+| `processed_at_ms` | the frame left the worker's queue | kept until applied and aged |
+| `applied_at_ms` | the worker applied every event in the frame | emptied after 60 days |
+| `quarantined_at_ms` | the worker gave up on the frame | kept indefinitely |
+
+- **Processed is not applied.** A frame's first message projection marks it
+  processed; a multi-event frame (a WhatsApp history sync, a Google message
+  with its reaction snapshot) still has events to apply after that. If the
+  app is killed, quits, or exhausts its retries in between, the frame stays
+  processed without `applied_at_ms`. No drain retries a processed frame, so
+  its payload is the only copy of the events that never landed, and retention
+  never empties it. List these frames (`legacy.reply` rows are reply-target
+  stubs, not transport frames):
+
+  ```bash
+  sqlite3 -readonly "$HOME/Library/Application Support/OpenMessage/v2/store.sqlite3" "
+    SELECT inbox_id, codec, datetime(received_at_ms/1000,'unixepoch','localtime'), length(payload)
+    FROM inbox
+    WHERE processed_at_ms IS NOT NULL AND applied_at_ms IS NULL
+      AND quarantined_at_ms IS NULL AND codec <> 'legacy.reply';"
+  ```
+
+- **Quarantined frames keep their payload indefinitely**, so they are the
+  evidence to replay through the worker in a package test. A re-delivery that
+  fails under an existing dedupe key is counted in `quarantined` but leaves
+  the stored row alone: that row holds the original delivery, not the bytes
+  that failed.
+- **Frames from before migration 0011** recorded neither outcome. The migration
+  marks every frame already processed as applied, so a frame quarantined or
+  interrupted before the upgrade ages out like any other.
 - **Readers that decode payloads** must keep their receipt-time window at or
   under 45 days (`sqlite.MinInboxPayloadRetention`); the pruner refuses any
   shorter retention, so such a window never meets a pruned row. Readers of
@@ -283,7 +310,7 @@ transaction. MCP clients and the read-only CLI never prune.
   This is the only lever that reaches the macOS app, whose backend runs with a
   fixed environment. A CLI daemon (`openmessage serve --web`) also honours
   `OPENMESSAGES_V2_INBOX_RETENTION_DAYS` (`0` disables; values under 45 are
-  raised to 45).
+  raised to 45, values over 36500 lowered to it).
 
 Check what retention has done (read-only `sqlite3` opens the live v2 store):
 
@@ -292,18 +319,21 @@ sqlite3 -readonly "$HOME/Library/Application Support/OpenMessage/v2/store.sqlite
   SELECT codec, COUNT(*) AS frames,
          SUM(payload_pruned_at_ms IS NOT NULL) AS pruned,
          SUM(quarantined_at_ms IS NOT NULL) AS quarantined,
+         SUM(processed_at_ms IS NOT NULL AND applied_at_ms IS NULL) AS unapplied,
          SUM(length(payload)) AS payload_bytes
   FROM inbox GROUP BY codec;"
 ```
 
 **Disk.** Pruning frees pages inside the file for reuse; the file itself does
 not shrink, so growth stops rather than reverses. Measured 2026-10-08 on a
-copy of Max's store: 30,033 frames held 29.7 MB of payload (Google writes about
-50–600 frames a day; WhatsApp and Signal had been unpaired since mid-August);
-the first pass emptied 14,733 payloads (17.3 MB) in 131 ms with an 18 ms
-slowest batch and left `integrity_check` ok. A `VACUUM` afterwards gave a
-76.7 MB file, against 94.6 MB for the same store vacuumed unpruned. To reclaim
-that space once, park the watchdog, quit the app, back up, then vacuum:
+copy of Max's store: 30,134 frames held about 29.8 MB of payload (Google
+writes about 50–600 frames a day; WhatsApp and Signal had been unpaired since
+mid-August). Opening it with this build took 2.2 s once, for migration 0011
+and its backfill; the first pass then emptied 16,786 payloads (18.6 MB) in
+268 ms with a 55 ms slowest batch, left 11.5 MB of pages free for reuse, and
+left `integrity_check` ok. A `VACUUM` afterwards gave a 75.6 MB file; the
+same store vacuumed unpruned that morning was 94.6 MB. To reclaim that space
+once, park the watchdog, quit the app, back up, then vacuum:
 
 ```bash
 touch "$HOME/Library/Application Support/OpenMessage/watchdog-disabled"

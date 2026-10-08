@@ -116,8 +116,14 @@ func resolveV2RuntimeMode(isDemo bool, dataDir string) (v2RuntimeMode, error) {
 }
 
 // inboxRetentionEnv overrides how many days processed v2 inbox frames keep
-// their payloads. 0 disables pruning; values below the floor are raised to it.
+// their payloads. 0 disables pruning; values below the floor are raised to
+// it, and values above maxInboxRetentionDays are lowered to it.
 const inboxRetentionEnv = "OPENMESSAGES_V2_INBOX_RETENTION_DAYS"
+
+// maxInboxRetentionDays caps the override. Larger day counts would overflow
+// time.Duration (about 292 years) and come back as a short or negative
+// retention; a century already means "keep".
+const maxInboxRetentionDays = 36500
 
 // inboxRetentionHoldFile, inside <data dir>/v2, pauses pruning while it
 // exists. It is the lever that reaches the macOS app, whose backend runs with
@@ -152,6 +158,15 @@ func inboxPayloadRetention() (retention time.Duration, note string) {
 			days,
 			floorDays,
 			floorDays,
+		)
+	}
+	if days > maxInboxRetentionDays {
+		return maxInboxRetentionDays * 24 * time.Hour, fmt.Sprintf(
+			"%s=%d is above the %d-day cap; using %d days",
+			inboxRetentionEnv,
+			days,
+			maxInboxRetentionDays,
+			maxInboxRetentionDays,
 		)
 	}
 	return time.Duration(days) * 24 * time.Hour, ""
