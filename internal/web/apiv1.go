@@ -57,7 +57,13 @@ type v1DeliveryResponse struct {
 	RemoteMessageID string                `json:"remote_message_id,omitempty"`
 	ErrorClass      string                `json:"error_class,omitempty"`
 	ErrorCode       string                `json:"error_code,omitempty"`
-	Warning         string                `json:"warning,omitempty"`
+	// ErrorDetail carries the last failure's full description (including the
+	// adapter fingerprint) so a caller can say why a send is not going out.
+	ErrorDetail    string `json:"error_detail,omitempty"`
+	AttemptCount   int64  `json:"attempt_count,omitempty"`
+	NextAttemptMS  *int64 `json:"next_attempt_at_ms,omitempty"`
+	RetryExhausted bool   `json:"retry_exhausted,omitempty"`
+	Warning        string `json:"warning,omitempty"`
 }
 
 type v1PendingResponse struct {
@@ -73,6 +79,10 @@ type v1PendingResponse struct {
 	Summary        string                `json:"summary"`
 	ErrorClass     string                `json:"error_class,omitempty"`
 	ErrorCode      string                `json:"error_code,omitempty"`
+	ErrorDetail    string                `json:"error_detail,omitempty"`
+	// RetryExhausted marks a rejected send the dispatcher gave up on; the tray
+	// keeps it visible (as "Not sent") so the user can send it again.
+	RetryExhausted bool `json:"retry_exhausted,omitempty"`
 }
 
 func registerV1Routes(mux *http.ServeMux, legacy *db.Store, logger zerolog.Logger, v2 *V2Options, primary bool) {
@@ -523,15 +533,23 @@ func submissionResponse(submission messaging.Submission) v1SubmissionResponse {
 }
 
 func deliveryResponse(delivery messaging.Delivery) v1DeliveryResponse {
-	return v1DeliveryResponse{
+	response := v1DeliveryResponse{
 		OutboxID:        delivery.OutboxID,
 		State:           delivery.State,
 		LocalMessageID:  delivery.LocalMessageID,
 		RemoteMessageID: delivery.RemoteMessageID,
 		ErrorClass:      delivery.ErrorClass,
 		ErrorCode:       delivery.ErrorCode,
+		ErrorDetail:     delivery.ErrorDetail,
+		AttemptCount:    delivery.AttemptCount,
+		RetryExhausted:  delivery.RetryExhausted,
 		Warning:         delivery.Warning,
 	}
+	if !delivery.NextAttemptAt.IsZero() {
+		nextAttemptMS := delivery.NextAttemptAt.UnixMilli()
+		response.NextAttemptMS = &nextAttemptMS
+	}
+	return response
 }
 
 func pendingResponse(delivery messaging.PendingDelivery) v1PendingResponse {
@@ -547,6 +565,8 @@ func pendingResponse(delivery messaging.PendingDelivery) v1PendingResponse {
 		Summary:        delivery.Summary,
 		ErrorClass:     delivery.ErrorClass,
 		ErrorCode:      delivery.ErrorCode,
+		ErrorDetail:    delivery.ErrorDetail,
+		RetryExhausted: delivery.RetryExhausted,
 	}
 	if !delivery.NextAttemptAt.IsZero() {
 		nextAttemptMS := delivery.NextAttemptAt.UnixMilli()

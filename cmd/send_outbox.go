@@ -198,6 +198,9 @@ func writeCLIDelivery(output io.Writer, delivery outboxDelivery, key string, sch
 		if !scheduled {
 			fmt.Fprintln(output, "queued; app retries automatically. Do not resend.")
 		}
+		if delivery.ErrorDetail != "" {
+			fmt.Fprintf(output, "last failure: %s\n", delivery.ErrorDetail)
+		}
 	case "queued", "dispatching":
 		if !scheduled {
 			fmt.Fprintln(output, "queued; app continues sending in the background. Do not resend.")
@@ -208,7 +211,18 @@ func writeCLIDelivery(output io.Writer, delivery outboxDelivery, key string, sch
 	case "store_failed":
 		fmt.Fprintln(output, "transport accepted the message; the local record is being repaired automatically. Do not resend.")
 	case "rejected":
+		if delivery.RetryExhausted {
+			attempts := "exhausting its retry budget"
+			if delivery.AttemptCount > 0 {
+				attempts = fmt.Sprintf("%d attempts", delivery.AttemptCount)
+			}
+			fmt.Fprintf(output, "not sent: the app gave up after %s; nothing was sent\n", attempts)
+		}
 		fmt.Fprintln(output, "delivery was rejected; the app will not retry it")
+		if delivery.ErrorDetail != "" {
+			fmt.Fprintf(output, "reason: %s\n", delivery.ErrorDetail)
+			return fmt.Errorf("delivery was rejected; the app will not retry it: %s", delivery.ErrorDetail)
+		}
 		return fmt.Errorf("delivery was rejected; the app will not retry it")
 	case "canceled":
 		fmt.Fprintln(output, "delivery was canceled")

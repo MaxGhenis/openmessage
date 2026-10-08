@@ -195,8 +195,22 @@ func waitForV2Delivery(
 	if delivery.Warning != "" {
 		payload["warning"] = delivery.Warning
 	}
+	addV2DeliveryFailureDetail(payload, delivery)
 
 	return structuredResult(payload, v2DeliveryText(delivery))
+}
+
+// addV2DeliveryFailureDetail adds the failure fields both serve modes report
+// for a settled delivery, so an agent sees why a send is not going out and
+// whether the app gave up on it. retry_exhausted is always present.
+func addV2DeliveryFailureDetail(payload map[string]any, delivery messaging.Delivery) {
+	payload["retry_exhausted"] = delivery.RetryExhausted
+	if delivery.ErrorDetail != "" {
+		payload["error_detail"] = delivery.ErrorDetail
+	}
+	if delivery.AttemptCount > 0 {
+		payload["attempt_count"] = delivery.AttemptCount
+	}
 }
 
 // v2InterruptedResult handles Wait ending before the delivery settled (request
@@ -253,14 +267,56 @@ func v2DeliveryText(delivery messaging.Delivery) string {
 	case messaging.OutboxUncertain:
 		return fmt.Sprintf("Message delivery is uncertain (outbox %s): the transport may have accepted it. Do not retry automatically; send again only as a deliberate new intent.", delivery.OutboxID)
 	case messaging.OutboxNotDispatched:
-		return fmt.Sprintf("Delivery has not succeeded yet (outbox %s, error class %s). The app is retrying it automatically; do NOT send this message again.", delivery.OutboxID, firstNonEmpty(delivery.ErrorClass, "unknown"))
+		text := fmt.Sprintf("Delivery has not succeeded yet (outbox %s, error class %s). The app is retrying it automatically; do NOT send this message again.", delivery.OutboxID, firstNonEmpty(delivery.ErrorClass, "unknown"))
+		if delivery.ErrorDetail != "" {
+			text += " Last failure: " + delivery.ErrorDetail
+		}
+		return text
 	case messaging.OutboxStoreFailed:
 		return fmt.Sprintf("The transport accepted the message (outbox %s, remote message %s); the local record is being repaired automatically. Do not resend.", delivery.OutboxID, delivery.RemoteMessageID)
 	case messaging.OutboxRejected:
-		return fmt.Sprintf("Message delivery was rejected (outbox %s, error class %s). The app will not retry it; sending again creates a new message and may fail the same way.", delivery.OutboxID, firstNonEmpty(delivery.ErrorClass, "unknown"))
+		return v2RejectedText(delivery)
 	case messaging.OutboxCanceled:
 		return fmt.Sprintf("Message delivery was canceled (outbox %s).", delivery.OutboxID)
 	default:
 		return fmt.Sprintf("Message delivery settled as %s (outbox %s).", delivery.State, delivery.OutboxID)
+	}
+}
+
+// googleAccountPairingSwitchedFingerprint is the Google adapter's fingerprint
+// for a send the phone refused because Google Messages switched to
+// Google-account pairing while this session is QR-paired.
+const googleAccountPairingSwitchedFingerprint = "google_account_pairing_switched"
+
+// v2RejectedText explains a rejected delivery. The two cases an agent must
+// not misread get their own wording: the phone refusing a QR-paired session
+// (only a re-link fixes it, and re-pairing is the user's call) and a send the
+// dispatcher gave up on after its retry budget (never sent, never retried).
+func v2RejectedText(delivery messaging.Delivery) string {
+	detail := ""
+	if delivery.ErrorDetail != "" {
+		detail = " (" + delivery.ErrorDetail + ")"
+	}
+	switch {
+	case strings.Contains(delivery.ErrorDetail, googleAccountPairingSwitchedFingerprint):
+		return fmt.Sprintf(
+			"NOT SENT: the phone switched Google Messages to Google-account pairing, so it refuses sends from this QR-paired session%s. Nothing was sent and it will not be retried. Sends need a re-link: re-link OpenMessage with Google-account pairing, or switch the phone back to QR pairing. That is the user's call; do not re-pair or reconnect on your own. Outbox %s.",
+			detail, delivery.OutboxID,
+		)
+	case delivery.RetryExhausted:
+		attempts := "exhausting its retry budget"
+		if delivery.AttemptCount > 0 {
+			attempts = fmt.Sprintf("%d attempts", delivery.AttemptCount)
+		}
+		return fmt.Sprintf(
+			"NOT SENT: gave up after %s%s. Nothing was sent and it will not be retried. Send it again only if it is still wanted. Outbox %s.",
+			attempts, detail, delivery.OutboxID,
+		)
+	default:
+		text := fmt.Sprintf("Message delivery was rejected (outbox %s, error class %s). The app will not retry it; sending again creates a new message and may fail the same way.", delivery.OutboxID, firstNonEmpty(delivery.ErrorClass, "unknown"))
+		if delivery.ErrorDetail != "" {
+			text += " Reason: " + delivery.ErrorDetail
+		}
+		return text
 	}
 }

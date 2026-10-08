@@ -144,7 +144,8 @@ type Submission struct {
 	Deduplicated   bool   `json:"deduplicated"`
 }
 
-// Delivery mirrors the daemon's v1 delivery response.
+// Delivery mirrors the daemon's v1 delivery response. The failure detail
+// fields are empty against a daemon that predates them.
 type Delivery struct {
 	OutboxID        string `json:"outbox_id"`
 	State           string `json:"state"`
@@ -152,6 +153,10 @@ type Delivery struct {
 	RemoteMessageID string `json:"remote_message_id"`
 	ErrorClass      string `json:"error_class"`
 	ErrorCode       string `json:"error_code"`
+	ErrorDetail     string `json:"error_detail"`
+	AttemptCount    int64  `json:"attempt_count"`
+	NextAttemptAtMS int64  `json:"next_attempt_at_ms"`
+	RetryExhausted  bool   `json:"retry_exhausted"`
 	Warning         string `json:"warning"`
 }
 

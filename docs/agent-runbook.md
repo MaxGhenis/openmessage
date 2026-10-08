@@ -781,8 +781,16 @@ Key facts:
   string is **native Swift, not a stale webview cache** — don't go chasing
   WKWebView caches (a red herring that cost real time). As of PR #42 the **web
   UI** surfaces a "Google Messages isn't sending — Re-pair" banner when
-  `google.needs_repair` is set (3 consecutive Google send failures while
-  connected). Issue #43 tracks adding the same affordance to the native view.
+  `google.needs_repair` is set. Issue #43 tracks adding the same affordance to
+  the native view.
+- **"3 consecutive send failures → `needs_repair`" is legacy-only.** That
+  counter lives in `RecordGoogleSendOutcome`, which only the legacy send paths
+  call; the v2 Google adapter never does. On a v2 install `needs_repair` comes
+  from session failures instead (a stored session that fails to start, a
+  generation that ends on an auth, upgrade or configuration failure, or a
+  failed cookie repair). A v2 send failure that does not end the generation
+  shows in the outbox tray, `GET /api/v1/outbox` and the send result's
+  `error_detail`, not as `needs_repair`.
 - **QR pairing is dead** — Google disabled device-pairing QR for many accounts.
   Use **Google Account pairing**.
 
@@ -1059,6 +1067,75 @@ Connecting/disconnecting the Google web session many times in a short window
 `"Google Messages connection lost; reconnecting…"` in a loop with a perfectly
 valid session. The fix is to **stop and let it cool down** (minutes up to ~1h),
 not to hammer reconnect. Sends may land in brief connected windows meanwhile.
+
+### Phone switched to Google-account pairing: receive works, sends refused
+
+Seen 2026-10-07. **Symptom:** inbound SMS/RCS keeps arriving and ingesting
+normally, but every Google send from a QR-paired session sticks. Before the
+stuck-send fix the outbox row sat in `not_dispatched` with `get Google
+conversation: transport returned no conversation`, retrying every ~5 s
+(`attempt_count` 1959 overnight). The daemon log shows `Fetched conversations
+count=0` at startup (deep-backfill folder scans also find 0 conversations)
+while inbound pushes still ingest. On the phone, read-only `adb logcat` shows
+`I/BugleNetwork: Gaia pairing on. Handling DittoRequest: 43 [… browserId=<this
+session's browser id>]` (43 = GET_CONVERSATION) in step with every attempt.
+
+What is happening: the phone has Google-account ("Gaia") pairing turned on and
+answers every request from the QR-paired (Bugle) session without data while
+still pushing inbound updates. libgm hands back an empty conversation with no
+error (inferred from the phone log and libgm's code; the reply bytes were not
+captured), and turns the account container the phone sends at startup into
+`events.AccountChange{IsFake: true}`. It is not a stale or re-keyed thread id
+(that case is "Google thread ids are device-local" above): the same remote id
+keeps receiving.
+
+**Status field.** OpenMessage records that event for a QR-paired session:
+
+```bash
+curl -s http://127.0.0.1:7007/api/status | jq '.google | {connected, account_pairing_switched, switched_account, account_pairing_switched_at_ms}'
+```
+
+`account_pairing_switched: true` (reported only while paired) names the
+account and when the switch was first seen. The web UI shows a banner that
+says the phone won't let this session send and opens Platforms (never
+Reconnect); MCP `get_status` prints one line for it. It does not set
+`needs_repair`, change `connected`, or end the receive generation, because
+inbound is healthy. Sends fail fast instead of looping: the Google adapter
+reports the refusal as a certain non-send (class `reauth_required`, fingerprint
+`google_account_pairing_switched`), so the outbox row is rejected and the tray
+lists it under "Not sent". The flag clears on proof that the phone serves the
+session again (a real conversation lookup or a successful send), on a non-fake
+account change that turns Google-account pairing off, and on unpair or a new
+pairing. It is not cleared on reconnect: whether the phone resends the account
+container on every connect is not established.
+
+**Remedies are Max's call; agents never re-pair.** Either re-link OpenMessage
+with Google-account pairing (the cookie method in "Re-pair recipe" above), or
+turn Google-account pairing off on the phone and re-pair by QR, if QR pairing
+is still offered for the account (see "QR pairing is dead" above). Don't
+reconnect in a loop hoping it clears ("Don't over-reconnect"), and don't delete
+`session.json` for this.
+
+**Outbox retry budget (v2 dispatcher).** A retryable failure that proves
+nothing was sent (`DispatchNotCalled`) consumes one attempt. Retries back off
+5 s, 10 s, 20 s, 40 s, 80 s (doubling from the 5 s base, capped at 5 min; a
+later retry time from the adapter wins), and the 6th consuming failure rejects
+the row about 2.6 min after the first with `error_class: retry_exhausted` and
+an `error_detail` like `retry budget exhausted after 6 attempts; last failure
+transient [google_conversation_not_found]: …`. Not-connected failures
+(transient, fingerprint ending `_not_connected`) and `credentials_expired`
+failures are exempt: they refund the attempt and keep the 5 s cadence, so an
+offline platform or a cookie self-heal never exhausts a send. Outcomes that may
+have reached the transport (`uncertain`) never count and never become
+rejected. A row already at or over the cap is rejected before any transport
+call, so an old row with a huge `attempt_count` can never fire late. A
+`conversation_moved` failure rebinds the conversation to the new remote id and
+retries at once (still consuming an attempt). Rejected rows with class
+`retry_exhausted` or `reauth_required` stay in `GET /api/v1/outbox` for 24 h,
+until sent again, with `retry_exhausted` and `error_detail`. The tray labels
+them "Not sent" and offers **Send again**, which creates a new message (nothing
+was sent the first time). MCP sends report `NOT SENT: gave up after N attempts
+(…)`, and the CLI prints the reason.
 
 ## WhatsApp linking (QR and phone-number code)
 

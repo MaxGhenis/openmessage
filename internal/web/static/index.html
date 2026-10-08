@@ -3431,6 +3431,14 @@ body::after {
   line-height: 1.4;
 }
 
+.outbox-row-reason {
+  margin-top: 4px;
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
 .outbox-row-meta {
   flex-wrap: wrap;
   gap: 4px 10px;
@@ -11917,19 +11925,49 @@ body::after {
     loadScheduledMessages(activeConvoId);
   }
 
+  const OUTBOX_REASON_MAX_CHARS = 160;
+  const GOOGLE_ACCOUNT_PAIRING_SWITCHED_FINGERPRINT = 'google_account_pairing_switched';
+
+  // A rejected send stays visible only when the user can act on it: the
+  // dispatcher gave up after its retry budget, or the account must be
+  // re-linked first. Neither was sent, so "Send again" is a plain new send.
+  // Every other rejection (and every other terminal state) stays hidden.
+  function outboxRejectedRowActionable(row) {
+    return !!(row && (row.retry_exhausted === true
+      || String(row.error_class || '').trim().toLowerCase() === 'reauth_required'));
+  }
+
+  function outboxRowVisible(row) {
+    const stateName = String(row && row.state || '').trim().toLowerCase();
+    if (stateName === 'rejected') return outboxRejectedRowActionable(row);
+    return OUTBOX_VISIBLE_STATES.has(stateName);
+  }
+
+  function truncateOutboxReason(text, maxChars = OUTBOX_REASON_MAX_CHARS) {
+    const collapsed = String(text || '').replace(/\s+/g, ' ').trim();
+    const chars = Array.from(collapsed);
+    if (chars.length <= maxChars) return collapsed;
+    return `${chars.slice(0, maxChars - 1).join('').trimEnd()}…`;
+  }
+
   // The v2 tray is a read-through view of the durable outbox. It deliberately
-  // omits terminal rows and non-message intents; confirmed sends live in the
-  // thread, while reactions/read receipts remain outside this surface.
+  // omits settled rows and non-message intents; confirmed sends live in the
+  // thread, while reactions/read receipts remain outside this surface. The one
+  // exception is an actionable rejection (see outboxRejectedRowActionable),
+  // shown as "Not sent" so a send that will never go out cannot vanish.
   function outboxRowView(row, now = Date.now()) {
     const stateName = String(row && row.state || '').trim().toLowerCase();
     const scheduledForMS = Number(row && row.scheduled_for_ms || 0);
     const nextAttemptMS = Number(row && row.next_attempt_at_ms || 0);
     const scheduled = stateName === 'queued' && scheduledForMS > now;
+    const errorDetail = String(row && row.error_detail || '').trim();
     const view = {
-      visible: OUTBOX_VISIBLE_STATES.has(stateName),
+      visible: outboxRowVisible(row),
       group: scheduled ? 'scheduled' : 'inflight',
       label: '',
       guidance: '',
+      reason: '',
+      reasonTitle: '',
       action: '',
       actionLabel: '',
       actionTitle: '',
@@ -11955,10 +11993,34 @@ body::after {
       case 'not_dispatched':
         view.label = 'Retrying…';
         view.guidance = 'The app retries automatically; do not resend it.';
+        view.reason = truncateOutboxReason(errorDetail);
+        view.reasonTitle = errorDetail;
         view.action = 'cancel';
         view.actionLabel = 'Cancel';
         view.actionTitle = 'Cancel this automatically retrying send';
         break;
+      case 'rejected': {
+        if (!view.visible) break;
+        const attempts = Number(row && row.attempt_count || 0);
+        let cause = 'This account must be re-linked before it can send.';
+        if (errorDetail.includes(GOOGLE_ACCOUNT_PAIRING_SWITCHED_FINGERPRINT)) {
+          cause = 'Your phone switched Google Messages to Google-account pairing, so it won’t accept sends from this session.';
+        } else if (row.retry_exhausted === true) {
+          cause = attempts > 0
+            ? `The app gave up after ${attempts} attempt${attempts === 1 ? '' : 's'}.`
+            : 'The app gave up after its retry budget ran out.';
+        }
+        view.group = 'notsent';
+        view.label = 'Not sent';
+        view.guidance = `${cause} Nothing was sent. Send again creates a new message.`;
+        view.reason = truncateOutboxReason(errorDetail);
+        view.reasonTitle = errorDetail;
+        view.action = 'send-again';
+        view.actionLabel = 'Send again';
+        view.actionTitle = 'Nothing was sent; send this message as a new send';
+        view.timeMS = 0;
+        break;
+      }
       case 'uncertain':
         view.label = 'Sent — unconfirmed';
         view.guidance = 'It may have been delivered. Sending again is a deliberate new intent and may create a duplicate.';
@@ -11982,8 +12044,7 @@ body::after {
   function visibleOutboxRows() {
     return outboxRows.filter(row => {
       const kind = String(row && row.kind || '').trim().toLowerCase();
-      const stateName = String(row && row.state || '').trim().toLowerCase();
-      return OUTBOX_SEND_KINDS.has(kind) && OUTBOX_VISIBLE_STATES.has(stateName);
+      return OUTBOX_SEND_KINDS.has(kind) && outboxRowVisible(row);
     });
   }
 
@@ -12026,6 +12087,7 @@ body::after {
       </div>
       <div class="outbox-row-state"><strong>${escapeHtml(view.label)}</strong>${time ? `<span>${escapeHtml(time)}</span>` : ''}</div>
       <div class="outbox-row-guidance">${escapeHtml(view.guidance)}</div>
+      ${view.reason ? `<div class="outbox-row-reason" title="${escapeHtml(view.reasonTitle)}">Reason: ${escapeHtml(view.reason)}</div>` : ''}
       ${metadata.length ? `<div class="outbox-row-meta">${metadata.map(item => `<span>${escapeHtml(item)}</span>`).join('')}</div>` : ''}
     </article>`;
   }
@@ -12059,14 +12121,17 @@ body::after {
     if (!$outboxTrayContent) return;
 
     const now = Date.now();
+    const notSent = [];
     const scheduled = [];
     const inflight = [];
     rows.forEach(row => {
       const view = outboxRowView(row, now);
-      (view.group === 'scheduled' ? scheduled : inflight).push(row);
+      if (view.group === 'notsent') notSent.push(row);
+      else (view.group === 'scheduled' ? scheduled : inflight).push(row);
     });
     $outboxTrayContent.innerHTML = rows.length
-      ? outboxGroupHTML('Scheduled', 'scheduled', scheduled, now)
+      ? outboxGroupHTML('Not sent', 'notsent', notSent, now)
+        + outboxGroupHTML('Scheduled', 'scheduled', scheduled, now)
         + outboxGroupHTML('In flight', 'inflight', inflight, now)
       : '<div class="outbox-empty">Nothing queued or unsettled.</div>';
     $outboxTrayContent.querySelectorAll('.outbox-row-action').forEach(button => {
@@ -12173,7 +12238,11 @@ body::after {
           idempotency_key: sendAgainKeys.get(outboxID),
         });
         sendAgainKeys.delete(outboxID);
-        successMessage = 'New send queued. The original may still arrive.';
+        // Only an uncertain original may still arrive; a "Not sent" row never
+        // reached the transport.
+        successMessage = String(row.state || '').trim().toLowerCase() === 'rejected'
+          ? 'New send queued.'
+          : 'New send queued. The original may still arrive.';
       } else if (action === 'repair') {
         await postJSON(`/api/v1/outbox/${encodeURIComponent(outboxID)}/repair`, {});
         successMessage = 'Local repair requested. This does not resend.';
@@ -12918,7 +12987,21 @@ body::after {
       needs_repair: !!raw.needs_repair,
       phone_responding: raw.phone_responding === undefined ? true : !!raw.phone_responding,
       last_error: raw.last_error || '',
+      account_pairing_switched: !!raw.account_pairing_switched,
+      switched_account: raw.switched_account || '',
+      account_pairing_switched_at_ms: Number(raw.account_pairing_switched_at_ms || 0),
     };
+  }
+
+  // The phone answers a QR-paired session's requests without data once Google
+  // Messages switches to Google-account pairing, while inbound keeps flowing.
+  // Sends still go to the durable outbox (which rejects them visibly); this
+  // copy only explains why and names the two remedies.
+  function accountPairingSwitchedCopy(account = '') {
+    const named = account ? ` (${account})` : '';
+    return `Your phone switched Google Messages to Google-account pairing${named}. `
+      + 'This QR-paired session still receives messages, but the phone won’t let it send. '
+      + 'Re-link OpenMessage with Google-account pairing, or switch the phone back to QR pairing.';
   }
 
   function setConnectionState() {
@@ -12929,6 +13012,19 @@ body::after {
       $connectionBannerCopy.textContent = 'No internet connection. Local history is available, but new messages will wait until you are back online.';
       $connectionBannerAction.textContent = 'Retry';
       $connectionBannerAction.dataset.action = 'retry-connection';
+      $connectionBannerAction.style.display = '';
+      return;
+    }
+    // Checked before needs_repair: this session is healthy for receiving, so
+    // "your phone may have unlinked OpenMessage" would misdescribe it. The
+    // action only opens Platforms; reconnecting cannot fix a pairing switch
+    // and repeated reconnects throttle the account.
+    if (googleStatus.connected && googleStatus.account_pairing_switched) {
+      $connectionBanner.className = 'connection-banner disconnected';
+      $connectionBanner.style.display = 'flex';
+      $connectionBannerCopy.textContent = accountPairingSwitchedCopy(googleStatus.switched_account);
+      $connectionBannerAction.textContent = 'Platforms';
+      $connectionBannerAction.dataset.action = 'open-platforms';
       $connectionBannerAction.style.display = '';
       return;
     }
@@ -13218,7 +13314,17 @@ body::after {
     } else if (googleStatus.last_error) {
       $gmStatusPill.classList.add('error');
     }
-    if (googleStatus.needs_repair) {
+    if (googleStatus.connected && googleStatus.account_pairing_switched) {
+      // Same precedence as the banner: receiving works, so this is not the
+      // generic needs-repair state. The re-pair affordance stays as it is for
+      // any connected session; choosing a remedy is the user's call.
+      $gmHelper.textContent = accountPairingSwitchedCopy(googleStatus.switched_account);
+      showGoogleError('');
+      $gmActionsRow.style.display = '';
+      $gmReconnectBtn.disabled = false;
+      $gmReconnectBtn.textContent = 'Pair again';
+      $gmReconnectBtn.dataset.mode = 'pair';
+    } else if (googleStatus.needs_repair) {
       $gmHelper.textContent = nativeAppBridge()
         ? 'Google Messages needs to be paired again. Open the native pairing flow to refresh your Android phone connection.'
         : 'Google Messages needs to be paired again. Use the button below to copy the pair command, then run it in Terminal.';
