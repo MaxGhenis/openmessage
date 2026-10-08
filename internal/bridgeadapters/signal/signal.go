@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -513,6 +514,17 @@ func (a *Adapter) Start(
 		if sink == nil {
 			return
 		}
+		// A panic below the sink loses the frame like any failed append.
+		// Left alone, signallive recovers it and only logs.
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				a.recordIngressFailure(sink, req.AccountID, fmt.Errorf(
+					"panic in Signal ingest tee: %v\n%s",
+					recovered,
+					debug.Stack(),
+				))
+			}
+		}()
 		record, ephemeral, err := ingest.BuildSignalIngress(
 			req.AccountID,
 			req.Generation,

@@ -572,7 +572,8 @@ func (r *run) teeIngress(evt any, receivedAt time.Time) {
 		return
 	}
 	// A stale-generation rejection is the supervisor fencing off a retiring
-	// connection, not an ingest fault; WhatsApp and Signal skip it the same way.
+	// connection whose events were still in flight, not an ingest fault.
+	// WhatsApp and Signal skip it the same way.
 	if err == nil || errors.Is(err, bridge.ErrStaleGeneration) {
 		return
 	}

@@ -707,10 +707,9 @@ func TestIngressTeeAppendPanicDoesNotInterruptLegacyHandler(t *testing.T) {
 	}
 }
 
-// The supervisor deactivates a generation's fence before it stops the run, so
-// events the run already admitted are rejected with ErrStaleGeneration at
-// every retirement. That is the fence working, not an ingest fault: it must
-// not count, or append_errors climbs at every reconnect.
+// A retiring generation's fence closes while its run can still be delivering
+// events it already admitted; those are rejected with ErrStaleGeneration.
+// That is the fence working, not an ingest fault, so it must not count.
 func TestIngressTeeStaleGenerationIsNotAnIngressError(t *testing.T) {
 	host := newTestApp(t)
 	legacyHandled := 0

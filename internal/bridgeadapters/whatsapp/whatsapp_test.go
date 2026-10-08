@@ -549,7 +549,12 @@ func newTestAdapter(t *testing.T, client *fakeLifecycleClient, now func() time.T
 	return a
 }
 
-func newTestSupervisor(t *testing.T, adapter *Adapter, clock *manualClock) *bridge.Supervisor {
+func newTestSupervisor(
+	t *testing.T,
+	adapter *Adapter,
+	clock *manualClock,
+	options ...bridge.SupervisorOption,
+) *bridge.Supervisor {
 	t.Helper()
 	supervisor, err := bridge.NewSupervisor(
 		"whatsapp-primary",
@@ -566,6 +571,7 @@ func newTestSupervisor(t *testing.T, adapter *Adapter, clock *manualClock) *brid
 		},
 		clock,
 		midpointRandom{},
+		options...,
 	)
 	if err != nil {
 		t.Fatalf("NewSupervisor() error = %v", err)

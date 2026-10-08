@@ -843,7 +843,9 @@ func TestGenerationSinkForwardsIngressErrorsToConfiguredSink(t *testing.T) {
 	if !ok {
 		t.Fatalf("generation sink %T does not implement IngressErrorRecorder", firstSink)
 	}
-	recorder.RecordIngressError("account-1")
+	// The wrapper serves one account, so the count lands there whatever the
+	// adapter passes.
+	recorder.RecordIngressError("some-other-account")
 	if got := downstream.IngressErrors(); len(got) != 1 || got[0] != "account-1" {
 		t.Fatalf("downstream RecordIngressError calls = %q, want [account-1]", got)
 	}
@@ -858,12 +860,58 @@ func TestGenerationSinkForwardsIngressErrorsToConfiguredSink(t *testing.T) {
 	clock.Advance(backoff.RetryAt.Sub(clock.Now()))
 	awaitSupervisorStartCount(t, lifecycle, 2)
 	recorder.RecordIngressError("account-1")
-	if got := downstream.IngressErrors(); len(got) != 2 {
-		t.Fatalf("downstream RecordIngressError calls after turnover = %q, want 2", got)
+	if got := downstream.IngressErrors(); len(got) != 2 || got[1] != "account-1" {
+		t.Fatalf("downstream RecordIngressError calls after turnover = %q, want [account-1 account-1]", got)
 	}
 	if ingress, ephemeral := downstream.Counts(); ingress != 0 || ephemeral != 0 {
 		t.Fatalf("RecordIngressError forwarded frames: ingress=%d ephemeral=%d", ingress, ephemeral)
 	}
+}
+
+// A lost frame is not evidence that the connection is alive, so reporting one
+// must not refresh the liveness the supervisor derives from real frames.
+func TestGenerationSinkIngressErrorRecordsNoActivity(t *testing.T) {
+	clock := newSupervisorManualClock(supervisorTestEpoch)
+	run := newSupervisorTestRun()
+	lifecycle := &supervisorTestLifecycle{scripts: []supervisorStartScript{{run: run}}}
+	supervisor := newTestSupervisor(
+		t,
+		lifecycle,
+		supervisorTestPolicy(),
+		clock,
+		&supervisorScriptedRandom{},
+		WithConnectionSink(&supervisorIngressErrorSink{}),
+	)
+	if err := supervisorStart(t, supervisor, StartRequest{DeviceID: "device-1"}); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	sink := awaitSupervisorStartCount(t, lifecycle, 1)[0].sink
+	run.MarkReady()
+	online := awaitSupervisorSnapshot(t, supervisor, "generation one online", func(snapshot Snapshot) bool {
+		return snapshot.State == StateOnline
+	})
+
+	clock.Advance(time.Second)
+	sink.(IngressErrorRecorder).RecordIngressError("account-1")
+	supervisorSync(t, supervisor)
+	got := supervisor.Snapshot()
+	if !got.LastEventAt.Equal(online.LastEventAt) || !got.LivenessDeadline.Equal(online.LivenessDeadline) {
+		t.Fatalf("RecordIngressError refreshed liveness:\n got  %+v\n want %+v", got, online)
+	}
+
+	// Control: a real frame at the same instant does move it.
+	ctx, cancel := supervisorTestContext(t)
+	defer cancel()
+	if err := sink.AppendIngress(ctx, RawIngressRecord{
+		AccountID:  "account-1",
+		Generation: 1,
+		DedupeKey:  "frame",
+	}); err != nil {
+		t.Fatalf("AppendIngress() error = %v", err)
+	}
+	awaitSupervisorSnapshot(t, supervisor, "liveness after a real frame", func(snapshot Snapshot) bool {
+		return snapshot.LastEventAt.After(online.LastEventAt)
+	})
 }
 
 func TestGenerationSinkIngressErrorWithoutRecordingSinkIsNoop(t *testing.T) {
