@@ -8,9 +8,11 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"sync"
 	"testing"
+	"testing/quick"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -749,6 +751,56 @@ func TestIngressTeeStaleGenerationIsNotAnIngressError(t *testing.T) {
 	}
 }
 
+// For any sequence of tee outcomes, the adapter's own count and its reports
+// to the sink both equal the number of real faults: clean appends and
+// stale-generation rejections (bare or wrapped) never count.
+func TestIngressTeeErrorClassificationProperty(t *testing.T) {
+	host := newTestApp(t)
+	fake := &fakeTransport{}
+	a := newTestAdapter(t, host, fake)
+	sink := &outcomeSink{}
+	run, err := a.Start(context.Background(), bridge.StartRequest{
+		AccountID:  "google-primary",
+		Generation: 15,
+	}, sink)
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	t.Cleanup(func() { stopRun(t, run) })
+
+	outcomes := []error{
+		nil,
+		bridge.ErrStaleGeneration,
+		fmt.Errorf("generation 15 retired: %w", bridge.ErrStaleGeneration),
+		errors.New("inbox unavailable"),
+	}
+	property := func(steps []uint8) bool {
+		countBefore, reportsBefore := a.IngressErrorCount(), sink.reportCount()
+		faults := 0
+		for i, step := range steps {
+			outcome := outcomes[int(step)%len(outcomes)]
+			if outcome != nil && !errors.Is(outcome, bridge.ErrStaleGeneration) {
+				faults++
+			}
+			sink.setOutcome(outcome)
+			if step/uint8(len(outcomes))%2 == 0 {
+				fake.emit(&gmproto.Conversation{ConversationID: fmt.Sprintf("property-%d", i)})
+			} else {
+				fake.emit(&gmproto.TypingData{
+					ConversationID: fmt.Sprintf("property-%d", i),
+					User:           &gmproto.User{Number: "+15551234567"},
+					Type:           gmproto.TypingTypes_STARTED_TYPING,
+				})
+			}
+		}
+		return a.IngressErrorCount()-countBefore == uint64(faults) &&
+			sink.reportCount()-reportsBefore == faults
+	}
+	if err := quick.Check(property, &quick.Config{MaxCount: 200}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // TestIngressAppendFaultReachesRealSinkThroughSupervisor runs the production
 // chain: a real bridge.Supervisor starts the Google adapter with its
 // per-generation sink in front of a real ingest.Sink. A durable append that
@@ -1075,6 +1127,46 @@ func (f *fakeTransport) probeCount() int {
 	count := f.probes
 	f.mu.Unlock()
 	return count
+}
+
+// outcomeSink returns one scripted result for every tee call and counts
+// RecordIngressError reports.
+type outcomeSink struct {
+	mu      sync.Mutex
+	outcome error
+	reports int
+}
+
+func (s *outcomeSink) setOutcome(err error) {
+	s.mu.Lock()
+	s.outcome = err
+	s.mu.Unlock()
+}
+
+func (s *outcomeSink) AppendIngress(context.Context, bridge.RawIngressRecord) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.outcome
+}
+
+func (s *outcomeSink) EmitEphemeral(context.Context, bridge.EphemeralEvent) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.outcome
+}
+
+func (*outcomeSink) Beat(bridge.Generation, time.Time, string) {}
+
+func (s *outcomeSink) RecordIngressError(string) {
+	s.mu.Lock()
+	s.reports++
+	s.mu.Unlock()
+}
+
+func (s *outcomeSink) reportCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.reports
 }
 
 type recordingSink struct {

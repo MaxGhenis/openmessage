@@ -691,6 +691,17 @@ LIVE_PLATFORMS=google GOWORK=off go test -tags livetransport \
   ./internal/livetransport/
 ```
 
+`append_errors` counts frames (and typing events) a Google, WhatsApp, or
+Signal adapter captured but could not hand to v2 ingest: an encode fault, a
+failed durable append such as a SQLite error, or a panic in the adapter's
+ingest tee. Each one is also logged at warn. It should stay `0`; a nonzero
+count means frames reached the transport but not the v2 inbox. Rejections by
+the generation fence (`bridge.ErrStaleGeneration`) are not counted: the
+supervisor closes a generation's fence before it stops that run, so events
+the run already admitted are rejected at every reconnect by design. Before
+2026-10-08 this counter read `0` in the running daemon whatever happened,
+because the supervisor's per-generation sink did not forward the count.
+
 It sends nothing. Add `whatsapp` or `signal` to the comma-separated
 `LIVE_PLATFORMS` list only when that platform will receive a real frame within
 the test deadline; use `LIVE_GOOGLE_CONV`, `LIVE_WHATSAPP_CONV`, or
