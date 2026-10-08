@@ -27,6 +27,7 @@ import (
 	signaladapter "github.com/maxghenis/openmessage/internal/bridgeadapters/signal"
 	whatsappadapter "github.com/maxghenis/openmessage/internal/bridgeadapters/whatsapp"
 	"github.com/maxghenis/openmessage/internal/db"
+	"github.com/maxghenis/openmessage/internal/freshness"
 	"github.com/maxghenis/openmessage/internal/googlecookies"
 	"github.com/maxghenis/openmessage/internal/importer"
 	"github.com/maxghenis/openmessage/internal/ingest"
@@ -97,6 +98,31 @@ func v2SendWebOptions(stack *v2Stack, enabled bool) *web.V2Options {
 		Blobs:    stack.Blobs,
 		Registry: stack.Registry,
 	}
+}
+
+// freshnessActivitySource picks the clock /api/status judges platform silence
+// by, following where readers get their messages. On a v2-primary daemon that
+// is the v2 inbox, where transport events land before decoding. Otherwise
+// readers use the legacy store, which also takes rows that never pass through
+// the inbox (backfills, desktop imports), so its incoming-message timestamps
+// are the clock.
+func freshnessActivitySource(stack *v2Stack, legacy *db.Store, v2Primary bool) freshness.ActivitySource {
+	if v2Primary && stack != nil && stack.Store != nil {
+		return freshness.NewInboxActivity(stack.Store, map[string]string{
+			ingest.GoogleCodec:        "google",
+			whatsapplive.IngressCodec: "whatsapp",
+			ingest.SignalJSONRPCCodec: "signal",
+		})
+	}
+	if legacy != nil {
+		return freshness.NewMessageActivity(legacy, map[string]string{
+			"sms":      "google",
+			"rcs":      "google",
+			"whatsapp": "whatsapp",
+			"signal":   "signal",
+		})
+	}
+	return nil
 }
 
 func v2IngestCountersProvider(stack *v2Stack) func() map[string]ingest.CounterSnapshot {
@@ -665,6 +691,12 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 
 	v2Options := v2SendWebOptions(stack, v2Send)
 	v2IngestCounters := v2IngestCountersProvider(stack)
+	// Demo data is a frozen fixture; judging its silence would only report a
+	// demo platform as stalled.
+	var freshnessActivity freshness.ActivitySource
+	if !isDemo {
+		freshnessActivity = freshnessActivitySource(stack, a.Store, v2Primary)
+	}
 
 	httpEnabled := opts.web || opts.mcpSSE
 	if httpEnabled {
@@ -678,6 +710,7 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 				Auth:                  controlAuth,
 				V2:                    v2Options,
 				V2IngestCounters:      v2IngestCounters,
+				Activity:              freshnessActivity,
 				Reads:                 reads,
 				V2Primary:             v2Primary,
 				Client:                a.GetClient,
