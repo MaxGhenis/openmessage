@@ -639,6 +639,9 @@ func (r *run) appendHistory(
 		if errors.Is(err, bridge.ErrStaleGeneration) {
 			return fmt.Errorf("google generation %d retired: %w: %w", r.request.Generation, app.ErrGoogleHistoryClosed, err)
 		}
+		if errors.Is(err, bridge.ErrHistoryIngressDisabled) {
+			return fmt.Errorf("%w: %w", app.ErrGoogleHistoryDisabled, err)
+		}
 		return err
 	}
 	return nil

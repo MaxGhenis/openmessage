@@ -328,15 +328,22 @@ func TestHistoryIngressFenceJoinsInFlightAppend(t *testing.T) {
 }
 
 // Legacy-only mode (no downstream sink): a current-generation history frame is
-// accepted and dropped, like live ingress. Contrast: the live frame in the same
-// mode still enqueues activity (generationSink.forward enqueues whether or not
-// a downstream sink exists); the history frame does not.
-func TestHistoryIngressWithoutDownstreamSinkIsAcceptedAndDropped(t *testing.T) {
+// refused with ErrHistoryIngressDisabled, so a caller can tell "no v2 ingest is
+// running" from "v2 took it" (it used to return nil, and catch-ups counted
+// every hand-off on a legacy-only install as delivered to v2). Contrast: the
+// live frame in the same mode is accepted and still enqueues activity
+// (generationSink.forward enqueues whether or not a downstream sink exists);
+// the history frame records none.
+func TestHistoryIngressWithoutDownstreamSinkReportsDisabled(t *testing.T) {
 	supervisor, clock, sink, online := historyFenceOnline(t)
 
 	clock.Advance(time.Second)
-	if err := appendHistoryForTest(t, sink, historyFenceRecord(1, clock.Now())); err != nil {
-		t.Fatalf("AppendHistoryIngress() without downstream error = %v, want nil", err)
+	err := appendHistoryForTest(t, sink, historyFenceRecord(1, clock.Now()))
+	if !errors.Is(err, ErrHistoryIngressDisabled) {
+		t.Fatalf("AppendHistoryIngress() without downstream error = %v, want ErrHistoryIngressDisabled", err)
+	}
+	if errors.Is(err, ErrStaleGeneration) || errors.Is(err, ErrHistoryIngressMissing) {
+		t.Fatalf("disabled history ingress reported as %v", err)
 	}
 	if err := appendHistoryForTest(t, sink, historyFenceRecord(2, clock.Now())); !errors.Is(err, ErrStaleGeneration) {
 		t.Fatalf("identity check skipped without downstream: error = %v, want ErrStaleGeneration", err)

@@ -44,12 +44,15 @@ type CounterSnapshot struct {
 	// Appended/Deduped; HistoryImported counts messages a history frame
 	// inserted; HistoryExisting counts history messages skipped because v2
 	// already held them; HistoryConversations counts conversations a history
-	// snapshot created.
+	// snapshot created; HistorySkipped counts history snapshots and messages
+	// v2 could only have placed by moving a thread binding (or whose snapshot
+	// was unusable), which history never does.
 	HistoryAppended      uint64 `json:"history_appended"`
 	HistoryDeduped       uint64 `json:"history_deduped"`
 	HistoryImported      uint64 `json:"history_imported"`
 	HistoryExisting      uint64 `json:"history_existing"`
 	HistoryConversations uint64 `json:"history_conversations"`
+	HistorySkipped       uint64 `json:"history_skipped"`
 }
 
 type accountCounters struct {
@@ -83,6 +86,7 @@ type accountCounters struct {
 	historyImported      atomic.Uint64
 	historyExisting      atomic.Uint64
 	historyConversations atomic.Uint64
+	historySkipped       atomic.Uint64
 }
 
 // Counters owns atomic ingest counters partitioned by account. Its zero value
@@ -173,5 +177,6 @@ func snapshotCounters(c *accountCounters) CounterSnapshot {
 		HistoryImported:      c.historyImported.Load(),
 		HistoryExisting:      c.historyExisting.Load(),
 		HistoryConversations: c.historyConversations.Load(),
+		HistorySkipped:       c.historySkipped.Load(),
 	}
 }

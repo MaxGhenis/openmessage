@@ -54,10 +54,14 @@ type googleFrameEnvelope struct {
 	ConversationB64 []byte `json:"conversation_b64,omitempty"`
 }
 
-// GoogleIngressDedupeKey is the inbox dedupe key shared by live and history
-// Google frames: the kind, the remote ID, and a short hash of the protobuf.
-// Sharing it means a fetched copy byte-identical to a frame the live channel
-// already delivered collapses onto that row instead of adding another.
+// GoogleIngressDedupeKey is the inbox dedupe key of a Google frame: the kind,
+// the remote ID, and a short hash of the protobuf. Live frames use the kinds
+// "msg" and "conv"; history frames use "hmsg" and "hconv", so the two origins
+// never collapse onto each other's rows. If they shared a key, a fetched copy
+// that reached the inbox first would swallow a later byte-identical live push:
+// the push would be replayed against an already-processed history row and
+// dropped as a stale replay (losing, say, an attachment that only the live
+// path records), and the live-delivery monitors would never see it.
 func GoogleIngressDedupeKey(kind, remoteID string, protoBytes []byte) string {
 	digest := sha256.Sum256(protoBytes)
 	return fmt.Sprintf("%s:%s:%x", kind, remoteID, digest[:4])
@@ -119,10 +123,14 @@ func googleConversationRecord(
 	if err != nil {
 		return bridge.RawIngressRecord{}, err
 	}
+	kind := "conv"
+	if codec == GoogleHistoryCodec {
+		kind = "hconv"
+	}
 	return bridge.RawIngressRecord{
 		AccountID:    accountID,
 		Generation:   generation,
-		DedupeKey:    GoogleIngressDedupeKey("conv", conversation.GetConversationID(), protoBytes),
+		DedupeKey:    GoogleIngressDedupeKey(kind, conversation.GetConversationID(), protoBytes),
 		Codec:        codec,
 		CodecVersion: GoogleCodecVersion,
 		ReceivedAt:   receivedAt,
@@ -134,9 +142,9 @@ func googleConversationRecord(
 // catch-up fetched from conversationID. A fetched message with no conversation
 // ID of its own is attributed to conversationID (on a copy; the caller's proto
 // is never mutated). conversation, when it is the snapshot of that same
-// conversation, rides along in the frame; the dedupe key covers only the
-// message, so a re-fetch of an unchanged message dedupes even though the
-// conversation snapshot moved on.
+// conversation, rides along in the frame; the dedupe key ("hmsg") covers only
+// the message, so a re-fetch of an unchanged message dedupes onto its earlier
+// history row even though the conversation snapshot moved on.
 func GoogleHistoryMessageRecord(
 	accountID string,
 	generation bridge.Generation,
@@ -171,7 +179,7 @@ func GoogleHistoryMessageRecord(
 	return bridge.RawIngressRecord{
 		AccountID:    accountID,
 		Generation:   generation,
-		DedupeKey:    GoogleIngressDedupeKey("msg", message.GetMessageID(), protoBytes),
+		DedupeKey:    GoogleIngressDedupeKey("hmsg", message.GetMessageID(), protoBytes),
 		Codec:        GoogleHistoryCodec,
 		CodecVersion: GoogleCodecVersion,
 		ReceivedAt:   receivedAt,

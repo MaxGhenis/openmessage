@@ -123,9 +123,13 @@ func TestHistorySinkCountsHistoryApartFromLive(t *testing.T) {
 		again.receivedAtMS != first.receivedAtMS {
 		t.Fatalf("history replay changed the stored row: %+v -> %+v", first, again)
 	}
-	// A deduplicated history append queues nothing: history is insert-only,
-	// so a second pass over the same frame could add nothing.
-	hsinkAssertNoWork(t, harness.worker)
+	// A re-fetched history frame is replayed against its own history row, so
+	// the worker re-evaluates it (a message skipped while its thread was
+	// unbound is placed once the live channel has bound the thread).
+	item = hsinkTakeWork(t, harness.worker)
+	if item.inboxID != first.inboxID || !item.replay || item.record.Codec != GoogleHistoryCodec {
+		t.Fatalf("queued work after history re-fetch = %+v, want history replay of %q", item, first.inboxID)
+	}
 
 	// A second, distinct history frame is a new append; the live counters stay
 	// untouched throughout.
@@ -141,82 +145,72 @@ func TestHistorySinkCountsHistoryApartFromLive(t *testing.T) {
 	}
 }
 
-func TestHistorySinkLiveThenHistoryDedupesOntoLiveRow(t *testing.T) {
-	harness, clock := hsinkNewHarness(t)
-	message := hsinkMessage("cross-origin-live-first", "same bytes")
+// Live and history frames never share an inbox row, in either arrival order,
+// even when the message bytes are identical. Each origin gets its own row, is
+// counted under its own counters, and is queued under its own codec.
+//
+// Regression (review of PR #200): with a shared key, a fetched copy that
+// reached the inbox first swallowed the later live push. The push was replayed
+// against the already-processed history row and dropped as a stale replay, so
+// an attachment or edit only the live path applies never reached v2, and the
+// live-delivery monitors (which read live-codec rows) never saw the delivery.
+func TestHistorySinkLiveAndHistoryNeverShareARow(t *testing.T) {
+	for _, order := range []string{"live first", "history first"} {
+		t.Run(order, func(t *testing.T) {
+			harness, clock := hsinkNewHarness(t)
+			message := hsinkMessage("cross-origin", "same bytes")
+			live := hsinkLiveRecord(t, message)
+			history := hsinkHistoryRecordWithConversation(t, message)
+			if history.DedupeKey == live.DedupeKey {
+				t.Fatalf("fixture: history and live share the dedupe key %q", live.DedupeKey)
+			}
 
-	live := hsinkLiveRecord(t, message)
-	if err := harness.sink.AppendIngress(context.Background(), live); err != nil {
-		t.Fatalf("AppendIngress(live): %v", err)
-	}
-	liveRow := hsinkInbox(t, harness.path, live.DedupeKey)
-	_ = hsinkTakeWork(t, harness.worker)
+			appendLive := func() {
+				t.Helper()
+				if err := harness.sink.AppendIngress(context.Background(), live); err != nil {
+					t.Fatalf("AppendIngress(live): %v", err)
+				}
+				item := hsinkTakeWork(t, harness.worker)
+				if item.replay || item.record.Codec != GoogleCodec {
+					t.Fatalf("queued live work = %+v, want a fresh live item", item)
+				}
+			}
+			appendHistory := func() {
+				t.Helper()
+				if err := harness.sink.AppendHistoryIngress(context.Background(), history); err != nil {
+					t.Fatalf("AppendHistoryIngress: %v", err)
+				}
+				item := hsinkTakeWork(t, harness.worker)
+				if item.replay || item.record.Codec != GoogleHistoryCodec {
+					t.Fatalf("queued history work = %+v, want a fresh history item", item)
+				}
+			}
+			if order == "live first" {
+				appendLive()
+				clock.Advance(time.Hour)
+				appendHistory()
+			} else {
+				appendHistory()
+				clock.Advance(time.Hour)
+				appendLive()
+			}
 
-	// The history copy carries a conversation snapshot and is_old=true, so its
-	// payload differs, but its dedupe key covers only the message proto.
-	clock.Advance(time.Hour)
-	history := hsinkHistoryRecordWithConversation(t, message)
-	if history.DedupeKey != live.DedupeKey || string(history.Payload) == string(live.Payload) {
-		t.Fatalf("fixture: history key %q payload-differs=%v, live key %q",
-			history.DedupeKey, string(history.Payload) != string(live.Payload), live.DedupeKey)
-	}
-	if err := harness.sink.AppendHistoryIngress(context.Background(), history); err != nil {
-		t.Fatalf("AppendHistoryIngress(after live): %v", err)
-	}
-
-	hsinkAssertCounts(t, harness, hsinkCounts{appended: 1, historyDeduped: 1})
-	if got := i01QueryInt64(t, harness.path, `SELECT COUNT(*) FROM inbox`); got != 1 {
-		t.Fatalf("inbox rows = %d, want the single live row", got)
-	}
-	after := hsinkInbox(t, harness.path, live.DedupeKey)
-	// No receipt-time bump and no codec or payload rewrite: the live row is
-	// exactly as the live channel left it (DESIGN decision 2).
-	if after.inboxID != liveRow.inboxID || after.codec != GoogleCodec ||
-		after.receivedAtMS != liveRow.receivedAtMS || string(after.payload) != string(live.Payload) {
-		t.Fatalf("live row after history dedupe = %+v, want unchanged %+v", after, liveRow)
-	}
-	// No history replay may be queued against the live row: the worker would
-	// apply history semantics to it and mark it processed, so a live update
-	// still waiting in the inbox would never be applied.
-	hsinkAssertNoWork(t, harness.worker)
-}
-
-func TestHistorySinkHistoryThenLiveDedupesOntoHistoryRow(t *testing.T) {
-	harness, clock := hsinkNewHarness(t)
-	message := hsinkMessage("cross-origin-history-first", "same bytes")
-
-	history := hsinkHistoryRecordWithConversation(t, message)
-	if err := harness.sink.AppendHistoryIngress(context.Background(), history); err != nil {
-		t.Fatalf("AppendHistoryIngress: %v", err)
-	}
-	historyRow := hsinkInbox(t, harness.path, history.DedupeKey)
-	_ = hsinkTakeWork(t, harness.worker)
-
-	clock.Advance(time.Hour)
-	live := hsinkLiveRecord(t, message)
-	if err := harness.sink.AppendIngress(context.Background(), live); err != nil {
-		t.Fatalf("AppendIngress(after history): %v", err)
-	}
-
-	// Specified behavior (DESIGN decision 2, shared keys): the later live push
-	// counts as a live dedupe and adds no row. Known trade-off recorded in
-	// reader-silence-190.md: the stored row keeps the history codec, so a
-	// codec-filtered silence monitor does not see this live delivery.
-	hsinkAssertCounts(t, harness, hsinkCounts{deduped: 1, historyAppended: 1})
-	if got := i01QueryInt64(t, harness.path, `SELECT COUNT(*) FROM inbox`); got != 1 {
-		t.Fatalf("inbox rows = %d, want the single history row", got)
-	}
-	after := hsinkInbox(t, harness.path, history.DedupeKey)
-	if after.inboxID != historyRow.inboxID || after.codec != GoogleHistoryCodec ||
-		after.receivedAtMS != historyRow.receivedAtMS || string(after.payload) != string(history.Payload) {
-		t.Fatalf("history row after live dedupe = %+v, want unchanged %+v", after, historyRow)
-	}
-	if got := i01QueryInt64(t, harness.path, `SELECT COUNT(*) FROM inbox WHERE codec = ?`, GoogleCodec); got != 0 {
-		t.Fatalf("live-codec inbox rows = %d, want 0 (live push collapsed onto the history row)", got)
-	}
-	item := hsinkTakeWork(t, harness.worker)
-	if item.inboxID != historyRow.inboxID || !item.replay || item.record.Codec != GoogleCodec {
-		t.Fatalf("queued work = %+v, want live replay against history row %q", item, historyRow.inboxID)
+			hsinkAssertCounts(t, harness, hsinkCounts{appended: 1, historyAppended: 1})
+			if got := i01QueryInt64(t, harness.path, `SELECT COUNT(*) FROM inbox`); got != 2 {
+				t.Fatalf("inbox rows = %d, want one per origin", got)
+			}
+			liveRow := hsinkInbox(t, harness.path, live.DedupeKey)
+			historyRow := hsinkInbox(t, harness.path, history.DedupeKey)
+			if liveRow.codec != GoogleCodec || string(liveRow.payload) != string(live.Payload) {
+				t.Fatalf("live row = %+v, want the live frame under the live codec", liveRow)
+			}
+			if historyRow.codec != GoogleHistoryCodec || string(historyRow.payload) != string(history.Payload) {
+				t.Fatalf("history row = %+v, want the history frame under the history codec", historyRow)
+			}
+			if liveRow.inboxID == historyRow.inboxID || liveRow.receivedAtMS == historyRow.receivedAtMS {
+				t.Fatalf("rows share identity or receipt time: live %+v history %+v", liveRow, historyRow)
+			}
+		})
 	}
 }
 
@@ -370,15 +364,6 @@ func hsinkInbox(t *testing.T, path, dedupeKey string) hsinkInboxRow {
 		t.Fatalf("read inbox row %q: %v", dedupeKey, err)
 	}
 	return row
-}
-
-func hsinkAssertNoWork(t *testing.T, worker *Worker) {
-	t.Helper()
-	select {
-	case item := <-worker.work:
-		t.Fatalf("sink queued %+v, want no work item", item)
-	default:
-	}
 }
 
 func hsinkTakeWork(t *testing.T, worker *Worker) workItem {

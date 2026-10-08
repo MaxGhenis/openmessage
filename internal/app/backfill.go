@@ -18,6 +18,10 @@ const (
 	recentReconcileConversationLimit = 50
 	recentReconcileMessageLimit      = 30
 	recentReconcileMaxPages          = 4
+	// windowBackfillMaxPages bounds one conversation's paging in a window
+	// backfill (50 messages a page), so a reply that never crosses the window
+	// boundary cannot page forever.
+	windowBackfillMaxPages = 400
 )
 
 // orphanContactDiscoveryEnabled reports whether deep backfill should run
@@ -77,6 +81,9 @@ func (a *App) Backfill() error {
 	a.Logger.Info().Int("count", len(convos)).Msg("Fetched conversations")
 
 	for _, conv := range convos {
+		if catchUp.closed {
+			break
+		}
 		if err := catchUp.storeConversation(conv); err != nil {
 			a.Logger.Error().Err(err).Str("conv_id", conv.GetConversationID()).Msg("Failed to store conversation")
 			continue
@@ -216,16 +223,19 @@ func (a *App) StartGoogleWindowBackfill(since time.Time) bool {
 func (a *App) windowBackfill(since time.Time) {
 	defer a.endBackfill()
 
+	// Progress is reset before anything can fail, so /api/backfill/status
+	// reports this run (with its error) rather than the previous one.
+	a.BackfillProgress.reset()
+	defer a.BackfillProgress.finish()
+
 	catchUp := a.beginGoogleCatchUp("window_backfill")
 	if catchUp == nil {
 		a.Logger.Error().Msg("Window backfill: client not connected")
+		a.BackfillProgress.addError("window backfill: Google client not connected")
 		return
 	}
 	defer catchUp.finish()
 	catchUp.progress = &a.BackfillProgress
-
-	a.BackfillProgress.reset()
-	defer a.BackfillProgress.finish()
 
 	sinceMS := since.UnixMilli()
 	a.Logger.Info().Time("since", since).Msg("Starting window backfill")
@@ -237,11 +247,15 @@ func (a *App) windowBackfill(since time.Time) {
 		return last == 0 || last >= sinceMS
 	}
 	seen := map[string]*gmproto.Conversation{}
+	aborted := func() {
+		a.BackfillProgress.addError("window backfill stopped early: the Google connection changed or ended; run it again")
+		a.emitConversationsChange()
+		a.emitMessagesChange("")
+	}
 	for _, folder := range backfillFolders {
-		n, aborted := a.paginateFolder(catchUp, folder, seen, inWindow)
-		if aborted {
-			a.emitConversationsChange()
-			a.emitMessagesChange("")
+		n, stopped := a.paginateFolder(catchUp, folder, seen, inWindow)
+		if stopped {
+			aborted()
 			return
 		}
 		a.BackfillProgress.add(0, 0, 0, 1)
@@ -253,11 +267,10 @@ func (a *App) windowBackfill(since time.Time) {
 
 	a.BackfillProgress.setPhase(BackfillPhaseMessages)
 	for convID, conv := range seen {
-		n, aborted := a.deepBackfillConversationWithToken(catchUp, convID, conv, sinceMS)
+		n, stopped := a.deepBackfillConversationWithToken(catchUp, convID, conv, sinceMS)
 		a.BackfillProgress.add(0, n, 0, 0)
-		if aborted {
-			a.emitConversationsChange()
-			a.emitMessagesChange("")
+		if stopped {
+			aborted()
 			return
 		}
 	}
@@ -297,7 +310,7 @@ func (a *App) paginateFolder(
 	var cursor *gmproto.Cursor
 
 	for {
-		if a.deepBackfillShouldAbort(catchUp.token, "folders") {
+		if catchUp.shouldAbort("folders") {
 			return found, true
 		}
 		resp, err := catchUp.gm.ListConversationsWithCursor(100, folder, cursor)
@@ -318,6 +331,9 @@ func (a *App) paginateFolder(
 		batchFound := 0
 		batchErrors := 0
 		for _, conv := range convos {
+			if catchUp.closed {
+				break
+			}
 			convID := conv.GetConversationID()
 			if _, ok := seen[convID]; ok {
 				continue
@@ -359,11 +375,14 @@ func (a *App) paginateFolder(
 }
 
 // deepBackfillConversationWithToken fetches a conversation's messages newest
-// first with cursor pagination. With stopBeforeMS > 0 it stops after the first
-// page that reaches a message older than stopBeforeMS; otherwise it fetches
-// every page. conv is the conversation's listed snapshot (nil when the caller
-// has none). It reports the number of messages fetched and whether the
-// catch-up must abort.
+// first with cursor pagination. With stopBeforeMS > 0 (a window backfill) it
+// stops after the first page that reaches a message older than stopBeforeMS,
+// and when a reply carries no cursor it continues from the oldest message it
+// has seen, as libgm's own bridge does, because a missing cursor does not mean
+// the conversation is exhausted. With stopBeforeMS == 0 it fetches every page
+// the phone hands a cursor for. conv is the conversation's listed snapshot
+// (nil when the caller has none). It reports the number of messages fetched
+// and whether the catch-up must abort.
 func (a *App) deepBackfillConversationWithToken(
 	catchUp *googleCatchUp,
 	convID string,
@@ -372,10 +391,20 @@ func (a *App) deepBackfillConversationWithToken(
 ) (int, bool) {
 	total := 0
 	var cursor *gmproto.Cursor
+	windowed := stopBeforeMS > 0
+	// oldestSeenMS is the oldest positive message time stored so far;
+	// synthesized marks a cursor this loop built because the reply had none.
+	oldestSeenMS := int64(0)
+	synthesized := false
 
-	for {
-		if a.deepBackfillShouldAbort(catchUp.token, "messages") {
+	for page := 0; ; page++ {
+		if catchUp.shouldAbort("messages") {
 			return total, true
+		}
+		if windowed && page >= windowBackfillMaxPages {
+			a.Logger.Warn().Str("conv_id", convID).Int("pages", page).Msg("Window backfill: page limit reached before the window boundary")
+			a.BackfillProgress.addError(fmt.Sprintf("fetch messages %s: page limit reached before the window boundary", convID))
+			break
 		}
 		resp, err := catchUp.gm.FetchMessages(convID, 50, cursor)
 		if err != nil {
@@ -392,21 +421,50 @@ func (a *App) deepBackfillConversationWithToken(
 			break
 		}
 
+		// Only a real (positive) timestamp can place a message before the
+		// window; a message with no timestamp says nothing about where the
+		// page is.
+		var oldest *gmproto.Message
+		for _, msg := range msgs {
+			if ts := msg.GetTimestamp() / 1000; ts > 0 && (oldest == nil || ts < oldest.GetTimestamp()/1000) {
+				oldest = msg
+			}
+		}
+		if synthesized && (oldest == nil || oldest.GetTimestamp()/1000 >= oldestSeenMS) {
+			// The page fetched below the oldest message holds nothing older:
+			// the conversation is exhausted (or the cursor was not honoured).
+			break
+		}
+
 		reachedBoundary := false
 		for _, msg := range msgs {
+			if catchUp.closed {
+				break
+			}
 			catchUp.storeMessage(convID, conv, msg)
 			total++
-			if stopBeforeMS > 0 && msg.GetTimestamp()/1000 < stopBeforeMS {
+			if ts := msg.GetTimestamp() / 1000; windowed && ts > 0 && ts < stopBeforeMS {
 				reachedBoundary = true
 			}
 		}
 		if reachedBoundary {
 			break
 		}
+		if oldest != nil && (oldestSeenMS == 0 || oldest.GetTimestamp()/1000 < oldestSeenMS) {
+			oldestSeenMS = oldest.GetTimestamp() / 1000
+		}
 
 		cursor = resp.GetCursor()
+		synthesized = false
 		if cursor == nil {
-			break
+			if !windowed || oldestSeenMS == 0 {
+				break
+			}
+			// No cursor, boundary not reached: a missing cursor does not mean
+			// the conversation is exhausted, so continue below the oldest
+			// message stored so far.
+			cursor = &gmproto.Cursor{LastItemID: oldestMessageID(msgs, oldest), LastItemTimestamp: oldestSeenMS}
+			synthesized = true
 		}
 
 		a.Logger.Debug().
@@ -426,10 +484,19 @@ func (a *App) deepBackfillConversationWithToken(
 	return total, false
 }
 
+// oldestMessageID names the message a synthesized cursor continues below: the
+// page's oldest timestamped message, else the page's last message.
+func oldestMessageID(msgs []*gmproto.Message, oldest *gmproto.Message) string {
+	if oldest != nil {
+		return oldest.GetMessageID()
+	}
+	return msgs[len(msgs)-1].GetMessageID()
+}
+
 // discoverFromContacts lists all contacts and tries to find conversations
 // for phone numbers not already seen in the folder scan.
 func (a *App) discoverFromContacts(catchUp *googleCatchUp, seen map[string]*gmproto.Conversation) bool {
-	if a.deepBackfillShouldAbort(catchUp.token, "contacts") {
+	if catchUp.shouldAbort("contacts") {
 		return true
 	}
 	contactsResp, err := catchUp.gm.ListContacts()
@@ -446,7 +513,7 @@ func (a *App) discoverFromContacts(catchUp *googleCatchUp, seen map[string]*gmpr
 	a.Logger.Info().Int("count", len(contacts)).Msg("Deep backfill: checking contacts for orphan conversations")
 
 	for _, contact := range contacts {
-		if a.deepBackfillShouldAbort(catchUp.token, "contacts") {
+		if catchUp.shouldAbort("contacts") {
 			return true
 		}
 		num := contact.GetNumber()

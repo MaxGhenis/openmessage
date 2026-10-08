@@ -121,16 +121,12 @@ func (s *Sink) append(ctx context.Context, record bridge.RawIngressRecord, histo
 	replay := effectiveID != inboxID
 	switch {
 	case history && replay:
-		// A fetched copy that collapsed onto an existing row is not replayed.
-		// Onto a live row, a replay would apply history semantics to it and
-		// mark it processed, so a live update still waiting in the inbox would
-		// never be applied. Onto a history row, history is insert-only and
-		// adds nothing on a second pass. Either row is (or will be) drained
-		// under its own codec. One cost: a history row that an older binary
-		// quarantined as an unknown codec is not re-applied by an identical
-		// re-fetch; the legacy store still holds that message.
+		// History keys are disjoint from live keys, so this is a re-fetch of
+		// a frame already in the inbox as history. The replay re-evaluates it
+		// with the latest conversation snapshot: a message skipped because its
+		// thread was not yet bound is placed once the live channel binds it.
+		// Like every replay it is best effort: a full worker queue drops it.
 		counters.historyDeduped.Add(1)
-		return nil
 	case history:
 		counters.historyAppended.Add(1)
 	case replay:

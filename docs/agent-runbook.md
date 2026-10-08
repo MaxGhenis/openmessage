@@ -296,28 +296,41 @@ visible to readers. Each catch-up now captures the current connection
 generation's history ingress together with its client and hands every fetched
 conversation and message to v2 as well:
 
-- **Codec `google.protobuf.history`.** Same envelope as live frames, but a
-  distinct inbox codec, so anything that measures live delivery from inbox rows
-  ignores fetched history: the silence detector (#190) and the SMS-path
-  monitor (#191) both select rows by exact codec `google.protobuf`. A
-  reconcile right after a reconnect therefore cannot reset a silence clock.
-  Dedupe keys are shared with live frames: a fetched copy byte-identical to a
-  pushed frame collapses onto the live row.
-- **Insert-only.** A history frame creates a conversation only when its wire id
-  is unbound, inserts a message only when v2 lacks it, applies reactions only
-  to messages it inserted, and never updates an existing row. The live channel
-  owns updates; a general upsert from fetched data would resurrect deleted
-  rows, revert edits and clobber reactions. Message frames carry the
-  conversation snapshot they were fetched under, so a new group's messages are
-  filed into the group, not a member's 1:1 thread.
+- **Codec `google.protobuf.history`, own dedupe keys.** Same envelope as live
+  frames, but a distinct inbox codec. On a v2-primary daemon, the silence
+  detector (#190) and the SMS-path monitor (#191) select inbox rows by exact
+  codec `google.protobuf`, so a reconcile right after a reconnect cannot reset
+  a silence clock there. (On a legacy-primary daemon silence is read from the
+  legacy store's incoming messages, which catch-ups have always written to.)
+  History keys (`hmsg:`/`hconv:`) never collide with live keys, so a live push
+  always gets its own inbox row and is applied and counted even when a
+  catch-up fetched the same message first.
+- **Fills gaps, never moves a binding.** A history frame inserts a message only
+  when v2 lacks it, applies reactions only to messages it inserted, and never
+  updates an existing row; the live channel owns updates (a general upsert
+  from fetched data would resurrect deleted rows, revert edits and clobber
+  reactions). It places a message only in the thread its wire id is bound to,
+  or in a thread its own conversation snapshot created. A snapshot creates a
+  thread only for an unbound id whose roster no existing thread answers to.
+  Anything else is skipped and counted in `history_skipped`: an unbound id
+  matching an existing thread's roster (the phone can hold two threads with
+  the same people), a sender who isn't the bound 1:1 thread's peer, or a
+  thread with no snapshot. #176's id-space rebinding stays a live-channel
+  repair. A skipped frame is re-evaluated when the same history is fetched
+  again (best effort), so once a live frame binds the thread, the next
+  catch-up files it.
 - **No liveness.** History commits under the generation fence but records no
   supervisor activity, so a working pull path never masks a dead push path.
+  When the generation ends mid-catch-up, the catch-up stops (it stores nothing
+  more, legacy included) and the next generation fetches again.
 - **Counters.** `/api/status` → `v2_ingest.per_account.<account>`:
   `history_appended`, `history_deduped`, `history_imported`,
-  `history_existing`, `history_conversations`. `appended` and `projected` keep
-  counting only what the live channel delivered. Backfill runs also report
-  `history_teed` / `history_tee_failed` in `/api/backfill/status`; a failed
-  hand-off still leaves the message in the legacy store.
+  `history_existing`, `history_conversations`, `history_skipped`. `appended`,
+  `deduped` and `projected` count only live frames; shared counters such as
+  `decoded_events`, `quarantined`, `empty_stubs_skipped` and the reaction and
+  echo counters include history too. Backfill runs also report `history_teed`
+  / `history_tee_failed` in `/api/backfill/status` (both stay zero on a
+  legacy-only install).
 
 **Recovering a window the live channel skipped** (for example after the phone
 stopped relaying): run a window backfill from just before the gap. It lists
@@ -333,8 +346,12 @@ curl -s http://127.0.0.1:7007/api/backfill/status | jq
 curl -s http://127.0.0.1:7007/api/status | jq '.v2_ingest.per_account["google-primary"] | with_entries(select(.key|startswith("history")))'
 ```
 
-`since` also accepts a `YYYY-MM-DD` local date or Unix milliseconds; unknown
-fields are rejected so a typo can't start a full deep backfill. Then confirm
+`since` also accepts a `YYYY-MM-DD` local date or Unix milliseconds. A body
+with `since` either starts a window or is rejected (400): unknown fields,
+trailing data, bodies over 4 KB and Unix seconds are refused, so a typo can't
+fall through to a full deep backfill. (An empty body, `{}` or `{"since":null}`
+still means a deep backfill.) A run that couldn't start or stopped early says
+so in `/api/backfill/status` `error_details`. Then confirm
 the phone's row ids are present (they advance with every message on the phone):
 
 ```bash
@@ -1170,8 +1187,9 @@ briefly show "reconnecting" before it settles (see throttling note above).
 Read `curl -s http://127.0.0.1:7007/api/status | jq '.v2_ingest'`. A healthy
 enabled stack reports `enabled: true`; under `per_account`, `appended` grows as
 receive frames arrive, message-bearing frames advance `projected`, and
-`quarantined` remains `0`. Catch-up history counts only under the `history_*`
-counters, so `appended`/`projected` growth is evidence of live delivery. An idle WhatsApp or Signal account can legitimately
+`quarantined` remains `0`. Catch-up history never moves `appended`,
+`deduped` or `projected` (it has its own `history_*` counters), so their
+growth is evidence of live delivery. An idle WhatsApp or Signal account can legitimately
 stay at zero until a new inbound/history frame arrives.
 
 The manual receive-only check is:

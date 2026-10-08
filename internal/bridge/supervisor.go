@@ -23,6 +23,7 @@ var (
 	ErrSupervisorBlocked       = errors.New("bridge: supervisor is blocked")
 	ErrStaleGeneration         = errors.New("bridge: stale connection generation")
 	ErrHistoryIngressMissing   = errors.New("bridge: connection sink cannot accept history ingress")
+	ErrHistoryIngressDisabled  = errors.New("bridge: no ingest sink is configured for history")
 	ErrAccountMismatch         = errors.New("bridge: account does not match supervisor")
 	ErrPairerUnavailable       = errors.New("bridge: pairing is unavailable")
 	ErrPairingInProgress       = errors.New("bridge: pairing is already in progress")
@@ -1451,7 +1452,8 @@ func (s *generationSink) AppendIngress(ctx context.Context, record RawIngressRec
 // generation, and fence checks as AppendIngress, but records no generation
 // activity: a catch-up reply must not refresh the live channel's liveness
 // deadline or reset its failure history. With no downstream sink (legacy-only
-// mode) the frame is accepted and dropped, exactly like live ingress.
+// mode) it returns ErrHistoryIngressDisabled, so the caller can tell "v2 is
+// not running" from "v2 took it" (live ingress silently drops there instead).
 func (s *generationSink) AppendHistoryIngress(ctx context.Context, record RawIngressRecord) error {
 	if record.AccountID != s.supervisor.accountID || record.Generation != s.generation {
 		return ErrStaleGeneration
@@ -1466,7 +1468,7 @@ func (s *generationSink) AppendHistoryIngress(ctx context.Context, record RawIng
 		return ErrStaleGeneration
 	}
 	if s.supervisor.sink == nil {
-		return nil
+		return ErrHistoryIngressDisabled
 	}
 	history, ok := s.supervisor.sink.(HistoryIngressSink)
 	if !ok {

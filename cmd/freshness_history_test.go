@@ -133,10 +133,20 @@ func TestFreshnessActivitySourceIgnoresGoogleHistoryFrames(t *testing.T) {
 		t.Fatalf("Between() = %v, want only the live receipt %v", receipts, lastLive)
 	}
 
-	// Live delivery still moves the clock.
+	// Live delivery still moves the clock, even for a message a catch-up
+	// already fetched with identical bytes: history keys never collide with
+	// live keys, so the push gets its own live-codec row. (With a shared key
+	// it collapsed onto the history row and the delivery was invisible here.)
 	resumed := base.Add(10 * time.Hour)
-	live(resumed, "live-2")
+	live(resumed, "fetched-3")
 	if got := latestGoogle(); !got.Equal(resumed) {
-		t.Fatalf("Latest after live delivery resumed = %v, want %v", got, resumed)
+		t.Fatalf("Latest after the phone pushed an already-fetched message = %v, want %v", got, resumed)
+	}
+	receipts, err = source.Between(context.Background(), "google", base, base.Add(24*time.Hour))
+	if err != nil {
+		t.Fatalf("Between(): %v", err)
+	}
+	if len(receipts) != 2 || !receipts[0].Equal(lastLive) || !receipts[1].Equal(resumed) {
+		t.Fatalf("Between() = %v, want the two live receipts %v and %v", receipts, lastLive, resumed)
 	}
 }

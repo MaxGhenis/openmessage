@@ -1647,8 +1647,10 @@ func TestHistoryWindowBackfillFillsHoleBelowNewerMessages(t *testing.T) {
 	}
 
 	// Paging stops after the first page that crosses since (two runs, so
-	// every count is doubled).
-	for id, wantPages := range map[string]int{"win": 2, "zero": 2, "arch": 1, "hole": 2} {
+	// every count is doubled). arch's single page stays inside the window and
+	// carries no cursor, so the backfill asks once more below its oldest
+	// message before concluding the conversation is exhausted.
+	for id, wantPages := range map[string]int{"win": 2, "zero": 2, "arch": 2, "hole": 2} {
 		if got := mock.fetchCalls[id]; got != 2*wantPages {
 			t.Errorf("conversation %s fetched %d pages over two runs, want %d", id, got, 2*wantPages)
 		}
@@ -1696,22 +1698,26 @@ func TestHistoryWindowBackfillFillsHoleBelowNewerMessages(t *testing.T) {
 	}
 
 	// Counters. First run: 4 conversation frames (win, zero, arch, hole) and 13
-	// message frames. hole's conversation frame and h-new-1 are byte-identical
-	// to the live frames (shared dedupe keys), so they dedupe. h-new-2's
-	// changed copy is appended and skipped as existing. The second run's 17
-	// frames are all dedupe hits.
+	// message frames, each its own history row: history keys never collide
+	// with live keys, so even hole's snapshot and h-new-1, byte-identical to
+	// the live frames, are appended. h-new-1 and h-new-2's changed copy are
+	// skipped as existing. The second run's 17 frames all dedupe onto their
+	// history rows and are replayed; its 13 messages are all found existing.
 	c := v2.snapshot()
-	if got := c.HistoryAppended - before.HistoryAppended; got != 15 {
-		t.Errorf("history_appended +%d, want +15", got)
+	if got := c.HistoryAppended - before.HistoryAppended; got != 17 {
+		t.Errorf("history_appended +%d, want +17", got)
 	}
-	if got := c.HistoryDeduped - before.HistoryDeduped; got != 2+17 {
-		t.Errorf("history_deduped +%d, want +19", got)
+	if got := c.HistoryDeduped - before.HistoryDeduped; got != 17 {
+		t.Errorf("history_deduped +%d, want +17", got)
 	}
 	if got := c.HistoryImported - before.HistoryImported; got != 11 {
 		t.Errorf("history_imported +%d, want +11 (w-1..4, z-1..2, a-1, h-1..3, h-old)", got)
 	}
-	if got := c.HistoryExisting - before.HistoryExisting; got != 1 {
-		t.Errorf("history_existing +%d, want +1 (h-new-2)", got)
+	if got := c.HistoryExisting - before.HistoryExisting; got != 2+13 {
+		t.Errorf("history_existing +%d, want +15 (h-new-1 and h-new-2, then the second run's 13)", got)
+	}
+	if got := c.HistorySkipped - before.HistorySkipped; got != 0 {
+		t.Errorf("history_skipped +%d, want 0", got)
 	}
 	if got := c.HistoryConversations - before.HistoryConversations; got != 3 {
 		t.Errorf("history_conversations +%d, want +3 (win, zero, arch; hole was bound)", got)
@@ -1752,26 +1758,151 @@ func hcdTwoConversationMock() *mockGMClient {
 	}
 }
 
-func TestHistoryTeeStopsAfterGenerationClosedButLegacyKeepsEverything(t *testing.T) {
-	v2 := hcdNewV2(t)
-	ingress := &hcdIngress{sink: v2.sink, script: func(call int) error {
-		if call == 2 {
-			return fmt.Errorf("google generation 1 ended: %w", ErrGoogleHistoryClosed)
+// When the generation that is fetching ends, its history ingress reports
+// closed and the catch-up stops: it stores nothing more, in either store. A
+// message written only to legacy past that point would be hidden from v2 for
+// good, because later reconciles stop at the newest legacy message; stopping
+// lets the next generation's catch-up fetch it into both.
+func TestHistoryCatchUpStopsWhenItsGenerationCloses(t *testing.T) {
+	t.Run("deep backfill, closed on a conversation", func(t *testing.T) {
+		v2 := hcdNewV2(t)
+		ingress := &hcdIngress{sink: v2.sink, script: func(call int) error {
+			if call == 2 {
+				return fmt.Errorf("google generation 1 ended: %w", ErrGoogleHistoryClosed)
+			}
+			return nil
+		}}
+		mock := hcdTwoConversationMock()
+		mock.fetchCalls = map[string]int{}
+		a, _, legacyDB := hcdNewApp(t, mock, ingress)
+
+		a.DeepBackfill()
+		v2.drain(t)
+
+		calls, offers := ingress.snapshot()
+		if calls != 2 {
+			t.Fatalf("ingress calls = %d, want 2: a closed generation must stop every later hand-off (offers %+v)", calls, offers)
 		}
-		return nil
+		progress := a.GetBackfillProgress()
+		if progress.HistoryTeed != 1 || progress.HistoryTeeFailed != 1 {
+			t.Errorf("progress history_teed=%d history_tee_failed=%d, want 1/1", progress.HistoryTeed, progress.HistoryTeeFailed)
+		}
+		// Only what was handed to v2 before the close is in legacy: the first
+		// conversation. The refused one and every message are in neither.
+		if offers[0].Kind != "conv" {
+			t.Fatalf("first offer = %+v, want a conversation", offers[0])
+		}
+		if got := hcdKeys(hcdLegacyConversationIDs(t, legacyDB)); !reflect.DeepEqual(got, []string{offers[0].ConversationID}) {
+			t.Errorf("legacy conversations = %v, want only %s", got, offers[0].ConversationID)
+		}
+		if got := hcdKeys(hcdV2ConversationRemoteIDs(t, v2.inspect)); !reflect.DeepEqual(got, []string{offers[0].ConversationID}) {
+			t.Errorf("v2 conversations = %v, want only %s", got, offers[0].ConversationID)
+		}
+		if got := len(hcdLegacyMessages(t, legacyDB)); got != 0 {
+			t.Errorf("legacy holds %d messages after the close, want 0", got)
+		}
+		if n := v2.count(t, `SELECT COUNT(*) FROM messages`); n != 0 {
+			t.Errorf("v2 holds %d messages, want 0", n)
+		}
+		if len(mock.fetchCalls) != 0 {
+			t.Errorf("messages were fetched after the close: %v", mock.fetchCalls)
+		}
+	})
+
+	t.Run("deep backfill, closed on a message", func(t *testing.T) {
+		v2 := hcdNewV2(t)
+		// Calls 1-2 are the two conversations; call 3 is the first message,
+		// call 4 the second.
+		ingress := &hcdIngress{sink: v2.sink, script: func(call int) error {
+			if call == 4 {
+				return fmt.Errorf("google generation 1 retired: %w", ErrGoogleHistoryClosed)
+			}
+			return nil
+		}}
+		a, _, legacyDB := hcdNewApp(t, hcdTwoConversationMock(), ingress)
+
+		a.DeepBackfill()
+		v2.drain(t)
+
+		calls, offers := ingress.snapshot()
+		if calls != 4 {
+			t.Fatalf("ingress calls = %d, want 4 (offers %+v)", calls, offers)
+		}
+		legacy := hcdLegacyMessages(t, legacyDB)
+		stored := hcdV2Messages(t, v2.inspect)
+		if len(legacy) != 1 || len(stored) != 1 {
+			t.Fatalf("legacy holds %d messages and v2 %d, want exactly the one handed over before the close", len(legacy), len(stored))
+		}
+		for id := range legacy {
+			if _, ok := stored[id]; !ok {
+				t.Errorf("legacy holds %s, which v2 was never given", id)
+			}
+		}
+		if progress := a.GetBackfillProgress(); progress.HistoryTeed != 3 || progress.HistoryTeeFailed != 1 {
+			t.Errorf("progress history_teed=%d history_tee_failed=%d, want 3/1", progress.HistoryTeed, progress.HistoryTeeFailed)
+		}
+	})
+
+	t.Run("shallow backfill", func(t *testing.T) {
+		shallow := &hcdIngress{script: func(int) error { return fmt.Errorf("retired: %w", ErrGoogleHistoryClosed) }}
+		mock := hcdTwoConversationMock()
+		mock.fetchCalls = map[string]int{}
+		b, _, shallowDB := hcdNewApp(t, mock, shallow)
+		if err := b.Backfill(); err != nil {
+			t.Fatalf("Backfill(): %v", err)
+		}
+		if calls, _ := shallow.snapshot(); calls != 1 {
+			t.Errorf("shallow backfill ingress calls = %d, want 1", calls)
+		}
+		if got := len(hcdLegacyMessages(t, shallowDB)); got != 0 {
+			t.Errorf("shallow backfill legacy holds %d messages after the close, want 0", got)
+		}
+		if got := hcdKeys(hcdLegacyConversationIDs(t, shallowDB)); len(got) != 0 {
+			t.Errorf("shallow backfill legacy conversations = %v, want none", got)
+		}
+		if len(mock.fetchCalls) != 0 {
+			t.Errorf("messages were fetched after the close: %v", mock.fetchCalls)
+		}
+	})
+
+	t.Run("phone backfill", func(t *testing.T) {
+		// A phone backfill ignores a client change but still stops when the
+		// generation that is fetching has closed its history ingress.
+		ingress := &hcdIngress{script: func(call int) error {
+			if call == 3 {
+				return fmt.Errorf("retired: %w", ErrGoogleHistoryClosed)
+			}
+			return nil
+		}}
+		mock := hcdTwoConversationMock()
+		mock.getOrCreateResults = map[string]*gmproto.Conversation{"+15550001111": makeConv("t1", "One")}
+		a, _, legacyDB := hcdNewApp(t, mock, ingress)
+		if err := a.BackfillConversationByPhone("+15550001111"); err != nil {
+			t.Fatalf("BackfillConversationByPhone(): %v", err)
+		}
+		if calls, _ := ingress.snapshot(); calls != 3 {
+			t.Errorf("ingress calls = %d, want 3 (conversation, one message, the refused one)", calls)
+		}
+		if got := len(hcdLegacyMessages(t, legacyDB)); got != 1 {
+			t.Errorf("legacy holds %d messages, want only the one handed over before the close", got)
+		}
+	})
+}
+
+// A legacy-only install has no v2 ingest: the ingress reports disabled. The
+// catch-up keeps filling the legacy store, stops offering history, and counts
+// neither a hand-off nor a failure (it used to count every item as handed to
+// v2 and log that it had).
+func TestHistoryCatchUpWithIngestDisabledOnlyFillsLegacy(t *testing.T) {
+	ingress := &hcdIngress{script: func(int) error {
+		return fmt.Errorf("%w: no ingest sink", ErrGoogleHistoryDisabled)
 	}}
 	a, _, legacyDB := hcdNewApp(t, hcdTwoConversationMock(), ingress)
 
 	a.DeepBackfill()
-	v2.drain(t)
 
-	calls, offers := ingress.snapshot()
-	if calls != 2 {
-		t.Fatalf("ingress calls = %d, want 2: a closed generation must stop every later hand-off (offers %+v)", calls, offers)
-	}
-	progress := a.GetBackfillProgress()
-	if progress.HistoryTeed != 1 || progress.HistoryTeeFailed != 1 {
-		t.Errorf("progress history_teed=%d history_tee_failed=%d, want 1/1", progress.HistoryTeed, progress.HistoryTeeFailed)
+	if calls, _ := ingress.snapshot(); calls != 1 {
+		t.Errorf("ingress calls = %d, want 1: after disabled, nothing more is offered", calls)
 	}
 	if got := len(hcdLegacyMessages(t, legacyDB)); got != 6 {
 		t.Errorf("legacy holds %d messages, want all 6", got)
@@ -1779,32 +1910,12 @@ func TestHistoryTeeStopsAfterGenerationClosedButLegacyKeepsEverything(t *testing
 	if got := hcdKeys(hcdLegacyConversationIDs(t, legacyDB)); !reflect.DeepEqual(got, []string{"t1", "t2"}) {
 		t.Errorf("legacy conversations = %v, want [t1 t2]", got)
 	}
-	// Only the first hand-off (a conversation frame) reached v2.
-	if offers[0].Kind != "conv" {
-		t.Fatalf("first offer = %+v, want a conversation", offers[0])
+	progress := a.GetBackfillProgress()
+	if progress.HistoryTeed != 0 || progress.HistoryTeeFailed != 0 || progress.Errors != 0 {
+		t.Errorf("progress = %+v, want no history counts and no errors", progress)
 	}
-	if got := hcdKeys(hcdV2ConversationRemoteIDs(t, v2.inspect)); !reflect.DeepEqual(got, []string{offers[0].ConversationID}) {
-		t.Errorf("v2 conversations = %v, want only %s", got, offers[0].ConversationID)
-	}
-	if n := v2.count(t, `SELECT COUNT(*) FROM messages`); n != 0 {
-		t.Errorf("v2 holds %d messages, want 0", n)
-	}
-	if c := v2.snapshot(); c.HistoryAppended != 1 {
-		t.Errorf("history_appended = %d, want 1", c.HistoryAppended)
-	}
-
-	// The shallow backfill has no progress struct; a closed generation still
-	// stops it after the first refusal, and legacy still gets everything.
-	shallow := &hcdIngress{script: func(int) error { return fmt.Errorf("retired: %w", ErrGoogleHistoryClosed) }}
-	b, _, shallowDB := hcdNewApp(t, hcdTwoConversationMock(), shallow)
-	if err := b.Backfill(); err != nil {
-		t.Fatalf("Backfill(): %v", err)
-	}
-	if calls, _ := shallow.snapshot(); calls != 1 {
-		t.Errorf("shallow backfill ingress calls = %d, want 1", calls)
-	}
-	if got := len(hcdLegacyMessages(t, shallowDB)); got != 6 {
-		t.Errorf("shallow backfill legacy holds %d messages, want 6", got)
+	if progress.MessagesFound != 6 || progress.ConversationsFound != 2 {
+		t.Errorf("progress messages=%d conversations=%d, want 6/2", progress.MessagesFound, progress.ConversationsFound)
 	}
 }
 

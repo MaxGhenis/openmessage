@@ -438,7 +438,12 @@ func TestHistoryDecoderEnvelopeShape(t *testing.T) {
 	}
 }
 
-func TestHistoryRecordMessageSharesLiveDedupeKey(t *testing.T) {
+// History keys live in their own namespace ("hmsg"): equal across re-fetches
+// of the same bytes, never equal to the live key for those bytes. If the two
+// origins shared a key, a fetched copy that reached the inbox first would
+// swallow a later byte-identical live push (it would be replayed against an
+// already-processed history row and dropped as a stale replay).
+func TestHistoryRecordMessageKeyIsDisjointFromLiveKey(t *testing.T) {
 	t.Parallel()
 
 	message := hdecIncomingMessage("shared-key-message", "conversation-shared", "same bytes")
@@ -451,10 +456,11 @@ func TestHistoryRecordMessageSharesLiveDedupeKey(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantKey := ingest.GoogleIngressDedupeKey("msg", "shared-key-message", protoBytes)
-	if !strings.HasPrefix(wantKey, "msg:shared-key-message:") || len(wantKey) != len("msg:shared-key-message:")+8 {
-		t.Fatalf("GoogleIngressDedupeKey = %q, want msg:<id>:<8 hex chars>", wantKey)
+	wantKey := ingest.GoogleIngressDedupeKey("hmsg", "shared-key-message", protoBytes)
+	if !strings.HasPrefix(wantKey, "hmsg:shared-key-message:") || len(wantKey) != len("hmsg:shared-key-message:")+8 {
+		t.Fatalf("GoogleIngressDedupeKey = %q, want hmsg:<id>:<8 hex chars>", wantKey)
 	}
+	liveKey := ingest.GoogleIngressDedupeKey("msg", "shared-key-message", protoBytes)
 
 	history, err := ingest.GoogleHistoryMessageRecord(
 		hdecAccountID, hdecGeneration, "conversation-shared",
@@ -473,7 +479,7 @@ func TestHistoryRecordMessageSharesLiveDedupeKey(t *testing.T) {
 	}
 
 	// The live tee's record for the identical proto, pushed fresh or replayed
-	// (is_old), carries the same key: a fetched copy collapses onto it.
+	// (is_old), keeps the live key, which the history key never equals.
 	for _, isOld := range []bool{false, true} {
 		live, err := ingest.GoogleMessageRecord(
 			hdecAccountID, hdecGeneration,
@@ -486,8 +492,11 @@ func TestHistoryRecordMessageSharesLiveDedupeKey(t *testing.T) {
 		if live.Codec != ingest.GoogleCodec {
 			t.Fatalf("live record codec = %q, want %q", live.Codec, ingest.GoogleCodec)
 		}
-		if live.DedupeKey != history.DedupeKey {
-			t.Fatalf("live(is_old=%v) key %q != history key %q", isOld, live.DedupeKey, history.DedupeKey)
+		if live.DedupeKey != liveKey {
+			t.Fatalf("live(is_old=%v) key = %q, want %q", isOld, live.DedupeKey, liveKey)
+		}
+		if live.DedupeKey == history.DedupeKey {
+			t.Fatalf("live(is_old=%v) key %q equals the history key; the origins must not share inbox rows", isOld, live.DedupeKey)
 		}
 		if string(live.Payload) == string(history.Payload) {
 			t.Fatal("live and history payloads are identical; history should carry is_old=true and the snapshot")
@@ -556,7 +565,7 @@ func TestHistoryRecordFillsMissingConversationIDOnClone(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if want := ingest.GoogleIngressDedupeKey("msg", "fill-message", filledBytes); record.DedupeKey != want {
+			if want := ingest.GoogleIngressDedupeKey("hmsg", "fill-message", filledBytes); record.DedupeKey != want {
 				t.Fatalf("dedupe key = %q, want key of the filled proto %q", record.DedupeKey, want)
 			}
 			if strings.TrimSpace(test.ownID) == "" {
@@ -702,7 +711,7 @@ func TestHistoryRecordDedupeKeyIgnoresConversationSnapshot(t *testing.T) {
 	}
 }
 
-func TestHistoryRecordConversationUsesHistoryCodecAndLiveKey(t *testing.T) {
+func TestHistoryRecordConversationUsesHistoryCodecAndOwnKey(t *testing.T) {
 	t.Parallel()
 
 	conversation := hdecGroupConversation("conversation-key")
@@ -718,12 +727,10 @@ func TestHistoryRecordConversationUsesHistoryCodecAndLiveKey(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GoogleConversationRecord: %v", err)
 	}
-	wantKey := ingest.GoogleIngressDedupeKey("conv", "conversation-key", protoBytes)
-	if !strings.HasPrefix(wantKey, "conv:conversation-key:") {
-		t.Fatalf("conversation key = %q, want conv: prefix", wantKey)
-	}
-	if history.DedupeKey != wantKey || live.DedupeKey != wantKey {
-		t.Fatalf("keys history=%q live=%q, want both %q", history.DedupeKey, live.DedupeKey, wantKey)
+	wantHistory := ingest.GoogleIngressDedupeKey("hconv", "conversation-key", protoBytes)
+	wantLive := ingest.GoogleIngressDedupeKey("conv", "conversation-key", protoBytes)
+	if history.DedupeKey != wantHistory || live.DedupeKey != wantLive || wantHistory == wantLive {
+		t.Fatalf("keys history=%q live=%q, want %q and %q (disjoint)", history.DedupeKey, live.DedupeKey, wantHistory, wantLive)
 	}
 	if history.Codec != ingest.GoogleHistoryCodec || live.Codec != ingest.GoogleCodec {
 		t.Fatalf("codecs history=%q live=%q", history.Codec, live.Codec)
@@ -874,8 +881,9 @@ func TestHistoryRecordDecodeMatchesLiveProperty(t *testing.T) {
 			t.Errorf("GoogleMessageRecord: %v", err)
 			return false
 		}
-		if history.DedupeKey != live.DedupeKey {
-			t.Errorf("history key %q != live key %q for %v", history.DedupeKey, live.DedupeKey, liveMessage)
+		// Same content hash, disjoint namespaces.
+		if history.DedupeKey != "h"+live.DedupeKey {
+			t.Errorf("history key %q, want \"h\"+live key %q for %v", history.DedupeKey, live.DedupeKey, liveMessage)
 			return false
 		}
 

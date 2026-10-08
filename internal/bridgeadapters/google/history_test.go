@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/quick"
 	"time"
@@ -233,15 +234,16 @@ func TestHistoryMessageAppendsOneHistoryFrameKeyedLikeLive(t *testing.T) {
 		t.Fatal("AppendHistoryMessage mutated the caller's protobufs")
 	}
 
-	wantKey := historyTeeKey(t, "msg", "history-message-1", message)
+	wantKey := historyTeeKey(t, "hmsg", "history-message-1", message)
 	if record.DedupeKey != wantKey ||
-		record.DedupeKey != ingest.GoogleIngressDedupeKey("msg", "history-message-1", envelope.Proto) {
+		record.DedupeKey != ingest.GoogleIngressDedupeKey("hmsg", "history-message-1", envelope.Proto) {
 		t.Fatalf("history dedupe key = %q, want %q", record.DedupeKey, wantKey)
 	}
 
-	// The live tee for the same protobuf derives the same key (DESIGN.md
-	// decision 2), although its payload differs: the key covers only the
-	// message protobuf, not is_old or the embedded conversation (intended).
+	// The live tee for the same protobuf uses the live key namespace: the two
+	// origins never share an inbox row, so a fetched copy cannot swallow a
+	// later live push of the same bytes. Both keys cover only the message
+	// protobuf, not is_old or the embedded conversation.
 	fake.emit(&libgm.WrappedMessage{Message: message, IsOld: false})
 	live := sink.ingressRecords()
 	if len(live) != 1 {
@@ -250,8 +252,8 @@ func TestHistoryMessageAppendsOneHistoryFrameKeyedLikeLive(t *testing.T) {
 	if live[0].Codec != ingest.GoogleCodec {
 		t.Fatalf("live codec = %q, want %q", live[0].Codec, ingest.GoogleCodec)
 	}
-	if live[0].DedupeKey != record.DedupeKey {
-		t.Fatalf("live key %q != history key %q for the same protobuf", live[0].DedupeKey, record.DedupeKey)
+	if live[0].DedupeKey != historyTeeKey(t, "msg", "history-message-1", message) || live[0].DedupeKey == record.DedupeKey {
+		t.Fatalf("live key %q, history key %q: want the live msg: key, distinct from the history key", live[0].DedupeKey, record.DedupeKey)
 	}
 	if bytes.Equal(live[0].Payload, record.Payload) {
 		t.Fatal("live and history payloads are identical; history must carry is_old=true and the conversation")
@@ -300,7 +302,7 @@ func TestHistoryMessageConversationSnapshotRules(t *testing.T) {
 		if _, fields := decodeHistoryTeeEnvelope(t, records[0].Payload); fields["conversation_b64"] != nil {
 			t.Fatalf("foreign snapshot was embedded: %s", records[0].Payload)
 		}
-		if records[0].DedupeKey != historyTeeKey(t, "msg", "m-other", message) {
+		if records[0].DedupeKey != historyTeeKey(t, "hmsg", "m-other", message) {
 			t.Fatalf("dedupe key = %q, want key over the unchanged message", records[0].DedupeKey)
 		}
 	})
@@ -335,10 +337,10 @@ func TestHistoryMessageConversationSnapshotRules(t *testing.T) {
 		attributed.ConversationID = "fetched-from"
 		// Intended divergence: the key covers the attributed bytes, so it
 		// differs from a key over the raw fetched protobuf.
-		if records[0].DedupeKey != historyTeeKey(t, "msg", "m-orphan", attributed) {
+		if records[0].DedupeKey != historyTeeKey(t, "hmsg", "m-orphan", attributed) {
 			t.Fatalf("dedupe key = %q, want key over the attributed copy", records[0].DedupeKey)
 		}
-		if records[0].DedupeKey == historyTeeKey(t, "msg", "m-orphan", message) {
+		if records[0].DedupeKey == historyTeeKey(t, "hmsg", "m-orphan", message) {
 			t.Fatal("dedupe key ignored the attribution")
 		}
 	})
@@ -404,7 +406,7 @@ func TestHistoryConversationAppendsHistoryConversationFrame(t *testing.T) {
 	if !proto.Equal(&got, conversation) {
 		t.Fatalf("history conversation proto = %v, want %v", &got, conversation)
 	}
-	if want := historyTeeKey(t, "conv", "listed-conversation", conversation); record.DedupeKey != want {
+	if want := historyTeeKey(t, "hconv", "listed-conversation", conversation); record.DedupeKey != want {
 		t.Fatalf("history conversation key = %q, want %q", record.DedupeKey, want)
 	}
 
@@ -413,10 +415,10 @@ func TestHistoryConversationAppendsHistoryConversationFrame(t *testing.T) {
 	if len(live) != 1 || live[0].Codec != ingest.GoogleCodec {
 		t.Fatalf("live conversation records = %+v, want one google.protobuf frame", live)
 	}
-	if live[0].DedupeKey != record.DedupeKey {
-		t.Fatalf("live conversation key %q != history key %q", live[0].DedupeKey, record.DedupeKey)
+	if live[0].DedupeKey != historyTeeKey(t, "conv", "listed-conversation", conversation) || live[0].DedupeKey == record.DedupeKey {
+		t.Fatalf("live conversation key %q, history key %q: want the live conv: key, distinct from the history key", live[0].DedupeKey, record.DedupeKey)
 	}
-	// Only the codec differs: the conversation envelope is the same bytes.
+	// Codec and key namespace differ: the conversation envelope is the same bytes.
 	if !bytes.Equal(live[0].Payload, record.Payload) {
 		t.Fatalf("conversation payloads differ:\n live    %s\n history %s", live[0].Payload, record.Payload)
 	}
@@ -494,12 +496,16 @@ func TestHistorySinkWithoutHistoryPathReportsMissing(t *testing.T) {
 // without claiming the generation closed.
 func TestHistoryStaleGenerationIsReportedAsClosed(t *testing.T) {
 	for _, tc := range []struct {
-		name       string
-		sinkErr    error
-		wantClosed bool
+		name         string
+		sinkErr      error
+		wantClosed   bool
+		wantDisabled bool
 	}{
 		{name: "stale generation", sinkErr: bridge.ErrStaleGeneration, wantClosed: true},
-		{name: "other commit error", sinkErr: errors.New("inbox unavailable"), wantClosed: false},
+		// No v2 ingest is running (legacy-only install): the catch-up must be
+		// able to tell, so it stops offering without counting a failure.
+		{name: "no ingest sink", sinkErr: bridge.ErrHistoryIngressDisabled, wantDisabled: true},
+		{name: "other commit error", sinkErr: errors.New("inbox unavailable")},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			sink := &historyTeeSink{historyErr: tc.sinkErr}
@@ -514,6 +520,9 @@ func TestHistoryStaleGenerationIsReportedAsClosed(t *testing.T) {
 				}
 				if got := errors.Is(err, app.ErrGoogleHistoryClosed); got != tc.wantClosed {
 					t.Fatalf("call %d errors.Is(ErrGoogleHistoryClosed) = %v, want %v (err %v)", i, got, tc.wantClosed, err)
+				}
+				if got := errors.Is(err, app.ErrGoogleHistoryDisabled); got != tc.wantDisabled {
+					t.Fatalf("call %d errors.Is(ErrGoogleHistoryDisabled) = %v, want %v (err %v)", i, got, tc.wantDisabled, err)
 				}
 			}
 			if got := len(sink.historyRecords()); got != 2 {
@@ -763,17 +772,15 @@ func TestHistoryMessageThroughRealSinkImportsIntoV2(t *testing.T) {
 		t.Fatalf("v2 message = %+v, want %+v", stored, want)
 	}
 
-	// I2: the same hand-off again dedupes onto the existing inbox row and is
-	// not replayed (history is insert-only, so a second pass adds nothing).
-	before := v2.snapshot()
+	// I2: the same hand-off again dedupes onto its history row; the replay
+	// re-evaluates the frame and finds the message already stored.
 	if err := history.AppendHistoryMessage(context.Background(), "e2e-group", conversation, message); err != nil {
 		t.Fatalf("second AppendHistoryMessage() error = %v", err)
 	}
-	again := v2.await(t, "history dedupe", func(s ingest.CounterSnapshot) bool { return s.HistoryDeduped == 1 })
-	if again.HistoryAppended != 1 || again.HistoryImported != 1 || again.HistoryExisting != 0 ||
-		again.HistoryConversations != 1 || again.Appended != 0 || again.Deduped != 0 ||
-		again.DecodedEvents != before.DecodedEvents {
-		t.Fatalf("counters after re-hand-off = %+v (before %+v)", again, before)
+	again := v2.await(t, "history replay", func(s ingest.CounterSnapshot) bool { return s.HistoryExisting == 1 })
+	if again.HistoryAppended != 1 || again.HistoryDeduped != 1 || again.HistoryImported != 1 ||
+		again.HistoryConversations != 1 || again.HistorySkipped != 0 || again.Appended != 0 || again.Deduped != 0 {
+		t.Fatalf("counters after re-hand-off = %+v", again)
 	}
 	if n := v2.count(t, "SELECT COUNT(*) FROM inbox"); n != 1 {
 		t.Fatalf("inbox rows after re-hand-off = %d, want 1", n)
@@ -786,13 +793,12 @@ func TestHistoryMessageThroughRealSinkImportsIntoV2(t *testing.T) {
 	}
 }
 
-// DESIGN.md decision 2 end to end: a fetched copy byte-identical to a frame
-// the live channel already delivered collapses onto the live inbox row (no
-// extra row, no receipt-time bump, the row keeps the live codec), is counted
-// as history_deduped, and is never replayed: a history replay against the
-// live row would mark it processed under history semantics. The
-// live-projected message stays as it was.
-func TestHistoryAfterLiveDedupesOntoLiveRow(t *testing.T) {
+// End to end: a fetched copy byte-identical to a frame the live channel
+// already delivered gets its own history inbox row (the origins never share a
+// row), is skipped by the worker as existing, and leaves the live row, the
+// live counters and the live-projected message exactly as they were. Its
+// group snapshot does not rewrite the thread the live frame created.
+func TestHistoryCopyOfLiveFrameLeavesLiveRowAndMessageAlone(t *testing.T) {
 	v2 := newHistoryTeeV2(t)
 	_, history, fake := startHistoryTeeRun(t, v2.sink, 42)
 
@@ -802,9 +808,10 @@ func TestHistoryAfterLiveDedupesOntoLiveRow(t *testing.T) {
 	if live.Appended != 1 || live.HistoryAppended != 0 {
 		t.Fatalf("counters after live frame = %+v", live)
 	}
+	var liveInboxID string
 	var receivedBefore int64
-	if err := v2.db.QueryRow("SELECT received_at_ms FROM inbox").Scan(&receivedBefore); err != nil {
-		t.Fatalf("read inbox receipt: %v", err)
+	if err := v2.db.QueryRow("SELECT inbox_id, received_at_ms FROM inbox").Scan(&liveInboxID, &receivedBefore); err != nil {
+		t.Fatalf("read live inbox row: %v", err)
 	}
 	stored := v2.storedMessage(t, "pushed-then-fetched")
 
@@ -816,26 +823,102 @@ func TestHistoryAfterLiveDedupesOntoLiveRow(t *testing.T) {
 	); err != nil {
 		t.Fatalf("AppendHistoryMessage() error = %v", err)
 	}
-	got := v2.await(t, "history dedupe onto the live row", func(s ingest.CounterSnapshot) bool { return s.HistoryDeduped == 1 })
-	if got.HistoryAppended != 0 || got.HistoryImported != 0 || got.HistoryExisting != 0 ||
-		got.HistoryConversations != 0 || got.Appended != 1 || got.Deduped != 0 ||
-		got.DecodedEvents != live.DecodedEvents {
-		t.Fatalf("counters after fetched copy = %+v (live %+v); want no worker activity", got, live)
+	got := v2.await(t, "history copy skipped as existing", func(s ingest.CounterSnapshot) bool { return s.HistoryExisting == 1 })
+	if got.HistoryAppended != 1 || got.HistoryDeduped != 0 || got.HistoryImported != 0 ||
+		got.HistoryConversations != 0 || got.HistorySkipped != 0 ||
+		got.Appended != live.Appended || got.Deduped != live.Deduped || got.Projected != live.Projected ||
+		got.StaleReplays != 0 {
+		t.Fatalf("counters after fetched copy = %+v (live %+v)", got, live)
 	}
-	if n := v2.count(t, "SELECT COUNT(*) FROM inbox"); n != 1 {
-		t.Fatalf("inbox rows = %d, want 1", n)
+	if n := v2.count(t, "SELECT COUNT(*) FROM inbox"); n != 2 {
+		t.Fatalf("inbox rows = %d, want the live row and the history row", n)
 	}
 	var codec string
 	var receivedAfter int64
-	if err := v2.db.QueryRow("SELECT codec, received_at_ms FROM inbox").Scan(&codec, &receivedAfter); err != nil {
-		t.Fatalf("read inbox row: %v", err)
+	if err := v2.db.QueryRow("SELECT codec, received_at_ms FROM inbox WHERE inbox_id = ?", liveInboxID).Scan(&codec, &receivedAfter); err != nil {
+		t.Fatalf("read live inbox row: %v", err)
 	}
 	if codec != ingest.GoogleCodec || receivedAfter != receivedBefore {
-		t.Fatalf("inbox row = (%q, %d), want unchanged live row (%q, %d)", codec, receivedAfter, ingest.GoogleCodec, receivedBefore)
+		t.Fatalf("live inbox row = (%q, %d), want unchanged (%q, %d)", codec, receivedAfter, ingest.GoogleCodec, receivedBefore)
+	}
+	if n := v2.count(t, "SELECT COUNT(*) FROM inbox WHERE codec = '"+ingest.GoogleHistoryCodec+"'"); n != 1 {
+		t.Fatalf("history-codec inbox rows = %d, want 1", n)
 	}
 	if after := v2.storedMessage(t, "pushed-then-fetched"); after != stored {
 		t.Fatalf("fetched copy changed the live-projected row:\n got  %+v\n want %+v", after, stored)
 	}
+}
+
+// Stop joins an in-flight history hand-off (the run admits it like a libgm
+// callback), so nothing can commit after the generation is retired, and a
+// hand-off attempted after Stop fails closed.
+func TestHistoryStopJoinsInFlightHandOff(t *testing.T) {
+	sink := &historyBlockingSink{entered: make(chan struct{}), release: make(chan struct{})}
+	started, history, _ := startHistoryTeeRun(t, sink, 5)
+
+	handOff := make(chan error, 1)
+	go func() {
+		handOff <- history.AppendHistoryMessage(context.Background(), "c-join", nil, historyTeeMessage("m-join", "c-join", "in flight"))
+	}()
+	select {
+	case <-sink.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("history hand-off never reached the sink")
+	}
+
+	stopped := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		stopped <- started.Stop(ctx)
+	}()
+	select {
+	case err := <-stopped:
+		t.Fatalf("Stop() returned (%v) while a history hand-off was still committing", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	close(sink.release)
+	select {
+	case err := <-handOff:
+		if err != nil {
+			t.Fatalf("in-flight hand-off error = %v, want it to finish", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("in-flight hand-off did not finish after release")
+	}
+	select {
+	case err := <-stopped:
+		if err != nil {
+			t.Fatalf("Stop() error = %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Stop() did not return after the hand-off finished")
+	}
+
+	err := history.AppendHistoryMessage(context.Background(), "c-join", nil, historyTeeMessage("m-late", "c-join", "too late"))
+	if !errors.Is(err, app.ErrGoogleHistoryClosed) {
+		t.Fatalf("hand-off after Stop error = %v, want ErrGoogleHistoryClosed", err)
+	}
+	if got := sink.appends.Load(); got != 1 {
+		t.Fatalf("history appends that reached the sink = %d, want only the in-flight one", got)
+	}
+}
+
+// historyBlockingSink blocks its first history append until released.
+type historyBlockingSink struct {
+	recordingSink
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+	appends atomic.Int64
+}
+
+func (s *historyBlockingSink) AppendHistoryIngress(context.Context, bridge.RawIngressRecord) error {
+	s.appends.Add(1)
+	s.once.Do(func() { close(s.entered) })
+	<-s.release
+	return nil
 }
 
 // historyTeeCase is a random fetched message: random IDs and body, an
@@ -891,11 +974,12 @@ func (historyTeeCase) Generate(r *rand.Rand, _ int) reflect.Value {
 }
 
 // Property: for any fetched message that carries its own conversation ID, the
-// run's history frame and the live tee's frame for the same protobuf share
-// the dedupe key, while the history frame always uses the history codec and
+// run's history frame and the live tee's frame for the same protobuf never
+// share a dedupe key (hmsg: vs msg: over the same bytes), while the history
+// frame always uses the history codec and
 // is_old=true and embeds exactly the matching snapshot, and the live frame
 // keeps the live codec and its own is_old.
-func TestHistoryPropertyHistoryKeyMatchesLiveKey(t *testing.T) {
+func TestHistoryPropertyHistoryKeyIsDisjointFromLiveKey(t *testing.T) {
 	sink := &historyTeeSink{}
 	_, history, fake := startHistoryTeeRun(t, sink, 99)
 
@@ -912,7 +996,9 @@ func TestHistoryPropertyHistoryKeyMatchesLiveKey(t *testing.T) {
 			return false
 		}
 		h, l := histories[len(histories)-1], lives[len(lives)-1]
-		if h.DedupeKey != l.DedupeKey || h.DedupeKey != historyTeeKey(t, "msg", c.Message.GetMessageID(), c.Message) {
+		if h.DedupeKey == l.DedupeKey ||
+			h.DedupeKey != historyTeeKey(t, "hmsg", c.Message.GetMessageID(), c.Message) ||
+			l.DedupeKey != historyTeeKey(t, "msg", c.Message.GetMessageID(), c.Message) {
 			t.Logf("keys: history %q live %q", h.DedupeKey, l.DedupeKey)
 			return false
 		}

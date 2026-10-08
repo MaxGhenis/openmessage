@@ -1294,7 +1294,7 @@ func TestHistoryWorkerRepeatedCatchUpIsIdempotent(t *testing.T) {
 		h.historyConversation(t, hwtConversation("hwt-h-g1", "Renamed in an old listing", true, hwtKarl, hwtShoshana)),
 		h.historyConversation(t, g2),
 		h.historyMessage(t, g1, changedCopy.proto()),
-		h.historyMessage(t, g1, existingOutgoing.proto()), // byte-identical to the live frame
+		h.historyMessage(t, g1, existingOutgoing.proto()), // byte-identical to the live frame; its own history row
 		h.historyMessage(t, g1, missed.proto()),
 		h.historyMessage(t, g2, inNewGroup.proto()),
 		h.historyMessage(t, g2, sentInNewGroup.proto()),
@@ -1303,14 +1303,16 @@ func TestHistoryWorkerRepeatedCatchUpIsIdempotent(t *testing.T) {
 	}
 	h.pump(t)
 	first := h.counts()
-	// 9 records: one shares the live frame's dedupe key; it collapses onto
-	// the live row and is never replayed. Inserted: missed, inNewGroup,
-	// sentInNewGroup. Existing: changedCopy, contentDuplicate. Created: g2.
-	// The stub decodes to no message.
-	if first.HistoryAppended != 8 || first.HistoryDeduped != 1 ||
-		first.HistoryImported != 3 || first.HistoryExisting != 2 ||
-		first.HistoryConversations != 1 || first.EmptyStubsSkipped != 1 ||
+	// 9 records, each its own history row (history keys never collide with
+	// live keys). Inserted: missed, inNewGroup, sentInNewGroup. Existing:
+	// changedCopy, the byte-identical copy of the live frame, contentDuplicate.
+	// Created: g2. The stub decodes to no message.
+	if first.HistoryAppended != 9 || first.HistoryDeduped != 0 ||
+		first.HistoryImported != 3 || first.HistoryExisting != 3 ||
+		first.HistoryConversations != 1 || first.HistorySkipped != 0 ||
+		first.EmptyStubsSkipped != 1 ||
 		first.ReactionsApplied != 2 || first.ReactionsRemoved != 0 ||
+		first.Appended != 3 || first.Projected != 2 ||
 		first.RemoteRebinds != 0 || first.Quarantined != 0 {
 		t.Fatalf("first catch-up counters = %+v", first)
 	}
@@ -1338,13 +1340,17 @@ func TestHistoryWorkerRepeatedCatchUpIsIdempotent(t *testing.T) {
 	if got := i01QueryInt64(t, h.path, `SELECT COUNT(*) FROM inbox`); got != inboxRows {
 		t.Fatalf("inbox rows = %d after repeat, want %d", got, inboxRows)
 	}
+	// Every frame dedupes onto its history row and is replayed; each replayed
+	// message (6 of the 9 frames carry one that decodes) is found existing.
 	if second.HistoryDeduped-first.HistoryDeduped != uint64(len(records)) ||
 		second.HistoryAppended != first.HistoryAppended ||
 		second.HistoryImported != first.HistoryImported ||
 		second.HistoryConversations != first.HistoryConversations ||
-		second.HistoryExisting != first.HistoryExisting || // deduplicated history is never replayed
+		second.HistoryExisting-first.HistoryExisting != 6 ||
+		second.HistorySkipped != 0 ||
 		second.ReactionsApplied != first.ReactionsApplied ||
 		second.ReactionsRemoved != first.ReactionsRemoved ||
+		second.Appended != first.Appended || second.Projected != first.Projected ||
 		second.RemoteRebinds != 0 ||
 		second.Quarantined != 0 {
 		t.Fatalf("repeat counters first=%+v second=%+v", first, second)

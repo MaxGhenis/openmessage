@@ -266,12 +266,14 @@ func TestV2StackHistoryFrameImportsThroughProductionWiring(t *testing.T) {
 			}
 
 			// Step 4: the identical history frame again (I2). It dedupes onto
-			// its inbox row and is not replayed: history is insert-only, so a
-			// second pass could add nothing, and the worker never runs.
+			// its history row; the replay re-evaluates it and finds both the
+			// thread and the message already there.
 			if err := h.stack.Sink.AppendHistoryIngress(ctx, historyRecord); err != nil {
 				t.Fatalf("AppendHistoryIngress(repeat): %v", err)
 			}
 			want.HistoryDeduped = 1
+			want.DecodedEvents = 7
+			want.HistoryExisting = 2
 			h.waitCounters(t, "repeat history frame", want)
 			if got := h.message(t, conversation.ConversationID, "hist-1"); !reflect.DeepEqual(got, imported) {
 				t.Fatalf("repeat history frame modified the row\n got: %+v\nwant: %+v", got, imported)
@@ -333,6 +335,7 @@ func TestV2StackHistoryFrameImportsThroughProductionWiring(t *testing.T) {
 				"history_imported":      want.HistoryImported,
 				"history_existing":      want.HistoryExisting,
 				"history_conversations": want.HistoryConversations,
+				"history_skipped":       want.HistorySkipped,
 				"appended":              want.Appended,
 				"deduped":               want.Deduped,
 				"projected":             want.Projected,
@@ -362,6 +365,7 @@ func TestV2StackHistoryCounterJSONKeys(t *testing.T) {
 		HistoryImported:      3,
 		HistoryExisting:      4,
 		HistoryConversations: 5,
+		HistorySkipped:       6,
 	})
 	if err != nil {
 		t.Fatalf("marshal CounterSnapshot: %v", err)
@@ -376,6 +380,7 @@ func TestV2StackHistoryCounterJSONKeys(t *testing.T) {
 		"history_imported":      3,
 		"history_existing":      4,
 		"history_conversations": 5,
+		"history_skipped":       6,
 		"appended":              0,
 		"deduped":               0,
 		"projected":             0,
@@ -394,7 +399,7 @@ func TestV2StackHistoryCounterJSONKeys(t *testing.T) {
 	if err := json.Unmarshal(zero, &zeroFields); err != nil {
 		t.Fatalf("unmarshal zero CounterSnapshot: %v", err)
 	}
-	for _, key := range []string{"history_appended", "history_deduped", "history_imported", "history_existing", "history_conversations"} {
+	for _, key := range []string{"history_appended", "history_deduped", "history_imported", "history_existing", "history_conversations", "history_skipped"} {
 		if value, ok := zeroFields[key]; !ok || value != 0 {
 			t.Errorf("zero CounterSnapshot JSON %q = %d (present %t), want present 0", key, value, ok)
 		}
