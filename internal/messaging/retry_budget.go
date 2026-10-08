@@ -109,12 +109,16 @@ func exhaustedDetail(attempts int64, class, fingerprint, failure string) string 
 
 // recordCalledNotDispatched files a retryable failure that the transport
 // proved never left this device. Exempt failures are refunded and retried at
-// exemptRetryAt (the caller's fixed cadence, or the adapter's RetryAt). Every
-// other failure consumes one attempt: the attempt that reaches
-// maxTransportAttempts rejects the intent as retry_exhausted, and earlier ones
-// back off exponentially (never earlier than an adapter-supplied RetryAt). A
-// conversation_moved failure first rebinds the local conversation to the
-// remote ID the transport now uses, then retries at once under that ID.
+// exemptRetryAt (the caller's fixed cadence, or the adapter's RetryAt), but
+// never sooner than the fixed cadence. Every other failure consumes one
+// attempt: the attempt that reaches maxTransportAttempts rejects the intent
+// as retry_exhausted, and earlier ones back off exponentially (never earlier
+// than an adapter-supplied RetryAt). A conversation_moved failure first
+// rebinds the local conversation to the remote ID the transport now uses,
+// then retries at once under that ID.
+//
+// The rebind is logged through the zerolog logger carried by ctx (none means
+// silent); error_detail records it either way.
 func (s *MessageService) recordCalledNotDispatched(
 	ctx context.Context,
 	item sqlite.OutboxItem,
@@ -125,6 +129,13 @@ func (s *MessageService) recordCalledNotDispatched(
 ) error {
 	failure := sendErr.Error()
 	if budgetExempt(opErr) {
+		// An adapter RetryAt may postpone an exempt retry but never hurry it:
+		// an offline account would otherwise be polled faster than the fixed
+		// cadence, and a RetryAt at or before the epoch would be refused by
+		// the not-dispatched write, stopping the dispatcher for every account.
+		if cadence := s.clock.Now().Add(s.retryDelay); exemptRetryAt.Before(cadence) {
+			exemptRetryAt = cadence
+		}
 		if err := s.outbox.MarkCalledNotDispatchedRefundingAttempt(
 			ctx,
 			item.OutboxID,
