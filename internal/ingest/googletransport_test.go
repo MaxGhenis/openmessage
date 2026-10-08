@@ -285,6 +285,26 @@ func TestGoogleIncomingTransportsCountsMMSNotificationsWithoutContent(t *testing
 	}
 }
 
+// A phone whose clock runs fast stamps a message two hours ahead. Its first
+// frame is capped at receipt; a status update a day later would be capped two
+// hours later. Matching on the phone's own stamps keeps them one message, at
+// the first receipt, so the update cannot read as a newer SMS.
+func TestGoogleIncomingTransportsKeepsAFastClockMessageWhole(t *testing.T) {
+	t.Parallel()
+	at := transportBase
+	first := incoming("chat", "fast", googleTypeSMS, at.Add(2*time.Hour))
+	update := first
+	update.status = gmproto.MessageStatusType_INCOMING_DISPLAYED
+	events, stats := ingest.GoogleIncomingTransports([]ingest.GoogleInboxFrame{
+		googleMessageFrame(t, at, first),
+		googleMessageFrame(t, at.Add(24*time.Hour), update),
+	})
+	want := []freshness.TransportEvent{{At: at, Transport: freshness.TransportSMS}}
+	if !sameEvents(events, want) || stats.Incoming != 1 {
+		t.Fatalf("events = %+v stats = %+v, want one SMS at the first receipt", events, stats)
+	}
+}
+
 func TestGoogleIncomingTransportsCountsOnlyIncomingDeliveries(t *testing.T) {
 	t.Parallel()
 	at := transportBase
@@ -405,7 +425,6 @@ func TestGoogleIncomingTransportsDetectsTheOctoberIMSOutage(t *testing.T) {
 
 	events, _ := ingest.GoogleIncomingTransports(frames)
 	cfg := freshness.DefaultSMSPathConfig
-	cfg.Location = time.UTC
 	episodes := map[int64]int{}
 	var firstStall time.Time
 	for now := lastSMS; now.Before(lastSMS.Add(57 * time.Hour)); now = now.Add(5 * time.Minute) {

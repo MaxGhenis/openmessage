@@ -283,13 +283,21 @@ curl -s http://127.0.0.1:7007/api/status | jq '.freshness.google.sms_path, .fres
   arrivals would have come (`expected_arrivals` of 6 or more).
   - The pace (`arrivals_per_day`) counts texts within 30 minutes of each other
     as one arrival, so a burst of codes counts once.
-  - It is measured over the 28 calendar days ending on the last SMS's day.
+  - It is measured over the 28 days before the last SMS.
+  - The silence must also be longer than the phone's usual quiet spell
+    (`usual_gap_ms`, the second-longest gap between texts in those 28 days),
+    so a regular weekly lull never fires and one earlier outage does not raise
+    the bar.
   - For the install it was calibrated on, the pace is about 5.8 a day, so the
     bar is about 25 hours.
 - **The phone's texting is regular enough to judge:** at least 21 of those 28
-  days had an incoming SMS, with at least 10 arrivals. A phone that gets texts
-  only on weekdays (20 of any 28 days), rarely, or in clusters days apart is
-  never judged (`thin_baseline`).
+  days had an incoming SMS (`active_days`), with at least 10 arrivals.
+  - Days are counted without a calendar or a time zone: under every
+    hour-aligned way of cutting time into 24-hour days, and the smallest count
+    is used.
+  - A phone that gets texts only on weekdays therefore scores 20 wherever this
+    machine's clock is set, and is never judged (`thin_baseline`). The same
+    holds for phones that get texts rarely or in clusters days apart.
 - **RCS is flowing now:** at least 3 incoming RCS messages in the last 24 hours,
   the newest within 3 hours.
 

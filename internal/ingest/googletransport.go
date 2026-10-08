@@ -111,10 +111,11 @@ const googleSameMessageSpan = time.Hour
 
 type googleIncoming struct {
 	key googleIncomingKey
-	// at is the earliest time among the message's frames and latest the
-	// newest; a frame joins only if the pair stays within
-	// googleSameMessageSpan, so merging cannot creep forward frame by frame.
-	at         time.Time
+	// earliest and latest are the oldest and newest timestamps among the
+	// message's frames, as the phone stamped them; a frame joins only if the
+	// pair stays within googleSameMessageSpan, so merging cannot creep
+	// forward frame by frame. receivedAt is the earliest receipt.
+	earliest   time.Time
 	latest     time.Time
 	receivedAt time.Time
 	// messageTransport comes from the message's own type; conversationID
@@ -206,19 +207,20 @@ func GoogleIncomingTransports(frames []GoogleInboxFrame) ([]freshness.TransportE
 				stats.Stubs++
 				continue
 			}
-			at := time.UnixMicro(micros)
-			if frame.ReceivedAt.Before(at) {
-				at = frame.ReceivedAt
-			}
+			// Frames are matched by the phone's own timestamps, before any
+			// capping: a fast phone clock stamps every frame of a message
+			// alike, while capping each at its own receipt would pull them
+			// apart and count the message twice.
+			stamped := time.UnixMicro(micros)
 			transport := GoogleMessageTransport(message.GetType())
 			var seen *googleIncoming
 			for _, candidate := range incoming[key] {
-				earliest, latest := candidate.at, candidate.latest
-				if at.Before(earliest) {
-					earliest = at
+				earliest, latest := candidate.earliest, candidate.latest
+				if stamped.Before(earliest) {
+					earliest = stamped
 				}
-				if at.After(latest) {
-					latest = at
+				if stamped.After(latest) {
+					latest = stamped
 				}
 				if latest.Sub(earliest) < googleSameMessageSpan {
 					seen = candidate
@@ -227,15 +229,19 @@ func GoogleIncomingTransports(frames []GoogleInboxFrame) ([]freshness.TransportE
 			}
 			if seen == nil {
 				incoming[key] = append(incoming[key], &googleIncoming{
-					key: key, at: at, latest: at, receivedAt: frame.ReceivedAt, messageTransport: transport,
+					key: key, earliest: stamped, latest: stamped,
+					receivedAt: frame.ReceivedAt, messageTransport: transport,
 				})
 				continue
 			}
-			if at.Before(seen.at) {
-				seen.at = at
+			if stamped.Before(seen.earliest) {
+				seen.earliest = stamped
 			}
-			if at.After(seen.latest) {
-				seen.latest = at
+			if stamped.After(seen.latest) {
+				seen.latest = stamped
+			}
+			if frame.ReceivedAt.Before(seen.receivedAt) {
+				seen.receivedAt = frame.ReceivedAt
 			}
 			if seen.messageTransport == freshness.TransportUnknown {
 				seen.messageTransport = transport
@@ -249,7 +255,7 @@ func GoogleIncomingTransports(frames []GoogleInboxFrame) ([]freshness.TransportE
 	for _, messages := range incoming {
 		for _, message := range messages {
 			events = append(events, freshness.TransportEvent{
-				At:        message.at,
+				At:        message.at(),
 				Transport: message.transport(conversationTypes),
 			})
 		}
@@ -274,8 +280,17 @@ func GoogleIncomingTransports(frames []GoogleInboxFrame) ([]freshness.TransportE
 	return events, stats
 }
 
+// at times a message at its earliest stamp, capped at its earliest receipt so
+// a fast phone clock cannot hide a silence.
+func (m *googleIncoming) at() time.Time {
+	if m.receivedAt.Before(m.earliest) {
+		return m.receivedAt
+	}
+	return m.earliest
+}
+
 // transport labels a message by its own type, else by its conversation's type
-// in force when it was received.
+// in force when it was first received.
 func (m *googleIncoming) transport(conversationTypes map[string][]googleConversationTypeAt) freshness.Transport {
 	if m.messageTransport != freshness.TransportUnknown {
 		return m.messageTransport

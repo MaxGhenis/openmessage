@@ -274,3 +274,68 @@ func TestAddGoogleSMSPathSynthesizesAMissingGoogleEntry(t *testing.T) {
 		t.Fatalf("out = %v", out)
 	}
 }
+
+// failingReads serves platform stats until told to fail.
+type failingReads struct {
+	stubReads
+	fail *bool
+}
+
+func (f failingReads) PlatformStats() ([]db.PlatformStat, error) {
+	if *f.fail {
+		return nil, fmt.Errorf("database is locked")
+	}
+	return f.stubReads.PlatformStats()
+}
+
+// When platform stats start failing, freshness keeps its last good value, but
+// a stall in it must not outlive the phone becoming unreachable.
+func TestStatusRejudgesTheSMSPathWhenPlatformStatsFail(t *testing.T) {
+	now := time.Now().Truncate(time.Minute)
+	inbox := newSMSPathInbox(t)
+	inbox.history(now.Add(-40*time.Hour), now)
+	fail, reachable := false, true
+	nowMS := time.Now().UnixMilli()
+	opts := APIOptions{
+		GoogleSMSPath: inbox.monitor(),
+		Reads: failingReads{
+			stubReads: stubReads{stats: []db.PlatformStat{{Platform: "sms", Count: 1, LatestMS: nowMS, LatestRecvMS: nowMS}}},
+			fail:      &fail,
+		},
+		GooglePhoneResponding: func() bool { return reachable },
+	}
+	srv := httptest.NewServer(APIHandlerWithOptions(legacyWithFreshGoogle(t), nil, zerolog.Nop(), nil, opts))
+	defer srv.Close()
+	fetch := func() map[string]any {
+		t.Helper()
+		resp, err := http.Get(srv.URL + "/api/status")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		var payload map[string]any
+		if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+			t.Fatal(err)
+		}
+		return payload["freshness"].(map[string]any)
+	}
+	if fresh := fetch(); fresh["sms_path_stalled"] != true {
+		t.Fatalf("freshness = %v, want a stall cached", fresh)
+	}
+
+	fail, reachable = true, false
+	// Step past the 30-second freshness cache by asking the helper directly,
+	// as computeFreshness does on a stats error.
+	cached := fetch()
+	rejudged := withFreshGoogleSMSPath(cached, opts.GoogleSMSPath, time.Now(), func() bool { return reachable })
+	path := rejudged["google"].(map[string]any)["sms_path"].(freshness.SMSPathReport)
+	if path.Stalled || path.Reason != freshness.SMSPathGoogleUnreachable || rejudged["sms_path_stalled"] != false {
+		t.Fatalf("rejudged = %+v, want the stall withheld as %q", path, freshness.SMSPathGoogleUnreachable)
+	}
+	if cached["sms_path_stalled"] != true {
+		t.Fatal("the cached value was changed in place; responses still being written share it")
+	}
+	if rejudged["google"].(map[string]any)["latest_ms"] == nil || rejudged["newest_ms"] == nil {
+		t.Fatalf("rejudged = %v, want the rest of the cached value kept", rejudged)
+	}
+}

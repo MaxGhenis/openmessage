@@ -53,3 +53,33 @@ func addGoogleSMSPath(
 	entry["sms_path"] = report
 	out["sms_path_stalled"] = report.Stalled
 }
+
+// withFreshGoogleSMSPath returns a copy of a cached freshness value with the
+// SMS path judged again. The cached map is shared with responses already being
+// written, so it is copied rather than changed in place.
+func withFreshGoogleSMSPath(
+	cached map[string]any,
+	monitor *freshness.SMSPathMonitor,
+	now time.Time,
+	googleReachable func() bool,
+) map[string]any {
+	if cached == nil || monitor == nil {
+		return cached
+	}
+	out := make(map[string]any, len(cached))
+	for key, value := range cached {
+		out[key] = value
+	}
+	delete(out, "sms_path_stalled")
+	if google, ok := cached["google"].(map[string]any); ok {
+		entry := make(map[string]any, len(google))
+		for key, value := range google {
+			if key != "sms_path" {
+				entry[key] = value
+			}
+		}
+		out["google"] = entry
+	}
+	addGoogleSMSPath(out, monitor, now, googleReachable)
+	return out
+}

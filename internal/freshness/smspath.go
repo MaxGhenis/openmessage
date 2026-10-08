@@ -51,12 +51,19 @@ type SMSPathConfig struct {
 	// ArrivalGap merges SMS closer together than this into one arrival, so a
 	// burst of verification codes or a group MMS counts once.
 	ArrivalGap time.Duration
-	// BaselineDays is how many local calendar days, ending on the last SMS's
-	// day, make up the baseline the usual pace is measured on. The silence is
+	// BaselineDays is how many days (of 24 hours), ending at the last SMS,
+	// make up the baseline the usual pace is measured on. The silence is
 	// judged only when at least MinActiveDays of them had an incoming SMS and
 	// the baseline holds at least MinBaselineArrivals arrivals. A phone that
 	// gets texts only on weekdays (20 of any 28 days), rarely, or in clusters
 	// days apart is never judged.
+	//
+	// Days are counted without a calendar: under each of the 24 hour-aligned
+	// ways to cut time into 24-hour days, count the days with an SMS among the
+	// BaselineDays ending on the last SMS's day, and take the smallest count.
+	// A weekday-only texter scores 20 under the cut that matches their own
+	// midnight, wherever this machine's clock is set, and no daylight-saving
+	// or time-zone change can move the count.
 	BaselineDays        int
 	MinActiveDays       int
 	MinBaselineArrivals int
@@ -67,8 +74,6 @@ type SMSPathConfig struct {
 	// failure.
 	MinRCSInWindow int
 	RCSRecency     time.Duration
-	// Location sets the calendar for BaselineDays; nil means time.Local.
-	Location *time.Location
 }
 
 // DefaultSMSPathConfig is calibrated on the Google Messages history of the
@@ -78,11 +83,11 @@ type SMSPathConfig struct {
 // about 25 hours, and the longest normal gap between incoming SMS from
 // 2026-09-04 to the outage was 19.2 hours. Replayed as live checks saw it,
 // frames counting only once received, the rule flags the outage about 25 hours
-// after the last SMS and nowhere before it. In simulation (two years, arrivals
-// in waking hours, RCS hourly) it never fired for weekday-only texters, with
-// or without holidays, and fired zero to four times in 330 days for
-// memoryless daily texters at one to ten arrivals a day, the statistical floor
-// for a phone whose texts come at random.
+// after the last SMS and nowhere before it. In simulation (texts in waking
+// hours, RCS hourly) it never fired for weekday-only texters, with or without
+// holidays, and fired zero to four times in 330 days for memoryless daily
+// texters at one to ten arrivals a day, the statistical floor for a phone
+// whose texts come at random.
 var DefaultSMSPathConfig = SMSPathConfig{
 	Window:              24 * time.Hour,
 	MinExpectedArrivals: 6,
@@ -104,7 +109,8 @@ const (
 	// SMSPathFlowing: an incoming SMS arrived inside the window.
 	SMSPathFlowing = "sms_recent"
 	// SMSPathUsualPace: SMS has been silent for the window, but at the usual
-	// pace fewer than MinExpectedArrivals arrivals would have come.
+	// pace fewer than MinExpectedArrivals arrivals would have come, or the
+	// phone has recently gone this long between texts (UsualGap).
 	SMSPathUsualPace = "within_usual_pace"
 	// SMSPathRCSQuiet: SMS is silent but RCS is not flowing either, so the
 	// silence cannot be pinned on the SMS path.
@@ -125,11 +131,16 @@ type SMSPathVerdict struct {
 	// RCSInWindow counts incoming RCS messages in (now-Window, now].
 	RCSInWindow int
 	// BaselineSMS and BaselineArrivals count the incoming SMS, and the
-	// arrivals they merge into, in the baseline days; ActiveDays counts the
-	// baseline days that had any.
+	// arrivals they merge into, in the baseline; ActiveDays counts the
+	// baseline days that had any, under the least favourable cut into days.
 	BaselineSMS      int
 	BaselineArrivals int
 	ActiveDays       int
+	// UsualGap is the second-longest stretch between two baseline SMS: how
+	// long a quiet spell normally lasts. The single longest is left out so
+	// one earlier outage does not raise the bar; a weekly lull repeats and
+	// still counts. A stall must outlast it.
+	UsualGap time.Duration
 	// ArrivalsPerDay is the usual pace: arrivals after the first, over the
 	// time from the first to LastSMS. ExpectedArrivals is that pace times
 	// Silence.
@@ -150,10 +161,6 @@ type SMSPathVerdict struct {
 // alone cannot show. Outgoing messages are not evidence either way: they
 // measure what the user sent, not what the carrier delivered.
 func EvaluateSMSPath(events []TransportEvent, now time.Time, cfg SMSPathConfig) SMSPathVerdict {
-	loc := cfg.Location
-	if loc == nil {
-		loc = time.Local
-	}
 	var verdict SMSPathVerdict
 	for _, event := range events {
 		if event.At.After(now) {
@@ -176,8 +183,7 @@ func EvaluateSMSPath(events []TransportEvent, now time.Time, cfg SMSPathConfig) 
 	}
 	verdict.Silence = now.Sub(verdict.LastSMS)
 
-	lastDay := verdict.LastSMS.In(loc)
-	baselineStart := time.Date(lastDay.Year(), lastDay.Month(), lastDay.Day()-cfg.BaselineDays+1, 0, 0, 0, 0, loc)
+	baselineStart := verdict.LastSMS.Add(-time.Duration(cfg.BaselineDays) * 24 * time.Hour)
 	windowStart := now.Add(-cfg.Window)
 	var baseline []time.Time
 	for _, event := range events {
@@ -186,7 +192,7 @@ func EvaluateSMSPath(events []TransportEvent, now time.Time, cfg SMSPathConfig) 
 		}
 		switch event.Transport {
 		case TransportSMS:
-			if !event.At.Before(baselineStart) {
+			if event.At.After(baselineStart) {
 				baseline = append(baseline, event.At)
 			}
 		case TransportRCS:
@@ -197,20 +203,24 @@ func EvaluateSMSPath(events []TransportEvent, now time.Time, cfg SMSPathConfig) 
 	}
 	sort.Slice(baseline, func(i, j int) bool { return baseline[i].Before(baseline[j]) })
 	verdict.BaselineSMS = len(baseline)
-	type day struct {
-		year  int
-		month time.Month
-		day   int
-	}
-	days := map[day]bool{}
+	var longest time.Duration
 	for i, at := range baseline {
-		local := at.In(loc)
-		days[day{local.Year(), local.Month(), local.Day()}] = true
-		if i == 0 || at.Sub(baseline[i-1]) > cfg.ArrivalGap {
+		if i == 0 {
+			verdict.BaselineArrivals++
+			continue
+		}
+		gap := at.Sub(baseline[i-1])
+		if gap > cfg.ArrivalGap {
 			verdict.BaselineArrivals++
 		}
+		switch {
+		case gap > longest:
+			verdict.UsualGap, longest = longest, gap
+		case gap > verdict.UsualGap:
+			verdict.UsualGap = gap
+		}
 	}
-	verdict.ActiveDays = len(days)
+	verdict.ActiveDays = leastActiveDays(baseline, verdict.LastSMS, cfg.BaselineDays)
 	if span := verdict.LastSMS.Sub(baseline[0]); span > 0 && verdict.BaselineArrivals > 1 {
 		verdict.ArrivalsPerDay = float64(verdict.BaselineArrivals-1) / span.Hours() * 24
 	}
@@ -224,7 +234,7 @@ func EvaluateSMSPath(events []TransportEvent, now time.Time, cfg SMSPathConfig) 
 	switch {
 	case verdict.Silence < cfg.Window:
 		verdict.Reason = SMSPathFlowing
-	case verdict.ExpectedArrivals < cfg.MinExpectedArrivals:
+	case verdict.ExpectedArrivals < cfg.MinExpectedArrivals, verdict.Silence <= verdict.UsualGap:
 		verdict.Reason = SMSPathUsualPace
 	case verdict.RCSInWindow < cfg.MinRCSInWindow,
 		verdict.LastRCS.IsZero(),
@@ -235,6 +245,39 @@ func EvaluateSMSPath(events []TransportEvent, now time.Time, cfg SMSPathConfig) 
 		verdict.Reason = SMSPathStalled
 	}
 	return verdict
+}
+
+// leastActiveDays counts the days with an SMS among the `days` 24-hour days
+// ending on the last SMS's day, under each of the 24 hour-aligned cuts of time
+// into days, and returns the smallest count. Every such day lies within
+// days*24h before last, so sms need only hold that stretch.
+func leastActiveDays(sms []time.Time, last time.Time, days int) int {
+	const day = int64(24 * 60 * 60)
+	least := -1
+	for offset := int64(0); offset < 24; offset++ {
+		index := func(at time.Time) int64 {
+			return floorDiv(at.Unix()-offset*3600, day)
+		}
+		lastIndex := index(last)
+		active := map[int64]bool{}
+		for _, at := range sms {
+			if i := index(at); i <= lastIndex && lastIndex-i < int64(days) {
+				active[i] = true
+			}
+		}
+		if least < 0 || len(active) < least {
+			least = len(active)
+		}
+	}
+	return least
+}
+
+func floorDiv(a, b int64) int64 {
+	q := a / b
+	if a%b != 0 && (a < 0) != (b < 0) {
+		q--
+	}
+	return q
 }
 
 // SMSPathReport is the published form of a verdict, shared by /api/status
@@ -257,6 +300,7 @@ type SMSPathReport struct {
 	ActiveDays          int     `json:"active_days"`
 	ArrivalsPerDay      float64 `json:"arrivals_per_day"`
 	ExpectedArrivals    float64 `json:"expected_arrivals"`
+	UsualGapMS          int64   `json:"usual_gap_ms"`
 	WindowMS            int64   `json:"window_ms"`
 	MinExpectedArrivals float64 `json:"min_expected_arrivals"`
 	BaselineDays        int     `json:"baseline_days"`
@@ -291,6 +335,7 @@ func NewSMSPathReport(verdict SMSPathVerdict, cfg SMSPathConfig) SMSPathReport {
 		ActiveDays:          verdict.ActiveDays,
 		ArrivalsPerDay:      math.Round(verdict.ArrivalsPerDay*100) / 100,
 		ExpectedArrivals:    math.Round(verdict.ExpectedArrivals*100) / 100,
+		UsualGapMS:          verdict.UsualGap.Milliseconds(),
 		WindowMS:            cfg.Window.Milliseconds(),
 		MinExpectedArrivals: cfg.MinExpectedArrivals,
 		BaselineDays:        cfg.BaselineDays,
