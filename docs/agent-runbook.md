@@ -224,7 +224,9 @@ some platform's `stale_reason` is `"silent"`, so a platform dead and "behind"
 for weeks doesn't hold it. The macOS app says to check or restart the phone
 instead of "needs re-pairing", and posts one notification per silence episode;
 a reconnect or an app relaunch during the same silence does not repeat it. If
-an activity query fails, the last verdict is kept and marked `carried_over`.
+an activity query fails during a silence, its last verdict is kept and marked
+`carried_over`; if a new event arrived but its baseline can't be read, the new
+silence is judged without one (`baseline_unavailable`).
 
 ```bash
 curl -s http://127.0.0.1:7007/api/status | jq '.freshness.google | {stale, stale_reason, silence}'

@@ -3884,7 +3884,9 @@ func staleReason(behind, silent bool) string {
 // silenceBaselineCache keeps each platform's baseline event times keyed by
 // the baseline window they cover. The window depends only on the local date
 // of the last event, so a platform is re-judged every refresh, and two weeks of
-// history are read at most once a day per platform.
+// history are read at most once a day per platform. Rows that land inside an
+// already-cached window later (a legacy backfill writes old timestamps) join
+// the baseline when the window next moves.
 type silenceBaselineCache map[string]silenceBaseline
 
 type silenceBaseline struct {
@@ -3947,11 +3949,19 @@ func addSilence(
 			anyStalled = true
 		}
 	}
-	carry := func(platform string) {
+	// carry reuses the previous verdict for platform. With a known last event
+	// it only does so within the same silence episode: once a newer event has
+	// arrived, the old verdict (perhaps a stall) no longer describes it.
+	carry := func(platform string, last time.Time) bool {
 		prevEntry, _ := prev[platform].(map[string]any)
 		block, _ := prevEntry["silence"].(map[string]any)
 		if block == nil {
-			return
+			return false
+		}
+		if !last.IsZero() {
+			if prevLast, ok := block["last_event_ms"].(int64); !ok || prevLast != last.UnixMilli() {
+				return false
+			}
 		}
 		carried := make(map[string]any, len(block)+1)
 		for key, value := range block {
@@ -3960,6 +3970,7 @@ func addSilence(
 		carried["carried_over"] = true
 		stalled, _ := block["stalled"].(bool)
 		apply(platform, carried, stalled)
+		return true
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), silenceQueryTimeout)
@@ -3967,7 +3978,7 @@ func addSilence(
 	latest, err := source.Latest(ctx)
 	if err != nil {
 		for platform := range prev {
-			carry(platform)
+			carry(platform, time.Time{})
 		}
 		out["silence_stalled"] = anyStalled
 		return
@@ -3976,25 +3987,33 @@ func addSilence(
 	for platform, last := range latest {
 		from, to := freshness.BaselineRange(last, loc, cfg)
 		baseline, ok := cache[platform]
+		baselineUnavailable := false
 		if !ok || !baseline.from.Equal(from) || !baseline.to.Equal(to) {
 			events, err := source.Between(ctx, platform, from, to)
-			if err != nil {
-				carry(platform)
+			switch {
+			case err == nil:
+				baseline = silenceBaseline{from: from, to: to, events: events}
+				if cache != nil {
+					cache[platform] = baseline
+				}
+			case carry(platform, last):
 				continue
-			}
-			baseline = silenceBaseline{from: from, to: to, events: events}
-			if cache != nil {
-				cache[platform] = baseline
+			default:
+				// A new event arrived but its baseline can't be read: judge the
+				// new silence without one, so only the 72 h floor can fire.
+				baseline = silenceBaseline{}
+				baselineUnavailable = true
 			}
 		}
 		verdict := freshness.EvaluateSilence(last, baseline.events, now, loc, cfg)
-		apply(platform, map[string]any{
+		block := map[string]any{
 			"source":                       source.Name(),
 			"last_event_ms":                last.UnixMilli(),
 			"silent_ms":                    verdict.Silence.Milliseconds(),
 			"expected_active_hours":        freshness.RoundHours(verdict.ExpectedActiveHours),
 			"expected_active_hours_limit":  cfg.ExpectedActiveHoursLimit,
 			"max_silent_ms":                cfg.MaxSilence.Milliseconds(),
+			"long_silent_ms":               cfg.LongSilence.Milliseconds(),
 			"baseline_days":                cfg.BaselineDays,
 			"baseline_active_days":         verdict.BaselineActiveDays,
 			"baseline_events":              verdict.BaselineEvents,
@@ -4002,7 +4021,11 @@ func addSilence(
 			"evaluated":                    verdict.Evaluated,
 			"stalled":                      verdict.Stalled,
 			"rule":                         verdict.Rule,
-		}, verdict.Stalled)
+		}
+		if baselineUnavailable {
+			block["baseline_unavailable"] = true
+		}
+		apply(platform, block, verdict.Stalled)
 	}
 	out["silence_stalled"] = anyStalled
 }

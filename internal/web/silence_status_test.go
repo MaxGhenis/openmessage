@@ -313,3 +313,39 @@ func TestAddSilenceKeepsLastVerdictWhenQueriesFail(t *testing.T) {
 		t.Fatalf("google with no previous verdict = %v, want untouched", google)
 	}
 }
+
+// A new event ends the silence even if its baseline can't be read: the old
+// stalled verdict must not be carried into the new episode. (Re-review of
+// PR #190.) The new silence is judged without a baseline, so only the 72 h
+// floor could fire.
+func TestAddSilenceDoesNotCarryAStallPastANewEvent(t *testing.T) {
+	loc := time.UTC
+	now := time.Date(2026, 10, 7, 15, 31, 0, 0, loc)
+	stalledAt := time.Date(2026, 10, 6, 1, 11, 0, 0, loc)
+	activity := &flakyActivity{stubActivity: stubActivity{events: map[string][]time.Time{"google": steadyTraffic(stalledAt)}}}
+	fresh := func() map[string]any {
+		return map[string]any{"google": map[string]any{"behind_days": 0, "stale": false, "stale_reason": ""}}
+	}
+	first := fresh()
+	addSilence(first, activity, silenceBaselineCache{}, nil, now, loc)
+	if first["google"].(map[string]any)["stale_reason"] != "silent" {
+		t.Fatalf("first verdict = %v, want a silent stall", first["google"])
+	}
+
+	// The phone relays again at 15:30; the baseline read for the new day fails.
+	activity.events["google"] = append(activity.events["google"], now.Add(-time.Minute))
+	activity.failBetween = true
+	out := fresh()
+	addSilence(out, activity, silenceBaselineCache{}, first, now, loc)
+	google := out["google"].(map[string]any)
+	silence := google["silence"].(map[string]any)
+	if google["stale"] != false || silence["stalled"] != false || silence["carried_over"] != nil {
+		t.Fatalf("google after a new event = %v, want fresh and not carried over", google)
+	}
+	if silence["baseline_unavailable"] != true || silence["last_event_ms"] != now.Add(-time.Minute).UnixMilli() {
+		t.Fatalf("silence block = %v, want the new event judged without a baseline", silence)
+	}
+	if out["silence_stalled"] != false {
+		t.Fatalf("silence_stalled = %v, want false", out["silence_stalled"])
+	}
+}
