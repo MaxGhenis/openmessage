@@ -117,6 +117,18 @@ struct SilenceNotificationLatch {
         self.notifiedEpisode = notifiedEpisode
     }
 
+    /// Restores the latch from a property-list value written by `storedValue`
+    /// (UserDefaults). Anything unreadable starts empty.
+    init(storedValue: Any?) {
+        let stored = storedValue as? [String: Any] ?? [:]
+        self.init(notifiedEpisode: stored.compactMapValues { ($0 as? NSNumber)?.int64Value })
+    }
+
+    /// The latch as a property-list value for UserDefaults.
+    var storedValue: [String: NSNumber] {
+        notifiedEpisode.mapValues { NSNumber(value: $0) }
+    }
+
     /// Silent items not yet notified for their current episode. Marks them
     /// notified.
     mutating func newlySilent(_ items: [PlatformAttention]) -> [PlatformAttention] {

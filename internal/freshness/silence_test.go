@@ -330,3 +330,27 @@ func TestExpectedActiveHoursTerminatesNearMaxTime(t *testing.T) {
 		t.Fatal("ExpectedActiveHours did not terminate near the maximum time")
 	}
 }
+
+// A pairing day's history burst over only one or two active days is still the
+// median; the platform is not busy until there are MinBusyDays active days.
+// (Third review of PR #190.)
+func TestEvaluateSilenceNeedsSeveralDaysBeforeABurstCountsAsBusy(t *testing.T) {
+	loc := time.UTC
+	last := time.Date(2026, 10, 6, 21, 0, 0, 0, loc)
+	cfg := DefaultSilenceConfig
+	pairingDay := time.Date(2026, 10, 4, 10, 0, 0, 0, loc)
+	var baseline []time.Time
+	for i := 0; i < 40; i++ { // history sync on the pairing day
+		baseline = append(baseline, pairingDay.Add(time.Duration(i)*time.Minute))
+	}
+	for i := 0; i < 3; i++ { // an ordinary light day after it
+		baseline = append(baseline, time.Date(2026, 10, 5, 9+4*i, 0, 0, 0, loc))
+	}
+	overnight := EvaluateSilence(last, baseline, last.Add(cfg.MaxSilence+2*time.Hour), loc, cfg)
+	if overnight.Stalled || overnight.BaselineActiveDays != 2 {
+		t.Fatalf("verdict after an ordinary overnight gap = %+v, want 2 active days and not stalled", overnight)
+	}
+	if long := EvaluateSilence(last, baseline, last.Add(cfg.LongSilence), loc, cfg); !long.Stalled || long.Rule != RuleLongSilence {
+		t.Fatalf("verdict at LongSilence = %+v, want stalled by %s", long, RuleLongSilence)
+	}
+}

@@ -121,7 +121,12 @@ func TestInboxActivityLatestIsIncremental(t *testing.T) {
 	if want := []int64{0, 2}; !reflect.DeepEqual(store.afters, want) {
 		t.Fatalf("high-water marks queried = %v, want %v", store.afters, want)
 	}
-	latest() // nothing new
+	// A newer row with an older receipt time (a clock stepped back) does not
+	// pull the known latest time down.
+	store.rows = append(store.rows, stubInboxRow{4, "google.protobuf", 6_000})
+	if got := latest(); !got["google"].Equal(time.UnixMilli(7_000)) {
+		t.Fatalf("Latest() after an older receipt = %v, want google at 7000", got)
+	}
 	clock = clock.Add(inboxRescanInterval)
 	latest()
 	if want := []int64{0, 2, 3, 0}; !reflect.DeepEqual(store.afters, want) {
@@ -145,11 +150,11 @@ type stubMessageStore struct {
 	platforms [][]string
 }
 
-func (s *stubMessageStore) LatestIncomingMessageTimestamp(_ context.Context, platforms []string) (int64, error) {
+func (s *stubMessageStore) LatestIncomingMessageTimestamp(_ context.Context, platforms []string, notAfterMS int64) (int64, error) {
 	var latest int64
 	for _, platform := range platforms {
 		for _, ms := range s.stamps[platform] {
-			if ms > latest {
+			if ms > latest && ms <= notAfterMS {
 				latest = ms
 			}
 		}

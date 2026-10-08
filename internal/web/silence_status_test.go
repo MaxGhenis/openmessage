@@ -349,3 +349,79 @@ func TestAddSilenceDoesNotCarryAStallPastANewEvent(t *testing.T) {
 		t.Fatalf("silence_stalled = %v, want false", out["silence_stalled"])
 	}
 }
+
+// A baseline read that keeps failing must not freeze the verdict: the silence
+// is judged again on every refresh without a baseline, so the 72 h floor still
+// fires. (Third review of PR #190: the unjudged verdict used to be carried
+// forever with its first silent_ms.)
+func TestAddSilenceKeepsJudgingWhileTheBaselineReadKeepsFailing(t *testing.T) {
+	loc := time.UTC
+	last := time.Date(2026, 10, 6, 1, 11, 0, 0, loc)
+	activity := &flakyActivity{stubActivity: stubActivity{events: map[string][]time.Time{"google": steadyTraffic(last)}}, failBetween: true}
+	var prev map[string]any
+	for _, tc := range []struct {
+		after   time.Duration
+		stalled bool
+	}{{time.Hour, false}, {20 * time.Hour, false}, {80 * time.Hour, true}, {200 * time.Hour, true}} {
+		out := map[string]any{"google": map[string]any{"stale": false, "stale_reason": ""}}
+		addSilence(out, activity, silenceBaselineCache{}, prev, last.Add(tc.after), loc)
+		silence := out["google"].(map[string]any)["silence"].(map[string]any)
+		if silence["stalled"] != tc.stalled || silence["baseline_unavailable"] != true || silence["carried_over"] != nil {
+			t.Fatalf("at +%v: silence = %v, want stalled=%v, judged without a baseline", tc.after, silence, tc.stalled)
+		}
+		if got := silence["silent_ms"].(int64); got != tc.after.Milliseconds() {
+			t.Fatalf("at +%v: silent_ms = %d, want %d", tc.after, got, tc.after.Milliseconds())
+		}
+		if tc.stalled && silence["rule"] != freshness.RuleLongSilence {
+			t.Fatalf("at +%v: rule = %v, want %s", tc.after, silence["rule"], freshness.RuleLongSilence)
+		}
+		prev = out
+	}
+	// If the activity query itself starts failing too, the unjudged verdict
+	// is judged again from its last event rather than dropped.
+	activity.failLatest = true
+	out := map[string]any{"google": map[string]any{"stale": false, "stale_reason": ""}}
+	addSilence(out, activity, silenceBaselineCache{}, prev, last.Add(300*time.Hour), loc)
+	silence := out["google"].(map[string]any)["silence"].(map[string]any)
+	if silence["stalled"] != true || silence["silent_ms"].(int64) != (300*time.Hour).Milliseconds() {
+		t.Fatalf("after Latest fails too: silence = %v, want stalled at 300 h", silence)
+	}
+}
+
+// A carried verdict reports the silence up to now and the length rules apply
+// to it again (here the 16 h cap for a busy platform), so a failing query can
+// neither freeze the menu-bar hours nor hold a growing silence fresh.
+func TestAddSilenceCarriedVerdictTracksTheSilence(t *testing.T) {
+	loc := time.UTC
+	last := time.Date(2026, 10, 6, 1, 11, 0, 0, loc)
+	activity := &flakyActivity{stubActivity: stubActivity{events: map[string][]time.Time{
+		// Busy, but only at 03:00, so the profile rule stays quiet overnight.
+		"google": nil,
+	}}}
+	for d := 1; d <= 16; d++ {
+		for i := 0; i < 30; i++ {
+			activity.events["google"] = append(activity.events["google"],
+				time.Date(2026, 10, 6-d, 3, i, 0, 0, loc))
+		}
+	}
+	activity.events["google"] = append(activity.events["google"], last)
+	cache := silenceBaselineCache{}
+	first := map[string]any{"google": map[string]any{"stale": false, "stale_reason": ""}}
+	addSilence(first, activity, cache, nil, last.Add(time.Hour), loc)
+	if s := first["google"].(map[string]any)["silence"].(map[string]any); s["stalled"] != false || s["evaluated"] != true {
+		t.Fatalf("first verdict = %v, want evaluated and fresh", s)
+	}
+	activity.failLatest = true
+	for _, tc := range []struct {
+		after   time.Duration
+		stalled bool
+		rule    string
+	}{{10 * time.Hour, false, ""}, {17 * time.Hour, true, freshness.RuleMaxSilence}} {
+		out := map[string]any{"google": map[string]any{"stale": false, "stale_reason": ""}}
+		addSilence(out, activity, cache, first, last.Add(tc.after), loc)
+		s := out["google"].(map[string]any)["silence"].(map[string]any)
+		if s["carried_over"] != true || s["silent_ms"].(int64) != tc.after.Milliseconds() || s["stalled"] != tc.stalled || s["rule"] != tc.rule {
+			t.Fatalf("at +%v carried: silence = %v, want carried, silent_ms current, stalled=%v rule=%q", tc.after, s, tc.stalled, tc.rule)
+		}
+	}
+}

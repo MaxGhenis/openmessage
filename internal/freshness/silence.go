@@ -32,6 +32,10 @@ type SilenceConfig struct {
 	// anything; only LongSilence applies to it. The median keeps one burst
 	// (a history sync after pairing) from making a sparse platform look busy.
 	MinEventsPerActiveDay float64
+	// MinBusyDays is how many active baseline days the median needs before a
+	// platform counts as busy. With one or two days a single burst can still
+	// be the median.
+	MinBusyDays int
 	// ExpectedActiveHoursLimit flags a stall once the profile predicts activity
 	// in at least this many of the silent hours.
 	ExpectedActiveHoursLimit float64
@@ -59,6 +63,7 @@ var DefaultSilenceConfig = SilenceConfig{
 	BaselineDays:             14,
 	MinActiveDays:            7,
 	MinEventsPerActiveDay:    20,
+	MinBusyDays:              3,
 	ExpectedActiveHoursLimit: 6,
 	MaxSilence:               16 * time.Hour,
 	LongSilence:              72 * time.Hour,
@@ -221,7 +226,8 @@ type SilenceVerdict struct {
 	BaselineActiveDays  int
 	BaselineEvents      int
 	// BaselineMedianDailyEvents is the median event count over active
-	// baseline days; at MinEventsPerActiveDay or more the platform is busy.
+	// baseline days; at MinEventsPerActiveDay or more, over at least
+	// MinBusyDays active days, the platform is busy.
 	BaselineMedianDailyEvents float64
 	// Evaluated reports whether the baseline was rich enough to trust the
 	// hour-of-day profile: MinActiveDays active days and a busy median.
@@ -257,7 +263,8 @@ func EvaluateSilence(
 	verdict.BaselineEvents = profile.Events
 	verdict.ExpectedActiveHours = profile.ExpectedActiveHours(last, last.Add(verdict.Silence), loc)
 	verdict.BaselineMedianDailyEvents = profile.MedianDailyEvents
-	busy := profile.ActiveDays > 0 && profile.MedianDailyEvents >= cfg.MinEventsPerActiveDay
+	busy := profile.ActiveDays > 0 && profile.ActiveDays >= cfg.MinBusyDays &&
+		profile.MedianDailyEvents >= cfg.MinEventsPerActiveDay
 	verdict.Evaluated = busy && profile.ActiveDays >= cfg.MinActiveDays
 	switch {
 	case verdict.Evaluated && cfg.ExpectedActiveHoursLimit > 0 &&

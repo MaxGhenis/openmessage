@@ -3949,63 +3949,57 @@ func addSilence(
 			anyStalled = true
 		}
 	}
-	// carry reuses the previous verdict for platform. With a known last event
-	// it only does so within the same silence episode: once a newer event has
-	// arrived, the old verdict (perhaps a stall) no longer describes it.
+	cfg := freshness.DefaultSilenceConfig
+	// carry reuses the previous verdict for platform while its queries fail.
+	// With a known last event it only does so within the same silence
+	// episode: once a newer event has arrived, the old verdict (perhaps a
+	// stall) no longer describes it. A verdict judged without a baseline is
+	// never carried; it is cheap to judge again. The carried block's silence
+	// length is brought up to now and the length rules are applied to it
+	// again, so a failing query cannot hold a growing silence fresh.
 	carry := func(platform string, last time.Time) bool {
 		prevEntry, _ := prev[platform].(map[string]any)
 		block, _ := prevEntry["silence"].(map[string]any)
-		if block == nil {
+		if block == nil || block["baseline_unavailable"] == true {
 			return false
 		}
-		if !last.IsZero() {
-			if prevLast, ok := block["last_event_ms"].(int64); !ok || prevLast != last.UnixMilli() {
-				return false
-			}
+		prevLast, ok := block["last_event_ms"].(int64)
+		if !ok || (!last.IsZero() && prevLast != last.UnixMilli()) {
+			return false
 		}
 		carried := make(map[string]any, len(block)+1)
 		for key, value := range block {
 			carried[key] = value
 		}
 		carried["carried_over"] = true
+		silence := now.Sub(time.UnixMilli(prevLast))
+		if silence < 0 {
+			silence = 0
+		}
+		carried["silent_ms"] = silence.Milliseconds()
 		stalled, _ := block["stalled"].(bool)
+		if !stalled {
+			// Re-apply the length rules to the longer silence, from the
+			// baseline facts the block already holds.
+			activeDays, _ := block["baseline_active_days"].(int)
+			median, _ := block["baseline_median_daily_events"].(float64)
+			busy := activeDays > 0 && activeDays >= cfg.MinBusyDays && median >= cfg.MinEventsPerActiveDay
+			switch {
+			case busy && cfg.MaxSilence > 0 && silence >= cfg.MaxSilence:
+				stalled = true
+				carried["rule"] = freshness.RuleMaxSilence
+			case cfg.LongSilence > 0 && silence >= cfg.LongSilence:
+				stalled = true
+				carried["rule"] = freshness.RuleLongSilence
+			}
+			carried["stalled"] = stalled
+		}
 		apply(platform, carried, stalled)
 		return true
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), silenceQueryTimeout)
-	defer cancel()
-	latest, err := source.Latest(ctx)
-	if err != nil {
-		for platform := range prev {
-			carry(platform, time.Time{})
-		}
-		out["silence_stalled"] = anyStalled
-		return
-	}
-	cfg := freshness.DefaultSilenceConfig
-	for platform, last := range latest {
-		from, to := freshness.BaselineRange(last, loc, cfg)
-		baseline, ok := cache[platform]
-		baselineUnavailable := false
-		if !ok || !baseline.from.Equal(from) || !baseline.to.Equal(to) {
-			events, err := source.Between(ctx, platform, from, to)
-			switch {
-			case err == nil:
-				baseline = silenceBaseline{from: from, to: to, events: events}
-				if cache != nil {
-					cache[platform] = baseline
-				}
-			case carry(platform, last):
-				continue
-			default:
-				// A new event arrived but its baseline can't be read: judge the
-				// new silence without one, so only the 72 h floor can fire.
-				baseline = silenceBaseline{}
-				baselineUnavailable = true
-			}
-		}
-		verdict := freshness.EvaluateSilence(last, baseline.events, now, loc, cfg)
+	judge := func(platform string, last time.Time, events []time.Time, baselineUnavailable bool) {
+		verdict := freshness.EvaluateSilence(last, events, now, loc, cfg)
 		block := map[string]any{
 			"source":                       source.Name(),
 			"last_event_ms":                last.UnixMilli(),
@@ -4023,9 +4017,50 @@ func addSilence(
 			"rule":                         verdict.Rule,
 		}
 		if baselineUnavailable {
+			// Judged without a baseline: only the LongSilence floor can fire.
 			block["baseline_unavailable"] = true
 		}
 		apply(platform, block, verdict.Stalled)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), silenceQueryTimeout)
+	defer cancel()
+	latest, err := source.Latest(ctx)
+	if err != nil {
+		for platform := range prev {
+			if carry(platform, time.Time{}) {
+				continue
+			}
+			// A verdict judged without a baseline is judged again from its
+			// last event, so the LongSilence floor keeps working.
+			prevEntry, _ := prev[platform].(map[string]any)
+			block, _ := prevEntry["silence"].(map[string]any)
+			if prevLast, ok := block["last_event_ms"].(int64); ok {
+				judge(platform, time.UnixMilli(prevLast), nil, true)
+			}
+		}
+		out["silence_stalled"] = anyStalled
+		return
+	}
+	for platform, last := range latest {
+		from, to := freshness.BaselineRange(last, loc, cfg)
+		baseline, ok := cache[platform]
+		if !ok || !baseline.from.Equal(from) || !baseline.to.Equal(to) {
+			events, err := source.Between(ctx, platform, from, to)
+			switch {
+			case err == nil:
+				baseline = silenceBaseline{from: from, to: to, events: events}
+				if cache != nil {
+					cache[platform] = baseline
+				}
+			case carry(platform, last):
+				continue
+			default:
+				judge(platform, last, nil, true)
+				continue
+			}
+		}
+		judge(platform, last, baseline.events, false)
 	}
 	out["silence_stalled"] = anyStalled
 }

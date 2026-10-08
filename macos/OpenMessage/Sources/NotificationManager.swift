@@ -86,10 +86,7 @@ final class NotificationManager: NSObject, ObservableObject, UNUserNotificationC
             defaults.set(true, forKey: preferenceKey)
         }
         self.preferenceEnabled = defaults.bool(forKey: preferenceKey)
-        let stored = defaults.dictionary(forKey: silenceLatchKey) ?? [:]
-        self.silenceLatch = SilenceNotificationLatch(
-            notifiedEpisode: stored.compactMapValues { ($0 as? NSNumber)?.int64Value }
-        )
+        self.silenceLatch = SilenceNotificationLatch(storedValue: defaults.object(forKey: silenceLatchKey))
         super.init()
         UNUserNotificationCenter.current().delegate = self
     }
@@ -375,7 +372,7 @@ final class NotificationManager: NSObject, ObservableObject, UNUserNotificationC
         )
         let newlySilent = silenceLatch.newlySilent(attention)
         if !newlySilent.isEmpty {
-            defaults.set(silenceLatch.notifiedEpisode.mapValues { NSNumber(value: $0) }, forKey: silenceLatchKey)
+            defaults.set(silenceLatch.storedValue, forKey: silenceLatchKey)
         }
         for item in newlySilent {
             guard let body = PlatformAttention.silentNotificationBody(item) else { continue }

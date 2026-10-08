@@ -77,6 +77,7 @@ func (silenceCase) Generate(r *rand.Rand, _ int) reflect.Value {
 			BaselineDays:             1 + r.Intn(21),
 			MinActiveDays:            r.Intn(15),
 			MinEventsPerActiveDay:    float64(r.Intn(60)),
+			MinBusyDays:              r.Intn(6),
 			ExpectedActiveHoursLimit: 12*r.Float64() - 1,
 			MaxSilence:               time.Duration(r.Int63n(int64(40 * time.Hour))),
 			LongSilence:              time.Duration(r.Int63n(int64(60 * time.Hour))),
@@ -140,7 +141,8 @@ func TestSilencePropertyBounds(t *testing.T) {
 func TestSilencePropertyRulesFireExactlyOnTheirPreconditions(t *testing.T) {
 	checkProperty(t, "rule preconditions", func(c silenceCase) bool {
 		v := EvaluateSilence(c.Last, c.Baseline, c.Now, c.Loc, c.Cfg)
-		busy := v.BaselineActiveDays > 0 && v.BaselineMedianDailyEvents >= c.Cfg.MinEventsPerActiveDay
+		busy := v.BaselineActiveDays > 0 && v.BaselineActiveDays >= c.Cfg.MinBusyDays &&
+			v.BaselineMedianDailyEvents >= c.Cfg.MinEventsPerActiveDay
 		limitHours := time.Duration(c.Cfg.ExpectedActiveHoursLimit * float64(time.Hour))
 		switch v.Rule {
 		case "":

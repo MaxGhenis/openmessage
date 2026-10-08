@@ -213,8 +213,9 @@ send can't reset it). A silence is a stall when:
 - the profile expected activity in at least 6 of the silent hours, judged
   only when the baseline has at least 7 active days and a median of at least
   20 events per active day;
-- or 16 hours have passed on a platform with that median (even with fewer
-  active days, as after an outage);
+- or 16 hours have passed on a platform with that median over at least 3
+  active days (so it also covers the days after an outage, while one burst on
+  a pairing day doesn't count);
 - or 72 hours have passed, whatever the baseline, so no platform stays fresh
   forever.
 
@@ -224,9 +225,10 @@ some platform's `stale_reason` is `"silent"`, so a platform dead and "behind"
 for weeks doesn't hold it. The macOS app says to check or restart the phone
 instead of "needs re-pairing", and posts one notification per silence episode;
 a reconnect or an app relaunch during the same silence does not repeat it. If
-an activity query fails during a silence, its last verdict is kept and marked
-`carried_over`; if a new event arrived but its baseline can't be read, the new
-silence is judged without one (`baseline_unavailable`).
+an activity query fails during a silence, its last verdict is kept, marked
+`carried_over`, with its silence length brought up to now and the length rules
+applied again. A silence whose baseline can't be read is judged without one on
+every refresh (`baseline_unavailable`), so only the 72-hour floor can fire.
 
 ```bash
 curl -s http://127.0.0.1:7007/api/status | jq '.freshness.google | {stale, stale_reason, silence}'

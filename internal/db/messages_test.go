@@ -1387,14 +1387,18 @@ func TestIncomingMessageActivityTimestamps(t *testing.T) {
 		}
 	}
 
-	latest, err := store.LatestIncomingMessageTimestamp(ctx, []string{"sms", "rcs"})
+	latest, err := store.LatestIncomingMessageTimestamp(ctx, []string{"sms", "rcs"}, 1<<62)
 	if err != nil {
 		t.Fatalf("LatestIncomingMessageTimestamp: %v", err)
 	}
 	if latest != 3000 {
 		t.Fatalf("LatestIncomingMessageTimestamp(sms, rcs) = %d, want 3000 (the failed send at 9000 is not delivery)", latest)
 	}
-	if latest, err := store.LatestIncomingMessageTimestamp(ctx, []string{"signal"}); err != nil || latest != 0 {
+	// A row stamped past the bound (a skewed sender clock) is ignored.
+	if latest, err := store.LatestIncomingMessageTimestamp(ctx, []string{"sms", "rcs"}, 2500); err != nil || latest != 2000 {
+		t.Fatalf("LatestIncomingMessageTimestamp(sms, rcs, <=2500) = %d, %v; want 2000", latest, err)
+	}
+	if latest, err := store.LatestIncomingMessageTimestamp(ctx, []string{"signal"}, 1<<62); err != nil || latest != 0 {
 		t.Fatalf("LatestIncomingMessageTimestamp(signal) = %d, %v; want 0, nil", latest, err)
 	}
 

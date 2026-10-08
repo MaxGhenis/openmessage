@@ -689,6 +689,12 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 
 	v2Options := v2SendWebOptions(stack, v2Send)
 	v2IngestCounters := v2IngestCountersProvider(stack)
+	// Demo data is a frozen fixture; judging its silence would only report a
+	// demo platform as stalled.
+	var freshnessActivity freshness.ActivitySource
+	if !isDemo {
+		freshnessActivity = freshnessActivitySource(stack, a.Store, v2Primary)
+	}
 
 	httpEnabled := opts.web || opts.mcpSSE
 	if httpEnabled {
@@ -702,7 +708,7 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 				Auth:                  controlAuth,
 				V2:                    v2Options,
 				V2IngestCounters:      v2IngestCounters,
-				Activity:              freshnessActivitySource(stack, a.Store, v2Primary),
+				Activity:              freshnessActivity,
 				Reads:                 reads,
 				V2Primary:             v2Primary,
 				Client:                a.GetClient,

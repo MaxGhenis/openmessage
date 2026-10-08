@@ -129,4 +129,24 @@ final class PlatformAttentionTests: XCTestCase {
         var relaunched = SilenceNotificationLatch(notifiedEpisode: first.notifiedEpisode)
         XCTAssertEqual(relaunched.newlySilent([silent]), [])
     }
+
+    // The latch round-trips through UserDefaults, the way NotificationManager
+    // persists it, and an unreadable stored value starts empty.
+    func testSilenceLatchRoundTripsThroughUserDefaults() throws {
+        let suite = "PlatformAttentionTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let silent = PlatformAttention(key: "google", name: "Google Messages", reason: .silent(hours: 7, since: 1_791_263_467_102))
+        var latch = SilenceNotificationLatch()
+        XCTAssertEqual(latch.newlySilent([silent]), [silent])
+        defaults.set(latch.storedValue, forKey: "silenceNotifiedEpisodes")
+
+        var restored = SilenceNotificationLatch(storedValue: defaults.object(forKey: "silenceNotifiedEpisodes"))
+        XCTAssertEqual(restored.notifiedEpisode, ["google": 1_791_263_467_102])
+        XCTAssertEqual(restored.newlySilent([silent]), [])
+
+        XCTAssertEqual(SilenceNotificationLatch(storedValue: "garbage").notifiedEpisode, [:])
+        XCTAssertEqual(SilenceNotificationLatch(storedValue: nil).notifiedEpisode, [:])
+    }
 }

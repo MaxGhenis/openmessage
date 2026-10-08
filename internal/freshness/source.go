@@ -143,7 +143,7 @@ func (s *inboxActivity) Between(ctx context.Context, platform string, from, to t
 // MessageStore is the slice of the legacy store a message activity source
 // reads.
 type MessageStore interface {
-	LatestIncomingMessageTimestamp(ctx context.Context, platforms []string) (int64, error)
+	LatestIncomingMessageTimestamp(ctx context.Context, platforms []string, notAfterMS int64) (int64, error)
 	IncomingMessageTimestampsBetween(ctx context.Context, platforms []string, fromMS, toMS int64) ([]int64, error)
 }
 
@@ -167,12 +167,17 @@ func NewMessageActivity(store MessageStore, platformByStorage map[string]string)
 	for _, stored := range storage {
 		sort.Strings(stored)
 	}
-	return messageActivity{store: store, storageByPlatform: storage}
+	return messageActivity{store: store, storageByPlatform: storage, now: time.Now}
 }
+
+// futureSkewAllowance is how far past now a sender's timestamp may run and
+// still count as activity; later ones are clock skew.
+const futureSkewAllowance = 10 * time.Minute
 
 type messageActivity struct {
 	store             MessageStore
 	storageByPlatform map[string][]string
+	now               func() time.Time
 }
 
 func (messageActivity) Name() string { return SourceMessages }
@@ -183,7 +188,7 @@ func (s messageActivity) Latest(ctx context.Context) (map[string]time.Time, erro
 	}
 	latest := map[string]time.Time{}
 	for platform, stored := range s.storageByPlatform {
-		ms, err := s.store.LatestIncomingMessageTimestamp(ctx, stored)
+		ms, err := s.store.LatestIncomingMessageTimestamp(ctx, stored, s.now().Add(futureSkewAllowance).UnixMilli())
 		if err != nil {
 			return nil, fmt.Errorf("message activity %s: %w", platform, err)
 		}
