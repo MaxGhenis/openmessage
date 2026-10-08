@@ -1,6 +1,7 @@
 package db
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -817,6 +818,74 @@ func (s *Store) PlatformStats() ([]PlatformStat, error) {
 		stats = append(stats, st)
 	}
 	return stats, rows.Err()
+}
+
+// LatestIncomingMessageTimestamp returns the newest timestamp, at or before
+// notAfterMS, of an incoming (not from me) message on any of the given source
+// platforms, or 0. It walks the timestamp index from notAfterMS down and stops
+// at the first match; for a platform with no incoming rows that walk covers the
+// whole index. Freshness uses it as the activity clock when readers use the
+// legacy store. Outgoing rows are skipped because the app writes them itself,
+// so a send (even a failed one) must not read as the platform delivering, and
+// rows stamped in the future (a skewed sender clock) must not hide a silence.
+func (s *Store) LatestIncomingMessageTimestamp(ctx context.Context, platforms []string, notAfterMS int64) (int64, error) {
+	if len(platforms) == 0 {
+		return 0, nil
+	}
+	args := make([]any, 0, len(platforms)+1)
+	args = append(args, notAfterMS)
+	for _, platform := range platforms {
+		args = append(args, platform)
+	}
+	var ts int64
+	err := s.db.QueryRowContext(ctx, `
+		SELECT timestamp_ms
+		FROM messages
+		WHERE timestamp_ms <= ?
+			AND is_from_me = 0
+			AND source_platform IN (`+strings.TrimSuffix(strings.Repeat("?,", len(platforms)), ",")+`)
+		ORDER BY timestamp_ms DESC
+		LIMIT 1
+	`, args...).Scan(&ts)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, nil
+	}
+	return ts, err
+}
+
+// IncomingMessageTimestampsBetween returns the timestamps (ms, ascending) of
+// incoming messages from the given source platforms inside [fromMS, toMS].
+// The timestamp index bounds the scan to the window.
+func (s *Store) IncomingMessageTimestampsBetween(ctx context.Context, platforms []string, fromMS, toMS int64) ([]int64, error) {
+	if len(platforms) == 0 || toMS < fromMS {
+		return nil, nil
+	}
+	args := make([]any, 0, len(platforms)+2)
+	args = append(args, fromMS, toMS)
+	for _, platform := range platforms {
+		args = append(args, platform)
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT timestamp_ms
+		FROM messages
+		WHERE timestamp_ms BETWEEN ? AND ?
+			AND is_from_me = 0
+			AND source_platform IN (`+strings.TrimSuffix(strings.Repeat("?,", len(platforms)), ",")+`)
+		ORDER BY timestamp_ms
+	`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var timestamps []int64
+	for rows.Next() {
+		var ts int64
+		if err := rows.Scan(&ts); err != nil {
+			return nil, err
+		}
+		timestamps = append(timestamps, ts)
+	}
+	return timestamps, rows.Err()
 }
 
 func scanMessages(rows interface {

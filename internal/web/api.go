@@ -28,6 +28,7 @@ import (
 	"github.com/maxghenis/openmessage/internal/app"
 	"github.com/maxghenis/openmessage/internal/client"
 	"github.com/maxghenis/openmessage/internal/db"
+	"github.com/maxghenis/openmessage/internal/freshness"
 	"github.com/maxghenis/openmessage/internal/ingest"
 	"github.com/maxghenis/openmessage/internal/media"
 	"github.com/maxghenis/openmessage/internal/messaging"
@@ -129,6 +130,11 @@ type APIOptions struct {
 	BackfillStatus        func() any         // returns a JSON-serializable backfill progress snapshot
 	BackfillPhone         func(string) error // targeted backfill for a single phone number
 	SyncGoogleContacts    func() (int, error)
+
+	// Activity reports when each platform's transport last delivered anything.
+	// /api/status uses it to flag a platform whose silence outlasts its own
+	// baseline (freshness.<platform>.silence). Nil skips the silence check.
+	Activity freshness.ActivitySource
 }
 
 type SearchResult struct {
@@ -236,6 +242,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		freshnessMu       sync.Mutex
 		freshnessComputed time.Time
 		freshnessValue    map[string]any
+		silenceBaselines  = silenceBaselineCache{}
 	)
 	computeFreshness := func() map[string]any {
 		freshnessMu.Lock()
@@ -262,11 +269,13 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 				continue
 			}
 			behind := daysBehind(st.LatestMS, newest)
+			stale := st.LatestMS > 0 && behind >= staleDaysThreshold
 			entry := map[string]any{
 				"latest_ms":          st.LatestMS,
 				"latest_received_ms": st.LatestRecvMS,
 				"behind_days":        behind,
-				"stale":              st.LatestMS > 0 && behind >= staleDaysThreshold,
+				"stale":              stale,
+				"stale_reason":       staleReason(stale, false),
 			}
 			// sms + rcs both map to "google"; keep the freshest.
 			if existing, ok := out[key].(map[string]any); ok {
@@ -283,6 +292,11 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		// receives nothing, and every per-platform row still looks fresh. Publish
 		// the per-platform gap so the divergence is observable (#155).
 		addProjectionLag(out, keyFor, store, reads, opts.V2Primary)
+		// The relative rule above cannot see a stall on the platform that
+		// carries the most traffic: it is the newest platform, so it is never
+		// "behind". Judge each platform's silence against its own baseline too
+		// (2026-10-06: Google ingest silent 38h with stale=false throughout).
+		addSilence(out, opts.Activity, silenceBaselines, freshnessValue, time.Now(), time.Local)
 		freshnessValue = out
 		freshnessComputed = time.Now()
 		return out
@@ -3849,4 +3863,204 @@ func addProjectionLag(
 		out[key] = entry
 	}
 	out["projection_stalled"] = stalled
+}
+
+// staleReason names why a freshness entry is stale. "behind" (the platform
+// trails the newest platform by staleDaysThreshold days) outranks "silent"
+// (the platform's own silence outlasts its baseline): a platform that is days
+// behind is usually logged out or unpaired, while a silent platform that is
+// still the newest one usually means the phone stopped relaying.
+func staleReason(behind, silent bool) string {
+	switch {
+	case behind:
+		return "behind"
+	case silent:
+		return "silent"
+	default:
+		return ""
+	}
+}
+
+// silenceBaselineCache keeps each platform's baseline event times keyed by
+// the baseline window they cover. The window depends only on the local date
+// of the last event, so a platform is re-judged every refresh, and two weeks of
+// history are read at most once a day per platform. Rows that land inside an
+// already-cached window later (a legacy backfill writes old timestamps) join
+// the baseline when the window next moves.
+type silenceBaselineCache map[string]silenceBaseline
+
+type silenceBaseline struct {
+	from   time.Time
+	to     time.Time
+	events []time.Time
+}
+
+// silenceQueryTimeout bounds the activity queries behind one status refresh.
+const silenceQueryTimeout = 5 * time.Second
+
+// addSilence annotates each per-platform freshness entry with a "silence"
+// block judging how long the platform has delivered nothing against its own
+// hour-of-day baseline (freshness.EvaluateSilence), folds a stall into
+// "stale"/"stale_reason", and stamps a top-level "silence_stalled" that is
+// true when some platform's stale_reason is "silent". A nil
+// source leaves the payload untouched. When a query fails, the platform keeps
+// the silence block from prev (the previous payload), marked
+// "carried_over", so a failing query cannot clear a stall that is still
+// going on.
+func addSilence(
+	out map[string]any,
+	source freshness.ActivitySource,
+	cache silenceBaselineCache,
+	prev map[string]any,
+	now time.Time,
+	loc *time.Location,
+) {
+	if source == nil || out == nil {
+		return
+	}
+	anyStalled := false
+	apply := func(platform string, block map[string]any, stalled bool) {
+		entry, ok := out[platform].(map[string]any)
+		if !ok {
+			entry = map[string]any{
+				"latest_ms":          int64(0),
+				"latest_received_ms": int64(0),
+				"behind_days":        0,
+				"stale":              false,
+			}
+		}
+		// Only the relative rule's verdict carries over; "stale" alone can't
+		// tell an entry made stale by the relative rule from one this function
+		// already marked.
+		behind := false
+		if reason, ok := entry["stale_reason"].(string); ok {
+			behind = reason == "behind"
+		} else {
+			behind, _ = entry["stale"].(bool)
+		}
+		entry["silence"] = block
+		entry["stale"] = behind || stalled
+		entry["stale_reason"] = staleReason(behind, stalled)
+		out[platform] = entry
+		// Only platforms whose stale reason ends up "silent" count: a
+		// platform already "behind" (often unpaired or logged out for weeks)
+		// would otherwise hold silence_stalled true forever.
+		if entry["stale_reason"] == "silent" {
+			anyStalled = true
+		}
+	}
+	cfg := freshness.DefaultSilenceConfig
+	// carry reuses the previous verdict for platform while its queries fail.
+	// With a known last event it only does so within the same silence
+	// episode: once a newer event has arrived, the old verdict (perhaps a
+	// stall) no longer describes it. A verdict judged without a baseline is
+	// never carried; it is cheap to judge again. The carried block's silence
+	// length is brought up to now and the length rules are applied to it
+	// again, so a failing query cannot hold a growing silence fresh.
+	carry := func(platform string, last time.Time) bool {
+		prevEntry, _ := prev[platform].(map[string]any)
+		block, _ := prevEntry["silence"].(map[string]any)
+		if block == nil || block["baseline_unavailable"] == true {
+			return false
+		}
+		prevLast, ok := block["last_event_ms"].(int64)
+		if !ok || (!last.IsZero() && prevLast != last.UnixMilli()) {
+			return false
+		}
+		carried := make(map[string]any, len(block)+1)
+		for key, value := range block {
+			carried[key] = value
+		}
+		carried["carried_over"] = true
+		silence := now.Sub(time.UnixMilli(prevLast))
+		if silence < 0 {
+			silence = 0
+		}
+		carried["silent_ms"] = silence.Milliseconds()
+		stalled, _ := block["stalled"].(bool)
+		if !stalled {
+			// Re-apply the length rules to the longer silence, from the
+			// baseline facts the block already holds.
+			activeDays, _ := block["baseline_active_days"].(int)
+			median, _ := block["baseline_median_daily_events"].(float64)
+			busy := activeDays > 0 && activeDays >= cfg.MinBusyDays && median >= cfg.MinEventsPerActiveDay
+			switch {
+			case busy && cfg.MaxSilence > 0 && silence >= cfg.MaxSilence:
+				stalled = true
+				carried["rule"] = freshness.RuleMaxSilence
+			case cfg.LongSilence > 0 && silence >= cfg.LongSilence:
+				stalled = true
+				carried["rule"] = freshness.RuleLongSilence
+			}
+			carried["stalled"] = stalled
+		}
+		apply(platform, carried, stalled)
+		return true
+	}
+
+	judge := func(platform string, last time.Time, events []time.Time, baselineUnavailable bool) {
+		verdict := freshness.EvaluateSilence(last, events, now, loc, cfg)
+		block := map[string]any{
+			"source":                       source.Name(),
+			"last_event_ms":                last.UnixMilli(),
+			"silent_ms":                    verdict.Silence.Milliseconds(),
+			"expected_active_hours":        freshness.RoundHours(verdict.ExpectedActiveHours),
+			"expected_active_hours_limit":  cfg.ExpectedActiveHoursLimit,
+			"max_silent_ms":                cfg.MaxSilence.Milliseconds(),
+			"long_silent_ms":               cfg.LongSilence.Milliseconds(),
+			"baseline_days":                cfg.BaselineDays,
+			"baseline_active_days":         verdict.BaselineActiveDays,
+			"baseline_events":              verdict.BaselineEvents,
+			"baseline_median_daily_events": verdict.BaselineMedianDailyEvents,
+			"evaluated":                    verdict.Evaluated,
+			"stalled":                      verdict.Stalled,
+			"rule":                         verdict.Rule,
+		}
+		if baselineUnavailable {
+			// Judged without a baseline: only the LongSilence floor can fire.
+			block["baseline_unavailable"] = true
+		}
+		apply(platform, block, verdict.Stalled)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), silenceQueryTimeout)
+	defer cancel()
+	latest, err := source.Latest(ctx)
+	if err != nil {
+		for platform := range prev {
+			if carry(platform, time.Time{}) {
+				continue
+			}
+			// A verdict judged without a baseline is judged again from its
+			// last event, so the LongSilence floor keeps working.
+			prevEntry, _ := prev[platform].(map[string]any)
+			block, _ := prevEntry["silence"].(map[string]any)
+			if prevLast, ok := block["last_event_ms"].(int64); ok {
+				judge(platform, time.UnixMilli(prevLast), nil, true)
+			}
+		}
+		out["silence_stalled"] = anyStalled
+		return
+	}
+	for platform, last := range latest {
+		from, to := freshness.BaselineRange(last, loc, cfg)
+		baseline, ok := cache[platform]
+		if !ok || !baseline.from.Equal(from) || !baseline.to.Equal(to) {
+			events, err := source.Between(ctx, platform, from, to)
+			switch {
+			case err == nil:
+				baseline = silenceBaseline{from: from, to: to, events: events}
+				if cache != nil {
+					cache[platform] = baseline
+				}
+			case carry(platform, last):
+				continue
+			default:
+				judge(platform, last, nil, true)
+				continue
+			}
+		}
+		judge(platform, last, baseline.events, false)
+	}
+	out["silence_stalled"] = anyStalled
 }
