@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -12,6 +13,7 @@ import (
 	"github.com/rs/zerolog"
 
 	"github.com/maxghenis/openmessage/internal/db"
+	"github.com/maxghenis/openmessage/internal/freshness"
 )
 
 // RunStatus handles "openmessage status [--json]".
@@ -45,9 +47,14 @@ func RunStatus(logger zerolog.Logger, args ...string) error {
 	}
 
 	dbPath := session.StorePath
+	// Only the v2 inbox can tell SMS from RCS; a legacy-mode session skips it.
+	var smsPath *freshness.SMSPathReport
+	if session.V2Store != nil {
+		smsPath = statusSMSPath(context.Background(), session.V2Store, now)
+	}
 
 	if asJSON {
-		return writeStatusJSON(dbPath, session.DataDir, total, stats)
+		return writeStatusJSON(dbPath, session.DataDir, total, stats, smsPath)
 	}
 
 	fmt.Printf("OpenMessage store — %s\n", dbPath)
@@ -73,10 +80,18 @@ func RunStatus(logger zerolog.Logger, args ...string) error {
 	if newestOverall > 0 {
 		fmt.Printf("Newest message overall: %s (%s).\n", fmtTS(newestOverall), humanAge(newestOverall, now))
 	}
+	if smsPath != nil {
+		fmt.Println(smsPathStatusLine(*smsPath))
+	}
 	return nil
 }
 
-func writeStatusJSON(dbPath, dataDir string, total int, stats []db.PlatformStat) error {
+func writeStatusJSON(
+	dbPath, dataDir string,
+	total int,
+	stats []db.PlatformStat,
+	smsPath *freshness.SMSPathReport,
+) error {
 	type platformJSON struct {
 		Platform         string `json:"platform"`
 		Count            int    `json:"count"`
@@ -86,11 +101,12 @@ func writeStatusJSON(dbPath, dataDir string, total int, stats []db.PlatformStat)
 		LatestReceived   string `json:"latest_received,omitempty"`
 	}
 	out := struct {
-		DataDir   string         `json:"data_dir"`
-		DBPath    string         `json:"db_path"`
-		Total     int            `json:"total_messages"`
-		Platforms []platformJSON `json:"platforms"`
-	}{DataDir: dataDir, DBPath: dbPath, Total: total}
+		DataDir   string                   `json:"data_dir"`
+		DBPath    string                   `json:"db_path"`
+		Total     int                      `json:"total_messages"`
+		Platforms []platformJSON           `json:"platforms"`
+		SMSPath   *freshness.SMSPathReport `json:"google_sms_path,omitempty"`
+	}{DataDir: dataDir, DBPath: dbPath, Total: total, SMSPath: smsPath}
 
 	for _, st := range stats {
 		pj := platformJSON{

@@ -57,7 +57,10 @@ openmessage status [--json]                                       # per-platform
 each platform's message count and latest sent/received timestamps, and flags any
 platform whose latest message trails the newest overall by ≥3 days ("Nd behind").
 A stale row means the daemon isn't syncing that platform — searches over that
-window will miss messages. `read` resolves each hit's sender (name → number →
+window will miss messages. On a v2-primary store it also prints a "Google SMS:"
+line: a ⚠ there means no incoming SMS for longer than usual while RCS still
+arrives, which per-platform freshness cannot see; on 2026-10-07 it was the
+phone's IMS stack (runbook: "SMS stopped while RCS works"). `read` resolves each hit's sender (name → number →
 conversation id) so results are legible without a second lookup, and accepts
 `--since`/`--until` (YYYY-MM-DD, local time; `--until` is inclusive to end of
 day) to scope a search to a date window. Date filtering lives in the store via

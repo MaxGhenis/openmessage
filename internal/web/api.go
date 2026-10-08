@@ -135,6 +135,10 @@ type APIOptions struct {
 	// /api/status uses it to flag a platform whose silence outlasts its own
 	// baseline (freshness.<platform>.silence). Nil skips the silence check.
 	Activity freshness.ActivitySource
+
+	// GoogleSMSPath judges whether carrier SMS has stopped reaching the phone
+	// while RCS still flows (freshness.google.sms_path). Nil skips the check.
+	GoogleSMSPath *freshness.SMSPathMonitor
 }
 
 type SearchResult struct {
@@ -297,6 +301,20 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		// "behind". Judge each platform's silence against its own baseline too
 		// (2026-10-06: Google ingest silent 38h with stale=false throughout).
 		addSilence(out, opts.Activity, silenceBaselines, freshnessValue, time.Now(), time.Local)
+		// A phone can lose carrier SMS while RCS keeps arriving over data
+		// (2026-10-03 to 10-07: 95 hours). Google stays the newest platform the
+		// whole time, so judge its SMS path on its own.
+		addGoogleSMSPath(out, opts.GoogleSMSPath, time.Now(), func() bool {
+			if !googlePhoneResponding() {
+				return false
+			}
+			if opts.GoogleStatus != nil {
+				if status, ok := opts.GoogleStatus().(app.GoogleStatusSnapshot); ok {
+					return status.Connected
+				}
+			}
+			return true
+		})
 		freshnessValue = out
 		freshnessComputed = time.Now()
 		return out
