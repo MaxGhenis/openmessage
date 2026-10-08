@@ -3,6 +3,7 @@ package messaging
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -12,6 +13,8 @@ import (
 	"testing"
 	"testing/quick"
 	"time"
+
+	"github.com/rs/zerolog"
 
 	"github.com/maxghenis/openmessage/internal/bridge"
 	"github.com/maxghenis/openmessage/internal/storage/sqlite"
@@ -386,6 +389,25 @@ func TestRetryBudgetHonoursAdapterRetryAt(t *testing.T) {
 			Dispatch:    bridge.DispatchNotCalled,
 			Cause:       errors.New("repairing credentials"),
 		}},
+		// Dispatched at banEnds+2h: asks for one second, gets the 5 s cadence.
+		{err: bridge.OpError{
+			Class:       bridge.FailureTransient,
+			Operation:   "send_text",
+			Fingerprint: "google_not_connected",
+			RetryAt:     banEnds.Add(2*time.Hour + time.Second),
+			Dispatch:    bridge.DispatchNotCalled,
+			Cause:       errors.New("offline"),
+		}},
+		// A RetryAt before the epoch must not reach MarkCalledNotDispatched,
+		// which would refuse it and stop the dispatcher.
+		{err: bridge.OpError{
+			Class:       bridge.FailureCredentialsExpired,
+			Operation:   "send_text",
+			Fingerprint: "repairing",
+			RetryAt:     time.UnixMilli(-1000),
+			Dispatch:    bridge.DispatchNotCalled,
+			Cause:       errors.New("repairing credentials"),
+		}},
 	}}
 	registry := newScriptedRegistry("budget-retry-at", sender)
 	registry.setAvailable(true)
@@ -419,6 +441,21 @@ func TestRetryBudgetHonoursAdapterRetryAt(t *testing.T) {
 	if got := mustDelivery(t, service, submission.OutboxID); !got.NextAttemptAt.Equal(banEnds.Add(2*time.Hour)) ||
 		got.AttemptCount != 2 {
 		t.Fatalf("exempt delivery = %+v, want the adapter's retry-at and a refunded attempt", got)
+	}
+	// An adapter RetryAt never hurries an exempt retry below the fixed cadence.
+	clock.Advance(banEnds.Add(2 * time.Hour).Sub(clock.Now()))
+	for _, label := range []string{"earlier than the cadence", "before the epoch"} {
+		if processed, err := service.DispatchDue(ctx, 1); err != nil || processed != 1 {
+			t.Fatalf("DispatchDue(exempt retry-at %s) = %d, %v; want 1, nil", label, processed, err)
+		}
+		if got := mustDelivery(t, service, submission.OutboxID); got.State != OutboxNotDispatched ||
+			!got.NextAttemptAt.Equal(clock.Now().Add(defaultRetryDelay)) || got.AttemptCount != 2 {
+			t.Fatalf("exempt delivery with a retry-at %s = %+v, want the 5 s cadence", label, got)
+		}
+		clock.Advance(defaultRetryDelay)
+	}
+	if got := sender.requestCount(); got != 5 {
+		t.Fatalf("transport calls = %d, want 5", got)
 	}
 }
 
@@ -707,6 +744,83 @@ func TestRetryBudgetConversationMovedRebindFailureAndCap(t *testing.T) {
 			t.Fatalf("conversation = %+v, %v; want the rebind kept", conversation, err)
 		}
 	})
+}
+
+// Both rebind outcomes are logged through the logger the caller's context
+// carries, with the IDs needed to trace the move.
+func TestRetryBudgetConversationMovedRebindIsLogged(t *testing.T) {
+	tests := []struct {
+		name      string
+		from      string
+		wantLevel string
+		wantMsg   string
+		wantError string
+	}{
+		{
+			name:      "rebound",
+			from:      "remote-conversation",
+			wantLevel: "info",
+			wantMsg:   "Outbox rebound a moved conversation before sending",
+		},
+		{
+			name:      "refused",
+			from:      "remote-somewhere-else",
+			wantLevel: "warn",
+			wantMsg:   "Outbox could not rebind a moved conversation",
+			wantError: `conversation "conversation-1" is now bound to remote ID "remote-conversation", not "remote-somewhere-else"`,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			clock := newManualClock(messagingTestTime)
+			store := openMessagingTestStore(t, clock.Now())
+			sender := &scriptedTextSender{steps: []sendStep{
+				{err: movedFailure(test.from, "remote-conversation-new")},
+			}}
+			registry := newScriptedRegistry("budget-moved-log", sender)
+			registry.setAvailable(true)
+			service := newMessagingTestService(t, store, registry, clock)
+			submission := mustSendText(t, service, SendTextCommand{
+				CommonCommand: testCommonCommand("budget-moved-log"),
+				Body:          "logged move",
+			})
+			var output bytes.Buffer
+			ctx := zerolog.New(&output).WithContext(context.Background())
+			if processed, err := service.DispatchDue(ctx, 1); err != nil || processed != 1 {
+				t.Fatalf("DispatchDue() = %d, %v; want 1, nil", processed, err)
+			}
+
+			lines := strings.Split(strings.TrimSpace(output.String()), "\n")
+			if len(lines) != 1 {
+				t.Fatalf("log lines = %q, want exactly one", output.String())
+			}
+			var entry map[string]any
+			if err := json.Unmarshal([]byte(lines[0]), &entry); err != nil {
+				t.Fatalf("decode log line %q: %v", lines[0], err)
+			}
+			want := map[string]any{
+				"level":           test.wantLevel,
+				"message":         test.wantMsg,
+				"outbox_id":       submission.OutboxID,
+				"account_id":      "account-1",
+				"conversation_id": "conversation-1",
+				"from_remote_id":  test.from,
+				"to_remote_id":    "remote-conversation-new",
+				"attempt":         float64(1),
+			}
+			if test.wantError != "" {
+				want["error"] = test.wantError
+			}
+			for key, value := range want {
+				if entry[key] != value {
+					t.Fatalf("log %q = %v, want %v (entry %v)", key, entry[key], value, entry)
+				}
+			}
+			if _, ok := entry["error"]; ok != (test.wantError != "") {
+				t.Fatalf("log entry %v: error field present = %v", entry, ok)
+			}
+		})
+	}
 }
 
 // B3: a direct conversation with exactly one canonical E.164 peer gives text
