@@ -26,19 +26,25 @@ const (
 	MessageStateDeleted MessageState = "deleted"
 )
 
-// InboxRecord is one durable, undecoded transport frame. ReceivedAtMS and
-// ProcessedAtMS are populated on reads; AppendInbox stamps ReceivedAtMS with
-// the repository's injected clock and always stores ProcessedAtMS as NULL.
+// InboxRecord is one durable, undecoded transport frame. ReceivedAtMS,
+// ProcessedAtMS, QuarantinedAtMS, and PayloadPrunedAtMS are populated on
+// reads; AppendInbox stamps ReceivedAtMS with the repository's injected clock
+// and always stores the other three as NULL.
+//
+// A non-nil PayloadPrunedAtMS means retention emptied Payload; the row and its
+// dedupe key remain (see PruneInboxPayloads).
 type InboxRecord struct {
-	InboxID       string
-	AccountID     string
-	Generation    int64
-	DedupeKey     string
-	Codec         string
-	CodecVersion  int64
-	ReceivedAtMS  int64
-	Payload       []byte
-	ProcessedAtMS *int64
+	InboxID           string
+	AccountID         string
+	Generation        int64
+	DedupeKey         string
+	Codec             string
+	CodecVersion      int64
+	ReceivedAtMS      int64
+	Payload           []byte
+	ProcessedAtMS     *int64
+	QuarantinedAtMS   *int64
+	PayloadPrunedAtMS *int64
 }
 
 // Message is one normalized projected message. CreatedAtMS and UpdatedAtMS are
@@ -188,8 +194,9 @@ func (r *MessageRepository) Unprocessed(ctx context.Context) ([]InboxRecord, err
 }
 
 // MarkInboxProcessed removes a durable frame from the worker's unprocessed
-// queue without deleting its payload. Repeated calls, including calls for a
-// row that is already processed or does not exist for the account, succeed.
+// queue. The payload stays until PruneInboxPayloads ages it out. Repeated
+// calls, including calls for a row that is already processed or does not exist
+// for the account, succeed.
 func (r *MessageRepository) MarkInboxProcessed(
 	ctx context.Context,
 	inboxID string,
@@ -833,7 +840,9 @@ const inboxColumns = `
 	codec_version,
 	received_at_ms,
 	payload,
-	processed_at_ms`
+	processed_at_ms,
+	quarantined_at_ms,
+	payload_pruned_at_ms`
 
 func scanInboxRecord(row rowScanner) (InboxRecord, error) {
 	var record InboxRecord
@@ -847,6 +856,8 @@ func scanInboxRecord(row rowScanner) (InboxRecord, error) {
 		&record.ReceivedAtMS,
 		&record.Payload,
 		&record.ProcessedAtMS,
+		&record.QuarantinedAtMS,
+		&record.PayloadPrunedAtMS,
 	)
 	return record, err
 }

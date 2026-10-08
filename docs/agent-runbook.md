@@ -165,6 +165,64 @@ Outgoing-only windows are reported as `ambiguous` and left in place: a
 message frame carries no recipient, so nothing proves where an outbound text
 belongs until the thread's ConversationEvent re-binds the id.
 
+## v2 inbox retention: rows stay, old payloads go
+
+Every transport frame lands in the v2 `inbox` table before decoding. The row,
+its `(account_id, dedupe_key)`, and its timestamps are kept for the life of
+the store: the key is what makes a re-delivered or re-fetched frame collapse
+onto the original instead of projecting again, and keeping every row keeps
+rowids monotonic. Only the payload bytes age out. Once a day (first pass ~2
+minutes after start) the daemon empties the payload of every frame that was
+**processed more than 60 days ago and never quarantined**, and stamps
+`payload_pruned_at_ms`. It works in batches of 500, each in its own short
+transaction. MCP clients and the read-only CLI never prune.
+
+- **Quarantined frames keep their payload indefinitely.** The worker now stamps
+  `quarantined_at_ms` when it gives up on a frame, and whatever in that frame
+  failed to project survives only in its payload, so these rows are the
+  evidence to replay through the worker in a package test. Frames quarantined
+  before migration 0011 were never marked (they look processed) and age out
+  like any other processed frame.
+- **Readers that decode payloads** must keep their receipt-time window at or
+  under 45 days (`sqlite.MinInboxPayloadRetention`); the pruner refuses any
+  shorter retention, so such a window never meets a pruned row. Readers of
+  `received_at_ms`/`codec` alone are unaffected at any window.
+- **Pausing pruning on a live install** (e.g. mid-investigation of old frames):
+  `touch "$HOME/Library/Application Support/OpenMessage/v2/inbox-retention-hold"`.
+  Each pass checks for the file, so no restart is needed; remove it to resume.
+  This is the only lever that reaches the macOS app, whose backend runs with a
+  fixed environment. A CLI daemon (`openmessage serve --web`) also honours
+  `OPENMESSAGES_V2_INBOX_RETENTION_DAYS` (`0` disables; values under 45 are
+  raised to 45).
+
+Check what retention has done (read-only `sqlite3` opens the live v2 store):
+
+```bash
+sqlite3 -readonly "$HOME/Library/Application Support/OpenMessage/v2/store.sqlite3" "
+  SELECT codec, COUNT(*) AS frames,
+         SUM(payload_pruned_at_ms IS NOT NULL) AS pruned,
+         SUM(quarantined_at_ms IS NOT NULL) AS quarantined,
+         SUM(length(payload)) AS payload_bytes
+  FROM inbox GROUP BY codec;"
+```
+
+**Disk.** Pruning frees pages inside the file for reuse; the file itself does
+not shrink, so growth stops rather than reverses. Measured 2026-10-08 on a
+copy of Max's store: 30,033 frames held 29.7 MB of payload (Google writes about
+50–600 frames a day; WhatsApp and Signal had been unpaired since mid-August);
+the first pass emptied 14,733 payloads (17.3 MB) in 131 ms with an 18 ms
+slowest batch and left `integrity_check` ok. A `VACUUM` afterwards gave a
+76.7 MB file, against 94.6 MB for the same store vacuumed unpruned. To reclaim
+that space once, park the watchdog, quit the app, back up, then vacuum:
+
+```bash
+touch "$HOME/Library/Application Support/OpenMessage/watchdog-disabled"
+osascript -e 'quit app "OpenMessage"'
+cd "$HOME/Library/Application Support/OpenMessage/v2"
+sqlite3 store.sqlite3 ".backup 'store.pre-vacuum.sqlite3'" && sqlite3 store.sqlite3 "VACUUM;"
+open -a OpenMessage && rm "$HOME/Library/Application Support/OpenMessage/watchdog-disabled"
+```
+
 ## MCP serving — exactly one process may own live transports
 
 **The failure mode (empirically confirmed 2026-07-20):** `openmessage serve

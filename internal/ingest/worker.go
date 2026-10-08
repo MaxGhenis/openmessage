@@ -307,8 +307,10 @@ func (w *Worker) markQuarantined(
 	record bridge.RawIngressRecord,
 	cause error,
 ) {
+	// The durable mark keeps the frame's payload out of retention pruning:
+	// whatever in it failed to project survives only there.
 	err := retryTransient(ctx, func() error {
-		return w.messages.MarkInboxProcessed(ctx, inboxID, record.AccountID)
+		return w.messages.MarkInboxQuarantined(ctx, inboxID, record.AccountID)
 	})
 	if err != nil {
 		if ctx.Err() == nil {
@@ -317,7 +319,7 @@ func (w *Worker) markQuarantined(
 				Str("account_id", record.AccountID).
 				Str("inbox_id", inboxID).
 				Str("codec", record.Codec).
-				Msg("Failed to mark quarantined ingest frame processed")
+				Msg("Failed to mark ingest frame quarantined")
 		}
 		return
 	}
