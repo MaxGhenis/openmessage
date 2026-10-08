@@ -54,11 +54,31 @@ openmessage status [--json]                                       # per-platform
 ```
 
 `status` is the fast way to check coverage before trusting a search: it lists
-each platform's message count and latest sent/received timestamps, and flags any
-platform whose latest message trails the newest overall by ≥3 days ("Nd behind").
-A stale row means the daemon isn't syncing that platform — searches over that
-window will miss messages. `read` resolves each hit's sender (name → number →
-conversation id) so results are legible without a second lookup, and accepts
+each platform's message count and latest sent/received timestamps, and flags a
+platform that has stopped syncing in the AGE column. "Nd behind": its latest
+message trails the newest overall by ≥3 days. "silent Nh": its transport has
+delivered nothing for N hours, longer than its own baseline explains. That is
+the `internal/freshness` silence rule behind `/api/status`
+`freshness.<platform>.silence`, and it also catches a stall of the newest
+platform, which the relative rule never can (Google, 2026-10-06). When the
+running app serves the same data dir and reports a verdict measured on the
+source this command reads, `status` shows the app's (daemon truth, as for
+sends). Otherwise it judges locally with `freshness.EvaluateSilence` on the
+source the daemon would read: the v2 inbox when reads come from the v2 store,
+the legacy store's incoming messages otherwise. It reuses the stores it already
+opened. A line under the table says which and why (app not running, another
+data dir, an app build without the check, the app on v2 while the CLI reads
+legacy). `--json` adds each row's `behind_days`, `silence` (the daemon's field
+names, built by `freshness.SilenceBlock`) and `silence_judged_by` (`daemon` |
+`local`), plus `silence_note`. sms and rcs rows both carry Google's verdict.
+A stale row means the daemon isn't syncing that platform, or the phone behind
+it has stopped delivering; searches over that window will miss messages.
+"Read-only" means no repair sweeps and no transports: opening a store still
+applies pending schema migrations (`sqlite.Open` for v2, `db.New` for legacy),
+so keep the CLI binary in step with the app.
+
+`read` resolves each hit's sender (name → number → conversation id) so results
+are legible without a second lookup, and accepts
 `--since`/`--until` (YYYY-MM-DD, local time; `--until` is inclusive to end of
 day) to scope a search to a date window. Date filtering lives in the store via
 `SearchFilter`/`SearchMessagesFiltered`; the legacy `SearchMessages(query,

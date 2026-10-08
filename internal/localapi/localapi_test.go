@@ -65,6 +65,31 @@ func TestStatusReachability(t *testing.T) {
 			t.Fatalf("auth data dir = %q", status.Auth.DataDir)
 		}
 	})
+
+	// The freshness block stays raw so a caller can show the daemon's
+	// silence verdict byte for byte.
+	t.Run("daemon reports freshness", func(t *testing.T) {
+		const silence = `{"silent_ms":46800000,"stalled":true,"rule":"expected_activity"}`
+		client := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			io.WriteString(w, `{"freshness":{"newest_ms":1791473060776,"google":{"stale":true,"silence":`+silence+`}}}`)
+		}))
+		status, _, err := client.Status(context.Background())
+		if err != nil {
+			t.Fatalf("Status() = %v", err)
+		}
+		if got := string(status.Freshness["newest_ms"]); got != "1791473060776" {
+			t.Fatalf("freshness.newest_ms = %s", got)
+		}
+		var google struct {
+			Silence json.RawMessage `json:"silence"`
+		}
+		if err := json.Unmarshal(status.Freshness["google"], &google); err != nil {
+			t.Fatalf("decode freshness.google: %v", err)
+		}
+		if string(google.Silence) != silence {
+			t.Fatalf("freshness.google.silence = %s, want %s", google.Silence, silence)
+		}
+	})
 }
 
 func TestSubmitTextSendsTokenAndDecodes(t *testing.T) {

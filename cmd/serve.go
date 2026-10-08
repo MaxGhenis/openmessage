@@ -115,14 +115,19 @@ func freshnessActivitySource(stack *v2Stack, legacy *db.Store, v2Primary bool) f
 		})
 	}
 	if legacy != nil {
-		return freshness.NewMessageActivity(legacy, map[string]string{
-			"sms":      "google",
-			"rcs":      "google",
-			"whatsapp": "whatsapp",
-			"signal":   "signal",
-		})
+		return freshness.NewMessageActivity(legacy, freshnessPlatformByStorage)
 	}
 	return nil
+}
+
+// freshnessPlatformByStorage maps stored message platforms to the status
+// platform keys freshness reports under. Google Messages stores SMS and RCS;
+// imports (gchat, imessage) have no live transport and no key.
+var freshnessPlatformByStorage = map[string]string{
+	"sms":      "google",
+	"rcs":      "google",
+	"whatsapp": "whatsapp",
+	"signal":   "signal",
 }
 
 func v2IngestCountersProvider(stack *v2Stack) func() map[string]ingest.CounterSnapshot {
