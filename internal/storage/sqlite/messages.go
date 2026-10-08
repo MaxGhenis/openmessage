@@ -585,6 +585,90 @@ func (r *MessageRepository) ImportMessage(
 	return nil
 }
 
+// InsertHistoricalMessage inserts a message recovered from fetched history,
+// with its attachments, only when no row already holds its primary key or its
+// (account, conversation, remote message) natural key. It never updates an
+// existing row: ProjectMessage and ImportMessage overwrite body, state,
+// occurrence time, sender and reply target unconditionally, which would let a
+// fetched copy resurrect a deleted row, revert an edit, or regress newer
+// content. inserted reports whether this call created the row; attachments are
+// recorded only then. Like ImportMessage it does not touch the inbox.
+func (r *MessageRepository) InsertHistoricalMessage(
+	ctx context.Context,
+	projection MessageProjection,
+) (inserted bool, err error) {
+	message := projection.Message
+	tx, err := r.store.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, fmt.Errorf("insert historical message %q: begin transaction: %w", message.MessageID, err)
+	}
+	defer tx.Rollback()
+
+	nowMS, err := r.nowMS("insert historical message")
+	if err != nil {
+		return false, err
+	}
+	result, err := tx.ExecContext(ctx, `
+		INSERT INTO messages (
+			message_id,
+			conversation_id,
+			account_id,
+			remote_message_id,
+			sender_identity_id,
+			direction,
+			body,
+			reply_to_remote_id,
+			state,
+			occurred_at_ms,
+			created_at_ms,
+			updated_at_ms
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT DO NOTHING
+	`,
+		message.MessageID,
+		message.ConversationID,
+		message.AccountID,
+		message.RemoteMessageID,
+		message.SenderIdentityID,
+		message.Direction,
+		message.Body,
+		message.ReplyToRemoteID,
+		message.State,
+		message.OccurredAtMS,
+		nowMS,
+		nowMS,
+	)
+	if err != nil {
+		return false, r.mapMessageWriteError(ctx, tx, message, err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("insert historical message %q: read rows affected: %w", message.MessageID, err)
+	}
+	if affected == 0 {
+		return false, nil
+	}
+	attachmentRepository := &MessageAttachmentRepository{store: r.store, now: r.now}
+	for _, attachment := range projection.Attachments {
+		attachment.MessageID = message.MessageID
+		if err := attachmentRepository.RecordInboundAttachment(ctx, tx, attachment); err != nil {
+			return false, fmt.Errorf(
+				"insert historical message %q: record attachment ordinal %d: %w",
+				message.MessageID,
+				attachment.Ordinal,
+				err,
+			)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		if isSQLiteConstraint(err) {
+			return false, invalidMessageConstraintError(nil, err, "commit historical message insert")
+		}
+		return false, fmt.Errorf("insert historical message %q: commit: %w", message.MessageID, err)
+	}
+	return true, nil
+}
+
 // ProjectMessage atomically upserts a normalized message by remote ID and
 // marks its source inbox row processed. A replay of an already-processed inbox
 // row returns without writing either timestamp.

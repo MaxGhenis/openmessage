@@ -27,6 +27,16 @@ type ConnectionSink interface {
 	Beat(generation Generation, aliveAt time.Time, detail string)
 }
 
+// HistoryIngressSink is an optional ConnectionSink extension for frames a
+// transport fetched on request (catch-up history) instead of receiving them on
+// its live channel. AppendHistoryIngress keeps AppendIngress's generation
+// fence and durable commit, but a history frame is not evidence that the live
+// connection delivered anything: implementations must not record it as
+// connection activity, and should count it apart from live ingress.
+type HistoryIngressSink interface {
+	AppendHistoryIngress(ctx context.Context, record RawIngressRecord) error
+}
+
 // Lifecycle owns transport connection generations.
 type Lifecycle interface {
 	// Start creates one owned connection generation. Run.Done must resolve when

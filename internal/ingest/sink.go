@@ -33,7 +33,10 @@ type Sink struct {
 	ids      messaging.IDSource
 }
 
-var _ bridge.ConnectionSink = (*Sink)(nil)
+var (
+	_ bridge.ConnectionSink     = (*Sink)(nil)
+	_ bridge.HistoryIngressSink = (*Sink)(nil)
+)
 
 // RecordIngressError counts a capture or append fault surfaced by a transport
 // adapter. The frame itself was logged and dropped at the transport edge; the
@@ -73,6 +76,17 @@ func NewSink(config SinkConfig) (*Sink, error) {
 // AppendIngress validates and durably inserts exactly one raw frame before a
 // best-effort, non-blocking worker notification.
 func (s *Sink) AppendIngress(ctx context.Context, record bridge.RawIngressRecord) error {
+	return s.append(ctx, record, false)
+}
+
+// AppendHistoryIngress appends a frame a catch-up fetched on request. It is
+// stored and projected exactly like live ingress, but counted under the
+// history counters so appended/deduped keep describing the live channel.
+func (s *Sink) AppendHistoryIngress(ctx context.Context, record bridge.RawIngressRecord) error {
+	return s.append(ctx, record, true)
+}
+
+func (s *Sink) append(ctx context.Context, record bridge.RawIngressRecord, history bool) error {
 	if err := validateIngress(ctx, record); err != nil {
 		return err
 	}
@@ -105,9 +119,14 @@ func (s *Sink) AppendIngress(ctx context.Context, record bridge.RawIngressRecord
 
 	counters := s.counters.account(record.AccountID)
 	replay := effectiveID != inboxID
-	if replay {
+	switch {
+	case history && replay:
+		counters.historyDeduped.Add(1)
+	case history:
+		counters.historyAppended.Add(1)
+	case replay:
 		counters.deduped.Add(1)
-	} else {
+	default:
 		counters.appended.Add(1)
 	}
 	s.worker.enqueue(workItem{
