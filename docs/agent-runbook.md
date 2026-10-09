@@ -474,11 +474,11 @@ hung daemon, and it alerts when the daemon is up but a platform has gone
 quiet.
 
 This section follows the script's code on Max's local dotfiles `master` at
-`c30e106` (2026-10-08), plus the `append_errors` alert (`27df7b3`). The
-script's header comment summarizes the checks but
-is incomplete: it leaves out the inbox-read alert, the parse-error path and
-the `STATE`/`LOG` overrides, and it lists a top-level `projection_stalled`
-check that never fires (the daemon publishes that flag inside `freshness`).
+`7de27cc` (2026-10-08), plus the `append_errors` alert (`27df7b3`). Later
+commits on `master` aren't covered yet. The script's header comment summarizes
+the checks but is incomplete: it leaves out the inbox-read alert and the
+parse-error path, and it lists a top-level `projection_stalled` check that
+never fires (the daemon publishes that flag inside `freshness`).
 launchd runs the working-tree file, so editing it, or checking out another
 branch in `~/dotfiles`, changes live behavior within 5 minutes. Try changes on
 a copy ([testing a change](#testing-a-change)).
@@ -492,15 +492,23 @@ a copy ([testing a change](#testing-a-change)).
 - State: `~/.local/state/openmessage-watchdog/` holds `consecutive_fails`,
   `last_action_epoch` (the relaunch throttle), the episode counters
   `disc_<platform>` and `repair_google`, one `alert_<key>` cooldown stamp
-  per alert (epoch seconds; deleting one re-arms that alert), and
-  `append_errors` (see the `append_errors` alert below).
+  per alert (epoch seconds; deleting one re-arms that alert),
+  `append_errors` (see the `append_errors` alert below), and
+  `paired_<platform>`, the pairing state the watchdog last recorded (`1` or
+  `0`; a loss deferred by the cooldown stays `1` until it is announced).
+  Deleting a `paired_` file makes the platform's next unpaired run a first
+  sighting, which is only logged.
 - Loaded? `launchctl list | grep openmessage-watchdog`.
 
 ### Relaunching a dead or hung daemon
 
 A run first skips, logging why, if the `watchdog-disabled` flag exists
-([parking it](#parking-the-launchd-watchdog)), if any process's command line
-contains `openmessage pair`, or if `/Applications/OpenMessage.app` is missing.
+([parking it](#parking-the-launchd-watchdog)), if a process is running
+`openmessage pair` by path or name (`pgrep -f
+'(^|/)openmessage[ ]pair( |$)'`), or if `/Applications/OpenMessage.app` is
+missing. Until 2026-10-08 that check matched any command line containing the
+phrase, including a grep for it and a test's `pgrep` stub; a stub made it skip
+live runs that day.
 Skipped runs neither count nor reset anything. Otherwise it fetches
 `http://127.0.0.1:7007/api/status` with a 5 s timeout. The probe fails when the
 reply doesn't contain the string `"connected"`: connection refused, no answer
@@ -551,7 +559,8 @@ in-app supervisors. It alerts on:
   than 5 minutes older than its newest in the legacy store, or the read store
   has no rows for a platform the legacy store has. It compares newest
   timestamps, not ingest delay, so a gap left in the past keeps it true
-  indefinitely;
+  indefinitely. Skipped for a platform whose status block says `paired` is
+  `false`;
 - a platform's newest received message
   (`freshness.<platform>.latest_received_ms`, or `latest_ms` if it has
   received nothing) more than 48 h older than
@@ -560,7 +569,8 @@ in-app supervisors. It alerts on:
   sends. The premise is that traffic elsewhere proves the pipe works, but the
   alert always says "while other platforms flow", even when the newer message
   is the platform's own send. A platform with no rows in the read store never
-  trips this check; only `proj_<platform>` catches it;
+  trips this check; only `proj_<platform>` catches it. Skipped for a platform
+  whose status block says `paired` is `false`;
 - no message, sent or received, on any platform for more than 24 h (key
   `all_quiet`). With WhatsApp and Signal unlinked this works as a Google
   silence alarm: it fired at 24, 30 and 36 h during the 2026-10-06 stall;
@@ -574,7 +584,19 @@ in-app supervisors. It alerts on:
   file).
   The alert names each failing account, as in "3 failed attempt(s) to
   append to v2 ingest (google-primary 3)";
-- Signal `receive_recovery.pending_count >= 5` (key `signal_recovery`);
+- Signal `receive_recovery.pending_count >= 5` (key `signal_recovery`). This
+  check doesn't look at pairing;
+- a platform whose `paired` was `true` on an earlier run and is now `false`
+  (stamp `alert_unlinked_<platform>`). The notification reads "No longer
+  paired: <platforms> - check the app; relink unless that was intended",
+  because `paired: false` is not always a deliberate unlink. Google's
+  server-side logout (`GaiaLoggedOut`) deletes the session file `paired` is
+  read from, whatsmeow's `device_removed` deletes the WhatsApp device store,
+  and a WhatsApp or Signal bridge that fails to start reports `paired: false`
+  with a `last_error`. A platform first seen unpaired (no `paired_<platform>`
+  file) is only logged, as `unpaired: <platform> - staleness alerts paused
+  until it is relinked`; a relink logs `paired again: <platform> - staleness
+  alerts resume`;
 - a paired, connected platform whose silence outlasts its own baseline, by
   the rule in
   [Google Messages silent while "connected"](#google-messages-silent-while-connected-the-phone-stopped-relaying).
@@ -587,9 +609,11 @@ in-app supervisors. It alerts on:
   - On an older daemon with v2 ingest enabled, the watchdog computes Google's
     verdict itself from `v2/store.sqlite3` (constants mirrored from
     `internal/freshness`), marks the alert "(watchdog estimate)" (key
-    `silent_google`), and lists it first so that it leads the notification. If
-    it can't read the inbox, it raises `silence_check` instead, at normal
-    priority. It skips this whenever any platform publishes a `silence` block.
+    `silent_google`), and lists it first so that it leads the notification,
+    unless a lost pairing is announced in the same run, which goes ahead of
+    it. If it can't read the inbox, it raises `silence_check` instead, at
+    normal priority. It skips this whenever any platform publishes a
+    `silence` block.
 
   To see which applies, run
   `curl -s http://127.0.0.1:7007/api/status | jq '.freshness.google.silence'`.
@@ -601,9 +625,10 @@ in-app supervisors. It alerts on:
 ### How alerts repeat
 
 Each run posts at most one macOS notification: its first fresh alert, plus
-"(+N more - see log)" when there are others. The log has each alert as
-`ALERT: …` and the notification as `NOTIFY: …`. A `NOTIFY:` line records the
-attempt, not that macOS showed it.
+"(+N more - see log)" when there are others. A lost pairing always goes first,
+as one alert naming every platform announced in that run. The log has each
+alert as `ALERT: …` and the notification as `NOTIFY: …`. A `NOTIFY:` line
+records the attempt, not that macOS showed it.
 
 - The disconnect and `needs_repair` alerts count consecutive answered runs and
   notify once, when the count reaches 3, so one notification covers the whole
@@ -647,17 +672,30 @@ attempt, not that macOS showed it.
   `append_errors baseline reset: backend restarted (…)` with the number
   carried. A run whose status has no accounts under `v2_ingest.per_account`
   leaves the state alone.
+- A lost pairing is announced once per change. If the platform's previous
+  lost-pairing notification was less than 6 hours ago, the run logs
+  `suppressed (cooldown): unlinked_<platform>` and leaves `paired_<platform>`
+  at `1`, so later runs retry and it goes out on the first run 6 hours after
+  the previous one, if the platform is still unpaired then. A relink in the
+  meantime logs nothing, since the stored state never left paired.
 - If `/api/status` contains `"connected"` but isn't valid JSON, the run logs
   `status parse error: …` and checks nothing else.
 
 Consequences worth knowing:
 
-- Only the disconnect and silence checks look at pairing. The trailing,
-  projection and Signal-recovery checks don't, so a platform left unlinked
-  keeps alerting. On 2026-10-08, with WhatsApp and Signal unlinked, the
-  notification every 6 hours read "signal projection stalled (+2 more - see
-  log)" (the other two are `behind_signal` and `behind_whatsapp`), and it can
+- The trailing and projection checks skip a platform whose status says
+  `paired: false`; the Signal-recovery check doesn't. Before dotfiles
+  `7de27cc` (2026-10-08) neither skipped it: with WhatsApp and Signal
+  unlinked, the watchdog re-notified every 6 hours from 2026-09-03, and from
+  2026-09-20 the notification read "signal projection stalled (+2 more - see
+  log)" (the other two are `behind_signal` and `behind_whatsapp`), which could
   hide a new alert raised in the same run.
+- `paired: false` doesn't say why. A bridge that failed to start looks like
+  an unlink, so after its one lost-pairing notification its staleness alerts
+  stay paused; check `last_error` in `/api/status`. A platform relinked while
+  still more than 48 h behind alerts `behind_<platform>` on the first run
+  that sees it paired (if its `behind_` stamp is at least 6 hours old), and
+  every 6 hours after until it receives a message.
 - `quarantined` is an in-memory counter that starts at zero whenever the
   backend starts. Any backend restart (an app or watchdog relaunch, or the app
   restarting `openmessage serve`) therefore stops the alert. The quarantined
@@ -689,11 +727,11 @@ Consequences worth knowing:
 
 `OPENMESSAGE_WATCHDOG_DRYRUN=1` logs decisions without relaunching or
 notifying, but it still writes state: `consecutive_fails`, the episode
-counters, the `alert_<key>` stamps (not the relaunch stamp) and the
-`append_errors` file. Run against the real state dir, it can swallow the next
-real alert: a stamped key stays quiet for 6 hours, an episode counter pushed
-past 3 never alerts, and an `append_errors` count marked reported never
-alerts. Point
+counters, the `paired_<platform>` files, the `alert_<key>` stamps (not the
+relaunch stamp) and the `append_errors` file. Run against the real state dir,
+it can swallow the next real alert: a stamped key stays quiet for 6 hours, an
+episode counter pushed past 3 never alerts, an `append_errors` count marked
+reported never alerts, and a lost pairing it records is never announced. Point
 `OPENMESSAGE_WATCHDOG_STATE` and `OPENMESSAGE_WATCHDOG_LOG` at a scratch
 directory and run a copy of the script:
 
@@ -712,6 +750,19 @@ payload, set `OPENMESSAGE_WATCHDOG_PORT` to a stub server that serves it at
 relaunch path. Repeated dry runs of the relaunch path count past the threshold
 (`4/3`, `5/3`, …), because only a real relaunch or an answered probe resets
 the counter.
+
+Two more overrides exist for tests. `OPENMESSAGE_WATCHDOG_APP` replaces the
+`/Applications/OpenMessage.app` existence check (the relaunch still opens the
+app by name). `OPENMESSAGE_WATCHDOG_NOW` (epoch seconds) pins the clock for
+the cooldowns, the relaunch throttle and the python block's `now_ms`; the
+silence estimate still reads the wall clock.
+`~/dotfiles/tests/test_openmessage_watchdog.py` runs the real script against a
+fixture daemon with all of this sandboxed and stub
+`osascript`/`open`/`pgrep`/`pkill` first on `PATH`:
+
+```bash
+cd ~/dotfiles && PYTHONDONTWRITEBYTECODE=1 pytest -q -p no:cacheprovider tests/test_openmessage_watchdog.py
+```
 
 ### Reading the backend's os_log
 
@@ -758,11 +809,11 @@ done, whatever the outcome. Nothing ages it out. A flag forgotten from
 has no frames from any platform between 08-20 18:55 and 09-03 16:03. If alerts
 seem to have stopped, `tail` the log first; a parked watchdog says so on every
 run. The watchdog also skips while an `openmessage pair` process is running,
-but that check matches any command line containing the string, so don't rely
-on it for multi-step procedures. The quick deploy recipe below doesn't need
-parking if the app is back within a few minutes: with no app process, a
-relaunch takes two failed probes 5 minutes apart, and the watchdog skips while
-`/Applications/OpenMessage.app` is missing.
+but only while it runs, so don't rely on it for multi-step procedures. The
+quick deploy recipe below doesn't need parking if the app is back within a few
+minutes: with no app process, a relaunch takes two failed probes 5 minutes
+apart, and the watchdog skips while `/Applications/OpenMessage.app` is
+missing.
 
 ## Pairing & the "zombie session"
 
