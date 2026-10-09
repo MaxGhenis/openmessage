@@ -168,26 +168,33 @@ func (s *Source) LatestConversationPreviews(ids []string) (map[string]string, er
 		unique = append(unique, id)
 	}
 	previews := make(map[string]string, len(unique))
+	if len(unique) == 0 {
+		return previews, nil
+	}
+	// One read for every conversation's newest message and one for their
+	// ordinal-0 attachments, instead of two statements per conversation.
+	latest, err := s.messages.LatestMessagesForConversations(context.Background(), unique)
+	if err != nil {
+		return nil, err
+	}
+	latestIDs := make([]string, 0, len(latest))
 	for _, conversationID := range unique {
-		messages, err := s.messages.ListMessagesByConversation(
-			context.Background(), conversationID, 0, "", 1,
-		)
-		if err != nil {
-			return nil, err
+		if message, ok := latest[conversationID]; ok {
+			latestIDs = append(latestIDs, message.MessageID)
 		}
-		if len(messages) == 0 {
+	}
+	attachments, err := s.attachments.ListForDownload(context.Background(), latestIDs, 0)
+	if err != nil {
+		return nil, err
+	}
+	for _, conversationID := range unique {
+		message, ok := latest[conversationID]
+		if !ok {
 			continue
-		}
-		message := messages[0]
-		attachment, hasAttachment, err := s.messageAttachment(
-			context.Background(), message.MessageID,
-		)
-		if err != nil {
-			return nil, err
 		}
 		mediaID := ""
 		mimeType := ""
-		if hasAttachment {
+		if attachment, hasAttachment := attachments[message.MessageID]; hasAttachment {
 			mediaID = "v2msg:" + message.MessageID + ":0"
 			mimeType = attachment.MIME
 		}
