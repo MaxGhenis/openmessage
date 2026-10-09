@@ -89,7 +89,8 @@ func TestSMSPathStatusLineCoversEveryReason(t *testing.T) {
 		Silence:          61 * time.Hour,
 		ArrivalsPerDay:   5.8,
 		ExpectedArrivals: 14.7,
-		ActiveDays:       19,
+		BaselineSpan:     20 * 24 * time.Hour,
+		LongGaps:         3,
 		BaselineArrivals: 40,
 	}, cfg)
 	cases := map[string]string{
@@ -98,7 +99,7 @@ func TestSMSPathStatusLineCoversEveryReason(t *testing.T) {
 		freshness.SMSPathRCSQuiet:          "not an SMS-only failure",
 		freshness.SMSPathHistoryStale:      "could not be reloaded",
 		freshness.SMSPathFlowing:           "last incoming SMS 2026-10-03 16:16 (2d)",
-		freshness.SMSPathThinBaseline:      "SMS arrived on 19 of the 28 days before the last one, in 40 separate arrivals (needs 21 days and 10 arrivals)",
+		freshness.SMSPathThinBaseline:      "went a whole 24h without one 3 time(s) (allowed 1), over 20d of history (needs 21d) and 40 separate arrivals (needs 10)",
 		freshness.SMSPathNoHistory:         "no incoming SMS in the Google inbox",
 		freshness.SMSPathGoogleUnreachable: "no incoming SMS in the Google inbox",
 	}

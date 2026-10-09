@@ -12,7 +12,8 @@ import (
 // statusSMSPath judges whether carrier SMS has stopped reaching the phone while
 // RCS flows, from the v2 inbox: the only store that keeps the protobuf type
 // telling SMS from RCS. It uses the daemon's monitor and rule, and returns nil
-// when the read fails.
+// when the read fails. Unlike /api/status it cannot see whether the daemon
+// reaches the phone right now, so it never reports google_unreachable.
 func statusSMSPath(ctx context.Context, store ingest.GoogleInboxReader, now time.Time) *freshness.SMSPathReport {
 	report, ok := freshness.NewSMSPathMonitor(ingest.GoogleSMSPathLoader(store)).Report(ctx, now)
 	if !ok {
@@ -49,10 +50,12 @@ func smsPathStatusLine(report freshness.SMSPathReport) string {
 		return fmt.Sprintf("Google SMS: last incoming SMS %s.", since(report.LastSMSMS))
 	case freshness.SMSPathThinBaseline:
 		return fmt.Sprintf(
-			"Google SMS: not judged; SMS arrived on %d of the %d days before the last one, in %d "+
-				"separate arrivals (needs %d days and %d arrivals).",
-			report.ActiveDays, report.BaselineDays, report.BaselineArrivals,
-			report.MinActiveDays, report.MinBaselineArrivals)
+			"Google SMS: not judged; before the last SMS it went a whole %s without one %d time(s) "+
+				"(allowed %d), over %s of history (needs %s) and %d separate arrivals (needs %d).",
+			humanHours(time.Duration(report.WindowMS)*time.Millisecond), report.LongGaps, report.MaxLongGaps,
+			humanHours(time.Duration(report.BaselineSpanMS)*time.Millisecond),
+			humanHours(time.Duration(report.MinBaselineSpanMS)*time.Millisecond),
+			report.BaselineArrivals, report.MinBaselineArrivals)
 	default:
 		return "Google SMS: not judged; no incoming SMS in the Google inbox."
 	}
