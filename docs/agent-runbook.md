@@ -937,9 +937,8 @@ episode counters and their start files, the `paired_<platform>` files, the
 counter or time file it reads as damaged or later than its clock, the relaunch
 stamp included. With `OPENMESSAGE_WATCHDOG_NOW` pinned earlier than the
 stamps already in the state dir, it deletes each one it reads. Alert stamps
-and start times come back on that earlier clock when their condition holds,
-but a deleted relaunch stamp stays deleted, which lifts the throttle. Run
-against the real state dir, it can swallow the next real alert:
+and start times may come back on that earlier clock, but a deleted relaunch
+stamp stays deleted, which lifts the throttle. Run against the real state dir, it can swallow the next real alert:
 a stamped key stays quiet for 6 hours, an episode counter pushed past 3 never
 alerts, an `append_errors` count marked reported never alerts, and a lost
 pairing it records is never announced. It also overwrites the live
