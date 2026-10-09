@@ -224,19 +224,100 @@ func TestDaemonSendMessageResolvesPlatformsWithoutTransports(t *testing.T) {
 		}
 	})
 
-	t.Run("sms without existing conversation", func(t *testing.T) {
+	t.Run("sms without existing conversation delegates thread creation to the daemon", func(t *testing.T) {
 		store, err := db.New(":memory:")
 		if err != nil {
 			t.Fatalf("create db: %v", err)
 		}
 		t.Cleanup(func() { store.Close() })
-		withReads := options
-		withReads.Reads = store
+
+		var createSaw map[string]any
+		var submitSaw map[string]any
+		mux := http.NewServeMux()
+		mux.HandleFunc("/api/status", func(w http.ResponseWriter, r *http.Request) {
+			json.NewEncoder(w).Encode(map[string]any{"v2_send": true, "v2_primary": true, "connected": true})
+		})
+		mux.HandleFunc("/api/new-conversation", func(w http.ResponseWriter, r *http.Request) {
+			if err := json.NewDecoder(r.Body).Decode(&createSaw); err != nil {
+				t.Errorf("decode new-conversation request: %v", err)
+			}
+			json.NewEncoder(w).Encode(map[string]any{
+				"conversation_id": "conv-new",
+				"name":            "+16505550100",
+			})
+		})
+		mux.HandleFunc("/api/v1/outbox/messages", func(w http.ResponseWriter, r *http.Request) {
+			if err := json.NewDecoder(r.Body).Decode(&submitSaw); err != nil {
+				t.Errorf("decode submit request: %v", err)
+			}
+			json.NewEncoder(w).Encode(map[string]any{"outbox_id": "out-1", "state": "queued"})
+		})
+		mux.HandleFunc("/api/v1/outbox/out-1", func(w http.ResponseWriter, r *http.Request) {
+			json.NewEncoder(w).Encode(map[string]any{
+				"outbox_id":         "out-1",
+				"state":             "confirmed",
+				"remote_message_id": "remote-1",
+			})
+		})
+
+		withReads := Options{Daemon: daemonClientFor(t, mux), Reads: store}
 		handler := daemonSendMessageHandler(withReads)
 
 		req := mcp.CallToolRequest{}
 		req.Params.Arguments = map[string]any{
-			"recipient": "+16505550100",
+			"recipient":       "+16505550100",
+			"message":         "hi",
+			"idempotency_key": "key-new",
+		}
+		result, err := handler(context.Background(), req)
+		if err != nil {
+			t.Fatalf("handler: %v", err)
+		}
+		if result.IsError {
+			t.Fatalf("expected success (create hop should have delegated to daemon), got %+v", result)
+		}
+		if createSaw == nil {
+			t.Fatal("daemon /api/new-conversation was never called for a brand-new SMS thread")
+		}
+		if createSaw["phone_number"] != "+16505550100" {
+			t.Fatalf("new-conversation phone_number = %v", createSaw["phone_number"])
+		}
+		if createSaw["platform"] != "sms" {
+			t.Fatalf("new-conversation platform = %v", createSaw["platform"])
+		}
+		if submitSaw == nil {
+			t.Fatal("daemon /api/v1/outbox/messages was never called after create")
+		}
+		if submitSaw["conversation_id"] != "conv-new" {
+			t.Fatalf("submit conversation_id = %v (want conv-new — the id returned by the create hop)", submitSaw["conversation_id"])
+		}
+		payload := structuredMap(t, result)
+		if payload["ok"] != true {
+			t.Fatalf("payload.ok = %v, want true", payload["ok"])
+		}
+	})
+
+	t.Run("sms create-hop 503 surfaces re-pair guidance", func(t *testing.T) {
+		store, err := db.New(":memory:")
+		if err != nil {
+			t.Fatalf("create db: %v", err)
+		}
+		t.Cleanup(func() { store.Close() })
+
+		mux := http.NewServeMux()
+		mux.HandleFunc("/api/status", func(w http.ResponseWriter, r *http.Request) {
+			json.NewEncoder(w).Encode(map[string]any{"v2_send": true, "v2_primary": true, "connected": true})
+		})
+		mux.HandleFunc("/api/new-conversation", func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, "google messages not connected", http.StatusServiceUnavailable)
+		})
+
+		withReads := Options{Daemon: daemonClientFor(t, mux), Reads: store}
+		handler := daemonSendMessageHandler(withReads)
+
+		req := mcp.CallToolRequest{}
+		req.Params.Arguments = map[string]any{
+			"recipient": "+16505550101",
 			"message":   "hi",
 		}
 		result, err := handler(context.Background(), req)
@@ -244,12 +325,12 @@ func TestDaemonSendMessageResolvesPlatformsWithoutTransports(t *testing.T) {
 			t.Fatalf("handler: %v", err)
 		}
 		if !result.IsError {
-			t.Fatal("expected error result for a brand-new SMS thread in client mode")
+			t.Fatal("expected error result when the app cannot reach Google Messages during create")
 		}
 		payload := structuredMap(t, result)
 		message, _ := payload["error"].(string)
-		if !strings.Contains(message, "no existing SMS conversation") {
-			t.Fatalf("sms error = %q", message)
+		if !strings.Contains(message, "Google Messages is not connected") {
+			t.Fatalf("expected re-pair guidance, got: %q", message)
 		}
 	})
 
