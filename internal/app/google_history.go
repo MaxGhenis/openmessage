@@ -60,11 +60,14 @@ type googleCatchUp struct {
 // history ingress under one lock, so history fetched with generation N's client
 // can only ever be handed to generation N. It returns nil when no client is
 // connected.
+//
+// The catch-up's client stops it after its first unanswered request
+// (failFastGMClient).
 func (a *App) beginGoogleCatchUp(reason string) *googleCatchUp {
 	if a.gmClient != nil {
 		return &googleCatchUp{
 			app:     a,
-			gm:      a.gmClient,
+			gm:      newFailFastGMClient(a.gmClient),
 			token:   a.gmClient,
 			reason:  reason,
 			history: a.gmHistory,
@@ -82,7 +85,7 @@ func (a *App) beginGoogleCatchUp(reason string) *googleCatchUp {
 	}
 	return &googleCatchUp{
 		app:     a,
-		gm:      newRealGMClient(cli.GM),
+		gm:      newFailFastGMClient(newRealGMClient(cli.GM)),
 		token:   cli.GM,
 		reason:  reason,
 		history: history,

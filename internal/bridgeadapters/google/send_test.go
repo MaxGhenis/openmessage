@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"go.mau.fi/mautrix-gmessages/pkg/libgm"
 	"go.mau.fi/mautrix-gmessages/pkg/libgm/gmproto"
 
 	"github.com/maxghenis/openmessage/internal/bridge"
@@ -1410,3 +1411,47 @@ func (panicReader) Read([]byte) (int, error) { panic("reader used before readine
 type errorReader struct{ err error }
 
 func (r errorReader) Read([]byte) (int, error) { return 0, r.err }
+
+// libgm fails a request the phone never answers (ErrPhoneNotResponding) and
+// every request still waiting when the client disconnects
+// (ErrConnectionClosed). The server has already accepted a send that fails
+// this way, so the phone may still deliver it: it must stay ambiguous (the
+// outbox records it as uncertain and never re-sends it). The conversation
+// lookup before the send has no side effect on the phone, so a lookup that
+// fails this way stays retryable.
+func TestSendTextUnansweredLibgmRequests(t *testing.T) {
+	for _, reason := range []error{libgm.ErrPhoneNotResponding, libgm.ErrConnectionClosed} {
+		t.Run(reason.Error(), func(t *testing.T) {
+			sendErr := &libgm.UnansweredRequestError{Action: gmproto.ActionType_SEND_MESSAGE, Reason: reason}
+			fake := &fakeTextSendClient{conversationResult: &gmproto.Conversation{}, sendErr: sendErr}
+			a := newTextSendTestAdapter(t, fake)
+			_, err := a.SendText(context.Background(), bridge.TextRequest{
+				Conversation: bridge.ConversationRef{RemoteID: "conversation-id"},
+				Body:         "hello",
+				RequestID:    "request-id",
+			})
+			failure := requireTextOpError(t, err)
+			if failure.Class != bridge.FailureTransient || failure.Dispatch == bridge.DispatchNotCalled ||
+				failure.Fingerprint != "google_text_send_failed" || !errors.Is(failure.Cause, reason) {
+				t.Fatalf("send failure = %+v, want an ambiguous transient failure wrapping %v", failure, reason)
+			}
+
+			lookupErr := &libgm.UnansweredRequestError{Action: gmproto.ActionType_GET_CONVERSATION, Reason: reason}
+			lookupFake := &fakeTextSendClient{conversationErr: lookupErr}
+			a = newTextSendTestAdapter(t, lookupFake)
+			_, err = a.SendText(context.Background(), bridge.TextRequest{
+				Conversation: bridge.ConversationRef{RemoteID: "conversation-id"},
+				Body:         "hello",
+				RequestID:    "request-id",
+			})
+			failure = requireTextOpError(t, err)
+			if failure.Class != bridge.FailureTransient || failure.Dispatch != bridge.DispatchNotCalled ||
+				!errors.Is(failure.Cause, reason) {
+				t.Fatalf("lookup failure = %+v, want a retryable not-called failure wrapping %v", failure, reason)
+			}
+			if lookupFake.sendCalls != 0 {
+				t.Fatalf("SendMessage calls = %d after a failed lookup, want 0", lookupFake.sendCalls)
+			}
+		})
+	}
+}
