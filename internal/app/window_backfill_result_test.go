@@ -281,6 +281,9 @@ func TestRecoveryRunGivesUpOnARequestThePhoneNeverAnswers(t *testing.T) {
 	if result.Errors == 0 {
 		t.Fatal("the missed deadline was not counted as an error")
 	}
+	if result.InboxOutcome != GooglePullError {
+		t.Fatalf("InboxOutcome = %q, want error for a missed INBOX deadline", result.InboxOutcome)
+	}
 	// After the first miss, later listings fail at once instead of each
 	// waiting out its own deadline.
 	if calls := gm.calls.Load(); calls != 1 {
@@ -368,5 +371,31 @@ func TestInboxOutcomeIgnoresOtherPulls(t *testing.T) {
 	a.recordGooglePull(a.gmClient, "targeted", "", 1, nil, true)
 	if result.InboxOutcome != GooglePullEmpty {
 		t.Fatalf("InboxOutcome = %q, want empty", result.InboxOutcome)
+	}
+}
+
+// panickingGM panics inside a listing, as a libgm bug would.
+type panickingGM struct{ mockGMClient }
+
+func (*panickingGM) ListConversationsWithCursor(int, gmproto.ListConversationsRequest_Folder, *gmproto.Cursor) (*gmproto.ListConversationsResponse, error) {
+	panic("libgm blew up")
+}
+
+func TestRecoveryRunPanicReachesTheCaller(t *testing.T) {
+	a := newTestApp(t, nil)
+	a.gmClient = &panickingGM{}
+	var recovered any
+	func() {
+		defer func() { recovered = recover() }()
+		a.RunGoogleWindowBackfill(time.UnixMilli(1_000), BackfillTriggerSilenceRecovery)
+	}()
+	// Before the deadline wrapper ran calls on their own goroutine, a libgm
+	// panic reached the caller, whose tick recovers it. It still must, or it
+	// takes the whole daemon down.
+	if recovered != "libgm blew up" {
+		t.Fatalf("recovered %v, want the libgm panic on the caller's goroutine", recovered)
+	}
+	if a.IsDeepBackfillRunning() {
+		t.Fatal("the backfill guard is still held after the panic")
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -945,7 +946,9 @@ func TestClassify(t *testing.T) {
 		{"recovered without an inbox record", RunResult{Connected: true, Listed: 10, Conversations: 2, Messages: 5, HistoryTeed: 7}, true, OutcomeRecovered},
 		{"aborted wins", RunResult{Connected: true, Aborted: true, Listed: 10, InboxOutcome: InboxEmpty}, false, OutcomeAborted},
 		{"inbox empty", RunResult{Connected: true, InboxOutcome: InboxEmpty}, false, OutcomeEmpty},
-		{"inbox empty while archive lists data", RunResult{Connected: true, Listed: 3, Conversations: 1, Messages: 4, HistoryTeed: 5, InboxOutcome: InboxEmpty}, false, OutcomeEmpty},
+		{"inbox empty, nothing listed anywhere", RunResult{Connected: true, InboxOutcome: InboxEmpty}, false, OutcomeEmpty},
+		{"inbox empty while archive lists data", RunResult{Connected: true, Listed: 3, Conversations: 1, Messages: 4, HistoryTeed: 5, InboxOutcome: InboxEmpty}, false, OutcomePartial},
+		{"inbox empty and archive listing failed", RunResult{Connected: true, Errors: 2, InboxOutcome: InboxEmpty}, false, OutcomePartial},
 		{"inbox without payload", RunResult{Connected: true, Listed: 3, InboxOutcome: InboxNoPayload}, false, OutcomeEmpty},
 		{"inbox listing failed", RunResult{Connected: true, Errors: 3, InboxOutcome: InboxError}, false, OutcomePartial},
 		{"inbox timed out but archive listed", RunResult{Connected: true, Listed: 4, Conversations: 1, Messages: 2, Errors: 1, HistoryTeed: 3, InboxOutcome: InboxError}, false, OutcomePartial},
@@ -955,7 +958,8 @@ func TestClassify(t *testing.T) {
 		{"every in-window fetch failed", RunResult{Connected: true, Listed: 10, Conversations: 3, Errors: 3, InboxOutcome: InboxOK}, false, OutcomePartial},
 		{"one in-window fetch empty", RunResult{Connected: true, Listed: 40, Conversations: 5, Messages: 60, EmptyConversations: 1, HistoryTeed: 65, InboxOutcome: InboxOK}, false, OutcomePartial},
 		{"fetch errors", RunResult{Connected: true, Listed: 10, Conversations: 2, Messages: 3, Errors: 1, HistoryTeed: 5, InboxOutcome: InboxOK}, false, OutcomePartial},
-		{"tee failures", RunResult{Connected: true, Listed: 10, Conversations: 2, Messages: 3, HistoryTeed: 4, HistoryTeeFailed: 1, InboxOutcome: InboxOK}, false, OutcomePartial},
+		{"tee failures when readers use v2", RunResult{Connected: true, Listed: 10, Conversations: 2, Messages: 3, HistoryTeed: 4, HistoryTeeFailed: 1, InboxOutcome: InboxOK}, true, OutcomePartial},
+		{"tee failures when readers use the legacy store", RunResult{Connected: true, Listed: 10, Conversations: 2, Messages: 3, HistoryTeed: 4, HistoryTeeFailed: 1, InboxOutcome: InboxOK}, false, OutcomeRecovered},
 		{"v2 missing", RunResult{Connected: true, Listed: 10, Conversations: 2, Messages: 3, InboxOutcome: InboxOK}, true, OutcomePartial},
 		{"v2 not required", RunResult{Connected: true, Listed: 10, Conversations: 2, Messages: 3, InboxOutcome: InboxOK}, false, OutcomeRecovered},
 		{"nothing in window", RunResult{Connected: true, Listed: 10, InboxOutcome: InboxOK}, true, OutcomeNothingInWindow},
@@ -1035,8 +1039,8 @@ func TestFailedBaselineReadKeepsTheGapUntilItCanBeJudged(t *testing.T) {
 	if saved := h.savedState(); len(saved.Unjudged) != 1 {
 		t.Fatalf("the unjudged gap was not saved at once: %+v", saved.Unjudged)
 	}
-	if !strings.Contains(h.rec.Snapshot().ActivityError, "database is locked") {
-		t.Fatalf("baseline failure not reported: %q", h.rec.Snapshot().ActivityError)
+	if !strings.Contains(h.rec.Snapshot().BaselineError, "database is locked") {
+		t.Fatalf("baseline failure not reported: %q", h.rec.Snapshot().BaselineError)
 	}
 	at := end.Add(2 * time.Minute)
 	for i := 0; i < 60 && h.rec.State().Pending == nil && len(h.rec.State().History) == 0; i++ {
@@ -1094,8 +1098,8 @@ func TestQuietBaselineErrorsAreReported(t *testing.T) {
 	h.source.betweenErr = func(time.Time, time.Time) error { return errors.New("database is locked") }
 	h.tickAt(last.Add(20 * time.Hour))
 	snap := h.rec.Snapshot()
-	if !strings.Contains(snap.ActivityError, "database is locked") {
-		t.Fatalf("activity error during a quiet silence = %q", snap.ActivityError)
+	if !strings.Contains(snap.BaselineError, "database is locked") {
+		t.Fatalf("baseline error during a quiet silence = %q", snap.BaselineError)
 	}
 	if snap.Flagged != nil {
 		t.Fatalf("flagged without a baseline: %+v", snap.Flagged)
@@ -1338,8 +1342,9 @@ func TestMergePullsTheNextAttemptIn(t *testing.T) {
 	second2 := at2.Add(17 * time.Hour)
 	h2.source.add(second2)
 	h2.tickAt(second2.Add(time.Second))
-	if got := h2.rec.State().Pending.NextAttemptMS; got != due {
-		t.Fatalf("next attempt moved from %d to %d by a merge", due, got)
+	// The overdue attempt now waits for the new silence to settle too.
+	if got := h2.rec.State().Pending.NextAttemptMS; got <= due || got != second2.Add(h2.cfg.Settle).UnixMilli() {
+		t.Fatalf("next attempt %d after a merge, want the newer silence's settle %d", got, second2.Add(h2.cfg.Settle).UnixMilli())
 	}
 }
 
@@ -1481,5 +1486,305 @@ func TestNoticesSurviveAHistoryBurst(t *testing.T) {
 	}
 	if got := h.rec.Snapshot().Notice; got != tooLarge {
 		t.Fatalf("notice after a burst of later episodes = %q, want it kept", got)
+	}
+}
+
+func TestEarlierLateJudgedGapExtendsThePendingWindow(t *testing.T) {
+	h := newHarness(t, day)
+	last := busyBaseline(h.source, day, 14)
+	h.tickAt(last.Add(time.Second))
+	endA := last.Add(20 * time.Hour)
+	endB := endA.Add(20 * time.Hour)
+	h.source.add(endA, endB)
+	fromA, _ := freshness.BaselineRange(last, newYork, h.cfg.Silence)
+	failOnce := true
+	h.source.betweenErr = func(from, _ time.Time) error {
+		if from.Equal(fromA) && failOnce {
+			failOnce = false
+			return errors.New("database is locked")
+		}
+		return nil
+	}
+	h.tickAt(endB.Add(30 * time.Second)) // B pending, A unjudged
+	if pending := h.rec.State().Pending; pending == nil || pending.LastEventMS != endA.UnixMilli() {
+		t.Fatalf("pending = %+v, want B (the silence after A's end)", pending)
+	}
+	h.tickAt(endB.Add(90 * time.Second)) // A judged stalled: it takes over
+	pending := h.rec.State().Pending
+	if pending == nil || pending.LastEventMS != last.UnixMilli() || pending.SinceMS != last.Add(-h.cfg.Margin).UnixMilli() ||
+		len(pending.Covers) != 1 || pending.Covers[0].LastEventMS != endA.UnixMilli() {
+		t.Fatalf("pending = %+v, want A owning the window with B covered", pending)
+	}
+	if pending.NextAttemptMS < endB.Add(h.cfg.Settle).UnixMilli() {
+		t.Fatalf("next attempt %d before B settled", pending.NextAttemptMS)
+	}
+	h.tickAt(endB.Add(3 * time.Minute))
+	if h.runner.callCount() != 1 || h.runner.calls[0].After(last.Add(-h.cfg.Margin)) {
+		t.Fatalf("calls = %v, want one run from %v or earlier", h.runner.calls, last.Add(-h.cfg.Margin))
+	}
+}
+
+func TestLateJudgedGapJoinsAnEpisodeWaitingForGoogle(t *testing.T) {
+	h := newHarness(t, day)
+	last := busyBaseline(h.source, day, 14)
+	h.tickAt(last.Add(time.Second))
+	endA := last.Add(20 * time.Hour)
+	endB := endA.Add(20 * time.Hour)
+	h.source.add(endA, endB)
+	fromA, _ := freshness.BaselineRange(last, newYork, h.cfg.Silence)
+	failing := true
+	h.source.betweenErr = func(from, _ time.Time) error {
+		if from.Equal(fromA) && failing {
+			return errors.New("database is locked")
+		}
+		return nil
+	}
+	h.runner.ready, h.runner.reason = false, "disconnected"
+	at := endB.Add(time.Minute)
+	for i := 0; i < 24*60/30; i++ { // a day of failures while B waits
+		h.tickAt(at)
+		at = at.Add(30 * time.Minute)
+	}
+	failing = false
+	h.tickAt(at)
+	h.runner.ready, h.runner.reason = true, ""
+	h.tickAt(at.Add(time.Minute))
+	if h.runner.callCount() != 1 || h.runner.calls[0].After(last.Add(-h.cfg.Margin)) {
+		t.Fatalf("calls = %v, want one run reaching back to %v", h.runner.calls, last.Add(-h.cfg.Margin))
+	}
+	done := h.rec.State().History
+	if len(done) != 1 || done[0].LastEventMS != last.UnixMilli() || done[0].State != StateRecovered {
+		t.Fatalf("history = %+v", done)
+	}
+}
+
+func TestUnjudgedRetriesRotate(t *testing.T) {
+	h := newHarness(t, day)
+	last := time.Date(2026, 10, 5, 10, 0, 0, 0, newYork)
+	steadyAllDay(h.source, last)
+	h.tickAt(last.Add(time.Second))
+	// Five 25-hour gaps in a row, each starting on its own local day so each
+	// has its own baseline; the first four keep failing their baseline.
+	var lasts []time.Time
+	at := last
+	for i := 0; i < 5; i++ {
+		lasts = append(lasts, at)
+		at = at.Add(25 * time.Hour)
+		h.source.add(at)
+	}
+	failing := map[int64]bool{}
+	for _, l := range lasts[:4] {
+		from, _ := freshness.BaselineRange(l, newYork, h.cfg.Silence)
+		failing[from.UnixMilli()] = true
+	}
+	fifthFrom, _ := freshness.BaselineRange(lasts[4], newYork, h.cfg.Silence)
+	healthy := false
+	h.source.betweenErr = func(from, _ time.Time) error {
+		if failing[from.UnixMilli()] || (!healthy && from.Equal(fifthFrom)) {
+			return errors.New("database is locked")
+		}
+		return nil
+	}
+	h.tickAt(at.Add(time.Second)) // the walk: every baseline fails
+	if got := len(h.rec.State().Unjudged); got != 5 {
+		t.Fatalf("unjudged = %d, want 5", got)
+	}
+	healthy = true // only the fifth gap's baseline can be read now
+	before := h.source.betweenCalls
+	h.tickAt(at.Add(time.Minute))
+	if reads := h.source.betweenCalls - before; reads != maxUnjudgedPerTick {
+		t.Fatalf("%d baseline reads in a tick, want the cap %d", reads, maxUnjudgedPerTick)
+	}
+	h.runner.ready, h.runner.reason = false, "disconnected" // keep it pending to inspect
+	h.tickAt(at.Add(2 * time.Minute))
+	state := h.rec.State()
+	if len(state.Unjudged) != 4 || state.Pending == nil || state.Pending.LastEventMS != lasts[4].UnixMilli() {
+		t.Fatalf("after two ticks: unjudged %d, pending %+v; want the fifth gap judged despite four failing ahead of it", len(state.Unjudged), state.Pending)
+	}
+}
+
+func TestExpiringGapGetsOneLastRead(t *testing.T) {
+	h := newHarness(t, day)
+	last := busyBaseline(h.source, day, 14)
+	h.tickAt(last.Add(time.Second))
+	end := last.Add(40 * time.Hour)
+	h.source.add(end)
+	fromA, _ := freshness.BaselineRange(last, newYork, h.cfg.Silence)
+	failing := true
+	h.source.betweenErr = func(from, _ time.Time) error {
+		if from.Equal(fromA) && failing {
+			return errors.New("disk I/O error")
+		}
+		return nil
+	}
+	h.tickAt(end.Add(time.Second))
+	expiry := last.Add(-h.cfg.Margin).Add(h.cfg.MaxWindow)
+	// Just at the bound: still retried within the cap, still failing.
+	h.tickAt(expiry)
+	if len(h.rec.State().Unjudged) != 1 {
+		t.Fatal("expired at the bound, not past it")
+	}
+	failing = false // the baseline comes back just as the window expires
+	h.tickAt(expiry.Add(time.Millisecond))
+	state := h.rec.State()
+	if len(state.Unjudged) != 0 || len(state.History)+boolInt(state.Pending != nil) != 1 {
+		t.Fatalf("state = %+v", state)
+	}
+	if len(state.History) == 1 && state.History[0].State == StateUnjudged {
+		t.Fatal("a gap judgeable at expiry got the could-not-be-judged notice")
+	}
+}
+
+func boolInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+func TestUnjudgedFailuresSaveLazily(t *testing.T) {
+	h := newHarness(t, day)
+	h.cfg.PersistEvery = 365 * 24 * time.Hour
+	h.restart()
+	last := busyBaseline(h.source, day, 14)
+	h.tickAt(last.Add(time.Second))
+	end := last.Add(40 * time.Hour)
+	h.source.add(end)
+	fromA, _ := freshness.BaselineRange(last, newYork, h.cfg.Silence)
+	h.source.betweenErr = func(from, _ time.Time) error {
+		if from.Equal(fromA) {
+			return errors.New("database is locked")
+		}
+		return nil
+	}
+	h.tickAt(end.Add(time.Second))
+	saved := h.savedState()
+	if len(saved.Unjudged) != 1 || saved.Unjudged[0].Failures != 1 {
+		t.Fatalf("saved = %+v, want the new unjudged gap saved at once", saved.Unjudged)
+	}
+	for i := 1; i <= 10; i++ {
+		h.tickAt(end.Add(time.Duration(i) * time.Minute))
+	}
+	if got := h.rec.State().Unjudged[0].Failures; got != 11 {
+		t.Fatalf("in-memory failures = %d, want 11", got)
+	}
+	if got := h.savedState().Unjudged[0].Failures; got != 1 {
+		t.Fatalf("saved failures = %d: retries rewrote the file every tick", got)
+	}
+}
+
+func TestSettledGapIsSavedAtOnce(t *testing.T) {
+	h := newHarness(t, day)
+	h.cfg.PersistEvery = 365 * 24 * time.Hour
+	h.restart()
+	last := busyBaseline(h.source, day, 14)
+	h.tickAt(last.Add(time.Second))
+	end := last.Add(40 * time.Hour)
+	h.source.add(end)
+	fromA, _ := freshness.BaselineRange(last, newYork, h.cfg.Silence)
+	failOnce := true
+	h.source.betweenErr = func(from, _ time.Time) error {
+		if from.Equal(fromA) && failOnce {
+			failOnce = false
+			return errors.New("database is locked")
+		}
+		return nil
+	}
+	h.runner.ready, h.runner.reason = false, "disconnected"
+	h.tickAt(end.Add(time.Second))
+	h.tickAt(end.Add(time.Minute))
+	saved := h.savedState()
+	if len(saved.Unjudged) != 0 || saved.Pending == nil || saved.Pending.LastEventMS != last.UnixMilli() {
+		t.Fatalf("saved = %+v, want the settled gap's episode on disk", saved)
+	}
+}
+
+func TestRunWaitsWhileStateCantBeSaved(t *testing.T) {
+	h := newHarness(t, day)
+	last := busyBaseline(h.source, day, 14)
+	h.tickAt(last.Add(time.Second))
+	end := last.Add(20 * time.Hour)
+	h.source.add(end)
+	h.tickAt(end.Add(time.Second))
+	dir := filepath.Dir(h.path)
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(dir, 0o700) })
+	at := end.Add(3 * time.Minute)
+	h.tickAt(at)
+	pending := h.rec.State().Pending
+	if h.runner.callCount() != 0 || pending == nil || pending.Waiting != "state_not_saved" || pending.Attempts != 0 || pending.State != StatePending {
+		t.Fatalf("ran without a durable running state: calls %d, pending %+v", h.runner.callCount(), pending)
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	h.tickAt(at.Add(h.cfg.BusyRetry))
+	if h.runner.callCount() != 1 {
+		t.Fatalf("calls = %d once the state could be saved", h.runner.callCount())
+	}
+}
+
+func TestPreserveUnreadablePicksAFreshName(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, StateFileName)
+	now := time.UnixMilli(1_700_000_000_000)
+	taken := fmt.Sprintf("%s.unreadable-%d", path, now.UnixMilli())
+	if err := os.WriteFile(taken, []byte("older backup"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("{bad"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	aside, err := preserveUnreadable(path, now)
+	if err != nil || aside != taken+"-1" {
+		t.Fatalf("aside = %q, %v; want %q", aside, err, taken+"-1")
+	}
+	if data, _ := os.ReadFile(taken); string(data) != "older backup" {
+		t.Fatalf("the older backup was overwritten: %q", data)
+	}
+}
+
+func TestPreserveUnreadableCopiesWhenItCantMove(t *testing.T) {
+	saved := renameUnreadable
+	renameUnreadable = func(string, string) error { return errors.New("cross-device link") }
+	t.Cleanup(func() { renameUnreadable = saved })
+	dir := t.TempDir()
+	path := filepath.Join(dir, StateFileName)
+	if err := os.WriteFile(path, []byte("{bad"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	aside, err := preserveUnreadable(path, time.UnixMilli(5))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if data, _ := os.ReadFile(aside); string(data) != "{bad" {
+		t.Fatalf("copy = %q", data)
+	}
+}
+
+func TestPreserveUnreadableReportsAStatError(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "not-a-dir")
+	if err := os.WriteFile(file, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// The state path sits under a regular file: every stat of a name next to
+	// it fails with "not a directory", which must not loop forever.
+	path := filepath.Join(file, StateFileName)
+	done := make(chan struct{})
+	var rec *Recoverer
+	go func() {
+		rec = New(testConfig(), nil, nil, path, zerolog.Nop())
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("New hung on an unreadable state path")
+	}
+	if rec.Snapshot().StateLoadError == "" {
+		t.Fatal("no load error reported")
 	}
 }
