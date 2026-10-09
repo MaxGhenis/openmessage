@@ -734,6 +734,99 @@ func TestUpsertConversationMatchesUnguardedUpsertProperty(t *testing.T) {
 	}
 }
 
+// Every guarded column, changed on its own (NULL transitions included),
+// still writes the row and moves its update time; the same values write
+// nothing. Random sequences reach single-column changes only sometimes, so
+// this pins each guard term directly.
+func TestUpsertGuardsWriteEveryChangedColumn(t *testing.T) {
+	store := openGuardTestStore(t)
+	defer closeGuardTestStore(t, store)
+	mustRepositoryWrite(t, "seed account", store.UpsertAccount(repositoryTestAccount("account-a")))
+	installWriteCounter(t, store, "identities", "conversations")
+
+	identity := repositoryTestIdentity("identity-a", "account-a", "+15550000001")
+	mustRepositoryWrite(t, "seed identity", store.UpsertIdentity(identity))
+	identityChanges := map[string]func(*Identity){
+		"raw_value":      func(i *Identity) { i.RawValue = "raw-changed" },
+		"display_name":   func(i *Identity) { i.DisplayName = "Named" },
+		"is_self":        func(i *Identity) { i.IsSelf = !i.IsSelf },
+		"metadata_json":  func(i *Identity) { i.MetadataJSON = `{"changed":true}` },
+		"display_name()": func(i *Identity) { i.DisplayName = "" },
+	}
+	nowMS := repositoryTestTimeMS
+	for _, column := range []string{"raw_value", "display_name", "is_self", "metadata_json", "display_name()"} {
+		nowMS += 10
+		before := rowWrites(t, store, "identities")
+		identity.UpdatedAtMS = nowMS
+		mustRepositoryWrite(t, "UpsertIdentity(same)", store.UpsertIdentity(identity))
+		if got := rowWrites(t, store, "identities") - before; got != 0 {
+			t.Fatalf("unchanged identity before %s change wrote %d rows", column, got)
+		}
+		identityChanges[column](&identity)
+		mustRepositoryWrite(t, "UpsertIdentity("+column+")", store.UpsertIdentity(identity))
+		stored, err := store.GetIdentity("identity-a")
+		mustRepositoryRead(t, "GetIdentity", err)
+		if got := rowWrites(t, store, "identities") - before; got != 1 || stored.UpdatedAtMS != nowMS {
+			t.Fatalf("identity %s change wrote %d rows, updated_at %d; want 1 row at %d", column, got, stored.UpdatedAtMS, nowMS)
+		}
+		want := identity
+		want.CreatedAtMS = repositoryTestTimeMS
+		if stored != want {
+			t.Fatalf("identity after %s change = %+v, want %+v", column, stored, want)
+		}
+	}
+
+	revision, other := "v1", "v2"
+	archived, archivedLater := int64(0), int64(7)
+	conversation := Conversation{
+		ConversationID:       "conversation-a",
+		AccountID:            "account-a",
+		RemoteConversationID: "remote-a",
+		Kind:                 ConversationKindDirect,
+		NotificationMode:     NotificationModeAll,
+		MetadataJSON:         `{}`,
+		CreatedAtMS:          repositoryTestTimeMS,
+		UpdatedAtMS:          repositoryTestTimeMS,
+	}
+	mustRepositoryWrite(t, "seed conversation", store.UpsertConversation(conversation))
+	conversationChanges := []struct {
+		column string
+		change func(*Conversation)
+	}{
+		{"kind", func(c *Conversation) { c.Kind = ConversationKindGroup }},
+		{"title", func(c *Conversation) { c.Title = "Title" }},
+		{"remote_revision (NULL to value)", func(c *Conversation) { c.RemoteRevision = &revision }},
+		{"remote_revision (value to value)", func(c *Conversation) { c.RemoteRevision = &other }},
+		{"remote_revision (value to NULL)", func(c *Conversation) { c.RemoteRevision = nil }},
+		{"notification_mode", func(c *Conversation) { c.NotificationMode = NotificationModeMuted }},
+		{"is_favorite", func(c *Conversation) { c.IsFavorite = true }},
+		{"archived_at_ms (NULL to 0)", func(c *Conversation) { c.ArchivedAtMS = &archived }},
+		{"archived_at_ms (0 to 7)", func(c *Conversation) { c.ArchivedAtMS = &archivedLater }},
+		{"archived_at_ms (7 to NULL)", func(c *Conversation) { c.ArchivedAtMS = nil }},
+		{"last_message_at_ms", func(c *Conversation) { c.LastMessageAtMS = 42 }},
+		{"metadata_json", func(c *Conversation) { c.MetadataJSON = `{"changed":true}` }},
+	}
+	for _, step := range conversationChanges {
+		nowMS += 10
+		before := rowWrites(t, store, "conversations")
+		conversation.UpdatedAtMS = nowMS
+		mustRepositoryWrite(t, "UpsertConversation(same)", store.UpsertConversation(conversation))
+		if got := rowWrites(t, store, "conversations") - before; got != 0 {
+			t.Fatalf("unchanged conversation before %s change wrote %d rows", step.column, got)
+		}
+		step.change(&conversation)
+		mustRepositoryWrite(t, "UpsertConversation("+step.column+")", store.UpsertConversation(conversation))
+		stored, err := store.GetConversation("conversation-a")
+		mustRepositoryRead(t, "GetConversation", err)
+		if got := rowWrites(t, store, "conversations") - before; got != 1 || stored.UpdatedAtMS != nowMS {
+			t.Fatalf("conversation %s change wrote %d rows, updated_at %d; want 1 row at %d", step.column, got, stored.UpdatedAtMS, nowMS)
+		}
+		if !reflect.DeepEqual(stored, conversation) {
+			t.Fatalf("conversation after %s change = %+v, want %+v", step.column, stored, conversation)
+		}
+	}
+}
+
 // seedRosterGraph seeds two accounts, their identities and conversations for
 // the roster properties.
 func seedRosterGraph(t *testing.T, store *Store) {
@@ -1187,7 +1280,8 @@ func TestSyncConversationParticipantsUnchangedRosterTakesNoWriteLock(t *testing.
 	if err != nil || changed {
 		t.Fatalf("SyncConversationParticipants(unchanged) under a held write lock = (%v, %v), want (false, nil)", changed, err)
 	}
-	if elapsed := time.Since(started); elapsed > time.Second {
+	// A sync that took the lock would wait out the 5 s busy timeout.
+	if elapsed := time.Since(started); elapsed > 3*time.Second {
 		t.Fatalf("unchanged roster sync waited %s behind the write lock", elapsed)
 	}
 }
