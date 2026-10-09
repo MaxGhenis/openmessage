@@ -374,7 +374,8 @@ hung daemon, and it alerts when the daemon is up but a platform has gone
 quiet.
 
 This section follows the script's code on Max's local dotfiles `master` at
-`c30e106` (2026-10-08). The script's header comment summarizes the checks but
+`c30e106` (2026-10-08), plus the `append_errors` alert (`27df7b3`). The
+script's header comment summarizes the checks but
 is incomplete: it leaves out the inbox-read alert, the parse-error path and
 the `STATE`/`LOG` overrides, and it lists a top-level `projection_stalled`
 check that never fires (the daemon publishes that flag inside `freshness`).
@@ -390,8 +391,9 @@ a copy ([testing a change](#testing-a-change)).
   staleness check was off, and the main log said nothing about it.
 - State: `~/.local/state/openmessage-watchdog/` holds `consecutive_fails`,
   `last_action_epoch` (the relaunch throttle), the episode counters
-  `disc_<platform>` and `repair_google`, and one `alert_<key>` cooldown stamp
-  per alert (epoch seconds; deleting one re-arms that alert).
+  `disc_<platform>` and `repair_google`, one `alert_<key>` cooldown stamp
+  per alert (epoch seconds; deleting one re-arms that alert), and
+  `append_errors` (see the `append_errors` alert below).
 - Loaded? `launchctl list | grep openmessage-watchdog`.
 
 ### Relaunching a dead or hung daemon
@@ -463,6 +465,15 @@ in-app supervisors. It alerts on:
   `all_quiet`). With WhatsApp and Signal unlinked this works as a Google
   silence alarm: it fired at 24, 30 and 36 h during the 2026-10-06 stall;
 - v2 ingest `quarantined` above 0, summed over accounts (key `quarantine`);
+- v2 ingest `append_errors`, summed over accounts, above the count the
+  watchdog has already reported (key `append_errors`). PR #195 makes the
+  daemon count failed attempts to append a captured Google, WhatsApp or
+  Signal frame to the v2 inbox (a replayed Signal line that fails again
+  counts again). Daemons built before #195 always report 0 here, so only
+  attempts a #195 daemon counted can reach this alert (or a damaged state
+  file).
+  The alert names each failing account, as in "3 failed attempt(s) to
+  append to v2 ingest (google-primary 3)";
 - Signal `receive_recovery.pending_count >= 5` (key `signal_recovery`);
 - a paired, connected platform whose silence outlasts its own baseline, by
   the rule in
@@ -508,6 +519,34 @@ attempt, not that macOS showed it.
   together therefore stay in lockstep, and one that is never first only ever
   shows up as "+N more". Stamps aren't cleared when a condition clears, so a
   recurrence within 6 hours stays silent.
+- `append_errors` alerts on growth, not while a condition holds, because the
+  daemon keeps the count for the life of its process. The state file
+  `append_errors` holds the `append_errors` and `appended` sums from the last
+  run that saw accounts, the count already reported, attempts carried over a
+  restart, and the listening backend's identity (PID and start time). A run
+  alerts when the sum is above the reported count (or attempts are carried)
+  and the `alert_append_errors` stamp is at least 6 hours old. A count that
+  stays flat never posts another banner, so deleting the stamp alone doesn't
+  repeat it; delete the `append_errors` file too. Growth inside the 6 hours
+  logs `suppressed (cooldown): append_errors (<sum>, last alert reported <n>)`
+  (plus `, <k> from before a restart` when attempts are carried) and is
+  reported by the first run after it, as "N failed attempt(s) to append to v2
+  ingest, M since the last alert (…)". When another alert leads the run's
+  notification, it logs `deferred: append_errors …` and waits for a run it
+  leads, so it never appears only as "+N more".
+- The baseline goes back to 0 when the backend restarts: exactly one process
+  listens on the port and its PID or start time (read with `lsof` and `ps` in
+  UTC, so a time-zone change is not a restart) differs from the last one seen,
+  or either sum is lower than on the last run that saw accounts. No listener,
+  several, or a failed `lsof` leaves the identity unknown for that run, and
+  only the sums can show a restart. Attempts the watchdog saw but had not
+  reported yet are carried into the next alert ("…, and N more seen before the
+  backend restarted", or "N failed attempt(s) to append to v2 ingest before
+  the backend restarted" when the new backend has none). When the old count
+  was above 0, the reset is logged as
+  `append_errors baseline reset: backend restarted (…)` with the number
+  carried. A run whose status has no accounts under `v2_ingest.per_account`
+  leaves the state alone.
 - If `/api/status` contains `"connected"` but isn't valid JSON, the run logs
   `status parse error: …` and checks nothing else.
 
@@ -525,6 +564,21 @@ Consequences worth knowing:
   frames stay in the v2 `inbox` table, marked processed like frames that
   projected fine, and the cause is not stored (issue #161). Their inbox ids
   are only in the backend's `Quarantined ingest frame` log lines.
+- `append_errors` is the same kind of in-memory counter, but its banner
+  doesn't repeat for an unchanged count. In the state dir's `health.txt`
+  (rewritten by every run) the count is an `alert:` line on every run that
+  reads the status while it is above 0, reported or not, until the backend
+  restarts; attempts carried over a restart are listed until they are
+  reported, and on runs without
+  accounts the unreported remainder is listed instead. Failures after the
+  watchdog's last run that saw accounts and before a restart die with the old
+  process uncounted. When the identity is unknown on a run after a restart and
+  neither sum falls, that run takes the new backend for the old one: a count
+  at exactly the reported one stays silent, and "M since the last alert"
+  understates. The next run with a known identity sees the restart, and
+  attempts counted in between can then be reported a second time, so the
+  watchdog errs toward over-reporting. While `lsof` stays blind, only the sums
+  can show a restart.
 - Quarantine alerts recur: they appeared on 33 days between 2026-08-01 and
   10-08, many of them 6-hourly repeats of one unchanged count. The first
   surfaced three Google conversation snapshots quarantined over
@@ -535,9 +589,11 @@ Consequences worth knowing:
 
 `OPENMESSAGE_WATCHDOG_DRYRUN=1` logs decisions without relaunching or
 notifying, but it still writes state: `consecutive_fails`, the episode
-counters and the `alert_<key>` stamps (not the relaunch stamp). Run against
-the real state dir, it can swallow the next real alert: a stamped key stays
-quiet for 6 hours, and an episode counter pushed past 3 never alerts. Point
+counters, the `alert_<key>` stamps (not the relaunch stamp) and the
+`append_errors` file. Run against the real state dir, it can swallow the next
+real alert: a stamped key stays quiet for 6 hours, an episode counter pushed
+past 3 never alerts, and an `append_errors` count marked reported never
+alerts. Point
 `OPENMESSAGE_WATCHDOG_STATE` and `OPENMESSAGE_WATCHDOG_LOG` at a scratch
 directory and run a copy of the script:
 
