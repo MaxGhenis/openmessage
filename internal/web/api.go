@@ -4025,26 +4025,10 @@ func addSilence(
 
 	judge := func(platform string, last time.Time, events []time.Time, baselineUnavailable bool) {
 		verdict := freshness.EvaluateSilence(last, events, now, loc, cfg)
-		block := map[string]any{
-			"source":                       source.Name(),
-			"last_event_ms":                last.UnixMilli(),
-			"silent_ms":                    verdict.Silence.Milliseconds(),
-			"expected_active_hours":        freshness.RoundHours(verdict.ExpectedActiveHours),
-			"expected_active_hours_limit":  cfg.ExpectedActiveHoursLimit,
-			"max_silent_ms":                cfg.MaxSilence.Milliseconds(),
-			"long_silent_ms":               cfg.LongSilence.Milliseconds(),
-			"baseline_days":                cfg.BaselineDays,
-			"baseline_active_days":         verdict.BaselineActiveDays,
-			"baseline_events":              verdict.BaselineEvents,
-			"baseline_median_daily_events": verdict.BaselineMedianDailyEvents,
-			"evaluated":                    verdict.Evaluated,
-			"stalled":                      verdict.Stalled,
-			"rule":                         verdict.Rule,
-		}
-		if baselineUnavailable {
-			// Judged without a baseline: only the LongSilence floor can fire.
-			block["baseline_unavailable"] = true
-		}
+		// Judged without a baseline (baselineUnavailable), only the
+		// LongSilence floor can fire. `openmessage status` renders its local
+		// verdicts with the same SilenceBlock.
+		block := freshness.SilenceBlock(source.Name(), verdict, cfg, baselineUnavailable)
 		apply(platform, block, verdict.Stalled)
 	}
 

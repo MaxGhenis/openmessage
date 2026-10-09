@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -23,6 +24,13 @@ func openSMSPathTestStore(t *testing.T) (*sqlite.Store, func(at time.Time, id st
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = store.Close() })
+	return store, smsPathReceiver(t, store)
+}
+
+// smsPathReceiver returns a func that appends an incoming Google message frame
+// of the given protobuf type (field 11) to store's inbox, received at its time.
+func smsPathReceiver(t *testing.T, store *sqlite.Store) func(at time.Time, id string, messageType int64) {
+	t.Helper()
 	nowMS := time.Now().UnixMilli()
 	if err := store.UpsertAccount(sqlite.Account{
 		AccountID: "google-primary", BridgeKey: "google_messages", Mode: sqlite.AccountModeLive,
@@ -55,7 +63,7 @@ func openSMSPathTestStore(t *testing.T) (*sqlite.Store, func(at time.Time, id st
 			t.Fatal(err)
 		}
 	}
-	return store, receive
+	return receive
 }
 
 func TestStatusSMSPathFlagsSMSSilenceWhileRCSFlows(t *testing.T) {
@@ -79,6 +87,54 @@ func TestStatusSMSPathFlagsSMSSilenceWhileRCSFlows(t *testing.T) {
 		if !strings.Contains(line, want) {
 			t.Fatalf("line %q lacks %q", line, want)
 		}
+	}
+}
+
+// runStatus writes the SMS-path line to its own output and --json carries the
+// same verdict as google_sms_path; demo mode, like silence, judges nothing.
+func TestRunStatusReportsTheSMSPath(t *testing.T) {
+	now := time.Now().Truncate(time.Minute)
+	lastSMS := now.Add(-50 * time.Hour)
+	dataDir := t.TempDir()
+	seedStatusV2Store(t, dataDir, statusV2Seed{account: statusGoogleAccount, lastMessage: lastSMS})
+	store, err := sqlite.Open(filepath.Join(dataDir, "v2", "store.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	receive := smsPathReceiver(t, store)
+	for i := 0; i < 30*3; i++ { // three a day, eight hours apart, for 30 days
+		receive(lastSMS.Add(-time.Duration(i)*8*time.Hour), fmt.Sprintf("sms-%d", i), 1)
+	}
+	for i := 0; i < 49; i++ {
+		receive(lastSMS.Add(time.Duration(i+1)*time.Hour), fmt.Sprintf("rcs-%d", i), 4)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	session := openStatusSession(t, dataDir, true)
+	deps := statusDeps{daemon: downDaemon(t), now: func() time.Time { return now }}
+
+	text := runStatusOutput(t, session, deps, false)
+	if !strings.Contains(text, "\n⚠ Google SMS: no incoming SMS since "+fmtTS(lastSMS.UnixMilli())) {
+		t.Fatalf("status output lacks the stalled SMS-path line:\n%s", text)
+	}
+	var status struct {
+		SMSPath *freshness.SMSPathReport `json:"google_sms_path"`
+	}
+	raw := runStatusOutput(t, session, deps, true)
+	if err := json.Unmarshal([]byte(raw), &status); err != nil {
+		t.Fatalf("decode status --json: %v\n%s", err, raw)
+	}
+	if status.SMSPath == nil || !status.SMSPath.Stalled || status.SMSPath.LastSMSMS != lastSMS.UnixMilli() {
+		t.Fatalf("google_sms_path = %+v, want stalled since %d", status.SMSPath, lastSMS.UnixMilli())
+	}
+
+	deps.demo = true
+	if text := runStatusOutput(t, session, deps, false); strings.Contains(text, "Google SMS") {
+		t.Fatalf("demo status judged the SMS path:\n%s", text)
+	}
+	if raw := runStatusOutput(t, session, deps, true); strings.Contains(raw, "google_sms_path") {
+		t.Fatalf("demo status --json carries google_sms_path:\n%s", raw)
 	}
 }
 
