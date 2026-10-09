@@ -142,6 +142,19 @@ func TestMergeSearchResultsMatchesPerHitReferenceProperty(t *testing.T) {
 				msgs = append(msgs, &clone)
 			}
 		}
+		// Conversation hits under an alias (remote) or padded ID: the batch
+		// cannot answer them, so the per-ID fallback must, as before.
+		for i := 0; i < len(all) && i < len(rs.RemoteIDs); i++ {
+			if rng.Intn(3) != 0 {
+				continue
+			}
+			clone := *all[i]
+			clone.ConversationID = rs.RemoteIDs[rng.Intn(len(rs.RemoteIDs))]
+			if rng.Intn(3) == 0 {
+				clone.ConversationID = " " + clone.ConversationID
+			}
+			all = append(all, &clone)
+		}
 		rng.Shuffle(len(msgs), func(i, j int) { msgs[i], msgs[j] = msgs[j], msgs[i] })
 		rng.Shuffle(len(all), func(i, j int) { all[i], all[j] = all[j], all[i] })
 		for _, limit := range []int{1, 7, 500} {

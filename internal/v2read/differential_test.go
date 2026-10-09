@@ -308,3 +308,93 @@ func conversationIDProbes(rs *randomStore) []string {
 	}
 	return ids
 }
+
+// The differential properties are only as strong as the stores they run on:
+// across the seeds they use, the generator must produce every mapped field
+// and every edge the batching could get wrong.
+func TestRandomStoresCoverEveryMappedEdge(t *testing.T) {
+	seen := map[string]int{}
+	config := differentialSeeds(t)
+	for i := 0; i < config.MaxCount; i++ {
+		rs := buildRandomStore(t, config.Rand.Int63(), sqlitetest.DenseShape)
+		conversations, err := rs.source.ListConversations(math.MaxInt)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, conversation := range conversations {
+			var participants []participantDTO
+			if err := json.Unmarshal([]byte(conversation.Participants), &participants); err != nil {
+				t.Fatal(err)
+			}
+			switch {
+			case len(participants) == 0:
+				seen["conversation without participants"]++
+			case len(participants) > 1:
+				seen["conversation with several participants"]++
+			}
+			for _, participant := range participants {
+				if participant.IsMe {
+					seen["self participant"]++
+				}
+			}
+			if !conversation.IsGroup && conversation.Name != "" {
+				seen["named direct conversation"]++
+			}
+			messages, err := rs.source.GetMessagesByConversation(conversation.ConversationID, 100)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, message := range messages {
+				if message.Status != "" {
+					seen["status "+message.Status]++
+				} else if message.IsFromMe {
+					seen["outgoing without status"]++
+				}
+				if message.MediaID != "" {
+					seen["media"]++
+				}
+				if message.SenderName != "" || message.SenderNumber != "" {
+					seen["attributed sender"]++
+				}
+				if message.Reactions != "" {
+					seen["reactions"]++
+				}
+				if message.ReplyToID != "" {
+					seen["reply"]++
+				}
+			}
+		}
+		raw := sqlitetest.OpenRaw(t, rs.Path)
+		for label, query := range map[string]string{
+			"outbox rows tied on created_at":  `SELECT COUNT(*) FROM (SELECT 1 FROM outbox GROUP BY account_id, local_message_id, created_at_ms HAVING COUNT(*) > 1)`,
+			"outbox row of another account":   `SELECT COUNT(*) FROM outbox o JOIN messages m ON m.message_id = o.local_message_id WHERE o.account_id <> m.account_id`,
+			"attachment without ordinal 0":    `SELECT COUNT(DISTINCT message_id) FROM message_attachments a WHERE NOT EXISTS (SELECT 1 FROM message_attachments z WHERE z.message_id = a.message_id AND z.ordinal = 0)`,
+			"inactive participant":            `SELECT COUNT(*) FROM conversation_participants WHERE is_active = 0`,
+			"padded participant display name": `SELECT COUNT(*) FROM conversation_participants WHERE display_name <> trim(display_name) AND trim(display_name) <> ''`,
+			"messages tied on occurred_at":    `SELECT COUNT(*) FROM (SELECT 1 FROM messages GROUP BY conversation_id, occurred_at_ms HAVING COUNT(*) > 1)`,
+			"conversations tied on recency":   `SELECT COUNT(*) FROM (SELECT 1 FROM conversations GROUP BY last_message_at_ms HAVING COUNT(*) > 1)`,
+			"removed reaction":                `SELECT COUNT(*) FROM reactions WHERE state = 'removed'`,
+			"two accounts on one platform":    `SELECT COUNT(*) FROM (SELECT 1 FROM accounts GROUP BY trim(bridge_key) HAVING COUNT(*) > 1)`,
+			"padded stored conversation ID":   `SELECT COUNT(*) FROM conversations WHERE conversation_id <> trim(conversation_id)`,
+		} {
+			var count int
+			if err := raw.QueryRow(query).Scan(&count); err != nil {
+				t.Fatalf("%s: %v", label, err)
+			}
+			seen[label] += count
+		}
+	}
+	for _, want := range []string{
+		"conversation without participants", "conversation with several participants", "self participant",
+		"named direct conversation", "status sending", "status sent", "status failed", "outgoing without status",
+		"media", "attributed sender", "reactions", "reply",
+		"outbox rows tied on created_at", "outbox row of another account", "attachment without ordinal 0",
+		"inactive participant", "padded participant display name", "messages tied on occurred_at",
+		"conversations tied on recency", "removed reaction", "two accounts on one platform",
+		"padded stored conversation ID",
+	} {
+		if seen[want] == 0 {
+			t.Errorf("random stores never produced %q (seen: %v)", want, seen)
+		}
+	}
+}

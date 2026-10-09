@@ -15,9 +15,10 @@ import (
 // RandomStore is a migrated v2 store filled with seeded random rows, written
 // straight through SQL (foreign keys on) so the generator controls what the
 // repository write paths would normalize away: timestamp and created_at ties,
-// blank and padded display names, inactive participants, attachments missing
-// ordinal 0, several outbox rows per local message, outbox rows of another
-// account naming the same local message, removed reactions.
+// blank and padded display names, conversation IDs with a leading space,
+// inactive participants, attachments missing ordinal 0, several outbox rows
+// per local message, outbox rows of another account naming the same local
+// message, removed reactions.
 type RandomStore struct {
 	Path            string
 	Store           *sqlite.Store
@@ -155,6 +156,11 @@ func BuildRandomStore(t testing.TB, seed int64, shape Shape) *RandomStore {
 		accountIdentities := identitiesOf[account.ID]
 		for c := 0; c < rng.Intn(shape.MaxConversations+1); c++ {
 			conversationID := fmt.Sprintf("%c%s-conv-%02d", 'a'+rune(rng.Intn(26)), account.ID, c)
+			if maybe(0.05) {
+				// The schema allows a stored ID with surrounding space; reads
+				// that trim caller IDs can never resolve to it.
+				conversationID = " " + conversationID
+			}
 			remoteID := fmt.Sprintf("remote-%s-%02d", account.ID, c)
 			title := ""
 			if maybe(0.4) {
