@@ -165,16 +165,23 @@ func (c *googleCatchUp) record(err error) {
 		// catch-up (stillCurrent turns false and nothing more is stored): its
 		// client is going away, and a message stored only in legacy would be
 		// hidden from v2 for good, since later reconciles stop at the newest
-		// legacy message. The next generation's catch-up fetches it again.
+		// legacy message. What a recent reconcile or startup backfill did not
+		// store sits above what it stored, so the next generation's reconcile
+		// fetches it; a deep or window backfill has to be run again.
 		c.history = nil
 		c.closed = true
+		c.app.Logger.Info().
+			Err(err).
+			Str("reason", c.reason).
+			Msg("Google catch-up stopped: its connection generation ended")
+		return
 	}
 	if !c.warned {
 		c.warned = true
 		c.app.Logger.Warn().
 			Err(err).
 			Str("reason", c.reason).
-			Msg("Google catch-up could not hand fetched history to v2; the legacy store still has it")
+			Msg("Google catch-up could not hand fetched history to v2; the catch-up still writes it to the legacy store")
 	}
 }
 

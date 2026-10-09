@@ -314,15 +314,27 @@ conversation and message to v2 as well:
   thread only for an unbound id whose roster no existing thread answers to.
   Anything else is skipped and counted in `history_skipped`: an unbound id
   matching an existing thread's roster (the phone can hold two threads with
-  the same people), a sender who isn't the bound 1:1 thread's peer, or a
-  thread with no snapshot. #176's id-space rebinding stays a live-channel
-  repair. A skipped frame is re-evaluated when the same history is fetched
-  again (best effort), so once a live frame binds the thread, the next
-  catch-up files it.
+  the same people), a sender who isn't the bound 1:1 thread's peer, an unbound
+  thread with no snapshot, or a snapshot that names a different thread than
+  the one its id is bound to. That last case is a stale binding: after a phone
+  swap or restore an id can still be bound to the old phone's thread, and a
+  snapshot of another kind, another 1:1 peer or a fully disjoint group means
+  nothing in that frame is filed there. #176's id-space rebinding stays a
+  live-channel repair. A frame fetched without a snapshot (the pending-media
+  refresh) can't be checked that way; only an incoming 1:1 sender is. A skipped
+  frame is re-evaluated when a later catch-up fetches it again, best effort:
+  the worker drops the re-check when its queue is full, as it can be during a
+  large re-fetch. Once a live frame has bound or corrected the thread,
+  re-running a narrow window backfill gives it another chance.
 - **No liveness.** History commits under the generation fence but records no
   supervisor activity, so a working pull path never masks a dead push path.
-  When the generation ends mid-catch-up, the catch-up stops (it stores nothing
-  more, legacy included) and the next generation fetches again.
+  When the generation ends mid-catch-up, the catch-up stops and stores nothing
+  more, legacy included. The recent reconcile and the startup backfill store
+  what they fetched for a conversation oldest first, so what they didn't store
+  sits above what they did, and the next recent reconcile (which pages down to
+  the newest stored message) fetches it. A reconcile interrupted between pages
+  stores nothing for that conversation. A deep or window backfill that stops
+  has to be run again; a window run says so in `error_details`.
 - **Counters.** `/api/status` → `v2_ingest.per_account.<account>`:
   `history_appended`, `history_deduped`, `history_imported`,
   `history_existing`, `history_conversations`, `history_skipped`. `appended`,
@@ -335,7 +347,10 @@ conversation and message to v2 as well:
 **Recovering a window the live channel skipped** (for example after the phone
 stopped relaying): run a window backfill from just before the gap. It lists
 every folder, keeps conversations whose last message is at or after `since`,
-and pages each one's messages until a page reaches older than `since`. Unlike
+and pages each one's messages until a page reaches older than `since`. When
+the phone sends no cursor, it continues below the oldest message on the page
+(by that message's id and time) and stops when a page brings nothing new; it
+gives up on a conversation after 400 pages and reports that. Unlike
 the recent reconcile it does not stop at the newest stored message, which sits
 above the hole once push resumes; unlike a deep backfill it does not re-fetch
 (and store a frame for) every message the phone has ever held.

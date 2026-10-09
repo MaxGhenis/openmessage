@@ -45,8 +45,10 @@ type BackfillSnapshot struct {
 	Errors             int           `json:"errors"`
 	ErrorDetails       []string      `json:"error_details,omitempty"`
 	// HistoryTeed counts fetched conversations and messages handed to v2
-	// ingest; HistoryTeeFailed counts hand-offs v2 refused (the legacy store
-	// kept those). Both stay zero when v2 ingest is not running.
+	// ingest; HistoryTeeFailed counts hand-offs v2 refused. A refused item is
+	// still written to the legacy store unless the refusal was the generation
+	// closing, which stops the catch-up. Both stay zero when v2 ingest is not
+	// running.
 	HistoryTeed      int `json:"history_teed"`
 	HistoryTeeFailed int `json:"history_tee_failed"`
 }

@@ -3,8 +3,10 @@ package app
 import (
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -81,10 +83,10 @@ func (a *App) Backfill() error {
 	a.Logger.Info().Int("count", len(convos)).Msg("Fetched conversations")
 
 	for _, conv := range convos {
-		if catchUp.closed {
-			break
-		}
 		if err := catchUp.storeConversation(conv); err != nil {
+			if errors.Is(err, ErrGoogleHistoryClosed) {
+				break
+			}
 			a.Logger.Error().Err(err).Str("conv_id", conv.GetConversationID()).Msg("Failed to store conversation")
 			continue
 		}
@@ -98,7 +100,7 @@ func (a *App) Backfill() error {
 			continue
 		}
 
-		for _, msg := range msgResp.GetMessages() {
+		for _, msg := range oldestFirst(msgResp.GetMessages()) {
 			catchUp.storeMessage(conv.GetConversationID(), conv, msg)
 		}
 	}
@@ -345,6 +347,10 @@ func (a *App) paginateFolder(
 			found++
 
 			if err := catchUp.storeConversation(conv); err != nil {
+				if errors.Is(err, ErrGoogleHistoryClosed) {
+					// Not a store failure: the catch-up is stopping.
+					break
+				}
 				a.Logger.Error().Err(err).Str("conv_id", convID).Msg("Deep backfill: store conversation failed")
 				batchErrors++
 				continue
@@ -392,9 +398,9 @@ func (a *App) deepBackfillConversationWithToken(
 	total := 0
 	var cursor *gmproto.Cursor
 	windowed := stopBeforeMS > 0
-	// oldestSeenMS is the oldest positive message time stored so far;
-	// synthesized marks a cursor this loop built because the reply had none.
-	oldestSeenMS := int64(0)
+	// seen holds the IDs a windowed run has already stored; synthesized marks
+	// a cursor this loop built because the reply had none.
+	seen := map[string]bool{}
 	synthesized := false
 
 	for page := 0; ; page++ {
@@ -417,32 +423,38 @@ func (a *App) deepBackfillConversationWithToken(
 		}
 
 		msgs := resp.GetMessages()
+		if windowed {
+			fresh := make([]*gmproto.Message, 0, len(msgs))
+			for _, msg := range msgs {
+				if !seen[msg.GetMessageID()] {
+					fresh = append(fresh, msg)
+				}
+			}
+			if synthesized && len(fresh) == 0 {
+				// The page fetched below the oldest message holds nothing new:
+				// the conversation is exhausted, or the cursor was not honoured.
+				break
+			}
+			msgs = fresh
+		}
 		if len(msgs) == 0 {
 			break
 		}
 
-		// Only a real (positive) timestamp can place a message before the
-		// window; a message with no timestamp says nothing about where the
-		// page is.
-		var oldest *gmproto.Message
-		for _, msg := range msgs {
-			if ts := msg.GetTimestamp() / 1000; ts > 0 && (oldest == nil || ts < oldest.GetTimestamp()/1000) {
-				oldest = msg
-			}
-		}
-		if synthesized && (oldest == nil || oldest.GetTimestamp()/1000 >= oldestSeenMS) {
-			// The page fetched below the oldest message holds nothing older:
-			// the conversation is exhausted (or the cursor was not honoured).
-			break
-		}
-
 		reachedBoundary := false
-		for _, msg := range msgs {
+		for _, msg := range oldestFirst(msgs) {
+			catchUp.storeMessage(convID, conv, msg)
 			if catchUp.closed {
+				// Refused: its generation ended, so it is in neither store.
 				break
 			}
-			catchUp.storeMessage(convID, conv, msg)
 			total++
+			if windowed {
+				seen[msg.GetMessageID()] = true
+			}
+			// Only a real (positive) timestamp can place a message before the
+			// window; a message with no timestamp says nothing about where
+			// the page is.
 			if ts := msg.GetTimestamp() / 1000; windowed && ts > 0 && ts < stopBeforeMS {
 				reachedBoundary = true
 			}
@@ -450,20 +462,21 @@ func (a *App) deepBackfillConversationWithToken(
 		if reachedBoundary {
 			break
 		}
-		if oldest != nil && (oldestSeenMS == 0 || oldest.GetTimestamp()/1000 < oldestSeenMS) {
-			oldestSeenMS = oldest.GetTimestamp() / 1000
-		}
 
 		cursor = resp.GetCursor()
 		synthesized = false
 		if cursor == nil {
-			if !windowed || oldestSeenMS == 0 {
+			oldest := oldestOnPage(msgs)
+			if !windowed || oldest == nil {
 				break
 			}
 			// No cursor, boundary not reached: a missing cursor does not mean
-			// the conversation is exhausted, so continue below the oldest
-			// message stored so far.
-			cursor = &gmproto.Cursor{LastItemID: oldestMessageID(msgs, oldest), LastItemTimestamp: oldestSeenMS}
+			// the conversation is exhausted (libgm's own bridge synthesizes
+			// one the same way), so continue below this page's oldest message.
+			cursor = &gmproto.Cursor{
+				LastItemID:        oldest.GetMessageID(),
+				LastItemTimestamp: oldest.GetTimestamp() / 1000,
+			}
 			synthesized = true
 		}
 
@@ -484,13 +497,41 @@ func (a *App) deepBackfillConversationWithToken(
 	return total, false
 }
 
-// oldestMessageID names the message a synthesized cursor continues below: the
-// page's oldest timestamped message, else the page's last message.
-func oldestMessageID(msgs []*gmproto.Message, oldest *gmproto.Message) string {
-	if oldest != nil {
-		return oldest.GetMessageID()
+// oldestOnPage returns the page's oldest message with a timestamp, the later
+// one on the page when two share the oldest millisecond (pages come newest
+// first), or nil when no message has a timestamp.
+func oldestOnPage(msgs []*gmproto.Message) *gmproto.Message {
+	var oldest *gmproto.Message
+	for _, msg := range msgs {
+		ts := msg.GetTimestamp() / 1000
+		if ts <= 0 {
+			continue
+		}
+		if oldest == nil || ts <= oldest.GetTimestamp()/1000 {
+			oldest = msg
+		}
 	}
-	return msgs[len(msgs)-1].GetMessageID()
+	return oldest
+}
+
+// oldestFirst returns a copy of fetched messages ordered oldest first
+// (stable, so same-millisecond messages keep the phone's relative order
+// reversed into time order). Pages arrive newest first. The recent reconcile
+// and the startup backfill store everything they fetched for a conversation
+// oldest first, so one that stops partway (its connection generation ended)
+// leaves the unstored remainder above what it stored, where the next recent
+// reconcile, which pages down only to the newest stored message, fetches it
+// again. Deep and window backfills store page by page; a stop there leaves a
+// hole below the stored pages that only re-running the backfill fills.
+func oldestFirst(msgs []*gmproto.Message) []*gmproto.Message {
+	ordered := make([]*gmproto.Message, len(msgs))
+	for index, msg := range msgs {
+		ordered[len(msgs)-1-index] = msg
+	}
+	sort.SliceStable(ordered, func(i, j int) bool {
+		return ordered[i].GetTimestamp() < ordered[j].GetTimestamp()
+	})
+	return ordered
 }
 
 // discoverFromContacts lists all contacts and tries to find conversations
@@ -686,51 +727,63 @@ func (a *App) reconcileRecentConversationMessages(catchUp *googleCatchUp, conv *
 		localLatestTS int64
 		localLatestID string
 		cursor        *gmproto.Cursor
-		storedAny     bool
 	)
 	if len(localLatest) > 0 {
 		localLatestTS = localLatest[0].TimestampMS
 		localLatestID = localLatest[0].MessageID
 	}
 
+	// Fetch every page down to the newest stored message before storing any,
+	// then store them oldest first. The next reconcile pages down only to the
+	// newest stored message, so whatever this one stores must reach down to
+	// that boundary without a hole: a run that stops partway (its connection
+	// generation ended) then leaves everything it did not store above what it
+	// stored, where the next reconcile fetches it. Storing page by page, newest
+	// first, left a hole below the stored pages that no reconcile revisits.
+	var fetched []*gmproto.Message
 	for page := 0; page < recentReconcileMaxPages; page++ {
 		if !catchUp.stillCurrent() {
-			return storedAny, true
+			// Nothing stored: the next reconcile starts from the same boundary.
+			return false, true
 		}
 
 		msgResp, err := catchUp.gm.FetchMessages(convID, recentReconcileMessageLimit, cursor)
 		if err != nil {
 			if a.HandleGoogleAuthExpiredError(err) {
-				return storedAny, true
+				return false, true
 			}
+			// Store what was fetched, as before: a page the phone keeps
+			// failing would otherwise keep every newer message out too.
 			a.Logger.Warn().Err(err).Str("conv_id", convID).Int("page", page).Msg("Recent reconcile: fetch messages failed")
-			return storedAny, false
+			break
 		}
 
 		msgs := msgResp.GetMessages()
 		if len(msgs) == 0 {
-			return storedAny, false
+			break
 		}
-
-		for _, msg := range msgs {
-			catchUp.storeMessage(convID, conv, msg)
-		}
-		storedAny = true
+		fetched = append(fetched, msgs...)
 
 		if localLatestTS == 0 {
-			return storedAny, false
+			break
 		}
 		if reconcileBatchReachedLocalBoundary(msgs, localLatestTS, localLatestID) {
-			return storedAny, false
+			break
 		}
 
 		cursor = msgResp.GetCursor()
 		if cursor == nil {
-			return storedAny, false
+			break
 		}
 	}
 
-	return storedAny, false
+	if len(fetched) == 0 {
+		return false, false
+	}
+	for _, msg := range oldestFirst(fetched) {
+		catchUp.storeMessage(convID, conv, msg)
+	}
+	return true, false
 }
 
 func (a *App) refreshPendingMediaMessageWithSchedule(convID, messageID string, schedule []time.Duration) {

@@ -62,6 +62,11 @@ type WorkerConfig struct {
 // place by moving an existing thread binding, which history never does.
 var errHistoryUnplaceable = errors.New("history frame cannot be placed without moving a thread binding")
 
+// errHistoryContradicted marks a history snapshot whose bound thread is a
+// different thread on the phone now (a stale binding after a device ID-space
+// reset): the frame must not file anything under that remote ID.
+var errHistoryContradicted = errors.New("history snapshot contradicts the thread its remote ID is bound to")
+
 type registeredDecoder struct {
 	platform bridge.Platform
 	decoder  bridge.Decoder
@@ -97,6 +102,18 @@ type Worker struct {
 
 	changeMu sync.Mutex
 	changed  chan struct{}
+
+	// fault lets tests inject a storage failure at a named point between two
+	// of a frame's commits (see faultAt). Nil outside tests.
+	fault func(point string) error
+}
+
+// faultAt returns the injected failure for point, if a test set one.
+func (w *Worker) faultAt(point string) error {
+	if w.fault == nil {
+		return nil
+	}
+	return w.fault(point)
 }
 
 // NewWorker validates and copies its explicitly configured decoder
@@ -524,6 +541,10 @@ func (w *Worker) applyEvents(
 	changed := false
 	googleSnapshots := make(map[string]*googleReactionSnapshot)
 	googleSnapshotOrder := make([]string, 0)
+	// contradicted holds remote conversation IDs whose snapshot in this frame
+	// says the bound thread is a different thread now; history files nothing
+	// under them.
+	contradicted := make(map[string]bool)
 	for _, event := range events {
 		if event.Kind != bridge.EventConversation {
 			continue
@@ -538,6 +559,14 @@ func (w *Worker) applyEvents(
 				}
 			case isTransientDBError(err):
 				return false, err
+			case errors.Is(err, errHistoryContradicted):
+				contradicted[v2keys.NormalizeRemoteConversationID(string(platform), event.Conversation.RemoteConversationID)] = true
+				w.counters.account(accountID).historySkipped.Add(1)
+				w.logger.Info().
+					Str("account_id", accountID).
+					Str("inbox_id", inboxID).
+					Str("remote_conversation_id", event.Conversation.RemoteConversationID).
+					Msg("ingest: history snapshot contradicts its bound thread (stale binding); left to the live channel")
 			default:
 				// Unplaceable, or unusable (for example a participant with no
 				// valid address): skip the snapshot, never the frame. The
@@ -565,6 +594,10 @@ func (w *Worker) applyEvents(
 			continue
 		}
 		var projection sqlite.MessageProjection
+		if history && contradicted[v2keys.NormalizeRemoteConversationID(string(platform), event.Message.RemoteConversationID)] {
+			w.counters.account(accountID).historySkipped.Add(1)
+			continue
+		}
 		if history {
 			message, inserted, err := w.historyMessage(
 				ctx,
@@ -978,6 +1011,9 @@ func (w *Worker) refreshConversation(
 	if err := w.store.UpsertConversation(conversation); err != nil {
 		return sqlite.Conversation{}, err
 	}
+	if err := w.faultAt("conversation-upserted"); err != nil {
+		return sqlite.Conversation{}, err
+	}
 	conversation, err = w.store.GetConversationByRemote(accountID, remoteID)
 	if err != nil {
 		return sqlite.Conversation{}, err
@@ -1096,8 +1132,15 @@ func (w *Worker) applyHistoryConversation(
 		return false, nil
 	}
 	if !started {
-		_, _, err := w.existingConversation(accountID, platform, event.RemoteConversationID)
+		bound, _, err := w.existingConversation(accountID, platform, event.RemoteConversationID)
 		if err == nil {
+			contradicts, err := w.historySnapshotContradicts(accountID, platform, event, bound)
+			if err != nil {
+				return false, err
+			}
+			if contradicts {
+				return false, errHistoryContradicted
+			}
 			return false, nil
 		}
 		if !errors.Is(err, sqlite.ErrNotFound) {
@@ -1126,6 +1169,67 @@ func (w *Worker) applyHistoryConversation(
 	}
 	progress.setConversation(remoteID, true)
 	return true, nil
+}
+
+// historySnapshotContradicts reports whether a fetched snapshot names a
+// different thread than the one its remote ID is bound to in v2. That is the
+// signature of a stale binding after a phone swap or restore, which the live
+// channel repairs by rebinding (#176) and history must not file into. A bound
+// thread with no known peers proves nothing either way. Otherwise the kinds
+// must agree and the rosters must pass #176's consistency rule (a direct
+// thread's sole peer must match; group membership may change but a fully
+// disjoint roster is a different group). Peers are looked up, not created.
+func (w *Worker) historySnapshotContradicts(
+	accountID string,
+	platform bridge.Platform,
+	event bridge.ConversationEvent,
+	bound sqlite.Conversation,
+) (bool, error) {
+	storedPeers, err := w.store.ListConversationPeerIdentities(accountID, bound.ConversationID)
+	if err != nil {
+		return false, err
+	}
+	if len(storedPeers) == 0 {
+		return false, nil
+	}
+	kind := sqlite.ConversationKindDirect
+	if event.Kind == string(sqlite.ConversationKindGroup) {
+		kind = sqlite.ConversationKindGroup
+	}
+	if kind != bound.Kind {
+		return true, nil
+	}
+	eventPeers := make([]sqlite.Identity, 0, len(event.Participants))
+	seen := make(map[string]struct{}, len(event.Participants))
+	for _, participant := range event.Participants {
+		if participant.Identity.IsSelf || identityRaw(participant.Identity) == "" {
+			continue
+		}
+		key, err := v2keys.IdentityKey(accountID, string(platform), identityRaw(participant.Identity))
+		if err != nil {
+			return false, err
+		}
+		identityID := v2keys.DeriveID("identity", accountID, key.Kind+"\x1f"+key.Canonical)
+		identity, err := w.store.GetIdentityByCanonical(accountID, sqlite.IdentityKind(key.Kind), key.Canonical)
+		switch {
+		case err == nil:
+			if identity.IsSelf {
+				continue
+			}
+			identityID = identity.IdentityID
+		case !errors.Is(err, sqlite.ErrNotFound):
+			return false, err
+		}
+		if _, duplicate := seen[identityID]; duplicate {
+			continue
+		}
+		seen[identityID] = struct{}{}
+		eventPeers = append(eventPeers, sqlite.Identity{IdentityID: identityID})
+	}
+	if len(eventPeers) == 0 {
+		return false, nil
+	}
+	return !rostersConsistent(kind == sqlite.ConversationKindDirect, eventPeers, storedPeers), nil
 }
 
 // historyMessage places and inserts one fetched message under the history
@@ -1187,6 +1291,9 @@ func (w *Worker) historyMessage(
 	}
 	w.counters.account(accountID).historyImported.Add(1)
 	progress.setInsertedMessage(key, projection.Message)
+	if err := w.faultAt("history-message-inserted"); err != nil {
+		return sqlite.Message{}, false, err
+	}
 	return projection.Message, true, nil
 }
 

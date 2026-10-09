@@ -797,20 +797,22 @@ func TestHistoryMessageThroughRealSinkImportsIntoV2(t *testing.T) {
 // already delivered gets its own history inbox row (the origins never share a
 // row), is skipped by the worker as existing, and leaves the live row, the
 // live counters and the live-projected message exactly as they were. Its
-// group snapshot does not rewrite the thread the live frame created.
+// group snapshot does not rewrite the thread the live frames created.
 func TestHistoryCopyOfLiveFrameLeavesLiveRowAndMessageAlone(t *testing.T) {
 	v2 := newHistoryTeeV2(t)
 	_, history, fake := startHistoryTeeRun(t, v2.sink, 42)
 
+	// The live channel delivers the thread's snapshot and then the message.
+	fake.emit(historyTeeGroup("pushed-conversation"))
 	message := historyTeeMessage("pushed-then-fetched", "pushed-conversation", "pushed first")
 	fake.emit(&libgm.WrappedMessage{Message: message})
 	live := v2.await(t, "live projection", func(s ingest.CounterSnapshot) bool { return s.Projected == 1 })
-	if live.Appended != 1 || live.HistoryAppended != 0 {
-		t.Fatalf("counters after live frame = %+v", live)
+	if live.Appended != 2 || live.HistoryAppended != 0 {
+		t.Fatalf("counters after live frames = %+v", live)
 	}
 	var liveInboxID string
 	var receivedBefore int64
-	if err := v2.db.QueryRow("SELECT inbox_id, received_at_ms FROM inbox").Scan(&liveInboxID, &receivedBefore); err != nil {
+	if err := v2.db.QueryRow("SELECT inbox_id, received_at_ms FROM inbox WHERE dedupe_key LIKE 'msg:%'").Scan(&liveInboxID, &receivedBefore); err != nil {
 		t.Fatalf("read live inbox row: %v", err)
 	}
 	stored := v2.storedMessage(t, "pushed-then-fetched")
@@ -830,8 +832,8 @@ func TestHistoryCopyOfLiveFrameLeavesLiveRowAndMessageAlone(t *testing.T) {
 		got.StaleReplays != 0 {
 		t.Fatalf("counters after fetched copy = %+v (live %+v)", got, live)
 	}
-	if n := v2.count(t, "SELECT COUNT(*) FROM inbox"); n != 2 {
-		t.Fatalf("inbox rows = %d, want the live row and the history row", n)
+	if n := v2.count(t, "SELECT COUNT(*) FROM inbox"); n != 3 {
+		t.Fatalf("inbox rows = %d, want the two live rows and the history row", n)
 	}
 	var codec string
 	var receivedAfter int64

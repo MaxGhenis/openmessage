@@ -362,6 +362,26 @@ func TestHistoryIngressWithoutDownstreamSinkReportsDisabled(t *testing.T) {
 	}
 }
 
+// Legacy-only mode is fenced too: once its generation is retired, a history
+// frame reports ErrStaleGeneration (the adapter's "closed": the catch-up
+// stops, as it already did when its client went away), never
+// ErrHistoryIngressDisabled, which would let it keep filling the legacy store
+// alone for a generation that has ended.
+func TestHistoryIngressWithoutDownstreamSinkIsFencedAfterStop(t *testing.T) {
+	supervisor, clock, sink, _ := historyFenceOnline(t)
+
+	ctx, cancel := supervisorTestContext(t)
+	err := supervisor.Stop(ctx)
+	cancel()
+	if err != nil {
+		t.Fatalf("Supervisor.Stop() error = %v", err)
+	}
+	err = appendHistoryForTest(t, sink, historyFenceRecord(1, clock.Now()))
+	if !errors.Is(err, ErrStaleGeneration) || errors.Is(err, ErrHistoryIngressDisabled) {
+		t.Fatalf("AppendHistoryIngress() after Stop without downstream error = %v, want ErrStaleGeneration only", err)
+	}
+}
+
 // A downstream that cannot take history fails closed with
 // ErrHistoryIngressMissing; it never falls back to the live AppendIngress
 // (which would record the frame as live delivery).

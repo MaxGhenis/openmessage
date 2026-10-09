@@ -1819,6 +1819,10 @@ func TestHistoryCatchUpStopsWhenItsGenerationCloses(t *testing.T) {
 		if progress.HistoryTeed != 1 || progress.HistoryTeeFailed != 1 {
 			t.Errorf("progress history_teed=%d history_tee_failed=%d, want 1/1", progress.HistoryTeed, progress.HistoryTeeFailed)
 		}
+		// The refused conversation is not a store failure.
+		if progress.Errors != 0 {
+			t.Errorf("progress errors = %d, want 0 (%v)", progress.Errors, progress.ErrorDetails)
+		}
 		// Only what was handed to v2 before the close is in legacy: the first
 		// conversation. The refused one and every message are in neither.
 		if offers[0].Kind != "conv" {
@@ -1870,8 +1874,13 @@ func TestHistoryCatchUpStopsWhenItsGenerationCloses(t *testing.T) {
 				t.Errorf("legacy holds %s, which v2 was never given", id)
 			}
 		}
-		if progress := a.GetBackfillProgress(); progress.HistoryTeed != 3 || progress.HistoryTeeFailed != 1 {
+		progress := a.GetBackfillProgress()
+		if progress.HistoryTeed != 3 || progress.HistoryTeeFailed != 1 {
 			t.Errorf("progress history_teed=%d history_tee_failed=%d, want 3/1", progress.HistoryTeed, progress.HistoryTeeFailed)
+		}
+		// The refused message is in neither store, so it is not found either.
+		if progress.MessagesFound != 1 {
+			t.Errorf("progress messages found = %d, want 1", progress.MessagesFound)
 		}
 	})
 

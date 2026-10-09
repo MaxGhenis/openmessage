@@ -1417,10 +1417,14 @@ const (
 	hwtPropMaxQueued = 48 // below the worker queue capacity, so no replay notification is dropped
 )
 
-// Distinct exact rosters, so no history-created group can match a live one
-// by roster (that path is covered by the #176 tests, not by I3).
+// Distinct exact rosters by default. A universe can also give the history-only
+// thread conversation 0's roster (history must not mint a twin or take the
+// live group's binding) or give conversation 0's fetched snapshots
+// hwtPropStaleRoster, disjoint from its live roster (a stale binding history
+// must not file into).
 var (
-	hwtPropRosters  = [][]string{{hwtKarl, hwtShoshana}, {hwtShoshana, hwtAda}, {hwtKarl, hwtAda}}
+	hwtPropRosters     = [][]string{{hwtKarl, hwtShoshana}, {hwtShoshana, hwtAda}, {hwtKarl, hwtAda}}
+	hwtPropStaleRoster = []string{hwtAda, hwtBea}
 	hwtPropReactors = []string{hwtKarl, hwtShoshana, hwtAda}
 	hwtPropEmoji    = []string{"👍", "❤️", "😂"}
 )
@@ -1481,6 +1485,17 @@ type hwtPropConversation struct {
 	Wire   string
 	Roster []string
 	Live   bool // false: unknown to v2 until history creates it
+	// Snapshot is the roster fetched snapshots carry: Roster, or for a stale
+	// binding a disjoint one.
+	Snapshot []string
+	// Twin: history-only, with a live thread's exact roster.
+	Twin bool
+}
+
+// skipped reports that history must place nothing in the conversation: its
+// binding is stale, or it is a history-only twin of a live roster.
+func (c hwtPropConversation) skipped() bool {
+	return c.Twin || (c.Live && !reflect.DeepEqual(c.Snapshot, c.Roster))
 }
 
 type hwtPropMessage struct {
@@ -1553,11 +1568,19 @@ func (hwtPropUniverse) Generate(r *rand.Rand, _ int) reflect.Value {
 	var universe hwtPropUniverse
 	conversationCount := 2 + r.Intn(2)
 	for index := 0; index < conversationCount; index++ {
-		universe.Conversations = append(universe.Conversations, hwtPropConversation{
+		conversation := hwtPropConversation{
 			Wire:   fmt.Sprintf("hwt-p-c%d", index),
 			Roster: hwtPropRosters[index],
 			Live:   index < conversationCount-1 || r.Intn(2) == 0,
-		})
+		}
+		if !conversation.Live && r.Intn(3) == 0 {
+			conversation.Roster, conversation.Twin = hwtPropRosters[0], true
+		}
+		conversation.Snapshot = conversation.Roster
+		if index == 0 && r.Intn(4) == 0 {
+			conversation.Snapshot = hwtPropStaleRoster
+		}
+		universe.Conversations = append(universe.Conversations, conversation)
 	}
 	messageCount := 1 + r.Intn(8)
 	for index := 0; index < messageCount; index++ {
@@ -1572,7 +1595,9 @@ func (hwtPropUniverse) Generate(r *rand.Rand, _ int) reflect.Value {
 
 	var frames []hwtPropFrame
 	for index, message := range universe.Messages {
-		roster := universe.Conversations[message.Conversation].Roster
+		// Fetched copies come from the phone, so their senders are on the
+		// roster its snapshot names.
+		roster := universe.Conversations[message.Conversation].Snapshot
 		for count := r.Intn(3); count > 0; count-- {
 			version := hwtPropNewVersion(r, index, messageCount, roster, true)
 			if message.Delivered && r.Intn(4) == 0 {
@@ -1609,7 +1634,7 @@ func (hwtPropUniverse) Generate(r *rand.Rand, _ int) reflect.Value {
 func (u hwtPropUniverse) record(t *testing.T, h *hwtHarness, frame hwtPropFrame) bridge.RawIngressRecord {
 	t.Helper()
 	conversation := u.Conversations[frame.Conversation]
-	snapshot := hwtConversation(conversation.Wire, frame.Title, true, conversation.Roster...)
+	snapshot := hwtConversation(conversation.Wire, frame.Title, true, conversation.Snapshot...)
 	if frame.Message < 0 {
 		return h.historyConversation(t, snapshot)
 	}
@@ -1678,10 +1703,18 @@ func hwtPropCheck(t *testing.T, u hwtPropUniverse) error {
 	// Model: the first insertable history version of an ID v2 lacks is
 	// inserted; everything else is skipped. A thread v2 lacks is created by
 	// the first frame that mentions it, with that frame's snapshot title.
+	// Nothing is placed in a stale-bound thread or a live roster's twin, and
+	// the twin is never created.
 	expected := map[int]hwtPropVersion{}
 	createdTitle := map[int]string{}
+	skippedFrames := 0
 	for _, frame := range u.Frames {
-		if !u.Conversations[frame.Conversation].Live {
+		conversation := u.Conversations[frame.Conversation]
+		if conversation.skipped() {
+			skippedFrames++
+			continue
+		}
+		if !conversation.Live {
 			if _, seen := createdTitle[frame.Conversation]; !seen {
 				createdTitle[frame.Conversation] = frame.Title
 			}
@@ -1732,6 +1765,9 @@ func hwtPropCheck(t *testing.T, u hwtPropUniverse) error {
 	if first.Appended != before.Appended || first.Projected != before.Projected ||
 		first.ReactionsOrphaned != before.ReactionsOrphaned || first.RemoteRebinds != 0 {
 		fail("live counters moved: before=%+v after=%+v", before, first)
+	}
+	if skippedFrames > 0 && first.HistorySkipped == before.HistorySkipped {
+		fail("%d frames name a stale-bound or twin thread, but history_skipped did not move", skippedFrames)
 	}
 
 	// I3: every pre-existing row, attachment, reaction and fence is
@@ -1932,7 +1968,8 @@ func (h *hwtHarness) thread(t *testing.T, byWire map[string]string, wire string)
 	return parsed
 }
 
-// For random universes (2-3 threads, one sometimes unknown to v2; up to 8
+// For random universes (2-3 threads, one sometimes unknown to v2 and
+// sometimes a twin of a live roster, the first sometimes stale-bound; up to 8
 // message IDs, some delivered live and then deleted or edited in SQL) and a
 // random catch-up (new IDs, changed copies of stored IDs, byte-identical
 // copies of live frames, stubs, ts=0, standalone snapshots, exact repeats, in
