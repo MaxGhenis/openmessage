@@ -14,6 +14,7 @@ const (
 	sqliteConstraintCode           = 19
 	sqliteConstraintForeignKeyCode = 787
 	sqliteConstraintPrimaryKeyCode = 1555
+	sqliteCorruptVTabCode          = 267 // SQLITE_CORRUPT_VTAB
 )
 
 type rowScanner interface {
@@ -805,29 +806,15 @@ func (s *Store) ListConversationsByRecencyAllAccounts(limit int) ([]Conversation
 // participants' display names or canonical addresses, contain query as a
 // case-insensitive substring — newest first, at most limit rows. It is the
 // bounded v2 counterpart of the legacy metadata search: the match runs in SQL
-// so callers map only the hits instead of every conversation.
+// so callers map only the hits instead of every conversation. A query with a
+// run of three or more characters is answered from the trigram indexes
+// (searchConversationsByNameStatement); the rows are the same either way.
 func (s *Store) SearchConversationsByName(query string, limit int) ([]Conversation, error) {
 	if limit <= 0 || strings.TrimSpace(query) == "" {
 		return []Conversation{}, nil
 	}
-	pattern := "%" + escapeLikePattern(query) + "%"
-	rows, err := s.db.QueryContext(
-		context.Background(),
-		"SELECT "+conversationColumns+`
-		 FROM conversations
-		 WHERE title LIKE ? ESCAPE '\'
-		    OR conversation_id IN (
-		        SELECT cp.conversation_id
-		        FROM conversation_participants cp
-		        JOIN identities i ON i.identity_id = cp.identity_id
-		        WHERE cp.display_name LIKE ? ESCAPE '\'
-		           OR i.display_name LIKE ? ESCAPE '\'
-		           OR i.canonical_value LIKE ? ESCAPE '\'
-		    )
-		 ORDER BY last_message_at_ms DESC, conversation_id
-		 LIMIT ?`,
-		pattern, pattern, pattern, pattern, limit,
-	)
+	statement, args := searchConversationsByNameStatement(query, limit)
+	rows, err := s.db.QueryContext(context.Background(), statement, args...)
 	if err != nil {
 		return nil, fmt.Errorf("search conversations by name: %w", err)
 	}
@@ -836,6 +823,83 @@ func (s *Store) SearchConversationsByName(query string, limit int) ([]Conversati
 		return nil, fmt.Errorf("search conversations by name: %w", err)
 	}
 	return conversations, nil
+}
+
+// likeConversationsByNameQuery matches the escaped pattern against every
+// title, participant name and identity in a scan of each table. It serves
+// queries the trigram indexes cannot narrow.
+const likeConversationsByNameQuery = `
+	SELECT ` + conversationColumns + `
+	FROM conversations
+	WHERE title LIKE ? ESCAPE '\'
+	   OR conversation_id IN (
+	       SELECT cp.conversation_id
+	       FROM conversation_participants cp
+	       JOIN identities i ON i.identity_id = cp.identity_id
+	       WHERE cp.display_name LIKE ? ESCAPE '\'
+	          OR i.display_name LIKE ? ESCAPE '\'
+	          OR i.canonical_value LIKE ? ESCAPE '\'
+	   )
+	ORDER BY last_message_at_ms DESC, conversation_id
+	LIMIT ?`
+
+// trigramConversationsByNameQuery is likeConversationsByNameQuery answered from
+// the trigram indexes, one UNION arm per searched column. Each arm takes two
+// patterns. The first, on the FTS column, is the candidate pattern
+// (trigramCandidatePattern): SQLite hands only a LIKE without ESCAPE to the
+// index, so the literal '%' and '_' of the escaped pattern become '_', which
+// matches them and anything else. The second is the escaped pattern itself,
+// applied to the candidate rows. Each arm therefore yields exactly the rows its
+// OR term in likeConversationsByNameQuery matches; the participant-name arm
+// keeps that query's identity join. CROSS JOIN keeps each index the arm's
+// outer loop, as in trigramSearchMessagesStatement.
+const trigramConversationsByNameQuery = `
+	SELECT ` + conversationColumns + `
+	FROM conversations
+	WHERE conversation_id IN (
+	    SELECT c.conversation_id
+	    FROM conversations_fts AS f
+	    CROSS JOIN conversations AS c ON c.rowid = f.rowid
+	    WHERE f.title LIKE ? AND c.title LIKE ? ESCAPE '\'
+	    UNION ALL
+	    SELECT cp.conversation_id
+	    FROM conversation_participants_fts AS f
+	    CROSS JOIN conversation_participants AS cp ON cp.rowid = f.rowid
+	    JOIN identities AS i ON i.identity_id = cp.identity_id
+	    WHERE f.display_name LIKE ? AND cp.display_name LIKE ? ESCAPE '\'
+	    UNION ALL
+	    SELECT cp.conversation_id
+	    FROM identities_fts AS f
+	    CROSS JOIN identities AS i ON i.rowid = f.rowid
+	    JOIN conversation_participants AS cp ON cp.identity_id = i.identity_id
+	    WHERE f.display_name LIKE ? AND i.display_name LIKE ? ESCAPE '\'
+	    UNION ALL
+	    SELECT cp.conversation_id
+	    FROM identities_fts AS f
+	    CROSS JOIN identities AS i ON i.rowid = f.rowid
+	    JOIN conversation_participants AS cp ON cp.identity_id = i.identity_id
+	    WHERE f.canonical_value LIKE ? AND i.canonical_value LIKE ? ESCAPE '\'
+	)
+	ORDER BY last_message_at_ms DESC, conversation_id
+	LIMIT ?`
+
+// searchConversationsByNameStatement picks SearchConversationsByName's SQL: the
+// trigram arms when the candidate pattern has a run the index can use, else the
+// scans. Both return the conversations whose title, participant name, identity
+// name or canonical value contains query literally, ASCII case-insensitively.
+func searchConversationsByNameStatement(query string, limit int) (string, []any) {
+	exact := "%" + escapeLikePattern(query) + "%"
+	candidate := "%" + trigramCandidatePattern(query) + "%"
+	if !likePatternUsesTrigrams(candidate) {
+		return likeConversationsByNameQuery, []any{exact, exact, exact, exact, limit}
+	}
+	return trigramConversationsByNameQuery, []any{
+		candidate, exact,
+		candidate, exact,
+		candidate, exact,
+		candidate, exact,
+		limit,
+	}
 }
 
 // escapeLikePattern makes user text match literally inside a LIKE pattern

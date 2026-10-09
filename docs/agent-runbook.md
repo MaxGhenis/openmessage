@@ -51,6 +51,54 @@ inclusive to end of day), and `limit` (default 50, max 500).
 Outgoing message rows carry a `Status`: `OUTGOING_SENDING` → `OUTGOING_SENT`/
 `OUTGOING_DELIVERED`, or `OUTGOING_FAILED:<STATUS>` when a send is rejected.
 
+### What a v2 search matches
+
+v2 search (`/api/search`, `/api/search/messages`, the in-thread search, MCP
+`search_messages`, `openmessage read`) is a SQLite `LIKE '%q%'` substring
+match: case-insensitive for ASCII letters only (`É` does not match `é`), no
+accent folding (`cafe` does not match `café`). In message search `%` and `_`
+are wildcards (`a_c` matches `abc`); the conversation-name half of
+`/api/search` matches them literally. Results are newest first; there is no
+relevance ranking.
+
+Since migration 0012 (`substring_search`) the store answers searches across
+conversations (optionally in a date range) from a read of the newest 2,000
+messages and from FTS5 trigram indexes (`messages_fts`, `conversations_fts`,
+`conversation_participants_fts`, `identities_fts`). Neither changes which rows
+match: SQLite re-applies the `LIKE` to every candidate, and tests compare every
+path with the plain `LIKE`. When the newest messages hold fewer hits than asked
+for, the index answers. A query needs a run of three characters between
+wildcards for the index to help; a one- or two-character query is answered from
+the newest messages when they hold enough hits, and otherwise scans as it always
+did. A search within one conversation (`conversation_id=`, the thread search
+box) or by sender (`phone=`) runs the `LIKE` over that conversation's or
+sender's messages, as before. The one search that can now take longer than
+before is a term found in many messages overall but in few of the newest 2,000:
+the index then visits all its matches, measured at up to about 1.5x the old
+scan's time.
+
+If searches miss messages that `LIKE` finds, check the indexes on a copy of the
+store (never the live file; copy `store.sqlite3` with its `-wal`):
+
+```bash
+sqlite3 /tmp/store-copy.sqlite3 "INSERT INTO messages_fts(messages_fts, rank) VALUES ('integrity-check', 1);"
+```
+
+No output means the index equals the `messages` table; `database disk image is
+malformed` means it doesn't (repeat for the other three tables). `PRAGMA
+integrity_check` does not compare these indexes with their tables. To rebuild,
+quit the app first and run `INSERT INTO messages_fts(messages_fts) VALUES
+('rebuild');` (likewise per table). Triggers keep the indexes in step with
+every write the app makes, so a mismatch means something wrote the store
+around them.
+
+Migration 0012 builds the indexes from the existing rows in one transaction
+when the upgraded app starts, before its v2 stack exists: 1.7 to 3.2 s on
+copies of Max's store (72k messages, depending on machine load), 13 s for 10x
+the history and 47 s at 30x. Only the app's daemon (and `repair`/cutover)
+migrates the store; until it has, the CLI and the MCP client refuse the store
+(see "MCP serving" and "Deploying a new build" below).
+
 ### Message JSON field names — the epoch-0 trap
 
 The legacy message DTO marshals **Go field names**, not snake_case, for its core

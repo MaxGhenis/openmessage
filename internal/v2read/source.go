@@ -1,5 +1,7 @@
 // Package v2read adapts the clean-slate SQLite store to the canonical legacy
-// read DTOs. Search is deliberately LIKE-based in R5; FTS/ranking is deferred.
+// read DTOs. Search keeps R5's LIKE substring semantics; the store answers it
+// from FTS5 trigram indexes without changing which rows match, and offers no
+// relevance ranking.
 package v2read
 
 import (
