@@ -124,9 +124,20 @@ curl -s http://127.0.0.1:7007/api/status | jq '.freshness'
   into the v2 store (`internal/v2wire/mirror.go`). On a migrated store it
   reuses the account's migrated local device, whose id is a derived hash
   (`9bcc1343…` for Google), not `local-primary:<account>`. It also leaves the
-  account row alone. A thread the migration already keyed by hash fails with
-  `natural key belongs to v2 conversation <id>`, and nothing is written. Before
-  2026-10-09 every mirror call on a migrated store failed with
+  account row alone. A thread the migration (or v2 ingest) already keyed by
+  hash is adopted as stored: sends, replies and read cursors go to that row,
+  and the mirror adds a legacy-keyed row only for a thread v2 has never seen.
+  The dispatcher addresses the transport by `remote_conversation_id`, which is
+  the legacy id either way, and the legacy visibility projector writes each
+  confirmed send into the thread named by that column, never under the hash.
+  A reply quotes the copy v2 already holds: the mirror keys a Signal reply
+  target by its bare timestamp, as the migration does, and signal-cli resolves
+  a bare id by restoring the `signal:` prefix. One case is refused with
+  `reply_target_unavailable`: a Google message the migration keyed by a
+  `source_id` other than its message id, which the transport cannot quote.
+  For a while on 2026-10-09 the mirror refused migrated threads instead, with
+  a 409 `natural key belongs to v2 conversation <id>`. Before that, every
+  mirror call on a migrated store failed with
   `UNIQUE constraint failed: devices.account_id`. Each call first rewrote the
   account's `bridge_key` (`google_messages` → `google`), and v2 reads derive a
   thread's platform from that key, so Google threads would then read as

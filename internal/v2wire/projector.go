@@ -225,7 +225,33 @@ func (p *Projector) projectMessageRow(
 		)
 	}
 
-	legacyMessage, err := legacyProjection(row, message)
+	// The legacy thread is the conversation's remote ID, not its v2 ID: a
+	// migrated store and v2 ingest key conversations by derived hash, and the
+	// legacy upsert would move an existing message into a hash-named thread
+	// the legacy UI never lists. For a conversation the mirror created the
+	// two are equal.
+	conversation, err := p.V2Store.GetConversation(row.ConversationID)
+	if err != nil {
+		return fmt.Errorf("project confirmed outbox item %q: load v2 conversation: %w", row.OutboxID, err)
+	}
+	if conversation.AccountID != row.AccountID {
+		return fmt.Errorf(
+			"project confirmed outbox item %q: v2 conversation %q belongs to account %q",
+			row.OutboxID,
+			conversation.ConversationID,
+			conversation.AccountID,
+		)
+	}
+	legacyConversationID := strings.TrimSpace(conversation.RemoteConversationID)
+	if legacyConversationID == "" {
+		return fmt.Errorf(
+			"project confirmed outbox item %q: v2 conversation %q has no remote id",
+			row.OutboxID,
+			conversation.ConversationID,
+		)
+	}
+
+	legacyMessage, err := legacyProjection(row, message, legacyConversationID)
 	if err != nil {
 		return err
 	}
@@ -249,19 +275,23 @@ func (p *Projector) projectMessageRow(
 		return fmt.Errorf("project confirmed outbox item %q into legacy store: %w", row.OutboxID, err)
 	}
 	if p.Events != nil {
-		p.Events.PublishMessages(row.ConversationID)
+		p.Events.PublishMessages(legacyConversationID)
 		p.Events.PublishConversations()
 	}
 	return nil
 }
 
-func legacyProjection(row sqlite.PendingRow, message sqlite.Message) (*db.Message, error) {
+func legacyProjection(
+	row sqlite.PendingRow,
+	message sqlite.Message,
+	legacyConversationID string,
+) (*db.Message, error) {
 	resultRemoteID := ""
 	if row.ResultRemoteID != nil {
 		resultRemoteID = strings.TrimSpace(*row.ResultRemoteID)
 	}
 	projected := &db.Message{
-		ConversationID: row.ConversationID,
+		ConversationID: legacyConversationID,
 		Body:           message.Body,
 		TimestampMS:    row.UpdatedAtMS,
 		IsFromMe:       true,

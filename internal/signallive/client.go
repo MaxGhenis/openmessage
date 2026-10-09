@@ -4265,11 +4265,11 @@ func (b *Bridge) signalQuoteArgs(replyToID, account string) ([]string, error) {
 	if b == nil || b.store == nil {
 		return nil, nil
 	}
-	target, err := b.store.GetMessageByID(replyToID)
+	target, err := b.signalReplyTarget(replyToID)
 	if err != nil {
-		return nil, fmt.Errorf("load Signal reply target: %w", err)
+		return nil, err
 	}
-	if target == nil || target.SourcePlatform != "signal" {
+	if target == nil {
 		return nil, errors.New("signal reply target not found")
 	}
 	if target.TimestampMS == 0 {
@@ -4296,6 +4296,30 @@ func (b *Bridge) signalQuoteArgs(replyToID, account string) ([]string, error) {
 		"--quote-author", author,
 		"--quote-message", quoteBody,
 	}, nil
+}
+
+// signalReplyTarget loads the legacy Signal message a reply quotes. replyToID
+// is either a legacy message ID ("signal:<id>") or a v2 remote message ID. v2
+// keys a message the legacy store also holds by that legacy ID without its
+// "signal:" prefix (the migration's source ID, and the bare timestamp the v2
+// decoder gives a sent message), so a bare ID that is not itself a legacy
+// message ID is retried with the prefix. A legacy ID resolves exactly as
+// before. It returns nil when neither form names a Signal message.
+func (b *Bridge) signalReplyTarget(replyToID string) (*db.Message, error) {
+	candidates := []string{replyToID}
+	if !strings.HasPrefix(replyToID, "signal:") {
+		candidates = append(candidates, "signal:"+replyToID)
+	}
+	for _, candidate := range candidates {
+		target, err := b.store.GetMessageByID(candidate)
+		if err != nil {
+			return nil, fmt.Errorf("load Signal reply target: %w", err)
+		}
+		if target != nil && target.SourcePlatform == "signal" {
+			return target, nil
+		}
+	}
+	return nil, nil
 }
 
 func (b *Bridge) writeLocalAttachment(data []byte, filename string) (string, error) {

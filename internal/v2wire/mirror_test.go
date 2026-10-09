@@ -3,7 +3,9 @@ package v2wire
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -147,11 +149,26 @@ func TestMirrorReplyTargetDerivesRemoteIDsAndTypedErrors(t *testing.T) {
 			wantRemoteID:   "wa-remote",
 		},
 		{
-			name:           "signal full legacy id",
+			// The migration and the sync-message decoder key it the same way.
+			name:           "signal bare timestamp",
 			conversationID: "signal:+15551230000",
 			platform:       "signal",
 			message:        &db.Message{MessageID: "signal:1700000000123", SourceID: "1700000000123", Body: "signal body", TimestampMS: 1_700_000_000_123},
-			wantRemoteID:   "signal:1700000000123",
+			wantRemoteID:   "1700000000123",
+		},
+		{
+			name:           "signal source id other than its timestamp",
+			conversationID: "signal:+15551230000",
+			platform:       "signal",
+			message:        &db.Message{MessageID: "signal:1700000000124", SourceID: "1700000000999", Body: "signal body", TimestampMS: 1_700_000_000_124},
+			wantErr:        ErrReplyTargetUnavailable,
+		},
+		{
+			name:           "signal received hash unavailable",
+			conversationID: "signal:+15551230000",
+			platform:       "signal",
+			message:        &db.Message{MessageID: "signal:0a1b2c", SourceID: "0a1b2c", Body: "signal body", TimestampMS: 1_700_000_000_125},
+			wantErr:        ErrReplyTargetUnavailable,
 		},
 		{
 			name:           "signal local unavailable",
@@ -232,6 +249,117 @@ func TestMirrorReplyTargetReturnsExistingNaturalKeyMessageID(t *testing.T) {
 	if got != existingLocalID {
 		t.Fatalf("MirrorReplyTarget() = %q, want existing %q", got, existingLocalID)
 	}
+}
+
+// TestMirrorReplyTargetReusesEarlierFullIDSignalCopy covers a store the mirror
+// wrote before Signal reply targets used the bare timestamp: the copy it
+// stored under the full legacy ID is reused, not joined by a second one.
+func TestMirrorReplyTargetReusesEarlierFullIDSignalCopy(t *testing.T) {
+	legacy := openLegacyTestStore(t)
+	v2 := openV2TestStore(t)
+	seedLegacyConversation(t, legacy, "signal:+15551230000", "signal", false)
+	target := &db.Message{
+		MessageID: "signal:1700000000123", ConversationID: "signal:+15551230000",
+		SourcePlatform: "signal", SourceID: "1700000000123", IsFromMe: true,
+		Body: "sent before the upgrade", TimestampMS: 1_700_000_000_123,
+	}
+	if err := legacy.UpsertMessage(target); err != nil {
+		t.Fatalf("legacy UpsertMessage(): %v", err)
+	}
+	if _, _, err := MirrorConversation(legacy, v2, target.ConversationID); err != nil {
+		t.Fatalf("MirrorConversation(): %v", err)
+	}
+	const earlierID = "legacy-reply:earlier"
+	projectV2TestMessage(t, v2, sqlite.Message{
+		MessageID: earlierID, ConversationID: target.ConversationID,
+		AccountID: signalAccountID, RemoteMessageID: target.MessageID,
+		Direction: sqlite.MessageDirectionOutgoing, Body: target.Body,
+		State: sqlite.MessageStateActive, OccurredAtMS: target.TimestampMS,
+	})
+
+	got, err := MirrorReplyTarget(legacy, v2, target.MessageID)
+	if err != nil {
+		t.Fatalf("MirrorReplyTarget(): %v", err)
+	}
+	if got != earlierID {
+		t.Fatalf("MirrorReplyTarget() = %q, want the earlier copy %q", got, earlierID)
+	}
+	if count := countV2Messages(t, v2, target.ConversationID); count != 1 {
+		t.Fatalf("v2 messages in %q = %d, want 1", target.ConversationID, count)
+	}
+}
+
+// TestMirrorReplyTargetRefusesGoogleCopyUnderUnquotableSourceID covers a Google
+// row with a source_id other than its message ID. The migration keys it by the
+// source_id, which the Google transport cannot quote, so the mirror refuses
+// rather than add a second copy under the message ID; without such a copy it
+// projects under the message ID.
+func TestMirrorReplyTargetRefusesGoogleCopyUnderUnquotableSourceID(t *testing.T) {
+	for _, migrated := range []bool{true, false} {
+		t.Run(fmt.Sprintf("migrated copy %v", migrated), func(t *testing.T) {
+			legacy := openLegacyTestStore(t)
+			v2 := openV2TestStore(t)
+			seedLegacyConversation(t, legacy, "google-chat", "sms", false)
+			target := &db.Message{
+				MessageID: "google-message", SourceID: "google-source", ConversationID: "google-chat",
+				SourcePlatform: "sms", Body: "google body", TimestampMS: 1_900_000_000_020,
+			}
+			if err := legacy.UpsertMessage(target); err != nil {
+				t.Fatalf("legacy UpsertMessage(): %v", err)
+			}
+			if _, _, err := MirrorConversation(legacy, v2, target.ConversationID); err != nil {
+				t.Fatalf("MirrorConversation(): %v", err)
+			}
+			if migrated {
+				projectV2TestMessage(t, v2, sqlite.Message{
+					MessageID: "migrated-copy", ConversationID: target.ConversationID,
+					AccountID: googleAccountID, RemoteMessageID: target.SourceID,
+					Direction: sqlite.MessageDirectionIncoming, Body: target.Body,
+					State: sqlite.MessageStateActive, OccurredAtMS: target.TimestampMS,
+				})
+			}
+
+			got, err := MirrorReplyTarget(legacy, v2, target.MessageID)
+			if migrated {
+				if !errors.Is(err, ErrReplyTargetUnavailable) || !strings.Contains(err.Error(), "google-source") {
+					t.Fatalf("MirrorReplyTarget() = %q, %v; want ErrReplyTargetUnavailable naming the source id", got, err)
+				}
+				if count := countV2Messages(t, v2, target.ConversationID); count != 1 {
+					t.Fatalf("v2 messages = %d, want only the migrated copy", count)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("MirrorReplyTarget(): %v", err)
+			}
+			repository, err := sqlite.NewMessageRepository(v2, time.Now)
+			if err != nil {
+				t.Fatalf("NewMessageRepository(): %v", err)
+			}
+			message, err := repository.GetMessage(context.Background(), got)
+			if err != nil || message.RemoteMessageID != target.MessageID {
+				t.Fatalf("mirrored target = %+v, %v; want remote %q", message, err, target.MessageID)
+			}
+		})
+	}
+}
+
+func countV2Messages(t *testing.T, store *sqlite.Store, conversationID string) int {
+	t.Helper()
+	return len(listV2Messages(t, store, conversationID))
+}
+
+func listV2Messages(t *testing.T, store *sqlite.Store, conversationID string) []sqlite.Message {
+	t.Helper()
+	repository, err := sqlite.NewMessageRepository(store, time.Now)
+	if err != nil {
+		t.Fatalf("NewMessageRepository(): %v", err)
+	}
+	messages, err := repository.ListMessagesByConversation(context.Background(), conversationID, 0, "", 10_000)
+	if err != nil {
+		t.Fatalf("ListMessagesByConversation(%q): %v", conversationID, err)
+	}
+	return messages
 }
 
 func openLegacyTestStore(t *testing.T) *db.Store {
