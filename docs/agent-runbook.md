@@ -474,7 +474,7 @@ hung daemon, and it alerts when the daemon is up but a platform has gone
 quiet.
 
 This section follows the script's code on Max's local dotfiles `master` at
-`ffda554` (2026-10-09). The script's header comment summarizes the checks but
+`2538865` (2026-10-09). The script's header comment summarizes the checks but
 is incomplete: it leaves out the inbox-read alert and the parse-error path,
 and it lists a top-level `projection_stalled` check that never fires (the
 daemon publishes that flag inside `freshness`).
@@ -514,6 +514,19 @@ a copy ([testing a change](#testing-a-change)).
   `1` until it is announced), `python.stderr` and `health.txt`. Times are
   epoch seconds. Deleting a `paired_` file makes the platform's next unpaired
   run a first sighting, which is only logged.
+
+  Since dotfiles `2538865` a platform name from the status is encoded before
+  it names a file or appears in an alert key, the log, health.txt or a
+  notification. Lowercase ASCII letters, digits and `._-` stay, and every
+  other byte becomes `%XX`, so `Signal` would be `%53ignal`. A name whose
+  encoding runs past 64 characters is cut to its first 40, plus `~` and 16
+  hex digits of its SHA-256. The daemon's platform keys (`google`,
+  `whatsapp`, `signal`) encode to themselves, so the state files kept their
+  names. Before `2538865` a name went in raw. A `/` in it, or a name past the
+  file-name length limit, made its stamp writes fail, so its alert notified
+  on every run. Names differing only in case shared a file, since the volume
+  ignores case: a status with `signal` paired and `Signal` unpaired
+  announced a lost pairing every 6 hours.
 
   Since dotfiles `ea25916` every counter and time is read through
   `read_state`. A file that isn't a canonical decimal (digits only, no
@@ -855,10 +868,18 @@ into place only once the last line, `# end`, is written, so a reader sees one
 run's complete file. Lines end in `\n`, and every ASCII control character
 inside a value (tab, CR, DEL, …) becomes a space, so each value stays on its
 line. C1 controls, U+2028 and U+2029 pass through, so split on `\n` only. A
-newline in daemon text never gets that far: the script reads the Python
-block's output line by line, so a newline in, say, Signal's
-`last_issue_reason` cuts that alert off there, and the rest is read as a line
-of its own (a separate alert if it is shaped like one). After the comment line
+newline in daemon text never gets that far. The script reads the Python
+block's output line by line, and since dotfiles `2538865` the block turns
+every ASCII control character and lone surrogate in a line into a space
+before printing it. A newline in, say, Signal's `last_issue_reason` now stays
+inside its alert as a space. Before `2538865` it cut that alert off there,
+and the rest was read as a line of its own. A rest shaped like
+`ALERT|key|text` became an alert with its own cooldown stamp, counted in the
+notification like any other (the 2026-10-09 reproduction showed "(+1 more -
+see log)"). One shaped like another line kind (`DISC|google`, `PAIRED|x`, …)
+was acted on as that kind, and anything else was ignored. A lone surrogate (a
+`\ud800`-style escape in the JSON) usually made the block exit with an
+error, so that run's staleness checks did not run. After the comment line
 come:
 
 - `updated` and `updated_epoch`: the run's clock, in local time and epoch
@@ -982,7 +1003,7 @@ this sandboxed and stub `osascript`/`open`/`pgrep`/`pkill` first on `PATH`.
 `test_openmessage_watchdog_append_errors.py` and
 `test_openmessage_watchdog_pull_health.py` next to it cover those two alerts.
 The suites use Hypothesis, which the plain `pytest` on Max's Mac lacks, so run
-them through `uvx` (226 tests, about 7 minutes at `ffda554`):
+them through `uvx` (234 tests, 6 to 9 minutes at `2538865`):
 
 ```bash
 cd ~/dotfiles && PYTHONDONTWRITEBYTECODE=1 uvx --with hypothesis pytest -q -p no:cacheprovider tests/test_openmessage_watchdog.py tests/test_openmessage_watchdog_append_errors.py tests/test_openmessage_watchdog_pull_health.py
