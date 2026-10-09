@@ -300,8 +300,11 @@ stops there, can't fill it.
   counts too: if no Google traffic arrived for long enough to be stalled,
   the window is fetched when traffic resumes. If a gap's baseline can't be
   read, the gap goes on an `unjudged` list (saved with the state) and is
-  judged again every minute until a read succeeds; a gap still unjudged when
-  its window passes 7 days ends with a notice instead of being dropped.
+  judged again each minute, three gaps a minute, longest untried first,
+  until a read succeeds. When its window passes 7 days it gets one last read;
+  if that fails too it ends with a notice instead of being dropped. A
+  silence judged late this way can be earlier than one already owed: it then
+  takes over that episode and its window reaches back to it.
 - When something new arrives after a stalled silence (on a v2-primary daemon a
   live `google.protobuf` inbox frame; fetched history uses the separate
   `google.protobuf.history` codec, so the recovery's own fetch can't end a
@@ -312,6 +315,8 @@ stops there, can't fill it.
   write, so there a catch-up that stores a newer message also ends a silence.
 - It starts a fetch only over a healthy session: Google paired, connected,
   not `auth_expired` or `needs_repair`, phone responding. Otherwise it waits.
+  It also waits (`waiting: "state_not_saved"`) while its state file can't be
+  saved, since a run that crashed the daemon then wouldn't be counted.
   It never starts a reconnect or a re-pair itself. A 401 during its fetch is
   handled like any other pull's: the session is marked expired, the current
   Google connection ends, and the supervisor, which owns repair and
@@ -320,35 +325,43 @@ stops there, can't fill it.
 - Each request it makes gets 2 minutes. libgm waits for a reply with no hard
   timeout, so without this one request the phone never answers would hold
   the backfill guard, and the reconciles it refuses, until a restart. After
-  one miss the rest of that run fails fast and counts as `partial`.
+  one miss the rest of that run fails fast; the run counts as `partial`
+  unless the client changed (`aborted`) or the INBOX listing had already
+  answered with nothing. A panic inside a request still reaches the
+  recovery's own tick and is recorded as `crashed`.
 - A run counts as recovered only if the pull path returned data. The run's
   own first INBOX listing is classified the way `google.pull_health` (#193)
   classifies that counted pull, but read off this run alone, since the shared
   snapshot can be stale or overwritten by another pull meanwhile; it shows
   up as `last_attempt.inbox_outcome`. The run is `empty` (the 10/7 defect)
-  when that listing came back empty or without a payload, when the listings
-  returned nothing without an error, or when every in-window conversation
-  fetched nothing. It is `partial` when the INBOX listing failed, on listing,
-  fetch or store errors, on failed v2 hand-offs, when an in-window
-  conversation fetched nothing while others worked, or when messages never
-  reached v2 on a v2-primary daemon. It is `aborted` when the client changed
-  or Google rejected the session mid-run, and `crashed` when the run
-  panicked or the daemon stopped during it. Retries wait 5 m, 15 m, 30 m,
-  1 h, 2 h, then every 4 h. `empty` and `aborted` episodes keep trying (an
-  empty listing costs three calls) until the window passes 7 days, so they
-  recover on their own once pulls work or the connection settles. After 7
-  `partial` or `crashed` attempts an episode is given up with a notice.
+  when that listing came back without a payload, when every listing came
+  back empty without an error, or when every in-window conversation fetched
+  nothing. It is `partial` when the INBOX listing failed or came back empty
+  while other folders listed conversations (an inbox that really is empty
+  ends here too, with a notice that says so), on listing, fetch or store
+  errors, when an in-window conversation fetched nothing while others
+  worked, and, on a v2-primary daemon, on failed v2 hand-offs or messages
+  that never reached v2. It is `aborted` when the client changed or Google
+  rejected the session mid-run, and `crashed` when the run panicked or the
+  daemon stopped during it. Retries wait 5 m, 15 m, 30 m, 1 h, 2 h, then
+  every 4 h. `empty` and `aborted` episodes keep trying (when every folder
+  answers empty, a try costs three calls) until the window passes 7 days, so
+  they recover on their own once pulls work or the connection settles.
+  After 7 `partial` or `crashed` attempts an episode is given up with a
+  notice.
 - A window wider than 7 days is never fetched automatically; it gets a notice
   instead. That includes an app left off for over a week and a Google
   account unpaired for that long, so after a re-pair expect a notice there.
   A silence that ended while an earlier one was still owed joins that
-  window; if the earlier window turns out too large, the later silence is
-  owed again on its own window.
+  window, and the next attempt waits until the latest of them has settled;
+  if the window turns out too large, the later silences are owed again on
+  their own windows.
 - Each silence is queued once and gets one recovery, across restarts. The
   state lives in `google-silence-recovery.json` in the data dir. An
-  unreadable file is moved to `google-silence-recovery.json.unreadable-<ms>`
-  and reported in `state_load_error`; if it can't be moved or copied, it is
-  left untouched and nothing is saved. A run cut off by a quit or crash
+  unreadable file is moved (or, failing that, copied) to
+  `google-silence-recovery.json.unreadable-<ms>` (with a `-<n>` suffix if
+  that name is taken) and reported in `state_load_error`; if neither works,
+  it is left untouched and nothing is saved. A run cut off by a quit or crash
   before its result was saved counts as a `crashed` attempt and runs again
   after the backoff (so its window can be fetched twice), and a run that
   keeps crashing the daemon is given up rather than looping.
@@ -362,7 +375,9 @@ curl -s http://127.0.0.1:7007/api/backfill/status | jq '{running, trigger, since
 `flagged` is set while a stalled silence is still going on. `pending` is the
 owed run: `running_since_ms` while it runs, `waiting` says why it hasn't
 started, and `last_attempt` what the last try found. `unjudged` lists gaps
-waiting for a readable baseline. `last` is the latest finished silence.
+waiting for a readable baseline, and `baseline_error` the latest failed
+baseline read (`activity_error` is the latest failed read of the activity
+clock itself). `last` is the latest finished silence.
 `notices` lists, newest first, the notices of silences that gave up, were too
 large or could never be judged in the last 14 days, each with the command to
 run by hand (`notice` is the newest); the history keeps those episodes for

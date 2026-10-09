@@ -212,7 +212,7 @@ func TestRecovererMatchesAnOfflineOracle(t *testing.T) {
 	if testing.Short() {
 		cases = 8
 	}
-	mergesSeen, tooLargeSeen, injectedFailures := 0, 0, 0
+	mergesSeen, tooLargeSeen, injectedFailures, latestOutages, unjudgedSeen := 0, 0, 0, 0, 0
 	for c := 0; c < cases; c++ {
 		seed := int64(20261008 + c)
 		t.Run(fmt.Sprintf("seed%d", seed), func(t *testing.T) {
@@ -226,9 +226,20 @@ func TestRecovererMatchesAnOfflineOracle(t *testing.T) {
 			src := &fakeSource{clock: &clock, events: s.events}
 			// One baseline read in ten fails (baseline reads span weeks; the
 			// gap walks span hours).
+			// Baseline reads (local midnight to local midnight) fail one in ten
+			// at random, and all of them during bursts of 1h to 9 days.
 			baselineFailures := true
+			var burstUntil time.Time
+			isBaseline := func(from, to time.Time) bool {
+				f, e := from.In(cfg.Location), to.In(cfg.Location)
+				return f.Hour() == 0 && f.Minute() == 0 && f.Second() == 0 && f.Nanosecond() == 0 &&
+					e.Hour() == 0 && e.Minute() == 0 && e.Second() == 0 && e.Nanosecond() == 0
+			}
 			src.betweenErr = func(from, to time.Time) error {
-				if baselineFailures && to.Sub(from) > 3*24*time.Hour && r.Intn(10) == 0 {
+				if !baselineFailures || !isBaseline(from, to) {
+					return nil
+				}
+				if clock.Before(burstUntil) || r.Intn(10) == 0 {
 					injectedFailures++
 					return fmt.Errorf("database is locked")
 				}
@@ -267,7 +278,37 @@ func TestRecovererMatchesAnOfflineOracle(t *testing.T) {
 			}
 			rec := newRecoverer()
 			readyAgain := time.Time{}
+			var latestOutageUntil, downUntil time.Time
+			first := true
 			for clock.Before(s.end) {
+				if !first {
+					// The activity clock can't be read for 1h to 3 days, so the
+					// next good read crosses many gaps at once.
+					if latestOutageUntil.IsZero() && r.Intn(200) == 0 {
+						latestOutageUntil = clock.Add(time.Hour + time.Duration(r.Int63n(int64(3*24*time.Hour))))
+						src.latestErr = fmt.Errorf("database is locked")
+						latestOutages++
+					}
+					if r.Intn(200) == 0 {
+						burstUntil = clock.Add(time.Hour + time.Duration(r.Int63n(int64(9*24*time.Hour))))
+					}
+					// The daemon is down for 1h to 4 days: no ticks, then a restart.
+					if r.Intn(300) == 0 {
+						downUntil = clock.Add(time.Hour + time.Duration(r.Int63n(int64(4*24*time.Hour))))
+					}
+				}
+				first = false
+				if !latestOutageUntil.IsZero() && !clock.Before(latestOutageUntil) {
+					latestOutageUntil = time.Time{}
+					src.latestErr = nil
+				}
+				if clock.Before(downUntil) {
+					clock = clock.Add(time.Duration(1+r.Intn(45)) * time.Minute)
+					if !clock.Before(downUntil) {
+						rec = newRecoverer()
+					}
+					continue
+				}
 				// Google is sometimes unable to serve a fetch for a while (1h to
 				// 10 days), which makes later silences merge into a pending one
 				// and windows outgrow MaxWindow.
@@ -310,11 +351,13 @@ func TestRecovererMatchesAnOfflineOracle(t *testing.T) {
 				}
 				clock = clock.Add(time.Duration(1+r.Intn(45)) * time.Minute)
 			}
-			// Let anything still owed finish.
+			// Let anything still owed finish. Tick a few times regardless, so a
+			// scan an outage held back at the end still happens.
 			runner.ready, runner.reason = true, ""
 			crashNext = false
 			baselineFailures = false
-			for i := 0; i < 400 && (rec.State().Pending != nil || len(rec.State().Unjudged) > 0); i++ {
+			src.latestErr = nil
+			for i := 0; i < 400 && (i < 5 || rec.State().Pending != nil || len(rec.State().Unjudged) > 0); i++ {
 				runner.results = []runOutcome{goodRun}
 				nextGood = true
 				rec.Tick(context.Background())
@@ -355,9 +398,15 @@ func TestRecovererMatchesAnOfflineOracle(t *testing.T) {
 			completed := map[int64][]*run{}
 			for _, run := range runs {
 				key := run.since.Add(cfg.Margin).UnixMilli()
-				episode, ok := episodes[key]
+				// A run starts at its episode's owner. An earlier silence judged
+				// late can take ownership afterwards, so a run that didn't
+				// recover may start at a silence now covered by the episode.
+				episode, ok := owner[key]
 				if !ok || !want[key] {
 					t.Fatalf("fetched from %v, which no stalled silence explains", run.since)
+				}
+				if run.completed && run.good && episode.LastEventMS != key {
+					t.Fatalf("a good run from %v, but the silence it started at is owned by the episode after %v", run.since, time.UnixMilli(episode.LastEventMS))
 				}
 				if run.at.Sub(run.since) > cfg.MaxWindow {
 					t.Fatalf("fetched a %v window from %v, over MaxWindow", run.at.Sub(run.since), run.since)
@@ -395,7 +444,11 @@ func TestRecovererMatchesAnOfflineOracle(t *testing.T) {
 				case StateGaveUp:
 					// Seven partial or crashed attempts: allowed, rare.
 				case StateUnjudged:
-					t.Fatalf("stalled silence after %v was never judged although baselines failed only one read in ten", time.UnixMilli(key))
+					// A baseline burst outlasted the window: allowed, with a notice.
+					unjudgedSeen++
+					if key != episode.LastEventMS {
+						t.Fatalf("silence after %v covered by an unjudged gap", time.UnixMilli(key))
+					}
 				case StateWindowTooLarge:
 					tooLargeSeen++
 					if key != episode.LastEventMS {
@@ -409,14 +462,15 @@ func TestRecovererMatchesAnOfflineOracle(t *testing.T) {
 				}
 			}
 			for key, episode := range owner {
-				if !want[key] {
+				if !want[key] && episode.State != StateUnjudged {
 					t.Fatalf("episode after %v (%s) that no stalled silence explains", time.UnixMilli(key), episode.State)
 				}
 			}
 			mergesSeen += merges
 		})
 	}
-	t.Logf("across all cases: %d merged silences, %d too-large episodes, %d failed baseline reads", mergesSeen, tooLargeSeen, injectedFailures)
+	t.Logf("across all cases: %d merged silences, %d too-large episodes, %d failed baseline reads, %d activity outages, %d stalled silences never judged",
+		mergesSeen, tooLargeSeen, injectedFailures, latestOutages, unjudgedSeen)
 	if !testing.Short() && (mergesSeen == 0 || tooLargeSeen == 0 || injectedFailures == 0) {
 		t.Fatalf("the generator no longer produces merges (%d), too-large windows (%d) and baseline failures (%d)", mergesSeen, tooLargeSeen, injectedFailures)
 	}

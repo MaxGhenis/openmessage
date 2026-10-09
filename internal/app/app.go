@@ -54,8 +54,9 @@ type BackfillSnapshot struct {
 	// Trigger names what started the current or last run: "deep" for a deep
 	// backfill (POST /api/backfill, or the supervisor's after pairing),
 	// "window" for POST /api/backfill {"since": ...}, and "silence_recovery"
-	// for the automatic window backfill after a flagged silence ends. SinceMS
-	// is a window run's start (Unix ms); deep runs leave it zero.
+	// for the automatic window backfill after a flagged silence ends. The
+	// shallow startup backfill does not report progress and leaves it as it
+	// was. SinceMS is a window run's start (Unix ms); deep runs leave it zero.
 	Trigger string `json:"trigger,omitempty"`
 	SinceMS int64  `json:"since_ms,omitempty"`
 }

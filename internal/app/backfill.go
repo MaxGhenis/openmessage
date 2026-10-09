@@ -226,7 +226,7 @@ type GoogleWindowBackfillResult struct {
 	// Listed counts the distinct conversations the folder listings returned,
 	// in the window or not. Zero means the phone listed nothing at all.
 	Listed int
-	// Conversations counts the listed conversations kept as in the window.
+	// Conversations counts the in-window conversations stored without error.
 	Conversations int
 	// Messages counts the messages fetched from those conversations.
 	Messages int
@@ -258,8 +258,10 @@ func (a *App) StartGoogleWindowBackfill(since time.Time) bool {
 }
 
 // RunGoogleWindowBackfill runs a window backfill from since on the calling
-// goroutine and returns its result. It takes the same guard as every other
-// backfill and reports false, without running, when one is already running.
+// goroutine and returns its result. It takes the guard the startup, deep and
+// window backfills share and reports false, without running, when one of them
+// is already running. (The phone backfill and the recent reconcile don't take
+// it.)
 // trigger is recorded in BackfillSnapshot.Trigger.
 func (a *App) RunGoogleWindowBackfill(since time.Time, trigger string) (GoogleWindowBackfillResult, bool) {
 	if !a.beginBackfill() {

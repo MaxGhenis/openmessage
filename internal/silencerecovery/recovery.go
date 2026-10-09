@@ -10,7 +10,9 @@
 //
 // A Recoverer watches the same activity clock the status payload judges
 // silence by. When a silence that was stalled ends, which means the live
-// channel delivered something after it, the Recoverer runs one guarded window
+// channel delivered something after it (on a daemon whose readers use the
+// legacy store, a catch-up that stores a newer message counts too), the
+// Recoverer runs one guarded window
 // backfill from just before the silence began, so the messages the phone
 // created during it reach both stores. Its state lives in a small JSON file,
 // so each silence gets one recovery across restarts; only a run cut off before
@@ -51,7 +53,8 @@ const (
 	// counts it as a crashed attempt.
 	StateRunning = "running"
 	// StateRecovered: a window backfill returned data for the window, or
-	// showed that no conversation had a message inside it.
+	// showed that no conversation had a message inside it. Earlier empty or
+	// aborted attempts may already have fetched part of it.
 	StateRecovered = "recovered"
 	// StateGaveUp: len(Config.Backoff)+1 attempts were partial or crashed;
 	// Notice says what to do.
@@ -74,12 +77,14 @@ const (
 	// a message inside the window, so nothing was missing.
 	OutcomeNothingInWindow = "nothing_in_window"
 	// OutcomeEmpty: the pull path answered with nothing (the 2026-10-07
-	// defect): the run's first INBOX listing came back empty or without a
-	// payload, or every in-window conversation fetched nothing.
+	// defect): the run's first INBOX listing came back without a payload,
+	// every listing came back empty without an error, or every in-window
+	// conversation fetched nothing.
 	OutcomeEmpty = "empty"
-	// OutcomePartial: listings, fetches or store writes failed, an in-window
-	// conversation fetched nothing while others worked, or history did not
-	// reach v2.
+	// OutcomePartial: listings, fetches or store writes failed, the INBOX
+	// listing came back empty while other folders listed conversations, an
+	// in-window conversation fetched nothing while others worked, or, when
+	// readers use v2, history did not reach it.
 	OutcomePartial = "partial"
 	// OutcomeAborted: the run stopped early because the client changed or
 	// disconnected, or Google rejected the session.
@@ -101,8 +106,9 @@ type Config struct {
 	Interval time.Duration
 	// Settle delays the first attempt after a silence ends, so the backlog
 	// the phone pushes when it resumes, and any reconnect catch-up, usually
-	// land first. Nothing waits for them; a catch-up still holding the
-	// backfill guard makes the attempt retry after BusyRetry.
+	// land first. Nothing waits for them: the reconnect reconcile does not
+	// take the backfill guard and may run alongside; a backfill that holds
+	// the guard makes the attempt retry after BusyRetry.
 	Settle time.Duration
 	// Margin moves the window start this far before the silence's last
 	// event, for clock skew between the receipt clock and message times.
@@ -115,13 +121,15 @@ type Config struct {
 	BusyRetry time.Duration
 	// Backoff[i] is the wait after attempt i+1 when it did not recover the
 	// silence; later attempts wait the last entry. An episode is given up
-	// after len(Backoff)+1 failed attempts (partial, aborted or cut off by a
-	// crash). Empty attempts, where the pull path returned no data, never
-	// give up: the episode keeps probing until its window exceeds MaxWindow,
-	// so it recovers on its own once the pull path works again.
+	// after len(Backoff)+1 partial or crashed attempts. Empty attempts (the
+	// pull path returned no data) and aborted ones (the connection changed)
+	// never give up: the episode keeps trying until its window exceeds
+	// MaxWindow, so it recovers on its own once the pull path works again.
 	Backoff []time.Duration
-	// PersistEvery bounds how stale the persisted watermark may get. Episode
-	// changes are always persisted at once.
+	// PersistEvery bounds how stale the persisted watermark may get. New,
+	// started, finished and merged episodes are persisted at once; failure
+	// counts of unjudged gaps and the record of a run cut off by a crash
+	// ride this periodic save.
 	PersistEvery time.Duration
 	// HistoryLimit is how many finished episodes the state file keeps.
 	HistoryLimit int
@@ -229,8 +237,10 @@ type Episode struct {
 	// Rule is the stall rule that flagged it.
 	Rule         string `json:"rule"`
 	DetectedAtMS int64  `json:"detected_at_ms"`
-	// SinceMS is the window start: LastEventMS minus Config.Margin. A later
-	// silence merged in (Covers) starts after it, so its window is inside.
+	// SinceMS is the window start: LastEventMS minus Config.Margin. The
+	// episode is always owned by the earliest silence it covers (a silence
+	// judged late can take over and move the start back), so every covered
+	// silence's window is inside.
 	SinceMS  int64  `json:"since_ms"`
 	State    string `json:"state"`
 	Attempts int    `json:"attempts"`
@@ -266,8 +276,9 @@ type State struct {
 	Pending     *Episode  `json:"pending,omitempty"`
 	History     []Episode `json:"history,omitempty"`
 	// Unjudged holds gaps long enough to be stalled whose baseline could not
-	// be read. They are judged again every tick until a verdict comes in or
-	// their window exceeds MaxWindow.
+	// be read. Each tick retries up to maxUnjudgedPerTick of them, longest
+	// untried first, until a verdict comes in or their window exceeds
+	// MaxWindow.
 	Unjudged []Gap `json:"unjudged,omitempty"`
 }
 
@@ -299,6 +310,7 @@ type Recoverer struct {
 	loadErr     string
 	saveErr     string
 	activityErr string
+	baselineErr string
 	// readOnly is set when an unreadable state file could not be preserved;
 	// saving then would destroy it, so nothing is saved.
 	readOnly bool
@@ -316,8 +328,9 @@ const NoticeTTL = 14 * 24 * time.Hour
 const maxUnjudgedPerTick = 3
 
 // New builds a Recoverer whose state lives at statePath (empty keeps it in
-// memory only). It loads any existing state; an unreadable file is logged and
-// replaced on the next save.
+// memory only). It loads any existing state. An unreadable file is logged,
+// reported in Snapshot.StateLoadError and moved or copied aside; if neither
+// works it is left alone and nothing is saved over it.
 func New(
 	cfg Config,
 	source freshness.ActivitySource,
@@ -444,19 +457,19 @@ func (r *Recoverer) Tick(ctx context.Context) {
 }
 
 // runAttempt runs a planned attempt and records its result. A run that
-// panics is recorded as an aborted attempt before the panic continues, so the
+// panics is recorded as a crashed attempt before the panic continues, so the
 // episode is retried on the backoff schedule instead of staying "running"
 // until the next restart.
 func (r *Recoverer) runAttempt(plan *attemptPlan) {
-	finished := false
+	returned := false
 	defer func() {
-		if !finished {
+		if !returned {
 			r.finishCrashed(plan.key, plan.startedAt.UnixMilli(), "the run panicked", r.now())
 		}
 	}()
 	result, started := r.runner.RunWindowBackfill(plan.since)
+	returned = true
 	r.finishAttempt(plan, result, started, r.now())
-	finished = true
 }
 
 // detected is a stalled silence found by observe.
@@ -508,7 +521,7 @@ func (r *Recoverer) observe(ctx context.Context, now time.Time) {
 		if err != nil {
 			// Without its baseline the silence can't be flagged before the
 			// floor rule; say so. Its end is judged again when traffic resumes.
-			r.noteActivityError(fmt.Errorf("baseline for the silence after %s: %w", watermark.Format(time.RFC3339), err))
+			r.noteBaselineError(fmt.Errorf("baseline for the silence after %s: %w", watermark.Format(time.RFC3339), err))
 		}
 		if !verdict.Stalled {
 			return
@@ -565,7 +578,7 @@ func (r *Recoverer) observe(ctx context.Context, now time.Time) {
 				// Not stalled without its baseline, which can't be read: keep
 				// the gap and judge it again each tick (retryUnjudged).
 				unjudged = append(unjudged, Gap{LastEventMS: prev.UnixMilli(), EndedAtMS: event.UnixMilli(), Failures: 1, LastError: err.Error()})
-				r.noteActivityError(fmt.Errorf("baseline for the silence after %s: %w", prev.Format(time.RFC3339), err))
+				r.noteBaselineError(fmt.Errorf("baseline for the silence after %s: %w", prev.Format(time.RFC3339), err))
 			}
 		}
 		prev = event
@@ -590,10 +603,11 @@ func (r *Recoverer) observe(ctx context.Context, now time.Time) {
 	r.pruneBaselines(latest.UnixMilli())
 }
 
-// retryUnjudged judges again the gaps whose baseline could not be read. A
-// verdict settles a gap: a stalled one becomes an episode, any other is
-// dropped. A gap still unjudged once its window exceeds MaxWindow is finished
-// with a notice, since nothing would be fetched for it anyway.
+// retryUnjudged judges again the gaps whose baseline could not be read, up to
+// maxUnjudgedPerTick a tick, longest untried first. A verdict settles a gap:
+// a stalled one becomes an episode, any other is dropped. A gap whose window
+// has passed MaxWindow gets one last read, outside the cap; if that fails too
+// it is finished with a notice, since nothing would be fetched for it anyway.
 func (r *Recoverer) retryUnjudged(ctx context.Context, now time.Time) {
 	r.mu.Lock()
 	gaps := append([]Gap(nil), r.state.Unjudged...)
@@ -601,21 +615,20 @@ func (r *Recoverer) retryUnjudged(ctx context.Context, now time.Time) {
 	if len(gaps) == 0 || r.source == nil {
 		return
 	}
-	var keep []Gap
+	var keep, tried []Gap
 	var settled []detected
 	var expired []Gap
-	tried := 0
+	reads := 0
 	for _, gap := range gaps {
 		last, end := time.UnixMilli(gap.LastEventMS), time.UnixMilli(gap.EndedAtMS)
-		if r.cfg.MaxWindow > 0 && now.Sub(last.Add(-r.cfg.Margin)) > r.cfg.MaxWindow {
-			expired = append(expired, gap)
-			continue
-		}
-		if tried >= maxUnjudgedPerTick {
+		expiring := r.cfg.MaxWindow > 0 && now.Sub(last.Add(-r.cfg.Margin)) > r.cfg.MaxWindow
+		if !expiring && reads >= maxUnjudgedPerTick {
 			keep = append(keep, gap)
 			continue
 		}
-		tried++
+		// A gap about to expire gets one last read, outside the cap: a
+		// verdict now beats a notice that it could not be judged.
+		reads++
 		verdict, err := r.judge(ctx, last, end)
 		switch {
 		case verdict.Stalled:
@@ -623,14 +636,21 @@ func (r *Recoverer) retryUnjudged(ctx context.Context, now time.Time) {
 		case err != nil:
 			gap.Failures++
 			gap.LastError = err.Error()
-			keep = append(keep, gap)
-			r.noteActivityError(fmt.Errorf("baseline for the silence after %s: %w", last.Format(time.RFC3339), err))
+			r.noteBaselineError(fmt.Errorf("baseline for the silence after %s: %w", last.Format(time.RFC3339), err))
+			if expiring {
+				expired = append(expired, gap)
+			} else {
+				tried = append(tried, gap)
+			}
 		default:
 			// Judged and not stalled: nothing is owed.
 		}
 	}
 	r.mu.Lock()
-	r.state.Unjudged = keep
+	// Gaps tried this tick go to the back, so a few that keep failing can't
+	// starve the rest of their reads.
+	r.state.Unjudged = append(keep, tried...)
+	remaining := len(r.state.Unjudged)
 	for _, found := range settled {
 		r.addEpisodeLocked(found, now)
 	}
@@ -639,7 +659,9 @@ func (r *Recoverer) retryUnjudged(ctx context.Context, now time.Time) {
 	}
 	r.dirty = true
 	r.mu.Unlock()
-	if len(settled) > 0 || len(expired) > 0 || tried > 0 {
+	// A settled or expired gap is saved at once; failure counts ride the
+	// periodic save.
+	if len(settled) > 0 || len(expired) > 0 || remaining < len(gaps) {
 		r.save(now)
 	}
 	for _, gap := range gaps {
@@ -700,6 +722,9 @@ func (r *Recoverer) judge(ctx context.Context, last, at time.Time) (freshness.Si
 		} else {
 			baseline = events
 			r.baselines[key] = events
+			r.mu.Lock()
+			r.baselineErr = ""
+			r.mu.Unlock()
 		}
 	}
 	return freshness.EvaluateSilence(last, baseline, at, r.cfg.Location, r.cfg.Silence), readErr
@@ -712,6 +737,17 @@ func (r *Recoverer) pruneBaselines(watermarkMS int64) {
 			delete(r.baselines, key)
 		}
 	}
+}
+
+// noteBaselineError records a failed baseline read; a successful one clears
+// it (judge).
+func (r *Recoverer) noteBaselineError(err error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.baselineErr == "" {
+		r.logger.Warn().Err(err).Msg("Silence recovery: baseline read failed; will retry")
+	}
+	r.baselineErr = err.Error()
 }
 
 func (r *Recoverer) noteActivityError(err error) {
@@ -737,23 +773,50 @@ func (r *Recoverer) addEpisodeLocked(found detected, now time.Time) {
 		return
 	}
 	sinceMS := found.last.Add(-r.cfg.Margin).UnixMilli()
-	// A merged silence always starts after the pending one (the watermark
-	// only moves forward), so the pending window already reaches back past it.
-	next := found.end.Add(r.cfg.Settle)
-	if next.Before(now) {
-		next = now
-	}
 	if pending := r.state.Pending; pending != nil {
-		pending.Covers = append(pending.Covers, Covered{LastEventMS: key, EndedAtMS: found.end.UnixMilli(), Rule: found.rule})
-		if pending.NextAttemptMS > next.UnixMilli() {
-			pending.NextAttemptMS = next.UnixMilli()
+		joined := Covered{LastEventMS: key, EndedAtMS: found.end.UnixMilli(), Rule: found.rule}
+		if key < pending.LastEventMS {
+			// An earlier silence, judged late (its baseline could not be read
+			// at first): it becomes the owner, and the window reaches back to
+			// it. The pending silence and its covers join it.
+			pending.Covers = append([]Covered{{
+				LastEventMS: pending.LastEventMS,
+				EndedAtMS:   pending.EndedAtMS,
+				Rule:        pending.Rule,
+			}}, pending.Covers...)
+			pending.LastEventMS = key
+			pending.EndedAtMS = joined.EndedAtMS
+			pending.SilentMS = joined.EndedAtMS - key
+			pending.Rule = found.rule
+			pending.SinceMS = sinceMS
+		} else {
+			pending.Covers = append(pending.Covers, joined)
 		}
+		// The next attempt comes once every silence the window owns has
+		// settled: sooner than a backoff would allow (there is new data to
+		// fetch), but never before the latest of them settles.
+		latestEnd := pending.EndedAtMS
+		for _, c := range pending.Covers {
+			if c.EndedAtMS > latestEnd {
+				latestEnd = c.EndedAtMS
+			}
+		}
+		next := time.UnixMilli(latestEnd).Add(r.cfg.Settle)
+		if next.Before(now) {
+			next = now
+		}
+		pending.NextAttemptMS = next.UnixMilli()
 		r.logger.Info().
 			Time("last_event", found.last).
 			Time("ended", found.end).
-			Int64("pending_last_event_ms", pending.LastEventMS).
+			Int64("owner_last_event_ms", pending.LastEventMS).
+			Time("since", time.UnixMilli(pending.SinceMS)).
 			Msg("Silence recovery: another stalled silence ended; it joins the pending window backfill")
 		return
+	}
+	next := found.end.Add(r.cfg.Settle)
+	if next.Before(now) {
+		next = now
 	}
 	r.state.Pending = &Episode{
 		LastEventMS:   key,
@@ -920,7 +983,22 @@ func (r *Recoverer) beginAttempt(now time.Time) *attemptPlan {
 	plan := &attemptPlan{key: pending.LastEventMS, since: since, startedAt: now}
 	attempt := pending.Attempts
 	r.mu.Unlock()
-	r.save(now)
+	if !r.save(now) {
+		// Without the running state on disk, a run that killed the daemon
+		// would not count against the episode, and could crash-loop it. Wait
+		// until the state can be saved.
+		r.mu.Lock()
+		if p := r.state.Pending; p != nil && p.LastEventMS == plan.key {
+			p.State = StatePending
+			p.RunningSinceMS = 0
+			p.Attempts--
+			p.Waiting = "state_not_saved"
+			p.NextAttemptMS = now.Add(r.cfg.BusyRetry).UnixMilli()
+		}
+		r.mu.Unlock()
+		r.logger.Warn().Msg("Silence recovery: the state file can't be saved; not starting a window backfill until it can")
+		return nil
+	}
 	r.logger.Info().
 		Time("since", since).
 		Int("attempt", attempt).
@@ -1023,9 +1101,10 @@ func (r *Recoverer) finishAttempt(plan *attemptPlan, result RunResult, started b
 		Msg(message)
 }
 
-// finishCrashed records an attempt that panicked (in this process) or was cut
-// off when the daemon stopped. It counts as a failure and backs off, so a run
-// that keeps crashing is given up instead of looping.
+// finishCrashed records an attempt that panicked in this process. It counts
+// as a failure and backs off, so a run that keeps crashing is given up
+// instead of looping. A run cut off when the daemon stopped is recorded the
+// same way on the next tick (recoverInterruptedLocked).
 func (r *Recoverer) finishCrashed(key, startedMS int64, detail string, now time.Time) {
 	r.mu.Lock()
 	r.crashedLocked(key, startedMS, detail, now)
@@ -1154,8 +1233,14 @@ func Classify(result RunResult, requireV2 bool) (string, string) {
 	switch {
 	case result.Aborted:
 		return OutcomeAborted, "the run stopped early: the client changed or disconnected, or Google rejected the session"
-	case result.InboxOutcome == InboxEmpty || result.InboxOutcome == InboxNoPayload:
-		return OutcomeEmpty, fmt.Sprintf("the phone answered the INBOX listing with no conversations (%s)", result.InboxOutcome)
+	case result.InboxOutcome == InboxNoPayload:
+		return OutcomeEmpty, "the phone answered the INBOX listing without a payload"
+	case result.InboxOutcome == InboxEmpty && result.Listed == 0 && result.Errors == 0:
+		return OutcomeEmpty, "the phone listed no conversations in any folder; its request/response calls return no data"
+	case result.InboxOutcome == InboxEmpty:
+		// Other folders answered with data, so the pull path works; the inbox
+		// may really be empty, or its listing broken. Bounded, not probed.
+		return OutcomePartial, fmt.Sprintf("the INBOX listing came back empty while other folders listed %d conversations; if the inbox really is empty, nothing was missed", result.Listed)
 	case result.InboxOutcome == InboxError:
 		return OutcomePartial, fmt.Sprintf("the INBOX listing failed (%d errors in all)", result.Errors)
 	case result.Listed == 0 && result.Errors == 0:
@@ -1164,7 +1249,7 @@ func Classify(result RunResult, requireV2 bool) (string, string) {
 		return OutcomePartial, fmt.Sprintf("the conversation listings failed (%d errors)", result.Errors)
 	case result.Conversations > 0 && result.Messages == 0 && result.Errors == 0:
 		return OutcomeEmpty, fmt.Sprintf("all %d in-window conversations fetched no messages", result.Conversations)
-	case result.Errors > 0 || result.HistoryTeeFailed > 0 || result.EmptyConversations > 0:
+	case result.Errors > 0 || (requireV2 && result.HistoryTeeFailed > 0) || result.EmptyConversations > 0:
 		return OutcomePartial, fmt.Sprintf(
 			"%d listing, fetch or store errors, %d in-window conversations fetched nothing, %d hand-offs to v2 failed",
 			result.Errors, result.EmptyConversations, result.HistoryTeeFailed)
@@ -1199,17 +1284,23 @@ type Snapshot struct {
 	MarginMS    int64    `json:"margin_ms"`
 	MaxWindowMS int64    `json:"max_window_ms"`
 	SettleMS    int64    `json:"settle_ms"`
-	// MaxFailedAttempts is how many partial or aborted attempts an episode
-	// gets before it is given up; empty attempts probe until MaxWindow.
+	// MaxFailedAttempts is how many partial or crashed attempts an episode
+	// gets before it is given up; empty and aborted attempts keep trying
+	// until MaxWindow.
 	MaxFailedAttempts int    `json:"max_failed_attempts"`
 	StatePath         string `json:"state_path,omitempty"`
 	// StateError is the latest failure to save the state file.
 	StateError string `json:"state_error,omitempty"`
-	// StateLoadError is why the state file could not be read at startup; the
-	// file was moved aside and the Recoverer started fresh.
+	// StateLoadError is why the state file could not be read at startup. The
+	// file was moved or copied aside and the Recoverer started fresh, or, if
+	// neither worked, it was left in place and nothing is saved.
 	StateLoadError string `json:"state_load_error,omitempty"`
-	// ActivityError is the latest activity query failure, until one succeeds.
+	// ActivityError is the latest failure to read the activity clock, until
+	// a read succeeds.
 	ActivityError string `json:"activity_error,omitempty"`
+	// BaselineError is the latest failure to read a silence's baseline, until
+	// a baseline read succeeds.
+	BaselineError string `json:"baseline_error,omitempty"`
 }
 
 // Snapshot returns the current status view.
@@ -1227,6 +1318,7 @@ func (r *Recoverer) Snapshot() Snapshot {
 		StateError:        r.saveErr,
 		StateLoadError:    r.loadErr,
 		ActivityError:     r.activityErr,
+		BaselineError:     r.baselineErr,
 		RequireV2:         r.cfg.RequireV2,
 	}
 	if r.source != nil {
@@ -1302,11 +1394,11 @@ func (r *Recoverer) persistIfDue(now time.Time) {
 }
 
 // save writes the state file now.
-func (r *Recoverer) save(now time.Time) {
+// It reports whether the state is now durable: true in memory-only mode,
+// false when the save failed or the file is left alone (read-only).
+func (r *Recoverer) save(now time.Time) bool {
 	r.mu.Lock()
 	state := copyState(r.state)
-	r.mu.Unlock()
-	r.mu.Lock()
 	readOnly := r.readOnly
 	r.mu.Unlock()
 	if r.path == "" || readOnly {
@@ -1314,7 +1406,7 @@ func (r *Recoverer) save(now time.Time) {
 		r.dirty = false
 		r.persistedAt = now
 		r.mu.Unlock()
-		return
+		return r.path == ""
 	}
 	err := saveState(r.path, state)
 	r.mu.Lock()
@@ -1327,12 +1419,17 @@ func (r *Recoverer) save(now time.Time) {
 		// Retry on the next tick, not only when something else changes.
 		r.dirty = true
 		r.persistedAt = time.Time{}
-		return
+		return false
 	}
 	r.saveErr = ""
 	r.dirty = false
 	r.persistedAt = now
+	return true
 }
+
+// renameUnreadable moves an unreadable state file aside; tests replace it to
+// exercise the copy fallback.
+var renameUnreadable = os.Rename
 
 // preserveUnreadable moves an unreadable state file to a name of its own
 // (path.unreadable-<unix ms>), or copies it there when it can't be moved, so
@@ -1340,12 +1437,16 @@ func (r *Recoverer) save(now time.Time) {
 func preserveUnreadable(path string, now time.Time) (string, error) {
 	aside := fmt.Sprintf("%s.unreadable-%d", path, now.UnixMilli())
 	for i := 1; ; i++ {
-		if _, err := os.Lstat(aside); errors.Is(err, os.ErrNotExist) {
+		_, err := os.Lstat(aside)
+		if errors.Is(err, os.ErrNotExist) {
 			break
+		}
+		if err != nil {
+			return "", err
 		}
 		aside = fmt.Sprintf("%s.unreadable-%d-%d", path, now.UnixMilli(), i)
 	}
-	if err := os.Rename(path, aside); err == nil {
+	if err := renameUnreadable(path, aside); err == nil {
 		return aside, nil
 	}
 	data, err := os.ReadFile(path)

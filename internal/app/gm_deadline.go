@@ -45,18 +45,31 @@ func callWithDeadline[T any](c *deadlineGMClient, name string, call func() (T, e
 		return zero, missed
 	}
 	type reply struct {
-		value T
-		err   error
+		value    T
+		err      error
+		panicked any
 	}
 	done := make(chan reply, 1)
 	go func() {
+		// A panic inside libgm must not take the daemon down from a goroutine
+		// nobody recovers; hand it to the caller, whose own recovery handles
+		// it as before the deadline existed. Once the caller has given up on
+		// the call, the panic is dropped with the reply.
+		defer func() {
+			if p := recover(); p != nil {
+				done <- reply{panicked: p}
+			}
+		}()
 		value, err := call()
-		done <- reply{value, err}
+		done <- reply{value: value, err: err}
 	}()
 	timer := time.NewTimer(c.deadline)
 	defer timer.Stop()
 	select {
 	case r := <-done:
+		if r.panicked != nil {
+			panic(r.panicked)
+		}
 		return r.value, r.err
 	case <-timer.C:
 		err := fmt.Errorf("%s: %w (%s)", name, ErrGoogleCallDeadline, c.deadline)
