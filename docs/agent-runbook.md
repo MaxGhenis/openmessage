@@ -1464,6 +1464,46 @@ up the whole `signal-cli/` dir first and restore the media subdirs
 after the new link (recipe proven 2026-07-20; backups live under
 `<datadir>/app-backups/`).
 
+### Signal quote-replies on v2-primary
+
+Signal quotes a message by its author and sent timestamp, passed to signal-cli
+as `--quote-timestamp/--quote-author/--quote-message`. The outbox stores only
+the quoted message's v2 remote ID, which for an incoming message is a SHA-1
+(`v2keys.SignalIncomingSourceID`), not a timestamp. So the dispatcher
+(`messaging.replyRefForLease`) loads the quoted v2 message and puts its author,
+`occurred_at_ms`, body and first attachment on the request's
+`bridge.MessageRef`, and `signallive.QuoteArgs` builds the quote from those.
+No legacy row is needed. Before this, the Signal transport looked the quote up
+in the legacy `messages.db` only (the retained receive handler still writes
+it on v2-primary), and on v2-primary that lookup cannot find:
+
+- any send this account made through the v2 outbox. The legacy projector runs
+  only on legacy-primary, and the adapter expects no echo of its own sends;
+- messages this account sent from the phone after cutover. Legacy keeps them
+  as `signal:local:<sha1>`, v2 as the bare timestamp;
+- incoming messages whose sender the legacy handler resolved differently from
+  the capture-time contact cache (it refreshes contacts on a miss, capture
+  does not), which puts them under different IDs.
+
+Rules worth knowing when a quote looks wrong:
+
+- The timestamp is `occurred_at_ms` (the decoder and the migration both set it
+  to the Signal sent timestamp), except for a message this account wrote whose
+  remote ID is a decimal timestamp. A send through the outbox keeps its
+  *submit* time as `occurred_at_ms`, and confirming it sets the remote ID to the
+  timestamp signal-cli reported, so that ID wins.
+- A reply submitted while its quoted send was still pending stored the quoted
+  message's transport request ID. The dispatcher follows the outbox row from
+  that ID to the message's current remote ID.
+- A quoted message v2 does not hold, or an outgoing one still awaiting its
+  transport ID, gets a bare ref, and the transport falls back to the legacy
+  lookup. A delivery that fails with `signal reply target not found` is that
+  case. Check the quoted message's own outbox row
+  (`GET /api/v1/outbox/<outbox_id>`).
+- On legacy-primary with `OPENMESSAGES_V2_SEND=1`, the mirror keys a reply
+  target by its legacy ID (`signal:<ts>`) and records no sender or attachment.
+  Such an ID still quotes from its legacy row when that row exists.
+
 ## Deploying a new build to a live install
 
 **`RELEASE=1` is required.** Without it `build.sh` stamps the dev bundle id

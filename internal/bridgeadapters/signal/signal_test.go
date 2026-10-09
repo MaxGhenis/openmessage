@@ -166,7 +166,7 @@ func TestSendTextMapsRetainedTimestampAndRequest(t *testing.T) {
 	request := poller.lastTextRequest()
 	if request.conversationID != "signal:+15551234567" ||
 		request.body != "hello from durable Signal" ||
-		request.replyToID != "signal:1700000000000" {
+		request.reply != (signallive.ReplyTarget{RemoteID: "signal:1700000000000"}) {
 		t.Fatalf("retained SendTextRequest = %+v, want mapped TextRequest", request)
 	}
 }
@@ -679,7 +679,7 @@ func TestSendMediaMapsRetainedTimestampAndRequest(t *testing.T) {
 		request.filename != "photo.png" ||
 		request.mime != "image/png" ||
 		request.caption != "signal photo" ||
-		request.replyToID != "signal:1700000000000" ||
+		request.reply != (signallive.ReplyTarget{RemoteID: "signal:1700000000000"}) ||
 		!bytes.Equal(request.content, content) {
 		t.Fatalf("retained SendMediaRequest = %+v, want mapped MediaRequest", request)
 	}
@@ -1525,7 +1525,7 @@ type fakePoller struct {
 type fakeTextRequest struct {
 	conversationID string
 	body           string
-	replyToID      string
+	reply          signallive.ReplyTarget
 }
 
 type fakeReactionRequest struct {
@@ -1543,7 +1543,7 @@ type fakeMediaRequest struct {
 	filename       string
 	mime           string
 	caption        string
-	replyToID      string
+	reply          signallive.ReplyTarget
 }
 
 type fakeDownloadRequest struct {
@@ -1653,12 +1653,12 @@ func (p *fakePoller) Status() signallive.StatusSnapshot {
 	return p.status
 }
 
-func (p *fakePoller) SendTextRequest(conversationID, body, replyToID string) (int64, error) {
+func (p *fakePoller) SendTextRequest(conversationID, body string, reply signallive.ReplyTarget) (int64, error) {
 	p.mu.Lock()
 	p.textCalls = append(p.textCalls, fakeTextRequest{
 		conversationID: conversationID,
 		body:           body,
-		replyToID:      replyToID,
+		reply:          reply,
 	})
 	timestamp, err := p.textTimestamp, p.textErr
 	p.mu.Unlock()
@@ -1715,7 +1715,8 @@ func (p *fakePoller) SendMediaRequest(
 	conversationID string,
 	content io.Reader,
 	size int64,
-	filename, mime, caption, replyToID string,
+	filename, mime, caption string,
+	reply signallive.ReplyTarget,
 ) (int64, error) {
 	data, readErr := io.ReadAll(content)
 	p.mu.Lock()
@@ -1726,7 +1727,7 @@ func (p *fakePoller) SendMediaRequest(
 		filename:       filename,
 		mime:           mime,
 		caption:        caption,
-		replyToID:      replyToID,
+		reply:          reply,
 	})
 	timestamp, sendErr := p.mediaTimestamp, p.mediaErr
 	p.mu.Unlock()

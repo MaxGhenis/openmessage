@@ -1065,8 +1065,9 @@ func (b *Bridge) SendText(conversationID, body, replyToID string) (*db.Message, 
 // SendTextRequest sends one text message through signal-cli's structured JSON
 // path and returns Signal's canonical outgoing identity. Signal uses the send
 // timestamp as its message ID; the durable request ID remains local dedupe
-// metadata until reconciliation can make uncertain retries safe.
-func (b *Bridge) SendTextRequest(conversationID, body, replyToID string) (timestampMS int64, err error) {
+// metadata until reconciliation can make uncertain retries safe. A zero reply
+// sends no quote.
+func (b *Bridge) SendTextRequest(conversationID, body string, reply ReplyTarget) (timestampMS int64, err error) {
 	body = strings.TrimSpace(body)
 	if body == "" {
 		return 0, errors.New("signal message body is required")
@@ -1082,7 +1083,7 @@ func (b *Bridge) SendTextRequest(conversationID, body, replyToID string) (timest
 	}
 
 	args := []string{"--output=json", "-a", account, "send", "-m", body}
-	quoteArgs, err := b.signalQuoteArgs(replyToID, account)
+	quoteArgs, err := b.replyQuoteArgs(reply, account)
 	if err != nil {
 		return 0, err
 	}
@@ -1137,7 +1138,7 @@ func (b *Bridge) SendMedia(conversationID string, data []byte, filename, mime, c
 		int64(len(data)),
 		filename,
 		caption,
-		replyToID,
+		ReplyTarget{RemoteID: replyToID},
 		true,
 	)
 	if err != nil {
@@ -1173,12 +1174,13 @@ func (b *Bridge) SendMedia(conversationID string, data []byte, filename, mime, c
 // SendMediaRequest streams one attachment to signal-cli and returns Signal's
 // canonical outgoing identity. Signal uses the send timestamp as its message
 // ID; the durable request ID remains local dedupe metadata until reconciliation
-// can make uncertain retries safe.
+// can make uncertain retries safe. A zero reply sends no quote.
 func (b *Bridge) SendMediaRequest(
 	conversationID string,
 	content io.Reader,
 	size int64,
-	filename, mime, caption, replyToID string,
+	filename, mime, caption string,
+	reply ReplyTarget,
 ) (timestampMS int64, err error) {
 	result, err := b.sendMediaRequest(
 		conversationID,
@@ -1186,7 +1188,7 @@ func (b *Bridge) SendMediaRequest(
 		size,
 		filename,
 		caption,
-		replyToID,
+		reply,
 		false,
 	)
 	return result.timestampMS, err
@@ -1206,7 +1208,8 @@ func (b *Bridge) sendMediaRequest(
 	conversationID string,
 	content io.Reader,
 	size int64,
-	filename, caption, replyToID string,
+	filename, caption string,
+	reply ReplyTarget,
 	retainOnSuccess bool,
 ) (result signalMediaRequestResult, err error) {
 	account, err := b.usableAccount()
@@ -1241,7 +1244,7 @@ func (b *Bridge) sendMediaRequest(
 	// keeps the recipient available for parsing as the positional.
 	// Reproduced with "No recipients given" when sending to an ACI-only contact.
 	args = append(args, "--attachment="+attachmentPath)
-	quoteArgs, err := b.signalQuoteArgs(replyToID, account)
+	quoteArgs, err := b.replyQuoteArgs(reply, account)
 	if err != nil {
 		return result, err
 	}
@@ -4275,27 +4278,7 @@ func (b *Bridge) signalQuoteArgs(replyToID, account string) ([]string, error) {
 	if target.TimestampMS == 0 {
 		return nil, errors.New("signal reply target timestamp is unavailable")
 	}
-	author := normalizeSignalAddress(target.SenderNumber)
-	if target.IsFromMe || addressesMatch(author, account) || author == "" {
-		author = account
-	} else {
-		author = b.resolveContactAddress(author)
-	}
-	if author == "" {
-		return nil, errors.New("signal reply target author is unavailable")
-	}
-	quoteBody := strings.TrimSpace(target.Body)
-	if quoteBody == "" && target.MediaID != "" {
-		quoteBody = signalAttachmentPlaceholder([]signalAttachment{{ContentType: target.MimeType}})
-	}
-	if quoteBody == "" {
-		quoteBody = "Attachment"
-	}
-	return []string{
-		"--quote-timestamp", strconv.FormatInt(target.TimestampMS, 10),
-		"--quote-author", author,
-		"--quote-message", quoteBody,
-	}, nil
+	return QuoteArgs(legacyReplyTarget(target), account, b.resolveContactAddress)
 }
 
 func (b *Bridge) writeLocalAttachment(data []byte, filename string) (string, error) {
