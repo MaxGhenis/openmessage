@@ -13,6 +13,15 @@ env:
   GO_COVERAGE_MIN: "40.0"
 
 jobs:
+  release-metadata:
+    name: Release Metadata
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test release tag provenance and version validation
+        run: python3 -m unittest discover -s scripts -p 'test_release_*.py'
+
   go-test:
     name: Go Test
     runs-on: ubuntu-latest
