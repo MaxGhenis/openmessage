@@ -1003,7 +1003,7 @@ this sandboxed and stub `osascript`/`open`/`pgrep`/`pkill` first on `PATH`.
 `test_openmessage_watchdog_append_errors.py` and
 `test_openmessage_watchdog_pull_health.py` next to it cover those two alerts.
 The suites use Hypothesis, which the plain `pytest` on Max's Mac lacks, so run
-them through `uvx` (234 tests, 7 to 9 minutes at `2538865`):
+them through `uvx` (234 tests, 6 to 9 minutes at `2538865`):
 
 ```bash
 cd ~/dotfiles && PYTHONDONTWRITEBYTECODE=1 uvx --with hypothesis pytest -q -p no:cacheprovider tests/test_openmessage_watchdog.py tests/test_openmessage_watchdog_append_errors.py tests/test_openmessage_watchdog_pull_health.py
