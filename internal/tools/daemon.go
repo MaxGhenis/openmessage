@@ -480,6 +480,22 @@ func phoneDigitsMatch(wantedDigits, participantNumber string) bool {
 		strings.HasSuffix(wantedDigits, participantDigits)
 }
 
+// smsPathStatusText warns, in one line, when the daemon reports that carrier
+// SMS has stopped reaching the phone while RCS still arrives
+// (freshness.google.sms_path), and says nothing otherwise.
+func smsPathStatusText(raw map[string]any) string {
+	freshness, _ := raw["freshness"].(map[string]any)
+	google, _ := freshness["google"].(map[string]any)
+	path, _ := google["sms_path"].(map[string]any)
+	if stalled, _ := path["stalled"].(bool); !stalled {
+		return ""
+	}
+	silentMS, _ := path["silent_ms"].(float64)
+	return fmt.Sprintf("Google SMS: STOPPED. No incoming SMS for %.0fh while RCS still arrives; "+
+		"the phone has likely stopped receiving SMS (try restarting it). See freshness.google.sms_path.\n",
+		silentMS/float64(time.Hour/time.Millisecond))
+}
+
 // daemonGetStatusHandler serves get_status in client mode: daemon truth when
 // the app is running, an explicit "app not running" report otherwise.
 func daemonGetStatusHandler(a *app.App, options Options) server.ToolHandlerFunc {
@@ -543,6 +559,7 @@ func daemonGetStatusHandler(a *app.App, options Options) server.ToolHandlerFunc 
 		appendPlatform("Google Messages", "google")
 		appendPlatform("WhatsApp", "whatsapp")
 		appendPlatform("Signal", "signal")
+		sb.WriteString(smsPathStatusText(raw))
 		if v2Primary, ok := raw["v2_primary"].(bool); ok {
 			fmt.Fprintf(&sb, "App v2 mode: primary=%v send=%v\n", v2Primary, raw["v2_send"])
 		}

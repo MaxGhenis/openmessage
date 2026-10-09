@@ -130,6 +130,17 @@ var freshnessPlatformByStorage = map[string]string{
 	"signal":   "signal",
 }
 
+// googleSMSPathMonitor judges whether carrier SMS has stopped reaching the
+// phone while RCS flows. Only the v2 inbox keeps the protobuf type that tells
+// SMS from RCS, and only v2 ingest writes it, so without both there is
+// nothing to judge.
+func googleSMSPathMonitor(stack *v2Stack, ingestEnabled bool) *freshness.SMSPathMonitor {
+	if stack == nil || stack.Store == nil || !ingestEnabled {
+		return nil
+	}
+	return freshness.NewSMSPathMonitor(ingest.GoogleSMSPathLoader(stack.Store))
+}
+
 func v2IngestCountersProvider(stack *v2Stack) func() map[string]ingest.CounterSnapshot {
 	if stack == nil {
 		return nil
@@ -717,6 +728,7 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 				V2:                    v2Options,
 				V2IngestCounters:      v2IngestCounters,
 				Activity:              freshnessActivity,
+				GoogleSMSPath:         googleSMSPathMonitor(stack, v2Ingest),
 				Reads:                 reads,
 				V2Primary:             v2Primary,
 				Client:                a.GetClient,

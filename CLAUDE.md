@@ -77,6 +77,13 @@ both carry Google's verdict. A stale row means the daemon isn't syncing that
 platform, or the phone behind it has stopped delivering; searches over that
 window will miss messages.
 
+On a v2-primary store `status` also prints a "Google SMS:" line: a ⚠ there
+means no incoming SMS for longer than usual while RCS still arrives, which
+per-platform freshness cannot see; on 2026-10-07 it was the phone's IMS stack
+(runbook: "SMS stopped while RCS works"). `--json` carries it as
+`google_sms_path`. It is judged locally from the v2 inbox, so it never reports
+`google_unreachable`; `/api/status` is the authority.
+
 "Read-only" here means no startup repair sweeps (`repairStartupArtifacts`) and
 no transports. Opening a store still writes: `sqlite.Open` (v2) applies any
 pending migrations and writes nothing when the store is current; `db.New`

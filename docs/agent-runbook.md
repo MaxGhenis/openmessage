@@ -382,6 +382,141 @@ All of this needs the request/response path to work. If the fetch replies are
 empty (`Fetched conversations count=0` while the store holds history), nothing
 can be recovered until that is fixed.
 
+## SMS stopped while RCS works: the phone's SMS path
+
+**Symptom:** from 2026-10-03 16:16 to 2026-10-07 15:29 EDT the user's Pixel
+received and sent no ordinary SMS, while RCS chats over data kept arriving. It
+surfaced days later, when verification codes never came. The cause was on the
+phone: its IMS stack lost its SMS layer
+(`ImsStack: [GII-ImsSmsImpl]sendSms failed: mReady=true, mSmsTL is null: true`).
+**A full phone restart fixed it; "Reset mobile network settings" does not**,
+because that restarts `com.android.phone` and `rild` but not
+`com.android.imsstack`.
+
+Per-platform freshness could not see it: SMS and RCS both land as Google
+Messages traffic, RCS kept Google the newest platform, and `behind_days` stayed
+0. `/api/status` now judges the SMS path on its own:
+
+```bash
+curl -s http://127.0.0.1:7007/api/status | jq '.freshness.google.sms_path, .freshness.sms_path_stalled'
+```
+
+`stalled: true` (reason `sms_silent_rcs_flowing`) means three things hold:
+
+- **SMS silent past its usual pace:** no incoming SMS or MMS for at least 24
+  hours, and long enough that at this phone's usual pace about six separate
+  arrivals would have come (`expected_arrivals` of 6 or more).
+  - The pace (`arrivals_per_day`) counts texts within 30 minutes of each other
+    as one arrival, so a burst of codes counts once.
+  - It is measured over the 28 days before the last SMS.
+  - For the install it was calibrated on, the pace is about 5.8 a day, so the
+    bar is about 25 hours.
+- **The phone's texting is regular enough to judge:**
+  - In those 28 days the phone went a whole 24 hours without any incoming SMS
+    at most once (`long_gaps` of 0 or 1).
+  - The shorter gaps, the time it kept its usual rhythm, add up to at least 21
+    days (`regular_span_ms`), with at least 10 arrivals. A long gap never
+    counts toward the 21 days.
+  - The one allowance keeps an earlier outage of up to about a week from
+    blocking the next. A longer earlier outage, or a second one within the 28
+    days, withholds judgment (`thin_baseline`) until it leaves the baseline.
+  - No calendar or time zone enters, so travel and daylight-saving changes
+    cannot move the verdict.
+  - A phone that gets texts only on weekdays goes two days without one every
+    weekend, and is never judged (`thin_baseline`). Nor is a phone whose texts
+    come in clusters with quiet days between them, however busy the clusters.
+  - A phone that gets one text a day at a random time of day goes a whole day
+    without one at about half its gaps, and is then not judged. If every gap
+    stays under 24 hours it is judged, and at one arrival a day a stall takes
+    six days to flag.
+- **RCS is flowing now:** at least 3 incoming RCS messages in the last 24 hours,
+  the newest within 3 hours.
+
+`last_sms_ms` stays fixed for the whole outage, so it identifies the episode.
+The verdict can switch between `sms_silent_rcs_flowing` and `rcs_quiet` during
+an outage when RCS pauses for a few hours (overnight, say). Alert once per
+`last_sms_ms`, not on each switch.
+
+The other reasons:
+
+- `sms_recent`
+- `within_usual_pace`: silent past 24 hours, but not yet unusual for this phone.
+- `rcs_quiet`: RCS stopped too, so it cannot be pinned on SMS. The relay-silence
+  check in `freshness.google.silence` (section "Google Messages silent while
+  'connected'") covers that case.
+- `google_unreachable`: the daemon itself is disconnected from the phone, or
+  the phone is not responding.
+- `history_stale`: the inbox could not be reloaded for 15 minutes.
+- `thin_baseline`
+- `no_sms_history`: the block is then left out.
+
+It never sets `stale`: the macOS app reads a stale Google entry as "needs
+re-pairing", and this called for a phone restart.
+
+How it classifies, and why. The v2 `inbox` keeps every Google frame's raw
+protobuf, and only there does the transport survive (the projected tables and
+the legacy store label all Google traffic `sms`). Each incoming message
+(`MessageStatus` `INCOMING_*`, not from the account owner) is labelled by its
+own type, `Message.Type` (field 11: 1 SMS, 2 and 3 MMS, 4 RCS), and only when
+that is missing by its conversation's type, `Conversation.Type` (field 22: 1
+SMS, 2 RCS). The conversation type is the weaker signal: on 2026-10-05 a new
+one-to-one chat reported SMS for its first 36 seconds before switching to RCS,
+and its first message (type 4) would otherwise have read as SMS recovering in
+the middle of the outage. RCS chats also fall back to SMS for single messages.
+Each message counts once, at its own timestamp capped at receipt, because
+Google re-sends months-old messages when a thread refreshes; frames with no
+timestamp and contentless stubs are skipped, and frames sharing IDs but timed
+more than an hour apart are separate messages (Google IDs are device-local,
+and a phone swap reuses them). Calibration on that install, replayed as live checks saw it (a frame counts
+only once received):
+
+- **9/4 to 10/4:** quiet. The longest normal gap between incoming SMS over that
+  stretch was 19.2 hours.
+- **10/4 17:10 EDT:** flags the outage, 24.9 hours after the last SMS.
+
+Simulated with texts in waking hours and RCS hourly (seeded tests in
+`internal/freshness/smspath_test.go`):
+
+- **Weekday-only texters:** it never fired over 26 weeks, holidays included.
+- **Clustered texters** (nine busy days in every 27): it never fired over 135
+  days (five cycles).
+- **Daily texters whose texts come at random:** at most two false alerts in
+  330 days at one to ten arrivals a day. That is the statistical floor: a long
+  random lull looks like an outage.
+
+Only daemons running v2 ingest (`OPENMESSAGES_V2_INGEST=1`, implied by
+v2-primary) publish the block.
+
+Known limits:
+
+- **Pooled carriers:** SMS and MMS are pooled, and so are the SIMs of a
+  dual-SIM phone, so one SIM losing SMS while the other still gets texts goes
+  unseen.
+- **Quiet RCS:** nothing can be judged while RCS is quiet too.
+- **Relay stalls:** the monitor reads only live frames (codec
+  `google.protobuf`), not catch-up history (`google.protobuf.history`, see
+  "Catch-up history reaches v2"). A relay stall of a day or more therefore
+  leaves a long gap in its baseline, which uses up the one allowance for the
+  next 28 days.
+- **Lookback:** the daemon reads 42 days of frames, so an outage longer than
+  about two weeks loses part of its baseline and can stop being judged.
+- **Deliberately offline phones:** a phone kept off the cellular network on
+  purpose (abroad without roaming, for example) looks the same as a broken SMS
+  path.
+- **Exact replays:** event times alone cannot replay history exactly. A
+  faithful replay must also drop frames not yet received at each instant.
+
+`openmessage status`, run with `OPENMESSAGES_V2_PRIMARY=1` and
+`OPENMESSAGES_DATA_DIR` pointing at the app's data dir, prints the verdict as a
+"Google SMS:" line and as `google_sms_path` in `--json`. It reads the inbox
+directly, so it cannot tell whether the daemon reaches the phone right now and
+never reports `google_unreachable`; `/api/status` is the authority.
+
+**What to do when it fires:** unless the phone is off the cellular network on
+purpose, restart it. If texts still fail, read the phone's own logs over adb (`dumpsys isms`, and
+`logcat -b all | grep -E 'mSmsTL|onSendSmsResult|SEND_SMS|InboundSmsHandler'`)
+before blaming the carrier or the signal.
+
 ## MCP serving — exactly one process may own live transports
 
 **The failure mode (empirically confirmed 2026-07-20):** `openmessage serve
