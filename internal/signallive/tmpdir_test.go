@@ -116,7 +116,7 @@ func TestSweepSignalTmpRootRemovesOnlyStaleEntries(t *testing.T) {
 	}
 }
 
-func TestSweepLegacyLibsignalTempFiltersByNameAndAge(t *testing.T) {
+func TestSweepSystemLibsignalTempFiltersByNameAndAge(t *testing.T) {
 	tempRoot := t.TempDir()
 	t.Setenv("TMPDIR", tempRoot)
 
@@ -128,14 +128,14 @@ func TestSweepLegacyLibsignalTempFiltersByNameAndAge(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	old := time.Now().Add(-2 * legacyLibsignalMaxAge)
+	old := time.Now().Add(-2 * libsignalTmpMaxAge)
 	for _, p := range []string{oldLeak, unrelated} {
 		if err := os.Chtimes(p, old, old); err != nil {
 			t.Fatal(err)
 		}
 	}
 
-	sweepLegacyLibsignalTemp(zerolog.Nop())
+	sweepSystemLibsignalTemp(zerolog.Nop())
 
 	if _, err := os.Stat(oldLeak); !os.IsNotExist(err) {
 		t.Fatalf("old libsignal dir should be removed, stat err = %v", err)
@@ -148,6 +148,39 @@ func TestSweepLegacyLibsignalTempFiltersByNameAndAge(t *testing.T) {
 	}
 }
 
+// The gate used to be 24h, which made this sweep slower than the leak it
+// exists to contain: on a signal-cli build that ignores the TMPDIR and
+// java.io.tmpdir confinement, every interrupted invocation strands ~185MiB in
+// the system temp dir, and a day's worth of that fills a disk long before the
+// oldest dir becomes eligible. Pin the gate to the run age so a regression to
+// "some comfortable number of hours" fails here rather than in production.
+func TestSweepSystemLibsignalTempReapsWithinTheHour(t *testing.T) {
+	if libsignalTmpMaxAge != signalRunTmpMaxAge {
+		t.Fatalf("libsignalTmpMaxAge = %v, want signalRunTmpMaxAge (%v): a gate "+
+			"longer than the longest legitimate run is a delay, not a backstop",
+			libsignalTmpMaxAge, signalRunTmpMaxAge)
+	}
+
+	tempRoot := t.TempDir()
+	t.Setenv("TMPDIR", tempRoot)
+
+	leak := filepath.Join(tempRoot, "libsignal4242")
+	if err := os.MkdirAll(leak, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// Older than any live run, far younger than the day the gate used to be.
+	aged := time.Now().Add(-45 * time.Minute)
+	if err := os.Chtimes(leak, aged, aged); err != nil {
+		t.Fatal(err)
+	}
+
+	sweepSystemLibsignalTemp(zerolog.Nop())
+
+	if _, err := os.Stat(leak); !os.IsNotExist(err) {
+		t.Fatalf("a 45-minute-old libsignal dir must be reaped, stat err = %v", err)
+	}
+}
+
 func TestSweepRespectsOptOut(t *testing.T) {
 	tempRoot := t.TempDir()
 	t.Setenv("TMPDIR", tempRoot)
@@ -157,12 +190,12 @@ func TestSweepRespectsOptOut(t *testing.T) {
 	if err := os.MkdirAll(leak, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	old := time.Now().Add(-2 * legacyLibsignalMaxAge)
+	old := time.Now().Add(-2 * libsignalTmpMaxAge)
 	if err := os.Chtimes(leak, old, old); err != nil {
 		t.Fatal(err)
 	}
 
-	sweepLegacyLibsignalTemp(zerolog.Nop())
+	sweepSystemLibsignalTemp(zerolog.Nop())
 	sweepSignalTmpRoot(zerolog.Nop(), signalRunTmpMaxAge)
 
 	if _, err := os.Stat(leak); err != nil {
