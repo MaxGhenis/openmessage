@@ -106,6 +106,14 @@ func (s *MessageService) DispatchDue(ctx context.Context, limit int) (int, error
 			}
 			break
 		}
+		// The batch is leased together but dispatched one row at a time, so a
+		// row behind a slow transport call would start its own call with
+		// whatever lease the calls before it left over, and could outlive it.
+		// It goes back to the queue untouched (no attempt spent) instead, and
+		// the wake from releaseUntouched leases it afresh at once.
+		if index > 0 && !leaseFreshForDispatch(lease, s.clock.Now(), s.leaseTime) {
+			return processed, s.releaseUntouched(ctx, leases[index:])
+		}
 		var dispatchErr error
 		switch lease.Kind {
 		case sqlite.OutboxKindText:

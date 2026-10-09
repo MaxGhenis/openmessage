@@ -167,6 +167,42 @@ func (s *Store) ReassignConversationRemoteID(
 	toConversationID string,
 	nowMS int64,
 ) error {
+	return s.reassignConversationRemoteID(accountID, "", remoteID, toConversationID, nowMS)
+}
+
+// ErrConversationRebound reports that a conversation is no longer bound to the
+// remote ID a conditional rebind expected, so nothing was changed.
+var ErrConversationRebound = errors.New("conversation is bound to a different remote ID")
+
+// ReassignConversationRemoteIDFrom is ReassignConversationRemoteID guarded by
+// the conversation's current binding, read inside the same write transaction:
+// it moves remoteID to toConversationID only while that conversation is still
+// bound to fromRemoteID. A conversation already bound to remoteID is left as
+// is; any other binding (another writer rebound it after the caller looked)
+// returns ErrConversationRebound and changes nothing, so a stale caller can
+// never overwrite a newer binding or displace its holder.
+func (s *Store) ReassignConversationRemoteIDFrom(
+	accountID string,
+	fromRemoteID string,
+	remoteID string,
+	toConversationID string,
+	nowMS int64,
+) error {
+	if strings.TrimSpace(fromRemoteID) == "" {
+		return fmt.Errorf("reassign remote conversation ID %q: expected current binding is empty", remoteID)
+	}
+	return s.reassignConversationRemoteID(accountID, fromRemoteID, remoteID, toConversationID, nowMS)
+}
+
+// reassignConversationRemoteID implements both reassignments. An empty
+// fromRemoteID moves the binding unconditionally.
+func (s *Store) reassignConversationRemoteID(
+	accountID string,
+	fromRemoteID string,
+	remoteID string,
+	toConversationID string,
+	nowMS int64,
+) error {
 	remoteID = strings.TrimSpace(remoteID)
 	if remoteID == "" {
 		return fmt.Errorf("reassign remote conversation ID: remote ID is empty")
@@ -175,11 +211,43 @@ func (s *Store) ReassignConversationRemoteID(
 		return fmt.Errorf("reassign remote conversation ID %q: target conversation is empty", remoteID)
 	}
 	ctx := context.Background()
+	// The store opens write transactions with BEGIN IMMEDIATE, so the
+	// guard below and the writes after it see no concurrent writer.
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("reassign remote conversation ID %q: begin: %w", remoteID, err)
 	}
 	defer tx.Rollback()
+
+	if fromRemoteID != "" {
+		var current string
+		err := tx.QueryRowContext(ctx, `
+			SELECT remote_conversation_id FROM conversations
+			WHERE account_id = ? AND conversation_id = ?
+		`, accountID, toConversationID).Scan(&current)
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			return fmt.Errorf(
+				"reassign remote conversation ID %q: target conversation %q: %w",
+				remoteID,
+				toConversationID,
+				ErrNotFound,
+			)
+		case err != nil:
+			return fmt.Errorf("reassign remote conversation ID %q: read target binding: %w", remoteID, err)
+		case current == remoteID:
+			return nil
+		case current != fromRemoteID:
+			return fmt.Errorf(
+				"reassign remote conversation ID %q: conversation %q is bound to %q, not %q: %w",
+				remoteID,
+				toConversationID,
+				current,
+				fromRemoteID,
+				ErrConversationRebound,
+			)
+		}
+	}
 
 	var holderID string
 	err = tx.QueryRowContext(ctx, `

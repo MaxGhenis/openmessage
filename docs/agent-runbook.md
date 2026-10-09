@@ -1107,8 +1107,14 @@ inbound is healthy. Sends fail fast instead of looping: the Google adapter
 reports the refusal as a certain non-send (class `reauth_required`, fingerprint
 `google_account_pairing_switched`), so the outbox row is rejected, its
 `error_detail` starts with `[google_account_pairing_switched]`, and the tray
-lists it under "Not sent". The flag clears on proof that the phone serves the
-session again (a real conversation lookup or a successful send), on a non-fake
+lists it under "Not sent". A send that finds the session disconnected while
+the switch is reported is refused the same way rather than held as an offline
+retry, which would send it on its own once pairing is restored; on a v2
+install the web UI likewise hands such sends to the outbox instead of its
+browser-local queue, and keeps the switch banner (not Reconnect) while
+disconnected. The flag clears on proof that this same session is served again
+(a real conversation lookup, a successful send or caption, from the installed
+client; a late answer to a replaced client proves nothing), on a non-fake
 account change that turns Google-account pairing off, and on unpair, session
 invalidation or a new pairing. It is not cleared on reconnect: whether the
 phone resends the account container on every connect is not established.
@@ -1138,10 +1144,17 @@ failure that may have reached the transport is outside the budget: the row
 becomes `uncertain`, which is never retried automatically and cannot be
 canceled (HTTP 409), only sent again deliberately. A row already at or over
 the cap is rejected before any transport call, so an old row with a huge
-`attempt_count` can never fire late. A `conversation_moved` failure rebinds the
-conversation to the new remote id and retries at once (still consuming an
-attempt); if the rebind is refused, it is an ordinary consuming failure and
-`error_detail` says why. Rejected text and media rows with class
+`attempt_count` can never fire late, and the cutover carry reports such a row
+as uncarryable instead of recreating it at zero attempts (a carried row also
+keeps the old row's pending retry time). A `conversation_moved` failure rebinds
+the conversation to the new remote id and retries at once (still consuming an
+attempt). The rebind checks, inside its write transaction, that the
+conversation is still bound to the old id; if ingest rebound it in the
+meantime, nothing changes, it is an ordinary consuming failure, and
+`error_detail` says why. Rows leased together are dispatched one at a time, and
+a row with less than nine tenths of its lease left goes back to the queue
+untouched (no attempt spent) and is leased afresh, so no transport call starts
+on a nearly spent lease. Rejected text and media rows with class
 `retry_exhausted` or `reauth_required` stay in `GET /api/v1/outbox` for 24 h,
 until sent again, with `retry_exhausted` and `error_detail`. The tray labels
 them "Not sent" and offers **Send again**, which creates a new message (nothing

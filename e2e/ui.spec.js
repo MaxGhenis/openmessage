@@ -2768,6 +2768,70 @@ test('a QR session whose phone switched to Google-account pairing explains why s
   await expect(page.locator('#connection-banner')).toBeHidden();
 });
 
+test('a disconnected session the phone refuses keeps the switch banner instead of Reconnect', async ({ page }) => {
+  await page.waitForFunction(() => window.__openMessageTestHooks?.applyAppStatus);
+  const switchedOffline = {
+    connected: false,
+    google: {
+      connected: false,
+      paired: true,
+      needs_pairing: false,
+      needs_repair: false,
+      account_pairing_switched: true,
+      switched_account: 'x@gmail.com',
+      account_pairing_switched_at_ms: 1_700_000_000_000,
+    },
+    whatsapp: { connected: true, paired: true },
+    signal: { connected: true, paired: true },
+    backfill: { running: false },
+  };
+  await page.route('**/api/status', route => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify(switchedOffline),
+  }));
+  await page.evaluate((s) => window.__openMessageTestHooks.applyAppStatus(s), switchedOffline);
+  // Reconnecting cannot fix a pairing switch, so the banner must not offer it.
+  await expect(page.locator('#connection-banner-copy')).toContainText('switched Google Messages to Google-account pairing (x@gmail.com)');
+  await expect(page.locator('#connection-banner-copy')).toContainText('also disconnected right now');
+  await expect(page.locator('#connection-banner-copy')).not.toContainText('still receives messages');
+  await expect(page.locator('#connection-banner-action')).toHaveText('Platforms');
+  await expect(page.locator('#connection-banner-action')).toHaveAttribute('data-action', 'open-platforms');
+});
+
+test('while the phone refuses the session, v2 sends route to the outbox instead of the browser queue', async ({ page }) => {
+  await page.waitForFunction(() => window.__openMessageTestHooks?.googleSendRouting);
+  const routing = await page.evaluate(() => {
+    const route = window.__openMessageTestHooks.googleSendRouting;
+    const switched = { connected: false, paired: true, account_pairing_switched: true };
+    const offline = { connected: false, paired: true };
+    const healthy = { connected: true, paired: true };
+    const repair = { connected: true, paired: true, needs_repair: true };
+    return {
+      switchedV2: route(switched, true),
+      switchedConnectedV2: route({ ...switched, connected: true }, true),
+      switchedLegacy: route(switched, false),
+      // The server reports the switch only for a paired session; an unpaired
+      // snapshot carrying the flag must not route anywhere new.
+      switchedUnpairedV2: route({ ...switched, paired: false }, true),
+      offlineV2: route(offline, true),
+      healthyV2: route(healthy, true),
+      repairV2: route(repair, true),
+    };
+  });
+  // A send made while switched must reach the durable outbox (which refuses
+  // it visibly) rather than wait in localStorage and fire when pairing heals.
+  expect(routing.switchedV2).toEqual({ sendNow: true, flushQueued: true });
+  expect(routing.switchedConnectedV2).toEqual({ sendNow: true, flushQueued: true });
+  // Legacy installs have no durable outbox to refuse it: unchanged behaviour.
+  expect(routing.switchedLegacy).toEqual({ sendNow: false, flushQueued: false });
+  expect(routing.switchedUnpairedV2).toEqual({ sendNow: false, flushQueued: false });
+  // Everything else keeps the existing rules.
+  expect(routing.offlineV2).toEqual({ sendNow: false, flushQueued: false });
+  expect(routing.healthyV2).toEqual({ sendNow: true, flushQueued: true });
+  expect(routing.repairV2).toEqual({ sendNow: false, flushQueued: false });
+});
+
 test('sends still go to the durable outbox while the phone refuses a QR session', async ({ page }) => {
   const outbound = `Account switch send ${Date.now()}`;
   let sendRequests = 0;

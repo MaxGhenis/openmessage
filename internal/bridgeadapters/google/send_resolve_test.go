@@ -1230,3 +1230,141 @@ func newGoogleAccountLegacyClient(t *testing.T) *client.Client {
 	}
 	return legacy
 }
+
+// A caption the phone sends proves it serves this session, even when an
+// account change arrived while the caption request was in flight (PR #204
+// review: caption success skipped the proof clear).
+func TestSendMediaCaptionSuccessClearsAccountSwitch(t *testing.T) {
+	h := startSendRun(t, newLegacyClient)
+	fake := &fakeMediaSendClient{
+		uploadResult:       &gmproto.MediaContent{MediaID: "media-id"},
+		conversationResult: directConversation(testRemoteID, testPeerNumber),
+		sendResults: []*gmproto.SendMessageResponse{
+			{Status: gmproto.SendMessageResponse_SUCCESS},
+			{Status: gmproto.SendMessageResponse_SUCCESS},
+		},
+		sendHook: func(index int) {
+			if index == 1 {
+				h.emitAccountChange()
+			}
+		},
+	}
+	installMediaSendClient(t, h.host.GetClient(), fake)
+	if _, err := h.adapter.SendMedia(context.Background(), bridge.MediaRequest{
+		Conversation: bridge.ConversationRef{RemoteID: testRemoteID},
+		Reader:       strings.NewReader("x"),
+		Size:         1,
+		Caption:      "caption",
+		RequestID:    "request-id",
+	}); err != nil {
+		t.Fatalf("SendMedia() error = %v", err)
+	}
+	if len(fake.sent) != 2 {
+		t.Fatalf("SendMessage calls = %d, want media then caption", len(fake.sent))
+	}
+	if switched, _ := h.host.GoogleAccountSwitch(); switched {
+		t.Fatal("a sent caption left the account switch set")
+	}
+}
+
+// A send that finds the session disconnected while the phone refuses it is
+// the terminal account-switch refusal, not the exempt not-connected retry
+// that would hold it queued and send it on its own once pairing is restored
+// (PR #204 review). Without the switch it stays the plain not-connected
+// failure.
+func TestDisconnectedSendWhileSwitchedIsRefused(t *testing.T) {
+	ref := bridge.ConversationRef{RemoteID: testRemoteID, Kind: "direct", DirectPeerNumber: testPeerNumber}
+	sends := map[string]func(*sendRunHarness) error{
+		"send_text": func(h *sendRunHarness) error {
+			_, err := h.adapter.SendText(context.Background(), bridge.TextRequest{
+				Conversation: ref, Body: "hello", RequestID: "request-id",
+			})
+			return err
+		},
+		"send_media": func(h *sendRunHarness) error {
+			_, err := h.adapter.SendMedia(context.Background(), bridge.MediaRequest{
+				Conversation: ref, Reader: strings.NewReader("x"), Size: 1, RequestID: "request-id",
+			})
+			return err
+		},
+		"send_reaction": func(h *sendRunHarness) error {
+			_, err := h.adapter.SendReaction(context.Background(), bridge.ReactionRequest{
+				Conversation: ref,
+				Target:       bridge.MessageRef{RemoteID: "target-id"},
+				Emoji:        "👍",
+				Action:       bridge.ReactionAdd,
+			})
+			return err
+		},
+	}
+	for operation, send := range sends {
+		for _, switched := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/switched=%v", operation, switched), func(t *testing.T) {
+				h := startSendRun(t, newLegacyClient)
+				if switched {
+					h.emitAccountChange()
+				}
+				h.host.Connected.Store(false)
+				var failure bridge.OpError
+				if !errors.As(send(h), &failure) {
+					t.Fatal("send did not fail with an OpError")
+				}
+				if switched {
+					requireAccountSwitchRefusal(t, failure, operation)
+					if !strings.Contains(failure.Error(), "also disconnected") {
+						t.Fatalf("refusal %q does not say the session is disconnected", failure.Error())
+					}
+					return
+				}
+				if failure.Class != bridge.FailureTransient ||
+					failure.Fingerprint != "google_not_connected" ||
+					failure.Dispatch != bridge.DispatchNotCalled {
+					t.Fatalf("failure = %+v, want the plain not-connected failure", failure)
+				}
+			})
+		}
+	}
+}
+
+// A lookup that answers after its client was replaced must not clear the
+// installed session's report (PR #204 review's stale-proof probe).
+func TestLookupAnsweredAfterClientReplacementKeepsAccountSwitch(t *testing.T) {
+	h := startSendRun(t, newLegacyClient)
+	replacement := qrLegacyClientWithBrowser(t, "replacement-browser")
+	fake := &fakeTextSendClient{
+		conversationResult: directConversation(testRemoteID, testPeerNumber),
+		sendResult:         &gmproto.SendMessageResponse{Status: gmproto.SendMessageResponse_SUCCESS},
+		conversationHook: func() {
+			// The session is replaced and the new one reports the switch
+			// while this lookup is still in flight.
+			generation := h.host.BeginGoogleGeneration(replacement)
+			generation.Handler.Handle(accountChangeEvent(testSwitchAccount))
+		},
+	}
+	installTextSendClient(t, h.host.GetClient(), fake)
+	_, _ = h.adapter.SendText(context.Background(), bridge.TextRequest{
+		Conversation: bridge.ConversationRef{RemoteID: testRemoteID},
+		Body:         "hello",
+		RequestID:    "request-id",
+	})
+	if switched, account := h.host.GoogleAccountSwitch(); !switched || account != testSwitchAccount {
+		t.Fatalf("GoogleAccountSwitch() = (%v, %q), want the replacement session's report kept", switched, account)
+	}
+}
+
+// qrLegacyClientWithBrowser is a QR-paired legacy client for a session other
+// than newLegacyClient's (a different browser ID).
+func qrLegacyClientWithBrowser(t *testing.T, browserID string) *client.Client {
+	t.Helper()
+	legacy, err := client.NewFromSession(
+		&client.SessionData{AuthDataJSON: []byte(`{"browser":{"sourceID":"` + browserID + `"}}`)},
+		zerolog.Nop(),
+	)
+	if err != nil {
+		t.Fatalf("NewFromSession() error = %v", err)
+	}
+	if legacy.GM.AuthData.IsGoogleAccount() {
+		t.Fatal("QR fixture is a Google-account session")
+	}
+	return legacy
+}

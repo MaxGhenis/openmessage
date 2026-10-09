@@ -171,12 +171,15 @@ func (a *Adapter) SendText(
 	ctx context.Context,
 	req bridge.TextRequest,
 ) (bridge.SendResult, error) {
-	if a == nil || a.host == nil || !a.host.Connected.Load() {
+	if a == nil || a.host == nil {
 		return bridge.SendResult{}, notConnectedTextError()
+	}
+	if !a.host.Connected.Load() {
+		return bridge.SendResult{}, a.notConnectedFailure("send_text", notConnectedTextError())
 	}
 	cli := a.host.GetClient()
 	if cli == nil || cli.GM == nil {
-		return bridge.SendResult{}, notConnectedTextError()
+		return bridge.SendResult{}, a.notConnectedFailure("send_text", notConnectedTextError())
 	}
 	transport := textSendClientFor(cli)
 	if transport == nil {
@@ -193,7 +196,7 @@ func (a *Adapter) SendText(
 	}
 
 	budget := newCallBudget(ctx)
-	conversation, err := a.resolveSendConversation(budget, transport, req.Conversation, textConversationLookup)
+	conversation, err := a.resolveSendConversation(cli, budget, transport, req.Conversation, textConversationLookup)
 	if err != nil {
 		return bridge.SendResult{}, err
 	}
@@ -250,12 +253,15 @@ func (a *Adapter) SendReaction(
 	ctx context.Context,
 	req bridge.ReactionRequest,
 ) (bridge.SendResult, error) {
-	if a == nil || a.host == nil || !a.host.Connected.Load() {
+	if a == nil || a.host == nil {
 		return bridge.SendResult{}, notConnectedReactionError()
+	}
+	if !a.host.Connected.Load() {
+		return bridge.SendResult{}, a.notConnectedFailure("send_reaction", notConnectedReactionError())
 	}
 	cli := a.host.GetClient()
 	if cli == nil || cli.GM == nil {
-		return bridge.SendResult{}, notConnectedReactionError()
+		return bridge.SendResult{}, a.notConnectedFailure("send_reaction", notConnectedReactionError())
 	}
 	transport := reactionSendClientFor(cli)
 	if transport == nil {
@@ -272,7 +278,7 @@ func (a *Adapter) SendReaction(
 	}
 
 	budget := newCallBudget(ctx)
-	conversation, err := a.resolveSendConversation(budget, transport, req.Conversation, reactionConversationLookup)
+	conversation, err := a.resolveSendConversation(cli, budget, transport, req.Conversation, reactionConversationLookup)
 	if err != nil {
 		return bridge.SendResult{}, err
 	}
@@ -427,12 +433,15 @@ func (a *Adapter) SendMedia(
 	ctx context.Context,
 	req bridge.MediaRequest,
 ) (bridge.SendResult, error) {
-	if a == nil || a.host == nil || !a.host.Connected.Load() {
+	if a == nil || a.host == nil {
 		return bridge.SendResult{}, notConnectedMediaError()
+	}
+	if !a.host.Connected.Load() {
+		return bridge.SendResult{}, a.notConnectedFailure("send_media", notConnectedMediaError())
 	}
 	cli := a.host.GetClient()
 	if cli == nil || cli.GM == nil {
-		return bridge.SendResult{}, notConnectedMediaError()
+		return bridge.SendResult{}, a.notConnectedFailure("send_media", notConnectedMediaError())
 	}
 	transport := mediaSendClientFor(cli)
 	if transport == nil {
@@ -477,7 +486,7 @@ func (a *Adapter) SendMedia(
 	// Resolve the conversation before uploading: a send that cannot find its
 	// conversation must not re-upload the whole file on every retry.
 	budget := newCallBudget(ctx)
-	conversation, err := a.resolveSendConversation(budget, transport, req.Conversation, mediaConversationLookup)
+	conversation, err := a.resolveSendConversation(cli, budget, transport, req.Conversation, mediaConversationLookup)
 	if err != nil {
 		return bridge.SendResult{}, err
 	}
@@ -598,6 +607,9 @@ func (a *Adapter) SendMedia(
 				Cause:       errors.New(sendStatusDetail("media caption", captionResponse)),
 			}
 		}
+		// The phone sent the caption for this session, so it is not refusing
+		// it (an account change during the caption request is superseded).
+		a.host.ClearGoogleAccountSwitchFor(cli)
 	}
 
 	return bridge.SendResult{
@@ -845,6 +857,7 @@ var (
 // re-resolved by number and validated to be the same remote ID, so no caller
 // ever sends after a nil lookup without one of those.
 func (a *Adapter) resolveSendConversation(
+	cli *client.Client,
 	budget callBudget,
 	transport conversationResolver,
 	ref bridge.ConversationRef,
@@ -861,7 +874,7 @@ func (a *Adapter) resolveSendConversation(
 	}
 	if conversation != nil {
 		// The phone answered this session with data, so it is not refusing it.
-		a.host.ClearGoogleAccountSwitch()
+		a.host.ClearGoogleAccountSwitchFor(cli)
 		return conversation, nil
 	}
 	// libgm decrypts a response frame, firing AccountChange for an account
@@ -886,7 +899,7 @@ func (a *Adapter) resolveSendConversation(
 			Cause:       err,
 		}
 	}
-	return a.resolveDirectConversationByNumber(budget, transport, ref, peer, lookup)
+	return a.resolveDirectConversationByNumber(cli, budget, transport, ref, peer, lookup)
 }
 
 // resolveDirectConversationByNumber asks the phone for the 1:1 thread with
@@ -895,6 +908,7 @@ func (a *Adapter) resolveSendConversation(
 // targets; a thread filed under another ID is reported as moved so the
 // dispatcher can rebind the local conversation before anything is sent.
 func (a *Adapter) resolveDirectConversationByNumber(
+	cli *client.Client,
 	budget callBudget,
 	transport conversationResolver,
 	ref bridge.ConversationRef,
@@ -924,7 +938,7 @@ func (a *Adapter) resolveDirectConversationByNumber(
 			response.GetStatus().String(),
 		))
 	}
-	a.host.ClearGoogleAccountSwitch()
+	a.host.ClearGoogleAccountSwitchFor(cli)
 	if err := validateDirectConversation(resolved, peer); err != nil {
 		return nil, bridge.OpError{
 			Class:       bridge.FailureMisconfigured,
@@ -1045,6 +1059,18 @@ func conversationNotFoundError(operation string, cause error) bridge.OpError {
 	}
 }
 
+// notConnectedFailure is the failure for a send that found no connected
+// session. While the phone refuses this QR-paired session it is the terminal
+// account-switch refusal instead: reconnecting alone cannot make the send
+// succeed, and the exempt not-connected retry would otherwise keep it queued
+// and send it on its own, possibly much later, once pairing is restored.
+func (a *Adapter) notConnectedFailure(operation string, notConnected bridge.OpError) bridge.OpError {
+	if refusal, switched := a.accountSwitchRefusal(operation, "this session is also disconnected"); switched {
+		return refusal
+	}
+	return notConnected
+}
+
 // accountSwitchRefusal returns the terminal refusal for a send while the
 // phone reports Google-account pairing for this QR-paired session.
 func (a *Adapter) accountSwitchRefusal(operation, detail string) (bridge.OpError, bool) {
@@ -1104,7 +1130,7 @@ func (a *Adapter) classifySendMessageResponse(
 ) (bridge.OpError, bool) {
 	status := response.GetStatus()
 	if status == gmproto.SendMessageResponse_SUCCESS {
-		a.host.ClearGoogleAccountSwitch()
+		a.host.ClearGoogleAccountSwitchFor(cli)
 		return bridge.OpError{}, false
 	}
 	// A refused status proves the connection is healthy enough to respond;

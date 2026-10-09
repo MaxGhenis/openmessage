@@ -19,7 +19,7 @@ import (
 // it. Failures from an offline account or one whose credentials are being
 // repaired are exempt (see budgetExempt): they never count, so an intent
 // composed offline still goes out when the account reconnects.
-var maxTransportAttempts int64 = 6
+var maxTransportAttempts = sqlite.DefaultMaxTransportAttempts
 
 const (
 	// maxRetryBackoff bounds the wait between budget-consuming attempts.
@@ -213,9 +213,11 @@ func (s *MessageService) recordCalledNotDispatched(
 }
 
 // rebindMovedConversation moves the moved-from binding of the intent's
-// conversation to the remote ID the transport resolved. It refuses when the
-// conversation is no longer bound to FromRemoteID (something else rebound it
-// since the attempt started); a binding already at ToRemoteID counts as done.
+// conversation to the remote ID the transport resolved. The store checks the
+// conversation's current binding inside the rebind transaction: it refuses,
+// changing nothing, when the conversation is no longer bound to FromRemoteID
+// (ingest rebound it since the attempt started), and a binding already at
+// ToRemoteID counts as done.
 func (s *MessageService) rebindMovedConversation(
 	item sqlite.OutboxItem,
 	moved *bridge.ConversationMovedError,
@@ -225,26 +227,13 @@ func (s *MessageService) rebindMovedConversation(
 	if to == "" || to == moved.FromRemoteID {
 		return fmt.Errorf("moved-to remote conversation ID %q is not a move", moved.ToRemoteID)
 	}
-	conversation, err := s.store.GetConversation(item.ConversationID)
-	if err != nil {
-		return fmt.Errorf("load conversation %q: %w", item.ConversationID, err)
-	}
-	if conversation.AccountID != item.AccountID {
-		return fmt.Errorf("conversation %q belongs to account %q", item.ConversationID, conversation.AccountID)
-	}
-	switch conversation.RemoteConversationID {
-	case to:
-		return nil
-	case moved.FromRemoteID:
-		return s.store.ReassignConversationRemoteID(item.AccountID, to, item.ConversationID, now.UnixMilli())
-	default:
-		return fmt.Errorf(
-			"conversation %q is now bound to remote ID %q, not %q",
-			item.ConversationID,
-			conversation.RemoteConversationID,
-			moved.FromRemoteID,
-		)
-	}
+	return s.store.ReassignConversationRemoteIDFrom(
+		item.AccountID,
+		moved.FromRemoteID,
+		to,
+		item.ConversationID,
+		now.UnixMilli(),
+	)
 }
 
 // rejectExhaustedBeforeCall rejects a leased intent whose attempt count is
@@ -317,4 +306,16 @@ func canonicalE164(value string) bool {
 		}
 	}
 	return true
+}
+
+// leaseFreshForDispatch reports whether a leased row still has at least nine
+// tenths of a full lease left, enough for the slowest transport attempt the
+// adapters allow (the Google adapter bounds an attempt at 27 s of the 30 s
+// default lease).
+func leaseFreshForDispatch(lease sqlite.Lease, now time.Time, leaseTime time.Duration) bool {
+	if lease.LeaseExpiresAtMS == nil {
+		return true
+	}
+	remaining := time.UnixMilli(*lease.LeaseExpiresAtMS).Sub(now)
+	return remaining*10 >= leaseTime*9
 }

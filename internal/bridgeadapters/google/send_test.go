@@ -1496,6 +1496,9 @@ type fakeMediaSendClient struct {
 	resolve            fakeConversationResolve
 	sendResults        []*gmproto.SendMessageResponse
 	sendErrors         []error
+	// sendHook runs inside SendMessage (with the 0-based send index) before
+	// it returns, the way libgm fires events ahead of the RPC result.
+	sendHook func(index int)
 
 	uploadCalls       int
 	uploadData        []byte
@@ -1545,6 +1548,9 @@ func (f *fakeMediaSendClient) SendMessage(payload *gmproto.SendMessageRequest) (
 	var err error
 	if index < len(f.sendErrors) {
 		err = f.sendErrors[index]
+	}
+	if f.sendHook != nil {
+		f.sendHook(index)
 	}
 	return result, err
 }

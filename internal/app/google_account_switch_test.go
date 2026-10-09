@@ -395,3 +395,35 @@ func TestLibgmAccountContainerFrameRaisesAccountSwitch(t *testing.T) {
 		t.Fatal("the account container changed Connected or set needs_repair")
 	}
 }
+
+// Proof that the phone serves a session clears the report only for that
+// session: a lookup or send that answers after its client was replaced (the
+// PR #204 review's stale-proof probe) must not erase the installed session's
+// report.
+func TestProofFromAnotherSessionDoesNotClearAccountSwitch(t *testing.T) {
+	a, _ := accountSwitchTestApp(t)
+	old := qrSessionClient(t, "browser-a")
+	first := a.BeginGoogleGeneration(old)
+	first.Release()
+	installed := qrSessionClient(t, "browser-b")
+	current := a.BeginGoogleGeneration(installed)
+	t.Cleanup(current.Release)
+	current.Handler.Handle(fakeAccountChange("current@example.com"))
+
+	for name, cli := range map[string]*client.Client{
+		"replaced session":                 old,
+		"nil client":                       nil,
+		"Google-account session":           googleAccountSessionClient(t),
+		"uninstalled client, same session": qrSessionClient(t, "browser-b"),
+	} {
+		a.ClearGoogleAccountSwitchFor(cli)
+		if switched, account := a.GoogleAccountSwitch(); !switched || account != "current@example.com" {
+			t.Fatalf("%s: GoogleAccountSwitch() = (%v, %q), want the installed session's report kept", name, switched, account)
+		}
+	}
+
+	a.ClearGoogleAccountSwitchFor(installed)
+	if switched, _ := a.GoogleAccountSwitch(); switched {
+		t.Fatal("proof from the installed session did not clear its report")
+	}
+}

@@ -155,6 +155,18 @@ func CarryPendingOutbox(
 			report.Uncarryable = append(report.Uncarryable, entry)
 			continue
 		}
+		// A carried intent starts over at zero attempts, so carrying one that
+		// already spent its retry budget would let it fire late. Leave it for
+		// review instead; nothing was sent, and sending it again is the
+		// user's call.
+		if intent.AttemptCount >= sqlite.DefaultMaxTransportAttempts {
+			entry.Reason = fmt.Sprintf(
+				"retry budget already exhausted (%d attempts); not carried so it cannot fire late",
+				intent.AttemptCount,
+			)
+			report.Uncarryable = append(report.Uncarryable, entry)
+			continue
+		}
 
 		conversation, err := fresh.GetConversationByRemote(
 			intent.AccountID,
@@ -202,7 +214,7 @@ func CarryPendingOutbox(
 			Operation:          intent.Operation,
 			LocalMessageID:     *intent.LocalMessageID,
 			TransportRequestID: intent.TransportRequestID,
-			ScheduledForMS:     intent.ScheduledForMS,
+			ScheduledForMS:     carriedScheduleMS(intent),
 		}
 		message := sqlite.Message{
 			MessageID:       *intent.LocalMessageID,
@@ -328,7 +340,7 @@ func validateExistingCarry(
 		carried.IdempotencyKey != intent.IdempotencyKey ||
 		carried.PayloadHash != intent.PayloadHash ||
 		carried.Operation != intent.Operation ||
-		carried.ScheduledForMS != intent.ScheduledForMS {
+		carried.ScheduledForMS != carriedScheduleMS(intent) {
 		return fmt.Errorf(
 			"carry pending outbox item %q: idempotency key %q resolved to a different fresh intent",
 			intent.OutboxID,
@@ -364,3 +376,14 @@ func carryEntryFromReview(intent sqlite.CarryReviewIntent) CarryEntry {
 
 var _ CarrySource = Endpoint{}
 var _ CarryTarget = Endpoint{}
+
+// carriedScheduleMS keeps a not-dispatched intent's pending retry time: the
+// carried row is due no earlier than the old row's next attempt, so a carry
+// never hurries a retry the dispatcher had backed off.
+func carriedScheduleMS(intent sqlite.CarryableIntent) int64 {
+	scheduled := intent.ScheduledForMS
+	if intent.NextAttemptAtMS != nil && *intent.NextAttemptAtMS > scheduled {
+		scheduled = *intent.NextAttemptAtMS
+	}
+	return scheduled
+}

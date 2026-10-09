@@ -406,11 +406,36 @@ func (a *App) recordGoogleAccountSwitch(cli *client.Client, account, source stri
 	a.emitStatusChange(a.Connected.Load())
 }
 
-// ClearGoogleAccountSwitch forgets the phone's account-switch report, e.g.
-// after the phone served this session (a real conversation or a successful
-// send) or after the session was unpaired or invalidated.
+// ClearGoogleAccountSwitch forgets the phone's account-switch report
+// unconditionally, for when the session itself goes away (unpaired or
+// invalidated). Proof that the phone serves a session clears it through
+// ClearGoogleAccountSwitchFor instead.
 func (a *App) ClearGoogleAccountSwitch() {
-	a.clearGoogleAccountSwitch("phone_served_session")
+	a.clearGoogleAccountSwitch("session_removed")
+}
+
+// ClearGoogleAccountSwitchFor forgets the account-switch report because the
+// session cli just proved the phone serves it (a real conversation or a
+// successful send). A result from a replaced client, or from a session other
+// than the one the report is about, proves nothing about the installed
+// session and changes nothing.
+func (a *App) ClearGoogleAccountSwitchFor(cli *client.Client) {
+	key, ok := googleQRSessionKey(cli)
+	if !ok || a.GetClient() != cli {
+		return
+	}
+	a.googleAccountSwitchMu.Lock()
+	previous := a.googleAccountSwitch
+	if !previous.switched || previous.sessionKey != key {
+		a.googleAccountSwitchMu.Unlock()
+		return
+	}
+	a.googleAccountSwitch = googleAccountSwitchState{}
+	a.googleAccountSwitchMu.Unlock()
+	a.Logger.Info().
+		Str("reason", "phone_served_session").
+		Msg("Google-account pairing switch cleared for this session")
+	a.emitStatusChange(a.Connected.Load())
 }
 
 func (a *App) clearGoogleAccountSwitch(reason string) {

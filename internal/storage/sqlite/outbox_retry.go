@@ -14,6 +14,12 @@ import (
 // sent again explicitly.
 const RetryExhaustedErrorClass = "retry_exhausted"
 
+// DefaultMaxTransportAttempts is the transport retry budget of one outbox
+// intent: the dispatcher rejects the intent (RetryExhaustedErrorClass) on the
+// budget-consuming failure that reaches it and never calls the transport again
+// for a row at or over it. The cutover carry refuses to recreate such a row.
+const DefaultMaxTransportAttempts int64 = 6
+
 // TrayRejectedWindow is how long after its last update a rejected text or
 // media intent the user can act on stays listed by ListPending.
 const TrayRejectedWindow = 24 * time.Hour

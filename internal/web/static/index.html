@@ -7099,7 +7099,9 @@ body::after {
   function conversationCanSendNow(convo) {
     if (!convo) return false;
     const platform = sourcePlatformOf(convo);
-    if (platform === 'sms') return googleStatus.connected && !googleStatus.needs_repair;
+    if (platform === 'sms') {
+      return googleSendsGoToRefusingOutbox() || (googleStatus.connected && !googleStatus.needs_repair);
+    }
     if (platform === 'whatsapp') return whatsAppStatus.connected;
     if (platform === 'signal') return signalStatus.connected;
     return false;
@@ -9865,7 +9867,12 @@ body::after {
 
   function platformReadyForQueuedSend(platform) {
     if (browserIsOffline()) return false;
-    if (platform === 'sms') return googleStatus.connected && !googleStatus.needs_repair;
+    if (platform === 'sms') {
+      // A send parked here while the phone refuses this session would fire
+      // on its own once pairing is restored; flush it to the durable outbox,
+      // which refuses it visibly instead.
+      return googleSendsGoToRefusingOutbox() || (googleStatus.connected && !googleStatus.needs_repair);
+    }
     if (platform === 'whatsapp') return whatsAppStatus.connected;
     if (platform === 'signal') return signalStatus.connected;
     return false;
@@ -13044,11 +13051,29 @@ body::after {
   // Messages switches to Google-account pairing, while inbound keeps flowing.
   // Sends still go to the durable outbox (which rejects them visibly); this
   // copy only explains why and names the two remedies.
-  function accountPairingSwitchedCopy(account = '') {
+  function accountPairingSwitchedCopy(account = '', connected = true) {
     const named = account ? ` (${account})` : '';
+    const session = connected
+      ? 'This QR-paired session still receives messages, but the phone won’t let it send. '
+      : 'This QR-paired session is also disconnected right now, and reconnecting alone won’t let it send. ';
     return `Your phone switched Google Messages to Google-account pairing${named}. `
-      + 'This QR-paired session still receives messages, but the phone won’t let it send. '
+      + session
       + 'Re-link OpenMessage with Google-account pairing, or switch the phone back to QR pairing.';
+  }
+
+  // True while the phone refuses this QR-paired session (the server reports
+  // the switch only for a paired session). It takes precedence over
+  // connectivity: reconnecting cannot fix a pairing switch.
+  function googleAccountPairingSwitched() {
+    return !!googleStatus.paired && !!googleStatus.account_pairing_switched;
+  }
+
+  // On a v2 install a send made while the phone refuses this session goes
+  // straight to the durable outbox, which refuses it visibly ("Not sent",
+  // Send again). Parking it in this browser's queue instead would send it
+  // automatically, possibly much later, once pairing is restored.
+  function googleSendsGoToRefusingOutbox() {
+    return state.v2Primary === true && googleAccountPairingSwitched();
   }
 
   function setConnectionState() {
@@ -13062,14 +13087,15 @@ body::after {
       $connectionBannerAction.style.display = '';
       return;
     }
-    // Checked before needs_repair: this session is healthy for receiving, so
-    // "your phone may have unlinked OpenMessage" would misdescribe it. The
+    // Checked before needs_repair and before connectivity: the phone refuses
+    // this session whether or not it is connected right now, so neither "your
+    // phone may have unlinked OpenMessage" nor a Reconnect action fits. The
     // action only opens Platforms; reconnecting cannot fix a pairing switch
     // and repeated reconnects throttle the account.
-    if (googleStatus.connected && googleStatus.account_pairing_switched) {
+    if (googleAccountPairingSwitched()) {
       $connectionBanner.className = 'connection-banner disconnected';
       $connectionBanner.style.display = 'flex';
-      $connectionBannerCopy.textContent = accountPairingSwitchedCopy(googleStatus.switched_account);
+      $connectionBannerCopy.textContent = accountPairingSwitchedCopy(googleStatus.switched_account, googleStatus.connected);
       $connectionBannerAction.textContent = 'Platforms';
       $connectionBannerAction.dataset.action = 'open-platforms';
       $connectionBannerAction.style.display = '';
@@ -13361,11 +13387,12 @@ body::after {
     } else if (googleStatus.last_error) {
       $gmStatusPill.classList.add('error');
     }
-    if (googleStatus.connected && googleStatus.account_pairing_switched) {
-      // Same precedence as the banner: receiving works, so this is not the
-      // generic needs-repair state. The re-pair affordance stays as it is for
-      // any connected session; choosing a remedy is the user's call.
-      $gmHelper.textContent = accountPairingSwitchedCopy(googleStatus.switched_account);
+    if (googleAccountPairingSwitched()) {
+      // Same precedence as the banner, connected or not: this is neither the
+      // generic needs-repair state nor a paused sync that Reconnect would
+      // resume. The re-pair affordance stays; choosing a remedy is the user's
+      // call.
+      $gmHelper.textContent = accountPairingSwitchedCopy(googleStatus.switched_account, googleStatus.connected);
       showGoogleError('');
       $gmActionsRow.style.display = '';
       $gmReconnectBtn.disabled = false;
@@ -15090,6 +15117,21 @@ body::after {
       },
       outboxButtonLabels(rows, expanded, now) {
         return outboxButtonLabels(rows, expanded, now);
+      },
+      googleSendRouting(googleRaw, v2Primary) {
+        const savedGoogle = googleStatus;
+        const savedV2Primary = state.v2Primary;
+        try {
+          googleStatus = normalizeGoogleStatus(googleRaw || {});
+          state.v2Primary = v2Primary;
+          return {
+            sendNow: conversationCanSendNow({ SourcePlatform: 'sms' }),
+            flushQueued: platformReadyForQueuedSend('sms'),
+          };
+        } finally {
+          googleStatus = savedGoogle;
+          state.v2Primary = savedV2Primary;
+        }
       },
     };
   }

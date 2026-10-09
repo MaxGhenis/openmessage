@@ -684,7 +684,7 @@ func TestRetryBudgetConversationMovedRebindFailureAndCap(t *testing.T) {
 		got := mustDelivery(t, service, submission.OutboxID)
 		if got.State != OutboxNotDispatched || got.AttemptCount != 1 ||
 			!got.NextAttemptAt.Equal(clock.Now().Add(defaultRetryDelay)) ||
-			!strings.Contains(got.ErrorDetail, `; rebind failed: conversation "conversation-1" is now bound to remote ID "remote-conversation", not "remote-somewhere-else"`) {
+			!strings.Contains(got.ErrorDetail, `; rebind failed: reassign remote conversation ID "remote-conversation-new": conversation "conversation-1" is bound to "remote-conversation", not "remote-somewhere-else"`) {
 			t.Fatalf("delivery = %+v, want a consuming backoff failure naming the refused rebind", got)
 		}
 		if conversation, err := store.GetConversation("conversation-1"); err != nil ||
@@ -767,7 +767,7 @@ func TestRetryBudgetConversationMovedRebindIsLogged(t *testing.T) {
 			from:      "remote-somewhere-else",
 			wantLevel: "warn",
 			wantMsg:   "Outbox could not rebind a moved conversation",
-			wantError: `conversation "conversation-1" is now bound to remote ID "remote-conversation", not "remote-somewhere-else"`,
+			wantError: `reassign remote conversation ID "remote-conversation-new": conversation "conversation-1" is bound to "remote-conversation", not "remote-somewhere-else": conversation is bound to a different remote ID`,
 		},
 	}
 	for _, test := range tests {
@@ -1349,4 +1349,78 @@ func (s *budgetFuncSender) lastRequest() bridge.TextRequest {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.requests[len(s.requests)-1]
+}
+
+// Rows leased together are dispatched one at a time; a row whose lease the
+// rows before it used up is returned to the queue untouched (no transport
+// call, no attempt) and dispatched on a fresh lease next, so no transport call
+// starts with too little lease left (PR #204 review).
+func TestDispatchReleasesRowsWhoseLeaseASlowCallUsedUp(t *testing.T) {
+	clock := newManualClock(messagingTestTime)
+	store := openMessagingTestStore(t, clock.Now())
+	sender := &scriptedTextSender{steps: []sendStep{
+		{result: bridge.SendResult{RemoteMessageID: "remote-first"}},
+		{result: bridge.SendResult{RemoteMessageID: "remote-second"}},
+	}}
+	registry := newScriptedRegistry("lease-fresh", sender)
+	registry.setAvailable(true)
+	service := newMessagingTestService(t, store, registry, clock)
+	first := mustSendText(t, service, SendTextCommand{CommonCommand: testCommonCommand("lease-first"), Body: "first"})
+	second := mustSendText(t, service, SendTextCommand{CommonCommand: testCommonCommand("lease-second"), Body: "second"})
+	// The first send is slow: it uses a third of the lease.
+	sender.onSend = func() {
+		if sender.requestCount() == 1 {
+			clock.Advance(defaultLeaseTime / 3)
+		}
+	}
+	ctx := context.Background()
+
+	if processed, err := service.DispatchDue(ctx, 2); err != nil || processed != 1 {
+		t.Fatalf("DispatchDue(batch) = %d, %v; want 1 dispatched, nil", processed, err)
+	}
+	if got := sender.requestCount(); got != 1 {
+		t.Fatalf("transport calls = %d, want only the first row's", got)
+	}
+	if delivery := mustDelivery(t, service, first.OutboxID); delivery.State != OutboxConfirmed {
+		t.Fatalf("first delivery = %+v, want confirmed", delivery)
+	}
+	released := mustOutboxItem(t, service, second.OutboxID)
+	if released.State != sqlite.OutboxQueued || released.AttemptCount != 0 || released.LeaseToken != nil {
+		t.Fatalf("second row = %+v, want queued again with no attempt spent", released)
+	}
+
+	if processed, err := service.DispatchDue(ctx, 2); err != nil || processed != 1 {
+		t.Fatalf("DispatchDue(fresh lease) = %d, %v; want 1, nil", processed, err)
+	}
+	if got := sender.requestCount(); got != 2 {
+		t.Fatalf("transport calls = %d, want the second row dispatched on its fresh lease", got)
+	}
+	if delivery := mustDelivery(t, service, second.OutboxID); delivery.State != OutboxConfirmed {
+		t.Fatalf("second delivery = %+v, want confirmed", delivery)
+	}
+}
+
+func TestLeaseFreshForDispatch(t *testing.T) {
+	now := messagingTestTime
+	expiring := func(in time.Duration) sqlite.Lease {
+		ms := now.Add(in).UnixMilli()
+		return sqlite.Lease{OutboxItem: sqlite.OutboxItem{LeaseExpiresAtMS: &ms}}
+	}
+	for _, test := range []struct {
+		remaining time.Duration
+		want      bool
+	}{
+		{defaultLeaseTime, true},
+		{27 * time.Second, true},
+		{27*time.Second - time.Millisecond, false},
+		{time.Second, false},
+		{-time.Second, false},
+	} {
+		if got := leaseFreshForDispatch(expiring(test.remaining), now, defaultLeaseTime); got != test.want {
+			t.Fatalf("leaseFreshForDispatch(%v left of %v) = %v, want %v", test.remaining, defaultLeaseTime, got, test.want)
+		}
+	}
+	if !leaseFreshForDispatch(sqlite.Lease{}, now, defaultLeaseTime) {
+		t.Fatal("a lease without an expiry was treated as used up")
+	}
 }
