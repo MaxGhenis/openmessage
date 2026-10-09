@@ -13,6 +13,8 @@ type GoogleGeneration struct {
 	app     *App
 	Client  *client.Client
 	Handler *client.EventHandler
+	// history is fixed at birth (BeginGoogleGenerationWithHistory).
+	history GoogleHistoryIngress
 }
 
 // BeginGoogleGeneration installs a fresh legacy client for the unchanged
@@ -20,7 +22,15 @@ type GoogleGeneration struct {
 // must capture Handler directly; a libgm callback must never look up
 // App.EventHandler after it has been installed.
 func (a *App) BeginGoogleGeneration(cli *client.Client) *GoogleGeneration {
-	generation := &GoogleGeneration{app: a, Client: cli}
+	return a.BeginGoogleGenerationWithHistory(cli, nil)
+}
+
+// BeginGoogleGenerationWithHistory is BeginGoogleGeneration that also installs
+// the generation's history ingress in the same critical section as the client,
+// so no catch-up can capture the new client without it. Catch-ups that fetch
+// with this client hand what they fetch to history.
+func (a *App) BeginGoogleGenerationWithHistory(cli *client.Client, history GoogleHistoryIngress) *GoogleGeneration {
+	generation := &GoogleGeneration{app: a, Client: cli, history: history}
 	generation.Handler = &client.EventHandler{
 		Store:       a.Store,
 		Logger:      a.Logger,

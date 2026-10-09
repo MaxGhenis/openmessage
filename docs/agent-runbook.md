@@ -271,11 +271,10 @@ start in the evening after about 13–15 hours, with the 16-hour cap as the
 bound. A day that an outage covers only in part still counts in a later
 baseline and can delay a repeat detection by an hour or two.
 
-**What a stall leaves behind.** On a v2-primary install nothing re-fetches the
-messages a stall skipped: the startup backfill and recent reconcile write only
-the legacy `messages.db`, and v2 reads see only what the live long-poll
-delivers. Find the hole by the phone's row ids, which advance with every
-message on the phone:
+**What a stall leaves behind.** Resuming does not bring back what the phone
+skipped: after the 10/7 restart OpenMessage held 4 of the 124 row ids the phone
+had created during the stall. Find the hole by the phone's row ids, which
+advance with every message on the phone:
 
 ```bash
 sqlite3 -readonly "$HOME/Library/Application Support/OpenMessage/v2/store.sqlite3" \
@@ -283,6 +282,105 @@ sqlite3 -readonly "$HOME/Library/Application Support/OpenMessage/v2/store.sqlite
    from messages where account_id='google-primary' and remote_message_id glob '[0-9]*'
    order by occurred_at_ms desc limit 40"
 ```
+
+Then recover it with a window backfill from just before the gap (next
+section). Catch-ups now hand what they fetch to v2; before that, every fetch
+wrote only the legacy `messages.db`, which v2-primary readers never see.
+
+## Catch-up history reaches v2 as history frames
+
+Google catch-ups (startup shallow backfill, the recent reconcile on
+`listen_recovered` / `phone_responding_again`, deep and window backfill, phone
+backfill, pending-media refresh) fetch with request/response calls, whose
+replies never pass through the live long-poll tee. They used to write only the
+legacy `messages.db`, so on a v2-primary install nothing they fetched was
+visible to readers. Each catch-up now captures the current connection
+generation's history ingress together with its client and hands every fetched
+conversation and message to v2 as well:
+
+- **Codec `google.protobuf.history`, own dedupe keys.** Same envelope as live
+  frames, but a distinct inbox codec. On a v2-primary daemon, the silence
+  detector (#190) and the SMS-path monitor (#191) select inbox rows by exact
+  codec `google.protobuf`, so a reconcile right after a reconnect cannot reset
+  a silence clock there. (On a legacy-primary daemon silence is read from the
+  legacy store's incoming messages, which catch-ups have always written to.)
+  History keys (`hmsg:`/`hconv:`) never collide with live keys, so a live push
+  always gets its own inbox row and is applied and counted even when a
+  catch-up fetched the same message first.
+- **Fills gaps, never moves a binding.** A history frame inserts a message only
+  when v2 lacks it, applies reactions only to messages it inserted, and never
+  updates an existing row; the live channel owns updates (a general upsert
+  from fetched data would resurrect deleted rows, revert edits and clobber
+  reactions). It places a message only in the thread its wire id is bound to,
+  or in a thread its own conversation snapshot created. A snapshot creates a
+  thread only for an unbound id whose roster no existing thread answers to.
+  Anything else is skipped and counted in `history_skipped`: an unbound id
+  matching an existing thread's roster (the phone can hold two threads with
+  the same people), a sender who isn't the bound 1:1 thread's peer, an unbound
+  thread with no snapshot, or a snapshot that names a different thread than
+  the one its id is bound to. That last case is a stale binding: after a phone
+  swap or restore an id can still be bound to the old phone's thread, and a
+  snapshot of another kind, another 1:1 peer or a fully disjoint group means
+  nothing in that frame is filed there. #176's id-space rebinding stays a
+  live-channel repair. A frame fetched without a snapshot (the pending-media
+  refresh) can't be checked that way; only an incoming 1:1 sender is. A skipped
+  frame is re-evaluated when a later catch-up fetches it again, best effort:
+  the worker drops the re-check when its queue is full, as it can be during a
+  large re-fetch. Once a live frame has bound or corrected the thread,
+  re-running a narrow window backfill gives it another chance.
+- **No liveness.** History commits under the generation fence but records no
+  supervisor activity, so a working pull path never masks a dead push path.
+  When the generation ends mid-catch-up, the catch-up stops and stores nothing
+  more, legacy included. The recent reconcile and the startup backfill store
+  what they fetched for a conversation oldest first, so what they didn't store
+  sits above what they did, and the next recent reconcile (which pages down to
+  the newest stored message) fetches it. A reconcile interrupted between pages
+  stores nothing for that conversation. A deep or window backfill that stops
+  has to be run again; a window run says so in `error_details`.
+- **Counters.** `/api/status` → `v2_ingest.per_account.<account>`:
+  `history_appended`, `history_deduped`, `history_imported`,
+  `history_existing`, `history_conversations`, `history_skipped`. `appended`,
+  `deduped` and `projected` count only live frames; shared counters such as
+  `decoded_events`, `quarantined`, `empty_stubs_skipped` and the reaction and
+  echo counters include history too. Backfill runs also report `history_teed`
+  / `history_tee_failed` in `/api/backfill/status` (both stay zero on a
+  legacy-only install).
+
+**Recovering a window the live channel skipped** (for example after the phone
+stopped relaying): run a window backfill from just before the gap. It lists
+every folder, keeps conversations whose last message is at or after `since`,
+and pages each one's messages until a page reaches older than `since`. When
+the phone sends no cursor, it continues below the oldest message on the page
+(by that message's id and time) and stops when a page brings nothing new; it
+gives up on a conversation after 400 pages and reports that. Unlike
+the recent reconcile it does not stop at the newest stored message, which sits
+above the hole once push resumes; unlike a deep backfill it does not re-fetch
+(and store a frame for) every message the phone has ever held.
+
+```bash
+curl -s -X POST http://127.0.0.1:7007/api/backfill -d '{"since":"2026-10-05T22:00:00-04:00"}'
+curl -s http://127.0.0.1:7007/api/backfill/status | jq
+curl -s http://127.0.0.1:7007/api/status | jq '.v2_ingest.per_account["google-primary"] | with_entries(select(.key|startswith("history")))'
+```
+
+`since` also accepts a `YYYY-MM-DD` local date or Unix milliseconds. A body
+with `since` either starts a window or is rejected (400): unknown fields,
+trailing data, bodies over 4 KB and Unix seconds are refused, so a typo can't
+fall through to a full deep backfill. (An empty body, `{}` or `{"since":null}`
+still means a deep backfill.) A run that couldn't start or stopped early says
+so in `/api/backfill/status` `error_details`. Then confirm
+the phone's row ids are present (they advance with every message on the phone):
+
+```bash
+sqlite3 -readonly "$HOME/Library/Application Support/OpenMessage/v2/store.sqlite3" \
+  "select cast(remote_message_id as integer) id, datetime(occurred_at_ms/1000,'unixepoch','localtime')
+   from messages where account_id='google-primary' and remote_message_id glob '[0-9]*'
+     and cast(remote_message_id as integer) between <first> and <last> order by id"
+```
+
+All of this needs the request/response path to work. If the fetch replies are
+empty (`Fetched conversations count=0` while the store holds history), nothing
+can be recovered until that is fixed.
 
 ## MCP serving — exactly one process may own live transports
 
@@ -1185,7 +1283,9 @@ briefly show "reconnecting" before it settles (see throttling note above).
 Read `curl -s http://127.0.0.1:7007/api/status | jq '.v2_ingest'`. A healthy
 enabled stack reports `enabled: true`; under `per_account`, `appended` grows as
 receive frames arrive, message-bearing frames advance `projected`, and
-`quarantined` remains `0`. An idle WhatsApp or Signal account can legitimately
+`quarantined` remains `0`. Catch-up history never moves `appended`,
+`deduped` or `projected` (it has its own `history_*` counters), so their
+growth is evidence of live delivery. An idle WhatsApp or Signal account can legitimately
 stay at zero until a new inbound/history frame arrives.
 
 The manual receive-only check is:

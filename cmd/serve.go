@@ -755,6 +755,7 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 				DownloadWhatsAppMedia: a.DownloadWhatsAppMedia,
 				DownloadSignalMedia:   a.DownloadSignalMedia,
 				StartDeepBackfill:     a.StartDeepBackfill,
+				StartWindowBackfill:   a.StartGoogleWindowBackfill,
 				BackfillStatus:        func() any { return a.GetBackfillProgress() },
 				BackfillPhone:         a.BackfillConversationByPhone,
 				SyncGoogleContacts:    a.SyncGoogleContacts,

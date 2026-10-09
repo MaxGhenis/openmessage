@@ -26,10 +26,22 @@ type EchoObserver interface {
 
 // DecoderRegistration binds a durable codec to both its pure decoder and the
 // platform needed for shared key derivation.
+//
+// History marks a codec whose frames were fetched on request (catch-up
+// replies) rather than received live. History frames only fill gaps and never
+// move a thread binding: a snapshot creates a conversation only when its
+// remote ID is unbound and no existing thread already answers to its roster;
+// a message is inserted only when v2 lacks it, and only into the thread its
+// remote conversation ID is bound to, unless its sender contradicts that
+// thread's direct peer. Reactions apply only to messages a frame inserted, and
+// no existing row is updated. What history cannot place without moving a
+// binding is skipped (history_skipped); the live channel owns the #176
+// id-space repairs. History is supported for Google only.
 type DecoderRegistration struct {
 	Codec    string
 	Platform bridge.Platform
 	Decoder  bridge.Decoder
+	History  bool
 }
 
 // WorkerConfig configures the single-goroutine projection worker.
@@ -46,9 +58,19 @@ type WorkerConfig struct {
 	Decoders []DecoderRegistration
 }
 
+// errHistoryUnplaceable marks a history snapshot or message that v2 could only
+// place by moving an existing thread binding, which history never does.
+var errHistoryUnplaceable = errors.New("history frame cannot be placed without moving a thread binding")
+
+// errHistoryContradicted marks a history snapshot whose bound thread is a
+// different thread on the phone now (a stale binding after a device ID-space
+// reset): the frame must not file anything under that remote ID.
+var errHistoryContradicted = errors.New("history snapshot contradicts the thread its remote ID is bound to")
+
 type registeredDecoder struct {
 	platform bridge.Platform
 	decoder  bridge.Decoder
+	history  bool
 }
 
 type workItem struct {
@@ -80,6 +102,18 @@ type Worker struct {
 
 	changeMu sync.Mutex
 	changed  chan struct{}
+
+	// fault lets tests inject a storage failure at a named point between two
+	// of a frame's commits (see faultAt). Nil outside tests.
+	fault func(point string) error
+}
+
+// faultAt returns the injected failure for point, if a test set one.
+func (w *Worker) faultAt(point string) error {
+	if w.fault == nil {
+		return nil
+	}
+	return w.fault(point)
 }
 
 // NewWorker validates and copies its explicitly configured decoder
@@ -125,9 +159,17 @@ func NewWorker(config WorkerConfig) (*Worker, error) {
 		if _, exists := decoders[codec]; exists {
 			return nil, fmt.Errorf("create ingest worker: duplicate decoder codec %q", codec)
 		}
+		if registration.History && registration.Platform != bridge.PlatformGoogle {
+			return nil, fmt.Errorf(
+				"create ingest worker: history codec %q is only supported for %q",
+				codec,
+				bridge.PlatformGoogle,
+			)
+		}
 		decoders[codec] = registeredDecoder{
 			platform: registration.Platform,
 			decoder:  registration.Decoder,
+			history:  registration.History,
 		}
 	}
 
@@ -257,9 +299,11 @@ func (w *Worker) handleRecord(
 		}
 	}()
 
+	// One progress record spans every retry of this frame.
+	progress := &historyFrameProgress{}
 	err := retryTransient(ctx, func() error {
 		var err error
-		changed, err = w.processRecordResult(ctx, inboxID, record)
+		changed, err = w.processRecordAttempt(ctx, inboxID, record, progress)
 		return err
 	})
 	if err == nil || ctx.Err() != nil {
@@ -344,6 +388,65 @@ func (w *Worker) processRecordResult(
 	inboxID string,
 	record bridge.RawIngressRecord,
 ) (bool, error) {
+	return w.processRecordAttempt(ctx, inboxID, record, nil)
+}
+
+// historyFrameProgress remembers what earlier attempts of one history frame
+// already committed. History's writes are separate commits (the thread, its
+// roster, the message, its reactions, the inbox mark), and history skips
+// whatever v2 already holds; without this, a retry after a transient storage
+// error would find its own half-finished thread or message, skip it as
+// existing, and never write the roster or reactions that follow.
+type historyFrameProgress struct {
+	// conversations maps a remote conversation ID this frame began creating
+	// to whether its creation finished.
+	conversations map[string]bool
+	// messages holds the messages this frame inserted, by remote target key.
+	messages map[string]sqlite.Message
+}
+
+func (p *historyFrameProgress) conversationState(remoteID string) (started, finished bool) {
+	if p == nil {
+		return false, false
+	}
+	finished, started = p.conversations[remoteID]
+	return started, finished
+}
+
+func (p *historyFrameProgress) setConversation(remoteID string, finished bool) {
+	if p == nil {
+		return
+	}
+	if p.conversations == nil {
+		p.conversations = make(map[string]bool)
+	}
+	p.conversations[remoteID] = finished
+}
+
+func (p *historyFrameProgress) insertedMessage(key string) (sqlite.Message, bool) {
+	if p == nil {
+		return sqlite.Message{}, false
+	}
+	message, ok := p.messages[key]
+	return message, ok
+}
+
+func (p *historyFrameProgress) setInsertedMessage(key string, message sqlite.Message) {
+	if p == nil {
+		return
+	}
+	if p.messages == nil {
+		p.messages = make(map[string]sqlite.Message)
+	}
+	p.messages[key] = message
+}
+
+func (w *Worker) processRecordAttempt(
+	ctx context.Context,
+	inboxID string,
+	record bridge.RawIngressRecord,
+	progress *historyFrameProgress,
+) (bool, error) {
 	registration, exists := w.decoders[record.Codec]
 	if !exists {
 		return false, quarantine(fmt.Errorf("unknown ingress codec %q", record.Codec))
@@ -360,7 +463,7 @@ func (w *Worker) processRecordResult(
 		}
 	}
 	w.counters.account(record.AccountID).decodedEvents.Add(uint64(len(events)))
-	changed, err := w.applyEvents(ctx, registration.platform, record, inboxID, events)
+	changed, err := w.applyEvents(ctx, registration.platform, registration.history, record, inboxID, events, progress)
 	return changed, classifyApplyError(err)
 }
 
@@ -428,19 +531,57 @@ func validateDecodedEvent(event bridge.Event) error {
 func (w *Worker) applyEvents(
 	ctx context.Context,
 	platform bridge.Platform,
+	history bool,
 	record bridge.RawIngressRecord,
 	inboxID string,
 	events []bridge.Event,
+	progress *historyFrameProgress,
 ) (bool, error) {
 	accountID := record.AccountID
 	changed := false
 	googleSnapshots := make(map[string]*googleReactionSnapshot)
 	googleSnapshotOrder := make([]string, 0)
+	// contradicted holds remote conversation IDs whose snapshot in this frame
+	// says the bound thread is a different thread now; history files nothing
+	// under them.
+	contradicted := make(map[string]bool)
 	for _, event := range events {
 		if event.Kind != bridge.EventConversation {
 			continue
 		}
-		if _, err := w.refreshConversation(accountID, platform, *event.Conversation); err != nil {
+		if history {
+			created, err := w.applyHistoryConversation(accountID, platform, *event.Conversation, progress)
+			switch {
+			case err == nil:
+				if created {
+					w.counters.account(accountID).historyConversations.Add(1)
+					changed = true
+				}
+			case isTransientDBError(err):
+				return false, err
+			case errors.Is(err, errHistoryContradicted):
+				contradicted[v2keys.NormalizeRemoteConversationID(string(platform), event.Conversation.RemoteConversationID)] = true
+				w.counters.account(accountID).historySkipped.Add(1)
+				w.logger.Info().
+					Str("account_id", accountID).
+					Str("inbox_id", inboxID).
+					Str("remote_conversation_id", event.Conversation.RemoteConversationID).
+					Msg("ingest: history snapshot contradicts its bound thread (stale binding); left to the live channel")
+			default:
+				// Unplaceable, or unusable (for example a participant with no
+				// valid address): skip the snapshot, never the frame. The
+				// frame's message then needs a bound thread to be placed.
+				w.counters.account(accountID).historySkipped.Add(1)
+				w.logger.Debug().
+					Err(err).
+					Str("account_id", accountID).
+					Str("inbox_id", inboxID).
+					Str("remote_conversation_id", event.Conversation.RemoteConversationID).
+					Msg("ingest: skipped history conversation snapshot")
+			}
+			continue
+		}
+		if _, err := w.refreshConversation(accountID, platform, *event.Conversation, true); err != nil {
 			return false, err
 		}
 		changed = true
@@ -452,49 +593,76 @@ func (w *Worker) applyEvents(
 		if event.Kind != bridge.EventMessage {
 			continue
 		}
-		projection, duplicateOf, err := w.messageProjection(
-			ctx,
-			accountID,
-			platform,
-			inboxID,
-			*event.Message,
-			messageCount == 0,
-		)
-		if err != nil {
-			return false, err
-		}
-		if duplicateOf != nil {
-			// A re-delivery under a re-keyed remote ID: the message already
-			// exists in its thread under the old ID. Do not project a second
-			// row, but let the frame's reaction snapshot refresh the original.
-			if platform == bridge.PlatformGoogle {
-				key := reactionRemoteTargetKey(
-					platform,
-					event.Message.RemoteConversationID,
-					event.Message.RemoteMessageID,
-				)
-				if _, exists := googleSnapshots[key]; !exists {
-					googleSnapshotOrder = append(googleSnapshotOrder, key)
-				}
-				googleSnapshots[key] = &googleReactionSnapshot{
-					accountID:      duplicateOf.AccountID,
-					conversationID: duplicateOf.ConversationID,
-					messageID:      duplicateOf.MessageID,
-				}
-			}
+		var projection sqlite.MessageProjection
+		if history && contradicted[v2keys.NormalizeRemoteConversationID(string(platform), event.Message.RemoteConversationID)] {
+			w.counters.account(accountID).historySkipped.Add(1)
 			continue
 		}
-		if messageCount == 0 {
-			if err := w.messages.ProjectMessage(ctx, projection); err != nil {
+		if history {
+			message, inserted, err := w.historyMessage(
+				ctx,
+				accountID,
+				platform,
+				inboxID,
+				*event.Message,
+				messageCount == 0,
+				progress,
+			)
+			if err != nil {
 				return false, err
 			}
-			projected = true
-			w.counters.account(accountID).projected.Add(1)
+			if !inserted {
+				continue
+			}
+			projection.Message = message
 		} else {
-			if err := w.messages.ImportMessage(ctx, projection); err != nil {
+			var duplicateOf *sqlite.Message
+			var err error
+			projection, duplicateOf, err = w.messageProjection(
+				ctx,
+				accountID,
+				platform,
+				inboxID,
+				*event.Message,
+				messageCount == 0,
+				false,
+			)
+			if err != nil {
 				return false, err
 			}
-			w.counters.account(accountID).imported.Add(1)
+			if duplicateOf != nil {
+				// A re-delivery under a re-keyed remote ID: the message already
+				// exists in its thread under the old ID. Do not project a second
+				// row, but let the frame's reaction snapshot refresh the original.
+				if platform == bridge.PlatformGoogle {
+					key := reactionRemoteTargetKey(
+						platform,
+						event.Message.RemoteConversationID,
+						event.Message.RemoteMessageID,
+					)
+					if _, exists := googleSnapshots[key]; !exists {
+						googleSnapshotOrder = append(googleSnapshotOrder, key)
+					}
+					googleSnapshots[key] = &googleReactionSnapshot{
+						accountID:      duplicateOf.AccountID,
+						conversationID: duplicateOf.ConversationID,
+						messageID:      duplicateOf.MessageID,
+					}
+				}
+				continue
+			}
+			if messageCount == 0 {
+				if err := w.messages.ProjectMessage(ctx, projection); err != nil {
+					return false, err
+				}
+				projected = true
+				w.counters.account(accountID).projected.Add(1)
+			} else {
+				if err := w.messages.ImportMessage(ctx, projection); err != nil {
+					return false, err
+				}
+				w.counters.account(accountID).imported.Add(1)
+			}
 		}
 		if platform == bridge.PlatformGoogle {
 			// Message upserts preserve the first local primary key on a remote-key
@@ -598,10 +766,16 @@ func (w *Worker) applyEvents(
 			)
 			snapshot, exists := googleSnapshots[key]
 			if strings.TrimSpace(reaction.TargetRemoteMessageID) == "" || !exists {
+				if history {
+					// The target was skipped because v2 already had it (or the
+					// reaction is a tapback with no resolvable target); either
+					// way history has nothing to apply and nothing is lost.
+					continue
+				}
 				w.countOrphanReaction(accountID, inboxID, reaction)
 				continue
 			}
-			entry, ok, err := w.prepareReactionSnapshotEntry(accountID, platform, reaction)
+			entry, ok, err := w.prepareReactionSnapshotEntryFor(accountID, platform, reaction, history)
 			if err != nil {
 				return changed, err
 			}
@@ -726,6 +900,7 @@ func (w *Worker) refreshConversation(
 	accountID string,
 	platform bridge.Platform,
 	event bridge.ConversationEvent,
+	rebind bool,
 ) (sqlite.Conversation, error) {
 	remoteID := v2keys.NormalizeRemoteConversationID(string(platform), event.RemoteConversationID)
 	if strings.TrimSpace(remoteID) == "" {
@@ -786,7 +961,7 @@ func (w *Worker) refreshConversation(
 	}
 
 	conversation, err := w.store.GetConversationByRemote(accountID, remoteID)
-	if platform == bridge.PlatformGoogle {
+	if platform == bridge.PlatformGoogle && rebind {
 		// Google remote IDs are device-local and re-key on a phone swap or
 		// restore; trust the event's roster over the stored numeric binding.
 		conversation, err = w.googleConversationEventTarget(
@@ -836,6 +1011,9 @@ func (w *Worker) refreshConversation(
 	if err := w.store.UpsertConversation(conversation); err != nil {
 		return sqlite.Conversation{}, err
 	}
+	if err := w.faultAt("conversation-upserted"); err != nil {
+		return sqlite.Conversation{}, err
+	}
 	conversation, err = w.store.GetConversationByRemote(accountID, remoteID)
 	if err != nil {
 		return sqlite.Conversation{}, err
@@ -843,7 +1021,9 @@ func (w *Worker) refreshConversation(
 
 	participants := make([]sqlite.ConversationParticipant, 0, len(prepared))
 	for _, item := range prepared {
-		identity, identityErr := w.resolveIdentity(accountID, platform, item.participant.Identity)
+		// rebind is false only for history's mint, which never rewrites a
+		// known identity.
+		identity, identityErr := w.resolveIdentityFor(accountID, platform, item.participant.Identity, !rebind)
 		if identityErr != nil {
 			return sqlite.Conversation{}, identityErr
 		}
@@ -923,10 +1103,286 @@ func (w *Worker) existingConversation(
 	return conversation, remoteID, err
 }
 
+// applyHistoryConversation applies a fetched conversation snapshot only when
+// it creates a thread without moving any binding. A bound remote ID is left to
+// the live channel. An unbound one whose roster an existing thread already
+// answers to is ambiguous: #176 would rebind that thread, which takes its live
+// remote ID away when the phone simply holds two threads with the same people
+// (an old and a new one, or an SMS and an RCS thread), so the snapshot is
+// skipped (errHistoryUnplaceable). Otherwise a fresh thread is minted from the
+// participants that carry an address; one without (which libgm does deliver)
+// is left off the roster instead of making the whole snapshot unusable.
+func (w *Worker) applyHistoryConversation(
+	accountID string,
+	platform bridge.Platform,
+	event bridge.ConversationEvent,
+	progress *historyFrameProgress,
+) (bool, error) {
+	usable := make([]bridge.Participant, 0, len(event.Participants))
+	for _, participant := range event.Participants {
+		if identityRaw(participant.Identity) != "" {
+			usable = append(usable, participant)
+		}
+	}
+	event.Participants = usable
+	remoteID := v2keys.NormalizeRemoteConversationID(string(platform), event.RemoteConversationID)
+
+	started, finished := progress.conversationState(remoteID)
+	if finished {
+		return false, nil
+	}
+	if !started {
+		bound, _, err := w.existingConversation(accountID, platform, event.RemoteConversationID)
+		if err == nil {
+			contradicts, err := w.historySnapshotContradicts(accountID, platform, event, bound)
+			if err != nil {
+				return false, err
+			}
+			if contradicts {
+				return false, errHistoryContradicted
+			}
+			return false, nil
+		}
+		if !errors.Is(err, sqlite.ErrNotFound) {
+			return false, err
+		}
+		peers, err := w.resolveEventPeers(accountID, platform, event, true)
+		if err != nil {
+			return false, err
+		}
+		if len(peers) > 0 {
+			direct := event.Kind != string(sqlite.ConversationKindGroup)
+			_, findErr := w.findThreadByRoster(accountID, direct, peers)
+			if findErr == nil {
+				return false, errHistoryUnplaceable
+			}
+			if !errors.Is(findErr, sqlite.ErrNotFound) {
+				return false, findErr
+			}
+		}
+		progress.setConversation(remoteID, false)
+	}
+	// Either a fresh mint, or an earlier attempt of this frame committed the
+	// thread row and failed before its roster: write both again.
+	if _, err := w.refreshConversation(accountID, platform, event, false); err != nil {
+		return false, err
+	}
+	progress.setConversation(remoteID, true)
+	return true, nil
+}
+
+// historySnapshotContradicts reports whether a fetched snapshot names a
+// different thread than the one its remote ID is bound to in v2. That is the
+// signature of a stale binding after a phone swap or restore, which the live
+// channel repairs by rebinding (#176) and history must not file into. A bound
+// thread with no known peers proves nothing either way. Otherwise the kinds
+// must agree and the rosters must pass #176's consistency rule (a direct
+// thread's sole peer must match; group membership may change but a fully
+// disjoint roster is a different group). Peers are looked up, not created.
+func (w *Worker) historySnapshotContradicts(
+	accountID string,
+	platform bridge.Platform,
+	event bridge.ConversationEvent,
+	bound sqlite.Conversation,
+) (bool, error) {
+	storedPeers, err := w.store.ListConversationPeerIdentities(accountID, bound.ConversationID)
+	if err != nil {
+		return false, err
+	}
+	if len(storedPeers) == 0 {
+		return false, nil
+	}
+	kind := sqlite.ConversationKindDirect
+	if event.Kind == string(sqlite.ConversationKindGroup) {
+		kind = sqlite.ConversationKindGroup
+	}
+	if kind != bound.Kind {
+		return true, nil
+	}
+	eventPeers := make([]sqlite.Identity, 0, len(event.Participants))
+	seen := make(map[string]struct{}, len(event.Participants))
+	for _, participant := range event.Participants {
+		if participant.Identity.IsSelf || identityRaw(participant.Identity) == "" {
+			continue
+		}
+		key, err := v2keys.IdentityKey(accountID, string(platform), identityRaw(participant.Identity))
+		if err != nil {
+			return false, err
+		}
+		identityID := v2keys.DeriveID("identity", accountID, key.Kind+"\x1f"+key.Canonical)
+		identity, err := w.store.GetIdentityByCanonical(accountID, sqlite.IdentityKind(key.Kind), key.Canonical)
+		switch {
+		case err == nil:
+			if identity.IsSelf {
+				continue
+			}
+			identityID = identity.IdentityID
+		case !errors.Is(err, sqlite.ErrNotFound):
+			return false, err
+		}
+		if _, duplicate := seen[identityID]; duplicate {
+			continue
+		}
+		seen[identityID] = struct{}{}
+		eventPeers = append(eventPeers, sqlite.Identity{IdentityID: identityID})
+	}
+	if len(eventPeers) == 0 {
+		return false, nil
+	}
+	return !rostersConsistent(kind == sqlite.ConversationKindDirect, eventPeers, storedPeers), nil
+}
+
+// historyMessage places and inserts one fetched message under the history
+// rules. inserted reports that this frame inserted the message, now or in an
+// earlier attempt, so the caller finishes its reactions and recency; anything
+// history must not or need not insert is counted here and reported false.
+func (w *Worker) historyMessage(
+	ctx context.Context,
+	accountID string,
+	platform bridge.Platform,
+	inboxID string,
+	event bridge.MessageEvent,
+	routeEcho bool,
+	progress *historyFrameProgress,
+) (sqlite.Message, bool, error) {
+	key := reactionRemoteTargetKey(platform, event.RemoteConversationID, event.RemoteMessageID)
+	if message, ok := progress.insertedMessage(key); ok {
+		return message, true, nil
+	}
+	exists, err := w.historyMessageExists(ctx, accountID, platform, event)
+	if err != nil {
+		return sqlite.Message{}, false, err
+	}
+	if exists {
+		// Skip before projection so a re-fetch has no side effects: no
+		// identity rewrite, no echo reconcile.
+		w.counters.account(accountID).historyExisting.Add(1)
+		return sqlite.Message{}, false, nil
+	}
+	projection, duplicateOf, err := w.messageProjection(ctx, accountID, platform, inboxID, event, routeEcho, true)
+	if errors.Is(err, errHistoryUnplaceable) {
+		w.counters.account(accountID).historySkipped.Add(1)
+		w.logger.Debug().
+			Str("account_id", accountID).
+			Str("inbox_id", inboxID).
+			Str("remote_conversation_id", event.RemoteConversationID).
+			Str("remote_message_id", event.RemoteMessageID).
+			Msg("ingest: skipped history message whose thread binding is missing or contradicts its sender")
+		return sqlite.Message{}, false, nil
+	}
+	if err != nil {
+		return sqlite.Message{}, false, err
+	}
+	if duplicateOf != nil {
+		// History never refreshes an existing row, including its reactions;
+		// the stored copy stays as the live channel left it.
+		w.counters.account(accountID).historyExisting.Add(1)
+		return sqlite.Message{}, false, nil
+	}
+	inserted, err := w.messages.InsertHistoricalMessage(ctx, projection)
+	if err != nil {
+		return sqlite.Message{}, false, err
+	}
+	if !inserted {
+		// Another row already holds this message's primary or natural key
+		// (for example under a thread a repair moved it to).
+		w.counters.account(accountID).historyExisting.Add(1)
+		return sqlite.Message{}, false, nil
+	}
+	w.counters.account(accountID).historyImported.Add(1)
+	progress.setInsertedMessage(key, projection.Message)
+	if err := w.faultAt("history-message-inserted"); err != nil {
+		return sqlite.Message{}, false, err
+	}
+	return projection.Message, true, nil
+}
+
+// historyMessageConversation returns the thread a fetched message belongs to
+// without moving any binding: the thread its remote conversation ID is bound
+// to (by an earlier live frame or by the snapshot in the same history frame).
+// An unbound ID, or an incoming sender who is not the bound direct thread's
+// peer (a binding #176 would move), is errHistoryUnplaceable.
+func (w *Worker) historyMessageConversation(
+	accountID string,
+	platform bridge.Platform,
+	remoteConversationID string,
+	sender *sqlite.Identity,
+) (sqlite.Conversation, string, error) {
+	conversation, remoteID, err := w.existingConversation(accountID, platform, remoteConversationID)
+	if errors.Is(err, sqlite.ErrNotFound) {
+		return sqlite.Conversation{}, "", errHistoryUnplaceable
+	}
+	if err != nil {
+		return sqlite.Conversation{}, "", err
+	}
+	if sender != nil && conversation.Kind == sqlite.ConversationKindDirect {
+		peers, err := w.store.ListConversationPeerIdentities(accountID, conversation.ConversationID)
+		if err != nil {
+			return sqlite.Conversation{}, "", err
+		}
+		if len(peers) > 0 && !identitiesContain(peers, sender.IdentityID) {
+			return sqlite.Conversation{}, "", errHistoryUnplaceable
+		}
+	}
+	return conversation, remoteID, nil
+}
+
+// historyMessageExists reports whether v2 already holds the message a history
+// frame carries: under the message ID derived from its wire identity (wherever
+// a rebind or repair has since moved that row), or under its remote ID in the
+// thread its wire conversation ID is bound to (an outbox echo re-keys a local
+// send row to the remote ID while keeping its own message ID). A malformed
+// event reports false so messageProjection rejects it exactly as it would a
+// live frame.
+func (w *Worker) historyMessageExists(
+	ctx context.Context,
+	accountID string,
+	platform bridge.Platform,
+	event bridge.MessageEvent,
+) (bool, error) {
+	remoteMessageID := strings.TrimSpace(event.RemoteMessageID)
+	remoteConversationID := v2keys.NormalizeRemoteConversationID(string(platform), event.RemoteConversationID)
+	if remoteMessageID == "" || strings.TrimSpace(remoteConversationID) == "" {
+		return false, nil
+	}
+	derivedID := v2keys.DeriveID("message", accountID, remoteConversationID+"\x1f"+remoteMessageID)
+	if _, err := w.messages.GetMessage(ctx, derivedID); err == nil {
+		return true, nil
+	} else if !errors.Is(err, sqlite.ErrNotFound) {
+		return false, err
+	}
+	conversation, _, err := w.existingConversation(accountID, platform, event.RemoteConversationID)
+	if errors.Is(err, sqlite.ErrNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if _, err := w.messages.GetMessageByRemote(ctx, accountID, conversation.ConversationID, remoteMessageID); err == nil {
+		return true, nil
+	} else if !errors.Is(err, sqlite.ErrNotFound) {
+		return false, err
+	}
+	return false, nil
+}
+
 func (w *Worker) resolveIdentity(
 	accountID string,
 	platform bridge.Platform,
 	reference bridge.IdentityRef,
+) (sqlite.Identity, error) {
+	return w.resolveIdentityFor(accountID, platform, reference, false)
+}
+
+// resolveIdentityFor resolves (creating if needed) the identity a reference
+// names. With createOnly, an identity that already exists is returned as
+// stored: history frames use this so a fetched copy never rewrites a known
+// contact's name, raw value or update time.
+func (w *Worker) resolveIdentityFor(
+	accountID string,
+	platform bridge.Platform,
+	reference bridge.IdentityRef,
+	createOnly bool,
 ) (sqlite.Identity, error) {
 	raw := identityRaw(reference)
 	key, err := v2keys.IdentityKey(accountID, string(platform), raw)
@@ -939,6 +1395,9 @@ func (w *Worker) resolveIdentity(
 	}
 	kind := sqlite.IdentityKind(key.Kind)
 	identity, err := w.store.GetIdentityByCanonical(accountID, kind, key.Canonical)
+	if err == nil && createOnly {
+		return identity, nil
+	}
 	if errors.Is(err, sqlite.ErrNotFound) {
 		identity = sqlite.Identity{
 			IdentityID:     v2keys.DeriveID("identity", accountID, key.Kind+"\x1f"+key.Canonical),
@@ -988,6 +1447,7 @@ func (w *Worker) prepareReactionActor(
 	platform bridge.Platform,
 	reference bridge.IdentityRef,
 	emoji string,
+	createOnly bool,
 ) (preparedReactionActor, error) {
 	if reference.IsSelf {
 		return preparedReactionActor{
@@ -1003,7 +1463,7 @@ func (w *Worker) prepareReactionActor(
 		// Google snapshots remove absent reactors without using this key.
 		return preparedReactionActor{key: "anon:" + emoji}, nil
 	}
-	identity, err := w.resolveIdentity(accountID, platform, reference)
+	identity, err := w.resolveIdentityFor(accountID, platform, reference, createOnly)
 	if err != nil {
 		return preparedReactionActor{}, err
 	}
@@ -1019,11 +1479,22 @@ func (w *Worker) prepareReactionSnapshotEntry(
 	platform bridge.Platform,
 	reaction bridge.ReactionEvent,
 ) (sqlite.ReactionSnapshotEntry, bool, error) {
+	return w.prepareReactionSnapshotEntryFor(accountID, platform, reaction, false)
+}
+
+// prepareReactionSnapshotEntryFor is prepareReactionSnapshotEntry with the
+// reactor's identity resolved create-only when the frame is history.
+func (w *Worker) prepareReactionSnapshotEntryFor(
+	accountID string,
+	platform bridge.Platform,
+	reaction bridge.ReactionEvent,
+	createOnly bool,
+) (sqlite.ReactionSnapshotEntry, bool, error) {
 	emoji := strings.TrimSpace(reaction.Emoji)
 	if emoji == "" {
 		return sqlite.ReactionSnapshotEntry{}, false, nil
 	}
-	actor, err := w.prepareReactionActor(accountID, platform, reaction.Actor, emoji)
+	actor, err := w.prepareReactionActor(accountID, platform, reaction.Actor, emoji, createOnly)
 	if err != nil {
 		return sqlite.ReactionSnapshotEntry{}, false, err
 	}
@@ -1043,7 +1514,7 @@ func (w *Worker) prepareReactionApply(
 	reaction bridge.ReactionEvent,
 	sourceSeqMS int64,
 ) (sqlite.ReactionApply, error) {
-	actor, err := w.prepareReactionActor(accountID, platform, reaction.Actor, reaction.Emoji)
+	actor, err := w.prepareReactionActor(accountID, platform, reaction.Actor, reaction.Emoji, false)
 	if err != nil {
 		return sqlite.ReactionApply{}, err
 	}
@@ -1152,6 +1623,7 @@ func (w *Worker) messageProjection(
 	inboxID string,
 	event bridge.MessageEvent,
 	routeEcho bool,
+	history bool,
 ) (sqlite.MessageProjection, *sqlite.Message, error) {
 	direction, err := messageDirection(event.Direction)
 	if err != nil {
@@ -1162,9 +1634,12 @@ func (w *Worker) messageProjection(
 		return sqlite.MessageProjection{}, nil, fmt.Errorf("message remote ID is empty")
 	}
 
-	if routeEcho && strings.TrimSpace(event.ClientRequestID) != "" && direction == sqlite.MessageDirectionOutgoing {
+	observeEcho := func() error {
+		if !routeEcho || strings.TrimSpace(event.ClientRequestID) == "" || direction != sqlite.MessageDirectionOutgoing {
+			return nil
+		}
 		if w.echoes == nil {
-			return sqlite.MessageProjection{}, nil, fmt.Errorf("echo observer is unavailable")
+			return fmt.Errorf("echo observer is unavailable")
 		}
 		outcome, err := w.echoes.ObserveTransportEcho(ctx, messaging.TransportEcho{
 			AccountID:          accountID,
@@ -1192,6 +1667,12 @@ func (w *Worker) messageProjection(
 		default:
 			w.counters.account(accountID).echoReconciled.Add(1)
 		}
+		return nil
+	}
+	if !history {
+		if err := observeEcho(); err != nil {
+			return sqlite.MessageProjection{}, nil, err
+		}
 	}
 
 	occurredAtMS := event.OccurredAt.UnixMilli()
@@ -1205,7 +1686,7 @@ func (w *Worker) messageProjection(
 	// instead of quarantining real content on an unresolvable identity.
 	var senderIdentity *sqlite.Identity
 	if direction != sqlite.MessageDirectionOutgoing && !event.Sender.IsSelf && identityRaw(event.Sender) != "" {
-		identity, identityErr := w.resolveIdentity(accountID, platform, event.Sender)
+		identity, identityErr := w.resolveIdentityFor(accountID, platform, event.Sender, history)
 		if identityErr != nil {
 			return sqlite.MessageProjection{}, nil, identityErr
 		}
@@ -1214,7 +1695,15 @@ func (w *Worker) messageProjection(
 
 	var conversation sqlite.Conversation
 	var remoteConversationID string
-	if platform == bridge.PlatformGoogle && senderIdentity != nil {
+	if history {
+		// Fetched history never moves a binding (see historyMessageConversation).
+		conversation, remoteConversationID, err = w.historyMessageConversation(
+			accountID,
+			platform,
+			event.RemoteConversationID,
+			senderIdentity,
+		)
+	} else if platform == bridge.PlatformGoogle && senderIdentity != nil {
 		// Google thread ids are device-local; the sender, not the id, decides
 		// which direct thread an inbound message belongs to.
 		conversation, remoteConversationID, err = w.googleIncomingConversation(
@@ -1235,6 +1724,13 @@ func (w *Worker) messageProjection(
 	if err != nil {
 		return sqlite.MessageProjection{}, nil, err
 	}
+	if history {
+		// Only once the message is known to be placeable, so a skipped
+		// history frame never touches the outbox.
+		if err := observeEcho(); err != nil {
+			return sqlite.MessageProjection{}, nil, err
+		}
+	}
 
 	if platform == bridge.PlatformSignal && direction == sqlite.MessageDirectionOutgoing {
 		remoteMessageID, err = w.signalOutgoingRemoteID(
@@ -1252,10 +1748,12 @@ func (w *Worker) messageProjection(
 	var senderIdentityID *string
 	if senderIdentity != nil {
 		senderIdentityID = &senderIdentity.IdentityID
-		if err := w.ensureDirectPeerParticipant(conversation, *senderIdentity); err != nil {
-			return sqlite.MessageProjection{}, nil, err
+		if !history {
+			if err := w.ensureDirectPeerParticipant(conversation, *senderIdentity); err != nil {
+				return sqlite.MessageProjection{}, nil, err
+			}
 		}
-	} else if conversation.Kind == sqlite.ConversationKindDirect {
+	} else if !history && conversation.Kind == sqlite.ConversationKindDirect {
 		if err := w.ensureDirectPeerFromRemoteID(
 			accountID, platform, conversation, remoteConversationID,
 		); err != nil {
