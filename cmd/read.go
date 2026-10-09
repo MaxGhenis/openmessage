@@ -23,7 +23,9 @@ type commandReadSession struct {
 	Reads     readsource.ReadSource
 	DataDir   string
 	StorePath string
-	close     func()
+	// V2Store is the v2 store behind Reads in v2-primary mode, nil otherwise.
+	V2Store *sqlite.Store
+	close   func()
 }
 
 func (s *commandReadSession) Close() {
@@ -54,6 +56,7 @@ func openCommandReadSource(
 			Reads:     v2read.New(store),
 			DataDir:   dataDir,
 			StorePath: storePath,
+			V2Store:   store,
 			close: func() {
 				_ = store.Close()
 			},

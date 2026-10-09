@@ -65,6 +65,45 @@ func TestStatusReachability(t *testing.T) {
 			t.Fatalf("auth data dir = %q", status.Auth.DataDir)
 		}
 	})
+
+	// The freshness block stays raw so a caller can show the daemon's
+	// silence verdict unchanged.
+	t.Run("daemon reports freshness", func(t *testing.T) {
+		const silence = `{"silent_ms":46800000,"stalled":true,"rule":"expected_activity"}`
+		client := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			io.WriteString(w, `{"freshness":{"newest_ms":1791473060776,"google":{"stale":true,"silence":`+silence+`}}}`)
+		}))
+		status, _, err := client.Status(context.Background())
+		if err != nil {
+			t.Fatalf("Status() = %v", err)
+		}
+		var freshness struct {
+			NewestMS json.RawMessage `json:"newest_ms"`
+			Google   struct {
+				Silence json.RawMessage `json:"silence"`
+			} `json:"google"`
+		}
+		if err := json.Unmarshal(status.Freshness, &freshness); err != nil {
+			t.Fatalf("decode freshness: %v", err)
+		}
+		if string(freshness.NewestMS) != "1791473060776" || string(freshness.Google.Silence) != silence {
+			t.Fatalf("freshness = %s, want newest_ms 1791473060776 and google.silence %s", status.Freshness, silence)
+		}
+	})
+
+	// The send and MCP paths read only the mode fields, so a freshness block
+	// of any JSON shape must not turn a reachable daemon into a probe failure.
+	t.Run("daemon reports a non-object freshness", func(t *testing.T) {
+		for _, freshness := range []string{`[]`, `"stale"`, `7`, `true`, `null`} {
+			client := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				io.WriteString(w, `{"v2_primary":true,"freshness":`+freshness+`}`)
+			}))
+			status, reachable, err := client.Status(context.Background())
+			if err != nil || !reachable || !status.V2Primary {
+				t.Fatalf("freshness %s: Status() = %+v, reachable %v, err %v", freshness, status, reachable, err)
+			}
+		}
+	})
 }
 
 func TestSubmitTextSendsTokenAndDecodes(t *testing.T) {
