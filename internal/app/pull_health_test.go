@@ -548,3 +548,47 @@ func TestPullFromGenerationRetiredDuringCountIsIgnored(t *testing.T) {
 		t.Fatalf("current-generation pull not applied: %+v", h)
 	}
 }
+
+// Round-4 review: the other production retirement shapes. Release and
+// SessionInvalid clear a.Client mid-count, so the pull is dropped; a client
+// that stays current is applied. (Adapted from the round-3 reviewer's probe.)
+func TestPullRetirementShapesOnProductionPath(t *testing.T) {
+	cases := []struct {
+		name    string
+		retire  func(g *GoogleGeneration)
+		applied bool
+	}{
+		{"release", func(g *GoogleGeneration) { g.Release() }, false},
+		{"session-invalid", func(g *GoogleGeneration) { g.SessionInvalid() }, false},
+		{"still-current", func(g *GoogleGeneration) {}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a := &App{Logger: zerolog.Nop(), SessionPath: t.TempDir() + "/session.json"}
+			cli := &client.Client{GM: &libgm.Client{}}
+			g := a.BeginGoogleGeneration(cli)
+			counting, release := make(chan struct{}), make(chan struct{})
+			a.SetGoogleConversationCounter(func() (int, error) {
+				close(counting)
+				<-release
+				return 1044, nil
+			})
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				a.recordGoogleListPull(cli.GM, tc.name, gmproto.ListConversationsRequest_INBOX, true, nil, noPayloadErr(true))
+			}()
+			<-counting
+			tc.retire(g)
+			close(release)
+			<-done
+			got := a.GooglePullHealth()
+			if (got != nil) != tc.applied {
+				t.Fatalf("applied=%t, want %t: %+v", got != nil, tc.applied, got)
+			}
+			if tc.applied && (!got.EmptyWithLocalHistory || !got.AccountSwitch || got.LocalConversations != 1044) {
+				t.Fatalf("current client's pull mis-recorded: %+v", got)
+			}
+		})
+	}
+}
