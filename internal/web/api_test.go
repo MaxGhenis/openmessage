@@ -4200,3 +4200,64 @@ func TestScheduleMediaRejectsOversizedUpload(t *testing.T) {
 		t.Fatalf("status %d, want 413: %s", resp.StatusCode, b)
 	}
 }
+
+// The diagnostics export (pasted into public issues) masks the Google account
+// email that /api/status reports in full for local tools.
+func TestDiagnosticsMasksSwitchedGoogleAccount(t *testing.T) {
+	ts := newTestServerWithOptions(t, APIOptions{
+		GoogleStatus: func() any {
+			return app.GoogleStatusSnapshot{
+				Connected:           true,
+				Paired:              true,
+				AccountSwitched:     true,
+				SwitchedAccount:     "someone@gmail.com",
+				AccountSwitchedAtMS: 1791404170000,
+			}
+		},
+	})
+	googleField := func(path string) map[string]any {
+		t.Helper()
+		resp, err := http.Get(ts.server.URL + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		var payload map[string]any
+		if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+			t.Fatal(err)
+		}
+		google, ok := payload["google"].(map[string]any)
+		if !ok {
+			t.Fatalf("%s: expected google status object, got %#v", path, payload["google"])
+		}
+		return google
+	}
+
+	status := googleField("/api/status")
+	if status["switched_account"] != "someone@gmail.com" || status["account_pairing_switched"] != true {
+		t.Fatalf("/api/status google = %#v, want the full account and the switch flag", status)
+	}
+	diagnostics := googleField("/api/diagnostics")
+	if diagnostics["switched_account"] != "s***@gmail.com" {
+		t.Fatalf("/api/diagnostics switched_account = %#v, want s***@gmail.com", diagnostics["switched_account"])
+	}
+	if diagnostics["account_pairing_switched"] != true {
+		t.Fatalf("/api/diagnostics google = %#v, want the switch flag kept", diagnostics)
+	}
+}
+
+func TestMaskEmailAddress(t *testing.T) {
+	for input, want := range map[string]string{
+		"someone@gmail.com":  "s***@gmail.com",
+		" a@b.org ":          "a***@b.org",
+		"no-at-sign":         "***",
+		"@leading.example":   "***",
+		"":                   "***",
+		"éva@example.fr":     "é***@example.fr",
+		"x@y@multiple.at.co": "x***@multiple.at.co",
+	} {
+		if got := maskEmailAddress(input); got != want {
+			t.Fatalf("maskEmailAddress(%q) = %q, want %q", input, got, want)
+		}
+	}
+}

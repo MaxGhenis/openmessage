@@ -106,6 +106,14 @@ func (s *MessageService) DispatchDue(ctx context.Context, limit int) (int, error
 			}
 			break
 		}
+		// The batch is leased together but dispatched one row at a time, so a
+		// row behind a slow transport call would start its own call with
+		// whatever lease the calls before it left over, and could outlive it.
+		// It goes back to the queue untouched (no attempt spent) instead, and
+		// the wake from releaseUntouched leases it afresh at once.
+		if index > 0 && !leaseFreshForDispatch(lease, s.clock.Now(), s.leaseTime) {
+			return processed, s.releaseUntouched(ctx, leases[index:])
+		}
 		var dispatchErr error
 		switch lease.Kind {
 		case sqlite.OutboxKindText:
@@ -134,6 +142,9 @@ func (s *MessageService) dispatchTextLease(ctx context.Context, outboxLease sqli
 	item := outboxLease.OutboxItem
 	if item.LeaseToken == nil {
 		return fmt.Errorf("dispatch outbox item %q: storage returned no lease token", item.OutboxID)
+	}
+	if exhausted, err := s.rejectExhaustedBeforeCall(ctx, item, textOperation); exhausted {
+		return err
 	}
 	dispatchLease, err := s.bridges.Acquire(ctx, item.AccountID, bridge.CapabilityTextSend)
 	if err != nil {
@@ -185,6 +196,7 @@ func (s *MessageService) dispatchTextLease(ctx context.Context, outboxLease sqli
 			s.clock.Now().Add(s.retryDelay),
 		)
 	}
+	conversationRef := s.directConversationRef(conversation)
 
 	if err := s.outbox.MarkTransportCalled(ctx, sqlite.Attempt{
 		OutboxID:             item.OutboxID,
@@ -201,12 +213,10 @@ func (s *MessageService) dispatchTextLease(ctx context.Context, outboxLease sqli
 	s.signalChange()
 
 	request := bridge.TextRequest{
-		AccountID: item.AccountID,
-		Conversation: bridge.ConversationRef{
-			RemoteID: conversation.RemoteConversationID,
-		},
-		Body:      message.Body,
-		RequestID: item.TransportRequestID,
+		AccountID:    item.AccountID,
+		Conversation: conversationRef,
+		Body:         message.Body,
+		RequestID:    item.TransportRequestID,
 	}
 	if message.ReplyToRemoteID != nil {
 		request.ReplyTo = &bridge.MessageRef{RemoteID: *message.ReplyToRemoteID}
@@ -261,6 +271,9 @@ func (s *MessageService) dispatchMediaLease(ctx context.Context, outboxLease sql
 	item := outboxLease.OutboxItem
 	if item.LeaseToken == nil {
 		return fmt.Errorf("dispatch outbox item %q: storage returned no lease token", item.OutboxID)
+	}
+	if exhausted, err := s.rejectExhaustedBeforeCall(ctx, item, mediaOperation); exhausted {
+		return err
 	}
 
 	dispatchLease, err := s.bridges.Acquire(ctx, item.AccountID, bridge.CapabilityMediaSend)
@@ -323,6 +336,7 @@ func (s *MessageService) dispatchMediaLease(ctx context.Context, outboxLease sql
 			s.clock.Now().Add(s.retryDelay),
 		)
 	}
+	conversationRef := s.directConversationRef(conversation)
 
 	attachment, err := s.outbox.GetOutboxAttachment(ctx, item.OutboxID)
 	if err != nil {
@@ -372,16 +386,14 @@ func (s *MessageService) dispatchMediaLease(ctx context.Context, outboxLease sql
 	s.signalChange()
 
 	request := bridge.MediaRequest{
-		AccountID: item.AccountID,
-		Conversation: bridge.ConversationRef{
-			RemoteID: conversation.RemoteConversationID,
-		},
-		Reader:    reader,
-		Size:      attachment.SizeBytes,
-		Filename:  attachment.Filename,
-		MIME:      attachment.MIME,
-		Caption:   message.Body,
-		RequestID: item.TransportRequestID,
+		AccountID:    item.AccountID,
+		Conversation: conversationRef,
+		Reader:       reader,
+		Size:         attachment.SizeBytes,
+		Filename:     attachment.Filename,
+		MIME:         attachment.MIME,
+		Caption:      message.Body,
+		RequestID:    item.TransportRequestID,
 	}
 	if message.ReplyToRemoteID != nil {
 		request.ReplyTo = &bridge.MessageRef{RemoteID: *message.ReplyToRemoteID}
@@ -436,6 +448,9 @@ func (s *MessageService) dispatchReactionLease(ctx context.Context, outboxLease 
 	item := outboxLease.OutboxItem
 	if item.LeaseToken == nil {
 		return fmt.Errorf("dispatch outbox item %q: storage returned no lease token", item.OutboxID)
+	}
+	if exhausted, err := s.rejectExhaustedBeforeCall(ctx, item, reactionOperation); exhausted {
+		return err
 	}
 
 	dispatchLease, err := s.bridges.Acquire(ctx, item.AccountID, bridge.CapabilityReactions)
@@ -525,14 +540,12 @@ func (s *MessageService) dispatchReactionLease(ctx context.Context, outboxLease 
 	s.signalChange()
 
 	result, sendErr := dispatchLease.Reaction.SendReaction(ctx, bridge.ReactionRequest{
-		AccountID: item.AccountID,
-		Conversation: bridge.ConversationRef{
-			RemoteID: conversation.RemoteConversationID,
-		},
-		Target:    target,
-		Emoji:     reaction.Emoji,
-		Action:    bridge.ReactionAction(reaction.Action),
-		RequestID: item.TransportRequestID,
+		AccountID:    item.AccountID,
+		Conversation: storedConversationRef(conversation),
+		Target:       target,
+		Emoji:        reaction.Emoji,
+		Action:       bridge.ReactionAction(reaction.Action),
+		RequestID:    item.TransportRequestID,
 	})
 	mutationCtx, cancel := s.storageMutationContext(ctx)
 	defer cancel()
@@ -586,6 +599,9 @@ func (s *MessageService) dispatchReadLease(ctx context.Context, outboxLease sqli
 	item := outboxLease.OutboxItem
 	if item.LeaseToken == nil {
 		return fmt.Errorf("dispatch outbox item %q: storage returned no lease token", item.OutboxID)
+	}
+	if exhausted, err := s.rejectExhaustedBeforeCall(ctx, item, readOperation); exhausted {
+		return err
 	}
 
 	dispatchLease, err := s.bridges.Acquire(ctx, item.AccountID, bridge.CapabilityReadReceipts)
@@ -675,12 +691,10 @@ func (s *MessageService) dispatchReadLease(ctx context.Context, outboxLease sqli
 	s.signalChange()
 
 	sendErr := dispatchLease.ReadReceipt.MarkRead(ctx, bridge.ReadReceiptRequest{
-		AccountID: item.AccountID,
-		Conversation: bridge.ConversationRef{
-			RemoteID: conversation.RemoteConversationID,
-		},
-		Messages: []bridge.MessageRef{target},
-		ReadAt:   time.UnixMilli(receipt.ReadAtMS),
+		AccountID:    item.AccountID,
+		Conversation: storedConversationRef(conversation),
+		Messages:     []bridge.MessageRef{target},
+		ReadAt:       time.UnixMilli(receipt.ReadAtMS),
 	})
 	mutationCtx, cancel := s.storageMutationContext(ctx)
 	defer cancel()
@@ -885,6 +899,9 @@ func (s *MessageService) recordSendError(
 	class := "unknown"
 	code := defaultCode
 	retryAt := s.clock.Now().Add(s.retryDelay)
+	// error_detail keeps the adapter fingerprint, which OpError.Error() omits,
+	// so every surface can say which failure this was.
+	detail := sendErr.Error()
 	if classified {
 		if opErr.Class != "" {
 			class = string(opErr.Class)
@@ -895,11 +912,12 @@ func (s *MessageService) recordSendError(
 		if !opErr.RetryAt.IsZero() {
 			retryAt = opErr.RetryAt
 		}
+		detail = fingerprintedDetail(opErr.Fingerprint, detail)
 
 		// An explicitly ambiguous result can never be converted into a safe or
 		// terminal outcome based only on its failure class.
 		if opErr.Dispatch == bridge.DispatchUncertain {
-			return s.markSendUncertain(ctx, item, class, code, sendErr)
+			return s.markSendUncertain(ctx, item, class, code, detail)
 		}
 
 		if terminalFailure(opErr.Class) {
@@ -909,7 +927,7 @@ func (s *MessageService) recordSendError(
 				*item.LeaseToken,
 				class,
 				code,
-				sendErr.Error(),
+				detail,
 			); err != nil {
 				return fmt.Errorf("reject outbox item %q: %w", item.OutboxID, err)
 			}
@@ -918,36 +936,21 @@ func (s *MessageService) recordSendError(
 		}
 
 		if retryableFailure(opErr.Class) && opErr.Dispatch == bridge.DispatchNotCalled {
-			if err := s.outbox.MarkCalledNotDispatched(
-				ctx,
-				item.OutboxID,
-				*item.LeaseToken,
-				class,
-				code,
-				sendErr.Error(),
-				retryAt,
-			); err != nil {
-				return fmt.Errorf(
-					"mark called outbox item %q not dispatched: %w",
-					item.OutboxID,
-					err,
-				)
-			}
-			s.signalChange()
-			return nil
+			// Only proven-undispatched failures are budgeted; every other
+			// retryable outcome below stays uncertain.
+			return s.recordCalledNotDispatched(ctx, item, opErr, sendErr, class, code, retryAt)
 		}
 	}
 	if contextError(sendErr) {
 		code = "timeout"
 	}
-	return s.markSendUncertain(ctx, item, class, code, sendErr)
+	return s.markSendUncertain(ctx, item, class, code, detail)
 }
 
 func (s *MessageService) markSendUncertain(
 	ctx context.Context,
 	item sqlite.OutboxItem,
-	class, code string,
-	sendErr error,
+	class, code, detail string,
 ) error {
 	if err := s.outbox.MarkUncertain(
 		ctx,
@@ -955,7 +958,7 @@ func (s *MessageService) markSendUncertain(
 		*item.LeaseToken,
 		class,
 		code,
-		sendErr.Error(),
+		detail,
 	); err != nil {
 		return fmt.Errorf("mark outbox item %q uncertain: %w", item.OutboxID, err)
 	}

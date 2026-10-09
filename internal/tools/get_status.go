@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
@@ -31,6 +32,27 @@ var (
 		return a.SignalStatus()
 	}
 )
+
+// googleAccountSwitchSummary is the get_status line (both serve modes) for a
+// QR-paired session whose phone switched Google Messages to Google-account
+// pairing: inbound still works, sends are refused, and the remedy is a re-link
+// the user decides on.
+func googleAccountSwitchSummary(account string, atMS int64) string {
+	var observed []string
+	if account != "" {
+		observed = append(observed, account)
+	}
+	if atMS > 0 {
+		observed = append(observed, "since "+time.UnixMilli(atMS).Format(time.RFC3339))
+	}
+	detail := ""
+	if len(observed) > 0 {
+		detail = " (" + strings.Join(observed, ", ") + ")"
+	}
+	return "the phone switched Google Messages to Google-account pairing" + detail +
+		". This QR-paired session still receives messages, but the phone refuses its sends." +
+		" Re-link with Google-account pairing or switch the phone back to QR pairing; that is the user's call, so do not re-pair."
+}
 
 func getStatusTool() mcp.Tool {
 	return mcp.NewTool("get_status",
@@ -80,6 +102,9 @@ func getStatusHandler(a *app.App, configured ...Options) server.ToolHandlerFunc 
 		fmt.Fprintf(&sb, "  Phone responding: %v\n", google.PhoneResponding)
 		if google.RepairsPaced > 0 {
 			fmt.Fprintf(&sb, "  Repairs paced: %d (cookie repairs delayed by the min-interval floor)\n", google.RepairsPaced)
+		}
+		if google.AccountSwitched {
+			fmt.Fprintf(&sb, "  Account pairing switched: %s\n", googleAccountSwitchSummary(google.SwitchedAccount, google.AccountSwitchedAtMS))
 		}
 		if google.LastError != "" {
 			fmt.Fprintf(&sb, "  Last error: %s\n", google.LastError)

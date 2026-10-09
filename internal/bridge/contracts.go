@@ -58,6 +58,16 @@ type Liveness struct {
 
 type ConversationRef struct {
 	RemoteID string
+	// Kind is the locally stored conversation kind ("direct", "group",
+	// "broadcast", "system") when the dispatcher knows it. Empty means
+	// unknown; adapters must fail closed for any behaviour that depends on it.
+	Kind string
+	// DirectPeerNumber is the canonical E.164 number of a direct
+	// conversation's sole active non-self participant, as recorded in the
+	// local store. It is empty unless Kind is "direct" and exactly one such
+	// E.164 peer is known. An adapter may use it to re-resolve a direct thread
+	// whose RemoteID the transport no longer recognizes.
+	DirectPeerNumber string
 }
 
 type MessageRef struct {

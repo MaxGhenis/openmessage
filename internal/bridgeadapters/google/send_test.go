@@ -167,10 +167,13 @@ func TestSendTextConversationFailuresAreClassifiedNotCalled(t *testing.T) {
 			fingerprint: "google_conversation_get_failed",
 		},
 		{
+			// Deliberately updated (stuck-send fix, A2): an empty lookup with no
+			// account switch and no by-number fallback is its own fingerprint,
+			// distinct from a lookup that errored.
 			name:        "nil conversation",
 			fake:        &fakeTextSendClient{},
 			wantClass:   bridge.FailureTransient,
-			fingerprint: "google_conversation_get_failed",
+			fingerprint: "google_conversation_not_found",
 		},
 		{
 			name: "auth expiry",
@@ -271,11 +274,26 @@ func TestSendTextTransientAndRejectedFailuresDoNotRetireGeneration(t *testing.T)
 			fake: &fakeTextSendClient{
 				conversationResult: &gmproto.Conversation{},
 				sendResult: &gmproto.SendMessageResponse{
-					Status: gmproto.SendMessageResponse_UNKNOWN,
+					Status: gmproto.SendMessageResponse_FAILURE_2,
 				},
 			},
 			dispatch:    bridge.DispatchNotCalled,
 			fingerprint: "google_text_send_rejected",
+		},
+		{
+			// Deliberately updated (stuck-send fix, A3): UNKNOWN used to be the
+			// "rejected status" case and retry as not dispatched. The phone may
+			// have sent it, so it is now uncertain and never auto-retried; it
+			// still must not touch the receive generation.
+			name: "unknown status",
+			fake: &fakeTextSendClient{
+				conversationResult: &gmproto.Conversation{},
+				sendResult: &gmproto.SendMessageResponse{
+					Status: gmproto.SendMessageResponse_UNKNOWN,
+				},
+			},
+			dispatch:    bridge.DispatchUncertain,
+			fingerprint: "google_text_send_unknown_status",
 		},
 	}
 
@@ -507,18 +525,23 @@ func TestSendReactionSuccessMapsNativeActionsAndReturnsEmptyResult(t *testing.T)
 
 func TestSendReactionConversationFailuresAreClassifiedNotCalled(t *testing.T) {
 	tests := []struct {
-		name string
-		fake *fakeReactionSendClient
+		name        string
+		fake        *fakeReactionSendClient
+		fingerprint string
 	}{
 		{
 			name: "transport error",
 			fake: &fakeReactionSendClient{
 				conversationErr: errors.New("conversation unavailable"),
 			},
+			fingerprint: "google_conversation_get_failed",
 		},
 		{
-			name: "nil conversation",
-			fake: &fakeReactionSendClient{},
+			// Deliberately updated (stuck-send fix, A2): an empty lookup is
+			// google_conversation_not_found, as for text and media.
+			name:        "nil conversation",
+			fake:        &fakeReactionSendClient{},
+			fingerprint: "google_conversation_not_found",
 		},
 	}
 
@@ -533,8 +556,8 @@ func TestSendReactionConversationFailuresAreClassifiedNotCalled(t *testing.T) {
 			})
 			failure := requireReactionOpError(t, err)
 			if failure.Class != bridge.FailureTransient || failure.Dispatch != bridge.DispatchNotCalled ||
-				failure.Operation != "send_reaction" || failure.Fingerprint != "google_conversation_get_failed" {
-				t.Fatalf("failure = %+v, want transient pre-call google_conversation_get_failed", failure)
+				failure.Operation != "send_reaction" || failure.Fingerprint != test.fingerprint {
+				t.Fatalf("failure = %+v, want transient pre-call %s", failure, test.fingerprint)
 			}
 			if test.fake.sendCalls != 0 {
 				t.Fatalf("SendReaction calls = %d, want 0", test.fake.sendCalls)
@@ -948,26 +971,35 @@ func TestSendMediaBoundsAndLengthChecksReaderBeforeUpload(t *testing.T) {
 	}
 }
 
+// Deliberately updated (stuck-send fix, A2): the conversation is now resolved
+// before the upload, so the upload cases supply a conversation, and a failed
+// lookup never uploads (wantUploads 0).
 func TestSendMediaPreDispatchTransportFailuresAreClassifiedNotCalled(t *testing.T) {
 	tests := []struct {
 		name        string
 		configure   func(*fakeMediaSendClient)
 		wantClass   bridge.FailureClass
 		fingerprint string
+		wantUploads int
 	}{
 		{
 			name: "upload",
 			configure: func(fake *fakeMediaSendClient) {
+				fake.conversationResult = &gmproto.Conversation{}
 				fake.uploadErr = errors.New("upload unavailable")
 			},
 			wantClass:   bridge.FailureTransient,
 			fingerprint: "google_media_upload_failed",
+			wantUploads: 1,
 		},
 		{
-			name:        "nil upload result",
-			configure:   func(*fakeMediaSendClient) {},
+			name: "nil upload result",
+			configure: func(fake *fakeMediaSendClient) {
+				fake.conversationResult = &gmproto.Conversation{}
+			},
 			wantClass:   bridge.FailureTransient,
 			fingerprint: "google_media_upload_failed",
+			wantUploads: 1,
 		},
 		{
 			name: "nil conversation result",
@@ -975,7 +1007,8 @@ func TestSendMediaPreDispatchTransportFailuresAreClassifiedNotCalled(t *testing.
 				fake.uploadResult = &gmproto.MediaContent{MediaID: "media-id"}
 			},
 			wantClass:   bridge.FailureTransient,
-			fingerprint: "google_conversation_get_failed",
+			fingerprint: "google_conversation_not_found",
+			wantUploads: 0,
 		},
 		{
 			name: "conversation auth expiry",
@@ -985,6 +1018,7 @@ func TestSendMediaPreDispatchTransportFailuresAreClassifiedNotCalled(t *testing.
 			},
 			wantClass:   bridge.FailureCredentialsExpired,
 			fingerprint: "google_auth_expired",
+			wantUploads: 0,
 		},
 	}
 
@@ -1005,6 +1039,9 @@ func TestSendMediaPreDispatchTransportFailuresAreClassifiedNotCalled(t *testing.
 			}
 			if len(fake.sent) != 0 {
 				t.Fatalf("SendMessage calls = %d, want 0", len(fake.sent))
+			}
+			if fake.uploadCalls != test.wantUploads {
+				t.Fatalf("UploadMedia calls = %d, want %d", fake.uploadCalls, test.wantUploads)
 			}
 		})
 	}
@@ -1122,26 +1159,50 @@ func TestSendMediaAuthExpiryStillReportsToLifecycle(t *testing.T) {
 	}
 }
 
+// Deliberately updated (stuck-send fix, A3): UNKNOWN used to be pinned here
+// as rejected-not-dispatched. It is now uncertain (the phone may have sent
+// it), while FAILURE_2 keeps the old retryable classification. The exhaustive
+// status table lives in TestSendMessageResponseClassificationIsTotal.
 func TestSendMediaRejectedStatusIsClassifiedNotCalled(t *testing.T) {
-	fake := &fakeMediaSendClient{
-		uploadResult:       &gmproto.MediaContent{MediaID: "media-id"},
-		conversationResult: &gmproto.Conversation{},
-		sendResults: []*gmproto.SendMessageResponse{{
-			Status: gmproto.SendMessageResponse_UNKNOWN,
-		}},
+	tests := []struct {
+		status      gmproto.SendMessageResponse_Status
+		dispatch    bridge.DispatchCertainty
+		fingerprint string
+	}{
+		{
+			status:      gmproto.SendMessageResponse_FAILURE_2,
+			dispatch:    bridge.DispatchNotCalled,
+			fingerprint: "google_media_send_rejected",
+		},
+		{
+			status:      gmproto.SendMessageResponse_UNKNOWN,
+			dispatch:    bridge.DispatchUncertain,
+			fingerprint: "google_media_send_unknown_status",
+		},
 	}
-	a := newMediaSendTestAdapter(t, fake)
+	for _, test := range tests {
+		t.Run(test.status.String(), func(t *testing.T) {
+			fake := &fakeMediaSendClient{
+				uploadResult:       &gmproto.MediaContent{MediaID: "media-id"},
+				conversationResult: &gmproto.Conversation{},
+				sendResults: []*gmproto.SendMessageResponse{{
+					Status: test.status,
+				}},
+			}
+			a := newMediaSendTestAdapter(t, fake)
 
-	_, err := a.SendMedia(context.Background(), bridge.MediaRequest{
-		Conversation: bridge.ConversationRef{RemoteID: "conversation-id"},
-		Reader:       strings.NewReader("x"),
-		Size:         1,
-		RequestID:    "request-id",
-	})
-	failure := requireMediaOpError(t, err)
-	if failure.Class != bridge.FailureTransient || failure.Dispatch != bridge.DispatchNotCalled ||
-		failure.Operation != "send_media" || failure.Fingerprint != "google_media_send_rejected" {
-		t.Fatalf("failure = %+v, want transient pre-call google_media_send_rejected", failure)
+			_, err := a.SendMedia(context.Background(), bridge.MediaRequest{
+				Conversation: bridge.ConversationRef{RemoteID: "conversation-id"},
+				Reader:       strings.NewReader("x"),
+				Size:         1,
+				RequestID:    "request-id",
+			})
+			failure := requireMediaOpError(t, err)
+			if failure.Class != bridge.FailureTransient || failure.Dispatch != test.dispatch ||
+				failure.Operation != "send_media" || failure.Fingerprint != test.fingerprint {
+				t.Fatalf("failure = %+v, want transient %q dispatch %q", failure, test.fingerprint, test.dispatch)
+			}
+		})
 	}
 }
 
@@ -1176,6 +1237,27 @@ func TestSendMediaCaptionFailureRemainsAmbiguousAfterMediaSuccess(t *testing.T) 
 				nil,
 			},
 			fingerprint: "google_caption_send_failed",
+		},
+		// A session-indicting caption error would classify as terminal on its
+		// own; after the media went out it must stay ambiguous, or the outbox
+		// would reject the row as never sent and offer to resend the media.
+		{
+			name: "not logged in",
+			sendResults: []*gmproto.SendMessageResponse{
+				{Status: gmproto.SendMessageResponse_SUCCESS},
+				nil,
+			},
+			sendErrors:  []error{nil, errors.New("not logged in")},
+			fingerprint: "google_session_invalid",
+		},
+		{
+			name: "no auth token",
+			sendResults: []*gmproto.SendMessageResponse{
+				{Status: gmproto.SendMessageResponse_SUCCESS},
+				nil,
+			},
+			sendErrors:  []error{nil, errors.New("no auth token")},
+			fingerprint: "google_session_invalid",
 		},
 	}
 
@@ -1245,8 +1327,12 @@ func requireTextOpError(t *testing.T, err error) bridge.OpError {
 type fakeTextSendClient struct {
 	conversationResult *gmproto.Conversation
 	conversationErr    error
-	sendResult         *gmproto.SendMessageResponse
-	sendErr            error
+	// conversationHook runs inside GetConversation before it returns, the way
+	// libgm fires events synchronously ahead of the RPC result.
+	conversationHook func()
+	resolve          fakeConversationResolve
+	sendResult       *gmproto.SendMessageResponse
+	sendErr          error
 
 	conversationCalls int
 	conversationID    string
@@ -1257,13 +1343,43 @@ type fakeTextSendClient struct {
 func (f *fakeTextSendClient) GetConversation(conversationID string) (*gmproto.Conversation, error) {
 	f.conversationCalls++
 	f.conversationID = conversationID
+	if f.conversationHook != nil {
+		f.conversationHook()
+	}
 	return f.conversationResult, f.conversationErr
+}
+
+func (f *fakeTextSendClient) GetOrCreateConversation(
+	req *gmproto.GetOrCreateConversationRequest,
+) (*gmproto.GetOrCreateConversationResponse, error) {
+	return f.resolve.call(req)
 }
 
 func (f *fakeTextSendClient) SendMessage(payload *gmproto.SendMessageRequest) (*gmproto.SendMessageResponse, error) {
 	f.sendCalls++
 	f.sent = payload
 	return f.sendResult, f.sendErr
+}
+
+// fakeConversationResolve scripts GetOrCreateConversation for every send fake.
+type fakeConversationResolve struct {
+	result *gmproto.GetOrCreateConversationResponse
+	err    error
+	hook   func()
+
+	calls   int
+	request *gmproto.GetOrCreateConversationRequest
+}
+
+func (f *fakeConversationResolve) call(
+	req *gmproto.GetOrCreateConversationRequest,
+) (*gmproto.GetOrCreateConversationResponse, error) {
+	f.calls++
+	f.request = req
+	if f.hook != nil {
+		f.hook()
+	}
+	return f.result, f.err
 }
 
 func newReactionSendTestAdapter(t *testing.T, fake *fakeReactionSendClient) *Adapter {
@@ -1304,6 +1420,8 @@ func requireReactionOpError(t *testing.T, err error) bridge.OpError {
 type fakeReactionSendClient struct {
 	conversationResult *gmproto.Conversation
 	conversationErr    error
+	conversationHook   func()
+	resolve            fakeConversationResolve
 	sendResult         *gmproto.SendReactionResponse
 	sendErr            error
 
@@ -1316,7 +1434,16 @@ type fakeReactionSendClient struct {
 func (f *fakeReactionSendClient) GetConversation(conversationID string) (*gmproto.Conversation, error) {
 	f.conversationCalls++
 	f.conversationID = conversationID
+	if f.conversationHook != nil {
+		f.conversationHook()
+	}
 	return f.conversationResult, f.conversationErr
+}
+
+func (f *fakeReactionSendClient) GetOrCreateConversation(
+	req *gmproto.GetOrCreateConversationRequest,
+) (*gmproto.GetOrCreateConversationResponse, error) {
+	return f.resolve.call(req)
 }
 
 func (f *fakeReactionSendClient) SendReaction(payload *gmproto.SendReactionRequest) (*gmproto.SendReactionResponse, error) {
@@ -1365,18 +1492,27 @@ type fakeMediaSendClient struct {
 	uploadErr          error
 	conversationResult *gmproto.Conversation
 	conversationErr    error
+	conversationHook   func()
+	resolve            fakeConversationResolve
 	sendResults        []*gmproto.SendMessageResponse
 	sendErrors         []error
+	// sendHook runs inside SendMessage (with the 0-based send index) before
+	// it returns, the way libgm fires events ahead of the RPC result.
+	sendHook func(index int)
 
-	uploadCalls    int
-	uploadData     []byte
-	uploadFilename string
-	uploadMIME     string
-	conversationID string
-	sent           []*gmproto.SendMessageRequest
+	uploadCalls       int
+	uploadData        []byte
+	uploadFilename    string
+	uploadMIME        string
+	conversationCalls int
+	conversationID    string
+	sent              []*gmproto.SendMessageRequest
+	// calls records the transport call order.
+	calls []string
 }
 
 func (f *fakeMediaSendClient) UploadMedia(data []byte, filename, mime string) (*gmproto.MediaContent, error) {
+	f.calls = append(f.calls, "upload")
 	f.uploadCalls++
 	f.uploadData = append([]byte(nil), data...)
 	f.uploadFilename = filename
@@ -1385,11 +1521,24 @@ func (f *fakeMediaSendClient) UploadMedia(data []byte, filename, mime string) (*
 }
 
 func (f *fakeMediaSendClient) GetConversation(conversationID string) (*gmproto.Conversation, error) {
+	f.calls = append(f.calls, "get_conversation")
+	f.conversationCalls++
 	f.conversationID = conversationID
+	if f.conversationHook != nil {
+		f.conversationHook()
+	}
 	return f.conversationResult, f.conversationErr
 }
 
+func (f *fakeMediaSendClient) GetOrCreateConversation(
+	req *gmproto.GetOrCreateConversationRequest,
+) (*gmproto.GetOrCreateConversationResponse, error) {
+	f.calls = append(f.calls, "get_or_create_conversation")
+	return f.resolve.call(req)
+}
+
 func (f *fakeMediaSendClient) SendMessage(payload *gmproto.SendMessageRequest) (*gmproto.SendMessageResponse, error) {
+	f.calls = append(f.calls, "send")
 	f.sent = append(f.sent, payload)
 	index := len(f.sent) - 1
 	var result *gmproto.SendMessageResponse
@@ -1399,6 +1548,9 @@ func (f *fakeMediaSendClient) SendMessage(payload *gmproto.SendMessageRequest) (
 	var err error
 	if index < len(f.sendErrors) {
 		err = f.sendErrors[index]
+	}
+	if f.sendHook != nil {
+		f.sendHook(index)
 	}
 	return result, err
 }

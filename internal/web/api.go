@@ -347,6 +347,13 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		runtime.ReadMemStats(&mem)
 
 		payload := statusPayload(currentConnected())
+		// The diagnostics export is meant to be pasted into a public issue, so
+		// it masks the Google account email that /api/status reports when the
+		// phone switched to Google-account pairing.
+		if google, ok := payload["google"].(app.GoogleStatusSnapshot); ok && google.SwitchedAccount != "" {
+			google.SwitchedAccount = maskEmailAddress(google.SwitchedAccount)
+			payload["google"] = google
+		}
 		payload["schema_version"] = 1
 		payload["generated_at"] = now.UnixMilli()
 		payload["generated_at_iso"] = now.UTC().Format(time.RFC3339Nano)
@@ -4070,4 +4077,16 @@ func addSilence(
 		judge(platform, last, baseline.events, false)
 	}
 	out["silence_stalled"] = anyStalled
+}
+
+// maskEmailAddress keeps an address recognisable to its owner without
+// publishing it: the first character of the local part and the domain.
+func maskEmailAddress(address string) string {
+	address = strings.TrimSpace(address)
+	at := strings.LastIndex(address, "@")
+	if at <= 0 {
+		return "***"
+	}
+	first, _ := utf8.DecodeRuneInString(address)
+	return string(first) + "***" + address[at:]
 }

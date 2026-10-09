@@ -112,7 +112,18 @@ type Delivery struct {
 	RemoteMessageID string
 	ErrorClass      string
 	ErrorCode       string
-	Warning         string
+	// ErrorDetail is the last failure's full description, including the
+	// adapter fingerprint, so a caller can say why a send is not going out.
+	ErrorDetail string
+	// AttemptCount counts transport attempts that consumed the retry budget.
+	AttemptCount int64
+	// NextAttemptAt is the scheduled retry time of a not_dispatched intent;
+	// zero otherwise.
+	NextAttemptAt time.Time
+	// RetryExhausted reports a rejected intent that gave up after its retry
+	// budget. Nothing was sent; it will not be retried automatically.
+	RetryExhausted bool
+	Warning        string
 }
 
 // TransportEcho is the transport-neutral correlation shape reserved for M5.
