@@ -1238,6 +1238,27 @@ func TestSendMediaCaptionFailureRemainsAmbiguousAfterMediaSuccess(t *testing.T) 
 			},
 			fingerprint: "google_caption_send_failed",
 		},
+		// A session-indicting caption error would classify as terminal on its
+		// own; after the media went out it must stay ambiguous, or the outbox
+		// would reject the row as never sent and offer to resend the media.
+		{
+			name: "not logged in",
+			sendResults: []*gmproto.SendMessageResponse{
+				{Status: gmproto.SendMessageResponse_SUCCESS},
+				nil,
+			},
+			sendErrors:  []error{nil, errors.New("not logged in")},
+			fingerprint: "google_session_invalid",
+		},
+		{
+			name: "no auth token",
+			sendResults: []*gmproto.SendMessageResponse{
+				{Status: gmproto.SendMessageResponse_SUCCESS},
+				nil,
+			},
+			sendErrors:  []error{nil, errors.New("no auth token")},
+			fingerprint: "google_session_invalid",
+		},
 	}
 
 	for _, test := range tests {

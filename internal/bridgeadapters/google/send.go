@@ -571,11 +571,7 @@ func (a *Adapter) SendMedia(
 				"google_caption_send_failed",
 				"",
 			)
-			// The media send has already succeeded, so the overall request cannot
-			// truthfully be classified as not dispatched even if a wrapped caption
-			// error carries that narrower certainty.
-			failure.Dispatch = ""
-			return bridge.SendResult{}, failure
+			return bridge.SendResult{}, afterMediaSent(failure)
 		}
 		if captionResponse == nil {
 			failure := a.classifyMediaTransportError(
@@ -583,7 +579,7 @@ func (a *Adapter) SendMedia(
 				"google_caption_send_failed",
 				"",
 			)
-			return bridge.SendResult{}, failure
+			return bridge.SendResult{}, afterMediaSent(failure)
 		}
 		if captionResponse.GetStatus() != gmproto.SendMessageResponse_SUCCESS {
 			// The connection just delivered the media; a rejected caption is not a
@@ -608,6 +604,25 @@ func (a *Adapter) SendMedia(
 		RemoteMessageID: payload.GetTmpID(),
 		EchoExpected:    true,
 	}, nil
+}
+
+// afterMediaSent keeps a caption failure ambiguous for the outbox. The media
+// part has already gone out, so the request as a whole can be neither "not
+// dispatched" (a retry would resend the media) nor terminal: the dispatcher
+// rejects terminal classes, and a rejected row reads "Nothing was sent" and
+// offers to send the media again. A failure that indicts the session has
+// already been reported to the lifecycle by classifyMediaTransportError.
+func afterMediaSent(failure bridge.OpError) bridge.OpError {
+	failure.Dispatch = ""
+	switch failure.Class {
+	case bridge.FailureUnpaired,
+		bridge.FailureReauthRequired,
+		bridge.FailureUpgradeRequired,
+		bridge.FailureMisconfigured,
+		bridge.FailureUnsupported:
+		failure.Class = bridge.FailureTransient
+	}
+	return failure
 }
 
 // Fingerprints for conversation resolution and send refusals. The outbox
