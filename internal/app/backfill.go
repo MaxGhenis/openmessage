@@ -142,6 +142,7 @@ func (a *App) deepBackfill() {
 	catchUp.progress = &a.BackfillProgress
 
 	a.BackfillProgress.reset()
+	a.BackfillProgress.setRun(BackfillTriggerDeep, 0)
 	defer a.BackfillProgress.finish()
 
 	a.Logger.Info().Msg("Starting deep backfill of all messages")
@@ -204,6 +205,47 @@ func (a *App) deepBackfill() {
 	a.emitMessagesChange("")
 }
 
+// Backfill triggers reported in BackfillSnapshot.Trigger.
+const (
+	BackfillTriggerDeep            = "deep"
+	BackfillTriggerWindow          = "window"
+	BackfillTriggerSilenceRecovery = "silence_recovery"
+)
+
+// GoogleWindowBackfillResult reports one window backfill run.
+type GoogleWindowBackfillResult struct {
+	Since      time.Time
+	Trigger    string
+	StartedAt  time.Time
+	FinishedAt time.Time
+	// Connected is false when no Google client was connected, so nothing ran.
+	Connected bool
+	// Aborted is set when the run stopped early because the client changed or
+	// disconnected, or Google rejected the session.
+	Aborted bool
+	// Listed counts the distinct conversations the folder listings returned,
+	// in the window or not. Zero means the phone listed nothing at all.
+	Listed int
+	// Conversations counts the in-window conversations stored without error.
+	Conversations int
+	// Messages counts the messages fetched from those conversations.
+	Messages int
+	// EmptyConversations counts in-window conversations with a known last
+	// message time whose fetch succeeded but returned no message at all. Their
+	// last message is inside the window, so a working fetch returns it.
+	EmptyConversations int
+	// Errors counts failed listings, fetches and legacy-store writes
+	// (BackfillSnapshot.Errors).
+	Errors int
+	// HistoryTeed and HistoryTeeFailed count hand-offs to v2 ingest.
+	HistoryTeed      int
+	HistoryTeeFailed int
+	// InboxOutcome is how the run's first INBOX listing went, classified as
+	// pull health classifies it (ok, empty, no_payload, error), or "" when
+	// the run never listed INBOX.
+	InboxOutcome GooglePullOutcome
+}
+
 // StartGoogleWindowBackfill starts a guarded background re-fetch of every
 // Google message from since onward (see windowBackfill). It reports false when
 // a backfill or catch-up is already running.
@@ -215,6 +257,19 @@ func (a *App) StartGoogleWindowBackfill(since time.Time) bool {
 	return true
 }
 
+// RunGoogleWindowBackfill runs a window backfill from since on the calling
+// goroutine and returns its result. It takes the guard the startup, deep and
+// window backfills share and reports false, without running, when one of them
+// is already running. (The phone backfill and the recent reconcile don't take
+// it.)
+// trigger is recorded in BackfillSnapshot.Trigger.
+func (a *App) RunGoogleWindowBackfill(since time.Time, trigger string) (GoogleWindowBackfillResult, bool) {
+	if !a.beginBackfill() {
+		return GoogleWindowBackfillResult{}, false
+	}
+	return a.windowBackfillAs(since, trigger), true
+}
+
 // windowBackfill re-fetches the messages the phone holds from since onward,
 // into both stores. It lists every folder, keeps the conversations whose last
 // message is at or after since, and pages each one's messages newest first
@@ -222,28 +277,67 @@ func (a *App) StartGoogleWindowBackfill(since time.Time) bool {
 // live channel skipped (a phone that stopped relaying): unlike DeepBackfill it
 // does not re-fetch every message the phone has ever held, and unlike the
 // recent reconcile it does not stop at the newest message already stored, which
-// after the live channel resumes sits above the hole.
-func (a *App) windowBackfill(since time.Time) {
+// after the live channel resumes sits above the hole. The caller holds the
+// backfill guard; windowBackfill releases it.
+func (a *App) windowBackfill(since time.Time) GoogleWindowBackfillResult {
+	return a.windowBackfillAs(since, BackfillTriggerWindow)
+}
+
+// windowBackfillAs is windowBackfill recording trigger as what started it.
+func (a *App) windowBackfillAs(since time.Time, trigger string) (result GoogleWindowBackfillResult) {
 	defer a.endBackfill()
+	result = GoogleWindowBackfillResult{Since: since, Trigger: trigger, StartedAt: time.Now()}
+	defer func() { result.FinishedAt = time.Now() }()
 
 	// Progress is reset before anything can fail, so /api/backfill/status
 	// reports this run (with its error) rather than the previous one.
 	a.BackfillProgress.reset()
+	a.BackfillProgress.setRun(trigger, since.UnixMilli())
 	defer a.BackfillProgress.finish()
+	// Copy the run's counters into the result on every exit path.
+	var inbox *inboxPullRecorder
+	defer func() {
+		if inbox != nil {
+			result.InboxOutcome = inbox.Outcome()
+		}
+		progress := a.BackfillProgress.snapshot()
+		result.Conversations = progress.ConversationsFound
+		result.Messages = progress.MessagesFound
+		result.Errors = progress.Errors
+		result.HistoryTeed = progress.HistoryTeed
+		result.HistoryTeeFailed = progress.HistoryTeeFailed
+	}()
 
 	catchUp := a.beginGoogleCatchUp("window_backfill")
 	if catchUp == nil {
-		a.Logger.Error().Msg("Window backfill: client not connected")
+		a.Logger.Error().Str("trigger", trigger).Msg("Window backfill: client not connected")
 		a.BackfillProgress.addError("window backfill: Google client not connected")
-		return
+		return result
 	}
+	result.Connected = true
 	defer catchUp.finish()
 	catchUp.progress = &a.BackfillProgress
+	if trigger == BackfillTriggerSilenceRecovery {
+		// libgm waits for a reply with no hard timeout, so one request the
+		// phone never answers would hold the backfill guard, and the
+		// reconciles it refuses, until the process restarts. An automatic run
+		// gives up on that request instead (googleRecoveryCallDeadline).
+		catchUp.gm = newDeadlineGMClient(catchUp.gm, googleRecoveryCallDeadline, a.Logger)
+	}
+	inbox = &inboxPullRecorder{GMClient: catchUp.gm}
+	catchUp.gm = inbox
 
 	sinceMS := since.UnixMilli()
-	a.Logger.Info().Time("since", since).Msg("Starting window backfill")
+	a.Logger.Info().Time("since", since).Str("trigger", trigger).Msg("Starting window backfill")
 
+	listed := map[string]bool{}
 	inWindow := func(conv *gmproto.Conversation) bool {
+		// An out-of-window conversation is offered again on every page and
+		// folder that lists it; count it once.
+		if id := conv.GetConversationID(); !listed[id] {
+			listed[id] = true
+			result.Listed++
+		}
 		// LastMessageTimestamp is in microseconds; 0 means the phone did not
 		// say, so keep the conversation rather than risk skipping the hole.
 		last := conv.GetLastMessageTimestamp() / 1000
@@ -251,6 +345,7 @@ func (a *App) windowBackfill(since time.Time) {
 	}
 	seen := map[string]*gmproto.Conversation{}
 	aborted := func() {
+		result.Aborted = true
 		a.BackfillProgress.addError("window backfill stopped early: the Google connection changed or ended; run it again")
 		a.emitConversationsChange()
 		a.emitMessagesChange("")
@@ -259,7 +354,7 @@ func (a *App) windowBackfill(since time.Time) {
 		n, stopped := a.paginateFolder(catchUp, folder, seen, inWindow)
 		if stopped {
 			aborted()
-			return
+			return result
 		}
 		a.BackfillProgress.add(0, 0, 0, 1)
 		a.Logger.Info().
@@ -270,25 +365,34 @@ func (a *App) windowBackfill(since time.Time) {
 
 	a.BackfillProgress.setPhase(BackfillPhaseMessages)
 	for convID, conv := range seen {
+		errorsBefore := a.BackfillProgress.errorCount()
 		n, stopped := a.deepBackfillConversationWithToken(catchUp, convID, conv, sinceMS)
 		a.BackfillProgress.add(0, n, 0, 0)
 		if stopped {
 			aborted()
-			return
+			return result
+		}
+		// A fetch that failed is an error, not an empty answer.
+		if n == 0 && conv.GetLastMessageTimestamp() > 0 && a.BackfillProgress.errorCount() == errorsBefore {
+			result.EmptyConversations++
 		}
 	}
 
 	progress := a.BackfillProgress.snapshot()
 	a.Logger.Info().
 		Time("since", since).
+		Str("trigger", trigger).
+		Int("listed", result.Listed).
 		Int("conversations", progress.ConversationsFound).
 		Int("messages", progress.MessagesFound).
+		Int("empty_conversations", result.EmptyConversations).
 		Int("errors", progress.Errors).
 		Int("history_teed", progress.HistoryTeed).
 		Int("history_tee_failed", progress.HistoryTeeFailed).
 		Msg("Window backfill complete")
 	a.emitConversationsChange()
 	a.emitMessagesChange("")
+	return result
 }
 
 func (a *App) deepBackfillShouldAbort(clientToken any, phase string) bool {
@@ -947,7 +1051,9 @@ func (a *App) storeConversation(conv *gmproto.Conversation) error {
 	return nil
 }
 
-func (a *App) storeMessage(msg *gmproto.Message) {
+// storeMessage writes one fetched message to the legacy store and returns
+// the write error, if any. Empty contentless stubs are skipped, not failures.
+func (a *App) storeMessage(msg *gmproto.Message) error {
 	body := client.ExtractMessageBody(msg)
 	senderName, senderNumber := client.ExtractSenderInfo(msg)
 
@@ -984,10 +1090,12 @@ func (a *App) storeMessage(msg *gmproto.Message) {
 	// Skip empty contentless stubs so backfill doesn't repopulate "Empty
 	// message" rows that the live path and startup repair remove.
 	if db.IsEmptyStubMessage(dbMsg) {
-		return
+		return nil
 	}
 
 	if err := a.Store.UpsertMessage(dbMsg); err != nil {
 		a.Logger.Error().Err(err).Str("msg_id", dbMsg.MessageID).Msg("Failed to store backfill message")
+		return err
 	}
+	return nil
 }

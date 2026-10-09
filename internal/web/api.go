@@ -138,6 +138,9 @@ type APIOptions struct {
 	// /api/status uses it to flag a platform whose silence outlasts its own
 	// baseline (freshness.<platform>.silence). Nil skips the silence check.
 	Activity freshness.ActivitySource
+	// SilenceRecovery reports the automatic window backfill that runs after a
+	// flagged silence ends (/api/status "silence_recovery"). Nil omits it.
+	SilenceRecovery func() any
 }
 
 type SearchResult struct {
@@ -338,6 +341,9 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		}
 		if f := computeFreshness(); f != nil {
 			payload["freshness"] = f
+		}
+		if opts.SilenceRecovery != nil {
+			payload["silence_recovery"] = opts.SilenceRecovery()
 		}
 		return payload
 	}
