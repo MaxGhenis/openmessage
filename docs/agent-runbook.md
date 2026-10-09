@@ -474,31 +474,72 @@ hung daemon, and it alerts when the daemon is up but a platform has gone
 quiet.
 
 This section follows the script's code on Max's local dotfiles `master` at
-`b51582d` (2026-10-08), plus the `append_errors` alert (`27df7b3`) and the
-`pull_empty` alert (`ffda554`). Other commits on `master` after `b51582d`
-aren't covered yet. The script's header comment summarizes the checks but is
-incomplete: it leaves out the inbox-read alert and the parse-error path, and
-it lists a top-level `projection_stalled` check that never fires (the daemon
-publishes that flag inside `freshness`).
+`ffda554` (2026-10-09). The script's header comment summarizes the checks but
+is incomplete: it leaves out the inbox-read alert and the parse-error path,
+and it lists a top-level `projection_stalled` check that never fires (the
+daemon publishes that flag inside `freshness`).
 launchd runs the working-tree file, so editing it, or checking out another
 branch in `~/dotfiles`, changes live behavior within 5 minutes. Try changes on
 a copy ([testing a change](#testing-a-change)).
 
+- Health: `~/.local/state/openmessage-watchdog/health.txt`, rewritten by every
+  run, says what the last run did and every alert it raised or held back
+  ([reading it](#healthtxt-what-the-last-run-saw)). Read it first: a clean run
+  writes nothing to the log.
 - Log: `~/Library/Logs/openmessage-watchdog.log`.
 - Script stderr, including Python failures:
-  `~/Library/Logs/openmessage-watchdog-launchd.log`. Look there when the main
-  log shows probes and relaunches but no staleness lines. From 2026-09-15 to
-  09-20, `/usr/bin/python3` refused to run (an unaccepted Xcode license), every
-  staleness check was off, and the main log said nothing about it.
+  `~/Library/Logs/openmessage-watchdog-launchd.log`. From 2026-09-15 to 09-20,
+  `/usr/bin/python3` refused to run (an unaccepted Xcode license), every
+  staleness check was off, and the main log said nothing about it. Since
+  dotfiles `9a20c28` such a run logs `staleness checks did not run: python3
+  exited N (<last stderr line>)` and lists the same text as an `alert:` line
+  in `health.txt`. It posts no notification. The parenthesis holds the last
+  line of the Python block's stderr, cut to 160 printable characters, and is
+  left out when that line is empty. The whole stderr also lands in
+  `python.stderr` in the state dir, rewritten by every run where the daemon
+  answered. A run with no status data (python3 failed, or the status wasn't
+  valid JSON) leaves the disconnect and repair counters as they were. Before
+  `9a20c28` such a run zeroed them and logged `reconnected: <platform>` and
+  `google repair cleared`, so an episode that had already notified and
+  outlasted the gap notified again once data came back, and one that hadn't
+  yet started its count over.
 - State: `~/.local/state/openmessage-watchdog/` holds `consecutive_fails`,
-  `last_action_epoch` (the relaunch throttle), the episode counters
-  `disc_<platform>` and `repair_google`, one `alert_<key>` cooldown stamp
-  per alert (epoch seconds; deleting one re-arms that alert),
-  `append_errors` (see the `append_errors` alert below), and
-  `paired_<platform>`, the pairing state the watchdog last recorded (`1` or
-  `0`; a loss deferred by the cooldown stays `1` until it is announced).
-  Deleting a `paired_` file makes the platform's next unpaired run a first
-  sighting, which is only logged.
+  `last_action_epoch` (the relaunch throttle), `down_since` (the current
+  outage's first failed probe), the episode counters `disc_<platform>` and
+  `repair_google` with their start times `disc_since_<platform>` and
+  `repair_since_google`, one `alert_<key>` cooldown stamp per alert
+  (deleting one re-arms that alert), `append_errors` (see the
+  `append_errors` alert below), `paired_<platform>`, the pairing state the
+  watchdog last recorded (`1` or `0`; a loss deferred by the cooldown stays
+  `1` until it is announced), `python.stderr` and `health.txt`. Times are
+  epoch seconds. Deleting a `paired_` file makes the platform's next unpaired
+  run a first sighting, which is only logged.
+
+  Since dotfiles `ea25916` every counter and time is read through
+  `read_state`. A file that isn't a canonical decimal (digits only, no
+  leading zero, at most 18 digits; an empty file fails too), or a time later
+  than the run's clock, is logged as `state file <name> was damaged
+  ('<content>') - removed, read as 0` (or `was in the future (…)`), deleted,
+  and read as 0, which is how a missing file reads. `<content>` keeps only
+  the letters, digits, spaces and `._:-` of the file's first 64 bytes, cut
+  to 40 characters, so a rejected `+5` logs as `'5'`; look at the file before
+  the next run deletes it. A counter restarts, a cooldown stamp lets its
+  alert through, the relaunch throttle lifts, and a start time restarts at
+  that run. A file is checked only when a run reads it, so a damaged stamp
+  stays until its alert next comes up. `paired_<platform>` is compared as a
+  string. `append_errors` has its own check on runs whose status has ingest
+  accounts: it logs `state file append_errors was damaged (…) - bad fields
+  read as 0` and rewrites the file at the end of that run instead of
+  deleting it. An answered run without accounts (or without status data)
+  reads its bad fields as 0 without a log line; down and skipped runs don't
+  read it.
+  Before `ea25916` most of these values went straight into bash arithmetic:
+  a word ended any run that did arithmetic on it (a down run for
+  `consecutive_fails`, a due relaunch, an alert or episode whose condition
+  held), `08` in a stamp stopped the alert loop at that key on every run
+  (losing that alert and every line after it), and a future
+  `last_action_epoch` throttled every relaunch until 30 minutes after the
+  clock passed it.
 - Loaded? `launchctl list | grep openmessage-watchdog`.
 
 ### Relaunching a dead or hung daemon
@@ -510,7 +551,10 @@ A run first skips, logging why, if the `watchdog-disabled` flag exists
 missing. Until 2026-10-08 that check matched any command line containing the
 phrase, including a grep for it and a test's `pgrep` stub; a stub made it skip
 live runs that day.
-Skipped runs neither count nor reset anything. Otherwise it fetches
+A skipped run doesn't probe the daemon and leaves the fail count and the
+episode counters where they were, but it deletes `down_since`, the outage
+clock: nothing watches the daemon while runs skip, so the next failed probe
+starts a new outage. Otherwise it fetches
 `http://127.0.0.1:7007/api/status` with a 5 s timeout. The probe fails when the
 reply doesn't contain the string `"connected"`: connection refused, no answer
 within 5 s, or an error body. Any real status payload passes, even with every
@@ -539,6 +583,16 @@ was down - relaunched the app", in both cases; `quitting hung app` in the log
 tells them apart. The probe sends no control token. That works only while
 `/api/` auth is accept-and-log: if enforcement ships, every probe will fail.
 
+The outage clock, `down_since` (`daemon_down_since` in health.txt), starts at
+an outage's first failed probe and survives relaunches and throttled runs. An
+answered probe deletes it, and so does a skipped run. Every failed probe lists
+`daemon not answering since <time> (N failed probe(s) in a row) - messages are
+not syncing` in health.txt. N is the fail count, which a relaunch resets, so
+it starts over while the time stays. A skip does the opposite: it restarts
+the time but keeps the count. After a skip, N can include probes that failed
+before `<time>`, and with no app process a count left at 1 means the first
+failed probe after the skip relaunches.
+
 ### Staleness alerts
 
 While the daemon answers, the script reads `/api/status` for the "app up,
@@ -546,10 +600,11 @@ platform silently dead" class. It only alerts; platform recovery stays with the
 in-app supervisors. It alerts on:
 
 - a paired platform (`paired` true, `connected` false) on 3 consecutive runs
-  where the daemon answered. That is 10–15 minutes while the Mac is awake, and
+  that read the status. That is 10–15 minutes while the Mac is awake, and
   longer across sleep, because launchd skips the runs that fall while it is
-  asleep;
-- `google.needs_repair` on 3 consecutive answered runs;
+  asleep. Runs where the daemon is down, the watchdog skips, or the status
+  couldn't be read neither count nor break the streak;
+- `google.needs_repair` on 3 consecutive runs that read the status;
 - `google.repairs_paced >= 3` (key `repairs_paced`): at least three cookie
   repairs since the daemon started had to wait out the daemon's own minimum
   repair interval (90 s by default), so something is revoking the cookies
@@ -651,15 +706,28 @@ Each run posts at most one macOS notification: its first fresh alert, plus
 "(+N more - see log)" when there are others. A lost pairing always goes first,
 as one alert naming every platform announced in that run. The log has each
 alert as `ALERT: …` and the notification as `NOTIFY: …`. A `NOTIFY:` line
-records the attempt, not that macOS showed it.
+records the attempt, not that macOS showed it. The notification goes inside an
+AppleScript string literal, and parts of its text come from the daemon or from
+Python errors (Signal's `last_issue_reason`, the `silence_check` error), so
+since dotfiles `aaeefc3` it drops every `"` and `\` from the text. The
+`NOTIFY:` line and health.txt keep them. Before `aaeefc3`, a quote or a
+backslash in that text could keep the notification from compiling, and a
+quote could end the literal early and turn the rest into AppleScript.
 
-- The disconnect and `needs_repair` alerts count consecutive answered runs and
-  notify once, when the count reaches 3, so one notification covers the whole
-  episode. The count resets on any answered run without the condition,
-  including one where the platform became unpaired or the status didn't parse,
-  so `reconnected: <platform>` and `google repair cleared` in the log don't
-  prove a recovery. Runs where the daemon is down, or where the watchdog
-  skips, leave the count where it was.
+- The disconnect and `needs_repair` alerts count consecutive runs that read
+  the status and notify once, when the count reaches 3, so one notification
+  covers the whole episode. The count resets on any run that reads the status
+  without finding the condition, including one where the platform became
+  unpaired, so
+  `reconnected: <platform>` and `google repair cleared` in the log don't
+  prove a recovery. Runs where the daemon is down, where the watchdog skips,
+  or where it got no status data (python3 failed, or the status didn't parse)
+  leave the count where it was. Each episode's first check is kept in
+  `disc_since_<platform>` or `repair_since_google`, deleted when the count
+  resets. From the 3rd check on, every run that sees the condition lists the
+  episode in health.txt with that start, while the notification still fires
+  only at the 3rd. A count found without its start file (one from before
+  `9a20c28`, or a damaged file) starts the clock at that run.
 - Every other alert has a 6-hour cooldown per key. While the condition holds,
   the first answered run at least 6 hours after the key's last stamp alerts
   again; runs in between log `suppressed (cooldown): <key>`. Every alert in a
@@ -702,7 +770,9 @@ records the attempt, not that macOS showed it.
   the previous one, if the platform is still unpaired then. A relink in the
   meantime logs nothing, since the stored state never left paired.
 - If `/api/status` contains `"connected"` but isn't valid JSON, the run logs
-  `status parse error: …` and checks nothing else.
+  `status parse error: …`, lists it in health.txt, checks nothing else in the
+  response, and posts no notification. health.txt can still list a saved
+  `append_errors` remainder on such a run.
 
 Consequences worth knowing:
 
@@ -726,12 +796,13 @@ Consequences worth knowing:
   projected fine, and the cause is not stored (issue #161). Their inbox ids
   are only in the backend's `Quarantined ingest frame` log lines.
 - `append_errors` is the same kind of in-memory counter, but its banner
-  doesn't repeat for an unchanged count. In the state dir's `health.txt`
-  (rewritten by every run) the count is an `alert:` line on every run that
-  reads the status while it is above 0, reported or not, until the backend
-  restarts; attempts carried over a restart are listed until they are
-  reported, and on runs without
-  accounts the unreported remainder is listed instead. Failures after the
+  doesn't repeat for an unchanged count. In
+  [health.txt](#healthtxt-what-the-last-run-saw) the count is an `alert:`
+  line on every run that reads the status while it is above 0, reported or
+  not, until the backend restarts; attempts carried over a restart are listed
+  until they are reported, and on answered runs without accounts or without
+  status data the unreported remainder is listed instead (down and skipped
+  runs list nothing for it). Failures after the
   watchdog's last run that saw accounts and before a restart die with the old
   process uncounted. When the identity is unknown on a run after a restart and
   neither sum falls, that run takes the new backend for the old one: a count
@@ -746,25 +817,145 @@ Consequences worth knowing:
   duplicated self-participants (fixed by deduping in `refreshConversation`,
   PR #160). The recent ones have no diagnosed cause.
 
+### health.txt: what the last run saw
+
+Since dotfiles `9a20c28`, every run rewrites
+`~/.local/state/openmessage-watchdog/health.txt` from an EXIT trap, skipped
+runs included. Only a malformed `OPENMESSAGE_WATCHDOG_NOW` exits before then.
+A clean run writes nothing to the main log, so this file is the proof of life
+and the quickest view of what the watchdog sees. On the live install at 06:11
+on 2026-10-09 it read:
+
+```text
+# openmessage-watchdog health, rewritten by each run (launchd, every 5 min while the Mac is awake)
+updated=2026-10-09 06:11:04
+updated_epoch=1791540664
+watchdog=active
+watchdog_detail=no banner this run
+daemon=up
+daemon_detail=answered /api/status
+alerts=2
+alert: Google pulls return no data while the store holds 1048 conversations (last pull 2h ago) - phone switched to Google-account pairing; re-link or switch back to QR (d1088)
+alert: 1 ingested frame(s) quarantined
+note: signal unpaired - its staleness checks are paused
+note: whatsapp unpaired - its staleness checks are paused
+# end
+```
+
+Both alerts were inside their cooldowns, so that run posted nothing and logged
+only `suppressed (cooldown)` lines. Runs stop while the Mac sleeps, so a stale
+`updated_epoch` alone doesn't mean the watchdog died. Check whether the Mac
+was awake in the meantime before suspecting launchd. Nothing reads the file
+automatically: a watchdog that stopped running, ended in `watchdog=error`, or
+lists `staleness checks did not run` posts no notification, so you have to
+look.
+
+The file is replaced whole. A run writes a temp file next to it and moves it
+into place only once the last line, `# end`, is written, so a reader sees one
+run's complete file. Lines end in `\n`, and every ASCII control character
+inside a value (tab, CR, DEL, …) becomes a space, so each value stays on its
+line. C1 controls, U+2028 and U+2029 pass through, so split on `\n` only. A
+newline in daemon text never gets that far: the script reads the Python
+block's output line by line, so a newline in, say, Signal's
+`last_issue_reason` cuts that alert off there, and the rest is read as a line
+of its own (a separate alert if it is shaped like one). After the comment line
+come:
+
+- `updated` and `updated_epoch`: the run's clock, in local time and epoch
+  seconds.
+- `watchdog`: `active` (the run reached the end of the relaunch path or of the
+  staleness checks), `disabled` (the flag), `pairing` (an `openmessage pair`
+  process), `app-missing`, or `error`. A run where python3 failed or the
+  status didn't parse is still `active`, with the failure as an `alert:` line,
+  so read the alerts before taking `active` to mean the checks ran. `error`
+  means the run stopped before its last lines (say, an unbound variable under
+  `set -u`); its stderr is in the launchd log.
+- `watchdog_detail`: `banner: <text>` (the notification as logged, before
+  quotes and backslashes are dropped), `no banner this run`, why checks are
+  paused, or, on an `error` run, `the run stopped before it finished; its
+  stderr is in the launchd log`. A dry run shows `would banner: <text>`, or
+  `DRYRUN: no relaunch, no banner` on the relaunch path. For the flag the
+  detail is when it was set, its age and its reason, as in `disable flag set
+  2026-10-09 08:32 (3h ago); reason: re-pairing Google; no probe, relaunch or
+  alert until it is removed`.
+- `daemon`: `up`, `down`, or `unknown` (not probed: a skipped run, or one that
+  stopped before the probe). `daemon_detail` says what happened:
+  `answered /api/status`, or the relaunch path's step, as in
+  `dead (no app process); 1/2 failed probes, no action yet`,
+  `… relaunch throttled (12m since the last; one per 30m)`,
+  `… relaunched the app` or `… DRYRUN: would relaunch`.
+- Only when they apply, in epoch seconds: `paused_since` (the flag file's
+  modification time, so touching or rewriting the flag restarts it),
+  `daemon_down_since` (on down runs, the outage's first failed probe), and
+  `disconnected_since_<platform>` and `repair_since_google` (the episode's
+  first check, on runs that list the episode).
+- `alerts=N`, then N `alert: <text>` lines, then any `note: <text>` lines.
+
+The `alert:` lines are every alert the run raised, whether or not a cooldown
+kept it out of the notification. The log's `ALERT:` lines are only the alerts
+that weren't suppressed, so health.txt can list an alert the log hasn't
+mentioned for hours. They are:
+
+- on a down run, `daemon not answering since <time> (N failed probe(s) in a
+  row) - messages are not syncing`, and nothing else: the staleness checks
+  need an answering daemon;
+- every staleness alert's text, including those logged as
+  `suppressed (cooldown)`;
+- a disconnect or `needs_repair` episode from its 3rd check, on every run that
+  sees the condition, as `<platform> disconnected since <time> (N checks in a
+  row)` or `Google needs repair since <time> (N checks in a row)`. Checks 1
+  and 2 show up only in the log, as `disconnected: <platform> (N/3)` and
+  `google needs_repair (N/3)`;
+- a lost pairing, as `<platform> no longer paired - check the app; relink
+  unless that was intended` (one line per platform), while its announcement
+  waits out the cooldown and on the run that announces it;
+- the `append_errors` counts described under
+  [how alerts repeat](#how-alerts-repeat);
+- `staleness checks did not run: python3 exited N (…)` and
+  `status parse error: …`, which post no notification. Such a run also lists
+  any unreported `append_errors` remainder from the state file, labeled "(no
+  ingest accounts this run)" although it read no status.
+
+The `note:` lines are `<platform> unpaired - its staleness checks are paused`,
+one per unpaired platform on every run that reads the status (next to the
+lost-pairing alert while that lasts), and each silence the daemon reports (the
+`note:` lines in the log).
+
+Episodes, unpaired notes and silence notes come only from a run that read the
+status. A down, skipped or data-less run lists none of them, though the
+counters and start times carry on, so a missing episode line on such a run
+doesn't mean the episode is over. A dry run writes health.txt into its own
+state dir ([testing a change](#testing-a-change)).
+
 ### Testing a change
 
 `OPENMESSAGE_WATCHDOG_DRYRUN=1` logs decisions without relaunching or
-notifying, but it still writes state: `consecutive_fails`, the episode
-counters, the `paired_<platform>` files, the `alert_<key>` stamps (not the
-relaunch stamp) and the `append_errors` file. Run against the real state dir,
-it can swallow the next real alert: a stamped key stays quiet for 6 hours, an
-episode counter pushed past 3 never alerts, an `append_errors` count marked
-reported never alerts, and a lost pairing it records is never announced. Point
-`OPENMESSAGE_WATCHDOG_STATE` and `OPENMESSAGE_WATCHDOG_LOG` at a scratch
-directory and run a copy of the script:
+notifying, but it still writes state: `consecutive_fails`, `down_since`, the
+episode counters and their start files, the `paired_<platform>` files, the
+`alert_<key>` stamps (it never writes the relaunch stamp), the
+`append_errors` file, `python.stderr` and `health.txt`. It also deletes any
+counter or time file it reads as damaged or later than its clock, the relaunch
+stamp included. With `OPENMESSAGE_WATCHDOG_NOW` pinned earlier than the
+stamps already in the state dir, it deletes each one it reads. Alert stamps
+and start times may come back on that earlier clock, but a deleted relaunch
+stamp stays deleted, which lifts the throttle. Run against the real state dir, it can swallow the next real alert:
+a stamped key stays quiet for 6 hours, an episode counter pushed past 3 never
+alerts, an `append_errors` count marked reported never alerts, and a lost
+pairing it records is never announced. It also overwrites the live
+health.txt. Point `OPENMESSAGE_WATCHDOG_STATE` and `OPENMESSAGE_WATCHDOG_LOG`
+at a scratch directory and run a copy of the script:
 
 ```bash
 d=$(mktemp -d)
 cp ~/dotfiles/bin/openmessage-watchdog "$d/wd"   # edit "$d/wd" to try a change
 OPENMESSAGE_WATCHDOG_DRYRUN=1 OPENMESSAGE_WATCHDOG_STATE="$d" \
   OPENMESSAGE_WATCHDOG_LOG="$d/log" bash "$d/wd"
-cat "$d/log"
+cat "$d/log" "$d/health.txt"
 ```
+
+In a dry run, health.txt's `watchdog_detail` reads `would banner: …` where a
+real run would notify, and `DRYRUN: no relaunch, no banner` where it would
+relaunch.
 
 A dry run still obeys the real `watchdog-disabled` flag (its path is fixed)
 and probes the live daemon. To exercise the staleness checks against a crafted
@@ -777,16 +968,24 @@ the counter.
 Two more overrides exist for tests. `OPENMESSAGE_WATCHDOG_APP` replaces the
 `/Applications/OpenMessage.app` existence check (the relaunch still opens the
 app by name). `OPENMESSAGE_WATCHDOG_NOW` (epoch seconds) pins the clock for
-the cooldowns, the relaunch throttle and the python block's `now_ms`, which
-the silence estimate now reads too (before dotfiles `b51582d` it read the wall
-clock). The estimate buckets its baseline by local day and hour, so a test
-that pins the clock should pin `TZ` too.
+the cooldowns, the relaunch throttle, the future-time check on state files,
+health.txt's `updated` and the outage and episode clocks, the disable flag's
+age (measured from the flag's real modification time, so set that with
+`touch -t` to match), and the python block's `now_ms`, which the silence
+estimate now reads too (before dotfiles `b51582d` it read the wall clock).
+Log line timestamps stay on the wall clock.
+The estimate buckets its baseline by local day and hour, so a test that pins
+the clock should pin `TZ` too.
 `~/dotfiles/tests/test_openmessage_watchdog.py` runs the real script against a
 fixture daemon, and the silence estimate against a temp v2 store, with all of
-this sandboxed and stub `osascript`/`open`/`pgrep`/`pkill` first on `PATH`:
+this sandboxed and stub `osascript`/`open`/`pgrep`/`pkill` first on `PATH`.
+`test_openmessage_watchdog_append_errors.py` and
+`test_openmessage_watchdog_pull_health.py` next to it cover those two alerts.
+The suites use Hypothesis, which the plain `pytest` on Max's Mac lacks, so run
+them through `uvx` (226 tests, about 7 minutes at `ffda554`):
 
 ```bash
-cd ~/dotfiles && PYTHONDONTWRITEBYTECODE=1 pytest -q -p no:cacheprovider tests/test_openmessage_watchdog.py
+cd ~/dotfiles && PYTHONDONTWRITEBYTECODE=1 uvx --with hypothesis pytest -q -p no:cacheprovider tests/test_openmessage_watchdog.py tests/test_openmessage_watchdog_append_errors.py tests/test_openmessage_watchdog_pull_health.py
 ```
 
 ### Reading the backend's os_log
@@ -822,23 +1021,33 @@ are the quarantined ones. No ready-made replay test exists.
 (re-pairing, a slow deploy, long debugging), park the launchd watchdog:
 
 ```bash
-touch "$HOME/Library/Application Support/OpenMessage/watchdog-disabled"
+echo "re-pairing Google" > "$HOME/Library/Application Support/OpenMessage/watchdog-disabled"
 ```
 
-While the flag exists, every run logs `skip: disable flag present` and exits:
-no probe, no relaunch, no watchdog alert. (The app's own silence notification
+While the flag exists, every run logs
+`skip: disable flag present (set Nh ago; reason: re-pairing Google)` and exits:
+no probe, no relaunch, no watchdog alert. The reason is the first non-blank
+line in the flag's first 512 bytes, with leading spaces dropped, cut to 120
+characters. Tabs, CRs and other control bytes become spaces, and so do
+non-ASCII bytes, since launchd runs the script without a `LANG`; keep the
+reason to one line of plain ASCII. An empty flag, as `touch` makes, logs only
+`(set Nh ago)`. N counts whole hours since the file was last modified, so
+touching or rewriting the flag restarts it. health.txt shows
+`watchdog=disabled` with the same age and reason, and `paused_since`.
+(The app's own silence notification
 and the chief-of-staff watcher don't read the flag.) Remove it when you're
 done, whatever the outcome. Nothing ages it out. A flag forgotten from
 2026-08-29 17:44 to 09-03 16:00 (1,278 consecutive skipped runs) silenced the
 6-hourly `all_quiet` alerts in the middle of a two-week outage: the v2 inbox
 has no frames from any platform between 08-20 18:55 and 09-03 16:03. If alerts
-seem to have stopped, `tail` the log first; a parked watchdog says so on every
-run. The watchdog also skips while an `openmessage pair` process is running,
-but only while it runs, so don't rely on it for multi-step procedures. The
+seem to have stopped, read health.txt or `tail` the log first; a parked
+watchdog says so on every run. The watchdog also skips while an
+`openmessage pair` process is running, but only while it runs, so don't rely
+on it for multi-step procedures. The
 quick deploy recipe below doesn't need parking if the app is back within a few
 minutes: with no app process, a relaunch takes two failed probes 5 minutes
-apart, and the watchdog skips while `/Applications/OpenMessage.app` is
-missing.
+apart (counting one that failed before a skip), and the watchdog skips while
+`/Applications/OpenMessage.app` is missing.
 
 ## Pairing & the "zombie session"
 
