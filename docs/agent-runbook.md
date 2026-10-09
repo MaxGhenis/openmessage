@@ -382,6 +382,46 @@ All of this needs the request/response path to work. If the fetch replies are
 empty (`Fetched conversations count=0` while the store holds history), nothing
 can be recovered until that is fixed.
 
+### Requests the phone never answers
+
+libgm (the fork's third carried patch) gives up on a request the phone hasn't
+answered within 60 s (`libgm.DefaultRequestTimeout`). It also fails every
+request still waiting when the client disconnects, which happens on unpair, on
+a reconnect that replaces the client, and at shutdown. The first kind fails
+with an error matching `libgm.ErrPhoneNotResponding`, the second with one
+matching `libgm.ErrConnectionClosed`. Before that patch such a request waited
+forever. A catch-up blocked on one held the backfill guard until the process
+restarted, so every later backfill, recent reconcile and pending-media refresh
+was refused (`backfill already running`).
+
+- **A catch-up stops after its first unanswered request.** Every later
+  request in the same run fails at once without reaching the phone, with
+  `skipped: an earlier request in this Google catch-up got no answer`
+  wrapping the first error. A run against a silent phone therefore ends about
+  60 s after its first unanswered request and releases the guard.
+  - Startup, deep and window backfills count each skipped fetch in
+    `/api/backfill/status` `errors` / `error_details`.
+  - The recent reconcile and the pending-media refresh log it.
+  - Run a backfill again once the phone answers. When the ditto pinger sees
+    the phone respond again, it starts a recent reconcile on its own
+    (`phone_responding_again`).
+- **Sends.** A send the phone never answers now fails after 60 s instead of
+  sitting in `dispatching` until a restart. The server had already accepted
+  it, so the phone may still deliver it: the outbox records it as
+  `uncertain` and never sends it again. The legacy HTTP send keeps its
+  idempotency claim, so a retry with the same key gets 409. A timed-out
+  conversation lookup before a send has no effect on the phone and stays
+  retryable.
+- **What you see.**
+  - libgm logs `Phone did not answer the request in time; giving up on it`
+    with `request_action` and `timeout`.
+  - A timed-out INBOX listing shows in `google.pull_health` as
+    `last_outcome: error` with `last_error` ending
+    `phone did not respond to request after 1m0s`.
+  - A request the phone answered only with the Google-account notice still
+    fails as `no_payload` (see "Pulls that return nothing"), even when the
+    timeout cuts it off.
+
 ## MCP serving — exactly one process may own live transports
 
 **The failure mode (empirically confirmed 2026-07-20):** `openmessage serve
@@ -1034,10 +1074,10 @@ Without it, a single transient network blip during a scheduled token refresh
 permanently killed the session.
 
 The replacement in `go.mod` pins fork commit
-[`100192cb3078`](https://github.com/MaxGhenis/gmessages/commit/100192cb3078739f7ed925730f7248eb18b6c340).
+[`1055c990a942`](https://github.com/MaxGhenis/gmessages/commit/1055c990a942e269cb92b7d6f4f47142ba1eae00).
 It is upstream `mautrix/gmessages` base
 [`3433cc07d5ea`](https://github.com/mautrix/gmessages/commit/3433cc07d5ea9522309adad3a8c92ed5b08dc11d),
-which contains the auth-refresh retry, plus two carried patches, oldest first:
+which contains the auth-refresh retry, plus three carried patches, oldest first:
 
 1. `Add ListConversationsWithCursor for paginated conversation listing`. That
    method is required by OpenMessage's backfill and reconciliation paths.
@@ -1049,16 +1089,30 @@ which contains the auth-refresh retry, plus two carried patches, oldest first:
    `libgm.ErrNoResponsePayload` instead of returning an empty success. A bare
    header answering a listing is still an empty result. See "Pulls that
    return nothing" below. Upstream still has the old behaviour.
+3. `libgm: fail phone requests after a hard timeout and on disconnect`
+   ([MaxGhenis/gmessages#1](https://github.com/MaxGhenis/gmessages/pull/1)).
+   A request the phone doesn't answer within `DefaultRequestTimeout` (60 s,
+   `Client.SetRequestTimeout`) fails with `libgm.ErrPhoneNotResponding`.
+   `Client.Disconnect` fails every waiting request with
+   `libgm.ErrConnectionClosed`. See "Requests the phone never answers"
+   above. Upstream made the same change in
+   [`c0a2d38`](https://github.com/mautrix/gmessages/commit/c0a2d38a24dc187e135aad60cc35a4f840954905)
+   with the same sentinel names and default. Its version also adds a
+   `context.Context` parameter to every public method. A rebase past
+   `c0a2d38` drops this patch for upstream's and moves OpenMessage's call
+   sites to the context API.
 
 **Keep the fork rebased on upstream.** The weekly
 `gmessages-fork-drift.yml` workflow records the base and patch set (count and
 subjects) and fails as soon as upstream `main` advances. When rebasing, replay
-both carried patches, verify the auth-refresh retry is still present, and
+the carried patches, verify the auth-refresh retry is still present, and
 update the fork pin, `EXPECTED_PATCHES`, and recorded SHAs together. The pinned
-commit must be on the fork's `main`. `TestGMessagesForkRejectsPayloadlessResponses`
-runs the pinned fork's own response-acceptance tests, so it fails if a rebase
-drops the second patch or keeps its exported names without the rejection. The
-durable architectural fix (move SMS/RCS onto an Android companion) is issue #75.
+commit must be on the fork's `main`. Two tests run the pinned fork's own tests
+by name and require each to pass: `TestGMessagesForkRejectsPayloadlessResponses`
+(second patch) and `TestGMessagesForkTimesOutUnansweredRequests` (third
+patch). Each fails if a rebase drops its patch, or keeps the exported names
+without the behaviour. The durable architectural fix (move SMS/RCS onto an
+Android companion) is issue #75.
 
 ### Pulls that return nothing (phone switched to Google-account pairing)
 

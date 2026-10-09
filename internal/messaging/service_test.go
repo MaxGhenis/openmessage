@@ -13,6 +13,9 @@ import (
 	"testing"
 	"time"
 
+	"go.mau.fi/mautrix-gmessages/pkg/libgm"
+	"go.mau.fi/mautrix-gmessages/pkg/libgm/gmproto"
+
 	"github.com/maxghenis/openmessage/internal/bridge"
 	"github.com/maxghenis/openmessage/internal/storage/blob"
 	"github.com/maxghenis/openmessage/internal/storage/sqlite"
@@ -718,6 +721,50 @@ func TestPostCallTimeoutBecomesUncertainAndIsNotRedispatched(t *testing.T) {
 	}
 	if got := sender.requestCount(); got != 1 {
 		t.Fatalf("timeout send count = %d, want 1", got)
+	}
+}
+
+// A Google send that libgm gave up on (the phone never answered, or the client
+// disconnected while it waited) reaches the outbox as the Google adapter
+// classifies it: transient, with no dispatch certainty. The server had
+// accepted the request, so the phone may still send it: the outbox must
+// record it as uncertain and never send it again.
+func TestUnansweredGoogleSendBecomesUncertainAndIsNotRedispatched(t *testing.T) {
+	for _, reason := range []error{libgm.ErrPhoneNotResponding, libgm.ErrConnectionClosed} {
+		t.Run(reason.Error(), func(t *testing.T) {
+			clock := newManualClock(messagingTestTime)
+			store := openMessagingTestStore(t, clock.Now())
+			sender := &scriptedTextSender{steps: []sendStep{{err: bridge.OpError{
+				Class:       bridge.FailureTransient,
+				Operation:   "send_text",
+				Fingerprint: "google_text_send_failed",
+				Cause: fmt.Errorf("send Google text: %w", &libgm.UnansweredRequestError{
+					Action: gmproto.ActionType_SEND_MESSAGE,
+					Reason: reason,
+				}),
+			}}}}
+			registry := newScriptedRegistry("unanswered-platform", sender)
+			registry.setAvailable(true)
+			service := newMessagingTestService(t, store, registry, clock)
+			submission := mustSendText(t, service, SendTextCommand{
+				CommonCommand: testCommonCommand("key-unanswered"),
+				Body:          "maybe sent",
+			})
+
+			if processed, err := service.DispatchDue(context.Background(), 4); err != nil || processed != 1 {
+				t.Fatalf("DispatchDue(unanswered) = %d, %v", processed, err)
+			}
+			if got := mustDelivery(t, service, submission.OutboxID); got.State != OutboxUncertain {
+				t.Fatalf("delivery = %+v, want uncertain", got)
+			}
+			clock.Advance(24 * time.Hour)
+			if processed, err := service.DispatchDue(context.Background(), 4); err != nil || processed != 0 {
+				t.Fatalf("DispatchDue(after unanswered) = %d, %v; want 0, nil", processed, err)
+			}
+			if got := sender.requestCount(); got != 1 {
+				t.Fatalf("send count = %d, want 1", got)
+			}
+		})
 	}
 }
 

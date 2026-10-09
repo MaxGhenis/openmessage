@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/rs/zerolog"
+
 	"go.mau.fi/mautrix-gmessages/pkg/libgm"
 	"go.mau.fi/mautrix-gmessages/pkg/libgm/gmproto"
 )
@@ -17,9 +19,9 @@ import (
 const (
 	gmessagesModule            = "go.mau.fi/mautrix-gmessages"
 	gmessagesFork              = "github.com/MaxGhenis/gmessages"
-	minimumGMessagesFork       = "v0.2602.1-0.20261009001900-100192cb3078"
-	minimumGMessagesForkTime   = "20261009001900"
-	gmessagesAuthRetryContract = "libgm/longpoll auth-refresh network retry and payload-less response rejection"
+	minimumGMessagesFork       = "v0.2602.1-0.20261009120339-1055c990a942"
+	minimumGMessagesForkTime   = "20261009120339"
+	gmessagesAuthRetryContract = "libgm/longpoll auth-refresh network retry, payload-less response rejection and request timeout"
 )
 
 var pseudoVersionSuffix = regexp.MustCompile(`[.-]([0-9]{14})-[0-9a-f]{12}$`)
@@ -153,7 +155,58 @@ func TestGMessagesForkRejectsPayloadlessResponses(t *testing.T) {
 		t.Error("ResponsePayloadError must match ErrNoResponsePayload")
 	}
 
-	args := []string{"test", "-count=1", "-v", "-run", "^(" + strings.Join(gmessagesAcceptanceTests, "|") + ")$"}
+	runPinnedForkTests(t, gmessagesAcceptanceTests, "payload-less response patch")
+}
+
+// gmessagesTimeoutTests are the pinned fork's behavioural tests for its third
+// carried patch: the request timeout and failing waiters on disconnect.
+var gmessagesTimeoutTests = []string{
+	"TestUnansweredRequestFailsWithPhoneNotResponding",
+	"TestTimeoutAfterPayloadlessAnswerReportsPayloadError",
+	"TestDisconnectFailsPendingRequests",
+	"TestPublicMethodsTimeOut",
+	"TestPublicMethodFailsOnDisconnect",
+	"TestTerminalOutcomeIsTheFirstTerminalEvent",
+	"TestTimeoutRacesCompleteExactlyOnce",
+	"TestPingerIgnoresAbandonedPing",
+	"TestGaiaPairingMessageEndsCleanly",
+}
+
+// TestGMessagesForkTimesOutUnansweredRequests pins the fork's third carried
+// patch. Without it, a request the phone never answers blocks its caller
+// until the process exits; a catch-up blocked that way holds the backfill
+// guard, so every later backfill, recent reconcile and pending-media refresh
+// is refused until a restart. OpenMessage's catch-ups also rely on the two
+// sentinels to stop a run after its first unanswered request
+// (failFastGMClient).
+func TestGMessagesForkTimesOutUnansweredRequests(t *testing.T) {
+	if libgm.DefaultRequestTimeout < time.Minute || libgm.DefaultRequestTimeout > 2*time.Minute {
+		t.Errorf("DefaultRequestTimeout = %s, want 1-2 minutes", libgm.DefaultRequestTimeout)
+	}
+	cli := libgm.NewClient(libgm.NewAuthData(), nil, zerolog.Nop())
+	if got := cli.RequestTimeout(); got != libgm.DefaultRequestTimeout {
+		t.Errorf("a new client's request timeout is %s, want the default", got)
+	}
+	cli.SetRequestTimeout(90 * time.Second)
+	if got := cli.RequestTimeout(); got != 90*time.Second {
+		t.Errorf("SetRequestTimeout(90s) left %s", got)
+	}
+	for _, reason := range []error{libgm.ErrPhoneNotResponding, libgm.ErrConnectionClosed} {
+		var err error = &libgm.UnansweredRequestError{Action: gmproto.ActionType_LIST_MESSAGES, Reason: reason}
+		if !errors.Is(err, reason) {
+			t.Errorf("UnansweredRequestError must match its reason %v", reason)
+		}
+	}
+
+	runPinnedForkTests(t, gmessagesTimeoutTests, "request-timeout patch")
+}
+
+// runPinnedForkTests runs the named tests of the pinned fork's libgm package
+// and requires each one to have run and passed: the API checks alone would
+// stay green if a rebase kept the exported names but lost the behaviour.
+func runPinnedForkTests(t *testing.T, names []string, patch string) {
+	t.Helper()
+	args := []string{"test", "-count=1", "-v", "-run", "^(" + strings.Join(names, "|") + ")$"}
 	if modfile := os.Getenv("OPENMESSAGE_CONTRACT_MODFILE"); modfile != "" {
 		// Lets a mutation check point the contract at a modified fork copy.
 		// Run the outer test with -count=1: Go's test cache does not see
@@ -165,11 +218,11 @@ func TestGMessagesForkRejectsPayloadlessResponses(t *testing.T) {
 	cmd.Env = envWithGOWorkOff()
 	output, runErr := cmd.CombinedOutput()
 	if runErr != nil {
-		t.Fatalf("the pinned gmessages fork fails its response-acceptance tests: %v\n%s", runErr, output)
+		t.Fatalf("the pinned gmessages fork fails its %s tests: %v\n%s", patch, runErr, output)
 	}
-	for _, name := range gmessagesAcceptanceTests {
+	for _, name := range names {
 		if !strings.Contains(string(output), "--- PASS: "+name+" ") {
-			t.Errorf("the pinned gmessages fork did not run and pass %s; a rebase may have dropped the payload-less response patch\n%s", name, output)
+			t.Errorf("the pinned gmessages fork did not run and pass %s; a rebase may have dropped the %s\n%s", name, patch, output)
 		}
 	}
 }
