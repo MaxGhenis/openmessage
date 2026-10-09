@@ -474,8 +474,8 @@ hung daemon, and it alerts when the daemon is up but a platform has gone
 quiet.
 
 This section follows the script's code on Max's local dotfiles `master` at
-`7de27cc` (2026-10-08), plus the `append_errors` alert (`27df7b3`) and the
-`pull_empty` alert (`ffda554`). Other commits on `master` after `7de27cc`
+`b51582d` (2026-10-08), plus the `append_errors` alert (`27df7b3`) and the
+`pull_empty` alert (`ffda554`). Other commits on `master` after `b51582d`
 aren't covered yet. The script's header comment summarizes the checks but is
 incomplete: it leaves out the inbox-read alert and the parse-error path, and
 it lists a top-level `projection_stalled` check that never fires (the daemon
@@ -777,11 +777,13 @@ the counter.
 Two more overrides exist for tests. `OPENMESSAGE_WATCHDOG_APP` replaces the
 `/Applications/OpenMessage.app` existence check (the relaunch still opens the
 app by name). `OPENMESSAGE_WATCHDOG_NOW` (epoch seconds) pins the clock for
-the cooldowns, the relaunch throttle and the python block's `now_ms`; the
-silence estimate still reads the wall clock.
+the cooldowns, the relaunch throttle and the python block's `now_ms`, which
+the silence estimate now reads too (before dotfiles `b51582d` it read the wall
+clock). The estimate buckets its baseline by local day and hour, so a test
+that pins the clock should pin `TZ` too.
 `~/dotfiles/tests/test_openmessage_watchdog.py` runs the real script against a
-fixture daemon with all of this sandboxed and stub
-`osascript`/`open`/`pgrep`/`pkill` first on `PATH`:
+fixture daemon, and the silence estimate against a temp v2 store, with all of
+this sandboxed and stub `osascript`/`open`/`pgrep`/`pkill` first on `PATH`:
 
 ```bash
 cd ~/dotfiles && PYTHONDONTWRITEBYTECODE=1 pytest -q -p no:cacheprovider tests/test_openmessage_watchdog.py
