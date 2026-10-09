@@ -268,6 +268,9 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 		} else {
 			logger.Info().Msg("V2 stack disabled (flags off)")
 		}
+		// Pull health compares empty Google pulls against what readers see;
+		// install the count before the supervisor can start a backfill.
+		installGooglePullCounter(a, v2Primary, stack)
 		repairer := newGoogleCredentialRepairer(
 			a.SessionPath,
 			canRefreshGoogleCookies,
@@ -1178,4 +1181,14 @@ func logSyncError(logger zerolog.Logger, lastImportErr map[string]string, platfo
 		event = logger.Debug().Err(err).Str("platform", platform)
 	}
 	event.Msg("Local platform sync unavailable")
+}
+
+// installGooglePullCounter points pull health at the store readers use: v2 on
+// a v2-primary install, else the legacy store.
+func installGooglePullCounter(a *app.App, v2Primary bool, stack *v2Stack) {
+	var reads readsource.ReadSource = a.Store
+	if v2Primary && stack != nil {
+		reads = v2read.New(stack.Store)
+	}
+	a.SetGoogleConversationCounter(func() (int, error) { return reads.ConversationCount("sms") })
 }

@@ -2,20 +2,24 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"regexp"
 	"strings"
 	"testing"
 	"time"
+
+	"go.mau.fi/mautrix-gmessages/pkg/libgm"
+	"go.mau.fi/mautrix-gmessages/pkg/libgm/gmproto"
 )
 
 const (
 	gmessagesModule            = "go.mau.fi/mautrix-gmessages"
 	gmessagesFork              = "github.com/MaxGhenis/gmessages"
-	minimumGMessagesFork       = "v0.2602.1-0.20260703132304-0e43542dfa0e"
-	minimumGMessagesForkTime   = "20260703132304"
-	gmessagesAuthRetryContract = "libgm/longpoll auth-refresh network retry"
+	minimumGMessagesFork       = "v0.2602.1-0.20261009001900-100192cb3078"
+	minimumGMessagesForkTime   = "20261009001900"
+	gmessagesAuthRetryContract = "libgm/longpoll auth-refresh network retry and payload-less response rejection"
 )
 
 var pseudoVersionSuffix = regexp.MustCompile(`[.-]([0-9]{14})-[0-9a-f]{12}$`)
@@ -105,4 +109,67 @@ func envWithGOWorkOff() []string {
 		i++
 	}
 	return append(env, "GOWORK=off")
+}
+
+// gmessagesAcceptanceTests are the pinned fork's own behavioural tests for its
+// second carried patch. They drive synthetic frames through libgm's receive
+// path, which OpenMessage can't reach from outside the package.
+var gmessagesAcceptanceTests = []string{
+	"TestAccountContainerOnlyFrameFailsInsteadOfReturningEmpty",
+	"TestHeaderOnlyFrameFails",
+	"TestHeaderOnlyFrameStillCompletesAListing",
+	"TestTypedResponseSurfacesPayloadError",
+	"TestRealResponseAfterPayloadlessFrameIsDelivered",
+	"TestEncryptedEmptyPayloadIsALegitimateEmptyAnswer",
+	"TestNonDataActionsKeepFirstFrameSemantics",
+	"TestAcceptanceInvariantOverRandomFrameSequences",
+}
+
+// TestGMessagesForkRejectsPayloadlessResponses pins the fork's second carried
+// patch. Without it, a phone that answers a pull with a frame lacking the
+// encrypted payload (on 2026-10-07/08: one GAIA_1 frame holding only the
+// field-11 account container, after the phone switched to Google-account
+// pairing) reaches backfill and sends as an empty success.
+//
+// The API checks alone would stay green if a rebase kept the exported names
+// but lost the rejection in receiveResponse, so this also runs the pinned
+// fork's behavioural tests and requires each one to have run and passed.
+func TestGMessagesForkRejectsPayloadlessResponses(t *testing.T) {
+	for _, action := range []gmproto.ActionType{
+		gmproto.ActionType_LIST_CONVERSATIONS,
+		gmproto.ActionType_LIST_MESSAGES,
+		gmproto.ActionType_GET_OR_CREATE_CONVERSATION,
+		gmproto.ActionType_GET_CONVERSATION,
+	} {
+		if !libgm.ResponsePayloadRequired(action) {
+			t.Errorf("fork must require a response payload for %s", action)
+		}
+	}
+	if libgm.ResponsePayloadRequired(gmproto.ActionType_NOTIFY_DITTO_ACTIVITY) {
+		t.Error("liveness pings must keep first-frame semantics")
+	}
+	var err error = &libgm.ResponsePayloadError{Action: gmproto.ActionType_LIST_CONVERSATIONS, AccountSwitch: true}
+	if !errors.Is(err, libgm.ErrNoResponsePayload) {
+		t.Error("ResponsePayloadError must match ErrNoResponsePayload")
+	}
+
+	args := []string{"test", "-count=1", "-v", "-run", "^(" + strings.Join(gmessagesAcceptanceTests, "|") + ")$"}
+	if modfile := os.Getenv("OPENMESSAGE_CONTRACT_MODFILE"); modfile != "" {
+		// Lets a mutation check point the contract at a modified fork copy.
+		// Run the outer test with -count=1: Go's test cache does not see
+		// edits to that copy and would replay a stale pass.
+		args = append(args, "-modfile="+modfile)
+	}
+	args = append(args, gmessagesModule+"/pkg/libgm")
+	cmd := exec.Command("go", args...)
+	cmd.Env = envWithGOWorkOff()
+	output, runErr := cmd.CombinedOutput()
+	if runErr != nil {
+		t.Fatalf("the pinned gmessages fork fails its response-acceptance tests: %v\n%s", runErr, output)
+	}
+	for _, name := range gmessagesAcceptanceTests {
+		if !strings.Contains(string(output), "--- PASS: "+name+" ") {
+			t.Errorf("the pinned gmessages fork did not run and pass %s; a rebase may have dropped the payload-less response patch\n%s", name, output)
+		}
+	}
 }

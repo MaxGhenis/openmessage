@@ -187,6 +187,7 @@ type App struct {
 	googleLifecycleMu         sync.RWMutex
 	googleLifecycleNotifier   GoogleLifecycleNotifier
 	googleRepairPaceMu        sync.RWMutex
+	googlePull                googlePullHealth
 	googleRepairPaceCount     func() uint64
 	signalLifecycleMu         sync.RWMutex
 	signalLifecycleNotifier   SignalLifecycleNotifier
@@ -215,6 +216,11 @@ type GoogleStatusSnapshot struct {
 	// heal cycle; a climbing count means cookies are being revoked within
 	// minutes, which the pacing floor is throttling rather than hiding.
 	RepairsPaced uint64 `json:"repairs_paced,omitempty"`
+	// PullHealth reports recent catch-up pulls (conversation listings and
+	// targeted lookups). Its empty_with_local_history flag is set when pulls
+	// return no data while the store holds this account's conversations, the
+	// state push-only health checks can't see. Absent before the first pull.
+	PullHealth *GooglePullHealthSnapshot `json:"pull_health,omitempty"`
 }
 
 // googleRepairThreshold is how many consecutive failed Google sends (with no
@@ -247,6 +253,9 @@ func (a *App) RecordGoogleSendOutcomeWithPhone(success bool, phoneResponding boo
 // returns a SendMessageResponse status. Only auth/dead-session failures mark
 // the session for re-pair; transient network errors should remain recoverable.
 func (a *App) RecordGoogleSendError(err error) {
+	// An account-switch answer (IsGoogleAccountSwitchError) is deliberately not
+	// counted here: needs_repair parks the transport, and in that state push
+	// is the only delivery still working. pull_health.account_switch reports it.
 	if isGoogleAuthInvalid(err) {
 		a.markGoogleNeedsRepairAndPark(err)
 	}
@@ -769,6 +778,7 @@ func (a *App) GoogleStatus() GoogleStatusSnapshot {
 		AuthExpired:     a.googleAuthExpired.Load(),
 		PhoneResponding: a.GooglePhoneResponding(),
 		RepairsPaced:    a.GoogleRepairsPaced(),
+		PullHealth:      a.GooglePullHealth(),
 	}
 }
 
