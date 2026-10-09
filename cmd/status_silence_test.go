@@ -432,6 +432,7 @@ func TestRunStatusJudgesLocallyWhenTheAppCannotSpeakForThisStore(t *testing.T) {
 		{"app predates silence checks", fakeDaemon(t, `{"v2_primary":true,"auth":{"data_dir":`+jsonString(dataDir)+`},"freshness":{"newest_ms":1,"google":{"behind_days":0,"stale":false}}}`), "the running app doesn't report silence"},
 		{"app predates auth.data_dir", fakeDaemon(t, `{"freshness":{"google":{"silence":`+freshBlock+`}}}`), "the running app doesn't report its data dir"},
 		{"app measures another source", fakeDaemon(t, daemonStatusWithGoogleSilence(dataDir, `{"source":"messages","silent_ms":1,"stalled":false}`)), "the running app measures stored incoming messages, not the v2 inbox"},
+		{"app sends a non-object freshness", fakeDaemon(t, `{"auth":{"data_dir":`+jsonString(dataDir)+`},"freshness":[]}`), "the running app's freshness block was unreadable"},
 		{"app answers garbage", fakeDaemon(t, `not json`), "the running app's /api/status was unreadable"},
 	}
 	for _, c := range cases {
