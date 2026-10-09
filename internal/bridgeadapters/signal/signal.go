@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -513,6 +514,17 @@ func (a *Adapter) Start(
 		if sink == nil {
 			return
 		}
+		// A panic below the sink loses the frame like any failed append.
+		// Left alone, signallive recovers it and only logs.
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				a.recordIngressFailure(sink, req.AccountID, fmt.Errorf(
+					"panic in Signal ingest tee: %v\n%s",
+					recovered,
+					debug.Stack(),
+				))
+			}
+		}()
 		record, ephemeral, err := ingest.BuildSignalIngress(
 			req.AccountID,
 			req.Generation,
@@ -523,18 +535,18 @@ func (a *Adapter) Start(
 			time.Now(),
 		)
 		if err != nil {
-			a.recordIngressFailure(err)
+			a.recordIngressFailure(sink, req.AccountID, err)
 			return
 		}
 		if ephemeral != nil {
 			if err := sink.EmitEphemeral(context.Background(), *ephemeral); err != nil {
-				a.recordIngressFailure(err)
+				a.recordIngressFailure(sink, req.AccountID, err)
 			}
 			return
 		}
 		if record != nil {
 			if err := sink.AppendIngress(context.Background(), *record); err != nil {
-				a.recordIngressFailure(err)
+				a.recordIngressFailure(sink, req.AccountID, err)
 			}
 		}
 	})
@@ -578,11 +590,18 @@ func (a *Adapter) Start(
 	return r, nil
 }
 
-func (a *Adapter) recordIngressFailure(err error) {
+// recordIngressFailure counts a frame this generation captured but could not
+// hand to its sink, both locally and in the sink's shared ingest counters
+// (v2_ingest append_errors), and logs it through the poller. Stale-generation
+// rejections are the fence retiring an old connection, not faults.
+func (a *Adapter) recordIngressFailure(sink bridge.ConnectionSink, accountID string, err error) {
 	if a == nil || err == nil || errors.Is(err, bridge.ErrStaleGeneration) {
 		return
 	}
 	a.ingressFailures.Add(1)
+	if recorder, ok := sink.(bridge.IngressErrorRecorder); ok {
+		recorder.RecordIngressError(accountID)
+	}
 	if reporter, ok := a.poller.(interface{ ReportIngressError(error) }); ok {
 		reporter.ReportIngressError(err)
 	}

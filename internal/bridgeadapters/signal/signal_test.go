@@ -965,8 +965,9 @@ func TestAdapterIngressFailureDoesNotTerminateGeneration(t *testing.T) {
 	adapter := &Adapter{accountID: "signal-primary", poller: poller}
 	wantErr := errors.New("durable sink unavailable")
 	sink := &recordingSink{
-		ingress:   make(chan bridge.RawIngressRecord, 1),
-		appendErr: wantErr,
+		ingress:       make(chan bridge.RawIngressRecord, 1),
+		ingressErrors: make(chan string, 1),
+		appendErr:     wantErr,
 	}
 
 	run, err := adapter.Start(context.Background(), bridge.StartRequest{
@@ -981,6 +982,9 @@ func TestAdapterIngressFailureDoesNotTerminateGeneration(t *testing.T) {
 	if got := adapter.ingressFailures.Load(); got != 1 {
 		t.Fatalf("ingress failure count = %d, want 1", got)
 	}
+	if got := receiveValue(t, sink.ingressErrors, "sink ingress error count"); got != "signal-primary" {
+		t.Fatalf("RecordIngressError account = %q, want signal-primary", got)
+	}
 	poller.mu.Lock()
 	reported := append([]error(nil), poller.ingressErrors...)
 	poller.mu.Unlock()
@@ -990,6 +994,47 @@ func TestAdapterIngressFailureDoesNotTerminateGeneration(t *testing.T) {
 	select {
 	case terminal := <-run.Done():
 		t.Fatalf("ingress failure terminated generation: %v", terminal)
+	default:
+	}
+}
+
+// signallive recovers a panicking observer and only logs it, so the adapter
+// has to recover first for the lost frame to be counted.
+func TestAdapterIngressPanicIsCountedAndDoesNotTerminateGeneration(t *testing.T) {
+	poller := newFakePoller()
+	poller.startAccount = "+15551230000"
+	poller.startLine = []byte(`{"account":"+15551230000","envelope":{"source":"+15551234567","timestamp":1700000000123,"dataMessage":{"timestamp":1700000000123,"message":"sink panics"}}}`)
+	adapter := &Adapter{accountID: "signal-primary", poller: poller}
+	sink := &recordingSink{
+		ingress:       make(chan bridge.RawIngressRecord, 1),
+		ingressErrors: make(chan string, 1),
+		appendPanic:   "inbox panic",
+	}
+
+	run, err := adapter.Start(context.Background(), bridge.StartRequest{
+		AccountID:  "signal-primary",
+		Generation: 32,
+	}, sink)
+	if err != nil {
+		t.Fatalf("Start(): %v", err)
+	}
+	t.Cleanup(func() { stopAdapterRun(t, run) })
+	receiveValue(t, sink.ingress, "panicking durable append")
+	if got := adapter.ingressFailures.Load(); got != 1 {
+		t.Fatalf("ingress failure count = %d, want 1", got)
+	}
+	if got := receiveValue(t, sink.ingressErrors, "sink ingress error count"); got != "signal-primary" {
+		t.Fatalf("RecordIngressError account = %q, want signal-primary", got)
+	}
+	poller.mu.Lock()
+	reported := append([]error(nil), poller.ingressErrors...)
+	poller.mu.Unlock()
+	if len(reported) != 1 || !strings.Contains(reported[0].Error(), "panic in Signal ingest tee: inbox panic") {
+		t.Fatalf("reported ingress errors = %v, want the recovered tee panic", reported)
+	}
+	select {
+	case terminal := <-run.Done():
+		t.Fatalf("ingress panic terminated generation: %v", terminal)
 	default:
 	}
 }
@@ -1020,7 +1065,10 @@ func TestStaleSignalIngressCallbackIsBenignAtGenerationFence(t *testing.T) {
 	poller := newFakePoller()
 	adapter := &Adapter{accountID: "signal-primary", poller: poller}
 	clock := newManualClock(signalAdapterTestEpoch)
-	downstream := &recordingSink{ingress: make(chan bridge.RawIngressRecord, 2)}
+	downstream := &recordingSink{
+		ingress:       make(chan bridge.RawIngressRecord, 2),
+		ingressErrors: make(chan string, 2),
+	}
 	supervisor, err := bridge.NewSupervisor(
 		"signal-primary",
 		bridge.PlatformSignal,
@@ -1072,8 +1120,69 @@ func TestStaleSignalIngressCallbackIsBenignAtGenerationFence(t *testing.T) {
 	if got := adapter.ingressFailures.Load(); got != 0 {
 		t.Fatalf("benign stale callback counted as ingress failure: %d", got)
 	}
+	select {
+	case account := <-downstream.ingressErrors:
+		t.Fatalf("benign stale callback reported to the sink as an ingest fault for %q", account)
+	default:
+	}
 	if snapshot := supervisor.Snapshot(); snapshot.State != bridge.StateOnline || snapshot.Generation != 2 {
 		t.Fatalf("snapshot after stale callback = %+v, want online generation 2", snapshot)
+	}
+}
+
+// Before the supervisor's per-generation sink forwarded RecordIngressError,
+// and before this adapter reported to it at all, a Signal append fault was
+// only logged: /api/status append_errors never moved.
+func TestSignalIngressFailureReachesSinkThroughSupervisor(t *testing.T) {
+	poller := newFakePoller()
+	adapter := &Adapter{accountID: "signal-primary", poller: poller}
+	clock := newManualClock(signalAdapterTestEpoch)
+	downstream := &recordingSink{
+		ingress:       make(chan bridge.RawIngressRecord, 1),
+		ingressErrors: make(chan string, 1),
+		appendErr:     errors.New("durable sink unavailable"),
+	}
+	supervisor, err := bridge.NewSupervisor(
+		"signal-primary",
+		bridge.PlatformSignal,
+		adapter,
+		signalSupervisorTestPolicy(),
+		clock,
+		midpointRandom{},
+		bridge.WithConnectionSink(downstream),
+	)
+	if err != nil {
+		t.Fatalf("NewSupervisor(): %v", err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), signalAdapterTestTimeout)
+		defer cancel()
+		if err := supervisor.Stop(ctx); err != nil {
+			t.Errorf("Supervisor.Stop(): %v", err)
+		}
+	})
+
+	startSupervisor(t, supervisor)
+	readyNextGeneration(t, supervisor, poller, 1)
+	poller.mu.Lock()
+	observer := poller.ingress
+	poller.mu.Unlock()
+	observer(
+		"+15551230000",
+		[]byte(`{"account":"+15551230000","envelope":{"source":"+15551234567","timestamp":1700000000123,"dataMessage":{"timestamp":1700000000123,"message":"append fails"}}}`),
+		"",
+		"",
+	)
+
+	receiveValue(t, downstream.ingress, "durable append through the supervisor")
+	if got := receiveValue(t, downstream.ingressErrors, "sink ingress error count"); got != "signal-primary" {
+		t.Fatalf("RecordIngressError account = %q, want signal-primary", got)
+	}
+	if got := adapter.ingressFailures.Load(); got != 1 {
+		t.Fatalf("ingress failure count = %d, want 1", got)
+	}
+	if snapshot := supervisor.Snapshot(); snapshot.State != bridge.StateOnline || snapshot.Generation != 1 {
+		t.Fatalf("snapshot after append fault = %+v, want online generation 1", snapshot)
 	}
 }
 
@@ -1888,16 +1997,27 @@ type recordedBeat struct {
 }
 
 type recordingSink struct {
-	beats        chan recordedBeat
-	ingress      chan bridge.RawIngressRecord
-	ephemeral    chan bridge.EphemeralEvent
-	appendErr    error
-	ephemeralErr error
+	beats         chan recordedBeat
+	ingress       chan bridge.RawIngressRecord
+	ephemeral     chan bridge.EphemeralEvent
+	ingressErrors chan string
+	appendErr     error
+	appendPanic   any
+	ephemeralErr  error
+}
+
+func (s *recordingSink) RecordIngressError(accountID string) {
+	if s.ingressErrors != nil {
+		s.ingressErrors <- accountID
+	}
 }
 
 func (s *recordingSink) AppendIngress(_ context.Context, record bridge.RawIngressRecord) error {
 	if s.ingress != nil {
 		s.ingress <- record
+	}
+	if s.appendPanic != nil {
+		panic(s.appendPanic)
 	}
 	return s.appendErr
 }

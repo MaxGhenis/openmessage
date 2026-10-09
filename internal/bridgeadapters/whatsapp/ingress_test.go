@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -155,6 +156,7 @@ func TestIngressAppendErrorsDoNotRetireGeneration(t *testing.T) {
 	tests := []struct {
 		name             string
 		appendErr        error
+		appendPanic      any
 		wantErrorRecords int
 		wantLogs         int
 	}{
@@ -165,6 +167,12 @@ func TestIngressAppendErrorsDoNotRetireGeneration(t *testing.T) {
 		{
 			name:             "other append error is counted and logged",
 			appendErr:        nonStale,
+			wantErrorRecords: 1,
+			wantLogs:         1,
+		},
+		{
+			name:             "append panic is counted and logged",
+			appendPanic:      "inbox panic",
 			wantErrorRecords: 1,
 			wantLogs:         1,
 		},
@@ -179,6 +187,11 @@ func TestIngressAppendErrorsDoNotRetireGeneration(t *testing.T) {
 			logs := &ingressLogCapture{}
 			a.logIngressError = logs.Record
 			sink := &ingressRecordingSink{appendErr: test.appendErr}
+			if test.appendPanic != nil {
+				sink.append = func(context.Context, bridge.RawIngressRecord) error {
+					panic(test.appendPanic)
+				}
+			}
 
 			lifecycleRun, err := a.Start(context.Background(), bridge.StartRequest{
 				AccountID:  "whatsapp-primary",
@@ -214,11 +227,50 @@ func TestIngressAppendErrorsDoNotRetireGeneration(t *testing.T) {
 			}
 			if test.wantLogs == 1 {
 				got := gotLogs[0]
-				if !errors.Is(got.err, nonStale) || got.accountID != "whatsapp-primary" || got.generation != 23 {
-					t.Fatalf("LogIngressError call = %+v, want error/account/generation %v/%q/%d", got, nonStale, "whatsapp-primary", 23)
+				wantErr := errors.Is(got.err, nonStale)
+				if test.appendPanic != nil {
+					wantErr = strings.Contains(got.err.Error(), "panic in WhatsApp ingest tee: inbox panic")
+				}
+				if !wantErr || got.accountID != "whatsapp-primary" || got.generation != 23 {
+					t.Fatalf("LogIngressError call = %+v, want the fault for account/generation %q/%d", got, "whatsapp-primary", 23)
 				}
 			}
 		})
+	}
+}
+
+// In the daemon the adapter's sink is the supervisor's per-generation
+// wrapper. A failed append must still reach the configured sink's count.
+func TestIngressAppendFaultReachesSinkThroughSupervisor(t *testing.T) {
+	client := newFakeLifecycleClient()
+	observer := newIngressObserverHarness()
+	clock := newManualClock(whatsappAdapterTestEpoch)
+	a := newTestAdapter(t, client, clock.Now)
+	a.observeIngress = observer.Observe
+	logs := &ingressLogCapture{}
+	a.logIngressError = logs.Record
+	downstream := &ingressRecordingSink{appendErr: errors.New("durable ingress unavailable")}
+	supervisor := newTestSupervisor(t, a, clock, bridge.WithConnectionSink(downstream))
+
+	startSupervisor(t, supervisor)
+	awaitCondition(t, "ingress observer registration", observer.Registered)
+	if !observer.Emit(whatsapplive.IngressFrame{
+		DedupeKey:  "frame",
+		ReceivedAt: whatsappAdapterTestEpoch,
+		Payload:    []byte(`{"kind":"message"}`),
+	}) {
+		t.Fatal("ingress observer was not installed")
+	}
+
+	records, _, errorRecords := downstream.Snapshot()
+	if len(records) != 1 {
+		t.Fatalf("AppendIngress call count = %d, want 1", len(records))
+	}
+	if len(errorRecords) != 1 || errorRecords[0] != "whatsapp-primary" {
+		t.Fatalf("RecordIngressError calls = %q, want [whatsapp-primary]", errorRecords)
+	}
+	if gotLogs := logs.Snapshot(); len(gotLogs) != 1 {
+		t.Fatalf("LogIngressError calls = %+v, want 1", gotLogs)
 	}
 }
 

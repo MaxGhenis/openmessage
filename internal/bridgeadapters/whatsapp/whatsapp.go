@@ -754,10 +754,6 @@ func (r *run) admitCallback() bool {
 	return true
 }
 
-type ingressErrorRecorder interface {
-	RecordIngressError(accountID string)
-}
-
 func (r *run) handleIngress(frame whatsapplive.IngressFrame) {
 	if !r.admitCallback() {
 		return
@@ -766,6 +762,17 @@ func (r *run) handleIngress(frame whatsapplive.IngressFrame) {
 	if r.sink == nil {
 		return
 	}
+	// A panic below the sink loses the frame like any failed append. Left
+	// alone, whatsapplive recovers it and only logs.
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			r.recordIngressError(fmt.Errorf(
+				"panic in WhatsApp ingest tee: %v\n%s",
+				recovered,
+				debug.Stack(),
+			))
+		}
+	}()
 
 	err := r.sink.AppendIngress(context.Background(), bridge.RawIngressRecord{
 		AccountID:    r.request.AccountID,
@@ -779,7 +786,11 @@ func (r *run) handleIngress(frame whatsapplive.IngressFrame) {
 	if err == nil || errors.Is(err, bridge.ErrStaleGeneration) {
 		return
 	}
-	if recorder, ok := r.sink.(ingressErrorRecorder); ok {
+	r.recordIngressError(err)
+}
+
+func (r *run) recordIngressError(err error) {
+	if recorder, ok := r.sink.(bridge.IngressErrorRecorder); ok {
 		recorder.RecordIngressError(r.request.AccountID)
 	}
 	if r.adapter.logIngressError != nil {

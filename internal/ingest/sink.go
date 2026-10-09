@@ -45,6 +45,8 @@ func (s *Sink) RecordIngressError(accountID string) {
 	s.counters.account(accountID).appendErrors.Add(1)
 }
 
+var _ bridge.IngressErrorRecorder = (*Sink)(nil)
+
 // NewSink constructs a storage-backed ConnectionSink.
 func NewSink(config SinkConfig) (*Sink, error) {
 	if config.Messages == nil {

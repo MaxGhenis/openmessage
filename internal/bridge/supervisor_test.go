@@ -811,6 +811,147 @@ func TestSupervisorStopJoinsCurrentGeneration(t *testing.T) {
 	}
 }
 
+// Adapters only ever hold the supervisor's per-generation sink, so their
+// IngressErrorRecorder assertion succeeds only if that wrapper forwards the
+// method. Before it did, every adapter-reported ingest fault was dropped here
+// and /api/status append_errors stayed 0 in the running daemon.
+func TestGenerationSinkForwardsIngressErrorsToConfiguredSink(t *testing.T) {
+	clock := newSupervisorManualClock(supervisorTestEpoch)
+	runOne := newSupervisorTestRun()
+	runTwo := newSupervisorTestRun()
+	lifecycle := &supervisorTestLifecycle{scripts: []supervisorStartScript{
+		{run: runOne},
+		{run: runTwo},
+	}}
+	random := &supervisorScriptedRandom{values: []int64{int64(time.Second)}}
+	downstream := &supervisorIngressErrorSink{}
+	policy := supervisorTestPolicy()
+	supervisor := newTestSupervisor(
+		t,
+		lifecycle,
+		policy,
+		clock,
+		random,
+		WithConnectionSink(downstream),
+	)
+
+	if err := supervisorStart(t, supervisor, StartRequest{DeviceID: "device-1"}); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	firstSink := awaitSupervisorStartCount(t, lifecycle, 1)[0].sink
+	recorder, ok := firstSink.(IngressErrorRecorder)
+	if !ok {
+		t.Fatalf("generation sink %T does not implement IngressErrorRecorder", firstSink)
+	}
+	// The wrapper serves one account, so the count lands there whatever the
+	// adapter passes.
+	recorder.RecordIngressError("some-other-account")
+	if got := downstream.IngressErrors(); len(got) != 1 || got[0] != "account-1" {
+		t.Fatalf("downstream RecordIngressError calls = %q, want [account-1]", got)
+	}
+
+	// A fault the adapter hit while generation one was current, but reported
+	// after the supervisor retired it, is still a lost frame: counting is not
+	// fenced the way AppendIngress is.
+	clock.Advance(policy.ConnectTimeout)
+	backoff := awaitSupervisorSnapshot(t, supervisor, "generation one backoff", func(snapshot Snapshot) bool {
+		return snapshot.Generation == 1 && snapshot.State == StateBackoff
+	})
+	clock.Advance(backoff.RetryAt.Sub(clock.Now()))
+	awaitSupervisorStartCount(t, lifecycle, 2)
+	recorder.RecordIngressError("account-1")
+	if got := downstream.IngressErrors(); len(got) != 2 || got[1] != "account-1" {
+		t.Fatalf("downstream RecordIngressError calls after turnover = %q, want [account-1 account-1]", got)
+	}
+	if ingress, ephemeral := downstream.Counts(); ingress != 0 || ephemeral != 0 {
+		t.Fatalf("RecordIngressError forwarded frames: ingress=%d ephemeral=%d", ingress, ephemeral)
+	}
+}
+
+// A lost frame is not evidence that the connection is alive, so reporting one
+// must not refresh the liveness the supervisor derives from real frames.
+func TestGenerationSinkIngressErrorRecordsNoActivity(t *testing.T) {
+	clock := newSupervisorManualClock(supervisorTestEpoch)
+	run := newSupervisorTestRun()
+	lifecycle := &supervisorTestLifecycle{scripts: []supervisorStartScript{{run: run}}}
+	supervisor := newTestSupervisor(
+		t,
+		lifecycle,
+		supervisorTestPolicy(),
+		clock,
+		&supervisorScriptedRandom{},
+		WithConnectionSink(&supervisorIngressErrorSink{}),
+	)
+	if err := supervisorStart(t, supervisor, StartRequest{DeviceID: "device-1"}); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	sink := awaitSupervisorStartCount(t, lifecycle, 1)[0].sink
+	run.MarkReady()
+	online := awaitSupervisorSnapshot(t, supervisor, "generation one online", func(snapshot Snapshot) bool {
+		return snapshot.State == StateOnline
+	})
+
+	clock.Advance(time.Second)
+	sink.(IngressErrorRecorder).RecordIngressError("account-1")
+	supervisorSync(t, supervisor)
+	got := supervisor.Snapshot()
+	if !got.LastEventAt.Equal(online.LastEventAt) || !got.LivenessDeadline.Equal(online.LivenessDeadline) {
+		t.Fatalf("RecordIngressError refreshed liveness:\n got  %+v\n want %+v", got, online)
+	}
+
+	// Control: a real frame at the same instant does move it.
+	ctx, cancel := supervisorTestContext(t)
+	defer cancel()
+	if err := sink.AppendIngress(ctx, RawIngressRecord{
+		AccountID:  "account-1",
+		Generation: 1,
+		DedupeKey:  "frame",
+	}); err != nil {
+		t.Fatalf("AppendIngress() error = %v", err)
+	}
+	awaitSupervisorSnapshot(t, supervisor, "liveness after a real frame", func(snapshot Snapshot) bool {
+		return snapshot.LastEventAt.After(online.LastEventAt)
+	})
+}
+
+func TestGenerationSinkIngressErrorWithoutRecordingSinkIsNoop(t *testing.T) {
+	tests := []struct {
+		name    string
+		options []SupervisorOption
+	}{
+		{name: "no connection sink"},
+		{
+			name:    "sink without RecordIngressError",
+			options: []SupervisorOption{WithConnectionSink(&supervisorRecordingSink{})},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			clock := newSupervisorManualClock(supervisorTestEpoch)
+			lifecycle := &supervisorTestLifecycle{scripts: []supervisorStartScript{
+				{run: newSupervisorTestRun()},
+			}}
+			supervisor := newTestSupervisor(
+				t,
+				lifecycle,
+				supervisorTestPolicy(),
+				clock,
+				&supervisorScriptedRandom{},
+				test.options...,
+			)
+			if err := supervisorStart(t, supervisor, StartRequest{DeviceID: "device-1"}); err != nil {
+				t.Fatalf("Start() error = %v", err)
+			}
+			sink := awaitSupervisorStartCount(t, lifecycle, 1)[0].sink
+			recorder, ok := sink.(IngressErrorRecorder)
+			if !ok {
+				t.Fatalf("generation sink %T does not implement IngressErrorRecorder", sink)
+			}
+			recorder.RecordIngressError("account-1")
+		})
+	}
+}
+
 func supervisorTestPolicy() Policy {
 	return Policy{
 		ConnectTimeout:     20 * time.Second,
@@ -1259,6 +1400,24 @@ func (s *supervisorRecordingSink) Counts() (int, int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return len(s.ingress), len(s.ephemeral)
+}
+
+type supervisorIngressErrorSink struct {
+	supervisorRecordingSink
+	errorsMu      sync.Mutex
+	ingressErrors []string
+}
+
+func (s *supervisorIngressErrorSink) RecordIngressError(accountID string) {
+	s.errorsMu.Lock()
+	s.ingressErrors = append(s.ingressErrors, accountID)
+	s.errorsMu.Unlock()
+}
+
+func (s *supervisorIngressErrorSink) IngressErrors() []string {
+	s.errorsMu.Lock()
+	defer s.errorsMu.Unlock()
+	return append([]string(nil), s.ingressErrors...)
 }
 
 type supervisorRepairCall struct {

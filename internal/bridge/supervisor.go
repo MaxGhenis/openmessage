@@ -1504,6 +1504,21 @@ func (s *generationSink) Beat(generation Generation, aliveAt time.Time, _ string
 	})
 }
 
+// RecordIngressError forwards an adapter's ingest-fault count to the
+// configured sink when that sink counts them (ingest.Sink feeds
+// v2_ingest.per_account.<account>.append_errors in /api/status). Adapters
+// only ever hold this wrapper, so without it their IngressErrorRecorder
+// assertion fails and every fault goes uncounted. The count goes under this
+// supervisor's own account whatever the adapter passes: the wrapper serves one
+// account, as AppendIngress enforces. It is deliberately not fenced: the
+// frame was already lost, and the loss stays true even if this generation
+// retired before the adapter reported it.
+func (s *generationSink) RecordIngressError(string) {
+	if recorder, ok := s.supervisor.sink.(IngressErrorRecorder); ok {
+		recorder.RecordIngressError(s.supervisor.accountID)
+	}
+}
+
 func (s *generationSink) forward(
 	ctx context.Context,
 	forward func(ConnectionSink) error,
@@ -1737,4 +1752,5 @@ func callPair(
 }
 
 var _ ConnectionSink = (*generationSink)(nil)
+var _ IngressErrorRecorder = (*generationSink)(nil)
 var _ PairSink = (*pairingSink)(nil)

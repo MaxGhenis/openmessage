@@ -1378,3 +1378,25 @@ It sends nothing. Add `whatsapp` or `signal` to the comma-separated
 `LIVE_PLATFORMS` list only when that platform will receive a real frame within
 the test deadline; use `LIVE_GOOGLE_CONV`, `LIVE_WHATSAPP_CONV`, or
 `LIVE_SIGNAL_CONV` to override the expected self-thread remote ID.
+
+`append_errors` counts failed attempts to hand a live frame to v2 ingest. It
+should stay `0`; a nonzero count means frames reached the transport but not
+the v2 inbox. Each counted fault is also logged at warn. What counts, by
+adapter:
+
+- **Google:** an encode error, a failed durable append (such as a SQLite
+  error), or a panic in the ingest tee.
+- **WhatsApp:** a failed durable append or a panic in the tee. Encode and
+  capture faults happen earlier, inside `whatsapplive`, which logs them at
+  warn ("Failed to capture WhatsApp ingress frame") and does not count them.
+- **Signal:** a frame that cannot be classified or encoded, a failed durable
+  append, or a panic in the tee. A replayed line that fails again counts
+  again.
+
+Rejections by the generation fence (`bridge.ErrStaleGeneration`) are not
+counted. When the supervisor retires a generation it closes that generation's
+fence, and events that run is still delivering are rejected. That is the fence
+working, not an ingest fault. In builds that predate
+MaxGhenis/openmessage#195 this counter reads `0` in the running daemon
+whatever happens: the supervisor's per-generation sink did not forward the
+count, and Signal never reported one.

@@ -556,7 +556,10 @@ func (r *run) teeIngress(evt any, receivedAt time.Time) {
 	default:
 		return
 	}
-	if err == nil {
+	// A stale-generation rejection is the supervisor fencing off a retiring
+	// connection whose events were still in flight, not an ingest fault.
+	// WhatsApp and Signal skip it the same way.
+	if err == nil || errors.Is(err, bridge.ErrStaleGeneration) {
 		return
 	}
 	r.recordIngressError(evt, err)
@@ -564,7 +567,7 @@ func (r *run) teeIngress(evt any, receivedAt time.Time) {
 
 func (r *run) recordIngressError(evt any, err error) {
 	r.adapter.ingressErrors.Add(1)
-	if recorder, ok := r.sink.(interface{ RecordIngressError(string) }); ok && recorder != nil {
+	if recorder, ok := r.sink.(bridge.IngressErrorRecorder); ok {
 		recorder.RecordIngressError(r.request.AccountID)
 	}
 	r.adapter.host.Logger.Warn().

@@ -8,9 +8,11 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"sync"
 	"testing"
+	"testing/quick"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -479,72 +481,7 @@ func TestIngressTeeMessageFramesUseContentHash(t *testing.T) {
 
 func TestIngressTeeThroughRealSinkDedupesExactFrames(t *testing.T) {
 	host := newTestApp(t)
-	storePath := filepath.Join(t.TempDir(), "v2.sqlite3")
-	store, err := sqlite.Open(storePath)
-	if err != nil {
-		t.Fatalf("sqlite.Open(): %v", err)
-	}
-	t.Cleanup(func() { _ = store.Close() })
-	now := time.Now
-	nowMS := now().UnixMilli()
-	if err := store.UpsertAccount(sqlite.Account{
-		AccountID:   "google-primary",
-		BridgeKey:   "google_messages",
-		DisplayName: "Google Messages",
-		Mode:        sqlite.AccountModeLive,
-		Enabled:     true,
-		ConfigJSON:  "{}",
-		CreatedAtMS: nowMS,
-		UpdatedAtMS: nowMS,
-	}); err != nil {
-		t.Fatalf("UpsertAccount(): %v", err)
-	}
-	messages, err := sqlite.NewMessageRepository(store, now)
-	if err != nil {
-		t.Fatalf("NewMessageRepository(): %v", err)
-	}
-	reactions, err := sqlite.NewReactionRepository(store, now)
-	if err != nil {
-		t.Fatalf("NewReactionRepository(): %v", err)
-	}
-	counters := &ingest.Counters{}
-	worker, err := ingest.NewWorker(ingest.WorkerConfig{
-		Store:     store,
-		Messages:  messages,
-		Reactions: reactions,
-		Counters:  counters,
-		Logger:    zerolog.Nop(),
-		Decoders: []ingest.DecoderRegistration{{
-			Codec:    ingest.GoogleCodec,
-			Platform: bridge.PlatformGoogle,
-			Decoder:  ingest.NewGoogleDecoder(counters),
-		}},
-	})
-	if err != nil {
-		t.Fatalf("NewWorker(): %v", err)
-	}
-	sink, err := ingest.NewSink(ingest.SinkConfig{
-		Messages: messages,
-		Worker:   worker,
-		Counters: counters,
-	})
-	if err != nil {
-		t.Fatalf("NewSink(): %v", err)
-	}
-	workerCtx, cancelWorker := context.WithCancel(context.Background())
-	workerDone := make(chan error, 1)
-	go func() { workerDone <- worker.Run(workerCtx) }()
-	t.Cleanup(func() {
-		cancelWorker()
-		select {
-		case runErr := <-workerDone:
-			if runErr != nil {
-				t.Errorf("Worker.Run(): %v", runErr)
-			}
-		case <-time.After(time.Second):
-			t.Error("Worker.Run() did not stop")
-		}
-	})
+	sink, counters, storePath := newRealIngestSink(t)
 
 	fake := &fakeTransport{}
 	a := newTestAdapter(t, host, fake)
@@ -723,6 +660,9 @@ func TestIngressTeeAppendErrorDoesNotInterruptLegacyHandler(t *testing.T) {
 	if got := a.IngressErrorCount(); got != 1 {
 		t.Fatalf("recorded ingress errors = %d, want 1", got)
 	}
+	if got := sink.ingressErrorAccounts(); len(got) != 1 || got[0] != "google-primary" {
+		t.Fatalf("sink RecordIngressError calls = %q, want [google-primary]", got)
+	}
 	if records := sink.ingressRecords(); len(records) != 1 {
 		t.Fatalf("AppendIngress calls = %d, want 1", len(records))
 	}
@@ -757,12 +697,310 @@ func TestIngressTeeAppendPanicDoesNotInterruptLegacyHandler(t *testing.T) {
 	if got := a.IngressErrorCount(); got != 1 {
 		t.Fatalf("recorded ingress errors = %d, want 1", got)
 	}
+	if got := sink.ingressErrorAccounts(); len(got) != 1 || got[0] != "google-primary" {
+		t.Fatalf("sink RecordIngressError calls = %q, want [google-primary]", got)
+	}
 	select {
 	case terminal := <-run.Done():
 		t.Fatalf("tee panic ended the generation: %v", terminal)
 	default:
 	}
 }
+
+// A retiring generation's fence closes while its run can still be delivering
+// events it already admitted; those are rejected with ErrStaleGeneration.
+// That is the fence working, not an ingest fault, so it must not count.
+func TestIngressTeeStaleGenerationIsNotAnIngressError(t *testing.T) {
+	host := newTestApp(t)
+	legacyHandled := 0
+	host.OnConversationsChange = func() { legacyHandled++ }
+	fake := &fakeTransport{}
+	a := newTestAdapter(t, host, fake)
+	sink := &recordingSink{
+		appendErr:    bridge.ErrStaleGeneration,
+		ephemeralErr: bridge.ErrStaleGeneration,
+	}
+	run, err := a.Start(context.Background(), bridge.StartRequest{
+		AccountID:  "google-primary",
+		Generation: 14,
+	}, sink)
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	t.Cleanup(func() { stopRun(t, run) })
+
+	fake.emit(&gmproto.Conversation{ConversationID: "retiring-generation", Name: "Legacy"})
+	fake.emit(&gmproto.TypingData{
+		ConversationID: "retiring-generation",
+		User:           &gmproto.User{Number: "+15551234567"},
+		Type:           gmproto.TypingTypes_STARTED_TYPING,
+	})
+
+	if legacyHandled != 1 {
+		t.Fatalf("legacy conversation callbacks = %d, want 1", legacyHandled)
+	}
+	if records, ephemeral := sink.ingressRecords(), sink.ephemeralEvents(); len(records) != 1 || len(ephemeral) != 1 {
+		t.Fatalf("tee calls = %d durable, %d ephemeral; want 1 each", len(records), len(ephemeral))
+	}
+	if got := a.IngressErrorCount(); got != 0 {
+		t.Fatalf("stale-generation rejections counted as ingress errors: %d", got)
+	}
+	if got := sink.ingressErrorAccounts(); len(got) != 0 {
+		t.Fatalf("stale-generation rejections reported to the sink: %q", got)
+	}
+}
+
+// For any sequence of tee outcomes, the adapter's own count and its reports
+// to the sink both equal the number of real faults: clean appends and
+// stale-generation rejections (bare or wrapped) never count.
+func TestIngressTeeErrorClassificationProperty(t *testing.T) {
+	host := newTestApp(t)
+	fake := &fakeTransport{}
+	a := newTestAdapter(t, host, fake)
+	sink := &outcomeSink{}
+	run, err := a.Start(context.Background(), bridge.StartRequest{
+		AccountID:  "google-primary",
+		Generation: 15,
+	}, sink)
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	t.Cleanup(func() { stopRun(t, run) })
+
+	outcomes := []error{
+		nil,
+		bridge.ErrStaleGeneration,
+		fmt.Errorf("generation 15 retired: %w", bridge.ErrStaleGeneration),
+		errors.New("inbox unavailable"),
+	}
+	property := func(steps []uint8) bool {
+		countBefore, reportsBefore := a.IngressErrorCount(), sink.reportCount()
+		faults := 0
+		for i, step := range steps {
+			outcome := outcomes[int(step)%len(outcomes)]
+			if outcome != nil && !errors.Is(outcome, bridge.ErrStaleGeneration) {
+				faults++
+			}
+			sink.setOutcome(outcome)
+			if step/uint8(len(outcomes))%2 == 0 {
+				fake.emit(&gmproto.Conversation{ConversationID: fmt.Sprintf("property-%d", i)})
+			} else {
+				fake.emit(&gmproto.TypingData{
+					ConversationID: fmt.Sprintf("property-%d", i),
+					User:           &gmproto.User{Number: "+15551234567"},
+					Type:           gmproto.TypingTypes_STARTED_TYPING,
+				})
+			}
+		}
+		return a.IngressErrorCount()-countBefore == uint64(faults) &&
+			sink.reportCount()-reportsBefore == faults
+	}
+	if err := quick.Check(property, &quick.Config{MaxCount: 200}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestIngressAppendFaultReachesRealSinkThroughSupervisor runs the production
+// chain: a real bridge.Supervisor starts the Google adapter with its
+// per-generation sink in front of a real ingest.Sink. A durable append that
+// fails in SQLite must land in that sink's append_errors counter; a frame the
+// retired generation tees after the fence closed must not.
+func TestIngressAppendFaultReachesRealSinkThroughSupervisor(t *testing.T) {
+	host := newTestApp(t)
+	legacyHandled := 0
+	host.OnConversationsChange = func() { legacyHandled++ }
+	sink, counters, storePath := newRealIngestSink(t)
+	fake := &fakeTransport{}
+	a := newTestAdapter(t, host, fake)
+	supervisor, err := bridge.NewSupervisor(
+		"google-primary",
+		bridge.PlatformGoogle,
+		a,
+		bridge.Policy{
+			ConnectTimeout:     time.Hour,
+			ProbeEvery:         time.Hour,
+			ProbeTimeout:       time.Minute,
+			LivenessTimeout:    2 * time.Hour,
+			MinBackoff:         time.Second,
+			MaxBackoff:         time.Minute,
+			MaxSameFingerprint: 5,
+		},
+		wallClock{},
+		midpointRandom{},
+		bridge.WithConnectionSink(sink),
+	)
+	if err != nil {
+		t.Fatalf("NewSupervisor() error = %v", err)
+	}
+	stopSupervisor := func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := supervisor.Stop(ctx); err != nil {
+			t.Errorf("Supervisor.Stop() error = %v", err)
+		}
+	}
+	t.Cleanup(stopSupervisor)
+	startCtx, cancelStart := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelStart()
+	if err := supervisor.Start(startCtx, bridge.StartRequest{}); err != nil {
+		t.Fatalf("Supervisor.Start() error = %v", err)
+	}
+	current := awaitCurrentRun(t, a)
+
+	conversation := func(id string) *gmproto.Conversation {
+		return &gmproto.Conversation{ConversationID: id, Name: id}
+	}
+	fake.emit(conversation("delivered"))
+	if got := counters.Snapshot("google-primary"); got.Appended != 1 || got.AppendErrors != 0 {
+		t.Fatalf("counters after a clean append = %+v, want appended=1 append_errors=0", got)
+	}
+
+	failInboxAppends(t, storePath)
+	fake.emit(conversation("lost"))
+	if got := counters.Snapshot("google-primary"); got.Appended != 1 || got.AppendErrors != 1 {
+		t.Fatalf("counters after a failed append = %+v, want appended=1 append_errors=1", got)
+	}
+	if got := a.IngressErrorCount(); got != 1 {
+		t.Fatalf("adapter ingress errors = %d, want 1", got)
+	}
+	if legacyHandled != 2 {
+		t.Fatalf("legacy conversation callbacks = %d, want 2", legacyHandled)
+	}
+
+	stopSupervisor()
+	current.teeIngress(conversation("after-retirement"), time.Now())
+	if got := counters.Snapshot("google-primary"); got.Appended != 1 || got.AppendErrors != 1 {
+		t.Fatalf("counters after a retired-generation tee = %+v, want unchanged appended=1 append_errors=1", got)
+	}
+	if got := a.IngressErrorCount(); got != 1 {
+		t.Fatalf("adapter ingress errors after a retired-generation tee = %d, want 1", got)
+	}
+}
+
+// newRealIngestSink builds the production ingest.Sink over a fresh v2 store
+// with the Google decoder registered and its worker running.
+func newRealIngestSink(t *testing.T) (*ingest.Sink, *ingest.Counters, string) {
+	t.Helper()
+	storePath := filepath.Join(t.TempDir(), "v2.sqlite3")
+	store, err := sqlite.Open(storePath)
+	if err != nil {
+		t.Fatalf("sqlite.Open(): %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	now := time.Now
+	nowMS := now().UnixMilli()
+	if err := store.UpsertAccount(sqlite.Account{
+		AccountID:   "google-primary",
+		BridgeKey:   "google_messages",
+		DisplayName: "Google Messages",
+		Mode:        sqlite.AccountModeLive,
+		Enabled:     true,
+		ConfigJSON:  "{}",
+		CreatedAtMS: nowMS,
+		UpdatedAtMS: nowMS,
+	}); err != nil {
+		t.Fatalf("UpsertAccount(): %v", err)
+	}
+	messages, err := sqlite.NewMessageRepository(store, now)
+	if err != nil {
+		t.Fatalf("NewMessageRepository(): %v", err)
+	}
+	reactions, err := sqlite.NewReactionRepository(store, now)
+	if err != nil {
+		t.Fatalf("NewReactionRepository(): %v", err)
+	}
+	counters := &ingest.Counters{}
+	worker, err := ingest.NewWorker(ingest.WorkerConfig{
+		Store:     store,
+		Messages:  messages,
+		Reactions: reactions,
+		Counters:  counters,
+		Logger:    zerolog.Nop(),
+		Decoders: []ingest.DecoderRegistration{{
+			Codec:    ingest.GoogleCodec,
+			Platform: bridge.PlatformGoogle,
+			Decoder:  ingest.NewGoogleDecoder(counters),
+		}},
+	})
+	if err != nil {
+		t.Fatalf("NewWorker(): %v", err)
+	}
+	sink, err := ingest.NewSink(ingest.SinkConfig{
+		Messages: messages,
+		Worker:   worker,
+		Counters: counters,
+	})
+	if err != nil {
+		t.Fatalf("NewSink(): %v", err)
+	}
+	workerCtx, cancelWorker := context.WithCancel(context.Background())
+	workerDone := make(chan error, 1)
+	go func() { workerDone <- worker.Run(workerCtx) }()
+	t.Cleanup(func() {
+		cancelWorker()
+		select {
+		case runErr := <-workerDone:
+			if runErr != nil {
+				t.Errorf("Worker.Run(): %v", runErr)
+			}
+		case <-time.After(time.Second):
+			t.Error("Worker.Run() did not stop")
+		}
+	})
+	return sink, counters, storePath
+}
+
+// failInboxAppends makes every later inbox insert fail inside SQLite, the way
+// a full disk or a corrupt page would, without touching any other table. The
+// busy timeout lets the DDL wait out the ingest worker's projection write.
+func failInboxAppends(t *testing.T, storePath string) {
+	t.Helper()
+	conn, err := sql.Open("sqlite", "file:"+storePath+"?_pragma=busy_timeout(5000)")
+	if err != nil {
+		t.Fatalf("open v2 store for fault injection: %v", err)
+	}
+	defer conn.Close()
+	if _, err := conn.Exec(`
+		CREATE TRIGGER reject_inbox_append BEFORE INSERT ON inbox
+		BEGIN SELECT RAISE(ABORT, 'simulated inbox write fault'); END
+	`); err != nil {
+		t.Fatalf("install inbox fault trigger: %v", err)
+	}
+}
+
+func awaitCurrentRun(t *testing.T, a *Adapter) *run {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		a.mu.Lock()
+		current := a.current
+		a.mu.Unlock()
+		if current != nil {
+			return current
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("supervisor never started a Google generation")
+	return nil
+}
+
+type wallClock struct{}
+
+func (wallClock) Now() time.Time { return time.Now() }
+
+func (wallClock) NewTimer(delay time.Duration) bridge.Timer {
+	return wallTimer{timer: time.NewTimer(delay)}
+}
+
+type wallTimer struct{ timer *time.Timer }
+
+func (t wallTimer) C() <-chan time.Time { return t.timer.C }
+
+func (t wallTimer) Stop() bool { return t.timer.Stop() }
+
+type midpointRandom struct{}
+
+func (midpointRandom) Int63n(bound int64) int64 { return bound / 2 }
 
 func newTestApp(t *testing.T) *app.App {
 	t.Helper()
@@ -891,14 +1129,67 @@ func (f *fakeTransport) probeCount() int {
 	return count
 }
 
+// outcomeSink returns one scripted result for every tee call and counts
+// RecordIngressError reports.
+type outcomeSink struct {
+	mu      sync.Mutex
+	outcome error
+	reports int
+}
+
+func (s *outcomeSink) setOutcome(err error) {
+	s.mu.Lock()
+	s.outcome = err
+	s.mu.Unlock()
+}
+
+func (s *outcomeSink) AppendIngress(context.Context, bridge.RawIngressRecord) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.outcome
+}
+
+func (s *outcomeSink) EmitEphemeral(context.Context, bridge.EphemeralEvent) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.outcome
+}
+
+func (*outcomeSink) Beat(bridge.Generation, time.Time, string) {}
+
+func (s *outcomeSink) RecordIngressError(string) {
+	s.mu.Lock()
+	s.reports++
+	s.mu.Unlock()
+}
+
+func (s *outcomeSink) reportCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.reports
+}
+
 type recordingSink struct {
-	mu           sync.Mutex
-	beats        int
-	records      []bridge.RawIngressRecord
-	ephemeral    []bridge.EphemeralEvent
-	appendErr    error
-	appendPanic  any
-	ephemeralErr error
+	mu            sync.Mutex
+	beats         int
+	records       []bridge.RawIngressRecord
+	ephemeral     []bridge.EphemeralEvent
+	ingressErrors []string
+	appendErr     error
+	appendPanic   any
+	ephemeralErr  error
+}
+
+func (s *recordingSink) RecordIngressError(accountID string) {
+	s.mu.Lock()
+	s.ingressErrors = append(s.ingressErrors, accountID)
+	s.mu.Unlock()
+}
+
+func (s *recordingSink) ingressErrorAccounts() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.ingressErrors...)
 }
 
 func (s *recordingSink) AppendIngress(_ context.Context, record bridge.RawIngressRecord) error {
