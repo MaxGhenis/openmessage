@@ -34,6 +34,7 @@ import (
 	"github.com/maxghenis/openmessage/internal/localapi"
 	"github.com/maxghenis/openmessage/internal/notify"
 	"github.com/maxghenis/openmessage/internal/readsource"
+	"github.com/maxghenis/openmessage/internal/silencerecovery"
 	"github.com/maxghenis/openmessage/internal/storage/sqlite"
 	"github.com/maxghenis/openmessage/internal/telemetry"
 	"github.com/maxghenis/openmessage/internal/tools"
@@ -703,6 +704,23 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 	if !isDemo {
 		freshnessActivity = freshnessActivitySource(stack, a.Store, v2Primary)
 	}
+	// When a flagged Google silence ends, re-fetch the window it skipped
+	// (internal/silencerecovery). Only the transport-owning daemon fetches.
+	var googleSilenceRecovery *silencerecovery.Recoverer
+	silenceRecoveryOff := ""
+	switch {
+	case isDemo:
+		silenceRecoveryOff = "demo mode"
+	case !transports:
+		silenceRecoveryOff = "transports disabled"
+	default:
+		googleSilenceRecovery, silenceRecoveryOff = newGoogleSilenceRecovery(a, freshnessActivity, v2Primary, logger)
+	}
+	if googleSilenceRecovery != nil {
+		recoveryCtx, stopRecovery := context.WithCancel(context.Background())
+		defer stopRecovery()
+		googleSilenceRecovery.Start(recoveryCtx)
+	}
 
 	httpEnabled := opts.web || opts.mcpSSE
 	if httpEnabled {
@@ -717,6 +735,7 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 				V2:                    v2Options,
 				V2IngestCounters:      v2IngestCounters,
 				Activity:              freshnessActivity,
+				SilenceRecovery:       silenceRecoveryStatus(googleSilenceRecovery, silenceRecoveryOff),
 				Reads:                 reads,
 				V2Primary:             v2Primary,
 				Client:                a.GetClient,

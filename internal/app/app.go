@@ -51,6 +51,13 @@ type BackfillSnapshot struct {
 	// running.
 	HistoryTeed      int `json:"history_teed"`
 	HistoryTeeFailed int `json:"history_tee_failed"`
+	// Trigger names what started the current or last run: "deep" for a deep
+	// backfill (POST /api/backfill, or the supervisor's after pairing),
+	// "window" for POST /api/backfill {"since": ...}, and "silence_recovery"
+	// for the automatic window backfill after a flagged silence ends. SinceMS
+	// is a window run's start (Unix ms); deep runs leave it zero.
+	Trigger string `json:"trigger,omitempty"`
+	SinceMS int64  `json:"since_ms,omitempty"`
 }
 
 // BackfillProgress tracks the current state of a deep backfill operation.
@@ -73,6 +80,16 @@ func (p *BackfillProgress) reset() {
 	p.ErrorDetails = nil
 	p.HistoryTeed = 0
 	p.HistoryTeeFailed = 0
+	p.Trigger = ""
+	p.SinceMS = 0
+}
+
+// setRun records what started the run and, for a window run, its start.
+func (p *BackfillProgress) setRun(trigger string, sinceMS int64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.Trigger = trigger
+	p.SinceMS = sinceMS
 }
 
 // setPhase updates the current phase.
@@ -98,6 +115,13 @@ func (p *BackfillProgress) addError(detail string) {
 	if detail != "" && len(p.ErrorDetails) < maxErrorDetails {
 		p.ErrorDetails = append(p.ErrorDetails, detail)
 	}
+}
+
+// errorCount returns the current error count.
+func (p *BackfillProgress) errorCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.Errors
 }
 
 // addHistory counts hand-offs of fetched history to v2 ingest.
