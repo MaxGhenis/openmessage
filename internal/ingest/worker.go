@@ -211,7 +211,7 @@ func (w *Worker) Run(ctx context.Context) error {
 			// is absent from Unprocessed once processed, so re-decode the stable
 			// dedupe-equivalent frame to exercise stale-replay classification.
 			if item.replay {
-				w.handleRecord(ctx, item.inboxID, item.record)
+				w.handleRecord(ctx, item.inboxID, item.record, true)
 			}
 			w.drain(ctx)
 		}
@@ -262,7 +262,7 @@ func (w *Worker) drain(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
-		if w.handleRecord(ctx, record.InboxID, rawIngressRecord(record)) {
+		if w.handleRecord(ctx, record.InboxID, rawIngressRecord(record), false) {
 			changed = true
 		}
 	}
@@ -283,15 +283,21 @@ func rawIngressRecord(record sqlite.InboxRecord) bridge.RawIngressRecord {
 	}
 }
 
+// handleRecord applies one frame. replay is true for a deduplicated
+// re-delivery, whose bytes arrived just now and are not the ones stored under
+// inboxID. A replay therefore never marks the stored row applied or
+// quarantined: its success does not vouch that the stored frame was fully
+// applied, and its failure does not condemn a frame that projected.
 func (w *Worker) handleRecord(
 	ctx context.Context,
 	inboxID string,
 	record bridge.RawIngressRecord,
+	replay bool,
 ) (changed bool) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			changed = false
-			w.markQuarantined(ctx, inboxID, record, fmt.Errorf(
+			w.markQuarantined(ctx, inboxID, record, replay, fmt.Errorf(
 				"ingest frame panic: %v\n%s",
 				recovered,
 				debug.Stack(),
@@ -306,6 +312,9 @@ func (w *Worker) handleRecord(
 		changed, err = w.processRecordAttempt(ctx, inboxID, record, progress)
 		return err
 	})
+	if err == nil && !replay {
+		w.markApplied(ctx, inboxID, record)
+	}
 	if err == nil || ctx.Err() != nil {
 		return changed
 	}
@@ -326,7 +335,7 @@ func (w *Worker) handleRecord(
 
 	var deterministic quarantineError
 	if errors.As(err, &deterministic) {
-		w.markQuarantined(ctx, inboxID, record, deterministic.cause)
+		w.markQuarantined(ctx, inboxID, record, replay, deterministic.cause)
 		return partialChanged
 	}
 
@@ -341,29 +350,59 @@ func (w *Worker) handleRecord(
 		return partialChanged
 	}
 
-	w.markQuarantined(ctx, inboxID, record, err)
+	w.markQuarantined(ctx, inboxID, record, replay, err)
 	return partialChanged
+}
+
+// markApplied records that every event of the frame landed. Until the mark
+// commits, retention keeps the payload: a frame is processed as soon as its
+// first message projects, so a crash or failure after that point leaves the
+// rest of its events only there. A failed mark is not a failed frame; it only
+// means the payload is kept.
+func (w *Worker) markApplied(
+	ctx context.Context,
+	inboxID string,
+	record bridge.RawIngressRecord,
+) {
+	err := retryTransient(ctx, func() error {
+		return w.messages.MarkInboxApplied(ctx, inboxID, record.AccountID)
+	})
+	if err != nil && ctx.Err() == nil {
+		w.logger.Warn().
+			Err(err).
+			Str("account_id", record.AccountID).
+			Str("inbox_id", inboxID).
+			Str("codec", record.Codec).
+			Msg("Failed to mark ingest frame applied; retention will keep its payload")
+	}
 }
 
 func (w *Worker) markQuarantined(
 	ctx context.Context,
 	inboxID string,
 	record bridge.RawIngressRecord,
+	replay bool,
 	cause error,
 ) {
-	err := retryTransient(ctx, func() error {
-		return w.messages.MarkInboxProcessed(ctx, inboxID, record.AccountID)
-	})
-	if err != nil {
-		if ctx.Err() == nil {
-			w.logger.Warn().
-				Err(err).
-				Str("account_id", record.AccountID).
-				Str("inbox_id", inboxID).
-				Str("codec", record.Codec).
-				Msg("Failed to mark quarantined ingest frame processed")
+	if !replay {
+		// The durable mark keeps the frame's payload out of retention pruning:
+		// whatever in it failed to project survives only there. A failed replay
+		// is only counted and logged: the row holds the original delivery, not
+		// the bytes that failed.
+		err := retryTransient(ctx, func() error {
+			return w.messages.MarkInboxQuarantined(ctx, inboxID, record.AccountID)
+		})
+		if err != nil {
+			if ctx.Err() == nil {
+				w.logger.Warn().
+					Err(err).
+					Str("account_id", record.AccountID).
+					Str("inbox_id", inboxID).
+					Str("codec", record.Codec).
+					Msg("Failed to mark ingest frame quarantined")
+			}
+			return
 		}
-		return
 	}
 	w.counters.account(record.AccountID).quarantined.Add(1)
 	w.logger.Warn().

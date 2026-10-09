@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -47,6 +48,7 @@ type v2Stack struct {
 
 	outbox *sqlite.OutboxRepository
 	worker *ingest.Worker
+	pruner *ingest.PayloadPruner
 	logger zerolog.Logger
 
 	registerMu sync.Mutex
@@ -111,6 +113,63 @@ func resolveV2RuntimeMode(isDemo bool, dataDir string) (v2RuntimeMode, error) {
 	mode.Send = true
 	mode.Ingest = true
 	return mode, nil
+}
+
+// inboxRetentionEnv overrides how many days processed v2 inbox frames keep
+// their payloads. 0 disables pruning; values below the floor are raised to
+// it, and values above maxInboxRetentionDays are lowered to it.
+const inboxRetentionEnv = "OPENMESSAGES_V2_INBOX_RETENTION_DAYS"
+
+// maxInboxRetentionDays caps the override. Larger day counts would overflow
+// time.Duration (about 292 years) and come back as a short or negative
+// retention; a century already means "keep".
+const maxInboxRetentionDays = 36500
+
+// inboxRetentionHoldFile, inside <data dir>/v2, pauses pruning while it
+// exists. It is the lever that reaches the macOS app, whose backend runs with
+// a fixed environment.
+const inboxRetentionHoldFile = "inbox-retention-hold"
+
+// inboxPayloadRetention resolves the payload retention the daemon prunes
+// with. A zero retention means pruning is off. note explains any departure
+// from the configured value and is empty when the value was used as given.
+func inboxPayloadRetention() (retention time.Duration, note string) {
+	raw := strings.TrimSpace(os.Getenv(inboxRetentionEnv))
+	if raw == "" {
+		return sqlite.DefaultInboxPayloadRetention, ""
+	}
+	days, err := strconv.Atoi(raw)
+	if err != nil || days < 0 {
+		return sqlite.DefaultInboxPayloadRetention, fmt.Sprintf(
+			"%s=%q is not a whole number of days; using the %d-day default",
+			inboxRetentionEnv,
+			raw,
+			int(sqlite.DefaultInboxPayloadRetention/(24*time.Hour)),
+		)
+	}
+	if days == 0 {
+		return 0, ""
+	}
+	floorDays := int(sqlite.MinInboxPayloadRetention / (24 * time.Hour))
+	if days < floorDays {
+		return sqlite.MinInboxPayloadRetention, fmt.Sprintf(
+			"%s=%d is below the %d-day floor; using %d days",
+			inboxRetentionEnv,
+			days,
+			floorDays,
+			floorDays,
+		)
+	}
+	if days > maxInboxRetentionDays {
+		return maxInboxRetentionDays * 24 * time.Hour, fmt.Sprintf(
+			"%s=%d is above the %d-day cap; using %d days",
+			inboxRetentionEnv,
+			days,
+			maxInboxRetentionDays,
+			maxInboxRetentionDays,
+		)
+	}
+	return time.Duration(days) * 24 * time.Hour, ""
 }
 
 func v2FlagExplicitlyDisabled(name string) bool {
@@ -321,6 +380,24 @@ func newV2Stack(deps v2StackDeps) (_ *v2Stack, resultErr error) {
 	if err != nil {
 		return nil, fmt.Errorf("configure v2 stack: create media service: %w", err)
 	}
+	retention, note := inboxPayloadRetention()
+	if note != "" {
+		deps.Logger.Warn().Msg(note)
+	}
+	if retention == 0 {
+		deps.Logger.Info().Msgf("V2 inbox payload pruning disabled (%s=0)", inboxRetentionEnv)
+	} else {
+		pruner, err := ingest.NewPayloadPruner(ingest.PayloadPrunerConfig{
+			Messages:  messages,
+			Logger:    deps.Logger,
+			Retention: retention,
+			HoldPath:  filepath.Join(v2Dir, inboxRetentionHoldFile),
+		})
+		if err != nil {
+			return nil, fmt.Errorf("configure v2 stack: create inbox payload pruner: %w", err)
+		}
+		stack.pruner = pruner
+	}
 
 	closeStore = false
 	stack.Service = service
@@ -346,6 +423,9 @@ func (s *v2Stack) Start(
 		runnerCount++
 	}
 	if v2Primary {
+		runnerCount++
+	}
+	if s.pruner != nil {
 		runnerCount++
 	}
 	runWG.Add(runnerCount)
@@ -374,6 +454,14 @@ func (s *v2Stack) Start(
 			s.logger.Error().Err(err).Msg("V2 message dispatcher stopped")
 		}
 	}()
+	if s.pruner != nil {
+		go func() {
+			defer runWG.Done()
+			if err := s.pruner.Run(runCtx); err != nil && !errors.Is(err, context.Canceled) {
+				s.logger.Error().Err(err).Msg("V2 inbox payload pruner stopped")
+			}
+		}()
+	}
 	if !v2Primary {
 		projector := &v2wire.Projector{
 			V2Store: s.Store,
