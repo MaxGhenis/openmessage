@@ -57,8 +57,10 @@ type v1DeliveryResponse struct {
 	RemoteMessageID string                `json:"remote_message_id,omitempty"`
 	ErrorClass      string                `json:"error_class,omitempty"`
 	ErrorCode       string                `json:"error_code,omitempty"`
-	// ErrorDetail carries the last failure's full description (including the
-	// adapter fingerprint) so a caller can say why a send is not going out.
+	// ErrorDetail is the dispatcher's description of the last failure, so a
+	// caller can say why a send is not going out. It names the adapter
+	// fingerprint (as "[fingerprint] ...") only when the dispatcher recorded
+	// one: the outbox keeps the error text, and OpError.Error() omits it.
 	ErrorDetail    string `json:"error_detail,omitempty"`
 	AttemptCount   int64  `json:"attempt_count,omitempty"`
 	NextAttemptMS  *int64 `json:"next_attempt_at_ms,omitempty"`

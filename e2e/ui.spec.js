@@ -1072,10 +1072,15 @@ test('maps durable outbox states to honest tray labels and actions', async ({ pa
         error_class: 'retry_exhausted',
         error_detail: 'retry budget exhausted after 6 attempts; last failure transient [google_conversation_not_found]: send_text: transient: no conversation',
       }, now),
+      // The stored detail: the dispatcher's "[fingerprint] " prefix, then
+      // "operation: class: cause", where the Google adapter's cause also
+      // starts with the fingerprint.
       accountSwitched: view({
         state: 'rejected',
         error_class: 'reauth_required',
-        error_detail: 'send_text: reauth_required: [google_account_pairing_switched] the phone switched to Google-account pairing (x@gmail.com)',
+        error_detail: '[google_account_pairing_switched] send_text: reauth_required: [google_account_pairing_switched] '
+          + 'Your phone switched Google Messages to Google-account pairing (x@gmail.com) and refuses requests from this '
+          + 'QR-paired session, so nothing was sent.',
       }, now),
       reauth: view({ state: 'rejected', error_class: 'reauth_required', error_detail: 'send_text: reauth_required: session invalid' }, now),
     };
@@ -1113,6 +1118,38 @@ test('maps durable outbox states to honest tray labels and actions', async ({ pa
   expect(views.exhausted.reason).toContain('retry budget exhausted after 6 attempts');
   expect(views.accountSwitched.guidance).toContain('Google-account pairing');
   expect(views.reauth.guidance).toContain('re-linked');
+});
+
+test('counts not-sent outbox rows apart from pending sends in the button labels', async ({ page }) => {
+  await page.waitForFunction(() => window.__openMessageTestHooks?.outboxButtonLabels);
+  const labels = await page.evaluate(() => {
+    const now = 1_700_000_000_000;
+    const labelsFor = window.__openMessageTestHooks.outboxButtonLabels;
+    const queued = { state: 'queued', scheduled_for_ms: now };
+    const notSent = { state: 'rejected', error_class: 'retry_exhausted', retry_exhausted: true, attempt_count: 6 };
+    return {
+      empty: labelsFor([], false, now),
+      emptyOpen: labelsFor([], true, now),
+      onePending: labelsFor([queued], false, now),
+      twoPending: labelsFor([queued, queued], false, now),
+      onlyNotSent: labelsFor([notSent], false, now),
+      mixed: labelsFor([queued, queued, notSent], false, now),
+      mixedOpen: labelsFor([queued, queued, notSent], true, now),
+    };
+  });
+
+  expect(labels.empty).toEqual({ title: 'Open outbox', ariaLabel: 'Outbox, no pending sends', badge: '0' });
+  expect(labels.emptyOpen).toMatchObject({ title: 'Close outbox', ariaLabel: 'Close outbox, 0 pending sends' });
+  expect(labels.onePending).toEqual({ title: 'Open outbox (1 pending)', ariaLabel: 'Outbox, 1 pending send', badge: '1' });
+  expect(labels.twoPending).toMatchObject({ title: 'Open outbox (2 pending)', ariaLabel: 'Outbox, 2 pending sends' });
+  // A send that will never go out on its own is not "pending".
+  expect(labels.onlyNotSent).toEqual({ title: 'Open outbox (1 not sent)', ariaLabel: 'Outbox, 1 not sent', badge: '1' });
+  expect(labels.mixed).toEqual({
+    title: 'Open outbox (2 pending, 1 not sent)',
+    ariaLabel: 'Outbox, 2 pending sends, 1 not sent',
+    badge: '3',
+  });
+  expect(labels.mixedOpen).toMatchObject({ title: 'Close outbox', ariaLabel: 'Close outbox, 2 pending sends, 1 not sent' });
 });
 
 test('the outbox tray keeps a not-sent row visible and sends it again as a new message', async ({ page }) => {
@@ -1184,6 +1221,66 @@ test('the outbox tray keeps a not-sent row visible and sends it again as a new m
   await expect.poll(() => sendAgainBodies.length).toBe(1);
   expect(String(sendAgainBodies[0].idempotency_key || '')).not.toBe('');
   await expect(page.locator('#outbox-tray-status')).toHaveText('New send queued.');
+  await expect(page.locator('#outbox-tray-content .outbox-group[data-group="notsent"]')).toHaveCount(0);
+});
+
+test('a repeat Send again on a stale not-sent row reuses its key instead of sending twice', async ({ page }) => {
+  const notSentRow = {
+    outbox_id: 'e2e-stale-not-sent',
+    account_id: 'google-primary',
+    conversation_id: 'conv1',
+    kind: 'text',
+    state: 'rejected',
+    scheduled_for_ms: Date.now() - 600_000,
+    attempt_count: 1,
+    created_at_ms: Date.now() - 600_000,
+    summary: 'Stale not-sent outbound',
+    error_class: 'reauth_required',
+    error_code: 'send_text',
+    error_detail: '[google_account_pairing_switched] send_text: reauth_required: the phone refused this session',
+    retry_exhausted: false,
+  };
+  let rows = [notSentRow];
+  let failListing = false;
+  const sendAgainBodies = [];
+
+  await page.route(/\/api\/v1\/outbox(\?.*)?$/, route => (failListing
+    ? route.fulfill({ status: 500, contentType: 'application/json', body: JSON.stringify({ error: 'outbox unavailable' }) })
+    : route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(rows) })));
+  await page.route('**/api/v1/outbox/e2e-stale-not-sent/send-again', route => {
+    sendAgainBodies.push(route.request().postDataJSON());
+    const repeat = sendAgainBodies.length > 1;
+    if (repeat) {
+      // The server stops listing a row once a newer send names it.
+      rows = [];
+      failListing = false;
+    } else {
+      // The refresh after the first send fails, leaving the tray stale.
+      failListing = true;
+    }
+    return route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ outbox_id: 'e2e-successor', local_message_id: 'e2e-successor-message', state: 'queued', deduplicated: repeat }),
+    });
+  });
+
+  await expect(page.locator('#outbox-toggle-btn')).toBeVisible();
+  await page.locator('#outbox-toggle-btn').click();
+  const staleRow = page.locator('#outbox-tray-content .outbox-row[data-outbox-id="e2e-stale-not-sent"]');
+  await expect(staleRow).toContainText('Not sent');
+
+  await staleRow.locator('.outbox-row-action[data-action="send-again"]').click();
+  await expect.poll(() => sendAgainBodies.length).toBe(1);
+  // The failed refresh left the row (and its Send again button) on screen.
+  await expect(staleRow.locator('.outbox-row-action[data-action="send-again"]')).toBeEnabled();
+
+  await staleRow.locator('.outbox-row-action[data-action="send-again"]').click();
+  await expect.poll(() => sendAgainBodies.length).toBe(2);
+  const firstKey = String(sendAgainBodies[0].idempotency_key || '');
+  expect(firstKey).not.toBe('');
+  expect(sendAgainBodies[1].idempotency_key).toBe(firstKey);
+  await expect(page.locator('#outbox-tray-status')).toHaveText('Already sent again; no new send was created.');
   await expect(page.locator('#outbox-tray-content .outbox-group[data-group="notsent"]')).toHaveCount(0);
 });
 

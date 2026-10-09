@@ -26,7 +26,18 @@ import (
 
 const (
 	exhaustedDetail = "retry budget exhausted after 6 attempts; last failure transient [google_conversation_not_found]: send_text: transient: get Google conversation: transport returned no conversation"
-	switchedDetail  = "send_text: reauth_required: [google_account_pairing_switched] the phone switched Google Messages to Google-account pairing (x@gmail.com)"
+
+	// switchedAdapterCause is the Google adapter's account-switch refusal
+	// text (accountPairingSwitchedError), which starts with the fingerprint.
+	switchedAdapterCause = "[google_account_pairing_switched] Your phone switched Google Messages to Google-account pairing (x@gmail.com) and refuses requests from this QR-paired session, so nothing was sent. Re-link OpenMessage with Google-account pairing, or turn Google-account pairing off on the phone and pair again by QR."
+	// switchedDetail is the error_detail the outbox stores for that refusal:
+	// the dispatcher's "[fingerprint] " prefix (OpError.Error() omits the
+	// fingerprint), then "operation: class: cause".
+	switchedDetail = "[google_account_pairing_switched] send_text: reauth_required: " + switchedAdapterCause
+	// switchedPrefixOnlyDetail and switchedCauseOnlyDetail each carry the
+	// fingerprint in one place only; either is enough to name the switch.
+	switchedPrefixOnlyDetail = "[google_account_pairing_switched] send_text: reauth_required: the phone refused this session"
+	switchedCauseOnlyDetail  = "send_text: reauth_required: " + switchedAdapterCause
 )
 
 var allOutboxStates = []messaging.OutboxState{
@@ -70,24 +81,25 @@ func TestV2DeliveryTextRetryExhaustedSaysNotSent(t *testing.T) {
 }
 
 func TestV2DeliveryTextAccountPairingSwitchedNamesTheRelink(t *testing.T) {
-	text := v2DeliveryText(messaging.Delivery{
-		OutboxID:    "outbox-switched",
-		State:       messaging.OutboxRejected,
-		ErrorClass:  "reauth_required",
-		ErrorDetail: switchedDetail,
-	})
-	for _, fragment := range []string{
-		"NOT SENT",
-		"switched Google Messages to Google-account pairing",
-		"Nothing was sent and it will not be retried",
-		"re-link OpenMessage with Google-account pairing",
-		"switch the phone back to QR pairing",
-		"do not re-pair",
-		switchedDetail,
-		"outbox-switched",
-	} {
-		if !strings.Contains(text, fragment) {
-			t.Fatalf("account-switch text missing %q: %q", fragment, text)
+	for _, detail := range []string{switchedDetail, switchedPrefixOnlyDetail, switchedCauseOnlyDetail} {
+		text := v2DeliveryText(messaging.Delivery{
+			OutboxID:    "outbox-switched",
+			State:       messaging.OutboxRejected,
+			ErrorClass:  "reauth_required",
+			ErrorDetail: detail,
+		})
+		for _, fragment := range []string{
+			"NOT SENT: the phone switched Google Messages to Google-account pairing",
+			"Nothing was sent and it will not be retried",
+			"re-link OpenMessage with Google-account pairing",
+			"switch the phone back to QR pairing",
+			"do not re-pair",
+			detail,
+			"outbox-switched",
+		} {
+			if !strings.Contains(text, fragment) {
+				t.Fatalf("detail %q: account-switch text missing %q: %q", detail, fragment, text)
+			}
 		}
 	}
 }
@@ -130,7 +142,10 @@ func TestV2DeliveryTextShowsTheLastFailure(t *testing.T) {
 // switch or reauth_required. In particular an uncertain or retrying send is
 // never described as not sent, whatever its class or detail.
 func TestV2DeliveryTextNotSentOnlyForRejected(t *testing.T) {
-	details := []string{"", exhaustedDetail, switchedDetail, "send_text: transient: timeout"}
+	details := []string{
+		"", exhaustedDetail, switchedDetail, switchedPrefixOnlyDetail, switchedCauseOnlyDetail,
+		"send_text: transient: timeout",
+	}
 	classes := []string{"", "retry_exhausted", "reauth_required", "transient", "misconfigured", "upgrade_required"}
 	for _, state := range allOutboxStates {
 		for _, class := range classes {
@@ -171,13 +186,12 @@ func TestV2DeliveryTextNotSentOnlyForRejected(t *testing.T) {
 	}
 }
 
-// TestV2DeliveryTextReauthWithoutFingerprintStillNamesTheRelink covers the
-// account switch when the stored detail does not carry the fingerprint (a
-// terminal failure's detail is its error text, which need not include it):
-// the agent still reads NOT SENT, the re-link, and that re-pairing is the
-// user's call.
+// TestV2DeliveryTextReauthWithoutFingerprintStillNamesTheRelink covers a
+// reauth_required refusal whose detail does not name the account switch (for
+// example a WhatsApp session that was logged out): the agent still reads NOT
+// SENT, the re-link, and that re-pairing is the user's call.
 func TestV2DeliveryTextReauthWithoutFingerprintStillNamesTheRelink(t *testing.T) {
-	const detail = "send_text: reauth_required: the phone answers this QR-paired session without data"
+	const detail = "[whatsapp_session_invalid] send_text: reauth_required: the store doesn't contain a device JID"
 	text := v2DeliveryText(messaging.Delivery{
 		OutboxID:    "outbox-reauth",
 		State:       messaging.OutboxRejected,

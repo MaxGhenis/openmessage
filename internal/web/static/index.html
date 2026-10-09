@@ -12100,24 +12100,49 @@ body::after {
     </section>`;
   }
 
-  function renderOutboxTray() {
-    const rows = visibleOutboxRows();
-    if ($outboxToggleBtn) {
-      const expanded = $outboxToggleBtn.getAttribute('aria-expanded') === 'true';
-      $outboxToggleBtn.title = expanded
+  // The outbox button's tooltip, accessible name and badge for the visible
+  // rows. A "Not sent" row will never go out on its own, so it is counted on
+  // its own rather than as a pending send; the badge counts every row that
+  // needs attention.
+  function outboxButtonLabels(rows, expanded, now = Date.now()) {
+    const list = Array.isArray(rows) ? rows : [];
+    const notSent = list.filter(row => outboxRowView(row, now).group === 'notsent').length;
+    const pending = list.length - notSent;
+    const counts = sends => {
+      const parts = [];
+      if (pending > 0 || notSent === 0) {
+        parts.push(sends ? `${pending} pending send${pending === 1 ? '' : 's'}` : `${pending} pending`);
+      }
+      if (notSent > 0) parts.push(`${notSent} not sent`);
+      return parts.join(', ');
+    };
+    return {
+      title: expanded
         ? 'Close outbox'
-        : (rows.length ? `Open outbox (${rows.length} pending)` : 'Open outbox');
-      $outboxToggleBtn.setAttribute(
-        'aria-label',
-        expanded
-          ? `Close outbox, ${rows.length} pending sends`
-          : (rows.length ? `Outbox, ${rows.length} pending sends` : 'Outbox, no pending sends')
-      );
+        : (list.length ? `Open outbox (${counts(false)})` : 'Open outbox'),
+      ariaLabel: expanded
+        ? `Close outbox, ${counts(true)}`
+        : (list.length ? `Outbox, ${counts(true)}` : 'Outbox, no pending sends'),
+      badge: list.length > 99 ? '99+' : String(list.length),
+    };
+  }
+
+  function syncOutboxToggleLabels(rows = visibleOutboxRows()) {
+    const expanded = !!($outboxToggleBtn && $outboxToggleBtn.getAttribute('aria-expanded') === 'true');
+    const labels = outboxButtonLabels(rows, expanded);
+    if ($outboxToggleBtn) {
+      $outboxToggleBtn.title = labels.title;
+      $outboxToggleBtn.setAttribute('aria-label', labels.ariaLabel);
     }
     if ($outboxCount) {
-      $outboxCount.textContent = rows.length > 99 ? '99+' : String(rows.length);
+      $outboxCount.textContent = labels.badge;
       $outboxCount.hidden = rows.length === 0;
     }
+  }
+
+  function renderOutboxTray() {
+    const rows = visibleOutboxRows();
+    syncOutboxToggleLabels(rows);
     if (!$outboxTrayContent) return;
 
     const now = Date.now();
@@ -12153,6 +12178,7 @@ body::after {
       outboxRows = Array.isArray(response) ? response : [];
       setOutboxStatus('');
       renderOutboxTray();
+      pruneSendAgainKeys();
       return outboxRows;
     } catch (err) {
       if (requestID !== outboxRequestID || state.v2Primary !== true) return [];
@@ -12160,6 +12186,21 @@ body::after {
       renderOutboxTray();
       return outboxRows;
     }
+  }
+
+  // A Send again key lives as long as a fresh outbox read still offers Send
+  // again for its row. A repeat click on the same row (a stale tray left by a
+  // failed refresh, or a double click) then reuses the key, and the server
+  // returns the send it already queued instead of creating a second one. A
+  // failed read keeps every key.
+  function pruneSendAgainKeys(now = Date.now()) {
+    if (!sendAgainKeys.size) return;
+    const offered = new Set(visibleOutboxRows()
+      .filter(row => outboxRowView(row, now).action === 'send-again')
+      .map(row => row.outbox_id));
+    Array.from(sendAgainKeys.keys()).forEach(outboxID => {
+      if (!offered.has(outboxID)) sendAgainKeys.delete(outboxID);
+    });
   }
 
   function scheduleOutboxRefresh(delay = 80) {
@@ -12176,10 +12217,8 @@ body::after {
     if ($outboxTray) $outboxTray.hidden = true;
     if ($outboxToggleBtn) {
       $outboxToggleBtn.setAttribute('aria-expanded', 'false');
-      $outboxToggleBtn.title = visibleOutboxRows().length
-        ? `Open outbox (${visibleOutboxRows().length} pending)`
-        : 'Open outbox';
     }
+    syncOutboxToggleLabels();
     if (restoreFocus && wasOpen && $outboxToggleBtn && !$outboxToggleBtn.hidden) {
       $outboxToggleBtn.focus();
     }
@@ -12193,6 +12232,8 @@ body::after {
     if (opening) {
       renderOutboxTray();
       loadOutboxRows();
+    } else {
+      syncOutboxToggleLabels();
     }
   }
 
@@ -12231,18 +12272,24 @@ body::after {
         await postJSON(`/api/v1/outbox/${encodeURIComponent(outboxID)}/cancel`, {});
         successMessage = 'Canceled.';
       } else if (action === 'send-again') {
+        // The key outlives a successful request (pruneSendAgainKeys drops it
+        // once the row is no longer offered), so a repeat click on this row
+        // deduplicates server-side instead of queueing another copy.
         if (!sendAgainKeys.has(outboxID)) {
           sendAgainKeys.set(outboxID, freshV2IdempotencyKey());
         }
-        await postJSON(`/api/v1/outbox/${encodeURIComponent(outboxID)}/send-again`, {
+        const submission = await postJSON(`/api/v1/outbox/${encodeURIComponent(outboxID)}/send-again`, {
           idempotency_key: sendAgainKeys.get(outboxID),
         });
-        sendAgainKeys.delete(outboxID);
         // Only an uncertain original may still arrive; a "Not sent" row never
         // reached the transport.
-        successMessage = String(row.state || '').trim().toLowerCase() === 'rejected'
-          ? 'New send queued.'
-          : 'New send queued. The original may still arrive.';
+        if (submission && submission.deduplicated === true) {
+          successMessage = 'Already sent again; no new send was created.';
+        } else {
+          successMessage = String(row.state || '').trim().toLowerCase() === 'rejected'
+            ? 'New send queued.'
+            : 'New send queued. The original may still arrive.';
+        }
       } else if (action === 'repair') {
         await postJSON(`/api/v1/outbox/${encodeURIComponent(outboxID)}/repair`, {});
         successMessage = 'Local repair requested. This does not resend.';
@@ -15040,6 +15087,9 @@ body::after {
       },
       outboxRowView(row, now) {
         return outboxRowView(row, now);
+      },
+      outboxButtonLabels(rows, expanded, now) {
+        return outboxButtonLabels(rows, expanded, now);
       },
     };
   }

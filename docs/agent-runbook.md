@@ -1105,12 +1105,13 @@ Reconnect); MCP `get_status` prints one line for it. It does not set
 `needs_repair`, change `connected`, or end the receive generation, because
 inbound is healthy. Sends fail fast instead of looping: the Google adapter
 reports the refusal as a certain non-send (class `reauth_required`, fingerprint
-`google_account_pairing_switched`), so the outbox row is rejected and the tray
+`google_account_pairing_switched`), so the outbox row is rejected, its
+`error_detail` starts with `[google_account_pairing_switched]`, and the tray
 lists it under "Not sent". The flag clears on proof that the phone serves the
 session again (a real conversation lookup or a successful send), on a non-fake
-account change that turns Google-account pairing off, and on unpair or a new
-pairing. It is not cleared on reconnect: whether the phone resends the account
-container on every connect is not established.
+account change that turns Google-account pairing off, and on unpair, session
+invalidation or a new pairing. It is not cleared on reconnect: whether the
+phone resends the account container on every connect is not established.
 
 **Remedies are Max's call; agents never re-pair.** Either re-link OpenMessage
 with Google-account pairing (the cookie method in "Re-pair recipe" above), or
@@ -1123,23 +1124,29 @@ reconnect in a loop hoping it clears ("Don't over-reconnect"), and don't delete
 nothing was sent (`DispatchNotCalled`) consumes one attempt. Retries back off
 5 s, 10 s, 20 s, 40 s, 80 s (doubling from the 5 s base, capped at 5 min; a
 later retry time from the adapter wins), and the 6th consuming failure rejects
-the row about 2.6 min after the first with `error_class: retry_exhausted` and
-an `error_detail` like `retry budget exhausted after 6 attempts; last failure
-transient [google_conversation_not_found]: …`. Not-connected failures
-(transient, fingerprint ending `_not_connected`) and `credentials_expired`
-failures are exempt: they refund the attempt and keep the 5 s cadence, so an
-offline platform or a cookie self-heal never exhausts a send. A failure that
-may have reached the transport never consumes an attempt, so the budget never
-rejects it; a row that ends `uncertain` is never retried automatically and
-cannot be canceled (HTTP 409), only sent again deliberately. A row already at
-or over the cap is rejected before any transport call, so an old row with a
-huge `attempt_count` can never fire late. A `conversation_moved` failure
-rebinds the conversation to the new remote id and retries at once (still
-consuming an attempt). Rejected rows with class `retry_exhausted` or
-`reauth_required` stay in `GET /api/v1/outbox` for 24 h, until sent again,
-with `retry_exhausted` and `error_detail`. The tray labels them "Not sent" and
-offers **Send again**, which creates a new message (nothing was sent the first
-time). MCP sends report `NOT SENT: gave up after N attempts (…)` or, for a
+the row with `error_class: retry_exhausted` and an `error_detail` like `retry
+budget exhausted after 6 attempts; last failure transient
+[google_conversation_not_found]: …`. That is 155 s of backoff (5 + 10 + 20 +
+40 + 80 s) plus the time the six attempts themselves take: about 2.6 min after
+the first failure when each attempt fails at once, longer when the phone is
+slow to answer (the adapter gives up on a conversation lookup after 8 s).
+Not-connected failures (transient, fingerprint ending `_not_connected`) and
+`credentials_expired` failures are exempt: they refund the attempt and retry at
+the fixed 5 s cadence (never sooner; a later adapter retry time wins), so an
+offline platform or a cookie self-heal never exhausts a send. A retryable
+failure that may have reached the transport is outside the budget: the row
+becomes `uncertain`, which is never retried automatically and cannot be
+canceled (HTTP 409), only sent again deliberately. A row already at or over
+the cap is rejected before any transport call, so an old row with a huge
+`attempt_count` can never fire late. A `conversation_moved` failure rebinds the
+conversation to the new remote id and retries at once (still consuming an
+attempt); if the rebind is refused, it is an ordinary consuming failure and
+`error_detail` says why. Rejected text and media rows with class
+`retry_exhausted` or `reauth_required` stay in `GET /api/v1/outbox` for 24 h,
+until sent again, with `retry_exhausted` and `error_detail`. The tray labels
+them "Not sent" and offers **Send again**, which creates a new message (nothing
+was sent the first time); clicking it again on the same page returns the send
+it already queued. MCP sends report `NOT SENT: gave up after N attempts (…)` or, for a
 `reauth_required` refusal, `NOT SENT` with the re-link guidance; the CLI prints
 the reason.
 

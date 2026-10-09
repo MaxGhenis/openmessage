@@ -39,12 +39,6 @@ var v1ErrorClasses = []string{
 	"permanent",
 }
 
-// retryExhaustedReference is the shared definition of RetryExhausted
-// (DESIGN I8): rejected and class retry_exhausted.
-func retryExhaustedReference(state messaging.OutboxState, class string) bool {
-	return state == messaging.OutboxRejected && class == sqlite.RetryExhaustedErrorClass
-}
-
 func decodeJSONMap(t *testing.T, value any) map[string]any {
 	t.Helper()
 	encoded, err := json.Marshal(value)
@@ -131,31 +125,34 @@ func TestV1PendingResponseCarriesFailureDetail(t *testing.T) {
 	}
 }
 
-// TestV1RetryExhaustedMatchesStateAndClass is exhaustive over state x class:
-// when the service sets RetryExhausted by its definition, the delivery and
-// pending JSON report retry_exhausted exactly for rejected + retry_exhausted
-// (DESIGN I8, API side).
-func TestV1RetryExhaustedMatchesStateAndClass(t *testing.T) {
+// TestV1RetryExhaustedPassesThrough is exhaustive over state x class x flag:
+// the delivery and pending JSON report exactly the service's RetryExhausted,
+// whatever the state and class, so the API never derives or rewrites it. It
+// does not test the flag's definition (rejected and class retry_exhausted,
+// DESIGN I8); the messaging service owns that
+// (TestDeliveryFromItemRetryExhaustedAndNextAttemptExhaustive).
+func TestV1RetryExhaustedPassesThrough(t *testing.T) {
 	for _, state := range v1AllOutboxStates {
 		for _, class := range v1ErrorClasses {
-			want := retryExhaustedReference(state, class)
-			delivery := decodeJSONMap(t, deliveryResponse(messaging.Delivery{
-				OutboxID:       "outbox",
-				State:          state,
-				ErrorClass:     class,
-				RetryExhausted: want,
-			}))
-			if got := delivery["retry_exhausted"] == true; got != want {
-				t.Fatalf("delivery state=%s class=%q: retry_exhausted=%v, want %v", state, class, got, want)
-			}
-			pending := decodeJSONMap(t, pendingResponse(messaging.PendingDelivery{
-				OutboxID:       "outbox",
-				State:          state,
-				ErrorClass:     class,
-				RetryExhausted: want,
-			}))
-			if got := pending["retry_exhausted"] == true; got != want {
-				t.Fatalf("pending state=%s class=%q: retry_exhausted=%v, want %v", state, class, got, want)
+			for _, want := range []bool{false, true} {
+				delivery := decodeJSONMap(t, deliveryResponse(messaging.Delivery{
+					OutboxID:       "outbox",
+					State:          state,
+					ErrorClass:     class,
+					RetryExhausted: want,
+				}))
+				if got := delivery["retry_exhausted"] == true; got != want {
+					t.Fatalf("delivery state=%s class=%q: retry_exhausted=%v, want %v", state, class, got, want)
+				}
+				pending := decodeJSONMap(t, pendingResponse(messaging.PendingDelivery{
+					OutboxID:       "outbox",
+					State:          state,
+					ErrorClass:     class,
+					RetryExhausted: want,
+				}))
+				if got := pending["retry_exhausted"] == true; got != want {
+					t.Fatalf("pending state=%s class=%q: retry_exhausted=%v, want %v", state, class, got, want)
+				}
 			}
 		}
 	}

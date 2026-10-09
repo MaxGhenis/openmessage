@@ -292,10 +292,12 @@ const googleAccountPairingSwitchedFingerprint = "google_account_pairing_switched
 // misread get their own wording: the phone refusing a QR-paired session (only
 // a re-link fixes it, and re-pairing is the user's call), a send the
 // dispatcher gave up on after its retry budget (never sent, never retried),
-// and any other reauth_required refusal. The last one is also the fallback
-// for the account switch when the detail does not carry its fingerprint: the
-// dispatcher stores a terminal failure's error text, which need not name it.
-// These are the rejections the web tray lists as "Not sent".
+// and any other reauth_required refusal. The account switch is recognised by
+// its fingerprint anywhere in the detail; a refusal whose detail does not name
+// it (OpError.Error() omits the fingerprint, so only the dispatcher's
+// "[fingerprint]" prefix or the adapter's own text carries it) still gets the
+// generic re-link wording. These are the rejections the web tray lists as
+// "Not sent".
 func v2RejectedText(delivery messaging.Delivery) string {
 	detail := ""
 	if delivery.ErrorDetail != "" {
