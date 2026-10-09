@@ -188,6 +188,7 @@ type App struct {
 	googleLifecycleNotifier   GoogleLifecycleNotifier
 	googleRepairPaceMu        sync.RWMutex
 	googlePull                googlePullHealth
+	googleGaps                googleHistoryGaps
 	googleRepairPaceCount     func() uint64
 	signalLifecycleMu         sync.RWMutex
 	signalLifecycleNotifier   SignalLifecycleNotifier
@@ -221,6 +222,11 @@ type GoogleStatusSnapshot struct {
 	// return no data while the store holds this account's conversations, the
 	// state push-only health checks can't see. Absent before the first pull.
 	PullHealth *GooglePullHealthSnapshot `json:"pull_health,omitempty"`
+	// HistoryGaps lists conversations whose startup backfill or recent
+	// reconcile stored newer messages without reaching the ones it already
+	// held, so messages between them may be missing until a window backfill
+	// from history_gaps.since_ms runs. Absent when there are none.
+	HistoryGaps *GoogleHistoryGapsSnapshot `json:"history_gaps,omitempty"`
 }
 
 // googleRepairThreshold is how many consecutive failed Google sends (with no
@@ -779,6 +785,7 @@ func (a *App) GoogleStatus() GoogleStatusSnapshot {
 		PhoneResponding: a.GooglePhoneResponding(),
 		RepairsPaced:    a.GoogleRepairsPaced(),
 		PullHealth:      a.GooglePullHealth(),
+		HistoryGaps:     a.GoogleHistoryGaps(),
 	}
 }
 
