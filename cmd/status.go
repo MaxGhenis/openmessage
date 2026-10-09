@@ -15,6 +15,7 @@ import (
 
 	"github.com/maxghenis/openmessage/internal/app"
 	"github.com/maxghenis/openmessage/internal/db"
+	"github.com/maxghenis/openmessage/internal/freshness"
 	"github.com/maxghenis/openmessage/internal/localapi"
 )
 
@@ -54,10 +55,16 @@ type statusDeps struct {
 	// daemon probes the running app for its silence verdicts; nil judges
 	// every platform locally.
 	daemon *localapi.Client
-	now    func() time.Time
+	// now is the clock silence is judged at. The legacy activity source
+	// still drops rows stamped more than 10 minutes past the wall clock
+	// (freshness.NewMessageActivity), whatever now says.
+	now func() time.Time
 	// loc is the zone silence baselines are built in; the daemon uses
 	// time.Local.
 	loc *time.Location
+	// source overrides the activity source local verdicts are measured on;
+	// nil picks the session's own (commandReadSession.activitySource).
+	source freshness.ActivitySource
 	// demo skips silence: demo data is a frozen fixture.
 	demo   bool
 	output io.Writer
@@ -144,13 +151,15 @@ func runStatus(ctx context.Context, session *commandReadSession, deps statusDeps
 // transport has been silent past its baseline. Behind outranks silent, as in
 // /api/status stale_reason: a platform days behind is usually logged out or
 // unpaired, while a silent newest platform usually means the phone stopped
-// relaying.
+// relaying. A stalled verdict without a usable silent_ms gets no hours.
 func staleWarning(behindDays int, silence *platformSilence) string {
 	switch {
 	case behindDays >= staleBehindDays:
 		return fmt.Sprintf("  ⚠ %dd behind", behindDays)
-	case silence != nil && silence.Stalled:
+	case silence != nil && silence.Stalled && silence.SilentMS > 0:
 		return fmt.Sprintf("  ⚠ silent %dh", silence.SilentMS/time.Hour.Milliseconds())
+	case silence != nil && silence.Stalled:
+		return "  ⚠ silent"
 	default:
 		return ""
 	}

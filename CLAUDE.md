@@ -66,16 +66,26 @@ source this command reads, `status` shows the app's (daemon truth, as for
 sends). Otherwise it judges locally with `freshness.EvaluateSilence` on the
 source the daemon would read: the v2 inbox when reads come from the v2 store,
 the legacy store's incoming messages otherwise. It reuses the stores it already
-opened. A line under the table says which and why (app not running, another
-data dir, an app build without the check, the app on v2 while the CLI reads
-legacy). `--json` adds each row's `behind_days`, `silence` (the daemon's field
-names, built by `freshness.SilenceBlock`) and `silence_judged_by` (`daemon` |
-`local`), plus `silence_note`. sms and rcs rows both carry Google's verdict.
-A stale row means the daemon isn't syncing that platform, or the phone behind
-it has stopped delivering; searches over that window will miss messages.
-"Read-only" means no repair sweeps and no transports: opening a store still
-applies pending schema migrations (`sqlite.Open` for v2, `db.New` for legacy),
-so keep the CLI binary in step with the app.
+opened. The text under the table says who judged and why (the app isn't
+running or didn't answer within 3s, serves another data dir, predates the
+check, or measures v2 while the CLI reads legacy), and names any verdict
+judged without a baseline (only the 72h floor applies) or platform with no
+recorded activity. `--json` adds each row's `behind_days`, `silence` (the
+daemon's field names, built by `freshness.SilenceBlock`) and
+`silence_judged_by` (`daemon` | `local`), plus `silence_note`. sms and rcs rows
+both carry Google's verdict. A stale row means the daemon isn't syncing that
+platform, or the phone behind it has stopped delivering; searches over that
+window will miss messages.
+
+"Read-only" here means no startup repair sweeps (`repairStartupArtifacts`) and
+no transports. Opening a store still writes: `sqlite.Open` (v2) applies any
+pending migrations and writes nothing when the store is current; `db.New`
+(legacy) runs `migrate()` on every open, which drops and recreates three
+`contact_avatars` indexes, keeps one row of each group of Signal rows that
+share a conversation, sender and timestamp and deletes the rest, and
+repopulates the FTS index when its row count differs from `messages`. Keeping
+the CLI binary in step with the app avoids the v2 migrations, not the legacy
+writes.
 
 `read` resolves each hit's sender (name → number → conversation id) so results
 are legible without a second lookup, and accepts

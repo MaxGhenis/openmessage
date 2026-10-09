@@ -3,9 +3,13 @@ package cmd
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"math"
+	"net"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/maxghenis/openmessage/internal/db"
@@ -24,19 +28,22 @@ const (
 const statusSilenceQueryTimeout = 5 * time.Second
 
 // platformSilence is one status platform's silence verdict: the
-// freshness.<platform>.silence object of /api/status, kept as JSON so the
-// daemon's verdict is shown byte for byte.
+// freshness.<platform>.silence object of /api/status, kept as raw JSON so
+// --json shows the daemon's verdict unchanged (same keys, order and values;
+// only the indentation differs).
 type platformSilence struct {
 	Block    json.RawMessage
 	JudgedBy string
-	// SilentMS and Stalled are read back from Block for the text output.
-	SilentMS int64
-	Stalled  bool
-	source   string
+	// SilentMS, Stalled and BaselineUnavailable are read back from Block for
+	// the text output.
+	SilentMS            int64
+	Stalled             bool
+	BaselineUnavailable bool
+	source              string
 }
 
 // statusSilence holds the verdicts by status platform key ("google",
-// "whatsapp", "signal") and one sentence saying who judged them.
+// "whatsapp", "signal") and the sentences saying who judged them.
 type statusSilence struct {
 	byPlatform map[string]platformSilence
 	note       string
@@ -44,11 +51,12 @@ type statusSilence struct {
 
 // judgeStatusSilence returns a silence verdict for each status platform in
 // platforms. A platform takes the running app's verdict when the app serves
-// this data dir and reports one in freshness.<platform>.silence (daemon
-// truth, as for sends). Otherwise it is judged here with the same rule and
-// config (freshness.EvaluateSilence, DefaultSilenceConfig) over the same
-// activity source the daemon would read: the v2 inbox when reads come from
-// the v2 store, the legacy store's incoming messages otherwise.
+// this data dir and reports one in freshness.<platform>.silence measured on
+// the source this command reads (daemon truth, as for sends). Otherwise it is
+// judged here with the same rule and config (freshness.EvaluateSilence,
+// DefaultSilenceConfig) over the activity source the daemon would read: the v2
+// inbox when reads come from the v2 store, the legacy store's incoming
+// messages otherwise.
 func judgeStatusSilence(
 	ctx context.Context,
 	session *commandReadSession,
@@ -62,7 +70,10 @@ func judgeStatusSilence(
 		return statusSilence{}
 	}
 	out := statusSilence{byPlatform: map[string]platformSilence{}}
-	source := session.activitySource()
+	source := deps.source
+	if source == nil {
+		source = session.activitySource()
+	}
 	localSource := ""
 	if source != nil {
 		localSource = source.Name()
@@ -81,6 +92,7 @@ func judgeStatusSilence(
 	}
 
 	var localErr error
+	var noActivity []string
 	if len(missing) > 0 {
 		if source == nil {
 			localErr = fmt.Errorf("no activity source")
@@ -92,9 +104,16 @@ func judgeStatusSilence(
 			for platform, block := range blocks {
 				out.byPlatform[platform] = newPlatformSilence(block, silenceJudgedByLocal)
 			}
+			if err == nil {
+				for _, platform := range missing {
+					if _, ok := blocks[platform]; !ok {
+						noActivity = append(noActivity, platform)
+					}
+				}
+			}
 		}
 	}
-	out.note = silenceNote(out.byPlatform, localSource, whyLocal, localErr)
+	out.note = silenceNote(out.byPlatform, localSource, whyLocal, localErr, noActivity)
 	return out
 }
 
@@ -111,7 +130,7 @@ func daemonSilenceBlocks(ctx context.Context, daemon *localapi.Client, dataDir, 
 	cancel()
 	switch {
 	case err != nil && !reachable:
-		return nil, "the app isn't running"
+		return nil, unreachableReason(err)
 	case err != nil:
 		return nil, "the running app's /api/status was unreadable"
 	}
@@ -126,9 +145,13 @@ func daemonSilenceBlocks(ctx context.Context, daemon *localapi.Client, dataDir, 
 	if !samePath(served, dataDir) {
 		return nil, "the running app serves " + served
 	}
+	var entries map[string]json.RawMessage
+	if len(status.Freshness) > 0 && json.Unmarshal(status.Freshness, &entries) != nil {
+		return nil, "the running app's freshness block was unreadable"
+	}
 	blocks := map[string]json.RawMessage{}
 	otherSource := ""
-	for platform, raw := range status.Freshness {
+	for platform, raw := range entries {
 		var entry struct {
 			Silence json.RawMessage `json:"silence"`
 		}
@@ -140,10 +163,13 @@ func daemonSilenceBlocks(ctx context.Context, daemon *localapi.Client, dataDir, 
 		if len(block) == 0 || string(block) == "null" {
 			continue
 		}
-		// On a v2-primary install the app measures the v2 inbox, but this
-		// command reads the legacy store unless OPENMESSAGES_V2_PRIMARY=1 is
-		// set; a verdict on one says nothing about the other (the two diverge
-		// when the projection stalls, #155).
+		// The two sources clock different things: v2 inbox receipt times
+		// (every frame a bridge hands to ingest) against the sender
+		// timestamps of incoming rows in the legacy store. A verdict on one
+		// does not describe the other; they part when frames stop reaching
+		// one store while the other keeps ingesting (#155). On a v2-primary
+		// install the app measures the v2 inbox, while this command reads the
+		// legacy store unless OPENMESSAGES_V2_PRIMARY=1 is set.
 		var measured struct {
 			Source string `json:"source"`
 		}
@@ -160,6 +186,22 @@ func daemonSilenceBlocks(ctx context.Context, daemon *localapi.Client, dataDir, 
 		return nil, "the running app doesn't report silence"
 	}
 	return blocks, ""
+}
+
+// unreachableReason says why no app answered the status probe: a refused
+// connection means nothing listens on the port, while a timeout means
+// something did and was too slow (the daemon's own refresh may spend up to its
+// silenceQueryTimeout inside /api/status).
+func unreachableReason(err error) string {
+	var netErr net.Error
+	switch {
+	case errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &netErr) && netErr.Timeout()):
+		return fmt.Sprintf("the running app didn't answer within %s", clientProbeTimeout)
+	case errors.Is(err, syscall.ECONNREFUSED):
+		return "the app isn't running"
+	default:
+		return "the app couldn't be reached: " + err.Error()
+	}
 }
 
 // judgeSilenceLocally judges each of platforms that has any activity, the way
@@ -199,41 +241,60 @@ func judgeSilenceLocally(
 	return blocks, nil
 }
 
+// newPlatformSilence reads back the fields the text output needs. A daemon
+// block is foreign input: silent_ms is read as any JSON number and a
+// negative one counts as zero.
 func newPlatformSilence(block json.RawMessage, judgedBy string) platformSilence {
 	var view struct {
-		Source   string `json:"source"`
-		SilentMS int64  `json:"silent_ms"`
-		Stalled  bool   `json:"stalled"`
+		Source              string  `json:"source"`
+		SilentMS            float64 `json:"silent_ms"`
+		Stalled             bool    `json:"stalled"`
+		BaselineUnavailable bool    `json:"baseline_unavailable"`
 	}
 	_ = json.Unmarshal(block, &view)
 	return platformSilence{
-		Block:    block,
-		JudgedBy: judgedBy,
-		SilentMS: view.SilentMS,
-		Stalled:  view.Stalled,
-		source:   view.Source,
+		Block:               block,
+		JudgedBy:            judgedBy,
+		SilentMS:            int64(math.Max(0, view.SilentMS)),
+		Stalled:             view.Stalled,
+		BaselineUnavailable: view.BaselineUnavailable,
+		source:              view.Source,
 	}
 }
 
-// silenceNote is the sentence under the status table that says who judged
-// the silence verdicts, from what, and why any were judged locally:
+// silenceNote is the text under the status table that says who judged the
+// silence verdicts, from what, and why any were judged locally, then which
+// verdicts lacked a baseline and which platforms had nothing to judge:
 //
 //	Silence judged by the running app from the v2 inbox.
 //	Silence judged locally from the v2 inbox (the app isn't running).
-//	Silence: google judged by the running app from the v2 inbox; signal judged locally from the v2 inbox (the running app reported none).
-func silenceNote(byPlatform map[string]platformSilence, localSource, whyLocal string, localErr error) string {
-	var daemon, local []string
+//	Silence: Google Messages judged by the running app from the v2 inbox; Signal judged locally from the v2 inbox (the running app reported none).
+func silenceNote(
+	byPlatform map[string]platformSilence,
+	localSource, whyLocal string,
+	localErr error,
+	noActivity []string,
+) string {
+	var daemon, local, noBaseline []string
 	daemonSource := ""
-	for platform, verdict := range byPlatform {
+	platforms := make([]string, 0, len(byPlatform))
+	for platform := range byPlatform {
+		platforms = append(platforms, platform)
+	}
+	sort.Strings(platforms)
+	for _, platform := range platforms {
+		verdict := byPlatform[platform]
+		name := platformDisplayName(platform)
 		if verdict.JudgedBy == silenceJudgedByDaemon {
-			daemon = append(daemon, platform)
+			daemon = append(daemon, name)
 			daemonSource = verdict.source
 		} else {
-			local = append(local, platform)
+			local = append(local, name)
+		}
+		if verdict.BaselineUnavailable {
+			noBaseline = append(noBaseline, name)
 		}
 	}
-	sort.Strings(daemon)
-	sort.Strings(local)
 	reason := func(why string) string {
 		if why == "" {
 			return ""
@@ -245,24 +306,58 @@ func silenceNote(byPlatform map[string]platformSilence, localSource, whyLocal st
 		whyLocal = strings.TrimPrefix(whyLocal+"; ", "; ") + "local query failed: " + localErr.Error()
 	}
 
+	var sentences []string
 	switch {
 	case len(daemon) == 0 && len(local) == 0:
-		if localErr == nil {
-			return ""
+		if localErr != nil {
+			sentences = append(sentences, "Silence not judged"+reason(whyLocal)+".")
 		}
-		return "Silence not judged" + reason(whyLocal) + "."
 	case len(local) == 0 && localErr == nil:
-		return "Silence judged by the running app" + fromSource(daemonSource) + "."
+		sentences = append(sentences, "Silence judged by the running app"+fromSource(daemonSource)+".")
 	case len(daemon) == 0:
-		return "Silence judged locally" + fromSource(localSource) + reason(whyLocal) + "."
+		sentences = append(sentences, "Silence judged locally"+fromSource(localSource)+reason(whyLocal)+".")
+	default:
+		parts := []string{strings.Join(daemon, ", ") + " judged by the running app" + fromSource(daemonSource)}
+		if len(local) > 0 {
+			parts = append(parts, strings.Join(local, ", ")+" judged locally"+fromSource(localSource)+reason(whyLocal))
+		} else {
+			parts = append(parts, "the rest not judged"+reason(whyLocal))
+		}
+		sentences = append(sentences, "Silence: "+strings.Join(parts, "; ")+".")
 	}
-	parts := []string{strings.Join(daemon, ", ") + " judged by the running app" + fromSource(daemonSource)}
-	if len(local) > 0 {
-		parts = append(parts, strings.Join(local, ", ")+" judged locally"+fromSource(localSource)+reason(whyLocal))
-	} else {
-		parts = append(parts, "the rest not judged"+reason(whyLocal))
+	if len(noBaseline) > 0 {
+		// EvaluateSilence without a baseline can only apply LongSilence.
+		sentences = append(sentences, fmt.Sprintf("%s judged without a baseline, so only the %dh floor applies.",
+			strings.Join(noBaseline, ", "), int(freshness.DefaultSilenceConfig.LongSilence.Hours())))
 	}
-	return "Silence: " + strings.Join(parts, "; ") + "."
+	if len(noActivity) > 0 {
+		names := make([]string, len(noActivity))
+		for i, platform := range noActivity {
+			names[i] = platformDisplayName(platform)
+		}
+		sort.Strings(names)
+		sentence := strings.Join(names, ", ") + " not judged: no activity recorded" + strings.Replace(fromSource(localSource), " from ", " in ", 1)
+		if len(daemon) == 0 && len(local) == 0 {
+			sentence += reason(whyLocal)
+		}
+		sentences = append(sentences, sentence+".")
+	}
+	return strings.Join(sentences, " ")
+}
+
+// platformDisplayName names a status platform key for people. The table
+// labels Google Messages rows by what they store (sms, rcs).
+func platformDisplayName(platform string) string {
+	switch platform {
+	case "google":
+		return "Google Messages"
+	case "whatsapp":
+		return "WhatsApp"
+	case "signal":
+		return "Signal"
+	default:
+		return platform
+	}
 }
 
 // fromSource names an ActivitySource for people, as a " from ..." phrase.

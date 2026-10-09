@@ -237,17 +237,23 @@ curl -s http://127.0.0.1:7007/api/status | jq '.freshness.google | {stale, stale
 From a terminal, `openmessage status` flags the same stall in its AGE column
 (`⚠ silent 13h`: whole hours since the last event; `⚠ Nd behind` still takes
 precedence). It shows the running app's verdict when the app serves the same
-data dir and measured it on the source this command reads. Otherwise, for
-instance with the app down, on another data dir, on an app build that predates
-the check, or with the app on v2 while the CLI reads the legacy store (no
-`OPENMESSAGES_V2_PRIMARY=1`), it judges the store it opened with the same rule
-(`freshness.EvaluateSilence`, default config). It reads the source the daemon
-would: the v2 inbox when reads come from the v2 store, stored incoming messages
-otherwise. The line under the table says which and why. `--json` carries each
-row's `silence` object under the daemon's field names, with
-`silence_judged_by` (`daemon` | `local`) and a top-level `silence_note`. A local verdict has no carry-over: if the activity query itself
-fails, the note says so and the rows carry no verdict. Point it at the app's
-store, or it judges the CLI default store, which is usually stale:
+data dir and measured it on the source this command reads. Otherwise it
+judges the store it opened with the same rule (`freshness.EvaluateSilence`,
+default config): for instance with the app down or slower than 3s to answer,
+on another data dir, on a build that predates the check, or with the app on
+v2 while the CLI reads the legacy store. It reads the source the daemon would:
+the v2 inbox when reads come from the v2 store, stored incoming messages
+otherwise. The text under the table says who judged and why. It also names a
+verdict judged without its baseline (only the 72h floor can fire, so a long
+silence on a busy platform shows no warning) and a platform with no recorded
+activity. `--json` carries each row's `silence` object under the daemon's
+field names, with `silence_judged_by` (`daemon` | `local`) and a top-level
+`silence_note`. A local verdict has no carry-over: if the activity query
+itself fails, the note says so and the rows carry no verdict. Point it at the
+app's store, or it judges the CLI default store, which is usually stale. On a
+migrated (v2-primary) install also set `OPENMESSAGES_V2_PRIMARY=1`; drop it
+otherwise, since without a v2 store the command exits with "no migrated
+store":
 
 ```bash
 OPENMESSAGES_DATA_DIR="$HOME/Library/Application Support/OpenMessage" OPENMESSAGES_V2_PRIMARY=1 openmessage status

@@ -67,7 +67,7 @@ func TestStatusReachability(t *testing.T) {
 	})
 
 	// The freshness block stays raw so a caller can show the daemon's
-	// silence verdict byte for byte.
+	// silence verdict unchanged.
 	t.Run("daemon reports freshness", func(t *testing.T) {
 		const silence = `{"silent_ms":46800000,"stalled":true,"rule":"expected_activity"}`
 		client := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -77,17 +77,31 @@ func TestStatusReachability(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Status() = %v", err)
 		}
-		if got := string(status.Freshness["newest_ms"]); got != "1791473060776" {
-			t.Fatalf("freshness.newest_ms = %s", got)
+		var freshness struct {
+			NewestMS json.RawMessage `json:"newest_ms"`
+			Google   struct {
+				Silence json.RawMessage `json:"silence"`
+			} `json:"google"`
 		}
-		var google struct {
-			Silence json.RawMessage `json:"silence"`
+		if err := json.Unmarshal(status.Freshness, &freshness); err != nil {
+			t.Fatalf("decode freshness: %v", err)
 		}
-		if err := json.Unmarshal(status.Freshness["google"], &google); err != nil {
-			t.Fatalf("decode freshness.google: %v", err)
+		if string(freshness.NewestMS) != "1791473060776" || string(freshness.Google.Silence) != silence {
+			t.Fatalf("freshness = %s, want newest_ms 1791473060776 and google.silence %s", status.Freshness, silence)
 		}
-		if string(google.Silence) != silence {
-			t.Fatalf("freshness.google.silence = %s, want %s", google.Silence, silence)
+	})
+
+	// The send and MCP paths read only the mode fields, so a freshness block
+	// of any JSON shape must not turn a reachable daemon into a probe failure.
+	t.Run("daemon reports a non-object freshness", func(t *testing.T) {
+		for _, freshness := range []string{`[]`, `"stale"`, `7`, `true`, `null`} {
+			client := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				io.WriteString(w, `{"v2_primary":true,"freshness":`+freshness+`}`)
+			}))
+			status, reachable, err := client.Status(context.Background())
+			if err != nil || !reachable || !status.V2Primary {
+				t.Fatalf("freshness %s: Status() = %+v, reachable %v, err %v", freshness, status, reachable, err)
+			}
 		}
 	})
 }

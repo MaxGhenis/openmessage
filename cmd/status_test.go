@@ -83,11 +83,15 @@ func TestStaleWarning(t *testing.T) {
 		{"fresh verdict", 0, &platformSilence{SilentMS: hours(2)}, ""},
 		{"long quiet the baseline explains", 0, &platformSilence{SilentMS: hours(11)}, ""},
 		{"behind peers", 14, nil, "  ⚠ 14d behind"},
+		{"at the behind threshold", 3, nil, "  ⚠ 3d behind"},
 		{"just under the behind threshold", 2, nil, ""},
 		// The 2026-10-06 stall: Google was the newest platform, so it was never
 		// behind; its silence verdict is what flags it.
 		{"silent newest platform", 0, &platformSilence{SilentMS: hours(13) + 60_000, Stalled: true}, "  ⚠ silent 13h"},
+		{"hours are floored", 0, &platformSilence{SilentMS: hours(14) - 60_000, Stalled: true}, "  ⚠ silent 13h"},
 		{"silent for days", 0, &platformSilence{SilentMS: hours(80), Stalled: true}, "  ⚠ silent 80h"},
+		// A stalled verdict whose silent_ms was missing or negative.
+		{"stalled, hours unknown", 0, &platformSilence{Stalled: true}, "  ⚠ silent"},
 		// Behind outranks silent, as /api/status stale_reason does.
 		{"behind and silent", 5, &platformSilence{SilentMS: hours(120), Stalled: true}, "  ⚠ 5d behind"},
 	}

@@ -109,9 +109,9 @@ func seedStatusV2Store(t *testing.T, dataDir string, seeds ...statusV2Seed) {
 	}
 }
 
-// openStatusSession opens dataDir the way `openmessage status` does, reading
-// the v2 store when v2 is set and the legacy store otherwise.
-func openStatusSession(t *testing.T, dataDir string, v2 bool) *commandReadSession {
+// setStatusEnv points the CLI at dataDir, reading the v2 store when v2 is set
+// and the legacy store otherwise.
+func setStatusEnv(t *testing.T, dataDir string, v2 bool) {
 	t.Helper()
 	t.Setenv("OPENMESSAGES_DATA_DIR", dataDir)
 	t.Setenv("OPENMESSAGES_DEMO", "0")
@@ -125,6 +125,12 @@ func openStatusSession(t *testing.T, dataDir string, v2 bool) *commandReadSessio
 		t.Setenv("OPENMESSAGES_V2_SEND", "0")
 		t.Setenv("OPENMESSAGES_V2_INGEST", "0")
 	}
+}
+
+// openStatusSession opens dataDir the way `openmessage status` does.
+func openStatusSession(t *testing.T, dataDir string, v2 bool) *commandReadSession {
+	t.Helper()
+	setStatusEnv(t, dataDir, v2)
 	session, err := openCommandReadSource(zerolog.Nop(), io.Discard)
 	if err != nil {
 		t.Fatalf("openCommandReadSource(): %v", err)
@@ -153,7 +159,7 @@ func runStatusOutput(t *testing.T, session *commandReadSession, deps statusDeps,
 type statusJSON struct {
 	Platforms []struct {
 		Platform        string          `json:"platform"`
-		BehindDays      int             `json:"behind_days"`
+		BehindDays      *int            `json:"behind_days"`
 		Silence         json.RawMessage `json:"silence"`
 		SilenceJudgedBy string          `json:"silence_judged_by"`
 	} `json:"platforms"`
@@ -205,13 +211,38 @@ func fakeDaemon(t *testing.T, body string) *localapi.Client {
 	return localapi.NewClient(server.URL, "")
 }
 
-// downDaemon returns a client whose daemon refuses connections.
+// downDaemon returns a client whose daemon refuses connections, the way
+// internal/localapi's tests reach one.
 func downDaemon(t *testing.T) *localapi.Client {
 	t.Helper()
-	server := httptest.NewServer(http.NotFoundHandler())
-	url := server.URL
-	server.Close()
-	return localapi.NewClient(url, "")
+	return localapi.NewClient("http://127.0.0.1:1", "")
+}
+
+// pinLocal sets time.Local for the test. The daemon judges silence in
+// time.Local, and pinning it to a zone other than the one a test passes the
+// CLI (statusDeps.loc) proves the CLI used the one it was given.
+func pinLocal(t *testing.T, loc *time.Location) {
+	t.Helper()
+	saved := time.Local
+	time.Local = loc
+	t.Cleanup(func() { time.Local = saved })
+}
+
+// statusPlatform returns the --json row for platform.
+func statusPlatform(t *testing.T, status statusJSON, platform string) (row struct {
+	Platform        string          `json:"platform"`
+	BehindDays      *int            `json:"behind_days"`
+	Silence         json.RawMessage `json:"silence"`
+	SilenceJudgedBy string          `json:"silence_judged_by"`
+}) {
+	t.Helper()
+	for _, candidate := range status.Platforms {
+		if candidate.Platform == platform {
+			return candidate
+		}
+	}
+	t.Fatalf("no %s row in %+v", platform, status.Platforms)
+	return row
 }
 
 func newYork(t *testing.T) *time.Location {
@@ -237,14 +268,16 @@ func stall1006Frames(loc *time.Location) []time.Time {
 	return append(frames, time.Date(2026, 10, 6, 1, 11, 0, 0, loc))
 }
 
-// The 2026-10-06 stall, replayed through the CLI with the app down: the last
-// Google frame reached the v2 inbox at 01:11 and the 14 days before carried
-// daytime traffic. Before #190 nothing flagged it: Google was the newest
+// A 10/6-shaped Google stall through the CLI with the app down: the last
+// frame reached the v2 inbox at 01:11 and the 14 days before carried daytime
+// traffic. Before #190 nothing flagged the real one: Google was the newest
 // platform, so it was never "behind". Judged locally on the v2 inbox against
-// that baseline, it is quiet but expected at 13:30 (5.5 expected-active hours,
-// under the 6-hour limit) and stalled at 14:12.
+// this baseline, it is quiet but expected at 13:30 (5.5 expected-active hours,
+// under the 6-hour limit) and stalled at 14:12. time.Local is UTC here, so
+// the verdict must come from the zone the CLI was given.
 func TestRunStatusFlagsThe20261006GoogleStallLocally(t *testing.T) {
 	loc := newYork(t)
+	pinLocal(t, time.UTC)
 	dataDir := t.TempDir()
 	seedStatusV2Store(t, dataDir, statusV2Seed{
 		account:     statusGoogleAccount,
@@ -266,7 +299,7 @@ func TestRunStatusFlagsThe20261006GoogleStallLocally(t *testing.T) {
 	if !strings.HasSuffix(line, "⚠ silent 13h") {
 		t.Fatalf("at 14:12 the sms row = %q, want it to end in %q", line, "⚠ silent 13h")
 	}
-	if strings.Contains(text, "longer than usual") || strings.Contains(text, "behind") {
+	if strings.Contains(text, "longer than usual") || strings.Contains(line, "behind") {
 		t.Fatalf("status text = %q, want only the silent warning", text)
 	}
 	if !strings.Contains(text, "Silence judged locally from the v2 inbox (the app isn't running).") {
@@ -279,8 +312,8 @@ func TestRunStatusFlagsThe20261006GoogleStallLocally(t *testing.T) {
 		t.Fatalf("platforms = %+v, want one sms row", status.Platforms)
 	}
 	row := status.Platforms[0]
-	if row.SilenceJudgedBy != silenceJudgedByLocal || row.BehindDays != 0 {
-		t.Fatalf("sms row judged by %q, behind %d; want local, 0", row.SilenceJudgedBy, row.BehindDays)
+	if row.SilenceJudgedBy != "local" || row.BehindDays == nil || *row.BehindDays != 0 {
+		t.Fatalf("sms row judged by %q, behind %v; want local, 0", row.SilenceJudgedBy, row.BehindDays)
 	}
 	silence := silenceFields(t, row.Silence)
 	want := map[string]any{
@@ -306,7 +339,8 @@ func TestRunStatusFlagsThe20261006GoogleStallLocally(t *testing.T) {
 		t.Fatalf("silence_note = %q", status.SilenceNote)
 	}
 
-	// When the user looked on 10/7 the stall was 37 hours old.
+	// At 15:00 on 10/7, half an hour before the phone restart that ended the
+	// real stall, it is 37 hours old.
 	late := runStatusOutput(t, session, statusDeps{daemon: downDaemon(t), now: at(7, 15, 0), loc: loc}, false)
 	if line := statusRowLine(t, late, "sms"); !strings.HasSuffix(line, "⚠ silent 37h") {
 		t.Fatalf("on 10/7 15:00 the sms row = %q, want %q", line, "⚠ silent 37h")
@@ -322,7 +356,7 @@ func daemonStatusWithGoogleSilence(dataDir, block string) string {
 }
 
 // With the app running on the same data dir, its verdict is the one shown,
-// byte for byte, even where the store alone would judge otherwise (the
+// unchanged as JSON, even where the store alone would judge otherwise (the
 // daemon may have carried a verdict over or seen frames the CLI has not).
 func TestRunStatusShowsTheRunningAppsSilenceVerdict(t *testing.T) {
 	loc := newYork(t)
@@ -354,7 +388,7 @@ func TestRunStatusShowsTheRunningAppsSilenceVerdict(t *testing.T) {
 	if err := json.Compact(&got, row.Silence); err != nil {
 		t.Fatal(err)
 	}
-	if got.String() != stalledBlock || row.SilenceJudgedBy != silenceJudgedByDaemon {
+	if got.String() != stalledBlock || row.SilenceJudgedBy != "daemon" {
 		t.Fatalf("silence = %s judged by %q, want the daemon's block %s verbatim", got.String(), row.SilenceJudgedBy, stalledBlock)
 	}
 
@@ -442,10 +476,10 @@ func TestRunStatusFillsInPlatformsTheAppDidNotJudge(t *testing.T) {
 	for _, row := range status.Platforms {
 		judgedBy[row.Platform] = row.SilenceJudgedBy
 	}
-	if judgedBy["sms"] != silenceJudgedByDaemon || judgedBy["whatsapp"] != silenceJudgedByLocal {
+	if judgedBy["sms"] != "daemon" || judgedBy["whatsapp"] != "local" {
 		t.Fatalf("judged by = %v, want sms by the daemon and whatsapp locally", judgedBy)
 	}
-	want := "Silence: google judged by the running app from the v2 inbox; whatsapp judged locally from the v2 inbox (the running app reported none)."
+	want := "Silence: Google Messages judged by the running app from the v2 inbox; WhatsApp judged locally from the v2 inbox (the running app reported none)."
 	if status.SilenceNote != want {
 		t.Fatalf("silence_note = %q\nwant          %q", status.SilenceNote, want)
 	}
@@ -541,8 +575,14 @@ func TestRunStatusSkipsSilenceInDemoMode(t *testing.T) {
 		demo:   true,
 	}
 	raw := runStatusOutput(t, session, deps, true)
-	if strings.Contains(raw, "silence") || probed.Load() {
-		t.Fatalf("demo status = %s (probed %v), want no silence and no probe", raw, probed.Load())
+	status := decodeStatusJSON(t, raw)
+	for _, row := range status.Platforms {
+		if row.Silence != nil || row.SilenceJudgedBy != "" {
+			t.Fatalf("demo row %s carries a silence verdict: %s", row.Platform, raw)
+		}
+	}
+	if status.SilenceNote != "" || probed.Load() {
+		t.Fatalf("demo status = %s (probed %v), want no silence note and no probe", raw, probed.Load())
 	}
 }
 
@@ -550,12 +590,27 @@ func TestRunStatusSkipsSilenceInDemoMode(t *testing.T) {
 // locally matches the one the daemon puts in /api/status, for both activity
 // sources. Both read time.Now, so the two fields that grow with the clock may
 // differ by the moments between the calls; everything else must match.
+// time.Local is New York, and the traffic is New York daytime on exactly the
+// 14 days before a last frame at 01:11 New York. A side that judged in UTC
+// would end the baseline window at 20:00 or 19:00 New York the evening
+// before, drop those hours' frames and gain none at the start, so the zone
+// shows in baseline_events.
 func TestStatusLocalSilenceMatchesTheDaemon(t *testing.T) {
-	last := time.Now().Add(-9 * time.Hour).Truncate(time.Second)
-	var frames []time.Time
-	for at := last.Add(-16 * 24 * time.Hour); !at.After(last); at = at.Add(30 * time.Minute) {
-		frames = append(frames, at)
+	loc := newYork(t)
+	pinLocal(t, loc)
+	now := time.Now().In(loc)
+	last := time.Date(now.Year(), now.Month(), now.Day(), 1, 11, 0, 0, loc)
+	if last.After(now) {
+		last = last.AddDate(0, 0, -1)
 	}
+	var frames []time.Time
+	for day := -14; day <= -1; day++ {
+		date := last.AddDate(0, 0, day)
+		for minute := 8 * 60; minute < 23*60; minute += 30 {
+			frames = append(frames, time.Date(date.Year(), date.Month(), date.Day(), 0, minute, 0, 0, loc))
+		}
+	}
+	frames = append(frames, last)
 
 	t.Run("v2 inbox", func(t *testing.T) {
 		dataDir := t.TempDir()
@@ -653,8 +708,8 @@ func compareSilence(t *testing.T, daemon, local map[string]any) {
 	if !reflect.DeepEqual(daemon, local) {
 		t.Fatalf("silence verdicts differ\ndaemon %v\nlocal  %v", daemon, local)
 	}
-	if daemon["stalled"] != true {
-		t.Fatalf("fixture verdict = %v, want a stall (9 silent hours that are normally all active)", daemon)
+	if daemon["evaluated"] != true {
+		t.Fatalf("fixture verdict = %v, want a baseline rich enough to evaluate", daemon)
 	}
 }
 
@@ -663,12 +718,16 @@ func compareSilence(t *testing.T, daemon, local map[string]any) {
 // rows, as a partial read might, so callers must discard them on the error.
 type stubStatusActivity struct {
 	events     map[string][]time.Time
+	latestErr  error
 	betweenErr error
 }
 
 func (stubStatusActivity) Name() string { return freshness.SourceV2Inbox }
 
 func (s stubStatusActivity) Latest(context.Context) (map[string]time.Time, error) {
+	if s.latestErr != nil {
+		return nil, s.latestErr
+	}
 	latest := map[string]time.Time{}
 	for platform, events := range s.events {
 		for _, at := range events {
@@ -705,10 +764,20 @@ func TestJudgeSilenceLocallyIsEvaluateSilence(t *testing.T) {
 			t.Fatal(err)
 		}
 		var events []time.Time
-		for i, n := 0, r.Intn(800); i < n; i++ {
-			events = append(events, start.Add(time.Duration(r.Int63n(int64(20*24*time.Hour)))))
+		n := r.Intn(800)
+		if r.Intn(10) == 0 {
+			n = 0
 		}
-		now := start.Add(time.Duration(r.Int63n(int64(24 * 24 * time.Hour))))
+		last := start
+		for i := 0; i < n; i++ {
+			at := start.Add(time.Duration(r.Int63n(int64(20 * 24 * time.Hour))))
+			events = append(events, at)
+			if at.After(last) {
+				last = at
+			}
+		}
+		// Mostly after the last event, so most cases have a silence to judge.
+		now := last.Add(time.Duration(r.Int63n(int64(4*24*time.Hour))) - time.Hour)
 		var betweenErr error
 		if r.Intn(4) == 0 {
 			betweenErr = errors.New("baseline query failed")
@@ -772,12 +841,280 @@ func TestRunStatusPassesAnyDaemonVerdictThrough(t *testing.T) {
 			return false
 		}
 		line := statusRowLine(t, runStatusOutput(t, session, deps, false), "sms")
-		if !stalled {
+		switch ms := int64(silentMS) * 100; {
+		case !stalled:
 			return !strings.Contains(line, "⚠")
+		case ms == 0:
+			return strings.HasSuffix(line, "⚠ silent")
+		default:
+			return strings.HasSuffix(line, fmt.Sprintf("⚠ silent %dh", ms/time.Hour.Milliseconds()))
 		}
-		return strings.HasSuffix(line, fmt.Sprintf("⚠ silent %dh", int64(silentMS)*100/time.Hour.Milliseconds()))
 	}
 	if err := quick.Check(property, &quick.Config{MaxCount: 60, Rand: rand.New(rand.NewSource(190))}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// When the local activity query fails, the note says so and no row carries
+// a verdict; with the app's verdict for some platforms, the note says the
+// rest went unjudged.
+func TestRunStatusNotesAFailedLocalQuery(t *testing.T) {
+	loc := newYork(t)
+	dataDir := t.TempDir()
+	seedStatusV2Store(t, dataDir,
+		statusV2Seed{account: statusGoogleAccount, lastMessage: time.Date(2026, 10, 5, 22, 40, 0, 0, loc), frames: stall1006Frames(loc)},
+		statusV2Seed{account: statusWhatsAppAccount, lastMessage: time.Date(2026, 10, 6, 12, 0, 0, 0, loc)},
+	)
+	session := openStatusSession(t, dataDir, true)
+	failing := stubStatusActivity{latestErr: errors.New("database is locked")}
+	now := func() time.Time { return time.Date(2026, 10, 6, 14, 12, 0, 0, loc) }
+
+	t.Run("app down", func(t *testing.T) {
+		deps := statusDeps{daemon: downDaemon(t), source: failing, now: now, loc: loc}
+		status := decodeStatusJSON(t, runStatusOutput(t, session, deps, true))
+		for _, row := range status.Platforms {
+			if row.Silence != nil {
+				t.Fatalf("%s row carries a verdict %s after a failed query", row.Platform, row.Silence)
+			}
+		}
+		want := "Silence not judged (the app isn't running; local query failed: database is locked)."
+		if status.SilenceNote != want {
+			t.Fatalf("silence_note = %q\nwant          %q", status.SilenceNote, want)
+		}
+		if text := runStatusOutput(t, session, deps, false); !strings.Contains(text, want) {
+			t.Fatalf("status text = %q, want note %q", text, want)
+		}
+	})
+
+	t.Run("app judged some", func(t *testing.T) {
+		googleBlock := `{"source":"v2_inbox","last_event_ms":1791263460000,"silent_ms":47520000,"stalled":true,"rule":"expected_activity"}`
+		deps := statusDeps{daemon: fakeDaemon(t, daemonStatusWithGoogleSilence(dataDir, googleBlock)), source: failing, now: now, loc: loc}
+		status := decodeStatusJSON(t, runStatusOutput(t, session, deps, true))
+		if statusPlatform(t, status, "sms").SilenceJudgedBy != "daemon" || statusPlatform(t, status, "whatsapp").Silence != nil {
+			t.Fatalf("platforms = %+v, want sms judged by the daemon and whatsapp unjudged", status.Platforms)
+		}
+		want := "Silence: Google Messages judged by the running app from the v2 inbox; the rest not judged (the running app reported none; local query failed: database is locked)."
+		if status.SilenceNote != want {
+			t.Fatalf("silence_note = %q\nwant          %q", status.SilenceNote, want)
+		}
+	})
+}
+
+// A verdict judged without its baseline can only be flagged by the 72-hour
+// floor, so 37 silent hours on a busy platform show no warning. The note
+// says why, so the quiet row is not read as healthy.
+func TestRunStatusNotesAVerdictJudgedWithoutItsBaseline(t *testing.T) {
+	loc := newYork(t)
+	dataDir := t.TempDir()
+	frames := stall1006Frames(loc)
+	seedStatusV2Store(t, dataDir, statusV2Seed{account: statusGoogleAccount, lastMessage: time.Date(2026, 10, 5, 22, 40, 0, 0, loc)})
+	session := openStatusSession(t, dataDir, true)
+	deps := statusDeps{
+		daemon: downDaemon(t),
+		source: stubStatusActivity{events: map[string][]time.Time{"google": frames}, betweenErr: context.DeadlineExceeded},
+		now:    func() time.Time { return time.Date(2026, 10, 7, 15, 0, 0, 0, loc) },
+		loc:    loc,
+	}
+	text := runStatusOutput(t, session, deps, false)
+	if line := statusRowLine(t, text, "sms"); strings.Contains(line, "⚠") {
+		t.Fatalf("sms row = %q, want no warning before the 72h floor", line)
+	}
+	want := "Silence judged locally from the v2 inbox (the app isn't running). Google Messages judged without a baseline, so only the 72h floor applies."
+	if !strings.Contains(text, want) {
+		t.Fatalf("status text = %q, want note %q", text, want)
+	}
+	silence := silenceFields(t, statusPlatform(t, decodeStatusJSON(t, runStatusOutput(t, session, deps, true)), "sms").Silence)
+	if silence["baseline_unavailable"] != true || silence["evaluated"] != false {
+		t.Fatalf("silence = %v, want baseline_unavailable and not evaluated", silence)
+	}
+}
+
+// A platform with stored messages but no activity in the source (here a v2
+// store whose Google account has no inbox frames) has nothing to judge; the
+// note says so instead of leaving the row looking fresh.
+func TestRunStatusNotesAPlatformWithNoActivity(t *testing.T) {
+	loc := newYork(t)
+	dataDir := t.TempDir()
+	seedStatusV2Store(t, dataDir, statusV2Seed{account: statusGoogleAccount, lastMessage: time.Date(2026, 9, 29, 12, 0, 0, 0, loc)})
+	session := openStatusSession(t, dataDir, true)
+	deps := statusDeps{daemon: downDaemon(t), now: func() time.Time { return time.Date(2026, 10, 8, 12, 0, 0, 0, loc) }, loc: loc}
+	status := decodeStatusJSON(t, runStatusOutput(t, session, deps, true))
+	if row := statusPlatform(t, status, "sms"); row.Silence != nil {
+		t.Fatalf("sms row carries a verdict %s with no activity", row.Silence)
+	}
+	want := "Google Messages not judged: no activity recorded in the v2 inbox (the app isn't running)."
+	if status.SilenceNote != want {
+		t.Fatalf("silence_note = %q\nwant          %q", status.SilenceNote, want)
+	}
+}
+
+// A platform both days behind and silent warns "behind", and --json carries
+// behind_days and the literal silence_judged_by values documented in
+// CLAUDE.md.
+func TestRunStatusBehindOutranksSilentPerRow(t *testing.T) {
+	loc := newYork(t)
+	dataDir := t.TempDir()
+	whatsappLast := time.Date(2026, 10, 11, 6, 0, 0, 0, loc)
+	seedStatusV2Store(t, dataDir,
+		statusV2Seed{account: statusGoogleAccount, lastMessage: time.Date(2026, 10, 5, 22, 40, 0, 0, loc), frames: stall1006Frames(loc)},
+		statusV2Seed{account: statusWhatsAppAccount, lastMessage: whatsappLast, frames: []time.Time{whatsappLast}},
+	)
+	session := openStatusSession(t, dataDir, true)
+	deps := statusDeps{daemon: downDaemon(t), now: func() time.Time { return time.Date(2026, 10, 11, 12, 0, 0, 0, loc) }, loc: loc}
+
+	text := runStatusOutput(t, session, deps, false)
+	if line := statusRowLine(t, text, "sms"); !strings.HasSuffix(line, "⚠ 5d behind") {
+		t.Fatalf("sms row = %q, want %q", line, "⚠ 5d behind")
+	}
+	status := decodeStatusJSON(t, runStatusOutput(t, session, deps, true))
+	sms := statusPlatform(t, status, "sms")
+	if sms.BehindDays == nil || *sms.BehindDays != 5 || sms.SilenceJudgedBy != "local" {
+		t.Fatalf("sms row behind %v judged by %q, want 5 and local", sms.BehindDays, sms.SilenceJudgedBy)
+	}
+	if silenceFields(t, sms.Silence)["stalled"] != true {
+		t.Fatalf("sms silence = %s, want the stall kept in --json", sms.Silence)
+	}
+	if whatsapp := statusPlatform(t, status, "whatsapp"); whatsapp.BehindDays == nil || *whatsapp.BehindDays != 0 {
+		t.Fatalf("whatsapp behind_days = %v, want 0", whatsapp.BehindDays)
+	}
+}
+
+// Daemon truth on a legacy-reading CLI: an app in legacy mode measures the
+// same stored incoming messages, so its verdict is shown on both Google rows
+// (sms and rcs) and on no import row.
+func TestRunStatusShowsTheAppsVerdictOnLegacyRows(t *testing.T) {
+	loc := newYork(t)
+	dataDir := t.TempDir()
+	legacy, err := db.New(filepath.Join(dataDir, "messages.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := []*db.Message{
+		{MessageID: "sms-1", ConversationID: "sms:c", Body: "x", TimestampMS: time.Date(2026, 10, 6, 1, 11, 0, 0, loc).UnixMilli(), SourcePlatform: "sms", SourceID: "sms-1"},
+		{MessageID: "rcs-1", ConversationID: "sms:c", Body: "x", TimestampMS: time.Date(2026, 10, 5, 22, 40, 0, 0, loc).UnixMilli(), SourcePlatform: "rcs", SourceID: "rcs-1"},
+		{MessageID: "im-1", ConversationID: "im:c", Body: "x", TimestampMS: time.Date(2026, 10, 5, 20, 0, 0, 0, loc).UnixMilli(), SourcePlatform: "imessage", SourceID: "im-1"},
+	}
+	for _, row := range rows {
+		if err := legacy.UpsertMessage(row); err != nil {
+			t.Fatal(err)
+		}
+	}
+	legacy.Close()
+	session := openStatusSession(t, dataDir, false)
+	block := `{"source":"messages","last_event_ms":1791263460000,"silent_ms":47520000,"stalled":true,"rule":"max_silence"}`
+	deps := statusDeps{
+		daemon: fakeDaemon(t, daemonStatusWithGoogleSilence(dataDir, block)),
+		now:    func() time.Time { return time.Date(2026, 10, 6, 14, 12, 0, 0, loc) },
+		loc:    loc,
+	}
+	status := decodeStatusJSON(t, runStatusOutput(t, session, deps, true))
+	for _, platform := range []string{"sms", "rcs"} {
+		row := statusPlatform(t, status, platform)
+		var got bytes.Buffer
+		if err := json.Compact(&got, row.Silence); err != nil || got.String() != block || row.SilenceJudgedBy != "daemon" {
+			t.Fatalf("%s row silence = %s judged by %q, want the app's block", platform, row.Silence, row.SilenceJudgedBy)
+		}
+	}
+	if row := statusPlatform(t, status, "imessage"); row.Silence != nil || row.SilenceJudgedBy != "" {
+		t.Fatalf("imessage row = %+v, want no verdict (imports have no transport)", row)
+	}
+	if status.SilenceNote != "Silence judged by the running app from stored incoming messages." {
+		t.Fatalf("silence_note = %q", status.SilenceNote)
+	}
+}
+
+// The production entry point wires the probe to OPENMESSAGES_PORT and the
+// data dir's control token, and writes --json to stdout.
+func TestRunStatusProbesTheAppOnItsPort(t *testing.T) {
+	dataDir := t.TempDir()
+	last := time.Now().Add(-time.Hour)
+	seedStatusV2Store(t, dataDir, statusV2Seed{account: statusGoogleAccount, lastMessage: last, frames: []time.Time{last}})
+	setStatusEnv(t, dataDir, true)
+	if err := os.WriteFile(filepath.Join(dataDir, localapi.ControlTokenFile), []byte("test-token\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	block := `{"source":"v2_inbox","last_event_ms":1,"silent_ms":3600000,"stalled":false,"rule":""}`
+	var authorization atomic.Value
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authorization.Store(r.Header.Get("Authorization"))
+		io.WriteString(w, daemonStatusWithGoogleSilence(dataDir, block))
+	}))
+	t.Cleanup(server.Close)
+	port := server.URL[strings.LastIndex(server.URL, ":")+1:]
+	t.Setenv("OPENMESSAGES_PORT", port)
+
+	stdout := os.Stdout
+	read, write, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = write
+	runErr := RunStatus(zerolog.Nop(), "--json")
+	os.Stdout = stdout
+	write.Close()
+	raw, _ := io.ReadAll(read)
+	if runErr != nil {
+		t.Fatalf("RunStatus(): %v", runErr)
+	}
+	row := statusPlatform(t, decodeStatusJSON(t, string(raw)), "sms")
+	if row.SilenceJudgedBy != "daemon" {
+		t.Fatalf("sms row judged by %q, want daemon (output %s)", row.SilenceJudgedBy, raw)
+	}
+	if got, _ := authorization.Load().(string); got != "Bearer test-token" {
+		t.Fatalf("probe Authorization = %q, want the data dir's control token", got)
+	}
+}
+
+// The note tells a refused connection (nothing listening) from a timeout (an
+// app too slow to answer), using the errors a real probe returns.
+func TestUnreachableReasonTellsRefusedFromSlow(t *testing.T) {
+	release := make(chan struct{})
+	slow := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { <-release }))
+	t.Cleanup(func() { close(release); slow.Close() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	_, reachable, err := localapi.NewClient(slow.URL, "").Status(ctx)
+	if err == nil || reachable {
+		t.Fatalf("slow probe = reachable %v, err %v; want an unreachable timeout", reachable, err)
+	}
+	if got, want := unreachableReason(err), "the running app didn't answer within 3s"; got != want {
+		t.Fatalf("slow app: reason %q, want %q (err %v)", got, want, err)
+	}
+
+	_, _, err = downDaemon(t).Status(context.Background())
+	if got := unreachableReason(err); got != "the app isn't running" {
+		t.Fatalf("refused: reason %q (err %v)", got, err)
+	}
+
+	_, _, err = localapi.NewClient("http://127.0.0.1:notaport", "").Status(context.Background())
+	if got := unreachableReason(err); !strings.HasPrefix(got, "the app couldn't be reached: ") {
+		t.Fatalf("bad address: reason %q (err %v)", got, err)
+	}
+}
+
+// A daemon block is foreign input to the text output: silent_ms written as a
+// float, missing, negative or of the wrong type still yields a sane row.
+func TestNewPlatformSilenceReadsForeignBlocks(t *testing.T) {
+	cases := []struct {
+		block    string
+		silentMS int64
+		warning  string
+	}{
+		{`{"silent_ms":46800000,"stalled":true}`, 46_800_000, "  ⚠ silent 13h"},
+		{`{"silent_ms":4.68e7,"stalled":true}`, 46_800_000, "  ⚠ silent 13h"},
+		{`{"silent_ms":-7200000,"stalled":true}`, 0, "  ⚠ silent"},
+		{`{"stalled":true}`, 0, "  ⚠ silent"},
+		{`{"silent_ms":"13h","stalled":true}`, 0, "  ⚠ silent"},
+		{`{"silent_ms":46800000,"stalled":false}`, 46_800_000, ""},
+	}
+	for _, c := range cases {
+		verdict := newPlatformSilence(json.RawMessage(c.block), silenceJudgedByDaemon)
+		if verdict.SilentMS != c.silentMS {
+			t.Errorf("%s: SilentMS = %d, want %d", c.block, verdict.SilentMS, c.silentMS)
+		}
+		if got := staleWarning(0, &verdict); got != c.warning {
+			t.Errorf("%s: warning %q, want %q", c.block, got, c.warning)
+		}
 	}
 }
