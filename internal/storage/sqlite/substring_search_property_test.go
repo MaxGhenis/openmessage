@@ -28,6 +28,16 @@ var searchTextPieces = []string{
 	"\x00", "\xff", "\xc3",
 }
 
+// substringSearchQuickConfig runs the properties below over 30 random stores,
+// or 8 under -race: the race build exists to find data races, the properties
+// reach every path within a few stores, and the plain test run covers all 30.
+func substringSearchQuickConfig() *quick.Config {
+	if raceDetectorEnabled {
+		return &quick.Config{MaxCount: 8}
+	}
+	return readPlanQuickConfig
+}
+
 func randomSearchText(r *rand.Rand, pieces int) string {
 	var b strings.Builder
 	for range pieces {
@@ -152,7 +162,7 @@ func TestSearchMessagesMatchesLikeProperty(t *testing.T) {
 		}
 		return true
 	}
-	if err := quick.Check(property, readPlanQuickConfig); err != nil {
+	if err := quick.Check(property, substringSearchQuickConfig()); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -216,7 +226,7 @@ func TestSearchConversationsByNameMatchesLikeProperty(t *testing.T) {
 		}
 		return true
 	}
-	if err := quick.Check(property, readPlanQuickConfig); err != nil {
+	if err := quick.Check(property, substringSearchQuickConfig()); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -325,7 +335,7 @@ func TestSearchIndexesEqualTablesAfterRandomWritesProperty(t *testing.T) {
 		}
 		return true
 	}
-	if err := quick.Check(property, readPlanQuickConfig); err != nil {
+	if err := quick.Check(property, substringSearchQuickConfig()); err != nil {
 		t.Fatal(err)
 	}
 }
