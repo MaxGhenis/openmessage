@@ -95,3 +95,42 @@ func trayRejectedClause(nowMS int64) (string, []any) {
 		nowMS - TrayRejectedWindow.Milliseconds(),
 	}
 }
+
+// RestoreCarriedAttemptCount gives a freshly carried intent the attempt count
+// it had already spent in the store it was carried from, so a cutover can
+// never hand an intent a fresh retry budget. It applies only to a just
+// inserted, never leased row (state queued, attempt_count 0, no lease or
+// transport marker); attempts must lie in (0, DefaultMaxTransportAttempts),
+// because the carry refuses intents at or over the budget.
+func (r *OutboxRepository) RestoreCarriedAttemptCount(
+	ctx context.Context,
+	outboxID string,
+	attempts int64,
+) error {
+	if attempts <= 0 || attempts >= DefaultMaxTransportAttempts {
+		return fmt.Errorf(
+			"restore carried attempt count of outbox item %q: %d is outside (0, %d)",
+			outboxID,
+			attempts,
+			DefaultMaxTransportAttempts,
+		)
+	}
+	nowMS, err := r.nowMS("restore carried attempt count")
+	if err != nil {
+		return err
+	}
+	result, err := r.store.db.ExecContext(ctx, `
+		UPDATE outbox
+		SET attempt_count = ?,
+			updated_at_ms = MAX(updated_at_ms, ?)
+		WHERE outbox_id = ?
+		  AND state = 'queued'
+		  AND attempt_count = 0
+		  AND lease_token IS NULL
+		  AND transport_called_at_ms IS NULL
+	`, attempts, nowMS, outboxID)
+	if err != nil {
+		return fmt.Errorf("restore carried attempt count of outbox item %q: %w", outboxID, err)
+	}
+	return r.requireStateMutation(ctx, "restore carried attempt count of", outboxID, result)
+}

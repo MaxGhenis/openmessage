@@ -427,3 +427,34 @@ func TestProofFromAnotherSessionDoesNotClearAccountSwitch(t *testing.T) {
 		t.Fatal("proof from the installed session did not clear its report")
 	}
 }
+
+// The PR #204 round-2 interleaving: a proof from the installed client passes
+// its installed-client check, then (before it clears) another client of the
+// same pairing is installed and reports a fresh switch. That fresh report must
+// survive: the replacement cannot be installed until the proof's clear is
+// done, so its report lands afterwards.
+func TestProofCannotEraseASamePairingReplacementsFreshReport(t *testing.T) {
+	a, _ := accountSwitchTestApp(t)
+	old := qrSessionClient(t, "browser-a")
+	first := a.BeginGoogleGeneration(old)
+	first.Handler.Handle(fakeAccountChange("before@example.com"))
+
+	replaced := make(chan struct{})
+	googleAccountSwitchProofHook = func() {
+		go func() {
+			defer close(replaced)
+			first.Release()
+			replacement := a.BeginGoogleGeneration(qrSessionClient(t, "browser-a"))
+			replacement.Handler.Handle(fakeAccountChange("fresh@example.com"))
+		}()
+		// Give the replacement every chance to run inside the window.
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Cleanup(func() { googleAccountSwitchProofHook = nil })
+
+	a.ClearGoogleAccountSwitchFor(old)
+	<-replaced
+	if switched, account := a.GoogleAccountSwitch(); !switched || account != "fresh@example.com" {
+		t.Fatalf("GoogleAccountSwitch() = (%v, %q), want the replacement's fresh report kept", switched, account)
+	}
+}

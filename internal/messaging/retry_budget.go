@@ -309,9 +309,9 @@ func canonicalE164(value string) bool {
 }
 
 // leaseFreshForDispatch reports whether a leased row still has at least nine
-// tenths of a full lease left, enough for the slowest transport attempt the
-// adapters allow (the Google adapter bounds an attempt at 27 s of the 30 s
-// default lease).
+// tenths of a full lease left, comfortably more than the slowest transport
+// attempt the adapters allow (the Google adapter bounds an attempt at 23 s of
+// the 30 s default lease).
 func leaseFreshForDispatch(lease sqlite.Lease, now time.Time, leaseTime time.Duration) bool {
 	if lease.LeaseExpiresAtMS == nil {
 		return true

@@ -20,11 +20,18 @@ import (
 // lease every outbox attempt runs under.
 const dispatcherLeaseTime = 30 * time.Second
 
-// Design A5: a send attempt's libgm calls end within the dispatcher lease.
+// leaseContentionMargin is the time a lease may lose between being granted
+// and its transport call starting (a SQLite writer holding the database, as
+// the PR #204 round-2 review measured at 4 s), which a worst-case attempt
+// must still fit around.
+const leaseContentionMargin = 7 * time.Second
+
+// Design A5: a send attempt's libgm calls end within the dispatcher lease,
+// even after the lease lost leaseContentionMargin before the call started.
 func TestSendCallBoundsStayBelowDispatcherLease(t *testing.T) {
-	if worst := googleSendAttemptTimeout + googleSendMinimumTimeout; worst >= dispatcherLeaseTime {
-		t.Fatalf("attempt budget %s + send minimum %s = %s, want below the %s lease",
-			googleSendAttemptTimeout, googleSendMinimumTimeout, worst, dispatcherLeaseTime)
+	if worst := googleSendAttemptTimeout + googleSendMinimumTimeout; worst+leaseContentionMargin > dispatcherLeaseTime {
+		t.Fatalf("attempt budget %s + send minimum %s = %s, want it to fit the %s lease with %s to spare",
+			googleSendAttemptTimeout, googleSendMinimumTimeout, worst, dispatcherLeaseTime, leaseContentionMargin)
 	}
 	if googleLookupTimeout <= 0 || googleSendMinimumTimeout <= 0 {
 		t.Fatalf("bounds must be positive: lookup %s, send minimum %s", googleLookupTimeout, googleSendMinimumTimeout)

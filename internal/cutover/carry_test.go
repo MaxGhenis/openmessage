@@ -603,4 +603,27 @@ func TestCarryPendingOutboxLeavesExhaustedIntentsForReview(t *testing.T) {
 			t.Fatalf("exhausted intent was recreated in the fresh store: %+v", row)
 		}
 	}
+	// The carried intent keeps the attempts it already spent, so the cutover
+	// does not refill its retry budget, and a second (idempotent) pass leaves
+	// it alone.
+	assertCarriedAttempts := func(context string) {
+		t.Helper()
+		item, err := fresh.OutboxRepository.FindByID(ctx, nearly.OutboxID)
+		if err != nil {
+			t.Fatalf("%s: fresh FindByID(%q): %v", context, nearly.OutboxID, err)
+		}
+		if item.AttemptCount != sqlite.DefaultMaxTransportAttempts-1 || item.State != sqlite.OutboxQueued {
+			t.Fatalf("%s: carried intent = %+v, want queued with %d attempts already spent",
+				context, item, sqlite.DefaultMaxTransportAttempts-1)
+		}
+	}
+	assertCarriedAttempts("first pass")
+	again, err := CarryPendingOutbox(ctx, old, fresh)
+	if err != nil {
+		t.Fatalf("CarryPendingOutbox(second pass): %v", err)
+	}
+	if len(again.Carried) != 0 {
+		t.Fatalf("second pass carried %+v, want nothing new", again.Carried)
+	}
+	assertCarriedAttempts("second pass")
 }

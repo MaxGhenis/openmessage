@@ -9605,6 +9605,9 @@ body::after {
       attempts: Number(raw.attempts || 0),
       next_attempt_at: Number(raw.next_attempt_at || 0),
       last_error: lastError,
+      // Survives a reload, so a send written while the phone refused this
+      // session stays held for an explicit resend.
+      composed_while_refused: !!raw.composed_while_refused,
     };
   }
 
@@ -9921,8 +9924,23 @@ body::after {
     return changed;
   }
 
+  const QUEUED_SEND_REFUSED_AT_COMPOSE_MESSAGE = 'Not sent: your phone had switched Google Messages to '
+    + 'Google-account pairing when you wrote this, so it was held. Send it again if you still want it.';
+
+  // A send written while the phone refused this QR-paired session must never
+  // go out on its own: if pairing heals before it flushes (the browser was
+  // offline, say), it would arrive late. While the refusal lasts it still
+  // goes to the durable outbox, which refuses it visibly.
+  function queuedSendNeedsExplicitResend(item) {
+    return !!(item && item.composed_while_refused) && !googleSendsGoToRefusingOutbox();
+  }
+
   function queuedSendWaitingMessage(item) {
     const label = platformMeta(item.platform).label;
+    if (item.composed_while_refused) {
+      return 'Message held. Your phone switched Google Messages pairing, so this session can’t send it; '
+        + 'it won’t go out on its own.';
+    }
     if (browserIsOffline()) return 'Message queued. It will send when you are back online.';
     if (item.platform === 'sms' && googleStatus.needs_repair) {
       return 'Message queued. Re-pair Google Messages to send it.';
@@ -10023,6 +10041,17 @@ body::after {
     try {
       for (const item of pendingSendQueue.slice()) {
         if (!queuedSendCanFlush(item)) continue;
+        if (queuedSendNeedsExplicitResend(item)) {
+          updateQueuedSend(item.id, {
+            status: 'failed',
+            composed_while_refused: false,
+            last_error: QUEUED_SEND_REFUSED_AT_COMPOSE_MESSAGE,
+          });
+          if (activeConvoId === item.conversation_id) {
+            showThreadFeedback(QUEUED_SEND_REFUSED_AT_COMPOSE_MESSAGE, 'send');
+          }
+          continue;
+        }
         updateQueuedSend(item.id, { status: 'sending', last_error: '' });
         try {
           await sendQueuedItem(item);
@@ -10069,11 +10098,14 @@ body::after {
       showThreadFeedback('Queued message is no longer available.', 'send');
       return;
     }
+    // An explicit retry is the user's intent to send now, so it also clears
+    // the hold on a send written while the phone refused this session.
     const updated = updateQueuedSend(id, {
       status: 'pending',
       wait_for_reconnect: false,
       next_attempt_at: 0,
       last_error: '',
+      composed_while_refused: false,
     }) || item;
     if (!queuedSendCanFlush(updated)) {
       showThreadFeedback(queuedSendWaitingMessage(updated), 'send');
@@ -11641,6 +11673,10 @@ body::after {
     const originalPendingFile = pendingFile;
     const originalReplyToMsg = replyToMsg;
     const queuedItems = [];
+    // Written while the phone refuses this session: such a send may reach the
+    // durable outbox (which refuses it visibly) but never goes out on its own
+    // once pairing heals (see queuedSendNeedsExplicitResend).
+    const composedWhileRefused = activePlatform === 'sms' && googleSendsGoToRefusingOutbox();
     composeSendInFlight = true;
     clearThreadFeedback();
     $composeInput.value = '';
@@ -11665,6 +11701,7 @@ body::after {
           file_size: file.size || 0,
           timestamp_ms: Date.now(),
           status: 'pending',
+          composed_while_refused: composedWhileRefused,
         };
         queuedItems.push(await enqueueQueuedSend(mediaItem, file));
       }
@@ -11678,6 +11715,7 @@ body::after {
           reply_to_id: replyToID,
           timestamp_ms: Date.now() + (queuedItems.length ? 1 : 0),
           status: 'pending',
+          composed_while_refused: composedWhileRefused,
         };
         queuedItems.push(await enqueueQueuedSend(textItem));
       }
@@ -13259,6 +13297,8 @@ body::after {
   }
 
   function googleStatusText() {
+    // Reconnecting cannot fix a pairing switch, so the pill must not say so.
+    if (googleAccountPairingSwitched()) return 'Phone switched pairing';
     if (googleStatus.connected && !googleStatus.phone_responding) return 'Phone offline';
     if (googleStatus.connected) return 'Connected';
     if (googleStatus.paired && !googleStatus.needs_pairing) return 'Needs reconnect';
@@ -13292,6 +13332,15 @@ body::after {
       ];
       action = 'open-platforms';
       cta = 'Add platform';
+    } else if (googleAccountPairingSwitched()) {
+      // Before the disconnected case: the phone refuses this QR-paired
+      // session, so Reconnect would not help (and repeated reconnects
+      // throttle the account). Point at Platforms, as the banner does.
+      title = 'Google Messages switched pairing';
+      copy = accountPairingSwitchedCopy(googleStatus.switched_account, googleStatus.connected);
+      notes = [];
+      action = 'open-platforms';
+      cta = 'Platforms';
     } else if (googleDisconnected) {
       // Live sync warning still surfaces a reconnect CTA whether or not
       // conversations already exist, because it is actionable either way.
@@ -15117,6 +15166,30 @@ body::after {
       },
       outboxButtonLabels(rows, expanded, now) {
         return outboxButtonLabels(rows, expanded, now);
+      },
+      normalizeQueuedSend(raw) {
+        return normalizeQueuedSend(raw);
+      },
+      queuedSendNeedsExplicitResend(item, googleRaw, v2Primary) {
+        const savedGoogle = googleStatus;
+        const savedV2Primary = state.v2Primary;
+        try {
+          googleStatus = normalizeGoogleStatus(googleRaw || {});
+          state.v2Primary = v2Primary;
+          return queuedSendNeedsExplicitResend(item);
+        } finally {
+          googleStatus = savedGoogle;
+          state.v2Primary = savedV2Primary;
+        }
+      },
+      googleSurfaces(googleRaw) {
+        const savedGoogle = googleStatus;
+        try {
+          googleStatus = normalizeGoogleStatus(googleRaw || {});
+          return { pill: googleStatusText() };
+        } finally {
+          googleStatus = savedGoogle;
+        }
       },
       googleSendRouting(googleRaw, v2Primary) {
         const savedGoogle = googleStatus;

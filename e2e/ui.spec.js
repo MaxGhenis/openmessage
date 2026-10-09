@@ -2832,6 +2832,68 @@ test('while the phone refuses the session, v2 sends route to the outbox instead 
   expect(routing.repairV2).toEqual({ sendNow: false, flushQueued: false });
 });
 
+test('a send written while the phone refused the session never goes out on its own after pairing heals', async ({ page }) => {
+  await page.waitForFunction(() => window.__openMessageTestHooks?.queuedSendNeedsExplicitResend);
+  const decisions = await page.evaluate(() => {
+    const hooks = window.__openMessageTestHooks;
+    const switched = { connected: false, paired: true, account_pairing_switched: true };
+    const healed = { connected: true, paired: true };
+    const held = { id: 'held', conversation_id: 'c', type: 'text', body: 'hi', composed_while_refused: true };
+    const ordinary = { id: 'ordinary', conversation_id: 'c', type: 'text', body: 'hi' };
+    return {
+      // While the refusal lasts the held send goes to the outbox, which refuses it visibly.
+      heldWhileSwitched: hooks.queuedSendNeedsExplicitResend(held, switched, true),
+      // Once pairing heals it is handed back for an explicit resend instead of sending late.
+      heldAfterHealing: hooks.queuedSendNeedsExplicitResend(held, healed, true),
+      ordinaryAfterHealing: hooks.queuedSendNeedsExplicitResend(ordinary, healed, true),
+      // The hold survives a reload (the queue is rebuilt from localStorage).
+      reloaded: hooks.normalizeQueuedSend({ ...held, status: 'pending', timestamp_ms: Date.now() }).composed_while_refused,
+      reloadedOrdinary: hooks.normalizeQueuedSend({ ...ordinary, status: 'pending', timestamp_ms: Date.now() }).composed_while_refused,
+    };
+  });
+  expect(decisions).toEqual({
+    heldWhileSwitched: false,
+    heldAfterHealing: true,
+    ordinaryAfterHealing: false,
+    reloaded: true,
+    reloadedOrdinary: false,
+  });
+});
+
+test('the status pill and empty state point at Platforms, not Reconnect, while the phone refuses the session', async ({ page }) => {
+  const switchedOffline = {
+    connected: false,
+    v2_primary: true,
+    google: {
+      connected: false,
+      paired: true,
+      needs_pairing: false,
+      account_pairing_switched: true,
+      switched_account: 'x@gmail.com',
+    },
+    whatsapp: { connected: true, paired: true },
+    signal: { connected: true, paired: true },
+    backfill: { running: false },
+  };
+  await page.route('**/api/status', route => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify(switchedOffline),
+  }));
+  await page.route('**/api/conversations?limit=200', route => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: '[]',
+  }));
+  await page.reload();
+  await expect(page.locator('#empty-state-title')).toHaveText('Google Messages switched pairing');
+  await expect(page.locator('#empty-state-cta')).toHaveText('Platforms');
+  await expect(page.locator('#empty-state-cta')).toHaveAttribute('data-action', 'open-platforms');
+
+  const pill = await page.evaluate((google) => window.__openMessageTestHooks.googleSurfaces(google).pill, switchedOffline.google);
+  expect(pill).toBe('Phone switched pairing');
+});
+
 test('sends still go to the durable outbox while the phone refuses a QR session', async ({ page }) => {
   const outbound = `Account switch send ${Date.now()}`;
   let sendRequests = 0;

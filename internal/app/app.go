@@ -421,22 +421,41 @@ func (a *App) ClearGoogleAccountSwitch() {
 // session and changes nothing.
 func (a *App) ClearGoogleAccountSwitchFor(cli *client.Client) {
 	key, ok := googleQRSessionKey(cli)
-	if !ok || a.GetClient() != cli {
+	if !ok {
 		return
 	}
-	a.googleAccountSwitchMu.Lock()
-	previous := a.googleAccountSwitch
-	if !previous.switched || previous.sessionKey != key {
+	// The client lock is held through the installed-client check and the
+	// clear (lock order clientMu, then googleAccountSwitchMu; nothing takes
+	// them the other way round). Otherwise a client installed in between,
+	// even another client of the same pairing whose fresh report shares this
+	// key, could have its report erased by this older proof.
+	cleared := false
+	a.clientMu.RLock()
+	if a.Client == cli {
+		if googleAccountSwitchProofHook != nil {
+			googleAccountSwitchProofHook()
+		}
+		a.googleAccountSwitchMu.Lock()
+		if previous := a.googleAccountSwitch; previous.switched && previous.sessionKey == key {
+			a.googleAccountSwitch = googleAccountSwitchState{}
+			cleared = true
+		}
 		a.googleAccountSwitchMu.Unlock()
+	}
+	a.clientMu.RUnlock()
+	if !cleared {
 		return
 	}
-	a.googleAccountSwitch = googleAccountSwitchState{}
-	a.googleAccountSwitchMu.Unlock()
 	a.Logger.Info().
 		Str("reason", "phone_served_session").
 		Msg("Google-account pairing switch cleared for this session")
 	a.emitStatusChange(a.Connected.Load())
 }
+
+// googleAccountSwitchProofHook is a test seam: it runs inside
+// ClearGoogleAccountSwitchFor after the installed-client check, before the
+// clear, while the client lock is held.
+var googleAccountSwitchProofHook func()
 
 func (a *App) clearGoogleAccountSwitch(reason string) {
 	a.googleAccountSwitchMu.Lock()

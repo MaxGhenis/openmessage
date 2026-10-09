@@ -241,3 +241,46 @@ func TestOutboxListPendingShowsActionableRejectedRowsOnly(t *testing.T) {
 		t.Fatalf("ListPending(before boundary) = %d rows starting %+v, want the boundary row first", len(earlier), earlier[0])
 	}
 }
+
+// RestoreCarriedAttemptCount applies only to a just-inserted, never-leased
+// row and only within the retry budget, so it can neither reset a live row's
+// count nor hand an intent more attempts than the budget allows.
+func TestOutboxRestoreCarriedAttemptCountGuards(t *testing.T) {
+	clock := newOutboxTestClock(outboxTestTimeMS)
+	_, repository := openOutboxTestRepository(t, clock.Now)
+	ctx := context.Background()
+
+	fresh := outboxTestItem("carried")
+	mustEnqueueOutbox(t, repository, fresh)
+	for _, attempts := range []int64{0, -1, DefaultMaxTransportAttempts, DefaultMaxTransportAttempts + 1} {
+		if err := repository.RestoreCarriedAttemptCount(ctx, fresh.OutboxID, attempts); err == nil {
+			t.Fatalf("RestoreCarriedAttemptCount(%d) accepted a count outside the budget", attempts)
+		}
+	}
+	if err := repository.RestoreCarriedAttemptCount(ctx, fresh.OutboxID, 4); err != nil {
+		t.Fatalf("RestoreCarriedAttemptCount(): %v", err)
+	}
+	if got, err := repository.FindByID(ctx, fresh.OutboxID); err != nil || got.AttemptCount != 4 || got.State != OutboxQueued {
+		t.Fatalf("restored row = %+v, %v; want queued with 4 attempts", got, err)
+	}
+	// Applied once: the row no longer has zero attempts.
+	if err := repository.RestoreCarriedAttemptCount(ctx, fresh.OutboxID, 2); !errors.Is(err, ErrInvalidOutboxState) {
+		t.Fatalf("second restore error = %v, want ErrInvalidOutboxState", err)
+	}
+
+	leased := outboxTestItem("leased")
+	mustEnqueueOutbox(t, repository, leased)
+	clock.Set(outboxTestTimeMS + 1)
+	leases, err := repository.LeaseDue(ctx, LeaseRequest{
+		Owner: "worker", Now: clock.Now(), Duration: time.Minute, Limit: 2,
+	})
+	if err != nil || len(leases) != 2 {
+		t.Fatalf("LeaseDue() = %d leases, %v; want both rows leased", len(leases), err)
+	}
+	if err := repository.RestoreCarriedAttemptCount(ctx, leased.OutboxID, 3); !errors.Is(err, ErrInvalidOutboxState) {
+		t.Fatalf("restore on a leased row error = %v, want ErrInvalidOutboxState", err)
+	}
+	if err := repository.RestoreCarriedAttemptCount(ctx, "outbox-missing", 3); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("restore on a missing row error = %v, want ErrNotFound", err)
+	}
+}

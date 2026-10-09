@@ -654,11 +654,12 @@ const (
 // outbox. Each request therefore runs on its own goroutine and the adapter
 // stops waiting at a deadline. One send attempt's calls share
 // googleSendAttemptTimeout; the send itself always keeps at least
-// googleSendMinimumTimeout, so an attempt waits at most their sum, which
-// stays below the dispatcher's 30 s lease (messaging defaultLeaseTime).
-// Tests shorten them.
+// googleSendMinimumTimeout, so an attempt waits at most their sum (23 s).
+// That leaves 7 s of the dispatcher's 30 s lease (messaging defaultLeaseTime)
+// for storage contention between leasing a row and starting its call, so a
+// call does not outlive its lease. Tests shorten them.
 var (
-	googleSendAttemptTimeout = 22 * time.Second
+	googleSendAttemptTimeout = 18 * time.Second
 	googleSendMinimumTimeout = 5 * time.Second
 	// googleLookupTimeout caps one conversation lookup. A lookup sends
 	// nothing, so giving up early is always safe, and a phone that slow would
