@@ -286,6 +286,14 @@ func newV2Stack(deps v2StackDeps) (_ *v2Stack, resultErr error) {
 				Platform: bridge.PlatformGoogle,
 				Decoder:  ingest.NewGoogleDecoder(counters),
 			},
+			{
+				// Catch-up history: same envelope, insert-only semantics, and a
+				// codec the live-delivery monitors do not count.
+				Codec:    ingest.GoogleHistoryCodec,
+				Platform: bridge.PlatformGoogle,
+				Decoder:  ingest.NewGoogleDecoder(counters),
+				History:  true,
+			},
 			ingest.NewWhatsAppDecoderRegistration(),
 			{
 				Codec:    ingest.SignalJSONRPCCodec,

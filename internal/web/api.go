@@ -127,9 +127,12 @@ type APIOptions struct {
 	DownloadWhatsAppMedia func(msg *db.Message) ([]byte, string, error)
 	DownloadSignalMedia   func(msg *db.Message) ([]byte, string, error)
 	StartDeepBackfill     func() bool
-	BackfillStatus        func() any         // returns a JSON-serializable backfill progress snapshot
-	BackfillPhone         func(string) error // targeted backfill for a single phone number
-	SyncGoogleContacts    func() (int, error)
+	// StartWindowBackfill re-fetches every Google message from the given time
+	// onward (POST /api/backfill with {"since": ...}); false means busy.
+	StartWindowBackfill func(since time.Time) bool
+	BackfillStatus      func() any         // returns a JSON-serializable backfill progress snapshot
+	BackfillPhone       func(string) error // targeted backfill for a single phone number
+	SyncGoogleContacts  func() (int, error)
 
 	// Activity reports when each platform's transport last delivered anything.
 	// /api/status uses it to flag a platform whose silence outlasts its own
@@ -2618,6 +2621,23 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 	mux.HandleFunc("/api/backfill", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			httpError(w, "method not allowed", 405)
+			return
+		}
+		since, windowed, err := parseBackfillSince(r, time.Now())
+		if err != nil {
+			httpError(w, err.Error(), 400)
+			return
+		}
+		if windowed {
+			if opts.StartWindowBackfill == nil {
+				httpError(w, "window backfill not available", 501)
+				return
+			}
+			if !opts.StartWindowBackfill(since) {
+				httpError(w, "a sync is already running — try again in a moment", 409)
+				return
+			}
+			writeJSON(w, map[string]string{"status": "started", "since": since.Format(time.RFC3339)})
 			return
 		}
 		if opts.StartDeepBackfill != nil {
