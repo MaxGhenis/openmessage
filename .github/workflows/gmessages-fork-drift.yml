@@ -16,8 +16,8 @@ env:
   FORK_REPOSITORY: MaxGhenis/gmessages
   FORK_MODULE: github.com/MaxGhenis/gmessages
   FORK_BRANCH: main
-  FORK_VERSION: v0.2602.1-0.20261008222657-1dc753f2084e
-  FORK_COMMIT: 1dc753f2084eedf8db3efb63a2ac3fecb1deecf1
+  FORK_VERSION: v0.2602.1-0.20261009001900-100192cb3078
+  FORK_COMMIT: 100192cb3078739f7ed925730f7248eb18b6c340
   EXPECTED_PATCH_COUNT: "2"
   # Subjects of the carried patches, oldest first, one per line.
   EXPECTED_PATCHES: |-

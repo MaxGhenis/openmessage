@@ -63,8 +63,10 @@ type GooglePullHealthSnapshot struct {
 }
 
 // googlePullDatalessCap bounds the data-less streak the recorder remembers;
-// consecutive_dataless saturates there.
-const googlePullDatalessCap = 1024
+// consecutive_dataless saturates there. Over the cap the oldest entry is
+// evicted, which keeps the state independent of apply order. (A var so tests
+// can exercise saturation cheaply.)
+var googlePullDatalessCap = 1024
 
 type googlePullHealth struct {
 	mu       sync.Mutex
@@ -124,6 +126,14 @@ func (a *App) GooglePullHealth() *GooglePullHealthSnapshot {
 	return &snap
 }
 
+// IsGoogleAccountSwitchError reports whether err is a pull or lookup the phone
+// answered with its Google-account switch notice instead of data (the phone
+// switched to Google-account pairing; this session is a QR pairing).
+func IsGoogleAccountSwitchError(err error) bool {
+	var payloadErr *libgm.ResponsePayloadError
+	return errors.As(err, &payloadErr) && payloadErr.AccountSwitch
+}
+
 func classifyGooglePull(count int, err error) GooglePullOutcome {
 	switch {
 	case errors.Is(err, libgm.ErrNoResponsePayload):
@@ -172,8 +182,7 @@ func (a *App) recordGooglePull(clientToken any, trigger, folder string, count in
 		counted: counted,
 		local:   -1,
 	}
-	var payloadErr *libgm.ResponsePayloadError
-	rec.accountSwitch = errors.As(err, &payloadErr) && payloadErr.AccountSwitch
+	rec.accountSwitch = IsGoogleAccountSwitchError(err)
 	dataless := rec.outcome == GooglePullEmpty || rec.outcome == GooglePullNoPayload
 
 	h := &a.googlePull
@@ -192,7 +201,15 @@ func (a *App) recordGooglePull(clientToken any, trigger, folder string, count in
 		rec.local = a.countGoogleConversations()
 	}
 
-	snap, raised, cleared := h.apply(rec)
+	var (
+		snap            GooglePullHealthSnapshot
+		raised, cleared bool
+	)
+	if !a.whileGoogleClientCurrent(clientToken, func() { snap, raised, cleared = h.apply(rec) }) {
+		// The client was replaced while this pull's local count ran.
+		a.Logger.Debug().Str("trigger", trigger).AnErr("error", err).Msg("Ignoring Google pull outcome from a retired client")
+		return
+	}
 
 	evt := a.Logger.Info()
 	if dataless && counted {
@@ -260,8 +277,19 @@ func (h *googlePullHealth) apply(rec googlePullRecord) (snap GooglePullHealthSna
 				}
 			}
 			h.dataless = kept
-		} else if rec.seq > h.dataSeq && len(h.dataless) < googlePullDatalessCap {
+		} else if rec.seq > h.dataSeq {
 			h.dataless = append(h.dataless, rec.seq)
+			if len(h.dataless) > googlePullDatalessCap {
+				// Keep the newest: drop the smallest sequence number, so
+				// the retained set is the same whatever the apply order.
+				oldest := 0
+				for i, q := range h.dataless {
+					if q < h.dataless[oldest] {
+						oldest = i
+					}
+				}
+				h.dataless = append(h.dataless[:oldest], h.dataless[oldest+1:]...)
+			}
 		}
 		if dataless && rec.local >= 0 && rec.seq > h.localSeq {
 			h.localSeq = rec.seq
@@ -277,6 +305,31 @@ func (h *googlePullHealth) apply(rec googlePullRecord) (snap GooglePullHealthSna
 	s.AccountSwitch = h.newestAccountSwitch
 	s.EmptyWithLocalHistory = h.newestDataless && s.LocalConversations >= googlePullEmptyThreshold
 	return *s, s.EmptyWithLocalHistory && !was, was && !s.EmptyWithLocalHistory
+}
+
+// whileGoogleClientCurrent runs fn only if clientToken (nil = any) still
+// identifies the current Google client, holding the client lock so a
+// replacement can't land between the check and fn. Every path that replaces
+// a.Client does so under clientMu.
+func (a *App) whileGoogleClientCurrent(clientToken any, fn func()) bool {
+	if clientToken == nil {
+		fn()
+		return true
+	}
+	if a.gmClient != nil {
+		if a.gmClient != clientToken {
+			return false
+		}
+		fn()
+		return true
+	}
+	a.clientMu.RLock()
+	defer a.clientMu.RUnlock()
+	if a.Client == nil || a.Client.GM != clientToken {
+		return false
+	}
+	fn()
+	return true
 }
 
 func (a *App) countGoogleConversations() int {

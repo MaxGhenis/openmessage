@@ -17,8 +17,8 @@ import (
 const (
 	gmessagesModule            = "go.mau.fi/mautrix-gmessages"
 	gmessagesFork              = "github.com/MaxGhenis/gmessages"
-	minimumGMessagesFork       = "v0.2602.1-0.20261008222657-1dc753f2084e"
-	minimumGMessagesForkTime   = "20261008222657"
+	minimumGMessagesFork       = "v0.2602.1-0.20261009001900-100192cb3078"
+	minimumGMessagesForkTime   = "20261009001900"
 	gmessagesAuthRetryContract = "libgm/longpoll auth-refresh network retry and payload-less response rejection"
 )
 
@@ -117,6 +117,8 @@ func envWithGOWorkOff() []string {
 var gmessagesAcceptanceTests = []string{
 	"TestAccountContainerOnlyFrameFailsInsteadOfReturningEmpty",
 	"TestHeaderOnlyFrameFails",
+	"TestHeaderOnlyFrameStillCompletesAListing",
+	"TestTypedResponseSurfacesPayloadError",
 	"TestRealResponseAfterPayloadlessFrameIsDelivered",
 	"TestEncryptedEmptyPayloadIsALegitimateEmptyAnswer",
 	"TestNonDataActionsKeepFirstFrameSemantics",
@@ -154,6 +156,8 @@ func TestGMessagesForkRejectsPayloadlessResponses(t *testing.T) {
 	args := []string{"test", "-count=1", "-v", "-run", "^(" + strings.Join(gmessagesAcceptanceTests, "|") + ")$"}
 	if modfile := os.Getenv("OPENMESSAGE_CONTRACT_MODFILE"); modfile != "" {
 		// Lets a mutation check point the contract at a modified fork copy.
+		// Run the outer test with -count=1: Go's test cache does not see
+		// edits to that copy and would replay a stale pass.
 		args = append(args, "-modfile="+modfile)
 	}
 	args = append(args, gmessagesModule+"/pkg/libgm")

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -368,6 +369,9 @@ func TestConcurrentDatalessPullsBothCount(t *testing.T) {
 func TestPullHealthApplyOrderInvariance(t *testing.T) {
 	rng := rand.New(rand.NewSource(1008))
 	outcomes := []GooglePullOutcome{GooglePullOK, GooglePullEmpty, GooglePullNoPayload, GooglePullError}
+	saved := googlePullDatalessCap
+	googlePullDatalessCap = 3 // so random sets also exercise saturation
+	t.Cleanup(func() { googlePullDatalessCap = saved })
 	for iter := 0; iter < 500; iter++ {
 		n := 1 + rng.Intn(10)
 		recs := make([]googlePullRecord, n)
@@ -432,5 +436,82 @@ func TestDatalessStreakSaturates(t *testing.T) {
 	h.apply(googlePullRecord{seq: uint64(googlePullDatalessCap + 51), outcome: GooglePullOK, counted: true, count: 1, local: -1})
 	if h.snap.ConsecutiveDataless != 0 || h.snap.EmptyWithLocalHistory {
 		t.Fatalf("data did not clear a saturated streak: %+v", h.snap)
+	}
+}
+
+// A send lookup the phone answers with its account-switch notice counts like
+// the UNKNOWN send it used to become, so needs_repair still appears after
+// repeated attempts on the legacy send path.
+func TestAccountSwitchSendErrorsRaiseNeedsRepair(t *testing.T) {
+	a := newTestApp(t, &mockGMClient{})
+	a.SessionPath = t.TempDir() + "/session.json"
+	if err := os.WriteFile(a.SessionPath, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < googleRepairThreshold; i++ {
+		a.RecordGoogleSendError(fmt.Errorf("get conversation: %w", noPayloadErr(true)))
+	}
+	if !a.GoogleStatus().NeedsRepair {
+		t.Fatal("repeated account-switch send errors did not raise needs_repair")
+	}
+
+	b := newTestApp(t, &mockGMClient{})
+	b.SessionPath = a.SessionPath
+	for i := 0; i < googleRepairThreshold; i++ {
+		b.RecordGoogleSendError(noPayloadErr(false))
+		b.RecordGoogleSendError(errors.New("dial tcp: timeout"))
+	}
+	if b.GoogleStatus().NeedsRepair {
+		t.Fatal("non-account-switch errors must not raise needs_repair")
+	}
+}
+
+func TestIsGoogleAccountSwitchError(t *testing.T) {
+	if !IsGoogleAccountSwitchError(fmt.Errorf("wrapped: %w", noPayloadErr(true))) {
+		t.Fatal("wrapped account-switch error not recognised")
+	}
+	if IsGoogleAccountSwitchError(noPayloadErr(false)) || IsGoogleAccountSwitchError(errors.New("x")) || IsGoogleAccountSwitchError(nil) {
+		t.Fatal("false positive")
+	}
+}
+
+// Round-2 review: a client replaced while a pull's local count runs must not
+// have that pull applied; the check and the apply hold the client lock.
+func TestPullFromClientRetiredDuringCountIsIgnored(t *testing.T) {
+	oldClient := &mockGMClient{}
+	a := newTestApp(t, oldClient)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	a.SetGoogleConversationCounter(func() (int, error) {
+		close(entered)
+		<-release
+		return 1044, nil
+	})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		a.recordGoogleListPull(oldClient, "reconcile:old", gmproto.ListConversationsRequest_INBOX, true, nil, noPayloadErr(true))
+	}()
+	<-entered
+	a.gmClient = &mockGMClient{} // replacement lands mid-count
+	close(release)
+	<-done
+	if h := a.GooglePullHealth(); h != nil {
+		t.Fatalf("pull from the retired client was applied: %+v", h)
+	}
+}
+
+// Round-2 review: at saturation, a newer data-less pull applied before a
+// delayed older recovery must survive it (the streak is 1, not 0).
+func TestSaturatedStreakKeepsNewestAcrossDelayedRecovery(t *testing.T) {
+	var h googlePullHealth
+	n := uint64(googlePullDatalessCap)
+	for i := uint64(1); i <= n; i++ {
+		h.apply(googlePullRecord{seq: i, outcome: GooglePullEmpty, counted: true, local: 1044})
+	}
+	h.apply(googlePullRecord{seq: n + 2, outcome: GooglePullNoPayload, counted: true, local: 1044, accountSwitch: true})
+	h.apply(googlePullRecord{seq: n + 1, outcome: GooglePullOK, counted: true, count: 3, local: -1})
+	if h.snap.ConsecutiveDataless != 1 || !h.snap.EmptyWithLocalHistory || !h.snap.AccountSwitch {
+		t.Fatalf("snap = %+v", h.snap)
 	}
 }

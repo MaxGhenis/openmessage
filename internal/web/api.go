@@ -3678,6 +3678,9 @@ func googleAPIErrorMessage(action string, err error) string {
 	if isGoogleNetworkError(err) {
 		return "Google Messages is offline. Check your internet connection, then try again."
 	}
+	if app.IsGoogleAccountSwitchError(err) {
+		return "Google Messages on your phone switched to Google-account pairing and no longer answers this OpenMessage link. Re-pair OpenMessage, or switch the phone back to QR-code pairing."
+	}
 	return action + ": " + err.Error()
 }
 

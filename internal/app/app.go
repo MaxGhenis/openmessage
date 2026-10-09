@@ -235,6 +235,14 @@ func (a *App) RecordGoogleSendOutcomeWithPhone(success bool, phoneResponding boo
 func (a *App) RecordGoogleSendError(err error) {
 	if isGoogleAuthInvalid(err) {
 		a.markGoogleNeedsRepairAndPark(err)
+		return
+	}
+	if IsGoogleAccountSwitchError(err) {
+		// The phone switched to Google-account pairing and answers this
+		// session's lookups with a notice instead of data. Count it like the
+		// UNKNOWN send it used to turn into, so needs_repair (and the UI's
+		// re-pair prompt) still appears after repeated attempts.
+		a.RecordGoogleSendOutcome(false)
 	}
 }
 
