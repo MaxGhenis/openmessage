@@ -753,13 +753,14 @@ func (s *Store) ListConversationsByRecency(accountID string) ([]Conversation, er
 }
 
 // conversationsByRecencyQuery is ListConversationsByRecencyAllAccounts in one
-// statement. conversations_recency_idx is (archived_at_ms, last_message_at_ms
-// DESC, conversation_id), so each arm reads its rows already in recency order:
-// unarchived conversations as the archived_at_ms IS NULL prefix, archived ones
-// as the archived_at_ms >= 0 range (the column's CHECK makes that every non-NULL
-// value; IS NOT NULL would plan as a table scan without statistics). Each arm
-// stops after limit rows and the merge keeps the newest limit overall, so the
-// read is bounded by limit and the archived count, not by the table.
+// statement over conversations_recency_idx (archived_at_ms, last_message_at_ms
+// DESC, conversation_id). Unarchived conversations are its archived_at_ms IS
+// NULL prefix, already in recency order, so that arm stops after limit rows.
+// Archived ones are the archived_at_ms >= 0 range (the column's CHECK makes
+// that every non-NULL value; IS NOT NULL would plan as a table scan without
+// statistics); the range is ordered by archive time first, so that arm reads
+// and sorts every archived conversation. The read is therefore bounded by the
+// limit plus the archived count, not by the table.
 const conversationsByRecencyQuery = `
 	SELECT * FROM (
 		SELECT ` + conversationColumns + `

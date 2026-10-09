@@ -506,7 +506,10 @@ func searchMessagesStatement(query string, filter SearchQuery) (string, []any) {
 	conditions := []string{"m.body LIKE '%' || ? || '%'"}
 	args := []any{query}
 	if filter.AccountID != "" {
-		conditions = append(conditions, "m.account_id = ?")
+		// direction's CHECK allows exactly these two values, so the IN changes
+		// no result; it lets messages_account_direction_time_idx bound a date
+		// window per direction instead of reading the account's every row.
+		conditions = append(conditions, "m.account_id = ? AND m.direction IN ('incoming', 'outgoing')")
 		args = append(args, filter.AccountID)
 	}
 	if filter.ConversationID != "" {
@@ -530,15 +533,14 @@ func searchMessagesStatement(query string, filter SearchQuery) (string, []any) {
 	args = append(args, filter.Limit)
 
 	// A listing with no substring walks messages_time_idx from the newest end
-	// (of the window, if any) and stops after limit rows. A substring search
-	// over every conversation must not: for a rare or absent term the planner
-	// would walk the whole index and fetch each row out of rowid order, several
-	// times slower than one sequential scan. Pin that scan (with its top-N sort)
-	// until full-text search replaces LIKE. Conversation and sender filters
-	// already bound the search through their own indexes.
+	// (of the window, if any) and stops after limit rows; filtered by account
+	// it reads that account's rows inside the window. A substring search that
+	// no conversation or sender bounds must not use an index: for a rare or
+	// absent term the planner would walk messages_time_idx and fetch each row
+	// out of rowid order, several times slower than one sequential scan. Pin
+	// that scan (with its top-N sort) until full-text search replaces LIKE.
 	from := "messages AS m"
-	if (query != "" || filter.AccountID != "") &&
-		filter.ConversationID == "" && filter.SenderCanonicalValue == "" {
+	if query != "" && filter.ConversationID == "" && filter.SenderCanonicalValue == "" {
 		from = "messages AS m NOT INDEXED"
 	}
 	statement := `
