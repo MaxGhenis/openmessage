@@ -252,6 +252,31 @@ func newGapApp(t *testing.T, g *layoutGM, history GoogleHistoryIngress) *App {
 	return a
 }
 
+// newCaseApp is newTestApp for one property-test case: its store and avatar
+// sync are closed by the returned function when the case ends, not when the
+// whole test ends, so hundreds of cases don't hold hundreds of stores open.
+func newCaseApp(t *testing.T, g *layoutGM, history GoogleHistoryIngress) (*App, func()) {
+	t.Helper()
+	store, err := db.New(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := &App{Store: store, Logger: zerolog.Nop(), gmClient: g, gmHistory: history}
+	seedGapBoundary(t, a)
+	return a, func() {
+		a.StopGoogleAvatarSync()
+		_ = store.Close()
+	}
+}
+
+// propertyCases is how many cases a property test runs: fewer under -race.
+func propertyCases(plain, race int) int {
+	if raceDetector {
+		return race
+	}
+	return plain
+}
+
 // A restart after 50 messages arrived in a conversation the store last saw at
 // b000: the startup backfill pages down to b000 and stores all 50, in both
 // stores, leaving nothing for a later catch-up to miss. Before the fix it
@@ -958,10 +983,8 @@ func TestStartupBackfillPropertyNoSilentHole(t *testing.T) {
 			}
 			return nil
 		}}
-		a := newTestApp(t, g.mockGMClient)
-		a.gmClient = g
-		a.gmHistory = first
-		seedGapBoundary(t, a)
+		a, closeApp := newCaseApp(t, g, first)
+		defer closeApp()
 		swapped := false
 		if l.SwapAfter > 0 {
 			g.afterFetch = func(call int) {
@@ -1077,7 +1100,8 @@ func TestStartupBackfillPropertyNoSilentHole(t *testing.T) {
 		}
 		return true
 	}
-	if err := quick.Check(property, &quick.Config{MaxCount: 400, Rand: rand.New(rand.NewSource(20261009))}); err != nil {
+	cases := propertyCases(400, 60)
+	if err := quick.Check(property, &quick.Config{MaxCount: cases, Rand: rand.New(rand.NewSource(20261009))}); err != nil {
 		t.Fatal(err)
 	}
 	t.Logf("coverage: %v", coverage)
@@ -1090,7 +1114,7 @@ func TestStartupBackfillPropertyNoSilentHole(t *testing.T) {
 		"window cleared a gap",
 		"window kept a gap it could not fill",
 	} {
-		if coverage[branch] < 10 {
+		if coverage[branch] < max(1, cases/40) {
 			t.Errorf("only %d cases covered %q", coverage[branch], branch)
 		}
 	}
@@ -1122,20 +1146,16 @@ func TestStartupBackfillAgreesWithWindowBackfillWithinReach(t *testing.T) {
 		compared++
 		above := g.all[:l.Above]
 
-		startup := newTestApp(t, g.mockGMClient)
-		startup.gmClient = g
-		startup.gmHistory = &hcdIngress{}
-		seedGapBoundary(t, startup)
+		startup, closeStartup := newCaseApp(t, g, &hcdIngress{})
+		defer closeStartup()
 		if err := startup.Backfill(); err != nil {
 			t.Logf("layout %+v: Backfill(): %v", l, err)
 			return false
 		}
 
 		windowGM := l.gm()
-		window := newTestApp(t, windowGM.mockGMClient)
-		window.gmClient = windowGM
-		window.gmHistory = &hcdIngress{}
-		seedGapBoundary(t, window)
+		window, closeWindow := newCaseApp(t, windowGM, &hcdIngress{})
+		defer closeWindow()
 		runWindow(t, window, time.UnixMilli(gapBaseMS))
 
 		startupMissing := missingIDs(gapLegacy(t, startup), above)
@@ -1146,10 +1166,11 @@ func TestStartupBackfillAgreesWithWindowBackfillWithinReach(t *testing.T) {
 		}
 		return true
 	}
-	if err := quick.Check(property, &quick.Config{MaxCount: 200, Rand: rand.New(rand.NewSource(20261010))}); err != nil {
+	cases := propertyCases(200, 40)
+	if err := quick.Check(property, &quick.Config{MaxCount: cases, Rand: rand.New(rand.NewSource(20261010))}); err != nil {
 		t.Fatal(err)
 	}
-	if compared < 50 {
+	if compared < cases/4 {
 		t.Fatalf("only %d layouts were within reach; the comparison is too thin", compared)
 	}
 }
