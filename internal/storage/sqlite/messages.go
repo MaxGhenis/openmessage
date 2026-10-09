@@ -167,9 +167,75 @@ func (r *MessageRepository) AppendInbox(
 	return existingID, nil
 }
 
-// Unprocessed returns durable frames in receipt order. Multiple workers may
-// observe the same row; ProjectMessage provides the idempotent serialization
-// boundary.
+// InboxCursor is an unprocessed frame's position in receipt order: receipt
+// time, then inbox ID. The zero value sorts before every frame.
+type InboxCursor struct {
+	ReceivedAtMS int64
+	InboxID      string
+}
+
+// UnprocessedAfter returns the positions of at most limit unprocessed frames
+// after cursor, in receipt order, as a range seek on inbox_unprocessed_idx. It
+// selects no payload, so a caller can page past frames it means to skip
+// without decoding them; UnprocessedRecord loads one frame. (SQLite still
+// reads each listed row to confirm processed_at_ms IS NULL, and that column
+// follows the payload, so a skipped frame larger than a page also costs its
+// overflow pages.)
+func (r *MessageRepository) UnprocessedAfter(
+	ctx context.Context,
+	after InboxCursor,
+	limit int,
+) ([]InboxCursor, error) {
+	if limit <= 0 {
+		return []InboxCursor{}, nil
+	}
+	rows, err := r.store.db.QueryContext(ctx, `
+		SELECT received_at_ms, inbox_id
+		FROM inbox
+		WHERE processed_at_ms IS NULL
+		  AND (received_at_ms, inbox_id) > (?, ?)
+		ORDER BY received_at_ms, inbox_id
+		LIMIT ?
+	`, after.ReceivedAtMS, after.InboxID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list unprocessed inbox positions: %w", err)
+	}
+	positions, err := collectRows(rows, func(row rowScanner) (InboxCursor, error) {
+		var position InboxCursor
+		err := row.Scan(&position.ReceivedAtMS, &position.InboxID)
+		return position, err
+	})
+	if err != nil {
+		return nil, fmt.Errorf("list unprocessed inbox positions: %w", err)
+	}
+	return positions, nil
+}
+
+// UnprocessedRecord loads one frame for projection. ok is false when there is
+// nothing to project: the frame was processed (or never existed) after its
+// position was listed.
+func (r *MessageRepository) UnprocessedRecord(
+	ctx context.Context,
+	inboxID string,
+) (record InboxRecord, ok bool, err error) {
+	record, err = scanInboxRecord(r.store.db.QueryRowContext(ctx, `
+		SELECT `+inboxColumns+`
+		FROM inbox
+		WHERE inbox_id = ? AND processed_at_ms IS NULL
+	`, inboxID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return InboxRecord{}, false, nil
+	}
+	if err != nil {
+		return InboxRecord{}, false, fmt.Errorf("read unprocessed inbox record %q: %w", inboxID, err)
+	}
+	return record, true, nil
+}
+
+// Unprocessed returns every durable unprocessed frame, payloads included, in
+// receipt order. The worker pages with UnprocessedAfter instead; this whole
+// backlog read serves tests and diagnostics. Multiple workers may observe the
+// same row; ProjectMessage provides the idempotent serialization boundary.
 func (r *MessageRepository) Unprocessed(ctx context.Context) ([]InboxRecord, error) {
 	rows, err := r.store.db.QueryContext(ctx, `
 		SELECT `+inboxColumns+`
