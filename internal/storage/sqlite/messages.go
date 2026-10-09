@@ -153,11 +153,8 @@ func (r *MessageRepository) AppendInbox(
 	}
 
 	var existingID string
-	if err := r.store.db.QueryRowContext(ctx, `
-		SELECT inbox_id
-		FROM inbox
-		WHERE account_id = ? AND dedupe_key = ?
-	`, record.AccountID, record.DedupeKey).Scan(&existingID); err != nil {
+	if err := r.store.db.QueryRowContext(ctx, inboxDedupeLookupQuery,
+		record.AccountID, record.DedupeKey).Scan(&existingID); err != nil {
 		return "", fmt.Errorf(
 			"append inbox %q: read existing deduplicated row: %w",
 			record.InboxID,
@@ -166,6 +163,16 @@ func (r *MessageRepository) AppendInbox(
 	}
 	return existingID, nil
 }
+
+// inboxDedupeLookupQuery finds the frame that already holds a nonempty dedupe
+// key. dedupe_key <> ” repeats the condition of the partial unique index
+// inbox_dedupe_uq; without it SQLite cannot prove the index covers a bound
+// key and scans every inbox row instead.
+const inboxDedupeLookupQuery = `
+	SELECT inbox_id
+	FROM inbox
+	WHERE account_id = ? AND dedupe_key = ? AND dedupe_key <> ''
+`
 
 // Unprocessed returns durable frames in receipt order. Multiple workers may
 // observe the same row; ProjectMessage provides the idempotent serialization
