@@ -21,11 +21,7 @@ type plainReads struct{ readsource.ReadSource }
 // ListConversations(math.MaxInt), for every platform spelling and limit.
 func TestListConversationsPlatformFilterMatchesFullScanProperty(t *testing.T) {
 	a := testApp(t)
-	count := 25
-	if testing.Short() {
-		count = 5
-	}
-	config := &quick.Config{MaxCount: count, Rand: rand.New(rand.NewSource(20261009))}
+	config := &quick.Config{MaxCount: sqlitetest.PropertyRuns(25), Rand: rand.New(rand.NewSource(20261009))}
 	property := func(seed int64) bool {
 		rs := sqlitetest.BuildRandomStore(t, seed, sqlitetest.DenseShape)
 		source := v2read.New(rs.Store)

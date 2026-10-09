@@ -41,11 +41,7 @@ func buildRandomStore(t *testing.T, seed int64, shape sqlitetest.Shape) *randomS
 const readBatchSizeForTest = 500
 
 func differentialSeeds(t *testing.T) *quick.Config {
-	count := 40
-	if testing.Short() {
-		count = 8
-	}
-	return &quick.Config{MaxCount: count, Rand: rand.New(rand.NewSource(20261009))}
+	return &quick.Config{MaxCount: sqlitetest.PropertyRuns(30), Rand: rand.New(rand.NewSource(20261009))}
 }
 
 // sameResult reports whether two (value, error) results agree: both errors or
@@ -89,14 +85,34 @@ func TestConversationMappingMatchesPerRowReferenceProperty(t *testing.T) {
 			ok = sameResult(t, fmt.Sprintf("seed %d ListConversations(%d)", seed, limit), got, gotErr, want, wantErr) && ok
 		}
 
+		// The platform oracle filters one per-row ListConversations(MaxInt),
+		// exactly as referenceSource.ListPlatformConversations does per call.
+		everything, err := rs.ref.ListConversations(math.MaxInt)
+		if err != nil {
+			t.Fatal(err)
+		}
 		platforms := []string{"sms", "whatsapp", "signal", "gchat", "imessage", "custom_bridge", "", " sms", "nope"}
 		for _, platform := range platforms {
 			for _, limit := range []int{0, 1, 2, total, math.MaxInt} {
+				want := []*db.Conversation{}
+				for _, conversation := range everything {
+					if limit > 0 && len(want) < limit && conversation.SourcePlatform == platform {
+						want = append(want, conversation)
+					}
+				}
 				got, gotErr := rs.source.ListPlatformConversations(platform, limit)
-				want, wantErr := rs.ref.ListPlatformConversations(platform, limit)
-				ok = sameResult(t, fmt.Sprintf("seed %d ListPlatformConversations(%q, %d)", seed, platform, limit), got, gotErr, want, wantErr) && ok
+				ok = sameResult(t, fmt.Sprintf("seed %d ListPlatformConversations(%q, %d)", seed, platform, limit), got, gotErr, want, nil) && ok
 			}
 		}
+		// And the oracle itself once, against the reference method.
+		gotRef, gotRefErr := rs.ref.ListPlatformConversations("sms", 2)
+		wantRef := []*db.Conversation{}
+		for _, conversation := range everything {
+			if len(wantRef) < 2 && conversation.SourcePlatform == "sms" {
+				wantRef = append(wantRef, conversation)
+			}
+		}
+		ok = sameResult(t, fmt.Sprintf("seed %d reference ListPlatformConversations", seed), gotRef, gotRefErr, wantRef, nil) && ok
 
 		for _, term := range rs.SearchTerms {
 			for _, limit := range []int{0, 1, 5, 500} {

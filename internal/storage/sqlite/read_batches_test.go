@@ -59,10 +59,7 @@ func keySample(rng *rand.Rand, keys []string) []string {
 // it replaces returns for that key, and nothing for keys it would not find.
 func TestBatchedReadsMatchSingleRowReadsProperty(t *testing.T) {
 	ctx := context.Background()
-	config := &quick.Config{MaxCount: 25, Rand: rand.New(rand.NewSource(20261009))}
-	if testing.Short() {
-		config.MaxCount = 5
-	}
+	config := &quick.Config{MaxCount: sqlitetest.PropertyRuns(25), Rand: rand.New(rand.NewSource(20261009))}
 	property := func(seed int64) bool {
 		rs := sqlitetest.BuildRandomStore(t, seed, sqlitetest.DenseShape)
 		repos := newBatchRepositories(t, rs.Store)

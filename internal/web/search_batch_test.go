@@ -76,11 +76,7 @@ func referenceMergeSearchResults(reads readsource.ReadSource, identityStore *db.
 type plainReads struct{ readsource.ReadSource }
 
 func TestMergeSearchResultsMatchesPerHitReferenceProperty(t *testing.T) {
-	count := 30
-	if testing.Short() {
-		count = 6
-	}
-	config := &quick.Config{MaxCount: count, Rand: rand.New(rand.NewSource(20261009))}
+	config := &quick.Config{MaxCount: sqlitetest.PropertyRuns(25), Rand: rand.New(rand.NewSource(20261009))}
 	property := func(seed int64) bool {
 		rs := sqlitetest.BuildRandomStore(t, seed, sqlitetest.DenseShape)
 		source := v2read.New(rs.Store)

@@ -227,6 +227,16 @@ go test ./cmd/ -v      # Unit + integration tests
 go test ./... -v       # All tests
 ```
 
+v2 read mapping (`internal/v2read`) reads each page's senders, attachments,
+send states, rosters and previews in batched statements
+(`internal/storage/sqlite/read_batches.go`), never one per row. Two kinds of
+test pin that. Statement budgets count real SQL through
+`sqlitetest.OpenCounting`. Differential properties compare every read surface
+against `referenceSource` (`internal/v2read/reference_test.go`), the per-row
+mapping kept verbatim, over `sqlitetest.BuildRandomStore` stores. A mapping
+change must keep both green: update the reference only when the DTO is meant
+to change.
+
 ## Relationship visualization (`generate_viz`)
 
 Generates a self-contained HTML file combining data dashboards with narrative chapters. Output is deployable to Vercel or viewable locally.
