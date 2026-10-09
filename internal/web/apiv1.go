@@ -453,8 +453,9 @@ func v1ErrorResponse(err error) (int, string) {
 	case errors.Is(err, messaging.ErrInvalidState):
 		return http.StatusConflict, err.Error()
 	case errors.Is(err, sqlite.ErrConversationIdentityConflict):
-		// The legacy mirror refuses a thread a migrated v2 store already keys
-		// by hash; the message names that v2 conversation.
+		// A thread's natural key belongs to another v2 row that the legacy
+		// mirror could not load to adopt, which only a concurrent writer
+		// removing it can cause.
 		return http.StatusConflict, err.Error()
 	case errors.Is(err, v2wire.ErrPlatformNotSendable),
 		errors.Is(err, messaging.ErrUnsupported),
