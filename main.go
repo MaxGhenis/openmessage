@@ -23,13 +23,14 @@ func main() {
 		With().Timestamp().Logger().Level(level)
 
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "Usage: openmessage <pair|serve|demo|backup|migrate|read|thread|threads|send|import>")
+		fmt.Fprintln(os.Stderr, "Usage: openmessage <pair|serve|demo|backup|migrate|v2|read|thread|threads|send|import>")
 		fmt.Fprintln(os.Stderr, "  pair [--google|--google-file path]       - Pair with your phone via QR or Google account cookies")
 		fmt.Fprintln(os.Stderr, "  serve [--demo] [--web|--no-web] [--mcp-sse|--no-mcp-sse] [--mcp-stdio] - Start explicit web/MCP transports")
 		fmt.Fprintln(os.Stderr, "  demo                                     - Start a seeded fake-data UI with live transports disabled")
 		fmt.Fprintln(os.Stderr, "  backup [--to dir] [--json]               - Create a verified legacy migration backup and manifest")
 		fmt.Fprintln(os.Stderr, "  migrate [--check] [--from dir] [--to dir] [--json] - Transform the legacy store into a validated v2 store")
 		fmt.Fprintln(os.Stderr, "  repair google-idspace --since <RFC3339|unix-ms> [--apply] [--json] - Re-file v2 rows misrouted by a Google device id-space reset (dry run by default)")
+		fmt.Fprintln(os.Stderr, "  v2 reconcile-signal [--from dir] [--since YYYY-MM-DD] [--dry-run] [--json] - Top up v2 from legacy Signal history")
 		fmt.Fprintln(os.Stderr, "  read <query> [--limit N] [--phone X] [--since YYYY-MM-DD] [--until YYYY-MM-DD] [--json] - Search the local store")
 		fmt.Fprintln(os.Stderr, "  thread <name|number|conversation_id> [--limit N] [--since YYYY-MM-DD] [--until YYYY-MM-DD] [--json] - Print a full conversation chronologically")
 		fmt.Fprintln(os.Stderr, "  threads [--limit N] [--json]             - List recent conversations (find an id/name for thread)")
@@ -58,6 +59,19 @@ func main() {
 		err = cmd.RunMigrate(logger, os.Args[2:]...)
 	case "repair":
 		err = cmd.RunRepair(logger, os.Args[2:]...)
+	case "v2":
+		if len(os.Args) < 3 {
+			fmt.Fprintln(os.Stderr, "Usage: openmessage v2 reconcile-signal [--from dir] [--since YYYY-MM-DD] [--dry-run] [--json]")
+			os.Exit(1)
+		}
+		switch os.Args[2] {
+		case "reconcile-signal":
+			err = cmd.RunReconcileSignal(logger, os.Args[3:]...)
+		default:
+			fmt.Fprintf(os.Stderr, "Unknown v2 command: %s\n", os.Args[2])
+			fmt.Fprintln(os.Stderr, "Usage: openmessage v2 reconcile-signal [--from dir] [--since YYYY-MM-DD] [--dry-run] [--json]")
+			os.Exit(1)
+		}
 	case "read", "search":
 		if len(os.Args) < 3 {
 			fmt.Fprintln(os.Stderr, "Usage: openmessage read <query> [--limit N] [--phone NUMBER] [--json]")
@@ -130,7 +144,7 @@ func main() {
 		err = cmd.RunDebugMedia(logger, os.Args[2])
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown command: %s\n", os.Args[1])
-		fmt.Fprintln(os.Stderr, "Usage: openmessage <pair|serve|demo|backup|migrate|read|thread|threads|send|import>")
+		fmt.Fprintln(os.Stderr, "Usage: openmessage <pair|serve|demo|backup|migrate|v2|read|thread|threads|send|import>")
 		os.Exit(1)
 	}
 
