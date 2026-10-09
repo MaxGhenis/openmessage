@@ -744,7 +744,19 @@ Consequences worth knowing:
   10-08, many of them 6-hourly repeats of one unchanged count. The first
   surfaced three Google conversation snapshots quarantined over
   duplicated self-participants (fixed by deduping in `refreshConversation`,
-  PR #160). The recent ones have no diagnosed cause.
+  PR #160). On 2026-10-09 the live inbox's 9,155 Google frames (2026-07-19 to
+  10-09) were replayed into an empty store through the worker on `main`, and
+  66 were quarantined:
+  - 59 conversation snapshots whose `updated_at_ms` would have fallen below
+    the row's `created_at_ms` (a thread minted from a message carries the
+    phone's clock; #201 changes this);
+  - 3 messages whose `message_id` was already taken;
+  - 4 snapshots of 1:1 threads that listed the account itself three to five
+    times, all but one copy without a number. Since #211 such entries are
+    left off the roster instead (see
+    [Roster entries without an address](#roster-entries-without-an-address-and-why-not-to-replay-quarantined-frames)).
+    The daemon's `quarantined: 1` on the morning of 10/9 is consistent with
+    the last of them (05:50 EDT), the only replayed quarantine after 10/2.
 
 ### Testing a change
 
@@ -814,7 +826,64 @@ To reproduce a quarantine offline, copy `v2/store.sqlite3` with its `-wal` and
 feed them through a worker built with that codec's real decoder. Model it on
 `newGoogleEchoHarness` in `internal/ingest/google_echo_e2e_test.go`; the
 harness in `worker_paths_test.go` uses a fake decoder. The frames that fail
-are the quarantined ones. No ready-made replay test exists.
+are the quarantined ones. No ready-made replay test exists. To copy the live
+store without stopping the app, take an online backup, which includes what is
+still in the WAL:
+
+```bash
+sqlite3 -readonly "$HOME/Library/Application Support/OpenMessage/v2/store.sqlite3" ".backup /tmp/v2-copy.sqlite3"
+```
+
+### Roster entries without an address, and why not to replay quarantined frames
+
+A Google conversation snapshot can list entries with no number (libgm fills in
+only a participant ID and a name) or with a number v2 can't key (a "+" with no
+digits). The live worker used to fail the whole snapshot on such an entry and
+quarantine it, so the thread missed that update: its kind, title and roster.
+Since #211 the worker leaves those entries off before it reads the roster,
+and #176's rebinding (`googleConversationEventTarget`) judges the same
+entries. A stored member the snapshot doesn't name is kept when it may be one
+of the entries left off: any member when one of them isn't flagged as the
+account, and only the account's own rows when all of them are (the only shape
+seen live). A complete snapshot still replaces the roster. Each such snapshot
+logs `Left conversation snapshot participants without a usable address off
+the roster`, with `unaddressable` and `unaddressable_self` counts.
+
+What the quarantine cost: a thread v2 first sees through an incoming message
+is stored as direct, with the sender as its peer, and only a conversation
+snapshot corrects that. A group whose snapshots were all quarantined stayed
+direct, and catch-up history (see
+[Catch-up history reaches v2](#catch-up-history-reaches-v2-as-history-frames))
+skipped every fetched message of it as contradicting that thread. On this
+install no thread was left wrong. The 4 affected threads were all 1:1 and each
+got a clean snapshot later, and the replay above ends in the same state with
+or without the fix.
+
+**Don't replay quarantined frames to repair a thread.** No command re-applies
+a processed frame. The only way is to clear `processed_at_ms` on its inbox row
+while the daemon is down, since `Worker.Run` applies every unprocessed row
+when it starts. That is unsafe in general:
+
+- An old snapshot rewrites the thread's title and roster with what was true
+  when it arrived, whatever came after it.
+- A snapshot from an earlier device ID space (before a phone swap or restore)
+  is judged against today's bindings, so #176 can move a live thread's binding
+  onto its stale wire ID. On a copy of the 10/9 store, re-applying the four
+  quarantined frames changed only `updated_at_ms` in three threads. The
+  fourth, wire 1334 from 2026-08-08 (the old phone), took over the binding of
+  a short-code thread the new phone holds as wire 1333 (26 messages). A
+  message then sent on 1333 started a new thread instead of joining them.
+
+Instead, let the thread's next live snapshot correct it: the live channel
+keeps sending snapshots of threads with traffic (the four affected threads had
+4 to 14 snapshots for 5 to 19 message frames). Then run a window backfill from
+before the gap to import the history that was skipped. If re-applying a frame
+ever seems necessary, try it on a copy first. Clear `processed_at_ms` only on
+the newest snapshot of each wire, and only for frames received since the last
+re-pair. Drain the copy with a worker built from this repo and compare the
+touched threads before and after; `remote_rebinds` must stay 0. Only then
+repeat it on the live store, with the watchdog parked, the app quit and
+`v2/store.sqlite3*` copied aside.
 
 ### Parking the launchd watchdog
 
