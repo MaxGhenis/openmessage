@@ -69,6 +69,9 @@ var migration0010SQL string
 //go:embed migrations/0011_read_path_indexes.sql
 var migration0011SQL string
 
+//go:embed migrations/0012_substring_search.sql
+var migration0012SQL string
+
 var embeddedMigrations = []migration{
 	newMigration(1, "storage_shell", migration0001SQL, newStorageShellArguments),
 	newMigration(2, "identity_graph", migration0002SQL, nil),
@@ -81,6 +84,7 @@ var embeddedMigrations = []migration{
 	newMigration(9, "outbox_send_again", migration0009SQL, nil),
 	newMigration(10, "reactions", migration0010SQL, nil),
 	newMigration(11, "read_path_indexes", migration0011SQL, nil),
+	newMigration(12, "substring_search", migration0012SQL, nil),
 }
 
 func newMigration(

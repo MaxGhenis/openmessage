@@ -260,20 +260,23 @@ func TestReadQueryPlansStayOffWholeTableScans(t *testing.T) {
 	}
 }
 
-// TestUnscopedSubstringSearchKeepsSequentialScan pins the one deliberate scan:
-// a substring search over every conversation reads messages once in rowid order
-// and keeps the newest rows in a top-N sort. With messages_time_idx available
-// the planner would otherwise walk that index and fetch each row out of order,
-// which for a rare or absent term costs several times the scan (3.4 s against
-// 0.45 s on a 2.2M-message store). Full-text search is the fix for this one.
-func TestUnscopedSubstringSearchKeepsSequentialScan(t *testing.T) {
+// TestShortSubstringSearchKeepsSequentialScan pins the one deliberate scan: a
+// substring search over every conversation whose query has no literal run of
+// three characters, which the trigram index cannot narrow, reads messages once
+// in rowid order and keeps the newest rows in a top-N sort. With
+// messages_time_idx available the planner would otherwise walk that index and
+// fetch each row out of order, which for a rare or absent term costs several
+// times the scan (3.4 s against 0.45 s on a 2.2M-message store). Longer
+// queries search messages_fts (TestSubstringSearchPlansReadTheTrigramIndexes),
+// and SearchMessages tries the newest messages first for every query.
+func TestShortSubstringSearchKeepsSequentialScan(t *testing.T) {
 	store := openRepositoryTestStore(t)
 	for _, filter := range []SearchQuery{
 		{Limit: 30},
 		{SinceMS: 1, UntilMS: 2, Limit: 30},
 		{AccountID: "account-a", Limit: 30},
 	} {
-		query, args := searchMessagesStatement("term", filter)
+		query, args := searchMessagesStatement("te", filter)
 		plan := explainPlanLines(t, store.db, query, args...)
 		want := []string{"SCAN m", "USE TEMP B-TREE FOR ORDER BY"}
 		if !slices.Equal(plan, want) {
