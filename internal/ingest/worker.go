@@ -562,7 +562,10 @@ func (w *Worker) applyEvents(
 			case errors.Is(err, errHistoryContradicted):
 				contradicted[v2keys.NormalizeRemoteConversationID(string(platform), event.Conversation.RemoteConversationID)] = true
 				w.counters.account(accountID).historySkipped.Add(1)
-				w.logger.Info().
+				// Debug: after a phone swap a deep backfill can hit this once
+				// per fetched message of every stale thread; history_skipped
+				// carries the count.
+				w.logger.Debug().
 					Str("account_id", accountID).
 					Str("inbox_id", inboxID).
 					Str("remote_conversation_id", event.Conversation.RemoteConversationID).
@@ -1110,8 +1113,11 @@ func (w *Worker) existingConversation(
 // remote ID away when the phone simply holds two threads with the same people
 // (an old and a new one, or an SMS and an RCS thread), so the snapshot is
 // skipped (errHistoryUnplaceable). Otherwise a fresh thread is minted from the
-// participants that carry an address; one without (which libgm does deliver)
-// is left off the roster instead of making the whole snapshot unusable.
+// participants that carry a usable address; one without (which libgm does
+// deliver), or with one that cannot be keyed (such as a bare "+"), is left off
+// the roster instead of making the whole snapshot unusable. That also keeps the
+// stale-binding check from failing open on such an entry: an error there would
+// skip the snapshot without marking its remote ID contradicted.
 func (w *Worker) applyHistoryConversation(
 	accountID string,
 	platform bridge.Platform,
@@ -1120,9 +1126,14 @@ func (w *Worker) applyHistoryConversation(
 ) (bool, error) {
 	usable := make([]bridge.Participant, 0, len(event.Participants))
 	for _, participant := range event.Participants {
-		if identityRaw(participant.Identity) != "" {
-			usable = append(usable, participant)
+		raw := identityRaw(participant.Identity)
+		if raw == "" {
+			continue
 		}
+		if _, err := v2keys.IdentityKey(accountID, string(platform), raw); err != nil {
+			continue
+		}
+		usable = append(usable, participant)
 	}
 	event.Participants = usable
 	remoteID := v2keys.NormalizeRemoteConversationID(string(platform), event.RemoteConversationID)

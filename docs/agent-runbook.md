@@ -319,8 +319,12 @@ conversation and message to v2 as well:
   the one its id is bound to. That last case is a stale binding: after a phone
   swap or restore an id can still be bound to the old phone's thread, and a
   snapshot of another kind, another 1:1 peer or a fully disjoint group means
-  nothing in that frame is filed there. #176's id-space rebinding stays a
-  live-channel repair. A frame fetched without a snapshot (the pending-media
+  nothing in that frame is filed there. A group v2 first saw through a live
+  message frame is stored as direct, so its group snapshots count as
+  contradicting it until a live conversation event corrects the kind; if that
+  event never lands (quarantined, or dropped by libgm as old on reconnect),
+  history stays skipped for that thread and only legacy has those messages.
+  #176's id-space rebinding stays a live-channel repair. A frame fetched without a snapshot (the pending-media
   refresh) can't be checked that way; only an incoming 1:1 sender is. A skipped
   frame is re-evaluated when a later catch-up fetches it again, best effort:
   the worker drops the re-check when its queue is full, as it can be during a
@@ -332,7 +336,8 @@ conversation and message to v2 as well:
   more, legacy included. The recent reconcile and the startup backfill store
   what they fetched for a conversation oldest first, so what they didn't store
   sits above what they did, and the next recent reconcile (which pages down to
-  the newest stored message) fetches it. A reconcile interrupted between pages
+  the newest stored message, at most 4 pages of 30) fetches it, unless a live
+  message lands in legacy first and that reconcile stops above the remainder. A reconcile interrupted between pages
   stores nothing for that conversation. A deep or window backfill that stops
   has to be run again; a window run says so in `error_details`.
 - **Counters.** `/api/status` → `v2_ingest.per_account.<account>`:

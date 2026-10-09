@@ -66,8 +66,11 @@ func TestHistoryStaleBindingDirectThreadGetsNoOutgoingMessage(t *testing.T) {
 	if n := i01QueryInt64(t, h.path, `SELECT COUNT(*) FROM messages WHERE conversation_id = ?`, ada.ConversationID); n != 0 {
 		t.Fatalf("Ada's thread holds %d messages, want none", n)
 	}
-	if counts := h.counts(); counts.HistorySkipped != 2 || counts.HistoryImported != 0 {
+	if counts := h.counts(); counts.HistorySkipped != 2 || counts.HistoryImported != 0 || counts.RemoteRebinds != 0 {
 		t.Fatalf("counters = %+v, want the snapshot and the message skipped", counts)
+	}
+	if got := h.conversation(t, "zz-7"); got.ConversationID != ada.ConversationID {
+		t.Fatalf("zz-7 is bound to %q, want Ada's thread %q", got.ConversationID, ada.ConversationID)
 	}
 }
 
@@ -82,7 +85,7 @@ func TestHistoryConsistentSnapshotStillImports(t *testing.T) {
 		grown := hwtConversation("hp-grew", "Family", true, hwtKarl, hwtShoshana, hwtBea)
 		h.historyMessage(t, grown, hwtMessage{id: "hp-grew-1", conversation: "hp-grew", body: "welcome Bea", from: hwtBea, at: hwtStart.Add(-time.Hour)}.proto())
 		h.pump(t)
-		if counts := h.counts(); counts.HistoryImported != 1 || counts.HistorySkipped != 0 {
+		if counts := h.counts(); counts.HistoryImported != 1 || counts.HistorySkipped != 0 || counts.RemoteRebinds != 0 {
 			t.Fatalf("counters = %+v, want the message imported", counts)
 		}
 		if got := h.message(t, "hp-grew", "hp-grew-1").Body; got != "welcome Bea" {
@@ -101,7 +104,7 @@ func TestHistoryConsistentSnapshotStillImports(t *testing.T) {
 		snapshot := hwtConversation("hp-nopeer", "Ada", false, hwtAda)
 		h.historyMessage(t, snapshot, hwtMessage{id: "hp-nopeer-1", conversation: "hp-nopeer", body: "reply", from: hwtAda, at: hwtStart.Add(-time.Hour)}.proto())
 		h.pump(t)
-		if counts := h.counts(); counts.HistoryImported != 1 || counts.HistorySkipped != 0 {
+		if counts := h.counts(); counts.HistoryImported != 1 || counts.HistorySkipped != 0 || counts.RemoteRebinds != 0 {
 			t.Fatalf("counters = %+v, want the message imported", counts)
 		}
 	})
@@ -123,7 +126,7 @@ func TestHistoryKindMismatchWaitsForTheLiveCorrection(t *testing.T) {
 	group := hwtConversation("hp-kind", "Weekend", true, hwtKarl, hwtShoshana)
 	record := h.historyMessage(t, group, hwtMessage{id: "hp-kind-1", conversation: "hp-kind", body: "fetched", from: hwtShoshana, at: hwtStart.Add(-time.Hour)}.proto())
 	h.pump(t)
-	if counts := h.counts(); counts.HistoryImported != 0 || counts.HistorySkipped != 2 {
+	if counts := h.counts(); counts.HistoryImported != 0 || counts.HistorySkipped != 2 || counts.RemoteRebinds != 0 {
 		t.Fatalf("counters = %+v, want the frame skipped", counts)
 	}
 
