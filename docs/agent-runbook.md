@@ -421,6 +421,17 @@ running app:
   `TestNewClientPerformsNoStoreWrites` (internal/app),
   `TestRunServeMCPClientDoesNotRepairStore` and
   `TestOpenCommandReadSourceLegacyDoesNotRepairStore` (cmd).
+- **The v2 store opens without migrating** (`sqlite.OpenWithoutMigrating`):
+  only the store's owner applies schema migrations, i.e. the daemon as the
+  first step of building its v2 stack, plus `repair` and cutover. A migration
+  holds SQLite's write lock for its whole run (index builds take seconds on a
+  large store) and the daemon's writers give up after the 5 s busy timeout,
+  so a client migrating under the running app would drop inbox appends. A
+  client binary newer than the store refuses it with "quit and reopen the
+  OpenMessage app"; one older than the store refuses it as "newer than
+  supported". Regression tests: `TestOpenWithoutMigrating*`
+  (internal/storage/sqlite), `TestOpenCommandReadSourceNeverMigratesTheV2Store`
+  and `TestRunServeMCPClientNeverMigratesTheV2Store` (cmd).
 - **Sends/reactions route through the daemon** (`/api/v1/outbox` on v2,
   `/api/send`+`/api/react` on legacy), like the CLI has done since PR #140,
   with the same do-not-resend idempotency contract. With the app closed,
@@ -454,8 +465,8 @@ daemon-truth detection all line up (two-data-dirs trap above). On a migrated
 `messages.db` froze at cutover, and this keeps MCP reads on the v2 store even
 when the app is closed or predates the `auth.data_dir` status field (drop the
 line on a non-migrated install). Keep the PATH binary in lockstep with the
-installed app — both open the same SQLite stores and a version-skewed binary
-can migrate the schema under the older one.
+installed app — both open the same SQLite stores, and a client binary at a
+different schema version than the store refuses it until the two match.
 
 **Never** configure MCP to run `serve --web`, `serve --mcp-sse`, or
 `serve ... --transports` alongside the app: those are daemon shapes and will
@@ -1479,6 +1490,12 @@ rm -rf /Applications/OpenMessage.app && cp -R macos/build/OpenMessage.app /Appli
 xattr -cr /Applications/OpenMessage.app
 open -a OpenMessage
 ```
+
+A build with a new schema migration applies it when the new app starts,
+before its v2 stack (and so v2 ingest) exists. Update the PATH binary
+(`/usr/local/bin/openmessage`) after the app: until the two match, `openmessage
+read`/`status` and the MCP client refuse the store (a newer binary asks you to
+reopen the app; an older one reports the store as newer than supported).
 
 Confirm the deployed bundle kept the release id:
 

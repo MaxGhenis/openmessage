@@ -238,9 +238,10 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 	}
 	// Per-platform data-freshness, used to catch "zombie" bridges that report
 	// connected=true while no longer actually syncing (the connection flag
-	// lies; the data doesn't). Computing this scans the messages table, and
-	// /api/status is polled every few seconds, so cache it — staleness is a
-	// multi-day signal, so a 30s cache is plenty fresh.
+	// lies; the data doesn't). /api/status is polled every few seconds, so
+	// cache it — staleness is a multi-day signal, so a 30s cache is plenty
+	// fresh. On v2 the read is a few index seeks (platformLatest); the legacy
+	// store's PlatformStats still aggregates its whole messages table.
 	var (
 		freshnessMu       sync.Mutex
 		freshnessComputed time.Time

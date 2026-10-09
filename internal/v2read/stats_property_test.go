@@ -5,6 +5,7 @@ import (
 	"math/rand"
 	"reflect"
 	"sort"
+	"strings"
 	"testing"
 	"testing/quick"
 
@@ -30,7 +31,9 @@ func (statsCase) Generate(r *rand.Rand, _ int) reflect.Value {
 //   - MessageCount, ConversationCount and LatestTimestamp agree with the same
 //     sums and maxima, per platform and in total.
 func TestStatsMatchReferenceAggregatesProperty(t *testing.T) {
-	bridges := []string{"google_messages", "google_messages", "signal_cli", "whatsmeow", "mystery_bridge"}
+	// "\t" passes the accounts.bridge_key CHECK (SQLite's trim strips only
+	// spaces) but strings.TrimSpace blanks it, so it is the "unknown" platform.
+	bridges := []string{"google_messages", "google_messages", "signal_cli", "whatsmeow", "mystery_bridge", "\t"}
 	property := func(c statsCase) bool {
 		r := rand.New(rand.NewSource(c.Seed))
 		store, messages, source := openSourceTestStore(t)
@@ -42,9 +45,12 @@ func TestStatsMatchReferenceAggregatesProperty(t *testing.T) {
 			}
 			id := fmt.Sprintf("account-%d", i)
 			seedSourceAccount(t, store, id, bridge)
-			// An unmapped bridge key is its own platform label; PlatformStats
-			// would say "unknown" only for a blank one.
+			// An unmapped bridge key is its own platform label; a blank one is
+			// "unknown" in PlatformStats.
 			platform := platformForBridgeKey(bridge)
+			if strings.TrimSpace(platform) == "" {
+				platform = "unknown"
+			}
 			accounts = append(accounts, account{id: id, platform: platform})
 		}
 		if len(accounts) == 0 {
@@ -79,8 +85,10 @@ func TestStatsMatchReferenceAggregatesProperty(t *testing.T) {
 				AccountID:       conversation.AccountID,
 				RemoteMessageID: fmt.Sprintf("remote-message-%d", i),
 				Direction:       direction,
-				State:           sqlite.MessageStateActive,
-				OccurredAtMS:    occurred,
+				// Edited and deleted rows still count: the aggregates cover
+				// every stored message, as the walk they replace did.
+				State:        []sqlite.MessageState{sqlite.MessageStateActive, sqlite.MessageStateEdited, sqlite.MessageStateDeleted}[r.Intn(3)],
+				OccurredAtMS: occurred,
 			})
 			var platform string
 			for _, a := range accounts {
@@ -137,8 +145,15 @@ func TestStatsMatchReferenceAggregatesProperty(t *testing.T) {
 		for _, platform := range platforms {
 			var wantCount int
 			var wantLatest int64
+			wantConversations := conversationsPer[platform]
 			if stat := want[platform]; stat != nil {
 				wantCount, wantLatest = stat.Count, stat.LatestMS
+			}
+			if platform == "unknown" {
+				// The per-platform counters filter on the raw label, which is
+				// empty for a blank bridge key; only PlatformStats relabels it
+				// "unknown". Unchanged by the per-account rewrite.
+				wantCount, wantLatest, wantConversations = 0, 0, 0
 			}
 			count, err := source.MessageCount(platform)
 			if err != nil || count != wantCount {
@@ -151,8 +166,8 @@ func TestStatsMatchReferenceAggregatesProperty(t *testing.T) {
 				return false
 			}
 			conversations, err := source.ConversationCount(platform)
-			if err != nil || conversations != conversationsPer[platform] {
-				t.Errorf("seed %d: ConversationCount(%q) = %d, %v; want %d", c.Seed, platform, conversations, err, conversationsPer[platform])
+			if err != nil || conversations != wantConversations {
+				t.Errorf("seed %d: ConversationCount(%q) = %d, %v; want %d", c.Seed, platform, conversations, err, wantConversations)
 				return false
 			}
 		}

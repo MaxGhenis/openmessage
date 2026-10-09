@@ -10,9 +10,10 @@ import (
 )
 
 // Every aggregate below is per account: a COUNT(*) range or MAX seeks on an
-// account-leading index (see sqlite.Store.LatestMessageTimes). They used to
-// load each account's whole conversation list and page through every message,
-// once per /api/status freshness refresh.
+// account-leading index (see sqlite.Store.LatestMessageTimes). Before, each
+// loaded the account's whole conversation list; PlatformStats and MessageCount
+// then paged through every message, and LatestTimestamp read each
+// conversation's newest message.
 
 // MessageCount returns all message rows or those whose account maps to the
 // requested legacy source platform.

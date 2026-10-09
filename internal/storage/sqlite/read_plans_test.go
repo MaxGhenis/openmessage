@@ -75,6 +75,8 @@ func TestReadQueryPlansStayOffWholeTableScans(t *testing.T) {
 	senderSQL, senderArgs := search("", SearchQuery{SenderCanonicalValue: "+15550000001"})
 	senderWindowSQL, senderWindowArgs := search("x", SearchQuery{SenderCanonicalValue: "+15550000001", SinceMS: 1, UntilMS: 2})
 	listSQL, listArgs := search("", SearchQuery{})
+	accountWindowSQL, accountWindowArgs := search("", SearchQuery{AccountID: account, SinceMS: 1, UntilMS: 2})
+	accountListSQL, accountListArgs := search("", SearchQuery{AccountID: account})
 	listWindowSQL, listWindowArgs := search("", SearchQuery{SinceMS: 1, UntilMS: 2})
 	conversationSQL, conversationArgs := search("x", SearchQuery{ConversationID: conv})
 
@@ -123,6 +125,20 @@ func TestReadQueryPlansStayOffWholeTableScans(t *testing.T) {
 			wantExact: true,
 		},
 		{
+			name:    "account listing inside a window seeks each direction's window",
+			query:   accountWindowSQL,
+			args:    accountWindowArgs,
+			want:    []string{"SEARCH m USING INDEX messages_account_direction_time_idx (account_id=? AND direction=? AND occurred_at_ms>? AND occurred_at_ms<?)"},
+			notScan: []string{"m", "messages"},
+		},
+		{
+			name:    "account listing stays inside the account's index range",
+			query:   accountListSQL,
+			args:    accountListArgs,
+			want:    []string{"SEARCH m USING INDEX messages_account_direction_time_idx (account_id=? AND direction=?)"},
+			notScan: []string{"m", "messages"},
+		},
+		{
 			name:      "search inside one conversation",
 			query:     conversationSQL,
 			args:      conversationArgs,
@@ -169,15 +185,7 @@ func TestReadQueryPlansStayOffWholeTableScans(t *testing.T) {
 			},
 			notScan: []string{"conversations"},
 		},
-		{
-			name:  "newest message times are two covering seeks",
-			query: latestMessageTimesQuery,
-			args:  []any{account, account},
-			want: []string{
-				"SEARCH messages USING COVERING INDEX messages_account_direction_time_idx (account_id=? AND direction=?)",
-			},
-			notScan: []string{"messages"},
-		},
+
 		{
 			name:    "message count stays inside one account's index range",
 			query:   countMessagesQuery,
@@ -214,6 +222,22 @@ func TestReadQueryPlansStayOffWholeTableScans(t *testing.T) {
 			!strings.HasPrefix(plan[0], "SEARCH messages USING INDEX ") ||
 			!strings.Contains(plan[0], "occurred_at_ms=?") {
 			t.Fatalf("plan = %q, want a SEARCH bounded by occurred_at_ms=?", plan)
+		}
+	})
+	t.Run("newest message times seek both directions", func(t *testing.T) {
+		plan := explainPlanLines(t, db, latestMessageTimesQuery, account, account)
+		seek := "SEARCH messages USING COVERING INDEX messages_account_direction_time_idx (account_id=? AND direction=?)"
+		seeks := 0
+		for _, line := range plan {
+			if line == seek {
+				seeks++
+			}
+		}
+		// One seek per direction. Dropping either subquery's direction term
+		// keeps the MAX right but walks the account's whole range: still a
+		// SEARCH, so count the seeks rather than look for a SCAN.
+		if seeks != 2 || len(planScans(plan, "messages")) > 0 {
+			t.Fatalf("plan = %q, want exactly two %q lines", plan, seek)
 		}
 	})
 	for _, tc := range cases {

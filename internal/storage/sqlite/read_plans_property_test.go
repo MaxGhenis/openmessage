@@ -273,7 +273,9 @@ func seedReadStoreInto(t *testing.T, store *Store, seed int64) seededReadStore {
 	return out
 }
 
-func queryMessageIDs(t *testing.T, db *sql.DB, query string, args ...any) []string {
+// queryMessages returns every column of every row, so a differential check
+// compares whole rows, not just which IDs came back.
+func queryMessages(t *testing.T, db *sql.DB, query string, args ...any) []Message {
 	t.Helper()
 	rows, err := db.Query(query, args...)
 	if err != nil {
@@ -283,14 +285,10 @@ func queryMessageIDs(t *testing.T, db *sql.DB, query string, args ...any) []stri
 	if err != nil {
 		t.Fatalf("scan: %v", err)
 	}
-	ids := make([]string, 0, len(messages))
-	for _, message := range messages {
-		ids = append(ids, message.MessageID)
-	}
-	return ids
+	return messages
 }
 
-func queryConversationIDs(t *testing.T, db *sql.DB, query string, args ...any) []string {
+func queryConversations(t *testing.T, db *sql.DB, query string, args ...any) []Conversation {
 	t.Helper()
 	rows, err := db.Query(query, args...)
 	if err != nil {
@@ -300,6 +298,12 @@ func queryConversationIDs(t *testing.T, db *sql.DB, query string, args ...any) [
 	if err != nil {
 		t.Fatalf("scan: %v", err)
 	}
+	return conversations
+}
+
+func queryConversationIDs(t *testing.T, db *sql.DB, query string, args ...any) []string {
+	t.Helper()
+	conversations := queryConversations(t, db, query, args...)
 	ids := make([]string, 0, len(conversations))
 	for _, conversation := range conversations {
 		ids = append(ids, conversation.ConversationID)
@@ -329,10 +333,10 @@ func TestKeysetCursorMatchesORFormProperty(t *testing.T) {
 				{messagesBeforeCursorQuery, oldMessagesBeforeCursorQuery},
 				{messagesAfterCursorQuery, oldMessagesAfterCursorQuery},
 			} {
-				got := queryMessageIDs(t, s.store.db, pair[0], conversation, ms, id, limit)
-				want := queryMessageIDs(t, s.store.db, pair[1], conversation, ms, ms, id, limit)
-				if !slices.Equal(got, want) {
-					t.Errorf("seed %d: cursor (%d, %q) limit %d in %s = %v, OR form = %v", c.Seed, ms, id, limit, conversation, got, want)
+				got := queryMessages(t, s.store.db, pair[0], conversation, ms, id, limit)
+				want := queryMessages(t, s.store.db, pair[1], conversation, ms, ms, id, limit)
+				if !reflect.DeepEqual(got, want) {
+					t.Errorf("seed %d: cursor (%d, %q) limit %d in %s = %v, OR form = %v", c.Seed, ms, id, limit, conversation, messageIDs(got), messageIDs(want))
 					return false
 				}
 			}
@@ -410,10 +414,10 @@ func TestSearchStatementMatchesPreviousStatementProperty(t *testing.T) {
 			term := pick(s.terms)
 			newSQL, newArgs := searchMessagesStatement(term, filter)
 			oldSQL, oldArgs := oldSearchMessagesStatement(term, filter)
-			got := queryMessageIDs(t, s.store.db, newSQL, newArgs...)
-			want := queryMessageIDs(t, s.store.db, oldSQL, oldArgs...)
-			if !slices.Equal(got, want) {
-				t.Errorf("seed %d: search %q %+v = %v, previous statement = %v", c.Seed, term, filter, got, want)
+			got := queryMessages(t, s.store.db, newSQL, newArgs...)
+			want := queryMessages(t, s.store.db, oldSQL, oldArgs...)
+			if !reflect.DeepEqual(got, want) {
+				t.Errorf("seed %d: search %q %+v = %v, previous statement = %v", c.Seed, term, filter, messageIDs(got), messageIDs(want))
 				return false
 			}
 		}
@@ -445,7 +449,7 @@ func TestRebindLookupsMatchPreviousQueriesProperty(t *testing.T) {
 				if err != nil {
 					t.Fatalf("old peers: %v", err)
 				}
-				var want []string
+				want := []Identity{}
 				for rows.Next() {
 					var identity Identity
 					if err := rows.Scan(&identity.IdentityID, &identity.AccountID, &identity.Kind, &identity.CanonicalValue,
@@ -453,27 +457,23 @@ func TestRebindLookupsMatchPreviousQueriesProperty(t *testing.T) {
 						&identity.CreatedAtMS, &identity.UpdatedAtMS); err != nil {
 						t.Fatalf("scan old peers: %v", err)
 					}
-					want = append(want, identity.IdentityID)
+					want = append(want, identity)
 				}
 				rows.Close()
-				gotIDs := []string{}
-				for _, identity := range got {
-					gotIDs = append(gotIDs, identity.IdentityID)
-				}
-				if !slices.Equal(gotIDs, append([]string{}, want...)) {
-					t.Errorf("seed %d: peers of %s/%s = %v, previous = %v", c.Seed, account, conversation.ConversationID, gotIDs, want)
+				if !reflect.DeepEqual(append([]Identity{}, got...), want) {
+					t.Errorf("seed %d: peers of %s/%s = %+v, previous = %+v", c.Seed, account, conversation.ConversationID, got, want)
 					return false
 				}
 			}
 			for _, identityID := range identityIDs {
 				got, gotErr := s.store.FindDirectConversationBySolePeer(account, identityID)
-				want := queryConversationIDs(t, db, oldDirectConversationBySolePeerQuery, account, identityID, identityID)
+				want := queryConversations(t, db, oldDirectConversationBySolePeerQuery, account, identityID, identityID)
 				switch {
 				case len(want) == 0 && !errorsIsNotFound(gotErr):
 					t.Errorf("seed %d: sole peer %s/%s = %v, %v; previous found none", c.Seed, account, identityID, got.ConversationID, gotErr)
 					return false
-				case len(want) == 1 && (gotErr != nil || got.ConversationID != want[0]):
-					t.Errorf("seed %d: sole peer %s/%s = %q, %v; previous = %q", c.Seed, account, identityID, got.ConversationID, gotErr, want[0])
+				case len(want) == 1 && (gotErr != nil || !reflect.DeepEqual(got, want[0])):
+					t.Errorf("seed %d: sole peer %s/%s = %+v, %v; previous = %+v", c.Seed, account, identityID, got, gotErr, want[0])
 					return false
 				}
 			}
@@ -500,8 +500,8 @@ func TestRebindLookupsMatchPreviousQueriesProperty(t *testing.T) {
 			for _, set := range sets {
 				got, gotErr := s.store.FindGroupConversationByPeerSet(account, set)
 				want, wantFound := previousGroupByPeerSet(t, db, account, set)
-				if wantFound != (gotErr == nil) || (wantFound && got.ConversationID != want) {
-					t.Errorf("seed %d: group with peers %v in %s = %q, %v; previous = %q, found %v", c.Seed, set, account, got.ConversationID, gotErr, want, wantFound)
+				if wantFound != (gotErr == nil) || (wantFound && !reflect.DeepEqual(got, want)) {
+					t.Errorf("seed %d: group with peers %v in %s = %+v, %v; previous = %+v, found %v", c.Seed, set, account, got, gotErr, want, wantFound)
 					return false
 				}
 			}
@@ -519,14 +519,14 @@ func errorsIsNotFound(err error) bool {
 
 // previousGroupByPeerSet is FindGroupConversationByPeerSet as it was: every
 // group of the account newest first, each roster compared with the wanted set.
-func previousGroupByPeerSet(t *testing.T, db *sql.DB, account string, identityIDs []string) (string, bool) {
+func previousGroupByPeerSet(t *testing.T, db *sql.DB, account string, identityIDs []string) (Conversation, bool) {
 	t.Helper()
 	want := map[string]struct{}{}
 	for _, id := range identityIDs {
 		want[id] = struct{}{}
 	}
-	for _, group := range queryConversationIDs(t, db, oldGroupConversationsQuery, account) {
-		rows, err := db.Query(oldConversationPeerIdentitiesQuery, account, group)
+	for _, group := range queryConversations(t, db, oldGroupConversationsQuery, account) {
+		rows, err := db.Query(oldConversationPeerIdentitiesQuery, account, group.ConversationID)
 		if err != nil {
 			t.Fatalf("old roster: %v", err)
 		}
@@ -555,7 +555,7 @@ func previousGroupByPeerSet(t *testing.T, db *sql.DB, account string, identityID
 			return group, true
 		}
 	}
-	return "", false
+	return Conversation{}, false
 }
 
 // Invariant: the one-statement recency list equals sorting every conversation
@@ -563,7 +563,12 @@ func previousGroupByPeerSet(t *testing.T, db *sql.DB, account string, identityID
 func TestConversationsByRecencyMatchesFullSortProperty(t *testing.T) {
 	property := func(c readPlanStore) bool {
 		s := seedReadStore(t, c.Seed)
-		all := slices.Clone(s.conversations)
+		// Every conversation row, read whole, sorted in Go: the reference
+		// does not share the statement under test.
+		all := queryConversations(t, s.store.db, `SELECT `+conversationColumns+` FROM conversations NOT INDEXED`)
+		if len(all) != len(s.conversations) {
+			t.Fatalf("seed %d: read %d conversations, seeded %d", c.Seed, len(all), len(s.conversations))
+		}
 		sort.Slice(all, func(i, j int) bool {
 			if all[i].LastMessageAtMS != all[j].LastMessageAtMS {
 				return all[i].LastMessageAtMS > all[j].LastMessageAtMS
@@ -576,15 +581,9 @@ func TestConversationsByRecencyMatchesFullSortProperty(t *testing.T) {
 				t.Fatalf("ListConversationsByRecencyAllAccounts(%d): %v", limit, err)
 			}
 			want := all[:min(limit, len(all))]
-			if len(got) != len(want) {
-				t.Errorf("seed %d: limit %d returned %d rows, want %d", c.Seed, limit, len(got), len(want))
+			if !reflect.DeepEqual(got, want) {
+				t.Errorf("seed %d: limit %d returned %v, want %v", c.Seed, limit, conversationIDs(got), conversationIDs(want))
 				return false
-			}
-			for i := range got {
-				if got[i].ConversationID != want[i].ConversationID {
-					t.Errorf("seed %d: limit %d row %d = %s, want %s", c.Seed, limit, i, got[i].ConversationID, want[i].ConversationID)
-					return false
-				}
 			}
 		}
 		return true
@@ -674,6 +673,14 @@ func messageIDs(messages []Message) []string {
 	ids := make([]string, 0, len(messages))
 	for _, message := range messages {
 		ids = append(ids, message.MessageID)
+	}
+	return ids
+}
+
+func conversationIDs(conversations []Conversation) []string {
+	ids := make([]string, 0, len(conversations))
+	for _, conversation := range conversations {
+		ids = append(ids, conversation.ConversationID)
 	}
 	return ids
 }
