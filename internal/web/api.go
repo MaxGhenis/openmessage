@@ -238,9 +238,10 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 	}
 	// Per-platform data-freshness, used to catch "zombie" bridges that report
 	// connected=true while no longer actually syncing (the connection flag
-	// lies; the data doesn't). Computing this scans the messages table, and
-	// /api/status is polled every few seconds, so cache it — staleness is a
-	// multi-day signal, so a 30s cache is plenty fresh.
+	// lies; the data doesn't). /api/status is polled every few seconds, so
+	// cache it — staleness is a multi-day signal, so a 30s cache is plenty
+	// fresh. On v2 the read is a few index seeks (platformLatest); the legacy
+	// store's PlatformStats still aggregates its whole messages table.
 	var (
 		freshnessMu       sync.Mutex
 		freshnessComputed time.Time
@@ -253,7 +254,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		if freshnessValue != nil && time.Since(freshnessComputed) < 30*time.Second {
 			return freshnessValue
 		}
-		stats, err := reads.PlatformStats()
+		stats, err := platformLatest(reads)
 		if err != nil {
 			return freshnessValue // keep last good value on error
 		}
@@ -3814,6 +3815,34 @@ func daysBehind(older, newer int64) int {
 // (legacy path and v2 projection commit independently), so seconds of
 // disagreement are normal; a real projection stall shows up as minutes.
 const projectionLagFloorMS = int64(5 * 60 * 1000)
+
+// platformLatestSource is implemented by read sources that report each
+// platform's newest message times without counting every message (v2read).
+type platformLatestSource interface {
+	PlatformLatest() ([]db.PlatformLatest, error)
+}
+
+// platformLatest returns each stored platform's newest sent/received times.
+// Freshness never reads the counts, so a v2 store answers with index seeks; the
+// legacy store has no such method and still runs its GROUP BY.
+func platformLatest(reads readsource.ReadSource) ([]db.PlatformLatest, error) {
+	if source, ok := reads.(platformLatestSource); ok {
+		return source.PlatformLatest()
+	}
+	stats, err := reads.PlatformStats()
+	if err != nil {
+		return nil, err
+	}
+	latest := make([]db.PlatformLatest, 0, len(stats))
+	for _, st := range stats {
+		latest = append(latest, db.PlatformLatest{
+			Platform:     st.Platform,
+			LatestMS:     st.LatestMS,
+			LatestRecvMS: st.LatestRecvMS,
+		})
+	}
+	return latest, nil
+}
 
 // addProjectionLag annotates each per-platform freshness entry with how far the
 // active read source trails the legacy store, and stamps a top-level

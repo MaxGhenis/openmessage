@@ -881,9 +881,11 @@ func runServeMCPClient(logger zerolog.Logger, opts serveOptions) error {
 		if _, err := os.Stat(v2StorePath); err != nil {
 			return fmt.Errorf("v2-primary reads selected but no migrated store at %s: %w", v2StorePath, err)
 		}
-		opened, err := sqlite.Open(v2StorePath)
+		// Never migrate here: the daemon owns the store, and a migration's
+		// write lock would stall its writes for the whole index build.
+		opened, err := sqlite.OpenWithoutMigrating(v2StorePath)
 		if err != nil {
-			return fmt.Errorf("open v2 read store %q: %w", v2StorePath, err)
+			return fmt.Errorf("open v2 read store %q: %w", v2StorePath, clientStoreOpenError(err))
 		}
 		v2Store = opened
 		defer func() {

@@ -61,15 +61,28 @@ func (s *Store) ListInboundSenderIdentityIDsBefore(conversationID string, sinceM
 // MessageHasReadCursor reports whether any read cursor points at the message.
 // Such a row cannot change conversation without breaking the cursor's
 // composite foreign key.
+//
+// read_cursors has no index on last_read_message_id, but that same composite
+// key puts any cursor naming the message in the message's own conversation, so
+// the lookup seeks read_cursors_conversation_idx (a few rows, one per device)
+// instead of scanning every cursor once per planned repair row.
 func (s *Store) MessageHasReadCursor(messageID string) (bool, error) {
-	var count int64
-	if err := s.db.QueryRowContext(context.Background(), `
-		SELECT COUNT(*) FROM read_cursors WHERE last_read_message_id = ?
-	`, messageID).Scan(&count); err != nil {
+	var referenced bool
+	if err := s.db.QueryRowContext(
+		context.Background(), messageHasReadCursorQuery, messageID, messageID,
+	).Scan(&referenced); err != nil {
 		return false, fmt.Errorf("check read cursors for message %q: %w", messageID, err)
 	}
-	return count > 0, nil
+	return referenced, nil
 }
+
+const messageHasReadCursorQuery = `
+	SELECT EXISTS (
+		SELECT 1 FROM read_cursors
+		WHERE conversation_id = (SELECT conversation_id FROM messages WHERE message_id = ?)
+		  AND last_read_message_id = ?
+	)
+`
 
 // SelfIdentityID returns one self identity for the account, if any.
 func (s *Store) SelfIdentityID(accountID string) (string, bool, error) {

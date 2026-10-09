@@ -780,6 +780,14 @@ type PlatformStat struct {
 	LatestRecvMS int64 // most recent received message, 0 if none
 }
 
+// PlatformLatest is a PlatformStat without the message count, for callers that
+// only judge freshness and should not pay for counting every message.
+type PlatformLatest struct {
+	Platform     string
+	LatestMS     int64 // most recent message (sent or received), 0 if none
+	LatestRecvMS int64 // most recent received message, 0 if none
+}
+
 // PlatformStats returns per-platform message counts and the latest sent/received
 // timestamps in a single GROUP BY pass, ordered most-recent-activity first.
 //

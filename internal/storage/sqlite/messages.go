@@ -295,6 +295,32 @@ func (r *MessageRepository) GetMessageByRemote(
 	return message, nil
 }
 
+// Keyset pages compare (occurred_at_ms, message_id) as one row value, which
+// SQLite turns into a range on messages_conversation_time_idx and so reads only
+// the page. The equivalent OR form,
+// occurred_at_ms < ? OR (occurred_at_ms = ? AND message_id < ?), bounds only
+// conversation_id: each page then walks every row between the conversation's
+// newest message and the cursor, and walking a whole thread is quadratic.
+// Both columns are NOT NULL, so the two forms select the same rows.
+const (
+	messagesBeforeCursorQuery = `
+		SELECT ` + messageColumns + `
+		FROM messages
+		WHERE conversation_id = ?
+		  AND (occurred_at_ms, message_id) < (?, ?)
+		ORDER BY occurred_at_ms DESC, message_id DESC
+		LIMIT ?
+	`
+	messagesAfterCursorQuery = `
+		SELECT ` + messageColumns + `
+		FROM messages
+		WHERE conversation_id = ?
+		  AND (occurred_at_ms, message_id) > (?, ?)
+		ORDER BY occurred_at_ms ASC, message_id ASC
+		LIMIT ?
+	`
+)
+
 // ListMessagesByConversation returns a newest-first page. beforeMS == 0
 // selects the latest page; otherwise beforeID is the deterministic tie cursor.
 func (r *MessageRepository) ListMessagesByConversation(
@@ -325,15 +351,8 @@ func (r *MessageRepository) ListMessagesByConversation(
 		`
 		args = []any{conversationID, beforeMS, limit}
 		if beforeID != "" {
-			query = `
-				SELECT ` + messageColumns + `
-				FROM messages
-				WHERE conversation_id = ?
-				  AND (occurred_at_ms < ? OR (occurred_at_ms = ? AND message_id < ?))
-				ORDER BY occurred_at_ms DESC, message_id DESC
-				LIMIT ?
-			`
-			args = []any{conversationID, beforeMS, beforeMS, beforeID, limit}
+			query = messagesBeforeCursorQuery
+			args = []any{conversationID, beforeMS, beforeID, limit}
 		}
 	}
 	rows, err := r.store.db.QueryContext(ctx, query, args...)
@@ -368,15 +387,8 @@ func (r *MessageRepository) ListMessagesByConversationAfter(
 	`
 	args := []any{conversationID, afterMS, limit}
 	if afterID != "" {
-		query = `
-			SELECT ` + messageColumns + `
-			FROM messages
-			WHERE conversation_id = ?
-			  AND (occurred_at_ms > ? OR (occurred_at_ms = ? AND message_id > ?))
-			ORDER BY occurred_at_ms ASC, message_id ASC
-			LIMIT ?
-		`
-		args = []any{conversationID, afterMS, afterMS, afterID, limit}
+		query = messagesAfterCursorQuery
+		args = []any{conversationID, afterMS, afterID, limit}
 	}
 	rows, err := r.store.db.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -420,14 +432,10 @@ func (r *MessageRepository) ListMessagesAroundMessage(
 		return nil, fmt.Errorf("message %q in conversation %q: %w", messageID, conversationID, ErrNotFound)
 	}
 
-	beforeRows, err := r.store.db.QueryContext(ctx, `
-		SELECT `+messageColumns+`
-		FROM messages
-		WHERE conversation_id = ?
-		  AND (occurred_at_ms < ? OR (occurred_at_ms = ? AND message_id < ?))
-		ORDER BY occurred_at_ms DESC, message_id DESC
-		LIMIT ?
-	`, conversationID, anchor.OccurredAtMS, anchor.OccurredAtMS, anchor.MessageID, before)
+	beforeRows, err := r.store.db.QueryContext(
+		ctx, messagesBeforeCursorQuery,
+		conversationID, anchor.OccurredAtMS, anchor.MessageID, before,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("list messages before %q: %w", messageID, err)
 	}
@@ -436,14 +444,10 @@ func (r *MessageRepository) ListMessagesAroundMessage(
 		return nil, fmt.Errorf("list messages before %q: %w", messageID, err)
 	}
 
-	afterRows, err := r.store.db.QueryContext(ctx, `
-		SELECT `+messageColumns+`
-		FROM messages
-		WHERE conversation_id = ?
-		  AND (occurred_at_ms > ? OR (occurred_at_ms = ? AND message_id > ?))
-		ORDER BY occurred_at_ms ASC, message_id ASC
-		LIMIT ?
-	`, conversationID, anchor.OccurredAtMS, anchor.OccurredAtMS, anchor.MessageID, after)
+	afterRows, err := r.store.db.QueryContext(
+		ctx, messagesAfterCursorQuery,
+		conversationID, anchor.OccurredAtMS, anchor.MessageID, after,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("list messages after %q: %w", messageID, err)
 	}
@@ -476,10 +480,36 @@ func (r *MessageRepository) SearchMessages(
 		filter.SinceMS, filter.UntilMS = filter.UntilMS, filter.SinceMS
 	}
 
+	statement, args := searchMessagesStatement(query, filter)
+	rows, err := r.store.db.QueryContext(ctx, statement, args...)
+	if err != nil {
+		return nil, fmt.Errorf("search messages: %w", err)
+	}
+	messages, err := collectRows(rows, scanMessage)
+	if err != nil {
+		return nil, fmt.Errorf("search messages: %w", err)
+	}
+	return messages, nil
+}
+
+// searchMessagesStatement builds SearchMessages' SQL for an already
+// normalized filter.
+//
+// The sender filter selects the sender's identity IDs in a subquery so the
+// planner can seek messages_sender_time_idx per identity. Joining identities
+// and filtering on i.canonical_value instead walked that whole index, every
+// attributed message, because no identities index leads with canonical_value.
+// The subquery needs no account_id match: the composite foreign key
+// messages(account_id, sender_identity_id) -> identities(account_id,
+// identity_id) already makes a sender identity belong to the message's account.
+func searchMessagesStatement(query string, filter SearchQuery) (string, []any) {
 	conditions := []string{"m.body LIKE '%' || ? || '%'"}
 	args := []any{query}
 	if filter.AccountID != "" {
-		conditions = append(conditions, "m.account_id = ?")
+		// direction's CHECK allows exactly these two values, so the IN changes
+		// no result; it lets messages_account_direction_time_idx bound a date
+		// window per direction instead of reading the account's every row.
+		conditions = append(conditions, "m.account_id = ? AND m.direction IN ('incoming', 'outgoing')")
 		args = append(args, filter.AccountID)
 	}
 	if filter.ConversationID != "" {
@@ -487,7 +517,9 @@ func (r *MessageRepository) SearchMessages(
 		args = append(args, filter.ConversationID)
 	}
 	if filter.SenderCanonicalValue != "" {
-		conditions = append(conditions, "i.canonical_value = ?")
+		conditions = append(conditions, `m.sender_identity_id IN (
+			SELECT identity_id FROM identities WHERE canonical_value = ?
+		)`)
 		args = append(args, filter.SenderCanonicalValue)
 	}
 	if filter.SinceMS > 0 {
@@ -500,24 +532,25 @@ func (r *MessageRepository) SearchMessages(
 	}
 	args = append(args, filter.Limit)
 
+	// A listing with no substring walks messages_time_idx from the newest end
+	// (of the window, if any) and stops after limit rows; filtered by account
+	// it reads that account's rows inside the window. A substring search that
+	// no conversation or sender bounds must not use an index: for a rare or
+	// absent term the planner would walk messages_time_idx and fetch each row
+	// out of rowid order, several times slower than one sequential scan. Pin
+	// that scan (with its top-N sort) until full-text search replaces LIKE.
+	from := "messages AS m"
+	if query != "" && filter.ConversationID == "" && filter.SenderCanonicalValue == "" {
+		from = "messages AS m NOT INDEXED"
+	}
 	statement := `
 		SELECT ` + prefixedMessageColumns("m") + `
-		FROM messages AS m
-		LEFT JOIN identities AS i
-		  ON i.account_id = m.account_id AND i.identity_id = m.sender_identity_id
+		FROM ` + from + `
 		WHERE ` + strings.Join(conditions, " AND ") + `
 		ORDER BY m.occurred_at_ms DESC, m.message_id DESC
 		LIMIT ?
 	`
-	rows, err := r.store.db.QueryContext(ctx, statement, args...)
-	if err != nil {
-		return nil, fmt.Errorf("search messages: %w", err)
-	}
-	messages, err := collectRows(rows, scanMessage)
-	if err != nil {
-		return nil, fmt.Errorf("search messages: %w", err)
-	}
-	return messages, nil
+	return statement, args
 }
 
 // ImportMessage atomically upserts a historical normalized message by remote
