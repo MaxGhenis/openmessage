@@ -78,6 +78,13 @@ type DaemonStatus struct {
 	Auth      struct {
 		DataDir string `json:"data_dir"`
 	} `json:"auth"`
+	// Freshness is the daemon's freshness block, kept raw: an object of
+	// per-platform entries ("google", "whatsapp", "signal") whose "silence"
+	// object is the daemon's verdict, plus top-level scalars such as
+	// "newest_ms". `openmessage status` shows those verdicts as daemon
+	// truth. It stays undecoded here so a malformed block can only affect
+	// that command, never the send and MCP callers of Status.
+	Freshness json.RawMessage `json:"freshness"`
 }
 
 // SendsViaOutbox reports whether the daemon expects sends on the durable

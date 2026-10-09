@@ -286,3 +286,32 @@ func EvaluateSilence(
 func RoundHours(hours float64) float64 {
 	return math.Round(hours*100) / 100
 }
+
+// SilenceBlock renders a verdict as the freshness.<platform>.silence object
+// of /api/status. The daemon and `openmessage status --json` both emit it, so
+// its field names and value types are defined here once. source is the
+// ActivitySource name the verdict was measured on. baselineUnavailable marks a
+// verdict judged without a baseline because the baseline query failed; only
+// LongSilence can flag one.
+func SilenceBlock(source string, verdict SilenceVerdict, cfg SilenceConfig, baselineUnavailable bool) map[string]any {
+	block := map[string]any{
+		"source":                       source,
+		"last_event_ms":                verdict.LastEvent.UnixMilli(),
+		"silent_ms":                    verdict.Silence.Milliseconds(),
+		"expected_active_hours":        RoundHours(verdict.ExpectedActiveHours),
+		"expected_active_hours_limit":  cfg.ExpectedActiveHoursLimit,
+		"max_silent_ms":                cfg.MaxSilence.Milliseconds(),
+		"long_silent_ms":               cfg.LongSilence.Milliseconds(),
+		"baseline_days":                cfg.BaselineDays,
+		"baseline_active_days":         verdict.BaselineActiveDays,
+		"baseline_events":              verdict.BaselineEvents,
+		"baseline_median_daily_events": verdict.BaselineMedianDailyEvents,
+		"evaluated":                    verdict.Evaluated,
+		"stalled":                      verdict.Stalled,
+		"rule":                         verdict.Rule,
+	}
+	if baselineUnavailable {
+		block["baseline_unavailable"] = true
+	}
+	return block
+}

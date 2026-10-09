@@ -372,3 +372,49 @@ func TestEvaluateSilenceBusyNeedsExactlyMinBusyDays(t *testing.T) {
 		}
 	}
 }
+
+// SilenceBlock is the freshness.<platform>.silence contract that /api/status
+// and `openmessage status --json` share. Readers key on these names, and the
+// daemon's carry-over path type-asserts last_event_ms (int64),
+// baseline_active_days (int) and baseline_median_daily_events (float64), so
+// both the names and the Go types are pinned here.
+func TestSilenceBlockFieldsAndTypes(t *testing.T) {
+	loc := mustLoad(t, "America/New_York")
+	last := time.Date(2026, 10, 6, 1, 11, 0, 0, loc)
+	cfg := DefaultSilenceConfig
+	verdict := EvaluateSilence(last, dailyTraffic(last, 14, 8, 23, 30*time.Minute, loc), last.Add(13*time.Hour+time.Minute), loc, cfg)
+
+	block := SilenceBlock(SourceV2Inbox, verdict, cfg, false)
+	want := map[string]any{
+		"source":                       SourceV2Inbox,
+		"last_event_ms":                last.UnixMilli(),
+		"silent_ms":                    (13*time.Hour + time.Minute).Milliseconds(),
+		"expected_active_hours":        6.2,
+		"expected_active_hours_limit":  6.0,
+		"max_silent_ms":                (16 * time.Hour).Milliseconds(),
+		"long_silent_ms":               (72 * time.Hour).Milliseconds(),
+		"baseline_days":                14,
+		"baseline_active_days":         14,
+		"baseline_events":              14 * 30,
+		"baseline_median_daily_events": 30.0,
+		"evaluated":                    true,
+		"stalled":                      true,
+		"rule":                         RuleExpectedActivity,
+	}
+	if len(block) != len(want) {
+		t.Fatalf("SilenceBlock has %d fields, want %d: %v", len(block), len(want), block)
+	}
+	for key, value := range want {
+		if got, ok := block[key]; !ok || got != value {
+			t.Errorf("SilenceBlock[%q] = %#v, want %#v", key, block[key], value)
+		}
+	}
+
+	unavailable := SilenceBlock(SourceMessages, EvaluateSilence(last, nil, last.Add(time.Hour), loc, cfg), cfg, true)
+	if unavailable["baseline_unavailable"] != true || unavailable["source"] != SourceMessages || unavailable["stalled"] != false {
+		t.Fatalf("baseline-unavailable block = %v", unavailable)
+	}
+	if _, ok := block["baseline_unavailable"]; ok {
+		t.Fatal("a block judged with its baseline must not carry baseline_unavailable")
+	}
+}
