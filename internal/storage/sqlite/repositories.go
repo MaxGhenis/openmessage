@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"sort"
 	"strings"
 
 	moderncsqlite "modernc.org/sqlite"
@@ -753,33 +752,50 @@ func (s *Store) ListConversationsByRecency(accountID string) ([]Conversation, er
 	return conversations, nil
 }
 
-// ListConversationsByRecencyAllAccounts merges every account's recency list,
-// orders the result deterministically, and returns at most limit rows.
+// conversationsByRecencyQuery is ListConversationsByRecencyAllAccounts in one
+// statement. conversations_recency_idx is (archived_at_ms, last_message_at_ms
+// DESC, conversation_id), so each arm reads its rows already in recency order:
+// unarchived conversations as the archived_at_ms IS NULL prefix, archived ones
+// as the archived_at_ms >= 0 range (the column's CHECK makes that every non-NULL
+// value; IS NOT NULL would plan as a table scan without statistics). Each arm
+// stops after limit rows and the merge keeps the newest limit overall, so the
+// read is bounded by limit and the archived count, not by the table.
+const conversationsByRecencyQuery = `
+	SELECT * FROM (
+		SELECT ` + conversationColumns + `
+		FROM conversations
+		WHERE archived_at_ms IS NULL
+		ORDER BY last_message_at_ms DESC, conversation_id
+		LIMIT ?
+	)
+	UNION ALL
+	SELECT * FROM (
+		SELECT ` + conversationColumns + `
+		FROM conversations
+		WHERE archived_at_ms >= 0
+		ORDER BY last_message_at_ms DESC, conversation_id
+		LIMIT ?
+	)
+	ORDER BY last_message_at_ms DESC, conversation_id
+	LIMIT ?
+`
+
+// ListConversationsByRecencyAllAccounts returns at most limit conversations
+// across every account, newest first, with conversation ID as a deterministic
+// tie-breaker.
 func (s *Store) ListConversationsByRecencyAllAccounts(limit int) ([]Conversation, error) {
 	if limit <= 0 {
 		return []Conversation{}, nil
 	}
-	accounts, err := s.ListAccounts()
+	rows, err := s.db.QueryContext(
+		context.Background(), conversationsByRecencyQuery, limit, limit, limit,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("list conversations across accounts: %w", err)
 	}
-
-	conversations := make([]Conversation, 0)
-	for _, account := range accounts {
-		accountConversations, err := s.ListConversationsByRecency(account.AccountID)
-		if err != nil {
-			return nil, fmt.Errorf("list conversations across accounts: %w", err)
-		}
-		conversations = append(conversations, accountConversations...)
-	}
-	sort.Slice(conversations, func(i, j int) bool {
-		if conversations[i].LastMessageAtMS != conversations[j].LastMessageAtMS {
-			return conversations[i].LastMessageAtMS > conversations[j].LastMessageAtMS
-		}
-		return conversations[i].ConversationID < conversations[j].ConversationID
-	})
-	if len(conversations) > limit {
-		conversations = conversations[:limit]
+	conversations, err := collectRows(rows, scanConversation)
+	if err != nil {
+		return nil, fmt.Errorf("list conversations across accounts: %w", err)
 	}
 	return conversations, nil
 }

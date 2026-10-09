@@ -7,6 +7,25 @@ import (
 	"fmt"
 )
 
+// messageContentDuplicateQuery runs for every Google message with a body. It
+// must seek on the exact occurrence millisecond: through
+// messages_conversation_time_idx, or messages_account_direction_time_idx, which
+// the planner prefers for its third equality. Either reads only that
+// millisecond's rows.
+const messageContentDuplicateQuery = `
+	SELECT ` + messageColumns + `
+	FROM messages
+	WHERE account_id = ?
+	  AND conversation_id = ?
+	  AND occurred_at_ms = ?
+	  AND direction = ?
+	  AND body = ?
+	  AND sender_identity_id IS ?
+	  AND remote_message_id <> ?
+	ORDER BY created_at_ms, message_id
+	LIMIT 1
+`
+
 // FindMessageContentDuplicate returns a message in the same conversation with
 // identical content (direction, sender, occurrence millisecond, and body) but
 // a different remote message ID. This is the signature of a re-delivery after
@@ -24,19 +43,7 @@ func (r *MessageRepository) FindMessageContentDuplicate(
 	occurredAtMS int64,
 	body string,
 ) (Message, bool, error) {
-	message, err := scanMessage(r.store.db.QueryRowContext(ctx, `
-		SELECT `+messageColumns+`
-		FROM messages
-		WHERE account_id = ?
-		  AND conversation_id = ?
-		  AND occurred_at_ms = ?
-		  AND direction = ?
-		  AND body = ?
-		  AND sender_identity_id IS ?
-		  AND remote_message_id <> ?
-		ORDER BY created_at_ms, message_id
-		LIMIT 1
-	`,
+	message, err := scanMessage(r.store.db.QueryRowContext(ctx, messageContentDuplicateQuery,
 		accountID,
 		conversationID,
 		occurredAtMS,

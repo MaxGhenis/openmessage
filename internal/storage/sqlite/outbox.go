@@ -2018,6 +2018,16 @@ func (r *OutboxRepository) FindStoreFailedDue(
 	return items, nil
 }
 
+// latestOutboxStateQuery seeks outbox_local_message_idx and reads its newest
+// entry; read surfaces run it for every outgoing message they render.
+const latestOutboxStateQuery = `
+	SELECT state
+	FROM outbox
+	WHERE account_id = ? AND local_message_id = ?
+	ORDER BY created_at_ms DESC, outbox_id DESC
+	LIMIT 1
+`
+
 // LatestStateForLocalMessage returns the delivery state of the most recent
 // outbox row for an optimistic outgoing message, so a read surface can show
 // its send lifecycle. ok is false when the message has no outbox row (a
@@ -2028,13 +2038,9 @@ func (r *OutboxRepository) LatestStateForLocalMessage(
 	accountID, localMessageID string,
 ) (state OutboxState, ok bool, err error) {
 	var value string
-	scanErr := r.store.db.QueryRowContext(ctx, `
-		SELECT state
-		FROM outbox
-		WHERE account_id = ? AND local_message_id = ?
-		ORDER BY created_at_ms DESC, outbox_id DESC
-		LIMIT 1
-	`, accountID, localMessageID).Scan(&value)
+	scanErr := r.store.db.QueryRowContext(
+		ctx, latestOutboxStateQuery, accountID, localMessageID,
+	).Scan(&value)
 	if errors.Is(scanErr, sql.ErrNoRows) {
 		return "", false, nil
 	}

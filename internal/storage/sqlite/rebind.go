@@ -21,22 +21,64 @@ func displacedRemoteID(remoteID, conversationID string) string {
 	return DisplacedRemoteIDPrefix + remoteID + ":" + conversationID
 }
 
+// The rebind lookups below start from conversation_participants: a
+// conversation's roster through its primary key, a peer's conversations through
+// conversation_participants_identity_idx. The store never runs ANALYZE, and
+// without statistics the planner otherwise starts from the account's side
+// instead (every identity, or every conversation, of the account) and probes
+// participants once per row, which grows with the account rather than with the
+// roster.
+const (
+	// CROSS JOIN pins participants as the outer loop.
+	conversationPeerIdentitiesQuery = `
+		SELECT i.identity_id, i.account_id, i.kind, i.canonical_value, i.raw_value,
+		       i.display_name, i.is_self, i.metadata_json, i.created_at_ms, i.updated_at_ms
+		FROM conversation_participants p
+		CROSS JOIN identities i
+		  ON i.account_id = p.account_id AND i.identity_id = p.identity_id
+		WHERE p.account_id = ? AND p.conversation_id = ?
+		  AND p.is_active = 1 AND i.is_self = 0
+		ORDER BY i.identity_id
+	`
+	directConversationBySolePeerQuery = `
+		SELECT ` + conversationColumns + `
+		FROM conversations c
+		WHERE c.account_id = ? AND c.kind = 'direct'
+		  AND c.conversation_id IN (
+		      SELECT p.conversation_id FROM conversation_participants p
+		      WHERE p.identity_id = ? AND p.account_id = ? AND p.is_active = 1
+		  )
+		  AND NOT EXISTS (
+		      SELECT 1 FROM conversation_participants p2
+		      JOIN identities i2
+		        ON i2.account_id = p2.account_id AND i2.identity_id = p2.identity_id
+		      WHERE p2.account_id = c.account_id AND p2.conversation_id = c.conversation_id
+		        AND p2.is_active = 1 AND i2.is_self = 0 AND p2.identity_id <> ?
+		  )
+		ORDER BY c.last_message_at_ms DESC, c.conversation_id
+		LIMIT 1
+	`
+	groupConversationsWithMemberQuery = `
+		SELECT ` + conversationColumns + `
+		FROM conversations c
+		WHERE c.account_id = ? AND c.kind = 'group'
+		  AND c.conversation_id IN (
+		      SELECT p.conversation_id FROM conversation_participants p
+		      WHERE p.identity_id = ? AND p.account_id = ? AND p.is_active = 1
+		  )
+		ORDER BY c.last_message_at_ms DESC, c.conversation_id
+	`
+)
+
 // ListConversationPeerIdentities returns the active non-self participant
 // identities of a conversation — a direct thread's peer, or a group's members.
 func (s *Store) ListConversationPeerIdentities(
 	accountID string,
 	conversationID string,
 ) ([]Identity, error) {
-	rows, err := s.db.QueryContext(context.Background(), `
-		SELECT i.identity_id, i.account_id, i.kind, i.canonical_value, i.raw_value,
-		       i.display_name, i.is_self, i.metadata_json, i.created_at_ms, i.updated_at_ms
-		FROM conversation_participants p
-		JOIN identities i
-		  ON i.account_id = p.account_id AND i.identity_id = p.identity_id
-		WHERE p.account_id = ? AND p.conversation_id = ?
-		  AND p.is_active = 1 AND i.is_self = 0
-		ORDER BY i.identity_id
-	`, accountID, conversationID)
+	rows, err := s.db.QueryContext(
+		context.Background(), conversationPeerIdentitiesQuery, accountID, conversationID,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("list peer identities for conversation %q: %w", conversationID, err)
 	}
@@ -71,25 +113,10 @@ func (s *Store) FindDirectConversationBySolePeer(
 	accountID string,
 	identityID string,
 ) (Conversation, error) {
-	conversation, err := scanConversation(s.db.QueryRowContext(context.Background(), `
-		SELECT `+conversationColumns+`
-		FROM conversations c
-		WHERE c.account_id = ? AND c.kind = 'direct'
-		  AND EXISTS (
-		      SELECT 1 FROM conversation_participants p
-		      WHERE p.account_id = c.account_id AND p.conversation_id = c.conversation_id
-		        AND p.identity_id = ? AND p.is_active = 1
-		  )
-		  AND NOT EXISTS (
-		      SELECT 1 FROM conversation_participants p2
-		      JOIN identities i2
-		        ON i2.account_id = p2.account_id AND i2.identity_id = p2.identity_id
-		      WHERE p2.account_id = c.account_id AND p2.conversation_id = c.conversation_id
-		        AND p2.is_active = 1 AND i2.is_self = 0 AND p2.identity_id <> ?
-		  )
-		ORDER BY c.last_message_at_ms DESC, c.conversation_id
-		LIMIT 1
-	`, accountID, identityID, identityID))
+	conversation, err := scanConversation(s.db.QueryRowContext(
+		context.Background(), directConversationBySolePeerQuery,
+		accountID, identityID, accountID, identityID,
+	))
 	if errors.Is(err, sql.ErrNoRows) {
 		return Conversation{}, fmt.Errorf(
 			"direct conversation with sole peer %q: %w",
@@ -122,12 +149,13 @@ func (s *Store) FindGroupConversationByPeerSet(
 		want[id] = struct{}{}
 	}
 
-	rows, err := s.db.QueryContext(context.Background(), `
-		SELECT `+conversationColumns+`
-		FROM conversations c
-		WHERE c.account_id = ? AND c.kind = 'group'
-		ORDER BY c.last_message_at_ms DESC, c.conversation_id
-	`, accountID)
+	// A match's active non-self participants are exactly the wanted set, so it
+	// has every wanted identity as an active participant. Only groups holding
+	// the first one can match; the roster comparison below decides among them.
+	rows, err := s.db.QueryContext(
+		context.Background(), groupConversationsWithMemberQuery,
+		accountID, identityIDs[0], accountID,
+	)
 	if err != nil {
 		return Conversation{}, fmt.Errorf("list group conversations: %w", err)
 	}
