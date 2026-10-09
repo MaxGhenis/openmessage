@@ -60,11 +60,27 @@ type ConversationRef struct {
 	RemoteID string
 }
 
+// MessageRef names a stored message an operation refers to: a reaction or
+// read-receipt target, or the message a reply quotes. RemoteID is the
+// transport's identity for it. The dispatcher fills the other fields from the
+// stored message. AuthorID is the author's canonical identity. It is empty
+// when the stored message names no sender, which is always the case for a
+// message this account sent, and adapters read empty as this account. SentAt
+// is the message's occurred time. A zero
+// SentAt means the dispatcher had no stored message to describe (it does not
+// hold one under RemoteID, or the message is an outgoing one still waiting
+// for its transport ID), so only RemoteID is meaningful.
 type MessageRef struct {
 	RemoteID string
 	AuthorID string
 	SentAt   time.Time
-	Text     string
+	// Text, HasAttachment and AttachmentMIME are filled for reply targets
+	// only. Text is the stored body. HasAttachment reports whether the message
+	// carries an attachment, and AttachmentMIME is the first attachment's MIME
+	// type, so an adapter can describe a body-less message in its quote.
+	Text           string
+	HasAttachment  bool
+	AttachmentMIME string
 }
 
 type SendResult struct {

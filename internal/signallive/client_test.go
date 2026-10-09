@@ -141,7 +141,7 @@ func TestBridgeSendTextRequestRunsJSONSendAndReturnsSignalTimestamp(t *testing.T
 				return success, nil
 			}
 
-			timestamp, err := bridge.SendTextRequest(tc.conversationID, "  hello from durable Signal  ", "")
+			timestamp, err := bridge.SendTextRequest(tc.conversationID, "  hello from durable Signal  ", ReplyTarget{})
 			if err != nil {
 				t.Fatalf("SendTextRequest(): %v", err)
 			}
@@ -202,7 +202,7 @@ func TestBridgeSendTextRequestIncludesSignalQuoteArguments(t *testing.T) {
 		return success, nil
 	}
 
-	if _, err := bridge.SendTextRequest(conversationID, "replying", "signal:reply-1"); err != nil {
+	if _, err := bridge.SendTextRequest(conversationID, "replying", ReplyTarget{RemoteID: "signal:reply-1"}); err != nil {
 		t.Fatalf("SendTextRequest(): %v", err)
 	}
 	wantArgs := []string{
@@ -276,7 +276,7 @@ func TestBridgeSendTextRequestClassifiesStructuredAndOpaqueFailures(t *testing.T
 				return tc.output, tc.commandErr
 			}
 
-			_, err := bridge.SendTextRequest("signal:+15551234567", "hello", "")
+			_, err := bridge.SendTextRequest("signal:+15551234567", "hello", ReplyTarget{})
 			if err == nil || !IsCommandError(err) {
 				t.Fatalf("SendTextRequest() error = %v (%T), want CommandError", err, err)
 			}
@@ -310,7 +310,7 @@ func TestBridgeSendTextRequestSucceedsOnMixedRecipientResults(t *testing.T) {
 		return mixed, nil
 	}
 
-	timestamp, err := bridge.SendTextRequest("signal-group:test-group", "hello group", "")
+	timestamp, err := bridge.SendTextRequest("signal-group:test-group", "hello group", ReplyTarget{})
 	if err != nil {
 		t.Fatalf("SendTextRequest() on mixed results = %v, want success", err)
 	}
@@ -455,7 +455,7 @@ func TestBridgeSendMediaRequestStreamsAttachmentAndRemovesTempFileOnSuccess(t *t
 		"photo.png",
 		"image/png",
 		"signal photo",
-		"",
+		ReplyTarget{},
 	)
 	if err != nil {
 		t.Fatalf("SendMediaRequest(): %v", err)
@@ -555,7 +555,7 @@ func TestBridgeSendMediaRequestClassifiesStructuredAndOpaqueFailures(t *testing.
 				"photo.png",
 				"image/png",
 				"",
-				"",
+				ReplyTarget{},
 			)
 			if err == nil || !IsCommandError(err) {
 				t.Fatalf("SendMediaRequest() error = %v (%T), want CommandError", err, err)
@@ -615,7 +615,7 @@ func TestBridgeSendMediaRequestSucceedsOnMixedRecipientResults(t *testing.T) {
 		"photo.png",
 		"image/png",
 		"group photo",
-		"",
+		ReplyTarget{},
 	)
 	if err != nil {
 		t.Fatalf("SendMediaRequest() on mixed results = %v, want success", err)
@@ -723,7 +723,7 @@ func TestBridgeSendMediaRequestRejectsOversizeReaderBeforeCommand(t *testing.T) 
 		"attachment.bin",
 		"application/octet-stream",
 		"",
-		"",
+		ReplyTarget{},
 	)
 	if err == nil || !strings.Contains(err.Error(), "exceeds declared size") {
 		t.Fatalf("SendMediaRequest() error = %v, want declared-size error", err)

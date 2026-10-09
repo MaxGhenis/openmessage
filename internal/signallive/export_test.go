@@ -2,6 +2,7 @@ package signallive
 
 import (
 	"bytes"
+	"context"
 
 	"github.com/maxghenis/openmessage/internal/db"
 	"github.com/rs/zerolog"
@@ -49,4 +50,38 @@ func CaptureAndProcessReceiveLineForTest(
 	defer unregister()
 	processed, err := bridge.processReceiveLine(account, line, false)
 	return captured, processed, err
+}
+
+// SetRunSignalCLIForTest replaces the signal-cli runner (contact and group
+// refreshes included) for an external test and returns the restore function.
+func SetRunSignalCLIForTest(
+	run func(ctx context.Context, configDir string, args ...string) ([]byte, error),
+) func() {
+	original := runSignalCLI
+	runSignalCLI = run
+	return func() { runSignalCLI = original }
+}
+
+// LegacyQuoteArgsForTest is the legacy-store quote lookup: what a reply quoting
+// replyToID got before the v2 dispatcher described its target.
+func LegacyQuoteArgsForTest(
+	store *db.Store,
+	contactByACI map[string]string,
+	account string,
+	replyToID string,
+) ([]string, error) {
+	bridge := &Bridge{store: store, logger: zerolog.Nop(), contactByACI: contactByACI}
+	return bridge.signalQuoteArgs(replyToID, account)
+}
+
+// ReplyQuoteArgsForTest is the quote SendTextRequest and SendMediaRequest
+// build for reply.
+func ReplyQuoteArgsForTest(
+	store *db.Store,
+	contactByACI map[string]string,
+	account string,
+	reply ReplyTarget,
+) ([]string, error) {
+	bridge := &Bridge{store: store, logger: zerolog.Nop(), contactByACI: contactByACI}
+	return bridge.replyQuoteArgs(reply, account)
 }
