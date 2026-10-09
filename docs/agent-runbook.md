@@ -474,11 +474,12 @@ hung daemon, and it alerts when the daemon is up but a platform has gone
 quiet.
 
 This section follows the script's code on Max's local dotfiles `master` at
-`7de27cc` (2026-10-08), plus the `append_errors` alert (`27df7b3`). Later
-commits on `master` aren't covered yet. The script's header comment summarizes
-the checks but is incomplete: it leaves out the inbox-read alert and the
-parse-error path, and it lists a top-level `projection_stalled` check that
-never fires (the daemon publishes that flag inside `freshness`).
+`7de27cc` (2026-10-08), plus the `append_errors` alert (`27df7b3`) and the
+`pull_empty` alert (`ffda554`). Other commits on `master` after `7de27cc`
+aren't covered yet. The script's header comment summarizes the checks but is
+incomplete: it leaves out the inbox-read alert and the parse-error path, and
+it lists a top-level `projection_stalled` check that never fires (the daemon
+publishes that flag inside `freshness`).
 launchd runs the working-tree file, so editing it, or checking out another
 branch in `~/dotfiles`, changes live behavior within 5 minutes. Try changes on
 a copy ([testing a change](#testing-a-change)).
@@ -554,6 +555,28 @@ in-app supervisors. It alerts on:
   repair interval (90 s by default), so something is revoking the cookies
   within minutes. The counter never resets while the daemon runs, so the alert
   repeats until the daemon restarts, even after the churn stops;
+- `google.pull_health.empty_with_local_history` (key `pull_empty`; daemons
+  with PR #193): the latest INBOX listing or targeted lookup returned no data
+  while the store held at least `threshold` (10) Google conversations, so
+  catch-up is broken even if push still flows
+  ([pulls that return nothing](#pulls-that-return-nothing-phone-switched-to-google-account-pairing)).
+  The text gives the store's count and the time since the daemon last
+  recorded a pull (a listing of any folder or page, or a targeted lookup,
+  whatever its outcome; message fetches and the lookups sends make don't
+  count), as in "Google pulls return no data while the store holds 1048
+  conversations (last pull 1m ago)". It adds "phone switched to
+  Google-account pairing; re-link or switch back to QR (d1088)" when
+  `account_switch` is true. The flag changes only when another first-page
+  INBOX listing or targeted lookup gets an answer (a transport or auth error
+  doesn't count), so after a fix the alert can repeat every 6 hours until one
+  does. A large age means nothing has re-tested the flag; a small one doesn't
+  mean it was re-confirmed. A daemon restart resets it: `pull_health` lives in
+  the backend's memory, so the alert stops until the new process's first
+  INBOX listing or targeted lookup (normally the startup backfill's or a
+  reconcile's) re-tests it. The check is skipped when `google.paired` is
+  `false`, and a missing `pull_health` (a daemon before #193, or one that
+  hasn't recorded a pull since it started) raises nothing. It first fired on
+  2026-10-09 at 03:40;
 - `freshness.<platform>.projection_stalled` (key `proj_<platform>`; v2-primary
   daemons only): the platform's newest message in the v2 read store is more
   than 5 minutes older than its newest in the legacy store, or the read store
@@ -1082,6 +1105,8 @@ account pairing, please log in to continue using SMS/RCS").
   returns data clears it; other folders, later pages and transport errors
   leave it alone. The threshold is a heuristic: an account whose INBOX is
   legitimately empty while archived threads remain would also raise it.
+- On Max's install the launchd watchdog turns this flag into a macOS
+  notification (key `pull_empty`; see [staleness alerts](#staleness-alerts)).
 
 ```bash
 curl -s http://127.0.0.1:7007/api/status | jq '.google.pull_health'
