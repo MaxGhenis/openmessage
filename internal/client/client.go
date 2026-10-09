@@ -180,6 +180,23 @@ func ExtractSenderInfo(msg *gmproto.Message) (name, number string) {
 	return
 }
 
+// UnknownMessageStatus is the status recorded for a Google message whose frame
+// carries no MessageStatus.
+const UnknownMessageStatus = "unknown"
+
+// MessageStatusString returns the status string recorded for a Google message:
+// the MessageStatus enum name, or UnknownMessageStatus when the frame has none.
+// The empty-stub policy (db.IsEmptyStubMessage) reads this string, so the
+// legacy live and backfill paths and the v2 decoder all derive it here; a
+// separate default on any one path makes them disagree on which contentless
+// messages to drop.
+func MessageStatusString(msg *gmproto.Message) string {
+	if ms := msg.GetMessageStatus(); ms != nil {
+		return ms.GetStatus().String()
+	}
+	return UnknownMessageStatus
+}
+
 // MessageIsFromMe infers whether a Google Messages/RCS message was sent by the
 // local account. Historical backfill messages sometimes omit sender participant
 // metadata even when the message status is clearly outgoing.

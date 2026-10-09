@@ -324,6 +324,25 @@ func TestGoogleDecoderEmptyStubPolicy(t *testing.T) {
 	if got := counters.Snapshot("account-1").EmptyStubsSkipped; got != 1 {
 		t.Fatalf("empty_stubs_skipped = %d, want 1", got)
 	}
+
+	// No MessageStatus: legacy records "unknown", a terminal status, so a
+	// contentless frame is a stub and one with content is kept.
+	noStatusStub := proto.Clone(terminalStub).(*gmproto.Message)
+	noStatusStub.MessageID = "empty-no-status"
+	noStatusStub.MessageStatus = nil
+	if events := decodeGoogleMessage(t, decoder, "account-1", noStatusStub, false); len(events) != 0 {
+		t.Fatalf("no-status stub events = %+v, want none", events)
+	}
+	if got := counters.Snapshot("account-1").EmptyStubsSkipped; got != 2 {
+		t.Fatalf("empty_stubs_skipped = %d, want 2", got)
+	}
+	noStatusText := proto.Clone(noStatusStub).(*gmproto.Message)
+	noStatusText.MessageID = "text-no-status"
+	noStatusText.MessageInfo = textInfo("hello")
+	events = decodeGoogleMessage(t, decoder, "account-1", noStatusText, false)
+	if len(events) != 1 || events[0].Message == nil || events[0].Message.Body != "hello" {
+		t.Fatalf("no-status text events = %+v, want one MessageEvent with the body", events)
+	}
 }
 
 func TestGoogleDecoderMapsConversationSnapshot(t *testing.T) {
