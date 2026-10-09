@@ -35,9 +35,10 @@ type Lifecycle interface {
 }
 
 // IngressErrorRecorder is an optional ConnectionSink extension. An adapter
-// that captured a frame but could not hand it to the sink (an encode fault, a
-// failed durable append, a panic in its ingest tee) reports the loss here so it
-// is counted, not only logged. Adapters must not report ErrStaleGeneration:
+// that captured a frame but could not hand it to the sink (for example a
+// failed durable append or a panic in its ingest tee) reports the loss here so
+// it is counted, not only logged. Faults raised before the adapter sees a
+// frame, such as WhatsApp encode faults inside whatsapplive, never reach it. Adapters must not report ErrStaleGeneration:
 // that rejection is the generation fence retiring an old connection, not an
 // ingest fault. Any wrapper between an adapter and the durable sink must
 // forward this method, or the adapter's type assertion fails on the wrapper

@@ -86,7 +86,7 @@ func TestSupervisedAppendFailureReachesStatusAppendErrors(t *testing.T) {
 
 			// Make every later inbox insert fail inside SQLite, the way a full
 			// disk or a corrupt page would, without touching any other table.
-			inspection, err := sql.Open("sqlite", filepath.Join(dataDir, "v2", "store.sqlite3"))
+			inspection, err := sql.Open("sqlite", "file:"+filepath.Join(dataDir, "v2", "store.sqlite3")+"?_pragma=busy_timeout(5000)")
 			if err != nil {
 				t.Fatalf("open v2 store for fault injection: %v", err)
 			}

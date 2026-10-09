@@ -951,10 +951,11 @@ func newRealIngestSink(t *testing.T) (*ingest.Sink, *ingest.Counters, string) {
 }
 
 // failInboxAppends makes every later inbox insert fail inside SQLite, the way
-// a full disk or a corrupt page would, without touching any other table.
+// a full disk or a corrupt page would, without touching any other table. The
+// busy timeout lets the DDL wait out the ingest worker's projection write.
 func failInboxAppends(t *testing.T, storePath string) {
 	t.Helper()
-	conn, err := sql.Open("sqlite", storePath)
+	conn, err := sql.Open("sqlite", "file:"+storePath+"?_pragma=busy_timeout(5000)")
 	if err != nil {
 		t.Fatalf("open v2 store for fault injection: %v", err)
 	}
