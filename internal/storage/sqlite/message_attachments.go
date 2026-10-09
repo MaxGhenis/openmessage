@@ -116,34 +116,27 @@ func (r *MessageAttachmentRepository) RecordInboundAttachment(
 	return nil
 }
 
-// GetForDownload returns an attachment joined to its owning account. A missing
-// row wraps database/sql.ErrNoRows.
-func (r *MessageAttachmentRepository) GetForDownload(
-	ctx context.Context,
-	messageID string,
-	ordinal int64,
-) (MessageAttachment, error) {
+// downloadAttachmentColumns selects an attachment joined to its owning
+// message (aliases ma and m) in scanDownloadAttachment's order.
+const downloadAttachmentColumns = `
+	ma.message_id,
+	ma.ordinal,
+	ma.remote_id,
+	ma.remote_ref,
+	ma.filename,
+	ma.mime,
+	ma.size_bytes,
+	ma.state,
+	ma.blob_hash,
+	m.account_id`
+
+func scanDownloadAttachment(row rowScanner) (MessageAttachment, error) {
 	var (
 		attachment MessageAttachment
 		size       sql.NullInt64
 		hash       sql.NullString
 	)
-	err := r.store.db.QueryRowContext(ctx, `
-		SELECT
-			ma.message_id,
-			ma.ordinal,
-			ma.remote_id,
-			ma.remote_ref,
-			ma.filename,
-			ma.mime,
-			ma.size_bytes,
-			ma.state,
-			ma.blob_hash,
-			m.account_id
-		FROM message_attachments AS ma
-		JOIN messages AS m ON m.message_id = ma.message_id
-		WHERE ma.message_id = ? AND ma.ordinal = ?
-	`, messageID, ordinal).Scan(
+	if err := row.Scan(
 		&attachment.MessageID,
 		&attachment.Ordinal,
 		&attachment.RemoteID,
@@ -154,7 +147,31 @@ func (r *MessageAttachmentRepository) GetForDownload(
 		&attachment.State,
 		&hash,
 		&attachment.AccountID,
-	)
+	); err != nil {
+		return MessageAttachment{}, err
+	}
+	if size.Valid {
+		attachment.SizeBytes = &size.Int64
+	}
+	if hash.Valid {
+		attachment.BlobHash = &hash.String
+	}
+	return attachment, nil
+}
+
+// GetForDownload returns an attachment joined to its owning account. A missing
+// row wraps database/sql.ErrNoRows.
+func (r *MessageAttachmentRepository) GetForDownload(
+	ctx context.Context,
+	messageID string,
+	ordinal int64,
+) (MessageAttachment, error) {
+	attachment, err := scanDownloadAttachment(r.store.db.QueryRowContext(ctx, `
+		SELECT `+downloadAttachmentColumns+`
+		FROM message_attachments AS ma
+		JOIN messages AS m ON m.message_id = ma.message_id
+		WHERE ma.message_id = ? AND ma.ordinal = ?
+	`, messageID, ordinal))
 	if err != nil {
 		return MessageAttachment{}, fmt.Errorf(
 			"get message attachment %q ordinal %d for download: %w",
@@ -162,12 +179,6 @@ func (r *MessageAttachmentRepository) GetForDownload(
 			ordinal,
 			err,
 		)
-	}
-	if size.Valid {
-		attachment.SizeBytes = &size.Int64
-	}
-	if hash.Valid {
-		attachment.BlobHash = &hash.String
 	}
 	return attachment, nil
 }

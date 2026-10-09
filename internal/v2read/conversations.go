@@ -4,6 +4,8 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"sort"
+	"strings"
 
 	"github.com/maxghenis/openmessage/internal/db"
 	"github.com/maxghenis/openmessage/internal/storage/sqlite"
@@ -22,15 +24,47 @@ func (s *Source) ListConversations(limit int) ([]*db.Conversation, error) {
 	if err != nil {
 		return nil, fmt.Errorf("list conversations: %w", err)
 	}
-	mapped := make([]*db.Conversation, 0, len(conversations))
-	for _, conversation := range conversations {
-		dto, err := s.mapConversation(conversation, accounts)
-		if err != nil {
-			return nil, err
-		}
-		mapped = append(mapped, dto)
+	return s.mapConversations(conversations, accounts)
+}
+
+// ListPlatformConversations returns the conversations whose SourcePlatform is
+// platform, newest first with conversation ID as the tie-breaker, at most
+// limit: exactly the first limit rows of ListConversations(math.MaxInt) whose
+// SourcePlatform equals platform. Only the accounts of that platform are read,
+// and only the returned rows are mapped.
+func (s *Source) ListPlatformConversations(platform string, limit int) ([]*db.Conversation, error) {
+	if err := s.ready(); err != nil {
+		return nil, err
 	}
-	return mapped, nil
+	if limit <= 0 {
+		return []*db.Conversation{}, nil
+	}
+	accounts, err := s.store.ListAccounts()
+	if err != nil {
+		return nil, fmt.Errorf("list %s conversations: %w", platform, err)
+	}
+	var conversations []sqlite.Conversation
+	for _, account := range accounts {
+		if platformForBridgeKey(account.BridgeKey) != platform {
+			continue
+		}
+		accountConversations, err := s.store.ListConversationsByRecency(account.AccountID)
+		if err != nil {
+			return nil, fmt.Errorf("list %s conversations: %w", platform, err)
+		}
+		conversations = append(conversations, accountConversations...)
+	}
+	// ListConversationsByRecencyAllAccounts' order.
+	sort.Slice(conversations, func(i, j int) bool {
+		if conversations[i].LastMessageAtMS != conversations[j].LastMessageAtMS {
+			return conversations[i].LastMessageAtMS > conversations[j].LastMessageAtMS
+		}
+		return conversations[i].ConversationID < conversations[j].ConversationID
+	})
+	if len(conversations) > limit {
+		conversations = conversations[:limit]
+	}
+	return s.mapConversations(conversations, indexAccounts(accounts))
 }
 
 // SearchConversationsByMetadata is the v2 counterpart of the legacy metadata
@@ -51,15 +85,7 @@ func (s *Source) SearchConversationsByMetadata(query string, limit int) ([]*db.C
 	if err != nil {
 		return nil, fmt.Errorf("search conversations: %w", err)
 	}
-	mapped := make([]*db.Conversation, 0, len(conversations))
-	for _, conversation := range conversations {
-		dto, err := s.mapConversation(conversation, accounts)
-		if err != nil {
-			return nil, err
-		}
-		mapped = append(mapped, dto)
-	}
-	return mapped, nil
+	return s.mapConversations(conversations, accounts)
 }
 
 // GetConversation returns one v2 conversation as the canonical legacy DTO.
@@ -80,5 +106,60 @@ func (s *Source) GetConversation(id string) (*db.Conversation, error) {
 	if err != nil {
 		return nil, fmt.Errorf("get conversation %q: %w", id, err)
 	}
-	return s.mapConversation(conversation, accounts)
+	mapped, err := s.mapConversations([]sqlite.Conversation{conversation}, accounts)
+	if err != nil {
+		return nil, err
+	}
+	return mapped[0], nil
+}
+
+// GetConversationsByID is GetConversation for many IDs in a fixed number of
+// statements, keyed by the requested ID. It answers only IDs that name a v2
+// conversation directly (as stored: no surrounding whitespace), for which
+// GetConversation returns the same DTO; legacy remote IDs, unknown IDs and
+// untrimmed IDs are absent, and callers resolve those with GetConversation.
+func (s *Source) GetConversationsByID(ids []string) (map[string]*db.Conversation, error) {
+	if err := s.ready(); err != nil {
+		return nil, err
+	}
+	rows, err := s.store.ConversationsByID(directConversationIDs(ids))
+	if err != nil {
+		return nil, err
+	}
+	result := make(map[string]*db.Conversation, len(rows))
+	if len(rows) == 0 {
+		return result, nil
+	}
+	conversations := make([]sqlite.Conversation, 0, len(rows))
+	for _, conversation := range rows {
+		conversations = append(conversations, conversation)
+	}
+	// Map in a fixed order so an unmappable row always reports the same error.
+	sort.Slice(conversations, func(i, j int) bool {
+		return conversations[i].ConversationID < conversations[j].ConversationID
+	})
+	accounts, err := s.accountIndex()
+	if err != nil {
+		return nil, fmt.Errorf("get conversations: %w", err)
+	}
+	mapped, err := s.mapConversations(conversations, accounts)
+	if err != nil {
+		return nil, err
+	}
+	for _, conversation := range mapped {
+		result[conversation.ConversationID] = conversation
+	}
+	return result, nil
+}
+
+// directConversationIDs keeps the IDs that resolveConversationID passes
+// through unchanged when they exist: non-empty and already trimmed.
+func directConversationIDs(ids []string) []string {
+	direct := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if id != "" && strings.TrimSpace(id) == id {
+			direct = append(direct, id)
+		}
+	}
+	return direct
 }

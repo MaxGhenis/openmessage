@@ -3186,20 +3186,32 @@ func mergeSearchResults(reads readsource.ReadSource, identityStore *db.Store, ms
 		results = append(results, result)
 	}
 
+	conversationIDs := make([]string, 0, len(msgs))
 	for _, msg := range msgs {
-		conv, err := reads.GetConversation(msg.ConversationID)
-		if err != nil || conv == nil {
+		conversationIDs = append(conversationIDs, msg.ConversationID)
+	}
+	conversationFor := searchConversationLookup(reads, conversationIDs)
+	for _, msg := range msgs {
+		conv := conversationFor(msg.ConversationID)
+		if conv == nil {
 			continue
 		}
 		appendResult(searchResultForConversation(conv, msg.TimestampMS, searchPreviewForMessage(msg), identityIndex))
 	}
 
+	unseen := make([]string, 0, len(convos))
+	for _, conv := range convos {
+		if _, ok := seen[conv.ConversationID]; !ok {
+			unseen = append(unseen, conv.ConversationID)
+		}
+	}
+	latestFor := searchLatestMessageLookup(reads, unseen)
 	for _, conv := range convos {
 		if _, ok := seen[conv.ConversationID]; ok {
 			continue
 		}
 		preview := ""
-		msgs, err := reads.GetMessagesByConversation(conv.ConversationID, 1)
+		msgs, err := latestFor(conv.ConversationID)
 		if err == nil && len(msgs) > 0 {
 			preview = searchPreviewForMessage(msgs[0])
 		}
@@ -3216,6 +3228,65 @@ func mergeSearchResults(reads readsource.ReadSource, identityStore *db.Store, ms
 		results = results[:limit]
 	}
 	return results
+}
+
+// searchConversationBatchSource is implemented by read sources that map many
+// conversations in a fixed number of statements (v2read). The map holds only
+// IDs it can answer exactly as GetConversation would.
+type searchConversationBatchSource interface {
+	GetConversationsByID(ids []string) (map[string]*db.Conversation, error)
+}
+
+// searchLatestMessagesBatchSource is implemented by read sources that read
+// many conversations' newest message in a fixed number of statements
+// (v2read). The map holds only IDs it can answer exactly as
+// GetMessagesByConversation(id, 1) would.
+type searchLatestMessagesBatchSource interface {
+	LatestMessagesByConversation(ids []string) (map[string][]*db.Message, error)
+}
+
+// searchConversationLookup returns reads.GetConversation memoized per ID, so a
+// search hit list maps each distinct conversation once however many of its
+// messages matched, and prefetched in one batch when the source supports it.
+// A failed or empty lookup yields nil, which mergeSearchResults skips.
+func searchConversationLookup(reads readsource.ReadSource, ids []string) func(string) *db.Conversation {
+	known := make(map[string]*db.Conversation, len(ids))
+	if batch, ok := reads.(searchConversationBatchSource); ok && len(ids) > 0 {
+		if prefetched, err := batch.GetConversationsByID(ids); err == nil {
+			for id, conv := range prefetched {
+				known[id] = conv
+			}
+		}
+	}
+	return func(id string) *db.Conversation {
+		if conv, ok := known[id]; ok {
+			return conv
+		}
+		conv, err := reads.GetConversation(id)
+		if err != nil {
+			conv = nil
+		}
+		known[id] = conv
+		return conv
+	}
+}
+
+// searchLatestMessageLookup returns reads.GetMessagesByConversation(id, 1),
+// prefetched in one batch when the source supports it. IDs the batch does not
+// answer, or every ID if the batch fails, fall back to the per-ID read.
+func searchLatestMessageLookup(reads readsource.ReadSource, ids []string) func(string) ([]*db.Message, error) {
+	var prefetched map[string][]*db.Message
+	if batch, ok := reads.(searchLatestMessagesBatchSource); ok && len(ids) > 0 {
+		if latest, err := batch.LatestMessagesByConversation(ids); err == nil {
+			prefetched = latest
+		}
+	}
+	return func(id string) ([]*db.Message, error) {
+		if msgs, ok := prefetched[id]; ok {
+			return msgs, nil
+		}
+		return reads.GetMessagesByConversation(id, 1)
+	}
 }
 
 type unifiedConversationIdentity struct {

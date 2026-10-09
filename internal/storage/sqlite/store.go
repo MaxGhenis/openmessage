@@ -24,6 +24,14 @@ type Store struct {
 // Open opens path, configures SQLite, and migrates the database to the latest
 // embedded schema version.
 func Open(path string) (*Store, error) {
+	return OpenWithDriver("sqlite", path)
+}
+
+// OpenWithDriver is Open through the database/sql driver registered as
+// driverName, which must wrap modernc.org/sqlite (the driver Open uses, "sqlite").
+// It exists for instrumentation, such as tests that count the statements a
+// read path issues.
+func OpenWithDriver(driverName, path string) (*Store, error) {
 	if strings.TrimSpace(path) == "" {
 		return nil, fmt.Errorf("open sqlite store: path is empty")
 	}
@@ -34,7 +42,7 @@ func Open(path string) (*Store, error) {
 	openMu.Lock()
 	defer openMu.Unlock()
 
-	db, err := sql.Open("sqlite", storeDSN(path))
+	db, err := sql.Open(driverName, storeDSN(path))
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite store: %w", err)
 	}

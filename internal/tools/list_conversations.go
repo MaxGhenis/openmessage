@@ -24,6 +24,13 @@ func listConversationsTool() mcp.Tool {
 	)
 }
 
+// platformConversationLister is implemented by read sources that filter by
+// platform in the store (v2read): the first limit conversations, newest first,
+// whose SourcePlatform equals platform.
+type platformConversationLister interface {
+	ListPlatformConversations(platform string, limit int) ([]*db.Conversation, error)
+}
+
 func listConversationsHandler(a *app.App, configured ...Options) server.ToolHandlerFunc {
 	options := resolvedOptions(a, configured)
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -41,6 +48,12 @@ func listConversationsHandler(a *app.App, configured ...Options) server.ToolHand
 			convs, err = options.Reads.ListConversations(limit)
 		} else if limit <= 0 {
 			convs = []*db.Conversation{}
+		} else if lister, ok := options.Reads.(platformConversationLister); ok {
+			// v2read reads only that platform's accounts and maps only the rows
+			// it returns. SourcePlatform is never blank on v2 (accounts.bridge_key
+			// is CHECKed non-blank), so matching normalizedPlatform(platform)
+			// exactly is the filter below.
+			convs, err = lister.ListPlatformConversations(normalizedPlatform(platform), limit)
 		} else {
 			// ReadSource intentionally mirrors only the canonical legacy methods;
 			// filter the v2 cross-account recency result here rather than widening
