@@ -1,7 +1,8 @@
-const CACHE_NAME = 'openmessage-static-v1';
+const CACHE_NAME = 'openmessage-static-v2';
 const STATIC_ASSETS = [
   '/',
   '/manifest.webmanifest',
+  '/emoji-data.js',
   '/favicon.svg',
   '/platform-signal.svg',
   '/platform-whatsapp.svg',

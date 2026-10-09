@@ -1827,7 +1827,9 @@ html, body {
 }
 .emoji-full-panel .emoji-grid {
   display: grid;
-  grid-template-columns: repeat(8, 1fr);
+  grid-template-columns: repeat(8, minmax(0, 1fr));
+  grid-auto-rows: max-content;
+  align-content: start;
   gap: 2px;
   padding: 8px;
   overflow-y: auto;
@@ -1836,6 +1838,8 @@ html, body {
 .emoji-full-panel .emoji-grid button {
   background: none;
   border: none;
+  min-width: 0;
+  overflow: hidden;
   font-size: 24px;
   padding: 4px;
   cursor: pointer;
@@ -5973,6 +5977,7 @@ body::after {
   </div>
 </div>
 
+<script src="/emoji-data.js"></script>
 <script>
 (function() {
   'use strict';
@@ -6242,19 +6247,11 @@ body::after {
   let threadSearchAnchorMessageID = '';
   const QUICK_EMOJIS = ['😂', '❤️', '👍', '👎', '😮', '😢', '😡', '🙏', '🔥', '🎉', '👀', '💯'];
 
-  // Full emoji dataset by category
-  const EMOJI_CATEGORIES = [
-    { name: 'Smileys', emojis: ['😀','😃','😄','😁','😆','😅','🤣','😂','🙂','😊','😇','🥰','😍','🤩','😘','😗','😚','😙','🥲','😋','😛','😜','🤪','😝','🤑','🤗','🤭','🤫','🤔','🫡','🤐','🤨','😐','😑','😶','🫥','😏','😒','🙄','😬','🤥','😌','😔','😪','🤤','😴','😷','🤒','🤕','🤢','🤮','🥵','🥶','🥴','😵','🤯','🤠','🥳','🥸','😎','🤓','🧐','😕','🫤','😟','🙁','😮','😯','😲','😳','🥺','🥹','😦','😧','😨','😰','😥','😢','😭','😱','😖','😣','😞','😓','😩','😫','🥱','😤','😡','😠','🤬','😈','👿','💀','☠️','💩','🤡','👹','👺','👻','👽','👾','🤖'] },
-    { name: 'Gestures', emojis: ['👋','🤚','🖐️','✋','🖖','🫱','🫲','🫳','🫴','👌','🤌','🤏','✌️','🤞','🫰','🤟','🤘','🤙','👈','👉','👆','🖕','👇','☝️','🫵','👍','👎','✊','👊','🤛','🤜','👏','🙌','🫶','👐','🤲','🤝','🙏','✍️','💅','🤳','💪','🦾','🦿'] },
-    { name: 'Hearts', emojis: ['❤️','🧡','💛','💚','💙','💜','🖤','🤍','🤎','💔','❤️‍🔥','❤️‍🩹','❣️','💕','💞','💓','💗','💖','💘','💝','💟'] },
-    { name: 'Animals', emojis: ['🐶','🐱','🐭','🐹','🐰','🦊','🐻','🐼','🐻‍❄️','🐨','🐯','🦁','🐮','🐷','🐸','🐵','🙈','🙉','🙊','🐒','🐔','🐧','🐦','🐤','🐣','🐥','🦆','🦅','🦉','🦇','🐺','🐗','🐴','🦄','🐝','🪱','🐛','🦋','🐌','🐞','🐜','🪰','🪲','🪳','🦟','🦗','🕷️','🦂','🐢','🐍','🦎','🦖','🦕','🐙','🦑','🦐','🦞','🦀','🐡','🐠','🐟','🐬','🐳','🐋','🦈','🪸','🐊','🐅','🐆','🦓','🦍','🦧','🐘','🦛','🦏','🐪','🐫','🦒','🦘','🦬','🐃','🐂','🐄','🐎','🐖','🐏','🐑','🦙','🐐','🦌','🐕','🐩','🦮','🐕‍🦺','🐈','🐈‍⬛','🪶','🐓','🦃','🦤','🦚','🦜','🦢','🦩','🕊️','🐇','🦝','🦨','🦡','🦫','🦦','🦥','🐁','🐀','🐿️','🦔'] },
-    { name: 'Food', emojis: ['🍎','🍐','🍊','🍋','🍌','🍉','🍇','🍓','🫐','🍈','🍒','🍑','🥭','🍍','🥥','🥝','🍅','🍆','🥑','🥦','🥬','🥒','🌶️','🫑','🌽','🥕','🫒','🧄','🧅','🥔','🍠','🫘','🥐','🥖','🍞','🥨','🥯','🧀','🥚','🍳','🧈','🥞','🧇','🥓','🥩','🍗','🍖','🌭','🍔','🍟','🍕','🫓','🥪','🥙','🧆','🌮','🌯','🫔','🥗','🥘','🫕','🥫','🍝','🍜','🍲','🍛','🍣','🍱','🥟','🦪','🍤','🍙','🍚','🍘','🍥','🥠','🥮','🍢','🍡','🍧','🍨','🍦','🥧','🧁','🍰','🎂','🍮','🍭','🍬','🍫','🍿','🍩','🍪','🌰','🥜','🍯','🥛','🍼','🫖','☕','🍵','🧃','🥤','🧋','🍶','🍺','🍻','🥂','🍷','🥃','🍸','🍹','🧉','🍾','🧊','🥄','🍴','🍽️','🥣','🥡','🥢'] },
-    { name: 'Activities', emojis: ['⚽','🏀','🏈','⚾','🥎','🎾','🏐','🏉','🥏','🎱','🪀','🏓','🏸','🏒','🏑','🥍','🏏','🪃','🥅','⛳','🪁','🏹','🎣','🤿','🥊','🥋','🎽','🛹','🛼','🛷','⛸️','🥌','🎿','⛷️','🏂','🪂','🏋️','🤼','🤸','⛹️','🤺','🤾','🏌️','🏇','🧘','🏄','🏊','🤽','🚣','🧗','🚵','🚴','🏆','🥇','🥈','🥉','🏅','🎖️','🏵️','🎗️','🎪','🎭','🎨','🎬','🎤','🎧','🎼','🎹','🥁','🪘','🎷','🎺','🪗','🎸','🪕','🎻','🎲','♟️','🎯','🎳','🎮','🕹️','🧩'] },
-    { name: 'Travel', emojis: ['🚗','🚕','🚙','🚌','🚎','🏎️','🚓','🚑','🚒','🚐','🛻','🚚','🚛','🚜','🏍️','🛵','🚲','🛴','🛺','🚃','🚋','🚞','🚝','🚅','🚆','🚇','🚊','🚉','✈️','🛫','🛬','🛩️','💺','🛰️','🚀','🛸','🚁','🛶','⛵','🚤','🛥️','🛳️','⛴️','🚢','🗼','🏰','🏯','🏟️','🎡','🎢','🎠','⛲','⛱️','🏖️','🏝️','🏜️','🌋','⛰️','🏔️','🗻','🏕️','🛖','🏠','🏡','🏘️','🏚️','🏗️','🏭','🏢','🏬','🏣','🏤','🏥','🏦','🏨','🏪','🏫','🏩','💒','🏛️','⛪','🕌','🕍','🛕','🕋','⛩️','🗾','🎑','🏞️','🌅','🌄','🌠','🎆','🎇','🌇','🌆','🏙️','🌃','🌌','🌉','🌁'] },
-    { name: 'Objects', emojis: ['⌚','📱','💻','⌨️','🖥️','🖨️','🖱️','🖲️','💾','💿','📀','📷','📸','📹','🎥','📽️','🎞️','📞','☎️','📟','📠','📺','📻','🎙️','🎚️','🎛️','🧭','⏱️','⏲️','⏰','🕰️','⌛','⏳','📡','🔋','🪫','🔌','💡','🔦','🕯️','🧯','🛢️','💸','💵','💴','💶','💷','🪙','💰','💳','🪪','💎','⚖️','🪜','🧰','🪛','🔧','🔨','⚒️','🛠️','⛏️','🪚','🔩','⚙️','🪤','🧱','⛓️','🧲','🔫','💣','🧨','🪓','🔪','🗡️','⚔️','🛡️','🚬','⚰️','🪦','⚱️','🏺','🔮','📿','🧿','🪬','💈','⚗️','🔭','🔬','🕳️','🩹','🩺','🩻','🩼','💊','💉','🩸','🧬','🦠','🧫','🧪','🌡️','🧹','🪠','🧺','🧻','🚽','🚰','🚿','🛁','🛀','🧼','🪥','🪒','🧽','🪣','🧴','🛎️','🔑','🗝️','🚪','🪑','🛋️','🛏️','🛌','🧸','🪆','🖼️','🪞','🪟','🛍️','🛒','🎁','🎈','🎏','🎀','🪄','🪅','🎊','🎉','🎎','🎐','🧧','✉️','📩','📨','📧','💌','📥','📤','📦','🏷️','🪧','📪','📫','📬','📭','📮','📯','📜','📃','📄','📑','🧾','📊','📈','📉','🗒️','🗓️','📆','📅','🗑️','📇','🗃️','🗳️','🗄️','📋','📁','📂','🗂️','🗞️','📰','📓','📔','📒','📕','📗','📘','📙','📚','📖','🔖','🧷','🔗','📎','🖇️','📐','📏','🧮','📌','📍','✂️','🖊️','🖋️','✒️','🖌️','🖍️','📝','✏️','🔍','🔎','🔏','🔐','🔒','🔓'] },
-    { name: 'Symbols', emojis: ['❤️','🧡','💛','💚','💙','💜','🖤','🤍','🤎','💔','❣️','💕','💞','💓','💗','💖','💘','💝','💟','☮️','✝️','☪️','🕉️','☸️','✡️','🔯','🕎','☯️','☦️','🛐','⛎','♈','♉','♊','♋','♌','♍','♎','♏','♐','♑','♒','♓','🆔','⚛️','🉑','☢️','☣️','📴','📳','🈶','🈚','🈸','🈺','🈷️','✴️','🆚','💮','🉐','㊙️','㊗️','🈴','🈵','🈹','🈲','🅰️','🅱️','🆎','🆑','🅾️','🆘','❌','⭕','🛑','⛔','📛','🚫','💯','💢','♨️','🚷','🚯','🚳','🚱','🔞','📵','🚭','❗','❕','❓','❔','‼️','⁉️','🔅','🔆','〽️','⚠️','🚸','🔱','⚜️','🔰','♻️','✅','🈯','💹','❇️','✳️','❎','🌐','💠','Ⓜ️','🌀','💤','🏧','🚾','♿','🅿️','🛗','🈳','🈂️','🛂','🛃','🛄','🛅','🚹','🚺','🚼','⚧️','🚻','🚮','🎦','📶','🈁','🔣','ℹ️','🔤','🔡','🔠','🆖','🆗','🆙','🆒','🆕','🆓','0️⃣','1️⃣','2️⃣','3️⃣','4️⃣','5️⃣','6️⃣','7️⃣','8️⃣','9️⃣','🔟','🔢','#️⃣','*️⃣','⏏️','▶️','⏸️','⏯️','⏹️','⏺️','⏭️','⏮️','⏩','⏪','⏫','⏬','◀️','🔼','🔽','➡️','⬅️','⬆️','⬇️','↗️','↘️','↙️','↖️','↕️','↔️','↪️','↩️','⤴️','⤵️','🔀','🔁','🔂','🔄','🔃','🎵','🎶','➕','➖','➗','✖️','🟰','♾️','💲','💱','™️','©️','®️','👁️‍🗨️','🔚','🔙','🔛','🔝','🔜','〰️','➰','➿','✔️','☑️','🔘','🔴','🟠','🟡','🟢','🔵','🟣','⚫','⚪','🟤','🔺','🔻','🔸','🔹','🔶','🔷','🔳','🔲','▪️','▫️','◾','◽','◼️','◻️','🟥','🟧','🟨','🟩','🟦','🟪','⬛','⬜','🟫','🔈','🔇','🔉','🔊','🔔','🔕','📣','📢','💬','💭','🗯️','♠️','♣️','♥️','♦️','🃏','🎴','🀄'] },
-    { name: 'Flags', emojis: ['🏁','🚩','🎌','🏴','🏳️','🏳️‍🌈','🏳️‍⚧️','🏴‍☠️','🇺🇸','🇬🇧','🇫🇷','🇩🇪','🇯🇵','🇰🇷','🇨🇳','🇮🇳','🇧🇷','🇨🇦','🇦🇺','🇲🇽','🇮🇹','🇪🇸','🇷🇺','🇿🇦','🇳🇬','🇦🇷','🇨🇴','🇵🇪','🇨🇱','🇻🇪','🇪🇨','🇧🇴','🇵🇾','🇺🇾','🇬🇾','🇸🇷','🇹🇷','🇸🇦','🇦🇪','🇮🇱','🇪🇬','🇰🇪','🇹🇿','🇪🇹','🇬🇭','🇨🇮','🇸🇳','🇲🇱','🇹🇭','🇻🇳','🇵🇭','🇮🇩','🇲🇾','🇸🇬','🇳🇿','🇫🇮','🇸🇪','🇳🇴','🇩🇰','🇳🇱','🇧🇪','🇨🇭','🇦🇹','🇵🇱','🇨🇿','🇭🇺','🇷🇴','🇬🇷','🇵🇹','🇮🇪','🇮🇸','🇭🇷','🇺🇦','🇬🇪','🇦🇲','🇦🇿','🇰🇿','🇺🇿','🇵🇰','🇧🇩','🇱🇰','🇳🇵','🇲🇲','🇰🇭','🇱🇦','🇲🇳','🇹🇼','🇭🇰','🇲🇴','🇯🇲','🇹🇹','🇧🇸','🇧🇧','🇭🇹','🇩🇴','🇨🇺','🇵🇷','🇵🇦','🇨🇷','🇬🇹','🇭🇳','🇸🇻','🇳🇮','🇧🇿','🇶🇦','🇰🇼','🇧🇭','🇴🇲','🇯🇴','🇱🇧','🇮🇶','🇮🇷','🇦🇫','🇱🇾','🇹🇳','🇩🇿','🇲🇦'] },
-  ];
+  // Shared by compose and reaction pickers; bundled locally for offline use.
+  const EMOJI_CATEGORIES = OPENMESSAGE_EMOJI_DATA.map(category => ({
+    name: category.name,
+    emojis: category.emojis.map(([emoji]) => emoji),
+  }));
 
   // Emoji search names (emoji → space-separated keywords)
   const EN = {
@@ -6269,6 +6266,16 @@ body::after {
     '❤️':'red heart love','☮️':'peace','✝️':'cross christian','☪️':'star crescent islam','♈':'aries zodiac','♉':'taurus zodiac','♊':'gemini zodiac','♋':'cancer zodiac','♌':'leo zodiac','♍':'virgo zodiac','♎':'libra zodiac','♏':'scorpio zodiac','♐':'sagittarius zodiac','♑':'capricorn zodiac','♒':'aquarius zodiac','♓':'pisces zodiac','🆔':'id','☢️':'radioactive','☣️':'biohazard','🆚':'versus vs','💯':'hundred perfect score','💢':'anger','♨️':'hot springs','🚫':'prohibited no forbidden','❗':'exclamation','❓':'question','‼️':'double exclamation','⁉️':'exclamation question','⚠️':'warning','♻️':'recycling recycle','✅':'check mark yes done','❎':'cross mark no','❌':'cross mark no wrong','⭕':'circle','🔴':'red circle','🟠':'orange circle','🟡':'yellow circle','🟢':'green circle','🔵':'blue circle','🟣':'purple circle','⚫':'black circle','⚪':'white circle','🔺':'red triangle up','🔻':'red triangle down','▶️':'play','⏸️':'pause','⏹️':'stop','⏺️':'record','⏩':'fast forward','⏪':'rewind','➡️':'right arrow','⬅️':'left arrow','⬆️':'up arrow','⬇️':'down arrow','🔀':'shuffle','🔁':'repeat loop','🎵':'music note','🎶':'music notes','➕':'plus add','➖':'minus subtract','✖️':'multiply','➗':'divide','♾️':'infinity','💲':'dollar sign','™️':'trademark','©️':'copyright','®️':'registered','✔️':'check mark','🔘':'radio button','🔈':'speaker low','🔇':'mute','🔉':'speaker medium','🔊':'speaker loud','🔔':'bell notification','🔕':'bell slash mute','💬':'speech bubble chat','💭':'thought bubble','♠️':'spade','♣️':'club','♥️':'heart suit','♦️':'diamond suit','🃏':'joker','🎴':'flower playing card',
     '🏁':'checkered flag race','🚩':'red flag','🎌':'crossed flags','🏴':'black flag','🏳️':'white flag','🏳️‍🌈':'rainbow pride flag','🏳️‍⚧️':'transgender flag','🏴‍☠️':'pirate flag','🇺🇸':'usa america united states','🇬🇧':'uk britain england','🇫🇷':'france','🇩🇪':'germany','🇯🇵':'japan','🇰🇷':'korea south','🇨🇳':'china','🇮🇳':'india','🇧🇷':'brazil','🇨🇦':'canada','🇦🇺':'australia','🇲🇽':'mexico','🇮🇹':'italy','🇪🇸':'spain','🇷🇺':'russia','🇿🇦':'south africa','🇳🇬':'nigeria','🇦🇷':'argentina','🇨🇴':'colombia','🇵🇪':'peru','🇨🇱':'chile','🇻🇪':'venezuela','🇪🇨':'ecuador','🇹🇷':'turkey','🇸🇦':'saudi arabia','🇦🇪':'uae emirates','🇮🇱':'israel','🇪🇬':'egypt','🇰🇪':'kenya','🇹🇿':'tanzania','🇪🇹':'ethiopia','🇬🇭':'ghana','🇹🇭':'thailand','🇻🇳':'vietnam','🇵🇭':'philippines','🇮🇩':'indonesia','🇲🇾':'malaysia','🇸🇬':'singapore','🇳🇿':'new zealand','🇫🇮':'finland','🇸🇪':'sweden','🇳🇴':'norway','🇩🇰':'denmark','🇳🇱':'netherlands','🇧🇪':'belgium','🇨🇭':'switzerland','🇦🇹':'austria','🇵🇱':'poland','🇨🇿':'czech','🇭🇺':'hungary','🇷🇴':'romania','🇬🇷':'greece','🇵🇹':'portugal','🇮🇪':'ireland','🇮🇸':'iceland','🇺🇦':'ukraine','🇵🇰':'pakistan','🇧🇩':'bangladesh','🇱🇰':'sri lanka','🇳🇵':'nepal','🇹🇼':'taiwan','🇭🇰':'hong kong','🇯🇲':'jamaica','🇨🇺':'cuba','🇵🇷':'puerto rico','🇵🇦':'panama','🇨🇷':'costa rica','🇮🇶':'iraq','🇮🇷':'iran','🇦🇫':'afghanistan','🇲🇦':'morocco',
   };
+
+  // Keep familiar aliases while making every catalog entry searchable by name.
+  OPENMESSAGE_EMOJI_DATA.forEach(category => {
+    category.emojis.forEach(([emoji, name]) => {
+      const aliases = name.includes('facepalming') ? 'facepalm face palm smh'
+        : name.includes('shrugging') ? 'shrug idk dunno'
+        : '';
+      EN[emoji] = [name, EN[emoji], aliases].filter(Boolean).join(' ');
+    });
+  });
 
   // ─── Avatar Colors ───
   // Pleasant, muted palette that works on both dark and light backgrounds
@@ -10852,9 +10859,10 @@ body::after {
     let html = '<div class="emoji-search"><input type="text" placeholder="Search emoji..." oninput="filterEmojis(event, \'' + jsArg + '\')"></div>';
     html += `<div class="emoji-grid" id="emoji-grid-${idAttr}">`;
     EMOJI_CATEGORIES.forEach(cat => {
-      html += `<div class="emoji-cat-label">${cat.name}</div>`;
+      html += `<div class="emoji-cat-label">${escapeHtml(cat.name)}</div>`;
       cat.emojis.forEach(e => {
-        html += `<button data-emoji="${e}" data-name="${escapeHtml(EN[e] || '')}" onclick="sendReactionFromGrid(this, '${jsArg}')">${e}</button>`;
+        const name = escapeHtml(EN[e] || 'emoji');
+        html += `<button type="button" data-emoji="${escapeHtml(e)}" data-name="${name}" aria-label="${name}" title="${name}" onclick="sendReactionFromGrid(this, '${jsArg}')">${escapeHtml(e)}</button>`;
       });
     });
     html += '</div>';
