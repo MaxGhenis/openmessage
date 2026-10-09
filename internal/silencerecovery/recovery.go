@@ -77,14 +77,15 @@ const (
 	// a message inside the window, so nothing was missing.
 	OutcomeNothingInWindow = "nothing_in_window"
 	// OutcomeEmpty: the pull path answered with nothing (the 2026-10-07
-	// defect): the run's first INBOX listing came back without a payload,
-	// every listing came back empty without an error, or every in-window
-	// conversation fetched nothing.
+	// defect): the run's first INBOX listing came back without a payload, or
+	// empty while no other folder listed anything; every listing came back
+	// empty without an error; or every in-window conversation fetched nothing
+	// and nothing failed. See Classify.
 	OutcomeEmpty = "empty"
-	// OutcomePartial: listings, fetches or store writes failed, the INBOX
-	// listing came back empty while other folders listed conversations, an
-	// in-window conversation fetched nothing while others worked, or, when
-	// readers use v2, history did not reach it.
+	// OutcomePartial: listings, fetches or store writes failed, an in-window
+	// conversation fetched nothing while others worked, the INBOX listing came
+	// back empty while other folders listed conversations, or, when readers
+	// use v2, fetched history did not reach it. See Classify.
 	OutcomePartial = "partial"
 	// OutcomeAborted: the run stopped early because the client changed or
 	// disconnected, or Google rejected the session.
@@ -163,7 +164,7 @@ type RunResult struct {
 	Aborted bool
 	// Listed counts the distinct conversations the folder listings returned.
 	Listed int
-	// Conversations counts the listed conversations inside the window.
+	// Conversations counts the in-window conversations stored without error.
 	Conversations int
 	// Messages counts the messages fetched from them.
 	Messages int
@@ -252,9 +253,11 @@ type Episode struct {
 	RunningSinceMS int64    `json:"running_since_ms,omitempty"`
 	Waiting        string   `json:"waiting,omitempty"`
 	LastAttempt    *Attempt `json:"last_attempt,omitempty"`
-	// Covers lists later silences that ended while this one was still owed.
-	// This episode's window includes theirs. If it is finished without a
-	// fetch (window too large), they are owed again on their own windows.
+	// Covers lists the other silences this episode's window includes: later
+	// ones that ended while it was owed, and, after an earlier silence judged
+	// late took the episode over, the previous owner and its covers. If the
+	// episode is finished without a fetch (window too large), the earliest of
+	// them is owed again on its own window and covers the rest.
 	Covers       []Covered `json:"covers,omitempty"`
 	Notice       string    `json:"notice,omitempty"`
 	FinishedAtMS int64     `json:"finished_at_ms,omitempty"`
@@ -277,8 +280,8 @@ type State struct {
 	History     []Episode `json:"history,omitempty"`
 	// Unjudged holds gaps long enough to be stalled whose baseline could not
 	// be read. Each tick retries up to maxUnjudgedPerTick of them, longest
-	// untried first, until a verdict comes in or their window exceeds
-	// MaxWindow.
+	// untried first, until a verdict comes in; a gap whose window has passed
+	// MaxWindow gets one last read outside that cap and is then finished.
 	Unjudged []Gap `json:"unjudged,omitempty"`
 }
 
@@ -427,8 +430,9 @@ func (r *Recoverer) Start(ctx context.Context) {
 func (r *Recoverer) safeTick(ctx context.Context) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
+			// fmt keeps a relayed panic's own stack (app.RelayedPanic) readable.
 			r.logger.Error().
-				Interface("panic", recovered).
+				Str("panic", fmt.Sprint(recovered)).
 				Bytes("stack", debug.Stack()).
 				Msg("Silence recovery: tick panicked; will retry next interval")
 		}
@@ -446,8 +450,12 @@ func (r *Recoverer) Tick(ctx context.Context) {
 	r.tickMu.Lock()
 	defer r.tickMu.Unlock()
 
-	r.retryUnjudged(ctx, r.now())
-	r.observe(ctx, r.now())
+	if ctx.Err() == nil {
+		// A cancelled tick (shutdown) would only record its own queries'
+		// cancellation as failures, possibly as a gap's last read.
+		r.retryUnjudged(ctx, r.now())
+		r.observe(ctx, r.now())
+	}
 	if ctx.Err() == nil {
 		if plan := r.beginAttempt(r.now()); plan != nil {
 			r.runAttempt(plan)
@@ -789,6 +797,19 @@ func (r *Recoverer) addEpisodeLocked(found detected, now time.Time) {
 			pending.SilentMS = joined.EndedAtMS - key
 			pending.Rule = found.rule
 			pending.SinceMS = sinceMS
+			pending.DetectedAtMS = now.UnixMilli()
+			// The attempts so far fetched the previous owner's window, which
+			// did not reach this silence: the wider window starts afresh. A
+			// run of the previous owner cut off by a crash is not charged to
+			// it either (each takeover needs a distinct earlier silence, so
+			// this can't loop).
+			pending.Attempts = 0
+			pending.Failures = 0
+			pending.LastAttempt = nil
+			if pending.State == StateRunning {
+				pending.State = StatePending
+				pending.RunningSinceMS = 0
+			}
 		} else {
 			pending.Covers = append(pending.Covers, joined)
 		}
@@ -983,12 +1004,18 @@ func (r *Recoverer) beginAttempt(now time.Time) *attemptPlan {
 	plan := &attemptPlan{key: pending.LastEventMS, since: since, startedAt: now}
 	attempt := pending.Attempts
 	r.mu.Unlock()
-	if !r.save(now) {
+	r.mu.Lock()
+	readOnly := r.readOnly
+	r.mu.Unlock()
+	if !r.save(now) && !readOnly {
 		// Without the running state on disk, a run that killed the daemon
 		// would not count against the episode, and could crash-loop it. Wait
-		// until the state can be saved.
+		// until the state can be saved. (In read-only mode a restart forgets
+		// the episode altogether, so it can't loop; runs go ahead.)
 		r.mu.Lock()
+		wasWaiting := false
 		if p := r.state.Pending; p != nil && p.LastEventMS == plan.key {
+			wasWaiting = p.Waiting == "state_not_saved"
 			p.State = StatePending
 			p.RunningSinceMS = 0
 			p.Attempts--
@@ -996,7 +1023,9 @@ func (r *Recoverer) beginAttempt(now time.Time) *attemptPlan {
 			p.NextAttemptMS = now.Add(r.cfg.BusyRetry).UnixMilli()
 		}
 		r.mu.Unlock()
-		r.logger.Warn().Msg("Silence recovery: the state file can't be saved; not starting a window backfill until it can")
+		if !wasWaiting {
+			r.logger.Warn().Msg("Silence recovery: the state file can't be saved; not starting a window backfill until it can")
+		}
 		return nil
 	}
 	r.logger.Info().
@@ -1060,8 +1089,9 @@ func (r *Recoverer) finishAttempt(plan *attemptPlan, result RunResult, started b
 		r.finishLocked(now)
 	case OutcomeEmpty, OutcomeAborted:
 		// The pull path answered with nothing, or the connection changed
-		// under the run: both pass. Keep probing (an empty listing costs three
-		// calls) until the window outgrows MaxWindow.
+		// under the run: both pass. Keep probing (when every folder answers
+		// empty, a probe costs three calls) until the window outgrows
+		// MaxWindow.
 		wait := r.backoffAfter(attempts)
 		pending.State = StatePending
 		pending.NextAttemptMS = now.Add(wait).UnixMilli()
@@ -1171,7 +1201,7 @@ func (r *Recoverer) backoffAfter(attempts int) time.Duration {
 
 func (r *Recoverer) giveUpNotice(episode *Episode, detail string) string {
 	return fmt.Sprintf(
-		"Automatic recovery of the Google silence from %s to %s gave up after %d partial or crashed attempts (last: %s). Once that is fixed, run POST /api/backfill {\"since\": %q} by hand.",
+		"Automatic recovery of the Google silence from %s to %s gave up after %d partial or crashed attempts (last: %s). If messages from then are missing, fix that and run POST /api/backfill {\"since\": %q} by hand.",
 		formatTime(time.UnixMilli(episode.LastEventMS), r.cfg.Location),
 		formatTime(time.UnixMilli(episode.EndedAtMS), r.cfg.Location),
 		episode.Failures,
@@ -1223,24 +1253,31 @@ func noticeActive(episode Episode, now time.Time) bool {
 }
 
 // Classify judges a run that started and had a client. A run counts as
-// recovered only when the pull path demonstrably returned data. It is empty
-// when the phone answered with nothing (the 2026-10-07 defect): the run's own
-// first INBOX listing came back empty or without a payload (the counted pull
-// Google pull health records, read off this run alone), the listings returned
-// nothing without an error, or every in-window conversation fetched nothing.
-// Failures and lost writes make it partial.
+// recovered only when the pull path demonstrably returned data.
+//
+// It is empty when the phone answered with nothing (the 2026-10-07 defect):
+// the run's own first INBOX listing (the counted pull Google pull health
+// records, read off this run alone) came back without a payload, or came back
+// empty while no other folder listed anything; the listings returned nothing
+// without an error; or every in-window conversation fetched nothing and
+// nothing failed.
+//
+// It is partial when something failed (the INBOX listing, other listings,
+// fetches, legacy-store writes, or, when readers use v2, hand-offs to v2), when
+// an in-window conversation fetched nothing while others worked, or when the
+// INBOX listing came back empty while other folders listed conversations and
+// nothing failed (the inbox may really be empty).
 func Classify(result RunResult, requireV2 bool) (string, string) {
 	switch {
 	case result.Aborted:
 		return OutcomeAborted, "the run stopped early: the client changed or disconnected, or Google rejected the session"
 	case result.InboxOutcome == InboxNoPayload:
 		return OutcomeEmpty, "the phone answered the INBOX listing without a payload"
-	case result.InboxOutcome == InboxEmpty && result.Listed == 0 && result.Errors == 0:
+	case result.InboxOutcome == InboxEmpty && result.Listed == 0:
+		if result.Errors > 0 {
+			return OutcomeEmpty, fmt.Sprintf("the phone answered the INBOX listing with no conversations and the other listings failed (%d errors)", result.Errors)
+		}
 		return OutcomeEmpty, "the phone listed no conversations in any folder; its request/response calls return no data"
-	case result.InboxOutcome == InboxEmpty:
-		// Other folders answered with data, so the pull path works; the inbox
-		// may really be empty, or its listing broken. Bounded, not probed.
-		return OutcomePartial, fmt.Sprintf("the INBOX listing came back empty while other folders listed %d conversations; if the inbox really is empty, nothing was missed", result.Listed)
 	case result.InboxOutcome == InboxError:
 		return OutcomePartial, fmt.Sprintf("the INBOX listing failed (%d errors in all)", result.Errors)
 	case result.Listed == 0 && result.Errors == 0:
@@ -1253,6 +1290,11 @@ func Classify(result RunResult, requireV2 bool) (string, string) {
 		return OutcomePartial, fmt.Sprintf(
 			"%d listing, fetch or store errors, %d in-window conversations fetched nothing, %d hand-offs to v2 failed",
 			result.Errors, result.EmptyConversations, result.HistoryTeeFailed)
+	case result.InboxOutcome == InboxEmpty:
+		// Other folders answered with data and nothing failed, so the pull path
+		// works; the inbox may really be empty, or its listing broken. Bounded,
+		// not probed.
+		return OutcomePartial, fmt.Sprintf("the INBOX listing came back empty while other folders listed %d conversations and nothing failed; the inbox may really be empty", result.Listed)
 	case requireV2 && result.Messages > 0 && result.HistoryTeed == 0:
 		return OutcomePartial, "fetched messages did not reach v2 ingest"
 	case result.Conversations == 0:
@@ -1453,7 +1495,20 @@ func preserveUnreadable(path string, now time.Time) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if err := os.WriteFile(aside, data, 0o600); err != nil {
+	copied, err := os.OpenFile(aside, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return "", err
+	}
+	if _, err := copied.Write(data); err != nil {
+		copied.Close()
+		return "", err
+	}
+	// The copy must be on disk before the next save replaces the original.
+	if err := syncStateFile(copied); err != nil {
+		copied.Close()
+		return "", err
+	}
+	if err := copied.Close(); err != nil {
 		return "", err
 	}
 	return aside, nil

@@ -322,7 +322,7 @@ func (a *App) windowBackfillAs(since time.Time, trigger string) (result GoogleWi
 		// phone never answers would hold the backfill guard, and the
 		// reconciles it refuses, until the process restarts. An automatic run
 		// gives up on that request instead (googleRecoveryCallDeadline).
-		catchUp.gm = newDeadlineGMClient(catchUp.gm, googleRecoveryCallDeadline)
+		catchUp.gm = newDeadlineGMClient(catchUp.gm, googleRecoveryCallDeadline, a.Logger)
 	}
 	inbox = &inboxPullRecorder{GMClient: catchUp.gm}
 	catchUp.gm = inbox

@@ -299,7 +299,8 @@ stops there, can't fill it.
   so a gap that spans a restart, an app that was quit, or a Mac that slept
   counts too: if no Google traffic arrived for long enough to be stalled,
   the window is fetched when traffic resumes. If a gap's baseline can't be
-  read, the gap goes on an `unjudged` list (saved with the state) and is
+  read and the gap isn't stalled without it (only the 72-hour floor can fire
+  then), the gap goes on an `unjudged` list (saved with the state) and is
   judged again each minute, three gaps a minute, longest untried first,
   until a read succeeds. When its window passes 7 days it gets one last read;
   if that fails too it ends with a notice instead of being dropped. A
@@ -325,23 +326,27 @@ stops there, can't fill it.
 - Each request it makes gets 2 minutes. libgm waits for a reply with no hard
   timeout, so without this one request the phone never answers would hold
   the backfill guard, and the reconciles it refuses, until a restart. After
-  one miss the rest of that run fails fast; the run counts as `partial`
+  one miss the rest of that run fails fast; the run counts as `partial`,
   unless the client changed (`aborted`) or the INBOX listing had already
-  answered with nothing. A panic inside a request still reaches the
-  recovery's own tick and is recorded as `crashed`.
+  answered with nothing (`empty`). A panic inside a request that comes
+  before its deadline reaches the recovery's own tick, with the request's
+  stack, and is recorded as `crashed`; one that comes after is logged.
 - A run counts as recovered only if the pull path returned data. The run's
   own first INBOX listing is classified the way `google.pull_health` (#193)
   classifies that counted pull, but read off this run alone, since the shared
   snapshot can be stale or overwritten by another pull meanwhile; it shows
   up as `last_attempt.inbox_outcome`. The run is `empty` (the 10/7 defect)
-  when that listing came back without a payload, when every listing came
-  back empty without an error, or when every in-window conversation fetched
-  nothing. It is `partial` when the INBOX listing failed or came back empty
-  while other folders listed conversations (an inbox that really is empty
-  ends here too, with a notice that says so), on listing, fetch or store
+  when that listing came back without a payload, or empty while no other
+  folder listed anything (whether the other listings answered empty or
+  failed), when every listing came back empty without an error, or when
+  every in-window conversation fetched nothing and nothing failed. It is
+  `partial` when the INBOX listing failed, on listing, fetch or store
   errors, when an in-window conversation fetched nothing while others
-  worked, and, on a v2-primary daemon, on failed v2 hand-offs or messages
-  that never reached v2. It is `aborted` when the client changed or Google
+  worked, on a v2-primary daemon when a run that fetched messages failed to
+  hand some of its history to v2,
+  and when the INBOX listing came back empty while other folders listed
+  conversations and nothing failed: an inbox that really is empty ends here
+  too, and `last_attempt.detail` says so until the episode gives up. It is `aborted` when the client changed or Google
   rejected the session mid-run, and `crashed` when the run panicked or the
   daemon stopped during it. Retries wait 5 m, 15 m, 30 m, 1 h, 2 h, then
   every 4 h. `empty` and `aborted` episodes keep trying (when every folder
@@ -354,8 +359,8 @@ stops there, can't fill it.
   account unpaired for that long, so after a re-pair expect a notice there.
   A silence that ended while an earlier one was still owed joins that
   window, and the next attempt waits until the latest of them has settled;
-  if the window turns out too large, the later silences are owed again on
-  their own windows.
+  if the window turns out too large, the earliest of the others is owed
+  again on its own window, with a fresh attempt count, and covers the rest.
 - Each silence is queued once and gets one recovery, across restarts. The
   state lives in `google-silence-recovery.json` in the data dir. An
   unreadable file is moved (or, failing that, copied) to

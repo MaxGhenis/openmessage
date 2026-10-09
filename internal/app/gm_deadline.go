@@ -3,8 +3,11 @@ package app
 import (
 	"errors"
 	"fmt"
+	"runtime/debug"
 	"sync"
 	"time"
+
+	"github.com/rs/zerolog"
 
 	"go.mau.fi/mautrix-gmessages/pkg/libgm/gmproto"
 )
@@ -27,13 +30,26 @@ var ErrGoogleCallDeadline = errors.New("google request got no reply before its d
 type deadlineGMClient struct {
 	inner    GMClient
 	deadline time.Duration
+	logger   zerolog.Logger
 
 	mu     sync.Mutex
 	missed error
 }
 
-func newDeadlineGMClient(inner GMClient, deadline time.Duration) GMClient {
-	return &deadlineGMClient{inner: inner, deadline: deadline}
+func newDeadlineGMClient(inner GMClient, deadline time.Duration, logger zerolog.Logger) GMClient {
+	return &deadlineGMClient{inner: inner, deadline: deadline, logger: logger}
+}
+
+// RelayedPanic is a panic raised inside a Google call that ran on its own
+// goroutine, re-raised on the caller's goroutine. Stack is where it happened
+// inside the call, which the caller's own stack would not show.
+type RelayedPanic struct {
+	Value any
+	Stack []byte
+}
+
+func (p *RelayedPanic) String() string {
+	return fmt.Sprintf("%v\n\nraised in a Google call:\n%s", p.Value, p.Stack)
 }
 
 func callWithDeadline[T any](c *deadlineGMClient, name string, call func() (T, error)) (T, error) {
@@ -47,17 +63,28 @@ func callWithDeadline[T any](c *deadlineGMClient, name string, call func() (T, e
 	type reply struct {
 		value    T
 		err      error
-		panicked any
+		panicked *RelayedPanic
 	}
 	done := make(chan reply, 1)
+	gaveUp := make(chan struct{})
 	go func() {
 		// A panic inside libgm must not take the daemon down from a goroutine
 		// nobody recovers; hand it to the caller, whose own recovery handles
-		// it as before the deadline existed. Once the caller has given up on
-		// the call, the panic is dropped with the reply.
+		// it as before the deadline existed. If the caller has already given
+		// up on the call, log it instead.
 		defer func() {
 			if p := recover(); p != nil {
-				done <- reply{panicked: p}
+				relayed := &RelayedPanic{Value: p, Stack: debug.Stack()}
+				select {
+				case <-gaveUp:
+					c.logger.Error().
+						Str("call", name).
+						Interface("panic", p).
+						Bytes("stack", relayed.Stack).
+						Msg("Google call panicked after its deadline; nobody was waiting for it")
+				default:
+				}
+				done <- reply{panicked: relayed}
 			}
 		}()
 		value, err := call()
@@ -72,6 +99,7 @@ func callWithDeadline[T any](c *deadlineGMClient, name string, call func() (T, e
 		}
 		return r.value, r.err
 	case <-timer.C:
+		close(gaveUp)
 		err := fmt.Errorf("%s: %w (%s)", name, ErrGoogleCallDeadline, c.deadline)
 		c.mu.Lock()
 		if c.missed == nil {

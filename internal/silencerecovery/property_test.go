@@ -212,7 +212,7 @@ func TestRecovererMatchesAnOfflineOracle(t *testing.T) {
 	if testing.Short() {
 		cases = 8
 	}
-	mergesSeen, tooLargeSeen, injectedFailures, latestOutages, unjudgedSeen := 0, 0, 0, 0, 0
+	mergesSeen, tooLargeSeen, injectedFailures, latestOutages, unjudgedSeen, gaveUpSeen := 0, 0, 0, 0, 0, 0
 	for c := 0; c < cases; c++ {
 		seed := int64(20261008 + c)
 		t.Run(fmt.Sprintf("seed%d", seed), func(t *testing.T) {
@@ -235,16 +235,20 @@ func TestRecovererMatchesAnOfflineOracle(t *testing.T) {
 				return f.Hour() == 0 && f.Minute() == 0 && f.Second() == 0 && f.Nanosecond() == 0 &&
 					e.Hour() == 0 && e.Minute() == 0 && e.Second() == 0 && e.Nanosecond() == 0
 			}
+			failedAt := map[int64][]time.Time{} // baseline start -> failed read times
 			src.betweenErr = func(from, to time.Time) error {
 				if !baselineFailures || !isBaseline(from, to) {
 					return nil
 				}
 				if clock.Before(burstUntil) || r.Intn(10) == 0 {
 					injectedFailures++
+					failedAt[from.UnixMilli()] = append(failedAt[from.UnixMilli()], clock)
 					return fmt.Errorf("database is locked")
 				}
 				return nil
 			}
+			// One case in eight is heavy in partial runs, so episodes give up.
+			partialHeavy := c%8 == 0
 			path := filepath.Join(t.TempDir(), StateFileName)
 			type run struct {
 				since     time.Time
@@ -326,7 +330,7 @@ func TestRecovererMatchesAnOfflineOracle(t *testing.T) {
 					runner.results = []runOutcome{{started: false}}
 				case p < 30:
 					runner.results = []runOutcome{{started: true, result: RunResult{Connected: true, InboxOutcome: InboxEmpty}}}
-				case p < 34:
+				case p < 34 || (partialHeavy && p < 85):
 					runner.results = []runOutcome{{started: true, result: RunResult{Connected: true, Listed: 5, Conversations: 1, Messages: 2, Errors: 1, HistoryTeed: 3, InboxOutcome: InboxOK}}}
 				default:
 					runner.results = []runOutcome{goodRun}
@@ -433,6 +437,9 @@ func TestRecovererMatchesAnOfflineOracle(t *testing.T) {
 					if len(runs) != 1 {
 						t.Fatalf("episode after %v recovered by %d completed runs, want 1", time.UnixMilli(episode.LastEventMS), len(runs))
 					}
+					if runs[0].at.Before(endedBy[key].Add(cfg.Settle)) {
+						t.Fatalf("silence after %v (to %v) was fetched at %v, before it settled", time.UnixMilli(key), endedBy[key], runs[0].at)
+					}
 					// The run must cover this silence: start at or before it
 					// and run after it ended.
 					if runs[0].since.After(time.UnixMilli(key).Add(-cfg.Margin)) || runs[0].at.Before(endedBy[key]) {
@@ -442,15 +449,33 @@ func TestRecovererMatchesAnOfflineOracle(t *testing.T) {
 						merges++
 					}
 				case StateGaveUp:
-					// Seven partial or crashed attempts: allowed, rare.
+					gaveUpSeen++
+					if episode.Failures <= len(cfg.Backoff) {
+						t.Fatalf("episode after %v gave up after %d failures", time.UnixMilli(episode.LastEventMS), episode.Failures)
+					}
 				case StateUnjudged:
-					// A baseline burst outlasted the window: allowed, with a notice.
+					// A baseline burst outlasted the window: allowed, with a
+					// notice, but only after a read at or past its expiry failed.
 					unjudgedSeen++
 					if key != episode.LastEventMS {
 						t.Fatalf("silence after %v covered by an unjudged gap", time.UnixMilli(key))
 					}
+					from, _ := freshness.BaselineRange(time.UnixMilli(key), cfg.Location, cfg.Silence)
+					expiry := time.UnixMilli(key).Add(-cfg.Margin).Add(cfg.MaxWindow)
+					justified := false
+					for _, at := range failedAt[from.UnixMilli()] {
+						if at.After(expiry) {
+							justified = true
+						}
+					}
+					if !justified {
+						t.Fatalf("silence after %v ended unjudged without a failed read after its expiry %v", time.UnixMilli(key), expiry)
+					}
 				case StateWindowTooLarge:
 					tooLargeSeen++
+					if time.UnixMilli(episode.FinishedAtMS).Sub(time.UnixMilli(episode.SinceMS)) <= cfg.MaxWindow {
+						t.Fatalf("episode after %v finished too large with a window of %v", time.UnixMilli(episode.LastEventMS), time.UnixMilli(episode.FinishedAtMS).Sub(time.UnixMilli(episode.SinceMS)))
+					}
 					if key != episode.LastEventMS {
 						t.Fatalf("silence after %v left covered by an episode finished too large", time.UnixMilli(key))
 					}
@@ -469,10 +494,10 @@ func TestRecovererMatchesAnOfflineOracle(t *testing.T) {
 			mergesSeen += merges
 		})
 	}
-	t.Logf("across all cases: %d merged silences, %d too-large episodes, %d failed baseline reads, %d activity outages, %d stalled silences never judged",
-		mergesSeen, tooLargeSeen, injectedFailures, latestOutages, unjudgedSeen)
-	if !testing.Short() && (mergesSeen == 0 || tooLargeSeen == 0 || injectedFailures == 0) {
-		t.Fatalf("the generator no longer produces merges (%d), too-large windows (%d) and baseline failures (%d)", mergesSeen, tooLargeSeen, injectedFailures)
+	t.Logf("across all cases: %d merged silences, %d too-large episodes, %d failed baseline reads, %d activity outages, %d stalled silences never judged, %d silences given up",
+		mergesSeen, tooLargeSeen, injectedFailures, latestOutages, unjudgedSeen, gaveUpSeen)
+	if !testing.Short() && (mergesSeen == 0 || tooLargeSeen == 0 || injectedFailures == 0 || gaveUpSeen == 0) {
+		t.Fatalf("the generator no longer produces merges (%d), too-large windows (%d), baseline failures (%d) and give-ups (%d)", mergesSeen, tooLargeSeen, injectedFailures, gaveUpSeen)
 	}
 }
 

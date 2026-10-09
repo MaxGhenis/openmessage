@@ -3,11 +3,13 @@ package app
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/rs/zerolog"
 	"go.mau.fi/mautrix-gmessages/pkg/libgm/gmproto"
 )
 
@@ -302,7 +304,7 @@ func TestDeadlineGMClientPassesRepliesThrough(t *testing.T) {
 		},
 		fetchMsgErrors: map[string]error{"c": errors.New("boom")},
 	}
-	client := newDeadlineGMClient(mock, time.Second)
+	client := newDeadlineGMClient(mock, time.Second, zerolog.Nop())
 	resp, err := client.ListConversationsWithCursor(10, gmproto.ListConversationsRequest_INBOX, nil)
 	if err != nil || len(resp.GetConversations()) != 1 {
 		t.Fatalf("list = %v, %v", resp, err)
@@ -392,8 +394,9 @@ func TestRecoveryRunPanicReachesTheCaller(t *testing.T) {
 	// Before the deadline wrapper ran calls on their own goroutine, a libgm
 	// panic reached the caller, whose tick recovers it. It still must, or it
 	// takes the whole daemon down.
-	if recovered != "libgm blew up" {
-		t.Fatalf("recovered %v, want the libgm panic on the caller's goroutine", recovered)
+	relayed, ok := recovered.(*RelayedPanic)
+	if !ok || relayed.Value != "libgm blew up" || !strings.Contains(string(relayed.Stack), "ListConversationsWithCursor") {
+		t.Fatalf("recovered %v, want the libgm panic, with the call's stack, on the caller's goroutine", recovered)
 	}
 	if a.IsDeepBackfillRunning() {
 		t.Fatal("the backfill guard is still held after the panic")

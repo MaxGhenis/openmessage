@@ -948,7 +948,8 @@ func TestClassify(t *testing.T) {
 		{"inbox empty", RunResult{Connected: true, InboxOutcome: InboxEmpty}, false, OutcomeEmpty},
 		{"inbox empty, nothing listed anywhere", RunResult{Connected: true, InboxOutcome: InboxEmpty}, false, OutcomeEmpty},
 		{"inbox empty while archive lists data", RunResult{Connected: true, Listed: 3, Conversations: 1, Messages: 4, HistoryTeed: 5, InboxOutcome: InboxEmpty}, false, OutcomePartial},
-		{"inbox empty and archive listing failed", RunResult{Connected: true, Errors: 2, InboxOutcome: InboxEmpty}, false, OutcomePartial},
+		{"inbox empty and the other listings failed", RunResult{Connected: true, Errors: 2, InboxOutcome: InboxEmpty}, false, OutcomeEmpty},
+		{"inbox empty, archive listed, a fetch failed", RunResult{Connected: true, Listed: 3, Conversations: 1, Messages: 2, Errors: 1, HistoryTeed: 3, InboxOutcome: InboxEmpty}, false, OutcomePartial},
 		{"inbox without payload", RunResult{Connected: true, Listed: 3, InboxOutcome: InboxNoPayload}, false, OutcomeEmpty},
 		{"inbox listing failed", RunResult{Connected: true, Errors: 3, InboxOutcome: InboxError}, false, OutcomePartial},
 		{"inbox timed out but archive listed", RunResult{Connected: true, Listed: 4, Conversations: 1, Messages: 2, Errors: 1, HistoryTeed: 3, InboxOutcome: InboxError}, false, OutcomePartial},
@@ -1057,6 +1058,9 @@ func TestFailedBaselineReadKeepsTheGapUntilItCanBeJudged(t *testing.T) {
 	}
 	if owner == nil || owner.LastEventMS != last.UnixMilli() || len(state.Unjudged) != 0 {
 		t.Fatalf("the gap was not judged once its baseline came back: %+v", state)
+	}
+	if got := h.rec.Snapshot().BaselineError; got != "" {
+		t.Fatalf("baseline_error kept after a good read: %q", got)
 	}
 }
 
@@ -1515,6 +1519,9 @@ func TestEarlierLateJudgedGapExtendsThePendingWindow(t *testing.T) {
 		len(pending.Covers) != 1 || pending.Covers[0].LastEventMS != endA.UnixMilli() {
 		t.Fatalf("pending = %+v, want A owning the window with B covered", pending)
 	}
+	if pending.EndedAtMS != endA.UnixMilli() || pending.SilentMS != endA.Sub(last).Milliseconds() || pending.Rule == "" {
+		t.Fatalf("pending = %+v, want A's own end, length and rule", pending)
+	}
 	if pending.NextAttemptMS < endB.Add(h.cfg.Settle).UnixMilli() {
 		t.Fatalf("next attempt %d before B settled", pending.NextAttemptMS)
 	}
@@ -1786,5 +1793,170 @@ func TestPreserveUnreadableReportsAStatError(t *testing.T) {
 	}
 	if rec.Snapshot().StateLoadError == "" {
 		t.Fatal("no load error reported")
+	}
+}
+
+func TestTakeoverStartsTheAttemptHistoryAfresh(t *testing.T) {
+	h := newHarness(t, day)
+	last := busyBaseline(h.source, day, 14)
+	h.tickAt(last.Add(time.Second))
+	endA := last.Add(20 * time.Hour)
+	endB := endA.Add(20 * time.Hour)
+	h.source.add(endA, endB)
+	fromA, _ := freshness.BaselineRange(last, newYork, h.cfg.Silence)
+	failing := true
+	h.source.betweenErr = func(from, _ time.Time) error {
+		if from.Equal(fromA) && failing {
+			return errors.New("database is locked")
+		}
+		return nil
+	}
+	// B runs and comes back partial twice while A can't be judged.
+	partial := runOutcome{started: true, result: RunResult{Connected: true, Listed: 9, Conversations: 1, Messages: 2, Errors: 1, HistoryTeed: 3, InboxOutcome: InboxOK}}
+	h.runner.results = []runOutcome{partial, partial, goodRun}
+	at := endB.Add(3 * time.Minute)
+	for h.runner.callCount() < 2 {
+		h.tickAt(at)
+		at = at.Add(5 * time.Minute)
+	}
+	if p := h.rec.State().Pending; p == nil || p.Failures != 2 {
+		t.Fatalf("pending = %+v, want B with two failures", p)
+	}
+	failing = false
+	h.runner.ready, h.runner.reason = false, "disconnected"
+	h.tickAt(at)
+	p := h.rec.State().Pending
+	if p == nil || p.LastEventMS != last.UnixMilli() || p.Attempts != 0 || p.Failures != 0 || p.LastAttempt != nil {
+		t.Fatalf("pending after takeover = %+v, want A with a fresh attempt history", p)
+	}
+}
+
+func TestTakeoverOfALeftoverRunningEpisode(t *testing.T) {
+	h := newHarness(t, day)
+	last := busyBaseline(h.source, day, 14)
+	h.tickAt(last.Add(time.Second))
+	endA := last.Add(20 * time.Hour)
+	endB := endA.Add(20 * time.Hour)
+	h.source.add(endA, endB)
+	fromA, _ := freshness.BaselineRange(last, newYork, h.cfg.Silence)
+	failing := true
+	h.source.betweenErr = func(from, _ time.Time) error {
+		if from.Equal(fromA) && failing {
+			return errors.New("database is locked")
+		}
+		return nil
+	}
+	// The daemon dies during B's run.
+	var during State
+	h.runner.onRun = func(time.Time, bool) { during = h.savedState() }
+	h.tickAt(endB.Add(3 * time.Minute))
+	if err := saveState(h.path, during); err != nil {
+		t.Fatal(err)
+	}
+	h.runner.onRun = nil
+	failing = false
+	h.restart()
+	h.tickAt(endB.Add(4 * time.Minute)) // A judged: takes over the leftover
+	if h.runner.callCount() != 2 || !h.runner.calls[1].Equal(last.Add(-h.cfg.Margin)) {
+		t.Fatalf("calls = %v, want B's cut-off run, then one from A's start", h.runner.calls)
+	}
+	done := h.rec.State().History
+	if len(done) != 1 || done[0].LastEventMS != last.UnixMilli() || done[0].State != StateRecovered || len(done[0].Covers) != 1 {
+		t.Fatalf("history = %+v", done)
+	}
+}
+
+func TestReadOnlyStateStillRuns(t *testing.T) {
+	h := newHarness(t, day)
+	if err := os.WriteFile(h.path, []byte("{bad"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Dir(h.path)
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(dir, 0o700) })
+	h.restart() // read-only: the bad file can be neither moved nor copied
+	last := busyBaseline(h.source, day, 14)
+	h.tickAt(last.Add(time.Second))
+	end := last.Add(20 * time.Hour)
+	h.source.add(end)
+	h.tickAt(end.Add(time.Second))
+	h.tickAt(end.Add(3 * time.Minute))
+	if h.runner.callCount() != 1 {
+		t.Fatalf("calls = %d: read-only mode blocked the recovery", h.runner.callCount())
+	}
+	if data, _ := os.ReadFile(h.path); string(data) != "{bad" {
+		t.Fatalf("the unreadable original was overwritten: %q", data)
+	}
+}
+
+func TestCancelledTickRecordsNothing(t *testing.T) {
+	h := newHarness(t, day)
+	last := busyBaseline(h.source, day, 14)
+	h.tickAt(last.Add(time.Second))
+	end := last.Add(40 * time.Hour)
+	h.source.add(end)
+	fromA, _ := freshness.BaselineRange(last, newYork, h.cfg.Silence)
+	h.source.betweenErr = func(from, _ time.Time) error {
+		if from.Equal(fromA) {
+			return errors.New("database is locked")
+		}
+		return nil
+	}
+	h.tickAt(end.Add(time.Second))
+	before := h.rec.State()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	h.clock = last.Add(-h.cfg.Margin).Add(h.cfg.MaxWindow + time.Hour) // the gap would expire now
+	h.rec.Tick(ctx)
+	after := h.rec.State()
+	if len(after.Unjudged) != len(before.Unjudged) || len(after.History) != 0 {
+		t.Fatalf("a cancelled tick changed the state: %+v", after)
+	}
+}
+
+func TestExpiringReadIgnoresTheCap(t *testing.T) {
+	h := newHarness(t, day)
+	last := time.Date(2026, 10, 5, 10, 0, 0, 0, newYork)
+	steadyAllDay(h.source, last)
+	h.tickAt(last.Add(time.Second))
+	// Four 25-hour gaps, all with failing baselines.
+	var lasts []time.Time
+	at := last
+	for i := 0; i < 4; i++ {
+		lasts = append(lasts, at)
+		at = at.Add(25 * time.Hour)
+		h.source.add(at)
+	}
+	failing := map[int64]bool{}
+	for _, l := range lasts {
+		from, _ := freshness.BaselineRange(l, newYork, h.cfg.Silence)
+		failing[from.UnixMilli()] = true
+	}
+	h.source.betweenErr = func(from, _ time.Time) error {
+		if failing[from.UnixMilli()] {
+			return errors.New("database is locked")
+		}
+		return nil
+	}
+	h.tickAt(at.Add(time.Second))
+	if got := len(h.rec.State().Unjudged); got != 4 {
+		t.Fatalf("unjudged = %d", got)
+	}
+	// Rotate the first gap to the back of the line, so the three others
+	// fill the cap ahead of it.
+	for i := 1; i <= 3; i++ {
+		h.tickAt(at.Add(time.Duration(i) * time.Minute))
+	}
+	if order := h.rec.State().Unjudged; order[len(order)-1].LastEventMS != lasts[0].UnixMilli() {
+		t.Fatalf("order = %+v, want the first gap last", order)
+	}
+	// Only the first gap's window passes 7 days now.
+	expiry := lasts[0].Add(-h.cfg.Margin).Add(h.cfg.MaxWindow)
+	h.tickAt(expiry.Add(time.Millisecond))
+	state := h.rec.State()
+	if len(state.History) != 1 || state.History[0].LastEventMS != lasts[0].UnixMilli() || state.History[0].State != StateUnjudged {
+		t.Fatalf("history = %+v, want the expiring gap finished in this tick", state.History)
 	}
 }
