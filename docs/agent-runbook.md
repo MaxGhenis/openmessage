@@ -752,7 +752,7 @@ Consequences worth knowing:
     phone's clock; #201 changes this);
   - 3 messages whose `message_id` was already taken;
   - 4 snapshots of 1:1 threads that listed the account itself three to five
-    times, all but one copy without a number. Since #PRNUM such entries are
+    times, all but one copy without a number. Since #211 such entries are
     left off the roster instead (see
     [Roster entries without an address](#roster-entries-without-an-address-and-why-not-to-replay-quarantined-frames)).
     The daemon's `quarantined: 1` on the morning of 10/9 is consistent with
@@ -840,7 +840,7 @@ A Google conversation snapshot can list entries with no number (libgm fills in
 only a participant ID and a name) or with a number v2 can't key (a "+" with no
 digits). The live worker used to fail the whole snapshot on such an entry and
 quarantine it, so the thread missed that update: its kind, title and roster.
-Since #PRNUM the worker leaves those entries off before it reads the roster,
+Since #211 the worker leaves those entries off before it reads the roster,
 and #176's rebinding (`googleConversationEventTarget`) judges the same
 entries. A stored member the snapshot doesn't name is kept when it may be one
 of the entries left off: any member when one of them isn't flagged as the
