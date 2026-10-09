@@ -837,7 +837,12 @@ account pairing, please log in to continue using SMS/RCS").
   lengths, `decoded_size`, `unknown_len`, `account_switch`). Answers that arrive after their request
   already finished are logged as `Received response with no pending request`.
 - Pulls fail with an error that matches `libgm.ErrNoResponsePayload`; deep
-  backfill counts them in `errors`.
+  backfill counts them in `errors`. Lookups on the legacy send and
+  new-conversation paths fail after the answer delay plus the 10 s grace
+  with "Google Messages on your phone switched to Google-account pairing…".
+  These errors deliberately do not count toward `needs_repair`: that would
+  park the transport, and push is the only delivery still working in this
+  state.
 - `/api/status` → `google.pull_health` records the last pull (`last_trigger`,
   `last_outcome` = `ok|empty|no_payload|error`, `last_error`) and raises
   `empty_with_local_history: true` when the latest INBOX listing or targeted

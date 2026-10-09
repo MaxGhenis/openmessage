@@ -10,8 +10,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/rs/zerolog"
 	"go.mau.fi/mautrix-gmessages/pkg/libgm"
 	"go.mau.fi/mautrix-gmessages/pkg/libgm/gmproto"
+
+	"github.com/maxghenis/openmessage/internal/client"
+	"github.com/maxghenis/openmessage/internal/db"
 )
 
 func noPayloadErr(accountSwitch bool) error {
@@ -439,30 +443,20 @@ func TestDatalessStreakSaturates(t *testing.T) {
 	}
 }
 
-// A send lookup the phone answers with its account-switch notice counts like
-// the UNKNOWN send it used to become, so needs_repair still appears after
-// repeated attempts on the legacy send path.
-func TestAccountSwitchSendErrorsRaiseNeedsRepair(t *testing.T) {
+// Round-3 review: an account-switch answer must not count toward
+// needs_repair. Three of them would park the transport, and in that state
+// push is the only delivery still working.
+func TestAccountSwitchSendErrorsDoNotParkTheTransport(t *testing.T) {
 	a := newTestApp(t, &mockGMClient{})
 	a.SessionPath = t.TempDir() + "/session.json"
 	if err := os.WriteFile(a.SessionPath, []byte("{}"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	for i := 0; i < googleRepairThreshold; i++ {
-		a.RecordGoogleSendError(fmt.Errorf("get conversation: %w", noPayloadErr(true)))
+	for i := 0; i < googleRepairThreshold+2; i++ {
+		a.RecordGoogleSendError(fmt.Errorf("get or create conversation: %w", noPayloadErr(true)))
 	}
-	if !a.GoogleStatus().NeedsRepair {
-		t.Fatal("repeated account-switch send errors did not raise needs_repair")
-	}
-
-	b := newTestApp(t, &mockGMClient{})
-	b.SessionPath = a.SessionPath
-	for i := 0; i < googleRepairThreshold; i++ {
-		b.RecordGoogleSendError(noPayloadErr(false))
-		b.RecordGoogleSendError(errors.New("dial tcp: timeout"))
-	}
-	if b.GoogleStatus().NeedsRepair {
-		t.Fatal("non-account-switch errors must not raise needs_repair")
+	if a.GoogleStatus().NeedsRepair {
+		t.Fatal("account-switch errors raised needs_repair, which parks the transport")
 	}
 }
 
@@ -513,5 +507,44 @@ func TestSaturatedStreakKeepsNewestAcrossDelayedRecovery(t *testing.T) {
 	h.apply(googlePullRecord{seq: n + 1, outcome: GooglePullOK, counted: true, count: 3, local: -1})
 	if h.snap.ConsecutiveDataless != 1 || !h.snap.EmptyWithLocalHistory || !h.snap.AccountSwitch {
 		t.Fatalf("snap = %+v", h.snap)
+	}
+}
+
+// Round-3 review: the retirement check on the production path (a real client
+// generation, not the mock), with the replacement landing mid-count.
+func TestPullFromGenerationRetiredDuringCountIsIgnored(t *testing.T) {
+	store, err := db.New(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { store.Close() })
+	a := &App{Store: store, Logger: zerolog.Nop()}
+	oldCli := &client.Client{GM: libgm.NewClient(libgm.NewAuthData(), nil, zerolog.Nop())}
+	a.BeginGoogleGeneration(oldCli)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	a.SetGoogleConversationCounter(func() (int, error) {
+		close(entered)
+		<-release
+		return 1044, nil
+	})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		a.recordGoogleListPull(oldCli.GM, "reconcile:old", gmproto.ListConversationsRequest_INBOX, true, nil, noPayloadErr(true))
+	}()
+	<-entered
+	a.BeginGoogleGeneration(&client.Client{GM: libgm.NewClient(libgm.NewAuthData(), nil, zerolog.Nop())})
+	close(release)
+	<-done
+	if h := a.GooglePullHealth(); h != nil {
+		t.Fatalf("pull from the retired generation was applied: %+v", h)
+	}
+
+	// A pull from the current generation is applied.
+	a.SetGoogleConversationCounter(func() (int, error) { return 1044, nil })
+	a.recordGoogleListPull(a.GetClient().GM, "reconcile:new", gmproto.ListConversationsRequest_INBOX, true, nil, noPayloadErr(true))
+	if h := a.GooglePullHealth(); h == nil || h.LastTrigger != "reconcile:new" || !h.EmptyWithLocalHistory {
+		t.Fatalf("current-generation pull not applied: %+v", h)
 	}
 }

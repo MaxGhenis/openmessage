@@ -14760,8 +14760,10 @@ body::after {
     $newMsgError.style.display = 'none';
 
     // Hard timeout so the button never hangs forever if the backend stalls.
+    // Longer than the backend's own failure path: a lookup the phone refuses
+    // takes its answer delay plus libgm's 10 s payload grace (11-15 s seen).
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 15000);
+    const timeoutId = setTimeout(() => controller.abort(), 30000);
 
     try {
       const resp = await fetch(API + '/api/new-conversation', {

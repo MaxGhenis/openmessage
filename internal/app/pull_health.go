@@ -46,7 +46,7 @@ type GooglePullHealthSnapshot struct {
 	LastError     string            `json:"last_error,omitempty"`
 	// LastDataMS is when a counted pull last returned data.
 	LastDataMS int64 `json:"last_data_ms,omitempty"`
-	// AccountSwitch is set when the latest payload-less answer carried the
+	// AccountSwitch is set when the newest counted pull was answered with the
 	// phone's Google-account switch notice.
 	AccountSwitch bool `json:"account_switch,omitempty"`
 	// ConsecutiveDataless counts counted pulls in a row (first INBOX pages and

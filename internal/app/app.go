@@ -233,16 +233,11 @@ func (a *App) RecordGoogleSendOutcomeWithPhone(success bool, phoneResponding boo
 // returns a SendMessageResponse status. Only auth/dead-session failures mark
 // the session for re-pair; transient network errors should remain recoverable.
 func (a *App) RecordGoogleSendError(err error) {
+	// An account-switch answer (IsGoogleAccountSwitchError) is deliberately not
+	// counted here: needs_repair parks the transport, and in that state push
+	// is the only delivery still working. pull_health.account_switch reports it.
 	if isGoogleAuthInvalid(err) {
 		a.markGoogleNeedsRepairAndPark(err)
-		return
-	}
-	if IsGoogleAccountSwitchError(err) {
-		// The phone switched to Google-account pairing and answers this
-		// session's lookups with a notice instead of data. Count it like the
-		// UNKNOWN send it used to turn into, so needs_repair (and the UI's
-		// re-pair prompt) still appears after repeated attempts.
-		a.RecordGoogleSendOutcome(false)
 	}
 }
 
