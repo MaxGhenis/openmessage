@@ -3,13 +3,14 @@ package app
 import (
 	"context"
 	"errors"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/rs/zerolog"
+	"go.mau.fi/mautrix-gmessages/pkg/libgm"
 	"go.mau.fi/mautrix-gmessages/pkg/libgm/gmproto"
 )
 
@@ -247,25 +248,30 @@ func TestWindowBackfillCountsLegacyStoreFailures(t *testing.T) {
 }
 
 // blockingGM answers listings only when release is closed.
-type blockingGM struct {
+// silentPhoneGM answers no listing: each one fails the way libgm fails a
+// request the phone never answers, after a short wait standing in for
+// libgm's request timeout.
+type silentPhoneGM struct {
 	mockGMClient
-	release chan struct{}
-	calls   atomic.Int32
+	calls atomic.Int32
 }
 
-func (b *blockingGM) ListConversationsWithCursor(count int, folder gmproto.ListConversationsRequest_Folder, cursor *gmproto.Cursor) (*gmproto.ListConversationsResponse, error) {
-	b.calls.Add(1)
-	<-b.release
-	return b.mockGMClient.ListConversationsWithCursor(count, folder, cursor)
+func (s *silentPhoneGM) ListConversationsWithCursor(int, gmproto.ListConversationsRequest_Folder, *gmproto.Cursor) (*gmproto.ListConversationsResponse, error) {
+	s.calls.Add(1)
+	time.Sleep(20 * time.Millisecond)
+	return nil, &libgm.UnansweredRequestError{
+		Action: gmproto.ActionType_LIST_CONVERSATIONS,
+		Reason: libgm.ErrPhoneNotResponding,
+		Waited: 20 * time.Millisecond,
+	}
 }
 
+// libgm fails a request the phone never answers after its request timeout,
+// and the catch-up stops after that first unanswered request
+// (failFastGMClient), so a recovery run against a silent phone ends after one
+// timeout instead of one per folder and releases the backfill guard.
 func TestRecoveryRunGivesUpOnARequestThePhoneNeverAnswers(t *testing.T) {
-	saved := googleRecoveryCallDeadline
-	googleRecoveryCallDeadline = 50 * time.Millisecond
-	t.Cleanup(func() { googleRecoveryCallDeadline = saved })
-
-	gm := &blockingGM{release: make(chan struct{})}
-	t.Cleanup(func() { close(gm.release) })
+	gm := &silentPhoneGM{}
 	a := newTestApp(t, nil)
 	a.gmClient = gm
 
@@ -281,40 +287,18 @@ func TestRecoveryRunGivesUpOnARequestThePhoneNeverAnswers(t *testing.T) {
 		t.Fatal("the recovery run hung on an unanswered request")
 	}
 	if result.Errors == 0 {
-		t.Fatal("the missed deadline was not counted as an error")
+		t.Fatal("the unanswered request was not counted as an error")
 	}
 	if result.InboxOutcome != GooglePullError {
-		t.Fatalf("InboxOutcome = %q, want error for a missed INBOX deadline", result.InboxOutcome)
+		t.Fatalf("InboxOutcome = %q, want error for an unanswered INBOX listing", result.InboxOutcome)
 	}
 	// After the first miss, later listings fail at once instead of each
-	// waiting out its own deadline.
+	// waiting out libgm's timeout.
 	if calls := gm.calls.Load(); calls != 1 {
 		t.Fatalf("%d listings reached the phone, want 1", calls)
 	}
 	if a.IsDeepBackfillRunning() {
 		t.Fatal("the backfill guard is still held")
-	}
-
-}
-
-func TestDeadlineGMClientPassesRepliesThrough(t *testing.T) {
-	mock := &mockGMClient{
-		conversations: map[gmproto.ListConversationsRequest_Folder][][]*gmproto.Conversation{
-			gmproto.ListConversationsRequest_INBOX: {{convAt("c", 2_000)}},
-		},
-		fetchMsgErrors: map[string]error{"c": errors.New("boom")},
-	}
-	client := newDeadlineGMClient(mock, time.Second, zerolog.Nop())
-	resp, err := client.ListConversationsWithCursor(10, gmproto.ListConversationsRequest_INBOX, nil)
-	if err != nil || len(resp.GetConversations()) != 1 {
-		t.Fatalf("list = %v, %v", resp, err)
-	}
-	if _, err := client.FetchMessages("c", 10, nil); err == nil || errors.Is(err, ErrGoogleCallDeadline) {
-		t.Fatalf("fetch error = %v, want the client's own error", err)
-	}
-	// An ordinary error does not poison later calls.
-	if _, err := client.ListConversationsWithCursor(10, gmproto.ListConversationsRequest_INBOX, nil); err != nil {
-		t.Fatalf("later call failed: %v", err)
 	}
 }
 
@@ -387,15 +371,18 @@ func TestRecoveryRunPanicReachesTheCaller(t *testing.T) {
 	a := newTestApp(t, nil)
 	a.gmClient = &panickingGM{}
 	var recovered any
+	var stack []byte
 	func() {
-		defer func() { recovered = recover() }()
+		defer func() {
+			recovered = recover()
+			stack = debug.Stack()
+		}()
 		a.RunGoogleWindowBackfill(time.UnixMilli(1_000), BackfillTriggerSilenceRecovery)
 	}()
-	// Before the deadline wrapper ran calls on their own goroutine, a libgm
-	// panic reached the caller, whose tick recovers it. It still must, or it
-	// takes the whole daemon down.
-	relayed, ok := recovered.(*RelayedPanic)
-	if !ok || relayed.Value != "libgm blew up" || !strings.Contains(string(relayed.Stack), "ListConversationsWithCursor") {
+	// A libgm panic must reach the caller, whose tick recovers it, or it
+	// takes the whole daemon down. Requests run on the caller's goroutine, so
+	// its recover still sees the frames that panicked.
+	if recovered != "libgm blew up" || !strings.Contains(string(stack), "ListConversationsWithCursor") {
 		t.Fatalf("recovered %v, want the libgm panic, with the call's stack, on the caller's goroutine", recovered)
 	}
 	if a.IsDeepBackfillRunning() {

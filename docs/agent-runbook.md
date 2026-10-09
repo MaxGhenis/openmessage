@@ -323,14 +323,13 @@ stops there, can't fill it.
   Google connection ends, and the supervisor, which owns repair and
   reconnect, takes it from there.
   When another backfill holds the guard it tries again 2 minutes later.
-- Each request it makes gets 2 minutes. libgm waits for a reply with no hard
-  timeout, so without this one request the phone never answers would hold
-  the backfill guard, and the reconciles it refuses, until a restart. After
-  one miss the rest of that run fails fast; the run counts as `partial`,
-  unless the client changed (`aborted`) or the INBOX listing had already
-  answered with nothing (`empty`). A panic inside a request that comes
-  before its deadline reaches the recovery's own tick, with the request's
-  stack, and is recorded as `crashed`; one that comes after is logged.
+- A request the phone never answers fails after libgm's 60 s request
+  timeout, and the rest of that run then fails at once, as in every
+  catch-up (see "Requests the phone never answers"). The run counts as
+  `partial`, unless the client changed (`aborted`) or the INBOX listing had
+  already answered with nothing (`empty`). A panic inside a request reaches
+  the recovery's own tick, with the request's stack, and is recorded as
+  `crashed`.
 - A run counts as recovered only if the pull path returned data. The run's
   own first INBOX listing is classified the way `google.pull_health` (#193)
   classifies that counted pull, but read off this run alone, since the shared

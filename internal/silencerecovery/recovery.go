@@ -430,7 +430,8 @@ func (r *Recoverer) Start(ctx context.Context) {
 func (r *Recoverer) safeTick(ctx context.Context) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			// fmt keeps a relayed panic's own stack (app.RelayedPanic) readable.
+			// Deferred during the panic, so debug.Stack still holds the frames
+			// that panicked (inside a Google request, for one in a fetch).
 			r.logger.Error().
 				Str("panic", fmt.Sprint(recovered)).
 				Bytes("stack", debug.Stack()).
