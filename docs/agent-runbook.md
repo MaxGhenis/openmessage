@@ -530,7 +530,9 @@ a copy ([testing a change](#testing-a-change)).
   string. `append_errors` has its own check on runs whose status has ingest
   accounts: it logs `state file append_errors was damaged (…) - bad fields
   read as 0` and rewrites the file at the end of that run instead of
-  deleting it. Other runs read its bad fields as 0 without a log line.
+  deleting it. An answered run without accounts (or without status data)
+  reads its bad fields as 0 without a log line; down and skipped runs don't
+  read it.
   Before `ea25916` most of these values went straight into bash arithmetic:
   a word ended any run that did arithmetic on it (a down run for
   `consecutive_fails`, a due relaunch, an alert or episode whose condition
@@ -712,10 +714,11 @@ since dotfiles `aaeefc3` it drops every `"` and `\` from the text. The
 backslash in that text could keep the notification from compiling, and a
 quote could end the literal early and turn the rest into AppleScript.
 
-- The disconnect and `needs_repair` alerts count consecutive answered runs and
-  notify once, when the count reaches 3, so one notification covers the whole
-  episode. The count resets on any run that reads the status without finding
-  the condition, including one where the platform became unpaired, so
+- The disconnect and `needs_repair` alerts count consecutive runs that read
+  the status and notify once, when the count reaches 3, so one notification
+  covers the whole episode. The count resets on any run that reads the status
+  without finding the condition, including one where the platform became
+  unpaired, so
   `reconnected: <platform>` and `google repair cleared` in the log don't
   prove a recovery. Runs where the daemon is down, where the watchdog skips,
   or where it got no status data (python3 failed, or the status didn't parse)
@@ -767,8 +770,9 @@ quote could end the literal early and turn the rest into AppleScript.
   the previous one, if the platform is still unpaired then. A relink in the
   meantime logs nothing, since the stored state never left paired.
 - If `/api/status` contains `"connected"` but isn't valid JSON, the run logs
-  `status parse error: …`, lists it in health.txt, checks nothing else, and
-  posts no notification.
+  `status parse error: …`, lists it in health.txt, checks nothing else in the
+  response, and posts no notification. health.txt can still list a saved
+  `append_errors` remainder on such a run.
 
 Consequences worth knowing:
 
@@ -796,8 +800,9 @@ Consequences worth knowing:
   [health.txt](#healthtxt-what-the-last-run-saw) the count is an `alert:`
   line on every run that reads the status while it is above 0, reported or
   not, until the backend restarts; attempts carried over a restart are listed
-  until they are reported, and on runs without accounts or without status
-  data the unreported remainder is listed instead. Failures after the
+  until they are reported, and on answered runs without accounts or without
+  status data the unreported remainder is listed instead (down and skipped
+  runs list nothing for it). Failures after the
   watchdog's last run that saw accounts and before a restart die with the old
   process uncounted. When the identity is unknown on a run after a restart and
   neither sum falls, that run takes the new backend for the old one: a count
@@ -930,9 +935,11 @@ episode counters and their start files, the `paired_<platform>` files, the
 `alert_<key>` stamps (it never writes the relaunch stamp), the
 `append_errors` file, `python.stderr` and `health.txt`. It also deletes any
 counter or time file it reads as damaged or later than its clock, the relaunch
-stamp included. With `OPENMESSAGE_WATCHDOG_NOW` pinned in the past, that is
-every stamp and start time it reads, and it writes them back on the past
-clock. Run against the real state dir, it can swallow the next real alert:
+stamp included. With `OPENMESSAGE_WATCHDOG_NOW` pinned earlier than the
+stamps already in the state dir, it deletes each one it reads. Alert stamps
+and start times come back on that earlier clock when their condition holds,
+but a deleted relaunch stamp stays deleted, which lifts the throttle. Run
+against the real state dir, it can swallow the next real alert:
 a stamped key stays quiet for 6 hours, an episode counter pushed past 3 never
 alerts, an `append_errors` count marked reported never alerts, and a lost
 pairing it records is never announced. It also overwrites the live
