@@ -684,6 +684,54 @@ in-app supervisors. It alerts on:
     its desktop notifications are on), and the chief-of-staff watcher
     (`com.maxghenis.cos.openmessage-health-watch`) relays Google's verdict to
     Max on Telegram. The watchdog only logs it, as a `note:` line on every run.
+  - The same watcher also tells Max when OpenMessage can't judge silence at
+    all. It tracks two things, on each run that reads the status while Google
+    is paired, and sends at most one Telegram alert per outage of each:
+    - **Detection**, sent as "OpenMessage's Google silence detection is down
+      (since …)": can the verdict above be trusted? A run is blind when any of
+      these holds:
+      - `freshness.google.silence` is missing although an earlier run showed
+        it. A #190 daemon leaves it out until its activity clock has been read
+        once since it started, and drops the whole `freshness` block while its
+        first store read fails.
+      - The verdict is `carried_over`. It is kept while a query behind it
+        fails, so without its hour-of-day rule it flags a stall only after 16 or
+        72 hours. If it can't see new messages, it may flag one that isn't real.
+      - The verdict is `baseline_unavailable`, so only the 72-hour rule can
+        fire.
+      - The verdict is frozen: judged (`last_event_ms + silent_ms`) more than
+        10 minutes ago, before the previous run, with the Mac awake for 60
+        seconds since that run. The daemon keeps serving its last freshness
+        block while the store read behind it fails. Its 30-second cache runs on
+        a clock that stops in sleep, so an old block right after a wake doesn't
+        count.
+    - **Recovery** (daemons with PR #199), sent as "OpenMessage's silence
+      recovery is stuck (since …)": is the automatic re-fetch still following
+      the clock? A run is blind when `silence_recovery.google.activity_error`
+      is set, or when `silence_recovery.google.watermark_ms` is 30 minutes or
+      more behind the verdict's `last_event_ms` while no run is going. Every
+      tick the recovery completes moves its watermark up to the newest event.
+      When a read fails, the watermark stays put and the recovery records no
+      new silence. Once the clock reads again, it walks on from the watermark.
+      A walk that keeps failing clears `activity_error` for up to 10 seconds
+      of each one-minute tick, but the lag stays. When only this track is
+      blind, the stall alert still works, and the message says so.
+
+    Each track alerts once its blind runs have lasted an hour, each within
+    20 minutes of the run before, so a longer sleep restarts the count. Two
+    clean runs in a row reset a streak that hasn't alerted. An alerted outage
+    ends only after clean runs spanning 30 minutes, which the watcher logs
+    once. If no run counts for 24 hours, the outage is closed unseen, so a new
+    one can alert. Both tracks due on the same run share one message. The
+    alert names each reason and quotes the error. To dig in, read the fields
+    and the backend log
+    ([reading the backend's os_log](#reading-the-backends-os_log)). #199 logs
+    "Silence recovery: activity query failed; will retry" once per failing
+    stretch.
+
+    ```bash
+    curl -s http://127.0.0.1:7007/api/status | jq '{silence: .freshness.google.silence, recovery: (.silence_recovery.google // {} | {activity_error, baseline_error, watermark_ms, running_since_ms: .pending.running_since_ms})}'
+    ```
   - On an older daemon with v2 ingest enabled, the watchdog computes Google's
     verdict itself from `v2/store.sqlite3` (constants mirrored from
     `internal/freshness`), marks the alert "(watchdog estimate)" (key
@@ -696,9 +744,9 @@ in-app supervisors. It alerts on:
   To see which applies, run
   `curl -s http://127.0.0.1:7007/api/status | jq '.freshness.google.silence'`.
   With the daemon answering, `null` almost always means it predates #190 (a
-  #190 daemon also omits the block when Google has no recorded activity or its
-  first activity query fails), and then the watchdog's estimate and
-  `all_quiet` are the only silence alarms.
+  #190 daemon also omits the block when Google has no recorded activity, or
+  until its activity clock has been read once since it started), and then the
+  watchdog's estimate and `all_quiet` are the only silence alarms.
 
 ### How alerts repeat
 
