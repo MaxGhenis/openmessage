@@ -1178,8 +1178,8 @@ func TestMessagesInboxMigrationIsChecksummedAndStrict(t *testing.T) {
 		t,
 		func() time.Time { return time.UnixMilli(messageTestTimeMS) },
 	)
-	if len(embeddedMigrations) != 11 {
-		t.Fatalf("embedded migrations = %d, want 11", len(embeddedMigrations))
+	if len(embeddedMigrations) != 12 {
+		t.Fatalf("embedded migrations = %d, want 12", len(embeddedMigrations))
 	}
 	assertPragmaInt(t, store.db, "user_version", len(embeddedMigrations))
 	ledger := readLedgerRow(t, store.db, 4)
@@ -1234,11 +1234,7 @@ func openMessageTestRepository(
 	if err != nil {
 		t.Fatalf("Open(): %v", err)
 	}
-	t.Cleanup(func() {
-		if err := store.Close(); err != nil {
-			t.Errorf("Close(): %v", err)
-		}
-	})
+	closeTestStore(t, store)
 	repository, err := NewMessageRepository(store, now)
 	if err != nil {
 		t.Fatalf("NewMessageRepository(): %v", err)

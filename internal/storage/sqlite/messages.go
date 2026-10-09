@@ -465,14 +465,55 @@ func (r *MessageRepository) ListMessagesAroundMessage(
 	return result, nil
 }
 
-// SearchMessages performs the R5 substring-compatible LIKE scan. FTS and
-// relevance ranking are intentionally deferred; rows are ordered by recency
-// with message ID as a deterministic tie-breaker.
+// SearchMessages returns the messages whose body matches LIKE '%' || query ||
+// '%' (R5 substring semantics: ASCII case-insensitive, with '%' and '_' in
+// query acting as wildcards), newest first with message ID as a deterministic
+// tie-breaker. Relevance ranking is intentionally not offered.
+//
+// A search narrowed by conversation or sender runs the LIKE over the messages
+// that index bounds (indexBoundedSearch). Any other nonempty query first reads
+// the newest messages, within the date range if any, stopping once it has
+// limit matches (searchRecentMessages). That answers it whenever those
+// messages hold limit matches, which covers common terms that the trigram
+// index would have to visit in full, or are the whole range. Otherwise the
+// whole scope is searched: from the trigram index when the query has a literal
+// run of three characters, by the LIKE alone when it has none. Every path
+// applies the same LIKE and returns the same rows (substring_search.go).
 func (r *MessageRepository) SearchMessages(
 	ctx context.Context,
 	query string,
 	filter SearchQuery,
 ) ([]Message, error) {
+	messages, _, err := r.searchMessages(ctx, query, filter, recentSearchWindow)
+	return messages, err
+}
+
+// recentSearchWindow is how many of the newest messages SearchMessages reads
+// before searching every conversation. On copies of the live store, reading
+// them cost about 0.5 to 1 us a message, stopping at limit matches, and the
+// trigram index cost about 2 to 3 us a candidate: 2,000 messages cost about as
+// much as one lookup of a medium-frequency term (1-2 ms), and a term in more
+// than limit/2,000 of them (1.5% for the UI's 30) is answered there without
+// visiting its other matches.
+const recentSearchWindow = 2000
+
+// searchPath names the path that answered a search, for tests.
+type searchPath string
+
+const (
+	searchPathRecentWindow searchPath = "recent window"
+	searchPathTrigramIndex searchPath = "trigram index"
+	searchPathLike         searchPath = "like"
+)
+
+// searchMessages is SearchMessages with the window as a parameter, so tests
+// can reach every path on small stores, and reports the path that answered.
+func (r *MessageRepository) searchMessages(
+	ctx context.Context,
+	query string,
+	filter SearchQuery,
+	window int,
+) ([]Message, searchPath, error) {
 	if filter.Limit <= 0 {
 		filter.Limit = 20
 	}
@@ -480,7 +521,25 @@ func (r *MessageRepository) SearchMessages(
 		filter.SinceMS, filter.UntilMS = filter.UntilMS, filter.SinceMS
 	}
 
+	if query != "" && !indexBoundedSearch(filter) {
+		messages, complete, err := r.searchRecentMessages(ctx, query, filter, window)
+		if err != nil {
+			return nil, "", err
+		}
+		if complete {
+			return messages, searchPathRecentWindow, nil
+		}
+	}
+	path := searchPathLike
+	if usesTrigramIndex(query, filter) {
+		path = searchPathTrigramIndex
+	}
 	statement, args := searchMessagesStatement(query, filter)
+	messages, err := r.queryMessages(ctx, statement, args)
+	return messages, path, err
+}
+
+func (r *MessageRepository) queryMessages(ctx context.Context, statement string, args []any) ([]Message, error) {
 	rows, err := r.store.db.QueryContext(ctx, statement, args...)
 	if err != nil {
 		return nil, fmt.Errorf("search messages: %w", err)
@@ -492,36 +551,97 @@ func (r *MessageRepository) SearchMessages(
 	return messages, nil
 }
 
-// searchMessagesStatement builds SearchMessages' SQL for an already
-// normalized filter.
-//
-// The sender filter selects the sender's identity IDs in a subquery so the
-// planner can seek messages_sender_time_idx per identity. Joining identities
-// and filtering on i.canonical_value instead walked that whole index, every
-// attributed message, because no identities index leads with canonical_value.
-// The subquery needs no account_id match: the composite foreign key
-// messages(account_id, sender_identity_id) -> identities(account_id,
-// identity_id) already makes a sender identity belong to the message's account.
-func searchMessagesStatement(query string, filter SearchQuery) (string, []any) {
-	conditions := []string{"m.body LIKE '%' || ? || '%'"}
-	args := []any{query}
+// searchRecentMessages applies the search to a window: the newest window
+// messages, within the date range if any, read from messages_time_idx. The
+// other filters and the LIKE then apply to the window's rows, read newest
+// first until limit match. The window lists the range in result order, so the
+// scope's rows within it are the scope's newest rows. complete reports that
+// the result is the whole answer: either it holds limit matches, which are then
+// the scope's newest limit matches; or the range held fewer than window rows,
+// so the window was all of it.
+func (r *MessageRepository) searchRecentMessages(
+	ctx context.Context,
+	query string,
+	filter SearchQuery,
+	window int,
+) (messages []Message, complete bool, err error) {
+	statement, args := recentSearchMessagesStatement(query, filter, window)
+	messages, err = r.queryMessages(ctx, statement, args)
+	if err != nil {
+		return nil, false, fmt.Errorf("recent window: %w", err)
+	}
+	if len(messages) >= filter.Limit {
+		return messages, true, nil
+	}
+	statement, args = recentWindowCountStatement(filter, window)
+	var inRange int
+	if err := r.store.db.QueryRowContext(ctx, statement, args...).Scan(&inRange); err != nil {
+		return nil, false, fmt.Errorf("count recent search window: %w", err)
+	}
+	return messages, inRange < window, nil
+}
+
+// recentSearchMessagesStatement reads the window (recentWindowRange) and
+// applies the other filters and the LIKE to its rows. SearchMessages sends
+// conversation and sender searches to their own indexes instead, but the
+// window applies those filters too, so it is exact for every filter.
+func recentSearchMessagesStatement(query string, filter SearchQuery, window int) (string, []any) {
+	from, conditions, args := recentWindowRange(filter)
+	args = append(args, window)
+	var outer []string
 	if filter.AccountID != "" {
-		// direction's CHECK allows exactly these two values, so the IN changes
-		// no result; it lets messages_account_direction_time_idx bound a date
-		// window per direction instead of reading the account's every row.
-		conditions = append(conditions, "m.account_id = ? AND m.direction IN ('incoming', 'outgoing')")
+		outer = append(outer, "account_id = ?")
 		args = append(args, filter.AccountID)
 	}
 	if filter.ConversationID != "" {
-		conditions = append(conditions, "m.conversation_id = ?")
+		outer = append(outer, "conversation_id = ?")
 		args = append(args, filter.ConversationID)
 	}
 	if filter.SenderCanonicalValue != "" {
-		conditions = append(conditions, `m.sender_identity_id IN (
-			SELECT identity_id FROM identities WHERE canonical_value = ?
-		)`)
+		outer = append(outer, "sender_identity_id IN ("+senderIdentityIDsQuery+")")
 		args = append(args, filter.SenderCanonicalValue)
 	}
+	outer = append(outer, "body LIKE '%' || ? || '%'")
+	args = append(args, query, filter.Limit)
+	statement := `
+		SELECT ` + messageColumns + `
+		FROM (
+			SELECT ` + prefixedMessageColumns("m") + `
+			FROM ` + from + `
+			` + whereClause(conditions) + `
+			ORDER BY m.occurred_at_ms DESC, m.message_id DESC
+			LIMIT ?
+		)
+		` + whereClause(outer) + `
+		ORDER BY occurred_at_ms DESC, message_id DESC
+		LIMIT ?
+	`
+	return statement, args
+}
+
+// recentWindowCountStatement counts the rows of the window's range, up to
+// upTo, by walking the range's index.
+func recentWindowCountStatement(filter SearchQuery, upTo int) (string, []any) {
+	from, conditions, args := recentWindowRange(filter)
+	args = append(args, upTo)
+	statement := `
+		SELECT count(*) FROM (
+			SELECT 1
+			FROM ` + from + `
+			` + whereClause(conditions) + `
+			LIMIT ?
+		)
+	`
+	return statement, args
+}
+
+// recentWindowRange names the index range a window reads: messages_time_idx,
+// bounded by the date range. Every condition is a bound on that index, so the
+// window never reads more than window index entries. The other filters stay
+// outside: inside, the planner would have to read rows until window of them
+// matched, all of a small account's history and beyond.
+func recentWindowRange(filter SearchQuery) (from string, conditions []string, args []any) {
+	from = "messages AS m INDEXED BY messages_time_idx"
 	if filter.SinceMS > 0 {
 		conditions = append(conditions, "m.occurred_at_ms >= ?")
 		args = append(args, filter.SinceMS)
@@ -530,6 +650,80 @@ func searchMessagesStatement(query string, filter SearchQuery) (string, []any) {
 		conditions = append(conditions, "m.occurred_at_ms <= ?")
 		args = append(args, filter.UntilMS)
 	}
+	return from, conditions, args
+}
+
+func whereClause(conditions []string) string {
+	if len(conditions) == 0 {
+		return ""
+	}
+	return "WHERE " + strings.Join(conditions, " AND ")
+}
+
+// indexBoundedSearch reports a search narrowed by conversation or sender. Its
+// LIKE reads only the messages of that conversation's or sender's index range,
+// and stops at limit matches when the range is in recency order (a
+// conversation's is). The trigram index, which returns matches from every
+// conversation, could not beat that bound and would lose to it for a term
+// common elsewhere but rare in this scope: on the live store's busiest thread
+// (about 15,000 messages) the LIKE took at most 8 ms, its busiest sender 3 to
+// 6 ms, while one lookup of a common term took 45 ms.
+func indexBoundedSearch(filter SearchQuery) bool {
+	return filter.ConversationID != "" || filter.SenderCanonicalValue != ""
+}
+
+// searchMessagesStatement builds the SQL that searches a filter's whole
+// scope, for an already normalized filter. A query the trigram index can
+// narrow reads its candidates from messages_fts
+// (trigramSearchMessagesStatement) unless a conversation or sender index
+// bounds the search (indexBoundedSearch); any other query, and the empty one,
+// uses likeSearchMessagesStatement. Both select the rows whose body matches the
+// LIKE, in the same order.
+func searchMessagesStatement(query string, filter SearchQuery) (string, []any) {
+	if usesTrigramIndex(query, filter) {
+		return trigramSearchMessagesStatement(query, filter)
+	}
+	return likeSearchMessagesStatement(query, filter)
+}
+
+func usesTrigramIndex(query string, filter SearchQuery) bool {
+	return likePatternUsesTrigrams(query) && !indexBoundedSearch(filter)
+}
+
+// trigramSearchMessagesStatement puts the substring LIKE on messages_fts.body,
+// which SQLite hands to the trigram index: the index returns the rowids of the
+// messages holding every trigram of the query's literal runs, SQLite applies
+// the LIKE to each of those bodies, and the filters and recency order apply to
+// the joined messages rows.
+//
+// CROSS JOIN keeps messages_fts the outer loop. Given a filter on messages
+// (an account), the planner otherwise may read those messages first and probe
+// the index once per row, running the whole trigram query for each: 7 to 34
+// seconds for one account's 72k messages, against 0.2 to 4 ms this way.
+func trigramSearchMessagesStatement(query string, filter SearchQuery) (string, []any) {
+	conditions, args := searchMessageFilters(filter)
+	conditions = append([]string{"f.body LIKE '%' || ? || '%'"}, conditions...)
+	args = append([]any{query}, args...)
+	args = append(args, filter.Limit)
+	statement := `
+		SELECT ` + prefixedMessageColumns("m") + `
+		FROM messages_fts AS f
+		CROSS JOIN messages AS m ON m.rowid = f.rowid
+		WHERE ` + strings.Join(conditions, " AND ") + `
+		ORDER BY m.occurred_at_ms DESC, m.message_id DESC
+		LIMIT ?
+	`
+	return statement, args
+}
+
+// likeSearchMessagesStatement matches the LIKE against messages directly. It
+// serves the empty query (a listing), queries without a literal run of three
+// characters, which the trigram index cannot narrow, and searches a
+// conversation or sender index bounds (indexBoundedSearch).
+func likeSearchMessagesStatement(query string, filter SearchQuery) (string, []any) {
+	conditions, args := searchMessageFilters(filter)
+	conditions = append([]string{"m.body LIKE '%' || ? || '%'"}, conditions...)
+	args = append([]any{query}, args...)
 	args = append(args, filter.Limit)
 
 	// A listing with no substring walks messages_time_idx from the newest end
@@ -538,7 +732,8 @@ func searchMessagesStatement(query string, filter SearchQuery) (string, []any) {
 	// no conversation or sender bounds must not use an index: for a rare or
 	// absent term the planner would walk messages_time_idx and fetch each row
 	// out of rowid order, several times slower than one sequential scan. Pin
-	// that scan (with its top-N sort) until full-text search replaces LIKE.
+	// that scan (with its top-N sort) for the short queries the trigram index
+	// cannot serve.
 	from := "messages AS m"
 	if query != "" && filter.ConversationID == "" && filter.SenderCanonicalValue == "" {
 		from = "messages AS m NOT INDEXED"
@@ -552,6 +747,49 @@ func searchMessagesStatement(query string, filter SearchQuery) (string, []any) {
 	`
 	return statement, args
 }
+
+// searchMessageFilters returns SearchMessages' filter conditions on messages
+// AS m, with their arguments in order.
+//
+// The sender filter selects the sender's identity IDs in a subquery so the
+// planner can seek messages_sender_time_idx per identity. Joining identities
+// and filtering on i.canonical_value instead walked that whole index, every
+// attributed message, because no identities index leads with canonical_value.
+// The subquery needs no account_id match: the composite foreign key
+// messages(account_id, sender_identity_id) -> identities(account_id,
+// identity_id) already makes a sender identity belong to the message's account.
+func searchMessageFilters(filter SearchQuery) ([]string, []any) {
+	var conditions []string
+	var args []any
+	if filter.AccountID != "" {
+		// direction's CHECK allows exactly these two values, so the IN changes
+		// no result; it lets messages_account_direction_time_idx bound a date
+		// window per direction instead of reading the account's every row.
+		conditions = append(conditions, "m.account_id = ? AND m.direction IN ('incoming', 'outgoing')")
+		args = append(args, filter.AccountID)
+	}
+	if filter.ConversationID != "" {
+		conditions = append(conditions, "m.conversation_id = ?")
+		args = append(args, filter.ConversationID)
+	}
+	if filter.SenderCanonicalValue != "" {
+		conditions = append(conditions, "m.sender_identity_id IN ("+senderIdentityIDsQuery+")")
+		args = append(args, filter.SenderCanonicalValue)
+	}
+	if filter.SinceMS > 0 {
+		conditions = append(conditions, "m.occurred_at_ms >= ?")
+		args = append(args, filter.SinceMS)
+	}
+	if filter.UntilMS > 0 {
+		conditions = append(conditions, "m.occurred_at_ms <= ?")
+		args = append(args, filter.UntilMS)
+	}
+	return conditions, args
+}
+
+// senderIdentityIDsQuery selects the identities holding a canonical address,
+// for the sender filter.
+const senderIdentityIDsQuery = `SELECT identity_id FROM identities WHERE canonical_value = ?`
 
 // ImportMessage atomically upserts a historical normalized message by remote
 // ID and records its attachments without requiring or modifying an inbox row.

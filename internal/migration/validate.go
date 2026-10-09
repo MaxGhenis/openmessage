@@ -23,7 +23,7 @@ var targetCountTables = []string{
 	"read_cursors",
 }
 
-const migration0011Checksum = "d23db3d6dfcd5b9d22423e4cbd1414d274eb557807892c376e5096533d171c3f"
+const migration0012Checksum = "b2c0f767402191cae6ebb3aec846acea5dccaff2a87898bd522b1210db710f74"
 
 func checkpointAndSyncSQLite(ctx context.Context, path string) error {
 	database, err := sql.Open("sqlite", path)
@@ -150,13 +150,7 @@ func validateTarget(
 
 	countsMatched := countsMatch(dataset, state, report, actualHistory, actualScheduled, actualHistoryByPlatform)
 	report.Validation.CountsMatched = countsMatched
-	report.Validation.Passed = quick == "ok" &&
-		report.Target.SchemaVersion == 11 && len(report.Target.MigrationChecksums) == 11 &&
-		report.Target.MigrationChecksums[10] == migration0011Checksum &&
-		len(fkViolations) == 0 && orphanTotal(orphans) == 0 &&
-		countsMatched && report.Validation.SampledHashesMatched &&
-		report.Validation.BlobReferencesValid && report.Validation.SourceUnchanged &&
-		len(report.MessageCollisions) == 0
+	report.Validation.Passed = validationPassed(report)
 
 	appendMediaWarnings(report)
 	if !report.Validation.Passed {
@@ -423,6 +417,23 @@ func detectOrphans(ctx context.Context, database *sql.DB) (OrphanReport, error) 
 		}
 	}
 	return report, nil
+}
+
+// validationPassed reports whether a staged store cleared every integrity gate
+// recorded in report: SQLite's quick_check, the current schema, foreign keys
+// and orphans, reconciled counts, sampled hashes, blob references, an
+// unchanged source, search indexes equal to their tables, and no message
+// collisions.
+func validationPassed(report *Report) bool {
+	validation := report.Validation
+	return validation.QuickCheck == "ok" &&
+		report.Target.SchemaVersion == 12 && len(report.Target.MigrationChecksums) == 12 &&
+		report.Target.MigrationChecksums[11] == migration0012Checksum &&
+		len(validation.ForeignKeyViolations) == 0 && orphanTotal(validation.Orphans) == 0 &&
+		validation.CountsMatched && validation.SampledHashesMatched &&
+		validation.BlobReferencesValid && validation.SourceUnchanged &&
+		validation.SearchIndexesValid &&
+		len(report.MessageCollisions) == 0
 }
 
 func orphanTotal(report OrphanReport) int64 {
