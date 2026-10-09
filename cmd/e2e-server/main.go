@@ -23,6 +23,7 @@ import (
 	"github.com/maxghenis/openmessage/internal/messaging"
 	"github.com/maxghenis/openmessage/internal/migration"
 	"github.com/maxghenis/openmessage/internal/storage/blob"
+	"github.com/maxghenis/openmessage/internal/storage/dataversion"
 	"github.com/maxghenis/openmessage/internal/storage/sqlite"
 	"github.com/maxghenis/openmessage/internal/v2keys"
 	"github.com/maxghenis/openmessage/internal/v2read"
@@ -164,9 +165,18 @@ func newE2EServer(logger zerolog.Logger) (_ *e2eServer, cleanup func(), resultEr
 	}()
 	go func() {
 		defer runWG.Done()
+		// Same revision gate as production (cmd/v2stack.go), so the suite
+		// runs against a notifier that publishes only for real changes.
+		v2Revision := dataversion.New(v2StorePath)
+		defer v2Revision.Close()
+		legacyRevision := dataversion.New(legacyPath)
+		defer legacyRevision.Close()
 		notifier := &v2wire.PrimaryNotifier{Sources: []func() <-chan struct{}{
 			messageService.Changes,
 			func() <-chan struct{} { return e2eChanges },
+		}, Revisions: []v2wire.PrimaryNotifierRevision{
+			{Name: "v2", Read: v2Revision.Read},
+			{Name: "legacy", Read: legacyRevision.Read},
 		}, Events: events, Logger: logger}
 		_ = notifier.Run(runCtx)
 	}()

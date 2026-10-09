@@ -21,6 +21,7 @@ import (
 	"github.com/maxghenis/openmessage/internal/media"
 	"github.com/maxghenis/openmessage/internal/messaging"
 	"github.com/maxghenis/openmessage/internal/storage/blob"
+	"github.com/maxghenis/openmessage/internal/storage/dataversion"
 	"github.com/maxghenis/openmessage/internal/storage/sqlite"
 	"github.com/maxghenis/openmessage/internal/v2wire"
 )
@@ -45,9 +46,13 @@ type v2Stack struct {
 	Sink     *ingest.Sink
 	Counters *ingest.Counters
 
-	outbox *sqlite.OutboxRepository
-	worker *ingest.Worker
-	logger zerolog.Logger
+	outbox    *sqlite.OutboxRepository
+	worker    *ingest.Worker
+	storePath string
+	logger    zerolog.Logger
+	// notifierFallbackInterval overrides the primary notifier's fallback
+	// period when positive; tests shorten it.
+	notifierFallbackInterval time.Duration
 
 	registerMu sync.Mutex
 }
@@ -232,10 +237,11 @@ func newV2Stack(deps v2StackDeps) (_ *v2Stack, resultErr error) {
 	}
 
 	stack := &v2Stack{
-		Store:    store,
-		Blobs:    blobs,
-		Registry: bridge.NewRegistry(),
-		logger:   deps.Logger,
+		Store:     store,
+		Blobs:     blobs,
+		Registry:  bridge.NewRegistry(),
+		storePath: storePath,
+		logger:    deps.Logger,
 	}
 	if deps.Google != nil {
 		if err := stack.RegisterAdapter(deps.Google); err != nil {
@@ -332,6 +338,28 @@ func newV2Stack(deps v2StackDeps) (_ *v2Stack, resultErr error) {
 	return stack, nil
 }
 
+type namedRevisionProbe struct {
+	name string
+	*dataversion.Probe
+}
+
+// primaryNotifierProbes watches every store the v2-primary web client reads.
+// The notifier's sources cover sends and ingest; these probes catch every
+// other commit, from this process or another, so its fallback tick publishes
+// only when something committed. The v2 store holds conversations, messages
+// and the outbox. Drafts still live in the legacy store, and the draft_message
+// MCP tool writes them there without publishing, usually from an MCP client
+// process.
+func (s *v2Stack) primaryNotifierProbes(legacy *db.Store) []namedRevisionProbe {
+	probes := []namedRevisionProbe{{name: "v2", Probe: dataversion.New(s.storePath)}}
+	if legacy != nil {
+		if path := legacy.Path(); path != "" && path != ":memory:" {
+			probes = append(probes, namedRevisionProbe{name: "legacy", Probe: dataversion.New(path)})
+		}
+	}
+	return probes
+}
+
 func (s *v2Stack) Start(
 	ctx context.Context,
 	legacy *db.Store,
@@ -392,16 +420,30 @@ func (s *v2Stack) Start(
 		}()
 	}
 	if v2Primary {
+		probes := s.primaryNotifierProbes(legacy)
+		revisions := make([]v2wire.PrimaryNotifierRevision, 0, len(probes))
+		for _, probe := range probes {
+			revisions = append(revisions, v2wire.PrimaryNotifierRevision{Name: probe.name, Read: probe.Read})
+		}
 		notifier := &v2wire.PrimaryNotifier{
 			Sources: []func() <-chan struct{}{
 				s.Service.Changes,
 				s.worker.Changes,
 			},
-			Events: events,
-			Logger: s.logger,
+			Revisions:        revisions,
+			Events:           events,
+			Logger:           s.logger,
+			FallbackInterval: s.notifierFallbackInterval,
 		}
 		go func() {
 			defer runWG.Done()
+			defer func() {
+				for _, probe := range probes {
+					if err := probe.Close(); err != nil {
+						s.logger.Warn().Err(err).Str("store", probe.name).Msg("Failed to close store revision probe")
+					}
+				}
+			}()
 			if err := notifier.Run(runCtx); err != nil && !errors.Is(err, context.Canceled) {
 				s.logger.Error().Err(err).Msg("V2 primary notifier stopped")
 			}
