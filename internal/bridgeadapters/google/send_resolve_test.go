@@ -11,6 +11,7 @@ import (
 	"testing/quick"
 
 	"github.com/rs/zerolog"
+	"go.mau.fi/mautrix-gmessages/pkg/libgm"
 	"go.mau.fi/mautrix-gmessages/pkg/libgm/events"
 	"go.mau.fi/mautrix-gmessages/pkg/libgm/gmproto"
 
@@ -1367,4 +1368,64 @@ func qrLegacyClientWithBrowser(t *testing.T, browserID string) *client.Client {
 		t.Fatal("QR fixture is a Google-account session")
 	}
 	return legacy
+}
+
+// With the libgm acceptance fix (PR #193) a lookup the phone answers only with
+// its Google-account switch notice fails with a typed error instead of an
+// empty conversation. That error is the account-switch refusal (and records
+// the switch for status) even before the synthetic AccountChange is applied;
+// a no-payload error without the notice stays an ordinary budgeted failure.
+func TestTypedAccountSwitchLookupErrorIsTheRefusal(t *testing.T) {
+	switchErr := &libgm.ResponsePayloadError{Action: gmproto.ActionType_GET_CONVERSATION, Frames: 1, AccountSwitch: true}
+	bareErr := &libgm.ResponsePayloadError{Action: gmproto.ActionType_GET_CONVERSATION, Frames: 1}
+
+	t.Run("lookup with the switch notice", func(t *testing.T) {
+		h := startSendRun(t, newLegacyClient)
+		fake := &fakeTextSendClient{conversationErr: switchErr}
+		installTextSendClient(t, h.host.GetClient(), fake)
+		_, err := h.adapter.SendText(context.Background(), directTextRequest())
+		failure := requireTextOpError(t, err)
+		if failure.Class != bridge.FailureReauthRequired ||
+			failure.Fingerprint != fingerprintAccountPairingSwitched ||
+			failure.Dispatch != bridge.DispatchNotCalled {
+			t.Fatalf("failure = %+v, want the account-switch refusal", failure)
+		}
+		if fake.sendCalls != 0 || fake.resolve.calls != 0 {
+			t.Fatalf("calls = (send %d, fallback %d), want none", fake.sendCalls, fake.resolve.calls)
+		}
+		if switched, _ := h.host.GoogleAccountSwitch(); !switched {
+			t.Fatal("the typed switch error did not record the switch for status")
+		}
+		h.assertGenerationIntact(t, "typed switch refusal")
+	})
+
+	t.Run("by-number fallback with the switch notice", func(t *testing.T) {
+		h := startSendRun(t, newLegacyClient)
+		fake := &fakeTextSendClient{resolve: fakeConversationResolve{err: switchErr}}
+		installTextSendClient(t, h.host.GetClient(), fake)
+		_, err := h.adapter.SendText(context.Background(), directTextRequest())
+		failure := requireTextOpError(t, err)
+		if failure.Fingerprint != fingerprintAccountPairingSwitched || failure.Class != bridge.FailureReauthRequired {
+			t.Fatalf("failure = %+v, want the account-switch refusal", failure)
+		}
+		if fake.sendCalls != 0 {
+			t.Fatalf("SendMessage calls = %d, want none", fake.sendCalls)
+		}
+	})
+
+	t.Run("no payload without the notice", func(t *testing.T) {
+		h := startSendRun(t, newLegacyClient)
+		fake := &fakeTextSendClient{conversationErr: bareErr}
+		installTextSendClient(t, h.host.GetClient(), fake)
+		_, err := h.adapter.SendText(context.Background(), directTextRequest())
+		failure := requireTextOpError(t, err)
+		if failure.Class != bridge.FailureTransient ||
+			failure.Fingerprint != "google_conversation_get_failed" ||
+			failure.Dispatch != bridge.DispatchNotCalled {
+			t.Fatalf("failure = %+v, want a transient not-dispatched lookup failure", failure)
+		}
+		if switched, _ := h.host.GoogleAccountSwitch(); switched {
+			t.Fatal("a bare no-payload error recorded an account switch")
+		}
+	})
 }

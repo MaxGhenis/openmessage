@@ -867,7 +867,7 @@ func (a *Adapter) resolveSendConversation(
 		return transport.GetConversation(ref.RemoteID)
 	})
 	if err != nil {
-		return nil, a.conversationLookupFailure(
+		return nil, a.conversationLookupFailure(cli,
 			fmt.Errorf("get Google conversation: %w", err),
 			lookup,
 		)
@@ -922,7 +922,7 @@ func (a *Adapter) resolveDirectConversationByNumber(
 		return transport.GetOrCreateConversation(request)
 	})
 	if err != nil {
-		return nil, a.conversationLookupFailure(
+		return nil, a.conversationLookupFailure(cli,
 			fmt.Errorf("resolve Google conversation %q by peer number: %w", ref.RemoteID, err),
 			lookup,
 		)
@@ -1033,7 +1033,16 @@ func canonicalPhoneNumber(number string) string {
 // reported Google-account pairing: a phone refusing this session may surface
 // as a typed no-payload error instead of an empty response, and retrying it
 // cannot succeed.
-func (a *Adapter) conversationLookupFailure(err error, lookup conversationLookup) bridge.OpError {
+func (a *Adapter) conversationLookupFailure(cli *client.Client, err error, lookup conversationLookup) bridge.OpError {
+	// libgm reports a lookup the phone answered only with its Google-account
+	// switch notice as a typed error (app.IsGoogleAccountSwitchError, PR
+	// #193). That is the refusal itself, whether or not the synthetic
+	// AccountChange from the same frame has been applied yet.
+	if app.IsGoogleAccountSwitchError(err) {
+		a.host.NoteGoogleAccountSwitch(cli, "")
+		_, account := a.host.GoogleAccountSwitch()
+		return accountSwitchError(lookup.operation, account, err.Error())
+	}
 	failure, unanswered := unansweredCallFailure(err, lookup.operation, "", fingerprintConversationGetTimeout,
 		lookup.contextFingerprint, bridge.DispatchNotCalled)
 	if !unanswered {
