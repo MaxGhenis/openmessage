@@ -93,7 +93,7 @@ fix (this PR) makes v2 reads accept **either** key: unknown ids fall back to a
 carries the canonical v2 id. Prefer storing the **v2 id** for anything durable;
 the alias exists so old references keep working.
 
-Two more cutover artifacts worth knowing:
+Three more cutover artifacts worth knowing:
 
 - **Only the Google decoder emits `ConversationEvent` frames.** Signal and
   WhatsApp conversations are minted from message frames, which carry no kind and
@@ -116,6 +116,27 @@ Two more cutover artifacts worth knowing:
 
 ```bash
 curl -s http://127.0.0.1:7007/api/status | jq '.freshness'
+```
+
+- **The legacy→v2 mirror never rewrites migrated rows.** A legacy-primary
+  daemon with `OPENMESSAGES_V2_SEND=1` (for example after rolling back from
+  v2-primary) mirrors each `/api/v1/outbox` send and each `/api/mark-read`
+  into the v2 store (`internal/v2wire/mirror.go`). On a migrated store it
+  reuses the account's migrated local device, whose id is a derived hash
+  (`9bcc1343…` for Google), not `local-primary:<account>`. It also leaves the
+  account row alone. A thread the migration already keyed by hash fails with
+  `natural key belongs to v2 conversation <id>`, and nothing is written. Before
+  2026-10-09 every mirror call on a migrated store failed with
+  `UNIQUE constraint failed: devices.account_id`. Each call first rewrote the
+  account's `bridge_key` (`google_messages` → `google`), and v2 reads derive a
+  thread's platform from that key, so Google threads would then read as
+  `google` instead of `sms`. A v2-primary daemon no longer runs the mirror on
+  `/api/mark-read`. The keys should read `google_messages`, `whatsmeow` and
+  `signal_cli` (the live store was clean on 2026-10-09):
+
+```bash
+sqlite3 -readonly "$HOME/Library/Application Support/OpenMessage/v2/store.sqlite3" \
+  "SELECT account_id, bridge_key, display_name FROM accounts"
 ```
 
 ## Google thread ids are device-local: phone swaps re-key everything

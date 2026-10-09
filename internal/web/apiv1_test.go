@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -261,6 +262,7 @@ func TestV1ErrorStatusMapping(t *testing.T) {
 		{name: "idempotency conflict", err: messaging.ErrIdempotencyConflict, wantStatus: http.StatusConflict},
 		{name: "invalid command", err: messaging.ErrInvalidCommand, wantStatus: http.StatusBadRequest},
 		{name: "invalid state", err: messaging.ErrInvalidState, wantStatus: http.StatusConflict},
+		{name: "migrated conversation", err: fmt.Errorf("mirror conversation %q: %w", "thread", sqlite.ErrConversationIdentityConflict), wantStatus: http.StatusConflict},
 		{name: "platform", err: v2wire.ErrPlatformNotSendable, wantStatus: http.StatusNotImplemented},
 		{name: "reply", err: v2wire.ErrReplyTargetUnavailable, wantStatus: http.StatusUnprocessableEntity, wantMessage: "reply_target_unavailable"},
 		{name: "media unavailable", err: media.ErrUnavailable, wantStatus: http.StatusServiceUnavailable},
@@ -369,6 +371,112 @@ func TestMarkReadBestEffortWritesV2Cursor(t *testing.T) {
 	}
 	if cursor.LastReadAtMS <= 0 || cursor.UpdatedAtMS <= 0 {
 		t.Fatalf("cursor timestamps = %+v, want positive", cursor)
+	}
+}
+
+// TestMarkReadMirrorsOntoMigratedLocalDevice covers a legacy-primary daemon
+// with v2 send on a migrated store: the account's current local device has a
+// derived ID, and devices_current_local_uq rejected the mirror's attempt to
+// add "local-primary:<account>" next to it, so no cursor was written.
+func TestMarkReadMirrorsOntoMigratedLocalDevice(t *testing.T) {
+	v2Store, err := sqlite.Open(filepath.Join(t.TempDir(), "v2.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = v2Store.Close() })
+	const migratedDeviceID = "9bcc134365b6f21de496ec1693b68421"
+	account := sqlite.Account{
+		AccountID: "google-primary", BridgeKey: "google_messages", DisplayName: "Google Messages",
+		Mode: sqlite.AccountModeLive, Enabled: true, ConfigJSON: "{}",
+		CreatedAtMS: 1_700_000_000_000, UpdatedAtMS: 1_700_000_000_000,
+	}
+	if err := v2Store.UpsertAccount(account); err != nil {
+		t.Fatal(err)
+	}
+	if err := v2Store.UpsertDevice(sqlite.Device{
+		DeviceID: migratedDeviceID, AccountID: "google-primary",
+		Kind: sqlite.DeviceKindLocalInstallation, DisplayName: "OpenMessage",
+		State: sqlite.DeviceStateActive, IsCurrent: true,
+		CreatedAtMS: 1_700_000_000_000, UpdatedAtMS: 1_700_000_000_000,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	ts := newV1RecorderHarness(t, APIOptions{V2: &V2Options{V2Store: v2Store}})
+	if err := ts.store.UpsertConversation(&db.Conversation{
+		ConversationID: "google-thread-1",
+		Name:           "Alice",
+		SourcePlatform: "sms",
+		UnreadCount:    3,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/api/mark-read", bytes.NewBufferString(`{"conversation_id":"google-thread-1"}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp := ts.do(t, req)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 200; body=%s", resp.StatusCode, raw)
+	}
+
+	cursor, err := v2Store.GetReadCursor(migratedDeviceID, "google-thread-1")
+	if err != nil {
+		t.Fatalf("GetReadCursor(migrated device): %v", err)
+	}
+	if cursor.AccountID != "google-primary" || cursor.LastReadAtMS <= 0 {
+		t.Fatalf("cursor = %+v, want google account read cursor", cursor)
+	}
+	devices, err := v2Store.ListDevices("google-primary")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(devices) != 1 || devices[0].DeviceID != migratedDeviceID {
+		t.Fatalf("devices = %+v, want only the migrated device", devices)
+	}
+	if got, err := v2Store.GetAccount("google-primary"); err != nil || !reflect.DeepEqual(got, account) {
+		t.Fatalf("account = %+v, %v; want unchanged %+v", got, err, account)
+	}
+}
+
+// TestMarkReadSkipsLegacyMirrorOnV2Primary pins that a v2-primary daemon does
+// not run the legacy mirror: it would resolve the id against the legacy store
+// and, for a thread the v2 store lacks, add a legacy-keyed conversation (and
+// the account and device rows around it) to the primary store.
+func TestMarkReadSkipsLegacyMirrorOnV2Primary(t *testing.T) {
+	v2Store, err := sqlite.Open(filepath.Join(t.TempDir(), "v2.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = v2Store.Close() })
+
+	ts := newV1RecorderHarness(t, APIOptions{V2Primary: true, V2: &V2Options{V2Store: v2Store}})
+	if err := ts.store.UpsertConversation(&db.Conversation{
+		ConversationID: "google-thread-1",
+		Name:           "Alice",
+		SourcePlatform: "sms",
+		UnreadCount:    3,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/api/mark-read", bytes.NewBufferString(`{"conversation_id":"google-thread-1"}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp := ts.do(t, req)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 200; body=%s", resp.StatusCode, raw)
+	}
+
+	accounts, err := v2Store.ListAccounts()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(accounts) != 0 {
+		t.Fatalf("v2 accounts = %+v, want none: the legacy mirror ran on a v2-primary daemon", accounts)
+	}
+	if _, err := v2Store.GetConversation("google-thread-1"); !errors.Is(err, sqlite.ErrNotFound) {
+		t.Fatalf("GetConversation(legacy id) error = %v, want ErrNotFound", err)
 	}
 }
 

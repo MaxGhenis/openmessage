@@ -2348,7 +2348,12 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			httpError(w, "mark read: "+err.Error(), 500)
 			return
 		}
-		if opts.V2 != nil {
+		// The legacy mirror is the legacy-primary dual-write seam, like the
+		// /api/v1 send split on V2Primary. A v2-primary UI sends v2
+		// conversation ids, which the mirror cannot resolve against the
+		// legacy store, and a legacy id for a thread the v2 store lacks
+		// would add a legacy-keyed conversation row to the primary store.
+		if opts.V2 != nil && !opts.V2Primary {
 			nowMS := time.Now().UnixMilli()
 			if err := mirrorV2ReadCursor(r.Context(), store, opts.V2.V2Store, req.ConversationID, nowMS); err != nil {
 				logger.Warn().

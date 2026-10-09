@@ -118,6 +118,33 @@ func (s *Store) UpsertAccount(account Account) error {
 	return nil
 }
 
+// EnsureAccount inserts account when no row has its account ID and returns the
+// stored row. An existing account is returned unchanged: its bridge key,
+// display name, mode, enabled flag, and config belong to whichever bootstrap
+// created it (live adapter registration or the migration), and v2 reads derive
+// each conversation's platform from the bridge key.
+func (s *Store) EnsureAccount(account Account) (Account, error) {
+	_, err := s.db.ExecContext(context.Background(), `
+		INSERT INTO accounts (`+accountColumns+`
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(account_id) DO NOTHING
+	`,
+		account.AccountID,
+		account.BridgeKey,
+		account.RemoteAccountID,
+		account.DisplayName,
+		account.Mode,
+		account.Enabled,
+		account.ConfigJSON,
+		account.CreatedAtMS,
+		account.UpdatedAtMS,
+	)
+	if err != nil {
+		return Account{}, fmt.Errorf("ensure account %q: %w", account.AccountID, mapConstraintError(err))
+	}
+	return s.GetAccount(account.AccountID)
+}
+
 // GetAccount returns the account with accountID.
 func (s *Store) GetAccount(accountID string) (Account, error) {
 	account, err := scanAccount(s.db.QueryRowContext(
@@ -178,10 +205,12 @@ const deviceColumns = `
 	created_at_ms,
 	updated_at_ms`
 
-// UpsertDevice inserts a device or updates the row with the same device ID.
-// The original creation timestamp is retained on update.
-func (s *Store) UpsertDevice(device Device) error {
-	_, err := s.db.ExecContext(context.Background(), `
+// upsertDeviceSQL leaves account_id out of the DO UPDATE SET. account_id is
+// part of the parent key read_cursors(account_id, device_id) references, so
+// assigning it, even to the same value, makes SQLite scan the device's read
+// cursors for FK children on every conflict. The WHERE keeps a device from
+// moving between accounts; such a move would also orphan those cursors.
+const upsertDeviceSQL = `
 		INSERT INTO devices (
 			device_id,
 			account_id,
@@ -195,7 +224,6 @@ func (s *Store) UpsertDevice(device Device) error {
 			updated_at_ms
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(device_id) DO UPDATE SET
-			account_id = excluded.account_id,
 			remote_device_id = excluded.remote_device_id,
 			kind = excluded.kind,
 			display_name = excluded.display_name,
@@ -203,7 +231,15 @@ func (s *Store) UpsertDevice(device Device) error {
 			is_current = excluded.is_current,
 			last_seen_at_ms = excluded.last_seen_at_ms,
 			updated_at_ms = excluded.updated_at_ms
-	`,
+		WHERE devices.account_id = excluded.account_id
+	`
+
+// UpsertDevice inserts a device or updates the row with the same device ID.
+// The original creation timestamp is retained on update. A device ID that
+// already belongs to another account is left unchanged and the write fails
+// with ErrCrossAccountDevice.
+func (s *Store) UpsertDevice(device Device) error {
+	result, err := s.db.ExecContext(context.Background(), upsertDeviceSQL,
 		device.DeviceID,
 		device.AccountID,
 		device.RemoteDeviceID,
@@ -218,7 +254,71 @@ func (s *Store) UpsertDevice(device Device) error {
 	if err != nil {
 		return fmt.Errorf("upsert device %q: %w", device.DeviceID, mapConstraintError(err))
 	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("upsert device %q: rows affected: %w", device.DeviceID, err)
+	}
+	if affected == 0 {
+		return fmt.Errorf(
+			"upsert device %q for account %q: %w: %w",
+			device.DeviceID,
+			device.AccountID,
+			ErrConstraintViolation,
+			ErrCrossAccountDevice,
+		)
+	}
 	return nil
+}
+
+// EnsureLocalInstallationDevice returns the account's local installation
+// device and inserts device only when the account has none. It never adds a
+// local device next to an existing one, whatever that one's ID: a migrated
+// store already holds the account's current local device under a derived ID,
+// and devices_current_local_uq allows one current local device per account.
+// The result is the row GetLocalInstallationDevice resolves, which is also the
+// device ingest advances read cursors for.
+func (s *Store) EnsureLocalInstallationDevice(ctx context.Context, device Device) (Device, error) {
+	if device.Kind != DeviceKindLocalInstallation {
+		return Device{}, fmt.Errorf(
+			"ensure local installation device %q: kind %q is not %q",
+			device.DeviceID,
+			device.Kind,
+			DeviceKindLocalInstallation,
+		)
+	}
+	// One statement, so the existence check and the insert see the same
+	// snapshot; SQLite serializes writers.
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO devices (`+deviceColumns+`
+		)
+		SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+		WHERE NOT EXISTS (
+			SELECT 1
+			FROM devices
+			WHERE account_id = ? AND kind = 'local_installation'
+		)
+	`,
+		device.DeviceID,
+		device.AccountID,
+		device.RemoteDeviceID,
+		device.Kind,
+		device.DisplayName,
+		device.State,
+		device.IsCurrent,
+		device.LastSeenAtMS,
+		device.CreatedAtMS,
+		device.UpdatedAtMS,
+		device.AccountID,
+	)
+	if err != nil {
+		return Device{}, fmt.Errorf(
+			"ensure local installation device %q for account %q: %w",
+			device.DeviceID,
+			device.AccountID,
+			mapConstraintError(err),
+		)
+	}
+	return s.GetLocalInstallationDevice(ctx, device.AccountID)
 }
 
 // GetDevice returns the device with deviceID.
@@ -628,11 +728,7 @@ const conversationColumns = `
 	created_at_ms,
 	updated_at_ms`
 
-// UpsertConversation inserts a conversation or updates the row with the same
-// account and remote conversation ID. A natural-key conflict retains the
-// existing conversation ID and creation timestamp.
-func (s *Store) UpsertConversation(conversation Conversation) error {
-	_, err := s.db.ExecContext(context.Background(), `
+const upsertConversationSQL = `
 		INSERT INTO conversations (
 			conversation_id,
 			account_id,
@@ -658,7 +754,48 @@ func (s *Store) UpsertConversation(conversation Conversation) error {
 			last_message_at_ms = excluded.last_message_at_ms,
 			metadata_json = excluded.metadata_json,
 			updated_at_ms = excluded.updated_at_ms
-	`,
+	`
+
+// UpsertConversation inserts a conversation or updates the row with the same
+// account and remote conversation ID. A natural-key conflict retains the
+// existing conversation ID and creation timestamp.
+func (s *Store) UpsertConversation(conversation Conversation) error {
+	if _, err := s.execConversationUpsert(upsertConversationSQL, conversation); err != nil {
+		return err
+	}
+	return nil
+}
+
+// UpsertOwnedConversation is UpsertConversation for a caller that owns the
+// conversation ID. It inserts the row, or updates the row holding the natural
+// key only when that row has the same conversation ID. If the natural key
+// belongs to a different conversation it writes nothing and fails with
+// ErrConversationIdentityConflict; UpsertConversation would instead rewrite
+// that row's title, kind, archive state, notification mode, favorite flag,
+// and recency in place.
+func (s *Store) UpsertOwnedConversation(conversation Conversation) error {
+	affected, err := s.execConversationUpsert(
+		upsertConversationSQL+"WHERE conversations.conversation_id = excluded.conversation_id",
+		conversation,
+	)
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return fmt.Errorf(
+			"upsert conversation %q: natural key (%q, %q): %w: %w",
+			conversation.ConversationID,
+			conversation.AccountID,
+			conversation.RemoteConversationID,
+			ErrConstraintViolation,
+			ErrConversationIdentityConflict,
+		)
+	}
+	return nil
+}
+
+func (s *Store) execConversationUpsert(statement string, conversation Conversation) (int64, error) {
+	result, err := s.db.ExecContext(context.Background(), statement,
 		conversation.ConversationID,
 		conversation.AccountID,
 		conversation.RemoteConversationID,
@@ -674,13 +811,17 @@ func (s *Store) UpsertConversation(conversation Conversation) error {
 		conversation.UpdatedAtMS,
 	)
 	if err != nil {
-		return fmt.Errorf(
+		return 0, fmt.Errorf(
 			"upsert conversation %q: %w",
 			conversation.ConversationID,
 			mapConstraintError(err),
 		)
 	}
-	return nil
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("upsert conversation %q: rows affected: %w", conversation.ConversationID, err)
+	}
+	return affected, nil
 }
 
 // GetConversation returns the conversation with conversationID.
