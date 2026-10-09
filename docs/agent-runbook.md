@@ -382,6 +382,53 @@ All of this needs the request/response path to work. If the fetch replies are
 empty (`Fetched conversations count=0` while the store holds history), nothing
 can be recovered until that is fixed.
 
+### How far the startup backfill and the recent reconcile reach (`google.history_gaps`)
+
+The startup backfill (the newest 100 inbox conversations, once after the first
+Online when the store already holds SMS) and the recent reconcile (the newest
+50) catch each conversation up the same way: read its newest stored message
+(the boundary), page the phone newest first down to it, 30 messages a page and
+at most 4 pages, continuing below a page's oldest message when a reply carries
+no cursor, then store everything fetched oldest first. A conversation with no
+stored messages gets one page. The startup backfill used to store only each
+conversation's newest 20 messages, so a restart after a stall that left more
+than 20 new messages in a conversation moved its boundary above the rest, and
+no later reconcile looked below it.
+
+When a run stores messages without reaching the boundary (more than about 120
+new messages, a later page failing, or a phone that pages no further), the
+messages between the boundary and the oldest one it stored may be missing. The
+run records that range rather than hiding it, in three places: a warning log
+line ("stored newer messages without reaching the ones already held") that
+carries the recovery request; `google-history-gaps.json` in the data dir, so a
+restart keeps it (the next startup backfill can no longer see the hole); and
+`google.history_gaps` in `/api/status`:
+
+```bash
+curl -s http://127.0.0.1:7007/api/status | jq '.google.history_gaps'
+```
+
+A window backfill from `since_ms` covers every recorded gap:
+
+```bash
+since=$(curl -s http://127.0.0.1:7007/api/status | jq '.google.history_gaps.since_ms')
+curl -s -X POST http://127.0.0.1:7007/api/backfill -d "{\"since\": $since}"
+curl -s http://127.0.0.1:7007/api/backfill/status | jq
+```
+
+A gap clears when a window, deep or phone backfill pages its conversation from
+the newest message down and stores a message at or before the gap's boundary,
+or pages until the phone answers with an empty page (nothing older). A run that
+stops above the boundary for any other reason leaves the gap recorded, even
+when it reports no errors: a page limit, a failed page, a generation that ended
+mid-page, or a phone that re-serves a page instead of the messages below it.
+The `reason` field says why the catch-up stopped: `page_limit`, `fetch_error`
+or `no_older_page` (the phone re-served a page). An empty reply below the
+oldest fetched message ends a catch-up without a gap, because it means the
+phone holds nothing older, for instance when the boundary message itself is
+gone from the phone. (libgm reports a reply with no payload as an error, not
+as an empty page.) The relaunch watchdog does not alert on `history_gaps` yet.
+
 ## MCP serving — exactly one process may own live transports
 
 **The failure mode (empirically confirmed 2026-07-20):** `openmessage serve
