@@ -11,6 +11,7 @@ import (
 type Store struct {
 	db         *sql.DB
 	ftsEnabled bool
+	path       string
 }
 
 type Conversation struct {
@@ -125,7 +126,7 @@ func New(dsn string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("set synchronous mode: %w", err)
 	}
-	s := &Store{db: db}
+	s := &Store{db: db, path: dsn}
 	if err := s.migrate(); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("migrate: %w", err)
@@ -135,6 +136,12 @@ func New(dsn string) (*Store, error) {
 
 func (s *Store) Close() error {
 	return s.db.Close()
+}
+
+// Path returns the data source name the store was opened with: the database
+// file path for every on-disk store the app opens.
+func (s *Store) Path() string {
+	return s.path
 }
 
 // SeedDemo populates the database with fake data for screenshots/demos.

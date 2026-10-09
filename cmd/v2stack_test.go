@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -588,6 +589,120 @@ func TestV2PrimaryStackStartsPrimaryNotifier(t *testing.T) {
 		case <-time.After(3 * time.Second):
 			t.Fatalf("timed out waiting for primary notifier event %+v", want)
 		}
+	}
+}
+
+// Every notifier publish makes each open web client refetch its conversation
+// list, open thread, drafts and outbox. The real v2-primary stack commits
+// nothing while idle, so after the startup publish it must stay quiet. A
+// commit that fires neither the send nor the ingest source must still publish
+// within one fallback interval: to the v2 store, or a draft written to the
+// legacy store through another handle, as the draft_message MCP tool does from
+// an MCP client process.
+func TestV2PrimaryStackNotifierPublishesOnlyForCommits(t *testing.T) {
+	const interval = 20 * time.Millisecond
+	dataDir := t.TempDir()
+	legacyPath := filepath.Join(dataDir, "messages.db")
+	legacy, err := db.New(legacyPath)
+	if err != nil {
+		t.Fatalf("db.New(daemon): %v", err)
+	}
+	defer legacy.Close()
+	mcpClientLegacy, err := db.New(legacyPath)
+	if err != nil {
+		t.Fatalf("db.New(MCP client): %v", err)
+	}
+	defer mcpClientLegacy.Close()
+	stack, err := newV2Stack(v2StackDeps{
+		Logger:  zerolog.Nop(),
+		DataDir: dataDir,
+	})
+	if err != nil {
+		t.Fatalf("newV2Stack(): %v", err)
+	}
+	stack.notifierFallbackInterval = interval
+	events := &v2StackCountingEvents{}
+
+	stop := stack.Start(context.Background(), legacy, events, true)
+	defer stop()
+
+	events.waitForPublishes(t, 1)
+	time.Sleep(10 * interval)
+	events.requirePublishes(t, 1)
+
+	nowMS := time.Now().UnixMilli()
+	if err := stack.Store.UpsertAccount(sqlite.Account{
+		AccountID:   "unsignalled-write-account",
+		BridgeKey:   "unsignalled-write-bridge",
+		DisplayName: "Unsignalled write",
+		Mode:        sqlite.AccountModeArchive,
+		ConfigJSON:  "{}",
+		CreatedAtMS: nowMS,
+		UpdatedAtMS: nowMS,
+	}); err != nil {
+		t.Fatalf("UpsertAccount(): %v", err)
+	}
+	events.waitForPublishes(t, 2)
+	time.Sleep(10 * interval)
+	events.requirePublishes(t, 2)
+
+	if err := mcpClientLegacy.UpsertDraft(&db.Draft{
+		DraftID:        "agent-draft",
+		ConversationID: "conversation-1",
+		Body:           "drafted by an agent",
+		CreatedAt:      time.Now().UnixMilli(),
+	}); err != nil {
+		t.Fatalf("UpsertDraft(): %v", err)
+	}
+	events.waitForPublishes(t, 3)
+	time.Sleep(10 * interval)
+	events.requirePublishes(t, 3)
+}
+
+type v2StackCountingEvents struct {
+	mu            sync.Mutex
+	messages      int
+	conversations int
+}
+
+func (e *v2StackCountingEvents) PublishMessages(string) {
+	e.mu.Lock()
+	e.messages++
+	e.mu.Unlock()
+}
+
+func (e *v2StackCountingEvents) PublishConversations() {
+	e.mu.Lock()
+	e.conversations++
+	e.mu.Unlock()
+}
+
+func (e *v2StackCountingEvents) counts() (int, int) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.messages, e.conversations
+}
+
+func (e *v2StackCountingEvents) waitForPublishes(t *testing.T, want int) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		messages, conversations := e.counts()
+		if conversations >= want {
+			e.requirePublishes(t, want)
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %d publishes; messages %d, conversations %d", want, messages, conversations)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func (e *v2StackCountingEvents) requirePublishes(t *testing.T, want int) {
+	t.Helper()
+	if messages, conversations := e.counts(); messages != want || conversations != want {
+		t.Fatalf("publishes = messages %d, conversations %d; want %d each", messages, conversations, want)
 	}
 }
 
