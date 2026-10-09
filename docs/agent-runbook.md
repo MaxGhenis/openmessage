@@ -192,9 +192,11 @@ runs on 10/7 put none of the missing rows into `messages.db`. On this install
 the request/response calls themselves came back empty: after a relaunch at
 15:56 on 10/7, with push working again, the startup backfill logged
 `Fetched conversations count=0` and a deep backfill scanned 3 folders and
-found 0 conversations, with no errors. That is a separate defect (libgm
-accepts a correctly typed but empty response; the cause is not established),
-and until it is fixed no pull can confirm or repair delivery. A phone restart
+found 0 conversations, with no errors. That was a separate defect, since
+diagnosed (see "Pulls that return nothing"): the phone had switched to
+Google-account pairing and answered every pull with an account-switch notice
+and no data, which libgm accepted as an empty response. Until the pairing is
+fixed, no pull can confirm or repair delivery. A phone restart
 ended the push stall; a re-pair was not tried and is not the first thing to
 try. (Google Messages auto-updated on the phone at 02:07 on 10/6, an hour
 after the last frame; nothing on hand says whether that caused it. The same
@@ -269,11 +271,10 @@ start in the evening after about 13–15 hours, with the 16-hour cap as the
 bound. A day that an outage covers only in part still counts in a later
 baseline and can delay a repeat detection by an hour or two.
 
-**What a stall leaves behind.** On a v2-primary install nothing re-fetches the
-messages a stall skipped: the startup backfill and recent reconcile write only
-the legacy `messages.db`, and v2 reads see only what the live long-poll
-delivers. Find the hole by the phone's row ids, which advance with every
-message on the phone:
+**What a stall leaves behind.** Resuming does not bring back what the phone
+skipped: after the 10/7 restart OpenMessage held 4 of the 124 row ids the phone
+had created during the stall. Find the hole by the phone's row ids, which
+advance with every message on the phone:
 
 ```bash
 sqlite3 -readonly "$HOME/Library/Application Support/OpenMessage/v2/store.sqlite3" \
@@ -281,6 +282,105 @@ sqlite3 -readonly "$HOME/Library/Application Support/OpenMessage/v2/store.sqlite
    from messages where account_id='google-primary' and remote_message_id glob '[0-9]*'
    order by occurred_at_ms desc limit 40"
 ```
+
+Then recover it with a window backfill from just before the gap (next
+section). Catch-ups now hand what they fetch to v2; before that, every fetch
+wrote only the legacy `messages.db`, which v2-primary readers never see.
+
+## Catch-up history reaches v2 as history frames
+
+Google catch-ups (startup shallow backfill, the recent reconcile on
+`listen_recovered` / `phone_responding_again`, deep and window backfill, phone
+backfill, pending-media refresh) fetch with request/response calls, whose
+replies never pass through the live long-poll tee. They used to write only the
+legacy `messages.db`, so on a v2-primary install nothing they fetched was
+visible to readers. Each catch-up now captures the current connection
+generation's history ingress together with its client and hands every fetched
+conversation and message to v2 as well:
+
+- **Codec `google.protobuf.history`, own dedupe keys.** Same envelope as live
+  frames, but a distinct inbox codec. On a v2-primary daemon, the silence
+  detector (#190) and the SMS-path monitor (#191) select inbox rows by exact
+  codec `google.protobuf`, so a reconcile right after a reconnect cannot reset
+  a silence clock there. (On a legacy-primary daemon silence is read from the
+  legacy store's incoming messages, which catch-ups have always written to.)
+  History keys (`hmsg:`/`hconv:`) never collide with live keys, so a live push
+  always gets its own inbox row and is applied and counted even when a
+  catch-up fetched the same message first.
+- **Fills gaps, never moves a binding.** A history frame inserts a message only
+  when v2 lacks it, applies reactions only to messages it inserted, and never
+  updates an existing row; the live channel owns updates (a general upsert
+  from fetched data would resurrect deleted rows, revert edits and clobber
+  reactions). It places a message only in the thread its wire id is bound to,
+  or in a thread its own conversation snapshot created. A snapshot creates a
+  thread only for an unbound id whose roster no existing thread answers to.
+  Anything else is skipped and counted in `history_skipped`: an unbound id
+  matching an existing thread's roster (the phone can hold two threads with
+  the same people), a sender who isn't the bound 1:1 thread's peer, an unbound
+  thread with no snapshot, or a snapshot that names a different thread than
+  the one its id is bound to. That last case is a stale binding: after a phone
+  swap or restore an id can still be bound to the old phone's thread, and a
+  snapshot of another kind, another 1:1 peer or a fully disjoint group means
+  nothing in that frame is filed there. #176's id-space rebinding stays a
+  live-channel repair. A frame fetched without a snapshot (the pending-media
+  refresh) can't be checked that way; only an incoming 1:1 sender is. A skipped
+  frame is re-evaluated when a later catch-up fetches it again, best effort:
+  the worker drops the re-check when its queue is full, as it can be during a
+  large re-fetch. Once a live frame has bound or corrected the thread,
+  re-running a narrow window backfill gives it another chance.
+- **No liveness.** History commits under the generation fence but records no
+  supervisor activity, so a working pull path never masks a dead push path.
+  When the generation ends mid-catch-up, the catch-up stops and stores nothing
+  more, legacy included. The recent reconcile and the startup backfill store
+  what they fetched for a conversation oldest first, so what they didn't store
+  sits above what they did, and the next recent reconcile (which pages down to
+  the newest stored message) fetches it. A reconcile interrupted between pages
+  stores nothing for that conversation. A deep or window backfill that stops
+  has to be run again; a window run says so in `error_details`.
+- **Counters.** `/api/status` → `v2_ingest.per_account.<account>`:
+  `history_appended`, `history_deduped`, `history_imported`,
+  `history_existing`, `history_conversations`, `history_skipped`. `appended`,
+  `deduped` and `projected` count only live frames; shared counters such as
+  `decoded_events`, `quarantined`, `empty_stubs_skipped` and the reaction and
+  echo counters include history too. Backfill runs also report `history_teed`
+  / `history_tee_failed` in `/api/backfill/status` (both stay zero on a
+  legacy-only install).
+
+**Recovering a window the live channel skipped** (for example after the phone
+stopped relaying): run a window backfill from just before the gap. It lists
+every folder, keeps conversations whose last message is at or after `since`,
+and pages each one's messages until a page reaches older than `since`. When
+the phone sends no cursor, it continues below the oldest message on the page
+(by that message's id and time) and stops when a page brings nothing new; it
+gives up on a conversation after 400 pages and reports that. Unlike
+the recent reconcile it does not stop at the newest stored message, which sits
+above the hole once push resumes; unlike a deep backfill it does not re-fetch
+(and store a frame for) every message the phone has ever held.
+
+```bash
+curl -s -X POST http://127.0.0.1:7007/api/backfill -d '{"since":"2026-10-05T22:00:00-04:00"}'
+curl -s http://127.0.0.1:7007/api/backfill/status | jq
+curl -s http://127.0.0.1:7007/api/status | jq '.v2_ingest.per_account["google-primary"] | with_entries(select(.key|startswith("history")))'
+```
+
+`since` also accepts a `YYYY-MM-DD` local date or Unix milliseconds. A body
+with `since` either starts a window or is rejected (400): unknown fields,
+trailing data, bodies over 4 KB and Unix seconds are refused, so a typo can't
+fall through to a full deep backfill. (An empty body, `{}` or `{"since":null}`
+still means a deep backfill.) A run that couldn't start or stopped early says
+so in `/api/backfill/status` `error_details`. Then confirm
+the phone's row ids are present (they advance with every message on the phone):
+
+```bash
+sqlite3 -readonly "$HOME/Library/Application Support/OpenMessage/v2/store.sqlite3" \
+  "select cast(remote_message_id as integer) id, datetime(occurred_at_ms/1000,'unixepoch','localtime')
+   from messages where account_id='google-primary' and remote_message_id glob '[0-9]*'
+     and cast(remote_message_id as integer) between <first> and <last> order by id"
+```
+
+All of this needs the request/response path to work. If the fetch replies are
+empty (`Fetched conversations count=0` while the store holds history), nothing
+can be recovered until that is fixed.
 
 ## SMS stopped while RCS works: the phone's SMS path
 
@@ -342,7 +442,8 @@ The other reasons:
 - `sms_recent`
 - `within_usual_pace`: silent past 24 hours, but not yet unusual for this phone.
 - `rcs_quiet`: RCS stopped too, so it cannot be pinned on SMS. The relay-silence
-  check in `freshness.google.silence` (previous section) covers that case.
+  check in `freshness.google.silence` (section "Google Messages silent while
+  'connected'") covers that case.
 - `google_unreachable`: the daemon itself is disconnected from the phone, or
   the phone is not responding.
 - `history_stale`: the inbox could not be reloaded for 15 minutes.
@@ -392,6 +493,11 @@ Known limits:
   dual-SIM phone, so one SIM losing SMS while the other still gets texts goes
   unseen.
 - **Quiet RCS:** nothing can be judged while RCS is quiet too.
+- **Relay stalls:** the monitor reads only live frames (codec
+  `google.protobuf`), not catch-up history (`google.protobuf.history`, see
+  "Catch-up history reaches v2"). A relay stall of a day or more therefore
+  leaves a long gap in its baseline, which uses up the one allowance for the
+  next 28 days.
 - **Lookback:** the daemon reads 42 days of frames, so an outage longer than
   about two weeks loses part of its baseline and can stop being judged.
 - **Deliberately offline phones:** a phone kept off the cellular network on
@@ -503,10 +609,12 @@ hung daemon, and it alerts when the daemon is up but a platform has gone
 quiet.
 
 This section follows the script's code on Max's local dotfiles `master` at
-`c30e106` (2026-10-08). The script's header comment summarizes the checks but
-is incomplete: it leaves out the inbox-read alert, the parse-error path and
-the `STATE`/`LOG` overrides, and it lists a top-level `projection_stalled`
-check that never fires (the daemon publishes that flag inside `freshness`).
+`b51582d` (2026-10-08), plus the `append_errors` alert (`27df7b3`) and the
+`pull_empty` alert (`ffda554`). Other commits on `master` after `b51582d`
+aren't covered yet. The script's header comment summarizes the checks but is
+incomplete: it leaves out the inbox-read alert and the parse-error path, and
+it lists a top-level `projection_stalled` check that never fires (the daemon
+publishes that flag inside `freshness`).
 launchd runs the working-tree file, so editing it, or checking out another
 branch in `~/dotfiles`, changes live behavior within 5 minutes. Try changes on
 a copy ([testing a change](#testing-a-change)).
@@ -519,15 +627,24 @@ a copy ([testing a change](#testing-a-change)).
   staleness check was off, and the main log said nothing about it.
 - State: `~/.local/state/openmessage-watchdog/` holds `consecutive_fails`,
   `last_action_epoch` (the relaunch throttle), the episode counters
-  `disc_<platform>` and `repair_google`, and one `alert_<key>` cooldown stamp
-  per alert (epoch seconds; deleting one re-arms that alert).
+  `disc_<platform>` and `repair_google`, one `alert_<key>` cooldown stamp
+  per alert (epoch seconds; deleting one re-arms that alert),
+  `append_errors` (see the `append_errors` alert below), and
+  `paired_<platform>`, the pairing state the watchdog last recorded (`1` or
+  `0`; a loss deferred by the cooldown stays `1` until it is announced).
+  Deleting a `paired_` file makes the platform's next unpaired run a first
+  sighting, which is only logged.
 - Loaded? `launchctl list | grep openmessage-watchdog`.
 
 ### Relaunching a dead or hung daemon
 
 A run first skips, logging why, if the `watchdog-disabled` flag exists
-([parking it](#parking-the-launchd-watchdog)), if any process's command line
-contains `openmessage pair`, or if `/Applications/OpenMessage.app` is missing.
+([parking it](#parking-the-launchd-watchdog)), if a process is running
+`openmessage pair` by path or name (`pgrep -f
+'(^|/)openmessage[ ]pair( |$)'`), or if `/Applications/OpenMessage.app` is
+missing. Until 2026-10-08 that check matched any command line containing the
+phrase, including a grep for it and a test's `pgrep` stub; a stub made it skip
+live runs that day.
 Skipped runs neither count nor reset anything. Otherwise it fetches
 `http://127.0.0.1:7007/api/status` with a 5 s timeout. The probe fails when the
 reply doesn't contain the string `"connected"`: connection refused, no answer
@@ -573,12 +690,35 @@ in-app supervisors. It alerts on:
   repair interval (90 s by default), so something is revoking the cookies
   within minutes. The counter never resets while the daemon runs, so the alert
   repeats until the daemon restarts, even after the churn stops;
+- `google.pull_health.empty_with_local_history` (key `pull_empty`; daemons
+  with PR #193): the latest INBOX listing or targeted lookup returned no data
+  while the store held at least `threshold` (10) Google conversations, so
+  catch-up is broken even if push still flows
+  ([pulls that return nothing](#pulls-that-return-nothing-phone-switched-to-google-account-pairing)).
+  The text gives the store's count and the time since the daemon last
+  recorded a pull (a listing of any folder or page, or a targeted lookup,
+  whatever its outcome; message fetches and the lookups sends make don't
+  count), as in "Google pulls return no data while the store holds 1048
+  conversations (last pull 1m ago)". It adds "phone switched to
+  Google-account pairing; re-link or switch back to QR (d1088)" when
+  `account_switch` is true. The flag changes only when another first-page
+  INBOX listing or targeted lookup gets an answer (a transport or auth error
+  doesn't count), so after a fix the alert can repeat every 6 hours until one
+  does. A large age means nothing has re-tested the flag; a small one doesn't
+  mean it was re-confirmed. A daemon restart resets it: `pull_health` lives in
+  the backend's memory, so the alert stops until the new process's first
+  INBOX listing or targeted lookup (normally the startup backfill's or a
+  reconcile's) re-tests it. The check is skipped when `google.paired` is
+  `false`, and a missing `pull_health` (a daemon before #193, or one that
+  hasn't recorded a pull since it started) raises nothing. It first fired on
+  2026-10-09 at 03:40;
 - `freshness.<platform>.projection_stalled` (key `proj_<platform>`; v2-primary
   daemons only): the platform's newest message in the v2 read store is more
   than 5 minutes older than its newest in the legacy store, or the read store
   has no rows for a platform the legacy store has. It compares newest
   timestamps, not ingest delay, so a gap left in the past keeps it true
-  indefinitely;
+  indefinitely. Skipped for a platform whose status block says `paired` is
+  `false`;
 - a platform's newest received message
   (`freshness.<platform>.latest_received_ms`, or `latest_ms` if it has
   received nothing) more than 48 h older than
@@ -587,12 +727,34 @@ in-app supervisors. It alerts on:
   sends. The premise is that traffic elsewhere proves the pipe works, but the
   alert always says "while other platforms flow", even when the newer message
   is the platform's own send. A platform with no rows in the read store never
-  trips this check; only `proj_<platform>` catches it;
+  trips this check; only `proj_<platform>` catches it. Skipped for a platform
+  whose status block says `paired` is `false`;
 - no message, sent or received, on any platform for more than 24 h (key
   `all_quiet`). With WhatsApp and Signal unlinked this works as a Google
   silence alarm: it fired at 24, 30 and 36 h during the 2026-10-06 stall;
 - v2 ingest `quarantined` above 0, summed over accounts (key `quarantine`);
-- Signal `receive_recovery.pending_count >= 5` (key `signal_recovery`);
+- v2 ingest `append_errors`, summed over accounts, above the count the
+  watchdog has already reported (key `append_errors`). PR #195 makes the
+  daemon count failed attempts to append a captured Google, WhatsApp or
+  Signal frame to the v2 inbox (a replayed Signal line that fails again
+  counts again). Daemons built before #195 always report 0 here, so only
+  attempts a #195 daemon counted can reach this alert (or a damaged state
+  file).
+  The alert names each failing account, as in "3 failed attempt(s) to
+  append to v2 ingest (google-primary 3)";
+- Signal `receive_recovery.pending_count >= 5` (key `signal_recovery`). This
+  check doesn't look at pairing;
+- a platform whose `paired` was `true` on an earlier run and is now `false`
+  (stamp `alert_unlinked_<platform>`). The notification reads "No longer
+  paired: <platforms> - check the app; relink unless that was intended",
+  because `paired: false` is not always a deliberate unlink. Google's
+  server-side logout (`GaiaLoggedOut`) deletes the session file `paired` is
+  read from, whatsmeow's `device_removed` deletes the WhatsApp device store,
+  and a WhatsApp or Signal bridge that fails to start reports `paired: false`
+  with a `last_error`. A platform first seen unpaired (no `paired_<platform>`
+  file) is only logged, as `unpaired: <platform> - staleness alerts paused
+  until it is relinked`; a relink logs `paired again: <platform> - staleness
+  alerts resume`;
 - a paired, connected platform whose silence outlasts its own baseline, by
   the rule in
   [Google Messages silent while "connected"](#google-messages-silent-while-connected-the-phone-stopped-relaying).
@@ -605,9 +767,11 @@ in-app supervisors. It alerts on:
   - On an older daemon with v2 ingest enabled, the watchdog computes Google's
     verdict itself from `v2/store.sqlite3` (constants mirrored from
     `internal/freshness`), marks the alert "(watchdog estimate)" (key
-    `silent_google`), and lists it first so that it leads the notification. If
-    it can't read the inbox, it raises `silence_check` instead, at normal
-    priority. It skips this whenever any platform publishes a `silence` block.
+    `silent_google`), and lists it first so that it leads the notification,
+    unless a lost pairing is announced in the same run, which goes ahead of
+    it. If it can't read the inbox, it raises `silence_check` instead, at
+    normal priority. It skips this whenever any platform publishes a
+    `silence` block.
 
   To see which applies, run
   `curl -s http://127.0.0.1:7007/api/status | jq '.freshness.google.silence'`.
@@ -619,9 +783,10 @@ in-app supervisors. It alerts on:
 ### How alerts repeat
 
 Each run posts at most one macOS notification: its first fresh alert, plus
-"(+N more - see log)" when there are others. The log has each alert as
-`ALERT: …` and the notification as `NOTIFY: …`. A `NOTIFY:` line records the
-attempt, not that macOS showed it.
+"(+N more - see log)" when there are others. A lost pairing always goes first,
+as one alert naming every platform announced in that run. The log has each
+alert as `ALERT: …` and the notification as `NOTIFY: …`. A `NOTIFY:` line
+records the attempt, not that macOS showed it.
 
 - The disconnect and `needs_repair` alerts count consecutive answered runs and
   notify once, when the count reaches 3, so one notification covers the whole
@@ -637,23 +802,79 @@ attempt, not that macOS showed it.
   together therefore stay in lockstep, and one that is never first only ever
   shows up as "+N more". Stamps aren't cleared when a condition clears, so a
   recurrence within 6 hours stays silent.
+- `append_errors` alerts on growth, not while a condition holds, because the
+  daemon keeps the count for the life of its process. The state file
+  `append_errors` holds the `append_errors` and `appended` sums from the last
+  run that saw accounts, the count already reported, attempts carried over a
+  restart, and the listening backend's identity (PID and start time). A run
+  alerts when the sum is above the reported count (or attempts are carried)
+  and the `alert_append_errors` stamp is at least 6 hours old. A count that
+  stays flat never posts another banner, so deleting the stamp alone doesn't
+  repeat it; delete the `append_errors` file too. Growth inside the 6 hours
+  logs `suppressed (cooldown): append_errors (<sum>, last alert reported <n>)`
+  (plus `, <k> from before a restart` when attempts are carried) and is
+  reported by the first run after it, as "N failed attempt(s) to append to v2
+  ingest, M since the last alert (…)". When another alert leads the run's
+  notification, it logs `deferred: append_errors …` and waits for a run it
+  leads, so it never appears only as "+N more".
+- The baseline goes back to 0 when the backend restarts: exactly one process
+  listens on the port and its PID or start time (read with `lsof` and `ps` in
+  UTC, so a time-zone change is not a restart) differs from the last one seen,
+  or either sum is lower than on the last run that saw accounts. No listener,
+  several, or a failed `lsof` leaves the identity unknown for that run, and
+  only the sums can show a restart. Attempts the watchdog saw but had not
+  reported yet are carried into the next alert ("…, and N more seen before the
+  backend restarted", or "N failed attempt(s) to append to v2 ingest before
+  the backend restarted" when the new backend has none). When the old count
+  was above 0, the reset is logged as
+  `append_errors baseline reset: backend restarted (…)` with the number
+  carried. A run whose status has no accounts under `v2_ingest.per_account`
+  leaves the state alone.
+- A lost pairing is announced once per change. If the platform's previous
+  lost-pairing notification was less than 6 hours ago, the run logs
+  `suppressed (cooldown): unlinked_<platform>` and leaves `paired_<platform>`
+  at `1`, so later runs retry and it goes out on the first run 6 hours after
+  the previous one, if the platform is still unpaired then. A relink in the
+  meantime logs nothing, since the stored state never left paired.
 - If `/api/status` contains `"connected"` but isn't valid JSON, the run logs
   `status parse error: …` and checks nothing else.
 
 Consequences worth knowing:
 
-- Only the disconnect and silence checks look at pairing. The trailing,
-  projection and Signal-recovery checks don't, so a platform left unlinked
-  keeps alerting. On 2026-10-08, with WhatsApp and Signal unlinked, the
-  notification every 6 hours read "signal projection stalled (+2 more - see
-  log)" (the other two are `behind_signal` and `behind_whatsapp`), and it can
+- The trailing and projection checks skip a platform whose status says
+  `paired: false`; the Signal-recovery check doesn't. Before dotfiles
+  `7de27cc` (2026-10-08) neither skipped it: with WhatsApp and Signal
+  unlinked, the watchdog re-notified every 6 hours from 2026-09-03, and from
+  2026-09-20 the notification read "signal projection stalled (+2 more - see
+  log)" (the other two are `behind_signal` and `behind_whatsapp`), which could
   hide a new alert raised in the same run.
+- `paired: false` doesn't say why. A bridge that failed to start looks like
+  an unlink, so after its one lost-pairing notification its staleness alerts
+  stay paused; check `last_error` in `/api/status`. A platform relinked while
+  still more than 48 h behind alerts `behind_<platform>` on the first run
+  that sees it paired (if its `behind_` stamp is at least 6 hours old), and
+  every 6 hours after until it receives a message.
 - `quarantined` is an in-memory counter that starts at zero whenever the
   backend starts. Any backend restart (an app or watchdog relaunch, or the app
   restarting `openmessage serve`) therefore stops the alert. The quarantined
   frames stay in the v2 `inbox` table, marked processed like frames that
   projected fine, and the cause is not stored (issue #161). Their inbox ids
   are only in the backend's `Quarantined ingest frame` log lines.
+- `append_errors` is the same kind of in-memory counter, but its banner
+  doesn't repeat for an unchanged count. In the state dir's `health.txt`
+  (rewritten by every run) the count is an `alert:` line on every run that
+  reads the status while it is above 0, reported or not, until the backend
+  restarts; attempts carried over a restart are listed until they are
+  reported, and on runs without
+  accounts the unreported remainder is listed instead. Failures after the
+  watchdog's last run that saw accounts and before a restart die with the old
+  process uncounted. When the identity is unknown on a run after a restart and
+  neither sum falls, that run takes the new backend for the old one: a count
+  at exactly the reported one stays silent, and "M since the last alert"
+  understates. The next run with a known identity sees the restart, and
+  attempts counted in between can then be reported a second time, so the
+  watchdog errs toward over-reporting. While `lsof` stays blind, only the sums
+  can show a restart.
 - Quarantine alerts recur: they appeared on 33 days between 2026-08-01 and
   10-08, many of them 6-hourly repeats of one unchanged count. The first
   surfaced three Google conversation snapshots quarantined over
@@ -664,9 +885,11 @@ Consequences worth knowing:
 
 `OPENMESSAGE_WATCHDOG_DRYRUN=1` logs decisions without relaunching or
 notifying, but it still writes state: `consecutive_fails`, the episode
-counters and the `alert_<key>` stamps (not the relaunch stamp). Run against
-the real state dir, it can swallow the next real alert: a stamped key stays
-quiet for 6 hours, and an episode counter pushed past 3 never alerts. Point
+counters, the `paired_<platform>` files, the `alert_<key>` stamps (not the
+relaunch stamp) and the `append_errors` file. Run against the real state dir,
+it can swallow the next real alert: a stamped key stays quiet for 6 hours, an
+episode counter pushed past 3 never alerts, an `append_errors` count marked
+reported never alerts, and a lost pairing it records is never announced. Point
 `OPENMESSAGE_WATCHDOG_STATE` and `OPENMESSAGE_WATCHDOG_LOG` at a scratch
 directory and run a copy of the script:
 
@@ -685,6 +908,21 @@ payload, set `OPENMESSAGE_WATCHDOG_PORT` to a stub server that serves it at
 relaunch path. Repeated dry runs of the relaunch path count past the threshold
 (`4/3`, `5/3`, …), because only a real relaunch or an answered probe resets
 the counter.
+
+Two more overrides exist for tests. `OPENMESSAGE_WATCHDOG_APP` replaces the
+`/Applications/OpenMessage.app` existence check (the relaunch still opens the
+app by name). `OPENMESSAGE_WATCHDOG_NOW` (epoch seconds) pins the clock for
+the cooldowns, the relaunch throttle and the python block's `now_ms`, which
+the silence estimate now reads too (before dotfiles `b51582d` it read the wall
+clock). The estimate buckets its baseline by local day and hour, so a test
+that pins the clock should pin `TZ` too.
+`~/dotfiles/tests/test_openmessage_watchdog.py` runs the real script against a
+fixture daemon, and the silence estimate against a temp v2 store, with all of
+this sandboxed and stub `osascript`/`open`/`pgrep`/`pkill` first on `PATH`:
+
+```bash
+cd ~/dotfiles && PYTHONDONTWRITEBYTECODE=1 pytest -q -p no:cacheprovider tests/test_openmessage_watchdog.py
+```
 
 ### Reading the backend's os_log
 
@@ -731,11 +969,11 @@ done, whatever the outcome. Nothing ages it out. A flag forgotten from
 has no frames from any platform between 08-20 18:55 and 09-03 16:03. If alerts
 seem to have stopped, `tail` the log first; a parked watchdog says so on every
 run. The watchdog also skips while an `openmessage pair` process is running,
-but that check matches any command line containing the string, so don't rely
-on it for multi-step procedures. The quick deploy recipe below doesn't need
-parking if the app is back within a few minutes: with no app process, a
-relaunch takes two failed probes 5 minutes apart, and the watchdog skips while
-`/Applications/OpenMessage.app` is missing.
+but only while it runs, so don't rely on it for multi-step procedures. The
+quick deploy recipe below doesn't need parking if the app is back within a few
+minutes: with no app process, a relaunch takes two failed probes 5 minutes
+apart, and the watchdog skips while `/Applications/OpenMessage.app` is
+missing.
 
 ## Pairing & the "zombie session"
 
@@ -931,19 +1169,100 @@ Without it, a single transient network blip during a scheduled token refresh
 permanently killed the session.
 
 The replacement in `go.mod` pins fork commit
-[`0e43542dfa0e`](https://github.com/MaxGhenis/gmessages/commit/0e43542dfa0e0b97e410f185a5842e8740106099).
+[`100192cb3078`](https://github.com/MaxGhenis/gmessages/commit/100192cb3078739f7ed925730f7248eb18b6c340).
 It is upstream `mautrix/gmessages` base
 [`3433cc07d5ea`](https://github.com/mautrix/gmessages/commit/3433cc07d5ea9522309adad3a8c92ed5b08dc11d),
-which contains the auth-refresh retry, plus exactly one carried patch:
-`Add ListConversationsWithCursor for paginated conversation listing`. That
-method is required by OpenMessage's backfill and reconciliation paths.
+which contains the auth-refresh retry, plus two carried patches, oldest first:
+
+1. `Add ListConversationsWithCursor for paginated conversation listing`. That
+   method is required by OpenMessage's backfill and reconciliation paths.
+2. `libgm: don't complete data requests with payload-less frames`. A read
+   (list/get conversations, messages, contacts, thumbnails, full-size images)
+   answered by a frame that carries the field-11 account container and no
+   encrypted payload, or a single-object lookup answered by a bare header,
+   now waits up to 10 s for the real response and then fails with
+   `libgm.ErrNoResponsePayload` instead of returning an empty success. A bare
+   header answering a listing is still an empty result. See "Pulls that
+   return nothing" below. Upstream still has the old behaviour.
 
 **Keep the fork rebased on upstream.** The weekly
-`gmessages-fork-drift.yml` workflow records the base and patch set and fails as
-soon as upstream `main` advances. When rebasing, replay the single carried
-patch, verify the auth-refresh retry is still present, and update the fork pin
-and recorded SHAs together. The durable architectural fix (move SMS/RCS onto
-an Android companion) is issue #75.
+`gmessages-fork-drift.yml` workflow records the base and patch set (count and
+subjects) and fails as soon as upstream `main` advances. When rebasing, replay
+both carried patches, verify the auth-refresh retry is still present, and
+update the fork pin, `EXPECTED_PATCHES`, and recorded SHAs together. The pinned
+commit must be on the fork's `main`. `TestGMessagesForkRejectsPayloadlessResponses`
+runs the pinned fork's own response-acceptance tests, so it fails if a rebase
+drops the second patch or keeps its exported names without the rejection. The
+durable architectural fix (move SMS/RCS onto an Android companion) is issue #75.
+
+### Pulls that return nothing (phone switched to Google-account pairing)
+
+**Symptom (recorded 2026-10-07 15:56 and throughout 10-08; the 10/6
+relaunches' backfills also pulled nothing):** new messages still arrive
+(`freshness.google.latest_received_ms` keeps advancing) and
+`phone_responding` is `true`, but every pull comes back empty. Startup backfill
+logs `Fetched conversations count=0`, deep backfill reports
+`conversations_found=0, errors=0`, and `GetOrCreateConversation` /
+`GetConversation` return no conversation, so sends fail with "transport
+returned no conversation". The account had ~1,040 Google conversations.
+
+**Cause, observed on the wire:** the phone had switched to Google-account
+(Gaia) pairing while OpenMessage's session is a QR (Bugle) pairing. The phone
+answers each data request (and each liveness ping) with exactly one frame of
+message type `GAIA_1` that carries only the field-11 account container (the
+Google account address) and no field-8 response payload. No real response
+follows. libgm used to hand that frame to the waiting request as a
+pre-allocated, empty response with a nil error. The same container arrives as
+`GET_UPDATES` frames, which libgm logs as `Got unknown event type` with
+`decrypted_data=EhMKE…` and turns into a synthetic `events.AccountChange`
+(upstream mautrix-gmessages reports this state as "You switched to Google
+account pairing, please log in to continue using SMS/RCS").
+
+**What you see now:**
+
+- libgm logs `Phone answered a pending request without a response payload`
+  and, 10 s later, `Phone never sent a response payload; failing the request`.
+  They carry the envelope shape and no content, as `frame` on the first and
+  `last_frame` on the second (`message_type`, `f5`/`f8`/`f11` presence and
+  lengths, `decoded_size`, `unknown_len`, `account_switch`). Answers that arrive after their request
+  already finished are logged as `Received response with no pending request`.
+- Pulls fail with an error that matches `libgm.ErrNoResponsePayload`; deep
+  backfill counts them in `errors`. Lookups on the legacy send and
+  new-conversation paths fail after the answer delay plus the 10 s grace
+  with "Google Messages on your phone switched to Google-account pairing…".
+  These errors deliberately do not count toward `needs_repair`: that would
+  park the transport, and push is the only delivery still working in this
+  state.
+- `/api/status` → `google.pull_health` records the last pull (`last_trigger`,
+  `last_outcome` = `ok|empty|no_payload|error`, `last_error`) and raises
+  `empty_with_local_history: true` when the latest INBOX listing or targeted
+  lookup returned no data while the store held at least `threshold` (10)
+  Google conversations. `account_switch: true` means the phone sent the
+  account-switch notice. The next INBOX listing or targeted lookup that
+  returns data clears it; other folders, later pages and transport errors
+  leave it alone. The threshold is a heuristic: an account whose INBOX is
+  legitimately empty while archived threads remain would also raise it.
+- On Max's install the launchd watchdog turns this flag into a macOS
+  notification (key `pull_empty`; see [staleness alerts](#staleness-alerts)).
+
+```bash
+curl -s http://127.0.0.1:7007/api/status | jq '.google.pull_health'
+```
+
+**Fix:** not a reconnect, a restart, or a cookie refresh: none of them
+changes the phone's pairing mode (two app restarts on 10/8 changed nothing).
+Two remedies follow from the mechanism and from upstream mautrix-gmessages,
+whose (commented-out) alert for this state reads "Switched to Google account
+pairing, please switch back or relogin with `login-google`"
+(`pkg/connector/handlegmessages.go`). Neither has been tried on this install
+yet:
+
+1. Re-link OpenMessage with Google-account pairing (cookie method, re-pair
+   recipe above).
+2. Switch the phone back to QR/device pairing in Google Messages' device
+   pairing settings.
+
+Both are the user's call.
 
 ### Don't over-reconnect
 
@@ -1177,7 +1496,9 @@ briefly show "reconnecting" before it settles (see throttling note above).
 Read `curl -s http://127.0.0.1:7007/api/status | jq '.v2_ingest'`. A healthy
 enabled stack reports `enabled: true`; under `per_account`, `appended` grows as
 receive frames arrive, message-bearing frames advance `projected`, and
-`quarantined` remains `0`. An idle WhatsApp or Signal account can legitimately
+`quarantined` remains `0`. Catch-up history never moves `appended`,
+`deduped` or `projected` (it has its own `history_*` counters), so their
+growth is evidence of live delivery. An idle WhatsApp or Signal account can legitimately
 stay at zero until a new inbound/history frame arrives.
 
 The manual receive-only check is:

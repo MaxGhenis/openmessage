@@ -2,9 +2,11 @@ package ingest
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"go.mau.fi/mautrix-gmessages/pkg/libgm"
@@ -17,8 +19,15 @@ import (
 )
 
 const (
-	// GoogleCodec is the durable Google Messages protobuf envelope codec.
+	// GoogleCodec is the durable Google Messages protobuf envelope codec for
+	// frames the live long-poll delivered.
 	GoogleCodec = "google.protobuf"
+	// GoogleHistoryCodec marks the same envelope for frames a catch-up fetched
+	// on request (ListConversations / FetchMessages replies). The distinct codec
+	// keeps fetched history out of anything that measures live delivery from
+	// inbox rows (the silence and SMS-path monitors filter by exact codec), and
+	// selects the worker's insert-only history semantics.
+	GoogleHistoryCodec = "google.protobuf.history"
 	// GoogleCodecVersion is the only envelope version understood by this decoder.
 	GoogleCodecVersion uint32 = 1
 )
@@ -31,10 +40,151 @@ const (
 // googleFrameEnvelope keeps the protobuf byte-preserving while making its
 // concrete message type explicit. A non-nil IsOld makes the field appear for
 // message frames even when false; conversation frames omit it.
+//
+// ConversationB64 is set only on history message frames: the conversation
+// snapshot the message was fetched under. Carrying it in the same frame makes
+// the worker apply the conversation before the message; as separate frames the
+// two could be drained in either order (same-millisecond inbox rows sort by a
+// random id), and a group message projected before its conversation is
+// rerouted by sender into a member's 1:1 thread.
 type googleFrameEnvelope struct {
-	Kind     string `json:"kind"`
-	ProtoB64 []byte `json:"proto_b64"`
-	IsOld    *bool  `json:"is_old,omitempty"`
+	Kind            string `json:"kind"`
+	ProtoB64        []byte `json:"proto_b64"`
+	IsOld           *bool  `json:"is_old,omitempty"`
+	ConversationB64 []byte `json:"conversation_b64,omitempty"`
+}
+
+// GoogleIngressDedupeKey is the inbox dedupe key of a Google frame: the kind,
+// the remote ID, and a short hash of the protobuf. Live frames use the kinds
+// "msg" and "conv"; history frames use "hmsg" and "hconv", so the two origins
+// never collapse onto each other's rows. If they shared a key, a fetched copy
+// that reached the inbox first would swallow a later byte-identical live push:
+// the push would be replayed against an already-processed history row and
+// dropped as a stale replay (losing, say, an attachment that only the live
+// path records), and the live-delivery monitors would never see it.
+func GoogleIngressDedupeKey(kind, remoteID string, protoBytes []byte) string {
+	digest := sha256.Sum256(protoBytes)
+	return fmt.Sprintf("%s:%s:%x", kind, remoteID, digest[:4])
+}
+
+// GoogleMessageRecord builds the durable ingress record the live tee appends
+// for one pushed message.
+func GoogleMessageRecord(
+	accountID string,
+	generation bridge.Generation,
+	event *libgm.WrappedMessage,
+	receivedAt time.Time,
+) (bridge.RawIngressRecord, error) {
+	payload, protoBytes, err := MarshalGoogleMessageFrame(event)
+	if err != nil {
+		return bridge.RawIngressRecord{}, err
+	}
+	return bridge.RawIngressRecord{
+		AccountID:    accountID,
+		Generation:   generation,
+		DedupeKey:    GoogleIngressDedupeKey("msg", event.GetMessageID(), protoBytes),
+		Codec:        GoogleCodec,
+		CodecVersion: GoogleCodecVersion,
+		ReceivedAt:   receivedAt,
+		Payload:      payload,
+	}, nil
+}
+
+// GoogleConversationRecord builds the durable ingress record the live tee
+// appends for one pushed conversation snapshot.
+func GoogleConversationRecord(
+	accountID string,
+	generation bridge.Generation,
+	conversation *gmproto.Conversation,
+	receivedAt time.Time,
+) (bridge.RawIngressRecord, error) {
+	return googleConversationRecord(accountID, generation, GoogleCodec, conversation, receivedAt)
+}
+
+// GoogleHistoryConversationRecord builds the history-codec record for one
+// conversation a catch-up listed.
+func GoogleHistoryConversationRecord(
+	accountID string,
+	generation bridge.Generation,
+	conversation *gmproto.Conversation,
+	receivedAt time.Time,
+) (bridge.RawIngressRecord, error) {
+	return googleConversationRecord(accountID, generation, GoogleHistoryCodec, conversation, receivedAt)
+}
+
+func googleConversationRecord(
+	accountID string,
+	generation bridge.Generation,
+	codec string,
+	conversation *gmproto.Conversation,
+	receivedAt time.Time,
+) (bridge.RawIngressRecord, error) {
+	payload, protoBytes, err := MarshalGoogleConversationFrame(conversation)
+	if err != nil {
+		return bridge.RawIngressRecord{}, err
+	}
+	kind := "conv"
+	if codec == GoogleHistoryCodec {
+		kind = "hconv"
+	}
+	return bridge.RawIngressRecord{
+		AccountID:    accountID,
+		Generation:   generation,
+		DedupeKey:    GoogleIngressDedupeKey(kind, conversation.GetConversationID(), protoBytes),
+		Codec:        codec,
+		CodecVersion: GoogleCodecVersion,
+		ReceivedAt:   receivedAt,
+		Payload:      payload,
+	}, nil
+}
+
+// GoogleHistoryMessageRecord builds the history-codec record for one message a
+// catch-up fetched from conversationID. A fetched message with no conversation
+// ID of its own is attributed to conversationID (on a copy; the caller's proto
+// is never mutated). conversation, when it is the snapshot of that same
+// conversation, rides along in the frame; the dedupe key ("hmsg") covers only
+// the message, so a re-fetch of an unchanged message dedupes onto its earlier
+// history row even though the conversation snapshot moved on.
+func GoogleHistoryMessageRecord(
+	accountID string,
+	generation bridge.Generation,
+	conversationID string,
+	conversation *gmproto.Conversation,
+	message *gmproto.Message,
+	receivedAt time.Time,
+) (bridge.RawIngressRecord, error) {
+	if message == nil {
+		return bridge.RawIngressRecord{}, fmt.Errorf("marshal Google history message frame: message is nil")
+	}
+	conversationID = strings.TrimSpace(conversationID)
+	if strings.TrimSpace(message.GetConversationID()) == "" {
+		if conversationID == "" {
+			return bridge.RawIngressRecord{}, fmt.Errorf(
+				"marshal Google history message frame: message %q has no conversation ID",
+				message.GetMessageID(),
+			)
+		}
+		message = proto.Clone(message).(*gmproto.Message)
+		message.ConversationID = conversationID
+	}
+	if conversation != nil && conversation.GetConversationID() != message.GetConversationID() {
+		// A snapshot of some other thread proves nothing about this message's
+		// thread; let the message route itself exactly as a live frame would.
+		conversation = nil
+	}
+	payload, protoBytes, err := marshalGoogleMessageEnvelope(message, true, conversation)
+	if err != nil {
+		return bridge.RawIngressRecord{}, err
+	}
+	return bridge.RawIngressRecord{
+		AccountID:    accountID,
+		Generation:   generation,
+		DedupeKey:    GoogleIngressDedupeKey("hmsg", message.GetMessageID(), protoBytes),
+		Codec:        GoogleHistoryCodec,
+		CodecVersion: GoogleCodecVersion,
+		ReceivedAt:   receivedAt,
+		Payload:      payload,
+	}, nil
 }
 
 // MarshalGoogleMessageFrame serializes the exact v1 frame used by the Google
@@ -48,16 +198,30 @@ func MarshalGoogleMessageFrame(
 	if event.Message == nil {
 		return nil, nil, fmt.Errorf("marshal Google message frame: protobuf message is nil")
 	}
-	protoBytes, err = proto.Marshal(event.Message)
+	return marshalGoogleMessageEnvelope(event.Message, event.IsOld, nil)
+}
+
+func marshalGoogleMessageEnvelope(
+	message *gmproto.Message,
+	isOld bool,
+	conversation *gmproto.Conversation,
+) (payload, protoBytes []byte, err error) {
+	protoBytes, err = proto.Marshal(message)
 	if err != nil {
 		return nil, nil, fmt.Errorf("marshal Google message protobuf: %w", err)
 	}
-	isOld := event.IsOld
-	payload, err = json.Marshal(googleFrameEnvelope{
+	envelope := googleFrameEnvelope{
 		Kind:     googleFrameMessage,
 		ProtoB64: protoBytes,
 		IsOld:    &isOld,
-	})
+	}
+	if conversation != nil {
+		envelope.ConversationB64, err = proto.Marshal(conversation)
+		if err != nil {
+			return nil, nil, fmt.Errorf("marshal Google message conversation protobuf: %w", err)
+		}
+	}
+	payload, err = json.Marshal(envelope)
 	if err != nil {
 		return nil, nil, fmt.Errorf("marshal Google message envelope: %w", err)
 	}
@@ -111,8 +275,14 @@ func (d *GoogleDecoder) Decode(
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if record.Codec != GoogleCodec {
-		return nil, fmt.Errorf("decode Google ingress: codec %q is not %q", record.Codec, GoogleCodec)
+	history := record.Codec == GoogleHistoryCodec
+	if record.Codec != GoogleCodec && !history {
+		return nil, fmt.Errorf(
+			"decode Google ingress: codec %q is not %q or %q",
+			record.Codec,
+			GoogleCodec,
+			GoogleHistoryCodec,
+		)
 	}
 	if record.CodecVersion != GoogleCodecVersion {
 		return nil, fmt.Errorf(
@@ -129,6 +299,12 @@ func (d *GoogleDecoder) Decode(
 		return nil, fmt.Errorf("decode Google ingress envelope: proto_b64 is empty")
 	}
 
+	if len(envelope.ConversationB64) > 0 && (!history || envelope.Kind != googleFrameMessage) {
+		return nil, fmt.Errorf(
+			"decode Google ingress envelope: conversation_b64 is only valid on history message frames",
+		)
+	}
+
 	switch envelope.Kind {
 	case googleFrameMessage:
 		if envelope.IsOld == nil {
@@ -138,7 +314,24 @@ func (d *GoogleDecoder) Decode(
 		if err := proto.Unmarshal(envelope.ProtoB64, &message); err != nil {
 			return nil, fmt.Errorf("decode Google message protobuf: %w", err)
 		}
-		return d.decodeMessage(record.AccountID, &message)
+		events, err := d.decodeMessage(record.AccountID, &message)
+		if err != nil || len(envelope.ConversationB64) == 0 {
+			return events, err
+		}
+		var conversation gmproto.Conversation
+		if err := proto.Unmarshal(envelope.ConversationB64, &conversation); err != nil {
+			return nil, fmt.Errorf("decode Google message conversation protobuf: %w", err)
+		}
+		if conversation.GetConversationID() != message.GetConversationID() {
+			return nil, fmt.Errorf(
+				"decode Google ingress envelope: conversation %q does not match message conversation %q",
+				conversation.GetConversationID(),
+				message.GetConversationID(),
+			)
+		}
+		// The conversation leads even when the message itself is an empty stub:
+		// the snapshot is still the phone's view of a thread v2 may lack.
+		return append([]bridge.Event{googleConversationEvent(&conversation)}, events...), nil
 	case googleFrameConversation:
 		var conversation gmproto.Conversation
 		if err := proto.Unmarshal(envelope.ProtoB64, &conversation); err != nil {

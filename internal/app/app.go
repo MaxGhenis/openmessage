@@ -44,6 +44,13 @@ type BackfillSnapshot struct {
 	ContactsChecked    int           `json:"contacts_checked"`
 	Errors             int           `json:"errors"`
 	ErrorDetails       []string      `json:"error_details,omitempty"`
+	// HistoryTeed counts fetched conversations and messages handed to v2
+	// ingest; HistoryTeeFailed counts hand-offs v2 refused. A refused item is
+	// still written to the legacy store unless the refusal was the generation
+	// closing, which stops the catch-up. Both stay zero when v2 ingest is not
+	// running.
+	HistoryTeed      int `json:"history_teed"`
+	HistoryTeeFailed int `json:"history_tee_failed"`
 }
 
 // BackfillProgress tracks the current state of a deep backfill operation.
@@ -64,6 +71,8 @@ func (p *BackfillProgress) reset() {
 	p.ContactsChecked = 0
 	p.Errors = 0
 	p.ErrorDetails = nil
+	p.HistoryTeed = 0
+	p.HistoryTeeFailed = 0
 }
 
 // setPhase updates the current phase.
@@ -89,6 +98,14 @@ func (p *BackfillProgress) addError(detail string) {
 	if detail != "" && len(p.ErrorDetails) < maxErrorDetails {
 		p.ErrorDetails = append(p.ErrorDetails, detail)
 	}
+}
+
+// addHistory counts hand-offs of fetched history to v2 ingest.
+func (p *BackfillProgress) addHistory(teed, failed int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.HistoryTeed += teed
+	p.HistoryTeeFailed += failed
 }
 
 // add increments the given counters atomically.
@@ -137,7 +154,10 @@ type App struct {
 
 	// gmClient is used by backfill methods. If nil, it's derived from Client.GM.
 	// Set this field directly in tests to inject a mock.
-	gmClient                  GMClient
+	gmClient GMClient
+	// gmHistory pairs with gmClient in tests: the history ingress catch-ups
+	// hand fetched history to while the mock client is installed.
+	gmHistory                 GoogleHistoryIngress
 	BackfillProgress          BackfillProgress
 	backfillRunning           atomic.Bool
 	reconcileRunning          atomic.Bool
@@ -167,6 +187,7 @@ type App struct {
 	googleLifecycleMu         sync.RWMutex
 	googleLifecycleNotifier   GoogleLifecycleNotifier
 	googleRepairPaceMu        sync.RWMutex
+	googlePull                googlePullHealth
 	googleRepairPaceCount     func() uint64
 	signalLifecycleMu         sync.RWMutex
 	signalLifecycleNotifier   SignalLifecycleNotifier
@@ -195,6 +216,11 @@ type GoogleStatusSnapshot struct {
 	// heal cycle; a climbing count means cookies are being revoked within
 	// minutes, which the pacing floor is throttling rather than hiding.
 	RepairsPaced uint64 `json:"repairs_paced,omitempty"`
+	// PullHealth reports recent catch-up pulls (conversation listings and
+	// targeted lookups). Its empty_with_local_history flag is set when pulls
+	// return no data while the store holds this account's conversations, the
+	// state push-only health checks can't see. Absent before the first pull.
+	PullHealth *GooglePullHealthSnapshot `json:"pull_health,omitempty"`
 }
 
 // googleRepairThreshold is how many consecutive failed Google sends (with no
@@ -227,6 +253,9 @@ func (a *App) RecordGoogleSendOutcomeWithPhone(success bool, phoneResponding boo
 // returns a SendMessageResponse status. Only auth/dead-session failures mark
 // the session for re-pair; transient network errors should remain recoverable.
 func (a *App) RecordGoogleSendError(err error) {
+	// An account-switch answer (IsGoogleAccountSwitchError) is deliberately not
+	// counted here: needs_repair parks the transport, and in that state push
+	// is the only delivery still working. pull_health.account_switch reports it.
 	if isGoogleAuthInvalid(err) {
 		a.markGoogleNeedsRepairAndPark(err)
 	}
@@ -658,16 +687,6 @@ func (a *App) getGMClient() GMClient {
 	return nil
 }
 
-func (a *App) currentBackfillClient() (GMClient, any) {
-	if a.gmClient != nil {
-		return a.gmClient, a.gmClient
-	}
-	if cli := a.GetClient(); cli != nil {
-		return newRealGMClient(cli.GM), cli.GM
-	}
-	return nil, nil
-}
-
 func (a *App) backfillClientStillCurrent(token any) bool {
 	if token == nil {
 		return false
@@ -759,6 +778,7 @@ func (a *App) GoogleStatus() GoogleStatusSnapshot {
 		AuthExpired:     a.googleAuthExpired.Load(),
 		PhoneResponding: a.GooglePhoneResponding(),
 		RepairsPaced:    a.GoogleRepairsPaced(),
+		PullHealth:      a.GooglePullHealth(),
 	}
 }
 

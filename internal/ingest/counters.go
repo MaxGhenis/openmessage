@@ -38,6 +38,21 @@ type CounterSnapshot struct {
 	// dropped because identical content already existed under another remote id.
 	RemoteRebinds       uint64 `json:"remote_rebinds"`
 	ContentDupesSkipped uint64 `json:"content_dupes_skipped"`
+	// History counters cover frames a catch-up fetched on request (history
+	// codecs) rather than received live, so Appended/Projected keep meaning
+	// "the live channel delivered". HistoryAppended/HistoryDeduped mirror
+	// Appended/Deduped; HistoryImported counts messages a history frame
+	// inserted; HistoryExisting counts history messages skipped because v2
+	// already held them; HistoryConversations counts conversations a history
+	// snapshot created; HistorySkipped counts history snapshots and messages
+	// v2 could only have placed by moving a thread binding (or whose snapshot
+	// was unusable), which history never does.
+	HistoryAppended      uint64 `json:"history_appended"`
+	HistoryDeduped       uint64 `json:"history_deduped"`
+	HistoryImported      uint64 `json:"history_imported"`
+	HistoryExisting      uint64 `json:"history_existing"`
+	HistoryConversations uint64 `json:"history_conversations"`
+	HistorySkipped       uint64 `json:"history_skipped"`
 }
 
 type accountCounters struct {
@@ -65,6 +80,13 @@ type accountCounters struct {
 	ephemeral           atomic.Uint64
 	remoteRebinds       atomic.Uint64
 	contentDupesSkipped atomic.Uint64
+
+	historyAppended      atomic.Uint64
+	historyDeduped       atomic.Uint64
+	historyImported      atomic.Uint64
+	historyExisting      atomic.Uint64
+	historyConversations atomic.Uint64
+	historySkipped       atomic.Uint64
 }
 
 // Counters owns atomic ingest counters partitioned by account. Its zero value
@@ -149,5 +171,12 @@ func snapshotCounters(c *accountCounters) CounterSnapshot {
 		Ephemeral:           c.ephemeral.Load(),
 		RemoteRebinds:       c.remoteRebinds.Load(),
 		ContentDupesSkipped: c.contentDupesSkipped.Load(),
+
+		HistoryAppended:      c.historyAppended.Load(),
+		HistoryDeduped:       c.historyDeduped.Load(),
+		HistoryImported:      c.historyImported.Load(),
+		HistoryExisting:      c.historyExisting.Load(),
+		HistoryConversations: c.historyConversations.Load(),
+		HistorySkipped:       c.historySkipped.Load(),
 	}
 }
