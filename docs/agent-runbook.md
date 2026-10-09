@@ -313,14 +313,22 @@ curl -s http://127.0.0.1:7007/api/status | jq '.freshness.google.sms_path, .fres
     bar is about 25 hours.
 - **The phone's texting is regular enough to judge:**
   - In those 28 days the phone went a whole 24 hours without any incoming SMS
-    at most once (`long_gaps` of 0 or 1). The one allowance keeps an earlier
-    outage from blocking the next.
-  - The history covers at least 21 days, with at least 10 arrivals.
+    at most once (`long_gaps` of 0 or 1).
+  - The shorter gaps, the time it kept its usual rhythm, add up to at least 21
+    days (`regular_span_ms`), with at least 10 arrivals. A long gap never
+    counts toward the 21 days.
+  - The one allowance keeps an earlier outage of up to about a week from
+    blocking the next. A longer earlier outage, or a second one within the 28
+    days, withholds judgment (`thin_baseline`) until it leaves the baseline.
   - No calendar or time zone enters, so travel and daylight-saving changes
     cannot move the verdict.
   - A phone that gets texts only on weekdays goes two days without one every
-    weekend, and is never judged (`thin_baseline`). The same holds for phones
-    that get texts rarely, once a day or less, or in clusters days apart.
+    weekend, and is never judged (`thin_baseline`). Nor is a phone whose texts
+    come in clusters with quiet days between them, however busy the clusters.
+  - A phone that gets one text a day at a random time of day goes a whole day
+    without one at about half its gaps, and is then not judged. If every gap
+    stays under 24 hours it is judged, and at one arrival a day a stall takes
+    six days to flag.
 - **RCS is flowing now:** at least 3 incoming RCS messages in the last 24 hours,
   the newest within 3 hours.
 
@@ -365,11 +373,14 @@ only once received):
   stretch was 19.2 hours.
 - **10/4 17:10 EDT:** flags the outage, 24.9 hours after the last SMS.
 
-Simulated over two years with texts in waking hours and RCS hourly:
+Simulated with texts in waking hours and RCS hourly (seeded tests in
+`internal/freshness/smspath_test.go`):
 
-- **Weekday-only texters:** it never fired, holidays included.
-- **Daily texters whose texts come at random:** zero to four false alerts a
-  year at one to ten arrivals a day. That is the statistical floor: a long
+- **Weekday-only texters:** it never fired over 26 weeks, holidays included.
+- **Clustered texters** (nine busy days in every 27): it never fired over 135
+  days (five cycles).
+- **Daily texters whose texts come at random:** at most two false alerts in
+  330 days at one to ten arrivals a day. That is the statistical floor: a long
   random lull looks like an outage.
 
 Only daemons running v2 ingest (`OPENMESSAGES_V2_INGEST=1`, implied by

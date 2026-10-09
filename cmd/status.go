@@ -128,6 +128,11 @@ func runStatus(ctx context.Context, session *commandReadSession, deps statusDeps
 	fmt.Fprintf(out, "OpenMessage store — %s\n", dbPath)
 	if len(stats) == 0 {
 		fmt.Fprintln(out, "\nNo messages stored yet. Pair and serve, or run an `openmessage import …`.")
+		// The inbox can hold frames that never became stored messages; --json
+		// reports their verdict too.
+		if smsPath != nil {
+			fmt.Fprintln(out, smsPathStatusLine(*smsPath))
+		}
 		return nil
 	}
 	fmt.Fprintln(out)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -115,8 +116,27 @@ func TestRunStatusReportsTheSMSPath(t *testing.T) {
 	deps := statusDeps{daemon: downDaemon(t), now: func() time.Time { return now }}
 
 	text := runStatusOutput(t, session, deps, false)
-	if !strings.Contains(text, "\n⚠ Google SMS: no incoming SMS since "+fmtTS(lastSMS.UnixMilli())) {
+	line := "\n⚠ Google SMS: no incoming SMS since " + fmtTS(lastSMS.UnixMilli())
+	if !strings.Contains(text, line) {
 		t.Fatalf("status output lacks the stalled SMS-path line:\n%s", text)
+	}
+	// It is the last line, after the table and #202's silence note.
+	if note := strings.Index(text, "\nSilence "); note < 0 || note > strings.Index(text, line) ||
+		!strings.HasSuffix(strings.TrimSpace(text), "try restarting the phone.") {
+		t.Fatalf("the SMS-path line should close the output, after the silence note:\n%s", text)
+	}
+	// It reads the inbox under the caller's context: a cancelled one yields
+	// no verdict rather than a judgment of nothing.
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	var buffered strings.Builder
+	cancelledDeps := deps
+	cancelledDeps.output = &buffered
+	if err := runStatus(cancelled, session, cancelledDeps, false); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(buffered.String(), "Google SMS") {
+		t.Fatalf("a cancelled status still judged the SMS path:\n%s", buffered.String())
 	}
 	var status struct {
 		SMSPath *freshness.SMSPathReport `json:"google_sms_path"`
@@ -138,6 +158,36 @@ func TestRunStatusReportsTheSMSPath(t *testing.T) {
 	}
 }
 
+// The inbox can hold SMS and RCS frames that never became stored messages;
+// the text output then still says what --json reports.
+func TestRunStatusReportsTheSMSPathWithNoStoredMessages(t *testing.T) {
+	now := time.Now().Truncate(time.Minute)
+	lastSMS := now.Add(-50 * time.Hour)
+	dataDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dataDir, "v2"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	store, err := sqlite.Open(filepath.Join(dataDir, "v2", "store.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	receive := smsPathReceiver(t, store)
+	for i := 0; i < 30*3; i++ {
+		receive(lastSMS.Add(-time.Duration(i)*8*time.Hour), fmt.Sprintf("sms-%d", i), 1)
+	}
+	for i := 0; i < 49; i++ {
+		receive(lastSMS.Add(time.Duration(i+1)*time.Hour), fmt.Sprintf("rcs-%d", i), 4)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	session := openStatusSession(t, dataDir, true)
+	text := runStatusOutput(t, session, statusDeps{daemon: downDaemon(t), now: func() time.Time { return now }}, false)
+	if !strings.Contains(text, "No messages stored yet") || !strings.Contains(text, "⚠ Google SMS: no incoming SMS since") {
+		t.Fatalf("empty store output:\n%s", text)
+	}
+}
+
 func TestSMSPathStatusLineCoversEveryReason(t *testing.T) {
 	cfg := freshness.DefaultSMSPathConfig
 	base := freshness.NewSMSPathReport(freshness.SMSPathVerdict{
@@ -145,7 +195,8 @@ func TestSMSPathStatusLineCoversEveryReason(t *testing.T) {
 		Silence:          61 * time.Hour,
 		ArrivalsPerDay:   5.8,
 		ExpectedArrivals: 14.7,
-		BaselineSpan:     20 * 24 * time.Hour,
+		BaselineSpan:     27 * 24 * time.Hour,
+		RegularSpan:      20 * 24 * time.Hour,
 		LongGaps:         3,
 		BaselineArrivals: 40,
 	}, cfg)
@@ -155,7 +206,7 @@ func TestSMSPathStatusLineCoversEveryReason(t *testing.T) {
 		freshness.SMSPathRCSQuiet:          "not an SMS-only failure",
 		freshness.SMSPathHistoryStale:      "could not be reloaded",
 		freshness.SMSPathFlowing:           "last incoming SMS 2026-10-03 16:16 (2d)",
-		freshness.SMSPathThinBaseline:      "went a whole 24h without one 3 time(s) (allowed 1), over 20d of history (needs 21d) and 40 separate arrivals (needs 10)",
+		freshness.SMSPathThinBaseline:      "in the 28d before the last SMS it went a whole 24h without one 3 time(s) (allowed 1) and kept its usual rhythm for 20d (needs 21d), with 40 separate arrivals (needs 10)",
 		freshness.SMSPathNoHistory:         "no incoming SMS in the Google inbox",
 		freshness.SMSPathGoogleUnreachable: "no incoming SMS in the Google inbox",
 	}

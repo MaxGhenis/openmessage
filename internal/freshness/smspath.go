@@ -52,16 +52,24 @@ type SMSPathConfig struct {
 	// burst of verification codes or a group MMS counts once.
 	ArrivalGap time.Duration
 	// BaselineWindow is how much history before the last SMS the usual pace
-	// is measured on. The silence is judged only when that baseline reaches
-	// back at least MinBaselineSpan, holds at least MinBaselineArrivals
-	// arrivals, and shows the phone going a whole Window without any incoming
-	// SMS at most MaxLongGaps times. No calendar or time zone enters: a
+	// is measured on. The silence is judged only when that baseline shows a
+	// phone that texts regularly: at least MinBaselineArrivals arrivals, at
+	// most MaxLongGaps long gaps (a whole Window or more without any incoming
+	// SMS), and at least MinRegularSpan covered by the shorter gaps, the time
+	// the phone kept its usual rhythm. Long gaps never count toward
+	// MinRegularSpan, so a phone that texts in clusters with quiet days
+	// between them is not judged, however busy the clusters and however long
+	// the history reaches back. No calendar or time zone enters: a
 	// weekday-only texter goes two days without texts every weekend, wherever
-	// and whenever midnight falls, and is never judged; nor are phones that
-	// get texts rarely or in clusters days apart. One long gap is allowed so
-	// that an earlier outage does not stop the next one being caught.
+	// and whenever midnight falls, and is never judged. A phone that gets
+	// about one text a day is judged only if every gap stays under Window; at
+	// one arrival a day a stall then takes MinExpectedArrivals days to flag.
+	// One long gap, shorter than BaselineWindow minus MinRegularSpan (a week
+	// by default), is allowed so that an earlier outage does not stop the
+	// next one being caught; a longer one, or a second, withholds judgment
+	// until it leaves the baseline.
 	BaselineWindow      time.Duration
-	MinBaselineSpan     time.Duration
+	MinRegularSpan      time.Duration
 	MinBaselineArrivals int
 	MaxLongGaps         int
 	// MinRCSInWindow is how many incoming RCS messages the trailing window must
@@ -82,15 +90,16 @@ type SMSPathConfig struct {
 // frames counting only once received, the rule flags the outage about 25 hours
 // after the last SMS and nowhere before it. In simulation (texts in waking
 // hours, RCS hourly) it never fired for weekday-only texters, with or without
-// holidays, and fired zero to four times in 330 days for memoryless daily
-// texters at one to ten arrivals a day, the statistical floor for a phone
-// whose texts come at random.
+// holidays, or for phones that text in clusters with quiet days between, and
+// fired at most a few times in 330 days for memoryless daily texters at one to
+// ten arrivals a day, the statistical floor for a phone whose texts come at
+// random.
 var DefaultSMSPathConfig = SMSPathConfig{
 	Window:              24 * time.Hour,
 	MinExpectedArrivals: 6,
 	ArrivalGap:          30 * time.Minute,
 	BaselineWindow:      28 * 24 * time.Hour,
-	MinBaselineSpan:     21 * 24 * time.Hour,
+	MinRegularSpan:      21 * 24 * time.Hour,
 	MinBaselineArrivals: 10,
 	MaxLongGaps:         1,
 	MinRCSInWindow:      3,
@@ -129,12 +138,15 @@ type SMSPathVerdict struct {
 	RCSInWindow int
 	// BaselineSMS and BaselineArrivals count the incoming SMS, and the
 	// arrivals they merge into, in the baseline. BaselineSpan runs from the
-	// first of them to LastSMS, and LongGaps counts the gaps between
-	// consecutive baseline SMS that lasted a whole Window or more.
+	// first of them to LastSMS. LongGaps counts the gaps between consecutive
+	// baseline SMS that lasted a whole Window or more, and RegularSpan sums
+	// the shorter ones: the part of BaselineSpan in which the phone kept its
+	// usual rhythm.
 	BaselineSMS      int
 	BaselineArrivals int
 	BaselineSpan     time.Duration
 	LongGaps         int
+	RegularSpan      time.Duration
 	// ArrivalsPerDay is the usual pace: arrivals after the first, over the
 	// time from the first to LastSMS. ExpectedArrivals is that pace times
 	// Silence.
@@ -209,6 +221,8 @@ func EvaluateSMSPath(events []TransportEvent, now time.Time, cfg SMSPathConfig) 
 		}
 		if gap >= cfg.Window {
 			verdict.LongGaps++
+		} else {
+			verdict.RegularSpan += gap
 		}
 	}
 	if span := verdict.LastSMS.Sub(baseline[0]); span > 0 && verdict.BaselineArrivals > 1 {
@@ -217,7 +231,7 @@ func EvaluateSMSPath(events []TransportEvent, now time.Time, cfg SMSPathConfig) 
 	verdict.ExpectedArrivals = verdict.ArrivalsPerDay * verdict.Silence.Hours() / 24
 
 	if verdict.BaselineArrivals < cfg.MinBaselineArrivals ||
-		verdict.BaselineSpan < cfg.MinBaselineSpan ||
+		verdict.RegularSpan < cfg.MinRegularSpan ||
 		verdict.LongGaps > cfg.MaxLongGaps {
 		verdict.Reason = SMSPathThinBaseline
 		return verdict
@@ -258,12 +272,13 @@ type SMSPathReport struct {
 	BaselineArrivals    int     `json:"baseline_arrivals"`
 	BaselineSpanMS      int64   `json:"baseline_span_ms"`
 	LongGaps            int     `json:"long_gaps"`
+	RegularSpanMS       int64   `json:"regular_span_ms"`
 	ArrivalsPerDay      float64 `json:"arrivals_per_day"`
 	ExpectedArrivals    float64 `json:"expected_arrivals"`
 	WindowMS            int64   `json:"window_ms"`
 	MinExpectedArrivals float64 `json:"min_expected_arrivals"`
 	BaselineWindowMS    int64   `json:"baseline_window_ms"`
-	MinBaselineSpanMS   int64   `json:"min_baseline_span_ms"`
+	MinRegularSpanMS    int64   `json:"min_regular_span_ms"`
 	MaxLongGaps         int     `json:"max_long_gaps"`
 	MinBaselineArrivals int     `json:"min_baseline_arrivals"`
 	MinRCSInWindow      int     `json:"min_rcs_in_window"`
@@ -294,12 +309,13 @@ func NewSMSPathReport(verdict SMSPathVerdict, cfg SMSPathConfig) SMSPathReport {
 		BaselineArrivals:    verdict.BaselineArrivals,
 		BaselineSpanMS:      verdict.BaselineSpan.Milliseconds(),
 		LongGaps:            verdict.LongGaps,
+		RegularSpanMS:       verdict.RegularSpan.Milliseconds(),
 		ArrivalsPerDay:      math.Round(verdict.ArrivalsPerDay*100) / 100,
 		ExpectedArrivals:    math.Round(verdict.ExpectedArrivals*100) / 100,
 		WindowMS:            cfg.Window.Milliseconds(),
 		MinExpectedArrivals: cfg.MinExpectedArrivals,
 		BaselineWindowMS:    cfg.BaselineWindow.Milliseconds(),
-		MinBaselineSpanMS:   cfg.MinBaselineSpan.Milliseconds(),
+		MinRegularSpanMS:    cfg.MinRegularSpan.Milliseconds(),
 		MaxLongGaps:         cfg.MaxLongGaps,
 		MinBaselineArrivals: cfg.MinBaselineArrivals,
 		MinRCSInWindow:      cfg.MinRCSInWindow,

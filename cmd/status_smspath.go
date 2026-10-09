@@ -50,11 +50,12 @@ func smsPathStatusLine(report freshness.SMSPathReport) string {
 		return fmt.Sprintf("Google SMS: last incoming SMS %s.", since(report.LastSMSMS))
 	case freshness.SMSPathThinBaseline:
 		return fmt.Sprintf(
-			"Google SMS: not judged; before the last SMS it went a whole %s without one %d time(s) "+
-				"(allowed %d), over %s of history (needs %s) and %d separate arrivals (needs %d).",
+			"Google SMS: not judged; in the %s before the last SMS it went a whole %s without one %d time(s) "+
+				"(allowed %d) and kept its usual rhythm for %s (needs %s), with %d separate arrivals (needs %d).",
+			humanHours(time.Duration(report.BaselineWindowMS)*time.Millisecond),
 			humanHours(time.Duration(report.WindowMS)*time.Millisecond), report.LongGaps, report.MaxLongGaps,
-			humanHours(time.Duration(report.BaselineSpanMS)*time.Millisecond),
-			humanHours(time.Duration(report.MinBaselineSpanMS)*time.Millisecond),
+			humanHours(time.Duration(report.RegularSpanMS)*time.Millisecond),
+			humanHours(time.Duration(report.MinRegularSpanMS)*time.Millisecond),
 			report.BaselineArrivals, report.MinBaselineArrivals)
 	default:
 		return "Google SMS: not judged; no incoming SMS in the Google inbox."

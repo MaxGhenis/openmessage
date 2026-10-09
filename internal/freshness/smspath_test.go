@@ -55,8 +55,10 @@ func TestEvaluateSMSPathFlagsSMSSilenceWhileRCSFlows(t *testing.T) {
 	if !verdict.LastSMS.Equal(lastSMS) || verdict.Silence != 30*time.Hour {
 		t.Fatalf("last SMS %s silence %s", verdict.LastSMS, verdict.Silence)
 	}
-	if verdict.LongGaps != 0 || verdict.BaselineArrivals < 130 || verdict.BaselineSpan < 27*24*time.Hour {
-		t.Fatalf("baseline: %d long gaps, %d arrivals, span %s", verdict.LongGaps, verdict.BaselineArrivals, verdict.BaselineSpan)
+	if verdict.LongGaps != 0 || verdict.BaselineArrivals < 130 || verdict.BaselineSpan < 27*24*time.Hour ||
+		verdict.RegularSpan != verdict.BaselineSpan {
+		t.Fatalf("baseline: %d long gaps, %d arrivals, span %s, regular %s",
+			verdict.LongGaps, verdict.BaselineArrivals, verdict.BaselineSpan, verdict.RegularSpan)
 	}
 	if math.Abs(verdict.ArrivalsPerDay-5) > 0.1 || verdict.ExpectedArrivals < 6 {
 		t.Fatalf("pace %.2f/day, expected %.2f", verdict.ArrivalsPerDay, verdict.ExpectedArrivals)
@@ -174,8 +176,8 @@ func TestEvaluateSMSPathSkipsSparseOrIrregularTexters(t *testing.T) {
 			t.Errorf("%s: %+v, want %q", name, v, SMSPathThinBaseline)
 		}
 	}
-	// One SMS exactly a day goes a whole day without one every day: not
-	// judged. Two a day is judged, and 30 quiet hours are within its pace.
+	// One SMS exactly every 24 hours goes a whole day without one every day:
+	// not judged. Two a day is judged, and 30 quiet hours are within its pace.
 	var daily, twice []time.Time
 	for d := 0; d < 30; d++ {
 		daily = append(daily, lastSMS.Add(-time.Duration(d)*24*time.Hour))
@@ -186,6 +188,72 @@ func TestEvaluateSMSPathSkipsSparseOrIrregularTexters(t *testing.T) {
 	}
 	if v := EvaluateSMSPath(sms(twice), now, testSMSPathConfig); v.Stalled || v.Reason != SMSPathUsualPace {
 		t.Errorf("two SMS a day, 30h quiet: %+v, want %q", v, SMSPathUsualPace)
+	}
+}
+
+// Intended: one SMS a day whose every gap stays under a day (each a minute
+// earlier than the last, the review round 5 probe) never goes a whole day
+// without one, so it is judged, at its pace of one arrival a day: six quiet
+// days flag it, five do not.
+func TestEvaluateSMSPathJudgesADailyTexterWhoseGapsStayUnderADay(t *testing.T) {
+	lastSMS := time.Date(2026, 3, 13, 12, 0, 0, 0, time.UTC)
+	var events []TransportEvent
+	for d := 0; d < 30; d++ {
+		events = append(events, TransportEvent{At: lastSMS.Add(-time.Duration(d) * (24*time.Hour - time.Minute)), Transport: TransportSMS})
+	}
+	for at := lastSMS.Add(time.Hour); at.Before(lastSMS.Add(8 * 24 * time.Hour)); at = at.Add(time.Hour) {
+		events = append(events, TransportEvent{At: at, Transport: TransportRCS})
+	}
+	if v := EvaluateSMSPath(events, lastSMS.Add(5*24*time.Hour), testSMSPathConfig); v.Reason != SMSPathUsualPace || v.LongGaps != 0 {
+		t.Fatalf("five quiet days: %+v, want %q with no long gaps", v, SMSPathUsualPace)
+	}
+	if v := EvaluateSMSPath(events, lastSMS.Add(7*24*time.Hour), testSMSPathConfig); !v.Stalled || math.Abs(v.ArrivalsPerDay-1) > 0.01 {
+		t.Fatalf("seven quiet days: %+v, want stalled at about one arrival a day", v)
+	}
+}
+
+// A phone that texts in busy clusters with quiet spells of days between them
+// is never judged: the quiet spells are long gaps, which never count as time
+// spent texting regularly, however busy the clusters and however far back the
+// history reaches. Review round 5 found the previous gate, which measured the
+// whole span, flagging the probe below in every quiet spell.
+func TestEvaluateSMSPathNeverJudgesClusteredTexters(t *testing.T) {
+	// The review's probe: six 27-day cycles, each nine days with SMS at 08:00,
+	// 11:00, 14:00, 17:00 and 20:00 UTC, the current cluster March 5-13.
+	current := time.Date(2026, 3, 5, 0, 0, 0, 0, time.UTC)
+	var events []TransportEvent
+	for k := 0; k < 6; k++ {
+		start := current.AddDate(0, 0, -27*k)
+		events = append(events, smsDailyTraffic(start, start.AddDate(0, 0, 9).Add(-time.Minute))...)
+	}
+	now := time.Date(2026, 3, 17, 20, 0, 0, 0, time.UTC)
+	probe := append(append([]TransportEvent(nil), events...),
+		TransportEvent{At: now.Add(-2 * time.Hour), Transport: TransportRCS},
+		TransportEvent{At: now.Add(-time.Hour), Transport: TransportRCS},
+		TransportEvent{At: now, Transport: TransportRCS})
+	// One long gap is allowed; the regular span (nine days) is what fails.
+	if v := EvaluateSMSPath(probe, now, testSMSPathConfig); v.Evaluated || v.Stalled || v.LongGaps != 1 ||
+		v.RegularSpan > 9*24*time.Hour || v.BaselineSpan < 27*24*time.Hour {
+		t.Fatalf("review's cluster probe: %+v, want unjudged on nine regular days of a 27-day span", v)
+	}
+	last := current.AddDate(0, 0, 27)
+	for at := current.AddDate(0, 0, -27*5); at.Before(last); at = at.Add(time.Hour) {
+		events = append(events, TransportEvent{At: at.Add(30 * time.Minute), Transport: TransportRCS})
+	}
+	if n := countEpisodes(events, current.AddDate(0, 0, -27*4), last, time.Hour, testSMSPathConfig); n != 0 {
+		t.Fatalf("27-day clusters: %d false episodes", n)
+	}
+
+	// The review's anchor probe: one SMS 27 days back, then nine busy days.
+	lastSMS := time.Date(2026, 3, 13, 20, 0, 0, 0, time.UTC)
+	anchored := []TransportEvent{{At: lastSMS.AddDate(0, 0, -27), Transport: TransportSMS}}
+	anchored = append(anchored, smsDailyTraffic(lastSMS.AddDate(0, 0, -9), lastSMS)...)
+	now = lastSMS.Add(4 * 24 * time.Hour)
+	for at := now.Add(-24 * time.Hour); !at.After(now); at = at.Add(time.Hour) {
+		anchored = append(anchored, TransportEvent{At: at, Transport: TransportRCS})
+	}
+	if v := EvaluateSMSPath(anchored, now, testSMSPathConfig); v.Evaluated || v.Stalled || v.LongGaps != 1 {
+		t.Fatalf("anchor plus nine busy days: %+v, want unjudged despite one long gap and a 27-day span", v)
 	}
 }
 
@@ -290,32 +358,63 @@ func TestEvaluateSMSPathFalseAlarmRateForMemorylessTexters(t *testing.T) {
 	}
 }
 
-// A four-day outage ends; ten days later SMS stops again. The first outage's
-// quiet days stay inside the 28-day baseline, but 24 of 28 days still had
-// SMS, and the second outage is flagged within a day and a half.
-func TestEvaluateSMSPathAnEarlierOutageDoesNotBlockTheNext(t *testing.T) {
-	firstStart := time.Date(2026, 10, 3, 20, 0, 0, 0, time.UTC)
-	recovery := firstStart.Add(4 * 24 * time.Hour)
-	secondLast := recovery.Add(10 * 24 * time.Hour)
-	events := smsDailyTraffic(firstStart.Add(-30*24*time.Hour), firstStart)
-	events = append(events, smsDailyTraffic(recovery, secondLast.Add(time.Minute))...)
-	for at := firstStart; at.Before(secondLast.Add(3 * 24 * time.Hour)); at = at.Add(30 * time.Minute) {
-		events = append(events, TransportEvent{At: at, Transport: TransportRCS})
-	}
-	var first time.Time
-	var lastVerdict SMSPathVerdict
-	for now := secondLast; now.Before(secondLast.Add(3 * 24 * time.Hour)); now = now.Add(15 * time.Minute) {
-		lastVerdict = EvaluateSMSPath(events, now, testSMSPathConfig)
-		if lastVerdict.Stalled {
-			first = now
-			break
+// firstStall walks the clock from lastSMS in 15-minute steps for three days
+// and returns the first stalled verdict, if any.
+func firstStall(events []TransportEvent, lastSMS time.Time) (time.Time, SMSPathVerdict) {
+	var verdict SMSPathVerdict
+	for now := lastSMS; now.Before(lastSMS.Add(3 * 24 * time.Hour)); now = now.Add(15 * time.Minute) {
+		if verdict = EvaluateSMSPath(events, now, testSMSPathConfig); verdict.Stalled {
+			return now, verdict
 		}
 	}
-	if first.IsZero() {
-		t.Fatalf("second outage never flagged: %+v", lastVerdict)
+	return time.Time{}, verdict
+}
+
+// outagesThenSilence returns heavy daily traffic with an outage of each given
+// length (each followed by ten days of traffic), then SMS silence from the
+// returned last SMS while RCS arrives every 30 minutes throughout.
+func outagesThenSilence(outages ...time.Duration) ([]TransportEvent, time.Time) {
+	at := time.Date(2026, 9, 1, 20, 0, 0, 0, time.UTC)
+	events := smsDailyTraffic(at.Add(-30*24*time.Hour), at)
+	for _, length := range outages {
+		resume := at.Add(length)
+		at = resume.Add(10 * 24 * time.Hour)
+		events = append(events, smsDailyTraffic(resume, at.Add(time.Minute))...)
 	}
-	if lastSMS := lastVerdict.LastSMS; first.Sub(lastSMS) > 36*time.Hour {
-		t.Fatalf("second outage flagged %s after its last SMS, want within 36h", first.Sub(lastSMS))
+	for rcs := at.Add(-60 * 24 * time.Hour); rcs.Before(at.Add(3 * 24 * time.Hour)); rcs = rcs.Add(30 * time.Minute) {
+		events = append(events, TransportEvent{At: rcs, Transport: TransportRCS})
+	}
+	return events, at
+}
+
+// A four-day outage ends; ten days later SMS stops again. The first outage is
+// the baseline's one allowed long gap, 24 of its 28 days are regular, and the
+// second outage is flagged within a day and a half.
+func TestEvaluateSMSPathAnEarlierOutageDoesNotBlockTheNext(t *testing.T) {
+	events, lastSMS := outagesThenSilence(4 * 24 * time.Hour)
+	first, verdict := firstStall(events, lastSMS)
+	if first.IsZero() {
+		t.Fatalf("second outage never flagged: %+v", verdict)
+	}
+	if first.Sub(lastSMS) > 36*time.Hour || verdict.LongGaps != 1 {
+		t.Fatalf("second outage flagged %s after its last SMS (%+v), want within 36h with one long gap", first.Sub(lastSMS), verdict)
+	}
+}
+
+// Intended limits of the one allowance: an earlier outage of a week or more
+// leaves under 21 regular days in the baseline, and two earlier outages are
+// two long gaps, so the next outage is withheld until the earlier ones leave
+// the 28-day baseline.
+func TestEvaluateSMSPathWithholdsAfterALongOrSecondEarlierOutage(t *testing.T) {
+	for name, outages := range map[string][]time.Duration{
+		"an eight-day outage":  {8 * 24 * time.Hour},
+		"two four-day outages": {4 * 24 * time.Hour, 4 * 24 * time.Hour},
+		"two two-day outages":  {2 * 24 * time.Hour, 2 * 24 * time.Hour},
+	} {
+		events, lastSMS := outagesThenSilence(outages...)
+		if first, verdict := firstStall(events, lastSMS); !first.IsZero() || verdict.Reason != SMSPathThinBaseline {
+			t.Errorf("after %s: stalled at %s (%+v), want %q", name, first, verdict, SMSPathThinBaseline)
+		}
 	}
 }
 
@@ -471,7 +570,7 @@ func randomConfig(r *rand.Rand) SMSPathConfig {
 		MinExpectedArrivals: float64(r.IntN(10)),
 		ArrivalGap:          time.Duration(r.IntN(120)) * time.Minute,
 		BaselineWindow:      time.Duration(1+r.IntN(35)) * 24 * time.Hour,
-		MinBaselineSpan:     time.Duration(r.IntN(30)) * 24 * time.Hour,
+		MinRegularSpan:      time.Duration(r.IntN(30)) * 24 * time.Hour,
 		MinBaselineArrivals: r.IntN(15),
 		MaxLongGaps:         r.IntN(4),
 		MinRCSInWindow:      r.IntN(6),
@@ -511,46 +610,70 @@ func outageShaped(r *rand.Rand, now time.Time) []TransportEvent {
 }
 
 // referenceSMSPathStalled restates the stalled rule as directly as possible,
-// sharing no code with EvaluateSMSPath, for a differential check.
+// sharing no code or structure with EvaluateSMSPath, for a differential check.
+// It never sorts: each distinct baseline SMS time finds its predecessor by
+// scanning every other one, and the regular span is the baseline span minus
+// the long gaps, not a running sum of the short ones.
 func referenceSMSPathStalled(events []TransportEvent, now time.Time, cfg SMSPathConfig) bool {
-	var sms, rcs []time.Time
+	var last, newestRCS time.Time
+	rcsInWindow := 0
 	for _, e := range events {
 		if e.At.After(now) {
 			continue
 		}
-		if e.Transport == TransportSMS {
-			sms = append(sms, e.At)
-		} else if e.Transport == TransportRCS {
-			rcs = append(rcs, e.At)
+		switch e.Transport {
+		case TransportSMS:
+			if e.At.After(last) {
+				last = e.At
+			}
+		case TransportRCS:
+			if now.Sub(e.At) < cfg.Window {
+				rcsInWindow++
+			}
+			if e.At.After(newestRCS) {
+				newestRCS = e.At
+			}
 		}
 	}
-	if len(sms) == 0 {
+	if last.IsZero() {
 		return false
 	}
-	sort.Slice(sms, func(i, j int) bool { return sms[i].Before(sms[j]) })
-	last := sms[len(sms)-1]
-	var base []time.Time
-	for _, at := range sms {
-		if last.Sub(at) < cfg.BaselineWindow {
-			base = append(base, at)
+	base := map[int64]time.Time{}
+	for _, e := range events {
+		if e.Transport == TransportSMS && !e.At.After(now) && last.Sub(e.At) < cfg.BaselineWindow {
+			base[e.At.UnixNano()] = e.At
+		}
+	}
+	first := last
+	for _, at := range base {
+		if at.Before(first) {
+			first = at
 		}
 	}
 	arrivals, long := 0, 0
-	for i := range base {
-		if i == 0 {
-			arrivals++
+	var longTotal time.Duration
+	for _, at := range base {
+		var prev time.Time
+		for _, other := range base {
+			if other.Before(at) && other.After(prev) {
+				prev = other
+			}
+		}
+		if prev.IsZero() {
+			arrivals++ // the first baseline SMS
 			continue
 		}
-		gap := base[i].Sub(base[i-1])
+		gap := at.Sub(prev)
 		if gap > cfg.ArrivalGap {
 			arrivals++
 		}
 		if gap >= cfg.Window {
 			long++
+			longTotal += gap
 		}
 	}
-	span := last.Sub(base[0])
-	if arrivals < cfg.MinBaselineArrivals || span < cfg.MinBaselineSpan || long > cfg.MaxLongGaps {
+	span := last.Sub(first)
+	if arrivals < cfg.MinBaselineArrivals || span-longTotal < cfg.MinRegularSpan || long > cfg.MaxLongGaps {
 		return false
 	}
 	silence := now.Sub(last)
@@ -561,20 +684,8 @@ func referenceSMSPathStalled(events []TransportEvent, now time.Time, cfg SMSPath
 	if arrivals > 1 && span > 0 {
 		expected = float64(arrivals-1) / span.Hours() * silence.Hours()
 	}
-	if expected < cfg.MinExpectedArrivals {
-		return false
-	}
-	in := 0
-	var newest time.Time
-	for _, at := range rcs {
-		if at.After(now.Add(-cfg.Window)) {
-			in++
-		}
-		if at.After(newest) {
-			newest = at
-		}
-	}
-	return in >= cfg.MinRCSInWindow && !newest.IsZero() && now.Sub(newest) <= cfg.RCSRecency
+	return expected >= cfg.MinExpectedArrivals &&
+		rcsInWindow >= cfg.MinRCSInWindow && !newestRCS.IsZero() && now.Sub(newestRCS) <= cfg.RCSRecency
 }
 
 // TestEvaluateSMSPathMatchesTheReferenceRule compares EvaluateSMSPath with the
@@ -626,7 +737,7 @@ func TestEvaluateSMSPathProperties(t *testing.T) {
 			if !verdict.Evaluated ||
 				verdict.Silence < cfg.Window ||
 				verdict.ExpectedArrivals < cfg.MinExpectedArrivals ||
-				verdict.BaselineSpan < cfg.MinBaselineSpan ||
+				verdict.RegularSpan < cfg.MinRegularSpan ||
 				verdict.LongGaps > cfg.MaxLongGaps ||
 				verdict.BaselineArrivals < cfg.MinBaselineArrivals ||
 				verdict.RCSInWindow < cfg.MinRCSInWindow ||
@@ -640,7 +751,15 @@ func TestEvaluateSMSPathProperties(t *testing.T) {
 			t.Fatalf("case %d: inconsistent verdict %+v", i, verdict)
 		}
 		if verdict.BaselineArrivals > verdict.BaselineSMS || verdict.LongGaps >= verdict.BaselineSMS && verdict.BaselineSMS > 0 {
-			t.Fatalf("case %d: more arrivals or days than SMS: %+v", i, verdict)
+			t.Fatalf("case %d: more arrivals or long gaps than SMS: %+v", i, verdict)
+		}
+		// The regular span is the baseline span less the long gaps, each of
+		// which lasts at least a Window.
+		if verdict.RegularSpan < 0 ||
+			verdict.RegularSpan > verdict.BaselineSpan-time.Duration(verdict.LongGaps)*cfg.Window ||
+			verdict.LongGaps == 0 && verdict.RegularSpan != verdict.BaselineSpan {
+			t.Fatalf("case %d: regular span %s against span %s with %d long gaps of at least %s",
+				i, verdict.RegularSpan, verdict.BaselineSpan, verdict.LongGaps, cfg.Window)
 		}
 
 		// Order does not matter.
@@ -660,7 +779,8 @@ func TestEvaluateSMSPathProperties(t *testing.T) {
 		}
 		got := EvaluateSMSPath(moved, smsPathNow.Add(shift), cfg)
 		if got.Stalled != verdict.Stalled || got.Reason != verdict.Reason || got.Silence != verdict.Silence ||
-			got.LongGaps != verdict.LongGaps || got.BaselineArrivals != verdict.BaselineArrivals {
+			got.LongGaps != verdict.LongGaps || got.BaselineArrivals != verdict.BaselineArrivals ||
+			got.RegularSpan != verdict.RegularSpan {
 			t.Fatalf("case %d: shifted verdict %+v != %+v", i, got, verdict)
 		}
 
