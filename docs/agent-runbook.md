@@ -163,6 +163,11 @@ OPENMESSAGES_DATA_DIR="$HOME/Library/Application Support/OpenMessage" \
 is any copy of `v2/store.sqlite3` taken before the reset (the app-support dir
 snapshots agents take before support work are exactly this); without it the
 repair still re-files messages but cannot restore overwritten titles/rosters.
+The restore considers the threads whose `updated_at_ms` is at or after
+`--since`. Ingest moves that time only when a snapshot changes the thread's
+kind, title, revision or roster (a re-sent identical snapshot writes
+nothing), so every thread a re-keyed snapshot overwrote in the window is
+listed, and one that was merely re-sent there is not.
 Outgoing-only windows are reported as `ambiguous` and left in place: a
 message frame carries no recipient, so nothing proves where an outbound text
 belongs until the thread's ConversationEvent re-binds the id.
@@ -1009,11 +1014,24 @@ memory, so a quarantine cause from hours ago is gone. Capture live:
 ```
 
 To reproduce a quarantine offline, copy `v2/store.sqlite3` with its `-wal` and
-`-shm` files, take the account's frames from the window before the alert, and
-feed them through a worker built with that codec's real decoder. Model it on
-`newGoogleEchoHarness` in `internal/ingest/google_echo_e2e_test.go`; the
-harness in `worker_paths_test.go` uses a fake decoder. The frames that fail
-are the quarantined ones. No ready-made replay test exists.
+`-shm` files and replay the copy's inbox through the real decoders with the
+opt-in harness in `internal/ingest/replay_harness_test.go`. It rebuilds a
+fresh store frame by frame, in receipt order, with the clock pinned to each
+frame's receipt time, and writes the per-account counters (`quarantined`
+among them) and row-write counts to a JSON file; `OM_REPLAY_LOG=1` prints the
+worker's log, which names each quarantined frame and its cause. Never point it
+at the live store (it refuses the app-support path):
+
+```bash
+mkdir -p /tmp/om-copy && cp "$HOME/Library/Application Support/OpenMessage/v2/"store.sqlite3* /tmp/om-copy/
+OM_REPLAY_SOURCE=/tmp/om-copy/store.sqlite3 OM_REPLAY_OUT=/tmp/om-replay.sqlite3 \
+OM_REPLAY_METRICS=/tmp/om-replay.json OM_REPLAY_CODECS=google.protobuf OM_REPLAY_LOG=1 \
+GOWORK=off go test -tags replayharness -run 'TestReplayInboxCorpus$' -timeout 60m ./internal/ingest/
+```
+
+Run it at two commits and compare the outputs with `TestReplayStoresMatch`
+(`OM_REPLAY_A`, `OM_REPLAY_B`, `OM_REPLAY_IGNORE=table.column,…`) to check
+that an ingest change leaves real traffic's result unchanged.
 
 ### Parking the launchd watchdog
 
@@ -1587,3 +1605,20 @@ It sends nothing. Add `whatsapp` or `signal` to the comma-separated
 `LIVE_PLATFORMS` list only when that platform will receive a real frame within
 the test deadline; use `LIVE_GOOGLE_CONV`, `LIVE_WHATSAPP_CONV`, or
 `LIVE_SIGNAL_CONV` to override the expected self-thread remote ID.
+
+### Deferred frames
+
+A frame whose projection still gets `SQLITE_BUSY`/`SQLITE_LOCKED` after the
+worker's four quick attempts (5, 10 and 20 ms apart; a busy attempt first
+waits up to the store's 5 s busy timeout) is deferred, not dropped. It stays
+unprocessed in the inbox, `v2_ingest.per_account.<account>.deferred` counts
+the deferral, and the worker tries it again 1 s later, doubling per failure up
+to 5 min. The worker wakes for that retry by itself, without waiting for new
+traffic. Newer frames keep projecting past it meanwhile. Until its retry is
+due, a drain touches a deferred frame only to confirm it is still unprocessed
+(one inbox row read, plus its overflow pages when the payload spills past a
+page), with no decode or apply. A restart forgets the backoff and retries
+every unprocessed frame at once. A rising `deferred` means something holds
+the store's write lock for seconds at a time (for example another
+`openmessage` process opening the store while it applies a pending
+migration): find the holder rather than restarting the app.

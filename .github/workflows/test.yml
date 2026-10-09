@@ -28,6 +28,9 @@ jobs:
       - name: Run Go test suite with coverage
         run: go test ./... -coverprofile=coverage.out
 
+      - name: Vet the opt-in ingest replay harness
+        run: go vet -tags replayharness ./internal/ingest/
+
       - name: Summarize Go coverage
         run: |
           go tool cover -func=coverage.out | tee coverage.txt

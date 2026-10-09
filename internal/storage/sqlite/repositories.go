@@ -285,7 +285,9 @@ const identityColumns = `
 
 // UpsertIdentity inserts an identity or updates the row with the same account,
 // kind, and canonical value. A natural-key conflict retains the existing
-// identity ID and creation timestamp.
+// identity ID and creation timestamp, and writes nothing (updated_at_ms
+// included) when the raw value, display name, self flag and metadata already
+// match: updated_at_ms is the time of the last change, not the last refresh.
 func (s *Store) UpsertIdentity(identity Identity) error {
 	_, err := s.db.ExecContext(context.Background(), `
 		INSERT INTO identities (
@@ -306,6 +308,10 @@ func (s *Store) UpsertIdentity(identity Identity) error {
 			is_self = excluded.is_self,
 			metadata_json = excluded.metadata_json,
 			updated_at_ms = excluded.updated_at_ms
+		WHERE identities.raw_value IS NOT excluded.raw_value
+		   OR identities.display_name IS NOT excluded.display_name
+		   OR identities.is_self IS NOT excluded.is_self
+		   OR identities.metadata_json IS NOT excluded.metadata_json
 	`,
 		identity.IdentityID,
 		identity.AccountID,
@@ -630,7 +636,8 @@ const conversationColumns = `
 
 // UpsertConversation inserts a conversation or updates the row with the same
 // account and remote conversation ID. A natural-key conflict retains the
-// existing conversation ID and creation timestamp.
+// existing conversation ID and creation timestamp, and writes nothing
+// (updated_at_ms included) when every other column already matches.
 func (s *Store) UpsertConversation(conversation Conversation) error {
 	_, err := s.db.ExecContext(context.Background(), `
 		INSERT INTO conversations (
@@ -658,6 +665,14 @@ func (s *Store) UpsertConversation(conversation Conversation) error {
 			last_message_at_ms = excluded.last_message_at_ms,
 			metadata_json = excluded.metadata_json,
 			updated_at_ms = excluded.updated_at_ms
+		WHERE conversations.kind IS NOT excluded.kind
+		   OR conversations.title IS NOT excluded.title
+		   OR conversations.remote_revision IS NOT excluded.remote_revision
+		   OR conversations.notification_mode IS NOT excluded.notification_mode
+		   OR conversations.is_favorite IS NOT excluded.is_favorite
+		   OR conversations.archived_at_ms IS NOT excluded.archived_at_ms
+		   OR conversations.last_message_at_ms IS NOT excluded.last_message_at_ms
+		   OR conversations.metadata_json IS NOT excluded.metadata_json
 	`,
 		conversation.ConversationID,
 		conversation.AccountID,
@@ -860,14 +875,36 @@ const participantColumns = `
 // ReplaceConversationParticipants atomically replaces every typed participant
 // row for a conversation. Empty account and conversation IDs in an input row
 // are filled from the target conversation; contradictory IDs are rejected.
+// Only rows that differ are written (see SyncConversationParticipants).
 func (s *Store) ReplaceConversationParticipants(
 	conversationID string,
 	participants []ConversationParticipant,
 ) error {
+	_, err := s.SyncConversationParticipants(conversationID, participants, 0)
+	return err
+}
+
+// SyncConversationParticipants makes a conversation's participant rows exactly
+// participants, with ReplaceConversationParticipants' validation and errors,
+// but writes only the difference: rows no longer listed are deleted, changed
+// rows updated, new rows inserted, and a roster that already matches is read
+// without taking the write lock. changed reports whether any row was written.
+// When it was and touchedAtMS is positive, the conversation's updated_at_ms
+// advances to at least touchedAtMS in the same transaction, so a roster change
+// still moves the conversation's update time when its own row is unchanged.
+func (s *Store) SyncConversationParticipants(
+	conversationID string,
+	participants []ConversationParticipant,
+	touchedAtMS int64,
+) (changed bool, err error) {
 	ctx := context.Background()
+	if s.participantRosterMatches(ctx, conversationID, participants) {
+		return false, nil
+	}
+
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("replace participants for conversation %q: begin transaction: %w", conversationID, err)
+		return false, fmt.Errorf("replace participants for conversation %q: begin transaction: %w", conversationID, err)
 	}
 	defer tx.Rollback()
 
@@ -877,22 +914,38 @@ func (s *Store) ReplaceConversationParticipants(
 		`SELECT account_id FROM conversations WHERE conversation_id = ?`,
 		conversationID,
 	).Scan(&conversationAccountID); errors.Is(err, sql.ErrNoRows) {
-		return notFound("conversation", conversationID)
+		return false, notFound("conversation", conversationID)
 	} else if err != nil {
-		return fmt.Errorf("replace participants for conversation %q: read account: %w", conversationID, err)
+		return false, fmt.Errorf("replace participants for conversation %q: read account: %w", conversationID, err)
 	}
 
-	if _, err := tx.ExecContext(
-		ctx,
-		`DELETE FROM conversation_participants WHERE conversation_id = ?`,
-		conversationID,
-	); err != nil {
-		return fmt.Errorf("replace participants for conversation %q: delete existing rows: %w", conversationID, err)
+	existing, err := listParticipantsByIdentity(ctx, tx, conversationID)
+	if err != nil {
+		return false, fmt.Errorf("replace participants for conversation %q: read existing rows: %w", conversationID, err)
+	}
+	listed := make(map[string]struct{}, len(participants))
+	for _, participant := range participants {
+		listed[participant.IdentityID] = struct{}{}
+	}
+	for identityID := range existing {
+		if _, keep := listed[identityID]; keep {
+			continue
+		}
+		if _, err := tx.ExecContext(
+			ctx,
+			`DELETE FROM conversation_participants WHERE conversation_id = ? AND identity_id = ?`,
+			conversationID,
+			identityID,
+		); err != nil {
+			return false, fmt.Errorf("replace participants for conversation %q: delete existing rows: %w", conversationID, err)
+		}
+		changed = true
 	}
 
+	seen := make(map[string]struct{}, len(participants))
 	for i, participant := range participants {
 		if participant.ConversationID != "" && participant.ConversationID != conversationID {
-			return invalidParticipantError(
+			return false, invalidParticipantError(
 				nil,
 				"participant %d names conversation %q while replacing %q",
 				i,
@@ -906,7 +959,7 @@ func (s *Store) ReplaceConversationParticipants(
 			accountID = conversationAccountID
 		}
 		if accountID != conversationAccountID {
-			return invalidParticipantError(
+			return false, invalidParticipantError(
 				ErrCrossAccountParticipant,
 				"participant %d account %q does not match conversation account %q",
 				i,
@@ -914,81 +967,257 @@ func (s *Store) ReplaceConversationParticipants(
 				conversationAccountID,
 			)
 		}
+		participant.AccountID = accountID
+		participant.ConversationID = conversationID
 
-		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO conversation_participants (
-				account_id,
-				conversation_id,
-				identity_id,
-				role,
-				display_name,
-				is_active,
-				joined_at_ms,
-				left_at_ms
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-		`,
-			accountID,
-			conversationID,
-			participant.IdentityID,
-			participant.Role,
-			participant.DisplayName,
-			participant.IsActive,
-			participant.JoinedAtMS,
-			participant.LeftAtMS,
-		); err != nil {
-			if isSQLiteErrorCode(err, sqliteConstraintForeignKeyCode) {
-				specific, classifyErr := classifyParticipantForeignKey(
-					ctx,
-					tx,
-					conversationAccountID,
-					participant.IdentityID,
-				)
-				if classifyErr != nil {
-					return fmt.Errorf(
-						"replace participants for conversation %q: classify participant %d constraint: %w",
-						conversationID,
-						i,
-						classifyErr,
-					)
-				}
-				return invalidParticipantConstraintError(
-					specific,
-					err,
-					"insert participant %d identity %q",
-					i,
-					participant.IdentityID,
-				)
-			}
-			if isSQLiteConstraint(err) {
-				return invalidParticipantConstraintError(
-					nil,
-					err,
-					"insert participant %d identity %q",
-					i,
-					participant.IdentityID,
-				)
-			}
-			return fmt.Errorf(
-				"replace participants for conversation %q: insert participant %d: %w",
+		_, duplicate := seen[participant.IdentityID]
+		seen[participant.IdentityID] = struct{}{}
+		current, exists := existing[participant.IdentityID]
+		var writeErr error
+		switch {
+		case !duplicate && exists && sameParticipantRow(current, participant):
+			continue
+		case !duplicate && exists:
+			_, writeErr = tx.ExecContext(ctx, `
+				UPDATE conversation_participants
+				SET role = ?, display_name = ?, is_active = ?, joined_at_ms = ?, left_at_ms = ?
+				WHERE conversation_id = ? AND identity_id = ?
+			`,
+				participant.Role,
+				participant.DisplayName,
+				participant.IsActive,
+				participant.JoinedAtMS,
+				participant.LeftAtMS,
 				conversationID,
-				i,
-				err,
+				participant.IdentityID,
+			)
+		default:
+			// A new identity, or a repeat of one already written: the plain
+			// insert fails on the primary key for a repeat, exactly as a
+			// delete-and-reinsert replacement does.
+			_, writeErr = tx.ExecContext(ctx, `
+				INSERT INTO conversation_participants (
+					account_id,
+					conversation_id,
+					identity_id,
+					role,
+					display_name,
+					is_active,
+					joined_at_ms,
+					left_at_ms
+				) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+			`,
+				accountID,
+				conversationID,
+				participant.IdentityID,
+				participant.Role,
+				participant.DisplayName,
+				participant.IsActive,
+				participant.JoinedAtMS,
+				participant.LeftAtMS,
 			)
 		}
+		if writeErr != nil {
+			return false, participantWriteError(ctx, tx, conversationID, conversationAccountID, i, participant.IdentityID, writeErr)
+		}
+		changed = true
 	}
 
+	if !changed {
+		return false, nil
+	}
+	if touchedAtMS > 0 {
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE conversations
+			SET updated_at_ms = ?
+			WHERE conversation_id = ? AND updated_at_ms < ?
+		`, touchedAtMS, conversationID, touchedAtMS); err != nil {
+			return false, fmt.Errorf("replace participants for conversation %q: touch conversation: %w", conversationID, err)
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		if isSQLiteErrorCode(err, sqliteConstraintForeignKeyCode) {
-			return fmt.Errorf(
+			return false, fmt.Errorf(
 				"%w: %w: commit participant replacement: %w",
 				ErrInvalidConversationParticipant,
 				ErrConstraintViolation,
 				err,
 			)
 		}
-		return fmt.Errorf("replace participants for conversation %q: commit: %w", conversationID, err)
+		return false, fmt.Errorf("replace participants for conversation %q: commit: %w", conversationID, err)
 	}
-	return nil
+	return true, nil
+}
+
+// participantRosterMatches reports, without a write transaction, whether the
+// conversation exists and its rows already equal a well-formed participants
+// list. Anything else (a missing conversation, an input the transaction would
+// reject, a read error, a difference) reports false and leaves the decision
+// and any error to the transaction.
+func (s *Store) participantRosterMatches(
+	ctx context.Context,
+	conversationID string,
+	participants []ConversationParticipant,
+) bool {
+	// One statement, so the account and the roster come from one snapshot.
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT c.account_id, p.identity_id, p.role, p.display_name, p.is_active,
+		       p.joined_at_ms, p.left_at_ms
+		FROM conversations c
+		LEFT JOIN conversation_participants p ON p.conversation_id = c.conversation_id
+		WHERE c.conversation_id = ?
+	`, conversationID)
+	if err != nil {
+		return false
+	}
+	conversationAccountID := ""
+	existing := make(map[string]ConversationParticipant)
+	found := false
+	for rows.Next() {
+		var identityID, role, displayName sql.NullString
+		var isActive sql.NullBool
+		var current ConversationParticipant
+		if err := rows.Scan(
+			&conversationAccountID,
+			&identityID,
+			&role,
+			&displayName,
+			&isActive,
+			&current.JoinedAtMS,
+			&current.LeftAtMS,
+		); err != nil {
+			_ = rows.Close()
+			return false
+		}
+		found = true
+		if !identityID.Valid {
+			continue
+		}
+		current.AccountID = conversationAccountID
+		current.ConversationID = conversationID
+		current.IdentityID = identityID.String
+		current.Role = ParticipantRole(role.String)
+		current.DisplayName = displayName.String
+		current.IsActive = isActive.Bool
+		existing[current.IdentityID] = current
+	}
+	if rows.Err() != nil || rows.Close() != nil || !found || len(existing) != len(participants) {
+		return false
+	}
+	for _, participant := range participants {
+		if participant.ConversationID != "" && participant.ConversationID != conversationID {
+			return false
+		}
+		if participant.AccountID != "" && participant.AccountID != conversationAccountID {
+			return false
+		}
+		participant.AccountID = conversationAccountID
+		participant.ConversationID = conversationID
+		current, exists := existing[participant.IdentityID]
+		if !exists || !sameParticipantRow(current, participant) {
+			return false
+		}
+		// Each identity may match once; a repeat is an input error.
+		delete(existing, participant.IdentityID)
+	}
+	return true
+}
+
+type participantQueryer interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}
+
+func listParticipantsByIdentity(
+	ctx context.Context,
+	queryer participantQueryer,
+	conversationID string,
+) (map[string]ConversationParticipant, error) {
+	rows, err := queryer.QueryContext(ctx, "SELECT "+participantColumns+`
+		FROM conversation_participants
+		WHERE conversation_id = ?`,
+		conversationID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	participants, err := collectRows(rows, scanConversationParticipant)
+	if err != nil {
+		return nil, err
+	}
+	byIdentity := make(map[string]ConversationParticipant, len(participants))
+	for _, participant := range participants {
+		byIdentity[participant.IdentityID] = participant
+	}
+	return byIdentity, nil
+}
+
+func sameParticipantRow(left, right ConversationParticipant) bool {
+	return left.AccountID == right.AccountID &&
+		left.ConversationID == right.ConversationID &&
+		left.IdentityID == right.IdentityID &&
+		left.Role == right.Role &&
+		left.DisplayName == right.DisplayName &&
+		left.IsActive == right.IsActive &&
+		optionalInt64Equal(left.JoinedAtMS, right.JoinedAtMS) &&
+		optionalInt64Equal(left.LeftAtMS, right.LeftAtMS)
+}
+
+func optionalInt64Equal(left, right *int64) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return *left == *right
+}
+
+// participantWriteError classifies a failed participant insert or update the
+// way a replacement always has.
+func participantWriteError(
+	ctx context.Context,
+	tx *sql.Tx,
+	conversationID string,
+	conversationAccountID string,
+	index int,
+	identityID string,
+	err error,
+) error {
+	if isSQLiteErrorCode(err, sqliteConstraintForeignKeyCode) {
+		specific, classifyErr := classifyParticipantForeignKey(
+			ctx,
+			tx,
+			conversationAccountID,
+			identityID,
+		)
+		if classifyErr != nil {
+			return fmt.Errorf(
+				"replace participants for conversation %q: classify participant %d constraint: %w",
+				conversationID,
+				index,
+				classifyErr,
+			)
+		}
+		return invalidParticipantConstraintError(
+			specific,
+			err,
+			"insert participant %d identity %q",
+			index,
+			identityID,
+		)
+	}
+	if isSQLiteConstraint(err) {
+		return invalidParticipantConstraintError(
+			nil,
+			err,
+			"insert participant %d identity %q",
+			index,
+			identityID,
+		)
+	}
+	return fmt.Errorf(
+		"replace participants for conversation %q: insert participant %d: %w",
+		conversationID,
+		index,
+		err,
+	)
 }
 
 // ListParticipants returns typed participant rows in stable identity ID order.
