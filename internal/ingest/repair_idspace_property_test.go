@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"math/rand"
+	"os"
 	"reflect"
 	"strconv"
 	"strings"
@@ -159,13 +160,18 @@ func (repairDamageScenario) Generate(r *rand.Rand, _ int) reflect.Value {
 // repairDamageState is every row the repair may rewrite.
 type repairDamageState struct {
 	Messages    map[string]repairMessageRow
-	Reactions   map[[2]string][3]any // (message, reactor) -> (occurred, seq, conversation)
+	Reactions   map[[2]string]repairReactionRow // (message, reactor)
 	Fences      map[string]int64
 	Attachments map[string]string // message -> state (ordinal 0)
 	Intents     map[string][2]string
 	Cursors     map[[2]string]string // (device, conversation) -> message, "" for none
 	Sends       map[string][3]string // outbox_id -> (local message, conversation, state)
 	Threads     map[string]bool      // conversation ids
+}
+
+type repairReactionRow struct {
+	OccurredAtMS, SourceSeqMS int64
+	State, ConversationID     string
 }
 
 type repairMessageRow struct {
@@ -178,7 +184,7 @@ func readRepairDamageState(t *testing.T, path string) repairDamageState {
 	defer database.Close()
 	state := repairDamageState{
 		Messages:    map[string]repairMessageRow{},
-		Reactions:   map[[2]string][3]any{},
+		Reactions:   map[[2]string]repairReactionRow{},
 		Fences:      map[string]int64{},
 		Attachments: map[string]string{},
 		Intents:     map[string][2]string{},
@@ -209,11 +215,11 @@ func readRepairDamageState(t *testing.T, path string) repairDamageState {
 		state.Messages[id] = row
 		return err
 	})
-	query(`SELECT message_id, reactor_key, occurred_at_ms, source_seq_ms, conversation_id FROM reactions`, func(rows *sql.Rows) error {
-		var message, reactor, conversation string
-		var occurred, seq int64
-		err := rows.Scan(&message, &reactor, &occurred, &seq, &conversation)
-		state.Reactions[[2]string{message, reactor}] = [3]any{occurred, seq, conversation}
+	query(`SELECT message_id, reactor_key, occurred_at_ms, source_seq_ms, state, conversation_id FROM reactions`, func(rows *sql.Rows) error {
+		var message, reactor string
+		var row repairReactionRow
+		err := rows.Scan(&message, &reactor, &row.OccurredAtMS, &row.SourceSeqMS, &row.State, &row.ConversationID)
+		state.Reactions[[2]string{message, reactor}] = row
 		return err
 	})
 	query(`SELECT message_id, source_seq_ms FROM reaction_snapshot_fences`, func(rows *sql.Rows) error {
@@ -389,10 +395,11 @@ func seedRepairDamage(t *testing.T, fixture repairMergeFixture, scenario repairD
 //   - a delete step's survivor is never deleted, and holds the deleted row's
 //     exact content; kept rows keep their content and only deleted rows go;
 //   - every intent targets root(its old target), inside its own conversation;
-//   - reactions group by (root, reactor): one row each, carrying the group's
-//     latest (occurred_at_ms, source_seq_ms), in root's conversation;
-//   - fences keep the group's largest source_seq_ms; attachments one row per
-//     root, downloaded if any in the group was;
+//   - reactions and fences equal a replay of the documented merge over the
+//     delete steps (newer row per reactor wins, a fence tombstones reactors
+//     the newest snapshot omitted, the larger fence stays), with each
+//     reaction in its message's conversation;
+//   - attachments keep one row per root, downloaded if any in the group was;
 //   - every cursor naming a message survives, on root(that message), and a
 //     cursor naming none survives unless the repair dropped its thread;
 //   - an unfinished send's local message is neither deleted nor moved out of
@@ -502,28 +509,67 @@ func TestGoogleIDSpaceRepairInvariantsProperty(t *testing.T) {
 			}
 		}
 
-		wantReactions := map[[2]string][3]any{}
-		for key, value := range before.Reactions {
-			grouped := [2]string{root(key[0]), key[1]}
-			current, seen := wantReactions[grouped]
-			if seen {
-				coverage["reaction groups merged"]++
-			}
-			if !seen || value[0].(int64) > current[0].(int64) ||
-				(value[0].(int64) == current[0].(int64) && value[1].(int64) > current[1].(int64)) {
-				current = value
-			}
-			current[2] = after.Messages[grouped[0]].ConversationID
-			wantReactions[grouped] = current
-		}
-		if !reflect.DeepEqual(after.Reactions, wantReactions) {
-			return fail("reactions\n got %v\nwant %v", after.Reactions, wantReactions)
+		// Reactions and fences: replay the documented merge over the delete
+		// steps in plan order. A fence on either row means its reactions come
+		// from snapshots, ordered by source_seq_ms first, and a reactor still
+		// active below the merged fence is tombstoned; without one, deltas
+		// order by occurred_at_ms first. The survivor's row stays on a tie.
+		wantReactions := map[[2]string]repairReactionRow{}
+		for key, row := range before.Reactions {
+			wantReactions[key] = row
 		}
 		wantFences := map[string]int64{}
 		for message, seq := range before.Fences {
-			if current, seen := wantFences[root(message)]; !seen || seq > current {
-				wantFences[root(message)] = seq
+			wantFences[message] = seq
+		}
+		applyMS := i01TestTime.UnixMilli()
+		for _, step := range report.Steps {
+			if step.Op != "delete" {
+				continue
 			}
+			duplicate, survivor := step.MessageID, step.SurvivorMessageID
+			duplicateFence, duplicateFenced := wantFences[duplicate]
+			survivorFence, survivorFenced := wantFences[survivor]
+			fenced, mergedFence := duplicateFenced || survivorFenced, max(duplicateFence, survivorFence)
+			rank := func(row repairReactionRow) [2]int64 {
+				if fenced {
+					return [2]int64{row.SourceSeqMS, row.OccurredAtMS}
+				}
+				return [2]int64{row.OccurredAtMS, row.SourceSeqMS}
+			}
+			for key, row := range wantReactions {
+				if key[0] != duplicate {
+					continue
+				}
+				delete(wantReactions, key)
+				survivorKey := [2]string{survivor, key[1]}
+				if existing, conflict := wantReactions[survivorKey]; conflict {
+					coverage["reaction groups merged"]++
+					mine, theirs := rank(row), rank(existing)
+					if mine[0] < theirs[0] || (mine[0] == theirs[0] && mine[1] <= theirs[1]) {
+						continue
+					}
+				}
+				wantReactions[survivorKey] = row
+			}
+			if fenced {
+				for key, row := range wantReactions {
+					if key[0] == survivor && row.State == "active" && row.SourceSeqMS < mergedFence {
+						row.State, row.OccurredAtMS, row.SourceSeqMS = "removed", applyMS, mergedFence
+						wantReactions[key] = row
+						coverage["reaction tombstoned below the merged fence"]++
+					}
+				}
+				wantFences[survivor] = mergedFence
+			}
+			delete(wantFences, duplicate)
+		}
+		for key, row := range wantReactions {
+			row.ConversationID = after.Messages[key[0]].ConversationID
+			wantReactions[key] = row
+		}
+		if !reflect.DeepEqual(after.Reactions, wantReactions) {
+			return fail("reactions\n got %v\nwant %v", after.Reactions, wantReactions)
 		}
 		if !reflect.DeepEqual(after.Fences, wantFences) {
 			return fail("fences\n got %v\nwant %v", after.Fences, wantFences)
@@ -607,11 +653,7 @@ func TestGoogleIDSpaceRepairInvariantsProperty(t *testing.T) {
 		coverage["plan applied"]++
 		return true
 	}
-	cases := 200
-	if raceDetectorEnabled {
-		cases = 40
-	}
-	if err := quick.Check(property, &quick.Config{MaxCount: cases, Rand: rand.New(rand.NewSource(20261010))}); err != nil {
+	if err := quick.Check(property, repairPropertyConfig(t, 200, 40)); err != nil {
 		t.Fatal(err)
 	}
 	t.Logf("coverage: %v", coverage)
@@ -621,6 +663,7 @@ func TestGoogleIDSpaceRepairInvariantsProperty(t *testing.T) {
 		"plan applied", "delete", "delete across conversations",
 		"remote id taken: same content", "remote id taken: other content",
 		"intent changed conversation", "intent on a deleted duplicate", "reaction groups merged",
+		"reaction tombstoned below the merged fence",
 		"cursor on a deleted duplicate", "open send",
 	} {
 		if coverage[name] == 0 {
@@ -640,4 +683,31 @@ func (h *i01Harness) mustListWindowRows(t *testing.T) []string {
 		ids = append(ids, row.MessageID)
 	}
 	return ids
+}
+
+// repairPropertyConfig returns the cases and seed for a repair property test:
+// fewer cases under -race, where the pure-Go SQLite engine runs about tenfold
+// slower. OPENMESSAGE_PROPERTY_CASES and OPENMESSAGE_PROPERTY_SEED override
+// both, so a sweep over seeds needs no rebuild.
+func repairPropertyConfig(t *testing.T, cases, raceCases int) *quick.Config {
+	t.Helper()
+	if raceDetectorEnabled {
+		cases = raceCases
+	}
+	seed := int64(20261010)
+	for name, target := range map[string]func(int64){
+		"OPENMESSAGE_PROPERTY_CASES": func(value int64) { cases = int(value) },
+		"OPENMESSAGE_PROPERTY_SEED":  func(value int64) { seed = value },
+	} {
+		raw := os.Getenv(name)
+		if raw == "" {
+			continue
+		}
+		value, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || value <= 0 {
+			t.Fatalf("%s = %q, want a positive integer", name, raw)
+		}
+		target(value)
+	}
+	return &quick.Config{MaxCount: cases, Rand: rand.New(rand.NewSource(seed))}
 }

@@ -13,7 +13,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/maxghenis/openmessage/internal/bridge"
 	"github.com/maxghenis/openmessage/internal/storage/sqlite"
 )
 
@@ -126,8 +125,8 @@ func insertRepairSend(t *testing.T, database *sql.DB, id string, message sqlite.
 	}
 }
 
-// seedInboundChildren records a delta reaction, an embedded snapshot with its
-// fence, and a downloaded attachment on message.
+// seedInboundChildren records an embedded reaction snapshot (two reactors and
+// its fence) and a downloaded attachment on message.
 func (f repairMergeFixture) seedInboundChildren(t *testing.T, message sqlite.Message) {
 	t.Helper()
 	ctx := context.Background()
@@ -136,17 +135,13 @@ func (f repairMergeFixture) seedInboundChildren(t *testing.T, message sqlite.Mes
 		t.Fatalf("NewReactionRepository(): %v", err)
 	}
 	if _, err := reactions.ReplaceEmbeddedReactions(ctx, message.MessageID, i01AccountID, message.ConversationID,
-		[]sqlite.ReactionSnapshotEntry{{ReactorKey: "snapshot-reactor", ReactorLabel: "peer", Emoji: "❤️"}},
+		[]sqlite.ReactionSnapshotEntry{
+			{ReactorKey: "first-reactor", ReactorLabel: "peer", Emoji: "❤️"},
+			{ReactorKey: "second-reactor", ReactorIsSelf: true, Emoji: "😂"},
+		},
 		message.OccurredAtMS+50,
 	); err != nil {
 		t.Fatalf("ReplaceEmbeddedReactions(): %v", err)
-	}
-	if applied, err := reactions.ApplyReaction(ctx, sqlite.ReactionApply{
-		AccountID: i01AccountID, ConversationID: message.ConversationID, MessageID: message.MessageID,
-		ReactorKey: "delta-reactor", ReactorLabel: "peer", Emoji: "😂", Action: bridge.ReactionAdd,
-		OccurredAtMS: message.OccurredAtMS + 60,
-	}); err != nil || !applied {
-		t.Fatalf("ApplyReaction() = (%v, %v), want applied", applied, err)
 	}
 	database := i01OpenInspector(t, f.harness.path)
 	defer database.Close()
@@ -163,7 +158,7 @@ func (f repairMergeFixture) seedInboundChildren(t *testing.T, message sqlite.Mes
 func (f repairMergeFixture) assertInboundChildrenOn(t *testing.T, message sqlite.Message) {
 	t.Helper()
 	path := f.harness.path
-	for _, reactor := range []string{"snapshot-reactor", "delta-reactor"} {
+	for _, reactor := range []string{"first-reactor", "second-reactor"} {
 		if n := i01QueryInt64(t, path, `
 			SELECT COUNT(*) FROM reactions
 			WHERE message_id = ? AND reactor_key = ? AND conversation_id = ? AND state = 'active'
