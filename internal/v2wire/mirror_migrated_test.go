@@ -405,10 +405,20 @@ func TestMirrorConversationIgnoresUnrelatedThreadInAnotherAccount(t *testing.T) 
 			if err := MirrorReadCursor(context.Background(), legacy, v2, legacyID, 1_910_000_000_000); err != nil {
 				t.Fatalf("MirrorReadCursor(): %v", err)
 			}
-			if _, err := SubmitText(context.Background(), deps, TextInput{
-				ConversationID: legacyID, Body: "hi", IdempotencyKey: "unrelated-thread-send",
-			}); err != nil {
-				t.Fatalf("SubmitText(): %v", err)
+			replyTarget := &db.Message{
+				MessageID: "google-reply-target", ConversationID: legacyID, Body: "earlier",
+				TimestampMS: 1_900_000_000_001, SourcePlatform: "sms",
+			}
+			if err := legacy.UpsertMessage(replyTarget); err != nil {
+				t.Fatalf("legacy UpsertMessage(reply target): %v", err)
+			}
+			// Twice, so the second send reuses the mirrored reply target.
+			for _, key := range []string{"unrelated-thread-send-1", "unrelated-thread-send-2"} {
+				if _, err := SubmitText(context.Background(), deps, TextInput{
+					ConversationID: legacyID, Body: "hi", ReplyToID: replyTarget.MessageID, IdempotencyKey: key,
+				}); err != nil {
+					t.Fatalf("SubmitText(%s): %v", key, err)
+				}
 			}
 			mirrored, err := v2.GetConversation(legacyID)
 			if err != nil || mirrored.AccountID != googleAccountID || mirrored.RemoteConversationID != legacyID {

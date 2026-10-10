@@ -125,7 +125,8 @@ curl -s http://127.0.0.1:7007/api/status | jq '.freshness'
   reuses the account's migrated local device, whose id is a derived hash
   (`9bcc1343…` for Google), not `local-primary:<account>`. It also leaves the
   account row alone. A thread the migration already keyed by hash fails with
-  `natural key belongs to v2 conversation <id>`, and nothing is written. Before
+  `natural key belongs to v2 conversation <id>`, and the migrated row is left
+  unchanged. Before
   2026-10-09 every mirror call on a migrated store failed with
   `UNIQUE constraint failed: devices.account_id`. Each call first rewrote the
   account's `bridge_key` (`google_messages` → `google`), and v2 reads derive a
