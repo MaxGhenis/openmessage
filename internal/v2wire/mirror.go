@@ -11,6 +11,7 @@ import (
 
 	"github.com/maxghenis/openmessage/internal/db"
 	"github.com/maxghenis/openmessage/internal/storage/sqlite"
+	"github.com/maxghenis/openmessage/internal/v2keys"
 )
 
 const (
@@ -72,12 +73,15 @@ func AccountForConversation(legacy *db.Store, legacyConversationID string) (stri
 // conversation needed by the outbox. Conversation identity deliberately stays
 // byte-for-byte equal to the legacy ID consumed by the live adapters.
 //
-// Rows the mirror did not create are never rewritten. An existing account
-// keeps its metadata, the account's existing local installation device is
-// reused whatever its ID, and a conversation whose natural key already
-// belongs to a v2 row under another ID (a migrated store keys conversations by
-// derived hash) fails with sqlite.ErrConversationIdentityConflict, without
-// writing.
+// The only v2 conversation row the mirror writes is the one whose ID equals
+// the legacy ID; it inserts or refreshes that row. An existing account keeps
+// its metadata, and the account's existing local installation device is
+// reused whatever its ID. The natural key is normalized as the migration
+// normalizes it (v2keys.NormalizeRemoteConversationID), so when it belongs to
+// a row under another ID (a migrated store keys conversations by derived hash)
+// the call fails with sqlite.ErrConversationIdentityConflict. That check runs
+// before the account and device bootstraps, and the conversation upsert is
+// guarded too, so the other row is never modified.
 func MirrorConversation(
 	legacy *db.Store,
 	v2 *sqlite.Store,
@@ -113,6 +117,20 @@ func mirrorConversation(
 	if err != nil {
 		return mirroredConversation{}, fmt.Errorf("mirror conversation %q: %w", legacyConversationID, err)
 	}
+	remoteID, err := mirrorRemoteConversationID(v2, accountID, legacyConversationID)
+	if err != nil {
+		return mirroredConversation{}, err
+	}
+	switch owner, err := v2.GetConversationByRemote(accountID, remoteID); {
+	case err == nil && owner.ConversationID != legacyConversationID:
+		return mirroredConversation{}, naturalKeyOwnedElsewhere(
+			legacyConversationID,
+			owner.ConversationID,
+			sqlite.ErrConversationIdentityConflict,
+		)
+	case err != nil && !errors.Is(err, sqlite.ErrNotFound):
+		return mirroredConversation{}, fmt.Errorf("mirror conversation %q: %w", legacyConversationID, err)
+	}
 
 	bridgeKey, displayName := accountBootstrap(accountID)
 	nowMS := time.Now().UnixMilli()
@@ -140,7 +158,7 @@ func mirrorConversation(
 	if err := v2.UpsertOwnedConversation(sqlite.Conversation{
 		ConversationID:       legacyConversationID,
 		AccountID:            accountID,
-		RemoteConversationID: legacyConversationID,
+		RemoteConversationID: remoteID,
 		Kind:                 kind,
 		Title:                conversation.Name,
 		NotificationMode:     sqlite.NotificationModeAll,
@@ -151,25 +169,19 @@ func mirrorConversation(
 		UpdatedAtMS:          nowMS,
 	}); err != nil {
 		if errors.Is(err, sqlite.ErrConversationIdentityConflict) {
-			if owner, lookupErr := v2.GetConversationByRemote(accountID, legacyConversationID); lookupErr == nil {
-				return mirroredConversation{}, fmt.Errorf(
-					"mirror conversation %q: natural key belongs to v2 conversation %q: %w",
-					legacyConversationID,
-					owner.ConversationID,
-					err,
-				)
+			if owner, lookupErr := v2.GetConversationByRemote(accountID, remoteID); lookupErr == nil {
+				return mirroredConversation{}, naturalKeyOwnedElsewhere(legacyConversationID, owner.ConversationID, err)
 			}
 		}
 		return mirroredConversation{}, fmt.Errorf("mirror conversation %q: %w", legacyConversationID, err)
 	}
 
-	mirrored, err := v2.GetConversationByRemote(accountID, legacyConversationID)
+	mirrored, err := v2.GetConversationByRemote(accountID, remoteID)
 	if err != nil {
 		return mirroredConversation{}, fmt.Errorf("load mirrored conversation %q: %w", legacyConversationID, err)
 	}
 	if mirrored.ConversationID != legacyConversationID {
-		return mirroredConversation{}, fmt.Errorf(
-			"mirror conversation %q: natural key belongs to v2 conversation %q: %w",
+		return mirroredConversation{}, naturalKeyOwnedElsewhere(
 			legacyConversationID,
 			mirrored.ConversationID,
 			sqlite.ErrConversationIdentityConflict,
@@ -180,6 +192,32 @@ func mirrorConversation(
 		conversationID: mirrored.ConversationID,
 		deviceID:       deviceID,
 	}, nil
+}
+
+// mirrorRemoteConversationID returns the natural key the mirror writes the
+// conversation under. A row the mirror already holds under this legacy ID keeps
+// the remote ID it was created with; earlier versions used the raw legacy ID.
+// Otherwise it is the migration's normalized form, so a Signal ID that differs
+// from the migrated key only by whitespace ("signal:  +1650…") still meets the
+// migrated row rather than minting a second conversation beside it.
+func mirrorRemoteConversationID(v2 *sqlite.Store, accountID, legacyConversationID string) (string, error) {
+	existing, err := v2.GetConversation(legacyConversationID)
+	if err == nil && existing.AccountID == accountID {
+		return existing.RemoteConversationID, nil
+	}
+	if err != nil && !errors.Is(err, sqlite.ErrNotFound) {
+		return "", fmt.Errorf("mirror conversation %q: %w", legacyConversationID, err)
+	}
+	return v2keys.NormalizeRemoteConversationID(accountPlatform(accountID), legacyConversationID), nil
+}
+
+func naturalKeyOwnedElsewhere(legacyConversationID, ownerConversationID string, cause error) error {
+	return fmt.Errorf(
+		"mirror conversation %q: natural key belongs to v2 conversation %q: %w",
+		legacyConversationID,
+		ownerConversationID,
+		cause,
+	)
 }
 
 // MirrorReplyTarget creates the minimum normalized v2 message needed for a
@@ -368,10 +406,24 @@ func accountBootstrap(accountID string) (bridgeKey string, displayName string) {
 	}
 }
 
+// accountPlatform names the migration's platform for a live account, the
+// vocabulary v2keys.NormalizeRemoteConversationID keys on.
+func accountPlatform(accountID string) string {
+	switch accountID {
+	case whatsappAccountID:
+		return "whatsapp"
+	case signalAccountID:
+		return "signal"
+	default:
+		return "sms"
+	}
+}
+
 // localDeviceID names the local device the mirror creates for an account that
 // has none. It is account-scoped because devices.device_id is a global primary
-// key. A constant ID lets mirroring a second account steal the first account's
-// device row and invalidates that account's read-cursor foreign key.
+// key, so one shared ID would collide across accounts. Before UpsertDevice
+// refused cross-account writes, a shared ID let mirroring a second account take
+// over the first account's device row and orphan its read cursors.
 func localDeviceID(accountID string) string {
 	return "local-primary:" + accountID
 }

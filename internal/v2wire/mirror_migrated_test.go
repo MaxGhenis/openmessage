@@ -30,6 +30,9 @@ var migratedFixtureConversations = []migratedFixtureConversation{
 	{legacyID: "google-migrated", platform: "sms", accountID: googleAccountID},
 	{legacyID: "whatsapp:15550002222@s.whatsapp.net", platform: "whatsapp", accountID: whatsappAccountID},
 	{legacyID: "signal:+15550003333", platform: "signal", accountID: signalAccountID},
+	// The migration normalizes this to remote ID "signal:+16505550100"; the
+	// mirror must meet that row rather than mint one keyed by the spaced form.
+	{legacyID: "signal:  +16505550100", platform: "signal", accountID: signalAccountID},
 }
 
 // postCutoverFixtureConversations exist only in the legacy store; the migrated
@@ -38,6 +41,7 @@ var postCutoverFixtureConversations = []migratedFixtureConversation{
 	{legacyID: "google-after-cutover", platform: "sms", accountID: googleAccountID},
 	{legacyID: "whatsapp:15559990000@s.whatsapp.net", platform: "whatsapp", accountID: whatsappAccountID},
 	{legacyID: "signal:+15559990000", platform: "signal", accountID: signalAccountID},
+	{legacyID: "signal:  +16505559999", platform: "signal", accountID: signalAccountID},
 }
 
 // openMigratedTestStores runs the real migration over a small legacy store, so
@@ -68,6 +72,7 @@ func openMigratedTestStores(t *testing.T) (*db.Store, *sqlite.Store) {
 		{MessageID: "google-message-1", ConversationID: "google-migrated", SenderNumber: "+15550001111", Body: "google", TimestampMS: baseMS, SourcePlatform: "sms"},
 		{MessageID: "whatsapp:wa-1", SourceID: "wa-1", ConversationID: "whatsapp:15550002222@s.whatsapp.net", SenderNumber: "15550002222@s.whatsapp.net", Body: "whatsapp", TimestampMS: baseMS + 1, SourcePlatform: "whatsapp"},
 		{MessageID: "signal:1700000000002", SourceID: "1700000000002", ConversationID: "signal:+15550003333", SenderNumber: "+15550003333", Body: "signal", TimestampMS: baseMS + 2, SourcePlatform: "signal"},
+		{MessageID: "signal:1700000000003", SourceID: "1700000000003", ConversationID: "signal:  +16505550100", SenderNumber: "+16505550100", Body: "spaced signal", TimestampMS: baseMS + 3, SourcePlatform: "signal"},
 	} {
 		if err := legacy.UpsertMessage(message); err != nil {
 			t.Fatalf("legacy UpsertMessage(%q): %v", message.MessageID, err)
@@ -135,6 +140,13 @@ func TestMirrorOnMigratedStoreReusesMigratedLocalDevice(t *testing.T) {
 			}
 			if accountID != conversation.accountID || conversationID != conversation.legacyID {
 				t.Fatalf("MirrorConversation() = (%q, %q), want (%q, %q)", accountID, conversationID, conversation.accountID, conversation.legacyID)
+			}
+			mirrored, err := v2.GetConversation(conversation.legacyID)
+			if err != nil {
+				t.Fatalf("GetConversation(): %v", err)
+			}
+			if want := v2keys.NormalizeRemoteConversationID(conversation.platform, conversation.legacyID); mirrored.RemoteConversationID != want {
+				t.Fatalf("mirrored remote ID = %q, want the migration's normalized %q", mirrored.RemoteConversationID, want)
 			}
 			for _, readAtMS := range []int64{1_910_000_000_000, 1_910_000_000_500} {
 				if err := MirrorReadCursor(ctx, legacy, v2, conversation.legacyID, readAtMS); err != nil {
@@ -269,6 +281,86 @@ func TestAccountBootstrapMatchesMigrationAccounts(t *testing.T) {
 			t.Errorf("accountBootstrap(%q) = (%q, %q), migration wrote (%q, %q)",
 				accountID, bridgeKey, displayName, migrated.BridgeKey, migrated.DisplayName)
 		}
+	}
+}
+
+// TestMirrorConversationKeepsEarlierRawRemoteID covers a store an earlier
+// mirror wrote, which keyed rows by the raw legacy ID. Normalizing that key
+// now would collide with the row's own primary key.
+func TestMirrorConversationKeepsEarlierRawRemoteID(t *testing.T) {
+	legacy := openLegacyTestStore(t)
+	v2 := openV2TestStore(t)
+	const spaced = "signal:  +16505550100"
+	seedLegacyConversation(t, legacy, spaced, "signal", false)
+	bridgeKey, displayName := accountBootstrap(signalAccountID)
+	if _, err := v2.EnsureAccount(sqlite.Account{
+		AccountID: signalAccountID, BridgeKey: bridgeKey, DisplayName: displayName,
+		Mode: sqlite.AccountModeLive, Enabled: true, ConfigJSON: "{}",
+		CreatedAtMS: 1_800_000_000_000, UpdatedAtMS: 1_800_000_000_000,
+	}); err != nil {
+		t.Fatalf("EnsureAccount(): %v", err)
+	}
+	if err := v2.UpsertConversation(sqlite.Conversation{
+		ConversationID: spaced, AccountID: signalAccountID, RemoteConversationID: spaced,
+		Kind: sqlite.ConversationKindDirect, NotificationMode: sqlite.NotificationModeAll,
+		MetadataJSON: "{}", CreatedAtMS: 1_700_000_000_000, UpdatedAtMS: 1_700_000_000_000,
+	}); err != nil {
+		t.Fatalf("UpsertConversation(earlier mirror row): %v", err)
+	}
+
+	if err := MirrorReadCursor(context.Background(), legacy, v2, spaced, 1_910_000_000_000); err != nil {
+		t.Fatalf("MirrorReadCursor(): %v", err)
+	}
+	got, err := v2.GetConversation(spaced)
+	if err != nil {
+		t.Fatalf("GetConversation(): %v", err)
+	}
+	if got.RemoteConversationID != spaced || got.Title != "Conversation "+spaced {
+		t.Fatalf("conversation = %+v, want the earlier row refreshed under its raw remote ID", got)
+	}
+	if _, err := v2.GetConversationByRemote(signalAccountID, "signal:+16505550100"); !errors.Is(err, sqlite.ErrNotFound) {
+		t.Fatalf("GetConversationByRemote(normalized) error = %v, want ErrNotFound: a second row was minted", err)
+	}
+}
+
+// TestMirrorConversationRefusalWritesNothing pins that the ownership check runs
+// before the account and device bootstraps: an account whose local device is
+// missing must not gain one from a call that is then refused.
+func TestMirrorConversationRefusalWritesNothing(t *testing.T) {
+	legacy := openLegacyTestStore(t)
+	v2 := openV2TestStore(t)
+	seedLegacyConversation(t, legacy, "google-thread", "sms", false)
+	bridgeKey, displayName := accountBootstrap(googleAccountID)
+	account, err := v2.EnsureAccount(sqlite.Account{
+		AccountID: googleAccountID, BridgeKey: bridgeKey, DisplayName: displayName,
+		Mode: sqlite.AccountModeLive, Enabled: true, ConfigJSON: "{}",
+		CreatedAtMS: 1_800_000_000_000, UpdatedAtMS: 1_800_000_000_000,
+	})
+	if err != nil {
+		t.Fatalf("EnsureAccount(): %v", err)
+	}
+	owner := sqlite.Conversation{
+		ConversationID: v2keys.DeriveID("conversation", googleAccountID, "google-thread"),
+		AccountID:      googleAccountID, RemoteConversationID: "google-thread",
+		Kind: sqlite.ConversationKindDirect, Title: "ingested", NotificationMode: sqlite.NotificationModeMuted,
+		MetadataJSON: "{}", CreatedAtMS: 1_800_000_000_000, UpdatedAtMS: 1_800_000_000_000,
+	}
+	if err := v2.UpsertConversation(owner); err != nil {
+		t.Fatalf("UpsertConversation(owner): %v", err)
+	}
+
+	_, _, err = MirrorConversation(legacy, v2, "google-thread")
+	if !errors.Is(err, sqlite.ErrConversationIdentityConflict) || !strings.Contains(err.Error(), owner.ConversationID) {
+		t.Fatalf("MirrorConversation() error = %v, want ErrConversationIdentityConflict naming %q", err, owner.ConversationID)
+	}
+	if devices := mustListDevices(t, v2, googleAccountID); len(devices) != 0 {
+		t.Fatalf("devices = %+v, want none: the refused call bootstrapped a device", devices)
+	}
+	if got := mustGetAccount(t, v2, googleAccountID); !reflect.DeepEqual(got, account) {
+		t.Fatalf("account = %+v, want unchanged %+v", got, account)
+	}
+	if got, err := v2.GetConversation(owner.ConversationID); err != nil || !reflect.DeepEqual(got, owner) {
+		t.Fatalf("owner = %+v, %v; want unchanged %+v", got, err, owner)
 	}
 }
 
