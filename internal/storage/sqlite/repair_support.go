@@ -103,8 +103,11 @@ type RepairParticipant struct {
 //	             with Kind, Title and roster (Participants, else
 //	             ParticipantIdentityIDs); any current holder of the remote id is
 //	             displaced first
-//	move         move message MessageID (and its reactions) to TargetConversationID
-//	delete       delete message MessageID (attachments/reactions cascade)
+//	move         move message MessageID to TargetConversationID with its
+//	             reactions and the reaction and read-receipt intents that
+//	             target it; refused while a read cursor names it
+//	delete       merge message MessageID into SurvivorMessageID, a copy of the
+//	             same message (see mergeDuplicateMessage), then delete it
 //	rebind       bind RemoteConversationID to TargetConversationID, displacing any
 //	             other holder
 //	meta         set ConversationID's Title and replace its roster with Participants
@@ -116,6 +119,7 @@ type RepairStep struct {
 	RemoteConversationID   string              `json:"remote_conversation_id,omitempty"`
 	TargetConversationID   string              `json:"target_conversation_id,omitempty"`
 	MessageID              string              `json:"message_id,omitempty"`
+	SurvivorMessageID      string              `json:"survivor_message_id,omitempty"`
 	Kind                   string              `json:"kind,omitempty"`
 	Title                  string              `json:"title,omitempty"`
 	ParticipantIdentityIDs []string            `json:"participant_identity_ids,omitempty"`
@@ -154,13 +158,20 @@ func (s *Store) ListConversationsUpdatedSince(accountID string, sinceMS int64) (
 	return conversations, nil
 }
 
-// ApplyRepairPlan executes the steps in order inside one transaction.
+// ApplyRepairPlan executes the steps in order inside one transaction. A step
+// naming a message that isn't in the account (gone already, when a plan is
+// applied again) is a no-op; any other failure rolls the whole plan back.
 func (s *Store) ApplyRepairPlan(ctx context.Context, accountID string, steps []RepairStep, nowMS int64) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("apply repair plan: begin: %w", err)
 	}
 	defer tx.Rollback()
+
+	// mergedInto maps each message a delete step removed to the copy it was
+	// merged into, so a later step whose survivor is already gone reaches the
+	// copy that stayed.
+	mergedInto := make(map[string]string)
 
 	displace := func(remoteID string) error {
 		var holderID string
@@ -221,20 +232,9 @@ func (s *Store) ApplyRepairPlan(ctx context.Context, accountID string, steps []R
 			}
 			stepErr = insertRepairRoster(ctx, tx, accountID, step.ConversationID, step.Participants)
 		case "move":
-			if _, stepErr = tx.ExecContext(ctx, `
-				UPDATE reactions SET conversation_id = ?, updated_at_ms = MAX(updated_at_ms, ?)
-				WHERE message_id = ?
-			`, step.TargetConversationID, nowMS, step.MessageID); stepErr != nil {
-				break
-			}
-			_, stepErr = tx.ExecContext(ctx, `
-				UPDATE messages SET conversation_id = ?, updated_at_ms = MAX(updated_at_ms, ?)
-				WHERE message_id = ? AND account_id = ?
-			`, step.TargetConversationID, nowMS, step.MessageID, accountID)
+			stepErr = applyRepairMove(ctx, tx, accountID, step, nowMS)
 		case "delete":
-			_, stepErr = tx.ExecContext(ctx, `
-				DELETE FROM messages WHERE message_id = ? AND account_id = ?
-			`, step.MessageID, accountID)
+			stepErr = applyRepairDelete(ctx, tx, accountID, step, mergedInto, nowMS)
 		case "rebind":
 			var holderID string
 			err := tx.QueryRowContext(ctx, `
@@ -283,6 +283,92 @@ func (s *Store) ApplyRepairPlan(ctx context.Context, accountID string, steps []R
 		return fmt.Errorf("apply repair plan: commit: %w", err)
 	}
 	return nil
+}
+
+func applyRepairMove(ctx context.Context, tx *sql.Tx, accountID string, step RepairStep, nowMS int64) error {
+	inAccount, err := messageInAccount(ctx, tx, accountID, step.MessageID)
+	if err != nil || !inAccount {
+		return err
+	}
+	deviceID, found, err := readCursorDeviceOutside(ctx, tx, step.MessageID, step.TargetConversationID)
+	if err != nil {
+		return err
+	}
+	if found {
+		return fmt.Errorf(
+			"the read cursor of device %q names message %q, and a cursor can't follow it into conversation %q",
+			deviceID,
+			step.MessageID,
+			step.TargetConversationID,
+		)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE reactions SET conversation_id = ?, updated_at_ms = MAX(updated_at_ms, ?)
+		WHERE message_id = ?
+	`, step.TargetConversationID, nowMS, step.MessageID); err != nil {
+		return err
+	}
+	if err := retargetMessageIntents(ctx, tx, step.MessageID, step.TargetConversationID, nowMS); err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `
+		UPDATE messages SET conversation_id = ?, updated_at_ms = MAX(updated_at_ms, ?)
+		WHERE message_id = ? AND account_id = ?
+	`, step.TargetConversationID, nowMS, step.MessageID, accountID)
+	return err
+}
+
+// applyRepairDelete merges a duplicate into its survivor and deletes it. A
+// plain DELETE would fail on the NO ACTION intents that still name the
+// duplicate, and cascade away its reactions, fence and attachments.
+func applyRepairDelete(
+	ctx context.Context,
+	tx *sql.Tx,
+	accountID string,
+	step RepairStep,
+	mergedInto map[string]string,
+	nowMS int64,
+) error {
+	if step.SurvivorMessageID == "" {
+		return fmt.Errorf(
+			"delete of message %q names no survivor; a plain delete would cascade away its reactions and attachments",
+			step.MessageID,
+		)
+	}
+	inAccount, err := messageInAccount(ctx, tx, accountID, step.MessageID)
+	if err != nil || !inAccount {
+		return err
+	}
+	survivorID := step.SurvivorMessageID
+	// Every hop lands on a message that existed when it was merged into, so
+	// the walk ends within len(mergedInto) hops.
+	for range len(mergedInto) {
+		next, merged := mergedInto[survivorID]
+		if !merged {
+			break
+		}
+		survivorID = next
+	}
+	if err := mergeDuplicateMessage(ctx, tx, step.MessageID, survivorID, nowMS); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `
+		DELETE FROM messages WHERE message_id = ? AND account_id = ?
+	`, step.MessageID, accountID); err != nil {
+		return err
+	}
+	mergedInto[step.MessageID] = survivorID
+	return nil
+}
+
+func messageInAccount(ctx context.Context, tx *sql.Tx, accountID, messageID string) (bool, error) {
+	var exists bool
+	if err := tx.QueryRowContext(ctx, `
+		SELECT EXISTS (SELECT 1 FROM messages WHERE message_id = ? AND account_id = ?)
+	`, messageID, accountID).Scan(&exists); err != nil {
+		return false, fmt.Errorf("look up message %q: %w", messageID, err)
+	}
+	return exists, nil
 }
 
 func insertRepairRoster(ctx context.Context, tx *sql.Tx, accountID, conversationID string, roster []RepairParticipant) error {
