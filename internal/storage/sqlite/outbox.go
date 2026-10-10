@@ -1581,17 +1581,15 @@ func (r *OutboxRepository) Confirm(
 
 	var (
 		accountID          string
-		conversationID     string
 		localMessageID     sql.NullString
 		transportRequestID string
 	)
 	if err := tx.QueryRowContext(ctx, `
-		SELECT account_id, conversation_id, local_message_id, transport_request_id
+		SELECT account_id, local_message_id, transport_request_id
 		FROM outbox
 		WHERE outbox_id = ?
 	`, confirmation.OutboxID).Scan(
 		&accountID,
-		&conversationID,
 		&localMessageID,
 		&transportRequestID,
 	); err != nil {
@@ -1606,7 +1604,6 @@ func (r *OutboxRepository) Confirm(
 			ctx,
 			tx,
 			accountID,
-			conversationID,
 			localMessageID.String,
 			transportRequestID,
 			resultRemoteID,
@@ -1649,7 +1646,6 @@ func (r *OutboxRepository) ReconcileConfirm(
 
 	var (
 		outboxID                string
-		conversationID          string
 		state                   OutboxState
 		localMessageID          sql.NullString
 		persistedResultRemoteID sql.NullString
@@ -1658,7 +1654,6 @@ func (r *OutboxRepository) ReconcileConfirm(
 	err = tx.QueryRowContext(ctx, `
 		SELECT
 			o.outbox_id,
-			o.conversation_id,
 			o.state,
 			o.local_message_id,
 			o.result_remote_id,
@@ -1668,7 +1663,6 @@ func (r *OutboxRepository) ReconcileConfirm(
 		WHERE o.account_id = ? AND o.transport_request_id = ?
 	`, req.AccountID, req.TransportRequestID).Scan(
 		&outboxID,
-		&conversationID,
 		&state,
 		&localMessageID,
 		&persistedResultRemoteID,
@@ -1713,7 +1707,6 @@ func (r *OutboxRepository) ReconcileConfirm(
 				ctx,
 				tx,
 				req.AccountID,
-				conversationID,
 				localMessageID.String,
 				req.TransportRequestID,
 				req.ResultRemoteID,
@@ -1777,7 +1770,6 @@ func (r *OutboxRepository) ReconcileConfirm(
 			ctx,
 			tx,
 			req.AccountID,
-			conversationID,
 			localMessageID.String,
 			req.TransportRequestID,
 			req.ResultRemoteID,
@@ -1816,7 +1808,7 @@ func requireSingleReconcileMutation(result sql.Result, outboxID string) error {
 func (r *OutboxRepository) repointLocalMessage(
 	ctx context.Context,
 	tx *sql.Tx,
-	accountID, conversationID, localMessageID, transportRequestID, realID string,
+	accountID, localMessageID, transportRequestID, realID string,
 ) error {
 	if realID == transportRequestID {
 		return nil
@@ -1826,6 +1818,24 @@ func (r *OutboxRepository) repointLocalMessage(
 		return err
 	}
 
+	// The natural key the UPDATE below must keep unique is scoped to the
+	// conversation the local row is in now, which a repair move can change
+	// from the outbox row's. If the local row is gone there is nothing to
+	// repoint, and an echo row already holding realID is then the only copy
+	// of the sent message, so it stays.
+	var localConversationID string
+	err = tx.QueryRowContext(ctx, `
+		SELECT conversation_id
+		FROM messages
+		WHERE message_id = ? AND account_id = ?
+	`, localMessageID, accountID).Scan(&localConversationID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("repoint local message %q: read local row: %w", localMessageID, err)
+	}
+
 	var collisionMessageID string
 	err = tx.QueryRowContext(ctx, `
 		SELECT message_id
@@ -1833,11 +1843,26 @@ func (r *OutboxRepository) repointLocalMessage(
 		WHERE account_id = ?
 		  AND conversation_id = ?
 		  AND remote_message_id = ?
-	`, accountID, conversationID, realID).Scan(&collisionMessageID)
+	`, accountID, localConversationID, realID).Scan(&collisionMessageID)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("repoint local message %q: read remote-ID collision: %w", localMessageID, err)
 	}
 	if err == nil && collisionMessageID != localMessageID {
+		if err := mergeEchoDuplicate(
+			ctx,
+			tx,
+			localConversationID,
+			collisionMessageID,
+			localMessageID,
+			nowMS,
+		); err != nil {
+			return fmt.Errorf(
+				"repoint local message %q: merge echo duplicate %q: %w",
+				localMessageID,
+				collisionMessageID,
+				mapConstraintError(err),
+			)
+		}
 		if _, err := tx.ExecContext(ctx, `
 			DELETE FROM messages
 			WHERE message_id = ?
@@ -1862,6 +1887,184 @@ func (r *OutboxRepository) repointLocalMessage(
 			localMessageID,
 			mapConstraintError(err),
 		)
+	}
+	return nil
+}
+
+// mergeEchoDuplicate merges an echo-projected duplicate into the surviving
+// local row, so that deleting the duplicate neither trips a NO ACTION foreign
+// key nor cascades away state recorded on it. It covers every table with a
+// foreign key to messages. outbox.local_message_id has none and names the row
+// its enqueue inserted, never a projected echo. Both rows are in
+// conversationID. The rules:
+//   - read_cursors, outbox_reactions and outbox_read_receipts point at the
+//     same logical message, so they're repointed.
+//   - reactions: when both rows have one for the same reactor, the newer one
+//     stays and the other is deleted (the survivor's stays on an exact tie).
+//     If either row has a reaction_snapshot_fences row, the message's
+//     reactions come from full embedded snapshots. ReplaceEmbeddedReactions
+//     orders those by source_seq_ms and stamps occurred_at_ms with the write
+//     time, so newer means a larger (source_seq_ms, occurred_at_ms). Then,
+//     as applying the newest snapshot would, a reactor still active below
+//     the merged fence is tombstoned, because that snapshot didn't list it.
+//     Without a fence, newer means a larger (occurred_at_ms, source_seq_ms),
+//     the order ApplyReaction applies deltas in.
+//   - reaction_snapshot_fences keeps the larger source_seq_ms.
+//   - message_attachments: per ordinal, a downloaded survivor row stays.
+//     Otherwise the duplicate's row replaces the survivor's, since a pending
+//     row holds no bytes.
+//
+// Losing survivor rows are deleted here, and losing duplicate rows go with
+// the duplicate. If both rows have the same fence, reactors active in either
+// snapshot stay active.
+func mergeEchoDuplicate(
+	ctx context.Context,
+	tx *sql.Tx,
+	conversationID, duplicateID, survivorID string,
+	nowMS int64,
+) error {
+	var fence sql.NullInt64
+	if err := tx.QueryRowContext(ctx, `
+		SELECT MAX(source_seq_ms)
+		FROM reaction_snapshot_fences
+		WHERE message_id IN (?, ?)
+	`, duplicateID, survivorID).Scan(&fence); err != nil {
+		return fmt.Errorf("read reaction snapshot fences: %w", err)
+	}
+	duplicateReactionIsNewer := `(duplicate.occurred_at_ms, duplicate.source_seq_ms) >
+		(reactions.occurred_at_ms, reactions.source_seq_ms)`
+	if fence.Valid {
+		duplicateReactionIsNewer = `(duplicate.source_seq_ms, duplicate.occurred_at_ms) >
+			(reactions.source_seq_ms, reactions.occurred_at_ms)`
+	}
+
+	arguments := []any{
+		sql.Named("conversation_id", conversationID),
+		sql.Named("duplicate_id", duplicateID),
+		sql.Named("survivor_id", survivorID),
+		sql.Named("now_ms", nowMS),
+		sql.Named("fence", fence),
+	}
+	steps := []struct {
+		name  string
+		query string
+	}{
+		{
+			name: "repoint read cursors",
+			query: `
+				UPDATE read_cursors
+				SET last_read_message_id = :survivor_id,
+					updated_at_ms = MAX(updated_at_ms, :now_ms)
+				WHERE conversation_id = :conversation_id
+				  AND last_read_message_id = :duplicate_id
+			`,
+		},
+		{
+			name: "repoint reaction intents",
+			query: `
+				UPDATE outbox_reactions
+				SET target_message_id = :survivor_id
+				WHERE target_message_id = :duplicate_id
+			`,
+		},
+		{
+			name: "repoint read-receipt intents",
+			query: `
+				UPDATE outbox_read_receipts
+				SET last_read_message_id = :survivor_id
+				WHERE last_read_message_id = :duplicate_id
+			`,
+		},
+		{
+			name: "drop survivor reactions the duplicate supersedes",
+			query: `
+				DELETE FROM reactions
+				WHERE message_id = :survivor_id
+				  AND EXISTS (
+					SELECT 1
+					FROM reactions AS duplicate
+					WHERE duplicate.message_id = :duplicate_id
+					  AND duplicate.reactor_key = reactions.reactor_key
+					  AND ` + duplicateReactionIsNewer + `
+				  )
+			`,
+		},
+		{
+			name: "move reactions",
+			query: `
+				UPDATE reactions
+				SET message_id = :survivor_id,
+					updated_at_ms = MAX(updated_at_ms, :now_ms)
+				WHERE message_id = :duplicate_id
+				  AND NOT EXISTS (
+					SELECT 1
+					FROM reactions AS survivor
+					WHERE survivor.message_id = :survivor_id
+					  AND survivor.reactor_key = reactions.reactor_key
+				  )
+			`,
+		},
+		{
+			// A no-op without a fence: source_seq_ms < NULL matches nothing.
+			name: "tombstone reactions the newest snapshot omitted",
+			query: `
+				UPDATE reactions
+				SET state = 'removed',
+					occurred_at_ms = :now_ms,
+					source_seq_ms = :fence,
+					updated_at_ms = MAX(updated_at_ms, :now_ms)
+				WHERE message_id = :survivor_id
+				  AND state = 'active'
+				  AND source_seq_ms < :fence
+			`,
+		},
+		{
+			name: "merge reaction snapshot fence",
+			query: `
+				INSERT INTO reaction_snapshot_fences (message_id, source_seq_ms, updated_at_ms)
+				SELECT :survivor_id, source_seq_ms, :now_ms
+				FROM reaction_snapshot_fences
+				WHERE message_id = :duplicate_id
+				ON CONFLICT(message_id) DO UPDATE SET
+					source_seq_ms = excluded.source_seq_ms,
+					updated_at_ms = MAX(reaction_snapshot_fences.updated_at_ms, excluded.updated_at_ms)
+				WHERE excluded.source_seq_ms > reaction_snapshot_fences.source_seq_ms
+			`,
+		},
+		{
+			name: "drop pending survivor attachments the duplicate covers",
+			query: `
+				DELETE FROM message_attachments
+				WHERE message_id = :survivor_id
+				  AND blob_hash IS NULL
+				  AND EXISTS (
+					SELECT 1
+					FROM message_attachments AS duplicate
+					WHERE duplicate.message_id = :duplicate_id
+					  AND duplicate.ordinal = message_attachments.ordinal
+				  )
+			`,
+		},
+		{
+			name: "move attachments",
+			query: `
+				UPDATE message_attachments
+				SET message_id = :survivor_id,
+					updated_at_ms = MAX(updated_at_ms, :now_ms)
+				WHERE message_id = :duplicate_id
+				  AND NOT EXISTS (
+					SELECT 1
+					FROM message_attachments AS survivor
+					WHERE survivor.message_id = :survivor_id
+					  AND survivor.ordinal = message_attachments.ordinal
+				  )
+			`,
+		},
+	}
+	for _, step := range steps {
+		if _, err := tx.ExecContext(ctx, step.query, arguments...); err != nil {
+			return fmt.Errorf("%s: %w", step.name, err)
+		}
 	}
 	return nil
 }
