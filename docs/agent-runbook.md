@@ -167,6 +167,19 @@ Outgoing-only windows are reported as `ambiguous` and left in place: a
 message frame carries no recipient, so nothing proves where an outbound text
 belongs until the thread's ConversationEvent re-binds the id.
 
+A duplicate is deleted only after what was recorded on it moves to the copy
+that stays, which each delete step in the report names as
+`survivor_message_id`: inbound reactions (per person, the later one wins),
+the reaction snapshot fence, attachments (a downloaded copy wins), queued
+reaction and read-receipt intents, and read cursors in the same thread.
+Intents take the surviving copy's thread, as they do when a row moves,
+because the dispatcher only sends an intent whose target is in its own
+thread. A row stays in its thread, and the group's `detail` says why, when a
+read cursor names it (a cursor can't follow a row into another thread) or
+when the target thread already uses its remote id for other content (the two
+phones' ids collide by chance). Such a row is still deleted if it duplicates
+a row that stays in its thread.
+
 ## Google Messages silent while "connected": the phone stopped relaying
 
 **Symptom:** no new SMS/RCS for hours while `/api/status` shows

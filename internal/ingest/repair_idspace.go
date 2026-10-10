@@ -123,7 +123,10 @@ type repairPlanner struct {
 	metas     []sqlite.RepairStep
 	drops     []sqlite.RepairStep
 	recency   map[string]struct{}
-	planned   map[string]map[string]struct{} // target conversation → content keys planned into it
+	planned   map[string]map[string]string         // target conversation → content key → message planned into it
+	remoteIDs map[string]map[string]sqlite.Message // target conversation → remote id → message planned into it
+	inPlace   map[string]struct{}                  // window rows planMoves leaves where they are
+	merged    map[string]string                    // message a delete step removes → its survivor
 	mintedIDs map[string]struct{}
 }
 
@@ -165,7 +168,10 @@ func PlanGoogleIDSpaceRepair(
 		report:    &report,
 		clobbered: make(map[string]*clobberInfo),
 		recency:   make(map[string]struct{}),
-		planned:   make(map[string]map[string]struct{}),
+		planned:   make(map[string]map[string]string),
+		remoteIDs: make(map[string]map[string]sqlite.Message),
+		inPlace:   make(map[string]struct{}),
+		merged:    make(map[string]string),
 		mintedIDs: make(map[string]struct{}),
 	}
 	selfID, _, err := store.SelfIdentityID(opts.AccountID)
@@ -202,6 +208,13 @@ func PlanGoogleIDSpaceRepair(
 
 	if err := p.planRestores(); err != nil {
 		return IDSpaceRepairReport{}, err
+	}
+	// A delete's survivor can itself be a duplicate the plan deletes; name
+	// the copy that stays.
+	for index := range p.rowSteps {
+		if p.rowSteps[index].Op == "delete" {
+			p.rowSteps[index].SurvivorMessageID = p.root(p.rowSteps[index].SurvivorMessageID)
+		}
 	}
 
 	report.Steps = append(report.Steps, p.mints...)
@@ -374,7 +387,9 @@ func (p *repairPlanner) planGroup(conversationID string, rows []sqlite.Message) 
 		}
 		group.TargetConversationID = target
 		group.TargetTitle = info.live.Title
-		p.planMoves(conversationID, target, rows, &group)
+		if err := p.planMoves(conversationID, target, rows, &group); err != nil {
+			return err
+		}
 		if olderCount == 0 && group.Moved+group.Deleted == len(rows) {
 			p.drops = append(p.drops, sqlite.RepairStep{Op: "drop", ConversationID: conversationID})
 			p.report.Drops++
@@ -511,7 +526,9 @@ func (p *repairPlanner) planGroup(conversationID string, rows []sqlite.Message) 
 		group.Verdict = verdictReroutedExisting
 	}
 
-	p.planMoves(conversationID, target.ConversationID, rows, &group)
+	if err := p.planMoves(conversationID, target.ConversationID, rows, &group); err != nil {
+		return err
+	}
 	if wireID != "" && !minted {
 		p.rebinds = append(p.rebinds, sqlite.RepairStep{
 			Op: "rebind", RemoteConversationID: wireID, TargetConversationID: target.ConversationID,
@@ -530,23 +547,59 @@ func (p *repairPlanner) planGroup(conversationID string, rows []sqlite.Message) 
 }
 
 // planMoves moves window rows to the target, deleting those whose content the
-// target already holds and leaving rows a read cursor still points at.
-func (p *repairPlanner) planMoves(conversationID, target string, rows []sqlite.Message, group *IDSpaceRepairGroup) {
+// target already holds (into that copy). It leaves in place rows a read cursor
+// still points at, or whose remote id the target already uses for other
+// content, unless they restate a row that stays in this conversation.
+func (p *repairPlanner) planMoves(conversationID, target string, rows []sqlite.Message, group *IDSpaceRepairGroup) error {
+	leave := func(row sqlite.Message, why string) error {
+		deleted, err := p.dedupeInPlace(conversationID, row, group)
+		if err != nil || deleted {
+			return err
+		}
+		p.inPlace[row.MessageID] = struct{}{}
+		group.Detail = strings.TrimSpace(group.Detail + " left message " + row.MessageID + " in place: " + why)
+		return nil
+	}
 	for _, row := range rows {
 		cursor, err := p.store.MessageHasReadCursor(row.MessageID)
-		if err == nil && cursor {
-			group.Detail = strings.TrimSpace(group.Detail + " left message " + row.MessageID + " in place: a read cursor references it")
+		if err != nil {
+			return err
+		}
+		if cursor {
+			if err := leave(row, "a read cursor references it"); err != nil {
+				return err
+			}
 			continue
 		}
-		duplicate, _ := p.isPlannedOrStoredDuplicate(target, row)
-		if duplicate {
-			p.rowSteps = append(p.rowSteps, sqlite.RepairStep{
-				Op: "delete", MessageID: row.MessageID, ConversationID: conversationID,
-				Reason: "duplicate of content already in " + target,
-			})
-			group.Deleted++
-			p.report.Deletes++
+		survivorID, duplicate, err := p.plannedOrStoredDuplicate(target, row)
+		if err != nil {
+			return err
+		}
+		if duplicate && p.planDelete(conversationID, row, survivorID, "duplicate of content already in "+target, group) {
 			continue
+		}
+		// UNIQUE(account_id, conversation_id, remote_message_id) bars a move
+		// onto a remote id the target already holds. Ids from the two device
+		// id spaces collide by chance, so a matching id is no evidence the
+		// rows are one message; only matching content is.
+		holder, taken, err := p.remoteIDHolder(target, row.RemoteMessageID)
+		if err != nil {
+			return err
+		}
+		if taken {
+			sameContent := strings.TrimSpace(row.Body) != "" && contentKey(holder) == contentKey(row)
+			if sameContent && p.planDelete(conversationID, row, holder.MessageID,
+				"duplicate of "+holder.MessageID+", which holds the same remote id in "+target, group) {
+				continue
+			}
+			// A holder the plan deletes is gone before this row moves: its
+			// delete step comes first. Any other holder keeps the id.
+			if _, deleted := p.merged[holder.MessageID]; !deleted {
+				if err := leave(row, target+" already holds remote id "+row.RemoteMessageID+" for other content"); err != nil {
+					return err
+				}
+				continue
+			}
 		}
 		p.rowSteps = append(p.rowSteps, sqlite.RepairStep{
 			Op: "move", MessageID: row.MessageID, ConversationID: conversationID,
@@ -556,6 +609,7 @@ func (p *repairPlanner) planMoves(conversationID, target string, rows []sqlite.M
 		group.Moved++
 		p.report.Moves++
 	}
+	return nil
 }
 
 // resolveClobberTarget finds or mints the thread the overwriting
@@ -686,7 +740,9 @@ func (p *repairPlanner) rosterFromIDs(peerIDs []string) []sqlite.RepairParticipa
 }
 
 // dedupeWithin deletes window rows that restate content the conversation
-// already held (an older row, or an earlier row in the same window).
+// already held (an older row, or an earlier row in the same window), merging
+// each into that older row. The older row stays in this conversation, so a
+// read cursor on the duplicate moves to it.
 func (p *repairPlanner) dedupeWithin(conversationID string, rows []sqlite.Message, group *IDSpaceRepairGroup) error {
 	for _, row := range rows {
 		if strings.TrimSpace(row.Body) == "" {
@@ -707,22 +763,66 @@ func (p *repairPlanner) dedupeWithin(conversationID string, rows []sqlite.Messag
 		if !older {
 			continue
 		}
-		cursor, err := p.store.MessageHasReadCursor(row.MessageID)
-		if err != nil {
-			return err
+		if p.planDelete(conversationID, row, existing.MessageID, "duplicate of "+existing.MessageID, group) {
+			p.recency[conversationID] = struct{}{}
 		}
-		if cursor {
-			continue
-		}
-		p.rowSteps = append(p.rowSteps, sqlite.RepairStep{
-			Op: "delete", MessageID: row.MessageID, ConversationID: conversationID,
-			Reason: "duplicate of " + existing.MessageID,
-		})
-		group.Deleted++
-		p.report.Deletes++
-		p.recency[conversationID] = struct{}{}
 	}
 	return nil
+}
+
+// dedupeInPlace deletes a row planMoves can't move when it restates a row
+// that stays in its conversation: one from before the window (the repair
+// moves and deletes only window rows) or one already left in place. That is
+// the delete dedupeWithin would plan for the row once it is the only kind
+// left in its conversation, so a second plan finds nothing to do.
+func (p *repairPlanner) dedupeInPlace(conversationID string, row sqlite.Message, group *IDSpaceRepairGroup) (bool, error) {
+	if strings.TrimSpace(row.Body) == "" {
+		return false, nil
+	}
+	existing, found, err := p.messages.FindMessageContentDuplicate(
+		p.ctx, p.opts.AccountID, conversationID, row.RemoteMessageID,
+		row.Direction, row.SenderIdentityID, row.OccurredAtMS, row.Body,
+	)
+	if err != nil || !found {
+		return false, err
+	}
+	_, stays := p.inPlace[existing.MessageID]
+	if existing.CreatedAtMS >= p.opts.SinceMS && !stays {
+		return false, nil
+	}
+	return p.planDelete(conversationID, row, existing.MessageID, "duplicate of "+existing.MessageID, group), nil
+}
+
+// planDelete plans deleting row into survivorID, unless the plan already
+// merges survivorID into row: the two would delete each other. That happens
+// when two misfiled threads are routed into each other and each holds a copy
+// of the same message; the row planned first goes and the other stays.
+func (p *repairPlanner) planDelete(conversationID string, row sqlite.Message, survivorID, reason string, group *IDSpaceRepairGroup) bool {
+	if p.root(survivorID) == row.MessageID {
+		return false
+	}
+	p.rowSteps = append(p.rowSteps, sqlite.RepairStep{
+		Op: "delete", MessageID: row.MessageID, ConversationID: conversationID,
+		SurvivorMessageID: survivorID, Reason: reason,
+	})
+	p.merged[row.MessageID] = survivorID
+	group.Deleted++
+	p.report.Deletes++
+	return true
+}
+
+// root follows planned deletes from messageID to the copy that stays.
+// planDelete never plans a delete whose survivor leads back to its row, so
+// the walk takes at most len(p.merged) hops.
+func (p *repairPlanner) root(messageID string) string {
+	for range len(p.merged) {
+		next, deleted := p.merged[messageID]
+		if !deleted {
+			break
+		}
+		messageID = next
+	}
+	return messageID
 }
 
 func contentKey(row sqlite.Message) string {
@@ -735,26 +835,52 @@ func contentKey(row sqlite.Message) string {
 
 func (p *repairPlanner) rememberPlanned(target string, row sqlite.Message) {
 	if p.planned[target] == nil {
-		p.planned[target] = make(map[string]struct{})
+		p.planned[target] = make(map[string]string)
+		p.remoteIDs[target] = make(map[string]sqlite.Message)
 	}
-	p.planned[target][contentKey(row)] = struct{}{}
+	p.planned[target][contentKey(row)] = row.MessageID
+	p.remoteIDs[target][row.RemoteMessageID] = row
 }
 
-func (p *repairPlanner) isPlannedOrStoredDuplicate(target string, row sqlite.Message) (bool, error) {
+// plannedOrStoredDuplicate returns the message holding row's content in
+// target: a row already planned into it, else a stored one.
+func (p *repairPlanner) plannedOrStoredDuplicate(target string, row sqlite.Message) (string, bool, error) {
 	if strings.TrimSpace(row.Body) == "" {
-		return false, nil
+		return "", false, nil
 	}
-	if _, ok := p.planned[target][contentKey(row)]; ok {
-		return true, nil
+	if messageID, ok := p.planned[target][contentKey(row)]; ok {
+		return messageID, true, nil
 	}
 	if _, minted := p.mintedIDs[target]; minted {
-		return false, nil
+		return "", false, nil
 	}
-	_, found, err := p.messages.FindMessageContentDuplicate(
+	existing, found, err := p.messages.FindMessageContentDuplicate(
 		p.ctx, p.opts.AccountID, target, row.RemoteMessageID,
 		row.Direction, row.SenderIdentityID, row.OccurredAtMS, row.Body,
 	)
-	return found, err
+	if err != nil || !found {
+		return "", false, err
+	}
+	return existing.MessageID, true, nil
+}
+
+// remoteIDHolder returns the message that holds remoteID in target: a row
+// already planned into it, else a stored one.
+func (p *repairPlanner) remoteIDHolder(target, remoteID string) (sqlite.Message, bool, error) {
+	if holder, ok := p.remoteIDs[target][remoteID]; ok {
+		return holder, true, nil
+	}
+	if _, minted := p.mintedIDs[target]; minted {
+		return sqlite.Message{}, false, nil
+	}
+	holder, err := p.messages.GetMessageByRemote(p.ctx, p.opts.AccountID, target, remoteID)
+	if errors.Is(err, sqlite.ErrNotFound) {
+		return sqlite.Message{}, false, nil
+	}
+	if err != nil {
+		return sqlite.Message{}, false, err
+	}
+	return holder, true, nil
 }
 
 // mint plans a fresh conversation bound to the wire id, keyed past any
