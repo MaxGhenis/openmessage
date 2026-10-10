@@ -1459,9 +1459,9 @@ func (w *Worker) prepareReactionActor(
 ) (preparedReactionActor, error) {
 	if reference.IsSelf {
 		return preparedReactionActor{
-			key:    "self",
+			key:    sqlite.SelfReactorKey,
 			isSelf: true,
-			label:  "me",
+			label:  sqlite.SelfReactorLabel,
 		}, nil
 	}
 	if identityRaw(reference) == "" {

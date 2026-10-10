@@ -5990,7 +5990,10 @@ body::after {
   const NOTIFICATION_MODE_MENTIONS = 'mentions';
   const NOTIFICATION_MODE_MUTED = 'muted';
   const OUTBOX_VISIBLE_STATES = new Set(['queued', 'dispatching', 'not_dispatched', 'uncertain', 'store_failed']);
-  const OUTBOX_SEND_KINDS = new Set(['text', 'media']);
+  const OUTBOX_TRAY_KINDS = new Set(['text', 'media', 'reaction']);
+  // A reaction is listed only while the app is still sending it. It has no
+  // "send again", so one that ends unresolved is reported when it is sent.
+  const OUTBOX_REACTION_STATES = new Set(['queued', 'dispatching', 'not_dispatched']);
   let activeConvoId = null;
   let conversations = [];
   let allConversations = [];
@@ -11918,10 +11921,11 @@ body::after {
   }
 
   // The v2 tray is a read-through view of the durable outbox. It deliberately
-  // omits terminal rows and non-message intents; confirmed sends live in the
-  // thread, while reactions/read receipts remain outside this surface.
+  // omits terminal rows and read receipts; confirmed sends and reactions live
+  // in the thread.
   function outboxRowView(row, now = Date.now()) {
     const stateName = String(row && row.state || '').trim().toLowerCase();
+    const isReaction = String(row && row.kind || '').trim().toLowerCase() === 'reaction';
     const scheduledForMS = Number(row && row.scheduled_for_ms || 0);
     const nextAttemptMS = Number(row && row.next_attempt_at_ms || 0);
     const scheduled = stateName === 'queued' && scheduledForMS > now;
@@ -11942,22 +11946,28 @@ body::after {
         view.label = scheduled ? 'Scheduled' : 'Sending…';
         view.guidance = scheduled
           ? 'Waiting in the outbox until the scheduled time.'
-          : 'The app owns this send; do not resend it.';
+          : (isReaction ? 'The app owns this reaction; do not react again.' : 'The app owns this send; do not resend it.');
         view.action = 'cancel';
         view.actionLabel = 'Cancel';
-        view.actionTitle = scheduled ? 'Cancel scheduled send' : 'Cancel queued send';
+        view.actionTitle = scheduled ? 'Cancel scheduled send' : (isReaction ? 'Cancel queued reaction' : 'Cancel queued send');
         if (scheduled) view.timePrefix = 'For';
         break;
       case 'dispatching':
         view.label = 'Sending…';
-        view.guidance = 'The send is in progress; do not resend it.';
+        view.guidance = isReaction
+          ? 'The reaction is in progress; do not react again.'
+          : 'The send is in progress; do not resend it.';
         break;
       case 'not_dispatched':
         view.label = 'Retrying…';
-        view.guidance = 'The app retries automatically; do not resend it.';
+        view.guidance = isReaction
+          ? 'The app retries automatically; do not react again.'
+          : 'The app retries automatically; do not resend it.';
         view.action = 'cancel';
         view.actionLabel = 'Cancel';
-        view.actionTitle = 'Cancel this automatically retrying send';
+        view.actionTitle = isReaction
+          ? 'Cancel this automatically retrying reaction'
+          : 'Cancel this automatically retrying send';
         break;
       case 'uncertain':
         view.label = 'Sent — unconfirmed';
@@ -11976,14 +11986,19 @@ body::after {
       default:
         view.visible = false;
     }
+    if (isReaction && !OUTBOX_REACTION_STATES.has(stateName)) {
+      view.visible = false;
+      view.action = '';
+      view.actionLabel = '';
+      view.actionTitle = '';
+    }
     return view;
   }
 
   function visibleOutboxRows() {
     return outboxRows.filter(row => {
       const kind = String(row && row.kind || '').trim().toLowerCase();
-      const stateName = String(row && row.state || '').trim().toLowerCase();
-      return OUTBOX_SEND_KINDS.has(kind) && OUTBOX_VISIBLE_STATES.has(stateName);
+      return OUTBOX_TRAY_KINDS.has(kind) && outboxRowView(row).visible;
     });
   }
 
@@ -12001,8 +12016,10 @@ body::after {
 
   function outboxRowHTML(row, now) {
     const view = outboxRowView(row, now);
-    const summary = String(row && row.summary || '').trim()
-      || (String(row && row.kind || '').toLowerCase() === 'media' ? 'Attachment' : 'Message');
+    const kind = String(row && row.kind || '').toLowerCase();
+    const summary = kind === 'reaction'
+      ? `Reaction ${String(row && row.summary || '').trim()}`.trim()
+      : (String(row && row.summary || '').trim() || (kind === 'media' ? 'Attachment' : 'Message'));
     const time = view.timeMS > 0
       ? `${view.timePrefix} ${formatScheduledWhen(view.timeMS)}`
       : '';
@@ -14059,18 +14076,41 @@ body::after {
   }
 
   // ─── Reactions ───
-	  window.sendReaction = async function(messageId, emoji) {
-	    // Close pickers
-	    document.querySelectorAll('.emoji-picker.show').forEach(p => p.classList.remove('show'));
-	    document.querySelectorAll('.emoji-full-panel.show').forEach(p => p.classList.remove('show'));
-	    closeComposeGifPanel();
+  // On a v2 daemon /api/react stores the reaction on the outbox and waits a
+  // few seconds for it. 200 means the platform accepted it, 202 means it is
+  // stored and still the app's to send, and anything else means this reaction
+  // will not go out.
+  async function reactionError(response) {
+    if (state.v2Primary === true) {
+      if (response.status === 422) return new Error("Can't react to that message.");
+      if (response.status === 501) return new Error("This conversation can't send reactions.");
+      if (response.status === 503) return new Error('Reactions are starting up — try again.');
+    }
+    return new Error(await responseError(response));
+  }
+
+  window.sendReaction = async function(messageId, emoji) {
+    // Close pickers
+    document.querySelectorAll('.emoji-picker.show').forEach(p => p.classList.remove('show'));
+    document.querySelectorAll('.emoji-full-panel.show').forEach(p => p.classList.remove('show'));
+    closeComposeGifPanel();
     try {
-      await postJSON('/api/react', {
-        message_id: messageId,
-        emoji: emoji,
-        conversation_id: activeConvoId,
-        action: 'add',
+      const response = await fetch(API + '/api/react', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          message_id: messageId,
+          emoji: emoji,
+          conversation_id: activeConvoId,
+          action: 'add',
+        }),
       });
+      if (!response.ok) throw await reactionError(response);
+      const result = await response.json().catch(() => null);
+      if (response.status === 202 || (result && result.queued)) {
+        showThreadFeedback("Reaction not sent yet. The app keeps trying; it's in the outbox, where you can cancel it.", 'send');
+        scheduleOutboxRefresh(0);
+      }
       // Reload to see updated reactions
       if (activeConvoId) await loadMessages(activeConvoId, {poll: true});
     } catch (err) {
