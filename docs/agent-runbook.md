@@ -174,11 +174,13 @@ the reaction snapshot fence, attachments (a downloaded copy wins), queued
 reaction and read-receipt intents, and read cursors in the same thread.
 Intents take the surviving copy's thread, as they do when a row moves,
 because the dispatcher only sends an intent whose target is in its own
-thread. A row stays in its thread, and the group's `detail` says why, when a
-read cursor names it (a cursor can't follow a row into another thread) or
-when the target thread already uses its remote id for other content (the two
-phones' ids collide by chance). Such a row is still deleted if it duplicates
-a row that stays in its thread.
+thread. A row stays in its thread, and the group's `detail` says why, when an
+unfinished send names it as its local copy (dispatch reads that row in the
+send's own thread), when a read cursor names it (a cursor can't follow a row
+into another thread), or when the target thread already uses its remote id
+for other content (the two phones' ids collide by chance). A row kept for a
+cursor or a taken id is still deleted if it duplicates a row that stays in
+its thread; a row an unfinished send names is never deleted.
 
 ## Google Messages silent while "connected": the phone stopped relaying
 

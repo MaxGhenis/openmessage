@@ -125,7 +125,7 @@ type repairPlanner struct {
 	recency   map[string]struct{}
 	planned   map[string]map[string]string         // target conversation → content key → message planned into it
 	remoteIDs map[string]map[string]sqlite.Message // target conversation → remote id → message planned into it
-	inPlace   map[string]struct{}                  // window rows planMoves leaves where they are
+	inPlace   map[string]map[string]string         // conversation → content key → window row planMoves leaves there
 	merged    map[string]string                    // message a delete step removes → its survivor
 	mintedIDs map[string]struct{}
 }
@@ -170,7 +170,7 @@ func PlanGoogleIDSpaceRepair(
 		recency:   make(map[string]struct{}),
 		planned:   make(map[string]map[string]string),
 		remoteIDs: make(map[string]map[string]sqlite.Message),
-		inPlace:   make(map[string]struct{}),
+		inPlace:   make(map[string]map[string]string),
 		merged:    make(map[string]string),
 		mintedIDs: make(map[string]struct{}),
 	}
@@ -547,20 +547,36 @@ func (p *repairPlanner) planGroup(conversationID string, rows []sqlite.Message) 
 }
 
 // planMoves moves window rows to the target, deleting those whose content the
-// target already holds (into that copy). It leaves in place rows a read cursor
-// still points at, or whose remote id the target already uses for other
-// content, unless they restate a row that stays in this conversation.
+// target already holds (into that copy). It leaves in place rows an unfinished
+// send names, and rows a read cursor still points at or whose remote id the
+// target already uses for other content unless they restate a row that stays
+// in this conversation.
 func (p *repairPlanner) planMoves(conversationID, target string, rows []sqlite.Message, group *IDSpaceRepairGroup) error {
+	keep := func(row sqlite.Message, why string) {
+		if p.inPlace[conversationID] == nil {
+			p.inPlace[conversationID] = make(map[string]string)
+		}
+		if _, seen := p.inPlace[conversationID][contentKey(row)]; !seen {
+			p.inPlace[conversationID][contentKey(row)] = row.MessageID
+		}
+		group.Detail = strings.TrimSpace(group.Detail + " left message " + row.MessageID + " in place: " + why)
+	}
 	leave := func(row sqlite.Message, why string) error {
 		deleted, err := p.dedupeInPlace(conversationID, row, group)
-		if err != nil || deleted {
-			return err
+		if err == nil && !deleted {
+			keep(row, why)
 		}
-		p.inPlace[row.MessageID] = struct{}{}
-		group.Detail = strings.TrimSpace(group.Detail + " left message " + row.MessageID + " in place: " + why)
-		return nil
+		return err
 	}
 	for _, row := range rows {
+		openSend, err := p.store.MessageHasOpenSend(row.MessageID)
+		if err != nil {
+			return err
+		}
+		if openSend {
+			keep(row, "an unfinished send names it")
+			continue
+		}
 		cursor, err := p.store.MessageHasReadCursor(row.MessageID)
 		if err != nil {
 			return err
@@ -763,6 +779,14 @@ func (p *repairPlanner) dedupeWithin(conversationID string, rows []sqlite.Messag
 		if !older {
 			continue
 		}
+		// An unfinished send reads this row as its local copy at dispatch.
+		openSend, err := p.store.MessageHasOpenSend(row.MessageID)
+		if err != nil {
+			return err
+		}
+		if openSend {
+			continue
+		}
 		if p.planDelete(conversationID, row, existing.MessageID, "duplicate of "+existing.MessageID, group) {
 			p.recency[conversationID] = struct{}{}
 		}
@@ -779,18 +803,20 @@ func (p *repairPlanner) dedupeInPlace(conversationID string, row sqlite.Message,
 	if strings.TrimSpace(row.Body) == "" {
 		return false, nil
 	}
-	existing, found, err := p.messages.FindMessageContentDuplicate(
-		p.ctx, p.opts.AccountID, conversationID, row.RemoteMessageID,
-		row.Direction, row.SenderIdentityID, row.OccurredAtMS, row.Body,
-	)
-	if err != nil || !found {
-		return false, err
+	survivorID, stays := p.inPlace[conversationID][contentKey(row)]
+	if !stays {
+		// The lookup returns the oldest copy, so a copy from before the
+		// window is found whenever one exists.
+		existing, found, err := p.messages.FindMessageContentDuplicate(
+			p.ctx, p.opts.AccountID, conversationID, row.RemoteMessageID,
+			row.Direction, row.SenderIdentityID, row.OccurredAtMS, row.Body,
+		)
+		if err != nil || !found || existing.CreatedAtMS >= p.opts.SinceMS {
+			return false, err
+		}
+		survivorID = existing.MessageID
 	}
-	_, stays := p.inPlace[existing.MessageID]
-	if existing.CreatedAtMS >= p.opts.SinceMS && !stays {
-		return false, nil
-	}
-	return p.planDelete(conversationID, row, existing.MessageID, "duplicate of "+existing.MessageID, group), nil
+	return p.planDelete(conversationID, row, survivorID, "duplicate of "+survivorID, group), nil
 }
 
 // planDelete plans deleting row into survivorID, unless the plan already

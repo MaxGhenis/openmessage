@@ -28,6 +28,8 @@ func repairPropertyMessageID(index int) string {
 // repairPlanScenario is a random message graph and a random plan over it.
 type repairPlanScenario struct {
 	Conversations   [repairPropertyMessages]int // conversation index per message
+	Bodies          [repairPropertyMessages]int // body variant per message; deletes need equal content
+	Sends           map[int]bool                // message -> its send is still open (else confirmed)
 	Reactions       map[[2]int]echoMergeReactionSeed
 	Fences          map[int]int64
 	Attachments     map[[2]int]int // (message, ordinal) -> 1 pending, 2 downloaded
@@ -44,10 +46,17 @@ func (repairPlanScenario) Generate(r *rand.Rand, _ int) reflect.Value {
 		Fences:       map[int]int64{},
 		Attachments:  map[[2]int]int{},
 		Cursors:      map[[2]int]int{},
+		Sends:        map[int]bool{},
 		FutureOutbox: r.Intn(4) == 0,
 	}
 	for index := range scenario.Conversations {
 		scenario.Conversations[index] = r.Intn(len(repairPropertyConversations))
+		if r.Intn(4) == 0 {
+			scenario.Bodies[index] = 1
+		}
+		if r.Intn(6) == 0 {
+			scenario.Sends[index] = r.Intn(2) == 0
+		}
 	}
 	for message := range repairPropertyMessages {
 		for reactor := range 3 {
@@ -126,12 +135,21 @@ func (repairPlanScenario) Generate(r *rand.Rand, _ int) reflect.Value {
 
 // repairPlanState is every row the move and delete steps touch.
 type repairPlanState struct {
-	Messages    map[string]string // message_id -> conversation_id
+	Messages    map[string]repairMessageRow // message_id
+	Sends       map[string]repairSendRow    // outbox_id of text sends
 	Reactions   map[[2]string]echoMergeReactionRow
 	Fences      map[string]echoMergeFenceRow
 	Attachments map[echoMergeAttachmentKey]echoMergeAttachmentRow
 	Cursors     map[[2]string]echoMergeCursorRow
 	Intents     map[string]repairIntentRow // outbox_id
+}
+
+type repairMessageRow struct {
+	ConversationID, Body string
+}
+
+type repairSendRow struct {
+	LocalMessageID, ConversationID, State string
 }
 
 type repairIntentRow struct {
@@ -141,7 +159,8 @@ type repairIntentRow struct {
 
 func (state repairPlanState) clone() repairPlanState {
 	clone := repairPlanState{
-		Messages:    map[string]string{},
+		Messages:    map[string]repairMessageRow{},
+		Sends:       state.Sends,
 		Reactions:   map[[2]string]echoMergeReactionRow{},
 		Fences:      map[string]echoMergeFenceRow{},
 		Attachments: map[echoMergeAttachmentKey]echoMergeAttachmentRow{},
@@ -183,7 +202,7 @@ func repairPlanModel(before repairPlanState, steps []RepairStep, nowMS int64, co
 	for _, step := range steps {
 		switch step.Op {
 		case "move":
-			conversation, exists := state.Messages[step.MessageID]
+			message, exists := state.Messages[step.MessageID]
 			if !exists {
 				coverage["move of a missing message"]++
 				continue
@@ -191,6 +210,12 @@ func repairPlanModel(before repairPlanState, steps []RepairStep, nowMS int64, co
 			for _, cursor := range state.Cursors {
 				if cursor.LastReadMessageID.String == step.MessageID && cursor.ConversationID != step.TargetConversationID {
 					return refuse("move under a read cursor")
+				}
+			}
+			for _, send := range state.Sends {
+				if send.LocalMessageID == step.MessageID && send.State != "confirmed" &&
+					send.ConversationID != step.TargetConversationID {
+					return refuse("move under an open send")
 				}
 			}
 			for key, reaction := range state.Reactions {
@@ -208,19 +233,25 @@ func repairPlanModel(before repairPlanState, steps []RepairStep, nowMS int64, co
 					coverage["intent follows a moved message"]++
 				}
 			}
-			if conversation != step.TargetConversationID {
+			if message.ConversationID != step.TargetConversationID {
 				coverage["move across conversations"]++
 			}
-			state.Messages[step.MessageID] = step.TargetConversationID
+			message.ConversationID = step.TargetConversationID
+			state.Messages[step.MessageID] = message
 		case "delete":
 			duplicate := step.MessageID
 			if step.SurvivorMessageID == "" {
 				return refuse("no survivor")
 			}
-			duplicateConversation, exists := state.Messages[duplicate]
+			duplicateRow, exists := state.Messages[duplicate]
 			if !exists {
 				coverage["delete of a missing duplicate"]++
 				continue
+			}
+			for _, send := range state.Sends {
+				if send.LocalMessageID == duplicate && send.State != "confirmed" {
+					return refuse("delete under an open send")
+				}
 			}
 			survivor := step.SurvivorMessageID
 			for {
@@ -234,11 +265,15 @@ func repairPlanModel(before repairPlanState, steps []RepairStep, nowMS int64, co
 			if survivor == duplicate {
 				return refuse("own survivor")
 			}
-			survivorConversation, exists := state.Messages[survivor]
+			survivorRow, exists := state.Messages[survivor]
 			if !exists {
 				return refuse("survivor missing")
 			}
-			if survivorConversation != duplicateConversation {
+			if survivorRow.Body != duplicateRow.Body {
+				return refuse("content differs")
+			}
+			survivorConversation := survivorRow.ConversationID
+			if survivorConversation != duplicateRow.ConversationID {
 				for _, cursor := range state.Cursors {
 					if cursor.LastReadMessageID.String == duplicate {
 						return refuse("cursor can't follow")
@@ -323,10 +358,12 @@ func repairPlanModel(before repairPlanState, steps []RepairStep, nowMS int64, co
 
 // Property (repair plan model): for any message graph and any sequence of
 // move and delete steps, ApplyRepairPlan either commits exactly the rows
-// repairPlanModel derives, or fails and leaves every row as it was. After a
-// committed plan, no row references a deleted message, foreign_key_check is
-// clean, cursors and intents are conserved, and every intent's target is in
-// the intent's own conversation.
+// repairPlanModel derives, or fails and leaves every row as it was. The model
+// refuses a delete whose survivor holds other content, so a deleted message's
+// content always survives. After a committed plan, no row references a
+// deleted message, foreign_key_check is clean, cursors and intents are
+// conserved, every intent's target is in the intent's own conversation, and
+// every open send still has its local message in its own conversation.
 func TestApplyRepairPlanMatchesModelProperty(t *testing.T) {
 	coverage := map[string]int{}
 	clock := newOutboxTestClock(outboxTestTimeMS)
@@ -374,9 +411,17 @@ func TestApplyRepairPlanMatchesModelProperty(t *testing.T) {
 				len(before.Cursors), len(after.Cursors), len(before.Intents), len(after.Intents))
 		}
 		for outboxID, intent := range after.Intents {
-			if after.Messages[intent.Target] != intent.ConversationID {
+			if after.Messages[intent.Target].ConversationID != intent.ConversationID {
 				t.Errorf("intent %s targets %s in %s, outside its conversation %s",
-					outboxID, intent.Target, after.Messages[intent.Target], intent.ConversationID)
+					outboxID, intent.Target, after.Messages[intent.Target].ConversationID, intent.ConversationID)
+			}
+		}
+		for outboxID, send := range after.Sends {
+			if send.State == "confirmed" {
+				continue
+			}
+			if row, kept := after.Messages[send.LocalMessageID]; !kept || row.ConversationID != send.ConversationID {
+				t.Errorf("open send %s lost its local message %s in %s", outboxID, send.LocalMessageID, send.ConversationID)
 			}
 		}
 		return !t.Failed()
@@ -395,6 +440,7 @@ func TestApplyRepairPlanMatchesModelProperty(t *testing.T) {
 		"delete of a missing duplicate", "move of a missing message",
 		"refused: no survivor", "refused: own survivor", "refused: survivor missing",
 		"refused: cursor can't follow", "refused: move under a read cursor",
+		"refused: move under an open send", "refused: delete under an open send", "refused: content differs",
 		"reaction conflict: survivor's row stays",
 	} {
 		if coverage[name] == 0 {
@@ -411,6 +457,22 @@ func seedRepairPlanScenario(t *testing.T, store *Store, repository *OutboxReposi
 	}
 	for message := range repairPropertyMessages {
 		seedOutboxTestMessage(t, store, repairPropertyMessageID(message), "account-a", conversationOf(message))
+		mustExec(t, store.db, `UPDATE messages SET body = ? WHERE message_id = ?`,
+			"body-"+strconv.Itoa(scenario.Bodies[message]), repairPropertyMessageID(message))
+	}
+	for message, open := range scenario.Sends {
+		state := "confirmed"
+		if open {
+			state = "queued"
+		}
+		id := "plan-send-" + strconv.Itoa(message)
+		mustExec(t, store.db, `
+			INSERT INTO outbox (
+				outbox_id, account_id, conversation_id, kind, idempotency_key, payload_hash, operation,
+				state, local_message_id, transport_request_id, scheduled_for_ms, created_at_ms, updated_at_ms
+			) VALUES (?, 'account-a', ?, 'text', ?, ?, 'send_text', ?, ?, ?, ?, ?, ?)
+		`, "outbox-"+id, conversationOf(message), "idempotency-"+id, "hash-"+id, state,
+			repairPropertyMessageID(message), "request-"+id, outboxTestTimeMS, outboxTestTimeMS, outboxTestTimeMS)
 	}
 	for key, seed := range scenario.Reactions {
 		messageID := repairPropertyMessageID(key[0])
@@ -484,7 +546,8 @@ func readRepairPlanState(t *testing.T, store *Store) repairPlanState {
 	t.Helper()
 	snapshot := readEchoMergeSnapshot(t, store)
 	state := repairPlanState{
-		Messages:    map[string]string{},
+		Messages:    map[string]repairMessageRow{},
+		Sends:       map[string]repairSendRow{},
 		Reactions:   snapshot.Reactions,
 		Fences:      snapshot.Fences,
 		Attachments: snapshot.Attachments,
@@ -506,10 +569,18 @@ func readRepairPlanState(t *testing.T, store *Store) repairPlanState {
 			t.Fatalf("iterate snapshot %q: %v", statement, err)
 		}
 	}
-	query(`SELECT message_id, conversation_id FROM messages`, func(rows *sql.Rows) error {
-		var messageID, conversationID string
-		err := rows.Scan(&messageID, &conversationID)
-		state.Messages[messageID] = conversationID
+	query(`SELECT message_id, conversation_id, body FROM messages`, func(rows *sql.Rows) error {
+		var messageID string
+		var row repairMessageRow
+		err := rows.Scan(&messageID, &row.ConversationID, &row.Body)
+		state.Messages[messageID] = row
+		return err
+	})
+	query(`SELECT outbox_id, local_message_id, conversation_id, state FROM outbox WHERE kind = 'text'`, func(rows *sql.Rows) error {
+		var outboxID string
+		var send repairSendRow
+		err := rows.Scan(&outboxID, &send.LocalMessageID, &send.ConversationID, &send.State)
+		state.Sends[outboxID] = send
 		return err
 	})
 	query(`
@@ -517,6 +588,7 @@ func readRepairPlanState(t *testing.T, store *Store) repairPlanState {
 		FROM outbox AS o
 		LEFT JOIN outbox_reactions AS r ON r.outbox_id = o.outbox_id
 		LEFT JOIN outbox_read_receipts AS p ON p.outbox_id = o.outbox_id
+		WHERE o.kind IN ('reaction', 'read')
 	`, func(rows *sql.Rows) error {
 		var outboxID string
 		var intent repairIntentRow

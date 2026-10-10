@@ -38,7 +38,8 @@ type repairDamageScenario struct {
 	Attachments     map[int]bool // row -> downloaded
 	ReactionIntents []int
 	ReceiptIntents  []int
-	Cursors         map[int]int // conversation -> row
+	Cursors         map[[2]int]int // (device, conversation) -> row, or -1 for a cursor naming no message
+	Sends           map[int]bool   // row -> its text send is still open (else confirmed)
 }
 
 func (repairDamageScenario) Generate(r *rand.Rand, _ int) reflect.Value {
@@ -46,7 +47,8 @@ func (repairDamageScenario) Generate(r *rand.Rand, _ int) reflect.Value {
 		Reactions:   map[[2]int][2]int64{},
 		Fences:      map[int]int64{},
 		Attachments: map[int]bool{},
-		Cursors:     map[int]int{},
+		Cursors:     map[[2]int]int{},
+		Sends:       map[int]bool{},
 	}
 	// Google message ids are the phone's row ids. Older rows come from the
 	// old phone and window rows from the new one, so an id is unique within
@@ -127,18 +129,28 @@ func (repairDamageScenario) Generate(r *rand.Rand, _ int) reflect.Value {
 		scenario.ReceiptIntents = append(scenario.ReceiptIntents, r.Intn(rows))
 	}
 	all := append(append([]repairRowSeed{}, scenario.Older...), scenario.Window...)
-	for conversation := range 4 {
-		if r.Intn(3) != 0 {
-			continue
-		}
-		var members []int
-		for index, row := range all {
-			if row.Conversation == conversation {
-				members = append(members, index)
+	for device := range 2 {
+		for conversation := range 4 {
+			if r.Intn(3) != 0 {
+				continue
+			}
+			var members []int
+			for index, row := range all {
+				if row.Conversation == conversation {
+					members = append(members, index)
+				}
+			}
+			switch {
+			case len(members) > 0 && r.Intn(5) != 0:
+				scenario.Cursors[[2]int{device, conversation}] = members[r.Intn(len(members))]
+			default:
+				scenario.Cursors[[2]int{device, conversation}] = -1
 			}
 		}
-		if len(members) > 0 {
-			scenario.Cursors[conversation] = members[r.Intn(len(members))]
+	}
+	for row := range rows {
+		if r.Intn(8) == 0 {
+			scenario.Sends[row] = r.Intn(2) == 0
 		}
 	}
 	return reflect.ValueOf(scenario)
@@ -151,7 +163,9 @@ type repairDamageState struct {
 	Fences      map[string]int64
 	Attachments map[string]string // message -> state (ordinal 0)
 	Intents     map[string][2]string
-	Cursors     map[string]string // conversation -> message
+	Cursors     map[[2]string]string // (device, conversation) -> message, "" for none
+	Sends       map[string][3]string // outbox_id -> (local message, conversation, state)
+	Threads     map[string]bool      // conversation ids
 }
 
 type repairMessageRow struct {
@@ -168,7 +182,9 @@ func readRepairDamageState(t *testing.T, path string) repairDamageState {
 		Fences:      map[string]int64{},
 		Attachments: map[string]string{},
 		Intents:     map[string][2]string{},
-		Cursors:     map[string]string{},
+		Cursors:     map[[2]string]string{},
+		Sends:       map[string][3]string{},
+		Threads:     map[string]bool{},
 	}
 	query := func(statement string, each func(*sql.Rows) error) {
 		rows, err := database.Query(statement)
@@ -216,16 +232,30 @@ func readRepairDamageState(t *testing.T, path string) repairDamageState {
 	query(`SELECT o.outbox_id, COALESCE(r.target_message_id, p.last_read_message_id), o.conversation_id
 		FROM outbox AS o
 		LEFT JOIN outbox_reactions AS r ON r.outbox_id = o.outbox_id
-		LEFT JOIN outbox_read_receipts AS p ON p.outbox_id = o.outbox_id`, func(rows *sql.Rows) error {
+		LEFT JOIN outbox_read_receipts AS p ON p.outbox_id = o.outbox_id
+		WHERE o.kind IN ('reaction', 'read')`, func(rows *sql.Rows) error {
 		var outboxID, target, conversation string
 		err := rows.Scan(&outboxID, &target, &conversation)
 		state.Intents[outboxID] = [2]string{target, conversation}
 		return err
 	})
-	query(`SELECT conversation_id, last_read_message_id FROM read_cursors`, func(rows *sql.Rows) error {
-		var conversation, message string
-		err := rows.Scan(&conversation, &message)
-		state.Cursors[conversation] = message
+	query(`SELECT device_id, conversation_id, COALESCE(last_read_message_id, '') FROM read_cursors`, func(rows *sql.Rows) error {
+		var device, conversation, message string
+		err := rows.Scan(&device, &conversation, &message)
+		state.Cursors[[2]string{device, conversation}] = message
+		return err
+	})
+	query(`SELECT outbox_id, local_message_id, conversation_id, state FROM outbox WHERE kind = 'text'`, func(rows *sql.Rows) error {
+		var outboxID string
+		var send [3]string
+		err := rows.Scan(&outboxID, &send[0], &send[1], &send[2])
+		state.Sends[outboxID] = send
+		return err
+	})
+	query(`SELECT conversation_id FROM conversations`, func(rows *sql.Rows) error {
+		var conversation string
+		err := rows.Scan(&conversation)
+		state.Threads[conversation] = true
 		return err
 	})
 	return state
@@ -236,7 +266,7 @@ func readRepairDamageState(t *testing.T, path string) repairDamageState {
 // enforce foreign keys, so each table is cleared explicitly.
 func resetRepairDamage(t *testing.T, path string) {
 	t.Helper()
-	database := i01OpenInspector(t, path)
+	database := openRepairSeeder(t, path)
 	defer database.Close()
 	for _, table := range []string{
 		"outbox_reactions", "outbox_read_receipts", "outbox", "read_cursors", "reactions",
@@ -246,6 +276,19 @@ func resetRepairDamage(t *testing.T, path string) {
 			t.Fatalf("reset %s: %v", table, err)
 		}
 	}
+}
+
+// openRepairSeeder opens a seeding connection that skips the fsync SQLite's
+// default synchronous=FULL makes on every commit; a test store needn't
+// survive power loss, and the property seeds thousands of rows.
+func openRepairSeeder(t *testing.T, path string) *sql.DB {
+	t.Helper()
+	database := i01OpenInspector(t, path)
+	if _, err := database.Exec(`PRAGMA synchronous = OFF`); err != nil {
+		_ = database.Close()
+		t.Fatalf("seeder synchronous: %v", err)
+	}
+	return database
 }
 
 func seedRepairDamage(t *testing.T, fixture repairMergeFixture, scenario repairDamageScenario) {
@@ -280,7 +323,7 @@ func seedRepairDamage(t *testing.T, fixture repairMergeFixture, scenario repairD
 		seed(row, inWindow+int64(index))
 	}
 
-	database := i01OpenInspector(t, harness.path)
+	database := openRepairSeeder(t, harness.path)
 	defer database.Close()
 	exec := func(statement string, arguments ...any) {
 		if _, err := database.Exec(statement, arguments...); err != nil {
@@ -318,10 +361,25 @@ func seedRepairDamage(t *testing.T, fixture repairMergeFixture, scenario repairD
 	for index, row := range scenario.ReceiptIntents {
 		fixture.enqueueReadReceipt(t, "property-read-"+strconv.Itoa(index), rows[row], nowMS+int64(index))
 	}
+	for row, open := range scenario.Sends {
+		state := sqlite.OutboxConfirmed
+		if open {
+			state = sqlite.OutboxQueued
+		}
+		insertRepairSend(t, database, "property-send-"+strconv.Itoa(row), rows[row], state)
+	}
 	// Enqueueing a receipt moved a cursor; the scenario's cursors replace them.
 	exec(`DELETE FROM read_cursors`)
-	for _, row := range scenario.Cursors {
-		fixture.setCursor(t, rows[row], nowMS)
+	for key, row := range scenario.Cursors {
+		device := "device-property-" + strconv.Itoa(key[0])
+		if row >= 0 {
+			fixture.setDeviceCursor(t, device, rows[row], nowMS)
+			continue
+		}
+		fixture.setDeviceCursor(t, device, rows[0], nowMS)
+		exec(`UPDATE read_cursors SET conversation_id = ?, last_read_message_id = NULL
+			WHERE device_id = ? AND conversation_id = ?`,
+			threads[key[1]].ConversationID, device, rows[0].ConversationID)
 	}
 }
 
@@ -335,8 +393,12 @@ func seedRepairDamage(t *testing.T, fixture repairMergeFixture, scenario repairD
 //     latest (occurred_at_ms, source_seq_ms), in root's conversation;
 //   - fences keep the group's largest source_seq_ms; attachments one row per
 //     root, downloaded if any in the group was;
-//   - every cursor survives, on root(its old message);
-//   - no conversation holds two copies of a window row's content;
+//   - every cursor naming a message survives, on root(that message), and a
+//     cursor naming none survives unless the repair dropped its thread;
+//   - an unfinished send's local message is neither deleted nor moved out of
+//     the send's conversation;
+//   - no conversation holds two copies of a window row's content, except a
+//     copy an unfinished send pins;
 //   - planning again finds nothing to do unless the first plan left a row in
 //     place.
 func TestGoogleIDSpaceRepairInvariantsProperty(t *testing.T) {
@@ -475,9 +537,19 @@ func TestGoogleIDSpaceRepairInvariantsProperty(t *testing.T) {
 		if !reflect.DeepEqual(after.Attachments, wantAttachments) {
 			return fail("attachments\n got %v\nwant %v", after.Attachments, wantAttachments)
 		}
-		wantCursors := map[string]string{}
-		for conversation, message := range before.Cursors {
-			wantCursors[conversation] = root(message)
+		wantCursors := map[[2]string]string{}
+		for key, message := range before.Cursors {
+			if message == "" {
+				// A cursor naming no message goes with its thread when a
+				// repair drops the emptied thread.
+				if after.Threads[key[1]] {
+					wantCursors[key] = ""
+				} else {
+					coverage["empty cursor dropped with its thread"]++
+				}
+				continue
+			}
+			wantCursors[key] = root(message)
 			if root(message) != message {
 				coverage["cursor on a deleted duplicate"]++
 			}
@@ -485,18 +557,37 @@ func TestGoogleIDSpaceRepairInvariantsProperty(t *testing.T) {
 		if !reflect.DeepEqual(after.Cursors, wantCursors) {
 			return fail("cursors\n got %v\nwant %v", after.Cursors, wantCursors)
 		}
+		if !reflect.DeepEqual(after.Sends, before.Sends) {
+			return fail("sends changed\n got %v\nwant %v", after.Sends, before.Sends)
+		}
+		for outboxID, send := range after.Sends {
+			if send[2] == string(sqlite.OutboxConfirmed) {
+				continue
+			}
+			coverage["open send"]++
+			if row, kept := after.Messages[send[0]]; !kept || row.ConversationID != send[1] {
+				return fail("open send %s lost its local message %s in %s", outboxID, send[0], send[1])
+			}
+		}
 
 		again, err := PlanGoogleIDSpaceRepair(ctx, harness.store, harness.messages, options)
 		if err != nil {
 			return fail("second plan: %v", err)
 		}
 		// Duplicates are merged on the first pass: no conversation still
-		// holds two copies of a window row's content.
+		// holds two copies of a window row's content, unless an unfinished
+		// send pins one of them.
+		pinned := map[string]bool{}
+		for _, send := range before.Sends {
+			if send[2] != string(sqlite.OutboxConfirmed) {
+				pinned[send[0]] = true
+			}
+		}
 		copies := map[[2]string]string{}
 		for messageID, row := range after.Messages {
 			key := [2]string{row.ConversationID, row.Content}
-			if strings.HasSuffix(row.Content, "|") {
-				continue // blank body: the repair never matches on content
+			if strings.HasSuffix(row.Content, "|") || pinned[messageID] {
+				continue // the repair never matches a blank body on content
 			}
 			if other, seen := copies[key]; seen && (windowRows[messageID] || windowRows[other]) {
 				return fail("conversation %s still holds %s and %s with content %q", row.ConversationID, other, messageID, row.Content)
@@ -530,7 +621,7 @@ func TestGoogleIDSpaceRepairInvariantsProperty(t *testing.T) {
 		"plan applied", "delete", "delete across conversations",
 		"remote id taken: same content", "remote id taken: other content",
 		"intent changed conversation", "intent on a deleted duplicate", "reaction groups merged",
-		"cursor on a deleted duplicate",
+		"cursor on a deleted duplicate", "open send",
 	} {
 		if coverage[name] == 0 {
 			t.Errorf("generator never produced %q; coverage = %v", name, coverage)

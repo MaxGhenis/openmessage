@@ -269,6 +269,11 @@ func TestApplyRepairPlanDeleteRejectsInvalidSurvivor(t *testing.T) {
 			wantText: "account",
 		},
 		{
+			name:     "survivor holds other content",
+			steps:    []RepairStep{repairDeleteStep(repairMergeDuplicateID, "message-other-content")},
+			wantText: "different content",
+		},
+		{
 			name: "survivor chain loops back",
 			steps: []RepairStep{
 				repairDeleteStep(repairMergeSurvivorID, repairMergeDuplicateID),
@@ -283,6 +288,8 @@ func TestApplyRepairPlanDeleteRejectsInvalidSurvivor(t *testing.T) {
 			seedMessageAccount(t, store, "account-b", "test")
 			seedMessageConversation(t, store, "conversation-other-account", "account-b")
 			seedOutboxTestMessage(t, store, "message-other-account", "account-b", "conversation-other-account")
+			seedOutboxTestMessage(t, store, "message-other-content", "account-a", "conversation-a")
+			mustExec(t, store.db, `UPDATE messages SET body = 'other text' WHERE message_id = 'message-other-content'`)
 			seedOutboxTestMessage(t, store, repairMergeDuplicateID, "account-a", "conversation-a")
 			seedOutboxTestMessage(t, store, repairMergeSurvivorID, "account-a", "conversation-a")
 			seedEchoCascadeChildren(t, store, repairMergeDuplicateID)
@@ -351,4 +358,56 @@ func TestApplyRepairPlanMoveRefusesMessageACursorNames(t *testing.T) {
 	}
 	assertMessageExists(t, store, repairMergeDuplicateID, true)
 	assertForeignKeyCheckClean(t, store.db)
+}
+
+// A send that hasn't finished reads its local message inside its own
+// conversation at dispatch, so a repair must neither delete that row nor move
+// it elsewhere. Once the send is confirmed, rejected or canceled the row is
+// ordinary history.
+func TestApplyRepairPlanRefusesMessagesAnOpenSendNames(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		state string
+		step  RepairStep
+		want  string
+	}{
+		{name: "delete under a queued send", state: "queued", step: repairDeleteStep("message-repair-send", repairMergeSurvivorID), want: "unfinished send"},
+		{name: "move under an uncertain send", state: "uncertain", step: RepairStep{Op: "move", MessageID: "message-repair-send", TargetConversationID: "conversation-b"}, want: "unfinished send"},
+		{name: "move within the send's conversation", state: "queued", step: RepairStep{Op: "move", MessageID: "message-repair-send", TargetConversationID: "conversation-a"}},
+		{name: "delete after the send was canceled", state: "canceled", step: repairDeleteStep("message-repair-send", repairMergeSurvivorID)},
+		{name: "move after the send was confirmed", state: "confirmed", step: RepairStep{Op: "move", MessageID: "message-repair-send", TargetConversationID: "conversation-b"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			store, repository := openRepairMergeStore(t)
+			item := outboxTestItem("repair-send")
+			mustEnqueueOutgoingOutbox(t, repository, item, "optimistic body")
+			// The survivor restates the optimistic row exactly.
+			mustExec(t, store.db, `
+				INSERT INTO messages (
+					message_id, conversation_id, account_id, remote_message_id, sender_identity_id, direction,
+					body, reply_to_remote_id, state, occurred_at_ms, created_at_ms, updated_at_ms
+				)
+				SELECT ?, conversation_id, account_id, 'remote-survivor', sender_identity_id, direction,
+					body, NULL, 'active', occurred_at_ms, created_at_ms, updated_at_ms
+				FROM messages WHERE message_id = ?
+			`, repairMergeSurvivorID, item.LocalMessageID)
+			mustExec(t, store.db, `UPDATE outbox SET state = ? WHERE outbox_id = ?`, test.state, item.OutboxID)
+
+			err := applyRepairPlan(t, store, test.step)
+			if test.want == "" {
+				if err != nil {
+					t.Fatalf("ApplyRepairPlan(): %v", err)
+				}
+				assertForeignKeyCheckClean(t, store.db)
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("ApplyRepairPlan() error = %v, want one containing %q", err, test.want)
+			}
+			message, err := mustMessageRepository(t, store, repairMergeNowMS).GetMessage(context.Background(), item.LocalMessageID)
+			if err != nil || message.ConversationID != item.ConversationID {
+				t.Fatalf("optimistic row = (%+v, %v), want it unchanged in %s", message, err, item.ConversationID)
+			}
+		})
+	}
 }
