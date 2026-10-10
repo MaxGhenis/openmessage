@@ -433,8 +433,9 @@ func TestSendReactionMapsAllActionsAndReturnsEmptyResult(t *testing.T) {
 				AccountID:    "signal-primary",
 				Conversation: bridge.ConversationRef{RemoteID: "signal-group:test-group"},
 				Target: bridge.MessageRef{
-					RemoteID: "1700000000123",
+					RemoteID: "f48818f15483f503bb133d92360ca8e2fbd8287e",
 					AuthorID: "+15551234567",
+					SentAt:   time.UnixMilli(1_700_000_000_123),
 				},
 				Emoji:     "👍",
 				Action:    action,
@@ -447,9 +448,13 @@ func TestSendReactionMapsAllActionsAndReturnsEmptyResult(t *testing.T) {
 				t.Fatalf("SendReaction() result = %+v, want empty ConfirmWithoutResult mapping", result)
 			}
 			request := poller.lastReactionRequest()
+			wantTarget := signallive.ReactionTarget{
+				RemoteID: "f48818f15483f503bb133d92360ca8e2fbd8287e",
+				AuthorID: "+15551234567",
+				SentAt:   time.UnixMilli(1_700_000_000_123),
+			}
 			if request.conversationID != "signal-group:test-group" ||
-				request.targetRemoteID != "1700000000123" ||
-				request.targetAuthorID != "+15551234567" ||
+				request.target != wantTarget ||
 				request.emoji != "👍" ||
 				request.action != string(action) {
 				t.Fatalf("retained SendReactionRequest = %+v, want mapped ReactionRequest", request)
@@ -1530,8 +1535,7 @@ type fakeTextRequest struct {
 
 type fakeReactionRequest struct {
 	conversationID string
-	targetRemoteID string
-	targetAuthorID string
+	target         signallive.ReactionTarget
 	emoji          string
 	action         string
 }
@@ -1681,13 +1685,14 @@ func (p *fakePoller) lastTextRequest() fakeTextRequest {
 }
 
 func (p *fakePoller) SendReactionRequest(
-	conversationID, targetRemoteID, targetAuthorID, emoji, action string,
+	conversationID string,
+	target signallive.ReactionTarget,
+	emoji, action string,
 ) error {
 	p.mu.Lock()
 	p.reactionCalls = append(p.reactionCalls, fakeReactionRequest{
 		conversationID: conversationID,
-		targetRemoteID: targetRemoteID,
-		targetAuthorID: targetAuthorID,
+		target:         target,
 		emoji:          emoji,
 		action:         action,
 	})

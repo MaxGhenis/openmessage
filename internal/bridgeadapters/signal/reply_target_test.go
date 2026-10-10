@@ -19,6 +19,7 @@ func TestReplyTargetCarriesEveryMessageRefField(t *testing.T) {
 	ref := bridge.MessageRef{
 		RemoteID:       "f48818f15483f503bb133d92360ca8e2fbd8287e",
 		AuthorID:       "+15551234567",
+		Outgoing:       true,
 		SentAt:         time.UnixMilli(1_700_000_000_123),
 		Text:           "quoted",
 		HasAttachment:  true,
