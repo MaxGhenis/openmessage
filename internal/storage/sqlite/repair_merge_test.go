@@ -12,6 +12,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 )
 
 const (
@@ -19,6 +20,8 @@ const (
 	repairMergeSurvivorID  = "message-repair-survivor"
 	repairMergeBystanderID = "message-repair-bystander"
 	repairMergeNowMS       = outboxTestTimeMS + 5_000
+	repairMergeReactorA    = "repair-reactor-a"
+	repairMergeReactorB    = "repair-reactor-b"
 )
 
 func openRepairMergeStore(t *testing.T) (*Store, *OutboxRepository) {
@@ -40,6 +43,33 @@ func seedRepairMergeIntents(
 ) (NewOutboxItem, NewOutboxItem) {
 	t.Helper()
 	return seedEchoNoActionReferences(t, store, repository, messageID)
+}
+
+// seedRepairMergeChildren records an embedded reaction snapshot (two reactors
+// and its fence) and a downloaded attachment on messageID, which must be in
+// conversation-a.
+func seedRepairMergeChildren(t *testing.T, store *Store, messageID string) {
+	t.Helper()
+	ctx := context.Background()
+	reactions, err := NewReactionRepository(store, func() time.Time { return time.UnixMilli(outboxTestTimeMS - 300) })
+	if err != nil {
+		t.Fatalf("NewReactionRepository(): %v", err)
+	}
+	if _, err := reactions.ReplaceEmbeddedReactions(ctx, messageID, "account-a", "conversation-a",
+		[]ReactionSnapshotEntry{
+			{ReactorKey: repairMergeReactorA, ReactorLabel: "peer", Emoji: "heart"},
+			{ReactorKey: repairMergeReactorB, ReactorIsSelf: true, Emoji: "thumbs-up"},
+		},
+		echoMergeFenceSeq,
+	); err != nil {
+		t.Fatalf("ReplaceEmbeddedReactions(): %v", err)
+	}
+	mustExec(t, store.db, `
+		INSERT INTO message_attachments (
+			message_id, ordinal, remote_id, remote_ref, filename, mime, size_bytes,
+			state, blob_hash, last_error, created_at_ms, updated_at_ms
+		) VALUES (?, 0, 'media-0', x'', 'photo.png', 'image/png', 42, 'downloaded', ?, NULL, ?, ?)
+	`, messageID, echoMergeBlobHash, outboxTestTimeMS-300, outboxTestTimeMS-300)
 }
 
 func applyRepairPlan(t *testing.T, store *Store, steps ...RepairStep) error {
@@ -109,7 +139,7 @@ func TestApplyRepairPlanDeleteMergesDuplicateIntoSurvivor(t *testing.T) {
 				seedOutboxTestMessage(t, store, repairMergeDuplicateID, "account-a", "conversation-a")
 				seedOutboxTestMessage(t, store, repairMergeSurvivorID, "account-a", survivorConversation)
 				seedOutboxTestMessage(t, store, repairMergeBystanderID, "account-a", "conversation-a")
-				seedEchoCascadeChildren(t, store, repairMergeDuplicateID)
+				seedRepairMergeChildren(t, store, repairMergeDuplicateID)
 				var reactionIntent, receiptIntent NewOutboxItem
 				if withReferences {
 					reactionIntent, receiptIntent = seedRepairMergeIntents(t, store, repository, repairMergeDuplicateID)
@@ -132,10 +162,10 @@ func TestApplyRepairPlanDeleteMergesDuplicateIntoSurvivor(t *testing.T) {
 
 				assertMessageExists(t, store, repairMergeDuplicateID, false)
 				assertMessageExists(t, store, repairMergeSurvivorID, true)
-				assertEchoMergedReaction(t, store, repairMergeSurvivorID, "reactor-delta", "thumbs-up", "active")
-				assertEchoMergedReaction(t, store, repairMergeSurvivorID, "reactor-snapshot", "heart", "active")
-				assertReactionConversation(t, store, repairMergeSurvivorID, "reactor-delta", survivorConversation)
-				assertReactionConversation(t, store, repairMergeSurvivorID, "reactor-snapshot", survivorConversation)
+				assertEchoMergedReaction(t, store, repairMergeSurvivorID, repairMergeReactorB, "thumbs-up", "active")
+				assertEchoMergedReaction(t, store, repairMergeSurvivorID, repairMergeReactorA, "heart", "active")
+				assertReactionConversation(t, store, repairMergeSurvivorID, repairMergeReactorB, survivorConversation)
+				assertReactionConversation(t, store, repairMergeSurvivorID, repairMergeReactorA, survivorConversation)
 				assertReactionFence(t, store, repairMergeSurvivorID, echoMergeFenceSeq)
 				attachment, err := mustEchoMergeAttachments(t, store).GetForDownload(ctx, repairMergeSurvivorID, 0)
 				if err != nil {
@@ -183,7 +213,7 @@ func TestApplyRepairPlanDeleteRefusesCursorThatCannotFollow(t *testing.T) {
 	store, repository := openRepairMergeStore(t)
 	seedOutboxTestMessage(t, store, repairMergeDuplicateID, "account-a", "conversation-a")
 	seedOutboxTestMessage(t, store, repairMergeSurvivorID, "account-a", "conversation-b")
-	seedEchoCascadeChildren(t, store, repairMergeDuplicateID)
+	seedRepairMergeChildren(t, store, repairMergeDuplicateID)
 	seedRepairMergeIntents(t, store, repository, repairMergeDuplicateID)
 
 	err := applyRepairPlan(t, store, repairDeleteStep(repairMergeDuplicateID, repairMergeSurvivorID))
@@ -192,7 +222,7 @@ func TestApplyRepairPlanDeleteRefusesCursorThatCannotFollow(t *testing.T) {
 	}
 	// The plan rolled back: the duplicate and everything on it are intact.
 	assertMessageExists(t, store, repairMergeDuplicateID, true)
-	assertEchoMergedReaction(t, store, repairMergeDuplicateID, "reactor-delta", "thumbs-up", "active")
+	assertEchoMergedReaction(t, store, repairMergeDuplicateID, repairMergeReactorB, "thumbs-up", "active")
 	assertReactionFence(t, store, repairMergeDuplicateID, echoMergeFenceSeq)
 	assertRowCount(t, store.db, "message_attachments", 1)
 	assertForeignKeyCheckClean(t, store.db)
@@ -207,7 +237,7 @@ func TestApplyRepairPlanDeleteFollowsSurvivorChain(t *testing.T) {
 			seedOutboxTestMessage(t, store, repairMergeDuplicateID, "account-a", "conversation-a")
 			seedOutboxTestMessage(t, store, repairMergeSurvivorID, "account-a", "conversation-a")
 			seedOutboxTestMessage(t, store, root, "account-a", "conversation-b")
-			seedEchoCascadeChildren(t, store, repairMergeDuplicateID)
+			seedRepairMergeChildren(t, store, repairMergeDuplicateID)
 			reactionIntent := outboxTestReactionItem("repair-chain-reaction")
 			if _, _, err := repository.EnqueueReaction(ctx, reactionIntent, OutboxReaction{
 				TargetMessageID: repairMergeDuplicateID, Emoji: "thumbs-up", Action: "add",
@@ -227,8 +257,8 @@ func TestApplyRepairPlanDeleteFollowsSurvivorChain(t *testing.T) {
 			}
 
 			assertRowCount(t, store.db, "messages", 1)
-			assertEchoMergedReaction(t, store, root, "reactor-delta", "thumbs-up", "active")
-			assertReactionConversation(t, store, root, "reactor-delta", "conversation-b")
+			assertEchoMergedReaction(t, store, root, repairMergeReactorB, "thumbs-up", "active")
+			assertReactionConversation(t, store, root, repairMergeReactorB, "conversation-b")
 			assertReactionFence(t, store, root, echoMergeFenceSeq)
 			reaction, err := repository.GetOutboxReaction(ctx, reactionIntent.OutboxID)
 			if err != nil || reaction.TargetMessageID != root {
@@ -292,7 +322,7 @@ func TestApplyRepairPlanDeleteRejectsInvalidSurvivor(t *testing.T) {
 			mustExec(t, store.db, `UPDATE messages SET body = 'other text' WHERE message_id = 'message-other-content'`)
 			seedOutboxTestMessage(t, store, repairMergeDuplicateID, "account-a", "conversation-a")
 			seedOutboxTestMessage(t, store, repairMergeSurvivorID, "account-a", "conversation-a")
-			seedEchoCascadeChildren(t, store, repairMergeDuplicateID)
+			seedRepairMergeChildren(t, store, repairMergeDuplicateID)
 
 			err := applyRepairPlan(t, store, test.steps...)
 			if err == nil || !strings.Contains(err.Error(), test.wantText) {
@@ -300,7 +330,7 @@ func TestApplyRepairPlanDeleteRejectsInvalidSurvivor(t *testing.T) {
 			}
 			assertMessageExists(t, store, repairMergeDuplicateID, true)
 			assertMessageExists(t, store, repairMergeSurvivorID, true)
-			assertEchoMergedReaction(t, store, repairMergeDuplicateID, "reactor-delta", "thumbs-up", "active")
+			assertEchoMergedReaction(t, store, repairMergeDuplicateID, repairMergeReactorB, "thumbs-up", "active")
 			assertRowCount(t, store.db, "message_attachments", 1)
 		})
 	}
@@ -320,7 +350,7 @@ func TestApplyRepairPlanMoveCarriesIntentsAndReactions(t *testing.T) {
 	ctx := context.Background()
 	seedOutboxTestMessage(t, store, repairMergeDuplicateID, "account-a", "conversation-a")
 	seedOutboxTestMessage(t, store, repairMergeBystanderID, "account-a", "conversation-a")
-	seedEchoCascadeChildren(t, store, repairMergeDuplicateID)
+	seedRepairMergeChildren(t, store, repairMergeDuplicateID)
 	reactionIntent, receiptIntent := seedRepairMergeIntents(t, store, repository, repairMergeDuplicateID)
 	bystander := repairMergeBystanderID
 	mustRepositoryWrite(t, "advance cursor", store.UpsertReadCursor(ReadCursor{
@@ -338,7 +368,7 @@ func TestApplyRepairPlanMoveCarriesIntentsAndReactions(t *testing.T) {
 	if err != nil || message.ConversationID != "conversation-b" {
 		t.Fatalf("moved message = (%+v, %v), want it in conversation-b", message, err)
 	}
-	assertReactionConversation(t, store, repairMergeDuplicateID, "reactor-delta", "conversation-b")
+	assertReactionConversation(t, store, repairMergeDuplicateID, repairMergeReactorB, "conversation-b")
 	assertOutboxConversation(t, repository, reactionIntent.OutboxID, "conversation-b")
 	assertOutboxConversation(t, repository, receiptIntent.OutboxID, "conversation-b")
 	assertForeignKeyCheckClean(t, store.db)

@@ -169,9 +169,11 @@ belongs until the thread's ConversationEvent re-binds the id.
 
 A duplicate is deleted only after what was recorded on it moves to the copy
 that stays, which each delete step in the report names as
-`survivor_message_id`: inbound reactions (per person, the later one wins),
-the reaction snapshot fence, attachments (a downloaded copy wins), queued
-reaction and read-receipt intents, and read cursors in the same thread.
+`survivor_message_id`: inbound reactions (per person, the newer one wins;
+where they came from Google's embedded snapshots, a person the newest
+snapshot no longer lists is marked removed), the reaction snapshot fence,
+attachments (a downloaded copy wins), queued reaction and read-receipt
+intents, and read cursors in the same thread.
 Intents take the surviving copy's thread, as they do when a row moves,
 because the dispatcher only sends an intent whose target is in its own
 thread. A row stays in its thread, and the group's `detail` says why, when an
