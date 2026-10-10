@@ -209,7 +209,8 @@ const deviceColumns = `
 // part of the parent key read_cursors(account_id, device_id) references, so
 // assigning it, even to the same value, makes SQLite scan the device's read
 // cursors for FK children on every conflict. The WHERE keeps a device from
-// moving between accounts; such a move would also orphan those cursors.
+// moving between accounts: the old SET moved a device that had no read cursors
+// without complaint, and failed the read_cursors foreign key for one that had.
 const upsertDeviceSQL = `
 		INSERT INTO devices (
 			device_id,

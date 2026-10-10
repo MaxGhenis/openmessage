@@ -27,9 +27,10 @@ var (
 	// moves between accounts.
 	ErrCrossAccountDevice = errors.New("device belongs to another account")
 
-	// ErrConversationIdentityConflict means a conversation's account-scoped
-	// natural key (account_id, remote_conversation_id) already belongs to a row
-	// with a different conversation ID.
+	// ErrConversationIdentityConflict means a conversation ID and an
+	// account-scoped natural key (account_id, remote_conversation_id) name
+	// different rows: the key already belongs to a row with another ID, or the
+	// ID already belongs to a row with another key.
 	ErrConversationIdentityConflict = errors.New("conversation natural key belongs to another conversation")
 
 	// ErrOrphanParticipantIdentity means a participant references an identity
