@@ -458,8 +458,9 @@ func TestGoogleIDSpaceRepairInvariantsProperty(t *testing.T) {
 			t.Errorf("scenario %+v: plan: %v", scenario, err)
 			return false
 		}
-		// The repair runs after every snapshot was written, so a tombstone
-		// it writes carries a later time than any stored reaction.
+		// The repair runs after every snapshot was written, as a real one
+		// does. A tombstone stamped with the repair's time would then
+		// outrank every stored reaction.
 		appliedAt := i01TestTime.Add(time.Hour)
 		if err := ApplyGoogleIDSpaceRepair(ctx, harness.store, report, appliedAt); err != nil {
 			t.Errorf("scenario %+v: apply: %v\nplan %+v", scenario, err, report.Steps)

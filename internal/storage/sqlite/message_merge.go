@@ -35,12 +35,13 @@ import (
 //     Without a fence the rows are deltas, and newer means a larger
 //     (occurred_at_ms, source_seq_ms). ApplyReaction orders deltas by
 //     occurred_at_ms and lets a later write replace an equal-time row.
-//     source_seq_ms is the frame's receive time, so the larger one is the
-//     later write whenever frames were applied in the order they arrived. If
-//     they weren't (a replay), the rows don't record which write one message
-//     would have kept: updated_at_ms doesn't either, because rewriting a row
-//     with what it already holds leaves it untouched. Moved rows take the
-//     survivor's conversation.
+//     source_seq_ms is the frame's receive time in milliseconds, so the
+//     larger one is the later write whenever frames were applied in the
+//     order they arrived and arrived in different milliseconds. Otherwise (a
+//     replay, or two frames in one millisecond) the rows don't record which
+//     write one message would have kept: updated_at_ms doesn't either,
+//     because rewriting a row with what it already holds leaves it
+//     untouched. Moved rows take the survivor's conversation.
 //   - reaction_snapshot_fences keeps the larger source_seq_ms.
 //   - message_attachments: per ordinal, a downloaded survivor row stays.
 //     Otherwise the duplicate's row replaces the survivor's, since a pending
@@ -246,13 +247,19 @@ func mergeDuplicateRows(
 
 // inferredTombstoneOccurredAtMS is the occurred_at_ms of a tombstone the merge
 // infers from a fence. No snapshot wrote that removal: the merge concludes it
-// because the newest snapshot it has seen didn't list the reactor. The
-// earliest time ranks it below every stored row at the same fence, so if a
-// copy merged later (in this plan or a later repair) holds a reaction a
-// snapshot at that fence did list, that reaction wins. Stamped with the merge
-// time instead, the tombstone would outrank it and an active reaction would
-// be lost. Only active reactions are read back, and Google messages receive
-// no deltas, so nothing else reads this value.
+// because the newest snapshot it has seen didn't list the reactor. Snapshot
+// rows carry the time they were written, and this is the smallest value the
+// schema allows, so the tombstone ranks below any row a snapshot wrote at the
+// same fence (it would only tie one written in the first millisecond of
+// 1970). If a copy merged later, in this plan or a later repair, holds a
+// reaction a snapshot at that fence did list, that reaction wins. Stamped
+// with the merge time instead, the tombstone would outrank it and an active
+// reaction would be lost.
+//
+// Nothing else depends on the value. Reads select active reactions only.
+// ApplyReaction does compare occurred_at_ms, so a delta would revive the
+// reactor, but the ingest worker sends Google reactions through
+// ReplaceEmbeddedReactions only, and only that writer creates fences.
 const inferredTombstoneOccurredAtMS = 1
 
 // tombstoneReactionsBelowFence marks removed every reaction on messageID that
