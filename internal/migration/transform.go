@@ -1162,6 +1162,21 @@ func accountForPlatform(platform string) (accountSpec, error) {
 	return account, nil
 }
 
+// ConversationPlacement reports where Transform files a legacy conversation:
+// the account for its stored source platform, and its remote conversation ID
+// normalized for that platform. ok is false for a platform Transform rejects.
+// The stored platform alone decides the account; an ID prefix does not.
+func ConversationPlacement(
+	sourcePlatform string,
+	legacyConversationID string,
+) (accountID string, remoteConversationID string, ok bool) {
+	account, err := accountForPlatform(sourcePlatform)
+	if err != nil {
+		return "", "", false
+	}
+	return account.AccountID, v2keys.NormalizeRemoteConversationID(account.Platform, legacyConversationID), true
+}
+
 func minLegacyTimestamp(dataset legacyDataset) int64 {
 	minimum := int64(0)
 	consider := func(value int64) {
