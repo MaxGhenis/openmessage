@@ -330,6 +330,97 @@ func TestMirrorNeverChangesLegacyIDReads(t *testing.T) {
 	}
 }
 
+// TestConversationPlacementMatchesMigration is a differential check: the
+// placement rule the mirror asks the migration for must name the row the real
+// migration wrote, for every fixture thread, including the one whose stored
+// platform disagrees with its ID prefix.
+func TestConversationPlacementMatchesMigration(t *testing.T) {
+	_, v2 := openMigratedTestStores(t)
+	for _, conversation := range migratedFixtureConversations {
+		accountID, remoteID, ok := migration.ConversationPlacement(conversation.platform, conversation.legacyID)
+		if !ok || accountID != conversation.accountID {
+			t.Fatalf("ConversationPlacement(%q, %q) = (%q, %q, %v), want account %q",
+				conversation.platform, conversation.legacyID, accountID, remoteID, ok, conversation.accountID)
+		}
+		row, err := v2.GetConversationByRemote(accountID, remoteID)
+		if err != nil {
+			t.Fatalf("migrated row for %q at (%q, %q): %v", conversation.legacyID, accountID, remoteID, err)
+		}
+		if want := v2keys.DeriveID("conversation", accountID, conversation.legacyID); row.ConversationID != want {
+			t.Fatalf("migrated row for %q has ID %q, want %q", conversation.legacyID, row.ConversationID, want)
+		}
+	}
+	if _, _, ok := migration.ConversationPlacement("telegram", "telegram:1"); ok {
+		t.Fatal("ConversationPlacement(telegram) ok = true, want false for a platform the migration rejects")
+	}
+}
+
+// TestMirrorConversationIgnoresUnrelatedThreadInAnotherAccount pins that only
+// the routed key and the migration's placement are checked. Google thread IDs
+// are opaque, so a second account can hold an unrelated thread under the same
+// remote ID; that must not block the first account's sends or mark-read.
+func TestMirrorConversationIgnoresUnrelatedThreadInAnotherAccount(t *testing.T) {
+	for _, order := range []string{"mirror first", "other account first"} {
+		t.Run(order, func(t *testing.T) {
+			legacy := openLegacyTestStore(t)
+			v2 := openV2TestStore(t)
+			const legacyID = "2873"
+			seedLegacyConversation(t, legacy, legacyID, "sms", false)
+			registry := submitTestRegistry{caps: map[string]bridge.CapabilitySet{googleAccountID: {TextSend: true}}}
+			deps := Deps{Legacy: legacy, V2: v2, Service: newSubmitTestService(t, v2, registry, nil), Registry: registry}
+			seedOther := func() sqlite.Conversation {
+				t.Helper()
+				if _, err := v2.EnsureAccount(sqlite.Account{
+					AccountID: "google-secondary", BridgeKey: "google_messages", DisplayName: "Second phone",
+					Mode: sqlite.AccountModeLive, Enabled: true, ConfigJSON: "{}",
+					CreatedAtMS: 1_700_000_000_000, UpdatedAtMS: 1_700_000_000_000,
+				}); err != nil {
+					t.Fatalf("EnsureAccount(google-secondary): %v", err)
+				}
+				other := sqlite.Conversation{
+					ConversationID: "secondary-thread", AccountID: "google-secondary", RemoteConversationID: legacyID,
+					Kind: sqlite.ConversationKindDirect, Title: "unrelated", NotificationMode: sqlite.NotificationModeAll,
+					MetadataJSON: "{}", CreatedAtMS: 1_700_000_000_000, UpdatedAtMS: 1_700_000_000_000,
+				}
+				if err := v2.UpsertConversation(other); err != nil {
+					t.Fatalf("UpsertConversation(secondary-thread): %v", err)
+				}
+				return other
+			}
+
+			var other sqlite.Conversation
+			if order == "other account first" {
+				other = seedOther()
+			}
+			if _, _, err := MirrorConversation(legacy, v2, legacyID); err != nil {
+				t.Fatalf("MirrorConversation(first): %v", err)
+			}
+			if order == "mirror first" {
+				other = seedOther()
+			}
+
+			if _, _, err := MirrorConversation(legacy, v2, legacyID); err != nil {
+				t.Fatalf("MirrorConversation(refresh): %v", err)
+			}
+			if err := MirrorReadCursor(context.Background(), legacy, v2, legacyID, 1_910_000_000_000); err != nil {
+				t.Fatalf("MirrorReadCursor(): %v", err)
+			}
+			if _, err := SubmitText(context.Background(), deps, TextInput{
+				ConversationID: legacyID, Body: "hi", IdempotencyKey: "unrelated-thread-send",
+			}); err != nil {
+				t.Fatalf("SubmitText(): %v", err)
+			}
+			mirrored, err := v2.GetConversation(legacyID)
+			if err != nil || mirrored.AccountID != googleAccountID || mirrored.RemoteConversationID != legacyID {
+				t.Fatalf("mirrored row = %+v, %v; want the google-primary thread", mirrored, err)
+			}
+			if got, err := v2.GetConversation(other.ConversationID); err != nil || !reflect.DeepEqual(got, other) {
+				t.Fatalf("other account's thread = %+v, %v; want unchanged %+v", got, err, other)
+			}
+		})
+	}
+}
+
 // TestMirrorConversationRefusesDisplacedBinding covers ingest re-keying a stale
 // Google binding: the row under the legacy ID keeps the ID but its remote key
 // becomes "displaced:…", and a fresh row may take the key. The mirror must not

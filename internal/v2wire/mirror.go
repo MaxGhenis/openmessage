@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/maxghenis/openmessage/internal/db"
+	"github.com/maxghenis/openmessage/internal/migration"
 	"github.com/maxghenis/openmessage/internal/storage/sqlite"
 	"github.com/maxghenis/openmessage/internal/v2keys"
 )
@@ -76,12 +77,14 @@ func AccountForConversation(legacy *db.Store, legacyConversationID string) (stri
 // The only v2 conversation row the mirror writes is the one whose ID equals
 // the legacy ID; it inserts or refreshes that row. An existing account keeps
 // its metadata, and the account's existing local installation device is
-// reused whatever its ID. When the legacy thread already maps to a v2 row
-// under another ID (see mirrorNaturalKey), the call fails with
+// reused whatever its ID. When the legacy thread already has a v2 row under
+// another ID (see mirrorNaturalKey), the call fails with
 // sqlite.ErrConversationIdentityConflict and leaves that row unchanged. The
 // check runs before the account and device bootstraps, so such a refusal
-// writes nothing unless a concurrent writer creates the conflicting row
-// mid-call; the conversation upsert is guarded either way.
+// writes nothing when the conflicting row exists before the call. If a
+// concurrent writer creates it mid-call, the bootstraps may already have run.
+// The conversation upsert then still refuses a conflict on the routed
+// account's key; it cannot see a row added under another account.
 func MirrorConversation(
 	legacy *db.Store,
 	v2 *sqlite.Store,
@@ -117,7 +120,7 @@ func mirrorConversation(
 	if err != nil {
 		return mirroredConversation{}, fmt.Errorf("mirror conversation %q: %w", legacyConversationID, err)
 	}
-	remoteID, err := mirrorNaturalKey(v2, accountID, legacyConversationID)
+	remoteID, err := mirrorNaturalKey(v2, accountID, conversation.SourcePlatform, legacyConversationID)
 	if err != nil {
 		return mirroredConversation{}, err
 	}
@@ -186,40 +189,40 @@ func mirrorConversation(
 
 // mirrorNaturalKey returns the remote ID the mirror writes the conversation
 // under. It fails with sqlite.ErrConversationIdentityConflict when the legacy
-// thread already maps to a v2 row under another ID.
+// thread already has a v2 row under another ID, in either place one can be:
 //
-// That check looks the legacy ID up the way v2 reads resolve one
-// (internal/v2read resolveConversationID): under every account, as the remote
-// ID normalized for that account's platform. The migration routes a thread by
-// its stored platform while the mirror routes by ID prefix, so a "signal:"
-// thread stored as sms was migrated under the Google account. Creating a row
-// under the legacy ID beside it would shadow that history for legacy-ID reads.
+//   - under the routed account, at the remote ID normalized as the migration
+//     normalizes it, so "signal:  +1650…" meets a migrated "signal:+1650…";
+//   - where the migration files this conversation
+//     (migration.ConversationPlacement). The migration routes by the stored
+//     platform while the mirror routes by ID prefix, so a "signal:" thread
+//     stored as sms was migrated under the Google account. A new row under
+//     the legacy ID would shadow that history for legacy-ID reads, because
+//     internal/v2read resolves a direct ID match before it tries remote IDs.
 //
-// The key is the migration's normalized form, so "signal:  +1650…" meets a
-// migrated "signal:+1650…". The one exception is a row an earlier mirror wrote
-// under this legacy ID and account with the raw legacy ID as its key: once
-// nothing else holds the normalized key, that row keeps its key. A row under
-// the legacy ID with any other key or account is refused, not adopted (ingest
-// rewrites a stale Google binding's key to "displaced:…").
-func mirrorNaturalKey(v2 *sqlite.Store, accountID, legacyConversationID string) (string, error) {
-	bridgeKey, _ := accountBootstrap(accountID)
-	normalized := v2keys.NormalizeRemoteConversationID(platformForBridgeKey(bridgeKey), legacyConversationID)
-
-	accounts, err := v2.ListAccounts()
-	if err != nil {
-		return "", fmt.Errorf("mirror conversation %q: %w", legacyConversationID, err)
-	}
+// No other account is consulted: unrelated threads can share an opaque Google
+// thread ID across accounts, and neither is this conversation.
+//
+// The key written is the normalized one. The one exception is a row an earlier
+// mirror wrote under this legacy ID and account with the raw legacy ID as its
+// key, which keeps that key. A row under the legacy ID with any other key or
+// account is refused, not adopted (ingest rewrites a stale Google binding's
+// key to "displaced:…").
+func mirrorNaturalKey(
+	v2 *sqlite.Store,
+	accountID string,
+	sourcePlatform string,
+	legacyConversationID string,
+) (string, error) {
+	normalized := v2keys.NormalizeRemoteConversationID(accountPlatform(accountID), legacyConversationID)
 	type naturalKey struct{ accountID, remoteID string }
 	keys := []naturalKey{{accountID, normalized}}
-	seen := map[naturalKey]bool{keys[0]: true}
-	for _, account := range accounts {
-		key := naturalKey{
-			account.AccountID,
-			v2keys.NormalizeRemoteConversationID(platformForBridgeKey(account.BridgeKey), legacyConversationID),
-		}
-		if !seen[key] {
-			seen[key] = true
-			keys = append(keys, key)
+	if migratedAccountID, migratedRemoteID, ok := migration.ConversationPlacement(
+		sourcePlatform,
+		legacyConversationID,
+	); ok {
+		if migrated := (naturalKey{migratedAccountID, migratedRemoteID}); migrated != keys[0] {
+			keys = append(keys, migrated)
 		}
 	}
 	for _, key := range keys {
@@ -456,19 +459,16 @@ func accountBootstrap(accountID string) (bridgeKey string, displayName string) {
 	}
 }
 
-// platformForBridgeKey maps an account's bridge key to the migration's platform
-// vocabulary, which v2keys.NormalizeRemoteConversationID keys on. It is the
-// mapping internal/v2read and internal/ingest apply to stored bridge keys.
-func platformForBridgeKey(bridgeKey string) string {
-	switch bridgeKey = strings.TrimSpace(bridgeKey); bridgeKey {
-	case "google_messages":
-		return "sms"
-	case "whatsmeow":
+// accountPlatform names the migration's platform for a live account, the
+// vocabulary v2keys.NormalizeRemoteConversationID keys on.
+func accountPlatform(accountID string) string {
+	switch accountID {
+	case whatsappAccountID:
 		return "whatsapp"
-	case "signal_cli":
+	case signalAccountID:
 		return "signal"
 	default:
-		return bridgeKey
+		return "sms"
 	}
 }
 
