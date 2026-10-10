@@ -405,11 +405,36 @@ func daemonReactToMessageHandler(options Options) server.ToolHandlerFunc {
 		if action == "" {
 			action = "add"
 		}
-		if err := daemon.React(ctx, conversationID, messageID, emoji, action); err != nil {
+		// A v2-primary app takes reactions on its durable outbox, where the
+		// intent carries an idempotency key and its delivery can be followed.
+		// Any other answer to the probe keeps the reaction on /api/react,
+		// which every app mode serves.
+		status, reachable, probeErr := daemon.Status(ctx)
+		if probeErr != nil && !reachable {
+			return daemonDownResult(probeErr), nil
+		}
+		if probeErr == nil && status.ReactionsViaOutbox() {
+			return daemonSubmitReactionAndWait(ctx, daemon, args, conversationID, messageID, emoji, action), nil
+		}
+		result, err := daemon.React(ctx, conversationID, messageID, emoji, action)
+		if err != nil {
 			if responseErr, ok := localapi.AsResponseError(err); ok {
 				return errorResult(fmt.Sprintf("the app could not send the reaction: HTTP %d: %s", responseErr.StatusCode, responseErr.Body)), nil
 			}
 			return daemonDownResult(err), nil
+		}
+		if !result.Success {
+			// The legacy Google route answers 200 with success false when the
+			// phone refuses the reaction.
+			return errorResult("the app reported that the reaction was not applied"), nil
+		}
+		if result.Queued {
+			// A v2-primary app answered on the compatibility route: the
+			// reaction is on its outbox and not delivered yet.
+			return v2ReactionResult(
+				messaging.Delivery{OutboxID: result.OutboxID, State: messaging.OutboxState(result.State)},
+				false, "", nil,
+			), nil
 		}
 		return structuredResult(map[string]any{
 			"ok":         true,

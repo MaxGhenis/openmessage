@@ -75,9 +75,12 @@ func RegisterWithOptions(s *server.MCPServer, a *app.App, options Options) {
 		s.AddTool(sendToConversationTool(true), sendToConversationHandler(a, configuredV2))
 		s.AddTool(sendMediaToConversationTool(true), sendMediaToConversationHandler(a, configuredV2))
 	}
-	if options.Daemon != nil {
-		s.AddTool(reactToMessageTool(), daemonReactToMessageHandler(options))
-	} else {
+	switch {
+	case options.Daemon != nil:
+		s.AddTool(reactToMessageTool(true), daemonReactToMessageHandler(options))
+	case v2Primary:
+		s.AddTool(reactToMessageTool(true), reactToMessageHandler(a, options))
+	default:
 		s.AddTool(reactToMessageTool(), reactToMessageHandler(a))
 	}
 	s.AddTool(setMessageTranscriptTool(), setMessageTranscriptHandler(a))

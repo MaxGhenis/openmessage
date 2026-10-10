@@ -626,6 +626,7 @@ type v2ToolRegistry struct {
 	accountID string
 	text      bridge.TextSender
 	media     bridge.MediaSender
+	reaction  bridge.ReactionSender
 }
 
 func (r *v2ToolRegistry) Snapshot(accountID string) (bridge.Snapshot, bool) {
@@ -661,6 +662,8 @@ func (r *v2ToolRegistry) Acquire(
 		lease.Text = r.text
 	case bridge.CapabilityMediaSend:
 		lease.Media = r.media
+	case bridge.CapabilityReactions:
+		lease.Reaction = r.reaction
 	default:
 		return nil, bridge.ErrCapabilityUnavailable
 	}
@@ -674,6 +677,7 @@ func (r *v2ToolRegistry) Capabilities(accountID string) bridge.CapabilitySet {
 	return bridge.CapabilitySet{
 		TextSend:  r.text != nil,
 		MediaSend: r.media != nil,
+		Reactions: r.reaction != nil,
 	}
 }
 

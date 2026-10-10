@@ -162,6 +162,15 @@ return an error naming the working read tools instead.
   `/api/conversations/<id>/messages`), the HTTP twin of the `search_messages`
   MCP tool. Optional `phone`, `conversation_id`, `since`/`until` (YYYY-MM-DD,
   local time, `until` inclusive to end of day), `limit` (default 50, max 500).
+- `POST /api/react` — `{conversation_id, message_id, emoji, action}`. On a
+  v2-primary daemon it takes the v2 IDs the read API returns, queues the
+  reaction on the durable outbox and waits up to 8 s: 200 delivered, 202
+  queued and still retrying (don't repeat it), 502/409 not delivered, 422
+  unknown target. Legacy-primary daemons call the platform senders directly.
+- `POST /api/v1/outbox/reactions` — the durable twin (v2-primary only,
+  `idempotency_key` required), returns the outbox submission immediately.
+  Details: [docs/agent-runbook.md](docs/agent-runbook.md) ("Reactions on
+  v2-primary go through the outbox").
 
 ### Schema
 

@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/maxghenis/openmessage/internal/bridge"
 )
 
 // OutboxKind identifies the shape of an outbound intent.
@@ -208,6 +210,17 @@ type Confirmation struct {
 	LeaseToken        string
 	ResultRemoteID    string
 	TransportResultID string
+}
+
+// ReactionConfirmation records that the transport accepted a reaction for the
+// active lease. ResultRemoteID is empty when the transport returns no identity
+// for a reaction. OccurredAt is when the transport accepted it, and orders the
+// reaction against other mutations of the same reactor.
+type ReactionConfirmation struct {
+	OutboxID       string
+	LeaseToken     string
+	ResultRemoteID string
+	OccurredAt     time.Time
 }
 
 // ReconcileRequest identifies one accepted transport request and its
@@ -1529,6 +1542,113 @@ func (r *OutboxRepository) ConfirmWithoutResult(
 		return fmt.Errorf("confirm outbox item %q without result: %w", outboxID, err)
 	}
 	return r.requireLeaseMutation(ctx, "confirm without result", outboxID, result)
+}
+
+// ConfirmReaction terminally confirms a reaction's active called lease and, in
+// the same transaction, applies the reaction to the read model as this
+// account's own. Sending a reaction stores nothing else locally, so without
+// this row a reader would see the reaction only if the transport later
+// reported it back. The row is the one such a report addresses
+// (SelfReactorKey), and it is applied with ApplyReaction's ordering rule, so a
+// mutation of the same reactor that already carries a later time wins.
+//
+// The target's account and conversation are read from the message as it is
+// stored now, not from the outbox row, because a message can be rebound to
+// another conversation after its reaction was queued. applied reports whether
+// the read model changed.
+func (r *OutboxRepository) ConfirmReaction(
+	ctx context.Context,
+	confirmation ReactionConfirmation,
+) (applied bool, err error) {
+	occurredAtMS := confirmation.OccurredAt.UnixMilli()
+	if occurredAtMS <= 0 {
+		return false, fmt.Errorf(
+			"confirm reaction outbox item %q: occurrence time is not positive",
+			confirmation.OutboxID,
+		)
+	}
+	nowMS, err := r.nowMS("confirm reaction outbox item")
+	if err != nil {
+		return false, err
+	}
+	tx, err := r.store.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, fmt.Errorf(
+			"confirm reaction outbox item %q: begin transaction: %w",
+			confirmation.OutboxID,
+			err,
+		)
+	}
+	defer tx.Rollback()
+
+	result, err := tx.ExecContext(ctx, `
+		UPDATE outbox
+		SET state = 'confirmed',
+			result_remote_id = ?,
+			error_class = NULL,
+			error_code = NULL,
+			error_detail = NULL,
+			next_attempt_at_ms = NULL,
+			lease_owner = NULL,
+			lease_token = NULL,
+			lease_expires_at_ms = NULL,
+			transport_called_at_ms = NULL,
+			updated_at_ms = ?
+		WHERE outbox_id = ?
+		  AND kind = 'reaction'
+		  AND state = 'dispatching'
+		  AND lease_token = ?
+		  AND transport_called_at_ms IS NOT NULL
+	`,
+		nullableOutboxText(strings.TrimSpace(confirmation.ResultRemoteID)),
+		nowMS,
+		confirmation.OutboxID,
+		confirmation.LeaseToken,
+	)
+	if err != nil {
+		return false, fmt.Errorf("confirm reaction outbox item %q: update: %w", confirmation.OutboxID, err)
+	}
+	if err := r.requireLeaseMutationWithQueryer(
+		ctx, tx, "confirm reaction", confirmation.OutboxID, result,
+	); err != nil {
+		return false, err
+	}
+
+	reaction := ReactionApply{
+		ReactorKey:    SelfReactorKey,
+		ReactorIsSelf: true,
+		ReactorLabel:  SelfReactorLabel,
+		OccurredAtMS:  occurredAtMS,
+		SourceSeqMS:   occurredAtMS,
+	}
+	var action string
+	if err := tx.QueryRowContext(ctx, `
+		SELECT m.message_id, m.account_id, m.conversation_id, r.emoji, r.action
+		FROM outbox_reactions AS r
+		JOIN messages AS m ON m.message_id = r.target_message_id
+		WHERE r.outbox_id = ?
+	`, confirmation.OutboxID).Scan(
+		&reaction.MessageID,
+		&reaction.AccountID,
+		&reaction.ConversationID,
+		&reaction.Emoji,
+		&action,
+	); err != nil {
+		return false, fmt.Errorf(
+			"confirm reaction outbox item %q: read reaction target: %w",
+			confirmation.OutboxID,
+			err,
+		)
+	}
+	reaction.Action = bridge.ReactionAction(action)
+	applied, err = applyReaction(ctx, tx, reaction, nowMS)
+	if err != nil {
+		return false, fmt.Errorf("confirm reaction outbox item %q: %w", confirmation.OutboxID, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("confirm reaction outbox item %q: commit: %w", confirmation.OutboxID, err)
+	}
+	return applied, nil
 }
 
 // Confirm atomically records a known remote result for the active called
