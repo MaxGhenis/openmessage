@@ -257,9 +257,10 @@ func mergeDuplicateRows(
 // reaction would be lost.
 //
 // Nothing else depends on the value. Reads select active reactions only.
-// ApplyReaction does compare occurred_at_ms, so a delta would revive the
+// ApplyReaction does compare occurred_at_ms, so a later add would revive the
 // reactor, but the ingest worker sends Google reactions through
-// ReplaceEmbeddedReactions only, and only that writer creates fences.
+// ReplaceEmbeddedReactions only, and fences originate only there: a merge
+// copies a duplicate's fence to its survivor, it never invents one.
 const inferredTombstoneOccurredAtMS = 1
 
 // tombstoneReactionsBelowFence marks removed every reaction on messageID that
