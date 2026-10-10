@@ -1637,7 +1637,13 @@ the same SQLite transaction (`OutboxRepository.ConfirmReaction`); without it
 the reaction would appear only if a transport later reported it. Its time is
 when the transport accepted it, and a later report for the same reactor key
 replaces it when it carries a later time (the usual `ApplyReaction`
-ordering). A reaction that ends
+ordering). On Google Messages the phone's copy is authoritative instead:
+every Google frame for a message applies that message's full reaction
+snapshot (`ReplaceEmbeddedReactions`), which removes active reactors the
+snapshot does not list, and the Google decoder names reactors by participant
+ID rather than as self. So the next frame for the message replaces the "self"
+row with the reactor the phone names, or removes it if the phone's copy does
+not have the reaction yet; a reaction can disappear briefly and come back. A reaction that ends
 `uncertain`, `rejected`, `not_dispatched` or `canceled` writes nothing, so the
 thread shows only reactions that went out. While a reaction is `queued`,
 `dispatching` or `not_dispatched` it is listed in the web UI's outbox tray
