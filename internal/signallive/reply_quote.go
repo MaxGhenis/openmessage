@@ -13,10 +13,13 @@ import (
 // The other fields describe the stored message; the v2 dispatcher fills them
 // from the v2 store (bridge.MessageRef). A zero SentAt means they are absent,
 // and the quote is resolved from the legacy store by RemoteID, as it always
-// was (signalQuoteArgs).
+// was (signalQuoteArgs). Outgoing reports that this account sent the message;
+// QuoteArgs does not read it and still takes an empty AuthorID as this
+// account.
 type ReplyTarget struct {
 	RemoteID       string
 	AuthorID       string
+	Outgoing       bool
 	SentAt         time.Time
 	Text           string
 	HasAttachment  bool

@@ -26,7 +26,7 @@ type poller interface {
 	ObserveIngress(func(account string, line []byte, resolvedSource string, resolvedDestination string)) func()
 	StartPoller(context.Context) (signallive.PollerRun, error)
 	SendTextRequest(string, string, signallive.ReplyTarget) (int64, error)
-	SendReactionRequest(string, string, string, string, string) error
+	SendReactionRequest(string, signallive.ReactionTarget, string, string) error
 	SendMediaRequest(string, io.Reader, int64, string, string, string, signallive.ReplyTarget) (int64, error)
 	DownloadMediaRef(string, string, string, string, string, bool) ([]byte, string, error)
 	Status() signallive.StatusSnapshot
@@ -163,10 +163,24 @@ func ReplyTarget(ref *bridge.MessageRef) signallive.ReplyTarget {
 	return signallive.ReplyTarget{
 		RemoteID:       ref.RemoteID,
 		AuthorID:       ref.AuthorID,
+		Outgoing:       ref.Outgoing,
 		SentAt:         ref.SentAt,
 		Text:           ref.Text,
 		HasAttachment:  ref.HasAttachment,
 		AttachmentMIME: ref.AttachmentMIME,
+	}
+}
+
+// ReactionTarget carries a durable reaction's target to signallive. Signal
+// names the target by author and sent timestamp, so the dispatcher's
+// description (author, direction, occurred time) travels with the remote ID;
+// signallive decides whether those name a message (ReactionTargetArgs).
+func ReactionTarget(ref bridge.MessageRef) signallive.ReactionTarget {
+	return signallive.ReactionTarget{
+		RemoteID: ref.RemoteID,
+		AuthorID: ref.AuthorID,
+		Outgoing: ref.Outgoing,
+		SentAt:   ref.SentAt,
 	}
 }
 
@@ -204,8 +218,7 @@ func (a *Adapter) SendReaction(
 
 	err := a.poller.SendReactionRequest(
 		req.Conversation.RemoteID,
-		req.Target.RemoteID,
-		req.Target.AuthorID,
+		ReactionTarget(req.Target),
 		req.Emoji,
 		string(req.Action),
 	)

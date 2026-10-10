@@ -62,6 +62,7 @@ func (s *MessageService) replyRefForLease(
 	return &bridge.MessageRef{
 		RemoteID:       target.RemoteMessageID,
 		AuthorID:       authorID,
+		Outgoing:       target.Direction == sqlite.MessageDirectionOutgoing,
 		SentAt:         time.UnixMilli(target.OccurredAtMS),
 		Text:           target.Body,
 		HasAttachment:  hasAttachment,
