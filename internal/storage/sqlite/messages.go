@@ -83,9 +83,9 @@ type MessageProjection struct {
 type MessageRepository struct {
 	store *Store
 	now   func() time.Time
-	// afterConversationWindow, when a test sets it, runs between the two
-	// statements a conversation search composes its answer from.
-	afterConversationWindow func()
+	// betweenSearchStatements, when a test sets it, runs between the
+	// statements a conversation or sender search composes its answer from.
+	betweenSearchStatements func()
 }
 
 // NewMessageRepository creates an inbox/message repository. now is required so

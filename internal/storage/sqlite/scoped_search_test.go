@@ -592,7 +592,7 @@ func TestConversationSearchReadsOneSnapshot(t *testing.T) {
 	// A newest-3 window, and the index never tried: the rest answers. Between
 	// the window and the rest, the newest message moves below the cut.
 	plan := searchPlan{window: 3, indexMinRows: 1000}
-	repository.afterConversationWindow = func() {
+	repository.betweenSearchStatements = func() {
 		mustExec(t, db, `UPDATE messages SET occurred_at_ms = 50 WHERE message_id = 'message-10'`)
 	}
 	got, path, err := repository.searchMessages(ctx, "quay", filter, plan)
@@ -612,5 +612,56 @@ func TestConversationSearchReadsOneSnapshot(t *testing.T) {
 	}
 	if ids := messageIDs(got); len(ids) != 11 || ids[0] != "message-10" || ids[10] != "message-10" {
 		t.Fatalf("without a transaction = %v; want message-10 first and again last, which is why searchScope opens one", ids)
+	}
+}
+
+// A sender's identities and their messages are read by separate statements
+// too. In searchScope's transaction the answer is the LIKE's at one snapshot
+// even when a message moves to another identity of the same address between
+// them; without it, that message is in neither the identities read before nor
+// the messages read after.
+func TestSenderSearchReadsOneSnapshot(t *testing.T) {
+	ctx := context.Background()
+	store := openRepositoryTestStore(t)
+	repository := mustMessageRepository(t, store, 100)
+	db := store.db
+	mustExec(t, db, `INSERT INTO accounts (account_id, bridge_key, created_at_ms, updated_at_ms) VALUES ('account-a', 'signal_cli', 1, 1)`)
+	mustExec(t, db, `INSERT INTO identities (identity_id, account_id, kind, canonical_value, raw_value, created_at_ms, updated_at_ms) VALUES ('identity-a', 'account-a', 'phone', '+15550000001', '+15550000001', 1, 1)`)
+	mustExec(t, db, `INSERT INTO conversations (conversation_id, account_id, remote_conversation_id, kind, created_at_ms, updated_at_ms) VALUES ('conversation-a', 'account-a', 'remote-a', 'direct', 1, 1)`)
+	for i := 1; i <= 6; i++ {
+		mustExec(t, db, `INSERT INTO messages (message_id, conversation_id, account_id, remote_message_id, sender_identity_id, direction, body, occurred_at_ms, created_at_ms, updated_at_ms)
+			VALUES (?, 'conversation-a', 'account-a', ?, 'identity-a', 'incoming', 'lunch at the quay', ?, 1, 1)`, fmt.Sprintf("message-%02d", i), fmt.Sprintf("remote-%d", i), 100+i)
+	}
+	filter := SearchQuery{SenderCanonicalValue: "+15550000001", Limit: 20}
+	likeSQL, likeArgs := likeSearchMessagesStatement("quay", filter)
+	before := queryMessages(t, db, likeSQL, likeArgs...)
+	// After the identities are read, the address gains a second identity and
+	// the newest message becomes its.
+	reattribute := func() {
+		mustExec(t, db, `INSERT INTO identities (identity_id, account_id, kind, canonical_value, raw_value, created_at_ms, updated_at_ms) VALUES ('identity-b', 'account-a', 'e164', '+15550000001', '+15550000001', 1, 1)`)
+		mustExec(t, db, `UPDATE messages SET sender_identity_id = 'identity-b' WHERE message_id = 'message-06'`)
+	}
+	repository.betweenSearchStatements = reattribute
+	got, path, err := repository.searchMessages(ctx, "quay", filter, searchPlan{indexMinRows: 1000})
+	if err != nil || path != searchPathLike {
+		t.Fatalf("searchMessages() path %s, err %v", path, err)
+	}
+	if !reflect.DeepEqual(got, before) {
+		t.Fatalf("searchMessages() = %v, want the LIKE's rows before the write %v", messageIDs(got), messageIDs(before))
+	}
+
+	// The same statements outside a transaction lose the moved message, which
+	// the LIKE finds both before and after the write.
+	mustExec(t, db, `UPDATE messages SET sender_identity_id = 'identity-a' WHERE message_id = 'message-06'`)
+	mustExec(t, db, `DELETE FROM identities WHERE identity_id = 'identity-b'`)
+	expression, _ := trigramMatchQuery("quay")
+	got, _, err = repository.searchSender(ctx, db, "quay", expression, filter, searchPlan{indexMinRows: 1000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	after := queryMessages(t, db, likeSQL, likeArgs...)
+	if len(before) != 6 || len(after) != 6 || len(got) != 5 {
+		t.Fatalf("without a transaction = %v (LIKE before %d rows, after %d); want the moved message missing, which is why searchScope opens one",
+			messageIDs(got), len(before), len(after))
 	}
 }

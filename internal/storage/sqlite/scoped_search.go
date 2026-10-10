@@ -108,7 +108,7 @@ const (
 )
 
 // searchQuerier runs a scoped search's statements: the store, or the read
-// transaction a conversation search composes its answer in.
+// transaction searchScope composes an answer in.
 type searchQuerier interface {
 	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
@@ -121,19 +121,22 @@ type searchQuerier interface {
 // so a term common in the thread is answered by its newest rows. searchScope
 // therefore first reads the newest conversationWindow messages of the
 // conversation's range (the rows at or above boundary, the window-th newest),
-// and stops if they hold limit matches. Otherwise the rows below boundary remain. The
-// window's match rate predicts how many of them the LIKE would read before
-// it found the rest of its matches (expectedLikeRows); when that many rows
-// remain (scopeIndexBound), the index search answers if it has few enough
-// candidates; otherwise the LIKE continues below boundary. The window and
-// the rest are separate statements, so they run in one read transaction: a
-// write between them cannot move a message across the boundary, to be
-// returned twice or not at all.
+// and stops if they hold limit matches. Otherwise the rows below boundary
+// remain. The window's match rate predicts how many of them the LIKE would
+// read before it found the rest of its matches (expectedLikeRows); when that
+// many rows remain (scopeIndexBound), the index search answers if it has few
+// enough candidates; otherwise the LIKE continues below boundary.
 //
 // A sender's messages can come from several identities, whose rows the LIKE
 // reads in full and sorts whatever the term (one identity's it reads in time
 // order, stopping at limit matches). searchScope counts them and decides the
 // same way, asking for senderIndexMinimums times the minimum.
+//
+// Either answer is put together from several statements: a conversation's
+// window and rest, a sender's identities and their messages. They run in one
+// read transaction, so a write between them cannot move a message across the
+// boundary, or to another identity of the sender, to be returned twice or not
+// at all.
 func (r *MessageRepository) searchScope(
 	ctx context.Context,
 	query string,
@@ -141,51 +144,54 @@ func (r *MessageRepository) searchScope(
 	filter SearchQuery,
 	plan searchPlan,
 ) ([]Message, searchPath, error) {
-	if filter.ConversationID == "" {
-		return r.searchSender(ctx, query, expression, filter, plan)
-	}
 	tx, err := r.store.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
-		return nil, "", fmt.Errorf("search conversation: begin: %w", err)
+		return nil, "", fmt.Errorf("search scope: begin: %w", err)
 	}
 	defer tx.Rollback()
+	if filter.ConversationID == "" {
+		return r.searchSender(ctx, tx, query, expression, filter, plan)
+	}
 	return r.searchConversation(ctx, tx, query, expression, filter, plan)
 }
 
 func (r *MessageRepository) searchSender(
 	ctx context.Context,
+	tx searchQuerier,
 	query string,
 	expression string,
 	filter SearchQuery,
 	plan searchPlan,
 ) ([]Message, searchPath, error) {
-	db := r.store.db
 	// The sender's identities are read once and named in each statement:
 	// identities has no index on canonical_value, so the filter's subquery
 	// reads the whole table every time a statement runs it.
-	senderIDs, err := senderIdentityIDs(ctx, db, filter.SenderCanonicalValue)
+	senderIDs, err := senderIdentityIDs(ctx, tx, filter.SenderCanonicalValue)
 	if err != nil {
 		return nil, "", err
+	}
+	if r.betweenSearchStatements != nil {
+		r.betweenSearchStatements()
 	}
 	if len(senderIDs) == 0 {
 		// No identity holds the address, so no message has such a sender.
 		return []Message{}, searchPathLike, nil
 	}
 	countStatement, countArgs := senderRangeCountStatement(filter, senderIDs)
-	bound, err := scopeIndexBound(ctx, db, -1, max(plan.senderMinimums, 1), plan, func(upTo int) (int, error) {
-		return countSearchRows(ctx, db, countStatement, append(countArgs, upTo)...)
+	bound, err := scopeIndexBound(ctx, tx, -1, max(plan.senderMinimums, 1), plan, func(upTo int) (int, error) {
+		return countSearchRows(ctx, tx, countStatement, append(countArgs, upTo)...)
 	})
 	if err != nil {
 		return nil, "", err
 	}
 	if bound > 0 {
-		messages, complete, err := scopeIndexSearch(ctx, db, expression, query, filter, senderIDs, bound)
+		messages, complete, err := scopeIndexSearch(ctx, tx, expression, query, filter, senderIDs, bound)
 		if err != nil || complete {
 			return messages, searchPathScopeIndex, err
 		}
 	}
 	statement, args := senderLikeSearchStatement(query, filter, senderIDs)
-	messages, err := querySearchMessages(ctx, db, statement, args)
+	messages, err := querySearchMessages(ctx, tx, statement, args)
 	return messages, searchPathLike, err
 }
 
@@ -268,8 +274,8 @@ func (r *MessageRepository) searchConversation(
 	if len(matches) >= filter.Limit {
 		return matches, searchPathConversationWindow, nil
 	}
-	if r.afterConversationWindow != nil {
-		r.afterConversationWindow()
+	if r.betweenSearchStatements != nil {
+		r.betweenSearchStatements()
 	}
 	countStatement, countArgs := conversationRestCountStatement(filter, boundary)
 	expected := expectedLikeRows(filter.Limit, len(matches), window)
