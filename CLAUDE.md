@@ -169,7 +169,10 @@ Migration 0012 (`substring_search`) answers searches across conversations and
 conversation-name search from FTS5 trigram indexes kept in step by triggers, or
 from a read of the newest 2,000 messages, without changing which rows match
 (`internal/storage/sqlite/substring_search.go`; the runbook's "What a v2 search
-matches" covers checking and rebuilding the indexes).
+matches" covers checking and rebuilding the indexes). A search within one
+conversation or by sender reads that scope with the `LIKE`, and switches to
+the index only when counts show the `LIKE` would still read many rows and the
+index has few candidates (`internal/storage/sqlite/scoped_search.go`).
 
 ### Schema
 

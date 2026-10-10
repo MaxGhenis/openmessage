@@ -70,12 +70,33 @@ path with the plain `LIKE`. When the newest messages hold fewer hits than asked
 for, the index answers. A query needs a run of three characters between
 wildcards for the index to help; a one- or two-character query is answered from
 the newest messages when they hold enough hits, and otherwise scans as it always
-did. A search within one conversation (`conversation_id=`, the thread search
-box) or by sender (`phone=`) runs the `LIKE` over that conversation's or
-sender's messages, as before. The one search that can now take longer than
-before is a term found in many messages overall but in few of the newest 2,000:
-the index then visits all its matches, measured at up to about 1.5x the old
-scan's time.
+did. The one search across conversations that can now take longer than before
+is a term found in many messages overall but in few of the newest 2,000: the
+index then visits all its matches, measured at up to about 1.5x the old scan's
+time.
+
+A search within one conversation (`conversation_id=`, the thread search box)
+or by sender (`phone=`) reads that conversation's or sender's messages with
+the `LIKE`, a conversation's newest first, so a term common in the thread is
+answered by its newest 500 messages. When those hold too few hits, the store
+estimates how many more rows the `LIKE` would read (from the hit rate so far,
+and a count of the rows left) and tries the index only when that is at least
+3,000 rows (or 1/50 of the store's messages, if more). The index search reads
+at most half that many candidates; with more, it gives up and the `LIKE`
+continues. A sender's search is decided the same way from a count of the
+sender's messages, which must reach twice that minimum. Every choice comes
+from counts, never timings, so a search always takes the same path, and every
+path returns the `LIKE`'s rows.
+
+Measured on copies of the live store: with ten times the history, the median
+search in its 127,000-message thread fell from 79 ms to 4 ms, and at today's
+size in the busiest thread (12,700 messages) from 6.0 ms to 1.8 ms. A range a
+little longer than 500 messages but too short for the index pays for the
+checks: in medians, 0.45 ms more on a 1.1 ms search of 2,900 messages, and
+1.0-1.7 ms more on 4.4-5.6 ms searches of 7,800-12,700 messages at ten times
+the history. Searches by sender take 0.15-0.3 ms longer at today's size (no
+sender has enough messages for the index), and fell from 40-47 ms to 7-11 ms
+at ten times the history.
 
 If searches miss messages that `LIKE` finds, check the indexes on a copy of the
 store (never the live file; copy `store.sqlite3` with its `-wal`):

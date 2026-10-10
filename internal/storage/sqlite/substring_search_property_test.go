@@ -90,16 +90,20 @@ func randomSearchQuery(r *rand.Rand, values []string) string {
 // Invariant: for every query and filter combination, SearchMessages' whole-scope
 // statement returns exactly the messages, in exactly the order, of the plain
 // LIKE statement; the repository method returns the same through every path
-// its limits choose; and a recent window that reports itself complete holds
+// its plan chooses; and a recent window that reports itself complete holds
 // that same answer.
 func TestSearchMessagesMatchesLikeProperty(t *testing.T) {
-	pathsSeen := map[searchPath]bool{}
+	pathsSeen := map[searchPath]int{}
 	defer func() {
-		for _, path := range []searchPath{searchPathRecentWindow, searchPathTrigramIndex, searchPathLike} {
-			if !t.Failed() && !pathsSeen[path] {
+		for _, path := range []searchPath{
+			searchPathRecentWindow, searchPathTrigramIndex, searchPathLike,
+			searchPathConversationWindow, searchPathConversationRest, searchPathScopeIndex,
+		} {
+			if !t.Failed() && pathsSeen[path] == 0 {
 				t.Errorf("no search took the %s path (saw %v); the property must reach every path", path, pathsSeen)
 			}
 		}
+		t.Logf("searches by path: %v", pathsSeen)
 	}()
 	property := func(c readPlanStore) bool {
 		s := seedReadStore(t, c.Seed)
@@ -112,15 +116,27 @@ func TestSearchMessagesMatchesLikeProperty(t *testing.T) {
 		}
 		repository := mustMessageRepository(t, s.store, 100)
 		pick := func(values []string) string { return values[r.Intn(len(values))] }
-		for range 80 {
-			filter := SearchQuery{Limit: 1 + r.Intn(12)}
-			if r.Intn(4) == 0 {
+		for i := range 140 {
+			// The first 80 searches draw every filter. The last 60 are each
+			// bounded by a conversation or sender, with small windows and
+			// thresholds, and alternate between a term in about a third of the
+			// bodies with a small limit, which a conversation's newest rows
+			// answer, and a drawn or rarer term with a larger limit, which the
+			// index or the rest of the scope answers; so every store reaches
+			// the scoped paths, not only the few the first 80 draw for them.
+			scoped, common := i >= 80, i >= 80 && i%2 == 0
+			filter := SearchQuery{Limit: []int{1 + r.Intn(12), 1 + r.Intn(3)}[r.Intn(2)]}
+			if scoped {
+				filter.Limit = []int{2 + r.Intn(5), 1 + r.Intn(2)}[i%2^1]
+			}
+			if r.Intn(4) == 0 && !scoped {
 				filter.AccountID = pick(append(slices.Clone(s.accounts), "account-none"))
 			}
-			if r.Intn(3) == 0 {
+			byConversation := r.Intn(3) == 0 || (scoped && r.Intn(3) != 0)
+			if byConversation {
 				filter.ConversationID = s.conversations[r.Intn(len(s.conversations))].ConversationID
 			}
-			if r.Intn(3) == 0 {
+			if r.Intn(3) == 0 || (scoped && !byConversation) {
 				filter.SenderCanonicalValue = pick(append(slices.Clone(s.phones), "uuid-1", "+19999999999"))
 			}
 			if r.Intn(3) == 0 {
@@ -130,34 +146,101 @@ func TestSearchMessagesMatchesLikeProperty(t *testing.T) {
 				filter.UntilMS = int64(r.Intn(9))
 			}
 			query := randomSearchQuery(r, bodies)
+			switch {
+			case common:
+				query = "the"
+			case scoped && len(bodies) > 0 && r.Intn(2) == 0:
+				// A longer piece of one body, which few others share.
+				if body := pick(bodies); len(body) >= 4 {
+					start := r.Intn(len(body) - 3)
+					query = body[start : start+4+r.Intn(min(5, len(body)-start-3))]
+				}
+			case !scoped && r.Intn(3) == 0:
+				query = []string{"the", "the", "e"}[r.Intn(3)]
+			}
 			normalized := filter
 			if normalized.SinceMS > 0 && normalized.UntilMS > 0 && normalized.UntilMS < normalized.SinceMS {
 				normalized.SinceMS, normalized.UntilMS = normalized.UntilMS, normalized.SinceMS
 			}
 			got := assertMessageSearchMatchesLike(t, s.store.db, query, normalized)
-			// Windows from zero to past the store's size reach every path: the
-			// window answers with limit matches or is the whole range, or the
+			// Windows from zero to past the store's size, and index thresholds
+			// from none to more than any scope holds, reach every path: a
+			// window answers with limit matches or is the whole range, a
+			// conversation's newest rows answer or the rest is read, or the
 			// whole scope is searched by the index or the LIKE.
-			window := r.Intn(len(s.messages) + 3)
-			messages, path, err := repository.searchMessages(context.Background(), query, filter, window)
-			if err != nil {
-				t.Fatalf("searchMessages(%q, %+v, %d): %v", query, filter, window, err)
+			plan := searchPlan{
+				window:          []int{r.Intn(len(s.messages) + 3), 1 + r.Intn(6)}[r.Intn(2)],
+				indexMinRows:    r.Intn(len(s.messages)/2 + 3),
+				indexStoreShare: []int{0, 0, 1, 3, 1000}[r.Intn(5)],
 			}
-			pathsSeen[path] = true
+			if common {
+				plan = searchPlan{window: 1 + r.Intn(4), indexMinRows: 2 + r.Intn(6)}
+			} else if scoped {
+				plan = searchPlan{window: 1 + r.Intn(3), indexMinRows: 3 + r.Intn(4), indexStoreShare: []int{0, 0, 0, 3}[r.Intn(4)]}
+			}
+			messages, path, err := repository.searchMessages(context.Background(), query, filter, plan)
+			if err != nil {
+				t.Fatalf("searchMessages(%q, %+v, %+v): %v", query, filter, plan, err)
+			}
+			pathsSeen[path]++
 			likeSQL, likeArgs := likeSearchMessagesStatement(query, normalized)
 			want := queryMessages(t, s.store.db, likeSQL, likeArgs...)
 			if !reflect.DeepEqual(messages, want) {
-				t.Errorf("seed %d: searchMessages(%q, %+v, window %d) = %v, LIKE = %v", c.Seed, query, filter, window, messageIDs(messages), got)
+				t.Errorf("seed %d: searchMessages(%q, %+v, %+v) via %s = %v, LIKE = %v", c.Seed, query, filter, plan, path, messageIDs(messages), got)
 				return false
 			}
 			// The recent window alone, when it claims to be complete, is the answer.
-			recent, complete, err := repository.searchRecentMessages(context.Background(), query, normalized, window)
+			recent, complete, err := repository.searchRecentMessages(context.Background(), query, normalized, plan.window)
 			if err != nil {
-				t.Fatalf("searchRecentMessages(%q, %+v, %d): %v", query, normalized, window, err)
+				t.Fatalf("searchRecentMessages(%q, %+v, %d): %v", query, normalized, plan.window, err)
 			}
 			if complete && !reflect.DeepEqual(recent, want) {
-				t.Errorf("seed %d: complete recent window %d for %q %+v = %v, want %v", c.Seed, window, query, normalized, messageIDs(recent), got)
+				t.Errorf("seed %d: complete recent window %d for %q %+v = %v, want %v", c.Seed, plan.window, query, normalized, messageIDs(recent), got)
 				return false
+			}
+			// The scope's index search, run whatever the plan would choose and
+			// with any bound, is the answer when it reports itself complete,
+			// and gives up only when the index holds at least bound candidates.
+			if expression, ok := trigramMatchQuery(query); ok && indexBoundedSearch(normalized) {
+				var candidates int
+				if err := s.store.db.QueryRow(`SELECT count(*) FROM messages_fts WHERE messages_fts MATCH ?`, expression).Scan(&candidates); err != nil {
+					t.Fatal(err)
+				}
+				// A sender's identities are named by ID or selected by the
+				// filter's subquery; both are the same search.
+				senders := [][]string{nil}
+				if normalized.SenderCanonicalValue != "" {
+					ids, err := senderIdentityIDs(context.Background(), s.store.db, normalized.SenderCanonicalValue)
+					if err != nil {
+						t.Fatal(err)
+					}
+					senders = append(senders, append([]string{}, ids...))
+				}
+				for _, senderIDs := range senders {
+					for _, bound := range []int{1 + r.Intn(len(s.messages)+2), len(s.messages) + 1} {
+						indexed, complete, err := scopeIndexSearch(context.Background(), s.store.db, expression, query, normalized, senderIDs, bound)
+						if err != nil {
+							t.Fatalf("scopeIndexSearch(%q, %+v, %v, %d): %v", query, normalized, senderIDs, bound, err)
+						}
+						if complete != (candidates < bound) || (complete && !reflect.DeepEqual(indexed, want)) || (!complete && indexed != nil) {
+							t.Errorf("seed %d: scope index for %q %+v (senders %v) with bound %d (%d candidates) = %v complete %v, want %v",
+								c.Seed, query, normalized, senderIDs, bound, candidates, messageIDs(indexed), complete, got)
+							return false
+						}
+					}
+				}
+			}
+			// The sender's LIKE with its identities named by ID is the LIKE.
+			if normalized.SenderCanonicalValue != "" {
+				ids, err := senderIdentityIDs(context.Background(), s.store.db, normalized.SenderCanonicalValue)
+				if err != nil {
+					t.Fatal(err)
+				}
+				senderSQL, senderArgs := senderLikeSearchStatement(query, normalized, append([]string{}, ids...))
+				if byID := queryMessages(t, s.store.db, senderSQL, senderArgs...); !reflect.DeepEqual(byID, want) {
+					t.Errorf("seed %d: sender LIKE by identity for %q %+v = %v, want %v", c.Seed, query, normalized, messageIDs(byID), got)
+					return false
+				}
 			}
 		}
 		return true
