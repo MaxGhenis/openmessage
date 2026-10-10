@@ -34,22 +34,44 @@ type repairRowSeed struct {
 
 type repairDamageScenario struct {
 	Older, Window   []repairRowSeed
-	Reactions       map[[2]int][2]int64 // (row, reactor) -> (occurred offset, source seq)
-	Fences          map[int]int64
-	Attachments     map[int]bool // row -> downloaded
+	Snapshots       map[int]repairSnapshotSeed // row -> the embedded reaction snapshot stored on it
+	Attachments     map[int]bool               // row -> downloaded
 	ReactionIntents []int
 	ReceiptIntents  []int
-	Cursors         map[[2]int]int // (device, conversation) -> row, or -1 for a cursor naming no message
-	Sends           map[int]bool   // row -> its text send is still open (else confirmed)
+	Cursors         map[[2]int]int         // (device, conversation) -> row, or -1 for a cursor naming no message
+	Sends           map[int]repairSendSeed // row -> the send naming it as its local copy
+}
+
+// repairSnapshotSeed is a row's reactions as a Google embedded snapshot at
+// Fence leaves them: listed reactors active at Fence, and reactors an earlier
+// or this snapshot dropped removed at or below it.
+type repairSnapshotSeed struct {
+	Fence     int64
+	Reactions map[int]repairReactionSeed
+}
+
+type repairReactionSeed struct {
+	Active      bool
+	SourceSeqMS int64
+}
+
+type repairSendSeed struct {
+	State sqlite.OutboxState
+	Kind  string
+}
+
+// repairOpenSendStates still need the send's local row; the other states are
+// terminal.
+var repairOpenSendStates = map[sqlite.OutboxState]bool{
+	sqlite.OutboxQueued: true, sqlite.OutboxUncertain: true, sqlite.OutboxStoreFailed: true,
 }
 
 func (repairDamageScenario) Generate(r *rand.Rand, _ int) reflect.Value {
 	scenario := repairDamageScenario{
-		Reactions:   map[[2]int][2]int64{},
-		Fences:      map[int]int64{},
+		Snapshots:   map[int]repairSnapshotSeed{},
 		Attachments: map[int]bool{},
 		Cursors:     map[[2]int]int{},
-		Sends:       map[int]bool{},
+		Sends:       map[int]repairSendSeed{},
 	}
 	// Google message ids are the phone's row ids. Older rows come from the
 	// old phone and window rows from the new one, so an id is unique within
@@ -111,13 +133,17 @@ func (repairDamageScenario) Generate(r *rand.Rand, _ int) reflect.Value {
 	}
 	rows := len(scenario.Older) + len(scenario.Window)
 	for row := range rows {
-		for reactor := range 2 {
-			if r.Intn(4) == 0 {
-				scenario.Reactions[[2]int{row, reactor}] = [2]int64{int64(r.Intn(3)), int64(r.Intn(3))}
+		if r.Intn(3) == 0 {
+			snapshot := repairSnapshotSeed{Fence: 1 + int64(r.Intn(3)), Reactions: map[int]repairReactionSeed{}}
+			for reactor := range 2 {
+				switch r.Intn(3) {
+				case 0:
+					snapshot.Reactions[reactor] = repairReactionSeed{Active: true, SourceSeqMS: snapshot.Fence}
+				case 1:
+					snapshot.Reactions[reactor] = repairReactionSeed{SourceSeqMS: 1 + int64(r.Intn(int(snapshot.Fence)))}
+				}
 			}
-		}
-		if r.Intn(5) == 0 {
-			scenario.Fences[row] = int64(r.Intn(4))
+			scenario.Snapshots[row] = snapshot
 		}
 		if r.Intn(5) == 0 {
 			scenario.Attachments[row] = r.Intn(2) == 0
@@ -151,7 +177,11 @@ func (repairDamageScenario) Generate(r *rand.Rand, _ int) reflect.Value {
 	}
 	for row := range rows {
 		if r.Intn(8) == 0 {
-			scenario.Sends[row] = r.Intn(2) == 0
+			states := []sqlite.OutboxState{
+				sqlite.OutboxQueued, sqlite.OutboxUncertain, sqlite.OutboxStoreFailed,
+				sqlite.OutboxConfirmed, sqlite.OutboxRejected, sqlite.OutboxCanceled,
+			}
+			scenario.Sends[row] = repairSendSeed{State: states[r.Intn(len(states))], Kind: []string{"text", "media"}[r.Intn(2)]}
 		}
 	}
 	return reflect.ValueOf(scenario)
@@ -251,7 +281,7 @@ func readRepairDamageState(t *testing.T, path string) repairDamageState {
 		state.Cursors[[2]string{device, conversation}] = message
 		return err
 	})
-	query(`SELECT outbox_id, local_message_id, conversation_id, state FROM outbox WHERE kind = 'text'`, func(rows *sql.Rows) error {
+	query(`SELECT outbox_id, local_message_id, conversation_id, state FROM outbox WHERE local_message_id IS NOT NULL`, func(rows *sql.Rows) error {
 		var outboxID string
 		var send [3]string
 		err := rows.Scan(&outboxID, &send[0], &send[1], &send[2])
@@ -337,18 +367,23 @@ func seedRepairDamage(t *testing.T, fixture repairMergeFixture, scenario repairD
 		}
 	}
 	nowMS := i01TestTime.UnixMilli()
-	for key, value := range scenario.Reactions {
-		message := rows[key[0]]
-		exec(`INSERT INTO reactions (
-				message_id, reactor_key, account_id, conversation_id, reactor_identity_id, reactor_is_self,
-				reactor_label, emoji, state, occurred_at_ms, source_seq_ms, created_at_ms, updated_at_ms
-			) VALUES (?, ?, ?, ?, NULL, 0, 'peer', '👍', 'active', ?, ?, ?, ?)`,
-			message.MessageID, "reactor-"+strconv.Itoa(key[1]), i01AccountID, message.ConversationID,
-			nowMS+value[0], value[1], nowMS, nowMS)
-	}
-	for row, seq := range scenario.Fences {
+	for row, snapshot := range scenario.Snapshots {
+		message := rows[row]
 		exec(`INSERT INTO reaction_snapshot_fences (message_id, source_seq_ms, updated_at_ms) VALUES (?, ?, ?)`,
-			rows[row].MessageID, seq, nowMS)
+			message.MessageID, snapshot.Fence, nowMS)
+		for reactor, reaction := range snapshot.Reactions {
+			state := "removed"
+			if reaction.Active {
+				state = "active"
+			}
+			// Each row gets its own write time, as snapshot writes do.
+			exec(`INSERT INTO reactions (
+					message_id, reactor_key, account_id, conversation_id, reactor_identity_id, reactor_is_self,
+					reactor_label, emoji, state, occurred_at_ms, source_seq_ms, created_at_ms, updated_at_ms
+				) VALUES (?, ?, ?, ?, NULL, 0, 'peer', '👍', ?, ?, ?, ?, ?)`,
+				message.MessageID, "reactor-"+strconv.Itoa(reactor), i01AccountID, message.ConversationID,
+				state, nowMS+1+int64(2*row+reactor), reaction.SourceSeqMS, nowMS, nowMS)
+		}
 	}
 	for row, downloaded := range scenario.Attachments {
 		state, hash := "pending", any(nil)
@@ -367,12 +402,8 @@ func seedRepairDamage(t *testing.T, fixture repairMergeFixture, scenario repairD
 	for index, row := range scenario.ReceiptIntents {
 		fixture.enqueueReadReceipt(t, "property-read-"+strconv.Itoa(index), rows[row], nowMS+int64(index))
 	}
-	for row, open := range scenario.Sends {
-		state := sqlite.OutboxConfirmed
-		if open {
-			state = sqlite.OutboxQueued
-		}
-		insertRepairSend(t, database, "property-send-"+strconv.Itoa(row), rows[row], state)
+	for row, send := range scenario.Sends {
+		insertRepairSend(t, database, "property-send-"+strconv.Itoa(row), send.Kind, rows[row], send.State)
 	}
 	// Enqueueing a receipt moved a cursor; the scenario's cursors replace them.
 	exec(`DELETE FROM read_cursors`)
@@ -382,10 +413,7 @@ func seedRepairDamage(t *testing.T, fixture repairMergeFixture, scenario repairD
 			fixture.setDeviceCursor(t, device, rows[row], nowMS)
 			continue
 		}
-		fixture.setDeviceCursor(t, device, rows[0], nowMS)
-		exec(`UPDATE read_cursors SET conversation_id = ?, last_read_message_id = NULL
-			WHERE device_id = ? AND conversation_id = ?`,
-			threads[key[1]].ConversationID, device, rows[0].ConversationID)
+		fixture.setEmptyCursor(t, device, threads[key[1]].ConversationID)
 	}
 }
 
@@ -395,10 +423,10 @@ func seedRepairDamage(t *testing.T, fixture repairMergeFixture, scenario repairD
 //   - a delete step's survivor is never deleted, and holds the deleted row's
 //     exact content; kept rows keep their content and only deleted rows go;
 //   - every intent targets root(its old target), inside its own conversation;
-//   - reactions and fences equal a replay of the documented merge over the
-//     delete steps (newer row per reactor wins, a fence tombstones reactors
-//     the newest snapshot omitted, the larger fence stays), with each
-//     reaction in its message's conversation;
+//   - reactions follow the copies' snapshots taken together: per (root,
+//     reactor) the row with the largest (source_seq_ms, occurred_at_ms)
+//     stays, tombstoned if still active below the group's largest fence, in
+//     root's conversation; the largest fence stays;
 //   - attachments keep one row per root, downloaded if any in the group was;
 //   - every cursor naming a message survives, on root(that message), and a
 //     cursor naming none survives unless the repair dropped its thread;
@@ -427,7 +455,10 @@ func TestGoogleIDSpaceRepairInvariantsProperty(t *testing.T) {
 			t.Errorf("scenario %+v: plan: %v", scenario, err)
 			return false
 		}
-		if err := ApplyGoogleIDSpaceRepair(ctx, harness.store, report, i01TestTime); err != nil {
+		// The repair runs after every snapshot was written, so a tombstone
+		// it writes carries a later time than any stored reaction.
+		appliedAt := i01TestTime.Add(time.Hour)
+		if err := ApplyGoogleIDSpaceRepair(ctx, harness.store, report, appliedAt); err != nil {
 			t.Errorf("scenario %+v: apply: %v\nplan %+v", scenario, err, report.Steps)
 			return false
 		}
@@ -509,64 +540,41 @@ func TestGoogleIDSpaceRepairInvariantsProperty(t *testing.T) {
 			}
 		}
 
-		// Reactions and fences: replay the documented merge over the delete
-		// steps in plan order. A fence on either row means its reactions come
-		// from snapshots, ordered by source_seq_ms first, and a reactor still
-		// active below the merged fence is tombstoned; without one, deltas
-		// order by occurred_at_ms first. The survivor's row stays on a tie.
-		wantReactions := map[[2]string]repairReactionRow{}
-		for key, row := range before.Reactions {
-			wantReactions[key] = row
-		}
+		// Reactions and fences, from the copies' original snapshot rows: a
+		// group is a root and the copies merged into it, and F its largest
+		// fence. Each reactor keeps the group's row with the largest
+		// (source_seq_ms, occurred_at_ms). A reactor still active below F is
+		// tombstoned at F, since no snapshot at F listed it; one a snapshot
+		// at F lists stays active, whatever order the copies merged in.
 		wantFences := map[string]int64{}
 		for message, seq := range before.Fences {
-			wantFences[message] = seq
+			wantFences[root(message)] = max(wantFences[root(message)], seq)
 		}
-		applyMS := i01TestTime.UnixMilli()
-		for _, step := range report.Steps {
-			if step.Op != "delete" {
-				continue
-			}
-			duplicate, survivor := step.MessageID, step.SurvivorMessageID
-			duplicateFence, duplicateFenced := wantFences[duplicate]
-			survivorFence, survivorFenced := wantFences[survivor]
-			fenced, mergedFence := duplicateFenced || survivorFenced, max(duplicateFence, survivorFence)
-			rank := func(row repairReactionRow) [2]int64 {
-				if fenced {
-					return [2]int64{row.SourceSeqMS, row.OccurredAtMS}
-				}
-				return [2]int64{row.OccurredAtMS, row.SourceSeqMS}
-			}
-			for key, row := range wantReactions {
-				if key[0] != duplicate {
-					continue
-				}
-				delete(wantReactions, key)
-				survivorKey := [2]string{survivor, key[1]}
-				if existing, conflict := wantReactions[survivorKey]; conflict {
-					coverage["reaction groups merged"]++
-					mine, theirs := rank(row), rank(existing)
-					if mine[0] < theirs[0] || (mine[0] == theirs[0] && mine[1] <= theirs[1]) {
-						continue
-					}
-				}
-				wantReactions[survivorKey] = row
-			}
-			if fenced {
-				for key, row := range wantReactions {
-					if key[0] == survivor && row.State == "active" && row.SourceSeqMS < mergedFence {
-						row.State, row.OccurredAtMS, row.SourceSeqMS = "removed", applyMS, mergedFence
-						wantReactions[key] = row
-						coverage["reaction tombstoned below the merged fence"]++
-					}
-				}
-				wantFences[survivor] = mergedFence
-			}
-			delete(wantFences, duplicate)
+		merged := map[string]bool{}
+		for _, survivor := range survivorOf {
+			merged[survivor] = true
 		}
-		for key, row := range wantReactions {
-			row.ConversationID = after.Messages[key[0]].ConversationID
-			wantReactions[key] = row
+		wantReactions := map[[2]string]repairReactionRow{}
+		for key, row := range before.Reactions {
+			grouped := [2]string{root(key[0]), key[1]}
+			best, seen := wantReactions[grouped]
+			if seen {
+				coverage["reaction groups merged"]++
+			}
+			if !seen || row.SourceSeqMS > best.SourceSeqMS ||
+				(row.SourceSeqMS == best.SourceSeqMS && row.OccurredAtMS > best.OccurredAtMS) {
+				wantReactions[grouped] = row
+			}
+		}
+		for grouped, row := range wantReactions {
+			if fence := wantFences[grouped[0]]; merged[grouped[0]] && row.State == "active" && row.SourceSeqMS < fence {
+				row.State, row.OccurredAtMS, row.SourceSeqMS = "removed", appliedAt.UnixMilli(), fence
+				coverage["reaction tombstoned below the largest fence"]++
+			} else if merged[grouped[0]] && row.State == "active" {
+				coverage["reaction active at the largest fence"]++
+			}
+			row.ConversationID = after.Messages[grouped[0]].ConversationID
+			wantReactions[grouped] = row
 		}
 		if !reflect.DeepEqual(after.Reactions, wantReactions) {
 			return fail("reactions\n got %v\nwant %v", after.Reactions, wantReactions)
@@ -607,7 +615,7 @@ func TestGoogleIDSpaceRepairInvariantsProperty(t *testing.T) {
 			return fail("sends changed\n got %v\nwant %v", after.Sends, before.Sends)
 		}
 		for outboxID, send := range after.Sends {
-			if send[2] == string(sqlite.OutboxConfirmed) {
+			if !repairOpenSendStates[sqlite.OutboxState(send[2])] {
 				continue
 			}
 			coverage["open send"]++
@@ -625,7 +633,7 @@ func TestGoogleIDSpaceRepairInvariantsProperty(t *testing.T) {
 		// send pins one of them.
 		pinned := map[string]bool{}
 		for _, send := range before.Sends {
-			if send[2] != string(sqlite.OutboxConfirmed) {
+			if repairOpenSendStates[sqlite.OutboxState(send[2])] {
 				pinned[send[0]] = true
 			}
 		}
@@ -647,8 +655,8 @@ func TestGoogleIDSpaceRepairInvariantsProperty(t *testing.T) {
 		for _, group := range report.Groups {
 			leftInPlace = leftInPlace || strings.Contains(group.Detail, "left message")
 		}
-		if !leftInPlace && again.Moves+again.Deletes != 0 {
-			return fail("second plan moves %d and deletes %d: %+v", again.Moves, again.Deletes, again.Steps)
+		if !leftInPlace && again.Moves+again.Deletes+again.Rebinds+again.Mints+again.Drops != 0 {
+			return fail("second plan is not a no-op: %+v", again.Steps)
 		}
 		coverage["plan applied"]++
 		return true
@@ -663,7 +671,7 @@ func TestGoogleIDSpaceRepairInvariantsProperty(t *testing.T) {
 		"plan applied", "delete", "delete across conversations",
 		"remote id taken: same content", "remote id taken: other content",
 		"intent changed conversation", "intent on a deleted duplicate", "reaction groups merged",
-		"reaction tombstoned below the merged fence",
+		"reaction tombstoned below the largest fence", "reaction active at the largest fence",
 		"cursor on a deleted duplicate", "open send",
 	} {
 		if coverage[name] == 0 {

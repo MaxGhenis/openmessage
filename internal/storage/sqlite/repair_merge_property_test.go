@@ -29,8 +29,8 @@ func repairPropertyMessageID(index int) string {
 // repairPlanScenario is a random message graph and a random plan over it.
 type repairPlanScenario struct {
 	Conversations   [repairPropertyMessages]int // conversation index per message
-	Bodies          [repairPropertyMessages]int // body variant per message; deletes need equal content
-	Sends           map[int]bool                // message -> its send is still open (else confirmed)
+	Contents        [repairPropertyMessages]int // content variant per message; deletes need equal content
+	Sends           map[int]repairSendSeed      // message -> the send naming it as its local copy
 	Reactions       map[[2]int]echoMergeReactionSeed
 	Fences          map[int]int64
 	Attachments     map[[2]int]int // (message, ordinal) -> 1 pending, 2 downloaded
@@ -47,16 +47,19 @@ func (repairPlanScenario) Generate(r *rand.Rand, _ int) reflect.Value {
 		Fences:       map[int]int64{},
 		Attachments:  map[[2]int]int{},
 		Cursors:      map[[2]int]int{},
-		Sends:        map[int]bool{},
+		Sends:        map[int]repairSendSeed{},
 		FutureOutbox: r.Intn(4) == 0,
 	}
 	for index := range scenario.Conversations {
 		scenario.Conversations[index] = r.Intn(len(repairPropertyConversations))
 		if r.Intn(4) == 0 {
-			scenario.Bodies[index] = 1
+			scenario.Contents[index] = 1 + r.Intn(len(repairContentVariants)-1)
 		}
 		if r.Intn(6) == 0 {
-			scenario.Sends[index] = r.Intn(2) == 0
+			scenario.Sends[index] = repairSendSeed{
+				State: repairSendStates[r.Intn(len(repairSendStates))],
+				Kind:  []string{"text", "media"}[r.Intn(2)],
+			}
 		}
 	}
 	for message := range repairPropertyMessages {
@@ -134,6 +137,28 @@ func (repairPlanScenario) Generate(r *rand.Rand, _ int) reflect.Value {
 	return reflect.ValueOf(scenario)
 }
 
+type repairSendSeed struct {
+	State, Kind string
+}
+
+// repairSendStates are outbox states a seeded send can be in: three open
+// (dispatch or reconcile still needs the local row) and the three closed.
+var repairSendStates = []string{"queued", "uncertain", "store_failed", "confirmed", "rejected", "canceled"}
+
+func repairSendIsOpen(state string) bool {
+	return state == "queued" || state == "uncertain" || state == "store_failed"
+}
+
+// repairContentVariants each change one field of the planner's content key.
+// Variant 0 is the base content.
+var repairContentVariants = []string{
+	``,
+	`body = 'other body'`,
+	`occurred_at_ms = occurred_at_ms + 1`,
+	`direction = 'outgoing'`,
+	`sender_identity_id = 'identity-a'`,
+}
+
 // repairPlanState is every row the move and delete steps touch.
 type repairPlanState struct {
 	Messages    map[string]repairMessageRow // message_id
@@ -146,7 +171,7 @@ type repairPlanState struct {
 }
 
 type repairMessageRow struct {
-	ConversationID, Body string
+	ConversationID, Content string
 }
 
 type repairSendRow struct {
@@ -196,6 +221,7 @@ func (state repairPlanState) clone() repairPlanState {
 func repairPlanModel(before repairPlanState, steps []RepairStep, nowMS int64, coverage map[string]int) (repairPlanState, bool) {
 	state := before.clone()
 	mergedInto := map[string]string{}
+	survivors := map[string]bool{} // messages a delete merged into
 	refuse := func(reason string) (repairPlanState, bool) {
 		coverage["refused: "+reason]++
 		return before, false
@@ -214,7 +240,7 @@ func repairPlanModel(before repairPlanState, steps []RepairStep, nowMS int64, co
 				}
 			}
 			for _, send := range state.Sends {
-				if send.LocalMessageID == step.MessageID && send.State != "confirmed" &&
+				if send.LocalMessageID == step.MessageID && repairSendIsOpen(send.State) &&
 					send.ConversationID != step.TargetConversationID {
 					return refuse("move under an open send")
 				}
@@ -250,7 +276,7 @@ func repairPlanModel(before repairPlanState, steps []RepairStep, nowMS int64, co
 				continue
 			}
 			for _, send := range state.Sends {
-				if send.LocalMessageID == duplicate && send.State != "confirmed" {
+				if send.LocalMessageID == duplicate && repairSendIsOpen(send.State) {
 					return refuse("delete under an open send")
 				}
 			}
@@ -270,7 +296,7 @@ func repairPlanModel(before repairPlanState, steps []RepairStep, nowMS int64, co
 			if !exists {
 				return refuse("survivor missing")
 			}
-			if survivorRow.Body != duplicateRow.Body {
+			if survivorRow.Content != duplicateRow.Content {
 				return refuse("content differs")
 			}
 			survivorConversation := survivorRow.ConversationID
@@ -307,11 +333,9 @@ func repairPlanModel(before repairPlanState, steps []RepairStep, nowMS int64, co
 			// A fence on either row means the reactions come from embedded
 			// snapshots, which order by source_seq_ms first; deltas order by
 			// occurred_at_ms first.
-			mergedFence, fenced := int64(0), false
-			for _, messageID := range []string{duplicate, survivor} {
-				if fence, ok := state.Fences[messageID]; ok {
-					mergedFence, fenced = max(mergedFence, fence.SourceSeqMS), true
-				}
+			_, fenced := state.Fences[duplicate]
+			if _, survivorFenced := state.Fences[survivor]; survivorFenced {
+				fenced = true
 			}
 			rank := func(reaction echoMergeReactionRow) [2]int64 {
 				if fenced {
@@ -339,20 +363,7 @@ func repairPlanModel(before repairPlanState, steps []RepairStep, nowMS int64, co
 				reaction.UpdatedAtMS = max(reaction.UpdatedAtMS, nowMS)
 				state.Reactions[survivorKey] = reaction
 			}
-			// The newest snapshot didn't list a reactor still active below
-			// the merged fence, so it is tombstoned.
-			if fenced {
-				for key, reaction := range state.Reactions {
-					if reaction.MessageID == survivor && reaction.State == "active" && reaction.SourceSeqMS < mergedFence {
-						reaction.State = "removed"
-						reaction.OccurredAtMS = nowMS
-						reaction.SourceSeqMS = mergedFence
-						reaction.UpdatedAtMS = max(reaction.UpdatedAtMS, nowMS)
-						state.Reactions[key] = reaction
-						coverage["reaction tombstoned below the merged fence"]++
-					}
-				}
-			}
+			survivors[survivor] = true
 			if fence, ok := state.Fences[duplicate]; ok {
 				delete(state.Fences, duplicate)
 				existing, exists := state.Fences[survivor]
@@ -380,6 +391,21 @@ func repairPlanModel(before repairPlanState, steps []RepairStep, nowMS int64, co
 			}
 			delete(state.Messages, duplicate)
 			mergedInto[duplicate] = survivor
+		}
+	}
+	// After every step, a reactor still active below a survivor's merged
+	// fence is tombstoned: the newest snapshot didn't list it. Doing this
+	// once, last, keeps a synthesized tombstone from outranking a later
+	// duplicate's real row.
+	for key, reaction := range state.Reactions {
+		fence, fenced := state.Fences[reaction.MessageID]
+		if survivors[reaction.MessageID] && fenced && reaction.State == "active" && reaction.SourceSeqMS < fence.SourceSeqMS {
+			reaction.State = "removed"
+			reaction.OccurredAtMS = nowMS
+			reaction.SourceSeqMS = fence.SourceSeqMS
+			reaction.UpdatedAtMS = max(reaction.UpdatedAtMS, nowMS)
+			state.Reactions[key] = reaction
+			coverage["reaction tombstoned below the merged fence"]++
 		}
 	}
 	coverage["plan applied"]++
@@ -447,7 +473,7 @@ func TestApplyRepairPlanMatchesModelProperty(t *testing.T) {
 			}
 		}
 		for outboxID, send := range after.Sends {
-			if send.State == "confirmed" {
+			if !repairSendIsOpen(send.State) {
 				continue
 			}
 			if row, kept := after.Messages[send.LocalMessageID]; !kept || row.ConversationID != send.ConversationID {
@@ -483,21 +509,18 @@ func seedRepairPlanScenario(t *testing.T, store *Store, repository *OutboxReposi
 	}
 	for message := range repairPropertyMessages {
 		seedOutboxTestMessage(t, store, repairPropertyMessageID(message), "account-a", conversationOf(message))
-		mustExec(t, store.db, `UPDATE messages SET body = ? WHERE message_id = ?`,
-			"body-"+strconv.Itoa(scenario.Bodies[message]), repairPropertyMessageID(message))
-	}
-	for message, open := range scenario.Sends {
-		state := "confirmed"
-		if open {
-			state = "queued"
+		if variant := repairContentVariants[scenario.Contents[message]]; variant != "" {
+			mustExec(t, store.db, `UPDATE messages SET `+variant+` WHERE message_id = ?`, repairPropertyMessageID(message))
 		}
+	}
+	for message, send := range scenario.Sends {
 		id := "plan-send-" + strconv.Itoa(message)
 		mustExec(t, store.db, `
 			INSERT INTO outbox (
 				outbox_id, account_id, conversation_id, kind, idempotency_key, payload_hash, operation,
 				state, local_message_id, transport_request_id, scheduled_for_ms, created_at_ms, updated_at_ms
-			) VALUES (?, 'account-a', ?, 'text', ?, ?, 'send_text', ?, ?, ?, ?, ?, ?)
-		`, "outbox-"+id, conversationOf(message), "idempotency-"+id, "hash-"+id, state,
+			) VALUES (?, 'account-a', ?, ?, ?, ?, 'send', ?, ?, ?, ?, ?, ?)
+		`, "outbox-"+id, conversationOf(message), send.Kind, "idempotency-"+id, "hash-"+id, send.State,
 			repairPropertyMessageID(message), "request-"+id, outboxTestTimeMS, outboxTestTimeMS, outboxTestTimeMS)
 	}
 	for key, seed := range scenario.Reactions {
@@ -595,14 +618,16 @@ func readRepairPlanState(t *testing.T, store *Store) repairPlanState {
 			t.Fatalf("iterate snapshot %q: %v", statement, err)
 		}
 	}
-	query(`SELECT message_id, conversation_id, body FROM messages`, func(rows *sql.Rows) error {
+	query(`SELECT message_id, conversation_id,
+			direction || '|' || COALESCE(sender_identity_id, '') || '|' || occurred_at_ms || '|' || body
+		FROM messages`, func(rows *sql.Rows) error {
 		var messageID string
 		var row repairMessageRow
-		err := rows.Scan(&messageID, &row.ConversationID, &row.Body)
+		err := rows.Scan(&messageID, &row.ConversationID, &row.Content)
 		state.Messages[messageID] = row
 		return err
 	})
-	query(`SELECT outbox_id, local_message_id, conversation_id, state FROM outbox WHERE kind = 'text'`, func(rows *sql.Rows) error {
+	query(`SELECT outbox_id, local_message_id, conversation_id, state FROM outbox WHERE kind IN ('text', 'media')`, func(rows *sql.Rows) error {
 		var outboxID string
 		var send repairSendRow
 		err := rows.Scan(&outboxID, &send.LocalMessageID, &send.ConversationID, &send.State)
@@ -650,4 +675,166 @@ func repairPropertyConfig(t *testing.T, cases, raceCases int) *quick.Config {
 		target(value)
 	}
 	return &quick.Config{MaxCount: cases, Rand: rand.New(rand.NewSource(seed))}
+}
+
+// repairSnapshotScenario is one message stored as several copies, each as a
+// Google embedded snapshot leaves it: a fence, the reactors that snapshot
+// listed active at the fence's sequence, and tombstones at or below it. Copy
+// 0 is the survivor; Order is the order the other copies are merged in.
+type repairSnapshotScenario struct {
+	Copies []repairSnapshotCopy
+	Order  []int
+}
+
+type repairSnapshotCopy struct {
+	Fence     *int64        // nil: the copy never received a snapshot
+	Reactions map[int]bool  // reactor -> active (else removed)
+	RemovedAt map[int]int64 // removed reactor -> its source_seq_ms, at most Fence
+	Emoji     map[int]string
+}
+
+func (repairSnapshotScenario) Generate(r *rand.Rand, _ int) reflect.Value {
+	var scenario repairSnapshotScenario
+	for range 2 + r.Intn(4) {
+		snapshot := repairSnapshotCopy{Reactions: map[int]bool{}, RemovedAt: map[int]int64{}, Emoji: map[int]string{}}
+		if r.Intn(5) != 0 {
+			fence := int64(1 + r.Intn(3))
+			snapshot.Fence = &fence
+			for reactor := range 3 {
+				switch r.Intn(3) {
+				case 0:
+					snapshot.Reactions[reactor] = true
+				case 1:
+					snapshot.Reactions[reactor] = false
+					snapshot.RemovedAt[reactor] = 1 + int64(r.Intn(int(fence)))
+				}
+				snapshot.Emoji[reactor] = []string{"a", "b", "c"}[r.Intn(3)]
+			}
+		}
+		scenario.Copies = append(scenario.Copies, snapshot)
+	}
+	scenario.Order = r.Perm(len(scenario.Copies) - 1)
+	return reflect.ValueOf(scenario)
+}
+
+// Property (order independence): however many snapshot-fenced copies of one
+// message a plan merges into a survivor, and in whatever order, the survivor
+// ends with what the copies' snapshots say taken together. With F the largest
+// fence, each reactor keeps its row with the largest (source_seq_ms,
+// occurred_at_ms) among all copies, and a reactor still active below F is
+// tombstoned at F, because no snapshot at F listed it. So a reactor active in
+// any snapshot at F stays active. The expectation is computed from the
+// original rows, not by replaying merges.
+func TestApplyRepairPlanReactionMergeIsOrderIndependentProperty(t *testing.T) {
+	coverage := map[string]int{}
+	store, _ := openOutboxTestRepository(t, newOutboxTestClock(outboxTestTimeMS).Now)
+	seedMessageIdentity(t, store, "identity-a", "account-a")
+	seedMessageConversation(t, store, "conversation-a", "account-a")
+	type row struct {
+		State, Emoji              string
+		SourceSeqMS, OccurredAtMS int64
+	}
+	property := func(scenario repairSnapshotScenario) bool {
+		mustExec(t, store.db, `DELETE FROM messages`)
+		want := map[string]row{}
+		var mergedFence int64
+		fenced := false
+		occurredAtMS := outboxTestTimeMS - 900
+		for index, snapshot := range scenario.Copies {
+			messageID := repairPropertyMessageID(index)
+			seedOutboxTestMessage(t, store, messageID, "account-a", "conversation-a")
+			if snapshot.Fence == nil {
+				continue
+			}
+			fenced, mergedFence = true, max(mergedFence, *snapshot.Fence)
+			mustExec(t, store.db, `
+				INSERT INTO reaction_snapshot_fences (message_id, source_seq_ms, updated_at_ms) VALUES (?, ?, ?)
+			`, messageID, *snapshot.Fence, outboxTestTimeMS-700)
+			for reactor, active := range snapshot.Reactions {
+				// Every row gets its own write time, as snapshots do.
+				occurredAtMS++
+				seeded := row{State: "active", Emoji: snapshot.Emoji[reactor], SourceSeqMS: *snapshot.Fence, OccurredAtMS: occurredAtMS}
+				if !active {
+					seeded.State, seeded.SourceSeqMS = "removed", snapshot.RemovedAt[reactor]
+				}
+				reactorKey := "r" + strconv.Itoa(reactor)
+				mustExec(t, store.db, `
+					INSERT INTO reactions (
+						message_id, reactor_key, account_id, conversation_id, reactor_identity_id,
+						reactor_is_self, reactor_label, emoji, state, occurred_at_ms, source_seq_ms,
+						created_at_ms, updated_at_ms
+					) VALUES (?, ?, 'account-a', 'conversation-a', NULL, 0, 'peer', ?, ?, ?, ?, ?, ?)
+				`, messageID, reactorKey, seeded.Emoji, seeded.State, seeded.OccurredAtMS, seeded.SourceSeqMS,
+					outboxTestTimeMS-950, outboxTestTimeMS-950)
+				if best, seen := want[reactorKey]; !seen || seeded.SourceSeqMS > best.SourceSeqMS ||
+					(seeded.SourceSeqMS == best.SourceSeqMS && seeded.OccurredAtMS > best.OccurredAtMS) {
+					want[reactorKey] = seeded
+				}
+			}
+		}
+		for reactorKey, best := range want {
+			if best.State == "active" && best.SourceSeqMS < mergedFence {
+				best.State, best.SourceSeqMS, best.OccurredAtMS = "removed", mergedFence, repairMergeNowMS
+				want[reactorKey] = best
+				coverage["reactor tombstoned below the largest fence"]++
+			} else if best.State == "active" {
+				coverage["reactor active at the largest fence"]++
+			}
+		}
+
+		survivorID := repairPropertyMessageID(0)
+		steps := make([]RepairStep, 0, len(scenario.Order))
+		for _, index := range scenario.Order {
+			steps = append(steps, repairDeleteStep(repairPropertyMessageID(index+1), survivorID))
+		}
+		if len(steps) > 1 {
+			coverage["several copies merged"]++
+		}
+		if err := store.ApplyRepairPlan(context.Background(), "account-a", steps, repairMergeNowMS); err != nil {
+			t.Errorf("scenario %+v: ApplyRepairPlan(): %v", scenario, err)
+			return false
+		}
+
+		got := map[string]row{}
+		rows, err := store.db.Query(`
+			SELECT reactor_key, state, emoji, source_seq_ms, occurred_at_ms FROM reactions WHERE message_id = ?
+		`, survivorID)
+		if err != nil {
+			t.Fatalf("read survivor reactions: %v", err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var reactorKey string
+			var read row
+			if err := rows.Scan(&reactorKey, &read.State, &read.Emoji, &read.SourceSeqMS, &read.OccurredAtMS); err != nil {
+				t.Fatalf("scan survivor reaction: %v", err)
+			}
+			got[reactorKey] = read
+		}
+		if err := rows.Err(); err != nil {
+			t.Fatalf("iterate survivor reactions: %v", err)
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("scenario %+v: survivor reactions\n got %+v\nwant %+v", scenario, got, want)
+			return false
+		}
+		assertRowCount(t, store.db, "messages", 1)
+		assertRowCount(t, store.db, "reactions", len(want))
+		if fenced {
+			assertReactionFence(t, store, survivorID, mergedFence)
+		} else {
+			assertRowCount(t, store.db, "reaction_snapshot_fences", 0)
+		}
+		return !t.Failed()
+	}
+	if err := quick.Check(property, repairPropertyConfig(t, 400, 120)); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{
+		"several copies merged", "reactor tombstoned below the largest fence", "reactor active at the largest fence",
+	} {
+		if coverage[name] == 0 {
+			t.Errorf("generator never produced %q; coverage = %v", name, coverage)
+		}
+	}
 }

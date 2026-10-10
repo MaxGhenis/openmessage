@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"sort"
 )
 
 // ListMessagesCreatedSince returns an account's messages whose row was created
@@ -131,7 +132,9 @@ type RepairParticipant struct {
 //	delete       merge message MessageID into SurvivorMessageID, a copy with
 //	             the same direction, sender, occurrence time and body (see
 //	             mergeDuplicateMessage), then delete it; refused while an
-//	             unfinished send names it
+//	             unfinished send names it. Reactors still active below a
+//	             survivor's merged snapshot fence are tombstoned after the
+//	             last step
 //	rebind       bind RemoteConversationID to TargetConversationID, displacing any
 //	             other holder
 //	meta         set ConversationID's Title and replace its roster with Participants
@@ -196,6 +199,10 @@ func (s *Store) ApplyRepairPlan(ctx context.Context, accountID string, steps []R
 	// merged into, so a later step whose survivor is already gone reaches the
 	// copy that stayed.
 	mergedInto := make(map[string]string)
+	// survivors are the messages delete steps merged into. Their reactions
+	// below the merged snapshot fence are tombstoned once, after every step,
+	// so the result doesn't depend on the order duplicates were merged in.
+	survivors := make(map[string]struct{})
 
 	displace := func(remoteID string) error {
 		var holderID string
@@ -258,7 +265,7 @@ func (s *Store) ApplyRepairPlan(ctx context.Context, accountID string, steps []R
 		case "move":
 			stepErr = applyRepairMove(ctx, tx, accountID, step, nowMS)
 		case "delete":
-			stepErr = applyRepairDelete(ctx, tx, accountID, step, mergedInto, nowMS)
+			stepErr = applyRepairDelete(ctx, tx, accountID, step, mergedInto, survivors, nowMS)
 		case "rebind":
 			var holderID string
 			err := tx.QueryRowContext(ctx, `
@@ -301,6 +308,16 @@ func (s *Store) ApplyRepairPlan(ctx context.Context, accountID string, steps []R
 		if stepErr != nil {
 			return fmt.Errorf("apply repair plan: step %d (%s %s/%s/%s): %w",
 				index, step.Op, step.ConversationID, step.MessageID, step.RemoteConversationID, stepErr)
+		}
+	}
+	survivorIDs := make([]string, 0, len(survivors))
+	for survivorID := range survivors {
+		survivorIDs = append(survivorIDs, survivorID)
+	}
+	sort.Strings(survivorIDs)
+	for _, survivorID := range survivorIDs {
+		if err := tombstoneReactionsBelowFence(ctx, tx, survivorID, nowMS); err != nil {
+			return fmt.Errorf("apply repair plan: %w", err)
 		}
 	}
 	if err := tx.Commit(); err != nil {
@@ -354,6 +371,7 @@ func applyRepairDelete(
 	accountID string,
 	step RepairStep,
 	mergedInto map[string]string,
+	survivors map[string]struct{},
 	nowMS int64,
 ) error {
 	if step.SurvivorMessageID == "" {
@@ -391,7 +409,7 @@ func applyRepairDelete(
 	if survivor != duplicate {
 		return fmt.Errorf("survivor %q holds different content than message %q", survivorID, step.MessageID)
 	}
-	if err := mergeDuplicateMessage(ctx, tx, step.MessageID, survivorID, nowMS); err != nil {
+	if err := mergeDuplicateRows(ctx, tx, step.MessageID, survivorID, nowMS); err != nil {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `
@@ -400,6 +418,7 @@ func applyRepairDelete(
 		return err
 	}
 	mergedInto[step.MessageID] = survivorID
+	survivors[survivorID] = struct{}{}
 	return nil
 }
 

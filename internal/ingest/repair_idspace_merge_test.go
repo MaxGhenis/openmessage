@@ -102,24 +102,43 @@ func (f repairMergeFixture) setDeviceCursor(t *testing.T, deviceID string, targe
 	}
 }
 
+// setEmptyCursor gives the device a cursor in conversationID that names no
+// message, as an imported cursor can.
+func (f repairMergeFixture) setEmptyCursor(t *testing.T, deviceID, conversationID string) {
+	t.Helper()
+	if err := f.harness.store.UpsertDevice(sqlite.Device{
+		DeviceID: deviceID, AccountID: i01AccountID,
+		Kind: sqlite.DeviceKindLocalInstallation, State: sqlite.DeviceStateActive,
+		CreatedAtMS: i01TestTime.UnixMilli(), UpdatedAtMS: i01TestTime.UnixMilli(),
+	}); err != nil {
+		t.Fatalf("UpsertDevice(): %v", err)
+	}
+	if err := f.harness.store.UpsertReadCursor(sqlite.ReadCursor{
+		AccountID: i01AccountID, DeviceID: deviceID, ConversationID: conversationID,
+		UpdatedAtMS: i01TestTime.UnixMilli(),
+	}); err != nil {
+		t.Fatalf("UpsertReadCursor(empty): %v", err)
+	}
+}
+
 // queueSend records a text send in state whose local copy is message, as
 // EnqueueOutgoingMessage leaves it.
 func (f repairMergeFixture) queueSend(t *testing.T, id string, message sqlite.Message, state sqlite.OutboxState) {
 	t.Helper()
 	database := i01OpenInspector(t, f.harness.path)
 	defer database.Close()
-	insertRepairSend(t, database, id, message, state)
+	insertRepairSend(t, database, id, "text", message, state)
 }
 
-func insertRepairSend(t *testing.T, database *sql.DB, id string, message sqlite.Message, state sqlite.OutboxState) {
+func insertRepairSend(t *testing.T, database *sql.DB, id, kind string, message sqlite.Message, state sqlite.OutboxState) {
 	t.Helper()
 	nowMS := i01TestTime.UnixMilli()
 	if _, err := database.Exec(`
 		INSERT INTO outbox (
 			outbox_id, account_id, conversation_id, kind, idempotency_key, payload_hash, operation,
 			state, local_message_id, transport_request_id, scheduled_for_ms, created_at_ms, updated_at_ms
-		) VALUES (?, ?, ?, 'text', ?, ?, 'send_text', ?, ?, ?, ?, ?, ?)
-	`, "outbox-"+id, i01AccountID, message.ConversationID, "idempotency-"+id, "hash-"+id, string(state),
+		) VALUES (?, ?, ?, ?, ?, ?, 'send', ?, ?, ?, ?, ?, ?)
+	`, "outbox-"+id, i01AccountID, message.ConversationID, kind, "idempotency-"+id, "hash-"+id, string(state),
 		message.MessageID, "request-"+id, nowMS, nowMS, nowMS); err != nil {
 		t.Fatalf("queue send %s: %v", id, err)
 	}
@@ -596,4 +615,71 @@ func TestGoogleIDSpaceRepairMergesPinnedCopiesIntoOneAnother(t *testing.T) {
 	if err != nil || again.Deletes != 0 {
 		t.Fatalf("second plan = (%+v, %v), want no deletes", again.Steps, err)
 	}
+}
+
+// Three stored copies of one message whose snapshots disagree: the original's
+// snapshot (fence 100) lists a reactor, and two re-served copies at fence 200
+// list nobody and the reactor. The reactor stays active on the original,
+// because a snapshot at the largest fence lists it, even though the copy
+// listing nobody is merged first.
+func TestGoogleIDSpaceRepairKeepsReactionTheNewestSnapshotLists(t *testing.T) {
+	fixture := newRepairMergeFixture(t)
+	harness := fixture.harness
+	ctx := context.Background()
+	before := repairWindowMS - 10_000_000
+	inWindow := repairWindowMS + 5_000
+
+	self := repairSeedIdentity(t, harness, idsSelfNumber, "Max Ghenis", true)
+	shoshana := repairSeedIdentity(t, harness, idsShoshana, "Shoshana Weissmann", false)
+	thread := repairSeedConversation(t, harness, "3093", "Shoshana Weissmann", sqlite.ConversationKindDirect, before, shoshana, self)
+	original := repairSeedMessage(t, harness, thread, "86133", &shoshana, idsAnimalsBody, idsAnimalsTimeMS, before+1)
+	empty := repairSeedMessage(t, harness, thread, "59", &shoshana, idsAnimalsBody, idsAnimalsTimeMS, inWindow)
+	active := repairSeedMessage(t, harness, thread, "60", &shoshana, idsAnimalsBody, idsAnimalsTimeMS, inWindow+1)
+
+	reactions, err := sqlite.NewReactionRepository(harness.store, func() time.Time { return i01TestTime })
+	if err != nil {
+		t.Fatalf("NewReactionRepository(): %v", err)
+	}
+	listed := []sqlite.ReactionSnapshotEntry{{ReactorKey: "reactor", ReactorLabel: "peer", Emoji: "❤️"}}
+	for _, snapshot := range []struct {
+		message sqlite.Message
+		entries []sqlite.ReactionSnapshotEntry
+		seq     int64
+	}{{original, listed, 100}, {empty, nil, 200}, {active, listed, 200}} {
+		if _, err := reactions.ReplaceEmbeddedReactions(ctx, snapshot.message.MessageID, i01AccountID,
+			snapshot.message.ConversationID, snapshot.entries, snapshot.seq); err != nil {
+			t.Fatalf("ReplaceEmbeddedReactions(%s): %v", snapshot.message.RemoteMessageID, err)
+		}
+	}
+
+	report, err := PlanGoogleIDSpaceRepair(ctx, harness.store, harness.messages, IDSpaceRepairOptions{
+		AccountID: i01AccountID, SinceMS: repairWindowMS, Now: func() time.Time { return i01TestTime },
+	})
+	if err != nil {
+		t.Fatalf("PlanGoogleIDSpaceRepair: %v", err)
+	}
+	var deleted []string
+	for _, step := range report.Steps {
+		if step.Op == "delete" {
+			deleted = append(deleted, step.MessageID)
+		}
+	}
+	if len(deleted) != 2 || deleted[0] != empty.MessageID || deleted[1] != active.MessageID {
+		t.Fatalf("delete order = %v, want the empty copy %s then the active copy %s", deleted, empty.MessageID, active.MessageID)
+	}
+	// The repair runs after the snapshots were written, so a tombstone it
+	// synthesized would carry the later time and outrank the real reaction.
+	if err := ApplyGoogleIDSpaceRepair(ctx, harness.store, report, i01TestTime.Add(time.Hour)); err != nil {
+		t.Fatalf("ApplyGoogleIDSpaceRepair: %v", err)
+	}
+	if n := i01QueryInt64(t, harness.path, `
+		SELECT COUNT(*) FROM reactions
+		WHERE message_id = ? AND reactor_key = 'reactor' AND state = 'active' AND source_seq_ms = 200
+	`, original.MessageID); n != 1 {
+		t.Fatalf("the reactor is not active at fence 200 on the original")
+	}
+	if n := i01QueryInt64(t, harness.path, `SELECT COUNT(*) FROM reactions`); n != 1 {
+		t.Fatalf("reaction rows = %d, want 1", n)
+	}
+	fixture.assertForeignKeysClean(t)
 }

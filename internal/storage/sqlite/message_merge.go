@@ -48,6 +48,25 @@ func mergeDuplicateMessage(
 	duplicateID, survivorID string,
 	nowMS int64,
 ) error {
+	if err := mergeDuplicateRows(ctx, tx, duplicateID, survivorID, nowMS); err != nil {
+		return err
+	}
+	return tombstoneReactionsBelowFence(ctx, tx, survivorID, nowMS)
+}
+
+// mergeDuplicateRows is mergeDuplicateMessage without its last step, the
+// tombstone of reactors still active below the merged fence. A caller that
+// merges several duplicates into one survivor runs that step once, after the
+// last of them (tombstoneReactionsBelowFence): a tombstone written in between
+// is stamped with the merge time, so it would outrank a later duplicate's
+// real reaction at the same fence, and the result would depend on the order
+// of the merges.
+func mergeDuplicateRows(
+	ctx context.Context,
+	tx *sql.Tx,
+	duplicateID, survivorID string,
+	nowMS int64,
+) error {
 	if duplicateID == survivorID {
 		return fmt.Errorf("message %q is its own survivor", duplicateID)
 	}
@@ -106,7 +125,6 @@ func mergeDuplicateMessage(
 		sql.Named("duplicate_id", duplicateID),
 		sql.Named("survivor_id", survivorID),
 		sql.Named("now_ms", nowMS),
-		sql.Named("fence", fence),
 	}
 	steps := []struct {
 		name  string
@@ -169,20 +187,6 @@ func mergeDuplicateMessage(
 			`,
 		},
 		{
-			// A no-op without a fence: source_seq_ms < NULL matches nothing.
-			name: "tombstone reactions the newest snapshot omitted",
-			query: `
-				UPDATE reactions
-				SET state = 'removed',
-					occurred_at_ms = :now_ms,
-					source_seq_ms = :fence,
-					updated_at_ms = MAX(updated_at_ms, :now_ms)
-				WHERE message_id = :survivor_id
-				  AND state = 'active'
-				  AND source_seq_ms < :fence
-			`,
-		},
-		{
 			name: "merge reaction snapshot fence",
 			query: `
 				INSERT INTO reaction_snapshot_fences (message_id, source_seq_ms, updated_at_ms)
@@ -229,6 +233,30 @@ func mergeDuplicateMessage(
 		if _, err := tx.ExecContext(ctx, step.query, arguments...); err != nil {
 			return fmt.Errorf("%s: %w", step.name, err)
 		}
+	}
+	return nil
+}
+
+// tombstoneReactionsBelowFence marks removed every reaction on messageID that
+// is still active below the message's snapshot fence: the newest snapshot
+// didn't list that reactor. It is a no-op for a message without a fence.
+func tombstoneReactionsBelowFence(ctx context.Context, tx *sql.Tx, messageID string, nowMS int64) error {
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE reactions
+		SET state = 'removed',
+			occurred_at_ms = :now_ms,
+			source_seq_ms = fence.source_seq_ms,
+			updated_at_ms = MAX(reactions.updated_at_ms, :now_ms)
+		FROM reaction_snapshot_fences AS fence
+		WHERE fence.message_id = :message_id
+		  AND reactions.message_id = :message_id
+		  AND reactions.state = 'active'
+		  AND reactions.source_seq_ms < fence.source_seq_ms
+	`,
+		sql.Named("message_id", messageID),
+		sql.Named("now_ms", nowMS),
+	); err != nil {
+		return fmt.Errorf("tombstone reactions the newest snapshot omitted on message %q: %w", messageID, err)
 	}
 	return nil
 }
