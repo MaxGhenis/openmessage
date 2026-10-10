@@ -683,3 +683,89 @@ func TestGoogleIDSpaceRepairKeepsReactionTheNewestSnapshotLists(t *testing.T) {
 	}
 	fixture.assertForeignKeysClean(t)
 }
+
+// The same three copies, repaired twice. The first repair can't touch the
+// copy that lists the reactor: it sits misfiled in another thread, pinned by
+// a read cursor. It merges the copy listing nobody into the original, which
+// tombstones the reactor there. Once the cursor moves on, a second repair
+// merges the pinned copy, and the reactor its snapshot lists must come back:
+// the first repair's tombstone was inferred from a fence, not written by a
+// snapshot, so it must not outrank a reaction a snapshot at that fence lists.
+func TestGoogleIDSpaceRepairKeepsReactionAcrossTwoRepairs(t *testing.T) {
+	fixture := newRepairMergeFixture(t)
+	harness := fixture.harness
+	ctx := context.Background()
+	before := repairWindowMS - 10_000_000
+	inWindow := repairWindowMS + 5_000
+
+	self := repairSeedIdentity(t, harness, idsSelfNumber, "Max Ghenis", true)
+	shoshana := repairSeedIdentity(t, harness, idsShoshana, "Shoshana Weissmann", false)
+	paypal := repairSeedIdentity(t, harness, idsPayPal, "", false)
+	shoshanaThread := repairSeedConversation(t, harness, "3093", "Shoshana Weissmann", sqlite.ConversationKindDirect, before, shoshana, self)
+	paypalThread := repairSeedConversation(t, harness, "2873", "72975", sqlite.ConversationKindDirect, before, paypal, self)
+	original := repairSeedMessage(t, harness, shoshanaThread, "86133", &shoshana, idsAnimalsBody, idsAnimalsTimeMS, before+1)
+	anchor := repairSeedMessage(t, harness, paypalThread, "500", &paypal, "Your PayPal code is 123456", idsAnimalsTimeMS+4_000, before+2)
+	empty := repairSeedMessage(t, harness, shoshanaThread, "59", &shoshana, idsAnimalsBody, idsAnimalsTimeMS, inWindow)
+	active := repairSeedMessage(t, harness, paypalThread, "60", &shoshana, idsAnimalsBody, idsAnimalsTimeMS, inWindow+1)
+
+	reactions, err := sqlite.NewReactionRepository(harness.store, func() time.Time { return i01TestTime })
+	if err != nil {
+		t.Fatalf("NewReactionRepository(): %v", err)
+	}
+	listed := []sqlite.ReactionSnapshotEntry{{ReactorKey: "reactor", ReactorLabel: "peer", Emoji: "❤️"}}
+	for _, snapshot := range []struct {
+		message sqlite.Message
+		entries []sqlite.ReactionSnapshotEntry
+		seq     int64
+	}{{original, listed, 100}, {empty, nil, 200}, {active, listed, 200}} {
+		if _, err := reactions.ReplaceEmbeddedReactions(ctx, snapshot.message.MessageID, i01AccountID,
+			snapshot.message.ConversationID, snapshot.entries, snapshot.seq); err != nil {
+			t.Fatalf("ReplaceEmbeddedReactions(%s): %v", snapshot.message.RemoteMessageID, err)
+		}
+	}
+	fixture.setCursor(t, active, inWindow+10)
+
+	repair := func(at time.Time) IDSpaceRepairReport {
+		t.Helper()
+		report, err := PlanGoogleIDSpaceRepair(ctx, harness.store, harness.messages, IDSpaceRepairOptions{
+			AccountID: i01AccountID, SinceMS: repairWindowMS, Now: func() time.Time { return at },
+		})
+		if err != nil {
+			t.Fatalf("PlanGoogleIDSpaceRepair: %v", err)
+		}
+		if err := ApplyGoogleIDSpaceRepair(ctx, harness.store, report, at); err != nil {
+			t.Fatalf("ApplyGoogleIDSpaceRepair: %v", err)
+		}
+		return report
+	}
+	activeReactors := func(messageID string) int64 {
+		return i01QueryInt64(t, harness.path, `
+			SELECT COUNT(*) FROM reactions WHERE message_id = ? AND reactor_key = 'reactor' AND state = 'active'
+		`, messageID)
+	}
+
+	first := repair(i01TestTime.Add(time.Hour))
+	if first.Deletes != 1 || first.Moves != 0 {
+		t.Fatalf("first repair = %d deletes and %d moves, want only the empty copy deleted: %+v", first.Deletes, first.Moves, first.Steps)
+	}
+	if _, err := harness.messages.GetMessage(ctx, active.MessageID); err != nil {
+		t.Fatalf("the pinned copy should survive the first repair: %v", err)
+	}
+	if activeReactors(original.MessageID) != 0 || activeReactors(active.MessageID) != 1 {
+		t.Fatalf("after the first repair the reactor should be removed on the original and active on the pinned copy")
+	}
+
+	// The device reads on; nothing else changes before the second repair.
+	fixture.setCursor(t, anchor, inWindow+20)
+	second := repair(i01TestTime.Add(2 * time.Hour))
+	if second.Deletes != 1 {
+		t.Fatalf("second repair deletes = %d, want the pinned copy merged: %+v", second.Deletes, second.Steps)
+	}
+	if _, err := harness.messages.GetMessage(ctx, active.MessageID); !errors.Is(err, sqlite.ErrNotFound) {
+		t.Fatalf("pinned copy: GetMessage error = %v, want it merged into the original", err)
+	}
+	if activeReactors(original.MessageID) != 1 {
+		t.Fatalf("the reactor the pinned copy's snapshot lists was lost in the second repair")
+	}
+	fixture.assertForeignKeysClean(t)
+}

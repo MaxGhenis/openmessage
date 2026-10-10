@@ -10,6 +10,7 @@ package sqlite
 
 import (
 	"context"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -444,42 +445,49 @@ func TestApplyRepairPlanRefusesMessagesAnOpenSendNames(t *testing.T) {
 
 // Three copies of one message: old's snapshot (fence 100) lists the reactor,
 // and two newer snapshots at fence 200 disagree, one listing nobody and one
-// listing the reactor. Merged in either order the reactor stays active: a
-// snapshot at the largest fence lists it. Merging the empty copy first must
-// not leave a tombstone that outranks the other copy's real reaction.
+// listing the reactor. Merged in either order, in one repair or two, the
+// reactor stays active: a snapshot at the largest fence lists it. Merging the
+// empty copy first must not leave a tombstone that outranks the other copy's
+// real reaction, even when that copy is only merged by a later repair.
 func TestApplyRepairPlanKeepsReactionActiveAtTheLargestFenceInAnyOrder(t *testing.T) {
 	for _, order := range [][]string{{"message-empty", "message-active"}, {"message-active", "message-empty"}} {
-		t.Run(strings.Join(order, " then "), func(t *testing.T) {
-			store, _ := openRepairMergeStore(t)
-			seed := func(messageID string, fence int64, reaction bool, occurredAtMS int64) {
-				seedOutboxTestMessage(t, store, messageID, "account-a", "conversation-a")
-				mustExec(t, store.db, `
+		for _, repairs := range []int{1, 2} {
+			t.Run(strings.Join(order, " then ")+", repairs: "+strconv.Itoa(repairs), func(t *testing.T) {
+				store, _ := openRepairMergeStore(t)
+				seed := func(messageID string, fence int64, reaction bool, occurredAtMS int64) {
+					seedOutboxTestMessage(t, store, messageID, "account-a", "conversation-a")
+					mustExec(t, store.db, `
 					INSERT INTO reaction_snapshot_fences (message_id, source_seq_ms, updated_at_ms) VALUES (?, ?, ?)
 				`, messageID, fence, outboxTestTimeMS-700)
-				if !reaction {
-					return
-				}
-				mustExec(t, store.db, `
+					if !reaction {
+						return
+					}
+					mustExec(t, store.db, `
 					INSERT INTO reactions (
 						message_id, reactor_key, account_id, conversation_id, reactor_identity_id,
 						reactor_is_self, reactor_label, emoji, state, occurred_at_ms, source_seq_ms,
 						created_at_ms, updated_at_ms
 					) VALUES (?, 'reactor', 'account-a', 'conversation-a', NULL, 0, 'peer', 'heart', 'active', ?, ?, ?, ?)
 				`, messageID, occurredAtMS, fence, outboxTestTimeMS-950, outboxTestTimeMS-950)
-			}
-			seed("message-old", 100, true, outboxTestTimeMS-900)
-			seed("message-empty", 200, false, 0)
-			seed("message-active", 200, true, outboxTestTimeMS-800)
+				}
+				seed("message-old", 100, true, outboxTestTimeMS-900)
+				seed("message-empty", 200, false, 0)
+				seed("message-active", 200, true, outboxTestTimeMS-800)
 
-			if err := applyRepairPlan(t, store,
-				repairDeleteStep(order[0], "message-old"), repairDeleteStep(order[1], "message-old"),
-			); err != nil {
-				t.Fatalf("ApplyRepairPlan(): %v", err)
-			}
-			assertEchoMergedReaction(t, store, "message-old", "reactor", "heart", "active")
-			assertReactionFence(t, store, "message-old", 200)
-			assertRowCount(t, store.db, "messages", 1)
-			assertForeignKeyCheckClean(t, store.db)
-		})
+				plans := [][]RepairStep{{repairDeleteStep(order[0], "message-old"), repairDeleteStep(order[1], "message-old")}}
+				if repairs == 2 {
+					plans = [][]RepairStep{plans[0][:1], plans[0][1:]}
+				}
+				for _, plan := range plans {
+					if err := applyRepairPlan(t, store, plan...); err != nil {
+						t.Fatalf("ApplyRepairPlan(): %v", err)
+					}
+				}
+				assertEchoMergedReaction(t, store, "message-old", "reactor", "heart", "active")
+				assertReactionFence(t, store, "message-old", 200)
+				assertRowCount(t, store.db, "messages", 1)
+				assertForeignKeyCheckClean(t, store.db)
+			})
+		}
 	}
 }

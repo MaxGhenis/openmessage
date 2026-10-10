@@ -401,7 +401,7 @@ func repairPlanModel(before repairPlanState, steps []RepairStep, nowMS int64, co
 		fence, fenced := state.Fences[reaction.MessageID]
 		if survivors[reaction.MessageID] && fenced && reaction.State == "active" && reaction.SourceSeqMS < fence.SourceSeqMS {
 			reaction.State = "removed"
-			reaction.OccurredAtMS = nowMS
+			reaction.OccurredAtMS = inferredTombstoneOccurredAtMS
 			reaction.SourceSeqMS = fence.SourceSeqMS
 			reaction.UpdatedAtMS = max(reaction.UpdatedAtMS, nowMS)
 			state.Reactions[key] = reaction
@@ -680,10 +680,12 @@ func repairPropertyConfig(t *testing.T, cases, raceCases int) *quick.Config {
 // repairSnapshotScenario is one message stored as several copies, each as a
 // Google embedded snapshot leaves it: a fence, the reactors that snapshot
 // listed active at the fence's sequence, and tombstones at or below it. Copy
-// 0 is the survivor; Order is the order the other copies are merged in.
+// 0 is the survivor; Order is the order the other copies are merged in, and
+// the first Split of them are merged by an earlier repair.
 type repairSnapshotScenario struct {
 	Copies []repairSnapshotCopy
 	Order  []int
+	Split  int
 }
 
 type repairSnapshotCopy struct {
@@ -714,17 +716,22 @@ func (repairSnapshotScenario) Generate(r *rand.Rand, _ int) reflect.Value {
 		scenario.Copies = append(scenario.Copies, snapshot)
 	}
 	scenario.Order = r.Perm(len(scenario.Copies) - 1)
+	scenario.Split = r.Intn(len(scenario.Order) + 1)
 	return reflect.ValueOf(scenario)
 }
 
 // Property (order independence): however many snapshot-fenced copies of one
-// message a plan merges into a survivor, and in whatever order, the survivor
-// ends with what the copies' snapshots say taken together. With F the largest
-// fence, each reactor keeps its row with the largest (source_seq_ms,
-// occurred_at_ms) among all copies, and a reactor still active below F is
-// tombstoned at F, because no snapshot at F listed it. So a reactor active in
-// any snapshot at F stays active. The expectation is computed from the
-// original rows, not by replaying merges.
+// message are merged into a survivor, in whatever order and whether by one
+// repair or two, the survivor ends with what the copies' snapshots say taken
+// together. With F the largest fence, each reactor keeps its row with the
+// largest (source_seq_ms, occurred_at_ms) among all copies, and a reactor
+// still active below F is tombstoned at F, because no snapshot at F listed
+// it. Across two repairs a removed reactor's row may be the first repair's
+// inferred tombstone instead of the row that removed it, so then only its
+// state is compared. So a reactor a
+// snapshot at F lists stays active, unless another copy holds a tombstone for
+// it written later at F. The expectation is computed from the original rows,
+// not by replaying merges.
 func TestApplyRepairPlanReactionMergeIsOrderIndependentProperty(t *testing.T) {
 	coverage := map[string]int{}
 	store, _ := openOutboxTestRepository(t, newOutboxTestClock(outboxTestTimeMS).Now)
@@ -774,7 +781,7 @@ func TestApplyRepairPlanReactionMergeIsOrderIndependentProperty(t *testing.T) {
 		}
 		for reactorKey, best := range want {
 			if best.State == "active" && best.SourceSeqMS < mergedFence {
-				best.State, best.SourceSeqMS, best.OccurredAtMS = "removed", mergedFence, repairMergeNowMS
+				best.State, best.SourceSeqMS, best.OccurredAtMS = "removed", mergedFence, inferredTombstoneOccurredAtMS
 				want[reactorKey] = best
 				coverage["reactor tombstoned below the largest fence"]++
 			} else if best.State == "active" {
@@ -790,9 +797,18 @@ func TestApplyRepairPlanReactionMergeIsOrderIndependentProperty(t *testing.T) {
 		if len(steps) > 1 {
 			coverage["several copies merged"]++
 		}
-		if err := store.ApplyRepairPlan(context.Background(), "account-a", steps, repairMergeNowMS); err != nil {
-			t.Errorf("scenario %+v: ApplyRepairPlan(): %v", scenario, err)
-			return false
+		twoRepairs := scenario.Split > 0 && scenario.Split < len(steps)
+		plans := [][]RepairStep{steps}
+		if twoRepairs {
+			plans = [][]RepairStep{steps[:scenario.Split], steps[scenario.Split:]}
+			coverage["merged by two repairs"]++
+		}
+		for index, plan := range plans {
+			// The second repair runs later than the first.
+			if err := store.ApplyRepairPlan(context.Background(), "account-a", plan, repairMergeNowMS+int64(1000*index)); err != nil {
+				t.Errorf("scenario %+v: ApplyRepairPlan(): %v", scenario, err)
+				return false
+			}
 		}
 
 		got := map[string]row{}
@@ -814,6 +830,15 @@ func TestApplyRepairPlanReactionMergeIsOrderIndependentProperty(t *testing.T) {
 		if err := rows.Err(); err != nil {
 			t.Fatalf("iterate survivor reactions: %v", err)
 		}
+		if twoRepairs {
+			for _, reactions := range []map[string]row{got, want} {
+				for reactorKey, reaction := range reactions {
+					if reaction.State == "removed" {
+						reactions[reactorKey] = row{State: "removed"}
+					}
+				}
+			}
+		}
 		if !reflect.DeepEqual(got, want) {
 			t.Errorf("scenario %+v: survivor reactions\n got %+v\nwant %+v", scenario, got, want)
 			return false
@@ -831,7 +856,8 @@ func TestApplyRepairPlanReactionMergeIsOrderIndependentProperty(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, name := range []string{
-		"several copies merged", "reactor tombstoned below the largest fence", "reactor active at the largest fence",
+		"several copies merged", "merged by two repairs",
+		"reactor tombstoned below the largest fence", "reactor active at the largest fence",
 	} {
 		if coverage[name] == 0 {
 			t.Errorf("generator never produced %q; coverage = %v", name, coverage)

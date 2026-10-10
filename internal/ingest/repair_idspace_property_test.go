@@ -435,7 +435,10 @@ func seedRepairDamage(t *testing.T, fixture repairMergeFixture, scenario repairD
 //   - no conversation holds two copies of a window row's content, except a
 //     copy an unfinished send pins;
 //   - planning again finds nothing to do unless the first plan left a row in
-//     place.
+//     place;
+//   - after a later repair, run once nothing pins a row, every message's
+//     content is on its survivor and each reactor's state still follows the
+//     original snapshots of every copy either repair merged.
 func TestGoogleIDSpaceRepairInvariantsProperty(t *testing.T) {
 	coverage := map[string]int{}
 	ctx := context.Background()
@@ -543,9 +546,10 @@ func TestGoogleIDSpaceRepairInvariantsProperty(t *testing.T) {
 		// Reactions and fences, from the copies' original snapshot rows: a
 		// group is a root and the copies merged into it, and F its largest
 		// fence. Each reactor keeps the group's row with the largest
-		// (source_seq_ms, occurred_at_ms). A reactor still active below F is
-		// tombstoned at F, since no snapshot at F listed it; one a snapshot
-		// at F lists stays active, whatever order the copies merged in.
+		// (source_seq_ms, occurred_at_ms), whatever order the copies merged
+		// in. A reactor still active below F is tombstoned at F, since no
+		// snapshot at F listed it. One a snapshot at F lists stays active,
+		// unless another copy holds a tombstone for it written later at F.
 		wantFences := map[string]int64{}
 		for message, seq := range before.Fences {
 			wantFences[root(message)] = max(wantFences[root(message)], seq)
@@ -568,7 +572,8 @@ func TestGoogleIDSpaceRepairInvariantsProperty(t *testing.T) {
 		}
 		for grouped, row := range wantReactions {
 			if fence := wantFences[grouped[0]]; merged[grouped[0]] && row.State == "active" && row.SourceSeqMS < fence {
-				row.State, row.OccurredAtMS, row.SourceSeqMS = "removed", appliedAt.UnixMilli(), fence
+				// The merge infers this removal; it stamps the earliest time.
+				row.State, row.OccurredAtMS, row.SourceSeqMS = "removed", 1, fence
 				coverage["reaction tombstoned below the largest fence"]++
 			} else if merged[grouped[0]] && row.State == "active" {
 				coverage["reaction active at the largest fence"]++
@@ -659,6 +664,92 @@ func TestGoogleIDSpaceRepairInvariantsProperty(t *testing.T) {
 			return fail("second plan is not a no-op: %+v", again.Steps)
 		}
 		coverage["plan applied"]++
+
+		// A later repair, once nothing pins a row any more: the devices read
+		// on and the sends finish. Copies the first repair had to leave are
+		// merged now, into survivors that may carry tombstones the first
+		// repair inferred. A reactor's state must still follow the original
+		// snapshots of every copy merged by either repair.
+		seeder := openRepairSeeder(t, harness.path)
+		for _, statement := range []string{
+			`DELETE FROM read_cursors`,
+			`UPDATE outbox SET state = 'confirmed' WHERE local_message_id IS NOT NULL`,
+		} {
+			if _, err := seeder.Exec(statement); err != nil {
+				_ = seeder.Close()
+				t.Fatalf("unpin rows (%s): %v", statement, err)
+			}
+		}
+		if err := seeder.Close(); err != nil {
+			t.Fatalf("close seeder: %v", err)
+		}
+		later, err := PlanGoogleIDSpaceRepair(ctx, harness.store, harness.messages, options)
+		if err != nil {
+			return fail("later plan: %v", err)
+		}
+		if err := ApplyGoogleIDSpaceRepair(ctx, harness.store, later, appliedAt.Add(time.Hour)); err != nil {
+			return fail("later apply: %v\nlater steps %+v", err, later.Steps)
+		}
+		final := readRepairDamageState(t, harness.path)
+		fixture.assertForeignKeysClean(t)
+		laterSurvivorOf := map[string]string{}
+		for _, step := range later.Steps {
+			if step.Op == "delete" {
+				laterSurvivorOf[step.MessageID] = step.SurvivorMessageID
+				coverage["later repair delete"]++
+			}
+		}
+		finalRoot := func(messageID string) string {
+			messageID = root(messageID)
+			if survivor, deleted := laterSurvivorOf[messageID]; deleted {
+				return survivor
+			}
+			return messageID
+		}
+		for messageID, row := range before.Messages {
+			if kept, exists := final.Messages[finalRoot(messageID)]; !exists || kept.Content != row.Content {
+				return fail("after the later repair, %s's content %q is not on its survivor %s", messageID, row.Content, finalRoot(messageID))
+			}
+		}
+		finalFence := map[string]int64{}
+		for message, seq := range before.Fences {
+			finalFence[finalRoot(message)] = max(finalFence[finalRoot(message)], seq)
+		}
+		mergedByEither := map[string]bool{}
+		for message := range before.Messages {
+			if finalRoot(message) != message {
+				mergedByEither[finalRoot(message)] = true
+			}
+		}
+		best := map[[2]string]repairReactionRow{}
+		for key, row := range before.Reactions {
+			grouped := [2]string{finalRoot(key[0]), key[1]}
+			if current, seen := best[grouped]; !seen || row.SourceSeqMS > current.SourceSeqMS ||
+				(row.SourceSeqMS == current.SourceSeqMS && row.OccurredAtMS > current.OccurredAtMS) {
+				best[grouped] = row
+			}
+		}
+		if len(final.Reactions) != len(best) {
+			return fail("after the later repair, reactions = %v, want one per group in %v", final.Reactions, best)
+		}
+		for grouped, row := range best {
+			got := final.Reactions[grouped]
+			wantActive := row.State == "active" && !(mergedByEither[grouped[0]] && row.SourceSeqMS < finalFence[grouped[0]])
+			switch {
+			case wantActive && (got.State != "active" || got.SourceSeqMS != row.SourceSeqMS || got.OccurredAtMS != row.OccurredAtMS):
+				return fail("after the later repair, reaction %v = %+v, want the active row %+v", grouped, got, row)
+			case !wantActive && got.State != "removed":
+				return fail("after the later repair, reaction %v = %+v, want it removed", grouped, got)
+			case got.ConversationID != final.Messages[grouped[0]].ConversationID:
+				return fail("after the later repair, reaction %v is in %s, not its message's conversation", grouped, got.ConversationID)
+			}
+			if wantActive && mergedByEither[grouped[0]] {
+				coverage["reaction active after both repairs"]++
+			}
+		}
+		if !reflect.DeepEqual(final.Fences, finalFence) {
+			return fail("after the later repair, fences\n got %v\nwant %v", final.Fences, finalFence)
+		}
 		return true
 	}
 	if err := quick.Check(property, repairPropertyConfig(t, 200, 40)); err != nil {
@@ -672,7 +763,7 @@ func TestGoogleIDSpaceRepairInvariantsProperty(t *testing.T) {
 		"remote id taken: same content", "remote id taken: other content",
 		"intent changed conversation", "intent on a deleted duplicate", "reaction groups merged",
 		"reaction tombstoned below the largest fence", "reaction active at the largest fence",
-		"cursor on a deleted duplicate", "open send",
+		"cursor on a deleted duplicate", "open send", "later repair delete", "reaction active after both repairs",
 	} {
 		if coverage[name] == 0 {
 			t.Errorf("generator never produced %q; coverage = %v", name, coverage)

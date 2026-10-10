@@ -30,9 +30,16 @@ import (
 //     orders those by source_seq_ms and stamps occurred_at_ms with the write
 //     time, so newer means a larger (source_seq_ms, occurred_at_ms). Then,
 //     as applying the newest snapshot would, a reactor still active below
-//     the merged fence is tombstoned, because that snapshot didn't list it.
-//     Without a fence, newer means a larger (occurred_at_ms, source_seq_ms),
-//     the order ApplyReaction applies deltas in. Moved rows take the
+//     the merged fence is tombstoned, because that snapshot didn't list it
+//     (see tombstoneReactionsBelowFence for how that tombstone ranks).
+//     Without a fence the rows are deltas, and newer means a larger
+//     (occurred_at_ms, source_seq_ms). ApplyReaction orders deltas by
+//     occurred_at_ms and lets a later write replace an equal-time row.
+//     source_seq_ms is the frame's receive time, so the larger one is the
+//     later write whenever frames were applied in the order they arrived. If
+//     they weren't (a replay), the rows don't record which write one message
+//     would have kept: updated_at_ms doesn't either, because rewriting a row
+//     with what it already holds leaves it untouched. Moved rows take the
 //     survivor's conversation.
 //   - reaction_snapshot_fences keeps the larger source_seq_ms.
 //   - message_attachments: per ordinal, a downloaded survivor row stays.
@@ -40,8 +47,9 @@ import (
 //     row holds no bytes.
 //
 // Losing survivor rows are deleted here, and losing duplicate rows go with
-// the duplicate. If both rows have the same fence, reactors active in either
-// snapshot stay active.
+// the duplicate. If both rows have the same fence, a reactor active in one
+// stays active unless the other holds a tombstone for it written later at
+// that fence.
 func mergeDuplicateMessage(
 	ctx context.Context,
 	tx *sql.Tx,
@@ -57,10 +65,9 @@ func mergeDuplicateMessage(
 // mergeDuplicateRows is mergeDuplicateMessage without its last step, the
 // tombstone of reactors still active below the merged fence. A caller that
 // merges several duplicates into one survivor runs that step once, after the
-// last of them (tombstoneReactionsBelowFence): a tombstone written in between
-// is stamped with the merge time, so it would outrank a later duplicate's
-// real reaction at the same fence, and the result would depend on the order
-// of the merges.
+// last of them (tombstoneReactionsBelowFence), so that every comparison is
+// between rows the writers stored and a removed reactor keeps the row that
+// removed it.
 func mergeDuplicateRows(
 	ctx context.Context,
 	tx *sql.Tx,
@@ -237,6 +244,17 @@ func mergeDuplicateRows(
 	return nil
 }
 
+// inferredTombstoneOccurredAtMS is the occurred_at_ms of a tombstone the merge
+// infers from a fence. No snapshot wrote that removal: the merge concludes it
+// because the newest snapshot it has seen didn't list the reactor. The
+// earliest time ranks it below every stored row at the same fence, so if a
+// copy merged later (in this plan or a later repair) holds a reaction a
+// snapshot at that fence did list, that reaction wins. Stamped with the merge
+// time instead, the tombstone would outrank it and an active reaction would
+// be lost. Only active reactions are read back, and Google messages receive
+// no deltas, so nothing else reads this value.
+const inferredTombstoneOccurredAtMS = 1
+
 // tombstoneReactionsBelowFence marks removed every reaction on messageID that
 // is still active below the message's snapshot fence: the newest snapshot
 // didn't list that reactor. It is a no-op for a message without a fence.
@@ -244,7 +262,7 @@ func tombstoneReactionsBelowFence(ctx context.Context, tx *sql.Tx, messageID str
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE reactions
 		SET state = 'removed',
-			occurred_at_ms = :now_ms,
+			occurred_at_ms = :inferred_occurred_at_ms,
 			source_seq_ms = fence.source_seq_ms,
 			updated_at_ms = MAX(reactions.updated_at_ms, :now_ms)
 		FROM reaction_snapshot_fences AS fence
@@ -255,6 +273,7 @@ func tombstoneReactionsBelowFence(ctx context.Context, tx *sql.Tx, messageID str
 	`,
 		sql.Named("message_id", messageID),
 		sql.Named("now_ms", nowMS),
+		sql.Named("inferred_occurred_at_ms", inferredTombstoneOccurredAtMS),
 	); err != nil {
 		return fmt.Errorf("tombstone reactions the newest snapshot omitted on message %q: %w", messageID, err)
 	}
