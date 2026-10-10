@@ -421,9 +421,10 @@ running app:
   `TestNewClientPerformsNoStoreWrites` (internal/app),
   `TestRunServeMCPClientDoesNotRepairStore` and
   `TestOpenCommandReadSourceLegacyDoesNotRepairStore` (cmd).
-- **Sends/reactions route through the daemon** (`/api/v1/outbox` on v2,
-  `/api/send`+`/api/react` on legacy), like the CLI has done since PR #140,
-  with the same do-not-resend idempotency contract. With the app closed,
+- **Sends/reactions route through the daemon** (sends: `/api/v1/outbox` on
+  v2, `/api/send` on legacy; reactions: `/api/v1/outbox/reactions` on a
+  v2-primary app, `/api/react` otherwise), like the CLI has done since PR
+  #140, with the same do-not-resend idempotency contract. With the app closed,
   send tools return an actionable "start the OpenMessage app" error — they
   never fall back to opening their own connections.
 - Escape hatches: `--transports` forces the old standalone full-stack stdio
@@ -1575,11 +1576,88 @@ incoming message that is a SHA-1. signal-cli 0.14.8 refuses a non-integer
 while parsing its arguments (`could not convert '<id>' to integer (64 bits)`,
 exit 1), and the row ended `uncertain` with nothing sent.
 
-No surface submits a reaction to the v2 outbox yet. The web UI's `/api/react`
-and the `react_to_message` MCP tool both call the legacy
-`signallive.Bridge.SendReaction`, which looks the target up in the legacy
-`messages.db` by message ID. Only `MessageService.SendReaction` (tests, so
-far) reaches the path above.
+On a v2-primary install every reaction from the web UI and the
+`react_to_message` MCP tool takes this path; see "Reactions on v2-primary go
+through the outbox" below.
+
+## Reactions on v2-primary go through the outbox
+
+On a v2-primary daemon the read API hands out v2 IDs (32-hex conversation and
+message keys). The legacy reaction senders cannot place those: `/api/react`
+used to tell platforms apart by a `signal:`/`whatsapp:` prefix or a
+legacy-store lookup and fall back to Google Messages, so before this every
+reaction from the UI or MCP to a v2 message, on any platform, went down the
+Google path with a v2 message ID: with no Google client it answered
+`503 not connected to Google Messages` (reproduced in
+`TestR5ReactRoutesThroughTheOutboxOnV2Primary`), and with one it asked Google
+to react to an ID that is not a Google message ID.
+Legacy-primary daemons, including ones with `OPENMESSAGES_V2_SEND=1`, keep the
+legacy senders unchanged.
+
+**Routes.**
+
+- `POST /api/react` `{conversation_id, message_id, emoji, action}` resolves the
+  target by its v2 message ID and queues the reaction on the outbox
+  (`MessageService.SendReaction`). The target decides the account and the
+  conversation; `conversation_id` may be omitted, and when given must name the
+  target's own conversation, by v2 ID or by its remote ID (`signal:+1…`, a
+  WhatsApp JID, a Google thread id). It then waits up to 8 s for the reaction
+  to settle, and the answer says how far it got:
+
+  | Status | Body | Meaning |
+  |---|---|---|
+  | 200 | `success: true` | The platform accepted it (`confirmed`, or `store_failed`). |
+  | 202 | `success: true, queued: true` | Stored, not delivered yet (`queued`, `dispatching`, `not_dispatched`). The app keeps retrying it; do not react again. |
+  | 502 | `error` | `uncertain` (the transport call ended without an answer: it may have been applied) or `rejected` (the platform refused it). |
+  | 409 | `error` | `canceled` before it was sent. |
+  | 422 | `reaction_target_unavailable` | No v2 message with that ID, or not in that conversation. Nothing was queued. |
+  | 501 | `error` | The account has no reaction sender (an import-only platform). |
+
+  Every 2xx/409/502 answer carries `outbox_id` and `state`. The legacy handler
+  answered only after the transport call; this one returns while delivery may
+  still be in progress, which is what the 202 is for. A request without
+  `idempotency_key` mints a new key, so repeating the POST queues a second
+  reaction.
+- `POST /api/v1/outbox/reactions` (same body plus a required
+  `idempotency_key`) is the durable twin, like `/api/v1/outbox/messages`: it
+  returns the submission at once and `GET /api/v1/outbox/<id>` follows it. A
+  legacy-primary daemon answers it `409 legacy primary: use /api/react`.
+- The MCP tool, in-process on a v2-primary daemon, queues on the outbox and
+  waits up to 25 s. In transportless client mode it probes `/api/status` and,
+  when the app reports `v2_primary`, submits to `/api/v1/outbox/reactions`
+  and polls the delivery; otherwise it uses `/api/react`. Its result carries
+  `outbox_id`, `state`, `idempotency_key` and `settled`; `settled: false` is not
+  an error and means do not react again.
+
+**What the user sees.** The adapters store nothing when they send a reaction
+(the legacy senders updated the stored reactions themselves after the send).
+So when the transport accepts a reaction, the outbox confirms the row and
+writes the account's own reaction (`reactor_key = 'self'`, shown as "You") in
+the same SQLite transaction (`OutboxRepository.ConfirmReaction`); without it
+the reaction would appear only if a transport later reported it. Its time is
+when the transport accepted it, and a later report for the same reactor key
+replaces it when it carries a later time (the usual `ApplyReaction`
+ordering). A reaction that ends
+`uncertain`, `rejected`, `not_dispatched` or `canceled` writes nothing, so the
+thread shows only reactions that went out. While a reaction is `queued`,
+`dispatching` or `not_dispatched` it is listed in the web UI's outbox tray
+with a Cancel button.
+
+**Reactions stuck retrying.** A reaction the transport cannot deliver yet goes
+`not_dispatched` and retries (every 5 s by default) with no cap; a Signal
+reaction whose target can never be named (above) stays there until it is
+canceled. Find them with:
+
+```bash
+curl -s "http://127.0.0.1:7007/api/v1/outbox?limit=100" | jq '.[] | select(.kind=="reaction")'
+```
+
+and cancel one with `POST /api/v1/outbox/<id>/cancel`.
+
+**A count one higher than the reactors shown.** A migrated message whose legacy
+reaction named nobody (`[{"emoji":"👍","count":1}]`) keeps it as an anonymous
+reactor (`reactor_key = 'anon:👍'`, `migration/transform.go`). Reacting 👍 to it on v2 adds "me" beside
+it, so the pill reads 2 with only "You" listed.
 
 ## Deploying a new build to a live install
 

@@ -1070,6 +1070,98 @@ test('maps durable outbox states to honest tray labels and actions', async ({ pa
   }
 });
 
+test('lists a reaction in the tray only while the app is still sending it', async ({ page }) => {
+  await page.waitForFunction(() => window.__openMessageTestHooks?.outboxRowView);
+  const views = await page.evaluate(() => {
+    const now = 1_700_000_000_000;
+    const view = window.__openMessageTestHooks.outboxRowView;
+    const reaction = state => view({ kind: 'reaction', state, scheduled_for_ms: now }, now);
+    return {
+      queued: reaction('queued'),
+      dispatching: reaction('dispatching'),
+      retrying: reaction('not_dispatched'),
+      uncertain: reaction('uncertain'),
+      repairing: reaction('store_failed'),
+      confirmed: reaction('confirmed'),
+      rejected: reaction('rejected'),
+    };
+  });
+
+  expect(views.queued).toMatchObject({ visible: true, label: 'Sending…', action: 'cancel' });
+  expect(views.queued.guidance).toContain('do not react again');
+  expect(views.dispatching).toMatchObject({ visible: true, label: 'Sending…', action: '' });
+  expect(views.retrying).toMatchObject({ visible: true, label: 'Retrying…', action: 'cancel' });
+  // A reaction cannot be sent again from the tray, so one the app has stopped
+  // sending is not listed there with an action that would fail.
+  for (const done of [views.uncertain, views.repairing, views.confirmed, views.rejected]) {
+    expect(done).toMatchObject({ visible: false, action: '' });
+  }
+});
+
+async function reactToLastReceivedMessage(page) {
+  const target = page.locator('#messages-area .msg.received').last();
+  const messageID = await target.getAttribute('data-msg-id');
+  const message = page.locator(`#messages-area .msg[data-msg-id="${messageID}"]`);
+  const answered = page.waitForResponse(response =>
+    response.request().method() === 'POST' && /\/api\/react(\?|$)/.test(response.url()));
+  await message.hover();
+  await message.locator('.action-react').click();
+  const emoji = (await message.locator('.emoji-picker button').first().textContent()).trim();
+  await message.locator('.emoji-picker button').first().click();
+  return { message, emoji, response: await answered };
+}
+
+test('sends a reaction through the outbox and shows it on the message', async ({ page }) => {
+  await openConversation(page, 'Sarah Chen');
+
+  const { message, emoji, response } = await reactToLastReceivedMessage(page);
+  expect(response.status()).toBe(200);
+  expect(await response.json()).toMatchObject({ success: true, state: 'confirmed' });
+
+  // Nothing echoes the reaction back in this fixture: the pill is the own
+  // reaction the app recorded when the transport accepted it.
+  const pill = message.locator('.reaction-pill').filter({ hasText: emoji });
+  await expect(pill).toHaveCount(1);
+  await expect(pill).toHaveAttribute('title', /You/);
+});
+
+test('reports a queued reaction and lists it in the outbox while the platform is down', async ({ page, request }) => {
+  await openConversation(page, 'Sarah Chen');
+  // Enough refusals that the app's automatic retries cannot deliver the
+  // reaction before the test cancels it.
+  for (let i = 0; i < 12; i++) {
+    await request.post('/_e2e/bridges/google-primary/next-reaction', { data: { next_result: 'not_connected' } });
+  }
+  try {
+    const { response } = await reactToLastReceivedMessage(page);
+    expect(response.status()).toBe(202);
+    expect(await response.json()).toMatchObject({ success: true, queued: true, state: 'not_dispatched' });
+    await expect(page.locator('#thread-feedback')).toContainText('Reaction not sent yet');
+
+    await page.locator('#outbox-toggle-btn').click();
+    const row = page.locator('#outbox-tray .outbox-row').filter({ hasText: 'Reaction' });
+    await expect(row).toHaveCount(1);
+    await expect(row).toContainText('Retrying…');
+    await row.locator('.outbox-row-action').click();
+    await expect(row).toHaveCount(0);
+  } finally {
+    await request.post('/_e2e/bridges/google-primary/next-reaction', { data: { next_result: 'clear' } });
+  }
+});
+
+test('says so when the platform refuses a reaction', async ({ page, request }) => {
+  await openConversation(page, 'Sarah Chen');
+  await request.post('/_e2e/bridges/google-primary/next-reaction', { data: { next_result: 'rejected' } });
+  try {
+    const { response } = await reactToLastReceivedMessage(page);
+    expect(response.status()).toBe(502);
+    expect(await response.json()).toMatchObject({ success: false, state: 'rejected' });
+    await expect(page.locator('#thread-feedback')).toContainText('refused the reaction');
+  } finally {
+    await request.post('/_e2e/bridges/google-primary/next-reaction', { data: { next_result: 'clear' } });
+  }
+});
+
 test('keeps existing thread nodes mounted after sending', async ({ page }) => {
   const outbound = `Stable send ${Date.now()}`;
 

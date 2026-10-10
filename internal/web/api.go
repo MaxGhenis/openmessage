@@ -175,7 +175,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 	if reads == nil {
 		reads = store
 	}
-	registerV1Routes(mux, store, logger, opts.V2, opts.V2Primary)
+	v1 := registerV1Routes(mux, store, logger, opts.V2, opts.V2Primary)
 	diagnosticsStartedAt := time.Now()
 	getClient := func() *client.Client {
 		if opts.Client != nil {
@@ -2079,18 +2079,20 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			httpError(w, "method not allowed", 405)
 			return
 		}
-		var req struct {
-			ConversationID string `json:"conversation_id"`
-			MessageID      string `json:"message_id"`
-			Emoji          string `json:"emoji"`
-			Action         string `json:"action"` // "add", "remove", "switch"; default "add"
-		}
+		var req reactionRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			httpError(w, "invalid JSON: "+err.Error(), 400)
 			return
 		}
 		if req.MessageID == "" || req.Emoji == "" {
 			httpError(w, "message_id and emoji are required", 400)
+			return
+		}
+		if opts.V2Primary {
+			// The read API hands out v2 IDs here, which the legacy routing
+			// below cannot place: it tells platforms apart by ID prefix or a
+			// legacy-store lookup and falls back to Google Messages.
+			v1.react(w, r, req)
 			return
 		}
 		if isWhatsAppConversation(req.ConversationID) {

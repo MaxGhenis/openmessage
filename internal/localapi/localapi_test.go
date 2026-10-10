@@ -320,3 +320,66 @@ func TestDefaultBaseURLHonorsPortEnv(t *testing.T) {
 		t.Fatalf("DefaultBaseURL() = %q", got)
 	}
 }
+
+func TestReactionsViaOutboxNeedsV2Primary(t *testing.T) {
+	for _, status := range []DaemonStatus{
+		{}, {V2Send: true}, {V2Primary: true}, {V2Send: true, V2Primary: true},
+	} {
+		if got := status.ReactionsViaOutbox(); got != status.V2Primary {
+			t.Fatalf("%+v.ReactionsViaOutbox() = %v, want %v", status, got, status.V2Primary)
+		}
+	}
+}
+
+func TestSubmitReactionPostsToTheOutbox(t *testing.T) {
+	var path string
+	var body map[string]any
+	client := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path = r.Method + " " + r.URL.Path
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode: %v", err)
+		}
+		json.NewEncoder(w).Encode(map[string]any{"outbox_id": "out", "state": "queued", "deduplicated": true})
+	}))
+	submission, err := client.SubmitReaction(context.Background(), ReactionSubmission{
+		MessageID: "msg", Emoji: "👍", IdempotencyKey: "key",
+	})
+	if err != nil || submission.OutboxID != "out" || !submission.Deduplicated {
+		t.Fatalf("SubmitReaction() = %+v, %v", submission, err)
+	}
+	if path != "POST /api/v1/outbox/reactions" {
+		t.Fatalf("request = %s", path)
+	}
+	// conversation_id and action are optional and omitted when empty.
+	if len(body) != 3 || body["message_id"] != "msg" || body["emoji"] != "👍" || body["idempotency_key"] != "key" {
+		t.Fatalf("body = %v", body)
+	}
+
+	empty := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{"state": "queued"})
+	}))
+	if _, err := empty.SubmitReaction(context.Background(), ReactionSubmission{MessageID: "m", Emoji: "👍", IdempotencyKey: "k"}); err == nil {
+		t.Fatal("expected an error for a response without outbox_id")
+	}
+}
+
+func TestReactDecodesTheQueuedAnswer(t *testing.T) {
+	client := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusAccepted)
+		json.NewEncoder(w).Encode(map[string]any{"success": true, "queued": true, "outbox_id": "out", "state": "not_dispatched"})
+	}))
+	result, err := client.React(context.Background(), "conv", "msg", "👍", "add")
+	if err != nil || result != (ReactResult{Success: true, Queued: true, OutboxID: "out", State: "not_dispatched"}) {
+		t.Fatalf("React() = %+v, %v", result, err)
+	}
+
+	refused := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		json.NewEncoder(w).Encode(map[string]any{"success": false, "error": "send reaction: the transport refused the reaction"})
+	}))
+	if _, err := refused.React(context.Background(), "conv", "msg", "👍", "add"); err == nil {
+		t.Fatal("expected a ResponseError for a refused reaction")
+	} else if responseErr, ok := AsResponseError(err); !ok || responseErr.StatusCode != http.StatusBadGateway {
+		t.Fatalf("React() error = %v", err)
+	}
+}
