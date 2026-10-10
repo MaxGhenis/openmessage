@@ -665,8 +665,8 @@ func TestSubstringSearchPlansReadTheTrigramIndexes(t *testing.T) {
 }
 
 // TestSearchMessagesChoosesItsPath pins which path answers each kind of
-// search, with the window scaled down to a small store, and that each answer
-// is the LIKE's.
+// search, with the plan scaled down to a small store, and that each answer is
+// the LIKE's.
 func TestSearchMessagesChoosesItsPath(t *testing.T) {
 	ctx := context.Background()
 	store := openRepositoryTestStore(t)
@@ -686,26 +686,55 @@ func TestSearchMessagesChoosesItsPath(t *testing.T) {
 			fmt.Sprintf("message-%02d", i), fmt.Sprintf("remote-%d", i), body, 100+i)
 	}
 
+	window := func(n int) searchPlan { return searchPlan{window: n} }
+	// scoped plans: a 20-message window; the index considered once the LIKE
+	// has minRows rows left, and used below minRows/2 candidates.
+	scoped := func(minRows, storeShare int) searchPlan {
+		return searchPlan{window: 20, indexMinRows: minRows, indexStoreShare: storeShare}
+	}
+	conversation := func(limit int) SearchQuery { return SearchQuery{ConversationID: "conversation-a", Limit: limit} }
+	sender := func(limit int) SearchQuery { return SearchQuery{SenderCanonicalValue: "+15550000001", Limit: limit} }
 	for _, tc := range []struct {
 		name   string
 		query  string
 		filter SearchQuery
-		window int
+		plan   searchPlan
 		want   searchPath
 	}{
-		{"a common term is answered by the newest messages", "common", SearchQuery{Limit: 5}, 20, searchPathRecentWindow},
-		{"a window larger than the range reads all of it", "rare", SearchQuery{Limit: 5}, 50, searchPathRecentWindow},
-		{"a date range smaller than the window is read whole", "rare", SearchQuery{SinceMS: 100, UntilMS: 110, Limit: 5}, 20, searchPathRecentWindow},
-		{"a rare term reads the index", "rare", SearchQuery{Limit: 5}, 20, searchPathTrigramIndex},
-		{"a rare term in a wide date range reads the index", "rare", SearchQuery{SinceMS: 100, UntilMS: 200, Limit: 5}, 20, searchPathTrigramIndex},
-		{"a rare term in an account reads the index", "rare", SearchQuery{AccountID: "account-a", Limit: 5}, 20, searchPathTrigramIndex},
-		{"a short rare term scans", "ra", SearchQuery{Limit: 5}, 20, searchPathLike},
-		{"a conversation search runs the LIKE over the conversation", "rare", SearchQuery{ConversationID: "conversation-a", Limit: 5}, 20, searchPathLike},
-		{"a sender search runs the LIKE over the sender", "rare", SearchQuery{SenderCanonicalValue: "+15550000001", Limit: 5}, 20, searchPathLike},
-		{"the empty query is a listing", "", SearchQuery{Limit: 5}, 20, searchPathLike},
+		{"a common term is answered by the newest messages", "common", SearchQuery{Limit: 5}, window(20), searchPathRecentWindow},
+		{"a window larger than the range reads all of it", "rare", SearchQuery{Limit: 5}, window(50), searchPathRecentWindow},
+		{"a date range smaller than the window is read whole", "rare", SearchQuery{SinceMS: 100, UntilMS: 110, Limit: 5}, window(20), searchPathRecentWindow},
+		{"a rare term reads the index", "rare", SearchQuery{Limit: 5}, window(20), searchPathTrigramIndex},
+		{"a rare term in a wide date range reads the index", "rare", SearchQuery{SinceMS: 100, UntilMS: 200, Limit: 5}, window(20), searchPathTrigramIndex},
+		{"a rare term in an account reads the index", "rare", SearchQuery{AccountID: "account-a", Limit: 5}, window(20), searchPathTrigramIndex},
+		{"a short rare term scans", "ra", SearchQuery{Limit: 5}, window(20), searchPathLike},
+		{"the empty query is a listing", "", SearchQuery{Limit: 5}, window(20), searchPathLike},
+
+		{"a conversation shorter than the window runs the LIKE", "rare", conversation(5), defaultSearchPlan, searchPathLike},
+		{"a short query in a conversation runs the LIKE", "ra", conversation(5), scoped(10, 0), searchPathLike},
+		{"a term common in the thread is answered by its newest messages", "common", conversation(5), scoped(10, 0), searchPathConversationWindow},
+		{"a thread is cut at the conversation window, not the cross-conversation one", "common", conversation(5),
+			searchPlan{window: 50, conversationWindow: 20, indexMinRows: 10}, searchPathConversationWindow},
+		{"a thread shorter than the conversation window runs the LIKE", "common", conversation(5),
+			searchPlan{window: 20, conversationWindow: 50, indexMinRows: 10}, searchPathLike},
+		{"a term rare in a long thread reads the index", "rare", conversation(5), scoped(10, 0), searchPathScopeIndex},
+		{"a rare term reads the rest of a thread shorter than the minimum", "rare", conversation(5), scoped(21, 0), searchPathConversationRest},
+		{"the minimum grows with the store", "rare", conversation(5), scoped(10, 1), searchPathConversationRest},
+		{"a term the window finds often enough reads the rest", "common", conversation(30), scoped(10, 0), searchPathConversationRest},
+		{"a rare term in a wide date range of a thread reads the index", "rare", SearchQuery{ConversationID: "conversation-a", SinceMS: 100, UntilMS: 200, Limit: 5}, scoped(10, 0), searchPathScopeIndex},
+		{"a date range shorter than the window runs the LIKE", "rare", SearchQuery{ConversationID: "conversation-a", SinceMS: 100, UntilMS: 110, Limit: 5}, scoped(10, 0), searchPathLike},
+		{"a rare term from a prolific sender reads the index", "rare", sender(5), scoped(10, 0), searchPathScopeIndex},
+		{"a rare term from a sender below the minimum runs the LIKE", "rare", sender(5), scoped(41, 0), searchPathLike},
+		{"a sender can be asked for several minimums", "rare", sender(5),
+			searchPlan{window: 20, indexMinRows: 21, senderMinimums: 2}, searchPathLike},
+		{"a sender with one minimum of 21 reads the index", "rare", sender(5),
+			searchPlan{window: 20, indexMinRows: 21, senderMinimums: 1}, searchPathScopeIndex},
+		{"an address no identity holds has no messages", "rare", SearchQuery{SenderCanonicalValue: "+19999999999", Limit: 5}, scoped(10, 0), searchPathLike},
+		{"a term common for the sender runs the LIKE", "common", sender(5), scoped(10, 0), searchPathLike},
+		{"a sender in a conversation is searched within the conversation", "rare", SearchQuery{ConversationID: "conversation-a", SenderCanonicalValue: "+15550000001", Limit: 5}, scoped(10, 0), searchPathScopeIndex},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got, path, err := repository.searchMessages(ctx, tc.query, tc.filter, tc.window)
+			got, path, err := repository.searchMessages(ctx, tc.query, tc.filter, tc.plan)
 			if err != nil {
 				t.Fatalf("searchMessages(): %v", err)
 			}

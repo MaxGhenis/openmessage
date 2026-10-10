@@ -41,6 +41,55 @@ func likePatternUsesTrigrams(pattern string) bool {
 	return false
 }
 
+// trigramMatchQuery returns an FTS5 MATCH expression selecting exactly the
+// rows FTS5 reads as candidates for LIKE '%' || query || '%', and whether
+// there is one (likePatternUsesTrigrams). The query ends at its first NUL and
+// is cut at '%' and '_'; each piece that likePatternUsesTrigrams accepts
+// contributes all of its trigrams, ANDed. Each trigram is quoted as its own
+// term, because a detail=none index refuses a phrase of several ("phrase
+// queries are not supported"). Within a piece, a byte from 0xC0 up takes the
+// continuation bytes after it as one character and any other byte stands
+// alone, which makes every quoted term exactly one trigram to the tokenizer.
+// TestTrigramMatchQuerySelectsFTS5LikeCandidates checks the candidates against
+// FTS5's own for the LIKE, over NULs, invalid UTF-8, quotes and wildcards. A
+// body the LIKE matches is among them, so the expression excludes no match.
+func trigramMatchQuery(query string) (string, bool) {
+	if i := strings.IndexByte(query, 0); i >= 0 {
+		query = query[:i]
+	}
+	var expression strings.Builder
+	for len(query) > 0 {
+		end := strings.IndexAny(query, "%_")
+		if end < 0 {
+			end = len(query)
+		}
+		piece := query[:end]
+		query = query[min(end+1, len(query)):]
+		if !likePatternUsesTrigrams(piece) {
+			continue
+		}
+		var characters []string
+		for i := 0; i < len(piece); {
+			next := i + 1
+			if piece[i] >= 0xC0 {
+				for next < len(piece) && piece[next]&0xC0 == 0x80 {
+					next++
+				}
+			}
+			characters = append(characters, piece[i:next])
+			i = next
+		}
+		for i := 0; i+3 <= len(characters); i++ {
+			trigram := characters[i] + characters[i+1] + characters[i+2]
+			if expression.Len() > 0 {
+				expression.WriteByte(' ')
+			}
+			expression.WriteString(`"` + strings.ReplaceAll(trigram, `"`, `""`) + `"`)
+		}
+	}
+	return expression.String(), expression.Len() > 0
+}
+
 // searchIndexes are the FTS5 trigram tables migration 0012 maintains, each
 // over the table named in its content= option.
 var searchIndexes = []string{
