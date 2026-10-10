@@ -93,7 +93,7 @@ fix (this PR) makes v2 reads accept **either** key: unknown ids fall back to a
 carries the canonical v2 id. Prefer storing the **v2 id** for anything durable;
 the alias exists so old references keep working.
 
-Three more cutover artifacts worth knowing:
+Four more cutover artifacts worth knowing:
 
 - **Only the Google decoder emits `ConversationEvent` frames.** Signal and
   WhatsApp conversations are minted from message frames, which carry no kind and
@@ -130,13 +130,45 @@ curl -s http://127.0.0.1:7007/api/status | jq '.freshness'
   `UNIQUE constraint failed: devices.account_id`. Each call first rewrote the
   account's `bridge_key` (`google_messages` → `google`), and v2 reads derive a
   thread's platform from that key, so Google threads would then read as
-  `google` instead of `sms`. A v2-primary daemon no longer runs the mirror on
-  `/api/mark-read`. The keys should read `google_messages`, `whatsmeow` and
-  `signal_cli` (the live store was clean on 2026-10-09):
+  `google` instead of `sms`. A v2-primary daemon does not run the mirror on
+  `/api/mark-read`; it writes the cursor natively (next bullet). The keys
+  should read `google_messages`, `whatsmeow` and `signal_cli` (the live store
+  was clean on 2026-10-09):
 
 ```bash
 sqlite3 -readonly "$HOME/Library/Application Support/OpenMessage/v2/store.sqlite3" \
   "SELECT account_id, bridge_key, display_name FROM accounts"
+```
+
+- **On v2-primary, `/api/mark-read` writes the v2 read cursor natively**
+  (`v2wire.MarkReadV2`). It resolves `conversation_id` the way v2 reads do:
+  the v2 id, or a legacy-form id through `remote_conversation_id`
+  (`v2read.ResolveConversation`). An id that matches nothing writes nothing;
+  the mirror would have created the thread under its legacy id. The cursor
+  belongs to the account's local installation device, the one
+  `GetLocalInstallationDevice` resolves and ingest receipts advance, so on a
+  migrated store it is the derived-id device. An account with no local device
+  gets one under the migration's derived id
+  (`v2keys.LocalInstallationDeviceID`), never `local-primary:<account>`. The
+  cursor is dated at the request and names no message
+  (`last_read_message_id` NULL, as the mirror writes it). `read_cursors`
+  references `messages` with no `ON DELETE` action, so a cursor that named the
+  newest message would pin it. The outbox deletes a send's echo duplicate on
+  reconcile, and that delete then fails with `FOREIGN KEY constraint failed`.
+  Id-space repair likewise leaves cursor-referenced messages in place. Writes
+  are monotone in read time, so a cursor already dated later than the request
+  stays (an ingested receipt carries the receipt's own time). The write is best
+  effort and sends no read receipt to the phone. A failure logs `Failed to write v2 read cursor` with
+  `conv_id`, and the response stays 200. Nothing reads these cursors yet: v2
+  reads report `UnreadCount: 0`, and the web UI calls mark-read only when
+  `UnreadCount > 0`, so on v2-primary only API callers reach it until unread
+  derivation (S5b/S8) lands. To see the latest cursors:
+
+```bash
+sqlite3 -readonly "$HOME/Library/Application Support/OpenMessage/v2/store.sqlite3" \
+  "SELECT conversation_id, device_id, last_read_message_id,
+          datetime(last_read_at_ms / 1000, 'unixepoch', 'localtime')
+   FROM read_cursors ORDER BY last_read_at_ms DESC LIMIT 5"
 ```
 
 ## Google thread ids are device-local: phone swaps re-key everything
