@@ -11,6 +11,7 @@ package sqlite
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -299,42 +300,119 @@ func TestMigrationDroppingParentTableFails(t *testing.T) {
 	})
 }
 
-func TestWithForeignKeysOffDiscardsConnectionItCannotRestore(t *testing.T) {
-	store := openMigrationFKTestStore(t)
-	ctx := context.Background()
-
-	var sawOff int
-	err := withForeignKeysOff(ctx, store.db, func(conn *sql.Conn) error {
-		if err := conn.QueryRowContext(ctx, `PRAGMA foreign_keys`).Scan(&sawOff); err != nil {
-			return err
-		}
-		// Leave a write transaction open: PRAGMA foreign_keys is a no-op
-		// inside it, so enforcement can't be turned back on.
-		_, err := conn.ExecContext(ctx, `BEGIN IMMEDIATE`)
-		return err
-	})
-	if sawOff != 0 {
-		t.Fatalf("foreign_keys inside withForeignKeysOff = %d, want 0", sawOff)
+func TestWithForeignKeysOffNeverReturnsItsConnectionToThePool(t *testing.T) {
+	cases := []struct {
+		name string
+		fn   func(context.Context, *sql.Conn) error
+	}{
+		{
+			name: "fn succeeds leaving a TEMP table",
+			fn: func(ctx context.Context, conn *sql.Conn) error {
+				_, err := conn.ExecContext(ctx, `CREATE TEMP TABLE migration_scratch (x INTEGER)`)
+				return err
+			},
+		},
+		{
+			name: "fn fails leaving a raw write transaction open",
+			fn: func(ctx context.Context, conn *sql.Conn) error {
+				if _, err := conn.ExecContext(ctx, `CREATE TEMP TABLE migration_scratch (x INTEGER)`); err != nil {
+					return err
+				}
+				if _, err := conn.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
+					return err
+				}
+				return errors.New("migration step failed")
+			},
+		},
 	}
-	if err == nil || !strings.Contains(err.Error(), "a transaction is open") {
-		t.Fatalf("withForeignKeysOff() error = %v, want the restore failure", err)
-	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			store := openMigrationFKTestStore(t)
+			ctx := context.Background()
+			var sawEnforcement int
+			err := withForeignKeysOff(ctx, store.db, func(conn *sql.Conn) error {
+				if err := conn.QueryRowContext(ctx, `PRAGMA foreign_keys`).Scan(&sawEnforcement); err != nil {
+					return err
+				}
+				return test.fn(ctx, conn)
+			})
+			if sawEnforcement != 0 {
+				t.Fatalf("foreign_keys inside withForeignKeysOff = %d, want 0", sawEnforcement)
+			}
+			if strings.Contains(test.name, "fails") != (err != nil) {
+				t.Fatalf("withForeignKeysOff() error = %v", err)
+			}
 
-	// The pool holds one connection. Had the pinned one been returned, this
-	// would reuse it with enforcement off and its write lock still held.
-	assertForeignKeysEnforced(t, store.db)
-	seedMessageConversation(t, store, "conversation-after-discard", "account-a")
+			// The pool holds one connection. Had the pinned one been returned,
+			// these would reuse it: enforcement off, its TEMP table visible, and
+			// in the failing case its write lock still held.
+			assertForeignKeysEnforced(t, store.db)
+			var scratch int
+			if err := store.db.QueryRow(`
+				SELECT COUNT(*) FROM sqlite_temp_schema WHERE name = 'migration_scratch'
+			`).Scan(&scratch); err != nil {
+				t.Fatalf("inspect temp schema: %v", err)
+			}
+			if scratch != 0 {
+				t.Fatal("the migration connection's TEMP table is visible from the pool")
+			}
+			seedMessageConversation(t, store, "conversation-after-discard", "account-a")
+		})
+	}
 }
 
-func TestWithForeignKeysOffRestoresEnforcementAfterFailure(t *testing.T) {
+// A panicking migration must still release its transaction, or closing the
+// migration connection would block forever.
+func TestRunMigrationsReleasesConnectionWhenAMigrationPanics(t *testing.T) {
 	store := openMigrationFKTestStore(t)
-	ctx, cancel := context.WithCancel(context.Background())
-	err := withForeignKeysOff(ctx, store.db, func(*sql.Conn) error {
-		cancel()
-		return context.Canceled
-	})
-	if err != context.Canceled {
-		t.Fatalf("withForeignKeysOff() error = %v, want context.Canceled only", err)
+	migrations := withTestMigration(newMigration(len(embeddedMigrations)+1, "panics", `SELECT 1;`, func() ([]any, error) {
+		panic("migration arguments exploded")
+	}))
+	done := make(chan any, 1)
+	go func() {
+		defer func() { done <- recover() }()
+		_ = runMigrations(context.Background(), store.db, migrations)
+	}()
+	select {
+	case recovered := <-done:
+		if recovered == nil {
+			t.Fatal("runMigrations() did not panic")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("runMigrations() hung after a panicking migration")
 	}
+	assertRowCount(t, store.db, "schema_migrations", len(embeddedMigrations))
 	assertForeignKeysEnforced(t, store.db)
+}
+
+// The missing-parent check reads only the main schema, so a TEMP table that
+// shadows a main table's name can neither hide a dropped parent nor make a
+// valid one look missing.
+func TestMigrationParentCheckIgnoresTempTables(t *testing.T) {
+	t.Run("TEMP child cannot hide a dropped parent", func(t *testing.T) {
+		store := openMigrationFKTestStore(t)
+		migrations := withTestMigration(newMigration(len(embeddedMigrations)+1, "shadow_and_drop", `
+			CREATE TEMP TABLE person_identities (x TEXT);
+			DROP TABLE people;
+		`, nil))
+		err := runMigrations(context.Background(), store.db, migrations)
+		if err == nil || !strings.Contains(err.Error(), `table "person_identities" references missing table "people"`) {
+			t.Fatalf("runMigrations() error = %v, want main.person_identities reported", err)
+		}
+		assertRowCount(t, store.db, "people", 0)
+		assertRowCount(t, store.db, "schema_migrations", len(embeddedMigrations))
+	})
+
+	t.Run("TEMP child with a TEMP parent is not a missing main parent", func(t *testing.T) {
+		store := openMigrationFKTestStore(t)
+		migrations := withTestMigration(newMigration(len(embeddedMigrations)+1, "shadow_child", `
+			CREATE TEMP TABLE temp_parent (id TEXT PRIMARY KEY);
+			CREATE TEMP TABLE person_identities (x TEXT REFERENCES temp_parent(id));
+		`, nil))
+		if err := runMigrations(context.Background(), store.db, migrations); err != nil {
+			t.Fatalf("runMigrations(): %v", err)
+		}
+		assertRowCount(t, store.db, "schema_migrations", len(migrations))
+		assertForeignKeysEnforced(t, store.db)
+	})
 }

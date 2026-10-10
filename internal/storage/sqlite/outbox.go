@@ -1891,35 +1891,59 @@ func (r *OutboxRepository) repointLocalMessage(
 	return nil
 }
 
-// mergeEchoDuplicate moves everything that references an echo-projected
-// duplicate onto the surviving local row, so that deleting the duplicate
-// neither trips a NO ACTION foreign key nor cascades away state recorded on
-// it. Both rows are in conversationID. The rules:
-//   - Read cursors, reaction intents and read-receipt intents point at the
+// mergeEchoDuplicate merges an echo-projected duplicate into the surviving
+// local row, so that deleting the duplicate neither trips a NO ACTION foreign
+// key nor cascades away state recorded on it. It covers every table with a
+// foreign key to messages. outbox.local_message_id has none and names the row
+// its enqueue inserted, never a projected echo. Both rows are in
+// conversationID. The rules:
+//   - read_cursors, outbox_reactions and outbox_read_receipts point at the
 //     same logical message, so they're repointed.
-//   - Inbound reactions: when both rows have one for the same reactor, the
-//     later (occurred_at_ms, source_seq_ms) wins, and the survivor's on a
-//     tie. ApplyReaction orders deltas by occurred_at_ms, and
-//     ReplaceEmbeddedReactions stamps it with the write time.
-//   - The embedded-snapshot fence keeps the larger source_seq_ms.
-//   - Attachments: per ordinal, a downloaded survivor row stays. Otherwise
-//     the duplicate's row replaces it, since a pending row holds no bytes.
+//   - reactions: when both rows have one for the same reactor, the newer one
+//     stays and the other is deleted (the survivor's stays on an exact tie).
+//     If either row has a reaction_snapshot_fences row, the message's
+//     reactions come from full embedded snapshots. ReplaceEmbeddedReactions
+//     orders those by source_seq_ms and stamps occurred_at_ms with the write
+//     time, so newer means a larger (source_seq_ms, occurred_at_ms). Then,
+//     as applying the newest snapshot would, a reactor still active below
+//     the merged fence is tombstoned, because that snapshot didn't list it.
+//     Without a fence, newer means a larger (occurred_at_ms, source_seq_ms),
+//     the order ApplyReaction applies deltas in.
+//   - reaction_snapshot_fences keeps the larger source_seq_ms.
+//   - message_attachments: per ordinal, a downloaded survivor row stays.
+//     Otherwise the duplicate's row replaces the survivor's, since a pending
+//     row holds no bytes.
 //
-// Rows that lose stay on the duplicate and are deleted with it. Merging two
-// snapshot-fenced reaction sets can leave a reactor active that the newer
-// snapshot didn't list. The next snapshot at or above the fence tombstones
-// it.
+// Losing survivor rows are deleted here, and losing duplicate rows go with
+// the duplicate. If both rows have the same fence, reactors active in either
+// snapshot stay active.
 func mergeEchoDuplicate(
 	ctx context.Context,
 	tx *sql.Tx,
 	conversationID, duplicateID, survivorID string,
 	nowMS int64,
 ) error {
+	var fence sql.NullInt64
+	if err := tx.QueryRowContext(ctx, `
+		SELECT MAX(source_seq_ms)
+		FROM reaction_snapshot_fences
+		WHERE message_id IN (?, ?)
+	`, duplicateID, survivorID).Scan(&fence); err != nil {
+		return fmt.Errorf("read reaction snapshot fences: %w", err)
+	}
+	duplicateReactionIsNewer := `(duplicate.occurred_at_ms, duplicate.source_seq_ms) >
+		(reactions.occurred_at_ms, reactions.source_seq_ms)`
+	if fence.Valid {
+		duplicateReactionIsNewer = `(duplicate.source_seq_ms, duplicate.occurred_at_ms) >
+			(reactions.source_seq_ms, reactions.occurred_at_ms)`
+	}
+
 	arguments := []any{
 		sql.Named("conversation_id", conversationID),
 		sql.Named("duplicate_id", duplicateID),
 		sql.Named("survivor_id", survivorID),
 		sql.Named("now_ms", nowMS),
+		sql.Named("fence", fence),
 	}
 	steps := []struct {
 		name  string
@@ -1961,13 +1985,7 @@ func mergeEchoDuplicate(
 					FROM reactions AS duplicate
 					WHERE duplicate.message_id = :duplicate_id
 					  AND duplicate.reactor_key = reactions.reactor_key
-					  AND (
-						duplicate.occurred_at_ms > reactions.occurred_at_ms
-						OR (
-							duplicate.occurred_at_ms = reactions.occurred_at_ms
-							AND duplicate.source_seq_ms > reactions.source_seq_ms
-						)
-					  )
+					  AND ` + duplicateReactionIsNewer + `
 				  )
 			`,
 		},
@@ -1984,6 +2002,20 @@ func mergeEchoDuplicate(
 					WHERE survivor.message_id = :survivor_id
 					  AND survivor.reactor_key = reactions.reactor_key
 				  )
+			`,
+		},
+		{
+			// A no-op without a fence: source_seq_ms < NULL matches nothing.
+			name: "tombstone reactions the newest snapshot omitted",
+			query: `
+				UPDATE reactions
+				SET state = 'removed',
+					occurred_at_ms = :now_ms,
+					source_seq_ms = :fence,
+					updated_at_ms = MAX(updated_at_ms, :now_ms)
+				WHERE message_id = :survivor_id
+				  AND state = 'active'
+				  AND source_seq_ms < :fence
 			`,
 		},
 		{

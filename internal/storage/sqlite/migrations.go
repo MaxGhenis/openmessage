@@ -105,10 +105,10 @@ func newMigration(
 // DROP old, RENAME new) would then cascade-delete its children, or fail on a
 // NO ACTION child, and foreign_key_check would still pass because the orphans
 // are gone. So the runner follows SQLite's documented procedure for schema
-// changes (https://www.sqlite.org/lang_altertable.html#otheralter): it turns
-// enforcement off on one pinned connection before BEGIN and back on after the
-// last COMMIT. Each migration is checked with foreign_key_check (and for FKs
-// whose parent table no longer exists) before its COMMIT.
+// changes (https://www.sqlite.org/lang_altertable.html#otheralter): it runs
+// the migrations on a dedicated connection whose enforcement it turned off
+// before BEGIN. Each migration is checked with foreign_key_check, and for FKs
+// whose parent table no longer exists, before its COMMIT.
 //
 // For migration authors, this means:
 //   - Rebuild a table in the documented order: CREATE the new table, copy
@@ -117,7 +117,8 @@ func newMigration(
 //   - Don't rely on ON DELETE CASCADE or SET NULL. They don't fire, so a
 //     migration that deletes parent rows must delete or repoint the children
 //     itself. If it doesn't, the orphans fail the check and the migration
-//     rolls back. That is a loud failure, never silent data loss.
+//     rolls back, so a missing FK action fails loudly instead of an FK
+//     action deleting rows silently.
 func runMigrations(ctx context.Context, db *sql.DB, migrations []migration) error {
 	if err := validateMigrationList(migrations); err != nil {
 		return err
@@ -127,99 +128,84 @@ func runMigrations(ctx context.Context, db *sql.DB, migrations []migration) erro
 	})
 }
 
-// withForeignKeysOff runs fn on a pinned connection with foreign-key
-// enforcement off, then turns it back on. If enforcement can't be confirmed on
-// again (for example, because fn left a transaction open, where the pragma is
-// a no-op), the connection is discarded rather than returned to the pool.
+// withForeignKeysOff runs fn on a dedicated connection with foreign-key
+// enforcement off. Afterwards the connection is closed rather than returned to
+// the pool, so nothing fn left on it (enforcement off, TEMP tables, other
+// connection pragmas, a raw BEGIN left open) reaches later queries. fn must
+// finish every *sql.Tx it begins: database/sql holds a connection with an
+// open Tx until the Tx ends, so closing would block.
 func withForeignKeysOff(ctx context.Context, db *sql.DB, fn func(*sql.Conn) error) error {
 	conn, err := db.Conn(ctx)
 	if err != nil {
 		return fmt.Errorf("pin migration connection: %w", err)
 	}
-	restored := false
 	defer func() {
-		if !restored {
-			// Raw closes the driver connection instead of pooling it when f
-			// returns driver.ErrBadConn.
-			_ = conn.Raw(func(any) error { return driver.ErrBadConn })
-		}
+		// Raw closes the driver connection instead of pooling it when f
+		// returns driver.ErrBadConn.
+		_ = conn.Raw(func(any) error { return driver.ErrBadConn })
 		_ = conn.Close()
 	}()
 
-	if err := setConnForeignKeys(ctx, conn, false); err != nil {
-		return err
+	if _, err := conn.ExecContext(ctx, `PRAGMA foreign_keys = OFF`); err != nil {
+		return fmt.Errorf("disable sqlite foreign keys on migration connection: %w", err)
 	}
-	fnErr := fn(conn)
-	// Restore even when ctx was canceled mid-migration.
-	if err := setConnForeignKeys(context.WithoutCancel(ctx), conn, true); err != nil {
-		return errors.Join(fnErr, err)
-	}
-	restored = true
-	return fnErr
-}
-
-func setConnForeignKeys(ctx context.Context, conn *sql.Conn, enabled bool) error {
-	want := 0
-	if enabled {
-		want = 1
-	}
-	if _, err := conn.ExecContext(ctx, fmt.Sprintf("PRAGMA foreign_keys = %d", want)); err != nil {
-		return fmt.Errorf("set sqlite foreign_keys = %d on migration connection: %w", want, err)
-	}
-	var got int
-	if err := conn.QueryRowContext(ctx, `PRAGMA foreign_keys`).Scan(&got); err != nil {
+	var enabled int
+	if err := conn.QueryRowContext(ctx, `PRAGMA foreign_keys`).Scan(&enabled); err != nil {
 		return fmt.Errorf("read sqlite foreign_keys on migration connection: %w", err)
 	}
-	if got != want {
-		return fmt.Errorf(
-			"set sqlite foreign_keys = %d on migration connection: still %d (a transaction is open)",
-			want,
-			got,
-		)
+	if enabled != 0 {
+		return fmt.Errorf("disable sqlite foreign keys on migration connection: still %d", enabled)
 	}
-	return nil
+	return fn(conn)
 }
 
 func applyPendingMigrations(ctx context.Context, conn *sql.Conn, migrations []migration) error {
 	for {
-		// storeDSN configures writable transactions as BEGIN IMMEDIATE. Reading
-		// and validating the ledger after BeginTx prevents concurrent Open calls
-		// from both deciding that the same migration is pending.
-		tx, err := conn.BeginTx(ctx, nil)
-		if err != nil {
-			return fmt.Errorf("begin migration transaction: %w", err)
-		}
-
-		applied, ledgerExists, err := readAppliedMigrations(ctx, tx)
-		if err != nil {
-			_ = tx.Rollback()
+		done, err := applyNextMigration(ctx, conn, migrations)
+		if err != nil || done {
 			return err
-		}
-		if err := validateDatabaseState(ctx, tx, ledgerExists, applied, migrations); err != nil {
-			_ = tx.Rollback()
-			return err
-		}
-
-		if len(applied) == len(migrations) {
-			if err := tx.Commit(); err != nil {
-				return fmt.Errorf("commit migration verification: %w", err)
-			}
-			return nil
-		}
-
-		next := migrations[len(applied)]
-		if err := applyMigration(ctx, tx, next); err != nil {
-			_ = tx.Rollback()
-			return fmt.Errorf("apply migration %04d %q: %w", next.version, next.name, err)
-		}
-		if err := tx.Commit(); err != nil {
-			return fmt.Errorf("commit migration %04d %q: %w", next.version, next.name, err)
-		}
-
-		if len(applied)+1 == len(migrations) {
-			return nil
 		}
 	}
+}
+
+// applyNextMigration validates the ledger and applies the next pending
+// migration in one transaction. It reports done when nothing was pending or
+// it applied the last migration.
+func applyNextMigration(ctx context.Context, conn *sql.Conn, migrations []migration) (bool, error) {
+	// storeDSN configures writable transactions as BEGIN IMMEDIATE. Reading
+	// and validating the ledger after BeginTx prevents concurrent Open calls
+	// from both deciding that the same migration is pending.
+	tx, err := conn.BeginTx(ctx, nil)
+	if err != nil {
+		return false, fmt.Errorf("begin migration transaction: %w", err)
+	}
+	// A no-op after Commit. Otherwise it ends the Tx on every early return or
+	// panic, which withForeignKeysOff needs in order to close the connection.
+	defer tx.Rollback()
+
+	applied, ledgerExists, err := readAppliedMigrations(ctx, tx)
+	if err != nil {
+		return false, err
+	}
+	if err := validateDatabaseState(ctx, tx, ledgerExists, applied, migrations); err != nil {
+		return false, err
+	}
+
+	if len(applied) == len(migrations) {
+		if err := tx.Commit(); err != nil {
+			return false, fmt.Errorf("commit migration verification: %w", err)
+		}
+		return true, nil
+	}
+
+	next := migrations[len(applied)]
+	if err := applyMigration(ctx, tx, next); err != nil {
+		return false, fmt.Errorf("apply migration %04d %q: %w", next.version, next.name, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("commit migration %04d %q: %w", next.version, next.name, err)
+	}
+	return len(applied)+1 == len(migrations), nil
 }
 
 func validateMigrationList(migrations []migration) error {
@@ -502,20 +488,22 @@ func checkForeignKeys(ctx context.Context, tx *sql.Tx) error {
 	return nil
 }
 
-// checkForeignKeyParentsExist fails if any foreign key names a parent table
-// that doesn't exist. foreign_key_check reports such a key only for child
-// rows that hold a non-NULL value, so a migration that drops a parent table
-// with no surviving child rows would otherwise pass.
+// checkForeignKeyParentsExist fails if any foreign key in the main schema
+// names a parent table that doesn't exist there. foreign_key_check reports
+// such a key only for child rows that hold a non-NULL value, so a migration
+// that drops a parent table with no surviving child rows would otherwise
+// pass. Both lookups name the main schema so a TEMP table of the same name
+// can't stand in for a child or a parent.
 func checkForeignKeyParentsExist(ctx context.Context, tx *sql.Tx) error {
 	var child, parent string
 	err := tx.QueryRowContext(ctx, `
 		SELECT child.name, fk."table"
-		FROM sqlite_schema AS child
-		JOIN pragma_foreign_key_list(child.name) AS fk
+		FROM main.sqlite_schema AS child
+		JOIN pragma_foreign_key_list(child.name, 'main') AS fk
 		WHERE child.type = 'table'
 		  AND NOT EXISTS (
 			SELECT 1
-			FROM sqlite_schema AS parent
+			FROM main.sqlite_schema AS parent
 			WHERE parent.type = 'table'
 			  AND lower(parent.name) = lower(fk."table")
 		  )

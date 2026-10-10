@@ -15,6 +15,7 @@ import (
 	"errors"
 	"math/rand"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"testing/quick"
@@ -160,8 +161,8 @@ func TestOutboxRepointMergesEchoDuplicateIntoLocalRow(t *testing.T) {
 				}
 
 				// Cascade children moved onto the survivor instead of vanishing.
-				assertEchoMergedReaction(t, store, item.LocalMessageID, "reactor-delta", "thumbs-up", "active")
-				assertEchoMergedReaction(t, store, item.LocalMessageID, "reactor-snapshot", "heart", "active")
+				assertEchoMergedReaction(t, store, item.LocalMessageID, "reactor-self", "thumbs-up", "active")
+				assertEchoMergedReaction(t, store, item.LocalMessageID, "reactor-peer", "heart", "active")
 				assertReactionFence(t, store, item.LocalMessageID, echoMergeFenceSeq)
 				attachment, err := mustEchoMergeAttachments(t, store).GetForDownload(ctx, item.LocalMessageID, 0)
 				if err != nil {
@@ -240,8 +241,8 @@ func seedEchoDuplicate(t *testing.T, store *Store, messageID string, item NewOut
 	)
 }
 
-// seedEchoCascadeChildren records an inbound delta reaction, an embedded
-// reaction snapshot (with its fence) and a downloaded attachment on messageID.
+// seedEchoCascadeChildren records an embedded reaction snapshot (two reactors
+// and its fence) and a downloaded attachment on messageID.
 func seedEchoCascadeChildren(t *testing.T, store *Store, messageID string) {
 	t.Helper()
 	ctx := context.Background()
@@ -249,23 +250,15 @@ func seedEchoCascadeChildren(t *testing.T, store *Store, messageID string) {
 	if err != nil {
 		t.Fatalf("NewReactionRepository(): %v", err)
 	}
+	peer := "identity-a"
 	if _, err := reactions.ReplaceEmbeddedReactions(ctx, messageID, "account-a", "conversation-a",
-		[]ReactionSnapshotEntry{{ReactorKey: "reactor-snapshot", ReactorLabel: "peer", Emoji: "heart"}},
+		[]ReactionSnapshotEntry{
+			{ReactorKey: "reactor-peer", ReactorIdentityID: &peer, ReactorLabel: "peer", Emoji: "heart"},
+			{ReactorKey: "reactor-self", ReactorIsSelf: true, Emoji: "thumbs-up"},
+		},
 		echoMergeFenceSeq,
 	); err != nil {
 		t.Fatalf("ReplaceEmbeddedReactions(): %v", err)
-	}
-	if applied, err := reactions.ApplyReaction(ctx, ReactionApply{
-		AccountID:      "account-a",
-		ConversationID: "conversation-a",
-		MessageID:      messageID,
-		ReactorKey:     "reactor-delta",
-		ReactorLabel:   "peer",
-		Emoji:          "thumbs-up",
-		Action:         bridge.ReactionAdd,
-		OccurredAtMS:   outboxTestTimeMS - 250,
-	}); err != nil || !applied {
-		t.Fatalf("ApplyReaction() = (%v, %v), want applied", applied, err)
 	}
 
 	attachments := mustEchoMergeAttachments(t, store)
@@ -442,7 +435,7 @@ func TestOutboxRepointKeepsEchoRowWhenLocalRowIsGone(t *testing.T) {
 	if echo.RemoteMessageID != echoMergeRealID {
 		t.Fatalf("echo remote ID = %q, want %q", echo.RemoteMessageID, echoMergeRealID)
 	}
-	assertEchoMergedReaction(t, store, echoMergeEchoID, "reactor-delta", "thumbs-up", "active")
+	assertEchoMergedReaction(t, store, echoMergeEchoID, "reactor-self", "thumbs-up", "active")
 	assertReactionFence(t, store, echoMergeEchoID, echoMergeFenceSeq)
 }
 
@@ -509,6 +502,8 @@ type echoMergeScenario struct {
 }
 
 type echoMergeReactionSeed struct {
+	IdentityID   *string
+	IsSelf       bool
 	Emoji        string
 	State        string
 	OccurredAtMS int64
@@ -530,11 +525,16 @@ func (echoMergeScenario) Generate(r *rand.Rand, _ int) reflect.Value {
 	}
 	reaction := func() *echoMergeReactionSeed {
 		seed := &echoMergeReactionSeed{
+			IsSelf:       r.Intn(4) == 0,
 			Emoji:        []string{"a", "b", "c"}[r.Intn(3)],
 			State:        "active",
 			OccurredAtMS: outboxTestTimeMS - 800 + int64(r.Intn(3)),
 			SourceSeqMS:  int64(r.Intn(3)),
 			UpdatedAtMS:  updatedAt(),
+		}
+		if !seed.IsSelf && r.Intn(3) == 0 {
+			identityID := "identity-a"
+			seed.IdentityID = &identityID
 		}
 		if r.Intn(5) == 0 {
 			seed.State = "removed"
@@ -556,7 +556,7 @@ func (echoMergeScenario) Generate(r *rand.Rand, _ int) reflect.Value {
 			scenario.Reactions[key] = pair
 		}
 	}
-	for side, percent := range [2]int{40, 60} {
+	for side, percent := range [2]int{25, 45} {
 		if r.Intn(100) < percent {
 			seq := int64(r.Intn(4))
 			scenario.Fences[side] = &seq
@@ -587,13 +587,21 @@ type echoMergeSnapshot struct {
 	Fences      map[string]echoMergeFenceRow       // message_id
 	Attachments map[echoMergeAttachmentKey]echoMergeAttachmentRow
 	Cursors     map[[2]string]echoMergeCursorRow // (device_id, conversation_id)
-	Intents     map[string]string                // outbox_id -> target message (reactions and receipts)
+	Intents     map[string]echoMergeIntentRow    // outbox_id
 }
 
 type echoMergeReactionRow struct {
 	MessageID, ReactorKey, AccountID, ConversationID, Label, Emoji, State string
+	IdentityID                                                            sql.NullString
 	IsSelf                                                                bool
 	OccurredAtMS, SourceSeqMS, CreatedAtMS, UpdatedAtMS                   int64
+}
+
+// echoMergeIntentRow is one outbox_reactions or outbox_read_receipts row:
+// Target is the message column the merge may repoint, Payload every other
+// column.
+type echoMergeIntentRow struct {
+	Target, Payload string
 }
 
 type echoMergeFenceRow struct {
@@ -609,7 +617,8 @@ type echoMergeAttachmentKey struct {
 type echoMergeAttachmentRow struct {
 	echoMergeAttachmentKey
 	RemoteID, Filename, MIME, State string
-	BlobHash                        sql.NullString
+	RemoteRef                       []byte
+	BlobHash, LastError             sql.NullString
 	SizeBytes                       sql.NullInt64
 	CreatedAtMS, UpdatedAtMS        int64
 }
@@ -617,6 +626,7 @@ type echoMergeAttachmentRow struct {
 type echoMergeCursorRow struct {
 	AccountID, DeviceID, ConversationID string
 	LastReadMessageID                   sql.NullString
+	SourceUpdatedAtMS                   sql.NullInt64
 	LastReadAtMS, UpdatedAtMS           int64
 }
 
@@ -628,25 +638,48 @@ func echoMergeModel(before echoMergeSnapshot, duplicateID, survivorID string, no
 		Fences:      map[string]echoMergeFenceRow{},
 		Attachments: map[echoMergeAttachmentKey]echoMergeAttachmentRow{},
 		Cursors:     map[[2]string]echoMergeCursorRow{},
-		Intents:     map[string]string{},
+		Intents:     map[string]echoMergeIntentRow{},
+	}
+	// A fence on either row means snapshot semantics: order by source sequence,
+	// and the newest snapshot's omissions tombstone whatever is still active
+	// below it. Otherwise deltas order by occurrence time.
+	fence, fenced := int64(0), false
+	for _, messageID := range []string{survivorID, duplicateID} {
+		if row, ok := before.Fences[messageID]; ok && (!fenced || row.SourceSeqMS > fence) {
+			fence, fenced = row.SourceSeqMS, true
+		}
+	}
+	newer := func(a, b echoMergeReactionRow) bool {
+		first, second := [2]int64{a.OccurredAtMS, a.SourceSeqMS}, [2]int64{b.OccurredAtMS, b.SourceSeqMS}
+		if fenced {
+			first, second = [2]int64{a.SourceSeqMS, a.OccurredAtMS}, [2]int64{b.SourceSeqMS, b.OccurredAtMS}
+		}
+		return first[0] > second[0] || (first[0] == second[0] && first[1] > second[1])
 	}
 	for key, row := range before.Reactions {
 		switch row.MessageID {
 		case survivorID:
 			duplicate, conflict := before.Reactions[[2]string{duplicateID, row.ReactorKey}]
-			if !conflict || !(duplicate.OccurredAtMS > row.OccurredAtMS ||
-				(duplicate.OccurredAtMS == row.OccurredAtMS && duplicate.SourceSeqMS > row.SourceSeqMS)) {
+			if !conflict || !newer(duplicate, row) {
 				after.Reactions[key] = row
 			}
 		case duplicateID:
 			survivor, conflict := before.Reactions[[2]string{survivorID, row.ReactorKey}]
-			if !conflict || row.OccurredAtMS > survivor.OccurredAtMS ||
-				(row.OccurredAtMS == survivor.OccurredAtMS && row.SourceSeqMS > survivor.SourceSeqMS) {
+			if !conflict || newer(row, survivor) {
 				row.MessageID = survivorID
 				row.UpdatedAtMS = max(row.UpdatedAtMS, nowMS)
 				after.Reactions[[2]string{survivorID, row.ReactorKey}] = row
 			}
 		default:
+			after.Reactions[key] = row
+		}
+	}
+	for key, row := range after.Reactions {
+		if fenced && row.MessageID == survivorID && row.State == "active" && row.SourceSeqMS < fence {
+			row.State = "removed"
+			row.OccurredAtMS = nowMS
+			row.SourceSeqMS = fence
+			row.UpdatedAtMS = max(row.UpdatedAtMS, nowMS)
 			after.Reactions[key] = row
 		}
 	}
@@ -689,21 +722,23 @@ func echoMergeModel(before echoMergeSnapshot, duplicateID, survivorID string, no
 		}
 		after.Cursors[key] = cursor
 	}
-	for outboxID, target := range before.Intents {
-		if target == duplicateID {
-			target = survivorID
+	for outboxID, intent := range before.Intents {
+		if intent.Target == duplicateID {
+			intent.Target = survivorID
 		}
-		after.Intents[outboxID] = target
+		after.Intents[outboxID] = intent
 	}
 	return after
 }
 
 // Property (merge model): for any rows on the echo duplicate, the survivor and
-// a bystander, and through every entry point, the repoint commits; afterwards
-// no row references the duplicate, foreign_key_check is clean, and every row
-// of every touched table equals what echoMergeModel derives from the rows
-// before the repoint. Read-cursor, intent and reaction counts are conserved
-// except for reaction rows the model resolves a conflict away from.
+// a bystander, the repoint commits (each of the 150 scenarios goes through one
+// of the four entry points, and every entry point is exercised). Afterwards no
+// row references the duplicate, foreign_key_check is clean, cursor and intent
+// counts are conserved, and every column of every row of the six tables that
+// reference messages equals what echoMergeModel derives from the rows before
+// the repoint. TestOutboxRepointEchoMergeConvergesWithOneMessageProperty
+// checks the model's reaction rules against the public writers.
 func TestOutboxRepointEchoMergeMatchesModelProperty(t *testing.T) {
 	coverage := map[string]int{}
 	clock := newOutboxTestClock(outboxTestTimeMS)
@@ -768,7 +803,10 @@ func TestOutboxRepointEchoMergeMatchesModelProperty(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, name := range []string{
-		"reaction conflict: duplicate wins", "reaction conflict: survivor wins", "reaction conflict: exact tie",
+		"delta reaction conflict: duplicate wins", "delta reaction conflict: survivor wins",
+		"delta reaction conflict: exact tie", "snapshot reaction conflict: duplicate wins",
+		"snapshot reaction conflict: survivor wins", "snapshot reaction conflict: exact tie",
+		"active reaction below the merged fence", "reaction with identity", "self reaction",
 		"fence on both", "fence on duplicate only", "attachment conflict: survivor downloaded",
 		"attachment conflict: survivor pending", "cursor on duplicate", "reaction intent on duplicate",
 		"receipt intent on duplicate", "updated_at after repoint clock",
@@ -796,9 +834,9 @@ func seedEchoMergeScenario(
 				message_id, reactor_key, account_id, conversation_id, reactor_identity_id,
 				reactor_is_self, reactor_label, emoji, state, occurred_at_ms, source_seq_ms,
 				created_at_ms, updated_at_ms
-			) VALUES (?, ?, 'account-a', 'conversation-a', NULL, 0, ?, ?, ?, ?, ?, ?, ?)
-		`, messageID, reactorKey, "label-"+messageID, seed.Emoji, seed.State, seed.OccurredAtMS,
-			seed.SourceSeqMS, outboxTestTimeMS-950, seed.UpdatedAtMS)
+			) VALUES (?, ?, 'account-a', 'conversation-a', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`, messageID, reactorKey, seed.IdentityID, seed.IsSelf, "label-"+messageID, seed.Emoji, seed.State,
+			seed.OccurredAtMS, seed.SourceSeqMS, outboxTestTimeMS-950, seed.UpdatedAtMS)
 	}
 	for reactorKey, pair := range scenario.Reactions {
 		for side, seed := range pair {
@@ -821,17 +859,19 @@ func seedEchoMergeScenario(
 	insertAttachment := func(messageID string, ordinal, state int) {
 		var blobHash any
 		stateName := "pending"
+		lastError := any("download failed for " + messageID)
 		if state == 2 {
 			stateName = "downloaded"
 			blobHash = strings.Repeat(string("0123456789abcdef"[len(messageID)%16]), 63) + string("0123456789abcdef"[ordinal])
+			lastError = nil
 		}
 		mustExec(t, store.db, `
 			INSERT INTO message_attachments (
 				message_id, ordinal, remote_id, remote_ref, filename, mime, size_bytes,
 				state, blob_hash, last_error, created_at_ms, updated_at_ms
-			) VALUES (?, ?, ?, x'', ?, 'image/png', 10, ?, ?, NULL, ?, ?)
-		`, messageID, ordinal, "remote-"+messageID, "file-"+messageID, stateName, blobHash,
-			outboxTestTimeMS-600, outboxTestTimeMS-600+int64(ordinal))
+			) VALUES (?, ?, ?, ?, ?, 'image/png', 10, ?, ?, ?, ?, ?)
+		`, messageID, ordinal, "remote-"+messageID, []byte("opaque-ref:"+messageID), "file-"+messageID,
+			stateName, blobHash, lastError, outboxTestTimeMS-600, outboxTestTimeMS-600+int64(ordinal))
 	}
 	for ordinal, pair := range scenario.Attachments {
 		for side, state := range pair {
@@ -841,7 +881,7 @@ func seedEchoMergeScenario(
 		}
 	}
 	// The bystander's rows must come through untouched.
-	insertReaction(bystanderID, "r0", echoMergeReactionSeed{Emoji: "a", State: "active", OccurredAtMS: outboxTestTimeMS - 10, UpdatedAtMS: outboxTestTimeMS - 10})
+	insertReaction(bystanderID, "r0", echoMergeReactionSeed{Emoji: "a", State: "active", OccurredAtMS: outboxTestTimeMS - 10, SourceSeqMS: 1, UpdatedAtMS: outboxTestTimeMS - 10})
 	insertFence(bystanderID, 7)
 	insertAttachment(bystanderID, 0, 2)
 
@@ -870,7 +910,7 @@ func seedEchoMergeScenario(
 	for index, target := range scenario.ReactionIntents {
 		intent := outboxTestReactionItem("property-reaction-" + string(rune('a'+index)))
 		if _, _, err := repository.EnqueueReaction(ctx, intent, OutboxReaction{
-			TargetMessageID: targets[target], Emoji: "a", Action: "add",
+			TargetMessageID: targets[target], Emoji: []string{"a", "b"}[index%2], Action: []string{"add", "remove"}[index%2],
 		}); err != nil {
 			t.Fatalf("EnqueueReaction(): %v", err)
 		}
@@ -893,19 +933,46 @@ func seedEchoMergeScenario(
 
 func recordEchoMergeCoverage(coverage map[string]int, scenario echoMergeScenario) {
 	coverage["path "+string(rune('0'+scenario.Path))]++
+	fenced, fence := false, int64(0)
+	for _, seq := range scenario.Fences {
+		if seq != nil && (!fenced || *seq > fence) {
+			fenced, fence = true, *seq
+		}
+	}
+	mode := "delta "
+	if fenced {
+		mode = "snapshot "
+	}
 	for _, pair := range scenario.Reactions {
+		for _, seed := range pair {
+			if seed == nil {
+				continue
+			}
+			if seed.IdentityID != nil {
+				coverage["reaction with identity"]++
+			}
+			if seed.IsSelf {
+				coverage["self reaction"]++
+			}
+			if fenced && seed.State == "active" && seed.SourceSeqMS < fence {
+				coverage["active reaction below the merged fence"]++
+			}
+		}
 		survivor, duplicate := pair[0], pair[1]
 		if survivor == nil || duplicate == nil {
 			continue
 		}
+		first, second := [2]int64{duplicate.OccurredAtMS, duplicate.SourceSeqMS}, [2]int64{survivor.OccurredAtMS, survivor.SourceSeqMS}
+		if fenced {
+			first, second = [2]int64{duplicate.SourceSeqMS, duplicate.OccurredAtMS}, [2]int64{survivor.SourceSeqMS, survivor.OccurredAtMS}
+		}
 		switch {
-		case duplicate.OccurredAtMS > survivor.OccurredAtMS ||
-			(duplicate.OccurredAtMS == survivor.OccurredAtMS && duplicate.SourceSeqMS > survivor.SourceSeqMS):
-			coverage["reaction conflict: duplicate wins"]++
-		case duplicate.OccurredAtMS == survivor.OccurredAtMS && duplicate.SourceSeqMS == survivor.SourceSeqMS:
-			coverage["reaction conflict: exact tie"]++
+		case first == second:
+			coverage[mode+"reaction conflict: exact tie"]++
+		case first[0] > second[0] || (first[0] == second[0] && first[1] > second[1]):
+			coverage[mode+"reaction conflict: duplicate wins"]++
 		default:
-			coverage["reaction conflict: survivor wins"]++
+			coverage[mode+"reaction conflict: survivor wins"]++
 		}
 	}
 	switch {
@@ -952,7 +1019,7 @@ func readEchoMergeSnapshot(t *testing.T, store *Store) echoMergeSnapshot {
 		Fences:      map[string]echoMergeFenceRow{},
 		Attachments: map[echoMergeAttachmentKey]echoMergeAttachmentRow{},
 		Cursors:     map[[2]string]echoMergeCursorRow{},
-		Intents:     map[string]string{},
+		Intents:     map[string]echoMergeIntentRow{},
 	}
 	scan := func(query string, each func(*sql.Rows) error) {
 		rows, err := store.db.Query(query)
@@ -969,46 +1036,430 @@ func readEchoMergeSnapshot(t *testing.T, store *Store) echoMergeSnapshot {
 			t.Fatalf("iterate snapshot %q: %v", query, err)
 		}
 	}
-	scan(`SELECT message_id, reactor_key, account_id, conversation_id, reactor_label, emoji, state,
-			reactor_is_self, occurred_at_ms, source_seq_ms, created_at_ms, updated_at_ms
-		FROM reactions WHERE reactor_identity_id IS NULL`, func(rows *sql.Rows) error {
+	scan(`SELECT message_id, reactor_key, account_id, conversation_id, reactor_identity_id, reactor_label,
+			emoji, state, reactor_is_self, occurred_at_ms, source_seq_ms, created_at_ms, updated_at_ms
+		FROM reactions`, func(rows *sql.Rows) error {
 		var row echoMergeReactionRow
-		err := rows.Scan(&row.MessageID, &row.ReactorKey, &row.AccountID, &row.ConversationID, &row.Label,
-			&row.Emoji, &row.State, &row.IsSelf, &row.OccurredAtMS, &row.SourceSeqMS, &row.CreatedAtMS, &row.UpdatedAtMS)
+		err := rows.Scan(&row.MessageID, &row.ReactorKey, &row.AccountID, &row.ConversationID, &row.IdentityID,
+			&row.Label, &row.Emoji, &row.State, &row.IsSelf, &row.OccurredAtMS, &row.SourceSeqMS,
+			&row.CreatedAtMS, &row.UpdatedAtMS)
 		snapshot.Reactions[[2]string{row.MessageID, row.ReactorKey}] = row
 		return err
 	})
-	assertRowCount(t, store.db, "reactions", len(snapshot.Reactions))
 	scan(`SELECT message_id, source_seq_ms, updated_at_ms FROM reaction_snapshot_fences`, func(rows *sql.Rows) error {
 		var row echoMergeFenceRow
 		err := rows.Scan(&row.MessageID, &row.SourceSeqMS, &row.UpdatedAtMS)
 		snapshot.Fences[row.MessageID] = row
 		return err
 	})
-	scan(`SELECT message_id, ordinal, remote_id, filename, mime, state, blob_hash, size_bytes,
-			created_at_ms, updated_at_ms
+	scan(`SELECT message_id, ordinal, remote_id, remote_ref, filename, mime, state, blob_hash, last_error,
+			size_bytes, created_at_ms, updated_at_ms
 		FROM message_attachments`, func(rows *sql.Rows) error {
 		var row echoMergeAttachmentRow
-		err := rows.Scan(&row.MessageID, &row.Ordinal, &row.RemoteID, &row.Filename, &row.MIME, &row.State,
-			&row.BlobHash, &row.SizeBytes, &row.CreatedAtMS, &row.UpdatedAtMS)
+		err := rows.Scan(&row.MessageID, &row.Ordinal, &row.RemoteID, &row.RemoteRef, &row.Filename, &row.MIME,
+			&row.State, &row.BlobHash, &row.LastError, &row.SizeBytes, &row.CreatedAtMS, &row.UpdatedAtMS)
 		snapshot.Attachments[row.echoMergeAttachmentKey] = row
 		return err
 	})
-	scan(`SELECT account_id, device_id, conversation_id, last_read_message_id, last_read_at_ms, updated_at_ms
+	scan(`SELECT account_id, device_id, conversation_id, last_read_message_id, last_read_at_ms,
+			source_updated_at_ms, updated_at_ms
 		FROM read_cursors`, func(rows *sql.Rows) error {
 		var row echoMergeCursorRow
 		err := rows.Scan(&row.AccountID, &row.DeviceID, &row.ConversationID, &row.LastReadMessageID,
-			&row.LastReadAtMS, &row.UpdatedAtMS)
+			&row.LastReadAtMS, &row.SourceUpdatedAtMS, &row.UpdatedAtMS)
 		snapshot.Cursors[[2]string{row.DeviceID, row.ConversationID}] = row
 		return err
 	})
-	scan(`SELECT outbox_id, target_message_id FROM outbox_reactions
+	scan(`SELECT outbox_id, target_message_id,
+			'reaction|' || emoji || '|' || action || '|' || created_at_ms
+		FROM outbox_reactions
 		UNION ALL
-		SELECT outbox_id, last_read_message_id FROM outbox_read_receipts`, func(rows *sql.Rows) error {
-		var outboxID, target string
-		err := rows.Scan(&outboxID, &target)
-		snapshot.Intents[outboxID] = target
+		SELECT outbox_id, last_read_message_id,
+			'read|' || device_id || '|' || read_at_ms || '|' || created_at_ms
+		FROM outbox_read_receipts`, func(rows *sql.Rows) error {
+		var outboxID string
+		var intent echoMergeIntentRow
+		err := rows.Scan(&outboxID, &intent.Target, &intent.Payload)
+		snapshot.Intents[outboxID] = intent
 		return err
 	})
 	return snapshot
+}
+
+// Full embedded snapshots are ordered by source sequence, not by when they
+// were written, and a newer snapshot's omissions are removals, even when the
+// two snapshots landed on different local rows of the same message. The
+// cases come from the PR #218 review.
+func TestOutboxRepointEchoMergeFollowsSnapshotSourceOrder(t *testing.T) {
+	type snapshot struct {
+		onDuplicate bool
+		seq         int64
+		entries     []ReactionSnapshotEntry
+	}
+	peer := func(emoji string) []ReactionSnapshotEntry {
+		return []ReactionSnapshotEntry{{ReactorKey: "peer", ReactorLabel: "peer", Emoji: emoji}}
+	}
+	cases := []struct {
+		name       string
+		snapshots  []snapshot // in processing order
+		wantActive []string
+	}{
+		{
+			name:       "older snapshot processed later on the duplicate",
+			snapshots:  []snapshot{{false, 200, peer("newer")}, {true, 100, peer("older")}},
+			wantActive: []string{"peer:newer"},
+		},
+		{
+			name:       "older snapshot processed later on the survivor",
+			snapshots:  []snapshot{{true, 200, peer("newer")}, {false, 100, peer("older")}},
+			wantActive: []string{"peer:newer"},
+		},
+		{
+			name:      "newer empty snapshot on the duplicate",
+			snapshots: []snapshot{{false, 100, peer("heart")}, {true, 200, nil}},
+		},
+		{
+			name:      "newer empty snapshot on the survivor",
+			snapshots: []snapshot{{true, 100, peer("heart")}, {false, 200, nil}},
+		},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			clock := newOutboxTestClock(outboxTestTimeMS)
+			store, repository := openOutboxTestRepository(t, clock.Now)
+			seedEchoMergeGraph(t, store)
+			ctx := context.Background()
+			item := outboxTestItem("echo-merge-source-order")
+			mustEnqueueOutgoingOutbox(t, repository, item, "optimistic body")
+			repoint := echoMergePaths()[0].prepare(t, repository, clock.Now(), item, echoMergeRealID)
+			seedEchoDuplicate(t, store, echoMergeEchoID, item, echoMergeRealID)
+			reactions, err := NewReactionRepository(store, clock.Now)
+			if err != nil {
+				t.Fatalf("NewReactionRepository(): %v", err)
+			}
+			for index, snapshot := range test.snapshots {
+				clock.Set(outboxTestTimeMS + int64(100*(index+1)))
+				messageID := item.LocalMessageID
+				if snapshot.onDuplicate {
+					messageID = echoMergeEchoID
+				}
+				if _, err := reactions.ReplaceEmbeddedReactions(ctx, messageID, item.AccountID, item.ConversationID,
+					snapshot.entries, snapshot.seq); err != nil {
+					t.Fatalf("ReplaceEmbeddedReactions(%d): %v", index, err)
+				}
+			}
+
+			clock.Set(echoMergeRepointMS)
+			if err := repoint(); err != nil {
+				t.Fatalf("Confirm(): %v", err)
+			}
+			assertReactionFence(t, store, item.LocalMessageID, 200)
+			if got := echoMergeActiveReactions(t, store, item.LocalMessageID); !reflect.DeepEqual(got, test.wantActive) {
+				t.Fatalf("active reactions after merge = %q, want %q", got, test.wantActive)
+			}
+			// Replaying the older frame stays fenced off and changes nothing.
+			if _, err := reactions.ReplaceEmbeddedReactions(ctx, item.LocalMessageID, item.AccountID, item.ConversationID,
+				peer("older"), 100); err != nil {
+				t.Fatalf("ReplaceEmbeddedReactions(replay): %v", err)
+			}
+			if got := echoMergeActiveReactions(t, store, item.LocalMessageID); !reflect.DeepEqual(got, test.wantActive) {
+				t.Fatalf("active reactions after replaying the older frame = %q, want %q", got, test.wantActive)
+			}
+		})
+	}
+}
+
+// echoMergeActiveReactions lists messageID's active reactions as
+// "reactor:emoji", plus identity and self markers when set.
+func echoMergeActiveReactions(t *testing.T, store *Store, messageID string) []string {
+	t.Helper()
+	rows, err := store.db.Query(`
+		SELECT reactor_key, emoji, COALESCE(reactor_identity_id, ''), reactor_is_self, reactor_label
+		FROM reactions
+		WHERE message_id = ? AND state = 'active'
+		ORDER BY reactor_key
+	`, messageID)
+	if err != nil {
+		t.Fatalf("list active reactions for %q: %v", messageID, err)
+	}
+	defer rows.Close()
+	var active []string
+	for rows.Next() {
+		var key, emoji, identity, label string
+		var isSelf bool
+		if err := rows.Scan(&key, &emoji, &identity, &isSelf, &label); err != nil {
+			t.Fatalf("scan active reaction: %v", err)
+		}
+		entry := key + ":" + emoji
+		if identity != "" {
+			entry += " identity=" + identity
+		}
+		if isSelf {
+			entry += " self"
+		}
+		if label != "" && label != key {
+			entry += " label=" + label
+		}
+		active = append(active, entry)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate active reactions: %v", err)
+	}
+	return active
+}
+
+func echoMergeFence(t *testing.T, store *Store, messageID string) sql.NullInt64 {
+	t.Helper()
+	var fence sql.NullInt64
+	err := store.db.QueryRow(`SELECT source_seq_ms FROM reaction_snapshot_fences WHERE message_id = ?`, messageID).Scan(&fence)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("read fence for %q: %v", messageID, err)
+	}
+	return fence
+}
+
+// echoMergeWriteScenario is a random sequence of reaction writes through the
+// public writers, each aimed at the local survivor or the echo duplicate, in
+// processing order, plus writes that arrive after the merge. Google messages
+// take full embedded snapshots and every other platform takes deltas, so one
+// scenario uses one kind.
+type echoMergeWriteScenario struct {
+	Path     int
+	Snapshot bool
+	Writes   []echoMergeWrite
+	After    []echoMergeWrite
+}
+
+type echoMergeWrite struct {
+	OnDuplicate bool
+	SourceSeqMS int64                   // snapshot: distinct across the scenario
+	Entries     []ReactionSnapshotEntry // snapshot
+	Delta       ReactionApply           // delta: MessageID is filled in when applied
+}
+
+func (echoMergeWriteScenario) Generate(r *rand.Rand, _ int) reflect.Value {
+	scenario := echoMergeWriteScenario{Path: r.Intn(len(echoMergePaths())), Snapshot: r.Intn(2) == 0}
+	reactors := []string{"r0", "r1", "r2", "r3"}
+	identity := "identity-a"
+	reactorFields := func(key string) (*string, bool, string) {
+		switch key {
+		case "r0":
+			return &identity, false, "peer-a"
+		case "r1":
+			return nil, true, ""
+		default:
+			return nil, false, "label-" + key
+		}
+	}
+	writes := 1 + r.Intn(6)
+	after := r.Intn(3)
+	// Distinct source sequences, assigned in a random order so snapshots are
+	// often processed out of source order.
+	seqs := r.Perm(writes + after)
+	for index := range writes + after {
+		write := echoMergeWrite{OnDuplicate: r.Intn(2) == 0}
+		if scenario.Snapshot {
+			write.SourceSeqMS = int64(100 + 10*seqs[index])
+			for _, key := range reactors {
+				if r.Intn(2) == 0 {
+					identityID, isSelf, label := reactorFields(key)
+					write.Entries = append(write.Entries, ReactionSnapshotEntry{
+						ReactorKey: key, ReactorIdentityID: identityID, ReactorIsSelf: isSelf, ReactorLabel: label,
+						Emoji: []string{"a", "b", "c"}[r.Intn(3)],
+					})
+				}
+			}
+		} else {
+			key := reactors[r.Intn(len(reactors))]
+			identityID, isSelf, label := reactorFields(key)
+			write.Delta = ReactionApply{
+				AccountID: "account-a", ConversationID: "conversation-a",
+				ReactorKey: key, ReactorIdentityID: identityID, ReactorIsSelf: isSelf, ReactorLabel: label,
+				Emoji:        []string{"a", "b", "c"}[r.Intn(3)],
+				Action:       []bridge.ReactionAction{bridge.ReactionAdd, bridge.ReactionAdd, bridge.ReactionRemove, bridge.ReactionSwitch}[r.Intn(4)],
+				OccurredAtMS: outboxTestTimeMS - 800 + int64(r.Intn(4)),
+				SourceSeqMS:  int64(1000 + index),
+			}
+		}
+		if index < writes {
+			scenario.Writes = append(scenario.Writes, write)
+		} else {
+			scenario.After = append(scenario.After, write)
+		}
+	}
+	return reflect.ValueOf(scenario)
+}
+
+// Property (one message): merging the echo duplicate into the survivor leaves
+// the survivor's active reactions and snapshot fence exactly as if every
+// write had gone to one message in the same processing order, and they stay
+// equal as more writes arrive after the merge. This checks the merge's
+// reaction rules against ReplaceEmbeddedReactions and ApplyReaction rather
+// than against a restatement of the rules.
+func TestOutboxRepointEchoMergeConvergesWithOneMessageProperty(t *testing.T) {
+	coverage := map[string]int{}
+	clock := newOutboxTestClock(outboxTestTimeMS)
+	store, repository := openOutboxTestRepository(t, clock.Now)
+	seedEchoMergeGraph(t, store)
+	reactions, err := NewReactionRepository(store, clock.Now)
+	if err != nil {
+		t.Fatalf("NewReactionRepository(): %v", err)
+	}
+	ctx := context.Background()
+	const referenceID = "message-reference"
+	property := func(scenario echoMergeWriteScenario) bool {
+		for _, statement := range []string{`DELETE FROM outbox`, `DELETE FROM read_cursors`, `DELETE FROM messages`} {
+			if _, err := store.db.Exec(statement); err != nil {
+				t.Errorf("reset (%s): %v", statement, err)
+				return false
+			}
+		}
+		clock.Set(outboxTestTimeMS)
+		item := outboxTestItem("echo-merge-writers")
+		mustEnqueueOutgoingOutbox(t, repository, item, "optimistic body")
+		path := echoMergePaths()[scenario.Path]
+		repoint := path.prepare(t, repository, clock.Now(), item, echoMergeRealID)
+		survivorID := item.LocalMessageID
+		seedEchoDuplicate(t, store, echoMergeEchoID, item, echoMergeRealID)
+		seedOutboxTestMessage(t, store, referenceID, "account-a", "conversation-a")
+
+		step := 0
+		apply := func(write echoMergeWrite, messageIDs ...string) bool {
+			step++
+			clock.Set(outboxTestTimeMS + int64(10*step))
+			for _, messageID := range messageIDs {
+				var err error
+				if scenario.Snapshot {
+					_, err = reactions.ReplaceEmbeddedReactions(ctx, messageID, "account-a", "conversation-a",
+						write.Entries, write.SourceSeqMS)
+				} else {
+					delta := write.Delta
+					delta.MessageID = messageID
+					_, err = reactions.ApplyReaction(ctx, delta)
+				}
+				if err != nil {
+					t.Errorf("write %+v to %q: %v", write, messageID, err)
+					return false
+				}
+			}
+			return true
+		}
+		for _, write := range scenario.Writes {
+			target := survivorID
+			if write.OnDuplicate {
+				target = echoMergeEchoID
+			}
+			if !apply(write, target, referenceID) {
+				return false
+			}
+		}
+		recordEchoMergeWriteCoverage(coverage, scenario)
+
+		clock.Set(echoMergeRepointMS)
+		if err := repoint(); err != nil {
+			t.Errorf("scenario %+v: repoint through %s: %v", scenario, path.name, err)
+			return false
+		}
+		compare := func(when string) bool {
+			got, want := echoMergeActiveReactions(t, store, survivorID), echoMergeActiveReactions(t, store, referenceID)
+			gotFence, wantFence := echoMergeFence(t, store, survivorID), echoMergeFence(t, store, referenceID)
+			if !reflect.DeepEqual(got, want) || gotFence != wantFence {
+				t.Errorf("scenario %+v via %s, %s: survivor active=%q fence=%v; one message active=%q fence=%v",
+					scenario, path.name, when, got, gotFence, want, wantFence)
+				return false
+			}
+			return true
+		}
+		if !compare("after the merge") {
+			return false
+		}
+		for index, write := range scenario.After {
+			if !apply(write, survivorID, referenceID) || !compare("after post-merge write "+string(rune('0'+index))) {
+				return false
+			}
+		}
+		assertNoMessageReferences(t, store, echoMergeEchoID)
+		return !t.Failed()
+	}
+	if err := quick.Check(property, &quick.Config{MaxCount: 300, Rand: rand.New(rand.NewSource(20261010))}); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{
+		"snapshot: older snapshot processed after a newer one on the other row",
+		"snapshot: newest snapshot omits a reactor the other row has active",
+		"snapshot: writes after the merge",
+		"delta: same reactor on both rows", "delta: equal occurrence on both rows",
+		"delta: writes after the merge",
+		"path 0", "path 1", "path 2", "path 3",
+	} {
+		if coverage[name] == 0 {
+			t.Errorf("generator never produced %q; coverage = %v", name, coverage)
+		}
+	}
+}
+
+func recordEchoMergeWriteCoverage(coverage map[string]int, scenario echoMergeWriteScenario) {
+	coverage["path "+string(rune('0'+scenario.Path))]++
+	if scenario.Snapshot {
+		var newest [2]*echoMergeWrite
+		for index := range scenario.Writes {
+			write := &scenario.Writes[index]
+			side := 0
+			if write.OnDuplicate {
+				side = 1
+			}
+			other := newest[1-side]
+			if other != nil && other.SourceSeqMS > write.SourceSeqMS {
+				coverage["snapshot: older snapshot processed after a newer one on the other row"]++
+			}
+			if newest[side] == nil || write.SourceSeqMS > newest[side].SourceSeqMS {
+				newest[side] = write
+			}
+		}
+		if newest[0] != nil && newest[1] != nil {
+			older, newer := newest[0], newest[1]
+			if older.SourceSeqMS > newer.SourceSeqMS {
+				older, newer = newer, older
+			}
+			listed := map[string]bool{}
+			for _, entry := range newer.Entries {
+				listed[entry.ReactorKey] = true
+			}
+			for _, entry := range older.Entries {
+				if !listed[entry.ReactorKey] {
+					coverage["snapshot: newest snapshot omits a reactor the other row has active"]++
+					break
+				}
+			}
+		}
+		if len(scenario.After) > 0 {
+			coverage["snapshot: writes after the merge"]++
+		}
+		return
+	}
+	occurrences := map[string][2][]int64{}
+	for _, write := range scenario.Writes {
+		side := 0
+		if write.OnDuplicate {
+			side = 1
+		}
+		entry := occurrences[write.Delta.ReactorKey]
+		entry[side] = append(entry[side], write.Delta.OccurredAtMS)
+		occurrences[write.Delta.ReactorKey] = entry
+	}
+	for _, sides := range occurrences {
+		if len(sides[0]) == 0 || len(sides[1]) == 0 {
+			continue
+		}
+		coverage["delta: same reactor on both rows"]++
+		for _, a := range sides[0] {
+			if slices.Contains(sides[1], a) {
+				coverage["delta: equal occurrence on both rows"]++
+				break
+			}
+		}
+	}
+	if len(scenario.After) > 0 {
+		coverage["delta: writes after the merge"]++
+	}
 }
