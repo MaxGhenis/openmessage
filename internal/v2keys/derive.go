@@ -91,6 +91,31 @@ func SignalIncomingSourceID(conversationID, source string, timestamp int64) stri
 	return hex.EncodeToString(sum[:])
 }
 
+// IsSignalIncomingSourceID reports whether id has the form
+// SignalIncomingSourceID returns: 40 lowercase hexadecimal digits. An incoming
+// Signal message stored under such an ID was keyed by a receiver from its
+// sender and sent timestamp.
+func IsSignalIncomingSourceID(id string) bool {
+	if len(id) != sha1.Size*2 {
+		return false
+	}
+	for _, r := range id {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// SignalReceivedSourceID returns the source ID of an incoming Signal message
+// that was stored with no sent timestamp, only the time it was received (a
+// Signal Desktop row without one). Signal names a message by its sender and
+// sent timestamp, so this message has no Signal identity. The prefix keeps it
+// from passing for one keyed by SignalIncomingSourceID.
+func SignalReceivedSourceID(conversationID, source string, receivedAt int64) string {
+	return "received:" + SignalIncomingSourceID(conversationID, source, receivedAt)
+}
+
 // SignalLocalAlias returns the migration remote-message key for a fabricated
 // local Signal message.
 func SignalLocalAlias(conversationID string, timestamp int64) string {

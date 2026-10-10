@@ -1390,14 +1390,17 @@ func signalSendAllRecipientsFailed(err error) bool {
 	return errors.As(err, &resultErr) && resultErr.allRecipientsFailed
 }
 
-// SendReactionRequest sends a reaction using only the durable request's remote
-// references. Unlike the legacy SendReaction path, it neither reads nor updates
-// locally stored message state.
+// SendReactionRequest sends a reaction using only the durable request's
+// description of its target. Unlike the legacy SendReaction path, it neither
+// reads nor updates locally stored message state. The target's author and
+// sent timestamp come from ReactionTargetArgs; a target it cannot name fails
+// before signal-cli runs.
 func (b *Bridge) SendReactionRequest(
-	conversationID, targetRemoteID, targetAuthorID, emoji, action string,
+	conversationID string,
+	target ReactionTarget,
+	emoji, action string,
 ) error {
-	targetRemoteID = strings.TrimSpace(targetRemoteID)
-	if targetRemoteID == "" {
+	if strings.TrimSpace(target.RemoteID) == "" {
 		return errors.New("signal target message is required")
 	}
 	emoji = strings.TrimSpace(emoji)
@@ -1417,19 +1420,16 @@ func (b *Bridge) SendReactionRequest(
 	if err != nil {
 		return err
 	}
-	targetAuthor := strings.TrimSpace(targetAuthorID)
-	if targetAuthor == "" {
-		// An empty author identifies a message sent by this account.
-		targetAuthor = account
+	targetArgs, err := ReactionTargetArgs(target, account)
+	if err != nil {
+		return err
 	}
 
-	args := []string{
+	args := append([]string{
 		"-a", account,
 		"sendReaction",
 		"-e", emoji,
-		"-a", targetAuthor,
-		"-t", targetRemoteID,
-	}
+	}, targetArgs...)
 	if action == "remove" {
 		args = append(args, "-r")
 	}

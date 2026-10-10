@@ -64,15 +64,20 @@ type ConversationRef struct {
 // read-receipt target, or the message a reply quotes. RemoteID is the
 // transport's identity for it. The dispatcher fills the other fields from the
 // stored message. AuthorID is the author's canonical identity. It is empty
-// when the stored message names no sender, which is always the case for a
-// message this account sent, and adapters read empty as this account. SentAt
-// is the message's occurred time. A zero
-// SentAt means the dispatcher had no stored message to describe (it does not
-// hold one under RemoteID, or the message is an outgoing one still waiting
-// for its transport ID), so only RemoteID is meaningful.
+// when the stored message names no sender. That is always the case for a
+// message this account sent, but an incoming message can lack a sender too
+// (the legacy Signal receiver stored group messages with no source, and the
+// legacy-primary mirror records none), so an empty AuthorID does not by itself
+// mean this account. Outgoing reports that this account sent the message.
+// SentAt is the message's occurred time. Reaction and read refs always
+// describe the message they name. A reply ref with a zero SentAt is
+// undescribed (the dispatcher holds no message under RemoteID, or the quoted
+// message is an outgoing one still on its outbox request ID), so only its
+// RemoteID is meaningful.
 type MessageRef struct {
 	RemoteID string
 	AuthorID string
+	Outgoing bool
 	SentAt   time.Time
 	// Text, HasAttachment and AttachmentMIME are filled for reply targets
 	// only. Text is the stored body. HasAttachment reports whether the message

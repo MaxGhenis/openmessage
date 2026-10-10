@@ -74,6 +74,43 @@ func LegacyQuoteArgsForTest(
 	return bridge.signalQuoteArgs(replyToID, account)
 }
 
+// NewConnectedBridgeForTest is a Bridge that reports account as paired and
+// connected, so the Signal adapter dispatches to it. Every signal-cli call goes
+// through runSignalCLI (see SetRunSignalCLIForTest); store is the legacy store
+// the retained legacy paths read.
+func NewConnectedBridgeForTest(
+	store *db.Store,
+	configDir string,
+	account string,
+	contactByACI map[string]string,
+) *Bridge {
+	if contactByACI == nil {
+		contactByACI = map[string]string{}
+	}
+	return &Bridge{
+		store:        store,
+		logger:       zerolog.Nop(),
+		configDir:    configDir,
+		account:      account,
+		connected:    true,
+		contactByACI: contactByACI,
+	}
+}
+
+// LegacySendReactionForTest runs the legacy reaction path (SendReaction, which
+// looks its target up in the legacy store by message ID) from a connected
+// bridge over store, with whatever runSignalCLI is installed.
+func LegacySendReactionForTest(
+	store *db.Store,
+	configDir string,
+	account string,
+	contactByACI map[string]string,
+	conversationID, messageID, emoji, action string,
+) error {
+	return NewConnectedBridgeForTest(store, configDir, account, contactByACI).
+		SendReaction(conversationID, messageID, emoji, action)
+}
+
 // ReplyQuoteArgsForTest is the quote SendTextRequest and SendMediaRequest
 // build for reply.
 func ReplyQuoteArgsForTest(

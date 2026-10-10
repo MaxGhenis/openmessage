@@ -1504,6 +1504,83 @@ Rules worth knowing when a quote looks wrong:
   target by its legacy ID (`signal:<ts>`) and records no sender or attachment.
   Such an ID still quotes from its legacy row when that row exists.
 
+### Signal reactions through the v2 outbox
+
+Signal names the message a reaction targets by its author and sent timestamp
+(`signal-cli sendReaction -a <author> -t <timestamp>`), never by an ID
+OpenMessage stores. The dispatcher (`messaging.targetRefForLease`) puts the
+target's sender, direction (`Outgoing`) and `occurred_at_ms` on the request's
+`bridge.MessageRef`, and `signallive.ReactionTargetArgs` sends a reaction only
+when the store vouches for both halves of that name:
+
+- **An incoming message** is named by its stored sender and `occurred_at_ms`,
+  and only when its remote ID is a SHA-1 (40 hex digits,
+  `v2keys.SignalIncomingSourceID`). That is the ID a Signal receiver gives a
+  message it keyed by sender and sent timestamp, and each writer that uses it
+  stores that timestamp as the occurred time: the v2 decoder, the legacy
+  receiver, and a Signal Desktop import of a row that has a sent time. The ID
+  itself is not sent.
+- **A message this account sent** is named by this account and its remote ID,
+  and only when that ID is a decimal timestamp. That is how a send Signal
+  accepted is stored when its timestamp was kept: an outbox confirm sets the ID
+  to the timestamp signal-cli reported, a sync message from the phone arrives
+  under its own, and the legacy `SendMedia` and legacy-primary projector keyed
+  their rows by signal-cli's. Its `occurred_at_ms` is not used. This is stricter than the
+  quote rule above, because a quote carries the quoted text with it and a
+  reaction carries nothing but the name.
+
+Anything else stops before signal-cli runs. The row goes `not_dispatched`
+(`error_class: transient`, `error_code: send_reaction` on
+`GET /api/v1/outbox/<id>`) and retries every 5 s with no cap. The reason is in
+the `error_detail` column of the `outbox` table in the v2 store:
+
+- `signal reaction target timestamp is unavailable`, for this account's own
+  message: its remote ID is not a Signal timestamp.
+  - *Still on its outbox request ID.* A pending send: the reaction goes out on
+    a retry once the send is confirmed. A canceled or failed send: never. An
+    uncertain one: not while it is unresolved. Also a send Signal accepted
+    whose local confirm failed (`store_failed`): the outbox row holds the
+    timestamp as its result, but the message is not moved to it until that
+    confirm is repaired (`RepairStoreFailed`).
+  - *A migrated `local:<sha1>` message.* The legacy `SendText` stamped its row
+    with the wall clock after signal-cli returned, not with Signal's
+    timestamp. The phone's own sends were stored under the same alias with the
+    right time, and nothing tells the two apart, so none of them can be
+    reacted to through the outbox.
+  - *A migrated scheduled send caught in `sending`*: imported under a derived
+    request ID with its creation time and no outbox row.
+- `signal reaction target timestamp is unavailable`, for an incoming message:
+  its remote ID is not a SHA-1, or it has no occurred time.
+  - *`received:<sha1>`*: a Signal Desktop row that had no sent time. The
+    importer stores it under the time it was received and marks its source ID
+    (`v2keys.SignalReceivedSourceID`).
+  - *`signal:<id>`*: a legacy ID the legacy-primary mirror kept.
+- `signal reaction target author is unavailable`: an incoming message stored
+  with no sender. The legacy receiver stored a group message with no source
+  that way, and the legacy-primary mirror (`v2wire.MirrorReplyTarget`) records
+  none.
+
+A reaction that can never be named keeps retrying until it is canceled
+(`POST /api/v1/outbox/<id>/cancel`).
+
+One gap remains that nothing can mark. Before the importer marked them, a
+Signal Desktop row with no sent time was stored under a plain SHA-1 of its
+received time. A re-import rewrites that source ID in the legacy store, but a
+v2 store migrated before then still holds the row under the unmarked hash,
+indistinguishable from a message keyed by its sent timestamp. A reaction to
+it names the received time.
+
+Before this the transport passed the v2 remote ID to `-t`. For a decoded
+incoming message that is a SHA-1. signal-cli 0.14.8 refuses a non-integer
+while parsing its arguments (`could not convert '<id>' to integer (64 bits)`,
+exit 1), and the row ended `uncertain` with nothing sent.
+
+No surface submits a reaction to the v2 outbox yet. The web UI's `/api/react`
+and the `react_to_message` MCP tool both call the legacy
+`signallive.Bridge.SendReaction`, which looks the target up in the legacy
+`messages.db` by message ID. Only `MessageService.SendReaction` (tests, so
+far) reaches the path above.
+
 ## Deploying a new build to a live install
 
 **`RELEASE=1` is required.** Without it `build.sh` stamps the dev bundle id

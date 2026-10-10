@@ -143,3 +143,50 @@ func TestSignalLocalAlias(t *testing.T) {
 		t.Fatalf("SignalLocalAlias() = %q, want %q", got, want)
 	}
 }
+
+func TestSignalReceivedSourceIDIsNotAnIncomingSourceID(t *testing.T) {
+	t.Parallel()
+
+	const conversation, source, when = "signal:+16505550100", "+16505550100", int64(1_700_000_001_000)
+	incoming := SignalIncomingSourceID(conversation, source, when)
+	if !IsSignalIncomingSourceID(incoming) {
+		t.Fatalf("IsSignalIncomingSourceID(%q) = false for SignalIncomingSourceID's own output", incoming)
+	}
+	received := SignalReceivedSourceID(conversation, source, when)
+	if want := "received:" + incoming; received != want {
+		t.Fatalf("SignalReceivedSourceID() = %q, want %q", received, want)
+	}
+	// The same message stored under a received time must never read as one
+	// keyed by its sent timestamp.
+	if IsSignalIncomingSourceID(received) {
+		t.Fatalf("IsSignalIncomingSourceID(%q) = true for a received-time ID", received)
+	}
+}
+
+func TestIsSignalIncomingSourceID(t *testing.T) {
+	t.Parallel()
+
+	sha := SignalIncomingSourceID("signal:+16505550100", "+16505550100", 1_700_000_001_000)
+	tests := []struct {
+		id   string
+		want bool
+	}{
+		{id: sha, want: true},
+		{id: "0000000000000000000000000000000000000000", want: true},
+		{id: "", want: false},
+		{id: sha[:39], want: false},
+		{id: sha + "0", want: false},
+		{id: " " + sha[1:], want: false},
+		{id: "A" + sha[1:], want: false},
+		{id: "g" + sha[1:], want: false},
+		{id: "1700000001000", want: false},
+		{id: "signal:1700000001000", want: false},
+		{id: SignalLocalAlias("signal:+16505550100", 1_700_000_001_000), want: false},
+		{id: DeriveID("transport_request", "signal-primary", "scheduled-1"), want: false},
+	}
+	for _, test := range tests {
+		if got := IsSignalIncomingSourceID(test.id); got != test.want {
+			t.Errorf("IsSignalIncomingSourceID(%q) = %v, want %v", test.id, got, test.want)
+		}
+	}
+}
