@@ -71,6 +71,27 @@ func (s *Store) MessageHasReadCursor(messageID string) (bool, error) {
 	return count > 0, nil
 }
 
+// MessageHasOpenSend reports whether an unfinished send (an outbox row not yet
+// confirmed, rejected or canceled) names the message as its local copy.
+// Dispatch and carry-over read that row inside the send's own conversation,
+// so it can't move to another conversation or be deleted while the send is
+// open.
+func (s *Store) MessageHasOpenSend(messageID string) (bool, error) {
+	var exists bool
+	if err := s.db.QueryRowContext(context.Background(), `
+		SELECT EXISTS (
+			SELECT 1 FROM outbox
+			WHERE local_message_id = ? AND state NOT IN `+closedOutboxStates+`
+		)
+	`, messageID).Scan(&exists); err != nil {
+		return false, fmt.Errorf("check open sends for message %q: %w", messageID, err)
+	}
+	return exists, nil
+}
+
+// closedOutboxStates are the terminal outbox states, as an SQL list.
+const closedOutboxStates = `('confirmed', 'rejected', 'canceled')`
+
 // SelfIdentityID returns one self identity for the account, if any.
 func (s *Store) SelfIdentityID(accountID string) (string, bool, error) {
 	var id string
@@ -105,9 +126,12 @@ type RepairParticipant struct {
 //	             displaced first
 //	move         move message MessageID to TargetConversationID with its
 //	             reactions and the reaction and read-receipt intents that
-//	             target it; refused while a read cursor names it
-//	delete       merge message MessageID into SurvivorMessageID, a copy of the
-//	             same message (see mergeDuplicateMessage), then delete it
+//	             target it; refused while a read cursor or an unfinished send
+//	             names it
+//	delete       merge message MessageID into SurvivorMessageID, a copy with
+//	             the same direction, sender, occurrence time and body (see
+//	             mergeDuplicateMessage), then delete it; refused while an
+//	             unfinished send names it
 //	rebind       bind RemoteConversationID to TargetConversationID, displacing any
 //	             other holder
 //	meta         set ConversationID's Title and replace its roster with Participants
@@ -302,6 +326,9 @@ func applyRepairMove(ctx context.Context, tx *sql.Tx, accountID string, step Rep
 			step.TargetConversationID,
 		)
 	}
+	if err := refuseOpenSend(ctx, tx, step.MessageID, step.TargetConversationID); err != nil {
+		return err
+	}
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE reactions SET conversation_id = ?, updated_at_ms = MAX(updated_at_ms, ?)
 		WHERE message_id = ?
@@ -339,6 +366,10 @@ func applyRepairDelete(
 	if err != nil || !inAccount {
 		return err
 	}
+	// Every conversation id is non-empty, so this refuses any open send.
+	if err := refuseOpenSend(ctx, tx, step.MessageID, ""); err != nil {
+		return err
+	}
 	survivorID := step.SurvivorMessageID
 	// Every hop lands on a message that existed when it was merged into, so
 	// the walk ends within len(mergedInto) hops.
@@ -348,6 +379,17 @@ func applyRepairDelete(
 			break
 		}
 		survivorID = next
+	}
+	duplicate, err := readMessageContent(ctx, tx, step.MessageID)
+	if err != nil {
+		return err
+	}
+	survivor, err := readMessageContent(ctx, tx, survivorID)
+	if err != nil {
+		return fmt.Errorf("read survivor %q: %w", survivorID, err)
+	}
+	if survivor != duplicate {
+		return fmt.Errorf("survivor %q holds different content than message %q", survivorID, step.MessageID)
 	}
 	if err := mergeDuplicateMessage(ctx, tx, step.MessageID, survivorID, nowMS); err != nil {
 		return err
@@ -359,6 +401,54 @@ func applyRepairDelete(
 	}
 	mergedInto[step.MessageID] = survivorID
 	return nil
+}
+
+// refuseOpenSend fails if an unfinished send names messageID as its local
+// copy and belongs to a conversation other than conversationID.
+func refuseOpenSend(ctx context.Context, tx *sql.Tx, messageID, conversationID string) error {
+	var outboxID, state string
+	err := tx.QueryRowContext(ctx, `
+		SELECT outbox_id, state FROM outbox
+		WHERE local_message_id = ? AND conversation_id <> ? AND state NOT IN `+closedOutboxStates+`
+		ORDER BY outbox_id
+		LIMIT 1
+	`, messageID, conversationID).Scan(&outboxID, &state)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return nil
+	case err != nil:
+		return fmt.Errorf("check open sends for message %q: %w", messageID, err)
+	default:
+		return fmt.Errorf(
+			"unfinished send %q (%s) names message %q as its local copy, and dispatch reads it in the send's own conversation",
+			outboxID,
+			state,
+			messageID,
+		)
+	}
+}
+
+// messageContent is what makes two rows the same message for a repair: the
+// planner's content key.
+type messageContent struct {
+	direction        string
+	senderIdentityID sql.NullString
+	occurredAtMS     int64
+	body             string
+}
+
+func readMessageContent(ctx context.Context, tx *sql.Tx, messageID string) (messageContent, error) {
+	var content messageContent
+	err := tx.QueryRowContext(ctx, `
+		SELECT direction, sender_identity_id, occurred_at_ms, body FROM messages WHERE message_id = ?
+	`, messageID).Scan(&content.direction, &content.senderIdentityID, &content.occurredAtMS, &content.body)
+	if errors.Is(err, sql.ErrNoRows) {
+		return messageContent{}, notFound("message", messageID)
+	}
+	if err != nil {
+		return messageContent{}, fmt.Errorf("read message %q: %w", messageID, err)
+	}
+	return content, nil
 }
 
 func messageInAccount(ctx context.Context, tx *sql.Tx, accountID, messageID string) (bool, error) {
