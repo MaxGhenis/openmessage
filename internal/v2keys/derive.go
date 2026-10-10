@@ -26,6 +26,15 @@ func DeriveID(entity, accountID, naturalKey string) string {
 	return hex.EncodeToString(sum[:])[:32]
 }
 
+// LocalInstallationDeviceID is the ID the migration mints for an account's
+// local installation device. Code that must create that device for an account
+// that has none uses it too, so a v2 store holds one ID shape whichever path
+// created the device. Code that reads the device resolves it by role
+// (sqlite.Store.GetLocalInstallationDevice), never by this ID.
+func LocalInstallationDeviceID(accountID string) string {
+	return DeriveID("device", accountID, accountID+"\x1flocal")
+}
+
 var signalACI = regexp.MustCompile(`(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 
 // IdentityKey classifies and canonicalizes a platform identity.

@@ -35,6 +35,7 @@ import (
 	"github.com/maxghenis/openmessage/internal/readsource"
 	"github.com/maxghenis/openmessage/internal/storage/sqlite"
 	"github.com/maxghenis/openmessage/internal/story"
+	"github.com/maxghenis/openmessage/internal/v2wire"
 	"github.com/maxghenis/openmessage/internal/whatsapplive"
 )
 
@@ -2348,14 +2349,24 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			httpError(w, "mark read: "+err.Error(), 500)
 			return
 		}
-		// The legacy mirror is the legacy-primary dual-write seam, like the
-		// /api/v1 send split on V2Primary. A v2-primary UI sends v2
-		// conversation ids, which the mirror cannot resolve against the
-		// legacy store, and a legacy id for a thread the v2 store lacks
-		// would add a legacy-keyed conversation row to the primary store.
-		if opts.V2 != nil && !opts.V2Primary {
+		// The v2 read cursor is best effort: a failure is logged and the
+		// response stays 200. It splits on V2Primary like the /api/v1 sends.
+		// The legacy mirror cannot resolve the v2 ids a v2-primary UI sends,
+		// and for a legacy id the v2 store lacks it would add a legacy-keyed
+		// conversation row to the primary store, so a v2-primary daemon
+		// writes the cursor natively. The write outlives a client that hangs
+		// up, like the legacy write above.
+		if opts.V2 != nil {
 			nowMS := time.Now().UnixMilli()
-			if err := mirrorV2ReadCursor(r.Context(), store, opts.V2.V2Store, req.ConversationID, nowMS); err != nil {
+			ctx := context.WithoutCancel(r.Context())
+			if opts.V2Primary {
+				if err := v2wire.MarkReadV2(ctx, opts.V2.V2Store, req.ConversationID, nowMS); err != nil {
+					logger.Warn().
+						Err(err).
+						Str("conv_id", req.ConversationID).
+						Msg("Failed to write v2 read cursor")
+				}
+			} else if err := mirrorV2ReadCursor(ctx, store, opts.V2.V2Store, req.ConversationID, nowMS); err != nil {
 				logger.Warn().
 					Err(err).
 					Str("conv_id", req.ConversationID).
