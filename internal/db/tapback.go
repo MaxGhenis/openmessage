@@ -82,19 +82,27 @@ func isTruncatedQuote(quoted string) bool {
 // regular message. It returns false (so the caller stores m normally) when m
 // isn't a tapback or no matching target message can be found.
 func (s *Store) ApplyTapback(m *Message) (bool, error) {
+	applied, _, err := s.ApplyTapbackChange(m)
+	return applied, err
+}
+
+// ApplyTapbackChange is ApplyTapback that also reports whether the target's
+// reactions changed; re-applying a tapback already reflected there is a
+// no-op (applied, unchanged) that writes nothing.
+func (s *Store) ApplyTapbackChange(m *Message) (applied, changed bool, err error) {
 	if m == nil {
-		return false, nil
+		return false, false, nil
 	}
 	tb, ok := ParseTapback(m.Body)
 	if !ok {
-		return false, nil
+		return false, false, nil
 	}
 	target, err := s.findTapbackTarget(m.ConversationID, tb.Quoted, m.TimestampMS, tb.Truncated)
 	if err != nil {
-		return false, err
+		return false, false, err
 	}
 	if target == nil {
-		return false, nil
+		return false, false, nil
 	}
 	actor := strings.TrimSpace(m.SenderNumber)
 	if m.IsFromMe {
@@ -104,14 +112,14 @@ func (s *Store) ApplyTapback(m *Message) (bool, error) {
 	}
 	next, changed, err := mergeReaction(target.Reactions, tb.Emoji, actor, tb.Remove)
 	if err != nil {
-		return false, err
+		return false, false, err
 	}
 	if changed {
 		if _, err := s.db.Exec(`UPDATE messages SET reactions = ? WHERE message_id = ?`, next, target.MessageID); err != nil {
-			return false, err
+			return false, false, err
 		}
 	}
-	return true, nil
+	return true, changed, nil
 }
 
 // findTapbackTarget locates the message a tapback refers to: the most recent

@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -61,12 +62,27 @@ func TestRepairLegacyMediaPlaceholders(t *testing.T) {
 		t.Fatalf("seed placeholder message: %v", err)
 	}
 
+	statsBefore, err := store.PlatformStats()
+	if err != nil {
+		t.Fatalf("PlatformStats(): %v", err)
+	}
+
 	result, err := (&WhatsAppNative{DBPath: dbPath}).RepairLegacyMediaPlaceholders(store)
 	if err != nil {
 		t.Fatalf("RepairLegacyMediaPlaceholders(): %v", err)
 	}
 	if result.MessagesRepaired != 1 {
 		t.Fatalf("MessagesRepaired = %d, want 1", result.MessagesRepaired)
+	}
+	// The repair edits rows it found in place and never moves a timestamp,
+	// so it cannot advance the legacy side of /api/status projection lag
+	// on a v2-primary install (#231 lets it run there again).
+	statsAfter, err := store.PlatformStats()
+	if err != nil {
+		t.Fatalf("PlatformStats(): %v", err)
+	}
+	if !reflect.DeepEqual(statsBefore, statsAfter) {
+		t.Fatalf("repair changed platform stats: %+v -> %+v", statsBefore, statsAfter)
 	}
 
 	msg, err := store.GetMessageByID("whatsapp:abc123")

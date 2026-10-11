@@ -117,6 +117,43 @@ func TestApplyTapback(t *testing.T) {
 	}
 }
 
+func TestApplyTapbackChangeReportsOnlyRealChanges(t *testing.T) {
+	store := newTestStore(t)
+	if err := store.UpsertMessage(&Message{MessageID: "m1", ConversationID: "c1", Body: "dinner at 7?", TimestampMS: 1000, IsFromMe: true}); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+	loved := &Message{ConversationID: "c1", SenderNumber: "+15551234567", Body: `Loved "dinner at 7?"`, TimestampMS: 2000}
+	removed := &Message{ConversationID: "c1", SenderNumber: "+15551234567", Body: `Removed a heart from "dinner at 7?"`, TimestampMS: 3000}
+
+	for i, step := range []struct {
+		m                     *Message
+		wantApplied, wantDiff bool
+		wantHeart             bool
+	}{
+		{m: loved, wantApplied: true, wantDiff: true, wantHeart: true},
+		{m: loved, wantApplied: true, wantDiff: false, wantHeart: true}, // replay: no write
+		{m: removed, wantApplied: true, wantDiff: true, wantHeart: false},
+		{m: removed, wantApplied: true, wantDiff: false, wantHeart: false},
+		{m: &Message{ConversationID: "c1", Body: `Liked "nothing"`, TimestampMS: 4000}},
+		{m: &Message{ConversationID: "c1", Body: "plain text", TimestampMS: 5000}},
+	} {
+		applied, changed, err := store.ApplyTapbackChange(step.m)
+		if err != nil {
+			t.Fatalf("step %d: %v", i, err)
+		}
+		if applied != step.wantApplied || changed != step.wantDiff {
+			t.Fatalf("step %d: applied=%v changed=%v, want %v %v", i, applied, changed, step.wantApplied, step.wantDiff)
+		}
+		if !step.wantApplied {
+			continue
+		}
+		target, _ := store.GetMessageByID("m1")
+		if got := strings.Contains(target.Reactions, "❤️"); got != step.wantHeart {
+			t.Fatalf("step %d: heart=%v (reactions %q), want %v", i, got, target.Reactions, step.wantHeart)
+		}
+	}
+}
+
 func TestRepairTapbacks(t *testing.T) {
 	store := newTestStore(t)
 	must := func(m *Message) {

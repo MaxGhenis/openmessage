@@ -21,14 +21,39 @@ const coreDataEpoch = 978307200
 
 // IMessage imports messages from the macOS Messages chat.db.
 // Requires Full Disk Access to read ~/Library/Messages/chat.db.
+//
+// An import writes only what the store lacks or holds differently: a message
+// already stored with the same conversation, sender, body, time and
+// direction is counted in MessagesDuplicate and not rewritten, and a chat is
+// upserted only when it is new to the store, differs from it, or one of its
+// messages was written. MessagesImported counts the messages written, new or
+// changed.
+// Tapbacks ("Loved “…”") become reactions on the message they quote, as
+// Store.RepairTapbacks does at startup, instead of standalone text rows.
 type IMessage struct {
 	// DBPath is the path to chat.db. Defaults to ~/Library/Messages/chat.db.
 	DBPath string
 	// MyName is the display name for outgoing messages (default "Me").
 	MyName string
+	// AfterRowID limits an import to chat.db messages whose ROWID is greater.
+	// Messages assigns ROWIDs in insertion order, so this also catches older
+	// messages that iCloud sync inserts late, which a date window would miss.
+	// An import that finishes without errors advances it to the highest ROWID
+	// it saw, so one IMessage reused across polls reads only what arrived
+	// since the last poll. Zero reads everything; a chat.db whose highest
+	// ROWID is below it (replaced, restored, or its newest rows deleted) is
+	// read in full again. An edit to an already-read row is picked up by the
+	// next full read, which a daemon does once per start.
+	AfterRowID int64
+
+	// The chat table's own high-water mark, valid while AfterRowID still
+	// holds the value this importer set (markedRowID): Messages can add a
+	// chat before it has any message, and a full read creates those too.
+	afterChatRowID int64
+	markedRowID    int64
 }
 
-// ImportFromDB reads the iMessage database and imports all messages.
+// ImportFromDB imports the chat.db messages after AfterRowID; see IMessage.
 func (im *IMessage) ImportFromDB(store *db.Store) (*ImportResult, error) {
 	dbPath := im.DBPath
 	if dbPath == "" {
@@ -43,10 +68,28 @@ func (im *IMessage) ImportFromDB(store *db.Store) (*ImportResult, error) {
 	defer chatDB.Close()
 	chatDB.SetMaxOpenConns(1)
 
-	result := &ImportResult{}
+	// Bound this import at the newest rows now present, so a message Messages
+	// writes while it runs is read by the next import, not half by this one.
+	var highWater, chatHighWater int64
+	if err := chatDB.QueryRow(`SELECT COALESCE((SELECT MAX(ROWID) FROM message), 0), COALESCE((SELECT MAX(ROWID) FROM chat), 0)`).Scan(&highWater, &chatHighWater); err != nil {
+		return nil, fmt.Errorf("read iMessage high-water mark: %w", err)
+	}
+	after := im.AfterRowID
+	if after < 0 || after > highWater {
+		after = 0
+	}
+	// -1: chats are selected by their messages alone.
+	afterChat := int64(-1)
+	if after > 0 && after == im.markedRowID {
+		afterChat = im.afterChatRowID
+	}
 
-	// Get all chats (conversations)
-	chats, err := im.loadChats(chatDB)
+	result := &ImportResult{}
+	if after > 0 && after == highWater && afterChat >= chatHighWater {
+		return result, nil
+	}
+
+	chats, err := im.loadChats(chatDB, after, highWater, afterChat, chatHighWater)
 	if err != nil {
 		return nil, fmt.Errorf("load chats: %w", err)
 	}
@@ -54,27 +97,14 @@ func (im *IMessage) ImportFromDB(store *db.Store) (*ImportResult, error) {
 	for _, chat := range chats {
 		convID := "imessage:" + chat.guid
 
-		participants, _ := json.Marshal(chat.participants)
-		if err := store.UpsertConversation(&db.Conversation{
-			ConversationID: convID,
-			Name:           chat.displayName,
-			IsGroup:        chat.isGroup,
-			Participants:   string(participants),
-			LastMessageTS:  chat.lastMessageTS,
-			SourcePlatform: "imessage",
-		}); err != nil {
-			result.Errors = append(result.Errors, fmt.Sprintf("conversation %s: %v", chat.guid, err))
-			continue
-		}
-		result.ConversationsCreated++
-
-		// Import messages for this chat
-		msgs, err := im.loadMessages(chatDB, chat.rowID)
+		msgs, err := im.loadMessages(chatDB, chat.rowID, after, highWater)
 		if err != nil {
 			result.Errors = append(result.Errors, fmt.Sprintf("messages for %s: %v", chat.guid, err))
 			continue
 		}
 
+		var writes []*db.Message
+		var tapbacks []*db.Message
 		for _, m := range msgs {
 			msg := &db.Message{
 				MessageID:      "imessage:" + m.guid,
@@ -88,20 +118,112 @@ func (im *IMessage) ImportFromDB(store *db.Store) (*ImportResult, error) {
 				SourcePlatform: "imessage",
 				SourceID:       m.guid,
 			}
+			existing, err := store.GetMessageByID(msg.MessageID)
+			if err != nil {
+				result.Errors = append(result.Errors, fmt.Sprintf("message %s: %v", m.guid, err))
+				continue
+			}
+			if existing != nil && sameIMessageRow(existing, msg) {
+				result.MessagesDuplicate++
+				continue
+			}
+			if existing == nil {
+				if _, ok := db.ParseTapback(msg.Body); ok {
+					tapbacks = append(tapbacks, msg)
+					continue
+				}
+			}
+			writes = append(writes, msg)
+		}
 
+		participants, _ := json.Marshal(chat.participants)
+		conv := &db.Conversation{
+			ConversationID: convID,
+			Name:           chat.displayName,
+			IsGroup:        chat.isGroup,
+			Participants:   string(participants),
+			LastMessageTS:  chat.lastMessageTS,
+			SourcePlatform: "imessage",
+		}
+		existingConv, _ := store.GetConversation(convID)
+		if existingConv == nil || !sameIMessageConversation(existingConv, conv) || len(writes) > 0 || len(tapbacks) > 0 {
+			if err := store.UpsertConversation(conv); err != nil {
+				result.Errors = append(result.Errors, fmt.Sprintf("conversation %s: %v", chat.guid, err))
+				continue
+			}
+			if existingConv == nil {
+				result.ConversationsCreated++
+			}
+		}
+
+		// Messages are loaded oldest first; a tapback is applied after every
+		// message of its batch is stored, so it finds a target that arrived
+		// in the same import, and in order, so a later removal wins.
+		for _, msg := range writes {
 			if err := store.UpsertMessage(msg); err != nil {
 				if strings.Contains(err.Error(), "UNIQUE constraint") {
 					result.MessagesDuplicate++
 				} else {
-					result.Errors = append(result.Errors, fmt.Sprintf("message %s: %v", m.guid, err))
+					result.Errors = append(result.Errors, fmt.Sprintf("message %s: %v", msg.SourceID, err))
 				}
+				continue
+			}
+			result.MessagesImported++
+		}
+		for _, msg := range tapbacks {
+			applied, changed, err := store.ApplyTapbackChange(msg)
+			if err != nil {
+				result.Errors = append(result.Errors, fmt.Sprintf("tapback %s: %v", msg.SourceID, err))
+				continue
+			}
+			if applied {
+				if changed {
+					result.MessagesImported++
+				} else {
+					result.MessagesDuplicate++
+				}
+				continue
+			}
+			// No target yet: keep it as text, as every other path does;
+			// RepairTapbacks converts it once its target is stored.
+			if err := store.UpsertMessage(msg); err != nil {
+				result.Errors = append(result.Errors, fmt.Sprintf("message %s: %v", msg.SourceID, err))
 				continue
 			}
 			result.MessagesImported++
 		}
 	}
 
+	if len(result.Errors) == 0 {
+		im.AfterRowID = highWater
+		im.markedRowID = highWater
+		im.afterChatRowID = chatHighWater
+	}
 	return result, nil
+}
+
+// sameIMessageConversation reports whether a stored chat already holds every
+// field an import writes. A chat's last_message_ts counts every message in
+// it, including ones without text that import nothing.
+func sameIMessageConversation(existing, conv *db.Conversation) bool {
+	return existing.Name == conv.Name &&
+		existing.IsGroup == conv.IsGroup &&
+		existing.Participants == conv.Participants &&
+		existing.LastMessageTS == conv.LastMessageTS &&
+		existing.SourcePlatform == conv.SourcePlatform
+}
+
+// sameIMessageRow reports whether a stored row already holds everything an
+// import would write for msg, so writing it again would change nothing.
+func sameIMessageRow(existing, msg *db.Message) bool {
+	return existing.ConversationID == msg.ConversationID &&
+		existing.Body == msg.Body &&
+		existing.TimestampMS == msg.TimestampMS &&
+		existing.IsFromMe == msg.IsFromMe &&
+		existing.SenderName == msg.SenderName &&
+		existing.SenderNumber == msg.SenderNumber &&
+		existing.SourcePlatform == msg.SourcePlatform &&
+		existing.SourceID == msg.SourceID
 }
 
 type imessageChat struct {
@@ -122,21 +244,33 @@ type imessageMessage struct {
 	isFromMe    bool
 }
 
-func (im *IMessage) loadChats(chatDB *sql.DB) ([]imessageChat, error) {
+// loadChats returns every chat when after is 0, else the chats with a message
+// whose ROWID is in (after, upTo] and, when afterChat is not -1, the chats
+// whose own ROWID is in (afterChat, chatUpTo].
+func (im *IMessage) loadChats(chatDB *sql.DB, after, upTo, afterChat, chatUpTo int64) ([]imessageChat, error) {
 	rows, err := chatDB.Query(`
-		SELECT c.ROWID, c.guid, c.display_name, c.style,
+		SELECT c.ROWID, c.guid, COALESCE(c.display_name, ''), c.style,
 			COALESCE(MAX(m.date), 0) as last_date
 		FROM chat c
 		LEFT JOIN chat_message_join cmj ON c.ROWID = cmj.chat_id
 		LEFT JOIN message m ON cmj.message_id = m.ROWID
+		WHERE ? = 0
+			OR c.ROWID IN (
+				SELECT chat_id FROM chat_message_join WHERE message_id > ? AND message_id <= ?
+			)
+			OR (? >= 0 AND c.ROWID > ? AND c.ROWID <= ?)
 		GROUP BY c.ROWID
 		ORDER BY last_date DESC
-	`)
+	`, after, after, upTo, afterChat, afterChat, chatUpTo)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
+	// Collect every row before loading participants: ImportFromDB holds one
+	// connection (MaxOpenConns=1), so a query issued while these rows are open
+	// waits forever. It did, from 2026-02-22 until this fix, on any chat.db
+	// with a chat; the sandbox flag kept the daemon from reaching it.
 	var chats []imessageChat
 	for rows.Next() {
 		var c imessageChat
@@ -147,8 +281,15 @@ func (im *IMessage) loadChats(chatDB *sql.DB) ([]imessageChat, error) {
 		}
 		c.isGroup = style == 43 // iMessage group chat style
 		c.lastMessageTS = coreDataToMS(lastDate)
+		chats = append(chats, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	rows.Close()
 
-		// Load participants
+	for i := range chats {
+		c := &chats[i]
 		c.participants = im.loadChatParticipants(chatDB, c.rowID)
 
 		// Derive name if empty
@@ -163,10 +304,8 @@ func (im *IMessage) loadChats(chatDB *sql.DB) ([]imessageChat, error) {
 			}
 			c.displayName = strings.Join(names, ", ")
 		}
-
-		chats = append(chats, c)
 	}
-	return chats, rows.Err()
+	return chats, nil
 }
 
 func (im *IMessage) loadChatParticipants(chatDB *sql.DB, chatRowID int) []map[string]string {
@@ -195,7 +334,9 @@ func (im *IMessage) loadChatParticipants(chatDB *sql.DB, chatRowID int) []map[st
 	return participants
 }
 
-func (im *IMessage) loadMessages(chatDB *sql.DB, chatRowID int) ([]imessageMessage, error) {
+// loadMessages returns a chat's messages whose ROWID is in (after, upTo],
+// oldest first.
+func (im *IMessage) loadMessages(chatDB *sql.DB, chatRowID int, after, upTo int64) ([]imessageMessage, error) {
 	rows, err := chatDB.Query(`
 		SELECT m.guid, COALESCE(m.text, ''), m.attributedBody, m.date, m.is_from_me,
 			COALESCE(h.id, '') as handle_id,
@@ -203,9 +344,9 @@ func (im *IMessage) loadMessages(chatDB *sql.DB, chatRowID int) ([]imessageMessa
 		FROM message m
 		JOIN chat_message_join cmj ON m.ROWID = cmj.message_id
 		LEFT JOIN handle h ON m.handle_id = h.ROWID
-		WHERE cmj.chat_id = ?
-		ORDER BY m.date ASC
-	`, chatRowID)
+		WHERE cmj.chat_id = ? AND m.ROWID > ? AND m.ROWID <= ?
+		ORDER BY m.date ASC, m.ROWID ASC
+	`, chatRowID, after, upTo)
 	if err != nil {
 		return nil, err
 	}
