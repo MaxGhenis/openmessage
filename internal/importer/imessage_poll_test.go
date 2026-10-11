@@ -688,6 +688,40 @@ func TestIMessageHandleAndChatRowsArrivingLate(t *testing.T) {
 	requireMatchesFullImport(t, "late handle and chat rows", path, chat)
 }
 
+// Deleting an iMessage conversation in OpenMessage deletes its messages. A
+// full read brings both back (chat.db still has them), so the next poll
+// does too, with the chat's newest message, not 0.
+func TestIMessageConversationDeletedFromTheStoreComesBack(t *testing.T) {
+	chat := newNativeChatDB(t)
+	h := chat.addHandle("+15550000001")
+	a := chat.addChat("A", strPtr("A"), false, h)
+	b := chat.addChat("B", strPtr("B"), false, h)
+	chat.message(a, "a1", "in A", at(3*time.Hour), false, h)
+	chat.message(a, "a2", "newest in A", at(2*time.Hour), false, h)
+	chat.message(b, "b1", "in B", at(time.Hour), false, h)
+	store, path := newIMessageStore(t)
+	poller := newPoller(chat.path)
+	runImport(t, poller, store)
+	if err := store.DeleteConversation("imessage:A"); err != nil {
+		t.Fatal(err)
+	}
+	chat.message(b, "b2", "another in B", at(30*time.Minute), false, h) // any chat.db write
+	runImport(t, poller, store)
+	if poller.last.full {
+		t.Fatalf("a deleted conversation forced a full read (%s)", poller.last.fullReason)
+	}
+	conv, err := store.GetConversation("imessage:A")
+	if err != nil || conv.LastMessageTS != at(2*time.Hour)*1000 {
+		t.Fatalf("restored conversation = %+v, %v", conv, err)
+	}
+	for _, id := range []string{"imessage:a1", "imessage:a2"} {
+		if m, _ := store.GetMessageByID(id); m == nil {
+			t.Fatalf("%s not restored", id)
+		}
+	}
+	requireMatchesFullImport(t, "restored conversation", path, chat)
+}
+
 // A row whose write fails is retried by the next poll even when chat.db has
 // not changed since; the marks still advance past it.
 func TestIMessageRetriesFailedRows(t *testing.T) {

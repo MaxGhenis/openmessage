@@ -392,6 +392,12 @@ func TestRepairTapbacksLeavesIMessageRows(t *testing.T) {
 		// An SMS tapback inside an iMessage conversation must not react to
 		// the iMessage row either.
 		{MessageID: "sms:mixed", ConversationID: "imessage:c", Body: "Liked “hello”", TimestampMS: 30, SenderNumber: "+2", SourcePlatform: "sms"},
+		// Each guard alone: an iMessage-platform row without the id prefix,
+		// and a pre-migration iMessage row (platform defaulted to sms).
+		{MessageID: "x-target", ConversationID: "imessage:d", Body: "yo", TimestampMS: 10, SourcePlatform: "imessage"},
+		{MessageID: "x-typed", ConversationID: "imessage:d", Body: "Loved “yo”", TimestampMS: 20, IsFromMe: true, SourcePlatform: "imessage"},
+		{MessageID: "imessage:old-target", ConversationID: "imessage:e", Body: "hey", TimestampMS: 10, SourcePlatform: "sms"},
+		{MessageID: "imessage:old-typed", ConversationID: "imessage:e", Body: "Loved “hey”", TimestampMS: 20, IsFromMe: true, SourcePlatform: "sms"},
 	} {
 		if err := s.UpsertMessage(m); err != nil {
 			t.Fatal(err)
@@ -412,5 +418,10 @@ func TestRepairTapbacksLeavesIMessageRows(t *testing.T) {
 	}
 	if m, _ := s.GetMessageByID("sms:mixed"); m == nil {
 		t.Fatal("unmatched SMS tapback deleted")
+	}
+	for _, id := range []string{"x-typed", "imessage:old-typed"} {
+		if m, _ := s.GetMessageByID(id); m == nil {
+			t.Fatalf("%s converted", id)
+		}
 	}
 }

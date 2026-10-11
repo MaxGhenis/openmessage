@@ -414,6 +414,11 @@ func (im *IMessage) read(store *db.Store, dataVersion int64, fullReason string, 
 		plan.chatOf["imessage:"+chats[i].guid] = chats[i].rowID
 	}
 
+	storedConvs, err := store.IMessageConversations()
+	if err != nil {
+		return nil, fmt.Errorf("read stored iMessage conversations: %w", err)
+	}
+
 	// rows: the message rows to reconcile. lastTSChats: chats whose newest
 	// message must be recomputed.
 	rows := map[int64]*msgRow{}
@@ -464,7 +469,12 @@ func (im *IMessage) read(store *db.Store, dataVersion int64, fullReason string, 
 			}
 		}
 		for _, c := range chats {
-			if _, ok := im.marks.chatGUIDs[c.rowID]; !ok {
+			_, known := im.marks.chatGUIDs[c.rowID]
+			_, stored := storedConvs["imessage:"+c.guid]
+			// A chat whose conversation another writer deleted from the store
+			// (deleting a conversation deletes its messages) is restored whole,
+			// as a full read would.
+			if !known || !stored {
 				newChats = append(newChats, c.rowID)
 				lastTSChats[c.rowID] = struct{}{}
 			}
@@ -538,10 +548,6 @@ func (im *IMessage) read(store *db.Store, dataVersion int64, fullReason string, 
 	}
 	if err != nil {
 		return nil, fmt.Errorf("read stored iMessage rows: %w", err)
-	}
-	storedConvs, err := store.IMessageConversations()
-	if err != nil {
-		return nil, fmt.Errorf("read stored iMessage conversations: %w", err)
 	}
 	for _, c := range chats {
 		if _, ok := storedConvs["imessage:"+c.guid]; !ok {
