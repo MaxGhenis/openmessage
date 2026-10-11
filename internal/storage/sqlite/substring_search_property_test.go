@@ -151,7 +151,7 @@ func TestSearchMessagesMatchesLikeProperty(t *testing.T) {
 				return false
 			}
 			// The recent window alone, when it claims to be complete, is the answer.
-			recent, complete, err := repository.searchRecentMessages(context.Background(), query, normalized, window)
+			recent, complete, err := searchRecentMessages(context.Background(), s.store.db, query, normalized, window)
 			if err != nil {
 				t.Fatalf("searchRecentMessages(%q, %+v, %d): %v", query, normalized, window, err)
 			}
@@ -238,10 +238,30 @@ func TestSearchConversationsByNameMatchesLikeProperty(t *testing.T) {
 // conversations), REPLACE (a delete and an insert), deletes, and deletes of a
 // conversation that cascade to its messages and roster.
 func TestSearchIndexesEqualTablesAfterRandomWritesProperty(t *testing.T) {
+	// touched counts, per write shape, the writes that changed at least one
+	// row, so the property cannot pass on writes that selected nothing.
+	touched := map[int]int{}
+	defer func() {
+		for op := range 11 {
+			if !t.Failed() && touched[op] == 0 {
+				t.Errorf("write shape %d never changed a row (touched: %v)", op, touched)
+			}
+		}
+	}()
 	property := func(c readPlanStore) bool {
 		s := seedReadStore(t, c.Seed)
 		r := rand.New(rand.NewSource(c.Seed ^ 0x3417e5))
 		db := s.store.db
+		write := func(op int, statement string, args ...any) {
+			t.Helper()
+			result, err := db.Exec(statement, args...)
+			if err != nil {
+				t.Fatalf("write shape %d: %v\n%s", op, err, statement)
+			}
+			if n, err := result.RowsAffected(); err == nil && n > 0 {
+				touched[op]++
+			}
+		}
 		// Read cursors and outbox rows point at messages; they play no part in
 		// search, and clearing them lets any message or conversation be deleted.
 		mustExec(t, db, `DELETE FROM read_cursors`)
@@ -286,7 +306,7 @@ func TestSearchIndexesEqualTablesAfterRandomWritesProperty(t *testing.T) {
 			op := r.Intn(11)
 			switch op {
 			case 0, 1:
-				mustExec(t, db, `INSERT INTO messages (message_id, conversation_id, account_id, remote_message_id, direction, body, occurred_at_ms, created_at_ms, updated_at_ms)
+				write(op, `INSERT INTO messages (message_id, conversation_id, account_id, remote_message_id, direction, body, occurred_at_ms, created_at_ms, updated_at_ms)
 					VALUES (?, ?, ?, ?, 'incoming', ?, ?, 1, 1)`, messageID, conversation, account, "remote-"+messageID, text(), 1+r.Intn(8))
 			case 2:
 				// The projection upsert: same natural key, new or unchanged body.
@@ -294,30 +314,30 @@ func TestSearchIndexesEqualTablesAfterRandomWritesProperty(t *testing.T) {
 				if r.Intn(2) == 0 {
 					body = "unchanged"
 				}
-				mustExec(t, db, `INSERT INTO messages (message_id, conversation_id, account_id, remote_message_id, direction, body, occurred_at_ms, created_at_ms, updated_at_ms)
+				write(op, `INSERT INTO messages (message_id, conversation_id, account_id, remote_message_id, direction, body, occurred_at_ms, created_at_ms, updated_at_ms)
 					SELECT ?, conversation_id, account_id, remote_message_id, direction, ?, occurred_at_ms, 1, 1 FROM messages WHERE message_id = `+anyMessage+`
 					ON CONFLICT(account_id, conversation_id, remote_message_id) DO UPDATE SET body = excluded.body
 					WHERE messages.body IS NOT excluded.body`, messageID, body, offset)
 			case 3:
-				mustExec(t, db, `UPDATE messages SET body = ?, state = 'edited' WHERE message_id = `+anyMessage, text(), offset)
+				write(op, `UPDATE messages SET body = ?, state = 'edited' WHERE message_id = `+anyMessage, text(), offset)
 			case 4:
-				mustExec(t, db, `UPDATE messages SET state = 'deleted', updated_at_ms = updated_at_ms + 1 WHERE message_id = `+anyMessage, offset)
+				write(op, `UPDATE messages SET state = 'deleted', updated_at_ms = updated_at_ms + 1 WHERE message_id = `+anyMessage, offset)
 			case 5:
-				mustExec(t, db, `UPDATE messages SET conversation_id = ? WHERE message_id = `+anyMessage+` AND account_id = ?`, conversation, offset, account)
+				write(op, `UPDATE messages SET conversation_id = ? WHERE message_id = `+anyMessage+` AND account_id = ?`, conversation, offset, account)
 			case 6:
-				mustExec(t, db, `REPLACE INTO messages (message_id, conversation_id, account_id, remote_message_id, direction, body, occurred_at_ms, created_at_ms, updated_at_ms)
+				write(op, `REPLACE INTO messages (message_id, conversation_id, account_id, remote_message_id, direction, body, occurred_at_ms, created_at_ms, updated_at_ms)
 					SELECT message_id, conversation_id, account_id, remote_message_id, direction, ?, occurred_at_ms, created_at_ms, updated_at_ms
 					FROM messages WHERE message_id = `+anyMessage, text(), offset)
 			case 7:
-				mustExec(t, db, `DELETE FROM messages WHERE message_id = `+anyMessage, offset)
+				write(op, `DELETE FROM messages WHERE message_id = `+anyMessage, offset)
 			case 8:
-				mustExec(t, db, `UPDATE conversations SET title = ?, last_message_at_ms = last_message_at_ms + 1 WHERE conversation_id = ?`, text(), conversation)
-				mustExec(t, db, `UPDATE conversation_participants SET display_name = ? WHERE conversation_id = ?`, text(), conversation)
+				write(op, `UPDATE conversations SET title = ?, last_message_at_ms = last_message_at_ms + 1 WHERE conversation_id = ?`, text(), conversation)
+				write(op, `UPDATE conversation_participants SET display_name = ? WHERE conversation_id = ?`, text(), conversation)
 			case 9:
-				mustExec(t, db, `UPDATE identities SET display_name = ? WHERE account_id = ? AND is_self = 0`, text(), account)
+				write(op, `UPDATE identities SET display_name = ? WHERE account_id = ? AND is_self = 0`, text(), account)
 			case 10:
 				if r.Intn(3) == 0 {
-					mustExec(t, db, `DELETE FROM conversations WHERE conversation_id = ?`, conversation)
+					write(op, `DELETE FROM conversations WHERE conversation_id = ?`, conversation)
 				}
 			}
 			// Checking after every write names the statement that broke an index.

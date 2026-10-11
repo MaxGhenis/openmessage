@@ -422,31 +422,45 @@ final class BackendManager: ObservableObject {
         healthyResetTask = nil
     }
 
-    /// Poll /api/status until the backend is ready.
+    /// How long to wait for a starting backend; see `BackendStartupWait`.
+    private static let startupWait = BackendStartupWait()
+
+    /// Poll /api/status until the backend is ready. Past the grace period the
+    /// wait continues while the backend process is alive, since it may still
+    /// be applying store migrations before it listens.
     private func startHealthCheck() {
         healthCheckTask = Task {
-            for attempt in 1...60 {
-                if Task.isCancelled { return }
-                try? await Task.sleep(for: .milliseconds(500))
-                do {
-                    let url = baseURL.appendingPathComponent("api/status")
-                    let (data, response) = try await URLSession.shared.data(from: url)
-                    if let http = response as? HTTPURLResponse, http.statusCode == 200,
-                       let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                        _ = json
-                        self.state = .running
-                        self.logger.info("Backend ready after \(attempt) checks")
-                        self.scheduleRestartBudgetReset()
-                        self.startConnectionMonitor()
-                        return
-                    }
-                } catch {
-                    self.logger.debug("Health check \(attempt): \(error)")
+            let outcome = await Self.startupWait.poll(
+                probe: { await self.backendAnswersStatus() },
+                processAlive: { !self.backendProcessIsDead() },
+                onSlowStart: { attempt in
+                    self.logger.warning("Backend not ready after \(attempt) checks but its process is alive (it may be applying store migrations); still waiting")
                 }
+            )
+            switch outcome {
+            case .ready(let attempt):
+                self.state = .running
+                self.logger.info("Backend ready after \(attempt) checks")
+                self.scheduleRestartBudgetReset()
+                self.startConnectionMonitor()
+            case .gaveUp(let message):
+                self.state = .error(message)
+            case .cancelled:
+                return
             }
-            if !Task.isCancelled {
-                self.state = .error("Backend failed to start within 30 seconds")
-            }
+        }
+    }
+
+    /// Whether /api/status answers 200 with a JSON object.
+    private func backendAnswersStatus() async -> Bool {
+        do {
+            let url = baseURL.appendingPathComponent("api/status")
+            let (data, response) = try await URLSession.shared.data(from: url)
+            guard let http = response as? HTTPURLResponse, http.statusCode == 200 else { return false }
+            return (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) != nil
+        } catch {
+            logger.debug("Health check: \(error)")
+            return false
         }
     }
 

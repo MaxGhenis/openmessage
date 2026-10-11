@@ -719,3 +719,63 @@ func TestSearchMessagesChoosesItsPath(t *testing.T) {
 		})
 	}
 }
+
+// TestSearchMessagesWindowAndCountShareASnapshot pins the read transaction
+// around a search. The window of the three newest messages holds no match, so
+// the search counts the range to learn whether the window was all of it. A
+// writer deletes two of those messages in between. Read outside one snapshot,
+// the count would find a range smaller than the window and return the empty
+// window as the complete answer, missing the oldest message, which matches.
+func TestSearchMessagesWindowAndCountShareASnapshot(t *testing.T) {
+	ctx := context.Background()
+	store := openRepositoryTestStore(t)
+	repository := mustMessageRepository(t, store, 100)
+	db := store.db
+	mustExec(t, db, `INSERT INTO accounts (account_id, bridge_key, created_at_ms, updated_at_ms) VALUES ('account-a', 'signal_cli', 1, 1)`)
+	mustExec(t, db, `INSERT INTO conversations (conversation_id, account_id, remote_conversation_id, kind, created_at_ms, updated_at_ms) VALUES ('conversation-a', 'account-a', 'remote-a', 'direct', 1, 1)`)
+	for i, body := range []string{"the rare one", "filler", "filler", "filler"} {
+		mustExec(t, db, `INSERT INTO messages (message_id, conversation_id, account_id, remote_message_id, direction, body, occurred_at_ms, created_at_ms, updated_at_ms)
+			VALUES (?, 'conversation-a', 'account-a', ?, 'incoming', ?, ?, 1, 1)`,
+			fmt.Sprintf("message-%d", i), fmt.Sprintf("remote-%d", i), body, 100+i)
+	}
+	deleted := false
+	testHookAfterRecentWindow = func() {
+		// Another connection of the pool: a concurrent writer.
+		mustExec(t, db, `DELETE FROM messages WHERE message_id IN ('message-2', 'message-3')`)
+		deleted = true
+	}
+	t.Cleanup(func() { testHookAfterRecentWindow = nil })
+
+	got, path, err := repository.searchMessages(ctx, "rare", SearchQuery{Limit: 5}, 3)
+	if err != nil {
+		t.Fatalf("searchMessages(): %v", err)
+	}
+	if !deleted {
+		t.Fatal("the hook never ran: the window answered before counting")
+	}
+	if ids := messageIDs(got); !slices.Equal(ids, []string{"message-0"}) || path != searchPathTrigramIndex {
+		t.Fatalf("search = %v via %s, want [message-0] via %s (the window must not be taken as complete)", ids, path, searchPathTrigramIndex)
+	}
+}
+
+// TestSearchIndexesFollowReplace replaces a message whose body changes, the
+// write shape that skips delete triggers unless recursive triggers are on.
+func TestSearchIndexesFollowReplace(t *testing.T) {
+	store := openRepositoryTestStore(t)
+	db := store.db
+	mustExec(t, db, `INSERT INTO accounts (account_id, bridge_key, created_at_ms, updated_at_ms) VALUES ('account-a', 'signal_cli', 1, 1)`)
+	mustExec(t, db, `INSERT INTO conversations (conversation_id, account_id, remote_conversation_id, kind, created_at_ms, updated_at_ms) VALUES ('conversation-a', 'account-a', 'remote-a', 'direct', 1, 1)`)
+	mustExec(t, db, `INSERT INTO messages (message_id, conversation_id, account_id, remote_message_id, direction, body, occurred_at_ms, created_at_ms, updated_at_ms)
+		VALUES ('message-a', 'conversation-a', 'account-a', 'remote-a', 'incoming', 'original wording', 10, 1, 1)`)
+	mustExec(t, db, `REPLACE INTO messages (message_id, conversation_id, account_id, remote_message_id, direction, body, occurred_at_ms, created_at_ms, updated_at_ms)
+		VALUES ('message-a', 'conversation-a', 'account-a', 'remote-a', 'incoming', 'replacement text', 10, 1, 1)`)
+	if err := store.VerifySearchIndexes(context.Background()); err != nil {
+		t.Fatalf("VerifySearchIndexes() after REPLACE: %v", err)
+	}
+	if got := assertMessageSearchMatchesLike(t, db, "original", SearchQuery{Limit: 5}); len(got) != 0 {
+		t.Fatalf("the replaced body is still found: %v", got)
+	}
+	if got := assertMessageSearchMatchesLike(t, db, "replacement", SearchQuery{Limit: 5}); !slices.Equal(got, []string{"message-a"}) {
+		t.Fatalf("the new body is not found: %v", got)
+	}
+}

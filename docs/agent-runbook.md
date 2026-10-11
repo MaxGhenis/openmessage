@@ -97,7 +97,10 @@ when the upgraded app starts, before its v2 stack exists: 1.7 to 3.2 s on
 copies of Max's store (72k messages, depending on machine load), 13 s for 10x
 the history and 47 s at 30x. Only the app's daemon (and `repair`/cutover)
 migrates the store; until it has, the CLI and the MCP client refuse the store
-(see "MCP serving" and "Deploying a new build" below).
+(see "MCP serving" and "Deploying a new build" below). The app waits for the
+backend while its process is alive, up to 10 minutes rather than a flat 30 s,
+and logs `Backend not ready after N checks but its process is alive` when a
+start runs past 30 s.
 
 ### Message JSON field names — the epoch-0 trap
 

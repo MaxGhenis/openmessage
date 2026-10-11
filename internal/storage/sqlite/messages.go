@@ -508,6 +508,12 @@ const (
 
 // searchMessages is SearchMessages with the window as a parameter, so tests
 // can reach every path on small stores, and reports the path that answered.
+//
+// Every statement runs in one read-only (deferred) transaction, so the
+// window, its row count and the whole-scope search see one snapshot. Read
+// separately, a write landing between the window and its count could shrink
+// the range below the window and pass off a window that missed older matches
+// as complete.
 func (r *MessageRepository) searchMessages(
 	ctx context.Context,
 	query string,
@@ -521,8 +527,31 @@ func (r *MessageRepository) searchMessages(
 		filter.SinceMS, filter.UntilMS = filter.UntilMS, filter.SinceMS
 	}
 
+	tx, err := r.store.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return nil, "", fmt.Errorf("search messages: begin read: %w", err)
+	}
+	defer tx.Rollback()
+
+	messages, path, err := searchMessagesIn(ctx, tx, query, filter, window)
+	if err != nil {
+		return nil, "", err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, "", fmt.Errorf("search messages: end read: %w", err)
+	}
+	return messages, path, nil
+}
+
+func searchMessagesIn(
+	ctx context.Context,
+	tx searchQuerier,
+	query string,
+	filter SearchQuery,
+	window int,
+) ([]Message, searchPath, error) {
 	if query != "" && !indexBoundedSearch(filter) {
-		messages, complete, err := r.searchRecentMessages(ctx, query, filter, window)
+		messages, complete, err := searchRecentMessages(ctx, tx, query, filter, window)
 		if err != nil {
 			return nil, "", err
 		}
@@ -535,12 +564,19 @@ func (r *MessageRepository) searchMessages(
 		path = searchPathTrigramIndex
 	}
 	statement, args := searchMessagesStatement(query, filter)
-	messages, err := r.queryMessages(ctx, statement, args)
+	messages, err := queryMessageRows(ctx, tx, statement, args)
 	return messages, path, err
 }
 
-func (r *MessageRepository) queryMessages(ctx context.Context, statement string, args []any) ([]Message, error) {
-	rows, err := r.store.db.QueryContext(ctx, statement, args...)
+// searchQuerier is what a search reads through: the read transaction, or in
+// tests the store itself.
+type searchQuerier interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+func queryMessageRows(ctx context.Context, q searchQuerier, statement string, args []any) ([]Message, error) {
+	rows, err := q.QueryContext(ctx, statement, args...)
 	if err != nil {
 		return nil, fmt.Errorf("search messages: %w", err)
 	}
@@ -551,6 +587,10 @@ func (r *MessageRepository) queryMessages(ctx context.Context, statement string,
 	return messages, nil
 }
 
+// testHookAfterRecentWindow, when a test sets it, runs between the window read
+// and its count: the moment a concurrent write could change the range.
+var testHookAfterRecentWindow func()
+
 // searchRecentMessages applies the search to a window: the newest window
 // messages, within the date range if any, read from messages_time_idx. The
 // other filters and the LIKE then apply to the window's rows, read newest
@@ -558,24 +598,29 @@ func (r *MessageRepository) queryMessages(ctx context.Context, statement string,
 // scope's rows within it are the scope's newest rows. complete reports that
 // the result is the whole answer: either it holds limit matches, which are then
 // the scope's newest limit matches; or the range held fewer than window rows,
-// so the window was all of it.
-func (r *MessageRepository) searchRecentMessages(
+// so the window was all of it. The two reads must share a snapshot (q is a
+// read transaction in production).
+func searchRecentMessages(
 	ctx context.Context,
+	q searchQuerier,
 	query string,
 	filter SearchQuery,
 	window int,
 ) (messages []Message, complete bool, err error) {
 	statement, args := recentSearchMessagesStatement(query, filter, window)
-	messages, err = r.queryMessages(ctx, statement, args)
+	messages, err = queryMessageRows(ctx, q, statement, args)
 	if err != nil {
 		return nil, false, fmt.Errorf("recent window: %w", err)
 	}
 	if len(messages) >= filter.Limit {
 		return messages, true, nil
 	}
+	if testHookAfterRecentWindow != nil {
+		testHookAfterRecentWindow()
+	}
 	statement, args = recentWindowCountStatement(filter, window)
 	var inRange int
-	if err := r.store.db.QueryRowContext(ctx, statement, args...).Scan(&inRange); err != nil {
+	if err := q.QueryRowContext(ctx, statement, args...).Scan(&inRange); err != nil {
 		return nil, false, fmt.Errorf("count recent search window: %w", err)
 	}
 	return messages, inRange < window, nil
