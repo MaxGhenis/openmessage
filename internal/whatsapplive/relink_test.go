@@ -23,6 +23,8 @@ import (
 	watypes "go.mau.fi/whatsmeow/types"
 	waevents "go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
+
+	"github.com/maxghenis/openmessage/internal/db"
 )
 
 var (
@@ -565,6 +567,63 @@ func TestInterruptedRelinkSupersedesTheLogout(t *testing.T) {
 			t.Fatalf("held identity = %+v, want the newer link", got)
 		}
 	})
+}
+
+// whatsmeow does not order PairSuccess before the connection that follows a
+// pairing. A paired Connected whose PairSuccess has not arrived adopts the
+// identity whatsmeow installed: the adapter's pairer can finish on it, and it
+// supersedes an outstanding logout.
+func TestConnectedAdoptsAnIdentityWhosePairSuccessIsMissing(t *testing.T) {
+	sessionPath := relinkTestSessionPath(t)
+	SeedLinkedDeviceForTest(t, sessionPath, relinkTestJID)
+	// A paired Connected starts store reconciliation, so this bridge needs a
+	// message store.
+	store, err := db.New(filepath.Join(filepath.Dir(sessionPath), "messages.db"))
+	if err != nil {
+		t.Fatalf("db.New(): %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	b, err := New(sessionPath, store, zerolog.Nop(), Callbacks{})
+	if err != nil {
+		t.Fatalf("New(): %v", err)
+	}
+	t.Cleanup(func() { _ = b.Close() })
+	b.handleEvent(&waevents.LoggedOut{Reason: waevents.ConnectFailureLoggedOut})
+	if !heldIdentity(b).empty() || !b.Status().NeedsRelink {
+		t.Fatal("logout did not leave an unpaired client with needs_relink")
+	}
+
+	var connectedPaired []bool
+	b.ObserveLifecycle(func(event LifecycleEvent) {
+		if _, ok := event.Raw.(*waevents.Connected); ok {
+			connectedPaired = append(connectedPaired, event.Paired)
+		}
+	})
+	// What a pairing does to the client before PairSuccess is dispatched.
+	b.mu.Lock()
+	device := b.client.Store
+	device.ID = &relinkTestOtherJID
+	device.Account = testADVIdentity()
+	err = device.Save(context.Background())
+	b.mu.Unlock()
+	if err != nil {
+		t.Fatalf("save paired device: %v", err)
+	}
+	b.handleEvent(&waevents.Connected{})
+
+	if want := storedIdentity(t, sessionPath, relinkTestOtherJID); heldIdentity(b) != want {
+		t.Fatalf("held identity = %+v, want the adopted %+v", heldIdentity(b), want)
+	}
+	if !reflect.DeepEqual(connectedPaired, []bool{true}) {
+		t.Fatalf("Connected reached the observer with Paired = %v, want [true]", connectedPaired)
+	}
+	status := b.Status()
+	if !status.Paired || status.NeedsRelink || status.AccountJID != relinkTestOtherJID.String() {
+		t.Fatalf("status = %+v, want the adopted link paired without needs_relink", status)
+	}
+	if b.loggedOutSnapshot().active() {
+		t.Fatal("the adopted link did not end the logout record")
+	}
 }
 
 func TestUnpairEndsTheLogoutWithoutDialingTheRevokedIdentity(t *testing.T) {
