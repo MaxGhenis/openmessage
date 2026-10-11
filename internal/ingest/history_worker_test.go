@@ -1360,7 +1360,7 @@ func TestHistoryWorkerRepeatedCatchUpIsIdempotent(t *testing.T) {
 // ---------------------------------------------------------------------------
 // (i) Registration
 
-func TestHistoryWorkerRegistrationAllowsGoogleAndWhatsApp(t *testing.T) {
+func TestHistoryWorkerRegistrationAllowsEveryPlatform(t *testing.T) {
 	store, err := sqlite.Open(filepath.Join(t.TempDir(), "store.sqlite3"))
 	if err != nil {
 		t.Fatalf("sqlite.Open(): %v", err)
@@ -1382,23 +1382,25 @@ func TestHistoryWorkerRegistrationAllowsGoogleAndWhatsApp(t *testing.T) {
 		return WorkerConfig{Store: store, Messages: messages, Reactions: reactions, Decoders: registrations}
 	}
 
-	for _, platform := range []bridge.Platform{bridge.PlatformSignal} {
+	// Google catch-ups and the WhatsApp and Signal Desktop archives all feed
+	// history, so a history codec is valid on every platform the worker takes.
+	for _, platform := range []bridge.Platform{bridge.PlatformGoogle, bridge.PlatformWhatsApp, bridge.PlatformSignal} {
 		t.Run(string(platform), func(t *testing.T) {
 			const codec = "test.hwt.history"
-			_, err := NewWorker(config(DecoderRegistration{Codec: codec, Platform: platform, Decoder: decoder, History: true}))
-			want := fmt.Sprintf("history codec %q is only supported for %q and %q", codec, bridge.PlatformGoogle, bridge.PlatformWhatsApp)
-			if err == nil || !strings.Contains(err.Error(), want) {
-				t.Fatalf("NewWorker(History on %s) error = %v, want %q", platform, err, want)
+			worker, err := NewWorker(config(DecoderRegistration{Codec: codec, Platform: platform, Decoder: decoder, History: true}))
+			if err != nil {
+				t.Fatalf("NewWorker(History on %s) error = %v", platform, err)
 			}
-			// Control: the same registration without History is valid, so the
-			// rejection is about history, not the platform or codec.
-			if _, err := NewWorker(config(DecoderRegistration{Codec: codec, Platform: platform, Decoder: decoder})); err != nil {
-				t.Fatalf("NewWorker(live %s) error = %v", platform, err)
+			if !worker.decoders[codec].history {
+				t.Fatalf("NewWorker(History on %s) registered a live codec", platform)
 			}
 		})
 	}
-	if _, err := NewWorker(config(NewWhatsAppDesktopHistoryDecoderRegistration())); err != nil {
-		t.Fatalf("NewWorker(WhatsApp desktop history): %v", err)
+	if _, err := NewWorker(config(DecoderRegistration{Codec: "test.hwt.history", Platform: "telegram", Decoder: decoder, History: true})); err == nil {
+		t.Fatalf("NewWorker(History on an unknown platform) succeeded")
+	}
+	if _, err := NewWorker(config(NewWhatsAppDesktopHistoryDecoderRegistration(), NewSignalDesktopHistoryDecoderRegistration())); err != nil {
+		t.Fatalf("NewWorker(desktop history codecs): %v", err)
 	}
 
 	worker, err := NewWorker(config(hwtRegistrations(&Counters{})...))

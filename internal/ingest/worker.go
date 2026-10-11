@@ -36,12 +36,16 @@ type EchoObserver interface {
 // thread's direct peer. Reactions apply only to messages a frame inserted, and
 // no existing row is updated. What history cannot place without moving a
 // binding is skipped (history_skipped); the live channel owns the #176
-// id-space repairs. History is supported for Google catch-up and WhatsApp
-// Desktop snapshots; a history codec never establishes live delivery evidence.
+// id-space repairs. History is supported for Google catch-up and for the
+// WhatsApp and Signal Desktop snapshots; a history codec never establishes
+// live delivery evidence.
 // A WhatsApp remote ID is the chat's own JID, not a device-local thread number,
 // so WhatsApp history trusts a bound ID without the roster contradiction check,
 // mints an unbound ID without the roster guard, skips the direct-sender check,
 // and refuses any stanza ID another thread of the account already holds.
+// Signal history keeps the Google rules: its 1:1 IDs follow whichever address
+// form (number or ACI) the live bridge saw, so a roster match is the only
+// guard against a second thread for the same person.
 type DecoderRegistration struct {
 	Codec    string
 	Platform bridge.Platform
@@ -163,14 +167,6 @@ func NewWorker(config WorkerConfig) (*Worker, error) {
 		}
 		if _, exists := decoders[codec]; exists {
 			return nil, fmt.Errorf("create ingest worker: duplicate decoder codec %q", codec)
-		}
-		if registration.History && registration.Platform != bridge.PlatformGoogle && registration.Platform != bridge.PlatformWhatsApp {
-			return nil, fmt.Errorf(
-				"create ingest worker: history codec %q is only supported for %q and %q",
-				codec,
-				bridge.PlatformGoogle,
-				bridge.PlatformWhatsApp,
-			)
 		}
 		decoders[codec] = registeredDecoder{
 			platform: registration.Platform,
@@ -627,6 +623,9 @@ func (w *Worker) applyEvents(
 
 	messageCount := 0
 	projected := false
+	// historyInserted holds the messages this history frame inserted (now or
+	// in an earlier attempt). History applies reactions only to those.
+	historyInserted := make(map[string]bool)
 	for _, event := range events {
 		if event.Kind != bridge.EventMessage {
 			continue
@@ -653,6 +652,11 @@ func (w *Worker) applyEvents(
 			if !inserted {
 				continue
 			}
+			historyInserted[reactionRemoteTargetKey(
+				platform,
+				event.Message.RemoteConversationID,
+				event.Message.RemoteMessageID,
+			)] = true
 			projection.Message = message
 		} else {
 			var duplicateOf *sqlite.Message
@@ -860,6 +864,16 @@ func (w *Worker) applyEvents(
 				continue
 			}
 			reaction := *event.Reaction
+			if history && !historyInserted[reactionRemoteTargetKey(
+				platform,
+				reaction.RemoteConversationID,
+				reaction.TargetRemoteMessageID,
+			)] {
+				// History never touches a message it did not insert, including
+				// its reactions; the live channel owns those. Nothing is lost:
+				// the reaction rode along with a message v2 already had.
+				continue
+			}
 			target, found, err := w.resolveReactionTarget(
 				ctx,
 				accountID,
@@ -879,6 +893,7 @@ func (w *Worker) applyEvents(
 				target,
 				reaction,
 				record.ReceivedAt.UnixMilli(),
+				history,
 			)
 			if err != nil {
 				return changed, err
@@ -1570,14 +1585,17 @@ func (w *Worker) prepareReactionSnapshotEntryFor(
 	}, true, nil
 }
 
+// prepareReactionApply resolves the reactor create-only for history, which
+// never rewrites a known identity's name, raw value or update time.
 func (w *Worker) prepareReactionApply(
 	accountID string,
 	platform bridge.Platform,
 	target sqlite.Message,
 	reaction bridge.ReactionEvent,
 	sourceSeqMS int64,
+	history bool,
 ) (sqlite.ReactionApply, error) {
-	actor, err := w.prepareReactionActor(accountID, platform, reaction.Actor, reaction.Emoji, false)
+	actor, err := w.prepareReactionActor(accountID, platform, reaction.Actor, reaction.Emoji, history)
 	if err != nil {
 		return sqlite.ReactionApply{}, err
 	}
