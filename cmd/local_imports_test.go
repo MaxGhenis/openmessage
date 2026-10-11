@@ -280,13 +280,19 @@ func TestLocalImportsStatusJSON(t *testing.T) {
 	for _, tc := range []struct {
 		reason    string
 		sandboxed bool
+		imessage  bool
 		want      string
 	}{
-		{reason: "", want: `{"enabled":true,"app_sandbox":false}`},
-		{reason: localImportsOffV2Primary, want: `{"enabled":false,"off_reason":"v2_primary","app_sandbox":false}`},
-		{reason: localImportsOffAppSandbox, sandboxed: true, want: `{"enabled":false,"off_reason":"app_sandbox","app_sandbox":true}`},
+		{reason: "", want: `{"enabled":true,"app_sandbox":false,"imessage":false}`},
+		{reason: "", imessage: true, want: `{"enabled":true,"app_sandbox":false,"imessage":true}`},
+		{reason: localImportsOffV2Primary, imessage: true, want: `{"enabled":false,"off_reason":"v2_primary","app_sandbox":false,"imessage":false}`},
+		{reason: localImportsOffAppSandbox, sandboxed: true, want: `{"enabled":false,"off_reason":"app_sandbox","app_sandbox":true,"imessage":false}`},
 	} {
-		l := newLocalImports(localImportsConfig{Logger: zerolog.Nop(), OffReason: tc.reason, Sandboxed: tc.sandboxed})
+		cfg := localImportsConfig{Logger: zerolog.Nop(), OffReason: tc.reason, Sandboxed: tc.sandboxed, IMessageSupported: true}
+		if tc.imessage {
+			cfg.ImportIMessage = func(*db.Store) (*importer.ImportResult, error) { return &importer.ImportResult{}, nil }
+		}
+		l := newLocalImports(cfg)
 		raw, err := json.Marshal(l.status())
 		if err != nil {
 			t.Fatal(err)

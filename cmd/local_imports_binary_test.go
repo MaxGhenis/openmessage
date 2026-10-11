@@ -40,7 +40,7 @@ func TestBuiltBinaryLocalImportsDecision(t *testing.T) {
 		return string(output)
 	}
 	const (
-		on        = "Local desktop imports on:"
+		on        = "Local desktop imports on (legacy store):"
 		v2Primary = "Local desktop imports off: this daemon reads the v2 store"
 		sandbox   = "Local desktop imports off: the app runs in the macOS App Sandbox"
 	)
@@ -55,7 +55,11 @@ func TestBuiltBinaryLocalImportsDecision(t *testing.T) {
 
 	t.Run("unsandboxed legacy-primary daemon runs them", func(t *testing.T) {
 		dataDir := filepath.Join(t.TempDir(), "data")
-		expectOnly(t, run(t, dataDir, "OPENMESSAGES_APP_SANDBOX=0", "OPENMESSAGES_V2_PRIMARY=0"), on)
+		output := run(t, dataDir, "OPENMESSAGES_APP_SANDBOX=0", "OPENMESSAGES_V2_PRIMARY=0")
+		expectOnly(t, output, on)
+		if !strings.Contains(output, "iMessage stays off") {
+			t.Fatalf("the daemon must say the iMessage poll stays off:\n%s", output)
+		}
 	})
 	t.Run("launcher flag keeps them off", func(t *testing.T) {
 		dataDir := filepath.Join(t.TempDir(), "data")

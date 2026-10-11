@@ -389,16 +389,17 @@ Mac: Messages' `~/Library/Messages/chat.db` (needs Full Disk Access), Signal
 Desktop's `~/Library/Application Support/Signal/sql/db.sqlite` (key from the
 "Signal Safe Storage" keychain item) and WhatsApp Desktop's
 `ChatStorage.sqlite`. These importers write **only the legacy
-`messages.db`**. The daemon polls them every 30 s: WhatsApp Desktop while
-its live bridge is unused, Signal Desktop while signal-cli is paired,
-iMessage on macOS. It also rescans Signal Desktop in full every 30 min.
+`messages.db`**. The daemon polls two of them every 30 s: WhatsApp Desktop
+while its live bridge is unused, and Signal Desktop while signal-cli is
+paired. It also rescans Signal Desktop in full every 30 min. It does not
+poll iMessage (see the end of this section).
 
 Whether they run at all is one decision, logged once at startup and reported
 in `/api/status` (the log line is Info, which macOS keeps only in memory):
 
 ```bash
 curl -s http://127.0.0.1:7007/api/status | jq '.local_imports'
-# {"enabled": false, "off_reason": "v2_primary", "app_sandbox": false}
+# {"enabled": false, "off_reason": "v2_primary", "app_sandbox": false, "imessage": false}
 ```
 
 `off_reason` is `demo`, `transports_off`, `app_sandbox` or `v2_primary`.
@@ -417,8 +418,9 @@ curl -s http://127.0.0.1:7007/api/status | jq '.local_imports'
   serves conversations, messages and search from the v2 store, so
   legacy-only rows don't appear there. A few surfaces still read the legacy
   store directly (`/api/people`, MCP `download_media`); they are not a route
-  for new history. The rows also break the projection check: the legacy store is the copy of live
-  traffic that `freshness.<platform>.projection_stalled` measures v2 against
+  for new history. The rows also break the projection check: the legacy
+  store is the copy of live traffic that
+  `freshness.<platform>.projection_stalled` measures v2 against
   (whatsapp, signal, sms/rcs), and a desktop import moves `legacy_latest_ms`
   past anything v2 holds. Seen 2026-10-11: signal `projection_stalled: true`,
   `legacy_latest_ms` on 09-27, v2's newest Signal message on 08-18. The
@@ -443,18 +445,28 @@ curl -s http://127.0.0.1:7007/api/status | jq '.local_imports'
   moves a timestamp, so it cannot touch the projection check (one candidate
   row on 2026-10-11).
 
-On a legacy-primary install the iMessage importer reads only the chats with a
-chat.db row added since its last poll (by ROWID, which also catches old-dated
-rows that iCloud inserts late). It reads chat.db in full once per daemon
-start, and again if the row at its mark is gone or is a different message
-(chat.db replaced). It writes only rows that differ, so a restart picks up
-edits. Tapbacks become reactions. Each chat it reads has its reactions
-rebuilt from the chat's complete tapback list, because a late, older tapback
-or an older message with the quoted text changes the outcome of tapbacks
-already applied. The rebuild commits only what changes. A message joined to
-two chats belongs to the lower chat ROWID. Before #231 it deadlocked on any
-chat.db with a chat (one SQLite connection, nested query); the sandbox flag
-had hidden that since April.
+**iMessage is not polled on any install.** `importer.IMessage` re-reads all
+of chat.db and re-upserts every chat and message on each call. On Max's
+chat.db (2,020 chats, 43,731 messages with text), measured into an in-memory
+store on 2026-10-11:
+- a first import took 162 s;
+- importing the same, unchanged chat.db again took 334 s and rewrote every
+  row.
+
+From ed03e741 (2026-02-22) until #231 it also never returned: it held one
+SQLite connection and queried chat participants with the chat rows still
+open. The sandbox flag hid both problems from 2026-04-04. #231 fixes the hang
+and the dropped chats whose `display_name` is NULL, so `openmessage import
+imessage` and MCP `import_messages` work as one-shot full imports. A poll
+needs an incremental importer first. Two review rounds on #231 set its
+requirements:
+- read tapbacks from chat.db's `associated_message_guid` /
+  `associated_message_type`, not by matching quoted text, which can delete
+  typed messages;
+- track late `chat_message_join` rows, not only a message ROWID mark;
+- detect a replaced chat.db;
+- keep row metadata (transcripts, media) intact;
+- keep a one-message poll cheap on a large chat.
 
 ## MCP serving — exactly one process may own live transports
 

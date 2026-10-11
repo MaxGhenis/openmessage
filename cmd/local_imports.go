@@ -11,9 +11,9 @@ import (
 
 // Local desktop imports are the legacy-store importers that read other apps'
 // databases on this Mac: WhatsApp Desktop (ChatStorage.sqlite), Signal Desktop
-// (sql/db.sqlite) and Messages (chat.db). The daemon polls them every 30 s and
-// rescans Signal Desktop in full every 30 min. They write only the legacy
-// messages.db.
+// (sql/db.sqlite) and Messages (chat.db). The daemon polls the configured ones
+// every 30 s (not iMessage; see ImportIMessage) and rescans Signal Desktop in
+// full every 30 min. They write only the legacy messages.db.
 
 // Why a daemon runs none of the local desktop importers ("" = it runs them).
 const (
@@ -62,10 +62,12 @@ func localImportsOffReason(transports, demo, sandboxed, v2Primary bool) string {
 // localImportsStatus is the `local_imports` block of /api/status. The startup
 // log line says the same thing, but the app keeps backend lines only in
 // memory (os_log Info), so this is the durable place to read the decision.
+// IMessage says whether the poll includes iMessage at all.
 type localImportsStatus struct {
 	Enabled    bool   `json:"enabled"`
 	OffReason  string `json:"off_reason,omitempty"`
 	AppSandbox bool   `json:"app_sandbox"`
+	IMessage   bool   `json:"imessage"`
 }
 
 type localImportsConfig struct {
@@ -80,7 +82,10 @@ type localImportsConfig struct {
 	IMessageSupported  bool
 
 	// The importers. Signal's full flag forces a full rescan instead of the
-	// incremental window.
+	// incremental window. ImportIMessage is nil on the daemon: importer.IMessage
+	// re-reads and rewrites every chat and message on each call (on a real
+	// 2,020-chat chat.db, 334 s to re-import it unchanged), and an incremental
+	// version needs native tapback metadata and late-join tracking first.
 	ImportWhatsApp func(store *db.Store) (*importer.ImportResult, error)
 	ImportSignal   func(store *db.Store, account string, full bool) (*importer.ImportResult, error)
 	ImportIMessage func(store *db.Store) (*importer.ImportResult, error)
@@ -107,7 +112,12 @@ func (l *localImports) status() localImportsStatus {
 		Enabled:    l.enabled(),
 		OffReason:  l.cfg.OffReason,
 		AppSandbox: l.cfg.Sandboxed,
+		IMessage:   l.iMessageEnabled(),
 	}
+}
+
+func (l *localImports) iMessageEnabled() bool {
+	return l.enabled() && l.cfg.ImportIMessage != nil && l.cfg.IMessageSupported
 }
 
 // logDecision writes one line at startup saying whether the importers run.
@@ -115,9 +125,16 @@ func (l *localImports) logDecision() {
 	logger := l.cfg.Logger
 	switch l.cfg.OffReason {
 	case "":
+		msg := "Local desktop imports on (legacy store): WhatsApp Desktop while its live bridge is unused, Signal Desktop while signal-cli is paired"
+		if l.iMessageEnabled() {
+			msg += ", iMessage"
+		} else {
+			msg += "; iMessage stays off until its importer stops rewriting all of chat.db on every poll"
+		}
 		logger.Info().
 			Bool("app_sandbox", l.cfg.Sandboxed).
-			Msg("Local desktop imports on: WhatsApp Desktop while its live bridge is unused, Signal Desktop while signal-cli is paired, iMessage on macOS (legacy store)")
+			Bool("imessage", l.iMessageEnabled()).
+			Msg(msg)
 	case localImportsOffV2Primary:
 		logger.Info().
 			Str("off_reason", l.cfg.OffReason).
@@ -167,7 +184,7 @@ func (l *localImports) syncOnce() bool {
 			})
 		}
 	}
-	if l.cfg.ImportIMessage != nil && l.cfg.IMessageSupported {
+	if l.iMessageEnabled() {
 		syncPlatform("imessage", "iMessage sync complete", l.cfg.ImportIMessage)
 	}
 	return changed
