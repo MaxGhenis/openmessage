@@ -1481,9 +1481,10 @@ whatsmeow does a full resync of it, and OpenMessage does not trigger one yet.
 
 Some frames are never delivered again, so redelivery cannot save them:
 
-- **History-sync chunks.** whatsmeow downloads each chunk in a background
-  loop that does not belong to any generation. It dispatches the chunk,
-  ignores whether the handler took it, and then deletes the server copy.
+- **History-sync chunks.** The bridge's history-sync pump (next section)
+  downloads each chunk outside any generation. Once the chunk is committed
+  or held it acknowledges the notification and deletes the server copy, so
+  nothing delivers the chunk again.
 - **Receipts.** whatsmeow acknowledges a receipt before dispatching it.
 - **Messages whose redelivery misses whatsmeow's event buffer.** The buffer
   is keyed on the sender, so a stanza decrypted under the peer's phone number
@@ -1515,9 +1516,10 @@ generation, or after a later commit on the same one, at most every 30
 seconds.
 
 The spool holds at most 4,096 frames and 256 MiB of payload. A message it
-refuses falls back to redelivery (above). A refused receipt or history chunk
-is lost from v2 and logs `WhatsApp receipt neither committed nor held` or
-`WhatsApp history-sync chunk neither committed nor held` at error level. Rows
+refuses falls back to redelivery (above). A history chunk it refuses stays
+queued as a notification and is downloaded again later (next section). A
+refused receipt is lost from v2 and logs `WhatsApp receipt neither committed
+nor held` at error level. Rows
 survive a restart. The first generation of the next run replays them, and
 startup logs `WhatsApp ingress spool holds frames from an earlier run`.
 Unpairing does not clear them: they are frames the account received.
@@ -1553,12 +1555,115 @@ legacy-only installs. It also covers an
 app-state patch interrupted between its version and MAC writes.
 `generation_gap_test.go` uses the same harness for the spool. It sends a
 history-sync notification from our own phone through whatsmeow's real
-background loop, and the chunk is dispatched after the generation retired.
+handler, and the history-sync pump dispatches the chunk after the generation
+retired.
 It also covers a receipt in the gap, a redelivery under a LID, a
 placeholder resend, and a frame committed twice that stays one row in the
 real v2 inbox. `ingress_spool_test.go` and
 `ingress_spool_interleaving_test.go` check the spool against a model, and
 check every sequence of up to five gap events.
+
+### History-sync notifications the app has not downloaded yet (the queue)
+
+Our phone sends message history as history-sync notifications: protocol
+messages from our own account, each naming one chunk that travels inline or
+sits on WhatsApp's media server. whatsmeow's default handling kept a
+notification only in memory. It queued the notification on a channel, sent
+the history-sync receipt at once, and downloaded and dispatched the chunk
+later from a background loop. By then the bridge had reported the
+notification's own message handled, so whatsmeow had cleared its buffered
+plaintext and acknowledged the stanza, and nothing delivered it again. Before
+PR #241, quitting, crashing or updating the app in that window lost the
+chunk. So did a download that failed once.
+
+How it works now:
+
+- The bridge downloads history itself. whatsmeow runs with
+  `ManualHistorySyncDownload` and `DisableManualHistorySyncReceipt`, so it
+  neither queues the notification nor sends its receipt.
+- The handler stores each notification in
+  `openmessage_whatsapp_history_sync_pending` (in `whatsapp-session.db`, next
+  to the ingress spool) before it reports the protocol message handled. If
+  it cannot (the table is full or its database fails), the message is
+  reported not handled, as an uncommitted message is: whatsmeow keeps the
+  plaintext and sends no receipt, and the notification is queued when the
+  server delivers the stanza again (see the section above on redelivery).
+  Log line: `WhatsApp history-sync notification not queued; leaving it for
+  redelivery`.
+- A pump works through the table oldest first, only while the account is
+  connected. It wakes when a notification is queued, when the account
+  connects, when a generation begins observing ingress, and when a deferred
+  attempt comes due. For each notification it downloads the chunk and parses
+  it through whatsmeow's `DownloadHistorySync`, which also stores what the
+  chunk carries for whatsmeow (LID mappings, push names, message secrets)
+  before the row goes. It hands the chunk to the bridge like any captured
+  frame: committed to the observing generation, or held in the ingress spool
+  for the next. Only then does it send the history-sync receipt, delete the
+  server copy (a chunk carried inline has none) and remove the row. Rows
+  survive a restart, and startup logs `WhatsApp history-sync queue holds
+  notifications from an earlier run`.
+- A pumped chunk commits as a replayed frame
+  (`bridge.ReplayIngressSink`), so it does not count as connection activity:
+  the pump may run long after the connection that delivered the
+  notification, in a later generation or run.
+- Failures never block the notifications behind them:
+  - A server copy that is gone (HTTP 404 or 410), a notification naming no
+    chunk, or a chunk that does not decompress or parse is dropped at once.
+  - A download or receipt that fails otherwise is retried after 30 seconds,
+    doubling to at most an hour, and dropped on the tenth failure.
+  - A failure because the connection went away counts no attempt. The pass
+    stops and the next connection resumes it.
+  - A chunk the bridge neither commits nor holds (v2 refuses appends and the
+    spool is full) stays queued with no attempt counted, as back-pressure.
+  - A drop sends the history-sync receipt whatsmeow's default handling would
+    have sent and logs `Dropped a WhatsApp history-sync notification` at
+    error level, with the reason and the sync type and chunk order.
+  - A notification received by a different account (the app was unpaired and
+    another account paired) is removed with no download and no receipt.
+- The table holds at most 4,096 notifications and 64 MiB. A full table means
+  downloads have failed, or v2 has refused chunks, for a long time.
+- The legacy store takes a chunk after it is committed or held, as it does
+  messages. If the process ends between v2's commit and the legacy write, the
+  next run downloads the chunk again and both get it. If that download finds
+  the server copy gone, the chunk is in v2 only.
+
+Log lines: `Queued a WhatsApp history-sync notification` (debug),
+`Committed a WhatsApp history-sync chunk` (info, with `attempts`),
+`WhatsApp history-sync notification failed; retrying later` (warning, with
+`attempts` and `next_attempt`), and `WhatsApp history-sync chunk neither
+committed nor held; keeping its notification queued` (warning).
+
+Inspecting the queue on a live install (read-only):
+
+```bash
+sqlite3 -readonly "$HOME/Library/Application Support/OpenMessage/whatsapp-session.db" \
+  "select seq, message_id, attempts, committed_at_ns > 0 committed, last_error,
+          notification_bytes,
+          datetime(received_at_ns/1e9,'unixepoch','localtime') received,
+          datetime(nullif(next_attempt_at_ns, 0)/1e9,'unixepoch','localtime') next_attempt
+   from openmessage_whatsapp_history_sync_pending order by seq"
+```
+
+An empty table is the normal state. While the phone is sending history it
+holds the notifications not yet downloaded. A row with `committed` 1 is
+waiting only for its receipt (the receipt failed, or the connection went
+away, after the commit).
+Don't delete rows by hand: each one is a chunk v2 may not have.
+
+Tests: `history_notification_test.go` drives notifications through
+whatsmeow's real handler. It checks that whatsmeow sends no history-sync
+receipt itself, that the pump's receipt and `DeleteMedia` follow the chunk's
+commit, and that a notification the full table refuses stays in whatsmeow's
+event buffer until its redelivery is queued.
+`TestHistoryNotificationSurvivesAnExitBeforeItsChunkIsDispatched` (in
+`generation_gap_test.go`) ends the process after the notification was
+handled and before its chunk was dispatched, and finds the chunk in v2 after
+the restart. `history_sync_queue_test.go` checks the table against a model.
+`history_sync_pump_test.go` checks each failure class.
+`history_sync_interleaving_test.go` runs every sequence of up to four events
+(notifications, passes with each outcome, crashes inside a download, after a
+commit and after a receipt, and generation and connection changes) under four
+table and spool bounds, plus longer random runs.
 
 ## signal-cli
 
