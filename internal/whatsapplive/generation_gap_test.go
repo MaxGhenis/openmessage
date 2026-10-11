@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -235,6 +236,70 @@ func TestHistoryChunkDispatchedBetweenGenerationsReachesV2(t *testing.T) {
 	h.awaitLegacyMessage(id, text)
 	_, generation := h.awaitGeneration()
 	requireFramesIn(t, h.sink.historyFrames(t, id), generation, "history chunk dispatched between generations")
+}
+
+// TestHistoryNotificationSurvivesAnExitBeforeItsChunkIsDispatched covers the
+// window #239 left open. Our phone's history-sync notification is a protocol
+// message: once the bridge reports it handled, whatsmeow clears its buffered
+// plaintext and acknowledges it, so the server never redelivers it, and the
+// chunk it names is downloaded and dispatched later, in the background. The
+// process ends in between (the app quits, crashes or updates): the goroutine
+// that would dispatch the chunk dies at that point, before the bridge sees
+// it. The next run must still get the chunk to v2, and to the legacy store,
+// which on an install without v2 is the only one.
+func TestHistoryNotificationSurvivesAnExitBeforeItsChunkIsDispatched(t *testing.T) {
+	for _, mode := range []teardownMode{{}, {legacyOnly: true}} {
+		t.Run(mode.String(), func(t *testing.T) {
+			h := newTeardownHarness(t, mode)
+			first, _ := h.awaitGeneration()
+			phone := h.newOwnPhone()
+
+			const id watypes.MessageID = "3EB0HISTORYEXIT"
+			const text = "history chunk whose process ended before dispatch"
+			handled := make(chan struct{})
+			died := make(chan struct{})
+			var once sync.Once
+			whatsapplive.RunBeforeBridgeHandlerForTeardownTest(h.host, func(raw any) {
+				if _, ok := raw.(*waevents.HistorySync); !ok {
+					return
+				}
+				select {
+				case <-handled:
+				case <-time.After(teardownTestTimeout):
+					t.Error("the notification's handler never returned")
+				}
+				once.Do(func() { close(died) })
+				// The process ends here: this goroutine never reaches the bridge.
+				runtime.Goexit()
+			})
+			h.deliver(first, h.phoneMessage(phone, "3EB0HISTORYEXITNOTICE", h.historyNotification(h.historyChunk(id, text))))
+			close(handled)
+			select {
+			case <-died:
+			case <-time.After(teardownTestTimeout):
+				t.Fatal("the chunk was never dispatched")
+			}
+			if frames := h.sink.historyFrames(t, id); len(frames) != 0 {
+				t.Fatalf("history chunk committed before the process ended: %v", frames)
+			}
+			if stored, _ := h.messages.GetMessageByID("whatsapp:" + string(id)); stored != nil {
+				t.Fatal("legacy store took the chunk before the process ended")
+			}
+
+			h.restartProcess()
+			_, generation := h.awaitGeneration()
+			h.awaitLegacyMessage(id, text)
+			if mode.legacyOnly {
+				return
+			}
+			if !awaitTeardownCondition(t, "the next run to commit the history chunk", func() bool {
+				return len(h.sink.historyFrames(t, id)) > 0
+			}) {
+				t.FailNow()
+			}
+			requireFramesIn(t, h.sink.historyFrames(t, id), generation, "history chunk whose process ended before dispatch")
+		})
+	}
 }
 
 // TestFramesCapturedBetweenGenerationsReachV2 dispatches each frame kind

@@ -244,11 +244,13 @@ type IngressFrame struct {
 	DedupeKey  string
 	ReceivedAt time.Time
 	Payload    []byte
-	// Replayed marks a frame the bridge held in its ingress spool because no
-	// generation committed it when it arrived. The live channel delivered it
-	// under an earlier generation, so committing it says nothing about the
-	// current connection: the observer must not count it as connection
-	// activity.
+	// Replayed marks a frame whose commit says nothing about the current
+	// connection, so the observer must not count it as connection activity:
+	// a frame the bridge held in its ingress spool because no generation
+	// committed it when it arrived (the live channel delivered it under an
+	// earlier generation), or a history-sync chunk the bridge downloaded for
+	// a notification it queued (history_sync_queue.go), possibly in an
+	// earlier generation or run.
 	Replayed bool
 }
 
@@ -385,6 +387,14 @@ type Bridge struct {
 	// spool holds frames no generation committed until one can (see
 	// ingress_spool.go). It is nil when the runtime database is not open.
 	spool *ingressSpool
+	// historySync holds our phone's history-sync notifications until their
+	// chunks are committed or held, and downloads them (history_sync_queue.go,
+	// history_sync_pump.go). It is nil when the runtime database is not open.
+	historySync *historySyncPump
+	// beforeEventForTest, when set, sees every event before the bridge
+	// applies it, as a whatsmeow handler registered ahead of the bridge's
+	// would (RunBeforeBridgeHandlerForTeardownTest).
+	beforeEventForTest func(any)
 
 	runtimeMu    sync.Mutex
 	runtimeDB    *sql.DB
@@ -415,6 +425,7 @@ func New(sessionPath string, store *db.Store, logger zerolog.Logger, callbacks C
 		_ = bridge.Close()
 		return nil, err
 	}
+	bridge.startHistorySyncPump()
 	return bridge, nil
 }
 
@@ -451,6 +462,14 @@ func (b *Bridge) initClientLocked() error {
 	// against the advanced session, fails with an old-counter error, and
 	// whatsmeow acknowledges it.
 	cli.EnableDecryptedEventBuffer = true
+	// Download history-sync chunks ourselves, and send each notification's
+	// history-sync receipt only once its chunk is committed or held. By
+	// default whatsmeow keeps a notification only in memory, acknowledges it
+	// before downloading its chunk, and drops it if the download fails, so a
+	// process that ends before the chunk is dispatched loses it (see
+	// history_sync_queue.go).
+	cli.ManualHistorySyncDownload = true
+	cli.DisableManualHistorySyncReceipt = true
 	b.clientGeneration++
 	clientGeneration := b.clientGeneration
 	cli.AddEventHandlerWithSuccessStatus(func(raw any) bool {
@@ -485,6 +504,11 @@ func (b *Bridge) initRuntimeState() error {
 		_ = database.Close()
 		return err
 	}
+	historySyncQueue, err := openHistorySyncQueue(database, historySyncQueueMaxRows, historySyncQueueMaxBytes)
+	if err != nil {
+		_ = database.Close()
+		return err
+	}
 
 	b.runtimeMu.Lock()
 	b.runtimeDB = database
@@ -494,9 +518,13 @@ func (b *Bridge) initRuntimeState() error {
 	b.runtimeMu.Unlock()
 	b.mu.Lock()
 	b.spool = spool
+	b.historySync = newHistorySyncPump(historySyncQueue)
 	b.mu.Unlock()
 	if held := spool.heldFrames(); held > 0 {
 		b.logger.Info().Int64("frames", held).Msg("WhatsApp ingress spool holds frames from an earlier run; the next generation replays them")
+	}
+	if queued := historySyncQueue.pending(); queued > 0 {
+		b.logger.Info().Int64("notifications", queued).Msg("WhatsApp history-sync queue holds notifications from an earlier run; they are downloaded once the account connects")
 	}
 	return nil
 }
@@ -641,6 +669,7 @@ func (b *Bridge) ObserveIngress(callback func(IngressFrame) error, durable bool)
 	b.mu.Unlock()
 
 	b.replayIngressSpool(true)
+	b.wakeHistorySync()
 
 	return func() {
 		b.mu.Lock()
@@ -1334,6 +1363,9 @@ func (b *Bridge) UsesLiveSession() bool {
 }
 
 func (b *Bridge) Close() error {
+	// The pump uses the client and the queue's database; stop it first, and
+	// without holding b.mu, which it takes.
+	b.stopHistorySyncPump()
 	b.mu.Lock()
 	if b.client != nil {
 		b.client.Disconnect()
@@ -2049,12 +2081,20 @@ func (b *Bridge) ProfilePhoto(conversationID string) ([]byte, string, error) {
 //
 // It returns whatsmeow's handler success status: false only for a message
 // whose ingress frame was neither committed nor held in the ingress spool, so
-// a later delivery must commit it (see ObserveIngress). Every other event, and
+// a later delivery must commit it (see ObserveIngress), or that carries a
+// history-sync notification the bridge could not queue; and for a
+// history-sync chunk whose frame was neither committed nor held (whatsmeow
+// ignores that status; the history-sync pump keeps the chunk's notification
+// queued). Every other event, and
 // every event from a retired client, reports success.
 func (b *Bridge) handleClientEvent(source *whatsmeow.Client, generation uint64, raw any) bool {
 	b.mu.RLock()
 	current := source == nil || (b.client == source && b.clientGeneration == generation)
+	hook := b.beforeEventForTest
 	b.mu.RUnlock()
+	if hook != nil {
+		hook(raw)
+	}
 	if !current {
 		return true
 	}
@@ -2376,23 +2416,66 @@ func (b *Bridge) captureReceiptIngress(evt *waevents.Receipt) {
 	}
 }
 
-func (b *Bridge) captureHistorySyncIngress(evt *waevents.HistorySync) {
+// applyHistorySync commits or holds a history-sync chunk's frame and hands
+// the chunk to the legacy store. It reports whether the frame was committed
+// or held; when it was neither, the history-sync pump keeps the chunk's
+// notification queued and applies the chunk again later. The legacy store
+// takes the chunk on its first application either way, as it takes a message
+// (handleMessage); a later application of a chunk it already stored without a
+// v2 commit skips the legacy write (legacyAhead), so it cannot undo an edit or
+// revoke applied in between.
+func (b *Bridge) applyHistorySync(evt *waevents.HistorySync, replayed bool) bool {
+	dedupeKey, held, err := b.captureHistorySyncIngress(evt, replayed)
+	applied := err == nil
+	committed := applied && !held
+	now := time.Now()
+	if b.legacyTakesDelivery(dedupeKey, committed, now) {
+		if err := b.handleHistorySyncRecovering(evt); err == nil && !committed {
+			b.legacyTook(dedupeKey, now)
+		}
+	}
+	return applied
+}
+
+// handleHistorySyncRecovering contains a panic in legacy history handling:
+// the history-sync pump runs it on its own goroutine, with no whatsmeow
+// dispatcher to recover it.
+func (b *Bridge) handleHistorySyncRecovering(evt *waevents.HistorySync) (err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			b.logger.Error().
+				Str("panic", fmt.Sprint(recovered)).
+				Msg("Recovered panic in WhatsApp legacy history-sync handling")
+			err = fmt.Errorf("legacy history-sync handling panicked: %v", recovered)
+		}
+	}()
+	b.handleHistorySync(evt)
+	return nil
+}
+
+// captureHistorySyncIngress returns the frame's dedupe key, whether it was
+// held in the ingress spool rather than committed, and a non-nil error only
+// when the frame was built but neither committed nor held. A chunk whose
+// frame cannot be built would fail the same way again, so that is logged and
+// reported as captured.
+func (b *Bridge) captureHistorySyncIngress(evt *waevents.HistorySync, replayed bool) (dedupeKey string, held bool, deliveryErr error) {
 	// Capture is strictly additive observation: a panic anywhere in the
-	// capture body must not reach the whatsmeow callback or skip the legacy
-	// handling that follows it.
+	// capture body must not reach the caller or skip the legacy handling that
+	// follows it.
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			b.logIngressCaptureError("history_sync", fmt.Errorf("capture panic: %v", recovered))
+			dedupeKey, held, deliveryErr = "", false, nil
 		}
 	}()
 	if evt == nil || evt.Data == nil || !b.wantsIngress() {
-		return
+		return "", false, nil
 	}
 	receivedAt := time.Now()
 	protoBytes, err := proto.Marshal(evt.Data)
 	if err != nil {
 		b.logIngressCaptureError("history_sync", err)
-		return
+		return "", false, nil
 	}
 	payload, err := json.Marshal(whatsappHistorySyncIngressEnvelope{
 		Kind:     "history_sync",
@@ -2400,20 +2483,19 @@ func (b *Bridge) captureHistorySyncIngress(evt *waevents.HistorySync) {
 	})
 	if err != nil {
 		b.logIngressCaptureError("history_sync", err)
-		return
+		return "", false, nil
 	}
-	// whatsmeow ignores the handler result for history sync and deletes the
-	// blob from the server after dispatch (handleHistorySyncNotificationLoop),
-	// so it is never delivered again: a chunk no generation commits is held in
-	// the ingress spool, before this returns and so before the deletion, for
-	// the next generation.
-	if _, err := b.commitIngress("history_sync", IngressFrame{
-		DedupeKey:  "hist:" + ingressHash8(payload),
+	// A chunk no generation commits is held in the ingress spool for the
+	// next one. One the spool cannot take either stays queued as a
+	// notification (history_sync_queue.go) and is applied again later.
+	dedupeKey = "hist:" + ingressHash8(payload)
+	held, err = b.commitIngress("history_sync", IngressFrame{
+		DedupeKey:  dedupeKey,
 		ReceivedAt: receivedAt,
 		Payload:    payload,
-	}); err != nil {
-		b.logger.Error().Err(err).Msg("WhatsApp history-sync chunk neither committed nor held; v2 will not see it")
-	}
+		Replayed:   replayed,
+	})
+	return dedupeKey, held, err
 }
 
 func (b *Bridge) captureMentionLabels(msg *waE2E.Message, chatJID watypes.JID) map[string]string {
@@ -2471,8 +2553,10 @@ func (b *Bridge) logIngressCaptureError(kind string, err error) {
 	b.logger.Warn().Err(err).Str("kind", kind).Msg("Failed to capture WhatsApp ingress frame")
 }
 
-// applyEvent returns false only for a message whose ingress frame was neither
-// committed nor held, so a later delivery must commit it.
+// applyEvent returns false only for a message that must be delivered again
+// (its ingress frame was neither committed nor held, or its history-sync
+// notification was not queued) and for a history-sync chunk whose frame was
+// neither committed nor held.
 func (b *Bridge) applyEvent(raw any) bool {
 	switch evt := raw.(type) {
 	case *waevents.Connected:
@@ -2517,8 +2601,7 @@ func (b *Bridge) applyEvent(raw any) bool {
 	case *waevents.GroupInfo:
 		b.handleGroupInfo(evt)
 	case *waevents.HistorySync:
-		b.captureHistorySyncIngress(evt)
-		b.handleHistorySync(evt)
+		return b.applyHistorySync(evt, false)
 	default:
 		b.logger.Debug().Type("type", evt).Msg("Unhandled WhatsApp event")
 	}
@@ -2553,6 +2636,7 @@ func (b *Bridge) handleConnected() {
 	}
 	go b.reconcileStoredDirectChats()
 	go b.repairUnavailableMediaPlaceholdersAsync()
+	b.wakeHistorySync()
 	b.emitStatusChange()
 }
 
@@ -2671,6 +2755,19 @@ func (b *Bridge) handleMessage(evt *waevents.Message) bool {
 			Str("msg_id", string(evt.Info.ID)).
 			Msg("WhatsApp message not committed to ingress; leaving it for redelivery")
 	}
+	// Our phone's history-sync notification is reported handled only once it
+	// is queued: whatsmeow then clears its plaintext and acknowledges it, and
+	// nothing delivers it again (history_sync_queue.go). It is queued whatever
+	// became of its frame, so it is durable as early as possible; a
+	// redelivery is the same row.
+	queued := true
+	if err := b.queueHistorySyncNotification(evt); err != nil {
+		queued = false
+		b.logger.Warn().
+			Err(err).
+			Str("msg_id", string(evt.Info.ID)).
+			Msg("WhatsApp history-sync notification not queued; leaving it for redelivery")
+	}
 	// A held message is in the legacy store ahead of v2, like one left for
 	// redelivery: a rare redelivery of it (whatsmeow failed to clear its
 	// plaintext) must not rewrite the legacy row either.
@@ -2681,7 +2778,7 @@ func (b *Bridge) handleMessage(evt *waevents.Message) bool {
 			b.legacyTook(dedupeKey, now)
 		}
 	}
-	return handled
+	return handled && queued
 }
 
 // handleLegacyMessageRecovering contains a panic in legacy handling. Left to
