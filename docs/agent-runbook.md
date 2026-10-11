@@ -485,6 +485,107 @@ It fails on any quarantine, scan error, stanza held by two threads, `@lid`
 thread, or insert on the second scan. Inbox payload pruning for this codec
 arrives with PR #196, as for Google history.
 
+## Signal Desktop history reaches v2
+
+**Why.** v2's Signal history stopped at 2026-08-18 21:16 (14,576 messages), and
+by 10-11 signal-cli reported `paired: false`. The legacy store kept receiving
+Signal rows until 09-27 from the legacy Signal Desktop importer (every media
+ref is `signallocal:`), which writes only `messages.db`, so
+`freshness.signal.projection_stalled` turned true. Signal Desktop on the Mac is
+a separate linked device and kept syncing, so it holds a second copy of the
+account's history.
+
+**How it reads.** Signal Desktop's `~/Library/Application Support/Signal/sql/db.sqlite`
+is SQLCipher. Its key is `config.json`'s `encryptedKey`, decrypted with the
+"Signal Safe Storage" keychain password, which the daemon reads with the
+`security` tool. macOS can show a prompt the first time; the daemon keeps the
+key for its lifetime and, after a failed read, waits 30 minutes before asking
+again. The daemon runs `internal/signaldesktop/read_helper.cjs` with the system
+Node.js and Signal.app's own SQLCipher addon. The request, key included, goes
+over stdin. The helper switches the connection to `query_only`, accepts only
+single SELECT statements and runs them in one read transaction, so it never
+writes and reads one consistent snapshot. It needs Node.js (Homebrew),
+`/Applications/Signal.app`, and Desktop linked to the same account: the feed
+refuses a Desktop whose own number (`items.number_id`) differs from the v2
+account's.
+
+**What it sends.** Codec `signal.desktop.history`, insert-only, on the existing
+`signal-primary` account with generation 0. Each Desktop message becomes the
+signal-cli receive line the live bridge would have captured (a data message,
+or a sync transcript for an outgoing one) and goes through the live Signal
+decoder, so IDs and bodies match live: incoming `sha1(conversation, sender,
+sent ms)`, outgoing the sent ms (a migrated `local:` alias row counts as the
+same message). Live keys a contact by phone number when signal-cli knows it and
+by ACI otherwise. Desktop usually knows both, so the feed uses the form v2
+already uses for that person: a bound 1:1 thread, else the only identity v2
+knows, else the number. It also leaves out any message v2 holds under either
+form. Skipped and counted: system notices, stories, messages deleted for
+everyone, outgoing messages that never sent, rows the account authored arriving
+as incoming, PNI-only contacts. Reactions ride along and apply only to messages
+the same frame inserts. The account's own number comes from v2
+(`accounts.remote_account_id`, else its one self phone identity), never from
+signal-cli, which is what is missing when this feed matters; on 2026-10-11
+`remote_account_id` was NULL, so the self identity is used.
+
+**When it runs.** With the v2 stack and transports on, outside demo; opt out
+with `OPENMESSAGES_SIGNAL_DESKTOP_FEED=0`. It appends only while signal-cli is
+unpaired, paired but disconnected for five continuous minutes, or connected but
+silent past `freshness.signal.silence`'s rule (how a remotely unlinked device
+looks), and re-checks before every frame. When live and history do overlap,
+the IDs match, a later live frame updates the history row, and a send's confirm
+merges a history row that took its remote ID (#218). First scan 40 s after
+start; every 30 s it reads rows past the last rowid, skipping the read when
+Desktop's database and WAL are unchanged; every 6 h it rescans in full; if
+Desktop's rows end below the mark (a re-linked Desktop) it starts over.
+
+**Status.** `/api/status.signal_desktop` reports `enabled`, `available`,
+`active`, `gate` (`live_unpaired`, `live_offline`, `live_offline_waiting`,
+`live_silent`, `live_receiving`), `account_verified`, `db_path`,
+`last_scan_at_ms`, `last_full_scan_at_ms`, `high_water_rowid`,
+`frames_appended`, `messages_appended`, and for the last scan `rows_included`,
+`rows_in_v2` and `rows_skipped_by_reason`, plus `next_attempt_at_ms` while
+backing off and `last_error`. Inserts and skips show under
+`v2_ingest.per_account["signal-primary"].history_*`. The `signal` block still
+describes signal-cli only. History is never live evidence: silence counts only
+`signal.jsonrpc` inbox rows, and frames record no supervisor activity.
+`latest_ms`, `behind_days`, `stale` and `projection_stalled` measure stored
+coverage, so they do move.
+
+**Expected on this Mac** (dry run on a copy, 2026-10-11): 1,734 messages to
+fill, 1,588 of them after 08-18 and 146 July and August gaps signal-cli missed;
+6,612 Desktop messages already in v2; 14 new threads; 1,624 reactions. All 63
+v2 1:1 threads and 21 groups matched Desktop's by remote ID. v2's newest Signal
+message moves to 10-11 00:04, past legacy's 09-27 20:01, so
+`projection_stalled` clears on the first full scan after deploy. A second scan
+sends nothing. No existing message, identity, participant or reaction changed.
+
+```bash
+curl -s http://127.0.0.1:7007/api/status | jq '.signal_desktop, (.freshness.signal | {projection_stalled, latest_ms, legacy_latest_ms})'
+```
+
+**Rehearsing before a deploy.** Back up the v2 store read-only, then run the
+count-only dry run against the copy. It reads the keychain (a prompt can show),
+applies the frames to the copy through the real worker, rescans, and prints
+counts only:
+
+```bash
+mkdir -p /tmp/om-rehearsal && chmod 700 /tmp/om-rehearsal
+sqlite3 "file:$HOME/Library/Application Support/OpenMessage/v2/store.sqlite3?mode=ro" ".backup '/tmp/om-rehearsal/store.sqlite3'"
+GOWORK=off go run ./internal/signaldesktop/cmd/dryrun -v2 /tmp/om-rehearsal/store.sqlite3 -apply
+```
+
+**Limits.** Signal Desktop encrypts its attachment files at rest, so frames
+carry the placeholder body (`[Photo]`, `[Video]`, ...) and no file. History
+never updates a row: an edit, deletion or reaction that reaches Desktop after a
+message was captured is not applied. A send whose acknowledgement was lost
+keeps its local row under the request ID, and Desktop's copy is added beside it,
+as the live path would. Two distinct groups with identical rosters are both
+skipped while neither is in v2; once one is, the roster guard skips the other.
+The legacy Signal Desktop importer is separate and unchanged here (#231 turns
+the legacy local importers off on v2-primary). Inbox growth stays small: a
+scan sends a frame only for messages v2 lacks, so a rescan of unchanged history
+appends nothing. Payloads are kept until inbox retention (PR #196) lands.
+
 ## MCP serving — exactly one process may own live transports
 
 **The failure mode (empirically confirmed 2026-07-20):** `openmessage serve
