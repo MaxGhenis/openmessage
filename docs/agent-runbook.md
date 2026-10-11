@@ -1403,11 +1403,12 @@ reason="401|403|406">` at connect, or the `device_removed` stream error while
 connected) by dispatching `LoggedOut` on a goroutine and then deleting the
 session with the connection's event context (`connectionevents.go` in the
 pinned module). That context is the one `ConnectPaired` passes to
-`ConnectContext`. The lifecycle adapter cancels it as soon as `LoggedOut`
-reaches it, and the SQLite driver interrupts a statement whose context ends.
-In a test through the real bridge, adapter, supervisor and whatsmeow handler,
-with a small session store, whatsmeow's delete lost that race in 261 of 299
-runs.
+`ConnectContext`. Once `LoggedOut` reaches the lifecycle adapter, its
+coordinator cancels that context, and the SQLite driver interrupts a
+statement whose context ends. In a test through the real bridge, adapter,
+supervisor and whatsmeow handler, with a small session store, whatsmeow's
+delete lost that race in 261 of 299 runs. That makes the race the likely
+cause on 08-20, though the logs that would show it are gone.
 
 Since PR #232:
 
@@ -1418,33 +1419,52 @@ Since PR #232:
   for the episode). They are stored in the session store's
   `openmessage_whatsapp_runtime_state` row, so a restart keeps them.
   `last_error` is in memory only.
-- `paired` is `false` while `needs_relink` holds. `paired` means the install
-  holds an identity WhatsApp still accepts. whatsmeow's own contract is that
-  a logout deletes the session; the watchdog and the supervisor control's
-  re-pair path already treat a server logout as unpaired; and a revoked
-  identity that reads as paired blocks both reconnect and QR pairing.
+- The record names the revoked identity by its JID and a fingerprint of its
+  identity key. A new link always gets a new key, so the record never
+  matches a newer link, even one WhatsApp gave the same JID.
+- `paired` is `false` while the linked identity is the revoked one, and
+  `needs_relink` is `true` only while no newer link is stored, so one status
+  never reports both. `paired` means the install holds an identity WhatsApp
+  still accepts. whatsmeow's own contract is that a logout deletes the
+  session; the watchdog and the supervisor control's re-pair path already
+  treat a server logout as unpaired; and a revoked identity that reads as
+  paired blocks both reconnect and QR pairing. Status reads the bridge's own
+  record of the identity, never the live device, whose ID whatsmeow clears
+  from its own goroutine.
 - The bridge deletes the revoked identity itself, with its own 15 s context
-  and only that JID, right after the supervisor has been told. Every connect
-  and pair attempt deletes it first if it is still there, and nothing dials
-  it again. `whatsmeow_lid_map` has no tie to the device row and is kept.
+  and only on a JID and key match, right after the supervisor has been told.
+  Building the bridge and every connect and pair attempt do it again if it
+  is still there, so nothing dials it. `whatsmeow_lid_map` has no tie to the
+  device row and is kept.
+- The live bridge keeps owning WhatsApp during a logout
+  (`UsesLiveSession`), so the WhatsApp Desktop importer does not start;
+  its conversation upserts would overwrite timestamps and unread counts.
+  (Before #232 a logout whose delete succeeded did let it start.) It runs
+  only while WhatsApp is unlinked on purpose or was never linked, and never
+  under the macOS launcher, which sets `OPENMESSAGES_APP_SANDBOX=1`.
 - It is set by `LoggedOut` (401, 403, 406), or a `ConnectFailure` with one
-  of those reasons, on a client that held a linked identity. Temporary bans,
-  an outdated client, a replaced stream and a failed pairing attempt don't
-  set it.
-- A successful pairing (`PairSuccess`) clears it, and so does
-  `POST /api/whatsapp/unpair`. Unpair is a deliberate unlink, the way
-  Signal's unpair clears `needs_reauth`.
-- The app posts "WhatsApp needs relinking" once per episode. The latch is
-  `relink_since_ms`, kept in the app's `relinkNotifiedEpisodes` default, so a
-  relaunch during the logout stays quiet. Like every app health notification
-  it needs the app's desktop notifications on, and on Max's install they were
-  off on 2026-10-11:
+  of those reasons, on the current client while it holds a linked identity.
+  Temporary bans, an outdated client, a replaced stream, a failed pairing
+  attempt and events from a client already replaced don't set it.
+- It ends when a new link succeeds (`PairSuccess`), when a newer link is
+  found in the store (a pairing whose `PairSuccess` never arrived, or a
+  relink by an older binary), or on `POST /api/whatsapp/unpair`. Unpair is a
+  deliberate unlink, the way Signal's unpair clears `needs_reauth`. A write
+  of the record that fails is retried on the next change or connect
+  attempt; if an unpair's clear never lands, the unpair reports it, and a
+  restart before the retry brings `needs_relink` back until a relink.
+- The app posts "WhatsApp needs relinking" once per episode, keyed on
+  `relink_since_ms` in the app's `relinkNotifiedEpisodes` default. The episode
+  counts once macOS accepted the notification, so a relaunch during the
+  logout stays quiet and a rejected submission is retried. Like every app
+  health notification it needs the app's desktop notifications on, and on
+  Max's install they were off on 2026-10-11:
   `plutil -extract desktopNotificationsEnabled raw ~/Library/Preferences/com.openmessage.app.plist`
   printed `false`. (`defaults read com.openmessage.app` reads a stale July
   sandbox-container plist under `~/Library/Containers` and prints `1`.) The
-  menu bar says "WhatsApp needs re-pairing", MCP `get_status` prints a "Needs
-  relink" line, and the web Platforms panel shows "Logged out" with the
-  reason and date.
+  menu bar says "WhatsApp needs re-pairing", MCP `get_status` prints a
+  "Needs relink" line (in the app and in daemon-routed MCP stdio), and the
+  web Platforms panel shows "Logged out" with the reason and date.
 - The watchdog needs no change. It sees `paired` go from `true` to `false`
   and posts "No longer paired: whatsapp - check the app; relink unless that
   was intended" once, then pauses WhatsApp's staleness checks. Before #232 a

@@ -185,6 +185,9 @@ struct SilenceNotificationLatch {
     /// Platform key → the `since` of the last episode notified. Persist it
     /// (see `NotificationManager`) so an app relaunch mid-outage stays quiet.
     private(set) var notifiedEpisode: [String: Int64]
+    /// Platform key → the `since` of an episode whose notification was
+    /// submitted but not yet confirmed. Not persisted: a relaunch retries it.
+    private(set) var pendingEpisode: [String: Int64] = [:]
 
     init(notifiedEpisode: [String: Int64] = [:]) {
         self.notifiedEpisode = notifiedEpisode
@@ -221,14 +224,32 @@ struct SilenceNotificationLatch {
         }
     }
 
-    /// Logged-out items not yet notified for their episode (`relink_since_ms`,
-    /// fixed until a new link or an unpair). Keep a separate latch for these
-    /// too, so a relaunch during a logout stays quiet and the next logout
-    /// notifies again.
-    mutating func newlyLoggedOut(_ items: [PlatformAttention]) -> [PlatformAttention] {
-        newlyNotified(items) { reason in
-            if case let .loggedOut(since, _) = reason { return since }
-            return nil
+    /// Logged-out items to notify now: their episode (`relink_since_ms`, fixed
+    /// until a new link or an unpair) has not been delivered and is not in
+    /// flight. Marks them in flight; report each submission's outcome with
+    /// `finishLoggedOut`. Keep a separate latch for these, so a relaunch during
+    /// a logout stays quiet and the next logout notifies again. Unlike the
+    /// silence latches, an episode counts as notified only once macOS accepted
+    /// its notification, so a failed submission is retried.
+    mutating func beginLoggedOut(_ items: [PlatformAttention]) -> [PlatformAttention] {
+        items.filter { item in
+            guard case let .loggedOut(since, _) = item.reason else { return false }
+            if notifiedEpisode[item.key] == since || pendingEpisode[item.key] == since { return false }
+            pendingEpisode[item.key] = since
+            return true
+        }
+    }
+
+    /// Records the outcome of a submission `beginLoggedOut` started. Delivered
+    /// marks the episode notified (persist `storedValue` afterwards); a failure
+    /// leaves it for the next health check.
+    mutating func finishLoggedOut(_ item: PlatformAttention, delivered: Bool) {
+        guard case let .loggedOut(since, _) = item.reason else { return }
+        if pendingEpisode[item.key] == since {
+            pendingEpisode[item.key] = nil
+        }
+        if delivered {
+            notifiedEpisode[item.key] = since
         }
     }
 

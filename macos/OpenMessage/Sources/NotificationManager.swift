@@ -379,13 +379,21 @@ final class NotificationManager: NSObject, ObservableObject, UNUserNotificationC
             title: "WhatsApp needs attention",
             body: "WhatsApp was logged out. Open OpenMessage to scan the QR code and reconnect."
         )
-        let newlyLoggedOut = relinkLatch.newlyLoggedOut(attention)
-        if !newlyLoggedOut.isEmpty {
-            defaults.set(relinkLatch.storedValue, forKey: relinkLatchKey)
-        }
-        for item in newlyLoggedOut {
-            guard let body = PlatformAttention.loggedOutNotificationBody(item) else { continue }
-            sendHealthNotification(key: "\(item.key)-relink", title: "\(item.name) needs relinking", body: body)
+        // The episode counts as notified only once macOS accepted the
+        // notification; a failed submission is retried on the next check.
+        for item in relinkLatch.beginLoggedOut(attention) {
+            guard let body = PlatformAttention.loggedOutNotificationBody(item) else {
+                relinkLatch.finishLoggedOut(item, delivered: false)
+                continue
+            }
+            sendHealthNotification(key: "\(item.key)-relink", title: "\(item.name) needs relinking", body: body) { delivered in
+                Task { @MainActor in
+                    self.relinkLatch.finishLoggedOut(item, delivered: delivered)
+                    if delivered {
+                        self.defaults.set(self.relinkLatch.storedValue, forKey: self.relinkLatchKey)
+                    }
+                }
+            }
         }
         let newlySilent = silenceLatch.newlySilent(attention)
         if !newlySilent.isEmpty {
@@ -415,7 +423,12 @@ final class NotificationManager: NSObject, ObservableObject, UNUserNotificationC
         }
     }
 
-    private func sendHealthNotification(key: String, title: String, body: String) {
+    private func sendHealthNotification(
+        key: String,
+        title: String,
+        body: String,
+        completion: (@Sendable (_ delivered: Bool) -> Void)? = nil
+    ) {
         let content = UNMutableNotificationContent()
         content.title = title
         content.body = body
@@ -431,6 +444,7 @@ final class NotificationManager: NSObject, ObservableObject, UNUserNotificationC
             if let error {
                 self.logger.error("Failed to send health notification: \(error)")
             }
+            completion?(error == nil)
         }
     }
 

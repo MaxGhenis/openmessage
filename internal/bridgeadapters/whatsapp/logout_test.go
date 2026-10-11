@@ -12,9 +12,9 @@ import (
 
 // One half of the 2026-08-20 mechanism. whatsmeow deletes a logged-out session
 // with the event context of the connection, which is the context Start hands
-// to connect, and it dispatches LoggedOut before it starts that delete. The
-// adapter cancels the context as soon as LoggedOut reaches it, so whatsmeow's
-// delete can be interrupted. whatsapplive therefore removes the revoked
+// to connect, and it dispatches LoggedOut before it starts that delete. Once
+// LoggedOut reaches the adapter, its coordinator cancels that context, so
+// whatsmeow's delete can be interrupted. whatsapplive therefore removes the revoked
 // identity itself (whatsapplive's TestWhatsmeowLogoutDeleteNeedsALiveEventContext
 // pins the other half).
 func TestLoggedOutCancelsTheContextGivenToConnect(t *testing.T) {

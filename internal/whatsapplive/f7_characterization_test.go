@@ -214,6 +214,8 @@ func TestHandleTemporaryBanSurfacesExpiryOnlyInLastError(t *testing.T) {
 		client: &whatsmeow.Client{
 			Store: &wastore.Device{ID: &ownJID},
 		},
+		// New records the identity of the device it builds the client from.
+		identity: linkedIdentity{JID: ownJID},
 		callbacks: Callbacks{
 			OnStatusChange: func() { statusChanges++ },
 		},

@@ -293,23 +293,48 @@ final class PlatformAttentionTests: XCTestCase {
         )
 
         var latch = SilenceNotificationLatch()
-        XCTAssertEqual(latch.newlyLoggedOut([loggedOut]), [loggedOut])
-        XCTAssertEqual(latch.newlyLoggedOut([loggedOut]), [])
+        XCTAssertEqual(latch.beginLoggedOut([loggedOut]), [loggedOut])
+        latch.finishLoggedOut(loggedOut, delivered: true)
+        XCTAssertEqual(latch.beginLoggedOut([loggedOut]), [])
         defaults.set(latch.storedValue, forKey: "relinkNotifiedEpisodes")
 
         var relaunched = SilenceNotificationLatch(storedValue: defaults.object(forKey: "relinkNotifiedEpisodes"))
-        XCTAssertEqual(relaunched.newlyLoggedOut([loggedOut]), [])
-        XCTAssertEqual(relaunched.newlyLoggedOut([]), [], "relinked: nothing to notify")
-        XCTAssertEqual(relaunched.newlyLoggedOut([nextLogout]), [nextLogout])
+        XCTAssertEqual(relaunched.beginLoggedOut([loggedOut]), [])
+        XCTAssertEqual(relaunched.beginLoggedOut([]), [], "relinked: nothing to notify")
+        XCTAssertEqual(relaunched.beginLoggedOut([nextLogout]), [nextLogout])
 
         // The other latches never fire on a logout, and this one never fires on
         // their reasons.
         var silence = SilenceNotificationLatch()
         XCTAssertEqual(silence.newlySilent([loggedOut]), [])
         XCTAssertEqual(silence.newlyStoppedSMS([loggedOut]), [])
-        XCTAssertEqual(silence.newlyLoggedOut([
+        XCTAssertEqual(silence.beginLoggedOut([
             PlatformAttention(key: "google", name: "Google Messages", reason: .silent(hours: 7, since: 1_000)),
         ]), [])
+    }
+
+    // A submission macOS rejected does not consume the episode: the next check
+    // retries it. One in flight is not submitted twice, and only a delivered
+    // episode is persisted.
+    func testLogoutNotificationRetriesAFailedSubmission() {
+        let loggedOut = PlatformAttention(
+            key: "whatsapp", name: "WhatsApp", reason: .loggedOut(since: 1_787_260_699_000, reason: "401: logged out from another device")
+        )
+        var latch = SilenceNotificationLatch()
+        XCTAssertEqual(latch.beginLoggedOut([loggedOut]), [loggedOut])
+        XCTAssertEqual(latch.beginLoggedOut([loggedOut]), [], "already in flight")
+        latch.finishLoggedOut(loggedOut, delivered: false)
+        XCTAssertEqual(latch.storedValue, [:], "a failed submission must not be persisted as notified")
+        XCTAssertEqual(latch.beginLoggedOut([loggedOut]), [loggedOut], "retried after the failure")
+        latch.finishLoggedOut(loggedOut, delivered: true)
+        XCTAssertEqual(latch.storedValue, ["whatsapp": NSNumber(value: Int64(1_787_260_699_000))])
+        XCTAssertEqual(latch.beginLoggedOut([loggedOut]), [])
+
+        // A relaunch while a submission was in flight retries it.
+        var inFlight = SilenceNotificationLatch()
+        XCTAssertEqual(inFlight.beginLoggedOut([loggedOut]), [loggedOut])
+        var relaunched = SilenceNotificationLatch(storedValue: inFlight.storedValue)
+        XCTAssertEqual(relaunched.beginLoggedOut([loggedOut]), [loggedOut])
     }
 
     // A backend that predates needs_relink keeps the old reading (paired=false
