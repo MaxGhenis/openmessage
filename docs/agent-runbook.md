@@ -1462,6 +1462,57 @@ every session-store call for prekey, ordinary and group messages, with
 the handler context both detached and cancelled. It also covers an
 app-state patch interrupted between its version and MAC writes.
 
+### Acks wait for the commit (receipts, newsletter posts, retry receipts)
+
+Until PR #240 whatsmeow ran with asynchronous acks. It acknowledged a
+receipt, a newsletter (channel) post, a notification or a call in a goroutine
+as soon as it started handling it, and it acknowledged an incoming retry
+receipt (a peer asking us to resend a message it could not decrypt) whatever
+happened to the resend. A teardown in that window lost the stanza: the
+generation dropped the v2 frame, or the resend failed on the closed socket,
+and the server, holding the ack, never sent it again.
+
+Now:
+
+- whatsmeow runs with `SynchronousAck`. It acknowledges a stanza after its
+  event handlers return, and not at all when one reports failure. The bridge
+  reports a receipt not handled when its frame was not committed, as it does
+  for messages, with the log line `WhatsApp receipt not committed to ingress;
+  leaving it for redelivery`. The legacy receipt status update still runs on
+  every delivery; it only ever upgrades a status.
+- whatsmeow (pinned at upstream `d7b3e15` or later) acknowledges an incoming
+  retry receipt after its resend, and skips the ack when the resend failed
+  because the client had no connection, so the next connection resends.
+- Notifications and calls carry no frame and are acknowledged after their
+  handlers, as before but later.
+- With synchronous acks, whatsmeow asks our own phone for a message it cannot
+  decrypt, on the first retry receipt it sends for that message (a
+  placeholder resend request, the same request OpenMessage's media
+  placeholder repair sends). It asks only on the first retry for a message.
+  whatsmeow logs
+  `Requested message <id> from phone` (debug) or `Failed to send request for
+  unavailable message <id> to phone`. The phone's answer arrives as a message
+  from our account's device 0 and is ingested like any message.
+- Outgoing retry receipts and phone requests now run inside whatsmeow's
+  handler queue, so a burst of undecryptable messages slows handling.
+  whatsmeow logs `Node handling is taking long` every 30 s for a stanza that
+  holds the queue.
+
+Still not covered: protocol receipts to our own phone (`hist_sync`,
+`peer_msg`) go out before the outcome is known; a resend that fails for any
+reason other than a lost connection is acknowledged; and in a grouped receipt
+with several `participants` children, whatsmeow keeps only the last child's
+result, so a transient append error on an earlier child is acknowledged.
+
+Tests: `fakeWhatsApp` (`internal/whatsapplive/fakewhatsapp_test.go`) is an
+in-process WhatsApp web server that whatsmeow dials for real: Noise
+handshake, login, acks over the real socket, and redelivery of
+unacknowledged stanzas on reconnect. `ack_teardown_test.go` drops the
+connection while a receipt, a newsletter post and a retry receipt are in
+flight. `ack_table_test.go` runs every stanza kind against every ingress
+outcome with the connection left open. `phone_request_test.go` covers the
+phone request and its answer.
+
 ## signal-cli
 
 Require **signal-cli ≥ 0.14.5**. 0.14.1 throws
