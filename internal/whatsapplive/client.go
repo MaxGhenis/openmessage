@@ -422,6 +422,22 @@ func (b *Bridge) initClientLocked() error {
 	// against the advanced session, fails with an old-counter error, and
 	// whatsmeow acknowledges it.
 	cli.EnableDecryptedEventBuffer = true
+	// Acknowledge a stanza only after its event handlers return, and not at
+	// all when one reports failure. With asynchronous acks whatsmeow acks
+	// receipts, newsletter posts and notifications in a goroutine before it
+	// handles them, so one whose ingress frame a retiring generation dropped
+	// was never redelivered; and it acked an incoming retry receipt whatever
+	// happened to the resend. Now the server redelivers what was not
+	// committed (or not resent) to a later connection.
+	cli.SynchronousAck = true
+	// With synchronous acks whatsmeow asks our phone for a message it cannot
+	// decrypt on the first retry receipt it sends for it, whatever this flag
+	// says (sendRetryReceipt). It is set so that the asynchronous path, which
+	// waits five seconds for the sender's resend before asking, agrees. The
+	// phone answers with a placeholder resend, which reaches handleMessage
+	// like any message; OpenMessage already sends the same request to repair
+	// unavailable media placeholders.
+	cli.AutomaticMessageRerequestFromPhone = true
 	b.clientGeneration++
 	clientGeneration := b.clientGeneration
 	cli.AddEventHandlerWithSuccessStatus(func(raw any) bool {
@@ -577,9 +593,10 @@ func (b *Bridge) ObserveLifecycle(callback func(LifecycleEvent)) func() {
 // The callback returns nil once the frame is durably committed (or the
 // observer deliberately discards it, as a legacy-only sink does). A non-nil
 // error means the frame was not committed and a later delivery can succeed;
-// for a message, whatsmeow is then told the event was not handled, so it keeps
-// the decrypted plaintext in its event buffer, sends no receipt, and the
-// server redelivers it to a later generation.
+// for a message or receipt, whatsmeow is then told the event was not handled,
+// so it sends no ack or receipt (SynchronousAck), keeps a decrypted message's
+// plaintext in its event buffer, and the server redelivers the stanza to a
+// later generation.
 func (b *Bridge) ObserveIngress(callback func(IngressFrame) error) func() {
 	b.mu.Lock()
 	b.nextIngressObserverID++
@@ -1996,10 +2013,10 @@ func (b *Bridge) ProfilePhoto(conversationID string) ([]byte, string, error) {
 // local generation. Temporary-ban persistence happens before either the
 // compatibility status projection or the supervisor observer is notified.
 //
-// It returns whatsmeow's handler success status: false only for a message
-// whose ingress frame was not committed and can be on a later delivery (see
-// ObserveIngress). Every other event, and every event from a retired client,
-// reports success.
+// It returns whatsmeow's handler success status: false only for a message or
+// receipt whose ingress frame was not committed and can be on a later
+// delivery (see ObserveIngress). Every other event, and every event from a
+// retired client, reports success.
 func (b *Bridge) handleClientEvent(source *whatsmeow.Client, generation uint64, raw any) bool {
 	b.mu.RLock()
 	current := source == nil || (b.client == source && b.clientGeneration == generation)
@@ -2146,17 +2163,22 @@ func (b *Bridge) captureMessageIngress(evt *waevents.Message, chatJID watypes.JI
 	})
 }
 
-func (b *Bridge) captureReceiptIngress(evt *waevents.Receipt) {
+// captureReceiptIngress returns a non-nil error only when the frame was built
+// but not committed and a later delivery can succeed, like
+// captureMessageIngress. whatsmeow then leaves the receipt unacknowledged
+// (SynchronousAck), so the server redelivers it.
+func (b *Bridge) captureReceiptIngress(evt *waevents.Receipt) (deliveryErr error) {
 	// Capture is strictly additive observation: a panic anywhere in the
 	// capture body must not reach the whatsmeow callback or skip the legacy
 	// handling that follows it.
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			b.logIngressCaptureError("receipt", fmt.Errorf("capture panic: %v", recovered))
+			deliveryErr = nil
 		}
 	}()
-	if !b.hasIngressObserver() {
-		return
+	if !b.wantsIngress() {
+		return nil
 	}
 	receivedAt := time.Now()
 	// canonicalJID, not normalizeConversationJID: the latter merges legacy
@@ -2178,11 +2200,9 @@ func (b *Bridge) captureReceiptIngress(evt *waevents.Receipt) {
 	})
 	if err != nil {
 		b.logIngressCaptureError("receipt", err)
-		return
+		return nil
 	}
-	// whatsmeow acknowledges a receipt before dispatching it (asynchronous
-	// acks), so a delivery error here cannot become a redelivery.
-	_ = b.emitIngress(IngressFrame{
+	return b.emitIngress(IngressFrame{
 		DedupeKey:  "rcpt:" + ingressHash8(payload),
 		ReceivedAt: receivedAt,
 		Payload:    payload,
@@ -2280,8 +2300,8 @@ func (b *Bridge) logIngressCaptureError(kind string, err error) {
 	b.logger.Warn().Err(err).Str("kind", kind).Msg("Failed to capture WhatsApp ingress frame")
 }
 
-// applyEvent returns false only for a message whose ingress frame was not
-// committed and can be on a later delivery.
+// applyEvent returns false only for a message or receipt whose ingress frame
+// was not committed and can be on a later delivery.
 func (b *Bridge) applyEvent(raw any) bool {
 	switch evt := raw.(type) {
 	case *waevents.Connected:
@@ -2320,7 +2340,7 @@ func (b *Bridge) applyEvent(raw any) bool {
 	case *waevents.Message:
 		return b.handleMessage(evt)
 	case *waevents.Receipt:
-		b.handleReceipt(evt)
+		return b.handleReceipt(evt)
 	case *waevents.ChatPresence:
 		b.handleChatPresence(evt)
 	case *waevents.GroupInfo:
@@ -2622,11 +2642,29 @@ func (b *Bridge) handleReactionMessage(evt *waevents.Message) bool {
 	return true
 }
 
-func (b *Bridge) handleReceipt(evt *waevents.Receipt) {
+// handleReceipt reports false when the receipt's ingress frame was not
+// committed and a later delivery can commit it (see ObserveIngress), so
+// whatsmeow leaves the receipt unacknowledged and the server redelivers it.
+// The legacy status update runs on every delivery: it only ever upgrades a
+// status, so a redelivery repeats it without effect.
+func (b *Bridge) handleReceipt(evt *waevents.Receipt) bool {
 	if evt == nil || len(evt.MessageIDs) == 0 {
-		return
+		return true
 	}
-	b.captureReceiptIngress(evt)
+	handled := true
+	if err := b.captureReceiptIngress(evt); err != nil {
+		b.logger.Warn().
+			Err(err).
+			Strs("msg_ids", evt.MessageIDs).
+			Str("receipt_type", string(evt.Type)).
+			Msg("WhatsApp receipt not committed to ingress; leaving it for redelivery")
+		handled = false
+	}
+	b.applyLegacyReceipt(evt)
+	return handled
+}
+
+func (b *Bridge) applyLegacyReceipt(evt *waevents.Receipt) {
 	nextStatus, ok := receiptStatus(evt.Type)
 	if !ok {
 		return

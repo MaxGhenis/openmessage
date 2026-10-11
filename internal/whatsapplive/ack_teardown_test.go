@@ -232,7 +232,16 @@ func newAckHarness(t *testing.T) *ackHarness {
 		t.Fatalf("db.New(): %v", err)
 	}
 	t.Cleanup(func() { _ = messages.Close() })
+	h := &ackHarness{
+		clock:   new(atomic.Uint64),
+		peerLID: watypes.JID{User: "200000000000002", Server: watypes.HiddenUserServer},
+	}
+	// The server starts first so its cleanup (dropping the connection) runs
+	// after the client has been closed: whatsmeow races on its disconnect
+	// handler when the two closes overlap.
+	h.server = newFakeWhatsApp(t, h.clock, ourLID)
 	logs := newLogCapture()
+	h.logs = logs
 	var out = zerolog.MultiLevelWriter(logs)
 	if os.Getenv("OPENMESSAGE_TEARDOWN_TEST_LOG") != "" {
 		out = zerolog.MultiLevelWriter(logs, zerolog.ConsoleWriter{Out: os.Stderr})
@@ -244,11 +253,6 @@ func newAckHarness(t *testing.T) *ackHarness {
 	}
 	t.Cleanup(func() { _ = host.Close() })
 
-	h := &ackHarness{
-		clock:   new(atomic.Uint64),
-		logs:    logs,
-		peerLID: watypes.JID{User: "200000000000002", Server: watypes.HiddenUserServer},
-	}
 	cli := whatsapplive.ClientForTeardownTest(host)
 	h.lids = &lidStoreHook{LIDStore: cli.Store.LIDs}
 	cli.Store.LIDs = h.lids
@@ -267,7 +271,6 @@ func newAckHarness(t *testing.T) *ackHarness {
 		return nil
 	}
 
-	h.server = newFakeWhatsApp(t, h.clock, ourLID)
 	cli.SetWebsocketHTTPClient(h.server.httpClient())
 	dials := make(chan context.Context, 8)
 	whatsapplive.StubDialForTeardownTest(t, func(ctx context.Context, cli *whatsmeow.Client) error {

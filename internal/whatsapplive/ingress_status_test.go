@@ -29,11 +29,12 @@ const (
 )
 
 // TestHandledStatusTable checks, for every combination of observer state and
-// event kind, the status the bridge reports to whatsmeow and whether the
-// legacy store took the message. The rule: only a message whose frame was not
+// event kind, the status the bridge reports to whatsmeow and what the legacy
+// store took. The rule: only a message or receipt whose frame was not
 // committed while an adapter owns ingress, for a reason a later delivery can
 // clear (no observing generation, or the observer rejected it), is reported
-// not handled, and then the legacy store does not take it either.
+// not handled. The legacy store then does not take the message; a receipt's
+// upgrade-only status change applies on every delivery.
 func TestHandledStatusTable(t *testing.T) {
 	outcomes := []ingressObserverOutcome{observerNeverUsed, observerCommits, observerRejects, observerPanics, observerRemoved}
 	kinds := []string{"message", "receipt", "history_sync", "chat_presence"}
@@ -61,6 +62,20 @@ func TestHandledStatusTable(t *testing.T) {
 				}
 
 				chat := watypes.NewJID("15551234567", watypes.DefaultUserServer)
+				if kind == "receipt" {
+					if err := store.UpsertMessage(&db.Message{
+						MessageID:      "whatsapp:status-table",
+						ConversationID: "whatsapp:" + chat.String(),
+						Body:           "our message",
+						TimestampMS:    1775005000000,
+						Status:         "sent",
+						IsFromMe:       true,
+						SourcePlatform: "whatsapp",
+						SourceID:       "status-table",
+					}); err != nil {
+						t.Fatalf("seed outgoing message: %v", err)
+					}
+				}
 				var event any
 				switch kind {
 				case "message":
@@ -95,9 +110,17 @@ func TestHandledStatusTable(t *testing.T) {
 					t.Fatalf("observer saw %d frames, want %d", observed, wantObserved)
 				}
 
-				wantHandled := !(kind == "message" && (outcome == observerRejects || outcome == observerRemoved))
+				carriesFrame := kind == "message" || kind == "receipt"
+				wantHandled := !(carriesFrame && (outcome == observerRejects || outcome == observerRemoved))
 				if handled != wantHandled {
 					t.Fatalf("handled = %v, want %v", handled, wantHandled)
+				}
+				if kind == "receipt" {
+					stored, err := store.GetMessageByID("whatsapp:status-table")
+					if err != nil || stored == nil || stored.Status != "read" {
+						t.Fatalf("legacy status after the receipt = %+v, %v; want read on every delivery", stored, err)
+					}
+					return
 				}
 				if kind != "message" {
 					return
