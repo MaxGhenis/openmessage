@@ -32,6 +32,23 @@ struct BackendCommandMatcher: Sendable {
     }
 }
 
+/// Whether a process runs inside the macOS App Sandbox. macOS sets
+/// `APP_SANDBOX_CONTAINER_ID` in the environment of every sandboxed process,
+/// so the app reads its own environment instead of assuming. The shipped
+/// Developer ID build is not sandboxed (OpenMessage.entitlements carries only
+/// Hardened Runtime exceptions); the sandboxed Xcode target this flag was
+/// first written for no longer exists.
+enum AppSandbox {
+    static let containerIDKey = "APP_SANDBOX_CONTAINER_ID"
+
+    static func isActive(
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> Bool {
+        guard let containerID = environment[containerIDKey] else { return false }
+        return !containerID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+}
+
 /// Complete, inspectable description of one backend launch.
 struct BackendLaunchConfiguration: Equatable, Sendable {
     let executableURL: URL
@@ -49,19 +66,28 @@ struct BackendLaunchConfiguration: Equatable, Sendable {
     /// isolated package tests can add stricter test-only controls without
     /// changing or contradicting the canonical environment shipped by
     /// BackendManager.
+    ///
+    /// `appSandboxed` defaults to what this process really is. The backend
+    /// skips the local desktop imports (WhatsApp Desktop, Signal Desktop,
+    /// iMessage) and the WhatsApp media repair when it receives "1", because a
+    /// sandboxed app cannot read other apps' data. Passing "1" from an
+    /// unsandboxed app turned those off on every install from 2026-04-04 on.
+    /// The key is always set ("1" or "0") so `additionalEnvironment` can never
+    /// supply it.
     static func application(
         executablePath: String,
         dataDirectory: String,
         port: Int,
         homeDirectory: String = NSHomeDirectory(),
         v2Primary: Bool = false,
+        appSandboxed: Bool = AppSandbox.isActive(),
         additionalEnvironment: [String: String] = [:]
     ) -> BackendLaunchConfiguration {
         var canonical = [
             "OPENMESSAGES_PORT": String(port),
             "OPENMESSAGES_DATA_DIR": dataDirectory,
             "OPENMESSAGES_LOG_LEVEL": "info",
-            "OPENMESSAGES_APP_SANDBOX": "1",
+            "OPENMESSAGES_APP_SANDBOX": appSandboxed ? "1" : "0",
             "OPENMESSAGES_MACOS_NOTIFICATIONS": "0",
             "HOME": homeDirectory,
             "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
