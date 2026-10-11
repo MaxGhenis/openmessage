@@ -169,7 +169,10 @@ func Queries(afterRowID int64) []Query {
 				COALESCE(m.type, '') AS type,
 				COALESCE(m.body, '') AS body,
 				COALESCE(m.sent_at, 0) AS sent_at,
-				COALESCE(m.source, '') AS source,
+				-- messages.source is declared STRING, which SQLite gives
+				-- numeric affinity: a stored "+1555..." comes back as the
+				-- integer 1555.... Put the plus back.
+				CASE WHEN typeof(m.source) = 'integer' THEN '+' || m.source ELSE COALESCE(m.source, '') END AS source,
 				COALESCE(m.sourceServiceId, '') AS source_service_id,
 				COALESCE(json_extract(m.json, '$.deletedForEveryone'), 0) AS deleted_for_everyone,
 				COALESCE(json_extract(m.json, '$.isViewOnce'), 0) AS view_once,
