@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -25,32 +26,39 @@ const coreDataEpoch = 978307200
 // An import writes only what the store lacks or holds differently: a message
 // already stored with the same conversation, sender, body, time and
 // direction is counted in MessagesDuplicate and not rewritten, and a chat is
-// upserted only when it is new to the store, differs from it, or one of its
-// messages was written. MessagesImported counts the messages written, new or
-// changed.
+// upserted only when it is new to the store or differs from it.
 // Tapbacks ("Loved “…”") become reactions on the message they quote, as
-// Store.RepairTapbacks does at startup, instead of standalone text rows.
+// Store.RepairTapbacks does at startup, instead of standalone text rows. A
+// chat's reactions depend on the order of all its tapbacks and on which
+// messages they can quote, so every chat an import reads has them rebuilt
+// from its complete tapback list (Store.RebuildTapbackReactions), which
+// commits only what changes. A message that Messages joins to two chats
+// belongs to the one with the lower ROWID. MessagesImported counts the rows
+// written: new or changed messages plus rows a rebuild changed.
 type IMessage struct {
 	// DBPath is the path to chat.db. Defaults to ~/Library/Messages/chat.db.
 	DBPath string
 	// MyName is the display name for outgoing messages (default "Me").
 	MyName string
-	// AfterRowID limits an import to chat.db messages whose ROWID is greater.
-	// Messages assigns ROWIDs in insertion order, so this also catches older
-	// messages that iCloud sync inserts late, which a date window would miss.
-	// An import that finishes without errors advances it to the highest ROWID
-	// it saw, so one IMessage reused across polls reads only what arrived
-	// since the last poll. Zero reads everything; a chat.db whose highest
-	// ROWID is below it (replaced, restored, or its newest rows deleted) is
-	// read in full again. An edit to an already-read row is picked up by the
-	// next full read, which a daemon does once per start.
+	// AfterRowID limits an import to the chats that have a chat.db message
+	// whose ROWID is greater (messages up to it are not re-checked). Messages
+	// assigns ROWIDs in insertion order, so this also catches older messages
+	// that iCloud sync inserts late, which a date window would miss. An
+	// import that finishes without errors advances it to the highest ROWID it
+	// saw, so one IMessage reused across polls reads only the chats that
+	// changed since the last poll. Zero reads everything. When the row at the
+	// mark is gone or is another message (chat.db replaced, restored, or its
+	// newest rows deleted), the importer that set the mark reads everything
+	// again. An edit to an already-read row is picked up by the next full
+	// read, which a daemon does once per start.
 	AfterRowID int64
 
-	// The chat table's own high-water mark, valid while AfterRowID still
-	// holds the value this importer set (markedRowID): Messages can add a
-	// chat before it has any message, and a full read creates those too.
-	afterChatRowID int64
+	// What this importer recorded when it set AfterRowID (markedRowID): the
+	// guid of the message at the mark, and the chat table's own mark, since
+	// Messages can add a chat before it has any message.
 	markedRowID    int64
+	markedGUID     string
+	afterChatRowID int64
 }
 
 // ImportFromDB imports the chat.db messages after AfterRowID; see IMessage.
@@ -71,7 +79,11 @@ func (im *IMessage) ImportFromDB(store *db.Store) (*ImportResult, error) {
 	// Bound this import at the newest rows now present, so a message Messages
 	// writes while it runs is read by the next import, not half by this one.
 	var highWater, chatHighWater int64
-	if err := chatDB.QueryRow(`SELECT COALESCE((SELECT MAX(ROWID) FROM message), 0), COALESCE((SELECT MAX(ROWID) FROM chat), 0)`).Scan(&highWater, &chatHighWater); err != nil {
+	var highWaterGUID sql.NullString
+	if err := chatDB.QueryRow(`SELECT
+			COALESCE((SELECT MAX(ROWID) FROM message), 0),
+			(SELECT guid FROM message ORDER BY ROWID DESC LIMIT 1),
+			COALESCE((SELECT MAX(ROWID) FROM chat), 0)`).Scan(&highWater, &highWaterGUID, &chatHighWater); err != nil {
 		return nil, fmt.Errorf("read iMessage high-water mark: %w", err)
 	}
 	after := im.AfterRowID
@@ -81,7 +93,16 @@ func (im *IMessage) ImportFromDB(store *db.Store) (*ImportResult, error) {
 	// -1: chats are selected by their messages alone.
 	afterChat := int64(-1)
 	if after > 0 && after == im.markedRowID {
-		afterChat = im.afterChatRowID
+		var guid string
+		err := chatDB.QueryRow(`SELECT guid FROM message WHERE ROWID = ?`, after).Scan(&guid)
+		switch {
+		case errors.Is(err, sql.ErrNoRows) || (err == nil && guid != im.markedGUID):
+			after = 0
+		case err != nil:
+			return nil, fmt.Errorf("check iMessage high-water mark: %w", err)
+		default:
+			afterChat = im.afterChatRowID
+		}
 	}
 
 	result := &ImportResult{}
@@ -97,14 +118,15 @@ func (im *IMessage) ImportFromDB(store *db.Store) (*ImportResult, error) {
 	for _, chat := range chats {
 		convID := "imessage:" + chat.guid
 
-		msgs, err := im.loadMessages(chatDB, chat.rowID, after, highWater)
+		// The whole chat, so its tapbacks can be rebuilt; only messages past
+		// the mark can be new.
+		msgs, err := im.loadMessages(chatDB, chat.rowID, highWater)
 		if err != nil {
 			result.Errors = append(result.Errors, fmt.Sprintf("messages for %s: %v", chat.guid, err))
 			continue
 		}
 
-		var writes []*db.Message
-		var tapbacks []*db.Message
+		var writes, tapbacks []*db.Message
 		for _, m := range msgs {
 			msg := &db.Message{
 				MessageID:      "imessage:" + m.guid,
@@ -118,6 +140,13 @@ func (im *IMessage) ImportFromDB(store *db.Store) (*ImportResult, error) {
 				SourcePlatform: "imessage",
 				SourceID:       m.guid,
 			}
+			if _, ok := db.ParseTapback(msg.Body); ok {
+				tapbacks = append(tapbacks, msg)
+				continue
+			}
+			if m.rowID <= after {
+				continue
+			}
 			existing, err := store.GetMessageByID(msg.MessageID)
 			if err != nil {
 				result.Errors = append(result.Errors, fmt.Sprintf("message %s: %v", m.guid, err))
@@ -126,12 +155,6 @@ func (im *IMessage) ImportFromDB(store *db.Store) (*ImportResult, error) {
 			if existing != nil && sameIMessageRow(existing, msg) {
 				result.MessagesDuplicate++
 				continue
-			}
-			if existing == nil {
-				if _, ok := db.ParseTapback(msg.Body); ok {
-					tapbacks = append(tapbacks, msg)
-					continue
-				}
 			}
 			writes = append(writes, msg)
 		}
@@ -146,7 +169,7 @@ func (im *IMessage) ImportFromDB(store *db.Store) (*ImportResult, error) {
 			SourcePlatform: "imessage",
 		}
 		existingConv, _ := store.GetConversation(convID)
-		if existingConv == nil || !sameIMessageConversation(existingConv, conv) || len(writes) > 0 || len(tapbacks) > 0 {
+		if existingConv == nil || !sameIMessageConversation(existingConv, conv) {
 			if err := store.UpsertConversation(conv); err != nil {
 				result.Errors = append(result.Errors, fmt.Sprintf("conversation %s: %v", chat.guid, err))
 				continue
@@ -156,9 +179,6 @@ func (im *IMessage) ImportFromDB(store *db.Store) (*ImportResult, error) {
 			}
 		}
 
-		// Messages are loaded oldest first; a tapback is applied after every
-		// message of its batch is stored, so it finds a target that arrived
-		// in the same import, and in order, so a later removal wins.
 		for _, msg := range writes {
 			if err := store.UpsertMessage(msg); err != nil {
 				if strings.Contains(err.Error(), "UNIQUE constraint") {
@@ -170,33 +190,18 @@ func (im *IMessage) ImportFromDB(store *db.Store) (*ImportResult, error) {
 			}
 			result.MessagesImported++
 		}
-		for _, msg := range tapbacks {
-			applied, changed, err := store.ApplyTapbackChange(msg)
-			if err != nil {
-				result.Errors = append(result.Errors, fmt.Sprintf("tapback %s: %v", msg.SourceID, err))
-				continue
-			}
-			if applied {
-				if changed {
-					result.MessagesImported++
-				} else {
-					result.MessagesDuplicate++
-				}
-				continue
-			}
-			// No target yet: keep it as text, as every other path does;
-			// RepairTapbacks converts it once its target is stored.
-			if err := store.UpsertMessage(msg); err != nil {
-				result.Errors = append(result.Errors, fmt.Sprintf("message %s: %v", msg.SourceID, err))
-				continue
-			}
-			result.MessagesImported++
+		rebuilt, err := store.RebuildTapbackReactions(convID, tapbacks)
+		if err != nil {
+			result.Errors = append(result.Errors, fmt.Sprintf("tapbacks for %s: %v", chat.guid, err))
+			continue
 		}
+		result.MessagesImported += rebuilt
 	}
 
 	if len(result.Errors) == 0 {
 		im.AfterRowID = highWater
 		im.markedRowID = highWater
+		im.markedGUID = highWaterGUID.String
 		im.afterChatRowID = chatHighWater
 	}
 	return result, nil
@@ -236,6 +241,7 @@ type imessageChat struct {
 }
 
 type imessageMessage struct {
+	rowID       int64
 	guid        string
 	text        string
 	senderName  string
@@ -249,7 +255,7 @@ type imessageMessage struct {
 // whose own ROWID is in (afterChat, chatUpTo].
 func (im *IMessage) loadChats(chatDB *sql.DB, after, upTo, afterChat, chatUpTo int64) ([]imessageChat, error) {
 	rows, err := chatDB.Query(`
-		SELECT c.ROWID, c.guid, COALESCE(c.display_name, ''), c.style,
+		SELECT c.ROWID, c.guid, COALESCE(c.display_name, ''), COALESCE(c.style, 0),
 			COALESCE(MAX(m.date), 0) as last_date
 		FROM chat c
 		LEFT JOIN chat_message_join cmj ON c.ROWID = cmj.chat_id
@@ -277,7 +283,7 @@ func (im *IMessage) loadChats(chatDB *sql.DB, after, upTo, afterChat, chatUpTo i
 		var style int
 		var lastDate int64
 		if err := rows.Scan(&c.rowID, &c.guid, &c.displayName, &style, &lastDate); err != nil {
-			continue
+			return nil, err
 		}
 		c.isGroup = style == 43 // iMessage group chat style
 		c.lastMessageTS = coreDataToMS(lastDate)
@@ -290,7 +296,10 @@ func (im *IMessage) loadChats(chatDB *sql.DB, after, upTo, afterChat, chatUpTo i
 
 	for i := range chats {
 		c := &chats[i]
-		c.participants = im.loadChatParticipants(chatDB, c.rowID)
+		c.participants, err = im.loadChatParticipants(chatDB, c.rowID)
+		if err != nil {
+			return nil, fmt.Errorf("participants of %s: %w", c.guid, err)
+		}
 
 		// Derive name if empty
 		if c.displayName == "" {
@@ -308,15 +317,15 @@ func (im *IMessage) loadChats(chatDB *sql.DB, after, upTo, afterChat, chatUpTo i
 	return chats, nil
 }
 
-func (im *IMessage) loadChatParticipants(chatDB *sql.DB, chatRowID int) []map[string]string {
+func (im *IMessage) loadChatParticipants(chatDB *sql.DB, chatRowID int) ([]map[string]string, error) {
 	rows, err := chatDB.Query(`
-		SELECT h.id, COALESCE(h.uncanonicalized_id, h.id)
+		SELECT COALESCE(h.id, ''), COALESCE(h.uncanonicalized_id, h.id, '')
 		FROM handle h
 		JOIN chat_handle_join chj ON h.ROWID = chj.handle_id
 		WHERE chj.chat_id = ?
 	`, chatRowID)
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	defer rows.Close()
 
@@ -324,29 +333,33 @@ func (im *IMessage) loadChatParticipants(chatDB *sql.DB, chatRowID int) []map[st
 	for rows.Next() {
 		var id, displayID string
 		if err := rows.Scan(&id, &displayID); err != nil {
-			continue
+			return nil, err
 		}
 		participants = append(participants, map[string]string{
 			"name":   displayID,
 			"number": id,
 		})
 	}
-	return participants
+	return participants, rows.Err()
 }
 
-// loadMessages returns a chat's messages whose ROWID is in (after, upTo],
-// oldest first.
-func (im *IMessage) loadMessages(chatDB *sql.DB, chatRowID int, after, upTo int64) ([]imessageMessage, error) {
+// loadMessages returns the messages with text that a chat owns, up to ROWID
+// upTo, oldest first. A message joined to several chats is owned by the one
+// with the lowest ROWID, so which chat holds it never depends on which chats
+// an import happens to read.
+func (im *IMessage) loadMessages(chatDB *sql.DB, chatRowID int, upTo int64) ([]imessageMessage, error) {
 	rows, err := chatDB.Query(`
-		SELECT m.guid, COALESCE(m.text, ''), m.attributedBody, m.date, m.is_from_me,
+		SELECT m.ROWID, m.guid, COALESCE(m.text, ''), m.attributedBody, COALESCE(m.date, 0),
+			COALESCE(m.is_from_me, 0),
 			COALESCE(h.id, '') as handle_id,
 			COALESCE(h.uncanonicalized_id, h.id, '') as handle_display
 		FROM message m
 		JOIN chat_message_join cmj ON m.ROWID = cmj.message_id
 		LEFT JOIN handle h ON m.handle_id = h.ROWID
-		WHERE cmj.chat_id = ? AND m.ROWID > ? AND m.ROWID <= ?
+		WHERE cmj.chat_id = ? AND m.ROWID <= ?
+			AND cmj.chat_id = (SELECT MIN(j.chat_id) FROM chat_message_join j WHERE j.message_id = m.ROWID)
 		ORDER BY m.date ASC, m.ROWID ASC
-	`, chatRowID, after, upTo)
+	`, chatRowID, upTo)
 	if err != nil {
 		return nil, err
 	}
@@ -363,8 +376,8 @@ func (im *IMessage) loadMessages(chatDB *sql.DB, chatRowID int, after, upTo int6
 		var date int64
 		var handleID, handleDisplay string
 		var attributedBody []byte
-		if err := rows.Scan(&m.guid, &m.text, &attributedBody, &date, &m.isFromMe, &handleID, &handleDisplay); err != nil {
-			continue
+		if err := rows.Scan(&m.rowID, &m.guid, &m.text, &attributedBody, &date, &m.isFromMe, &handleID, &handleDisplay); err != nil {
+			return nil, err
 		}
 		// Modern Messages stores the body in attributedBody (an NSAttributedString
 		// archive) and leaves text NULL — without this, the bulk of recent

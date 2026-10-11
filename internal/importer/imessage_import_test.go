@@ -346,11 +346,13 @@ func TestIMessageImportKeepsTheMarkWhenItFails(t *testing.T) {
 }
 
 // TestIMessagePollingMatchesAFullImport is M2/M3 over seeded random
-// histories: chats appear over time, some rows arrive late with older dates
-// (iCloud), some are attributedBody-only or empty, and tapbacks add and
-// remove reactions on earlier messages.
+// histories: chats appear over time; messages arrive with new or older dates
+// (iCloud inserts late); text repeats, so a quote can match several
+// messages; some rows are attributedBody-only, empty, or joined to two chats;
+// and tapbacks add and remove reactions with dates before or after
+// everything already read.
 func TestIMessagePollingMatchesAFullImport(t *testing.T) {
-	const cases = 60
+	const cases = 80
 	kinds := map[string]int{}
 	for seed := uint64(1); seed <= cases; seed++ {
 		r := rand.New(rand.NewPCG(seed, 0x5eed))
@@ -358,11 +360,27 @@ func TestIMessagePollingMatchesAFullImport(t *testing.T) {
 		handles := []int64{chat.addHandle("+15550000001"), chat.addHandle("+15550000002"), chat.addHandle("carol@example.com")}
 
 		var chats []int64
-		bodies := map[int64][]string{} // chat -> stored, quotable bodies
+		bodies := map[int64][]string{} // chat -> texts a tapback can quote
 		newestDate := int64(1_700_000_000)
 		polled, pollPath := newIMessageTestStore(t)
 		poller := &IMessage{DBPath: chat.path, MyName: "Me"}
 		msgSeq := 0
+		date := func(late bool) int64 {
+			if late {
+				return newestDate - int64(r.IntN(3000))
+			}
+			newestDate += int64(1 + r.IntN(90))
+			return newestDate
+		}
+		text := func(chatID int64) string {
+			msgSeq++
+			if len(bodies[chatID]) > 0 && r.IntN(3) == 0 {
+				return bodies[chatID][r.IntN(len(bodies[chatID]))] // repeated text
+			}
+			body := fmt.Sprintf("message %d", msgSeq)
+			bodies[chatID] = append(bodies[chatID], body)
+			return body
+		}
 
 		steps := 1 + r.IntN(6)
 		for step := 0; step < steps; step++ {
@@ -378,57 +396,280 @@ func TestIMessagePollingMatchesAFullImport(t *testing.T) {
 				}
 				chats = append(chats, chat.addChat(fmt.Sprintf("iMessage;-;chat%d", len(chats)), name, r.IntN(2) == 0, handles[r.IntN(len(handles))]))
 			}
-			for n := 1 + r.IntN(5); n > 0; n-- {
+			for n := 1 + r.IntN(6); n > 0; n-- {
 				chatID := chats[r.IntN(len(chats))]
-				msgSeq++
-				guid := fmt.Sprintf("g%d", msgSeq)
+				guid := fmt.Sprintf("g%d-%d", step, n)
 				fromMe := r.IntN(3) == 0
 				handle := handles[r.IntN(len(handles))]
-				// Kind from the high bits of a fresh draw (see the LCG note in
-				// the review guide): every branch must be exercised.
-				switch kind := r.Uint64() >> 62; {
-				case kind == 0 && len(bodies[chatID]) > 0:
-					// Tapback on an earlier message, dated after everything.
+				// Kind from the high bits of a fresh draw, so every branch is
+				// exercised (asserted below).
+				switch kind := r.Uint64() >> 61; {
+				case kind <= 1 && len(bodies[chatID]) > 0:
 					quoted := bodies[chatID][r.IntN(len(bodies[chatID]))]
 					verb := []string{"Loved “%s”", "Liked “%s”", "Removed a heart from “%s”", "Removed a like from “%s”"}[r.IntN(4)]
-					newestDate += 60
-					kinds["tapback"]++
-					chat.addMessage(chatID, guid, fmt.Sprintf(verb, quoted), false, newestDate, fromMe, handle)
-				case kind == 1:
-					// Late iCloud insert: an older date with a fresh body
-					// nothing quotes yet.
-					kinds["late"]++
-					chat.addMessage(chatID, guid, fmt.Sprintf("late %d", msgSeq), r.IntN(2) == 0, newestDate-int64(1+r.IntN(5000)), fromMe, handle)
+					late := r.IntN(2) == 0
+					if late {
+						kinds["late tapback"]++
+					} else {
+						kinds["tapback"]++
+					}
+					chat.addMessage(chatID, guid, fmt.Sprintf(verb, quoted), false, date(late), fromMe, handle)
 				case kind == 2:
+					kinds["late"]++
+					chat.addMessage(chatID, guid, text(chatID), r.IntN(2) == 0, date(true), fromMe, handle)
+				case kind == 3:
 					kinds["empty"]++
-					chat.addMessage(chatID, guid, "", false, newestDate+1, fromMe, handle)
+					chat.addMessage(chatID, guid, "", false, date(false), fromMe, handle)
+				case kind == 4 && len(chats) > 1:
+					other := chats[r.IntN(len(chats))]
+					if other == chatID {
+						continue
+					}
+					kinds["shared"]++
+					rowID := chat.addMessage(chatID, guid, text(chatID), false, date(false), fromMe, handle)
+					chat.exec(`INSERT INTO chat_message_join (chat_id, message_id) VALUES (?, ?)`, other, rowID)
 				default:
-					body := fmt.Sprintf("message %d", msgSeq)
-					newestDate += 60
 					kinds["text"]++
-					chat.addMessage(chatID, guid, body, r.IntN(2) == 0, newestDate, fromMe, handle)
-					bodies[chatID] = append(bodies[chatID], body)
+					chat.addMessage(chatID, guid, text(chatID), r.IntN(2) == 0, date(false), fromMe, handle)
 				}
 			}
 			importIMessage(t, poller, polled)
 		}
 
-		full, fullPath := newIMessageTestStore(t)
-		importIMessage(t, &IMessage{DBPath: chat.path, MyName: "Me"}, full)
-		pollDump, fullDump := dumpLegacyStore(t, pollPath), dumpLegacyStore(t, fullPath)
-		if !reflect.DeepEqual(pollDump, fullDump) {
-			t.Fatalf("seed %d: polling and a full import disagree:\npoll %v\nfull %v", seed, pollDump, fullDump)
-		}
+		pollDump := dumpLegacyStore(t, pollPath)
+		requireSameDump(t, fmt.Sprintf("seed %d: polling vs full import", seed), pollDump, fullImportDump(t, chat.path))
 
 		// M3: a restart's full read over the polled store changes nothing.
 		importIMessage(t, &IMessage{DBPath: chat.path, MyName: "Me"}, polled)
-		if again := dumpLegacyStore(t, pollPath); !reflect.DeepEqual(pollDump, again) {
-			t.Fatalf("seed %d: full re-read changed the polled store:\nbefore %v\nafter  %v", seed, pollDump, again)
-		}
+		requireSameDump(t, fmt.Sprintf("seed %d: full re-read of the polled store", seed), dumpLegacyStore(t, pollPath), pollDump)
 	}
-	for _, kind := range []string{"tapback", "late", "empty", "text"} {
+	for _, kind := range []string{"tapback", "late tapback", "late", "empty", "shared", "text"} {
 		if kinds[kind] < 10 {
 			t.Fatalf("generator exercised %q only %d times: %v", kind, kinds[kind], kinds)
 		}
+	}
+	t.Logf("kinds: %v", kinds)
+}
+
+// fullImportDump is the store one full import of chat.db produces.
+func fullImportDump(t *testing.T, chatPath string) storeDump {
+	t.Helper()
+	store, path := newIMessageTestStore(t)
+	importIMessage(t, &IMessage{DBPath: chatPath, MyName: "Me"}, store)
+	return dumpLegacyStore(t, path)
+}
+
+func requireSameDump(t *testing.T, what string, got, want storeDump) {
+	t.Helper()
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("%s:\ngot  %v\nwant %v", what, got, want)
+	}
+}
+
+// Review r1 finding 1: a replacement chat.db with as many rows or more.
+func TestIMessageImportRereadsAReplacementWithMoreRows(t *testing.T) {
+	for _, replacementRows := range []int{4, 5} {
+		first := newFakeChatDB(t)
+		alice := first.addHandle("+15550000001")
+		chatID := first.addChat("iMessage;-;+15550000001", strPtr("Alice"), false, alice)
+		for i := 0; i < 4; i++ {
+			first.addMessage(chatID, fmt.Sprintf("old%d", i), fmt.Sprintf("old %d", i), false, 1_700_000_000+int64(i), false, alice)
+		}
+		store, path := newIMessageTestStore(t)
+		imp := &IMessage{DBPath: first.path, MyName: "Me"}
+		importIMessage(t, imp, store)
+
+		replacement := newFakeChatDB(t)
+		alice = replacement.addHandle("+15550000001")
+		chatID = replacement.addChat("iMessage;-;+15550000001", strPtr("Alice"), false, alice)
+		for i := 0; i < replacementRows; i++ {
+			replacement.addMessage(chatID, fmt.Sprintf("new%d", i), fmt.Sprintf("new %d", i), false, 1_800_000_000+int64(i), false, alice)
+		}
+		imp.DBPath = replacement.path
+		result := importIMessage(t, imp, store)
+		if result.MessagesImported != replacementRows {
+			t.Fatalf("%d-row replacement: imported %d, want every replacement row", replacementRows, result.MessagesImported)
+		}
+		for i := 0; i < replacementRows; i++ {
+			if m, _ := store.GetMessageByID(fmt.Sprintf("imessage:new%d", i)); m == nil {
+				t.Fatalf("%d-row replacement: new%d missing", replacementRows, i)
+			}
+		}
+		_ = path
+	}
+}
+
+// Review r1 finding 2: an older tapback that arrives after a newer one, and
+// an older same-text message that arrives after the tapback quoting it.
+func TestIMessagePollingRebuildsOrderDependentTapbacks(t *testing.T) {
+	t.Run("late add before a removal", func(t *testing.T) {
+		chat := newFakeChatDB(t)
+		alice := chat.addHandle("+15550000001")
+		c := chat.addChat("iMessage;-;+15550000001", strPtr("Alice"), false, alice)
+		chat.addMessage(c, "hello", "hello", false, 1_700_000_010, true, 0)
+		chat.addMessage(c, "remove", "Removed a heart from “hello”", false, 1_700_000_030, false, alice)
+		store, path := newIMessageTestStore(t)
+		poller := &IMessage{DBPath: chat.path, MyName: "Me"}
+		importIMessage(t, poller, store)
+		chat.addMessage(c, "love", "Loved “hello”", false, 1_700_000_020, false, alice)
+		importIMessage(t, poller, store)
+		requireSameDump(t, "polling vs full import", dumpLegacyStore(t, path), fullImportDump(t, chat.path))
+		if m, _ := store.GetMessageByID("imessage:hello"); m == nil || m.Reactions != "" {
+			t.Fatalf("the later removal must win: %+v", m)
+		}
+	})
+	t.Run("late older message with the quoted text", func(t *testing.T) {
+		chat := newFakeChatDB(t)
+		alice := chat.addHandle("+15550000001")
+		c := chat.addChat("iMessage;-;+15550000001", strPtr("Alice"), false, alice)
+		chat.addMessage(c, "hello10", "hello", false, 1_700_000_010, true, 0)
+		chat.addMessage(c, "love", "Loved “hello”", false, 1_700_000_030, false, alice)
+		store, path := newIMessageTestStore(t)
+		poller := &IMessage{DBPath: chat.path, MyName: "Me"}
+		importIMessage(t, poller, store)
+		chat.addMessage(c, "hello20", "hello", false, 1_700_000_020, true, 0)
+		importIMessage(t, poller, store)
+		requireSameDump(t, "polling vs full import", dumpLegacyStore(t, path), fullImportDump(t, chat.path))
+		if m, _ := store.GetMessageByID("imessage:hello10"); m == nil || m.Reactions != "" {
+			t.Fatalf("the reaction must move off the older message: %+v", m)
+		}
+	})
+}
+
+// Review r1 finding 3: a tapback stored as text before its target arrived.
+func TestIMessagePollingAppliesATapbackWhenItsTargetArrives(t *testing.T) {
+	chat := newFakeChatDB(t)
+	alice := chat.addHandle("+15550000001")
+	c := chat.addChat("iMessage;-;+15550000001", strPtr("Alice"), false, alice)
+	chat.addMessage(c, "love", "Loved “hello”", false, 1_700_000_020, false, alice)
+	store, path := newIMessageTestStore(t)
+	poller := &IMessage{DBPath: chat.path, MyName: "Me"}
+	importIMessage(t, poller, store)
+	if m, _ := store.GetMessageByID("imessage:love"); m == nil {
+		t.Fatal("a tapback with no target is kept as text")
+	}
+	chat.addMessage(c, "hello", "hello", false, 1_700_000_010, true, 0)
+	importIMessage(t, poller, store)
+	if m, _ := store.GetMessageByID("imessage:love"); m != nil {
+		t.Fatalf("tapback still text after its target arrived: %+v", m)
+	}
+	requireSameDump(t, "polling vs full import", dumpLegacyStore(t, path), fullImportDump(t, chat.path))
+	// A fresh full read over the polled store agrees too.
+	importIMessage(t, &IMessage{DBPath: chat.path, MyName: "Me"}, store)
+	requireSameDump(t, "full re-read", dumpLegacyStore(t, path), fullImportDump(t, chat.path))
+}
+
+// Review r1 finding 4: a message Messages joins to two chats.
+func TestIMessageSharedMessageBelongsToTheLowerChat(t *testing.T) {
+	chat := newFakeChatDB(t)
+	alice := chat.addHandle("+15550000001")
+	a := chat.addChat("iMessage;-;chatA", strPtr("A"), false, alice)
+	b := chat.addChat("iMessage;-;chatB", strPtr("B"), false, alice)
+	shared := chat.addMessage(a, "m1", "shared", false, 1_700_000_010, false, alice)
+	chat.exec(`INSERT INTO chat_message_join (chat_id, message_id) VALUES (?, ?)`, b, shared)
+	chat.addMessage(a, "m2", "only in A", false, 1_700_000_020, false, alice)
+
+	store, path := newIMessageTestStore(t)
+	poller := &IMessage{DBPath: chat.path, MyName: "Me"}
+	importIMessage(t, poller, store)
+	chat.addMessage(b, "m3", "only in B", false, 1_700_000_030, false, alice)
+	importIMessage(t, poller, store)
+	requireSameDump(t, "polling vs full import", dumpLegacyStore(t, path), fullImportDump(t, chat.path))
+	importIMessage(t, &IMessage{DBPath: chat.path, MyName: "Me"}, store)
+	requireSameDump(t, "full re-read", dumpLegacyStore(t, path), fullImportDump(t, chat.path))
+	if m, _ := store.GetMessageByID("imessage:m1"); m == nil || m.ConversationID != "imessage:iMessage;-;chatA" {
+		t.Fatalf("shared message must stay in the lower chat: %+v", m)
+	}
+}
+
+// Review r1 finding 5: an unchanged tapback must not rewrite its chat.
+func TestIMessageReimportWithTapbacksKeepsUnreadCounts(t *testing.T) {
+	chat := newFakeChatDB(t)
+	alice := chat.addHandle("+15550000001")
+	c := chat.addChat("iMessage;-;+15550000001", strPtr("Alice"), false, alice)
+	chat.addMessage(c, "hello", "hello", false, 1_700_000_010, true, 0)
+	chat.addMessage(c, "love", "Loved “hello”", false, 1_700_000_020, false, alice)
+	chat.addMessage(c, "orphan", "Liked “nothing”", false, 1_700_000_030, false, alice)
+
+	store, path := newIMessageTestStore(t)
+	importIMessage(t, &IMessage{DBPath: chat.path}, store)
+	observer, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer observer.Close()
+	if _, err := observer.Exec(`UPDATE conversations SET unread_count = 2`); err != nil {
+		t.Fatal(err)
+	}
+	before := dumpLegacyStore(t, path)
+	version := dataVersion(t, observer)
+	result := importIMessage(t, &IMessage{DBPath: chat.path}, store)
+	if result.MessagesImported != 0 {
+		t.Fatalf("re-import wrote %d rows", result.MessagesImported)
+	}
+	if v := dataVersion(t, observer); v != version {
+		t.Fatalf("re-import committed (data_version %d -> %d)", version, v)
+	}
+	requireSameDump(t, "re-import", dumpLegacyStore(t, path), before)
+}
+
+// Messages leaves some columns NULL; a row that fails to scan is an import
+// error (the mark stays), so NULLs must scan.
+func TestIMessageImportReadsNullColumns(t *testing.T) {
+	chat := newFakeChatDB(t)
+	alice := chat.addHandle("+15550000001")
+	c := chat.addChat("iMessage;-;+15550000001", strPtr("Alice"), false, alice)
+	chat.exec(`UPDATE chat SET style = NULL WHERE ROWID = ?`, c)
+	id := chat.addMessage(c, "m1", "hello", false, 1_700_000_000, false, alice)
+	chat.exec(`UPDATE message SET date = NULL, is_from_me = NULL WHERE ROWID = ?`, id)
+	chat.exec(`INSERT INTO chat_handle_join (chat_id, handle_id) VALUES (?, 999)`, c) // dangling handle
+
+	store, _ := newIMessageTestStore(t)
+	imp := &IMessage{DBPath: chat.path}
+	result := importIMessage(t, imp, store)
+	if result.MessagesImported != 1 || imp.AfterRowID != id {
+		t.Fatalf("result = %+v, AfterRowID = %d", result, imp.AfterRowID)
+	}
+}
+
+// A mark the caller set past the end of chat.db (not one this importer
+// recorded, so there is no fingerprint to check) means a full read.
+func TestIMessageImportReadsInFullPastACallerMark(t *testing.T) {
+	chat := newFakeChatDB(t)
+	alice := chat.addHandle("+15550000001")
+	c := chat.addChat("iMessage;-;+15550000001", strPtr("Alice"), false, alice)
+	chat.addMessage(c, "m1", "hello", false, 1_700_000_000, false, alice)
+	store, _ := newIMessageTestStore(t)
+	result := importIMessage(t, &IMessage{DBPath: chat.path, AfterRowID: 50}, store)
+	if result.MessagesImported != 1 {
+		t.Fatalf("result = %+v, want the row read", result)
+	}
+}
+
+// A late message that does not move its chat's last message time leaves the
+// chat row, and so its unread count, alone.
+func TestIMessageLateMessageKeepsUnreadCount(t *testing.T) {
+	chat := newFakeChatDB(t)
+	alice := chat.addHandle("+15550000001")
+	c := chat.addChat("iMessage;-;+15550000001", strPtr("Alice"), false, alice)
+	chat.addMessage(c, "m1", "newest", false, 1_700_000_100, false, alice)
+	store, path := newIMessageTestStore(t)
+	poller := &IMessage{DBPath: chat.path}
+	importIMessage(t, poller, store)
+	observer, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer observer.Close()
+	if _, err := observer.Exec(`UPDATE conversations SET unread_count = 2`); err != nil {
+		t.Fatal(err)
+	}
+	chat.addMessage(c, "m0", "older, synced late", false, 1_700_000_000, false, alice)
+	if result := importIMessage(t, poller, store); result.MessagesImported != 1 {
+		t.Fatalf("result = %+v", result)
+	}
+	var unread int
+	if err := observer.QueryRow(`SELECT unread_count FROM conversations`).Scan(&unread); err != nil || unread != 2 {
+		t.Fatalf("unread_count = %d (%v), want 2", unread, err)
 	}
 }

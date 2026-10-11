@@ -413,9 +413,11 @@ curl -s http://127.0.0.1:7007/api/status | jq '.local_imports'
   when its own environment has `APP_SANDBOX_CONTAINER_ID`, else "0". A
   backend started by an older app still shows `OPENMESSAGES_APP_SANDBOX=1` in
   `ps eww <pid>`. That reflects the old launcher, not a sandbox.
-- **`v2_primary`: off, whatever the sandbox says.** A v2-primary daemon's
-  readers see only the v2 store, so legacy-only rows are invisible. They
-  also break the projection check: the legacy store is the copy of live
+- **`v2_primary`: off, whatever the sandbox says.** A v2-primary daemon
+  serves conversations, messages and search from the v2 store, so
+  legacy-only rows don't appear there. A few surfaces still read the legacy
+  store directly (`/api/people`, MCP `download_media`); they are not a route
+  for new history. The rows also break the projection check: the legacy store is the copy of live
   traffic that `freshness.<platform>.projection_stalled` measures v2 against
   (whatsapp, signal, sms/rcs), and a desktop import moves `legacy_latest_ms`
   past anything v2 holds. Seen 2026-10-11: signal `projection_stalled: true`,
@@ -441,12 +443,18 @@ curl -s http://127.0.0.1:7007/api/status | jq '.local_imports'
   moves a timestamp, so it cannot touch the projection check (one candidate
   row on 2026-10-11).
 
-On a legacy-primary install the iMessage importer reads only the chat.db rows
-added since its last poll (by ROWID, which also catches old-dated rows that
-iCloud inserts late). It reads chat.db in full once per daemon start and
-writes only rows that differ, so a restart picks up edits. Tapbacks become
-reactions. Before #231 it deadlocked on any chat.db with a chat (one SQLite
-connection, nested query); the sandbox flag had hidden that since April.
+On a legacy-primary install the iMessage importer reads only the chats with a
+chat.db row added since its last poll (by ROWID, which also catches old-dated
+rows that iCloud inserts late). It reads chat.db in full once per daemon
+start, and again if the row at its mark is gone or is a different message
+(chat.db replaced). It writes only rows that differ, so a restart picks up
+edits. Tapbacks become reactions. Each chat it reads has its reactions
+rebuilt from the chat's complete tapback list, because a late, older tapback
+or an older message with the quoted text changes the outcome of tapbacks
+already applied. The rebuild commits only what changes. A message joined to
+two chats belongs to the lower chat ROWID. Before #231 it deadlocked on any
+chat.db with a chat (one SQLite connection, nested query); the sandbox flag
+had hidden that since April.
 
 ## MCP serving — exactly one process may own live transports
 

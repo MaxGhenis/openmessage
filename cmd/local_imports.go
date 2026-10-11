@@ -33,9 +33,10 @@ const (
 // importers at all; per-poll conditions (the WhatsApp live bridge in use,
 // signal-cli paired, macOS) still apply on top.
 //
-// A v2-primary daemon runs none of them. Its readers see only the v2 store, so
-// rows written to the legacy store are invisible. They also corrupt
-// /api/status: there the legacy store is the comparison copy of live traffic
+// A v2-primary daemon runs none of them. It serves conversations, messages and
+// search from the v2 store, so rows written to the legacy store don't appear
+// there (only side surfaces such as /api/people still read legacy). They also
+// corrupt /api/status: there the legacy store is the comparison copy of live traffic
 // that `freshness.<platform>.projection_stalled` measures v2 against, and a
 // desktop import advances `legacy_latest_ms` for whatsapp or signal past
 // anything v2 holds. Seen live on 2026-10-11: signal `projection_stalled`

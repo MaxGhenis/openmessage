@@ -1,7 +1,10 @@
 package db
 
 import (
+	"database/sql"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"regexp"
 	"strings"
 )
@@ -82,22 +85,25 @@ func isTruncatedQuote(quoted string) bool {
 // regular message. It returns false (so the caller stores m normally) when m
 // isn't a tapback or no matching target message can be found.
 func (s *Store) ApplyTapback(m *Message) (bool, error) {
-	applied, _, err := s.ApplyTapbackChange(m)
-	return applied, err
-}
-
-// ApplyTapbackChange is ApplyTapback that also reports whether the target's
-// reactions changed; re-applying a tapback already reflected there is a
-// no-op (applied, unchanged) that writes nothing.
-func (s *Store) ApplyTapbackChange(m *Message) (applied, changed bool, err error) {
 	if m == nil {
-		return false, false, nil
+		return false, nil
 	}
 	tb, ok := ParseTapback(m.Body)
 	if !ok {
-		return false, false, nil
+		return false, nil
 	}
-	target, err := s.findTapbackTarget(m.ConversationID, tb.Quoted, m.TimestampMS, tb.Truncated)
+	applied, _, err := applyTapback(s.db, m, tb)
+	return applied, err
+}
+
+// tapbackQuerier is what tapback application needs from *sql.DB or *sql.Tx.
+type tapbackQuerier interface {
+	Query(query string, args ...any) (*sql.Rows, error)
+	Exec(query string, args ...any) (sql.Result, error)
+}
+
+func applyTapback(q tapbackQuerier, m *Message, tb *Tapback) (applied, changed bool, err error) {
+	target, err := findTapbackTarget(q, m.ConversationID, tb.Quoted, m.TimestampMS, tb.Truncated)
 	if err != nil {
 		return false, false, err
 	}
@@ -115,17 +121,139 @@ func (s *Store) ApplyTapbackChange(m *Message) (applied, changed bool, err error
 		return false, false, err
 	}
 	if changed {
-		if _, err := s.db.Exec(`UPDATE messages SET reactions = ? WHERE message_id = ?`, next, target.MessageID); err != nil {
+		if _, err := q.Exec(`UPDATE messages SET reactions = ? WHERE message_id = ?`, next, target.MessageID); err != nil {
 			return false, false, err
 		}
 	}
 	return true, changed, nil
 }
 
+// RebuildTapbackReactions recomputes, for one conversation whose reactions
+// come only from tapbacks (iMessage), what its complete tapback list gives:
+// every message's reactions are cleared, the listed tapbacks' own rows are
+// removed, and the tapbacks are applied in the order given, each one stored
+// as text when it has no target, exactly as applying them one by one to the
+// conversation's other messages. Applying tapbacks one poll at a time cannot
+// do that: an older tapback that arrives late, or an older message whose text
+// a later tapback quotes, changes the outcome of tapbacks applied before it.
+//
+// It runs in one transaction and commits only when the result differs from
+// what was stored, returning how many of the conversation's rows changed.
+func (s *Store) RebuildTapbackReactions(conversationID string, tapbacks []*Message) (int, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+
+	ids := make([]any, 0, len(tapbacks))
+	for _, m := range tapbacks {
+		ids = append(ids, m.MessageID)
+	}
+	before, err := tapbackState(tx, conversationID, ids)
+	if err != nil {
+		return 0, err
+	}
+	// Nothing to rebuild and nothing to clear: write nothing at all, not even
+	// a no-op statement that would take the write lock.
+	if len(ids) == 0 && len(before) == 0 {
+		return 0, nil
+	}
+	if _, err := tx.Exec(`UPDATE messages SET reactions = '' WHERE conversation_id = ? AND IFNULL(reactions, '') != ''`, conversationID); err != nil {
+		return 0, err
+	}
+	for _, id := range ids {
+		if _, err := s.deleteMessages(tx, `message_id = ?`, id); err != nil {
+			return 0, err
+		}
+	}
+	for _, m := range tapbacks {
+		if m.ConversationID != conversationID {
+			return 0, fmt.Errorf("tapback %s belongs to %s, not %s", m.MessageID, m.ConversationID, conversationID)
+		}
+		tb, ok := ParseTapback(m.Body)
+		if ok {
+			applied, _, err := applyTapback(tx, m, tb)
+			if err != nil {
+				return 0, err
+			}
+			if applied {
+				continue
+			}
+		}
+		if err := upsertMessageTx(tx, m); err != nil {
+			return 0, err
+		}
+		body, err := messageSearchBodyTx(tx, m.MessageID)
+		if err != nil {
+			return 0, err
+		}
+		if err := s.syncMessageSearchIndex(tx, m.MessageID, body); err != nil {
+			return 0, err
+		}
+	}
+	after, err := tapbackState(tx, conversationID, ids)
+	if err != nil {
+		return 0, err
+	}
+	changed := 0
+	for id, row := range after {
+		if before[id] != row {
+			changed++
+		}
+	}
+	for id := range before {
+		if _, ok := after[id]; !ok {
+			changed++
+		}
+	}
+	if changed == 0 {
+		return 0, nil
+	}
+	return changed, tx.Commit()
+}
+
+// tapbackState is every row a tapback rebuild can change: the conversation's
+// rows that carry reactions, and the listed tapbacks' own rows.
+func tapbackState(tx *sql.Tx, conversationID string, ids []any) (map[string]string, error) {
+	state := map[string]string{}
+	rows, err := tx.Query(`SELECT message_id, IFNULL(reactions, '') FROM messages
+		WHERE conversation_id = ? AND IFNULL(reactions, '') != ''`, conversationID)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var id, reactions string
+		if err := rows.Scan(&id, &reactions); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		state[id] = "reactions:" + reactions
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	for _, id := range ids {
+		var row string
+		err := tx.QueryRow(`SELECT conversation_id || '|' || sender_name || '|' || sender_number || '|' || body || '|' ||
+			timestamp_ms || '|' || status || '|' || is_from_me || '|' || IFNULL(reactions, '') || '|' ||
+			source_platform || '|' || source_id FROM messages WHERE message_id = ?`, id).Scan(&row)
+		if errors.Is(err, sql.ErrNoRows) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		state[id.(string)] = "row:" + row
+	}
+	return state, nil
+}
+
 // findTapbackTarget locates the message a tapback refers to: the most recent
 // message in the conversation (at or before the tapback) whose body equals the
 // quoted text, or — for truncated quotes — starts with it.
-func (s *Store) findTapbackTarget(conversationID, quoted string, beforeTS int64, truncated bool) (*Message, error) {
+func findTapbackTarget(q tapbackQuerier, conversationID, quoted string, beforeTS int64, truncated bool) (*Message, error) {
 	quoted = strings.TrimSpace(quoted)
 	// iMessage truncates long quotes with an ellipsis; for those, strip the
 	// trailing ellipsis/period so the remaining text can prefix-match the
@@ -138,10 +266,12 @@ func (s *Store) findTapbackTarget(conversationID, quoted string, beforeTS int64,
 	if quoted == "" {
 		return nil, nil
 	}
-	rows, err := s.db.Query(
+	// message_id breaks timestamp ties so the target does not depend on the
+	// order rows were inserted in.
+	rows, err := q.Query(
 		`SELECT message_id, body, reactions FROM messages
 		 WHERE conversation_id = ? AND timestamp_ms <= ? AND TRIM(body) != ''
-		 ORDER BY timestamp_ms DESC LIMIT 200`,
+		 ORDER BY timestamp_ms DESC, message_id DESC LIMIT 200`,
 		conversationID, beforeTS,
 	)
 	if err != nil {
