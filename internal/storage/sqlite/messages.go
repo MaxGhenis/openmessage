@@ -470,21 +470,24 @@ func (r *MessageRepository) ListMessagesAroundMessage(
 // query acting as wildcards), newest first with message ID as a deterministic
 // tie-breaker. Relevance ranking is intentionally not offered.
 //
-// A search narrowed by conversation or sender runs the LIKE over the messages
-// that index bounds (indexBoundedSearch). Any other nonempty query first reads
-// the newest messages, within the date range if any, stopping once it has
-// limit matches (searchRecentMessages). That answers it whenever those
-// messages hold limit matches, which covers common terms that the trigram
-// index would have to visit in full, or are the whole range. Otherwise the
-// whole scope is searched: from the trigram index when the query has a literal
-// run of three characters, by the LIKE alone when it has none. Every path
-// applies the same LIKE and returns the same rows (substring_search.go).
+// A search narrowed by conversation or sender (indexBoundedSearch) reads that
+// scope's index range with the LIKE, or, when the query has a literal run of
+// three characters and the LIKE would read many rows of a long thread or a
+// prolific sender, the trigram index's candidates in that scope
+// (searchScope). Any other nonempty query first reads the newest messages,
+// within the date range if any, stopping once it has limit matches
+// (searchRecentMessages). That answers it whenever those messages hold limit
+// matches, which covers common terms that the trigram index would have to
+// visit in full, or are the whole range. Otherwise the whole scope is
+// searched: from the trigram index when the query has a literal run of three
+// characters, by the LIKE alone when it has none. Every path applies the same
+// LIKE and returns the same rows (substring_search.go).
 func (r *MessageRepository) SearchMessages(
 	ctx context.Context,
 	query string,
 	filter SearchQuery,
 ) ([]Message, error) {
-	messages, _, err := r.searchMessages(ctx, query, filter, recentSearchWindow)
+	messages, _, err := r.searchMessages(ctx, query, filter, defaultSearchPlan)
 	return messages, err
 }
 
@@ -506,19 +509,21 @@ const (
 	searchPathLike         searchPath = "like"
 )
 
-// searchMessages is SearchMessages with the window as a parameter, so tests
-// can reach every path on small stores, and reports the path that answered.
+// searchMessages is SearchMessages with its plan as a parameter, so tests can
+// reach every path on small stores, and reports the path that answered.
 //
 // Every statement runs in one read-only (deferred) transaction, so the
-// window, its row count and the whole-scope search see one snapshot. Read
-// separately, a write landing between the window and its count could shrink
-// the range below the window and pass off a window that missed older matches
-// as complete.
+// window, its row count and the whole-scope search see one snapshot, and so do
+// the statements a conversation or sender search composes its answer from
+// (searchScope). Read separately, a write landing between the window and its
+// count could shrink the range below the window and pass off a window that
+// missed older matches as complete, and one landing between a conversation's
+// window and its rest could move a message across the cut.
 func (r *MessageRepository) searchMessages(
 	ctx context.Context,
 	query string,
 	filter SearchQuery,
-	window int,
+	plan searchPlan,
 ) ([]Message, searchPath, error) {
 	if filter.Limit <= 0 {
 		filter.Limit = 20
@@ -533,7 +538,7 @@ func (r *MessageRepository) searchMessages(
 	}
 	defer tx.Rollback()
 
-	messages, path, err := searchMessagesIn(ctx, tx, query, filter, window)
+	messages, path, err := searchMessagesIn(ctx, tx, query, filter, plan)
 	if err != nil {
 		return nil, "", err
 	}
@@ -548,10 +553,15 @@ func searchMessagesIn(
 	tx searchQuerier,
 	query string,
 	filter SearchQuery,
-	window int,
+	plan searchPlan,
 ) ([]Message, searchPath, error) {
+	if query != "" && indexBoundedSearch(filter) {
+		if expression, ok := trigramMatchQuery(query); ok {
+			return searchScope(ctx, tx, query, expression, filter, plan)
+		}
+	}
 	if query != "" && !indexBoundedSearch(filter) && !likePatternTooLong("%"+query+"%") {
-		messages, complete, err := searchRecentMessages(ctx, tx, query, filter, window)
+		messages, complete, err := searchRecentMessages(ctx, tx, query, filter, plan.window)
 		if err != nil {
 			return nil, "", err
 		}
@@ -709,10 +719,11 @@ func whereClause(conditions []string) string {
 // LIKE reads only the messages of that conversation's or sender's index range,
 // and stops at limit matches when the range is in recency order (a
 // conversation's is). The trigram index, which returns matches from every
-// conversation, could not beat that bound and would lose to it for a term
-// common elsewhere but rare in this scope: on the live store's busiest thread
-// (about 15,000 messages) the LIKE took at most 8 ms, its busiest sender 3 to
-// 6 ms, while one lookup of a common term took 45 ms.
+// conversation, loses to that bound for a term common elsewhere but rare in
+// this scope (one lookup of a word in 28% of messages took 45 ms on the live
+// store, whose busiest thread the LIKE reads in 8 ms), and wins only when the
+// scope is long and the term rare; searchScope chooses between them by
+// counting both.
 func indexBoundedSearch(filter SearchQuery) bool {
 	return filter.ConversationID != "" || filter.SenderCanonicalValue != ""
 }
