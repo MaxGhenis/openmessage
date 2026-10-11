@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -249,7 +250,9 @@ func (m teardownMode) String() string {
 }
 
 type teardownHarness struct {
-	t                *testing.T
+	t *testing.T
+	// logs holds everything the bridge and whatsmeow logged.
+	logs             *lockedBuffer
 	cancelOnTeardown bool
 	legacyOnly       bool
 	cancelHandlers   context.CancelFunc
@@ -287,6 +290,7 @@ func newTeardownHarness(t *testing.T, mode teardownMode) *teardownHarness {
 	peerJID := watypes.JID{User: "15559870000", Server: watypes.DefaultUserServer}
 	h := &teardownHarness{
 		t:                t,
+		logs:             &lockedBuffer{},
 		cancelOnTeardown: mode.cancelOnTeardown,
 		legacyOnly:       mode.legacyOnly,
 		messages:         messages,
@@ -310,10 +314,11 @@ func newTeardownHarness(t *testing.T, mode teardownMode) *teardownHarness {
 func (h *teardownHarness) startProcess() {
 	t := h.t
 	t.Helper()
-	logger := zerolog.Nop()
+	var out io.Writer = h.logs
 	if os.Getenv("OPENMESSAGE_TEARDOWN_TEST_LOG") != "" {
-		logger = zerolog.New(zerolog.ConsoleWriter{Out: os.Stderr}).With().Timestamp().Logger()
+		out = io.MultiWriter(h.logs, zerolog.ConsoleWriter{Out: os.Stderr})
 	}
+	logger := zerolog.New(out).With().Timestamp().Logger()
 	host, err := whatsapplive.New(h.sessionPath, h.messages, logger, whatsapplive.Callbacks{})
 	if err != nil {
 		t.Fatalf("whatsapplive.New(): %v", err)
@@ -358,6 +363,24 @@ func (h *teardownHarness) startProcess() {
 	h.host = host
 	h.cli = whatsapplive.ClientForTeardownTest(host)
 	h.supervisor = supervisor
+}
+
+// lockedBuffer collects log output written from many goroutines.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
 
 // restartProcess ends this run the way quitting the app does (the supervisor

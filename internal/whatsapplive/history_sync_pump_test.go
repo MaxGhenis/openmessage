@@ -63,8 +63,9 @@ type pumpFixture struct {
 	// download decides each download's outcome.
 	downloadOutcome func(id string) error
 	receiptOutcome  func(id string) error
-	// crash, when set, ends the pass goroutine at that effect (after it took
-	// effect), the way the process ending there would.
+	// crash, when set, ends the pass goroutine at the first effect it
+	// prefixes (after the effect took place), the way the process ending
+	// there would.
 	crash string
 }
 
@@ -77,6 +78,11 @@ func newPumpFixture(t *testing.T, database *sql.DB, spoolFrames, queueRows int64
 		t.Fatalf("db.New(): %v", err)
 	}
 	t.Cleanup(func() { _ = store.Close() })
+	return newPumpFixtureWith(t, database, store, spoolFrames, queueRows)
+}
+
+func newPumpFixtureWith(t *testing.T, database *sql.DB, store *db.Store, spoolFrames, queueRows int64) *pumpFixture {
+	t.Helper()
 	f := &pumpFixture{
 		t:               t,
 		database:        database,
@@ -208,7 +214,7 @@ func chunkIDs(t *testing.T, payload []byte) []string {
 func (f *pumpFixture) record(event string) {
 	f.mu.Lock()
 	f.log = append(f.log, event)
-	crash := f.crash == event
+	crash := f.crash != "" && strings.HasPrefix(event, f.crash)
 	if crash {
 		f.crash = ""
 	}
