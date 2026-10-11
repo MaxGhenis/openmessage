@@ -5,6 +5,7 @@ import (
 	"compress/zlib"
 	"context"
 	"encoding/json"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -22,6 +23,7 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	"github.com/maxghenis/openmessage/internal/bridge"
+	"github.com/maxghenis/openmessage/internal/storage/sqlite"
 	"github.com/maxghenis/openmessage/internal/whatsapplive"
 )
 
@@ -367,4 +369,84 @@ func TestPlaceholderResendBetweenGenerationsReachesV2(t *testing.T) {
 	h.deliver(second, node)
 	requireCommittedOnlyIn(t, h.requireDelivered(id, text,
 		"a placeholder resend dispatched after its generation retired"), generation)
+}
+
+// TestSpooledAndRedeliveredMessageIsOneInboxRow checks that committing a frame
+// more than once is harmless. With a handler context that teardown cancels,
+// a message dispatched after its generation retired is held in the spool and
+// reported handled, but whatsmeow's cancelled clear of its buffered plaintext
+// fails, so the server's redelivery dispatches it again. The next generation
+// then commits it twice: once replayed from the spool, once live. Both commits
+// carry the key it was captured with, so the real v2 inbox keeps one row.
+func TestSpooledAndRedeliveredMessageIsOneInboxRow(t *testing.T) {
+	h := newTeardownHarness(t, teardownMode{cancelOnTeardown: true})
+	first, _ := h.awaitGeneration()
+	h.startPeerSession()
+	const id watypes.MessageID = "3EB0SPOOLANDREDELIVER"
+	const text = "held in the spool and redelivered by the server"
+	node := h.peerMessage(id, text)
+	var once sync.Once
+	h.cli.Store.MsgSecrets = &msgSecretStoreHook{
+		MsgSecretStore: h.cli.Store.MsgSecrets,
+		beforePut:      func(context.Context) { once.Do(h.retireGeneration) },
+	}
+	h.deliver(first, node)
+	second, generation := h.awaitGeneration()
+	h.deliver(second, node)
+
+	commits := h.requireDelivered(id, text, "held in the spool, then redelivered")
+	requireCommittedOnlyIn(t, commits, generation)
+	if len(commits) < 2 {
+		t.Fatalf("message committed %d times, want the replay and the redelivery both to commit", len(commits))
+	}
+
+	store, err := sqlite.Open(filepath.Join(t.TempDir(), "store.sqlite3"))
+	if err != nil {
+		t.Fatalf("sqlite.Open(): %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if err := store.UpsertAccount(sqlite.Account{
+		AccountID:   "whatsapp-primary",
+		BridgeKey:   "whatsapp",
+		Mode:        sqlite.AccountModeLive,
+		Enabled:     true,
+		ConfigJSON:  `{}`,
+		CreatedAtMS: 1,
+		UpdatedAtMS: 1,
+	}); err != nil {
+		t.Fatalf("UpsertAccount(): %v", err)
+	}
+	inbox, err := sqlite.NewMessageRepository(store, time.Now)
+	if err != nil {
+		t.Fatalf("NewMessageRepository(): %v", err)
+	}
+	h.sink.mu.Lock()
+	records := append([]bridge.RawIngressRecord(nil), h.sink.records...)
+	h.sink.mu.Unlock()
+	for index, record := range records {
+		if _, err := inbox.AppendInbox(context.Background(), sqlite.InboxRecord{
+			InboxID:      fmt.Sprintf("inbox-%d", index),
+			AccountID:    record.AccountID,
+			Generation:   int64(record.Generation),
+			DedupeKey:    record.DedupeKey,
+			Codec:        record.Codec,
+			CodecVersion: int64(record.CodecVersion),
+			Payload:      record.Payload,
+		}); err != nil {
+			t.Fatalf("AppendInbox(%s): %v", record.DedupeKey, err)
+		}
+	}
+	rows, err := inbox.Unprocessed(context.Background())
+	if err != nil {
+		t.Fatalf("Unprocessed(): %v", err)
+	}
+	inboxRows := 0
+	for _, row := range rows {
+		if strings.HasPrefix(row.DedupeKey, "msg:"+string(id)+":") {
+			inboxRows++
+		}
+	}
+	if inboxRows != 1 {
+		t.Fatalf("inbox holds %d rows for the message, want 1", inboxRows)
+	}
 }
