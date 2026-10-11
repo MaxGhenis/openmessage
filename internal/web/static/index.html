@@ -12990,7 +12990,18 @@ body::after {
       push_name: raw.push_name || '',
       account_jid: raw.account_jid || '',
       last_error: raw.last_error || '',
+      needs_relink: !!raw.needs_relink,
+      relink_reason: raw.relink_reason || '',
+      relink_since_ms: Number(raw.relink_since_ms || 0),
     };
+  }
+
+  // WhatsApp logged this device out and nothing has relinked it yet. The
+  // backend reports such an account as unpaired, so without this the panel
+  // would read like a WhatsApp that was never set up.
+  function whatsAppLoggedOut() {
+    return whatsAppStatus.needs_relink && !whatsAppStatus.connected
+      && !whatsAppStatus.connecting && !whatsAppStatus.pairing;
   }
 
   function normalizeSignalHistorySync(raw = {}) {
@@ -13178,6 +13189,7 @@ body::after {
     if (whatsAppStatus.connected) return 'Connected';
     if (whatsAppStatus.connecting) return 'Connecting';
     if (whatsAppStatus.pairing) return 'Awaiting scan';
+    if (whatsAppLoggedOut()) return 'Logged out';
     if (whatsAppStatus.paired) return 'Paired';
     return 'Not paired';
   }
@@ -13278,7 +13290,7 @@ body::after {
     $waStatusPill.className = 'wa-state-pill';
     if (whatsAppStatus.connected) {
       $waStatusPill.classList.add('connected');
-    } else if (whatsAppStatus.last_error) {
+    } else if (whatsAppStatus.last_error || whatsAppLoggedOut()) {
       $waStatusPill.classList.add('error');
     }
 
@@ -13292,6 +13304,12 @@ body::after {
       $waHelper.textContent = `Reconnecting live sync for ${identity}. This should usually complete automatically in a few seconds after launch.`;
     } else if (whatsAppStatus.pairing) {
       $waHelper.textContent = 'Scan the QR code below from WhatsApp on your phone: Settings -> Linked Devices -> Link a Device.';
+    } else if (whatsAppLoggedOut()) {
+      const why = whatsAppStatus.relink_reason ? ` (${whatsAppStatus.relink_reason})` : '';
+      const when = whatsAppStatus.relink_since_ms
+        ? ` on ${new Date(whatsAppStatus.relink_since_ms).toLocaleDateString([], { month: 'short', day: 'numeric', year: 'numeric' })}`
+        : '';
+      $waHelper.textContent = `WhatsApp logged this device out${why}${when}, so WhatsApp messages have stopped syncing. Click Connect WhatsApp for a fresh QR code, or link with a phone number below.`;
     } else if (whatsAppStatus.paired) {
       $waHelper.textContent = 'This WhatsApp account is already paired locally. Reconnect to resume live WhatsApp sync.';
     } else if (waPairingExpired) {
@@ -13323,7 +13341,8 @@ body::after {
 
     // "timeout" as a raw error string is cryptic; the expired-state helper
     // text above already explains it.
-    if (whatsAppStatus.last_error && !whatsAppStatus.pairing && !waPairingExpired) {
+    // A logout's raw reason is already in the helper text above.
+    if (whatsAppStatus.last_error && !whatsAppStatus.pairing && !waPairingExpired && !whatsAppLoggedOut()) {
       showWhatsAppError(whatsAppStatus.last_error);
     }
 
