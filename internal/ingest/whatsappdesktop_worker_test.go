@@ -234,19 +234,133 @@ func TestWhatsAppDesktopHistoryWorkerI3I4NewChatAndMessageIdentity(t *testing.T)
 	}
 }
 
-func TestWhatsAppDesktopHistoryWorkerUnboundMatchingRosterSkipped(t *testing.T) {
-	h := newWADHHarness(t)
-	snapshot := WhatsAppDesktopHistorySnapshot{ChatJID: "123456789@g.us", Title: "synthetic original", Participants: []WhatsAppDesktopHistoryParticipant{{JID: waCanonicalChatJID}, {JID: waSenderJID}}, Messages: []WhatsAppDesktopHistoryMessage{{StanzaID: "original", SenderJID: waCanonicalChatJID, TimestampMS: 1780000001000, Type: 0, Text: "synthetic original"}}}
-	h.append(t, wadhRecord(t, snapshot), true)
-	before := h.state(t)
-	snapshot.ChatJID = "987654321@g.us"
-	snapshot.Title = "synthetic ambiguous"
-	snapshot.Messages[0].StanzaID = "ambiguous"
-	h.append(t, wadhRecord(t, snapshot), true)
-	if after := h.state(t); !reflect.DeepEqual(before, after) {
-		t.Fatal("unbound roster-match rewrote existing thread or created a new one")
+func TestWhatsAppDesktopHistoryWorkerDistinctGroupJIDsWithSameRosterBothPlaced(t *testing.T) {
+	// A WhatsApp group JID is the chat's identity, so a second group with the
+	// same members is a second chat: both are minted, in either order.
+	for _, reverse := range []bool{false, true} {
+		t.Run(fmt.Sprintf("reverse_%t", reverse), func(t *testing.T) {
+			h := newWADHHarness(t)
+			first := WhatsAppDesktopHistorySnapshot{ChatJID: "123456789@g.us", Title: "synthetic first", Participants: []WhatsAppDesktopHistoryParticipant{{JID: waCanonicalChatJID}, {JID: waSenderJID}}, Messages: []WhatsAppDesktopHistoryMessage{{StanzaID: "first", SenderJID: waCanonicalChatJID, TimestampMS: 1780000001000, Type: 0, Text: "synthetic first"}}}
+			second := first
+			second.ChatJID = "987654321@g.us"
+			second.Title = "synthetic second"
+			second.Messages = []WhatsAppDesktopHistoryMessage{{StanzaID: "second", SenderJID: waSenderJID, TimestampMS: 1780000002000, Type: 0, Text: "synthetic second"}}
+			order := []WhatsAppDesktopHistorySnapshot{first, second}
+			if reverse {
+				order = []WhatsAppDesktopHistorySnapshot{second, first}
+			}
+			for _, snapshot := range order {
+				h.append(t, wadhRecord(t, snapshot), true)
+			}
+			h.message(t, "123456789@g.us", "first")
+			h.message(t, "987654321@g.us", "second")
+			if c := h.counts(); c.HistorySkipped != 0 || c.HistoryImported != 2 || c.HistoryConversations != 2 {
+				t.Fatalf("counts=%+v", c)
+			}
+		})
 	}
-	if c := h.counts(); c.HistorySkipped != 2 || c.HistoryImported != 1 || c.HistoryConversations != 1 || c.RemoteRebinds != 0 {
+}
+
+// wadhLive appends one live WhatsApp message frame through the real decoder.
+func wadhLive(t *testing.T, h *wadhHarness, chatJID, senderJID, stanza string, fromMe bool, timestampMS int64) {
+	t.Helper()
+	envelope := waBaseMessageEnvelope()
+	envelope.ChatJID = chatJID
+	envelope.SenderJID = senderJID
+	envelope.MessageID = stanza
+	envelope.TimestampMS = timestampMS
+	envelope.IsFromMe = fromMe
+	envelope.IsGroup = strings.HasSuffix(chatJID, "@g.us")
+	record, _ := waMessageRecord(t, envelope, &waE2E.Message{Conversation: proto.String("synthetic live " + stanza)})
+	record.AccountID = waWorkerAccountID
+	record.DedupeKey = "synthetic-live-" + stanza
+	h.append(t, record, false)
+}
+
+func wadhPeerKinds(t *testing.T, h *wadhHarness, jid string) []string {
+	t.Helper()
+	conversation := h.conversation(t, jid)
+	peers, err := h.store.ListConversationPeerIdentities(waWorkerAccountID, conversation.ConversationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var kinds []string
+	for _, peer := range peers {
+		kinds = append(kinds, string(peer.Kind))
+	}
+	return kinds
+}
+
+func TestWhatsAppDesktopHistoryWorkerFillsDirectThreadsWhosePeersAreAliased(t *testing.T) {
+	// Live outgoing messages link the direct peer from the remote ID (a jid
+	// identity) while live incoming senders are e164 identities, so a real
+	// thread can carry {jid}, or {jid, e164}, for one person. Desktop history
+	// names the e164 form. The bound remote JID decides placement, so the gap
+	// must still fill.
+	for _, withIncoming := range []bool{false, true} {
+		t.Run(fmt.Sprintf("incoming_%t", withIncoming), func(t *testing.T) {
+			h := newWADHHarness(t)
+			wadhLive(t, h, waCanonicalChatJID, "", "live-out", true, 1780000001000)
+			if withIncoming {
+				wadhLive(t, h, waCanonicalChatJID, waCanonicalChatJID, "live-in", false, 1780000002000)
+			}
+			kinds := wadhPeerKinds(t, h, waCanonicalChatJID)
+			if len(kinds) == 0 || (withIncoming && len(kinds) < 2) {
+				t.Fatalf("fixture did not produce the aliased roster: peers %v", kinds)
+			}
+			snapshot := WhatsAppDesktopHistorySnapshot{ChatJID: waCanonicalChatJID, Title: "synthetic chat", Participants: []WhatsAppDesktopHistoryParticipant{{JID: waCanonicalChatJID}}, Messages: []WhatsAppDesktopHistoryMessage{
+				{StanzaID: "gap-in", TimestampMS: 1780000010000, Type: 0, Text: "synthetic gap in"},
+				{StanzaID: "gap-out", TimestampMS: 1780000011000, Type: 0, Text: "synthetic gap out", IsFromMe: true},
+			}}
+			h.append(t, wadhRecord(t, snapshot), true)
+			h.message(t, waCanonicalChatJID, "gap-in")
+			h.message(t, waCanonicalChatJID, "gap-out")
+			if c := h.counts(); c.HistorySkipped != 0 || c.HistoryImported != 2 || c.HistoryConversations != 0 {
+				t.Fatalf("counts=%+v", c)
+			}
+			if got := h.conversation(t, waCanonicalChatJID).LastMessageAtMS; got != 1780000011000 {
+				t.Fatalf("recency = %d", got)
+			}
+		})
+	}
+}
+
+func TestWhatsAppDesktopHistoryWorkerFillsBoundGroupWhoseMembersAreLIDs(t *testing.T) {
+	// The live bridge can file group members under LID identities while
+	// Desktop resolves the same people to phone numbers; with no overlapping
+	// identity the Google-style roster check would call the binding stale.
+	const group = "120363000000000001@g.us"
+	h := newWADHHarness(t)
+	wadhLive(t, h, group, "88888888@lid", "live-group", false, 1780000001000)
+	snapshot := WhatsAppDesktopHistorySnapshot{ChatJID: group, Title: "synthetic group", Participants: []WhatsAppDesktopHistoryParticipant{{JID: waCanonicalChatJID}, {JID: waSenderJID}}, Messages: []WhatsAppDesktopHistoryMessage{{StanzaID: "gap-group", SenderJID: waSenderJID, TimestampMS: 1780000010000, Type: 0, Text: "synthetic group gap"}}}
+	h.append(t, wadhRecord(t, snapshot), true)
+	h.message(t, group, "gap-group")
+	if c := h.counts(); c.HistorySkipped != 0 || c.HistoryImported != 1 {
+		t.Fatalf("counts=%+v", c)
+	}
+}
+
+func TestWhatsAppDesktopHistoryWorkerNeverDuplicatesAMessageHeldInAnotherThread(t *testing.T) {
+	// A contact's renumbered or aliased chat maps to a different remote ID,
+	// but its messages keep their stanza IDs. History must not copy them into
+	// a second thread, and must not mint a thread that would only be empty.
+	h := newWADHHarness(t)
+	wadhLive(t, h, waCanonicalChatJID, waCanonicalChatJID, "held", false, 1780000001000)
+	alias := WhatsAppDesktopHistorySnapshot{ChatJID: waSenderJID, Title: "synthetic alias", Participants: []WhatsAppDesktopHistoryParticipant{{JID: waSenderJID}}, Messages: []WhatsAppDesktopHistoryMessage{{StanzaID: "held", TimestampMS: 1780000001000, Type: 0, Text: "synthetic held"}}}
+	h.append(t, wadhRecord(t, alias), true)
+	if _, err := h.store.GetConversationByRemote(waWorkerAccountID, "whatsapp:"+waSenderJID); err == nil {
+		t.Fatal("history minted a thread whose only message lives in another thread")
+	}
+	if c := h.counts(); c.HistoryExisting != 1 || c.HistoryImported != 0 || c.HistoryConversations != 0 {
+		t.Fatalf("counts=%+v", c)
+	}
+	alias.Messages = append(alias.Messages, WhatsAppDesktopHistoryMessage{StanzaID: "new-after-renumber", TimestampMS: 1780000020000, Type: 0, Text: "synthetic new"})
+	h.append(t, wadhRecord(t, alias), true)
+	h.message(t, waSenderJID, "new-after-renumber")
+	if rows := h.rows(t, "SELECT * FROM messages WHERE remote_message_id='held'"); len(rows) != 1 {
+		t.Fatalf("held message rows = %d, want 1", len(rows))
+	}
+	if c := h.counts(); c.HistoryImported != 1 || c.HistoryConversations != 1 {
 		t.Fatalf("counts=%+v", c)
 	}
 }

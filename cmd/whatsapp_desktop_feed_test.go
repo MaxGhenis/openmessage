@@ -255,14 +255,16 @@ func TestWhatsAppDesktopFeedUnavailableDatabaseDoesNotScanOrAdvance(t *testing.T
 	if err := os.Remove(feed.status.DBPath); err != nil {
 		t.Fatal(err)
 	}
-	feed.scanOnce(context.Background(), time.Now())
+	start := time.Now()
+	feed.scanOnce(context.Background(), start)
 	if calls != 0 || feed.Snapshot().Available || feed.Snapshot().Active || feed.Snapshot().HighWaterPK != 0 || feed.Snapshot().LastError == "" {
 		t.Fatalf("missing database scanned/advanced: calls=%d status=%+v", calls, feed.Snapshot())
 	}
 	if err := os.WriteFile(feed.status.DBPath, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	feed.scanOnce(context.Background(), time.Now())
+	// The failure armed a one-minute backoff; the next scan waits it out.
+	feed.scanOnce(context.Background(), start.Add(whatsappDesktopRetryMin))
 	if calls != 1 || feed.Snapshot().Available || feed.Snapshot().Active || feed.Snapshot().HighWaterPK != 0 || feed.Snapshot().LastError != "synthetic unreadable schema" {
 		t.Fatalf("unsupported database claimed availability: calls=%d status=%+v", calls, feed.Snapshot())
 	}
@@ -339,5 +341,107 @@ func TestWhatsAppDesktopHistoryRegisteredAndGenerationZeroAccepted(t *testing.T)
 	counters := stack.Counters.Snapshot(whatsappAccountID)
 	if counters.HistoryAppended != 1 || counters.HistoryImported != 1 || counters.Appended != 0 || counters.Projected != 0 {
 		t.Fatalf("desktop history counted as live evidence: %+v", counters)
+	}
+}
+
+func TestWhatsAppDesktopFeedBacksOffAfterFailuresAndResetsOnSuccess(t *testing.T) {
+	failing := true
+	calls := 0
+	feed := newDesktopFeedTest(t, func() whatsapplive.StatusSnapshot { return whatsapplive.StatusSnapshot{} }, func(context.Context, whatsappdesktop.ScanOptions, func(whatsappdesktop.Chunk) error) (whatsappdesktop.Stats, error) {
+		calls++
+		if failing {
+			return whatsappdesktop.Stats{}, errors.New("synthetic scan failure")
+		}
+		return whatsappdesktop.Stats{HighWaterPK: 7}, nil
+	}, &desktopFeedTestSink{})
+	base := time.Now()
+	at := base
+	// Each failure doubles the wait: 1, 2, 4, ... minutes, capped at an hour.
+	for _, wait := range []time.Duration{time.Minute, 2 * time.Minute, 4 * time.Minute, 8 * time.Minute, 16 * time.Minute, 32 * time.Minute, time.Hour, time.Hour} {
+		before := calls
+		feed.scanOnce(context.Background(), at)
+		if calls != before+1 {
+			t.Fatalf("scan at +%v did not run", at.Sub(base))
+		}
+		feed.scanOnce(context.Background(), at.Add(wait-time.Second))
+		if calls != before+1 {
+			t.Fatalf("scan inside the %v backoff ran", wait)
+		}
+		at = at.Add(wait)
+	}
+	failing = false
+	feed.scanOnce(context.Background(), at)
+	if feed.Snapshot().HighWaterPK != 7 || feed.Snapshot().LastError != "" {
+		t.Fatalf("recovery scan status = %+v", feed.Snapshot())
+	}
+	before := calls
+	feed.scanOnce(context.Background(), at.Add(time.Second))
+	if calls != before+1 {
+		t.Fatal("a successful scan did not clear the backoff")
+	}
+}
+
+func TestWhatsAppDesktopFeedRecoversFromAScanPanic(t *testing.T) {
+	feed := newDesktopFeedTest(t, func() whatsapplive.StatusSnapshot { return whatsapplive.StatusSnapshot{} }, func(context.Context, whatsappdesktop.ScanOptions, func(whatsappdesktop.Chunk) error) (whatsappdesktop.Stats, error) {
+		panic("synthetic reader panic")
+	}, &desktopFeedTestSink{})
+	start := time.Now()
+	feed.scanOnce(context.Background(), start)
+	if status := feed.Snapshot(); !strings.Contains(status.LastError, "panicked") || status.HighWaterPK != 0 {
+		t.Fatalf("status after panic = %+v", status)
+	}
+	if !feed.retryAfter.After(start) {
+		t.Fatal("a panic did not arm the backoff")
+	}
+}
+
+func TestWhatsAppDesktopFeedSkipsTheAppsOwnSends(t *testing.T) {
+	// A send whose acknowledgement was lost keeps its local row under the
+	// request ID. Desktop shows the delivered copy under the derived stanza
+	// ID; history must leave it to the outbox and live channel.
+	own := whatsapplive.DeriveWebMessageID("synthetic-request")
+	sink := &desktopFeedTestSink{}
+	feed := newDesktopFeedTest(t, func() whatsapplive.StatusSnapshot { return whatsapplive.StatusSnapshot{} }, func(_ context.Context, _ whatsappdesktop.ScanOptions, emit func(whatsappdesktop.Chunk) error) (whatsappdesktop.Stats, error) {
+		mixed := desktopFeedTestChunk()
+		mixed.Messages = append(mixed.Messages, whatsappdesktop.Message{PK: 2, StanzaID: own, IsFromMe: true, TimestampMS: 1800000001000, Type: 0, Text: "synthetic own send"})
+		if err := emit(mixed); err != nil {
+			return whatsappdesktop.Stats{}, err
+		}
+		onlyOwn := desktopFeedTestChunk()
+		onlyOwn.Messages = []whatsappdesktop.Message{{PK: 3, StanzaID: own, IsFromMe: true, TimestampMS: 1800000002000, Type: 0, Text: "synthetic own send"}}
+		return whatsappdesktop.Stats{HighWaterPK: 3}, emit(onlyOwn)
+	}, sink)
+	feed.ownSends = func() (map[string]bool, error) { return map[string]bool{own: true}, nil }
+	feed.scanOnce(context.Background(), time.Now())
+	if len(sink.records) != 1 {
+		t.Fatalf("appended %d frames, want only the mixed chunk", len(sink.records))
+	}
+	if strings.Contains(string(sink.records[0].Payload), own) {
+		t.Fatal("the app's own send reached desktop history")
+	}
+	if got := feed.Snapshot().RowsSkippedByReason["own_send"]; got != 2 {
+		t.Fatalf("own_send skips = %d, want 2", got)
+	}
+}
+
+func TestWhatsAppDesktopSelfJIDPrefersAnOlderPhoneRowOverANewerLID(t *testing.T) {
+	store, err := sqlite.Open(filepath.Join(t.TempDir(), "store.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := ensureWhatsAppDesktopAccount(store); err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range []sqlite.Identity{
+		{IdentityID: "self-phone", AccountID: whatsappAccountID, Kind: "e164", CanonicalValue: "+15550100002", RawValue: "+15550100002", IsSelf: true, MetadataJSON: "{}", CreatedAtMS: 100, UpdatedAtMS: 100},
+		{IdentityID: "self-lid", AccountID: whatsappAccountID, Kind: "jid", CanonicalValue: "991122@lid", RawValue: "991122@lid", IsSelf: true, MetadataJSON: "{}", CreatedAtMS: 100, UpdatedAtMS: 500},
+	} {
+		if err := store.UpsertIdentity(row); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got, err := whatsappDesktopSelfJID(store); err != nil || got != "15550100002@s.whatsapp.net" {
+		t.Fatalf("self JID = %q, %v", got, err)
 	}
 }

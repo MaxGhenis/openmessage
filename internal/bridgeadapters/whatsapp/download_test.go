@@ -377,3 +377,32 @@ func TestDownloadMediaTransportClassificationDoesNotRetireReceiveGeneration(t *t
 		})
 	}
 }
+
+func TestDownloadMediaServesLocalDesktopRefsWithoutTheLiveTransport(t *testing.T) {
+	// Desktop history supplies local refs exactly while the live bridge is
+	// down; reading Desktop's own file needs no WhatsApp connection. A remote
+	// ref under the same disconnected adapter still fails passively.
+	var downloads []string
+	a := &Adapter{
+		mediaReady: func() bool { return false },
+		downloadMediaRef: func(kind string, _ whatsapplive.StoredMediaRef, _ string, _ string, _ string) ([]byte, string, error) {
+			downloads = append(downloads, kind)
+			return []byte("synthetic"), "image/jpeg", nil
+		},
+	}
+	local := []byte(`{"v":1,"kind":"local","local_ref":"walocal:dGVzdA"}`)
+	stream, err := a.DownloadMedia(context.Background(), "whatsapp-primary", bridge.MediaRef{Opaque: local, MIME: "image/jpeg"})
+	if err != nil || stream.ReadCloser == nil {
+		t.Fatalf("local DownloadMedia() = %+v, %v", stream, err)
+	}
+	stream.Close()
+	remote := []byte(`{"v":1,"kind":"remote","direct_path":"/mms/image","file_sha256":"0506","file_enc_sha256":"0304","media_key":"0102","file_length":9,"local_ref":""}`)
+	_, err = a.DownloadMedia(context.Background(), "whatsapp-primary", bridge.MediaRef{Opaque: remote})
+	failure, ok := asOpError(err)
+	if !ok || failure.Fingerprint != "whatsapp_not_connected" {
+		t.Fatalf("remote DownloadMedia() error = %v, want not connected", err)
+	}
+	if len(downloads) != 1 || downloads[0] != "local" {
+		t.Fatalf("transport downloads = %v, want only the local ref", downloads)
+	}
+}
