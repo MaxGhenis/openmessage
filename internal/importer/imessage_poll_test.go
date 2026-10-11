@@ -696,8 +696,9 @@ func TestIMessageConversationDeletedFromTheStoreComesBack(t *testing.T) {
 	h := chat.addHandle("+15550000001")
 	a := chat.addChat("A", strPtr("A"), false, h)
 	b := chat.addChat("B", strPtr("B"), false, h)
-	chat.message(a, "a1", "in A", at(3*time.Hour), false, h)
-	chat.message(a, "a2", "newest in A", at(2*time.Hour), false, h)
+	// Older than the 24 h window, so only the restore re-reads them.
+	chat.message(a, "a1", "in A", at(72*time.Hour), false, h)
+	chat.message(a, "a2", "newest in A", at(48*time.Hour), false, h)
 	chat.message(b, "b1", "in B", at(time.Hour), false, h)
 	store, path := newIMessageStore(t)
 	poller := newPoller(chat.path)
@@ -711,7 +712,7 @@ func TestIMessageConversationDeletedFromTheStoreComesBack(t *testing.T) {
 		t.Fatalf("a deleted conversation forced a full read (%s)", poller.last.fullReason)
 	}
 	conv, err := store.GetConversation("imessage:A")
-	if err != nil || conv.LastMessageTS != at(2*time.Hour)*1000 {
+	if err != nil || conv.LastMessageTS != at(48*time.Hour)*1000 {
 		t.Fatalf("restored conversation = %+v, %v", conv, err)
 	}
 	for _, id := range []string{"imessage:a1", "imessage:a2"} {
