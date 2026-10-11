@@ -792,7 +792,7 @@ func (r *run) handleIngress(frame whatsapplive.IngressFrame) error {
 		return nil
 	}
 
-	err := r.sink.AppendIngress(context.Background(), bridge.RawIngressRecord{
+	record := bridge.RawIngressRecord{
 		AccountID:    r.request.AccountID,
 		Generation:   r.request.Generation,
 		DedupeKey:    frame.DedupeKey,
@@ -800,7 +800,15 @@ func (r *run) handleIngress(frame whatsapplive.IngressFrame) error {
 		CodecVersion: whatsapplive.IngressCodecVersion,
 		ReceivedAt:   frame.ReceivedAt,
 		Payload:      frame.Payload,
-	})
+	}
+	var err error
+	if replay, ok := r.sink.(bridge.ReplayIngressSink); ok && frame.Replayed {
+		// A frame held across a generation change commits under this
+		// generation without counting as its connection's activity.
+		err = replay.AppendReplayedIngress(context.Background(), record)
+	} else {
+		err = r.sink.AppendIngress(context.Background(), record)
+	}
 	if err == nil || errors.Is(err, bridge.ErrStaleGeneration) {
 		if !r.durableIngress {
 			return nil

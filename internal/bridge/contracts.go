@@ -46,6 +46,19 @@ type IngressDurability interface {
 	DurableIngress() bool
 }
 
+// ReplayIngressSink is an optional ConnectionSink extension for frames a
+// transport received on its live channel under an earlier generation, could
+// not commit before that generation retired, and held durably until a later
+// generation could. AppendReplayedIngress keeps AppendIngress's generation
+// fence and durable commit, and downstream the frame counts as live ingress
+// (the live channel did deliver it). But it is not evidence that the current
+// generation's connection delivered anything: implementations must not record
+// it as connection activity, which would refresh liveness and reset the
+// failure history that sizes backoff.
+type ReplayIngressSink interface {
+	AppendReplayedIngress(ctx context.Context, record RawIngressRecord) error
+}
+
 // Lifecycle owns transport connection generations.
 type Lifecycle interface {
 	// Start creates one owned connection generation. Run.Done must resolve when
