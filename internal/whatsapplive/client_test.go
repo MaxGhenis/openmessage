@@ -434,6 +434,36 @@ func TestBridgeNewInitializesSQLiteSessionStore(t *testing.T) {
 	}
 }
 
+// TestBridgeClientAcknowledgesOnlyHandledStanzas pins the whatsmeow settings
+// the bridge's delivery guarantees rest on: acks wait for the handlers
+// (SynchronousAck), decrypted messages are buffered until handled
+// (EnableDecryptedEventBuffer), and the phone re-request that synchronous
+// acks send on a first retry is the configured behavior in both ack modes.
+func TestBridgeClientAcknowledgesOnlyHandledStanzas(t *testing.T) {
+	dataDir := t.TempDir()
+	store, err := db.New(filepath.Join(dataDir, "messages.db"))
+	if err != nil {
+		t.Fatalf("db.New(): %v", err)
+	}
+	defer store.Close()
+	bridge, err := New(filepath.Join(dataDir, "whatsapp-session.db"), store, zerolog.Nop(), Callbacks{})
+	if err != nil {
+		t.Fatalf("New(): %v", err)
+	}
+	defer bridge.Close()
+
+	cli := bridge.client
+	if !cli.SynchronousAck {
+		t.Error("SynchronousAck is off: whatsmeow would ack receipts and newsletter posts before handling them")
+	}
+	if !cli.EnableDecryptedEventBuffer {
+		t.Error("EnableDecryptedEventBuffer is off: an unhandled message's plaintext would not survive to its redelivery")
+	}
+	if !cli.AutomaticMessageRerequestFromPhone {
+		t.Error("AutomaticMessageRerequestFromPhone is off: the asynchronous ack path would disagree with the synchronous one")
+	}
+}
+
 func TestBridgeSendTextBuildsOutgoingWhatsAppMessage(t *testing.T) {
 	ownJID := watypes.NewJID("15551230000", watypes.DefaultUserServer)
 	bridge := &Bridge{
