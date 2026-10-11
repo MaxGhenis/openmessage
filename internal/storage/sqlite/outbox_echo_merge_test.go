@@ -630,7 +630,7 @@ type echoMergeCursorRow struct {
 	LastReadAtMS, UpdatedAtMS           int64
 }
 
-// echoMergeModel is the reference semantics of mergeEchoDuplicate followed by
+// echoMergeModel is the reference semantics of mergeDuplicateMessage followed by
 // the duplicate's DELETE, written independently over plain Go maps.
 func echoMergeModel(before echoMergeSnapshot, duplicateID, survivorID string, nowMS int64) echoMergeSnapshot {
 	after := echoMergeSnapshot{
@@ -677,7 +677,7 @@ func echoMergeModel(before echoMergeSnapshot, duplicateID, survivorID string, no
 	for key, row := range after.Reactions {
 		if fenced && row.MessageID == survivorID && row.State == "active" && row.SourceSeqMS < fence {
 			row.State = "removed"
-			row.OccurredAtMS = nowMS
+			row.OccurredAtMS = inferredTombstoneOccurredAtMS
 			row.SourceSeqMS = fence
 			row.UpdatedAtMS = max(row.UpdatedAtMS, nowMS)
 			after.Reactions[key] = row
