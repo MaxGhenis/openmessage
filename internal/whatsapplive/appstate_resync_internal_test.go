@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"runtime"
+	"sync"
 	"testing"
 	"testing/quick"
 	"time"
@@ -217,4 +219,77 @@ func TestStoppedResyncerStartsNothing(t *testing.T) {
 		t.Fatal("a stopped resyncer started a resync")
 	default:
 	}
+}
+
+// TestRetiredClientErrorNeverResyncsItsReplacement checks that an
+// AppStateSyncError reaches only the resyncer of the client that reported it.
+// handleClientEvent checks the source client before applying an event, and
+// the client can be replaced between that check and the resyncer lookup; the
+// lookup must not then hand the retired client's error to the replacement.
+// (Found by the PR #238 review, which raced the two.)
+func TestRetiredClientErrorNeverResyncsItsReplacement(t *testing.T) {
+	var mu sync.Mutex
+	resynced := make(map[*whatsmeow.Client]int)
+	original := fetchAppStateFullSync
+	fetchAppStateFullSync = func(_ context.Context, cli *whatsmeow.Client, _ appstate.WAPatchName) error {
+		mu.Lock()
+		resynced[cli]++
+		mu.Unlock()
+		return nil
+	}
+	t.Cleanup(func() { fetchAppStateFullSync = original })
+	evt := &waevents.AppStateSyncError{Name: appstate.WAPatchCriticalUnblockLow, Error: fmt.Errorf("failed to verify patch v3: %w", appstate.ErrMismatchingLTHash)}
+	retired, replacement := &whatsmeow.Client{}, &whatsmeow.Client{}
+
+	t.Run("replaced before the lookup", func(t *testing.T) {
+		b := &Bridge{logger: zerolog.Nop(), client: replacement, clientGeneration: 2, appStateResync: newAppStateResyncer(replacement, zerolog.Nop())}
+		b.handleAppStateSyncError(retired, 1, evt)
+		b.handleAppStateSyncError(replacement, 1, evt) // same client, stale generation
+		b.appStateResync.stop()
+		b.appStateResync.wait(5 * time.Second)
+		mu.Lock()
+		defer mu.Unlock()
+		if resynced[replacement] != 0 {
+			t.Fatalf("a retired client's error resynced its replacement %d time(s)", resynced[replacement])
+		}
+	})
+
+	t.Run("replaced concurrently", func(t *testing.T) {
+		b := &Bridge{logger: zerolog.Nop()}
+		for generation := uint64(1); generation <= 2000; generation++ {
+			retiredResync := newAppStateResyncer(retired, zerolog.Nop())
+			replacementResync := newAppStateResyncer(replacement, zerolog.Nop())
+			b.mu.Lock()
+			b.client, b.clientGeneration, b.appStateResync = retired, generation, retiredResync
+			b.mu.Unlock()
+			start := make(chan struct{})
+			var wg sync.WaitGroup
+			wg.Add(2)
+			go func() {
+				defer wg.Done()
+				<-start
+				b.handleClientEvent(retired, generation, evt)
+			}()
+			go func() {
+				defer wg.Done()
+				<-start
+				runtime.Gosched()
+				b.mu.Lock()
+				retiredResync.stop()
+				b.client, b.clientGeneration, b.appStateResync = replacement, generation+1, replacementResync
+				b.mu.Unlock()
+			}()
+			close(start)
+			wg.Wait()
+			replacementResync.stop()
+			if !retiredResync.wait(5*time.Second) || !replacementResync.wait(5*time.Second) {
+				t.Fatal("a resync did not return")
+			}
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if resynced[replacement] != 0 {
+			t.Fatalf("retired clients' errors resynced the replacement %d time(s)", resynced[replacement])
+		}
+	})
 }

@@ -48,8 +48,10 @@ type appStateResyncPolicy struct {
 }
 
 // appStateResyncLimits allows a collection three full resyncs a day, ten
-// minutes apart. A collection corrupted once needs one; one that still fails
-// after three is not a local-state problem a fourth snapshot would fix.
+// minutes apart. A collection corrupted once needs one. The cap bounds the
+// snapshot fetches a collection that keeps failing can cost, whatever the
+// cause (resyncs that fail, a corruption that recurs, a snapshot that does
+// not verify).
 var appStateResyncLimits = appStateResyncPolicy{cooldown: 10 * time.Minute, maxStarts: 3, window: 24 * time.Hour}
 
 var appStateResyncNow = time.Now
@@ -164,8 +166,10 @@ func newAppStateResyncer(cli *whatsmeow.Client, logger zerolog.Logger) *appState
 // The resync context is not the handler's. A generation teardown does not
 // cancel it (cancelling between whatsmeow's version and MAC writes is how a
 // collection gets stuck); only retiring the client does. If the connection
-// drops before the snapshot arrives, whatsmeow has already deleted the stored
-// version, and its next fetch of the collection is a full sync.
+// drops while the snapshot request is out, whatsmeow waits up to 5 seconds
+// for a reconnect and resends it (request.go retryFrame). If the resync fails
+// after whatsmeow deleted the stored version, the collection is at version 0,
+// and whatsmeow's next fetch of it is a full sync.
 func (r *appStateResyncer) handle(evt *waevents.AppStateSyncError) {
 	if r == nil || evt == nil {
 		return
@@ -290,11 +294,17 @@ func (r *appStateResyncer) inFlight() int {
 const appStateResyncStopTimeout = 5 * time.Second
 
 // handleAppStateSyncError hands whatsmeow's app-state decode failure to the
-// current client's resyncer. handleClientEvent has already dropped events from
-// a retired client.
-func (b *Bridge) handleAppStateSyncError(evt *waevents.AppStateSyncError) {
+// resyncer of the client that reported it (source; nil means the current
+// client). The client and its resyncer are replaced together under b.mu and
+// read together here, so a retired client's error never starts a resync of
+// its replacement, even when the client is replaced after handleClientEvent
+// checked it.
+func (b *Bridge) handleAppStateSyncError(source *whatsmeow.Client, generation uint64, evt *waevents.AppStateSyncError) {
 	b.mu.RLock()
-	resync := b.appStateResync
+	var resync *appStateResyncer
+	if source == nil || (b.client == source && b.clientGeneration == generation) {
+		resync = b.appStateResync
+	}
 	b.mu.RUnlock()
 	resync.handle(evt)
 }

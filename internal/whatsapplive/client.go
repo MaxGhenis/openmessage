@@ -2048,6 +2048,9 @@ func (b *Bridge) handleClientEvent(source *whatsmeow.Client, generation uint64, 
 		retryAt, persistenceErr = b.persistTemporaryBan(at, event.Expire)
 	}
 
+	if event, ok := raw.(*waevents.AppStateSyncError); ok && event != nil {
+		b.handleAppStateSyncError(source, generation, event)
+	}
 	handled := b.applyEvent(raw)
 
 	b.mu.RLock()
@@ -2370,7 +2373,7 @@ func (b *Bridge) applyEvent(raw any) bool {
 		b.captureHistorySyncIngress(evt)
 		b.handleHistorySync(evt)
 	case *waevents.AppStateSyncError:
-		b.handleAppStateSyncError(evt)
+		// handleClientEvent hands it to the reporting client's resyncer.
 	default:
 		b.logger.Debug().Type("type", evt).Msg("Unhandled WhatsApp event")
 	}

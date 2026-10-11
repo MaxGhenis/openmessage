@@ -1524,10 +1524,15 @@ the snapshot leaves out. Later patches then apply normally.
   re-pairing starts a fresh one.
 - Its context is not the handler's: a generation teardown does not cancel it.
   Closing the bridge or replacing the client (re-pairing) does, and `Close`
-  waits up to 5 seconds for it to return. If the socket drops before the
-  snapshot arrives, whatsmeow has already deleted the stored version, and its
-  next fetch of the collection (the next app-state notification for it) is a
-  full sync.
+  waits up to 5 seconds for it to return. If the connection drops while the
+  snapshot request is out, whatsmeow waits up to 5 seconds for a reconnect and
+  resends it. If the resync still fails after whatsmeow deleted the stored
+  version, the collection is at version 0, and whatsmeow's next fetch of it
+  (the next app-state notification for it) is a full sync.
+- A client's error only ever resyncs that client's collection: the bridge
+  hands it to the resyncer of the client that reported it, read together
+  with the current client, and a replaced client's resyncer is stopped and
+  refuses new resyncs.
 - Other decode failures do not start a resync: a patch, content or index MAC
   mismatch is about the patch itself, and a missing key makes whatsmeow
   request the key instead (it dispatches no error for that).
@@ -1539,12 +1544,14 @@ Log lines (the bridge's log; each carries `collection` and `full_sync`):
 | `WhatsApp app state collection disagrees with the server; starting a full resync` | warn | a resync started; `attempt` of `max_attempts` in `window` |
 | `WhatsApp app state full resync completed` | info | the collection was rebuilt from the snapshot |
 | `WhatsApp app state full resync failed` | warn | e.g. not connected or an IQ timeout; the next failing patch can retry after the cooldown |
-| `... full resync budget used up` | warn once, then debug | 3 resyncs in 24 hours did not fix it; `next_resync_after` says when one may start again |
+| `... full resync budget used up` | warn once, then debug | 3 resyncs started in 24 hours and the collection still fails to verify; `next_resync_after` says when one may start again |
 | `... full resync cooling down` / `... already running` | debug | refused by the cooldown or because one is in flight |
 
-A collection that hits the cap is not a local-state problem a fourth snapshot
-would fix (or the server's snapshot itself fails to verify, which logs
-`failed to verify snapshot: ... mismatching LTHash`). To inspect it read-only:
+The cap bounds what a collection that keeps failing can cost; it does not
+say why. Read the log lines before it: resyncs that each failed (not
+connected, an IQ timeout, a database error), a corruption that recurs after
+each completed resync, or a snapshot that does not verify itself
+(`failed to verify snapshot: ... mismatching LTHash`). To inspect it read-only:
 `whatsmeow_app_state_version` holds each collection's version, and
 `whatsmeow_app_state_mutation_macs` its value MACs (copy `whatsapp-session.db`
 first; the app holds it open). Restarting the app resets the budget.
