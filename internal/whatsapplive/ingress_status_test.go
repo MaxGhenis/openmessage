@@ -159,12 +159,19 @@ func TestUnhandledMessageIsCommittedOnRedelivery(t *testing.T) {
 	if len(frames) != 1 {
 		t.Fatalf("redelivery committed %d frames, want 1", len(frames))
 	}
+	if len(bridge.legacyAhead) != 0 {
+		t.Fatalf("legacy records after the committed redelivery = %v, want none", bridge.legacyAhead)
+	}
+	fresh := statusTestMessage(chat, "fresh", &waE2E.Message{Conversation: proto.String("committed first time")})
+	if !bridge.handleClientEvent(nil, 0, fresh) || len(bridge.legacyAhead) != 0 {
+		t.Fatalf("a message committed on its first delivery left legacy records %v", bridge.legacyAhead)
+	}
 	messages, err := store.GetMessagesByConversation(waConversationID(chat), 10)
 	if err != nil {
 		t.Fatalf("GetMessagesByConversation(): %v", err)
 	}
-	if len(messages) != 1 {
-		t.Fatalf("legacy store holds %d rows after two deliveries, want 1", len(messages))
+	if len(messages) != 2 {
+		t.Fatalf("legacy store holds %d rows after two deliveries of one message and one of another, want 2", len(messages))
 	}
 }
 
@@ -368,7 +375,30 @@ func TestLegacyFailureOnAnUncommittedDeliveryIsRetriedAndNotAcknowledged(t *test
 	chat := watypes.NewJID("15551234567", watypes.DefaultUserServer)
 	event := statusTestMessage(chat, "fragile", &waE2E.Message{Conversation: proto.String("fragile text")})
 
-	t.Run("panic", func(t *testing.T) {
+	t.Run("panic before the write", func(t *testing.T) {
+		store, err := db.New(":memory:")
+		if err != nil {
+			t.Fatalf("db.New(): %v", err)
+		}
+		t.Cleanup(func() { _ = store.Close() })
+		// With no store the legacy conversation upsert dereferences nil, a
+		// panic before the message row is written.
+		bridge := &Bridge{}
+		bridge.ObserveIngress(func(IngressFrame) error { return nil }, true)()
+		if bridge.handleClientEvent(nil, 0, event) {
+			t.Fatal("an uncommitted message whose legacy handling panicked was reported handled")
+		}
+		if len(bridge.legacyAhead) != 0 {
+			t.Fatalf("a legacy write that panicked was recorded as taken: %v", bridge.legacyAhead)
+		}
+		bridge.store = store
+		bridge.handleClientEvent(nil, 0, event) // redelivery, still uncommitted
+		if stored, err := store.GetMessageByID("whatsapp:fragile"); err != nil || stored == nil {
+			t.Fatalf("legacy store after the redelivery = %+v, %v; want the panicked write retried", stored, err)
+		}
+	})
+
+	t.Run("panic after the write", func(t *testing.T) {
 		store, err := db.New(":memory:")
 		if err != nil {
 			t.Fatalf("db.New(): %v", err)

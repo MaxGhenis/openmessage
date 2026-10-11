@@ -64,7 +64,9 @@ import (
 // handler context that teardown cancels, which is how main behaved and what a
 // teardown that overlaps ConnectContext returning still does.
 
-const teardownTestTimeout = 10 * time.Second
+// teardownTestTimeout bounds every wait; passing runs never approach it, but a
+// heavily loaded machine under -race can stall the supervisor for seconds.
+const teardownTestTimeout = 30 * time.Second
 
 // teardownClock is a real clock whose short timers (the supervisor's backoff;
 // every other supervisor timer in these tests is at least a minute) wait for
