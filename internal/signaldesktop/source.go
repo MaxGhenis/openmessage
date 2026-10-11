@@ -31,7 +31,7 @@ var readHelper []byte
 
 const (
 	helperTimeout   = 2 * time.Minute
-	keychainTimeout = 10 * time.Second
+	keychainTimeout = 60 * time.Second
 	// maxHelperOutput bounds what one read may return. A full scan of a
 	// several-year archive is tens of megabytes; this is far above that and
 	// far below what would hurt the daemon.

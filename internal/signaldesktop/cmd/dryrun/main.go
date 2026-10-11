@@ -187,6 +187,26 @@ func main() {
 		// /api/status flags projection_stalled when the legacy store's newest
 		// Signal message is more than five minutes past v2's.
 		output["projection_stalled_after"] = *legacyLatestMS-newest > 5*60*1000
+
+		// A second pass over the same archive after applying should find
+		// everything in v2: the feed is a fixed point on real data too.
+		again, err := signaldesktop.LoadFacts(ctx, store, accountID)
+		if err != nil {
+			fail("reload v2 facts")
+		}
+		var secondMessages int64
+		second, err := (&signaldesktop.Reader{Runner: runner}).Scan(ctx, again, signaldesktop.ScanOptions{}, func(chunk signaldesktop.Chunk) error {
+			secondMessages += int64(len(chunk.Messages))
+			return nil
+		})
+		if err != nil {
+			fail("second pass failed")
+		}
+		output["second_pass"] = map[string]any{
+			"messages_to_send":       secondMessages,
+			"rows_in_v2":             second.RowsInV2,
+			"rows_skipped_by_reason": second.RowsSkippedByReason,
+		}
 	}
 	encoder := json.NewEncoder(os.Stdout)
 	encoder.SetIndent("", "  ")

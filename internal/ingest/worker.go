@@ -853,6 +853,7 @@ func (w *Worker) applyEvents(
 				target,
 				reaction,
 				record.ReceivedAt.UnixMilli(),
+				history,
 			)
 			if err != nil {
 				return changed, err
@@ -1523,14 +1524,17 @@ func (w *Worker) prepareReactionSnapshotEntryFor(
 	}, true, nil
 }
 
+// prepareReactionApply resolves the reactor create-only for history, which
+// never rewrites a known identity's name, raw value or update time.
 func (w *Worker) prepareReactionApply(
 	accountID string,
 	platform bridge.Platform,
 	target sqlite.Message,
 	reaction bridge.ReactionEvent,
 	sourceSeqMS int64,
+	history bool,
 ) (sqlite.ReactionApply, error) {
-	actor, err := w.prepareReactionActor(accountID, platform, reaction.Actor, reaction.Emoji, false)
+	actor, err := w.prepareReactionActor(accountID, platform, reaction.Actor, reaction.Emoji, history)
 	if err != nil {
 		return sqlite.ReactionApply{}, err
 	}

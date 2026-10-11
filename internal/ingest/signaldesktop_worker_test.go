@@ -190,6 +190,8 @@ func TestSignalDesktopHistoryWorkerS2ExistingRowsRemainByteIdentical(t *testing.
 	h := newSDHHarness(t)
 	snapshot := sdhDirectSnapshot()
 	h.append(t, sdhRecord(t, snapshot), true)
+	// The group's other member is known from live delivery, with a name.
+	h.live(t, "signal-group:"+sdhGroupID, SignalDesktopHistoryMessage{AuthorAddress: sdhOtherACI, AuthorName: "Live Name", SentAtMS: sdhBaseMS + 100, Body: "synthetic live"})
 	before := h.state(t)
 	h.now = h.now.Add(time.Hour)
 	changed := snapshot
@@ -206,6 +208,21 @@ func TestSignalDesktopHistoryWorkerS2ExistingRowsRemainByteIdentical(t *testing.
 	if c := h.counts(); c.HistoryExisting != 2 || c.HistoryImported != 2 {
 		t.Fatalf("counts=%+v", c)
 	}
+
+	// A history gap message whose sender, participants and reactors are all
+	// known identities, under other names, rewrites none of them.
+	group := sdhGroup(SignalDesktopHistoryMessage{AuthorAddress: sdhOtherACI, AuthorName: "History Name", SentAtMS: sdhBaseMS + 200, Body: "synthetic group gap",
+		Reactions: []SignalDesktopHistoryReaction{{ActorAddress: sdhOtherACI, ActorName: "History Name", Emoji: "👍"}, {ActorAddress: sdhPeerACI, ActorName: "History Peer", Emoji: "❤️"}}})
+	group.Participants = []SignalDesktopHistoryParticipant{{Address: sdhPeerACI, Name: "History Peer"}, {Address: sdhOtherACI, Name: "History Name"}}
+	h.now = h.now.Add(time.Hour)
+	h.append(t, sdhRecord(t, group), true)
+	if afterGroup := h.state(t); !reflect.DeepEqual(before["identities"], afterGroup["identities"]) {
+		t.Fatalf("history rewrote known identities:\nbefore=%v\nafter=%v", before["identities"], afterGroup["identities"])
+	}
+	if c := h.counts(); c.HistoryImported != 3 || c.ReactionsApplied != 2 {
+		t.Fatalf("counts=%+v", c)
+	}
+	before = h.state(t)
 
 	// A gap message inserts; the thread changes only by the recency bump.
 	beforeConversation := h.conversation(t, snapshot.RemoteConversationID)
@@ -225,8 +242,8 @@ func TestSignalDesktopHistoryWorkerS2ExistingRowsRemainByteIdentical(t *testing.
 			t.Fatalf("gap insertion rewrote %s", table)
 		}
 	}
-	if len(after["messages"]) != 3 {
-		t.Fatalf("messages = %d, want 3", len(after["messages"]))
+	if len(after["messages"]) != 5 {
+		t.Fatalf("messages = %d, want 5", len(after["messages"]))
 	}
 	for _, row := range before["messages"] {
 		found := false
