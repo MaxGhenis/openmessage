@@ -14,6 +14,7 @@ import (
 
 	"github.com/rs/zerolog"
 	"go.mau.fi/whatsmeow"
+	waCommon "go.mau.fi/whatsmeow/proto/waCommon"
 	waE2E "go.mau.fi/whatsmeow/proto/waE2E"
 	waHistorySync "go.mau.fi/whatsmeow/proto/waHistorySync"
 	wastore "go.mau.fi/whatsmeow/store"
@@ -542,5 +543,43 @@ func TestHeldFramesSurviveARestart(t *testing.T) {
 	}
 	if got := second.ingressSpool().heldFrames(); got != 0 {
 		t.Fatalf("held after replay = %d, want 0", got)
+	}
+}
+
+// TestRedeliveryOfAHeldMessageDoesNotUndoLegacyEdits: a held message is in
+// the legacy store ahead of v2, as one left for redelivery is. If whatsmeow
+// redelivers it anyway (its clear of the plaintext failed), the redelivery
+// must not write the original body back over an edit applied in between,
+// whether the spool holds it again or a generation commits it.
+func TestRedeliveryOfAHeldMessageDoesNotUndoLegacyEdits(t *testing.T) {
+	chat := watypes.NewJID("15551234567", watypes.DefaultUserServer)
+	original := statusTestMessage(chat, "held-original", &waE2E.Message{Conversation: proto.String("original text")})
+	edit := statusTestMessage(chat, "held-edit", &waE2E.Message{ProtocolMessage: &waE2E.ProtocolMessage{
+		Type:          waE2E.ProtocolMessage_MESSAGE_EDIT.Enum(),
+		Key:           &waCommon.MessageKey{ID: proto.String("held-original")},
+		EditedMessage: &waE2E.Message{Conversation: proto.String("edited text")},
+	}})
+
+	bridge, store, _ := spoolTestBridge(t, 16)
+	bridge.ObserveIngress(func(IngressFrame) error { return nil }, true)() // durable, now gone
+	if !bridge.handleClientEvent(nil, 0, original) {
+		t.Fatal("a held message was reported not handled")
+	}
+	bridge.handleClientEvent(nil, 0, edit)
+
+	if !bridge.handleClientEvent(nil, 0, original) { // redelivery, held again
+		t.Fatal("the held redelivery was reported not handled")
+	}
+	recorder := &replayRecorder{}
+	bridge.ObserveIngress(recorder.observe, true)
+	if !bridge.handleClientEvent(nil, 0, original) { // redelivery, committed
+		t.Fatal("the committed redelivery was reported not handled")
+	}
+	if stored, err := store.GetMessageByID("whatsapp:held-original"); err != nil || stored == nil || stored.Body != "edited text" {
+		t.Fatalf("legacy row after the redeliveries = %+v, %v; want the edit kept", stored, err)
+	}
+	keys := recorder.keys()
+	if len(keys) < 2 || keys[0] != keys[len(keys)-1] {
+		t.Fatalf("committed keys = %v, want the replayed frame and the redelivery under one key", keys)
 	}
 }
