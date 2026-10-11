@@ -669,7 +669,8 @@ in-app supervisors. It alerts on:
   paired: <platforms> - check the app; relink unless that was intended",
   because `paired: false` is not always a deliberate unlink. Google's
   server-side logout (`GaiaLoggedOut`) deletes the session file `paired` is
-  read from, whatsmeow's `device_removed` deletes the WhatsApp device store,
+  read from, a WhatsApp logout reads as `paired: false` with `needs_relink`
+  set ([logged out by WhatsApp](#logged-out-by-whatsapp-needs_relink)),
   and a WhatsApp or Signal bridge that fails to start reports `paired: false`
   with a `last_error`. A platform first seen unpaired (no `paired_<platform>`
   file) is only logged, as `unpaired: <platform> - staleness alerts paused
@@ -785,7 +786,10 @@ Consequences worth knowing:
   hide a new alert raised in the same run.
 - `paired: false` doesn't say why. A bridge that failed to start looks like
   an unlink, so after its one lost-pairing notification its staleness alerts
-  stay paused; check `last_error` in `/api/status`. A platform relinked while
+  stay paused; check `last_error` in `/api/status`. For WhatsApp,
+  `needs_relink: true` means WhatsApp logged the device out, and it survives
+  a restart where `last_error` doesn't. The watchdog doesn't read
+  `needs_relink`. A platform relinked while
   still more than 48 h behind alerts `behind_<platform>` on the first run
   that sees it paired (if its `behind_` stamp is at least 6 hours old), and
   every 6 hours after until it receives a message.
@@ -1381,6 +1385,79 @@ Hard-won facts from the 2026-07-03/04 re-pair ordeal:
   `use ../tmp/whatsmeow` silently overrode go.mod's whatsmeow pin for every
   workspace-mode build (including `macos/build.sh`). If a dependency bump
   mysteriously doesn't take, check `go.work`.
+
+### Logged out by WhatsApp (`needs_relink`)
+
+On 2026-08-20 at about 18:13 EDT WhatsApp logged OpenMessage's linked device
+out (`401: logged out from another device`), most likely when Max moved
+WhatsApp to a new phone. `/api/status` then said `paired: true, connected:
+false` for eight days. `POST /api/whatsapp/connect` was refused ("requires
+re-pairing"), QR pairing refuses while the session store holds an identity,
+and the app's health notification fired only on `paired: false`. It ended on
+08-28 when an agent called `/api/whatsapp/unpair`. That made WhatsApp read as
+deliberately unlinked and left it dead. The evidence is in
+`~/reviews/openmessage-whatsapp-stall-2026-10-11/forensics.md`.
+
+Why the identity survived. whatsmeow handles a logout (`<failure
+reason="401|403|406">` at connect, or the `device_removed` stream error while
+connected) by dispatching `LoggedOut` on a goroutine and then deleting the
+session with the connection's event context (`connectionevents.go` in the
+pinned module). That context is the one `ConnectPaired` passes to
+`ConnectContext`. The lifecycle adapter cancels it as soon as `LoggedOut`
+reaches it, and the SQLite driver interrupts a statement whose context ends.
+In a test through the real bridge, adapter, supervisor and whatsmeow handler,
+with a small session store, whatsmeow's delete lost that race in 261 of 299
+runs.
+
+Since PR #232:
+
+- The `whatsapp` block of `/api/status` carries `needs_relink`, which is
+  always present and normally `false`. With it come `relink_reason`
+  (whatsmeow's text, such as `401: logged out from another device`) and
+  `relink_since_ms` (when this install first saw the logout; it stays fixed
+  for the episode). They are stored in the session store's
+  `openmessage_whatsapp_runtime_state` row, so a restart keeps them.
+  `last_error` is in memory only.
+- `paired` is `false` while `needs_relink` holds. `paired` means the install
+  holds an identity WhatsApp still accepts. whatsmeow's own contract is that
+  a logout deletes the session; the watchdog and the supervisor control's
+  re-pair path already treat a server logout as unpaired; and a revoked
+  identity that reads as paired blocks both reconnect and QR pairing.
+- The bridge deletes the revoked identity itself, with its own 15 s context
+  and only that JID, right after the supervisor has been told. Every connect
+  and pair attempt deletes it first if it is still there, and nothing dials
+  it again. `whatsmeow_lid_map` has no tie to the device row and is kept.
+- It is set by `LoggedOut` (401, 403, 406), or a `ConnectFailure` with one
+  of those reasons, on a client that held a linked identity. Temporary bans,
+  an outdated client, a replaced stream and a failed pairing attempt don't
+  set it.
+- A successful pairing (`PairSuccess`) clears it, and so does
+  `POST /api/whatsapp/unpair`. Unpair is a deliberate unlink, the way
+  Signal's unpair clears `needs_reauth`.
+- The app posts "WhatsApp needs relinking" once per episode. The latch is
+  `relink_since_ms`, kept in the app's `relinkNotifiedEpisodes` default, so a
+  relaunch during the logout stays quiet. Like every app health notification
+  it needs the app's desktop notifications on, and on Max's install they were
+  off on 2026-10-11:
+  `plutil -extract desktopNotificationsEnabled raw ~/Library/Preferences/com.openmessage.app.plist`
+  printed `false`. (`defaults read com.openmessage.app` reads a stale July
+  sandbox-container plist under `~/Library/Containers` and prints `1`.) The
+  menu bar says "WhatsApp needs re-pairing", MCP `get_status` prints a "Needs
+  relink" line, and the web Platforms panel shows "Logged out" with the
+  reason and date.
+- The watchdog needs no change. It sees `paired` go from `true` to `false`
+  and posts "No longer paired: whatsapp - check the app; relink unless that
+  was intended" once, then pauses WhatsApp's staleness checks. Before #232 a
+  logout that left the identity behind kept `paired: true`, so the watchdog
+  raised its disconnect alert instead and kept running WhatsApp's staleness
+  checks.
+
+To relink, open Platforms and click Connect WhatsApp, or run
+`curl -X POST http://127.0.0.1:7007/api/whatsapp/connect`, which starts QR
+pairing at once for a logged-out account. Then scan from the phone: WhatsApp
+→ Settings → Linked Devices → Link a Device. The phone-number code works too.
+**Don't unpair to clear `needs_relink`.** It clears the flag, the menu-bar
+alert and the `get_status` line with it, and WhatsApp stays dead.
 
 ## signal-cli
 
