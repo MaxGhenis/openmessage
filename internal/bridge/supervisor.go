@@ -1439,6 +1439,12 @@ type generationSink struct {
 	generation Generation
 }
 
+// DurableIngress reports whether this generation's AppendIngress commits to a
+// downstream sink (false in legacy-only mode).
+func (s *generationSink) DurableIngress() bool {
+	return s.supervisor.sink != nil
+}
+
 func (s *generationSink) AppendIngress(ctx context.Context, record RawIngressRecord) error {
 	if record.AccountID != s.supervisor.accountID || record.Generation != s.generation {
 		return ErrStaleGeneration

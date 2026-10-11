@@ -1410,6 +1410,78 @@ Hard-won facts from the 2026-07-03/04 re-pair ordeal:
   workspace-mode build (including `macos/build.sh`). If a dependency bump
   mysteriously doesn't take, check `go.work`.
 
+## WhatsApp messages that arrive while a generation is torn down
+
+A lifecycle generation ends on a dropped socket, a keepalive or send failure,
+a supervisor Stop or a logout. whatsmeow may be inside a node handler at that
+moment (decrypting a message, storing an app-state patch). Before PR #236 that
+could lose data in two ways:
+
+- **Messages.** The adapter cancelled the context whatsmeow runs node handlers
+  with, and modernc.org/sqlite interrupts a statement whose context ends. A
+  prekey message could store its advanced Signal session and then fail on the
+  prekey removal. A plain message's session write could commit and still be
+  reported as cancelled (the driver checks the context after the statement
+  finishes). A message decrypted after the generation stopped observing
+  ingress was dropped from v2, while whatsmeow still counted it handled. In
+  each case the server's redelivery was decrypted against the advanced
+  session. That fails with `received message with old counter`, which
+  whatsmeow ignores and then acknowledges, so the message was gone for good.
+- **App state.** whatsmeow stores a patch's new collection version before its
+  value MACs, in separate statements. A cancel between them left the version
+  advanced without the MACs. The patch's changes (contact names, which
+  OpenMessage reads from whatsmeow's contact store) were never applied, and
+  every later patch touching the same entries failed with
+  `failed to verify patch vN: mismatching LTHash`.
+
+How it works now:
+
+- whatsmeow decrypts each message and stores its plaintext in
+  `whatsmeow_event_buffer` (in `whatsapp-session.db`) in one transaction
+  (`EnableDecryptedEventBuffer`). The session store opens with
+  `_txlock=immediate`, so that transaction waits for SQLite's write lock
+  instead of failing with `SQLITE_BUSY` when another connection is writing.
+- On an install with v2 ingest (a v2 sink behind the supervisor), the bridge
+  reports a message handled only once its v2 ingress frame is committed. A
+  message that finds no observing generation, a closed admission, a stale
+  generation or an append error is reported not handled, with the log line
+  `WhatsApp message not committed to ingress; leaving it for redelivery`.
+  whatsmeow then keeps the plaintext and sends no delivery receipt. When the
+  server redelivers the stanza (it does so for an unacknowledged message on a
+  later connection; whatsmeow's event buffer is built on that, and the tests
+  simulate it rather than exercise the real server), whatsmeow re-dispatches
+  the buffered plaintext and the v2 inbox dedupes it by key. An append error
+  leaves the message out of v2 until the next connection.
+- The legacy store takes a message on its first delivery whether or not v2
+  committed it, as before. When the redelivery of a frame legacy already took
+  without a v2 commit arrives, the legacy write is skipped, so an edit, revoke
+  or receipt status applied to the row in between is not undone. The bridge
+  remembers those frames in memory, so after a restart a redelivery writes
+  legacy again.
+- On a legacy-only install (the default: no v2 sink), the supervisor's
+  generation sink reports `DurableIngress() == false`, every message is
+  reported handled, and whatsmeow acknowledges it as before.
+- The context `ConnectPaired` hands whatsmeow is cancelled by the generation
+  only while it dials and handshakes. After that, teardown closes the socket,
+  which ends the handler loop, and a handler that is already running finishes
+  its writes.
+- Rows in `whatsmeow_event_buffer` whose `plaintext` is not NULL are messages
+  decrypted but not yet handled. whatsmeow deletes rows older than 14 days
+  (its comment says the server buffers events for that long).
+
+Reading old logs: `received message with old counter` right after a
+reconnect, with no matching message in v2, is a message the old teardown
+path lost. A collection stuck on `mismatching LTHash` stays stuck until
+whatsmeow does a full resync of it, and OpenMessage does not trigger one yet.
+
+Tests: `internal/whatsapplive/handler_teardown_test.go` sends real Signal
+ciphertext from a second Signal store through whatsmeow's real handler, the
+bridge, the adapter and the supervisor. It retires the generation before
+every session-store call for prekey, ordinary and group messages, with
+the handler context both detached and cancelled, on v2-ingest and
+legacy-only installs. It also covers an
+app-state patch interrupted between its version and MAC writes.
+
 ## signal-cli
 
 Require **signal-cli ≥ 0.14.5**. 0.14.1 throws
