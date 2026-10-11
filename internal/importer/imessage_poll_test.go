@@ -618,7 +618,37 @@ func TestIMessageDeletionsForceAFullRead(t *testing.T) {
 	if m, _ := store.GetMessageByID("imessage:third"); m.ConversationID != "imessage:B" {
 		t.Fatalf("moved message owner = %s", m.ConversationID)
 	}
-	_ = path
+	_ = path // the deleted message stays stored, so no empty-store comparison
+}
+
+// Deleting a join below the mark, not the highest, is seen by the count
+// alone. Here it moves a shared message to its other chat and lowers the
+// first chat's newest message.
+func TestIMessageDeletedJoinBelowTheMark(t *testing.T) {
+	chat := newNativeChatDB(t)
+	h := chat.addHandle("+15550000001")
+	a := chat.addChat("A", strPtr("A"), false, h)
+	b := chat.addChat("B", strPtr("B"), false, h)
+	chat.message(a, "old", "old", at(5*time.Hour), false, h)
+	chat.add(row{GUID: "shared", Body: "shared", Unix: at(time.Hour), Handle: h, Chats: []int64{a, b}})
+	chat.message(b, "tail", "tail", at(3*time.Hour), false, h) // the highest join, left alone
+	store, path := newIMessageStore(t)
+	poller := newPoller(chat.path)
+	runImport(t, poller, store)
+
+	shared := chat.queryInt(`SELECT ROWID FROM message WHERE guid = 'shared'`)
+	chat.exec(`DELETE FROM chat_message_join WHERE chat_id = ? AND message_id = ?`, a, shared)
+	runImport(t, poller, store)
+	if !poller.last.full || poller.last.fullReason != "chat_message_join rows deleted" {
+		t.Fatalf("deleted join below the mark: %+v", poller.last)
+	}
+	if m, _ := store.GetMessageByID("imessage:shared"); m.ConversationID != "imessage:B" {
+		t.Fatalf("shared message owner = %s, want imessage:B", m.ConversationID)
+	}
+	if conv, _ := store.GetConversation("imessage:A"); conv.LastMessageTS != at(5*time.Hour)*1000 {
+		t.Fatalf("chat A's newest message = %d, want the old one", conv.LastMessageTS)
+	}
+	requireMatchesFullImport(t, "deleted join below the mark", path, chat)
 }
 
 // Sync order is not insertion order: a message can name a handle, and a join

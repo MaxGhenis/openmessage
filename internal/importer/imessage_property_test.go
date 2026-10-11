@@ -443,10 +443,23 @@ func (h *history) step(kind string) {
 		chat.exec(`DELETE FROM message WHERE ROWID = ?`, h.pick(h.ids(`SELECT ROWID FROM message`)))
 		h.event("message deleted")
 	case "delete join":
-		joins := h.ids(`SELECT rowid FROM chat_message_join`)
+		joins := h.ids(`SELECT rowid FROM chat_message_join ORDER BY rowid`)
 		target := h.pick(joins)
-		if h.r.IntN(2) == 0 && len(joins) > 0 {
-			target = joins[len(joins)-1] // the highest: its rowid is reused by the next join
+		switch h.r.IntN(3) {
+		case 0:
+			if len(joins) > 0 {
+				target = joins[len(joins)-1] // the highest: its rowid is reused by the next join
+			}
+		case 1:
+			// One whose deletion changes the output: a shared message's owner
+			// join, or the join of a chat's newest message.
+			if picks := h.ids(`SELECT j.rowid FROM chat_message_join j
+					WHERE j.chat_id = (SELECT MIN(chat_id) FROM chat_message_join WHERE message_id = j.message_id)
+						AND (SELECT COUNT(*) FROM chat_message_join WHERE message_id = j.message_id) > 1
+					UNION SELECT j.rowid FROM chat_message_join j JOIN message m ON m.ROWID = j.message_id
+					WHERE m.date = (SELECT MAX(m2.date) FROM chat_message_join j2 JOIN message m2 ON m2.ROWID = j2.message_id WHERE j2.chat_id = j.chat_id)`); len(picks) > 0 {
+				target = h.pick(picks)
+			}
 		}
 		chat.exec(`DELETE FROM chat_message_join WHERE rowid = ?`, target)
 		h.event("join deleted")
