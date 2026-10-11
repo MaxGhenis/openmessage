@@ -215,8 +215,15 @@ type IngressFrame struct {
 
 type ingressObservation struct {
 	id       uint64
-	callback func(IngressFrame)
+	callback func(IngressFrame) error
 }
+
+// ErrIngressNotObserved reports a message that arrived while a lifecycle
+// adapter owns durable ingress but no generation is accepting it: the frame
+// raced a generation's teardown. The message is reported to whatsmeow as not
+// handled, so whatsmeow keeps its decrypted plaintext and sends no receipt,
+// and the next generation receives it again.
+var ErrIngressNotObserved = errors.New("whatsapp ingress: no lifecycle generation is accepting frames")
 
 type whatsappMessageIngressEnvelope struct {
 	Kind        string            `json:"kind"`
@@ -318,6 +325,11 @@ type Bridge struct {
 	ingressObservation    ingressObservation
 	nextObserverID        uint64
 	nextIngressObserverID uint64
+	// ingressOwned is set once a lifecycle adapter installs an ingress
+	// observer. From then on a message that finds no observer is reported to
+	// whatsmeow as not handled instead of being dropped; a process that never
+	// observes ingress (no adapter) keeps the legacy-only behavior.
+	ingressOwned bool
 
 	runtimeMu    sync.Mutex
 	runtimeDB    *sql.DB
@@ -375,10 +387,19 @@ func (b *Bridge) initClientLocked() error {
 	cli.EnableAutoReconnect = false
 	cli.InitialAutoReconnect = false
 	cli.DisableLoginAutoReconnect = true
+	// Decrypt each message and buffer its plaintext in one session-store
+	// transaction, and keep the plaintext until the event handler reports the
+	// message handled. Without the buffer, a message whose Signal ratchet
+	// advanced but whose event never reached a live ingress generation (a
+	// generation teardown cancelling the decrypt's store writes, or retiring
+	// the generation before dispatch) is lost: the server's redelivery decrypts
+	// against the advanced session, fails with an old-counter error, and
+	// whatsmeow acknowledges it.
+	cli.EnableDecryptedEventBuffer = true
 	b.clientGeneration++
 	clientGeneration := b.clientGeneration
-	cli.AddEventHandler(func(raw any) {
-		b.handleClientEvent(cli, clientGeneration, raw)
+	cli.AddEventHandlerWithSuccessStatus(func(raw any) bool {
+		return b.handleClientEvent(cli, clientGeneration, raw)
 	})
 	b.container = container
 	b.client = cli
@@ -413,8 +434,17 @@ func (b *Bridge) initRuntimeState() error {
 	return nil
 }
 
+// sessionStoreDSN opens the whatsmeow session store for writing.
+// _txlock=immediate makes modernc.org/sqlite begin writable transactions with
+// BEGIN IMMEDIATE, so a transaction takes SQLite's write reservation up front
+// and waits for it under busy_timeout. whatsmeow decrypts each message in a
+// transaction (EnableDecryptedEventBuffer) that reads the session before
+// writing it; begun deferred, that read-to-write upgrade fails with
+// SQLITE_BUSY at once, without waiting, whenever another connection is
+// writing (whatsmeow's background buffer cleanup, push-name updates), and
+// whatsmeow treats the failure as an undecryptable message.
 func sessionStoreDSN(path string) string {
-	return sessionStoreDSNWithQuery(path, "_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)")
+	return sessionStoreDSNWithQuery(path, "_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)&_txlock=immediate")
 }
 
 func sessionStoreReadOnlyDSN(path string) string {
@@ -517,7 +547,14 @@ func (b *Bridge) ObserveLifecycle(callback func(LifecycleEvent)) func() {
 
 // ObserveIngress installs the one active durable-ingress observer. The
 // returned removal function cannot clear an observer that replaced it.
-func (b *Bridge) ObserveIngress(callback func(IngressFrame)) func() {
+//
+// The callback returns nil once the frame is durably committed (or the
+// observer deliberately discards it, as a legacy-only sink does). A non-nil
+// error means the frame was not committed and a later delivery can succeed;
+// for a message, whatsmeow is then told the event was not handled, so it keeps
+// the decrypted plaintext in its event buffer, sends no receipt, and the
+// server redelivers it to a later generation.
+func (b *Bridge) ObserveIngress(callback func(IngressFrame) error) func() {
 	b.mu.Lock()
 	b.nextIngressObserverID++
 	id := b.nextIngressObserverID
@@ -525,6 +562,7 @@ func (b *Bridge) ObserveIngress(callback func(IngressFrame)) func() {
 		id:       id,
 		callback: callback,
 	}
+	b.ingressOwned = true
 	b.mu.Unlock()
 
 	return func() {
@@ -1931,12 +1969,17 @@ func (b *Bridge) ProfilePhoto(conversationID string) ([]byte, string, error) {
 // handleClientEvent fences callbacks by the concrete whatsmeow client and its
 // local generation. Temporary-ban persistence happens before either the
 // compatibility status projection or the supervisor observer is notified.
-func (b *Bridge) handleClientEvent(source *whatsmeow.Client, generation uint64, raw any) {
+//
+// It returns whatsmeow's handler success status: false only for a message
+// whose ingress frame was not committed and can be on a later delivery (see
+// ObserveIngress). Every other event, and every event from a retired client,
+// reports success.
+func (b *Bridge) handleClientEvent(source *whatsmeow.Client, generation uint64, raw any) bool {
 	b.mu.RLock()
 	current := source == nil || (b.client == source && b.clientGeneration == generation)
 	b.mu.RUnlock()
 	if !current {
-		return
+		return true
 	}
 
 	at := time.Now()
@@ -1946,7 +1989,7 @@ func (b *Bridge) handleClientEvent(source *whatsmeow.Client, generation uint64, 
 		retryAt, persistenceErr = b.persistTemporaryBan(at, event.Expire)
 	}
 
-	b.applyEvent(raw)
+	handled := b.applyEvent(raw)
 
 	b.mu.RLock()
 	// Re-check after applying the event because a concurrent explicit unpair
@@ -1959,7 +2002,7 @@ func (b *Bridge) handleClientEvent(source *whatsmeow.Client, generation uint64, 
 	observer := b.observation.callback
 	b.mu.RUnlock()
 	if !current || observer == nil {
-		return
+		return handled
 	}
 	observer(LifecycleEvent{
 		Raw:              raw,
@@ -1968,6 +2011,7 @@ func (b *Bridge) handleClientEvent(source *whatsmeow.Client, generation uint64, 
 		RetryAt:          retryAt,
 		PersistenceError: persistenceErr,
 	})
+	return handled
 }
 
 // handleEvent remains the characterization-test entry point. Production
@@ -1976,24 +2020,32 @@ func (b *Bridge) handleEvent(raw any) {
 	b.handleClientEvent(nil, 0, raw)
 }
 
-func (b *Bridge) emitIngress(frame IngressFrame) {
+// emitIngress hands one frame to the ingress observer and returns its result.
+// With no observer it returns ErrIngressNotObserved once an adapter owns
+// ingress, and nil before (legacy-only processes never observe ingress). A
+// panicking observer is a bug that a redelivery would repeat, so it is logged
+// and reported as handled, as before.
+func (b *Bridge) emitIngress(frame IngressFrame) (err error) {
 	b.mu.RLock()
 	observer := b.ingressObservation.callback
+	owned := b.ingressOwned
 	b.mu.RUnlock()
 	if observer == nil {
-		return
+		if owned {
+			return ErrIngressNotObserved
+		}
+		return nil
 	}
 	frame.Payload = cloneBytes(frame.Payload)
-	func() {
-		defer func() {
-			if recovered := recover(); recovered != nil {
-				b.logger.Warn().
-					Str("panic", fmt.Sprint(recovered)).
-					Msg("Recovered panic in WhatsApp ingress observer")
-			}
-		}()
-		observer(frame)
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			b.logger.Warn().
+				Str("panic", fmt.Sprint(recovered)).
+				Msg("Recovered panic in WhatsApp ingress observer")
+			err = nil
+		}
 	}()
+	return observer(frame)
 }
 
 func (b *Bridge) hasIngressObserver() bool {
@@ -2003,23 +2055,38 @@ func (b *Bridge) hasIngressObserver() bool {
 	return hasObserver
 }
 
-func (b *Bridge) captureMessageIngress(evt *waevents.Message, chatJID watypes.JID) {
+// wantsIngress reports whether a frame should be captured: an observer is
+// installed, or an adapter owns ingress and must be told the frame missed.
+func (b *Bridge) wantsIngress() bool {
+	b.mu.RLock()
+	wanted := b.ingressObservation.callback != nil || b.ingressOwned
+	b.mu.RUnlock()
+	return wanted
+}
+
+// captureMessageIngress returns a non-nil error only when the frame was built
+// but not committed and a later delivery can succeed (see ObserveIngress). A
+// frame that cannot be built (a marshal failure or a panic while building it)
+// or that panics the observer would fail the same way again, so it is logged
+// and reported as handled, as before.
+func (b *Bridge) captureMessageIngress(evt *waevents.Message, chatJID watypes.JID) (deliveryErr error) {
 	// Capture is strictly additive observation: a panic anywhere in the
 	// capture body must not reach the whatsmeow callback or skip the legacy
 	// handling that follows it.
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			b.logIngressCaptureError("message", fmt.Errorf("capture panic: %v", recovered))
+			deliveryErr = nil
 		}
 	}()
-	if !b.hasIngressObserver() {
-		return
+	if !b.wantsIngress() {
+		return nil
 	}
 	receivedAt := time.Now()
 	protoBytes, err := proto.Marshal(evt.Message)
 	if err != nil {
 		b.logIngressCaptureError("message", err)
-		return
+		return nil
 	}
 
 	senderJID := b.canonicalJID(evt.Info.Sender).String()
@@ -2044,9 +2111,9 @@ func (b *Bridge) captureMessageIngress(evt *waevents.Message, chatJID watypes.JI
 	})
 	if err != nil {
 		b.logIngressCaptureError("message", err)
-		return
+		return nil
 	}
-	b.emitIngress(IngressFrame{
+	return b.emitIngress(IngressFrame{
 		DedupeKey:  "msg:" + string(evt.Info.ID) + ":" + ingressHash8(protoBytes),
 		ReceivedAt: receivedAt,
 		Payload:    payload,
@@ -2087,7 +2154,9 @@ func (b *Bridge) captureReceiptIngress(evt *waevents.Receipt) {
 		b.logIngressCaptureError("receipt", err)
 		return
 	}
-	b.emitIngress(IngressFrame{
+	// whatsmeow acknowledges a receipt before dispatching it (asynchronous
+	// acks), so a delivery error here cannot become a redelivery.
+	_ = b.emitIngress(IngressFrame{
 		DedupeKey:  "rcpt:" + ingressHash8(payload),
 		ReceivedAt: receivedAt,
 		Payload:    payload,
@@ -2120,7 +2189,10 @@ func (b *Bridge) captureHistorySyncIngress(evt *waevents.HistorySync) {
 		b.logIngressCaptureError("history_sync", err)
 		return
 	}
-	b.emitIngress(IngressFrame{
+	// whatsmeow ignores the handler result for history sync and deletes the
+	// blob from the server after dispatch, so a delivery error here cannot
+	// become a redelivery.
+	_ = b.emitIngress(IngressFrame{
 		DedupeKey:  "hist:" + ingressHash8(payload),
 		ReceivedAt: receivedAt,
 		Payload:    payload,
@@ -2182,7 +2254,9 @@ func (b *Bridge) logIngressCaptureError(kind string, err error) {
 	b.logger.Warn().Err(err).Str("kind", kind).Msg("Failed to capture WhatsApp ingress frame")
 }
 
-func (b *Bridge) applyEvent(raw any) {
+// applyEvent returns false only for a message whose ingress frame was not
+// committed and can be on a later delivery.
+func (b *Bridge) applyEvent(raw any) bool {
 	switch evt := raw.(type) {
 	case *waevents.Connected:
 		b.handleConnected()
@@ -2218,7 +2292,7 @@ func (b *Bridge) applyEvent(raw any) {
 	case *waevents.QRScannedWithoutMultidevice:
 		b.handlePairError(fmt.Errorf("scan the QR code again after enabling multi-device support in WhatsApp"))
 	case *waevents.Message:
-		b.handleMessage(evt)
+		return b.handleMessage(evt)
 	case *waevents.Receipt:
 		b.handleReceipt(evt)
 	case *waevents.ChatPresence:
@@ -2231,6 +2305,7 @@ func (b *Bridge) applyEvent(raw any) {
 	default:
 		b.logger.Debug().Type("type", evt).Msg("Unhandled WhatsApp event")
 	}
+	return true
 }
 
 func (b *Bridge) handleConnected() {
@@ -2359,13 +2434,24 @@ func (b *Bridge) handleProtocolMessage(evt *waevents.Message) bool {
 	}
 }
 
-func (b *Bridge) handleMessage(evt *waevents.Message) {
+// handleMessage reports false, and skips the legacy handling, when the
+// message's ingress frame was not committed and a later delivery can commit it
+// (see ObserveIngress). The legacy store then sees the message once, on the
+// delivery that is reported handled.
+func (b *Bridge) handleMessage(evt *waevents.Message) bool {
 	if evt == nil || evt.Message == nil {
-		return
+		return true
 	}
 	chatJID := b.normalizeConversationJID(evt.Info.Chat)
-	b.captureMessageIngress(evt, chatJID)
+	if err := b.captureMessageIngress(evt, chatJID); err != nil {
+		b.logger.Warn().
+			Err(err).
+			Str("msg_id", string(evt.Info.ID)).
+			Msg("WhatsApp message not committed to ingress; leaving it for redelivery")
+		return false
+	}
 	b.handleLegacyMessage(evt, chatJID)
+	return true
 }
 
 func (b *Bridge) handleMessageWithoutIngress(evt *waevents.Message) {

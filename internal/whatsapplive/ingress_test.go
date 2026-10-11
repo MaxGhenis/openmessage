@@ -24,12 +24,14 @@ import (
 func TestObserveIngressIsSingleSlotAndRemovalCannotClearReplacement(t *testing.T) {
 	bridge := &Bridge{}
 	var firstCalls, secondCalls int
-	removeFirst := bridge.ObserveIngress(func(IngressFrame) {
+	removeFirst := bridge.ObserveIngress(func(IngressFrame) error {
 		firstCalls++
+		return nil
 	})
-	removeSecond := bridge.ObserveIngress(func(frame IngressFrame) {
+	removeSecond := bridge.ObserveIngress(func(frame IngressFrame) error {
 		secondCalls++
 		frame.Payload[0] = 'X'
+		return nil
 	})
 
 	// Removing the replaced observer must leave the current slot installed.
@@ -85,8 +87,9 @@ func TestMessageIngressCaptureExactEnvelopeMentionsAndDedupe(t *testing.T) {
 		}},
 	}
 	var frames []IngressFrame
-	bridge.ObserveIngress(func(frame IngressFrame) {
+	bridge.ObserveIngress(func(frame IngressFrame) error {
 		frames = append(frames, frame)
+		return nil
 	})
 
 	event := &waevents.Message{
@@ -168,7 +171,7 @@ func TestMessageIngressCanonicalizesConversationJIDAtCapture(t *testing.T) {
 		}},
 	}
 	var frame IngressFrame
-	bridge.ObserveIngress(func(captured IngressFrame) { frame = captured })
+	bridge.ObserveIngress(func(captured IngressFrame) error { frame = captured; return nil })
 	bridge.handleMessage(&waevents.Message{
 		Info: watypes.MessageInfo{
 			MessageSource: watypes.MessageSource{Chat: chatLID, Sender: chatLID},
@@ -211,7 +214,7 @@ func TestMessageIngressResolvesMentionsFromEditedPayload(t *testing.T) {
 
 	bridge := &Bridge{store: store}
 	var frame IngressFrame
-	bridge.ObserveIngress(func(captured IngressFrame) { frame = captured })
+	bridge.ObserveIngress(func(captured IngressFrame) error { frame = captured; return nil })
 	bridge.handleMessage(&waevents.Message{
 		Info: watypes.MessageInfo{
 			MessageSource: watypes.MessageSource{
@@ -251,7 +254,7 @@ func TestReceiptIngressCaptureUsesWireNamesAndPayloadHash(t *testing.T) {
 	defer store.Close()
 	bridge := &Bridge{store: store}
 	var frames []IngressFrame
-	bridge.ObserveIngress(func(frame IngressFrame) { frames = append(frames, frame) })
+	bridge.ObserveIngress(func(frame IngressFrame) error { frames = append(frames, frame); return nil })
 
 	chat := watypes.NewJID("15551234567", watypes.DefaultUserServer)
 	sender := watypes.NewJID("15557654321", watypes.DefaultUserServer)
@@ -318,7 +321,7 @@ func TestHistorySyncIngressCapturesOneFrameWithoutNestedMessageFrames(t *testing
 		client: &whatsmeow.Client{Store: &wastore.Device{ID: &own}},
 	}
 	var frames []IngressFrame
-	bridge.ObserveIngress(func(frame IngressFrame) { frames = append(frames, frame) })
+	bridge.ObserveIngress(func(frame IngressFrame) error { frames = append(frames, frame); return nil })
 	bridge.handleEvent(&waevents.HistorySync{Data: data})
 
 	if len(frames) != 1 {
@@ -358,7 +361,7 @@ func TestPanickingIngressObserverDoesNotInterruptLegacyMessageHandling(t *testin
 		}},
 	}
 	observerCalls := 0
-	bridge.ObserveIngress(func(IngressFrame) {
+	bridge.ObserveIngress(func(IngressFrame) error {
 		observerCalls++
 		panic("sink panic")
 	})
@@ -445,7 +448,7 @@ func TestReceiptIngressCaptureDoesNotMergeLegacyConversations(t *testing.T) {
 		}},
 	}
 	var frame IngressFrame
-	bridge.ObserveIngress(func(captured IngressFrame) { frame = captured })
+	bridge.ObserveIngress(func(captured IngressFrame) error { frame = captured; return nil })
 	bridge.handleReceipt(&waevents.Receipt{
 		MessageSource: watypes.MessageSource{Chat: chatLID, Sender: chatLID},
 		MessageIDs:    []watypes.MessageID{"receipt-target"},

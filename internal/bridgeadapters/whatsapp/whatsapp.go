@@ -42,7 +42,7 @@ type Adapter struct {
 	markReadRequest     func(string, []string, string, time.Time) error
 	sendMediaRequest    func(string, []byte, string, string, string, string, string) (string, time.Time, error)
 	downloadMediaRef    func(string, whatsapplive.StoredMediaRef, string, string, string) ([]byte, string, error)
-	observeIngress      func(func(whatsapplive.IngressFrame)) func()
+	observeIngress      func(func(whatsapplive.IngressFrame) error) func()
 	logIngressError     func(error, string, uint64)
 
 	mu       sync.Mutex
@@ -758,13 +758,21 @@ type ingressErrorRecorder interface {
 	RecordIngressError(accountID string)
 }
 
-func (r *run) handleIngress(frame whatsapplive.IngressFrame) {
+// errIngressAdmissionClosed reports a frame that reached a generation after it
+// stopped admitting callbacks (it is being retired).
+var errIngressAdmissionClosed = errors.New("whatsapp lifecycle: generation no longer admits ingress")
+
+// handleIngress commits one frame under this generation. It returns nil once
+// the frame is committed (or there is no sink to commit it to) and the reason
+// otherwise, so the bridge can leave an uncommitted message for whatsmeow to
+// redeliver to a later generation (whatsapplive.Bridge.ObserveIngress).
+func (r *run) handleIngress(frame whatsapplive.IngressFrame) error {
 	if !r.admitCallback() {
-		return
+		return errIngressAdmissionClosed
 	}
 	defer r.callbacks.Done()
 	if r.sink == nil {
-		return
+		return nil
 	}
 
 	err := r.sink.AppendIngress(context.Background(), bridge.RawIngressRecord{
@@ -777,7 +785,7 @@ func (r *run) handleIngress(frame whatsapplive.IngressFrame) {
 		Payload:      frame.Payload,
 	})
 	if err == nil || errors.Is(err, bridge.ErrStaleGeneration) {
-		return
+		return err
 	}
 	if recorder, ok := r.sink.(ingressErrorRecorder); ok {
 		recorder.RecordIngressError(r.request.AccountID)
@@ -785,6 +793,7 @@ func (r *run) handleIngress(frame whatsapplive.IngressFrame) {
 	if r.adapter.logIngressError != nil {
 		r.adapter.logIngressError(err, r.request.AccountID, uint64(r.request.Generation))
 	}
+	return err
 }
 
 func (r *run) handleEvent(event whatsapplive.LifecycleEvent) {
