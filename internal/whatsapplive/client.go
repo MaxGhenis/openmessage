@@ -244,6 +244,12 @@ type IngressFrame struct {
 	DedupeKey  string
 	ReceivedAt time.Time
 	Payload    []byte
+	// Replayed marks a frame the bridge held in its ingress spool because no
+	// generation committed it when it arrived. The live channel delivered it
+	// under an earlier generation, so committing it says nothing about the
+	// current connection: the observer must not count it as connection
+	// activity.
+	Replayed bool
 }
 
 type ingressObservation struct {
@@ -360,7 +366,8 @@ type Bridge struct {
 	nextObserverID        uint64
 	nextIngressObserverID uint64
 	// legacyAhead holds the ingress dedupe keys of messages the legacy store
-	// took on a delivery whose v2 frame did not commit, with when. Their
+	// took on a delivery whose v2 frame did not commit (it was held in the
+	// ingress spool, or left for whatsmeow's redelivery), with when. Their
 	// redelivery (whatsmeow re-dispatches the buffered plaintext) skips the
 	// legacy write: re-upserting would undo an edit, revoke or receipt status
 	// applied to the row in between. The set lives in memory, so after a
@@ -368,11 +375,15 @@ type Bridge struct {
 	legacyAheadMu sync.Mutex
 	legacyAhead   map[string]time.Time
 	// ingressOwned is whether the most recently installed ingress observer
-	// commits frames to a durable inbox. While it is set, a message that finds
-	// no observer (it raced a generation's teardown) is reported to whatsmeow
-	// as not handled instead of being dropped from v2. Legacy-only installs
+	// commits frames to a durable inbox. While it is set, a frame that finds
+	// no observer (it raced a generation's teardown) is held in the ingress
+	// spool (or, for a message the spool cannot take, reported to whatsmeow
+	// as not handled) instead of being dropped from v2. Legacy-only installs
 	// (no v2 sink) and processes that never observe ingress leave it unset.
 	ingressOwned bool
+	// spool holds frames no generation committed until one can (see
+	// ingress_spool.go). It is nil when the runtime database is not open.
+	spool *ingressSpool
 
 	runtimeMu    sync.Mutex
 	runtimeDB    *sql.DB
@@ -468,12 +479,24 @@ func (b *Bridge) initRuntimeState() error {
 		return fmt.Errorf("load WhatsApp runtime state: %w", err)
 	}
 
+	spool, err := openIngressSpool(database, ingressSpoolMaxFrames, ingressSpoolMaxBytes)
+	if err != nil {
+		_ = database.Close()
+		return err
+	}
+
 	b.runtimeMu.Lock()
 	b.runtimeDB = database
 	if blockedUntilNS > 0 {
 		b.blockedUntil = time.Unix(0, blockedUntilNS)
 	}
 	b.runtimeMu.Unlock()
+	b.mu.Lock()
+	b.spool = spool
+	b.mu.Unlock()
+	if held := spool.heldFrames(); held > 0 {
+		b.logger.Info().Int64("frames", held).Msg("WhatsApp ingress spool holds frames from an earlier run; the next generation replays them")
+	}
 	return nil
 }
 
@@ -593,12 +616,17 @@ func (b *Bridge) ObserveLifecycle(callback func(LifecycleEvent)) func() {
 //
 // The callback returns nil once the frame is durably committed (or the
 // observer deliberately discards it, as a legacy-only sink does). A non-nil
-// error means the frame was not committed and a later delivery can succeed;
-// for a message, whatsmeow is then told the event was not handled, so it keeps
-// the decrypted plaintext in its event buffer, sends no receipt, and the
-// server redelivers it to a later generation. durable says whether the
-// observer commits to a durable inbox; only then does a message that later
-// finds no observer report not handled (see ingressOwned).
+// error means the frame was not committed. The bridge then holds the frame in
+// its ingress spool for a later generation; a message the spool cannot take is
+// reported to whatsmeow as not handled, so whatsmeow keeps the decrypted
+// plaintext in its event buffer, sends no receipt, and the server redelivers
+// it to a later generation. durable says whether the observer commits to a
+// durable inbox; only then are frames held, or messages reported not handled
+// (see ingressOwned).
+//
+// Before it returns, ObserveIngress replays every frame the spool holds to a
+// durable observer, oldest first (see replayIngressSpool), so they precede the
+// frames of the connection the observer's generation is about to make.
 func (b *Bridge) ObserveIngress(callback func(IngressFrame) error, durable bool) func() {
 	b.mu.Lock()
 	b.nextIngressObserverID++
@@ -610,6 +638,8 @@ func (b *Bridge) ObserveIngress(callback func(IngressFrame) error, durable bool)
 	}
 	b.ingressOwned = durable
 	b.mu.Unlock()
+
+	b.replayIngressSpool(true)
 
 	return func() {
 		b.mu.Lock()
@@ -2066,24 +2096,33 @@ func (b *Bridge) handleEvent(raw any) {
 	b.handleClientEvent(nil, 0, raw)
 }
 
-// emitIngress hands one frame to the ingress observer and returns its result.
-// With no observer it returns ErrIngressNotObserved when the last observer
-// committed to a durable inbox, and nil otherwise (legacy-only installs, and
-// processes that never observe ingress). A
-// panicking observer is a bug that a redelivery would repeat, so it is logged
-// and reported as handled, as before.
-func (b *Bridge) emitIngress(frame IngressFrame) (err error) {
+// emitIngress hands one frame to the ingress observer and returns its result
+// and the id of the observer it reached (0 for none). With no observer it
+// returns ErrIngressNotObserved when the last observer committed to a durable
+// inbox, and nil otherwise (legacy-only installs, and processes that never
+// observe ingress). A non-durable observer's errors are ignored: it never
+// commits a frame, so a later attempt could not commit it either.
+func (b *Bridge) emitIngress(frame IngressFrame) (observerID uint64, err error) {
 	b.mu.RLock()
-	observer := b.ingressObservation.callback
-	durable := b.ingressObservation.durable
+	observation := b.ingressObservation
 	owned := b.ingressOwned
 	b.mu.RUnlock()
-	if observer == nil {
+	if observation.callback == nil {
 		if owned {
-			return ErrIngressNotObserved
+			return 0, ErrIngressNotObserved
 		}
-		return nil
+		return 0, nil
 	}
+	if err := b.callIngressObserver(observation.callback, frame); err != nil && observation.durable {
+		return observation.id, err
+	}
+	return observation.id, nil
+}
+
+// callIngressObserver runs one observer callback. A panicking observer is a
+// bug that a redelivery would repeat, so it is logged and reported as
+// committed, as before.
+func (b *Bridge) callIngressObserver(observer func(IngressFrame) error, frame IngressFrame) (err error) {
 	frame.Payload = cloneBytes(frame.Payload)
 	defer func() {
 		if recovered := recover(); recovered != nil {
@@ -2093,19 +2132,133 @@ func (b *Bridge) emitIngress(frame IngressFrame) (err error) {
 			err = nil
 		}
 	}()
-	if err := observer(frame); err != nil && durable {
-		return err
-	}
-	// A non-durable observer never commits a frame, so its errors cannot
-	// become a later commit either.
-	return nil
+	return observer(frame)
 }
 
-func (b *Bridge) hasIngressObserver() bool {
+func (b *Bridge) currentIngressObserverID() uint64 {
 	b.mu.RLock()
-	hasObserver := b.ingressObservation.callback != nil
-	b.mu.RUnlock()
-	return hasObserver
+	defer b.mu.RUnlock()
+	return b.ingressObservation.id
+}
+
+func (b *Bridge) ingressSpool() *ingressSpool {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return b.spool
+}
+
+// commitIngress commits a captured frame to the observing generation or, when
+// that fails, holds it in the ingress spool for the next one. It returns nil
+// once the frame is committed (held false) or held (held true), and otherwise
+// the reason it was not committed.
+func (b *Bridge) commitIngress(kind string, frame IngressFrame) (held bool, err error) {
+	observerID, err := b.emitIngress(frame)
+	if err == nil {
+		// A commit shows the generation takes frames; retry anything an
+		// earlier replay to it left held.
+		b.replayIngressSpool(false)
+		return false, nil
+	}
+	spool := b.ingressSpool()
+	if holdErr := spool.hold(kind, frame); holdErr != nil {
+		b.logger.Warn().
+			Err(err).
+			AnErr("spool_error", holdErr).
+			Str("kind", kind).
+			Str("dedupe_key", frame.DedupeKey).
+			Msg("WhatsApp ingress frame neither committed nor held")
+		return false, err
+	}
+	b.logger.Info().
+		AnErr("commit_error", err).
+		Str("kind", kind).
+		Str("dedupe_key", frame.DedupeKey).
+		Int64("held", spool.heldFrames()).
+		Msg("WhatsApp ingress frame held for the next generation")
+	// A generation that began observing after this frame missed it has
+	// already replayed the spool without it.
+	if current := b.currentIngressObserverID(); current != 0 && current != observerID {
+		b.replayIngressSpool(true)
+	}
+	return true, nil
+}
+
+// replayIngressSpool hands every held frame, oldest first, to the current
+// ingress observer as a Replayed frame, and releases each one it commits. A
+// frame the observer does not commit stays held for the next replay: the next
+// observer's (ObserveIngress), or a retry after a later commit on this one,
+// no sooner than ingressSpoolRetryInterval after a replay that left frames
+// held (force skips that wait). A frame committed but not released is
+// committed again by a later replay, under the same dedupe key, which the
+// inbox keeps as one row.
+func (b *Bridge) replayIngressSpool(force bool) {
+	spool := b.ingressSpool()
+	if spool.heldFrames() == 0 {
+		return
+	}
+	spool.replayMu.Lock()
+	defer spool.replayMu.Unlock()
+	if !force && spool.now().Before(spool.retryAfter) {
+		return
+	}
+	seqs, err := spool.sequence()
+	if err != nil {
+		b.logger.Warn().Err(err).Msg("Failed to list the WhatsApp ingress spool")
+		return
+	}
+	var replayed, kept int
+	var firstErr error
+	for index, seq := range seqs {
+		b.mu.RLock()
+		observation := b.ingressObservation
+		b.mu.RUnlock()
+		if observation.callback == nil || !observation.durable {
+			// Only a generation with a durable inbox can commit a held frame;
+			// a legacy-only observer would drop it.
+			kept += len(seqs) - index
+			firstErr = errors.Join(firstErr, ErrIngressNotObserved)
+			break
+		}
+		held, ok, err := spool.load(seq)
+		if err != nil {
+			kept++
+			firstErr = errors.Join(firstErr, err)
+			continue
+		}
+		if !ok {
+			continue
+		}
+		frame := held.frame
+		frame.Replayed = true
+		if err := b.callIngressObserver(observation.callback, frame); err != nil {
+			kept++
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		replayed++
+		if err := spool.release(seq); err != nil {
+			b.logger.Warn().
+				Err(err).
+				Str("dedupe_key", frame.DedupeKey).
+				Msg("Replayed a held WhatsApp ingress frame but could not release it; a later replay commits it again under the same dedupe key")
+		}
+	}
+	if kept > 0 {
+		spool.retryAfter = spool.now().Add(ingressSpoolRetryInterval)
+	} else {
+		spool.retryAfter = time.Time{}
+	}
+	if replayed > 0 || kept > 0 {
+		event := b.logger.Info()
+		if kept > 0 {
+			event = b.logger.Warn().AnErr("first_error", firstErr)
+		}
+		event.Int("replayed", replayed).
+			Int("kept", kept).
+			Msg("Replayed held WhatsApp ingress frames")
+	}
 }
 
 // wantsIngress reports whether a frame should be captured: an observer is
@@ -2118,28 +2271,29 @@ func (b *Bridge) wantsIngress() bool {
 }
 
 // captureMessageIngress returns a non-nil error only when the frame was built
-// but not committed and a later delivery can succeed (see ObserveIngress). A
-// frame that cannot be built (a marshal failure or a panic while building it)
-// or that panics the observer would fail the same way again, so it is logged
-// and reported as handled, as before.
-func (b *Bridge) captureMessageIngress(evt *waevents.Message, chatJID watypes.JID) (dedupeKey string, deliveryErr error) {
+// but neither committed nor held in the ingress spool, so a later delivery
+// must commit it (see ObserveIngress); held reports a frame the spool holds
+// for a later generation. A frame that cannot be built (a marshal failure or a
+// panic while building it) or that panics the observer would fail the same
+// way again, so it is logged and reported as handled, as before.
+func (b *Bridge) captureMessageIngress(evt *waevents.Message, chatJID watypes.JID) (dedupeKey string, held bool, deliveryErr error) {
 	// Capture is strictly additive observation: a panic anywhere in the
 	// capture body must not reach the whatsmeow callback or skip the legacy
 	// handling that follows it.
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			b.logIngressCaptureError("message", fmt.Errorf("capture panic: %v", recovered))
-			dedupeKey, deliveryErr = "", nil
+			dedupeKey, held, deliveryErr = "", false, nil
 		}
 	}()
 	if !b.wantsIngress() {
-		return "", nil
+		return "", false, nil
 	}
 	receivedAt := time.Now()
 	protoBytes, err := proto.Marshal(evt.Message)
 	if err != nil {
 		b.logIngressCaptureError("message", err)
-		return "", nil
+		return "", false, nil
 	}
 
 	senderJID := b.canonicalJID(evt.Info.Sender).String()
@@ -2164,14 +2318,15 @@ func (b *Bridge) captureMessageIngress(evt *waevents.Message, chatJID watypes.JI
 	})
 	if err != nil {
 		b.logIngressCaptureError("message", err)
-		return "", nil
+		return "", false, nil
 	}
 	dedupeKey = "msg:" + string(evt.Info.ID) + ":" + ingressHash8(protoBytes)
-	return dedupeKey, b.emitIngress(IngressFrame{
+	held, deliveryErr = b.commitIngress("message", IngressFrame{
 		DedupeKey:  dedupeKey,
 		ReceivedAt: receivedAt,
 		Payload:    payload,
 	})
+	return dedupeKey, held, deliveryErr
 }
 
 func (b *Bridge) captureReceiptIngress(evt *waevents.Receipt) {
@@ -2183,7 +2338,7 @@ func (b *Bridge) captureReceiptIngress(evt *waevents.Receipt) {
 			b.logIngressCaptureError("receipt", fmt.Errorf("capture panic: %v", recovered))
 		}
 	}()
-	if !b.hasIngressObserver() {
+	if !b.wantsIngress() {
 		return
 	}
 	receivedAt := time.Now()
@@ -2209,12 +2364,15 @@ func (b *Bridge) captureReceiptIngress(evt *waevents.Receipt) {
 		return
 	}
 	// whatsmeow acknowledges a receipt before dispatching it (asynchronous
-	// acks), so a delivery error here cannot become a redelivery.
-	_ = b.emitIngress(IngressFrame{
+	// acks), so it is never delivered again: a receipt no generation commits
+	// is held in the ingress spool for the next one.
+	if _, err := b.commitIngress("receipt", IngressFrame{
 		DedupeKey:  "rcpt:" + ingressHash8(payload),
 		ReceivedAt: receivedAt,
 		Payload:    payload,
-	})
+	}); err != nil {
+		b.logger.Error().Err(err).Msg("WhatsApp receipt neither committed nor held; v2 will not see it")
+	}
 }
 
 func (b *Bridge) captureHistorySyncIngress(evt *waevents.HistorySync) {
@@ -2226,7 +2384,7 @@ func (b *Bridge) captureHistorySyncIngress(evt *waevents.HistorySync) {
 			b.logIngressCaptureError("history_sync", fmt.Errorf("capture panic: %v", recovered))
 		}
 	}()
-	if evt == nil || evt.Data == nil || !b.hasIngressObserver() {
+	if evt == nil || evt.Data == nil || !b.wantsIngress() {
 		return
 	}
 	receivedAt := time.Now()
@@ -2244,13 +2402,17 @@ func (b *Bridge) captureHistorySyncIngress(evt *waevents.HistorySync) {
 		return
 	}
 	// whatsmeow ignores the handler result for history sync and deletes the
-	// blob from the server after dispatch, so a delivery error here cannot
-	// become a redelivery.
-	_ = b.emitIngress(IngressFrame{
+	// blob from the server after dispatch (handleHistorySyncNotificationLoop),
+	// so it is never delivered again: a chunk no generation commits is held in
+	// the ingress spool, before this returns and so before the deletion, for
+	// the next generation.
+	if _, err := b.commitIngress("history_sync", IngressFrame{
 		DedupeKey:  "hist:" + ingressHash8(payload),
 		ReceivedAt: receivedAt,
 		Payload:    payload,
-	})
+	}); err != nil {
+		b.logger.Error().Err(err).Msg("WhatsApp history-sync chunk neither committed nor held; v2 will not see it")
+	}
 }
 
 func (b *Bridge) captureMentionLabels(msg *waE2E.Message, chatJID watypes.JID) map[string]string {
@@ -2488,32 +2650,37 @@ func (b *Bridge) handleProtocolMessage(evt *waevents.Message) bool {
 	}
 }
 
-// handleMessage reports false when the message's ingress frame was not
-// committed and a later delivery can commit it (see ObserveIngress), so
-// whatsmeow keeps it for redelivery. The legacy store takes the message on
-// its first delivery either way, as before; a redelivery of a frame it
-// already stored without a v2 commit skips the legacy write (see
+// handleMessage reports false when the message's ingress frame was neither
+// committed nor held in the ingress spool and a later delivery can commit it
+// (see ObserveIngress), so whatsmeow keeps it for redelivery. The legacy store
+// takes the message on its first delivery either way, as before; a
+// redelivery of a frame it already stored without a v2 commit (held, or left
+// for redelivery) skips the legacy write (see
 // legacyAhead).
 func (b *Bridge) handleMessage(evt *waevents.Message) bool {
 	if evt == nil || evt.Message == nil {
 		return true
 	}
 	chatJID := b.normalizeConversationJID(evt.Info.Chat)
-	dedupeKey, err := b.captureMessageIngress(evt, chatJID)
-	committed := err == nil
-	if !committed {
+	dedupeKey, held, err := b.captureMessageIngress(evt, chatJID)
+	handled := err == nil
+	if !handled {
 		b.logger.Warn().
 			Err(err).
 			Str("msg_id", string(evt.Info.ID)).
 			Msg("WhatsApp message not committed to ingress; leaving it for redelivery")
 	}
+	// A held message is in the legacy store ahead of v2, like one left for
+	// redelivery: a rare redelivery of it (whatsmeow failed to clear its
+	// plaintext) must not rewrite the legacy row either.
+	committed := handled && !held
 	now := time.Now()
 	if b.legacyTakesDelivery(dedupeKey, committed, now) {
 		if err := b.handleLegacyMessageRecovering(evt, chatJID); err == nil && !committed {
 			b.legacyTook(dedupeKey, now)
 		}
 	}
-	return committed
+	return handled
 }
 
 // handleLegacyMessageRecovering contains a panic in legacy handling. Left to
