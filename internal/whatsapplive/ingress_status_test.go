@@ -1,9 +1,11 @@
 package whatsapplive
 
 import (
+	"database/sql"
 	"errors"
 	"fmt"
 	"math/rand"
+	"path/filepath"
 	"testing"
 	"testing/quick"
 	"time"
@@ -248,64 +250,175 @@ func TestRedeliveryDoesNotUndoWhatLegacyAppliedInBetween(t *testing.T) {
 	})
 }
 
-// legacyTakesModel is the reference semantics of legacyTakesDelivery: per
-// frame, the legacy store takes a delivery iff no uncommitted delivery of the
-// frame is pending (one taken since the frame's last committed delivery, no
-// older than the retention); every uncommitted delivery leaves one pending,
-// and a committed one clears it. Pending entries are pruned only when an
-// uncommitted delivery records one, as in the implementation.
+// legacyTakesModel is the reference semantics of legacyTakesDelivery plus
+// legacyTook, as handleMessage drives them: per frame, the legacy store takes
+// a delivery iff no stored uncommitted delivery of the frame is pending (one
+// recorded since the frame's last committed delivery, within the retention);
+// an uncommitted delivery whose legacy write succeeded is recorded, and a
+// committed delivery clears the record.
 type legacyTakesModel struct {
 	pending map[string]time.Time
 }
 
-func (m *legacyTakesModel) deliver(key string, committed bool, now time.Time) bool {
+func (m *legacyTakesModel) deliver(key string, committed, writeOK bool, now time.Time) bool {
 	if key == "" {
 		return true
 	}
-	_, isPending := m.pending[key]
+	at, isPending := m.pending[key]
+	if isPending && now.Sub(at) > legacyAheadRetention {
+		delete(m.pending, key)
+		isPending = false
+	}
 	if committed {
 		delete(m.pending, key)
-		return !isPending
 	}
-	if isPending {
-		return false
+	take := !isPending
+	if take && writeOK && !committed {
+		for k, t := range m.pending {
+			if now.Sub(t) > legacyAheadRetention {
+				delete(m.pending, k)
+			}
+		}
+		m.pending[key] = now
 	}
-	for k, t := range m.pending {
-		if now.Sub(t) > legacyAheadRetention {
-			delete(m.pending, k)
+	return take
+}
+
+type legacyDelivery struct {
+	key                string
+	committed, writeOK bool
+	at                 time.Time
+	took               bool
+}
+
+// legacyTakesFromHistory states the rule from the delivery history alone,
+// independent of any state machine: delivery i takes the legacy store unless
+// an earlier delivery j of the same frame took it, stored it, was uncommitted,
+// lies within the retention of i, and no committed delivery of the frame came
+// between j and i.
+func legacyTakesFromHistory(history []legacyDelivery, i int) bool {
+	d := history[i]
+	if d.key == "" {
+		return true
+	}
+	for j := i - 1; j >= 0; j-- {
+		e := history[j]
+		if e.key != d.key {
+			continue
+		}
+		if e.committed {
+			return true
+		}
+		if e.took && e.writeOK && d.at.Sub(e.at) <= legacyAheadRetention {
+			return false
 		}
 	}
-	m.pending[key] = now
 	return true
 }
 
 // TestLegacyTakesDeliveryMatchesItsModel is a differential property test:
-// over random delivery sequences (a small key space, both outcomes, time
-// steps that cross the retention), the implementation and the model agree on
-// every delivery.
+// over random delivery sequences (a small key space, committed or not, legacy
+// writes that fail, time steps that cross the retention), the implementation
+// agrees with the reference model and with the history rule on every
+// delivery, and holds no more records than the model.
 func TestLegacyTakesDeliveryMatchesItsModel(t *testing.T) {
 	type step struct {
 		Key       uint8
 		Committed bool
+		WriteFail uint8
 		AdvanceH  uint16
 	}
 	property := func(steps []step) bool {
 		bridge := &Bridge{}
 		model := &legacyTakesModel{pending: map[string]time.Time{}}
 		now := time.Unix(1775000000, 0)
+		var history []legacyDelivery
 		for _, s := range steps {
 			now = now.Add(time.Duration(s.AdvanceH%400) * time.Hour)
 			key := ""
 			if s.Key%5 != 0 {
 				key = fmt.Sprintf("msg:k%d:00000000", s.Key%5)
 			}
-			if got, want := bridge.legacyTakesDelivery(key, s.Committed, now), model.deliver(key, s.Committed, now); got != want {
+			writeOK := s.WriteFail%4 != 0
+			took := bridge.legacyTakesDelivery(key, s.Committed, now)
+			if took && writeOK && !s.Committed {
+				bridge.legacyTook(key, now)
+			}
+			if took != model.deliver(key, s.Committed, writeOK, now) {
+				return false
+			}
+			history = append(history, legacyDelivery{key: key, committed: s.Committed, writeOK: writeOK, at: now, took: took})
+			if took != legacyTakesFromHistory(history, len(history)-1) {
 				return false
 			}
 		}
 		return len(bridge.legacyAhead) == len(model.pending)
 	}
-	if err := quick.Check(property, &quick.Config{MaxCount: 2000, Rand: rand.New(rand.NewSource(20261011))}); err != nil {
+	if err := quick.Check(property, &quick.Config{MaxCount: 3000, Rand: rand.New(rand.NewSource(20261011))}); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// TestLegacyFailureOnAnUncommittedDeliveryIsRetriedAndNotAcknowledged covers
+// the two ways legacy handling can fail on a delivery v2 did not commit. A
+// panic must not escape to whatsmeow, whose dispatcher would treat the event
+// as handled and acknowledge it; the message stays not handled. A failed
+// write is not recorded as taken, so the redelivery writes legacy again.
+func TestLegacyFailureOnAnUncommittedDeliveryIsRetriedAndNotAcknowledged(t *testing.T) {
+	chat := watypes.NewJID("15551234567", watypes.DefaultUserServer)
+	event := statusTestMessage(chat, "fragile", &waE2E.Message{Conversation: proto.String("fragile text")})
+
+	t.Run("panic", func(t *testing.T) {
+		store, err := db.New(":memory:")
+		if err != nil {
+			t.Fatalf("db.New(): %v", err)
+		}
+		t.Cleanup(func() { _ = store.Close() })
+		panics := true
+		bridge := &Bridge{store: store, callbacks: Callbacks{OnMessagesChange: func(string) {
+			if panics {
+				panics = false
+				panic("legacy callback bug")
+			}
+		}}}
+		bridge.ObserveIngress(func(IngressFrame) error { return nil }, true)()
+		if bridge.handleClientEvent(nil, 0, event) {
+			t.Fatal("an uncommitted message whose legacy handling panicked was reported handled")
+		}
+		var frames int
+		bridge.ObserveIngress(func(IngressFrame) error { frames++; return nil }, true)
+		if !bridge.handleClientEvent(nil, 0, event) || frames != 1 {
+			t.Fatalf("redelivery: frames = %d, want the message committed", frames)
+		}
+	})
+
+	t.Run("failed write", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "messages.db")
+		store, err := db.New(path)
+		if err != nil {
+			t.Fatalf("db.New(): %v", err)
+		}
+		t.Cleanup(func() { _ = store.Close() })
+		raw, err := sql.Open("sqlite", "file:"+path+"?_pragma=busy_timeout(5000)")
+		if err != nil {
+			t.Fatalf("open raw store: %v", err)
+		}
+		t.Cleanup(func() { _ = raw.Close() })
+		if _, err := raw.Exec(`CREATE TRIGGER fail_message_insert BEFORE INSERT ON messages BEGIN SELECT RAISE(ABORT, 'injected failure'); END`); err != nil {
+			t.Fatalf("create failing trigger: %v", err)
+		}
+		bridge := &Bridge{store: store}
+		bridge.ObserveIngress(func(IngressFrame) error { return nil }, true)()
+		bridge.handleClientEvent(nil, 0, event)
+		if stored, _ := store.GetMessageByID("whatsapp:fragile"); stored != nil {
+			t.Fatal("the injected failure did not stop the legacy write")
+		}
+		if _, err := raw.Exec(`DROP TRIGGER fail_message_insert`); err != nil {
+			t.Fatalf("drop failing trigger: %v", err)
+		}
+		bridge.handleClientEvent(nil, 0, event) // redelivery, still uncommitted
+		if stored, err := store.GetMessageByID("whatsapp:fragile"); err != nil || stored == nil {
+			t.Fatalf("legacy store after the redelivery = %+v, %v; want the failed write retried", stored, err)
+		}
+	})
 }

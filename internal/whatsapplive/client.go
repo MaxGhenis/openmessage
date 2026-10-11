@@ -2491,8 +2491,9 @@ func (b *Bridge) handleProtocolMessage(evt *waevents.Message) bool {
 // handleMessage reports false when the message's ingress frame was not
 // committed and a later delivery can commit it (see ObserveIngress), so
 // whatsmeow keeps it for redelivery. The legacy store takes the message on
-// its first delivery either way, as before; a redelivery of the same frame
-// skips the legacy write (see legacyAhead).
+// its first delivery either way, as before; a redelivery of a frame it
+// already stored without a v2 commit skips the legacy write (see
+// legacyAhead).
 func (b *Bridge) handleMessage(evt *waevents.Message) bool {
 	if evt == nil || evt.Message == nil {
 		return true
@@ -2506,10 +2507,29 @@ func (b *Bridge) handleMessage(evt *waevents.Message) bool {
 			Str("msg_id", string(evt.Info.ID)).
 			Msg("WhatsApp message not committed to ingress; leaving it for redelivery")
 	}
-	if b.legacyTakesDelivery(dedupeKey, committed, time.Now()) {
-		b.handleLegacyMessage(evt, chatJID)
+	now := time.Now()
+	if b.legacyTakesDelivery(dedupeKey, committed, now) {
+		if err := b.handleLegacyMessageRecovering(evt, chatJID); err == nil && !committed {
+			b.legacyTook(dedupeKey, now)
+		}
 	}
 	return committed
+}
+
+// handleLegacyMessageRecovering contains a panic in legacy handling. Left to
+// whatsmeow's dispatcher, a panic would be recovered there as a handled event,
+// and an uncommitted message would be acknowledged without reaching v2.
+func (b *Bridge) handleLegacyMessageRecovering(evt *waevents.Message, chatJID watypes.JID) (err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			b.logger.Error().
+				Str("panic", fmt.Sprint(recovered)).
+				Str("msg_id", string(evt.Info.ID)).
+				Msg("Recovered panic in WhatsApp legacy message handling")
+			err = fmt.Errorf("legacy message handling panicked: %v", recovered)
+		}
+	}()
+	return b.handleLegacyMessage(evt, chatJID)
 }
 
 // legacyAheadRetention bounds legacyAhead: whatsmeow drops buffered
@@ -2518,23 +2538,34 @@ func (b *Bridge) handleMessage(evt *waevents.Message) bool {
 const legacyAheadRetention = 15 * 24 * time.Hour
 
 // legacyTakesDelivery reports whether the legacy store should take this
-// delivery of a message frame, and records an uncommitted one in legacyAhead.
-// A delivery whose frame the legacy store already took while v2 had not
-// committed it is skipped; a committed delivery clears the record.
+// delivery of a message frame: not when it already stored the frame on an
+// uncommitted delivery (legacyTook) within the retention and no committed
+// delivery has come since. A committed delivery clears that record.
 func (b *Bridge) legacyTakesDelivery(dedupeKey string, committed bool, now time.Time) bool {
 	if dedupeKey == "" {
 		return true
 	}
 	b.legacyAheadMu.Lock()
 	defer b.legacyAheadMu.Unlock()
-	_, ahead := b.legacyAhead[dedupeKey]
+	at, ahead := b.legacyAhead[dedupeKey]
+	if ahead && now.Sub(at) > legacyAheadRetention {
+		delete(b.legacyAhead, dedupeKey)
+		ahead = false
+	}
 	if committed {
 		delete(b.legacyAhead, dedupeKey)
-		return !ahead
 	}
-	if ahead {
-		return false
+	return !ahead
+}
+
+// legacyTook records that the legacy store stored a frame on a delivery v2 did
+// not commit, and prunes records past the retention.
+func (b *Bridge) legacyTook(dedupeKey string, now time.Time) {
+	if dedupeKey == "" {
+		return
 	}
+	b.legacyAheadMu.Lock()
+	defer b.legacyAheadMu.Unlock()
 	if b.legacyAhead == nil {
 		b.legacyAhead = make(map[string]time.Time)
 	}
@@ -2544,7 +2575,6 @@ func (b *Bridge) legacyTakesDelivery(dedupeKey string, committed bool, now time.
 		}
 	}
 	b.legacyAhead[dedupeKey] = now
-	return true
 }
 
 func (b *Bridge) handleMessageWithoutIngress(evt *waevents.Message) {
@@ -2552,18 +2582,22 @@ func (b *Bridge) handleMessageWithoutIngress(evt *waevents.Message) {
 		return
 	}
 	chatJID := b.normalizeConversationJID(evt.Info.Chat)
-	b.handleLegacyMessage(evt, chatJID)
+	_ = b.handleLegacyMessage(evt, chatJID)
 }
 
-func (b *Bridge) handleLegacyMessage(evt *waevents.Message, chatJID watypes.JID) {
+// handleLegacyMessage writes one message event to the legacy store. It returns
+// an error only when the message row could not be stored; events it skips on
+// purpose (reactions, protocol messages, unsupported or empty bodies) return
+// nil.
+func (b *Bridge) handleLegacyMessage(evt *waevents.Message, chatJID watypes.JID) error {
 	if evt.Info.IsGroup && b.shouldSuppressLeftGroup(waConversationID(chatJID)) {
-		return
+		return nil
 	}
 	if b.handleReactionMessage(evt) {
-		return
+		return nil
 	}
 	if b.handleProtocolMessage(evt) {
-		return
+		return nil
 	}
 	// Encrypted reactions (communities/newsletters). We don't decrypt these
 	// yet — whatsmeow's cli.DecryptReaction returns a plain ReactionMessage
@@ -2575,12 +2609,12 @@ func (b *Bridge) handleLegacyMessage(evt *waevents.Message, chatJID watypes.JID)
 			Str("msg_id", string(evt.Info.ID)).
 			Str("chat", evt.Info.Chat.String()).
 			Msg("Skipping EncReactionMessage (decryption not yet implemented)")
-		return
+		return nil
 	}
 
 	body := extractMessageBody(evt.Message)
 	if body == "" {
-		return
+		return nil
 	}
 	if body == "[Unsupported message]" {
 		// Log what we saw so we can add a proper extractor next time. No
@@ -2590,7 +2624,7 @@ func (b *Bridge) handleLegacyMessage(evt *waevents.Message, chatJID watypes.JID)
 			Str("chat", evt.Info.Chat.String()).
 			Str("content_types", describeWhatsAppMessageContent(evt.Message)).
 			Msg("Skipping unsupported WhatsApp message placeholder")
-		return
+		return nil
 	}
 
 	conv, err := b.upsertConversationForMessage(evt)
@@ -2621,7 +2655,7 @@ func (b *Bridge) handleLegacyMessage(evt *waevents.Message, chatJID watypes.JID)
 
 	if err := b.store.UpsertMessage(msg); err != nil {
 		b.logger.Error().Err(err).Str("msg_id", msg.MessageID).Msg("Failed to store WhatsApp message")
-		return
+		return err
 	}
 	if msg.MediaID != "" {
 		if placeholder, err := b.store.FindUnresolvedWhatsAppPlaceholderAlias(msg.ConversationID, msg.TimestampMS, msg.Body, msg.SourceID); err != nil {
@@ -2646,6 +2680,7 @@ func (b *Bridge) handleLegacyMessage(evt *waevents.Message, chatJID watypes.JID)
 	if b.callbacks.OnConversationsChange != nil {
 		b.callbacks.OnConversationsChange()
 	}
+	return nil
 }
 
 func (b *Bridge) handleReactionMessage(evt *waevents.Message) bool {
