@@ -687,4 +687,3 @@ func TestIMessageOldSchemaHasNoReactions(t *testing.T) {
 		t.Fatalf("result = %+v", res)
 	}
 }
-
