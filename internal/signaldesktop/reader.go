@@ -97,6 +97,7 @@ type ScanOptions struct {
 // Stats describe one scan with counts only: never text, names or numbers.
 type Stats struct {
 	HighWaterRowID           int64            `json:"high_water_rowid"`
+	MaxRowID                 int64            `json:"max_rowid"`
 	AccountVerified          bool             `json:"account_verified"`
 	AttachmentSource         string           `json:"attachment_source"`
 	ChatsResolved            int64            `json:"chats_resolved"`
@@ -136,6 +137,10 @@ func Queries(afterRowID int64) []Query {
 			Name:     "self",
 			SQL:      `SELECT id AS id, COALESCE(json_extract(json, '$.value'), '') AS value FROM items WHERE id IN ('number_id', 'uuid_id') ORDER BY id`,
 			Optional: true,
+		},
+		{
+			Name: "max_rowid",
+			SQL:  `SELECT COALESCE(MAX(rowid), 0) AS max_rowid FROM messages`,
 		},
 		{
 			Name: "conversations",
@@ -254,6 +259,9 @@ func (r *Reader) Scan(ctx context.Context, facts *Facts, options ScanOptions, em
 		}
 	}
 
+	if rows := results["max_rowid"].Rows; len(rows) == 1 {
+		stats.MaxRowID = rows[0].int("max_rowid")
+	}
 	selfE164, selfACI := desktopSelf(results["self"].Rows)
 	if selfE164 == "" {
 		return stats, ErrAccountUnverified
