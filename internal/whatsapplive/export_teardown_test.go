@@ -115,3 +115,15 @@ func RunBeforeBridgeHandlerForTeardownTest(b *Bridge, hook func(any)) {
 		return b.handleClientEvent(cli, generation, raw)
 	})
 }
+
+// BoundIngressSpoolForTeardownTest replaces the bridge's ingress spool bounds.
+func BoundIngressSpoolForTeardownTest(b *Bridge, maxFrames, maxBytes int64) {
+	spool := b.ingressSpool()
+	spool.maxFrames, spool.maxBytes = maxFrames, maxBytes
+}
+
+// HeldIngressFramesForTeardownTest reports how many frames the bridge's
+// ingress spool holds.
+func HeldIngressFramesForTeardownTest(b *Bridge) int64 {
+	return b.ingressSpool().heldFrames()
+}
