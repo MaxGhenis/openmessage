@@ -9,7 +9,7 @@ import (
 	"testing"
 )
 
-const readPathIndexesChecksum = "d23db3d6dfcd5b9d22423e4cbd1414d274eb557807892c376e5096533d171c3f"
+const readPathIndexesChecksum = "a0b486411095e4b1960dba219a0eefbafc243363d450875ba93443fcc0e367f3"
 
 // readPathIndexesMigration returns the position of the read_path_indexes
 // migration, found by name so the test survives a renumbering when parallel
@@ -115,7 +115,7 @@ func assertReadPathIndexes(t *testing.T, db *sql.DB) {
 	}{
 		{"messages_account_direction_time_idx", "messages", []string{"account_id", "direction", "occurred_at_ms"}, false},
 		{"messages_time_idx", "messages", []string{"occurred_at_ms", "message_id"}, false},
-		{"outbox_local_message_idx", "outbox", []string{"account_id", "local_message_id", "created_at_ms", "outbox_id"}, true},
+		{"outbox_local_message_idx", "outbox", []string{"local_message_id", "account_id", "created_at_ms", "outbox_id"}, true},
 	} {
 		rows, err := db.Query(`SELECT name FROM pragma_index_info(?) ORDER BY seqno`, index.name)
 		if err != nil {

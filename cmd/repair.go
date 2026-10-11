@@ -100,9 +100,17 @@ func runRepairGoogleIDSpace(ctx context.Context, logger zerolog.Logger, args []s
 		defer lock.Close()
 	}
 
-	store, err := sqlite.Open(storePath)
+	// Only an exclusive owner migrates the store: --apply holds the instance
+	// lock and has checked the daemon is down. A dry run may run beside the
+	// app, and a migration's write lock would stall the daemon's writes.
+	var store *sqlite.Store
+	if apply {
+		store, err = sqlite.Open(storePath)
+	} else {
+		store, err = sqlite.OpenWithoutMigrating(storePath)
+	}
 	if err != nil {
-		return fmt.Errorf("open v2 store: %w", err)
+		return fmt.Errorf("open v2 store: %w", clientStoreOpenError(err))
 	}
 	defer store.Close()
 	messages, err := sqlite.NewMessageRepository(store, time.Now)
@@ -115,11 +123,12 @@ func runRepairGoogleIDSpace(ctx context.Context, logger zerolog.Logger, args []s
 		if _, err := os.Stat(reference); err != nil {
 			return fmt.Errorf("reference store %q: %w", reference, err)
 		}
-		referenceStore, err = sqlite.Open(reference)
+		var closeReference func()
+		referenceStore, closeReference, err = openReferenceCopy(reference)
 		if err != nil {
 			return fmt.Errorf("open reference store: %w", err)
 		}
-		defer referenceStore.Close()
+		defer closeReference()
 	}
 
 	report, err := ingest.PlanGoogleIDSpaceRepair(ctx, store, messages, ingest.IDSpaceRepairOptions{
@@ -226,6 +235,30 @@ func daemonAnswers(probeURL string) bool {
 	}
 	_ = response.Body.Close()
 	return response.StatusCode == http.StatusOK
+}
+
+// openReferenceCopy opens a copy of the reference snapshot, migrated to this
+// build's schema, and returns a func that closes it and removes the copy. The
+// snapshot is often older than the build, and migrating it in place would
+// rewrite the user's backup.
+func openReferenceCopy(reference string) (*sqlite.Store, func(), error) {
+	dir, err := os.MkdirTemp("", "openmessage-repair-reference-")
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := copyStoreFiles(reference, dir); err != nil {
+		_ = os.RemoveAll(dir)
+		return nil, nil, fmt.Errorf("copy reference store: %w", err)
+	}
+	store, err := sqlite.Open(filepath.Join(dir, filepath.Base(reference)))
+	if err != nil {
+		_ = os.RemoveAll(dir)
+		return nil, nil, err
+	}
+	return store, func() {
+		_ = store.Close()
+		_ = os.RemoveAll(dir)
+	}, nil
 }
 
 func copyStoreFiles(storePath, backupDir string) error {

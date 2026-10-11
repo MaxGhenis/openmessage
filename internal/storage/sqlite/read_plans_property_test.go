@@ -76,7 +76,13 @@ const (
 		WHERE c.account_id = ? AND c.kind = 'group'
 		ORDER BY c.last_message_at_ms DESC, c.conversation_id
 	`
-	oldMessageHasReadCursorQuery = `SELECT COUNT(*) FROM read_cursors WHERE last_read_message_id = ?`
+	oldMessageHasReadCursorQuery    = `SELECT COUNT(*) FROM read_cursors WHERE last_read_message_id = ?`
+	oldReadCursorDeviceOutsideQuery = `
+		SELECT device_id FROM read_cursors
+		WHERE last_read_message_id = ? AND conversation_id <> ?
+		ORDER BY device_id
+		LIMIT 1
+	`
 )
 
 // oldSearchMessagesStatement is SearchMessages' builder before the audit: the
@@ -643,6 +649,15 @@ func TestAccountAggregatesAndLookupsMatchReferenceProperty(t *testing.T) {
 			if err != nil || got != (count > 0) {
 				t.Errorf("seed %d: MessageHasReadCursor(%s) = %v, %v; cursor count %d", c.Seed, id, got, err, count)
 				return false
+			}
+			for _, conversation := range append(conversationIDs(s.conversations), "conversation-none") {
+				var gotDevice, wantDevice string
+				gotErr := s.store.db.QueryRow(readCursorDeviceOutsideQuery, id, conversation, id).Scan(&gotDevice)
+				wantErr := s.store.db.QueryRow(oldReadCursorDeviceOutsideQuery, id, conversation).Scan(&wantDevice)
+				if (gotErr == nil) != (wantErr == nil) || gotDevice != wantDevice {
+					t.Errorf("seed %d: cursor device outside %s for %s = %q (%v), previous = %q (%v)", c.Seed, conversation, id, gotDevice, gotErr, wantDevice, wantErr)
+					return false
+				}
 			}
 		}
 		outbox, err := NewOutboxRepository(s.store, func() time.Time { return time.UnixMilli(100) })

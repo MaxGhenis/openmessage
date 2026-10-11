@@ -6,8 +6,10 @@ import (
 	"fmt"
 )
 
-// The per-account aggregates below replace reads that loaded every
-// conversation of an account and paged through every message. MAX on a
+// The per-account aggregates below replace v2read code that loaded every
+// conversation of an account and then paged through every message (platform
+// stats and message counts), read each conversation's newest message (latest
+// timestamp), or counted the loaded rows (conversation counts). MAX on a
 // literal direction is a single seek of messages_account_direction_time_idx;
 // COUNT(*) is a covering range of an account-leading index, which never reads
 // the message rows themselves.

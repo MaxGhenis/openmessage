@@ -14,9 +14,12 @@ CREATE INDEX messages_account_direction_time_idx
 CREATE INDEX messages_time_idx
     ON messages(occurred_at_ms, message_id);
 
--- Every outgoing message a thread renders asks for its newest outbox row by
--- local_message_id; without this index each lookup reads all of the account's
--- outbox rows. local_message_id = ? implies the partial predicate.
+-- Outbox rows by the local message they send. Every outgoing message a thread
+-- renders asks for its newest outbox row (account_id and local_message_id
+-- both bound), and repair asks whether a message has an unfinished send
+-- (local_message_id alone); without this index each lookup reads every outbox
+-- row of the account or of the store. local_message_id = ? implies the
+-- partial predicate.
 CREATE INDEX outbox_local_message_idx
-    ON outbox(account_id, local_message_id, created_at_ms, outbox_id)
+    ON outbox(local_message_id, account_id, created_at_ms, outbox_id)
     WHERE local_message_id IS NOT NULL;

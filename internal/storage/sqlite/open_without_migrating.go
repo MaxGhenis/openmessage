@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"strings"
 )
@@ -27,7 +28,12 @@ var ErrMigrationPending = errors.New("sqlite store has migrations this build wou
 // takes the write reservation: opening neither waits for nor blocks the
 // owner's writes. A store with pending migrations returns ErrMigrationPending;
 // one migrated by a newer build, or whose ledger does not match this build's
-// migrations, returns the same errors Open would.
+// migrations, returns the same errors Open would. The connection is opened
+// with mode=rw, so a file removed after the existence check is not recreated.
+// It is otherwise an ordinary read-write connection (the fuller read-only
+// attach is #166's OpenReadOnly): like any SQLite connection that closes last,
+// it may checkpoint a WAL nobody else has open into the main file, which
+// changes no row.
 func OpenWithoutMigrating(path string) (*Store, error) {
 	return openWithoutMigrating(path, embeddedMigrations)
 }
@@ -43,7 +49,7 @@ func openWithoutMigrating(path string, migrations []migration) (*Store, error) {
 		return nil, fmt.Errorf("open sqlite store without migrating: %w", err)
 	}
 
-	db, err := sql.Open("sqlite", storeDSN(path))
+	db, err := sql.Open("sqlite", existingStoreDSN(path))
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite store: %w", err)
 	}
@@ -83,4 +89,17 @@ func checkMigrated(ctx context.Context, db *sql.DB, migrations []migration) erro
 		)
 	}
 	return nil
+}
+
+// existingStoreDSN is storeDSN with mode=rw: SQLite opens the file for
+// reading and writing but refuses to create it.
+func existingStoreDSN(path string) string {
+	dsn, err := url.Parse(storeDSN(path))
+	if err != nil {
+		return storeDSN(path)
+	}
+	query := dsn.Query()
+	query.Set("mode", "rw")
+	dsn.RawQuery = query.Encode()
+	return dsn.String()
 }

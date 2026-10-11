@@ -339,12 +339,9 @@ func messageLocation(ctx context.Context, tx *sql.Tx, messageID string) (string,
 // the message left its conversation.
 func readCursorDeviceOutside(ctx context.Context, tx *sql.Tx, messageID, conversationID string) (string, bool, error) {
 	var deviceID string
-	err := tx.QueryRowContext(ctx, `
-		SELECT device_id FROM read_cursors
-		WHERE last_read_message_id = ? AND conversation_id <> ?
-		ORDER BY device_id
-		LIMIT 1
-	`, messageID, conversationID).Scan(&deviceID)
+	err := tx.QueryRowContext(
+		ctx, readCursorDeviceOutsideQuery, messageID, conversationID, messageID,
+	).Scan(&deviceID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", false, nil
 	}
@@ -353,3 +350,18 @@ func readCursorDeviceOutside(ctx context.Context, tx *sql.Tx, messageID, convers
 	}
 	return deviceID, true, nil
 }
+
+// readCursorDeviceOutsideQuery finds such a cursor without an index on
+// last_read_message_id: the cursor's composite foreign key
+// (conversation_id, last_read_message_id) -> messages(conversation_id,
+// message_id) puts any cursor naming the message in the message's own
+// conversation, so the lookup seeks read_cursors_conversation_idx there
+// instead of scanning every cursor.
+const readCursorDeviceOutsideQuery = `
+	SELECT device_id FROM read_cursors
+	WHERE conversation_id = (SELECT conversation_id FROM messages WHERE message_id = ?)
+	  AND conversation_id <> ?
+	  AND last_read_message_id = ?
+	ORDER BY device_id
+	LIMIT 1
+`

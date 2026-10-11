@@ -70,6 +70,12 @@ CREATE INDEX messages_sender_time_idx
 
 CREATE UNIQUE INDEX messages_conversation_message_uq
     ON messages(conversation_id, message_id);
+
+CREATE INDEX messages_account_direction_time_idx
+    ON messages(account_id, direction, occurred_at_ms);
+
+CREATE INDEX messages_time_idx
+    ON messages(occurred_at_ms, message_id);
 `
 
 // messageChildTables are every table with a foreign key to messages.

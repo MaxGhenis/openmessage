@@ -54,9 +54,10 @@ func TestOpenWithoutMigratingServesACurrentStore(t *testing.T) {
 	}
 }
 
-// A newer client meeting a store the app has not upgraded refuses it and
-// leaves it exactly as it was: no migration, no ledger row, no user_version
-// change. (Open would apply the pending migrations under the app's daemon.)
+// A newer client meeting a store the app has not upgraded refuses it: no
+// migration, no ledger row, no user_version change. (Open would apply the
+// pending migrations under the app's daemon.) The fixture has no WAL left to
+// checkpoint, so the file also stays byte-identical.
 func TestOpenWithoutMigratingRefusesAStoreWithPendingMigrations(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "store.sqlite3")
 	behind := len(embeddedMigrations) - 1
@@ -125,6 +126,19 @@ func TestOpenWithoutMigratingRefusesNewerAndMissingStores(t *testing.T) {
 	}
 	if _, err := os.Stat(missing); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("OpenWithoutMigrating created %s: %v", missing, err)
+	}
+	// The connection itself refuses to create the file, so a store removed
+	// between the existence check and the open is not recreated either.
+	database, err := sql.Open("sqlite", existingStoreDSN(missing))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.Ping(); err == nil {
+		t.Fatalf("a mode=rw connection to %s opened; want it refused", missing)
+	}
+	if _, err := os.Stat(missing); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the mode=rw connection created %s: %v", missing, err)
 	}
 }
 
