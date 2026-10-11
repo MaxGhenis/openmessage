@@ -1360,7 +1360,7 @@ func TestHistoryWorkerRepeatedCatchUpIsIdempotent(t *testing.T) {
 // ---------------------------------------------------------------------------
 // (i) Registration
 
-func TestHistoryWorkerRegistrationIsGoogleOnly(t *testing.T) {
+func TestHistoryWorkerRegistrationAllowsGoogleAndWhatsApp(t *testing.T) {
 	store, err := sqlite.Open(filepath.Join(t.TempDir(), "store.sqlite3"))
 	if err != nil {
 		t.Fatalf("sqlite.Open(): %v", err)
@@ -1382,11 +1382,11 @@ func TestHistoryWorkerRegistrationIsGoogleOnly(t *testing.T) {
 		return WorkerConfig{Store: store, Messages: messages, Reactions: reactions, Decoders: registrations}
 	}
 
-	for _, platform := range []bridge.Platform{bridge.PlatformWhatsApp, bridge.PlatformSignal} {
+	for _, platform := range []bridge.Platform{bridge.PlatformSignal} {
 		t.Run(string(platform), func(t *testing.T) {
 			const codec = "test.hwt.history"
 			_, err := NewWorker(config(DecoderRegistration{Codec: codec, Platform: platform, Decoder: decoder, History: true}))
-			want := fmt.Sprintf("history codec %q is only supported for %q", codec, bridge.PlatformGoogle)
+			want := fmt.Sprintf("history codec %q is only supported for %q and %q", codec, bridge.PlatformGoogle, bridge.PlatformWhatsApp)
 			if err == nil || !strings.Contains(err.Error(), want) {
 				t.Fatalf("NewWorker(History on %s) error = %v, want %q", platform, err, want)
 			}
@@ -1396,6 +1396,9 @@ func TestHistoryWorkerRegistrationIsGoogleOnly(t *testing.T) {
 				t.Fatalf("NewWorker(live %s) error = %v", platform, err)
 			}
 		})
+	}
+	if _, err := NewWorker(config(NewWhatsAppDesktopHistoryDecoderRegistration())); err != nil {
+		t.Fatalf("NewWorker(WhatsApp desktop history): %v", err)
 	}
 
 	worker, err := NewWorker(config(hwtRegistrations(&Counters{})...))
@@ -1425,8 +1428,8 @@ const (
 var (
 	hwtPropRosters     = [][]string{{hwtKarl, hwtShoshana}, {hwtShoshana, hwtAda}, {hwtKarl, hwtAda}}
 	hwtPropStaleRoster = []string{hwtAda, hwtBea}
-	hwtPropReactors = []string{hwtKarl, hwtShoshana, hwtAda}
-	hwtPropEmoji    = []string{"👍", "❤️", "😂"}
+	hwtPropReactors    = []string{hwtKarl, hwtShoshana, hwtAda}
+	hwtPropEmoji       = []string{"👍", "❤️", "😂"}
 )
 
 type hwtPropReaction struct{ Emoji, Actor string }

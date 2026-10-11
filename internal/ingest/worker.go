@@ -36,7 +36,8 @@ type EchoObserver interface {
 // thread's direct peer. Reactions apply only to messages a frame inserted, and
 // no existing row is updated. What history cannot place without moving a
 // binding is skipped (history_skipped); the live channel owns the #176
-// id-space repairs. History is supported for Google only.
+// id-space repairs. History is supported for Google catch-up and WhatsApp
+// Desktop snapshots; a history codec never establishes live delivery evidence.
 type DecoderRegistration struct {
 	Codec    string
 	Platform bridge.Platform
@@ -159,11 +160,12 @@ func NewWorker(config WorkerConfig) (*Worker, error) {
 		if _, exists := decoders[codec]; exists {
 			return nil, fmt.Errorf("create ingest worker: duplicate decoder codec %q", codec)
 		}
-		if registration.History && registration.Platform != bridge.PlatformGoogle {
+		if registration.History && registration.Platform != bridge.PlatformGoogle && registration.Platform != bridge.PlatformWhatsApp {
 			return nil, fmt.Errorf(
-				"create ingest worker: history codec %q is only supported for %q",
+				"create ingest worker: history codec %q is only supported for %q and %q",
 				codec,
 				bridge.PlatformGoogle,
+				bridge.PlatformWhatsApp,
 			)
 		}
 		decoders[codec] = registeredDecoder{
@@ -683,6 +685,9 @@ func (w *Worker) applyEvents(
 		changed = true
 		// Conversation rows are never re-upserted from message frames, so
 		// recency advances through this targeted monotone bump instead.
+		// History inserts advance recency too: the bump is a monotone MAX, so
+		// a gap-filled message moves its thread up the list without depending
+		// on frame order.
 		if err := w.store.BumpConversationRecency(
 			projection.Message.ConversationID,
 			projection.Message.OccurredAtMS,
