@@ -661,9 +661,14 @@ func TestUnpairEndsTheLogoutWithoutDialingTheRevokedIdentity(t *testing.T) {
 }
 
 // A logout callback that passed the first generation check and then lost the
-// race to a deliberate unpair must not bring the record back or touch the
-// replacement client.
+// race to a deliberate unpair must not bring the record back, revoke a link
+// made right after the unpair, or touch the replacement client.
 func TestLogoutCallbackRacingUnpairLeavesNoRecord(t *testing.T) {
+	t.Run("unpair", func(t *testing.T) { testLogoutCallbackRacingUnpair(t, false) })
+	t.Run("unpair then a new link", func(t *testing.T) { testLogoutCallbackRacingUnpair(t, true) })
+}
+
+func testLogoutCallbackRacingUnpair(t *testing.T, relink bool) {
 	sessionPath := relinkTestSessionPath(t)
 	SeedLinkedDeviceForTest(t, sessionPath, relinkTestJID)
 	b := openRelinkTestBridge(t, sessionPath)
@@ -680,6 +685,9 @@ func TestLogoutCallbackRacingUnpairLeavesNoRecord(t *testing.T) {
 	testHookBeforeLogoutRecord = func() {
 		testHookBeforeLogoutRecord = nil
 		unpairErr = b.Unpair()
+		if relink {
+			emulatePairingForTest(t, b, relinkTestOtherJID)
+		}
 	}
 	b.handleClientEvent(source, generation, &waevents.LoggedOut{Reason: waevents.ConnectFailureLoggedOut})
 	if unpairErr != nil {
@@ -687,12 +695,74 @@ func TestLogoutCallbackRacingUnpairLeavesNoRecord(t *testing.T) {
 	}
 
 	status := b.Status()
-	if status.NeedsRelink || status.Paired || status.LastError != "" {
-		t.Fatalf("status = %+v, want the deliberate unpair intact (no needs_relink, no logout error)", status)
+	if status.NeedsRelink || status.Paired != relink || status.LastError != "" {
+		t.Fatalf("status = %+v, want the deliberate unpair (and any new link) intact: no needs_relink, no logout error", status)
+	}
+	if relink {
+		assertLinkedDevices(t, sessionPath, relinkTestOtherJID.String())
+	} else {
+		assertLinkedDevices(t, sessionPath)
 	}
 	b = reopenRelinkTestBridge(t, b, sessionPath)
 	if b.Status().NeedsRelink {
 		t.Fatal("the retired callback persisted a logout record")
+	}
+}
+
+// A disconnect from a client that was replaced while the event was in flight
+// must not mark its successor disconnected or give it the old error.
+func TestRetiredDisconnectLeavesTheSuccessorAlone(t *testing.T) {
+	sessionPath := relinkTestSessionPath(t)
+	SeedLinkedDeviceForTest(t, sessionPath, relinkTestJID)
+	b := openRelinkTestBridge(t, sessionPath)
+	b.mu.Lock()
+	retired, generation := b.client, b.clientGeneration
+	if err := b.resetClientLocked(); err != nil {
+		b.mu.Unlock()
+		t.Fatalf("resetClientLocked(): %v", err)
+	}
+	b.connected, b.connecting = true, true
+	b.mu.Unlock()
+
+	b.handleDisconnected(retired, generation, "stream replaced")
+
+	b.mu.RLock()
+	connected, connecting, lastError := b.connected, b.connecting, b.lastError
+	b.mu.RUnlock()
+	if !connected || !connecting || lastError != "" {
+		t.Fatalf("successor state = connected %v, connecting %v, last_error %q; want it untouched", connected, connecting, lastError)
+	}
+}
+
+// whatsmeow's Store.Delete clears the live device's ID from its own goroutine,
+// holding no lock the bridge holds. Status, PairedAccount, UsesLiveSession,
+// DisconnectTransport and the lifecycle event path read the bridge's own
+// record instead, so they never touch that field. Under -race (CI's Go Race
+// job) any read of it here is reported: the write below has no
+// happens-before edge to the calls.
+func TestBridgeNeverReadsTheLiveDeviceID(t *testing.T) {
+	sessionPath := relinkTestSessionPath(t)
+	SeedLinkedDeviceForTest(t, sessionPath, relinkTestJID)
+	b := openRelinkTestBridge(t, sessionPath)
+	b.recordLoggedOut(time.Now(), relinkTestReason401, heldIdentity(b))
+	b.mu.RLock()
+	device := b.client.Store
+	b.mu.RUnlock()
+
+	written := make(chan struct{})
+	go func() {
+		device.ID = nil // what whatsmeow's Store.Delete does
+		close(written)
+	}()
+	status := b.Status()
+	_ = b.PairedAccount()
+	_ = b.UsesLiveSession()
+	b.handleEvent(&waevents.Disconnected{})
+	b.DisconnectTransport()
+	<-written
+
+	if status.Paired || !status.NeedsRelink {
+		t.Fatalf("status = %+v, want the revoked identity unpaired with needs_relink", status)
 	}
 }
 
