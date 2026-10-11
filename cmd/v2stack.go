@@ -301,6 +301,7 @@ func newV2Stack(deps v2StackDeps) (_ *v2Stack, resultErr error) {
 				Platform: bridge.PlatformSignal,
 				Decoder:  ingest.NewSignalDecoder(),
 			},
+			ingest.NewSignalDesktopHistoryDecoderRegistration(),
 		},
 	})
 	if err != nil {
