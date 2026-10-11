@@ -226,7 +226,7 @@ final class PlatformAttentionTests: XCTestCase {
     // The 2026-08-20 shape after the backend reports the logout: WhatsApp no
     // longer paired, needs_relink set with whatsmeow's reason. It asks for a
     // relink, in the menu bar and in its one notification.
-    func testWhatsAppLogoutAsksForARelink() {
+    func testWhatsAppLogoutAsksForARelink() throws {
         let json = status("""
         {"google": {"connected": true, "paired": true},
          "whatsapp": {"connected": false, "paired": false, "needs_relink": true,
@@ -238,19 +238,20 @@ final class PlatformAttentionTests: XCTestCase {
             key: "whatsapp", name: "WhatsApp",
             reason: .loggedOut(since: 1_787_260_699_000, reason: "401: logged out from another device")
         )])
+        let item = try XCTUnwrap(items.first)
         XCTAssertEqual(PlatformAttention.alertText(for: items), "WhatsApp needs re-pairing — it has stopped syncing.")
         XCTAssertEqual(
-            PlatformAttention.loggedOutNotificationBody(items[0]),
+            PlatformAttention.loggedOutNotificationBody(item),
             "WhatsApp logged OpenMessage out (401: logged out from another device), so its messages have stopped syncing. "
                 + "Open OpenMessage and scan the QR code to relink."
         )
-        XCTAssertNil(PlatformAttention.silentNotificationBody(items[0]))
+        XCTAssertNil(PlatformAttention.silentNotificationBody(item))
         XCTAssertNil(PlatformAttention.loggedOutNotificationBody(
             PlatformAttention(key: "google", name: "Google Messages", reason: .needsRepair)
         ))
     }
 
-    func testLogoutJoinsTheRepairSentence() {
+    func testLogoutJoinsTheRepairSentence() throws {
         let json = status("""
         {"google": {"connected": false, "paired": true},
          "whatsapp": {"connected": false, "paired": false, "needs_relink": true, "relink_since_ms": 5}}
@@ -261,8 +262,9 @@ final class PlatformAttentionTests: XCTestCase {
             PlatformAttention.alertText(for: items),
             "Google Messages, WhatsApp need re-pairing — they have stopped syncing."
         )
+        let whatsapp = try XCTUnwrap(items.first { $0.key == "whatsapp" })
         XCTAssertEqual(
-            PlatformAttention.loggedOutNotificationBody(items[1]),
+            PlatformAttention.loggedOutNotificationBody(whatsapp),
             "WhatsApp logged OpenMessage out, so its messages have stopped syncing. Open OpenMessage and scan the QR code to relink."
         )
     }
