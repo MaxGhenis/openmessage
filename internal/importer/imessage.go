@@ -62,8 +62,9 @@ const (
 // chat.db and, from its last successful call, marks of what it read. A call
 // returns at once when chat.db has not been written since. Otherwise it reads
 // only rows added since the marks, rows dated within Window (in-place edits),
-// and the small chat, handle and chat_handle_join tables, and recomputes what
-// those rows affect. It reads everything again on its first call, when the
+// the messages of handles and chats it has not seen before and of chats whose
+// conversation is missing from the store, and the small chat, handle and
+// chat_handle_join tables, and recomputes what those rows affect. It reads everything again on its first call, when the
 // file was replaced, when a row at or below a mark was deleted, when a chat's
 // guid or a handle changed, and every FullEvery. A poll leaves the store as a
 // full import would, except that an in-place edit to a row dated outside

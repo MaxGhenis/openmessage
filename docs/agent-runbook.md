@@ -457,9 +457,11 @@ chat.db and, from its last successful poll, marks of what it read. A poll:
 - otherwise reads, in one chat.db snapshot, the message rows above its
   ROWID mark, the messages of `chat_message_join` rows above its join mark,
   every row dated in the last 24 h (iMessage edits and unsends happen within
-  minutes, and outgoing rows get their date fixed just after insert), and
-  the whole `chat`, `handle` and `chat_handle_join` tables, and recomputes
-  only what those rows affect;
+  minutes, and outgoing rows get their date fixed just after insert), the
+  messages of handles and chats it has not seen before (sync can land them
+  after the rows that name them) and of chats whose conversation another
+  writer deleted from the store, and the whole `chat`, `handle` and
+  `chat_handle_join` tables, and recomputes only what those rows affect;
 - reads all of chat.db instead on its first call, when the path names a new
   file, when a row at or below a mark is gone (the row at a mark changed, or
   `COUNT(*)` is not the old count plus the rows above the mark), when a
