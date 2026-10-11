@@ -282,6 +282,7 @@ type ingressObserverHarness struct {
 	nextID        uint64
 	currentID     uint64
 	callback      func(whatsapplive.IngressFrame) error
+	durable       bool
 	registrations int
 	removals      int
 	removed       chan struct{}
@@ -291,12 +292,13 @@ func newIngressObserverHarness() *ingressObserverHarness {
 	return &ingressObserverHarness{removed: make(chan struct{})}
 }
 
-func (h *ingressObserverHarness) Observe(callback func(whatsapplive.IngressFrame) error) func() {
+func (h *ingressObserverHarness) Observe(callback func(whatsapplive.IngressFrame) error, durable bool) func() {
 	h.mu.Lock()
 	h.nextID++
 	id := h.nextID
 	h.currentID = id
 	h.callback = callback
+	h.durable = durable
 	h.registrations++
 	h.mu.Unlock()
 

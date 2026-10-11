@@ -2,6 +2,7 @@ package whatsapplive
 
 import (
 	"context"
+	"database/sql"
 	"testing"
 
 	"go.mau.fi/whatsmeow"
@@ -81,4 +82,21 @@ func NewPeerDeviceForTeardownTest(t testing.TB, path string, jid watypes.JID) *s
 		t.Fatalf("save peer device %s: %v", jid, err)
 	}
 	return device
+}
+
+// RetainedPlaintextsForTeardownTest counts the decrypted messages whatsmeow
+// still holds in its event buffer: ones it was told were not handled, and
+// whose plaintext it therefore kept for redelivery.
+func RetainedPlaintextsForTeardownTest(t testing.TB, sessionPath string) int {
+	t.Helper()
+	database, err := sql.Open("sqlite", sessionStoreReadOnlyDSN(sessionPath))
+	if err != nil {
+		t.Fatalf("open session store: %v", err)
+	}
+	defer database.Close()
+	var retained int
+	if err := database.QueryRow(`SELECT COUNT(*) FROM whatsmeow_event_buffer WHERE plaintext IS NOT NULL`).Scan(&retained); err != nil {
+		t.Fatalf("count retained plaintexts: %v", err)
+	}
+	return retained
 }

@@ -43,6 +43,9 @@ func TestIngressObserverReportsWhetherTheFrameWasCommitted(t *testing.T) {
 			}
 			t.Cleanup(func() { stopRun(t, lifecycleRun) })
 
+			if !observer.durable {
+				t.Fatal("a generation with a durable sink registered a non-durable ingress observer")
+			}
 			if err := observer.Callback()(frame); !errors.Is(err, test.wantErr) || (test.wantErr == nil) != (err == nil) {
 				t.Fatalf("observer result = %v, want %v", err, test.wantErr)
 			}
@@ -76,6 +79,30 @@ func TestIngressObserverReportsWhetherTheFrameWasCommitted(t *testing.T) {
 		}
 	})
 
+	t.Run("legacy-only sink", func(t *testing.T) {
+		for _, appendErr := range []error{nil, bridge.ErrStaleGeneration, diskErr} {
+			observer := newIngressObserverHarness()
+			a := newTestAdapter(t, newFakeLifecycleClient(), func() time.Time { return whatsappAdapterTestEpoch })
+			a.observeIngress = observer.Observe
+			sink := &legacyOnlyIngressSink{ingressRecordingSink: ingressRecordingSink{appendErr: appendErr}}
+			lifecycleRun, err := a.Start(context.Background(), bridge.StartRequest{AccountID: "whatsapp-primary", Generation: 8}, sink)
+			if err != nil {
+				t.Fatalf("Start() error = %v", err)
+			}
+			if observer.durable {
+				t.Fatal("a legacy-only generation registered a durable ingress observer")
+			}
+			retained := observer.Callback()
+			if err := retained(frame); err != nil {
+				t.Fatalf("legacy-only observer result with append error %v = %v, want nil (nothing durable can commit it)", appendErr, err)
+			}
+			stopRun(t, lifecycleRun)
+			if err := retained(frame); err != nil {
+				t.Fatalf("legacy-only observer result after Stop = %v, want nil", err)
+			}
+		}
+	})
+
 	t.Run("no sink", func(t *testing.T) {
 		observer := newIngressObserverHarness()
 		a := newTestAdapter(t, newFakeLifecycleClient(), func() time.Time { return whatsappAdapterTestEpoch })
@@ -85,8 +112,19 @@ func TestIngressObserverReportsWhetherTheFrameWasCommitted(t *testing.T) {
 			t.Fatalf("Start() error = %v", err)
 		}
 		t.Cleanup(func() { stopRun(t, lifecycleRun) })
+		if observer.durable {
+			t.Fatal("a generation without a sink registered a durable ingress observer")
+		}
 		if err := observer.Callback()(frame); err != nil {
 			t.Fatalf("observer result without a sink = %v, want nil (nothing can commit it)", err)
 		}
 	})
 }
+
+// legacyOnlyIngressSink is a ConnectionSink that reports, as the supervisor's
+// generation sink does in legacy-only mode, that it commits nothing durably.
+type legacyOnlyIngressSink struct {
+	ingressRecordingSink
+}
+
+func (*legacyOnlyIngressSink) DurableIngress() bool { return false }

@@ -223,11 +223,33 @@ func (s *teardownSink) textFrames(t *testing.T, id watypes.MessageID, text strin
 	return frames
 }
 
-type teardownHarness struct {
-	t *testing.T
-	// cancelOnTeardown makes retireGeneration cancel the handler context it
-	// returned from awaitGeneration.
+// teardownMode picks the handler context and the install shape a test runs
+// with.
+type teardownMode struct {
+	// cancelOnTeardown makes retireGeneration cancel the handler context
+	// awaitGeneration returned: main's behavior, and what a teardown that
+	// overlaps ConnectContext returning still does.
 	cancelOnTeardown bool
+	// legacyOnly runs the supervisor with no v2 sink, the default install
+	// (all v2 flags off): legacy messages.db is the only durable store.
+	legacyOnly bool
+}
+
+func (m teardownMode) String() string {
+	context := "handler context detached from teardown"
+	if m.cancelOnTeardown {
+		context = "handler context cancelled by teardown"
+	}
+	if m.legacyOnly {
+		return context + ", legacy-only install"
+	}
+	return context + ", v2 ingest"
+}
+
+type teardownHarness struct {
+	t                *testing.T
+	cancelOnTeardown bool
+	legacyOnly       bool
 	cancelHandlers   context.CancelFunc
 	host             *whatsapplive.Bridge
 	cli              *whatsmeow.Client
@@ -243,7 +265,7 @@ type teardownHarness struct {
 	groupJID         watypes.JID
 }
 
-func newTeardownHarness(t *testing.T, cancelOnTeardown bool) *teardownHarness {
+func newTeardownHarness(t *testing.T, mode teardownMode) *teardownHarness {
 	t.Helper()
 	dir := t.TempDir()
 	sessionPath := filepath.Join(dir, "whatsapp-session.db")
@@ -271,6 +293,10 @@ func newTeardownHarness(t *testing.T, cancelOnTeardown bool) *teardownHarness {
 	})
 	sink := &teardownSink{}
 	gate := newBackoffGate()
+	options := []bridge.SupervisorOption{}
+	if !mode.legacyOnly {
+		options = append(options, bridge.WithConnectionSink(sink))
+	}
 	supervisor, err := bridge.NewSupervisor(
 		"whatsapp-primary",
 		bridge.PlatformWhatsApp,
@@ -286,7 +312,7 @@ func newTeardownHarness(t *testing.T, cancelOnTeardown bool) *teardownHarness {
 		},
 		teardownClock{gate: gate},
 		teardownRandom{},
-		bridge.WithConnectionSink(sink),
+		options...,
 	)
 	if err != nil {
 		t.Fatalf("NewSupervisor(): %v", err)
@@ -306,7 +332,8 @@ func newTeardownHarness(t *testing.T, cancelOnTeardown bool) *teardownHarness {
 	peerJID := watypes.JID{User: "15559870000", Server: watypes.DefaultUserServer}
 	return &teardownHarness{
 		t:                t,
-		cancelOnTeardown: cancelOnTeardown,
+		cancelOnTeardown: mode.cancelOnTeardown,
+		legacyOnly:       mode.legacyOnly,
 		host:             host,
 		cli:              whatsapplive.ClientForTeardownTest(host),
 		messages:         messages,
@@ -361,11 +388,16 @@ func (h *teardownHarness) retireGeneration() {
 	}
 }
 
-// forEachHandlerContext runs a message test with the handler context the
-// bridge hands whatsmeow and with one that teardown cancels.
-func forEachHandlerContext(t *testing.T, test func(t *testing.T, cancelOnTeardown bool)) {
-	t.Run("handler context detached from teardown", func(t *testing.T) { test(t, false) })
-	t.Run("handler context cancelled by teardown", func(t *testing.T) { test(t, true) })
+// forEachTeardownMode runs a message test with the handler context the bridge
+// hands whatsmeow and with one that teardown cancels, on a v2-ingest install
+// and on a legacy-only one.
+func forEachTeardownMode(t *testing.T, test func(t *testing.T, mode teardownMode)) {
+	for _, legacyOnly := range []bool{false, true} {
+		for _, cancelOnTeardown := range []bool{false, true} {
+			mode := teardownMode{cancelOnTeardown: cancelOnTeardown, legacyOnly: legacyOnly}
+			t.Run(mode.String(), func(t *testing.T) { test(t, mode) })
+		}
+	}
 }
 
 // startPeerSession builds the peer's outgoing session from a prekey bundle of
@@ -496,11 +528,18 @@ func (h *teardownHarness) deliver(handlerCtx context.Context, node *waBinary.Nod
 	h.cli.DangerousInternals().HandleEncryptedMessage(handlerCtx, node)
 }
 
-// requireDelivered checks the invariant for one message part: it reached v2
-// ingest, every commit of it carries one dedupe key, and the legacy store
-// holds it. It returns the generations that committed it.
+// requireDelivered checks the invariant for one message part: the legacy
+// store holds it, and on a v2-ingest install it reached v2 ingest with one
+// dedupe key across every commit. It returns the generations that committed
+// it (none on a legacy-only install).
 func (h *teardownHarness) requireDelivered(id watypes.MessageID, text, why string) []bridge.Generation {
 	h.t.Helper()
+	if stored, err := h.messages.GetMessageByID("whatsapp:" + string(id)); err != nil || stored == nil || stored.Body != text {
+		h.t.Fatalf("legacy store message %s = %+v, %v; want body %q (%s)", id, stored, err, text, why)
+	}
+	if h.legacyOnly {
+		return nil
+	}
 	frames := h.sink.textFrames(h.t, id, text)
 	if len(frames) == 0 {
 		h.t.Fatalf("message %s never reached v2 ingest (%s)", id, why)
@@ -511,9 +550,6 @@ func (h *teardownHarness) requireDelivered(id watypes.MessageID, text, why strin
 			h.t.Fatalf("message %s committed under dedupe keys %q and %q", id, frames[0].dedupeKey, frame.dedupeKey)
 		}
 		generations = append(generations, frame.generation)
-	}
-	if stored, err := h.messages.GetMessageByID("whatsapp:" + string(id)); err != nil || stored == nil || stored.Body != text {
-		h.t.Fatalf("legacy store message %s = %+v, %v; want body %q", id, stored, err, text)
 	}
 	return generations
 }
@@ -560,8 +596,8 @@ func (h *msgSecretStoreHook) PutMessageSecret(ctx context.Context, chat, sender 
 // redelivery failed with "received message with old counter", which whatsmeow
 // ignores and acknowledges.
 func TestTeardownDuringPreKeyDecryptDoesNotLoseTheMessage(t *testing.T) {
-	forEachHandlerContext(t, func(t *testing.T, cancelOnTeardown bool) {
-		h := newTeardownHarness(t, cancelOnTeardown)
+	forEachTeardownMode(t, func(t *testing.T, mode teardownMode) {
+		h := newTeardownHarness(t, mode)
 		first, _ := h.awaitGeneration()
 		h.startPeerSession()
 		node := h.peerMessage("3EB0PREKEYTEARDOWN", "first message from a new session")
@@ -589,8 +625,8 @@ func TestTeardownDuringPreKeyDecryptDoesNotLoseTheMessage(t *testing.T) {
 // event because no generation was observing ingress, and whatsmeow, told the
 // event was handled, never saw it again.
 func TestTeardownBeforeDispatchDoesNotLoseTheMessage(t *testing.T) {
-	forEachHandlerContext(t, func(t *testing.T, cancelOnTeardown bool) {
-		h := newTeardownHarness(t, cancelOnTeardown)
+	forEachTeardownMode(t, func(t *testing.T, mode teardownMode) {
+		h := newTeardownHarness(t, mode)
 		first, _ := h.awaitGeneration()
 		h.startPeerSession()
 		node := h.peerMessage("3EB0DISPATCHTEARDOWN", "arrives while the generation retires")
@@ -607,6 +643,47 @@ func TestTeardownBeforeDispatchDoesNotLoseTheMessage(t *testing.T) {
 		requireCommittedOnlyIn(t, h.requireDelivered("3EB0DISPATCHTEARDOWN", "arrives while the generation retires",
 			"decrypted, then dispatched after the generation's ingress closed"), generation)
 	})
+}
+
+// TestTeardownBeforeDispatchAcknowledgesOnlyWhatV2Holds pins what whatsmeow
+// is told for a message dispatched after the generation retired. On a
+// v2-ingest install it is not handled: whatsmeow keeps the plaintext (and
+// sends no receipt) for the next generation. On a legacy-only install there
+// is no v2 to wait for: it is handled at once, whatsmeow clears the plaintext
+// and acknowledges it as on main, and the legacy store already holds it.
+func TestTeardownBeforeDispatchAcknowledgesOnlyWhatV2Holds(t *testing.T) {
+	for _, mode := range []teardownMode{{}, {legacyOnly: true}} {
+		t.Run(mode.String(), func(t *testing.T) {
+			h := newTeardownHarness(t, mode)
+			first, _ := h.awaitGeneration()
+			h.startPeerSession()
+			node := h.peerMessage("3EB0ACKTEARDOWN", "arrives as the generation retires")
+			var once sync.Once
+			h.cli.Store.MsgSecrets = &msgSecretStoreHook{
+				MsgSecretStore: h.cli.Store.MsgSecrets,
+				beforePut:      func(context.Context) { once.Do(h.retireGeneration) },
+			}
+			h.deliver(first, node)
+
+			if stored, err := h.messages.GetMessageByID("whatsapp:3EB0ACKTEARDOWN"); err != nil || stored == nil {
+				t.Fatalf("legacy store after the first delivery = %+v, %v; want the message", stored, err)
+			}
+			retained := whatsapplive.RetainedPlaintextsForTeardownTest(t, h.sessionPath)
+			if mode.legacyOnly && retained != 0 {
+				t.Fatalf("legacy-only install: whatsmeow kept %d plaintexts, want the message handled and cleared", retained)
+			}
+			if !mode.legacyOnly && retained != 1 {
+				t.Fatalf("v2 install: whatsmeow kept %d plaintexts, want the uncommitted message kept for redelivery", retained)
+			}
+
+			second, _ := h.awaitGeneration()
+			h.deliver(second, node)
+			h.requireDelivered("3EB0ACKTEARDOWN", "arrives as the generation retires", "redelivered to the next generation")
+			if retained := whatsapplive.RetainedPlaintextsForTeardownTest(t, h.sessionPath); retained != 0 {
+				t.Fatalf("whatsmeow still holds %d plaintexts after the redelivery was handled", retained)
+			}
+		})
+	}
 }
 
 // commitHook lets one test act inside SQLite's commit on a session store
@@ -653,9 +730,9 @@ func (h *sessionStoreHook) PutSession(ctx context.Context, address string, raw [
 // deferred done check), so before the fix libsignal saw a failed store after
 // the ratchet had moved, and the redelivery failed with an old counter.
 func TestTeardownWhileTheSessionCommitsDoesNotLoseTheMessage(t *testing.T) {
-	forEachHandlerContext(t, func(t *testing.T, cancelOnTeardown bool) {
+	forEachTeardownMode(t, func(t *testing.T, mode teardownMode) {
 		installCommitHooks()
-		h := newTeardownHarness(t, cancelOnTeardown)
+		h := newTeardownHarness(t, mode)
 		first, _ := h.awaitGeneration()
 		h.startPeerSession()
 		h.deliver(first, h.peerMessage("3EB0SESSIONSETUP", "opens the session"))
@@ -907,15 +984,15 @@ var teardownScenarios = []teardownScenario{
 // generation just before that call, redelivers the stanza to the next
 // generation, and requires the message to arrive.
 func TestEveryTeardownPointDeliversTheMessage(t *testing.T) {
-	forEachHandlerContext(t, func(t *testing.T, cancelOnTeardown bool) {
-		testEveryTeardownPoint(t, cancelOnTeardown)
+	forEachTeardownMode(t, func(t *testing.T, mode teardownMode) {
+		testEveryTeardownPoint(t, mode)
 	})
 }
 
-func testEveryTeardownPoint(t *testing.T, cancelOnTeardown bool) {
+func testEveryTeardownPoint(t *testing.T, mode teardownMode) {
 	for _, scenario := range teardownScenarios {
 		t.Run(scenario.name, func(t *testing.T) {
-			h := newTeardownHarness(t, cancelOnTeardown)
+			h := newTeardownHarness(t, mode)
 			first, _ := h.awaitGeneration()
 			node, id, text := scenario.prepare(h, first)
 			points := &cutPoints{}
@@ -931,7 +1008,7 @@ func testEveryTeardownPoint(t *testing.T, cancelOnTeardown bool) {
 
 			for cutAt, call := range calls {
 				t.Run(fmt.Sprintf("%02d_before_%s", cutAt, call), func(t *testing.T) {
-					h := newTeardownHarness(t, cancelOnTeardown)
+					h := newTeardownHarness(t, mode)
 					first, _ := h.awaitGeneration()
 					node, id, text := scenario.prepare(h, first)
 					points := &cutPoints{}
@@ -1056,7 +1133,7 @@ func (h *teardownHarness) syncAppState(ctx context.Context, list *appstate.Patch
 // (whatsmeow's contact store, which OpenMessage reads for display names)
 // stopped syncing.
 func TestTeardownDuringAppStateSyncKeepsTheCollectionUsable(t *testing.T) {
-	h := newTeardownHarness(t, false)
+	h := newTeardownHarness(t, teardownMode{})
 	first, _ := h.awaitGeneration()
 	phone := h.newAppStatePhone()
 	contact := watypes.JID{User: "15550001111", Server: watypes.DefaultUserServer}

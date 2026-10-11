@@ -42,7 +42,7 @@ type Adapter struct {
 	markReadRequest     func(string, []string, string, time.Time) error
 	sendMediaRequest    func(string, []byte, string, string, string, string, string) (string, time.Time, error)
 	downloadMediaRef    func(string, whatsapplive.StoredMediaRef, string, string, string) ([]byte, string, error)
-	observeIngress      func(func(whatsapplive.IngressFrame) error) func()
+	observeIngress      func(func(whatsapplive.IngressFrame) error, bool) func()
 	logIngressError     func(error, string, uint64)
 
 	mu       sync.Mutex
@@ -416,6 +416,13 @@ func (a *Adapter) Start(
 	a.starting = true
 	a.mu.Unlock()
 
+	// A sink without a durable inbox (legacy-only mode) never commits a frame,
+	// so its generations report every frame committed and whatsmeow
+	// acknowledges as it always has.
+	durableIngress := sink != nil
+	if durability, ok := sink.(bridge.IngressDurability); ok {
+		durableIngress = durability.DurableIngress()
+	}
 	runCtx, cancel := context.WithCancel(ctx)
 	r := &run{
 		adapter:   a,
@@ -428,6 +435,8 @@ func (a *Adapter) Start(
 		stopped:   make(chan struct{}),
 		finish:    make(chan error, 1),
 		admitting: true,
+
+		durableIngress: durableIngress,
 	}
 	r.workers.Add(1)
 	a.mu.Lock()
@@ -435,7 +444,7 @@ func (a *Adapter) Start(
 	a.starting = false
 	a.mu.Unlock()
 	if a.observeIngress != nil {
-		r.removeIngress = a.observeIngress(r.handleIngress)
+		r.removeIngress = a.observeIngress(r.handleIngress, durableIngress)
 	}
 
 	go r.coordinate()
@@ -653,6 +662,10 @@ type run struct {
 	ctx     context.Context
 	cancel  context.CancelFunc
 
+	// durableIngress is whether the sink commits frames to a durable inbox
+	// (bridge.IngressDurability); without one every frame reports committed.
+	durableIngress bool
+
 	ready      chan struct{}
 	done       chan error
 	stopped    chan struct{}
@@ -763,11 +776,15 @@ type ingressErrorRecorder interface {
 var errIngressAdmissionClosed = errors.New("whatsapp lifecycle: generation no longer admits ingress")
 
 // handleIngress commits one frame under this generation. It returns nil once
-// the frame is committed (or there is no sink to commit it to) and the reason
-// otherwise, so the bridge can leave an uncommitted message for whatsmeow to
-// redeliver to a later generation (whatsapplive.Bridge.ObserveIngress).
+// the frame is committed (or this generation has no durable inbox to commit it
+// to) and the reason otherwise, so the bridge can leave an uncommitted message
+// for whatsmeow to redeliver to a later generation
+// (whatsapplive.Bridge.ObserveIngress).
 func (r *run) handleIngress(frame whatsapplive.IngressFrame) error {
 	if !r.admitCallback() {
+		if !r.durableIngress {
+			return nil
+		}
 		return errIngressAdmissionClosed
 	}
 	defer r.callbacks.Done()
@@ -785,6 +802,9 @@ func (r *run) handleIngress(frame whatsapplive.IngressFrame) error {
 		Payload:      frame.Payload,
 	})
 	if err == nil || errors.Is(err, bridge.ErrStaleGeneration) {
+		if !r.durableIngress {
+			return nil
+		}
 		return err
 	}
 	if recorder, ok := r.sink.(ingressErrorRecorder); ok {
@@ -792,6 +812,9 @@ func (r *run) handleIngress(frame whatsapplive.IngressFrame) error {
 	}
 	if r.adapter.logIngressError != nil {
 		r.adapter.logIngressError(err, r.request.AccountID, uint64(r.request.Generation))
+	}
+	if !r.durableIngress {
+		return nil
 	}
 	return err
 }

@@ -100,3 +100,23 @@ func TestConnectPairedReleasesTheHandlerContextOfAFailedDial(t *testing.T) {
 		t.Fatal("a failed dial left its handler context live")
 	}
 }
+
+// TestConnectPairedReportsTheCallersReasonForAnAbortedDial: the dial only sees
+// the handler context's cancellation, so the caller's own reason (a deadline)
+// is wrapped into the error.
+func TestConnectPairedReportsTheCallersReasonForAnAbortedDial(t *testing.T) {
+	bridge := newPairedBridgeForUnpairTest(t)
+	original := connectClientContext
+	t.Cleanup(func() { connectClientContext = original })
+	connectClientContext = func(ctx context.Context, _ *whatsmeow.Client) error {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+
+	runCtx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	err := bridge.ConnectPaired(runCtx)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("ConnectPaired() = %v, want it to wrap context.DeadlineExceeded", err)
+	}
+}

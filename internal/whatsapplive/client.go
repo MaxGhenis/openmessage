@@ -120,6 +120,13 @@ func connectWithDetachedHandlers(ctx context.Context, cli *whatsmeow.Client) err
 		// cancelled), or the dial failed and whatsmeow kept no handlers.
 		cancelHandlers()
 	}
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil && !errors.Is(err, ctxErr) {
+			// Keep the caller's reason (a deadline, say) visible: the dial
+			// only saw handlerCtx's cancellation.
+			err = fmt.Errorf("%w: %w", ctxErr, err)
+		}
+	}
 	return err
 }
 
@@ -242,6 +249,7 @@ type IngressFrame struct {
 type ingressObservation struct {
 	id       uint64
 	callback func(IngressFrame) error
+	durable  bool
 }
 
 // ErrIngressNotObserved reports a message that arrived while a lifecycle
@@ -351,10 +359,11 @@ type Bridge struct {
 	ingressObservation    ingressObservation
 	nextObserverID        uint64
 	nextIngressObserverID uint64
-	// ingressOwned is set once a lifecycle adapter installs an ingress
-	// observer. From then on a message that finds no observer is reported to
-	// whatsmeow as not handled instead of being dropped; a process that never
-	// observes ingress (no adapter) keeps the legacy-only behavior.
+	// ingressOwned is whether the most recently installed ingress observer
+	// commits frames to a durable inbox. While it is set, a message that finds
+	// no observer (it raced a generation's teardown) is reported to whatsmeow
+	// as not handled instead of being dropped from v2. Legacy-only installs
+	// (no v2 sink) and processes that never observe ingress leave it unset.
 	ingressOwned bool
 
 	runtimeMu    sync.Mutex
@@ -579,16 +588,19 @@ func (b *Bridge) ObserveLifecycle(callback func(LifecycleEvent)) func() {
 // error means the frame was not committed and a later delivery can succeed;
 // for a message, whatsmeow is then told the event was not handled, so it keeps
 // the decrypted plaintext in its event buffer, sends no receipt, and the
-// server redelivers it to a later generation.
-func (b *Bridge) ObserveIngress(callback func(IngressFrame) error) func() {
+// server redelivers it to a later generation. durable says whether the
+// observer commits to a durable inbox; only then does a message that later
+// finds no observer report not handled (see ingressOwned).
+func (b *Bridge) ObserveIngress(callback func(IngressFrame) error, durable bool) func() {
 	b.mu.Lock()
 	b.nextIngressObserverID++
 	id := b.nextIngressObserverID
 	b.ingressObservation = ingressObservation{
 		id:       id,
 		callback: callback,
+		durable:  durable,
 	}
-	b.ingressOwned = true
+	b.ingressOwned = durable
 	b.mu.Unlock()
 
 	return func() {
@@ -2047,13 +2059,15 @@ func (b *Bridge) handleEvent(raw any) {
 }
 
 // emitIngress hands one frame to the ingress observer and returns its result.
-// With no observer it returns ErrIngressNotObserved once an adapter owns
-// ingress, and nil before (legacy-only processes never observe ingress). A
+// With no observer it returns ErrIngressNotObserved when the last observer
+// committed to a durable inbox, and nil otherwise (legacy-only installs, and
+// processes that never observe ingress). A
 // panicking observer is a bug that a redelivery would repeat, so it is logged
 // and reported as handled, as before.
 func (b *Bridge) emitIngress(frame IngressFrame) (err error) {
 	b.mu.RLock()
 	observer := b.ingressObservation.callback
+	durable := b.ingressObservation.durable
 	owned := b.ingressOwned
 	b.mu.RUnlock()
 	if observer == nil {
@@ -2071,7 +2085,12 @@ func (b *Bridge) emitIngress(frame IngressFrame) (err error) {
 			err = nil
 		}
 	}()
-	return observer(frame)
+	if err := observer(frame); err != nil && durable {
+		return err
+	}
+	// A non-durable observer never commits a frame, so its errors cannot
+	// become a later commit either.
+	return nil
 }
 
 func (b *Bridge) hasIngressObserver() bool {
@@ -2082,7 +2101,7 @@ func (b *Bridge) hasIngressObserver() bool {
 }
 
 // wantsIngress reports whether a frame should be captured: an observer is
-// installed, or an adapter owns ingress and must be told the frame missed.
+// installed, or the last observer was durable and must be told the frame missed.
 func (b *Bridge) wantsIngress() bool {
 	b.mu.RLock()
 	wanted := b.ingressObservation.callback != nil || b.ingressOwned
@@ -2460,24 +2479,27 @@ func (b *Bridge) handleProtocolMessage(evt *waevents.Message) bool {
 	}
 }
 
-// handleMessage reports false, and skips the legacy handling, when the
-// message's ingress frame was not committed and a later delivery can commit it
-// (see ObserveIngress). The legacy store then sees the message once, on the
-// delivery that is reported handled.
+// handleMessage reports false when the message's ingress frame was not
+// committed and a later delivery can commit it (see ObserveIngress), so
+// whatsmeow keeps it for redelivery. The legacy store takes the message on
+// every delivery, as before: its writes are idempotent (upserts keyed by
+// message id, a max-timestamp conversation bump), and notifications are
+// deduped by message id, so a redelivery repeats nothing a reader sees.
 func (b *Bridge) handleMessage(evt *waevents.Message) bool {
 	if evt == nil || evt.Message == nil {
 		return true
 	}
 	chatJID := b.normalizeConversationJID(evt.Info.Chat)
+	committed := true
 	if err := b.captureMessageIngress(evt, chatJID); err != nil {
 		b.logger.Warn().
 			Err(err).
 			Str("msg_id", string(evt.Info.ID)).
 			Msg("WhatsApp message not committed to ingress; leaving it for redelivery")
-		return false
+		committed = false
 	}
 	b.handleLegacyMessage(evt, chatJID)
-	return true
+	return committed
 }
 
 func (b *Bridge) handleMessageWithoutIngress(evt *waevents.Message) {

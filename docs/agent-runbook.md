@@ -1430,18 +1430,23 @@ How it works now:
   (`EnableDecryptedEventBuffer`). The session store opens with
   `_txlock=immediate`, so that transaction waits for SQLite's write lock
   instead of failing with `SQLITE_BUSY` when another connection is writing.
-- The bridge reports a message handled only once its v2 ingress frame is
-  committed. A message that finds no observing generation, a closed
-  admission, a stale generation or an append error is reported not handled,
-  with the log line `WhatsApp message not committed to ingress; leaving it for
-  redelivery`. whatsmeow then keeps the plaintext and sends no delivery
-  receipt. When the server redelivers the stanza (it does so for an
-  unacknowledged message on a later connection; whatsmeow's event buffer is
-  built on that, and the tests simulate it rather than exercise the real
-  server), whatsmeow re-dispatches the buffered plaintext. The v2 inbox
-  dedupes it by key, and the legacy store and notifications see it only on
-  the delivery that is handled. A process that never ran a lifecycle adapter
-  keeps the old legacy-only behavior.
+- On an install with v2 ingest (a v2 sink behind the supervisor), the bridge
+  reports a message handled only once its v2 ingress frame is committed. A
+  message that finds no observing generation, a closed admission, a stale
+  generation or an append error is reported not handled, with the log line
+  `WhatsApp message not committed to ingress; leaving it for redelivery`.
+  whatsmeow then keeps the plaintext and sends no delivery receipt. When the
+  server redelivers the stanza (it does so for an unacknowledged message on a
+  later connection; whatsmeow's event buffer is built on that, and the tests
+  simulate it rather than exercise the real server), whatsmeow re-dispatches
+  the buffered plaintext and the v2 inbox dedupes it by key. An append error
+  leaves the message out of v2 until the next connection.
+- The legacy store takes every message on every delivery, as before. Its
+  writes are idempotent (upserts keyed by message id, a max-timestamp
+  conversation bump), and desktop notifications are deduped by message id.
+- On a legacy-only install (the default: no v2 sink), the supervisor's
+  generation sink reports `DurableIngress() == false`, every message is
+  reported handled, and whatsmeow acknowledges it as before.
 - The context `ConnectPaired` hands whatsmeow is cancelled by the generation
   only while it dials and handshakes. After that, teardown closes the socket,
   which ends the handler loop, and a handler that is already running finishes
@@ -1459,7 +1464,8 @@ Tests: `internal/whatsapplive/handler_teardown_test.go` sends real Signal
 ciphertext from a second Signal store through whatsmeow's real handler, the
 bridge, the adapter and the supervisor. It retires the generation before
 every session-store call for prekey, ordinary and group messages, with
-the handler context both detached and cancelled. It also covers an
+the handler context both detached and cancelled, on v2-ingest and
+legacy-only installs. It also covers an
 app-state patch interrupted between its version and MAC writes.
 
 ## signal-cli
