@@ -406,6 +406,13 @@ func forEachTeardownMode(t *testing.T, test func(t *testing.T, mode teardownMode
 // our device, as the peer's client does after fetching our keys.
 func (h *teardownHarness) startPeerSession() {
 	h.t.Helper()
+	h.startSessionFrom(h.peer)
+}
+
+// startSessionFrom builds a remote device's outgoing session to our device
+// from a prekey bundle of ours.
+func (h *teardownHarness) startSessionFrom(remote *store.Device) {
+	h.t.Helper()
 	ctx := context.Background()
 	our := h.cli.Store
 	oneTime, err := our.PreKeys.GenOnePreKey(ctx)
@@ -418,7 +425,7 @@ func (h *teardownHarness) startPeerSession() {
 		ecc.NewDjbECPublicKey(*oneTime.Pub), ecc.NewDjbECPublicKey(*our.SignedPreKey.Pub), *our.SignedPreKey.Signature,
 		identity.NewKey(ecc.NewDjbECPublicKey(*our.IdentityKey.Pub)),
 	)
-	builder := session.NewBuilderFromSignal(h.peer, h.ourJID.SignalAddress(), store.SignalProtobufSerializer)
+	builder := session.NewBuilderFromSignal(remote, h.ourJID.SignalAddress(), store.SignalProtobufSerializer)
 	if err := builder.ProcessBundle(ctx, bundle); err != nil {
 		h.t.Fatalf("peer ProcessBundle(): %v", err)
 	}
@@ -440,7 +447,13 @@ func marshalForTeardownTest(t *testing.T, message *waE2E.Message) []byte {
 // encryptToUs encrypts one Signal message from the peer to our device.
 func (h *teardownHarness) encryptToUs(message *waE2E.Message) waBinary.Node {
 	h.t.Helper()
-	builder := session.NewBuilderFromSignal(h.peer, h.ourJID.SignalAddress(), store.SignalProtobufSerializer)
+	return h.encryptToUsFrom(h.peer, message)
+}
+
+// encryptToUsFrom encrypts one Signal message from a remote device to ours.
+func (h *teardownHarness) encryptToUsFrom(remote *store.Device, message *waE2E.Message) waBinary.Node {
+	h.t.Helper()
+	builder := session.NewBuilderFromSignal(remote, h.ourJID.SignalAddress(), store.SignalProtobufSerializer)
 	ciphertext, err := session.NewCipher(builder, h.ourJID.SignalAddress()).Encrypt(context.Background(), marshalForTeardownTest(h.t, message))
 	if err != nil {
 		h.t.Fatalf("peer Encrypt(): %v", err)
