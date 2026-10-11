@@ -278,26 +278,51 @@ func newTeardownHarness(t *testing.T, mode teardownMode) *teardownHarness {
 		t.Fatalf("db.New(): %v", err)
 	}
 	t.Cleanup(func() { _ = messages.Close() })
-	logger := zerolog.Nop()
-	if os.Getenv("OPENMESSAGE_TEARDOWN_TEST_LOG") != "" {
-		logger = zerolog.New(zerolog.ConsoleWriter{Out: os.Stderr}).With().Timestamp().Logger()
-	}
-	host, err := whatsapplive.New(sessionPath, messages, logger, whatsapplive.Callbacks{})
-	if err != nil {
-		t.Fatalf("whatsapplive.New(): %v", err)
-	}
-	t.Cleanup(func() { _ = host.Close() })
 
 	dials := make(chan context.Context, 8)
 	whatsapplive.StubDialForTeardownTest(t, func(ctx context.Context, _ *whatsmeow.Client) error {
 		dials <- ctx
 		return nil
 	})
-	sink := &teardownSink{}
-	gate := newBackoffGate()
+	peerJID := watypes.JID{User: "15559870000", Server: watypes.DefaultUserServer}
+	h := &teardownHarness{
+		t:                t,
+		cancelOnTeardown: mode.cancelOnTeardown,
+		legacyOnly:       mode.legacyOnly,
+		messages:         messages,
+		sink:             &teardownSink{},
+		gate:             newBackoffGate(),
+		dials:            dials,
+		sessionPath:      sessionPath,
+		ourJID:           ourJID,
+		peerJID:          peerJID,
+		peer:             whatsapplive.NewPeerDeviceForTeardownTest(t, filepath.Join(dir, "peer-session.db"), peerJID),
+		groupJID:         watypes.JID{User: "120363000000000001", Server: watypes.GroupServer},
+	}
+	h.startProcess()
+	return h
+}
+
+// startProcess starts what one run of the app starts for WhatsApp: a bridge
+// on the harness's session database, its lifecycle adapter and a supervisor
+// committing to the harness's sink (none on a legacy-only install). The
+// legacy store, the sink and the remote devices outlive it.
+func (h *teardownHarness) startProcess() {
+	t := h.t
+	t.Helper()
+	logger := zerolog.Nop()
+	if os.Getenv("OPENMESSAGE_TEARDOWN_TEST_LOG") != "" {
+		logger = zerolog.New(zerolog.ConsoleWriter{Out: os.Stderr}).With().Timestamp().Logger()
+	}
+	host, err := whatsapplive.New(h.sessionPath, h.messages, logger, whatsapplive.Callbacks{})
+	if err != nil {
+		t.Fatalf("whatsapplive.New(): %v", err)
+	}
+	t.Cleanup(func() { _ = host.Close() })
+	gate := h.gate
 	options := []bridge.SupervisorOption{}
-	if !mode.legacyOnly {
-		options = append(options, bridge.WithConnectionSink(sink))
+	if !h.legacyOnly {
+		options = append(options, bridge.WithConnectionSink(h.sink))
 	}
 	supervisor, err := bridge.NewSupervisor(
 		"whatsapp-primary",
@@ -330,25 +355,31 @@ func newTeardownHarness(t *testing.T, mode teardownMode) *teardownHarness {
 	if err := supervisor.Start(startCtx, bridge.StartRequest{}); err != nil {
 		t.Fatalf("Supervisor.Start(): %v", err)
 	}
+	h.host = host
+	h.cli = whatsapplive.ClientForTeardownTest(host)
+	h.supervisor = supervisor
+}
 
-	peerJID := watypes.JID{User: "15559870000", Server: watypes.DefaultUserServer}
-	return &teardownHarness{
-		t:                t,
-		cancelOnTeardown: mode.cancelOnTeardown,
-		legacyOnly:       mode.legacyOnly,
-		host:             host,
-		cli:              whatsapplive.ClientForTeardownTest(host),
-		messages:         messages,
-		supervisor:       supervisor,
-		sink:             sink,
-		gate:             gate,
-		dials:            dials,
-		sessionPath:      sessionPath,
-		ourJID:           ourJID,
-		peerJID:          peerJID,
-		peer:             whatsapplive.NewPeerDeviceForTeardownTest(t, filepath.Join(dir, "peer-session.db"), peerJID),
-		groupJID:         watypes.JID{User: "120363000000000001", Server: watypes.GroupServer},
+// restartProcess ends this run the way quitting the app does (the supervisor
+// stops its generation and the bridge closes) and starts the next run on the
+// same session database. The next generation stays held until
+// awaitGeneration.
+func (h *teardownHarness) restartProcess() {
+	h.t.Helper()
+	h.gate.hold()
+	ctx, cancel := context.WithTimeout(context.Background(), teardownTestTimeout)
+	defer cancel()
+	if err := h.supervisor.Stop(ctx); err != nil {
+		h.t.Fatalf("Supervisor.Stop(): %v", err)
 	}
+	if err := h.host.Close(); err != nil {
+		h.t.Fatalf("Bridge.Close(): %v", err)
+	}
+	if h.cancelHandlers != nil {
+		h.cancelHandlers()
+		h.cancelHandlers = nil
+	}
+	h.startProcess()
 }
 
 // awaitGeneration lets the next generation start, waits for the supervisor to
