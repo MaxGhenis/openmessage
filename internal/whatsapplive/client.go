@@ -359,6 +359,14 @@ type Bridge struct {
 	ingressObservation    ingressObservation
 	nextObserverID        uint64
 	nextIngressObserverID uint64
+	// legacyAhead holds the ingress dedupe keys of messages the legacy store
+	// took on a delivery whose v2 frame did not commit, with when. Their
+	// redelivery (whatsmeow re-dispatches the buffered plaintext) skips the
+	// legacy write: re-upserting would undo an edit, revoke or receipt status
+	// applied to the row in between. The set lives in memory, so after a
+	// restart a redelivery writes legacy again.
+	legacyAheadMu sync.Mutex
+	legacyAhead   map[string]time.Time
 	// ingressOwned is whether the most recently installed ingress observer
 	// commits frames to a durable inbox. While it is set, a message that finds
 	// no observer (it raced a generation's teardown) is reported to whatsmeow
@@ -2114,24 +2122,24 @@ func (b *Bridge) wantsIngress() bool {
 // frame that cannot be built (a marshal failure or a panic while building it)
 // or that panics the observer would fail the same way again, so it is logged
 // and reported as handled, as before.
-func (b *Bridge) captureMessageIngress(evt *waevents.Message, chatJID watypes.JID) (deliveryErr error) {
+func (b *Bridge) captureMessageIngress(evt *waevents.Message, chatJID watypes.JID) (dedupeKey string, deliveryErr error) {
 	// Capture is strictly additive observation: a panic anywhere in the
 	// capture body must not reach the whatsmeow callback or skip the legacy
 	// handling that follows it.
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			b.logIngressCaptureError("message", fmt.Errorf("capture panic: %v", recovered))
-			deliveryErr = nil
+			dedupeKey, deliveryErr = "", nil
 		}
 	}()
 	if !b.wantsIngress() {
-		return nil
+		return "", nil
 	}
 	receivedAt := time.Now()
 	protoBytes, err := proto.Marshal(evt.Message)
 	if err != nil {
 		b.logIngressCaptureError("message", err)
-		return nil
+		return "", nil
 	}
 
 	senderJID := b.canonicalJID(evt.Info.Sender).String()
@@ -2156,10 +2164,11 @@ func (b *Bridge) captureMessageIngress(evt *waevents.Message, chatJID watypes.JI
 	})
 	if err != nil {
 		b.logIngressCaptureError("message", err)
-		return nil
+		return "", nil
 	}
-	return b.emitIngress(IngressFrame{
-		DedupeKey:  "msg:" + string(evt.Info.ID) + ":" + ingressHash8(protoBytes),
+	dedupeKey = "msg:" + string(evt.Info.ID) + ":" + ingressHash8(protoBytes)
+	return dedupeKey, b.emitIngress(IngressFrame{
+		DedupeKey:  dedupeKey,
 		ReceivedAt: receivedAt,
 		Payload:    payload,
 	})
@@ -2482,24 +2491,60 @@ func (b *Bridge) handleProtocolMessage(evt *waevents.Message) bool {
 // handleMessage reports false when the message's ingress frame was not
 // committed and a later delivery can commit it (see ObserveIngress), so
 // whatsmeow keeps it for redelivery. The legacy store takes the message on
-// every delivery, as before: its writes are idempotent (upserts keyed by
-// message id, a max-timestamp conversation bump), and notifications are
-// deduped by message id, so a redelivery repeats nothing a reader sees.
+// its first delivery either way, as before; a redelivery of the same frame
+// skips the legacy write (see legacyAhead).
 func (b *Bridge) handleMessage(evt *waevents.Message) bool {
 	if evt == nil || evt.Message == nil {
 		return true
 	}
 	chatJID := b.normalizeConversationJID(evt.Info.Chat)
-	committed := true
-	if err := b.captureMessageIngress(evt, chatJID); err != nil {
+	dedupeKey, err := b.captureMessageIngress(evt, chatJID)
+	committed := err == nil
+	if !committed {
 		b.logger.Warn().
 			Err(err).
 			Str("msg_id", string(evt.Info.ID)).
 			Msg("WhatsApp message not committed to ingress; leaving it for redelivery")
-		committed = false
 	}
-	b.handleLegacyMessage(evt, chatJID)
+	if b.legacyTakesDelivery(dedupeKey, committed, time.Now()) {
+		b.handleLegacyMessage(evt, chatJID)
+	}
 	return committed
+}
+
+// legacyAheadRetention bounds legacyAhead: whatsmeow drops buffered
+// plaintext after 14 days (DeleteOldBufferedHashes), so no redelivery of an
+// older entry can arrive.
+const legacyAheadRetention = 15 * 24 * time.Hour
+
+// legacyTakesDelivery reports whether the legacy store should take this
+// delivery of a message frame, and records an uncommitted one in legacyAhead.
+// A delivery whose frame the legacy store already took while v2 had not
+// committed it is skipped; a committed delivery clears the record.
+func (b *Bridge) legacyTakesDelivery(dedupeKey string, committed bool, now time.Time) bool {
+	if dedupeKey == "" {
+		return true
+	}
+	b.legacyAheadMu.Lock()
+	defer b.legacyAheadMu.Unlock()
+	_, ahead := b.legacyAhead[dedupeKey]
+	if committed {
+		delete(b.legacyAhead, dedupeKey)
+		return !ahead
+	}
+	if ahead {
+		return false
+	}
+	if b.legacyAhead == nil {
+		b.legacyAhead = make(map[string]time.Time)
+	}
+	for key, at := range b.legacyAhead {
+		if now.Sub(at) > legacyAheadRetention {
+			delete(b.legacyAhead, key)
+		}
+	}
+	b.legacyAhead[dedupeKey] = now
+	return true
 }
 
 func (b *Bridge) handleMessageWithoutIngress(evt *waevents.Message) {

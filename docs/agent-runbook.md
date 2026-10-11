@@ -1441,9 +1441,12 @@ How it works now:
   simulate it rather than exercise the real server), whatsmeow re-dispatches
   the buffered plaintext and the v2 inbox dedupes it by key. An append error
   leaves the message out of v2 until the next connection.
-- The legacy store takes every message on every delivery, as before. Its
-  writes are idempotent (upserts keyed by message id, a max-timestamp
-  conversation bump), and desktop notifications are deduped by message id.
+- The legacy store takes a message on its first delivery whether or not v2
+  committed it, as before. When the redelivery of a frame legacy already took
+  without a v2 commit arrives, the legacy write is skipped, so an edit, revoke
+  or receipt status applied to the row in between is not undone. The bridge
+  remembers those frames in memory, so after a restart a redelivery writes
+  legacy again.
 - On a legacy-only install (the default: no v2 sink), the supervisor's
   generation sink reports `DurableIngress() == false`, every message is
   reported handled, and whatsmeow acknowledges it as before.

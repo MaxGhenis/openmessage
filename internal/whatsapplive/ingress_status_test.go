@@ -3,10 +3,13 @@ package whatsapplive
 import (
 	"errors"
 	"fmt"
+	"math/rand"
 	"testing"
+	"testing/quick"
 	"time"
 
 	"go.mau.fi/whatsmeow"
+	waCommon "go.mau.fi/whatsmeow/proto/waCommon"
 	waE2E "go.mau.fi/whatsmeow/proto/waE2E"
 	waHistorySync "go.mau.fi/whatsmeow/proto/waHistorySync"
 	wastore "go.mau.fi/whatsmeow/store"
@@ -160,5 +163,149 @@ func TestUnhandledMessageIsCommittedOnRedelivery(t *testing.T) {
 	}
 	if len(messages) != 1 {
 		t.Fatalf("legacy store holds %d rows after two deliveries, want 1", len(messages))
+	}
+}
+
+func statusTestMessage(chat watypes.JID, id watypes.MessageID, message *waE2E.Message) *waevents.Message {
+	return &waevents.Message{
+		Info: watypes.MessageInfo{
+			MessageSource: watypes.MessageSource{Chat: chat, Sender: chat},
+			ID:            id,
+			Timestamp:     time.UnixMilli(1775006200000),
+		},
+		Message: message,
+	}
+}
+
+// TestRedeliveryDoesNotUndoWhatLegacyAppliedInBetween: the legacy store took
+// a message on a delivery v2 did not commit, then an edit (or a revoke) of it
+// was applied; the redelivery of the original must not write the original
+// body back (or bring the revoked message back). A resend with different
+// content (a repaired undecryptable message, say) is a different frame and
+// still updates the row.
+func TestRedeliveryDoesNotUndoWhatLegacyAppliedInBetween(t *testing.T) {
+	chat := watypes.NewJID("15551234567", watypes.DefaultUserServer)
+	original := statusTestMessage(chat, "original", &waE2E.Message{Conversation: proto.String("original text")})
+
+	for _, change := range []string{"edit", "revoke"} {
+		t.Run(change, func(t *testing.T) {
+			store, err := db.New(":memory:")
+			if err != nil {
+				t.Fatalf("db.New(): %v", err)
+			}
+			t.Cleanup(func() { _ = store.Close() })
+			bridge := &Bridge{store: store}
+			bridge.ObserveIngress(func(IngressFrame) error { return nil }, true)() // durable, now gone
+
+			if bridge.handleClientEvent(nil, 0, original) {
+				t.Fatal("the first delivery was reported handled with no observing generation")
+			}
+			protocol := &waE2E.ProtocolMessage{Key: &waCommon.MessageKey{ID: proto.String("original")}}
+			if change == "edit" {
+				protocol.Type = waE2E.ProtocolMessage_MESSAGE_EDIT.Enum()
+				protocol.EditedMessage = &waE2E.Message{Conversation: proto.String("edited text")}
+			} else {
+				protocol.Type = waE2E.ProtocolMessage_REVOKE.Enum()
+			}
+			bridge.handleClientEvent(nil, 0, statusTestMessage(chat, "protocol-"+watypes.MessageID(change), &waE2E.Message{ProtocolMessage: protocol}))
+
+			bridge.handleClientEvent(nil, 0, original) // redelivery, still uncommitted
+			bridge.ObserveIngress(func(IngressFrame) error { return nil }, true)
+			if !bridge.handleClientEvent(nil, 0, original) { // redelivery, committed
+				t.Fatal("the committed redelivery was reported not handled")
+			}
+
+			stored, err := store.GetMessageByID("whatsapp:original")
+			if err != nil {
+				t.Fatalf("GetMessageByID(): %v", err)
+			}
+			switch change {
+			case "edit":
+				if stored == nil || stored.Body != "edited text" {
+					t.Fatalf("legacy row after redelivery = %+v, want the edit kept", stored)
+				}
+			case "revoke":
+				if stored != nil {
+					t.Fatalf("legacy row after redelivery = %+v, want the revoked message to stay deleted", stored)
+				}
+			}
+		})
+	}
+
+	t.Run("resend with different content", func(t *testing.T) {
+		store, err := db.New(":memory:")
+		if err != nil {
+			t.Fatalf("db.New(): %v", err)
+		}
+		t.Cleanup(func() { _ = store.Close() })
+		bridge := &Bridge{store: store}
+		bridge.ObserveIngress(func(IngressFrame) error { return nil }, true)()
+		bridge.handleClientEvent(nil, 0, original)
+		bridge.handleClientEvent(nil, 0, statusTestMessage(chat, "original", &waE2E.Message{Conversation: proto.String("resent text")}))
+		if stored, err := store.GetMessageByID("whatsapp:original"); err != nil || stored == nil || stored.Body != "resent text" {
+			t.Fatalf("legacy row after a different-content resend = %+v, %v; want it updated", stored, err)
+		}
+	})
+}
+
+// legacyTakesModel is the reference semantics of legacyTakesDelivery: per
+// frame, the legacy store takes a delivery iff no uncommitted delivery of the
+// frame is pending (one taken since the frame's last committed delivery, no
+// older than the retention); every uncommitted delivery leaves one pending,
+// and a committed one clears it. Pending entries are pruned only when an
+// uncommitted delivery records one, as in the implementation.
+type legacyTakesModel struct {
+	pending map[string]time.Time
+}
+
+func (m *legacyTakesModel) deliver(key string, committed bool, now time.Time) bool {
+	if key == "" {
+		return true
+	}
+	_, isPending := m.pending[key]
+	if committed {
+		delete(m.pending, key)
+		return !isPending
+	}
+	if isPending {
+		return false
+	}
+	for k, t := range m.pending {
+		if now.Sub(t) > legacyAheadRetention {
+			delete(m.pending, k)
+		}
+	}
+	m.pending[key] = now
+	return true
+}
+
+// TestLegacyTakesDeliveryMatchesItsModel is a differential property test:
+// over random delivery sequences (a small key space, both outcomes, time
+// steps that cross the retention), the implementation and the model agree on
+// every delivery.
+func TestLegacyTakesDeliveryMatchesItsModel(t *testing.T) {
+	type step struct {
+		Key       uint8
+		Committed bool
+		AdvanceH  uint16
+	}
+	property := func(steps []step) bool {
+		bridge := &Bridge{}
+		model := &legacyTakesModel{pending: map[string]time.Time{}}
+		now := time.Unix(1775000000, 0)
+		for _, s := range steps {
+			now = now.Add(time.Duration(s.AdvanceH%400) * time.Hour)
+			key := ""
+			if s.Key%5 != 0 {
+				key = fmt.Sprintf("msg:k%d:00000000", s.Key%5)
+			}
+			if got, want := bridge.legacyTakesDelivery(key, s.Committed, now), model.deliver(key, s.Committed, now); got != want {
+				return false
+			}
+		}
+		return len(bridge.legacyAhead) == len(model.pending)
+	}
+	if err := quick.Check(property, &quick.Config{MaxCount: 2000, Rand: rand.New(rand.NewSource(20261011))}); err != nil {
+		t.Fatal(err)
 	}
 }
