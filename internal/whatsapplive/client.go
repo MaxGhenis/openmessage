@@ -258,11 +258,12 @@ type ingressObservation struct {
 	durable  bool
 }
 
-// ErrIngressNotObserved reports a message that arrived while a lifecycle
+// ErrIngressNotObserved reports a frame that arrived while a lifecycle
 // adapter owns durable ingress but no generation is accepting it: the frame
-// raced a generation's teardown. The message is reported to whatsmeow as not
-// handled, so whatsmeow keeps its decrypted plaintext and sends no receipt,
-// and the next generation receives it again.
+// raced a generation's teardown. The bridge holds such a frame in its ingress
+// spool for the next generation; a message the spool cannot take is reported
+// to whatsmeow as not handled, so whatsmeow keeps its decrypted plaintext and
+// sends no receipt, and the next generation receives it again.
 var ErrIngressNotObserved = errors.New("whatsapp ingress: no lifecycle generation is accepting frames")
 
 type whatsappMessageIngressEnvelope struct {
@@ -2047,9 +2048,9 @@ func (b *Bridge) ProfilePhoto(conversationID string) ([]byte, string, error) {
 // compatibility status projection or the supervisor observer is notified.
 //
 // It returns whatsmeow's handler success status: false only for a message
-// whose ingress frame was not committed and can be on a later delivery (see
-// ObserveIngress). Every other event, and every event from a retired client,
-// reports success.
+// whose ingress frame was neither committed nor held in the ingress spool, so
+// a later delivery must commit it (see ObserveIngress). Every other event, and
+// every event from a retired client, reports success.
 func (b *Bridge) handleClientEvent(source *whatsmeow.Client, generation uint64, raw any) bool {
 	b.mu.RLock()
 	current := source == nil || (b.client == source && b.clientGeneration == generation)
@@ -2470,8 +2471,8 @@ func (b *Bridge) logIngressCaptureError(kind string, err error) {
 	b.logger.Warn().Err(err).Str("kind", kind).Msg("Failed to capture WhatsApp ingress frame")
 }
 
-// applyEvent returns false only for a message whose ingress frame was not
-// committed and can be on a later delivery.
+// applyEvent returns false only for a message whose ingress frame was neither
+// committed nor held, so a later delivery must commit it.
 func (b *Bridge) applyEvent(raw any) bool {
 	switch evt := raw.(type) {
 	case *waevents.Connected:
