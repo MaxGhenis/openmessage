@@ -1622,10 +1622,16 @@ How it works now:
     another account paired) is removed with no download and no receipt.
 - The table holds at most 4,096 notifications and 64 MiB. A full table means
   downloads have failed, or v2 has refused chunks, for a long time.
-- The legacy store takes a chunk after it is committed or held, as it does
-  messages. If the process ends between v2's commit and the legacy write, the
-  next run downloads the chunk again and both get it. If that download finds
-  the server copy gone, the chunk is in v2 only.
+- The legacy store takes a chunk the first time the pump applies it,
+  whatever v2 did with it, as it takes a message on its first delivery. A
+  later application of a chunk it already stored without a v2 commit skips
+  the legacy write (the in-memory `legacyAhead` set), so an edit or revoke in
+  between survives. After a restart the chunk is written again. If the
+  process ends after v2 commits a chunk and before the legacy write, the next
+  run downloads it again and both stores get it. If that download finds the
+  server copy gone, the chunk is in v2 only.
+- On an install without v2 (legacy-only), the same window lost the chunk from
+  the legacy store, and the queue covers it there too.
 
 Log lines: `Queued a WhatsApp history-sync notification` (debug),
 `Committed a WhatsApp history-sync chunk` (info, with `attempts`),
@@ -1657,8 +1663,9 @@ commit, and that a notification the full table refuses stays in whatsmeow's
 event buffer until its redelivery is queued.
 `TestHistoryNotificationSurvivesAnExitBeforeItsChunkIsDispatched` (in
 `generation_gap_test.go`) ends the process after the notification was
-handled and before its chunk was dispatched, and finds the chunk in v2 after
-the restart. `history_sync_queue_test.go` checks the table against a model.
+handled and before its chunk was dispatched. After the restart it finds the
+chunk in v2 and the legacy store, and on a legacy-only install in the legacy
+store. `history_sync_queue_test.go` checks the table against a model.
 `history_sync_pump_test.go` checks each failure class.
 `history_sync_interleaving_test.go` runs every sequence of up to four events
 (notifications, passes with each outcome, crashes inside a download, after a
