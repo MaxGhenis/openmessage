@@ -109,6 +109,9 @@ type APIOptions struct {
 	PairWhatsAppPhone     func(phone string) (string, error)
 	UnpairWhatsApp        func() error
 	SignalStatus          func() any
+	// LocalImports reports whether the daemon runs the local desktop
+	// importers (WhatsApp Desktop, Signal Desktop, iMessage) and why not.
+	LocalImports          func() any
 	ConnectSignal         func() error
 	ReplaySignalRecovery  func() error
 	UnpairSignal          func() error
@@ -332,6 +335,9 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		}
 		if opts.SignalStatus != nil {
 			payload["signal"] = opts.SignalStatus()
+		}
+		if opts.LocalImports != nil {
+			payload["local_imports"] = opts.LocalImports()
 		}
 		if opts.BackfillStatus != nil {
 			payload["backfill"] = opts.BackfillStatus()
