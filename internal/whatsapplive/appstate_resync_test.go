@@ -175,9 +175,16 @@ func awaitResync(t *testing.T, resyncs <-chan appStateResync, why string) appSta
 // next patch touching the corrupted contact fails to verify, whatsmeow
 // dispatches AppStateSyncError, OpenMessage resyncs the collection, the
 // contact store shows the phone's current name, and the patch after that
-// applies.
+// applies. It runs on both install shapes: with v2 ingest and legacy-only
+// (the default install).
 func TestStuckContactListRecoversAfterAppStateSyncError(t *testing.T) {
-	h := newTeardownHarness(t, false)
+	for _, mode := range []teardownMode{{}, {legacyOnly: true}} {
+		t.Run(mode.String(), func(t *testing.T) { testStuckContactListRecovers(t, mode) })
+	}
+}
+
+func testStuckContactListRecovers(t *testing.T, mode teardownMode) {
+	h := newTeardownHarness(t, mode)
 	ctx, _ := h.awaitGeneration()
 	interrupter := h.installAppStateInterrupter()
 	phone := h.newAppStatePhone()
@@ -273,7 +280,7 @@ func requireResyncs(t *testing.T, calls <-chan appstate.WAPatchName, want ...app
 // one resync per collection is in flight; and starts honor the cooldown and
 // the cap per window.
 func TestAppStateResyncRunsOffTheEventGoroutineOncePerCollection(t *testing.T) {
-	h := newTeardownHarness(t, false)
+	h := newTeardownHarness(t, teardownMode{})
 	h.awaitGeneration()
 	clock := newResyncClock(t)
 	whatsapplive.SetAppStateResyncLimitsForTest(t, time.Minute, 2, time.Hour)
@@ -337,7 +344,7 @@ func TestAppStateResyncRunsOffTheEventGoroutineOncePerCollection(t *testing.T) {
 // whatsmeow can report and checks that only a disagreeing stored state starts
 // a resync.
 func TestAppStateResyncOnlyAnswersStateMismatches(t *testing.T) {
-	h := newTeardownHarness(t, false)
+	h := newTeardownHarness(t, teardownMode{})
 	h.awaitGeneration()
 	newResyncClock(t)
 	calls := make(chan appstate.WAPatchName, 16)
@@ -384,7 +391,7 @@ func TestFullResyncRestoresTheCurrentContactNames(t *testing.T) {
 
 func testFullResyncRestoresTheCurrentContactNames(t *testing.T, seed int64) {
 	rng := rand.New(rand.NewSource(seed))
-	h := newTeardownHarness(t, false)
+	h := newTeardownHarness(t, teardownMode{})
 	ctx, _ := h.awaitGeneration()
 	clock := newResyncClock(t)
 	whatsapplive.SetAppStateResyncLimitsForTest(t, time.Minute, 1000, time.Hour)
@@ -468,7 +475,7 @@ func testFullResyncRestoresTheCurrentContactNames(t *testing.T, seed int64) {
 // off before the snapshot arrives leaves version 0, which whatsmeow's next
 // fetch of the collection turns into a full sync.
 func TestProductionFullSyncResetsTheStoredVersion(t *testing.T) {
-	h := newTeardownHarness(t, false)
+	h := newTeardownHarness(t, teardownMode{})
 	ctx, _ := h.awaitGeneration()
 	phone := h.newAppStatePhone()
 	contact := watypes.JID{User: "15550001111", Server: watypes.DefaultUserServer}
@@ -503,7 +510,7 @@ func TestProductionFullSyncResetsTheStoredVersion(t *testing.T) {
 // cancels a running resync and waits for it, and that a retired client's
 // error starts nothing.
 func TestCloseCancelsAnAppStateResyncInFlight(t *testing.T) {
-	h := newTeardownHarness(t, false)
+	h := newTeardownHarness(t, teardownMode{})
 	h.awaitGeneration()
 	newResyncClock(t)
 	var started atomic.Int32
