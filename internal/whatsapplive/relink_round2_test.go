@@ -217,6 +217,45 @@ func TestLogoutBeforePairSuccessIsNotUndone(t *testing.T) {
 }
 
 // A PairSuccess or Connected from a client replaced while the event was in
+// flight must not end the successor's own pairing attempt.
+func TestRetiredPairSuccessAndConnectedLeaveANewPairingAlone(t *testing.T) {
+	for _, event := range []struct {
+		name string
+		raw  any
+	}{
+		{"PairSuccess", &waevents.PairSuccess{ID: relinkTestJID}},
+		{"Connected", &waevents.Connected{}},
+	} {
+		t.Run(event.name, func(t *testing.T) {
+			sessionPath := relinkTestSessionPath(t)
+			b := openRelinkTestBridgeWithStore(t, sessionPath)
+			StubConnectForTest(t, func(context.Context, *whatsmeow.Client) error {
+				return errors.New("offline")
+			})
+			source, generation := currentGeneration(b)
+			emulatePairingSaveForTest(t, b, relinkTestJID)
+
+			original := testHookAfterAdmission
+			t.Cleanup(func() { testHookAfterAdmission = original })
+			testHookAfterAdmission = func(any) {
+				testHookAfterAdmission = nil
+				if err := b.Unpair(); err != nil {
+					t.Errorf("Unpair(): %v", err)
+				}
+				if _, err := b.PrepareQRPairing(context.Background()); err != nil {
+					t.Errorf("PrepareQRPairing(): %v", err)
+				}
+			}
+			b.handleClientEvent(source, generation, event.raw)
+
+			if status := b.Status(); !status.Pairing || !status.Connecting || status.Paired {
+				t.Fatalf("status = %+v, want the successor's pairing attempt still running", status)
+			}
+		})
+	}
+}
+
+// A PairSuccess or Connected from a client replaced while the event was in
 // flight (an unpair, possibly followed at once by a new link) must not
 // install its identity on the successor or mark the successor connected.
 func TestRetiredPairSuccessAndConnectedAreIgnored(t *testing.T) {
