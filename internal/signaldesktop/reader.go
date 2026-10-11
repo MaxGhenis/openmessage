@@ -101,6 +101,7 @@ type Stats struct {
 	AccountVerified          bool             `json:"account_verified"`
 	AttachmentSource         string           `json:"attachment_source"`
 	ChatsResolved            int64            `json:"chats_resolved"`
+	ChatsBoundInV2           map[string]int64 `json:"chats_bound_in_v2"`
 	ChatsSkippedByReason     map[string]int64 `json:"chats_skipped_by_reason"`
 	RowsScanned              int64            `json:"rows_scanned"`
 	RowsIncluded             int64            `json:"rows_included"`
@@ -118,6 +119,7 @@ func newStats(afterRowID int64) Stats {
 	return Stats{
 		HighWaterRowID:           afterRowID,
 		ChatsSkippedByReason:     map[string]int64{},
+		ChatsBoundInV2:           map[string]int64{},
 		RowsSkippedByReason:      map[string]int64{},
 		RowsSinceSkippedByReason: map[string]int64{},
 	}
@@ -362,6 +364,13 @@ func (r *Reader) Scan(ctx context.Context, facts *Facts, options ScanOptions, em
 		}
 		chats[state.chat.RemoteID] = state
 		stats.ChatsResolved++
+		if facts.Bound(state.chat.RemoteID) {
+			kind := "direct"
+			if state.chat.Group {
+				kind = "group"
+			}
+			stats.ChatsBoundInV2[kind]++
+		}
 	}
 	skipAmbiguousGroupRosters(chats, facts, &stats)
 
