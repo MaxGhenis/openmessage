@@ -166,12 +166,14 @@ func TestSignalDesktopHistoryRecordRejectsWhatLiveWouldNotKey(t *testing.T) {
 		"account not E.164":       func(s *SignalDesktopHistorySnapshot) { s.AccountAddress = sdhPeerACI },
 		"conversation PNI":        func(s *SignalDesktopHistorySnapshot) { s.RemoteConversationID = "signal:PNI:" + sdhPeerACI },
 		"conversation bad prefix": func(s *SignalDesktopHistorySnapshot) { s.RemoteConversationID = "whatsapp:" + sdhPeerE164 },
-		"uppercase ACI":           func(s *SignalDesktopHistorySnapshot) { s.RemoteConversationID = "signal:" + strings.ToUpper(sdhPeerACI) },
-		"group ID not base64":     func(s *SignalDesktopHistorySnapshot) { s.RemoteConversationID = "signal-group:not base64!" },
-		"author not peer":         func(s *SignalDesktopHistorySnapshot) { s.Messages[0].AuthorAddress = sdhOtherACI },
-		"author missing":          func(s *SignalDesktopHistorySnapshot) { s.Messages[0].AuthorAddress = "" },
-		"no sent time":            func(s *SignalDesktopHistorySnapshot) { s.Messages[0].SentAtMS = 0 },
-		"participant PNI":         func(s *SignalDesktopHistorySnapshot) { s.Participants[0].Address = "PNI:" + sdhPeerACI },
+		"uppercase ACI": func(s *SignalDesktopHistorySnapshot) {
+			s.RemoteConversationID = "signal:" + strings.ToUpper(sdhPeerACI)
+		},
+		"group ID not base64": func(s *SignalDesktopHistorySnapshot) { s.RemoteConversationID = "signal-group:not base64!" },
+		"author not peer":     func(s *SignalDesktopHistorySnapshot) { s.Messages[0].AuthorAddress = sdhOtherACI },
+		"author missing":      func(s *SignalDesktopHistorySnapshot) { s.Messages[0].AuthorAddress = "" },
+		"no sent time":        func(s *SignalDesktopHistorySnapshot) { s.Messages[0].SentAtMS = 0 },
+		"participant PNI":     func(s *SignalDesktopHistorySnapshot) { s.Participants[0].Address = "PNI:" + sdhPeerACI },
 		"reaction not peer": func(s *SignalDesktopHistorySnapshot) {
 			s.Messages[0].Reactions = []SignalDesktopHistoryReaction{{ActorAddress: sdhOtherACI, Emoji: "👍"}}
 		},
@@ -256,7 +258,9 @@ func TestSignalDesktopHistoryRecordDedupeKeyIgnoresInputOrderAndReceiptTime(t *t
 		shuffled := snapshot
 		shuffled.Messages = append([]SignalDesktopHistoryMessage(nil), snapshot.Messages...)
 		shuffled.Participants = append([]SignalDesktopHistoryParticipant(nil), snapshot.Participants...)
-		random.Shuffle(len(shuffled.Messages), func(i, j int) { shuffled.Messages[i], shuffled.Messages[j] = shuffled.Messages[j], shuffled.Messages[i] })
+		random.Shuffle(len(shuffled.Messages), func(i, j int) {
+			shuffled.Messages[i], shuffled.Messages[j] = shuffled.Messages[j], shuffled.Messages[i]
+		})
 		random.Shuffle(len(shuffled.Participants), func(i, j int) {
 			shuffled.Participants[i], shuffled.Participants[j] = shuffled.Participants[j], shuffled.Participants[i]
 		})
