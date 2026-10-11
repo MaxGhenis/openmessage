@@ -520,7 +520,7 @@ type storeFailedRepointFixture struct {
 	transportRequestID string
 	realID             string
 	echoMessageID      string
-	blockerOutboxID    string
+	dependentOutboxID  string
 }
 
 func newStoreFailedRepointFixture(t *testing.T, clock Clock) storeFailedRepointFixture {
@@ -539,16 +539,30 @@ func newStoreFailedRepointFixture(t *testing.T, clock Clock) storeFailedRepointF
 	item := mustOutboxItem(t, service, submission.OutboxID)
 	const echoMessageID = "echo-store-failed-collision"
 	projectReconcileEchoMessage(t, store, clock, echoMessageID, realID)
-	blocker := mustSendReaction(t, service, SendReactionCommand{
+	// A queued reaction aimed at the echo row references it with NO ACTION.
+	// The repoint must carry it to the optimistic row rather than fail on it.
+	dependent := mustSendReaction(t, service, SendReactionCommand{
 		CommonCommand: CommonCommand{
 			AccountID:      item.AccountID,
 			ConversationID: item.ConversationID,
-			IdempotencyKey: "key-reconcile-store-failed-blocker",
+			IdempotencyKey: "key-reconcile-store-failed-dependent",
 			NotBefore:      clock.Now().Add(time.Hour),
 		},
 		TargetMessageID: echoMessageID,
 		Emoji:           "🔒",
 	})
+	// Fail the repoint's delete of the echo row until removeBlocker runs, so
+	// the dispatch Confirm rolls back into store_failed.
+	if _, err := raw.ExecContext(context.Background(), `
+		CREATE TRIGGER block_echo_repoint
+		BEFORE DELETE ON messages
+		WHEN OLD.message_id = '`+echoMessageID+`'
+		BEGIN
+			SELECT RAISE(ABORT, 'injected repoint failure');
+		END
+	`); err != nil {
+		t.Fatalf("create repoint blocker: %v", err)
+	}
 
 	if processed, err := service.DispatchDue(context.Background(), 1); err != nil || processed != 1 {
 		t.Fatalf("DispatchDue(store failure) = %d, %v; want 1, nil", processed, err)
@@ -574,15 +588,14 @@ func newStoreFailedRepointFixture(t *testing.T, clock Clock) storeFailedRepointF
 		transportRequestID: item.TransportRequestID,
 		realID:             realID,
 		echoMessageID:      echoMessageID,
-		blockerOutboxID:    blocker.OutboxID,
+		dependentOutboxID:  dependent.OutboxID,
 	}
 }
 
 func (f storeFailedRepointFixture) removeBlocker(t *testing.T) {
 	t.Helper()
-	mustReconcileExecOne(t, f.raw, `DELETE FROM outbox WHERE outbox_id = ?`, f.blockerOutboxID)
-	if _, err := f.service.outbox.GetOutboxReaction(context.Background(), f.blockerOutboxID); !errors.Is(err, sql.ErrNoRows) {
-		t.Fatalf("GetOutboxReaction(removed blocker) error = %v, want sql.ErrNoRows", err)
+	if _, err := f.raw.ExecContext(context.Background(), `DROP TRIGGER block_echo_repoint`); err != nil {
+		t.Fatalf("drop repoint blocker: %v", err)
 	}
 }
 
@@ -597,6 +610,13 @@ func (f storeFailedRepointFixture) assertRepaired(t *testing.T, delivery Deliver
 	}
 	if _, err := f.service.messages.GetMessage(context.Background(), f.echoMessageID); !errors.Is(err, sqlite.ErrNotFound) {
 		t.Fatalf("GetMessage(repaired echo duplicate) error = %v, want ErrNotFound", err)
+	}
+	reaction, err := f.service.outbox.GetOutboxReaction(context.Background(), f.dependentOutboxID)
+	if err != nil {
+		t.Fatalf("GetOutboxReaction(dependent): %v", err)
+	}
+	if reaction.TargetMessageID != f.submission.LocalMessageID {
+		t.Fatalf("dependent reaction target = %q, want optimistic message %q", reaction.TargetMessageID, f.submission.LocalMessageID)
 	}
 }
 

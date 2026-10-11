@@ -1581,17 +1581,15 @@ func (r *OutboxRepository) Confirm(
 
 	var (
 		accountID          string
-		conversationID     string
 		localMessageID     sql.NullString
 		transportRequestID string
 	)
 	if err := tx.QueryRowContext(ctx, `
-		SELECT account_id, conversation_id, local_message_id, transport_request_id
+		SELECT account_id, local_message_id, transport_request_id
 		FROM outbox
 		WHERE outbox_id = ?
 	`, confirmation.OutboxID).Scan(
 		&accountID,
-		&conversationID,
 		&localMessageID,
 		&transportRequestID,
 	); err != nil {
@@ -1606,7 +1604,6 @@ func (r *OutboxRepository) Confirm(
 			ctx,
 			tx,
 			accountID,
-			conversationID,
 			localMessageID.String,
 			transportRequestID,
 			resultRemoteID,
@@ -1649,7 +1646,6 @@ func (r *OutboxRepository) ReconcileConfirm(
 
 	var (
 		outboxID                string
-		conversationID          string
 		state                   OutboxState
 		localMessageID          sql.NullString
 		persistedResultRemoteID sql.NullString
@@ -1658,7 +1654,6 @@ func (r *OutboxRepository) ReconcileConfirm(
 	err = tx.QueryRowContext(ctx, `
 		SELECT
 			o.outbox_id,
-			o.conversation_id,
 			o.state,
 			o.local_message_id,
 			o.result_remote_id,
@@ -1668,7 +1663,6 @@ func (r *OutboxRepository) ReconcileConfirm(
 		WHERE o.account_id = ? AND o.transport_request_id = ?
 	`, req.AccountID, req.TransportRequestID).Scan(
 		&outboxID,
-		&conversationID,
 		&state,
 		&localMessageID,
 		&persistedResultRemoteID,
@@ -1713,7 +1707,6 @@ func (r *OutboxRepository) ReconcileConfirm(
 				ctx,
 				tx,
 				req.AccountID,
-				conversationID,
 				localMessageID.String,
 				req.TransportRequestID,
 				req.ResultRemoteID,
@@ -1777,7 +1770,6 @@ func (r *OutboxRepository) ReconcileConfirm(
 			ctx,
 			tx,
 			req.AccountID,
-			conversationID,
 			localMessageID.String,
 			req.TransportRequestID,
 			req.ResultRemoteID,
@@ -1816,7 +1808,7 @@ func requireSingleReconcileMutation(result sql.Result, outboxID string) error {
 func (r *OutboxRepository) repointLocalMessage(
 	ctx context.Context,
 	tx *sql.Tx,
-	accountID, conversationID, localMessageID, transportRequestID, realID string,
+	accountID, localMessageID, transportRequestID, realID string,
 ) error {
 	if realID == transportRequestID {
 		return nil
@@ -1826,6 +1818,24 @@ func (r *OutboxRepository) repointLocalMessage(
 		return err
 	}
 
+	// The natural key the UPDATE below must keep unique is scoped to the
+	// conversation the local row is in now, which a repair move can change
+	// from the outbox row's. If the local row is gone there is nothing to
+	// repoint, and an echo row already holding realID is then the only copy
+	// of the sent message, so it stays.
+	var localConversationID string
+	err = tx.QueryRowContext(ctx, `
+		SELECT conversation_id
+		FROM messages
+		WHERE message_id = ? AND account_id = ?
+	`, localMessageID, accountID).Scan(&localConversationID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("repoint local message %q: read local row: %w", localMessageID, err)
+	}
+
 	var collisionMessageID string
 	err = tx.QueryRowContext(ctx, `
 		SELECT message_id
@@ -1833,11 +1843,25 @@ func (r *OutboxRepository) repointLocalMessage(
 		WHERE account_id = ?
 		  AND conversation_id = ?
 		  AND remote_message_id = ?
-	`, accountID, conversationID, realID).Scan(&collisionMessageID)
+	`, accountID, localConversationID, realID).Scan(&collisionMessageID)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("repoint local message %q: read remote-ID collision: %w", localMessageID, err)
 	}
 	if err == nil && collisionMessageID != localMessageID {
+		if err := mergeDuplicateMessage(
+			ctx,
+			tx,
+			collisionMessageID,
+			localMessageID,
+			nowMS,
+		); err != nil {
+			return fmt.Errorf(
+				"repoint local message %q: merge echo duplicate %q: %w",
+				localMessageID,
+				collisionMessageID,
+				mapConstraintError(err),
+			)
+		}
 		if _, err := tx.ExecContext(ctx, `
 			DELETE FROM messages
 			WHERE message_id = ?
