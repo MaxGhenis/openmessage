@@ -454,6 +454,32 @@ func (im *IMessage) read(store *db.Store, dataVersion int64, fullReason string, 
 		for id := range im.retryChats {
 			lastTSChats[id] = struct{}{}
 		}
+		// A handle or chat row can land after rows that name it (sync order is
+		// not insertion order): re-read the messages of every handle and chat
+		// this poll sees for the first time.
+		var newHandles, newChats []int64
+		for id := range handles {
+			if _, ok := im.marks.handles[id]; !ok {
+				newHandles = append(newHandles, id)
+			}
+		}
+		for _, c := range chats {
+			if _, ok := im.marks.chatGUIDs[c.rowID]; !ok {
+				newChats = append(newChats, c.rowID)
+				lastTSChats[c.rowID] = struct{}{}
+			}
+		}
+		named, err := r.rowIDsIn(`SELECT ROWID FROM message WHERE handle_id IN`, newHandles)
+		if err != nil {
+			return nil, err
+		}
+		inNewChats, err := r.rowIDsIn(`SELECT message_id FROM chat_message_join WHERE chat_id IN`, newChats)
+		if err != nil {
+			return nil, err
+		}
+		for _, id := range append(named, inNewChats...) {
+			changed[id] = struct{}{}
+		}
 		joined, err := r.chatsOfMessages(keys(changed))
 		if err != nil {
 			return nil, err
@@ -777,14 +803,19 @@ func (r *snapshotReader) joinsAbove(after, upTo int64) ([][3]int64, error) {
 
 // chatsOfMessages returns every chat any of the messages is joined to.
 func (r *snapshotReader) chatsOfMessages(rowIDs []int64) ([]int64, error) {
+	return r.rowIDsIn(`SELECT DISTINCT chat_id FROM chat_message_join WHERE message_id IN`, rowIDs)
+}
+
+// rowIDsIn runs query ("... IN") over ids in batches.
+func (r *snapshotReader) rowIDsIn(query string, ids []int64) ([]int64, error) {
 	var out []int64
-	for start := 0; start < len(rowIDs); start += chatDBReadBatch {
-		chunk := rowIDs[start:min(start+chatDBReadBatch, len(rowIDs))]
-		ids, err := r.rowIDs(`SELECT DISTINCT chat_id FROM chat_message_join WHERE message_id IN (`+qmarks(len(chunk))+`)`, int64Args(chunk)...)
+	for start := 0; start < len(ids); start += chatDBReadBatch {
+		chunk := ids[start:min(start+chatDBReadBatch, len(ids))]
+		got, err := r.rowIDs(query+` (`+qmarks(len(chunk))+`)`, int64Args(chunk)...)
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, ids...)
+		out = append(out, got...)
 	}
 	return out, nil
 }

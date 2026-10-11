@@ -621,6 +621,43 @@ func TestIMessageDeletionsForceAFullRead(t *testing.T) {
 	_ = path
 }
 
+// Sync order is not insertion order: a message can name a handle, and a join
+// a chat, whose row arrives later. The poll that first sees the handle or
+// chat re-reads the messages naming it, so the sender and the owner end as
+// a full import would set them.
+func TestIMessageHandleAndChatRowsArrivingLate(t *testing.T) {
+	chat := newNativeChatDB(t)
+	h := chat.addHandle("+15550000001")
+	c := chat.exec(`INSERT INTO chat (ROWID, guid, style, display_name) VALUES (2, 'c2', 45, 'Two')`)
+	chat.exec(`INSERT INTO chat_handle_join (chat_id, handle_id) VALUES (?, ?)`, c, h)
+	chat.message(c, "m1", "from a handle not there yet", at(3*time.Hour), false, 99)
+	orphan := chat.add(row{GUID: "m2", Body: "joined to a chat not there yet", Unix: at(2 * time.Hour), Handle: h})
+	chat.exec(`INSERT INTO chat_message_join (chat_id, message_id, message_date) VALUES (50, ?, 0)`, orphan)
+	shared := chat.message(c, "m3", "will move to a lower chat", at(time.Hour), false, h)
+	chat.exec(`INSERT INTO chat_message_join (chat_id, message_id, message_date) VALUES (1, ?, 0)`, shared)
+	store, path := newIMessageStore(t)
+	poller := newPoller(chat.path)
+	runImport(t, poller, store)
+
+	chat.exec(`INSERT INTO handle (ROWID, id, uncanonicalized_id) VALUES (99, '+15550000099', '+1 (555) 000-0099')`)
+	chat.exec(`INSERT INTO chat (ROWID, guid, style, display_name) VALUES (50, 'c50', 45, 'Fifty')`)
+	chat.exec(`INSERT INTO chat (ROWID, guid, style, display_name) VALUES (1, 'c1', 45, 'One')`)
+	runImport(t, poller, store)
+	if poller.last.full {
+		t.Fatalf("late handle and chat rows forced a full read (%s)", poller.last.fullReason)
+	}
+	if m, _ := store.GetMessageByID("imessage:m1"); m.SenderNumber != "+15550000099" {
+		t.Fatalf("sender after the late handle = %q", m.SenderNumber)
+	}
+	if m, _ := store.GetMessageByID("imessage:m2"); m == nil || m.ConversationID != "imessage:c50" {
+		t.Fatalf("message after the late chat = %+v", m)
+	}
+	if m, _ := store.GetMessageByID("imessage:m3"); m.ConversationID != "imessage:c1" {
+		t.Fatalf("owner after a late lower chat = %s", m.ConversationID)
+	}
+	requireMatchesFullImport(t, "late handle and chat rows", path, chat)
+}
+
 // A row whose write fails is retried by the next poll even when chat.db has
 // not changed since; the marks still advance past it.
 func TestIMessageRetriesFailedRows(t *testing.T) {

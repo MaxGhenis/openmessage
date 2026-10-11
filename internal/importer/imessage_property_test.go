@@ -84,6 +84,7 @@ func TestIMessagePollingMatchesFullReads(t *testing.T) {
 		"reaction before its target", "reaction to an absent message", "late target with reactions",
 		"first join", "lower-owner join", "typed tapback text", "in-window edit", "chat rename",
 		"participants change", "handle change", "message deleted", "join deleted", "replaced (copy)",
+		"late handle", "late chat",
 		"replaced (new rows)", "user metadata",
 	} {
 		if stats.events[e] < scale {
@@ -131,13 +132,15 @@ var historyKinds = []historyKind{
 	{"rename", 3, true},
 	{"participants", 3, true},
 	{"handle", 2, true},
+	{"dangling", 3, true},
+	{"late row", 3, true},
 	{"edit", 5, true},
 	{"jump", 1, true},
 	{"poll", 22, true},
 	{"user metadata", 3, false},
 	{"delete message", 2, false},
 	{"delete join", 2, false},
-	{"replace", 1, false},
+	{"replace", 2, false},
 }
 
 // history is one seed's generator state. Everything about chat.db is read
@@ -151,6 +154,8 @@ type history struct {
 	nextName   int
 	futures    []string // guids reactions named before any row had them
 	appendOnly bool
+	// Handle and chat ROWIDs that rows already name but no row has yet.
+	pendingHandles, pendingChats []int64
 }
 
 func (h *history) name(prefix string) string {
@@ -400,6 +405,38 @@ func (h *history) step(kind string) {
 			chat.exec(`UPDATE message SET date = date + ? WHERE ROWID = ?`, int64(1+h.r.IntN(5))*1_000_000_000, m)
 		}
 		h.event("in-window edit")
+	case "dangling":
+		// A message naming a handle, or joined to a chat, whose row has not
+		// arrived yet.
+		if h.r.IntN(2) == 0 {
+			id := chat.queryInt(`SELECT COALESCE(MAX(ROWID), 0) FROM handle`) + 1000 + int64(h.r.IntN(1000))
+			h.pendingHandles = append(h.pendingHandles, id)
+			chat.add(row{GUID: h.name("m"), Body: "names a later handle", Unix: h.date(), Handle: id, Chats: []int64{h.pick(chats)}})
+		} else {
+			id := chat.queryInt(`SELECT COALESCE(MAX(ROWID), 0) FROM chat`) + 1000 + int64(h.r.IntN(1000))
+			h.pendingChats = append(h.pendingChats, id)
+			m := chat.add(row{GUID: h.name("m"), Body: "joined to a later chat", Unix: h.date(), Handle: h.pick(h.ids(`SELECT ROWID FROM handle`))})
+			chat.exec(`INSERT INTO chat_message_join (chat_id, message_id, message_date) VALUES (?, ?, 0)`, id, m)
+			if h.r.IntN(2) == 0 {
+				chat.join(h.pick(chats), m)
+			}
+		}
+	case "late row":
+		if len(h.pendingHandles) > 0 && (len(h.pendingChats) == 0 || h.r.IntN(2) == 0) {
+			id := h.pendingHandles[0]
+			h.pendingHandles = h.pendingHandles[1:]
+			if chat.queryInt(`SELECT COUNT(*) FROM handle WHERE ROWID = ?`, id) == 0 {
+				chat.exec(`INSERT INTO handle (ROWID, id, uncanonicalized_id) VALUES (?, ?, ?)`, id, fmt.Sprintf("+1666%07d", id), h.name("late handle"))
+				h.event("late handle")
+			}
+		} else if len(h.pendingChats) > 0 {
+			id := h.pendingChats[0]
+			h.pendingChats = h.pendingChats[1:]
+			if chat.queryInt(`SELECT COUNT(*) FROM chat WHERE ROWID = ?`, id) == 0 {
+				chat.exec(`INSERT INTO chat (ROWID, guid, style, display_name) VALUES (?, ?, 45, ?)`, id, h.name("latechat"), h.name("Late"))
+				h.event("late chat")
+			}
+		}
 	case "jump":
 		h.clock.t = h.clock.t.Add(DefaultIMessageFullEvery + time.Minute)
 	case "delete message":
@@ -425,6 +462,7 @@ func (h *history) step(kind string) {
 				next.exec(`UPDATE chat SET display_name = 'renamed in the copy'`)
 			}
 			chat.replaceWith(next)
+			h.pendingHandles, h.pendingChats = nil, nil
 			h.event("replaced (copy)")
 			return
 		}
@@ -436,7 +474,7 @@ func (h *history) step(kind string) {
 			next.message(c, h.name("n"), "replacement body", h.date(), h.r.IntN(2) == 0, handle)
 		}
 		chat.replaceWith(next)
-		h.futures = nil
+		h.futures, h.pendingHandles, h.pendingChats = nil, nil, nil
 		h.event("replaced (new rows)")
 	}
 }
