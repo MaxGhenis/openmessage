@@ -474,7 +474,8 @@ hung daemon, and it alerts when the daemon is up but a platform has gone
 quiet.
 
 This section follows the script's code on Max's local dotfiles `master` at
-`ffda554` (2026-10-09). The script's header comment summarizes the checks but
+`ffda554` (2026-10-09), and its WhatsApp logout handling at `0cc1ecf`
+(2026-10-11). The script's header comment summarizes the checks but
 is incomplete: it leaves out the inbox-read alert and the parse-error path,
 and it lists a top-level `projection_stalled` check that never fires (the
 daemon publishes that flag inside `freshness`).
@@ -511,9 +512,13 @@ a copy ([testing a change](#testing-a-change)).
   (deleting one re-arms that alert), `append_errors` (see the
   `append_errors` alert below), `paired_<platform>`, the pairing state the
   watchdog last recorded (`1` or `0`; a loss deferred by the cooldown stays
-  `1` until it is announced), `python.stderr` and `health.txt`. Times are
+  `1` until it is announced), `relink_episode_whatsapp` (the start of the
+  last WhatsApp logout it announced, from `relink_since_ms`, or `0` when the
+  daemon gave none), `python.stderr` and `health.txt`. Times are
   epoch seconds. Deleting a `paired_` file makes the platform's next unpaired
-  run a first sighting, which is only logged.
+  run a first sighting, which is only logged; deleting
+  `relink_episode_whatsapp` announces a standing logout again (if the
+  6-hour stamp allows).
 
   Since dotfiles `ea25916` every counter and time is read through
   `read_state`. A file that isn't a canonical decimal (digits only, no
@@ -675,7 +680,34 @@ in-app supervisors. It alerts on:
   with a `last_error`. A platform first seen unpaired (no `paired_<platform>`
   file) is only logged, as `unpaired: <platform> - staleness alerts paused
   until it is relinked`; a relink logs `paired again: <platform> - staleness
-  alerts resume`;
+  alerts resume`. A WhatsApp logout that the daemon reports with
+  `needs_relink` gets the next bullet's notification instead;
+- `whatsapp.needs_relink` true (daemons with PR #232; since dotfiles
+  `0cc1ecf`): WhatsApp logged this install's device out. `paired: false`
+  alone can't tell that from a deliberate unlink; `needs_relink` can, so the
+  watchdog reads it. Every run that reads the status lists the logout in
+  health.txt as "whatsapp logged out since <local time> (<relink_reason>) -
+  relink: Platforms -> Connect WhatsApp", the time being `relink_since_ms`.
+  The notification has the same text and goes out once per logout episode
+  (`relink_since_ms` names it; the state file is
+  `relink_episode_whatsapp`), whether or not the watchdog saw WhatsApp
+  paired first. It takes the lost-pairing notification's place and its
+  `alert_unlinked_whatsapp` stamp: within 6 hours of WhatsApp's last
+  lost-pairing or logout notification the run logs `suppressed (cooldown):
+  unlinked_whatsapp` and the next run tries again. The loss itself is
+  recorded at once, logged as `unpaired: whatsapp - logged out by WhatsApp;
+  staleness alerts paused until it is relinked`, so WhatsApp never also gets
+  the generic "No longer paired" notification while `needs_relink` is true.
+  A standing logout doesn't notify again ([how alerts
+  repeat](#how-alerts-repeat) says why). A `whatsapp` status with `paired:
+  true` and no logout ends the episode, so the next logout notifies even
+  with an unknown start. A `relink_since_ms` that is missing, not a number,
+  under 1000 or at least 10^13 leaves the time out ("whatsapp logged out
+  (…)"), and a missing or non-string `relink_reason` leaves the parenthesis
+  out. A daemon without the field, and `needs_relink: false` (a deliberate
+  unpair), get the lost-pairing notification as before. Only the JSON
+  `true` counts, and only in the `whatsapp` block, the one place #232 sends
+  it;
 - a paired, connected platform whose silence outlasts its own baseline, by
   the rule in
   [Google Messages silent while "connected"](#google-messages-silent-while-connected-the-phone-stopped-relaying).
@@ -705,7 +737,10 @@ in-app supervisors. It alerts on:
 
 Each run posts at most one macOS notification: its first fresh alert, plus
 "(+N more - see log)" when there are others. A lost pairing always goes first,
-as one alert naming every platform announced in that run. The log has each
+as one alert naming every platform announced in that run. A WhatsApp logout
+announced in the run goes ahead of it in the same alert: "whatsapp logged
+out … - relink: Platforms -> Connect WhatsApp; also no longer paired:
+<platforms> - …". The log has each
 alert as `ALERT: …` and the notification as `NOTIFY: …`. A `NOTIFY:` line
 records the attempt, not that macOS showed it. The notification goes inside an
 AppleScript string literal, and parts of its text come from the daemon or from
@@ -770,6 +805,40 @@ quote could end the literal early and turn the rest into AppleScript.
   at `1`, so later runs retry and it goes out on the first run 6 hours after
   the previous one, if the platform is still unpaired then. A relink in the
   meantime logs nothing, since the stored state never left paired.
+- A WhatsApp logout (`needs_relink`) is announced once per episode and
+  doesn't notify again while it stands. health.txt lists it on every run
+  that reads the status. On 2026-10-11 this was chosen over repeating it on
+  the 6-hour cooldown, for three reasons:
+  - Repeating didn't reach Max in August. After WhatsApp's one disconnect
+    notification (08-20 18:28 in the log), the watchdog logged 28
+    `all_quiet` notifications, 6 hours apart, between 08-21 17:19 and 08-28
+    18:54 ("No messages on ANY platform for 24h" up to "187h"). That alarm
+    covered every platform, and the logout still stood until an agent
+    unpaired WhatsApp on 08-28. The notifications go out through
+    `osascript`, and Notification Center's app list
+    (`~/Library/Preferences/com.apple.ncprefs.plist`) had no entry for
+    `osascript` or Script Editor on 2026-09-03 or on 2026-10-11, so they
+    probably never showed. More notifications through the same channel
+    would not have helped.
+  - Repeating a standing state is what buried a real outage. The 6-hourly
+    alerts for unlinked WhatsApp and Signal ran from 2026-09-03 until
+    dotfiles `7de27cc` and could hide a new alert behind them (the first
+    consequence below). A logout that Max decides to
+    relink later has the same shape: the relink decision for WhatsApp and
+    Signal (d328) has been parked since 2026-10-02.
+  - The other surfaces work once per episode too. The app's own "WhatsApp
+    needs relinking" notification is keyed on `relink_since_ms`, and the
+    menu bar and MCP `get_status` show the logout while it lasts. The
+    channel built to reach Max is the chief-of-staff watcher
+    (`com.maxghenis.cos.openmessage-health-watch`). It sends the silence and
+    SMS verdicts once per episode through `say`, which delivers by Telegram
+    and holds alerts in quiet hours for the morning card. It doesn't read
+    `needs_relink` yet.
+
+  Deleting `relink_episode_whatsapp` makes the next run announce the logout
+  again (if the 6-hour stamp allows). To make it repeat every 6 hours
+  instead, give the logout its own `alert_<key>` cooldown in the script and
+  drop the episode file.
 - If `/api/status` contains `"connected"` but isn't valid JSON, the run logs
   `status parse error: …`, lists it in health.txt, checks nothing else in the
   response, and posts no notification. health.txt can still list a saved
@@ -788,8 +857,9 @@ Consequences worth knowing:
   an unlink, so after its one lost-pairing notification its staleness alerts
   stay paused; check `last_error` in `/api/status`. For WhatsApp,
   `needs_relink: true` means WhatsApp logged the device out, and it survives
-  a restart where `last_error` doesn't. The watchdog doesn't read
-  `needs_relink`. A platform relinked while
+  a restart where `last_error` doesn't. Since dotfiles `0cc1ecf` the
+  watchdog reads it and names the logout instead
+  ([staleness alerts](#staleness-alerts)). A platform relinked while
   still more than 48 h behind alerts `behind_<platform>` on the first run
   that sees it paired (if its `behind_` stamp is at least 6 hours old), and
   every 6 hours after until it receives a message.
@@ -890,9 +960,11 @@ come:
   `… relaunched the app` or `… DRYRUN: would relaunch`.
 - Only when they apply, in epoch seconds: `paused_since` (the flag file's
   modification time, so touching or rewriting the flag restarts it),
-  `daemon_down_since` (on down runs, the outage's first failed probe), and
+  `daemon_down_since` (on down runs, the outage's first failed probe),
   `disconnected_since_<platform>` and `repair_since_google` (the episode's
-  first check, on runs that list the episode).
+  first check, on runs that list the episode), and `relink_since_whatsapp`
+  (`relink_since_ms` in seconds, on runs that list a WhatsApp logout whose
+  start the daemon gave).
 - `alerts=N`, then N `alert: <text>` lines, then any `note: <text>` lines.
 
 The `alert:` lines are every alert the run raised, whether or not a cooldown
@@ -910,6 +982,10 @@ mentioned for hours. They are:
   row)` or `Google needs repair since <time> (N checks in a row)`. Checks 1
   and 2 show up only in the log, as `disconnected: <platform> (N/3)` and
   `google needs_repair (N/3)`;
+- a WhatsApp logout, first, as `whatsapp logged out since <time>
+  (<relink_reason>) - relink: Platforms -> Connect WhatsApp`, on every run
+  that reads `needs_relink: true`, announced or not. It is the whole
+  episode's line: a logout leaves no `whatsapp no longer paired` line;
 - a lost pairing, as `<platform> no longer paired - check the app; relink
   unless that was intended` (one line per platform), while its announcement
   waits out the cooldown and on the run that announces it;
@@ -925,8 +1001,8 @@ one per unpaired platform on every run that reads the status (next to the
 lost-pairing alert while that lasts), and each silence the daemon reports (the
 `note:` lines in the log).
 
-Episodes, unpaired notes and silence notes come only from a run that read the
-status. A down, skipped or data-less run lists none of them, though the
+Episodes, logouts, unpaired notes and silence notes come only from a run that
+read the status. A down, skipped or data-less run lists none of them, though the
 counters and start times carry on, so a missing episode line on such a run
 doesn't mean the episode is over. A dry run writes health.txt into its own
 state dir ([testing a change](#testing-a-change)).
@@ -936,16 +1012,18 @@ state dir ([testing a change](#testing-a-change)).
 `OPENMESSAGE_WATCHDOG_DRYRUN=1` logs decisions without relaunching or
 notifying, but it still writes state: `consecutive_fails`, `down_since`, the
 episode counters and their start files, the `paired_<platform>` files, the
-`alert_<key>` stamps (it never writes the relaunch stamp), the
-`append_errors` file, `python.stderr` and `health.txt`. It also deletes any
+`alert_<key>` stamps (it never writes the relaunch stamp),
+`relink_episode_whatsapp`, the `append_errors` file, `python.stderr` and
+`health.txt`. It also deletes any
 counter or time file it reads as damaged or later than its clock, the relaunch
 stamp included. With `OPENMESSAGE_WATCHDOG_NOW` pinned earlier than the
 stamps already in the state dir, it deletes each one it reads. Alert stamps
 and start times may come back on that earlier clock, but a deleted relaunch
 stamp stays deleted, which lifts the throttle. Run against the real state dir, it can swallow the next real alert:
 a stamped key stays quiet for 6 hours, an episode counter pushed past 3 never
-alerts, an `append_errors` count marked reported never alerts, and a lost
-pairing it records is never announced. It also overwrites the live
+alerts, an `append_errors` count marked reported never alerts, a lost
+pairing it records is never announced, and neither is a WhatsApp logout
+episode it announces. It also overwrites the live
 health.txt. Point `OPENMESSAGE_WATCHDOG_STATE` and `OPENMESSAGE_WATCHDOG_LOG`
 at a scratch directory and run a copy of the script:
 
@@ -985,8 +1063,10 @@ fixture daemon, and the silence estimate against a temp v2 store, with all of
 this sandboxed and stub `osascript`/`open`/`pgrep`/`pkill` first on `PATH`.
 `test_openmessage_watchdog_append_errors.py` and
 `test_openmessage_watchdog_pull_health.py` next to it cover those two alerts.
+The WhatsApp logout tests, including a reference model of its notification
+rule run against the real script, are in the first file.
 The suites use Hypothesis, which the plain `pytest` on Max's Mac lacks, so run
-them through `uvx` (226 tests, about 7 minutes at `ffda554`):
+them through `uvx` (252 tests, 11 minutes on a busy Mac at `0cc1ecf`):
 
 ```bash
 cd ~/dotfiles && PYTHONDONTWRITEBYTECODE=1 uvx --with hypothesis pytest -q -p no:cacheprovider tests/test_openmessage_watchdog.py tests/test_openmessage_watchdog_append_errors.py tests/test_openmessage_watchdog_pull_health.py
@@ -1481,19 +1561,26 @@ Since PR #232:
   menu bar says "WhatsApp needs re-pairing", MCP `get_status` prints a
   "Needs relink" line (in the app and in daemon-routed MCP stdio), and the
   web Platforms panel shows "Logged out" with the reason and date.
-- The watchdog needs no change. It sees `paired` go from `true` to `false`
-  and posts "No longer paired: whatsapp - check the app; relink unless that
-  was intended" once, then pauses WhatsApp's staleness checks. Before #232 a
-  logout that left the identity behind kept `paired: true`, so the watchdog
-  raised its disconnect alert instead and kept running WhatsApp's staleness
-  checks.
+- The watchdog reads `needs_relink` since dotfiles `0cc1ecf`. Every run
+  that reads the status lists "whatsapp logged out since <time> (<reason>) -
+  relink: Platforms -> Connect WhatsApp" in its health.txt, and the logout
+  gets one notification with that text per episode, in place of "No longer
+  paired: whatsapp - check the app; relink unless that was intended". It
+  doesn't repeat while the logout stands
+  ([how alerts repeat](#how-alerts-repeat) says why). WhatsApp's staleness
+  checks stay paused, as for any `paired: false`. Before #232 a logout that
+  left the identity behind kept `paired: true`, so the watchdog raised its
+  disconnect alert instead and kept running WhatsApp's staleness checks; an
+  older watchdog on a #232 daemon posts the generic lost-pairing
+  notification once.
 
 To relink, open Platforms and click Connect WhatsApp, or run
 `curl -X POST http://127.0.0.1:7007/api/whatsapp/connect`, which starts QR
 pairing at once for a logged-out account. Then scan from the phone: WhatsApp
 → Settings → Linked Devices → Link a Device. The phone-number code works too.
 **Don't unpair to clear `needs_relink`.** It clears the flag, the menu-bar
-alert and the `get_status` line with it, and WhatsApp stays dead.
+alert, the `get_status` line and the watchdog's health.txt line with it, and
+WhatsApp stays dead.
 
 ## signal-cli
 
