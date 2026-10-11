@@ -1066,7 +1066,7 @@ this sandboxed and stub `osascript`/`open`/`pgrep`/`pkill` first on `PATH`.
 The WhatsApp logout tests, including a reference model of its notification
 rule run against the real script, are in the first file.
 The suites use Hypothesis, which the plain `pytest` on Max's Mac lacks, so run
-them through `uvx` (252 tests at `0cc1ecf`):
+them through `uvx` (252 tests, 11 minutes on a busy Mac at `0cc1ecf`):
 
 ```bash
 cd ~/dotfiles && PYTHONDONTWRITEBYTECODE=1 uvx --with hypothesis pytest -q -p no:cacheprovider tests/test_openmessage_watchdog.py tests/test_openmessage_watchdog_append_errors.py tests/test_openmessage_watchdog_pull_health.py
