@@ -66,11 +66,14 @@ type Chat struct {
 }
 
 type Message struct {
-	PK            int64
-	StanzaID      string
-	TimestampMS   int64
-	IsFromMe      bool
-	SenderJID     string
+	PK          int64
+	StanzaID    string
+	TimestampMS int64
+	IsFromMe    bool
+	SenderJID   string
+	// SenderName is the sender's WhatsApp push name, one per JID (see
+	// loadPushNames), so a frame's order never decides an identity's name.
+	SenderName    string
 	Type          int
 	Text          string
 	Caption       string
@@ -140,6 +143,10 @@ func (r *Reader) Scan(ctx context.Context, options ScanOptions, emit func(Chunk)
 		return stats, err
 	}
 	r.loadExternalMappings(ctx, mappings, &stats)
+	names, err := loadPushNames(ctx, tx, mappings)
+	if err != nil {
+		return stats, err
+	}
 	resolved := make(map[int64]Chat, len(chats))
 	skipped := make(map[int64]string)
 	for _, raw := range chats {
@@ -159,7 +166,10 @@ func (r *Reader) Scan(ctx context.Context, options ScanOptions, emit func(Chunk)
 		if chat.IsGroup {
 			seen := map[string]bool{}
 			for _, member := range members {
-				if member.chatPK != chat.PK {
+				// Former members still resolve their old messages' senders
+				// (captureSender reads every member row), but a new thread's
+				// roster lists only who is in the group now.
+				if member.chatPK != chat.PK || !member.active {
 					continue
 				}
 				memberJID := canonicalSender(member.jid, member.identifier, mappings)
@@ -167,17 +177,17 @@ func (r *Reader) Scan(ctx context.Context, options ScanOptions, emit func(Chunk)
 					continue
 				}
 				seen[memberJID] = true
-				// Desktop contact labels can disagree between chat rosters. Keep
-				// identity labels empty so insertion order never chooses a name;
-				// conversation titles still preserve the Desktop title.
-				chat.Participants = append(chat.Participants, Participant{JID: memberJID})
+				// Desktop's per-chat contact labels can disagree between rosters,
+				// so a participant carries only its JID's single push name; any
+				// frame order then names a new identity the same way.
+				chat.Participants = append(chat.Participants, Participant{JID: memberJID, Name: names[memberJID]})
 			}
 			sort.Slice(chat.Participants, func(i, j int) bool { return chat.Participants[i].JID < chat.Participants[j].JID })
 		} else {
 			// A self-chat still carries its peer. The feeder marks this JID
 			// IsSelf, so a decoder's missing-roster fallback cannot invent a
 			// second non-self identity for the account's own phone number.
-			chat.Participants = []Participant{{JID: chat.JID}}
+			chat.Participants = []Participant{{JID: chat.JID, Name: names[chat.JID]}}
 		}
 		stats.ChatsResolved++
 		resolved[chat.PK] = chat
@@ -187,7 +197,6 @@ func (r *Reader) Scan(ctx context.Context, options ScanOptions, emit func(Chunk)
 		memberByPK[member.pk] = member
 	}
 	mergeSnapshots(resolved)
-	skipAmbiguousRosters(resolved, skipped, r.options.SelfJID, &stats)
 	query, err := messageQuery(ctx, tx)
 	if err != nil {
 		return stats, err
@@ -241,9 +250,6 @@ func (r *Reader) Scan(ctx context.Context, options ScanOptions, emit func(Chunk)
 		switch {
 		case !ok:
 			reason = "chat_" + skipped[chatPK]
-			if skipped[chatPK] == "ambiguous_roster" {
-				reason = "ambiguous_roster"
-			}
 			if reason == "chat_" {
 				reason = "chat_missing"
 			}
@@ -265,6 +271,9 @@ func (r *Reader) Scan(ctx context.Context, options ScanOptions, emit func(Chunk)
 		// placeholders without interpreting unknown enum values as voice notes.
 		message.VoiceNote = message.Type == 3 && mediaOrigin == 1
 		message.SenderJID, reason = captureSender(chat, message.IsFromMe, memberPK, fromJID, memberByPK, mappings, r.options.SelfJID)
+		if !message.IsFromMe {
+			message.SenderName = names[message.SenderJID]
+		}
 		if reason != "" {
 			stats.RowsSkippedByReason[reason]++
 			stats.RowsSkippedByType[message.Type]++
@@ -272,6 +281,11 @@ func (r *Reader) Scan(ctx context.Context, options ScanOptions, emit func(Chunk)
 				stats.RowsSinceSkippedByReason[reason]++
 			}
 			continue
+		}
+		if message.Type == 8 && strings.TrimSpace(message.Text) != "" {
+			// Desktop keeps a document's file name in ZTEXT and its caption in
+			// the media item's ZTITLE (read into Caption).
+			message.FileName = filepath.Base(strings.TrimSpace(message.Text))
 		}
 		if message.Type != 0 && message.Type != 7 {
 			r.captureMedia(&message, mediaPath)
@@ -405,47 +419,57 @@ func mergeSnapshots(chats map[int64]Chat) {
 	}
 }
 
-// I5: the worker deliberately refuses an unbound history remote ID whose
-// roster already belongs to another thread. If Desktop itself contains two
-// distinct remote IDs with the same roster, first-writer placement would make
-// frame order choose the surviving thread. Skip every such chat at capture,
-// preserving that guard and making the snapshot independent of frame order.
-// Duplicate Desktop sessions for the same canonical remote ID are harmless.
-func skipAmbiguousRosters(chats map[int64]Chat, skipped map[int64]string, selfJID string, stats *Stats) {
-	rosters := map[string]map[string]bool{}
-	keys := map[int64]string{}
-	for pk, chat := range chats {
-		kind := "direct"
-		if chat.IsGroup {
-			kind = "group"
+// loadPushNames maps each canonical sender JID to one WhatsApp push name from
+// ZWAPROFILEPUSHNAME. A LID's name also lands under the phone JID it maps to;
+// when two entries meet on one JID the phone JID's own entry wins, then the
+// lexically smallest name, so the result never depends on row order. A
+// Desktop schema without the table yields no names.
+func loadPushNames(ctx context.Context, tx *sql.Tx, mappings map[string]string) (map[string]string, error) {
+	names := map[string]string{}
+	columns, err := tableColumns(ctx, tx, "ZWAPROFILEPUSHNAME")
+	if err != nil || !columns["ZJID"] || !columns["ZPUSHNAME"] {
+		return names, nil
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT COALESCE(ZJID,''), COALESCE(ZPUSHNAME,'') FROM ZWAPROFILEPUSHNAME`)
+	if err != nil {
+		return nil, fmt.Errorf("read WhatsApp Desktop push names: %w", err)
+	}
+	defer rows.Close()
+	type entry struct{ jid, name string }
+	var entries []entry
+	for rows.Next() {
+		var jid, name string
+		if err := rows.Scan(&jid, &name); err != nil {
+			return nil, fmt.Errorf("scan WhatsApp Desktop push name: %w", err)
 		}
-		peers := []string{}
-		for _, participant := range chat.Participants {
-			if participant.JID != selfJID {
-				peers = append(peers, participant.JID)
-			}
+		if name = strings.TrimSpace(name); name != "" {
+			entries = append(entries, entry{normalizedJID(jid), name})
 		}
-		sort.Strings(peers)
-		// The worker only compares an unbound snapshot's roster when at
-		// least one peer exists. An empty roster is no evidence of equality.
-		if len(peers) == 0 {
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].jid != entries[j].jid {
+			return entries[i].jid < entries[j].jid
+		}
+		return entries[i].name < entries[j].name
+	})
+	exact := map[string]bool{}
+	for _, e := range entries {
+		canonical := canonicalSender(e.jid, "", mappings)
+		if canonical == "" {
 			continue
 		}
-		key := kind + "\x00" + strings.Join(peers, "\x00")
-		keys[pk] = key
-		if rosters[key] == nil {
-			rosters[key] = map[string]bool{}
-		}
-		rosters[key][chat.JID] = true
-	}
-	for pk := range chats {
-		if len(rosters[keys[pk]]) > 1 {
-			delete(chats, pk)
-			skipped[pk] = "ambiguous_roster"
-			stats.ChatsResolved--
-			stats.ChatsSkippedByReason["ambiguous_roster"]++
+		isExact := canonical == e.jid
+		current, found := names[canonical]
+		switch {
+		case !found, isExact && !exact[canonical], isExact == exact[canonical] && e.name < current:
+			names[canonical] = e.name
+			exact[canonical] = exact[canonical] || isExact
 		}
 	}
+	return names, nil
 }
 
 func openReadOnly(ctx context.Context, path string) (*sql.DB, error) {
@@ -475,6 +499,7 @@ type rawChat struct {
 type rawMember struct {
 	pk, chatPK            int64
 	jid, identifier, name string
+	active                bool
 }
 
 func loadRoster(ctx context.Context, tx *sql.Tx) ([]rawChat, []rawMember, map[string]string, error) {
@@ -498,7 +523,15 @@ func loadRoster(ctx context.Context, tx *sql.Tx) ([]rawChat, []rawMember, map[st
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	rows, err = tx.QueryContext(ctx, `SELECT Z_PK, COALESCE(ZCHATSESSION,0), COALESCE(ZMEMBERJID,''), COALESCE(ZCONTACTIDENTIFIER,''), COALESCE(ZCONTACTNAME,'') FROM ZWAGROUPMEMBER ORDER BY Z_PK`)
+	memberColumns, err := tableColumns(ctx, tx, "ZWAGROUPMEMBER")
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("read WhatsApp Desktop group member columns: %w", err)
+	}
+	active := "1"
+	if memberColumns["ZISACTIVE"] {
+		active = "COALESCE(ZISACTIVE,1)"
+	}
+	rows, err = tx.QueryContext(ctx, `SELECT Z_PK, COALESCE(ZCHATSESSION,0), COALESCE(ZMEMBERJID,''), COALESCE(ZCONTACTIDENTIFIER,''), COALESCE(ZCONTACTNAME,''), `+active+` FROM ZWAGROUPMEMBER ORDER BY Z_PK`)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("read WhatsApp Desktop group members: %w", err)
 	}
@@ -506,7 +539,7 @@ func loadRoster(ctx context.Context, tx *sql.Tx) ([]rawChat, []rawMember, map[st
 	var members []rawMember
 	for rows.Next() {
 		var member rawMember
-		if err := rows.Scan(&member.pk, &member.chatPK, &member.jid, &member.identifier, &member.name); err != nil {
+		if err := rows.Scan(&member.pk, &member.chatPK, &member.jid, &member.identifier, &member.name, &member.active); err != nil {
 			return nil, nil, nil, err
 		}
 		members = append(members, member)

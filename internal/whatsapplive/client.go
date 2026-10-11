@@ -1487,6 +1487,12 @@ func deriveWebMessageID(requestID string) watypes.MessageID {
 	return whatsmeow.WebMessageIDPrefix + strings.ToUpper(hex.EncodeToString(digest[:9]))
 }
 
+// DeriveWebMessageID is the wire message ID a v2 send with this transport
+// request ID goes out under, so other readers can recognize the app's own sends.
+func DeriveWebMessageID(requestID string) string {
+	return string(deriveWebMessageID(requestID))
+}
+
 type sendNotDispatchedError struct {
 	cause error
 }

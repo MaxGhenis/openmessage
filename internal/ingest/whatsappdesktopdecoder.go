@@ -38,6 +38,7 @@ type WhatsAppDesktopHistoryParticipant struct {
 type WhatsAppDesktopHistoryMessage struct {
 	StanzaID      string
 	SenderJID     string
+	SenderName    string
 	TimestampMS   int64
 	IsFromMe      bool
 	Type          int
@@ -120,7 +121,7 @@ func WhatsAppDesktopHistoryRecord(accountID string, generation bridge.Generation
 			sender = chatJID
 		}
 		envelope.Messages = append(envelope.Messages, whatsAppDesktopHistoryMessageEnvelope{
-			whatsAppFrameEnvelope: whatsAppFrameEnvelope{Kind: whatsAppFrameMessage, ChatJID: chatJID, SenderJID: sender, MessageID: captured.StanzaID, TimestampMS: captured.TimestampMS, IsFromMe: captured.IsFromMe, IsGroup: group, ProtoB64: protoBytes},
+			whatsAppFrameEnvelope: whatsAppFrameEnvelope{Kind: whatsAppFrameMessage, ChatJID: chatJID, SenderJID: sender, MessageID: captured.StanzaID, TimestampMS: captured.TimestampMS, IsFromMe: captured.IsFromMe, IsGroup: group, PushName: strings.TrimSpace(captured.SenderName), ProtoB64: protoBytes},
 			LocalMediaRef:         captured.LocalMediaRef, FileName: captured.FileName, MIMEType: captured.MIMEType, Size: captured.Size,
 		})
 	}

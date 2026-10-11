@@ -39,6 +39,13 @@ type EchoObserver interface {
 // id-space repairs. History is supported for Google catch-up and for the
 // WhatsApp and Signal Desktop snapshots; a history codec never establishes
 // live delivery evidence.
+// A WhatsApp remote ID is the chat's own JID, not a device-local thread number,
+// so WhatsApp history trusts a bound ID without the roster contradiction check,
+// mints an unbound ID without the roster guard, skips the direct-sender check,
+// and refuses any stanza ID another thread of the account already holds.
+// Signal history keeps the Google rules: its 1:1 IDs follow whichever address
+// form (number or ACI) the live bridge saw, so a roster match is the only
+// guard against a second thread for the same person.
 type DecoderRegistration struct {
 	Codec    string
 	Platform bridge.Platform
@@ -540,8 +547,40 @@ func (w *Worker) applyEvents(
 	// says the bound thread is a different thread now; history files nothing
 	// under them.
 	contradicted := make(map[string]bool)
+	// WhatsApp stanza IDs name one message across every chat, so WhatsApp
+	// history checks them account-wide: a message v2 already holds under any
+	// thread is never inserted again, and a snapshot whose messages all exist
+	// elsewhere (a contact's renumbered or aliased chat) mints no empty thread.
+	var present map[string]bool
+	conversationHasNew := map[string]bool{}
+	if history && platform == bridge.PlatformWhatsApp {
+		var remoteIDs []string
+		for _, event := range events {
+			if event.Kind == bridge.EventMessage && event.Message != nil {
+				remoteIDs = append(remoteIDs, event.Message.RemoteMessageID)
+			}
+		}
+		var err error
+		present, err = w.messages.RemoteMessageIDsPresent(ctx, accountID, remoteIDs)
+		if err != nil {
+			return false, err
+		}
+		for _, event := range events {
+			if event.Kind == bridge.EventMessage && event.Message != nil &&
+				!present[strings.TrimSpace(event.Message.RemoteMessageID)] {
+				remoteID := v2keys.NormalizeRemoteConversationID(string(platform), event.Message.RemoteConversationID)
+				conversationHasNew[remoteID] = true
+			}
+		}
+	}
 	for _, event := range events {
 		if event.Kind != bridge.EventConversation {
+			continue
+		}
+		if history && present != nil &&
+			!conversationHasNew[v2keys.NormalizeRemoteConversationID(string(platform), event.Conversation.RemoteConversationID)] {
+			// Nothing in this frame would land in the thread, so the snapshot
+			// neither mints nor needs it.
 			continue
 		}
 		if history {
@@ -605,6 +644,7 @@ func (w *Worker) applyEvents(
 				*event.Message,
 				messageCount == 0,
 				progress,
+				present,
 			)
 			if err != nil {
 				return false, err
@@ -1150,6 +1190,14 @@ func (w *Worker) applyHistoryConversation(
 	}
 	if !started {
 		bound, _, err := w.existingConversation(accountID, platform, event.RemoteConversationID)
+		if err == nil && platform == bridge.PlatformWhatsApp {
+			// A WhatsApp remote ID is the chat's own JID (a phone JID or a
+			// group JID), never a device-local thread number that a phone swap
+			// can reassign, so a bound ID is the right thread by construction.
+			// Roster comparison would only see identity aliases (e164 versus
+			// jid peers, LID versus phone members) and drop real history.
+			return false, nil
+		}
 		if err == nil {
 			contradicts, err := w.historySnapshotContradicts(accountID, platform, event, bound)
 			if err != nil {
@@ -1167,7 +1215,10 @@ func (w *Worker) applyHistoryConversation(
 		if err != nil {
 			return false, err
 		}
-		if len(peers) > 0 {
+		// Distinct WhatsApp JIDs are distinct chats even when their rosters
+		// match (two groups with the same members), so only Google's opaque
+		// thread IDs need the roster guard against minting a duplicate thread.
+		if len(peers) > 0 && platform != bridge.PlatformWhatsApp {
 			direct := event.Kind != string(sqlite.ConversationKindGroup)
 			_, findErr := w.findThreadByRoster(accountID, direct, peers)
 			if findErr == nil {
@@ -1261,10 +1312,17 @@ func (w *Worker) historyMessage(
 	event bridge.MessageEvent,
 	routeEcho bool,
 	progress *historyFrameProgress,
+	present map[string]bool,
 ) (sqlite.Message, bool, error) {
 	key := reactionRemoteTargetKey(platform, event.RemoteConversationID, event.RemoteMessageID)
 	if message, ok := progress.insertedMessage(key); ok {
 		return message, true, nil
+	}
+	if present[strings.TrimSpace(event.RemoteMessageID)] {
+		// Held under some thread of this account already (account-wide
+		// WhatsApp check in applyEvents); history never adds a second copy.
+		w.counters.account(accountID).historyExisting.Add(1)
+		return sqlite.Message{}, false, nil
 	}
 	exists, err := w.historyMessageExists(ctx, accountID, platform, event)
 	if err != nil {
@@ -1332,7 +1390,10 @@ func (w *Worker) historyMessageConversation(
 	if err != nil {
 		return sqlite.Conversation{}, "", err
 	}
-	if sender != nil && conversation.Kind == sqlite.ConversationKindDirect {
+	// A WhatsApp direct thread's remote ID is its peer's JID, and the decoder
+	// names that same JID as the incoming sender, so there is no binding for
+	// the check to protect; it would only trip on e164/jid identity aliases.
+	if sender != nil && conversation.Kind == sqlite.ConversationKindDirect && platform != bridge.PlatformWhatsApp {
 		peers, err := w.store.ListConversationPeerIdentities(accountID, conversation.ConversationID)
 		if err != nil {
 			return sqlite.Conversation{}, "", err

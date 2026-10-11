@@ -402,7 +402,11 @@ func TestI3I4SeededChatAndRowCategories(t *testing.T) {
 	}
 }
 
-func TestI5AmbiguousRostersSkipAllThreadsAndSameJIDMerges(t *testing.T) {
+func TestDistinctGroupJIDsWithSameRosterAreAllCapturedAndSameJIDMerges(t *testing.T) {
+	// WhatsApp group JIDs are authoritative chat identities: two groups with
+	// the same members are two chats, and the worker places each by its JID,
+	// so capture must not drop either. Two Desktop sessions for one JID still
+	// merge into one snapshot.
 	path, db := desktopFixture(t)
 	fixtureChat(t, db, 1, "15550000000-1@g.us", "")
 	fixtureChat(t, db, 2, "15550000000-2@g.us", "")
@@ -417,27 +421,54 @@ func TestI5AmbiguousRostersSkipAllThreadsAndSameJIDMerges(t *testing.T) {
 		fixtureMessage(t, db, pk, pk, 0, 0, pk, 0, 1000+float64(pk), "synthetic")
 	}
 	chunks, stats := capture(t, New(Options{DBPath: path}), ScanOptions{ChunkSize: 1})
-	if stats.ChatsSkippedByReason["ambiguous_roster"] != 2 || stats.RowsSkippedByReason["ambiguous_roster"] != 2 ||
-		stats.ChatsResolved != 2 || len(chunks) != 2 {
-		t.Fatalf("identical distinct threads not conservatively skipped: %+v", stats)
+	if stats.ChatsResolved != 4 || len(stats.ChatsSkippedByReason) != 0 || len(chunks) != 4 {
+		t.Fatalf("same-roster groups were not all captured: %+v (%d chunks)", stats, len(chunks))
 	}
+	seen := map[string]int{}
 	for _, chunk := range chunks {
-		if chunk.Chat.JID != "15550000000-3@g.us" ||
-			chunk.Chat.Title != "Synthetic chat 3" || len(chunk.Chat.Participants) != 1 {
+		seen[chunk.Chat.JID]++
+		if chunk.Chat.JID == "15550000000-3@g.us" &&
+			(chunk.Chat.Title != "Synthetic chat 3" || len(chunk.Chat.Participants) != 1) {
 			t.Fatalf("same-JID merged snapshot changed by raw session: %+v", chunk.Chat)
 		}
 	}
+	if seen["15550000000-1@g.us"] != 1 || seen["15550000000-2@g.us"] != 1 || seen["15550000000-3@g.us"] != 2 {
+		t.Fatalf("chunks by JID = %v", seen)
+	}
 }
 
-func TestI5EmptyGroupRostersAreNotAmbiguityEvidence(t *testing.T) {
+func TestGroupRosterListsOnlyActiveMembersButResolvesFormerSenders(t *testing.T) {
 	path, db := desktopFixture(t)
-	for pk := 1; pk <= 2; pk++ {
-		fixtureChat(t, db, pk, fmt.Sprintf("15550000000-%d@g.us", pk), "")
-		fixtureMessage(t, db, pk, pk, 0, 0, 0, 0, 1000, "synthetic group text")
+	execFixture(t, db, `ALTER TABLE ZWAGROUPMEMBER ADD COLUMN ZISACTIVE INTEGER`)
+	fixtureChat(t, db, 1, "15550000000-1@g.us", "")
+	execFixture(t, db, `INSERT INTO ZWAGROUPMEMBER VALUES (1,1,'15550000001@s.whatsapp.net',NULL,'Synthetic current',1)`)
+	execFixture(t, db, `INSERT INTO ZWAGROUPMEMBER VALUES (2,1,'15550000002@s.whatsapp.net',NULL,'Synthetic former',0)`)
+	fixtureMessage(t, db, 1, 1, 0, 0, 2, 0, 1000, "synthetic old message from a former member")
+	chunks, _ := capture(t, New(Options{DBPath: path}), ScanOptions{})
+	if len(chunks) != 1 || len(chunks[0].Messages) != 1 {
+		t.Fatalf("chunks = %+v", chunks)
 	}
-	chunks, stats := capture(t, New(Options{DBPath: path}), ScanOptions{})
-	if len(chunks) != 2 || stats.ChatsResolved != 2 || stats.ChatsSkippedByReason["ambiguous_roster"] != 0 {
-		t.Fatalf("empty rosters were treated as equal evidence: %+v", stats)
+	roster := chunks[0].Chat.Participants
+	if len(roster) != 1 || roster[0].JID != "15550000001@s.whatsapp.net" {
+		t.Fatalf("roster = %+v, want only the active member", roster)
+	}
+	if got := chunks[0].Messages[0].SenderJID; got != "15550000002@s.whatsapp.net" {
+		t.Fatalf("former member's message sender = %q", got)
+	}
+}
+
+func TestDocumentFileNameComesFromText(t *testing.T) {
+	path, db := desktopFixture(t)
+	fixtureChat(t, db, 1, "15550000001@s.whatsapp.net", "")
+	execFixture(t, db, `INSERT INTO ZWAMEDIAITEM (Z_PK,ZTITLE) VALUES (1,'synthetic caption')`)
+	fixtureMessage(t, db, 1, 1, 8, 0, 0, 1, 1000, "synthetic-file.pdf")
+	chunks, _ := capture(t, New(Options{DBPath: path}), ScanOptions{})
+	if len(chunks) != 1 || len(chunks[0].Messages) != 1 {
+		t.Fatalf("chunks = %+v", chunks)
+	}
+	message := chunks[0].Messages[0]
+	if message.FileName != "synthetic-file.pdf" || message.Caption != "synthetic caption" {
+		t.Fatalf("document file name %q caption %q", message.FileName, message.Caption)
 	}
 }
 
@@ -554,5 +585,30 @@ func TestDesktopReaderDifferentialLegacyTextRows(t *testing.T) {
 	}
 	if compared != 6 || len(newText) != compared {
 		t.Fatalf("compared=%d new text=%d, want all six", compared, len(newText))
+	}
+}
+
+func TestPushNamesNameRosterAndSendersDeterministically(t *testing.T) {
+	path, db := desktopFixture(t)
+	execFixture(t, db, `CREATE TABLE ZWAPROFILEPUSHNAME (Z_PK INTEGER PRIMARY KEY, ZJID TEXT, ZPUSHNAME TEXT)`)
+	fixtureChat(t, db, 1, "15550000000-1@g.us", "")
+	// The member is a LID that maps to a phone JID; Desktop holds a push name
+	// under both forms, and the phone JID's own entry must win.
+	execFixture(t, db, `INSERT INTO ZWAGROUPMEMBER VALUES (1,1,'4242@lid','15550000001@s.whatsapp.net','Synthetic label')`)
+	execFixture(t, db, `INSERT INTO ZWAGROUPMEMBER VALUES (2,1,'15550000002@s.whatsapp.net',NULL,'Synthetic label two')`)
+	execFixture(t, db, `INSERT INTO ZWAPROFILEPUSHNAME VALUES (1,'4242@lid','Synthetic stale LID name')`)
+	execFixture(t, db, `INSERT INTO ZWAPROFILEPUSHNAME VALUES (2,'15550000001@s.whatsapp.net','Synthetic phone name')`)
+	execFixture(t, db, `INSERT INTO ZWAPROFILEPUSHNAME VALUES (3,'99@lid','  ')`)
+	fixtureMessage(t, db, 1, 1, 0, 0, 1, 0, 1000, "synthetic group text")
+	chunks, _ := capture(t, New(Options{DBPath: path}), ScanOptions{})
+	if len(chunks) != 1 || len(chunks[0].Messages) != 1 {
+		t.Fatalf("chunks = %+v", chunks)
+	}
+	want := []Participant{{JID: "15550000001@s.whatsapp.net", Name: "Synthetic phone name"}, {JID: "15550000002@s.whatsapp.net"}}
+	if !reflect.DeepEqual(chunks[0].Chat.Participants, want) {
+		t.Fatalf("participants = %+v, want %+v", chunks[0].Chat.Participants, want)
+	}
+	if got := chunks[0].Messages[0].SenderName; got != "Synthetic phone name" {
+		t.Fatalf("sender name = %q", got)
 	}
 }

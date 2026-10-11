@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -26,6 +27,10 @@ const (
 	whatsappDesktopFullInterval = 6 * time.Hour
 	whatsappDesktopOfflineDelay = 5 * time.Minute
 	whatsappDesktopChunkSize    = 100
+	// A failed scan retries after this delay, doubling to the maximum, so a
+	// persistent fault never re-appends every frame every 30 seconds.
+	whatsappDesktopRetryMin = time.Minute
+	whatsappDesktopRetryMax = time.Hour
 )
 
 // whatsappDesktopFeedStatus describes the history feeder only. It never
@@ -82,6 +87,11 @@ type whatsappDesktopFeed struct {
 	logged  map[string]bool
 	initErr error
 	selfJID string
+	// ownSends returns the wire IDs of the app's own queued or sent messages.
+	// The outbox and live channel own those rows; desktop history skips them.
+	ownSends   func() (map[string]bool, error)
+	retryAfter time.Time
+	retryDelay time.Duration
 }
 
 func whatsappDesktopFeedEnabled(stack *v2Stack, transports, demo bool) bool {
@@ -125,6 +135,8 @@ func newWhatsAppDesktopFeed(stack *v2Stack, dataDir string, transports, demo boo
 	f.scan = reader.Scan
 	f.sink = stack.Sink
 	f.selfJID = selfJID
+	store := stack.Store
+	f.ownSends = func() (map[string]bool, error) { return whatsappDesktopOwnSends(store) }
 	if err := f.checkAvailable(); err != nil {
 		f.recordError(err)
 	}
@@ -151,33 +163,60 @@ func ensureWhatsAppDesktopAccount(store *sqlite.Store) error {
 	})
 }
 
-// Capture uses the existing WhatsApp self identity's PN JID, matching live
-// canonicalJID(...).String(). If no PN self identity exists, the empty sender
-// is intentional: IsFromMe/IsSelf still identifies outgoing messages and the
-// worker never resolves an outgoing sender identity. No self identity is minted.
+// Capture uses the account's self phone JID, matching live
+// canonicalJID(...).String(). Every self identity is considered (newest first)
+// because the newest may be a LID or other form while an older row holds the
+// phone number. If none is a phone number, the empty sender is intentional:
+// IsFromMe still marks outgoing messages and the worker never resolves an
+// outgoing sender identity. No self identity is minted.
 func whatsappDesktopSelfJID(store *sqlite.Store) (string, error) {
-	identityID, found, err := store.SelfIdentityID(whatsappAccountID)
-	if err != nil || !found {
-		return "", err
-	}
-	identity, err := store.GetIdentity(identityID)
+	values, err := store.SelfIdentityValues(whatsappAccountID)
 	if err != nil {
 		return "", err
 	}
-	value := strings.TrimSpace(identity.CanonicalValue)
-	if identity.Kind == "e164" {
+	for _, identity := range values {
+		if jid := whatsappDesktopPhoneJID(identity.Kind, identity.CanonicalValue); jid != "" {
+			return jid, nil
+		}
+	}
+	return "", nil
+}
+
+func whatsappDesktopPhoneJID(kind, canonical string) string {
+	value := strings.TrimSpace(canonical)
+	switch kind {
+	case "e164":
 		value = strings.TrimPrefix(value, "+") + "@s.whatsapp.net"
+	case "jid":
+	default:
+		return ""
 	}
 	jid, err := types.ParseJID(value)
 	if err != nil || jid.Server != types.DefaultUserServer || jid.User == "" || jid.User == "0" {
-		return "", nil
+		return ""
 	}
 	for _, digit := range jid.User {
 		if digit < '0' || digit > '9' {
-			return "", nil
+			return ""
 		}
 	}
-	return jid.ToNonAD().String(), nil
+	return jid.ToNonAD().String()
+}
+
+// whatsappDesktopOwnSends maps every v2 WhatsApp send's transport request ID
+// to the stanza ID the send path derives from it. Desktop sees those messages
+// too; if a send's acknowledgement was lost, its local row still sits under the
+// request ID, and inserting Desktop's copy would duplicate it.
+func whatsappDesktopOwnSends(store *sqlite.Store) (map[string]bool, error) {
+	requestIDs, err := store.MessageOutboxTransportRequestIDs(whatsappAccountID)
+	if err != nil {
+		return nil, err
+	}
+	own := make(map[string]bool, len(requestIDs))
+	for _, requestID := range requestIDs {
+		own[whatsapplive.DeriveWebMessageID(requestID)] = true
+	}
+	return own, nil
 }
 
 func (f *whatsappDesktopFeed) Snapshot() whatsappDesktopFeedStatus {
@@ -233,8 +272,23 @@ var errWhatsAppDesktopLiveServing = errors.New("WhatsApp live bridge resumed dur
 func (f *whatsappDesktopFeed) scanOnce(ctx context.Context, now time.Time) {
 	f.scanMu.Lock()
 	defer f.scanMu.Unlock()
+	// A fault in Desktop's data must never take down the daemon, which also
+	// carries the live Google and Signal connections.
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			f.logger.Error().
+				Interface("panic", recovered).
+				Bytes("stack", debug.Stack()).
+				Msg("WhatsApp desktop history scan panicked")
+			f.recordError(fmt.Errorf("WhatsApp desktop history scan panicked: %v", recovered))
+			f.backOff(now)
+		}
+	}()
 	snapshot := f.Snapshot()
 	if !snapshot.Enabled || f.initErr != nil {
+		return
+	}
+	if now.Before(f.retryAfter) {
 		return
 	}
 	if !f.gate.allowed(f.live(), now) {
@@ -245,8 +299,19 @@ func (f *whatsappDesktopFeed) scanOnce(ctx context.Context, now time.Time) {
 	}
 	if err := f.checkAvailable(); err != nil {
 		f.recordError(err)
+		f.backOff(now)
 		return
 	}
+	var ownSends map[string]bool
+	if f.ownSends != nil {
+		var err error
+		if ownSends, err = f.ownSends(); err != nil {
+			f.recordError(fmt.Errorf("WhatsApp desktop feed: read own sends: %w", err))
+			f.backOff(now)
+			return
+		}
+	}
+	ownSendsSkipped := int64(0)
 	full := snapshot.LastFullScanAtMS == 0 || now.Sub(time.UnixMilli(snapshot.LastFullScanAtMS)) >= whatsappDesktopFullInterval
 	afterPK := snapshot.HighWaterPK
 	if full {
@@ -271,13 +336,25 @@ func (f *whatsappDesktopFeed) scanOnce(ctx context.Context, now time.Time) {
 		if !f.gate.allowed(f.live(), time.Now()) {
 			return errWhatsAppDesktopLiveServing
 		}
+		messages := chunk.Messages[:0:0]
+		for _, message := range chunk.Messages {
+			if message.IsFromMe && ownSends[message.StanzaID] {
+				ownSendsSkipped++
+				continue
+			}
+			messages = append(messages, message)
+		}
+		if len(messages) == 0 {
+			return nil
+		}
+		chunk.Messages = messages
 		frame := ingest.WhatsAppDesktopHistorySnapshot{ChatJID: chunk.Chat.JID, Title: chunk.Chat.Title}
 		for _, participant := range chunk.Chat.Participants {
 			frame.Participants = append(frame.Participants, ingest.WhatsAppDesktopHistoryParticipant{JID: participant.JID, Name: participant.Name, IsSelf: f.selfJID != "" && participant.JID == f.selfJID})
 		}
 		for _, message := range chunk.Messages {
 			frame.Messages = append(frame.Messages, ingest.WhatsAppDesktopHistoryMessage{
-				StanzaID: message.StanzaID, SenderJID: message.SenderJID, TimestampMS: message.TimestampMS,
+				StanzaID: message.StanzaID, SenderJID: message.SenderJID, SenderName: message.SenderName, TimestampMS: message.TimestampMS,
 				IsFromMe: message.IsFromMe, Type: message.Type, Text: message.Text, Caption: message.Caption,
 				FileName: message.FileName, MIMEType: message.MIMEType, LocalMediaRef: message.LocalMediaRef,
 				VoiceNote: message.VoiceNote, Size: message.Size,
@@ -303,6 +380,12 @@ func (f *whatsappDesktopFeed) scanOnce(ctx context.Context, now time.Time) {
 	// Skip counters describe the most recent scan, rather than multiplying
 	// the same skipped rows on each six-hour full rescan.
 	f.status.RowsSkippedByReason = stats.RowsSkippedByReason
+	if ownSendsSkipped > 0 {
+		if f.status.RowsSkippedByReason == nil {
+			f.status.RowsSkippedByReason = map[string]int64{}
+		}
+		f.status.RowsSkippedByReason["own_send"] += ownSendsSkipped
+	}
 	if err != nil && callbackErr == nil && !errors.Is(err, context.Canceled) {
 		// A readable file can still be a corrupt or unsupported Desktop
 		// database. Projection/append failures leave source availability alone.
@@ -319,9 +402,28 @@ func (f *whatsappDesktopFeed) scanOnce(ctx context.Context, now time.Time) {
 		f.status.LastError = ""
 	}
 	f.mu.Unlock()
+	if err == nil {
+		f.retryAfter, f.retryDelay = time.Time{}, 0
+	}
 	if err != nil && !errors.Is(err, errWhatsAppDesktopLiveServing) && !errors.Is(err, context.Canceled) {
 		f.recordError(err)
+		f.backOff(now)
 	}
+}
+
+// backOff delays the next scan after a failure: one minute, doubling to an
+// hour, reset by the next successful scan. Callers hold scanMu.
+func (f *whatsappDesktopFeed) backOff(now time.Time) {
+	switch {
+	case f.retryDelay <= 0:
+		f.retryDelay = whatsappDesktopRetryMin
+	case f.retryDelay < whatsappDesktopRetryMax:
+		f.retryDelay *= 2
+		if f.retryDelay > whatsappDesktopRetryMax {
+			f.retryDelay = whatsappDesktopRetryMax
+		}
+	}
+	f.retryAfter = now.Add(f.retryDelay)
 }
 
 func (f *whatsappDesktopFeed) Start(ctx context.Context) func() {
