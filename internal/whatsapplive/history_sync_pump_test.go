@@ -711,7 +711,8 @@ func TestHistorySyncQueueFullLeavesTheNotificationForRedelivery(t *testing.T) {
 }
 
 // TestHistorySyncPumpStopsWithoutCountingAnAttempt: Close cancels a pass
-// mid-download; the notification keeps its attempts, and Close returns.
+// mid-download and returns only once the pass has returned (the queue's
+// database closes right after), and the notification keeps its attempts.
 func TestHistorySyncPumpStopsWithoutCountingAnAttempt(t *testing.T) {
 	f := newPumpFixture(t, openMemoryDB(t), 16, 16)
 	pump := f.bridge.historySync
@@ -719,6 +720,9 @@ func TestHistorySyncPumpStopsWithoutCountingAnAttempt(t *testing.T) {
 	pump.download = func(ctx context.Context, _ *whatsmeow.Client, _ *waE2E.HistorySyncNotification) (*waHistorySync.HistorySync, error) {
 		close(started)
 		<-ctx.Done()
+		// A download that takes a moment to notice the cancellation: Close
+		// must wait it out.
+		time.Sleep(20 * time.Millisecond)
 		return nil, ctx.Err()
 	}
 	f.notify("a", false)
@@ -733,6 +737,11 @@ func TestHistorySyncPumpStopsWithoutCountingAnAttempt(t *testing.T) {
 	case <-stopped:
 	case <-time.After(5 * time.Second):
 		t.Fatal("stopping the pump hung on a download")
+	}
+	select {
+	case <-pump.done:
+	default:
+		t.Fatal("stopHistorySyncPump returned while the pump was still running")
 	}
 	seqs, _ := pump.queue.due(queueTestFarFuture)
 	row, _, _ := pump.queue.load(seqs[0])
@@ -818,4 +827,127 @@ func openSessionStoreForTest(t *testing.T) *sqlstore.Container {
 	}
 	t.Cleanup(func() { _ = container.Close() })
 	return container
+}
+
+// TestHistorySyncPumpResumesWhenTheAccountConnects: a pump that found the
+// account disconnected stays idle until Connected, which wakes it to work
+// through the queue. This is how a run that starts with notifications from an
+// earlier one gets to them.
+func TestHistorySyncPumpResumesWhenTheAccountConnects(t *testing.T) {
+	f := newPumpFixture(t, openMemoryDB(t), 16, 16)
+	f.setConnected(false)
+	f.notify("a", true)
+	pump := f.bridge.historySync
+	f.bridge.startHistorySyncPump()
+	t.Cleanup(f.bridge.stopHistorySyncPump)
+	// Let the pump consume its wake-up and finish the pass it starts.
+	deadline := time.Now().Add(5 * time.Second)
+	for len(pump.wakeCh) > 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the pump never woke")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	pump.passMu.Lock()
+	pump.passMu.Unlock()
+	if got := f.effects(); len(got) != 0 {
+		t.Fatalf("effects while disconnected: %v", got)
+	}
+
+	f.bridge.handleClientEvent(nil, 0, &waevents.Connected{})
+	for len(f.queued()) > 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("Connected did not resume the queue (effects %v)", f.effects())
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if got := f.effects(); !reflect.DeepEqual(got, []string{"download:a", "commit:a", "receipt:a"}) {
+		t.Fatalf("effects once connected = %v", got)
+	}
+}
+
+// TestHistorySyncPumpKeepsAChunkItsClientNoLongerOwns: the account is unpaired
+// and paired again while a chunk downloads, so the client that downloaded it
+// is retired. The bridge does not apply the chunk; the notification stays
+// queued with no attempt counted, and the new client commits it.
+func TestHistorySyncPumpKeepsAChunkItsClientNoLongerOwns(t *testing.T) {
+	f := newPumpFixture(t, openMemoryDB(t), 16, 16)
+	f.notify("a", true)
+	f.downloadOutcome = func(string) error {
+		f.bridge.mu.Lock()
+		f.bridge.client = &whatsmeow.Client{Store: &wastore.Device{ID: &f.own}}
+		f.bridge.clientGeneration++
+		f.bridge.mu.Unlock()
+		return nil
+	}
+	f.pass()
+	if got := f.effects(); !reflect.DeepEqual(got, []string{"download:a"}) {
+		t.Fatalf("effects = %v, want the download only", got)
+	}
+	seqs, _ := f.bridge.historySync.queue.due(queueTestFarFuture)
+	if len(seqs) != 1 {
+		t.Fatalf("queue holds %d notifications, want 1", len(seqs))
+	}
+	row, _, _ := f.bridge.historySync.queue.load(seqs[0])
+	if row.attempts != 0 || row.committed {
+		t.Fatalf("attempts %d committed %v, want 0 and false", row.attempts, row.committed)
+	}
+
+	f.downloadOutcome = func(string) error { return nil }
+	f.advance(time.Minute)
+	f.pass()
+	if got := f.effects(); !reflect.DeepEqual(got, []string{"download:a", "download:a", "commit:a", "receipt:a"}) {
+		t.Fatalf("effects = %v", got)
+	}
+}
+
+// TestDownloadHistorySyncChunkStoresWhatItCarriesWhenCancelled: Close cancels
+// the pump's context. A chunk whose bytes are already fetched is parsed and
+// what it carries for whatsmeow (here, push names) stored regardless, since
+// the chunk itself may already be on its way to v2.
+func TestDownloadHistorySyncChunkStoresWhatItCarriesWhenCancelled(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "whatsapp-session.db")
+	own := watypes.JID{User: "15550000000", Device: 7, Server: watypes.DefaultUserServer}
+	SeedDeviceForTeardownTest(t, path, own)
+	open := func() *wastore.Device {
+		container, err := sqlstore.New(context.Background(), "sqlite", sessionStoreDSN(path), waLog.Noop)
+		if err != nil {
+			t.Fatalf("sqlstore.New(): %v", err)
+		}
+		t.Cleanup(func() { _ = container.Close() })
+		device, err := container.GetFirstDevice(context.Background())
+		if err != nil {
+			t.Fatalf("GetFirstDevice(): %v", err)
+		}
+		return device
+	}
+	cli := whatsmeow.NewClient(open(), nil)
+
+	peer := watypes.NewJID("15551234567", watypes.DefaultUserServer)
+	raw, err := proto.Marshal(&waHistorySync.HistorySync{
+		SyncType:  waHistorySync.HistorySync_PUSH_NAME.Enum(),
+		Pushnames: []*waHistorySync.Pushname{{ID: proto.String(peer.String()), Pushname: proto.String("Ada")}},
+	})
+	if err != nil {
+		t.Fatalf("marshal chunk: %v", err)
+	}
+	var compressed bytes.Buffer
+	writer := zlib.NewWriter(&compressed)
+	_, _ = writer.Write(raw)
+	_ = writer.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := downloadHistorySyncChunk(ctx, cli, &waE2E.HistorySyncNotification{
+		InitialHistBootstrapInlinePayload: compressed.Bytes(),
+	}); err != nil {
+		t.Fatalf("downloadHistorySyncChunk(): %v", err)
+	}
+	contact, err := open().Contacts.GetContact(context.Background(), peer)
+	if err != nil {
+		t.Fatalf("GetContact(): %v", err)
+	}
+	if contact.PushName != "Ada" {
+		t.Fatalf("stored push name = %q, want %q", contact.PushName, "Ada")
+	}
 }

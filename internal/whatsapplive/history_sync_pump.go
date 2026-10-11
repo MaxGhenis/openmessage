@@ -85,7 +85,10 @@ func newHistorySyncPump(queue *historySyncQueue) *historySyncPump {
 // DownloadHistorySync given those bytes inline, so the parse touches no
 // network. Storage is synchronous: what the chunk carries for whatsmeow (LID
 // mappings, push names, message secrets, the NCT salt) is stored before the
-// chunk is handed on and its row removed.
+// chunk is handed on and its row removed. Parsing and storage are local and
+// short, and run detached from ctx, as whatsmeow's own loop runs its storage
+// (context.WithoutCancel): a Close that cancels ctx mid-storage must not
+// leave a chunk that commits with its side data half stored.
 func downloadHistorySyncChunk(ctx context.Context, cli *whatsmeow.Client, notification *waE2E.HistorySyncNotification) (*waHistorySync.HistorySync, error) {
 	data := notification.InitialHistBootstrapInlinePayload
 	if data == nil {
@@ -96,7 +99,7 @@ func downloadHistorySyncChunk(ctx context.Context, cli *whatsmeow.Client, notifi
 	}
 	inline := proto.Clone(notification).(*waE2E.HistorySyncNotification)
 	inline.InitialHistBootstrapInlinePayload = data
-	chunk, err := cli.DownloadHistorySync(ctx, inline, true)
+	chunk, err := cli.DownloadHistorySync(context.WithoutCancel(ctx), inline, true)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", errHistorySyncUnreadable, err)
 	}
