@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"fmt"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -12,8 +13,8 @@ import (
 // Local desktop imports are the legacy-store importers that read other apps'
 // databases on this Mac: WhatsApp Desktop (ChatStorage.sqlite), Signal Desktop
 // (sql/db.sqlite) and Messages (chat.db). The daemon polls the configured ones
-// every 30 s (not iMessage; see ImportIMessage) and rescans Signal Desktop in
-// full every 30 min. They write only the legacy messages.db.
+// every 30 s and rescans Signal Desktop in full every 30 min. They write only
+// the legacy messages.db.
 
 // Why a daemon runs none of the local desktop importers ("" = it runs them).
 const (
@@ -82,10 +83,8 @@ type localImportsConfig struct {
 	IMessageSupported  bool
 
 	// The importers. Signal's full flag forces a full rescan instead of the
-	// incremental window. ImportIMessage is nil on the daemon: importer.IMessage
-	// re-reads and rewrites every chat and message on each call (on a real
-	// 2,020-chat chat.db, 334 s to re-import it unchanged), and an incremental
-	// version needs native tapback metadata and late-join tracking first.
+	// incremental window. ImportIMessage is one importer.IMessage reused
+	// across polls, so each poll reads only what chat.db changed.
 	ImportWhatsApp func(store *db.Store) (*importer.ImportResult, error)
 	ImportSignal   func(store *db.Store, account string, full bool) (*importer.ImportResult, error)
 	ImportIMessage func(store *db.Store) (*importer.ImportResult, error)
@@ -126,10 +125,13 @@ func (l *localImports) logDecision() {
 	switch l.cfg.OffReason {
 	case "":
 		msg := "Local desktop imports on (legacy store): WhatsApp Desktop while its live bridge is unused, Signal Desktop while signal-cli is paired"
-		if l.iMessageEnabled() {
-			msg += ", iMessage"
-		} else {
-			msg += "; iMessage stays off until its importer stops rewriting all of chat.db on every poll"
+		switch {
+		case l.iMessageEnabled():
+			msg += ", iMessage (chat.db changes since the last poll)"
+		case !l.cfg.IMessageSupported:
+			msg += "; no iMessage (macOS only)"
+		default:
+			msg += "; no iMessage importer configured"
 		}
 		logger.Info().
 			Bool("app_sandbox", l.cfg.Sandboxed).
@@ -161,6 +163,12 @@ func (l *localImports) syncOnce() bool {
 		if err != nil {
 			logSyncError(l.cfg.Logger, l.lastErr, platform, err)
 			return
+		}
+		if len(result.Errors) > 0 {
+			// Rows the importer could not write (it retries them); the rest
+			// of the poll still landed.
+			logSyncError(l.cfg.Logger, l.lastErr, platform,
+				fmt.Errorf("%d rows not written, first: %s", len(result.Errors), result.Errors[0]))
 		}
 		if result.MessagesImported == 0 {
 			return

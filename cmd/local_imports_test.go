@@ -1,11 +1,13 @@
 package cmd
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"path/filepath"
 	"reflect"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/rs/zerolog"
@@ -188,6 +190,28 @@ func TestLocalImportsImporterErrorIsNotAChange(t *testing.T) {
 	}
 	if l.lastErr["whatsapp"] == "" {
 		t.Fatal("the failure was not remembered for log de-duplication")
+	}
+}
+
+// TestLocalImportsLogsRowsNotWritten: rows an importer could not write (the
+// iMessage importer retries them next poll) are logged once, not on every
+// repeat of the same failure, and are not a change by themselves.
+func TestLocalImportsLogsRowsNotWritten(t *testing.T) {
+	var logged bytes.Buffer
+	l := newLocalImports(localImportsConfig{
+		Logger:            zerolog.New(&logged),
+		IMessageSupported: true,
+		ImportIMessage: func(*db.Store) (*importer.ImportResult, error) {
+			return &importer.ImportResult{Errors: []string{"imessage:g1: UNIQUE constraint failed"}}, nil
+		},
+	})
+	for i := 0; i < 3; i++ {
+		if l.syncOnce() {
+			t.Fatal("a poll that wrote nothing reported a change")
+		}
+	}
+	if n := strings.Count(logged.String(), "1 rows not written, first: imessage:g1: UNIQUE constraint failed"); n != 1 {
+		t.Fatalf("logged %d times, want once:\n%s", n, logged.String())
 	}
 }
 

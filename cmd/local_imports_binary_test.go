@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -57,8 +58,14 @@ func TestBuiltBinaryLocalImportsDecision(t *testing.T) {
 		dataDir := filepath.Join(t.TempDir(), "data")
 		output := run(t, dataDir, "OPENMESSAGES_APP_SANDBOX=0", "OPENMESSAGES_V2_PRIMARY=0")
 		expectOnly(t, output, on)
-		if !strings.Contains(output, "iMessage stays off") {
-			t.Fatalf("the daemon must say the iMessage poll stays off:\n%s", output)
+		// iMessage polls on macOS only (HOME is empty here, so the importer
+		// finds no chat.db and reads nothing of the developer's).
+		want := "; no iMessage (macOS only)"
+		if runtime.GOOS == "darwin" {
+			want = ", iMessage (chat.db changes since the last poll)"
+		}
+		if !strings.Contains(output, want) {
+			t.Fatalf("the daemon must say %q:\n%s", want, output)
 		}
 	})
 	t.Run("launcher flag keeps them off", func(t *testing.T) {

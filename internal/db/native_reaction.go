@@ -58,11 +58,13 @@ func IsNativeTapbackType(assocType int64) bool {
 //
 // It is a pure function of the set of events: they are replayed in
 // (Date, RowID) order whatever order they arrive in, so a reaction synced
-// late with an older date leaves the same state as a full import. As in
-// Messages, each actor holds at most one reaction: an add replaces the
-// actor's current one, and a removal clears it only when it is of the
-// removed kind (for kind 6, also the same emoji, unless the removal names
-// none). Emojis are listed by their earliest active add, actors by their add.
+// late with an older date leaves the same state as a full import. Messages
+// lets each person add one Tapback per message and replaces it when they
+// choose another (Apple's Messages User Guide, "React with Tapbacks"), so
+// each actor holds at most one reaction: an add replaces the actor's current
+// one, and a removal clears it only when it is of the removed kind (for kind
+// 6, also the same emoji, unless the removal names none). Emojis are listed
+// by their earliest active add, actors by their add.
 func NativeReactionsJSON(events []NativeReaction) string {
 	if len(events) == 0 {
 		return ""

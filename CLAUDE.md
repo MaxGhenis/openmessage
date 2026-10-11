@@ -103,10 +103,12 @@ openmessage import imessage                     # reads ~/Library/Messages/chat.
 openmessage import whatsapp /path/to/chat.txt --name "Your Name"
 ```
 
-The daemon also polls Signal Desktop and WhatsApp Desktop into the legacy
-store, except on a v2-primary or sandboxed daemon. It does not poll iMessage;
-`import imessage` is a one-shot full import. `/api/status` `local_imports`
-says what runs, and the runbook ("Local desktop imports") says why.
+The daemon also polls Signal Desktop, WhatsApp Desktop and (on macOS)
+iMessage into the legacy store, except on a v2-primary or sandboxed daemon.
+The iMessage poll reads only what chat.db changed since the last poll, and
+reactions come from chat.db's native `associated_message_*` columns, never
+from quoted text. `/api/status` `local_imports` says what runs, and the
+runbook ("Local desktop imports") says how and why.
 
 ### MCP serving modes
 

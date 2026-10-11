@@ -389,10 +389,10 @@ Mac: Messages' `~/Library/Messages/chat.db` (needs Full Disk Access), Signal
 Desktop's `~/Library/Application Support/Signal/sql/db.sqlite` (key from the
 "Signal Safe Storage" keychain item) and WhatsApp Desktop's
 `ChatStorage.sqlite`. These importers write **only the legacy
-`messages.db`**. The daemon polls two of them every 30 s: WhatsApp Desktop
-while its live bridge is unused, and Signal Desktop while signal-cli is
-paired. It also rescans Signal Desktop in full every 30 min. It does not
-poll iMessage (see the end of this section).
+`messages.db`**. The daemon polls them every 30 s: WhatsApp Desktop while
+its live bridge is unused, Signal Desktop while signal-cli is paired, and
+iMessage on macOS (see the end of this section). It also rescans Signal
+Desktop in full every 30 min.
 
 Whether they run at all is one decision, logged once at startup and reported
 in `/api/status` (the log line is Info, which macOS keeps only in memory):
@@ -445,28 +445,83 @@ curl -s http://127.0.0.1:7007/api/status | jq '.local_imports'
   moves a timestamp, so it cannot touch the projection check (one candidate
   row on 2026-10-11).
 
-**iMessage is not polled on any install.** `importer.IMessage` re-reads all
-of chat.db and re-upserts every chat and message on each call. On Max's
-chat.db (2,020 chats, 43,731 messages with text), measured into an in-memory
-store on 2026-10-11:
-- a first import took 162 s;
-- importing the same, unchanged chat.db again took 334 s and rewrote every
-  row.
+### The iMessage poll
 
-From ed03e741 (2026-02-22) until #231 it also never returned: it held one
-SQLite connection and queried chat participants with the chat rows still
-open. The sandbox flag hid both problems from 2026-04-04. #231 fixes the hang
-and the dropped chats whose `display_name` is NULL, so `openmessage import
-imessage` and MCP `import_messages` work as one-shot full imports. A poll
-needs an incremental importer first. Two review rounds on #231 set its
-requirements:
-- read tapbacks from chat.db's `associated_message_guid` /
-  `associated_message_type`, not by matching quoted text, which can delete
-  typed messages;
-- track late `chat_message_join` rows, not only a message ROWID mark;
-- detect a replaced chat.db;
-- keep row metadata (transcripts, media) intact;
-- keep a one-message poll cheap on a large chat.
+The daemon keeps one `importer.IMessage` for its life
+(`internal/importer/imessage.go`). It holds a read-only connection to
+chat.db and, from its last successful poll, marks of what it read. A poll:
+
+- returns at once when chat.db's `PRAGMA data_version` has not moved, the
+  file is the same inode, and no earlier write is waiting to be retried. It
+  then reads nothing and touches no store;
+- otherwise reads, in one chat.db snapshot, the message rows above its
+  ROWID mark, the messages of `chat_message_join` rows above its join mark,
+  every row dated in the last 24 h (iMessage edits and unsends happen within
+  minutes, and outgoing rows get their date fixed just after insert), and
+  the whole `chat`, `handle` and `chat_handle_join` tables, and recomputes
+  only what those rows affect;
+- reads all of chat.db instead on its first call, when the path names a new
+  file, when a row at or below a mark is gone (the row at a mark changed, or
+  `COUNT(*)` is not the old count plus the rows above the mark), when a
+  known chat's guid or a known handle changed, and every 6 h.
+
+What it writes is a function of chat.db alone, the same for a poll, a first
+import and `openmessage import imessage`:
+
+- a conversation per chat, a message per row that has a body, is joined to
+  a chat and is not a reaction. A message joined to several chats lives in
+  the lowest chat ROWID;
+- reactions from chat.db's own `associated_message_type` (2000–2006 add,
+  3000–3006 remove) and `associated_message_guid` (`p:N/<guid>`,
+  `bp:<guid>`, or a bare guid), folded per target in (date, ROWID) order, one
+  reaction per person (`db.NativeReactionsJSON`, the same
+  `[{emoji,count,actors}]` JSON as everywhere else). Reaction rows get no row
+  of their own. A row with type 0 is a message whatever it says, so a typed
+  "Loved “hi”" stays text;
+- only the columns it owns (`internal/db/imessage_sync.go`), only where they
+  differ, in short `BEGIN IMMEDIATE` batches that re-check each row. It never
+  touches transcripts, media, reply ids, `mentions_me`, unread counts,
+  favorites, tabs or notification modes, and rows whose chat.db message was
+  deleted stay in the store.
+
+Startup `RepairTapbacks` (the SMS/RCS quote heuristic) skips iMessage rows.
+The first full read of a store an older importer filled therefore deletes
+the reaction text rows it left (unless something was attached to them),
+replaces reactions the heuristic guessed with the native ones, and restores
+typed rows that look like tapbacks, which the heuristic used to delete.
+
+SMS threads in chat.db carry reactions only as text ("Loved “…”" from an
+iPhone in a group with Android phones). Those rows are type 0, so they stay
+text: 398 such rows on Max's chat.db, all with service `SMS`.
+
+Measured on Max's chat.db (46,965 rows) into an in-memory store on
+2026-10-11, with `OPENMESSAGE_IMESSAGE_PROBE=1 go test ./internal/importer
+-run TestIMessageRealChatDBProbe -v` (read-only, prints counts and timings
+only):
+
+| | before | now |
+|---|---|---|
+| first import | 162 s | 3.5 s (42,214 messages, 2,020 chats, 1,461 messages with reactions) |
+| re-import of the unchanged chat.db | 334 s, every row rewritten | 0.36 s, nothing written |
+| poll, chat.db unchanged | (none) | 38 µs, skipped |
+| poll after a chat.db write that changed no message | | 14 ms |
+| poll over the newest 200 rows | | 37 ms |
+
+The 1,517 fewer message rows than the 43,731 that used to import are the
+reactions. On a synthetic 5,000-row chat with 833 reactions a one-message
+poll takes about 5 ms, and about 50 ms when every row is inside the 24 h
+window (`TestIMessageOneMessagePollStaysCheap`).
+
+The one change a poll does not see is an in-place edit to a message dated
+more than 24 h ago. Messages does not make those; the next full read
+(daemon start, or within 6 h) picks one up.
+
+From ed03e741 (2026-02-22) until #231 the importer also never returned: it
+held one SQLite connection and queried chat participants with the chat rows
+still open. #231 fixed that and the dropped chats whose `display_name` is
+NULL; #237 made the importer incremental and turned the poll back on. Its
+requirements were the findings of two review rounds on a first incremental
+design, withdrawn in #231.
 
 ## MCP serving — exactly one process may own live transports
 

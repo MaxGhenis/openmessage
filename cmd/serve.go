@@ -495,6 +495,11 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 	// Local desktop imports (WhatsApp Desktop, Signal Desktop, iMessage) write
 	// only the legacy store; see localImportsOffReason for when they run.
 	sandboxed := app.Sandboxed()
+	// One iMessage importer for the daemon's life: it holds a read-only
+	// chat.db connection and marks of what it read, so a poll reads only what
+	// changed since the last one (see importer.IMessage).
+	iMessageImporter := &importer.IMessage{MyName: identityName}
+	defer iMessageImporter.Close()
 	localSync := newLocalImports(localImportsConfig{
 		Logger:             logger,
 		Store:              a.Store,
@@ -517,9 +522,7 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 			}
 			return imp.ImportFromDB(store)
 		},
-		// No iMessage poll: the importer re-reads and rewrites all of chat.db
-		// on every call (see localImportsConfig.ImportIMessage).
-		ImportIMessage: nil,
+		ImportIMessage: iMessageImporter.ImportFromDB,
 	})
 	localSync.logDecision()
 
