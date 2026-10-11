@@ -1024,9 +1024,11 @@ func (a *Adapter) pairEventResult(
 		failure.Operation = "pair"
 		return bridge.PairResult{}, failure, true
 	case *waevents.ManualLoginReconnect:
-		// PairSuccess is dispatched before the pairing 515 handoff. Ignore the
-		// handoff here; the successful result disconnects this transport and the
-		// command control asks Supervisor to Start the paired lifecycle.
+		// whatsmeow dispatches PairSuccess from its pairing goroutine and this
+		// handoff from the connection's, in either order. Ignore the handoff
+		// here; PairSuccess (or a paired Connected) completes the attempt, the
+		// successful result disconnects this transport, and the command control
+		// asks Supervisor to Start the paired lifecycle.
 	}
 	return bridge.PairResult{}, nil, false
 }

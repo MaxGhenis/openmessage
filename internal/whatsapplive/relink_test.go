@@ -18,7 +18,6 @@ import (
 	"github.com/rs/zerolog"
 	"go.mau.fi/whatsmeow"
 	waBinary "go.mau.fi/whatsmeow/binary"
-	wastore "go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	watypes "go.mau.fi/whatsmeow/types"
 	waevents "go.mau.fi/whatsmeow/types/events"
@@ -39,7 +38,18 @@ func relinkTestSessionPath(t *testing.T) string {
 	return filepath.Join(t.TempDir(), "whatsapp-session.db")
 }
 
+// openRelinkTestBridge builds a bridge and claims the live session, as the
+// daemon does (initializeWhatsAppForServe).
 func openRelinkTestBridge(t *testing.T, sessionPath string) *Bridge {
+	t.Helper()
+	b := openObservingTestBridge(t, sessionPath)
+	b.ClaimLiveSession()
+	return b
+}
+
+// openObservingTestBridge builds a bridge that does not own the live session,
+// like one in a serve --no-transports process sharing the session store.
+func openObservingTestBridge(t *testing.T, sessionPath string) *Bridge {
 	t.Helper()
 	b, err := New(sessionPath, nil, zerolog.Nop(), Callbacks{})
 	if err != nil {
@@ -75,8 +85,8 @@ func heldIdentity(b *Bridge) linkedIdentity {
 	return b.identity
 }
 
-// storedIdentity reads one stored identity (JID and key fingerprint).
-func storedIdentity(t *testing.T, sessionPath string, jid watypes.JID) linkedIdentity {
+// readStoredIdentity reads one stored identity (JID and key fingerprint).
+func readStoredIdentity(t *testing.T, sessionPath string, jid watypes.JID) linkedIdentity {
 	t.Helper()
 	container, err := sqlstore.New(context.Background(), "sqlite", sessionStoreDSN(sessionPath), waLog.Noop)
 	if err != nil {
@@ -107,28 +117,48 @@ func deleteStoredDevice(t *testing.T, sessionPath string, jid watypes.JID) {
 // function is called (or the test ends).
 func failPurgeDeletes(t *testing.T) (restore func()) {
 	t.Helper()
-	original := deleteLoggedOutDevice
-	deleteLoggedOutDevice = func(context.Context, *sqlstore.Container, *wastore.Device) error {
-		return errors.New("injected: session store is locked")
+	original := deleteRevokedDevice
+	deleteRevokedDevice = func(context.Context, *sql.DB, string, []byte) (int64, error) {
+		return 0, errors.New("injected: session store is locked")
 	}
 	var once sync.Once
-	restore = func() { once.Do(func() { deleteLoggedOutDevice = original }) }
+	restore = func() { once.Do(func() { deleteRevokedDevice = original }) }
 	t.Cleanup(restore)
 	return restore
 }
 
-// failRecordWrites makes writes of the logout record fail until the returned
-// function is called (or the test ends).
+// failRecordWrites makes writes and clears of the logout record fail until
+// the returned function is called (or the test ends).
 func failRecordWrites(t *testing.T) (restore func()) {
 	t.Helper()
-	original := writeLoggedOutState
-	writeLoggedOutState = func(context.Context, *sql.DB, loggedOutState) error {
+	originalWrite, originalClear := writeLoggedOutRecord, clearLoggedOutRecord
+	writeLoggedOutRecord = func(context.Context, *sql.DB, loggedOutState) error {
 		return errors.New("injected: disk I/O error")
 	}
+	clearLoggedOutRecord = func(context.Context, *sql.DB, loggedOutState) (bool, error) {
+		return false, errors.New("injected: disk I/O error")
+	}
 	var once sync.Once
-	restore = func() { once.Do(func() { writeLoggedOutState = original }) }
+	restore = func() {
+		once.Do(func() { writeLoggedOutRecord, clearLoggedOutRecord = originalWrite, originalClear })
+	}
 	t.Cleanup(restore)
 	return restore
+}
+
+// storedRecord reads the logout record as another process would.
+func storedRecord(t *testing.T, sessionPath string) loggedOutState {
+	t.Helper()
+	database, err := sql.Open("sqlite", sessionStoreReadOnlyDSN(sessionPath))
+	if err != nil {
+		t.Fatalf("open session store: %v", err)
+	}
+	defer database.Close()
+	state, err := readLoggedOutRecord(context.Background(), database)
+	if err != nil {
+		t.Fatalf("read logout record: %v", err)
+	}
+	return state
 }
 
 // The mechanism behind the 2026-08-20 state, in the pinned whatsmeow: on a
@@ -475,7 +505,7 @@ func TestNewLinkEndsTheLogout(t *testing.T) {
 	if !status.Paired || status.NeedsRelink || status.AccountJID != relinkTestOtherJID.String() {
 		t.Fatalf("status after relinking = %+v, want paired as %s without needs_relink", status, relinkTestOtherJID)
 	}
-	if got, want := heldIdentity(b), storedIdentity(t, sessionPath, relinkTestOtherJID); got != want {
+	if got, want := heldIdentity(b), readStoredIdentity(t, sessionPath, relinkTestOtherJID); got != want {
 		t.Fatalf("held identity after PairSuccess = %+v, want the stored one %+v", got, want)
 	}
 	b = reopenRelinkTestBridge(t, b, sessionPath)
@@ -530,14 +560,14 @@ func TestInterruptedRelinkSupersedesTheLogout(t *testing.T) {
 		// WhatsApp relinked this install under the same JID: new keys.
 		deleteStoredDevice(t, sessionPath, relinkTestJID)
 		SeedLinkedDeviceForTest(t, sessionPath, relinkTestJID)
-		relinked := storedIdentity(t, sessionPath, relinkTestJID)
+		relinked := readStoredIdentity(t, sessionPath, relinkTestJID)
 		if relinked.Key == revoked.Key {
 			t.Fatal("the seeded relink reused the revoked identity key")
 		}
 
 		b = openRelinkTestBridge(t, sessionPath)
 		assertLinkedDevices(t, sessionPath, relinkTestJID.String())
-		if got := storedIdentity(t, sessionPath, relinkTestJID); got != relinked {
+		if got := readStoredIdentity(t, sessionPath, relinkTestJID); got != relinked {
 			t.Fatalf("stored identity = %+v, want the relinked one %+v kept", got, relinked)
 		}
 		if status := b.Status(); !status.Paired || status.NeedsRelink {
@@ -588,6 +618,7 @@ func TestConnectedAdoptsAnIdentityWhosePairSuccessIsMissing(t *testing.T) {
 		t.Fatalf("New(): %v", err)
 	}
 	t.Cleanup(func() { _ = b.Close() })
+	b.ClaimLiveSession()
 	b.handleEvent(&waevents.LoggedOut{Reason: waevents.ConnectFailureLoggedOut})
 	if !heldIdentity(b).empty() || !b.Status().NeedsRelink {
 		t.Fatal("logout did not leave an unpaired client with needs_relink")
@@ -611,7 +642,7 @@ func TestConnectedAdoptsAnIdentityWhosePairSuccessIsMissing(t *testing.T) {
 	}
 	b.handleEvent(&waevents.Connected{})
 
-	if want := storedIdentity(t, sessionPath, relinkTestOtherJID); heldIdentity(b) != want {
+	if want := readStoredIdentity(t, sessionPath, relinkTestOtherJID); heldIdentity(b) != want {
 		t.Fatalf("held identity = %+v, want the adopted %+v", heldIdentity(b), want)
 	}
 	if !reflect.DeepEqual(connectedPaired, []bool{true}) {
@@ -679,11 +710,14 @@ func testLogoutCallbackRacingUnpair(t *testing.T, relink bool) {
 		return errors.New("offline")
 	})
 
-	original := testHookBeforeLogoutRecord
-	t.Cleanup(func() { testHookBeforeLogoutRecord = original })
+	original := testHookAfterAdmission
+	t.Cleanup(func() { testHookAfterAdmission = original })
 	var unpairErr error
-	testHookBeforeLogoutRecord = func() {
-		testHookBeforeLogoutRecord = nil
+	testHookAfterAdmission = func(raw any) {
+		if _, ok := raw.(*waevents.LoggedOut); !ok {
+			return
+		}
+		testHookAfterAdmission = nil
 		unpairErr = b.Unpair()
 		if relink {
 			emulatePairingForTest(t, b, relinkTestOtherJID)
@@ -1178,7 +1212,7 @@ func TestRelinkStateMachineInvariants(t *testing.T) {
 		if r.IntN(2) == 0 {
 			jid := newJID()
 			SeedLinkedDeviceForTest(t, sessionPath, jid)
-			m.stored = storedIdentity(t, sessionPath, jid)
+			m.stored = readStoredIdentity(t, sessionPath, jid)
 			m.held = m.stored
 		}
 		b := openRelinkTestBridge(t, sessionPath)
@@ -1230,7 +1264,7 @@ func TestRelinkStateMachineInvariants(t *testing.T) {
 			var want []string
 			if !m.stored.empty() {
 				want = []string{m.stored.JID.String()}
-				if got := storedIdentity(t, sessionPath, m.stored.JID); got != m.stored {
+				if got := readStoredIdentity(t, sessionPath, m.stored.JID); got != m.stored {
 					t.Fatalf("case %d %s: stored identity %+v, model %+v", c, step, got, m.stored)
 				}
 			}
@@ -1294,14 +1328,14 @@ func TestRelinkStateMachineInvariants(t *testing.T) {
 						branches["relink after logout"]++
 					}
 					emulatePairingForTest(t, b, jid)
-					m.stored = storedIdentity(t, sessionPath, jid)
+					m.stored = readStoredIdentity(t, sessionPath, jid)
 					m.held = m.stored
 					m.marker, m.reason, m.sinceMS = linkedIdentity{}, "", 0
 					break
 				}
 				branches["pairing interrupted by a restart"]++
 				SeedLinkedDeviceForTest(t, sessionPath, jid)
-				m.stored = storedIdentity(t, sessionPath, jid)
+				m.stored = readStoredIdentity(t, sessionPath, jid)
 				b = reopenRelinkTestBridge(t, b, sessionPath)
 				m.held = m.stored
 				reconcile(&m)

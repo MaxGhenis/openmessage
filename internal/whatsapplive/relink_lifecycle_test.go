@@ -80,6 +80,7 @@ func TestRemoteLogoutLeavesTheAccountReadyToRelink(t *testing.T) {
 				t.Fatalf("whatsapplive.New(): %v", err)
 			}
 			t.Cleanup(func() { _ = host.Close() })
+			host.ClaimLiveSession() // as the daemon does
 
 			dialed := make(chan context.Context, 1)
 			whatsapplive.StubConnectForTest(t, func(ctx context.Context, _ *whatsmeow.Client) error {

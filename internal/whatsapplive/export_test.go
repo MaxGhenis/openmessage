@@ -7,6 +7,7 @@ import (
 
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/proto/waAdv"
+	wastore "go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	watypes "go.mau.fi/whatsmeow/types"
 	waevents "go.mau.fi/whatsmeow/types/events"
@@ -90,10 +91,10 @@ func LinkedDeviceJIDsForTest(t testing.TB, sessionPath string) []string {
 	return jids
 }
 
-// emulatePairingForTest does what a successful whatsmeow pairing does to the
-// current client (install the identity and save it) and then delivers
-// PairSuccess through the bridge's event path.
-func emulatePairingForTest(t testing.TB, b *Bridge, jid watypes.JID) {
+// emulatePairingSaveForTest does what whatsmeow's handlePair does to the
+// current client before it dispatches PairSuccess: install the identity on the
+// client's device and save it. It returns that device.
+func emulatePairingSaveForTest(t testing.TB, b *Bridge, jid watypes.JID) *wastore.Device {
 	t.Helper()
 	b.mu.Lock()
 	device := b.client.Store
@@ -104,5 +105,14 @@ func emulatePairingForTest(t testing.TB, b *Bridge, jid watypes.JID) {
 	if err != nil {
 		t.Fatalf("save paired device %s: %v", jid, err)
 	}
+	return device
+}
+
+// emulatePairingForTest does what a successful whatsmeow pairing does to the
+// current client (install the identity and save it) and then delivers
+// PairSuccess through the bridge's event path.
+func emulatePairingForTest(t testing.TB, b *Bridge, jid watypes.JID) {
+	t.Helper()
+	emulatePairingSaveForTest(t, b, jid)
 	b.handleEvent(&waevents.PairSuccess{ID: jid})
 }

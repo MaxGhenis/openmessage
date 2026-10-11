@@ -333,12 +333,15 @@ type Bridge struct {
 	// retired client can never affect or terminate the replacement generation.
 	clientGeneration uint64
 	// identity is the linked identity the current client generation holds,
-	// read from the session store when the client is built or taken from
-	// PairSuccess. No whatsmeow goroutine is rewriting the device at either
-	// point. Status, pairing state and logout handling read it instead of the
-	// live device, whose ID whatsmeow's Store.Delete sets to nil from its own
-	// goroutine without any lock the bridge holds.
-	identity              linkedIdentity
+	// read from the session store when the client is built, taken from
+	// PairSuccess, or adopted from the store on a paired Connected. None of
+	// these reads the live device, whose ID whatsmeow's Store.Delete sets to
+	// nil from its own goroutine without any lock the bridge holds.
+	identity linkedIdentity
+	// loggedOutGeneration is the client generation whose logout was last
+	// recorded. The purge replaces that client even when the bridge had not
+	// yet recorded the identity it paired (a logout before PairSuccess).
+	loggedOutGeneration   uint64
 	observation           lifecycleObservation
 	ingressObservation    ingressObservation
 	nextObserverID        uint64
@@ -348,10 +351,14 @@ type Bridge struct {
 	runtimeDB    *sql.DB
 	blockedUntil time.Time
 	loggedOut    loggedOutState
-	// loggedOutDirty is set while loggedOut differs from what the runtime
-	// state table holds (a write failed); the next record, clear or purge
-	// retries the write.
-	loggedOutDirty bool
+	// storedLoggedOut is the record last known to be in the runtime state
+	// table. While it differs from loggedOut a write failed, and the next
+	// record, clear or purge retries it.
+	storedLoggedOut loggedOutState
+	// liveSessionOwner marks the process that owns the live session (see
+	// ClaimLiveSession). It is written with b.mu and runtimeMu both held, and
+	// read under either.
+	liveSessionOwner bool
 
 	connected                 bool
 	connecting                bool
@@ -377,15 +384,6 @@ func New(sessionPath string, store *db.Store, logger zerolog.Logger, callbacks C
 	if err := bridge.initRuntimeState(); err != nil {
 		_ = bridge.Close()
 		return nil, err
-	}
-	// Reconcile a logout recorded by an earlier process with the store: remove
-	// a revoked identity it could not, and drop a record a newer link
-	// superseded, before anything reads the pairing state.
-	bridge.mu.Lock()
-	_, err := bridge.purgeLoggedOutIdentityLocked()
-	bridge.mu.Unlock()
-	if err != nil {
-		logger.Warn().Err(err).Msg("Failed to remove the logged-out WhatsApp identity; the next connect or pair attempt retries")
 	}
 	return bridge, nil
 }
@@ -463,6 +461,7 @@ func (b *Bridge) initRuntimeState() error {
 		b.blockedUntil = time.Unix(0, blockedUntilNS)
 	}
 	b.loggedOut = loadLoggedOutState(loggedOutAtNS, loggedOutReason, loggedOutJID, loggedOutKey)
+	b.storedLoggedOut = b.loggedOut
 	b.runtimeMu.Unlock()
 	return nil
 }
@@ -640,49 +639,54 @@ func (b *Bridge) recoverPersistedSessionLocked() error {
 	// A clean unpaired device must keep its identity for the active pairing
 	// observation. Reset only when the database proves a paired identity was
 	// persisted after this in-memory store was created.
-	if persisted, _ := b.persistedIdentityLocked(); !persisted.empty() && !b.loggedOutSnapshot().revokes(persisted) {
+	if _, ok := b.storedLinkLocked(b.loggedOutSnapshot()); ok {
 		return b.resetClientLocked()
 	}
 	return nil
 }
 
 // linkedIdentityLocked returns the identity this install is linked with, and
-// its push name: the current client's as the bridge recorded it, or else the
-// first one in the session store. It never reads the live device's ID, which
-// whatsmeow's Store.Delete clears from its own goroutine. Caller holds b.mu.
-func (b *Bridge) linkedIdentityLocked() (linkedIdentity, string) {
-	if !b.identity.empty() {
+// its push name. In the process that owns the live session that is the
+// current client's identity as the bridge recorded it, unless a logout
+// revoked it; then a link stored since then takes its place. Any other
+// process reads the session store. Store reads use device structs nothing
+// else holds, so this never reads a live device's ID, which whatsmeow's
+// Store.Delete clears from its own goroutine. Caller holds b.mu.
+func (b *Bridge) linkedIdentityLocked(loggedOut loggedOutState) (linkedIdentity, string) {
+	held := linkedIdentity{}
+	if b.liveSessionOwner {
+		held = b.identity
+	}
+	if !held.empty() && !loggedOut.revokes(held) {
 		pushName := ""
 		if b.client != nil && b.client.Store != nil {
 			pushName = b.client.Store.PushName
 		}
-		return b.identity, pushName
+		return held, pushName
 	}
-	return b.persistedIdentityLocked()
-}
-
-// persistedIdentityLocked reads the first identity in the session store into
-// a device struct that nothing else holds. Caller holds b.mu.
-func (b *Bridge) persistedIdentityLocked() (linkedIdentity, string) {
-	if b.container == nil {
-		return linkedIdentity{}, ""
+	if stored, ok := b.storedLinkLocked(loggedOut); ok {
+		return stored.identity, stored.pushName
 	}
-	deviceStore, err := b.container.GetFirstDevice(context.Background())
-	if err != nil {
-		b.logger.Debug().Err(err).Msg("Failed to inspect persisted WhatsApp session state")
-		return linkedIdentity{}, ""
+	if !held.empty() {
+		return held, ""
 	}
-	return identityOf(deviceStore), deviceStore.PushName
+	// Only revoked identities are stored, if any.
+	if stored := b.storedIdentitiesLocked(); len(stored) > 0 {
+		return stored[0].identity, stored[0].pushName
+	}
+	return linkedIdentity{}, ""
 }
 
 // pairingStateLocked derives paired and needs_relink from one snapshot of the
 // logout record and the linked identity, so one status can never report both.
 // An identity a logout revoked is not paired, because WhatsApp no longer
-// accepts it, even before the purge removes it. A newer link supersedes the
-// record, even before the purge drops it. Caller holds b.mu.
+// accepts it, even before the purge removes it. A newer stored link
+// supersedes the record, even before the purge drops it. A process that does
+// not own the live session rereads the record first. Caller holds b.mu.
 func (b *Bridge) pairingStateLocked() (linked linkedIdentity, pushName string, paired bool, loggedOut loggedOutState, needsRelink bool) {
+	b.refreshLoggedOutLocked()
 	loggedOut = b.loggedOutSnapshot()
-	linked, pushName = b.linkedIdentityLocked()
+	linked, pushName = b.linkedIdentityLocked(loggedOut)
 	revoked := loggedOut.revokes(linked)
 	paired = !linked.empty() && !revoked
 	needsRelink = loggedOut.active() && (linked.empty() || revoked)
@@ -2050,6 +2054,9 @@ func (b *Bridge) handleClientEvent(source *whatsmeow.Client, generation uint64, 
 	if !current {
 		return
 	}
+	if testHookAfterAdmission != nil {
+		testHookAfterAdmission(raw)
+	}
 
 	at := time.Now()
 	var retryAt time.Time
@@ -2062,18 +2069,26 @@ func (b *Bridge) handleClientEvent(source *whatsmeow.Client, generation uint64, 
 	// and the record share one critical section with Unpair and client
 	// replacement, which change both under b.mu, so a callback from a client
 	// replaced meanwhile records nothing against its successor and cannot
-	// undo a deliberate unpair. A pairing transport holds no identity yet;
-	// its pair attempt reports that failure instead.
+	// undo a deliberate unpair.
 	loggedOut := false
 	if reason, ok := loggedOutEventReason(raw); ok {
-		if testHookBeforeLogoutRecord != nil {
-			testHookBeforeLogoutRecord()
-		}
 		b.mu.Lock()
 		current = b.isCurrentClientLocked(source, generation)
-		if current && !b.identity.empty() {
-			b.recordLoggedOut(at, reason, b.identity)
-			loggedOut = true
+		if current {
+			identity := b.identity
+			if identity.empty() {
+				// A pairing whose PairSuccess has not reached the bridge:
+				// whatsmeow saved the identity before dispatching it, so read it
+				// from the store (a pairing transport stores none).
+				if stored, ok := b.storedLinkLocked(b.loggedOutSnapshot()); ok {
+					identity = stored.identity
+				}
+			}
+			if !identity.empty() {
+				b.loggedOutGeneration = b.clientGeneration
+				b.recordLoggedOut(at, reason, identity)
+				loggedOut = true
+			}
 		}
 		b.mu.Unlock()
 		if !current {
@@ -2331,7 +2346,7 @@ func (b *Bridge) logIngressCaptureError(kind string, err error) {
 func (b *Bridge) applyEvent(source *whatsmeow.Client, generation uint64, raw any) {
 	switch evt := raw.(type) {
 	case *waevents.Connected:
-		b.handleConnected()
+		b.handleConnected(source, generation)
 	case *waevents.Disconnected:
 		b.handleDisconnected(source, generation, "")
 	case *waevents.LoggedOut:
@@ -2353,7 +2368,7 @@ func (b *Bridge) applyEvent(source *whatsmeow.Client, generation uint64, raw any
 		if evt == nil {
 			return
 		}
-		b.handlePairSuccess(evt)
+		b.handlePairSuccess(source, generation, evt)
 	case *waevents.PairError:
 		b.handlePairError(evt.Error)
 	case *waevents.PairPasskeyRequest:
@@ -2382,15 +2397,25 @@ func (b *Bridge) applyEvent(source *whatsmeow.Client, generation uint64, raw any
 	}
 }
 
-func (b *Bridge) handleConnected() {
+func (b *Bridge) handleConnected(source *whatsmeow.Client, generation uint64) {
 	b.mu.Lock()
-	// whatsmeow does not order PairSuccess before the connection that follows
-	// pairing. Adopt an identity it installed whose PairSuccess has not
-	// reached the bridge yet; a new link supersedes an outstanding logout.
-	if b.identity.empty() && b.client != nil && b.client.Store != nil && b.client.Store.ID != nil {
-		b.identity = identityOf(b.client.Store)
-		if !b.loggedOutSnapshot().revokes(b.identity) {
-			_ = b.clearLoggedOut()
+	if !b.isCurrentClientLocked(source, generation) {
+		b.mu.Unlock()
+		return
+	}
+	// whatsmeow dispatches PairSuccess from its own pairing goroutine, after it
+	// saves the new identity, with no ordering against this connection. Adopt
+	// a link it stored whose PairSuccess has not reached the bridge yet, read
+	// from the store rather than the live device. A link a logout revoked or
+	// whatsmeow deleted is not adopted. A new link supersedes an outstanding
+	// logout.
+	if b.identity.empty() {
+		loggedOut := b.loggedOutSnapshot()
+		if stored, ok := b.storedLinkLocked(loggedOut); ok {
+			b.identity = stored.identity
+			if loggedOut.active() {
+				_ = b.clearLoggedOut()
+			}
 		}
 	}
 	// An unpaired connection is only the transport we use to drive QR / phone-
@@ -2443,19 +2468,37 @@ func (b *Bridge) handleDisconnected(source *whatsmeow.Client, generation uint64,
 	b.emitStatusChange()
 }
 
-func (b *Bridge) handlePairSuccess(evt *waevents.PairSuccess) {
+func (b *Bridge) handlePairSuccess(source *whatsmeow.Client, generation uint64, evt *waevents.PairSuccess) {
 	b.mu.Lock()
+	// A PairSuccess from a client replaced while it was in flight (an unpair,
+	// a purge) must not install its identity on the successor or end its
+	// logout.
+	if !b.isCurrentClientLocked(source, generation) {
+		b.mu.Unlock()
+		return
+	}
 	b.pairing = false
 	b.lastError = ""
 	b.qr = QRSnapshot{}
-	// whatsmeow installed the new identity on this client before dispatching
-	// PairSuccess; its identity key is fixed when the device is created.
-	b.identity = linkedIdentity{JID: evt.ID}
+	// whatsmeow installed the new identity on this client and saved it before
+	// dispatching PairSuccess; its identity key is fixed when the device is
+	// created.
+	identity := linkedIdentity{JID: evt.ID}
 	if b.client != nil {
-		b.identity.Key = identityKeyFingerprint(b.client.Store)
+		identity.Key = identityKeyFingerprint(b.client.Store)
 	}
-	// A new link ends an outstanding logout.
-	_ = b.clearLoggedOut()
+	// A logout can overtake this event (whatsmeow dispatches both from their
+	// own goroutines). Install the identity only while the store still holds
+	// it and no logout revoked it; otherwise whatsmeow already deleted it or
+	// the bridge recorded its logout.
+	loggedOut := b.loggedOutSnapshot()
+	if !loggedOut.revokes(identity) && b.storesIdentityLocked(identity) {
+		b.identity = identity
+		// A new link ends an outstanding logout.
+		if loggedOut.active() {
+			_ = b.clearLoggedOut()
+		}
+	}
 	b.mu.Unlock()
 	b.emitStatusChange()
 }

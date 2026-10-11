@@ -948,6 +948,10 @@ func initializeWhatsAppForServe(
 		logger.Warn().Err(err).Msg("WhatsApp live bridge unavailable")
 		return nil, false
 	}
+	// This process owns the live session, so it alone repairs the session
+	// state it shares with other processes (a logged-out identity, the logout
+	// record), before the supervisor reads the pairing state.
+	whatsappBridge.ClaimLiveSession()
 	return whatsappBridge, true
 }
 

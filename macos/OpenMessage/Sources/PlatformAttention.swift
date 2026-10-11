@@ -242,12 +242,12 @@ struct SilenceNotificationLatch {
 
     /// Records the outcome of a submission `beginLoggedOut` started. Delivered
     /// marks the episode notified (persist `storedValue` afterwards); a failure
-    /// leaves it for the next health check.
+    /// leaves it for the next health check. A completion for an episode no
+    /// longer in flight (a newer logout started meanwhile) changes nothing, so
+    /// completions arriving out of order cannot move the latch back.
     mutating func finishLoggedOut(_ item: PlatformAttention, delivered: Bool) {
-        guard case let .loggedOut(since, _) = item.reason else { return }
-        if pendingEpisode[item.key] == since {
-            pendingEpisode[item.key] = nil
-        }
+        guard case let .loggedOut(since, _) = item.reason, pendingEpisode[item.key] == since else { return }
+        pendingEpisode[item.key] = nil
         if delivered {
             notifiedEpisode[item.key] = since
         }

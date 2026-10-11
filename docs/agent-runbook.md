@@ -1424,18 +1424,31 @@ Since PR #232:
   matches a newer link, even one WhatsApp gave the same JID.
 - `paired` is `false` while the linked identity is the revoked one, and
   `needs_relink` is `true` only while no newer link is stored, so one status
-  never reports both. `paired` means the install holds an identity WhatsApp
-  still accepts. whatsmeow's own contract is that a logout deletes the
-  session; the watchdog and the supervisor control's re-pair path already
-  treat a server logout as unpaired; and a revoked identity that reads as
-  paired blocks both reconnect and QR pairing. Status reads the bridge's own
-  record of the identity, never the live device, whose ID whatsmeow clears
-  from its own goroutine.
-- The bridge deletes the revoked identity itself, with its own 15 s context
-  and only on a JID and key match, right after the supervisor has been told.
-  Building the bridge and every connect and pair attempt do it again if it
-  is still there, so nothing dials it. `whatsmeow_lid_map` has no tie to the
-  device row and is kept.
+  never reports both. A link another process stores shows up without a
+  restart. `paired` means the install holds an identity WhatsApp still
+  accepts. whatsmeow's own contract is that a logout deletes the session;
+  the watchdog and the supervisor control's re-pair path already treat a
+  server logout as unpaired; and a revoked identity that reads as paired
+  blocks both reconnect and QR pairing. Status reads the bridge's own record
+  of the identity, or device rows read into structs nothing else holds,
+  never the live device, whose ID whatsmeow clears from its own goroutine.
+- Only the process that owns the live session repairs shared state: the
+  daemon claims it when it builds the WhatsApp bridge with transports on.
+  Another process that opens the same session store (`serve
+  --no-transports`, for one) never deletes an identity or writes the record,
+  and rereads the record on every status.
+- The owner deletes the revoked identity itself, with its own 15 s context,
+  right after the supervisor has been told. The delete repeats the JID and
+  identity-key check in the same SQL statement, so a row replaced in the
+  meantime survives. Claiming the session and every connect and pair attempt
+  do it again if it is still there, so nothing dials it. `whatsmeow_lid_map`
+  has no tie to the device row and is kept.
+- whatsmeow saves a new pairing and then dispatches `PairSuccess` from its
+  own goroutine, with no ordering against `LoggedOut`. A logout that
+  overtakes `PairSuccess` still records the identity whatsmeow just saved,
+  and the late `PairSuccess` (or a `Connected`) installs an identity only
+  while the store still holds it and no logout revoked it. Events from a
+  client that was replaced while they were in flight change nothing.
 - The live bridge keeps owning WhatsApp during a logout
   (`UsesLiveSession`), so the WhatsApp Desktop importer does not start;
   its conversation upserts would overwrite timestamps and unread counts.
@@ -1449,14 +1462,17 @@ Since PR #232:
 - It ends when a new link succeeds (`PairSuccess`), when a newer link is
   found in the store (a pairing whose `PairSuccess` never arrived, or a
   relink by an older binary), or on `POST /api/whatsapp/unpair`. Unpair is a
-  deliberate unlink, the way Signal's unpair clears `needs_reauth`. A write
-  of the record that fails is retried on the next change or connect
-  attempt; if an unpair's clear never lands, the unpair reports it, and a
-  restart before the retry brings `needs_relink` back until a relink.
+  deliberate unlink, the way Signal's unpair clears `needs_reauth`. A clear
+  only removes the episode it was meant for (compare-and-swap); if the
+  stored record changed meanwhile, the newer one is kept. A write of the
+  record that fails is retried on the next change or connect attempt; if an
+  unpair's clear never lands, the unpair reports it, and a restart before
+  the retry brings `needs_relink` back until a relink.
 - The app posts "WhatsApp needs relinking" once per episode, keyed on
   `relink_since_ms` in the app's `relinkNotifiedEpisodes` default. The episode
   counts once macOS accepted the notification, so a relaunch during the
-  logout stays quiet and a rejected submission is retried. Like every app
+  logout stays quiet and a rejected submission is retried; a late answer for
+  an older episode cannot move the latch back. Like every app
   health notification it needs the app's desktop notifications on, and on
   Max's install they were off on 2026-10-11:
   `plutil -extract desktopNotificationsEnabled raw ~/Library/Preferences/com.openmessage.app.plist`

@@ -337,6 +337,27 @@ final class PlatformAttentionTests: XCTestCase {
         XCTAssertEqual(relaunched.beginLoggedOut([loggedOut]), [loggedOut])
     }
 
+    // Completions can arrive out of order. A late completion for an older
+    // episode must not move the latch back, or the newer logout would be
+    // notified again after the next check or a relaunch.
+    func testLateCompletionOfAnOlderLogoutDoesNotRegressTheLatch() {
+        let first = PlatformAttention(
+            key: "whatsapp", name: "WhatsApp", reason: .loggedOut(since: 1_000, reason: "401: logged out from another device")
+        )
+        let second = PlatformAttention(
+            key: "whatsapp", name: "WhatsApp", reason: .loggedOut(since: 2_000, reason: "403: primary device was logged out")
+        )
+        var latch = SilenceNotificationLatch()
+        XCTAssertEqual(latch.beginLoggedOut([first]), [first])
+        XCTAssertEqual(latch.beginLoggedOut([second]), [second])
+        latch.finishLoggedOut(second, delivered: true)
+        latch.finishLoggedOut(first, delivered: true)
+        XCTAssertEqual(latch.storedValue, ["whatsapp": NSNumber(value: Int64(2_000))])
+        XCTAssertEqual(latch.beginLoggedOut([second]), [])
+        var relaunched = SilenceNotificationLatch(storedValue: latch.storedValue)
+        XCTAssertEqual(relaunched.beginLoggedOut([second]), [])
+    }
+
     // A backend that predates needs_relink keeps the old reading (paired=false
     // means logged out); one that reports it decides alone.
     func testLegacyWhatsAppReadingOnlyAppliesWithoutNeedsRelink() {
