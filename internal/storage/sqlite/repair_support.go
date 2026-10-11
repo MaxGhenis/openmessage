@@ -62,14 +62,19 @@ func (s *Store) ListInboundSenderIdentityIDsBefore(conversationID string, sinceM
 // MessageHasReadCursor reports whether any read cursor points at the message.
 // Such a row cannot change conversation without breaking the cursor's
 // composite foreign key.
+//
+// read_cursors has no index on last_read_message_id, but that same composite
+// key puts any cursor naming the message in the message's own conversation, so
+// the lookup seeks read_cursors_conversation_idx (a few rows, one per device)
+// instead of scanning every cursor once per planned repair row.
 func (s *Store) MessageHasReadCursor(messageID string) (bool, error) {
-	var count int64
-	if err := s.db.QueryRowContext(context.Background(), `
-		SELECT COUNT(*) FROM read_cursors WHERE last_read_message_id = ?
-	`, messageID).Scan(&count); err != nil {
+	var referenced bool
+	if err := s.db.QueryRowContext(
+		context.Background(), messageHasReadCursorQuery, messageID, messageID,
+	).Scan(&referenced); err != nil {
 		return false, fmt.Errorf("check read cursors for message %q: %w", messageID, err)
 	}
-	return count > 0, nil
+	return referenced, nil
 }
 
 // MessageHasOpenSend reports whether an unfinished send (an outbox row not yet
@@ -79,12 +84,9 @@ func (s *Store) MessageHasReadCursor(messageID string) (bool, error) {
 // open.
 func (s *Store) MessageHasOpenSend(messageID string) (bool, error) {
 	var exists bool
-	if err := s.db.QueryRowContext(context.Background(), `
-		SELECT EXISTS (
-			SELECT 1 FROM outbox
-			WHERE local_message_id = ? AND state NOT IN `+closedOutboxStates+`
-		)
-	`, messageID).Scan(&exists); err != nil {
+	if err := s.db.QueryRowContext(
+		context.Background(), messageHasOpenSendQuery, messageID,
+	).Scan(&exists); err != nil {
 		return false, fmt.Errorf("check open sends for message %q: %w", messageID, err)
 	}
 	return exists, nil
@@ -92,6 +94,30 @@ func (s *Store) MessageHasOpenSend(messageID string) (bool, error) {
 
 // closedOutboxStates are the terminal outbox states, as an SQL list.
 const closedOutboxStates = `('confirmed', 'rejected', 'canceled')`
+
+// The open-send lookups seek outbox_local_message_idx on local_message_id.
+const (
+	messageHasOpenSendQuery = `
+		SELECT EXISTS (
+			SELECT 1 FROM outbox
+			WHERE local_message_id = ? AND state NOT IN ` + closedOutboxStates + `
+		)
+	`
+	openSendElsewhereQuery = `
+		SELECT outbox_id, state FROM outbox
+		WHERE local_message_id = ? AND conversation_id <> ? AND state NOT IN ` + closedOutboxStates + `
+		ORDER BY outbox_id
+		LIMIT 1
+	`
+)
+
+const messageHasReadCursorQuery = `
+	SELECT EXISTS (
+		SELECT 1 FROM read_cursors
+		WHERE conversation_id = (SELECT conversation_id FROM messages WHERE message_id = ?)
+		  AND last_read_message_id = ?
+	)
+`
 
 // SelfIdentityID returns one self identity for the account, if any.
 func (s *Store) SelfIdentityID(accountID string) (string, bool, error) {
@@ -426,12 +452,9 @@ func applyRepairDelete(
 // copy and belongs to a conversation other than conversationID.
 func refuseOpenSend(ctx context.Context, tx *sql.Tx, messageID, conversationID string) error {
 	var outboxID, state string
-	err := tx.QueryRowContext(ctx, `
-		SELECT outbox_id, state FROM outbox
-		WHERE local_message_id = ? AND conversation_id <> ? AND state NOT IN `+closedOutboxStates+`
-		ORDER BY outbox_id
-		LIMIT 1
-	`, messageID, conversationID).Scan(&outboxID, &state)
+	err := tx.QueryRowContext(
+		ctx, openSendElsewhereQuery, messageID, conversationID,
+	).Scan(&outboxID, &state)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 		return nil
