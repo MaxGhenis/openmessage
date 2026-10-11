@@ -777,9 +777,10 @@ var errIngressAdmissionClosed = errors.New("whatsapp lifecycle: generation no lo
 
 // handleIngress commits one frame under this generation. It returns nil once
 // the frame is committed (or this generation has no durable inbox to commit it
-// to) and the reason otherwise, so the bridge can leave an uncommitted message
-// for whatsmeow to redeliver to a later generation
-// (whatsapplive.Bridge.ObserveIngress).
+// to) and the reason otherwise, so the bridge can hold an uncommitted frame
+// for a later generation (whatsapplive.Bridge.ObserveIngress). A frame the
+// bridge replays from its hold commits through bridge.ReplayIngressSink when
+// the sink has it, which records no connection activity.
 func (r *run) handleIngress(frame whatsapplive.IngressFrame) error {
 	if !r.admitCallback() {
 		if !r.durableIngress {
