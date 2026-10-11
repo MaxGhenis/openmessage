@@ -30,7 +30,7 @@ func propertySeeds(t *testing.T) int {
 		}
 		return n
 	}
-	if testing.Short() {
+	if testing.Short() || raceDetectorEnabled {
 		return 24
 	}
 	return 160

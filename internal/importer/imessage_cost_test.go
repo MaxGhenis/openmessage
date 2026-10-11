@@ -93,7 +93,7 @@ func TestIMessageOneMessagePollStaysCheap(t *testing.T) {
 			res := runImport(t, poller, store)
 			elapsed := time.Since(start)
 			t.Logf("one-message poll: %s, read %d rows, wrote %d", elapsed.Round(time.Millisecond), poller.last.rowsRead, res.MessagesImported)
-			if poller.last.full || res.MessagesImported != 1 || elapsed > budget {
+			if poller.last.full || res.MessagesImported != 1 || (elapsed > budget && !raceDetectorEnabled) {
 				t.Fatalf("one-message poll: full=%v wrote=%d in %s (budget %s)", poller.last.full, res.MessagesImported, elapsed, budget)
 			}
 
@@ -103,7 +103,7 @@ func TestIMessageOneMessagePollStaysCheap(t *testing.T) {
 			res = runImport(t, poller, store)
 			elapsed = time.Since(start)
 			t.Logf("one-reaction poll: %s, read %d rows, wrote %d", elapsed.Round(time.Millisecond), poller.last.rowsRead, res.MessagesImported)
-			if poller.last.full || res.MessagesImported != 1 || elapsed > budget {
+			if poller.last.full || res.MessagesImported != 1 || (elapsed > budget && !raceDetectorEnabled) {
 				t.Fatalf("one-reaction poll: full=%v wrote=%d in %s (budget %s)", poller.last.full, res.MessagesImported, elapsed, budget)
 			}
 		})

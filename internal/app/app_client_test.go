@@ -50,9 +50,11 @@ func seedRepairableStore(t *testing.T, dbPath string) {
 	msg(&db.Message{MessageID: "whatsapp:real", ConversationID: "whatsapp:group@g.us", Body: "real message", TimestampMS: 1000, SourcePlatform: "whatsapp", SourceID: "real"})
 	msg(&db.Message{MessageID: "whatsapp:reaction-placeholder", ConversationID: "whatsapp:group@g.us", Body: "[Reaction]", TimestampMS: 3000, SourcePlatform: "whatsapp", SourceID: "reaction-placeholder"})
 
-	conv(&db.Conversation{ConversationID: "imessage:chat", Name: "Chat", LastMessageTS: 2000, SourcePlatform: "imessage"})
-	msg(&db.Message{MessageID: "imessage:target", ConversationID: "imessage:chat", Body: "great idea", TimestampMS: 1000, IsFromMe: true, SourcePlatform: "imessage"})
-	msg(&db.Message{MessageID: "imessage:tapback", ConversationID: "imessage:chat", SenderNumber: "+15550100", Body: `Loved "great idea"`, TimestampMS: 2000, SourcePlatform: "imessage"})
+	// An SMS tapback text: RepairTapbacks leaves iMessage rows alone, whose
+	// reactions come from chat.db's own reaction rows.
+	conv(&db.Conversation{ConversationID: "sms:chat", Name: "Chat", LastMessageTS: 2000, SourcePlatform: "sms"})
+	msg(&db.Message{MessageID: "sms:target", ConversationID: "sms:chat", Body: "great idea", TimestampMS: 1000, IsFromMe: true, SourcePlatform: "sms"})
+	msg(&db.Message{MessageID: "sms:tapback", ConversationID: "sms:chat", SenderNumber: "+15550100", Body: `Loved "great idea"`, TimestampMS: 2000, SourcePlatform: "sms"})
 
 	conv(&db.Conversation{ConversationID: "sms:stub", Name: "Stub", LastMessageTS: 4000, SourcePlatform: "sms"})
 	msg(&db.Message{MessageID: "sms:stub-real", ConversationID: "sms:stub", Body: "hello", TimestampMS: 1000, SourcePlatform: "sms"})
@@ -190,10 +192,10 @@ func TestNewClientPerformsNoStoreWrites(t *testing.T) {
 	if m, err := a2.Store.GetMessageByID("whatsapp:reaction-placeholder"); err != nil || m != nil {
 		t.Errorf("RepairLegacyArtifacts did not delete the WhatsApp reaction placeholder (m=%v, err=%v)", m, err)
 	}
-	if m, err := a2.Store.GetMessageByID("imessage:tapback"); err != nil || m != nil {
+	if m, err := a2.Store.GetMessageByID("sms:tapback"); err != nil || m != nil {
 		t.Errorf("RepairTapbacks did not delete the tapback row (m=%v, err=%v)", m, err)
 	}
-	if target, err := a2.Store.GetMessageByID("imessage:target"); err != nil || target == nil || !strings.Contains(target.Reactions, "❤️") {
+	if target, err := a2.Store.GetMessageByID("sms:target"); err != nil || target == nil || !strings.Contains(target.Reactions, "❤️") {
 		t.Errorf("RepairTapbacks did not attach the reaction to the target (target=%+v, err=%v)", target, err)
 	}
 	if m, err := a2.Store.GetMessageByID("sms:stub-empty"); err != nil || m != nil {
