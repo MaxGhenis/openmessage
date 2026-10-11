@@ -25,12 +25,16 @@ import (
 	"go.mau.fi/libsignal/session"
 	"go.mau.fi/libsignal/util/optional"
 	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/appstate"
 	waBinary "go.mau.fi/whatsmeow/binary"
 	"go.mau.fi/whatsmeow/proto/waE2E"
+	"go.mau.fi/whatsmeow/proto/waServerSync"
+	"go.mau.fi/whatsmeow/proto/waSyncAction"
 	"go.mau.fi/whatsmeow/store"
 	watypes "go.mau.fi/whatsmeow/types"
 	waevents "go.mau.fi/whatsmeow/types/events"
 	"go.mau.fi/whatsmeow/util/keys"
+	waLog "go.mau.fi/whatsmeow/util/log"
 	"google.golang.org/protobuf/proto"
 	"modernc.org/sqlite"
 
@@ -54,6 +58,11 @@ import (
 // Invariant: a teardown at any point of a message's handling never loses the
 // message. Every frame committed for it carries one dedupe key per message
 // part (the inbox keeps one row per key), and the legacy store holds it.
+//
+// The message tests run twice: with the handler context the bridge hands
+// whatsmeow (detached from teardown once the connection is up), and with a
+// handler context that teardown cancels, which is how main behaved and what a
+// teardown that overlaps ConnectContext returning still does.
 
 const teardownTestTimeout = 10 * time.Second
 
@@ -215,22 +224,26 @@ func (s *teardownSink) textFrames(t *testing.T, id watypes.MessageID, text strin
 }
 
 type teardownHarness struct {
-	t           *testing.T
-	host        *whatsapplive.Bridge
-	cli         *whatsmeow.Client
-	messages    *db.Store
-	supervisor  *bridge.Supervisor
-	sink        *teardownSink
-	gate        *backoffGate
-	dials       chan context.Context
-	sessionPath string
-	ourJID      watypes.JID
-	peerJID     watypes.JID
-	peer        *store.Device
-	groupJID    watypes.JID
+	t *testing.T
+	// cancelOnTeardown makes retireGeneration cancel the handler context it
+	// returned from awaitGeneration.
+	cancelOnTeardown bool
+	cancelHandlers   context.CancelFunc
+	host             *whatsapplive.Bridge
+	cli              *whatsmeow.Client
+	messages         *db.Store
+	supervisor       *bridge.Supervisor
+	sink             *teardownSink
+	gate             *backoffGate
+	dials            chan context.Context
+	sessionPath      string
+	ourJID           watypes.JID
+	peerJID          watypes.JID
+	peer             *store.Device
+	groupJID         watypes.JID
 }
 
-func newTeardownHarness(t *testing.T) *teardownHarness {
+func newTeardownHarness(t *testing.T, cancelOnTeardown bool) *teardownHarness {
 	t.Helper()
 	dir := t.TempDir()
 	sessionPath := filepath.Join(dir, "whatsapp-session.db")
@@ -292,19 +305,20 @@ func newTeardownHarness(t *testing.T) *teardownHarness {
 
 	peerJID := watypes.JID{User: "15559870000", Server: watypes.DefaultUserServer}
 	return &teardownHarness{
-		t:           t,
-		host:        host,
-		cli:         whatsapplive.ClientForTeardownTest(host),
-		messages:    messages,
-		supervisor:  supervisor,
-		sink:        sink,
-		gate:        gate,
-		dials:       dials,
-		sessionPath: sessionPath,
-		ourJID:      ourJID,
-		peerJID:     peerJID,
-		peer:        whatsapplive.NewPeerDeviceForTeardownTest(t, filepath.Join(dir, "peer-session.db"), peerJID),
-		groupJID:    watypes.JID{User: "120363000000000001", Server: watypes.GroupServer},
+		t:                t,
+		cancelOnTeardown: cancelOnTeardown,
+		host:             host,
+		cli:              whatsapplive.ClientForTeardownTest(host),
+		messages:         messages,
+		supervisor:       supervisor,
+		sink:             sink,
+		gate:             gate,
+		dials:            dials,
+		sessionPath:      sessionPath,
+		ourJID:           ourJID,
+		peerJID:          peerJID,
+		peer:             whatsapplive.NewPeerDeviceForTeardownTest(t, filepath.Join(dir, "peer-session.db"), peerJID),
+		groupJID:         watypes.JID{User: "120363000000000001", Server: watypes.GroupServer},
 	}
 }
 
@@ -326,6 +340,9 @@ func (h *teardownHarness) awaitGeneration() (context.Context, bridge.Generation)
 	}) {
 		h.t.FailNow()
 	}
+	if h.cancelOnTeardown {
+		handlerCtx, h.cancelHandlers = context.WithCancel(handlerCtx)
+	}
 	return handlerCtx, h.supervisor.Snapshot().Generation
 }
 
@@ -338,6 +355,17 @@ func (h *teardownHarness) retireGeneration() {
 	awaitTeardownCondition(h.t, "the generation to retire", func() bool {
 		return h.supervisor.Snapshot().State == bridge.StateBackoff
 	})
+	if h.cancelHandlers != nil {
+		h.cancelHandlers()
+		h.cancelHandlers = nil
+	}
+}
+
+// forEachHandlerContext runs a message test with the handler context the
+// bridge hands whatsmeow and with one that teardown cancels.
+func forEachHandlerContext(t *testing.T, test func(t *testing.T, cancelOnTeardown bool)) {
+	t.Run("handler context detached from teardown", func(t *testing.T) { test(t, false) })
+	t.Run("handler context cancelled by teardown", func(t *testing.T) { test(t, true) })
 }
 
 // startPeerSession builds the peer's outgoing session from a prekey bundle of
@@ -532,25 +560,27 @@ func (h *msgSecretStoreHook) PutMessageSecret(ctx context.Context, chat, sender 
 // redelivery failed with "received message with old counter", which whatsmeow
 // ignores and acknowledges.
 func TestTeardownDuringPreKeyDecryptDoesNotLoseTheMessage(t *testing.T) {
-	h := newTeardownHarness(t)
-	first, _ := h.awaitGeneration()
-	h.startPeerSession()
-	node := h.peerMessage("3EB0PREKEYTEARDOWN", "first message from a new session")
-	if typ := node.GetChildren()[0].Attrs["type"]; typ != "pkmsg" {
-		t.Fatalf("first message type = %v, want pkmsg", typ)
-	}
+	forEachHandlerContext(t, func(t *testing.T, cancelOnTeardown bool) {
+		h := newTeardownHarness(t, cancelOnTeardown)
+		first, _ := h.awaitGeneration()
+		h.startPeerSession()
+		node := h.peerMessage("3EB0PREKEYTEARDOWN", "first message from a new session")
+		if typ := node.GetChildren()[0].Attrs["type"]; typ != "pkmsg" {
+			t.Fatalf("first message type = %v, want pkmsg", typ)
+		}
 
-	var once sync.Once
-	h.cli.Store.PreKeys = &preKeyStoreHook{
-		PreKeyStore:  h.cli.Store.PreKeys,
-		beforeRemove: func(context.Context) { once.Do(h.retireGeneration) },
-	}
-	h.deliver(first, node)
+		var once sync.Once
+		h.cli.Store.PreKeys = &preKeyStoreHook{
+			PreKeyStore:  h.cli.Store.PreKeys,
+			beforeRemove: func(context.Context) { once.Do(h.retireGeneration) },
+		}
+		h.deliver(first, node)
 
-	second, generation := h.awaitGeneration()
-	h.deliver(second, node)
-	requireCommittedOnlyIn(t, h.requireDelivered("3EB0PREKEYTEARDOWN", "first message from a new session",
-		"teardown landed between the session store and the prekey removal"), generation)
+		second, generation := h.awaitGeneration()
+		h.deliver(second, node)
+		requireCommittedOnlyIn(t, h.requireDelivered("3EB0PREKEYTEARDOWN", "first message from a new session",
+			"teardown landed between the session store and the prekey removal"), generation)
+	})
 }
 
 // TestTeardownBeforeDispatchDoesNotLoseTheMessage retires the generation after
@@ -559,22 +589,24 @@ func TestTeardownDuringPreKeyDecryptDoesNotLoseTheMessage(t *testing.T) {
 // event because no generation was observing ingress, and whatsmeow, told the
 // event was handled, never saw it again.
 func TestTeardownBeforeDispatchDoesNotLoseTheMessage(t *testing.T) {
-	h := newTeardownHarness(t)
-	first, _ := h.awaitGeneration()
-	h.startPeerSession()
-	node := h.peerMessage("3EB0DISPATCHTEARDOWN", "arrives while the generation retires")
+	forEachHandlerContext(t, func(t *testing.T, cancelOnTeardown bool) {
+		h := newTeardownHarness(t, cancelOnTeardown)
+		first, _ := h.awaitGeneration()
+		h.startPeerSession()
+		node := h.peerMessage("3EB0DISPATCHTEARDOWN", "arrives while the generation retires")
 
-	var once sync.Once
-	h.cli.Store.MsgSecrets = &msgSecretStoreHook{
-		MsgSecretStore: h.cli.Store.MsgSecrets,
-		beforePut:      func(context.Context) { once.Do(h.retireGeneration) },
-	}
-	h.deliver(first, node)
+		var once sync.Once
+		h.cli.Store.MsgSecrets = &msgSecretStoreHook{
+			MsgSecretStore: h.cli.Store.MsgSecrets,
+			beforePut:      func(context.Context) { once.Do(h.retireGeneration) },
+		}
+		h.deliver(first, node)
 
-	second, generation := h.awaitGeneration()
-	h.deliver(second, node)
-	requireCommittedOnlyIn(t, h.requireDelivered("3EB0DISPATCHTEARDOWN", "arrives while the generation retires",
-		"decrypted, then dispatched after the generation's ingress closed"), generation)
+		second, generation := h.awaitGeneration()
+		h.deliver(second, node)
+		requireCommittedOnlyIn(t, h.requireDelivered("3EB0DISPATCHTEARDOWN", "arrives while the generation retires",
+			"decrypted, then dispatched after the generation's ingress closed"), generation)
+	})
 }
 
 // commitHook lets one test act inside SQLite's commit on a session store
@@ -621,58 +653,60 @@ func (h *sessionStoreHook) PutSession(ctx context.Context, address string, raw [
 // deferred done check), so before the fix libsignal saw a failed store after
 // the ratchet had moved, and the redelivery failed with an old counter.
 func TestTeardownWhileTheSessionCommitsDoesNotLoseTheMessage(t *testing.T) {
-	installCommitHooks()
-	h := newTeardownHarness(t)
-	first, _ := h.awaitGeneration()
-	h.startPeerSession()
-	h.deliver(first, h.peerMessage("3EB0SESSIONSETUP", "opens the session"))
-	h.requireDelivered("3EB0SESSIONSETUP", "opens the session", "setup message")
-	h.replyToPeer()
-	node := h.peerMessage("3EB0COMMITTEARDOWN", "an ordinary message")
-	if typ := node.GetChildren()[0].Attrs["type"]; typ != "msg" {
-		t.Fatalf("message type = %v, want msg", typ)
-	}
+	forEachHandlerContext(t, func(t *testing.T, cancelOnTeardown bool) {
+		installCommitHooks()
+		h := newTeardownHarness(t, cancelOnTeardown)
+		first, _ := h.awaitGeneration()
+		h.startPeerSession()
+		h.deliver(first, h.peerMessage("3EB0SESSIONSETUP", "opens the session"))
+		h.requireDelivered("3EB0SESSIONSETUP", "opens the session", "setup message")
+		h.replyToPeer()
+		node := h.peerMessage("3EB0COMMITTEARDOWN", "an ordinary message")
+		if typ := node.GetChildren()[0].Attrs["type"]; typ != "msg" {
+			t.Fatalf("message type = %v, want msg", typ)
+		}
 
-	peerAddress := h.peerJID.SignalAddress().String()
-	var armed atomic.Bool
-	var writeCtx atomic.Pointer[context.Context]
-	h.cli.Store.Sessions = &sessionStoreHook{
-		SessionStore: h.cli.Store.Sessions,
-		onPut: func(ctx context.Context, address string) {
-			if address == peerAddress {
-				writeCtx.Store(&ctx)
-				armed.Store(true)
+		peerAddress := h.peerJID.SignalAddress().String()
+		var armed atomic.Bool
+		var writeCtx atomic.Pointer[context.Context]
+		h.cli.Store.Sessions = &sessionStoreHook{
+			SessionStore: h.cli.Store.Sessions,
+			onPut: func(ctx context.Context, address string) {
+				if address == peerAddress {
+					writeCtx.Store(&ctx)
+					armed.Store(true)
+				}
+			},
+		}
+		fired := false
+		hook := func(dsn string) {
+			// The commit that carries the session write: the statement's own
+			// autocommit, or the decryption transaction's commit.
+			if !strings.Contains(dsn, "whatsapp-session.db") || !armed.CompareAndSwap(true, false) {
+				return
 			}
-		},
-	}
-	fired := false
-	hook := func(dsn string) {
-		// The commit that carries the session write: the statement's own
-		// autocommit, or the decryption transaction's commit.
-		if !strings.Contains(dsn, "whatsapp-session.db") || !armed.CompareAndSwap(true, false) {
-			return
+			fired = true
+			h.retireGeneration()
+			if ctx := *writeCtx.Load(); ctx.Err() != nil {
+				// Let modernc's interruptOnDone goroutine observe the cancellation
+				// while the commit is still in progress.
+				time.Sleep(50 * time.Millisecond)
+			}
 		}
-		fired = true
-		h.retireGeneration()
-		if ctx := *writeCtx.Load(); ctx.Err() != nil {
-			// Let modernc's interruptOnDone goroutine observe the cancellation
-			// while the commit is still in progress.
-			time.Sleep(50 * time.Millisecond)
+		commitHook.Store(&hook)
+		t.Cleanup(func() { commitHook.Store(nil) })
+
+		h.deliver(first, node)
+		commitHook.Store(nil)
+		if !fired {
+			t.Fatal("the commit hook never saw the session write commit")
 		}
-	}
-	commitHook.Store(&hook)
-	t.Cleanup(func() { commitHook.Store(nil) })
 
-	h.deliver(first, node)
-	commitHook.Store(nil)
-	if !fired {
-		t.Fatal("the commit hook never saw the session write commit")
-	}
-
-	second, generation := h.awaitGeneration()
-	h.deliver(second, node)
-	requireCommittedOnlyIn(t, h.requireDelivered("3EB0COMMITTEARDOWN", "an ordinary message",
-		"the session committed but the store reported the cancellation"), generation)
+		second, generation := h.awaitGeneration()
+		h.deliver(second, node)
+		requireCommittedOnlyIn(t, h.requireDelivered("3EB0COMMITTEARDOWN", "an ordinary message",
+			"the session committed but the store reported the cancellation"), generation)
+	})
 }
 
 // cutPoints wraps the session-store calls whatsmeow's message handler makes
@@ -873,9 +907,15 @@ var teardownScenarios = []teardownScenario{
 // generation just before that call, redelivers the stanza to the next
 // generation, and requires the message to arrive.
 func TestEveryTeardownPointDeliversTheMessage(t *testing.T) {
+	forEachHandlerContext(t, func(t *testing.T, cancelOnTeardown bool) {
+		testEveryTeardownPoint(t, cancelOnTeardown)
+	})
+}
+
+func testEveryTeardownPoint(t *testing.T, cancelOnTeardown bool) {
 	for _, scenario := range teardownScenarios {
 		t.Run(scenario.name, func(t *testing.T) {
-			h := newTeardownHarness(t)
+			h := newTeardownHarness(t, cancelOnTeardown)
 			first, _ := h.awaitGeneration()
 			node, id, text := scenario.prepare(h, first)
 			points := &cutPoints{}
@@ -891,7 +931,7 @@ func TestEveryTeardownPointDeliversTheMessage(t *testing.T) {
 
 			for cutAt, call := range calls {
 				t.Run(fmt.Sprintf("%02d_before_%s", cutAt, call), func(t *testing.T) {
-					h := newTeardownHarness(t)
+					h := newTeardownHarness(t, cancelOnTeardown)
 					first, _ := h.awaitGeneration()
 					node, id, text := scenario.prepare(h, first)
 					points := &cutPoints{}
@@ -912,5 +952,132 @@ func TestEveryTeardownPointDeliversTheMessage(t *testing.T) {
 				})
 			}
 		})
+	}
+}
+
+type appStateStoreHook struct {
+	store.AppStateStore
+	afterPutVersion func()
+}
+
+func (h *appStateStoreHook) PutAppStateVersion(ctx context.Context, name string, version uint64, hash [128]byte) error {
+	err := h.AppStateStore.PutAppStateVersion(ctx, name, version, hash)
+	if err == nil && h.afterPutVersion != nil {
+		h.afterPutVersion()
+	}
+	return err
+}
+
+// appStatePhone encodes the contact-list app-state collection the way the
+// primary phone does, with its own copy of the collection in the peer's store.
+type appStatePhone struct {
+	proc  *appstate.Processor
+	state appstate.HashState
+	keyID []byte
+}
+
+func (h *teardownHarness) newAppStatePhone() *appStatePhone {
+	h.t.Helper()
+	ctx := context.Background()
+	keyID := []byte{0, 0, 0x2a, 1}
+	keyData := make([]byte, 32)
+	_, _ = rand.Read(keyData)
+	key := store.AppStateSyncKey{Data: keyData, Fingerprint: []byte{}, Timestamp: time.Now().UnixMilli()}
+	for _, device := range []*store.Device{h.cli.Store, h.peer} {
+		if err := device.AppStateKeys.PutAppStateSyncKey(ctx, keyID, key); err != nil {
+			h.t.Fatalf("PutAppStateSyncKey(): %v", err)
+		}
+	}
+	return &appStatePhone{proc: appstate.NewProcessor(h.peer, waLog.Noop), keyID: keyID}
+}
+
+// renameContact returns the server's patch list for one contact rename.
+func (p *appStatePhone) renameContact(t *testing.T, contact watypes.JID, name string) *appstate.PatchList {
+	t.Helper()
+	ctx := context.Background()
+	raw, err := p.proc.EncodePatch(ctx, p.keyID, p.state, appstate.PatchInfo{
+		Type: appstate.WAPatchCriticalUnblockLow,
+		Mutations: []appstate.MutationInfo{{
+			Index:   []string{appstate.IndexContact, contact.String()},
+			Version: 2,
+			Value: &waSyncAction.SyncActionValue{ContactAction: &waSyncAction.ContactAction{
+				FullName:  proto.String(name),
+				FirstName: proto.String(name),
+			}},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("EncodePatch(): %v", err)
+	}
+	patchList := func() *appstate.PatchList {
+		var patch waServerSync.SyncdPatch
+		if err := proto.Unmarshal(raw, &patch); err != nil {
+			t.Fatalf("unmarshal patch: %v", err)
+		}
+		patch.Version = &waServerSync.SyncdVersion{Version: proto.Uint64(p.state.Version + 1)}
+		return &appstate.PatchList{Name: appstate.WAPatchCriticalUnblockLow, Patches: []*waServerSync.SyncdPatch{&patch}}
+	}
+	_, next, err := p.proc.DecodePatches(ctx, patchList(), p.state, true)
+	if err != nil {
+		t.Fatalf("the phone could not apply its own patch: %v", err)
+	}
+	served := patchList()
+	p.state = next
+	return served
+}
+
+// syncAppState applies one fetched patch list the way whatsmeow's
+// fetchAppState does (appstate.go applyAppStatePatches): decode it against
+// the stored state, which stores the new version and value MACs, then apply
+// each mutation to the store (dispatchAppState).
+func (h *teardownHarness) syncAppState(ctx context.Context, list *appstate.PatchList) error {
+	version, hash, err := h.cli.Store.AppState.GetAppStateVersion(ctx, string(list.Name))
+	if err != nil {
+		return err
+	}
+	proc := appstate.NewProcessor(h.cli.Store, waLog.Noop)
+	mutations, _, err := proc.DecodePatches(ctx, list, appstate.HashState{Version: version, Hash: hash}, true)
+	if err != nil {
+		return err
+	}
+	for _, mutation := range mutations {
+		h.cli.DangerousInternals().DispatchAppState(ctx, list.Name, mutation, false)
+	}
+	return nil
+}
+
+// TestTeardownDuringAppStateSyncKeepsTheCollectionUsable retires the
+// generation while whatsmeow stores an app-state patch: after it has written
+// the collection's new version and before it writes the patch's value MACs
+// (appstate/decode.go storeMACs). Before the handler context was detached from
+// teardown, the cancelled MAC writes left the version advanced without its
+// MACs: the patch's contact rename was never applied, and every later patch
+// touching that contact failed with a mismatching LTHash, so the contact list
+// (whatsmeow's contact store, which OpenMessage reads for display names)
+// stopped syncing.
+func TestTeardownDuringAppStateSyncKeepsTheCollectionUsable(t *testing.T) {
+	h := newTeardownHarness(t, false)
+	first, _ := h.awaitGeneration()
+	phone := h.newAppStatePhone()
+	contact := watypes.JID{User: "15550001111", Server: watypes.DefaultUserServer}
+	renamed := phone.renameContact(t, contact, "Alice Phone")
+
+	var once sync.Once
+	h.cli.Store.AppState = &appStateStoreHook{
+		AppStateStore:   h.cli.Store.AppState,
+		afterPutVersion: func() { once.Do(h.retireGeneration) },
+	}
+	firstErr := h.syncAppState(first, renamed)
+
+	second, _ := h.awaitGeneration()
+	if err := h.syncAppState(second, phone.renameContact(t, contact, "Alice Renamed")); err != nil {
+		t.Fatalf("the next contact-list patch failed after a teardown during the previous one (that sync: %v): %v", firstErr, err)
+	}
+	info, err := h.cli.Store.Contacts.GetContact(context.Background(), contact)
+	if err != nil {
+		t.Fatalf("GetContact(): %v", err)
+	}
+	if info.FullName != "Alice Renamed" {
+		t.Fatalf("contact name = %q, want the phone's latest rename (first sync: %v)", info.FullName, firstErr)
 	}
 }

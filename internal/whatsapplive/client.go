@@ -97,6 +97,32 @@ var connectClientContext = func(ctx context.Context, cli *whatsmeow.Client) erro
 	return cli.ConnectContext(ctx)
 }
 
+// connectWithDetachedHandlers connects a lifecycle generation's client.
+// whatsmeow keeps the context passed to ConnectContext and runs every node
+// handler of the connection with it (message decryption, receipts, retry
+// receipts, app-state sync, prekey uploads) until the socket closes. Those
+// handlers write the session store in several statements with no enclosing
+// transaction, and modernc.org/sqlite interrupts a statement whose context
+// ends (and can report a committed one as failed), so cancelling that
+// context when the generation is torn down leaves partial writes: an app-state
+// version advanced without its value MACs, a logged-out session half deleted.
+// The context handed to whatsmeow is therefore cancelled by ctx only while
+// ConnectContext is dialing and handshaking, and never after it returns, the
+// way whatsmeow's own Connect uses its never-cancelled BackgroundEventCtx.
+// The socket still closes on teardown (DisconnectTransport), which ends the
+// handler loop; a handler already running finishes its writes.
+func connectWithDetachedHandlers(ctx context.Context, cli *whatsmeow.Client) error {
+	handlerCtx, cancelHandlers := context.WithCancel(context.WithoutCancel(ctx))
+	stopCancellingDial := context.AfterFunc(ctx, cancelHandlers)
+	err := connectClientContext(handlerCtx, cli)
+	if !stopCancellingDial() || err != nil {
+		// ctx ended while ConnectContext ran (so handlerCtx is already
+		// cancelled), or the dial failed and whatsmeow kept no handlers.
+		cancelHandlers()
+	}
+	return err
+}
+
 var logoutClient = func(ctx context.Context, cli *whatsmeow.Client) error {
 	return cli.Logout(ctx)
 }
@@ -745,7 +771,7 @@ func (b *Bridge) ConnectPaired(ctx context.Context) error {
 	b.mu.Unlock()
 	b.emitStatusChange()
 
-	if err := connectClientContext(ctx, cli); err != nil {
+	if err := connectWithDetachedHandlers(ctx, cli); err != nil {
 		b.finishConnectError(cli, err)
 		return err
 	}
