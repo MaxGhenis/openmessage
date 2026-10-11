@@ -300,9 +300,11 @@ func (c *whatsappSupervisorControl) isPairedLocked() bool {
 }
 
 // rebuildUnpairedSupervisor terminally joins a blocked supervisor whose
-// remote logout already removed the local session, then reuses the normal
-// stopped-supervisor rebuild path. The replacement is therefore admitted in
-// StateUnpaired and can own a fresh pairing attempt.
+// remote logout already removed the local session (whatsapplive removes the
+// revoked identity itself when whatsmeow's delete did not, and reports it as
+// unpaired either way), then reuses the normal stopped-supervisor rebuild
+// path. The replacement is therefore admitted in StateUnpaired and can own a
+// fresh pairing attempt.
 func (c *whatsappSupervisorControl) rebuildUnpairedSupervisor(
 	supervisor *bridge.Supervisor,
 ) (*bridge.Supervisor, error) {

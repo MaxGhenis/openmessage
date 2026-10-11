@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
 
@@ -415,6 +416,39 @@ func TestDaemonGetStatus(t *testing.T) {
 		text := resultText(t, result)
 		if !strings.Contains(text, "RUNNING") || !strings.Contains(text, "WhatsApp: connected=true") {
 			t.Fatalf("status text = %q", text)
+		}
+	})
+
+	// Default MCP stdio serves get_status from the daemon. After a logout and
+	// a daemon restart, last_error is gone and paired=false alone reads like a
+	// deliberate unlink, so the relink line has to come through here too.
+	t.Run("daemon reports a WhatsApp logout", func(t *testing.T) {
+		since := time.Date(2026, time.August, 20, 18, 13, 0, 0, time.Local)
+		mux := http.NewServeMux()
+		mux.HandleFunc("/api/status", func(w http.ResponseWriter, r *http.Request) {
+			json.NewEncoder(w).Encode(map[string]any{
+				"connected": true,
+				"whatsapp": map[string]any{
+					"connected":       false,
+					"paired":          false,
+					"needs_relink":    true,
+					"relink_reason":   "401: logged out from another device",
+					"relink_since_ms": since.UnixMilli(),
+				},
+			})
+		})
+		a := testApp(t)
+		options := Options{Reads: a.Store, Daemon: daemonClientFor(t, mux)}
+		result, err := daemonGetStatusHandler(a, options)(context.Background(), mcp.CallToolRequest{})
+		if err != nil {
+			t.Fatalf("handler: %v", err)
+		}
+		text := resultText(t, result)
+		want := "WhatsApp: connected=false paired=false\n" +
+			"  Needs relink: WhatsApp logged this device out (401: logged out from another device) at " +
+			since.Format("2006-01-02 15:04 MST") + "; relink by scanning a new QR code"
+		if !strings.Contains(text, want) {
+			t.Fatalf("status text lacks %q:\n%s", want, text)
 		}
 	})
 

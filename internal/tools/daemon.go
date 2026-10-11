@@ -17,6 +17,7 @@ import (
 	"github.com/maxghenis/openmessage/internal/localapi"
 	"github.com/maxghenis/openmessage/internal/messaging"
 	"github.com/maxghenis/openmessage/internal/readsource"
+	"github.com/maxghenis/openmessage/internal/whatsapplive"
 )
 
 // Daemon-routed MCP handlers back the transportless "client mode" serve. The
@@ -536,6 +537,17 @@ func daemonGetStatusHandler(a *app.App, options Options) server.ToolHandlerFunc 
 				fmt.Fprintf(&sb, " last_error=%q", lastError)
 			}
 			sb.WriteString("\n")
+			// A logged-out WhatsApp reads paired=false; say why, as the
+			// in-process get_status does, since last_error does not survive a
+			// daemon restart.
+			if needsRelink, _ := platform["needs_relink"].(bool); needsRelink && key == "whatsapp" {
+				reason, _ := platform["relink_reason"].(string)
+				sb.WriteString(whatsAppRelinkLine(whatsapplive.StatusSnapshot{
+					NeedsRelink:   true,
+					RelinkReason:  reason,
+					RelinkSinceMS: rawInt64(platform["relink_since_ms"]),
+				}))
+			}
 		}
 		if connected, ok := raw["connected"].(bool); ok {
 			fmt.Fprintf(&sb, "Overall connected: %v\n", connected)
@@ -554,4 +566,18 @@ func daemonGetStatusHandler(a *app.App, options Options) server.ToolHandlerFunc 
 			"daemon":           raw,
 		}, sb.String()), nil
 	}
+}
+
+// rawInt64 reads a JSON number decoded into an any.
+func rawInt64(value any) int64 {
+	switch number := value.(type) {
+	case float64:
+		return int64(number)
+	case json.Number:
+		parsed, _ := number.Int64()
+		return parsed
+	case int64:
+		return number
+	}
+	return 0
 }

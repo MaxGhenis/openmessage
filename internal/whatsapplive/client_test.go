@@ -1508,6 +1508,10 @@ func TestConnectIfPairedStartsAsyncConnect(t *testing.T) {
 		client: &whatsmeow.Client{
 			Store: &wastore.Device{ID: &ownJID},
 		},
+		// New records the identity of the device it builds the client from,
+		// and the daemon claims the live session.
+		identity:         linkedIdentity{JID: ownJID},
+		liveSessionOwner: true,
 	}
 
 	originalConnect := connectClient
@@ -1908,6 +1912,8 @@ func newPairedBridgeForUnpairTest(t *testing.T) *Bridge {
 	})
 	jid := watypes.NewJID("15551230000", watypes.DefaultUserServer)
 	bridge.client.Store.ID = &jid
+	bridge.identity = linkedIdentity{JID: jid}
+	bridge.liveSessionOwner = true
 	return bridge
 }
 

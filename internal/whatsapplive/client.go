@@ -67,7 +67,10 @@ var ErrMediaNotDispatched = ErrSendNotDispatched
 const whatsappRuntimeStateSchema = `
 CREATE TABLE IF NOT EXISTS openmessage_whatsapp_runtime_state (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-    blocked_until_ns INTEGER NOT NULL DEFAULT 0
+    blocked_until_ns INTEGER NOT NULL DEFAULT 0,
+    logged_out_at_ns INTEGER NOT NULL DEFAULT 0,
+    logged_out_reason TEXT NOT NULL DEFAULT '',
+    logged_out_jid TEXT NOT NULL DEFAULT ''
 );
 INSERT OR IGNORE INTO openmessage_whatsapp_runtime_state (singleton, blocked_until_ns)
 VALUES (1, 0);
@@ -264,6 +267,21 @@ type StatusSnapshot struct {
 	QRAvailable bool   `json:"qr_available"`
 	QREvent     string `json:"qr_event,omitempty"`
 	QRUpdatedAt int64  `json:"qr_updated_at,omitempty"`
+	// NeedsRelink reports that WhatsApp logged this install's linked device
+	// out (whatsmeow's LoggedOut: 401 logged out from another device or
+	// device removed, 403, 406) and no newer link is stored. Paired is false
+	// whenever it is true, because the server revoked that identity; the
+	// bridge removes it, so QR or phone-code pairing can start directly. A
+	// successful pairing, a newer stored link or an explicit unpair ends it,
+	// and it survives a restart. It is always present, so a client can tell a
+	// backend that predates it (field absent) from one reporting false.
+	NeedsRelink bool `json:"needs_relink"`
+	// RelinkReason is whatsmeow's description of the logout, such as
+	// "401: logged out from another device".
+	RelinkReason string `json:"relink_reason,omitempty"`
+	// RelinkSinceMS is when this install first saw the logout (Unix ms). It
+	// stays fixed for the episode, so it identifies it.
+	RelinkSinceMS int64 `json:"relink_since_ms,omitempty"`
 }
 
 type QRSnapshot struct {
@@ -313,7 +331,17 @@ type Bridge struct {
 	// clientGeneration changes whenever resetClientLocked installs a new
 	// whatsmeow client. Event handler closures capture it so callbacks from a
 	// retired client can never affect or terminate the replacement generation.
-	clientGeneration      uint64
+	clientGeneration uint64
+	// identity is the linked identity the current client generation holds,
+	// read from the session store when the client is built, taken from
+	// PairSuccess, or adopted from the store on a paired Connected. None of
+	// these reads the live device, whose ID whatsmeow's Store.Delete sets to
+	// nil from its own goroutine without any lock the bridge holds.
+	identity linkedIdentity
+	// loggedOutGeneration is the client generation whose logout was last
+	// recorded. The purge replaces that client even when the bridge had not
+	// yet recorded the identity it paired (a logout before PairSuccess).
+	loggedOutGeneration   uint64
 	observation           lifecycleObservation
 	ingressObservation    ingressObservation
 	nextObserverID        uint64
@@ -322,6 +350,15 @@ type Bridge struct {
 	runtimeMu    sync.Mutex
 	runtimeDB    *sql.DB
 	blockedUntil time.Time
+	loggedOut    loggedOutState
+	// storedLoggedOut is the record last known to be in the runtime state
+	// table. While it differs from loggedOut a write failed, and the next
+	// record, clear or purge retries it.
+	storedLoggedOut loggedOutState
+	// liveSessionOwner marks the process that owns the live session (see
+	// ClaimLiveSession). It is written with b.mu and runtimeMu both held, and
+	// read under either.
+	liveSessionOwner bool
 
 	connected                 bool
 	connecting                bool
@@ -382,6 +419,9 @@ func (b *Bridge) initClientLocked() error {
 	})
 	b.container = container
 	b.client = cli
+	// The client was built from this device a moment ago and has not
+	// connected, so no whatsmeow goroutine can be writing it yet.
+	b.identity = identityOf(deviceStore)
 	return nil
 }
 
@@ -395,11 +435,22 @@ func (b *Bridge) initRuntimeState() error {
 		_ = database.Close()
 		return fmt.Errorf("initialize WhatsApp runtime state: %w", err)
 	}
-	var blockedUntilNS int64
+	if err = ensureRuntimeStateColumns(context.Background(), database); err != nil {
+		_ = database.Close()
+		return fmt.Errorf("initialize WhatsApp runtime state: %w", err)
+	}
+	var (
+		blockedUntilNS  int64
+		loggedOutAtNS   int64
+		loggedOutReason string
+		loggedOutJID    string
+		loggedOutKey    string
+	)
 	if err = database.QueryRowContext(
 		context.Background(),
-		`SELECT blocked_until_ns FROM openmessage_whatsapp_runtime_state WHERE singleton = 1`,
-	).Scan(&blockedUntilNS); err != nil {
+		`SELECT blocked_until_ns, logged_out_at_ns, logged_out_reason, logged_out_jid, logged_out_key
+		 FROM openmessage_whatsapp_runtime_state WHERE singleton = 1`,
+	).Scan(&blockedUntilNS, &loggedOutAtNS, &loggedOutReason, &loggedOutJID, &loggedOutKey); err != nil {
 		_ = database.Close()
 		return fmt.Errorf("load WhatsApp runtime state: %w", err)
 	}
@@ -409,6 +460,8 @@ func (b *Bridge) initRuntimeState() error {
 	if blockedUntilNS > 0 {
 		b.blockedUntil = time.Unix(0, blockedUntilNS)
 	}
+	b.loggedOut = loadLoggedOutState(loggedOutAtNS, loggedOutReason, loggedOutJID, loggedOutKey)
+	b.storedLoggedOut = b.loggedOut
 	b.runtimeMu.Unlock()
 	return nil
 }
@@ -554,6 +607,7 @@ func (b *Bridge) resetClientLocked() error {
 		b.client.Disconnect()
 		b.client = nil
 	}
+	b.identity = linkedIdentity{}
 	if b.container != nil {
 		if err := b.container.Close(); err != nil {
 			b.logger.Warn().Err(err).Msg("Failed to close WhatsApp session store")
@@ -567,6 +621,12 @@ func (b *Bridge) recoverPersistedSessionLocked() error {
 	if err := b.initClientLocked(); err != nil {
 		return err
 	}
+	// A revoked identity must never be dialed again (it earns another 401) and
+	// blocks pairing while it is present, so every connect and pair entry point
+	// removes it first if the logout handler could not.
+	if _, err := b.purgeLoggedOutIdentityLocked(); err != nil {
+		return fmt.Errorf("remove logged-out WhatsApp identity: %w", err)
+	}
 	if b.client == nil || b.client.Store == nil {
 		return nil
 	}
@@ -579,28 +639,58 @@ func (b *Bridge) recoverPersistedSessionLocked() error {
 	// A clean unpaired device must keep its identity for the active pairing
 	// observation. Reset only when the database proves a paired identity was
 	// persisted after this in-memory store was created.
-	if deviceStore := b.pairedDeviceStoreLocked(); deviceStore != nil {
+	if _, ok := b.storedLinkLocked(b.loggedOutSnapshot()); ok {
 		return b.resetClientLocked()
 	}
 	return nil
 }
 
-func (b *Bridge) pairedDeviceStoreLocked() *wastore.Device {
-	if b.client != nil && b.client.Store != nil && b.client.Store.ID != nil {
-		return b.client.Store
+// linkedIdentityLocked returns the identity this install is linked with, and
+// its push name. In the process that owns the live session that is the
+// current client's identity as the bridge recorded it, unless a logout
+// revoked it; then a link stored since then takes its place. Any other
+// process reads the session store. Store reads use device structs nothing
+// else holds, so this never reads a live device's ID, which whatsmeow's
+// Store.Delete clears from its own goroutine. Caller holds b.mu.
+func (b *Bridge) linkedIdentityLocked(loggedOut loggedOutState) (linkedIdentity, string) {
+	held := linkedIdentity{}
+	if b.liveSessionOwner {
+		held = b.identity
 	}
-	if b.container == nil {
-		return nil
+	if !held.empty() && !loggedOut.revokes(held) {
+		pushName := ""
+		if b.client != nil && b.client.Store != nil {
+			pushName = b.client.Store.PushName
+		}
+		return held, pushName
 	}
-	deviceStore, err := b.container.GetFirstDevice(context.Background())
-	if err != nil {
-		b.logger.Debug().Err(err).Msg("Failed to inspect persisted WhatsApp session state")
-		return nil
+	if stored, ok := b.storedLinkLocked(loggedOut); ok {
+		return stored.identity, stored.pushName
 	}
-	if deviceStore == nil || deviceStore.ID == nil {
-		return nil
+	if !held.empty() {
+		return held, ""
 	}
-	return deviceStore
+	// Only revoked identities are stored, if any.
+	if stored := b.storedIdentitiesLocked(); len(stored) > 0 {
+		return stored[0].identity, stored[0].pushName
+	}
+	return linkedIdentity{}, ""
+}
+
+// pairingStateLocked derives paired and needs_relink from one snapshot of the
+// logout record and the linked identity, so one status can never report both.
+// An identity a logout revoked is not paired, because WhatsApp no longer
+// accepts it, even before the purge removes it. A newer stored link
+// supersedes the record, even before the purge drops it. A process that does
+// not own the live session rereads the record first. Caller holds b.mu.
+func (b *Bridge) pairingStateLocked() (linked linkedIdentity, pushName string, paired bool, loggedOut loggedOutState, needsRelink bool) {
+	b.refreshLoggedOutLocked()
+	loggedOut = b.loggedOutSnapshot()
+	linked, pushName = b.linkedIdentityLocked(loggedOut)
+	revoked := loggedOut.revokes(linked)
+	paired = !linked.empty() && !revoked
+	needsRelink = loggedOut.active() && (linked.empty() || revoked)
+	return linked, pushName, paired, loggedOut, needsRelink
 }
 
 func (b *Bridge) ConnectIfPaired() error {
@@ -864,7 +954,7 @@ func (b *Bridge) DisconnectTransport() {
 	if b.client == cli {
 		b.connected = false
 		b.connecting = false
-		if cli == nil || cli.Store == nil || cli.Store.ID != nil {
+		if cli == nil || !b.identity.empty() {
 			b.pairing = false
 		}
 	}
@@ -880,7 +970,7 @@ func (b *Bridge) ProbeKeepAlive(ctx context.Context) error {
 	}
 	b.mu.RLock()
 	cli := b.client
-	paired := cli != nil && cli.Store != nil && cli.Store.ID != nil
+	paired := cli != nil && !b.identity.empty()
 	b.mu.RUnlock()
 	if !paired {
 		return whatsmeow.ErrNotLoggedIn
@@ -901,14 +991,14 @@ func (b *Bridge) ProbeKeepAlive(ctx context.Context) error {
 func (b *Bridge) PairedAccount() AccountInfo {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
-	deviceStore := b.pairedDeviceStoreLocked()
-	if deviceStore == nil {
+	linked, pushName, paired, _, _ := b.pairingStateLocked()
+	if !paired {
 		return AccountInfo{}
 	}
 	return AccountInfo{
 		Paired:   true,
-		JID:      deviceStore.ID.String(),
-		PushName: strings.TrimSpace(deviceStore.PushName),
+		JID:      linked.JID.String(),
+		PushName: strings.TrimSpace(pushName),
 	}
 }
 
@@ -1079,25 +1169,30 @@ func (b *Bridge) consumeQR(ch <-chan whatsmeow.QRChannelItem) {
 func (b *Bridge) Unpair() error {
 	b.mu.RLock()
 	cli := b.client
+	revoked := b.loggedOutSnapshot().revokes(b.identity)
 	b.mu.RUnlock()
 
 	if cli != nil && cli.Store != nil && cli.Store.ID != nil {
-		remoteCtx, cancelRemote := context.WithTimeout(context.Background(), unpairRemoteTimeout)
-		connected := clientIsConnected(cli)
-		if !connected {
-			err := connectClientContext(remoteCtx, cli)
-			if err != nil && !errors.Is(err, whatsmeow.ErrAlreadyConnected) {
-				b.logger.Warn().Err(err).Msg("WhatsApp reconnect for logout failed; clearing local session anyway")
-			} else {
-				connected = true
+		// WhatsApp already removed an identity it logged out; dialing it only to
+		// send a logout would earn another 401. Clear it locally.
+		if !revoked {
+			remoteCtx, cancelRemote := context.WithTimeout(context.Background(), unpairRemoteTimeout)
+			connected := clientIsConnected(cli)
+			if !connected {
+				err := connectClientContext(remoteCtx, cli)
+				if err != nil && !errors.Is(err, whatsmeow.ErrAlreadyConnected) {
+					b.logger.Warn().Err(err).Msg("WhatsApp reconnect for logout failed; clearing local session anyway")
+				} else {
+					connected = true
+				}
 			}
-		}
-		if connected {
-			if err := logoutClient(remoteCtx, cli); err != nil {
-				b.logger.Warn().Err(err).Msg("WhatsApp logout failed; clearing local session anyway")
+			if connected {
+				if err := logoutClient(remoteCtx, cli); err != nil {
+					b.logger.Warn().Err(err).Msg("WhatsApp logout failed; clearing local session anyway")
+				}
 			}
+			cancelRemote()
 		}
-		cancelRemote()
 
 		// Logout clears the device store after the server confirms the unlink.
 		// If reconnect or logout failed, force the documented local fallback so
@@ -1119,10 +1214,18 @@ func (b *Bridge) Unpair() error {
 	b.lastError = ""
 	b.qr = QRSnapshot{}
 	err := b.resetClientLocked()
+	// An explicit unpair is a deliberate unlinked state, so it ends an
+	// outstanding logout as well (as Signal's unpair clears needs_reauth).
+	clearErr := b.clearLoggedOut()
 	b.mu.Unlock()
 	b.emitStatusChange()
 	if err != nil {
 		return fmt.Errorf("reset WhatsApp bridge: %w", err)
+	}
+	if clearErr != nil {
+		// The unpair itself is done; the next connect or pair attempt retries
+		// the write, and until then a restart would bring needs_relink back.
+		return fmt.Errorf("unpaired, but %w", clearErr)
 	}
 	return nil
 }
@@ -1137,10 +1240,18 @@ func (b *Bridge) Status() StatusSnapshot {
 		Pairing:    b.pairing,
 		LastError:  b.lastError,
 	}
-	if deviceStore := b.pairedDeviceStoreLocked(); deviceStore != nil {
+	linked, pushName, paired, loggedOut, needsRelink := b.pairingStateLocked()
+	if paired {
 		status.Paired = true
-		status.AccountJID = deviceStore.ID.String()
-		status.PushName = strings.TrimSpace(deviceStore.PushName)
+		status.AccountJID = linked.JID.String()
+		status.PushName = strings.TrimSpace(pushName)
+	}
+	if needsRelink {
+		status.NeedsRelink = true
+		status.RelinkReason = loggedOut.Reason
+		if !loggedOut.At.IsZero() {
+			status.RelinkSinceMS = loggedOut.At.UnixMilli()
+		}
 	}
 	status.QRAvailable = b.qr.Code != ""
 	status.QREvent = b.qr.Event
@@ -1213,9 +1324,13 @@ func (b *Bridge) QRCode() (QRSnapshot, error) {
 	return snap, nil
 }
 
+// UsesLiveSession reports whether the live bridge owns WhatsApp on this
+// install. A logout awaiting a relink still counts: losing authorization must
+// not silently hand ingestion to the WhatsApp Desktop importer, whose
+// conversation upserts would overwrite timestamps and unread counts.
 func (b *Bridge) UsesLiveSession() bool {
 	status := b.Status()
-	return status.Paired || status.Connected || status.Pairing
+	return status.Paired || status.Connected || status.Pairing || status.NeedsRelink
 }
 
 func (b *Bridge) Close() error {
@@ -1224,6 +1339,7 @@ func (b *Bridge) Close() error {
 		b.client.Disconnect()
 		b.client = nil
 	}
+	b.identity = linkedIdentity{}
 	b.connected = false
 	b.connecting = false
 	b.pairing = false
@@ -1933,10 +2049,13 @@ func (b *Bridge) ProfilePhoto(conversationID string) ([]byte, string, error) {
 // compatibility status projection or the supervisor observer is notified.
 func (b *Bridge) handleClientEvent(source *whatsmeow.Client, generation uint64, raw any) {
 	b.mu.RLock()
-	current := source == nil || (b.client == source && b.clientGeneration == generation)
+	current := b.isCurrentClientLocked(source, generation)
 	b.mu.RUnlock()
 	if !current {
 		return
+	}
+	if testHookAfterAdmission != nil {
+		testHookAfterAdmission(raw)
 	}
 
 	at := time.Now()
@@ -1945,35 +2064,77 @@ func (b *Bridge) handleClientEvent(source *whatsmeow.Client, generation uint64, 
 	if event, ok := raw.(*waevents.TemporaryBan); ok && event != nil {
 		retryAt, persistenceErr = b.persistTemporaryBan(at, event.Expire)
 	}
+	// Record a logout before the status projection below publishes it, so the
+	// first status change already reports needs_relink. The generation check
+	// and the record share one critical section with Unpair and client
+	// replacement, which change both under b.mu, so a callback from a client
+	// replaced meanwhile records nothing against its successor and cannot
+	// undo a deliberate unpair.
+	loggedOut := false
+	if reason, ok := loggedOutEventReason(raw); ok {
+		b.mu.Lock()
+		current = b.isCurrentClientLocked(source, generation)
+		if current {
+			identity := b.identity
+			if identity.empty() {
+				// A pairing whose PairSuccess has not reached the bridge:
+				// whatsmeow saved the identity before dispatching it, so read it
+				// from the store (a pairing transport stores none).
+				if stored, ok := b.storedLinkLocked(b.loggedOutSnapshot()); ok {
+					identity = stored.identity
+				}
+			}
+			if !identity.empty() {
+				b.loggedOutGeneration = b.clientGeneration
+				b.recordLoggedOut(at, reason, identity)
+				loggedOut = true
+			}
+		}
+		b.mu.Unlock()
+		if !current {
+			return
+		}
+	}
 
-	b.applyEvent(raw)
+	b.applyEvent(source, generation, raw)
 
 	b.mu.RLock()
 	// Re-check after applying the event because a concurrent explicit unpair
 	// may have replaced the client while the compatibility handler ran.
-	current = source == nil || (b.client == source && b.clientGeneration == generation)
-	paired := source != nil && source.Store != nil && source.Store.ID != nil
-	if source == nil {
-		paired = b.client != nil && b.client.Store != nil && b.client.Store.ID != nil
-	}
+	current = b.isCurrentClientLocked(source, generation)
+	// The bridge's own record of the identity, not the live device: whatsmeow
+	// clears that device's ID from its own goroutine during a logout.
+	paired := !b.identity.empty()
 	observer := b.observation.callback
 	b.mu.RUnlock()
-	if !current || observer == nil {
-		return
+	if current && observer != nil {
+		observer(LifecycleEvent{
+			Raw:              raw,
+			Paired:           paired,
+			At:               at,
+			RetryAt:          retryAt,
+			PersistenceError: persistenceErr,
+		})
 	}
-	observer(LifecycleEvent{
-		Raw:              raw,
-		Paired:           paired,
-		At:               at,
-		RetryAt:          retryAt,
-		PersistenceError: persistenceErr,
-	})
+	if loggedOut {
+		// After the observer, so the supervisor learns of the logout from this
+		// generation before the purge replaces its client.
+		b.purgeLoggedOutIdentity()
+	}
 }
 
 // handleEvent remains the characterization-test entry point. Production
 // whatsmeow callbacks always use handleClientEvent with a source generation.
 func (b *Bridge) handleEvent(raw any) {
 	b.handleClientEvent(nil, 0, raw)
+}
+
+// isCurrentClientLocked reports whether an event from source's generation
+// still belongs to the bridge's client. A nil source is the
+// characterization-test entry point and always counts as current. Caller
+// holds b.mu.
+func (b *Bridge) isCurrentClientLocked(source *whatsmeow.Client, generation uint64) bool {
+	return source == nil || (b.client == source && b.clientGeneration == generation)
 }
 
 func (b *Bridge) emitIngress(frame IngressFrame) {
@@ -2182,29 +2343,32 @@ func (b *Bridge) logIngressCaptureError(kind string, err error) {
 	b.logger.Warn().Err(err).Str("kind", kind).Msg("Failed to capture WhatsApp ingress frame")
 }
 
-func (b *Bridge) applyEvent(raw any) {
+func (b *Bridge) applyEvent(source *whatsmeow.Client, generation uint64, raw any) {
 	switch evt := raw.(type) {
 	case *waevents.Connected:
-		b.handleConnected()
+		b.handleConnected(source, generation)
 	case *waevents.Disconnected:
-		b.handleDisconnected("")
+		b.handleDisconnected(source, generation, "")
 	case *waevents.LoggedOut:
-		b.handleDisconnected(evt.PermanentDisconnectDescription())
+		b.handleDisconnected(source, generation, evt.PermanentDisconnectDescription())
 	case *waevents.StreamReplaced:
-		b.handleDisconnected("stream replaced")
+		b.handleDisconnected(source, generation, "stream replaced")
 	case *waevents.ClientOutdated:
-		b.handleDisconnected("client outdated")
+		b.handleDisconnected(source, generation, "client outdated")
 	case *waevents.ConnectFailure:
-		b.handleDisconnected(evt.PermanentDisconnectDescription())
+		b.handleDisconnected(source, generation, evt.PermanentDisconnectDescription())
 	case *waevents.TemporaryBan:
-		b.handleDisconnected(evt.PermanentDisconnectDescription())
+		b.handleDisconnected(source, generation, evt.PermanentDisconnectDescription())
 	case *waevents.ManualLoginReconnect:
 		// DisableLoginAutoReconnect turns whatsmeow's implicit 515 reconnect
 		// into this event. The adapter decides whether pairing is handing off or
 		// an active lifecycle generation must be retired and retried.
-		b.handleDisconnected("WhatsApp requested a supervised login reconnect")
+		b.handleDisconnected(source, generation, "WhatsApp requested a supervised login reconnect")
 	case *waevents.PairSuccess:
-		b.handlePairSuccess(evt)
+		if evt == nil {
+			return
+		}
+		b.handlePairSuccess(source, generation, evt)
 	case *waevents.PairError:
 		b.handlePairError(evt.Error)
 	case *waevents.PairPasskeyRequest:
@@ -2233,14 +2397,33 @@ func (b *Bridge) applyEvent(raw any) {
 	}
 }
 
-func (b *Bridge) handleConnected() {
+func (b *Bridge) handleConnected(source *whatsmeow.Client, generation uint64) {
 	b.mu.Lock()
+	if !b.isCurrentClientLocked(source, generation) {
+		b.mu.Unlock()
+		return
+	}
+	// whatsmeow dispatches PairSuccess from its own pairing goroutine, after it
+	// saves the new identity, with no ordering against this connection. Adopt
+	// a link it stored whose PairSuccess has not reached the bridge yet, read
+	// from the store rather than the live device. A link a logout revoked or
+	// whatsmeow deleted is not adopted. A new link supersedes an outstanding
+	// logout.
+	if b.identity.empty() {
+		loggedOut := b.loggedOutSnapshot()
+		if stored, ok := b.storedLinkLocked(loggedOut); ok {
+			b.identity = stored.identity
+			if loggedOut.active() {
+				_ = b.clearLoggedOut()
+			}
+		}
+	}
 	// An unpaired connection is only the transport we use to drive QR / phone-
 	// code pairing — it is not a usable session. Keep the pairing state (and the
 	// pairing affordance in the UI) alive until PairSuccess sets Store.ID; a
 	// premature connected=true would flip the UI to "Connected" and hide the
 	// code the user still needs to enter.
-	if b.client != nil && b.client.Store != nil && b.client.Store.ID == nil {
+	if b.identity.empty() {
 		b.connecting = false
 		b.mu.Unlock()
 		b.emitStatusChange()
@@ -2264,11 +2447,18 @@ func (b *Bridge) handleConnected() {
 	b.emitStatusChange()
 }
 
-func (b *Bridge) handleDisconnected(reason string) {
+// handleDisconnected applies a disconnect from source's generation, unless
+// that client was replaced while the event was in flight: a retired client's
+// disconnect must not mark its successor disconnected.
+func (b *Bridge) handleDisconnected(source *whatsmeow.Client, generation uint64, reason string) {
 	b.mu.Lock()
+	if !b.isCurrentClientLocked(source, generation) {
+		b.mu.Unlock()
+		return
+	}
 	b.connected = false
 	b.connecting = false
-	if b.client != nil && b.client.Store != nil && b.client.Store.ID == nil {
+	if b.identity.empty() {
 		b.pairing = false
 	}
 	if reason != "" {
@@ -2278,11 +2468,37 @@ func (b *Bridge) handleDisconnected(reason string) {
 	b.emitStatusChange()
 }
 
-func (b *Bridge) handlePairSuccess(_ *waevents.PairSuccess) {
+func (b *Bridge) handlePairSuccess(source *whatsmeow.Client, generation uint64, evt *waevents.PairSuccess) {
 	b.mu.Lock()
+	// A PairSuccess from a client replaced while it was in flight (an unpair,
+	// a purge) must not install its identity on the successor or end its
+	// logout.
+	if !b.isCurrentClientLocked(source, generation) {
+		b.mu.Unlock()
+		return
+	}
 	b.pairing = false
 	b.lastError = ""
 	b.qr = QRSnapshot{}
+	// whatsmeow installed the new identity on this client and saved it before
+	// dispatching PairSuccess; its identity key is fixed when the device is
+	// created.
+	identity := linkedIdentity{JID: evt.ID}
+	if b.client != nil {
+		identity.Key = identityKeyFingerprint(b.client.Store)
+	}
+	// A logout can overtake this event (whatsmeow dispatches both from their
+	// own goroutines). Install the identity only while the store still holds
+	// it and no logout revoked it; otherwise whatsmeow already deleted it or
+	// the bridge recorded its logout.
+	loggedOut := b.loggedOutSnapshot()
+	if !loggedOut.revokes(identity) && b.storesIdentityLocked(identity) {
+		b.identity = identity
+		// A new link ends an outstanding logout.
+		if loggedOut.active() {
+			_ = b.clearLoggedOut()
+		}
+	}
 	b.mu.Unlock()
 	b.emitStatusChange()
 }

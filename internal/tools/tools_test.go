@@ -630,6 +630,49 @@ func TestGetStatus(t *testing.T) {
 	}
 }
 
+// A WhatsApp logout reads as unpaired, so the text has to say why and how to
+// recover, or an agent reads "Paired: false" as a deliberate unlink.
+func TestGetStatusExplainsAWhatsAppLogout(t *testing.T) {
+	a := testApp(t)
+	a.DataDir = t.TempDir()
+
+	originalWhatsAppStatus := whatsAppStatus
+	since := time.Date(2026, time.August, 20, 18, 13, 0, 0, time.Local)
+	whatsAppStatus = func(*app.App) whatsapplive.StatusSnapshot {
+		return whatsapplive.StatusSnapshot{
+			NeedsRelink:   true,
+			RelinkReason:  "401: logged out from another device",
+			RelinkSinceMS: since.UnixMilli(),
+			LastError:     "401: logged out from another device",
+		}
+	}
+	t.Cleanup(func() { whatsAppStatus = originalWhatsAppStatus })
+
+	handler := getStatusHandler(a)
+	req := mcp.CallToolRequest{}
+	req.Params.Arguments = map[string]any{}
+	result, err := handler(context.Background(), req)
+	if err != nil {
+		t.Fatalf("handler error: %v", err)
+	}
+	text := result.Content[0].(mcp.TextContent).Text
+	want := "  Needs relink: WhatsApp logged this device out (401: logged out from another device) at " +
+		since.Format("2006-01-02 15:04 MST") +
+		"; relink by scanning a new QR code (POST /api/whatsapp/connect starts one). Unpairing clears this without restoring WhatsApp.\n"
+	if !strings.Contains(text, want) {
+		t.Fatalf("status text lacks the relink line %q:\n%s", want, text)
+	}
+	whatsApp, ok := structuredMap(t, result)["whatsapp"].(whatsapplive.StatusSnapshot)
+	if !ok || !whatsApp.NeedsRelink || whatsApp.Paired {
+		t.Fatalf("structured whatsapp = %#v, want needs_relink and not paired", structuredMap(t, result)["whatsapp"])
+	}
+
+	bare := whatsAppRelinkLine(whatsapplive.StatusSnapshot{NeedsRelink: true})
+	if bare != "  Needs relink: WhatsApp logged this device out; relink by scanning a new QR code (POST /api/whatsapp/connect starts one). Unpairing clears this without restoring WhatsApp.\n" {
+		t.Fatalf("relink line without details = %q", bare)
+	}
+}
+
 func TestGetStatusOmitsPacedRepairsWhenIdle(t *testing.T) {
 	a := testApp(t)
 	a.DataDir = t.TempDir()

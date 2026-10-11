@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
@@ -97,6 +98,9 @@ func getStatusHandler(a *app.App, configured ...Options) server.ToolHandlerFunc 
 		if whatsApp.PushName != "" {
 			fmt.Fprintf(&sb, "  Push name: %s\n", whatsApp.PushName)
 		}
+		if whatsApp.NeedsRelink {
+			sb.WriteString(whatsAppRelinkLine(whatsApp))
+		}
 		if whatsApp.LastError != "" {
 			fmt.Fprintf(&sb, "  Last error: %s\n", whatsApp.LastError)
 		}
@@ -138,4 +142,20 @@ func getStatusHandler(a *app.App, configured ...Options) server.ToolHandlerFunc 
 		}
 		return structuredResult(payload, sb.String()), nil
 	}
+}
+
+// whatsAppRelinkLine says that WhatsApp logged this install out, and how to
+// recover. Unpairing clears the flag without restoring WhatsApp, so the line
+// points at relinking instead.
+func whatsAppRelinkLine(status whatsapplive.StatusSnapshot) string {
+	var sb strings.Builder
+	sb.WriteString("  Needs relink: WhatsApp logged this device out")
+	if status.RelinkReason != "" {
+		fmt.Fprintf(&sb, " (%s)", status.RelinkReason)
+	}
+	if status.RelinkSinceMS > 0 {
+		fmt.Fprintf(&sb, " at %s", time.UnixMilli(status.RelinkSinceMS).Local().Format("2006-01-02 15:04 MST"))
+	}
+	sb.WriteString("; relink by scanning a new QR code (POST /api/whatsapp/connect starts one). Unpairing clears this without restoring WhatsApp.\n")
+	return sb.String()
 }

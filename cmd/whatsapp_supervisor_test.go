@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -43,8 +44,10 @@ func TestWhatsAppSupervisorControlRemoteLoggedOutCanPairAgain(t *testing.T) {
 			}
 			awaitWhatsAppControlState(t, harness.first, bridge.StateOnline)
 
-			// whatsapplive deletes the local session before publishing LoggedOut.
-			// The adapter then completes the active generation with ReauthRequired.
+			// On LoggedOut the bridge reads as unpaired: it records the logout and
+			// removes the revoked identity that whatsmeow's own delete (run with a
+			// context the adapter cancels) can leave behind. The adapter completes
+			// the active generation with ReauthRequired.
 			harness.adapter.paired.Store(false)
 			harness.adapter.Run(0).Fail(bridge.OpError{
 				Class:       bridge.FailureReauthRequired,
@@ -76,6 +79,38 @@ func TestWhatsAppSupervisorControlRemoteLoggedOutCanPairAgain(t *testing.T) {
 				t.Fatalf("supervisors constructed = %d, want 2", got)
 			}
 		})
+	}
+}
+
+// While a blocked account still reads as paired, Reconnect refuses instead of
+// pairing. That was the 2026-08-20 state: the revoked identity survived and
+// read as paired, and nothing could reconnect or re-pair it until an unpair.
+// The bridge now reports a logged-out account as unpaired (whatsapplive's
+// TestRemoteLogoutLeavesTheAccountReadyToRelink), so this refusal is left for
+// reauthentication blocks that keep a valid identity.
+func TestWhatsAppSupervisorControlRefusesToPairOverAPairedIdentity(t *testing.T) {
+	harness := newWhatsAppControlTestHarness(t, bridge.StateStopped, true)
+	if err := harness.control.Reconnect(); err != nil {
+		t.Fatalf("initial Reconnect() error = %v", err)
+	}
+	awaitWhatsAppControlState(t, harness.first, bridge.StateOnline)
+	harness.adapter.Run(0).Fail(bridge.OpError{
+		Class:       bridge.FailureReauthRequired,
+		Operation:   "connect",
+		Fingerprint: "whatsapp_logged_out",
+		Cause:       errors.New("401: logged out from another device"),
+	})
+	awaitWhatsAppControlState(t, harness.first, bridge.StateBlocked)
+
+	err := harness.control.Reconnect()
+	if err == nil || !strings.Contains(err.Error(), "requires re-pairing") {
+		t.Fatalf("Reconnect() error = %v, want a re-pairing refusal", err)
+	}
+	if got := harness.adapter.PairCount(); got != 0 {
+		t.Fatalf("pair attempts = %d, want none while the identity reads as paired", got)
+	}
+	if harness.currentSupervisor() != harness.first {
+		t.Fatal("Reconnect() replaced the blocked supervisor")
 	}
 }
 

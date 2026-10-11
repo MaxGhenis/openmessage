@@ -9,6 +9,12 @@ struct PlatformAttention: Equatable {
         /// Re-pair or reauth needed, a paired platform is disconnected, or its
         /// newest message trails the other platforms by days.
         case needsRepair
+        /// The service logged this install's linked device out
+        /// (`needs_relink`; WhatsApp's 401/403/406). From 2026-08-20 WhatsApp
+        /// sat logged out for eight days without a notification, because the
+        /// app only looked at `paired`. `since` is `relink_since_ms`, which
+        /// identifies the episode; `reason` is the backend's description.
+        case loggedOut(since: Int64, reason: String)
         /// Connected, but nothing has arrived for longer than the platform's
         /// own recent traffic explains (`freshness.<key>.stale_reason ==
         /// "silent"`). On 2026-10-06 the phone relayed nothing for 38 hours
@@ -37,8 +43,8 @@ struct PlatformAttention: Equatable {
     ]
 
     /// Platforms needing attention, in `platforms` order. Only platforms that
-    /// report `paired`, or explicitly ask for pairing/reauth, are considered,
-    /// so a platform the user never set up never nags.
+    /// report `paired`, or explicitly ask for pairing/reauth/relink, are
+    /// considered, so a platform the user never set up never nags.
     static func evaluate(status json: [String: Any]) -> [PlatformAttention] {
         let freshness = json["freshness"] as? [String: Any]
         return platforms.compactMap { platform in
@@ -47,6 +53,13 @@ struct PlatformAttention: Equatable {
             let connected = (p["connected"] as? Bool) ?? false
             let needsPairing = (p["needs_pairing"] as? Bool) ?? false
             let needsReauth = (p["needs_reauth"] as? Bool) ?? false
+            if (p["needs_relink"] as? Bool) ?? false {
+                let since = (p["relink_since_ms"] as? NSNumber)?.int64Value ?? 0
+                let reason = (p["relink_reason"] as? String) ?? ""
+                return PlatformAttention(
+                    key: platform.key, name: platform.name, reason: .loggedOut(since: since, reason: reason)
+                )
+            }
             if needsPairing || needsReauth || (paired && !connected) {
                 return PlatformAttention(key: platform.key, name: platform.name, reason: .needsRepair)
             }
@@ -88,10 +101,25 @@ struct PlatformAttention: Equatable {
         return evaluate(status: json)
     }
 
+    /// Whether a backend that predates `needs_relink` reads as WhatsApp having
+    /// been logged out: it only says `paired: false`, which also covers a
+    /// deliberate unpair and a WhatsApp never set up. Returns nil when the
+    /// backend reports `needs_relink`, which then decides on its own.
+    static func legacyWhatsAppLoggedOut(status json: [String: Any]) -> Bool? {
+        let whatsapp = json["whatsapp"] as? [String: Any]
+        if whatsapp?["needs_relink"] is Bool { return nil }
+        return !((whatsapp?["paired"] as? Bool) ?? true)
+    }
+
     /// One-line menu bar alert, or nil when every paired platform is healthy.
     static func alertText(for items: [PlatformAttention]) -> String? {
         var sentences: [String] = []
-        let repair = items.filter { $0.reason == .needsRepair }.map(\.name)
+        let repair = items.filter { item in
+            switch item.reason {
+            case .needsRepair, .loggedOut: return true
+            case .silent, .smsStopped: return false
+            }
+        }.map(\.name)
         switch repair.count {
         case 0: break
         case 1: sentences.append("\(repair[0]) needs re-pairing — it has stopped syncing.")
@@ -103,11 +131,20 @@ struct PlatformAttention: Equatable {
                 sentences.append(silentSentence(item, hours: hours))
             case let .smsStopped(hours, _):
                 sentences.append(smsStoppedSentence(hours: hours))
-            case .needsRepair:
+            case .needsRepair, .loggedOut:
                 break
             }
         }
         return sentences.isEmpty ? nil : sentences.joined(separator: " ")
+    }
+
+    /// Body of the one-time notification for a platform whose linked device
+    /// was logged out.
+    static func loggedOutNotificationBody(_ item: PlatformAttention) -> String? {
+        guard case let .loggedOut(_, reason) = item.reason else { return nil }
+        let why = reason.isEmpty ? "" : " (\(reason))"
+        return "\(item.name) logged OpenMessage out\(why), so its messages have stopped syncing. "
+            + "Open OpenMessage and scan the QR code to relink."
     }
 
     /// Body of the one-time notification for a platform that went silent.
@@ -148,6 +185,9 @@ struct SilenceNotificationLatch {
     /// Platform key → the `since` of the last episode notified. Persist it
     /// (see `NotificationManager`) so an app relaunch mid-outage stays quiet.
     private(set) var notifiedEpisode: [String: Int64]
+    /// Platform key → the `since` of an episode whose notification was
+    /// submitted but not yet confirmed. Not persisted: a relaunch retries it.
+    private(set) var pendingEpisode: [String: Int64] = [:]
 
     init(notifiedEpisode: [String: Int64] = [:]) {
         self.notifiedEpisode = notifiedEpisode
@@ -181,6 +221,35 @@ struct SilenceNotificationLatch {
         newlyNotified(items) { reason in
             if case let .smsStopped(_, since) = reason { return since }
             return nil
+        }
+    }
+
+    /// Logged-out items to notify now: their episode (`relink_since_ms`, fixed
+    /// until a new link or an unpair) has not been delivered and is not in
+    /// flight. Marks them in flight; report each submission's outcome with
+    /// `finishLoggedOut`. Keep a separate latch for these, so a relaunch during
+    /// a logout stays quiet and the next logout notifies again. Unlike the
+    /// silence latches, an episode counts as notified only once macOS accepted
+    /// its notification, so a failed submission is retried.
+    mutating func beginLoggedOut(_ items: [PlatformAttention]) -> [PlatformAttention] {
+        items.filter { item in
+            guard case let .loggedOut(since, _) = item.reason else { return false }
+            if notifiedEpisode[item.key] == since || pendingEpisode[item.key] == since { return false }
+            pendingEpisode[item.key] = since
+            return true
+        }
+    }
+
+    /// Records the outcome of a submission `beginLoggedOut` started. Delivered
+    /// marks the episode notified (persist `storedValue` afterwards); a failure
+    /// leaves it for the next health check. A completion for an episode no
+    /// longer in flight (a newer logout started meanwhile) changes nothing, so
+    /// completions arriving out of order cannot move the latch back.
+    mutating func finishLoggedOut(_ item: PlatformAttention, delivered: Bool) {
+        guard case let .loggedOut(since, _) = item.reason, pendingEpisode[item.key] == since else { return }
+        pendingEpisode[item.key] = nil
+        if delivered {
+            notifiedEpisode[item.key] = since
         }
     }
 

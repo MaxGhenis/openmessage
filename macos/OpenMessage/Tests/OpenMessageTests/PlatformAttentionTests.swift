@@ -222,4 +222,153 @@ final class PlatformAttentionTests: XCTestCase {
         XCTAssertEqual(smsLatch.newlyStoppedSMS([later]), [], "a relay silence in between does not re-arm the SMS episode")
         XCTAssertEqual(smsLatch.newlyStoppedSMS([next]), [next])
     }
+
+    // The 2026-08-20 shape after the backend reports the logout: WhatsApp no
+    // longer paired, needs_relink set with whatsmeow's reason. It asks for a
+    // relink, in the menu bar and in its one notification.
+    func testWhatsAppLogoutAsksForARelink() throws {
+        let json = status("""
+        {"google": {"connected": true, "paired": true},
+         "whatsapp": {"connected": false, "paired": false, "needs_relink": true,
+                      "relink_reason": "401: logged out from another device", "relink_since_ms": 1787260699000},
+         "freshness": {"whatsapp": {"stale": true, "stale_reason": "behind"}}}
+        """)
+        let items = PlatformAttention.evaluate(status: json)
+        XCTAssertEqual(items, [PlatformAttention(
+            key: "whatsapp", name: "WhatsApp",
+            reason: .loggedOut(since: 1_787_260_699_000, reason: "401: logged out from another device")
+        )])
+        let item = try XCTUnwrap(items.first)
+        XCTAssertEqual(PlatformAttention.alertText(for: items), "WhatsApp needs re-pairing — it has stopped syncing.")
+        XCTAssertEqual(
+            PlatformAttention.loggedOutNotificationBody(item),
+            "WhatsApp logged OpenMessage out (401: logged out from another device), so its messages have stopped syncing. "
+                + "Open OpenMessage and scan the QR code to relink."
+        )
+        XCTAssertNil(PlatformAttention.silentNotificationBody(item))
+        XCTAssertNil(PlatformAttention.loggedOutNotificationBody(
+            PlatformAttention(key: "google", name: "Google Messages", reason: .needsRepair)
+        ))
+    }
+
+    func testLogoutJoinsTheRepairSentence() throws {
+        let json = status("""
+        {"google": {"connected": false, "paired": true},
+         "whatsapp": {"connected": false, "paired": false, "needs_relink": true, "relink_since_ms": 5}}
+        """)
+        let items = PlatformAttention.evaluate(status: json)
+        XCTAssertEqual(items.map(\.key), ["google", "whatsapp"])
+        XCTAssertEqual(
+            PlatformAttention.alertText(for: items),
+            "Google Messages, WhatsApp need re-pairing — they have stopped syncing."
+        )
+        let whatsapp = try XCTUnwrap(items.first { $0.key == "whatsapp" })
+        XCTAssertEqual(
+            PlatformAttention.loggedOutNotificationBody(whatsapp),
+            "WhatsApp logged OpenMessage out, so its messages have stopped syncing. Open OpenMessage and scan the QR code to relink."
+        )
+    }
+
+    // Unpaired without needs_relink is a WhatsApp never set up or deliberately
+    // unpaired: no nagging.
+    func testUnpairedWhatsAppWithoutALogoutStaysQuiet() {
+        let json = status("""
+        {"whatsapp": {"connected": false, "paired": false, "needs_relink": false}}
+        """)
+        XCTAssertEqual(PlatformAttention.evaluate(status: json), [])
+    }
+
+    // One notification per logout episode (relink_since_ms): repeated health
+    // checks and an app relaunch during the logout stay quiet, a relink re-arms,
+    // and the next logout notifies again.
+    func testLogoutNotifiesOncePerEpisodeAcrossRelaunch() throws {
+        let suite = "PlatformAttentionTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let loggedOut = PlatformAttention(
+            key: "whatsapp", name: "WhatsApp", reason: .loggedOut(since: 1_787_260_699_000, reason: "401: logged out from another device")
+        )
+        let nextLogout = PlatformAttention(
+            key: "whatsapp", name: "WhatsApp", reason: .loggedOut(since: 1_790_000_000_000, reason: "403: primary device was logged out")
+        )
+
+        var latch = SilenceNotificationLatch()
+        XCTAssertEqual(latch.beginLoggedOut([loggedOut]), [loggedOut])
+        latch.finishLoggedOut(loggedOut, delivered: true)
+        XCTAssertEqual(latch.beginLoggedOut([loggedOut]), [])
+        defaults.set(latch.storedValue, forKey: "relinkNotifiedEpisodes")
+
+        var relaunched = SilenceNotificationLatch(storedValue: defaults.object(forKey: "relinkNotifiedEpisodes"))
+        XCTAssertEqual(relaunched.beginLoggedOut([loggedOut]), [])
+        XCTAssertEqual(relaunched.beginLoggedOut([]), [], "relinked: nothing to notify")
+        XCTAssertEqual(relaunched.beginLoggedOut([nextLogout]), [nextLogout])
+
+        // The other latches never fire on a logout, and this one never fires on
+        // their reasons.
+        var silence = SilenceNotificationLatch()
+        XCTAssertEqual(silence.newlySilent([loggedOut]), [])
+        XCTAssertEqual(silence.newlyStoppedSMS([loggedOut]), [])
+        XCTAssertEqual(silence.beginLoggedOut([
+            PlatformAttention(key: "google", name: "Google Messages", reason: .silent(hours: 7, since: 1_000)),
+        ]), [])
+    }
+
+    // A submission macOS rejected does not consume the episode: the next check
+    // retries it. One in flight is not submitted twice, and only a delivered
+    // episode is persisted.
+    func testLogoutNotificationRetriesAFailedSubmission() {
+        let loggedOut = PlatformAttention(
+            key: "whatsapp", name: "WhatsApp", reason: .loggedOut(since: 1_787_260_699_000, reason: "401: logged out from another device")
+        )
+        var latch = SilenceNotificationLatch()
+        XCTAssertEqual(latch.beginLoggedOut([loggedOut]), [loggedOut])
+        XCTAssertEqual(latch.beginLoggedOut([loggedOut]), [], "already in flight")
+        latch.finishLoggedOut(loggedOut, delivered: false)
+        XCTAssertEqual(latch.storedValue, [:], "a failed submission must not be persisted as notified")
+        XCTAssertEqual(latch.beginLoggedOut([loggedOut]), [loggedOut], "retried after the failure")
+        latch.finishLoggedOut(loggedOut, delivered: true)
+        XCTAssertEqual(latch.storedValue, ["whatsapp": NSNumber(value: Int64(1_787_260_699_000))])
+        XCTAssertEqual(latch.beginLoggedOut([loggedOut]), [])
+
+        // A relaunch while a submission was in flight retries it.
+        var inFlight = SilenceNotificationLatch()
+        XCTAssertEqual(inFlight.beginLoggedOut([loggedOut]), [loggedOut])
+        var relaunched = SilenceNotificationLatch(storedValue: inFlight.storedValue)
+        XCTAssertEqual(relaunched.beginLoggedOut([loggedOut]), [loggedOut])
+    }
+
+    // Completions can arrive out of order. A late completion for an older
+    // episode must not move the latch back, or the newer logout would be
+    // notified again after the next check or a relaunch.
+    func testLateCompletionOfAnOlderLogoutDoesNotRegressTheLatch() {
+        let first = PlatformAttention(
+            key: "whatsapp", name: "WhatsApp", reason: .loggedOut(since: 1_000, reason: "401: logged out from another device")
+        )
+        let second = PlatformAttention(
+            key: "whatsapp", name: "WhatsApp", reason: .loggedOut(since: 2_000, reason: "403: primary device was logged out")
+        )
+        var latch = SilenceNotificationLatch()
+        XCTAssertEqual(latch.beginLoggedOut([first]), [first])
+        XCTAssertEqual(latch.beginLoggedOut([second]), [second])
+        latch.finishLoggedOut(second, delivered: true)
+        latch.finishLoggedOut(first, delivered: true)
+        XCTAssertEqual(latch.storedValue, ["whatsapp": NSNumber(value: Int64(2_000))])
+        XCTAssertEqual(latch.beginLoggedOut([second]), [])
+        var relaunched = SilenceNotificationLatch(storedValue: latch.storedValue)
+        XCTAssertEqual(relaunched.beginLoggedOut([second]), [])
+    }
+
+    // A backend that predates needs_relink keeps the old reading (paired=false
+    // means logged out); one that reports it decides alone.
+    func testLegacyWhatsAppReadingOnlyAppliesWithoutNeedsRelink() {
+        XCTAssertEqual(PlatformAttention.legacyWhatsAppLoggedOut(status: status(#"{"whatsapp": {"paired": false}}"#)), true)
+        XCTAssertEqual(PlatformAttention.legacyWhatsAppLoggedOut(status: status(#"{"whatsapp": {"paired": true}}"#)), false)
+        XCTAssertEqual(PlatformAttention.legacyWhatsAppLoggedOut(status: status(#"{"google": {"paired": true}}"#)), false)
+        XCTAssertNil(PlatformAttention.legacyWhatsAppLoggedOut(
+            status: status(#"{"whatsapp": {"paired": false, "needs_relink": false}}"#)
+        ))
+        XCTAssertNil(PlatformAttention.legacyWhatsAppLoggedOut(
+            status: status(#"{"whatsapp": {"paired": false, "needs_relink": true}}"#)
+        ))
+    }
 }

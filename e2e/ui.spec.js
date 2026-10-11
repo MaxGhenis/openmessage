@@ -173,6 +173,33 @@ test('explains an expired WhatsApp pairing window instead of a raw timeout error
   await expect(page.locator('#wa-error')).toBeHidden();
 });
 
+test('explains a WhatsApp logout and offers relinking', async ({ page }) => {
+  // The 2026-08-20 shape as the backend now reports it: unpaired, with
+  // needs_relink and whatsmeow's reason, rather than a WhatsApp never set up.
+  await page.route('**/api/whatsapp/status', async route => {
+    await route.fulfill({
+      json: {
+        connected: false, connecting: false, paired: false, pairing: false, qr_available: false,
+        needs_relink: true,
+        relink_reason: '401: logged out from another device',
+        relink_since_ms: Date.UTC(2026, 7, 20, 22, 13),
+        last_error: '401: logged out from another device',
+      },
+    });
+  });
+  await openPlatforms(page);
+  await expect(page.locator('#wa-status-pill')).toHaveText('Logged out');
+  await expect(page.locator('#wa-status-pill')).toHaveClass(/error/);
+  await expect(page.locator('#wa-helper')).toContainText(
+    'WhatsApp logged this device out (401: logged out from another device) on Aug'
+  );
+  await expect(page.locator('#wa-connect-btn')).toHaveText('Connect WhatsApp');
+  await expect(page.locator('#wa-connect-btn')).toBeEnabled();
+  await expect(page.locator('#wa-pair-code')).toBeVisible();
+  // The reason is in the helper already; no second raw-error banner.
+  await expect(page.locator('#wa-error')).toBeHidden();
+});
+
 test('native bridge global window.openWhatsAppOverlay opens the platforms overlay', async ({ page }) => {
   // The macOS wrapper's "Pair in inbox" / menu-bar alert buttons call this via
   // evaluateJavaScript. The app script is an IIFE, so the function must be

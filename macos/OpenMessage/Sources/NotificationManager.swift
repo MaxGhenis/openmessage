@@ -47,12 +47,7 @@ final class NotificationManager: NSObject, ObservableObject, UNUserNotificationC
             let paired: Bool?
             let needs_repair: Bool?
         }
-        struct WhatsApp: Decodable {
-            let connected: Bool?
-            let paired: Bool?
-        }
         let google: Google?
-        let whatsapp: WhatsApp?
     }
 
     private let logger = Logger(subsystem: "com.openmessage.app", category: "Notifications")
@@ -65,6 +60,8 @@ final class NotificationManager: NSObject, ObservableObject, UNUserNotificationC
     private let silenceLatchKey = "silenceNotifiedEpisodes"
     private var smsLatch: SilenceNotificationLatch
     private let smsLatchKey = "smsStoppedNotifiedEpisodes"
+    private var relinkLatch: SilenceNotificationLatch
+    private let relinkLatchKey = "relinkNotifiedEpisodes"
     private var lastSeenTimestamps: [String: Int64] = [:]
     private var seenMessageIDs = Set<String>()
     private var seenMessageOrder: [String] = []
@@ -90,6 +87,7 @@ final class NotificationManager: NSObject, ObservableObject, UNUserNotificationC
         self.preferenceEnabled = defaults.bool(forKey: preferenceKey)
         self.silenceLatch = SilenceNotificationLatch(storedValue: defaults.object(forKey: silenceLatchKey))
         self.smsLatch = SilenceNotificationLatch(storedValue: defaults.object(forKey: smsLatchKey))
+        self.relinkLatch = SilenceNotificationLatch(storedValue: defaults.object(forKey: relinkLatchKey))
         super.init()
         UNUserNotificationCenter.current().delegate = self
     }
@@ -353,10 +351,13 @@ final class NotificationManager: NSObject, ObservableObject, UNUserNotificationC
         guard preferenceEnabled else { return }
         let status: PlatformStatus
         let attention: [PlatformAttention]
+        let legacyWhatsAppLoggedOut: Bool?
         do {
             let (data, _) = try await URLSession.shared.data(from: apiURL(pathComponents: ["api", "status"]))
             status = try JSONDecoder().decode(PlatformStatus.self, from: data)
             attention = PlatformAttention.evaluate(statusData: data) ?? []
+            let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+            legacyWhatsAppLoggedOut = json.flatMap { PlatformAttention.legacyWhatsAppLoggedOut(status: $0) }
         } catch {
             logger.debug("Health check fetch error: \(error)")
             return
@@ -368,12 +369,32 @@ final class NotificationManager: NSObject, ObservableObject, UNUserNotificationC
             title: "Google Messages needs attention",
             body: "SMS/RCS sync stopped and couldn't auto-recover. Open OpenMessage to re-pair."
         )
+        // A backend that reports whatsapp.needs_relink is read below, once per
+        // logout episode. One that predates it only says paired=false, which
+        // also covers a deliberate unpair and a WhatsApp never set up; keep the
+        // old once-per-launch reading for it.
         evaluatePlatformHealth(
             key: "whatsapp",
-            broken: !(status.whatsapp?.paired ?? true),
+            broken: legacyWhatsAppLoggedOut ?? false,
             title: "WhatsApp needs attention",
             body: "WhatsApp was logged out. Open OpenMessage to scan the QR code and reconnect."
         )
+        // The episode counts as notified only once macOS accepted the
+        // notification; a failed submission is retried on the next check.
+        for item in relinkLatch.beginLoggedOut(attention) {
+            guard let body = PlatformAttention.loggedOutNotificationBody(item) else {
+                relinkLatch.finishLoggedOut(item, delivered: false)
+                continue
+            }
+            sendHealthNotification(key: "\(item.key)-relink", title: "\(item.name) needs relinking", body: body) { delivered in
+                Task { @MainActor in
+                    self.relinkLatch.finishLoggedOut(item, delivered: delivered)
+                    if delivered {
+                        self.defaults.set(self.relinkLatch.storedValue, forKey: self.relinkLatchKey)
+                    }
+                }
+            }
+        }
         let newlySilent = silenceLatch.newlySilent(attention)
         if !newlySilent.isEmpty {
             defaults.set(silenceLatch.storedValue, forKey: silenceLatchKey)
@@ -402,7 +423,12 @@ final class NotificationManager: NSObject, ObservableObject, UNUserNotificationC
         }
     }
 
-    private func sendHealthNotification(key: String, title: String, body: String) {
+    private func sendHealthNotification(
+        key: String,
+        title: String,
+        body: String,
+        completion: (@Sendable (_ delivered: Bool) -> Void)? = nil
+    ) {
         let content = UNMutableNotificationContent()
         content.title = title
         content.body = body
@@ -418,6 +444,7 @@ final class NotificationManager: NSObject, ObservableObject, UNUserNotificationC
             if let error {
                 self.logger.error("Failed to send health notification: \(error)")
             }
+            completion?(error == nil)
         }
     }
 
