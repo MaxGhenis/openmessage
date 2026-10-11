@@ -101,19 +101,14 @@ func RetainedPlaintextsForTeardownTest(t testing.TB, sessionPath string) int {
 	return retained
 }
 
-// RunBeforeBridgeHandlerForTeardownTest makes hook see every whatsmeow event
-// before the bridge's handler does, as a handler registered ahead of the
-// bridge's would. It re-registers the bridge's handler the way
-// initClientLocked does; the bridge registers no other handler.
+// RunBeforeBridgeHandlerForTeardownTest makes hook see every event before the
+// bridge applies it, as a whatsmeow handler registered ahead of the bridge's
+// would: whatsmeow's events, and the history-sync chunks the bridge's pump
+// downloads.
 func RunBeforeBridgeHandlerForTeardownTest(b *Bridge, hook func(any)) {
-	b.mu.RLock()
-	cli, generation := b.client, b.clientGeneration
-	b.mu.RUnlock()
-	cli.RemoveEventHandlers()
-	cli.AddEventHandler(hook)
-	cli.AddEventHandlerWithSuccessStatus(func(raw any) bool {
-		return b.handleClientEvent(cli, generation, raw)
-	})
+	b.mu.Lock()
+	b.beforeEventForTest = hook
+	b.mu.Unlock()
 }
 
 // BoundIngressSpoolForTeardownTest replaces the bridge's ingress spool bounds.

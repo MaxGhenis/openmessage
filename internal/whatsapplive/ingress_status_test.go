@@ -34,14 +34,17 @@ const (
 
 // TestHandledStatusTable checks, for every combination of observer state,
 // observer durability and event kind, the status the bridge reports to
-// whatsmeow and what the legacy store holds. The rule: only a message whose
-// frame was not committed, for a reason a later delivery can clear (no
-// observing generation, or the observer rejected it), while the last observer
-// commits to a durable inbox, is reported not handled. The legacy store takes
-// every message on every delivery.
+// whatsmeow and what the legacy store holds. The bridge has neither a spool
+// nor a history-sync queue, as one whose runtime database is closed. The
+// rule: only a message or history-sync chunk whose frame was not committed,
+// for a reason a later delivery can clear (no observing generation, or the
+// observer rejected it), while the last observer commits to a durable inbox,
+// is reported not handled; and a history-sync notification is reported not
+// handled whatever the observer did, since nothing can queue it. The legacy
+// store takes every message on every delivery.
 func TestHandledStatusTable(t *testing.T) {
 	outcomes := []ingressObserverOutcome{observerNeverUsed, observerCommits, observerRejects, observerPanics, observerRemoved}
-	kinds := []string{"message", "receipt", "history_sync", "chat_presence"}
+	kinds := []string{"message", "receipt", "history_sync", "history_notification", "chat_presence"}
 	for _, durable := range []bool{true, false} {
 		for _, outcome := range outcomes {
 			for _, kind := range kinds {
@@ -90,6 +93,8 @@ func TestHandledStatusTable(t *testing.T) {
 						}
 					case "history_sync":
 						event = &waevents.HistorySync{Data: &waHistorySync.HistorySync{SyncType: waHistorySync.HistorySync_RECENT.Enum()}}
+					case "history_notification":
+						event = spoolTestEvent("history_notification", "status-table")
 					case "chat_presence":
 						event = &waevents.ChatPresence{MessageSource: watypes.MessageSource{Chat: chat, Sender: chat}}
 					}
@@ -103,7 +108,8 @@ func TestHandledStatusTable(t *testing.T) {
 					if observed != wantObserved {
 						t.Fatalf("observer saw %d frames, want %d", observed, wantObserved)
 					}
-					wantHandled := !(kind == "message" && durable && (outcome == observerRejects || outcome == observerRemoved))
+					missed := durable && (outcome == observerRejects || outcome == observerRemoved)
+					wantHandled := !((kind == "message" || kind == "history_sync") && missed) && kind != "history_notification"
 					if handled != wantHandled {
 						t.Fatalf("handled = %v, want %v", handled, wantHandled)
 					}

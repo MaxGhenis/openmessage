@@ -268,6 +268,31 @@ func spoolTestEvent(kind string, id string) any {
 				ID: proto.String(id + "@s.whatsapp.net"),
 			}},
 		}}
+	case "history_notification":
+		// Our phone's history-sync notification: a protocol message our own
+		// account sent, wrapped the way the phone sends it.
+		own := watypes.NewJID("15550000000", watypes.DefaultUserServer)
+		notification := &waE2E.Message{ProtocolMessage: &waE2E.ProtocolMessage{
+			Type: waE2E.ProtocolMessage_HISTORY_SYNC_NOTIFICATION.Enum(),
+			HistorySyncNotification: &waE2E.HistorySyncNotification{
+				SyncType:   waE2E.HistorySyncType_RECENT.Enum(),
+				ChunkOrder: proto.Uint32(1),
+				DirectPath: proto.String("/v/t62.history/" + id),
+			},
+		}}
+		raw := &waE2E.Message{DeviceSentMessage: &waE2E.DeviceSentMessage{
+			DestinationJID: proto.String(own.String()),
+			Message:        notification,
+		}}
+		return &waevents.Message{
+			Info: watypes.MessageInfo{
+				MessageSource: watypes.MessageSource{Chat: own, Sender: own, IsFromMe: true},
+				ID:            watypes.MessageID(id),
+				Timestamp:     time.UnixMilli(1775006000000),
+			},
+			Message:    notification,
+			RawMessage: raw,
+		}
 	case "chat_presence":
 		return &waevents.ChatPresence{MessageSource: watypes.MessageSource{Chat: chat, Sender: chat}}
 	}
@@ -275,16 +300,20 @@ func spoolTestEvent(kind string, id string) any {
 }
 
 // TestHandledStatusTableWithSpool extends TestHandledStatusTable (which runs
-// without a spool, as a bridge whose runtime database is closed does) with a
-// spool that takes frames and one that is full. The rule: a frame a durable
-// observer owns but no generation commits is held; a message is reported
-// handled iff it was committed or held; receipts and history chunks are
-// always reported handled (whatsmeow ignores the status for them). A
-// legacy-only (non-durable) observer never holds anything. The legacy store
-// takes every message on its first delivery.
+// without a spool or a history-sync queue, as a bridge whose runtime database
+// is closed does) with a spool and a history-sync queue that take everything
+// and ones that are full. The rule: a frame a durable observer owns but no
+// generation commits is held; a message or history chunk is reported handled
+// iff it was committed or held (for a chunk, the history-sync pump keeps its
+// notification queued otherwise); our phone's history-sync notification is
+// queued whatever became of its frame, and reported handled iff its frame was
+// committed or held and it was queued; a receipt is always reported handled
+// (whatsmeow ignores the status for it). A legacy-only (non-durable) observer
+// never holds anything. The legacy store takes every message on its first
+// delivery.
 func TestHandledStatusTableWithSpool(t *testing.T) {
 	outcomes := []ingressObserverOutcome{observerNeverUsed, observerCommits, observerRejects, observerPanics, observerRemoved}
-	kinds := []string{"message", "receipt", "history_sync", "chat_presence"}
+	kinds := []string{"message", "receipt", "history_sync", "history_notification", "chat_presence"}
 	for _, durable := range []bool{true, false} {
 		for _, full := range []bool{false, true} {
 			for _, outcome := range outcomes {
@@ -292,13 +321,18 @@ func TestHandledStatusTableWithSpool(t *testing.T) {
 					if outcome == observerNeverUsed && !durable {
 						continue // durability is a property of an observer
 					}
-					name := fmt.Sprintf("durable=%v/spool full=%v/%s/%s", durable, full, outcome, kind)
+					name := fmt.Sprintf("durable=%v/spool and queue full=%v/%s/%s", durable, full, outcome, kind)
 					t.Run(name, func(t *testing.T) {
 						maxFrames := int64(16)
 						if full {
 							maxFrames = 0
 						}
 						bridge, store, _ := spoolTestBridge(t, maxFrames)
+						queue, err := openHistorySyncQueue(bridge.spool.db, maxFrames, historySyncQueueMaxBytes)
+						if err != nil {
+							t.Fatalf("openHistorySyncQueue(): %v", err)
+						}
+						bridge.historySync = newHistorySyncPump(queue)
 						observed := 0
 						switch outcome {
 						case observerCommits:
@@ -329,9 +363,17 @@ func TestHandledStatusTableWithSpool(t *testing.T) {
 						if got := bridge.spool.heldFrames(); got != wantHeld {
 							t.Fatalf("spool holds %d frames, want %d", got, wantHeld)
 						}
-						wantHandled := !(kind == "message" && missed && full)
+						wantHandled := !((kind == "message" || kind == "history_sync" || kind == "history_notification") && missed && full) &&
+							!(kind == "history_notification" && full)
 						if handled != wantHandled {
 							t.Fatalf("handled = %v, want %v", handled, wantHandled)
+						}
+						wantQueued := int64(0)
+						if kind == "history_notification" && !full {
+							wantQueued = 1
+						}
+						if got := queue.pending(); got != wantQueued {
+							t.Fatalf("history-sync queue holds %d notifications, want %d", got, wantQueued)
 						}
 						if kind != "message" {
 							return
