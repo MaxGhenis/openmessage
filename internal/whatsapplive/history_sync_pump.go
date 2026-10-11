@@ -155,12 +155,27 @@ func (b *Bridge) runHistorySyncPump(ctx context.Context, pump *historySyncPump) 
 		case <-pump.wakeCh:
 		case <-timer.C:
 		}
-		next := b.pumpHistorySync(ctx)
+		next := b.pumpHistorySyncContained(ctx, pump)
 		timer.Stop()
 		if !next.IsZero() {
 			timer.Reset(max(next.Sub(pump.now()), 0))
 		}
 	}
+}
+
+// pumpHistorySyncContained runs one pass and contains a panic in it, so a
+// bug in one notification's handling cannot stop the pump until the next
+// run; the pass is retried later.
+func (b *Bridge) pumpHistorySyncContained(ctx context.Context, pump *historySyncPump) (next time.Time) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			b.logger.Error().
+				Str("panic", fmt.Sprint(recovered)).
+				Msg("Recovered panic in the WhatsApp history-sync pump")
+			next = pump.now().Add(historySyncRetryMin)
+		}
+	}()
+	return b.pumpHistorySync(ctx)
 }
 
 // stopHistorySyncPump cancels the pump and waits for it to return. Close
@@ -318,9 +333,9 @@ func (b *Bridge) downloadQueuedHistorySync(ctx context.Context, pump *historySyn
 }
 
 // applyQueuedHistorySync hands a downloaded chunk to the bridge, as
-// whatsmeow's loop dispatched one, and reports whether the bridge applied it:
-// the frame was committed or held, and the legacy store took the chunk. The
-// frame commits as Replayed: the pump may run long after the connection that
+// whatsmeow's loop dispatched one, and reports whether its frame was
+// committed or held (applyHistorySync; the legacy store takes the chunk on
+// its first application either way). The frame commits as Replayed: the pump may run long after the connection that
 // delivered the notification (in a later generation, or a later run), so
 // committing the chunk is no evidence about the current connection. The
 // notification's own message was.

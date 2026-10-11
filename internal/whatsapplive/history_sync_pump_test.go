@@ -951,3 +951,33 @@ func TestDownloadHistorySyncChunkStoresWhatItCarriesWhenCancelled(t *testing.T) 
 		t.Fatalf("stored push name = %q, want %q", contact.PushName, "Ada")
 	}
 }
+
+// TestHistorySyncPumpSurvivesAPanickingPass: a panic in a pass (here, in the
+// receipt) is contained and the pass retried later; the pump keeps running.
+func TestHistorySyncPumpSurvivesAPanickingPass(t *testing.T) {
+	f := newPumpFixture(t, openMemoryDB(t), 16, 16)
+	pump := f.bridge.historySync
+	var panicked sync.Once
+	pump.sendReceipt = func(ctx context.Context, cli *whatsmeow.Client, id watypes.MessageID) error {
+		var bug bool
+		panicked.Do(func() { bug = true })
+		if bug {
+			panic("receipt bug")
+		}
+		return f.sendReceipt(ctx, cli, id)
+	}
+	f.notify("a", true)
+	if next := f.bridge.pumpHistorySyncContained(context.Background(), pump); !next.Equal(f.clock().Add(historySyncRetryMin)) {
+		t.Fatalf("a panicking pass scheduled its retry for %v, want %v", next, f.clock().Add(historySyncRetryMin))
+	}
+	if got := f.queued(); !reflect.DeepEqual(got, []string{"a"}) {
+		t.Fatalf("queue after the panic = %v, want a still queued", got)
+	}
+	f.pass()
+	if got := f.queued(); len(got) != 0 {
+		t.Fatalf("queue holds %v after the retry", got)
+	}
+	if got := f.effects(); !reflect.DeepEqual(got, []string{"download:a", "commit:a", "receipt:a"}) {
+		t.Fatalf("effects = %v; the committed chunk should not download again", got)
+	}
+}
