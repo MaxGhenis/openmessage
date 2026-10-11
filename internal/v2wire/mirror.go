@@ -120,7 +120,7 @@ func mirrorConversation(
 	if err != nil {
 		return mirroredConversation{}, fmt.Errorf("mirror conversation %q: %w", legacyConversationID, err)
 	}
-	remoteID, err := mirrorNaturalKey(v2, accountID, conversation.SourcePlatform, legacyConversationID)
+	remoteID, err := mirrorNaturalKey(v2, accountID, legacyConversationID)
 	if err != nil {
 		return mirroredConversation{}, err
 	}
@@ -193,40 +193,35 @@ func mirrorConversation(
 //
 //   - under the routed account, at the remote ID normalized as the migration
 //     normalizes it, so "signal:  +1650…" meets a migrated "signal:+1650…";
-//   - where the migration files this conversation
-//     (migration.ConversationPlacement). The migration routes by the stored
-//     platform while the mirror routes by ID prefix, so a "signal:" thread
-//     stored as sms was migrated under the Google account. A new row under
-//     the legacy ID would shadow that history for legacy-ID reads, because
-//     internal/v2read resolves a direct ID match before it tries remote IDs.
+//   - at any placement the migration could have given this legacy ID
+//     (migration.ConversationPlacements). The migration routed by the
+//     platform stored at migration time, the mirror routes by ID prefix, and
+//     the legacy store can change a thread's stored platform afterwards, so a
+//     "signal:" thread once stored as sms may sit under the Google account.
+//     A new row under the legacy ID would shadow that history for legacy-ID
+//     reads, because internal/v2read resolves a direct ID match before it
+//     tries remote IDs.
 //
-// No other account is consulted: unrelated threads can share an opaque Google
-// thread ID across accounts, and neither is this conversation.
+// Those placements are under the migration's own accounts and are keyed by
+// the legacy ID itself, so they cannot name an unrelated thread whose ID only
+// looks the same under some other account (opaque Google thread IDs repeat
+// across accounts); no other account is consulted.
 //
 // The key written is the normalized one. The one exception is a row an earlier
 // mirror wrote under this legacy ID and account with the raw legacy ID as its
 // key, which keeps that key. A row under the legacy ID with any other key or
 // account is refused, not adopted (ingest rewrites a stale Google binding's
 // key to "displaced:…").
-func mirrorNaturalKey(
-	v2 *sqlite.Store,
-	accountID string,
-	sourcePlatform string,
-	legacyConversationID string,
-) (string, error) {
+func mirrorNaturalKey(v2 *sqlite.Store, accountID, legacyConversationID string) (string, error) {
 	normalized := v2keys.NormalizeRemoteConversationID(accountPlatform(accountID), legacyConversationID)
-	type naturalKey struct{ accountID, remoteID string }
-	keys := []naturalKey{{accountID, normalized}}
-	if migratedAccountID, migratedRemoteID, ok := migration.ConversationPlacement(
-		sourcePlatform,
-		legacyConversationID,
-	); ok {
-		if migrated := (naturalKey{migratedAccountID, migratedRemoteID}); migrated != keys[0] {
-			keys = append(keys, migrated)
+	keys := []migration.Placement{{AccountID: accountID, RemoteConversationID: normalized}}
+	for _, placement := range migration.ConversationPlacements(legacyConversationID) {
+		if placement != keys[0] {
+			keys = append(keys, placement)
 		}
 	}
 	for _, key := range keys {
-		owner, err := v2.GetConversationByRemote(key.accountID, key.remoteID)
+		owner, err := v2.GetConversationByRemote(key.AccountID, key.RemoteConversationID)
 		if errors.Is(err, sqlite.ErrNotFound) {
 			continue
 		}

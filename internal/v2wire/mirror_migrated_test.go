@@ -39,6 +39,7 @@ var migratedFixtureConversations = []migratedFixtureConversation{
 	// Stored as sms, so the migration files it under Google by stored platform,
 	// while the mirror routes it to Signal by its prefix.
 	{legacyID: "signal:  +16505550123", platform: "sms", accountID: googleAccountID},
+	{legacyID: "signal:+16505550124", platform: "sms", accountID: googleAccountID},
 }
 
 // postCutoverFixtureConversations exist only in the legacy store; the migrated
@@ -80,6 +81,7 @@ func openMigratedTestStores(t *testing.T) (*db.Store, *sqlite.Store) {
 		{MessageID: "signal:1700000000002", SourceID: "1700000000002", ConversationID: "signal:+15550003333", SenderNumber: "+15550003333", Body: "signal", TimestampMS: baseMS + 2, SourcePlatform: "signal"},
 		{MessageID: "signal:1700000000003", SourceID: "1700000000003", ConversationID: "signal:  +16505550100", SenderNumber: "+16505550100", Body: "spaced signal", TimestampMS: baseMS + 3, SourcePlatform: "signal"},
 		{MessageID: "google-message-misrouted", ConversationID: "signal:  +16505550123", SenderNumber: "+16505550123", Body: "stored as sms", TimestampMS: baseMS + 4, SourcePlatform: "sms"},
+		{MessageID: "google-message-misrouted-2", ConversationID: "signal:+16505550124", SenderNumber: "+16505550124", Body: "also stored as sms", TimestampMS: baseMS + 5, SourcePlatform: "sms"},
 	} {
 		if err := legacy.UpsertMessage(message); err != nil {
 			t.Fatalf("legacy UpsertMessage(%q): %v", message.MessageID, err)
@@ -350,8 +352,73 @@ func TestConversationPlacementMatchesMigration(t *testing.T) {
 			t.Fatalf("migrated row for %q has ID %q, want %q", conversation.legacyID, row.ConversationID, want)
 		}
 	}
+	migrationAccounts := map[string]bool{
+		googleAccountID: true, whatsappAccountID: true, signalAccountID: true,
+		"gchat-archive": true, "imessage-archive": true,
+	}
+	for _, conversation := range migratedFixtureConversations {
+		accountID, remoteID, _ := migration.ConversationPlacement(conversation.platform, conversation.legacyID)
+		placements := migration.ConversationPlacements(conversation.legacyID)
+		found := false
+		for _, placement := range placements {
+			if !migrationAccounts[placement.AccountID] {
+				t.Fatalf("ConversationPlacements(%q) names account %q, outside the migration's accounts", conversation.legacyID, placement.AccountID)
+			}
+			found = found || (placement == migration.Placement{AccountID: accountID, RemoteConversationID: remoteID})
+		}
+		if !found {
+			t.Fatalf("ConversationPlacements(%q) = %+v, missing the migrated placement (%q, %q)", conversation.legacyID, placements, accountID, remoteID)
+		}
+	}
 	if _, _, ok := migration.ConversationPlacement("telegram", "telegram:1"); ok {
 		t.Fatal("ConversationPlacement(telegram) ok = true, want false for a platform the migration rejects")
+	}
+}
+
+// TestMirrorRefusesMigratedThreadAfterLegacyPlatformChanges covers a stored
+// platform that changes after migration. The legacy Signal receiver can
+// correct a "signal:" thread that was stored as sms, but the migration already
+// filed it under Google; checking only where the current platform would put it
+// would miss that row and let the mirror shadow its history.
+func TestMirrorRefusesMigratedThreadAfterLegacyPlatformChanges(t *testing.T) {
+	legacy, v2 := openMigratedTestStores(t)
+	reader := v2read.New(v2)
+	for _, conversation := range migratedFixtureConversations {
+		if conversation.platform != "sms" || !strings.HasPrefix(conversation.legacyID, "signal:") {
+			continue
+		}
+		t.Run(conversation.legacyID, func(t *testing.T) {
+			stored, err := legacy.GetConversation(conversation.legacyID)
+			if err != nil {
+				t.Fatalf("legacy GetConversation(): %v", err)
+			}
+			stored.SourcePlatform = "signal"
+			if err := legacy.UpsertConversation(stored); err != nil {
+				t.Fatalf("legacy UpsertConversation(platform corrected): %v", err)
+			}
+			if got, err := legacy.GetConversation(conversation.legacyID); err != nil || got.SourcePlatform != "signal" {
+				t.Fatalf("legacy platform = %+v, %v; want corrected to signal", got, err)
+			}
+			before, err := reader.GetMessagesByConversation(conversation.legacyID, 50)
+			if err != nil || len(before) == 0 {
+				t.Fatalf("legacy-ID history before = %d messages, %v; want the migrated message", len(before), err)
+			}
+
+			_, _, err = MirrorConversation(legacy, v2, conversation.legacyID)
+			if !errors.Is(err, sqlite.ErrConversationIdentityConflict) {
+				t.Fatalf("MirrorConversation() error = %v, want ErrConversationIdentityConflict", err)
+			}
+			if err := MirrorReadCursor(context.Background(), legacy, v2, conversation.legacyID, 1_910_000_000_000); !errors.Is(err, sqlite.ErrConversationIdentityConflict) {
+				t.Fatalf("MirrorReadCursor() error = %v, want ErrConversationIdentityConflict", err)
+			}
+			after, err := reader.GetMessagesByConversation(conversation.legacyID, 50)
+			if err != nil || len(after) != len(before) {
+				t.Fatalf("legacy-ID history after = %d messages, %v; want unchanged %d", len(after), err, len(before))
+			}
+			if _, err := v2.GetConversation(conversation.legacyID); !errors.Is(err, sqlite.ErrNotFound) {
+				t.Fatalf("GetConversation(legacy id) error = %v, want ErrNotFound: the mirror created a shadowing row", err)
+			}
+		})
 	}
 }
 
