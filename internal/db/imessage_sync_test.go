@@ -398,6 +398,10 @@ func TestRepairTapbacksLeavesIMessageRows(t *testing.T) {
 		{MessageID: "x-typed", ConversationID: "imessage:d", Body: "Loved “yo”", TimestampMS: 20, IsFromMe: true, SourcePlatform: "imessage"},
 		{MessageID: "imessage:old-target", ConversationID: "imessage:e", Body: "hey", TimestampMS: 10, SourcePlatform: "sms"},
 		{MessageID: "imessage:old-typed", ConversationID: "imessage:e", Body: "Loved “hey”", TimestampMS: 20, IsFromMe: true, SourcePlatform: "sms"},
+		// The candidate guard alone: an iMessage row quoting an SMS row,
+		// which the target guard would allow.
+		{MessageID: "sms:quoted", ConversationID: "imessage:f", Body: "sup", TimestampMS: 10, SourcePlatform: "sms"},
+		{MessageID: "x-quoting", ConversationID: "imessage:f", Body: "Loved “sup”", TimestampMS: 20, IsFromMe: true, SourcePlatform: "imessage"},
 	} {
 		if err := s.UpsertMessage(m); err != nil {
 			t.Fatal(err)
@@ -419,7 +423,10 @@ func TestRepairTapbacksLeavesIMessageRows(t *testing.T) {
 	if m, _ := s.GetMessageByID("sms:mixed"); m == nil {
 		t.Fatal("unmatched SMS tapback deleted")
 	}
-	for _, id := range []string{"x-typed", "imessage:old-typed"} {
+	if quoted, _ := s.GetMessageByID("sms:quoted"); quoted.Reactions != "" {
+		t.Fatalf("an iMessage row reacted to an SMS row: %q", quoted.Reactions)
+	}
+	for _, id := range []string{"x-typed", "imessage:old-typed", "x-quoting"} {
 		if m, _ := s.GetMessageByID(id); m == nil {
 			t.Fatalf("%s converted", id)
 		}
