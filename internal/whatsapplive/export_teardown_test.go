@@ -100,3 +100,18 @@ func RetainedPlaintextsForTeardownTest(t testing.TB, sessionPath string) int {
 	}
 	return retained
 }
+
+// RunBeforeBridgeHandlerForTeardownTest makes hook see every whatsmeow event
+// before the bridge's handler does, as a handler registered ahead of the
+// bridge's would. It re-registers the bridge's handler the way
+// initClientLocked does; the bridge registers no other handler.
+func RunBeforeBridgeHandlerForTeardownTest(b *Bridge, hook func(any)) {
+	b.mu.RLock()
+	cli, generation := b.client, b.clientGeneration
+	b.mu.RUnlock()
+	cli.RemoveEventHandlers()
+	cli.AddEventHandler(hook)
+	cli.AddEventHandlerWithSuccessStatus(func(raw any) bool {
+		return b.handleClientEvent(cli, generation, raw)
+	})
+}
