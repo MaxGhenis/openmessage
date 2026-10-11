@@ -67,7 +67,10 @@ var ErrMediaNotDispatched = ErrSendNotDispatched
 const whatsappRuntimeStateSchema = `
 CREATE TABLE IF NOT EXISTS openmessage_whatsapp_runtime_state (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-    blocked_until_ns INTEGER NOT NULL DEFAULT 0
+    blocked_until_ns INTEGER NOT NULL DEFAULT 0,
+    logged_out_at_ns INTEGER NOT NULL DEFAULT 0,
+    logged_out_reason TEXT NOT NULL DEFAULT '',
+    logged_out_jid TEXT NOT NULL DEFAULT ''
 );
 INSERT OR IGNORE INTO openmessage_whatsapp_runtime_state (singleton, blocked_until_ns)
 VALUES (1, 0);
@@ -264,6 +267,21 @@ type StatusSnapshot struct {
 	QRAvailable bool   `json:"qr_available"`
 	QREvent     string `json:"qr_event,omitempty"`
 	QRUpdatedAt int64  `json:"qr_updated_at,omitempty"`
+	// NeedsRelink reports that WhatsApp logged this install's linked device
+	// out (whatsmeow's LoggedOut: 401 logged out from another device or
+	// device removed, 403, 406) and no new link has been made since. Paired
+	// is false while it holds, because the server revoked that identity; the
+	// bridge removes it, so QR or phone-code pairing can start directly. A
+	// successful pairing or an explicit unpair clears it, and it survives a
+	// restart. It is always present, so a client can tell a backend that
+	// predates it (field absent) from one reporting false.
+	NeedsRelink bool `json:"needs_relink"`
+	// RelinkReason is whatsmeow's description of the logout, such as
+	// "401: logged out from another device".
+	RelinkReason string `json:"relink_reason,omitempty"`
+	// RelinkSinceMS is when this install first saw the logout (Unix ms). It
+	// stays fixed for the episode, so it identifies it.
+	RelinkSinceMS int64 `json:"relink_since_ms,omitempty"`
 }
 
 type QRSnapshot struct {
@@ -313,7 +331,13 @@ type Bridge struct {
 	// clientGeneration changes whenever resetClientLocked installs a new
 	// whatsmeow client. Event handler closures capture it so callbacks from a
 	// retired client can never affect or terminate the replacement generation.
-	clientGeneration      uint64
+	clientGeneration uint64
+	// identityJID is the linked identity the current client generation holds:
+	// read from the session store when the client is built, or taken from
+	// PairSuccess. Both points are free of whatsmeow goroutines that could be
+	// rewriting the device, so a logout handler can rely on it even while
+	// whatsmeow is deleting that device.
+	identityJID           watypes.JID
 	observation           lifecycleObservation
 	ingressObservation    ingressObservation
 	nextObserverID        uint64
@@ -322,6 +346,7 @@ type Bridge struct {
 	runtimeMu    sync.Mutex
 	runtimeDB    *sql.DB
 	blockedUntil time.Time
+	loggedOut    loggedOutState
 
 	connected                 bool
 	connecting                bool
@@ -382,6 +407,10 @@ func (b *Bridge) initClientLocked() error {
 	})
 	b.container = container
 	b.client = cli
+	b.identityJID = watypes.EmptyJID
+	if deviceStore.ID != nil {
+		b.identityJID = *deviceStore.ID
+	}
 	return nil
 }
 
@@ -395,11 +424,21 @@ func (b *Bridge) initRuntimeState() error {
 		_ = database.Close()
 		return fmt.Errorf("initialize WhatsApp runtime state: %w", err)
 	}
-	var blockedUntilNS int64
+	if err = ensureRuntimeStateColumns(context.Background(), database); err != nil {
+		_ = database.Close()
+		return fmt.Errorf("initialize WhatsApp runtime state: %w", err)
+	}
+	var (
+		blockedUntilNS  int64
+		loggedOutAtNS   int64
+		loggedOutReason string
+		loggedOutJID    string
+	)
 	if err = database.QueryRowContext(
 		context.Background(),
-		`SELECT blocked_until_ns FROM openmessage_whatsapp_runtime_state WHERE singleton = 1`,
-	).Scan(&blockedUntilNS); err != nil {
+		`SELECT blocked_until_ns, logged_out_at_ns, logged_out_reason, logged_out_jid
+		 FROM openmessage_whatsapp_runtime_state WHERE singleton = 1`,
+	).Scan(&blockedUntilNS, &loggedOutAtNS, &loggedOutReason, &loggedOutJID); err != nil {
 		_ = database.Close()
 		return fmt.Errorf("load WhatsApp runtime state: %w", err)
 	}
@@ -409,6 +448,7 @@ func (b *Bridge) initRuntimeState() error {
 	if blockedUntilNS > 0 {
 		b.blockedUntil = time.Unix(0, blockedUntilNS)
 	}
+	b.loggedOut = loadLoggedOutState(loggedOutAtNS, loggedOutReason, loggedOutJID)
 	b.runtimeMu.Unlock()
 	return nil
 }
@@ -554,6 +594,7 @@ func (b *Bridge) resetClientLocked() error {
 		b.client.Disconnect()
 		b.client = nil
 	}
+	b.identityJID = watypes.EmptyJID
 	if b.container != nil {
 		if err := b.container.Close(); err != nil {
 			b.logger.Warn().Err(err).Msg("Failed to close WhatsApp session store")
@@ -566,6 +607,12 @@ func (b *Bridge) resetClientLocked() error {
 func (b *Bridge) recoverPersistedSessionLocked() error {
 	if err := b.initClientLocked(); err != nil {
 		return err
+	}
+	// A revoked identity must never be dialed again (it earns another 401) and
+	// blocks pairing while it is present, so every connect and pair entry point
+	// removes it first if the logout handler could not.
+	if _, err := b.purgeLoggedOutIdentityLocked(); err != nil {
+		return fmt.Errorf("remove logged-out WhatsApp identity: %w", err)
 	}
 	if b.client == nil || b.client.Store == nil {
 		return nil
@@ -585,7 +632,19 @@ func (b *Bridge) recoverPersistedSessionLocked() error {
 	return nil
 }
 
+// pairedDeviceStoreLocked returns the identity this install is linked with:
+// the current client's, or else the first one in the session store. An
+// identity an outstanding logout revoked does not count. WhatsApp no longer
+// accepts it, so it reads as unpaired even before the purge removes it.
 func (b *Bridge) pairedDeviceStoreLocked() *wastore.Device {
+	deviceStore := b.storedDeviceLocked()
+	if deviceStore == nil || b.isLoggedOutIdentity(*deviceStore.ID) {
+		return nil
+	}
+	return deviceStore
+}
+
+func (b *Bridge) storedDeviceLocked() *wastore.Device {
 	if b.client != nil && b.client.Store != nil && b.client.Store.ID != nil {
 		return b.client.Store
 	}
@@ -1079,25 +1138,30 @@ func (b *Bridge) consumeQR(ch <-chan whatsmeow.QRChannelItem) {
 func (b *Bridge) Unpair() error {
 	b.mu.RLock()
 	cli := b.client
+	revoked := b.isLoggedOutIdentity(b.identityJID)
 	b.mu.RUnlock()
 
 	if cli != nil && cli.Store != nil && cli.Store.ID != nil {
-		remoteCtx, cancelRemote := context.WithTimeout(context.Background(), unpairRemoteTimeout)
-		connected := clientIsConnected(cli)
-		if !connected {
-			err := connectClientContext(remoteCtx, cli)
-			if err != nil && !errors.Is(err, whatsmeow.ErrAlreadyConnected) {
-				b.logger.Warn().Err(err).Msg("WhatsApp reconnect for logout failed; clearing local session anyway")
-			} else {
-				connected = true
+		// WhatsApp already removed an identity it logged out; dialing it only to
+		// send a logout would earn another 401. Clear it locally.
+		if !revoked {
+			remoteCtx, cancelRemote := context.WithTimeout(context.Background(), unpairRemoteTimeout)
+			connected := clientIsConnected(cli)
+			if !connected {
+				err := connectClientContext(remoteCtx, cli)
+				if err != nil && !errors.Is(err, whatsmeow.ErrAlreadyConnected) {
+					b.logger.Warn().Err(err).Msg("WhatsApp reconnect for logout failed; clearing local session anyway")
+				} else {
+					connected = true
+				}
 			}
-		}
-		if connected {
-			if err := logoutClient(remoteCtx, cli); err != nil {
-				b.logger.Warn().Err(err).Msg("WhatsApp logout failed; clearing local session anyway")
+			if connected {
+				if err := logoutClient(remoteCtx, cli); err != nil {
+					b.logger.Warn().Err(err).Msg("WhatsApp logout failed; clearing local session anyway")
+				}
 			}
+			cancelRemote()
 		}
-		cancelRemote()
 
 		// Logout clears the device store after the server confirms the unlink.
 		// If reconnect or logout failed, force the documented local fallback so
@@ -1119,6 +1183,9 @@ func (b *Bridge) Unpair() error {
 	b.lastError = ""
 	b.qr = QRSnapshot{}
 	err := b.resetClientLocked()
+	// An explicit unpair is a deliberate unlinked state, so it ends an
+	// outstanding logout as well (as Signal's unpair clears needs_reauth).
+	b.clearLoggedOut()
 	b.mu.Unlock()
 	b.emitStatusChange()
 	if err != nil {
@@ -1141,6 +1208,13 @@ func (b *Bridge) Status() StatusSnapshot {
 		status.Paired = true
 		status.AccountJID = deviceStore.ID.String()
 		status.PushName = strings.TrimSpace(deviceStore.PushName)
+	}
+	if loggedOut := b.loggedOutSnapshot(); loggedOut.active() {
+		status.NeedsRelink = true
+		status.RelinkReason = loggedOut.Reason
+		if !loggedOut.At.IsZero() {
+			status.RelinkSinceMS = loggedOut.At.UnixMilli()
+		}
 	}
 	status.QRAvailable = b.qr.Code != ""
 	status.QREvent = b.qr.Event
@@ -1934,6 +2008,7 @@ func (b *Bridge) ProfilePhoto(conversationID string) ([]byte, string, error) {
 func (b *Bridge) handleClientEvent(source *whatsmeow.Client, generation uint64, raw any) {
 	b.mu.RLock()
 	current := source == nil || (b.client == source && b.clientGeneration == generation)
+	identity := b.identityJID
 	b.mu.RUnlock()
 	if !current {
 		return
@@ -1944,6 +2019,14 @@ func (b *Bridge) handleClientEvent(source *whatsmeow.Client, generation uint64, 
 	var persistenceErr error
 	if event, ok := raw.(*waevents.TemporaryBan); ok && event != nil {
 		retryAt, persistenceErr = b.persistTemporaryBan(at, event.Expire)
+	}
+	// Record a logout before the status projection below publishes it, so the
+	// first status change already reports needs_relink. A pairing transport
+	// holds no identity yet; its pair attempt reports that failure instead.
+	loggedOut := false
+	if reason, ok := loggedOutEventReason(raw); ok && !identity.IsEmpty() {
+		b.recordLoggedOut(at, reason, identity)
+		loggedOut = true
 	}
 
 	b.applyEvent(raw)
@@ -1958,16 +2041,20 @@ func (b *Bridge) handleClientEvent(source *whatsmeow.Client, generation uint64, 
 	}
 	observer := b.observation.callback
 	b.mu.RUnlock()
-	if !current || observer == nil {
-		return
+	if current && observer != nil {
+		observer(LifecycleEvent{
+			Raw:              raw,
+			Paired:           paired,
+			At:               at,
+			RetryAt:          retryAt,
+			PersistenceError: persistenceErr,
+		})
 	}
-	observer(LifecycleEvent{
-		Raw:              raw,
-		Paired:           paired,
-		At:               at,
-		RetryAt:          retryAt,
-		PersistenceError: persistenceErr,
-	})
+	if loggedOut {
+		// After the observer, so the supervisor learns of the logout from this
+		// generation before the purge replaces its client.
+		b.purgeLoggedOutIdentity()
+	}
 }
 
 // handleEvent remains the characterization-test entry point. Production
@@ -2204,6 +2291,9 @@ func (b *Bridge) applyEvent(raw any) {
 		// an active lifecycle generation must be retired and retried.
 		b.handleDisconnected("WhatsApp requested a supervised login reconnect")
 	case *waevents.PairSuccess:
+		if evt == nil {
+			return
+		}
 		b.handlePairSuccess(evt)
 	case *waevents.PairError:
 		b.handlePairError(evt.Error)
@@ -2278,11 +2368,14 @@ func (b *Bridge) handleDisconnected(reason string) {
 	b.emitStatusChange()
 }
 
-func (b *Bridge) handlePairSuccess(_ *waevents.PairSuccess) {
+func (b *Bridge) handlePairSuccess(evt *waevents.PairSuccess) {
 	b.mu.Lock()
 	b.pairing = false
 	b.lastError = ""
 	b.qr = QRSnapshot{}
+	b.identityJID = evt.ID
+	// A new link ends an outstanding logout.
+	b.clearLoggedOut()
 	b.mu.Unlock()
 	b.emitStatusChange()
 }
