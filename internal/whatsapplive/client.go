@@ -1298,6 +1298,7 @@ func (b *Bridge) Close() error {
 		b.client.Disconnect()
 		b.client = nil
 	}
+	b.identityJID = watypes.EmptyJID
 	b.connected = false
 	b.connecting = false
 	b.pairing = false
