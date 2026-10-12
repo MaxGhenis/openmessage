@@ -555,12 +555,13 @@ func searchMessagesIn(
 	filter SearchQuery,
 	plan searchPlan,
 ) ([]Message, searchPath, error) {
-	if query != "" && indexBoundedSearch(filter) {
+	tooLong := likePatternTooLong("%" + query + "%")
+	if query != "" && indexBoundedSearch(filter) && !tooLong {
 		if expression, ok := trigramMatchQuery(query); ok {
 			return searchScope(ctx, tx, query, expression, filter, plan)
 		}
 	}
-	if query != "" && !indexBoundedSearch(filter) && !likePatternTooLong("%"+query+"%") {
+	if query != "" && !indexBoundedSearch(filter) && !tooLong {
 		messages, complete, err := searchRecentMessages(ctx, tx, query, filter, plan.window)
 		if err != nil {
 			return nil, "", err

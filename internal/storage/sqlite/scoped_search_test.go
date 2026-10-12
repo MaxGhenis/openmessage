@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"math/bits"
 	"math/rand"
 	"path/filepath"
 	"reflect"
@@ -86,7 +87,8 @@ func TestTrigramMatchQuerySelectsFTS5LikeCandidates(t *testing.T) {
 		var pattern string
 		switch {
 		case i%1000 == 0:
-			// Hundreds of trigrams in one expression: no NUL to end it early.
+			// Hundreds of trigrams in one expression, nested by andTerms: no
+			// NUL to end it early.
 			pattern = strings.ReplaceAll(randomText(300+r.Intn(200)), "\x00", "")
 		case i%10 == 0:
 			pattern = randomText(20 + r.Intn(60))
@@ -96,7 +98,7 @@ func TestTrigramMatchQuerySelectsFTS5LikeCandidates(t *testing.T) {
 			pattern = randomSearchQuery(r, bodies)
 		}
 		expression, ok := trigramMatchQuery(pattern)
-		if terms := strings.Count(expression, `" "`) + 1; i%1000 == 0 && terms < 150 {
+		if terms := len(trigramTerms(pattern)); i%1000 == 0 && terms < 4*andTermsGroup {
 			t.Fatalf("long pattern %d made only %d trigram terms", i, terms)
 		}
 		if ok != likePatternUsesTrigrams(pattern) {
@@ -153,10 +155,53 @@ func TestTrigramMatchQueryQuotesEachTrigram(t *testing.T) {
 		{"\xc3\xa9t\xc3", "\"\xc3\xa9t\xc3\"", true},
 		{"a\x80bc", "\"a\x80b\" \"\x80bc\"", true},
 		{"\x80\x80\x80", "", false},
+		// A repeated trigram is written once.
+		{"aaaaaa", `"aaa"`, true},
+		{"abcabc%abc", `"abc" "bca" "cab"`, true},
 	} {
 		got, ok := trigramMatchQuery(tc.pattern)
 		if got != tc.want || ok != tc.ok {
 			t.Errorf("trigramMatchQuery(%q) = %q, %v; want %q, %v", tc.pattern, got, ok, tc.want, tc.ok)
+		}
+	}
+}
+
+// TestAndTermsNestsInHalves pins andTerms' shape: up to andTermsGroup terms
+// side by side, more nested in halves, every term once and in order.
+func TestAndTermsNestsInHalves(t *testing.T) {
+	terms := func(n int) []string {
+		var out []string
+		for i := range n {
+			out = append(out, fmt.Sprintf(`"t%d"`, i))
+		}
+		return out
+	}
+	if got, want := andTerms(terms(andTermsGroup)), strings.Join(terms(andTermsGroup), " "); got != want {
+		t.Fatalf("andTerms(%d terms) = %q, want them side by side", andTermsGroup, got)
+	}
+	all := terms(andTermsGroup + 1)
+	if got, want := andTerms(all), "("+strings.Join(all[:16], " ")+") AND ("+strings.Join(all[16:], " ")+")"; got != want {
+		t.Fatalf("andTerms(%d terms) = %q, want %q", len(all), got, want)
+	}
+	for _, n := range []int{100, 1000, 50000} {
+		expression := andTerms(terms(n))
+		depth, deepest := 0, 0
+		for _, c := range expression {
+			switch c {
+			case '(':
+				depth++
+				deepest = max(deepest, depth)
+			case ')':
+				depth--
+			}
+		}
+		flat := strings.NewReplacer("(", "", ")", "", " AND ", " ").Replace(expression)
+		if flat != strings.Join(terms(n), " ") || depth != 0 {
+			t.Fatalf("andTerms(%d terms) does not hold each term once, in order, in balanced parentheses", n)
+		}
+		// Halving to groups of andTermsGroup nests ceil(log2(n/andTermsGroup)) deep.
+		if want := bits.Len(uint((n - 1) / andTermsGroup)); deepest != want {
+			t.Fatalf("andTerms(%d terms) nests %d deep, want %d", n, deepest, want)
 		}
 	}
 }
@@ -741,5 +786,52 @@ func TestSenderSearchReadsOneSnapshot(t *testing.T) {
 	if len(before) != 6 || len(after) != 6 || len(got) != 5 {
 		t.Fatalf("without a transaction = %v (LIKE before %d rows, after %d); want the moved message missing, which is why searchMessages opens one",
 			messageIDs(got), len(before), len(after))
+	}
+}
+
+// TestOverlongScopedPatternsFailAsLikeDoes extends
+// TestOverlongPatternsFailAsLikeDoes to the conversation and sender searches,
+// under plans that would otherwise send a trigram-able query to the scope
+// index. The index has no candidate for an overlong pattern and so would return
+// nothing where the LIKE reports its length limit.
+func TestOverlongScopedPatternsFailAsLikeDoes(t *testing.T) {
+	ctx := context.Background()
+	store := openRepositoryTestStore(t)
+	repository := mustMessageRepository(t, store, 100)
+	db := store.db
+	mustExec(t, db, `INSERT INTO accounts (account_id, bridge_key, created_at_ms, updated_at_ms) VALUES ('account-a', 'signal_cli', 1, 1)`)
+	mustExec(t, db, `INSERT INTO identities (identity_id, account_id, kind, canonical_value, raw_value, created_at_ms, updated_at_ms) VALUES ('identity-a', 'account-a', 'phone', '+15550000001', '+15550000001', 1, 1)`)
+	mustExec(t, db, `INSERT INTO conversations (conversation_id, account_id, remote_conversation_id, kind, created_at_ms, updated_at_ms) VALUES ('conversation-a', 'account-a', 'remote-a', 'direct', 1, 1)`)
+	for i := range 40 {
+		mustExec(t, db, `INSERT INTO messages (message_id, conversation_id, account_id, remote_message_id, sender_identity_id, direction, body, occurred_at_ms, created_at_ms, updated_at_ms)
+			VALUES (?, 'conversation-a', 'account-a', ?, 'identity-a', 'incoming', 'common words', ?, 1, 1)`,
+			fmt.Sprintf("message-%02d", i), fmt.Sprintf("remote-%d", i), 100+i)
+	}
+
+	// '%' + query + '%' is one byte over the limit, then exactly at it.
+	over := strings.Repeat("z", maxLikePatternBytes-1)
+	at := strings.Repeat("z", maxLikePatternBytes-2)
+	for _, tc := range []struct {
+		name   string
+		filter SearchQuery
+		plan   searchPlan
+	}{
+		{"a thread past its window", SearchQuery{ConversationID: "conversation-a", Limit: 5}, searchPlan{window: 20, indexMinRows: 10}},
+		{"a thread in a date range", SearchQuery{ConversationID: "conversation-a", SinceMS: 100, UntilMS: 200, Limit: 5}, searchPlan{window: 20, indexMinRows: 10}},
+		{"a prolific sender", SearchQuery{SenderCanonicalValue: "+15550000001", Limit: 5}, searchPlan{window: 20, indexMinRows: 10, senderMinimums: 1}},
+		{"a sender in a date range", SearchQuery{SenderCanonicalValue: "+15550000001", SinceMS: 100, UntilMS: 200, Limit: 5}, searchPlan{window: 20, indexMinRows: 10, senderMinimums: 1}},
+		{"a sender in a thread", SearchQuery{ConversationID: "conversation-a", SenderCanonicalValue: "+15550000001", Limit: 5}, searchPlan{window: 20, indexMinRows: 10, senderMinimums: 1}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, path, err := repository.searchMessages(ctx, "zzz", tc.filter, tc.plan); err != nil || path != searchPathScopeIndex {
+				t.Fatalf("searchMessages(zzz) path = %s, %v; want %s, so the overlong pattern would reach it", path, err, searchPathScopeIndex)
+			}
+			if _, _, err := repository.searchMessages(ctx, over, tc.filter, tc.plan); err == nil || !strings.Contains(err.Error(), "pattern too complex") {
+				t.Errorf("searchMessages(overlong) error = %v, want LIKE's pattern-too-complex error", err)
+			}
+			if got, _, err := repository.searchMessages(ctx, at, tc.filter, tc.plan); err != nil || len(got) != 0 {
+				t.Errorf("searchMessages(at the limit) = %v, %v; want no rows and no error", messageIDs(got), err)
+			}
+		})
 	}
 }
