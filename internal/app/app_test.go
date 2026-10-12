@@ -145,6 +145,34 @@ func TestDemoModeEnvParsing(t *testing.T) {
 	})
 }
 
+func TestSandboxedFollowsTheLauncherFlagAndTheRealSandbox(t *testing.T) {
+	for _, tc := range []struct {
+		flag, containerID string
+		want              bool
+	}{
+		{flag: "", containerID: "", want: false},
+		// The macOS launcher always sends "1" or "0" now (#231).
+		{flag: "0", containerID: "", want: false},
+		{flag: "1", containerID: "", want: true},
+		{flag: "true", containerID: "", want: true},
+		{flag: " TRUE ", containerID: "", want: true},
+		{flag: "yes", containerID: "", want: false},
+		// A process inside the App Sandbox carries the container id whatever
+		// the flag says: it cannot read other apps' data either way.
+		{flag: "", containerID: "com.openmessage.app", want: true},
+		{flag: "0", containerID: "com.openmessage.app", want: true},
+		{flag: "0", containerID: "  ", want: false},
+	} {
+		t.Run(tc.flag+"|"+tc.containerID, func(t *testing.T) {
+			t.Setenv("OPENMESSAGES_APP_SANDBOX", tc.flag)
+			t.Setenv("APP_SANDBOX_CONTAINER_ID", tc.containerID)
+			if got := Sandboxed(); got != tc.want {
+				t.Fatalf("Sandboxed() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestGoogleSendOutcomeRepairFlag(t *testing.T) {
 	a := &App{}
 	// A session file makes GooglePaired() true so NeedsRepair can surface.

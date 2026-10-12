@@ -521,9 +521,19 @@ func LocalIdentityName() string {
 	return "Me"
 }
 
+// Sandboxed reports whether this process runs inside the macOS App Sandbox,
+// which keeps it out of other apps' data (Messages' chat.db, Signal Desktop,
+// WhatsApp Desktop). The macOS launcher passes OPENMESSAGES_APP_SANDBOX as "1"
+// or "0" from its own APP_SANDBOX_CONTAINER_ID; a backend that inherits that
+// variable itself (the sandbox sets it in every sandboxed process) counts as
+// sandboxed too. Tests set OPENMESSAGES_APP_SANDBOX=1 to keep local imports
+// from reading the developer's own data.
 func Sandboxed() bool {
-	return strings.EqualFold(strings.TrimSpace(os.Getenv("OPENMESSAGES_APP_SANDBOX")), "1") ||
-		strings.EqualFold(strings.TrimSpace(os.Getenv("OPENMESSAGES_APP_SANDBOX")), "true")
+	flag := strings.TrimSpace(os.Getenv("OPENMESSAGES_APP_SANDBOX"))
+	if strings.EqualFold(flag, "1") || strings.EqualFold(flag, "true") {
+		return true
+	}
+	return strings.TrimSpace(os.Getenv("APP_SANDBOX_CONTAINER_ID")) != ""
 }
 
 func (a *App) GetClient() *client.Client {

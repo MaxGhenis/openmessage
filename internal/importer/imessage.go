@@ -124,7 +124,7 @@ type imessageMessage struct {
 
 func (im *IMessage) loadChats(chatDB *sql.DB) ([]imessageChat, error) {
 	rows, err := chatDB.Query(`
-		SELECT c.ROWID, c.guid, c.display_name, c.style,
+		SELECT c.ROWID, c.guid, COALESCE(c.display_name, ''), COALESCE(c.style, 0),
 			COALESCE(MAX(m.date), 0) as last_date
 		FROM chat c
 		LEFT JOIN chat_message_join cmj ON c.ROWID = cmj.chat_id
@@ -137,6 +137,11 @@ func (im *IMessage) loadChats(chatDB *sql.DB) ([]imessageChat, error) {
 	}
 	defer rows.Close()
 
+	// Collect every chat before loading participants: ImportFromDB holds one
+	// connection (MaxOpenConns=1), so a query issued while these rows are open
+	// waits forever. It did, from ed03e741 (2026-02-22) until #231, on any
+	// chat.db with a chat. Messages leaves display_name NULL on some chats,
+	// which used to fail the scan and drop the chat.
 	var chats []imessageChat
 	for rows.Next() {
 		var c imessageChat
@@ -147,8 +152,15 @@ func (im *IMessage) loadChats(chatDB *sql.DB) ([]imessageChat, error) {
 		}
 		c.isGroup = style == 43 // iMessage group chat style
 		c.lastMessageTS = coreDataToMS(lastDate)
+		chats = append(chats, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	rows.Close()
 
-		// Load participants
+	for i := range chats {
+		c := &chats[i]
 		c.participants = im.loadChatParticipants(chatDB, c.rowID)
 
 		// Derive name if empty
@@ -163,10 +175,8 @@ func (im *IMessage) loadChats(chatDB *sql.DB) ([]imessageChat, error) {
 			}
 			c.displayName = strings.Join(names, ", ")
 		}
-
-		chats = append(chats, c)
 	}
-	return chats, rows.Err()
+	return chats, nil
 }
 
 func (im *IMessage) loadChatParticipants(chatDB *sql.DB, chatRowID int) []map[string]string {

@@ -399,6 +399,92 @@ All of this needs the request/response path to work. If the fetch replies are
 empty (`Fetched conversations count=0` while the store holds history), nothing
 can be recovered until that is fixed.
 
+## Local desktop imports (iMessage, Signal Desktop, WhatsApp Desktop)
+
+Besides the live bridges, the daemon can read other apps' databases on the
+Mac: Messages' `~/Library/Messages/chat.db` (needs Full Disk Access), Signal
+Desktop's `~/Library/Application Support/Signal/sql/db.sqlite` (key from the
+"Signal Safe Storage" keychain item) and WhatsApp Desktop's
+`ChatStorage.sqlite`. These importers write **only the legacy
+`messages.db`**. The daemon polls two of them every 30 s: WhatsApp Desktop
+while its live bridge is unused, and Signal Desktop while signal-cli is
+paired. It also rescans Signal Desktop in full every 30 min. It does not
+poll iMessage (see the end of this section).
+
+Whether they run at all is one decision, logged once at startup and reported
+in `/api/status` (the log line is Info, which macOS keeps only in memory):
+
+```bash
+curl -s http://127.0.0.1:7007/api/status | jq '.local_imports'
+# {"enabled": false, "off_reason": "v2_primary", "app_sandbox": false, "imessage": false}
+```
+
+`off_reason` is `demo`, `transports_off`, `app_sandbox` or `v2_primary`.
+
+- **`app_sandbox` means the process really runs in the macOS App Sandbox.**
+  From 2026-04-04 (8394909c) until #231 the launcher passed
+  `OPENMESSAGES_APP_SANDBOX=1` on every launch, written for a sandboxed
+  Xcode target that no longer exists. The shipped app is not sandboxed
+  (`codesign -d --entitlements :- /Applications/OpenMessage.app` lists only
+  Hardened Runtime exceptions). So every app install had the local imports
+  and the startup WhatsApp media repair off. The launcher now sends "1" only
+  when its own environment has `APP_SANDBOX_CONTAINER_ID`, else "0". A
+  backend started by an older app still shows `OPENMESSAGES_APP_SANDBOX=1` in
+  `ps eww <pid>`. That reflects the old launcher, not a sandbox.
+- **`v2_primary`: off, whatever the sandbox says.** A v2-primary daemon
+  serves conversations, messages and search from the v2 store, so
+  legacy-only rows don't appear there. A few surfaces still read the legacy
+  store directly (`/api/people`, MCP `download_media`); they are not a route
+  for new history. The rows also break the projection check: the legacy
+  store is the copy of live traffic that
+  `freshness.<platform>.projection_stalled` measures v2 against
+  (whatsapp, signal, sms/rcs), and a desktop import moves `legacy_latest_ms`
+  past anything v2 holds. Seen 2026-10-11: signal `projection_stalled: true`,
+  `legacy_latest_ms` on 09-27, v2's newest Signal message on 08-18. The
+  legacy rows in between carry `signallocal:` attachment refs, so they came
+  from Signal Desktop, written by the 30-minute full rescan, which the
+  sandbox flag never gated. Those rows stay in `messages.db`, so the flag
+  stays true until v2 holds Signal messages newer than 09-27. It is not a
+  live projection stall.
+  - *WhatsApp Desktop* reaches v2 only through a v2-native history feed
+    (in progress 2026-10-11, branch `feat/whatsapp-desktop-v2-feed`), never
+    through this importer.
+  - *Signal Desktop* has no v2 route yet. It is worth one: it is a
+    separate linked device (its database was still being written on 10-11
+    with signal-cli unpaired), the legacy rows from 08-19 to 09-27 came from
+    it, and v2 has no Signal message after 08-18. The route is the same
+    insert-only history feed as WhatsApp Desktop.
+  - *iMessage* has no v2 platform. On Max's Mac chat.db's newest message is
+    2024-09-02 (46,965 rows, none in 2026), so there is nothing to route.
+- The startup WhatsApp media repair (`app.New`) follows only the sandbox
+  flag, so an unsandboxed v2-primary daemon runs it. It edits legacy rows in
+  place (adds the local media ref to `[Photo]`-style placeholders) and never
+  moves a timestamp, so it cannot touch the projection check (one candidate
+  row on 2026-10-11).
+
+**iMessage is not polled on any install.** `importer.IMessage` re-reads all
+of chat.db and re-upserts every chat and message on each call. On Max's
+chat.db (2,020 chats, 43,731 messages with text), measured into an in-memory
+store on 2026-10-11:
+- a first import took 162 s;
+- importing the same, unchanged chat.db again took 334 s and rewrote every
+  row.
+
+From ed03e741 (2026-02-22) until #231 it also never returned: it held one
+SQLite connection and queried chat participants with the chat rows still
+open. The sandbox flag hid both problems from 2026-04-04. #231 fixes the hang
+and the dropped chats whose `display_name` is NULL, so `openmessage import
+imessage` and MCP `import_messages` work as one-shot full imports. A poll
+needs an incremental importer first. Two review rounds on #231 set its
+requirements:
+- read tapbacks from chat.db's `associated_message_guid` /
+  `associated_message_type`, not by matching quoted text, which can delete
+  typed messages;
+- track late `chat_message_join` rows, not only a message ROWID mark;
+- detect a replaced chat.db;
+- keep row metadata (transcripts, media) intact;
+- keep a one-message poll cheap on a large chat.
+
 ## MCP serving — exactly one process may own live transports
 
 **The failure mode (empirically confirmed 2026-07-20):** `openmessage serve

@@ -492,54 +492,36 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 			Msg("V2 stack enabled")
 	}
 
-	// Sync WhatsApp and iMessage periodically (every 30s, incremental)
-	lastImportErr := map[string]string{}
-	syncLocalPlatforms := func() {
-		if app.Sandboxed() || isDemo {
-			return
-		}
-		changed := false
-		syncPlatform := func(platform, successMsg string, importFromDB func(*db.Store) (*importer.ImportResult, error)) {
-			result, err := importFromDB(a.Store)
-			if err != nil {
-				logSyncError(logger, lastImportErr, platform, err)
-				return
+	// Local desktop imports (WhatsApp Desktop, Signal Desktop, iMessage) write
+	// only the legacy store; see localImportsOffReason for when they run.
+	sandboxed := app.Sandboxed()
+	localSync := newLocalImports(localImportsConfig{
+		Logger:             logger,
+		Store:              a.Store,
+		OffReason:          localImportsOffReason(transports, isDemo, sandboxed, v2Primary),
+		Sandboxed:          sandboxed,
+		WhatsAppLiveBridge: a.UsesWhatsAppLiveBridge,
+		SignalAccount: func() (string, bool) {
+			status := a.SignalStatus()
+			return status.Account, status.Paired
+		},
+		IMessageSupported: iMessageSyncSupported(),
+		ImportWhatsApp: func(store *db.Store) (*importer.ImportResult, error) {
+			return (&importer.WhatsAppNative{MyName: identityName}).ImportFromDB(store)
+		},
+		ImportSignal: func(store *db.Store, account string, full bool) (*importer.ImportResult, error) {
+			imp := &importer.SignalDesktop{MyName: identityName, MyAddress: account}
+			if full {
+				imp.MyName = strings.TrimSpace(os.Getenv("OPENMESSAGES_MY_NAME"))
+				imp.SinceMS = -1 // explicit full scan, ignore incremental window
 			}
-			if result.MessagesImported == 0 {
-				return
-			}
-
-			lastImportErr[platform] = ""
-			changed = true
-			logger.Info().
-				Int("messages", result.MessagesImported).
-				Int("conversations", result.ConversationsCreated).
-				Msg(successMsg)
-		}
-
-		if !a.UsesWhatsAppLiveBridge() {
-			syncPlatform("whatsapp", "WhatsApp sync complete", func(store *db.Store) (*importer.ImportResult, error) {
-				return (&importer.WhatsAppNative{MyName: identityName}).ImportFromDB(store)
-			})
-		}
-		if signalStatus := a.SignalStatus(); signalStatus.Paired {
-			syncPlatform("signal", "Signal desktop sync complete", func(store *db.Store) (*importer.ImportResult, error) {
-				return (&importer.SignalDesktop{
-					MyName:    identityName,
-					MyAddress: signalStatus.Account,
-				}).ImportFromDB(store)
-			})
-		}
-		if iMessageSyncSupported() {
-			syncPlatform("imessage", "iMessage sync complete", func(store *db.Store) (*importer.ImportResult, error) {
-				return (&importer.IMessage{MyName: identityName}).ImportFromDB(store)
-			})
-		}
-		if changed {
-			events.PublishConversations()
-			events.PublishMessages("")
-		}
-	}
+			return imp.ImportFromDB(store)
+		},
+		// No iMessage poll: the importer re-reads and rewrites all of chat.db
+		// on every call (see localImportsConfig.ImportIMessage).
+		ImportIMessage: nil,
+	})
+	localSync.logDecision()
 
 	// Run once immediately, then every 30 seconds. Each tick is wrapped in a
 	// recover() so a panic from one bad row (corrupt iMessage chat.db entry,
@@ -554,17 +536,10 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 					Msg("local platform sync panicked; skipping this tick")
 			}
 		}()
-		syncLocalPlatforms()
-	}
-	if transports {
-		go func() {
-			safeSync()
-			ticker := time.NewTicker(30 * time.Second)
-			defer ticker.Stop()
-			for range ticker.C {
-				safeSync()
-			}
-		}()
+		if localSync.syncOnce() {
+			events.PublishConversations()
+			events.PublishMessages("")
+		}
 	}
 
 	// Belt-and-suspenders: periodically force a full Signal Desktop rescan
@@ -583,35 +558,26 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 					Msg("periodic Signal full rescan panicked; will retry next interval")
 			}
 		}()
-		if !a.SignalStatus().Paired {
-			return
-		}
-		identityName := strings.TrimSpace(os.Getenv("OPENMESSAGES_MY_NAME"))
-		imp := &importer.SignalDesktop{
-			MyName:    identityName,
-			MyAddress: a.SignalStatus().Account,
-			SinceMS:   -1, // explicit full scan, ignore incremental window
-		}
-		result, err := imp.ImportFromDB(a.Store)
-		if err != nil {
-			logger.Debug().Err(err).Msg("Periodic Signal full rescan failed")
-			return
-		}
-		if result.MessagesImported > 0 {
-			logger.Info().
-				Int("recovered", result.MessagesImported).
-				Msg("Periodic Signal full rescan recovered drifted messages")
+		if localSync.fullSignalRescanOnce() > 0 {
 			events.PublishConversations()
 			events.PublishMessages("")
 		}
 	}
-	if transports {
+	if localSync.enabled() {
+		go func() {
+			safeSync()
+			ticker := time.NewTicker(localImportPollInterval)
+			defer ticker.Stop()
+			for range ticker.C {
+				safeSync()
+			}
+		}()
 		go func() {
 			// First full rescan 2 minutes after startup so a crash-restart
 			// cycle doesn't hammer the DB immediately, then every 30 minutes.
-			time.Sleep(2 * time.Minute)
+			time.Sleep(localSignalFullRescanDelay)
 			safeFullSignalSync()
-			ticker := time.NewTicker(30 * time.Minute)
+			ticker := time.NewTicker(localSignalFullRescanInterval)
 			defer ticker.Stop()
 			for range ticker.C {
 				safeFullSignalSync()
@@ -731,6 +697,7 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 				ReconnectGoogle:       reconnectGoogle,
 				Unpair:                unpairGoogle,
 				WhatsAppStatus:        func() any { return a.WhatsAppStatus() },
+				LocalImports:          func() any { return localSync.status() },
 				ConnectWhatsApp:       connectWhatsApp,
 				PairWhatsAppPhone:     pairWhatsAppPhone,
 				UnpairWhatsApp:        unpairWhatsApp,
