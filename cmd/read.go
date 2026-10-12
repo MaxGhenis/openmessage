@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -45,9 +46,11 @@ func openCommandReadSource(
 	}
 	if mode.Primary {
 		storePath := filepath.Join(dataDir, "v2", "store.sqlite3")
-		store, err := sqlite.Open(storePath)
+		// A reader never migrates the store the app owns: a migration holds
+		// the write lock for its whole run and would stall the daemon's writes.
+		store, err := sqlite.OpenWithoutMigrating(storePath)
 		if err != nil {
-			return nil, fmt.Errorf("open v2 read store %q: %w", storePath, err)
+			return nil, fmt.Errorf("open v2 read store %q: %w", storePath, clientStoreOpenError(err))
 		}
 		if banner != nil {
 			fmt.Fprintln(banner, "reading v2 store")
@@ -172,4 +175,13 @@ func firstNonEmpty(vals ...string) string {
 // accepts the same date forms as the CLI.
 func parseDayBound(s string, endOfDay bool) (int64, error) {
 	return db.ParseDayBound(s, endOfDay)
+}
+
+// clientStoreOpenError explains the refusal a read client gets when this
+// binary is newer than the store the app last upgraded.
+func clientStoreOpenError(err error) error {
+	if errors.Is(err, sqlite.ErrMigrationPending) {
+		return fmt.Errorf("%w (quit and reopen the OpenMessage app so it upgrades the store, then retry)", err)
+	}
+	return err
 }

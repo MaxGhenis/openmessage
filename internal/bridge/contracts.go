@@ -37,6 +37,15 @@ type HistoryIngressSink interface {
 	AppendHistoryIngress(ctx context.Context, record RawIngressRecord) error
 }
 
+// IngressDurability is an optional ConnectionSink extension. DurableIngress
+// reports whether AppendIngress commits frames to a durable inbox. It is false
+// in legacy-only mode, where the supervisor has no downstream sink and live
+// ingress is dropped, so a transport must not hold back a delivery
+// acknowledgement waiting for a commit that will never happen.
+type IngressDurability interface {
+	DurableIngress() bool
+}
+
 // Lifecycle owns transport connection generations.
 type Lifecycle interface {
 	// Start creates one owned connection generation. Run.Done must resolve when
