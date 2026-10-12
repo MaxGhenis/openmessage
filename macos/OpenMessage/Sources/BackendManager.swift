@@ -206,6 +206,10 @@ final class BackendManager: ObservableObject {
                         manager.logger.warning("Backend terminated via \(reason, privacy: .public) with code \(code)")
                         guard manager.launcher?.process === proc else { return }
                         manager.launcher = nil
+                        // The startup wait leaves a spawned backend's death to
+                        // this handler; end the wait before deciding.
+                        manager.healthCheckTask?.cancel()
+                        manager.healthCheckTask = nil
                         // Only react to crashes while we believed the backend was up. A
                         // deliberate stop()/quit clears ownership first, so this won't
                         // fight an intentional shutdown.
@@ -428,15 +432,24 @@ final class BackendManager: ObservableObject {
     /// Poll /api/status until the backend is ready. Past the grace period the
     /// wait continues while the backend process is alive, since it may still
     /// be applying store migrations before it listens.
+    ///
+    /// A spawned backend that dies is its termination handler's to handle: it
+    /// cancels this wait, then restarts the backend or reports the error. If
+    /// the wait judged that death itself it could set `.error` first, and the
+    /// handler, which acts only on `.starting` or `.running`, would skip the
+    /// restart. So only an adopted backend, which has no handler, is judged
+    /// dead here. Cancellation (stop, quit, relaunch) leaves the state alone.
     private func startHealthCheck() {
+        let spawned = launcher != nil
         healthCheckTask = Task {
             let outcome = await Self.startupWait.poll(
                 probe: { await self.backendAnswersStatus() },
-                processAlive: { !self.backendProcessIsDead() },
+                processAlive: { spawned || !self.backendProcessIsDead() },
                 onSlowStart: { attempt in
                     self.logger.warning("Backend not ready after \(attempt) checks but its process is alive (it may be applying store migrations); still waiting")
                 }
             )
+            if Task.isCancelled { return }
             switch outcome {
             case .ready(let attempt):
                 self.state = .running

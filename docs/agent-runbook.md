@@ -78,9 +78,14 @@ the index then visits all its matches, measured at up to about 1.5x the old
 scan's time.
 
 If searches miss messages that `LIKE` finds, check the indexes on a copy of the
-store (never the live file; copy `store.sqlite3` with its `-wal`):
+store. The check is a write statement, so it can't run on a read-only connection
+to the live file, and copying `store.sqlite3` and its `-wal` with `cp` can catch
+them mid-checkpoint and produce an inconsistent pair. `VACUUM INTO` over a
+read-only connection writes one consistent snapshot, keeps the rowids the
+indexes are keyed by, and never writes the source:
 
 ```bash
+sqlite3 -readonly "$HOME/Library/Application Support/OpenMessage/v2/store.sqlite3" "VACUUM INTO '/tmp/store-copy.sqlite3'"
 sqlite3 /tmp/store-copy.sqlite3 "INSERT INTO messages_fts(messages_fts, rank) VALUES ('integrity-check', 1);"
 ```
 

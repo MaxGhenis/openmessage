@@ -884,13 +884,13 @@ const trigramConversationsByNameQuery = `
 	LIMIT ?`
 
 // searchConversationsByNameStatement picks SearchConversationsByName's SQL: the
-// trigram arms when the candidate pattern has a run the index can use, else the
-// scans. Both return the conversations whose title, participant name, identity
+// trigram arms when the candidate pattern has a run the index can use, else
+// (and for a pattern too long for LIKE, likePatternTooLong) the scans. Both return the conversations whose title, participant name, identity
 // name or canonical value contains query literally, ASCII case-insensitively.
 func searchConversationsByNameStatement(query string, limit int) (string, []any) {
 	exact := "%" + escapeLikePattern(query) + "%"
 	candidate := "%" + trigramCandidatePattern(query) + "%"
-	if !likePatternUsesTrigrams(candidate) {
+	if !likePatternUsesTrigrams(candidate) || likePatternTooLong(exact) {
 		return likeConversationsByNameQuery, []any{exact, exact, exact, exact, limit}
 	}
 	return trigramConversationsByNameQuery, []any{

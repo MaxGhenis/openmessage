@@ -779,3 +779,35 @@ func TestSearchIndexesFollowReplace(t *testing.T) {
 		t.Fatalf("the new body is not found: %v", got)
 	}
 }
+
+// TestOverlongPatternsFailAsLikeDoes keeps SQLite's LIKE length limit an
+// error. A trigram index finds no candidate for an overlong pattern and so
+// would return nothing instead.
+func TestOverlongPatternsFailAsLikeDoes(t *testing.T) {
+	ctx := context.Background()
+	store := openRepositoryTestStore(t)
+	repository := mustMessageRepository(t, store, 100)
+	db := store.db
+	mustExec(t, db, `INSERT INTO accounts (account_id, bridge_key, created_at_ms, updated_at_ms) VALUES ('account-a', 'signal_cli', 1, 1)`)
+	mustExec(t, db, `INSERT INTO conversations (conversation_id, account_id, remote_conversation_id, kind, title, created_at_ms, updated_at_ms) VALUES ('conversation-a', 'account-a', 'remote-a', 'direct', 'hello', 1, 1)`)
+	mustExec(t, db, `INSERT INTO messages (message_id, conversation_id, account_id, remote_message_id, direction, body, occurred_at_ms, created_at_ms, updated_at_ms)
+		VALUES ('message-a', 'conversation-a', 'account-a', 'remote-a', 'incoming', 'hello', 10, 1, 1)`)
+
+	// '%' + query + '%' is one byte over the limit, then exactly at it.
+	over := strings.Repeat("z", maxLikePatternBytes-1)
+	at := strings.Repeat("z", maxLikePatternBytes-2)
+	for _, filter := range []SearchQuery{{Limit: 5}, {SinceMS: 1, UntilMS: 100, Limit: 5}, {AccountID: "account-a", Limit: 5}} {
+		if _, err := repository.SearchMessages(ctx, over, filter); err == nil || !strings.Contains(err.Error(), "pattern too complex") {
+			t.Errorf("SearchMessages(overlong, %+v) error = %v, want LIKE's pattern-too-complex error", filter, err)
+		}
+		if got, err := repository.SearchMessages(ctx, at, filter); err != nil || len(got) != 0 {
+			t.Errorf("SearchMessages(at the limit, %+v) = %v, %v; want no rows and no error", filter, messageIDs(got), err)
+		}
+	}
+	if _, err := store.SearchConversationsByName(over, 5); err == nil || !strings.Contains(err.Error(), "pattern too complex") {
+		t.Errorf("SearchConversationsByName(overlong) error = %v, want LIKE's pattern-too-complex error", err)
+	}
+	if got, err := store.SearchConversationsByName(at, 5); err != nil || len(got) != 0 {
+		t.Errorf("SearchConversationsByName(at the limit) = %v, %v; want no rows and no error", conversationIDs(got), err)
+	}
+}

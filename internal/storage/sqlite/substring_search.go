@@ -41,6 +41,19 @@ func likePatternUsesTrigrams(pattern string) bool {
 	return false
 }
 
+// maxLikePatternBytes is SQLite's limit on a LIKE pattern
+// (SQLITE_MAX_LIKE_PATTERN_LENGTH, 50,000 bytes in modernc's build). LIKE
+// rejects a longer one with "LIKE or GLOB pattern too complex".
+const maxLikePatternBytes = 50000
+
+// likePatternTooLong reports a pattern the plain LIKE rejects. Handed to a
+// trigram index it would instead match nothing without an error whenever no
+// candidate reached the LIKE, so the searches send it to the plain LIKE
+// statements, which fail on it as they always did.
+func likePatternTooLong(pattern string) bool {
+	return len(pattern) > maxLikePatternBytes
+}
+
 // searchIndexes are the FTS5 trigram tables migration 0012 maintains, each
 // over the table named in its content= option.
 var searchIndexes = []string{

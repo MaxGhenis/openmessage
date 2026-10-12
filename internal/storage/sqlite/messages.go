@@ -550,7 +550,7 @@ func searchMessagesIn(
 	filter SearchQuery,
 	window int,
 ) ([]Message, searchPath, error) {
-	if query != "" && !indexBoundedSearch(filter) {
+	if query != "" && !indexBoundedSearch(filter) && !likePatternTooLong("%"+query+"%") {
 		messages, complete, err := searchRecentMessages(ctx, tx, query, filter, window)
 		if err != nil {
 			return nil, "", err
@@ -732,7 +732,8 @@ func searchMessagesStatement(query string, filter SearchQuery) (string, []any) {
 }
 
 func usesTrigramIndex(query string, filter SearchQuery) bool {
-	return likePatternUsesTrigrams(query) && !indexBoundedSearch(filter)
+	return likePatternUsesTrigrams(query) && !indexBoundedSearch(filter) &&
+		!likePatternTooLong("%"+query+"%")
 }
 
 // trigramSearchMessagesStatement puts the substring LIKE on messages_fts.body,

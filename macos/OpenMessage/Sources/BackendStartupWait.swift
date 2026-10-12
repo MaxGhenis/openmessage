@@ -19,7 +19,9 @@ struct BackendStartupWait: Equatable {
 
     /// How long a backend may take to answer before its liveness matters.
     var grace: Duration = .seconds(30)
-    /// The longest the app waits for a live backend that has not answered.
+    /// How long the app keeps polling a live backend that has not answered.
+    /// It is a polling threshold: a probe already in flight when it passes
+    /// still counts if the backend answers.
     var ceiling: Duration = .seconds(600)
 
     func decide(elapsed: Duration, processAlive: Bool) -> Decision {
@@ -54,10 +56,12 @@ extension BackendStartupWait {
     }
 
     /// Polls `probe` every `interval` until it reports the backend ready, the
-    /// wait gives up (`decide`), or the task is cancelled. `processAlive` is
-    /// consulted only after the grace period. `onSlowStart` runs once, the
-    /// first time the wait continues past the grace period. It runs on the
-    /// main actor with its caller, `BackendManager`.
+    /// wait gives up (`decide`), or the task is cancelled. Cancellation wins
+    /// over a probe's result, so a stop that cancels an in-flight probe never
+    /// sees that probe's outcome applied. `processAlive` is consulted only
+    /// after the grace period. `onSlowStart` runs once, the first time the wait
+    /// continues past the grace period. It runs on the main actor with its
+    /// caller, `BackendManager`.
     @MainActor
     func poll(
         interval: Duration = .milliseconds(500),
@@ -73,7 +77,9 @@ extension BackendStartupWait {
             attempt += 1
             try? await Task.sleep(for: interval)
             if Task.isCancelled { return .cancelled }
-            if await probe() {
+            let answered = await probe()
+            if Task.isCancelled { return .cancelled }
+            if answered {
                 return .ready(attempt: attempt)
             }
             let elapsed = clock.now - started

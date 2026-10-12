@@ -70,6 +70,27 @@ final class BackendStartupPollTests: XCTestCase {
         XCTAssertEqual(outcome, .gaveUp("Backend did not become ready within 2 seconds"))
     }
 
+    func testCancellationDuringAProbeWinsOverItsResult() async {
+        // stop() cancels the wait while a probe is in flight. With no grace and
+        // no ceiling, a failed probe would otherwise give up (and overwrite
+        // .stopped with .error) and a successful one would report ready.
+        let immediate = BackendStartupWait(grace: .zero, ceiling: .zero)
+        for answer in [false, true] {
+            let task = Task { @MainActor in
+                await immediate.poll(
+                    interval: .milliseconds(1),
+                    probe: {
+                        withUnsafeCurrentTask { $0?.cancel() }
+                        return answer
+                    },
+                    processAlive: { false }
+                )
+            }
+            let outcome = await task.value
+            XCTAssertEqual(outcome, .cancelled, "a probe answering \(answer) after cancellation")
+        }
+    }
+
     func testCancellationEndsTheWait() async {
         let task = Task { await wait.poll(interval: .milliseconds(10), probe: { false }, processAlive: { true }) }
         try? await Task.sleep(for: .milliseconds(50))
