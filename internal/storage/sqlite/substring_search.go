@@ -54,6 +54,87 @@ func likePatternTooLong(pattern string) bool {
 	return len(pattern) > maxLikePatternBytes
 }
 
+// trigramMatchQuery returns an FTS5 MATCH expression selecting exactly the
+// rows FTS5 reads as candidates for LIKE '%' || query || '%', and whether
+// there is one (likePatternUsesTrigrams): the AND of trigramTerms(query).
+// TestTrigramMatchQuerySelectsFTS5LikeCandidates checks the candidates against
+// FTS5's own for the LIKE, over NULs, invalid UTF-8, quotes and wildcards. A
+// body the LIKE matches is among them, so the expression excludes no match.
+func trigramMatchQuery(query string) (string, bool) {
+	terms := trigramTerms(query)
+	if len(terms) == 0 {
+		return "", false
+	}
+	return andTerms(terms), true
+}
+
+// trigramTerms returns the distinct trigrams FTS5 ANDs for the LIKE pattern
+// '%' || query || '%', each quoted as an FTS5 string, in the order they first
+// appear. The query ends at its first NUL and is cut at '%' and '_'; each
+// piece that likePatternUsesTrigrams accepts contributes all of its trigrams.
+// Each trigram is its own term, because a detail=none index refuses a phrase
+// of several ("phrase queries are not supported"). Within a piece, a byte from
+// 0xC0 up takes the continuation bytes after it as one character and any other
+// byte stands alone, which makes every term exactly one trigram to the
+// tokenizer. A repeated trigram adds nothing to an AND, so it appears once.
+func trigramTerms(query string) []string {
+	if i := strings.IndexByte(query, 0); i >= 0 {
+		query = query[:i]
+	}
+	var terms []string
+	seen := make(map[string]bool)
+	for len(query) > 0 {
+		end := strings.IndexAny(query, "%_")
+		if end < 0 {
+			end = len(query)
+		}
+		piece := query[:end]
+		query = query[min(end+1, len(query)):]
+		if !likePatternUsesTrigrams(piece) {
+			continue
+		}
+		var characters []string
+		for i := 0; i < len(piece); {
+			next := i + 1
+			if piece[i] >= 0xC0 {
+				for next < len(piece) && piece[next]&0xC0 == 0x80 {
+					next++
+				}
+			}
+			characters = append(characters, piece[i:next])
+			i = next
+		}
+		for i := 0; i+3 <= len(characters); i++ {
+			trigram := characters[i] + characters[i+1] + characters[i+2]
+			if !seen[trigram] {
+				seen[trigram] = true
+				terms = append(terms, `"`+strings.ReplaceAll(trigram, `"`, `""`)+`"`)
+			}
+		}
+	}
+	return terms
+}
+
+// andTermsGroup is the most terms andTerms writes side by side.
+const andTermsGroup = 32
+
+// andTerms joins FTS5 terms into one AND. FTS5 parses a run of terms left to
+// right, and each step allocates a new AND node and copies into it the
+// children of the AND it extends (sqlite3Fts5ParseImplicitAnd,
+// sqlite3Fts5ParseNode, fts5ExprAddChildren), so n terms side by side cost n
+// squared: 3.5s for 50,000 in this build. Nesting them in halves, down to
+// groups of andTermsGroup, makes it n log n. The halves are joined by an
+// explicit AND, because FTS5 writes an implicit one only between phrases, and
+// it merges a nested AND's children into its parent's, so the expression is
+// the same single AND of every term.
+func andTerms(terms []string) string {
+	if len(terms) <= andTermsGroup {
+		return strings.Join(terms, " ")
+	}
+	half := len(terms) / 2
+	return "(" + andTerms(terms[:half]) + ") AND (" + andTerms(terms[half:]) + ")"
+}
+
 // searchIndexes are the FTS5 trigram tables migration 0012 maintains, each
 // over the table named in its content= option.
 var searchIndexes = []string{
