@@ -149,7 +149,19 @@ func unmarshalWhatsAppMediaOpaque(raw []byte) (whatsappMediaOpaqueV1, error) {
 // bridge.MediaStream. This necessarily forfeits true streaming until a future
 // transport-native streaming API replaces the retained []byte boundary.
 func (a *Adapter) DownloadMedia(ctx context.Context, _ string, ref bridge.MediaRef) (bridge.MediaStream, error) {
-	if a == nil || a.mediaReady == nil || !a.mediaReady() || a.downloadMediaRef == nil {
+	if a == nil || a.downloadMediaRef == nil {
+		return bridge.MediaStream{}, whatsappDownloadPreCallFailure(
+			"whatsapp_not_connected",
+			whatsmeow.ErrNotConnected,
+		)
+	}
+	// A valid local ref reads WhatsApp Desktop's own file and needs no
+	// WhatsApp connection, which is exactly when desktop history supplies such
+	// refs. Every other ref keeps the original order: readiness, then context,
+	// then the Opaque decode error.
+	payload, opaqueErr := unmarshalWhatsAppMediaOpaque(ref.Opaque)
+	local := opaqueErr == nil && payload.Kind == "local"
+	if !local && (a.mediaReady == nil || !a.mediaReady()) {
 		return bridge.MediaStream{}, whatsappDownloadPreCallFailure(
 			"whatsapp_not_connected",
 			whatsmeow.ErrNotConnected,
@@ -164,10 +176,8 @@ func (a *Adapter) DownloadMedia(ctx context.Context, _ string, ref bridge.MediaR
 	if err := ctx.Err(); err != nil {
 		return bridge.MediaStream{}, whatsappDownloadPreCallFailure("whatsapp_download_context_done", err)
 	}
-
-	payload, err := unmarshalWhatsAppMediaOpaque(ref.Opaque)
-	if err != nil {
-		return bridge.MediaStream{}, err
+	if opaqueErr != nil {
+		return bridge.MediaStream{}, opaqueErr
 	}
 	data, transportMIME, err := a.downloadMediaRef(
 		payload.Kind,

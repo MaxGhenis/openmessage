@@ -95,7 +95,8 @@ the alias exists so old references keep working.
 
 Two more cutover artifacts worth knowing:
 
-- **Only the Google decoder emits `ConversationEvent` frames.** Signal and
+- **Of the live decoders, only Google's emits `ConversationEvent` frames**
+  (WhatsApp Desktop history frames, below, carry a snapshot too). Signal and
   WhatsApp conversations are minted from message frames, which carry no kind and
   no roster. Before this PR that meant post-cutover Signal/WhatsApp **groups
   were stored as `direct`**, and 1:1 threads had **no participants and no
@@ -398,6 +399,108 @@ sqlite3 -readonly "$HOME/Library/Application Support/OpenMessage/v2/store.sqlite
 All of this needs the request/response path to work. If the fetch replies are
 empty (`Fetched conversations count=0` while the store holds history), nothing
 can be recovered until that is fixed.
+
+## WhatsApp Desktop history reaches v2
+
+Why this exists: on 2026-08-20 WhatsApp logged OpenMessage's linked device
+out (`401: logged out from another device`) the day the user moved WhatsApp to
+a new phone, which unlinks every companion. Relinking needs a QR scan on the
+phone, so WhatsApp sat at its 08-20 messages for seven weeks while WhatsApp
+Desktop on the same Mac kept syncing. The legacy Desktop importer never ran:
+the launcher's `OPENMESSAGES_APP_SANDBOX=1` disabled it, and it writes the
+legacy store that v2-primary readers ignore.
+
+**When it runs.** The whatsmeow live bridge remains WhatsApp's primary v2
+source. While that bridge is unpaired, or paired but continuously disconnected
+for five minutes, the daemon fills missing history from WhatsApp Desktop's
+`ChatStorage.sqlite`: a full scan about 20 seconds after startup, new `Z_PK`
+rows every 30 seconds, and a full rescan every six hours. It re-checks the
+bridge before every append and stops while the bridge is connected; a frame
+that races a reconnect is harmless, because the live channel's later frame for
+the same stanza updates the one row. It needs the v2 stack, daemon transports
+and non-demo mode; `OPENMESSAGES_WHATSAPP_DESKTOP_FEED=0` (or `false`/`off`)
+turns it off. It checks that the database is readable rather than the
+launcher's `OPENMESSAGES_APP_SANDBOX=1`, which does **not** mean the shipped app
+is sandboxed (its entitlements are hardened-runtime exceptions). A failed scan
+retries after a minute, doubling to an hour; a panic in a scan is logged and
+backed off, never fatal to the daemon. The feed reads; it cannot send.
+Sending, reactions and read receipts still need the live bridge relinked (QR
+scan, see "WhatsApp linking" below).
+
+**What it writes.** Frames use codec `whatsapp.desktop.history` on the
+WhatsApp live account with generation 0 (the reader owns no supervisor
+generation; ingress validation and SQLite allow 0) and go through the worker's
+history rules: insert-only, identities create-only, nothing existing rewritten.
+For WhatsApp those rules differ from Google's in three ways, because a WhatsApp
+remote ID is the chat's own JID rather than a device-local thread number:
+
+- A bound remote ID is the right thread by construction. There is no roster
+  contradiction check (live outgoing messages link a `jid:` peer while
+  incoming ones link `e164:`, and group members can be LIDs on one side and
+  phone numbers on the other, so a roster comparison only sees aliases).
+- An unbound remote ID mints its thread; two groups with the same members are
+  two chats.
+- A stanza ID any thread of the account already holds is never inserted again
+  (`RemoteMessageIDsPresent`), and a snapshot whose messages all live elsewhere
+  (a renumbered or aliased chat) mints nothing.
+
+Desktop keys most 1:1 chats by `@lid`; capture maps them to the phone JID v2
+uses (`ZWACHATSESSION.ZCONTACTIDENTIFIER`, then Desktop's `LID.sqlite`, then the
+whatsmeow LID map) and never mints an `@lid` thread. Bodies come from the live
+decoder (`[Photo]`, captions, `[Voice note]`, ...). A document's file name is
+`ZTEXT` and its caption the media item's `ZTITLE`. Rosters list active members
+only. New identities take the JID's WhatsApp push name
+(`ZWAPROFILEPUSHNAME`, one per JID) or none. Desktop rows that are the app's own
+v2 sends (stanza = `DeriveWebMessageID(transport_request_id)` of a text or media
+outbox row) are skipped as `own_send`: a send whose acknowledgement was lost
+keeps its local row under the request ID, and the outbox owns it. A
+conversation changes only by the monotone recency bump to its newest inserted
+message, so gap-filled threads move up the list. Local attachments resolve
+inside Desktop's `Message/` folder only, and download without a live
+connection.
+
+**Status.** `/api/status.whatsapp_desktop` reports `enabled`, `available`
+(last readability/scan result), `active`, `db_path`, `last_scan_at_ms`,
+`last_full_scan_at_ms`, `high_water_pk`, `frames_appended` (every append,
+including frames the inbox deduplicates on a rescan), `rows_skipped_by_reason`
+(the most recent scan only, so usually the last 30 s increment) and
+`last_error`. Inserts and skips show under
+`v2_ingest.per_account["whatsapp-primary"].history_*`. The `whatsapp` block
+still describes the live bridge only, and history frames never count as live
+delivery or reset freshness silence.
+
+**Limits.** History never updates a row, so a photo Desktop downloads after its
+row was captured is not attached later, and a message deleted for everyone
+after capture keeps its text. Mentions stay as WhatsApp's raw `@<digits>`, and
+replies are not linked. A group member Desktop knows only by LID gets a LID
+identity (named if Desktop has a push name), which a relinked live bridge may
+later file under the phone number instead.
+
+**Checking coverage.** Compare a chat's newest v2 message with Desktop's (both
+read-only):
+
+```bash
+curl -s "http://127.0.0.1:7007/api/conversations/<v2-id>/messages?limit=1" | jq '.[0] | {source_id, TimestampMS}'
+sqlite3 "file:$HOME/Library/Group Containers/group.net.whatsapp.WhatsApp.shared/ChatStorage.sqlite?mode=ro" \
+  "SELECT m.ZSTANZAID, CAST(ROUND(m.ZMESSAGEDATE+978307200)*1000 AS INTEGER) FROM ZWAMESSAGE m
+   JOIN ZWACHATSESSION c ON c.Z_PK=m.ZCHATSESSION WHERE c.ZCONTACTIDENTIFIER='<digits>@s.whatsapp.net'
+   ORDER BY m.ZMESSAGEDATE DESC LIMIT 1"
+```
+
+**Rehearsing before a deploy.** Back up the live stores read-only and run the
+real reader, decoder and worker against the copy; it logs counts only:
+
+```bash
+mkdir -p /tmp/om-rehearsal/v2
+sqlite3 "file:$HOME/Library/Application Support/OpenMessage/v2/store.sqlite3?mode=ro" ".backup '/tmp/om-rehearsal/v2/store.sqlite3'"
+sqlite3 "file:$HOME/Library/Application Support/OpenMessage/whatsapp-session.db?mode=ro" ".backup '/tmp/om-rehearsal/whatsapp-session.db'"
+OPENMESSAGES_DESKTOP_REHEARSAL_DIR=/tmp/om-rehearsal GOWORK=off go test ./cmd \
+  -run TestWhatsAppDesktopFeedRealDataRehearsal -v -count=1
+```
+
+It fails on any quarantine, scan error, stanza held by two threads, `@lid`
+thread, or insert on the second scan. Inbox payload pruning for this codec
+arrives with PR #196, as for Google history.
 
 ## MCP serving — exactly one process may own live transports
 

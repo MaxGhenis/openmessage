@@ -402,7 +402,7 @@ func TestHistoryPlacementRetryFinishesWhatAnEarlierAttemptCommitted(t *testing.T
 				t.Fatal("fixture: the frame decoded to no message")
 			}
 			progress := &historyFrameProgress{}
-			if _, inserted, err := h.worker.historyMessage(ctx, i01AccountID, bridge.PlatformGoogle, inboxID, *event, true, progress); err != nil || !inserted {
+			if _, inserted, err := h.worker.historyMessage(ctx, i01AccountID, bridge.PlatformGoogle, inboxID, *event, true, progress, nil); err != nil || !inserted {
 				t.Fatalf("attempt 1 historyMessage() = (inserted %v, %v), want the insert", inserted, err)
 			}
 

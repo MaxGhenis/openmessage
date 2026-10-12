@@ -305,6 +305,9 @@ type StatusSnapshot struct {
 	QRAvailable bool   `json:"qr_available"`
 	QREvent     string `json:"qr_event,omitempty"`
 	QRUpdatedAt int64  `json:"qr_updated_at,omitempty"`
+	// LastConnectedAt survives disconnects so local history can notice a brief
+	// usable reconnect even when a delayed status callback observes only offline.
+	LastConnectedAt time.Time `json:"-"`
 }
 
 type QRSnapshot struct {
@@ -379,6 +382,7 @@ type Bridge struct {
 	blockedUntil time.Time
 
 	connected                 bool
+	lastConnectedAt           time.Time
 	connecting                bool
 	pairing                   bool
 	lastError                 string
@@ -1216,10 +1220,11 @@ func (b *Bridge) Status() StatusSnapshot {
 	defer b.mu.RUnlock()
 
 	status := StatusSnapshot{
-		Connected:  b.connected && clientIsConnected(b.client),
-		Connecting: b.connecting,
-		Pairing:    b.pairing,
-		LastError:  b.lastError,
+		Connected:       b.connected && clientIsConnected(b.client),
+		Connecting:      b.connecting,
+		Pairing:         b.pairing,
+		LastError:       b.lastError,
+		LastConnectedAt: b.lastConnectedAt,
 	}
 	if deviceStore := b.pairedDeviceStoreLocked(); deviceStore != nil {
 		status.Paired = true
@@ -1564,6 +1569,12 @@ func (b *Bridge) sendMediaRequest(conversationID string, data []byte, filename, 
 func deriveWebMessageID(requestID string) watypes.MessageID {
 	digest := sha256.Sum256([]byte(requestID))
 	return whatsmeow.WebMessageIDPrefix + strings.ToUpper(hex.EncodeToString(digest[:9]))
+}
+
+// DeriveWebMessageID is the wire message ID a v2 send with this transport
+// request ID goes out under, so other readers can recognize the app's own sends.
+func DeriveWebMessageID(requestID string) string {
+	return string(deriveWebMessageID(requestID))
 }
 
 type sendNotDispatchedError struct {
@@ -2376,6 +2387,9 @@ func (b *Bridge) handleConnected() {
 		return
 	}
 	b.connected = true
+	// Record before SendPresence: that call can delay the status callback
+	// until after this usable connection has already disconnected again.
+	b.lastConnectedAt = time.Now()
 	b.connecting = false
 	b.pairing = false
 	b.lastError = ""

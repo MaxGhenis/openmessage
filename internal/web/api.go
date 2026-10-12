@@ -105,6 +105,7 @@ type APIOptions struct {
 	ReconnectGoogle       func() error
 	Unpair                UnpairFunc
 	WhatsAppStatus        func() any
+	WhatsAppDesktopStatus func() any // gap-filling history; never live bridge status
 	ConnectWhatsApp       func() error
 	PairWhatsAppPhone     func(phone string) (string, error)
 	UnpairWhatsApp        func() error
@@ -330,6 +331,9 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		}
 		if opts.WhatsAppStatus != nil {
 			payload["whatsapp"] = opts.WhatsAppStatus()
+		}
+		if opts.WhatsAppDesktopStatus != nil {
+			payload["whatsapp_desktop"] = opts.WhatsAppDesktopStatus()
 		}
 		if opts.SignalStatus != nil {
 			payload["signal"] = opts.SignalStatus()

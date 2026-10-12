@@ -323,6 +323,67 @@ const (
 
 // ListMessagesByConversation returns a newest-first page. beforeMS == 0
 // selects the latest page; otherwise beforeID is the deterministic tie cursor.
+// RemoteMessageIDsPresent reports which of remoteMessageIDs any message in the
+// account already carries, in whatever conversation it lives. WhatsApp stanza
+// IDs are unique per message across chats, so desktop history uses this to
+// refuse a second copy of a message v2 holds under another thread. The lookup
+// is a covering scan of the (account_id, conversation_id, remote_message_id)
+// unique index, one statement per batch.
+func (r *MessageRepository) RemoteMessageIDsPresent(
+	ctx context.Context,
+	accountID string,
+	remoteMessageIDs []string,
+) (map[string]bool, error) {
+	present := make(map[string]bool, len(remoteMessageIDs))
+	unique := make([]string, 0, len(remoteMessageIDs))
+	seen := make(map[string]bool, len(remoteMessageIDs))
+	for _, id := range remoteMessageIDs {
+		id = strings.TrimSpace(id)
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		unique = append(unique, id)
+	}
+	const batch = 400
+	for start := 0; start < len(unique); start += batch {
+		end := start + batch
+		if end > len(unique) {
+			end = len(unique)
+		}
+		args := make([]any, 0, end-start+1)
+		args = append(args, accountID)
+		placeholders := make([]string, 0, end-start)
+		for _, id := range unique[start:end] {
+			args = append(args, id)
+			placeholders = append(placeholders, "?")
+		}
+		rows, err := r.store.db.QueryContext(ctx, `
+			SELECT DISTINCT remote_message_id
+			FROM messages
+			WHERE account_id = ?
+			  AND remote_message_id IN (`+strings.Join(placeholders, ",")+`)
+		`, args...)
+		if err != nil {
+			return nil, fmt.Errorf("find present remote message IDs for account %q: %w", accountID, err)
+		}
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err != nil {
+				rows.Close()
+				return nil, fmt.Errorf("scan present remote message ID for account %q: %w", accountID, err)
+			}
+			present[id] = true
+		}
+		err = rows.Err()
+		rows.Close()
+		if err != nil {
+			return nil, fmt.Errorf("read present remote message IDs for account %q: %w", accountID, err)
+		}
+	}
+	return present, nil
+}
+
 func (r *MessageRepository) ListMessagesByConversation(
 	ctx context.Context,
 	conversationID string,

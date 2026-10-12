@@ -207,6 +207,13 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 	baseURL := "http://" + net.JoinHostPort(publicHost(host), port)
 
 	events := web.NewEventBroker()
+	whatsappDesktopGate := &whatsappDesktopGate{}
+	whatsappLiveStatus := func() whatsapplive.StatusSnapshot {
+		if whatsapp := a.GetWhatsApp(); whatsapp != nil {
+			return whatsapp.Status()
+		}
+		return whatsapplive.StatusSnapshot{}
+	}
 	isConnected := func() bool {
 		if isDemo {
 			return true
@@ -221,6 +228,7 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 	a.OnStatusChange = func(bool) { publishOverallStatus() }
 	a.OnTypingChange = events.PublishTyping
 	a.OnWhatsAppStatusChange = func() {
+		whatsappDesktopGate.allowed(whatsappLiveStatus(), time.Now())
 		publishOverallStatus()
 	}
 	a.OnSignalStatusChange = func() {
@@ -491,6 +499,10 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 			Bool("ingest", v2Ingest).
 			Msg("V2 stack enabled")
 	}
+	whatsappDesktopFeed := newWhatsAppDesktopFeed(stack, a.DataDir, transports, isDemo, whatsappDesktopGate, whatsappLiveStatus, logger)
+	whatsappDesktopGate.allowed(whatsappLiveStatus(), time.Now())
+	stopWhatsAppDesktopFeed := whatsappDesktopFeed.Start(context.Background())
+	defer stopWhatsAppDesktopFeed()
 
 	// Sync WhatsApp and iMessage periodically (every 30s, incremental)
 	lastImportErr := map[string]string{}
@@ -731,6 +743,7 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 				ReconnectGoogle:       reconnectGoogle,
 				Unpair:                unpairGoogle,
 				WhatsAppStatus:        func() any { return a.WhatsAppStatus() },
+				WhatsAppDesktopStatus: func() any { return whatsappDesktopFeed.Snapshot() },
 				ConnectWhatsApp:       connectWhatsApp,
 				PairWhatsAppPhone:     pairWhatsAppPhone,
 				UnpairWhatsApp:        unpairWhatsApp,

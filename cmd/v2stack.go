@@ -295,6 +295,7 @@ func newV2Stack(deps v2StackDeps) (_ *v2Stack, resultErr error) {
 				History:  true,
 			},
 			ingest.NewWhatsAppDecoderRegistration(),
+			ingest.NewWhatsAppDesktopHistoryDecoderRegistration(),
 			{
 				Codec:    ingest.SignalJSONRPCCodec,
 				Platform: bridge.PlatformSignal,
