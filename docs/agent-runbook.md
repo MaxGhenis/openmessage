@@ -399,6 +399,149 @@ All of this needs the request/response path to work. If the fetch replies are
 empty (`Fetched conversations count=0` while the store holds history), nothing
 can be recovered until that is fixed.
 
+## Local desktop imports (iMessage, Signal Desktop, WhatsApp Desktop)
+
+Besides the live bridges, the daemon can read other apps' databases on the
+Mac: Messages' `~/Library/Messages/chat.db` (needs Full Disk Access), Signal
+Desktop's `~/Library/Application Support/Signal/sql/db.sqlite` (key from the
+"Signal Safe Storage" keychain item) and WhatsApp Desktop's
+`ChatStorage.sqlite`. These importers write **only the legacy
+`messages.db`**. The daemon polls them every 30 s: WhatsApp Desktop while
+its live bridge is unused, Signal Desktop while signal-cli is paired, and
+iMessage on macOS (see the end of this section). It also rescans Signal
+Desktop in full every 30 min.
+
+Whether they run at all is one decision, logged once at startup and reported
+in `/api/status` (the log line is Info, which macOS keeps only in memory):
+
+```bash
+curl -s http://127.0.0.1:7007/api/status | jq '.local_imports'
+# {"enabled": false, "off_reason": "v2_primary", "app_sandbox": false, "imessage": false}
+```
+
+`off_reason` is `demo`, `transports_off`, `app_sandbox` or `v2_primary`.
+
+- **`app_sandbox` means the process really runs in the macOS App Sandbox.**
+  From 2026-04-04 (8394909c) until #231 the launcher passed
+  `OPENMESSAGES_APP_SANDBOX=1` on every launch, written for a sandboxed
+  Xcode target that no longer exists. The shipped app is not sandboxed
+  (`codesign -d --entitlements :- /Applications/OpenMessage.app` lists only
+  Hardened Runtime exceptions). So every app install had the local imports
+  and the startup WhatsApp media repair off. The launcher now sends "1" only
+  when its own environment has `APP_SANDBOX_CONTAINER_ID`, else "0". A
+  backend started by an older app still shows `OPENMESSAGES_APP_SANDBOX=1` in
+  `ps eww <pid>`. That reflects the old launcher, not a sandbox.
+- **`v2_primary`: off, whatever the sandbox says.** A v2-primary daemon
+  serves conversations, messages and search from the v2 store, so
+  legacy-only rows don't appear there. A few surfaces still read the legacy
+  store directly (`/api/people`, MCP `download_media`); they are not a route
+  for new history. The rows also break the projection check: the legacy
+  store is the copy of live traffic that
+  `freshness.<platform>.projection_stalled` measures v2 against
+  (whatsapp, signal, sms/rcs), and a desktop import moves `legacy_latest_ms`
+  past anything v2 holds. Seen 2026-10-11: signal `projection_stalled: true`,
+  `legacy_latest_ms` on 09-27, v2's newest Signal message on 08-18. The
+  legacy rows in between carry `signallocal:` attachment refs, so they came
+  from Signal Desktop, written by the 30-minute full rescan, which the
+  sandbox flag never gated. Those rows stay in `messages.db`, so the flag
+  stays true until v2 holds Signal messages newer than 09-27. It is not a
+  live projection stall.
+  - *WhatsApp Desktop* reaches v2 only through a v2-native history feed
+    (in progress 2026-10-11, branch `feat/whatsapp-desktop-v2-feed`), never
+    through this importer.
+  - *Signal Desktop* has no v2 route yet. It is worth one: it is a
+    separate linked device (its database was still being written on 10-11
+    with signal-cli unpaired), the legacy rows from 08-19 to 09-27 came from
+    it, and v2 has no Signal message after 08-18. The route is the same
+    insert-only history feed as WhatsApp Desktop.
+  - *iMessage* has no v2 platform. On Max's Mac chat.db's newest message is
+    2024-09-02 (46,965 rows, none in 2026), so there is nothing to route.
+- The startup WhatsApp media repair (`app.New`) follows only the sandbox
+  flag, so an unsandboxed v2-primary daemon runs it. It edits legacy rows in
+  place (adds the local media ref to `[Photo]`-style placeholders) and never
+  moves a timestamp, so it cannot touch the projection check (one candidate
+  row on 2026-10-11).
+
+### The iMessage poll
+
+The daemon keeps one `importer.IMessage` for its life
+(`internal/importer/imessage.go`). It holds a read-only connection to
+chat.db and, from its last successful poll, marks of what it read. A poll:
+
+- returns at once when chat.db's `PRAGMA data_version` has not moved, the
+  file is the same inode, and no earlier write is waiting to be retried. It
+  then reads nothing and touches no store;
+- otherwise reads, in one chat.db snapshot, the message rows above its
+  ROWID mark, the messages of `chat_message_join` rows above its join mark,
+  every row dated in the last 24 h (iMessage edits and unsends happen within
+  minutes, and outgoing rows get their date fixed just after insert), the
+  messages of handles and chats it has not seen before (sync can land them
+  after the rows that name them) and of chats whose conversation another
+  writer deleted from the store, and the whole `chat`, `handle` and
+  `chat_handle_join` tables, and recomputes only what those rows affect;
+- reads all of chat.db instead on its first call, when the path names a new
+  file, when a row at or below a mark is gone (the row at a mark changed, or
+  `COUNT(*)` is not the old count plus the rows above the mark), when a
+  known chat's guid or a known handle changed, and every 6 h.
+
+What it writes is a function of chat.db alone, the same for a poll, a first
+import and `openmessage import imessage`:
+
+- a conversation per chat, a message per row that has a body, is joined to
+  a chat and is not a reaction. A message joined to several chats lives in
+  the lowest chat ROWID;
+- reactions from chat.db's own `associated_message_type` (2000–2006 add,
+  3000–3006 remove) and `associated_message_guid` (`p:N/<guid>`,
+  `bp:<guid>`, or a bare guid), folded per target in (date, ROWID) order, one
+  reaction per person (`db.NativeReactionsJSON`, the same
+  `[{emoji,count,actors}]` JSON as everywhere else). Reaction rows get no row
+  of their own. A row with type 0 is a message whatever it says, so a typed
+  "Loved “hi”" stays text;
+- only the columns it owns (`internal/db/imessage_sync.go`), only where they
+  differ, in short `BEGIN IMMEDIATE` batches that re-check each row. It never
+  touches transcripts, media, reply ids, `mentions_me`, unread counts,
+  favorites, tabs or notification modes, and rows whose chat.db message was
+  deleted stay in the store.
+
+Startup `RepairTapbacks` (the SMS/RCS quote heuristic) skips iMessage rows.
+The first full read of a store an older importer filled therefore deletes
+the reaction text rows it left (unless something was attached to them),
+replaces reactions the heuristic guessed with the native ones, and restores
+typed rows that look like tapbacks, which the heuristic used to delete.
+
+SMS threads in chat.db carry reactions only as text ("Loved “…”" from an
+iPhone in a group with Android phones). Those rows are type 0, so they stay
+text: 398 such rows on Max's chat.db, all with service `SMS`.
+
+Measured on Max's chat.db (46,965 rows) into an in-memory store on
+2026-10-11, with `OPENMESSAGE_IMESSAGE_PROBE=1 go test ./internal/importer
+-run TestIMessageRealChatDBProbe -v` (read-only, prints counts and timings
+only):
+
+| | before | now |
+|---|---|---|
+| first import | 162 s | 3.5 s (42,214 messages, 2,020 chats, 1,461 messages with reactions) |
+| re-import of the unchanged chat.db | 334 s, every row rewritten | 0.36 s, nothing written |
+| poll, chat.db unchanged | (none) | 38 µs, skipped |
+| poll after a chat.db write that changed no message | | 14 ms |
+| poll over the newest 200 rows | | 37 ms |
+
+The 1,517 fewer message rows than the 43,731 that used to import are the
+reactions. On a synthetic 5,000-row chat with 833 reactions a one-message
+poll takes about 5 ms, and about 50 ms when every row is inside the 24 h
+window (`TestIMessageOneMessagePollStaysCheap`).
+
+The one change a poll does not see is an in-place edit to a message dated
+more than 24 h ago. Messages does not make those; the next full read
+(daemon start, or within 6 h) picks one up.
+
+From ed03e741 (2026-02-22) until #231 the importer also never returned: it
+held one SQLite connection and queried chat participants with the chat rows
+still open. #231 fixed that and the dropped chats whose `display_name` is
+NULL; #237 made the importer incremental and turned the poll back on. Its
+requirements were the findings of two review rounds on a first incremental
+design, withdrawn in #231.
+
 ## MCP serving — exactly one process may own live transports
 
 **The failure mode (empirically confirmed 2026-07-20):** `openmessage serve

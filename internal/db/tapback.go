@@ -130,9 +130,12 @@ func (s *Store) findTapbackTarget(conversationID, quoted string, beforeTS int64,
 	if quoted == "" {
 		return nil, nil
 	}
+	// iMessage rows are never targets: their reactions come only from
+	// chat.db's native reaction rows (see NativeReactionsJSON).
 	rows, err := s.db.Query(
 		`SELECT message_id, body, reactions FROM messages
 		 WHERE conversation_id = ? AND timestamp_ms <= ? AND TRIM(body) != ''
+		   AND source_platform != 'imessage'
 		 ORDER BY timestamp_ms DESC LIMIT 200`,
 		conversationID, beforeTS,
 	)
@@ -227,13 +230,19 @@ func mergeReaction(existingJSON, emoji, actor string, remove bool) (string, bool
 // RepairTapbacks converts already-stored tapback text messages into reactions
 // on their referenced messages and removes the standalone tapback rows. Returns
 // the number converted.
+//
+// It skips iMessage rows. chat.db marks its reactions natively, so the
+// iMessage importer never stores one as text, and a text row there that
+// reads like a tapback is a message someone typed.
 func (s *Store) RepairTapbacks() (int, error) {
 	rows, err := s.db.Query(`
 		SELECT message_id, conversation_id, sender_name, sender_number, body, timestamp_ms, is_from_me
 		FROM messages
-		WHERE body LIKE 'Loved %' OR body LIKE 'Liked %' OR body LIKE 'Disliked %'
+		WHERE source_platform != 'imessage'
+		  AND NOT (message_id >= 'imessage:' AND message_id < 'imessage;')
+		  AND (body LIKE 'Loved %' OR body LIKE 'Liked %' OR body LIKE 'Disliked %'
 		   OR body LIKE 'Laughed at %' OR body LIKE 'Emphasized %' OR body LIKE 'Questioned %'
-		   OR body LIKE 'Removed a %' OR body LIKE 'Reacted %'
+		   OR body LIKE 'Removed a %' OR body LIKE 'Reacted %')
 	`)
 	if err != nil {
 		return 0, err

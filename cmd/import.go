@@ -62,6 +62,7 @@ func RunImport(logger zerolog.Logger, source string, args []string) error {
 			myName = v
 		}
 		imp := &importer.IMessage{DBPath: dbPath, MyName: myName}
+		defer imp.Close()
 		result, err := imp.ImportFromDB(a.Store)
 		if err != nil {
 			return fmt.Errorf("import imessage: %w", err)

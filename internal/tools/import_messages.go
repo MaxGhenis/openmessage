@@ -72,6 +72,7 @@ func importMessagesHandler(a *app.App) server.ToolHandlerFunc {
 		case "imessage":
 			imp := &importer.IMessage{DBPath: path, MyName: name}
 			result, err = imp.ImportFromDB(a.Store)
+			imp.Close()
 
 		case "whatsapp":
 			if path == "" {
