@@ -108,7 +108,11 @@ func TestLikePatternUsesTrigramsMatchesFTS5(t *testing.T) {
 	}
 	r := rand.New(rand.NewSource(7))
 	pieces := []string{"a", "B", "%", "_", "é", "日", "😀", "\x00", "\x80", "\xc3", "\xff", " ", `\`, `"`}
-	for range 3000 {
+	patterns := 3000
+	if raceDetectorEnabled {
+		patterns = 300 // the race build checks concurrency, not this mirror
+	}
+	for range patterns {
 		var b strings.Builder
 		for range r.Intn(9) {
 			b.WriteString(pieces[r.Intn(len(pieces))])
@@ -436,12 +440,20 @@ func TestSearchIndexesFollowRepositoryWrites(t *testing.T) {
 		t.Fatalf("search in the target conversation after the move = %v", got)
 	}
 
+	// A repair delete merges a duplicate into a survivor with the same content.
+	duplicate := historical
+	duplicate.MessageID = "message-d"
+	duplicate.RemoteMessageID = "remote-d"
+	if inserted, err := repository.InsertHistoricalMessage(ctx, MessageProjection{Message: duplicate}); err != nil || !inserted {
+		t.Fatalf("InsertHistoricalMessage(duplicate) = %v, %v", inserted, err)
+	}
+	check("duplicate insert", "harbour", []string{"message-b", "message-d", "message-c"})
 	if err := store.ApplyRepairPlan(ctx, "account-a", []RepairStep{
-		{Op: "delete", MessageID: "message-c"},
+		{Op: "delete", MessageID: "message-d", SurvivorMessageID: "message-c"},
 	}, messageTestTimeMS+20); err != nil {
 		t.Fatalf("ApplyRepairPlan(delete): %v", err)
 	}
-	check("repair delete", "harbour", []string{"message-b"})
+	check("repair delete", "harbour", []string{"message-b", "message-c"})
 
 	if err := store.ApplyRepairPlan(ctx, "account-a", []RepairStep{
 		{Op: "meta", ConversationID: "conversation-b", Kind: "group", Title: "Harbour crew",

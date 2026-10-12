@@ -29,11 +29,13 @@ var searchTextPieces = []string{
 }
 
 // substringSearchQuickConfig runs the properties below over 30 random stores,
-// or 8 under -race: the race build exists to find data races, the properties
-// reach every path within a few stores, and the plain test run covers all 30.
+// or 4 under -race: the race build exists to find data races, the properties
+// reach every path and write shape within a few stores (they assert it), and
+// the plain test run covers all 30. The package's race run is close to Go's
+// 10-minute default timeout in CI.
 func substringSearchQuickConfig() *quick.Config {
 	if raceDetectorEnabled {
-		return &quick.Config{MaxCount: 8}
+		return &quick.Config{MaxCount: 4}
 	}
 	return readPlanQuickConfig
 }
