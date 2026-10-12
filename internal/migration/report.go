@@ -209,7 +209,10 @@ type ValidationReport struct {
 	SampledHashesMatched bool                  `json:"sampled_hashes_matched"`
 	BlobReferencesValid  bool                  `json:"blob_references_valid"`
 	SourceUnchanged      bool                  `json:"source_unchanged"`
-	Passed               bool                  `json:"passed"`
+	// SearchIndexesValid reports that each trigram search index equals its
+	// table after the transform wrote every row through the index triggers.
+	SearchIndexesValid bool `json:"search_indexes_valid"`
+	Passed             bool `json:"passed"`
 }
 
 type ForeignKeyViolation struct {

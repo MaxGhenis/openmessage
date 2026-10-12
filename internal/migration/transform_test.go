@@ -522,8 +522,8 @@ func assertFixtureReport(t *testing.T, report Report, sourceHash string) {
 			t.Errorf("source file evidence did not reconcile: %+v", file)
 		}
 	}
-	if report.Target.SchemaVersion != 11 || len(report.Target.MigrationChecksums) != 11 {
-		t.Fatalf("target schema = version %d with %d checksums, want version 11 with 11 checksums", report.Target.SchemaVersion, len(report.Target.MigrationChecksums))
+	if report.Target.SchemaVersion != 12 || len(report.Target.MigrationChecksums) != 12 {
+		t.Fatalf("target schema = version %d with %d checksums, want version 12 with 12 checksums", report.Target.SchemaVersion, len(report.Target.MigrationChecksums))
 	}
 	wantTargetCounts := map[string]int64{
 		"accounts": 5, "devices": 5, "people": 1, "person_identities": 2,
@@ -600,7 +600,8 @@ func assertFixtureReport(t *testing.T, report Report, sourceHash string) {
 	if report.Validation.QuickCheck != "ok" || len(report.Validation.ForeignKeyViolations) != 0 ||
 		orphanTotal(report.Validation.Orphans) != 0 || !report.Validation.CountsMatched ||
 		!report.Validation.SampledHashesMatched || !report.Validation.BlobReferencesValid ||
-		!report.Validation.SourceUnchanged || !report.Validation.Passed {
+		!report.Validation.SourceUnchanged || !report.Validation.SearchIndexesValid ||
+		!report.Validation.Passed {
 		t.Errorf("validation report = %+v", report.Validation)
 	}
 	for _, required := range []string{
