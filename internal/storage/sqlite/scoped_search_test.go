@@ -80,7 +80,7 @@ func TestTrigramMatchQuerySelectsFTS5LikeCandidates(t *testing.T) {
 	}
 	patterns := 3000
 	if raceDetectorEnabled {
-		patterns = 600
+		patterns = 300 // the race build checks concurrency, not this mirror
 	}
 	compared := 0
 	for i := range patterns {
@@ -292,6 +292,12 @@ func TestConversationSplitMatchesLikeProperty(t *testing.T) {
 // sender's statements keep the filter's subquery, so such a search still
 // returns the LIKE's rows, through the LIKE and through the index.
 func TestSenderSearchWithMoreIdentitiesThanParameters(t *testing.T) {
+	if raceDetectorEnabled {
+		// 84s under -race on a loaded host, for a check of data, not
+		// concurrency, that cannot shrink: it needs more identities than
+		// parameters. The plain test job runs it.
+		t.Skip("skipped under -race; the plain test run covers it")
+	}
 	ctx := context.Background()
 	store := openRepositoryTestStore(t)
 	repository := mustMessageRepository(t, store, 100)
