@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	"go.mau.fi/mautrix-gmessages/pkg/libgm/gmproto"
 )
@@ -141,7 +142,10 @@ func (c *googleCatchUp) storeMessage(
 			return
 		}
 	}
-	c.app.storeMessage(message)
+	if err := c.app.storeMessage(message); err != nil && c.progress != nil {
+		// A message the legacy store refused is a failed catch-up write.
+		c.progress.addError(fmt.Sprintf("store message %s: %v", message.GetMessageID(), err))
+	}
 }
 
 func (c *googleCatchUp) record(err error) {
