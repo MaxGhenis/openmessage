@@ -951,11 +951,6 @@ func (a *App) storeMessage(msg *gmproto.Message) {
 	body := client.ExtractMessageBody(msg)
 	senderName, senderNumber := client.ExtractSenderInfo(msg)
 
-	status := "unknown"
-	if ms := msg.GetMessageStatus(); ms != nil {
-		status = ms.GetStatus().String()
-	}
-
 	dbMsg := &db.Message{
 		MessageID:      msg.GetMessageID(),
 		ConversationID: msg.GetConversationID(),
@@ -963,7 +958,7 @@ func (a *App) storeMessage(msg *gmproto.Message) {
 		SenderNumber:   senderNumber,
 		Body:           body,
 		TimestampMS:    msg.GetTimestamp() / 1000,
-		Status:         status,
+		Status:         client.MessageStatusString(msg),
 		IsFromMe:       client.MessageIsFromMe(msg),
 		SourcePlatform: "sms",
 	}

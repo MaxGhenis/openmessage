@@ -499,10 +499,6 @@ func googleMessageIsEmptyStub(
 	media *client.MediaInfo,
 	reactions []client.Reaction,
 ) bool {
-	status := ""
-	if messageStatus := message.GetMessageStatus(); messageStatus != nil {
-		status = messageStatus.GetStatus().String()
-	}
 	mediaID := ""
 	if media != nil {
 		mediaID = media.MediaID
@@ -515,7 +511,7 @@ func googleMessageIsEmptyStub(
 		Body:      body,
 		MediaID:   mediaID,
 		Reactions: reactionMarker,
-		Status:    status,
+		Status:    client.MessageStatusString(message),
 	})
 }
 

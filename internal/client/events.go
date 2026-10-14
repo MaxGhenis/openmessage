@@ -151,11 +151,6 @@ func (h *EventHandler) handleMessage(evt *libgm.WrappedMessage) {
 	body := ExtractMessageBody(msg)
 	senderName, senderNumber := ExtractSenderInfo(msg)
 
-	status := "unknown"
-	if ms := msg.GetMessageStatus(); ms != nil {
-		status = ms.GetStatus().String()
-	}
-
 	dbMsg := &db.Message{
 		MessageID:      msg.GetMessageID(),
 		ConversationID: msg.GetConversationID(),
@@ -163,7 +158,7 @@ func (h *EventHandler) handleMessage(evt *libgm.WrappedMessage) {
 		SenderNumber:   senderNumber,
 		Body:           body,
 		TimestampMS:    msg.GetTimestamp() / 1000, // proto timestamp is microseconds
-		Status:         status,
+		Status:         MessageStatusString(msg),
 		IsFromMe:       MessageIsFromMe(msg),
 	}
 
