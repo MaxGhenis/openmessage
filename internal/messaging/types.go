@@ -172,4 +172,9 @@ func (t systemTimer) C() <-chan time.Time { return t.Timer.C }
 // operations through its application-facing API.
 type messageRepository interface {
 	GetMessage(context.Context, string) (sqlite.Message, error)
+	GetMessageByRemote(
+		ctx context.Context,
+		accountID, conversationID, remoteMessageID string,
+	) (sqlite.Message, error)
+	FirstAttachmentMIME(ctx context.Context, messageID string) (string, bool, error)
 }

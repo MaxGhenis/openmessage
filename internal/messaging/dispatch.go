@@ -185,6 +185,17 @@ func (s *MessageService) dispatchTextLease(ctx context.Context, outboxLease sqli
 			s.clock.Now().Add(s.retryDelay),
 		)
 	}
+	replyTo, code, err := s.replyRefForLease(ctx, item, message)
+	if err != nil {
+		return s.markPreCallFailure(
+			ctx,
+			item,
+			string(bridge.FailureTransient),
+			code,
+			err,
+			s.clock.Now().Add(s.retryDelay),
+		)
+	}
 
 	if err := s.outbox.MarkTransportCalled(ctx, sqlite.Attempt{
 		OutboxID:             item.OutboxID,
@@ -208,9 +219,7 @@ func (s *MessageService) dispatchTextLease(ctx context.Context, outboxLease sqli
 		Body:      message.Body,
 		RequestID: item.TransportRequestID,
 	}
-	if message.ReplyToRemoteID != nil {
-		request.ReplyTo = &bridge.MessageRef{RemoteID: *message.ReplyToRemoteID}
-	}
+	request.ReplyTo = replyTo
 	result, sendErr := dispatchLease.Text.SendText(ctx, request)
 	mutationCtx, cancel := s.storageMutationContext(ctx)
 	defer cancel()
@@ -323,6 +332,17 @@ func (s *MessageService) dispatchMediaLease(ctx context.Context, outboxLease sql
 			s.clock.Now().Add(s.retryDelay),
 		)
 	}
+	replyTo, code, err := s.replyRefForLease(ctx, item, message)
+	if err != nil {
+		return s.markPreCallFailure(
+			ctx,
+			item,
+			string(bridge.FailureTransient),
+			code,
+			err,
+			s.clock.Now().Add(s.retryDelay),
+		)
+	}
 
 	attachment, err := s.outbox.GetOutboxAttachment(ctx, item.OutboxID)
 	if err != nil {
@@ -383,9 +403,7 @@ func (s *MessageService) dispatchMediaLease(ctx context.Context, outboxLease sql
 		Caption:   message.Body,
 		RequestID: item.TransportRequestID,
 	}
-	if message.ReplyToRemoteID != nil {
-		request.ReplyTo = &bridge.MessageRef{RemoteID: *message.ReplyToRemoteID}
-	}
+	request.ReplyTo = replyTo
 	result, sendErr := dispatchLease.Media.SendMedia(ctx, request)
 	mutationCtx, cancel := s.storageMutationContext(ctx)
 	defer cancel()
@@ -717,23 +735,10 @@ func (s *MessageService) targetRefForLease(
 		)
 	}
 
-	authorID := ""
-	if target.SenderIdentityID != nil {
-		identity, err := s.store.GetIdentity(*target.SenderIdentityID)
-		if err != nil {
-			return bridge.MessageRef{}, "load_target_author", err
-		}
-		if identity.AccountID != item.AccountID {
-			return bridge.MessageRef{}, "load_target_author", fmt.Errorf(
-				"target author %q belongs to account %q",
-				identity.IdentityID,
-				identity.AccountID,
-			)
-		}
-		authorID = identity.CanonicalValue
+	authorID, err := s.messageAuthorID(item, target)
+	if err != nil {
+		return bridge.MessageRef{}, "load_target_author", err
 	}
-	// A nil sender marks an outgoing message authored by self, so an empty
-	// transport-neutral AuthorID preserves that distinction for adapter shims.
 	// Until echo reconciliation, an outgoing target's RemoteID remains its
 	// stable transport request ID.
 	return bridge.MessageRef{
