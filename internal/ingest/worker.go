@@ -906,6 +906,27 @@ func (w *Worker) refreshConversation(
 	if strings.TrimSpace(remoteID) == "" {
 		return sqlite.Conversation{}, fmt.Errorf("conversation remote ID is empty")
 	}
+	// Leave entries without a usable address off before anything reads the
+	// roster. One such entry used to fail IdentityKey and quarantine the whole
+	// snapshot, so a thread's kind, title and roster missed that update; and
+	// the roster written below and #176's rebinding
+	// (googleConversationEventTarget) now judge the same entries.
+	usable, unaddressable := addressableParticipants(accountID, platform, event.Participants)
+	event.Participants = usable
+	unaddressableSelf := 0
+	for _, participant := range unaddressable {
+		if participant.Identity.IsSelf {
+			unaddressableSelf++
+		}
+	}
+	if len(unaddressable) > 0 {
+		w.logger.Info().
+			Str("account_id", accountID).
+			Str("remote_conversation_id", remoteID).
+			Int("unaddressable", len(unaddressable)).
+			Int("unaddressable_self", unaddressableSelf).
+			Msg("Left conversation snapshot participants without a usable address off the roster")
+	}
 	type preparedParticipant struct {
 		participant bridge.Participant
 		role        sqlite.ParticipantRole
@@ -1035,6 +1056,38 @@ func (w *Worker) refreshConversation(
 			DisplayName:    item.participant.Identity.Name,
 			IsActive:       item.participant.Active,
 		})
+	}
+	if len(unaddressable) > 0 {
+		// A stored participant the snapshot doesn't name stays when it may be
+		// one of the entries the snapshot couldn't address. An entry flagged
+		// as the account can only be one of the account's own identities; any
+		// other entry could be anyone, the account included (#160 saw its
+		// number listed unflagged). A complete snapshot still replaces the
+		// roster.
+		stored, err := w.store.ListParticipants(conversation.ConversationID)
+		if err != nil {
+			return sqlite.Conversation{}, err
+		}
+		named := make(map[string]struct{}, len(participants))
+		for _, participant := range participants {
+			named[participant.IdentityID] = struct{}{}
+		}
+		peerUnaddressable := len(unaddressable) > unaddressableSelf
+		for _, participant := range stored {
+			if _, ok := named[participant.IdentityID]; ok {
+				continue
+			}
+			if !peerUnaddressable {
+				identity, err := w.store.GetIdentity(participant.IdentityID)
+				if err != nil {
+					return sqlite.Conversation{}, err
+				}
+				if !identity.IsSelf {
+					continue
+				}
+			}
+			participants = append(participants, participant)
+		}
 	}
 	if err := w.store.ReplaceConversationParticipants(conversation.ConversationID, participants); err != nil {
 		return sqlite.Conversation{}, err
