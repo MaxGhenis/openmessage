@@ -3,6 +3,8 @@ package db
 import (
 	"database/sql"
 	"fmt"
+	"net/url"
+	"path/filepath"
 	"strings"
 
 	_ "modernc.org/sqlite"
@@ -131,6 +133,44 @@ func New(dsn string) (*Store, error) {
 		return nil, fmt.Errorf("migrate: %w", err)
 	}
 	return s, nil
+}
+
+// OpenReadOnly opens an existing legacy database without running migrations,
+// repair statements, or WAL mode changes. Maintenance readers use this seam so
+// the legacy source remains immutable even when its schema predates the binary.
+func OpenReadOnly(path string) (*Store, error) {
+	if strings.TrimSpace(path) == "" {
+		return nil, fmt.Errorf("open read-only db: path is empty")
+	}
+	query := make(url.Values)
+	query.Set("mode", "ro")
+	dsn := (&url.URL{
+		Scheme:   "file",
+		Path:     filepath.ToSlash(path),
+		RawQuery: query.Encode(),
+	}).String()
+	database, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("open read-only db: %w", err)
+	}
+	database.SetMaxOpenConns(1)
+	closeWithError := func(openErr error) (*Store, error) {
+		_ = database.Close()
+		return nil, openErr
+	}
+	if err := database.Ping(); err != nil {
+		return closeWithError(fmt.Errorf("open read-only db connection: %w", err))
+	}
+	for _, pragma := range []string{
+		"PRAGMA query_only=ON",
+		"PRAGMA foreign_keys=ON",
+		"PRAGMA busy_timeout=5000",
+	} {
+		if _, err := database.Exec(pragma); err != nil {
+			return closeWithError(fmt.Errorf("configure read-only db: %w", err))
+		}
+	}
+	return &Store{db: database}, nil
 }
 
 func (s *Store) Close() error {
