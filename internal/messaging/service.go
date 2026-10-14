@@ -57,6 +57,10 @@ type PendingDelivery struct {
 	Summary        string
 	ErrorClass     string
 	ErrorCode      string
+	ErrorDetail    string
+	// RetryExhausted marks a rejected intent that gave up after its retry
+	// budget; the tray keeps it visible so the user can send it again.
+	RetryExhausted bool
 }
 
 // MessageService owns message intent submission and durable dispatch. Concrete
@@ -614,6 +618,8 @@ func (s *MessageService) ListPending(
 			Summary:        pendingSummary(row),
 			ErrorClass:     stringValue(row.ErrorClass),
 			ErrorCode:      stringValue(row.ErrorCode),
+			ErrorDetail:    stringValue(row.ErrorDetail),
+			RetryExhausted: retryExhausted(row.State, stringValue(row.ErrorClass)),
 		}
 		if row.NextAttemptAtMS != nil {
 			delivery.NextAttemptAt = time.UnixMilli(*row.NextAttemptAtMS)
@@ -1236,6 +1242,12 @@ func deliveryFromItem(item sqlite.OutboxItem) Delivery {
 		RemoteMessageID: stringValue(item.ResultRemoteID),
 		ErrorClass:      stringValue(item.ErrorClass),
 		ErrorCode:       stringValue(item.ErrorCode),
+		ErrorDetail:     stringValue(item.ErrorDetail),
+		AttemptCount:    item.AttemptCount,
+		RetryExhausted:  retryExhausted(item.State, stringValue(item.ErrorClass)),
+	}
+	if item.State == sqlite.OutboxNotDispatched && item.NextAttemptAtMS != nil {
+		delivery.NextAttemptAt = time.UnixMilli(*item.NextAttemptAtMS)
 	}
 	if item.State == sqlite.OutboxUncertain {
 		delivery.Warning = "delivery outcome is unknown"

@@ -37,6 +37,7 @@ type EventHandler struct {
 	OnConversationsChange    func()
 	OnSessionInvalid         OnSessionInvalid
 	OnConnectionLost         OnConnectionLost
+	OnAccountChange          func(*events.AccountChange)
 	OnIncomingMessage        func(*db.Message)
 	OnPendingMedia           func(conversationID, messageID string)
 	OnMessagesChange         func(string)
@@ -116,6 +117,23 @@ func (h *EventHandler) Handle(rawEvt any) {
 		}
 		if h.OnRealtimeGapRecovered != nil {
 			h.OnRealtimeGapRecovered("phone_responding_again")
+		}
+	case *events.AccountChange:
+		// libgm raises this for a real account-change update and, with IsFake,
+		// for a frame whose only payload is the encrypted account container
+		// (mautrix-gmessages reads either as a switch to Google-account
+		// pairing). It says nothing about the connection itself, so the owner
+		// decides what it means for this session; the handler only reports it.
+		if evt == nil {
+			return
+		}
+		h.Logger.Warn().
+			Str("account", evt.GetAccount()).
+			Bool("enabled", evt.GetEnabled()).
+			Bool("fake", evt.IsFake).
+			Msg("Google Messages reported an account pairing change")
+		if h.OnAccountChange != nil {
+			h.OnAccountChange(evt)
 		}
 	case *gmproto.TypingData:
 		h.handleTyping(evt)
