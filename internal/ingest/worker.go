@@ -103,9 +103,36 @@ type Worker struct {
 	changeMu sync.Mutex
 	changed  chan struct{}
 
+	// retries holds the frames that exhausted their transient retries in this
+	// process, by inbox ID, with the earliest time a drain may try each again.
+	// Only the Run goroutine touches it. The frames stay unprocessed in the
+	// inbox; this only spaces out their retries.
+	retries map[string]frameRetry
+	// retryNow, retryBase and retryMax drive that backoff; tests shorten them.
+	retryNow  func() time.Time
+	retryBase time.Duration
+	retryMax  time.Duration
+
 	// fault lets tests inject a storage failure at a named point between two
 	// of a frame's commits (see faultAt). Nil outside tests.
 	fault func(point string) error
+}
+
+const (
+	// drainPageSize bounds the frame positions one drain query reads. Payloads
+	// are loaded one frame at a time.
+	drainPageSize = 256
+	// A frame left unprocessed after exhausting its transient retries waits
+	// retryBaseDelay before its next attempt, doubling per failure up to
+	// retryMaxDelay.
+	retryBaseDelay = time.Second
+	retryMaxDelay  = 5 * time.Minute
+)
+
+// frameRetry is one deferred frame's backoff state.
+type frameRetry struct {
+	failures  int
+	notBefore time.Time
 }
 
 // faultAt returns the injected failure for point, if a test set one.
@@ -184,6 +211,10 @@ func NewWorker(config WorkerConfig) (*Worker, error) {
 		decoders:  decoders,
 		work:      make(chan workItem, config.QueueCapacity),
 		changed:   make(chan struct{}),
+		retries:   make(map[string]frameRetry),
+		retryNow:  time.Now,
+		retryBase: retryBaseDelay,
+		retryMax:  retryMaxDelay,
 	}, nil
 }
 
@@ -191,7 +222,8 @@ func NewWorker(config WorkerConfig) (*Worker, error) {
 func (w *Worker) Counters() *Counters { return w.counters }
 
 // Run performs a startup crash-recovery drain, then consumes non-blocking sink
-// notifications. Only one Run call may be active at a time.
+// notifications, and drains again when a deferred frame's backoff ends. Only
+// one Run call may be active at a time.
 func (w *Worker) Run(ctx context.Context) error {
 	if ctx == nil {
 		return fmt.Errorf("run ingest worker: context is nil")
@@ -201,20 +233,32 @@ func (w *Worker) Run(ctx context.Context) error {
 	}
 	defer w.running.Store(false)
 
+	retryTimer := time.NewTimer(time.Hour)
+	retryTimer.Stop()
+	defer retryTimer.Stop()
 	w.drain(ctx)
 	for {
+		var retryDue <-chan time.Time
+		if due, waiting := w.nextRetry(); waiting {
+			retryTimer.Reset(max(due.Sub(w.retryNow()), 0))
+			retryDue = retryTimer.C
+		}
 		select {
 		case <-ctx.Done():
 			return nil
 		case item := <-w.work:
 			// New records are loaded from durable storage. A deduplicated replay
-			// is absent from Unprocessed once processed, so re-decode the stable
-			// dedupe-equivalent frame to exercise stale-replay classification.
+			// is absent from the unprocessed index once processed, so re-decode
+			// the stable dedupe-equivalent frame to exercise stale-replay
+			// classification.
 			if item.replay {
 				w.handleRecord(ctx, item.inboxID, item.record)
 			}
 			w.drain(ctx)
+		case <-retryDue:
+			w.drain(ctx)
 		}
+		retryTimer.Stop()
 	}
 }
 
@@ -244,31 +288,114 @@ func (w *Worker) Changes() <-chan struct{} {
 	return w.changeChannel()
 }
 
+// drain projects every unprocessed frame in receipt order. It pages through
+// frame positions on the unprocessed index and loads one frame at a time, so a
+// frame still waiting out its retry backoff costs the row read that lists it,
+// not a decode and apply. No frame is ever dropped: one that exhausts its
+// transient retries stays unprocessed and is retried once its backoff ends
+// (Run wakes for it), and the first drain after a restart retries it at once.
 func (w *Worker) drain(ctx context.Context) {
-	var records []sqlite.InboxRecord
+	now := w.retryNow()
+	var cursor sqlite.InboxCursor
+	listed := make(map[string]struct{}, len(w.retries))
+	for {
+		var page []sqlite.InboxCursor
+		err := retryTransient(ctx, func() error {
+			var err error
+			page, err = w.messages.UnprocessedAfter(ctx, cursor, drainPageSize)
+			return err
+		})
+		if err != nil {
+			if ctx.Err() == nil {
+				w.logger.Warn().Err(err).Msg("Failed to list unprocessed ingest frames")
+			}
+			return
+		}
+		changed := false
+		for _, position := range page {
+			if ctx.Err() != nil {
+				return
+			}
+			cursor = position
+			listed[position.InboxID] = struct{}{}
+			if retry, waiting := w.retries[position.InboxID]; waiting && now.Before(retry.notBefore) {
+				continue
+			}
+			frameChanged, deferred := w.drainFrame(ctx, position.InboxID)
+			if frameChanged {
+				changed = true
+			}
+			if deferred {
+				w.deferRetry(position.InboxID)
+			} else {
+				delete(w.retries, position.InboxID)
+			}
+		}
+		if changed {
+			w.signalChange()
+		}
+		if len(page) < drainPageSize {
+			break
+		}
+	}
+	// The pass listed every unprocessed frame, so a deferred frame it did not
+	// list has been processed since (a replay, another worker): forget it.
+	for inboxID := range w.retries {
+		if _, unprocessed := listed[inboxID]; !unprocessed {
+			delete(w.retries, inboxID)
+		}
+	}
+}
+
+// drainFrame loads and handles one listed frame. deferred reports that the
+// frame is still unprocessed and should wait out a backoff before the next
+// attempt: its projection exhausted its transient retries, or it could not be
+// loaded.
+func (w *Worker) drainFrame(ctx context.Context, inboxID string) (changed bool, deferred bool) {
+	var record sqlite.InboxRecord
+	var found bool
 	err := retryTransient(ctx, func() error {
 		var err error
-		records, err = w.messages.Unprocessed(ctx)
+		record, found, err = w.messages.UnprocessedRecord(ctx, inboxID)
 		return err
 	})
 	if err != nil {
-		if ctx.Err() == nil {
-			w.logger.Warn().Err(err).Msg("Failed to list unprocessed ingest frames")
-		}
-		return
-	}
-	changed := false
-	for _, record := range records {
 		if ctx.Err() != nil {
-			return
+			return false, false
 		}
-		if w.handleRecord(ctx, record.InboxID, rawIngressRecord(record)) {
-			changed = true
+		w.logger.Warn().Err(err).Str("inbox_id", inboxID).Msg("Failed to load unprocessed ingest frame; retrying later")
+		return false, true
+	}
+	if !found {
+		return false, false
+	}
+	return w.handleRecordOutcome(ctx, record.InboxID, rawIngressRecord(record))
+}
+
+// deferRetry schedules a deferred frame's next attempt: retryBase after its
+// first failure, doubling per failure, capped at retryMax.
+func (w *Worker) deferRetry(inboxID string) {
+	retry := w.retries[inboxID]
+	retry.failures++
+	delay := w.retryMax
+	if shift := retry.failures - 1; shift < 32 && w.retryBase<<shift < w.retryMax && w.retryBase<<shift > 0 {
+		delay = w.retryBase << shift
+	}
+	retry.notBefore = w.retryNow().Add(delay)
+	w.retries[inboxID] = retry
+}
+
+// nextRetry returns the earliest time a deferred frame may be retried.
+func (w *Worker) nextRetry() (time.Time, bool) {
+	var earliest time.Time
+	waiting := false
+	for _, retry := range w.retries {
+		if !waiting || retry.notBefore.Before(earliest) {
+			earliest = retry.notBefore
+			waiting = true
 		}
 	}
-	if changed {
-		w.signalChange()
-	}
+	return earliest, waiting
 }
 
 func rawIngressRecord(record sqlite.InboxRecord) bridge.RawIngressRecord {
@@ -288,9 +415,22 @@ func (w *Worker) handleRecord(
 	inboxID string,
 	record bridge.RawIngressRecord,
 ) (changed bool) {
+	changed, _ = w.handleRecordOutcome(ctx, inboxID, record)
+	return changed
+}
+
+// handleRecordOutcome applies one frame. deferred reports that the frame
+// exhausted its transient retries and was left unprocessed for a later
+// attempt.
+func (w *Worker) handleRecordOutcome(
+	ctx context.Context,
+	inboxID string,
+	record bridge.RawIngressRecord,
+) (changed bool, deferred bool) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			changed = false
+			deferred = false
 			w.markQuarantined(ctx, inboxID, record, fmt.Errorf(
 				"ingest frame panic: %v\n%s",
 				recovered,
@@ -307,7 +447,7 @@ func (w *Worker) handleRecord(
 		return err
 	})
 	if err == nil || ctx.Err() != nil {
-		return changed
+		return changed, false
 	}
 	partialChanged := changed
 	changed = false
@@ -321,28 +461,29 @@ func (w *Worker) handleRecord(
 			Str("inbox_id", inboxID).
 			Str("codec", record.Codec).
 			Msg("Ignored stale ingest replay")
-		return false
+		return false, false
 	}
 
 	var deterministic quarantineError
 	if errors.As(err, &deterministic) {
 		w.markQuarantined(ctx, inboxID, record, deterministic.cause)
-		return partialChanged
+		return partialChanged, false
 	}
 
 	var exhausted transientExhaustedError
 	if errors.As(err, &exhausted) || isTransientDBError(err) {
+		w.counters.account(record.AccountID).deferred.Add(1)
 		w.logger.Warn().
 			Err(err).
 			Str("account_id", record.AccountID).
 			Str("inbox_id", inboxID).
 			Str("codec", record.Codec).
-			Msg("Ingest projection exhausted transient retries; leaving frame unprocessed")
-		return partialChanged
+			Msg("Ingest projection exhausted transient retries; leaving frame unprocessed for a later retry")
+		return partialChanged, true
 	}
 
 	w.markQuarantined(ctx, inboxID, record, err)
-	return partialChanged
+	return partialChanged, false
 }
 
 func (w *Worker) markQuarantined(
@@ -973,6 +1114,9 @@ func (w *Worker) refreshConversation(
 			err,
 		)
 	}
+	// A snapshot that matches the stored row writes nothing; only a new
+	// thread, or a kind, title or revision change, is upserted.
+	write := true
 	if errors.Is(err, sqlite.ErrNotFound) {
 		kind, kindErr := conversationKind(event.Kind, sqlite.ConversationKindDirect)
 		if kindErr != nil {
@@ -997,6 +1141,7 @@ func (w *Worker) refreshConversation(
 	} else if err != nil {
 		return sqlite.Conversation{}, err
 	} else {
+		stored := conversation
 		if strings.TrimSpace(event.Kind) != "" {
 			kind, kindErr := conversationKind(event.Kind, conversation.Kind)
 			if kindErr != nil {
@@ -1007,16 +1152,23 @@ func (w *Worker) refreshConversation(
 		conversation.Title = event.Title
 		conversation.RemoteRevision = optionalTrimmed(event.RemoteRevision)
 		conversation.UpdatedAtMS = nowMS
+		write = conversation.Kind != stored.Kind ||
+			conversation.Title != stored.Title ||
+			!optionalStringEqual(conversation.RemoteRevision, stored.RemoteRevision)
 	}
-	if err := w.store.UpsertConversation(conversation); err != nil {
-		return sqlite.Conversation{}, err
+	if write {
+		if err := w.store.UpsertConversation(conversation); err != nil {
+			return sqlite.Conversation{}, err
+		}
 	}
 	if err := w.faultAt("conversation-upserted"); err != nil {
 		return sqlite.Conversation{}, err
 	}
-	conversation, err = w.store.GetConversationByRemote(accountID, remoteID)
-	if err != nil {
-		return sqlite.Conversation{}, err
+	if write {
+		conversation, err = w.store.GetConversationByRemote(accountID, remoteID)
+		if err != nil {
+			return sqlite.Conversation{}, err
+		}
 	}
 
 	participants := make([]sqlite.ConversationParticipant, 0, len(prepared))
@@ -1036,10 +1188,20 @@ func (w *Worker) refreshConversation(
 			IsActive:       item.participant.Active,
 		})
 	}
-	if err := w.store.ReplaceConversationParticipants(conversation.ConversationID, participants); err != nil {
+	// Only roster rows that differ are written. A roster change also moves the
+	// conversation's updated_at_ms when its row was unchanged, which the
+	// id-space repair's clobber detection relies on.
+	if _, err := w.store.SyncConversationParticipants(conversation.ConversationID, participants, nowMS); err != nil {
 		return sqlite.Conversation{}, err
 	}
 	return conversation, nil
+}
+
+func optionalStringEqual(left, right *string) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return *left == *right
 }
 
 func (w *Worker) ensureMessageConversation(
@@ -1414,11 +1576,19 @@ func (w *Worker) resolveIdentityFor(
 	} else if err != nil {
 		return sqlite.Identity{}, err
 	} else {
+		stored := identity
 		identity.RawValue = raw
 		if name := strings.TrimSpace(reference.Name); name != "" {
 			identity.DisplayName = name
 		}
 		identity.IsSelf = identity.IsSelf || reference.IsSelf
+		if identity.RawValue == stored.RawValue &&
+			identity.DisplayName == stored.DisplayName &&
+			identity.IsSelf == stored.IsSelf {
+			// The reference names the identity exactly as stored, so the
+			// upsert would change nothing: skip it and the re-read.
+			return stored, nil
+		}
 		identity.UpdatedAtMS = nowMS
 	}
 	if err := w.store.UpsertIdentity(identity); err != nil {

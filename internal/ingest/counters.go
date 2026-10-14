@@ -8,7 +8,9 @@ import (
 // CounterSnapshot is the externally consumable, point-in-time view of one
 // account's ingest activity. Echo outcomes mirror messaging.EchoOutcome;
 // EchoErrors counts reconcile faults that were absorbed without blocking
-// projection of the inbound message.
+// projection of the inbound message. Deferred counts frame attempts that
+// exhausted their transient storage retries; each such frame stays
+// unprocessed and is retried after a backoff.
 type CounterSnapshot struct {
 	Appended          uint64 `json:"appended"`
 	Deduped           uint64 `json:"deduped"`
@@ -25,6 +27,7 @@ type CounterSnapshot struct {
 	ReceiptsDropped   uint64 `json:"receipts_dropped"`
 	AppendErrors      uint64 `json:"append_errors"`
 	Quarantined       uint64 `json:"quarantined"`
+	Deferred          uint64 `json:"deferred"`
 	StaleReplays      uint64 `json:"stale_replays"`
 	EchoReconciled    uint64 `json:"echo_reconciled"`
 	EchoEnriched      uint64 `json:"echo_enriched"`
@@ -71,6 +74,7 @@ type accountCounters struct {
 	receiptsDropped     atomic.Uint64
 	appendErrors        atomic.Uint64
 	quarantined         atomic.Uint64
+	deferred            atomic.Uint64
 	staleReplays        atomic.Uint64
 	echoReconciled      atomic.Uint64
 	echoEnriched        atomic.Uint64
@@ -162,6 +166,7 @@ func snapshotCounters(c *accountCounters) CounterSnapshot {
 		ReceiptsDropped:     c.receiptsDropped.Load(),
 		AppendErrors:        c.appendErrors.Load(),
 		Quarantined:         c.quarantined.Load(),
+		Deferred:            c.deferred.Load(),
 		StaleReplays:        c.staleReplays.Load(),
 		EchoReconciled:      c.echoReconciled.Load(),
 		EchoEnriched:        c.echoEnriched.Load(),

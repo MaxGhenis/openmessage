@@ -380,12 +380,17 @@ func (r *ReactionRepository) ReplaceEmbeddedReactions(
 	}
 	changes.Removed = int(affected)
 
+	// The fence advances on every accepted snapshot, empty ones included: an
+	// empty snapshot's fence is what keeps an older one carrying reactions (a
+	// frame retried after a transient failure) from resurrecting them later.
+	// Only a snapshot at the fence's own sequence leaves it unchanged.
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO reaction_snapshot_fences (message_id, source_seq_ms, updated_at_ms)
 		VALUES (?, ?, ?)
 		ON CONFLICT(message_id) DO UPDATE SET
 			source_seq_ms = excluded.source_seq_ms,
 			updated_at_ms = excluded.updated_at_ms
+		WHERE excluded.source_seq_ms IS NOT reaction_snapshot_fences.source_seq_ms
 	`, messageID, sourceSeqMS, nowMS); err != nil {
 		return changes, fmt.Errorf(
 			"replace embedded reactions for message %q: write source fence: %w",
