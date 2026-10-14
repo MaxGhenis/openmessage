@@ -2126,10 +2126,10 @@ func TestHistoryShallowBackfillTeesFirstPageThroughGMClient(t *testing.T) {
 	for _, id := range []string{"s1", "s2", "s3", "s4-page2", "s5-archive"} {
 		convs = append(convs, makeConv(id, "Shallow "+id))
 		var first, second []*gmproto.Message
-		for i := 0; i < 25; i++ { // newest first
+		for i := 0; i < 35; i++ { // newest first
 			first = append(first, makeMsg(fmt.Sprintf("%s-%02d", id, i), id, fmt.Sprintf("%s body %d", id, i), ms-int64(i)*1000))
 		}
-		for i := 25; i < 35; i++ {
+		for i := 35; i < 45; i++ {
 			second = append(second, makeMsg(fmt.Sprintf("%s-%02d", id, i), id, fmt.Sprintf("%s body %d", id, i), ms-int64(i)*1000))
 		}
 		messages[id] = [][]*gmproto.Message{first, second}
@@ -2156,7 +2156,13 @@ func TestHistoryShallowBackfillTeesFirstPageThroughGMClient(t *testing.T) {
 	if want := []hcdListCall{{Count: 100, Folder: gmproto.ListConversationsRequest_INBOX}}; !reflect.DeepEqual(gm.listCalls, want) {
 		t.Errorf("list calls = %+v, want one INBOX first-page call for 100", gm.listCalls)
 	}
-	wantFetches := []hcdFetchCall{{"s1", 20, ""}, {"s2", 20, ""}, {"s3", 20, ""}}
+	// No conversation has a local boundary, so each gets one page of the
+	// reconcile's size, which the phone trims to that count.
+	wantFetches := []hcdFetchCall{
+		{"s1", recentReconcileMessageLimit, ""},
+		{"s2", recentReconcileMessageLimit, ""},
+		{"s3", recentReconcileMessageLimit, ""},
+	}
 	if !reflect.DeepEqual(gm.fetches, wantFetches) {
 		t.Errorf("fetch calls = %+v, want %+v", gm.fetches, wantFetches)
 	}
@@ -2179,29 +2185,29 @@ func TestHistoryShallowBackfillTeesFirstPageThroughGMClient(t *testing.T) {
 	if !reflect.DeepEqual(convOffers, []string{"s1", "s2", "s3"}) {
 		t.Errorf("conversation offers = %v, want [s1 s2 s3]", convOffers)
 	}
-	if want := map[string]int{"s1": 20, "s2": 20, "s3": 20}; !reflect.DeepEqual(perConversation, want) {
+	if want := map[string]int{"s1": 30, "s2": 30, "s3": 30}; !reflect.DeepEqual(perConversation, want) {
 		t.Errorf("message offers per conversation = %v, want %v", perConversation, want)
 	}
 
 	stored := hcdV2Messages(t, v2.inspect)
 	legacy := hcdLegacyMessages(t, legacyDB)
-	if len(stored) != 60 || len(legacy) != 60 {
-		t.Errorf("v2 holds %d messages and legacy %d, want 60 each", len(stored), len(legacy))
+	if len(stored) != 90 || len(legacy) != 90 {
+		t.Errorf("v2 holds %d messages and legacy %d, want 90 each", len(stored), len(legacy))
 	}
 	for _, id := range []string{"s1", "s2", "s3"} {
-		for i := 0; i < 20; i++ {
+		for i := 0; i < 30; i++ {
 			remoteID := fmt.Sprintf("%s-%02d", id, i)
 			if v := stored[remoteID]; v == nil || v.RemoteConversationID != id || v.Body != legacy[remoteID].Body {
 				t.Errorf("v2 lacks or misfiles %s: %+v", remoteID, v)
 			}
 		}
-		if _, ok := stored[fmt.Sprintf("%s-20", id)]; ok {
-			t.Errorf("v2 holds %s-20, beyond the 20 the shallow backfill asked for", id)
+		if _, ok := stored[fmt.Sprintf("%s-30", id)]; ok {
+			t.Errorf("v2 holds %s-30, beyond the 30 the shallow backfill asked for", id)
 		}
 	}
 	c := v2.snapshot()
-	if c.HistoryAppended != 63 || c.HistoryImported != 60 || c.HistoryConversations != 3 {
-		t.Errorf("history_appended=%d history_imported=%d history_conversations=%d, want 63/60/3",
+	if c.HistoryAppended != 93 || c.HistoryImported != 90 || c.HistoryConversations != 3 {
+		t.Errorf("history_appended=%d history_imported=%d history_conversations=%d, want 93/90/3",
 			c.HistoryAppended, c.HistoryImported, c.HistoryConversations)
 	}
 	if c.Appended != 0 || c.Projected != 0 {

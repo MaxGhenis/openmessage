@@ -18,8 +18,14 @@ import (
 
 const (
 	recentReconcileConversationLimit = 50
-	recentReconcileMessageLimit      = 30
-	recentReconcileMaxPages          = 4
+	// recentReconcileMessageLimit is the page size, and recentReconcileMaxPages
+	// the page bound, with which the recent reconcile and the startup backfill
+	// page each conversation down to its local boundary.
+	recentReconcileMessageLimit = 30
+	recentReconcileMaxPages     = 4
+	// startupBackfillConversationLimit is how many inbox conversations the
+	// startup backfill catches up.
+	startupBackfillConversationLimit = 100
 	// windowBackfillMaxPages bounds one conversation's paging in a window
 	// backfill (50 messages a page), so a reply that never crosses the window
 	// boundary cannot page forever.
@@ -57,8 +63,14 @@ func (a *App) abortBackfillForGoogleAuthError(err error, phase, detail string) b
 	return true
 }
 
-// Backfill fetches existing conversations and recent messages from
-// Google Messages and stores them in the local database.
+// Backfill is the startup catch-up: it lists the newest
+// startupBackfillConversationLimit inbox conversations and catches each one up
+// exactly as the recent reconcile does (catchUpConversationToBoundary): it pages
+// the conversation down to the newest message the legacy store already holds,
+// then stores what it fetched oldest first. It used to store each
+// conversation's newest 20 messages: after a stall that left more than 20 new
+// messages in a conversation, that moved the boundary above the rest, where no
+// later reconcile looks.
 func (a *App) Backfill() error {
 	if !a.beginBackfill() {
 		return fmt.Errorf("backfill already running")
@@ -73,7 +85,7 @@ func (a *App) Backfill() error {
 
 	a.Logger.Info().Msg("Starting backfill of conversations and messages")
 
-	resp, err := catchUp.gm.ListConversationsWithCursor(100, gmproto.ListConversationsRequest_INBOX, nil)
+	resp, err := catchUp.gm.ListConversationsWithCursor(startupBackfillConversationLimit, gmproto.ListConversationsRequest_INBOX, nil)
 	a.recordGoogleListPull(catchUp.token, "backfill", gmproto.ListConversationsRequest_INBOX, true, resp, err)
 	if err != nil {
 		a.HandleGoogleAuthExpiredError(err)
@@ -92,17 +104,12 @@ func (a *App) Backfill() error {
 			continue
 		}
 
-		msgResp, err := catchUp.gm.FetchMessages(conv.GetConversationID(), 20, nil)
-		if err != nil {
-			if a.HandleGoogleAuthExpiredError(err) {
-				return fmt.Errorf("fetch messages %s: %w", conv.GetConversationID(), err)
-			}
-			a.Logger.Warn().Err(err).Str("conv_id", conv.GetConversationID()).Msg("Failed to fetch messages")
-			continue
-		}
-
-		for _, msg := range oldestFirst(msgResp.GetMessages()) {
-			catchUp.storeMessage(conv.GetConversationID(), conv, msg)
+		if _, err := a.catchUpConversationToBoundary(catchUp, conv); err != nil {
+			// Nothing of this conversation was stored, so its boundary is where
+			// it was and the next reconcile catches it up.
+			a.emitConversationsChange()
+			a.emitMessagesChange("")
+			return fmt.Errorf("fetch messages %s: %w", conv.GetConversationID(), err)
 		}
 	}
 
@@ -390,7 +397,9 @@ func (a *App) paginateFolder(
 // the conversation is exhausted. With stopBeforeMS == 0 it fetches every page
 // the phone hands a cursor for. conv is the conversation's listed snapshot
 // (nil when the caller has none). It reports the number of messages fetched
-// and whether the catch-up must abort.
+// and whether the catch-up must abort. A run that pages the conversation down
+// to a recorded history gap's boundary, or until the phone has nothing older,
+// clears that gap (clearGoogleHistoryGapCovered).
 func (a *App) deepBackfillConversationWithToken(
 	catchUp *googleCatchUp,
 	convID string,
@@ -404,6 +413,12 @@ func (a *App) deepBackfillConversationWithToken(
 	// a cursor this loop built because the reply had none.
 	seen := map[string]bool{}
 	synthesized := false
+	// oldestStoredMS is the oldest message stored so far, and exhausted is set
+	// when the phone answered with an empty page after stored ones: the pages
+	// are contiguous from the newest message down, so together they say how far
+	// down this run fetched everything.
+	var oldestStoredMS int64
+	exhausted := false
 
 	for page := 0; ; page++ {
 		if catchUp.shouldAbort("messages") {
@@ -425,6 +440,11 @@ func (a *App) deepBackfillConversationWithToken(
 		}
 
 		msgs := resp.GetMessages()
+		if len(msgs) == 0 {
+			// The phone has nothing (older) to give.
+			exhausted = total > 0
+			break
+		}
 		if windowed {
 			fresh := make([]*gmproto.Message, 0, len(msgs))
 			for _, msg := range msgs {
@@ -453,6 +473,9 @@ func (a *App) deepBackfillConversationWithToken(
 			total++
 			if windowed {
 				seen[msg.GetMessageID()] = true
+			}
+			if ts := msg.GetTimestamp() / 1000; ts > 0 && (oldestStoredMS == 0 || ts < oldestStoredMS) {
+				oldestStoredMS = ts
 			}
 			// Only a real (positive) timestamp can place a message before the
 			// window; a message with no timestamp says nothing about where
@@ -494,6 +517,11 @@ func (a *App) deepBackfillConversationWithToken(
 			Str("conv_id", convID).
 			Int("messages", total).
 			Msg("Deep backfill: conversation complete")
+	}
+	// A generation that ended partway through a page refused that page's
+	// newer messages, so what was stored is no longer contiguous.
+	if !catchUp.closed {
+		a.clearGoogleHistoryGapCovered(convID, oldestStoredMS, exhausted)
 	}
 
 	return total, false
@@ -704,9 +732,9 @@ func (a *App) reconcileRecentConversations(reason string) {
 			changed = true
 		}
 
-		storedMessages, aborted := a.reconcileRecentConversationMessages(catchUp, conv)
-		if aborted {
-			a.Logger.Warn().Str("reason", reason).Str("conv_id", conv.GetConversationID()).Msg("Recent reconcile aborted while fetching messages")
+		storedMessages, err := a.catchUpConversationToBoundary(catchUp, conv)
+		if err != nil {
+			a.Logger.Warn().Err(err).Str("reason", reason).Str("conv_id", conv.GetConversationID()).Msg("Recent reconcile aborted while fetching messages")
 			return
 		}
 		if storedMessages {
@@ -720,74 +748,178 @@ func (a *App) reconcileRecentConversations(reason string) {
 	}
 }
 
-func (a *App) reconcileRecentConversationMessages(catchUp *googleCatchUp, conv *gmproto.Conversation) (bool, bool) {
+// errGoogleCatchUpStopped reports that a catch-up stopped between pages
+// because its client changed or its connection generation ended.
+var errGoogleCatchUpStopped = errors.New("google catch-up stopped: the client changed or its connection generation ended")
+
+// catchUpConversationToBoundary is the per-conversation step of the recent
+// reconcile and the startup backfill. It reads the conversation's boundary (the
+// newest message the legacy store holds), fetches every page down to it
+// (fetchDownToBoundary), and only then stores what it fetched, oldest first.
+// The next reconcile pages down only to the newest stored message, so whatever
+// this one stores must reach down to the boundary without a hole: a run that
+// stops partway through storing (its connection generation ended) leaves
+// everything it did not store above what it stored, where the next reconcile
+// fetches it. Storing page by page, newest first, left a hole below the stored
+// pages that no reconcile revisits.
+//
+// When paging stops before reaching the boundary (the page bound, a failed
+// later page, a phone that pages no further), the fetched messages are stored
+// anyway, so the newest ones show up, and the range between the boundary and
+// the oldest of them is recorded as a history gap (history_gaps.go) instead of
+// being hidden.
+//
+// It reports whether it stored any messages. A non-nil error means the
+// catch-up must stop (the client changed, its generation ended between pages,
+// or Google auth expired); nothing of this conversation was stored then.
+func (a *App) catchUpConversationToBoundary(catchUp *googleCatchUp, conv *gmproto.Conversation) (bool, error) {
 	convID := conv.GetConversationID()
+	var boundaryMS int64
+	var boundaryID string
 	localLatest, err := a.Store.GetMessagesByConversation(convID, 1)
 	if err != nil {
-		a.Logger.Warn().Err(err).Str("conv_id", convID).Msg("Recent reconcile: read local boundary failed")
+		a.Logger.Warn().Err(err).Str("conv_id", convID).Msg("Google catch-up: read local boundary failed")
 	}
-
-	var (
-		localLatestTS int64
-		localLatestID string
-		cursor        *gmproto.Cursor
-	)
 	if len(localLatest) > 0 {
-		localLatestTS = localLatest[0].TimestampMS
-		localLatestID = localLatest[0].MessageID
+		boundaryMS = localLatest[0].TimestampMS
+		boundaryID = localLatest[0].MessageID
 	}
 
-	// Fetch every page down to the newest stored message before storing any,
-	// then store them oldest first. The next reconcile pages down only to the
-	// newest stored message, so whatever this one stores must reach down to
-	// that boundary without a hole: a run that stops partway (its connection
-	// generation ended) then leaves everything it did not store above what it
-	// stored, where the next reconcile fetches it. Storing page by page, newest
-	// first, left a hole below the stored pages that no reconcile revisits.
-	var fetched []*gmproto.Message
+	fetched, gapReason, err := a.fetchDownToBoundary(catchUp, convID, boundaryMS, boundaryID)
+	if err != nil {
+		return false, err
+	}
+	if len(fetched) == 0 {
+		return false, nil
+	}
+
+	stored := 0
+	var oldestStoredMS int64
+	for _, msg := range oldestFirst(fetched) {
+		catchUp.storeMessage(convID, conv, msg)
+		if catchUp.closed {
+			// Refused: its generation ended, so it is in neither store, and
+			// neither is anything newer.
+			break
+		}
+		stored++
+		if ts := msg.GetTimestamp() / 1000; ts > 0 && (oldestStoredMS == 0 || ts < oldestStoredMS) {
+			oldestStoredMS = ts
+		}
+	}
+	if gapReason != "" && stored > 0 {
+		a.Logger.Warn().
+			Str("conv_id", convID).
+			Str("reason", gapReason).
+			Str("source", catchUp.reason).
+			Int64("after_ms", boundaryMS).
+			Int64("before_ms", oldestStoredMS).
+			Int("stored", stored).
+			Str("recover_with", googleHistoryGapRecovery(boundaryMS)).
+			Msg("Google catch-up stored newer messages without reaching the ones already held; messages between them may be missing")
+		a.recordGoogleHistoryGap(GoogleHistoryGap{
+			ConversationID: convID,
+			AfterMS:        boundaryMS,
+			AfterID:        boundaryID,
+			BeforeMS:       oldestStoredMS,
+			Stored:         stored,
+			Reason:         gapReason,
+			Source:         catchUp.reason,
+		})
+	}
+	return true, nil
+}
+
+// fetchDownToBoundary fetches convID newest first, recentReconcileMessageLimit
+// messages a page, until a page reaches the boundary (the message boundaryID,
+// or one older than boundaryMS), and returns every distinct message fetched,
+// newest first. A conversation with no boundary (boundaryMS == 0) gets one
+// page: what lies below it is older history, not a hole.
+//
+// At most recentReconcileMaxPages pages are fetched. When a reply has no
+// cursor and the boundary has not been reached, paging continues below the
+// page's oldest message, as libgm's own bridge and the window backfill do,
+// because a missing cursor does not mean the conversation is exhausted. An
+// empty reply means the phone has nothing older (libgm reports a reply without
+// a payload as an error, ErrNoResponsePayload, not as an empty page), which
+// completes the fetch; a page of messages already fetched ends paging short of
+// the boundary.
+//
+// gapReason is set when it stopped with messages fetched but the boundary not
+// reached. A non-nil error means the catch-up must stop (see
+// catchUpConversationToBoundary).
+func (a *App) fetchDownToBoundary(
+	catchUp *googleCatchUp,
+	convID string,
+	boundaryMS int64,
+	boundaryID string,
+) (fetched []*gmproto.Message, gapReason string, err error) {
+	var cursor *gmproto.Cursor
+	seen := map[string]bool{}
+	reached := false
+	stop := googleHistoryGapPageLimit
 	for page := 0; page < recentReconcileMaxPages; page++ {
 		if !catchUp.stillCurrent() {
-			// Nothing stored: the next reconcile starts from the same boundary.
-			return false, true
+			return nil, "", errGoogleCatchUpStopped
 		}
 
 		msgResp, err := catchUp.gm.FetchMessages(convID, recentReconcileMessageLimit, cursor)
 		if err != nil {
 			if a.HandleGoogleAuthExpiredError(err) {
-				return false, true
+				return nil, "", err
 			}
 			// Store what was fetched, as before: a page the phone keeps
 			// failing would otherwise keep every newer message out too.
-			a.Logger.Warn().Err(err).Str("conv_id", convID).Int("page", page).Msg("Recent reconcile: fetch messages failed")
+			a.Logger.Warn().Err(err).Str("conv_id", convID).Int("page", page).Msg("Google catch-up: fetch messages failed")
+			stop = googleHistoryGapFetchError
 			break
 		}
 
 		msgs := msgResp.GetMessages()
 		if len(msgs) == 0 {
+			// The phone has nothing older: everything above the boundary that
+			// it still holds has been fetched (the boundary message itself is
+			// gone from it), so there is nothing between them to miss.
+			reached = true
 			break
 		}
-		fetched = append(fetched, msgs...)
-
-		if localLatestTS == 0 {
+		fresh := 0
+		for _, msg := range msgs {
+			if id := msg.GetMessageID(); !seen[id] {
+				seen[id] = true
+				fetched = append(fetched, msg)
+				fresh++
+			}
+		}
+		if fresh == 0 {
+			// The phone served a page it already sent instead of the messages
+			// below it.
+			stop = googleHistoryGapNoOlderPage
 			break
 		}
-		if reconcileBatchReachedLocalBoundary(msgs, localLatestTS, localLatestID) {
+		if boundaryMS == 0 || reconcileBatchReachedLocalBoundary(msgs, boundaryMS, boundaryID) {
+			reached = true
 			break
 		}
 
 		cursor = msgResp.GetCursor()
 		if cursor == nil {
-			break
+			oldest := oldestOnPage(msgs)
+			if oldest == nil {
+				stop = googleHistoryGapNoOlderPage
+				break
+			}
+			cursor = &gmproto.Cursor{
+				LastItemID:        oldest.GetMessageID(),
+				LastItemTimestamp: oldest.GetTimestamp() / 1000,
+			}
 		}
 	}
 
-	if len(fetched) == 0 {
-		return false, false
+	if reached || len(fetched) == 0 {
+		return fetched, "", nil
 	}
-	for _, msg := range oldestFirst(fetched) {
-		catchUp.storeMessage(convID, conv, msg)
-	}
-	return true, false
+	return fetched, stop, nil
 }
 
 func (a *App) refreshPendingMediaMessageWithSchedule(convID, messageID string, schedule []time.Duration) {
@@ -867,23 +999,24 @@ func (a *App) pendingMediaRefreshResolved(msg *gmproto.Message) (bool, bool) {
 	return true, false
 }
 
+// reconcileBatchReachedLocalBoundary reports whether a page reaches the local
+// boundary: it holds the boundary message, or a message older than it. Only a
+// real (positive) timestamp can place a message below the boundary; a message
+// with no timestamp says nothing about where the page is (it used to count as
+// the oldest on its page, so one such message ended paging above the boundary).
 func reconcileBatchReachedLocalBoundary(msgs []*gmproto.Message, localLatestTS int64, localLatestID string) bool {
 	if localLatestTS == 0 || len(msgs) == 0 {
 		return true
 	}
-
-	oldestTS := msgs[0].GetTimestamp() / 1000
 	for _, msg := range msgs {
-		ts := msg.GetTimestamp() / 1000
-		if ts < oldestTS {
-			oldestTS = ts
-		}
 		if localLatestID != "" && msg.GetMessageID() == localLatestID {
 			return true
 		}
+		if ts := msg.GetTimestamp() / 1000; ts > 0 && ts < localLatestTS {
+			return true
+		}
 	}
-
-	return oldestTS < localLatestTS
+	return false
 }
 
 func (a *App) storeConversation(conv *gmproto.Conversation) error {
