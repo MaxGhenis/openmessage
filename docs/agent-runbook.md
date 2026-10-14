@@ -118,6 +118,32 @@ Two more cutover artifacts worth knowing:
 curl -s http://127.0.0.1:7007/api/status | jq '.freshness'
 ```
 
+## How open web UIs learn about changes (v2-primary)
+
+Every open tab, the macOS app's embedded UI included, listens on `/api/events`.
+Each coarse `messages` or `conversations` event makes it refetch its
+conversation list, its open thread with drafts, and the outbox. On a
+v2-primary install `PrimaryNotifier` (`internal/v2wire/notifier.go`) sends
+those events:
+
+- at once, when a send changes state or an ingest batch lands;
+- otherwise on a 5 s tick, but only if `PRAGMA data_version` moved on
+  `v2/store.sqlite3` or `messages.db`. `internal/storage/dataversion` reads it
+  over a read-only connection of its own. It moves on any commit from any
+  process, so a draft the `draft_message` MCP tool writes from an MCP client
+  appears within about 5 s, and an idle install sends nothing.
+
+Until 2026-10-09 the notifier published on every 5 s tick whether or not
+anything had changed, so each open tab refetched everything every 5 s while
+idle. The stream does not depend on those events to stay alive: the handler
+sends its own `heartbeat` every 25 s, and the UI reconnects only after 45 s
+with no event at all.
+
+If a tab stays stale well past 5 s after a write, look in the daemon log for
+`cannot read a store revision`. A probe that cannot read fails open: it
+publishes on every tick, which is the old behaviour, until it can read again
+(`reads the store revision again`).
+
 ## Google thread ids are device-local: phone swaps re-key everything
 
 Google Messages conversation and message ids are the phone's own row ids, not
