@@ -615,7 +615,7 @@ func writeAccounts(target *sqlite.Store, state *transformState) error {
 		}); err != nil {
 			return fmt.Errorf("upsert %s account: %w", platform, err)
 		}
-		deviceID := v2keys.DeriveID("device", account.AccountID, account.AccountID+"\x1flocal")
+		deviceID := v2keys.LocalInstallationDeviceID(account.AccountID)
 		if err := target.UpsertDevice(sqlite.Device{
 			DeviceID: deviceID, AccountID: account.AccountID,
 			Kind: sqlite.DeviceKindLocalInstallation, DisplayName: "OpenMessage",
@@ -984,10 +984,7 @@ func writeReadCursors(
 			lastReadID = &value
 			lastReadAt = positions[index].At
 		}
-		deviceID := v2keys.DeriveID(
-			"device", conversation.Account.AccountID,
-			conversation.Account.AccountID+"\x1flocal",
-		)
+		deviceID := v2keys.LocalInstallationDeviceID(conversation.Account.AccountID)
 		updatedAt := state.baseTimestampMS
 		if len(positions) > 0 {
 			updatedAt = maxInt64(updatedAt, positions[len(positions)-1].At)

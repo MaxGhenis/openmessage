@@ -442,7 +442,9 @@ func TestMarkReadMirrorsOntoMigratedLocalDevice(t *testing.T) {
 // TestMarkReadSkipsLegacyMirrorOnV2Primary pins that a v2-primary daemon does
 // not run the legacy mirror: it would resolve the id against the legacy store
 // and, for a thread the v2 store lacks, add a legacy-keyed conversation (and
-// the account and device rows around it) to the primary store.
+// the account and device rows around it) to the primary store. The native
+// write resolves only threads the v2 store holds, so it writes nothing here
+// (markread_v2primary_test.go covers the threads it does hold).
 func TestMarkReadSkipsLegacyMirrorOnV2Primary(t *testing.T) {
 	v2Store, err := sqlite.Open(filepath.Join(t.TempDir(), "v2.sqlite3"))
 	if err != nil {

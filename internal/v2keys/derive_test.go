@@ -44,6 +44,23 @@ func TestDeriveIDMigrationFixtureGoldens(t *testing.T) {
 	}
 }
 
+// TestLocalInstallationDeviceIDMatchesMigrationGoldens pins the helper to the
+// device IDs the migration minted before the helper existed, so a device the
+// native mark-read path creates has the ID a migrated store would hold.
+func TestLocalInstallationDeviceIDMatchesMigrationGoldens(t *testing.T) {
+	t.Parallel()
+
+	for accountID, want := range map[string]string{
+		"google-primary":   "9bcc134365b6f21de496ec1693b68421",
+		"whatsapp-primary": "1aa97228aad2f8a40a7eea579625d579",
+		"signal-primary":   "f5725a0b516450efeab65b0ccdc9d041",
+	} {
+		if got := LocalInstallationDeviceID(accountID); got != want {
+			t.Errorf("LocalInstallationDeviceID(%q) = %q, want migration golden %q", accountID, got, want)
+		}
+	}
+}
+
 func TestIdentityKey(t *testing.T) {
 	t.Parallel()
 
