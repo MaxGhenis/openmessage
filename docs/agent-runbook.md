@@ -1471,8 +1471,8 @@ How it works now:
 
 Reading old logs: `received message with old counter` right after a
 reconnect, with no matching message in v2, is a message the old teardown
-path lost. A collection stuck on `mismatching LTHash` stays stuck until
-whatsmeow does a full resync of it, and OpenMessage does not trigger one yet.
+path lost. A collection stuck on `mismatching LTHash` before this fix is
+repaired by the full resync described in the next section.
 
 Tests: `internal/whatsapplive/handler_teardown_test.go` sends real Signal
 ciphertext from a second Signal store through whatsmeow's real handler, the
@@ -1481,6 +1481,89 @@ every session-store call for prekey, ordinary and group messages, with
 the handler context both detached and cancelled, on v2-ingest and
 legacy-only installs. It also covers an
 app-state patch interrupted between its version and MAC writes.
+
+## WhatsApp contact names stop updating: app state stuck on `mismatching LTHash`
+
+whatsmeow syncs the phone's "app state" (contact names, mutes, pins,
+archives, labels) as collections of encrypted patches. OpenMessage reads
+contact names from whatsmeow's contact store (`whatsmeow_contacts` in
+`whatsapp-session.db`), and the `critical_unblock_low` collection fills it.
+
+**How a collection gets stuck.** For each patch, whatsmeow stores the
+collection's new version and hash first, then deletes and inserts the value
+MACs, in separate statements (`appstate/decode.go` `storeMACs`). Anything that
+stops it in between leaves the version advanced without the MACs: generation
+teardown cancelling the handler context before PR #236, a crash, a failed
+write. Every later patch touching an affected entry then fails with
+
+```
+Failed to sync app state after notification: failed to decode app state critical_unblock_low patches: failed to verify patch v<N>: mismatching LTHash
+```
+
+whatsmeow dispatches `AppStateSyncError` for it and keeps fetching from the
+stored version. It never resyncs on its own, so the collection stays stuck
+and the affected contacts keep stale or missing names.
+
+**What OpenMessage does (PR #238).** On an `AppStateSyncError` whose error
+wraps `appstate.ErrMismatchingLTHash` (or `ErrMissingPreviousSetValueOperation`,
+which the pinned whatsmeow only logs as a warning), the bridge starts a full
+resync of that collection: `FetchAppState(ctx, name, true, false)`. whatsmeow
+deletes the stored version (the MACs cascade), fetches the server's snapshot
+and applies it. With `EmitAppStateEventsOnFullSync` off (the default), a
+`critical_unblock_low` snapshot upserts the first and full name of every
+contact in it (`PutAllContactNames`); it does not delete names of contacts
+the snapshot leaves out. Later patches then apply normally.
+
+- The resync runs on its own goroutine. whatsmeow dispatches the error while
+  holding the client's app-state lock, which `FetchAppState` takes again, so
+  running it inside the event handler would deadlock. It starts once the
+  failed fetch releases the lock.
+- At most one resync per collection runs at a time. Starts for one collection
+  are at least 10 minutes apart, and at most 3 start in any 24 hours. The
+  budget lives in memory per whatsmeow client: restarting the app or
+  re-pairing starts a fresh one.
+- Its context is not the handler's: a generation teardown does not cancel it.
+  Closing the bridge or replacing the client (re-pairing) does, and `Close`
+  waits up to 5 seconds for it to return. If the connection drops while the
+  snapshot request is out, whatsmeow waits up to 5 seconds for a reconnect and
+  resends it. If the resync still fails after whatsmeow deleted the stored
+  version, the collection is at version 0, and whatsmeow's next fetch of it
+  (the next app-state notification for it) is a full sync.
+- A client's error only ever resyncs that client's collection: the bridge
+  hands it to the resyncer of the client that reported it, read together
+  with the current client, and a replaced client's resyncer is stopped and
+  refuses new resyncs.
+- Other decode failures do not start a resync: a patch, content or index MAC
+  mismatch is about the patch itself, and a missing key makes whatsmeow
+  request the key instead (it dispatches no error for that).
+
+Log lines (the bridge's log; each carries `collection` and `full_sync`):
+
+| Line | Level | Meaning |
+|---|---|---|
+| `WhatsApp app state collection disagrees with the server; starting a full resync` | warn | a resync started; `attempt` of `max_attempts` in `window` |
+| `WhatsApp app state full resync completed` | info | the collection was rebuilt from the snapshot |
+| `WhatsApp app state full resync failed` | warn | e.g. not connected or an IQ timeout; the next failing patch can retry after the cooldown |
+| `... full resync budget used up` | warn once, then debug | 3 resyncs started in 24 hours and the collection still fails to verify; `next_resync_after` says when one may start again |
+| `... full resync cooling down` / `... already running` | debug | refused by the cooldown or because one is in flight |
+
+The cap bounds what a collection that keeps failing can cost; it does not
+say why. Read the log lines before it: resyncs that each failed (not
+connected, an IQ timeout, a database error), a corruption that recurs after
+each completed resync, or a snapshot that does not verify itself
+(`failed to verify snapshot: ... mismatching LTHash`). To inspect it read-only:
+`whatsmeow_app_state_version` holds each collection's version, and
+`whatsmeow_app_state_mutation_macs` its value MACs (copy `whatsapp-session.db`
+first; the app holds it open). Restarting the app resets the budget.
+
+Tests: `internal/whatsapplive/appstate_resync_test.go` corrupts the contact
+list the way the old teardown did and checks the recovery end to end through
+whatsmeow's real decoder and event dispatch (only the snapshot fetch is
+stubbed). A random-walk property test interrupts random patches over random
+rename histories and checks that each mismatch is answered by a resync that
+restores every contact's current name. `appstate_resync_internal_test.go`
+checks the budget against a reference model over random policies and event
+sequences.
 
 ## signal-cli
 

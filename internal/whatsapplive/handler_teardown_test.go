@@ -1050,9 +1050,15 @@ func (h *appStateStoreHook) PutAppStateVersion(ctx context.Context, name string,
 // appStatePhone encodes the contact-list app-state collection the way the
 // primary phone does, with its own copy of the collection in the peer's store.
 type appStatePhone struct {
+	mu    sync.Mutex
 	proc  *appstate.Processor
 	state appstate.HashState
 	keyID []byte
+	// records holds the collection's current value for each index (keyed by
+	// index MAC), and snapshotMAC the MAC of the current state: what the
+	// server serves as the collection's snapshot.
+	records     map[string]*waServerSync.SyncdRecord
+	snapshotMAC []byte
 }
 
 func (h *teardownHarness) newAppStatePhone() *appStatePhone {
@@ -1067,12 +1073,18 @@ func (h *teardownHarness) newAppStatePhone() *appStatePhone {
 			h.t.Fatalf("PutAppStateSyncKey(): %v", err)
 		}
 	}
-	return &appStatePhone{proc: appstate.NewProcessor(h.peer, waLog.Noop), keyID: keyID}
+	return &appStatePhone{
+		proc:    appstate.NewProcessor(h.peer, waLog.Noop),
+		keyID:   keyID,
+		records: make(map[string]*waServerSync.SyncdRecord),
+	}
 }
 
 // renameContact returns the server's patch list for one contact rename.
 func (p *appStatePhone) renameContact(t *testing.T, contact watypes.JID, name string) *appstate.PatchList {
 	t.Helper()
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	ctx := context.Background()
 	raw, err := p.proc.EncodePatch(ctx, p.keyID, p.state, appstate.PatchInfo{
 		Type: appstate.WAPatchCriticalUnblockLow,
@@ -1102,6 +1114,10 @@ func (p *appStatePhone) renameContact(t *testing.T, contact watypes.JID, name st
 	}
 	served := patchList()
 	p.state = next
+	for _, mutation := range served.Patches[0].GetMutations() {
+		p.records[string(mutation.GetRecord().GetIndex().GetBlob())] = mutation.GetRecord()
+	}
+	p.snapshotMAC = served.Patches[0].GetSnapshotMAC()
 	return served
 }
 

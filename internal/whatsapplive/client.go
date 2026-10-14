@@ -373,6 +373,10 @@ type Bridge struct {
 	// as not handled instead of being dropped from v2. Legacy-only installs
 	// (no v2 sink) and processes that never observe ingress leave it unset.
 	ingressOwned bool
+	// appStateResync answers the current client's app-state decode failures
+	// with full resyncs (appstate_resync.go). It is replaced, and the old one
+	// stopped, with the client.
+	appStateResync *appStateResyncer
 
 	runtimeMu    sync.Mutex
 	runtimeDB    *sql.DB
@@ -446,6 +450,7 @@ func (b *Bridge) initClientLocked() error {
 	})
 	b.container = container
 	b.client = cli
+	b.appStateResync = newAppStateResyncer(cli, b.logger)
 	return nil
 }
 
@@ -634,6 +639,8 @@ func (b *Bridge) LogIngressError(err error, accountID string, generation uint64)
 }
 
 func (b *Bridge) resetClientLocked() error {
+	b.appStateResync.stop()
+	b.appStateResync = nil
 	if b.client != nil {
 		b.client.Disconnect()
 		b.client = nil
@@ -1304,6 +1311,9 @@ func (b *Bridge) UsesLiveSession() bool {
 
 func (b *Bridge) Close() error {
 	b.mu.Lock()
+	appStateResync := b.appStateResync
+	appStateResync.stop()
+	b.appStateResync = nil
 	if b.client != nil {
 		b.client.Disconnect()
 		b.client = nil
@@ -1318,6 +1328,9 @@ func (b *Bridge) Close() error {
 	}
 	b.observation = lifecycleObservation{}
 	b.mu.Unlock()
+	if !appStateResync.wait(appStateResyncStopTimeout) {
+		b.logger.Warn().Dur("timeout", appStateResyncStopTimeout).Msg("WhatsApp app state resync still running after close")
+	}
 
 	b.runtimeMu.Lock()
 	if b.runtimeDB != nil {
@@ -2035,6 +2048,9 @@ func (b *Bridge) handleClientEvent(source *whatsmeow.Client, generation uint64, 
 		retryAt, persistenceErr = b.persistTemporaryBan(at, event.Expire)
 	}
 
+	if event, ok := raw.(*waevents.AppStateSyncError); ok && event != nil {
+		b.handleAppStateSyncError(source, generation, event)
+	}
 	handled := b.applyEvent(raw)
 
 	b.mu.RLock()
@@ -2356,6 +2372,8 @@ func (b *Bridge) applyEvent(raw any) bool {
 	case *waevents.HistorySync:
 		b.captureHistorySyncIngress(evt)
 		b.handleHistorySync(evt)
+	case *waevents.AppStateSyncError:
+		// handleClientEvent hands it to the reporting client's resyncer.
 	default:
 		b.logger.Debug().Type("type", evt).Msg("Unhandled WhatsApp event")
 	}
