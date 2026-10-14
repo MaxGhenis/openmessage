@@ -2045,7 +2045,13 @@ func TestHistoryCatchUpCapturesTheGenerationIngressWithItsClient(t *testing.T) {
 	if c1.token != any(cli1.GM) {
 		t.Error("generation 1 catch-up token is not generation 1's libgm client")
 	}
-	if real, ok := c1.gm.(*realGMClient); !ok || real.gm != cli1.GM {
+	// The catch-up fetches through its fail-fast wrapper (failFastGMClient).
+	var real *realGMClient
+	ff, ok := c1.gm.(*failFastGMClient)
+	if ok {
+		real, ok = ff.inner.(*realGMClient)
+	}
+	if !ok || real.gm != cli1.GM {
 		t.Errorf("generation 1 catch-up fetches with %#v, want generation 1's client", c1.gm)
 	}
 	if !c1.stillCurrent() {
