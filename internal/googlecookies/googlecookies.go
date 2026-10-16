@@ -71,18 +71,26 @@ func DefaultChromeProfile() string {
 // Refresh reads Google cookies from the Chrome profile and rewrites
 // auth_data.cookies in sessionPath. It never logs or returns cookie values.
 func Refresh(ctx context.Context, profile, sessionPath string) error {
-	if profile == "" {
-		return fmt.Errorf("no Chrome profile directory")
-	}
-	secret, err := chromeSafeStorageSecret(ctx)
-	if err != nil {
-		return fmt.Errorf("chrome safe storage secret: %w", err)
-	}
-	cookies, err := LoadChromeCookies(profile, secret)
+	cookies, err := Load(ctx, profile)
 	if err != nil {
 		return err
 	}
 	return UpdateSessionCookies(sessionPath, cookies)
+}
+
+// Load reads and decrypts the Google cookies of a Chrome profile with the
+// Chrome Safe Storage secret from the login keychain. It is what Refresh
+// writes into session.json and what `pair --google-chrome` pairs with.
+// Callers must never log the returned values.
+func Load(ctx context.Context, profile string) (map[string]string, error) {
+	if profile == "" {
+		return nil, fmt.Errorf("no Chrome profile directory")
+	}
+	secret, err := chromeSafeStorageSecret(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("chrome safe storage secret: %w", err)
+	}
+	return LoadChromeCookies(profile, secret)
 }
 
 // DeriveKey derives the AES-128 key Chrome uses for cookie encryption.

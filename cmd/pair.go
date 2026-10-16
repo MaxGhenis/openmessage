@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -23,6 +24,8 @@ import (
 
 	"github.com/maxghenis/openmessage/internal/app"
 	"github.com/maxghenis/openmessage/internal/client"
+	"github.com/maxghenis/openmessage/internal/googlecookies"
+	"github.com/maxghenis/openmessage/internal/localapi"
 )
 
 const maxQRRefreshes = 5
@@ -30,9 +33,16 @@ const maxQRRefreshes = 5
 type pairMode string
 
 const (
-	pairModeQR     pairMode = "qr"
-	pairModeGoogle pairMode = "google"
+	pairModeQR           pairMode = "qr"
+	pairModeGoogle       pairMode = "google"
+	pairModeGoogleChrome pairMode = "google-chrome"
 )
+
+// pairBackendExitWait is how long pair waits for a backend serving the same
+// data directory to exit before refusing. The macOS app terminates its backend
+// and spawns `pair` without waiting for the exit, so a short wait keeps the
+// in-app flow working while a backend that stays up is still refused.
+const pairBackendExitWait = 15 * time.Second
 
 func RunPair(logger zerolog.Logger, args ...string) error {
 	dataDir := app.DefaultDataDir()
@@ -41,19 +51,146 @@ func RunPair(logger zerolog.Logger, args ...string) error {
 	}
 
 	sessionPath := dataDir + "/session.json"
-	mode, googleInput, err := resolvePairMode(args)
+	mode, input, err := resolvePairMode(args)
 	if err != nil {
 		return err
+	}
+
+	ctx := context.Background()
+	if err := waitForBackendToReleaseSession(ctx, dataDir, defaultPairBackendProbe, pairBackendExitWait, time.Sleep); err != nil {
+		return err
+	}
+
+	var cookies map[string]string
+	switch mode {
+	case pairModeGoogle:
+		if cookies, err = parseGoogleCookiesInput(input); err != nil {
+			return fmt.Errorf("parse Google cookies: %w", err)
+		}
+	case pairModeGoogleChrome:
+		// Read right before pairing: Google rotates these cookies, and an
+		// older extract has failed pairing with HTTP 401.
+		if cookies, err = loadChromeCookiesForPairing(ctx, input, googlecookies.Load); err != nil {
+			return err
+		}
 	}
 
 	cli := client.NewForPairing(logger)
 	defer cli.GM.Disconnect()
 
-	if mode == pairModeGoogle {
-		return runGoogleAccountPairing(cli, sessionPath, googleInput)
+	if mode == pairModeQR {
+		return runQRPairing(logger, cli, sessionPath)
 	}
+	return runGoogleAccountPairing(cli, sessionPath, cookies)
+}
 
-	return runQRPairing(logger, cli, sessionPath)
+// pairBackendProbe reports whether an OpenMessage backend answers on the
+// local API port and, when its status says so, which data directory it serves.
+type pairBackendProbe func(ctx context.Context, dataDir string) (running bool, servedDataDir string, err error)
+
+func defaultPairBackendProbe(ctx context.Context, dataDir string) (bool, string, error) {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	probeURL := defaultBackendProbeURL()
+	running, err := probeBackend(ctx, &http.Client{}, probeURL)
+	if err != nil || !running {
+		return running, "", err
+	}
+	daemon := localapi.NewClient(strings.TrimSuffix(probeURL, "/api/status"), localapi.LoadControlToken(dataDir))
+	status, _, err := daemon.Status(ctx)
+	if err != nil {
+		// Something answers but does not say which data directory it serves.
+		return true, "", nil
+	}
+	return true, strings.TrimSpace(status.Auth.DataDir), nil
+}
+
+// waitForBackendToReleaseSession refuses to pair while a running backend
+// serves dataDir. That backend owns session.json: it rewrites the file when it
+// refreshes tokens and rotates cookies, so it would overwrite the new pairing,
+// and it keeps using its old session until it restarts. A backend that names a
+// different data directory is no conflict. One that answers without naming
+// its directory is treated as a conflict, and so is a probe that fails for any
+// reason other than a refused connection (a hung backend).
+func waitForBackendToReleaseSession(ctx context.Context, dataDir string, probe pairBackendProbe, wait time.Duration, sleep func(time.Duration)) error {
+	const poll = 500 * time.Millisecond
+	announced := false
+	for waited := time.Duration(0); ; waited += poll {
+		running, served, err := probe(ctx, dataDir)
+		if err == nil && (!running || (served != "" && !samePath(served, dataDir))) {
+			return nil
+		}
+		if waited >= wait {
+			if err != nil {
+				return fmt.Errorf("cannot rule out a running OpenMessage backend at %s: %w; quit the OpenMessage app and retry", defaultBackendProbeURL(), err)
+			}
+			return fmt.Errorf("an OpenMessage backend at %s is running on %s; quit the OpenMessage app first (osascript -e 'quit app \"OpenMessage\"'), because it rewrites session.json and would overwrite the new pairing", defaultBackendProbeURL(), dataDir)
+		}
+		if !announced {
+			fmt.Println("Waiting for the running OpenMessage backend to exit...")
+			announced = true
+		}
+		sleep(poll)
+	}
+}
+
+// loadChromeCookiesForPairing reads the Google account cookies of a local
+// Chrome profile, the same cookies the backend's self-heal refreshes the
+// session from. It prints how many it read, never their values.
+func loadChromeCookiesForPairing(ctx context.Context, profile string, load func(context.Context, string) (map[string]string, error)) (map[string]string, error) {
+	cookies, err := load(ctx, profile)
+	if err != nil {
+		return nil, fmt.Errorf("read Google cookies from Chrome profile %s: %w; sign that profile in to the Google account your phone's Google Messages uses, or pass another profile directory", profile, err)
+	}
+	fmt.Printf("Read %d Google cookies from Chrome profile %s\n", len(cookies), profile)
+	return cookies, nil
+}
+
+// savePairedSession writes a new pairing to sessionPath. A session it
+// replaces is first copied to session.json.bak-<time>, so a re-pair can be
+// rolled back by moving that file back.
+func savePairedSession(sessionPath string, data *client.SessionData, now time.Time) error {
+	backup, err := backupReplacedSession(sessionPath, now)
+	if err != nil {
+		return fmt.Errorf("back up the session being replaced: %w", err)
+	}
+	if backup != "" {
+		fmt.Println("Previous session backed up to", backup)
+	}
+	return client.SaveSession(sessionPath, data)
+}
+
+func backupReplacedSession(sessionPath string, now time.Time) (string, error) {
+	raw, err := os.ReadFile(sessionPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	base := sessionPath + ".bak-" + now.Format("20060102-150405")
+	for i := 1; i <= 100; i++ {
+		path := base
+		if i > 1 {
+			path = fmt.Sprintf("%s-%d", base, i)
+		}
+		file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		if errors.Is(err, os.ErrExist) {
+			continue
+		}
+		if err != nil {
+			return "", err
+		}
+		_, writeErr := file.Write(raw)
+		syncErr := file.Sync()
+		closeErr := file.Close()
+		if err := errors.Join(writeErr, syncErr, closeErr); err != nil {
+			_ = os.Remove(path)
+			return "", err
+		}
+		return path, nil
+	}
+	return "", fmt.Errorf("no free backup name for %s", base)
 }
 
 func runQRPairing(logger zerolog.Logger, cli *client.Client, sessionPath string) error {
@@ -73,7 +210,7 @@ func runQRPairing(logger zerolog.Logger, cli *client.Client, sessionPath string)
 			pairErr = fmt.Errorf("get session data: %w", err)
 			return
 		}
-		if err := client.SaveSession(sessionPath, sessionData); err != nil {
+		if err := savePairedSession(sessionPath, sessionData, time.Now()); err != nil {
 			pairErr = fmt.Errorf("save session: %w", err)
 			return
 		}
@@ -167,20 +304,25 @@ func resolvePairMode(args []string) (pairMode, string, error) {
 			return "", "", fmt.Errorf("read Google cookies file: %w", err)
 		}
 		return pairModeGoogle, string(b), nil
+	case "--google-chrome":
+		profile := googlecookies.DefaultChromeProfile()
+		if len(args) >= 2 && strings.TrimSpace(args[1]) != "" {
+			profile = strings.TrimSpace(args[1])
+		}
+		if profile == "" {
+			return "", "", fmt.Errorf("--google-chrome: no Chrome profile directory; pass one or set OPENMESSAGE_CHROME_PROFILE")
+		}
+		return pairModeGoogleChrome, profile, nil
 	default:
 		return "", "", fmt.Errorf("unknown pair option: %s", args[0])
 	}
 }
 
-func runGoogleAccountPairing(cli *client.Client, sessionPath, rawInput string) error {
-	cookies, err := parseGoogleCookiesInput(rawInput)
-	if err != nil {
-		return fmt.Errorf("parse Google cookies: %w", err)
-	}
+func runGoogleAccountPairing(cli *client.Client, sessionPath string, cookies map[string]string) error {
 	cli.GM.AuthData.Cookies = cookies
 
 	fmt.Println("Starting Google account pairing...")
-	err = cli.GM.DoGaiaPairing(context.Background(), func(emoji string) {
+	err := cli.GM.DoGaiaPairing(context.Background(), func(emoji string) {
 		fmt.Println("EMOJI:", emoji)
 		fmt.Println("Tap this emoji in Google Messages on your phone.")
 	})
@@ -192,7 +334,7 @@ func runGoogleAccountPairing(cli *client.Client, sessionPath, rawInput string) e
 	if err != nil {
 		return fmt.Errorf("get session data: %w", err)
 	}
-	if err := client.SaveSession(sessionPath, sessionData); err != nil {
+	if err := savePairedSession(sessionPath, sessionData, time.Now()); err != nil {
 		return fmt.Errorf("save session: %w", err)
 	}
 	fmt.Println("\nPairing successful!")
