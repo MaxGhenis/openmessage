@@ -1101,44 +1101,67 @@ Key facts:
 
 ### Re-pair recipe (the one that works)
 
-1. Park the launchd watchdog
+Last used 2026-10-16 to move the live install from a QR pairing to
+Google-account pairing (see
+[pulls that return nothing](#pulls-that-return-nothing-phone-switched-to-google-account-pairing)).
+
+1. **Have the user at the phone first.** `pair` shows the emoji seconds after
+   it starts, and the phone shows a Google Messages prompt to pick the
+   matching emoji. The app stays quit for the whole wait, so do not start
+   while the user is away. On 2026-10-16 an unattended attempt sat for over 10
+   minutes. `pair` now gives up after 5 minutes (`gaiaConfirmTimeout`) and
+   cancels the prompt on the phone.
+2. Park the launchd watchdog
    ([parking it](#parking-the-launchd-watchdog)); the flag stops its
    relaunches and its alerts alike. Then
-   `osascript -e 'quit app "OpenMessage"'`.
-2. Force the native pairing screen by removing `session.json` from **both**
-   data dirs (back them up first):
-   `~/Library/Application Support/OpenMessage/session.json` **and**
-   `~/.local/share/openmessage/session.json` (else migration copies the old one
-   back). Other platforms' sessions (`whatsapp-session.db`, `signal-cli/`) are
-   independent — leave them.
-3. **Clear the stale session FIRST (don't skip).** Running `pair --google` while a dead `session.json` is still in the data dir floods the pairing with `failed to decrypt data event: HMAC mismatch` and yields a new session that 401s on token refresh **immediately** (dead on arrival). Removing both `session.json` files (step 2) before pairing is what produces a healthy session that connects *and* syncs (`/api/status` freshness `behind_days` drops to 0). Some HMAC-mismatch lines are normal noise (events from the phone's own session the pairing client can't read) — the tell for a bad pair is an immediate post-pair 401, not the noise itself.
-4. The embedded Google sign-in inside `PairingView` is **blocked by Google**
-   ("sign-in not allowed in this app") and dead-ends in Google's troubleshooter.
-   Use the **cookie method** instead — extract Google cookies from the user's
-   signed-in Chrome and run:
+   `osascript -e 'quit app "OpenMessage"'` and check that nothing listens on
+   port 7007.
+3. Pair with the cookies of the user's signed-in Chrome profile:
    ```
    OPENMESSAGES_DATA_DIR="$HOME/Library/Application Support/OpenMessage" \
-     openmessage pair --google-file <cookiefile>
+     openmessage pair --google-chrome            # or: --google-chrome "<profile dir>"
    ```
-   Decrypting Chrome cookies on macOS:
-   - key: `security find-generic-password -w -s "Chrome Safe Storage"`
-   - derive: PBKDF2-HMAC-SHA1(key, salt=`saltysalt`, iterations=1003, len=16)
-   - decrypt each `encrypted_value`: strip `v10` prefix, AES-128-CBC, IV = 16
-     spaces, strip PKCS7 padding; recent Chrome prepends a 32-byte domain hash —
-     try stripping the first 32 bytes if the result isn't clean UTF-8.
-   - source: `~/Library/Application Support/Google/Chrome/Default/Cookies`
-     (the signed-in profile; `Local State` maps profiles → accounts). Build a
-     `name=value; name=value; …` header from `.google.com` / `messages.google.com`
-     cookies and write it to a `0600` file.
-   - **Extract cookies immediately before pairing** — pairing with an older
-     extract has returned HTTP 401 (the staleness threshold is not
-     established; don't rely on any grace window).
-5. `pair --google` prints `EMOJI: <emoji>`. The user taps that emoji in Google
-   Messages **on the phone** (notification shade, or profile → Device pairing)
-   to confirm. The Gaia client init can time out once — just retry.
-6. On confirmation the session saves to the app dir; relaunch the app and sends
-   work. Wipe the cookie file afterwards. Whatever the outcome, remove the
-   launchd watchdog's `watchdog-disabled` flag.
+   - It reads the cookies right before pairing, with the same native reader
+     the self-heal uses (keychain → PBKDF2 → AES; see
+     [self-healing](#self-healing-as-of-74-requirements-fixed-2026-07-20--try-this-before-any-manual-cookie-surgery)).
+     It prints how many it read, never their values.
+   - The profile must be signed in to the Google account the phone's Google
+     Messages uses. Chrome's `Local State` maps each profile directory to its
+     account (`profile.info_cache.<dir>.user_name`). The phone's account is
+     the address inside the `GAIA_1` frame's field-11 container (see
+     [pulls that return nothing](#pulls-that-return-nothing-phone-switched-to-google-account-pairing)).
+     The default profile is `Default`, or `OPENMESSAGE_CHROME_PROFILE` if set.
+   - It refuses to pair while a backend serving the same data dir answers on
+     the API port, after waiting 15 s for one that is shutting down. A running
+     backend rewrites `session.json` on token refresh and cookie rotation, so
+     it would overwrite the new pairing.
+   - On success it copies the replaced `session.json` to
+     `session.json.bak-<time>` before saving. To roll back, quit the app and
+     move that file back.
+   - `pair` builds a fresh session and never reads the old `session.json`,
+     so there is no need to delete it first. (Older notes here said a stale
+     `session.json` made new pairings dead on arrival. The cause was never
+     established; a backend still running on the old session fits, and the
+     guard above now refuses that.)
+   - Builds without `--google-chrome`: `pair --google-file <cookiefile>`,
+     where the file holds a `name=value; …` cookie header. Decrypt the Chrome
+     cookies the way `internal/googlecookies` does, or with
+     `scripts/refresh-google-session-cookies-macos.py`. Extract them right
+     before pairing: an older extract has returned HTTP 401.
+4. `pair` prints `EMOJI: <emoji>`. The user taps the matching emoji in the
+   Google Messages prompt on the phone. The Gaia client init can time out
+   once; just retry.
+5. On `Pairing successful!`, relaunch the app (`open -a
+   /Applications/OpenMessage.app`) and remove the watchdog's
+   `watchdog-disabled` flag. Remove the flag whatever the outcome.
+6. Verify: `/api/status` → `google.connected`, then `google.pull_health`
+   with `last_outcome: "ok"` and no `account_switch`. Check `v2_ingest` for
+   `quarantined: 0`. Then have the user send one real message and check that
+   it shows `OUTGOING_DELIVERED`.
+
+The macOS app's own pairing screen cannot do this: its embedded Google
+sign-in is blocked by Google ("sign-in not allowed in this app"). It takes a
+pasted cookie header or cURL command instead (`pair --google-stdin`).
 
 ### Self-healing (as of #74; requirements fixed 2026-07-20) — try this before any manual cookie surgery
 
@@ -1353,18 +1376,18 @@ curl -s http://127.0.0.1:7007/api/status | jq '.google.pull_health'
 
 **Fix:** not a reconnect, a restart, or a cookie refresh: none of them
 changes the phone's pairing mode (two app restarts on 10/8 changed nothing).
-Two remedies follow from the mechanism and from upstream mautrix-gmessages,
-whose (commented-out) alert for this state reads "Switched to Google account
-pairing, please switch back or relogin with `login-google`"
-(`pkg/connector/handlegmessages.go`). Neither has been tried on this install
-yet:
+Upstream mautrix-gmessages' (commented-out) alert for this state reads
+"Switched to google account pairing, please switch back or relogin with
+`login-google`" (`pkg/connector/handlegmessages.go`). The two remedies:
 
-1. Re-link OpenMessage with Google-account pairing (cookie method, re-pair
-   recipe above).
-2. Switch the phone back to QR/device pairing in Google Messages' device
-   pairing settings.
-
-Both are the user's call.
+1. Re-link OpenMessage with Google-account pairing
+   ([re-pair recipe](#re-pair-recipe-the-one-that-works),
+   `pair --google-chrome`). **Applied on the live install 2026-10-16**:
+   the first pull after relaunch returned 100 conversations with
+   `last_outcome: ok`, the account switch was gone, and a real send was
+   delivered.
+2. Switch the phone back to QR/device pairing. Google's help says QR pairing
+   for web is no longer offered in the US (d1104), so this may not exist.
 
 ### Don't over-reconnect
 
