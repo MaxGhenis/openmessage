@@ -11,6 +11,7 @@ import (
 	"os/signal"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -132,6 +133,26 @@ func waitForBackendToReleaseSession(ctx context.Context, dataDir string, probe p
 		}
 		sleep(poll)
 	}
+}
+
+// withGaiaConfirmTimeout runs a Google-account pairing and gives up when the
+// phone has not confirmed within timeout. It cancels (rather than lets a
+// deadline expire) because libgm sends the phone a pairing cancel only for
+// context.Canceled, which dismisses the stale prompt there.
+func withGaiaConfirmTimeout(ctx context.Context, timeout time.Duration, pair func(context.Context) error) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var timedOut atomic.Bool
+	timer := time.AfterFunc(timeout, func() {
+		timedOut.Store(true)
+		cancel()
+	})
+	defer timer.Stop()
+	err := pair(ctx)
+	if err != nil && timedOut.Load() {
+		return fmt.Errorf("the phone did not confirm within %v; run pair again when you can tap the emoji in Google Messages: %w", timeout, err)
+	}
+	return err
 }
 
 // loadChromeCookiesForPairing reads the Google account cookies of a local
@@ -318,13 +339,23 @@ func resolvePairMode(args []string) (pairMode, string, error) {
 	}
 }
 
+// gaiaConfirmTimeout bounds the wait for the emoji tap. libgm sends the
+// finish request with a 300 s TTL and then waits for the phone's answer with
+// no deadline of its own, so an unanswered prompt blocked `pair` for good
+// (2026-10-16: still waiting after 10 minutes) while the app stayed quit.
+const gaiaConfirmTimeout = 5 * time.Minute
+
 func runGoogleAccountPairing(cli *client.Client, sessionPath string, cookies map[string]string) error {
 	cli.GM.AuthData.Cookies = cookies
 
 	fmt.Println("Starting Google account pairing...")
-	err := cli.GM.DoGaiaPairing(context.Background(), func(emoji string) {
-		fmt.Println("EMOJI:", emoji)
-		fmt.Println("Tap this emoji in Google Messages on your phone.")
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	err := withGaiaConfirmTimeout(ctx, gaiaConfirmTimeout, func(ctx context.Context) error {
+		return cli.GM.DoGaiaPairing(ctx, func(emoji string) {
+			fmt.Println("EMOJI:", emoji)
+			fmt.Println("Tap this emoji in Google Messages on your phone.")
+		})
 	})
 	if err != nil {
 		return fmt.Errorf("google account pairing: %w", err)

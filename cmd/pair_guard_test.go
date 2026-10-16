@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -365,4 +366,50 @@ func assertFile(t *testing.T, path string, want []byte) {
 	if info.Mode().Perm() != 0o600 {
 		t.Fatalf("%s mode %v, want 0600", path, info.Mode().Perm())
 	}
+}
+
+func TestWithGaiaConfirmTimeout(t *testing.T) {
+	t.Run("an unanswered prompt is canceled at the timeout", func(t *testing.T) {
+		var sawErr error
+		err := withGaiaConfirmTimeout(context.Background(), 20*time.Millisecond, func(ctx context.Context) error {
+			<-ctx.Done()
+			sawErr = ctx.Err()
+			return fmt.Errorf("failed to send client finish: %w", ctx.Err())
+		})
+		// libgm sends the phone a pairing cancel only for context.Canceled,
+		// so the timeout must cancel rather than let a deadline expire.
+		if !errors.Is(sawErr, context.Canceled) {
+			t.Fatalf("pairing saw %v, want context.Canceled", sawErr)
+		}
+		if err == nil || !strings.Contains(err.Error(), "did not confirm within 20ms") || !errors.Is(err, context.Canceled) {
+			t.Fatalf("error = %v, want the timeout explained and the cause kept", err)
+		}
+		assertSwiftSafe(t, err.Error())
+	})
+
+	t.Run("a confirmation inside the window passes through", func(t *testing.T) {
+		if err := withGaiaConfirmTimeout(context.Background(), time.Minute, func(context.Context) error { return nil }); err != nil {
+			t.Fatalf("err = %v", err)
+		}
+	})
+
+	t.Run("a pairing error before the timeout is not called a timeout", func(t *testing.T) {
+		wrong := errors.New("incorrect emoji")
+		err := withGaiaConfirmTimeout(context.Background(), time.Minute, func(context.Context) error { return wrong })
+		if err != wrong {
+			t.Fatalf("err = %v, want the pairing error unchanged", err)
+		}
+	})
+
+	t.Run("an outer cancel (Ctrl-C) is not called a timeout", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		err := withGaiaConfirmTimeout(ctx, time.Minute, func(ctx context.Context) error {
+			<-ctx.Done()
+			return ctx.Err()
+		})
+		if !errors.Is(err, context.Canceled) || strings.Contains(err.Error(), "did not confirm") {
+			t.Fatalf("err = %v, want a plain cancel", err)
+		}
+	})
 }
