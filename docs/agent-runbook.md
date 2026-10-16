@@ -1110,7 +1110,9 @@ Google-account pairing (see
    matching emoji. The app stays quit for the whole wait, so do not start
    while the user is away. On 2026-10-16 an unattended attempt sat for over 10
    minutes. `pair` now gives up after 5 minutes (`gaiaConfirmTimeout`) and
-   cancels the prompt on the phone.
+   sends the phone a pairing cancel. A second Ctrl-C ends it at once; it
+   also returns on its own 30 s after any cancel (`gaiaCancelGrace`), because
+   libgm's long-poll connect wait ignores cancellation.
 2. Park the launchd watchdog
    ([parking it](#parking-the-launchd-watchdog)); the flag stops its
    relaunches and its alerts alike. Then
@@ -1131,18 +1133,25 @@ Google-account pairing (see
      the address inside the `GAIA_1` frame's field-11 container (see
      [pulls that return nothing](#pulls-that-return-nothing-phone-switched-to-google-account-pairing)).
      The default profile is `Default`, or `OPENMESSAGE_CHROME_PROFILE` if set.
-   - It refuses to pair while a backend serving the same data dir answers on
-     the API port, after waiting 15 s for one that is shutting down. A running
+   - It refuses to pair while a backend that holds this data dir's Google
+     session answers on the API port: `/api/status` names the same
+     `auth.data_dir` and does not report `google.paired: false`. Such a
      backend rewrites `session.json` on token refresh and cookie rotation, so
-     it would overwrite the new pairing.
-   - On success it copies the replaced `session.json` to
-     `session.json.bak-<time>` before saving. To roll back, quit the app and
-     move that file back.
+     it would overwrite the new pairing. A backend with no Google session (a
+     first pairing in Docker, or the macOS app after it unpairs) is no
+     conflict. It waits up to 15 s of wall time for one that is stopping;
+     each probe's timeout is capped at the time left.
+   - Before asking the phone anything, it copies an existing `session.json`
+     to `session.json.bak-<time>`, and it stops if that copy fails, so a
+     confirmed pairing is never lost to a failed backup. To roll back, quit
+     the app and move that file back.
    - `pair` builds a fresh session and never reads the old `session.json`,
      so there is no need to delete it first. (Older notes here said a stale
      `session.json` made new pairings dead on arrival. The cause was never
      established; a backend still running on the old session fits, and the
      guard above now refuses that.)
+   - `--google-chrome` is macOS-only (it reads the keychain). A bare
+     profile name such as `"Profile 1"` resolves beside the default profile.
    - Builds without `--google-chrome`: `pair --google-file <cookiefile>`,
      where the file holds a `name=value; …` cookie header. Decrypt the Chrome
      cookies the way `internal/googlecookies` does, or with

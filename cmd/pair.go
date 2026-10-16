@@ -6,9 +6,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -39,13 +42,42 @@ const (
 	pairModeGoogleChrome pairMode = "google-chrome"
 )
 
-// pairBackendExitWait is how long pair waits for a backend serving the same
-// data directory to exit before refusing. The macOS app terminates its backend
-// and spawns `pair` without waiting for the exit, so a short wait keeps the
-// in-app flow working while a backend that stays up is still refused.
+// pairBackendExitWait is how long pair waits for a backend that holds this
+// data directory's Google session to let go of it before refusing. The macOS
+// app unpairs (POST /api/unpair deletes session.json) and terminates its
+// backend, then spawns `pair` without waiting for the exit.
 const pairBackendExitWait = 15 * time.Second
 
+// pairProbeTimeout bounds one backend probe; the wait loop caps it further at
+// the time left in pairBackendExitWait.
+const pairProbeTimeout = 5 * time.Second
+
+// pairDeps are RunPair's seams; tests replace them.
+type pairDeps struct {
+	probe      pairBackendProbe
+	exitWait   time.Duration
+	now        func() time.Time
+	sleep      func(time.Duration)
+	loadChrome func(context.Context, string) (map[string]string, error)
+	pair       func(logger zerolog.Logger, mode pairMode, cookies map[string]string, sessionPath string) error
+}
+
+func defaultPairDeps() pairDeps {
+	return pairDeps{
+		probe:      defaultPairBackendProbe,
+		exitWait:   pairBackendExitWait,
+		now:        time.Now,
+		sleep:      time.Sleep,
+		loadChrome: googlecookies.Load,
+		pair:       runPairing,
+	}
+}
+
 func RunPair(logger zerolog.Logger, args ...string) error {
+	return runPair(logger, args, defaultPairDeps())
+}
+
+func runPair(logger zerolog.Logger, args []string, deps pairDeps) error {
 	dataDir := app.DefaultDataDir()
 	if err := os.MkdirAll(dataDir, 0700); err != nil {
 		return fmt.Errorf("create data dir: %w", err)
@@ -58,8 +90,18 @@ func RunPair(logger zerolog.Logger, args ...string) error {
 	}
 
 	ctx := context.Background()
-	if err := waitForBackendToReleaseSession(ctx, dataDir, defaultPairBackendProbe, pairBackendExitWait, time.Sleep); err != nil {
+	if err := waitForBackendToReleaseSession(ctx, dataDir, deps.probe, deps.exitWait, deps.now, deps.sleep); err != nil {
 		return err
+	}
+
+	// Back up before the phone is asked anything: a backup that fails after
+	// the user confirmed would throw away a pairing the phone already made.
+	backup, err := backupReplacedSession(sessionPath, deps.now())
+	if err != nil {
+		return fmt.Errorf("back up %s before pairing: %w; fix its permissions or move it aside, then retry", sessionPath, err)
+	}
+	if backup != "" {
+		fmt.Println("Current session backed up to", backup)
 	}
 
 	var cookies map[string]string
@@ -71,75 +113,142 @@ func RunPair(logger zerolog.Logger, args ...string) error {
 	case pairModeGoogleChrome:
 		// Read right before pairing: Google rotates these cookies, and an
 		// older extract has failed pairing with HTTP 401.
-		if cookies, err = loadChromeCookiesForPairing(ctx, input, googlecookies.Load); err != nil {
+		if cookies, err = loadChromeCookiesForPairing(ctx, input, deps.loadChrome); err != nil {
 			return err
 		}
 	}
+	return deps.pair(logger, mode, cookies, sessionPath)
+}
 
+func runPairing(logger zerolog.Logger, mode pairMode, cookies map[string]string, sessionPath string) error {
 	cli := client.NewForPairing(logger)
 	defer cli.GM.Disconnect()
-
 	if mode == pairModeQR {
 		return runQRPairing(logger, cli, sessionPath)
 	}
 	return runGoogleAccountPairing(cli, sessionPath, cookies)
 }
 
-// pairBackendProbe reports whether an OpenMessage backend answers on the
-// local API port and, when its status says so, which data directory it serves.
-type pairBackendProbe func(ctx context.Context, dataDir string) (running bool, servedDataDir string, err error)
+// pairBackendState is what a probe of the local API port found.
+type pairBackendState struct {
+	Running bool
+	// StatusKnown is set when the backend answered with a status document.
+	StatusKnown bool
+	// DataDir is the data directory the backend serves, when it says.
+	DataDir string
+	// NoGoogleSession is set only when the status says google.paired=false:
+	// no session.json, so the backend holds no Google session to write back.
+	NoGoogleSession bool
+}
 
-func defaultPairBackendProbe(ctx context.Context, dataDir string) (bool, string, error) {
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
+// mayRewriteSession reports whether this backend could overwrite dataDir's
+// session.json: it rewrites the file when it refreshes tokens and rotates
+// cookies, and it keeps using its old session until it restarts. Anything
+// that answers without a usable status is assumed to.
+func (s pairBackendState) mayRewriteSession(dataDir string) bool {
+	switch {
+	case !s.Running:
+		return false
+	case !s.StatusKnown:
+		return true
+	case s.DataDir != "" && !samePath(s.DataDir, dataDir):
+		return false
+	default:
+		return !s.NoGoogleSession
+	}
+}
+
+type pairBackendProbe func(ctx context.Context, dataDir string) (pairBackendState, error)
+
+func defaultPairBackendProbe(ctx context.Context, dataDir string) (pairBackendState, error) {
 	probeURL := defaultBackendProbeURL()
 	running, err := probeBackend(ctx, &http.Client{}, probeURL)
 	if err != nil || !running {
-		return running, "", err
+		return pairBackendState{Running: running}, err
 	}
-	daemon := localapi.NewClient(strings.TrimSuffix(probeURL, "/api/status"), localapi.LoadControlToken(dataDir))
-	status, _, err := daemon.Status(ctx)
+	// The control token goes only to a backend on this machine.
+	token := ""
+	if pairProbeHostIsLocal() {
+		token = localapi.LoadControlToken(dataDir)
+	}
+	raw, err := localapi.NewClient(strings.TrimSuffix(probeURL, "/api/status"), token).RawStatus(ctx)
 	if err != nil {
-		// Something answers but does not say which data directory it serves.
-		return true, "", nil
+		return pairBackendState{Running: true}, nil
 	}
-	return true, strings.TrimSpace(status.Auth.DataDir), nil
+	state := pairBackendState{Running: true, StatusKnown: true}
+	if auth, ok := raw["auth"].(map[string]any); ok {
+		if dir, ok := auth["data_dir"].(string); ok {
+			state.DataDir = strings.TrimSpace(dir)
+		}
+	}
+	if google, ok := raw["google"].(map[string]any); ok {
+		if paired, ok := google["paired"].(bool); ok && !paired {
+			state.NoGoogleSession = true
+		}
+	}
+	return state, nil
 }
 
-// waitForBackendToReleaseSession refuses to pair while a running backend
-// serves dataDir. That backend owns session.json: it rewrites the file when it
-// refreshes tokens and rotates cookies, so it would overwrite the new pairing,
-// and it keeps using its old session until it restarts. A backend that names a
-// different data directory is no conflict. One that answers without naming
-// its directory is treated as a conflict, and so is a probe that fails for any
-// reason other than a refused connection (a hung backend).
-func waitForBackendToReleaseSession(ctx context.Context, dataDir string, probe pairBackendProbe, wait time.Duration, sleep func(time.Duration)) error {
+func pairProbeHostIsLocal() bool {
+	host := strings.TrimSpace(os.Getenv("OPENMESSAGES_HOST"))
+	if host == "" || strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(strings.Trim(host, "[]"))
+	return ip != nil && (ip.IsLoopback() || ip.IsUnspecified())
+}
+
+// waitForBackendToReleaseSession refuses to pair while a backend that may
+// rewrite dataDir's session.json answers on the API port (see
+// mayRewriteSession), after waiting up to wait for it to stop. A probe that
+// fails other than by a refused connection (a hung backend) also counts as
+// one. wait bounds wall time: each probe's timeout is capped at what is left.
+func waitForBackendToReleaseSession(
+	ctx context.Context,
+	dataDir string,
+	probe pairBackendProbe,
+	wait time.Duration,
+	now func() time.Time,
+	sleep func(time.Duration),
+) error {
 	const poll = 500 * time.Millisecond
+	deadline := now().Add(wait)
 	announced := false
-	for waited := time.Duration(0); ; waited += poll {
-		running, served, err := probe(ctx, dataDir)
-		if err == nil && (!running || (served != "" && !samePath(served, dataDir))) {
+	for {
+		timeout := min(pairProbeTimeout, max(deadline.Sub(now()), poll))
+		probeCtx, cancel := context.WithTimeout(ctx, timeout)
+		state, err := probe(probeCtx, dataDir)
+		cancel()
+		if err == nil && !state.mayRewriteSession(dataDir) {
 			return nil
 		}
-		if waited >= wait {
+		left := deadline.Sub(now())
+		if left <= 0 {
 			if err != nil {
-				return fmt.Errorf("cannot rule out a running OpenMessage backend at %s: %w; quit the OpenMessage app and retry", defaultBackendProbeURL(), err)
+				return fmt.Errorf("cannot rule out an OpenMessage backend at %s that holds the Google session in %s (%v); stop it and retry", defaultBackendProbeURL(), dataDir, err)
 			}
-			return fmt.Errorf("an OpenMessage backend at %s is running on %s; quit the OpenMessage app first (osascript -e 'quit app \"OpenMessage\"'), because it rewrites session.json and would overwrite the new pairing", defaultBackendProbeURL(), dataDir)
+			return fmt.Errorf("an OpenMessage backend at %s holds the Google session in %s; stop it first (macOS app: osascript -e 'quit app \"OpenMessage\"'; Docker: stop the container, then docker compose run --rm openmessage pair), because it rewrites session.json and would overwrite the new pairing", defaultBackendProbeURL(), dataDir)
 		}
 		if !announced {
-			fmt.Println("Waiting for the running OpenMessage backend to exit...")
+			fmt.Printf("Waiting for the OpenMessage backend at %s to stop...\n", defaultBackendProbeURL())
 			announced = true
 		}
-		sleep(poll)
+		sleep(min(poll, left))
 	}
 }
 
+// gaiaCancelGrace is how long pair waits for libgm to return once a Google
+// pairing is canceled. Not every libgm wait honours the context: the
+// long-poll connect wait in StartGaiaPairing is a bare sync.WaitGroup, and
+// its HTTP requests use context.TODO, so a cancel alone can leave pair
+// blocked. After the grace, pair returns and the process exits.
+const gaiaCancelGrace = 30 * time.Second
+
 // withGaiaConfirmTimeout runs a Google-account pairing and gives up when the
-// phone has not confirmed within timeout. It cancels (rather than lets a
-// deadline expire) because libgm sends the phone a pairing cancel only for
-// context.Canceled, which dismisses the stale prompt there.
-func withGaiaConfirmTimeout(ctx context.Context, timeout time.Duration, pair func(context.Context) error) error {
+// phone has not confirmed within timeout. It cancels rather than letting a
+// deadline expire because libgm sends the phone a pairing cancel only for
+// context.Canceled.
+func withGaiaConfirmTimeout(ctx context.Context, timeout, grace time.Duration, pair func(context.Context) error) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	var timedOut atomic.Bool
@@ -148,7 +257,18 @@ func withGaiaConfirmTimeout(ctx context.Context, timeout time.Duration, pair fun
 		cancel()
 	})
 	defer timer.Stop()
-	err := pair(ctx)
+	done := make(chan error, 1)
+	go func() { done <- pair(ctx) }()
+	var err error
+	select {
+	case err = <-done:
+	case <-ctx.Done():
+		select {
+		case err = <-done:
+		case <-time.After(grace):
+			err = fmt.Errorf("pairing did not stop within %v of being canceled: %w", grace, ctx.Err())
+		}
+	}
 	if err != nil && timedOut.Load() {
 		return fmt.Errorf("the phone did not confirm within %v; run pair again when you can tap the emoji in Google Messages: %w", timeout, err)
 	}
@@ -161,26 +281,16 @@ func withGaiaConfirmTimeout(ctx context.Context, timeout time.Duration, pair fun
 func loadChromeCookiesForPairing(ctx context.Context, profile string, load func(context.Context, string) (map[string]string, error)) (map[string]string, error) {
 	cookies, err := load(ctx, profile)
 	if err != nil {
-		return nil, fmt.Errorf("read Google cookies from Chrome profile %s: %w; sign that profile in to the Google account your phone's Google Messages uses, or pass another profile directory", profile, err)
+		return nil, fmt.Errorf("read Google cookies from Chrome profile %s: %w; sign that profile in to the Google account your phone's Google Messages uses, or pass another profile", profile, err)
 	}
 	fmt.Printf("Read %d Google cookies from Chrome profile %s\n", len(cookies), profile)
 	return cookies, nil
 }
 
-// savePairedSession writes a new pairing to sessionPath. A session it
-// replaces is first copied to session.json.bak-<time>, so a re-pair can be
-// rolled back by moving that file back.
-func savePairedSession(sessionPath string, data *client.SessionData, now time.Time) error {
-	backup, err := backupReplacedSession(sessionPath, now)
-	if err != nil {
-		return fmt.Errorf("back up the session being replaced: %w", err)
-	}
-	if backup != "" {
-		fmt.Println("Previous session backed up to", backup)
-	}
-	return client.SaveSession(sessionPath, data)
-}
-
+// backupReplacedSession copies an existing session.json to
+// session.json.bak-<time> (never overwriting an earlier backup), so a re-pair
+// can be rolled back by moving that file back. It returns "" when there is no
+// session to back up.
 func backupReplacedSession(sessionPath string, now time.Time) (string, error) {
 	raw, err := os.ReadFile(sessionPath)
 	if errors.Is(err, os.ErrNotExist) {
@@ -231,7 +341,7 @@ func runQRPairing(logger zerolog.Logger, cli *client.Client, sessionPath string)
 			pairErr = fmt.Errorf("get session data: %w", err)
 			return
 		}
-		if err := savePairedSession(sessionPath, sessionData, time.Now()); err != nil {
+		if err := client.SaveSession(sessionPath, sessionData); err != nil {
 			pairErr = fmt.Errorf("save session: %w", err)
 			return
 		}
@@ -326,9 +436,12 @@ func resolvePairMode(args []string) (pairMode, string, error) {
 		}
 		return pairModeGoogle, string(b), nil
 	case "--google-chrome":
+		if runtime.GOOS != "darwin" {
+			return "", "", fmt.Errorf("--google-chrome reads Chrome's cookies through the macOS keychain and works only on macOS; use --google-file or --google-stdin")
+		}
 		profile := googlecookies.DefaultChromeProfile()
 		if len(args) >= 2 && strings.TrimSpace(args[1]) != "" {
-			profile = strings.TrimSpace(args[1])
+			profile = chromeProfileDir(strings.TrimSpace(args[1]), profile)
 		}
 		if profile == "" {
 			return "", "", fmt.Errorf("--google-chrome: no Chrome profile directory; pass one or set OPENMESSAGE_CHROME_PROFILE")
@@ -345,13 +458,29 @@ func resolvePairMode(args []string) (pairMode, string, error) {
 // (2026-10-16: still waiting after 10 minutes) while the app stayed quit.
 const gaiaConfirmTimeout = 5 * time.Minute
 
+// chromeProfileDir resolves a --google-chrome argument. A bare profile name
+// such as "Profile 1" names a directory beside the default profile; anything
+// with a path separator is a path.
+func chromeProfileDir(arg, defaultProfile string) string {
+	if strings.ContainsRune(arg, filepath.Separator) || defaultProfile == "" {
+		return arg
+	}
+	return filepath.Join(filepath.Dir(defaultProfile), arg)
+}
+
 func runGoogleAccountPairing(cli *client.Client, sessionPath string, cookies map[string]string) error {
 	cli.GM.AuthData.Cookies = cookies
 
 	fmt.Println("Starting Google account pairing...")
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	err := withGaiaConfirmTimeout(ctx, gaiaConfirmTimeout, func(ctx context.Context) error {
+	// After the first signal, restore the default action so a second Ctrl-C
+	// or SIGTERM ends the process even if libgm is stuck in a wait.
+	go func() {
+		<-ctx.Done()
+		stop()
+	}()
+	err := withGaiaConfirmTimeout(ctx, gaiaConfirmTimeout, gaiaCancelGrace, func(ctx context.Context) error {
 		return cli.GM.DoGaiaPairing(ctx, func(emoji string) {
 			fmt.Println("EMOJI:", emoji)
 			fmt.Println("Tap this emoji in Google Messages on your phone.")
@@ -365,7 +494,7 @@ func runGoogleAccountPairing(cli *client.Client, sessionPath string, cookies map
 	if err != nil {
 		return fmt.Errorf("get session data: %w", err)
 	}
-	if err := savePairedSession(sessionPath, sessionData, time.Now()); err != nil {
+	if err := client.SaveSession(sessionPath, sessionData); err != nil {
 		return fmt.Errorf("save session: %w", err)
 	}
 	fmt.Println("\nPairing successful!")
