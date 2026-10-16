@@ -76,6 +76,31 @@ curl -s "http://127.0.0.1:7007/api/conversations/<id>/messages?limit=1" | jq '.[
 The web UI reads `TimestampMS` throughout, so these names are a stable contract
 — don't "fix" them by renaming.
 
+### Sent messages showing twice (Google echo without a TmpID)
+
+**Symptom:** every SMS/RCS message sent from OpenMessage shows twice in its
+thread. One copy has `Status: "sent"` and a 32-hex `source_id` (the local
+row). The other has an empty `Status` and Google's numeric message id (the
+echo). `v2_ingest.per_account.google-primary.echo_*` counters stay at 0.
+
+**Cause (decoded from raw inbox frames, 2026-10-16):** the phone echoes
+each sent message with an empty `TmpID`. Correlation used only the `TmpID`
+(`bridge.MessageEvent.ClientRequestID`), so the echo never reached the
+outbox reconcile and projected as its own row. The v2 store holds the same
+doubling for sends on 9/22 and 9/29, under the old QR pairing.
+
+**Fix (#245):** an outgoing Google text echo without a `TmpID` is
+correlated by content: the oldest sent-but-unbound text intent in the same
+thread with the identical body, created between 30 minutes before and 2
+minutes after the echo's timestamp. It then takes the normal reconcile, which
+repoints the local row and merges any echo row. `echo_content_matched`
+counts these. A daemon-startup sweep merges the duplicates already stored
+(on the 10/16 live-store copy: 42 merged, 0 left). Media sends are not
+content-matched.
+
+To inspect a frame's `TmpID`, decode `inbox.payload`'s `proto_b64` as
+`gmproto.Message`.
+
 ## v2 cutover: conversation IDs re-key (issue #155)
 
 On a **v2-primary** install the API serves the v2 store, where a conversation's
