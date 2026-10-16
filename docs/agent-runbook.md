@@ -1386,8 +1386,9 @@ Upstream mautrix-gmessages' (commented-out) alert for this state reads
    the first pull after relaunch returned 100 conversations with
    `last_outcome: ok`, the account switch was gone, and a real send was
    delivered.
-2. Switch the phone back to QR/device pairing. Google's help says QR pairing
-   for web is no longer offered in the US (d1104), so this may not exist.
+2. Switch the phone back to QR/device pairing. Not tried: decision d1104
+   records that Google's help page says QR pairing for web is no longer
+   offered in the US, so the option may not exist.
 
 ### Don't over-reconnect
 
