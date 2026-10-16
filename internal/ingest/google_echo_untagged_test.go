@@ -4,7 +4,9 @@ package ingest
 // every message sent from OpenMessage with an empty TmpID (raw inbox frames,
 // 2026-10-16), so the TmpID correlation never ran and each send showed twice:
 // the local row and the echo row. These tests drive the real service, worker
-// and store.
+// and store, and check every pairing against the ground truth: each send must
+// end bound to its own echo, and every text typed on the phone stays its own
+// message.
 
 import (
 	"context"
@@ -12,7 +14,6 @@ import (
 	"fmt"
 	"math/rand"
 	"reflect"
-	"sort"
 	"testing"
 	"testing/quick"
 	"time"
@@ -20,6 +21,7 @@ import (
 	"go.mau.fi/mautrix-gmessages/pkg/libgm/gmproto"
 
 	"github.com/maxghenis/openmessage/internal/messaging"
+	"github.com/maxghenis/openmessage/internal/storage/sqlite"
 )
 
 // transportEchoOnly hides ObserveUncorrelatedEcho, standing in for a build
@@ -54,12 +56,38 @@ func (h *googleEchoHarness) waitDrained(t *testing.T) {
 	t.Fatalf("inbox not drained; counters=%+v", h.counters.Snapshot(googleEchoAccountID))
 }
 
-// sendAt submits and confirms a text with the service clock at at, so its
-// outbox row is created then.
-func (h *googleEchoHarness) sendAt(t *testing.T, key, body string, at time.Time) (messaging.Submission, string) {
+// phoneClockOffset puts the phone's clock well off this machine's, so no
+// test can pass by pairing on the phone's stamp instead of the receipt time.
+// The odd milliseconds keep a phone stamp from landing exactly on a local
+// send's timestamp, which the store's same-millisecond content dedupe would
+// (rightly) treat as one message.
+const phoneClockOffset = -45123 * time.Millisecond
+
+// echo delivers an outgoing frame with no TmpID that this machine receives
+// at arrivedAt (the clock only moves forward). A reconcile error fails the
+// test: a test must never pass because the matcher errored out.
+func (h *googleEchoHarness) echo(t *testing.T, remoteID, body string, status gmproto.MessageStatusType, arrivedAt time.Time) {
 	t.Helper()
-	h.clock.Set(at)
-	return h.enqueueAndConfirm(t, key, body)
+	if arrivedAt.Before(h.clock.Now()) {
+		t.Fatalf("echo arrives at %v, before the clock's %v", arrivedAt, h.clock.Now())
+	}
+	h.clock.Set(arrivedAt)
+	h.appendMessage(t, untaggedEcho(remoteID, body, status, arrivedAt.Add(phoneClockOffset)))
+	h.waitDrained(t)
+	if errors := h.counters.Snapshot(googleEchoAccountID).EchoErrors; errors != 0 {
+		t.Fatalf("echo reconcile failed %d times", errors)
+	}
+}
+
+// sendAt submits a text at createdAt and confirms it at sentAt (the moment
+// the transport answered; equal unless the send was retried or scheduled).
+func (h *googleEchoHarness) sendAt(t *testing.T, key, body string, createdAt, sentAt time.Time) messaging.Submission {
+	t.Helper()
+	h.clock.Set(createdAt)
+	submission, _ := h.enqueue(t, key, body)
+	h.clock.Set(sentAt)
+	h.confirm(t, submission.OutboxID)
+	return submission
 }
 
 // remoteIDs maps every message row in the test conversation to its remote ID.
@@ -89,196 +117,383 @@ func (h *googleEchoHarness) remoteIDs(t *testing.T) map[string]string {
 	return out
 }
 
-func (h *googleEchoHarness) deliveryRemoteID(t *testing.T, outboxID string) string {
+// occurredAt returns the stored timestamp of the row holding remoteID.
+func (h *googleEchoHarness) occurredAt(t *testing.T, remoteID string) int64 {
+	t.Helper()
+	return int64(countSQLiteRows(t, h.storePath,
+		"SELECT occurred_at_ms FROM messages WHERE account_id = ? AND conversation_id = ? AND remote_message_id = ?",
+		googleEchoAccountID, googleEchoConversationID, remoteID))
+}
+
+func (h *googleEchoHarness) delivery(t *testing.T, outboxID string) messaging.Delivery {
 	t.Helper()
 	delivery, err := h.service.Get(context.Background(), outboxID)
 	if err != nil {
 		t.Fatalf("MessageService.Get(): %v", err)
 	}
-	if delivery.State != messaging.OutboxConfirmed {
-		t.Fatalf("delivery %q state = %q, want confirmed", outboxID, delivery.State)
-	}
-	return delivery.RemoteMessageID
+	return delivery
 }
+
+func (h *googleEchoHarness) assertBound(t *testing.T, submission messaging.Submission, remoteID string) {
+	t.Helper()
+	ids := h.remoteIDs(t)
+	if ids[submission.LocalMessageID] != remoteID {
+		t.Fatalf("send %s holds %q, want its echo %q (rows %v)", submission.LocalMessageID, ids[submission.LocalMessageID], remoteID, ids)
+	}
+	if delivery := h.delivery(t, submission.OutboxID); delivery.State != messaging.OutboxConfirmed || delivery.RemoteMessageID != remoteID {
+		t.Fatalf("delivery = %+v, want confirmed at %q", delivery, remoteID)
+	}
+}
+
+const (
+	complete  = gmproto.MessageStatusType_OUTGOING_COMPLETE
+	delivered = gmproto.MessageStatusType_OUTGOING_DELIVERED
+)
 
 func TestGoogleEchoWithoutTmpIDMergesIntoTheSentMessage(t *testing.T) {
 	h := newGoogleEchoHarness(t, nil)
-	submission, requestID := h.sendAt(t, "untagged", "Yes a few hours ago", googleEchoNow)
-
-	// The live sequence: OUTGOING_COMPLETE about a second after the send,
+	send := h.sendAt(t, "untagged", "Yes a few hours ago", googleEchoNow, googleEchoNow.Add(time.Second))
+	// The live sequence: OUTGOING_COMPLETE received 0.8 s after the confirm,
 	// then OUTGOING_DELIVERED for the same message ID.
-	h.appendMessage(t, untaggedEcho("89087", "Yes a few hours ago", gmproto.MessageStatusType_OUTGOING_COMPLETE, googleEchoNow.Add(time.Second)))
-	h.appendMessage(t, untaggedEcho("89087", "Yes a few hours ago", gmproto.MessageStatusType_OUTGOING_DELIVERED, googleEchoNow.Add(time.Second)))
-	h.waitDrained(t)
+	h.echo(t, "89087", "Yes a few hours ago", complete, googleEchoNow.Add(1800*time.Millisecond))
+	h.echo(t, "89087", "Yes a few hours ago", delivered, googleEchoNow.Add(3*time.Second))
 
-	h.assertSinglePermanentMessage(t, submission.LocalMessageID, requestID, "89087")
-	if got := h.deliveryRemoteID(t, submission.OutboxID); got != "89087" {
-		t.Fatalf("delivery remote ID = %q, want the echo's", got)
+	h.assertBound(t, send, "89087")
+	if got := h.countV2Messages(t); got != 1 {
+		t.Fatalf("messages = %d, want one", got)
 	}
 	if snapshot := h.counters.Snapshot(googleEchoAccountID); snapshot.EchoContentMatched != 1 || snapshot.EchoErrors != 0 {
 		t.Fatalf("counters = %+v, want one content match and no errors", snapshot)
 	}
 }
 
-// An echo that outruns the dispatcher's confirm projects as its own row (the
-// intent is not sendable-confirmed yet); the next status frame for the same
-// message merges it.
-func TestGoogleEchoWithoutTmpIDBeforeConfirmConvergesOnTheNextStatusFrame(t *testing.T) {
+// Reviewer R2: every echo frame outruns the confirm, so the echo projects as
+// its own row. The next frame with that body, even a text typed on the
+// phone, must pair the send with its real echo row, not with itself.
+func TestGoogleEchoBeforeConfirmMergesTheRealEchoNotALaterPhoneText(t *testing.T) {
 	h := newGoogleEchoHarness(t, nil)
-	submission, requestID := h.enqueue(t, "early", "echo outran confirm")
-	h.appendMessage(t, untaggedEcho("90001", "echo outran confirm", gmproto.MessageStatusType_OUTGOING_COMPLETE, googleEchoNow.Add(time.Second)))
-	h.waitDrained(t)
+	submission, _ := h.enqueue(t, "early", "ok")
+	h.echo(t, "97001", "ok", complete, googleEchoNow.Add(300*time.Millisecond))
+	h.echo(t, "97001", "ok", delivered, googleEchoNow.Add(500*time.Millisecond))
+	h.clock.Set(googleEchoNow.Add(time.Second))
+	h.confirm(t, submission.OutboxID)
 	if got := h.countV2Messages(t); got != 2 {
-		t.Fatalf("messages before confirm = %d, want local plus echo", got)
+		t.Fatalf("messages after confirm = %d, want local plus echo", got)
 	}
 
-	h.confirm(t, submission.OutboxID)
-	h.appendMessage(t, untaggedEcho("90001", "echo outran confirm", gmproto.MessageStatusType_OUTGOING_DELIVERED, googleEchoNow.Add(time.Second)))
-	h.waitDrained(t)
-	h.assertSinglePermanentMessage(t, submission.LocalMessageID, requestID, "90001")
+	h.echo(t, "97002", "ok", complete, googleEchoNow.Add(9*time.Second)) // typed on the phone
+	h.assertBound(t, submission, "97001")
+	if ids := h.remoteIDs(t); len(ids) != 2 {
+		t.Fatalf("messages = %v, want the send and the phone's own text", ids)
+	}
 }
 
-func TestGoogleEchoWithoutTmpIDLeavesUnrelatedMessagesAlone(t *testing.T) {
-	cases := []struct {
-		name       string
-		body       string
-		occurredAt time.Time
-	}{
-		{name: "different body", body: "something else", occurredAt: googleEchoNow.Add(time.Second)},
-		{name: "stamped too long after the send", body: "hello", occurredAt: googleEchoNow.Add(31 * time.Minute)},
-		{name: "stamped too long before the send", body: "hello", occurredAt: googleEchoNow.Add(-3 * time.Minute)},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			h := newGoogleEchoHarness(t, nil)
-			submission, requestID := h.sendAt(t, "send", "hello", googleEchoNow)
-			h.appendMessage(t, untaggedEcho("91000", tc.body, gmproto.MessageStatusType_OUTGOING_COMPLETE, tc.occurredAt))
-			h.waitDrained(t)
+// Reviewer R1: a text typed on the phone a minute before an identical send
+// must not be taken for the send's echo by the startup repair.
+func TestRepairPrefersTheEchoOverAnEarlierPhoneText(t *testing.T) {
+	h := newGoogleEchoHarnessWithObserver(t, nil, preFixObserver)
+	h.echo(t, "96001", "Yes", complete, googleEchoNow) // typed on the phone
+	send := h.sendAt(t, "send", "Yes", googleEchoNow.Add(time.Minute), googleEchoNow.Add(time.Minute+time.Second))
+	h.echo(t, "96002", "Yes", complete, googleEchoNow.Add(time.Minute+1400*time.Millisecond))
+	phoneAt := h.occurredAt(t, "96001")
 
-			ids := h.remoteIDs(t)
-			if len(ids) != 2 || ids[submission.LocalMessageID] != requestID {
-				t.Fatalf("messages = %v, want the unbound send plus the phone's own message", ids)
+	report, err := h.service.RepairUncorrelatedEchoDuplicates(context.Background())
+	if err != nil || report.Merged != 1 {
+		t.Fatalf("repair = %+v, %v; want one merge", report, err)
+	}
+	h.assertBound(t, send, "96002")
+	if got := h.occurredAt(t, "96001"); got != phoneAt {
+		t.Fatalf("phone text's time changed from %d to %d", phoneAt, got)
+	}
+	if got := h.countV2Messages(t); got != 2 {
+		t.Fatalf("messages = %d, want the send and the phone text", got)
+	}
+}
+
+// Reviewer R4: a scheduled or retried send goes out long after it was
+// created. The window is measured from when it went out.
+func TestGoogleEchoOfALateSendMerges(t *testing.T) {
+	for _, viaRepair := range []bool{false, true} {
+		t.Run(fmt.Sprintf("viaRepair=%v", viaRepair), func(t *testing.T) {
+			var h *googleEchoHarness
+			if viaRepair {
+				h = newGoogleEchoHarnessWithObserver(t, nil, preFixObserver)
+			} else {
+				h = newGoogleEchoHarness(t, nil)
 			}
-			if got := h.deliveryRemoteID(t, submission.OutboxID); got != requestID {
-				t.Fatalf("delivery remote ID = %q, want it still on the request ID", got)
+			sentAt := googleEchoNow.Add(47 * time.Minute)
+			send := h.sendAt(t, "late", "see you Saturday", googleEchoNow, sentAt)
+			h.echo(t, "86953", "see you Saturday", delivered, sentAt.Add(500*time.Millisecond))
+			if viaRepair {
+				if _, err := h.service.RepairUncorrelatedEchoDuplicates(context.Background()); err != nil {
+					t.Fatalf("repair: %v", err)
+				}
 			}
-			if snapshot := h.counters.Snapshot(googleEchoAccountID); snapshot.EchoContentMatched != 0 {
-				t.Fatalf("counters = %+v, want no content match", snapshot)
-			}
+			h.assertBound(t, send, "86953")
 		})
 	}
 }
 
-func TestGoogleEchoWithoutTmpIDFromThePhoneProjectsNormally(t *testing.T) {
+// Reviewer R3: when an uncertain send is sent again, the resend owns the
+// echo. The uncertain original must stay uncertain, not flip to delivered.
+func TestGoogleEchoBelongsToTheResendNotTheUncertainOriginal(t *testing.T) {
 	h := newGoogleEchoHarness(t, nil)
-	h.appendMessage(t, untaggedEcho("92000", "typed on the phone", gmproto.MessageStatusType_OUTGOING_COMPLETE, googleEchoNow))
-	h.waitDrained(t)
-	if ids := h.remoteIDs(t); len(ids) != 1 {
-		t.Fatalf("messages = %v, want the one phone message", ids)
+	h.sender.uncertain = true
+	original, _ := h.enqueue(t, "original", "running late")
+	if _, err := h.service.DispatchDue(context.Background(), 1); err != nil {
+		t.Fatalf("DispatchDue(original): %v", err)
 	}
-	if snapshot := h.counters.Snapshot(googleEchoAccountID); snapshot.EchoContentMatched != 0 || snapshot.EchoErrors != 0 {
-		t.Fatalf("counters = %+v", snapshot)
+	if state := h.delivery(t, original.OutboxID).State; state != messaging.OutboxUncertain {
+		t.Fatalf("original state = %q, want uncertain", state)
+	}
+	h.sender.uncertain = false
+	h.clock.Set(googleEchoNow.Add(30 * time.Second))
+	resend, err := h.service.SendAgain(context.Background(), original.OutboxID, "resend-key")
+	if err != nil {
+		t.Fatalf("SendAgain(): %v", err)
+	}
+	h.confirm(t, resend.OutboxID)
+	h.echo(t, "98001", "running late", complete, googleEchoNow.Add(30500*time.Millisecond))
+
+	h.assertBound(t, resend, "98001")
+	if delivery := h.delivery(t, original.OutboxID); delivery.State != messaging.OutboxUncertain {
+		t.Fatalf("original = %+v, want it left uncertain", delivery)
 	}
 }
 
-func TestGoogleEchoWithoutTmpIDPairsRepeatedTextsOldestFirst(t *testing.T) {
+// Reviewer R6: Google reuses message IDs after a device ID-space reset. An ID
+// already bound in another thread must not block this thread's merge.
+func TestGoogleEchoWhoseIDIsBoundInAnotherThreadStillMerges(t *testing.T) {
 	h := newGoogleEchoHarness(t, nil)
-	first, _ := h.sendAt(t, "first", "ok", googleEchoNow)
-	second, _ := h.sendAt(t, "second", "ok", googleEchoNow.Add(5*time.Second))
+	nowMS := googleEchoNow.UnixMilli()
+	if err := h.store.UpsertConversation(sqlite.Conversation{
+		ConversationID:       "other-thread",
+		AccountID:            googleEchoAccountID,
+		RemoteConversationID: "other-remote",
+		Kind:                 sqlite.ConversationKindDirect,
+		Title:                "Other",
+		NotificationMode:     sqlite.NotificationModeAll,
+		MetadataJSON:         `{}`,
+		CreatedAtMS:          nowMS,
+		UpdatedAtMS:          nowMS,
+	}); err != nil {
+		t.Fatalf("UpsertConversation(other): %v", err)
+	}
+	other, err := h.service.SendText(context.Background(), messaging.SendTextCommand{
+		CommonCommand: messaging.CommonCommand{AccountID: googleEchoAccountID, ConversationID: "other-thread", IdempotencyKey: "other"},
+		Body:          "old",
+	})
+	if err != nil {
+		t.Fatalf("SendText(other): %v", err)
+	}
+	h.confirm(t, other.OutboxID)
+	outbox, err := sqlite.NewOutboxRepository(h.store, h.clock.Now)
+	if err != nil {
+		t.Fatalf("NewOutboxRepository(): %v", err)
+	}
+	item, err := outbox.FindByID(context.Background(), other.OutboxID)
+	if err != nil {
+		t.Fatalf("FindByID(): %v", err)
+	}
+	if _, err := outbox.ReconcileConfirm(context.Background(), sqlite.ReconcileRequest{
+		AccountID: googleEchoAccountID, TransportRequestID: item.TransportRequestID, ResultRemoteID: "85896",
+	}); err != nil {
+		t.Fatalf("bind the other thread's send: %v", err)
+	}
+
+	send := h.sendAt(t, "here", "hello", googleEchoNow.Add(time.Minute), googleEchoNow.Add(time.Minute))
+	h.echo(t, "85896", "hello", complete, googleEchoNow.Add(time.Minute+500*time.Millisecond))
+	h.assertBound(t, send, "85896")
+}
+
+// Intents that are still in flight or never went out are never paired.
+func TestGoogleEchoIgnoresSendsThatDidNotGoOut(t *testing.T) {
+	h := newGoogleEchoHarness(t, nil)
+	queued, requestID := h.enqueue(t, "queued", "hello")
+	h.echo(t, "99001", "hello", complete, googleEchoNow.Add(time.Second))
+	if ids := h.remoteIDs(t); len(ids) != 2 || ids[queued.LocalMessageID] != requestID {
+		t.Fatalf("messages = %v, want the queued send left alone", ids)
+	}
+	if _, err := h.service.Cancel(context.Background(), queued.OutboxID); err != nil {
+		t.Fatalf("Cancel(): %v", err)
+	}
+	h.echo(t, "99001", "hello", delivered, googleEchoNow.Add(time.Second))
+	if delivery := h.delivery(t, queued.OutboxID); delivery.State != messaging.OutboxCanceled {
+		t.Fatalf("canceled send = %+v, want it left canceled", delivery)
+	}
+	if report, err := h.service.RepairUncorrelatedEchoDuplicates(context.Background()); err != nil || report.Merged != 0 {
+		t.Fatalf("repair = %+v, %v; want no merge into a canceled send", report, err)
+	}
+}
+
+func TestGoogleEchoWithoutTmpIDLeavesUnrelatedMessagesAlone(t *testing.T) {
+	t.Run("different body", func(t *testing.T) {
+		h := newGoogleEchoHarness(t, nil)
+		send := h.sendAt(t, "send", "hello", googleEchoNow, googleEchoNow)
+		h.echo(t, "91000", "something else", complete, googleEchoNow.Add(500*time.Millisecond))
+		assertUnpaired(t, h, send, "91000")
+	})
+	t.Run("received too long after the send went out", func(t *testing.T) {
+		h := newGoogleEchoHarness(t, nil)
+		send := h.sendAt(t, "send", "hello", googleEchoNow, googleEchoNow)
+		h.echo(t, "91000", "hello", complete, googleEchoNow.Add(7*time.Second))
+		assertUnpaired(t, h, send, "91000")
+	})
+	t.Run("received too long before the send went out", func(t *testing.T) {
+		h := newGoogleEchoHarness(t, nil)
+		// The send waits a minute (retrying); the phone text lands 6 s before
+		// it finally goes out, and a status frame for it lands after.
+		h.clock.Set(googleEchoNow.Add(-time.Minute))
+		submission, _ := h.enqueue(t, "send", "hello")
+		h.echo(t, "91000", "hello", complete, googleEchoNow.Add(-6*time.Second))
+		h.clock.Set(googleEchoNow)
+		h.confirm(t, submission.OutboxID)
+		h.echo(t, "91000", "hello", delivered, googleEchoNow.Add(time.Second))
+		assertUnpaired(t, h, submission, "91000")
+	})
+	t.Run("received a few seconds late still pairs", func(t *testing.T) {
+		h := newGoogleEchoHarness(t, nil)
+		send := h.sendAt(t, "send", "hello", googleEchoNow, googleEchoNow)
+		h.echo(t, "91000", "hello", complete, googleEchoNow.Add(5*time.Second))
+		h.assertBound(t, send, "91000")
+	})
+}
+
+func assertUnpaired(t *testing.T, h *googleEchoHarness, send messaging.Submission, remoteID string) {
+	t.Helper()
+	if delivery := h.delivery(t, send.OutboxID); delivery.RemoteMessageID == remoteID {
+		t.Fatalf("send paired with an unrelated message: %+v", delivery)
+	}
+	if got := h.countV2Messages(t); got != 2 {
+		t.Fatalf("messages = %d, want the send and the phone's own message", got)
+	}
+	if snapshot := h.counters.Snapshot(googleEchoAccountID); snapshot.EchoContentMatched != 0 {
+		t.Fatalf("counters = %+v, want no content match", snapshot)
+	}
+}
+
+// When the resend's echo outruns the resend's own confirm, the uncertain
+// original is the only unbound send with that body. It must not take the echo.
+func TestGoogleEchoOutrunningAResendIsNotGivenToTheUncertainOriginal(t *testing.T) {
+	h := newGoogleEchoHarness(t, nil)
+	h.sender.uncertain = true
+	original, _ := h.enqueue(t, "original", "running late")
+	if _, err := h.service.DispatchDue(context.Background(), 1); err != nil {
+		t.Fatalf("DispatchDue(original): %v", err)
+	}
+	h.sender.uncertain = false
+	h.clock.Set(googleEchoNow.Add(time.Second))
+	resend, err := h.service.SendAgain(context.Background(), original.OutboxID, "resend-key")
+	if err != nil {
+		t.Fatalf("SendAgain(): %v", err)
+	}
+	h.echo(t, "98002", "running late", complete, googleEchoNow.Add(1200*time.Millisecond))
+	h.clock.Set(googleEchoNow.Add(1500 * time.Millisecond))
+	h.confirm(t, resend.OutboxID)
+	h.echo(t, "98002", "running late", delivered, googleEchoNow.Add(2*time.Second))
+
+	h.assertBound(t, resend, "98002")
+	if delivery := h.delivery(t, original.OutboxID); delivery.State != messaging.OutboxUncertain {
+		t.Fatalf("original = %+v, want it left uncertain", delivery)
+	}
+}
+
+// A canceled send of the same text, canceled just before the echo arrives,
+// fits the echo's timing better than the real send. It must not absorb the
+// pairing: the real send still takes its echo.
+func TestGoogleEchoIsNotSpentOnACanceledSend(t *testing.T) {
+	h := newGoogleEchoHarness(t, nil)
+	send := h.sendAt(t, "send", "hello", googleEchoNow, googleEchoNow)
+	h.clock.Set(googleEchoNow.Add(400 * time.Millisecond))
+	canceled, _ := h.enqueue(t, "canceled", "hello")
+	h.clock.Set(googleEchoNow.Add(500 * time.Millisecond))
+	if _, err := h.service.Cancel(context.Background(), canceled.OutboxID); err != nil {
+		t.Fatalf("Cancel(): %v", err)
+	}
+	h.echo(t, "99002", "hello", complete, googleEchoNow.Add(time.Second))
+	h.assertBound(t, send, "99002")
+}
+
+func TestGoogleEchoWithoutTmpIDPairsRepeatedTextsWithTheirOwnEchoes(t *testing.T) {
+	h := newGoogleEchoHarness(t, nil)
+	first := h.sendAt(t, "first", "ok", googleEchoNow, googleEchoNow)
 	// Each echo comes back once per status. The first message's DELIVERED
-	// frame lands before the second message's first echo and must not claim
-	// the second send, which would merge the two messages into one.
-	h.appendMessage(t, untaggedEcho("93001", "ok", gmproto.MessageStatusType_OUTGOING_COMPLETE, googleEchoNow.Add(time.Second)))
-	h.appendMessage(t, untaggedEcho("93001", "ok", gmproto.MessageStatusType_OUTGOING_DELIVERED, googleEchoNow.Add(time.Second)))
-	h.appendMessage(t, untaggedEcho("93002", "ok", gmproto.MessageStatusType_OUTGOING_COMPLETE, googleEchoNow.Add(6*time.Second)))
-	h.appendMessage(t, untaggedEcho("93002", "ok", gmproto.MessageStatusType_OUTGOING_DELIVERED, googleEchoNow.Add(6*time.Second)))
-	h.waitDrained(t)
-
-	ids := h.remoteIDs(t)
-	if len(ids) != 2 || ids[first.LocalMessageID] != "93001" || ids[second.LocalMessageID] != "93002" {
-		t.Fatalf("messages = %v, want first->93001 and second->93002", ids)
+	// frame lands after the second send and must not claim it, which would
+	// merge the two messages into one.
+	h.echo(t, "93001", "ok", complete, googleEchoNow.Add(500*time.Millisecond))
+	second := h.sendAt(t, "second", "ok", googleEchoNow.Add(time.Second), googleEchoNow.Add(time.Second))
+	h.echo(t, "93001", "ok", delivered, googleEchoNow.Add(1200*time.Millisecond))
+	h.echo(t, "93002", "ok", complete, googleEchoNow.Add(1500*time.Millisecond))
+	h.echo(t, "93002", "ok", delivered, googleEchoNow.Add(2*time.Second))
+	h.assertBound(t, first, "93001")
+	h.assertBound(t, second, "93002")
+	if got := h.countV2Messages(t); got != 2 {
+		t.Fatalf("messages = %d, want two", got)
 	}
 }
 
-func TestRepairUncorrelatedEchoDuplicatesMergesPreFixDuplicates(t *testing.T) {
+func TestRepairUncorrelatedEchoDuplicatesIsIdempotent(t *testing.T) {
 	h := newGoogleEchoHarnessWithObserver(t, nil, preFixObserver)
-	a1, _ := h.sendAt(t, "a1", "same text", googleEchoNow)
-	b, _ := h.sendAt(t, "b", "other text", googleEchoNow.Add(10*time.Second))
-	a2, _ := h.sendAt(t, "a2", "same text", googleEchoNow.Add(20*time.Second))
-	for _, echo := range []*gmproto.Message{
-		untaggedEcho("94001", "same text", gmproto.MessageStatusType_OUTGOING_DELIVERED, googleEchoNow.Add(time.Second)),
-		untaggedEcho("94002", "other text", gmproto.MessageStatusType_OUTGOING_DELIVERED, googleEchoNow.Add(11*time.Second)),
-		untaggedEcho("94003", "same text", gmproto.MessageStatusType_OUTGOING_DELIVERED, googleEchoNow.Add(21*time.Second)),
-		// The same words typed on the phone an hour later stay their own message.
-		untaggedEcho("94004", "same text", gmproto.MessageStatusType_OUTGOING_DELIVERED, googleEchoNow.Add(time.Hour)),
-	} {
-		h.appendMessage(t, echo)
-	}
-	h.waitDrained(t)
-	if got := h.countV2Messages(t); got != 7 {
-		t.Fatalf("messages before repair = %d, want 3 sends + 3 echo duplicates + 1 phone message", got)
+	a := h.sendAt(t, "a", "same text", googleEchoNow, googleEchoNow)
+	h.echo(t, "94001", "same text", delivered, googleEchoNow.Add(500*time.Millisecond))
+	b := h.sendAt(t, "b", "same text", googleEchoNow.Add(time.Minute), googleEchoNow.Add(time.Minute))
+	h.echo(t, "94002", "same text", delivered, googleEchoNow.Add(time.Minute+500*time.Millisecond))
+	h.echo(t, "94003", "same text", delivered, googleEchoNow.Add(time.Hour)) // typed on the phone
+	if got := h.countV2Messages(t); got != 5 {
+		t.Fatalf("messages before repair = %d, want 2 sends + 2 echoes + 1 phone text", got)
 	}
 
 	report, err := h.service.RepairUncorrelatedEchoDuplicates(context.Background())
-	if err != nil {
-		t.Fatalf("RepairUncorrelatedEchoDuplicates(): %v", err)
+	if err != nil || report.Merged != 2 || report.Failed != 0 {
+		t.Fatalf("repair = %+v, %v; want 2 merged", report, err)
 	}
-	if report.Unbound != 3 || report.Merged != 3 {
-		t.Fatalf("report = %+v, want 3 unbound, 3 merged", report)
+	h.assertBound(t, a, "94001")
+	h.assertBound(t, b, "94002")
+	if got := h.countV2Messages(t); got != 3 {
+		t.Fatalf("messages after repair = %d, want 2 sends + the phone text", got)
 	}
-	ids := h.remoteIDs(t)
-	want := map[string]string{a1.LocalMessageID: "94001", b.LocalMessageID: "94002", a2.LocalMessageID: "94003"}
-	if len(ids) != 4 {
-		t.Fatalf("messages after repair = %v, want 3 sends + the phone message", ids)
-	}
-	for local, remote := range want {
-		if ids[local] != remote {
-			t.Fatalf("messages after repair = %v, want %s->%s", ids, local, remote)
-		}
-	}
-	for _, submission := range []messaging.Submission{a1, b, a2} {
-		if got := h.deliveryRemoteID(t, submission.OutboxID); got != want[submission.LocalMessageID] {
-			t.Fatalf("delivery %s remote = %q, want %q", submission.OutboxID, got, want[submission.LocalMessageID])
-		}
-	}
-
 	again, err := h.service.RepairUncorrelatedEchoDuplicates(context.Background())
-	if err != nil || again.Unbound != 0 || again.Merged != 0 {
+	if err != nil || again.Groups != 0 || again.Merged != 0 {
 		t.Fatalf("second repair = %+v, %v; want nothing left to do", again, err)
 	}
 }
 
-// echoScenario is a random interleaving of sends from OpenMessage and texts
-// typed on the phone, every one echoed with no TmpID, all inside the match
-// window and arriving in timestamp order.
+// echoScenario interleaves sends from OpenMessage with texts typed on the
+// phone, in time order, at least a second apart. Each send's echo is
+// received 0.2-0.8 s after its confirm (as on the live store), or (outran)
+// that long before it, with a DELIVERED re-delivery after the confirm.
 type echoScenario struct {
 	events []echoScenarioEvent
 }
 
 type echoScenarioEvent struct {
 	fromApp bool
+	outran  bool
 	body    string
 	at      time.Duration // after googleEchoNow
+	lag     time.Duration // echo receipt relative to the confirm
 }
 
 func (echoScenario) Generate(r *rand.Rand, _ int) reflect.Value {
-	n := 1 + r.Intn(6)
+	n := 1 + r.Intn(7)
 	var scenario echoScenario
 	at := time.Duration(0)
 	for i := 0; i < n; i++ {
-		at += time.Duration(1+r.Intn(20)) * time.Second
+		at += time.Duration(1+r.Intn(40)) * time.Second
 		scenario.events = append(scenario.events, echoScenarioEvent{
 			fromApp: r.Intn(3) != 0,
+			outran:  r.Intn(4) == 0,
 			body:    []string{"ok", "on my way"}[r.Intn(2)],
 			at:      at,
+			lag:     time.Duration(200+r.Intn(600)) * time.Millisecond,
 		})
 	}
 	return reflect.ValueOf(scenario)
 }
 
-// runEchoScenario plays the scenario through either the live correlation or
-// a pre-fix build followed by the startup repair, and returns each send's
-// final remote ID plus the total message count.
+// runEchoScenario plays the scenario through the live correlation, or
+// through a pre-fix build followed by the startup repair. It returns each
+// send's final remote ID and the total message count.
 func runEchoScenario(t *testing.T, scenario echoScenario, viaRepair bool) (map[int]string, int) {
 	t.Helper()
 	var h *googleEchoHarness
@@ -289,16 +504,25 @@ func runEchoScenario(t *testing.T, scenario echoScenario, viaRepair bool) (map[i
 	}
 	sends := map[int]messaging.Submission{}
 	for i, event := range scenario.events {
-		if event.fromApp {
-			submission, _ := h.sendAt(t, fmt.Sprintf("send-%d", i), event.body, googleEchoNow.Add(event.at))
-			sends[i] = submission
+		remoteID := fmt.Sprintf("95%03d", i)
+		at := googleEchoNow.Add(event.at)
+		if !event.fromApp {
+			h.echo(t, remoteID, event.body, complete, at)
+			continue
 		}
+		if event.outran {
+			h.clock.Set(at.Add(-event.lag - 100*time.Millisecond))
+			submission, _ := h.enqueue(t, fmt.Sprintf("send-%d", i), event.body)
+			h.echo(t, remoteID, event.body, complete, at.Add(-event.lag))
+			h.clock.Set(at)
+			h.confirm(t, submission.OutboxID)
+			h.echo(t, remoteID, event.body, delivered, at.Add(event.lag))
+			sends[i] = submission
+			continue
+		}
+		sends[i] = h.sendAt(t, fmt.Sprintf("send-%d", i), event.body, at, at)
+		h.echo(t, remoteID, event.body, complete, at.Add(event.lag))
 	}
-	for i, event := range scenario.events {
-		// An app send's echo is stamped a moment after the send.
-		h.appendMessage(t, untaggedEcho(fmt.Sprintf("95%03d", i), event.body, gmproto.MessageStatusType_OUTGOING_COMPLETE, googleEchoNow.Add(event.at+500*time.Millisecond)))
-	}
-	h.waitDrained(t)
 	if viaRepair {
 		if _, err := h.service.RepairUncorrelatedEchoDuplicates(context.Background()); err != nil {
 			t.Fatalf("RepairUncorrelatedEchoDuplicates(): %v", err)
@@ -312,43 +536,29 @@ func runEchoScenario(t *testing.T, scenario echoScenario, viaRepair bool) (map[i
 	return bound, len(ids)
 }
 
-// TestUncorrelatedEchoLiveAndRepairAgreeProperty: for any scenario,
-//   - every message, sent from the app or typed on the phone, is exactly one row;
-//   - every app send ends bound to a real remote ID, and no remote ID binds twice;
-//   - the live correlation and the pre-fix-plus-repair path reach the same pairing.
-func TestUncorrelatedEchoLiveAndRepairAgreeProperty(t *testing.T) {
+// TestUncorrelatedEchoPairsEverySendWithItsOwnEchoProperty: for any
+// scenario, through the live path and through the pre-fix path plus repair,
+//   - every send ends bound to its own echo (ground truth, not just a
+//     consistent answer), and
+//   - every message, sent from the app or typed on the phone, is one row.
+func TestUncorrelatedEchoPairsEverySendWithItsOwnEchoProperty(t *testing.T) {
 	property := func(scenario echoScenario) bool {
-		live, liveRows := runEchoScenario(t, scenario, false)
-		repaired, repairedRows := runEchoScenario(t, scenario, true)
-		if liveRows != len(scenario.events) || repairedRows != len(scenario.events) {
-			t.Logf("rows live=%d repaired=%d, want %d", liveRows, repairedRows, len(scenario.events))
-			return false
-		}
-		seen := map[string]bool{}
-		for _, i := range sortedKeys(live) {
-			remote := live[i]
-			if len(remote) != 5 || seen[remote] {
-				t.Logf("send %d bound to %q (seen=%v)", i, remote, seen[remote])
+		for _, viaRepair := range []bool{false, true} {
+			bound, rows := runEchoScenario(t, scenario, viaRepair)
+			if rows != len(scenario.events) {
+				t.Logf("viaRepair=%v: rows = %d, want %d (%+v)", viaRepair, rows, len(scenario.events), scenario.events)
 				return false
 			}
-			seen[remote] = true
-			if repaired[i] != remote {
-				t.Logf("send %d: live %q, repaired %q", i, remote, repaired[i])
-				return false
+			for i, remote := range bound {
+				if want := fmt.Sprintf("95%03d", i); remote != want {
+					t.Logf("viaRepair=%v: send %d bound to %q, want its own echo %q (%+v)", viaRepair, i, remote, want, scenario.events)
+					return false
+				}
 			}
 		}
 		return true
 	}
-	if err := quick.Check(property, &quick.Config{MaxCount: 25}); err != nil {
+	if err := quick.Check(property, &quick.Config{MaxCount: 30}); err != nil {
 		t.Fatal(err)
 	}
-}
-
-func sortedKeys(m map[int]string) []int {
-	keys := make([]int, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
-	sort.Ints(keys)
-	return keys
 }

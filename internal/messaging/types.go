@@ -123,13 +123,14 @@ type TransportEcho struct {
 }
 
 // UncorrelatedEcho is an outgoing message frame that names no transport
-// request, such as a Google echo whose TmpID is empty.
+// request, such as a Google echo whose TmpID is empty. SeenAt is when this
+// machine received the frame.
 type UncorrelatedEcho struct {
 	AccountID            string
 	RemoteConversationID string
 	RemoteMessageID      string
 	Body                 string
-	OccurredAt           time.Time
+	SeenAt               time.Time
 }
 
 // Timer is the one-shot timer seam used by Run and Wait.

@@ -89,14 +89,23 @@ each sent message with an empty `TmpID`. Correlation used only the `TmpID`
 outbox reconcile and projected as its own row. The v2 store holds the same
 doubling for sends on 9/22 and 9/29, under the old QR pairing.
 
-**Fix (#245):** an outgoing Google text echo without a `TmpID` is
-correlated by content: the oldest sent-but-unbound text intent in the same
-thread with the identical body, created between 30 minutes before and 2
-minutes after the echo's timestamp. It then takes the normal reconcile, which
-repoints the local row and merges any echo row. `echo_content_matched`
-counts these. A daemon-startup sweep merges the duplicates already stored
-(on the 10/16 live-store copy: 42 merged, 0 left). Media sends are not
-content-matched.
+**Fix (#245):** outgoing Google text echoes without a `TmpID` are paired
+with their sends by content and timing, within one thread and one body
+(`sqlite.pairEchoes`). Both times come from this machine's clock: when the
+send went out (the intent's `updated_at_ms`, its confirm) and when the echo
+was first seen (the frame's receipt, or the echo row's `created_at_ms`). On
+the 10/16 live store all 44 doubled sends had their echo first seen
+0.28-0.79 s after the confirm. The phone's own stamp ran 0.6 s behind to 3.7 s
+ahead, so it is not used. Pairs keep time order, and a pair's cost grows with
+the square of its lag's distance from 0.5 s. A pair therefore only beats
+leaving both unpaired for lags of about -5 s to +6 s, so the same words typed
+on the phone near a send stay their own message. Each pair then takes the
+normal reconcile, which repoints the local row and merges the echo row.
+`echo_content_matched` counts these. On v2-primary installs a daemon-startup
+sweep pairs the duplicates already stored: on the 10/16 live-store copy it
+merged 43, left 0 twins, and took 86 ms. Not covered: media sends; uncertain
+sends (their `updated_at_ms` is when they were marked uncertain, not sent);
+echoes first stored by a history import rather than live.
 
 To inspect a frame's `TmpID`, decode `inbox.payload`'s `proto_b64` as
 `gmproto.Message`.

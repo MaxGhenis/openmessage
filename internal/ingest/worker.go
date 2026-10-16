@@ -633,6 +633,7 @@ func (w *Worker) applyEvents(
 				*event.Message,
 				messageCount == 0,
 				false,
+				record.ReceivedAt,
 			)
 			if err != nil {
 				return false, err
@@ -1266,7 +1267,7 @@ func (w *Worker) historyMessage(
 		w.counters.account(accountID).historyExisting.Add(1)
 		return sqlite.Message{}, false, nil
 	}
-	projection, duplicateOf, err := w.messageProjection(ctx, accountID, platform, inboxID, event, routeEcho, true)
+	projection, duplicateOf, err := w.messageProjection(ctx, accountID, platform, inboxID, event, routeEcho, true, time.Time{})
 	if errors.Is(err, errHistoryUnplaceable) {
 		w.counters.account(accountID).historySkipped.Add(1)
 		w.logger.Debug().
@@ -1623,6 +1624,15 @@ func reactionRemoteTargetKey(
 		"\x1f" + strings.TrimSpace(remoteMessageID)
 }
 
+// echoSeenAt is when this machine first had an echo frame: its inbox receipt,
+// or now for a record that carries none.
+func (w *Worker) echoSeenAt(receivedAt time.Time) time.Time {
+	if receivedAt.IsZero() {
+		return w.now()
+	}
+	return receivedAt
+}
+
 // observeUncorrelatedEcho correlates an outgoing Google text echo whose TmpID
 // is empty to its send (see sqlite.ReconcileUncorrelatedEcho). Like a TmpID
 // echo, it is best-effort: a fault is counted and the frame projects anyway.
@@ -1634,6 +1644,7 @@ func (w *Worker) observeUncorrelatedEcho(
 	platform bridge.Platform,
 	event bridge.MessageEvent,
 	remoteMessageID string,
+	receivedAt time.Time,
 ) {
 	if platform != bridge.PlatformGoogle || strings.TrimSpace(event.Body) == "" || len(event.Attachments) > 0 {
 		return
@@ -1647,7 +1658,7 @@ func (w *Worker) observeUncorrelatedEcho(
 		RemoteConversationID: v2keys.NormalizeRemoteConversationID(string(platform), event.RemoteConversationID),
 		RemoteMessageID:      remoteMessageID,
 		Body:                 event.Body,
-		OccurredAt:           event.OccurredAt,
+		SeenAt:               w.echoSeenAt(receivedAt),
 	})
 	switch {
 	case err != nil:
@@ -1670,6 +1681,7 @@ func (w *Worker) messageProjection(
 	event bridge.MessageEvent,
 	routeEcho bool,
 	history bool,
+	receivedAt time.Time,
 ) (sqlite.MessageProjection, *sqlite.Message, error) {
 	direction, err := messageDirection(event.Direction)
 	if err != nil {
@@ -1685,7 +1697,7 @@ func (w *Worker) messageProjection(
 			return nil
 		}
 		if strings.TrimSpace(event.ClientRequestID) == "" {
-			w.observeUncorrelatedEcho(ctx, accountID, platform, event, remoteMessageID)
+			w.observeUncorrelatedEcho(ctx, accountID, platform, event, remoteMessageID, receivedAt)
 			return nil
 		}
 		if w.echoes == nil {

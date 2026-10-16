@@ -925,9 +925,10 @@ func (s *MessageService) ObserveTransportEcho(
 	}
 }
 
-// ObserveUncorrelatedEcho correlates an echo that names no transport request
-// to the send it most likely echoes (same conversation, identical body, sent
-// shortly before) and reconciles it like ObserveTransportEcho. An echo of a
+// ObserveUncorrelatedEcho pairs an echo that names no transport request with
+// the send it echoes (same conversation, identical body, received right after
+// the send went out; see sqlite.pairEchoes) and reconciles it like
+// ObserveTransportEcho. An echo of a
 // message sent from the phone itself matches nothing and is a successful
 // NotFound.
 func (s *MessageService) ObserveUncorrelatedEcho(
@@ -942,7 +943,7 @@ func (s *MessageService) ObserveUncorrelatedEcho(
 		RemoteConversationID: echo.RemoteConversationID,
 		RemoteMessageID:      echo.RemoteMessageID,
 		Body:                 echo.Body,
-		OccurredAtMS:         echo.OccurredAt.UnixMilli(),
+		SeenAtMS:             echo.SeenAt.UnixMilli(),
 	})
 	if err != nil {
 		return "", fmt.Errorf("observe uncorrelated echo: %w", err)
