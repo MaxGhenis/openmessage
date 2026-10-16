@@ -122,6 +122,16 @@ type TransportEcho struct {
 	RemoteMessageID    string
 }
 
+// UncorrelatedEcho is an outgoing message frame that names no transport
+// request, such as a Google echo whose TmpID is empty.
+type UncorrelatedEcho struct {
+	AccountID            string
+	RemoteConversationID string
+	RemoteMessageID      string
+	Body                 string
+	OccurredAt           time.Time
+}
+
 // Timer is the one-shot timer seam used by Run and Wait.
 type Timer interface {
 	C() <-chan time.Time

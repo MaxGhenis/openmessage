@@ -925,6 +925,50 @@ func (s *MessageService) ObserveTransportEcho(
 	}
 }
 
+// ObserveUncorrelatedEcho correlates an echo that names no transport request
+// to the send it most likely echoes (same conversation, identical body, sent
+// shortly before) and reconciles it like ObserveTransportEcho. An echo of a
+// message sent from the phone itself matches nothing and is a successful
+// NotFound.
+func (s *MessageService) ObserveUncorrelatedEcho(
+	ctx context.Context,
+	echo UncorrelatedEcho,
+) (EchoOutcome, error) {
+	if ctx == nil {
+		return "", fmt.Errorf("observe uncorrelated echo: context is nil")
+	}
+	outcome, err := s.outbox.ReconcileUncorrelatedEcho(ctx, sqlite.UncorrelatedEchoRequest{
+		AccountID:            echo.AccountID,
+		RemoteConversationID: echo.RemoteConversationID,
+		RemoteMessageID:      echo.RemoteMessageID,
+		Body:                 echo.Body,
+		OccurredAtMS:         echo.OccurredAt.UnixMilli(),
+	})
+	if err != nil {
+		return "", fmt.Errorf("observe uncorrelated echo: %w", err)
+	}
+	switch outcome {
+	case sqlite.ReconcileOutcomeNotFound, sqlite.ReconcileOutcomeNoop:
+		return outcome, nil
+	case sqlite.ReconcileOutcomeReconciled, sqlite.ReconcileOutcomeEnriched:
+		s.signalChange()
+		return outcome, nil
+	default:
+		return "", fmt.Errorf("observe uncorrelated echo: unexpected reconcile outcome %q", outcome)
+	}
+}
+
+// RepairUncorrelatedEchoDuplicates merges Google echo rows that projected
+// beside their sent message before echoes were correlated by content. See
+// sqlite.OutboxRepository.RepairUncorrelatedEchoDuplicates.
+func (s *MessageService) RepairUncorrelatedEchoDuplicates(ctx context.Context) (sqlite.EchoDuplicateRepairReport, error) {
+	report, err := s.outbox.RepairUncorrelatedEchoDuplicates(ctx)
+	if report.Merged > 0 {
+		s.signalChange()
+	}
+	return report, err
+}
+
 // RepairStoreFailed re-drives local confirmation for a result the transport
 // already accepted. It never sends the intent again.
 func (s *MessageService) RepairStoreFailed(

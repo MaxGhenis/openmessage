@@ -362,6 +362,17 @@ func (s *v2Stack) Start(
 			Int("unresolved", report.Unresolved).
 			Msg("Backfilled participants for direct conversations missing them")
 	}
+	// Merge Google echo rows that projected beside their sent message because
+	// the phone echoed it without its TmpID. Runs before the worker and the
+	// dispatcher start, so nothing races it; idempotent, so safe on every start.
+	if report, err := s.Service.RepairUncorrelatedEchoDuplicates(runCtx); err != nil {
+		s.logger.Warn().Err(err).Msg("Failed to merge Google echo duplicates")
+	} else if report.Merged > 0 {
+		s.logger.Info().
+			Int("unbound", report.Unbound).
+			Int("merged", report.Merged).
+			Msg("Merged Google echo duplicates into their sent messages")
+	}
 	go func() {
 		defer runWG.Done()
 		if err := s.worker.Run(runCtx); err != nil && !errors.Is(err, context.Canceled) {

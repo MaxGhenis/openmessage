@@ -509,6 +509,17 @@ type googleEchoHarness struct {
 
 func newGoogleEchoHarness(t *testing.T, decoder bridge.Decoder) *googleEchoHarness {
 	t.Helper()
+	return newGoogleEchoHarnessWithObserver(t, decoder, nil)
+}
+
+// newGoogleEchoHarnessWithObserver lets a test hand the worker a different
+// echo observer built from the harness's service (nil keeps the service).
+func newGoogleEchoHarnessWithObserver(
+	t *testing.T,
+	decoder bridge.Decoder,
+	wrapObserver func(*messaging.MessageService) EchoObserver,
+) *googleEchoHarness {
+	t.Helper()
 	storePath := filepath.Join(t.TempDir(), "v2.sqlite3")
 	store, err := sqlite.Open(storePath)
 	if err != nil {
@@ -543,11 +554,15 @@ func newGoogleEchoHarness(t *testing.T, decoder bridge.Decoder) *googleEchoHarne
 	if decoder == nil {
 		decoder = NewGoogleDecoder(counters)
 	}
+	var echoObserver EchoObserver = service
+	if wrapObserver != nil {
+		echoObserver = wrapObserver(service)
+	}
 	worker, err := NewWorker(WorkerConfig{
 		Store:        store,
 		Messages:     messages,
 		Reactions:    reactions,
-		EchoObserver: service,
+		EchoObserver: echoObserver,
 		Counters:     counters,
 		Logger:       zerolog.Nop(),
 		Now:          clock.Now,
