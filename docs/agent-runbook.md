@@ -101,11 +101,19 @@ the square of its lag's distance from 0.5 s. A pair therefore only beats
 leaving both unpaired for lags of about -5 s to +6 s, so the same words typed
 on the phone near a send stay their own message. Each pair then takes the
 normal reconcile, which repoints the local row and merges the echo row.
+A candidate's phone stamp must also be within 5 minutes of when it was first
+seen. That rules out an old message arriving now, from a history catch-up or
+from a live re-delivery after a reaction changes, however well its arrival
+fits.
 `echo_content_matched` counts these. On v2-primary installs a daemon-startup
 sweep pairs the duplicates already stored: on the 10/16 live-store copy it
-merged 43, left 0 twins, and took 86 ms. Not covered: media sends; uncertain
-sends (their `updated_at_ms` is when they were marked uncertain, not sent);
-echoes first stored by a history import rather than live.
+merged 43, left 0 twins, and took 86 ms. Not covered:
+- media sends;
+- uncertain sends: lease recovery stamps `updated_at_ms` about 30 s after the
+  call, so their echo looks early and is left;
+- echoes first stored by a history import;
+- an echo that outran its confirm with no later frame of the same text in
+  that thread (it stays until the next startup sweep).
 
 To inspect a frame's `TmpID`, decode `inbox.payload`'s `proto_b64` as
 `gmproto.Message`.

@@ -49,16 +49,25 @@ const (
 	// echoMaxLagMS keeps the arithmetic small; any lag beyond it is far
 	// outside what echoUnpairedCost allows anyway.
 	echoMaxLagMS = int64(60 * 1000)
+	// echoMaxStampSkewMS bounds how far an echo's own (phone) timestamp may be
+	// from when this machine first saw it. A real echo is stamped as it is
+	// sent (live store: -1.35 s to +3.3 s). An old message that arrives now (a
+	// history catch-up inserting a months-old text, or a live re-delivery of
+	// one when a reaction changes) is first seen now but stamped long ago, so
+	// it is never an echo candidate, however well its arrival time fits.
+	echoMaxStampSkewMS = int64(5 * 60 * 1000)
 )
 
 // UncorrelatedEchoRequest is an outgoing message frame that names no
-// transport request. SeenAtMS is when this machine received the frame.
+// transport request. SeenAtMS is when this machine received the frame;
+// OccurredAtMS is the phone's stamp on the message.
 type UncorrelatedEchoRequest struct {
 	AccountID            string
 	RemoteConversationID string
 	RemoteMessageID      string
 	Body                 string
 	SeenAtMS             int64
+	OccurredAtMS         int64
 }
 
 // unboundTextIntentPredicate selects text intents the transport accepted (or
@@ -85,6 +94,16 @@ type echoIntent struct {
 type echoCandidate struct {
 	remoteMessageID string
 	seenAtMS        int64
+	// occurredAtMS is the phone's stamp; only an incoming frame carries it
+	// here (stored rows are filtered in SQL).
+	occurredAtMS int64
+}
+
+// stampFitsSeen reports whether a message's phone stamp is close enough to
+// when it was first seen for it to be a fresh echo (see echoMaxStampSkewMS).
+func stampFitsSeen(occurredAtMS, seenAtMS int64) bool {
+	d := occurredAtMS - seenAtMS
+	return d >= -echoMaxStampSkewMS && d <= echoMaxStampSkewMS
 }
 
 type echoPair struct {
@@ -211,18 +230,26 @@ func (r *OutboxRepository) reconcileEchoGroupTx(
 	// An echo row is claimed once it is some intent's own local row: that is
 	// what binding it does. The check is per conversation by construction,
 	// so a remote ID Google reused in another thread blocks nothing here.
+	// Bounding the phone stamp too lets the conversation-time index serve
+	// this, and drops rows that were stored long after they were sent.
 	rows, err = tx.QueryContext(ctx, `
 		SELECT e.remote_message_id, e.created_at_ms
 		FROM messages AS e
 		WHERE e.account_id = ?
 		  AND e.conversation_id = ?
+		  AND e.occurred_at_ms BETWEEN ? AND ?
+		  AND e.created_at_ms BETWEEN ? AND ?
+		  AND e.occurred_at_ms BETWEEN e.created_at_ms - ? AND e.created_at_ms + ?
 		  AND e.direction = 'outgoing'
 		  AND e.body = ?
-		  AND e.created_at_ms BETWEEN ? AND ?
 		  AND NOT EXISTS (
 		      SELECT 1 FROM outbox AS o WHERE o.local_message_id = e.message_id
 		  )
-	`, accountID, conversationID, body, firstSent-echoMaxLagMS, lastSent+echoMaxLagMS)
+	`, accountID, conversationID,
+		firstSent-echoMaxLagMS-echoMaxStampSkewMS, lastSent+echoMaxLagMS+echoMaxStampSkewMS,
+		firstSent-echoMaxLagMS, lastSent+echoMaxLagMS,
+		echoMaxStampSkewMS, echoMaxStampSkewMS,
+		body)
 	if err != nil {
 		return 0, false, fmt.Errorf("list echo rows: %w", err)
 	}
@@ -242,7 +269,7 @@ func (r *OutboxRepository) reconcileEchoGroupTx(
 	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
 		return 0, false, fmt.Errorf("list echo rows: %w", err)
 	}
-	if incoming != nil && !incomingIsRow {
+	if incoming != nil && !incomingIsRow && stampFitsSeen(incoming.occurredAtMS, incoming.seenAtMS) {
 		// Not yet a row: either new, or a status re-delivery of a message
 		// already bound to an intent (whose row then holds this remote ID).
 		var bound int
@@ -304,8 +331,8 @@ func (r *OutboxRepository) ReconcileUncorrelatedEcho(
 			return "", fmt.Errorf("reconcile uncorrelated echo: %s is empty", check.name)
 		}
 	}
-	if req.SeenAtMS <= 0 {
-		return "", fmt.Errorf("reconcile uncorrelated echo: receipt time is not positive")
+	if req.SeenAtMS <= 0 || req.OccurredAtMS <= 0 {
+		return "", fmt.Errorf("reconcile uncorrelated echo: receipt or occurrence time is not positive")
 	}
 
 	// Most outgoing frames (sent from the phone, or status re-deliveries of a
@@ -338,6 +365,7 @@ func (r *OutboxRepository) ReconcileUncorrelatedEcho(
 	changed, incomingMatched, err := r.reconcileEchoGroupTx(ctx, tx, req.AccountID, conversationID, req.Body, &echoCandidate{
 		remoteMessageID: req.RemoteMessageID,
 		seenAtMS:        req.SeenAtMS,
+		occurredAtMS:    req.OccurredAtMS,
 	})
 	if err != nil {
 		return "", fmt.Errorf("reconcile uncorrelated echo: %w", err)

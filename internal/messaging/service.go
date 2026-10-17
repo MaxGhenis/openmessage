@@ -944,6 +944,7 @@ func (s *MessageService) ObserveUncorrelatedEcho(
 		RemoteMessageID:      echo.RemoteMessageID,
 		Body:                 echo.Body,
 		SeenAtMS:             echo.SeenAt.UnixMilli(),
+		OccurredAtMS:         echo.OccurredAt.UnixMilli(),
 	})
 	if err != nil {
 		return "", fmt.Errorf("observe uncorrelated echo: %w", err)

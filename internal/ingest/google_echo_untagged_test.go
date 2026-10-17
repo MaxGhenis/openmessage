@@ -562,3 +562,52 @@ func TestUncorrelatedEchoPairsEverySendWithItsOwnEchoProperty(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// echoStamped delivers an outgoing frame received at arrivedAt whose phone
+// stamp is stamp, such as an old message arriving now (a history catch-up,
+// or a live re-delivery when a reaction on it changes).
+func (h *googleEchoHarness) echoStamped(t *testing.T, remoteID, body string, status gmproto.MessageStatusType, arrivedAt, stamp time.Time) {
+	t.Helper()
+	h.clock.Set(arrivedAt)
+	h.appendMessage(t, untaggedEcho(remoteID, body, status, stamp))
+	h.waitDrained(t)
+	if errors := h.counters.Snapshot(googleEchoAccountID).EchoErrors; errors != 0 {
+		t.Fatalf("echo reconcile failed %d times", errors)
+	}
+}
+
+// Reviewer H1: last month's identical text arrives right after a send goes
+// out. It is first seen now but stamped a month ago, so it is not an echo;
+// the send waits for its real echo.
+func TestGoogleEchoIgnoresAnOldMessageArrivingNow(t *testing.T) {
+	h := newGoogleEchoHarness(t, nil)
+	send := h.sendAt(t, "send", "ok", googleEchoNow, googleEchoNow)
+	lastMonth := googleEchoNow.Add(-30 * 24 * time.Hour)
+	h.echoStamped(t, "50001", "ok", delivered, googleEchoNow.Add(300*time.Millisecond), lastMonth)
+	h.echo(t, "97001", "ok", complete, googleEchoNow.Add(600*time.Millisecond))
+
+	h.assertBound(t, send, "97001")
+	if got := h.occurredAt(t, "50001"); got != lastMonth.UnixMilli() {
+		t.Fatalf("last month's message is stamped %d, want %d", got, lastMonth.UnixMilli())
+	}
+}
+
+// Reviewer H2: the send's echo was missed and an old identical text was
+// stored a second after the send went out. The repair must not merge it.
+func TestRepairIgnoresAnOldMessageStoredNearASend(t *testing.T) {
+	h := newGoogleEchoHarnessWithObserver(t, nil, preFixObserver)
+	send := h.sendAt(t, "send", "ok", googleEchoNow, googleEchoNow)
+	lastMonth := googleEchoNow.Add(-30 * 24 * time.Hour)
+	h.echoStamped(t, "50002", "ok", delivered, googleEchoNow.Add(time.Second), lastMonth)
+
+	report, err := h.service.RepairUncorrelatedEchoDuplicates(context.Background())
+	if err != nil || report.Merged != 0 {
+		t.Fatalf("repair = %+v, %v; want no merge", report, err)
+	}
+	if delivery := h.delivery(t, send.OutboxID); delivery.RemoteMessageID == "50002" {
+		t.Fatalf("send took last month's message: %+v", delivery)
+	}
+	if got := h.occurredAt(t, "50002"); got != lastMonth.UnixMilli() {
+		t.Fatalf("last month's message is stamped %d, want %d", got, lastMonth.UnixMilli())
+	}
+}

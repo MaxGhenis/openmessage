@@ -1659,6 +1659,7 @@ func (w *Worker) observeUncorrelatedEcho(
 		RemoteMessageID:      remoteMessageID,
 		Body:                 event.Body,
 		SeenAt:               w.echoSeenAt(receivedAt),
+		OccurredAt:           event.OccurredAt,
 	})
 	switch {
 	case err != nil:

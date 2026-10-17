@@ -131,6 +131,8 @@ type UncorrelatedEcho struct {
 	RemoteMessageID      string
 	Body                 string
 	SeenAt               time.Time
+	// OccurredAt is the phone's stamp on the message.
+	OccurredAt time.Time
 }
 
 // Timer is the one-shot timer seam used by Run and Wait.

@@ -91,7 +91,7 @@ func TestPairEchoesFindsEveryTrueEchoProperty(t *testing.T) {
 func TestPairEchoesTwoIdenticalTextsASecondApart(t *testing.T) {
 	// The case closest-first gets wrong: each send is nearer the other's echo.
 	intents := []echoIntent{{"a", 32_000}, {"b", 33_000}}
-	echoes := []echoCandidate{{"echo-a", 32_780}, {"echo-b", 33_300}}
+	echoes := []echoCandidate{{remoteMessageID: "echo-a", seenAtMS: 32_780}, {remoteMessageID: "echo-b", seenAtMS: 33_300}}
 	pairs := pairEchoes(intents, echoes)
 	if len(pairs) != 2 || pairs[0].echo.remoteMessageID != "echo-a" || pairs[1].echo.remoteMessageID != "echo-b" {
 		t.Fatalf("pairs = %+v, want a->echo-a, b->echo-b", pairs)
@@ -104,7 +104,7 @@ func TestPairEchoesTwoIdenticalTextsASecondApart(t *testing.T) {
 // pair by one. The squared cost does not.
 func TestPairEchoesDoesNotShiftPastAMissingEcho(t *testing.T) {
 	intents := []echoIntent{{"no-echo", 0}, {"next", 5_000}}
-	echoes := []echoCandidate{{"echo-next", 5_400}, {"phone", 12_000}}
+	echoes := []echoCandidate{{remoteMessageID: "echo-next", seenAtMS: 5_400}, {remoteMessageID: "phone", seenAtMS: 12_000}}
 	pairs := pairEchoes(intents, echoes)
 	if len(pairs) != 1 || pairs[0].intent.transportRequestID != "next" || pairs[0].echo.remoteMessageID != "echo-next" {
 		t.Fatalf("pairs = %+v, want only next->echo-next", pairs)
@@ -120,7 +120,7 @@ func TestEchoPairCostBounds(t *testing.T) {
 		// Weeks apart: the squared lag must not overflow into a cheap pair.
 		{30 * 24 * 3600 * 1000, false}, {-30 * 24 * 3600 * 1000, false}, {math.MaxInt64 / 2, false},
 	} {
-		c, ok := echoPairCost(echoIntent{"s", 1_000_000}, echoCandidate{"e", 1_000_000 + tc.lagMS})
+		c, ok := echoPairCost(echoIntent{"s", 1_000_000}, echoCandidate{remoteMessageID: "e", seenAtMS: 1_000_000 + tc.lagMS})
 		if got := ok && c < 2*echoUnpairedCost; got != tc.pairable {
 			t.Errorf("lag %d ms: cost %d (ok=%v), pairable=%v, want %v", tc.lagMS, c, ok, got, tc.pairable)
 		}
