@@ -94,16 +94,6 @@ func runPair(logger zerolog.Logger, args []string, deps pairDeps) error {
 		return err
 	}
 
-	// Back up before the phone is asked anything: a backup that fails after
-	// the user confirmed would throw away a pairing the phone already made.
-	backup, err := backupReplacedSession(sessionPath, deps.now())
-	if err != nil {
-		return fmt.Errorf("back up %s before pairing: %w; fix its permissions or move it aside, then retry", sessionPath, err)
-	}
-	if backup != "" {
-		fmt.Println("Current session backed up to", backup)
-	}
-
 	var cookies map[string]string
 	switch mode {
 	case pairModeGoogle:
@@ -116,6 +106,17 @@ func runPair(logger zerolog.Logger, args []string, deps pairDeps) error {
 		if cookies, err = loadChromeCookiesForPairing(ctx, input, deps.loadChrome); err != nil {
 			return err
 		}
+	}
+
+	// Back up right before the phone is asked anything: a backup that fails
+	// after the user confirmed would throw away a pairing the phone already
+	// made.
+	backup, err := backupReplacedSession(sessionPath, deps.now())
+	if err != nil {
+		return fmt.Errorf("back up %s before pairing: %w; fix its permissions or move it aside, then retry", sessionPath, err)
+	}
+	if backup != "" {
+		fmt.Println("Current session backed up to", backup)
 	}
 	return deps.pair(logger, mode, cookies, sessionPath)
 }
@@ -136,8 +137,12 @@ type pairBackendState struct {
 	StatusKnown bool
 	// DataDir is the data directory the backend serves, when it says.
 	DataDir string
-	// NoGoogleSession is set only when the status says google.paired=false:
-	// no session.json, so the backend holds no Google session to write back.
+	// NoGoogleSession is set only when the status says google.paired,
+	// google.connected and (where reported) google.client_loaded are all
+	// false. paired=false alone only means session.json is gone; a client
+	// still loaded rewrites that file on its next token refresh or cookie
+	// rotation. Unpair (the macOS app's re-pair flow) drops the client, and a
+	// first pairing in Docker never had one.
 	NoGoogleSession bool
 }
 
@@ -182,9 +187,11 @@ func defaultPairBackendProbe(ctx context.Context, dataDir string) (pairBackendSt
 		}
 	}
 	if google, ok := raw["google"].(map[string]any); ok {
-		if paired, ok := google["paired"].(bool); ok && !paired {
-			state.NoGoogleSession = true
-		}
+		paired, pairedOK := google["paired"].(bool)
+		connected, connectedOK := google["connected"].(bool)
+		loaded, loadedOK := google["client_loaded"].(bool)
+		// Daemons that predate client_loaded don't report it.
+		state.NoGoogleSession = pairedOK && !paired && connectedOK && !connected && (!loadedOK || !loaded)
 	}
 	return state, nil
 }
@@ -458,6 +465,18 @@ func resolvePairMode(args []string) (pairMode, string, error) {
 // (2026-10-16: still waiting after 10 minutes) while the app stayed quit.
 const gaiaConfirmTimeout = 5 * time.Minute
 
+// pairSignalContext is canceled by the first Ctrl-C or SIGTERM. That signal
+// also restores the default action, so a second one ends the process even if
+// libgm is stuck in a wait that ignores the context.
+func pairSignalContext() (context.Context, context.CancelFunc) {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-ctx.Done()
+		stop()
+	}()
+	return ctx, stop
+}
+
 // chromeProfileDir resolves a --google-chrome argument. A bare profile name
 // such as "Profile 1" names a directory beside the default profile; anything
 // with a path separator is a path.
@@ -472,14 +491,8 @@ func runGoogleAccountPairing(cli *client.Client, sessionPath string, cookies map
 	cli.GM.AuthData.Cookies = cookies
 
 	fmt.Println("Starting Google account pairing...")
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	ctx, stop := pairSignalContext()
 	defer stop()
-	// After the first signal, restore the default action so a second Ctrl-C
-	// or SIGTERM ends the process even if libgm is stuck in a wait.
-	go func() {
-		<-ctx.Done()
-		stop()
-	}()
 	err := withGaiaConfirmTimeout(ctx, gaiaConfirmTimeout, gaiaCancelGrace, func(ctx context.Context) error {
 		return cli.GM.DoGaiaPairing(ctx, func(emoji string) {
 			fmt.Println("EMOJI:", emoji)

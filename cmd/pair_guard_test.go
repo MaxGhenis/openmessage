@@ -11,10 +11,12 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"testing/quick"
 	"time"
@@ -214,7 +216,7 @@ func TestWaitForBackendToReleaseSessionBoundsWallTimeAgainstAHungBackend(t *test
 	if err == nil || !strings.Contains(err.Error(), "cannot rule out") {
 		t.Fatalf("error = %v, want a refusal", err)
 	}
-	if elapsed := clock.Now().Sub(start); elapsed > pairBackendExitWait+time.Second {
+	if elapsed := clock.Now().Sub(start); elapsed > pairBackendExitWait+500*time.Millisecond {
 		t.Fatalf("hung backend kept pair waiting %v (probe timeouts %v), want about %v", elapsed, timeouts, pairBackendExitWait)
 	}
 	for _, timeout := range timeouts {
@@ -293,13 +295,17 @@ func TestDefaultPairBackendProbe(t *testing.T) {
 		t.Setenv("OPENMESSAGES_HOST", host)
 		t.Setenv("OPENMESSAGES_PORT", port)
 	}
-	status := func(paired bool) http.HandlerFunc {
+	statusWith := func(google map[string]any) http.HandlerFunc {
 		return func(w http.ResponseWriter, r *http.Request) {
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"auth":   map[string]any{"data_dir": dataDir},
-				"google": map[string]any{"paired": paired, "connected": paired},
-			})
+			payload := map[string]any{"auth": map[string]any{"data_dir": dataDir}}
+			if google != nil {
+				payload["google"] = google
+			}
+			_ = json.NewEncoder(w).Encode(payload)
 		}
+	}
+	status := func(paired bool) http.HandlerFunc {
+		return statusWith(map[string]any{"paired": paired, "connected": paired, "client_loaded": paired})
 	}
 
 	t.Run("refused connection is no backend", func(t *testing.T) {
@@ -340,6 +346,56 @@ func TestDefaultPairBackendProbe(t *testing.T) {
 		}
 	})
 
+	// session.json deleted while the backend's client is still loaded: the
+	// client would write the old session back over the new pairing.
+	for name, google := range map[string]map[string]any{
+		"session file deleted, client still connected":    {"paired": false, "connected": true, "client_loaded": true},
+		"session file deleted, client loaded but offline": {"paired": false, "connected": false, "client_loaded": true},
+		"status without a google block":                   nil,
+	} {
+		t.Run(name, func(t *testing.T) {
+			serve(t, "127.0.0.1", statusWith(google))
+			state, err := defaultPairBackendProbe(context.Background(), dataDir)
+			if err != nil || state.NoGoogleSession || !state.mayRewriteSession(dataDir) {
+				t.Fatalf("probe = (%+v, %v), want a backend that may rewrite the session", state, err)
+			}
+		})
+	}
+
+	t.Run("a daemon that predates client_loaded, unpaired and disconnected", func(t *testing.T) {
+		serve(t, "127.0.0.1", statusWith(map[string]any{"paired": false, "connected": false}))
+		state, err := defaultPairBackendProbe(context.Background(), dataDir)
+		if err != nil || !state.NoGoogleSession {
+			t.Fatalf("probe = (%+v, %v), want no Google session", state, err)
+		}
+	})
+
+	t.Run("the control token never goes to a host off this machine", func(t *testing.T) {
+		ip := nonLoopbackIPv4(t)
+		listener, err := net.Listen("tcp", net.JoinHostPort(ip, "0"))
+		if err != nil {
+			t.Skipf("listen on %s: %v", ip, err)
+		}
+		var sawToken string
+		server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			sawToken = r.Header.Get("Authorization")
+			status(true)(w, r)
+		}))
+		server.Listener.Close()
+		server.Listener = listener
+		server.Start()
+		t.Cleanup(server.Close)
+		_, port, _ := net.SplitHostPort(listener.Addr().String())
+		t.Setenv("OPENMESSAGES_HOST", ip)
+		t.Setenv("OPENMESSAGES_PORT", port)
+		if _, err := defaultPairBackendProbe(context.Background(), dataDir); err != nil {
+			t.Fatalf("probe: %v", err)
+		}
+		if sawToken != "" {
+			t.Fatalf("sent Authorization %q to non-local host %s", sawToken, ip)
+		}
+	})
+
 	t.Run("an answer without a status document", func(t *testing.T) {
 		serve(t, "127.0.0.1", func(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "nope", http.StatusUnauthorized)
@@ -349,6 +405,23 @@ func TestDefaultPairBackendProbe(t *testing.T) {
 			t.Fatalf("probe = (%+v, %v), want a running backend of unknown state", state, err)
 		}
 	})
+}
+
+// nonLoopbackIPv4 returns an address of this machine that is not loopback,
+// or skips the test.
+func nonLoopbackIPv4(t *testing.T) string {
+	t.Helper()
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		t.Skipf("interface addresses: %v", err)
+	}
+	for _, addr := range addrs {
+		if ipNet, ok := addr.(*net.IPNet); ok && ipNet.IP.To4() != nil && !ipNet.IP.IsLoopback() && !ipNet.IP.IsLinkLocalUnicast() {
+			return ipNet.IP.String()
+		}
+	}
+	t.Skip("no non-loopback IPv4 address")
+	return ""
 }
 
 func TestPairProbeHostIsLocal(t *testing.T) {
@@ -473,6 +546,7 @@ type runPairHarness struct {
 	clock   *fakeClock
 	state   pairBackendState
 	cookies map[string]string
+	loadErr error
 	pairs   int
 	// backupsAtPair is what backups existed when the phone would be asked.
 	backupsAtPair []string
@@ -496,7 +570,7 @@ func (h *runPairHarness) run(t *testing.T, args ...string) (string, error) {
 		now:      h.clock.Now,
 		sleep:    h.clock.Advance,
 		loadChrome: func(context.Context, string) (map[string]string, error) {
-			return h.cookies, nil
+			return h.cookies, h.loadErr
 		},
 		pair: func(_ zerolog.Logger, mode pairMode, cookies map[string]string, sessionPath string) error {
 			h.pairs++
@@ -655,4 +729,104 @@ func TestWithGaiaConfirmTimeout(t *testing.T) {
 			t.Fatalf("err = %v, want a plain cancel", err)
 		}
 	})
+}
+
+// A pairing that stops before the phone is asked (here: Chrome's cookies
+// cannot be read) leaves no backup behind.
+func TestRunPairBacksUpOnlyWhenThePhoneWillBeAsked(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("--google-chrome is macOS-only")
+	}
+	h := newRunPairHarness(t)
+	h.loadErr = errors.New("missing required cookies: .google.com:SID")
+	if err := os.WriteFile(filepath.Join(h.dataDir, "session.json"), []byte(`{"old":true}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.run(t, "--google-chrome"); err == nil || h.pairs != 0 {
+		t.Fatalf("err = %v, pairs = %d; want a failure before pairing", err, h.pairs)
+	}
+	if matches, _ := filepath.Glob(filepath.Join(h.dataDir, "session.json.bak-*")); len(matches) != 0 {
+		t.Fatalf("a pairing that never asked the phone left backups %v", matches)
+	}
+}
+
+func TestGaiaWaitBounds(t *testing.T) {
+	// Long enough for a person to find the prompt; short enough that the app
+	// is not left quit for long.
+	if gaiaConfirmTimeout < 2*time.Minute || gaiaConfirmTimeout > 10*time.Minute {
+		t.Fatalf("gaiaConfirmTimeout = %v", gaiaConfirmTimeout)
+	}
+	// Long enough for libgm to send the phone its pairing cancel after a
+	// cancel; short enough that a stuck pair still exits promptly.
+	if gaiaCancelGrace < 10*time.Second || gaiaCancelGrace > time.Minute {
+		t.Fatalf("gaiaCancelGrace = %v", gaiaCancelGrace)
+	}
+}
+
+// TestPairSignalContext runs pairSignalContext in a child process: the first
+// SIGTERM cancels the context, and the second ends the process even though
+// the child ignores the cancel (as a stuck libgm wait does).
+func TestPairSignalContext(t *testing.T) {
+	if os.Getenv("OPENMESSAGE_PAIR_SIGNAL_CHILD") == "1" {
+		ctx, stop := pairSignalContext()
+		defer stop()
+		fmt.Println("ready")
+		<-ctx.Done()
+		fmt.Println("canceled")
+		select {} // a wait that ignores the cancel
+	}
+	cmd := exec.Command(os.Args[0], "-test.run=^TestPairSignalContext$")
+	cmd.Env = append(os.Environ(), "OPENMESSAGE_PAIR_SIGNAL_CHILD=1")
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	lines := make(chan string, 4)
+	go func() {
+		buf := make([]byte, 256)
+		for {
+			n, err := stdout.Read(buf)
+			for _, line := range strings.Fields(string(buf[:n])) {
+				lines <- line
+			}
+			if err != nil {
+				close(lines)
+				return
+			}
+		}
+	}()
+	expect := func(want string) {
+		t.Helper()
+		select {
+		case line := <-lines:
+			if line != want {
+				t.Fatalf("child printed %q, want %q", line, want)
+			}
+		case <-time.After(10 * time.Second):
+			_ = cmd.Process.Kill()
+			t.Fatalf("child never printed %q", want)
+		}
+	}
+	expect("ready")
+	_ = cmd.Process.Signal(syscall.SIGTERM)
+	expect("canceled")
+	// Let pairSignalContext's goroutine restore the default action; it runs
+	// on the same cancel that printed "canceled".
+	time.Sleep(500 * time.Millisecond)
+	_ = cmd.Process.Signal(syscall.SIGTERM)
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	select {
+	case err := <-done:
+		var exitErr *exec.ExitError
+		if !errors.As(err, &exitErr) {
+			t.Fatalf("child exited with %v, want death by SIGTERM", err)
+		}
+	case <-time.After(10 * time.Second):
+		_ = cmd.Process.Kill()
+		t.Fatal("a second SIGTERM did not end the child")
+	}
 }

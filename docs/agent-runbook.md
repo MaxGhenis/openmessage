@@ -1133,13 +1133,15 @@ Google-account pairing (see
      the address inside the `GAIA_1` frame's field-11 container (see
      [pulls that return nothing](#pulls-that-return-nothing-phone-switched-to-google-account-pairing)).
      The default profile is `Default`, or `OPENMESSAGE_CHROME_PROFILE` if set.
-   - It refuses to pair while a backend that holds this data dir's Google
-     session answers on the API port: `/api/status` names the same
-     `auth.data_dir` and does not report `google.paired: false`. Such a
-     backend rewrites `session.json` on token refresh and cookie rotation, so
-     it would overwrite the new pairing. A backend with no Google session (a
-     first pairing in Docker, or the macOS app after it unpairs) is no
-     conflict. It waits up to 15 s of wall time for one that is stopping;
+   - It refuses to pair while a backend that may hold this data dir's Google
+     session answers on the API port. That means `/api/status` names the
+     same `auth.data_dir` and does not report `google.paired`,
+     `google.connected` and `google.client_loaded` all false. Such a backend
+     rewrites `session.json` on token refresh and cookie rotation, so it would
+     overwrite the new pairing. Deleting `session.json` only flips `paired`:
+     a client that is still loaded writes the old session back. A backend
+     with no Google client is no conflict: a first pairing in Docker, or the
+     macOS app after `/api/unpair`. It waits up to 15 s of wall time for one that is stopping;
      each probe's timeout is capped at the time left.
    - Before asking the phone anything, it copies an existing `session.json`
      to `session.json.bak-<time>`, and it stops if that copy fails, so a
