@@ -362,6 +362,24 @@ func (s *v2Stack) Start(
 			Int("unresolved", report.Unresolved).
 			Msg("Backfilled participants for direct conversations missing them")
 	}
+	// Merge Google echo rows that projected beside their sent message because
+	// the phone echoed it without its TmpID. Runs before the worker and the
+	// dispatcher start, so nothing races it; idempotent, so safe on every
+	// start. Only on v2-primary: a merge stamps the send's outbox row as
+	// updated now, and the legacy projector would re-mirror weeks-old sends
+	// with that time.
+	if v2Primary {
+		report, err := s.Service.RepairUncorrelatedEchoDuplicates(runCtx)
+		if err != nil {
+			s.logger.Warn().Err(err).Int("failed_groups", report.Failed).Msg("Some Google echo duplicates could not be merged")
+		}
+		if report.Merged > 0 {
+			s.logger.Info().
+				Int("groups", report.Groups).
+				Int("merged", report.Merged).
+				Msg("Merged Google echo duplicates into their sent messages")
+		}
+	}
 	go func() {
 		defer runWG.Done()
 		if err := s.worker.Run(runCtx); err != nil && !errors.Is(err, context.Canceled) {

@@ -76,6 +76,48 @@ curl -s "http://127.0.0.1:7007/api/conversations/<id>/messages?limit=1" | jq '.[
 The web UI reads `TimestampMS` throughout, so these names are a stable contract
 — don't "fix" them by renaming.
 
+### Sent messages showing twice (Google echo without a TmpID)
+
+**Symptom:** every SMS/RCS message sent from OpenMessage shows twice in its
+thread. One copy has `Status: "sent"` and a 32-hex `source_id` (the local
+row). The other has an empty `Status` and Google's numeric message id (the
+echo). `v2_ingest.per_account.google-primary.echo_*` counters stay at 0.
+
+**Cause (decoded from raw inbox frames, 2026-10-16):** the phone echoes
+each sent message with an empty `TmpID`. Correlation used only the `TmpID`
+(`bridge.MessageEvent.ClientRequestID`), so the echo never reached the
+outbox reconcile and projected as its own row. The v2 store holds the same
+doubling for sends on 9/22 and 9/29, under the old QR pairing.
+
+**Fix (#245):** outgoing Google text echoes without a `TmpID` are paired
+with their sends by content and timing, within one thread and one body
+(`sqlite.pairEchoes`). Both times come from this machine's clock: when the
+send went out (the intent's `updated_at_ms`, its confirm) and when the echo
+was first seen (the frame's receipt, or the echo row's `created_at_ms`). On
+the 10/16 live store all 44 doubled sends had their echo first seen
+0.28-0.79 s after the confirm. The phone's own stamp ran 0.6 s behind to 3.7 s
+ahead, so it is not used. Pairs keep time order, and a pair's cost grows with
+the square of its lag's distance from 0.5 s. A pair therefore only beats
+leaving both unpaired for lags of about -5 s to +6 s, so the same words typed
+on the phone near a send stay their own message. Each pair then takes the
+normal reconcile, which repoints the local row and merges the echo row.
+A candidate's phone stamp must also be within 5 minutes of when it was first
+seen. That rules out an old message arriving now, from a history catch-up or
+from a live re-delivery after a reaction changes, however well its arrival
+fits.
+`echo_content_matched` counts these. On v2-primary installs a daemon-startup
+sweep pairs the duplicates already stored: on the 10/16 live-store copy it
+merged 43, left 0 twins, and took 86 ms. Not covered:
+- media sends;
+- uncertain sends: lease recovery stamps `updated_at_ms` about 30 s after the
+  call, so their echo looks early and is left;
+- echoes first stored by a history import;
+- an echo that outran its confirm with no later frame of the same text in
+  that thread (it stays until the next startup sweep).
+
+To inspect a frame's `TmpID`, decode `inbox.payload`'s `proto_b64` as
+`gmproto.Message`.
+
 ## v2 cutover: conversation IDs re-key (issue #155)
 
 On a **v2-primary** install the API serves the v2 store, where a conversation's
