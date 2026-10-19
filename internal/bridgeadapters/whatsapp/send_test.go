@@ -273,7 +273,7 @@ func TestSendReactionRequiresReadyTransportWithoutLifecycleAction(t *testing.T) 
 			return nil
 		},
 		mediaReady: func() bool { return false },
-		sendReactionRequest: func(string, string, string, string, string, string) (time.Time, error) {
+		sendReactionRequest: func(string, string, string, bool, string, string, string) (time.Time, error) {
 			sendCalls++
 			return time.Time{}, nil
 		},
@@ -326,7 +326,7 @@ func TestSendReactionContextGuardsRunBeforeTransport(t *testing.T) {
 			var sendCalls int
 			a := &Adapter{
 				mediaReady: func() bool { return true },
-				sendReactionRequest: func(string, string, string, string, string, string) (time.Time, error) {
+				sendReactionRequest: func(string, string, string, bool, string, string, string) (time.Time, error) {
 					sendCalls++
 					return time.Time{}, nil
 				},
@@ -356,23 +356,29 @@ func TestSendReactionSuccessAndActionMapping(t *testing.T) {
 		action     bridge.ReactionAction
 		wantAction string
 		authorID   string
+		outgoing   bool
 	}{
 		{name: "add", action: bridge.ReactionAdd, wantAction: "add", authorID: "+15557654321"},
 		{name: "remove", action: bridge.ReactionRemove, wantAction: "remove", authorID: "+15557654321"},
 		{name: "switch", action: bridge.ReactionSwitch, wantAction: "switch", authorID: "+15557654321"},
-		{name: "empty author remains self target", action: bridge.ReactionAdd, wantAction: "add"},
+		{name: "incoming with no stored sender", action: bridge.ReactionAdd, wantAction: "add"},
+		// An own target can carry this account's identity as its author; the
+		// direction, not the author, is what makes it this account's message.
+		{name: "own target", action: bridge.ReactionAdd, wantAction: "add", authorID: "+15550001111", outgoing: true},
 	}
 	sentAt := time.UnixMilli(1_780_000_000_950)
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			var gotConversationID, gotTargetRemoteID, gotTargetAuthorID, gotEmoji, gotAction, gotRequestID string
+			var gotOutgoing bool
 			a := &Adapter{
 				accountID:  "whatsapp-primary",
 				mediaReady: func() bool { return true },
-				sendReactionRequest: func(conversationID, targetRemoteID, targetAuthorID, emoji, action, requestID string) (time.Time, error) {
+				sendReactionRequest: func(conversationID, targetRemoteID, targetAuthorID string, targetOutgoing bool, emoji, action, requestID string) (time.Time, error) {
 					gotConversationID = conversationID
 					gotTargetRemoteID = targetRemoteID
 					gotTargetAuthorID = targetAuthorID
+					gotOutgoing = targetOutgoing
 					gotEmoji = emoji
 					gotAction = action
 					gotRequestID = requestID
@@ -388,6 +394,7 @@ func TestSendReactionSuccessAndActionMapping(t *testing.T) {
 				Target: bridge.MessageRef{
 					RemoteID: "target-remote-id",
 					AuthorID: test.authorID,
+					Outgoing: test.outgoing,
 				},
 				Emoji:     "🔥",
 				Action:    test.action,
@@ -405,13 +412,37 @@ func TestSendReactionSuccessAndActionMapping(t *testing.T) {
 			if gotConversationID != "whatsapp:120363019999999999@g.us" ||
 				gotTargetRemoteID != "target-remote-id" ||
 				gotTargetAuthorID != test.authorID ||
+				gotOutgoing != test.outgoing ||
 				gotEmoji != "🔥" ||
 				gotAction != test.wantAction ||
 				gotRequestID != "outbox-reaction-123" {
-				t.Fatalf("SendReactionRequest args = conversation=%q target=%q author=%q emoji=%q action=%q request=%q",
-					gotConversationID, gotTargetRemoteID, gotTargetAuthorID, gotEmoji, gotAction, gotRequestID)
+				t.Fatalf("SendReactionRequest args = conversation=%q target=%q author=%q outgoing=%t emoji=%q action=%q request=%q",
+					gotConversationID, gotTargetRemoteID, gotTargetAuthorID, gotOutgoing, gotEmoji, gotAction, gotRequestID)
 			}
 		})
+	}
+}
+
+// A target the transport cannot name (an incoming group message with no
+// stored sender) is refused before anything is sent, and finally: retrying
+// cannot name it either, so the dispatcher rejects the row instead of putting
+// it back to retry every 5 s.
+func TestSendReactionUnnamedTargetIsRefusedFinally(t *testing.T) {
+	a := &Adapter{
+		mediaReady: func() bool { return true },
+		sendReactionRequest: func(string, string, string, bool, string, string, string) (time.Time, error) {
+			return time.Time{}, fmt.Errorf("%w: %w", whatsapplive.ErrSendNotDispatched, whatsapplive.ErrReactionTargetAuthorUnknown)
+		},
+	}
+
+	_, err := a.SendReaction(context.Background(), bridge.ReactionRequest{})
+	failure, ok := asOpError(err)
+	if !ok || failure.Class != bridge.FailureUnsupported ||
+		failure.Dispatch != bridge.DispatchNotCalled ||
+		failure.Operation != "send_reaction" ||
+		failure.Fingerprint != "whatsapp_reaction_target_author_unavailable" ||
+		!errors.Is(failure.Cause, whatsapplive.ErrReactionTargetAuthorUnknown) {
+		t.Fatalf("SendReaction() error = %v (%+v), want a final pre-call refusal", err, failure)
 	}
 }
 
@@ -441,7 +472,7 @@ func TestSendReactionTransportErrorClassification(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			a := &Adapter{
 				mediaReady: func() bool { return true },
-				sendReactionRequest: func(string, string, string, string, string, string) (time.Time, error) {
+				sendReactionRequest: func(string, string, string, bool, string, string, string) (time.Time, error) {
 					return time.Time{}, test.err
 				},
 			}
@@ -481,7 +512,7 @@ func TestSendReactionFailureDoesNotRetireReceiveGeneration(t *testing.T) {
 			a := &Adapter{
 				current:    r,
 				mediaReady: func() bool { return true },
-				sendReactionRequest: func(string, string, string, string, string, string) (time.Time, error) {
+				sendReactionRequest: func(string, string, string, bool, string, string, string) (time.Time, error) {
 					return time.Time{}, test.err
 				},
 			}

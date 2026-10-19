@@ -1825,11 +1825,32 @@ snapshot (`ReplaceEmbeddedReactions`), which removes active reactors the
 snapshot does not list, and the Google decoder names reactors by participant
 ID rather than as self. So the next frame for the message replaces the "self"
 row with the reactor the phone names, or removes it if the phone's copy does
-not have the reaction yet; a reaction can disappear briefly and come back. A reaction that ends
+not have the reaction yet; a reaction can disappear briefly and come back.
+The transport's answer and the phone's frame race. When the outbox confirms a
+Google reaction after a frame for the message that was received at or after
+the transport call (`reaction_snapshot_fences.source_seq_ms`, the frame's
+local receipt time, against the row's `transport_called_at_ms`) is already
+stored, it writes no "self" row: that snapshot, or the next one, lists the
+reaction. Before, both rows stayed active and the pill read 2 until the
+message's next frame. A reaction that ends
 `uncertain`, `rejected`, `not_dispatched` or `canceled` writes nothing, so the
 thread shows only reactions that went out. While a reaction is `queued`,
 `dispatching` or `not_dispatched` it is listed in the web UI's outbox tray
 with a Cancel button.
+
+**WhatsApp reaction targets.** WhatsApp names the message a reaction targets
+by its chat, its ID, whether it is this account's own, and in a group its
+sender (whatsmeow's `BuildMessageKey`, which reads an empty sender as this
+account). The dispatcher passes the target's direction
+(`bridge.MessageRef.Outgoing`) and stored sender, and
+`whatsapplive.SendReactionRequest` addresses this account's message as its
+own, an incoming message by its stored sender, and an incoming 1:1 message
+with no stored sender as the other party's (the chat JID, as the legacy
+sender did). An incoming group message with no stored sender cannot be
+named, so nothing is sent: the row ends `rejected` (`error_class:
+unsupported`, `error_detail` `send_reaction: unsupported: whatsapp reaction
+target author is unavailable`). Before, both went out with an empty sender
+and addressed a message of this account's that does not exist.
 
 **Reactions stuck retrying.** A reaction the transport cannot deliver yet goes
 `not_dispatched` and retries (every 5 s by default) with no cap; a Signal

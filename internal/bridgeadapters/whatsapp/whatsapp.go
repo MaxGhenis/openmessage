@@ -38,7 +38,7 @@ type Adapter struct {
 	now                 func() time.Time
 	mediaReady          func() bool // Shared connection gate; it does no media-specific work.
 	sendTextRequest     func(string, string, string, string) (string, time.Time, error)
-	sendReactionRequest func(string, string, string, string, string, string) (time.Time, error)
+	sendReactionRequest func(string, string, string, bool, string, string, string) (time.Time, error)
 	markReadRequest     func(string, []string, string, time.Time) error
 	sendMediaRequest    func(string, []byte, string, string, string, string, string) (string, time.Time, error)
 	downloadMediaRef    func(string, whatsapplive.StoredMediaRef, string, string, string) ([]byte, string, error)
@@ -183,10 +183,21 @@ func (a *Adapter) SendReaction(ctx context.Context, req bridge.ReactionRequest) 
 		req.Conversation.RemoteID,
 		req.Target.RemoteID,
 		req.Target.AuthorID,
+		req.Target.Outgoing,
 		req.Emoji,
 		string(req.Action),
 		req.RequestID,
 	)
+	if errors.Is(err, whatsapplive.ErrReactionTargetAuthorUnknown) {
+		// Nothing was sent, and sending again cannot name the target either.
+		return bridge.SendResult{}, bridge.OpError{
+			Class:       bridge.FailureUnsupported,
+			Operation:   "send_reaction",
+			Fingerprint: "whatsapp_reaction_target_author_unavailable",
+			Dispatch:    bridge.DispatchNotCalled,
+			Cause:       err,
+		}
+	}
 	if err != nil {
 		// Deliberately no adapter-level lifecycle report. The retained core's
 		// guarded reportConnectionError path owns reconnect-worthy failures.
