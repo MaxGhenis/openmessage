@@ -200,6 +200,11 @@ type GoogleStatusSnapshot struct {
 	Connected    bool `json:"connected"`
 	Paired       bool `json:"paired"`
 	NeedsPairing bool `json:"needs_pairing"`
+	// ClientLoaded is set while the backend holds a Google Messages client.
+	// Paired only says session.json exists: a client that is still loaded
+	// keeps rewriting that file on token refresh and cookie rotation even
+	// after it is deleted. Unpair drops the client.
+	ClientLoaded bool `json:"client_loaded"`
 	// NeedsRepair is set when the session reports connected but sends keep
 	// failing — the phone has likely unlinked the device. The UI should
 	// offer re-pairing even though Connected is true.
@@ -768,6 +773,7 @@ func (a *App) GoogleStatus() GoogleStatusSnapshot {
 		Connected:    connected,
 		Paired:       paired,
 		NeedsPairing: !connected && !paired,
+		ClientLoaded: a.GetClient() != nil,
 		// needs_repair surfaces whenever the session is known-bad and a session
 		// file still exists — whether that's a zombie (connected, sends fail)
 		// or a dead-credentials disconnect (auth 401). Either way the fix is

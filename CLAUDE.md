@@ -35,10 +35,11 @@ before touching anything. The traps that cost the most:
 - **Read live messages via the HTTP API** (`/api/conversations/<id>/messages`,
   `/api/search`, `/api/status`) — the app holds the WAL'd DB, so a direct
   `sqlite3` reader hits "unable to open database file (14)".
-- **Re-pairing Google Messages:** QR is dead; use Google Account pairing via the
-  cookie method; clear `session.json` from **both** data dirs to reach the
-  pairing screen; don't over-reconnect (it throttles the account). Full recipe
-  in the runbook.
+- **Re-pairing Google Messages:** QR is dead; use Google Account pairing:
+  with the user at the phone, quit the app and run
+  `OPENMESSAGES_DATA_DIR=... openmessage pair --google-chrome` (reads the
+  signed-in Chrome profile's cookies; the user taps the printed emoji).
+  Don't over-reconnect (it throttles the account). Full recipe in the runbook.
 
 ## Local CLI (read-only, no transports)
 
