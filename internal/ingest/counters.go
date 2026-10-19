@@ -31,7 +31,10 @@ type CounterSnapshot struct {
 	EchoNoop          uint64 `json:"echo_noop"`
 	EchoNotFound      uint64 `json:"echo_notfound"`
 	EchoErrors        uint64 `json:"echo_errors"`
-	Ephemeral         uint64 `json:"ephemeral"`
+	// EchoContentMatched counts outgoing echoes that named no transport
+	// request and were correlated to their send by conversation, body and time.
+	EchoContentMatched uint64 `json:"echo_content_matched"`
+	Ephemeral          uint64 `json:"ephemeral"`
 	// RemoteRebinds counts Google remote conversation ids whose thread binding
 	// moved because participant identity contradicted the stored numeric id
 	// (device ID-space reset). ContentDupesSkipped counts re-delivered messages
@@ -77,6 +80,7 @@ type accountCounters struct {
 	echoNoop            atomic.Uint64
 	echoNotFound        atomic.Uint64
 	echoErrors          atomic.Uint64
+	echoContentMatched  atomic.Uint64
 	ephemeral           atomic.Uint64
 	remoteRebinds       atomic.Uint64
 	contentDupesSkipped atomic.Uint64
@@ -168,6 +172,7 @@ func snapshotCounters(c *accountCounters) CounterSnapshot {
 		EchoNoop:            c.echoNoop.Load(),
 		EchoNotFound:        c.echoNotFound.Load(),
 		EchoErrors:          c.echoErrors.Load(),
+		EchoContentMatched:  c.echoContentMatched.Load(),
 		Ephemeral:           c.ephemeral.Load(),
 		RemoteRebinds:       c.remoteRebinds.Load(),
 		ContentDupesSkipped: c.contentDupesSkipped.Load(),

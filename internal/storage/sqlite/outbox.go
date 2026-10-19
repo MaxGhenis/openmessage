@@ -1644,6 +1644,35 @@ func (r *OutboxRepository) ReconcileConfirm(
 	}
 	defer tx.Rollback()
 
+	outcome, err := r.reconcileConfirmTx(ctx, tx, req)
+	if err != nil {
+		return "", err
+	}
+	if err := commitReconcile(tx, outcome, req.TransportRequestID); err != nil {
+		return "", err
+	}
+	return outcome, nil
+}
+
+// commitReconcile commits a reconcile that changed durable state. NotFound and
+// Noop changed nothing, so their transaction is left to roll back.
+func commitReconcile(tx *sql.Tx, outcome ReconcileOutcome, transportRequestID string) error {
+	if outcome != ReconcileOutcomeReconciled && outcome != ReconcileOutcomeEnriched {
+		return nil
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("reconcile transport request %q: commit %s: %w", transportRequestID, outcome, err)
+	}
+	return nil
+}
+
+// reconcileConfirmTx is ReconcileConfirm inside the caller's transaction. It
+// never commits; the caller commits when the outcome changed durable state.
+func (r *OutboxRepository) reconcileConfirmTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	req ReconcileRequest,
+) (ReconcileOutcome, error) {
 	var (
 		outboxID                string
 		state                   OutboxState
@@ -1651,7 +1680,7 @@ func (r *OutboxRepository) ReconcileConfirm(
 		persistedResultRemoteID sql.NullString
 		localRemoteMessageID    sql.NullString
 	)
-	err = tx.QueryRowContext(ctx, `
+	err := tx.QueryRowContext(ctx, `
 		SELECT
 			o.outbox_id,
 			o.state,
@@ -1714,9 +1743,6 @@ func (r *OutboxRepository) ReconcileConfirm(
 				return "", fmt.Errorf("reconcile outbox item %q: %w", outboxID, err)
 			}
 		}
-		if err := tx.Commit(); err != nil {
-			return "", fmt.Errorf("reconcile outbox item %q: commit: %w", outboxID, err)
-		}
 		return ReconcileOutcomeReconciled, nil
 
 	case OutboxConfirmed:
@@ -1775,9 +1801,6 @@ func (r *OutboxRepository) ReconcileConfirm(
 			req.ResultRemoteID,
 		); err != nil {
 			return "", fmt.Errorf("reconcile outbox item %q: %w", outboxID, err)
-		}
-		if err := tx.Commit(); err != nil {
-			return "", fmt.Errorf("reconcile outbox item %q: commit enrichment: %w", outboxID, err)
 		}
 		return ReconcileOutcomeEnriched, nil
 
