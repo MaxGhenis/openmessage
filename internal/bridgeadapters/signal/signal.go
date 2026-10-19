@@ -25,9 +25,9 @@ import (
 type poller interface {
 	ObserveIngress(func(account string, line []byte, resolvedSource string, resolvedDestination string)) func()
 	StartPoller(context.Context) (signallive.PollerRun, error)
-	SendTextRequest(string, string, string) (int64, error)
+	SendTextRequest(string, string, signallive.ReplyTarget) (int64, error)
 	SendReactionRequest(string, string, string, string, string) error
-	SendMediaRequest(string, io.Reader, int64, string, string, string, string) (int64, error)
+	SendMediaRequest(string, io.Reader, int64, string, string, string, signallive.ReplyTarget) (int64, error)
 	DownloadMediaRef(string, string, string, string, string, bool) ([]byte, string, error)
 	Status() signallive.StatusSnapshot
 	ApplyPollerFailure(signallive.PollerExit)
@@ -126,14 +126,10 @@ func (a *Adapter) SendText(
 		return bridge.SendResult{}, signalNotConnectedError("send_text")
 	}
 
-	replyToID := ""
-	if req.ReplyTo != nil {
-		replyToID = req.ReplyTo.RemoteID
-	}
 	timestampMS, err := a.poller.SendTextRequest(
 		req.Conversation.RemoteID,
 		req.Body,
-		replyToID,
+		ReplyTarget(req.ReplyTo),
 	)
 	if err != nil {
 		a.ReportError(err)
@@ -153,6 +149,25 @@ func (a *Adapter) SendText(
 		RemoteMessageID: strconv.FormatInt(timestampMS, 10),
 		EchoExpected:    false,
 	}, nil
+}
+
+// ReplyTarget carries a durable reply reference to signallive unchanged. The
+// dispatcher's description of the quoted message (author, occurred time,
+// body, first attachment) lets signallive quote it without a legacy row; a
+// reference without one (zero SentAt) is still resolved from the legacy store
+// by RemoteID. A nil reference is no reply.
+func ReplyTarget(ref *bridge.MessageRef) signallive.ReplyTarget {
+	if ref == nil {
+		return signallive.ReplyTarget{}
+	}
+	return signallive.ReplyTarget{
+		RemoteID:       ref.RemoteID,
+		AuthorID:       ref.AuthorID,
+		SentAt:         ref.SentAt,
+		Text:           ref.Text,
+		HasAttachment:  ref.HasAttachment,
+		AttachmentMIME: ref.AttachmentMIME,
+	}
 }
 
 // SendReaction adapts a durable reaction request to Signal's store-free
@@ -241,10 +256,6 @@ func (a *Adapter) SendMedia(
 		return bridge.SendResult{}, signalNotConnectedError("send_media")
 	}
 
-	replyToID := ""
-	if req.ReplyTo != nil {
-		replyToID = req.ReplyTo.RemoteID
-	}
 	timestampMS, err := a.poller.SendMediaRequest(
 		req.Conversation.RemoteID,
 		req.Reader,
@@ -252,7 +263,7 @@ func (a *Adapter) SendMedia(
 		req.Filename,
 		req.MIME,
 		req.Caption,
-		replyToID,
+		ReplyTarget(req.ReplyTo),
 	)
 	if err != nil {
 		a.ReportError(err)
