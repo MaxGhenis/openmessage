@@ -327,8 +327,8 @@ func (a *Adapter) SendReaction(
 		}
 	}
 
-	// Reaction dispatch confirms an empty result via ConfirmWithoutResult;
-	// there is no reaction-message ID or echo-reconciliation consumer.
+	// Reaction dispatch confirms an empty result via ConfirmReaction; there
+	// is no reaction-message ID or echo-reconciliation consumer.
 	return bridge.SendResult{}, nil
 }
 

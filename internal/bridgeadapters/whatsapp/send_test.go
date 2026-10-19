@@ -273,9 +273,9 @@ func TestSendReactionRequiresReadyTransportWithoutLifecycleAction(t *testing.T) 
 			return nil
 		},
 		mediaReady: func() bool { return false },
-		sendReactionRequest: func(string, string, string, string, string, string) error {
+		sendReactionRequest: func(string, string, string, string, string, string) (time.Time, error) {
 			sendCalls++
-			return nil
+			return time.Time{}, nil
 		},
 	}
 
@@ -326,9 +326,9 @@ func TestSendReactionContextGuardsRunBeforeTransport(t *testing.T) {
 			var sendCalls int
 			a := &Adapter{
 				mediaReady: func() bool { return true },
-				sendReactionRequest: func(string, string, string, string, string, string) error {
+				sendReactionRequest: func(string, string, string, string, string, string) (time.Time, error) {
 					sendCalls++
-					return nil
+					return time.Time{}, nil
 				},
 			}
 
@@ -362,20 +362,21 @@ func TestSendReactionSuccessAndActionMapping(t *testing.T) {
 		{name: "switch", action: bridge.ReactionSwitch, wantAction: "switch", authorID: "+15557654321"},
 		{name: "empty author remains self target", action: bridge.ReactionAdd, wantAction: "add"},
 	}
+	sentAt := time.UnixMilli(1_780_000_000_950)
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			var gotConversationID, gotTargetRemoteID, gotTargetAuthorID, gotEmoji, gotAction, gotRequestID string
 			a := &Adapter{
 				accountID:  "whatsapp-primary",
 				mediaReady: func() bool { return true },
-				sendReactionRequest: func(conversationID, targetRemoteID, targetAuthorID, emoji, action, requestID string) error {
+				sendReactionRequest: func(conversationID, targetRemoteID, targetAuthorID, emoji, action, requestID string) (time.Time, error) {
 					gotConversationID = conversationID
 					gotTargetRemoteID = targetRemoteID
 					gotTargetAuthorID = targetAuthorID
 					gotEmoji = emoji
 					gotAction = action
 					gotRequestID = requestID
-					return nil
+					return sentAt, nil
 				},
 			}
 
@@ -395,8 +396,11 @@ func TestSendReactionSuccessAndActionMapping(t *testing.T) {
 			if err != nil {
 				t.Fatalf("SendReaction() error = %v", err)
 			}
-			if result != (bridge.SendResult{}) {
-				t.Fatalf("SendReaction() result = %+v, want empty result for ConfirmWithoutResult", result)
+			// No remote ID; AcceptedAt is the reaction's own sender timestamp,
+			// so the confirmation compares with later phone changes on the
+			// clock the ingest path uses (review of #227).
+			if result.RemoteMessageID != "" || !result.AcceptedAt.Equal(sentAt) {
+				t.Fatalf("SendReaction() result = %+v, want no remote ID and AcceptedAt %v", result, sentAt)
 			}
 			if gotConversationID != "whatsapp:120363019999999999@g.us" ||
 				gotTargetRemoteID != "target-remote-id" ||
@@ -437,8 +441,8 @@ func TestSendReactionTransportErrorClassification(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			a := &Adapter{
 				mediaReady: func() bool { return true },
-				sendReactionRequest: func(string, string, string, string, string, string) error {
-					return test.err
+				sendReactionRequest: func(string, string, string, string, string, string) (time.Time, error) {
+					return time.Time{}, test.err
 				},
 			}
 
@@ -477,8 +481,8 @@ func TestSendReactionFailureDoesNotRetireReceiveGeneration(t *testing.T) {
 			a := &Adapter{
 				current:    r,
 				mediaReady: func() bool { return true },
-				sendReactionRequest: func(string, string, string, string, string, string) error {
-					return test.err
+				sendReactionRequest: func(string, string, string, string, string, string) (time.Time, error) {
+					return time.Time{}, test.err
 				},
 			}
 

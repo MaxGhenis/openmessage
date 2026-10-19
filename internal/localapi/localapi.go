@@ -21,6 +21,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -93,6 +94,14 @@ func (s DaemonStatus) SendsViaOutbox() bool {
 	return s.V2Send || s.V2Primary
 }
 
+// ReactionsViaOutbox reports whether the daemon takes reactions on the durable
+// /api/v1/outbox/reactions surface. Only a v2-primary daemon does: the route
+// addresses messages by v2 ID, which a legacy-primary daemon does not hand
+// out, even with v2 send enabled.
+func (s DaemonStatus) ReactionsViaOutbox() bool {
+	return s.V2Primary
+}
+
 // Status probes /api/status. The second result reports reachability: false
 // means no daemon answered at all (connection refused/timeout), while true
 // with a non-nil error means something answered but the response was not a
@@ -133,6 +142,18 @@ type MediaSubmission struct {
 	IdempotencyKey string
 	NotBeforeMS    *int64
 	Content        io.Reader
+}
+
+// ReactionSubmission is a durable reaction routed at
+// POST /api/v1/outbox/reactions. MessageID is the target's v2 message ID.
+// ConversationID is optional; when set it must name the target's conversation.
+// Action is "add", "remove", or "switch", and empty means add.
+type ReactionSubmission struct {
+	ConversationID string `json:"conversation_id,omitempty"`
+	MessageID      string `json:"message_id"`
+	Emoji          string `json:"emoji"`
+	Action         string `json:"action,omitempty"`
+	IdempotencyKey string `json:"idempotency_key"`
 }
 
 // Submission mirrors the daemon's v1 submission response.
@@ -187,6 +208,20 @@ func (c *Client) SubmitText(ctx context.Context, submission TextSubmission) (Sub
 	}
 	var result Submission
 	if err := decodeResponse(response, &result); err != nil {
+		return Submission{}, err
+	}
+	if result.OutboxID == "" {
+		return Submission{}, fmt.Errorf("submission response omitted outbox_id")
+	}
+	return result, nil
+}
+
+// SubmitReaction enqueues a reaction on a v2-primary daemon's durable outbox.
+// Like SubmitText it returns once the intent is stored; Delivery and
+// WaitDelivery report what became of it.
+func (c *Client) SubmitReaction(ctx context.Context, submission ReactionSubmission) (Submission, error) {
+	var result Submission
+	if err := c.postJSON(ctx, "/api/v1/outbox/reactions", submission, &result); err != nil {
 		return Submission{}, err
 	}
 	if result.OutboxID == "" {
@@ -372,16 +407,54 @@ func (c *Client) LegacySendMedia(ctx context.Context, submission MediaSubmission
 	return result, nil
 }
 
+// ReactResult is the daemon's answer on /api/react.
+//
+// A legacy-primary daemon answers only after the transport call, and sets
+// Success alone. A v2-primary daemon queues the reaction on its durable outbox
+// and waits a few seconds for it to settle, so its answer also carries the
+// intent: Queued is true (HTTP 202) when the reaction is stored but not yet
+// delivered, in which case the daemon keeps retrying it and the caller must
+// not react again. OutboxID and State identify the intent for Delivery.
+type ReactResult struct {
+	Success  bool   `json:"success"`
+	Queued   bool   `json:"queued"`
+	OutboxID string `json:"outbox_id"`
+	State    string `json:"state"`
+}
+
 // React routes a reaction through the daemon's /api/react surface, which
 // works in every daemon mode. Action is "add", "remove", or "switch".
-func (c *Client) React(ctx context.Context, conversationID, messageID, emoji, action string) error {
+// idempotencyKey, when set, lets a v2-primary daemon recognise a repeat of
+// the same reaction; a legacy-primary daemon ignores it. A reaction the
+// daemon could not deliver is a ResponseError. When a v2-primary daemon had
+// already stored it on its outbox, the returned ReactResult still carries
+// that outbox_id and state alongside the error. On a v2-primary daemon prefer
+// SubmitReaction.
+func (c *Client) React(ctx context.Context, conversationID, messageID, emoji, action, idempotencyKey string) (ReactResult, error) {
 	payload := struct {
 		ConversationID string `json:"conversation_id"`
 		MessageID      string `json:"message_id"`
 		Emoji          string `json:"emoji"`
 		Action         string `json:"action"`
-	}{conversationID, messageID, emoji, action}
-	return c.postJSON(ctx, "/api/react", payload, &map[string]any{})
+		IdempotencyKey string `json:"idempotency_key,omitempty"`
+	}{conversationID, messageID, emoji, action, idempotencyKey}
+	var result ReactResult
+	if err := c.postJSON(ctx, "/api/react", payload, &result); err != nil {
+		if responseErr, ok := AsResponseError(err); ok {
+			var stored ReactResult
+			if json.Unmarshal([]byte(responseErr.Body), &stored) == nil && stored.OutboxID != "" {
+				return stored, err
+			}
+		}
+		return ReactResult{}, err
+	}
+	return result, nil
+}
+
+// IsConnectionRefused reports whether err means nothing was listening, so a
+// request certainly did not reach the daemon.
+func IsConnectionRefused(err error) bool {
+	return errors.Is(err, syscall.ECONNREFUSED)
 }
 
 func (c *Client) postJSON(ctx context.Context, path string, payload any, target any) error {

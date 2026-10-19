@@ -58,10 +58,49 @@ type e2eServer struct {
 
 type e2eAdapter struct {
 	*scripted.Adapter
+	reactions *e2eReactionScript
 }
 
 func (e2eAdapter) DeclaredCapabilities() bridge.CapabilitySet {
-	return bridge.CapabilitySet{TextSend: true, MediaSend: true}
+	return bridge.CapabilitySet{TextSend: true, MediaSend: true, Reactions: true}
+}
+
+// SendReaction gives a scripted account the reaction sender the scripted
+// adapter lacks. It accepts each reaction unless a test queued a failure for
+// the next one.
+func (a e2eAdapter) SendReaction(context.Context, bridge.ReactionRequest) (bridge.SendResult, error) {
+	if failure := a.reactions.next(); failure != nil {
+		return bridge.SendResult{}, *failure
+	}
+	return bridge.SendResult{AcceptedAt: time.Now()}, nil
+}
+
+type e2eReactionScript struct {
+	mu       sync.Mutex
+	failures []bridge.OpError
+}
+
+func (s *e2eReactionScript) enqueueFailure(failure bridge.OpError) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.failures = append(s.failures, failure)
+}
+
+func (s *e2eReactionScript) clear() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.failures = nil
+}
+
+func (s *e2eReactionScript) next() *bridge.OpError {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.failures) == 0 {
+		return nil
+	}
+	failure := s.failures[0]
+	s.failures = s.failures[1:]
+	return &failure
 }
 
 func (s *e2eServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -125,6 +164,7 @@ func newE2EServer(logger zerolog.Logger) (_ *e2eServer, cleanup func(), resultEr
 		"whatsapp-primary": scripted.New("whatsapp-primary", bridge.PlatformWhatsApp),
 		"signal-primary":   scripted.New("signal-primary", bridge.PlatformSignal),
 	}
+	reactionScripts := map[string]*e2eReactionScript{}
 	for _, adapter := range adapters {
 		for i := 0; i < 128; i++ {
 			adapter.EnqueueMediaResult(bridge.SendResult{
@@ -132,7 +172,8 @@ func newE2EServer(logger zerolog.Logger) (_ *e2eServer, cleanup func(), resultEr
 				AcceptedAt:      time.Now(),
 			})
 		}
-		if err := registry.Register(e2eAdapter{Adapter: adapter}); err != nil {
+		reactionScripts[adapter.AccountID()] = &e2eReactionScript{}
+		if err := registry.Register(e2eAdapter{Adapter: adapter, reactions: reactionScripts[adapter.AccountID()]}); err != nil {
 			_ = v2Store.Close()
 			_ = store.Close()
 			_ = os.RemoveAll(dataDir)
@@ -524,6 +565,39 @@ func newE2EServer(logger zerolog.Logger) (_ *e2eServer, cleanup func(), resultEr
 			http.Error(w, "next_result must be success or uncertain", http.StatusBadRequest)
 			return
 		}
+		writeJSON(w, map[string]any{"success": true})
+	})
+
+	mux.HandleFunc("POST /_e2e/bridges/{account}/next-reaction", func(w http.ResponseWriter, r *http.Request) {
+		script := reactionScripts[r.PathValue("account")]
+		if script == nil {
+			http.Error(w, "unknown bridge account", http.StatusNotFound)
+			return
+		}
+		var req struct {
+			Result string `json:"next_result"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		failure := bridge.OpError{Operation: "send_reaction", Cause: fmt.Errorf("scripted %s reaction", req.Result)}
+		switch req.Result {
+		case "clear":
+			script.clear()
+			writeJSON(w, map[string]any{"success": true})
+			return
+		case "not_connected":
+			failure.Class, failure.Fingerprint, failure.Dispatch = bridge.FailureTransient, "e2e_not_connected", bridge.DispatchNotCalled
+		case "rejected":
+			failure.Class, failure.Fingerprint, failure.Dispatch = bridge.FailureUnsupported, "e2e_rejected", bridge.DispatchNotCalled
+		case "uncertain":
+			failure.Class, failure.Fingerprint, failure.Dispatch = bridge.FailureTransient, "e2e_uncertain", bridge.DispatchUncertain
+		default:
+			http.Error(w, "next_result must be not_connected, rejected, uncertain or clear", http.StatusBadRequest)
+			return
+		}
+		script.enqueueFailure(failure)
 		writeJSON(w, map[string]any{"success": true})
 	})
 

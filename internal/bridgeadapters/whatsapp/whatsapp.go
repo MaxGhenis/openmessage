@@ -38,7 +38,7 @@ type Adapter struct {
 	now                 func() time.Time
 	mediaReady          func() bool // Shared connection gate; it does no media-specific work.
 	sendTextRequest     func(string, string, string, string) (string, time.Time, error)
-	sendReactionRequest func(string, string, string, string, string, string) error
+	sendReactionRequest func(string, string, string, string, string, string) (time.Time, error)
 	markReadRequest     func(string, []string, string, time.Time) error
 	sendMediaRequest    func(string, []byte, string, string, string, string, string) (string, time.Time, error)
 	downloadMediaRef    func(string, whatsapplive.StoredMediaRef, string, string, string) ([]byte, string, error)
@@ -179,7 +179,7 @@ func (a *Adapter) SendReaction(ctx context.Context, req bridge.ReactionRequest) 
 		return bridge.SendResult{}, whatsappReactionPreCallFailure("whatsapp_reaction_context_done", err)
 	}
 
-	err := a.sendReactionRequest(
+	sentAt, err := a.sendReactionRequest(
 		req.Conversation.RemoteID,
 		req.Target.RemoteID,
 		req.Target.AuthorID,
@@ -197,8 +197,10 @@ func (a *Adapter) SendReaction(ctx context.Context, req bridge.ReactionRequest) 
 		return bridge.SendResult{}, failure
 	}
 
-	// Reaction dispatch intentionally confirms without a transport result.
-	return bridge.SendResult{}, nil
+	// Reaction dispatch confirms without a remote ID. AcceptedAt is the
+	// reaction's own sender timestamp, which the ingest path also uses, so a
+	// change made on the phone moments later is not mistaken for a stale one.
+	return bridge.SendResult{AcceptedAt: sentAt}, nil
 }
 
 func whatsappReactionPreCallFailure(fingerprint string, cause error) bridge.OpError {

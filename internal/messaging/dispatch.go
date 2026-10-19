@@ -557,44 +557,30 @@ func (s *MessageService) dispatchReactionLease(ctx context.Context, outboxLease 
 	if sendErr != nil {
 		return s.recordSendError(mutationCtx, item, sendErr, reactionOperation)
 	}
-	if strings.TrimSpace(result.RemoteMessageID) == "" {
-		// Legacy web/api.go reaction dispatch returns only a success boolean, so
-		// an empty remote result is a valid confirmation for this operation.
-		if err := s.outbox.ConfirmWithoutResult(
-			mutationCtx,
-			item.OutboxID,
-			*item.LeaseToken,
-		); err != nil {
-			return fmt.Errorf(
-				"dispatch outbox item %q: confirm reaction without result: %w",
-				item.OutboxID,
-				err,
-			)
-		}
-		s.signalChange()
-		return nil
+	// The transport accepted the reaction. Confirming also records it in the
+	// read model as this account's own, in one transaction. The adapters store
+	// nothing when they send a reaction (the legacy senders wrote the stored
+	// reaction themselves after the send), so without this row a reader sees
+	// the reaction only if the transport later reports it back. The Google,
+	// WhatsApp and Signal adapters return no remote identity for a reaction,
+	// so an empty result is a valid confirmation.
+	occurredAt := result.AcceptedAt
+	if occurredAt.IsZero() {
+		occurredAt = s.clock.Now()
 	}
-
-	confirmation := sqlite.Confirmation{
+	if _, err := s.outbox.ConfirmReaction(mutationCtx, sqlite.ReactionConfirmation{
 		OutboxID:       item.OutboxID,
 		LeaseToken:     *item.LeaseToken,
 		ResultRemoteID: result.RemoteMessageID,
-	}
-	if err := s.outbox.Confirm(mutationCtx, confirmation); err != nil {
-		storeErr := s.outbox.MarkStoreFailed(
-			mutationCtx,
+		OccurredAt:     occurredAt,
+	}); err != nil {
+		// The row stays leased and called, so lease recovery settles it as
+		// uncertain: the reaction went out, and nothing here may send it again.
+		return fmt.Errorf(
+			"dispatch outbox item %q: confirm reaction: %w",
 			item.OutboxID,
-			*item.LeaseToken,
-			result.RemoteMessageID,
-			err.Error(),
+			err,
 		)
-		if storeErr != nil {
-			return fmt.Errorf(
-				"dispatch outbox item %q: confirm: %w",
-				item.OutboxID,
-				errors.Join(err, storeErr),
-			)
-		}
 	}
 	s.signalChange()
 	return nil

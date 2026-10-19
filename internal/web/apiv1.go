@@ -2,7 +2,9 @@ package web
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -33,6 +35,10 @@ type V2Options struct {
 	V2Store  *sqlite.Store
 	Blobs    *blob.BlobStore
 	Registry bridge.Registry
+
+	// ReactSettleTimeout bounds how long POST /api/react waits for a reaction
+	// to settle on a v2-primary daemon. Zero means reactSettleTimeout.
+	ReactSettleTimeout time.Duration
 }
 
 type v1API struct {
@@ -40,7 +46,15 @@ type v1API struct {
 	logger  zerolog.Logger
 	v2      *V2Options
 	primary bool
+	// reactSettle bounds how long POST /api/react waits for a reaction to
+	// settle on a v2-primary daemon.
+	reactSettle time.Duration
 }
+
+// reactSettleTimeout is the default reactSettle. It stays under the 10s
+// request timeout of localapi clients, which report a slower answer as the
+// app not running.
+const reactSettleTimeout = 8 * time.Second
 
 type v1SubmissionResponse struct {
 	OutboxID       string                `json:"outbox_id"`
@@ -75,11 +89,15 @@ type v1PendingResponse struct {
 	ErrorCode      string                `json:"error_code,omitempty"`
 }
 
-func registerV1Routes(mux *http.ServeMux, legacy *db.Store, logger zerolog.Logger, v2 *V2Options, primary bool) {
-	api := &v1API{legacy: legacy, logger: logger, v2: v2, primary: primary}
+func registerV1Routes(mux *http.ServeMux, legacy *db.Store, logger zerolog.Logger, v2 *V2Options, primary bool) *v1API {
+	api := &v1API{legacy: legacy, logger: logger, v2: v2, primary: primary, reactSettle: reactSettleTimeout}
+	if v2 != nil && v2.ReactSettleTimeout > 0 {
+		api.reactSettle = v2.ReactSettleTimeout
+	}
 
 	mux.HandleFunc("POST /api/v1/outbox/messages", api.submitText)
 	mux.HandleFunc("POST /api/v1/outbox/media", api.submitMedia)
+	mux.HandleFunc("POST /api/v1/outbox/reactions", api.submitReaction)
 	mux.HandleFunc("GET /api/v1/outbox", api.listPending)
 	mux.HandleFunc("GET /api/v1/outbox/{id}", api.getDelivery)
 	mux.HandleFunc("POST /api/v1/outbox/{id}/cancel", api.cancel)
@@ -93,6 +111,7 @@ func registerV1Routes(mux *http.ServeMux, legacy *db.Store, logger zerolog.Logge
 	// including paths introduced by a newer client than this daemon knows.
 	mux.HandleFunc("/api/v1", api.v1Fallback)
 	mux.HandleFunc("/api/v1/", api.v1Fallback)
+	return api
 }
 
 func (a *v1API) v1Fallback(w http.ResponseWriter, _ *http.Request) {
@@ -226,6 +245,162 @@ func (a *v1API) submitMedia(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, submissionResponse(submission))
+}
+
+// reactionRequest is the body of POST /api/v1/outbox/reactions and of
+// POST /api/react. conversation_id is optional: the target message decides
+// the conversation.
+type reactionRequest struct {
+	ConversationID string `json:"conversation_id"`
+	MessageID      string `json:"message_id"`
+	Emoji          string `json:"emoji"`
+	Action         string `json:"action"` // "add", "remove", "switch"; default "add"
+	IdempotencyKey string `json:"idempotency_key"`
+}
+
+func (request reactionRequest) input(idempotencyKey string) v2wire.ReactionInput {
+	return v2wire.ReactionInput{
+		ConversationID: request.ConversationID,
+		MessageID:      request.MessageID,
+		Emoji:          request.Emoji,
+		Action:         request.Action,
+		IdempotencyKey: idempotencyKey,
+	}
+}
+
+// submitReaction queues a reaction on the durable outbox and returns as soon
+// as the intent is stored, like the other outbox submissions: the response
+// says nothing about delivery, which GET /api/v1/outbox/{id} reports. It
+// takes v2 IDs, so it serves a v2-primary daemon only; on a legacy-primary
+// daemon reactions stay on /api/react.
+func (a *v1API) submitReaction(w http.ResponseWriter, r *http.Request) {
+	if !a.enabled(w) {
+		return
+	}
+	if !a.primary {
+		httpError(w, "legacy primary: use /api/react", http.StatusConflict)
+		return
+	}
+	var request reactionRequest
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		httpError(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if strings.TrimSpace(request.MessageID) == "" || strings.TrimSpace(request.Emoji) == "" {
+		httpError(w, "message_id and emoji are required", http.StatusBadRequest)
+		return
+	}
+	idempotencyKey, err := normalizeRequiredV2IdempotencyKey(request.IdempotencyKey)
+	if err != nil {
+		httpError(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if !a.submitDependenciesAvailable(w) {
+		return
+	}
+	submission, err := v2wire.SubmitReactionV2(r.Context(), a.nativeDeps(), request.input(idempotencyKey))
+	if err != nil {
+		a.writeError(w, err)
+		return
+	}
+	writeJSON(w, submissionResponse(submission))
+}
+
+// react serves POST /api/react on a v2-primary daemon. The legacy handler
+// answered only after the transport call; delivery is now the dispatcher's
+// job, so this queues the reaction on the outbox and waits up to reactSettle
+// for it to settle, and the status says how far it got (reactOutcome).
+// A request without an idempotency_key is a new intent each time.
+func (a *v1API) react(w http.ResponseWriter, r *http.Request, request reactionRequest) {
+	if !a.enabled(w) || !a.submitDependenciesAvailable(w) {
+		return
+	}
+	idempotencyKey, err := normalizeSendIdempotencyKey(request.IdempotencyKey)
+	if err != nil {
+		httpError(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if idempotencyKey == "" {
+		if idempotencyKey, err = newReactionIdempotencyKey(); err != nil {
+			a.writeError(w, err)
+			return
+		}
+	}
+	submission, err := v2wire.SubmitReactionV2(r.Context(), a.nativeDeps(), request.input(idempotencyKey))
+	if err != nil {
+		a.writeError(w, err)
+		return
+	}
+
+	waitCtx, cancel := context.WithTimeout(r.Context(), a.reactSettle)
+	defer cancel()
+	delivery, err := a.v2.Service.Wait(waitCtx, submission.OutboxID)
+	if err != nil && delivery.OutboxID == "" {
+		// The intent is stored; only this read of it failed.
+		delivery = messaging.Delivery{OutboxID: submission.OutboxID, State: submission.State}
+	}
+	status, body := reactOutcome(delivery)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(body)
+}
+
+// reactOutcome maps the delivery state POST /api/react reached within its
+// wait to the HTTP answer:
+//
+//   - 200, success true: the transport accepted the reaction, and it is in
+//     the read model as this account's own.
+//   - 202, success true, queued true: the reaction is stored on the outbox
+//     and has not been delivered yet. The app keeps retrying it until it goes
+//     out or is canceled, so the caller must not repeat it.
+//   - 409, 502, with error: the reaction will not be delivered by this
+//     intent. It was canceled (409), the transport refused it (502, state
+//     rejected), or the transport call ended without an answer and the
+//     reaction may or may not have been applied (502, state uncertain).
+//
+// Every answer carries outbox_id and state, so a caller can follow the
+// intent on GET /api/v1/outbox/{id}.
+func reactOutcome(delivery messaging.Delivery) (int, map[string]any) {
+	body := map[string]any{
+		"outbox_id": delivery.OutboxID,
+		"state":     delivery.State,
+	}
+	if delivery.ErrorClass != "" {
+		body["error_class"] = delivery.ErrorClass
+	}
+	if delivery.ErrorCode != "" {
+		body["error_code"] = delivery.ErrorCode
+	}
+	fail := func(status int, message string) (int, map[string]any) {
+		body["success"] = false
+		body["error"] = "send reaction: " + message
+		return status, body
+	}
+	switch delivery.State {
+	case messaging.OutboxConfirmed, messaging.OutboxStoreFailed:
+		body["success"] = true
+		return http.StatusOK, body
+	case messaging.OutboxUncertain:
+		return fail(http.StatusBadGateway, "the transport gave no answer, so the reaction may or may not have been applied")
+	case messaging.OutboxRejected:
+		return fail(http.StatusBadGateway, "the transport refused the reaction")
+	case messaging.OutboxCanceled:
+		return fail(http.StatusConflict, "the reaction was canceled before it was sent")
+	default:
+		// queued, dispatching, not_dispatched, and any state added later:
+		// stored, not delivered, still the app's to send.
+		body["success"] = true
+		body["queued"] = true
+		return http.StatusAccepted, body
+	}
+}
+
+func newReactionIdempotencyKey() (string, error) {
+	var value [16]byte
+	if _, err := rand.Read(value[:]); err != nil {
+		return "", fmt.Errorf("generate reaction idempotency key: %w", err)
+	}
+	return "react-" + hex.EncodeToString(value[:]), nil
 }
 
 func (a *v1API) listPending(w http.ResponseWriter, r *http.Request) {
@@ -448,6 +623,8 @@ func v1ErrorResponse(err error) (int, string) {
 	switch {
 	case errors.Is(err, v2wire.ErrReplyTargetUnavailable):
 		return http.StatusUnprocessableEntity, "reply_target_unavailable"
+	case errors.Is(err, v2wire.ErrReactionTargetUnavailable):
+		return http.StatusUnprocessableEntity, "reaction_target_unavailable"
 	case errors.Is(err, messaging.ErrIdempotencyConflict):
 		return http.StatusConflict, err.Error()
 	case errors.Is(err, messaging.ErrInvalidState):

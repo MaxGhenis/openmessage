@@ -33,6 +33,7 @@ func TestV1RoutesReturnServiceUnavailableWhenDisabled(t *testing.T) {
 	}{
 		{http.MethodPost, "/api/v1/outbox/messages"},
 		{http.MethodPost, "/api/v1/outbox/media"},
+		{http.MethodPost, "/api/v1/outbox/reactions"},
 		{http.MethodGet, "/api/v1/outbox"},
 		{http.MethodGet, "/api/v1/outbox/outbox-1"},
 		{http.MethodPost, "/api/v1/outbox/outbox-1/cancel"},
@@ -263,6 +264,7 @@ func TestV1ErrorStatusMapping(t *testing.T) {
 		{name: "invalid state", err: messaging.ErrInvalidState, wantStatus: http.StatusConflict},
 		{name: "platform", err: v2wire.ErrPlatformNotSendable, wantStatus: http.StatusNotImplemented},
 		{name: "reply", err: v2wire.ErrReplyTargetUnavailable, wantStatus: http.StatusUnprocessableEntity, wantMessage: "reply_target_unavailable"},
+		{name: "reaction", err: fmt.Errorf("%w: no v2 message", v2wire.ErrReactionTargetUnavailable), wantStatus: http.StatusUnprocessableEntity, wantMessage: "reaction_target_unavailable"},
 		{name: "media unavailable", err: media.ErrUnavailable, wantStatus: http.StatusServiceUnavailable},
 		{name: "not found", err: sqlite.ErrNotFound, wantStatus: http.StatusNotFound, wantMessage: "not found"},
 		{name: "too large", err: messaging.ErrTooLarge, wantStatus: http.StatusRequestEntityTooLarge},

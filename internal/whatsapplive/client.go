@@ -1622,11 +1622,14 @@ func (b *Bridge) MarkReadRequest(conversationID string, messageIDs []string, sen
 }
 
 // SendReactionRequest sends a reaction from the v2 request data without
-// loading or updating the locally stored target message.
-func (b *Bridge) SendReactionRequest(conversationID, targetRemoteID, targetAuthorID, emoji, action, requestID string) error {
+// loading or updating the locally stored target message. It returns the
+// reaction's own sender timestamp (milliseconds), the time WhatsApp and the
+// ingest path record for it, so a confirmation and a later change from the
+// phone compare on the same clock.
+func (b *Bridge) SendReactionRequest(conversationID, targetRemoteID, targetAuthorID, emoji, action, requestID string) (time.Time, error) {
 	chatJID, err := parseConversationJID(conversationID)
 	if err != nil {
-		return markSendNotDispatched(err, true)
+		return time.Time{}, markSendNotDispatched(err, true)
 	}
 	chatJID = b.normalizeConversationJID(chatJID)
 
@@ -1648,22 +1651,27 @@ func (b *Bridge) SendReactionRequest(conversationID, targetRemoteID, targetAutho
 
 	cli, err := b.ensureSendClient()
 	if err != nil {
-		return markSendNotDispatched(err, true)
+		return time.Time{}, markSendNotDispatched(err, true)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
 
-	_, err = sendTextMessage(cli, ctx, chatJID, cli.BuildReaction(
+	reaction := cli.BuildReaction(
 		chatJID,
 		targetSenderJID,
 		watypes.MessageID(targetRemoteID),
 		reactionText,
-	), whatsmeow.SendRequestExtra{ID: reqID})
+	)
+	_, err = sendTextMessage(cli, ctx, chatJID, reaction, whatsmeow.SendRequestExtra{ID: reqID})
 	if err != nil {
 		b.reportConnectionError(err)
-		return fmt.Errorf("send WhatsApp reaction: %w", err)
+		return time.Time{}, fmt.Errorf("send WhatsApp reaction: %w", err)
 	}
-	return nil
+	var sentAt time.Time
+	if ms := reaction.GetReactionMessage().GetSenderTimestampMS(); ms > 0 {
+		sentAt = time.UnixMilli(ms)
+	}
+	return sentAt, nil
 }
 
 func (b *Bridge) SendReaction(conversationID, targetMessageID, emoji, action string) error {
