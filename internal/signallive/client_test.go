@@ -19,6 +19,7 @@ import (
 
 	"github.com/maxghenis/openmessage/internal/db"
 	"github.com/maxghenis/openmessage/internal/storage/sqlite"
+	"github.com/maxghenis/openmessage/internal/v2keys"
 )
 
 func TestQRCodeRendersDataURL(t *testing.T) {
@@ -2248,10 +2249,15 @@ func TestBridgeSendReactionRequestMapsActionsWithoutStoredState(t *testing.T) {
 				return []byte("ok"), nil
 			}
 
+			// An incoming target: its v2 remote ID is a SHA-1, so -t is the
+			// described sent time.
 			err := bridge.SendReactionRequest(
 				"signal:+15551234567",
-				"1700000000123",
-				"+15551234567",
+				ReactionTarget{
+					RemoteID: v2keys.SignalIncomingSourceID("signal:+15551234567", "+15551234567", 1700000000123),
+					AuthorID: "+15551234567",
+					SentAt:   time.UnixMilli(1700000000123),
+				},
 				"😂",
 				tc.action,
 			)
@@ -2295,10 +2301,11 @@ func TestBridgeSendReactionRequestMapsEmptyAuthorToSelfForGroup(t *testing.T) {
 		return []byte("ok"), nil
 	}
 
+	// This account's confirmed send: its remote ID is the timestamp signal-cli
+	// reported, while its occurred time is the earlier submit time.
 	if err := bridge.SendReactionRequest(
 		"signal-group:test-group",
-		"1700000000123",
-		"",
+		ReactionTarget{RemoteID: "1700000000123", Outgoing: true, SentAt: time.UnixMilli(1700000000000)},
 		"👍",
 		"switch",
 	); err != nil {
@@ -2333,7 +2340,8 @@ func TestBridgeSendReactionRequestSeparatesPreCallAndCommandFailures(t *testing.
 		return nil, errors.New("exit status 1")
 	}
 
-	err := bridge.SendReactionRequest("invalid-conversation", "1700000000123", "", "👍", "add")
+	ownSend := ReactionTarget{RemoteID: "1700000000123", Outgoing: true}
+	err := bridge.SendReactionRequest("invalid-conversation", ownSend, "👍", "add")
 	if err == nil || IsCommandError(err) || IsSendNotDispatchedError(err) {
 		t.Fatalf("pre-call error = %v (%T), want unmarked validation error", err, err)
 	}
@@ -2341,7 +2349,7 @@ func TestBridgeSendReactionRequestSeparatesPreCallAndCommandFailures(t *testing.
 		t.Fatalf("signal-cli calls after pre-call failure = %d, want 0", calls)
 	}
 
-	err = bridge.SendReactionRequest("signal:+15551234567", "1700000000123", "", "👍", "add")
+	err = bridge.SendReactionRequest("signal:+15551234567", ownSend, "👍", "add")
 	if err == nil || !IsCommandError(err) || IsSendNotDispatchedError(err) {
 		t.Fatalf("send-boundary error = %v (%T), want uncertain CommandError", err, err)
 	}

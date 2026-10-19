@@ -24,6 +24,7 @@ import (
 	"golang.org/x/crypto/pbkdf2"
 
 	"github.com/maxghenis/openmessage/internal/db"
+	"github.com/maxghenis/openmessage/internal/v2keys"
 )
 
 var (
@@ -377,6 +378,15 @@ func (s *SignalDesktop) openMessageMessage(supportDir string, rawConvo signalDes
 	}
 
 	messageID, sourceID := signalDesktopMessageIDs(conversationID, senderAddress, timestamp, body, isOutgoing)
+	if !isOutgoing && row.SentAt <= 0 {
+		// The Desktop row has no sent time, so timestamp is when it was
+		// received. Signal names a message by its sender and sent timestamp;
+		// a hash of the received time is not that name, and a reaction sent to
+		// it would target nothing. The source ID says so. The message ID stays
+		// as it was, so a re-import rewrites the row an earlier import stored
+		// under the unmarked hash instead of adding a second one.
+		sourceID = v2keys.SignalReceivedSourceID(conversationID, senderAddress, timestamp)
+	}
 	msg := &db.Message{
 		MessageID:      messageID,
 		ConversationID: conversationID,
