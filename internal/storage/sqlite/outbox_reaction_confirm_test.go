@@ -418,3 +418,205 @@ func TestConfirmedOwnReactionIsStoredAsItsEchoWouldBe(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// activeReactions lists a message's active reactions, the rows a reader is
+// shown, as "reactor emoji".
+func activeReactions(t *testing.T, store *Store, messageID string) []string {
+	t.Helper()
+	rows, err := store.db.Query(`
+		SELECT reactor_key, emoji FROM reactions
+		WHERE message_id = ? AND state = 'active'
+		ORDER BY reactor_key
+	`, messageID)
+	if err != nil {
+		t.Fatalf("list active reactions: %v", err)
+	}
+	defer rows.Close()
+	var active []string
+	for rows.Next() {
+		var key, emoji string
+		if err := rows.Scan(&key, &emoji); err != nil {
+			t.Fatalf("scan active reaction: %v", err)
+		}
+		active = append(active, key+" "+emoji)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate active reactions: %v", err)
+	}
+	return active
+}
+
+// On Google the phone's copy of a message's reactions is authoritative: each
+// frame applies its full snapshot, which names this account's reaction by its
+// participant ID, never as "self". The transport's answer and the phone's
+// frame race, so the confirm and the snapshot reach the store in either order.
+// Either way the message must end with the reaction the phone lists, not that
+// one plus an own row beside it.
+func TestConfirmReactionAndGoogleSnapshotCountTheReactionOnce(t *testing.T) {
+	ctx := context.Background()
+	phoneCopy := []ReactionSnapshotEntry{{
+		ReactorKey: "identity-a", ReactorIdentityID: pointer("identity-a"), Emoji: "👍",
+	}}
+	calledAtMS := confirmReactionTimeMS
+	snapshot := func(t *testing.T, f *confirmReactionFixture, entries []ReactionSnapshotEntry, receivedAtMS int64) {
+		t.Helper()
+		if _, err := f.reactions.ReplaceEmbeddedReactions(
+			ctx, f.targetID, "account-a", "conversation-a", entries, receivedAtMS,
+		); err != nil {
+			t.Fatalf("ReplaceEmbeddedReactions(received %d): %v", receivedAtMS, err)
+		}
+	}
+	confirm := func(t *testing.T, f *confirmReactionFixture, outboxID, leaseToken string) bool {
+		t.Helper()
+		applied, err := f.outbox.ConfirmReaction(ctx, ReactionConfirmation{
+			OutboxID: outboxID, LeaseToken: leaseToken, OccurredAt: time.UnixMilli(calledAtMS + 250),
+		})
+		if err != nil {
+			t.Fatalf("ConfirmReaction(): %v", err)
+		}
+		if state := f.state(outboxID); state != OutboxConfirmed {
+			t.Fatalf("state = %q, want confirmed", state)
+		}
+		return applied
+	}
+	want := []string{"identity-a 👍"}
+
+	t.Run("frame then confirm", func(t *testing.T) {
+		f := newConfirmReactionFixture(t)
+		outboxID, leaseToken := f.called("👍", bridge.ReactionAdd)
+		f.clock.Set(calledAtMS + 200)
+		snapshot(t, f, phoneCopy, calledAtMS+200)
+		f.clock.Set(calledAtMS + 300)
+		if confirm(t, f, outboxID, leaseToken) {
+			t.Error("ConfirmReaction() reported an own row written beside the phone's newer snapshot")
+		}
+		if got := activeReactions(t, f.store, f.targetID); !reflect.DeepEqual(got, want) {
+			t.Fatalf("active reactions = %q, want only the phone's %q", got, want)
+		}
+	})
+
+	t.Run("confirm then frame", func(t *testing.T) {
+		f := newConfirmReactionFixture(t)
+		outboxID, leaseToken := f.called("👍", bridge.ReactionAdd)
+		f.clock.Set(calledAtMS + 300)
+		if !confirm(t, f, outboxID, leaseToken) {
+			t.Error("ConfirmReaction() wrote no own row before any snapshot named the reaction")
+		}
+		if got := activeReactions(t, f.store, f.targetID); !reflect.DeepEqual(got, []string{SelfReactorKey + " 👍"}) {
+			t.Fatalf("active reactions before the frame = %q, want the own row", got)
+		}
+		f.clock.Set(calledAtMS + 400)
+		snapshot(t, f, phoneCopy, calledAtMS+400)
+		if got := activeReactions(t, f.store, f.targetID); !reflect.DeepEqual(got, want) {
+			t.Fatalf("active reactions = %q, want only the phone's %q", got, want)
+		}
+	})
+
+	t.Run("frame received in the millisecond of the call", func(t *testing.T) {
+		f := newConfirmReactionFixture(t)
+		outboxID, leaseToken := f.called("👍", bridge.ReactionAdd)
+		snapshot(t, f, phoneCopy, calledAtMS)
+		f.clock.Set(calledAtMS + 300)
+		confirm(t, f, outboxID, leaseToken)
+		if got := activeReactions(t, f.store, f.targetID); !reflect.DeepEqual(got, want) {
+			t.Fatalf("active reactions = %q, want only the phone's %q", got, want)
+		}
+	})
+
+	// A frame the phone sent before the reaction cannot carry it, even when it
+	// is stored after the call. The own row is then the only sign of the
+	// reaction until the phone's next frame.
+	t.Run("frame received before the call but stored after it", func(t *testing.T) {
+		f := newConfirmReactionFixture(t)
+		outboxID, leaseToken := f.called("👍", bridge.ReactionAdd)
+		f.clock.Set(calledAtMS + 200)
+		snapshot(t, f, nil, calledAtMS-1)
+		f.clock.Set(calledAtMS + 300)
+		if !confirm(t, f, outboxID, leaseToken) {
+			t.Error("ConfirmReaction() wrote no own row after a snapshot older than the call")
+		}
+		if got := activeReactions(t, f.store, f.targetID); !reflect.DeepEqual(got, []string{SelfReactorKey + " 👍"}) {
+			t.Fatalf("active reactions = %q, want the own row", got)
+		}
+		f.clock.Set(calledAtMS + 400)
+		snapshot(t, f, phoneCopy, calledAtMS+400)
+		if got := activeReactions(t, f.store, f.targetID); !reflect.DeepEqual(got, want) {
+			t.Fatalf("active reactions after the phone's frame = %q, want %q", got, want)
+		}
+	})
+}
+
+// TestConfirmReactionAndGoogleSnapshotSettleOnThePhonesCopy states the
+// invariant behind the case above for any history: on a message with
+// snapshots, once the confirm and a frame the phone sent after the call have
+// both been stored, in either order and whatever the reaction and the earlier
+// snapshots were, the active reactions are exactly that frame's snapshot.
+func TestConfirmReactionAndGoogleSnapshotSettleOnThePhonesCopy(t *testing.T) {
+	f := newConfirmReactionFixture(t)
+	ctx := context.Background()
+	emoji := []string{"👍", "❤️"}
+	actions := []bridge.ReactionAction{bridge.ReactionAdd, bridge.ReactionRemove, bridge.ReactionSwitch}
+	randomSnapshot := func(r *rand.Rand) []ReactionSnapshotEntry {
+		var entries []ReactionSnapshotEntry
+		for _, reactor := range []string{"identity-a", "identity-other"} {
+			if r.Intn(2) == 0 {
+				entries = append(entries, ReactionSnapshotEntry{
+					ReactorKey: reactor, ReactorIdentityID: pointer(reactor), Emoji: emoji[r.Intn(len(emoji))],
+				})
+			}
+		}
+		return entries
+	}
+	cases := 0
+	property := func(seed int64) bool {
+		r := rand.New(rand.NewSource(seed))
+		cases++
+		f.retarget(fmt.Sprintf("google-target-%d", cases))
+		baseMS := confirmReactionTimeMS + int64(cases)*1_000
+		replace := func(entries []ReactionSnapshotEntry, receivedAtMS int64) bool {
+			if _, err := f.reactions.ReplaceEmbeddedReactions(
+				ctx, f.targetID, "account-a", "conversation-a", entries, receivedAtMS,
+			); err != nil {
+				t.Errorf("seed %d ReplaceEmbeddedReactions(): %v", seed, err)
+				return false
+			}
+			return true
+		}
+
+		f.clock.Set(baseMS)
+		if r.Intn(2) == 0 && !replace(randomSnapshot(r), baseMS-1-int64(r.Intn(50))) {
+			return false
+		}
+		f.clock.Set(baseMS + 1)
+		outboxID, leaseToken := f.called(emoji[r.Intn(len(emoji))], actions[r.Intn(len(actions))])
+		phone := randomSnapshot(r)
+		frameReceivedAtMS := baseMS + 1 + int64(r.Intn(5))
+		frameFirst := r.Intn(2) == 0
+		if frameFirst && !replace(phone, frameReceivedAtMS) {
+			return false
+		}
+		f.clock.Set(baseMS + 10)
+		if _, err := f.outbox.ConfirmReaction(ctx, ReactionConfirmation{
+			OutboxID: outboxID, LeaseToken: leaseToken, OccurredAt: time.UnixMilli(baseMS + 1 + int64(r.Intn(5))),
+		}); err != nil {
+			t.Errorf("seed %d ConfirmReaction(): %v", seed, err)
+			return false
+		}
+		if !frameFirst && !replace(phone, frameReceivedAtMS) {
+			return false
+		}
+
+		var want []string
+		for _, entry := range phone {
+			want = append(want, entry.ReactorKey+" "+entry.Emoji)
+		}
+		if got := activeReactions(t, f.store, f.targetID); !reflect.DeepEqual(got, want) {
+			t.Errorf("seed %d (frame first: %t): active reactions = %q, want the phone's %q", seed, frameFirst, got, want)
+			return false
+		}
+		return true
+	}
+	if err := quick.Check(property, &quick.Config{MaxCount: 200, Rand: rand.New(rand.NewSource(20261019))}); err != nil {
+		t.Fatal(err)
+	}
+}
