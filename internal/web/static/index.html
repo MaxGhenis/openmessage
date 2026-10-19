@@ -14089,22 +14089,45 @@ body::after {
     return new Error(await responseError(response));
   }
 
+  // A reaction whose outcome this page never learned (the request went out,
+  // the response was lost) keeps its idempotency key, so tapping it again
+  // replays the same intent instead of storing a second one.
+  const unresolvedReactionKeys = new Map();
+
   window.sendReaction = async function(messageId, emoji) {
     // Close pickers
     document.querySelectorAll('.emoji-picker.show').forEach(p => p.classList.remove('show'));
     document.querySelectorAll('.emoji-full-panel.show').forEach(p => p.classList.remove('show'));
     closeComposeGifPanel();
+    const conversationId = activeConvoId;
+    const intent = JSON.stringify([conversationId, messageId, emoji, 'add']);
+    const key = unresolvedReactionKeys.get(intent) || freshV2IdempotencyKey();
+    unresolvedReactionKeys.set(intent, key);
+    let response;
     try {
-      const response = await fetch(API + '/api/react', {
+      response = await fetch(API + '/api/react', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           message_id: messageId,
           emoji: emoji,
-          conversation_id: activeConvoId,
+          conversation_id: conversationId,
           action: 'add',
+          idempotency_key: key,
         }),
       });
+    } catch (err) {
+      // The request may have reached the app and been stored: don't call it
+      // unsent. The key stays, so another tap replays this reaction.
+      showThreadFeedback("Couldn't confirm the reaction reached the app. Check the outbox; tapping it again won't send it twice.", 'send');
+      scheduleOutboxRefresh(0);
+      console.error('Failed to send reaction:', err);
+      return;
+    }
+    // The app answered, so this intent is settled one way or another: a later
+    // tap is a new reaction.
+    unresolvedReactionKeys.delete(intent);
+    try {
       if (!response.ok) throw await reactionError(response);
       const result = await response.json().catch(() => null);
       if (response.status === 202 || (result && result.queued)) {
@@ -14112,7 +14135,7 @@ body::after {
         scheduleOutboxRefresh(0);
       }
       // Reload to see updated reactions
-      if (activeConvoId) await loadMessages(activeConvoId, {poll: true});
+      if (conversationId) await loadMessages(conversationId, {poll: true});
     } catch (err) {
       showThreadFeedback(err.message || 'Failed to send reaction', 'send');
       console.error('Failed to send reaction:', err);

@@ -2594,3 +2594,34 @@ test('an auth-dead Google session (disconnected + needs_repair) shows Re-pair, n
   }));
   await expect(page.locator('#connection-banner-action')).toHaveText('Reconnect');
 });
+
+// Review of #227: a reaction whose response was lost may already be on the
+// outbox. The page must not call it unsent, and tapping it again must replay
+// the same intent (same idempotency key) rather than store a second one. Once
+// the app answers, the next tap is a new reaction.
+test('replays a reaction whose response was lost under the same key', async ({ page }) => {
+  await openConversation(page, 'Sarah Chen');
+  const bodies = [];
+  let mode = 'drop';
+  await page.route('**/api/react', async (route) => {
+    bodies.push(JSON.parse(route.request().postData() || '{}'));
+    if (mode === 'drop') {
+      await route.abort('failed');
+      return;
+    }
+    await route.fulfill({ status: 200, contentType: 'application/json', body: '{"success":true,"state":"confirmed"}' });
+  });
+
+  await page.evaluate(() => window.sendReaction('seeded-message', '👍'));
+  await expect(page.locator('#thread-feedback')).toContainText("Couldn't confirm the reaction reached the app");
+  await expect(page.locator('#thread-feedback')).not.toContainText('not sent');
+
+  mode = 'answer';
+  await page.evaluate(() => window.sendReaction('seeded-message', '👍'));
+  await page.evaluate(() => window.sendReaction('seeded-message', '👍'));
+
+  expect(bodies).toHaveLength(3);
+  expect(bodies[0].idempotency_key).toBeTruthy();
+  expect(bodies[1].idempotency_key).toBe(bodies[0].idempotency_key);
+  expect(bodies[2].idempotency_key).not.toBe(bodies[0].idempotency_key);
+});
