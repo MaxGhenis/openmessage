@@ -459,9 +459,16 @@ func TestRepairUncorrelatedEchoDuplicatesIsIdempotent(t *testing.T) {
 }
 
 // echoScenario interleaves sends from OpenMessage with texts typed on the
-// phone, in time order, at least a second apart. Each send's echo is
-// received 0.2-0.8 s after its confirm (as on the live store), or (outran)
-// that long before it, with a DELIVERED re-delivery after the confirm.
+// phone, in time order, at least 2 s apart. Each send's echo is received
+// 0.2-0.8 s after its confirm (as on the live store), or (outran) that long
+// before it, with a DELIVERED re-delivery after the confirm.
+//
+// Closer than 2 s the input is ambiguous, not the rule: one send's echo can
+// arrive late and the next one's early (outran), so the two echoes are seen
+// in the opposite order to the sends. The pairing keeps pairs in send order,
+// since one dispatcher sends one at a time, so it swaps the two identical
+// texts; both messages stay (TestRepairKeepsBothMessagesWhenIdenticalEchoesCross).
+// The pure pairing property (sqlite) documents the same limit.
 type echoScenario struct {
 	events []echoScenarioEvent
 }
@@ -479,7 +486,7 @@ func (echoScenario) Generate(r *rand.Rand, _ int) reflect.Value {
 	var scenario echoScenario
 	at := time.Duration(0)
 	for i := 0; i < n; i++ {
-		at += time.Duration(1+r.Intn(40)) * time.Second
+		at += time.Duration(2+r.Intn(40)) * time.Second
 		scenario.events = append(scenario.events, echoScenarioEvent{
 			fromApp: r.Intn(3) != 0,
 			outran:  r.Intn(4) == 0,
@@ -609,5 +616,35 @@ func TestRepairIgnoresAnOldMessageStoredNearASend(t *testing.T) {
 	}
 	if got := h.occurredAt(t, "50002"); got != lastMonth.UnixMilli() {
 		t.Fatalf("last month's message is stamped %d, want %d", got, lastMonth.UnixMilli())
+	}
+}
+
+// The input CI drew on 2026-10-19 (Go Race on #227): two identical sends a
+// second apart whose echoes are seen in the opposite order. Which echo is
+// whose cannot be told from the data, so this pins only what must hold:
+// every message stays its own row, and each send binds to one of the two
+// echoes, never to a phone text.
+func TestRepairKeepsBothMessagesWhenIdenticalEchoesCross(t *testing.T) {
+	scenario := echoScenario{events: []echoScenarioEvent{
+		{fromApp: false, outran: true, body: "ok", at: 25 * time.Second, lag: 468 * time.Millisecond},
+		{fromApp: false, body: "ok", at: 37 * time.Second, lag: 605 * time.Millisecond},
+		{fromApp: false, body: "ok", at: 41 * time.Second, lag: 366 * time.Millisecond},
+		{fromApp: true, body: "on my way", at: 69 * time.Second, lag: 293 * time.Millisecond},
+		{fromApp: false, body: "ok", at: 94 * time.Second, lag: 439 * time.Millisecond},
+		{fromApp: true, body: "on my way", at: 111 * time.Second, lag: 768 * time.Millisecond},
+		{fromApp: true, outran: true, body: "on my way", at: 112 * time.Second, lag: 259 * time.Millisecond},
+	}}
+	for _, viaRepair := range []bool{false, true} {
+		bound, rows := runEchoScenario(t, scenario, viaRepair)
+		if rows != len(scenario.events) {
+			t.Fatalf("viaRepair=%v: rows = %d, want every message kept (%d)", viaRepair, rows, len(scenario.events))
+		}
+		if bound[3] != "95003" {
+			t.Fatalf("viaRepair=%v: send 3 bound to %q, want its own echo", viaRepair, bound[3])
+		}
+		crossing := map[string]bool{"95005": true, "95006": true}
+		if !crossing[bound[5]] || !crossing[bound[6]] || bound[5] == bound[6] {
+			t.Fatalf("viaRepair=%v: sends 5 and 6 bound to %q and %q, want the two crossing echoes", viaRepair, bound[5], bound[6])
+		}
 	}
 }
