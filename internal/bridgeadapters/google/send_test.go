@@ -566,13 +566,28 @@ func TestSendReactionSendFailureIsClassifiedUncertain(t *testing.T) {
 	}
 }
 
-func TestSendReactionRejectedIsClassifiedNotCalled(t *testing.T) {
+// A phone that answers success: false has refused the reaction, and the same
+// request would be refused again, so it is final. No answer at all is not a
+// refusal and stays retryable. Neither reached the phone as a reaction.
+func TestSendReactionRefusalIsFinalAndNoResponseIsRetryable(t *testing.T) {
 	tests := []struct {
-		name     string
-		response *gmproto.SendReactionResponse
+		name        string
+		response    *gmproto.SendReactionResponse
+		class       bridge.FailureClass
+		fingerprint string
 	}{
-		{name: "success false", response: &gmproto.SendReactionResponse{}},
-		{name: "nil response", response: nil},
+		{
+			name:        "success false",
+			response:    &gmproto.SendReactionResponse{},
+			class:       bridge.FailureUnsupported,
+			fingerprint: "google_reaction_rejected",
+		},
+		{
+			name:        "nil response",
+			response:    nil,
+			class:       bridge.FailureTransient,
+			fingerprint: "google_reaction_no_response",
+		},
 	}
 
 	for _, test := range tests {
@@ -590,9 +605,9 @@ func TestSendReactionRejectedIsClassifiedNotCalled(t *testing.T) {
 				Action:       bridge.ReactionAdd,
 			})
 			failure := requireReactionOpError(t, err)
-			if failure.Class != bridge.FailureTransient || failure.Dispatch != bridge.DispatchNotCalled ||
-				failure.Operation != "send_reaction" || failure.Fingerprint != "google_reaction_rejected" {
-				t.Fatalf("failure = %+v, want transient pre-call google_reaction_rejected", failure)
+			if failure.Class != test.class || failure.Dispatch != bridge.DispatchNotCalled ||
+				failure.Operation != "send_reaction" || failure.Fingerprint != test.fingerprint {
+				t.Fatalf("failure = %+v, want %s pre-call %s", failure, test.class, test.fingerprint)
 			}
 		})
 	}
@@ -602,6 +617,7 @@ func TestSendReactionTransientAndRejectedFailuresDoNotRetireGeneration(t *testin
 	tests := []struct {
 		name        string
 		fake        *fakeReactionSendClient
+		class       bridge.FailureClass
 		dispatch    bridge.DispatchCertainty
 		fingerprint string
 	}{
@@ -611,6 +627,7 @@ func TestSendReactionTransientAndRejectedFailuresDoNotRetireGeneration(t *testin
 				conversationResult: &gmproto.Conversation{},
 				sendErr:            errors.New("transport timeout"),
 			},
+			class:       bridge.FailureTransient,
 			dispatch:    "",
 			fingerprint: "google_reaction_send_failed",
 		},
@@ -620,6 +637,7 @@ func TestSendReactionTransientAndRejectedFailuresDoNotRetireGeneration(t *testin
 				conversationResult: &gmproto.Conversation{},
 				sendResult:         &gmproto.SendReactionResponse{},
 			},
+			class:       bridge.FailureUnsupported,
 			dispatch:    bridge.DispatchNotCalled,
 			fingerprint: "google_reaction_rejected",
 		},
@@ -649,9 +667,9 @@ func TestSendReactionTransientAndRejectedFailuresDoNotRetireGeneration(t *testin
 				Action:       bridge.ReactionAdd,
 			})
 			failure := requireReactionOpError(t, err)
-			if failure.Class != bridge.FailureTransient || failure.Dispatch != test.dispatch ||
+			if failure.Class != test.class || failure.Dispatch != test.dispatch ||
 				failure.Operation != "send_reaction" || failure.Fingerprint != test.fingerprint {
-				t.Fatalf("failure = %+v, want transient %q dispatch %q", failure, test.fingerprint, test.dispatch)
+				t.Fatalf("failure = %+v, want %s %q dispatch %q", failure, test.class, test.fingerprint, test.dispatch)
 			}
 			if !host.Connected.Load() {
 				t.Fatal("reaction failure marked the connected receive generation lost")

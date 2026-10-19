@@ -1790,7 +1790,7 @@ legacy senders unchanged.
   |---|---|---|
   | 200 | `success: true` | The platform accepted it (`confirmed`, or `store_failed`). |
   | 202 | `success: true, queued: true` | Stored, not delivered yet (`queued`, `dispatching`, `not_dispatched`). The app keeps retrying it; do not react again. |
-  | 502 | `error` | `uncertain` (the transport call ended without an answer: it may have been applied) or `rejected` (the platform refused it). |
+  | 502 | `error` | `uncertain` (the transport call ended without an answer: it may have been applied) or `rejected` (the platform refused it, for example Google's phone answering `success: false`, stored as `error_class: unsupported`; it is not retried). |
   | 409 | `error` | `canceled` before it was sent. |
   | 422 | `reaction_target_unavailable` | No v2 message with that ID, or not in that conversation. Nothing was queued. |
   | 501 | `error` | The account has no reaction sender (an import-only platform). |
@@ -1834,7 +1834,13 @@ with a Cancel button.
 **Reactions stuck retrying.** A reaction the transport cannot deliver yet goes
 `not_dispatched` and retries (every 5 s by default) with no cap; a Signal
 reaction whose target can never be named (above) stays there until it is
-canceled. Find them with:
+canceled. A refusal is not among them: when Google's phone answers a reaction
+with `success: false`, the row ends `rejected` after one attempt
+(`error_class: unsupported`, `error_code: send_reaction`, `error_detail`
+`send_reaction: unsupported: Google Messages refused the reaction`), because
+sending the same request again gets the same answer. Before that change it
+went `not_dispatched` and was sent again every 5 s. Find the ones still
+retrying with:
 
 ```bash
 curl -s "http://127.0.0.1:7007/api/v1/outbox?limit=100" | jq '.[] | select(.kind=="reaction")'
