@@ -382,8 +382,86 @@ func TestDaemonReactToMessageOnALegacyPrimaryApp(t *testing.T) {
 		}
 		assertV2ToolBool(t, payload, "settled", false)
 		assertV2ToolString(t, payload, "outbox_id", "out-compat")
-		if _, minted := payload["idempotency_key"]; minted {
-			t.Fatalf("payload = %v invents an idempotency key the app never returned", payload)
+		// The reaction went out under a key this call chose, and the app
+		// stored it under that key, so the result names it.
+		sent, _ := daemon.bodies[0]["idempotency_key"].(string)
+		if sent == "" {
+			t.Fatalf("/api/react body = %v, want an idempotency key", daemon.bodies[0])
+		}
+		assertV2ToolString(t, payload, "idempotency_key", sent)
+	})
+}
+
+// Review of #227, finding 3: when the status probe answers but cannot be read,
+// the reaction goes to /api/react, which may be a v2-primary app. It must
+// carry the caller's key there, and an answer that names a stored reaction
+// must come back as that outbox state, not as an error inviting a repeat.
+func TestDaemonReactToMessageThroughTheCompatibilityRoute(t *testing.T) {
+	arguments := map[string]any{
+		"conversation_id": "v2-conv", "message_id": "v2-msg", "emoji": "❤️",
+		"idempotency_key": "client-react-key",
+	}
+	unreadableStatus := func(daemon *reactDaemon, react http.HandlerFunc) http.Handler {
+		mux := http.NewServeMux()
+		mux.HandleFunc("/api/status", func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, "status unavailable", http.StatusInternalServerError)
+		})
+		inner := daemon.handler(react, nil, nil)
+		mux.Handle("/", inner)
+		return mux
+	}
+
+	t.Run("carries the caller's key", func(t *testing.T) {
+		daemon := &reactDaemon{t: t}
+		result := callDaemonReact(t, unreadableStatus(daemon, answerJSON(http.StatusOK, map[string]any{"success": true})), arguments)
+		if result.IsError {
+			t.Fatalf("result = %q", resultText(t, result))
+		}
+		if got := daemon.bodies[0]["idempotency_key"]; got != "client-react-key" {
+			t.Fatalf("/api/react key = %v, want the caller's", got)
+		}
+	})
+
+	t.Run("a stored but uncertain reaction is its outbox state, not an error", func(t *testing.T) {
+		daemon := &reactDaemon{t: t}
+		result := callDaemonReact(t, unreadableStatus(daemon, answerJSON(http.StatusBadGateway, map[string]any{
+			"success": false, "outbox_id": "out-uncertain", "state": "uncertain",
+			"error": "send reaction: the transport gave no answer",
+		})), arguments)
+		payload := v2ToolPayload(t, result)
+		if result.IsError {
+			t.Fatalf("an uncertain reaction was reported as an error, which invites a repeat: %v", payload)
+		}
+		assertV2ToolString(t, payload, "outbox_id", "out-uncertain")
+		assertV2ToolString(t, payload, "state", "uncertain")
+		assertV2ToolString(t, payload, "idempotency_key", "client-react-key")
+	})
+
+	t.Run("a lost answer is unknown, not app down", func(t *testing.T) {
+		daemon := &reactDaemon{t: t}
+		result := callDaemonReact(t, unreadableStatus(daemon, func(w http.ResponseWriter, r *http.Request) {
+			connection, _, err := http.NewResponseController(w).Hijack()
+			if err != nil {
+				t.Errorf("hijack: %v", err)
+				return
+			}
+			_ = connection.Close()
+		}), arguments)
+		payload := v2ToolPayload(t, result)
+		if result.IsError {
+			t.Fatalf("result = error %v", payload)
+		}
+		assertV2ToolBool(t, payload, "ambiguous", true)
+		assertV2ToolString(t, payload, "idempotency_key", "client-react-key")
+	})
+
+	t.Run("a refusal without a stored reaction is an error", func(t *testing.T) {
+		daemon := &reactDaemon{t: t}
+		result := callDaemonReact(t, unreadableStatus(daemon, answerJSON(http.StatusUnprocessableEntity, map[string]any{
+			"error": "reaction_target_unavailable",
+		})), arguments)
+		if !result.IsError {
+			t.Fatalf("result = %q, want an error", resultText(t, result))
 		}
 	})
 }

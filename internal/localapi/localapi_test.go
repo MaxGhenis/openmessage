@@ -368,7 +368,7 @@ func TestReactDecodesTheQueuedAnswer(t *testing.T) {
 		w.WriteHeader(http.StatusAccepted)
 		json.NewEncoder(w).Encode(map[string]any{"success": true, "queued": true, "outbox_id": "out", "state": "not_dispatched"})
 	}))
-	result, err := client.React(context.Background(), "conv", "msg", "👍", "add")
+	result, err := client.React(context.Background(), "conv", "msg", "👍", "add", "")
 	if err != nil || result != (ReactResult{Success: true, Queued: true, OutboxID: "out", State: "not_dispatched"}) {
 		t.Fatalf("React() = %+v, %v", result, err)
 	}
@@ -377,7 +377,7 @@ func TestReactDecodesTheQueuedAnswer(t *testing.T) {
 		w.WriteHeader(http.StatusBadGateway)
 		json.NewEncoder(w).Encode(map[string]any{"success": false, "error": "send reaction: the transport refused the reaction"})
 	}))
-	if _, err := refused.React(context.Background(), "conv", "msg", "👍", "add"); err == nil {
+	if _, err := refused.React(context.Background(), "conv", "msg", "👍", "add", ""); err == nil {
 		t.Fatal("expected a ResponseError for a refused reaction")
 	} else if responseErr, ok := AsResponseError(err); !ok || responseErr.StatusCode != http.StatusBadGateway {
 		t.Fatalf("React() error = %v", err)

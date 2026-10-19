@@ -21,6 +21,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -422,21 +423,38 @@ type ReactResult struct {
 }
 
 // React routes a reaction through the daemon's /api/react surface, which
-// works in every daemon mode. Action is "add", "remove", or "switch". A
-// reaction the daemon could not deliver is a ResponseError. On a v2-primary
-// daemon prefer SubmitReaction, which takes an idempotency key.
-func (c *Client) React(ctx context.Context, conversationID, messageID, emoji, action string) (ReactResult, error) {
+// works in every daemon mode. Action is "add", "remove", or "switch".
+// idempotencyKey, when set, lets a v2-primary daemon recognise a repeat of
+// the same reaction; a legacy-primary daemon ignores it. A reaction the
+// daemon could not deliver is a ResponseError. When a v2-primary daemon had
+// already stored it on its outbox, the returned ReactResult still carries
+// that outbox_id and state alongside the error. On a v2-primary daemon prefer
+// SubmitReaction.
+func (c *Client) React(ctx context.Context, conversationID, messageID, emoji, action, idempotencyKey string) (ReactResult, error) {
 	payload := struct {
 		ConversationID string `json:"conversation_id"`
 		MessageID      string `json:"message_id"`
 		Emoji          string `json:"emoji"`
 		Action         string `json:"action"`
-	}{conversationID, messageID, emoji, action}
+		IdempotencyKey string `json:"idempotency_key,omitempty"`
+	}{conversationID, messageID, emoji, action, idempotencyKey}
 	var result ReactResult
 	if err := c.postJSON(ctx, "/api/react", payload, &result); err != nil {
+		if responseErr, ok := AsResponseError(err); ok {
+			var stored ReactResult
+			if json.Unmarshal([]byte(responseErr.Body), &stored) == nil && stored.OutboxID != "" {
+				return stored, err
+			}
+		}
 		return ReactResult{}, err
 	}
 	return result, nil
+}
+
+// IsConnectionRefused reports whether err means nothing was listening, so a
+// request certainly did not reach the daemon.
+func IsConnectionRefused(err error) bool {
+	return errors.Is(err, syscall.ECONNREFUSED)
 }
 
 func (c *Client) postJSON(ctx context.Context, path string, payload any, target any) error {

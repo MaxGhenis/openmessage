@@ -56,6 +56,22 @@ func submitV2Reaction(
 // daemonSubmitReactionAndWait is submitV2Reaction for transportless client
 // mode: the running app owns the outbox, and this process follows the intent
 // over the app's local API.
+// ambiguousReactionResult answers a reaction request that failed mid-flight:
+// the app may or may not hold it. Not an IsError result, since an error
+// invites a second reaction; the key lets a deliberate repeat dedupe.
+func ambiguousReactionResult(key string, err error) *mcp.CallToolResult {
+	return structuredResult(map[string]any{
+		"ok":              false,
+		"settled":         false,
+		"ambiguous":       true,
+		"idempotency_key": key,
+		"error":           err.Error(),
+	}, fmt.Sprintf(
+		"The reaction's outcome is unknown (%v). Do NOT react again with a new key. To replay-check this exact reaction, repeat it with the same idempotency_key: %s. If the app is not running, start it first.",
+		err, key,
+	))
+}
+
 func daemonSubmitReactionAndWait(
 	ctx context.Context,
 	daemon *localapi.Client,
@@ -81,17 +97,8 @@ func daemonSubmitReactionAndWait(
 			return errorResult(fmt.Sprintf("the app could not queue the reaction: HTTP %d: %s", responseErr.StatusCode, responseErr.Body))
 		}
 		// The request failed mid-flight, so the app may or may not hold the
-		// intent. Not an IsError result: an error invites a second reaction.
-		return structuredResult(map[string]any{
-			"ok":              false,
-			"settled":         false,
-			"ambiguous":       true,
-			"idempotency_key": key,
-			"error":           err.Error(),
-		}, fmt.Sprintf(
-			"The reaction's outcome is unknown (%v). Do NOT react again with a new key. To replay-check this exact reaction, repeat it with the same idempotency_key: %s. If the app is not running, start it first.",
-			err, key,
-		))
+		// intent.
+		return ambiguousReactionResult(key, err)
 	}
 	delivery, settled, err := daemon.WaitDelivery(ctx, submission.OutboxID, daemonSettleTimeout)
 	if err != nil {
@@ -131,7 +138,6 @@ func v2ReactionResult(
 		"state":        state,
 		"deduplicated": deduplicated,
 	}
-	// The app's compatibility route mints its own key and does not return it.
 	if idempotencyKey != "" {
 		payload["idempotency_key"] = idempotencyKey
 	}
