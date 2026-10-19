@@ -72,7 +72,7 @@ func TestSendReactionRequestMapsActionsAndTargetSender(t *testing.T) {
 				return whatsmeow.SendResponse{}, nil
 			}
 
-			err := bridge.SendReactionRequest(
+			sentAt, err := bridge.SendReactionRequest(
 				"whatsapp:120363019999999999@g.us",
 				"target-remote-id",
 				test.targetAuthorID,
@@ -93,6 +93,11 @@ func TestSendReactionRequestMapsActionsAndTargetSender(t *testing.T) {
 			if reaction == nil {
 				t.Fatal("expected outgoing reaction message")
 			}
+			// The returned time is the reaction's own sender timestamp, the
+			// one the ingest path records for it.
+			if ms := reaction.GetSenderTimestampMS(); ms <= 0 || sentAt.UnixMilli() != ms {
+				t.Fatalf("returned time %d, want the reaction's sender timestamp %d", sentAt.UnixMilli(), ms)
+			}
 			if reaction.GetKey().GetID() != "target-remote-id" {
 				t.Fatalf("target ID = %q, want target-remote-id", reaction.GetKey().GetID())
 			}
@@ -111,7 +116,7 @@ func TestSendReactionRequestMapsActionsAndTargetSender(t *testing.T) {
 
 func TestSendReactionRequestMarksOnlyPreDispatchFailures(t *testing.T) {
 	t.Run("invalid conversation", func(t *testing.T) {
-		err := connectedMediaTestBridge().SendReactionRequest(
+		_, err := connectedMediaTestBridge().SendReactionRequest(
 			"invalid",
 			"target-remote-id",
 			"+15557654321",
@@ -128,7 +133,7 @@ func TestSendReactionRequestMarksOnlyPreDispatchFailures(t *testing.T) {
 	})
 
 	t.Run("transport disconnected before send", func(t *testing.T) {
-		err := (&Bridge{}).SendReactionRequest(
+		_, err := (&Bridge{}).SendReactionRequest(
 			"whatsapp:15551234567@s.whatsapp.net",
 			"target-remote-id",
 			"",
@@ -157,7 +162,7 @@ func TestSendReactionRequestMarksOnlyPreDispatchFailures(t *testing.T) {
 		var reported error
 		bridge.callbacks.OnConnectionError = func(err error) { reported = err }
 
-		err := bridge.SendReactionRequest(
+		_, err := bridge.SendReactionRequest(
 			"whatsapp:15551234567@s.whatsapp.net",
 			"target-remote-id",
 			"",
