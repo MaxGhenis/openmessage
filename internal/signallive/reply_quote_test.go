@@ -487,3 +487,29 @@ func preChangeLegacyQuoteArgs(b *Bridge, target *db.Message, account string) ([]
 		"--quote-message", quoteBody,
 	}, nil
 }
+
+// A described target keyed by a legacy ID quotes from its legacy row. When the
+// lookup fails (rather than finding nothing), the send must fail before
+// signal-cli runs: quoting the mirror's description instead would name this
+// account as the author of an incoming message (review of #225).
+func TestReplyQuoteArgsFailsWhenTheLegacyLookupFails(t *testing.T) {
+	store, err := db.New(filepath.Join(t.TempDir(), "messages.db"))
+	if err != nil {
+		t.Fatalf("db.New(): %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close(): %v", err)
+	}
+	bridge := &Bridge{account: replyQuoteTestAccount, connected: true, store: store, logger: zerolog.Nop()}
+	got, err := bridge.replyQuoteArgs(ReplyTarget{
+		RemoteID:      "signal:1700000000700",
+		SentAt:        time.UnixMilli(1_700_000_000_700),
+		HasAttachment: true,
+	}, replyQuoteTestAccount)
+	if err == nil || got != nil {
+		t.Fatalf("replyQuoteArgs(failed legacy lookup) = %q, %v; want an error and no quote", got, err)
+	}
+	if !strings.Contains(err.Error(), "look up Signal reply target") {
+		t.Fatalf("error = %v, want the lookup failure named", err)
+	}
+}

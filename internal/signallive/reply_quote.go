@@ -2,6 +2,7 @@ package signallive
 
 import (
 	"errors"
+	"fmt"
 	"strconv"
 	"strings"
 	"time"
@@ -31,8 +32,12 @@ type ReplyTarget struct {
 // author goes through resolveAuthor, which maps an ACI to its number when the
 // contact is known.
 //
-// The timestamp is SentAt, the stored occurred time: the v2 decoder and the
-// migration both set it to the Signal sent timestamp. One case differs. A
+// The timestamp is SentAt, the stored occurred time. The v2 decoder sets it
+// to the Signal sent timestamp, and so does the migration for every message
+// the legacy store took from Signal, but not for a text sent from the legacy
+// desktop path: that row kept its completion time and a "local:<sha1>" ID,
+// so a quote of it carries the completion time (a limitation the legacy
+// store already had, not one this path adds). One more case differs. A
 // message this account sent through the v2 outbox keeps its submit time as
 // its occurred time, while confirming the send set its remote ID to the
 // timestamp signal-cli reported. So for a message this account wrote, a
@@ -89,21 +94,36 @@ func QuoteArgs(target ReplyTarget, account string, resolveAuthor func(string) st
 // and its copy carries no sender or attachment, so the legacy row stays the
 // better source there, exactly as before.
 func (b *Bridge) replyQuoteArgs(reply ReplyTarget, account string) ([]string, error) {
-	if reply.SentAt.IsZero() || b.holdsLegacyReplyTarget(reply.RemoteID) {
+	if reply.SentAt.IsZero() {
+		return b.signalQuoteArgs(reply.RemoteID, account)
+	}
+	held, err := b.holdsLegacyReplyTarget(reply.RemoteID)
+	if err != nil {
+		// A failed lookup is not an absent row: quoting from the mirror's
+		// description instead would name this account as the author of an
+		// incoming message. Fail before signal-cli runs, as the legacy lookup
+		// always did.
+		return nil, err
+	}
+	if held {
 		return b.signalQuoteArgs(reply.RemoteID, account)
 	}
 	return QuoteArgs(reply, account, b.resolveContactAddress)
 }
 
 // holdsLegacyReplyTarget reports whether remoteID is a legacy Signal message
-// ID whose row the legacy lookup can quote.
-func (b *Bridge) holdsLegacyReplyTarget(remoteID string) bool {
+// ID whose row the legacy lookup can quote. A lookup that fails (as opposed
+// to finding no row) is returned as an error.
+func (b *Bridge) holdsLegacyReplyTarget(remoteID string) (bool, error) {
 	remoteID = strings.TrimSpace(remoteID)
 	if b == nil || b.store == nil || !strings.HasPrefix(remoteID, "signal:") {
-		return false
+		return false, nil
 	}
 	target, err := b.store.GetMessageByID(remoteID)
-	return err == nil && target != nil && target.SourcePlatform == "signal" && target.TimestampMS != 0
+	if err != nil {
+		return false, fmt.Errorf("look up Signal reply target %q: %w", remoteID, err)
+	}
+	return target != nil && target.SourcePlatform == "signal" && target.TimestampMS != 0, nil
 }
 
 // legacyReplyTarget describes a legacy Signal row for QuoteArgs exactly as the

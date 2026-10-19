@@ -1664,8 +1664,11 @@ it on v2-primary), and on v2-primary that lookup cannot find:
 
 Rules worth knowing when a quote looks wrong:
 
-- The timestamp is `occurred_at_ms` (the decoder and the migration both set it
-  to the Signal sent timestamp), except for a message this account wrote whose
+- The timestamp is `occurred_at_ms`. The decoder sets it to the Signal sent
+  timestamp, and so does the migration, except for a text sent from the legacy
+  desktop path: that row kept its completion time and a `local:<sha1>` ID, so a
+  quote of it carries the completion time (a limitation the legacy store
+  already had). The other exception is a message this account wrote whose
   remote ID is a decimal timestamp. A send through the outbox keeps its
   *submit* time as `occurred_at_ms`, and confirming it sets the remote ID to the
   timestamp signal-cli reported, so that ID wins.
@@ -1679,7 +1682,9 @@ Rules worth knowing when a quote looks wrong:
   (`GET /api/v1/outbox/<outbox_id>`).
 - On legacy-primary with `OPENMESSAGES_V2_SEND=1`, the mirror keys a reply
   target by its legacy ID (`signal:<ts>`) and records no sender or attachment.
-  Such an ID still quotes from its legacy row when that row exists.
+  Such an ID still quotes from its legacy row when that row exists. If the
+  legacy lookup itself fails, the send fails before signal-cli runs rather
+  than quoting the mirror's sender-less copy.
 
 ## Deploying a new build to a live install
 
