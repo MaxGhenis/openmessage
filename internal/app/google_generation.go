@@ -3,6 +3,8 @@ package app
 import (
 	"os"
 
+	"go.mau.fi/mautrix-gmessages/pkg/libgm/events"
+
 	"github.com/maxghenis/openmessage/internal/client"
 )
 
@@ -31,6 +33,10 @@ func (a *App) BeginGoogleGeneration(cli *client.Client) *GoogleGeneration {
 // with this client hand what they fetch to history.
 func (a *App) BeginGoogleGenerationWithHistory(cli *client.Client, history GoogleHistoryIngress) *GoogleGeneration {
 	generation := &GoogleGeneration{app: a, Client: cli, history: history}
+	// A new pairing must not inherit another session's account-switch report.
+	// Reconnecting the same session keeps it (see
+	// forgetGoogleAccountSwitchForNewSession).
+	a.forgetGoogleAccountSwitchForNewSession(cli)
 	generation.Handler = &client.EventHandler{
 		Store:       a.Store,
 		Logger:      a.Logger,
@@ -53,6 +59,7 @@ func (a *App) BeginGoogleGenerationWithHistory(cli *client.Client, history Googl
 		},
 		OnPhoneRespondingChange: generation.PhoneResponding,
 		OnConnectionLost:        generation.ConnectionLost,
+		OnAccountChange:         generation.AccountChange,
 		OnSessionInvalid:        generation.SessionInvalid,
 	}
 
@@ -119,6 +126,18 @@ func (g *GoogleGeneration) ConnectionLost() {
 	a.Logger.Warn().Msg("Google Messages connection lost; will attempt to reconnect")
 }
 
+// AccountChange applies the phone's Google-account pairing report for this
+// generation's session. It deliberately leaves Connected, needs_repair and
+// the generation alone: in the 2026-10-07 incident the phone kept pushing
+// inbound updates to this session while refusing its requests, so retiring
+// the receive side would only have lost messages.
+func (g *GoogleGeneration) AccountChange(evt *events.AccountChange) {
+	if evt == nil || !g.current() {
+		return
+	}
+	g.app.applyGoogleAccountChange(g.Client, evt)
+}
+
 func (g *GoogleGeneration) AuthExpired(err error) {
 	if !g.current() || !IsGoogleAuthExpiredError(err) {
 		return
@@ -137,6 +156,7 @@ func (g *GoogleGeneration) SessionInvalid() {
 	}
 	a := g.app
 	a.Connected.Store(false)
+	a.ClearGoogleAccountSwitch()
 	a.clientMu.Lock()
 	if a.googleGeneration == g && a.Client == g.Client {
 		a.Client = nil

@@ -41,6 +41,7 @@ type CarryTarget interface {
 		sqlite.Message,
 		sqlite.OutboxAttachment,
 	) (sqlite.OutboxItem, sqlite.EnqueueDisposition, error)
+	RestoreCarriedAttemptCount(context.Context, string, int64) error
 }
 
 // Endpoint combines a SQLite store, its outbox repository, and the adjacent
@@ -155,6 +156,18 @@ func CarryPendingOutbox(
 			report.Uncarryable = append(report.Uncarryable, entry)
 			continue
 		}
+		// An intent that already spent its retry budget is left for review
+		// rather than recreated: nothing was sent, and sending it again is
+		// the user's call. Under-budget intents keep their spent attempts
+		// (RestoreCarriedAttemptCount below).
+		if intent.AttemptCount >= sqlite.DefaultMaxTransportAttempts {
+			entry.Reason = fmt.Sprintf(
+				"retry budget already exhausted (%d attempts); not carried so it cannot fire late",
+				intent.AttemptCount,
+			)
+			report.Uncarryable = append(report.Uncarryable, entry)
+			continue
+		}
 
 		conversation, err := fresh.GetConversationByRemote(
 			intent.AccountID,
@@ -202,7 +215,7 @@ func CarryPendingOutbox(
 			Operation:          intent.Operation,
 			LocalMessageID:     *intent.LocalMessageID,
 			TransportRequestID: intent.TransportRequestID,
-			ScheduledForMS:     intent.ScheduledForMS,
+			ScheduledForMS:     carriedScheduleMS(intent),
 		}
 		message := sqlite.Message{
 			MessageID:       *intent.LocalMessageID,
@@ -310,6 +323,17 @@ func CarryPendingOutbox(
 			continue
 		}
 		if disposition == sqlite.EnqueueInserted {
+			// The enqueue starts every row at zero attempts; carry the attempts
+			// already spent so a cutover never refills the retry budget.
+			if intent.AttemptCount > 0 {
+				if err := fresh.RestoreCarriedAttemptCount(ctx, intent.OutboxID, intent.AttemptCount); err != nil {
+					return report, fmt.Errorf(
+						"carry pending outbox item %q: restore attempt count: %w",
+						intent.OutboxID,
+						err,
+					)
+				}
+			}
 			report.Carried = append(report.Carried, entry)
 		}
 	}
@@ -328,7 +352,7 @@ func validateExistingCarry(
 		carried.IdempotencyKey != intent.IdempotencyKey ||
 		carried.PayloadHash != intent.PayloadHash ||
 		carried.Operation != intent.Operation ||
-		carried.ScheduledForMS != intent.ScheduledForMS {
+		carried.ScheduledForMS != carriedScheduleMS(intent) {
 		return fmt.Errorf(
 			"carry pending outbox item %q: idempotency key %q resolved to a different fresh intent",
 			intent.OutboxID,
@@ -364,3 +388,14 @@ func carryEntryFromReview(intent sqlite.CarryReviewIntent) CarryEntry {
 
 var _ CarrySource = Endpoint{}
 var _ CarryTarget = Endpoint{}
+
+// carriedScheduleMS keeps a not-dispatched intent's pending retry time: the
+// carried row is due no earlier than the old row's next attempt, so a carry
+// never hurries a retry the dispatcher had backed off.
+func carriedScheduleMS(intent sqlite.CarryableIntent) int64 {
+	scheduled := intent.ScheduledForMS
+	if intent.NextAttemptAtMS != nil && *intent.NextAttemptAtMS > scheduled {
+		scheduled = *intent.NextAttemptAtMS
+	}
+	return scheduled
+}

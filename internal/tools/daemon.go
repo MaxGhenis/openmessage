@@ -61,15 +61,22 @@ func daemonStatusOrResult(ctx context.Context, daemon *localapi.Client) (localap
 }
 
 func deliveryFromLocalAPI(delivery localapi.Delivery) messaging.Delivery {
-	return messaging.Delivery{
+	converted := messaging.Delivery{
 		OutboxID:        delivery.OutboxID,
 		State:           messaging.OutboxState(delivery.State),
 		LocalMessageID:  delivery.LocalMessageID,
 		RemoteMessageID: delivery.RemoteMessageID,
 		ErrorClass:      delivery.ErrorClass,
 		ErrorCode:       delivery.ErrorCode,
+		ErrorDetail:     delivery.ErrorDetail,
+		AttemptCount:    delivery.AttemptCount,
+		RetryExhausted:  delivery.RetryExhausted,
 		Warning:         delivery.Warning,
 	}
+	if delivery.NextAttemptAtMS > 0 {
+		converted.NextAttemptAt = time.UnixMilli(delivery.NextAttemptAtMS)
+	}
+	return converted
 }
 
 // daemonAmbiguousResult reports a send whose outcome the daemon may or may
@@ -181,6 +188,7 @@ func daemonWaitForDelivery(
 	if delivery.Warning != "" {
 		payload["warning"] = delivery.Warning
 	}
+	addV2DeliveryFailureDetail(payload, converted)
 	return structuredResult(payload, v2DeliveryText(converted))
 }
 
@@ -541,6 +549,13 @@ func daemonGetStatusHandler(a *app.App, options Options) server.ToolHandlerFunc 
 			fmt.Fprintf(&sb, "Overall connected: %v\n", connected)
 		}
 		appendPlatform("Google Messages", "google")
+		if google, ok := raw["google"].(map[string]any); ok {
+			if switched, _ := google["account_pairing_switched"].(bool); switched {
+				account, _ := google["switched_account"].(string)
+				atMS, _ := google["account_pairing_switched_at_ms"].(float64)
+				fmt.Fprintf(&sb, "Google Messages account pairing switched: %s\n", googleAccountSwitchSummary(account, int64(atMS)))
+			}
+		}
 		appendPlatform("WhatsApp", "whatsapp")
 		appendPlatform("Signal", "signal")
 		if v2Primary, ok := raw["v2_primary"].(bool); ok {

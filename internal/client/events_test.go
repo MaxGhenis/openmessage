@@ -557,3 +557,45 @@ func TestHandleTyping_ResolvesParticipantName(t *testing.T) {
 		t.Fatal("typing = false, want true")
 	}
 }
+
+func TestHandleAccountChange_ReportsEventOnlyToAccountCallback(t *testing.T) {
+	var received []*events.AccountChange
+	var other int
+	handler := &EventHandler{
+		Logger: zerolog.Nop(),
+		OnAccountChange: func(evt *events.AccountChange) {
+			received = append(received, evt)
+		},
+		OnConnectionLost:        func() { other++ },
+		OnSessionInvalid:        func() { other++ },
+		OnPhoneRespondingChange: func(bool) { other++ },
+		OnRealtimeGapRecovered:  func(string) { other++ },
+		OnConversationsChange:   func() { other++ },
+	}
+
+	fake := &events.AccountChange{
+		AccountChangeOrSomethingEvent: &gmproto.AccountChangeOrSomethingEvent{Account: "owner@example.com"},
+		IsFake:                        true,
+	}
+	real := &events.AccountChange{
+		AccountChangeOrSomethingEvent: &gmproto.AccountChangeOrSomethingEvent{Enabled: false},
+	}
+	handler.Handle(fake)
+	handler.Handle(real)
+	// A container-less event and a nil event must not panic: a panic here
+	// would end the libgm receive generation.
+	handler.Handle(&events.AccountChange{IsFake: true})
+	handler.Handle((*events.AccountChange)(nil))
+
+	if len(received) != 3 || received[0] != fake || received[1] != real || received[2].IsFake != true {
+		t.Fatalf("OnAccountChange received %v, want the fake, real and container-less events in order", received)
+	}
+	// The account report is not a connection, credential, reachability or
+	// sync signal; the owner decides what it means.
+	if other != 0 {
+		t.Fatalf("AccountChange fired %d other callbacks, want 0", other)
+	}
+
+	// Without an owner the event is only logged.
+	(&EventHandler{Logger: zerolog.Nop()}).Handle(fake)
+}

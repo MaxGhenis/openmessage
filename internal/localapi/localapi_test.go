@@ -244,6 +244,51 @@ func TestWaitDeliveryNeverObservedReturnsError(t *testing.T) {
 	}
 }
 
+func TestDeliveryDecodesFailureDetail(t *testing.T) {
+	responses := map[string]string{
+		"exhausted": `{"outbox_id":"exhausted","state":"rejected","error_class":"retry_exhausted","error_code":"send_text",` +
+			`"error_detail":"retry budget exhausted after 6 attempts; last failure transient [google_conversation_not_found]: no conversation",` +
+			`"attempt_count":6,"retry_exhausted":true}`,
+		"retrying": `{"outbox_id":"retrying","state":"not_dispatched","error_class":"transient",` +
+			`"error_detail":"[google_conversation_not_found] no conversation","attempt_count":2,"next_attempt_at_ms":1760000000123}`,
+		// A daemon that predates the failure fields.
+		"older": `{"outbox_id":"older","state":"rejected","error_class":"misconfigured","error_code":"send_text"}`,
+	}
+	client := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, responses[strings.TrimPrefix(r.URL.Path, "/api/v1/outbox/")])
+	}))
+
+	want := map[string]Delivery{
+		"exhausted": {
+			OutboxID:       "exhausted",
+			State:          "rejected",
+			ErrorClass:     "retry_exhausted",
+			ErrorCode:      "send_text",
+			ErrorDetail:    "retry budget exhausted after 6 attempts; last failure transient [google_conversation_not_found]: no conversation",
+			AttemptCount:   6,
+			RetryExhausted: true,
+		},
+		"retrying": {
+			OutboxID:        "retrying",
+			State:           "not_dispatched",
+			ErrorClass:      "transient",
+			ErrorDetail:     "[google_conversation_not_found] no conversation",
+			AttemptCount:    2,
+			NextAttemptAtMS: 1760000000123,
+		},
+		"older": {OutboxID: "older", State: "rejected", ErrorClass: "misconfigured", ErrorCode: "send_text"},
+	}
+	for id, expected := range want {
+		got, err := client.Delivery(context.Background(), id)
+		if err != nil {
+			t.Fatalf("Delivery(%s): %v", id, err)
+		}
+		if got != expected {
+			t.Fatalf("Delivery(%s) = %+v\nwant %+v", id, got, expected)
+		}
+	}
+}
+
 func TestDeliverySettled(t *testing.T) {
 	for state, want := range map[string]bool{
 		"":               false,

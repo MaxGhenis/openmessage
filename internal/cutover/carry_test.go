@@ -155,8 +155,11 @@ func TestCutoverCarriesPendingOutbox(t *testing.T) {
 		got.ReplyToRemoteID == nil || *got.ReplyToRemoteID != "reply-remote-queued" {
 		t.Fatalf("carried queued row = %+v", got)
 	}
+	// The carried row keeps the old row's pending retry time (MarkNotDispatched
+	// above scheduled it a minute out), so a carry never hurries a backed-off
+	// retry (PR #204).
 	if got := byID[notDispatched.OutboxID]; got.IdempotencyKey != notDispatched.IdempotencyKey ||
-		got.ScheduledForMS != carryTestNowMS || got.BlobHash != mediaRef.Hash ||
+		got.ScheduledForMS != now.Add(time.Minute).UnixMilli() || got.BlobHash != mediaRef.Hash ||
 		got.BlobSizeBytes != int64(len(mediaBytes)) || got.MIME != "image/png" ||
 		got.Filename != "pending.png" {
 		t.Fatalf("carried not-dispatched media row = %+v", got)
@@ -539,4 +542,88 @@ func TestCarryPendingOutboxForeignCollisionReportsAndContinues(t *testing.T) {
 	if got.PayloadHash != "different-payload" {
 		t.Fatalf("foreign fresh row mutated: payload_hash = %q", got.PayloadHash)
 	}
+}
+
+// A not-dispatched intent that already spent its retry budget is reported for
+// review instead of carried: carried rows start over at zero attempts, so
+// carrying it would let the dispatcher send it late (PR #204 review). One
+// attempt short of the budget it is still carried.
+func TestCarryPendingOutboxLeavesExhaustedIntentsForReview(t *testing.T) {
+	ctx := context.Background()
+	now := time.UnixMilli(carryTestNowMS)
+	old := openCarryTestEndpoint(t, "old", now)
+	fresh := openCarryTestEndpoint(t, "fresh", now)
+	seedCarryAccount(t, old.Store, "account-a")
+	seedCarryAccount(t, fresh.Store, "account-a")
+	seedCarryConversation(t, old.Store, "old-conversation", "account-a", "remote-thread")
+	seedCarryConversation(t, fresh.Store, "fresh-conversation", "account-a", "remote-thread")
+
+	spend := func(item sqlite.OutboxItem, attempts int64) {
+		t.Helper()
+		for attempt := int64(0); attempt < attempts; attempt++ {
+			lease := leaseCarryItem(t, ctx, old, now)
+			if lease.OutboxID != item.OutboxID {
+				t.Fatalf("leased %q, want %q", lease.OutboxID, item.OutboxID)
+			}
+			markCarryTransportCalled(t, ctx, old, lease)
+			// Due again at once while attempts remain, then backed off so the
+			// next row's leases are not taken by this one.
+			retryAt := now
+			if attempt == attempts-1 {
+				retryAt = now.Add(time.Hour)
+			}
+			if err := old.OutboxRepository.MarkCalledNotDispatched(
+				ctx, item.OutboxID, *lease.LeaseToken,
+				"transient", "send_text", "[google_conversation_not_found] scripted", retryAt,
+			); err != nil {
+				t.Fatalf("MarkCalledNotDispatched(%q): %v", item.OutboxID, err)
+			}
+		}
+	}
+	exhausted := enqueueCarryText(t, ctx, old, "exhausted", "old-conversation", carryTestNowMS)
+	spend(exhausted, sqlite.DefaultMaxTransportAttempts)
+	nearly := enqueueCarryText(t, ctx, old, "nearly", "old-conversation", carryTestNowMS)
+	spend(nearly, sqlite.DefaultMaxTransportAttempts-1)
+
+	report, err := CarryPendingOutbox(ctx, old, fresh)
+	if err != nil {
+		t.Fatalf("CarryPendingOutbox(): %v", err)
+	}
+	assertCarryEntryIDs(t, "carried", report.Carried, []string{nearly.OutboxID})
+	if len(report.Uncarryable) != 1 || report.Uncarryable[0].OutboxID != exhausted.OutboxID ||
+		!strings.Contains(report.Uncarryable[0].Reason, "retry budget already exhausted") {
+		t.Fatalf("uncarryable = %+v, want only the exhausted intent, reported for its spent budget", report.Uncarryable)
+	}
+	rows, err := fresh.OutboxRepository.ListCarryable(ctx)
+	if err != nil {
+		t.Fatalf("fresh ListCarryable(): %v", err)
+	}
+	for _, row := range rows {
+		if row.OutboxID == exhausted.OutboxID {
+			t.Fatalf("exhausted intent was recreated in the fresh store: %+v", row)
+		}
+	}
+	// The carried intent keeps the attempts it already spent, so the cutover
+	// does not refill its retry budget, and a second (idempotent) pass leaves
+	// it alone.
+	assertCarriedAttempts := func(context string) {
+		t.Helper()
+		item, err := fresh.OutboxRepository.FindByID(ctx, nearly.OutboxID)
+		if err != nil {
+			t.Fatalf("%s: fresh FindByID(%q): %v", context, nearly.OutboxID, err)
+		}
+		if item.AttemptCount != sqlite.DefaultMaxTransportAttempts-1 || item.State != sqlite.OutboxQueued {
+			t.Fatalf("%s: carried intent = %+v, want queued with %d attempts already spent",
+				context, item, sqlite.DefaultMaxTransportAttempts-1)
+		}
+	}
+	assertCarriedAttempts("first pass")
+	again, err := CarryPendingOutbox(ctx, old, fresh)
+	if err != nil {
+		t.Fatalf("CarryPendingOutbox(second pass): %v", err)
+	}
+	if len(again.Carried) != 0 {
+		t.Fatalf("second pass carried %+v, want nothing new", again.Carried)
+	}
+	assertCarriedAttempts("second pass")
 }

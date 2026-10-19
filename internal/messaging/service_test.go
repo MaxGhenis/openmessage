@@ -285,8 +285,15 @@ func TestRetryableNotDispatchedReusesTransportRequestID(t *testing.T) {
 				t.Fatalf("first delivery = %+v, want %q not_dispatched", first, class)
 			}
 			row := mustOutboxItem(t, service, submission.OutboxID)
-			if row.AttemptCount != 1 {
-				t.Fatalf("attempt count = %d, want 1", row.AttemptCount)
+			// Deliberately changed with the retry budget: credentials_expired is
+			// exempt (the supervisor repairs the account, the message did nothing
+			// wrong), so its attempt is refunded; other classes consume one.
+			wantAttempts := int64(1)
+			if class == bridge.FailureCredentialsExpired {
+				wantAttempts = 0
+			}
+			if row.AttemptCount != wantAttempts {
+				t.Fatalf("attempt count = %d, want %d", row.AttemptCount, wantAttempts)
 			}
 
 			retried, err := service.RetryNotDispatched(context.Background(), submission.OutboxID)

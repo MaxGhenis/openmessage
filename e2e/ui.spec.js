@@ -1053,6 +1053,36 @@ test('maps durable outbox states to honest tray labels and actions', async ({ pa
       confirmed: view({ state: 'confirmed' }, now),
       rejected: view({ state: 'rejected' }, now),
       canceled: view({ state: 'canceled' }, now),
+      // Deliberate change (stuck-send fix): a rejected send the user can act
+      // on stays visible as "Not sent". Plain rejections stay hidden.
+      rejectedMisconfigured: view({
+        state: 'rejected', error_class: 'misconfigured', error_detail: 'send_text: misconfigured: bad conversation',
+      }, now),
+      confirmedWithStaleFlag: view({ state: 'confirmed', retry_exhausted: true }, now),
+      retryingWithDetail: view({
+        state: 'not_dispatched',
+        next_attempt_at_ms: now + 5_000,
+        error_class: 'transient',
+        error_detail: `[google_conversation_not_found] send_text: transient: ${'phone returned no conversation '.repeat(12)}`,
+      }, now),
+      exhausted: view({
+        state: 'rejected',
+        retry_exhausted: true,
+        attempt_count: 6,
+        error_class: 'retry_exhausted',
+        error_detail: 'retry budget exhausted after 6 attempts; last failure transient [google_conversation_not_found]: send_text: transient: no conversation',
+      }, now),
+      // The stored detail: the dispatcher's "[fingerprint] " prefix, then
+      // "operation: class: cause", where the Google adapter's cause also
+      // starts with the fingerprint.
+      accountSwitched: view({
+        state: 'rejected',
+        error_class: 'reauth_required',
+        error_detail: '[google_account_pairing_switched] send_text: reauth_required: [google_account_pairing_switched] '
+          + 'Your phone switched Google Messages to Google-account pairing (x@gmail.com) and refuses requests from this '
+          + 'QR-paired session, so nothing was sent.',
+      }, now),
+      reauth: view({ state: 'rejected', error_class: 'reauth_required', error_detail: 'send_text: reauth_required: session invalid' }, now),
     };
   });
 
@@ -1065,9 +1095,193 @@ test('maps durable outbox states to honest tray labels and actions', async ({ pa
   expect(views.uncertain.guidance).toContain('may create a duplicate');
   expect(views.repairing).toMatchObject({ visible: true, label: 'Repairing…', action: 'repair' });
   expect(views.repairing.guidance).toContain('transport accepted');
-  for (const terminal of [views.confirmed, views.rejected, views.canceled]) {
+  for (const terminal of [
+    views.confirmed, views.rejected, views.canceled, views.rejectedMisconfigured, views.confirmedWithStaleFlag,
+  ]) {
     expect(terminal.visible).toBe(false);
   }
+
+  // A retrying send says why it has not gone out yet, truncated for the tray.
+  expect(views.retryingWithDetail).toMatchObject({ visible: true, label: 'Retrying…', action: 'cancel' });
+  expect(views.retryingWithDetail.reason).toContain('google_conversation_not_found');
+  expect(Array.from(views.retryingWithDetail.reason).length).toBeLessThanOrEqual(160);
+  expect(views.retryingWithDetail.reason.endsWith('…')).toBe(true);
+  expect(views.retryingWithDetail.reasonTitle).toContain('phone returned no conversation');
+
+  for (const notSent of [views.exhausted, views.accountSwitched, views.reauth]) {
+    expect(notSent).toMatchObject({ visible: true, group: 'notsent', label: 'Not sent', action: 'send-again' });
+    expect(notSent.guidance).toContain('Nothing was sent. Send again creates a new message.');
+    expect(notSent.guidance).not.toContain('may create a duplicate');
+    expect(notSent.timeMS).toBe(0);
+  }
+  expect(views.exhausted.guidance).toContain('gave up after 6 attempts');
+  expect(views.exhausted.reason).toContain('retry budget exhausted after 6 attempts');
+  expect(views.accountSwitched.guidance).toContain('Google-account pairing');
+  expect(views.reauth.guidance).toContain('re-linked');
+});
+
+test('counts not-sent outbox rows apart from pending sends in the button labels', async ({ page }) => {
+  await page.waitForFunction(() => window.__openMessageTestHooks?.outboxButtonLabels);
+  const labels = await page.evaluate(() => {
+    const now = 1_700_000_000_000;
+    const labelsFor = window.__openMessageTestHooks.outboxButtonLabels;
+    const queued = { state: 'queued', scheduled_for_ms: now };
+    const notSent = { state: 'rejected', error_class: 'retry_exhausted', retry_exhausted: true, attempt_count: 6 };
+    return {
+      empty: labelsFor([], false, now),
+      emptyOpen: labelsFor([], true, now),
+      onePending: labelsFor([queued], false, now),
+      twoPending: labelsFor([queued, queued], false, now),
+      onlyNotSent: labelsFor([notSent], false, now),
+      mixed: labelsFor([queued, queued, notSent], false, now),
+      mixedOpen: labelsFor([queued, queued, notSent], true, now),
+    };
+  });
+
+  expect(labels.empty).toEqual({ title: 'Open outbox', ariaLabel: 'Outbox, no pending sends', badge: '0' });
+  expect(labels.emptyOpen).toMatchObject({ title: 'Close outbox', ariaLabel: 'Close outbox, 0 pending sends' });
+  expect(labels.onePending).toEqual({ title: 'Open outbox (1 pending)', ariaLabel: 'Outbox, 1 pending send', badge: '1' });
+  expect(labels.twoPending).toMatchObject({ title: 'Open outbox (2 pending)', ariaLabel: 'Outbox, 2 pending sends' });
+  // A send that will never go out on its own is not "pending".
+  expect(labels.onlyNotSent).toEqual({ title: 'Open outbox (1 not sent)', ariaLabel: 'Outbox, 1 not sent', badge: '1' });
+  expect(labels.mixed).toEqual({
+    title: 'Open outbox (2 pending, 1 not sent)',
+    ariaLabel: 'Outbox, 2 pending sends, 1 not sent',
+    badge: '3',
+  });
+  expect(labels.mixedOpen).toMatchObject({ title: 'Close outbox', ariaLabel: 'Close outbox, 2 pending sends, 1 not sent' });
+});
+
+test('the outbox tray keeps a not-sent row visible and sends it again as a new message', async ({ page }) => {
+  const exhaustedRow = {
+    outbox_id: 'e2e-exhausted',
+    account_id: 'google-primary',
+    conversation_id: 'conv1',
+    kind: 'text',
+    state: 'rejected',
+    scheduled_for_ms: Date.now() - 600_000,
+    attempt_count: 6,
+    created_at_ms: Date.now() - 600_000,
+    summary: 'Exhausted outbound',
+    error_class: 'retry_exhausted',
+    error_code: 'send_text',
+    error_detail: 'retry budget exhausted after 6 attempts; last failure transient [google_conversation_not_found]: send_text: transient: no conversation',
+    retry_exhausted: true,
+  };
+  const plainRejectedRow = {
+    ...exhaustedRow,
+    outbox_id: 'e2e-plain-rejected',
+    summary: 'Plain rejected outbound',
+    error_class: 'misconfigured',
+    error_detail: 'send_text: misconfigured: bad conversation',
+    retry_exhausted: false,
+  };
+  const retryingRow = {
+    ...exhaustedRow,
+    outbox_id: 'e2e-retrying',
+    state: 'not_dispatched',
+    summary: 'Retrying outbound',
+    attempt_count: 2,
+    next_attempt_at_ms: Date.now() + 10_000,
+    error_class: 'transient',
+    error_detail: '[google_conversation_not_found] send_text: transient: no conversation',
+    retry_exhausted: false,
+  };
+  let rows = [exhaustedRow, plainRejectedRow, retryingRow];
+  const sendAgainBodies = [];
+
+  await page.route(/\/api\/v1\/outbox(\?.*)?$/, route => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify(rows),
+  }));
+  await page.route('**/api/v1/outbox/e2e-exhausted/send-again', route => {
+    sendAgainBodies.push(route.request().postDataJSON());
+    // The server stops listing a row once a newer send names it.
+    rows = [retryingRow];
+    return route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ outbox_id: 'e2e-sent-again', local_message_id: 'e2e-sent-again-message', state: 'queued', deduplicated: false }),
+    });
+  });
+
+  await expect(page.locator('#outbox-toggle-btn')).toBeVisible();
+  await page.locator('#outbox-toggle-btn').click();
+  const notSentGroup = page.locator('#outbox-tray-content .outbox-group[data-group="notsent"]');
+  await expect(notSentGroup).toContainText('Not sent');
+  await expect(notSentGroup).toContainText('Exhausted outbound');
+  await expect(notSentGroup).toContainText('Nothing was sent. Send again creates a new message.');
+  await expect(notSentGroup.locator('.outbox-row-reason')).toContainText('retry budget exhausted after 6 attempts');
+  await expect(page.locator('#outbox-tray-content')).not.toContainText('Plain rejected outbound');
+  const retrying = page.locator('#outbox-tray-content .outbox-row[data-outbox-id="e2e-retrying"]');
+  await expect(retrying.locator('.outbox-row-reason')).toContainText('google_conversation_not_found');
+
+  await notSentGroup.locator('.outbox-row-action[data-action="send-again"]').click();
+  await expect.poll(() => sendAgainBodies.length).toBe(1);
+  expect(String(sendAgainBodies[0].idempotency_key || '')).not.toBe('');
+  await expect(page.locator('#outbox-tray-status')).toHaveText('New send queued.');
+  await expect(page.locator('#outbox-tray-content .outbox-group[data-group="notsent"]')).toHaveCount(0);
+});
+
+test('a repeat Send again on a stale not-sent row reuses its key instead of sending twice', async ({ page }) => {
+  const notSentRow = {
+    outbox_id: 'e2e-stale-not-sent',
+    account_id: 'google-primary',
+    conversation_id: 'conv1',
+    kind: 'text',
+    state: 'rejected',
+    scheduled_for_ms: Date.now() - 600_000,
+    attempt_count: 1,
+    created_at_ms: Date.now() - 600_000,
+    summary: 'Stale not-sent outbound',
+    error_class: 'reauth_required',
+    error_code: 'send_text',
+    error_detail: '[google_account_pairing_switched] send_text: reauth_required: the phone refused this session',
+    retry_exhausted: false,
+  };
+  let rows = [notSentRow];
+  let failListing = false;
+  const sendAgainBodies = [];
+
+  await page.route(/\/api\/v1\/outbox(\?.*)?$/, route => (failListing
+    ? route.fulfill({ status: 500, contentType: 'application/json', body: JSON.stringify({ error: 'outbox unavailable' }) })
+    : route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(rows) })));
+  await page.route('**/api/v1/outbox/e2e-stale-not-sent/send-again', route => {
+    sendAgainBodies.push(route.request().postDataJSON());
+    const repeat = sendAgainBodies.length > 1;
+    if (repeat) {
+      // The server stops listing a row once a newer send names it.
+      rows = [];
+      failListing = false;
+    } else {
+      // The refresh after the first send fails, leaving the tray stale.
+      failListing = true;
+    }
+    return route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ outbox_id: 'e2e-successor', local_message_id: 'e2e-successor-message', state: 'queued', deduplicated: repeat }),
+    });
+  });
+
+  await expect(page.locator('#outbox-toggle-btn')).toBeVisible();
+  await page.locator('#outbox-toggle-btn').click();
+  const staleRow = page.locator('#outbox-tray-content .outbox-row[data-outbox-id="e2e-stale-not-sent"]');
+  await expect(staleRow).toContainText('Not sent');
+
+  await staleRow.locator('.outbox-row-action[data-action="send-again"]').click();
+  await expect.poll(() => sendAgainBodies.length).toBe(1);
+  // The failed refresh left the row (and its Send again button) on screen.
+  await expect(staleRow.locator('.outbox-row-action[data-action="send-again"]')).toBeEnabled();
+
+  await staleRow.locator('.outbox-row-action[data-action="send-again"]').click();
+  await expect.poll(() => sendAgainBodies.length).toBe(2);
+  const firstKey = String(sendAgainBodies[0].idempotency_key || '');
+  expect(firstKey).not.toBe('');
+  expect(sendAgainBodies[1].idempotency_key).toBe(firstKey);
+  await expect(page.locator('#outbox-tray-status')).toHaveText('Already sent again; no new send was created.');
+  await expect(page.locator('#outbox-tray-content .outbox-group[data-group="notsent"]')).toHaveCount(0);
 });
 
 test('keeps existing thread nodes mounted after sending', async ({ page }) => {
@@ -2501,4 +2715,228 @@ test('an auth-dead Google session (disconnected + needs_repair) shows Re-pair, n
     backfill: { running: false },
   }));
   await expect(page.locator('#connection-banner-action')).toHaveText('Reconnect');
+});
+
+test('a QR session whose phone switched to Google-account pairing explains why sends fail', async ({ page }) => {
+  await page.waitForFunction(() => window.__openMessageTestHooks?.applyAppStatus);
+  const switched = {
+    connected: true,
+    google: {
+      connected: true,
+      paired: true,
+      needs_pairing: false,
+      needs_repair: true,
+      account_pairing_switched: true,
+      switched_account: 'x@gmail.com',
+      account_pairing_switched_at_ms: 1_700_000_000_000,
+    },
+    whatsapp: { connected: true, paired: true },
+    signal: { connected: true, paired: true },
+    backfill: { running: false },
+  };
+  // Serve the same document to any background status refetch (poll or SSE)
+  // so it cannot race the assertions below.
+  let statusPayload = switched;
+  await page.route('**/api/status', route => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify(statusPayload),
+  }));
+  await page.evaluate((s) => window.__openMessageTestHooks.applyAppStatus(s), switched);
+  // Takes precedence over the generic needs_repair copy: receiving still works.
+  await expect(page.locator('#connection-banner')).toBeVisible();
+  await expect(page.locator('#connection-banner-copy')).toContainText('switched Google Messages to Google-account pairing (x@gmail.com)');
+  await expect(page.locator('#connection-banner-copy')).toContainText('still receives messages');
+  await expect(page.locator('#connection-banner-copy')).toContainText('switch the phone back to QR pairing');
+  await expect(page.locator('#connection-banner-copy')).not.toContainText('unlinked OpenMessage');
+  await expect(page.locator('#connection-banner-action')).toHaveText('Platforms');
+  await expect(page.locator('#connection-banner-action')).toHaveAttribute('data-action', 'open-platforms');
+
+  await page.locator('#connection-banner-action').click();
+  await expect(page.locator('#wa-overlay')).toHaveClass(/show/);
+  await expect(page.locator('#gm-helper')).toContainText('Google-account pairing (x@gmail.com)');
+  await page.keyboard.press('Escape');
+
+  // Proof the phone serves the session again clears the flag and the banner.
+  const healthy = JSON.parse(JSON.stringify(switched));
+  healthy.google.account_pairing_switched = false;
+  healthy.google.switched_account = '';
+  healthy.google.account_pairing_switched_at_ms = 0;
+  healthy.google.needs_repair = false;
+  statusPayload = healthy;
+  await page.evaluate((s) => window.__openMessageTestHooks.applyAppStatus(s), healthy);
+  await expect(page.locator('#connection-banner')).toBeHidden();
+});
+
+test('a disconnected session the phone refuses keeps the switch banner instead of Reconnect', async ({ page }) => {
+  await page.waitForFunction(() => window.__openMessageTestHooks?.applyAppStatus);
+  const switchedOffline = {
+    connected: false,
+    google: {
+      connected: false,
+      paired: true,
+      needs_pairing: false,
+      needs_repair: false,
+      account_pairing_switched: true,
+      switched_account: 'x@gmail.com',
+      account_pairing_switched_at_ms: 1_700_000_000_000,
+    },
+    whatsapp: { connected: true, paired: true },
+    signal: { connected: true, paired: true },
+    backfill: { running: false },
+  };
+  await page.route('**/api/status', route => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify(switchedOffline),
+  }));
+  await page.evaluate((s) => window.__openMessageTestHooks.applyAppStatus(s), switchedOffline);
+  // Reconnecting cannot fix a pairing switch, so the banner must not offer it.
+  await expect(page.locator('#connection-banner-copy')).toContainText('switched Google Messages to Google-account pairing (x@gmail.com)');
+  await expect(page.locator('#connection-banner-copy')).toContainText('also disconnected right now');
+  await expect(page.locator('#connection-banner-copy')).not.toContainText('still receives messages');
+  await expect(page.locator('#connection-banner-action')).toHaveText('Platforms');
+  await expect(page.locator('#connection-banner-action')).toHaveAttribute('data-action', 'open-platforms');
+});
+
+test('while the phone refuses the session, v2 sends route to the outbox instead of the browser queue', async ({ page }) => {
+  await page.waitForFunction(() => window.__openMessageTestHooks?.googleSendRouting);
+  const routing = await page.evaluate(() => {
+    const route = window.__openMessageTestHooks.googleSendRouting;
+    const switched = { connected: false, paired: true, account_pairing_switched: true };
+    const offline = { connected: false, paired: true };
+    const healthy = { connected: true, paired: true };
+    const repair = { connected: true, paired: true, needs_repair: true };
+    return {
+      switchedV2: route(switched, true),
+      switchedConnectedV2: route({ ...switched, connected: true }, true),
+      switchedLegacy: route(switched, false),
+      // The server reports the switch only for a paired session; an unpaired
+      // snapshot carrying the flag must not route anywhere new.
+      switchedUnpairedV2: route({ ...switched, paired: false }, true),
+      offlineV2: route(offline, true),
+      healthyV2: route(healthy, true),
+      repairV2: route(repair, true),
+    };
+  });
+  // A send made while switched must reach the durable outbox (which refuses
+  // it visibly) rather than wait in localStorage and fire when pairing heals.
+  expect(routing.switchedV2).toEqual({ sendNow: true, flushQueued: true });
+  expect(routing.switchedConnectedV2).toEqual({ sendNow: true, flushQueued: true });
+  // Legacy installs have no durable outbox to refuse it: unchanged behaviour.
+  expect(routing.switchedLegacy).toEqual({ sendNow: false, flushQueued: false });
+  expect(routing.switchedUnpairedV2).toEqual({ sendNow: false, flushQueued: false });
+  // Everything else keeps the existing rules.
+  expect(routing.offlineV2).toEqual({ sendNow: false, flushQueued: false });
+  expect(routing.healthyV2).toEqual({ sendNow: true, flushQueued: true });
+  expect(routing.repairV2).toEqual({ sendNow: false, flushQueued: false });
+});
+
+test('a send written while the phone refused the session never goes out on its own after pairing heals', async ({ page }) => {
+  await page.waitForFunction(() => window.__openMessageTestHooks?.queuedSendNeedsExplicitResend);
+  const decisions = await page.evaluate(() => {
+    const hooks = window.__openMessageTestHooks;
+    const switched = { connected: false, paired: true, account_pairing_switched: true };
+    const healed = { connected: true, paired: true };
+    const held = { id: 'held', conversation_id: 'c', type: 'text', body: 'hi', composed_while_refused: true };
+    const ordinary = { id: 'ordinary', conversation_id: 'c', type: 'text', body: 'hi' };
+    return {
+      // While the refusal lasts the held send goes to the outbox, which refuses it visibly.
+      heldWhileSwitched: hooks.queuedSendNeedsExplicitResend(held, switched, true),
+      // Once pairing heals it is handed back for an explicit resend instead of sending late.
+      heldAfterHealing: hooks.queuedSendNeedsExplicitResend(held, healed, true),
+      ordinaryAfterHealing: hooks.queuedSendNeedsExplicitResend(ordinary, healed, true),
+      // The hold survives a reload (the queue is rebuilt from localStorage).
+      reloaded: hooks.normalizeQueuedSend({ ...held, status: 'pending', timestamp_ms: Date.now() }).composed_while_refused,
+      reloadedOrdinary: hooks.normalizeQueuedSend({ ...ordinary, status: 'pending', timestamp_ms: Date.now() }).composed_while_refused,
+    };
+  });
+  expect(decisions).toEqual({
+    heldWhileSwitched: false,
+    heldAfterHealing: true,
+    ordinaryAfterHealing: false,
+    reloaded: true,
+    reloadedOrdinary: false,
+  });
+});
+
+test('the status pill and empty state point at Platforms, not Reconnect, while the phone refuses the session', async ({ page }) => {
+  const switchedOffline = {
+    connected: false,
+    v2_primary: true,
+    google: {
+      connected: false,
+      paired: true,
+      needs_pairing: false,
+      account_pairing_switched: true,
+      switched_account: 'x@gmail.com',
+    },
+    whatsapp: { connected: true, paired: true },
+    signal: { connected: true, paired: true },
+    backfill: { running: false },
+  };
+  await page.route('**/api/status', route => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify(switchedOffline),
+  }));
+  await page.route('**/api/conversations?limit=200', route => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: '[]',
+  }));
+  await page.reload();
+  await expect(page.locator('#empty-state-title')).toHaveText('Google Messages switched pairing');
+  await expect(page.locator('#empty-state-cta')).toHaveText('Platforms');
+  await expect(page.locator('#empty-state-cta')).toHaveAttribute('data-action', 'open-platforms');
+
+  const pill = await page.evaluate((google) => window.__openMessageTestHooks.googleSurfaces(google).pill, switchedOffline.google);
+  expect(pill).toBe('Phone switched pairing');
+});
+
+test('sends still go to the durable outbox while the phone refuses a QR session', async ({ page }) => {
+  const outbound = `Account switch send ${Date.now()}`;
+  let sendRequests = 0;
+
+  await page.route('**/api/status', route => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({
+      v2_primary: true,
+      connected: true,
+      google: {
+        connected: true,
+        paired: true,
+        needs_pairing: false,
+        needs_repair: false,
+        account_pairing_switched: true,
+        switched_account: 'x@gmail.com',
+      },
+      whatsapp: { connected: true, paired: true },
+      signal: { connected: true, paired: true },
+      backfill: { running: false },
+    }),
+  }));
+  // The flag must not park sends in this browser's local queue (they would
+  // fire whenever it clears); the outbox owns them and rejects them visibly.
+  await page.route('**/api/v1/outbox/messages', route => {
+    sendRequests += 1;
+    return route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ outbox_id: 'e2e-switched-outbox', local_message_id: 'e2e-switched-message', state: 'queued', deduplicated: false }),
+    });
+  });
+
+  await page.reload();
+  await expect(page.locator('#connection-banner-copy')).toContainText('Google-account pairing');
+  await openConversation(page, 'Sarah Chen');
+  await page.locator('#compose-input').fill(outbound);
+  await page.locator('#send-btn').click();
+
+  await expect.poll(() => sendRequests).toBe(1);
+  await expect
+    .poll(() => page.evaluate(() => JSON.parse(localStorage.getItem('openmessage.pendingSends.v1') || '[]').length))
+    .toBe(0);
+  await expect(page.locator('#thread-feedback')).not.toContainText('Re-pair Google Messages to send it');
 });
