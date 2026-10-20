@@ -220,7 +220,10 @@ func (s *MessageService) dispatchTextLease(ctx context.Context, outboxLease sqli
 		RequestID: item.TransportRequestID,
 	}
 	request.ReplyTo = replyTo
-	result, sendErr := dispatchLease.Text.SendText(ctx, request)
+	result, sendErr := callTransport(s, ctx, item, textOperation, s.transportTimeout,
+		func(callCtx context.Context) (bridge.SendResult, error) {
+			return dispatchLease.Text.SendText(callCtx, request)
+		})
 	mutationCtx, cancel := s.storageMutationContext(ctx)
 	defer cancel()
 	if sendErr != nil {
@@ -375,7 +378,14 @@ func (s *MessageService) dispatchMediaLease(ctx context.Context, outboxLease sql
 			s.clock.Now().Add(s.retryDelay),
 		)
 	}
-	defer reader.Close()
+	// An abandoned media call may still be reading the attachment, so once the
+	// call starts its own goroutine closes the reader.
+	closeReader := true
+	defer func() {
+		if closeReader {
+			_ = reader.Close()
+		}
+	}()
 
 	if err := s.outbox.MarkTransportCalled(ctx, sqlite.Attempt{
 		OutboxID:             item.OutboxID,
@@ -404,7 +414,12 @@ func (s *MessageService) dispatchMediaLease(ctx context.Context, outboxLease sql
 		RequestID: item.TransportRequestID,
 	}
 	request.ReplyTo = replyTo
-	result, sendErr := dispatchLease.Media.SendMedia(ctx, request)
+	closeReader = false
+	result, sendErr := callTransport(s, ctx, item, mediaOperation, s.mediaTransportTimeout,
+		func(callCtx context.Context) (bridge.SendResult, error) {
+			defer reader.Close()
+			return dispatchLease.Media.SendMedia(callCtx, request)
+		})
 	mutationCtx, cancel := s.storageMutationContext(ctx)
 	defer cancel()
 	if sendErr != nil {
@@ -542,7 +557,7 @@ func (s *MessageService) dispatchReactionLease(ctx context.Context, outboxLease 
 	}
 	s.signalChange()
 
-	result, sendErr := dispatchLease.Reaction.SendReaction(ctx, bridge.ReactionRequest{
+	reactionRequest := bridge.ReactionRequest{
 		AccountID: item.AccountID,
 		Conversation: bridge.ConversationRef{
 			RemoteID: conversation.RemoteConversationID,
@@ -551,7 +566,11 @@ func (s *MessageService) dispatchReactionLease(ctx context.Context, outboxLease 
 		Emoji:     reaction.Emoji,
 		Action:    bridge.ReactionAction(reaction.Action),
 		RequestID: item.TransportRequestID,
-	})
+	}
+	result, sendErr := callTransport(s, ctx, item, reactionOperation, s.transportTimeout,
+		func(callCtx context.Context) (bridge.SendResult, error) {
+			return dispatchLease.Reaction.SendReaction(callCtx, reactionRequest)
+		})
 	mutationCtx, cancel := s.storageMutationContext(ctx)
 	defer cancel()
 	if sendErr != nil {
@@ -678,14 +697,18 @@ func (s *MessageService) dispatchReadLease(ctx context.Context, outboxLease sqli
 	}
 	s.signalChange()
 
-	sendErr := dispatchLease.ReadReceipt.MarkRead(ctx, bridge.ReadReceiptRequest{
+	readRequest := bridge.ReadReceiptRequest{
 		AccountID: item.AccountID,
 		Conversation: bridge.ConversationRef{
 			RemoteID: conversation.RemoteConversationID,
 		},
 		Messages: []bridge.MessageRef{target},
 		ReadAt:   time.UnixMilli(receipt.ReadAtMS),
-	})
+	}
+	_, sendErr := callTransport(s, ctx, item, readOperation, s.transportTimeout,
+		func(callCtx context.Context) (struct{}, error) {
+			return struct{}{}, dispatchLease.ReadReceipt.MarkRead(callCtx, readRequest)
+		})
 	mutationCtx, cancel := s.storageMutationContext(ctx)
 	defer cancel()
 	if sendErr != nil {

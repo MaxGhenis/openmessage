@@ -427,3 +427,39 @@ func (h *v1RecorderHarness) do(t *testing.T, request *http.Request) *http.Respon
 	h.handler.ServeHTTP(recorder, request)
 	return recorder.Result()
 }
+
+func TestStatusReportsV2DispatchHealth(t *testing.T) {
+	h := newA3Harness(t, true)
+	response := h.request(t, http.MethodGet, "/api/status", "", nil)
+	assertA3Status(t, response, http.StatusOK)
+
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(response.body, &payload); err != nil {
+		t.Fatal(err)
+	}
+	raw, ok := payload["v2_dispatch"]
+	if !ok {
+		t.Fatalf("status has no v2_dispatch: %s", response.body)
+	}
+	var health map[string]any
+	if err := json.Unmarshal(raw, &health); err != nil {
+		t.Fatal(err)
+	}
+	if health["abandoned_calls"] != float64(0) || health["abandoned_still_running"] != float64(0) {
+		t.Fatalf("v2_dispatch = %s, want zero abandoned calls", raw)
+	}
+	if _, inFlight := health["in_flight"]; inFlight {
+		t.Fatalf("v2_dispatch = %s, want no in-flight call while idle", raw)
+	}
+
+	disabled := newV1RecorderHarness(t, APIOptions{})
+	resp := disabled.do(t, httptest.NewRequest(http.MethodGet, "http://127.0.0.1/api/status", nil))
+	defer resp.Body.Close()
+	var legacyPayload map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&legacyPayload); err != nil {
+		t.Fatal(err)
+	}
+	if _, present := legacyPayload["v2_dispatch"]; present {
+		t.Fatalf("status without the v2 send stack reports v2_dispatch: %#v", legacyPayload["v2_dispatch"])
+	}
+}
