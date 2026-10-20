@@ -15,6 +15,7 @@ import (
 
 	"github.com/maxghenis/openmessage/internal/app"
 	"github.com/maxghenis/openmessage/internal/bridge"
+	"github.com/maxghenis/openmessage/internal/messaging"
 	"github.com/maxghenis/openmessage/internal/storage/sqlite"
 )
 
@@ -464,4 +465,24 @@ func TestDaemonReactToMessageThroughTheCompatibilityRoute(t *testing.T) {
 			t.Fatalf("result = %q, want an error", resultText(t, result))
 		}
 	})
+}
+
+// A reaction refused for one message (the platform said no, or its target
+// cannot be named) carries error class unsupported. The text must not read as
+// "this platform cannot react", which is a different rejection: an account
+// without reactions is rejected before the transport with its own code.
+func TestV2ReactionTextSaysARefusalIsAboutTheMessage(t *testing.T) {
+	refused := v2ReactionText("outbox-1", messaging.OutboxRejected, "unsupported", "send_reaction", "")
+	if !strings.Contains(refused, "outbox-1") || !strings.Contains(refused, "not because the platform lacks reactions") {
+		t.Fatalf("refused reaction text = %q, want it to say the refusal is about this message", refused)
+	}
+	for _, other := range []struct{ class, code string }{
+		{"unsupported", "reactions_unsupported"},
+		{"unpaired", "send_reaction"},
+	} {
+		text := v2ReactionText("outbox-2", messaging.OutboxRejected, other.class, other.code, "")
+		if strings.Contains(text, "lacks reactions") || !strings.Contains(text, "error class "+other.class) {
+			t.Fatalf("rejected text for %s/%s = %q, want only the class named", other.class, other.code, text)
+		}
+	}
 }

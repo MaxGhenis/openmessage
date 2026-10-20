@@ -1559,10 +1559,13 @@ func (r *OutboxRepository) ConfirmWithoutResult(
 //
 // A message whose reactions come from full snapshots (Google, which has a
 // reaction_snapshot_fences row) gets no own row when the latest snapshot
-// applied to it was received at or after the transport was called. That
-// snapshot was taken after the reaction was sent, so it or a later one lists
-// the reaction under the reactor the phone names; an own row written now
-// would sit beside it, counting the reaction twice, until the next snapshot.
+// applied to it was received at or after the transport was called. Such a
+// snapshot may already list the reaction under the reactor the phone names,
+// and an own row beside it would count the reaction twice until the next
+// snapshot. It may instead have left the phone before the phone applied the
+// reaction; then the reaction shows from the next snapshot that lists it,
+// the same gap the other order has, where that snapshot tombstones the own
+// row.
 func (r *OutboxRepository) ConfirmReaction(
 	ctx context.Context,
 	confirmation ReactionConfirmation,

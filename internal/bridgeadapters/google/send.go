@@ -322,10 +322,22 @@ func (a *Adapter) SendReaction(
 			Cause:       errors.New("send Google reaction: transport returned no response"),
 		}
 	}
+	if !response.GetSuccess() && req.Target.ProvisionalRemoteID {
+		// The target is this account's message still named by its send's
+		// request ID. The phone may know it only by its own ID, which the
+		// echo brings and the next attempt then uses, so this can succeed.
+		return bridge.SendResult{}, bridge.OpError{
+			Class:       bridge.FailureTransient,
+			Operation:   "send_reaction",
+			Fingerprint: "google_reaction_target_provisional",
+			Dispatch:    bridge.DispatchNotCalled,
+			Cause:       errors.New("Google Messages refused a reaction to a message still named by its send's request ID"),
+		}
+	}
 	if !response.GetSuccess() {
-		// The phone answered and refused the reaction. Sending the same
-		// request again gets the same answer, so it is final (the legacy
-		// sender reported it as a failure and did not retry either).
+		// The phone answered and refused a reaction to a message named by
+		// its own ID. A retry would send the same request, so the refusal
+		// is final.
 		return bridge.SendResult{}, bridge.OpError{
 			Class:       bridge.FailureUnsupported,
 			Operation:   "send_reaction",

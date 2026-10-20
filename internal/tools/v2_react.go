@@ -6,6 +6,7 @@ import (
 
 	"github.com/mark3labs/mcp-go/mcp"
 
+	"github.com/maxghenis/openmessage/internal/bridge"
 	"github.com/maxghenis/openmessage/internal/localapi"
 	"github.com/maxghenis/openmessage/internal/messaging"
 	"github.com/maxghenis/openmessage/internal/v2wire"
@@ -156,7 +157,7 @@ func v2ReactionResult(
 	if delivery.Warning != "" {
 		payload["warning"] = delivery.Warning
 	}
-	return structuredResult(payload, v2ReactionText(delivery.OutboxID, state, delivery.ErrorClass, idempotencyKey))
+	return structuredResult(payload, v2ReactionText(delivery.OutboxID, state, delivery.ErrorClass, delivery.ErrorCode, idempotencyKey))
 }
 
 // v2ReactionSettled reports whether the app is done with the reaction. A
@@ -171,14 +172,20 @@ func v2ReactionSettled(state messaging.OutboxState) bool {
 	}
 }
 
-func v2ReactionText(outboxID string, state messaging.OutboxState, errorClass, idempotencyKey string) string {
+func v2ReactionText(outboxID string, state messaging.OutboxState, errorClass, errorCode, idempotencyKey string) string {
 	switch state {
 	case messaging.OutboxConfirmed, messaging.OutboxStoreFailed:
 		return fmt.Sprintf("Reaction delivered (outbox %s).", outboxID)
 	case messaging.OutboxUncertain:
 		return fmt.Sprintf("The reaction's outcome is unknown (outbox %s): the platform may have applied it. Read the message's reactions before reacting again.", outboxID)
 	case messaging.OutboxRejected:
-		return fmt.Sprintf("The reaction was rejected (outbox %s, error class %s). The app will not retry it.", outboxID, firstNonEmpty(errorClass, "unknown"))
+		text := fmt.Sprintf("The reaction was rejected (outbox %s, error class %s). The app will not retry it.", outboxID, firstNonEmpty(errorClass, "unknown"))
+		if errorClass == string(bridge.FailureUnsupported) && errorCode == "send_reaction" {
+			// An account that cannot react at all is rejected before the
+			// transport with code reactions_unsupported instead.
+			text += " The platform refused this reaction, or the message it targets cannot be named: it was refused for this message, not because the platform lacks reactions."
+		}
+		return text
 	case messaging.OutboxCanceled:
 		return fmt.Sprintf("The reaction was canceled before it was sent (outbox %s).", outboxID)
 	default:

@@ -87,7 +87,12 @@ type MessageRef struct {
 	RemoteID string
 	AuthorID string
 	Outgoing bool
-	SentAt   time.Time
+	// ProvisionalRemoteID is set for this account's own message while RemoteID
+	// is still the request ID its send was given: the send is unresolved, or
+	// confirmed and waiting for the echo that brings the platform's own ID.
+	// A send that was canceled or rejected never gets one, so it is not set.
+	ProvisionalRemoteID bool
+	SentAt              time.Time
 	// Text, HasAttachment and AttachmentMIME are filled for reply targets
 	// only. Text is the stored body. HasAttachment reports whether the message
 	// carries an attachment, and AttachmentMIME is the first attachment's MIME

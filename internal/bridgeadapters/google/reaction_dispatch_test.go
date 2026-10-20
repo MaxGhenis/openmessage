@@ -2,6 +2,7 @@ package google
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -14,11 +15,11 @@ import (
 	"github.com/maxghenis/openmessage/internal/storage/sqlite"
 )
 
-// reactionDispatchRegistry leases one adapter's reaction sender to the
-// dispatcher, the way the account registry does for a connected account.
+// reactionDispatchRegistry leases one adapter's text and reaction senders to
+// the dispatcher, the way the account registry does for a connected account.
 type reactionDispatchRegistry struct {
 	accountID string
-	sender    bridge.ReactionSender
+	adapter   *Adapter
 }
 
 func (r reactionDispatchRegistry) Snapshot(string) (bridge.Snapshot, bool) {
@@ -30,16 +31,23 @@ func (r reactionDispatchRegistry) Acquire(
 	accountID string,
 	capability bridge.Capability,
 ) (*bridge.DispatchLease, error) {
-	if accountID != r.accountID || capability != bridge.CapabilityReactions {
+	if accountID != r.accountID {
 		return nil, bridge.ErrCapabilityUnavailable
 	}
-	return &bridge.DispatchLease{
-		AccountID: accountID, Platform: bridge.PlatformGoogle, Generation: 1, Ctx: ctx, Reaction: r.sender,
-	}, nil
+	lease := &bridge.DispatchLease{AccountID: accountID, Platform: bridge.PlatformGoogle, Generation: 1, Ctx: ctx}
+	switch capability {
+	case bridge.CapabilityReactions:
+		lease.Reaction = r.adapter
+	case bridge.CapabilityTextSend:
+		lease.Text = r.adapter
+	default:
+		return nil, bridge.ErrCapabilityUnavailable
+	}
+	return lease, nil
 }
 
 func (r reactionDispatchRegistry) Capabilities(accountID string) bridge.CapabilitySet {
-	return bridge.CapabilitySet{Reactions: accountID == r.accountID}
+	return bridge.CapabilitySet{Reactions: accountID == r.accountID, TextSend: accountID == r.accountID}
 }
 
 // reactionDispatchClock is a wall clock the test moves by hand.
@@ -64,14 +72,28 @@ func (c *reactionDispatchClock) NewTimer(d time.Duration) messaging.Timer {
 	return messaging.SystemClock{}.NewTimer(d)
 }
 
-// A reaction the phone refuses (SendReactionResponse success: false) must end
-// rejected, the state /api/react answers 502 for, and must not be sent again.
-// This runs the real Google adapter's classification through the real
-// dispatcher and outbox; only libgm's transport is faked. Before, the refusal
-// was classified transient and not dispatched, so the row went back to
-// not_dispatched, /api/react answered 202 "keeps trying", and the dispatcher
-// sent it again every 5 s with no cap.
-func TestGoogleRefusedReactionIsRejectedAndNotRetried(t *testing.T) {
+const (
+	reactionDispatchAccountID      = "google-primary"
+	reactionDispatchConversationID = "v2-google-thread"
+)
+
+// reactionDispatchFixture is a v2 store with one Google thread holding one
+// incoming message, served by the real Google adapter (only libgm's transport
+// is faked) through the real MessageService dispatcher.
+type reactionDispatchFixture struct {
+	t        *testing.T
+	ctx      context.Context
+	clock    *reactionDispatchClock
+	store    *sqlite.Store
+	service  *messaging.MessageService
+	outbox   *sqlite.OutboxRepository
+	reaction *fakeReactionSendClient
+	text     *fakeTextSendClient
+	keys     int
+}
+
+func newReactionDispatchFixture(t *testing.T) *reactionDispatchFixture {
+	t.Helper()
 	ctx := context.Background()
 	clock := &reactionDispatchClock{now: time.UnixMilli(1_900_000_000_000)}
 	store, err := sqlite.Open(filepath.Join(t.TempDir(), "v2.sqlite3"))
@@ -80,18 +102,17 @@ func TestGoogleRefusedReactionIsRejectedAndNotRetried(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = store.Close() })
 
-	const accountID = "google-primary"
 	nowMS := clock.Now().UnixMilli()
 	if err := store.UpsertAccount(sqlite.Account{
-		AccountID: accountID, BridgeKey: "google", DisplayName: "Google Messages",
+		AccountID: reactionDispatchAccountID, BridgeKey: "google", DisplayName: "Google Messages",
 		Mode: sqlite.AccountModeLive, Enabled: true, ConfigJSON: "{}",
 		CreatedAtMS: nowMS, UpdatedAtMS: nowMS,
 	}); err != nil {
 		t.Fatalf("UpsertAccount(): %v", err)
 	}
 	if err := store.UpsertConversation(sqlite.Conversation{
-		ConversationID: "v2-google-thread", AccountID: accountID, RemoteConversationID: "conversation-id",
-		Kind: sqlite.ConversationKindDirect, Title: "thread",
+		ConversationID: reactionDispatchConversationID, AccountID: reactionDispatchAccountID,
+		RemoteConversationID: "conversation-id", Kind: sqlite.ConversationKindDirect, Title: "thread",
 		NotificationMode: sqlite.NotificationModeAll, MetadataJSON: "{}",
 		CreatedAtMS: nowMS, UpdatedAtMS: nowMS,
 	}); err != nil {
@@ -102,7 +123,7 @@ func TestGoogleRefusedReactionIsRejectedAndNotRetried(t *testing.T) {
 		t.Fatalf("NewMessageRepository(): %v", err)
 	}
 	if _, err := messages.AppendInbox(ctx, sqlite.InboxRecord{
-		InboxID: "inbox-target", AccountID: accountID, Generation: 1,
+		InboxID: "inbox-target", AccountID: reactionDispatchAccountID, Generation: 1,
 		DedupeKey: "inbox-target", Codec: "test", CodecVersion: 1, Payload: []byte("test"),
 	}); err != nil {
 		t.Fatalf("AppendInbox(): %v", err)
@@ -110,22 +131,28 @@ func TestGoogleRefusedReactionIsRejectedAndNotRetried(t *testing.T) {
 	if err := messages.ProjectMessage(ctx, sqlite.MessageProjection{
 		InboxID: "inbox-target",
 		Message: sqlite.Message{
-			MessageID: "v2-target", ConversationID: "v2-google-thread", AccountID: accountID,
-			RemoteMessageID: "target-id", Direction: sqlite.MessageDirectionIncoming,
-			Body: "react to this", State: sqlite.MessageStateActive, OccurredAtMS: nowMS - 60_000,
+			MessageID: "v2-target", ConversationID: reactionDispatchConversationID,
+			AccountID: reactionDispatchAccountID, RemoteMessageID: "target-id",
+			Direction: sqlite.MessageDirectionIncoming, Body: "react to this",
+			State: sqlite.MessageStateActive, OccurredAtMS: nowMS - 60_000,
 		},
 	}); err != nil {
 		t.Fatalf("ProjectMessage(): %v", err)
 	}
 
-	fake := &fakeReactionSendClient{
+	reaction := &fakeReactionSendClient{
 		conversationResult: &gmproto.Conversation{},
 		sendResult:         &gmproto.SendReactionResponse{Success: false},
 	}
-	adapter := newReactionSendTestAdapter(t, fake)
+	text := &fakeTextSendClient{
+		conversationResult: &gmproto.Conversation{},
+		sendResult:         &gmproto.SendMessageResponse{Status: gmproto.SendMessageResponse_SUCCESS},
+	}
+	adapter := newReactionSendTestAdapter(t, reaction)
+	installTextSendClient(t, adapter.host.GetClient(), text)
 	service, err := messaging.NewMessageService(
 		store,
-		reactionDispatchRegistry{accountID: accountID, sender: adapter},
+		reactionDispatchRegistry{accountID: reactionDispatchAccountID, adapter: adapter},
 		nil,
 		clock,
 		messaging.CryptoIDSource{},
@@ -133,52 +160,162 @@ func TestGoogleRefusedReactionIsRejectedAndNotRetried(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewMessageService(): %v", err)
 	}
+	outbox, err := sqlite.NewOutboxRepository(store, clock.Now)
+	if err != nil {
+		t.Fatalf("NewOutboxRepository(): %v", err)
+	}
+	return &reactionDispatchFixture{
+		t: t, ctx: ctx, clock: clock, store: store, service: service, outbox: outbox,
+		reaction: reaction, text: text,
+	}
+}
 
-	submission, err := service.SendReaction(ctx, messaging.SendReactionCommand{
-		CommonCommand: messaging.CommonCommand{
-			AccountID: accountID, ConversationID: "v2-google-thread", IdempotencyKey: "refused-reaction",
-		},
-		TargetMessageID: "v2-target",
+func (f *reactionDispatchFixture) common() messaging.CommonCommand {
+	f.keys++
+	return messaging.CommonCommand{
+		AccountID:      reactionDispatchAccountID,
+		ConversationID: reactionDispatchConversationID,
+		IdempotencyKey: fmt.Sprintf("reaction-dispatch-%d", f.keys),
+	}
+}
+
+func (f *reactionDispatchFixture) react(targetMessageID string) messaging.Submission {
+	f.t.Helper()
+	submission, err := f.service.SendReaction(f.ctx, messaging.SendReactionCommand{
+		CommonCommand:   f.common(),
+		TargetMessageID: targetMessageID,
 		Emoji:           "👍",
 		Action:          bridge.ReactionAdd,
 	})
 	if err != nil {
-		t.Fatalf("SendReaction(): %v", err)
+		f.t.Fatalf("SendReaction(%q): %v", targetMessageID, err)
 	}
-	if processed, err := service.DispatchDue(ctx, 4); err != nil || processed != 1 {
-		t.Fatalf("DispatchDue() = %d, %v; want 1, nil", processed, err)
+	return submission
+}
+
+func (f *reactionDispatchFixture) dispatch(want int) {
+	f.t.Helper()
+	if processed, err := f.service.DispatchDue(f.ctx, 4); err != nil || processed != want {
+		f.t.Fatalf("DispatchDue() = %d, %v; want %d, nil", processed, err, want)
 	}
-	if fake.sendCalls != 1 || fake.sent == nil {
-		t.Fatalf("libgm SendReaction calls = %d, want 1", fake.sendCalls)
-	}
-	delivery, err := service.Get(ctx, submission.OutboxID)
+}
+
+func (f *reactionDispatchFixture) delivery(outboxID string) messaging.Delivery {
+	f.t.Helper()
+	delivery, err := f.service.Get(f.ctx, outboxID)
 	if err != nil {
-		t.Fatalf("Get(): %v", err)
+		f.t.Fatalf("Get(%q): %v", outboxID, err)
 	}
-	if delivery.State != messaging.OutboxRejected ||
+	return delivery
+}
+
+// A reaction the phone refuses (SendReactionResponse success: false) must end
+// rejected, the state /api/react answers 502 for, and must not be sent again.
+// Before, the refusal was classified transient and not dispatched, so the row
+// went back to not_dispatched, /api/react answered 202 "keeps trying", and the
+// dispatcher sent it again every 5 s with no cap.
+func TestGoogleRefusedReactionIsRejectedAndNotRetried(t *testing.T) {
+	f := newReactionDispatchFixture(t)
+	submission := f.react("v2-target")
+	f.dispatch(1)
+	if f.reaction.sendCalls != 1 || f.reaction.sent == nil {
+		t.Fatalf("libgm SendReaction calls = %d, want 1", f.reaction.sendCalls)
+	}
+	if delivery := f.delivery(submission.OutboxID); delivery.State != messaging.OutboxRejected ||
 		delivery.ErrorClass != string(bridge.FailureUnsupported) || delivery.ErrorCode != "send_reaction" {
 		t.Fatalf("delivery = %+v, want rejected unsupported send_reaction", delivery)
 	}
 
 	// Well past the retry delay, nothing is due and nothing is sent again.
-	clock.Advance(time.Hour)
-	if processed, err := service.DispatchDue(ctx, 4); err != nil || processed != 0 {
-		t.Fatalf("DispatchDue(an hour later) = %d, %v; want 0, nil", processed, err)
-	}
-	if fake.sendCalls != 1 {
-		t.Fatalf("libgm SendReaction calls = %d after an hour, want the refusal never resent", fake.sendCalls)
+	f.clock.Advance(time.Hour)
+	f.dispatch(0)
+	if f.reaction.sendCalls != 1 {
+		t.Fatalf("libgm SendReaction calls = %d after an hour, want the refusal never resent", f.reaction.sendCalls)
 	}
 
 	// A refused reaction is not shown as this account's own.
-	reactions, err := sqlite.NewReactionRepository(store, clock.Now)
+	reactions, err := sqlite.NewReactionRepository(f.store, f.clock.Now)
 	if err != nil {
 		t.Fatalf("NewReactionRepository(): %v", err)
 	}
-	shown, err := reactions.ReactionsForMessages(ctx, []string{"v2-target"})
+	shown, err := reactions.ReactionsForMessages(f.ctx, []string{"v2-target"})
 	if err != nil {
 		t.Fatalf("ReactionsForMessages(): %v", err)
 	}
 	if len(shown["v2-target"]) != 0 {
 		t.Fatalf("target reactions = %+v, want none for a refused reaction", shown["v2-target"])
+	}
+}
+
+// A message this account just sent is named by its send's request ID (Google's
+// TmpID) until the phone's echo brings the phone's own ID. A refusal of a
+// reaction to it then says nothing final: the retry names the phone's ID. So
+// that refusal is retried, and the reaction goes out once the echo arrives.
+// A refusal of a reaction to the same message once it has its own ID, or to a
+// message whose send was canceled and so never gets one, is final.
+func TestGoogleReactionToOwnMessageRetriesUntilItsEchoNamesIt(t *testing.T) {
+	f := newReactionDispatchFixture(t)
+	sent, err := f.service.SendText(f.ctx, messaging.SendTextCommand{CommonCommand: f.common(), Body: "my message"})
+	if err != nil {
+		t.Fatalf("SendText(): %v", err)
+	}
+	f.dispatch(1)
+	sendRow, err := f.outbox.FindByID(f.ctx, sent.OutboxID)
+	if err != nil {
+		t.Fatalf("FindByID(text): %v", err)
+	}
+	if sendRow.State != sqlite.OutboxConfirmed || f.text.sent.GetTmpID() != sendRow.TransportRequestID {
+		t.Fatalf("text send = %+v with TmpID %q, want confirmed under its request ID", sendRow, f.text.sent.GetTmpID())
+	}
+
+	reaction := f.react(sent.LocalMessageID)
+	f.dispatch(1)
+	if got := f.reaction.sent.GetReactionData(); f.reaction.sendCalls != 1 || f.reaction.sent.GetMessageID() != sendRow.TransportRequestID {
+		t.Fatalf("first reaction attempt = %d calls naming %q (%v), want one naming the request ID %q",
+			f.reaction.sendCalls, f.reaction.sent.GetMessageID(), got, sendRow.TransportRequestID)
+	}
+	if delivery := f.delivery(reaction.OutboxID); delivery.State != messaging.OutboxNotDispatched ||
+		delivery.ErrorClass != string(bridge.FailureTransient) {
+		t.Fatalf("delivery after a refusal of a provisionally named target = %+v, want not_dispatched transient", delivery)
+	}
+
+	// The phone's echo names the message by its own ID; the phone now accepts.
+	if _, err := f.service.ObserveTransportEcho(f.ctx, messaging.TransportEcho{
+		AccountID: reactionDispatchAccountID, TransportRequestID: sendRow.TransportRequestID, RemoteMessageID: "phone-message-id",
+	}); err != nil {
+		t.Fatalf("ObserveTransportEcho(): %v", err)
+	}
+	f.reaction.sendResult = &gmproto.SendReactionResponse{Success: true}
+	f.clock.Advance(time.Minute)
+	f.dispatch(1)
+	if f.reaction.sendCalls != 2 || f.reaction.sent.GetMessageID() != "phone-message-id" {
+		t.Fatalf("retry = %d calls naming %q, want a second naming phone-message-id", f.reaction.sendCalls, f.reaction.sent.GetMessageID())
+	}
+	if delivery := f.delivery(reaction.OutboxID); delivery.State != messaging.OutboxConfirmed {
+		t.Fatalf("delivery after the echo = %+v, want confirmed", delivery)
+	}
+
+	// Named by its own ID, the same message's refusal is final.
+	f.reaction.sendResult = &gmproto.SendReactionResponse{Success: false}
+	again := f.react(sent.LocalMessageID)
+	f.dispatch(1)
+	if delivery := f.delivery(again.OutboxID); delivery.State != messaging.OutboxRejected {
+		t.Fatalf("delivery of a refused reaction to a reconciled own message = %+v, want rejected", delivery)
+	}
+
+	// A canceled send never gets the phone's ID, so a refusal is final too.
+	later := f.common()
+	later.NotBefore = f.clock.Now().Add(24 * time.Hour)
+	canceled, err := f.service.SendText(f.ctx, messaging.SendTextCommand{CommonCommand: later, Body: "never sent"})
+	if err != nil {
+		t.Fatalf("SendText(scheduled): %v", err)
+	}
+	if _, err := f.service.Cancel(f.ctx, canceled.OutboxID); err != nil {
+		t.Fatalf("Cancel(): %v", err)
+	}
+	toCanceled := f.react(canceled.LocalMessageID)
+	f.dispatch(1)
+	if delivery := f.delivery(toCanceled.OutboxID); delivery.State != messaging.OutboxRejected {
+		t.Fatalf("delivery of a refused reaction to a canceled send = %+v, want rejected", delivery)
 	}
 }

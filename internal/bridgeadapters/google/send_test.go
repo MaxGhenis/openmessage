@@ -573,6 +573,7 @@ func TestSendReactionRefusalIsFinalAndNoResponseIsRetryable(t *testing.T) {
 	tests := []struct {
 		name        string
 		response    *gmproto.SendReactionResponse
+		provisional bool
 		class       bridge.FailureClass
 		fingerprint string
 	}{
@@ -581,6 +582,15 @@ func TestSendReactionRefusalIsFinalAndNoResponseIsRetryable(t *testing.T) {
 			response:    &gmproto.SendReactionResponse{},
 			class:       bridge.FailureUnsupported,
 			fingerprint: "google_reaction_rejected",
+		},
+		// The target's ID is its send's request ID until the echo brings the
+		// phone's own; the retry names that one, so this refusal can pass.
+		{
+			name:        "success false for a provisionally named target",
+			response:    &gmproto.SendReactionResponse{},
+			provisional: true,
+			class:       bridge.FailureTransient,
+			fingerprint: "google_reaction_target_provisional",
 		},
 		{
 			name:        "nil response",
@@ -600,7 +610,7 @@ func TestSendReactionRefusalIsFinalAndNoResponseIsRetryable(t *testing.T) {
 
 			_, err := a.SendReaction(context.Background(), bridge.ReactionRequest{
 				Conversation: bridge.ConversationRef{RemoteID: "conversation-id"},
-				Target:       bridge.MessageRef{RemoteID: "target-id"},
+				Target:       bridge.MessageRef{RemoteID: "target-id", ProvisionalRemoteID: test.provisional},
 				Emoji:        "👍",
 				Action:       bridge.ReactionAdd,
 			})

@@ -98,8 +98,73 @@ func TestReactionToOwnOutgoingMessageMapsEmptyAuthor(t *testing.T) {
 	}
 	requests := sender.snapshotRequests()
 	if len(requests) != 1 || requests[0].Target.RemoteID != targetRow.TransportRequestID ||
-		requests[0].Target.AuthorID != "" {
+		requests[0].Target.AuthorID != "" || !requests[0].Target.Outgoing {
 		t.Fatalf("own-target reaction request = %+v, want request ID target and empty author", requests)
+	}
+	// A canceled send never gets the platform's own ID, so its request ID
+	// is not provisional: it is the only name the message will ever have.
+	if requests[0].Target.ProvisionalRemoteID {
+		t.Fatalf("own-target reaction request = %+v, want a canceled send's ID not marked provisional", requests[0])
+	}
+}
+
+// A message whose send has not happened yet is named by its request ID only
+// until the platform gives it its own, so the reaction request says so; a
+// received message never carries the mark.
+func TestReactionTargetIsProvisionalWhileItsSendIsUnresolved(t *testing.T) {
+	clock := newManualClock(messagingTestTime)
+	store := openMessagingTestStore(t, clock.Now())
+	sender := &scriptedReactionSender{steps: []sendStep{{}, {}}}
+	registry := newScriptedRegistry("reaction-provisional-target", &scriptedTextSender{})
+	registry.setReactionSender(sender)
+	registry.setAvailable(true)
+	service := newMessagingTestService(t, store, registry, clock)
+
+	scheduled := testCommonCommand("reaction-provisional-send")
+	scheduled.NotBefore = clock.Now().Add(24 * time.Hour)
+	target := mustSendText(t, service, SendTextCommand{CommonCommand: scheduled, Body: "not sent yet"})
+	targetRow := mustOutboxItem(t, service, target.OutboxID)
+	mustSendDispatchReaction(t, service, SendReactionCommand{
+		CommonCommand:   testCommonCommand("reaction-provisional"),
+		TargetMessageID: target.LocalMessageID,
+		Emoji:           "👍",
+	})
+	incoming := mustProjectDispatchMessage(t, store, clock, sqlite.Message{
+		MessageID:       "message-provisional-incoming",
+		ConversationID:  "conversation-1",
+		AccountID:       "account-1",
+		RemoteMessageID: targetRow.TransportRequestID + "-incoming",
+		Direction:       sqlite.MessageDirectionIncoming,
+		Body:            "received",
+		State:           sqlite.MessageStateActive,
+		OccurredAtMS:    clock.Now().Add(-time.Minute).UnixMilli(),
+	})
+	mustSendDispatchReaction(t, service, SendReactionCommand{
+		CommonCommand:   testCommonCommand("reaction-provisional-incoming"),
+		TargetMessageID: incoming.MessageID,
+		Emoji:           "👍",
+	})
+
+	if processed, err := service.DispatchDue(context.Background(), 4); err != nil || processed != 2 {
+		t.Fatalf("DispatchDue() = %d, %v; want the two reactions, nil", processed, err)
+	}
+	requests := sender.snapshotRequests()
+	if len(requests) != 2 {
+		t.Fatalf("reaction requests = %+v, want two", requests)
+	}
+	for _, request := range requests {
+		switch request.Target.RemoteID {
+		case targetRow.TransportRequestID:
+			if !request.Target.Outgoing || !request.Target.ProvisionalRemoteID {
+				t.Fatalf("reaction to an unsent own message = %+v, want outgoing and provisional", request.Target)
+			}
+		case incoming.RemoteMessageID:
+			if request.Target.Outgoing || request.Target.ProvisionalRemoteID {
+				t.Fatalf("reaction to a received message = %+v, want neither outgoing nor provisional", request.Target)
+			}
+		default:
+			t.Fatalf("reaction request names %q, want one of the two targets", request.Target.RemoteID)
+		}
 	}
 }
 
