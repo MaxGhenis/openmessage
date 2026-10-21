@@ -1398,7 +1398,12 @@ func (r *OutboxRepository) RetryNotDispatched(
 	if err != nil {
 		return err
 	}
-	result, err := r.store.db.ExecContext(ctx, `
+	tx, err := r.store.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("retry not-dispatched outbox item %q: begin transaction: %w", outboxID, err)
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `
 		UPDATE outbox
 		SET next_attempt_at_ms = ?,
 			updated_at_ms = ?
@@ -1408,7 +1413,87 @@ func (r *OutboxRepository) RetryNotDispatched(
 	if err != nil {
 		return fmt.Errorf("retry not-dispatched outbox item %q: %w", outboxID, err)
 	}
-	return r.requireStateMutation(ctx, "retry not dispatched", outboxID, result)
+	return r.commitSendStateChange(ctx, tx, "retry not dispatched", outboxID, nowMS, result)
+}
+
+// ReactionTargetUnsentCode is the error code of a reaction the messaging
+// dispatcher holds, before the transport call, because the message it targets
+// is this account's own and that message's send has not gone out yet. Such a
+// reaction is next due just after the send.
+const ReactionTargetUnsentCode = "reaction_target_unsent"
+
+// commitSendStateChange finishes Cancel and RetryNotDispatched. When the
+// update changed the row, the reactions held for it as their target's send
+// (ReactionTargetUnsentCode) are made due 1 ms after now, in the same
+// transaction: the send is due now, or canceled and never going out, and
+// either way they need not wait for its old due time. The 1 ms keeps a
+// retried send ahead of them in LeaseDue's order.
+func (r *OutboxRepository) commitSendStateChange(
+	ctx context.Context,
+	tx *sql.Tx,
+	operation, outboxID string,
+	nowMS int64,
+	result sql.Result,
+) error {
+	if affected, err := result.RowsAffected(); err != nil || affected != 1 {
+		_ = tx.Rollback()
+		return r.requireStateMutation(ctx, operation, outboxID, result)
+	}
+	if _, err := wakeReactionsHeldFor(ctx, tx, outboxID, nowMS); err != nil {
+		return fmt.Errorf("%s outbox item %q: wake reactions held for it: %w", operation, outboxID, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("%s outbox item %q: commit: %w", operation, outboxID, err)
+	}
+	return nil
+}
+
+// WakeReactionsHeldFor makes the reactions held for the send sendOutboxID
+// (ReactionTargetUnsentCode) due 1 ms from now, as Cancel and
+// RetryNotDispatched do, and reports how many it moved. The dispatcher calls
+// it when the send changed while a reaction to it was being held.
+func (r *OutboxRepository) WakeReactionsHeldFor(ctx context.Context, sendOutboxID string) (int64, error) {
+	nowMS, err := r.nowMS("wake reactions held for outbox item")
+	if err != nil {
+		return 0, err
+	}
+	woken, err := wakeReactionsHeldFor(ctx, r.store.db, sendOutboxID, nowMS)
+	if err != nil {
+		return 0, fmt.Errorf("wake reactions held for outbox item %q: %w", sendOutboxID, err)
+	}
+	return woken, nil
+}
+
+// wakeReactionsHeldFor moves the reactions held for the send sendOutboxID
+// that are due later than 1 ms after nowMS to that time. Only reactions to
+// the send's own message are held for it.
+func wakeReactionsHeldFor(
+	ctx context.Context,
+	execer interface {
+		ExecContext(context.Context, string, ...any) (sql.Result, error)
+	},
+	sendOutboxID string,
+	nowMS int64,
+) (int64, error) {
+	result, err := execer.ExecContext(ctx, `
+		UPDATE outbox
+		SET next_attempt_at_ms = ?,
+			updated_at_ms = ?
+		WHERE kind = 'reaction'
+		  AND state = 'not_dispatched'
+		  AND error_code = ?
+		  AND next_attempt_at_ms > ?
+		  AND outbox_id IN (
+		      SELECT r.outbox_id
+		      FROM outbox_reactions AS r
+		      JOIN outbox AS send ON send.local_message_id = r.target_message_id
+		      WHERE send.outbox_id = ?
+		  )
+	`, nowMS+1, nowMS, ReactionTargetUnsentCode, nowMS+1, sendOutboxID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }
 
 // Cancel transitions pending work to a terminal canceled state. Active or
@@ -1418,7 +1503,12 @@ func (r *OutboxRepository) Cancel(ctx context.Context, outboxID string) error {
 	if err != nil {
 		return err
 	}
-	result, err := r.store.db.ExecContext(ctx, `
+	tx, err := r.store.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("cancel outbox item %q: begin transaction: %w", outboxID, err)
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `
 		UPDATE outbox
 		SET state = 'canceled',
 			next_attempt_at_ms = NULL,
@@ -1429,7 +1519,7 @@ func (r *OutboxRepository) Cancel(ctx context.Context, outboxID string) error {
 	if err != nil {
 		return fmt.Errorf("cancel outbox item %q: %w", outboxID, err)
 	}
-	return r.requireStateMutation(ctx, "cancel", outboxID, result)
+	return r.commitSendStateChange(ctx, tx, "cancel", outboxID, nowMS, result)
 }
 
 // MarkUncertain records an unknown outcome after the transport call boundary.
