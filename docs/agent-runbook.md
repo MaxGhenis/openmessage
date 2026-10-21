@@ -1771,8 +1771,10 @@ the `error_detail` column of the `outbox` table in the v2 store:
     `dispatching`, `not_dispatched`) never gets this far: the dispatcher holds
     the reaction before the adapter (`error_code: reaction_target_unsent`, see
     "Reactions stuck retrying" below), and it goes out once the send is
-    confirmed under its timestamp. A canceled or failed send: never. An
-    uncertain one: not while it is unresolved. Also a send Signal accepted
+    confirmed under its timestamp. A canceled or rejected send never gets
+    this far either: the dispatcher rejects the reaction
+    (`reaction_target_never_sent`). An uncertain one: not while it is
+    unresolved. Also a send Signal accepted
     whose local confirm failed (`store_failed`): the outbox row holds the
     timestamp as its result, but the message is not moved to it until that
     confirm is repaired (`RepairStoreFailed`).
@@ -1841,7 +1843,7 @@ legacy senders unchanged.
   |---|---|---|
   | 200 | `success: true` | The platform accepted it (`confirmed`, or `store_failed`). |
   | 202 | `success: true, queued: true` | Stored, not delivered yet (`queued`, `dispatching`, `not_dispatched`). The app keeps retrying it; do not react again. A reaction to your own message that has not been sent yet (a scheduled send) waits here for it (`error_code: reaction_target_unsent`). |
-  | 502 | `error` | `uncertain` (the transport call ended without an answer: it may have been applied) or `rejected` (the platform refused it, for example Google's phone answering `success: false` for a message whose ID will not change, stored as `error_class: unsupported`; it is not retried). |
+  | 502 | `error` | `uncertain` (the transport call ended without an answer: it may have been applied) or `rejected` (the platform refused it, for example Google's phone answering `success: false` for a message whose ID will not change, stored as `error_class: unsupported`; it is not retried). A reaction to your own message whose send was canceled or rejected is `rejected` before any transport call (`error_code: reaction_target_never_sent`, error "the message it reacts to was never sent"). |
   | 409 | `error` | `canceled` before it was sent. |
   | 422 | `reaction_target_unavailable` | No v2 message with that ID, or not in that conversation. Nothing was queued. |
   | 501 | `error` | The account has no reaction sender (an import-only platform). |
@@ -1913,8 +1915,9 @@ A WhatsApp send goes out under an ID derived from its request ID
 (`whatsapplive.deriveWebMessageID`), and its message is renamed to that ID
 when the send is confirmed. Until then the message is still named by the
 request ID itself, an ID WhatsApp never sees. So a reaction to a WhatsApp
-message of yours that has not been sent yet is held (see "Reactions stuck
-retrying" below) rather than addressed to that ID. One sent but `uncertain`
+message of yours that has not been sent yet is held, and one to a message
+whose send was canceled is rejected (see "Reactions stuck retrying" below),
+rather than addressed to that ID. One sent but `uncertain`
 or `store_failed` is still named by the request ID, and a reaction to it is
 still addressed to that ID, which no WhatsApp message has.
 
@@ -1942,15 +1945,28 @@ ID (Google's TmpID) depends on how far that send has got
   due (a scheduled send's time, or a retrying send's next attempt), and never
   sooner than 5 s. So a reaction to a message scheduled for tomorrow waits for
   tomorrow, and the dispatcher, which takes due rows in the order they fell
-  due, sends the message first. Retrying or canceling the send early does not
-  move the reaction's time; `POST /api/v1/outbox/<reaction id>/retry` makes it
-  due now (it is held again if the send still has not gone out). Before, the
-  reaction went to the transport with the request ID: on Google the phone
-  refused it and the refusal was retried every 5 s until someone canceled it,
-  WhatsApp addressed it to an ID no WhatsApp message has (above), and Signal
-  refused it before signal-cli, every 5 s.
+  due, sends the message first. Retrying the send early
+  (`POST /api/v1/outbox/<send id>/retry`) or canceling it makes the reactions
+  held for it due 1 ms later, in the same transaction
+  (`OutboxRepository.Cancel`, `RetryNotDispatched`): they follow a retried
+  send at once, and a canceled send's reactions are rejected (next bullet).
+  Before, the reaction went to the transport with the request ID: Google
+  asked the phone with the TmpID, and a refusal was retried every 5 s until
+  the send went out and its echo renamed the message, or someone canceled the
+  reaction; WhatsApp addressed it to an ID no WhatsApp message has (above);
+  Signal refused it before signal-cli, every 5 s.
+- **Never sent** (`canceled`, or `rejected` by the platform). The platform
+  never got the message and never will, so the dispatcher rejects the
+  reaction before the transport call: `rejected`, `error_class:
+  unsupported`, `error_code: reaction_target_never_sent`, and `/api/react`
+  answers 502 "the message it reacts to was never sent". Before, it went to
+  the transport naming the request ID: Google asked the phone and rejected
+  the reaction on its refusal, WhatsApp addressed it to no message and
+  recorded it as sent, and Signal retried it every 5 s for good.
 - **Sent less than a minute ago** (`confirmed` and waiting for the echo,
-  `uncertain`, or `store_failed`, timed from the send row's `updated_at_ms`).
+  `uncertain`, or `store_failed`, timed from the send row's `updated_at_ms`:
+  when the transport's answer was recorded, or later lease recovery or a
+  reconcile).
   The phone's echo may still rename the message to the phone's own ID, so the
   dispatcher marks the target `ProvisionalRemoteID`. A refusal of it goes
   `not_dispatched` (`error_detail` `send_reaction: transient: Google Messages
@@ -1962,14 +1978,15 @@ ID (Google's TmpID) depends on how far that send has got
   (`internal/storage/sqlite/uncorrelated_echo.go`) considers an echo at all.
   On the live install all 44 measured echoes were first seen 0.28-0.79 s
   after their send, and pairing by content takes one only within about
-  6.2 s. An echo that never pairs leaves the message on its TmpID for good.
-  On the live install that is every media send: its phone sent every echo
-  without a TmpID when this was checked (2026-10-16), and content pairing
-  takes text sends only. So a
-  refused reaction to such a message is sent at most about 13 times (once per
-  5 s for the minute, then the final one), where before it was sent every 5 s
-  until canceled. If the phone did not have the message yet, react again once
-  it does.
+  6.2 s. On the live install the phone sent every echo without a TmpID when
+  this was checked (2026-10-16), and content pairing takes text sends only,
+  so a media send keeps its TmpID for good. (A text whose echo was stored
+  before its send was recorded can still be paired after the minute, by the
+  startup repair or a later frame for the message; every measured echo
+  arrived after.) A refused reaction to a message that keeps its TmpID is
+  now sent at most 13 times (once per 5 s for the minute, then the final
+  one), where before it was sent every 5 s for as long as the message kept
+  it. If the phone did not have the message yet, react again once it does.
 
 Find the reactions still retrying with:
 

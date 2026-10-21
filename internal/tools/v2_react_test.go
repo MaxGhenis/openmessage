@@ -502,3 +502,13 @@ func TestV2ReactionTextSaysAHeldReactionWaitsForItsMessage(t *testing.T) {
 		}
 	}
 }
+
+// A reaction rejected because its own target was never sent says so, rather
+// than reading as a platform refusal.
+func TestV2ReactionTextSaysANeverSentTargetHasNothingToReactTo(t *testing.T) {
+	text := v2ReactionText("outbox-1", messaging.OutboxRejected, "unsupported", "reaction_target_never_sent", "")
+	if !strings.Contains(text, "outbox-1") || !strings.Contains(text, "was never sent") ||
+		strings.Contains(text, "The platform refused this reaction") {
+		t.Fatalf("never-sent target text = %q, want it to say the message was never sent, not that the platform refused", text)
+	}
+}

@@ -91,11 +91,12 @@ type MessageRef struct {
 	// is still the request ID its send was given and the platform may yet
 	// give it its own: the send has not gone out, or went out (confirmed and
 	// waiting for the echo that brings the platform's ID, uncertain, or
-	// store_failed) less than a minute ago, the longest echo pairing waits
-	// for an echo. A send that was canceled or rejected never gets one, so it
-	// is not set. The dispatcher holds a reaction to a message whose send has
-	// not gone out before the transport call, so a reaction ref with this set
-	// always names a message that went out.
+	// store_failed) less than a minute ago. A minute is the longest lag after
+	// a send at which echo pairing considers an echo at all. A send that was
+	// canceled or rejected never gets one, so it is not set. The dispatcher
+	// holds a reaction to a message whose send has not gone out, and rejects
+	// one to a message whose send never will, before the transport call, so a
+	// reaction ref with this set always names a message that went out.
 	ProvisionalRemoteID bool
 	SentAt              time.Time
 	// Text, HasAttachment and AttachmentMIME are filled for reply targets

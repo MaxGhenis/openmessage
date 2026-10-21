@@ -535,7 +535,7 @@ func (s *MessageService) dispatchReactionLease(ctx context.Context, outboxLease 
 			s.clock.Now().Add(s.retryDelay),
 		)
 	}
-	target, unsentSend, code, err := s.targetRefForLease(ctx, item, reaction.TargetMessageID)
+	target, send, code, err := s.targetRefForLease(ctx, item, reaction.TargetMessageID)
 	if err != nil {
 		return s.markPreCallFailure(
 			ctx,
@@ -546,7 +546,8 @@ func (s *MessageService) dispatchReactionLease(ctx context.Context, outboxLease 
 			s.clock.Now().Add(s.retryDelay),
 		)
 	}
-	if unsentSend != nil {
+	switch {
+	case send != nil && send.progress == sendUnsent:
 		// The target is this account's message whose send has not gone out,
 		// so the platform has no message to react to yet. Sending would name
 		// a message nobody has (on Google the phone may refuse it, on
@@ -556,13 +557,28 @@ func (s *MessageService) dispatchReactionLease(ctx context.Context, outboxLease 
 			ctx,
 			item,
 			string(bridge.FailureTransient),
-			"reaction_target_unsent",
+			sqlite.ReactionTargetUnsentCode,
 			fmt.Errorf(
 				"the message this reaction targets has not been sent yet (its send %s is %s)",
-				unsentSend.OutboxID,
-				unsentSend.State,
+				send.row.OutboxID,
+				send.row.State,
 			),
-			s.unsentTargetRetryAt(*unsentSend),
+			s.unsentTargetRetryAt(send.row),
+		)
+	case send != nil && send.progress == sendNeverSent:
+		// The target is this account's message whose send was canceled or
+		// rejected: the platform never got it and never will, so there is
+		// nothing to react to.
+		return s.rejectPreCall(
+			ctx,
+			item,
+			string(bridge.FailureUnsupported),
+			reactionTargetNeverSentCode,
+			fmt.Errorf(
+				"the message this reaction targets was never sent (its send %s is %s)",
+				send.row.OutboxID,
+				send.row.State,
+			),
 		)
 	}
 	conversation, err := s.store.GetConversation(item.ConversationID)
@@ -703,6 +719,8 @@ func (s *MessageService) dispatchReadLease(ctx context.Context, outboxLease sqli
 			s.clock.Now().Add(s.retryDelay),
 		)
 	}
+	// A read receipt is not held for its target's send: it names how far the
+	// conversation is read, not one message that must exist on the platform.
 	target, _, code, err := s.targetRefForLease(ctx, item, receipt.LastReadMessageID)
 	if err != nil {
 		return s.markPreCallFailure(
@@ -785,13 +803,14 @@ func (s *MessageService) dispatchReadLease(ctx context.Context, outboxLease sqli
 }
 
 // targetRefForLease describes the message a reaction or read receipt names.
-// unsentSend is the send of an own target whose send has not gone out (see
-// targetSendProgress), and nil for any other target.
+// send is the send that named an own target under its request ID, which the
+// target still carries (see targetSendProgress), and nil for any other
+// target.
 func (s *MessageService) targetRefForLease(
 	ctx context.Context,
 	item sqlite.OutboxItem,
 	targetMessageID string,
-) (ref bridge.MessageRef, unsentSend *sqlite.OutboxItem, code string, err error) {
+) (ref bridge.MessageRef, send *ownSend, code string, err error) {
 	target, err := s.messages.GetMessage(ctx, targetMessageID)
 	if err != nil {
 		return bridge.MessageRef{}, nil, "load_target", err
@@ -808,12 +827,9 @@ func (s *MessageService) targetRefForLease(
 	}
 	// Until echo reconciliation, an outgoing target's RemoteID remains its
 	// stable transport request ID.
-	send, unsent, provisional, err := s.targetSendProgress(ctx, target)
+	send, provisional, err := s.targetSendProgress(ctx, target)
 	if err != nil {
 		return bridge.MessageRef{}, nil, "load_target", err
-	}
-	if unsent {
-		unsentSend = &send
 	}
 	return bridge.MessageRef{
 		RemoteID:            target.RemoteMessageID,
@@ -821,51 +837,78 @@ func (s *MessageService) targetRefForLease(
 		Outgoing:            target.Direction == sqlite.MessageDirectionOutgoing,
 		ProvisionalRemoteID: provisional,
 		SentAt:              time.UnixMilli(target.OccurredAtMS),
-	}, unsentSend, "", nil
+	}, send, "", nil
 }
+
+// reactionTargetNeverSentCode is the error code of a reaction rejected before
+// the transport call because its target's send was canceled or rejected.
+const reactionTargetNeverSentCode = "reaction_target_never_sent"
 
 // provisionalTargetWindow is how long after its send went out an own message
 // still named by that send's request ID may yet be renamed by the echo that
-// brings the platform's own ID. "Went out" is the send row's updated_at_ms,
-// when the dispatcher recorded the transport's answer: the time echo pairing
-// measures from. It is sqlite.EchoMaxLag (60 s), the longest lag at which
-// pairing considers an echo at all. On the live install every echo was first
-// seen 0.28-0.79 s after its send, and pairing by content takes one only
-// within about 6.2 s (an echo that carries its TmpID is correlated whenever it
-// arrives; nothing in the code bounds that). Past the window a Google refusal
-// of a reaction to the message is final, instead of being retried every 5 s
-// for as long as the message keeps its request ID, which is for good when no
-// echo pairs: content pairing takes text sends only, and only in that window.
+// brings the platform's own ID. "Went out" is the send row's updated_at_ms:
+// when the dispatcher recorded the transport's answer, or later when lease
+// recovery marked the send uncertain or a reconcile confirmed it. It is the
+// time echo pairing measures from. It is sqlite.EchoMaxLag (60 s), the
+// longest lag at which pairing considers an echo at all. On the live install
+// every echo was first seen 0.28-0.79 s after its send, and pairing by
+// content takes one only within about 6.2 s (an echo that carries its TmpID
+// is correlated whenever it arrives; nothing in the code bounds that). Past
+// the window a Google refusal of a reaction to the message is final, instead
+// of being retried every 5 s for as long as the message keeps its request
+// ID. Content pairing takes text sends only, so with no TmpID on the echo a
+// media send keeps its request ID for good. (A text echo stored before its
+// send was recorded can still be paired after the window, by the startup
+// repair or a later frame for the message; every echo measured on the live
+// store arrived after.)
 const provisionalTargetWindow = sqlite.EchoMaxLag
 
-// targetSendProgress says how far the send has got that named an outgoing
-// message under its request ID, when the message still carries that ID.
-//
-//   - unsent: the send has not gone out (queued, dispatching or
-//     not_dispatched), so the platform has no such message yet.
-//   - provisional: the platform may still give the message its own ID: the
-//     send is unsent, or went out (confirmed and waiting for its echo,
-//     uncertain, or store_failed) less than provisionalTargetWindow ago.
-//
-// Neither holds for any other message: a received one, one already renamed
-// to the platform's ID, or one whose send was canceled or rejected (it never
-// gets the platform's ID). send is the send's row when the message has one.
+// ownSend is the send that named an own message under its request ID, which
+// the message still carries, and how far that send has got.
+type ownSend struct {
+	row      sqlite.OutboxItem
+	progress sendProgress
+}
+
+type sendProgress int
+
+const (
+	// sendUnsent: queued, dispatching or not_dispatched. The platform has no
+	// such message yet.
+	sendUnsent sendProgress = iota + 1
+	// sendNeverSent: canceled or rejected. The platform never got the
+	// message and never will.
+	sendNeverSent
+	// sendWentOut: confirmed and waiting for its echo, uncertain, or
+	// store_failed.
+	sendWentOut
+)
+
+// targetSendProgress finds the send that named an outgoing message under its
+// request ID, when the message still carries that ID, and says whether the
+// message's remote ID is provisional: the platform may still give the message
+// its own ID, because the send is unsent, or went out less than
+// provisionalTargetWindow ago. send is nil for any other message: a received
+// one, or one already renamed to the platform's ID.
 func (s *MessageService) targetSendProgress(
 	ctx context.Context,
 	message sqlite.Message,
-) (send sqlite.OutboxItem, unsent, provisional bool, err error) {
-	send, found, err := s.ownSendRow(ctx, message.AccountID, message)
+) (send *ownSend, provisional bool, err error) {
+	row, found, err := s.ownSendRow(ctx, message.AccountID, message)
 	if err != nil || !found {
-		return sqlite.OutboxItem{}, false, false, err
+		return nil, false, err
 	}
-	switch send.State {
+	switch row.State {
 	case sqlite.OutboxQueued, sqlite.OutboxDispatching, sqlite.OutboxNotDispatched:
-		return send, true, true, nil
+		return &ownSend{row: row, progress: sendUnsent}, true, nil
+	case sqlite.OutboxCanceled, sqlite.OutboxRejected:
+		return &ownSend{row: row, progress: sendNeverSent}, false, nil
 	case sqlite.OutboxConfirmed, sqlite.OutboxUncertain, sqlite.OutboxStoreFailed:
-		wentOut := time.UnixMilli(send.UpdatedAtMS)
-		return send, false, s.clock.Now().Before(wentOut.Add(provisionalTargetWindow)), nil
+		wentOut := time.UnixMilli(row.UpdatedAtMS)
+		return &ownSend{row: row, progress: sendWentOut},
+			s.clock.Now().Before(wentOut.Add(provisionalTargetWindow)), nil
 	default:
-		return send, false, false, nil
+		return nil, false, nil
 	}
 }
 

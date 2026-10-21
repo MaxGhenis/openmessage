@@ -303,7 +303,8 @@ func TestGoogleReactionToOwnMessageRetriesUntilItsEchoNamesIt(t *testing.T) {
 		t.Fatalf("delivery of a refused reaction to a reconciled own message = %+v, want rejected", delivery)
 	}
 
-	// A canceled send never gets the phone's ID, so a refusal is final too.
+	// A canceled send never reached the phone, so a reaction to its message
+	// is rejected without asking the phone.
 	later := f.common()
 	later.NotBefore = f.clock.Now().Add(24 * time.Hour)
 	canceled, err := f.service.SendText(f.ctx, messaging.SendTextCommand{CommonCommand: later, Body: "never sent"})
@@ -313,18 +314,22 @@ func TestGoogleReactionToOwnMessageRetriesUntilItsEchoNamesIt(t *testing.T) {
 	if _, err := f.service.Cancel(f.ctx, canceled.OutboxID); err != nil {
 		t.Fatalf("Cancel(): %v", err)
 	}
+	callsBefore := f.reaction.sendCalls
 	toCanceled := f.react(canceled.LocalMessageID)
 	f.dispatch(1)
-	if delivery := f.delivery(toCanceled.OutboxID); delivery.State != messaging.OutboxRejected {
-		t.Fatalf("delivery of a refused reaction to a canceled send = %+v, want rejected", delivery)
+	if delivery := f.delivery(toCanceled.OutboxID); delivery.State != messaging.OutboxRejected ||
+		delivery.ErrorCode != "reaction_target_never_sent" || f.reaction.sendCalls != callsBefore {
+		t.Fatalf("delivery of a reaction to a canceled send = %+v after %d phone calls, want rejected (reaction_target_never_sent) without one",
+			delivery, f.reaction.sendCalls-callsBefore)
 	}
 }
 
 // A reaction to a message this account has scheduled but not sent asks the
 // phone nothing: the phone has no such message, so the reaction waits for the
 // send. Before, it was sent every 5 s naming the send's TmpID, the phone
-// refused it, and the refusal was retried until someone canceled the reaction.
-// Once the send goes out the reaction follows it.
+// refused it, and the refusal was retried until the send went out and its
+// echo renamed the message, or someone canceled the reaction. Once the send
+// goes out the reaction follows it.
 func TestGoogleReactionToAScheduledSendWaitsWithoutCallingThePhone(t *testing.T) {
 	f := newReactionDispatchFixture(t)
 	later := f.common()
@@ -376,7 +381,7 @@ func TestGoogleReactionToAScheduledSendWaitsWithoutCallingThePhone(t *testing.T)
 // content, within seconds) keeps that TmpID for good. The phone's refusal is
 // retried while the echo could still rename the message, and is final once
 // provisionalTargetWindow (one minute) has passed since the send went out.
-// Before, it was retried every 5 s with no end.
+// Before, it was retried every 5 s for as long as the message kept the TmpID.
 func TestGoogleRefusalOfAnUnpairedOwnMessageIsFinalAfterTheEchoWindow(t *testing.T) {
 	f := newReactionDispatchFixture(t)
 	sent, err := f.service.SendText(f.ctx, messaging.SendTextCommand{CommonCommand: f.common(), Body: "no echo will pair"})

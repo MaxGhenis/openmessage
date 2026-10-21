@@ -180,10 +180,13 @@ func v2ReactionText(outboxID string, state messaging.OutboxState, errorClass, er
 		return fmt.Sprintf("The reaction's outcome is unknown (outbox %s): the platform may have applied it. Read the message's reactions before reacting again.", outboxID)
 	case messaging.OutboxRejected:
 		text := fmt.Sprintf("The reaction was rejected (outbox %s, error class %s). The app will not retry it.", outboxID, firstNonEmpty(errorClass, "unknown"))
-		if errorClass == string(bridge.FailureUnsupported) && errorCode == "send_reaction" {
+		switch {
+		case errorClass == string(bridge.FailureUnsupported) && errorCode == "send_reaction":
 			// An account that cannot react at all is rejected before the
 			// transport with code reactions_unsupported instead.
 			text += " The platform refused this reaction, or the message it targets cannot be named: it was refused for this message, not because the platform lacks reactions."
+		case errorCode == "reaction_target_never_sent":
+			text += " The message it reacts to is your own and was never sent (its send was canceled or refused), so there is nothing to react to."
 		}
 		return text
 	case messaging.OutboxCanceled:
@@ -196,7 +199,7 @@ func v2ReactionText(outboxID string, state messaging.OutboxState, errorClass, er
 		if errorCode == "reaction_target_unsent" {
 			// The dispatcher holds a reaction whose target is this
 			// account's own message that has not been sent yet.
-			text += " It is waiting for the message it reacts to, which has not been sent yet, and goes out after that message does."
+			text += " It is waiting for the message it reacts to, which has not been sent yet, and goes out after that message does (if that message is canceled instead, the reaction is rejected)."
 		}
 		if idempotencyKey != "" {
 			text += fmt.Sprintf(" To repeat this exact reaction deliberately, reuse idempotency_key %s.", idempotencyKey)

@@ -189,8 +189,9 @@ func TestDescribedReplyRefStatesWhoSentTheQuotedMessage(t *testing.T) {
 //
 //   - The ref names the target message's current remote ID: its outbox
 //     request ID until the transport confirms the send, then the transport's.
-//     A reaction to a send that has not gone out is not mapped at all: it is
-//     held before the transport call (reaction_target_unsent).
+//     A reaction to a send that has not gone out, or never will (canceled),
+//     is not mapped at all: it is held (reaction_target_unsent) or rejected
+//     (reaction_target_never_sent) before the transport call.
 //   - Outgoing is set exactly for a message this account sent, whether or not
 //     the stored message names a sender.
 //   - AuthorID is the sender's canonical value, "" when the message names
@@ -210,7 +211,9 @@ type reactionRefCase struct {
 	name     string
 	targetID string // local message ID the reaction targets
 	want     bridge.MessageRef
-	unsent   bool // the target's send has not gone out, so the reaction is held
+	// stopCode is set when the reaction stops before the transport call:
+	// reaction_target_unsent (held) or reaction_target_never_sent (rejected).
+	stopCode string
 }
 
 func checkReactionTargetRefInvariants(t *testing.T, seed int64) {
@@ -316,15 +319,15 @@ func checkReactionTargetRefInvariants(t *testing.T, seed int64) {
 		}
 		cases = append(cases, reactionRefCase{
 			name: submission.LocalMessageID, targetID: submission.LocalMessageID,
-			want:   bridge.MessageRef{RemoteID: wantRemote, Outgoing: true, SentAt: time.UnixMilli(occurredMS)},
-			unsent: fate == 2,
+			want:     bridge.MessageRef{RemoteID: wantRemote, Outgoing: true, SentAt: time.UnixMilli(occurredMS)},
+			stopCode: map[int]string{1: "reaction_target_never_sent", 2: "reaction_target_unsent"}[fate],
 		})
 		clock.Advance(time.Second)
 	}
 
 	random.Shuffle(len(cases), func(i, j int) { cases[i], cases[j] = cases[j], cases[i] })
 	for index, tc := range cases {
-		if tc.unsent {
+		if tc.stopCode != "" {
 			reaction := mustSendDispatchReaction(t, service, SendReactionCommand{
 				CommonCommand:   testCommonCommand(fmt.Sprintf("reaction-%d", index)),
 				TargetMessageID: tc.targetID,
@@ -335,12 +338,13 @@ func checkReactionTargetRefInvariants(t *testing.T, seed int64) {
 				t.Fatalf("seed %d case %s: DispatchDue = %d, %v", seed, tc.name, processed, err)
 			}
 			row := mustOutboxItem(t, service, reaction.OutboxID)
-			if reactions.requestCount() != before || row.State != sqlite.OutboxNotDispatched ||
-				row.ErrorCode == nil || *row.ErrorCode != "reaction_target_unsent" {
-				t.Fatalf("seed %d case %s: reaction to an unsent send = %+v, want it held uncalled", seed, tc.name, row)
+			if reactions.requestCount() != before || row.ErrorCode == nil || *row.ErrorCode != tc.stopCode {
+				t.Fatalf("seed %d case %s: reaction = %+v, want it stopped uncalled with %s", seed, tc.name, row, tc.stopCode)
 			}
-			if _, err := service.Cancel(context.Background(), reaction.OutboxID); err != nil {
-				t.Fatalf("seed %d case %s: Cancel(held reaction): %v", seed, tc.name, err)
+			if row.State == sqlite.OutboxNotDispatched {
+				if _, err := service.Cancel(context.Background(), reaction.OutboxID); err != nil {
+					t.Fatalf("seed %d case %s: Cancel(held reaction): %v", seed, tc.name, err)
+				}
 			}
 			continue
 		}

@@ -78,6 +78,9 @@ func TestQueuedReactionSurvivesRestartAndMapsRequest(t *testing.T) {
 	}
 }
 
+// A reaction to a message this account sent, which the platform has named,
+// names it by that ID as this account's own: an empty author, outgoing, and
+// not provisional.
 func TestReactionToOwnOutgoingMessageMapsEmptyAuthor(t *testing.T) {
 	clock := newManualClock(messagingTestTime)
 	store := openMessagingTestStore(t, clock.Now())
@@ -88,11 +91,10 @@ func TestReactionToOwnOutgoingMessageMapsEmptyAuthor(t *testing.T) {
 	registry.setReactionSender(sender)
 	registry.setAvailable(true)
 	service := newMessagingTestService(t, store, registry, clock)
-	target := mustCanceledDispatchTarget(t, service, "reaction-own-target")
-	targetRow := mustOutboxItem(t, service, target.OutboxID)
+	target := mustSentDispatchTarget(t, store, clock, "reaction-own-target")
 	mustSendDispatchReaction(t, service, SendReactionCommand{
 		CommonCommand:   testCommonCommand("reaction-own"),
-		TargetMessageID: target.LocalMessageID,
+		TargetMessageID: target.MessageID,
 		Emoji:           "👍",
 	})
 
@@ -100,14 +102,10 @@ func TestReactionToOwnOutgoingMessageMapsEmptyAuthor(t *testing.T) {
 		t.Fatalf("DispatchDue(own reaction) = %d, %v; want 1, nil", processed, err)
 	}
 	requests := sender.snapshotRequests()
-	if len(requests) != 1 || requests[0].Target.RemoteID != targetRow.TransportRequestID ||
-		requests[0].Target.AuthorID != "" || !requests[0].Target.Outgoing {
-		t.Fatalf("own-target reaction request = %+v, want request ID target and empty author", requests)
-	}
-	// A canceled send never gets the platform's own ID, so its request ID
-	// is not provisional: it is the only name the message will ever have.
-	if requests[0].Target.ProvisionalRemoteID {
-		t.Fatalf("own-target reaction request = %+v, want a canceled send's ID not marked provisional", requests[0])
+	if len(requests) != 1 || requests[0].Target.RemoteID != target.RemoteMessageID ||
+		requests[0].Target.AuthorID != "" || !requests[0].Target.Outgoing ||
+		requests[0].Target.ProvisionalRemoteID {
+		t.Fatalf("own-target reaction request = %+v, want the platform's ID, empty author, outgoing, not provisional", requests)
 	}
 }
 
@@ -405,10 +403,10 @@ func TestDuplicateReactionReturnsSameSubmissionAndDispatchesOnce(t *testing.T) {
 	registry.setReactionSender(sender)
 	registry.setAvailable(true)
 	service := newMessagingTestService(t, store, registry, clock)
-	target := mustCanceledDispatchTarget(t, service, "reaction-dedup-target")
+	target := mustSentDispatchTarget(t, store, clock, "reaction-dedup-target")
 	command := SendReactionCommand{
 		CommonCommand:   testCommonCommand("reaction-dedup"),
-		TargetMessageID: target.LocalMessageID,
+		TargetMessageID: target.MessageID,
 		Emoji:           "👍",
 		Action:          bridge.ReactionAdd,
 	}
@@ -435,17 +433,17 @@ func TestReactionToggleDispatchesAddThenRemove(t *testing.T) {
 	registry.setReactionSender(sender)
 	registry.setAvailable(true)
 	service := newMessagingTestService(t, store, registry, clock)
-	target := mustCanceledDispatchTarget(t, service, "reaction-toggle-target")
+	target := mustSentDispatchTarget(t, store, clock, "reaction-toggle-target")
 	mustSendDispatchReaction(t, service, SendReactionCommand{
 		CommonCommand:   testCommonCommand("reaction-toggle-add"),
-		TargetMessageID: target.LocalMessageID,
+		TargetMessageID: target.MessageID,
 		Emoji:           "👍",
 		Action:          bridge.ReactionAdd,
 	})
 	clock.Advance(time.Millisecond)
 	mustSendDispatchReaction(t, service, SendReactionCommand{
 		CommonCommand:   testCommonCommand("reaction-toggle-remove"),
-		TargetMessageID: target.LocalMessageID,
+		TargetMessageID: target.MessageID,
 		Emoji:           "👍",
 		Action:          bridge.ReactionRemove,
 	})
@@ -468,10 +466,10 @@ func TestReactionSuccessWithoutRemoteMessageIDConfirms(t *testing.T) {
 	registry.setReactionSender(sender)
 	registry.setAvailable(true)
 	service := newMessagingTestService(t, store, registry, clock)
-	target := mustCanceledDispatchTarget(t, service, "reaction-idless-target")
+	target := mustSentDispatchTarget(t, store, clock, "reaction-idless-target")
 	submission := mustSendDispatchReaction(t, service, SendReactionCommand{
 		CommonCommand:   testCommonCommand("reaction-idless-success"),
-		TargetMessageID: target.LocalMessageID,
+		TargetMessageID: target.MessageID,
 		Emoji:           "👍",
 	})
 
@@ -496,10 +494,10 @@ func TestReactionSuccessWithRemoteMessageIDConfirms(t *testing.T) {
 	registry.setReactionSender(sender)
 	registry.setAvailable(true)
 	service := newMessagingTestService(t, store, registry, clock)
-	target := mustCanceledDispatchTarget(t, service, "reaction-id-target")
+	target := mustSentDispatchTarget(t, store, clock, "reaction-id-target")
 	submission := mustSendDispatchReaction(t, service, SendReactionCommand{
 		CommonCommand:   testCommonCommand("reaction-id-success"),
-		TargetMessageID: target.LocalMessageID,
+		TargetMessageID: target.MessageID,
 		Emoji:           "👍",
 	})
 
@@ -525,10 +523,10 @@ func TestPostCallReactionTimeoutBecomesUncertainAndIsNotRedispatched(t *testing.
 	registry.setReactionSender(sender)
 	registry.setAvailable(true)
 	service := newMessagingTestService(t, store, registry, clock)
-	target := mustCanceledDispatchTarget(t, service, "reaction-timeout-target")
+	target := mustSentDispatchTarget(t, store, clock, "reaction-timeout-target")
 	submission := mustSendDispatchReaction(t, service, SendReactionCommand{
 		CommonCommand:   testCommonCommand("reaction-timeout"),
-		TargetMessageID: target.LocalMessageID,
+		TargetMessageID: target.MessageID,
 		Emoji:           "👍",
 	})
 
@@ -572,6 +570,26 @@ func (r nilCapabilityLeaseRegistry) Acquire(
 	}, nil
 }
 
+// mustSentDispatchTarget stores a message this account sent that the
+// platform has already named (as a message sent from the phone is), so a
+// reaction to it goes to the transport.
+func mustSentDispatchTarget(t *testing.T, store *sqlite.Store, clock Clock, key string) sqlite.Message {
+	t.Helper()
+	return mustProjectDispatchMessage(t, store, clock, sqlite.Message{
+		MessageID:       "message-" + key,
+		ConversationID:  "conversation-1",
+		AccountID:       "account-1",
+		RemoteMessageID: "platform-" + key,
+		Direction:       sqlite.MessageDirectionOutgoing,
+		Body:            "dispatch target",
+		State:           sqlite.MessageStateActive,
+		OccurredAtMS:    clock.Now().Add(-time.Minute).UnixMilli(),
+	})
+}
+
+// mustCanceledDispatchTarget queues a send and cancels it. A reaction to its
+// message is rejected before the transport call (the message was never
+// sent), so it serves tests that stop before the target is loaded.
 func mustCanceledDispatchTarget(
 	t *testing.T,
 	service *MessageService,
@@ -668,45 +686,45 @@ func mustProjectDispatchMessage(
 }
 
 // TestTargetSendProgressForEveryStateOfItsSend pins, for each outbox state of
-// the send that named an own message, whether a reaction to the message is
-// held before the transport call (the send has not gone out) and whether it
-// carries MessageRef.ProvisionalRemoteID (the send may still give the message
-// the platform's own ID): never once that is impossible (canceled, rejected)
-// or done (renamed to the platform's ID), and never for a message that row
-// did not send. Every state that went out is checked at the moment it did,
-// inside the window; TestProvisionalTargetWindowStartsWhenTheSendWentOut
-// checks its end.
+// the send that named an own message, what a reaction to the message does:
+// it is held before the transport call while the send has not gone out,
+// rejected before it when the send never will (canceled, rejected), and
+// otherwise sent, carrying MessageRef.ProvisionalRemoteID while the send may
+// still give the message the platform's own ID: never once that is done
+// (renamed to the platform's ID), and never for a message that row did not
+// send. Every state that went out is checked at the moment it did, inside the
+// window; TestProvisionalTargetWindowStartsWhenTheSendWentOut checks its end.
 func TestTargetSendProgressForEveryStateOfItsSend(t *testing.T) {
 	ctx := context.Background()
 	cases := []struct {
 		name            string
 		state           sqlite.OutboxState
 		drive           func(t *testing.T, outbox *sqlite.OutboxRepository, row sqlite.OutboxItem, lease func() string)
-		wantUnsent      bool
+		wantProgress    sendProgress // 0: not named by its send's request ID
 		wantProvisional bool
 	}{
-		{name: "queued", state: sqlite.OutboxQueued, wantUnsent: true, wantProvisional: true},
-		{name: "dispatching", state: sqlite.OutboxDispatching, wantUnsent: true, wantProvisional: true, drive: func(_ *testing.T, _ *sqlite.OutboxRepository, _ sqlite.OutboxItem, lease func() string) {
+		{name: "queued", state: sqlite.OutboxQueued, wantProgress: sendUnsent, wantProvisional: true},
+		{name: "dispatching", state: sqlite.OutboxDispatching, wantProgress: sendUnsent, wantProvisional: true, drive: func(_ *testing.T, _ *sqlite.OutboxRepository, _ sqlite.OutboxItem, lease func() string) {
 			lease()
 		}},
-		{name: "not_dispatched", state: sqlite.OutboxNotDispatched, wantUnsent: true, wantProvisional: true, drive: func(t *testing.T, outbox *sqlite.OutboxRepository, row sqlite.OutboxItem, lease func() string) {
+		{name: "not_dispatched", state: sqlite.OutboxNotDispatched, wantProgress: sendUnsent, wantProvisional: true, drive: func(t *testing.T, outbox *sqlite.OutboxRepository, row sqlite.OutboxItem, lease func() string) {
 			if err := outbox.MarkNotDispatched(ctx, row.OutboxID, lease(), "transient", "send_text", "scripted", messagingTestTime.Add(72*time.Hour)); err != nil {
 				t.Fatalf("MarkNotDispatched(): %v", err)
 			}
 		}},
-		{name: "uncertain", state: sqlite.OutboxUncertain, wantProvisional: true, drive: func(t *testing.T, outbox *sqlite.OutboxRepository, row sqlite.OutboxItem, lease func() string) {
+		{name: "uncertain", state: sqlite.OutboxUncertain, wantProgress: sendWentOut, wantProvisional: true, drive: func(t *testing.T, outbox *sqlite.OutboxRepository, row sqlite.OutboxItem, lease func() string) {
 			token := mustMarkCalled(t, outbox, row, lease)
 			if err := outbox.MarkUncertain(ctx, row.OutboxID, token, "transient", "send_text", "scripted"); err != nil {
 				t.Fatalf("MarkUncertain(): %v", err)
 			}
 		}},
-		{name: "store_failed", state: sqlite.OutboxStoreFailed, wantProvisional: true, drive: func(t *testing.T, outbox *sqlite.OutboxRepository, row sqlite.OutboxItem, lease func() string) {
+		{name: "store_failed", state: sqlite.OutboxStoreFailed, wantProgress: sendWentOut, wantProvisional: true, drive: func(t *testing.T, outbox *sqlite.OutboxRepository, row sqlite.OutboxItem, lease func() string) {
 			token := mustMarkCalled(t, outbox, row, lease)
 			if err := outbox.MarkStoreFailed(ctx, row.OutboxID, token, row.TransportRequestID, "scripted"); err != nil {
 				t.Fatalf("MarkStoreFailed(): %v", err)
 			}
 		}},
-		{name: "confirmed, waiting for its echo", state: sqlite.OutboxConfirmed, wantProvisional: true, drive: func(t *testing.T, outbox *sqlite.OutboxRepository, row sqlite.OutboxItem, lease func() string) {
+		{name: "confirmed, waiting for its echo", state: sqlite.OutboxConfirmed, wantProgress: sendWentOut, wantProvisional: true, drive: func(t *testing.T, outbox *sqlite.OutboxRepository, row sqlite.OutboxItem, lease func() string) {
 			token := mustMarkCalled(t, outbox, row, lease)
 			if err := outbox.Confirm(ctx, sqlite.Confirmation{OutboxID: row.OutboxID, LeaseToken: token, ResultRemoteID: row.TransportRequestID}); err != nil {
 				t.Fatalf("Confirm(request ID): %v", err)
@@ -718,12 +736,12 @@ func TestTargetSendProgressForEveryStateOfItsSend(t *testing.T) {
 				t.Fatalf("Confirm(platform ID): %v", err)
 			}
 		}},
-		{name: "rejected", state: sqlite.OutboxRejected, drive: func(t *testing.T, outbox *sqlite.OutboxRepository, row sqlite.OutboxItem, lease func() string) {
+		{name: "rejected", state: sqlite.OutboxRejected, wantProgress: sendNeverSent, drive: func(t *testing.T, outbox *sqlite.OutboxRepository, row sqlite.OutboxItem, lease func() string) {
 			if err := outbox.Reject(ctx, row.OutboxID, lease(), "unsupported", "send_text", "scripted"); err != nil {
 				t.Fatalf("Reject(): %v", err)
 			}
 		}},
-		{name: "canceled", state: sqlite.OutboxCanceled, drive: func(t *testing.T, outbox *sqlite.OutboxRepository, row sqlite.OutboxItem, _ func() string) {
+		{name: "canceled", state: sqlite.OutboxCanceled, wantProgress: sendNeverSent, drive: func(t *testing.T, outbox *sqlite.OutboxRepository, row sqlite.OutboxItem, _ func() string) {
 			if err := outbox.Cancel(ctx, row.OutboxID); err != nil {
 				t.Fatalf("Cancel(): %v", err)
 			}
@@ -760,15 +778,23 @@ func TestTargetSendProgressForEveryStateOfItsSend(t *testing.T) {
 			if err != nil {
 				t.Fatalf("GetMessage(own message): %v", err)
 			}
-			_, unsent, provisional, err := service.targetSendProgress(ctx, target)
-			if err != nil || unsent != test.wantUnsent || provisional != test.wantProvisional {
-				t.Fatalf("targetSendProgress(%s, remote %q) = unsent %t, provisional %t, %v; want %t, %t",
-					test.name, target.RemoteMessageID, unsent, provisional, err, test.wantUnsent, test.wantProvisional)
+			send, provisional, err := service.targetSendProgress(ctx, target)
+			var progress sendProgress
+			if send != nil {
+				progress = send.progress
+				if send.row.OutboxID != sent.OutboxID {
+					t.Fatalf("targetSendProgress(%s) found send %q, want %q", test.name, send.row.OutboxID, sent.OutboxID)
+				}
+			}
+			if err != nil || progress != test.wantProgress || provisional != test.wantProvisional {
+				t.Fatalf("targetSendProgress(%s, remote %q) = progress %d, provisional %t, %v; want %d, %t",
+					test.name, target.RemoteMessageID, progress, provisional, err, test.wantProgress, test.wantProvisional)
 			}
 
 			// The dispatcher acts on it: a reaction is held uncalled while
-			// the send has not gone out, and otherwise sent, marked
-			// provisional exactly when the rule says so.
+			// the send has not gone out, rejected uncalled when it never
+			// will, and otherwise sent, marked provisional exactly when the
+			// rule says so.
 			reaction := mustSendDispatchReaction(t, service, SendReactionCommand{
 				CommonCommand:   testCommonCommand("provisional-reaction"),
 				TargetMessageID: sent.LocalMessageID,
@@ -779,10 +805,18 @@ func TestTargetSendProgressForEveryStateOfItsSend(t *testing.T) {
 			}
 			requests := sender.snapshotRequests()
 			reactionRow := mustOutboxItem(t, service, reaction.OutboxID)
-			if test.wantUnsent {
+			switch test.wantProgress {
+			case sendUnsent:
 				if len(requests) != 0 || reactionRow.State != sqlite.OutboxNotDispatched ||
 					reactionRow.ErrorCode == nil || *reactionRow.ErrorCode != "reaction_target_unsent" || reactionRow.AttemptCount != 0 {
 					t.Fatalf("reaction to a %s send: requests %+v, row %+v; want it held uncalled (reaction_target_unsent)", test.name, requests, reactionRow)
+				}
+				return
+			case sendNeverSent:
+				if len(requests) != 0 || reactionRow.State != sqlite.OutboxRejected ||
+					reactionRow.ErrorClass == nil || *reactionRow.ErrorClass != string(bridge.FailureUnsupported) ||
+					reactionRow.ErrorCode == nil || *reactionRow.ErrorCode != "reaction_target_never_sent" || reactionRow.AttemptCount != 0 {
+					t.Fatalf("reaction to a %s send: requests %+v, row %+v; want it rejected uncalled (reaction_target_never_sent)", test.name, requests, reactionRow)
 				}
 				return
 			}
@@ -824,9 +858,9 @@ func TestTargetSendProgressForEveryStateOfItsSend(t *testing.T) {
 				State:           sqlite.MessageStateActive,
 				OccurredAtMS:    clock.Now().Add(-time.Minute).UnixMilli(),
 			})
-			if _, unsent, provisional, err := service.targetSendProgress(ctx, other); err != nil || unsent || provisional {
-				t.Fatalf("targetSendProgress(%s message under a reaction row's ID) = unsent %t, provisional %t, %v; want neither",
-					direction, unsent, provisional, err)
+			if send, provisional, err := service.targetSendProgress(ctx, other); err != nil || send != nil || provisional {
+				t.Fatalf("targetSendProgress(%s message under a reaction row's ID) = %+v, provisional %t, %v; want no send, not provisional",
+					direction, send, provisional, err)
 			}
 		}
 	})
@@ -935,14 +969,21 @@ func mustMarkCalledAt(t *testing.T, outbox *sqlite.OutboxRepository, row sqlite.
 	return token
 }
 
-// TestReactionToAnOwnMessageFollowsItsSend is the property behind the hold and
-// the window, against a reference model: for any state of the send that named
-// an own message, and any time after the send's last change, a reaction to the
-// message is never handed to the transport while the send has not gone out
-// (and is next tried just after the send is next due, but not within the
-// retry delay), and otherwise goes out marked provisional exactly when the message
-// still carries the request ID of a send that went out less than
-// provisionalTargetWindow ago.
+// TestReactionToAnOwnMessageFollowsItsSend is the property behind the hold,
+// the never-sent rejection and the window, against a reference model: for any
+// state of the send that named an own message, any delay between submitting
+// the send and its last change, and any time after that change, a reaction to
+// the message
+//
+//   - is never handed to the transport while the send has not gone out, and
+//     is next tried just after the send is next due (but not within the retry
+//     delay); a dispatcher that then reaches both sends the message first and
+//     the reaction right after it, provisionally;
+//   - is rejected without a transport call when the send was canceled or
+//     rejected;
+//   - otherwise goes out, marked provisional exactly when the message still
+//     carries the request ID of a send that went out less than
+//     provisionalTargetWindow ago.
 func TestReactionToAnOwnMessageFollowsItsSend(t *testing.T) {
 	ctx := context.Background()
 	states := []string{
@@ -963,11 +1004,14 @@ func TestReactionToAnOwnMessageFollowsItsSend(t *testing.T) {
 		default:
 			afterMS = r.Int63n(3 * window)
 		}
+		// How long the send waited between submission and its last change.
+		waited := time.Duration(r.Int63n(int64(10 * time.Minute)))
 
 		clock := newManualClock(messagingTestTime)
 		store := openMessagingTestStore(t, clock.Now())
 		sender := &scriptedReactionSender{}
-		registry := newScriptedRegistry("reaction-follows-send", &scriptedTextSender{})
+		text := &scriptedTextSender{}
+		registry := newScriptedRegistry("reaction-follows-send", text)
 		registry.setReactionSender(sender)
 		registry.setAvailable(true)
 		service := newMessagingTestService(t, store, registry, clock)
@@ -976,7 +1020,7 @@ func TestReactionToAnOwnMessageFollowsItsSend(t *testing.T) {
 			t.Errorf("seed %d NewOutboxRepository(): %v", seed, err)
 			return false
 		}
-		t0 := clock.Now()
+		t0 := clock.Now().Add(waited)
 		attemptAt := t0.Add(time.Duration(afterMS) * time.Millisecond)
 		command := testCommonCommand("follows-send")
 		// A send that has not gone out must not be due when the reaction
@@ -988,6 +1032,7 @@ func TestReactionToAnOwnMessageFollowsItsSend(t *testing.T) {
 		}
 		sent := mustSendText(t, service, SendTextCommand{CommonCommand: command, Body: "own message"})
 		row := mustOutboxItem(t, service, sent.OutboxID)
+		clock.Advance(waited)
 		var retryAt time.Time
 		switch state {
 		case "queued":
@@ -1027,6 +1072,7 @@ func TestReactionToAnOwnMessageFollowsItsSend(t *testing.T) {
 
 		// The reference model.
 		requests := sender.snapshotRequests()
+		reactionRow := mustOutboxItem(t, service, reaction.OutboxID)
 		switch state {
 		case "queued", "dispatching", "not_dispatched":
 			wantNext := attemptAt.Add(defaultRetryDelay)
@@ -1035,12 +1081,41 @@ func TestReactionToAnOwnMessageFollowsItsSend(t *testing.T) {
 					wantNext = after
 				}
 			}
-			held := mustOutboxItem(t, service, reaction.OutboxID)
-			if len(requests) != 0 || held.State != sqlite.OutboxNotDispatched || held.AttemptCount != 0 ||
-				held.TransportCalledAtMS != nil || held.ErrorCode == nil || *held.ErrorCode != "reaction_target_unsent" ||
-				held.NextAttemptAtMS == nil || *held.NextAttemptAtMS != wantNext.UnixMilli() {
+			if len(requests) != 0 || reactionRow.State != sqlite.OutboxNotDispatched || reactionRow.AttemptCount != 0 ||
+				reactionRow.TransportCalledAtMS != nil || reactionRow.ErrorCode == nil || *reactionRow.ErrorCode != "reaction_target_unsent" ||
+				reactionRow.NextAttemptAtMS == nil || *reactionRow.NextAttemptAtMS != wantNext.UnixMilli() {
 				t.Errorf("seed %d (%s, +%d ms): requests %+v, reaction row %+v; want it held uncalled until %d",
-					seed, state, afterMS, requests, held, wantNext.UnixMilli())
+					seed, state, afterMS, requests, reactionRow, wantNext.UnixMilli())
+				return false
+			}
+			if state == "dispatching" {
+				// The send's lease outlives the test; nothing more is due.
+				return true
+			}
+			// When the reaction is next due the send is due too. The send
+			// goes out first, confirmed under its request ID as a Google
+			// send is, and the reaction follows it, provisionally.
+			text.mu.Lock()
+			text.steps = []sendStep{{result: bridge.SendResult{RemoteMessageID: row.TransportRequestID, EchoExpected: true}}}
+			text.mu.Unlock()
+			clock.Advance(wantNext.Sub(clock.Now()))
+			if processed, err := service.DispatchDue(ctx, 4); err != nil || processed != 2 {
+				t.Errorf("seed %d (%s): DispatchDue(when both are due) = %d, %v; want the send and the reaction", seed, state, processed, err)
+				return false
+			}
+			requests = sender.snapshotRequests()
+			if sendRow := mustOutboxItem(t, service, sent.OutboxID); sendRow.State != sqlite.OutboxConfirmed ||
+				len(requests) != 1 || requests[0].Target.RemoteID != row.TransportRequestID || !requests[0].Target.ProvisionalRemoteID {
+				t.Errorf("seed %d (%s): send %s, requests %+v; want the send confirmed and then one provisional reaction",
+					seed, state, sendRow.State, requests)
+				return false
+			}
+			return true
+		case "rejected", "canceled":
+			if len(requests) != 0 || reactionRow.State != sqlite.OutboxRejected || reactionRow.AttemptCount != 0 ||
+				reactionRow.ErrorCode == nil || *reactionRow.ErrorCode != "reaction_target_never_sent" {
+				t.Errorf("seed %d (%s): requests %+v, reaction row %+v; want it rejected uncalled (reaction_target_never_sent)",
+					seed, state, requests, reactionRow)
 				return false
 			}
 			return true
@@ -1049,7 +1124,7 @@ func TestReactionToAnOwnMessageFollowsItsSend(t *testing.T) {
 		if state == "confirmed under the platform's ID" {
 			wantRemoteID = "platform-message-id"
 		}
-		wentOut := state == "uncertain" || state == "store_failed" || state == "confirmed under its request ID"
+		wentOut := state != "confirmed under the platform's ID"
 		wantProvisional := wentOut && afterMS < window
 		if len(requests) != 1 || requests[0].Target.RemoteID != wantRemoteID ||
 			requests[0].Target.ProvisionalRemoteID != wantProvisional {
@@ -1061,5 +1136,95 @@ func TestReactionToAnOwnMessageFollowsItsSend(t *testing.T) {
 	}
 	if err := quick.Check(property, &quick.Config{MaxCount: 150, Rand: rand.New(rand.NewSource(20261021))}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// Canceling the send a reaction is held for makes the reaction due at once,
+// and it is rejected without a transport call: the message was never sent.
+// Without the wake it would wait for the canceled send's scheduled time.
+func TestCancelingAHeldReactionsSendRejectsItAtOnce(t *testing.T) {
+	ctx := context.Background()
+	clock := newManualClock(messagingTestTime)
+	store := openMessagingTestStore(t, clock.Now())
+	sender := &scriptedReactionSender{}
+	registry := newScriptedRegistry("reaction-canceled-send", &scriptedTextSender{})
+	registry.setReactionSender(sender)
+	registry.setAvailable(true)
+	service := newMessagingTestService(t, store, registry, clock)
+	scheduled := testCommonCommand("canceled-send")
+	scheduled.NotBefore = clock.Now().Add(24 * time.Hour)
+	target := mustSendText(t, service, SendTextCommand{CommonCommand: scheduled, Body: "never sent"})
+	held := mustSendDispatchReaction(t, service, SendReactionCommand{
+		CommonCommand:   testCommonCommand("canceled-send-reaction"),
+		TargetMessageID: target.LocalMessageID,
+		Emoji:           "👍",
+	})
+	if processed, err := service.DispatchDue(ctx, 4); err != nil || processed != 1 {
+		t.Fatalf("DispatchDue(hold) = %d, %v; want the reaction held", processed, err)
+	}
+
+	clock.Advance(time.Hour)
+	if _, err := service.Cancel(ctx, target.OutboxID); err != nil {
+		t.Fatalf("Cancel(send): %v", err)
+	}
+	clock.Advance(time.Millisecond)
+	if processed, err := service.DispatchDue(ctx, 4); err != nil || processed != 1 {
+		t.Fatalf("DispatchDue(after the cancel) = %d, %v; want the reaction at once", processed, err)
+	}
+	row := mustOutboxItem(t, service, held.OutboxID)
+	if sender.requestCount() != 0 || row.State != sqlite.OutboxRejected || row.AttemptCount != 0 ||
+		row.ErrorCode == nil || *row.ErrorCode != "reaction_target_never_sent" {
+		t.Fatalf("reaction after its send was canceled: %d requests, row %+v; want it rejected uncalled (reaction_target_never_sent)",
+			sender.requestCount(), row)
+	}
+}
+
+// Retrying the send a reaction is held for, before the send's own next
+// attempt, makes the reaction due just after it: the send goes out first and
+// the reaction follows, instead of waiting for the send's old retry time.
+func TestRetryingAHeldReactionsSendEarlyBringsTheReactionWithIt(t *testing.T) {
+	ctx := context.Background()
+	clock := newManualClock(messagingTestTime)
+	store := openMessagingTestStore(t, clock.Now())
+	sender := &scriptedReactionSender{}
+	text := &scriptedTextSender{}
+	registry := newScriptedRegistry("reaction-retried-send", text)
+	registry.setReactionSender(sender)
+	registry.setAvailable(true)
+	service := newMessagingTestService(t, store, registry, clock)
+	outbox, err := sqlite.NewOutboxRepository(store, clock.Now)
+	if err != nil {
+		t.Fatalf("NewOutboxRepository(): %v", err)
+	}
+	target := mustSendText(t, service, SendTextCommand{CommonCommand: testCommonCommand("retried-send"), Body: "rate limited"})
+	row := mustOutboxItem(t, service, target.OutboxID)
+	if err := outbox.MarkNotDispatched(ctx, row.OutboxID, mustLeaseSend(t, outbox, row, clock.Now()),
+		"rate_limited", "send_text", "scripted", clock.Now().Add(time.Hour)); err != nil {
+		t.Fatalf("MarkNotDispatched(): %v", err)
+	}
+	held := mustSendDispatchReaction(t, service, SendReactionCommand{
+		CommonCommand:   testCommonCommand("retried-send-reaction"),
+		TargetMessageID: target.LocalMessageID,
+		Emoji:           "👍",
+	})
+	if processed, err := service.DispatchDue(ctx, 4); err != nil || processed != 1 {
+		t.Fatalf("DispatchDue(hold) = %d, %v; want the reaction held", processed, err)
+	}
+	if next := mustOutboxItem(t, service, held.OutboxID).NextAttemptAtMS; next == nil || *next != clock.Now().Add(time.Hour).UnixMilli()+1 {
+		t.Fatalf("held reaction next attempt = %v, want just after the send's retry in an hour", next)
+	}
+
+	clock.Advance(time.Minute)
+	if _, err := service.RetryNotDispatched(ctx, target.OutboxID); err != nil {
+		t.Fatalf("RetryNotDispatched(send): %v", err)
+	}
+	text.steps = []sendStep{{result: bridge.SendResult{RemoteMessageID: "platform-retried"}}}
+	clock.Advance(time.Millisecond)
+	if processed, err := service.DispatchDue(ctx, 4); err != nil || processed != 2 {
+		t.Fatalf("DispatchDue(after the retry) = %d, %v; want the send and then the reaction", processed, err)
+	}
+	requests := sender.snapshotRequests()
+	if len(requests) != 1 || requests[0].Target.RemoteID != "platform-retried" {
+		t.Fatalf("reaction requests = %+v, want one naming the sent message's platform ID", requests)
 	}
 }
