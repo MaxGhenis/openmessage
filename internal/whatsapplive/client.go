@@ -2840,7 +2840,7 @@ func (b *Bridge) handleChatPresence(evt *waevents.ChatPresence) {
 	}
 	conversationID := waConversationID(b.canonicalJID(evt.Chat))
 	senderJID := b.canonicalJID(evt.Sender)
-	senderNumber := jidToPhone(senderJID)
+	senderNumber := b.addressForJID(senderJID)
 	senderName := b.contactDisplayName(senderJID, "")
 	if senderName == "" {
 		senderName = strings.TrimSpace(senderJID.User)
@@ -2958,7 +2958,7 @@ func (b *Bridge) upsertConversationForMessage(evt *waevents.Message) (*db.Conver
 	}
 	if participants, err := marshalParticipants([]participantJSON{{
 		Name:   firstNonEmpty(name, fallbackChatName(chatJID)),
-		Number: b.phoneForJID(chatJID),
+		Number: b.addressForJID(chatJID),
 	}}); err == nil && participants != "" {
 		convo.Participants = participants
 	}
@@ -3026,12 +3026,12 @@ func (b *Bridge) resolveSender(evt *waevents.Message, convo *db.Conversation) (s
 	if !evt.Info.IsGroup {
 		chatJID := b.canonicalJID(evt.Info.Chat)
 		name := b.contactDisplayName(chatJID, evt.Info.PushName)
-		return firstNonEmpty(name, convoName(convo), fallbackChatName(chatJID)), b.phoneForJID(chatJID)
+		return firstNonEmpty(name, convoName(convo), fallbackChatName(chatJID)), b.addressForJID(chatJID)
 	}
 
 	senderJID := b.canonicalJID(evt.Info.Sender)
 	name := b.contactDisplayName(senderJID, evt.Info.PushName)
-	return firstNonEmpty(name, fallbackChatName(senderJID)), b.phoneForJID(senderJID)
+	return firstNonEmpty(name, fallbackChatName(senderJID)), b.addressForJID(senderJID)
 }
 
 func (b *Bridge) formatMentionedBody(body string, msg *waE2E.Message, convo *db.Conversation) string {
@@ -3217,21 +3217,45 @@ func (b *Bridge) contactDisplayName(jid watypes.JID, pushName string) string {
 	return firstNonEmpty(strings.TrimSpace(pushName), b.phoneForJID(jid))
 }
 
+// phoneForJID returns the phone number jid stands for, or "" when it names
+// none or its LID's number is not known. A contact's RedactedPhone is not one:
+// it is the masked number a LID group shows a non-contact by, and its digits
+// would be stored as a phone number. contactDisplayName may still show it.
 func (b *Bridge) phoneForJID(jid watypes.JID) string {
-	jid = b.canonicalJID(jid)
-	phone := jidToPhone(jid)
-	if phone != "" {
+	return jidToPhone(b.canonicalJID(jid))
+}
+
+// addressForJID returns the form the store records a sender or chat peer by:
+// StoredAddress of the JID canonicalJID gives, so a LID whose number is known
+// is stored as that number.
+func (b *Bridge) addressForJID(jid watypes.JID) string {
+	return StoredAddress(b.canonicalJID(jid))
+}
+
+// StoredAddress returns the form the legacy store records a person's JID by:
+// the phone number of a phone-number JID, and otherwise the JID itself, such
+// as "<digits>@lid" for a LID. That is the value v2 live ingest keeps for the
+// same JID (ingest.whatsAppIdentity), so a migrated row names the identity a
+// live frame does. Storing a LID's digits as a phone number ("+<digits>")
+// would make it look like one, match phone searches, and name
+// "<digits>@s.whatsapp.net" in reactions and receipts. A JID that names a
+// chat rather than a person (a group, broadcast list or newsletter) gives "":
+// none of them is anyone's address, and an all-digit one is no phone number
+// either.
+func StoredAddress(jid watypes.JID) string {
+	jid = jid.ToNonAD()
+	if phone := jidToPhone(jid); phone != "" {
 		return phone
 	}
-	b.mu.RLock()
-	cli := b.client
-	b.mu.RUnlock()
-	if cli != nil && cli.Store != nil && cli.Store.Contacts != nil {
-		if contact, err := cli.Store.Contacts.GetContact(context.Background(), jid); err == nil && contact.Found {
-			return strings.TrimSpace(contact.RedactedPhone)
-		}
+	if strings.TrimSpace(jid.User) == "" {
+		return ""
 	}
-	return ""
+	switch jid.Server {
+	case watypes.HiddenUserServer, watypes.HostedServer, watypes.HostedLIDServer, watypes.BotServer:
+		return jid.String()
+	default:
+		return ""
+	}
 }
 
 func (b *Bridge) didOwnAccountLeaveGroup(evt *waevents.GroupInfo) bool {
@@ -3458,7 +3482,7 @@ func (b *Bridge) groupParticipantsJSON(participants []watypes.GroupParticipant) 
 		name := firstNonEmpty(strings.TrimSpace(participant.DisplayName), b.contactDisplayName(jid, ""))
 		items = append(items, participantJSON{
 			Name:   firstNonEmpty(name, fallbackChatName(jid)),
-			Number: b.phoneForJID(jid),
+			Number: b.addressForJID(jid),
 		})
 	}
 	return marshalParticipants(items)
@@ -4423,7 +4447,13 @@ func waConversationID(jid watypes.JID) string {
 	return "whatsapp:" + jid.String()
 }
 
+// jidToPhone returns the phone number a phone-number JID names, or "". Only a
+// JID on the phone-number server names one: a LID ("<digits>@lid"), a group
+// or a newsletter also has an all-digit user, which is no phone number.
 func jidToPhone(jid watypes.JID) string {
+	if jid.Server != watypes.DefaultUserServer {
+		return ""
+	}
 	user := strings.TrimSpace(jid.User)
 	if user == "" {
 		return ""
@@ -4436,9 +4466,16 @@ func jidToPhone(jid watypes.JID) string {
 	return "+" + user
 }
 
+// fallbackChatName names a chat or person that has no name yet: the phone
+// number, or else the JID itself. A raw JID contains "@", so
+// looksLikeRawIdentifier lets a real name replace it when one arrives; a bare
+// user part ("<digits>" for a LID or a group) would pass for a name and stick.
 func fallbackChatName(jid watypes.JID) string {
 	if phone := jidToPhone(jid); phone != "" {
 		return phone
+	}
+	if strings.TrimSpace(jid.User) != "" && jid.Server != "" {
+		return jid.ToNonAD().String()
 	}
 	return firstNonEmpty(strings.TrimSpace(jid.User), jid.String())
 }
@@ -4638,11 +4675,16 @@ func (b *Bridge) lidForPhoneJID(cli *whatsmeow.Client, ctx context.Context, pn w
 	return watypes.EmptyJID
 }
 
+// reactionTargetSenderJID names who sent the legacy message a reaction
+// targets. The stored sender is a phone number or, for a LID whose number was
+// not known, its JID (addressForJID); both parse as reactionTargetAuthorJID
+// reads a v2 sender, where parseWhatsAppSenderJID would turn "<digits>@lid"
+// into "<digits>@lid@s.whatsapp.net".
 func (b *Bridge) reactionTargetSenderJID(msg *db.Message, chatJID watypes.JID) watypes.JID {
 	if msg == nil || msg.IsFromMe {
 		return watypes.EmptyJID
 	}
-	if senderJID := parseWhatsAppSenderJID(msg.SenderNumber); !senderJID.IsEmpty() {
+	if senderJID, ok := reactionTargetAuthorJID(msg.SenderNumber); ok {
 		return b.canonicalJID(senderJID)
 	}
 	if chatJID.Server == watypes.DefaultUserServer || chatJID.Server == watypes.HiddenUserServer {
