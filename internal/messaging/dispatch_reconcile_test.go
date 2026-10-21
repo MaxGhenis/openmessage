@@ -338,6 +338,7 @@ func TestStoreFailedRepointRepair(t *testing.T) {
 		fixture := newStoreFailedRepointFixture(t, clock)
 		fixture.service.pollDelay = time.Hour
 		drainReconcileWake(fixture.service)
+		drainTimerSignals(clock)
 
 		ctx, cancel := context.WithCancel(context.Background())
 		done := make(chan error, 1)
@@ -715,12 +716,34 @@ func newNotifyingReconcileClock(now time.Time) *notifyingReconcileClock {
 	}
 }
 
+// NewTimer signals only the dispatch loop's poll timer, which the test uses to
+// tell that a pass has finished. Transport calls also create timers on this
+// clock (their bounds, see callTransport): the fixture's setup DispatchDue
+// makes one before Run starts, and any pass that dispatches would make
+// another. Counting them left a stale signal, so a wait returned before the
+// pass it was waiting for had run. The filter keys on the default bounds,
+// which this fixture's service uses.
 func (c *notifyingReconcileClock) NewTimer(delay time.Duration) Timer {
+	switch delay {
+	case defaultTransportCallTimeout, defaultMediaTransportCallTimeout, defaultTransportShutdownGrace:
+		return c.manualClock.NewTimer(delay)
+	}
 	select {
 	case c.timerCreated <- struct{}{}:
 	default:
 	}
 	return c.manualClock.NewTimer(delay)
+}
+
+// drainTimerSignals drops signals from timers created before Run starts.
+func drainTimerSignals(clock *notifyingReconcileClock) {
+	for {
+		select {
+		case <-clock.timerCreated:
+		default:
+			return
+		}
+	}
 }
 
 func drainReconcileWake(service *MessageService) {
