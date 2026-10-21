@@ -1634,6 +1634,62 @@ the handler context both detached and cancelled, on v2-ingest and
 legacy-only installs. It also covers an
 app-state patch interrupted between its version and MAC writes.
 
+## WhatsApp LIDs stored as phone numbers
+
+A WhatsApp LID (`<digits>@lid`) has an all-digit user part, like a phone
+number (`<digits>@s.whatsapp.net`), so its digits alone never say which it
+is. Until this fix both `jidToPhone` helpers turned any all-digit user into
+`+<digits>`: the legacy bridge stored a LID whose number `canonicalJID` did not
+know that way, and the WhatsApp Desktop importer every LID sender. Migration
+then minted an `e164` identity for the LID's digits. In v2 such a sender shows
+a phone number that is no one's, matches phone searches, and a reaction or read
+receipt to their group message names `<lid digits>@s.whatsapp.net`.
+
+What each path stores now:
+
+- **v2 live ingest** (unchanged): the phone number when whatsmeow knows the
+  LID's number, else `<digits>@lid` (`ingest.whatsAppIdentity`).
+- **Legacy bridge**: the same value (`whatsapplive.StoredAddress`), so a
+  migrated row names the identity a live frame does. A contact's
+  `RedactedPhone` (the masked `+1 ••• ••21` a LID group shows a non-contact
+  by) is a display name only; its digits used to be stored as a number too.
+- **Desktop importer**: the number Desktop pairs the LID with (the chat's or
+  member's `ZCONTACTIDENTIFIER` when it is a phone-number JID or `+<digits>`,
+  or `LID.sqlite`), else `<digits>@lid`.
+
+**Repairing existing v2 identities** (the dry run may run beside the app;
+`--apply` needs the daemon down, takes the instance lock, refuses while
+`/api/status` answers, and copies `v2/store.sqlite3*` to
+`v2/repair-backups/<stamp>/` first; park the watchdog before applying):
+
+```bash
+OPENMESSAGES_DATA_DIR="$HOME/Library/Application Support/OpenMessage" \
+  openmessage repair whatsapp-lid --report lid-repair.json   # dry run
+# review, then add --apply
+```
+
+The repair rewrites an `e164` identity of the WhatsApp account only when a
+record that keeps the JID's server names its digits as a LID and no record
+names them as a phone number. It reads, read-only: the whatsmeow session store
+(`whatsapp-session.db`: `whatsmeow_lid_map`, the device row, contacts),
+WhatsApp Desktop (`ChatStorage.sqlite` chats, members and senders, and
+`LID.sqlite`; `--desktop-db ''` skips it), and the v2 store itself (the
+account's `<digits>@lid` identities and chats, its own number, and every
+number on another platform's account). Each source's line in the report says
+whether it was read, missing or failed; a source that fails only means less
+evidence, so fewer identities change. Digit length is never evidence. A LID
+becomes the identity live ingest mints for it today: the number the records
+pair it with when they name exactly one (and nothing names that number a LID),
+otherwise `<digits>@lid`. When that identity exists the two merge: messages,
+roster rows, reactions (the newer per person and message) and the person link
+move, and display names that only repeat the LID's digits are cleared. It
+refuses, and reports, an identity also named as a phone number
+(`also-a-phone-number`), this account's own (`own-identity`), one whose LID
+pairs with this account's own number (`target-is-own-identity`), and one whose
+target links to a different person (`target-links-another-person`). Running it
+again plans nothing new. It changes only the v2 store; the legacy
+`messages.db` keeps its old rows.
+
 ## signal-cli
 
 Require **signal-cli ≥ 0.14.5**. 0.14.1 throws
@@ -1993,12 +2049,11 @@ matched too; the LID is the form the message carries. 1:1 chats with a phone
 number or a LID were never affected: whatsmeow puts no participant in their
 messages' keys (a bot's chat, for one, does get one).
 
-Messages migrated from the legacy store, or imported from WhatsApp Desktop, can
-name a LID sender by the LID's digits as a phone number (`+<lid digits>`): the
-legacy bridge does so for a LID whose number it did not know, and the WhatsApp
-Desktop importer, which has no LID map, for every LID sender (both `jidToPhone`
-helpers keep any all-digit user). Such a sender looks like a phone number here
-and goes out as `<lid digits>@s.whatsapp.net`.
+Messages migrated from the legacy store, or imported from WhatsApp Desktop,
+before the fix in "WhatsApp LIDs stored as phone numbers" below can name a LID
+sender by the LID's digits as a phone number (`+<lid digits>`). Such a sender
+looks like a phone number here and goes out as `<lid digits>@s.whatsapp.net`
+until `openmessage repair whatsapp-lid` rewrites it.
 
 **Reactions stuck retrying.** A reaction the transport cannot deliver yet goes
 `not_dispatched` and retries (every 5 s by default) with no cap; a Signal

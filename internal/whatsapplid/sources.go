@@ -259,6 +259,16 @@ func ReadDesktopDB(ctx context.Context, q queryer, evidence *Evidence, senders b
 	return total, nil
 }
 
+// DefaultDesktopPath is where WhatsApp Desktop for macOS keeps
+// ChatStorage.sqlite.
+func DefaultDesktopPath() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, "Library", "Group Containers", "group.net.whatsapp.WhatsApp.shared", "ChatStorage.sqlite")
+}
+
 // DesktopLIDPath is where WhatsApp Desktop keeps LID.sqlite: beside
 // ChatStorage.sqlite.
 func DesktopLIDPath(chatStoragePath string) string {
