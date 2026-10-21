@@ -383,6 +383,11 @@ func reactOutcome(delivery messaging.Delivery) (int, map[string]any) {
 	case messaging.OutboxUncertain:
 		return fail(http.StatusBadGateway, "the transport gave no answer, so the reaction may or may not have been applied")
 	case messaging.OutboxRejected:
+		if delivery.ErrorCode == "reaction_target_never_sent" {
+			// Rejected before any transport call: the target is this
+			// account's own message, and its send was canceled or refused.
+			return fail(http.StatusBadGateway, "the message it reacts to was never sent")
+		}
 		return fail(http.StatusBadGateway, "the transport refused the reaction")
 	case messaging.OutboxCanceled:
 		return fail(http.StatusConflict, "the reaction was canceled before it was sent")

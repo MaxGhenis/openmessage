@@ -486,3 +486,30 @@ func TestV2ReactionTextSaysARefusalIsAboutTheMessage(t *testing.T) {
 		}
 	}
 }
+
+// A reaction held for its target's unsent send says why it waits, so an agent
+// reacting to a scheduled message does not read the wait as a stuck delivery.
+func TestV2ReactionTextSaysAHeldReactionWaitsForItsMessage(t *testing.T) {
+	held := v2ReactionText("outbox-1", messaging.OutboxNotDispatched, "transient", "reaction_target_unsent", "key-1")
+	if !strings.Contains(held, "outbox-1") || !strings.Contains(held, "Do NOT react again") ||
+		!strings.Contains(held, "waiting for the message it reacts to") || !strings.Contains(held, "key-1") ||
+		!strings.Contains(held, "canceled or the platform refuses it") {
+		t.Fatalf("held reaction text = %q, want it queued, not to be repeated, waiting for its message, and rejected if that message never goes out", held)
+	}
+	for _, code := range []string{"send_reaction", ""} {
+		text := v2ReactionText("outbox-2", messaging.OutboxNotDispatched, "transient", code, "")
+		if strings.Contains(text, "waiting for the message") {
+			t.Fatalf("not_dispatched text for code %q = %q, want no mention of an unsent target", code, text)
+		}
+	}
+}
+
+// A reaction rejected because its own target was never sent says so, rather
+// than reading as a platform refusal.
+func TestV2ReactionTextSaysANeverSentTargetHasNothingToReactTo(t *testing.T) {
+	text := v2ReactionText("outbox-1", messaging.OutboxRejected, "unsupported", "reaction_target_never_sent", "")
+	if !strings.Contains(text, "outbox-1") || !strings.Contains(text, "was never sent") ||
+		strings.Contains(text, "The platform refused this reaction") {
+		t.Fatalf("never-sent target text = %q, want it to say the message was never sent, not that the platform refused", text)
+	}
+}

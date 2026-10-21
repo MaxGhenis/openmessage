@@ -718,6 +718,8 @@ func (s *MessageService) Cancel(ctx context.Context, outboxID string) (Delivery,
 		return Delivery{}, fmt.Errorf("cancel delivery: %w", err)
 	}
 	s.signalChange()
+	// Canceling a send makes the reactions held for it due now.
+	s.signalWake()
 	return s.Get(ctx, outboxID)
 }
 

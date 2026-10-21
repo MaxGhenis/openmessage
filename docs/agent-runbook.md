@@ -1959,9 +1959,14 @@ the `error_detail` column of the `outbox` table in the v2 store:
 
 - `signal reaction target timestamp is unavailable`, for this account's own
   message: its remote ID is not a Signal timestamp.
-  - *Still on its outbox request ID.* A pending send: the reaction goes out on
-    a retry once the send is confirmed. A canceled or failed send: never. An
-    uncertain one: not while it is unresolved. Also a send Signal accepted
+  - *Still on its outbox request ID.* A send that has not gone out (`queued`,
+    `dispatching`, `not_dispatched`) never gets this far: the dispatcher holds
+    the reaction before the adapter (`error_code: reaction_target_unsent`, see
+    "Reactions stuck retrying" below), and it goes out once the send is
+    confirmed under its timestamp. A canceled or rejected send never gets
+    this far either: the dispatcher rejects the reaction
+    (`reaction_target_never_sent`). An uncertain one: not while it is
+    unresolved. Also a send Signal accepted
     whose local confirm failed (`store_failed`): the outbox row holds the
     timestamp as its result, but the message is not moved to it until that
     confirm is repaired (`RepairStoreFailed`).
@@ -2029,8 +2034,8 @@ legacy senders unchanged.
   | Status | Body | Meaning |
   |---|---|---|
   | 200 | `success: true` | The platform accepted it (`confirmed`, or `store_failed`). |
-  | 202 | `success: true, queued: true` | Stored, not delivered yet (`queued`, `dispatching`, `not_dispatched`). The app keeps retrying it; do not react again. |
-  | 502 | `error` | `uncertain` (the transport call ended without an answer: it may have been applied) or `rejected` (the platform refused it, for example Google's phone answering `success: false` for a message whose ID will not change, stored as `error_class: unsupported`; it is not retried). |
+  | 202 | `success: true, queued: true` | Stored, not delivered yet (`queued`, `dispatching`, `not_dispatched`). The app keeps retrying it; do not react again. A reaction to your own message that has not been sent yet (a scheduled send) waits here for it (`error_code: reaction_target_unsent`). |
+  | 502 | `error` | `uncertain` (the transport call ended without an answer: it may have been applied) or `rejected` (the platform refused it, for example Google's phone answering `success: false` for a message whose ID will not change, stored as `error_class: unsupported`; it is not retried). A reaction to your own message whose send was canceled or rejected is `rejected` before any transport call (`error_code: reaction_target_never_sent`, error "the message it reacts to was never sent"). |
   | 409 | `error` | `canceled` before it was sent. |
   | 422 | `reaction_target_unavailable` | No v2 message with that ID, or not in that conversation. Nothing was queued. |
   | 501 | `error` | The account has no reaction sender (an import-only platform). |
@@ -2137,6 +2142,16 @@ Desktop importer, which has no LID map, for every LID sender (both `jidToPhone`
 helpers keep any all-digit user). Such a sender looks like a phone number here
 and goes out as `<lid digits>@s.whatsapp.net`.
 
+A WhatsApp send goes out under an ID derived from its request ID
+(`whatsapplive.deriveWebMessageID`), and its message is renamed to that ID
+when the send is confirmed. Until then the message is still named by the
+request ID itself, an ID WhatsApp never sees. So a reaction to a WhatsApp
+message of yours that has not been sent yet is held, and one to a message
+whose send was canceled or rejected is rejected (see "Reactions stuck
+retrying" below), rather than addressed to that ID. One sent but `uncertain` or `store_failed`
+is still named by the request ID, and a reaction to it is still addressed to
+that ID, which no WhatsApp message has.
+
 **Reactions stuck retrying.** A reaction the transport cannot deliver yet goes
 `not_dispatched` and retries (every 5 s by default) with no cap; a Signal
 reaction whose target can never be named (above) stays there until it is
@@ -2145,18 +2160,73 @@ with `success: false`, the row ends `rejected` after one attempt
 (`error_class: unsupported`, `error_code: send_reaction`, `error_detail`
 `send_reaction: unsupported: Google Messages refused the reaction`), because a
 retry would send the same request. Before that change it went
-`not_dispatched` and was sent again every 5 s. The exception is a reaction to
-a message this account just sent, which is still named by its send's request
-ID (Google's TmpID) until the phone's echo brings the phone's own ID: the
-dispatcher marks that target `ProvisionalRemoteID` (its send is unresolved, or
-confirmed and waiting for the echo; not canceled or rejected), and a refusal
-of it goes `not_dispatched` (`error_detail` `send_reaction: transient: Google
-Messages refused a reaction to a message still named by its send's request
-ID`) so the retry after the echo names the phone's ID. Nothing bounds that
-wait: if no echo ever renames the message (a scheduled send that has not gone
-out, or an `uncertain` one that never reached the phone), the refusal is
-retried every 5 s until the reaction is canceled. Find the ones still retrying
-with:
+`not_dispatched` and was sent again every 5 s.
+
+A reaction to a message of your own that is still named by its send's request
+ID (Google's TmpID) depends on how far that send has got
+(`messaging.targetSendProgress`):
+
+- **Not sent yet** (`queued`, `dispatching`, `not_dispatched`, such as a
+  scheduled send). The platform has no such message, so the dispatcher holds
+  the reaction before the transport call, on every platform: no phone call, no
+  transport attempt counted. The row goes `not_dispatched` with
+  `error_class: transient`, `error_code: reaction_target_unsent` and
+  `error_detail` `the message this reaction targets has not been sent yet (its
+  send <outbox id> is <state>)`. It is tried again 1 ms after the send is next
+  due (a scheduled send's time, or a retrying send's next attempt), and never
+  sooner than 5 s. So a reaction to a message scheduled for tomorrow waits for
+  tomorrow, and the dispatcher, which takes due rows in the order they fell
+  due, sends the message first. Retrying the send early
+  (`POST /api/v1/outbox/<send id>/retry`) or canceling it makes the reactions
+  held for it due 1 ms later, in the same transaction
+  (`OutboxRepository.Cancel`, `RetryNotDispatched`): they follow a retried
+  send at once, and a canceled send's reactions are rejected (next bullet).
+  A cancel or retry that lands while the dispatcher is holding a reaction
+  for that send (the reaction is `dispatching`, so the wake passes it by) is
+  caught when the dispatcher reads the send again after recording the hold
+  (`wakeIfSendChanged`).
+  Before, the reaction went to the transport with the request ID: Google
+  asked the phone with the TmpID, and a refusal was retried every 5 s until
+  the send went out and its echo renamed the message, the send was canceled
+  or rejected (the next refusal was then final), or someone canceled the
+  reaction; WhatsApp addressed it to an ID no WhatsApp message has (above);
+  Signal refused it before signal-cli, every 5 s.
+- **Never sent** (`canceled`, or `rejected` by the platform). The platform
+  never got the message and never will, so the dispatcher rejects the
+  reaction before the transport call: `rejected`, `error_class:
+  unsupported`, `error_code: reaction_target_never_sent`, and `/api/react`
+  answers 502 "the message it reacts to was never sent". Before, it went to
+  the transport naming the request ID: Google asked the phone and rejected
+  the reaction on its refusal, WhatsApp addressed it to no message (and
+  recorded it as sent when WhatsApp accepted it), and Signal retried it
+  every 5 s for good.
+- **Sent less than a minute ago** (`confirmed` and waiting for the echo,
+  `uncertain`, or `store_failed`, timed from the send row's `updated_at_ms`:
+  when the transport's answer was recorded, or later lease recovery or a
+  reconcile).
+  The phone's echo may still rename the message to the phone's own ID, so the
+  dispatcher marks the target `ProvisionalRemoteID`. A refusal of it goes
+  `not_dispatched` (`error_detail` `send_reaction: transient: Google Messages
+  refused a reaction to a message still named by its send's request ID`), and
+  the retry after the echo names the phone's ID.
+- **Sent a minute ago or more.** The target is no longer provisional, so a
+  refusal is final (`rejected`, as above). The minute is
+  `sqlite.EchoMaxLag`, the longest lag at which echo pairing
+  (`internal/storage/sqlite/uncorrelated_echo.go`) considers an echo at all.
+  On the live install all 44 measured echoes were first seen 0.28-0.79 s
+  after their send, and pairing by content takes one only within about
+  6.2 s. On the live install the phone sent every echo without a TmpID when
+  this was checked (2026-10-16), and content pairing takes text sends only,
+  so a media send keeps its TmpID for good. (A text whose echo was stored
+  before its send was recorded can still be paired after the minute, by the
+  startup repair or a later frame for the message; every measured echo
+  arrived after.) A refused reaction to a message that keeps its TmpID is
+  now sent at most 13 times per window (once per 5 s for the minute, then the
+  final one; a later lease recovery or store repair of the send starts a new
+  window), where before it was sent every 5 s for as long as the message
+  kept it. If the phone did not have the message yet, react again once it does.
+
+Find the reactions still retrying with:
 
 ```bash
 curl -s "http://127.0.0.1:7007/api/v1/outbox?limit=100" | jq '.[] | select(.kind=="reaction")'

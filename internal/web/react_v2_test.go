@@ -65,6 +65,21 @@ func TestReactOutcomeAnswersEveryState(t *testing.T) {
 	}
 }
 
+// A reaction rejected because its own target was never sent was refused by
+// no transport, so the answer says what happened instead.
+func TestReactOutcomeSaysANeverSentTargetWasNotRefusedByTheTransport(t *testing.T) {
+	status, body := reactOutcome(messaging.Delivery{
+		OutboxID: "outbox-1", State: messaging.OutboxRejected, ErrorClass: "unsupported", ErrorCode: "reaction_target_never_sent",
+	})
+	if status != http.StatusBadGateway || body["error"] != "send reaction: the message it reacts to was never sent" ||
+		body["error_code"] != "reaction_target_never_sent" {
+		t.Fatalf("never-sent target answer = %d %v, want 502 saying the message was never sent", status, body)
+	}
+	if _, body := reactOutcome(messaging.Delivery{OutboxID: "outbox-2", State: messaging.OutboxRejected, ErrorCode: "send_reaction"}); body["error"] != "send reaction: the transport refused the reaction" {
+		t.Fatalf("transport refusal answer = %v, want the transport named", body)
+	}
+}
+
 func postJSONTo(t *testing.T, handler http.Handler, path, body string) (int, map[string]any) {
 	t.Helper()
 	recorder := httptest.NewRecorder()

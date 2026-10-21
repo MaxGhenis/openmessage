@@ -344,9 +344,11 @@ func (a *Adapter) SendReaction(
 	}
 	a.phoneAnswered("")
 	if !response.GetSuccess() && req.Target.ProvisionalRemoteID {
-		// The target is this account's message still named by its send's
-		// request ID. The phone may know it only by its own ID, which the
-		// echo brings and the next attempt then uses, so this can succeed.
+		// The target is this account's message, sent less than a minute ago
+		// and still named by its send's request ID. The phone may know it
+		// only by its own ID, which the echo brings and the next attempt then
+		// uses, so this can succeed. Past that minute the dispatcher stops
+		// setting the flag and the refusal below is final.
 		return bridge.SendResult{}, bridge.OpError{
 			Class:       bridge.FailureTransient,
 			Operation:   "send_reaction",
