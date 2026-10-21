@@ -239,6 +239,33 @@ func TestAnsweredRequestResetsTheBackoff(t *testing.T) {
 	}
 }
 
+// A read receipt is a request too: one answered after the window resets the
+// backoff, and one held meanwhile reaches the phone only after the window.
+func TestMarkReadAnsweredResetsTheBackoff(t *testing.T) {
+	a, _, clock := silentText(t)
+	read := &fakeReadSendClient{}
+	installReadSendClient(t, a.host.GetClient(), read)
+	markRead := func() error {
+		return a.MarkRead(context.Background(), bridge.ReadReceiptRequest{
+			Conversation: bridge.ConversationRef{RemoteID: "conversation-id"},
+			Messages:     []bridge.MessageRef{{RemoteID: "message-id"}},
+		})
+	}
+	requireTextOpError(t, sendText(t, a, "a"))
+	clock.Advance(30 * time.Second)
+	requireTextOpError(t, sendText(t, a, "b")) // second window: 1 minute
+	clock.Advance(time.Minute)
+	if err := markRead(); err != nil {
+		t.Fatalf("read receipt after the window = %v", err)
+	}
+	if read.calls != 1 {
+		t.Fatalf("MarkRead calls = %d, want 1", read.calls)
+	}
+	if until := a.silence.recordUnanswered(""); !until.Equal(clock.Now().Add(30 * time.Second)) {
+		t.Fatalf("window after an answered receipt = %s, want 30s", until.Sub(clock.Now()))
+	}
+}
+
 // stubbornLookups answers every conversation lookup except those for one
 // conversation, which the phone never answers.
 type stubbornLookups struct {
