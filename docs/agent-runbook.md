@@ -1936,7 +1936,7 @@ went out as the phone number in a LID group. whatsmeow's own message-secret
 lookup accepts a key's sender in either form, so the phone number may have
 matched too; the LID is the form the message carries. 1:1 chats with a phone
 number or a LID were never affected: whatsmeow puts no participant in their
-messages' keys (a chat on any other server, such as a bot's, does get one).
+messages' keys (a bot's chat, for one, does get one).
 
 Messages migrated from the legacy store, or imported from WhatsApp Desktop, can
 name a LID sender by the LID's digits as a phone number (`+<lid digits>`): the
