@@ -1246,13 +1246,37 @@ func TestRetryingAHeldReactionsSendEarlyBringsTheReactionWithIt(t *testing.T) {
 // the send again after the hold and, finding it changed, makes the reaction
 // due at once instead of at the send's old time.
 func TestASendChangedWhileItsReactionIsBeingHeldWakesTheReaction(t *testing.T) {
+	canceled := func(t *testing.T, service *MessageService, sender *scriptedReactionSender, held Submission) {
+		if processed, err := service.DispatchDue(context.Background(), 4); err != nil || processed != 1 {
+			t.Fatalf("DispatchDue() = %d, %v; want the reaction", processed, err)
+		}
+		if row := mustOutboxItem(t, service, held.OutboxID); sender.requestCount() != 0 || row.State != sqlite.OutboxRejected ||
+			row.ErrorCode == nil || *row.ErrorCode != "reaction_target_never_sent" {
+			t.Fatalf("reaction after its send was canceled in the gap = %+v, want rejected uncalled", row)
+		}
+	}
 	cases := []struct {
 		name string
+		// scheduled sends the message in an hour; otherwise it was tried
+		// and is retrying in an hour.
+		scheduled bool
 		// change lands in the gap; then is what the reaction does when it
 		// is next due, a millisecond later.
 		change func(t *testing.T, service *MessageService, send Submission)
 		then   func(t *testing.T, service *MessageService, sender *scriptedReactionSender, held Submission)
 	}{
+		{
+			// Canceling a scheduled send changes its state and time only:
+			// it had no next attempt to clear.
+			name:      "scheduled, canceled",
+			scheduled: true,
+			change: func(t *testing.T, service *MessageService, send Submission) {
+				if _, err := service.Cancel(context.Background(), send.OutboxID); err != nil {
+					t.Fatalf("Cancel(send): %v", err)
+				}
+			},
+			then: canceled,
+		},
 		{
 			name: "canceled",
 			change: func(t *testing.T, service *MessageService, send Submission) {
@@ -1260,15 +1284,7 @@ func TestASendChangedWhileItsReactionIsBeingHeldWakesTheReaction(t *testing.T) {
 					t.Fatalf("Cancel(send): %v", err)
 				}
 			},
-			then: func(t *testing.T, service *MessageService, sender *scriptedReactionSender, held Submission) {
-				if processed, err := service.DispatchDue(context.Background(), 4); err != nil || processed != 1 {
-					t.Fatalf("DispatchDue() = %d, %v; want the reaction", processed, err)
-				}
-				if row := mustOutboxItem(t, service, held.OutboxID); sender.requestCount() != 0 || row.State != sqlite.OutboxRejected ||
-					row.ErrorCode == nil || *row.ErrorCode != "reaction_target_never_sent" {
-					t.Fatalf("reaction after its send was canceled in the gap = %+v, want rejected uncalled", row)
-				}
-			},
+			then: canceled,
 		},
 		{
 			name: "retried early",
@@ -1302,13 +1318,19 @@ func TestASendChangedWhileItsReactionIsBeingHeldWakesTheReaction(t *testing.T) {
 			if err != nil {
 				t.Fatalf("NewOutboxRepository(): %v", err)
 			}
-			// The send is retrying in an hour, so it can be canceled or
-			// retried early.
-			send := mustSendText(t, service, SendTextCommand{CommonCommand: testCommonCommand("gap-send"), Body: "rate limited"})
-			row := mustOutboxItem(t, service, send.OutboxID)
-			if err := outbox.MarkNotDispatched(ctx, row.OutboxID, mustLeaseSend(t, outbox, row, clock.Now()),
-				"rate_limited", "send_text", "scripted", clock.Now().Add(time.Hour)); err != nil {
-				t.Fatalf("MarkNotDispatched(): %v", err)
+			// The send is due in an hour, scheduled or retrying, so it can
+			// be canceled or retried early.
+			command := testCommonCommand("gap-send")
+			if test.scheduled {
+				command.NotBefore = clock.Now().Add(time.Hour)
+			}
+			send := mustSendText(t, service, SendTextCommand{CommonCommand: command, Body: "due in an hour"})
+			if !test.scheduled {
+				row := mustOutboxItem(t, service, send.OutboxID)
+				if err := outbox.MarkNotDispatched(ctx, row.OutboxID, mustLeaseSend(t, outbox, row, clock.Now()),
+					"rate_limited", "send_text", "scripted", clock.Now().Add(time.Hour)); err != nil {
+					t.Fatalf("MarkNotDispatched(): %v", err)
+				}
 			}
 			held := mustSendDispatchReaction(t, service, SendReactionCommand{
 				CommonCommand:   testCommonCommand("gap-reaction"),

@@ -2147,8 +2147,8 @@ A WhatsApp send goes out under an ID derived from its request ID
 when the send is confirmed. Until then the message is still named by the
 request ID itself, an ID WhatsApp never sees. So a reaction to a WhatsApp
 message of yours that has not been sent yet is held, and one to a message
-whose send was canceled is rejected (see "Reactions stuck retrying" below),
-rather than addressed to that ID. One sent but `uncertain` or `store_failed`
+whose send was canceled or rejected is rejected (see "Reactions stuck
+retrying" below), rather than addressed to that ID. One sent but `uncertain` or `store_failed`
 is still named by the request ID, and a reaction to it is still addressed to
 that ID, which no WhatsApp message has.
 
