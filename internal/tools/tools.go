@@ -268,6 +268,16 @@ func structuredResult(structured any, text string) *mcp.CallToolResult {
 // attachments when present. The message_id is included for media messages so
 // the user can call download_media.
 func formatMessageBody(body, mediaID, mimeType, messageID, transcript string) string {
+	return formatMessageBodyWithMedia(body, mediaID, mimeType, messageID, transcript, "")
+}
+
+// formatMessageDisplay is formatMessageBody for a message read from the
+// store, marking an attachment its platform never delivered.
+func formatMessageDisplay(m *db.Message) string {
+	return formatMessageBodyWithMedia(m.Body, m.MediaID, m.MimeType, m.MessageID, m.Transcript, m.MediaUnavailable)
+}
+
+func formatMessageBodyWithMedia(body, mediaID, mimeType, messageID, transcript, mediaUnavailable string) string {
 	appendTranscript := func(base string) string {
 		if transcript == "" {
 			return base
@@ -292,6 +302,9 @@ func formatMessageBody(body, mediaID, mimeType, messageID, transcript string) st
 		tag = "attachment"
 	}
 	label := fmt.Sprintf("[%s, message_id: %s]", tag, messageID)
+	if strings.TrimSpace(mediaUnavailable) != "" {
+		label = fmt.Sprintf("[%s unavailable: the platform never delivered it, ask the sender to resend; message_id: %s]", tag, messageID)
+	}
 	if body != "" {
 		return appendTranscript(body + " " + label)
 	}
@@ -319,7 +332,7 @@ func formatMessageLine(m *db.Message) string {
 	if m.IsFromMe {
 		direction = "→"
 	}
-	display := formatMessageBody(m.Body, m.MediaID, m.MimeType, m.MessageID, m.Transcript)
+	display := formatMessageDisplay(m)
 	return fmt.Sprintf("[%s] %s %s: «%s»", ts, direction, resolveSender(m), display)
 }
 
@@ -359,6 +372,9 @@ type messageSummary struct {
 	SourcePlatform string `json:"source_platform"`
 	SourceID       string `json:"source_id,omitempty"`
 	DisplayText    string `json:"display_text,omitempty"`
+
+	// MediaUnavailable is why the attachment can never be downloaded.
+	MediaUnavailable string `json:"media_unavailable,omitempty"`
 }
 
 type contactSummary struct {
@@ -387,7 +403,7 @@ func summarizeMessage(m *db.Message) messageSummary {
 	if m == nil {
 		return messageSummary{}
 	}
-	return messageSummary{
+	summary := messageSummary{
 		MessageID:      m.MessageID,
 		ConversationID: m.ConversationID,
 		SenderName:     m.SenderName,
@@ -402,8 +418,10 @@ func summarizeMessage(m *db.Message) messageSummary {
 		ReplyToID:      m.ReplyToID,
 		SourcePlatform: normalizedPlatform(m.SourcePlatform),
 		SourceID:       m.SourceID,
-		DisplayText:    formatMessageBody(m.Body, m.MediaID, m.MimeType, m.MessageID, m.Transcript),
+		DisplayText:    formatMessageDisplay(m),
 	}
+	summary.MediaUnavailable = m.MediaUnavailable
+	return summary
 }
 
 func summarizeContact(c *db.Contact) contactSummary {

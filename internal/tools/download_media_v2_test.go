@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -18,6 +19,7 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 
 	"github.com/maxghenis/openmessage/internal/bridge"
+	"github.com/maxghenis/openmessage/internal/db"
 	"github.com/maxghenis/openmessage/internal/localapi"
 	"github.com/maxghenis/openmessage/internal/media"
 	"github.com/maxghenis/openmessage/internal/messaging"
@@ -188,8 +190,8 @@ func TestDownloadMediaReportsTheAppsReason(t *testing.T) {
 		daemon *fakeMediaDaemon
 		want   string
 	}{
-		"gone": {&fakeMediaDaemon{status: http.StatusNotFound, errorMsg: "media: attachment is no longer available from its transport: signal-cli did not store attachment x.html"},
-			"attachment unavailable: media: attachment is no longer available from its transport: signal-cli did not store attachment x.html"},
+		"gone": {&fakeMediaDaemon{status: http.StatusGone, errorMsg: "media: attachment is no longer available from its transport: Signal never delivered attachment x.html"},
+			"attachment unavailable: media: attachment is no longer available from its transport: Signal never delivered attachment x.html"},
 		"unknown":     {&fakeMediaDaemon{status: http.StatusNotFound, errorMsg: "not found"}, "message or attachment not found"},
 		"unreachable": {&fakeMediaDaemon{status: http.StatusServiceUnavailable, errorMsg: "attachment download unavailable: Signal is not connected"}, "attachment not downloadable right now (retry later): attachment download unavailable: Signal is not connected"},
 		"bad digest":  {&fakeMediaDaemon{body: []byte("bytes"), digest: strings.Repeat("0", 64)}, "but reported " + strings.Repeat("0", 64)},
@@ -222,7 +224,7 @@ func (r toolDownloadRegistry) Capabilities(string) bridge.CapabilitySet {
 type toolGoneDownloader struct{}
 
 func (toolGoneDownloader) DownloadMedia(context.Context, string, bridge.MediaRef) (bridge.MediaStream, error) {
-	return bridge.MediaStream{}, fmt.Errorf("%w: signal-cli did not store attachment x.html", bridge.ErrMediaGone)
+	return bridge.MediaStream{}, fmt.Errorf("%w: Signal never delivered attachment x.html", bridge.ErrMediaGone)
 }
 
 // In a process that owns the v2 store (the app's own MCP endpoint), the tool
@@ -307,5 +309,37 @@ func TestParseMediaReference(t *testing.T) {
 		if got := parseMediaReference(raw); got != want {
 			t.Errorf("parseMediaReference(%q) = %+v, want %+v", raw, got, want)
 		}
+	}
+}
+
+func TestMessageOutputMarksAnAttachmentThePlatformNeverDelivered(t *testing.T) {
+	message := &db.Message{
+		MessageID:        "m1",
+		ConversationID:   "c1",
+		Body:             "the spec is attached",
+		TimestampMS:      1,
+		MediaID:          "v2msg:m1:0",
+		MimeType:         "text/html",
+		SourcePlatform:   "signal",
+		MediaUnavailable: "media: attachment is no longer available from its transport: Signal never delivered attachment x.html",
+	}
+	wantLabel := "the spec is attached [attachment unavailable: the platform never delivered it, ask the sender to resend; message_id: m1]"
+	if got := formatMessageDisplay(message); got != wantLabel {
+		t.Fatalf("formatMessageDisplay() = %q, want %q", got, wantLabel)
+	}
+	if line := formatMessageLine(message); !strings.Contains(line, wantLabel) {
+		t.Fatalf("formatMessageLine() = %q, want it to carry %q", line, wantLabel)
+	}
+	summary := summarizeMessage(message)
+	if summary.MediaUnavailable != message.MediaUnavailable || summary.DisplayText != wantLabel || summary.MediaID != "v2msg:m1:0" {
+		t.Fatalf("summarizeMessage() = %+v", summary)
+	}
+
+	message.MediaUnavailable = ""
+	if got := formatMessageDisplay(message); got != "the spec is attached [attachment, message_id: m1]" {
+		t.Fatalf("formatMessageDisplay(available) = %q, want the unchanged label", got)
+	}
+	if encoded, _ := json.Marshal(summarizeMessage(message)); strings.Contains(string(encoded), "media_unavailable") {
+		t.Fatalf("an available attachment's summary carries media_unavailable: %s", encoded)
 	}
 }

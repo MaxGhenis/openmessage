@@ -144,6 +144,9 @@ func (s *Service) Resolve(ctx context.Context, command DownloadCommand) (Descrip
 	if row.State == "downloaded" {
 		return s.descriptorForRow(row)
 	}
+	if err := unavailableError(row); err != nil {
+		return Descriptor{}, err
+	}
 
 	key := row.MessageID + "\x00" + strconv.FormatInt(row.Ordinal, 10)
 	_, err, _ = s.group.Do(key, func() (any, error) {
@@ -190,6 +193,9 @@ func (s *Service) download(
 	}
 	if row.State == "downloaded" {
 		return blobRefForAttachment(row)
+	}
+	if err := unavailableError(row); err != nil {
+		return blob.BlobRef{}, err
 	}
 
 	// Capabilities returns the zero set for both an unsupported adapter and an
@@ -311,6 +317,11 @@ func (s *Service) recordFailure(
 	row sqlite.MessageAttachment,
 	failure error,
 ) error {
+	if row.LastError != nil && strings.HasPrefix(*row.LastError, sqlite.ReceiveAttachmentErrorPrefix) {
+		// A transient failure (the transport offline, say) says nothing new
+		// about this attachment; keep the transport's own receive-time report.
+		return failure
+	}
 	mutationCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), failureRecordTimeout)
 	defer cancel()
 	if err := s.attachments.MarkFailed(
@@ -324,21 +335,46 @@ func (s *Service) recordFailure(
 	return failure
 }
 
-// recordGone reports a transport that no longer has the attachment. When the
-// projection recorded the transport's receive-time account of why it never
-// fetched the bytes, that account is the useful diagnosis: it is kept in the
-// row and appended to the returned error instead of being overwritten.
+// recordGone marks an attachment whose transport no longer has it as
+// unavailable for good (sqlite.UnavailableAttachmentErrorPrefix), so later
+// requests answer ErrGone without asking the transport again. The reason
+// keeps the transport's receive-time account of the failure, when the
+// projection recorded one, because that is the useful diagnosis.
 func (s *Service) recordGone(
 	ctx context.Context,
 	row sqlite.MessageAttachment,
 	transportErr error,
 ) error {
-	failure := fmt.Errorf("%w: %w", ErrGone, transportErr)
-	if row.LastError != nil && strings.HasPrefix(*row.LastError, sqlite.ReceiveAttachmentErrorPrefix) {
-		return fmt.Errorf("%w (when the message arrived: %s)", failure,
-			strings.TrimPrefix(*row.LastError, sqlite.ReceiveAttachmentErrorPrefix))
+	receiveCause := ""
+	if row.LastError != nil {
+		if cause, ok := strings.CutPrefix(*row.LastError, sqlite.ReceiveAttachmentErrorPrefix); ok {
+			receiveCause = " (when the message arrived: " + strings.TrimSpace(cause) + ")"
+		}
 	}
-	return s.recordFailure(ctx, row, failure)
+	failure := fmt.Errorf("%w: %w%s", ErrGone, transportErr, receiveCause)
+	mutationCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), failureRecordTimeout)
+	defer cancel()
+	if err := s.attachments.MarkFailed(
+		mutationCtx,
+		row.MessageID,
+		row.Ordinal,
+		sqlite.UnavailableAttachmentErrorPrefix+transportErr.Error()+receiveCause,
+	); err != nil {
+		return errors.Join(failure, fmt.Errorf("record media download failure: %w", err))
+	}
+	return failure
+}
+
+// unavailableError answers for an attachment already marked unavailable.
+func unavailableError(row sqlite.MessageAttachment) error {
+	if row.LastError == nil {
+		return nil
+	}
+	reason, ok := strings.CutPrefix(*row.LastError, sqlite.UnavailableAttachmentErrorPrefix)
+	if !ok {
+		return nil
+	}
+	return fmt.Errorf("%w: %s", ErrGone, strings.TrimSpace(reason))
 }
 
 // Import stores content as one attachment's bytes and marks it downloaded,

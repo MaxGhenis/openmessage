@@ -50,6 +50,11 @@ type Message struct {
 	Transcript      string `json:"transcript,omitempty"`
 	TranscribedAtMS int64  `json:"transcribed_at_ms,omitempty"`
 	TranscriptModel string `json:"transcript_model,omitempty"`
+
+	// MediaUnavailable is why the attachment can never be downloaded through
+	// its platform (it never delivered the bytes); empty when it can be. Set
+	// by v2 reads only; not a legacy-store column.
+	MediaUnavailable string `json:"media_unavailable,omitempty"`
 }
 
 type Contact struct {

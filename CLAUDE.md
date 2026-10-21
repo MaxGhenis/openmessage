@@ -178,8 +178,10 @@ return an error naming the working read tools instead.
 - `GET /api/media/<message-id|v2msg:<message>:<n>>` and
   `GET /api/v1/messages/<id>/attachments/<n>` — attachment bytes (a pending
   v2 attachment is downloaded first; `X-Content-SHA256` carries the digest).
-  An attachment the transport can no longer deliver answers 404, a transport
-  that is unreachable right now 503.
+  An attachment the transport can no longer deliver is marked unavailable
+  for good and answers 410 Gone (404 is an unknown message or ordinal); a
+  transport that is unreachable right now answers 503. v2 message reads set
+  `media_unavailable` on such a message.
 - `PUT /api/v1/messages/<id>/attachments/<n>` — import a local copy (raw
   body, optional `X-Content-SHA256`) of a pending attachment the platform
   can't deliver, e.g. a Signal attachment signal-cli never stored; checked

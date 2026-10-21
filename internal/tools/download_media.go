@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"net/url"
 	"path/filepath"
 	"strconv"
@@ -160,11 +161,11 @@ func daemonMediaFailure(err error) *mcp.CallToolResult {
 	}
 	detail := responseErrorDetail(responseErr)
 	switch {
-	case responseErr.StatusCode == 404 && detail == "not found":
-		return errorResult("message or attachment not found")
-	case responseErr.StatusCode == 404:
+	case responseErr.StatusCode == http.StatusGone:
 		return errorResult("attachment unavailable: " + detail)
-	case responseErr.StatusCode == 503:
+	case responseErr.StatusCode == http.StatusNotFound:
+		return errorResult("message or attachment not found")
+	case responseErr.StatusCode == http.StatusServiceUnavailable:
 		return errorResult("attachment not downloadable right now (retry later): " + detail)
 	default:
 		return errorResult(fmt.Sprintf("fetch attachment from the OpenMessage app (HTTP %d): %s", responseErr.StatusCode, detail))

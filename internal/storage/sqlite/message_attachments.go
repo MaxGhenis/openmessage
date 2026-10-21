@@ -8,11 +8,35 @@ import (
 	"time"
 )
 
-// ReceiveAttachmentErrorPrefix starts the last_error a projection records
-// when the transport reported, with the message itself, that it failed to
-// fetch the attachment. Download attempts keep that text rather than
-// overwriting it with their own, usually less informative, failure.
-const ReceiveAttachmentErrorPrefix = "receive: "
+const (
+	// ReceiveAttachmentErrorPrefix starts the last_error a projection records
+	// when the transport reported, with the message itself, that it failed
+	// to fetch the attachment. Download attempts keep that text rather than
+	// overwriting it with their own, usually less informative, failure.
+	ReceiveAttachmentErrorPrefix = "receive: "
+	// UnavailableAttachmentErrorPrefix starts the last_error of an attachment
+	// a download attempt found its transport no longer has. It is terminal:
+	// the media service answers from the row without asking the transport
+	// again. The row stays pending (the state column allows only pending and
+	// downloaded), so an import of the bytes from elsewhere can still fill it.
+	UnavailableAttachmentErrorPrefix = "unavailable: "
+)
+
+// UnavailableReason reports why a pending attachment can never be
+// downloaded through its transport: a download attempt found the bytes gone,
+// or the transport said so when the message arrived. ok is false for an
+// attachment that is downloaded or may still download.
+func (a MessageAttachment) UnavailableReason() (reason string, ok bool) {
+	if a.State != "pending" || a.LastError == nil {
+		return "", false
+	}
+	for _, prefix := range []string{UnavailableAttachmentErrorPrefix, ReceiveAttachmentErrorPrefix} {
+		if rest, found := strings.CutPrefix(*a.LastError, prefix); found {
+			return strings.TrimSpace(rest), true
+		}
+	}
+	return "", false
+}
 
 // MessageAttachment is one inbound attachment associated with a normalized
 // message. AccountID is populated only by GetForDownload's messages join.

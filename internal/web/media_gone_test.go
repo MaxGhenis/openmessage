@@ -146,13 +146,15 @@ func errorBody(t *testing.T, recorder *httptest.ResponseRecorder) string {
 
 // The 2026-10-21 symptom: an attachment signal-cli never stored answered
 // /api/media with 500 "internal server error". It is a known, final state
-// of a message that exists, so every media route answers 404 with the reason.
-func TestV2MediaForAttachmentTheTransportNoLongerHasIs404NotA500(t *testing.T) {
+// of a message that exists, so every media route answers 410 Gone with the
+// reason (404 stays for an unknown message or ordinal), and only the first
+// request asks the transport.
+func TestV2MediaForAttachmentTheTransportNoLongerHasIs410NotA500(t *testing.T) {
 	calls := 0
 	handler := newMediaGoneHandler(t, 0, func(context.Context, string, bridge.MediaRef) (bridge.MediaStream, error) {
 		calls++
 		return bridge.MediaStream{}, fmt.Errorf(
-			"%w: signal-cli did not store attachment Q3x9KpLmN2vB7cRtYw4z.html when the message arrived and cannot download it again: %w",
+			"%w: Signal never delivered attachment Q3x9KpLmN2vB7cRtYw4z.html: signal-cli could not download it when the message arrived and cannot fetch it again; the sender can send it again: %w",
 			bridge.ErrMediaGone,
 			errors.New("download Signal attachment: exit status 1: Could not find attachment with ID: Q3x9KpLmN2vB7cRtYw4z.html"),
 		)
@@ -163,16 +165,16 @@ func TestV2MediaForAttachmentTheTransportNoLongerHasIs404NotA500(t *testing.T) {
 		"/api/v1/messages/" + mediaGoneMessageID + "/attachments/0",
 	} {
 		recorder := serveMediaRequest(handler, http.MethodGet, path, nil, nil)
-		if recorder.Code != http.StatusNotFound {
-			t.Fatalf("GET %s status = %d, want 404; body=%s", path, recorder.Code, recorder.Body.String())
+		if recorder.Code != http.StatusGone {
+			t.Fatalf("GET %s status = %d, want 410; body=%s", path, recorder.Code, recorder.Body.String())
 		}
 		message := errorBody(t, recorder)
 		if !strings.Contains(message, media.ErrGone.Error()) || !strings.Contains(message, "Could not find attachment with ID") {
 			t.Fatalf("GET %s error = %q, want the gone reason", path, message)
 		}
 	}
-	if calls != 3 {
-		t.Fatalf("transport calls = %d, want one per request", calls)
+	if calls != 1 {
+		t.Fatalf("transport calls = %d, want 1: the attachment is marked unavailable after the first", calls)
 	}
 	if recorder := serveMediaRequest(handler, http.MethodGet, "/api/media/v2msg:"+mediaGoneMessageID+":1", nil, nil); recorder.Code != http.StatusNotFound || errorBody(t, recorder) != "not found" {
 		t.Fatalf("GET unknown ordinal = %d %s, want plain 404", recorder.Code, recorder.Body.String())

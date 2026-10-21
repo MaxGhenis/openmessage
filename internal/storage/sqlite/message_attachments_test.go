@@ -352,3 +352,23 @@ func recordMessageAttachment(
 		t.Fatalf("commit attachment transaction: %v", err)
 	}
 }
+
+func TestMessageAttachmentUnavailableReason(t *testing.T) {
+	text := func(value string) *string { return &value }
+	for name, tc := range map[string]struct {
+		attachment MessageAttachment
+		reason     string
+		ok         bool
+	}{
+		"pending, no error":    {MessageAttachment{State: "pending"}, "", false},
+		"pending, transient":   {MessageAttachment{State: "pending", LastError: text("download_media: transient: offline")}, "", false},
+		"pending, unavailable": {MessageAttachment{State: "pending", LastError: text(UnavailableAttachmentErrorPrefix + "gone ")}, "gone", true},
+		"pending, receive":     {MessageAttachment{State: "pending", LastError: text(ReceiveAttachmentErrorPrefix + "reset")}, "reset", true},
+		"downloaded":           {MessageAttachment{State: "downloaded", LastError: text(UnavailableAttachmentErrorPrefix + "gone")}, "", false},
+	} {
+		reason, ok := tc.attachment.UnavailableReason()
+		if reason != tc.reason || ok != tc.ok {
+			t.Errorf("%s: UnavailableReason() = %q, %v; want %q, %v", name, reason, ok, tc.reason, tc.ok)
+		}
+	}
+}

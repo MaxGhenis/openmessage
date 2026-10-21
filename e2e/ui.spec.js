@@ -2625,3 +2625,43 @@ test('replays a reaction whose response was lost under the same key', async ({ p
   expect(bodies[1].idempotency_key).toBe(bodies[0].idempotency_key);
   expect(bodies[2].idempotency_key).not.toBe(bodies[0].idempotency_key);
 });
+
+test('marks an attachment the platform never delivered as unavailable instead of linking it', async ({ page }) => {
+  const marcusConversationID = await page.evaluate(async () => {
+    const response = await fetch('/api/conversations?limit=200');
+    const conversations = await response.json();
+    return conversations.find(conversation => conversation.Name === 'Marcus Johnson').ConversationID;
+  });
+  await page.route(new RegExp(`/api/conversations/${marcusConversationID}/messages\\?`), async route => {
+    const response = await route.fetch();
+    const payload = await response.json();
+    const messages = Array.isArray(payload) ? payload : (payload.messages || []);
+    const unavailable = {
+      MessageID: 'e2e-unavailable-attachment',
+      ConversationID: marcusConversationID,
+      SenderName: 'Marcus Johnson',
+      Body: 'here is the spec',
+      TimestampMS: Date.now(),
+      MediaID: 'v2msg:e2e-unavailable-attachment:0',
+      MimeType: 'text/html',
+      media_unavailable: 'media: attachment is no longer available from its transport: Signal never delivered attachment x.html',
+      source_platform: 'signal',
+    };
+    if (Array.isArray(payload)) {
+      payload.push(unavailable);
+    } else {
+      messages.push(unavailable);
+      payload.messages = messages;
+    }
+    await route.fulfill({ response, json: payload });
+  });
+
+  await page.locator('#conversation-list .convo-item').filter({ hasText: 'Marcus Johnson' }).first().click();
+  const message = page.locator('#messages-area .msg').filter({ hasText: 'here is the spec' }).first();
+  const card = message.locator('.msg-attachment-card.msg-attachment-unavailable');
+  await expect(card).toBeVisible();
+  await expect(card).toContainText('unavailable');
+  await expect(card).toContainText('Ask the sender to send it again.');
+  await expect(card).toHaveAttribute('title', /never delivered attachment/);
+  await expect(message.locator('a[href*="/api/media/"], img[src*="/api/media/"]')).toHaveCount(0);
+});

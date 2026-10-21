@@ -446,7 +446,7 @@ func TestDownloadMediaReportsAttachmentSignalCLINeverStoredAsGone(t *testing.T) 
 	if errors.As(err, &opErr) {
 		t.Fatalf("DownloadMedia() returned OpError %+v; an attachment signal-cli never stored is not a transient transport failure", opErr)
 	}
-	if !strings.Contains(err.Error(), "signal-cli did not store attachment Q3x9KpLmN2vB7cRtYw4z.html") ||
+	if !strings.Contains(err.Error(), "Signal never delivered attachment Q3x9KpLmN2vB7cRtYw4z.html") ||
 		!strings.Contains(err.Error(), "Could not find attachment with ID") {
 		t.Fatalf("DownloadMedia() error = %q, want the attachment id and signal-cli's answer", err)
 	}

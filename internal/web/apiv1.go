@@ -752,9 +752,10 @@ func v1ErrorResponse(err error) (int, string) {
 	case errors.Is(err, media.ErrUnavailable):
 		return http.StatusServiceUnavailable, err.Error()
 	case errors.Is(err, media.ErrGone):
-		// The message and its attachment row exist, but no download can
-		// produce the bytes: retrying the request will not help.
-		return http.StatusNotFound, err.Error()
+		// The message and its attachment exist, but no download can produce
+		// the bytes, and retrying will not help: 410, where 404 means an
+		// unknown message or ordinal.
+		return http.StatusGone, err.Error()
 	case errors.Is(err, media.ErrImportConflict):
 		return http.StatusConflict, err.Error()
 	case errors.Is(err, media.ErrImportMismatch):

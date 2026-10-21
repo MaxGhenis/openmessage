@@ -245,6 +245,12 @@ func (s *Source) mapMessage(
 	if ok {
 		dto.MediaID = fmt.Sprintf("v2msg:%s:%d", message.MessageID, attachment.Ordinal)
 		dto.MimeType = attachment.MIME
+		if reason, unavailable := attachment.UnavailableReason(); unavailable {
+			if reason == "" {
+				reason = "the platform never delivered this attachment"
+			}
+			dto.MediaUnavailable = reason
+		}
 	}
 	return dto, nil
 }

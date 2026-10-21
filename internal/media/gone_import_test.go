@@ -18,27 +18,55 @@ import (
 )
 
 func goneTransportError() error {
-	return fmt.Errorf("%w: signal-cli did not store attachment remote-gone.html when the message arrived and cannot download it again: %w",
+	return fmt.Errorf("%w: Signal never delivered attachment remote-gone.html: signal-cli could not download it when the message arrived and cannot fetch it again; the sender can send it again: %w",
 		bridge.ErrMediaGone, errors.New("download Signal attachment: exit status 1: Could not find attachment with ID: remote-gone.html"))
 }
 
-func TestResolveGoneTransportRecordsItAndStaysPending(t *testing.T) {
+func TestResolveGoneTransportMarksTheAttachmentUnavailableForGood(t *testing.T) {
 	env := newMediaTestEnvironment(t)
 	seedMediaMessage(t, env, "message-gone", []sqlite.MessageAttachment{{
 		Ordinal: 0, RemoteID: "remote-gone.html", Filename: "gone.html", MIME: "text/html",
 	}})
 	downloader := &scriptedDownloader{steps: []downloadStep{{err: goneTransportError()}}}
 	service := newMediaTestService(t, env, availableDownloadRegistry(downloader))
+	command := DownloadCommand{AccountID: "account-1", MessageID: "message-gone"}
 
-	_, err := service.Resolve(context.Background(), DownloadCommand{AccountID: "account-1", MessageID: "message-gone"})
+	_, err := service.Resolve(context.Background(), command)
 	if !errors.Is(err, ErrGone) || !errors.Is(err, bridge.ErrMediaGone) {
-		t.Fatalf("Resolve() error = %v, want ErrGone", err)
+		t.Fatalf("Resolve() error = %v, want ErrGone from the transport", err)
 	}
 	assertPendingWithoutBlob(t, env, "message-gone", 0)
 	lastError := attachmentLastError(t, env.dbPath, "message-gone", 0)
-	if !lastError.Valid || !strings.HasPrefix(lastError.String, ErrGone.Error()) ||
+	if !lastError.Valid || !strings.HasPrefix(lastError.String, sqlite.UnavailableAttachmentErrorPrefix) ||
 		!strings.Contains(lastError.String, "Could not find attachment with ID") {
-		t.Fatalf("last_error = %+v, want the gone failure", lastError)
+		t.Fatalf("last_error = %+v, want the unavailable marker and the transport's reason", lastError)
+	}
+	reason, unavailable := getMediaAttachment(t, env, "message-gone", 0).UnavailableReason()
+	if !unavailable || !strings.Contains(reason, "Could not find attachment with ID") {
+		t.Fatalf("UnavailableReason() = %q, %v", reason, unavailable)
+	}
+
+	// Terminal: later requests answer from the row; the transport is not asked.
+	for attempt := 2; attempt <= 3; attempt++ {
+		_, err = service.Resolve(context.Background(), command)
+		if !errors.Is(err, ErrGone) || !strings.Contains(err.Error(), "Could not find attachment with ID") {
+			t.Fatalf("Resolve() attempt %d error = %v, want ErrGone with the stored reason", attempt, err)
+		}
+	}
+	if downloader.requestCount() != 1 {
+		t.Fatalf("transport calls = %d, want 1: an unavailable attachment is not re-fetched", downloader.requestCount())
+	}
+
+	// An import still fills it.
+	content := []byte("<html>resent</html>")
+	if _, imported, err := service.Import(context.Background(), importCommand("message-gone", content, "")); err != nil || !imported {
+		t.Fatalf("Import(unavailable attachment) = imported=%v, %v", imported, err)
+	}
+	if descriptor, err := service.Resolve(context.Background(), command); err != nil || descriptor.Ref.Hash != sha256Hex(content) {
+		t.Fatalf("Resolve() after import = %+v, %v", descriptor, err)
+	}
+	if _, unavailable := getMediaAttachment(t, env, "message-gone", 0).UnavailableReason(); unavailable {
+		t.Fatal("an imported attachment still reads as unavailable")
 	}
 }
 
@@ -48,7 +76,13 @@ func TestResolveGoneTransportKeepsReceiveTimeCause(t *testing.T) {
 	seedMediaMessage(t, env, "message-gone-cause", []sqlite.MessageAttachment{{
 		Ordinal: 0, RemoteID: "remote-gone.html", Filename: "gone.html", MIME: "text/html", LastError: &cause,
 	}})
-	downloader := &scriptedDownloader{steps: []downloadStep{{err: goneTransportError()}, {err: goneTransportError()}}}
+	// Already unavailable as projected: the transport reported the failure
+	// with the message.
+	if reason, unavailable := getMediaAttachment(t, env, "message-gone-cause", 0).UnavailableReason(); !unavailable ||
+		reason != "java.io.IOException: Connection reset" {
+		t.Fatalf("UnavailableReason() before any download = %q, %v", reason, unavailable)
+	}
+	downloader := &scriptedDownloader{steps: []downloadStep{{err: goneTransportError()}}}
 	service := newMediaTestService(t, env, availableDownloadRegistry(downloader))
 	command := DownloadCommand{AccountID: "account-1", MessageID: "message-gone-cause"}
 
@@ -57,15 +91,40 @@ func TestResolveGoneTransportKeepsReceiveTimeCause(t *testing.T) {
 		if !errors.Is(err, ErrGone) {
 			t.Fatalf("Resolve() attempt %d error = %v, want ErrGone", attempt, err)
 		}
-		if !strings.HasSuffix(err.Error(), "(when the message arrived: java.io.IOException: Connection reset)") {
+		if !strings.HasSuffix(err.Error(), "(when the message arrived: java.io.IOException: Connection reset)") ||
+			strings.Count(err.Error(), "(when the message arrived:") != 1 {
 			t.Fatalf("Resolve() attempt %d error = %q, want the receive-time cause appended once", attempt, err)
 		}
-		if got := attachmentLastError(t, env.dbPath, "message-gone-cause", 0); !got.Valid || got.String != cause {
-			t.Fatalf("last_error after attempt %d = %+v, want the receive-time cause kept", attempt, got)
+		got := attachmentLastError(t, env.dbPath, "message-gone-cause", 0)
+		if !got.Valid || !strings.HasPrefix(got.String, sqlite.UnavailableAttachmentErrorPrefix) ||
+			!strings.HasSuffix(got.String, "(when the message arrived: java.io.IOException: Connection reset)") {
+			t.Fatalf("last_error after attempt %d = %+v, want unavailable with the receive-time cause", attempt, got)
 		}
 	}
-	if downloader.requestCount() != 2 {
-		t.Fatalf("transport calls = %d, want every request to re-ask the transport", downloader.requestCount())
+	if downloader.requestCount() != 1 {
+		t.Fatalf("transport calls = %d, want only the first request to ask the transport", downloader.requestCount())
+	}
+}
+
+func TestResolveTransientFailureKeepsTheReceiveTimeCause(t *testing.T) {
+	env := newMediaTestEnvironment(t)
+	cause := sqlite.ReceiveAttachmentErrorPrefix + "java.io.IOException: Connection reset"
+	seedMediaMessage(t, env, "message-offline", []sqlite.MessageAttachment{{
+		Ordinal: 0, RemoteID: "remote-offline.html", MIME: "text/html", LastError: &cause,
+	}})
+	offline := bridge.OpError{Class: bridge.FailureTransient, Operation: "download_media", Cause: errors.New("Signal is not connected")}
+	downloader := &scriptedDownloader{steps: []downloadStep{{err: offline}, {err: goneTransportError()}}}
+	service := newMediaTestService(t, env, availableDownloadRegistry(downloader))
+	command := DownloadCommand{AccountID: "account-1", MessageID: "message-offline"}
+
+	if _, err := service.Resolve(context.Background(), command); errors.Is(err, ErrGone) || err == nil {
+		t.Fatalf("Resolve(offline) error = %v, want the transient failure", err)
+	}
+	if got := attachmentLastError(t, env.dbPath, "message-offline", 0); !got.Valid || got.String != cause {
+		t.Fatalf("last_error after a transient failure = %+v, want the receive-time cause kept", got)
+	}
+	if _, err := service.Resolve(context.Background(), command); !errors.Is(err, ErrGone) {
+		t.Fatalf("Resolve(back online) error = %v, want ErrGone", err)
 	}
 }
 

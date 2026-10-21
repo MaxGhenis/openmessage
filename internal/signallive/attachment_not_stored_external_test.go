@@ -108,9 +108,10 @@ func (c *notStoredSignalCLI) calls() [][]string {
 // Before the fix the attachment was recorded with size 0 and no cause, and
 // every download attempt came back as a transient OpError (served as a 500)
 // that the next request retried forever. Now the row carries the declared
-// size and signal-cli's receive-time cause, the download reports
-// media.ErrGone with that cause, and a copy of the file obtained elsewhere
-// can be imported once.
+// size and signal-cli's receive-time cause; the first download reports
+// media.ErrGone with that cause and marks the attachment unavailable for
+// good, so later requests answer without running signal-cli again; and a
+// copy of the file obtained elsewhere can still be imported once.
 func TestSignalAttachmentSignalCLINeverStoredIsGoneNotTransient(t *testing.T) {
 	pngBytes := []byte("\x89PNG\r\n\x1a\nstored by signal-cli")
 	cli := installNotStoredSignalCLI(t, map[string][]byte{storedAttachmentID: pngBytes})
@@ -199,7 +200,8 @@ func TestSignalAttachmentSignalCLINeverStoredIsGoneNotTransient(t *testing.T) {
 
 	for attempt := 1; attempt <= 2; attempt++ {
 		_, err = service.Resolve(context.Background(), htmlCommand)
-		if !errors.Is(err, media.ErrGone) || !errors.Is(err, bridge.ErrMediaGone) {
+		// The first answer comes from the transport; the second from the row.
+		if !errors.Is(err, media.ErrGone) || (attempt == 1 && !errors.Is(err, bridge.ErrMediaGone)) {
 			t.Fatalf("Resolve(html) attempt %d error = %v, want media.ErrGone", attempt, err)
 		}
 		var opErr bridge.OpError
@@ -207,25 +209,29 @@ func TestSignalAttachmentSignalCLINeverStoredIsGoneNotTransient(t *testing.T) {
 			t.Fatalf("Resolve(html) attempt %d returned OpError %+v; a missing signal-cli file is not a transport failure to retry", attempt, opErr)
 		}
 		for _, want := range []string{
-			"signal-cli did not store attachment " + notStoredAttachmentID,
+			"Signal never delivered attachment " + notStoredAttachmentID,
 			"Could not find attachment with ID: " + notStoredAttachmentID,
 			"when the message arrived: java.io.IOException: Connection reset",
 		} {
 			if !strings.Contains(err.Error(), want) {
-				t.Fatalf("Resolve(html) error %q does not mention %q", err, want)
+				t.Fatalf("Resolve(html) attempt %d error %q does not mention %q", attempt, err, want)
 			}
 		}
 		after, err := attachments.GetForDownload(context.Background(), htmlMessage.MessageID, 0)
 		if err != nil {
 			t.Fatalf("GetForDownload(html) after attempt %d: %v", attempt, err)
 		}
-		if after.State != "pending" || after.LastError == nil || *after.LastError != wantCause {
-			t.Fatalf("html attachment after attempt %d = %+v, want pending with the receive-time cause kept", attempt, after)
+		reason, unavailable := after.UnavailableReason()
+		if after.State != "pending" || !unavailable || after.LastError == nil ||
+			!strings.HasPrefix(*after.LastError, sqlite.UnavailableAttachmentErrorPrefix) ||
+			!strings.HasSuffix(reason, "(when the message arrived: java.io.IOException: Connection reset <- java.net.SocketException: Connection reset)") {
+			t.Fatalf("html attachment after attempt %d = %+v, want pending, marked unavailable, keeping the receive-time cause", attempt, after)
 		}
 	}
+	// Only the first request asks signal-cli; the second answers from the row.
 	wantArgv := []string{"-a", quoteDiffAccount, "getAttachment", "--id", notStoredAttachmentID, "--recipient", notStoredSender}
-	if calls := cli.calls(); len(calls) != 2 || !slices.Equal(calls[0], wantArgv) {
-		t.Fatalf("getAttachment calls = %q, want two of %q", calls, wantArgv)
+	if calls := cli.calls(); len(calls) != 1 || !slices.Equal(calls[0], wantArgv) {
+		t.Fatalf("getAttachment calls = %q, want exactly one %q", calls, wantArgv)
 	}
 
 	pngDescriptor, err := service.Resolve(context.Background(), media.DownloadCommand{
@@ -273,7 +279,7 @@ func TestSignalAttachmentSignalCLINeverStoredIsGoneNotTransient(t *testing.T) {
 	if err != nil || !bytes.Equal(got, copyBytes) {
 		t.Fatalf("served html bytes differ from the imported copy (err %v)", err)
 	}
-	if calls := cli.calls(); len(calls) != 3 {
-		t.Fatalf("getAttachment calls after import = %d, want 3 (none for the downloaded HTML)", len(calls))
+	if calls := cli.calls(); len(calls) != 2 {
+		t.Fatalf("getAttachment calls after import = %d, want 2 (one each for the HTML and the PNG)", len(calls))
 	}
 }
