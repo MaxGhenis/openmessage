@@ -266,11 +266,11 @@ func TestMarkReadStopsAtTheFirstFailedReceipt(t *testing.T) {
 	}
 }
 
-// A group receipt whose sender names no member is refused by the retained
-// core before anything is sent, and retrying cannot name it either, so the
-// adapter reports it as unsupported: the dispatcher rejects the row and keeps
-// the read cursor.
-func TestMarkReadRefusesAGroupReceiptWhoseSenderNamesNoMember(t *testing.T) {
+// A group receipt whose stored sender is neither a user's JID nor a phone
+// number is refused by the retained core before anything is sent, and
+// retrying cannot name it either, so the adapter reports it as unsupported:
+// the dispatcher rejects the row and keeps the read cursor.
+func TestMarkReadRefusesAGroupReceiptWhoseSenderIsNotAJIDOrNumber(t *testing.T) {
 	for _, test := range []struct {
 		name    string
 		request func(string, []string, string, time.Time) error
@@ -291,17 +291,79 @@ func TestMarkReadRefusesAGroupReceiptWhoseSenderNamesNoMember(t *testing.T) {
 			a := &Adapter{mediaReady: func() bool { return true }, markReadRequest: test.request}
 			err := a.MarkRead(context.Background(), bridge.ReadReceiptRequest{
 				Conversation: bridge.ConversationRef{RemoteID: "whatsapp:120363019999999999@g.us"},
-				Messages:     []bridge.MessageRef{{RemoteID: "message-one", AuthorID: ""}},
+				Messages:     []bridge.MessageRef{{RemoteID: "message-one", AuthorID: "Me"}},
 			})
 			failure, ok := asOpError(err)
 			if !ok || failure.Class != bridge.FailureUnsupported ||
 				failure.Dispatch != bridge.DispatchNotCalled ||
 				failure.Operation != "mark_read" ||
-				failure.Fingerprint != "whatsapp_read_receipt_sender_unavailable" ||
+				failure.Fingerprint != "whatsapp_read_receipt_sender_invalid" ||
 				!errors.Is(failure.Cause, whatsapplive.ErrReadReceiptSenderUnknown) {
-				t.Fatalf("MarkRead() error = %v, want the unsupported unnamed-sender refusal", err)
+				t.Fatalf("MarkRead() error = %v, want the unsupported unparseable-sender refusal", err)
 			}
 		})
+	}
+}
+
+// A refused sender does not hold up the others: their receipts are still
+// sent, and the refusal is reported (as unsupported) once they are, whichever
+// batch it came from.
+func TestMarkReadSendsTheOtherSendersReceiptsPastARefusedOne(t *testing.T) {
+	refusal := fmt.Errorf("mark read: %w", whatsapplive.ErrReadReceiptSenderUnknown)
+	for refusedAt := 0; refusedAt < 3; refusedAt++ {
+		t.Run(strconv.Itoa(refusedAt), func(t *testing.T) {
+			errs := make([]error, 3)
+			errs[refusedAt] = refusal
+			var calls []readReceiptCall
+			err := recordingReadAdapter(&calls, errs...).MarkRead(context.Background(), bridge.ReadReceiptRequest{
+				Conversation: bridge.ConversationRef{RemoteID: "whatsapp:120363019999999999@g.us"},
+				Messages: []bridge.MessageRef{
+					{RemoteID: "message-one", AuthorID: "+15557654321"},
+					{RemoteID: "message-two", AuthorID: "+15550000000"},
+					{RemoteID: "message-three", AuthorID: "+15551111111"},
+				},
+			})
+			if len(calls) != 3 {
+				t.Fatalf("MarkRead transport calls = %d, want all three senders", len(calls))
+			}
+			failure, ok := asOpError(err)
+			if !ok || failure.Class != bridge.FailureUnsupported ||
+				failure.Dispatch != bridge.DispatchNotCalled ||
+				failure.Fingerprint != "whatsapp_read_receipt_sender_invalid" ||
+				!errors.Is(failure.Cause, whatsapplive.ErrReadReceiptSenderUnknown) {
+				t.Fatalf("MarkRead() error = %v, want the unsupported refusal", err)
+			}
+		})
+	}
+}
+
+// Once the request's context ends (callTransport abandons a call that
+// outlives its bound), no further receipt is sent.
+func TestMarkReadSendsNoFurtherReceiptAfterItsContextEnds(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var calls int
+	a := &Adapter{
+		mediaReady: func() bool { return true },
+		markReadRequest: func(string, []string, string, time.Time) error {
+			calls++
+			cancel()
+			return nil
+		},
+	}
+	err := a.MarkRead(ctx, bridge.ReadReceiptRequest{
+		Messages: []bridge.MessageRef{
+			{RemoteID: "message-one", AuthorID: "+15557654321"},
+			{RemoteID: "message-two", AuthorID: "+15550000000"},
+		},
+	})
+	if calls != 1 {
+		t.Fatalf("MarkRead transport calls = %d, want one (none after the context ended)", calls)
+	}
+	failure, ok := asOpError(err)
+	if !ok || failure.Fingerprint != "whatsapp_mark_read_context_done" ||
+		failure.Dispatch != bridge.DispatchNotCalled || !errors.Is(failure.Cause, context.Canceled) {
+		t.Fatalf("MarkRead() error = %v, want the context-done failure", err)
 	}
 }
 

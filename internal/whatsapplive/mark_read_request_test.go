@@ -244,6 +244,7 @@ func TestMarkReadRequestTransportErrorIsWrappedAndReported(t *testing.T) {
 // readReceiptTestCall is one receipt whatsmeow's MarkRead was asked to send.
 type readReceiptTestCall struct {
 	ctx    context.Context
+	ctxErr error // ctx.Err() when MarkRead was called
 	ids    []watypes.MessageID
 	chat   watypes.JID
 	sender watypes.JID
@@ -280,6 +281,7 @@ func newReadReceiptTestTransport(t *testing.T) *readReceiptTestTransport {
 	markReadMessages = func(_ *whatsmeow.Client, ctx context.Context, ids []watypes.MessageID, _ time.Time, chat, sender watypes.JID, _ ...watypes.ReceiptType) error {
 		transport.receipts = append(transport.receipts, readReceiptTestCall{
 			ctx:    ctx,
+			ctxErr: ctx.Err(),
 			ids:    append([]watypes.MessageID(nil), ids...),
 			chat:   chat,
 			sender: sender,
@@ -426,9 +428,10 @@ func TestMarkReadRequestNamesAGroupSenderInTheFormItsMessagesArrivedWith(t *test
 			if len(receipt.ids) != 2 || receipt.ids[0] != "message-one" || receipt.ids[1] != "message-two" {
 				t.Fatalf("receipt IDs = %q, want both messages under the one sender", receipt.ids)
 			}
-			// Only a phone number has another form to look up.
+			// Only a phone number whose LID is known has another form, so
+			// only then is the group's addressing looked up.
 			wantLookups := 0
-			if !strings.Contains(test.sender, "@") {
+			if _, known := test.lids[senderTestLID]; known && !strings.Contains(test.sender, "@") {
 				wantLookups = 1
 			}
 			if len(transport.lookups) != wantLookups {
@@ -440,8 +443,8 @@ func TestMarkReadRequestNamesAGroupSenderInTheFormItsMessagesArrivedWith(t *test
 
 // whatsmeow's MarkRead sends no participant in a 1:1 chat with a phone number
 // or a LID, so the stored sender only has to parse there. The group's
-// addressing is not looked up, and a sender that names no one is left out as
-// a missing one is, rather than refused.
+// addressing is not looked up, and a sender that is neither a JID nor a number
+// is left out as a missing one is, rather than refused.
 func TestMarkReadRequestNamesADirectChatSenderOfEitherForm(t *testing.T) {
 	for _, test := range []struct {
 		chat   string
@@ -450,6 +453,7 @@ func TestMarkReadRequestNamesADirectChatSenderOfEitherForm(t *testing.T) {
 	}{
 		{chat: "whatsapp:" + senderTestPhone + "@s.whatsapp.net", sender: senderTestLID + "@lid", want: senderTestLID + "@lid"},
 		{chat: "whatsapp:" + senderTestLID + "@lid", sender: senderTestLID + "@lid", want: senderTestLID + "@lid"},
+		{chat: "whatsapp:" + senderTestLID + "@lid", sender: "+" + senderTestPhone, want: senderTestPhone + "@s.whatsapp.net"},
 		{chat: "whatsapp:" + senderTestPhone + "@s.whatsapp.net", sender: "+" + senderTestPhone, want: senderTestPhone + "@s.whatsapp.net"},
 		{chat: "whatsapp:" + senderTestPhone + "@s.whatsapp.net", sender: "", want: ""},
 		{chat: "whatsapp:" + senderTestPhone + "@s.whatsapp.net", sender: senderTestLID + "@lid@s.whatsapp.net", want: ""},
@@ -482,8 +486,8 @@ func TestMarkReadRequestNamesADirectChatSenderOfEitherForm(t *testing.T) {
 
 // In a chat that is neither a group nor a 1:1 chat, such as a bot's, MarkRead
 // does send a participant. A sender's JID goes out as stored (before, a bot
-// went out as "<id>@bot@s.whatsapp.net"), and a sender that names no one is
-// left out as a missing one is.
+// went out as "<id>@bot@s.whatsapp.net"), and a sender that is neither a JID
+// nor a number is left out as a missing one is.
 func TestMarkReadRequestNamesABotChatSenderAsStored(t *testing.T) {
 	const bot = "867051314767696@bot"
 	for _, test := range []struct {
@@ -509,18 +513,17 @@ func TestMarkReadRequestNamesABotChatSenderAsStored(t *testing.T) {
 	}
 }
 
-// A group receipt must name the sender of the messages it covers (whatsmeow's
-// MarkRead requires one in a group), so a group message stored with no sender,
-// or with one that is neither a user's JID nor a phone number, cannot be
-// marked read. The receipt is refused before anything is sent, even while
-// disconnected; before, it went out naming no participant, or one no message
-// has. That includes the group's own JID, which the history decoder stores as
-// the sender of a group message that names no participant. In a 1:1 chat the
-// same receipt goes out with no sender, which MarkRead does not send anyway.
-func TestMarkReadRequestRefusesAGroupSenderThatIsMissingOrNamesNoMember(t *testing.T) {
+// A group receipt names the sender of the messages it covers (MarkRead's
+// documentation requires one in a group), so a group message stored with a
+// sender that is neither a user's JID nor a phone number cannot be marked
+// read. The receipt is refused before anything is sent, even while
+// disconnected; before, it went out naming "<value>@s.whatsapp.net", which no
+// message has. That includes the group's own JID, which the history decoder
+// stores as the sender of a group message that names no participant. In a 1:1
+// chat the same receipt goes out with no sender, which MarkRead does not send
+// anyway.
+func TestMarkReadRequestRefusesAGroupSenderThatIsNotAJIDOrNumber(t *testing.T) {
 	for _, sender := range []string{
-		"",
-		"  ",
 		"@lid",
 		senderTestLID + "@",
 		senderTestLID + "@lid@s.whatsapp.net",
@@ -536,7 +539,7 @@ func TestMarkReadRequestRefusesAGroupSenderThatIsMissingOrNamesNoMember(t *testi
 			transport := newReadReceiptTestTransport(t)
 			err := senderTestBridge(senderTestLIDs{}).MarkReadRequest(senderTestGroup, []string{"message-one"}, sender, time.Now())
 			if !errors.Is(err, ErrReadReceiptSenderUnknown) || !errors.Is(err, ErrSendNotDispatched) {
-				t.Fatalf("MarkReadRequest() error = %v, want the unnamed-sender refusal marked not dispatched", err)
+				t.Fatalf("MarkReadRequest() error = %v, want the unparseable-sender refusal marked not dispatched", err)
 			}
 			if len(transport.receipts) != 0 || len(transport.lookups) != 0 {
 				t.Fatalf("receipts = %d, lookups = %d, want none", len(transport.receipts), len(transport.lookups))
@@ -565,7 +568,8 @@ func TestMarkReadRequestRefusesAGroupSenderThatIsMissingOrNamesNoMember(t *testi
 // LID server, no device) and covers every message ID in request order. A
 // stored LID is sent as stored, with no lookup. A stored phone number is sent
 // as its LID exactly when the group addresses members by LID and the LID is
-// known, and as the phone number otherwise, after at most one lookup.
+// known, and as the phone number otherwise; the addressing is looked up once
+// when the LID is known and not at all otherwise.
 func TestMarkReadRequestGroupParticipantProperty(t *testing.T) {
 	type input struct {
 		Phone     uint64
@@ -603,12 +607,15 @@ func TestMarkReadRequestGroupParticipantProperty(t *testing.T) {
 			ids[i] = "message-" + strconv.Itoa(i)
 		}
 
-		sender, want, maxLookups := "+"+phone, phone+"@s.whatsapp.net", 1
+		sender, want, wantLookups := "+"+phone, phone+"@s.whatsapp.net", 0
 		if in.NoPlus {
 			sender = phone
 		}
+		if !in.StoredLID && in.Known {
+			wantLookups = 1
+		}
 		if in.StoredLID {
-			sender, want, maxLookups = lid+"@lid", lid+"@lid", 0
+			sender, want = lid+"@lid", lid+"@lid"
 		} else if transport.mode == watypes.AddressingModeLID && transport.lookupErr == nil && in.Known {
 			want = lid + "@lid"
 		}
@@ -627,7 +634,7 @@ func TestMarkReadRequestGroupParticipantProperty(t *testing.T) {
 		for i := 0; coversAll && i < len(ids); i++ {
 			coversAll = string(receipt.ids[i]) == ids[i]
 		}
-		if !wellFormed || participant != want || !coversAll || len(transport.lookups) > maxLookups {
+		if !wellFormed || participant != want || !coversAll || len(transport.lookups) != wantLookups {
 			t.Logf("sender %q, mode %q, lookup error %v, known %t: participant %q (want %q), ids %q, lookups %d",
 				sender, transport.mode, transport.lookupErr, in.Known, participant, want, receipt.ids, len(transport.lookups))
 			return false
@@ -671,19 +678,90 @@ func TestMarkReadRequestFindsAGroupSendersLIDInTheSessionStore(t *testing.T) {
 }
 
 // The addressing lookup can fetch the group from WhatsApp, so it runs under
-// the receipt's own deadline rather than an unbounded context.
-func TestMarkReadRequestLooksUpGroupAddressingUnderTheReceiptsDeadline(t *testing.T) {
+// its own deadline, shorter than and inside the receipt's 45 s one.
+func TestMarkReadRequestBoundsTheGroupAddressingLookup(t *testing.T) {
 	transport := newReadReceiptTestTransport(t)
-	if err := senderTestBridge(senderTestLIDs{}).MarkReadRequest(senderTestGroup, []string{"message-one"}, "+"+senderTestPhone, time.Now()); err != nil {
+	started := time.Now()
+	lids := senderTestLIDs{senderTestLID: senderTestPhone}
+	if err := senderTestBridge(lids).MarkReadRequest(senderTestGroup, []string{"message-one"}, "+"+senderTestPhone, time.Now()); err != nil {
 		t.Fatalf("MarkReadRequest() error = %v", err)
 	}
 	if len(transport.lookupCtxs) != 1 || len(transport.receipts) != 1 {
 		t.Fatalf("lookups = %d, receipts = %d, want one of each", len(transport.lookupCtxs), len(transport.receipts))
 	}
-	if _, ok := transport.lookupCtxs[0].Deadline(); !ok {
-		t.Fatal("group addressing lookup context has no deadline")
+	lookupDeadline, ok := transport.lookupCtxs[0].Deadline()
+	if !ok || lookupDeadline.After(started.Add(readReceiptAddressingTimeout+time.Second)) {
+		t.Fatalf("lookup deadline = %v (set %t), want within %s", lookupDeadline, ok, readReceiptAddressingTimeout)
 	}
-	if transport.lookupCtxs[0] != transport.receipts[0].ctx {
-		t.Fatal("group addressing lookup ran under a different context than the receipt")
+	receiptDeadline, ok := transport.receipts[0].ctx.Deadline()
+	if !ok || receiptDeadline.After(started.Add(46*time.Second)) || !receiptDeadline.After(lookupDeadline) {
+		t.Fatalf("receipt deadline = %v (set %t), want after the lookup's %v and within 45 s", receiptDeadline, ok, lookupDeadline)
+	}
+}
+
+// A group fetch that goes unanswered gives up at the lookup's own deadline,
+// and the receipt still goes out, naming the stored sender, under a context
+// with time left.
+func TestMarkReadRequestSendsTheStoredSenderWhenTheAddressingLookupHangs(t *testing.T) {
+	transport := newReadReceiptTestTransport(t)
+	originalTimeout := readReceiptAddressingTimeout
+	t.Cleanup(func() { readReceiptAddressingTimeout = originalTimeout })
+	readReceiptAddressingTimeout = 20 * time.Millisecond
+	groupAddressingMode = func(_ *whatsmeow.Client, ctx context.Context, _ watypes.JID) (watypes.AddressingMode, error) {
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-time.After(5 * time.Second):
+			return "", errors.New("lookup was not bounded")
+		}
+	}
+
+	lids := senderTestLIDs{senderTestLID: senderTestPhone}
+	if err := senderTestBridge(lids).MarkReadRequest(senderTestGroup, []string{"message-one"}, "+"+senderTestPhone, time.Now()); err != nil {
+		t.Fatalf("MarkReadRequest() error = %v", err)
+	}
+	if len(transport.receipts) != 1 {
+		t.Fatalf("receipts sent = %d, want one", len(transport.receipts))
+	}
+	receipt := transport.receipts[0]
+	if got := receipt.sender.String(); got != senderTestPhone+"@s.whatsapp.net" {
+		t.Fatalf("receipt participant = %q, want the stored phone number", got)
+	}
+	if receipt.ctxErr != nil {
+		t.Fatalf("receipt context had ended (%v) when MarkRead was called, want time left", receipt.ctxErr)
+	}
+}
+
+// This account's own messages are stored with no sender (ingest and migration
+// give an outgoing message no sender identity), and a read cursor may rest on
+// one. An empty sender is not refused: the receipt goes out with no
+// participant in a group, as before, and nothing is looked up.
+func TestMarkReadRequestSendsAGroupReceiptWithNoStoredSenderWithoutAParticipant(t *testing.T) {
+	for _, sender := range []string{"", "  "} {
+		t.Run(strconv.Quote(sender), func(t *testing.T) {
+			transport := newReadReceiptTestTransport(t)
+			if err := senderTestBridge(senderTestLIDs{}).MarkReadRequest(senderTestGroup, []string{"message-one"}, sender, time.Now()); err != nil {
+				t.Fatalf("MarkReadRequest() error = %v", err)
+			}
+			if len(transport.receipts) != 1 || !transport.receipts[0].sender.IsEmpty() {
+				t.Fatalf("receipts = %+v, want one with no participant", transport.receipts)
+			}
+			if len(transport.lookups) != 0 {
+				t.Fatalf("group addressing lookups = %v, want none", transport.lookups)
+			}
+		})
+	}
+}
+
+// The refusal covers groups only. A broadcast chat's receipt carries a
+// participant too, but a sender there that is neither a JID nor a number is
+// left out rather than refused, as in other chats that are not groups.
+func TestMarkReadRequestLeavesAnUnparseableBroadcastSenderOut(t *testing.T) {
+	transport := newReadReceiptTestTransport(t)
+	if err := senderTestBridge(senderTestLIDs{}).MarkReadRequest("whatsapp:status@broadcast", []string{"message-one"}, "Me", time.Now()); err != nil {
+		t.Fatalf("MarkReadRequest() error = %v", err)
+	}
+	if len(transport.receipts) != 1 || !transport.receipts[0].sender.IsEmpty() {
+		t.Fatalf("receipts = %+v, want one with no participant", transport.receipts)
 	}
 }

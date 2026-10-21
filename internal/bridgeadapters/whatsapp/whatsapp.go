@@ -253,10 +253,16 @@ func (a *Adapter) MarkRead(ctx context.Context, req bridge.ReadReceiptRequest) e
 
 	// whatsmeow's MarkRead names one sender for every message a receipt
 	// covers, so messages from different senders go out as one receipt per
-	// sender, in the order each sender first appears. (The dispatcher sends
-	// one message per receipt.) A failure ends the request, and a retry sends
-	// the receipts before it again, which is harmless.
+	// sender, in the order each sender first appears. (The dispatcher puts one
+	// message in each request.) A transport failure ends the request, and a
+	// retry sends the receipts before it again, which is harmless. A sender
+	// the retained core refuses to name does not hold up the others: their
+	// receipts are still sent, and the refusal is reported once they are.
+	var refused error
 	for _, batch := range readReceiptBatches(req.Messages) {
+		if err := ctx.Err(); err != nil {
+			return whatsappReadPreCallFailure("whatsapp_mark_read_context_done", err)
+		}
 		err := a.markReadRequest(
 			req.Conversation.RemoteID,
 			batch.messageIDs,
@@ -264,15 +270,8 @@ func (a *Adapter) MarkRead(ctx context.Context, req bridge.ReadReceiptRequest) e
 			req.ReadAt,
 		)
 		if errors.Is(err, whatsapplive.ErrReadReceiptSenderUnknown) {
-			// Nothing was sent for this sender, and sending again cannot name
-			// it either.
-			return bridge.OpError{
-				Class:       bridge.FailureUnsupported,
-				Operation:   "mark_read",
-				Fingerprint: "whatsapp_read_receipt_sender_unavailable",
-				Dispatch:    bridge.DispatchNotCalled,
-				Cause:       err,
-			}
+			refused = err
+			continue
 		}
 		if err != nil {
 			// Deliberately no adapter-level lifecycle report: the retained core owns
@@ -284,6 +283,17 @@ func (a *Adapter) MarkRead(ctx context.Context, req bridge.ReadReceiptRequest) e
 			// still rejected by their classification before certainty is consulted.
 			failure.Dispatch = bridge.DispatchNotCalled
 			return failure
+		}
+	}
+	if refused != nil {
+		// Nothing was sent for that sender, and sending again cannot name it
+		// either.
+		return bridge.OpError{
+			Class:       bridge.FailureUnsupported,
+			Operation:   "mark_read",
+			Fingerprint: "whatsapp_read_receipt_sender_invalid",
+			Dispatch:    bridge.DispatchNotCalled,
+			Cause:       refused,
 		}
 	}
 	return nil
