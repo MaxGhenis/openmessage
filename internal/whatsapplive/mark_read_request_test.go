@@ -526,10 +526,10 @@ func TestMarkReadRequestNamesABotChatSenderAsStored(t *testing.T) {
 // sender that is neither a user's JID nor a phone number cannot be marked
 // read. The receipt is refused before anything is sent, even while
 // disconnected; before, it went out naming "<value>@s.whatsapp.net", which no
-// message has (a bare "+" went out with no participant). That includes the group's own JID, which the history decoder
-// stores as the sender of a group message that names no participant. In a 1:1
-// chat the same receipt goes out with no sender, which MarkRead does not send
-// anyway.
+// message has (a bare "+" went out with no participant). That includes the
+// group's own JID, which the history decoder stores as the sender of a group
+// message that names no participant. In a 1:1 chat the same receipt goes out
+// with no sender, which MarkRead does not send anyway.
 func TestMarkReadRequestRefusesAGroupSenderThatIsNotAJIDOrNumber(t *testing.T) {
 	for _, sender := range []string{
 		"@lid",
@@ -761,8 +761,9 @@ func TestMarkReadRequestSendsTheStoredSenderWhenTheAddressingLookupHangs(t *test
 
 // This account's own messages are stored with no sender (neither the send
 // path, ingest nor migration gives an outgoing message a sender identity), and
-// a read cursor may rest on one. An empty sender is not refused: the receipt goes out with no
-// participant in a group, as before, and nothing is looked up.
+// a read cursor may rest on one. An empty sender is not refused: the receipt
+// goes out with no participant in a group, as before, and nothing is looked
+// up.
 func TestMarkReadRequestSendsAGroupReceiptWithNoStoredSenderWithoutAParticipant(t *testing.T) {
 	for _, sender := range []string{"", "  "} {
 		t.Run(strconv.Quote(sender), func(t *testing.T) {
