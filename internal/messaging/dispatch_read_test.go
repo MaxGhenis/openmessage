@@ -453,3 +453,36 @@ func mustMarkDispatchRead(
 	}
 	return submission
 }
+
+// A read receipt is not held for its target's send the way a reaction is: it
+// says how far the conversation is read, so it goes out even when the last
+// message read is this account's own, still waiting to be sent.
+func TestReadReceiptToAnUnsentOwnMessageIsNotHeld(t *testing.T) {
+	clock := newManualClock(messagingTestTime)
+	store := openMessagingTestStore(t, clock.Now())
+	seedDispatchDevice(t, store, "device-read-unsent", clock.Now())
+	sender := &scriptedReadReceiptSender{}
+	registry := newScriptedRegistry("read-unsent", &scriptedTextSender{})
+	registry.setReadReceiptSender(sender)
+	registry.setAvailable(true)
+	service := newMessagingTestService(t, store, registry, clock)
+	scheduled := testCommonCommand("read-unsent-send")
+	scheduled.NotBefore = clock.Now().Add(24 * time.Hour)
+	target := mustSendText(t, service, SendTextCommand{CommonCommand: scheduled, Body: "not sent yet"})
+	submission := mustMarkDispatchRead(t, service, MarkReadCommand{
+		CommonCommand:     testCommonCommand("read-unsent"),
+		DeviceID:          "device-read-unsent",
+		LastReadMessageID: target.LocalMessageID,
+		LastReadAt:        clock.Now(),
+	})
+
+	if processed, err := service.DispatchDue(context.Background(), 4); err != nil || processed != 1 {
+		t.Fatalf("DispatchDue(read) = %d, %v; want the read receipt, nil", processed, err)
+	}
+	if got := sender.requestCount(); got != 1 {
+		t.Fatalf("read requests = %d, want the receipt sent, not held", got)
+	}
+	if delivery := mustDelivery(t, service, submission.OutboxID); delivery.State != OutboxConfirmed {
+		t.Fatalf("read delivery = %+v, want confirmed", delivery)
+	}
+}

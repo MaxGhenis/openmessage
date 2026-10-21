@@ -128,37 +128,107 @@ the v2 store one outbox row sits in `dispatching` with `transport_called_at_ms`
 set and `lease_expires_at_ms` long past; later rows stay `queued`.
 
 **Cause:** the dispatch loop (`MessageService.Run` → `DispatchDue`) makes one
-transport call at a time and waits for it. libgm waits for the phone's answer
-to a request with no timeout (`waitForResponse` in the fork's
+transport call at a time and waits for it. libgm used to wait for the phone's
+answer to a request with no timeout (`waitForResponse` in the fork's
 `pkg/libgm/session_handler.go`: "TODO hard timeout?"). On 10/20 a Google text
 send at 15:55 got no answer, so the loop waited three and a half hours and a
 19:17 text sat queued until the app restarted. Lease recovery could not help:
 it runs at startup and between the calls of a batch, never while the loop is
 blocked.
 
-**Fix:** each transport call (text, media, reaction, read receipt; any
-platform) has a hard bound: 60 s, or 5 minutes for media, whose call includes
-the upload. A call past its bound is abandoned. Its intent becomes `uncertain`
-with error code `transport_timeout`, and the loop moves on. Nothing retries an
-uncertain intent, because the request may have reached the phone; the user can
-send it again. That includes a hang before the request left (Google's send
-first asks the phone for the conversation) and a hung read receipt: retrying
-them would hold the loop for another full bound each time. The abandoned
-call's goroutine, and its dispatch lease and media reader, live until the
-transport returns (for libgm, when the phone answers, if it ever does). At
-shutdown a canceled call gets 2 s to return its own result before it is
-abandoned the same way.
+**Fix, in two layers.**
 
-The bound limits the freeze; it does not remove it. One loop serves every
-account, so while the phone is not answering, each queued Google intent holds
-the loop for up to its bound before the next one, on any platform, goes out.
+1. **libgm gives up after 35 s** (`client.RequestTimeout`, set on every libgm
+   client OpenMessage builds; the fork's own default is 60 s). The wait starts
+   once the request has been sent, and the fork's HTTP client allows 20 s for
+   the response headers, so 35 s keeps an unanswered lookup inside the
+   dispatcher's 60 s bound. See "Requests the phone never answers" for the
+   patch. The Google adapter classifies the failure, because it knows whether
+   anything was sent:
+   - The conversation lookup that every Google send, reaction and media send
+     makes first (media looks up before it uploads): nothing was sent, so the
+     intent stays retryable (`not_dispatched`).
+   - The send, reaction, media send or caption itself, and a read receipt:
+     the phone may still act on it, so it becomes `uncertain` and is never
+     sent again. If the phone does send it, its echo confirms the row. A send
+     cut off by a disconnect is `uncertain` too. A read receipt cut off by a
+     disconnect stays retryable, since repeating it costs nothing.
+   - If the dispatcher gave up on the call while the lookup or upload ran, the
+     adapter stops there and sends nothing. The row is still `uncertain`
+     (`transport_timeout`), because the dispatcher can't know that, but such
+     a message has not gone out: if no echo appears in its thread, send it
+     again.
+2. **Each transport call (text, media, reaction, read receipt; any platform)
+   has a hard bound in the dispatcher:** 60 s, or 5 minutes for media, whose
+   call includes the upload. It is the backstop for what libgm's bound can't
+   cover: a stalled HTTP send, a Google send whose two requests together run
+   past 60 s, and every other platform. A call past its bound is abandoned.
+   Its intent becomes `uncertain` with error code `transport_timeout`, and the
+   loop moves on. Nothing retries an uncertain intent, because the request may
+   have reached the phone; the user can send it again. The abandoned call's
+   goroutine, and its dispatch lease and media reader, live until the
+   transport returns; for Google that is now at most 35 s after its last
+   request was sent. At shutdown a canceled call gets 2 s to return its own
+   result before it is abandoned the same way.
+
+**A silent phone holds the loop once per window, not once per retry.** One
+loop serves every account, so each unanswered Google request holds every other
+intent, on any platform, for the whole timeout. The outbox retries a
+`not_dispatched` intent every 5 s with no cap, so without more, a retried
+lookup would keep the loop waiting on the phone almost all the time, and every
+queued Google intent would add its own timeout to each round. The Google
+adapter therefore holds its intents while the phone is silent
+(`internal/bridgeadapters/google/phone_silence.go`):
+
+- After any send-path request goes unanswered, every Google intent on that
+  account (text, media, reaction, read receipt) fails at once without reaching
+  the phone. It stays `not_dispatched` and is retried within 30 s, or when the
+  window ends if sooner. Media is neither read nor uploaded.
+- The first intent due after the window probes the phone. The window is 30 s
+  after the first unanswered request and doubles with each one after it, to
+  at most 5 minutes. A test with libgm's timing and seven queued Google
+  intents measures an hour of silence at 13 phone requests, with the loop
+  waiting on the phone 13% of the hour; without the hold it waits almost the
+  whole hour. A read receipt that happens to be the probe becomes `uncertain`
+  (see above), so a long silence can drop about one queued receipt per window.
+- A lookup that goes unanswered is retried a little after the window ends, so
+  the intents held meanwhile probe first. If the phone answered something
+  else since that intent's previous unanswered lookup, its own delay doubles
+  too, so one lookup the phone never answers can't hold the loop at every
+  window while everything else goes through. Its sixth such lookup refuses
+  the intent (`rejected`, class `unsupported`; nothing was sent), rather than
+  retrying it for ever.
+- An answer to a send-path request (a lookup, send, reaction or read receipt)
+  ends the hold. So do libgm's pinger reporting the phone responding again
+  (`Phone responding again` in the log) and a new Google generation (a
+  reconnect or re-pair). After that, held intents go out within 30 s. An
+  intent whose own lookup went unanswered goes at the retry it was given
+  then, after the window. Catch-up and backfill answers don't end the hold.
+
+What you see while the phone is silent:
+
+- The backend logs `Google Messages phone did not answer; holding Google
+  sends until the next probe` (a zerolog warning, with `held_until`) once
+  per window, and `... releasing held Google sends` when the hold ends. The
+  app forwards every backend line to os_log at Info, which macOS keeps only
+  in memory, so capture them live with `/usr/bin/log stream --level info`
+  (see "Reading the backend's os_log"), or use `log show --info` while they
+  are still in memory.
+- `GET /api/v1/outbox` lists the held intents as `not_dispatched`, with
+  `error_class` `transient` and `error_code` the operation (`send_text`,
+  `send_media`, `send_reaction`, `mark_read`). `next_attempt_at_ms` is at most
+  30 s out, and `attempt_count` climbs by about 100 an hour, since each held
+  recheck counts as an attempt. The stored error text (`error_detail`, which
+  the API doesn't return) begins `google_phone_not_answering:` for a held
+  intent and `google_conversation_get_unanswered:` for an unanswered lookup.
 
 `/api/status` `v2_dispatch` shows the loop's calls: `in_flight` (`outbox_id`,
 `account_id`, `operation`, `started_at_ms`, `elapsed_ms`, `timeout_ms`) while
 one is out, plus `abandoned_calls`, `abandoned_still_running` and
 `last_abandoned` (`reason` `timeout` or `shutdown`). An
-`abandoned_still_running` that keeps growing means the platform is not
-answering at all.
+`abandoned_still_running` that keeps growing means a platform is not
+returning at all. For Google, libgm now ends an abandoned call within its
+35 s timeout, so that count falls back on its own.
 
 **On a build without the fix:** quit and reopen the app. Startup lease recovery
 marks the stuck row `uncertain` (its call was made, so it is not resent) and
@@ -488,6 +558,56 @@ sqlite3 -readonly "$HOME/Library/Application Support/OpenMessage/v2/store.sqlite
 All of this needs the request/response path to work. If the fetch replies are
 empty (`Fetched conversations count=0` while the store holds history), nothing
 can be recovered until that is fixed.
+
+### Requests the phone never answers
+
+libgm (the fork's third carried patch) gives up on a request the phone hasn't
+answered within its request timeout. Its default (`libgm.DefaultRequestTimeout`)
+is 60 s; OpenMessage sets 35 s on every client it builds
+(`client.RequestTimeout`), inside the outbox's 60 s bound on a transport call.
+The timeout starts once the request has been sent. It also fails every
+request still waiting when the client disconnects, which happens on unpair, on
+a reconnect that replaces the client, and at shutdown. The first kind fails
+with an error matching `libgm.ErrPhoneNotResponding`, the second with one
+matching `libgm.ErrConnectionClosed`. Before that patch such a request waited
+forever. A catch-up blocked on one held the backfill guard until the process
+restarted, so every later backfill, recent reconcile and pending-media refresh
+was refused (`backfill already running`).
+
+- **A catch-up stops after its first unanswered request.** Every later
+  request in the same run fails at once without reaching the phone, with
+  `skipped: an earlier request in this Google catch-up got no answer`
+  wrapping the first error. A run against a silent phone therefore ends about
+  35 s after its first unanswered request and releases the guard.
+  - Startup, deep and window backfills count each skipped fetch in
+    `/api/backfill/status` `errors` / `error_details`.
+  - The recent reconcile and the pending-media refresh log it.
+  - Run a backfill again once the phone answers. When the ditto pinger sees
+    the phone respond again, it starts a recent reconcile on its own
+    (`phone_responding_again`).
+- **Sends.** A send the phone never answers now fails after 35 s, in the
+  Google adapter, instead of being abandoned by the dispatcher's 60 s bound.
+  The server had already accepted it, so the phone may still deliver it: the
+  outbox records it as `uncertain` and never sends it again. The legacy HTTP
+  send keeps its idempotency claim, so a retry with the same key gets 409.
+  The legacy scheduler (legacy-primary daemons) treats a scheduled SMS the
+  same way: any SendMessage error other than an auth rejection or no client
+  (an unanswered request, a disconnect, a network or server error) marks it
+  `failed`, noting it may have gone out, instead of re-sending it with a new
+  TmpID. A timed-out conversation lookup before a send has no effect on the
+  phone and stays retryable, in the scheduler too. While the phone stays
+  silent, outbox intents are held, so the dispatch loop waits on the phone
+  at most once per window (see "Every send stuck behind one that never
+  returned").
+- **What you see.**
+  - libgm logs `Phone did not answer the request in time; giving up on it`
+    with `request_action` and `timeout`.
+  - A timed-out INBOX listing shows in `google.pull_health` as
+    `last_outcome: error` with `last_error` ending
+    `phone did not respond to request after 35s`.
+  - A request the phone answered only with the Google-account notice still
+    fails as `no_payload` (see "Pulls that return nothing"), even when the
+    timeout cuts it off.
 
 ## MCP serving — exactly one process may own live transports
 
@@ -1422,10 +1542,10 @@ Without it, a single transient network blip during a scheduled token refresh
 permanently killed the session.
 
 The replacement in `go.mod` pins fork commit
-[`100192cb3078`](https://github.com/MaxGhenis/gmessages/commit/100192cb3078739f7ed925730f7248eb18b6c340).
+[`6495a585293d`](https://github.com/MaxGhenis/gmessages/commit/6495a585293d59a48984c50d63c8c4c11b425877).
 It is upstream `mautrix/gmessages` base
 [`3433cc07d5ea`](https://github.com/mautrix/gmessages/commit/3433cc07d5ea9522309adad3a8c92ed5b08dc11d),
-which contains the auth-refresh retry, plus two carried patches, oldest first:
+which contains the auth-refresh retry, plus three carried patches, oldest first:
 
 1. `Add ListConversationsWithCursor for paginated conversation listing`. That
    method is required by OpenMessage's backfill and reconciliation paths.
@@ -1437,16 +1557,33 @@ which contains the auth-refresh retry, plus two carried patches, oldest first:
    `libgm.ErrNoResponsePayload` instead of returning an empty success. A bare
    header answering a listing is still an empty result. See "Pulls that
    return nothing" below. Upstream still has the old behaviour.
+3. `libgm: fail phone requests after a hard timeout and on disconnect`
+   ([MaxGhenis/gmessages#1](https://github.com/MaxGhenis/gmessages/pull/1)).
+   A request the phone doesn't answer within its request timeout
+   (`DefaultRequestTimeout`, 60 s; OpenMessage sets 35 s with
+   `Client.SetRequestTimeout`) fails with `libgm.ErrPhoneNotResponding`; a
+   late answer is logged (`Received response with no pending request`) and
+   dropped.
+   `Client.Disconnect` fails every waiting request with
+   `libgm.ErrConnectionClosed`. See "Requests the phone never answers"
+   above. Upstream made the same change in
+   [`c0a2d38`](https://github.com/mautrix/gmessages/commit/c0a2d38a24dc187e135aad60cc35a4f840954905)
+   with the same sentinel names and default. Its version also adds a
+   `context.Context` parameter to every public method. A rebase past
+   `c0a2d38` drops this patch for upstream's and moves OpenMessage's call
+   sites to the context API.
 
 **Keep the fork rebased on upstream.** The weekly
 `gmessages-fork-drift.yml` workflow records the base and patch set (count and
 subjects) and fails as soon as upstream `main` advances. When rebasing, replay
-both carried patches, verify the auth-refresh retry is still present, and
+the carried patches, verify the auth-refresh retry is still present, and
 update the fork pin, `EXPECTED_PATCHES`, and recorded SHAs together. The pinned
-commit must be on the fork's `main`. `TestGMessagesForkRejectsPayloadlessResponses`
-runs the pinned fork's own response-acceptance tests, so it fails if a rebase
-drops the second patch or keeps its exported names without the rejection. The
-durable architectural fix (move SMS/RCS onto an Android companion) is issue #75.
+commit must be on the fork's `main`. Two tests run the pinned fork's own tests
+by name and require each to pass: `TestGMessagesForkRejectsPayloadlessResponses`
+(second patch) and `TestGMessagesForkTimesOutUnansweredRequests` (third
+patch). Each fails if a rebase drops its patch, or keeps the exported names
+without the behaviour. The durable architectural fix (move SMS/RCS onto an
+Android companion) is issue #75.
 
 ### Pulls that return nothing (phone switched to Google-account pairing)
 
@@ -1900,9 +2037,14 @@ the `error_detail` column of the `outbox` table in the v2 store:
 
 - `signal reaction target timestamp is unavailable`, for this account's own
   message: its remote ID is not a Signal timestamp.
-  - *Still on its outbox request ID.* A pending send: the reaction goes out on
-    a retry once the send is confirmed. A canceled or failed send: never. An
-    uncertain one: not while it is unresolved. Also a send Signal accepted
+  - *Still on its outbox request ID.* A send that has not gone out (`queued`,
+    `dispatching`, `not_dispatched`) never gets this far: the dispatcher holds
+    the reaction before the adapter (`error_code: reaction_target_unsent`, see
+    "Reactions stuck retrying" below), and it goes out once the send is
+    confirmed under its timestamp. A canceled or rejected send never gets
+    this far either: the dispatcher rejects the reaction
+    (`reaction_target_never_sent`). An uncertain one: not while it is
+    unresolved. Also a send Signal accepted
     whose local confirm failed (`store_failed`): the outbox row holds the
     timestamp as its result, but the message is not moved to it until that
     confirm is repaired (`RepairStoreFailed`).
@@ -1970,8 +2112,8 @@ legacy senders unchanged.
   | Status | Body | Meaning |
   |---|---|---|
   | 200 | `success: true` | The platform accepted it (`confirmed`, or `store_failed`). |
-  | 202 | `success: true, queued: true` | Stored, not delivered yet (`queued`, `dispatching`, `not_dispatched`). The app keeps retrying it; do not react again. |
-  | 502 | `error` | `uncertain` (the transport call ended without an answer: it may have been applied) or `rejected` (the platform refused it, for example Google's phone answering `success: false` for a message whose ID will not change, stored as `error_class: unsupported`; it is not retried). |
+  | 202 | `success: true, queued: true` | Stored, not delivered yet (`queued`, `dispatching`, `not_dispatched`). The app keeps retrying it; do not react again. A reaction to your own message that has not been sent yet (a scheduled send) waits here for it (`error_code: reaction_target_unsent`). |
+  | 502 | `error` | `uncertain` (the transport call ended without an answer: it may have been applied) or `rejected` (the platform refused it, for example Google's phone answering `success: false` for a message whose ID will not change, stored as `error_class: unsupported`; it is not retried). A reaction to your own message whose send was canceled or rejected is `rejected` before any transport call (`error_code: reaction_target_never_sent`, error "the message it reacts to was never sent"). |
   | 409 | `error` | `canceled` before it was sent. |
   | 422 | `reaction_target_unavailable` | No v2 message with that ID, or not in that conversation. Nothing was queued. |
   | 501 | `error` | The account has no reaction sender (an import-only platform). |
@@ -2077,6 +2219,16 @@ sender by the LID's digits as a phone number (`+<lid digits>`). Such a sender
 looks like a phone number here and goes out as `<lid digits>@s.whatsapp.net`
 until `openmessage repair whatsapp-lid` rewrites it.
 
+A WhatsApp send goes out under an ID derived from its request ID
+(`whatsapplive.deriveWebMessageID`), and its message is renamed to that ID
+when the send is confirmed. Until then the message is still named by the
+request ID itself, an ID WhatsApp never sees. So a reaction to a WhatsApp
+message of yours that has not been sent yet is held, and one to a message
+whose send was canceled or rejected is rejected (see "Reactions stuck
+retrying" below), rather than addressed to that ID. One sent but `uncertain` or `store_failed`
+is still named by the request ID, and a reaction to it is still addressed to
+that ID, which no WhatsApp message has.
+
 **Reactions stuck retrying.** A reaction the transport cannot deliver yet goes
 `not_dispatched` and retries (every 5 s by default) with no cap; a Signal
 reaction whose target can never be named (above) stays there until it is
@@ -2085,18 +2237,73 @@ with `success: false`, the row ends `rejected` after one attempt
 (`error_class: unsupported`, `error_code: send_reaction`, `error_detail`
 `send_reaction: unsupported: Google Messages refused the reaction`), because a
 retry would send the same request. Before that change it went
-`not_dispatched` and was sent again every 5 s. The exception is a reaction to
-a message this account just sent, which is still named by its send's request
-ID (Google's TmpID) until the phone's echo brings the phone's own ID: the
-dispatcher marks that target `ProvisionalRemoteID` (its send is unresolved, or
-confirmed and waiting for the echo; not canceled or rejected), and a refusal
-of it goes `not_dispatched` (`error_detail` `send_reaction: transient: Google
-Messages refused a reaction to a message still named by its send's request
-ID`) so the retry after the echo names the phone's ID. Nothing bounds that
-wait: if no echo ever renames the message (a scheduled send that has not gone
-out, or an `uncertain` one that never reached the phone), the refusal is
-retried every 5 s until the reaction is canceled. Find the ones still retrying
-with:
+`not_dispatched` and was sent again every 5 s.
+
+A reaction to a message of your own that is still named by its send's request
+ID (Google's TmpID) depends on how far that send has got
+(`messaging.targetSendProgress`):
+
+- **Not sent yet** (`queued`, `dispatching`, `not_dispatched`, such as a
+  scheduled send). The platform has no such message, so the dispatcher holds
+  the reaction before the transport call, on every platform: no phone call, no
+  transport attempt counted. The row goes `not_dispatched` with
+  `error_class: transient`, `error_code: reaction_target_unsent` and
+  `error_detail` `the message this reaction targets has not been sent yet (its
+  send <outbox id> is <state>)`. It is tried again 1 ms after the send is next
+  due (a scheduled send's time, or a retrying send's next attempt), and never
+  sooner than 5 s. So a reaction to a message scheduled for tomorrow waits for
+  tomorrow, and the dispatcher, which takes due rows in the order they fell
+  due, sends the message first. Retrying the send early
+  (`POST /api/v1/outbox/<send id>/retry`) or canceling it makes the reactions
+  held for it due 1 ms later, in the same transaction
+  (`OutboxRepository.Cancel`, `RetryNotDispatched`): they follow a retried
+  send at once, and a canceled send's reactions are rejected (next bullet).
+  A cancel or retry that lands while the dispatcher is holding a reaction
+  for that send (the reaction is `dispatching`, so the wake passes it by) is
+  caught when the dispatcher reads the send again after recording the hold
+  (`wakeIfSendChanged`).
+  Before, the reaction went to the transport with the request ID: Google
+  asked the phone with the TmpID, and a refusal was retried every 5 s until
+  the send went out and its echo renamed the message, the send was canceled
+  or rejected (the next refusal was then final), or someone canceled the
+  reaction; WhatsApp addressed it to an ID no WhatsApp message has (above);
+  Signal refused it before signal-cli, every 5 s.
+- **Never sent** (`canceled`, or `rejected` by the platform). The platform
+  never got the message and never will, so the dispatcher rejects the
+  reaction before the transport call: `rejected`, `error_class:
+  unsupported`, `error_code: reaction_target_never_sent`, and `/api/react`
+  answers 502 "the message it reacts to was never sent". Before, it went to
+  the transport naming the request ID: Google asked the phone and rejected
+  the reaction on its refusal, WhatsApp addressed it to no message (and
+  recorded it as sent when WhatsApp accepted it), and Signal retried it
+  every 5 s for good.
+- **Sent less than a minute ago** (`confirmed` and waiting for the echo,
+  `uncertain`, or `store_failed`, timed from the send row's `updated_at_ms`:
+  when the transport's answer was recorded, or later lease recovery or a
+  reconcile).
+  The phone's echo may still rename the message to the phone's own ID, so the
+  dispatcher marks the target `ProvisionalRemoteID`. A refusal of it goes
+  `not_dispatched` (`error_detail` `send_reaction: transient: Google Messages
+  refused a reaction to a message still named by its send's request ID`), and
+  the retry after the echo names the phone's ID.
+- **Sent a minute ago or more.** The target is no longer provisional, so a
+  refusal is final (`rejected`, as above). The minute is
+  `sqlite.EchoMaxLag`, the longest lag at which echo pairing
+  (`internal/storage/sqlite/uncorrelated_echo.go`) considers an echo at all.
+  On the live install all 44 measured echoes were first seen 0.28-0.79 s
+  after their send, and pairing by content takes one only within about
+  6.2 s. On the live install the phone sent every echo without a TmpID when
+  this was checked (2026-10-16), and content pairing takes text sends only,
+  so a media send keeps its TmpID for good. (A text whose echo was stored
+  before its send was recorded can still be paired after the minute, by the
+  startup repair or a later frame for the message; every measured echo
+  arrived after.) A refused reaction to a message that keeps its TmpID is
+  now sent at most 13 times per window (once per 5 s for the minute, then the
+  final one; a later lease recovery or store repair of the send starts a new
+  window), where before it was sent every 5 s for as long as the message
+  kept it. If the phone did not have the message yet, react again once it does.
+
+Find the reactions still retrying with:
 
 ```bash
 curl -s "http://127.0.0.1:7007/api/v1/outbox?limit=100" | jq '.[] | select(.kind=="reaction")'

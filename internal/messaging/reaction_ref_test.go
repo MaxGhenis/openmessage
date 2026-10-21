@@ -79,25 +79,24 @@ func TestReactionTargetRefTellsAnOwnMessageFromASenderlessIncomingOne(t *testing
 	}
 }
 
-// A reaction to this account's own send that the transport has not accepted
-// carries the send's request ID. Once the send is confirmed, a retry carries
-// the transport's ID for it.
+// A reaction to this account's own send that has not gone out yet is held
+// before the transport is called. Once the send is confirmed, the next
+// attempt carries the transport's ID for it.
 func TestReactionToOwnPendingSendFollowsItsConfirmation(t *testing.T) {
 	clock := newManualClock(messagingTestTime)
 	store := openMessagingTestStore(t, clock.Now())
 	text := &scriptedTextSender{steps: []sendStep{{result: bridge.SendResult{RemoteMessageID: "1700000000555"}}}}
-	reactions := &scriptedReactionSender{steps: []sendStep{notDispatchedReaction(), {}}}
+	reactions := &scriptedReactionSender{steps: []sendStep{{}}}
 	registry := newScriptedRegistry("reaction-own-pending", text)
 	registry.setReactionSender(reactions)
 	registry.setAvailable(true)
 	service := newMessagingTestService(t, store, registry, clock)
 
 	// The reaction is due now; its target is scheduled a little later, so the
-	// first reaction attempt finds a message the transport has not accepted.
+	// first reaction attempt finds a message that has not been sent.
 	ownCommand := testCommonCommand("reaction-own-pending-send")
 	ownCommand.NotBefore = clock.Now().Add(2 * time.Second)
 	own := mustSendText(t, service, SendTextCommand{CommonCommand: ownCommand, Body: "scheduled"})
-	ownRow := mustOutboxItem(t, service, own.OutboxID)
 	reaction := mustSendDispatchReaction(t, service, SendReactionCommand{
 		CommonCommand:   testCommonCommand("reaction-own-pending"),
 		TargetMessageID: own.LocalMessageID,
@@ -108,13 +107,12 @@ func TestReactionToOwnPendingSendFollowsItsConfirmation(t *testing.T) {
 		t.Fatalf("DispatchDue(reaction before its target) = %d, %v; want 1, nil", processed, err)
 	}
 	submittedAt := time.UnixMilli(messagingTestTime.UnixMilli())
-	requests := reactions.snapshotRequests()
-	wantPending := bridge.MessageRef{RemoteID: ownRow.TransportRequestID, Outgoing: true, SentAt: submittedAt}
-	if len(requests) != 1 || !targetRefEqual(requests[0].Target, wantPending) {
-		t.Fatalf("reaction target while the send was pending = %+v, want %+v", requests, wantPending)
+	if requests := reactions.snapshotRequests(); len(requests) != 0 {
+		t.Fatalf("reaction requests while the send was pending = %+v, want none", requests)
 	}
-	if row := mustOutboxItem(t, service, reaction.OutboxID); row.State != sqlite.OutboxNotDispatched {
-		t.Fatalf("reaction row = %+v, want not_dispatched awaiting its retry", row)
+	if row := mustOutboxItem(t, service, reaction.OutboxID); row.State != sqlite.OutboxNotDispatched ||
+		row.ErrorCode == nil || *row.ErrorCode != "reaction_target_unsent" {
+		t.Fatalf("reaction row = %+v, want not_dispatched (reaction_target_unsent) awaiting its retry", row)
 	}
 
 	clock.Advance(3 * time.Second)
@@ -125,9 +123,9 @@ func TestReactionToOwnPendingSendFollowsItsConfirmation(t *testing.T) {
 	if processed, err := service.DispatchDue(context.Background(), 4); err != nil || processed != 1 {
 		t.Fatalf("DispatchDue(reaction retry) = %d, %v; want 1, nil", processed, err)
 	}
-	requests = reactions.snapshotRequests()
+	requests := reactions.snapshotRequests()
 	wantConfirmed := bridge.MessageRef{RemoteID: "1700000000555", Outgoing: true, SentAt: submittedAt}
-	if len(requests) != 2 || !targetRefEqual(requests[1].Target, wantConfirmed) {
+	if len(requests) != 1 || !targetRefEqual(requests[0].Target, wantConfirmed) {
 		t.Fatalf("reaction target after the send confirmed = %+v, want %+v", requests, wantConfirmed)
 	}
 	if delivery := mustDelivery(t, service, reaction.OutboxID); delivery.State != OutboxConfirmed {
@@ -191,6 +189,9 @@ func TestDescribedReplyRefStatesWhoSentTheQuotedMessage(t *testing.T) {
 //
 //   - The ref names the target message's current remote ID: its outbox
 //     request ID until the transport confirms the send, then the transport's.
+//     A reaction to a send that has not gone out, or never will (canceled),
+//     is not mapped at all: it is held (reaction_target_unsent) or rejected
+//     (reaction_target_never_sent) before the transport call.
 //   - Outgoing is set exactly for a message this account sent, whether or not
 //     the stored message names a sender.
 //   - AuthorID is the sender's canonical value, "" when the message names
@@ -210,6 +211,9 @@ type reactionRefCase struct {
 	name     string
 	targetID string // local message ID the reaction targets
 	want     bridge.MessageRef
+	// stopCode is set when the reaction stops before the transport call:
+	// reaction_target_unsent (held) or reaction_target_never_sent (rejected).
+	stopCode string
 }
 
 func checkReactionTargetRefInvariants(t *testing.T, seed int64) {
@@ -315,13 +319,35 @@ func checkReactionTargetRefInvariants(t *testing.T, seed int64) {
 		}
 		cases = append(cases, reactionRefCase{
 			name: submission.LocalMessageID, targetID: submission.LocalMessageID,
-			want: bridge.MessageRef{RemoteID: wantRemote, Outgoing: true, SentAt: time.UnixMilli(occurredMS)},
+			want:     bridge.MessageRef{RemoteID: wantRemote, Outgoing: true, SentAt: time.UnixMilli(occurredMS)},
+			stopCode: map[int]string{1: "reaction_target_never_sent", 2: "reaction_target_unsent"}[fate],
 		})
 		clock.Advance(time.Second)
 	}
 
 	random.Shuffle(len(cases), func(i, j int) { cases[i], cases[j] = cases[j], cases[i] })
 	for index, tc := range cases {
+		if tc.stopCode != "" {
+			reaction := mustSendDispatchReaction(t, service, SendReactionCommand{
+				CommonCommand:   testCommonCommand(fmt.Sprintf("reaction-%d", index)),
+				TargetMessageID: tc.targetID,
+				Emoji:           "👍",
+			})
+			before := reactions.requestCount()
+			if processed, err := service.DispatchDue(context.Background(), 1); err != nil || processed != 1 {
+				t.Fatalf("seed %d case %s: DispatchDue = %d, %v", seed, tc.name, processed, err)
+			}
+			row := mustOutboxItem(t, service, reaction.OutboxID)
+			if reactions.requestCount() != before || row.ErrorCode == nil || *row.ErrorCode != tc.stopCode {
+				t.Fatalf("seed %d case %s: reaction = %+v, want it stopped uncalled with %s", seed, tc.name, row, tc.stopCode)
+			}
+			if row.State == sqlite.OutboxNotDispatched {
+				if _, err := service.Cancel(context.Background(), reaction.OutboxID); err != nil {
+					t.Fatalf("seed %d case %s: Cancel(held reaction): %v", seed, tc.name, err)
+				}
+			}
+			continue
+		}
 		// The first attempt fails before dispatch, so the target is mapped twice.
 		reactions.mu.Lock()
 		reactions.steps = append(reactions.steps, notDispatchedReaction(), sendStep{})
