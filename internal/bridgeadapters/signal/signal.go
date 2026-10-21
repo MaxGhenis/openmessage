@@ -161,13 +161,14 @@ func ReplyTarget(ref *bridge.MessageRef) signallive.ReplyTarget {
 		return signallive.ReplyTarget{}
 	}
 	return signallive.ReplyTarget{
-		RemoteID:       ref.RemoteID,
-		AuthorID:       ref.AuthorID,
-		Outgoing:       ref.Outgoing,
-		SentAt:         ref.SentAt,
-		Text:           ref.Text,
-		HasAttachment:  ref.HasAttachment,
-		AttachmentMIME: ref.AttachmentMIME,
+		RemoteID:            ref.RemoteID,
+		AuthorID:            ref.AuthorID,
+		Outgoing:            ref.Outgoing,
+		ProvisionalRemoteID: ref.ProvisionalRemoteID,
+		SentAt:              ref.SentAt,
+		Text:                ref.Text,
+		HasAttachment:       ref.HasAttachment,
+		AttachmentMIME:      ref.AttachmentMIME,
 	}
 }
 
