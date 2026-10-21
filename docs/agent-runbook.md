@@ -2135,7 +2135,10 @@ and MCP `download_media` "message not found" (it searched only the legacy
 store). Live case: 2026-10-21, an HTML file from a contact's linked device.
 Its receive-time cause is unknown, because the WARN was discarded then.
 
-Recover one, in order:
+Recover one, in order. First check another linked device: if Signal Desktop
+shows the attachment as "File not available", it failed to download there
+too. Then the sender's upload or the CDN copy is gone, nothing on this Mac
+holds the bytes, and only a resend recovers them (the 2026-10-21 case).
 
 1. **A backup of signal-cli's store has the file** (for example the
    pre-relink backup the "Re-linking Signal" section keeps): copy that one
