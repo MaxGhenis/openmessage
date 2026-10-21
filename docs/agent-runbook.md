@@ -1619,15 +1619,17 @@ hardened the UI to ignore redundant status pushes.)
 
 ### Re-linking Signal (QR)
 
-- **Each QR lives about 90 seconds.** Signal's server closes the provisioning
-  socket with `reason: Timeout` (visible with `signal-cli --verbose`), and
-  the UI then shows "Link request timed out, please try again." Have the phone
-  on Settings → Linked devices → Link new device *before* the QR appears. A
-  phone that scans an expired QR reports a network error; one that scans a
-  live QR but never sees the device finish waits 30 s and closes silently.
+- **Each QR lives about 90 seconds** (observed 2026-10-21: `signal-cli
+  --verbose link` logged `[ProvisioningSocket] … onClosing … reason: Timeout`
+  90 s after start), and signal-cli then prints "Link request timed out,
+  please try again." Have the phone on Settings → Linked devices → Link new
+  device *before* the QR appears. Observed the same day: a phone that scanned
+  an expired QR reported a network error. Per Signal Android's
+  `LinkDeviceViewModel`, a phone whose link message is accepted but whose new
+  device never appears waits 30 s, then closes the dialog without an error.
 - **A fresh link prints a stderr line before its JSON.** Until the account's
   first receive, signal-cli's `last-receive-timestamp` is 0 and every command
-  logs `INFO AccountHelper - The Signal protocol expects that incoming
+  that loads the account logs `INFO AccountHelper - The Signal protocol expects that incoming
   messages are regularly received.`; after 7 days without a receive it logs a
   `WARN … Messages have been last received N days ago` instead
   (`AccountHelper.checkAccountState`). The account probe reads CombinedOutput,

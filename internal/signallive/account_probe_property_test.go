@@ -14,12 +14,18 @@ import (
 // signalCLINoiseLines are log lines of the shapes signal-cli writes to stderr.
 // The probe reads CombinedOutput, so any of them can land around the JSON.
 // Some embed an address inside prose, which must never count as an account.
+// The JSON-shaped ones name no account and reach the line-by-line decode.
 var signalCLINoiseLines = []string{
 	"WARN  AccountHelper - Messages have been last received 8 days ago. The Signal protocol expects that incoming messages are regularly received.",
+	"INFO  AccountHelper - The Signal protocol expects that incoming messages are regularly received.",
 	"WARN  MultiAccountManager - Ignoring +15551230000: User is not registered. (NotRegisteredException)",
 	"INFO  Manager - Starting up",
 	"WARN  RefreshRecipientsJob - Failed to refresh recipients",
 	"User +15557654321 is not registered.",
+	"[]",
+	`{"accounts":[]}`,
+	`{"error":{"message":"User +15551230000 is not registered."}}`,
+	`{"type":"x"}`,
 	"",
 	"   ",
 }
