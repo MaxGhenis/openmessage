@@ -1942,11 +1942,13 @@ ID (Google's TmpID) depends on how far that send has got
   due (a scheduled send's time, or a retrying send's next attempt), and never
   sooner than 5 s. So a reaction to a message scheduled for tomorrow waits for
   tomorrow, and the dispatcher, which takes due rows in the order they fell
-  due, sends the message first. Before, the reaction went to the transport
-  with the request ID: on Google the phone refused it and the refusal was
-  retried every 5 s until someone canceled it. WhatsApp addressed it to an ID
-  no WhatsApp message has (above), and Signal refused it before signal-cli,
-  every 5 s.
+  due, sends the message first. Retrying or canceling the send early does not
+  move the reaction's time; `POST /api/v1/outbox/<reaction id>/retry` makes it
+  due now (it is held again if the send still has not gone out). Before, the
+  reaction went to the transport with the request ID: on Google the phone
+  refused it and the refusal was retried every 5 s until someone canceled it,
+  WhatsApp addressed it to an ID no WhatsApp message has (above), and Signal
+  refused it before signal-cli, every 5 s.
 - **Sent less than a minute ago** (`confirmed` and waiting for the echo,
   `uncertain`, or `store_failed`, timed from the send row's `updated_at_ms`).
   The phone's echo may still rename the message to the phone's own ID, so the
@@ -1958,11 +1960,12 @@ ID (Google's TmpID) depends on how far that send has got
   refusal is final (`rejected`, as above). The minute is
   `sqlite.EchoMaxLag`, the longest lag at which echo pairing
   (`internal/storage/sqlite/uncorrelated_echo.go`) considers an echo at all.
-  On the live install every echo was first seen 0.28-0.79 s after its send,
-  and pairing by content takes one only within about 6.2 s. An echo that
-  never pairs leaves the message on its TmpID for good, and on the live
-  install that is common: its phone sent every echo without a TmpID when this
-  was checked (2026-10-16), and content pairing takes text sends only. So a
+  On the live install all 44 measured echoes were first seen 0.28-0.79 s
+  after their send, and pairing by content takes one only within about
+  6.2 s. An echo that never pairs leaves the message on its TmpID for good.
+  On the live install that is every media send: its phone sent every echo
+  without a TmpID when this was checked (2026-10-16), and content pairing
+  takes text sends only. So a
   refused reaction to such a message is sent at most about 13 times (once per
   5 s for the minute, then the final one), where before it was sent every 5 s
   until canceled. If the phone did not have the message yet, react again once
