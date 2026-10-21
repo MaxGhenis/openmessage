@@ -167,7 +167,7 @@ func (e *Evidence) AddJIDPair(first, second, source string) {
 		}
 	}
 	if lid, ok := LIDUser(second); ok {
-		if pn, ok := PhoneUser(first); ok {
+		if pn, ok := explicitPhone(first); ok {
 			e.AddPair(lid, pn, source)
 			return
 		}
@@ -242,17 +242,27 @@ func (e *Evidence) PhoneForLID(lid string) (string, bool) {
 	return numbers[0], true
 }
 
-// Address returns the form a store records a JID by: "+<digits>" for a
-// phone-number JID, and for a LID whose number the evidence names
-// (PhoneForLID); the LID JID "<digits>@lid" for any other LID; and "" for a
-// JID that names no person's phone number or LID (a group, a newsletter).
+// Address returns the form a store records a JID by, as the live bridge's
+// StoredAddress does: "+<digits>" for a phone-number JID, and for a LID whose
+// number the evidence names (PhoneForLID); the LID JID "<digits>@lid" for any
+// other LID; the JID itself for a hosted, bot or newsletter sender; and "" for
+// a JID that names no sender (a group, a broadcast list).
 func (e *Evidence) Address(raw string) string {
 	if user, ok := PhoneUser(raw); ok {
 		return "+" + user
 	}
 	lid, ok := LIDUser(raw)
 	if !ok {
-		return ""
+		jid, err := watypes.ParseJID(strings.TrimSpace(raw))
+		if err != nil || strings.Count(raw, "@") != 1 || jid.User == "" {
+			return ""
+		}
+		switch jid.Server {
+		case watypes.HostedServer, watypes.HostedLIDServer, watypes.BotServer, watypes.NewsletterServer:
+			return jid.ToNonAD().String()
+		default:
+			return ""
+		}
 	}
 	if e != nil {
 		if pn, ok := e.PhoneForLID(lid); ok {

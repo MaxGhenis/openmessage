@@ -21,8 +21,8 @@ import (
 //
 //   - safety: an identity is rewritten only if its digits are attested as a
 //     LID and not as a phone number, and it is not the account's own; its
-//     target is the live-ingest identity for the LID (the one paired number,
-//     unless that number is itself attested as a LID, else the LID);
+//     target is the one paired number, unless that number is itself attested
+//     as a LID, else the LID;
 //   - liveness: such an identity with no person link, whose target is not the
 //     account's own, is rewritten;
 //   - conservation: every message keeps its sender up to the rewrite map, the

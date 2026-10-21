@@ -42,13 +42,14 @@ func TestJIDPairsPairOnlyALIDWithAnExplicitNumber(t *testing.T) {
 	evidence := NewEvidence()
 	evidence.AddJIDPair("111@lid", "15550000001@s.whatsapp.net", "a")
 	evidence.AddJIDPair("15550000002@s.whatsapp.net", "222@lid", "a")
+	evidence.AddJIDPair("+15550000006", "666@lid", "a")
 	evidence.AddJIDPair("333@lid", "+15550000003", "a")
 	// Bare digits in an identifier column could be any number.
 	evidence.AddJIDPair("444@lid", "15550000004", "a")
 	evidence.AddJIDPair("555@lid", "", "a")
 	evidence.AddJIDPair("120363019999999999@g.us", "", "a")
 
-	for lid, want := range map[string]string{"111": "15550000001", "222": "15550000002", "333": "15550000003"} {
+	for lid, want := range map[string]string{"111": "15550000001", "222": "15550000002", "333": "15550000003", "666": "15550000006"} {
 		if got, ok := evidence.PhoneForLID(lid); !ok || got != want {
 			t.Errorf("PhoneForLID(%s) = %q, %v; want %q", lid, got, ok, want)
 		}
@@ -99,13 +100,15 @@ func TestAddressNeverStoresALIDAsANumber(t *testing.T) {
 	evidence := NewEvidence()
 	evidence.AddPair("222", "15550000002", "a")
 	cases := map[string]string{
-		"15550000001@s.whatsapp.net": "+15550000001",
-		"111@lid":                    "111@lid",
-		"111:4@lid":                  "111@lid",
-		"222@lid":                    "+15550000002",
-		"120363019999999999@g.us":    "",
-		"status@broadcast":           "",
-		"":                           "",
+		"15550000001@s.whatsapp.net":    "+15550000001",
+		"111@lid":                       "111@lid",
+		"111:4@lid":                     "111@lid",
+		"222@lid":                       "+15550000002",
+		"120363019999999999@g.us":       "",
+		"status@broadcast":              "",
+		"120363111111111111@newsletter": "120363111111111111@newsletter",
+		"98765432109876@hosted.lid":     "98765432109876@hosted.lid",
+		"":                              "",
 	}
 	for raw, want := range cases {
 		if got := evidence.Address(raw); got != want {

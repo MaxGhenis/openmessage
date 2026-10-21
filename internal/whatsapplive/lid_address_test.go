@@ -109,7 +109,7 @@ func TestAddressForJIDKeepsUnmappedLIDsAsLIDs(t *testing.T) {
 		{"hosted LID", unmapped, watypes.NewJID(lidAddressTestLID, watypes.HostedLIDServer), lidAddressTestLID + "@hosted.lid"},
 		{"bot", unmapped, watypes.NewJID("867051314767696", watypes.BotServer), "867051314767696@bot"},
 		{"group", unmapped, watypes.NewJID(lidAddressTestGroup, watypes.GroupServer), ""},
-		{"newsletter", unmapped, watypes.NewJID("120363111111111111", watypes.NewsletterServer), ""},
+		{"newsletter", unmapped, watypes.NewJID("120363111111111111", watypes.NewsletterServer), "120363111111111111@newsletter"},
 		{"broadcast", unmapped, watypes.NewJID("status", watypes.BroadcastServer), ""},
 		{"empty", unmapped, watypes.EmptyJID, ""},
 	}
@@ -131,8 +131,9 @@ func (c *redactedPhoneContacts) GetContact(context.Context, watypes.JID) (watype
 	return watypes.ContactInfo{Found: true, RedactedPhone: c.redacted}, nil
 }
 
-// A RedactedPhone ("+1 ••• ••21") is a display name, not a number: stored as
-// a number its digits ("+121") minted a fake phone identity in v2.
+// A RedactedPhone ("+1 ••• ••21") is a display name, not a number. Once
+// jidToPhone gives a LID no number, phoneForJID would reach the contact
+// lookup, and the mask's digits ("+121") would be stored as one.
 func TestRedactedPhoneIsANameNotANumber(t *testing.T) {
 	bridge := lidAddressBridge(nil)
 	bridge.client.Store.Contacts = &redactedPhoneContacts{redacted: "+1 ••• ••21"}
@@ -239,8 +240,17 @@ func TestHandleMessageStoresAnUnmappedLIDPeerByItsJID(t *testing.T) {
 	if len(participants) != 1 || participants[0].Number != lidAddressTestLID+"@lid" {
 		t.Fatalf("participants = %#v, want the LID as the peer's number", participants)
 	}
-	if strings.Contains(convo.Participants+msg.SenderNumber+msg.SenderName, "+"+lidAddressTestLID) {
-		t.Fatalf("the LID was stored as a phone number: %q / %q / %q", convo.Participants, msg.SenderNumber, msg.SenderName)
+	if strings.Contains(convo.Participants+msg.SenderNumber+msg.SenderName+convo.Name, "+"+lidAddressTestLID) {
+		t.Fatalf("the LID was stored as a phone number: %q / %q / %q / %q", convo.Participants, msg.SenderNumber, msg.SenderName, convo.Name)
+	}
+	// With no number, contact or push name the chat is named by its JID, so
+	// it lists under something and a real name replaces it later.
+	if convo.Name != lidAddressTestLID+"@lid" {
+		t.Fatalf("unnamed LID chat name = %q, want its JID", convo.Name)
+	}
+	bridge.handleMessage(lidAddressTestMessage(lid, lid, "direct-msg-2", "Ana", false))
+	if convo, err = store.GetConversation("whatsapp:" + lidAddressTestLID + "@lid"); err != nil || convo == nil || convo.Name != "Ana" {
+		t.Fatalf("chat after a push name = %+v, %v; want it renamed Ana", convo, err)
 	}
 }
 

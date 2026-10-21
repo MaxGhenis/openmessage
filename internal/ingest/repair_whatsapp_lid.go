@@ -25,10 +25,11 @@ import (
 // caller reads (whatsapplid: the whatsmeow session store, WhatsApp Desktop)
 // and the store's own LID identities and chats. An identity is rewritten only
 // when a record names its digits as a LID and none names them as a phone
-// number. It becomes the identity live ingest would mint for that LID today:
-// the phone number a record pairs the LID with when exactly one is named,
-// else the LID itself ("<digits>@lid"), merging into that identity when it
-// already exists.
+// number. It becomes the form v2 ingest gives a LID: the phone number a record
+// pairs the LID with when exactly one is named, else the LID itself
+// ("<digits>@lid"), merging into that identity when it already exists. Live
+// ingest knows only whatsmeow's pairs, so a pair only Desktop records can leave
+// live frames naming the LID until whatsmeow learns it.
 
 // In-store evidence sources.
 const (
@@ -40,12 +41,11 @@ const (
 
 // Candidate verdicts. Only lidVerdictRewrite changes the store.
 const (
-	lidVerdictRewrite      = "rewrite"
-	lidVerdictAlsoAPhone   = "also-a-phone-number"
-	lidVerdictOwnIdentity  = "own-identity"
-	lidVerdictTargetIsOwn  = "target-is-own-identity"
-	lidVerdictOtherPerson  = "target-links-another-person"
-	lidVerdictTargetIsSame = "target-is-itself"
+	lidVerdictRewrite     = "rewrite"
+	lidVerdictAlsoAPhone  = "also-a-phone-number"
+	lidVerdictOwnIdentity = "own-identity"
+	lidVerdictTargetIsOwn = "target-is-own-identity"
+	lidVerdictOtherPerson = "target-links-another-person"
 )
 
 // WhatsAppLIDRepairOptions scopes a WhatsApp LID repair to one account.
@@ -271,10 +271,6 @@ func planLIDCandidate(
 	}
 	candidate.TargetKind = key.Kind
 	candidate.TargetCanonicalValue = key.Canonical
-	if key.Kind == string(identity.Kind) && key.Canonical == identity.CanonicalValue {
-		candidate.Verdict = lidVerdictTargetIsSame
-		return candidate, nil, nil
-	}
 	targetID := v2keys.DeriveID("identity", accountID, key.Kind+"\x1f"+key.Canonical)
 	if existing, ok := byKey[key]; ok {
 		targetID = existing.IdentityID

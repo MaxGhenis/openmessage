@@ -14,10 +14,10 @@ import (
 	"github.com/maxghenis/openmessage/internal/whatsapplive"
 )
 
-// Three paths name a WhatsApp person: v2 live ingest (whatsAppIdentity), the
+// Three paths name a WhatsApp sender: v2 live ingest (whatsAppIdentity), the
 // legacy bridge (whatsapplive.StoredAddress, which migration turns into an
 // identity) and the WhatsApp Desktop importer (whatsapplid's Address with no
-// pairs). For any person's JID all three must reach the same v2 identity, or
+// pairs). For any sender's JID all three must reach the same v2 identity, or
 // one person splits in two after cutover; before the fix the legacy and
 // importer paths named a LID "+<digits>" where live ingest names it
 // "<digits>@lid".
@@ -25,7 +25,7 @@ import (
 type differentialJID struct{ JID types.JID }
 
 func (differentialJID) Generate(r *rand.Rand, _ int) reflect.Value {
-	servers := []string{types.DefaultUserServer, types.HiddenUserServer, types.HostedServer, types.HostedLIDServer, types.BotServer}
+	servers := []string{types.DefaultUserServer, types.HiddenUserServer, types.HostedServer, types.HostedLIDServer, types.BotServer, types.NewsletterServer}
 	user := strconv.FormatInt(1+r.Int63n(1_000_000_000_000_000), 10)
 	jid := types.NewJID(user, servers[r.Intn(len(servers))])
 	if r.Intn(3) == 0 {
@@ -49,12 +49,9 @@ func TestWhatsAppPersonIdentityAgreesAcrossIngestPaths(t *testing.T) {
 			t.Errorf("%s: live ingest %+v, legacy bridge %+v", input.JID, live, legacy)
 			return false
 		}
-		if server := input.JID.Server; server == types.DefaultUserServer || server == types.HiddenUserServer {
-			imported := key(whatsapplid.NewEvidence().Address(input.JID.String()))
-			if live != imported {
-				t.Errorf("%s: live ingest %+v, Desktop import %+v", input.JID, live, imported)
-				return false
-			}
+		if imported := key(whatsapplid.NewEvidence().Address(input.JID.String())); live != imported {
+			t.Errorf("%s: live ingest %+v, Desktop import %+v", input.JID, live, imported)
+			return false
 		}
 		return true
 	}

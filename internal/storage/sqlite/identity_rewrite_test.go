@@ -295,3 +295,21 @@ func TestIdentityRewriteOrdersReactionsLikeMessageMerges(t *testing.T) {
 		t.Errorf("delta reaction = %q, want the later event", got)
 	}
 }
+
+// With no raw names to clear, the rewrite leaves the target's other chats
+// alone: an untitled chat is not one whose raw title was cleared.
+func TestIdentityRewriteWithoutRawNamesTouchesNoUnrelatedChat(t *testing.T) {
+	f := newRewriteFixture(t)
+	f.identity("fake", "e164", "+98765432109876", "Ana", false)
+	f.identity("phone", "e164", "+15557654321", "", false)
+	f.conversation("solo", "direct", "")
+	f.conversation("lid-chat", "direct", "")
+	f.participant("solo", "phone", "", true, "member", nil)
+	f.participant("lid-chat", "fake", "", true, "member", nil)
+	if err := f.apply(lidRewrite("fake", "+98765432109876", "x", "e164", "+15557654321")); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if got := f.scalar(`SELECT group_concat(conversation_id || ':' || updated_at_ms) FROM (SELECT * FROM conversations ORDER BY conversation_id)`); got != "lid-chat:10,solo:10" {
+		t.Fatalf("conversations = %q, want both untouched", got)
+	}
+}

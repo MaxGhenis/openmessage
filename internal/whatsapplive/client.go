@@ -2956,6 +2956,12 @@ func (b *Bridge) upsertConversationForMessage(evt *waevents.Message) (*db.Conver
 	if shouldReplaceConversationName(convo.Name, name) {
 		convo.Name = name
 	}
+	if strings.TrimSpace(convo.Name) == "" {
+		// A LID with no known number, contact or push name has no name yet;
+		// its JID stands in, as fallbackChatName gives a group, and a real
+		// name replaces it when one arrives.
+		convo.Name = fallbackChatName(chatJID)
+	}
 	if participants, err := marshalParticipants([]participantJSON{{
 		Name:   firstNonEmpty(name, fallbackChatName(chatJID)),
 		Number: b.addressForJID(chatJID),
@@ -3238,10 +3244,11 @@ func (b *Bridge) addressForJID(jid watypes.JID) string {
 // same JID (ingest.whatsAppIdentity), so a migrated row names the identity a
 // live frame does. Storing a LID's digits as a phone number ("+<digits>")
 // would make it look like one, match phone searches, and name
-// "<digits>@s.whatsapp.net" in reactions and receipts. A JID that names a
-// chat rather than a person (a group, broadcast list or newsletter) gives "":
-// none of them is anyone's address, and an all-digit one is no phone number
-// either.
+// "<digits>@s.whatsapp.net" in reactions and receipts. A newsletter's posts
+// are its own, so a newsletter JID is kept too, as v2 names their sender. A
+// JID that names a chat rather than a sender (a group or broadcast list)
+// gives "": neither is anyone's address, and an all-digit one is no phone
+// number either.
 func StoredAddress(jid watypes.JID) string {
 	jid = jid.ToNonAD()
 	if phone := jidToPhone(jid); phone != "" {
@@ -3251,7 +3258,7 @@ func StoredAddress(jid watypes.JID) string {
 		return ""
 	}
 	switch jid.Server {
-	case watypes.HiddenUserServer, watypes.HostedServer, watypes.HostedLIDServer, watypes.BotServer:
+	case watypes.HiddenUserServer, watypes.HostedServer, watypes.HostedLIDServer, watypes.BotServer, watypes.NewsletterServer:
 		return jid.String()
 	default:
 		return ""

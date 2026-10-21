@@ -1643,16 +1643,23 @@ is. Until this fix both `jidToPhone` helpers turned any all-digit user into
 know that way, and the WhatsApp Desktop importer every LID sender. Migration
 then minted an `e164` identity for the LID's digits. In v2 such a sender shows
 a phone number that is no one's, matches phone searches, and a reaction or read
-receipt to their group message names `<lid digits>@s.whatsapp.net`.
+receipt to their group message names `<lid digits>@s.whatsapp.net`. The same
+check passed new-style group JIDs (`120363…@g.us`) and newsletters for phone
+numbers, so a legacy group with no subject was named `+120363…`, and a
+newsletter's posts named it as their sender by that number.
 
 What each path stores now:
 
 - **v2 live ingest** (unchanged): the phone number when whatsmeow knows the
   LID's number, else `<digits>@lid` (`ingest.whatsAppIdentity`).
 - **Legacy bridge**: the same value (`whatsapplive.StoredAddress`), so a
-  migrated row names the identity a live frame does. A contact's
-  `RedactedPhone` (the masked `+1 ••• ••21` a LID group shows a non-contact
-  by) is a display name only; its digits used to be stored as a number too.
+  migrated row names the identity a live frame does: the phone number, else
+  the sender's JID (a LID, a hosted or bot JID, a newsletter), and nothing for
+  a group or broadcast list. A chat with no name yet is named by its JID,
+  which a real name replaces when one arrives. `phoneForJID` no longer falls
+  back to a contact's `RedactedPhone` (the masked `+1 ••• ••21` a LID group
+  shows a non-contact by): once a LID gets no number from `jidToPhone`, that
+  fallback would store the mask's digits as one. It stays a display name.
 - **Desktop importer**: the number Desktop pairs the LID with (the chat's or
   member's `ZCONTACTIDENTIFIER` when it is a phone-number JID or `+<digits>`,
   or `LID.sqlite`), else `<digits>@lid`.
@@ -1678,9 +1685,14 @@ account's `<digits>@lid` identities and chats, its own number, and every
 number on another platform's account). Each source's line in the report says
 whether it was read, missing or failed; a source that fails only means less
 evidence, so fewer identities change. Digit length is never evidence. A LID
-becomes the identity live ingest mints for it today: the number the records
-pair it with when they name exactly one (and nothing names that number a LID),
-otherwise `<digits>@lid`. When that identity exists the two merge: messages,
+becomes the form v2 ingest gives a LID: its phone number when the records pair
+it with exactly one (and nothing names that number a LID), otherwise
+`<digits>@lid`. The repair can know a number live ingest does not yet:
+`canonicalJID` asks only whatsmeow and the session store's LID map, not
+Desktop. Until whatsmeow learns that pair, a new live message from the LID
+names it `<digits>@lid`, a second identity beside the number; any LID whose
+number becomes known after its first message gets the same split today.
+When that identity exists the two merge: messages,
 roster rows, reactions (the newer per person and message) and the person link
 move, and display names that only repeat the LID's digits are cleared. It
 refuses, and reports, an identity also named as a phone number
@@ -1688,7 +1700,17 @@ refuses, and reports, an identity also named as a phone number
 pairs with this account's own number (`target-is-own-identity`), and one whose
 target links to a different person (`target-links-another-person`). Running it
 again plans nothing new. It changes only the v2 store; the legacy
-`messages.db` keeps its old rows.
+`messages.db` keeps its old rows. It rewrites only LIDs: a group's or
+newsletter's digits stored as `+<digits>` before the fix (a group title, a
+newsletter's sender) stay as they are, since no record names those digits a
+LID.
+
+Read receipts parse their stored sender apart from reactions
+(`whatsapplive.MarkReadRequest`, which still reads `<digits>@lid` as
+`<digits>@lid@s.whatsapp.net`). So after the repair a group receipt for a
+LID's message names a malformed JID instead of a wrong number, until that
+parse is fixed. No production path queues a v2 read receipt yet: nothing
+outside tests calls `messaging.MessageService.MarkRead`.
 
 ## signal-cli
 
@@ -2050,7 +2072,7 @@ number or a LID were never affected: whatsmeow puts no participant in their
 messages' keys (a bot's chat, for one, does get one).
 
 Messages migrated from the legacy store, or imported from WhatsApp Desktop,
-before the fix in "WhatsApp LIDs stored as phone numbers" below can name a LID
+before the fix in "WhatsApp LIDs stored as phone numbers" above can name a LID
 sender by the LID's digits as a phone number (`+<lid digits>`). Such a sender
 looks like a phone number here and goes out as `<lid digits>@s.whatsapp.net`
 until `openmessage repair whatsapp-lid` rewrites it.

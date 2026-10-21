@@ -217,7 +217,9 @@ func applyIdentityRewrite(ctx context.Context, tx *sql.Tx, accountID string, rew
 		sql.Named("to_id", toID),
 		sql.Named("now_ms", nowMS),
 	}
-	rawList := "''"
+	// title and display_name are NOT NULL, so with no raw names "IN (NULL)"
+	// matches nothing: an untitled chat is not one whose raw title was cleared.
+	rawList := "NULL"
 	if len(rewrite.RawNames) > 0 {
 		placeholders := make([]string, len(rewrite.RawNames))
 		for i, name := range rewrite.RawNames {

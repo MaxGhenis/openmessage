@@ -173,3 +173,62 @@ func TestRepairWhatsAppLIDSummaryNamesSourcesAndVerdicts(t *testing.T) {
 		}
 	}
 }
+
+// LID.sqlite is read from beside --desktop-db unless --desktop-lid-db names
+// another file, and "" skips it even when Desktop's database is read.
+func TestRepairWhatsAppLIDDesktopLIDFlag(t *testing.T) {
+	seedWhatsAppLIDRepair(t)
+	desktop := filepath.Join(t.TempDir(), "ChatStorage.sqlite")
+	sourcePath := func(output whatsAppLIDRepairOutput, name string) (string, bool) {
+		for _, source := range output.Report.Sources {
+			if source.Name == name {
+				return source.Path, source.Missing
+			}
+		}
+		t.Fatalf("no %s source in %+v", name, output.Report.Sources)
+		return "", false
+	}
+	var stdout, stderr bytes.Buffer
+	for _, tc := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{"--desktop-db", desktop}, filepath.Join(filepath.Dir(desktop), "LID.sqlite")},
+		{[]string{"--desktop-db", desktop, "--desktop-lid-db", ""}, ""},
+		{[]string{"--desktop-db", desktop, "--desktop-lid-db", "/elsewhere/LID.sqlite"}, "/elsewhere/LID.sqlite"},
+	} {
+		stdout.Reset()
+		if err := runRepairWhatsAppLID(context.Background(), zerolog.Nop(), append([]string{"--json"}, tc.args...), &stdout, &stderr); err != nil {
+			t.Fatalf("%v: %v\n%s", tc.args, err, stderr.String())
+		}
+		var output whatsAppLIDRepairOutput
+		if err := json.Unmarshal(stdout.Bytes(), &output); err != nil {
+			t.Fatal(err)
+		}
+		if path, missing := sourcePath(output, "desktop_lid"); path != tc.want || !missing {
+			t.Errorf("%v: LID.sqlite source = %q (missing %v), want %q", tc.args, path, missing, tc.want)
+		}
+	}
+}
+
+// --apply refuses while another process holds the instance lock, and writes
+// nothing.
+func TestRepairWhatsAppLIDApplyRefusesWhileTheInstanceLockIsHeld(t *testing.T) {
+	dataDir, storePath := seedWhatsAppLIDRepair(t)
+	lock, err := acquireInstanceLock(filepath.Join(dataDir, instanceLockName), instanceLockRecord{PID: 4242, Process: "test-daemon"})
+	if err != nil {
+		t.Fatalf("acquire lock: %v", err)
+	}
+	defer lock.Close()
+	var stdout, stderr bytes.Buffer
+	err = runRepairWhatsAppLID(context.Background(), zerolog.Nop(), []string{"--apply", "--skip-daemon-probe", "--desktop-db", ""}, &stdout, &stderr)
+	if err == nil || !strings.Contains(err.Error(), "holds the instance lock") {
+		t.Fatalf("apply error = %v, want a refusal naming the instance lock", err)
+	}
+	if got := storeSenderOf(t, storePath, "m1"); got != "e164 +"+repairLIDDigits {
+		t.Fatalf("sender = %q after a refused apply", got)
+	}
+	if _, err := os.Stat(filepath.Join(dataDir, "v2", "repair-backups")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("a refused apply made a backup: %v", err)
+	}
+}

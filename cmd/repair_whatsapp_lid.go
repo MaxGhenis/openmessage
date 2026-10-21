@@ -49,7 +49,7 @@ func runRepairWhatsAppLID(ctx context.Context, logger zerolog.Logger, args []str
 	fs.StringVar(&accountID, "account", whatsappAccountID, "v2 WhatsApp account id")
 	fs.StringVar(&sessionPath, "session", filepath.Join(dataDir, "whatsapp-session.db"), "whatsmeow session store to read LID evidence from ('' to skip)")
 	fs.StringVar(&desktopPath, "desktop-db", whatsapplid.DefaultDesktopPath(), "WhatsApp Desktop ChatStorage.sqlite to read LID evidence from ('' to skip)")
-	fs.StringVar(&desktopLID, "desktop-lid-db", "", "WhatsApp Desktop LID.sqlite (default: beside --desktop-db)")
+	fs.StringVar(&desktopLID, "desktop-lid-db", "", "WhatsApp Desktop LID.sqlite to read LID pairs from (default: beside --desktop-db; '' to skip)")
 	fs.BoolVar(&apply, "apply", false, "apply the plan (default: dry run)")
 	fs.BoolVar(&asJSON, "json", false, "write the report as JSON to stdout")
 	fs.StringVar(&reportPath, "report", "", "also write the JSON report to this path")
@@ -60,7 +60,9 @@ func runRepairWhatsAppLID(ctx context.Context, logger zerolog.Logger, args []str
 		}
 		return err
 	}
-	if desktopLID == "" && strings.TrimSpace(desktopPath) != "" {
+	lidSet := false
+	fs.Visit(func(f *flag.Flag) { lidSet = lidSet || f.Name == "desktop-lid-db" })
+	if !lidSet && strings.TrimSpace(desktopPath) != "" {
 		desktopLID = whatsapplid.DesktopLIDPath(desktopPath)
 	}
 
