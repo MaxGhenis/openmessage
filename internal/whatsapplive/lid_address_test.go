@@ -28,6 +28,21 @@ const (
 	lidAddressTestGroup = "120363019999999999"
 )
 
+// lidAddressLIDs is the account's LID map in these tests: the phone number
+// each known LID stands for, by user part.
+type lidAddressLIDs map[string]string
+
+// lidAddressBridge is a connected bridge whose whatsmeow LID store knows lids.
+func lidAddressBridge(lids lidAddressLIDs) *Bridge {
+	lidToPN := map[string]watypes.JID{}
+	for lid, pn := range lids {
+		lidToPN[watypes.NewJID(lid, watypes.HiddenUserServer).String()] = watypes.NewJID(pn, watypes.DefaultUserServer)
+	}
+	bridge := connectedMediaTestBridge()
+	bridge.client.Store.LIDs = &testLIDStore{lidToPN: lidToPN}
+	return bridge
+}
+
 func TestJIDToPhoneNamesOnlyPhoneNumberJIDs(t *testing.T) {
 	cases := []struct {
 		jid  watypes.JID
@@ -79,8 +94,8 @@ func TestFallbackChatNameStaysReplaceableForLIDsAndGroups(t *testing.T) {
 
 func TestAddressForJIDKeepsUnmappedLIDsAsLIDs(t *testing.T) {
 	lid := watypes.NewJID(lidAddressTestLID, watypes.HiddenUserServer)
-	unmapped := reactionTestBridge(reactionTestLIDs{})
-	mapped := reactionTestBridge(reactionTestLIDs{lidAddressTestLID: lidAddressTestPhone})
+	unmapped := lidAddressBridge(nil)
+	mapped := lidAddressBridge(lidAddressLIDs{lidAddressTestLID: lidAddressTestPhone})
 	cases := []struct {
 		name   string
 		bridge *Bridge
@@ -119,7 +134,7 @@ func (c *redactedPhoneContacts) GetContact(context.Context, watypes.JID) (watype
 // A RedactedPhone ("+1 ••• ••21") is a display name, not a number: stored as
 // a number its digits ("+121") minted a fake phone identity in v2.
 func TestRedactedPhoneIsANameNotANumber(t *testing.T) {
-	bridge := reactionTestBridge(reactionTestLIDs{})
+	bridge := lidAddressBridge(nil)
 	bridge.client.Store.Contacts = &redactedPhoneContacts{redacted: "+1 ••• ••21"}
 	lid := watypes.NewJID(lidAddressTestLID, watypes.HiddenUserServer)
 
@@ -146,14 +161,14 @@ func lidAddressTestMessage(chat, sender watypes.JID, id, pushName string, isGrou
 	}
 }
 
-func lidAddressTestStoreBridge(t *testing.T, lids reactionTestLIDs) (*Bridge, *db.Store) {
+func lidAddressTestStoreBridge(t *testing.T, lids lidAddressLIDs) (*Bridge, *db.Store) {
 	t.Helper()
 	store, err := db.New(filepath.Join(t.TempDir(), "messages.db"))
 	if err != nil {
 		t.Fatalf("db.New(): %v", err)
 	}
 	t.Cleanup(func() { store.Close() })
-	bridge := reactionTestBridge(lids)
+	bridge := lidAddressBridge(lids)
 	bridge.store = store
 	// The bridge is not connected, so the group enrichment it starts for a
 	// new group returns without a network call.
@@ -166,14 +181,14 @@ func TestHandleMessageStoresAGroupLIDSenderByItsJIDOrNumber(t *testing.T) {
 	lid := watypes.NewJID(lidAddressTestLID, watypes.HiddenUserServer)
 	cases := []struct {
 		name       string
-		lids       reactionTestLIDs
+		lids       lidAddressLIDs
 		pushName   string
 		wantNumber string
 		wantName   string
 	}{
-		{"unmapped, named", reactionTestLIDs{}, "Ana", lidAddressTestLID + "@lid", "Ana"},
-		{"unmapped, unnamed", reactionTestLIDs{}, "", lidAddressTestLID + "@lid", lidAddressTestLID + "@lid"},
-		{"mapped", reactionTestLIDs{lidAddressTestLID: lidAddressTestPhone}, "Ana", "+" + lidAddressTestPhone, "Ana"},
+		{"unmapped, named", nil, "Ana", lidAddressTestLID + "@lid", "Ana"},
+		{"unmapped, unnamed", nil, "", lidAddressTestLID + "@lid", lidAddressTestLID + "@lid"},
+		{"mapped", lidAddressLIDs{lidAddressTestLID: lidAddressTestPhone}, "Ana", "+" + lidAddressTestPhone, "Ana"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -202,7 +217,7 @@ func TestHandleMessageStoresAGroupLIDSenderByItsJIDOrNumber(t *testing.T) {
 }
 
 func TestHandleMessageStoresAnUnmappedLIDPeerByItsJID(t *testing.T) {
-	bridge, store := lidAddressTestStoreBridge(t, reactionTestLIDs{})
+	bridge, store := lidAddressTestStoreBridge(t, nil)
 	lid := watypes.NewJID(lidAddressTestLID, watypes.HiddenUserServer)
 	bridge.handleMessage(lidAddressTestMessage(lid, lid, "direct-msg", "", false))
 
@@ -230,7 +245,7 @@ func TestHandleMessageStoresAnUnmappedLIDPeerByItsJID(t *testing.T) {
 }
 
 func TestGroupParticipantsJSONStoresAnUnmappedLIDMemberByItsJID(t *testing.T) {
-	bridge := reactionTestBridge(reactionTestLIDs{})
+	bridge := lidAddressBridge(nil)
 	serialized, err := bridge.groupParticipantsJSON([]watypes.GroupParticipant{
 		{JID: watypes.NewJID(lidAddressTestLID, watypes.HiddenUserServer), DisplayName: "+1 ••• ••21"},
 		{JID: watypes.NewJID("11111111111111", watypes.HiddenUserServer), PhoneNumber: watypes.NewJID(lidAddressTestPhone, watypes.DefaultUserServer)},
@@ -256,7 +271,7 @@ func TestGroupParticipantsJSONStoresAnUnmappedLIDMemberByItsJID(t *testing.T) {
 // The legacy reaction path reads the stored sender back. A LID stored as its
 // JID must go out as that LID, not "<digits>@lid@s.whatsapp.net".
 func TestLegacySendReactionNamesAStoredLIDSenderByItsLID(t *testing.T) {
-	bridge, store := lidAddressTestStoreBridge(t, reactionTestLIDs{})
+	bridge, store := lidAddressTestStoreBridge(t, nil)
 	bridge.connected = true
 	group := "whatsapp:" + lidAddressTestGroup + "@g.us"
 	if err := store.UpsertMessage(&db.Message{
