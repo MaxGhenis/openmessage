@@ -1164,8 +1164,19 @@ func TestCancelingAHeldReactionsSendRejectsItAtOnce(t *testing.T) {
 	}
 
 	clock.Advance(time.Hour)
+	select {
+	case <-service.wake:
+	default:
+	}
 	if _, err := service.Cancel(ctx, target.OutboxID); err != nil {
 		t.Fatalf("Cancel(send): %v", err)
+	}
+	// The running dispatcher is woken, so it need not sleep until the
+	// canceled send's old time.
+	select {
+	case <-service.wake:
+	default:
+		t.Fatalf("Cancel(send) did not wake the dispatcher")
 	}
 	clock.Advance(time.Millisecond)
 	if processed, err := service.DispatchDue(ctx, 4); err != nil || processed != 1 {
