@@ -251,28 +251,66 @@ func (a *Adapter) MarkRead(ctx context.Context, req bridge.ReadReceiptRequest) e
 		)
 	}
 
-	messageIDs := make([]string, len(req.Messages))
-	for i, message := range req.Messages {
-		messageIDs[i] = message.RemoteID
-	}
-	err := a.markReadRequest(
-		req.Conversation.RemoteID,
-		messageIDs,
-		req.Messages[0].AuthorID,
-		req.ReadAt,
-	)
-	if err != nil {
-		// Deliberately no adapter-level lifecycle report: the retained core owns
-		// reconnect reporting through its guarded reportConnectionError path.
-		failure := a.classifyError(err, "mark_read", "whatsapp_mark_read_failed")
-		// Deliberate idempotent-read divergence: even after whatsmeow's transport
-		// call, repeating a read receipt is harmless. Preserve every retryable
-		// class as DispatchNotCalled instead of uncertain; terminal classes are
-		// still rejected by their classification before certainty is consulted.
-		failure.Dispatch = bridge.DispatchNotCalled
-		return failure
+	// whatsmeow's MarkRead names one sender for every message a receipt
+	// covers, so messages from different senders go out as one receipt per
+	// sender, in the order each sender first appears. (The dispatcher sends
+	// one message per receipt.) A failure ends the request, and a retry sends
+	// the receipts before it again, which is harmless.
+	for _, batch := range readReceiptBatches(req.Messages) {
+		err := a.markReadRequest(
+			req.Conversation.RemoteID,
+			batch.messageIDs,
+			batch.authorID,
+			req.ReadAt,
+		)
+		if errors.Is(err, whatsapplive.ErrReadReceiptSenderUnknown) {
+			// Nothing was sent for this sender, and sending again cannot name
+			// it either.
+			return bridge.OpError{
+				Class:       bridge.FailureUnsupported,
+				Operation:   "mark_read",
+				Fingerprint: "whatsapp_read_receipt_sender_unavailable",
+				Dispatch:    bridge.DispatchNotCalled,
+				Cause:       err,
+			}
+		}
+		if err != nil {
+			// Deliberately no adapter-level lifecycle report: the retained core owns
+			// reconnect reporting through its guarded reportConnectionError path.
+			failure := a.classifyError(err, "mark_read", "whatsapp_mark_read_failed")
+			// Deliberate idempotent-read divergence: even after whatsmeow's transport
+			// call, repeating a read receipt is harmless. Preserve every retryable
+			// class as DispatchNotCalled instead of uncertain; terminal classes are
+			// still rejected by their classification before certainty is consulted.
+			failure.Dispatch = bridge.DispatchNotCalled
+			return failure
+		}
 	}
 	return nil
+}
+
+// readReceiptBatch is the messages of a read-receipt request that one
+// WhatsApp receipt covers: those stored with the same sender.
+type readReceiptBatch struct {
+	authorID   string
+	messageIDs []string
+}
+
+// readReceiptBatches groups messages by stored sender, in the order each
+// sender first appears, keeping request order within a sender.
+func readReceiptBatches(messages []bridge.MessageRef) []readReceiptBatch {
+	var batches []readReceiptBatch
+	bySender := make(map[string]int, len(messages))
+	for _, message := range messages {
+		i, seen := bySender[message.AuthorID]
+		if !seen {
+			i = len(batches)
+			bySender[message.AuthorID] = i
+			batches = append(batches, readReceiptBatch{authorID: message.AuthorID})
+		}
+		batches[i].messageIDs = append(batches[i].messageIDs, message.RemoteID)
+	}
+	return batches
 }
 
 func whatsappReadPreCallFailure(fingerprint string, cause error) bridge.OpError {

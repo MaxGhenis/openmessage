@@ -2000,6 +2000,32 @@ Desktop importer, which has no LID map, for every LID sender (both `jidToPhone`
 helpers keep any all-digit user). Such a sender looks like a phone number here
 and goes out as `<lid digits>@s.whatsapp.net`.
 
+**WhatsApp read-receipt senders.** A WhatsApp read receipt names the messages
+it covers by their chat and IDs, and in a group by their sender too:
+whatsmeow's `MarkRead` puts the sender in the receipt's `participant`
+attribute, requires one in a group, and names one sender for every message a
+receipt covers. `whatsapplive.MarkReadRequest` names a group sender the way a
+reaction names it (above): a stored LID as stored, and a stored phone number
+as its LID when the group addresses members by LID. That is also the form
+whatsmeow's own delivery receipt for the message named, since it copies the
+participant the message arrived with. A failed addressing lookup sends the
+stored sender, since `MarkRead` does not read the group cache. A group receipt
+whose stored sender is missing, or is neither a sender's JID nor a phone number
+(the same test as for reactions), is refused before anything is sent: the row
+ends `rejected` (`error_class: unsupported`, `error_code: mark_read`,
+`error_detail` `mark_read: unsupported: whatsapp read receipt sender is
+unavailable`), and the read cursor keeps its new position. Before, a stored LID
+went out as `<digits>@lid@s.whatsapp.net`, a missing sender went out with no
+participant, and any other value went out as `<value>@s.whatsapp.net` (less
+a leading `+`). In a 1:1 chat `MarkRead` sends no participant, so nothing
+changed there. When a request covers messages from several stored senders,
+the WhatsApp adapter sends one receipt per sender, in the order each first
+appears; before, one receipt named the first message's author for all of them.
+The dispatcher puts one message, the read cursor's, in each request. As of
+2026-10-21 no production path queues a v2 read receipt: nothing outside tests
+calls `messaging.MessageService.MarkRead`, and `/api/mark-read` only moves the
+cursor. So none of this has reached a live install yet.
+
 **Reactions stuck retrying.** A reaction the transport cannot deliver yet goes
 `not_dispatched` and retries (every 5 s by default) with no cap; a Signal
 reaction whose target can never be named (above) stays there until it is
