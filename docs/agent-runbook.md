@@ -2002,38 +2002,40 @@ and goes out as `<lid digits>@s.whatsapp.net`.
 
 **WhatsApp read-receipt senders.** A WhatsApp read receipt names the messages
 it covers by their chat and IDs, and in a group by their sender too:
-whatsmeow's `MarkRead` puts the sender in the receipt's `participant`
-attribute (its documentation requires one in a group) and names one sender for
-every message a receipt covers. `whatsapplive.MarkReadRequest` names a group
-sender the way a reaction names it (above): a stored LID as stored, and a
-stored phone number as its LID when the group addresses members by LID. That
-is also the form whatsmeow's own delivery receipt for the message named, since
-it copies the participant the message arrived with. The number's LID is looked
-up first, in local stores; only when one is known is the group's addressing
-read, which fetches the group from WhatsApp if whatsmeow's cache does not hold
-it. That fetch has 10 s of the receipt's 45 s; if it fails or runs out, the
-receipt goes out naming the stored phone number (`MarkRead` does not read the
-group cache). A group receipt whose stored sender is neither a sender's JID nor
-a phone number (the same test as for reactions) is refused before anything is
-sent: the row ends `rejected` (`error_class: unsupported`, `error_code:
-mark_read`, `error_detail` `mark_read: unsupported: whatsapp read receipt
-sender is not a user's JID or phone number`), and the read cursor keeps its new
-position. A message with no stored sender is not refused. This account's own
-messages have none (neither ingest nor migration gives an outgoing message a
-sender identity), so a receipt for one goes out with no participant, as
-before. Before, a stored LID went out as `<digits>@lid@s.whatsapp.net`, and any
-other value went out as `<value>@s.whatsapp.net` (less a leading `+`). In a
-1:1 chat `MarkRead` sends no participant, so nothing changed there. When a
-request covers messages from several stored senders, the WhatsApp adapter
-sends one receipt per sender, in the order each first appears. Before, one
-receipt named the first message's author for all of them. A refused sender
-does not hold up the others' receipts; the refusal is reported after they are
-sent. A transport failure ends the request, and so does the end of its
-context: the 60 s `callTransport` bound covers the whole request. The
-dispatcher puts one message, the read cursor's, in each request. As of
-2026-10-21 no production path queues a v2 read receipt: nothing outside tests
-calls `messaging.MessageService.MarkRead`, and `/api/mark-read` only moves the
-cursor. So none of this has reached a live install yet.
+whatsmeow's `MarkRead` puts the sender in the receipt's `participant` attribute
+(its documentation requires one in a group) and names one sender for every
+message a receipt covers. `whatsapplive.MarkReadRequest` names a group sender
+the way a reaction names it (above): a stored LID as stored, and a stored phone
+number as its LID when the group addresses members by LID. That is also the
+form whatsmeow's own delivery receipt for the message named, since it copies
+the participant the message arrived with. Reading the group's addressing
+fetches the group from WhatsApp if whatsmeow's cache does not hold it (which
+also stores the members' LIDs, so it is read before the number's LID is looked
+up). For a read receipt that fetch has 10 s of the receipt's 45 s; if it fails
+or runs out, the receipt goes out naming the stored phone number (`MarkRead`
+does not read the group cache). The 10 s does not cover waiting for whatsmeow's
+group cache lock, which another caller holds across its own fetch. A group
+receipt whose stored sender is neither a sender's JID nor a phone number (the
+same test as for reactions) is refused before anything is sent: the row ends
+`rejected` (`error_class: unsupported`, `error_code: mark_read`, `error_detail`
+`mark_read: unsupported: whatsapp read receipt sender is not a user's JID or
+phone number`), and the read cursor keeps its new position. A message with no
+stored sender is not refused. This account's own messages have none (neither
+the send path, ingest nor migration gives an outgoing message a sender
+identity), so a receipt for one goes out with no participant, as before.
+Before, a stored LID went out as `<digits>@lid@s.whatsapp.net`, and any other
+value went out as `<value>@s.whatsapp.net` (less a leading `+`; a bare `+` went
+out with no participant). In a 1:1 chat `MarkRead` sends no participant, so
+nothing changed there. When a request covers messages from several stored
+senders, the WhatsApp adapter sends one receipt per sender, in the order each
+first appears. Before, one receipt named the first message's author for all of
+them. A refused sender does not hold up the others' receipts; the refusal is
+reported after they are sent. A transport failure ends the request, and so does
+the end of its context: the 60 s `callTransport` bound covers the whole
+request. The dispatcher puts one message, the read cursor's, in each request.
+As of 2026-10-21 no production path queues a v2 read receipt: nothing outside
+tests calls `messaging.MessageService.MarkRead`, and `/api/mark-read` only
+moves the cursor. So none of this has reached a live install yet.
 
 **Reactions stuck retrying.** A reaction the transport cannot deliver yet goes
 `not_dispatched` and retries (every 5 s by default) with no cap; a Signal

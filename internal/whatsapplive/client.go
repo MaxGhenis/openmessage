@@ -1605,10 +1605,11 @@ func (e sendNotDispatchedError) Is(target error) bool {
 // receipt is not sent.
 var ErrReadReceiptSenderUnknown = errors.New("whatsapp read receipt sender is not a user's JID or phone number")
 
-// readReceiptAddressingTimeout bounds a read receipt's group addressing
-// lookup, which fetches the group from WhatsApp when whatsmeow's cache does
-// not hold it, so an unanswered query leaves the receipt most of its deadline
-// to go out naming the stored sender.
+// readReceiptAddressingTimeout bounds the group fetch a read receipt's
+// addressing lookup makes when whatsmeow's cache does not hold the group, so
+// an unanswered query leaves the receipt most of its deadline to go out naming
+// the stored sender. It does not bound the wait for whatsmeow's group cache
+// lock, which another caller holds across its own fetch.
 var readReceiptAddressingTimeout = 10 * time.Second
 
 // MarkReadRequest sends read receipts from v2 request data without loading
@@ -4630,18 +4631,15 @@ func storedSenderJID(authorID string) (watypes.JID, bool) {
 // by its LID too. A stored LID is kept: live ingest stores one only for a
 // message addressed by LID, and history sync stores the form the phone's
 // history names the sender by, so mapping it to a phone number (as
-// canonicalJID would) names a form neither gave. When the number's LID or the
-// addressing is unknown, the stored sender is used. The LID is looked up
-// first, in local stores, so a group is fetched for its addressing only when
-// the answer can change the form. A failed lookup is not an error here: a
-// reaction's SendMessage reads the same cache and reports it, and a read
-// receipt goes out naming the stored sender.
+// canonicalJID would) names a form neither gave. When the addressing or the
+// number's LID is unknown, the stored sender is used. The addressing is read
+// before the LID is looked up: fetching a group whatsmeow has not cached also
+// stores its members' LID mappings (getGroupInfo), so the fetch can supply the
+// LID. A failed lookup is not an error here: a reaction's SendMessage reads
+// the same cache and reports it, and a read receipt goes out naming the stored
+// sender.
 func (b *Bridge) groupSenderParticipant(cli *whatsmeow.Client, ctx context.Context, chatJID, sender watypes.JID) watypes.JID {
 	if chatJID.Server != watypes.GroupServer || sender.Server != watypes.DefaultUserServer {
-		return sender
-	}
-	lid := b.lidForPhoneJID(cli, ctx, sender)
-	if lid.IsEmpty() {
 		return sender
 	}
 	mode, err := groupAddressingMode(cli, ctx, chatJID)
@@ -4652,7 +4650,10 @@ func (b *Bridge) groupSenderParticipant(cli *whatsmeow.Client, ctx context.Conte
 	if mode != watypes.AddressingModeLID {
 		return sender
 	}
-	return lid
+	if lid := b.lidForPhoneJID(cli, ctx, sender); !lid.IsEmpty() {
+		return lid
+	}
+	return sender
 }
 
 // lidForPhoneJID returns the LID whatsmeow maps a phone-number JID to, or the

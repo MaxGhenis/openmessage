@@ -568,6 +568,28 @@ func TestSendReactionRequestGroupParticipantProperty(t *testing.T) {
 	}
 }
 
+// Fetching a group whatsmeow has not cached stores its members' LID mappings
+// (getGroupInfo), so the addressing is read before the LID is looked up: a
+// number whose LID only the fetch supplies is still named by its LID.
+func TestSendReactionRequestNamesTheLIDTheGroupFetchSupplies(t *testing.T) {
+	transport := newReactionTestTransport(t)
+	lids := senderTestLIDs{}
+	groupAddressingMode = func(_ *whatsmeow.Client, _ context.Context, group watypes.JID) (watypes.AddressingMode, error) {
+		transport.lookups = append(transport.lookups, group)
+		lids[senderTestLID] = senderTestPhone
+		return watypes.AddressingModeLID, nil
+	}
+	if _, err := senderTestBridge(lids).SendReactionRequest(senderTestGroup, "target-remote-id", "+"+senderTestPhone, false, "🔥", "add", "request-1"); err != nil {
+		t.Fatalf("SendReactionRequest() error = %v", err)
+	}
+	if len(transport.sent) != 1 || transport.sent[0] == nil {
+		t.Fatalf("reactions sent = %d, want one", len(transport.sent))
+	}
+	if got := transport.sent[0].GetKey().GetParticipant(); got != senderTestLID+"@lid" {
+		t.Fatalf("target participant = %q, want the LID the fetch stored", got)
+	}
+}
+
 // Like canonicalJID, the phone number's LID falls back to the session store's
 // LID map when whatsmeow's LID store has none.
 func TestSendReactionRequestFindsAGroupSendersLIDInTheSessionStore(t *testing.T) {
