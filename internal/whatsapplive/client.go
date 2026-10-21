@@ -1597,8 +1597,33 @@ func (e sendNotDispatchedError) Is(target error) bool {
 	return target == ErrSendNotDispatched
 }
 
+// ErrReadReceiptSenderUnknown reports a read receipt for group messages whose
+// stored sender is neither a user's JID nor a phone number (storedSenderJID).
+// WhatsApp names the messages a group receipt covers by their sender as well
+// as their IDs: whatsmeow's MarkRead puts the sender in the receipt's
+// participant attribute, and its documentation requires one in a group. The
+// receipt is not sent.
+var ErrReadReceiptSenderUnknown = errors.New("whatsapp read receipt sender is not a user's JID or phone number")
+
+// readReceiptAddressingTimeout bounds the group fetch a read receipt's
+// addressing lookup makes when whatsmeow's cache does not hold the group, so
+// an unanswered query leaves the receipt most of its deadline to go out naming
+// the stored sender. It does not bound the wait for whatsmeow's group cache
+// lock, which another caller holds across its own fetch.
+var readReceiptAddressingTimeout = 10 * time.Second
+
 // MarkReadRequest sends read receipts from v2 request data without loading
-// locally stored messages.
+// locally stored messages. senderID is the stored sender of every message in
+// messageIDs, since whatsmeow's MarkRead names one sender for all the messages
+// a receipt covers. In a group it is named in the form the messages arrived
+// with, the form whatsmeow's own delivery receipt for them named
+// (groupSenderParticipant): a stored LID as stored, and a stored phone number
+// as its LID when the group addresses members by LID. A group receipt whose
+// stored sender is neither a user's JID nor a phone number is refused before
+// anything is sent. An empty sender is sent as no participant, as before:
+// this account's own messages are stored with no sender. MarkRead sends no
+// participant in a 1:1 chat either way; in other chats an unparseable sender
+// is left out, as a missing one is.
 func (b *Bridge) MarkReadRequest(conversationID string, messageIDs []string, senderID string, readAt time.Time) error {
 	if len(messageIDs) == 0 {
 		return markSendNotDispatched(errors.New("at least one WhatsApp message ID is required"), true)
@@ -1614,9 +1639,9 @@ func (b *Bridge) MarkReadRequest(conversationID string, messageIDs []string, sen
 	for i, messageID := range messageIDs {
 		ids[i] = watypes.MessageID(messageID)
 	}
-	senderJID := watypes.EmptyJID
-	if strings.TrimSpace(senderID) != "" {
-		senderJID = b.canonicalJID(parseWhatsAppSenderJID(senderID))
+	senderJID, named := storedSenderJID(senderID)
+	if !named && strings.TrimSpace(senderID) != "" && chatJID.Server == watypes.GroupServer {
+		return markSendNotDispatched(ErrReadReceiptSenderUnknown, true)
 	}
 
 	cli, err := b.ensureSendClient()
@@ -1626,6 +1651,9 @@ func (b *Bridge) MarkReadRequest(conversationID string, messageIDs []string, sen
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
 
+	lookupCtx, cancelLookup := context.WithTimeout(ctx, readReceiptAddressingTimeout)
+	senderJID = b.groupSenderParticipant(cli, lookupCtx, chatJID, senderJID)
+	cancelLookup()
 	if err := markReadMessages(cli, ctx, ids, readAt, chatJID, senderJID); err != nil {
 		b.reportConnectionError(err)
 		return fmt.Errorf("mark WhatsApp messages read: %w", err)
@@ -1678,7 +1706,7 @@ func (b *Bridge) SendReactionRequest(conversationID, targetRemoteID, targetAutho
 
 	reaction := cli.BuildReaction(
 		chatJID,
-		b.reactionTargetParticipant(cli, ctx, chatJID, targetSenderJID),
+		b.groupSenderParticipant(cli, ctx, chatJID, targetSenderJID),
 		watypes.MessageID(targetRemoteID),
 		reactionText,
 	)
@@ -4571,17 +4599,17 @@ func (b *Bridge) reactionActorIDForClient(cli *whatsmeow.Client) string {
 // message. An incoming message with no stored sender is the other party's in a
 // 1:1 chat, as the legacy reactionTargetSenderJID has it; in a group nothing
 // names it, and named is false. A stored sender that is neither a JID nor a
-// phone number names no one either (reactionTargetAuthorJID).
+// phone number names no one either (storedSenderJID).
 //
 // The sender is not mapped between phone number and LID here. In a 1:1 chat
 // with a phone number or a LID it only tells BuildMessageKey the message is
 // not this account's, which either form does; in a group
-// reactionTargetParticipant picks the form.
+// groupSenderParticipant picks the form.
 func (b *Bridge) reactionRequestTargetSender(chatJID watypes.JID, authorID string, outgoing bool) (sender watypes.JID, named bool) {
 	if outgoing {
 		return watypes.EmptyJID, true
 	}
-	if senderJID, ok := reactionTargetAuthorJID(authorID); ok {
+	if senderJID, ok := storedSenderJID(authorID); ok {
 		return senderJID, true
 	}
 	if chatJID.Server == watypes.DefaultUserServer || chatJID.Server == watypes.HiddenUserServer {
@@ -4590,14 +4618,15 @@ func (b *Bridge) reactionRequestTargetSender(chatJID watypes.JID, authorID strin
 	return watypes.EmptyJID, false
 }
 
-// reactionTargetAuthorJID parses a v2 sender identity's canonical value: a
-// sender's JID such as "<digits>@lid", the form live ingest stores for a
-// sender whose LID had no known phone number, or an E.164 number
-// ("+<digits>"), the form it stores for a phone-number JID. A bot's JID is
-// kept as stored, the form its message arrived with. Anything else names no
-// one, including a chat's JID: the history decoder stores the group itself as
-// the sender of a group message that names no participant.
-func reactionTargetAuthorJID(authorID string) (watypes.JID, bool) {
+// storedSenderJID parses a v2 sender identity's canonical value, the stored
+// sender a reaction or read receipt names a message by: a sender's JID such as
+// "<digits>@lid", the form live ingest stores for a sender whose LID had no
+// known phone number, or an E.164 number ("+<digits>"), the form it stores for
+// a phone-number JID. A bot's JID is kept as stored, the form its message
+// arrived with. Anything else names no one, including a chat's JID: the
+// history decoder stores the group itself as the sender of a group message
+// that names no participant.
+func storedSenderJID(authorID string) (watypes.JID, bool) {
 	authorID = strings.TrimSpace(authorID)
 	if strings.Contains(authorID, "@") {
 		jid, err := watypes.ParseJID(authorID)
@@ -4623,16 +4652,17 @@ func reactionTargetAuthorJID(authorID string) (watypes.JID, bool) {
 	return watypes.NewJID(number, watypes.DefaultUserServer), true
 }
 
-// reactionTargetParticipant returns the sender a reaction names a group
-// message by: the form of the sender the message arrived with, which is the
-// form whatsmeow puts in the keys it builds for a received message
-// (getKeyFromInfo for a poll vote, the phone resend request), its
-// MessageInfo.Sender. That is the member's LID when the message was addressed
-// by LID (parseMessageSource reads the participant attribute, and the phone
-// number only into SenderAlt), and its phone number otherwise. whatsmeow's
-// message-secret lookup accepts a key's sender in either form (getMsgSecret,
-// decryptMsgSecret), so the other form may match too; this one is the form the
-// message carries.
+// groupSenderParticipant returns the sender a reaction's key or a read
+// receipt's participant names a group message by: the form of the sender the
+// message arrived with, which is the form whatsmeow puts in the keys it builds
+// for a received message (getKeyFromInfo for a poll vote, the phone resend
+// request), its MessageInfo.Sender, and in the delivery receipt it sends for
+// one (buildBaseReceipt copies the message's participant attribute). That is
+// the member's LID when the message was addressed by LID (parseMessageSource
+// reads the participant attribute, and the phone number only into SenderAlt),
+// and its phone number otherwise. whatsmeow's message-secret lookup accepts a
+// key's sender in either form (getMsgSecret, decryptMsgSecret), so the other
+// form may match too; this one is the form the message carries.
 //
 // Live ingest stores the phone number whenever whatsmeow knows the LID's
 // number at capture (canonicalJID; whatsmeow records it from SenderAlt before
@@ -4646,15 +4676,19 @@ func reactionTargetAuthorJID(authorID string) (watypes.JID, bool) {
 // message addressed by LID, and history sync stores the form the phone's
 // history names the sender by, so mapping it to a phone number (as
 // canonicalJID would) names a form neither gave. When the addressing or the
-// number's LID is unknown, the stored sender is used, and a failed lookup is
-// left for SendMessage, which reads the same cache, to report.
-func (b *Bridge) reactionTargetParticipant(cli *whatsmeow.Client, ctx context.Context, chatJID, sender watypes.JID) watypes.JID {
+// number's LID is unknown, the stored sender is used. The addressing is read
+// before the LID is looked up: fetching a group whatsmeow has not cached also
+// stores its members' LID mappings (getGroupInfo), so the fetch can supply the
+// LID. A failed lookup is not an error here: a reaction's SendMessage reads
+// the same cache and reports it, and a read receipt goes out naming the stored
+// sender.
+func (b *Bridge) groupSenderParticipant(cli *whatsmeow.Client, ctx context.Context, chatJID, sender watypes.JID) watypes.JID {
 	if chatJID.Server != watypes.GroupServer || sender.Server != watypes.DefaultUserServer {
 		return sender
 	}
 	mode, err := groupAddressingMode(cli, ctx, chatJID)
 	if err != nil {
-		b.logger.Debug().Err(err).Str("chat", chatJID.String()).Msg("Failed to read WhatsApp group addressing for a reaction target")
+		b.logger.Debug().Err(err).Str("chat", chatJID.String()).Msg("Failed to read WhatsApp group addressing to name a message's sender")
 		return sender
 	}
 	if mode != watypes.AddressingModeLID {
@@ -4684,28 +4718,20 @@ func (b *Bridge) lidForPhoneJID(cli *whatsmeow.Client, ctx context.Context, pn w
 
 // reactionTargetSenderJID names who sent the legacy message a reaction
 // targets. The stored sender is a phone number or, for a LID whose number was
-// not known, its JID (addressForJID); both parse as reactionTargetAuthorJID
-// reads a v2 sender, where parseWhatsAppSenderJID would turn "<digits>@lid"
-// into "<digits>@lid@s.whatsapp.net".
+// not known, its JID (addressForJID); both parse as storedSenderJID reads a
+// v2 sender, where a phone-number-only parse would turn "<digits>@lid" into
+// "<digits>@lid@s.whatsapp.net".
 func (b *Bridge) reactionTargetSenderJID(msg *db.Message, chatJID watypes.JID) watypes.JID {
 	if msg == nil || msg.IsFromMe {
 		return watypes.EmptyJID
 	}
-	if senderJID, ok := reactionTargetAuthorJID(msg.SenderNumber); ok {
+	if senderJID, ok := storedSenderJID(msg.SenderNumber); ok {
 		return b.canonicalJID(senderJID)
 	}
 	if chatJID.Server == watypes.DefaultUserServer || chatJID.Server == watypes.HiddenUserServer {
 		return b.canonicalJID(chatJID)
 	}
 	return watypes.EmptyJID
-}
-
-func parseWhatsAppSenderJID(number string) watypes.JID {
-	number = strings.TrimSpace(strings.TrimPrefix(number, "+"))
-	if number == "" {
-		return watypes.EmptyJID
-	}
-	return watypes.NewJID(number, watypes.DefaultUserServer)
 }
 
 func updateStoredReactions(existingJSON, actorID, emoji string) (string, bool, error) {

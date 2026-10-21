@@ -175,31 +175,31 @@ func TestSendReactionRequestMapsActionsAndTargetSender(t *testing.T) {
 }
 
 const (
-	reactionTestGroup = "whatsapp:120363019999999999@g.us"
-	reactionTestPhone = "15557654321"
-	reactionTestLID   = "98765432109876"
+	senderTestGroup = "whatsapp:120363019999999999@g.us"
+	senderTestPhone = "15557654321"
+	senderTestLID   = "98765432109876"
 )
 
-// reactionTestLIDs is the account's LID map in reaction tests: the phone
-// number each known LID stands for, by user part.
-type reactionTestLIDs map[string]string
+// senderTestLIDs is the account's LID map in reaction and read-receipt
+// tests: the phone number each known LID stands for, by user part.
+type senderTestLIDs map[string]string
 
-func (m reactionTestLIDs) PutManyLIDMappings(context.Context, []wastore.LIDMapping) error {
+func (m senderTestLIDs) PutManyLIDMappings(context.Context, []wastore.LIDMapping) error {
 	return nil
 }
 
-func (m reactionTestLIDs) PutLIDMapping(context.Context, watypes.JID, watypes.JID) error {
+func (m senderTestLIDs) PutLIDMapping(context.Context, watypes.JID, watypes.JID) error {
 	return nil
 }
 
-func (m reactionTestLIDs) GetPNForLID(_ context.Context, lid watypes.JID) (watypes.JID, error) {
+func (m senderTestLIDs) GetPNForLID(_ context.Context, lid watypes.JID) (watypes.JID, error) {
 	if pn, ok := m[lid.User]; ok {
 		return watypes.NewJID(pn, watypes.DefaultUserServer), nil
 	}
 	return watypes.EmptyJID, nil
 }
 
-func (m reactionTestLIDs) GetLIDForPN(_ context.Context, pn watypes.JID) (watypes.JID, error) {
+func (m senderTestLIDs) GetLIDForPN(_ context.Context, pn watypes.JID) (watypes.JID, error) {
 	for lid, number := range m {
 		if number == pn.User {
 			return watypes.NewJID(lid, watypes.HiddenUserServer), nil
@@ -208,7 +208,7 @@ func (m reactionTestLIDs) GetLIDForPN(_ context.Context, pn watypes.JID) (watype
 	return watypes.EmptyJID, nil
 }
 
-func (m reactionTestLIDs) GetManyLIDsForPNs(ctx context.Context, pns []watypes.JID) (map[watypes.JID]watypes.JID, error) {
+func (m senderTestLIDs) GetManyLIDsForPNs(ctx context.Context, pns []watypes.JID) (map[watypes.JID]watypes.JID, error) {
 	result := make(map[watypes.JID]watypes.JID)
 	for _, pn := range pns {
 		if lid, _ := m.GetLIDForPN(ctx, pn); !lid.IsEmpty() {
@@ -218,9 +218,9 @@ func (m reactionTestLIDs) GetManyLIDsForPNs(ctx context.Context, pns []watypes.J
 	return result, nil
 }
 
-// reactionTestBridge is a connected test bridge whose account knows the LIDs
+// senderTestBridge is a connected test bridge whose account knows the LIDs
 // in lids.
-func reactionTestBridge(lids reactionTestLIDs) *Bridge {
+func senderTestBridge(lids senderTestLIDs) *Bridge {
 	bridge := connectedMediaTestBridge()
 	bridge.client.Store.LIDs = lids
 	return bridge
@@ -268,13 +268,13 @@ func newReactionTestTransport(t *testing.T) *reactionTestTransport {
 // group that addresses members by LID.
 func TestSendReactionRequestNamesAGroupSenderByTheKeyItsMessageArrivedWith(t *testing.T) {
 	const (
-		lidJID   = reactionTestLID + "@lid"
-		phoneJID = reactionTestPhone + "@s.whatsapp.net"
+		lidJID   = senderTestLID + "@lid"
+		phoneJID = senderTestPhone + "@s.whatsapp.net"
 	)
 	lookupFailed := errors.New("group info query timed out")
 	tests := []struct {
 		name      string
-		lids      reactionTestLIDs
+		lids      senderTestLIDs
 		mode      watypes.AddressingMode
 		lookupErr error
 		author    string
@@ -282,7 +282,7 @@ func TestSendReactionRequestNamesAGroupSenderByTheKeyItsMessageArrivedWith(t *te
 	}{
 		{
 			name:   "LID-only sender in a group that addresses by LID",
-			lids:   reactionTestLIDs{},
+			lids:   senderTestLIDs{},
 			mode:   watypes.AddressingModeLID,
 			author: lidJID,
 			want:   lidJID,
@@ -291,75 +291,75 @@ func TestSendReactionRequestNamesAGroupSenderByTheKeyItsMessageArrivedWith(t *te
 		// does not change its key.
 		{
 			name:   "LID sender whose number became known later",
-			lids:   reactionTestLIDs{reactionTestLID: reactionTestPhone},
+			lids:   senderTestLIDs{senderTestLID: senderTestPhone},
 			mode:   watypes.AddressingModeLID,
 			author: lidJID,
 			want:   lidJID,
 		},
 		{
 			name:   "LID sender in a group that now reads phone-number addressing",
-			lids:   reactionTestLIDs{reactionTestLID: reactionTestPhone},
+			lids:   senderTestLIDs{senderTestLID: senderTestPhone},
 			mode:   watypes.AddressingModePN,
 			author: lidJID,
 			want:   lidJID,
 		},
 		{
 			name:   "phone-number sender in a group that addresses by LID",
-			lids:   reactionTestLIDs{reactionTestLID: reactionTestPhone},
+			lids:   senderTestLIDs{senderTestLID: senderTestPhone},
 			mode:   watypes.AddressingModeLID,
-			author: "+" + reactionTestPhone,
+			author: "+" + senderTestPhone,
 			want:   lidJID,
 		},
 		{
 			name:   "phone-number sender whose LID is unknown",
-			lids:   reactionTestLIDs{},
+			lids:   senderTestLIDs{},
 			mode:   watypes.AddressingModeLID,
-			author: "+" + reactionTestPhone,
+			author: "+" + senderTestPhone,
 			want:   phoneJID,
 		},
 		{
 			name:   "phone-number sender in a group that addresses by phone number",
-			lids:   reactionTestLIDs{reactionTestLID: reactionTestPhone},
+			lids:   senderTestLIDs{senderTestLID: senderTestPhone},
 			mode:   watypes.AddressingModePN,
-			author: "+" + reactionTestPhone,
+			author: "+" + senderTestPhone,
 			want:   phoneJID,
 		},
 		// whatsmeow's SendMessage treats any addressing but "lid" as phone
 		// numbers.
 		{
 			name:   "group that reports no addressing",
-			lids:   reactionTestLIDs{reactionTestLID: reactionTestPhone},
+			lids:   senderTestLIDs{senderTestLID: senderTestPhone},
 			mode:   "",
-			author: "+" + reactionTestPhone,
+			author: "+" + senderTestPhone,
 			want:   phoneJID,
 		},
 		// SendMessage reads the same cache and reports the failure; the
 		// lookup only decides the form.
 		{
 			name:      "group addressing lookup fails",
-			lids:      reactionTestLIDs{reactionTestLID: reactionTestPhone},
+			lids:      senderTestLIDs{senderTestLID: senderTestPhone},
 			mode:      watypes.AddressingModeLID,
 			lookupErr: lookupFailed,
-			author:    "+" + reactionTestPhone,
+			author:    "+" + senderTestPhone,
 			want:      phoneJID,
 		},
 		{
 			name:   "phone number stored without a plus",
-			lids:   reactionTestLIDs{},
+			lids:   senderTestLIDs{},
 			mode:   watypes.AddressingModePN,
-			author: reactionTestPhone,
+			author: senderTestPhone,
 			want:   phoneJID,
 		},
 		{
 			name:   "hosted sender",
-			lids:   reactionTestLIDs{},
+			lids:   senderTestLIDs{},
 			mode:   watypes.AddressingModeLID,
-			author: reactionTestPhone + "@hosted",
-			want:   reactionTestPhone + "@hosted",
+			author: senderTestPhone + "@hosted",
+			want:   senderTestPhone + "@hosted",
 		},
 		{
 			name:   "bot sender",
-			lids:   reactionTestLIDs{},
+			lids:   senderTestLIDs{},
 			mode:   watypes.AddressingModeLID,
 			author: "867051314767696@bot",
 			want:   "867051314767696@bot",
@@ -372,8 +372,8 @@ func TestSendReactionRequestNamesAGroupSenderByTheKeyItsMessageArrivedWith(t *te
 			transport.mode = test.mode
 			transport.lookupErr = test.lookupErr
 
-			_, err := reactionTestBridge(test.lids).SendReactionRequest(
-				reactionTestGroup,
+			_, err := senderTestBridge(test.lids).SendReactionRequest(
+				senderTestGroup,
 				"target-remote-id",
 				test.author,
 				false,
@@ -394,7 +394,7 @@ func TestSendReactionRequestNamesAGroupSenderByTheKeyItsMessageArrivedWith(t *te
 			if key.GetFromMe() {
 				t.Fatal("target FromMe = true, want another member's message")
 			}
-			if key.GetRemoteJID() != strings.TrimPrefix(reactionTestGroup, "whatsapp:") || key.GetID() != "target-remote-id" {
+			if key.GetRemoteJID() != strings.TrimPrefix(senderTestGroup, "whatsapp:") || key.GetID() != "target-remote-id" {
 				t.Fatalf("target key = %+v, want target-remote-id in the group", key)
 			}
 		})
@@ -409,13 +409,13 @@ func TestSendReactionRequestNamesADirectChatSenderOfEitherForm(t *testing.T) {
 		chat   string
 		author string
 	}{
-		{chat: "whatsapp:" + reactionTestPhone + "@s.whatsapp.net", author: reactionTestLID + "@lid"},
-		{chat: "whatsapp:" + reactionTestLID + "@lid", author: reactionTestLID + "@lid"},
-		{chat: "whatsapp:" + reactionTestPhone + "@s.whatsapp.net", author: "+" + reactionTestPhone},
+		{chat: "whatsapp:" + senderTestPhone + "@s.whatsapp.net", author: senderTestLID + "@lid"},
+		{chat: "whatsapp:" + senderTestLID + "@lid", author: senderTestLID + "@lid"},
+		{chat: "whatsapp:" + senderTestPhone + "@s.whatsapp.net", author: "+" + senderTestPhone},
 	} {
 		t.Run(test.chat+" "+test.author, func(t *testing.T) {
 			transport := newReactionTestTransport(t)
-			_, err := reactionTestBridge(reactionTestLIDs{}).SendReactionRequest(
+			_, err := senderTestBridge(senderTestLIDs{}).SendReactionRequest(
 				test.chat,
 				"target-remote-id",
 				test.author,
@@ -450,20 +450,20 @@ func TestSendReactionRequestNamesADirectChatSenderOfEitherForm(t *testing.T) {
 func TestSendReactionRequestRefusesAGroupSenderThatIsNotAJIDOrNumber(t *testing.T) {
 	for _, author := range []string{
 		"@lid",
-		reactionTestLID + "@",
-		reactionTestLID + "@lid@s.whatsapp.net",
-		strings.TrimPrefix(reactionTestGroup, "whatsapp:"),
+		senderTestLID + "@",
+		senderTestLID + "@lid@s.whatsapp.net",
+		strings.TrimPrefix(senderTestGroup, "whatsapp:"),
 		"status@broadcast",
 		"120363000000000000@newsletter",
-		reactionTestPhone + "@c.us",
+		senderTestPhone + "@c.us",
 		"Me",
 		"+",
 		"+1-555-765-4321",
 	} {
 		t.Run(author, func(t *testing.T) {
 			transport := newReactionTestTransport(t)
-			_, err := reactionTestBridge(reactionTestLIDs{}).SendReactionRequest(
-				reactionTestGroup,
+			_, err := senderTestBridge(senderTestLIDs{}).SendReactionRequest(
+				senderTestGroup,
 				"target-remote-id",
 				author,
 				false,
@@ -478,8 +478,8 @@ func TestSendReactionRequestRefusesAGroupSenderThatIsNotAJIDOrNumber(t *testing.
 				t.Fatalf("reactions sent = %d, want none", len(transport.sent))
 			}
 
-			_, err = reactionTestBridge(reactionTestLIDs{}).SendReactionRequest(
-				"whatsapp:"+reactionTestPhone+"@s.whatsapp.net",
+			_, err = senderTestBridge(senderTestLIDs{}).SendReactionRequest(
+				"whatsapp:"+senderTestPhone+"@s.whatsapp.net",
 				"target-remote-id",
 				author,
 				false,
@@ -520,7 +520,7 @@ func TestSendReactionRequestGroupParticipantProperty(t *testing.T) {
 		if phone == "15551230000" {
 			return true // the test account's own number
 		}
-		lids := reactionTestLIDs{}
+		lids := senderTestLIDs{}
 		if in.Known {
 			lids[lid] = phone
 		}
@@ -548,7 +548,7 @@ func TestSendReactionRequestGroupParticipantProperty(t *testing.T) {
 			want = lid + "@lid"
 		}
 
-		_, err := reactionTestBridge(lids).SendReactionRequest(reactionTestGroup, "target", author, false, "🔥", "add", "request")
+		_, err := senderTestBridge(lids).SendReactionRequest(senderTestGroup, "target", author, false, "🔥", "add", "request")
 		if err != nil || len(transport.sent) != 1 || transport.sent[0] == nil {
 			t.Logf("author %q: error %v, %d sent", author, err, len(transport.sent))
 			return false
@@ -568,6 +568,28 @@ func TestSendReactionRequestGroupParticipantProperty(t *testing.T) {
 	}
 }
 
+// Fetching a group whatsmeow has not cached stores its members' LID mappings
+// (getGroupInfo), so the addressing is read before the LID is looked up: a
+// number whose LID only the fetch supplies is still named by its LID.
+func TestSendReactionRequestNamesTheLIDTheGroupFetchSupplies(t *testing.T) {
+	transport := newReactionTestTransport(t)
+	lids := senderTestLIDs{}
+	groupAddressingMode = func(_ *whatsmeow.Client, _ context.Context, group watypes.JID) (watypes.AddressingMode, error) {
+		transport.lookups = append(transport.lookups, group)
+		lids[senderTestLID] = senderTestPhone
+		return watypes.AddressingModeLID, nil
+	}
+	if _, err := senderTestBridge(lids).SendReactionRequest(senderTestGroup, "target-remote-id", "+"+senderTestPhone, false, "🔥", "add", "request-1"); err != nil {
+		t.Fatalf("SendReactionRequest() error = %v", err)
+	}
+	if len(transport.sent) != 1 || transport.sent[0] == nil {
+		t.Fatalf("reactions sent = %d, want one", len(transport.sent))
+	}
+	if got := transport.sent[0].GetKey().GetParticipant(); got != senderTestLID+"@lid" {
+		t.Fatalf("target participant = %q, want the LID the fetch stored", got)
+	}
+}
+
 // Like canonicalJID, the phone number's LID falls back to the session store's
 // LID map when whatsmeow's LID store has none.
 func TestSendReactionRequestFindsAGroupSendersLIDInTheSessionStore(t *testing.T) {
@@ -580,22 +602,22 @@ func TestSendReactionRequestFindsAGroupSendersLIDInTheSessionStore(t *testing.T)
 	if _, err := sessionDB.Exec(`CREATE TABLE whatsmeow_lid_map (lid TEXT PRIMARY KEY, pn TEXT NOT NULL)`); err != nil {
 		t.Fatalf("create lid map: %v", err)
 	}
-	if _, err := sessionDB.Exec(`INSERT INTO whatsmeow_lid_map (lid, pn) VALUES (?, ?)`, reactionTestLID, reactionTestPhone); err != nil {
+	if _, err := sessionDB.Exec(`INSERT INTO whatsmeow_lid_map (lid, pn) VALUES (?, ?)`, senderTestLID, senderTestPhone); err != nil {
 		t.Fatalf("seed lid map: %v", err)
 	}
 
 	transport := newReactionTestTransport(t)
 	transport.mode = watypes.AddressingModeLID
-	bridge := reactionTestBridge(reactionTestLIDs{})
+	bridge := senderTestBridge(senderTestLIDs{})
 	bridge.sessionPath = sessionPath
-	if _, err := bridge.SendReactionRequest(reactionTestGroup, "target-remote-id", "+"+reactionTestPhone, false, "🔥", "add", "request-1"); err != nil {
+	if _, err := bridge.SendReactionRequest(senderTestGroup, "target-remote-id", "+"+senderTestPhone, false, "🔥", "add", "request-1"); err != nil {
 		t.Fatalf("SendReactionRequest() error = %v", err)
 	}
 	if len(transport.sent) != 1 || transport.sent[0] == nil {
 		t.Fatalf("reactions sent = %d, want one", len(transport.sent))
 	}
-	if got := transport.sent[0].GetKey().GetParticipant(); got != reactionTestLID+"@lid" {
-		t.Fatalf("target participant = %q, want the session store's LID %q", got, reactionTestLID+"@lid")
+	if got := transport.sent[0].GetKey().GetParticipant(); got != senderTestLID+"@lid" {
+		t.Fatalf("target participant = %q, want the session store's LID %q", got, senderTestLID+"@lid")
 	}
 }
 
