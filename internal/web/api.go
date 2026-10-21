@@ -322,6 +322,12 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 				"per_account": v2IngestPerAccount,
 			},
 		}
+		if opts.V2 != nil && opts.V2.Service != nil {
+			// The dispatch loop's in-flight and abandoned transport calls: a
+			// send that never returns froze all sending for hours on
+			// 2026-10-20 while every other field here looked healthy.
+			payload["v2_dispatch"] = opts.V2.Service.DispatchHealth()
+		}
 		if strings.TrimSpace(opts.IdentityName) != "" {
 			payload["identity_name"] = strings.TrimSpace(opts.IdentityName)
 		}

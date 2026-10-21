@@ -151,7 +151,14 @@ func (s *MessageService) dispatchTextLease(ctx context.Context, outboxLease sqli
 		}
 		return s.releaseUnavailable(ctx, item, bridge.ErrCapabilityUnavailable)
 	}
-	defer dispatchLease.Close()
+	// An abandoned transport call may still be using the lease, so once the
+	// call starts its own goroutine releases it.
+	closeLease := true
+	defer func() {
+		if closeLease {
+			dispatchLease.Close()
+		}
+	}()
 
 	message, err := s.messageForLease(ctx, item)
 	if err != nil {
@@ -220,7 +227,12 @@ func (s *MessageService) dispatchTextLease(ctx context.Context, outboxLease sqli
 		RequestID: item.TransportRequestID,
 	}
 	request.ReplyTo = replyTo
-	result, sendErr := dispatchLease.Text.SendText(ctx, request)
+	closeLease = false
+	result, sendErr := callTransport(s, ctx, item, textOperation, s.transportTimeout,
+		func(callCtx context.Context) (bridge.SendResult, error) {
+			defer dispatchLease.Close()
+			return dispatchLease.Text.SendText(callCtx, request)
+		})
 	mutationCtx, cancel := s.storageMutationContext(ctx)
 	defer cancel()
 	if sendErr != nil {
@@ -298,7 +310,14 @@ func (s *MessageService) dispatchMediaLease(ctx context.Context, outboxLease sql
 		}
 		return s.releaseUnavailable(ctx, item, bridge.ErrCapabilityUnavailable)
 	}
-	defer dispatchLease.Close()
+	// An abandoned transport call may still be using the lease, so once the
+	// call starts its own goroutine releases it.
+	closeLease := true
+	defer func() {
+		if closeLease {
+			dispatchLease.Close()
+		}
+	}()
 
 	message, err := s.messageForLease(ctx, item)
 	if err != nil {
@@ -375,7 +394,14 @@ func (s *MessageService) dispatchMediaLease(ctx context.Context, outboxLease sql
 			s.clock.Now().Add(s.retryDelay),
 		)
 	}
-	defer reader.Close()
+	// An abandoned media call may still be reading the attachment, so once the
+	// call starts its own goroutine closes the reader.
+	closeReader := true
+	defer func() {
+		if closeReader {
+			_ = reader.Close()
+		}
+	}()
 
 	if err := s.outbox.MarkTransportCalled(ctx, sqlite.Attempt{
 		OutboxID:             item.OutboxID,
@@ -404,7 +430,14 @@ func (s *MessageService) dispatchMediaLease(ctx context.Context, outboxLease sql
 		RequestID: item.TransportRequestID,
 	}
 	request.ReplyTo = replyTo
-	result, sendErr := dispatchLease.Media.SendMedia(ctx, request)
+	closeReader = false
+	closeLease = false
+	result, sendErr := callTransport(s, ctx, item, mediaOperation, s.mediaTransportTimeout,
+		func(callCtx context.Context) (bridge.SendResult, error) {
+			defer dispatchLease.Close()
+			defer reader.Close()
+			return dispatchLease.Media.SendMedia(callCtx, request)
+		})
 	mutationCtx, cancel := s.storageMutationContext(ctx)
 	defer cancel()
 	if sendErr != nil {
@@ -482,7 +515,14 @@ func (s *MessageService) dispatchReactionLease(ctx context.Context, outboxLease 
 		}
 		return s.releaseUnavailable(ctx, item, bridge.ErrCapabilityUnavailable)
 	}
-	defer dispatchLease.Close()
+	// An abandoned transport call may still be using the lease, so once the
+	// call starts its own goroutine releases it.
+	closeLease := true
+	defer func() {
+		if closeLease {
+			dispatchLease.Close()
+		}
+	}()
 
 	reaction, err := s.outbox.GetOutboxReaction(ctx, item.OutboxID)
 	if err != nil {
@@ -542,7 +582,7 @@ func (s *MessageService) dispatchReactionLease(ctx context.Context, outboxLease 
 	}
 	s.signalChange()
 
-	result, sendErr := dispatchLease.Reaction.SendReaction(ctx, bridge.ReactionRequest{
+	reactionRequest := bridge.ReactionRequest{
 		AccountID: item.AccountID,
 		Conversation: bridge.ConversationRef{
 			RemoteID: conversation.RemoteConversationID,
@@ -551,7 +591,13 @@ func (s *MessageService) dispatchReactionLease(ctx context.Context, outboxLease 
 		Emoji:     reaction.Emoji,
 		Action:    bridge.ReactionAction(reaction.Action),
 		RequestID: item.TransportRequestID,
-	})
+	}
+	closeLease = false
+	result, sendErr := callTransport(s, ctx, item, reactionOperation, s.transportTimeout,
+		func(callCtx context.Context) (bridge.SendResult, error) {
+			defer dispatchLease.Close()
+			return dispatchLease.Reaction.SendReaction(callCtx, reactionRequest)
+		})
 	mutationCtx, cancel := s.storageMutationContext(ctx)
 	defer cancel()
 	if sendErr != nil {
@@ -618,7 +664,14 @@ func (s *MessageService) dispatchReadLease(ctx context.Context, outboxLease sqli
 		}
 		return s.releaseUnavailable(ctx, item, bridge.ErrCapabilityUnavailable)
 	}
-	defer dispatchLease.Close()
+	// An abandoned transport call may still be using the lease, so once the
+	// call starts its own goroutine releases it.
+	closeLease := true
+	defer func() {
+		if closeLease {
+			dispatchLease.Close()
+		}
+	}()
 
 	receipt, err := s.outbox.GetOutboxReadReceipt(ctx, item.OutboxID)
 	if err != nil {
@@ -678,14 +731,20 @@ func (s *MessageService) dispatchReadLease(ctx context.Context, outboxLease sqli
 	}
 	s.signalChange()
 
-	sendErr := dispatchLease.ReadReceipt.MarkRead(ctx, bridge.ReadReceiptRequest{
+	readRequest := bridge.ReadReceiptRequest{
 		AccountID: item.AccountID,
 		Conversation: bridge.ConversationRef{
 			RemoteID: conversation.RemoteConversationID,
 		},
 		Messages: []bridge.MessageRef{target},
 		ReadAt:   time.UnixMilli(receipt.ReadAtMS),
-	})
+	}
+	closeLease = false
+	_, sendErr := callTransport(s, ctx, item, readOperation, s.transportTimeout,
+		func(callCtx context.Context) (struct{}, error) {
+			defer dispatchLease.Close()
+			return struct{}{}, dispatchLease.ReadReceipt.MarkRead(callCtx, readRequest)
+		})
 	mutationCtx, cancel := s.storageMutationContext(ctx)
 	defer cancel()
 	if sendErr != nil {
