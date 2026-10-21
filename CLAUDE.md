@@ -79,14 +79,16 @@ platform, or the phone behind it has stopped delivering; searches over that
 window will miss messages.
 
 "Read-only" here means no startup repair sweeps (`repairStartupArtifacts`) and
-no transports. Opening a store still writes: `sqlite.Open` (v2) applies any
-pending migrations and writes nothing when the store is current; `db.New`
-(legacy) runs `migrate()` on every open, which drops and recreates three
-`contact_avatars` indexes, keeps one row of each group of Signal rows that
-share a conversation, sender and timestamp and deletes the rest, and
-repopulates the FTS index when its row count differs from `messages`. Keeping
-the CLI binary in step with the app avoids the v2 migrations, not the legacy
-writes.
+no transports. The v2 store is opened with `sqlite.OpenWithoutMigrating`, which
+never migrates: a binary at a different schema version than the store refuses
+it (an older one reports the store as newer than supported; a newer one asks
+you to reopen the app). So on a macOS app install, `/usr/local/bin/openmessage`
+should be a symlink to the app bundle's binary (see the runbook's "MCP config").
+Opening the legacy store still writes: `db.New` runs `migrate()` on every open,
+which drops and recreates three `contact_avatars` indexes, keeps one row of
+each group of Signal rows that share a conversation, sender and timestamp and
+deletes the rest, and repopulates the FTS index when its row count differs
+from `messages`.
 
 `read` resolves each hit's sender (name → number → conversation id) so results
 are legible without a second lookup, and accepts

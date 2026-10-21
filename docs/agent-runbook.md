@@ -558,7 +558,7 @@ running app:
 
 ```json
 "openmessage": {
-  "command": "/usr/local/bin/openmessage",
+  "command": "/Applications/OpenMessage.app/Contents/Resources/openmessage",
   "args": ["serve", "--mcp-stdio"],
   "env": {
     "OPENMESSAGES_DATA_DIR": "/Users/<user>/Library/Application Support/OpenMessage",
@@ -572,9 +572,35 @@ daemon-truth detection all line up (two-data-dirs trap above). On a migrated
 (v2-primary) install, also set `OPENMESSAGES_V2_PRIMARY=1` — the legacy
 `messages.db` froze at cutover, and this keeps MCP reads on the v2 store even
 when the app is closed or predates the `auth.data_dir` status field (drop the
-line on a non-migrated install). Keep the PATH binary in lockstep with the
-installed app — both open the same SQLite stores, and a client binary at a
-different schema version than the store refuses it until the two match.
+line on a non-migrated install).
+
+**Run the app's own binary, not a copy.** The MCP client opens the same SQLite
+stores as the app, and a binary at a different schema version than the store
+refuses it when it starts. The backend inside the app bundle matches the store
+once the deployed app has started, so a client started after that can't drift.
+On 2026-10-21 a deploy added
+migration 0011, and the July copy at `/usr/local/bin/openmessage` failed with
+`database schema version 11 is newer than supported version 10`, so every new
+MCP session's openmessage server exited at startup. Point the PATH binary at the
+bundle too (it is root-owned, so this needs `sudo` once):
+
+```bash
+sudo ln -sf /Applications/OpenMessage.app/Contents/Resources/openmessage /usr/local/bin/openmessage
+```
+
+An MCP server checks the schema only when it starts. One started before a
+deploy keeps running the old build against the new store, so after a deploy
+that adds a migration, restart the MCP servers of open sessions. One started
+during a deploy fails: during a full deploy (`rm -rf` then `cp -R`) the bundle
+is briefly absent, and if the deploy adds a migration, the new binary is ahead
+of the store until the new app's first start (`ErrMigrationPending`, "quit and reopen the OpenMessage app").
+
+**Because sessions now run the bundle's binary, never overwrite it in place.**
+On macOS, `cp` over an executable that a process is running makes every later
+run of that path die (exit 137, kernel log `CODE SIGNING: ... rejecting invalid
+page`), even after the old process exits. Quitting the app does not stop MCP
+servers, so swap the file by rename (below). A path already broken this way is
+repaired by renaming a fresh copy over it.
 
 **Never** configure MCP to run `serve --web`, `serve --mcp-sse`, or
 `serve ... --transports` alongside the app: those are daemon shapes and will
@@ -1617,6 +1643,35 @@ poll — a crash loop that flaps the Signal `connected` flag every few seconds a
 makes the whole UI flicker. `brew upgrade signal-cli` fixes it. (PR #41 also
 hardened the UI to ignore redundant status pushes.)
 
+### Re-linking Signal (QR)
+
+- **Each QR lives about 90 seconds** (observed 2026-10-21: `signal-cli
+  --verbose link` logged `[ProvisioningSocket] … onClosing … reason: Timeout`
+  90 s after start), and signal-cli then prints "Link request timed out,
+  please try again." Have the phone on Settings → Linked devices → Link new
+  device *before* the QR appears. Observed the same day: a phone that scanned
+  an expired QR reported a network error. Per Signal Android's
+  `LinkDeviceViewModel`, a phone whose link message is accepted but whose new
+  device never appears waits 30 s, then closes the dialog without an error.
+- **A fresh link prints a stderr line before its JSON.** Until the account's
+  first receive, signal-cli's `last-receive-timestamp` is 0 and every command
+  that loads the account logs `INFO AccountHelper - The Signal protocol expects that incoming
+  messages are regularly received.`; after 7 days without a receive it logs a
+  `WARN … Messages have been last received N days ago` instead
+  (`AccountHelper.checkAccountState`). The account probe reads CombinedOutput,
+  so before the line-wise decode it parsed neither buffer: the post-link probe
+  found no account, the link "failed" right after a good scan, and the status
+  showed `last_error: "Associated with: +1…"` with `paired: true,
+  connected: false`. On a build without that fix, unblock a fresh link by
+  setting the timestamp, with no signal-cli running on that config dir:
+  `sqlite3 <datadir>/signal-cli/data/<path>.d/account.db "INSERT INTO key_value
+  (key, value) VALUES ('last-receive-timestamp', <now ms>) ON CONFLICT(key) DO
+  UPDATE SET value=excluded.value;"`, then `POST /api/signal/connect`.
+- **Restore media after a re-link.** Unpair removes the whole `signal-cli/`
+  dir. Clone the backup's `attachments/ avatars/ stickers/
+  outgoing-attachments/` back with `cp -R -n -c -p` (APFS clones; no
+  overwrite of what the new link wrote), never `data/`.
+
 ### Signal `needs_reauth` — read the fingerprint before believing the park
 
 `needs_reauth: true` is the bridge's **interpretation** of a signal-cli error,
@@ -1911,15 +1966,54 @@ target author is unavailable`). Before, both went out with an empty sender
 and addressed a message of this account's that does not exist. Unlike a Signal
 reaction whose target cannot be named (above), which keeps retrying, this one
 is not retried: if the message is later stored with its sender, react again.
+In a group, a stored sender that is neither a sender's JID (on the
+phone-number, LID, hosted or bot server) nor a phone number (digits, with or
+without a leading `+`) is refused the same way; that includes the group's own
+JID, which the history decoder stores as the sender of a group message that
+names no participant. In a 1:1 chat such a sender is replaced by the chat, as
+a missing one is.
+
+In a group the sender is sent in the form the message arrived with, the form
+whatsmeow puts in the keys it builds for a received message
+(`MessageInfo.Sender`): the member's LID (`<digits>@lid`) when the message was
+addressed by LID, the phone number otherwise. Live ingest stores the phone
+number whenever whatsmeow knew the LID's number when the message arrived, and
+`<digits>@lid` when it did not; history sync stores the phone number when the
+sync's own number mappings name it, and otherwise the form the phone's history
+gives. So `SendReactionRequest` sends a stored LID as it is, and maps a stored
+phone number back to its LID (whatsmeow's LID store, then the session store's
+`whatsmeow_lid_map`) when the group addresses members by LID. The store does
+not record each message's addressing, so the group's current addressing stands
+in for it: a message from before the group moved to LID addressing is named by
+its LID too. The addressing comes from the whatsmeow group cache that
+`SendMessage` reads to choose the identity it sends with; when the cache does
+not hold the group, the lookup fetches it and `SendMessage` then uses that
+copy. A phone number whose LID is not known, or a group whose addressing cannot
+be read, goes out as stored (and `SendMessage` repeats the lookup and reports a
+group it cannot read, as before). Before, a stored LID went out as
+`<digits>@lid@s.whatsapp.net`, which names no member, and a stored phone number
+went out as the phone number in a LID group. whatsmeow's own message-secret
+lookup accepts a key's sender in either form, so the phone number may have
+matched too; the LID is the form the message carries. 1:1 chats with a phone
+number or a LID were never affected: whatsmeow puts no participant in their
+messages' keys (a bot's chat, for one, does get one).
+
+Messages migrated from the legacy store, or imported from WhatsApp Desktop, can
+name a LID sender by the LID's digits as a phone number (`+<lid digits>`): the
+legacy bridge does so for a LID whose number it did not know, and the WhatsApp
+Desktop importer, which has no LID map, for every LID sender (both `jidToPhone`
+helpers keep any all-digit user). Such a sender looks like a phone number here
+and goes out as `<lid digits>@s.whatsapp.net`.
+
 A WhatsApp send goes out under an ID derived from its request ID
 (`whatsapplive.deriveWebMessageID`), and its message is renamed to that ID
 when the send is confirmed. Until then the message is still named by the
 request ID itself, an ID WhatsApp never sees. So a reaction to a WhatsApp
 message of yours that has not been sent yet is held, and one to a message
 whose send was canceled is rejected (see "Reactions stuck retrying" below),
-rather than addressed to that ID. One sent but `uncertain`
-or `store_failed` is still named by the request ID, and a reaction to it is
-still addressed to that ID, which no WhatsApp message has.
+rather than addressed to that ID. One sent but `uncertain` or `store_failed`
+is still named by the request ID, and a reaction to it is still addressed to
+that ID, which no WhatsApp message has.
 
 **Reactions stuck retrying.** A reaction the transport cannot deliver yet goes
 `not_dispatched` and retries (every 5 s by default) with no cap; a Signal
@@ -2018,10 +2112,69 @@ open -a OpenMessage
 ```
 
 A build with a new schema migration applies it when the new app starts,
-before its v2 stack (and so v2 ingest) exists. Update the PATH binary
-(`/usr/local/bin/openmessage`) after the app: until the two match, `openmessage
-read`/`status` and the MCP client refuse the store (a newer binary asks you to
-reopen the app; an older one reports the store as newer than supported).
+before its v2 stack (and so v2 ingest) exists. Any other copy of the binary
+must then match it: until it does, `openmessage read`/`status` and the MCP
+client refuse the store (a newer binary asks you to reopen the app; an older
+one reports the store as newer than supported). With the MCP config and
+`/usr/local/bin/openmessage` pointing at the bundle's binary (see "MCP config"),
+there is no other copy to update.
+
+**Backend-only swap.** When the Swift app is unchanged since the installed
+build, only the Go binary needs replacing. That skips the Swift build, the DMG,
+and most of the disk. The installed build's `git describe` is the
+`serverInfo.version` in an MCP `initialize` response; don't swap over a build
+whose version ends in `-dirty`. Check the precondition against the working
+tree, whose entitlements files the recipe signs with:
+`git diff --stat <installed-commit> -- macos/` must print nothing.
+
+Build to a file named `openmessage`: codesign takes the signing identifier from
+the file name, and `build.sh` signs the helper as `openmessage`. Swap it in by
+rename, never `cp` over the live path (see "MCP config" above for why):
+
+```
+mkdir -p /tmp/om-swap
+CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 GOWORK=off go build -trimpath \
+  -ldflags="-s -w -X main.version=$(git describe --tags --always --dirty)" -o /tmp/om-swap/openmessage .
+codesign --force --options runtime --entitlements macos/OpenMessageHelper.entitlements \
+  --sign "Developer ID Application: Max Ghenis (8VB5UKQZC6)" /tmp/om-swap/openmessage
+codesign -dv /tmp/om-swap/openmessage 2>&1 | grep -x 'Identifier=openmessage' || echo STOP
+R=/Applications/OpenMessage.app/Contents/Resources
+cp -p "$R/openmessage" ~/openmessage-backend.prev   # rollback copy, a bare file
+osascript -e 'quit app "OpenMessage"'
+cp /tmp/om-swap/openmessage "$R/openmessage.new" && mv -f "$R/openmessage.new" "$R/openmessage"
+codesign --force --options runtime --entitlements macos/OpenMessage.entitlements \
+  --sign "Developer ID Application: Max Ghenis (8VB5UKQZC6)" /Applications/OpenMessage.app
+codesign --verify --deep --strict /Applications/OpenMessage.app
+xattr -cr /Applications/OpenMessage.app
+open -a OpenMessage
+```
+
+The identifier check must print `Identifier=openmessage`; if it prints `STOP`,
+stop before the swap. A quick swap needs no
+[watchdog parking](#parking-the-launchd-watchdog): a relaunch takes two failed
+probes 5 minutes apart. If you park it, remove
+`$HOME/Library/Application Support/OpenMessage/watchdog-disabled` right after
+`open -a OpenMessage`.
+
+To roll back, stage the `.prev` copy and rename it into place (a copy, so the
+`.prev` file survives), then re-sign the bundle:
+
+```
+cp -p ~/openmessage-backend.prev "$R/openmessage.new" && mv -f "$R/openmessage.new" "$R/openmessage"
+```
+
+A binary rollback works only when the new build added no migration
+(`git diff --stat <installed-commit> -- internal/storage/sqlite/migrations/`
+prints nothing): an older binary refuses a store migrated past it. Otherwise
+the options are to roll forward, or to restore a copy of `v2/store.sqlite3`
+taken before the swap with sqlite3 `.backup`. Don't copy the raw file and its
+`-wal`/`-shm` instead: open MCP clients keep connections, and the last one to
+close may checkpoint the WAL into the main file mid-copy. Restoring loses
+whatever the new build stored after the swap. `openmessage backup` does not
+copy `v2/`.
+Keep the old binary as a bare file, not inside an `.app` (see "Bundle-id
+shadowing"). An arm64-only binary is fine on an Apple Silicon install; the next
+full `build.sh` deploy restores the universal one.
 
 Confirm the deployed bundle kept the release id:
 
