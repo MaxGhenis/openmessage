@@ -16,15 +16,17 @@ import (
 // and the quote is resolved from the legacy store by RemoteID, as it always
 // was (signalQuoteArgs). Outgoing reports that this account sent the message;
 // QuoteArgs does not read it and still takes an empty AuthorID as this
-// account.
+// account. ProvisionalRemoteID reports that RemoteID is still the request ID
+// of this account's send; QuoteArgs does not read it either.
 type ReplyTarget struct {
-	RemoteID       string
-	AuthorID       string
-	Outgoing       bool
-	SentAt         time.Time
-	Text           string
-	HasAttachment  bool
-	AttachmentMIME string
+	RemoteID            string
+	AuthorID            string
+	Outgoing            bool
+	ProvisionalRemoteID bool
+	SentAt              time.Time
+	Text                string
+	HasAttachment       bool
+	AttachmentMIME      string
 }
 
 // QuoteArgs builds signal-cli's --quote-timestamp, --quote-author and

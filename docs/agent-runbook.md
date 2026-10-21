@@ -1790,7 +1790,7 @@ legacy senders unchanged.
   |---|---|---|
   | 200 | `success: true` | The platform accepted it (`confirmed`, or `store_failed`). |
   | 202 | `success: true, queued: true` | Stored, not delivered yet (`queued`, `dispatching`, `not_dispatched`). The app keeps retrying it; do not react again. |
-  | 502 | `error` | `uncertain` (the transport call ended without an answer: it may have been applied) or `rejected` (the platform refused it). |
+  | 502 | `error` | `uncertain` (the transport call ended without an answer: it may have been applied) or `rejected` (the platform refused it, for example Google's phone answering `success: false` for a message whose ID will not change, stored as `error_class: unsupported`; it is not retried). |
   | 409 | `error` | `canceled` before it was sent. |
   | 422 | `reaction_target_unavailable` | No v2 message with that ID, or not in that conversation. Nothing was queued. |
   | 501 | `error` | The account has no reaction sender (an import-only platform). |
@@ -1825,16 +1825,60 @@ snapshot (`ReplaceEmbeddedReactions`), which removes active reactors the
 snapshot does not list, and the Google decoder names reactors by participant
 ID rather than as self. So the next frame for the message replaces the "self"
 row with the reactor the phone names, or removes it if the phone's copy does
-not have the reaction yet; a reaction can disappear briefly and come back. A reaction that ends
+not have the reaction yet; a reaction can disappear briefly and come back.
+The transport's answer and the phone's frame race. When the outbox confirms a
+Google reaction after a frame for the message that was received at or after
+the transport call (`reaction_snapshot_fences.source_seq_ms`, the frame's
+local receipt time, against the row's `transport_called_at_ms`) is already
+stored, it writes no "self" row, because that frame may already list the
+reaction. Before, both rows stayed active and the pill read 2 until the
+message's next frame. A frame received after the call can still have left the
+phone before the phone applied the reaction (the call is marked before the
+adapter's conversation lookup, and a frame can carry another change to the
+same message, such as another person's reaction). Then the reaction is hidden until the next
+frame that lists it, the same gap the other order has, where that frame
+tombstones the "self" row. A reaction that ends
 `uncertain`, `rejected`, `not_dispatched` or `canceled` writes nothing, so the
 thread shows only reactions that went out. While a reaction is `queued`,
 `dispatching` or `not_dispatched` it is listed in the web UI's outbox tray
 with a Cancel button.
 
+**WhatsApp reaction targets.** WhatsApp names the message a reaction targets
+by its chat, its ID, whether it is this account's own, and in a group its
+sender (whatsmeow's `BuildMessageKey`, which reads an empty sender as this
+account). The dispatcher passes the target's direction
+(`bridge.MessageRef.Outgoing`) and stored sender, and
+`whatsapplive.SendReactionRequest` addresses this account's message as its
+own, an incoming message by its stored sender, and an incoming 1:1 message
+with no stored sender as the other party's (the chat JID, as the legacy
+sender did). An incoming group message with no stored sender cannot be
+named, so nothing is sent: the row ends `rejected` (`error_class:
+unsupported`, `error_detail` `send_reaction: unsupported: whatsapp reaction
+target author is unavailable`). Before, both went out with an empty sender
+and addressed a message of this account's that does not exist. Unlike a Signal
+reaction whose target cannot be named (above), which keeps retrying, this one
+is not retried: if the message is later stored with its sender, react again.
+
 **Reactions stuck retrying.** A reaction the transport cannot deliver yet goes
 `not_dispatched` and retries (every 5 s by default) with no cap; a Signal
 reaction whose target can never be named (above) stays there until it is
-canceled. Find them with:
+canceled. A refusal is not among them: when Google's phone answers a reaction
+with `success: false`, the row ends `rejected` after one attempt
+(`error_class: unsupported`, `error_code: send_reaction`, `error_detail`
+`send_reaction: unsupported: Google Messages refused the reaction`), because a
+retry would send the same request. Before that change it went
+`not_dispatched` and was sent again every 5 s. The exception is a reaction to
+a message this account just sent, which is still named by its send's request
+ID (Google's TmpID) until the phone's echo brings the phone's own ID: the
+dispatcher marks that target `ProvisionalRemoteID` (its send is unresolved, or
+confirmed and waiting for the echo; not canceled or rejected), and a refusal
+of it goes `not_dispatched` (`error_detail` `send_reaction: transient: Google
+Messages refused a reaction to a message still named by its send's request
+ID`) so the retry after the echo names the phone's ID. Nothing bounds that
+wait: if no echo ever renames the message (a scheduled send that has not gone
+out, or an `uncertain` one that never reached the phone), the refusal is
+retried every 5 s until the reaction is canceled. Find the ones still retrying
+with:
 
 ```bash
 curl -s "http://127.0.0.1:7007/api/v1/outbox?limit=100" | jq '.[] | select(.kind=="reaction")'

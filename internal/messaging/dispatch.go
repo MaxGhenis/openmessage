@@ -727,12 +727,32 @@ func (s *MessageService) targetRefForLease(
 	}
 	// Until echo reconciliation, an outgoing target's RemoteID remains its
 	// stable transport request ID.
+	provisional, err := s.remoteIDIsProvisional(ctx, target)
+	if err != nil {
+		return bridge.MessageRef{}, "load_target", err
+	}
 	return bridge.MessageRef{
-		RemoteID: target.RemoteMessageID,
-		AuthorID: authorID,
-		Outgoing: target.Direction == sqlite.MessageDirectionOutgoing,
-		SentAt:   time.UnixMilli(target.OccurredAtMS),
+		RemoteID:            target.RemoteMessageID,
+		AuthorID:            authorID,
+		Outgoing:            target.Direction == sqlite.MessageDirectionOutgoing,
+		ProvisionalRemoteID: provisional,
+		SentAt:              time.UnixMilli(target.OccurredAtMS),
 	}, "", nil
+}
+
+// remoteIDIsProvisional reports whether an outgoing message is still named
+// by the request ID of a send that may yet give it the platform's own ID.
+func (s *MessageService) remoteIDIsProvisional(ctx context.Context, message sqlite.Message) (bool, error) {
+	send, found, err := s.ownSendRow(ctx, message.AccountID, message)
+	if err != nil || !found {
+		return false, err
+	}
+	switch send.State {
+	case sqlite.OutboxCanceled, sqlite.OutboxRejected:
+		return false, nil
+	default:
+		return true, nil
+	}
 }
 
 func (s *MessageService) messageForLease(

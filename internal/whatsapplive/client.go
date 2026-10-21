@@ -1621,21 +1621,29 @@ func (b *Bridge) MarkReadRequest(conversationID string, messageIDs []string, sen
 	return nil
 }
 
+// ErrReactionTargetAuthorUnknown reports a reaction to an incoming group
+// message stored with no sender. WhatsApp names a group message by its sender
+// as well as its ID, and whatsmeow reads an empty sender as this account, so
+// the reaction would address a message of this account's that does not exist.
+// It is not sent.
+var ErrReactionTargetAuthorUnknown = errors.New("whatsapp reaction target author is unavailable")
+
 // SendReactionRequest sends a reaction from the v2 request data without
-// loading or updating the locally stored target message. It returns the
-// reaction's own sender timestamp (milliseconds), the time WhatsApp and the
-// ingest path record for it, so a confirmation and a later change from the
-// phone compare on the same clock.
-func (b *Bridge) SendReactionRequest(conversationID, targetRemoteID, targetAuthorID, emoji, action, requestID string) (time.Time, error) {
+// loading or updating the locally stored target message. targetOutgoing says
+// the target is this account's own message. It returns the reaction's own
+// sender timestamp (milliseconds), the time WhatsApp and the ingest path
+// record for it, so a confirmation and a later change from the phone compare
+// on the same clock.
+func (b *Bridge) SendReactionRequest(conversationID, targetRemoteID, targetAuthorID string, targetOutgoing bool, emoji, action, requestID string) (time.Time, error) {
 	chatJID, err := parseConversationJID(conversationID)
 	if err != nil {
 		return time.Time{}, markSendNotDispatched(err, true)
 	}
 	chatJID = b.normalizeConversationJID(chatJID)
 
-	targetSenderJID := watypes.EmptyJID
-	if strings.TrimSpace(targetAuthorID) != "" {
-		targetSenderJID = b.canonicalJID(parseWhatsAppSenderJID(targetAuthorID))
+	targetSenderJID, named := b.reactionRequestTargetSender(chatJID, targetAuthorID, targetOutgoing)
+	if !named {
+		return time.Time{}, markSendNotDispatched(ErrReactionTargetAuthorUnknown, true)
 	}
 
 	reactionText := emoji
@@ -4499,6 +4507,25 @@ func (b *Bridge) reactionActorIDForClient(cli *whatsmeow.Client) string {
 		return b.canonicalJID(*cli.Store.ID).String()
 	}
 	return "me"
+}
+
+// reactionRequestTargetSender names who sent the message a v2 reaction
+// targets. whatsmeow's BuildMessageKey reads an empty sender as this account,
+// so the empty JID is returned only for this account's own message. An
+// incoming message with no stored sender is the other party's in a 1:1 chat,
+// as the legacy reactionTargetSenderJID has it; in a group nothing names it,
+// and named is false.
+func (b *Bridge) reactionRequestTargetSender(chatJID watypes.JID, authorID string, outgoing bool) (sender watypes.JID, named bool) {
+	if outgoing {
+		return watypes.EmptyJID, true
+	}
+	if senderJID := parseWhatsAppSenderJID(authorID); !senderJID.IsEmpty() {
+		return b.canonicalJID(senderJID), true
+	}
+	if chatJID.Server == watypes.DefaultUserServer || chatJID.Server == watypes.HiddenUserServer {
+		return b.canonicalJID(chatJID), true
+	}
+	return watypes.EmptyJID, false
 }
 
 func (b *Bridge) reactionTargetSenderJID(msg *db.Message, chatJID watypes.JID) watypes.JID {

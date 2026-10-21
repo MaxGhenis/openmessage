@@ -310,20 +310,40 @@ func (a *Adapter) SendReaction(
 		)
 		return bridge.SendResult{}, failure
 	}
-	if !response.GetSuccess() {
-		// A rejected response proves the connection is healthy enough to
-		// respond; this must not touch the receive lifecycle. A nil response
-		// also has GetSuccess false and is equally safe to retry.
-		cause := errors.New("Google reaction send was rejected")
-		if response == nil {
-			cause = errors.New("send Google reaction: transport returned no response")
-		}
+	// Neither failure below proves the connection unhealthy, so neither
+	// touches the receive lifecycle.
+	if response == nil {
+		// No answer is not a refusal; the reaction is safe to retry.
 		return bridge.SendResult{}, bridge.OpError{
 			Class:       bridge.FailureTransient,
 			Operation:   "send_reaction",
+			Fingerprint: "google_reaction_no_response",
+			Dispatch:    bridge.DispatchNotCalled,
+			Cause:       errors.New("send Google reaction: transport returned no response"),
+		}
+	}
+	if !response.GetSuccess() && req.Target.ProvisionalRemoteID {
+		// The target is this account's message still named by its send's
+		// request ID. The phone may know it only by its own ID, which the
+		// echo brings and the next attempt then uses, so this can succeed.
+		return bridge.SendResult{}, bridge.OpError{
+			Class:       bridge.FailureTransient,
+			Operation:   "send_reaction",
+			Fingerprint: "google_reaction_target_provisional",
+			Dispatch:    bridge.DispatchNotCalled,
+			Cause:       errors.New("Google Messages refused a reaction to a message still named by its send's request ID"),
+		}
+	}
+	if !response.GetSuccess() {
+		// The phone answered and refused a reaction to a message named by
+		// an ID that will not change. A retry would send the same request,
+		// so the refusal is final.
+		return bridge.SendResult{}, bridge.OpError{
+			Class:       bridge.FailureUnsupported,
+			Operation:   "send_reaction",
 			Fingerprint: "google_reaction_rejected",
 			Dispatch:    bridge.DispatchNotCalled,
-			Cause:       cause,
+			Cause:       errors.New("Google Messages refused the reaction"),
 		}
 	}
 

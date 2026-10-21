@@ -1556,6 +1556,16 @@ func (r *OutboxRepository) ConfirmWithoutResult(
 // stored now, not from the outbox row, because a message can be rebound to
 // another conversation after its reaction was queued. applied reports whether
 // the read model changed.
+//
+// A message whose reactions come from full snapshots (Google, which has a
+// reaction_snapshot_fences row) gets no own row when the latest snapshot
+// applied to it was received at or after the transport was called. Such a
+// snapshot may already list the reaction under the reactor the phone names,
+// and an own row beside it would count the reaction twice until the next
+// snapshot. It may instead have left the phone before the phone applied the
+// reaction; then the reaction shows from the next snapshot that lists it,
+// the same gap the other order has, where that snapshot tombstones the own
+// row.
 func (r *OutboxRepository) ConfirmReaction(
 	ctx context.Context,
 	confirmation ReactionConfirmation,
@@ -1580,6 +1590,19 @@ func (r *OutboxRepository) ConfirmReaction(
 		)
 	}
 	defer tx.Rollback()
+
+	// Read before the update clears it. The update below succeeds only when
+	// the row is still called under this lease, so the value is then set.
+	var calledAtMS sql.NullInt64
+	if err := tx.QueryRowContext(ctx, `
+		SELECT transport_called_at_ms FROM outbox WHERE outbox_id = ?
+	`, confirmation.OutboxID).Scan(&calledAtMS); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return false, fmt.Errorf(
+			"confirm reaction outbox item %q: read transport call time: %w",
+			confirmation.OutboxID,
+			err,
+		)
+	}
 
 	result, err := tx.ExecContext(ctx, `
 		UPDATE outbox
@@ -1622,10 +1645,12 @@ func (r *OutboxRepository) ConfirmReaction(
 		SourceSeqMS:   occurredAtMS,
 	}
 	var action string
+	var snapshotSeqMS sql.NullInt64
 	if err := tx.QueryRowContext(ctx, `
-		SELECT m.message_id, m.account_id, m.conversation_id, r.emoji, r.action
+		SELECT m.message_id, m.account_id, m.conversation_id, r.emoji, r.action, f.source_seq_ms
 		FROM outbox_reactions AS r
 		JOIN messages AS m ON m.message_id = r.target_message_id
+		LEFT JOIN reaction_snapshot_fences AS f ON f.message_id = m.message_id
 		WHERE r.outbox_id = ?
 	`, confirmation.OutboxID).Scan(
 		&reaction.MessageID,
@@ -1633,6 +1658,7 @@ func (r *OutboxRepository) ConfirmReaction(
 		&reaction.ConversationID,
 		&reaction.Emoji,
 		&action,
+		&snapshotSeqMS,
 	); err != nil {
 		return false, fmt.Errorf(
 			"confirm reaction outbox item %q: read reaction target: %w",
@@ -1641,9 +1667,11 @@ func (r *OutboxRepository) ConfirmReaction(
 		)
 	}
 	reaction.Action = bridge.ReactionAction(action)
-	applied, err = applyReaction(ctx, tx, reaction, nowMS)
-	if err != nil {
-		return false, fmt.Errorf("confirm reaction outbox item %q: %w", confirmation.OutboxID, err)
+	if !snapshotSeqMS.Valid || snapshotSeqMS.Int64 < calledAtMS.Int64 {
+		applied, err = applyReaction(ctx, tx, reaction, nowMS)
+		if err != nil {
+			return false, fmt.Errorf("confirm reaction outbox item %q: %w", confirmation.OutboxID, err)
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return false, fmt.Errorf("confirm reaction outbox item %q: commit: %w", confirmation.OutboxID, err)
