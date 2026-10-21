@@ -576,8 +576,9 @@ line on a non-migrated install).
 
 **Run the app's own binary, not a copy.** The MCP client opens the same SQLite
 stores as the app, and a binary at a different schema version than the store
-refuses it. The backend inside the app bundle always matches the store after a
-deploy, so a client that runs it can't drift. On 2026-10-21 a deploy added
+refuses it when it starts. The backend inside the app bundle matches the store
+once the deployed app has started, so a client started after that can't drift.
+On 2026-10-21 a deploy added
 migration 0011, and the July copy at `/usr/local/bin/openmessage` failed with
 `database schema version 11 is newer than supported version 10`, so every new
 MCP session's openmessage server exited at startup. Point the PATH binary at the
@@ -587,9 +588,19 @@ bundle too (it is root-owned, so this needs `sudo` once):
 sudo ln -sf /Applications/OpenMessage.app/Contents/Resources/openmessage /usr/local/bin/openmessage
 ```
 
-During a full deploy (`rm -rf` then `cp -R`) the bundle is briefly absent, and
-an MCP server started in those seconds fails; restart that session's MCP
-server.
+An MCP server checks the schema only when it starts. One started before a
+deploy keeps running the old build against the new store, so after a deploy
+that adds a migration, restart the MCP servers of open sessions. One started
+during a deploy fails: during a full deploy (`rm -rf` then `cp -R`) the bundle
+is briefly absent, and until the new app's first start the new binary is ahead
+of the store (`ErrMigrationPending`, "quit and reopen the OpenMessage app").
+
+**Because sessions now run the bundle's binary, never overwrite it in place.**
+On macOS, `cp` over an executable that a process is running makes every later
+run of that path die (exit 137, kernel log `CODE SIGNING: ... rejecting invalid
+page`), even after the old process exits. Quitting the app does not stop MCP
+servers, so swap the file by rename (below). A path already broken this way is
+repaired by renaming a fresh copy over it.
 
 **Never** configure MCP to run `serve --web`, `serve --mcp-sse`, or
 `serve ... --transports` alongside the app: those are daemon shapes and will
@@ -1979,19 +1990,28 @@ one reports the store as newer than supported). With the MCP config and
 there is no other copy to update.
 
 **Backend-only swap.** When the Swift app is unchanged since the installed
-build (`git diff --stat <installed-commit> HEAD -- macos/` is empty), only the
-Go binary needs replacing. That skips the Swift build, the DMG, and most of the
-disk. The installed build's `git describe` is the `serverInfo.version` in an
-MCP `initialize` response. Build and sign the backend as `build.sh` does, then
-swap it in while the app is quit (park the watchdog first):
+build, only the Go binary needs replacing. That skips the Swift build, the DMG,
+and most of the disk. The installed build's `git describe` is the
+`serverInfo.version` in an MCP `initialize` response; don't swap over a build
+whose version ends in `-dirty`. Check the precondition against the working
+tree, whose entitlements files the recipe signs with:
+`git diff --stat <installed-commit> -- macos/` must print nothing.
+
+Build to a file named `openmessage`: codesign takes the signing identifier from
+the file name, and `build.sh` signs the helper as `openmessage`. Swap it in by
+rename, never `cp` over the live path (see "MCP config" above for why):
 
 ```
+mkdir -p /tmp/om-swap
 CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 GOWORK=off go build -trimpath \
-  -ldflags="-s -w -X main.version=$(git describe --tags --always)" -o /tmp/om-backend .
+  -ldflags="-s -w -X main.version=$(git describe --tags --always --dirty)" -o /tmp/om-swap/openmessage .
 codesign --force --options runtime --entitlements macos/OpenMessageHelper.entitlements \
-  --sign "Developer ID Application: Max Ghenis (8VB5UKQZC6)" /tmp/om-backend
+  --sign "Developer ID Application: Max Ghenis (8VB5UKQZC6)" /tmp/om-swap/openmessage
+codesign -dv /tmp/om-swap/openmessage 2>&1 | grep -x 'Identifier=openmessage'
+R=/Applications/OpenMessage.app/Contents/Resources
+cp -p "$R/openmessage" ~/openmessage-backend.prev   # rollback copy, a bare file
 osascript -e 'quit app "OpenMessage"'
-cp /tmp/om-backend /Applications/OpenMessage.app/Contents/Resources/openmessage
+cp /tmp/om-swap/openmessage "$R/openmessage.new" && mv -f "$R/openmessage.new" "$R/openmessage"
 codesign --force --options runtime --entitlements macos/OpenMessage.entitlements \
   --sign "Developer ID Application: Max Ghenis (8VB5UKQZC6)" /Applications/OpenMessage.app
 codesign --verify --deep --strict /Applications/OpenMessage.app
@@ -1999,10 +2019,20 @@ xattr -cr /Applications/OpenMessage.app
 open -a OpenMessage
 ```
 
-Keep the old binary until the new one is verified. To roll back, copy it back
-and re-sign the bundle the same way. Don't keep a backup `.app` anywhere (see
-"Bundle-id shadowing"). An arm64-only binary is fine on an Apple Silicon
-install; the next full `build.sh` deploy restores the universal one.
+A quick swap needs no [watchdog parking](#parking-the-launchd-watchdog): a
+relaunch takes two failed probes 5 minutes apart. If you park it, remove
+`watchdog-disabled` right after `open -a OpenMessage`.
+
+To roll back, rename the `.prev` copy over the path the same way and re-sign
+the bundle. That works only when the new build added no migration
+(`git diff --stat <installed-commit> -- internal/storage/sqlite/migrations/`
+prints nothing): an older binary refuses a store migrated past it. Otherwise
+the options are to roll forward, or to restore a copy of `v2/store.sqlite3`
+taken before the swap (sqlite3 `.backup`, or the file with its `-wal` and
+`-shm` while the app is quit). `openmessage backup` does not copy `v2/`. Keep
+the old binary as a bare file, not inside an `.app` (see "Bundle-id
+shadowing"). An arm64-only binary is fine on an Apple Silicon install; the next
+full `build.sh` deploy restores the universal one.
 
 Confirm the deployed bundle kept the release id:
 
