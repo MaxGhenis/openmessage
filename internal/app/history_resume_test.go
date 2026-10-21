@@ -146,6 +146,9 @@ type reconcileCase struct {
 	Pages     []int // page sizes, newest page first; they sum to Newer+1
 	CloseAt   int
 	SwapAfter int
+	// Tied[i] puts message i+1 (newest first) in the same millisecond as
+	// message i, so ties can straddle pages and the boundary.
+	Tied []bool
 }
 
 func (reconcileCase) Generate(r *rand.Rand, _ int) reflect.Value {
@@ -161,6 +164,9 @@ func (reconcileCase) Generate(r *rand.Rand, _ int) reflect.Value {
 		previous = cut + 1
 	}
 	c.Pages = append(c.Pages, total-previous)
+	for index := 1; index < total; index++ {
+		c.Tied = append(c.Tied, r.Intn(3) == 0)
+	}
 	if r.Intn(2) == 0 {
 		c.CloseAt = 1 + r.Intn(total+1)
 	} else {
@@ -171,14 +177,20 @@ func (reconcileCase) Generate(r *rand.Rand, _ int) reflect.Value {
 
 // Whatever point a recent reconcile stops at, what it stored is every fetched
 // message from the boundary up to some point (nothing above a hole), and the
-// next reconcile leaves legacy holding all of them.
+// next reconcile leaves legacy holding all of them. Messages may share a
+// millisecond, across pages and with the boundary: storing them oldest first
+// then relies on reversing the page order before the stable sort.
 func TestHistoryReconcilePropertyStopLeavesNoHole(t *testing.T) {
 	property := func(c reconcileCase) bool {
 		total := c.Newer + 1
 		all := make([]*gmproto.Message, 0, total) // newest first
+		ts := int64(1000 * (total + 1))
 		for index := 0; index < total; index++ {
+			if index > 0 && !c.Tied[index-1] {
+				ts -= 1000
+			}
 			id := fmt.Sprintf("r%02d", total-index)
-			all = append(all, makeMsg(id, "c1", id, int64(1000*(total-index))))
+			all = append(all, makeMsg(id, "c1", id, ts))
 		}
 		var pages [][]*gmproto.Message
 		start := 0
@@ -200,10 +212,11 @@ func TestHistoryReconcilePropertyStopLeavesNoHole(t *testing.T) {
 		}}
 		a, gm, _ := hcdNewApp(t, mock, ingress)
 		boundary := all[total-1]
-		if err := a.Store.UpsertConversation(&db.Conversation{ConversationID: "c1", Name: "Alice", LastMessageTS: 1000}); err != nil {
+		boundaryMS := boundary.GetTimestamp() / 1000
+		if err := a.Store.UpsertConversation(&db.Conversation{ConversationID: "c1", Name: "Alice", LastMessageTS: boundaryMS}); err != nil {
 			t.Fatalf("seed conversation: %v", err)
 		}
-		if err := a.Store.UpsertMessage(&db.Message{MessageID: boundary.GetMessageID(), ConversationID: "c1", Body: "boundary", TimestampMS: 1000}); err != nil {
+		if err := a.Store.UpsertMessage(&db.Message{MessageID: boundary.GetMessageID(), ConversationID: "c1", Body: "boundary", TimestampMS: boundaryMS}); err != nil {
 			t.Fatalf("seed boundary: %v", err)
 		}
 		if c.CloseAt == 0 {
@@ -253,6 +266,30 @@ func TestHistoryReconcilePropertyStopLeavesNoHole(t *testing.T) {
 	}
 	if err := quick.Check(property, &quick.Config{MaxCount: 200, Rand: rand.New(rand.NewSource(20261009))}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// failingPageGM fails every fetch after the first page of a conversation.
+type failingPageGM struct{ *hcdRecordingGM }
+
+func (g failingPageGM) FetchMessages(conversationID string, count int64, cursor *gmproto.Cursor) (*gmproto.ListMessagesResponse, error) {
+	if cursor != nil {
+		return nil, fmt.Errorf("phone could not load page %s", cursor.GetLastItemID())
+	}
+	return g.hcdRecordingGM.FetchMessages(conversationID, count, cursor)
+}
+
+// A reconcile whose later page fails still stores the pages it fetched, as
+// before: a page the phone keeps failing must not keep every newer message out.
+func TestHistoryReconcileStoresFetchedPagesWhenALaterPageFails(t *testing.T) {
+	mock, seed := reconcileMock(t)
+	a, gm, _ := hcdNewApp(t, mock, &hcdIngress{})
+	seed(a)
+	a.gmClient = failingPageGM{gm}
+
+	a.reconcileRecentConversations("listen_recovered")
+	if got := legacyIDs(t, a, "c1"); got != "m1,m6,m7" {
+		t.Fatalf("legacy = %s, want the first page stored above the boundary", got)
 	}
 }
 
