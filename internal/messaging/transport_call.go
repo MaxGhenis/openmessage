@@ -20,8 +20,10 @@ import (
 // nothing sends it again automatically.
 const (
 	defaultTransportCallTimeout = 60 * time.Second
-	// Media calls upload the attachment first (up to DefaultMaxMediaBytes).
-	defaultMediaTransportCallTimeout = 10 * time.Minute
+	// A media call uploads the attachment first. libgm bounds each of its two
+	// upload requests at 2 minutes and WhatsApp its upload at 90 s, so
+	// 5 minutes leaves room for the send itself.
+	defaultMediaTransportCallTimeout = 5 * time.Minute
 	// defaultTransportShutdownGrace is how long a canceled call may take to
 	// return its own result before shutdown abandons it.
 	defaultTransportShutdownGrace = 2 * time.Second
@@ -177,7 +179,14 @@ type transportOutcome[T any] struct {
 // context canceled when the bound passes, but a transport that ignores its
 // context (libgm) keeps its goroutine until it returns; the dispatch loop does
 // not wait for it. An abandoned call returns an uncertain OpError, because the
-// request may already have reached the platform.
+// request may already have reached the platform. That holds even when the hang
+// came before the request left: Google's SendText first asks the phone for the
+// conversation, and a phone that never answers hangs there. Retrying such an
+// intent would let it hold the loop for another full bound each time.
+//
+// call runs on its own goroutine and must release anything it uses (the
+// dispatch lease, a media reader) itself, since an abandoned call can outlive
+// the dispatch path that started it.
 func callTransport[T any](
 	s *MessageService,
 	ctx context.Context,
@@ -186,6 +195,13 @@ func callTransport[T any](
 	timeout time.Duration,
 	call func(context.Context) (T, error),
 ) (T, error) {
+	if timeout <= 0 {
+		timeout = defaultTransportCallTimeout
+	}
+	grace := s.transportShutdownGrace
+	if grace <= 0 {
+		grace = defaultTransportShutdownGrace
+	}
 	callCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -216,17 +232,17 @@ func callTransport[T any](
 	case <-ctx.Done():
 		// A context-aware transport returns its own, better classified result
 		// once canceled; give it a moment before abandoning it.
-		grace := s.clock.NewTimer(s.transportShutdownGrace)
+		graceTimer := s.clock.NewTimer(grace)
 		select {
 		case outcome := <-done:
-			grace.Stop()
+			graceTimer.Stop()
 			s.transport.settle(record)
 			return outcome.value, outcome.err
-		case <-grace.C():
+		case <-graceTimer.C():
 			reason = abandonReasonShutdown
 		case <-deadline.C():
 		}
-		grace.Stop()
+		graceTimer.Stop()
 	}
 
 	if !s.transport.abandon(record, reason, s.clock.Now()) {

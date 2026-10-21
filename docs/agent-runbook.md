@@ -110,8 +110,8 @@ sweep pairs the duplicates already stored: on the 10/16 live-store copy it
 merged 43, left 0 twins, and took 86 ms. Not covered:
 - media sends;
 - uncertain sends: lease recovery stamps `updated_at_ms` about 30 s after the
-  call (an abandoned call, at its 60 s bound), so their echo looks early and
-  is left;
+  call, and an abandoned call is stamped when it is given up (at its bound, or
+  about 2 s after a shutdown cancel), so their echo looks early and is left;
 - echoes first stored by a history import;
 - an echo that outran its confirm with no later frame of the same text in
   that thread (it stays until the next startup sweep).
@@ -137,19 +137,28 @@ it runs at startup and between the calls of a batch, never while the loop is
 blocked.
 
 **Fix:** each transport call (text, media, reaction, read receipt; any
-platform) has a hard bound: 60 s, or 10 minutes for media, whose call includes
+platform) has a hard bound: 60 s, or 5 minutes for media, whose call includes
 the upload. A call past its bound is abandoned. Its intent becomes `uncertain`
 with error code `transport_timeout`, and the loop moves on. Nothing retries an
 uncertain intent, because the request may have reached the phone; the user can
-send it again. The abandoned call's goroutine lives until the transport returns
-(for libgm, when the phone answers, if it ever does). At shutdown a canceled
-call gets 2 s to return its own result before it is abandoned the same way.
+send it again. That includes a hang before the request left (Google's send
+first asks the phone for the conversation) and a hung read receipt: retrying
+them would hold the loop for another full bound each time. The abandoned
+call's goroutine, and its dispatch lease and media reader, live until the
+transport returns (for libgm, when the phone answers, if it ever does). At
+shutdown a canceled call gets 2 s to return its own result before it is
+abandoned the same way.
+
+The bound limits the freeze; it does not remove it. One loop serves every
+account, so while the phone is not answering, each queued Google intent holds
+the loop for up to its bound before the next one, on any platform, goes out.
 
 `/api/status` `v2_dispatch` shows the loop's calls: `in_flight` (`outbox_id`,
-`operation`, `elapsed_ms`, `timeout_ms`) while one is out, plus
-`abandoned_calls`, `abandoned_still_running` and `last_abandoned` (`reason`
-`timeout` or `shutdown`). An `abandoned_still_running` that keeps growing means
-the platform is not answering at all.
+`account_id`, `operation`, `started_at_ms`, `elapsed_ms`, `timeout_ms`) while
+one is out, plus `abandoned_calls`, `abandoned_still_running` and
+`last_abandoned` (`reason` `timeout` or `shutdown`). An
+`abandoned_still_running` that keeps growing means the platform is not
+answering at all.
 
 **On a build without the fix:** quit and reopen the app. Startup lease recovery
 marks the stuck row `uncertain` (its call was made, so it is not resent) and
