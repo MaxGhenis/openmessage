@@ -23,7 +23,7 @@ import (
 )
 
 type poller interface {
-	ObserveIngress(func(account string, line []byte, resolvedSource string, resolvedDestination string)) func()
+	ObserveIngressLine(func(signallive.IngressLine)) func()
 	StartPoller(context.Context) (signallive.PollerRun, error)
 	SendTextRequest(string, string, signallive.ReplyTarget) (int64, error)
 	SendReactionRequest(string, signallive.ReactionTarget, string, string) error
@@ -346,6 +346,17 @@ func (a *Adapter) DownloadMedia(
 		decoded.isGroup,
 	)
 	if err != nil {
+		if errors.Is(err, signallive.ErrAttachmentNotStored) {
+			// signal-cli only serves attachments its receive already stored,
+			// and it never retries a receive-time download, so this is final
+			// for the transport. It says nothing about the account's health.
+			return bridge.MediaStream{}, fmt.Errorf(
+				"%w: signal-cli did not store attachment %s when the message arrived and cannot download it again: %w",
+				bridge.ErrMediaGone,
+				decoded.payload.AttachmentID,
+				err,
+			)
+		}
 		// Preserve C6: ReportError only acts on unambiguous local-account
 		// CommandErrors and never widens recipient/network failures into receive
 		// lifecycle transitions.
@@ -529,22 +540,18 @@ func (a *Adapter) Start(
 		a.mu.Unlock()
 	}()
 
-	unregisterIngress = a.poller.ObserveIngress(func(
-		account string,
-		line []byte,
-		resolvedSource string,
-		resolvedDestination string,
-	) {
+	unregisterIngress = a.poller.ObserveIngressLine(func(captured signallive.IngressLine) {
 		if sink == nil {
 			return
 		}
-		record, ephemeral, err := ingest.BuildSignalIngress(
+		record, ephemeral, err := ingest.BuildSignalIngressWithAttachmentErrors(
 			req.AccountID,
 			req.Generation,
-			account,
-			line,
-			resolvedSource,
-			resolvedDestination,
+			captured.Account,
+			captured.Line,
+			captured.ResolvedSource,
+			captured.ResolvedDestination,
+			captured.AttachmentErrors,
 			time.Now(),
 		)
 		if err != nil {

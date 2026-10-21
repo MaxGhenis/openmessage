@@ -8,6 +8,12 @@ import (
 	"time"
 )
 
+// ReceiveAttachmentErrorPrefix starts the last_error a projection records
+// when the transport reported, with the message itself, that it failed to
+// fetch the attachment. Download attempts keep that text rather than
+// overwriting it with their own, usually less informative, failure.
+const ReceiveAttachmentErrorPrefix = "receive: "
+
 // MessageAttachment is one inbound attachment associated with a normalized
 // message. AccountID is populated only by GetForDownload's messages join.
 type MessageAttachment struct {
@@ -20,6 +26,10 @@ type MessageAttachment struct {
 	SizeBytes *int64
 	State     string
 	BlobHash  *string
+	// LastError is diagnostic text from the projection or the latest failed
+	// download. RecordInboundAttachment only writes a non-nil value, so a
+	// replay that carries none keeps what is stored.
+	LastError *string
 	AccountID string
 }
 
@@ -84,15 +94,17 @@ func (r *MessageAttachmentRepository) RecordInboundAttachment(
 			size_bytes,
 			state,
 			blob_hash,
+			last_error,
 			created_at_ms,
 			updated_at_ms
-		) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', NULL, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', NULL, ?, ?, ?)
 		ON CONFLICT(message_id, ordinal) DO UPDATE SET
 			remote_id = excluded.remote_id,
 			remote_ref = excluded.remote_ref,
 			filename = excluded.filename,
 			mime = excluded.mime,
 			size_bytes = excluded.size_bytes,
+			last_error = COALESCE(excluded.last_error, message_attachments.last_error),
 			updated_at_ms = excluded.updated_at_ms
 		WHERE message_attachments.blob_hash IS NULL
 	`,
@@ -103,6 +115,7 @@ func (r *MessageAttachmentRepository) RecordInboundAttachment(
 		attachment.Filename,
 		attachment.MIME,
 		attachment.SizeBytes,
+		attachment.LastError,
 		nowMS,
 		nowMS,
 	); err != nil {
@@ -127,6 +140,7 @@ func (r *MessageAttachmentRepository) GetForDownload(
 		attachment MessageAttachment
 		size       sql.NullInt64
 		hash       sql.NullString
+		lastError  sql.NullString
 	)
 	err := r.store.db.QueryRowContext(ctx, `
 		SELECT
@@ -139,6 +153,7 @@ func (r *MessageAttachmentRepository) GetForDownload(
 			ma.size_bytes,
 			ma.state,
 			ma.blob_hash,
+			ma.last_error,
 			m.account_id
 		FROM message_attachments AS ma
 		JOIN messages AS m ON m.message_id = ma.message_id
@@ -153,6 +168,7 @@ func (r *MessageAttachmentRepository) GetForDownload(
 		&size,
 		&attachment.State,
 		&hash,
+		&lastError,
 		&attachment.AccountID,
 	)
 	if err != nil {
@@ -168,6 +184,9 @@ func (r *MessageAttachmentRepository) GetForDownload(
 	}
 	if hash.Valid {
 		attachment.BlobHash = &hash.String
+	}
+	if lastError.Valid {
+		attachment.LastError = &lastError.String
 	}
 	return attachment, nil
 }

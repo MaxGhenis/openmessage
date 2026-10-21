@@ -1861,6 +1861,11 @@ func (w *Worker) messageProjection(
 	attachments := make([]sqlite.MessageAttachment, 0, len(event.Attachments))
 	for index, attachment := range event.Attachments {
 		size := attachment.Size
+		var lastError *string
+		if report := strings.TrimSpace(attachment.TransportError); report != "" {
+			note := sqlite.ReceiveAttachmentErrorPrefix + report
+			lastError = &note
+		}
 		attachments = append(attachments, sqlite.MessageAttachment{
 			RemoteID:  attachment.RemoteID,
 			Ordinal:   int64(index),
@@ -1869,6 +1874,7 @@ func (w *Worker) messageProjection(
 			MIME:      attachment.MIME,
 			SizeBytes: &size,
 			State:     "pending",
+			LastError: lastError,
 		})
 	}
 

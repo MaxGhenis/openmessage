@@ -1497,6 +1497,7 @@ type fakePoller struct {
 	ingressID                uint64
 	ingress                  func(account string, line []byte, resolvedSource string, resolvedDestination string)
 	ingressHistory           []func(account string, line []byte, resolvedSource string, resolvedDestination string)
+	ingressLine              func(signallive.IngressLine)
 	unregistered             int
 	startAccount             string
 	startLine                []byte
@@ -1571,6 +1572,35 @@ func (*fakeSignalSendNotDispatchedError) SignalSendNotDispatched() {}
 
 func newFakePoller() *fakePoller {
 	return &fakePoller{started: make(chan *fakePollerRun, 16)}
+}
+
+// ObserveIngressLine registers through ObserveIngress, as the real bridge
+// does, so tests that drive the four-argument observer keep working; tests
+// that need attachment errors call ingressLine.
+func (p *fakePoller) ObserveIngressLine(observer func(signallive.IngressLine)) func() {
+	var legacy func(account string, line []byte, resolvedSource string, resolvedDestination string)
+	if observer != nil {
+		legacy = func(account string, line []byte, resolvedSource string, resolvedDestination string) {
+			observer(signallive.IngressLine{
+				Account:             account,
+				Line:                line,
+				ResolvedSource:      resolvedSource,
+				ResolvedDestination: resolvedDestination,
+			})
+		}
+	}
+	unregister := p.ObserveIngress(legacy)
+	p.mu.Lock()
+	p.ingressLine = observer
+	p.mu.Unlock()
+	return func() {
+		unregister()
+		p.mu.Lock()
+		if p.ingress == nil {
+			p.ingressLine = nil
+		}
+		p.mu.Unlock()
+	}
 }
 
 func (p *fakePoller) ObserveIngress(observer func(

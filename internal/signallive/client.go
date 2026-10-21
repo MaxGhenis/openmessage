@@ -431,7 +431,7 @@ type Bridge struct {
 	configDir string
 	callbacks Callbacks
 
-	ingressObserver   func(account string, line []byte, resolvedSource string, resolvedDestination string)
+	ingressObserver   func(IngressLine)
 	ingressObserverID uint64
 
 	connected  bool
@@ -595,6 +595,9 @@ type signalAttachment struct {
 	ID          string `json:"id"`
 	Filename    string `json:"filename"`
 	Caption     string `json:"caption"`
+	// Size is the sender's declared plaintext size; signal-cli prints null
+	// when the pointer carries none.
+	Size *int64 `json:"size"`
 }
 
 type signalMention struct {
@@ -647,10 +650,38 @@ type SentMessage = signalSentMessage
 type Reaction = signalReaction
 type Attachment = signalAttachment
 
+// IngressLine is one captured Signal receive line plus what the bridge
+// learned about it while capturing it.
+type IngressLine struct {
+	Account             string
+	Line                []byte
+	ResolvedSource      string
+	ResolvedDestination string
+	// AttachmentErrors maps an attachment id in Line to the failure signal-cli
+	// logged while downloading it during the receive call that printed Line.
+	// signal-cli prints and acknowledges the envelope after such a failure and
+	// never downloads that attachment again (see ErrAttachmentNotStored). Nil
+	// when every attachment downloaded, and for replayed lines, whose call
+	// output is gone.
+	AttachmentErrors map[string]string
+}
+
 // ObserveIngress installs the one pre-dispatch Signal receive observer. A
 // later registration supersedes an earlier one; the returned function only
 // removes the registration it created.
 func (b *Bridge) ObserveIngress(observer func(account string, line []byte, resolvedSource string, resolvedDestination string)) func() {
+	if observer == nil {
+		return b.ObserveIngressLine(nil)
+	}
+	return b.ObserveIngressLine(func(captured IngressLine) {
+		observer(captured.Account, captured.Line, captured.ResolvedSource, captured.ResolvedDestination)
+	})
+}
+
+// ObserveIngressLine is ObserveIngress for observers that also want the
+// capture-time detail IngressLine carries. Both install the same single
+// observer slot.
+func (b *Bridge) ObserveIngressLine(observer func(IngressLine)) func() {
 	if b == nil {
 		return func() {}
 	}
@@ -672,7 +703,7 @@ func (b *Bridge) ObserveIngress(observer func(account string, line []byte, resol
 	}
 }
 
-func (b *Bridge) observeIngress(account string, line []byte, resolvedSource string, resolvedDestination string) {
+func (b *Bridge) observeIngress(captured IngressLine) {
 	if b == nil {
 		return
 	}
@@ -682,7 +713,7 @@ func (b *Bridge) observeIngress(account string, line []byte, resolvedSource stri
 	if observer == nil {
 		return
 	}
-	line = bytes.Clone(line)
+	captured.Line = bytes.Clone(captured.Line)
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			b.logger.Warn().
@@ -691,7 +722,7 @@ func (b *Bridge) observeIngress(account string, line []byte, resolvedSource stri
 				Msg("Recovered from panic in Signal ingress observer")
 		}
 	}()
-	observer(account, line, resolvedSource, resolvedDestination)
+	observer(captured)
 }
 
 // ReportIngressError lets the lifecycle adapter log an isolated durable-tee
@@ -2160,10 +2191,11 @@ func (b *Bridge) handleReceiveOutput(account string, output []byte) error {
 		b.logger.Warn().Err(err).Msg("Failed to persist signal-cli batch to WAL — continuing with best-effort processing")
 	}
 
+	failures := parseAttachmentDownloadFailures(output)
 	scanner := bufio.NewScanner(bytes.NewReader(output))
 	scanner.Buffer(make([]byte, 0, 64*1024), 2*1024*1024)
 	for scanner.Scan() {
-		if _, err := b.processReceiveLine(account, scanner.Bytes(), true); err != nil {
+		if _, err := b.processReceiveLineWithFailures(account, scanner.Bytes(), true, failures); err != nil {
 			b.logger.Debug().Err(err).Msg("Failed to process Signal receive payload")
 		}
 	}
@@ -2270,6 +2302,18 @@ func (b *Bridge) drainReceiveWAL(account string) {
 }
 
 func (b *Bridge) processReceiveLine(account string, rawLine []byte, allowRecovery bool) (bool, error) {
+	return b.processReceiveLineWithFailures(account, rawLine, allowRecovery, nil)
+}
+
+// processReceiveLineWithFailures is processReceiveLine for a line from a live
+// receive call, whose output also reported the attachment downloads that
+// failed while signal-cli handled its envelopes.
+func (b *Bridge) processReceiveLineWithFailures(
+	account string,
+	rawLine []byte,
+	allowRecovery bool,
+	failures attachmentDownloadFailures,
+) (bool, error) {
 	line := bytes.TrimSpace(rawLine)
 	if len(line) == 0 {
 		return true, nil
@@ -2289,7 +2333,21 @@ func (b *Bridge) processReceiveLine(account string, rawLine []byte, allowRecover
 	if env.SyncMessage != nil {
 		resolvedDestination = b.resolveContactAddressAtCapture(signalSentTarget(env.SyncMessage.SentMessage))
 	}
-	b.observeIngress(payloadAccount, line, resolvedSource, resolvedDestination)
+	attachmentErrors := failures.forEnvelope(&env)
+	for attachmentID, cause := range attachmentErrors {
+		b.logger.Warn().
+			Str("attachment_id", attachmentID).
+			Int64("envelope_timestamp", env.Timestamp).
+			Str("cause", cause).
+			Msg("signal-cli failed to download a Signal attachment while receiving it; it will not retry, so the attachment stays unavailable until restored by hand")
+	}
+	b.observeIngress(IngressLine{
+		Account:             payloadAccount,
+		Line:                line,
+		ResolvedSource:      resolvedSource,
+		ResolvedDestination: resolvedDestination,
+		AttachmentErrors:    attachmentErrors,
+	})
 	if reason := signalEnvelopeRecoveryReason(&env); reason != "" {
 		if allowRecovery {
 			b.recordReceiveRecoveryIssue(payloadAccount, line, reason, nil)
@@ -4311,9 +4369,13 @@ func (b *Bridge) downloadSignalAttachment(
 	output, err := runSignalCLI(ctx, b.configDir, args...)
 	b.commandMu.Unlock()
 	if err != nil {
-		return nil, commandError("download Signal attachment", err, output)
+		failure := commandError("download Signal attachment", err, output)
+		if isSignalAttachmentNotStored(output) {
+			return nil, fmt.Errorf("%w: %w", ErrAttachmentNotStored, failure)
+		}
+		return nil, failure
 	}
-	payload := strings.TrimSpace(string(output))
+	payload := signalAttachmentPayload(output)
 	if payload == "" {
 		return nil, errors.New("signal attachment is empty")
 	}
