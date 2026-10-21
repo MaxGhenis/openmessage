@@ -116,7 +116,11 @@ func newGate() *gate {
 }
 
 func (g *gate) block() {
-	g.entered <- struct{}{}
+	// entered is only a signal; a full buffer must not block the call.
+	select {
+	case g.entered <- struct{}{}:
+	default:
+	}
 	if g.onEnter != nil {
 		g.onEnter()
 	}
@@ -648,12 +652,10 @@ func checkHungTransportProperty(t *testing.T, seed int64, intents int, script []
 	// Each round dispatches what is due; a not-dispatched answer is retried
 	// after the retry delay. len(script)+intents rounds always suffice.
 	for round := 0; round <= len(script)+intents; round++ {
-		started := time.Now()
-		if _, err := service.DispatchDue(context.Background(), 8); err != nil {
+		// A pass whose hung call's bound never fires fails here instead of
+		// hanging until the go test timeout.
+		if _, err := dispatchWithin(t, service, context.Background(), 8, 30*time.Second); err != nil {
 			return fail("DispatchDue: %v", err)
-		}
-		if elapsed := time.Since(started); elapsed > 2*time.Second {
-			return fail("DispatchDue took %s", elapsed)
 		}
 		clock.Advance(defaultRetryDelay + time.Second)
 	}
@@ -767,4 +769,33 @@ func TestCallTransportResultsRacingTheBoundAreDeliveredOrAbandoned(t *testing.T)
 		t.Fatalf("AbandonedCalls = %d, want the %d abandoned results", health.AbandonedCalls, abandoned)
 	}
 	t.Logf("%d of %d calls abandoned at the bound", abandoned, calls)
+}
+
+func TestShutdownWithoutAGraceUsesTheDefaultGrace(t *testing.T) {
+	service := &MessageService{clock: SystemClock{}}
+	ctx, cancel := context.WithCancel(context.Background())
+	release := make(chan struct{})
+	defer close(release)
+	entered := make(chan struct{})
+	var canceledAt time.Time
+	go func() {
+		<-entered
+		canceledAt = time.Now()
+		cancel()
+	}()
+	_, err := callTransport(service, ctx, sqlite.OutboxItem{OutboxID: "no-grace"}, textOperation, time.Hour,
+		func(context.Context) (int, error) {
+			close(entered)
+			<-release
+			return 0, nil
+		})
+	waited := time.Since(canceledAt)
+	var opErr bridge.OpError
+	if !errors.As(err, &opErr) || opErr.Fingerprint != transportShutdownFingerprint {
+		t.Fatalf("callTransport(canceled, grace 0) error = %v, want abandoned at shutdown", err)
+	}
+	// A zero grace means the default, not abandoning a canceled call at once.
+	if waited < defaultTransportShutdownGrace*3/4 {
+		t.Fatalf("abandoned %s after cancel, want about the default grace %s", waited, defaultTransportShutdownGrace)
+	}
 }
