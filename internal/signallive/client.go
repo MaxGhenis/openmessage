@@ -133,6 +133,11 @@ func isSignalIdleReceiveTimeout(err error, timedOut bool, output []byte) bool {
 var (
 	now = time.Now
 
+	// receiveCallDeadline bounds one `signal-cli receive` call. signal-cli's
+	// own --timeout restarts after every envelope, so a call that is still
+	// delivering can run into it. Swapped by tests to reach it quickly.
+	receiveCallDeadline = time.Duration(receiveTimeoutSeconds+3) * time.Second
+
 	// accountProbeRetryDelays paces the in-generation listAccounts retries: a
 	// transient failure of signal-cli's per-account check (network not up at
 	// login-time autostart, a server hiccup) reports zero accounts with exit 0
@@ -1799,24 +1804,25 @@ func (b *Bridge) runReceiveLoop(
 
 		b.maybeSweepTmp()
 
-		callCtx, callCancel := context.WithTimeout(ctx, time.Duration(receiveTimeoutSeconds+3)*time.Second)
 		b.commandMu.Lock()
+		callCtx, callCancel := context.WithTimeout(ctx, receiveCallDeadline)
 		output, err := runSignalCLI(callCtx, b.configDir, "-a", probedAccount, "--output", "json", "receive", "--timeout", strconv.Itoa(receiveTimeoutSeconds), "--max-messages", strconv.Itoa(receiveMaxMessages))
 		b.commandMu.Unlock()
 		timedOut := errors.Is(callCtx.Err(), context.DeadlineExceeded)
 		callCancel()
+		stopped := ctx.Err() != nil
 		// signal-cli acknowledges each envelope to Signal's server as it
 		// prints it, so a call that was stopped, hit its deadline or exited
 		// non-zero can still hold messages the server will never deliver to
 		// this device again. Keep them before deciding what the call's
 		// outcome means; the success path below handles its own output.
 		delivered := receiveOutputHasEnvelopes(output)
-		if delivered && (err != nil || ctx.Err() != nil) {
+		if delivered && (err != nil || stopped) {
 			if handleErr := b.handleReceiveOutput(probedAccount, output); handleErr != nil {
 				b.logger.Debug().Err(handleErr).Msg("Failed to process Signal receive payload")
 			}
 		}
-		if ctx.Err() != nil {
+		if stopped {
 			continue
 		}
 		if err != nil {

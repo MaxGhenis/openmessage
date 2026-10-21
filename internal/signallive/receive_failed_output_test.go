@@ -26,6 +26,10 @@ const failedReceiveAccount = "+15551230000"
 // fires and configureSignalCancel sends SIGTERM (captured live 2026-10-21).
 const signalCLIShutdownLine = "INFO  Shutdown - Received SIGTERM signal, shutting down ..."
 
+// testReceiveCallDeadline stands in for the 5 s production deadline so a
+// fake receive call can run into it quickly.
+const testReceiveCallDeadline = 50 * time.Millisecond
+
 var errSignalCLIExit = errors.New("exit status 1")
 
 func failedReceiveEnvelope(sender string, ts int64, body string) string {
@@ -35,9 +39,20 @@ func failedReceiveEnvelope(sender string, ts int64, body string) string {
 	)
 }
 
-// newFailedReceiveBridge wires a bridge to a real store and swaps runSignalCLI
-// for receive, which answers the receive calls the loop makes.
-func newFailedReceiveBridge(t *testing.T, receive func(call int32) ([]byte, error)) (*Bridge, *db.Store, *atomic.Int32) {
+// runIntoDeadline models a call signal-cli was still running when the
+// receive deadline fired: it printed output, then got SIGTERM.
+func runIntoDeadline(ctx context.Context, output string) ([]byte, error) {
+	<-ctx.Done()
+	return []byte(output + "\n" + signalCLIShutdownLine + "\n"), ctx.Err()
+}
+
+// newFailedReceiveBridge wires a bridge to a real store, shortens the receive
+// deadline, and swaps runSignalCLI for receive, which answers the receive
+// calls the loop makes.
+func newFailedReceiveBridge(
+	t *testing.T,
+	receive func(ctx context.Context, call int32) ([]byte, error),
+) (*Bridge, *db.Store, *atomic.Int32) {
 	t.Helper()
 	store, err := db.New(filepath.Join(t.TempDir(), "messages.db"))
 	if err != nil {
@@ -46,11 +61,13 @@ func newFailedReceiveBridge(t *testing.T, receive func(call int32) ([]byte, erro
 	bridge := &Bridge{store: store, logger: zerolog.Nop(), configDir: t.TempDir()}
 
 	originalRun := runSignalCLI
+	originalDeadline := receiveCallDeadline
 	originalVersionProbe := probeSignalCLIVersion
 	t.Cleanup(func() {
 		_ = bridge.Close()
 		bridge.commandMu.Lock()
 		runSignalCLI = originalRun
+		receiveCallDeadline = originalDeadline
 		bridge.commandMu.Unlock()
 		probeSignalCLIVersion = originalVersionProbe
 		store.Close()
@@ -58,6 +75,7 @@ func newFailedReceiveBridge(t *testing.T, receive func(call int32) ([]byte, erro
 	probeSignalCLIVersion = func(context.Context) ([]byte, error) {
 		return []byte("signal-cli 0.14.9"), nil
 	}
+	receiveCallDeadline = testReceiveCallDeadline
 
 	var calls atomic.Int32
 	runSignalCLI = func(ctx context.Context, configDir string, args ...string) ([]byte, error) {
@@ -66,7 +84,7 @@ func newFailedReceiveBridge(t *testing.T, receive func(call int32) ([]byte, erro
 		case strings.Contains(joined, " listAccounts "):
 			return []byte(`[{"number":"` + failedReceiveAccount + `"}]`), nil
 		case strings.Contains(joined, " receive "):
-			return receive(calls.Add(1))
+			return receive(ctx, calls.Add(1))
 		}
 		return []byte{}, nil
 	}
@@ -94,11 +112,11 @@ func signalBodies(t *testing.T, store *db.Store, sender string) []string {
 func TestStartReceiveLoopKeepsEnvelopesFromTimedOutReceive(t *testing.T) {
 	const sender = "+15551234567"
 	envelope := failedReceiveEnvelope(sender, 1700000000123, "sent just before the deadline")
-	bridge, store, calls := newFailedReceiveBridge(t, func(call int32) ([]byte, error) {
+	bridge, store, calls := newFailedReceiveBridge(t, func(ctx context.Context, call int32) ([]byte, error) {
 		if call == 1 {
-			return []byte(envelope + "\n" + signalCLIShutdownLine + "\n"), context.DeadlineExceeded
+			return runIntoDeadline(ctx, envelope)
 		}
-		return []byte{}, context.DeadlineExceeded
+		return []byte{}, nil
 	})
 
 	var observed atomic.Int32
@@ -111,11 +129,44 @@ func TestStartReceiveLoopKeepsEnvelopesFromTimedOutReceive(t *testing.T) {
 	if got := signalBodies(t, store, sender); !slices.Equal(got, []string{"sent just before the deadline"}) {
 		t.Fatalf("stored bodies = %q, want the envelope printed before the deadline", got)
 	}
-	if observed.Load() != 1 {
-		t.Fatalf("ingress observer saw %d envelopes, want 1", observed.Load())
+	// At least once, not exactly once: the loop's startup WAL replay can
+	// race the first batch and re-observe it. Ingest dedupes by
+	// envelope source and timestamp.
+	if observed.Load() < 1 {
+		t.Fatal("ingress observer never saw the envelope printed before the deadline")
 	}
 	if status := bridge.Status(); !status.Connected || status.LastError != "" {
 		t.Fatalf("a deadline hit while delivering messages is not a failure; status = %+v", status)
+	}
+}
+
+// Deadline hits that each delivered envelopes are long batches. More than
+// receiveFailureLimit of them in a row must not count as failures and force
+// a reconnect.
+func TestStartReceiveLoopTreatsDeadlineHitsThatDeliveredAsBatches(t *testing.T) {
+	const sender = "+15552223333"
+	hits := int32(receiveFailureLimit + 1)
+	bridge, store, calls := newFailedReceiveBridge(t, func(ctx context.Context, call int32) ([]byte, error) {
+		if call <= hits {
+			body := fmt.Sprintf("batch %d", call)
+			return runIntoDeadline(ctx, failedReceiveEnvelope(sender, 1700000000000+int64(call), body))
+		}
+		return []byte{}, nil
+	})
+
+	go bridge.startReceiveLoop(failedReceiveAccount, false)
+	waitForCondition(t, 3*time.Second, func() bool { return calls.Load() > hits+1 })
+
+	if status := bridge.Status(); !status.Connected || status.LastError != "" {
+		t.Fatalf("%d deadline hits that delivered envelopes forced a reconnect; status = %+v", hits, status)
+	}
+	want := make([]string, 0, hits)
+	for call := int32(1); call <= hits; call++ {
+		want = append(want, fmt.Sprintf("batch %d", call))
+	}
+	slices.Sort(want)
+	if got := signalBodies(t, store, sender); !slices.Equal(got, want) {
+		t.Fatalf("stored bodies = %q, want %q", got, want)
 	}
 }
 
@@ -123,7 +174,7 @@ func TestStartReceiveLoopKeepsEnvelopesFromTimedOutReceive(t *testing.T) {
 // printed first, and still counts toward the reconnect limit.
 func TestStartReceiveLoopKeepsEnvelopesFromFailedReceiveAndStillCountsFailure(t *testing.T) {
 	const sender = "+15557654321"
-	bridge, store, _ := newFailedReceiveBridge(t, func(call int32) ([]byte, error) {
+	bridge, store, _ := newFailedReceiveBridge(t, func(_ context.Context, call int32) ([]byte, error) {
 		body := fmt.Sprintf("printed before failure %d", call)
 		out := failedReceiveEnvelope(sender, 1700000000000+int64(call), body) +
 			"\nERROR App - Unexpected error: connection reset\n"
@@ -156,7 +207,7 @@ type receiveCallScript struct {
 type scriptedReceiveCall struct {
 	Bodies  []string
 	Noise   bool
-	Outcome int // 0 success, 1 deadline exceeded, 2 non-zero exit
+	Outcome int // 0 success, 1 runs into the deadline, 2 non-zero exit
 }
 
 func (receiveCallScript) Generate(r *rand.Rand, _ int) reflect.Value {
@@ -185,11 +236,11 @@ func TestStartReceiveLoopStoresEveryPrintedEnvelopeProperty(t *testing.T) {
 			var printed []string
 			done := make(chan struct{})
 			var doneOnce sync.Once
-			bridge, store, _ := newFailedReceiveBridge(t, func(call int32) ([]byte, error) {
+			bridge, store, _ := newFailedReceiveBridge(t, func(ctx context.Context, call int32) ([]byte, error) {
 				index := int(call) - 1
 				if index >= len(script.Calls) {
 					doneOnce.Do(func() { close(done) })
-					return []byte{}, context.DeadlineExceeded
+					return []byte{}, nil
 				}
 				scripted := script.Calls[index]
 				var lines []string
@@ -202,14 +253,14 @@ func TestStartReceiveLoopStoresEveryPrintedEnvelopeProperty(t *testing.T) {
 				if scripted.Noise {
 					lines = append(lines, "WARN  AccountHelper - Messages have been last received 8 days ago.")
 				}
-				out := []byte(strings.Join(lines, "\n"))
+				out := strings.Join(lines, "\n")
 				switch scripted.Outcome {
 				case 1:
-					return append(out, []byte("\n"+signalCLIShutdownLine)...), context.DeadlineExceeded
+					return runIntoDeadline(ctx, out)
 				case 2:
-					return append(out, []byte("\nERROR App - Unexpected error")...), errSignalCLIExit
+					return []byte(out + "\nERROR App - Unexpected error"), errSignalCLIExit
 				}
-				return out, nil
+				return []byte(out), nil
 			})
 			go bridge.startReceiveLoop(failedReceiveAccount, false)
 			// The loop either runs past the end of the script or gives up
