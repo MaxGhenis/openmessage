@@ -486,3 +486,19 @@ func TestV2ReactionTextSaysARefusalIsAboutTheMessage(t *testing.T) {
 		}
 	}
 }
+
+// A reaction held for its target's unsent send says why it waits, so an agent
+// reacting to a scheduled message does not read the wait as a stuck delivery.
+func TestV2ReactionTextSaysAHeldReactionWaitsForItsMessage(t *testing.T) {
+	held := v2ReactionText("outbox-1", messaging.OutboxNotDispatched, "transient", "reaction_target_unsent", "key-1")
+	if !strings.Contains(held, "outbox-1") || !strings.Contains(held, "Do NOT react again") ||
+		!strings.Contains(held, "waiting for the message it reacts to") || !strings.Contains(held, "key-1") {
+		t.Fatalf("held reaction text = %q, want it queued, not to be repeated, and waiting for its message", held)
+	}
+	for _, code := range []string{"send_reaction", ""} {
+		text := v2ReactionText("outbox-2", messaging.OutboxNotDispatched, "transient", code, "")
+		if strings.Contains(text, "waiting for the message") {
+			t.Fatalf("not_dispatched text for code %q = %q, want no mention of an unsent target", code, text)
+		}
+	}
+}

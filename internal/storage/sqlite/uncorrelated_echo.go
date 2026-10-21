@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 )
 
 // Google Messages normally echoes a sent message with the TmpID it was sent
@@ -57,6 +58,12 @@ const (
 	// it is never an echo candidate, however well its arrival time fits.
 	echoMaxStampSkewMS = int64(5 * 60 * 1000)
 )
+
+// EchoMaxLag is echoMaxLagMS as a duration: no echo first seen later than
+// this after its send went out (the intent's updated_at_ms) is ever paired
+// with that send by content. The messaging dispatcher stops treating a sent
+// message as still awaiting its echo after it.
+const EchoMaxLag = time.Duration(echoMaxLagMS) * time.Millisecond
 
 // UncorrelatedEchoRequest is an outgoing message frame that names no
 // transport request. SeenAtMS is when this machine received the frame;

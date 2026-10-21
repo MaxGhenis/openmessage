@@ -193,6 +193,11 @@ func v2ReactionText(outboxID string, state messaging.OutboxState, errorClass, er
 			"The reaction is durably queued (outbox %s, state %s) and the app keeps retrying it in the background. Do NOT react again; it is listed in the app's outbox, where it can be canceled.",
 			outboxID, state,
 		)
+		if errorCode == "reaction_target_unsent" {
+			// The dispatcher holds a reaction whose target is this
+			// account's own message that has not been sent yet.
+			text += " It is waiting for the message it reacts to, which has not been sent yet, and goes out after that message does."
+		}
 		if idempotencyKey != "" {
 			text += fmt.Sprintf(" To repeat this exact reaction deliberately, reuse idempotency_key %s.", idempotencyKey)
 		}
