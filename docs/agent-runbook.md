@@ -1906,6 +1906,25 @@ target author is unavailable`). Before, both went out with an empty sender
 and addressed a message of this account's that does not exist. Unlike a Signal
 reaction whose target cannot be named (above), which keeps retrying, this one
 is not retried: if the message is later stored with its sender, react again.
+A stored sender that is neither a JID nor a phone number (digits, with or
+without a leading `+`) is refused the same way.
+
+In a group the sender must be the one the message arrived from (whatsmeow's
+`MessageInfo.Sender`, which it puts in the keys it builds for a received
+message): the member's LID (`<digits>@lid`) in a group that addresses members
+by LID, the phone number otherwise. The store keeps the phone number whenever
+the LID's number was known when the message arrived, and `<digits>@lid` when
+it was not. So `SendReactionRequest` sends a stored LID as it is, and maps a
+stored phone number back to its LID (whatsmeow's LID store, then the session
+store's `whatsmeow_lid_map`) when the group addresses members by LID. It reads
+the group's addressing from the whatsmeow group cache that `SendMessage` reads
+to choose the identity it sends with; when the cache does not hold the group,
+the lookup fetches it and `SendMessage` then uses that copy. A phone number
+whose LID is not known, or a group whose addressing cannot be read, goes out
+as stored (and `SendMessage` reports a group it cannot read, as before).
+Before, a stored LID went out as `<digits>@lid@s.whatsapp.net`, and a stored
+phone number went out as the phone number in a LID group. 1:1 chats were never
+affected: whatsmeow puts no participant in a 1:1 message's key.
 
 **Reactions stuck retrying.** A reaction the transport cannot deliver yet goes
 `not_dispatched` and retries (every 5 s by default) with no cap; a Signal

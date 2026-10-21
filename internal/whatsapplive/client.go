@@ -150,6 +150,18 @@ var clientIsConnected = func(cli *whatsmeow.Client) bool {
 	return cli != nil && cli.IsConnected()
 }
 
+// groupAddressingMode reads whether a group addresses its members by phone
+// number or by LID from whatsmeow's group cache, the record SendMessage reads
+// to choose the identity it sends to the group with. On a miss it fetches the
+// group's info, as SendMessage would.
+var groupAddressingMode = func(cli *whatsmeow.Client, ctx context.Context, group watypes.JID) (watypes.AddressingMode, error) {
+	data, err := cli.DangerousInternals().GetCachedGroupData(ctx, group)
+	if err != nil || data == nil {
+		return "", err
+	}
+	return data.AddressingMode, nil
+}
+
 var getProfilePictureInfo = func(cli *whatsmeow.Client, ctx context.Context, jid watypes.JID, params *whatsmeow.GetProfilePictureParams) (*watypes.ProfilePictureInfo, error) {
 	return cli.GetProfilePictureInfo(ctx, jid, params)
 }
@@ -1666,7 +1678,7 @@ func (b *Bridge) SendReactionRequest(conversationID, targetRemoteID, targetAutho
 
 	reaction := cli.BuildReaction(
 		chatJID,
-		targetSenderJID,
+		b.reactionTargetParticipant(cli, ctx, chatJID, targetSenderJID),
 		watypes.MessageID(targetRemoteID),
 		reactionText,
 	)
@@ -4510,22 +4522,104 @@ func (b *Bridge) reactionActorIDForClient(cli *whatsmeow.Client) string {
 }
 
 // reactionRequestTargetSender names who sent the message a v2 reaction
-// targets. whatsmeow's BuildMessageKey reads an empty sender as this account,
-// so the empty JID is returned only for this account's own message. An
-// incoming message with no stored sender is the other party's in a 1:1 chat,
-// as the legacy reactionTargetSenderJID has it; in a group nothing names it,
-// and named is false.
+// targets, as stored. whatsmeow's BuildMessageKey reads an empty sender as
+// this account, so the empty JID is returned only for this account's own
+// message. An incoming message with no stored sender is the other party's in a
+// 1:1 chat, as the legacy reactionTargetSenderJID has it; in a group nothing
+// names it, and named is false. A stored sender that is neither a JID nor a
+// phone number names no one either (reactionTargetAuthorJID).
+//
+// The sender is not mapped between phone number and LID here. In a 1:1 chat
+// it only tells BuildMessageKey the message is not this account's, which
+// either form does; in a group reactionTargetParticipant picks the form.
 func (b *Bridge) reactionRequestTargetSender(chatJID watypes.JID, authorID string, outgoing bool) (sender watypes.JID, named bool) {
 	if outgoing {
 		return watypes.EmptyJID, true
 	}
-	if senderJID := parseWhatsAppSenderJID(authorID); !senderJID.IsEmpty() {
-		return b.canonicalJID(senderJID), true
+	if senderJID, ok := reactionTargetAuthorJID(authorID); ok {
+		return senderJID, true
 	}
 	if chatJID.Server == watypes.DefaultUserServer || chatJID.Server == watypes.HiddenUserServer {
-		return b.canonicalJID(chatJID), true
+		return chatJID, true
 	}
 	return watypes.EmptyJID, false
+}
+
+// reactionTargetAuthorJID parses a v2 sender identity's canonical value: a
+// JID such as "<digits>@lid", the form ingest stores for a sender whose LID
+// had no known phone number, or an E.164 number ("+<digits>"), the form it
+// stores for a phone-number JID. Anything else names no one.
+func reactionTargetAuthorJID(authorID string) (watypes.JID, bool) {
+	authorID = strings.TrimSpace(authorID)
+	if strings.Contains(authorID, "@") {
+		jid, err := watypes.ParseJID(authorID)
+		if err != nil || strings.Count(authorID, "@") != 1 || jid.User == "" || jid.Server == "" {
+			return watypes.EmptyJID, false
+		}
+		return jid.ToNonAD(), true
+	}
+	number := strings.TrimPrefix(authorID, "+")
+	if number == "" {
+		return watypes.EmptyJID, false
+	}
+	for _, r := range number {
+		if r < '0' || r > '9' {
+			return watypes.EmptyJID, false
+		}
+	}
+	return watypes.NewJID(number, watypes.DefaultUserServer), true
+}
+
+// reactionTargetParticipant returns the sender a reaction names a group
+// message by. WhatsApp keys a group message by the sender it arrived from,
+// whatsmeow's MessageInfo.Sender (getKeyFromInfo puts it in a poll vote's key,
+// and requesting a message from the phone keys it the same way). That is the
+// member's LID when the message was addressed by LID (parseMessageSource
+// reads the participant attribute, and the phone number only into SenderAlt),
+// and its phone number otherwise.
+//
+// Ingest stores the phone number whenever the LID's number is known at
+// capture (canonicalJID), which whatsmeow records from SenderAlt before it
+// dispatches the message, so in a group that addresses members by LID a
+// stored phone number is mapped back to the LID. The group's addressing comes
+// from the cache SendMessage reads to choose the identity it sends with. A
+// stored LID is kept: ingest stores one only for a message addressed by LID,
+// so mapping it to a phone number (as canonicalJID would) names a key the
+// message never had. When the addressing or the number's LID is unknown, the
+// stored sender is used, and a failed lookup is left for SendMessage, which
+// reads the same cache, to report.
+func (b *Bridge) reactionTargetParticipant(cli *whatsmeow.Client, ctx context.Context, chatJID, sender watypes.JID) watypes.JID {
+	if chatJID.Server != watypes.GroupServer || sender.Server != watypes.DefaultUserServer {
+		return sender
+	}
+	mode, err := groupAddressingMode(cli, ctx, chatJID)
+	if err != nil {
+		b.logger.Debug().Err(err).Str("chat", chatJID.String()).Msg("Failed to read WhatsApp group addressing for a reaction target")
+		return sender
+	}
+	if mode != watypes.AddressingModeLID {
+		return sender
+	}
+	if lid := b.lidForPhoneJID(cli, ctx, sender); !lid.IsEmpty() {
+		return lid
+	}
+	return sender
+}
+
+// lidForPhoneJID returns the LID whatsmeow maps a phone-number JID to, or the
+// empty JID. Like canonicalJID's reverse lookup, it falls back to the session
+// store's LID map.
+func (b *Bridge) lidForPhoneJID(cli *whatsmeow.Client, ctx context.Context, pn watypes.JID) watypes.JID {
+	pn = pn.ToNonAD()
+	if cli != nil && cli.Store != nil && cli.Store.LIDs != nil {
+		if lid, err := cli.Store.LIDs.GetLIDForPN(ctx, pn); err == nil && !lid.IsEmpty() {
+			return lid.ToNonAD()
+		}
+	}
+	if lid := b.lookupLIDFromSessionStore(pn.User); lid.User != "" {
+		return lid.ToNonAD()
+	}
+	return watypes.EmptyJID
 }
 
 func (b *Bridge) reactionTargetSenderJID(msg *db.Message, chatJID watypes.JID) watypes.JID {
