@@ -139,6 +139,8 @@ func TestGoogleSendStepErrorRetriesOnlyRefusedSends(t *testing.T) {
 		{errors.New("HTTP 500: internal error"), true},
 		{errors.New("HTTP 401: invalid authentication credentials"), false},
 		{errors.New("session cookie expired"), false},
+		{errors.New("rpc error: code = Unauthenticated"), false},
+		{errors.New("refresh auth token: status 401"), false},
 		{fmt.Errorf(ErrNotConnected), false},
 	} {
 		err := googleSendStepError(c.err)
