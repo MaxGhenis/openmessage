@@ -350,6 +350,13 @@ func TestSendReactionRequestNamesAGroupSenderByTheKeyItsMessageArrivedWith(t *te
 			author: reactionTestPhone,
 			want:   phoneJID,
 		},
+		{
+			name:   "hosted sender",
+			lids:   reactionTestLIDs{},
+			mode:   watypes.AddressingModeLID,
+			author: reactionTestPhone + "@hosted",
+			want:   reactionTestPhone + "@hosted",
+		},
 	}
 
 	for _, test := range tests {
@@ -427,12 +434,25 @@ func TestSendReactionRequestNamesADirectChatSenderOfEitherForm(t *testing.T) {
 	}
 }
 
-// A stored sender that is neither a JID nor a phone number names no member.
-// In a group the reaction is refused before anything is sent, like one with no
-// stored sender; before, it went out naming a participant no message has. In
-// a 1:1 chat the other party is the sender, as with no stored sender.
+// A stored sender that is neither a user's JID nor a phone number names no
+// member. In a group the reaction is refused before anything is sent, like one
+// with no stored sender; before, it went out naming a participant no message
+// has. That includes a chat's JID, which the history decoder stores as the
+// sender of a group message that names no participant. In a 1:1 chat the other
+// party is the sender, as with no stored sender.
 func TestSendReactionRequestRefusesAGroupSenderThatIsNotAJIDOrNumber(t *testing.T) {
-	for _, author := range []string{"@lid", reactionTestLID + "@", reactionTestLID + "@lid@s.whatsapp.net", "Me", "+", "+1-555-765-4321"} {
+	for _, author := range []string{
+		"@lid",
+		reactionTestLID + "@",
+		reactionTestLID + "@lid@s.whatsapp.net",
+		strings.TrimPrefix(reactionTestGroup, "whatsapp:"),
+		"status@broadcast",
+		"120363000000000000@newsletter",
+		reactionTestPhone + "@c.us",
+		"Me",
+		"+",
+		"+1-555-765-4321",
+	} {
 		t.Run(author, func(t *testing.T) {
 			transport := newReactionTestTransport(t)
 			_, err := reactionTestBridge(reactionTestLIDs{}).SendReactionRequest(
@@ -471,7 +491,8 @@ func TestSendReactionRequestRefusesAGroupSenderThatIsNotAJIDOrNumber(t *testing.
 }
 
 // TestSendReactionRequestGroupParticipantProperty checks the participant rule
-// over random senders, LID maps and group addressing. The key always names a
+// over random senders in the two forms ingest stores ("+<digits>" and
+// "<digits>@lid"), LID maps and group addressing. The key always names a
 // well-formed member JID (one "@", the phone-number or LID server, no device).
 // A stored LID is sent as stored. A stored phone number is sent as its LID
 // exactly when the group addresses members by LID and the LID is known, and as

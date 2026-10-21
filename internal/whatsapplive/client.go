@@ -4546,17 +4546,24 @@ func (b *Bridge) reactionRequestTargetSender(chatJID watypes.JID, authorID strin
 }
 
 // reactionTargetAuthorJID parses a v2 sender identity's canonical value: a
-// JID such as "<digits>@lid", the form ingest stores for a sender whose LID
-// had no known phone number, or an E.164 number ("+<digits>"), the form it
-// stores for a phone-number JID. Anything else names no one.
+// user's JID such as "<digits>@lid", the form live ingest stores for a sender
+// whose LID had no known phone number, or an E.164 number ("+<digits>"), the
+// form it stores for a phone-number JID. Anything else names no one,
+// including a chat's JID: the history decoder stores the group itself as the
+// sender of a group message that names no participant.
 func reactionTargetAuthorJID(authorID string) (watypes.JID, bool) {
 	authorID = strings.TrimSpace(authorID)
 	if strings.Contains(authorID, "@") {
 		jid, err := watypes.ParseJID(authorID)
-		if err != nil || strings.Count(authorID, "@") != 1 || jid.User == "" || jid.Server == "" {
+		if err != nil || strings.Count(authorID, "@") != 1 || jid.User == "" {
 			return watypes.EmptyJID, false
 		}
-		return jid.ToNonAD(), true
+		switch jid.Server {
+		case watypes.DefaultUserServer, watypes.HiddenUserServer, watypes.HostedServer, watypes.HostedLIDServer:
+			return jid.ToNonAD(), true
+		default:
+			return watypes.EmptyJID, false
+		}
 	}
 	number := strings.TrimPrefix(authorID, "+")
 	if number == "" {
@@ -4571,23 +4578,28 @@ func reactionTargetAuthorJID(authorID string) (watypes.JID, bool) {
 }
 
 // reactionTargetParticipant returns the sender a reaction names a group
-// message by. WhatsApp keys a group message by the sender it arrived from,
-// whatsmeow's MessageInfo.Sender (getKeyFromInfo puts it in a poll vote's key,
-// and requesting a message from the phone keys it the same way). That is the
-// member's LID when the message was addressed by LID (parseMessageSource
-// reads the participant attribute, and the phone number only into SenderAlt),
-// and its phone number otherwise.
+// message by: the form of the sender the message arrived with, which is the
+// form whatsmeow puts in the keys it builds for a received message
+// (getKeyFromInfo for a poll vote, the phone resend request), its
+// MessageInfo.Sender. That is the member's LID when the message was addressed
+// by LID (parseMessageSource reads the participant attribute, and the phone
+// number only into SenderAlt), and its phone number otherwise. whatsmeow's
+// message-secret lookup accepts a key's sender in either form (getMsgSecret,
+// decryptMsgSecret), so the other form may match too; this one is the form the
+// message carries.
 //
-// Ingest stores the phone number whenever the LID's number is known at
-// capture (canonicalJID), which whatsmeow records from SenderAlt before it
-// dispatches the message, so in a group that addresses members by LID a
-// stored phone number is mapped back to the LID. The group's addressing comes
-// from the cache SendMessage reads to choose the identity it sends with. A
-// stored LID is kept: ingest stores one only for a message addressed by LID,
-// so mapping it to a phone number (as canonicalJID would) names a key the
-// message never had. When the addressing or the number's LID is unknown, the
-// stored sender is used, and a failed lookup is left for SendMessage, which
-// reads the same cache, to report.
+// Live ingest and history sync store the phone number whenever the LID's
+// number is known (canonicalJID; whatsmeow records it from SenderAlt before it
+// dispatches the message), so in a group that addresses members by LID a
+// stored phone number is mapped back to the LID. The store does not record a
+// message's own addressing, so the group's current addressing stands in for
+// it, read from the cache SendMessage reads to choose the identity it sends
+// with; a message from before the group moved to LID addressing is named by
+// its LID too. A stored LID is kept: those paths store one only for a message
+// addressed by LID, so mapping it to a phone number (as canonicalJID would)
+// names a form the message never had. When the addressing or the number's LID
+// is unknown, the stored sender is used, and a failed lookup is left for
+// SendMessage, which reads the same cache, to report.
 func (b *Bridge) reactionTargetParticipant(cli *whatsmeow.Client, ctx context.Context, chatJID, sender watypes.JID) watypes.JID {
 	if chatJID.Server != watypes.GroupServer || sender.Server != watypes.DefaultUserServer {
 		return sender
