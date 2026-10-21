@@ -21,17 +21,27 @@ import (
 	"github.com/maxghenis/openmessage/internal/storage/sqlite"
 )
 
-// RunRepair handles "openmessage repair google-idspace ...".
+// RunRepair handles "openmessage repair google-idspace ..." and
+// "openmessage repair whatsapp-lid ...".
 //
-// The repair rewrites the v2 store, so it refuses to run while the daemon
-// holds the instance lock or answers on its API, and it copies the store
-// files aside before applying.
+// A repair rewrites the v2 store, so --apply refuses to run while the daemon
+// holds the instance lock or answers on its API, and copies the store files
+// aside first.
 func RunRepair(logger zerolog.Logger, args ...string) error {
-	if len(args) == 0 || args[0] != "google-idspace" {
+	target := ""
+	if len(args) > 0 {
+		target = args[0]
+	}
+	switch target {
+	case "google-idspace":
+		return runRepairGoogleIDSpace(context.Background(), logger, args[1:], os.Stdout, os.Stderr)
+	case "whatsapp-lid":
+		return runRepairWhatsAppLID(context.Background(), logger, args[1:], os.Stdout, os.Stderr)
+	default:
 		fmt.Fprintln(os.Stderr, "Usage: openmessage repair google-idspace --since <RFC3339|unix-ms> [--account google-primary] [--apply] [--json] [--report path]")
+		fmt.Fprintln(os.Stderr, "       openmessage repair whatsapp-lid [--account whatsapp-primary] [--session path|''] [--desktop-db path|''] [--desktop-lid-db path|''] [--apply] [--json] [--report path]")
 		return errors.New("repair: unknown target")
 	}
-	return runRepairGoogleIDSpace(context.Background(), logger, args[1:], os.Stdout, os.Stderr)
 }
 
 type repairOutput struct {
@@ -74,45 +84,11 @@ func runRepairGoogleIDSpace(ctx context.Context, logger zerolog.Logger, args []s
 	}
 
 	dataDir := app.DefaultDataDir()
-	storePath := filepath.Join(dataDir, "v2", "store.sqlite3")
-	if _, err := os.Stat(storePath); err != nil {
-		return fmt.Errorf("v2 store %q: %w", storePath, err)
-	}
-
-	var lock *instanceLock
-	if apply {
-		if !skipProbe && daemonAnswers(defaultBackendProbeURL()) {
-			return errors.New("the OpenMessage daemon is answering on its API; quit the app (park the watchdog first) before applying")
-		}
-		commit, _ := buildRevision()
-		lock, err = acquireInstanceLock(filepath.Join(dataDir, instanceLockName), instanceLockRecord{
-			PID:       os.Getpid(),
-			Process:   "openmessage repair google-idspace",
-			StartedAt: time.Now().UTC().Format(time.RFC3339),
-			Commit:    commit,
-		})
-		if err != nil {
-			if errors.Is(err, errInstanceLockHeld) {
-				return fmt.Errorf("another OpenMessage process holds the instance lock; quit the app before applying: %w", err)
-			}
-			return err
-		}
-		defer lock.Close()
-	}
-
-	// Only an exclusive owner migrates the store: --apply holds the instance
-	// lock and has checked the daemon is down. A dry run may run beside the
-	// app, and a migration's write lock would stall the daemon's writes.
-	var store *sqlite.Store
-	if apply {
-		store, err = sqlite.Open(storePath)
-	} else {
-		store, err = sqlite.OpenWithoutMigrating(storePath)
-	}
+	store, storePath, release, err := openRepairStore(dataDir, "openmessage repair google-idspace", apply, skipProbe)
 	if err != nil {
-		return fmt.Errorf("open v2 store: %w", clientStoreOpenError(err))
+		return err
 	}
-	defer store.Close()
+	defer release()
 	messages, err := sqlite.NewMessageRepository(store, time.Now)
 	if err != nil {
 		return err
@@ -143,9 +119,9 @@ func runRepairGoogleIDSpace(ctx context.Context, logger zerolog.Logger, args []s
 	output := repairOutput{OK: true, Report: &report}
 
 	if apply && len(report.Steps) > 0 {
-		backupDir := filepath.Join(dataDir, "v2", "repair-backups", time.Now().UTC().Format("20060102-150405"))
-		if err := copyStoreFiles(storePath, backupDir); err != nil {
-			return fmt.Errorf("back up v2 store before repair: %w", err)
+		backupDir, err := backupRepairStore(dataDir, storePath)
+		if err != nil {
+			return err
 		}
 		output.BackupDir = backupDir
 		if err := ingest.ApplyGoogleIDSpaceRepair(ctx, store, report, time.Now()); err != nil {
@@ -156,11 +132,7 @@ func runRepairGoogleIDSpace(ctx context.Context, logger zerolog.Logger, args []s
 	}
 
 	if reportPath != "" {
-		payload, err := json.MarshalIndent(output, "", "  ")
-		if err != nil {
-			return err
-		}
-		if err := os.WriteFile(reportPath, payload, 0o600); err != nil {
+		if err := writeRepairReport(reportPath, output); err != nil {
 			return err
 		}
 		output.ReportPath = reportPath
@@ -170,6 +142,74 @@ func runRepairGoogleIDSpace(ctx context.Context, logger zerolog.Logger, args []s
 	}
 	writeRepairSummary(stdout, output)
 	return nil
+}
+
+// openRepairStore opens the v2 store a repair plans over. Only an exclusive
+// owner migrates the store: with apply it first checks the daemon is down and
+// takes the instance lock, which release frees. A dry run may run beside the
+// app, and a migration's write lock would stall the daemon's writes, so it
+// opens the store without migrating.
+func openRepairStore(dataDir, process string, apply, skipProbe bool) (*sqlite.Store, string, func(), error) {
+	storePath := filepath.Join(dataDir, "v2", "store.sqlite3")
+	if _, err := os.Stat(storePath); err != nil {
+		return nil, "", nil, fmt.Errorf("v2 store %q: %w", storePath, err)
+	}
+	var lock *instanceLock
+	if apply {
+		if !skipProbe && daemonAnswers(defaultBackendProbeURL()) {
+			return nil, "", nil, errors.New("the OpenMessage daemon is answering on its API; quit the app (park the watchdog first) before applying")
+		}
+		commit, _ := buildRevision()
+		var err error
+		lock, err = acquireInstanceLock(filepath.Join(dataDir, instanceLockName), instanceLockRecord{
+			PID:       os.Getpid(),
+			Process:   process,
+			StartedAt: time.Now().UTC().Format(time.RFC3339),
+			Commit:    commit,
+		})
+		if err != nil {
+			if errors.Is(err, errInstanceLockHeld) {
+				return nil, "", nil, fmt.Errorf("another OpenMessage process holds the instance lock; quit the app before applying: %w", err)
+			}
+			return nil, "", nil, err
+		}
+	}
+	var store *sqlite.Store
+	var err error
+	if apply {
+		store, err = sqlite.Open(storePath)
+	} else {
+		store, err = sqlite.OpenWithoutMigrating(storePath)
+	}
+	if err != nil {
+		if lock != nil {
+			lock.Close()
+		}
+		return nil, "", nil, fmt.Errorf("open v2 store: %w", clientStoreOpenError(err))
+	}
+	return store, storePath, func() {
+		store.Close()
+		if lock != nil {
+			lock.Close()
+		}
+	}, nil
+}
+
+// backupRepairStore copies the store files to v2/repair-backups/<stamp>/.
+func backupRepairStore(dataDir, storePath string) (string, error) {
+	backupDir := filepath.Join(dataDir, "v2", "repair-backups", time.Now().UTC().Format("20060102-150405"))
+	if err := copyStoreFiles(storePath, backupDir); err != nil {
+		return "", fmt.Errorf("back up v2 store before repair: %w", err)
+	}
+	return backupDir, nil
+}
+
+func writeRepairReport(path string, output any) error {
+	payload, err := json.MarshalIndent(output, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, payload, 0o600)
 }
 
 func writeRepairSummary(w io.Writer, output repairOutput) {
