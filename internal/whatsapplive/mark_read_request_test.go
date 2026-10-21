@@ -330,6 +330,15 @@ func TestMarkReadRequestNamesAGroupSenderInTheFormItsMessagesArrivedWith(t *test
 			sender: lidJID,
 			want:   lidJID,
 		},
+		// A stored LID is never looked up as a phone number, even when its
+		// digits are some member's number.
+		{
+			name:   "LID sender whose digits are a known phone number",
+			lids:   senderTestLIDs{"11111111111111": senderTestLID},
+			mode:   watypes.AddressingModeLID,
+			sender: lidJID,
+			want:   lidJID,
+		},
 		{
 			name:   "LID sender in a group that now reads phone-number addressing",
 			lids:   senderTestLIDs{senderTestLID: senderTestPhone},
