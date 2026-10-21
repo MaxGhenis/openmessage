@@ -1617,6 +1617,35 @@ poll — a crash loop that flaps the Signal `connected` flag every few seconds a
 makes the whole UI flicker. `brew upgrade signal-cli` fixes it. (PR #41 also
 hardened the UI to ignore redundant status pushes.)
 
+### Re-linking Signal (QR)
+
+- **Each QR lives about 90 seconds** (observed 2026-10-21: `signal-cli
+  --verbose link` logged `[ProvisioningSocket] … onClosing … reason: Timeout`
+  90 s after start), and signal-cli then prints "Link request timed out,
+  please try again." Have the phone on Settings → Linked devices → Link new
+  device *before* the QR appears. Observed the same day: a phone that scanned
+  an expired QR reported a network error. Per Signal Android's
+  `LinkDeviceViewModel`, a phone whose link message is accepted but whose new
+  device never appears waits 30 s, then closes the dialog without an error.
+- **A fresh link prints a stderr line before its JSON.** Until the account's
+  first receive, signal-cli's `last-receive-timestamp` is 0 and every command
+  that loads the account logs `INFO AccountHelper - The Signal protocol expects that incoming
+  messages are regularly received.`; after 7 days without a receive it logs a
+  `WARN … Messages have been last received N days ago` instead
+  (`AccountHelper.checkAccountState`). The account probe reads CombinedOutput,
+  so before the line-wise decode it parsed neither buffer: the post-link probe
+  found no account, the link "failed" right after a good scan, and the status
+  showed `last_error: "Associated with: +1…"` with `paired: true,
+  connected: false`. On a build without that fix, unblock a fresh link by
+  setting the timestamp, with no signal-cli running on that config dir:
+  `sqlite3 <datadir>/signal-cli/data/<path>.d/account.db "INSERT INTO key_value
+  (key, value) VALUES ('last-receive-timestamp', <now ms>) ON CONFLICT(key) DO
+  UPDATE SET value=excluded.value;"`, then `POST /api/signal/connect`.
+- **Restore media after a re-link.** Unpair removes the whole `signal-cli/`
+  dir. Clone the backup's `attachments/ avatars/ stickers/
+  outgoing-attachments/` back with `cp -R -n -c -p` (APFS clones; no
+  overwrite of what the new link wrote), never `data/`.
+
 ### Signal `needs_reauth` — read the fingerprint before believing the park
 
 `needs_reauth: true` is the bridge's **interpretation** of a signal-cli error,
