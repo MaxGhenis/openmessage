@@ -1908,10 +1908,10 @@ reaction whose target cannot be named (above), which keeps retrying, this one
 is not retried: if the message is later stored with its sender, react again.
 In a group, a stored sender that is neither a sender's JID (on the
 phone-number, LID, hosted or bot server) nor a phone number (digits, with or
-without a leading `+`) is refused the same way; that includes the group's own JID, which the
-history decoder stores as the sender of a group message that names no
-participant. In a 1:1 chat such a sender is replaced by the chat, as a missing
-one is.
+without a leading `+`) is refused the same way; that includes the group's own
+JID, which the history decoder stores as the sender of a group message that
+names no participant. In a 1:1 chat such a sender is replaced by the chat, as
+a missing one is.
 
 In a group the sender is sent in the form the message arrived with, the form
 whatsmeow puts in the keys it builds for a received message
@@ -1934,8 +1934,9 @@ group it cannot read, as before). Before, a stored LID went out as
 `<digits>@lid@s.whatsapp.net`, which names no member, and a stored phone number
 went out as the phone number in a LID group. whatsmeow's own message-secret
 lookup accepts a key's sender in either form, so the phone number may have
-matched too; the LID is the form the message carries. 1:1 chats were never
-affected: whatsmeow puts no participant in a 1:1 message's key.
+matched too; the LID is the form the message carries. 1:1 chats with a phone
+number or a LID were never affected: whatsmeow puts no participant in their
+messages' keys (a chat on any other server, such as a bot's, does get one).
 
 Messages migrated from the legacy store, or imported from WhatsApp Desktop, can
 name a LID sender by the LID's digits as a phone number (`+<lid digits>`): the
