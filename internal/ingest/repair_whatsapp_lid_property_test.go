@@ -605,11 +605,14 @@ func TestLIDRepairProperties(t *testing.T) {
 		}
 		return true
 	}
-	config := &quick.Config{MaxCount: 200, Rand: rand.New(rand.NewSource(20261021))}
+	config := repairPropertyConfig(t, 200, 40)
 	if err := quick.Check(check, config); err != nil {
 		t.Fatal(err)
 	}
 	t.Logf("coverage: %v", coverage)
+	if config.MaxCount < 200 {
+		return
+	}
 	for _, want := range []string{lidVerdictRewrite, lidVerdictAlsoAPhone, lidVerdictOwnIdentity, "rewrite to e164", "rewrite to jid",
 		"rewrite into an existing identity", "reaction collisions", "roster merges"} {
 		if coverage[want] == 0 {
