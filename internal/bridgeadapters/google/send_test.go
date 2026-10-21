@@ -983,37 +983,42 @@ func TestSendMediaPreDispatchTransportFailuresAreClassifiedNotCalled(t *testing.
 		configure   func(*fakeMediaSendClient)
 		wantClass   bridge.FailureClass
 		fingerprint string
+		// noUpload: the lookup, which comes first, failed, so nothing was
+		// uploaded.
+		noUpload bool
 	}{
 		{
 			name: "upload",
 			configure: func(fake *fakeMediaSendClient) {
+				fake.conversationResult = &gmproto.Conversation{}
 				fake.uploadErr = errors.New("upload unavailable")
 			},
 			wantClass:   bridge.FailureTransient,
 			fingerprint: "google_media_upload_failed",
 		},
 		{
-			name:        "nil upload result",
-			configure:   func(*fakeMediaSendClient) {},
+			name: "nil upload result",
+			configure: func(fake *fakeMediaSendClient) {
+				fake.conversationResult = &gmproto.Conversation{}
+			},
 			wantClass:   bridge.FailureTransient,
 			fingerprint: "google_media_upload_failed",
 		},
 		{
-			name: "nil conversation result",
-			configure: func(fake *fakeMediaSendClient) {
-				fake.uploadResult = &gmproto.MediaContent{MediaID: "media-id"}
-			},
+			name:        "nil conversation result",
+			configure:   func(*fakeMediaSendClient) {},
 			wantClass:   bridge.FailureTransient,
 			fingerprint: "google_conversation_get_failed",
+			noUpload:    true,
 		},
 		{
 			name: "conversation auth expiry",
 			configure: func(fake *fakeMediaSendClient) {
-				fake.uploadResult = &gmproto.MediaContent{MediaID: "media-id"}
 				fake.conversationErr = errors.New("HTTP 401: invalid authentication credentials")
 			},
 			wantClass:   bridge.FailureCredentialsExpired,
 			fingerprint: "google_auth_expired",
+			noUpload:    true,
 		},
 	}
 
@@ -1034,6 +1039,9 @@ func TestSendMediaPreDispatchTransportFailuresAreClassifiedNotCalled(t *testing.
 			}
 			if len(fake.sent) != 0 {
 				t.Fatalf("SendMessage calls = %d, want 0", len(fake.sent))
+			}
+			if test.noUpload && fake.uploadCalls != 0 {
+				t.Fatalf("UploadMedia calls = %d after a failed lookup, want 0", fake.uploadCalls)
 			}
 		})
 	}

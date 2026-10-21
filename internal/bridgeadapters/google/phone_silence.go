@@ -21,8 +21,8 @@ import (
 // A conversation lookup that times out is safe to retry: every Google send
 // looks the conversation up before it sends anything. But the outbox retries a
 // not-dispatched failure every 5 s with no cap, so while the phone stays silent
-// one queued intent would hold the loop for 45 s of every 50, and each further
-// queued Google intent would add its own 45 s to every round.
+// one queued intent would hold the loop almost all the time, and each further
+// queued Google intent would add its own timeout to every round.
 //
 // phoneSilence spaces those holds out:
 //
@@ -39,18 +39,26 @@ import (
 //     answered something else since that intent's previous unanswered lookup,
 //     the lookup itself is what goes unanswered, so its own delay doubles too
 //     (same schedule): it can't be the probe every time and hold the loop
-//     while the phone answers everything else. While the phone is wholly
-//     silent the account's window does the spacing, and each intent's own
-//     delay stays at the base, so it goes out soon after the phone is back.
-//   - Any answered request, or libgm reporting that the phone is responding
-//     again (its pinger keeps probing in the background), reopens the gate.
+//     while the phone answers everything else. After phoneSilenceMaxStuck
+//     such lookups the intent is refused (nothing was sent), rather than
+//     retried for ever. While the phone is wholly silent the account's window
+//     does the spacing and each intent's own delay stays at the base, so it
+//     goes out soon after the phone is back.
+//   - An answer to a send-path request (lookup, send, reaction, read receipt),
+//     libgm reporting that the phone is responding again (its pinger keeps
+//     probing in the background), or a new Google generation reopens the gate.
 const (
 	phoneSilenceBaseBackoff = 30 * time.Second
 	phoneSilenceMaxBackoff  = 5 * time.Minute
 	phoneSilenceRecheck     = 30 * time.Second
+	// phoneSilenceMaxStuck is how many times one intent's lookup may go
+	// unanswered, the first time and then each time after the phone answered
+	// something else, before the intent is refused.
+	phoneSilenceMaxStuck = 6
 	// phoneSilenceMaxIntents bounds the per-intent backoff table. Entries
-	// leave it when their lookup is answered or fails another way; this only
-	// matters for intents that stop being retried while still in it.
+	// leave it when their lookup is answered, fails another way or is
+	// refused; this only matters for intents that stop being retried while
+	// still in it.
 	phoneSilenceMaxIntents = 256
 )
 
@@ -72,11 +80,25 @@ type phoneSilence struct {
 }
 
 type silentIntent struct {
-	// unanswered counts this intent's unanswered lookups that each followed
-	// an answer to some other request.
+	// unanswered counts this intent's unanswered lookups: the first, and each
+	// later one that followed an answer to some other request.
 	unanswered int
 	answers    uint64 // answers when its last lookup went unanswered
 	lastAt     time.Time
+}
+
+// silenceRecord is what recordUnanswered decided.
+type silenceRecord struct {
+	// Since is when this silence began, Until when its window ends, and
+	// Unanswered the number of consecutive unanswered requests.
+	Since      time.Time
+	Until      time.Time
+	Unanswered int
+	// RetryAt is when the intent may retry: Until for a request recorded
+	// without an intent, later for a lookup, zero when Stuck.
+	RetryAt time.Time
+	// Stuck reports a lookup refused after phoneSilenceMaxStuck tries.
+	Stuck bool
 }
 
 // phoneSilenceBackoff is the wait after the given number of consecutive
@@ -116,12 +138,11 @@ func (p *phoneSilence) held() (since, retryAt time.Time, ok bool) {
 	return p.since, retryAt, true
 }
 
-// recordUnanswered closes the gate after a request the phone did not answer
-// and returns when the next request may go out. A lookup passes its intent's
-// transport request ID, and gets back a retry time past the account's window
-// by the intent's own delay. A request that will not be retried (a send, a
-// read receipt) passes "".
-func (p *phoneSilence) recordUnanswered(requestID string) time.Time {
+// recordUnanswered closes the gate after a request the phone did not answer.
+// A lookup passes its intent's transport request ID and is given a retry time
+// past the window by the intent's own delay, or is refused as stuck. A request
+// that will not be retried (a send, a read receipt) passes "".
+func (p *phoneSilence) recordUnanswered(requestID string) silenceRecord {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	now := p.clock()
@@ -130,8 +151,9 @@ func (p *phoneSilence) recordUnanswered(requestID string) time.Time {
 	}
 	p.unanswered++
 	p.until = now.Add(phoneSilenceBackoff(p.unanswered))
+	record := silenceRecord{Since: p.since, Until: p.until, Unanswered: p.unanswered, RetryAt: p.until}
 	if requestID == "" {
-		return p.until
+		return record
 	}
 	if p.intents == nil {
 		p.intents = make(map[string]*silentIntent)
@@ -145,9 +167,16 @@ func (p *phoneSilence) recordUnanswered(requestID string) time.Time {
 	case p.answers != intent.answers:
 		intent.unanswered++
 	}
+	if intent.unanswered >= phoneSilenceMaxStuck {
+		delete(p.intents, requestID)
+		record.Stuck = true
+		record.RetryAt = time.Time{}
+		return record
+	}
 	intent.answers = p.answers
 	intent.lastAt = now
-	return p.until.Add(phoneSilenceBackoff(intent.unanswered))
+	record.RetryAt = p.until.Add(phoneSilenceBackoff(intent.unanswered))
+	return record
 }
 
 func (p *phoneSilence) evictOldestIntentLocked() {
@@ -164,14 +193,14 @@ func (p *phoneSilence) evictOldestIntentLocked() {
 	delete(p.intents, oldestID)
 }
 
-// recordAnswered reopens the gate after the phone answered a request. A
-// lookup passes its intent's transport request ID, which also clears that
-// intent's own backoff.
-func (p *phoneSilence) recordAnswered(requestID string) {
+// recordAnswered reopens the gate after the phone answered a request, and
+// reports whether the phone had been silent until then. A lookup passes its
+// intent's transport request ID, which also clears that intent's own backoff.
+func (p *phoneSilence) recordAnswered(requestID string) (wasSilent bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.reopenLocked()
 	delete(p.intents, requestID)
+	return p.reopenLocked()
 }
 
 // forget clears an intent's own backoff after its lookup failed for a reason
@@ -182,19 +211,22 @@ func (p *phoneSilence) forget(requestID string) {
 	delete(p.intents, requestID)
 }
 
-// reopen opens the gate when libgm reports the phone responding again. Each
+// reopen opens the gate when libgm reports the phone responding again or a
+// new generation starts, and reports whether the phone had been silent. Each
 // intent keeps its own backoff: its retry is already scheduled.
-func (p *phoneSilence) reopen() {
+func (p *phoneSilence) reopen() (wasSilent bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.reopenLocked()
+	return p.reopenLocked()
 }
 
-func (p *phoneSilence) reopenLocked() {
+func (p *phoneSilence) reopenLocked() bool {
+	wasSilent := p.unanswered > 0
 	p.since = time.Time{}
 	p.until = time.Time{}
 	p.unanswered = 0
 	p.answers++
+	return wasSilent
 }
 
 // phoneHeldError is the failure for an intent held while the phone is silent:
@@ -207,7 +239,7 @@ func phoneHeldError(operation string, since, retryAt time.Time) bridge.OpError {
 		Fingerprint: "google_phone_not_answering",
 		Dispatch:    bridge.DispatchNotCalled,
 		Cause: fmt.Errorf(
-			"Google Messages: the phone has not answered since %s; held until %s",
+			"google_phone_not_answering: the phone has not answered since %s; held until %s",
 			since.UTC().Format(time.RFC3339),
 			retryAt.UTC().Format(time.RFC3339),
 		),
@@ -225,18 +257,63 @@ func (a *Adapter) holdIfPhoneSilent(operation string) *bridge.OpError {
 	return &failure
 }
 
+// phoneUnanswered records a send-path request the phone did not answer and
+// logs the hold it starts (once per probe window: requests in between are
+// held before they reach the phone).
+func (a *Adapter) phoneUnanswered(operation, requestID string) silenceRecord {
+	record := a.silence.recordUnanswered(requestID)
+	if a.host != nil {
+		a.host.Logger.Warn().
+			Str("operation", operation).
+			Int("unanswered", record.Unanswered).
+			Time("silent_since", record.Since).
+			Time("held_until", record.Until).
+			Bool("lookup_refused", record.Stuck).
+			Msg("Google Messages phone did not answer; holding Google sends until the next probe")
+	}
+	return record
+}
+
+// phoneAnswered records an answered send-path request and logs the end of a
+// silence.
+func (a *Adapter) phoneAnswered(requestID string) {
+	if a.silence.recordAnswered(requestID) && a.host != nil {
+		a.host.Logger.Info().Msg("Google Messages phone answered again; releasing held Google sends")
+	}
+}
+
+// phoneRecovered reopens the gate on a recovery signal, logging the end of a
+// silence.
+func (a *Adapter) phoneRecovered(reason string) {
+	if a.silence.reopen() && a.host != nil {
+		a.host.Logger.Info().Str("reason", reason).Msg("Google Messages phone may be back; releasing held Google sends")
+	}
+}
+
 // classifyLookup records what a failed conversation lookup says about the
 // phone and adjusts its failure. A lookup the phone did not answer sent
 // nothing, so it stays retryable (DispatchNotCalled), at the time the silence
-// backoff allows.
+// backoff allows. One that keeps going unanswered while the phone answers
+// other requests is refused, still as not sent.
 func (a *Adapter) classifyLookup(failure bridge.OpError, err error, requestID string) bridge.OpError {
 	if !errors.Is(err, libgm.ErrPhoneNotResponding) {
 		a.silence.forget(requestID)
 		return failure
 	}
-	failure.Fingerprint = "google_conversation_get_unanswered"
+	record := a.phoneUnanswered(failure.Operation, requestID)
 	failure.Dispatch = bridge.DispatchNotCalled
-	failure.RetryAt = a.silence.recordUnanswered(requestID)
+	if record.Stuck {
+		failure.Class = bridge.FailureUnsupported
+		failure.Fingerprint = "google_conversation_get_never_answered"
+		failure.Cause = fmt.Errorf(
+			"google_conversation_get_never_answered: the phone answered other requests but left this conversation's lookup unanswered %d times; nothing was sent: %w",
+			phoneSilenceMaxStuck, failure.Cause,
+		)
+		return failure
+	}
+	failure.Fingerprint = "google_conversation_get_unanswered"
+	failure.Cause = fmt.Errorf("google_conversation_get_unanswered: %w", failure.Cause)
+	failure.RetryAt = record.RetryAt
 	return failure
 }
 
@@ -246,7 +323,7 @@ func (a *Adapter) classifyLookup(failure bridge.OpError, err error, requestID st
 // sent again. A send the phone did not answer also closes the gate.
 func (a *Adapter) classifyUnansweredSend(failure bridge.OpError, err error) bridge.OpError {
 	if errors.Is(err, libgm.ErrPhoneNotResponding) {
-		a.silence.recordUnanswered("")
+		a.phoneUnanswered(failure.Operation, "")
 		failure.Dispatch = bridge.DispatchUncertain
 	} else if errors.Is(err, libgm.ErrConnectionClosed) {
 		failure.Dispatch = bridge.DispatchUncertain

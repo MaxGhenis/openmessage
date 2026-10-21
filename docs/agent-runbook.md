@@ -138,18 +138,23 @@ blocked.
 
 **Fix, in two layers.**
 
-1. **libgm gives up after 45 s** (`client.RequestTimeout`, set on every libgm
-   client OpenMessage builds; the fork's own default is 60 s). See "Requests
-   the phone never answers" for the patch. The Google adapter classifies the
-   failure, because it knows whether anything was sent:
+1. **libgm gives up after 35 s** (`client.RequestTimeout`, set on every libgm
+   client OpenMessage builds; the fork's own default is 60 s). The wait starts
+   once the request has been sent, and the fork's HTTP client allows 20 s for
+   the response headers, so 35 s keeps an unanswered lookup inside the
+   dispatcher's 60 s bound. See "Requests the phone never answers" for the
+   patch. The Google adapter classifies the failure, because it knows whether
+   anything was sent:
    - The conversation lookup that every Google send, reaction and media send
-     makes first: nothing was sent, so the intent stays retryable
-     (`not_dispatched`, fingerprint `google_conversation_get_unanswered`).
+     makes first (media looks up before it uploads): nothing was sent, so the
+     intent stays retryable (`not_dispatched`).
    - The send, reaction, media send or caption itself, and a read receipt:
      the phone may still act on it, so it becomes `uncertain` and is never
-     sent again. A send cut off by a disconnect is `uncertain` too. A read
-     receipt cut off by a disconnect stays retryable, since repeating it
-     costs nothing.
+     sent again. If the phone does send it, its echo confirms the row. A send
+     cut off by a disconnect is `uncertain` too. A read receipt cut off by a
+     disconnect stays retryable, since repeating it costs nothing.
+   - If the dispatcher gave up on the call while the lookup or upload ran, the
+     adapter stops there and sends nothing.
 2. **Each transport call (text, media, reaction, read receipt; any platform)
    has a hard bound in the dispatcher:** 60 s, or 5 minutes for media, whose
    call includes the upload. It is the backstop for what libgm's bound can't
@@ -159,43 +164,66 @@ blocked.
    loop moves on. Nothing retries an uncertain intent, because the request may
    have reached the phone; the user can send it again. The abandoned call's
    goroutine, and its dispatch lease and media reader, live until the
-   transport returns, which for Google is now at most libgm's 45 s per
-   request. At shutdown a canceled call gets 2 s to return its own result
-   before it is abandoned the same way.
+   transport returns; for Google that is now at most 35 s after its last
+   request was sent. At shutdown a canceled call gets 2 s to return its own
+   result before it is abandoned the same way.
 
 **A silent phone holds the loop once per window, not once per retry.** One
 loop serves every account, so each unanswered Google request holds every other
-intent, on any platform, for up to 45 s. The outbox retries a `not_dispatched`
-intent every 5 s with no cap, so without more, a retried lookup would hold the
-loop 45 s of every 50, and every queued Google intent would add its own 45 s
-to each round. The Google adapter therefore holds its intents while the phone
-is silent (`internal/bridgeadapters/google/phone_silence.go`):
+intent, on any platform, for the whole timeout. The outbox retries a
+`not_dispatched` intent every 5 s with no cap, so without more, a retried
+lookup would keep the loop waiting on the phone almost all the time, and every
+queued Google intent would add its own timeout to each round. The Google
+adapter therefore holds its intents while the phone is silent
+(`internal/bridgeadapters/google/phone_silence.go`):
 
 - After any send-path request goes unanswered, every Google intent on that
   account (text, media, reaction, read receipt) fails at once without reaching
-  the phone. It is `not_dispatched`, fingerprint `google_phone_not_answering`,
-  and is retried within 30 s, or when the window ends if sooner. Media is
-  neither read nor uploaded.
+  the phone. It stays `not_dispatched` and is retried within 30 s, or when the
+  window ends if sooner. Media is neither read nor uploaded.
 - The first intent due after the window probes the phone. The window is 30 s
   after the first unanswered request and doubles with each one after it, to
-  at most 5 minutes. An hour of silence costs about 15 holds, not hundreds.
+  at most 5 minutes. A test with libgm's timing and seven queued Google
+  intents measures an hour of silence at 13 phone requests, with the loop
+  waiting on the phone 13% of the hour; without the hold it waits almost the
+  whole hour. A read receipt that happens to be the probe becomes `uncertain`
+  (see above), so a long silence can drop about one queued receipt per window.
 - A lookup that goes unanswered is retried a little after the window ends, so
   the intents held meanwhile probe first. If the phone answered something
   else since that intent's previous unanswered lookup, its own delay doubles
   too, so one lookup the phone never answers can't hold the loop at every
-  window while everything else goes through.
-- Any answered request ends the hold, and so does libgm's pinger reporting
-  the phone responding again (`Phone responding again` in the log). After
-  that, held intents go out within 30 s. An intent whose own lookup went
-  unanswered goes at the retry it was given then, after the window.
+  window while everything else goes through. Its sixth such lookup refuses
+  the intent (`rejected`, class `unsupported`; nothing was sent), rather than
+  retrying it for ever.
+- An answer to a send-path request (a lookup, send, reaction or read receipt)
+  ends the hold. So do libgm's pinger reporting the phone responding again
+  (`Phone responding again` in the log) and a new Google generation (a
+  reconnect or re-pair). After that, held intents go out within 30 s. An
+  intent whose own lookup went unanswered goes at the retry it was given
+  then, after the window. Catch-up and backfill answers don't end the hold.
+
+What you see while the phone is silent:
+
+- The backend log has the warning `Google Messages phone did not answer;
+  holding Google sends until the next probe`, with `held_until`, once per
+  window; os_log keeps warnings, so `log show` finds it afterwards. The end
+  of a hold is logged at info (`... releasing held Google sends`), which only
+  `log stream` sees.
+- `GET /api/v1/outbox` lists the held intents as `not_dispatched`, with
+  `error_class` `transient` and `error_code` the operation (`send_text`,
+  `send_media`, `send_reaction`, `mark_read`). `next_attempt_at_ms` is at most
+  30 s out, and `attempt_count` climbs by about 100 an hour, since each held
+  recheck counts as an attempt. The stored error text (`error_detail`, which
+  the API doesn't return) begins `google_phone_not_answering:` for a held
+  intent and `google_conversation_get_unanswered:` for an unanswered lookup.
 
 `/api/status` `v2_dispatch` shows the loop's calls: `in_flight` (`outbox_id`,
 `account_id`, `operation`, `started_at_ms`, `elapsed_ms`, `timeout_ms`) while
 one is out, plus `abandoned_calls`, `abandoned_still_running` and
 `last_abandoned` (`reason` `timeout` or `shutdown`). An
-`abandoned_still_running` that keeps growing means the platform is not
-answering at all. A queued Google intent whose last error is
-`google_phone_not_answering` is waiting out a silent phone, not stuck.
+`abandoned_still_running` that keeps growing means a platform is not
+returning at all. For Google, libgm now ends an abandoned call within its
+35 s timeout, so that count falls back on its own.
 
 **On a build without the fix:** quit and reopen the app. Startup lease recovery
 marks the stuck row `uncertain` (its call was made, so it is not resent) and
@@ -530,7 +558,7 @@ can be recovered until that is fixed.
 
 libgm (the fork's third carried patch) gives up on a request the phone hasn't
 answered within its request timeout. Its default (`libgm.DefaultRequestTimeout`)
-is 60 s; OpenMessage sets 45 s on every client it builds
+is 60 s; OpenMessage sets 35 s on every client it builds
 (`client.RequestTimeout`), inside the outbox's 60 s bound on a transport call.
 The timeout starts once the request has been sent. It also fails every
 request still waiting when the client disconnects, which happens on unpair, on
@@ -545,28 +573,31 @@ was refused (`backfill already running`).
   request in the same run fails at once without reaching the phone, with
   `skipped: an earlier request in this Google catch-up got no answer`
   wrapping the first error. A run against a silent phone therefore ends about
-  45 s after its first unanswered request and releases the guard.
+  35 s after its first unanswered request and releases the guard.
   - Startup, deep and window backfills count each skipped fetch in
     `/api/backfill/status` `errors` / `error_details`.
   - The recent reconcile and the pending-media refresh log it.
   - Run a backfill again once the phone answers. When the ditto pinger sees
     the phone respond again, it starts a recent reconcile on its own
     (`phone_responding_again`).
-- **Sends.** A send the phone never answers now fails after 45 s instead of
-  sitting in `dispatching` until a restart. The server had already accepted
-  it, so the phone may still deliver it: the outbox records it as
-  `uncertain` and never sends it again. The legacy HTTP send keeps its
-  idempotency claim, so a retry with the same key gets 409. A timed-out
-  conversation lookup before a send has no effect on the phone and stays
-  retryable; while the phone stays silent, Google intents are held so the
-  dispatch loop is asked to wait at most once per window (see "Every send
-  stuck behind one that never returned").
+- **Sends.** A send the phone never answers now fails after 35 s, in the
+  Google adapter, instead of being abandoned by the dispatcher's 60 s bound.
+  The server had already accepted it, so the phone may still deliver it: the
+  outbox records it as `uncertain` and never sends it again. The legacy HTTP
+  send keeps its idempotency claim, so a retry with the same key gets 409.
+  The legacy scheduler (legacy-primary daemons) marks such a scheduled SMS
+  `failed`, noting it may have gone out, instead of re-sending it with a new
+  TmpID. A timed-out conversation lookup before a send has no effect on the
+  phone and stays retryable, in the scheduler too. While the phone stays
+  silent, outbox intents are held, so the dispatch loop waits on the phone
+  at most once per window (see "Every send stuck behind one that never
+  returned").
 - **What you see.**
   - libgm logs `Phone did not answer the request in time; giving up on it`
     with `request_action` and `timeout`.
   - A timed-out INBOX listing shows in `google.pull_health` as
     `last_outcome: error` with `last_error` ending
-    `phone did not respond to request after 45s`.
+    `phone did not respond to request after 35s`.
   - A request the phone answered only with the Google-account notice still
     fails as `no_payload` (see "Pulls that return nothing"), even when the
     timeout cuts it off.
@@ -1478,7 +1509,7 @@ Without it, a single transient network blip during a scheduled token refresh
 permanently killed the session.
 
 The replacement in `go.mod` pins fork commit
-[`1055c990a942`](https://github.com/MaxGhenis/gmessages/commit/1055c990a942e269cb92b7d6f4f47142ba1eae00).
+[`6495a585293d`](https://github.com/MaxGhenis/gmessages/commit/6495a585293d59a48984c50d63c8c4c11b425877).
 It is upstream `mautrix/gmessages` base
 [`3433cc07d5ea`](https://github.com/mautrix/gmessages/commit/3433cc07d5ea9522309adad3a8c92ed5b08dc11d),
 which contains the auth-refresh retry, plus three carried patches, oldest first:
@@ -1496,7 +1527,7 @@ which contains the auth-refresh retry, plus three carried patches, oldest first:
 3. `libgm: fail phone requests after a hard timeout and on disconnect`
    ([MaxGhenis/gmessages#1](https://github.com/MaxGhenis/gmessages/pull/1)).
    A request the phone doesn't answer within its request timeout
-   (`DefaultRequestTimeout`, 60 s; OpenMessage sets 45 s with
+   (`DefaultRequestTimeout`, 60 s; OpenMessage sets 35 s with
    `Client.SetRequestTimeout`) fails with `libgm.ErrPhoneNotResponding`; a
    late answer is logged (`Received response with no pending request`) and
    dropped.

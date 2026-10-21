@@ -195,7 +195,12 @@ func (a *Adapter) SendText(
 		)
 		return bridge.SendResult{}, a.classifyLookup(failure, err, req.RequestID)
 	}
-	a.silence.recordAnswered(req.RequestID)
+	a.phoneAnswered(req.RequestID)
+	if err := ctx.Err(); err != nil {
+		// The dispatcher gave up on this call while the lookup ran: nothing
+		// has been sent, so don't send now.
+		return bridge.SendResult{}, preDispatchTextError("google_text_context_done", err)
+	}
 	if conversation == nil {
 		failure := a.classifyTextTransportError(
 			errors.New("get Google conversation: transport returned no conversation"),
@@ -234,7 +239,7 @@ func (a *Adapter) SendText(
 		)
 		return bridge.SendResult{}, failure
 	}
-	a.silence.recordAnswered("")
+	a.phoneAnswered("")
 	if response.GetStatus() != gmproto.SendMessageResponse_SUCCESS {
 		// A rejected status proves the connection is healthy enough to respond;
 		// this must not touch the receive lifecycle.
@@ -295,7 +300,12 @@ func (a *Adapter) SendReaction(
 		)
 		return bridge.SendResult{}, a.classifyLookup(failure, err, req.RequestID)
 	}
-	a.silence.recordAnswered(req.RequestID)
+	a.phoneAnswered(req.RequestID)
+	if err := ctx.Err(); err != nil {
+		// The dispatcher gave up on this call while the lookup ran: nothing
+		// has been sent, so don't send now.
+		return bridge.SendResult{}, preDispatchReactionError("google_reaction_context_done", err)
+	}
 	if conversation == nil {
 		failure := a.classifyReactionTransportError(
 			errors.New("get Google conversation: transport returned no conversation"),
@@ -332,7 +342,7 @@ func (a *Adapter) SendReaction(
 			Cause:       errors.New("send Google reaction: transport returned no response"),
 		}
 	}
-	a.silence.recordAnswered("")
+	a.phoneAnswered("")
 	if !response.GetSuccess() && req.Target.ProvisionalRemoteID {
 		// The target is this account's message still named by its send's
 		// request ID. The phone may know it only by its own ID, which the
@@ -407,12 +417,12 @@ func (a *Adapter) MarkRead(ctx context.Context, req bridge.ReadReceiptRequest) e
 			// The receipt may have reached the phone, and retrying it would
 			// hold the dispatch loop for another full timeout, so it is not
 			// retried (the same call the dispatcher's own bound makes).
-			a.silence.recordUnanswered("")
+			a.phoneUnanswered("mark_read", "")
 			failure.Dispatch = bridge.DispatchUncertain
 		}
 		return failure
 	}
-	a.silence.recordAnswered("")
+	a.phoneAnswered("")
 	return nil
 }
 
@@ -523,6 +533,29 @@ func (a *Adapter) SendMedia(
 		)
 	}
 
+	// Look the conversation up before uploading: a phone that doesn't answer
+	// the lookup then costs no upload, however often the intent probes it.
+	conversation, err := transport.GetConversation(req.Conversation.RemoteID)
+	if err != nil {
+		failure := a.classifyMediaTransportError(
+			fmt.Errorf("get Google conversation: %w", err),
+			"google_conversation_get_failed",
+			bridge.DispatchNotCalled,
+		)
+		return bridge.SendResult{}, a.classifyLookup(failure, err, req.RequestID)
+	}
+	a.phoneAnswered(req.RequestID)
+	if conversation == nil {
+		failure := a.classifyMediaTransportError(
+			errors.New("get Google conversation: transport returned no conversation"),
+			"google_conversation_get_failed",
+			bridge.DispatchNotCalled,
+		)
+		return bridge.SendResult{}, failure
+	}
+	if err := ctx.Err(); err != nil {
+		return bridge.SendResult{}, preDispatchMediaError("google_media_context_done", err)
+	}
 	media, err := transport.UploadMedia(data, req.Filename, req.MIME)
 	if err != nil {
 		failure := a.classifyMediaTransportError(
@@ -540,23 +573,10 @@ func (a *Adapter) SendMedia(
 		)
 		return bridge.SendResult{}, failure
 	}
-	conversation, err := transport.GetConversation(req.Conversation.RemoteID)
-	if err != nil {
-		failure := a.classifyMediaTransportError(
-			fmt.Errorf("get Google conversation: %w", err),
-			"google_conversation_get_failed",
-			bridge.DispatchNotCalled,
-		)
-		return bridge.SendResult{}, a.classifyLookup(failure, err, req.RequestID)
-	}
-	a.silence.recordAnswered(req.RequestID)
-	if conversation == nil {
-		failure := a.classifyMediaTransportError(
-			errors.New("get Google conversation: transport returned no conversation"),
-			"google_conversation_get_failed",
-			bridge.DispatchNotCalled,
-		)
-		return bridge.SendResult{}, failure
+	if err := ctx.Err(); err != nil {
+		// The dispatcher gave up on this call during the lookup or upload:
+		// nothing has been sent, so don't send now.
+		return bridge.SendResult{}, preDispatchMediaError("google_media_context_done", err)
 	}
 	participantID, sim := app.ExtractSIMAndParticipant(conversation)
 	payload := app.BuildSendMediaPayloadWithTmpID(
@@ -583,7 +603,7 @@ func (a *Adapter) SendMedia(
 		)
 		return bridge.SendResult{}, failure
 	}
-	a.silence.recordAnswered("")
+	a.phoneAnswered("")
 	if response.GetStatus() != gmproto.SendMessageResponse_SUCCESS {
 		// A rejected status proves the connection is healthy enough to respond;
 		// this must not touch the receive lifecycle.

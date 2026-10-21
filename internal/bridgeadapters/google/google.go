@@ -194,6 +194,9 @@ func (a *Adapter) Start(
 	a.starting = false
 	installed = true
 	a.mu.Unlock()
+	// A new client may well reach a phone the old one could not; don't hold
+	// its first sends for the rest of the old probe window.
+	a.phoneRecovered("new_generation")
 
 	if err := transport.Connect(); err != nil {
 		failure := a.classifyTransportError(err, "connect", "connect_failed")
@@ -736,7 +739,7 @@ func (r *run) recordActivity(evt any, at time.Time, detail string) {
 		r.phoneNotResponding = false
 		// libgm's pinger got an answer: release intents held while the phone
 		// was silent instead of waiting out the probe window.
-		r.adapter.silence.reopen()
+		r.adapter.phoneRecovered("phone_responding_again")
 	}
 	close(r.activity)
 	r.activity = make(chan struct{})

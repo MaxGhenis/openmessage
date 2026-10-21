@@ -19,8 +19,8 @@ import (
 const (
 	gmessagesModule            = "go.mau.fi/mautrix-gmessages"
 	gmessagesFork              = "github.com/MaxGhenis/gmessages"
-	minimumGMessagesFork       = "v0.2602.1-0.20261009120339-1055c990a942"
-	minimumGMessagesForkTime   = "20261009120339"
+	minimumGMessagesFork       = "v0.2602.1-0.20261021163109-6495a585293d"
+	minimumGMessagesForkTime   = "20261021163109"
 	gmessagesAuthRetryContract = "libgm/longpoll auth-refresh network retry, payload-less response rejection and request timeout"
 )
 
@@ -165,16 +165,22 @@ var gmessagesTimeoutTests = []string{
 	"TestAnswerBeforeTimeoutIsDelivered",
 	"TestLateAnswerAfterTimeoutIsDropped",
 	"TestAnswerAtTheDeadlineWinsOverTheTimeout",
+	"TestTimeoutWaitsForTheClaimerToDeliver",
+	"TestReusedRequestIDFailsTheEarlierWaiter",
 	"TestTimeoutAfterPayloadlessAnswerReportsPayloadError",
+	"TestAnswerAfterPayloadlessFrameStopsTheGraceTimer",
 	"TestInFlightRequestKeepsItsTimeout",
+	"TestNudgePokesThePingerWithoutEndingTheWait",
 	"TestDisconnectFailsPendingRequests",
 	"TestPublicMethodsTimeOut",
 	"TestPublicMethodsDeliverTheAnswer",
 	"TestPublicMethodsFailOnDisconnect",
 	"TestTerminalOutcomeIsTheFirstTerminalEvent",
 	"TestTimeoutRacesCompleteExactlyOnce",
+	"TestPlainTimeoutRacesCompleteExactlyOnce",
 	"TestPingerIgnoresAbandonedPing",
 	"TestPingerIgnoresAbandonedPingDuringBackoff",
+	"TestPingReportsUnansweredAndAnsweredPings",
 	"TestGaiaPairingMessageEndsCleanly",
 }
 

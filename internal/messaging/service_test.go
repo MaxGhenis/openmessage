@@ -725,10 +725,10 @@ func TestPostCallTimeoutBecomesUncertainAndIsNotRedispatched(t *testing.T) {
 }
 
 // A Google send that libgm gave up on (the phone never answered, or the client
-// disconnected while it waited) reaches the outbox as the Google adapter
-// classifies it: transient, with no dispatch certainty. The server had
-// accepted the request, so the phone may still send it: the outbox must
-// record it as uncertain and never send it again.
+// disconnected while it waited) is uncertain: the server had accepted the
+// request, so the phone may still send it, and the outbox must never send it
+// again. The Google adapter marks it DispatchUncertain; this pins the
+// fallback too, a transient failure with no dispatch certainty at all.
 func TestUnansweredGoogleSendBecomesUncertainAndIsNotRedispatched(t *testing.T) {
 	for _, reason := range []error{libgm.ErrPhoneNotResponding, libgm.ErrConnectionClosed} {
 		t.Run(reason.Error(), func(t *testing.T) {

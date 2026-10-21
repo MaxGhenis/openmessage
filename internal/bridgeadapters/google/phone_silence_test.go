@@ -261,7 +261,7 @@ func TestMarkReadAnsweredResetsTheBackoff(t *testing.T) {
 	if read.calls != 1 {
 		t.Fatalf("MarkRead calls = %d, want 1", read.calls)
 	}
-	if until := a.silence.recordUnanswered(""); !until.Equal(clock.Now().Add(30 * time.Second)) {
+	if until := a.silence.recordUnanswered("").Until; !until.Equal(clock.Now().Add(30 * time.Second)) {
 		t.Fatalf("window after an answered receipt = %s, want 30s", until.Sub(clock.Now()))
 	}
 }
@@ -284,7 +284,9 @@ func (s *stubbornLookups) GetConversation(conversationID string) (*gmproto.Conve
 // A lookup the phone never answers, while it answers everything else, backs
 // off on its own schedule past the account's window. Other intents, due when
 // the window ends, probe first and get through, so the stuck one costs the
-// loop one timeout per its own growing interval and starves nobody.
+// loop one timeout per its own growing interval and starves nobody. Its sixth
+// unanswered lookup refuses it: nothing was sent, and retrying for ever would
+// keep costing the loop.
 func TestStuckLookupBacksOffPastTheWindowAndStarvesNobody(t *testing.T) {
 	fake := &stubbornLookups{stuck: "stuck-conversation"}
 	fake.sendResult = &gmproto.SendMessageResponse{Status: gmproto.SendMessageResponse_SUCCESS}
@@ -302,8 +304,11 @@ func TestStuckLookupBacksOffPastTheWindowAndStarvesNobody(t *testing.T) {
 		return err
 	}
 	var lastGap time.Duration
-	for round := 1; round <= 6; round++ {
+	for round := 1; round < phoneSilenceMaxStuck; round++ {
 		failure := requireTextOpError(t, send("stuck", "stuck-conversation"))
+		if failure.Class != bridge.FailureTransient || failure.Dispatch != bridge.DispatchNotCalled {
+			t.Fatalf("round %d: %+v, want a retryable not-dispatched lookup", round, failure)
+		}
 		windowEnds := clock.Now().Add(30 * time.Second) // reset by the answers in between
 		if !failure.RetryAt.After(windowEnds) {
 			t.Fatalf("round %d: stuck RetryAt %s is not past the window %s", round, failure.RetryAt, windowEnds)
@@ -322,6 +327,15 @@ func TestStuckLookupBacksOffPastTheWindowAndStarvesNobody(t *testing.T) {
 			t.Fatalf("round %d: healthy send after the window = %v", round, err)
 		}
 		clock.Advance(failure.RetryAt.Sub(clock.Now()))
+	}
+	failure := requireTextOpError(t, send("stuck", "stuck-conversation"))
+	if failure.Class != bridge.FailureUnsupported || failure.Dispatch != bridge.DispatchNotCalled ||
+		failure.Fingerprint != "google_conversation_get_never_answered" || !failure.RetryAt.IsZero() ||
+		!errors.Is(failure.Cause, libgm.ErrPhoneNotResponding) {
+		t.Fatalf("sixth unanswered lookup = %+v, want it refused as not sent", failure)
+	}
+	if fake.sendCalls != phoneSilenceMaxStuck-1 {
+		t.Fatalf("SendMessage calls = %d, want only the healthy sends (%d)", fake.sendCalls, phoneSilenceMaxStuck-1)
 	}
 }
 
@@ -349,7 +363,7 @@ func TestPhoneRespondingAgainReopensTheGate(t *testing.T) {
 		t.Fatal("PhoneRespondingAgain left Google intents held")
 	}
 	// The backoff restarted too.
-	if until := a.silence.recordUnanswered(""); !until.Equal(clock.Now().Add(30 * time.Second)) {
+	if until := a.silence.recordUnanswered("").Until; !until.Equal(clock.Now().Add(30 * time.Second)) {
 		t.Fatalf("window after recovery ends %s, want 30s", until.Sub(clock.Now()))
 	}
 }
@@ -515,7 +529,8 @@ func TestSilentIntentTableIsBounded(t *testing.T) {
 //     the window lasts wantBackoff(k).
 //  3. An unanswered lookup is retried strictly after the window ends, by its
 //     own backoff, whose step counts only the unanswered lookups that
-//     followed an answer or recovery since the intent's previous one.
+//     followed an answer or recovery since the intent's previous one; at
+//     the sixth such step it is refused instead.
 //  4. A caller that only reaches the phone when not held (the adapter's
 //     contract) leaves unanswered requests at least the window apart while
 //     the phone stays silent. This is the bound on how often the dispatch
@@ -581,9 +596,12 @@ func TestPhoneSilenceInvariantsOverRandomSchedules(t *testing.T) {
 				modelCount++
 				modelUntil = now.Add(wantBackoff(modelCount))
 				lastUnanswered, lastWindow, silentSinceLast = now, wantBackoff(modelCount), true
+				if !got.Until.Equal(modelUntil) || got.Unanswered != modelCount {
+					t.Fatalf("script %d step %d: window ends %s after %d, want %s after %d", script, step, got.Until, got.Unanswered, modelUntil, modelCount)
+				}
 				if id == "" {
-					if !got.Equal(modelUntil) {
-						t.Fatalf("script %d step %d: window ends %s, want %s", script, step, got, modelUntil)
+					if !got.RetryAt.Equal(modelUntil) || got.Stuck {
+						t.Fatalf("script %d step %d: retry %s stuck=%t, want the window end", script, step, got.RetryAt, got.Stuck)
 					}
 					break
 				}
@@ -591,8 +609,16 @@ func TestPhoneSilenceInvariantsOverRandomSchedules(t *testing.T) {
 					modelIntent[id]++
 				}
 				answeredSince[id] = false
-				if want := modelUntil.Add(wantBackoff(modelIntent[id])); !got.Equal(want) || !got.After(modelUntil) {
-					t.Fatalf("script %d step %d: lookup %q retry %s, want %s (after the window %s)", script, step, id, got, want, modelUntil)
+				if modelIntent[id] >= 6 { // refused, and forgotten
+					if !got.Stuck || !got.RetryAt.IsZero() {
+						t.Fatalf("script %d step %d: lookup %q after %d stuck tries = %+v, want refused", script, step, id, modelIntent[id], got)
+					}
+					delete(modelIntent, id)
+					delete(answeredSince, id)
+					break
+				}
+				if want := modelUntil.Add(wantBackoff(modelIntent[id])); got.Stuck || !got.RetryAt.Equal(want) || !got.RetryAt.After(modelUntil) {
+					t.Fatalf("script %d step %d: lookup %q retry %s stuck=%t, want %s (after the window %s)", script, step, id, got.RetryAt, got.Stuck, want, modelUntil)
 				}
 			case op < 5:
 				p.reopen()

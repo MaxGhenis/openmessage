@@ -12,13 +12,18 @@ import (
 )
 
 // RequestTimeout is how long a libgm request waits for the phone's answer
-// before failing with libgm.ErrPhoneNotResponding. It stays below the outbox's
-// 60 s bound on a transport call (internal/messaging), with room for the HTTP
-// send that comes first, so a request the phone never answers fails inside the
-// Google adapter, which knows whether anything was sent, rather than being
-// abandoned by the dispatcher, which must then assume it was. libgm's own
-// default is 60 s.
-const RequestTimeout = 45 * time.Second
+// before failing with libgm.ErrPhoneNotResponding. libgm's own default is
+// 60 s. The wait starts once the request has been sent, and the fork's HTTP
+// client allows 20 s for the server's response headers (ResponseHeaderTimeout),
+// so 35 s keeps a lookup the phone never answers inside the outbox's 60 s bound
+// on a transport call (internal/messaging). The Google adapter, which knows
+// whether anything was sent, then classifies it, rather than the dispatcher,
+// which must assume it was. A send that runs past the bound anyway (a fresh
+// connection's dial and TLS on top, or a slow lookup followed by an unanswered
+// send) is abandoned as uncertain, which never sends it twice. A phone that
+// answers after the timeout costs a retried lookup, or an uncertain send that
+// its echo later confirms.
+const RequestTimeout = 35 * time.Second
 
 type Client struct {
 	GM     *libgm.Client

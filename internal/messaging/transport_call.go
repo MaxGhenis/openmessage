@@ -186,10 +186,12 @@ type transportOutcome[T any] struct {
 // context canceled when the bound passes, but a transport that ignores its
 // context (libgm) keeps its goroutine until it returns; the dispatch loop does
 // not wait for it. An abandoned call returns an uncertain OpError, because the
-// request may already have reached the platform. That holds even when the hang
-// came before the request left: Google's SendText first asks the phone for the
-// conversation, and a phone that never answers hangs there. Retrying such an
-// intent would let it hold the loop for another full bound each time.
+// request may already have reached the platform. That holds even when the
+// call was abandoned before the request left (Google's SendText first asks the
+// phone for the conversation): the dispatcher can't tell, so it never retries
+// an abandoned call. libgm's own timeout normally ends an unanswered lookup
+// inside this bound, and the Google adapter then classifies it, and stops
+// before sending if this context was canceled meanwhile.
 //
 // call runs on its own goroutine and must release anything it uses (the
 // dispatch lease, a media reader) itself, since an abandoned call can outlive

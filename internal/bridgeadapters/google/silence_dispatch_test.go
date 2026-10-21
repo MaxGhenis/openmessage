@@ -6,6 +6,7 @@ import (
 
 	gmproto "go.mau.fi/mautrix-gmessages/pkg/libgm/gmproto"
 
+	"github.com/maxghenis/openmessage/internal/client"
 	"github.com/maxghenis/openmessage/internal/messaging"
 )
 
@@ -18,7 +19,9 @@ import (
 //   - nothing becomes uncertain or rejected: a lookup sends nothing, so every
 //     intent stays retryable;
 //   - the phone is asked at most once per probe window (30 s doubling to
-//     5 minutes), so in an hour the loop is held about 16 times, not ~2,000;
+//     5 minutes): about 15 times in the hour, where an instant fake retried
+//     every 5 s would be asked over 2,000 times (with real timing, see the
+//     next test, that is the loop waiting on the phone almost all the hour);
 //   - once the phone answers, every intent is delivered within the window.
 func TestSilentPhoneHoldsTheLoopOncePerWindowAndDeliversAfterwards(t *testing.T) {
 	f := newReactionDispatchFixture(t)
@@ -101,4 +104,112 @@ func TestSilentPhoneHoldsTheLoopOncePerWindowAndDeliversAfterwards(t *testing.T)
 	if f.text.sendCalls != 2 || f.reaction.sendCalls != 1 {
 		t.Fatalf("sends after recovery: text=%d reaction=%d, want 2 and 1", f.text.sendCalls, f.reaction.sendCalls)
 	}
+}
+
+// slowSilentText and slowSilentReaction leave lookups unanswered and, like libgm, take the whole
+// request timeout to say so: the fixture clock moves client.RequestTimeout per
+// unanswered lookup, so 30 s dispatch leases expire mid-batch as they do in
+// production.
+type slowSilentText struct {
+	fakeTextSendClient
+	clock  *reactionDispatchClock
+	silent bool
+}
+
+func (s *slowSilentText) GetConversation(id string) (*gmproto.Conversation, error) {
+	s.conversationCalls++
+	if s.silent {
+		s.clock.Advance(client.RequestTimeout)
+		return nil, unanswered(gmproto.ActionType_GET_CONVERSATION)
+	}
+	return &gmproto.Conversation{}, nil
+}
+
+type slowSilentReaction struct {
+	fakeReactionSendClient
+	clock  *reactionDispatchClock
+	silent bool
+}
+
+func (s *slowSilentReaction) GetConversation(id string) (*gmproto.Conversation, error) {
+	s.conversationCalls++
+	if s.silent {
+		s.clock.Advance(client.RequestTimeout)
+		return nil, unanswered(gmproto.ActionType_GET_CONVERSATION)
+	}
+	return &gmproto.Conversation{}, nil
+}
+
+// The same hour of silence with libgm's real timing and more queued intents
+// (six texts and a reaction): the share of the hour the dispatch loop spends
+// waiting on the phone stays low, nothing becomes uncertain, and everything
+// goes out within a window of the phone answering. Without the hold, the loop
+// would wait on the phone almost the whole hour.
+func TestSilentPhoneWithRealTimingKeepsTheLoopMostlyFree(t *testing.T) {
+	f := newReactionDispatchFixture(t)
+	f.adapter.silence.now = f.clock.Now
+	text := &slowSilentText{clock: f.clock, silent: true}
+	text.sendResult = &gmproto.SendMessageResponse{Status: gmproto.SendMessageResponse_SUCCESS}
+	installTextSendClient(t, f.adapter.host.GetClient(), text)
+	reaction := &slowSilentReaction{clock: f.clock, silent: true}
+	reaction.sendResult = &gmproto.SendReactionResponse{Success: true}
+	installReactionSendClient(t, f.adapter.host.GetClient(), reaction)
+
+	var intents []string
+	for i := 0; i < 6; i++ {
+		s, err := f.service.SendText(f.ctx, messaging.SendTextCommand{CommonCommand: f.common(), Body: "t"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		intents = append(intents, s.OutboxID)
+	}
+	intents = append(intents, f.react("v2-target").OutboxID)
+
+	lookups := func() int { return text.conversationCalls + reaction.conversationCalls }
+	start := f.clock.Now()
+	var waited time.Duration
+	for f.clock.Now().Sub(start) < time.Hour {
+		before := f.clock.Now()
+		if _, err := f.service.DispatchDue(f.ctx, 32); err != nil {
+			t.Fatalf("DispatchDue: %v", err)
+		}
+		waited += f.clock.Now().Sub(before)
+		for _, id := range intents {
+			if state := f.delivery(id).State; state != messaging.OutboxNotDispatched && state != messaging.OutboxQueued {
+				t.Fatalf("intent %s is %s at +%s, want it still retryable", id, state, f.clock.Now().Sub(start))
+			}
+		}
+		f.clock.Advance(time.Second)
+	}
+	share := waited.Seconds() / f.clock.Now().Sub(start).Seconds()
+	silentLookups := lookups()
+	if share > 0.25 || silentLookups > 17 {
+		t.Fatalf("hour of silence: %d phone requests, loop waiting %s (%.0f%%); want at most 17 and 25%%", silentLookups, waited, 100*share)
+	}
+
+	text.silent, reaction.silent = false, false
+	recovered := f.clock.Now()
+	for {
+		done := true
+		for _, id := range intents {
+			if f.delivery(id).State != messaging.OutboxConfirmed {
+				done = false
+			}
+		}
+		if done {
+			break
+		}
+		if f.clock.Now().Sub(recovered) > 5*time.Minute+time.Minute {
+			for _, id := range intents {
+				t.Logf("%s: %s", id, f.delivery(id).State)
+			}
+			t.Fatal("not every intent was delivered within a window (plus a minute) of the phone answering")
+		}
+		if _, err := f.service.DispatchDue(f.ctx, 32); err != nil {
+			t.Fatal(err)
+		}
+		f.clock.Advance(time.Second)
+	}
+	t.Logf("hour of silence with %s timeouts, 7 queued Google intents: %d phone requests, loop waiting %s (%.0f%%); all delivered %s after the phone answered",
+		client.RequestTimeout, silentLookups, waited.Round(time.Second), 100*share, f.clock.Now().Sub(recovered))
 }
