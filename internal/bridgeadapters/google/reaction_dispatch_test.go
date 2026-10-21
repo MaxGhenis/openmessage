@@ -87,6 +87,7 @@ type reactionDispatchFixture struct {
 	store    *sqlite.Store
 	service  *messaging.MessageService
 	outbox   *sqlite.OutboxRepository
+	adapter  *Adapter
 	reaction *fakeReactionSendClient
 	text     *fakeTextSendClient
 	keys     int
@@ -166,7 +167,7 @@ func newReactionDispatchFixture(t *testing.T) *reactionDispatchFixture {
 	}
 	return &reactionDispatchFixture{
 		t: t, ctx: ctx, clock: clock, store: store, service: service, outbox: outbox,
-		reaction: reaction, text: text,
+		adapter: adapter, reaction: reaction, text: text,
 	}
 }
 
