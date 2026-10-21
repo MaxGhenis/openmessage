@@ -111,6 +111,18 @@ func (v signalCLIVersion) String() string {
 	return fmt.Sprintf("%d.%d.%d", v.major, v.minor, v.patch)
 }
 
+// receiveOutputHasEnvelopes reports whether a receive call's output holds any
+// line processReceiveLine would treat as an envelope (it skips everything that
+// does not start with '{', such as signal-cli's log lines).
+func receiveOutputHasEnvelopes(output []byte) bool {
+	for _, line := range bytes.Split(output, []byte("\n")) {
+		if line = bytes.TrimSpace(line); len(line) > 0 && line[0] == '{' {
+			return true
+		}
+	}
+	return false
+}
+
 func isSignalIdleReceiveTimeout(err error, timedOut bool, output []byte) bool {
 	if len(bytes.TrimSpace(output)) != 0 {
 		return false
@@ -1793,17 +1805,34 @@ func (b *Bridge) runReceiveLoop(
 		b.commandMu.Unlock()
 		timedOut := errors.Is(callCtx.Err(), context.DeadlineExceeded)
 		callCancel()
+		// signal-cli acknowledges each envelope to Signal's server as it
+		// prints it, so a call that was stopped, hit its deadline or exited
+		// non-zero can still hold messages the server will never deliver to
+		// this device again. Keep them before deciding what the call's
+		// outcome means; the success path below handles its own output.
+		delivered := receiveOutputHasEnvelopes(output)
+		if delivered && (err != nil || ctx.Err() != nil) {
+			if handleErr := b.handleReceiveOutput(probedAccount, output); handleErr != nil {
+				b.logger.Debug().Err(handleErr).Msg("Failed to process Signal receive payload")
+			}
+		}
 		if ctx.Err() != nil {
 			continue
 		}
 		if err != nil {
-			if isSignalIdleReceiveTimeout(err, timedOut, output) {
+			// A deadline hit while envelopes were still arriving is a long
+			// batch, not a broken connection.
+			if isSignalIdleReceiveTimeout(err, timedOut, output) || (timedOut && delivered) {
 				consecutiveFailures = 0
 				consecutivePoisonFailures = 0
 				consecutiveAccountInvalid = 0
 				lastPoisonFingerprint = ""
 				if run != nil {
-					run.beat("receive_idle")
+					if delivered {
+						run.beat("receive_batch")
+					} else {
+						run.beat("receive_idle")
+					}
 				}
 				continue
 			}
