@@ -162,13 +162,19 @@ func TestGMessagesForkRejectsPayloadlessResponses(t *testing.T) {
 // carried patch: the request timeout and failing waiters on disconnect.
 var gmessagesTimeoutTests = []string{
 	"TestUnansweredRequestFailsWithPhoneNotResponding",
+	"TestAnswerBeforeTimeoutIsDelivered",
+	"TestLateAnswerAfterTimeoutIsDropped",
+	"TestAnswerAtTheDeadlineWinsOverTheTimeout",
 	"TestTimeoutAfterPayloadlessAnswerReportsPayloadError",
+	"TestInFlightRequestKeepsItsTimeout",
 	"TestDisconnectFailsPendingRequests",
 	"TestPublicMethodsTimeOut",
-	"TestPublicMethodFailsOnDisconnect",
+	"TestPublicMethodsDeliverTheAnswer",
+	"TestPublicMethodsFailOnDisconnect",
 	"TestTerminalOutcomeIsTheFirstTerminalEvent",
 	"TestTimeoutRacesCompleteExactlyOnce",
 	"TestPingerIgnoresAbandonedPing",
+	"TestPingerIgnoresAbandonedPingDuringBackoff",
 	"TestGaiaPairingMessageEndsCleanly",
 }
 

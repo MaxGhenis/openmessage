@@ -12,12 +12,19 @@ import (
 
 // Bounds on one transport call. The dispatch loop runs every call
 // synchronously on one goroutine, so a call that never returns stops every
-// later intent, on every account, until the app restarts. libgm's
-// request/response wait has no timeout of its own: on 2026-10-20 a Google text
-// send got no answer at 15:55 and froze all sending, reactions and read
-// receipts for three and a half hours. A call past its bound is abandoned and
-// its intent becomes uncertain: the request may have reached the platform, so
-// nothing sends it again automatically.
+// later intent, on every account, until the app restarts. On 2026-10-20 a
+// Google text send got no answer at 15:55 and, with libgm then waiting for the
+// phone forever, froze all sending, reactions and read receipts for three and
+// a half hours. A call past its bound is abandoned and its intent becomes
+// uncertain: the request may have reached the platform, so nothing sends it
+// again automatically.
+//
+// libgm now gives up on an unanswered request after client.RequestTimeout,
+// inside this bound, so the Google adapter classifies most such failures
+// itself (a conversation lookup that sent nothing stays retryable). This
+// bound remains the backstop for what that can't cover: a stalled HTTP send,
+// a Google send whose two requests together run past it, and every other
+// platform.
 const (
 	defaultTransportCallTimeout = 60 * time.Second
 	// A media call uploads the attachment first. libgm bounds each of its two

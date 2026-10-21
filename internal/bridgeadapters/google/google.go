@@ -47,6 +47,10 @@ type Adapter struct {
 	starting bool
 
 	ingressErrors atomic.Uint64
+
+	// silence holds Google intents while the phone is not answering them
+	// (phone_silence.go).
+	silence phoneSilence
 }
 
 func New(accountID string, host *app.App, canRepair func() bool) *Adapter {
@@ -730,6 +734,9 @@ func (r *run) recordActivity(evt any, at time.Time, detail string) {
 		r.phoneNotResponding = true
 	case *events.PhoneRespondingAgain:
 		r.phoneNotResponding = false
+		// libgm's pinger got an answer: release intents held while the phone
+		// was silent instead of waiting out the probe window.
+		r.adapter.silence.reopen()
 	}
 	close(r.activity)
 	r.activity = make(chan struct{})

@@ -4,15 +4,31 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/rs/zerolog"
 	"go.mau.fi/mautrix-gmessages/pkg/libgm"
 	"go.mau.fi/mautrix-gmessages/pkg/libgm/gmproto"
 )
 
+// RequestTimeout is how long a libgm request waits for the phone's answer
+// before failing with libgm.ErrPhoneNotResponding. It stays below the outbox's
+// 60 s bound on a transport call (internal/messaging), with room for the HTTP
+// send that comes first, so a request the phone never answers fails inside the
+// Google adapter, which knows whether anything was sent, rather than being
+// abandoned by the dispatcher, which must then assume it was. libgm's own
+// default is 60 s.
+const RequestTimeout = 45 * time.Second
+
 type Client struct {
 	GM     *libgm.Client
 	Logger zerolog.Logger
+}
+
+func newGMClient(authData *libgm.AuthData, pushKeys *libgm.PushKeys, logger zerolog.Logger) *libgm.Client {
+	cli := libgm.NewClient(authData, pushKeys, logger)
+	cli.SetRequestTimeout(RequestTimeout)
+	return cli
 }
 
 func NewFromSession(sessionData *SessionData, logger zerolog.Logger) (*Client, error) {
@@ -29,13 +45,13 @@ func NewFromSession(sessionData *SessionData, logger zerolog.Logger) (*Client, e
 		}
 	}
 
-	cli := libgm.NewClient(authData, pushKeys, logger)
+	cli := newGMClient(authData, pushKeys, logger)
 	return &Client{GM: cli, Logger: logger}, nil
 }
 
 func NewForPairing(logger zerolog.Logger) *Client {
 	authData := libgm.NewAuthData()
-	cli := libgm.NewClient(authData, nil, logger)
+	cli := newGMClient(authData, nil, logger)
 	return &Client{GM: cli, Logger: logger}
 }
 
