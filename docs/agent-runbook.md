@@ -154,7 +154,10 @@ blocked.
      cut off by a disconnect is `uncertain` too. A read receipt cut off by a
      disconnect stays retryable, since repeating it costs nothing.
    - If the dispatcher gave up on the call while the lookup or upload ran, the
-     adapter stops there and sends nothing.
+     adapter stops there and sends nothing. The row is still `uncertain`
+     (`transport_timeout`), because the dispatcher can't know that, but such
+     a message has not gone out: if no echo appears in its thread, send it
+     again.
 2. **Each transport call (text, media, reaction, read receipt; any platform)
    has a hard bound in the dispatcher:** 60 s, or 5 minutes for media, whose
    call includes the upload. It is the backstop for what libgm's bound can't
@@ -204,11 +207,13 @@ adapter therefore holds its intents while the phone is silent
 
 What you see while the phone is silent:
 
-- The backend log has the warning `Google Messages phone did not answer;
-  holding Google sends until the next probe`, with `held_until`, once per
-  window; os_log keeps warnings, so `log show` finds it afterwards. The end
-  of a hold is logged at info (`... releasing held Google sends`), which only
-  `log stream` sees.
+- The backend logs `Google Messages phone did not answer; holding Google
+  sends until the next probe` (a zerolog warning, with `held_until`) once
+  per window, and `... releasing held Google sends` when the hold ends. The
+  app forwards every backend line to os_log at Info, which macOS keeps only
+  in memory, so capture them live with `/usr/bin/log stream --level info`
+  (see "Reading the backend's os_log"), or use `log show --info` while they
+  are still in memory.
 - `GET /api/v1/outbox` lists the held intents as `not_dispatched`, with
   `error_class` `transient` and `error_code` the operation (`send_text`,
   `send_media`, `send_reaction`, `mark_read`). `next_attempt_at_ms` is at most
@@ -585,7 +590,9 @@ was refused (`backfill already running`).
   The server had already accepted it, so the phone may still deliver it: the
   outbox records it as `uncertain` and never sends it again. The legacy HTTP
   send keeps its idempotency claim, so a retry with the same key gets 409.
-  The legacy scheduler (legacy-primary daemons) marks such a scheduled SMS
+  The legacy scheduler (legacy-primary daemons) treats a scheduled SMS the
+  same way: any SendMessage error other than an auth rejection or no client
+  (an unanswered request, a disconnect, a network or server error) marks it
   `failed`, noting it may have gone out, instead of re-sending it with a new
   TmpID. A timed-out conversation lookup before a send has no effect on the
   phone and stays retryable, in the scheduler too. While the phone stays

@@ -72,8 +72,11 @@ type phoneSilence struct {
 	until      time.Time
 	unanswered int
 
-	// answers counts answered requests and recovery signals, so an intent can
-	// tell whether the phone answered anything since its last lookup.
+	// answers counts answered send-path requests, so an intent can tell
+	// whether the phone answered anything since its last lookup. Recovery
+	// signals (a new generation, libgm's PhoneRespondingAgain) reopen the
+	// gate but don't count: they don't show the phone answering a request,
+	// so they must not push an intent toward refusal while the phone is off.
 	answers uint64
 	// intents holds the lookups that went unanswered, by transport request ID.
 	intents map[string]*silentIntent
@@ -200,6 +203,7 @@ func (p *phoneSilence) recordAnswered(requestID string) (wasSilent bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	delete(p.intents, requestID)
+	p.answers++
 	return p.reopenLocked()
 }
 
@@ -213,7 +217,8 @@ func (p *phoneSilence) forget(requestID string) {
 
 // reopen opens the gate when libgm reports the phone responding again or a
 // new generation starts, and reports whether the phone had been silent. Each
-// intent keeps its own backoff: its retry is already scheduled.
+// intent keeps its own backoff (its retry is already scheduled), and its stuck
+// count doesn't grow: only an answered request shows the phone answering.
 func (p *phoneSilence) reopen() (wasSilent bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -225,7 +230,6 @@ func (p *phoneSilence) reopenLocked() bool {
 	p.since = time.Time{}
 	p.until = time.Time{}
 	p.unanswered = 0
-	p.answers++
 	return wasSilent
 }
 

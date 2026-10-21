@@ -529,8 +529,9 @@ func TestSilentIntentTableIsBounded(t *testing.T) {
 //     the window lasts wantBackoff(k).
 //  3. An unanswered lookup is retried strictly after the window ends, by its
 //     own backoff, whose step counts only the unanswered lookups that
-//     followed an answer or recovery since the intent's previous one; at
-//     the sixth such step it is refused instead.
+//     followed an answered request since the intent's previous one (a
+//     recovery signal is not an answer); at the sixth such step it is
+//     refused instead.
 //  4. A caller that only reaches the phone when not held (the adapter's
 //     contract) leaves unanswered requests at least the window apart while
 //     the phone stays silent. This is the bound on how often the dispatch
@@ -546,7 +547,7 @@ func TestPhoneSilenceInvariantsOverRandomSchedules(t *testing.T) {
 			modelUntil      time.Time
 			modelCount      int
 			modelIntent     = map[string]int{}
-			answeredSince   = map[string]bool{} // an answer or recovery since the intent's last unanswered lookup
+			answeredSince   = map[string]bool{} // an answered request since the intent's last unanswered lookup
 			lastUnanswered  time.Time
 			lastWindow      time.Duration
 			silentSinceLast bool
@@ -620,10 +621,9 @@ func TestPhoneSilenceInvariantsOverRandomSchedules(t *testing.T) {
 				if want := modelUntil.Add(wantBackoff(modelIntent[id])); got.Stuck || !got.RetryAt.Equal(want) || !got.RetryAt.After(modelUntil) {
 					t.Fatalf("script %d step %d: lookup %q retry %s stuck=%t, want %s (after the window %s)", script, step, id, got.RetryAt, got.Stuck, want, modelUntil)
 				}
-			case op < 5:
+			case op < 5: // a recovery signal reopens the gate but is no answer
 				p.reopen()
 				modelUntil, modelCount = time.Time{}, 0
-				answer()
 				silentSinceLast = false
 			case op < 6:
 				id := intents[1+rng.Intn(len(intents)-1)]

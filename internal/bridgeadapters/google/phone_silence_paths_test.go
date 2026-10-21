@@ -1,12 +1,14 @@
 package google
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/rs/zerolog"
 	"go.mau.fi/mautrix-gmessages/pkg/libgm/gmproto"
 
 	"github.com/maxghenis/openmessage/internal/bridge"
@@ -50,8 +52,16 @@ func (h *hookedReaction) GetConversation(id string) (*gmproto.Conversation, erro
 
 type hookedMedia struct {
 	fakeMediaSendClient
-	hook    func()
-	lookups int
+	hook       func()
+	uploadHook func()
+	lookups    int
+}
+
+func (h *hookedMedia) UploadMedia(data []byte, filename, mime string) (*gmproto.MediaContent, error) {
+	if h.uploadHook != nil {
+		h.uploadHook()
+	}
+	return h.fakeMediaSendClient.UploadMedia(data, filename, mime)
 }
 
 func (h *hookedMedia) GetConversation(id string) (*gmproto.Conversation, error) {
@@ -263,5 +273,87 @@ func TestNewGenerationReopensTheGate(t *testing.T) {
 	t.Cleanup(func() { stopRun(t, run) })
 	if _, _, held := a.silence.held(); held {
 		t.Fatal("a new generation left Google intents held")
+	}
+}
+
+// A media send whose call the dispatcher abandons during the upload stops
+// before sending, too.
+func TestMediaSendStopsWhenTheDispatcherGaveUpDuringTheUpload(t *testing.T) {
+	a, _ := newPathAdapter(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	fake := &hookedMedia{uploadHook: cancel}
+	fake.uploadResult = &gmproto.MediaContent{MediaID: "media"}
+	fake.conversationResult = &gmproto.Conversation{}
+	fake.sendResults = []*gmproto.SendMessageResponse{{Status: gmproto.SendMessageResponse_SUCCESS}}
+	installMediaSendClient(t, a.host.GetClient(), fake)
+	_, err := a.SendMedia(ctx, bridge.MediaRequest{
+		Conversation: bridge.ConversationRef{RemoteID: "conversation-id"},
+		Reader:       strings.NewReader("img"),
+		Size:         3,
+		RequestID:    "intent",
+	})
+	failure, ok := asOpError(err)
+	if !ok || failure.Dispatch != bridge.DispatchNotCalled || !errors.Is(failure.Cause, context.Canceled) {
+		t.Fatalf("failure = %v (%+v), want not dispatched because the call was abandoned", err, failure)
+	}
+	if fake.uploadCalls != 1 || len(fake.sent) != 0 {
+		t.Fatalf("uploads=%d sends=%d, want the upload and no send", fake.uploadCalls, len(fake.sent))
+	}
+}
+
+// Recovery signals reopen the gate but are not answers: with the phone off,
+// a queued text keeps waiting through reconnects and pinger recoveries, never
+// refused as a lookup the phone singles out.
+func TestRecoverySignalsNeverRefuseALookup(t *testing.T) {
+	for _, signal := range []string{"new_generation", "phone_responding_again"} {
+		t.Run(signal, func(t *testing.T) {
+			a, text, clock := silentText(t)
+			for probe := 1; probe <= 3*phoneSilenceMaxStuck; probe++ {
+				failure := requireTextOpError(t, sendText(t, a, "intent"))
+				if failure.Class != bridge.FailureTransient || failure.Fingerprint != "google_conversation_get_unanswered" {
+					t.Fatalf("probe %d with the phone off = %+v, want it still retryable", probe, failure)
+				}
+				if want := clock.Now().Add(30*time.Second + 30*time.Second); !failure.RetryAt.Equal(want) {
+					t.Fatalf("probe %d RetryAt = %s, want the base window and delay (%s)", probe, failure.RetryAt, want)
+				}
+				a.phoneRecovered(signal)
+				clock.Advance(failure.RetryAt.Sub(clock.Now()))
+			}
+			if text.sendCalls != 0 {
+				t.Fatalf("SendMessage calls = %d, want 0", text.sendCalls)
+			}
+		})
+	}
+}
+
+// The log lines the runbook points operators to: a warning when a hold
+// starts, with when it ends, and an info line when the phone answers again
+// or libgm reports it back.
+func TestHoldIsLogged(t *testing.T) {
+	a, text, clock := silentText(t)
+	var logs bytes.Buffer
+	a.host.Logger = zerolog.New(&logs)
+	requireTextOpError(t, sendText(t, a, "intent"))
+	if out := logs.String(); !strings.Contains(out, `"level":"warn"`) ||
+		!strings.Contains(out, "Google Messages phone did not answer; holding Google sends until the next probe") ||
+		!strings.Contains(out, `"held_until"`) || !strings.Contains(out, `"operation":"send_text"`) {
+		t.Fatalf("hold start log = %s", out)
+	}
+	logs.Reset()
+	clock.Advance(30 * time.Second)
+	answerEverything(text)
+	if err := sendText(t, a, "intent"); err != nil {
+		t.Fatal(err)
+	}
+	if out := logs.String(); !strings.Contains(out, "Google Messages phone answered again; releasing held Google sends") {
+		t.Fatalf("hold end log = %s", out)
+	}
+	logs.Reset()
+	a.silence.recordUnanswered("")
+	a.phoneRecovered("phone_responding_again")
+	if out := logs.String(); !strings.Contains(out, "Google Messages phone may be back; releasing held Google sends") ||
+		!strings.Contains(out, `"reason":"phone_responding_again"`) {
+		t.Fatalf("recovery log = %s", out)
 	}
 }
