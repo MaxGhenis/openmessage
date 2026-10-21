@@ -136,7 +136,12 @@ mode this prevents and the `~/.mcp.json` recipe.
 - `generate_person_story` — cross-platform narrative story for a person (merges + deduplicates)
 - `generate_viz` — self-contained HTML visualization combining data dashboards + narrative (see below)
 - `render_story` — render a pre-built Story JSON into HTML viz; supports `photo_paths` (curated list) or `photos_dir`
-- `send_message`, `draft_message`, `download_media`, `list_contacts`, `get_status`
+- `send_message`, `draft_message`, `list_contacts`, `get_status`
+- `download_media` — resolves a message ID or a `v2msg:<message>:<n>` media_id
+  (v2 reads go through the running app in client mode), downloads a pending
+  v2 attachment into the store, and with `save`/`output_path` writes a 0600
+  copy under the export root; an attachment its platform can no longer
+  deliver comes back as "attachment unavailable" with the reason
 
 Optional API story generation uses `claude-sonnet-5-5` with medium effort and
 a 16,000-token limit when the caller supplies an Anthropic API key. Without a
@@ -170,6 +175,17 @@ return an error naming the working read tools instead.
   `/api/conversations/<id>/messages`), the HTTP twin of the `search_messages`
   MCP tool. Optional `phone`, `conversation_id`, `since`/`until` (YYYY-MM-DD,
   local time, `until` inclusive to end of day), `limit` (default 50, max 500).
+- `GET /api/media/<message-id|v2msg:<message>:<n>>` and
+  `GET /api/v1/messages/<id>/attachments/<n>` — attachment bytes (a pending
+  v2 attachment is downloaded first; `X-Content-SHA256` carries the digest).
+  An attachment the transport can no longer deliver answers 404, a transport
+  that is unreachable right now 503.
+- `PUT /api/v1/messages/<id>/attachments/<n>` — import a local copy (raw
+  body, optional `X-Content-SHA256`) of a pending attachment the platform
+  can't deliver, e.g. a Signal attachment signal-cli never stored; checked
+  against the declared size. CLI: `openmessage media import`. See
+  [docs/agent-runbook.md](docs/agent-runbook.md) ("Signal attachments
+  signal-cli never stored").
 - `POST /api/react` — `{conversation_id, message_id, emoji, action}`. On a
   v2-primary daemon it takes the v2 IDs the read API returns, queues the
   reaction on the durable outbox and waits up to 8 s: 200 delivered, 202

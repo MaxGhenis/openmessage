@@ -383,3 +383,39 @@ func TestReactDecodesTheQueuedAnswer(t *testing.T) {
 		t.Fatalf("React() error = %v", err)
 	}
 }
+
+func TestMessageAttachmentReadsBytesHeadersAndLimit(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.EscapedPath() != "/api/v1/messages/msg%2F1/attachments/3" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Content-Disposition", `attachment; filename="Report.html"`)
+		w.Header().Set("X-Content-SHA256", "ABCDEF")
+		_, _ = w.Write([]byte("0123456789"))
+	}))
+	defer server.Close()
+	client := NewClient(server.URL, "")
+
+	attachment, err := client.MessageAttachment(context.Background(), "msg/1", 3, 10)
+	if err != nil {
+		t.Fatalf("MessageAttachment(): %v", err)
+	}
+	if string(attachment.Data) != "0123456789" || attachment.Filename != "Report.html" ||
+		attachment.MIME != "application/octet-stream" || attachment.SHA256 != "abcdef" {
+		t.Fatalf("MessageAttachment() = %+v", attachment)
+	}
+	if _, err := client.MessageAttachment(context.Background(), "msg/1", 3, 9); err == nil || !strings.Contains(err.Error(), "exceeds 9 bytes") {
+		t.Fatalf("MessageAttachment(limit 9) error = %v, want the size limit", err)
+	}
+	if _, err := client.MessageAttachment(context.Background(), "other", 0, 10); !IsDeterministicRejection(err) {
+		t.Fatalf("MessageAttachment(unknown) error = %v, want a 404 ResponseError", err)
+	}
+	if got := client.attachmentHTTP().Timeout; got < attachmentTimeout {
+		t.Fatalf("attachment timeout = %v, want at least %v", got, attachmentTimeout)
+	}
+	if client.HTTP.Timeout != 10*time.Second {
+		t.Fatalf("attachment requests changed the client's default timeout to %v", client.HTTP.Timeout)
+	}
+}

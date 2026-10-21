@@ -122,3 +122,9 @@ func ReplyQuoteArgsForTest(
 	bridge := &Bridge{store: store, logger: zerolog.Nop(), contactByACI: contactByACI}
 	return bridge.replyQuoteArgs(reply, account)
 }
+
+// HandleReceiveOutputForTest runs bridge's live receive-output handling (the
+// path a receive call's combined stdout and stderr take) over output.
+func HandleReceiveOutputForTest(bridge *Bridge, account string, output []byte) error {
+	return bridge.handleReceiveOutput(account, output)
+}

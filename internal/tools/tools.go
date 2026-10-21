@@ -93,7 +93,7 @@ func RegisterWithOptions(s *server.MCPServer, a *app.App, options Options) {
 		s.AddTool(getStatusTool(), getStatusHandler(a, options))
 	}
 	s.AddTool(draftMessageTool(), draftMessageHandler(a))
-	s.AddTool(downloadMediaTool(), downloadMediaHandler(a))
+	s.AddTool(downloadMediaTool(), downloadMediaHandler(a, options))
 	s.AddTool(importMessagesTool(), importMessagesHandler(a))
 	s.AddTool(getPersonMessagesTool(), getPersonMessagesHandler(a, options))
 	s.AddTool(getPersonMessagesRangeTool(), getPersonMessagesRangeHandler(a, options))
