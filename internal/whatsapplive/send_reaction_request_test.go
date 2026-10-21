@@ -357,6 +357,13 @@ func TestSendReactionRequestNamesAGroupSenderByTheKeyItsMessageArrivedWith(t *te
 			author: reactionTestPhone + "@hosted",
 			want:   reactionTestPhone + "@hosted",
 		},
+		{
+			name:   "bot sender",
+			lids:   reactionTestLIDs{},
+			mode:   watypes.AddressingModeLID,
+			author: "867051314767696@bot",
+			want:   "867051314767696@bot",
+		},
 	}
 
 	for _, test := range tests {
