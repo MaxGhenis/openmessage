@@ -4530,8 +4530,9 @@ func (b *Bridge) reactionActorIDForClient(cli *whatsmeow.Client) string {
 // phone number names no one either (reactionTargetAuthorJID).
 //
 // The sender is not mapped between phone number and LID here. In a 1:1 chat
-// it only tells BuildMessageKey the message is not this account's, which
-// either form does; in a group reactionTargetParticipant picks the form.
+// with a phone number or a LID it only tells BuildMessageKey the message is
+// not this account's, which either form does; in a group
+// reactionTargetParticipant picks the form.
 func (b *Bridge) reactionRequestTargetSender(chatJID watypes.JID, authorID string, outgoing bool) (sender watypes.JID, named bool) {
 	if outgoing {
 		return watypes.EmptyJID, true
