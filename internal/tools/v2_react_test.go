@@ -492,8 +492,9 @@ func TestV2ReactionTextSaysARefusalIsAboutTheMessage(t *testing.T) {
 func TestV2ReactionTextSaysAHeldReactionWaitsForItsMessage(t *testing.T) {
 	held := v2ReactionText("outbox-1", messaging.OutboxNotDispatched, "transient", "reaction_target_unsent", "key-1")
 	if !strings.Contains(held, "outbox-1") || !strings.Contains(held, "Do NOT react again") ||
-		!strings.Contains(held, "waiting for the message it reacts to") || !strings.Contains(held, "key-1") {
-		t.Fatalf("held reaction text = %q, want it queued, not to be repeated, and waiting for its message", held)
+		!strings.Contains(held, "waiting for the message it reacts to") || !strings.Contains(held, "key-1") ||
+		!strings.Contains(held, "canceled or the platform refuses it") {
+		t.Fatalf("held reaction text = %q, want it queued, not to be repeated, waiting for its message, and rejected if that message never goes out", held)
 	}
 	for _, code := range []string{"send_reaction", ""} {
 		text := v2ReactionText("outbox-2", messaging.OutboxNotDispatched, "transient", code, "")
