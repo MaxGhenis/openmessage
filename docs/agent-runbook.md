@@ -558,7 +558,7 @@ running app:
 
 ```json
 "openmessage": {
-  "command": "/usr/local/bin/openmessage",
+  "command": "/Applications/OpenMessage.app/Contents/Resources/openmessage",
   "args": ["serve", "--mcp-stdio"],
   "env": {
     "OPENMESSAGES_DATA_DIR": "/Users/<user>/Library/Application Support/OpenMessage",
@@ -572,9 +572,24 @@ daemon-truth detection all line up (two-data-dirs trap above). On a migrated
 (v2-primary) install, also set `OPENMESSAGES_V2_PRIMARY=1` — the legacy
 `messages.db` froze at cutover, and this keeps MCP reads on the v2 store even
 when the app is closed or predates the `auth.data_dir` status field (drop the
-line on a non-migrated install). Keep the PATH binary in lockstep with the
-installed app — both open the same SQLite stores, and a client binary at a
-different schema version than the store refuses it until the two match.
+line on a non-migrated install).
+
+**Run the app's own binary, not a copy.** The MCP client opens the same SQLite
+stores as the app, and a binary at a different schema version than the store
+refuses it. The backend inside the app bundle always matches the store after a
+deploy, so a client that runs it can't drift. On 2026-10-21 a deploy added
+migration 0011, and the July copy at `/usr/local/bin/openmessage` failed with
+`database schema version 11 is newer than supported version 10`, so every new
+MCP session's openmessage server exited at startup. Point the PATH binary at the
+bundle too (it is root-owned, so this needs `sudo` once):
+
+```bash
+sudo ln -sf /Applications/OpenMessage.app/Contents/Resources/openmessage /usr/local/bin/openmessage
+```
+
+During a full deploy (`rm -rf` then `cp -R`) the bundle is briefly absent, and
+an MCP server started in those seconds fails; restart that session's MCP
+server.
 
 **Never** configure MCP to run `serve --web`, `serve --mcp-sse`, or
 `serve ... --transports` alongside the app: those are daemon shapes and will
@@ -1956,10 +1971,38 @@ open -a OpenMessage
 ```
 
 A build with a new schema migration applies it when the new app starts,
-before its v2 stack (and so v2 ingest) exists. Update the PATH binary
-(`/usr/local/bin/openmessage`) after the app: until the two match, `openmessage
-read`/`status` and the MCP client refuse the store (a newer binary asks you to
-reopen the app; an older one reports the store as newer than supported).
+before its v2 stack (and so v2 ingest) exists. Any other copy of the binary
+must then match it: until it does, `openmessage read`/`status` and the MCP
+client refuse the store (a newer binary asks you to reopen the app; an older
+one reports the store as newer than supported). With the MCP config and
+`/usr/local/bin/openmessage` pointing at the bundle's binary (see "MCP config"),
+there is no other copy to update.
+
+**Backend-only swap.** When the Swift app is unchanged since the installed
+build (`git diff --stat <installed-commit> HEAD -- macos/` is empty), only the
+Go binary needs replacing. That skips the Swift build, the DMG, and most of the
+disk. The installed build's `git describe` is the `serverInfo.version` in an
+MCP `initialize` response. Build and sign the backend as `build.sh` does, then
+swap it in while the app is quit (park the watchdog first):
+
+```
+CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 GOWORK=off go build -trimpath \
+  -ldflags="-s -w -X main.version=$(git describe --tags --always)" -o /tmp/om-backend .
+codesign --force --options runtime --entitlements macos/OpenMessageHelper.entitlements \
+  --sign "Developer ID Application: Max Ghenis (8VB5UKQZC6)" /tmp/om-backend
+osascript -e 'quit app "OpenMessage"'
+cp /tmp/om-backend /Applications/OpenMessage.app/Contents/Resources/openmessage
+codesign --force --options runtime --entitlements macos/OpenMessage.entitlements \
+  --sign "Developer ID Application: Max Ghenis (8VB5UKQZC6)" /Applications/OpenMessage.app
+codesign --verify --deep --strict /Applications/OpenMessage.app
+xattr -cr /Applications/OpenMessage.app
+open -a OpenMessage
+```
+
+Keep the old binary until the new one is verified. To roll back, copy it back
+and re-sign the bundle the same way. Don't keep a backup `.app` anywhere (see
+"Bundle-id shadowing"). An arm64-only binary is fine on an Apple Silicon
+install; the next full `build.sh` deploy restores the universal one.
 
 Confirm the deployed bundle kept the release id:
 
