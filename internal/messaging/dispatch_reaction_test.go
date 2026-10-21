@@ -1239,3 +1239,97 @@ func TestRetryingAHeldReactionsSendEarlyBringsTheReactionWithIt(t *testing.T) {
 		t.Fatalf("reaction requests = %+v, want one naming the sent message's platform ID", requests)
 	}
 }
+
+// A cancel or early retry of the send that lands between the dispatcher
+// reading a reaction's target and recording the hold finds the reaction still
+// dispatching, so its own wake passes the reaction by. The dispatcher reads
+// the send again after the hold and, finding it changed, makes the reaction
+// due at once instead of at the send's old time.
+func TestASendChangedWhileItsReactionIsBeingHeldWakesTheReaction(t *testing.T) {
+	cases := []struct {
+		name string
+		// change lands in the gap; then is what the reaction does when it
+		// is next due, a millisecond later.
+		change func(t *testing.T, service *MessageService, send Submission)
+		then   func(t *testing.T, service *MessageService, sender *scriptedReactionSender, held Submission)
+	}{
+		{
+			name: "canceled",
+			change: func(t *testing.T, service *MessageService, send Submission) {
+				if _, err := service.Cancel(context.Background(), send.OutboxID); err != nil {
+					t.Fatalf("Cancel(send): %v", err)
+				}
+			},
+			then: func(t *testing.T, service *MessageService, sender *scriptedReactionSender, held Submission) {
+				if processed, err := service.DispatchDue(context.Background(), 4); err != nil || processed != 1 {
+					t.Fatalf("DispatchDue() = %d, %v; want the reaction", processed, err)
+				}
+				if row := mustOutboxItem(t, service, held.OutboxID); sender.requestCount() != 0 || row.State != sqlite.OutboxRejected ||
+					row.ErrorCode == nil || *row.ErrorCode != "reaction_target_never_sent" {
+					t.Fatalf("reaction after its send was canceled in the gap = %+v, want rejected uncalled", row)
+				}
+			},
+		},
+		{
+			name: "retried early",
+			change: func(t *testing.T, service *MessageService, send Submission) {
+				if _, err := service.RetryNotDispatched(context.Background(), send.OutboxID); err != nil {
+					t.Fatalf("RetryNotDispatched(send): %v", err)
+				}
+			},
+			then: func(t *testing.T, service *MessageService, sender *scriptedReactionSender, held Submission) {
+				if processed, err := service.DispatchDue(context.Background(), 4); err != nil || processed != 2 {
+					t.Fatalf("DispatchDue() = %d, %v; want the send and then the reaction", processed, err)
+				}
+				if requests := sender.snapshotRequests(); len(requests) != 1 || requests[0].Target.RemoteID != "platform-gap" {
+					t.Fatalf("reaction requests = %+v, want one naming the sent message", requests)
+				}
+			},
+		},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			clock := newManualClock(messagingTestTime)
+			store := openMessagingTestStore(t, clock.Now())
+			sender := &scriptedReactionSender{}
+			text := &scriptedTextSender{}
+			registry := newScriptedRegistry("reaction-gap", text)
+			registry.setReactionSender(sender)
+			registry.setAvailable(true)
+			service := newMessagingTestService(t, store, registry, clock)
+			outbox, err := sqlite.NewOutboxRepository(store, clock.Now)
+			if err != nil {
+				t.Fatalf("NewOutboxRepository(): %v", err)
+			}
+			// The send is retrying in an hour, so it can be canceled or
+			// retried early.
+			send := mustSendText(t, service, SendTextCommand{CommonCommand: testCommonCommand("gap-send"), Body: "rate limited"})
+			row := mustOutboxItem(t, service, send.OutboxID)
+			if err := outbox.MarkNotDispatched(ctx, row.OutboxID, mustLeaseSend(t, outbox, row, clock.Now()),
+				"rate_limited", "send_text", "scripted", clock.Now().Add(time.Hour)); err != nil {
+				t.Fatalf("MarkNotDispatched(): %v", err)
+			}
+			held := mustSendDispatchReaction(t, service, SendReactionCommand{
+				CommonCommand:   testCommonCommand("gap-reaction"),
+				TargetMessageID: send.LocalMessageID,
+				Emoji:           "👍",
+			})
+			clock.Advance(time.Second)
+			afterReactionTargetRead = func() {
+				afterReactionTargetRead = func() {}
+				test.change(t, service, send)
+			}
+			t.Cleanup(func() { afterReactionTargetRead = func() {} })
+			if processed, err := service.DispatchDue(ctx, 4); err != nil || processed != 1 {
+				t.Fatalf("DispatchDue(hold) = %d, %v; want the reaction held", processed, err)
+			}
+			if next := mustOutboxItem(t, service, held.OutboxID).NextAttemptAtMS; next == nil || *next != clock.Now().UnixMilli()+1 {
+				t.Fatalf("held reaction next attempt = %v, want 1 ms from now (%d), not the send's old time", next, clock.Now().UnixMilli()+1)
+			}
+			text.steps = []sendStep{{result: bridge.SendResult{RemoteMessageID: "platform-gap"}}}
+			clock.Advance(time.Millisecond)
+			test.then(t, service, sender, held)
+		})
+	}
+}

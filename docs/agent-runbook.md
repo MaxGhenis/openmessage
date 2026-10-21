@@ -2044,9 +2044,14 @@ ID (Google's TmpID) depends on how far that send has got
   held for it due 1 ms later, in the same transaction
   (`OutboxRepository.Cancel`, `RetryNotDispatched`): they follow a retried
   send at once, and a canceled send's reactions are rejected (next bullet).
+  A cancel or retry that lands while the dispatcher is holding a reaction
+  for that send (the reaction is `dispatching`, so the wake passes it by) is
+  caught when the dispatcher reads the send again after recording the hold
+  (`wakeIfSendChanged`).
   Before, the reaction went to the transport with the request ID: Google
   asked the phone with the TmpID, and a refusal was retried every 5 s until
-  the send went out and its echo renamed the message, or someone canceled the
+  the send went out and its echo renamed the message, the send was canceled
+  or rejected (the next refusal was then final), or someone canceled the
   reaction; WhatsApp addressed it to an ID no WhatsApp message has (above);
   Signal refused it before signal-cli, every 5 s.
 - **Never sent** (`canceled`, or `rejected` by the platform). The platform
@@ -2055,8 +2060,9 @@ ID (Google's TmpID) depends on how far that send has got
   unsupported`, `error_code: reaction_target_never_sent`, and `/api/react`
   answers 502 "the message it reacts to was never sent". Before, it went to
   the transport naming the request ID: Google asked the phone and rejected
-  the reaction on its refusal, WhatsApp addressed it to no message and
-  recorded it as sent, and Signal retried it every 5 s for good.
+  the reaction on its refusal, WhatsApp addressed it to no message (and
+  recorded it as sent when WhatsApp accepted it), and Signal retried it
+  every 5 s for good.
 - **Sent less than a minute ago** (`confirmed` and waiting for the echo,
   `uncertain`, or `store_failed`, timed from the send row's `updated_at_ms`:
   when the transport's answer was recorded, or later lease recovery or a
@@ -2078,9 +2084,10 @@ ID (Google's TmpID) depends on how far that send has got
   before its send was recorded can still be paired after the minute, by the
   startup repair or a later frame for the message; every measured echo
   arrived after.) A refused reaction to a message that keeps its TmpID is
-  now sent at most 13 times (once per 5 s for the minute, then the final
-  one), where before it was sent every 5 s for as long as the message kept
-  it. If the phone did not have the message yet, react again once it does.
+  now sent at most 13 times per window (once per 5 s for the minute, then the
+  final one; a later lease recovery or store repair of the send starts a new
+  window), where before it was sent every 5 s for as long as the message
+  kept it. If the phone did not have the message yet, react again once it does.
 
 Find the reactions still retrying with:
 

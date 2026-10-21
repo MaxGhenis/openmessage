@@ -199,7 +199,7 @@ func v2ReactionText(outboxID string, state messaging.OutboxState, errorClass, er
 		if errorCode == "reaction_target_unsent" {
 			// The dispatcher holds a reaction whose target is this
 			// account's own message that has not been sent yet.
-			text += " It is waiting for the message it reacts to, which has not been sent yet, and goes out after that message does (if that message is canceled instead, the reaction is rejected)."
+			text += " It is waiting for the message it reacts to, which has not been sent yet, and goes out after that message does (if that message is canceled or the platform refuses it instead, the reaction is rejected)."
 		}
 		if idempotencyKey != "" {
 			text += fmt.Sprintf(" To repeat this exact reaction deliberately, reuse idempotency_key %s.", idempotencyKey)

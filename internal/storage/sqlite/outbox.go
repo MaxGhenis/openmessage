@@ -1439,7 +1439,43 @@ func (r *OutboxRepository) commitSendStateChange(
 		_ = tx.Rollback()
 		return r.requireStateMutation(ctx, operation, outboxID, result)
 	}
-	if _, err := tx.ExecContext(ctx, `
+	if _, err := wakeReactionsHeldFor(ctx, tx, outboxID, nowMS); err != nil {
+		return fmt.Errorf("%s outbox item %q: wake reactions held for it: %w", operation, outboxID, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("%s outbox item %q: commit: %w", operation, outboxID, err)
+	}
+	return nil
+}
+
+// WakeReactionsHeldFor makes the reactions held for the send sendOutboxID
+// (ReactionTargetUnsentCode) due 1 ms from now, as Cancel and
+// RetryNotDispatched do, and reports how many it moved. The dispatcher calls
+// it when the send changed while a reaction to it was being held.
+func (r *OutboxRepository) WakeReactionsHeldFor(ctx context.Context, sendOutboxID string) (int64, error) {
+	nowMS, err := r.nowMS("wake reactions held for outbox item")
+	if err != nil {
+		return 0, err
+	}
+	woken, err := wakeReactionsHeldFor(ctx, r.store.db, sendOutboxID, nowMS)
+	if err != nil {
+		return 0, fmt.Errorf("wake reactions held for outbox item %q: %w", sendOutboxID, err)
+	}
+	return woken, nil
+}
+
+// wakeReactionsHeldFor moves the reactions held for the send sendOutboxID
+// that are due later than 1 ms after nowMS to that time. Only reactions to
+// the send's own message are held for it.
+func wakeReactionsHeldFor(
+	ctx context.Context,
+	execer interface {
+		ExecContext(context.Context, string, ...any) (sql.Result, error)
+	},
+	sendOutboxID string,
+	nowMS int64,
+) (int64, error) {
+	result, err := execer.ExecContext(ctx, `
 		UPDATE outbox
 		SET next_attempt_at_ms = ?,
 			updated_at_ms = ?
@@ -1453,13 +1489,11 @@ func (r *OutboxRepository) commitSendStateChange(
 		      JOIN outbox AS send ON send.local_message_id = r.target_message_id
 		      WHERE send.outbox_id = ?
 		  )
-	`, nowMS+1, nowMS, ReactionTargetUnsentCode, nowMS+1, outboxID); err != nil {
-		return fmt.Errorf("%s outbox item %q: wake reactions held for it: %w", operation, outboxID, err)
+	`, nowMS+1, nowMS, ReactionTargetUnsentCode, nowMS+1, sendOutboxID)
+	if err != nil {
+		return 0, err
 	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("%s outbox item %q: commit: %w", operation, outboxID, err)
-	}
-	return nil
+	return result.RowsAffected()
 }
 
 // Cancel transitions pending work to a terminal canceled state. Active or

@@ -546,6 +546,7 @@ func (s *MessageService) dispatchReactionLease(ctx context.Context, outboxLease 
 			s.clock.Now().Add(s.retryDelay),
 		)
 	}
+	afterReactionTargetRead()
 	switch {
 	case send != nil && send.progress == sendUnsent:
 		// The target is this account's message whose send has not gone out,
@@ -553,7 +554,7 @@ func (s *MessageService) dispatchReactionLease(ctx context.Context, outboxLease 
 		// a message nobody has (on Google the phone may refuse it, on
 		// WhatsApp the reaction would address an ID the send never uses), so
 		// the reaction waits, uncalled, until the send is next due.
-		return s.markPreCallFailure(
+		if err := s.markPreCallFailure(
 			ctx,
 			item,
 			string(bridge.FailureTransient),
@@ -564,7 +565,11 @@ func (s *MessageService) dispatchReactionLease(ctx context.Context, outboxLease 
 				send.row.State,
 			),
 			s.unsentTargetRetryAt(send.row),
-		)
+		); err != nil {
+			return err
+		}
+		s.wakeIfSendChanged(ctx, send.row)
+		return nil
 	case send != nil && send.progress == sendNeverSent:
 		// The target is this account's message whose send was canceled or
 		// rejected: the platform never got it and never will, so there is
@@ -910,6 +915,43 @@ func (s *MessageService) targetSendProgress(
 	default:
 		return nil, false, nil
 	}
+}
+
+// afterReactionTargetRead runs between reading a reaction's target (and its
+// send) and acting on it. Tests set it to land a change to the send in that
+// gap.
+var afterReactionTargetRead = func() {}
+
+// wakeIfSendChanged closes the gap between reading a held reaction's target
+// send and recording the hold. A cancel or early retry of the send that
+// committed in that gap found the reaction still dispatching, so its wake
+// (OutboxRepository.Cancel, RetryNotDispatched) passed the reaction by, and
+// the hold was timed from the send as it was. So the send is read again, and
+// if it has changed the reactions held for it are made due at once, to be
+// judged again. Should that fail, the hold stands as recorded: the reaction
+// is tried at the send's old due time.
+func (s *MessageService) wakeIfSendChanged(ctx context.Context, read sqlite.OutboxItem) {
+	current, err := s.outbox.FindByID(ctx, read.OutboxID)
+	if err != nil {
+		return
+	}
+	if current.State == read.State && current.UpdatedAtMS == read.UpdatedAtMS &&
+		equalOptionalMS(current.NextAttemptAtMS, read.NextAttemptAtMS) {
+		return
+	}
+	mutationCtx, cancel := s.storageMutationContext(ctx)
+	defer cancel()
+	if woken, err := s.outbox.WakeReactionsHeldFor(mutationCtx, read.OutboxID); err == nil && woken > 0 {
+		s.signalChange()
+		s.signalWake()
+	}
+}
+
+func equalOptionalMS(a, b *int64) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return *a == *b
 }
 
 // unsentTargetRetryAt is when a reaction held for its target's unsent send is

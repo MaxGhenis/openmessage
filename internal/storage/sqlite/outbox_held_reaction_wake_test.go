@@ -35,6 +35,12 @@ func TestCancelAndRetryWakeOnlyTheReactionsHeldForThatSend(t *testing.T) {
 		time.UnixMilli(tomorrowMS)); err != nil {
 		t.Fatalf("MarkNotDispatched(send-b): %v", err)
 	}
+	// send-c is in flight, so it can be neither canceled nor retried.
+	sendC := mustEnqueueOutgoingOutbox(t, outbox, outboxTestItem("send-c"), "in flight")
+	leased = mustLeaseOne(t, outbox, LeaseRequest{Owner: "dispatcher", Now: clock.Now(), Duration: 96 * time.Hour, Limit: 1})
+	if leased.OutboxID != sendC.OutboxID {
+		t.Fatalf("leased %q, want send-c", leased.OutboxID)
+	}
 	// Each reaction waits until retryAtMS with code: held for its target's
 	// send, or not_dispatched for another reason.
 	reactions := []struct {
@@ -46,6 +52,7 @@ func TestCancelAndRetryWakeOnlyTheReactionsHeldForThatSend(t *testing.T) {
 		// Due half an hour before the cancel below, so already due then.
 		{id: "due-sooner-for-a", target: "message-send-a", code: ReactionTargetUnsentCode, retryAtMS: nowMS + (30 * time.Minute).Milliseconds()},
 		{id: "held-for-b", target: "message-send-b", code: ReactionTargetUnsentCode, retryAtMS: tomorrowMS + 1},
+		{id: "held-for-c", target: "message-send-c", code: ReactionTargetUnsentCode, retryAtMS: tomorrowMS + 1},
 	}
 	for _, reaction := range reactions {
 		item := outboxTestReactionItem(reaction.id)
@@ -90,15 +97,35 @@ func TestCancelAndRetryWakeOnlyTheReactionsHeldForThatSend(t *testing.T) {
 		"held-for-b":       tomorrowMS + 1,
 	})
 
-	// A refused cancel or retry wakes nothing.
+	// A refused cancel or retry wakes nothing: send-c's reaction stays
+	// held for tomorrow.
 	clock.Set(cancelMS + time.Second.Milliseconds())
-	if err := outbox.Cancel(ctx, sendA.OutboxID); !errors.Is(err, ErrInvalidOutboxState) {
-		t.Fatalf("Cancel(canceled send-a) = %v, want ErrInvalidOutboxState", err)
+	for _, refused := range []struct {
+		name string
+		call func() error
+	}{
+		{"Cancel(canceled send-a)", func() error { return outbox.Cancel(ctx, sendA.OutboxID) }},
+		{"RetryNotDispatched(canceled send-a)", func() error { return outbox.RetryNotDispatched(ctx, sendA.OutboxID) }},
+		{"Cancel(in-flight send-c)", func() error { return outbox.Cancel(ctx, sendC.OutboxID) }},
+		{"RetryNotDispatched(in-flight send-c)", func() error { return outbox.RetryNotDispatched(ctx, sendC.OutboxID) }},
+	} {
+		if err := refused.call(); !errors.Is(err, ErrInvalidOutboxState) {
+			t.Fatalf("%s = %v, want ErrInvalidOutboxState", refused.name, err)
+		}
 	}
-	if err := outbox.RetryNotDispatched(ctx, sendA.OutboxID); !errors.Is(err, ErrInvalidOutboxState) {
-		t.Fatalf("RetryNotDispatched(canceled send-a) = %v, want ErrInvalidOutboxState", err)
+	want("after the refused calls", map[string]int64{
+		"held-for-a": cancelMS + 1,
+		"held-for-b": tomorrowMS + 1,
+		"held-for-c": tomorrowMS + 1,
+	})
+
+	// WakeReactionsHeldFor moves the same reactions on its own.
+	wakeMS := cancelMS + 2*time.Second.Milliseconds()
+	clock.Set(wakeMS)
+	if woken, err := outbox.WakeReactionsHeldFor(ctx, sendC.OutboxID); err != nil || woken != 1 {
+		t.Fatalf("WakeReactionsHeldFor(send-c) = %d, %v; want 1", woken, err)
 	}
-	want("after the refused calls", map[string]int64{"held-for-a": cancelMS + 1, "held-for-b": tomorrowMS + 1})
+	want("after waking send-c's reactions", map[string]int64{"held-for-c": wakeMS + 1, "held-for-b": tomorrowMS + 1})
 
 	// Retrying send-b early wakes its reaction just after it.
 	retryMS := cancelMS + time.Minute.Milliseconds()
