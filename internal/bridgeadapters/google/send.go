@@ -336,8 +336,8 @@ func (a *Adapter) SendReaction(
 	}
 	if !response.GetSuccess() {
 		// The phone answered and refused a reaction to a message named by
-		// its own ID. A retry would send the same request, so the refusal
-		// is final.
+		// an ID that will not change. A retry would send the same request,
+		// so the refusal is final.
 		return bridge.SendResult{}, bridge.OpError{
 			Class:       bridge.FailureUnsupported,
 			Operation:   "send_reaction",

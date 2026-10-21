@@ -1790,7 +1790,7 @@ legacy senders unchanged.
   |---|---|---|
   | 200 | `success: true` | The platform accepted it (`confirmed`, or `store_failed`). |
   | 202 | `success: true, queued: true` | Stored, not delivered yet (`queued`, `dispatching`, `not_dispatched`). The app keeps retrying it; do not react again. |
-  | 502 | `error` | `uncertain` (the transport call ended without an answer: it may have been applied) or `rejected` (the platform refused it, for example Google's phone answering `success: false` for a message named by its own ID, stored as `error_class: unsupported`; it is not retried). |
+  | 502 | `error` | `uncertain` (the transport call ended without an answer: it may have been applied) or `rejected` (the platform refused it, for example Google's phone answering `success: false` for a message whose ID will not change, stored as `error_class: unsupported`; it is not retried). |
   | 409 | `error` | `canceled` before it was sent. |
   | 422 | `reaction_target_unavailable` | No v2 message with that ID, or not in that conversation. Nothing was queued. |
   | 501 | `error` | The account has no reaction sender (an import-only platform). |
@@ -1874,8 +1874,11 @@ dispatcher marks that target `ProvisionalRemoteID` (its send is unresolved, or
 confirmed and waiting for the echo; not canceled or rejected), and a refusal
 of it goes `not_dispatched` (`error_detail` `send_reaction: transient: Google
 Messages refused a reaction to a message still named by its send's request
-ID`) so the retry after the echo names the phone's ID. Find the ones still
-retrying with:
+ID`) so the retry after the echo names the phone's ID. Nothing bounds that
+wait: if no echo ever renames the message (a scheduled send that has not gone
+out, or an `uncertain` one that never reached the phone), the refusal is
+retried every 5 s until the reaction is canceled. Find the ones still retrying
+with:
 
 ```bash
 curl -s "http://127.0.0.1:7007/api/v1/outbox?limit=100" | jq '.[] | select(.kind=="reaction")'

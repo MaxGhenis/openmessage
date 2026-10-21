@@ -117,17 +117,33 @@ func (s *MessageService) awaitingTransportID(
 	item sqlite.OutboxItem,
 	target sqlite.Message,
 ) (bool, error) {
+	_, found, err := s.ownSendRow(ctx, item.AccountID, target)
+	return found, err
+}
+
+// ownSendRow returns the outbox row whose transport request ID target's
+// remote ID still is, when target is the outgoing message that row sent.
+// found is false for any other message, including one already renamed to the
+// ID its platform gave it.
+func (s *MessageService) ownSendRow(
+	ctx context.Context,
+	accountID string,
+	target sqlite.Message,
+) (row sqlite.OutboxItem, found bool, err error) {
 	if target.Direction != sqlite.MessageDirectionOutgoing {
-		return false, nil
+		return sqlite.OutboxItem{}, false, nil
 	}
-	row, err := s.outbox.FindByTransportRequestID(ctx, item.AccountID, target.RemoteMessageID)
+	row, err = s.outbox.FindByTransportRequestID(ctx, accountID, target.RemoteMessageID)
 	if errors.Is(err, sqlite.ErrNotFound) {
-		return false, nil
+		return sqlite.OutboxItem{}, false, nil
 	}
 	if err != nil {
-		return false, err
+		return sqlite.OutboxItem{}, false, err
 	}
-	return row.LocalMessageID != nil && *row.LocalMessageID == target.MessageID, nil
+	if row.LocalMessageID == nil || *row.LocalMessageID != target.MessageID {
+		return sqlite.OutboxItem{}, false, nil
+	}
+	return row, true, nil
 }
 
 // messageAuthorID returns the canonical identity of a stored message's
