@@ -592,8 +592,8 @@ An MCP server checks the schema only when it starts. One started before a
 deploy keeps running the old build against the new store, so after a deploy
 that adds a migration, restart the MCP servers of open sessions. One started
 during a deploy fails: during a full deploy (`rm -rf` then `cp -R`) the bundle
-is briefly absent, and until the new app's first start the new binary is ahead
-of the store (`ErrMigrationPending`, "quit and reopen the OpenMessage app").
+is briefly absent, and if the deploy adds a migration, the new binary is ahead
+of the store until the new app's first start (`ErrMigrationPending`, "quit and reopen the OpenMessage app").
 
 **Because sessions now run the bundle's binary, never overwrite it in place.**
 On macOS, `cp` over an executable that a process is running makes every later
@@ -2007,7 +2007,7 @@ CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 GOWORK=off go build -trimpath \
   -ldflags="-s -w -X main.version=$(git describe --tags --always --dirty)" -o /tmp/om-swap/openmessage .
 codesign --force --options runtime --entitlements macos/OpenMessageHelper.entitlements \
   --sign "Developer ID Application: Max Ghenis (8VB5UKQZC6)" /tmp/om-swap/openmessage
-codesign -dv /tmp/om-swap/openmessage 2>&1 | grep -x 'Identifier=openmessage'
+codesign -dv /tmp/om-swap/openmessage 2>&1 | grep -x 'Identifier=openmessage' || echo STOP
 R=/Applications/OpenMessage.app/Contents/Resources
 cp -p "$R/openmessage" ~/openmessage-backend.prev   # rollback copy, a bare file
 osascript -e 'quit app "OpenMessage"'
@@ -2019,18 +2019,30 @@ xattr -cr /Applications/OpenMessage.app
 open -a OpenMessage
 ```
 
-A quick swap needs no [watchdog parking](#parking-the-launchd-watchdog): a
-relaunch takes two failed probes 5 minutes apart. If you park it, remove
-`watchdog-disabled` right after `open -a OpenMessage`.
+The identifier check must print `Identifier=openmessage`; if it prints `STOP`,
+stop before the swap. A quick swap needs no
+[watchdog parking](#parking-the-launchd-watchdog): a relaunch takes two failed
+probes 5 minutes apart. If you park it, remove
+`$HOME/Library/Application Support/OpenMessage/watchdog-disabled` right after
+`open -a OpenMessage`.
 
-To roll back, rename the `.prev` copy over the path the same way and re-sign
-the bundle. That works only when the new build added no migration
+To roll back, stage the `.prev` copy and rename it into place (a copy, so the
+`.prev` file survives), then re-sign the bundle:
+
+```
+cp -p ~/openmessage-backend.prev "$R/openmessage.new" && mv -f "$R/openmessage.new" "$R/openmessage"
+```
+
+A binary rollback works only when the new build added no migration
 (`git diff --stat <installed-commit> -- internal/storage/sqlite/migrations/`
 prints nothing): an older binary refuses a store migrated past it. Otherwise
 the options are to roll forward, or to restore a copy of `v2/store.sqlite3`
-taken before the swap (sqlite3 `.backup`, or the file with its `-wal` and
-`-shm` while the app is quit). `openmessage backup` does not copy `v2/`. Keep
-the old binary as a bare file, not inside an `.app` (see "Bundle-id
+taken before the swap with sqlite3 `.backup`. Don't copy the raw file and its
+`-wal`/`-shm` instead: open MCP clients keep connections, and the last one to
+close may checkpoint the WAL into the main file mid-copy. Restoring loses
+whatever the new build stored after the swap. `openmessage backup` does not
+copy `v2/`.
+Keep the old binary as a bare file, not inside an `.app` (see "Bundle-id
 shadowing"). An arm64-only binary is fine on an Apple Silicon install; the next
 full `build.sh` deploy restores the universal one.
 
