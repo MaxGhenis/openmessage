@@ -246,7 +246,10 @@ func drain(process *os.Process, req receiveDrainRequest, watch downloadWatch, po
 			req.beat("receive_download")
 		}
 		if verdict.kill {
-			if err := process.Kill(); errors.Is(err, os.ErrProcessDone) {
+			if err := process.Kill(); err != nil {
+				if !errors.Is(err, os.ErrProcessDone) {
+					req.logger.Warn().Err(err).Msg("Failed to kill a stopped Signal receive call")
+				}
 				return
 			}
 			event := req.logger.Warn().

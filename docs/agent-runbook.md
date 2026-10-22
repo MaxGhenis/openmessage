@@ -2005,7 +2005,9 @@ a receive call stopped by **its deadline** is *drained*
   then retries them about every 5 s. The dispatcher sends every platform's
   messages one at a time, so blocking would stall WhatsApp and Google too.
   Otherwise a send waits up to 10 s for the command gate, and its 20 s
-  timeout starts only once it holds the gate. Before this change the wait
+  timeout starts only once it holds the gate. A quoted reply to an author
+  the contact cache lacks can first wait for a contact refresh too, about
+  50 s in the worst case, still under the dispatcher's 60 s text limit. Before this change the wait
   counted against that timeout, so a send whose timeout ran out before
   signal-cli started could be marked uncertain.
   Attachment fetches (`getAttachment`), and the contact refresh a send runs
@@ -2041,7 +2043,11 @@ both `TMPDIR` and `SIGNAL_CLI_OPTS`, and takes `java.io.tmpdir` from
 succeeded. A JVM install keeps getting it through `SIGNAL_CLI_OPTS`, as
 before. A wrapper *script* around the native binary gets neither, so its
 ciphertext lands outside the run dir and the drain sees only the empty
-`attachments/*.tmp`: such a call is held for the 45 s stall window at most. Builds before #259 had each
+`attachments/*.tmp`. A wrapper that ends in `exec signal-cli "$@"` is then held
+for the 45 s stall window at most. One that doesn't `exec` dies on SIGTERM and
+leaves signal-cli running as an orphan, and the call holds the command gate
+until that orphan exits (10 min backstop), so point `OPENMESSAGES_SIGNAL_CLI`
+only at the binary or an `exec` wrapper. Builds before #259 had each
 call extract libsignal (29 MB) into the Darwin temp dir, and a killed call
 left it there as `libsignal<digits>/`. The periodic sweep looks only in the
 daemon's own temp dir, which is `/tmp`: the app starts the backend with an

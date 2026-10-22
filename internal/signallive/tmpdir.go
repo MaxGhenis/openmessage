@@ -3,6 +3,7 @@ package signallive
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -129,20 +130,28 @@ func acceptsTmpDirArg(executable string) bool {
 	if supported, ok := tmpDirArgSupport.Load(key); ok {
 		return supported.(bool)
 	}
-	supported := isNativeExecutable(executable) && probeTmpDirArg(executable)
-	tmpDirArgSupport.Store(key, supported)
+	if !isNativeExecutable(executable) {
+		tmpDirArgSupport.Store(key, false)
+		return false
+	}
+	supported, settled := probeTmpDirArg(executable)
+	if settled {
+		tmpDirArgSupport.Store(key, supported)
+	}
 	return supported
 }
 
 // probeTmpDirArg runs `<executable> -Djava.io.tmpdir=<dir> --version`, which
-// reads no config dir. Swapped by tests.
-var probeTmpDirArg = func(executable string) bool {
+// reads no config dir, and reports whether the binary took the argument.
+// settled is false when the run itself failed to happen (no temp dir, a
+// timeout, a failed start), so the next call probes again. Swapped by tests.
+var probeTmpDirArg = func(executable string) (supported, settled bool) {
 	if err := os.MkdirAll(signalTmpRoot(), 0o700); err != nil {
-		return false
+		return false, false
 	}
 	dir, err := os.MkdirTemp(signalTmpRoot(), "probe-")
 	if err != nil {
-		return false
+		return false, false
 	}
 	defer os.RemoveAll(dir)
 	ctx, cancel := context.WithTimeout(context.Background(), versionProbeTimeout)
@@ -151,7 +160,12 @@ var probeTmpDirArg = func(executable string) bool {
 	cmd.Env = signalCLIEnv(os.Environ(), dir)
 	configureSignalCancel(cmd)
 	output, err := cmd.CombinedOutput()
-	return err == nil && strings.HasPrefix(strings.TrimSpace(string(output)), "signal-cli ")
+	var exitErr *exec.ExitError
+	if err != nil && (ctx.Err() != nil || !errors.As(err, &exitErr)) {
+		return false, false
+	}
+	_, versioned := parseSignalCLIVersion(output)
+	return err == nil && versioned, true
 }
 
 // isNativeExecutable reports whether path is a Mach-O or ELF binary rather

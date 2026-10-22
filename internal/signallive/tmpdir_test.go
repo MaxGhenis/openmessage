@@ -270,11 +270,53 @@ func stubTmpDirArgProbe(t *testing.T, supported bool) *int {
 	tmpDirArgSupport.Clear()
 	t.Cleanup(tmpDirArgSupport.Clear)
 	probes := new(int)
-	probeTmpDirArg = func(string) bool {
+	probeTmpDirArg = func(string) (bool, bool) {
 		*probes++
-		return supported
+		return supported, true
 	}
 	return probes
+}
+
+// A probe that could not run (a timeout, say) is not cached as a verdict.
+func TestSignalCLITmpDirArgsProbesAgainAfterAProbeThatDidNotRun(t *testing.T) {
+	echo, err := exec.LookPath("echo")
+	if err != nil || !isNativeExecutable(echo) {
+		t.Skipf("no native echo binary (%q, %v)", echo, err)
+	}
+	stubTmpDirArgProbe(t, true)
+	runs := 0
+	probeTmpDirArg = func(string) (bool, bool) {
+		runs++
+		return runs > 1, runs > 1
+	}
+	if args := signalCLITmpDirArgs(echo, "/tmp/run-1"); args != nil {
+		t.Fatalf("args = %q after a probe that did not run", args)
+	}
+	if args := signalCLITmpDirArgs(echo, "/tmp/run-1"); len(args) != 1 {
+		t.Fatalf("args = %q, want the argument once a probe succeeded", args)
+	}
+	if args := signalCLITmpDirArgs(echo, "/tmp/run-1"); len(args) != 1 || runs != 2 {
+		t.Fatalf("args = %q after %d probes, want the cached verdict", args, runs)
+	}
+}
+
+// The real probe against the installed native signal-cli, which reads no
+// config dir for --version.
+func TestProbeTmpDirArgAcceptsTheInstalledNativeSignalCLI(t *testing.T) {
+	if testing.Short() {
+		t.Skip("runs the installed signal-cli --version")
+	}
+	installed, err := exec.LookPath("signal-cli")
+	if err != nil || !isNativeExecutable(installed) {
+		t.Skipf("no native signal-cli installed (%q, %v)", installed, err)
+	}
+	t.Setenv("TMPDIR", t.TempDir())
+	if supported, settled := probeTmpDirArg(installed); !supported || !settled {
+		t.Fatalf("probeTmpDirArg(%s) = %v, %v; want the native build to take the argument", installed, supported, settled)
+	}
+	if supported, settled := probeTmpDirArg("/bin/echo"); supported || !settled {
+		t.Fatalf("probeTmpDirArg(/bin/echo) = %v, %v; want a settled no", supported, settled)
+	}
 }
 
 // A native binary whose --version run rejects the argument (a compiled
