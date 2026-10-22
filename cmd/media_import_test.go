@@ -28,6 +28,7 @@ func TestParseMediaImportArgs(t *testing.T) {
 		"media id":         {args: []string{"v2msg:msg-1:2", "f.html", "--json"}, want: mediaImportArgs{messageID: "msg-1", ordinal: 2, path: "f.html", json: true}},
 		"ordinal flag":     {args: []string{"--ordinal", "1", "msg-1", "f.html", "--sha256", strings.ToUpper(digest)}, want: mediaImportArgs{messageID: "msg-1", ordinal: 1, path: "f.html", sha256: digest}},
 		"agreeing ordinal": {args: []string{"v2msg:msg-1:1", "f.html", "--ordinal", "1"}, want: mediaImportArgs{messageID: "msg-1", ordinal: 1, path: "f.html"}},
+		"replace":          {args: []string{"msg-1", "f.html", "--replace"}, want: mediaImportArgs{messageID: "msg-1", path: "f.html", replace: true}},
 		"contradiction":    {args: []string{"v2msg:msg-1:1", "f.html", "--ordinal", "2"}, wantErr: "contradicts"},
 		"bad media id":     {args: []string{"v2msg:msg-1", "f.html"}, wantErr: "is not v2msg"},
 		"bad digest":       {args: []string{"msg-1", "f.html", "--sha256", "xyz"}, wantErr: "--sha256"},

@@ -2279,7 +2279,7 @@ func (b *Bridge) drainReceiveWAL(account string) {
 	}
 	scanner := bufio.NewScanner(bytes.NewReader(raw))
 	scanner.Buffer(make([]byte, 0, 64*1024), 2*1024*1024)
-	replayed := 0
+	var records []signalReceiveRecoveryRecord
 	for scanner.Scan() {
 		line := bytes.TrimSpace(scanner.Bytes())
 		if len(line) == 0 {
@@ -2289,8 +2289,21 @@ func (b *Bridge) drainReceiveWAL(account string) {
 		if err := json.Unmarshal(line, &record); err != nil {
 			continue
 		}
+		records = append(records, record)
+	}
+	// The WAL keeps every line of each batch, signal-cli's log lines among
+	// them, so the attachment download failures a crashed batch reported are
+	// still recoverable. Remote ids are unique, so parsing the whole WAL at
+	// once cannot misattribute one batch's failure to another's envelope.
+	rawLines := make([]string, 0, len(records))
+	for _, record := range records {
+		rawLines = append(rawLines, record.Raw)
+	}
+	failures := parseAttachmentDownloadFailures([]byte(strings.Join(rawLines, "\n")))
+	replayed := 0
+	for _, record := range records {
 		replayAccount := firstNonEmpty(strings.TrimSpace(record.Account), normalizeSignalAddress(account))
-		if _, err := b.processReceiveLine(replayAccount, []byte(record.Raw), true); err != nil {
+		if _, err := b.processReceiveLineWithFailures(replayAccount, []byte(record.Raw), true, failures); err != nil {
 			b.logger.Debug().Err(err).Msg("Failed to replay Signal WAL entry")
 		}
 		replayed++
@@ -4375,7 +4388,10 @@ func (b *Bridge) downloadSignalAttachment(
 		}
 		return nil, failure
 	}
-	payload := signalAttachmentPayload(output)
+	payload, err := signalAttachmentPayload(output)
+	if err != nil {
+		return nil, fmt.Errorf("read Signal attachment: %w", err)
+	}
 	if payload == "" {
 		return nil, errors.New("signal attachment is empty")
 	}

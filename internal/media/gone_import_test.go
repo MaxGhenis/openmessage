@@ -266,3 +266,40 @@ func TestImportRoundTripProperty(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestImportRejectsEmptyContentAndReplacesOnlyWhenAsked(t *testing.T) {
+	env := newMediaTestEnvironment(t)
+	zero := int64(0)
+	seedMediaMessage(t, env, "message-undeclared", []sqlite.MessageAttachment{{
+		Ordinal: 0, RemoteID: "remote-undeclared", MIME: "text/html", SizeBytes: &zero,
+	}})
+	service := newMediaTestService(t, env, availableDownloadRegistry(&scriptedDownloader{}))
+
+	if _, _, err := service.Import(context.Background(), importCommand("message-undeclared", nil, "")); !errors.Is(err, ErrImportMismatch) {
+		t.Fatalf("Import(empty) error = %v, want ErrImportMismatch", err)
+	}
+	assertPendingWithoutBlob(t, env, "message-undeclared", 0)
+
+	wrong := []byte("<html>the wrong file</html>")
+	if _, imported, err := service.Import(context.Background(), importCommand("message-undeclared", wrong, "")); err != nil || !imported {
+		t.Fatalf("Import(wrong file) = imported=%v, %v", imported, err)
+	}
+	right := []byte("<html>the right file, a little longer</html>")
+	if _, _, err := service.Import(context.Background(), importCommand("message-undeclared", right, "")); !errors.Is(err, ErrImportConflict) {
+		t.Fatalf("Import(different bytes, no replace) error = %v, want ErrImportConflict", err)
+	}
+	replace := importCommand("message-undeclared", right, sha256Hex(right))
+	replace.Replace = true
+	descriptor, imported, err := service.Import(context.Background(), replace)
+	if err != nil || !imported || descriptor.Ref.Hash != sha256Hex(right) || descriptor.Size != int64(len(right)) {
+		t.Fatalf("Import(replace) = %+v, imported=%v, %v; want the right file", descriptor, imported, err)
+	}
+	if row := getMediaAttachment(t, env, "message-undeclared", 0); row.State != "downloaded" || *row.BlobHash != sha256Hex(right) {
+		t.Fatalf("row after replace = %+v", row)
+	}
+	// Replacing with the bytes it already holds is still a no-op success.
+	replace.Content = bytes.NewReader(right)
+	if _, imported, err := service.Import(context.Background(), replace); err != nil || imported {
+		t.Fatalf("Import(replace with same bytes) = imported=%v, %v; want a no-op", imported, err)
+	}
+}

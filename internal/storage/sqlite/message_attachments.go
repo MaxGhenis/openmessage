@@ -267,6 +267,51 @@ func (r *MessageAttachmentRepository) MarkDownloaded(
 	return nil
 }
 
+// ReplaceDownloaded points a downloaded attachment at different bytes, only
+// while it still holds oldBlobHash (compare-and-swap), and reports whether it
+// did. It exists to correct a wrong import; the old blob stays in the
+// BlobStore, which other rows may share.
+func (r *MessageAttachmentRepository) ReplaceDownloaded(
+	ctx context.Context,
+	messageID string,
+	ordinal int64,
+	oldBlobHash string,
+	blobHash string,
+	size int64,
+	mime string,
+) (bool, error) {
+	if err := validateBlobHash(blobHash); err != nil {
+		return false, fmt.Errorf("replace message attachment: %w", err)
+	}
+	if size < 0 {
+		return false, fmt.Errorf("replace message attachment: size is negative")
+	}
+	if strings.TrimSpace(mime) == "" {
+		return false, fmt.Errorf("replace message attachment: MIME type is empty")
+	}
+	nowMS, err := r.nowMS("replace message attachment")
+	if err != nil {
+		return false, err
+	}
+	result, err := r.store.db.ExecContext(ctx, `
+		UPDATE message_attachments
+		SET blob_hash = ?,
+		    size_bytes = ?,
+		    mime = ?,
+		    last_error = NULL,
+		    updated_at_ms = ?
+		WHERE message_id = ? AND ordinal = ? AND state = 'downloaded' AND blob_hash = ?
+	`, blobHash, size, mime, nowMS, messageID, ordinal, oldBlobHash)
+	if err != nil {
+		return false, fmt.Errorf("replace message attachment %q ordinal %d: %w", messageID, ordinal, err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("replace message attachment %q ordinal %d: read rows affected: %w", messageID, ordinal, err)
+	}
+	return affected == 1, nil
+}
+
 // MarkFailed records diagnostic text while leaving the attachment pending and
 // retryable. A missing or downloaded row is a no-op.
 func (r *MessageAttachmentRepository) MarkFailed(

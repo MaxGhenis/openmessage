@@ -20,6 +20,7 @@ import (
 	"github.com/mark3labs/mcp-go/server"
 
 	"github.com/maxghenis/openmessage/internal/app"
+	"github.com/maxghenis/openmessage/internal/bridge"
 	"github.com/maxghenis/openmessage/internal/localapi"
 	"github.com/maxghenis/openmessage/internal/media"
 	"github.com/maxghenis/openmessage/internal/messaging"
@@ -204,11 +205,15 @@ func fetchV2MediaInProcess(
 		Ordinal:   ref.Ordinal,
 	})
 	if err != nil {
+		var transportFailure bridge.OpError
 		switch {
 		case errors.Is(err, media.ErrNotFound):
 			return fetchedMedia{}, errorResult("message or attachment not found")
 		case errors.Is(err, media.ErrGone):
 			return fetchedMedia{}, errorResult("attachment unavailable: " + err.Error())
+		case errors.Is(err, media.ErrUnavailable),
+			errors.As(err, &transportFailure) && transportFailure.Class != bridge.FailureUnsupported:
+			return fetchedMedia{}, errorResult("attachment not downloadable right now (retry later): " + err.Error())
 		default:
 			return fetchedMedia{}, errorResult(fmt.Sprintf("resolve attachment: %v", err))
 		}

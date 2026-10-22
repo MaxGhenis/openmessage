@@ -19,7 +19,7 @@ import (
 	"github.com/maxghenis/openmessage/internal/messaging"
 )
 
-const mediaImportUsage = "Usage: openmessage media import <message-id|v2msg:<message-id>:<n>> <file> [--ordinal N] [--sha256 HEX] [--json]"
+const mediaImportUsage = "Usage: openmessage media import <message-id|v2msg:<message-id>:<n>> <file> [--ordinal N] [--sha256 HEX] [--replace] [--json]"
 
 // mediaImportTimeout bounds the whole import, upload included.
 const mediaImportTimeout = 3 * time.Minute
@@ -40,6 +40,7 @@ type mediaImportArgs struct {
 	ordinal   int64
 	path      string
 	sha256    string
+	replace   bool
 	json      bool
 }
 
@@ -71,6 +72,8 @@ func parseMediaImportArgs(args []string) (mediaImportArgs, error) {
 			}
 		case "--json":
 			parsed.json = true
+		case "--replace":
+			parsed.replace = true
 		default:
 			if strings.HasPrefix(args[i], "--") {
 				return parsed, fmt.Errorf("unknown flag %s\n%s", args[i], mediaImportUsage)
@@ -103,10 +106,10 @@ func parseMediaImportArgs(args []string) (mediaImportArgs, error) {
 
 // runMediaImport hands the running app a local copy of one pending inbound
 // attachment that its platform can no longer deliver, such as a Signal
-// attachment signal-cli never stored, saved from Signal Desktop. The app
-// owns the store: it checks the bytes against the size the platform
+// attachment signal-cli never stored that the sender sent again another way.
+// The app owns the store: it checks the bytes against the size the platform
 // declared and the digest sent here, stores them, and marks the attachment
-// downloaded.
+// downloaded. --replace corrects an earlier import of the wrong file.
 func runMediaImport(ctx context.Context, out io.Writer, client *localapi.Client, args []string) error {
 	parsed, err := parseMediaImportArgs(args)
 	if err != nil {
@@ -130,7 +133,7 @@ func runMediaImport(ctx context.Context, out io.Writer, client *localapi.Client,
 		return fmt.Errorf("%s has SHA-256 %s, not the expected %s", parsed.path, digest, parsed.sha256)
 	}
 
-	result, err := client.ImportMessageAttachment(ctx, parsed.messageID, parsed.ordinal, bytes.NewReader(data), digest)
+	result, err := client.ImportMessageAttachment(ctx, parsed.messageID, parsed.ordinal, bytes.NewReader(data), digest, parsed.replace)
 	if err != nil {
 		if localapi.IsConnectionRefused(err) {
 			return fmt.Errorf("the OpenMessage app isn't running; start it and retry: %w", err)

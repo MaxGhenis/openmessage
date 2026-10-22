@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 	"testing/quick"
+	"unicode/utf8"
 
 	"github.com/rs/zerolog"
 
@@ -66,11 +67,17 @@ func TestParseAttachmentDownloadFailuresBoundsTheCause(t *testing.T) {
 	if len(cause) > maxAttachmentFailureText+len("…") || !strings.HasSuffix(cause, "…") {
 		t.Fatalf("cause has %d bytes (suffix %q), want at most %d plus an ellipsis", len(cause), cause[len(cause)-3:], maxAttachmentFailureText)
 	}
+	// A cut never splits a multi-byte rune.
+	multibyte := "WARN  AttachmentHelper - Failed to download attachment (big), ignoring: " + strings.Repeat("é", 1000)
+	if cause := parseAttachmentDownloadFailures([]byte(multibyte))["big"]; !utf8.ValidString(cause) {
+		t.Fatalf("truncated cause is not valid UTF-8: %q", cause[len(cause)-8:])
+	}
 }
 
-// Property: a failure block never swallows an envelope line, so every
-// envelope the receive output carries still reaches processReceiveLine, and
-// every failure block yields exactly its sanitized remote id.
+// Property: every failure block yields exactly its sanitized remote id, and
+// no cause ever holds an envelope or a stack frame. (Envelope lines reach
+// processReceiveLine through a separate scan of the output, so the parser
+// cannot drop them.)
 func TestParseAttachmentDownloadFailuresProperty(t *testing.T) {
 	fragments := []string{
 		"java.io.IOException: boom",
@@ -85,7 +92,6 @@ func TestParseAttachmentDownloadFailuresProperty(t *testing.T) {
 		rng := rand.New(rand.NewSource(seed))
 		var lines []string
 		want := map[string]bool{}
-		envelopes := 0
 		for block := 0; block < 1+rng.Intn(6); block++ {
 			switch rng.Intn(3) {
 			case 0:
@@ -94,7 +100,6 @@ func TestParseAttachmentDownloadFailuresProperty(t *testing.T) {
 				want[sanitizeSignalAttachmentID(id)] = true
 			case 1:
 				lines = append(lines, fmt.Sprintf(`{"envelope":{"timestamp":%d}}`, block))
-				envelopes++
 			default:
 				lines = append(lines, fragments[rng.Intn(len(fragments))])
 			}
@@ -113,25 +118,15 @@ func TestParseAttachmentDownloadFailuresProperty(t *testing.T) {
 			}
 		}
 		for _, cause := range got {
-			if strings.Contains(cause, `{"envelope"`) || strings.Contains(cause, "\tat ") {
+			if strings.Contains(cause, `{"envelope"`) || strings.Contains(cause, "at a.b.C") {
 				return false
 			}
 		}
-		return receiveOutputEnvelopeCount(output) == envelopes
+		return true
 	}
 	if err := quick.Check(property, &quick.Config{MaxCount: 2000, Rand: rand.New(rand.NewSource(20261021))}); err != nil {
 		t.Fatal(err)
 	}
-}
-
-func receiveOutputEnvelopeCount(output []byte) int {
-	count := 0
-	for _, line := range strings.Split(string(output), "\n") {
-		if line = strings.TrimSpace(line); strings.HasPrefix(line, "{") {
-			count++
-		}
-	}
-	return count
 }
 
 func TestAttachmentDownloadFailuresMatchEnvelopeAttachmentIDs(t *testing.T) {
@@ -306,5 +301,49 @@ func TestObserveIngressStillServesFourArgumentObservers(t *testing.T) {
 	bridge.observeIngress(IngressLine{Account: "+2", Line: []byte("{}")})
 	if want := []string{"+1", "{}", "src", "dst"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("legacy observer saw %q, want %q", got, want)
+	}
+}
+
+func TestBridgeDownloadMediaRefRefusesASplicedPayload(t *testing.T) {
+	bridge := &Bridge{configDir: t.TempDir(), logger: zerolog.Nop()}
+	originalRun := runSignalCLI
+	t.Cleanup(func() { runSignalCLI = originalRun })
+	payload := base64.StdEncoding.EncodeToString([]byte("attachment bytes, long enough to split"))
+	runSignalCLI = func(context.Context, string, ...string) ([]byte, error) {
+		// A stderr line landing in the middle of the payload line.
+		return []byte(payload[:12] + "WARN  AccountHelper - noise\n" + payload[12:] + "\n"), nil
+	}
+	if data, _, err := bridge.DownloadMediaRef("+15551230000", "remote", "x.bin", "", "+15551234567", false); err == nil {
+		t.Fatalf("DownloadMediaRef() = %q, nil; want a refusal instead of a partial decode", data)
+	}
+}
+
+func TestDrainReceiveWALRecoversAttachmentFailures(t *testing.T) {
+	store, err := db.New(filepath.Join(t.TempDir(), "legacy.sqlite3"))
+	if err != nil {
+		t.Fatalf("db.New(): %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	bridge := &Bridge{store: store, configDir: t.TempDir(), logger: zerolog.Nop(), contactByACI: map[string]string{}}
+	output := strings.Join([]string{
+		"WARN  AttachmentHelper - Failed to download attachment (failedRemote), ignoring",
+		"java.io.IOException: Connection reset",
+		`{"envelope":{"source":"+15551234567","sourceNumber":"+15551234567","timestamp":3,"dataMessage":{"timestamp":3,"attachments":[{"id":"failedRemote.html"}]}},"account":"+15551230000"}`,
+	}, "\n")
+	// A batch persisted before a crash, never processed.
+	if err := appendReceiveWAL(bridge.receiveWALPath(), "+15551230000", []byte(output)); err != nil {
+		t.Fatalf("appendReceiveWAL(): %v", err)
+	}
+	var captured []IngressLine
+	unregister := bridge.ObserveIngressLine(func(line IngressLine) { captured = append(captured, line) })
+	defer unregister()
+	bridge.drainReceiveWAL("+15551230000")
+
+	if len(captured) != 1 {
+		t.Fatalf("replayed %d lines to the observer, want 1", len(captured))
+	}
+	want := map[string]string{"failedRemote.html": "java.io.IOException: Connection reset"}
+	if !reflect.DeepEqual(captured[0].AttachmentErrors, want) {
+		t.Fatalf("replayed attachment errors = %#v, want %#v", captured[0].AttachmentErrors, want)
 	}
 }

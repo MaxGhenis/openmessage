@@ -598,7 +598,9 @@ type v1AttachmentImportResponse struct {
 // importMessageAttachment fills a pending inbound attachment with the request
 // body: the repair path for an attachment its transport can no longer
 // download (for Signal, one signal-cli never stored). The body is the raw
-// file; the stored MIME type and filename stay the transport's.
+// file; the stored MIME type and filename stay the transport's. ?replace=true
+// swaps the bytes of an attachment that is already downloaded (to correct an
+// import of the wrong file).
 func (a *v1API) importMessageAttachment(w http.ResponseWriter, r *http.Request) {
 	if !a.enabled(w) {
 		return
@@ -631,12 +633,22 @@ func (a *v1API) importMessageAttachment(w http.ResponseWriter, r *http.Request) 
 	}
 	body := http.MaxBytesReader(w, r.Body, maxUploadBytes+1)
 	defer body.Close()
+	replace := false
+	if raw := strings.TrimSpace(r.URL.Query().Get("replace")); raw != "" {
+		value, err := strconv.ParseBool(raw)
+		if err != nil {
+			httpError(w, "replace must be true or false", http.StatusBadRequest)
+			return
+		}
+		replace = value
+	}
 	descriptor, imported, err := a.v2.Media.Import(r.Context(), media.ImportCommand{
 		AccountID: message.AccountID,
 		MessageID: message.MessageID,
 		Ordinal:   ordinal,
 		Content:   body,
 		SHA256:    wantSHA,
+		Replace:   replace,
 	})
 	if err != nil {
 		a.writeError(w, err)
@@ -693,11 +705,17 @@ func (a *v1API) internalUnavailable(w http.ResponseWriter, detail string) {
 	httpError(w, "v2_send_unavailable", http.StatusServiceUnavailable)
 }
 
-// mediaErrorResponse maps a media download failure. A transport failure is
-// the platform being unreachable or refusing right now (Signal not
-// connected, a signal-cli error, an expired session), not a server fault:
-// it answers 503, with Retry-After when the transport named a time.
+// mediaErrorResponse maps a media download failure. The known media
+// outcomes keep their codes (unsupported 501, gone 410, too large 413, ...).
+// A transport failure left over is the platform being unreachable or
+// refusing right now (Signal not connected, a signal-cli error, an expired
+// session), not a server fault: it answers 503, with Retry-After when the
+// transport named a time.
 func mediaErrorResponse(err error) (int, string, time.Time) {
+	code, message := v1ErrorResponse(err)
+	if code != http.StatusInternalServerError {
+		return code, message, time.Time{}
+	}
 	var failure *bridge.OpError
 	if errors.As(err, &failure) && failure != nil {
 		return http.StatusServiceUnavailable, "attachment download unavailable: " + err.Error(), failure.RetryAt
@@ -706,7 +724,6 @@ func mediaErrorResponse(err error) (int, string, time.Time) {
 	if errors.As(err, &value) {
 		return http.StatusServiceUnavailable, "attachment download unavailable: " + err.Error(), value.RetryAt
 	}
-	code, message := v1ErrorResponse(err)
 	return code, message, time.Time{}
 }
 
@@ -714,7 +731,8 @@ func writeMediaError(w http.ResponseWriter, err error) (int, string) {
 	code, message, retryAt := mediaErrorResponse(err)
 	if !retryAt.IsZero() {
 		if wait := time.Until(retryAt); wait > 0 {
-			w.Header().Set("Retry-After", strconv.FormatInt(int64(wait.Round(time.Second)/time.Second), 10))
+			seconds := int64((wait + time.Second - 1) / time.Second)
+			w.Header().Set("Retry-After", strconv.FormatInt(seconds, 10))
 		}
 	}
 	httpError(w, message, code)

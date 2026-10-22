@@ -454,8 +454,6 @@ func (c *Client) React(ctx context.Context, conversationID, messageID, emoji, ac
 	return result, nil
 }
 
-// IsConnectionRefused reports whether err means nothing was listening, so a
-// request certainly did not reach the daemon.
 // Attachment is one message attachment's bytes as the daemon served them.
 type Attachment struct {
 	Data     []byte
@@ -501,15 +499,20 @@ func (c *Client) LegacyMedia(ctx context.Context, messageID string, maxBytes int
 
 // ImportMessageAttachment hands the daemon the bytes of a pending attachment
 // its platform can no longer deliver. sha256, when not empty, is the hex
-// digest the daemon must find.
+// digest the daemon must find. replace lets it swap the bytes of an
+// attachment that is already downloaded.
 func (c *Client) ImportMessageAttachment(
 	ctx context.Context,
 	messageID string,
 	ordinal int64,
 	content io.Reader,
 	sha256 string,
+	replace bool,
 ) (AttachmentImport, error) {
 	path := "/api/v1/messages/" + url.PathEscape(messageID) + "/attachments/" + strconv.FormatInt(ordinal, 10)
+	if replace {
+		path += "?replace=true"
+	}
 	request, err := http.NewRequestWithContext(ctx, http.MethodPut, c.BaseURL+path, content)
 	if err != nil {
 		return AttachmentImport{}, err
@@ -575,6 +578,8 @@ func (c *Client) attachmentHTTP() *http.Client {
 	return &client
 }
 
+// IsConnectionRefused reports whether err means nothing was listening, so a
+// request certainly did not reach the daemon.
 func IsConnectionRefused(err error) bool {
 	return errors.Is(err, syscall.ECONNREFUSED)
 }

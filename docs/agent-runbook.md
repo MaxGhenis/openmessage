@@ -2112,9 +2112,10 @@ What OpenMessage records (since this fix):
   `attachment_id` and `cause`, and stores the cause in the envelope's
   `signal.jsonrpc` frame as `attachment_errors` (absent when nothing
   failed). The decoder projects it onto the attachment row as `last_error =
-  'receive: <cause>'`, and Signal's declared size as `size_bytes`. Replays
-  from the receive WAL or recovery queue keep only JSON lines; they never
-  erase a recorded cause.
+  'receive: <cause>'`, and Signal's declared size as `size_bytes`. A
+  replay from the receive WAL re-parses the crashed batch's log lines (the
+  WAL keeps every line), and one from the recovery queue, which keeps only
+  the JSON line, never erases a recorded cause.
 - A download that gets "Could not find attachment with ID" is
   `signallive.ErrAttachmentNotStored` → `bridge.ErrMediaGone` →
   `media.ErrGone`, not a transient failure. The media service then marks
@@ -2168,7 +2169,9 @@ holds the bytes, and only a resend recovers them (the 2026-10-21 case).
    `pending` attachment, and only when they match the size Signal declared.
    It records the blob hash and marks the row `downloaded`. Re-sending the
    same bytes returns `imported: false`; different bytes for a downloaded
-   attachment return 409. Rows written before this fix have `size_bytes = 0`,
+   attachment return 409, unless `--replace` (`?replace=true`) asks to swap
+   them, which corrects an import of the wrong file. Empty files are
+   refused. Rows written before this fix have `size_bytes = 0`,
    so the size isn't checked. Compare the file against `attachments[].size`
    in the message's frame (`inbox.payload` → `line.envelope.dataMessage`)
    first.

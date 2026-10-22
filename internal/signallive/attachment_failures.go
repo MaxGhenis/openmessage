@@ -5,6 +5,7 @@ import (
 	"errors"
 	"regexp"
 	"strings"
+	"unicode/utf8"
 )
 
 // ErrAttachmentNotStored reports that signal-cli's local attachment store has
@@ -89,7 +90,11 @@ func parseAttachmentDownloadFailures(output []byte) attachmentDownloadFailures {
 			cause = "signal-cli reported no cause"
 		}
 		if len(cause) > maxAttachmentFailureText {
-			cause = cause[:maxAttachmentFailureText] + "…"
+			cut := maxAttachmentFailureText
+			for cut > 0 && !utf8.RuneStart(cause[cut]) {
+				cut--
+			}
+			cause = cause[:cut] + "…"
 		}
 		failures[remoteID] = cause
 	}
@@ -179,18 +184,23 @@ func isSignalAttachmentNotStored(output []byte) bool {
 	return bytes.Contains(bytes.ToLower(output), []byte("could not find attachment with id"))
 }
 
-// signalAttachmentPayload returns the base64 text getAttachment printed. The
+// signalAttachmentPayload returns the base64 line getAttachment printed. The
 // command's output is combined with stderr, where signal-cli can log an
 // account-state line (for example "Messages have been last received N days
-// ago") before the payload, so log lines are skipped rather than decoded.
-func signalAttachmentPayload(output []byte) string {
-	lines := strings.Split(string(output), "\n")
-	for i := len(lines) - 1; i >= 0; i-- {
-		line := strings.TrimSpace(strings.ReplaceAll(lines[i], "\r", ""))
+// ago") before the payload, so whole log lines are skipped. Anything else
+// besides the one payload line (a log line spliced into the middle of it, for
+// instance) is refused rather than decoded into wrong bytes.
+func signalAttachmentPayload(output []byte) (string, error) {
+	payload := ""
+	for _, line := range strings.Split(string(output), "\n") {
+		line = strings.TrimSpace(strings.ReplaceAll(line, "\r", ""))
 		if line == "" || signalLogLevelPrefix.MatchString(line) {
 			continue
 		}
-		return line
+		if payload != "" {
+			return "", errors.New("signal-cli printed more than one non-log line for the attachment")
+		}
+		payload = line
 	}
-	return ""
+	return payload, nil
 }

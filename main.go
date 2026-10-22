@@ -41,7 +41,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "  import imessage [db-path]                 - Import iMessage (needs Full Disk Access)")
 		fmt.Fprintln(os.Stderr, "  import whatsapp <chat.txt> [--name You]   - Import WhatsApp text export")
 		fmt.Fprintln(os.Stderr, "  import signal [support-dir]               - Import Signal Desktop history")
-		fmt.Fprintln(os.Stderr, "  media import <message-id|v2msg:<id>:<n>> <file> [--ordinal N] [--sha256 HEX] [--json] - Give the running app a local copy of an attachment its platform can no longer deliver")
+		fmt.Fprintln(os.Stderr, "  media import <message-id|v2msg:<id>:<n>> <file> [--ordinal N] [--sha256 HEX] [--replace] [--json] - Give the running app a local copy of an attachment its platform can no longer deliver")
 		os.Exit(1)
 	}
 

@@ -79,6 +79,9 @@ type ImportCommand struct {
 	Content   io.Reader
 	// SHA256 is the lowercase hex digest the content must have, or empty.
 	SHA256 string
+	// Replace lets the import swap the bytes of an attachment that is
+	// already downloaded, to correct an earlier import of the wrong file.
+	Replace bool
 }
 
 // NewService constructs the media download service over application-owned
@@ -379,11 +382,12 @@ func unavailableError(row sqlite.MessageAttachment) error {
 
 // Import stores content as one attachment's bytes and marks it downloaded,
 // for an attachment its transport cannot deliver (ErrGone). Only a pending
-// attachment accepts new bytes. Importing the bytes an attachment already
-// holds is an idempotent success that reports imported=false; different
-// bytes fail with ErrImportConflict. The content must match command.SHA256
-// when that is set, and the size the transport declared when it declared
-// one. The stored MIME type and filename stay the transport's.
+// attachment accepts new bytes, unless command.Replace is set. Importing the
+// bytes an attachment already holds is an idempotent success that reports
+// imported=false; different bytes fail with ErrImportConflict. The content
+// must be non-empty, match command.SHA256 when that is set, and match the
+// size the transport declared when it declared one. The stored MIME type and
+// filename stay the transport's.
 func (s *Service) Import(ctx context.Context, command ImportCommand) (Descriptor, bool, error) {
 	if ctx == nil {
 		return Descriptor{}, false, fmt.Errorf("import media: context is nil")
@@ -422,19 +426,28 @@ func (s *Service) Import(ctx context.Context, command ImportCommand) (Descriptor
 	if int64(len(data)) > s.maxBytes {
 		return Descriptor{}, false, fmt.Errorf("%w: content exceeds %d bytes", ErrTooLarge, s.maxBytes)
 	}
+	if len(data) == 0 {
+		return Descriptor{}, false, fmt.Errorf("%w: content is empty", ErrImportMismatch)
+	}
 	digest := sha256.Sum256(data)
 	gotSHA := hex.EncodeToString(digest[:])
 	if wantSHA != "" && gotSHA != wantSHA {
 		return Descriptor{}, false, fmt.Errorf("%w: content SHA-256 is %s, expected %s", ErrImportMismatch, gotSHA, wantSHA)
 	}
+	replacing := false
 	if row.State == "downloaded" {
 		if row.BlobHash != nil && *row.BlobHash == gotSHA {
 			descriptor, err := s.descriptorForRow(row)
 			return descriptor, false, err
 		}
-		return Descriptor{}, false, ErrImportConflict
+		if !command.Replace || row.BlobHash == nil {
+			return Descriptor{}, false, ErrImportConflict
+		}
+		replacing = true
 	}
-	if row.SizeBytes != nil && *row.SizeBytes > 0 && int64(len(data)) != *row.SizeBytes {
+	// A downloaded row's size_bytes is the stored blob's size, not a
+	// declaration, so only a pending row's size constrains the import.
+	if !replacing && row.SizeBytes != nil && *row.SizeBytes > 0 && int64(len(data)) != *row.SizeBytes {
 		return Descriptor{}, false, fmt.Errorf("%w: content is %d bytes, the transport declared %d",
 			ErrImportMismatch, len(data), *row.SizeBytes)
 	}
@@ -444,7 +457,15 @@ func (s *Service) Import(ctx context.Context, command ImportCommand) (Descriptor
 	if err != nil {
 		return Descriptor{}, false, fmt.Errorf("import media: %w", err)
 	}
-	if err := s.attachments.MarkDownloaded(ctx, row.MessageID, row.Ordinal, ref.Hash, ref.Size, mime); err != nil {
+	if replacing {
+		swapped, err := s.attachments.ReplaceDownloaded(ctx, row.MessageID, row.Ordinal, *row.BlobHash, ref.Hash, ref.Size, mime)
+		if err != nil {
+			return Descriptor{}, false, fmt.Errorf("import media: replace: %w", err)
+		}
+		if !swapped {
+			return Descriptor{}, false, ErrImportConflict
+		}
+	} else if err := s.attachments.MarkDownloaded(ctx, row.MessageID, row.Ordinal, ref.Hash, ref.Size, mime); err != nil {
 		return Descriptor{}, false, fmt.Errorf("import media: mark downloaded: %w", err)
 	}
 	// A concurrent download may have won MarkDownloaded with other bytes; the

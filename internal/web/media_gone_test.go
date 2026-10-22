@@ -286,3 +286,39 @@ func TestParseV2MediaID(t *testing.T) {
 		}
 	}
 }
+
+// An adapter that cannot decode the attachment reference fails the same way
+// on every retry; it keeps the 501 it answered before transport failures
+// became 503s.
+func TestV2MediaUnsupportedReferenceStays501(t *testing.T) {
+	handler := newMediaGoneHandler(t, 0, func(context.Context, string, bridge.MediaRef) (bridge.MediaStream, error) {
+		return bridge.MediaStream{}, bridge.OpError{
+			Class:       bridge.FailureUnsupported,
+			Operation:   "download_media",
+			Fingerprint: "opaque_version_unsupported",
+			Cause:       errors.New("unsupported Signal media Opaque version 9"),
+		}
+	})
+	recorder := serveMediaRequest(handler, http.MethodGet, "/api/media/"+mediaGoneMessageID, nil, nil)
+	if recorder.Code != http.StatusNotImplemented {
+		t.Fatalf("status = %d, want 501; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if recorder.Header().Get("Retry-After") != "" {
+		t.Fatalf("Retry-After = %q on a failure no retry fixes", recorder.Header().Get("Retry-After"))
+	}
+}
+
+func TestV2MediaRetryAfterRoundsUp(t *testing.T) {
+	handler := newMediaGoneHandler(t, 0, func(context.Context, string, bridge.MediaRef) (bridge.MediaStream, error) {
+		return bridge.MediaStream{}, bridge.OpError{
+			Class:     bridge.FailureRateLimited,
+			Operation: "download_media",
+			RetryAt:   time.Now().Add(300 * time.Millisecond),
+			Cause:     errors.New("slow down"),
+		}
+	})
+	recorder := serveMediaRequest(handler, http.MethodGet, "/api/media/"+mediaGoneMessageID, nil, nil)
+	if recorder.Code != http.StatusServiceUnavailable || recorder.Header().Get("Retry-After") != "1" {
+		t.Fatalf("status = %d, Retry-After = %q; want 503 and 1", recorder.Code, recorder.Header().Get("Retry-After"))
+	}
+}
