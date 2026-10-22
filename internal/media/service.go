@@ -22,12 +22,6 @@ import (
 
 const failureRecordTimeout = 5 * time.Second
 
-// unavailableRecheckAfter is how long an attachment marked unavailable is
-// answered from its row before the transport is asked once more. It bounds
-// the transport calls a repeatedly rendered attachment costs while still
-// noticing a copy that came back.
-const unavailableRecheckAfter = time.Hour
-
 // Clock is the same application clock contract used by MessageService.
 type Clock = messaging.Clock
 
@@ -326,31 +320,40 @@ func (s *Service) recordFailure(
 	row sqlite.MessageAttachment,
 	failure error,
 ) error {
-	if row.LastError != nil && (strings.HasPrefix(*row.LastError, sqlite.ReceiveAttachmentErrorPrefix) ||
-		strings.HasPrefix(*row.LastError, sqlite.UnavailableAttachmentErrorPrefix)) {
+	if row.LastError != nil && strings.HasPrefix(*row.LastError, sqlite.ReceiveAttachmentErrorPrefix) {
 		// A transient failure (the transport offline, say) says nothing new
-		// about this attachment; keep the receive-time report or the
-		// unavailable mark it already has.
+		// about this attachment; keep the transport's receive-time report.
 		return failure
 	}
 	mutationCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), failureRecordTimeout)
 	defer cancel()
+	text := failure.Error()
+	if row.LastError != nil && strings.HasPrefix(*row.LastError, sqlite.UnavailableAttachmentErrorPrefix) {
+		// Nor does it lift an unavailable mark. Rewriting the mark restarts
+		// its window, so a transport that keeps failing is asked at most
+		// once per window rather than on every request.
+		text = *row.LastError
+	}
 	if err := s.attachments.MarkFailed(
 		mutationCtx,
 		row.MessageID,
 		row.Ordinal,
-		failure.Error(),
+		text,
 	); err != nil {
 		return errors.Join(failure, fmt.Errorf("record media download failure: %w", err))
 	}
 	return failure
 }
 
+// receiveCauseMarker opens the receive-time cause an unavailable mark keeps.
+const receiveCauseMarker = " (when the message arrived: "
+
 // recordGone marks an attachment whose transport has no copy of it
 // unavailable (sqlite.UnavailableAttachmentErrorPrefix), so requests within
-// unavailableRecheckAfter answer ErrGone without asking the transport. The
-// reason keeps the transport's receive-time account of the failure, when the
-// projection recorded one, because that is the useful diagnosis.
+// sqlite.UnavailableAttachmentRecheckAfter answer ErrGone without asking the
+// transport. The reason keeps the transport's receive-time account of the
+// failure, from the projection's note or the mark it replaces, because that
+// is the useful diagnosis.
 func (s *Service) recordGone(
 	ctx context.Context,
 	row sqlite.MessageAttachment,
@@ -359,7 +362,11 @@ func (s *Service) recordGone(
 	receiveCause := ""
 	if row.LastError != nil {
 		if cause, ok := strings.CutPrefix(*row.LastError, sqlite.ReceiveAttachmentErrorPrefix); ok {
-			receiveCause = " (when the message arrived: " + strings.TrimSpace(cause) + ")"
+			receiveCause = receiveCauseMarker + strings.TrimSpace(cause) + ")"
+		} else if strings.HasPrefix(*row.LastError, sqlite.UnavailableAttachmentErrorPrefix) {
+			if at := strings.Index(*row.LastError, receiveCauseMarker); at >= 0 {
+				receiveCause = (*row.LastError)[at:]
+			}
 		}
 	}
 	failure := fmt.Errorf("%w: %w%s", ErrGone, transportErr, receiveCause)
@@ -376,15 +383,11 @@ func (s *Service) recordGone(
 	return failure
 }
 
-// unavailableError answers for an attachment marked unavailable less than
-// unavailableRecheckAfter ago; an older mark lets the transport be asked
-// again.
+// unavailableError answers for an attachment whose unavailable mark still
+// stands; an older mark lets the transport be asked again.
 func (s *Service) unavailableError(row sqlite.MessageAttachment) error {
-	reason, ok := row.UnavailableReason()
+	reason, ok := row.UnavailableReasonAt(s.clock.Now())
 	if !ok {
-		return nil
-	}
-	if s.clock.Now().Sub(time.UnixMilli(row.UpdatedAtMS)) >= unavailableRecheckAfter {
 		return nil
 	}
 	return fmt.Errorf("%w: %s", ErrGone, reason)

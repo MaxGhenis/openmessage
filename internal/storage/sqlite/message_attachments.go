@@ -15,14 +15,21 @@ const (
 	// overwriting it with their own, usually less informative, failure.
 	ReceiveAttachmentErrorPrefix = "receive: "
 	// UnavailableAttachmentErrorPrefix starts the last_error of an attachment
-	// a download attempt found its transport has no copy of. The media
-	// service answers from the row, without asking the transport, until the
-	// mark is an hour old (updated_at_ms), then asks once more: a copy can
-	// come back, as when a re-linked Signal's attachment store is restored
-	// from a backup. The row stays pending (the state column allows only
-	// pending and downloaded), so an import from elsewhere can fill it.
+	// a download attempt found its transport has no copy of. The mark stands
+	// for UnavailableAttachmentRecheckAfter (from updated_at_ms): meanwhile
+	// the media service answers from the row and reads show the attachment
+	// as unavailable. After that, reads show it as downloadable again and the
+	// next download asks the transport once more, because a copy can come
+	// back (a re-linked Signal's attachment store restored from a backup).
+	// The row stays pending (the state column allows only pending and
+	// downloaded), so an import from elsewhere can fill it.
 	UnavailableAttachmentErrorPrefix = "unavailable: "
 )
+
+// UnavailableAttachmentRecheckAfter is how long an unavailable mark stands.
+// It bounds the transport calls a repeatedly rendered attachment costs while
+// still noticing a copy that came back.
+const UnavailableAttachmentRecheckAfter = time.Hour
 
 // UnavailableReason reports why a pending attachment cannot be downloaded
 // through its transport, once a download attempt has found it has no copy.
@@ -37,6 +44,18 @@ func (a MessageAttachment) UnavailableReason() (reason string, ok bool) {
 		return "", false
 	}
 	return strings.TrimSpace(rest), true
+}
+
+// UnavailableReasonAt is UnavailableReason for a mark still standing at now
+// (younger than UnavailableAttachmentRecheckAfter; UpdatedAtMS must be read).
+// A mark past it reads as not unavailable, so a reader fetches the
+// attachment and that fetch re-checks the transport.
+func (a MessageAttachment) UnavailableReasonAt(now time.Time) (reason string, ok bool) {
+	reason, ok = a.UnavailableReason()
+	if !ok || now.Sub(time.UnixMilli(a.UpdatedAtMS)) >= UnavailableAttachmentRecheckAfter {
+		return "", false
+	}
+	return reason, true
 }
 
 // MessageAttachment is one inbound attachment associated with a normalized

@@ -2134,10 +2134,13 @@ What OpenMessage records (since this fix):
   not connected, any other signal-cli error) answers **503**. A transient
   failure never overwrites a receive-time cause or an unavailable mark. None
   of these is a 500.
-- v2 reads mark an attachment as unavailable only once a download attempt
-  has confirmed it (an `unavailable:` `last_error` on a pending row,
-  `MessageAttachment.UnavailableReason`); a receive-time report alone
-  doesn't count. The mark shows as `media_unavailable` on the message. The
+- v2 reads mark an attachment as unavailable only while a download attempt's
+  mark stands: an `unavailable:` `last_error` on a pending row, younger than
+  the hour (`MessageAttachment.UnavailableReasonAt`). A receive-time report
+  alone doesn't count. The mark shows as `media_unavailable` on the message.
+  Past the hour the message reads as having a normal attachment again, so
+  the UI fetches it and that fetch re-checks the transport. A transient
+  failure at the re-check keeps the mark and restarts its hour. The
   web UI shows a disabled dashed card ("… unavailable · This app has no copy
   of the file. Ask the sender to send it again.") instead of a link. MCP
   message listings read `[attachment unavailable: this app has no copy, ask
@@ -2160,9 +2163,10 @@ holds the bytes, and only a resend recovers them (the 2026-10-21 case).
 
 1. **A backup of signal-cli's store has the file** (for example the
    pre-relink backup the "Re-linking Signal" section keeps): copy it back
-   (`cp -n -p` into `<signal-cli dir>/attachments/`). The next request after
-   the attachment's unavailable mark is an hour old downloads it as usual.
-   To land it right away, import the file as in step 2.
+   (`cp -n -p` into `<signal-cli dir>/attachments/`). Within an hour of its
+   unavailable mark the attachment shows as a normal one again, and opening
+   it downloads it as usual. To land it right away, import the file as in
+   step 2.
 2. **Another client of the account has it** (Signal Desktop on the same
    Mac, the phone): save the file from that client's UI. Don't open an HTML
    or other active attachment there; use its save/download action. Then hand

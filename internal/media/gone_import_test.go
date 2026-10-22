@@ -67,15 +67,20 @@ func TestResolveGoneTransportMarksUnavailableAndRechecksHourly(t *testing.T) {
 		t.Fatalf("transport calls within the hour = %d, want 1", downloader.requestCount())
 	}
 
-	// After it, the transport is asked again. Offline says nothing new, so
-	// the mark stays; still gone refreshes it.
+	// After it, the transport is asked again. Offline says nothing new: the
+	// mark stays and its window restarts, so the next request within the
+	// hour answers from the row again.
 	env.clock.advance(21 * time.Minute)
 	if _, err := service.Resolve(context.Background(), command); err == nil || errors.Is(err, ErrGone) {
 		t.Fatalf("Resolve(offline recheck) error = %v, want the transient failure", err)
 	}
-	if _, unavailable := getMediaAttachment(t, env, "message-gone", 0).UnavailableReason(); !unavailable {
-		t.Fatal("a transient failure dropped the unavailable mark")
+	if _, unavailable := getMediaAttachment(t, env, "message-gone", 0).UnavailableReasonAt(env.clock.Now()); !unavailable {
+		t.Fatal("a transient failure dropped the unavailable mark or did not restart its window")
 	}
+	if _, err := service.Resolve(context.Background(), command); !errors.Is(err, ErrGone) || downloader.requestCount() != 2 {
+		t.Fatalf("Resolve(right after the offline recheck) = %v with %d transport calls, want ErrGone from the row and 2", err, downloader.requestCount())
+	}
+	env.clock.advance(time.Hour)
 	if _, err := service.Resolve(context.Background(), command); !errors.Is(err, ErrGone) {
 		t.Fatalf("Resolve(gone recheck) error = %v, want ErrGone", err)
 	}
@@ -342,5 +347,31 @@ func TestImportRejectsEmptyContentAndReplacesOnlyWhenAsked(t *testing.T) {
 	replace.Content = bytes.NewReader(right)
 	if _, imported, err := service.Import(context.Background(), replace); err != nil || imported {
 		t.Fatalf("Import(replace with same bytes) = imported=%v, %v; want a no-op", imported, err)
+	}
+}
+
+func TestResolveRecheckKeepsTheReceiveTimeCause(t *testing.T) {
+	env := newMediaTestEnvironment(t)
+	cause := sqlite.ReceiveAttachmentErrorPrefix + "java.io.IOException: Connection reset"
+	seedMediaMessage(t, env, "message-recheck", []sqlite.MessageAttachment{{
+		Ordinal: 0, RemoteID: "remote-recheck.html", MIME: "text/html", LastError: &cause,
+	}})
+	downloader := &scriptedDownloader{steps: []downloadStep{{err: goneTransportError()}, {err: goneTransportError()}}}
+	service := newMediaTestService(t, env, availableDownloadRegistry(downloader))
+	command := DownloadCommand{AccountID: "account-1", MessageID: "message-recheck"}
+	const suffix = "(when the message arrived: java.io.IOException: Connection reset)"
+	for round := 1; round <= 2; round++ {
+		_, err := service.Resolve(context.Background(), command)
+		if !errors.Is(err, ErrGone) || !strings.HasSuffix(err.Error(), suffix) {
+			t.Fatalf("round %d Resolve() error = %v, want ErrGone ending with the receive-time cause", round, err)
+		}
+		got := attachmentLastError(t, env.dbPath, "message-recheck", 0)
+		if !got.Valid || !strings.HasSuffix(got.String, suffix) || strings.Count(got.String, "(when the message arrived:") != 1 {
+			t.Fatalf("round %d last_error = %+v, want the cause kept exactly once", round, got)
+		}
+		env.clock.advance(61 * time.Minute)
+	}
+	if downloader.requestCount() != 2 {
+		t.Fatalf("transport calls = %d, want one per window", downloader.requestCount())
 	}
 }

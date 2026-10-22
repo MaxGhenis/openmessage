@@ -372,3 +372,19 @@ func TestMessageAttachmentUnavailableReason(t *testing.T) {
 		}
 	}
 }
+
+func TestMessageAttachmentUnavailableReasonAtExpires(t *testing.T) {
+	mark := UnavailableAttachmentErrorPrefix + "gone"
+	markedAt := time.Date(2026, time.October, 21, 22, 0, 0, 0, time.UTC)
+	attachment := MessageAttachment{State: "pending", LastError: &mark, UpdatedAtMS: markedAt.UnixMilli()}
+	if reason, ok := attachment.UnavailableReasonAt(markedAt.Add(59 * time.Minute)); !ok || reason != "gone" {
+		t.Fatalf("UnavailableReasonAt(+59m) = %q, %v; want the mark standing", reason, ok)
+	}
+	if _, ok := attachment.UnavailableReasonAt(markedAt.Add(UnavailableAttachmentRecheckAfter)); ok {
+		t.Fatal("UnavailableReasonAt(+1h) still reports the mark; readers would never re-check")
+	}
+	receive := ReceiveAttachmentErrorPrefix + "reset"
+	if _, ok := (MessageAttachment{State: "pending", LastError: &receive, UpdatedAtMS: markedAt.UnixMilli()}).UnavailableReasonAt(markedAt); ok {
+		t.Fatal("a receive-time note alone reads as unavailable")
+	}
+}
