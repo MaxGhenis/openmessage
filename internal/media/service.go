@@ -22,6 +22,12 @@ import (
 
 const failureRecordTimeout = 5 * time.Second
 
+// unavailableRecheckAfter is how long an attachment marked unavailable is
+// answered from its row before the transport is asked once more. It bounds
+// the transport calls a repeatedly rendered attachment costs while still
+// noticing a copy that came back.
+const unavailableRecheckAfter = time.Hour
+
 // Clock is the same application clock contract used by MessageService.
 type Clock = messaging.Clock
 
@@ -147,7 +153,7 @@ func (s *Service) Resolve(ctx context.Context, command DownloadCommand) (Descrip
 	if row.State == "downloaded" {
 		return s.descriptorForRow(row)
 	}
-	if err := unavailableError(row); err != nil {
+	if err := s.unavailableError(row); err != nil {
 		return Descriptor{}, err
 	}
 
@@ -197,7 +203,7 @@ func (s *Service) download(
 	if row.State == "downloaded" {
 		return blobRefForAttachment(row)
 	}
-	if err := unavailableError(row); err != nil {
+	if err := s.unavailableError(row); err != nil {
 		return blob.BlobRef{}, err
 	}
 
@@ -320,9 +326,11 @@ func (s *Service) recordFailure(
 	row sqlite.MessageAttachment,
 	failure error,
 ) error {
-	if row.LastError != nil && strings.HasPrefix(*row.LastError, sqlite.ReceiveAttachmentErrorPrefix) {
+	if row.LastError != nil && (strings.HasPrefix(*row.LastError, sqlite.ReceiveAttachmentErrorPrefix) ||
+		strings.HasPrefix(*row.LastError, sqlite.UnavailableAttachmentErrorPrefix)) {
 		// A transient failure (the transport offline, say) says nothing new
-		// about this attachment; keep the transport's own receive-time report.
+		// about this attachment; keep the receive-time report or the
+		// unavailable mark it already has.
 		return failure
 	}
 	mutationCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), failureRecordTimeout)
@@ -338,10 +346,10 @@ func (s *Service) recordFailure(
 	return failure
 }
 
-// recordGone marks an attachment whose transport no longer has it as
-// unavailable for good (sqlite.UnavailableAttachmentErrorPrefix), so later
-// requests answer ErrGone without asking the transport again. The reason
-// keeps the transport's receive-time account of the failure, when the
+// recordGone marks an attachment whose transport has no copy of it
+// unavailable (sqlite.UnavailableAttachmentErrorPrefix), so requests within
+// unavailableRecheckAfter answer ErrGone without asking the transport. The
+// reason keeps the transport's receive-time account of the failure, when the
 // projection recorded one, because that is the useful diagnosis.
 func (s *Service) recordGone(
 	ctx context.Context,
@@ -368,16 +376,18 @@ func (s *Service) recordGone(
 	return failure
 }
 
-// unavailableError answers for an attachment already marked unavailable.
-func unavailableError(row sqlite.MessageAttachment) error {
-	if row.LastError == nil {
-		return nil
-	}
-	reason, ok := strings.CutPrefix(*row.LastError, sqlite.UnavailableAttachmentErrorPrefix)
+// unavailableError answers for an attachment marked unavailable less than
+// unavailableRecheckAfter ago; an older mark lets the transport be asked
+// again.
+func (s *Service) unavailableError(row sqlite.MessageAttachment) error {
+	reason, ok := row.UnavailableReason()
 	if !ok {
 		return nil
 	}
-	return fmt.Errorf("%w: %s", ErrGone, strings.TrimSpace(reason))
+	if s.clock.Now().Sub(time.UnixMilli(row.UpdatedAtMS)) >= unavailableRecheckAfter {
+		return nil
+	}
+	return fmt.Errorf("%w: %s", ErrGone, reason)
 }
 
 // Import stores content as one attachment's bytes and marks it downloaded,
@@ -463,7 +473,17 @@ func (s *Service) Import(ctx context.Context, command ImportCommand) (Descriptor
 			return Descriptor{}, false, fmt.Errorf("import media: replace: %w", err)
 		}
 		if !swapped {
-			return Descriptor{}, false, ErrImportConflict
+			// Lost a race; the reload below accepts a winner that stored
+			// these same bytes.
+			row, err = s.attachments.GetForDownload(ctx, command.MessageID, command.Ordinal)
+			if err != nil {
+				return Descriptor{}, false, fmt.Errorf("import media: reload attachment: %w", err)
+			}
+			if row.State != "downloaded" || row.BlobHash == nil || *row.BlobHash != ref.Hash {
+				return Descriptor{}, false, ErrImportConflict
+			}
+			descriptor, err := s.descriptorForRow(row)
+			return descriptor, false, err
 		}
 	} else if err := s.attachments.MarkDownloaded(ctx, row.MessageID, row.Ordinal, ref.Hash, ref.Size, mime); err != nil {
 		return Descriptor{}, false, fmt.Errorf("import media: mark downloaded: %w", err)

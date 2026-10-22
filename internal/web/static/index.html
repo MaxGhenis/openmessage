@@ -7277,15 +7277,16 @@ body::after {
     return `<a class="msg-attachment-card" href="${escapeHtml(href)}" target="_blank" rel="noopener noreferrer">${body}</a>`;
   }
 
-  // An attachment the platform never delivered (the v2 read API sets
-  // media_unavailable): show what it was without a link that can only fail.
+  // An attachment a download attempt found this app has no copy of (the v2
+  // read API sets media_unavailable): show what it was without a link that
+  // can only fail.
   function renderUnavailableAttachmentHTML(message, reason) {
     const mime = String(message && message.MimeType || '').trim();
     return `<div class="msg-attachment-card msg-attachment-unavailable" aria-disabled="true" title="${escapeHtml(reason)}">
         <span class="msg-attachment-icon">${escapeHtml(attachmentTypeLabel(mime))}</span>
         <span class="msg-attachment-copy">
           <span class="msg-attachment-title">${escapeHtml(attachmentTitle(message))} unavailable</span>
-          <span class="msg-attachment-meta">${message && message.IsFromMe ? 'Never delivered to this app.' : 'Never delivered. Ask the sender to send it again.'}</span>
+          <span class="msg-attachment-meta">${message && message.IsFromMe ? 'This app has no copy of the file.' : 'This app has no copy of the file. Ask the sender to send it again.'}</span>
         </span>
       </div>`;
   }

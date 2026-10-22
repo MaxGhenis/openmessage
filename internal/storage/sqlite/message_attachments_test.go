@@ -363,7 +363,7 @@ func TestMessageAttachmentUnavailableReason(t *testing.T) {
 		"pending, no error":    {MessageAttachment{State: "pending"}, "", false},
 		"pending, transient":   {MessageAttachment{State: "pending", LastError: text("download_media: transient: offline")}, "", false},
 		"pending, unavailable": {MessageAttachment{State: "pending", LastError: text(UnavailableAttachmentErrorPrefix + "gone ")}, "gone", true},
-		"pending, receive":     {MessageAttachment{State: "pending", LastError: text(ReceiveAttachmentErrorPrefix + "reset")}, "reset", true},
+		"pending, receive":     {MessageAttachment{State: "pending", LastError: text(ReceiveAttachmentErrorPrefix + "reset")}, "", false},
 		"downloaded":           {MessageAttachment{State: "downloaded", LastError: text(UnavailableAttachmentErrorPrefix + "gone")}, "", false},
 	} {
 		reason, ok := tc.attachment.UnavailableReason()

@@ -272,7 +272,7 @@ func formatMessageBody(body, mediaID, mimeType, messageID, transcript string) st
 }
 
 // formatMessageDisplay is formatMessageBody for a message read from the
-// store, marking an attachment its platform never delivered.
+// store, marking an attachment this app has no copy of.
 func formatMessageDisplay(m *db.Message) string {
 	return formatMessageBodyWithMedia(m.Body, m.MediaID, m.MimeType, m.MessageID, m.Transcript, m.MediaUnavailable)
 }
@@ -303,7 +303,7 @@ func formatMessageBodyWithMedia(body, mediaID, mimeType, messageID, transcript, 
 	}
 	label := fmt.Sprintf("[%s, message_id: %s]", tag, messageID)
 	if strings.TrimSpace(mediaUnavailable) != "" {
-		label = fmt.Sprintf("[%s unavailable: the platform never delivered it, ask the sender to resend; message_id: %s]", tag, messageID)
+		label = fmt.Sprintf("[%s unavailable: this app has no copy, ask the sender to resend; message_id: %s]", tag, messageID)
 	}
 	if body != "" {
 		return appendTranscript(body + " " + label)
@@ -373,7 +373,7 @@ type messageSummary struct {
 	SourceID       string `json:"source_id,omitempty"`
 	DisplayText    string `json:"display_text,omitempty"`
 
-	// MediaUnavailable is why the attachment can never be downloaded.
+	// MediaUnavailable is why the attachment cannot be downloaded.
 	MediaUnavailable string `json:"media_unavailable,omitempty"`
 }
 

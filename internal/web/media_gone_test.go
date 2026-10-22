@@ -322,3 +322,37 @@ func TestV2MediaRetryAfterRoundsUp(t *testing.T) {
 		t.Fatalf("status = %d, Retry-After = %q; want 503 and 1", recorder.Code, recorder.Header().Get("Retry-After"))
 	}
 }
+
+// The media URL names a message's attachment, not particular bytes, so
+// browsers revalidate against the blob hash: a replaced attachment is never
+// served stale from cache.
+func TestV2MediaRevalidatesAgainstTheBlobHash(t *testing.T) {
+	first := []byte("<html>the wrong file</html>")
+	second := []byte("<html>the right file</html>")
+	handler := newMediaGoneHandler(t, 0, func(context.Context, string, bridge.MediaRef) (bridge.MediaStream, error) {
+		return bridge.MediaStream{}, fmt.Errorf("%w: gone", bridge.ErrMediaGone)
+	})
+	path := "/api/v1/messages/" + mediaGoneMessageID + "/attachments/0"
+	if recorder := serveMediaRequest(handler, http.MethodPut, path, first, nil); recorder.Code != http.StatusOK {
+		t.Fatalf("PUT = %d %s", recorder.Code, recorder.Body.String())
+	}
+	served := serveMediaRequest(handler, http.MethodGet, "/api/media/"+mediaGoneMessageID, nil, nil)
+	etag := served.Header().Get("ETag")
+	if served.Code != http.StatusOK || etag == "" || served.Header().Get("Cache-Control") != "private, no-cache" {
+		t.Fatalf("GET = %d, ETag %q, Cache-Control %q", served.Code, etag, served.Header().Get("Cache-Control"))
+	}
+	notModified := serveMediaRequest(handler, http.MethodGet, "/api/media/"+mediaGoneMessageID, nil, http.Header{"If-None-Match": {etag}})
+	if notModified.Code != http.StatusNotModified || notModified.Body.Len() != 0 {
+		t.Fatalf("conditional GET = %d with %d body bytes, want 304 and none", notModified.Code, notModified.Body.Len())
+	}
+	if recorder := serveMediaRequest(handler, http.MethodPut, path+"?replace=true", second, nil); recorder.Code != http.StatusOK {
+		t.Fatalf("PUT ?replace=true = %d %s", recorder.Code, recorder.Body.String())
+	}
+	after := serveMediaRequest(handler, http.MethodGet, "/api/media/"+mediaGoneMessageID, nil, http.Header{"If-None-Match": {etag}})
+	if after.Code != http.StatusOK || !bytes.Equal(after.Body.Bytes(), second) || after.Header().Get("ETag") == etag {
+		t.Fatalf("conditional GET after replace = %d %q (ETag %q), want the new bytes", after.Code, after.Body.String(), after.Header().Get("ETag"))
+	}
+	if recorder := serveMediaRequest(handler, http.MethodPut, path+"?replace=maybe", second, nil); recorder.Code != http.StatusBadRequest {
+		t.Fatalf("PUT ?replace=maybe = %d, want 400", recorder.Code)
+	}
+}

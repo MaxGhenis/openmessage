@@ -323,7 +323,7 @@ func TestMessageOutputMarksAnAttachmentThePlatformNeverDelivered(t *testing.T) {
 		SourcePlatform:   "signal",
 		MediaUnavailable: "media: attachment is no longer available from its transport: Signal never delivered attachment x.html",
 	}
-	wantLabel := "the spec is attached [attachment unavailable: the platform never delivered it, ask the sender to resend; message_id: m1]"
+	wantLabel := "the spec is attached [attachment unavailable: this app has no copy, ask the sender to resend; message_id: m1]"
 	if got := formatMessageDisplay(message); got != wantLabel {
 		t.Fatalf("formatMessageDisplay() = %q, want %q", got, wantLabel)
 	}

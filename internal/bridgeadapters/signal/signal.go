@@ -351,7 +351,7 @@ func (a *Adapter) DownloadMedia(
 			// and it never retries a receive-time download, so this is final
 			// for the transport. It says nothing about the account's health.
 			return bridge.MediaStream{}, fmt.Errorf(
-				"%w: Signal never delivered attachment %s: signal-cli could not download it when the message arrived and cannot fetch it again; the sender can send it again: %w",
+				"%w: signal-cli has no copy of attachment %s (its download failed when the message arrived, or its attachment store was cleared since) and cannot fetch it again: %w",
 				bridge.ErrMediaGone,
 				decoded.payload.AttachmentID,
 				err,

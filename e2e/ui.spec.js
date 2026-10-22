@@ -2626,7 +2626,7 @@ test('replays a reaction whose response was lost under the same key', async ({ p
   expect(bodies[2].idempotency_key).not.toBe(bodies[0].idempotency_key);
 });
 
-test('marks an attachment the platform never delivered as unavailable instead of linking it', async ({ page }) => {
+test('marks an attachment this app has no copy of as unavailable instead of linking it', async ({ page }) => {
   const marcusConversationID = await page.evaluate(async () => {
     const response = await fetch('/api/conversations?limit=200');
     const conversations = await response.json();
@@ -2644,7 +2644,7 @@ test('marks an attachment the platform never delivered as unavailable instead of
       TimestampMS: Date.now(),
       MediaID: 'v2msg:e2e-unavailable-attachment:0',
       MimeType: 'text/html',
-      media_unavailable: 'media: attachment is no longer available from its transport: Signal never delivered attachment x.html',
+      media_unavailable: 'media: attachment is no longer available from its transport: signal-cli has no copy of attachment x.html',
       source_platform: 'signal',
     };
     if (Array.isArray(payload)) {
@@ -2662,6 +2662,6 @@ test('marks an attachment the platform never delivered as unavailable instead of
   await expect(card).toBeVisible();
   await expect(card).toContainText('unavailable');
   await expect(card).toContainText('Ask the sender to send it again.');
-  await expect(card).toHaveAttribute('title', /never delivered attachment/);
+  await expect(card).toHaveAttribute('title', /has no copy of attachment/);
   await expect(message.locator('a[href*="/api/media/"], img[src*="/api/media/"]')).toHaveCount(0);
 });

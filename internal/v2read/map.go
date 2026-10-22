@@ -247,7 +247,7 @@ func (s *Source) mapMessage(
 		dto.MimeType = attachment.MIME
 		if reason, unavailable := attachment.UnavailableReason(); unavailable {
 			if reason == "" {
-				reason = "the platform never delivered this attachment"
+				reason = "this app has no copy of this attachment"
 			}
 			dto.MediaUnavailable = reason
 		}

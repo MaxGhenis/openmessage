@@ -2118,25 +2118,33 @@ What OpenMessage records (since this fix):
   the JSON line, never erases a recorded cause.
 - A download that gets "Could not find attachment with ID" is
   `signallive.ErrAttachmentNotStored` → `bridge.ErrMediaGone` →
-  `media.ErrGone`, not a transient failure. The media service then marks
-  the attachment **unavailable for good**: `last_error = 'unavailable:
-  <reason>'`, with the receive-time cause appended when one was recorded.
-  The row stays `pending`, because the state column allows only `pending`
-  and `downloaded` and an import must still be able to fill it. Every later
-  request answers from the row without running signal-cli. `/api/media/<id>`
-  and `GET /api/v1/messages/<id>/attachments/<n>` answer **410 Gone** with
-  `media: attachment is no longer available from its transport: Signal never
-  delivered attachment <id> …`. An unknown message or ordinal stays 404. A
-  transport that is only unreachable (Signal not connected, any other
-  signal-cli error) answers **503**, and a transient failure never
-  overwrites a recorded receive-time cause. None of these is a 500.
-- v2 reads mark such an attachment (a `receive:` or `unavailable:`
-  `last_error` on a pending row, `MessageAttachment.UnavailableReason`) with
-  `media_unavailable` on the message. The web UI shows a disabled dashed card
-  ("… unavailable · Never delivered. Ask the sender to send it again.")
-  instead of a link. MCP message listings read `[attachment unavailable: the
-  platform never delivered it, ask the sender to resend; message_id: …]`, and
-  `download_media` answers `attachment unavailable: <reason>`.
+  `media.ErrGone`, not a transient failure. The media service then marks the
+  attachment **unavailable**: `last_error = 'unavailable: <reason>'`, with
+  the receive-time cause appended when one was recorded. For the next hour
+  (`unavailableRecheckAfter`, timed from `updated_at_ms`) requests answer
+  from the row without running signal-cli. After that the next request asks
+  once more, so a copy that comes back heals the row: for example signal-cli's
+  `attachments/` restored after a re-link, which wipes it. The row stays
+  `pending`, because the state column allows only `pending` and
+  `downloaded` and an import must still be able to fill it.
+  `/api/media/<id>` and `GET /api/v1/messages/<id>/attachments/<n>` answer
+  **410 Gone** with `media: attachment is no longer available from its
+  transport: signal-cli has no copy of attachment <id> …`. An unknown
+  message or ordinal stays 404. A transport that is only unreachable (Signal
+  not connected, any other signal-cli error) answers **503**. A transient
+  failure never overwrites a receive-time cause or an unavailable mark. None
+  of these is a 500.
+- v2 reads mark an attachment as unavailable only once a download attempt
+  has confirmed it (an `unavailable:` `last_error` on a pending row,
+  `MessageAttachment.UnavailableReason`); a receive-time report alone
+  doesn't count. The mark shows as `media_unavailable` on the message. The
+  web UI shows a disabled dashed card ("… unavailable · This app has no copy
+  of the file. Ask the sender to send it again.") instead of a link. MCP
+  message listings read `[attachment unavailable: this app has no copy, ask
+  the sender to resend; message_id: …]`, and `download_media` answers
+  `attachment unavailable: <reason>`. Media responses carry `ETag` (the blob
+  hash) with `Cache-Control: private, no-cache`, so a replaced attachment is
+  never served stale.
 
 Before this fix the same case showed as a pending row with `size_bytes = 0`
 and `last_error = "download_media: transient: download Signal attachment:
@@ -2151,10 +2159,10 @@ too. Then the sender's upload or the CDN copy is gone, nothing on this Mac
 holds the bytes, and only a resend recovers them (the 2026-10-21 case).
 
 1. **A backup of signal-cli's store has the file** (for example the
-   pre-relink backup the "Re-linking Signal" section keeps): import that file
-   as in step 2. An attachment already marked unavailable is never fetched
-   from signal-cli again, so copying the file back into signal-cli's store
-   isn't enough on its own.
+   pre-relink backup the "Re-linking Signal" section keeps): copy it back
+   (`cp -n -p` into `<signal-cli dir>/attachments/`). The next request after
+   the attachment's unavailable mark is an hour old downloads it as usual.
+   To land it right away, import the file as in step 2.
 2. **Another client of the account has it** (Signal Desktop on the same
    Mac, the phone): save the file from that client's UI. Don't open an HTML
    or other active attachment there; use its save/download action. Then hand

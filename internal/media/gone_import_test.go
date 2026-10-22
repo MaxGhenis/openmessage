@@ -12,22 +12,36 @@ import (
 	"strings"
 	"testing"
 	"testing/quick"
+	"time"
 
 	"github.com/maxghenis/openmessage/internal/bridge"
 	"github.com/maxghenis/openmessage/internal/storage/sqlite"
 )
 
 func goneTransportError() error {
-	return fmt.Errorf("%w: Signal never delivered attachment remote-gone.html: signal-cli could not download it when the message arrived and cannot fetch it again; the sender can send it again: %w",
+	return fmt.Errorf("%w: signal-cli has no copy of attachment remote-gone.html (its download failed when the message arrived, or its attachment store was cleared since) and cannot fetch it again: %w",
 		bridge.ErrMediaGone, errors.New("download Signal attachment: exit status 1: Could not find attachment with ID: remote-gone.html"))
 }
 
-func TestResolveGoneTransportMarksTheAttachmentUnavailableForGood(t *testing.T) {
+func (c *mediaManualClock) advance(delta time.Duration) {
+	c.mu.Lock()
+	c.now = c.now.Add(delta)
+	c.mu.Unlock()
+}
+
+func TestResolveGoneTransportMarksUnavailableAndRechecksHourly(t *testing.T) {
 	env := newMediaTestEnvironment(t)
 	seedMediaMessage(t, env, "message-gone", []sqlite.MessageAttachment{{
 		Ordinal: 0, RemoteID: "remote-gone.html", Filename: "gone.html", MIME: "text/html",
 	}})
-	downloader := &scriptedDownloader{steps: []downloadStep{{err: goneTransportError()}}}
+	offline := bridge.OpError{Class: bridge.FailureTransient, Operation: "download_media", Cause: errors.New("Signal is not connected")}
+	content := []byte("<html>restored</html>")
+	downloader := &scriptedDownloader{steps: []downloadStep{
+		{err: goneTransportError()},
+		{err: offline},
+		{err: goneTransportError()},
+		byteStreamStep(content, "text/html"),
+	}}
 	service := newMediaTestService(t, env, availableDownloadRegistry(downloader))
 	command := DownloadCommand{AccountID: "account-1", MessageID: "message-gone"}
 
@@ -36,37 +50,66 @@ func TestResolveGoneTransportMarksTheAttachmentUnavailableForGood(t *testing.T) 
 		t.Fatalf("Resolve() error = %v, want ErrGone from the transport", err)
 	}
 	assertPendingWithoutBlob(t, env, "message-gone", 0)
-	lastError := attachmentLastError(t, env.dbPath, "message-gone", 0)
-	if !lastError.Valid || !strings.HasPrefix(lastError.String, sqlite.UnavailableAttachmentErrorPrefix) ||
-		!strings.Contains(lastError.String, "Could not find attachment with ID") {
-		t.Fatalf("last_error = %+v, want the unavailable marker and the transport's reason", lastError)
-	}
 	reason, unavailable := getMediaAttachment(t, env, "message-gone", 0).UnavailableReason()
 	if !unavailable || !strings.Contains(reason, "Could not find attachment with ID") {
-		t.Fatalf("UnavailableReason() = %q, %v", reason, unavailable)
+		t.Fatalf("UnavailableReason() = %q, %v; want the transport's reason", reason, unavailable)
 	}
 
-	// Terminal: later requests answer from the row; the transport is not asked.
+	// Within the hour, requests answer from the row.
 	for attempt := 2; attempt <= 3; attempt++ {
+		env.clock.advance(20 * time.Minute)
 		_, err = service.Resolve(context.Background(), command)
 		if !errors.Is(err, ErrGone) || !strings.Contains(err.Error(), "Could not find attachment with ID") {
 			t.Fatalf("Resolve() attempt %d error = %v, want ErrGone with the stored reason", attempt, err)
 		}
 	}
 	if downloader.requestCount() != 1 {
-		t.Fatalf("transport calls = %d, want 1: an unavailable attachment is not re-fetched", downloader.requestCount())
+		t.Fatalf("transport calls within the hour = %d, want 1", downloader.requestCount())
 	}
 
-	// An import still fills it.
+	// After it, the transport is asked again. Offline says nothing new, so
+	// the mark stays; still gone refreshes it.
+	env.clock.advance(21 * time.Minute)
+	if _, err := service.Resolve(context.Background(), command); err == nil || errors.Is(err, ErrGone) {
+		t.Fatalf("Resolve(offline recheck) error = %v, want the transient failure", err)
+	}
+	if _, unavailable := getMediaAttachment(t, env, "message-gone", 0).UnavailableReason(); !unavailable {
+		t.Fatal("a transient failure dropped the unavailable mark")
+	}
+	if _, err := service.Resolve(context.Background(), command); !errors.Is(err, ErrGone) {
+		t.Fatalf("Resolve(gone recheck) error = %v, want ErrGone", err)
+	}
+	if downloader.requestCount() != 3 {
+		t.Fatalf("transport calls = %d, want 3", downloader.requestCount())
+	}
+
+	// A copy that came back (a restored attachment store) heals the row.
+	env.clock.advance(time.Hour)
+	descriptor, err := service.Resolve(context.Background(), command)
+	if err != nil || descriptor.Ref.Hash != sha256Hex(content) {
+		t.Fatalf("Resolve() after the copy came back = %+v, %v", descriptor, err)
+	}
+	if _, unavailable := getMediaAttachment(t, env, "message-gone", 0).UnavailableReason(); unavailable {
+		t.Fatal("a downloaded attachment still reads as unavailable")
+	}
+}
+
+func TestImportFillsAnAttachmentMarkedUnavailable(t *testing.T) {
+	env := newMediaTestEnvironment(t)
+	seedMediaMessage(t, env, "message-gone", []sqlite.MessageAttachment{{
+		Ordinal: 0, RemoteID: "remote-gone.html", MIME: "text/html",
+	}})
+	service := newMediaTestService(t, env, availableDownloadRegistry(&scriptedDownloader{steps: []downloadStep{{err: goneTransportError()}}}))
+	command := DownloadCommand{AccountID: "account-1", MessageID: "message-gone"}
+	if _, err := service.Resolve(context.Background(), command); !errors.Is(err, ErrGone) {
+		t.Fatalf("Resolve() error = %v, want ErrGone", err)
+	}
 	content := []byte("<html>resent</html>")
 	if _, imported, err := service.Import(context.Background(), importCommand("message-gone", content, "")); err != nil || !imported {
 		t.Fatalf("Import(unavailable attachment) = imported=%v, %v", imported, err)
 	}
 	if descriptor, err := service.Resolve(context.Background(), command); err != nil || descriptor.Ref.Hash != sha256Hex(content) {
 		t.Fatalf("Resolve() after import = %+v, %v", descriptor, err)
-	}
-	if _, unavailable := getMediaAttachment(t, env, "message-gone", 0).UnavailableReason(); unavailable {
-		t.Fatal("an imported attachment still reads as unavailable")
 	}
 }
 
@@ -76,11 +119,9 @@ func TestResolveGoneTransportKeepsReceiveTimeCause(t *testing.T) {
 	seedMediaMessage(t, env, "message-gone-cause", []sqlite.MessageAttachment{{
 		Ordinal: 0, RemoteID: "remote-gone.html", Filename: "gone.html", MIME: "text/html", LastError: &cause,
 	}})
-	// Already unavailable as projected: the transport reported the failure
-	// with the message.
-	if reason, unavailable := getMediaAttachment(t, env, "message-gone-cause", 0).UnavailableReason(); !unavailable ||
-		reason != "java.io.IOException: Connection reset" {
-		t.Fatalf("UnavailableReason() before any download = %q, %v", reason, unavailable)
+	// The receive-time report alone does not mark it: a download confirms.
+	if _, unavailable := getMediaAttachment(t, env, "message-gone-cause", 0).UnavailableReason(); unavailable {
+		t.Fatal("a receive-time report alone marked the attachment unavailable")
 	}
 	downloader := &scriptedDownloader{steps: []downloadStep{{err: goneTransportError()}}}
 	service := newMediaTestService(t, env, availableDownloadRegistry(downloader))

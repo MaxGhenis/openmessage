@@ -109,8 +109,8 @@ func (c *notStoredSignalCLI) calls() [][]string {
 // every download attempt came back as a transient OpError (served as a 500)
 // that the next request retried forever. Now the row carries the declared
 // size and signal-cli's receive-time cause; the first download reports
-// media.ErrGone with that cause and marks the attachment unavailable for
-// good, so later requests answer without running signal-cli again; and a
+// media.ErrGone with that cause and marks the attachment unavailable, so
+// later requests (within the hour) answer without running signal-cli; and a
 // copy of the file obtained elsewhere can still be imported once.
 func TestSignalAttachmentSignalCLINeverStoredIsGoneNotTransient(t *testing.T) {
 	pngBytes := []byte("\x89PNG\r\n\x1a\nstored by signal-cli")
@@ -209,7 +209,7 @@ func TestSignalAttachmentSignalCLINeverStoredIsGoneNotTransient(t *testing.T) {
 			t.Fatalf("Resolve(html) attempt %d returned OpError %+v; a missing signal-cli file is not a transport failure to retry", attempt, opErr)
 		}
 		for _, want := range []string{
-			"Signal never delivered attachment " + notStoredAttachmentID,
+			"signal-cli has no copy of attachment " + notStoredAttachmentID,
 			"Could not find attachment with ID: " + notStoredAttachmentID,
 			"when the message arrived: java.io.IOException: Connection reset",
 		} {

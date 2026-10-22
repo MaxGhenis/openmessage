@@ -657,7 +657,7 @@ func TestSourceMarksAttachmentsThePlatformNeverDelivered(t *testing.T) {
 	want := map[string]string{
 		"message-0": "",
 		"message-1": "",
-		"message-2": "java.io.IOException: Connection reset",
+		"message-2": "", // a receive-time report alone does not mark it
 		"message-3": "media gone",
 	}
 	if !reflect.DeepEqual(got, want) {

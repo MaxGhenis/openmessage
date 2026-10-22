@@ -575,7 +575,7 @@ func (a *v1API) messageAttachment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer reader.Close()
-	writeDescriptorMediaResponse(w, reader, descriptor)
+	writeDescriptorMediaResponse(w, r, reader, descriptor)
 }
 
 // importSHA256Header carries a hex SHA-256: on an attachment import, the
@@ -903,21 +903,42 @@ func mirrorV2ReadCursor(
 	return v2wire.MirrorReadCursor(ctx, legacy, v2, conversationID, atMS)
 }
 
-func writeDescriptorMediaResponse(w http.ResponseWriter, reader io.Reader, descriptor media.Descriptor) {
+func writeDescriptorMediaResponse(w http.ResponseWriter, r *http.Request, reader io.Reader, descriptor media.Descriptor) {
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Content-Security-Policy", "sandbox; default-src 'none'")
 	w.Header().Set("Cross-Origin-Resource-Policy", "same-origin")
-	w.Header().Set("Cache-Control", "private, max-age=86400")
+	// The URL names a message's attachment, not particular bytes (an import
+	// with replace can change them), so caches revalidate against the blob
+	// hash instead of keeping a copy for a day.
+	w.Header().Set("Cache-Control", "private, no-cache")
 	w.Header().Set("Content-Type", descriptor.MIME)
-	if descriptor.Ref.Hash != "" {
-		w.Header().Set(importSHA256Header, descriptor.Ref.Hash)
-	}
 	w.Header().Set(
 		"Content-Disposition",
 		string(descriptor.Disposition)+`; filename="`+sanitizeMediaFilename(descriptor.Filename)+`"`,
 	)
+	if descriptor.Ref.Hash != "" {
+		etag := `"` + descriptor.Ref.Hash + `"`
+		w.Header().Set("ETag", etag)
+		w.Header().Set(importSHA256Header, descriptor.Ref.Hash)
+		if r != nil && etagMatches(r.Header.Get("If-None-Match"), etag) {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+	}
 	if descriptor.Size >= 0 {
 		w.Header().Set("Content-Length", strconv.FormatInt(descriptor.Size, 10))
 	}
 	_, _ = io.Copy(w, reader)
+}
+
+// etagMatches reports whether an If-None-Match header names etag (weak
+// comparison, as RFC 9110 specifies for If-None-Match).
+func etagMatches(header, etag string) bool {
+	for _, candidate := range strings.Split(header, ",") {
+		candidate = strings.TrimPrefix(strings.TrimSpace(candidate), "W/")
+		if candidate == "*" || candidate == etag {
+			return true
+		}
+	}
+	return false
 }

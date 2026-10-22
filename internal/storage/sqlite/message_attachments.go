@@ -15,27 +15,28 @@ const (
 	// overwriting it with their own, usually less informative, failure.
 	ReceiveAttachmentErrorPrefix = "receive: "
 	// UnavailableAttachmentErrorPrefix starts the last_error of an attachment
-	// a download attempt found its transport no longer has. It is terminal:
-	// the media service answers from the row without asking the transport
-	// again. The row stays pending (the state column allows only pending and
-	// downloaded), so an import of the bytes from elsewhere can still fill it.
+	// a download attempt found its transport has no copy of. The media
+	// service answers from the row, without asking the transport, until the
+	// mark is an hour old (updated_at_ms), then asks once more: a copy can
+	// come back, as when a re-linked Signal's attachment store is restored
+	// from a backup. The row stays pending (the state column allows only
+	// pending and downloaded), so an import from elsewhere can fill it.
 	UnavailableAttachmentErrorPrefix = "unavailable: "
 )
 
-// UnavailableReason reports why a pending attachment can never be
-// downloaded through its transport: a download attempt found the bytes gone,
-// or the transport said so when the message arrived. ok is false for an
-// attachment that is downloaded or may still download.
+// UnavailableReason reports why a pending attachment cannot be downloaded
+// through its transport, once a download attempt has found it has no copy.
+// A receive-time report alone does not count: the attempt confirms it. ok is
+// false for an attachment that is downloaded or may still download.
 func (a MessageAttachment) UnavailableReason() (reason string, ok bool) {
 	if a.State != "pending" || a.LastError == nil {
 		return "", false
 	}
-	for _, prefix := range []string{UnavailableAttachmentErrorPrefix, ReceiveAttachmentErrorPrefix} {
-		if rest, found := strings.CutPrefix(*a.LastError, prefix); found {
-			return strings.TrimSpace(rest), true
-		}
+	rest, found := strings.CutPrefix(*a.LastError, UnavailableAttachmentErrorPrefix)
+	if !found {
+		return "", false
 	}
-	return "", false
+	return strings.TrimSpace(rest), true
 }
 
 // MessageAttachment is one inbound attachment associated with a normalized
@@ -55,6 +56,8 @@ type MessageAttachment struct {
 	// replay that carries none keeps what is stored.
 	LastError *string
 	AccountID string
+	// UpdatedAtMS is read by GetForDownload only.
+	UpdatedAtMS int64
 }
 
 // MessageAttachmentRepository owns inbound attachment lifecycle state.
@@ -178,6 +181,7 @@ func (r *MessageAttachmentRepository) GetForDownload(
 			ma.state,
 			ma.blob_hash,
 			ma.last_error,
+			ma.updated_at_ms,
 			m.account_id
 		FROM message_attachments AS ma
 		JOIN messages AS m ON m.message_id = ma.message_id
@@ -193,6 +197,7 @@ func (r *MessageAttachmentRepository) GetForDownload(
 		&attachment.State,
 		&hash,
 		&lastError,
+		&attachment.UpdatedAtMS,
 		&attachment.AccountID,
 	)
 	if err != nil {

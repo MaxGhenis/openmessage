@@ -2005,7 +2005,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 				return
 			}
 			messageID, ordinal := parseV2MediaID(msgID)
-			if err := writeV2MessageMediaResponse(r.Context(), w, opts.V2, messageID, ordinal); err != nil {
+			if err := writeV2MessageMediaResponse(r, w, opts.V2, messageID, ordinal); err != nil {
 				writeMediaError(w, err)
 			}
 			return
@@ -3493,12 +3493,13 @@ func parseV2MediaID(raw string) (string, int64) {
 }
 
 func writeV2MessageMediaResponse(
-	ctx context.Context,
+	r *http.Request,
 	w http.ResponseWriter,
 	v2 *V2Options,
 	messageID string,
 	ordinal int64,
 ) error {
+	ctx := r.Context()
 	messages, err := sqlite.NewMessageRepository(v2.V2Store, time.Now)
 	if err != nil {
 		return err
@@ -3520,7 +3521,7 @@ func writeV2MessageMediaResponse(
 		return err
 	}
 	defer reader.Close()
-	writeDescriptorMediaResponse(w, reader, descriptor)
+	writeDescriptorMediaResponse(w, r, reader, descriptor)
 	return nil
 }
 
