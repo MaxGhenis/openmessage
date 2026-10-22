@@ -2085,6 +2085,112 @@ On a v2-primary install every reaction from the web UI and the
 `react_to_message` MCP tool takes this path; see "Reactions on v2-primary go
 through the outbox" below.
 
+### Signal attachments signal-cli never stored
+
+signal-cli downloads an attachment exactly once, while `receive` handles its
+envelope (`IncomingMessageHandler` → `AttachmentHelper.downloadAttachment`),
+into `<signal-cli dir>/attachments/<remote id>.<ext>`. That file name is the
+attachment `id` in the receive JSON, so an id like `aB3dE5fG7hJ9kL1mN2pQ.html` is correct.
+OpenMessage's download (`getAttachment --id`) only reads that file
+("Retrieve an already downloaded attachment"). When the receive-time download
+fails, signal-cli logs `WARN AttachmentHelper - Failed to download
+attachment (<remote id>), ignoring` plus the exception (0.14.9: on the
+following lines), still prints and acknowledges the envelope, and keeps no
+pointer it could fetch the file with later. No signal-cli command can fetch
+it again: upstream treats this as by design (AsamK/signal-cli#2116), and
+signal-cli has no command that sends Signal's linked-device
+attachment-backfill request. While a download is in flight, signal-cli writes
+`attachments/<name>.<random>.tmp` and deletes it in a `finally`. So no file
+and no `.tmp` means the download started and failed cleanly. A leftover
+`.tmp` means the process was killed mid-download.
+
+What OpenMessage records (since this fix):
+
+- The receive loop parses those WARN blocks out of the call's combined
+  output (`signallive.parseAttachmentDownloadFailures`). It logs `signal-cli
+  failed to download a Signal attachment while receiving it` with
+  `attachment_id` and `cause`, and stores the cause in the envelope's
+  `signal.jsonrpc` frame as `attachment_errors` (absent when nothing
+  failed). The decoder projects it onto the attachment row as `last_error =
+  'receive: <cause>'`, and Signal's declared size as `size_bytes`. A
+  replay from the receive WAL re-parses the crashed batch's log lines (the
+  WAL keeps every line), and one from the recovery queue, which keeps only
+  the JSON line, never erases a recorded cause.
+- A download that gets "Could not find attachment with ID" is
+  `signallive.ErrAttachmentNotStored` → `bridge.ErrMediaGone` →
+  `media.ErrGone`, not a transient failure. The media service then marks the
+  attachment **unavailable**: `last_error = 'unavailable: <reason>'`, with
+  the receive-time cause appended when one was recorded. For the next hour
+  (`unavailableRecheckAfter`, timed from `updated_at_ms`) requests answer
+  from the row without running signal-cli. After that the next request asks
+  once more, so a copy that comes back heals the row: for example signal-cli's
+  `attachments/` restored after a re-link, which wipes it. The row stays
+  `pending`, because the state column allows only `pending` and
+  `downloaded` and an import must still be able to fill it.
+  `/api/media/<id>` and `GET /api/v1/messages/<id>/attachments/<n>` answer
+  **410 Gone** with `media: attachment is no longer available from its
+  transport: signal-cli has no copy of attachment <id> …`. An unknown
+  message or ordinal stays 404. A transport that is only unreachable (Signal
+  not connected, any other signal-cli error) answers **503**. A transient
+  failure never overwrites a receive-time cause or an unavailable mark. None
+  of these is a 500.
+- v2 reads mark an attachment as unavailable only while a download attempt's
+  mark stands: an `unavailable:` `last_error` on a pending row, younger than
+  the hour (`MessageAttachment.UnavailableReasonAt`). A receive-time report
+  alone doesn't count. The mark shows as `media_unavailable` on the message.
+  Past the hour the message reads as having a normal attachment again, so
+  the UI fetches it and that fetch re-checks the transport. A transient
+  failure at the re-check keeps the mark and restarts its hour. The
+  web UI shows a disabled dashed card ("… unavailable · This app has no copy
+  of the file. Ask the sender to send it again.") instead of a link. MCP
+  message listings read `[attachment unavailable: this app has no copy, ask
+  the sender to resend; message_id: …]`, and `download_media` answers
+  `attachment unavailable: <reason>`. Media responses carry `ETag` (the blob
+  hash) with `Cache-Control: private, no-cache`, so a replaced attachment is
+  never served stale.
+
+Before this fix the same case showed as a pending row with `size_bytes = 0`
+and `last_error = "download_media: transient: download Signal attachment:
+exit status 1: Could not find attachment with ID: <id>"`, `/api/media` 500,
+and MCP `download_media` "message not found" (it searched only the legacy
+store). Live case: 2026-10-21, an HTML file from a contact's linked device.
+Its receive-time cause is unknown, because the WARN was discarded then.
+
+Recover one, in order. First check another linked device: if Signal Desktop
+shows the attachment as "File not available", it failed to download there
+too. Then the sender's upload or the CDN copy is gone, nothing on this Mac
+holds the bytes, and only a resend recovers them (the 2026-10-21 case).
+
+1. **A backup of signal-cli's store has the file** (for example the
+   pre-relink backup the "Re-linking Signal" section keeps): copy it back
+   (`cp -n -p` into `<signal-cli dir>/attachments/`). Within an hour of its
+   unavailable mark the attachment shows as a normal one again, and opening
+   it downloads it as usual. To land it right away, import the file as in
+   step 2.
+2. **Another client of the account has it** (Signal Desktop on the same
+   Mac, the phone): save the file from that client's UI. Don't open an HTML
+   or other active attachment there; use its save/download action. Then hand
+   it to the running app:
+
+   ```bash
+   openmessage media import <v2-message-id or v2msg:<id>:<n>> <saved file> [--sha256 HEX]
+   ```
+
+   This is `PUT /api/v1/messages/<id>/attachments/<n>` with the raw file as
+   the body (optional `X-Content-SHA256`). The app accepts bytes only for a
+   `pending` attachment, and only when they match the size Signal declared.
+   It records the blob hash and marks the row `downloaded`. Re-sending the
+   same bytes returns `imported: false`; different bytes for a downloaded
+   attachment return 409, unless `--replace` (`?replace=true`) asks to swap
+   them, which corrects an import of the wrong file. Empty files are
+   refused. Rows written before this fix have `size_bytes = 0`,
+   so the size isn't checked. Compare the file against `attachments[].size`
+   in the message's frame (`inbox.payload` → `line.envelope.dataMessage`)
+   first.
+
+Then `download_media` with `save=true` (or `output_path`) writes a private
+copy under the export root and returns its path and SHA-256.
+
 ## Reactions on v2-primary go through the outbox
 
 On a v2-primary daemon the read API hands out v2 IDs (32-hex conversation and

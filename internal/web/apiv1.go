@@ -106,6 +106,7 @@ func registerV1Routes(mux *http.ServeMux, legacy *db.Store, logger zerolog.Logge
 	mux.HandleFunc("POST /api/v1/outbox/{id}/repair", api.repair)
 	mux.HandleFunc("GET /api/v1/outbox/{id}/media", api.outboxMedia)
 	mux.HandleFunc("GET /api/v1/messages/{id}/attachments/{ordinal}", api.messageAttachment)
+	mux.HandleFunc("PUT /api/v1/messages/{id}/attachments/{ordinal}", api.importMessageAttachment)
 
 	// Keep the whole versioned namespace deterministic while the flag is off,
 	// including paths introduced by a newer client than this daemon knows.
@@ -565,7 +566,7 @@ func (a *v1API) messageAttachment(w http.ResponseWriter, r *http.Request) {
 		Ordinal:   ordinal,
 	})
 	if err != nil {
-		a.writeError(w, err)
+		a.writeMediaError(w, err)
 		return
 	}
 	reader, err := a.v2.Media.Open(descriptor.Ref)
@@ -574,7 +575,95 @@ func (a *v1API) messageAttachment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer reader.Close()
-	writeDescriptorMediaResponse(w, reader, descriptor)
+	writeDescriptorMediaResponse(w, r, reader, descriptor)
+}
+
+// importSHA256Header carries a hex SHA-256: on an attachment import, the
+// digest the request body must have (optional); on an attachment download,
+// the digest of the served bytes.
+const importSHA256Header = "X-Content-SHA256"
+
+type v1AttachmentImportResponse struct {
+	MessageID string `json:"message_id"`
+	Ordinal   int64  `json:"ordinal"`
+	State     string `json:"state"`
+	BlobHash  string `json:"blob_hash"`
+	SizeBytes int64  `json:"size_bytes"`
+	MIME      string `json:"mime"`
+	Filename  string `json:"filename"`
+	// Imported is false when the attachment already held these exact bytes.
+	Imported bool `json:"imported"`
+}
+
+// importMessageAttachment fills a pending inbound attachment with the request
+// body: the repair path for an attachment its transport can no longer
+// download (for Signal, one signal-cli never stored). The body is the raw
+// file; the stored MIME type and filename stay the transport's. ?replace=true
+// swaps the bytes of an attachment that is already downloaded (to correct an
+// import of the wrong file).
+func (a *v1API) importMessageAttachment(w http.ResponseWriter, r *http.Request) {
+	if !a.enabled(w) {
+		return
+	}
+	if a.v2.V2Store == nil || a.v2.Media == nil {
+		a.internalUnavailable(w, "message media dependencies are not configured")
+		return
+	}
+	ordinal, err := strconv.ParseInt(r.PathValue("ordinal"), 10, 64)
+	if err != nil || ordinal < 0 {
+		httpError(w, "attachment ordinal must be a non-negative integer", http.StatusBadRequest)
+		return
+	}
+	wantSHA := strings.ToLower(strings.TrimSpace(r.Header.Get(importSHA256Header)))
+	if wantSHA != "" {
+		if decoded, err := hex.DecodeString(wantSHA); err != nil || len(decoded) != 32 {
+			httpError(w, importSHA256Header+" must be a hex SHA-256 digest", http.StatusBadRequest)
+			return
+		}
+	}
+	messages, err := sqlite.NewMessageRepository(a.v2.V2Store, time.Now)
+	if err != nil {
+		a.writeError(w, err)
+		return
+	}
+	message, err := messages.GetMessage(r.Context(), r.PathValue("id"))
+	if err != nil {
+		a.writeError(w, err)
+		return
+	}
+	body := http.MaxBytesReader(w, r.Body, maxUploadBytes+1)
+	defer body.Close()
+	replace := false
+	if raw := strings.TrimSpace(r.URL.Query().Get("replace")); raw != "" {
+		value, err := strconv.ParseBool(raw)
+		if err != nil {
+			httpError(w, "replace must be true or false", http.StatusBadRequest)
+			return
+		}
+		replace = value
+	}
+	descriptor, imported, err := a.v2.Media.Import(r.Context(), media.ImportCommand{
+		AccountID: message.AccountID,
+		MessageID: message.MessageID,
+		Ordinal:   ordinal,
+		Content:   body,
+		SHA256:    wantSHA,
+		Replace:   replace,
+	})
+	if err != nil {
+		a.writeError(w, err)
+		return
+	}
+	writeJSON(w, v1AttachmentImportResponse{
+		MessageID: message.MessageID,
+		Ordinal:   ordinal,
+		State:     "downloaded",
+		BlobHash:  descriptor.Ref.Hash,
+		SizeBytes: descriptor.Size,
+		MIME:      descriptor.MIME,
+		Filename:  descriptor.Filename,
+		Imported:  imported,
+	})
 }
 
 func (a *v1API) v2Deps() v2wire.Deps {
@@ -616,6 +705,46 @@ func (a *v1API) internalUnavailable(w http.ResponseWriter, detail string) {
 	httpError(w, "v2_send_unavailable", http.StatusServiceUnavailable)
 }
 
+// mediaErrorResponse maps a media download failure. The known media
+// outcomes keep their codes (unsupported 501, gone 410, too large 413, ...).
+// A transport failure left over is the platform being unreachable or
+// refusing right now (Signal not connected, a signal-cli error, an expired
+// session), not a server fault: it answers 503, with Retry-After when the
+// transport named a time.
+func mediaErrorResponse(err error) (int, string, time.Time) {
+	code, message := v1ErrorResponse(err)
+	if code != http.StatusInternalServerError {
+		return code, message, time.Time{}
+	}
+	var failure *bridge.OpError
+	if errors.As(err, &failure) && failure != nil {
+		return http.StatusServiceUnavailable, "attachment download unavailable: " + err.Error(), failure.RetryAt
+	}
+	var value bridge.OpError
+	if errors.As(err, &value) {
+		return http.StatusServiceUnavailable, "attachment download unavailable: " + err.Error(), value.RetryAt
+	}
+	return code, message, time.Time{}
+}
+
+func writeMediaError(w http.ResponseWriter, err error) (int, string) {
+	code, message, retryAt := mediaErrorResponse(err)
+	if !retryAt.IsZero() {
+		if wait := time.Until(retryAt); wait > 0 {
+			seconds := int64((wait + time.Second - 1) / time.Second)
+			w.Header().Set("Retry-After", strconv.FormatInt(seconds, 10))
+		}
+	}
+	httpError(w, message, code)
+	return code, message
+}
+
+func (a *v1API) writeMediaError(w http.ResponseWriter, err error) {
+	if code, _ := writeMediaError(w, err); code == http.StatusInternalServerError {
+		a.logger.Error().Err(err).Msg("V2 API media request failed")
+	}
+}
+
 func (a *v1API) writeError(w http.ResponseWriter, err error) {
 	code, message := v1ErrorResponse(err)
 	if code == http.StatusInternalServerError {
@@ -640,6 +769,15 @@ func v1ErrorResponse(err error) (int, string) {
 		return http.StatusNotImplemented, err.Error()
 	case errors.Is(err, media.ErrUnavailable):
 		return http.StatusServiceUnavailable, err.Error()
+	case errors.Is(err, media.ErrGone):
+		// The message and its attachment exist, but no download can produce
+		// the bytes, and retrying will not help: 410, where 404 means an
+		// unknown message or ordinal.
+		return http.StatusGone, err.Error()
+	case errors.Is(err, media.ErrImportConflict):
+		return http.StatusConflict, err.Error()
+	case errors.Is(err, media.ErrImportMismatch):
+		return http.StatusUnprocessableEntity, err.Error()
 	case errors.Is(err, sqlite.ErrNotFound),
 		errors.Is(err, sql.ErrNoRows),
 		errors.Is(err, media.ErrNotFound),
@@ -765,18 +903,42 @@ func mirrorV2ReadCursor(
 	return v2wire.MirrorReadCursor(ctx, legacy, v2, conversationID, atMS)
 }
 
-func writeDescriptorMediaResponse(w http.ResponseWriter, reader io.Reader, descriptor media.Descriptor) {
+func writeDescriptorMediaResponse(w http.ResponseWriter, r *http.Request, reader io.Reader, descriptor media.Descriptor) {
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Content-Security-Policy", "sandbox; default-src 'none'")
 	w.Header().Set("Cross-Origin-Resource-Policy", "same-origin")
-	w.Header().Set("Cache-Control", "private, max-age=86400")
+	// The URL names a message's attachment, not particular bytes (an import
+	// with replace can change them), so caches revalidate against the blob
+	// hash instead of keeping a copy for a day.
+	w.Header().Set("Cache-Control", "private, no-cache")
 	w.Header().Set("Content-Type", descriptor.MIME)
 	w.Header().Set(
 		"Content-Disposition",
 		string(descriptor.Disposition)+`; filename="`+sanitizeMediaFilename(descriptor.Filename)+`"`,
 	)
+	if descriptor.Ref.Hash != "" {
+		etag := `"` + descriptor.Ref.Hash + `"`
+		w.Header().Set("ETag", etag)
+		w.Header().Set(importSHA256Header, descriptor.Ref.Hash)
+		if r != nil && etagMatches(r.Header.Get("If-None-Match"), etag) {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+	}
 	if descriptor.Size >= 0 {
 		w.Header().Set("Content-Length", strconv.FormatInt(descriptor.Size, 10))
 	}
 	_, _ = io.Copy(w, reader)
+}
+
+// etagMatches reports whether an If-None-Match header names etag (weak
+// comparison, as RFC 9110 specifies for If-None-Match).
+func etagMatches(header, etag string) bool {
+	for _, candidate := range strings.Split(header, ",") {
+		candidate = strings.TrimPrefix(strings.TrimSpace(candidate), "W/")
+		if candidate == "*" || candidate == etag {
+			return true
+		}
+	}
+	return false
 }

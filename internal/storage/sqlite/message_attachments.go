@@ -8,6 +8,56 @@ import (
 	"time"
 )
 
+const (
+	// ReceiveAttachmentErrorPrefix starts the last_error a projection records
+	// when the transport reported, with the message itself, that it failed
+	// to fetch the attachment. Download attempts keep that text rather than
+	// overwriting it with their own, usually less informative, failure.
+	ReceiveAttachmentErrorPrefix = "receive: "
+	// UnavailableAttachmentErrorPrefix starts the last_error of an attachment
+	// a download attempt found its transport has no copy of. The mark stands
+	// for UnavailableAttachmentRecheckAfter (from updated_at_ms): meanwhile
+	// the media service answers from the row and reads show the attachment
+	// as unavailable. After that, reads show it as downloadable again and the
+	// next download asks the transport once more, because a copy can come
+	// back (a re-linked Signal's attachment store restored from a backup).
+	// The row stays pending (the state column allows only pending and
+	// downloaded), so an import from elsewhere can fill it.
+	UnavailableAttachmentErrorPrefix = "unavailable: "
+)
+
+// UnavailableAttachmentRecheckAfter is how long an unavailable mark stands.
+// It bounds the transport calls a repeatedly rendered attachment costs while
+// still noticing a copy that came back.
+const UnavailableAttachmentRecheckAfter = time.Hour
+
+// UnavailableReason reports why a pending attachment cannot be downloaded
+// through its transport, once a download attempt has found it has no copy.
+// A receive-time report alone does not count: the attempt confirms it. ok is
+// false for an attachment that is downloaded or may still download.
+func (a MessageAttachment) UnavailableReason() (reason string, ok bool) {
+	if a.State != "pending" || a.LastError == nil {
+		return "", false
+	}
+	rest, found := strings.CutPrefix(*a.LastError, UnavailableAttachmentErrorPrefix)
+	if !found {
+		return "", false
+	}
+	return strings.TrimSpace(rest), true
+}
+
+// UnavailableReasonAt is UnavailableReason for a mark still standing at now
+// (younger than UnavailableAttachmentRecheckAfter; UpdatedAtMS must be read).
+// A mark past it reads as not unavailable, so a reader fetches the
+// attachment and that fetch re-checks the transport.
+func (a MessageAttachment) UnavailableReasonAt(now time.Time) (reason string, ok bool) {
+	reason, ok = a.UnavailableReason()
+	if !ok || now.Sub(time.UnixMilli(a.UpdatedAtMS)) >= UnavailableAttachmentRecheckAfter {
+		return "", false
+	}
+	return reason, true
+}
+
 // MessageAttachment is one inbound attachment associated with a normalized
 // message. AccountID is populated only by GetForDownload's messages join.
 type MessageAttachment struct {
@@ -20,7 +70,13 @@ type MessageAttachment struct {
 	SizeBytes *int64
 	State     string
 	BlobHash  *string
+	// LastError is diagnostic text from the projection or the latest failed
+	// download. RecordInboundAttachment only writes a non-nil value, so a
+	// replay that carries none keeps what is stored.
+	LastError *string
 	AccountID string
+	// UpdatedAtMS is read by GetForDownload only.
+	UpdatedAtMS int64
 }
 
 // MessageAttachmentRepository owns inbound attachment lifecycle state.
@@ -84,15 +140,17 @@ func (r *MessageAttachmentRepository) RecordInboundAttachment(
 			size_bytes,
 			state,
 			blob_hash,
+			last_error,
 			created_at_ms,
 			updated_at_ms
-		) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', NULL, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', NULL, ?, ?, ?)
 		ON CONFLICT(message_id, ordinal) DO UPDATE SET
 			remote_id = excluded.remote_id,
 			remote_ref = excluded.remote_ref,
 			filename = excluded.filename,
 			mime = excluded.mime,
 			size_bytes = excluded.size_bytes,
+			last_error = COALESCE(excluded.last_error, message_attachments.last_error),
 			updated_at_ms = excluded.updated_at_ms
 		WHERE message_attachments.blob_hash IS NULL
 	`,
@@ -103,6 +161,7 @@ func (r *MessageAttachmentRepository) RecordInboundAttachment(
 		attachment.Filename,
 		attachment.MIME,
 		attachment.SizeBytes,
+		attachment.LastError,
 		nowMS,
 		nowMS,
 	); err != nil {
@@ -127,6 +186,7 @@ func (r *MessageAttachmentRepository) GetForDownload(
 		attachment MessageAttachment
 		size       sql.NullInt64
 		hash       sql.NullString
+		lastError  sql.NullString
 	)
 	err := r.store.db.QueryRowContext(ctx, `
 		SELECT
@@ -139,6 +199,8 @@ func (r *MessageAttachmentRepository) GetForDownload(
 			ma.size_bytes,
 			ma.state,
 			ma.blob_hash,
+			ma.last_error,
+			ma.updated_at_ms,
 			m.account_id
 		FROM message_attachments AS ma
 		JOIN messages AS m ON m.message_id = ma.message_id
@@ -153,6 +215,8 @@ func (r *MessageAttachmentRepository) GetForDownload(
 		&size,
 		&attachment.State,
 		&hash,
+		&lastError,
+		&attachment.UpdatedAtMS,
 		&attachment.AccountID,
 	)
 	if err != nil {
@@ -168,6 +232,9 @@ func (r *MessageAttachmentRepository) GetForDownload(
 	}
 	if hash.Valid {
 		attachment.BlobHash = &hash.String
+	}
+	if lastError.Valid {
+		attachment.LastError = &lastError.String
 	}
 	return attachment, nil
 }
@@ -222,6 +289,51 @@ func (r *MessageAttachmentRepository) MarkDownloaded(
 		)
 	}
 	return nil
+}
+
+// ReplaceDownloaded points a downloaded attachment at different bytes, only
+// while it still holds oldBlobHash (compare-and-swap), and reports whether it
+// did. It exists to correct a wrong import; the old blob stays in the
+// BlobStore, which other rows may share.
+func (r *MessageAttachmentRepository) ReplaceDownloaded(
+	ctx context.Context,
+	messageID string,
+	ordinal int64,
+	oldBlobHash string,
+	blobHash string,
+	size int64,
+	mime string,
+) (bool, error) {
+	if err := validateBlobHash(blobHash); err != nil {
+		return false, fmt.Errorf("replace message attachment: %w", err)
+	}
+	if size < 0 {
+		return false, fmt.Errorf("replace message attachment: size is negative")
+	}
+	if strings.TrimSpace(mime) == "" {
+		return false, fmt.Errorf("replace message attachment: MIME type is empty")
+	}
+	nowMS, err := r.nowMS("replace message attachment")
+	if err != nil {
+		return false, err
+	}
+	result, err := r.store.db.ExecContext(ctx, `
+		UPDATE message_attachments
+		SET blob_hash = ?,
+		    size_bytes = ?,
+		    mime = ?,
+		    last_error = NULL,
+		    updated_at_ms = ?
+		WHERE message_id = ? AND ordinal = ? AND state = 'downloaded' AND blob_hash = ?
+	`, blobHash, size, mime, nowMS, messageID, ordinal, oldBlobHash)
+	if err != nil {
+		return false, fmt.Errorf("replace message attachment %q ordinal %d: %w", messageID, ordinal, err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("replace message attachment %q ordinal %d: read rows affected: %w", messageID, ordinal, err)
+	}
+	return affected == 1, nil
 }
 
 // MarkFailed records diagnostic text while leaving the attachment pending and

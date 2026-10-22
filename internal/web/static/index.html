@@ -1466,6 +1466,23 @@ html, body {
 
 .msg.sent .msg-attachment-card { margin-left: auto; }
 
+.msg-attachment-card.msg-attachment-unavailable {
+  border-style: dashed;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: default;
+}
+
+.msg-attachment-card.msg-attachment-unavailable:hover {
+  border-color: var(--border);
+  background: transparent;
+}
+
+.msg-attachment-unavailable .msg-attachment-icon {
+  background: var(--bg-hover);
+  color: var(--text-muted);
+}
+
 .msg-attachment-card:hover {
   border-color: var(--border-accent);
   background: var(--bg-hover);
@@ -7260,6 +7277,20 @@ body::after {
     return `<a class="msg-attachment-card" href="${escapeHtml(href)}" target="_blank" rel="noopener noreferrer">${body}</a>`;
   }
 
+  // An attachment a download attempt found this app has no copy of (the v2
+  // read API sets media_unavailable): show what it was without a link that
+  // can only fail.
+  function renderUnavailableAttachmentHTML(message, reason) {
+    const mime = String(message && message.MimeType || '').trim();
+    return `<div class="msg-attachment-card msg-attachment-unavailable" aria-disabled="true" title="${escapeHtml(reason)}">
+        <span class="msg-attachment-icon">${escapeHtml(attachmentTypeLabel(mime))}</span>
+        <span class="msg-attachment-copy">
+          <span class="msg-attachment-title">${escapeHtml(attachmentTitle(message))} unavailable</span>
+          <span class="msg-attachment-meta">${message && message.IsFromMe ? 'This app has no copy of the file.' : 'This app has no copy of the file. Ask the sender to send it again.'}</span>
+        </span>
+      </div>`;
+  }
+
   function truncateOneLine(value, max = 96) {
     const text = String(value || '').replace(/\s+/g, ' ').trim();
     return text.length > max ? text.substring(0, Math.max(0, max - 3)) + '...' : text;
@@ -10992,7 +11023,11 @@ body::after {
       const transcript = message.Transcript || message.transcript || '';
       const transcriptModel = message.TranscriptModel || message.transcript_model || '';
 
-      if (hasMediaID && isImage && mediaSrc) {
+      const mediaUnavailable = String(message.media_unavailable || '').trim();
+
+      if (mediaUnavailable && !message._pendingSend) {
+        html += renderUnavailableAttachmentHTML(message, mediaUnavailable);
+      } else if (hasMediaID && isImage && mediaSrc) {
         html += `<div class="msg-media">`;
         html += `<div class="msg-media-loading" data-msg-id="${escapeHtml(message.MessageID)}" data-kind="image"><div class="spinner"></div><span class="msg-media-loading-text">Fetching image...</span></div>`;
         html += `<img src="${mediaSrc}" alt="Image" loading="lazy" decoding="async" onload="handleMediaLoad(this)" onerror="handleMediaError(this, 'image')" onclick="showFullscreen(this.src,'image')">`;

@@ -352,3 +352,39 @@ func recordMessageAttachment(
 		t.Fatalf("commit attachment transaction: %v", err)
 	}
 }
+
+func TestMessageAttachmentUnavailableReason(t *testing.T) {
+	text := func(value string) *string { return &value }
+	for name, tc := range map[string]struct {
+		attachment MessageAttachment
+		reason     string
+		ok         bool
+	}{
+		"pending, no error":    {MessageAttachment{State: "pending"}, "", false},
+		"pending, transient":   {MessageAttachment{State: "pending", LastError: text("download_media: transient: offline")}, "", false},
+		"pending, unavailable": {MessageAttachment{State: "pending", LastError: text(UnavailableAttachmentErrorPrefix + "gone ")}, "gone", true},
+		"pending, receive":     {MessageAttachment{State: "pending", LastError: text(ReceiveAttachmentErrorPrefix + "reset")}, "", false},
+		"downloaded":           {MessageAttachment{State: "downloaded", LastError: text(UnavailableAttachmentErrorPrefix + "gone")}, "", false},
+	} {
+		reason, ok := tc.attachment.UnavailableReason()
+		if reason != tc.reason || ok != tc.ok {
+			t.Errorf("%s: UnavailableReason() = %q, %v; want %q, %v", name, reason, ok, tc.reason, tc.ok)
+		}
+	}
+}
+
+func TestMessageAttachmentUnavailableReasonAtExpires(t *testing.T) {
+	mark := UnavailableAttachmentErrorPrefix + "gone"
+	markedAt := time.Date(2026, time.October, 21, 22, 0, 0, 0, time.UTC)
+	attachment := MessageAttachment{State: "pending", LastError: &mark, UpdatedAtMS: markedAt.UnixMilli()}
+	if reason, ok := attachment.UnavailableReasonAt(markedAt.Add(59 * time.Minute)); !ok || reason != "gone" {
+		t.Fatalf("UnavailableReasonAt(+59m) = %q, %v; want the mark standing", reason, ok)
+	}
+	if _, ok := attachment.UnavailableReasonAt(markedAt.Add(UnavailableAttachmentRecheckAfter)); ok {
+		t.Fatal("UnavailableReasonAt(+1h) still reports the mark; readers would never re-check")
+	}
+	receive := ReceiveAttachmentErrorPrefix + "reset"
+	if _, ok := (MessageAttachment{State: "pending", LastError: &receive, UpdatedAtMS: markedAt.UnixMilli()}).UnavailableReasonAt(markedAt); ok {
+		t.Fatal("a receive-time note alone reads as unavailable")
+	}
+}

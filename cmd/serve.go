@@ -84,6 +84,7 @@ func mcpV2Dependencies(stack *v2Stack) []*tools.V2Dependencies {
 		Service:  stack.Service,
 		V2Store:  stack.Store,
 		Registry: stack.Registry,
+		Media:    stack.Media,
 	}}
 }
 

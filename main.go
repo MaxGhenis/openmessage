@@ -41,6 +41,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "  import imessage [db-path]                 - Import iMessage (needs Full Disk Access)")
 		fmt.Fprintln(os.Stderr, "  import whatsapp <chat.txt> [--name You]   - Import WhatsApp text export")
 		fmt.Fprintln(os.Stderr, "  import signal [support-dir]               - Import Signal Desktop history")
+		fmt.Fprintln(os.Stderr, "  media import <message-id|v2msg:<id>:<n>> <file> [--ordinal N] [--sha256 HEX] [--replace] [--json] - Give the running app a local copy of an attachment its platform can no longer deliver")
 		os.Exit(1)
 	}
 
@@ -122,6 +123,8 @@ func main() {
 			os.Exit(1)
 		}
 		err = cmd.RunImport(logger, os.Args[2], os.Args[3:])
+	case "media":
+		err = cmd.RunMedia(os.Args[2:])
 	case "debug-media":
 		if len(os.Args) < 3 {
 			fmt.Fprintln(os.Stderr, "Usage: openmessage debug-media <conversation_id>")
