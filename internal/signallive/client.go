@@ -20,6 +20,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -148,8 +149,12 @@ var (
 	signalCLILookPath     = exec.LookPath
 	signalCLIStat         = os.Stat
 	probeSignalCLIVersion = func(ctx context.Context) ([]byte, error) {
-		cmd := exec.CommandContext(ctx, signalCLIExecutable(), "--version")
+		executable := signalCLIExecutable()
 		tmpDir, cleanupTmp, tmpErr := newSignalRunTmpDir()
+		if tmpErr != nil {
+			tmpDir = ""
+		}
+		cmd := exec.CommandContext(ctx, executable, append(signalCLITmpDirArgs(executable, tmpDir), "--version")...)
 		if tmpErr == nil {
 			cmd.Env = signalCLIEnv(os.Environ(), tmpDir)
 			defer cleanupTmp()
@@ -159,20 +164,31 @@ var (
 	}
 
 	runSignalCLI = func(ctx context.Context, configDir string, args ...string) ([]byte, error) {
-		commandArgs := append([]string{"--config", configDir}, args...)
-		cmd := exec.CommandContext(ctx, signalCLIExecutable(), commandArgs...)
+		executable := signalCLIExecutable()
 		tmpDir, cleanupTmp, tmpErr := newSignalRunTmpDir()
+		if tmpErr != nil {
+			tmpDir = ""
+		}
+		commandArgs := append(signalCLITmpDirArgs(executable, tmpDir), "--config", configDir)
+		cmd := exec.CommandContext(ctx, executable, append(commandArgs, args...)...)
 		if tmpErr == nil {
 			cmd.Env = signalCLIEnv(os.Environ(), tmpDir)
 			defer cleanupTmp()
 		}
-		configureSignalCancel(cmd)
+		exited := configureSignalStop(ctx, cmd, configDir, tmpDir)
+		defer exited()
 		return cmd.CombinedOutput()
 	}
 
 	startSignalLink = func(ctx context.Context, configDir string) (io.ReadCloser, func() error, error) {
-		cmd := exec.CommandContext(ctx, "script", "-q", "/dev/null", signalCLIExecutable(), "--config", configDir, "link", "-n", "OpenMessage")
+		executable := signalCLIExecutable()
 		tmpDir, cleanupTmp, tmpErr := newSignalRunTmpDir()
+		if tmpErr != nil {
+			tmpDir = ""
+		}
+		commandArgs := append([]string{"-q", "/dev/null", executable}, signalCLITmpDirArgs(executable, tmpDir)...)
+		commandArgs = append(commandArgs, "--config", configDir, "link", "-n", "OpenMessage")
+		cmd := exec.CommandContext(ctx, "script", commandArgs...)
 		if tmpErr == nil {
 			cmd.Env = signalCLIEnv(os.Environ(), tmpDir)
 		}
@@ -211,7 +227,7 @@ func configureSignalCancel(cmd *exec.Cmd) {
 		}
 		return nil
 	}
-	cmd.WaitDelay = 3 * time.Second
+	cmd.WaitDelay = signalStopGrace
 }
 
 type Callbacks struct {
@@ -334,6 +350,14 @@ func (r *pollerRun) markReady() {
 	r.readyOnce.Do(func() { close(r.ready) })
 }
 
+// beatFunc is beat for a caller that may hold no run (the legacy loop).
+func (r *pollerRun) beatFunc() func(detail string) {
+	if r == nil {
+		return nil
+	}
+	return r.beat
+}
+
 func (r *pollerRun) beat(detail string) {
 	activity := PollerActivity{At: now(), Detail: detail}
 	select {
@@ -423,7 +447,7 @@ type storedReaction struct {
 
 type Bridge struct {
 	mu         sync.RWMutex
-	commandMu  sync.Mutex
+	commandMu  commandGate
 	recoveryMu sync.Mutex
 
 	store     *db.Store
@@ -456,6 +480,10 @@ type Bridge struct {
 	// a valid link, but a persistent listAccounts/accounts.json disagreement
 	// still surfaces needs_reauth. Reset by a successful probe or an unpair.
 	probeEmptyStreak int
+
+	// receiveDraining is set while a receive call stopped by its deadline is
+	// held open to finish an attachment download (receive_drain.go).
+	receiveDraining atomic.Bool
 
 	pairCancel    context.CancelFunc
 	receiveCancel context.CancelFunc
@@ -1082,9 +1110,11 @@ func (b *Bridge) SendText(conversationID, body, replyToID string) (*db.Message, 
 		args = append(args, target)
 	}
 
+	if err := b.lockForRequest(); err != nil {
+		return nil, commandNotDispatchedError("send Signal message", err, nil)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), sendTimeout)
 	defer cancel()
-	b.commandMu.Lock()
 	output, err := runSignalCLI(ctx, b.configDir, args...)
 	b.commandMu.Unlock()
 	if err != nil {
@@ -1142,9 +1172,11 @@ func (b *Bridge) SendTextRequest(conversationID, body string, reply ReplyTarget)
 		args = append(args, target)
 	}
 
+	if err := b.lockForRequest(); err != nil {
+		return 0, commandNotDispatchedError("send Signal message", err, nil)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), sendTimeout)
 	defer cancel()
-	b.commandMu.Lock()
 	output, commandErr := runSignalCLI(ctx, b.configDir, args...)
 	b.commandMu.Unlock()
 	timestampMS, resultErr := parseSignalSendResult(output)
@@ -1303,9 +1335,11 @@ func (b *Bridge) sendMediaRequest(
 		args = append(args, target)
 	}
 
+	if err := b.lockForRequest(); err != nil {
+		return result, commandNotDispatchedError("send Signal media", err, nil)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), sendTimeout)
 	defer cancel()
-	b.commandMu.Lock()
 	output, commandErr := runSignalCLI(ctx, b.configDir, args...)
 	b.commandMu.Unlock()
 	timestampMS, resultErr := parseSignalSendResult(output)
@@ -1489,9 +1523,11 @@ func (b *Bridge) SendReactionRequest(
 		args = append(args, recipient)
 	}
 
+	if err := b.lockForRequest(); err != nil {
+		return commandNotDispatchedError("send Signal reaction", err, nil)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), sendTimeout)
 	defer cancel()
-	b.commandMu.Lock()
 	output, err := runSignalCLI(ctx, b.configDir, args...)
 	b.commandMu.Unlock()
 	if err != nil {
@@ -1554,9 +1590,11 @@ func (b *Bridge) SendReaction(conversationID, targetMessageID, emoji, action str
 		args = append(args, recipient)
 	}
 
+	if err := b.lockForRequest(); err != nil {
+		return commandNotDispatchedError("send Signal reaction", err, nil)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), sendTimeout)
 	defer cancel()
-	b.commandMu.Lock()
 	output, err := runSignalCLI(ctx, b.configDir, args...)
 	b.commandMu.Unlock()
 	if err != nil {
@@ -1837,7 +1875,15 @@ func (b *Bridge) runReceiveLoop(
 
 		b.commandMu.Lock()
 		callCtx, callCancel := context.WithTimeout(ctx, receiveCallDeadline)
-		output, err := runSignalCLI(callCtx, b.configDir, "-a", probedAccount, "--output", "json", "receive", "--timeout", strconv.Itoa(receiveTimeoutSeconds), "--max-messages", strconv.Itoa(receiveMaxMessages))
+		// A call its deadline stops may still be downloading an attachment
+		// for an envelope it has acknowledged; it is drained, not killed.
+		drainCtx := withReceiveDrain(callCtx, receiveDrainRequest{
+			abort:   ctx.Done(),
+			holding: &b.receiveDraining,
+			beat:    run.beatFunc(),
+			logger:  b.logger,
+		})
+		output, err := runSignalCLI(drainCtx, b.configDir, "-a", probedAccount, "--output", "json", "receive", "--timeout", strconv.Itoa(receiveTimeoutSeconds), "--max-messages", strconv.Itoa(receiveMaxMessages))
 		b.commandMu.Unlock()
 		timedOut := errors.Is(callCtx.Err(), context.DeadlineExceeded)
 		callCancel()
@@ -2138,7 +2184,8 @@ func (b *Bridge) parkUpgradeRequired(token uint64, detail string) {
 // maybeSweepTmp runs the crash-backstop sweeps at most once per
 // signalTmpSweepInterval. Normal runs clean up after themselves, so the
 // app-tmp sweep usually finds nothing; the legacy sweep keeps reaping
-// system-temp dirs leaked by older builds as they age past the gate.
+// system-temp dirs leaked by older builds as they age past the gate, and the
+// attachments sweep the partial files of receive calls that were killed.
 func (b *Bridge) maybeSweepTmp() {
 	b.mu.Lock()
 	due := now().Sub(b.lastTmpSweep) >= signalTmpSweepInterval
@@ -2150,6 +2197,7 @@ func (b *Bridge) maybeSweepTmp() {
 		b.goTracked(func() {
 			sweepSignalTmpRoot(b.logger, signalRunTmpMaxAge)
 			sweepLegacyLibsignalTemp(b.logger)
+			sweepSignalAttachmentTemps(b.logger, b.configDir, signalRunTmpMaxAge)
 		})
 	}
 }
@@ -2166,9 +2214,9 @@ func (b *Bridge) requestSync(account string) error {
 	if account == "" {
 		return errors.New("signal account is not paired")
 	}
+	b.commandMu.Lock()
 	ctx, cancel := context.WithTimeout(context.Background(), syncRequestTimeout)
 	defer cancel()
-	b.commandMu.Lock()
 	output, err := runSignalCLI(ctx, b.configDir, "-a", account, "sendSyncRequest")
 	b.commandMu.Unlock()
 	if err != nil {
@@ -3403,9 +3451,9 @@ func (b *Bridge) refreshGroupNames() {
 	if b == nil || b.store == nil {
 		return
 	}
+	b.commandMu.Lock()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	b.commandMu.Lock()
 	output, err := runSignalCLI(ctx, b.configDir, "listGroups")
 	b.commandMu.Unlock()
 	groups := parseSignalGroups(output)
@@ -3497,9 +3545,9 @@ func (b *Bridge) refreshContacts() {
 	if b == nil {
 		return
 	}
+	b.commandMu.Lock()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	b.commandMu.Lock()
 	output, err := runSignalCLI(ctx, b.configDir, "listContacts")
 	b.commandMu.Unlock()
 	contacts := parseSignalContacts(output)
@@ -4376,9 +4424,11 @@ func (b *Bridge) downloadSignalAttachment(
 		args = append(args, "--recipient", target)
 	}
 
+	if err := b.lockForRequest(); err != nil {
+		return nil, commandError("download Signal attachment", err, nil)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), sendTimeout)
 	defer cancel()
-	b.commandMu.Lock()
 	output, err := runSignalCLI(ctx, b.configDir, args...)
 	b.commandMu.Unlock()
 	if err != nil {
