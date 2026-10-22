@@ -2,6 +2,7 @@ package signallive
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -101,8 +102,10 @@ type signalDownloads struct {
 // as it arrives (IOUtils.createTempFile, PushServiceSocket.downloadFromCdn).
 // The plaintext goes through <name>.<random>.tmp in <configDir>/attachments,
 // created when the download starts and written once it completes
-// (AttachmentStore.storeAttachment). One older than the call is a leftover
-// of a killed call.
+// (AttachmentStore.storeAttachment). One modified before the call started is
+// a leftover of a killed call. On a filesystem with whole-second timestamps a
+// fresh one can look older and be missed; the run dir, which needs no age
+// test, still shows the download.
 type downloadWatch struct {
 	runDir         string
 	attachmentsDir string
@@ -221,17 +224,19 @@ func drain(process *os.Process, req receiveDrainRequest, watch downloadWatch, po
 			req.beat("receive_download")
 		}
 		if verdict.kill {
+			if err := process.Kill(); errors.Is(err, os.ErrProcessDone) {
+				return
+			}
 			event := req.logger.Warn().
 				Dur("after_stop", at.Sub(clock.stoppedAt)).
 				Bool("aborted", !clock.abortedAt.IsZero())
 			if downloads.files > 0 {
 				event.Int("downloads", downloads.files).
 					Int64("bytes", downloads.bytes).
-					Msg("Killing a Signal receive call with an attachment download in flight; signal-cli already acknowledged the envelope it was handling, so that message is lost")
+					Msg("Killed a Signal receive call with an attachment download in flight; signal-cli had acknowledged the envelope it was handling, so that message is lost")
 			} else {
-				event.Msg("Killing a Signal receive call that did not exit after SIGTERM; an envelope it was still handling is lost")
+				event.Msg("Killed a Signal receive call that had not exited after SIGTERM; an envelope it was still handling is lost")
 			}
-			_ = process.Kill()
 			return
 		}
 		select {
@@ -278,9 +283,7 @@ func configureSignalStop(ctx context.Context, cmd *exec.Cmd, configDir, runDir s
 	watch := downloadWatch{
 		runDir:         runDir,
 		attachmentsDir: filepath.Join(configDir, "attachments"),
-		// Whole seconds, so a filesystem with coarse timestamps still
-		// counts a file this call created.
-		since: time.Now().Truncate(time.Second),
+		since:          time.Now(),
 	}
 	exited := make(chan struct{})
 	drained := make(chan struct{})
@@ -296,7 +299,10 @@ func configureSignalStop(ctx context.Context, cmd *exec.Cmd, configDir, runDir s
 		}()
 		return nil
 	}
-	// A backstop only: the drain kills the call by policy.limit.
+	// A backstop only: the drain kills the call by policy.limit. WaitDelay
+	// also bounds the wait for the output pipe to close, so an executable
+	// that leaves a child holding it (a wrapper script that doesn't exec
+	// signal-cli) can hold the call this long rather than signalStopGrace.
 	cmd.WaitDelay = policy.limit + policy.idle
 	return func() {
 		close(exited)

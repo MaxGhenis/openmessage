@@ -1575,7 +1575,7 @@ func (b *Bridge) SendReaction(conversationID, targetMessageID, emoji, action str
 	if err != nil {
 		return err
 	}
-	targetAuthor := b.resolveContactAddress(target.SenderNumber)
+	targetAuthor := b.resolveContactAddressForRequest(target.SenderNumber)
 	if targetAuthor == "" {
 		return errors.New("signal reaction target author is unavailable")
 	}
@@ -3501,6 +3501,18 @@ func (b *Bridge) refreshGroupNames() {
 }
 
 func (b *Bridge) resolveContactAddress(value string) string {
+	return b.resolveContactAddressRefreshing(value, b.refreshContacts)
+}
+
+// resolveContactAddressForRequest is resolveContactAddress for a send: its
+// contact refresh gives up as the send would (lockForRequest) rather than
+// queue behind a drained receive call, leaving an unknown ACI unresolved.
+// signal-cli takes an ACI as an author too.
+func (b *Bridge) resolveContactAddressForRequest(value string) string {
+	return b.resolveContactAddressRefreshing(value, b.refreshContactsForRequest)
+}
+
+func (b *Bridge) resolveContactAddressRefreshing(value string, refresh func()) string {
 	value = normalizeSignalAddress(value)
 	if value == "" {
 		return ""
@@ -3514,7 +3526,7 @@ func (b *Bridge) resolveContactAddress(value string) string {
 	if resolved != "" {
 		return resolved
 	}
-	b.refreshContacts()
+	refresh()
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 	if resolved = normalizeSignalAddress(b.contactByACI[value]); resolved != "" {
@@ -3546,6 +3558,23 @@ func (b *Bridge) refreshContacts() {
 		return
 	}
 	b.commandMu.Lock()
+	b.listContactsHoldingGate()
+}
+
+func (b *Bridge) refreshContactsForRequest() {
+	if b == nil {
+		return
+	}
+	if err := b.lockForRequest(); err != nil {
+		b.logger.Debug().Err(err).Msg("Skipped refreshing Signal contacts for a send")
+		return
+	}
+	b.listContactsHoldingGate()
+}
+
+// listContactsHoldingGate refreshes the contact cache from listContacts. The
+// caller holds the command gate; it is released once signal-cli exits.
+func (b *Bridge) listContactsHoldingGate() {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	output, err := runSignalCLI(ctx, b.configDir, "listContacts")
@@ -4473,7 +4502,7 @@ func (b *Bridge) signalQuoteArgs(replyToID, account string) ([]string, error) {
 	if target.TimestampMS == 0 {
 		return nil, errors.New("signal reply target timestamp is unavailable")
 	}
-	return QuoteArgs(legacyReplyTarget(target), account, b.resolveContactAddress)
+	return QuoteArgs(legacyReplyTarget(target), account, b.resolveContactAddressForRequest)
 }
 
 func (b *Bridge) writeLocalAttachment(data []byte, filename string) (string, error) {

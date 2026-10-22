@@ -263,14 +263,16 @@ func TestDownloadWatchCountsOnlyTheCallsOwnDownloadFiles(t *testing.T) {
 
 // --- runSignalCLI with a stub signal-cli -------------------------------------
 
-// drainStubSignalCLI ignores SIGTERM like signal-cli finishing an envelope.
-// STUB_MODE picks what it does meanwhile: grow streams STUB_STEPS chunks of
+// drainStubSignalCLI ignores SIGTERM like signal-cli finishing an envelope,
+// and touches STUB_READY once its trap is set. STUB_MODE picks what it does
+// meanwhile: grow streams STUB_STEPS chunks of
 // ciphertext into its temp dir and then prints STUB_ENVELOPE; stall creates
 // the ciphertext file and never writes to it; store creates a fresh
 // attachments/*.tmp in STUB_CONFIG and never writes to it; idle downloads
 // nothing. Each step is 50 ms.
 const drainStubSignalCLI = `#!/bin/sh
 trap 'echo "INFO  Shutdown - Received SIGTERM signal, shutting down ..." >&2' TERM
+: > "$STUB_READY"
 f="$TMPDIR/signal-cli_tmp_1.tmp"
 case "$STUB_MODE" in
 grow)
@@ -291,6 +293,30 @@ while :; do sleep 0.05; done
 `
 
 const drainStubEnvelope = `{"envelope":{"source":"+15551234567","timestamp":1700000000123}}`
+
+// stubDeadline is a context that ends deadline after the stub has set its
+// SIGTERM trap (STUB_READY appears), so a loaded host can't deliver the
+// SIGTERM to a shell that would still die of it.
+func stubDeadline(t *testing.T, deadline time.Duration) context.Context {
+	t.Helper()
+	ready := filepath.Join(t.TempDir(), "ready")
+	t.Setenv("STUB_READY", ready)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go func() {
+		for give := time.Now().Add(30 * time.Second); time.Now().Before(give); time.Sleep(5 * time.Millisecond) {
+			if _, err := os.Stat(ready); err == nil {
+				break
+			}
+		}
+		select {
+		case <-time.After(deadline):
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	return ctx
+}
 
 type drainRun struct {
 	output   string
@@ -347,9 +373,7 @@ func runDrained(t *testing.T, policy receiveDrainPolicy, mode string, deadline, 
 		}
 	}()
 
-	ctx, cancel := context.WithTimeout(context.Background(), deadline)
-	defer cancel()
-	ctx = withReceiveDrain(ctx, receiveDrainRequest{
+	ctx := withReceiveDrain(stubDeadline(t, deadline), receiveDrainRequest{
 		abort:   abort,
 		holding: &holding,
 		beat:    func(string) { beats.Add(1) },
@@ -379,8 +403,8 @@ func TestRunSignalCLIDrainsAStoppedReceiveWhileItsDownloadGrows(t *testing.T) {
 	if !strings.Contains(run.output, drainStubEnvelope) {
 		t.Fatalf("output = %q (err %v after %s), want the envelope printed once the download finished", run.output, run.err, run.elapsed)
 	}
-	if !errors.Is(run.err, context.DeadlineExceeded) {
-		t.Fatalf("err = %v, want the deadline: the call exited 0 after its stop", run.err)
+	if !errors.Is(run.err, context.Canceled) {
+		t.Fatalf("err = %v, want the stop: the call exited 0 after it", run.err)
 	}
 	if !run.held || run.holdLeft {
 		t.Fatalf("held = %v, still holding after return = %v; want held during the download and released after", run.held, run.holdLeft)
@@ -475,8 +499,7 @@ func TestRunSignalCLIWithoutADrainRequestKeepsTheFixedGrace(t *testing.T) {
 	t.Setenv("STUB_MODE", "grow")
 	t.Setenv("STUB_STEPS", "1000000")
 	deadline := 200 * time.Millisecond
-	ctx, cancel := context.WithTimeout(context.Background(), deadline)
-	defer cancel()
+	ctx := stubDeadline(t, deadline)
 	started := time.Now()
 	_, err := runSignalCLI(ctx, t.TempDir(), "listContacts")
 	elapsed := time.Since(started)

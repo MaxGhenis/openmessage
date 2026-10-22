@@ -2008,15 +2008,17 @@ a receive call stopped by **its deadline** is *drained*
   timeout starts only once it holds the gate. Before this change the wait
   counted against that timeout, so a send whose timeout ran out before
   signal-cli started could be marked uncertain.
-  Attachment fetches (`getAttachment`) give up the same way.
+  Attachment fetches (`getAttachment`), and the contact refresh a send runs
+  to name a quoted or reacted-to author it doesn't know, give up the same
+  way; the author then goes to signal-cli as an ACI.
 
 Log lines (backend os_log):
 
 - `Holding a stopped Signal receive call open while it finishes an attachment download`
 - `Stopped Signal receive call exited after finishing its attachment download`
-- `Killing a Signal receive call with an attachment download in flight; ... that message is lost`
+- `Killed a Signal receive call with an attachment download in flight; ... that message is lost`
   means the stall window or the 10 min limit was hit.
-- `Killing a Signal receive call that did not exit after SIGTERM` means
+- `Killed a Signal receive call that had not exited after SIGTERM` means
   signal-cli was busy with something other than a download.
 
 Losses still possible: a caller stop during a download; non-download

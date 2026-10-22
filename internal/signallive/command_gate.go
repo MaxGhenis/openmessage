@@ -8,9 +8,10 @@ import (
 
 // requestLockWait bounds how long a send or attachment fetch waits for the
 // command gate. It is longer than a receive call holds the gate unless it is
-// drained (receiveCallDeadline plus signalStopGrace), so a request gives up
-// only behind a drain it started waiting before, or a stuck call. Swapped by
-// tests.
+// drained (receiveCallDeadline plus signalStopGrace). A request can still
+// give up behind a drain that began while it waited, a stuck call, or a
+// queue of ordinary calls ahead of it (a receive call, then a contact
+// refresh); it is then not dispatched and retried. Swapped by tests.
 var requestLockWait = 10 * time.Second
 
 var (

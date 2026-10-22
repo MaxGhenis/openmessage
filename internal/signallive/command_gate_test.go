@@ -19,7 +19,7 @@ func TestCommandGateHandsOffToTheWaiterBeforeTheHolderRetakesIt(t *testing.T) {
 	gate.Lock()
 	acquired := make(chan bool, 1)
 	go func() { acquired <- gate.lockWithin(5 * time.Second) }()
-	time.Sleep(100 * time.Millisecond) // let the waiter queue
+	time.Sleep(250 * time.Millisecond) // let the waiter queue
 
 	gate.Unlock()
 	retaken := make(chan struct{})
@@ -78,7 +78,15 @@ func sendThroughGate(bridge *Bridge) map[string]error {
 		RemoteID: "1700000000555", Outgoing: true, SentAt: time.UnixMilli(1700000000000),
 	}, "👍", "add")
 	_, legacyTextErr := bridge.SendText("signal:"+gateTestRecipient, "hi", "")
-	return map[string]error{"text": textErr, "media": mediaErr, "reaction": reactionErr, "legacy text": legacyTextErr}
+	// Quoting an author known only by an ACI the contact cache lacks makes
+	// the send refresh contacts first; that refresh must give up too.
+	_, quoteErr := bridge.SendTextRequest("signal:"+gateTestRecipient, "re", ReplyTarget{
+		RemoteID: "1700000000999", AuthorID: "8a3c1f2e-5b6d-4e7f-9a0b-1c2d3e4f5a6b", SentAt: time.UnixMilli(1700000000999), Text: "orig",
+	})
+	return map[string]error{
+		"text": textErr, "media": mediaErr, "reaction": reactionErr,
+		"legacy text": legacyTextErr, "quoted text": quoteErr,
+	}
 }
 
 func newGateTestBridge(t *testing.T, run func(ctx context.Context, args ...string) ([]byte, error)) *Bridge {
