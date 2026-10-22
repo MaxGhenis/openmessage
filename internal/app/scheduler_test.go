@@ -8,6 +8,7 @@ import (
 	"github.com/rs/zerolog"
 
 	"github.com/maxghenis/openmessage/internal/db"
+	"github.com/maxghenis/openmessage/internal/signallive"
 )
 
 func newSchedulerTestApp(t *testing.T) *App {
@@ -127,5 +128,25 @@ func TestProcessDueScheduledMessages_FailsAfterMaxAttempts(t *testing.T) {
 	}
 	if got.LastError == "" {
 		t.Errorf("expected a recorded error")
+	}
+}
+
+// A Signal send that gave up because signal-cli was finishing an attachment
+// download never ran. A drain can outlast the scheduler's few attempts, so
+// it goes back to pending without spending one.
+func TestProcessDueScheduledMessages_SignalDrainDoesNotSpendAnAttempt(t *testing.T) {
+	a := newSchedulerTestApp(t)
+	seedDue(t, a, "s1")
+	a.sendTextOverride = func(cid, body, rt string) (*db.Message, error) {
+		return nil, fmt.Errorf("send Signal message: %w", signallive.ErrReceiveDraining)
+	}
+
+	for i := 0; i < scheduleMaxAttempts+2; i++ {
+		a.processDueScheduledMessages()
+	}
+
+	got, _ := a.Store.GetScheduledMessage("s1")
+	if got.Status != db.ScheduleStatusPending || got.Attempts != 0 || got.LastError == "" {
+		t.Fatalf("after drained sends = %+v, want pending with no attempts spent and the reason recorded", got)
 	}
 }

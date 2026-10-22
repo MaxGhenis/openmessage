@@ -113,7 +113,7 @@ func (b *Bridge) replyQuoteArgs(reply ReplyTarget, account string) ([]string, er
 	if held {
 		return b.signalQuoteArgs(reply.RemoteID, account)
 	}
-	return QuoteArgs(reply, account, b.resolveContactAddress)
+	return QuoteArgs(reply, account, b.resolveContactAddressForRequest)
 }
 
 // holdsLegacyReplyTarget reports whether remoteID is a legacy Signal message

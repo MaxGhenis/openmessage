@@ -1960,6 +1960,103 @@ up the whole `signal-cli/` dir first and restore the media subdirs
 after the new link (recipe proven 2026-07-20; backups live under
 `<datadir>/app-backups/`).
 
+### Receive calls that are still downloading an attachment
+
+Each `signal-cli receive` call is bounded at 5 s (`receiveCallDeadline`), then
+gets SIGTERM. What happens next decides whether a message survives
+(signal-cli 0.14.9 and libsignal 0.103 source, read 2026-10-21):
+
+- signal-cli **caches and acks** each envelope before handling it, downloads
+  its attachments **while handling it**, and prints it only after that.
+- SIGTERM is graceful: `receive` installs signal-cli's `Shutdown` handler,
+  which stops reading from the server and waits for the envelope in hand to
+  finish. The native build does this too (observed: `[SIGTERM handler] INFO
+  Shutdown - Received SIGTERM signal, shutting down ...`, exit 0).
+- **A SIGKILL between the decrypt and the print loses that message
+  silently.** The next `receive` retries the cached copy first, but the
+  decrypt already advanced the session, so libsignal reports a duplicate and
+  signal-cli deletes the entry without printing it. It sends no delivery
+  receipt and makes no resend request. It is not a wedge, because later
+  messages flow normally.
+- Downloads are what make that window long. The CDN client allows 30 s
+  **per read** with no overall deadline, so a large video on a slow link takes
+  minutes. Ciphertext grows in `signal-cli_tmp_*.tmp` in `java.io.tmpdir`. The
+  plaintext is stored through `attachments/<name>.<random>.tmp`, which exists
+  but stays empty for the whole download.
+
+Before #259 every call got a fixed 3 s between SIGTERM and SIGKILL, so a
+download still running about 8 s into a receive call lost its message. Now
+a receive call stopped by **its deadline** is *drained*
+(`internal/signallive/receive_drain.go`):
+
+- It keeps running while a download in it grows. The drain watches the
+  call's run dir and fresh `attachments/*.tmp` every 250 ms.
+- It is killed 3 s after no download is in flight (the old grace), 45 s
+  after its downloads stop growing (longer than the CDN's 30 s read timeout,
+  so a stalled download fails inside signal-cli, which still prints the
+  message; #258 then marks the attachment unavailable), or 10 min after the
+  SIGTERM, whichever comes first.
+- A stop by the **caller** (bridge Close, Unpair, a new generation) still
+  gets only 3 s. Those stops wait for the receive loop.
+- The drain beats the poller every 5 s while bytes arrive. Without the beat,
+  the supervisor's liveness probe (2 min, then a 30 s probe) would retire the
+  generation, and that would kill the download.
+- **Sends during a drain fail at once as not dispatched.** The dispatcher
+  then retries them about every 5 s. The dispatcher sends every platform's
+  messages one at a time, so blocking would stall WhatsApp and Google too.
+  Otherwise a send waits up to 10 s for the command gate, and its 20 s
+  timeout starts only once it holds the gate. A quoted reply to an author
+  the contact cache lacks can first wait for a contact refresh too, about
+  50 s in the worst case, still under the dispatcher's 60 s text limit. Before this change the wait
+  counted against that timeout, so a send whose timeout ran out before
+  signal-cli started could be marked uncertain.
+  Attachment fetches (`getAttachment`), and the contact refresh a send runs
+  to name a quoted or reacted-to author it doesn't know, give up the same
+  way; the author then goes to signal-cli as an ACI. A send already waiting
+  when a drain begins gives up then. The legacy paths (web API on a
+  legacy-primary install, scheduled messages) get the same error; a
+  scheduled message goes back to pending **without** spending one of its 5
+  attempts (`signallive.IsReceiveDrainingError`).
+
+Log lines (backend os_log):
+
+- `Holding a stopped Signal receive call open while it finishes an attachment download`
+- `Stopped Signal receive call exited after finishing its attachment download`
+- `Killed a Signal receive call with an attachment download in flight; ... that message is lost`
+  means the stall window or the 10 min limit was hit.
+- `Killed a Signal receive call that had not exited after SIGTERM` means
+  signal-cli was busy with something other than a download. That may have
+  been an envelope (now lost) or only post-print work such as receipts.
+
+Losses still possible: a caller stop during a download; non-download
+handling that takes more than 3 s after the SIGTERM (for example a slow
+group-state fetch); and the signal-cli races where a SIGTERM's stop request
+is lost or its interrupt fails an in-flight download. The last one keeps the
+message and loses only the attachment.
+
+**The native signal-cli and temp dirs.** Homebrew's `signal-cli` is a
+GraalVM native image (`file $(which signal-cli)` reports Mach-O). It ignores
+both `TMPDIR` and `SIGNAL_CLI_OPTS`, and takes `java.io.tmpdir` from
+`getconf DARWIN_USER_TEMP_DIR`. The bridge therefore passes
+`-Djava.io.tmpdir=<run dir>` as the first argument to a native binary
+(Mach-O or ELF), once a `-Djava.io.tmpdir=… --version` run of that build has
+succeeded. A JVM install keeps getting it through `SIGNAL_CLI_OPTS`, as
+before. A wrapper *script* around the native binary gets neither, so its
+ciphertext lands outside the run dir and the drain sees only the empty
+`attachments/*.tmp`. A wrapper that ends in `exec signal-cli "$@"` is then held
+for the 45 s stall window at most. One that doesn't `exec` dies on SIGTERM and
+leaves signal-cli running as an orphan, and the call holds the command gate
+until that orphan exits (10 min backstop), so point `OPENMESSAGES_SIGNAL_CLI`
+only at the binary or an `exec` wrapper. Builds before #259 had each
+call extract libsignal (29 MB) into the Darwin temp dir, and a killed call
+left it there as `libsignal<digits>/`. The periodic sweep looks only in the
+daemon's own temp dir, which is `/tmp`: the app starts the backend with an
+environment that has no `TMPDIR` (`BackendLauncherCore.swift`). So those
+leftovers stay until removed by hand: `find "$(getconf DARWIN_USER_TEMP_DIR)" -maxdepth 1 -name
+'libsignal*' -mtime +1`, with no signal-cli running. A killed call's empty
+`attachments/<name>.<digits>.tmp` is swept after 30 min; a stored attachment
+whose sender named it `.tmp` (`<id>.tmp`) is not.
+
 ### Signal quote-replies on v2-primary
 
 Signal quotes a message by its author and sent timestamp, passed to signal-cli
