@@ -3,6 +3,7 @@ package signallive
 import (
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -208,4 +209,94 @@ func TestRunSignalCLIConfinesTempAndCleansUp(t *testing.T) {
 	if len(entries) != 0 {
 		t.Fatalf("tmp root should be empty after run, has %d entries", len(entries))
 	}
+}
+
+func TestIsNativeExecutableTellsBinariesFromScripts(t *testing.T) {
+	dir := t.TempDir()
+	for name, tc := range map[string]struct {
+		content []byte
+		want    bool
+	}{
+		"mach-o 64":      {[]byte{0xcf, 0xfa, 0xed, 0xfe, 0x0c, 0, 0, 1}, true},
+		"mach-o 32":      {[]byte{0xce, 0xfa, 0xed, 0xfe, 7, 0, 0, 0}, true},
+		"mach-o big end": {[]byte{0xfe, 0xed, 0xfa, 0xcf, 0, 0, 0, 0}, true},
+		"universal":      {[]byte{0xca, 0xfe, 0xba, 0xbe, 0, 0, 0, 2}, true},
+		"elf":            {[]byte{0x7f, 'E', 'L', 'F', 2, 1, 1, 0}, true},
+		"start script":   {[]byte("#!/usr/bin/env sh\nexec java \"$@\"\n"), false},
+		"short":          {[]byte{0x7f, 'E'}, false},
+		"empty":          {nil, false},
+		"something else": {[]byte("PK\x03\x04zip"), false},
+	} {
+		path := filepath.Join(dir, strings.ReplaceAll(name, " ", "-"))
+		if err := os.WriteFile(path, tc.content, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if got := isNativeExecutable(path); got != tc.want {
+			t.Errorf("isNativeExecutable(%s) = %v, want %v", name, got, tc.want)
+		}
+	}
+	if isNativeExecutable(filepath.Join(dir, "missing")) || isNativeExecutable("signal-cli-not-on-path") {
+		t.Error("a missing executable counted as native")
+	}
+}
+
+// A native signal-cli takes java.io.tmpdir only as a leading argument.
+// /bin/echo is a native binary that prints the arguments it was given.
+func TestRunSignalCLIPassesTheRunDirToANativeBinaryAsAnArgument(t *testing.T) {
+	echo, err := exec.LookPath("echo")
+	if err != nil || !isNativeExecutable(echo) {
+		t.Skipf("no native echo binary (%q, %v)", echo, err)
+	}
+	t.Setenv("TMPDIR", t.TempDir())
+	t.Setenv("OPENMESSAGES_SIGNAL_CLI", echo)
+	configDir := t.TempDir()
+	out, err := runSignalCLI(context.Background(), configDir, "receive")
+	if err != nil {
+		t.Fatalf("runSignalCLI: %v (out=%s)", err, out)
+	}
+	args := strings.Fields(string(out))
+	if len(args) != 4 || !strings.HasPrefix(args[0], "-Djava.io.tmpdir="+signalTmpRoot()) ||
+		args[1] != "--config" || args[2] != configDir || args[3] != "receive" {
+		t.Fatalf("native signal-cli argv = %q, want -Djava.io.tmpdir=<run dir> --config %s receive", args, configDir)
+	}
+}
+
+func TestSweepSignalAttachmentTempsRemovesOnlyStalePartialFiles(t *testing.T) {
+	configDir := t.TempDir()
+	dir := filepath.Join(configDir, "attachments")
+	if err := os.MkdirAll(filepath.Join(dir, "old.tmp.d"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	stale := time.Now().Add(-2 * signalRunTmpMaxAge)
+	files := map[string]time.Time{
+		"photo.jpg.123.tmp":   stale,      // a killed call's partial file
+		"video.mp4.456.tmp":   time.Now(), // a download in progress
+		"D49ZGyDHvzgVPhh.jpg": stale,      // a stored attachment
+	}
+	for name, modified := range files {
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(path, modified, modified); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Chtimes(filepath.Join(dir, "old.tmp.d"), stale, stale); err != nil {
+		t.Fatal(err)
+	}
+
+	sweepSignalAttachmentTemps(zerolog.Nop(), configDir, signalRunTmpMaxAge)
+
+	for name, want := range map[string]bool{
+		"photo.jpg.123.tmp":   false,
+		"video.mp4.456.tmp":   true,
+		"D49ZGyDHvzgVPhh.jpg": true,
+		"old.tmp.d":           true,
+	} {
+		if _, err := os.Stat(filepath.Join(dir, name)); (err == nil) != want {
+			t.Errorf("%s exists = %v after the sweep, want %v", name, err == nil, want)
+		}
+	}
+	sweepSignalAttachmentTemps(zerolog.Nop(), filepath.Join(configDir, "missing"), signalRunTmpMaxAge)
 }

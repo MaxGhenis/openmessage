@@ -100,9 +100,9 @@ func signalCLIEnv(base []string, dir string) []string {
 // SIGNAL_CLI_OPTS (a variable of the JVM start script) nor TMPDIR: on macOS
 // it takes java.io.tmpdir from the per-user Darwin temp dir. It does honor a
 // leading -Djava.io.tmpdir argument (0.14.9, checked 2026-10-21: libsignal
-// was extracted into the given dir and removed on a graceful exit). The JVM
-// start script would hand that argument to signal-cli's own parser, which
-// rejects it, so only a native executable gets it.
+// was extracted into the given dir and removed on a graceful exit). Only a
+// native executable gets it: that is the build it was checked against, and a
+// JVM install takes java.io.tmpdir from SIGNAL_CLI_OPTS (signalCLIEnv).
 func signalCLITmpDirArgs(executable, dir string) []string {
 	if dir == "" || !isNativeExecutable(executable) {
 		return nil

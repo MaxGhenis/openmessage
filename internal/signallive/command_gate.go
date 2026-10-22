@@ -19,9 +19,9 @@ var (
 )
 
 // commandGate serializes signal-cli invocations on the bridge's config dir:
-// signal-cli locks the account itself, so a second process would only queue
-// behind the first. Waiters are served in arrival order, and unlike a
-// sync.Mutex a waiter can give up (lockWithin).
+// signal-cli locks the account file itself (SignalAccount), so a second
+// process would wait for the first or fail. Waiters are served in arrival
+// order, and unlike a sync.Mutex a waiter can give up (lockWithin).
 type commandGate struct {
 	once sync.Once
 	slot chan struct{}
