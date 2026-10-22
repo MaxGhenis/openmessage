@@ -20,7 +20,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -483,7 +482,7 @@ type Bridge struct {
 
 	// receiveDraining is set while a receive call stopped by its deadline is
 	// held open to finish an attachment download (receive_drain.go).
-	receiveDraining atomic.Bool
+	receiveDraining drainFlag
 
 	pairCancel    context.CancelFunc
 	receiveCancel context.CancelFunc
@@ -1111,7 +1110,7 @@ func (b *Bridge) SendText(conversationID, body, replyToID string) (*db.Message, 
 	}
 
 	if err := b.lockForRequest(); err != nil {
-		return nil, commandNotDispatchedError("send Signal message", err, nil)
+		return nil, gateNotDispatchedError("send Signal message", err)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), sendTimeout)
 	defer cancel()
@@ -1173,7 +1172,7 @@ func (b *Bridge) SendTextRequest(conversationID, body string, reply ReplyTarget)
 	}
 
 	if err := b.lockForRequest(); err != nil {
-		return 0, commandNotDispatchedError("send Signal message", err, nil)
+		return 0, gateNotDispatchedError("send Signal message", err)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), sendTimeout)
 	defer cancel()
@@ -1300,6 +1299,11 @@ func (b *Bridge) sendMediaRequest(
 	if err != nil {
 		return result, err
 	}
+	// Retried every few seconds while a drain lasts; don't copy a large
+	// attachment each time only to give up at the gate.
+	if b.receiveDraining.Load() {
+		return result, gateNotDispatchedError("send Signal media", ErrReceiveDraining)
+	}
 
 	attachmentPath, err := b.writeLocalAttachmentReader(content, size, filename)
 	if err != nil {
@@ -1336,7 +1340,7 @@ func (b *Bridge) sendMediaRequest(
 	}
 
 	if err := b.lockForRequest(); err != nil {
-		return result, commandNotDispatchedError("send Signal media", err, nil)
+		return result, gateNotDispatchedError("send Signal media", err)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), sendTimeout)
 	defer cancel()
@@ -1524,7 +1528,7 @@ func (b *Bridge) SendReactionRequest(
 	}
 
 	if err := b.lockForRequest(); err != nil {
-		return commandNotDispatchedError("send Signal reaction", err, nil)
+		return gateNotDispatchedError("send Signal reaction", err)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), sendTimeout)
 	defer cancel()
@@ -1591,7 +1595,7 @@ func (b *Bridge) SendReaction(conversationID, targetMessageID, emoji, action str
 	}
 
 	if err := b.lockForRequest(); err != nil {
-		return commandNotDispatchedError("send Signal reaction", err, nil)
+		return gateNotDispatchedError("send Signal reaction", err)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), sendTimeout)
 	defer cancel()

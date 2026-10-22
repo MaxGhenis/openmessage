@@ -77,7 +77,7 @@ type receiveDrainRequest struct {
 	abort <-chan struct{}
 	// holding is set while the call is alive past the idle grace only to
 	// finish a download, so requests give up instead of queueing behind it.
-	holding *atomic.Bool
+	holding *drainFlag
 	// beat reports the poller alive while a download progresses. Without
 	// it the supervisor's liveness probe would retire the generation, and
 	// so abort the call, two and a half minutes into a long download.
@@ -114,7 +114,7 @@ type downloadWatch struct {
 
 func (w downloadWatch) look() signalDownloads {
 	var downloads signalDownloads
-	add := func(dir, prefix string, since time.Time) {
+	add := func(dir string, match func(name string) bool, since time.Time) {
 		if dir == "" {
 			return
 		}
@@ -123,8 +123,7 @@ func (w downloadWatch) look() signalDownloads {
 			return
 		}
 		for _, entry := range entries {
-			name := entry.Name()
-			if !entry.Type().IsRegular() || !strings.HasPrefix(name, prefix) || !strings.HasSuffix(name, ".tmp") {
+			if !entry.Type().IsRegular() || !match(entry.Name()) {
 				continue
 			}
 			info, err := entry.Info()
@@ -136,9 +135,32 @@ func (w downloadWatch) look() signalDownloads {
 			downloads.modified = max(downloads.modified, info.ModTime().UnixNano())
 		}
 	}
-	add(w.runDir, "signal-cli_tmp_", time.Time{})
-	add(w.attachmentsDir, "", w.since)
+	add(w.runDir, func(name string) bool {
+		return strings.HasPrefix(name, "signal-cli_tmp_") && strings.HasSuffix(name, ".tmp")
+	}, time.Time{})
+	add(w.attachmentsDir, isSignalAttachmentTemp, w.since)
 	return downloads
+}
+
+// isSignalAttachmentTemp matches the temp files AttachmentStore stores an
+// attachment through, <stored name>.<digits>.tmp (Files.createTempFile adds
+// an unsigned long), and not a stored attachment whose own extension is
+// .tmp, <id>.tmp.
+func isSignalAttachmentTemp(name string) bool {
+	rest, ok := strings.CutSuffix(name, ".tmp")
+	if !ok {
+		return false
+	}
+	dot := strings.LastIndexByte(rest, '.')
+	if dot <= 0 || dot == len(rest)-1 {
+		return false
+	}
+	for _, r := range rest[dot+1:] {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // drainClock decides, from what it has seen of a stopped call's downloads,
@@ -235,7 +257,7 @@ func drain(process *os.Process, req receiveDrainRequest, watch downloadWatch, po
 					Int64("bytes", downloads.bytes).
 					Msg("Killed a Signal receive call with an attachment download in flight; signal-cli had acknowledged the envelope it was handling, so that message is lost")
 			} else {
-				event.Msg("Killed a Signal receive call that had not exited after SIGTERM; an envelope it was still handling is lost")
+				event.Msg("Killed a Signal receive call that had not exited after SIGTERM; an envelope it was still handling, if any, is lost")
 			}
 			return
 		}
@@ -277,7 +299,7 @@ func configureSignalStop(ctx context.Context, cmd *exec.Cmd, configDir, runDir s
 		return func() {}
 	}
 	if req.holding == nil {
-		req.holding = new(atomic.Bool)
+		req.holding = new(drainFlag)
 	}
 	policy := receiveDrain
 	watch := downloadWatch{

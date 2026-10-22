@@ -2010,7 +2010,11 @@ a receive call stopped by **its deadline** is *drained*
   signal-cli started could be marked uncertain.
   Attachment fetches (`getAttachment`), and the contact refresh a send runs
   to name a quoted or reacted-to author it doesn't know, give up the same
-  way; the author then goes to signal-cli as an ACI.
+  way; the author then goes to signal-cli as an ACI. A send already waiting
+  when a drain begins gives up then. The legacy paths (web API on a
+  legacy-primary install, scheduled messages) get the same error; a
+  scheduled message goes back to pending **without** spending one of its 5
+  attempts (`signallive.IsReceiveDrainingError`).
 
 Log lines (backend os_log):
 
@@ -2019,7 +2023,8 @@ Log lines (backend os_log):
 - `Killed a Signal receive call with an attachment download in flight; ... that message is lost`
   means the stall window or the 10 min limit was hit.
 - `Killed a Signal receive call that had not exited after SIGTERM` means
-  signal-cli was busy with something other than a download.
+  signal-cli was busy with something other than a download. That may have
+  been an envelope (now lost) or only post-print work such as receipts.
 
 Losses still possible: a caller stop during a download; non-download
 handling that takes more than 3 s after the SIGTERM (for example a slow
@@ -2031,14 +2036,20 @@ message and loses only the attachment.
 GraalVM native image (`file $(which signal-cli)` reports Mach-O). It ignores
 both `TMPDIR` and `SIGNAL_CLI_OPTS`, and takes `java.io.tmpdir` from
 `getconf DARWIN_USER_TEMP_DIR`. The bridge therefore passes
-`-Djava.io.tmpdir=<run dir>` as the first argument to a native binary. A JVM
-install keeps getting it through `SIGNAL_CLI_OPTS`, as before. Builds before #259 had each
+`-Djava.io.tmpdir=<run dir>` as the first argument to a native binary
+(Mach-O or ELF), once a `-Djava.io.tmpdir=… --version` run of that build has
+succeeded. A JVM install keeps getting it through `SIGNAL_CLI_OPTS`, as
+before. A wrapper *script* around the native binary gets neither, so its
+ciphertext lands outside the run dir and the drain sees only the empty
+`attachments/*.tmp`: such a call is held for the 45 s stall window at most. Builds before #259 had each
 call extract libsignal (29 MB) into the Darwin temp dir, and a killed call
 left it there as `libsignal<digits>/`. The periodic sweep looks only in the
-daemon's own temp dir (`/tmp` under launchd), so those leftovers stay until
-removed by hand: `find "$(getconf DARWIN_USER_TEMP_DIR)" -maxdepth 1 -name
+daemon's own temp dir, which is `/tmp`: the app starts the backend with an
+environment that has no `TMPDIR` (`BackendLauncherCore.swift`). So those
+leftovers stay until removed by hand: `find "$(getconf DARWIN_USER_TEMP_DIR)" -maxdepth 1 -name
 'libsignal*' -mtime +1`, with no signal-cli running. A killed call's empty
-`attachments/*.tmp` is swept after 30 min.
+`attachments/<name>.<digits>.tmp` is swept after 30 min; a stored attachment
+whose sender named it `.tmp` (`<id>.tmp`) is not.
 
 ### Signal quote-replies on v2-primary
 

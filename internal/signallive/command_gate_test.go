@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -18,7 +20,7 @@ func TestCommandGateHandsOffToTheWaiterBeforeTheHolderRetakesIt(t *testing.T) {
 	var gate commandGate
 	gate.Lock()
 	acquired := make(chan bool, 1)
-	go func() { acquired <- gate.lockWithin(5 * time.Second) }()
+	go func() { acquired <- gate.lockWithin(5*time.Second, nil) }()
 	time.Sleep(250 * time.Millisecond) // let the waiter queue
 
 	gate.Unlock()
@@ -44,14 +46,14 @@ func TestCommandGateLockWithinGivesUpAndLeavesTheGateUsable(t *testing.T) {
 	var gate commandGate
 	gate.Lock()
 	started := time.Now()
-	if gate.lockWithin(80 * time.Millisecond) {
+	if gate.lockWithin(80*time.Millisecond, nil) {
 		t.Fatal("lockWithin took a held gate")
 	}
 	if waited := time.Since(started); waited < 80*time.Millisecond {
 		t.Fatalf("lockWithin gave up after %s, before its wait", waited)
 	}
 	gate.Unlock()
-	if !gate.lockWithin(time.Millisecond) {
+	if !gate.lockWithin(time.Millisecond, nil) {
 		t.Fatal("lockWithin could not take a free gate")
 	}
 	gate.Unlock()
@@ -116,9 +118,13 @@ func TestSendsGiveUpAsNotDispatchedWhileAReceiveIsDrained(t *testing.T) {
 
 	started := time.Now()
 	for path, err := range sendThroughGate(bridge) {
-		if !IsSendNotDispatchedError(err) || !IsCommandError(err) || !strings.Contains(err.Error(), "attachment download") {
+		if !IsSendNotDispatchedError(err) || !IsCommandError(err) || !IsReceiveDrainingError(err) ||
+			!strings.Contains(err.Error(), "attachment download") {
 			t.Errorf("%s send = %v, want a not-dispatched command error naming the drain", path, err)
 		}
+	}
+	if staged, _ := os.ReadDir(filepath.Join(bridge.configDir, "outgoing-attachments")); len(staged) != 0 {
+		t.Errorf("media send staged %d attachment copies behind a drain, want none", len(staged))
 	}
 	if waited := time.Since(started); waited > time.Second {
 		t.Fatalf("sends took %s to give up behind a drain, want at once", waited)
@@ -142,9 +148,63 @@ func TestSendsGiveUpAsNotDispatchedWhenTheGateStaysTaken(t *testing.T) {
 	defer bridge.commandMu.Unlock()
 
 	for path, err := range sendThroughGate(bridge) {
-		if !IsSendNotDispatchedError(err) || !strings.Contains(err.Error(), "stayed busy") {
+		if !IsSendNotDispatchedError(err) || IsReceiveDrainingError(err) || !strings.Contains(err.Error(), "stayed busy") {
 			t.Errorf("%s send = %v, want not dispatched after requestLockWait", path, err)
 		}
+	}
+}
+
+// A send that is already waiting when a drain begins gives up then, not at
+// requestLockWait: the dispatcher behind it sends for every platform.
+func TestASendWaitingForTheGateGivesUpWhenADrainBegins(t *testing.T) {
+	original := requestLockWait
+	requestLockWait = time.Minute
+	t.Cleanup(func() { requestLockWait = original })
+	bridge := newGateTestBridge(t, func(context.Context, ...string) ([]byte, error) {
+		return nil, errors.New("signal-cli must not run")
+	})
+	bridge.commandMu.Lock() // the receive call, still inside its deadline
+	defer bridge.commandMu.Unlock()
+
+	result := make(chan error, 1)
+	go func() {
+		_, err := bridge.SendTextRequest("signal:"+gateTestRecipient, "hi", ReplyTarget{})
+		result <- err
+	}()
+	time.Sleep(150 * time.Millisecond)
+	began := time.Now()
+	bridge.receiveDraining.Store(true) // the deadline passed with a download in flight
+	select {
+	case err := <-result:
+		if !IsReceiveDrainingError(err) || !IsSendNotDispatchedError(err) {
+			t.Fatalf("send = %v, want not dispatched because of the drain", err)
+		}
+		if waited := time.Since(began); waited > time.Second {
+			t.Fatalf("send gave up %s after the drain began", waited)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("a waiting send kept waiting after a drain began")
+	}
+}
+
+func TestDrainFlagStartedClosesWhileSet(t *testing.T) {
+	var flag drainFlag
+	clear := flag.started()
+	if isClosed(clear) || flag.Load() {
+		t.Fatal("zero drainFlag reads as set")
+	}
+	flag.Store(true)
+	if !isClosed(clear) || !isClosed(flag.started()) || !flag.Load() {
+		t.Fatal("setting the flag did not close the channels waiters hold")
+	}
+	flag.Store(true)
+	flag.Store(false)
+	if isClosed(flag.started()) || flag.Load() {
+		t.Fatal("cleared flag still reads as set")
+	}
+	flag.Store(true)
+	if !isClosed(flag.started()) {
+		t.Fatal("setting the flag again did not close a fresh channel")
 	}
 }
 

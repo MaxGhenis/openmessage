@@ -251,6 +251,7 @@ func TestDownloadWatchCountsOnlyTheCallsOwnDownloadFiles(t *testing.T) {
 	write(filepath.Join(attachments, "abc.jpg.123.tmp"), 0, fresh)                    // this call's store
 	write(filepath.Join(attachments, "old.jpg.456.tmp"), 50, since.Add(-time.Minute)) // a killed call's leftover
 	write(filepath.Join(attachments, "done.jpg"), 80, fresh)
+	write(filepath.Join(attachments, "D49ZGyDHvzgVPhh.tmp"), 60, fresh) // a stored attachment named .tmp by its sender
 
 	got := downloadWatch{runDir: runDir, attachmentsDir: attachments, since: since}.look()
 	if got.files != 2 || got.bytes != 300 {
@@ -354,7 +355,7 @@ func runDrained(t *testing.T, policy receiveDrainPolicy, mode string, deadline, 
 		timer := time.AfterFunc(abortAfter, func() { close(abort) })
 		t.Cleanup(func() { timer.Stop() })
 	}
-	var holding atomic.Bool
+	var holding drainFlag
 	var held atomic.Bool
 	var beats atomic.Int32
 	watching := make(chan struct{})
@@ -564,11 +565,31 @@ func TestReceiveDrainPolicyFitsTheTimeoutsAroundIt(t *testing.T) {
 		{p.stall > cdnReadTimeout, "a stalled download fails inside signal-cli (30 s read timeout) before the drain kills it"},
 		{p.tick < p.idle, "the drain looks more often than the idle grace"},
 		{drainBeatInterval < supervisorLivenessTimeout, "a progressing drain beats before the supervisor probes liveness"},
+		{p.stall+drainBeatInterval < supervisorLivenessTimeout, "the longest gap between a drain's beats (a stall) ends before the liveness probe"},
 		{signalRunTmpMaxAge > receiveCallDeadline+p.limit+p.idle, "no sweep removes the files of a call still being drained"},
 		{requestLockWait > receiveCallDeadline+signalStopGrace, "a request outwaits a receive call that is not drained"},
 	} {
 		if !check.ok {
 			t.Errorf("receiveDrain %+v: %s", p, check.what)
+		}
+	}
+}
+
+func TestIsSignalAttachmentTempMatchesOnlyJavaTempNames(t *testing.T) {
+	for name, want := range map[string]bool{
+		"D49ZGyDHvzgVPhhQxljN.html.8812345678901234567.tmp": true,
+		"photo.jpg.42.tmp":     true,
+		"noext.7.tmp":          true,
+		"D49ZGyDHvzgVPhh.tmp":  false, // stored attachment whose extension is .tmp
+		"12345.tmp":            false,
+		".42.tmp":              false,
+		"photo.jpg..tmp":       false,
+		"photo.jpg.4x2.tmp":    false,
+		"photo.jpg.42.tmp.jpg": false,
+		"photo.jpg":            false,
+	} {
+		if got := isSignalAttachmentTemp(name); got != want {
+			t.Errorf("isSignalAttachmentTemp(%q) = %v, want %v", name, got, want)
 		}
 	}
 }

@@ -1,14 +1,17 @@
 package signallive
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
 	"io"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -101,13 +104,54 @@ func signalCLIEnv(base []string, dir string) []string {
 // it takes java.io.tmpdir from the per-user Darwin temp dir. It does honor a
 // leading -Djava.io.tmpdir argument (0.14.9, checked 2026-10-21: libsignal
 // was extracted into the given dir and removed on a graceful exit). Only a
-// native executable gets it: that is the build it was checked against, and a
-// JVM install takes java.io.tmpdir from SIGNAL_CLI_OPTS (signalCLIEnv).
+// native executable gets it, and only once a --version run with the argument
+// has succeeded: that is the build it was checked against, a JVM install
+// takes java.io.tmpdir from SIGNAL_CLI_OPTS (signalCLIEnv), and a compiled
+// wrapper around a JVM install would pass the argument to signal-cli's own
+// parser.
 func signalCLITmpDirArgs(executable, dir string) []string {
-	if dir == "" || !isNativeExecutable(executable) {
+	if dir == "" || !acceptsTmpDirArg(executable) {
 		return nil
 	}
 	return []string{"-Djava.io.tmpdir=" + dir}
+}
+
+// tmpDirArgSupport caches acceptsTmpDirArg per executable path, size and
+// modification time, so an upgraded signal-cli is checked again.
+var tmpDirArgSupport sync.Map
+
+func acceptsTmpDirArg(executable string) bool {
+	info, err := os.Stat(executable)
+	if err != nil {
+		return false
+	}
+	key := fmt.Sprintf("%s|%d|%d", executable, info.Size(), info.ModTime().UnixNano())
+	if supported, ok := tmpDirArgSupport.Load(key); ok {
+		return supported.(bool)
+	}
+	supported := isNativeExecutable(executable) && probeTmpDirArg(executable)
+	tmpDirArgSupport.Store(key, supported)
+	return supported
+}
+
+// probeTmpDirArg runs `<executable> -Djava.io.tmpdir=<dir> --version`, which
+// reads no config dir. Swapped by tests.
+var probeTmpDirArg = func(executable string) bool {
+	if err := os.MkdirAll(signalTmpRoot(), 0o700); err != nil {
+		return false
+	}
+	dir, err := os.MkdirTemp(signalTmpRoot(), "probe-")
+	if err != nil {
+		return false
+	}
+	defer os.RemoveAll(dir)
+	ctx, cancel := context.WithTimeout(context.Background(), versionProbeTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, executable, "-Djava.io.tmpdir="+dir, "--version")
+	cmd.Env = signalCLIEnv(os.Environ(), dir)
+	configureSignalCancel(cmd)
+	output, err := cmd.CombinedOutput()
+	return err == nil && strings.HasPrefix(strings.TrimSpace(string(output)), "signal-cli ")
 }
 
 // isNativeExecutable reports whether path is a Mach-O or ELF binary rather
@@ -125,7 +169,7 @@ func isNativeExecutable(path string) bool {
 	switch binary.BigEndian.Uint32(magic[:]) {
 	case 0x7f454c46, // ELF
 		0xfeedface, 0xcefaedfe, 0xfeedfacf, 0xcffaedfe, // Mach-O, 32 and 64 bit, either byte order
-		0xcafebabe, 0xbebafeca: // universal Mach-O
+		0xcafebabe, 0xbebafeca, 0xcafebabf, 0xbfbafeca: // universal Mach-O, 32 and 64 bit
 		return true
 	}
 	return false
@@ -171,7 +215,7 @@ func sweepLegacyLibsignalTemp(logger zerolog.Logger) {
 	}
 }
 
-// sweepSignalAttachmentTemps removes the <name>.<random>.tmp files a killed
+// sweepSignalAttachmentTemps removes the <name>.<digits>.tmp files a killed
 // receive call leaves in signal-cli's attachments dir. signal-cli creates
 // one when an attachment download starts and deletes it in a finally block
 // that a SIGKILL skips; nothing removes it after that. maxAge must exceed the
@@ -190,7 +234,7 @@ func sweepSignalAttachmentTemps(logger zerolog.Logger, configDir string, maxAge 
 	removed := 0
 	var reclaimed int64
 	for _, entry := range entries {
-		if !entry.Type().IsRegular() || !strings.HasSuffix(entry.Name(), ".tmp") {
+		if !entry.Type().IsRegular() || !isSignalAttachmentTemp(entry.Name()) {
 			continue
 		}
 		info, err := entry.Info()

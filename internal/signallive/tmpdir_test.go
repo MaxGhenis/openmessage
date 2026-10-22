@@ -221,6 +221,7 @@ func TestIsNativeExecutableTellsBinariesFromScripts(t *testing.T) {
 		"mach-o 32":      {[]byte{0xce, 0xfa, 0xed, 0xfe, 7, 0, 0, 0}, true},
 		"mach-o big end": {[]byte{0xfe, 0xed, 0xfa, 0xcf, 0, 0, 0, 0}, true},
 		"universal":      {[]byte{0xca, 0xfe, 0xba, 0xbe, 0, 0, 0, 2}, true},
+		"universal 64":   {[]byte{0xca, 0xfe, 0xba, 0xbf, 0, 0, 0, 2}, true},
 		"elf":            {[]byte{0x7f, 'E', 'L', 'F', 2, 1, 1, 0}, true},
 		"start script":   {[]byte("#!/usr/bin/env sh\nexec java \"$@\"\n"), false},
 		"short":          {[]byte{0x7f, 'E'}, false},
@@ -247,6 +248,7 @@ func TestRunSignalCLIPassesTheRunDirToANativeBinaryAsAnArgument(t *testing.T) {
 	if err != nil || !isNativeExecutable(echo) {
 		t.Skipf("no native echo binary (%q, %v)", echo, err)
 	}
+	stubTmpDirArgProbe(t, true)
 	t.Setenv("TMPDIR", t.TempDir())
 	t.Setenv("OPENMESSAGES_SIGNAL_CLI", echo)
 	configDir := t.TempDir()
@@ -261,6 +263,46 @@ func TestRunSignalCLIPassesTheRunDirToANativeBinaryAsAnArgument(t *testing.T) {
 	}
 }
 
+func stubTmpDirArgProbe(t *testing.T, supported bool) *int {
+	t.Helper()
+	original := probeTmpDirArg
+	t.Cleanup(func() { probeTmpDirArg = original })
+	tmpDirArgSupport.Clear()
+	t.Cleanup(tmpDirArgSupport.Clear)
+	probes := new(int)
+	probeTmpDirArg = func(string) bool {
+		*probes++
+		return supported
+	}
+	return probes
+}
+
+// A native binary whose --version run rejects the argument (a compiled
+// wrapper around a JVM install, say) never gets it; the check runs once per
+// build of the file.
+func TestSignalCLITmpDirArgsNeedsAProbeTheBinaryPassed(t *testing.T) {
+	echo, err := exec.LookPath("echo")
+	if err != nil || !isNativeExecutable(echo) {
+		t.Skipf("no native echo binary (%q, %v)", echo, err)
+	}
+	probes := stubTmpDirArgProbe(t, false)
+	for range 3 {
+		if args := signalCLITmpDirArgs(echo, "/tmp/run-1"); args != nil {
+			t.Fatalf("args = %q for a binary that failed the probe", args)
+		}
+	}
+	if *probes != 1 {
+		t.Fatalf("probed %d times, want once per build", *probes)
+	}
+	script := filepath.Join(t.TempDir(), "signal-cli")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if args := signalCLITmpDirArgs(script, "/tmp/run-1"); args != nil || *probes != 1 {
+		t.Fatalf("script got args %q after %d probes, want none and no probe", args, *probes)
+	}
+}
+
 func TestSweepSignalAttachmentTempsRemovesOnlyStalePartialFiles(t *testing.T) {
 	configDir := t.TempDir()
 	dir := filepath.Join(configDir, "attachments")
@@ -272,6 +314,7 @@ func TestSweepSignalAttachmentTempsRemovesOnlyStalePartialFiles(t *testing.T) {
 		"photo.jpg.123.tmp":   stale,      // a killed call's partial file
 		"video.mp4.456.tmp":   time.Now(), // a download in progress
 		"D49ZGyDHvzgVPhh.jpg": stale,      // a stored attachment
+		"Q7pXk2LmNbVcZ.tmp":   stale,      // a stored attachment its sender named .tmp
 	}
 	for name, modified := range files {
 		path := filepath.Join(dir, name)
@@ -292,6 +335,7 @@ func TestSweepSignalAttachmentTempsRemovesOnlyStalePartialFiles(t *testing.T) {
 		"photo.jpg.123.tmp":   false,
 		"video.mp4.456.tmp":   true,
 		"D49ZGyDHvzgVPhh.jpg": true,
+		"Q7pXk2LmNbVcZ.tmp":   true,
 		"old.tmp.d":           true,
 	} {
 		if _, err := os.Stat(filepath.Join(dir, name)); (err == nil) != want {
