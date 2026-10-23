@@ -17,10 +17,18 @@ import (
 )
 
 const (
-	ControlTokenFile     = "control.token"
-	ControlCookieName    = "om_control"
-	AuthModeAcceptAndLog = "accept-and-log"
-	maxWarnedRemotes     = 1024
+	ControlTokenFile  = "control.token"
+	ControlCookieName = "om_control"
+	// AuthModeEnforce is the only mode: a protected request without a valid
+	// control token is refused with 401 before it reaches any handler. The
+	// accept-and-log stage (#144) that only warned has ended.
+	AuthModeEnforce  = "enforce"
+	maxWarnedRemotes = 1024
+	// maxLoginBodyBytes bounds the token-paste form; a token is 64 hex chars.
+	maxLoginBodyBytes = 4 << 10
+	// LoginErrorQuery is the query parameter /auth/login adds to its redirect
+	// back to the UI when the pasted token does not match.
+	LoginErrorQuery = "auth_error"
 )
 
 type ControlAuth struct {
@@ -127,21 +135,40 @@ func (a *ControlAuth) BootstrapURL(baseURL string) string {
 	return strings.TrimRight(baseURL, "/") + "/auth/bootstrap?t=" + a.bootstrap
 }
 
+// Handler authenticates local control requests. Every protected path (/api/*
+// and /mcp*) needs the control token, as an Authorization: Bearer header
+// (native clients, the CLI, MCP clients) or the om_control cookie (the web UI,
+// which gets it from the single-use bootstrap link, the token-paste form, or
+// the macOS app injecting it). Anything else gets 401 before dispatch.
 func (a *ControlAuth) Handler(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/auth/bootstrap" {
+		switch r.URL.Path {
+		case "/auth/bootstrap":
 			if _, ok := localRequestOrigin(r); !ok {
 				http.NotFound(w, r)
 				return
 			}
 			a.handleBootstrap(w, r)
 			return
+		case "/auth/login":
+			if _, ok := localRequestOrigin(r); !ok {
+				http.NotFound(w, r)
+				return
+			}
+			a.handleLogin(w, r)
+			return
 		}
 		if isProtectedLocalPath(r.URL.Path) {
 			classification := a.classify(r)
 			fetchSite := strings.TrimSpace(r.Header.Get("Sec-Fetch-Site"))
-			if classification == "missing" || classification == "invalid" || (fetchSite != "" && fetchSite != "same-origin" && fetchSite != "same-site" && fetchSite != "none") {
-				a.warnOnce(r, classification, fetchSite)
+			if classification == "missing" || classification == "invalid" {
+				a.warnOnce(r, classification, fetchSite, "Rejected local control request without a valid control token")
+				w.Header().Set("WWW-Authenticate", `Bearer realm="openmessage"`)
+				httpError(w, "unauthorized: send the control token as Authorization: Bearer <token> (the token is the control.token file in the OpenMessage data directory), or open the web UI through its authorization link", http.StatusUnauthorized)
+				return
+			}
+			if fetchSite != "" && fetchSite != "same-origin" && fetchSite != "same-site" && fetchSite != "none" {
+				a.warnOnce(r, classification, fetchSite, "Authenticated local control request has an unexpected Sec-Fetch-Site")
 			}
 		}
 		next.ServeHTTP(w, r)
@@ -171,7 +198,7 @@ func secureEqual(got, want string) bool {
 	return subtle.ConstantTimeCompare([]byte(got), []byte(want)) == 1
 }
 
-func (a *ControlAuth) warnOnce(r *http.Request, classification, fetchSite string) {
+func (a *ControlAuth) warnOnce(r *http.Request, classification, fetchSite, message string) {
 	key := r.RemoteAddr
 	if host, _, err := net.SplitHostPort(key); err == nil {
 		key = host
@@ -197,7 +224,7 @@ func (a *ControlAuth) warnOnce(r *http.Request, classification, fetchSite string
 	if overflow {
 		a.logger.Warn().Int("limit", maxWarnedRemotes).Msg("Cleared full unauthenticated remote warning cache")
 	}
-	a.logger.Warn().Str("remote", key).Str("auth", classification).Str("sec_fetch_site", fetchSite).Msg("Local control request is not authenticated; allowed during accept-and-log rollout")
+	a.logger.Warn().Str("remote", key).Str("auth", classification).Str("sec_fetch_site", fetchSite).Str("path", r.URL.Path).Msg(message)
 }
 
 func (a *ControlAuth) handleBootstrap(w http.ResponseWriter, r *http.Request) {
@@ -216,13 +243,48 @@ func (a *ControlAuth) handleBootstrap(w http.ResponseWriter, r *http.Request) {
 		httpError(w, "bootstrap code is invalid or already used", http.StatusGone)
 		return
 	}
-	http.SetCookie(w, &http.Cookie{Name: ControlCookieName, Value: a.token, Path: "/", HttpOnly: true, SameSite: http.SameSiteStrictMode})
+	a.setControlCookie(w)
 	http.Redirect(w, r, "/", http.StatusFound)
+}
+
+// handleLogin is the fallback for a browser that missed the single-use
+// bootstrap link (it is printed once per daemon start): the user pastes the
+// control token, which is already the capability, and gets the same cookie.
+// A cross-origin page cannot use it to log the browser in, and a wrong token
+// changes nothing.
+func (a *ControlAuth) handleLogin(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		httpError(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if origin := strings.TrimSpace(r.Header.Get("Origin")); origin != "" && origin != "null" {
+		reqOrigin, _ := localRequestOrigin(r)
+		if headerOrigin, ok := parseLocalOrigin(origin); !ok || headerOrigin != reqOrigin {
+			httpError(w, "forbidden: cross-origin login", http.StatusForbidden)
+			return
+		}
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxLoginBodyBytes)
+	if err := r.ParseForm(); err != nil {
+		httpError(w, "invalid login form", http.StatusBadRequest)
+		return
+	}
+	if !secureEqual(strings.TrimSpace(r.PostForm.Get("token")), a.token) {
+		a.warnOnce(r, "invalid", strings.TrimSpace(r.Header.Get("Sec-Fetch-Site")), "Rejected web UI login with a wrong control token")
+		http.Redirect(w, r, "/?"+LoginErrorQuery+"=invalid_token", http.StatusSeeOther)
+		return
+	}
+	a.setControlCookie(w)
+	http.Redirect(w, r, "/", http.StatusSeeOther)
+}
+
+func (a *ControlAuth) setControlCookie(w http.ResponseWriter) {
+	http.SetCookie(w, &http.Cookie{Name: ControlCookieName, Value: a.token, Path: "/", HttpOnly: true, SameSite: http.SameSiteStrictMode})
 }
 
 func (a *ControlAuth) Status() map[string]any {
 	if a == nil {
-		return map[string]any{"token_present": false, "mode": AuthModeAcceptAndLog}
+		return map[string]any{"token_present": false, "mode": AuthModeEnforce}
 	}
-	return map[string]any{"token_present": a.token != "", "mode": AuthModeAcceptAndLog, "data_dir": a.dataDir}
+	return map[string]any{"token_present": a.token != "", "mode": AuthModeEnforce, "data_dir": a.dataDir}
 }

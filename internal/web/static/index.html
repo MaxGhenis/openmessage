@@ -200,6 +200,14 @@ html, body {
   display: flex;
 }
 
+.auth-overlay { z-index: 200; }
+.auth-panel { width: min(520px, calc(100vw - 56px)); }
+.auth-body { padding: 4px 20px 20px; display: flex; flex-direction: column; gap: 12px; font-size: 14px; line-height: 1.5; color: var(--text-secondary); }
+.auth-body code { font-size: 12px; padding: 1px 5px; border-radius: 6px; background: var(--bg-hover); color: var(--text-primary); }
+.auth-form { display: flex; gap: 8px; }
+.auth-form input { flex: 1; min-width: 0; padding: 9px 12px; border-radius: 10px; border: 1px solid var(--border); background: var(--bg-tertiary); color: var(--text-primary); font: inherit; }
+.auth-error { color: #ff6b6b; margin: 0; }
+
 .wa-panel {
   width: min(680px, calc(100vw - 56px));
   max-height: calc(100vh - 56px);
@@ -5668,6 +5676,23 @@ body::after {
 </head>
 <body>
 
+<div class="wa-overlay auth-overlay" id="auth-overlay" role="dialog" aria-modal="true" aria-labelledby="auth-overlay-title">
+  <div class="wa-panel auth-panel">
+    <div class="new-msg-header">
+      <h2 id="auth-overlay-title">Authorize this browser</h2>
+    </div>
+    <div class="auth-body">
+      <p>OpenMessage answers only requests that carry its control token, so no other page or program on this computer can read or send your messages through it.</p>
+      <p>Open the one-time link that <code>openmessage serve --web</code> printed when it started, or paste the token from the <code>control.token</code> file in the OpenMessage data directory.</p>
+      <form method="post" action="/auth/login" class="auth-form">
+        <input type="password" name="token" aria-label="Control token" placeholder="Control token" autocomplete="off" spellcheck="false" required>
+        <button type="submit" class="cd-btn primary">Authorize</button>
+      </form>
+      <p class="auth-error" id="auth-overlay-error" hidden>That token doesn't match. Copy it again from control.token.</p>
+    </div>
+  </div>
+</div>
+
 <div class="app" id="app">
   <!-- Left Rail -->
   <div class="sidebar" id="sidebar" style="position:relative">
@@ -5993,6 +6018,42 @@ body::after {
 <script>
 (function() {
   'use strict';
+
+  // Every /api/ request needs the control token; a browser carries it as the
+  // om_control cookie. When the app answers 401, show how to authorize this
+  // browser instead of a page of failed loads.
+  const authOverlay = document.getElementById('auth-overlay');
+  function showAuthOverlay(invalidToken) {
+    if (!authOverlay) return;
+    authOverlay.classList.add('show');
+    const error = document.getElementById('auth-overlay-error');
+    if (error && invalidToken) error.hidden = false;
+    const input = authOverlay.querySelector('input[name="token"]');
+    if (input && document.activeElement !== input) input.focus();
+  }
+  function isSameOriginAPIRequest(input) {
+    try {
+      const url = new URL(typeof input === 'string' || input instanceof URL ? input : input.url, window.location.href);
+      return url.origin === window.location.origin && url.pathname.startsWith('/api/');
+    } catch {
+      return false;
+    }
+  }
+  const nativeFetch = window.fetch.bind(window);
+  window.fetch = async function(input, init) {
+    const response = await nativeFetch(input, init);
+    if (response.status === 401 && isSameOriginAPIRequest(input)) showAuthOverlay(false);
+    return response;
+  };
+  {
+    const params = new URLSearchParams(window.location.search);
+    if (params.get('auth_error') === 'invalid_token') {
+      params.delete('auth_error');
+      const query = params.toString();
+      window.history.replaceState(null, '', window.location.pathname + (query ? '?' + query : '') + window.location.hash);
+      showAuthOverlay(true);
+    }
+  }
 
   const API = '';
   const STREAM_RECONNECT_DELAY_MS = 2500;
@@ -10303,28 +10364,18 @@ body::after {
   }
 
   function escapeHtml(str) {
-    // Escape all HTML-significant characters including quotes.
-    // The browser-default div.textContent/div.innerHTML escapes <, >, &, but
-    // NOT ' or ", which breaks attribute-value and JS-string-literal contexts
-    // (onclick="foo('${untrusted}')"). Escape quotes explicitly so the same
-    // helper is safe for every context we use it in.
+    // Escape all HTML-significant characters including quotes, so the result
+    // is safe as element text and inside a quoted attribute value. It is NOT
+    // safe inside an inline event handler: the HTML parser decodes these
+    // entities before the handler's JS is parsed. The UI has no inline
+    // handlers (the CSP refuses them); attach handlers with addEventListener
+    // and pass ids through a closure.
     return String(str == null ? '' : str)
       .replace(/&/g, '&amp;')
       .replace(/</g, '&lt;')
       .replace(/>/g, '&gt;')
       .replace(/"/g, '&quot;')
       .replace(/'/g, '&#39;');
-  }
-
-  // jsEscape makes a value safe inside a single-quoted JS string literal in
-  // an inline handler. The HTML parser decodes entities BEFORE the JS parser
-  // sees the attribute value, so escapeHtml alone cannot protect that inner
-  // context — backslash-escape quotes for the JS layer, then escapeHtml the
-  // result for the attribute layer.
-  function jsEscape(str) {
-    return String(str == null ? '' : str)
-      .replace(/\\/g, '\\\\')
-      .replace(/'/g, "\\'");
   }
 
   function trimTrailingURLPunctuation(rawURL) {
@@ -10885,29 +10936,86 @@ body::after {
     }
   }
 
-  function buildEmojiFullPanelHTML(messageId) {
-    // Escape at the sink, per context: the id attribute needs HTML escaping;
-    // the inline-handler arguments additionally need JS-string escaping
-    // underneath it. Callers pass the raw message id.
-    const idAttr = escapeHtml(messageId);
-    const jsArg = escapeHtml(jsEscape(messageId));
-    let html = '<div class="emoji-search"><input type="text" placeholder="Search emoji..." oninput="filterEmojis(event, \'' + jsArg + '\')"></div>';
-    html += `<div class="emoji-grid" id="emoji-grid-${idAttr}">`;
+  // The reply preview, the reaction pickers and the draft buttons act on ids
+  // that a remote sender controls (a WhatsApp client picks its own stanza
+  // ids, including the id a reply quotes). They are built as DOM nodes whose
+  // handlers capture the raw id from a closure, never as inline handlers: the
+  // HTML parser decodes entities before an inline handler's JS is parsed, so
+  // escapeHtml inside onclick="f('...')" let a crafted id close the string
+  // and run code. The CSP now refuses inline handlers outright.
+  function buildReplyPreviewNode(message, messagesByID) {
+    const replyToID = String(message.ReplyToID || '');
+    const original = messagesByID.get(replyToID);
+    const origName = original ? (original.SenderName || 'You') : '';
+    const origBody = original ? (original.Body || 'Media') : 'Original message';
+    const truncBody = origBody.length > 60 ? origBody.substring(0, 60) + '…' : origBody;
+    const preview = document.createElement('div');
+    preview.className = 'msg-reply-preview';
+    preview.dataset.replyId = replyToID;
+    const author = document.createElement('span');
+    author.className = 'reply-author';
+    author.textContent = origName;
+    const body = document.createElement('span');
+    body.className = 'reply-body';
+    body.textContent = truncBody;
+    preview.append(author, body);
+    preview.addEventListener('click', () => scrollToMessage(replyToID));
+    return preview;
+  }
+
+  function buildQuickReactionPicker(messageId) {
+    const picker = document.createElement('div');
+    picker.className = 'emoji-picker';
+    picker.id = 'emoji-' + messageId;
+    QUICK_EMOJIS.forEach(emoji => {
+      const button = document.createElement('button');
+      button.dataset.emoji = emoji;
+      button.textContent = emoji;
+      button.addEventListener('click', () => sendReaction(messageId, emoji));
+      picker.appendChild(button);
+    });
+    const plus = document.createElement('button');
+    plus.className = 'emoji-plus';
+    plus.dataset.msgId = messageId;
+    plus.textContent = '+';
+    plus.addEventListener('click', (event) => toggleFullEmojiPanel(event, messageId));
+    picker.appendChild(plus);
+    return picker;
+  }
+
+  function populateEmojiFullPanel(panel, messageId) {
+    const search = document.createElement('div');
+    search.className = 'emoji-search';
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.placeholder = 'Search emoji...';
+    input.addEventListener('input', (event) => filterEmojis(event, messageId));
+    search.appendChild(input);
+    const grid = document.createElement('div');
+    grid.className = 'emoji-grid';
+    grid.id = 'emoji-grid-' + messageId;
     EMOJI_CATEGORIES.forEach(cat => {
-      html += `<div class="emoji-cat-label">${cat.name}</div>`;
-      cat.emojis.forEach(e => {
-        html += `<button data-emoji="${e}" data-name="${escapeHtml(EN[e] || '')}" onclick="sendReactionFromGrid(this, '${jsArg}')">${e}</button>`;
+      const label = document.createElement('div');
+      label.className = 'emoji-cat-label';
+      label.textContent = cat.name;
+      grid.appendChild(label);
+      cat.emojis.forEach(emoji => {
+        const button = document.createElement('button');
+        button.dataset.emoji = emoji;
+        button.dataset.name = EN[emoji] || '';
+        button.textContent = emoji;
+        button.addEventListener('click', () => sendReactionFromGrid(button, messageId));
+        grid.appendChild(button);
       });
     });
-    html += '</div>';
-    return html;
+    panel.replaceChildren(search, grid);
   }
 
   function ensureEmojiFullPanel(messageId) {
     const panel = document.getElementById('emoji-full-' + messageId);
     if (!panel) return null;
     if (panel.dataset.hydrated === 'true') return panel;
-    panel.innerHTML = buildEmojiFullPanelHTML(messageId);
+    populateEmojiFullPanel(panel, messageId);
     panel.dataset.hydrated = 'true';
     return panel;
   }
@@ -11005,14 +11113,6 @@ body::after {
 
     let html = '';
 
-    if (message.ReplyToID) {
-      const original = messagesByID.get(String(message.ReplyToID || ''));
-      const origName = original ? (original.SenderName || 'You') : '';
-      const origBody = original ? (original.Body || 'Media') : 'Original message';
-      const truncBody = origBody.length > 60 ? origBody.substring(0, 60) + '\u2026' : origBody;
-      html += `<div class="msg-reply-preview" data-reply-id="${escapeHtml(message.ReplyToID)}" onclick="scrollToMessage('${escapeHtml(message.ReplyToID)}')"><span class="reply-author">${escapeHtml(origName)}</span><span class="reply-body">${escapeHtml(truncBody)}</span></div>`;
-    }
-
     if (activeConvoIsGroup && !message.IsFromMe && message.SenderName) {
       html += `<div class="msg-sender" style="color:${avatarColor(message.SenderName)}">${escapeHtml(message.SenderName)}</div>`;
     }
@@ -11038,7 +11138,7 @@ body::after {
       } else if (hasMediaID && isImage && mediaSrc) {
         html += `<div class="msg-media">`;
         html += `<div class="msg-media-loading" data-msg-id="${escapeHtml(message.MessageID)}" data-kind="image"><div class="spinner"></div><span class="msg-media-loading-text">Fetching image...</span></div>`;
-        html += `<img src="${mediaSrc}" alt="Image" loading="lazy" decoding="async" onload="handleMediaLoad(this)" onerror="handleMediaError(this, 'image')" onclick="showFullscreen(this.src,'image')">`;
+        html += `<img src="${mediaSrc}" alt="Image" loading="lazy" decoding="async">`;
         html += `</div>`;
       } else if (hasMediaID && isAudio && mediaSrc) {
         html += `<div class="msg-media">`;
@@ -11053,7 +11153,7 @@ body::after {
       } else if (hasMediaID && isVideo && mediaSrc) {
         html += `<div class="msg-media">`;
         html += `<div class="msg-media-loading" data-msg-id="${escapeHtml(message.MessageID)}" data-kind="video"><div class="spinner"></div><span class="msg-media-loading-text">Fetching video...</span></div>`;
-        html += `<video src="${mediaSrc}" preload="none" controls playsinline style="display:none" onloadeddata="this.style.display='block';handleMediaLoad(this)" onerror="handleMediaError(this, 'video')" onclick="event.stopPropagation()"></video>`;
+        html += `<video src="${mediaSrc}" preload="none" controls playsinline style="display:none"></video>`;
         html += `</div>`;
       } else if (hasMediaID && isPDF && mediaSrc) {
         html += `<div class="msg-media msg-document-preview">`;
@@ -11111,18 +11211,26 @@ body::after {
     html += `<button class="action-forward" title="Forward" aria-label="Forward message" ${!message._pendingSend && messageHasForwardableContent(message) ? '' : 'disabled'}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 17 20 12 15 7"/><path d="M4 18v-2a4 4 0 0 1 4-4h12"/><polyline points="13 6 18 1 23 6"/><path d="M11 12h7"/></svg></button>`;
     html += `</div>`;
 
-    const safeMsgId = escapeHtml(message.MessageID);
-    html += `<div class="emoji-picker" id="emoji-${safeMsgId}">`;
-    QUICK_EMOJIS.forEach(e => {
-      const safeEmoji = escapeHtml(e);
-      html += `<button onclick="sendReaction('${safeMsgId}','${safeEmoji}')">${safeEmoji}</button>`;
-    });
-    html += `<button class="emoji-plus" data-msg-id="${safeMsgId}" onclick="toggleFullEmojiPanel(event, '${safeMsgId}')">+</button>`;
-    html += '</div>';
-    html += `<div class="emoji-full-panel" id="emoji-full-${safeMsgId}"></div>`;
-
     el.innerHTML = html;
     el.dataset.msgId = message.MessageID;
+    // Everything that carries a sender-controlled id (the quoted message's id,
+    // this message's own id) is built from DOM nodes with handlers that
+    // capture the id from this closure. Ids never pass through markup, where
+    // an escaping mistake would let a crafted id run as code.
+    if (message.ReplyToID) {
+      el.insertBefore(buildReplyPreviewNode(message, messagesByID), el.firstChild);
+    }
+    el.appendChild(buildQuickReactionPicker(message.MessageID));
+    const fullPanel = document.createElement('div');
+    fullPanel.className = 'emoji-full-panel';
+    fullPanel.id = 'emoji-full-' + message.MessageID;
+    el.appendChild(fullPanel);
+    el.querySelectorAll('.msg-media img').forEach(img => {
+      img.addEventListener('click', () => showFullscreen(img.src, 'image'));
+    });
+    el.querySelectorAll('.msg-media video').forEach(video => {
+      video.addEventListener('click', (e) => e.stopPropagation());
+    });
 
     el.querySelectorAll('.msg-retry-send, .action-retry-send').forEach(button => {
       button.addEventListener('click', (e) => {
@@ -11186,10 +11294,16 @@ body::after {
       <div class="draft-label">AI Draft</div>
       <textarea class="draft-text" rows="2"></textarea>
       <div class="draft-actions">
-        <button class="draft-discard-btn" onclick="discardDraft('${escapeHtml(draft.DraftID)}')">Discard</button>
-        <button class="draft-send-btn" onclick="sendDraft('${escapeHtml(draft.DraftID)}', this)" ${canSendActiveRoute ? '' : `disabled title="${escapeHtml(routeUnavailableMessage('send drafts', activeConversation))}"`}>Send</button>
+        <button class="draft-discard-btn">Discard</button>
+        <button class="draft-send-btn" ${canSendActiveRoute ? '' : `disabled title="${escapeHtml(routeUnavailableMessage('send drafts', activeConversation))}"`}>Send</button>
       </div>
     `;
+    // Draft ids come from MCP callers; handlers capture the id, like the
+    // message actions above.
+    const draftId = String(draft.DraftID || '');
+    draftEl.querySelector('.draft-discard-btn').addEventListener('click', () => discardDraft(draftId));
+    const sendBtn = draftEl.querySelector('.draft-send-btn');
+    sendBtn.addEventListener('click', () => sendDraft(draftId, sendBtn));
     const ta = draftEl.querySelector('textarea');
     ta.value = draftDisplayBody(draft);
     draftTextareasToAutosize.push(ta);
@@ -14543,9 +14657,17 @@ body::after {
   window.showFullscreen = function(src, type) {
     const overlay = document.createElement('div');
     overlay.className = 'msg-image-fullscreen';
+    const closeButton = document.createElement('button');
+    closeButton.className = 'fullscreen-close';
+    closeButton.textContent = '×';
 
     if (type === 'video') {
-      overlay.innerHTML = `<video src="${src}" controls autoplay playsinline></video><button class="fullscreen-close">&times;</button>`;
+      const video = document.createElement('video');
+      video.src = src;
+      video.controls = true;
+      video.autoplay = true;
+      video.playsInline = true;
+      overlay.append(video, closeButton);
       overlay.addEventListener('click', (e) => {
         if (e.target === overlay || e.target.classList.contains('fullscreen-close')) {
           const vid = overlay.querySelector('video');
@@ -14554,7 +14676,10 @@ body::after {
         }
       });
     } else {
-      overlay.innerHTML = `<img src="${src}" alt="Full size"><button class="fullscreen-close">&times;</button>`;
+      const img = document.createElement('img');
+      img.src = src;
+      img.alt = 'Full size';
+      overlay.append(img, closeButton);
       overlay.addEventListener('click', () => overlay.remove());
     }
 
