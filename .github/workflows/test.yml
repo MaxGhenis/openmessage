@@ -117,6 +117,9 @@ jobs:
       - name: Install site dependencies
         run: npm ci
 
+      - name: Test public write bounds
+        run: node --test lib/public-writes.test.mjs
+
       - name: Build marketing site
         run: npm run build
 
