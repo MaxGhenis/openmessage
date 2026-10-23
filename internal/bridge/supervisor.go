@@ -1023,7 +1023,6 @@ func (l *supervisorLoop) handleRepairResult(result repairResult) {
 		l.repairFailed = false
 		l.repairFailures = 0
 		l.snapshot.LastRepairOutcome = RepairOutcomeSucceeded
-		l.snapshot.LastRepairError = ""
 		_ = l.startGeneration()
 		return
 	}

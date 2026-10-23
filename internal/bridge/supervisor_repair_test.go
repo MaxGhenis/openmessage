@@ -294,6 +294,21 @@ func TestSupervisorRepairEpisodeProperties(t *testing.T) {
 				return fail("a blocked account repaired again on its own: %+v", late)
 			default:
 			}
+			// Only a user action leaves Blocked: it repairs again from a fresh
+			// episode, and the block reason goes with the blocked state.
+			if err := supervisorRetryBlocked(t, supervisor); err != nil {
+				return fail("RetryBlocked() error = %v", err)
+			}
+			receiveSupervisorValue(t, repairer.started, "repair after a user retry")
+			retried := supervisor.Snapshot()
+			if retried.State != StateRepairingCredentials || retried.BlockReason != "" || retried.RepairAttempts != 1 {
+				return fail("after RetryBlocked: %+v, want a fresh repair with no block reason", retried)
+			}
+			sendSupervisorValue(t, repairer.responses, error(terminal), "park again")
+			awaitSupervisorSnapshot(t, supervisor, "parked again", func(snapshot Snapshot) bool {
+				return snapshot.State == StateBlocked
+			})
+
 		case StateRepairingCredentials:
 			final = awaitSupervisorSnapshot(t, supervisor, "still repairing", func(snapshot Snapshot) bool {
 				return snapshot.LastRepairOutcome == model.outcome && snapshot.RepairAttempts == model.attempts
@@ -390,9 +405,19 @@ func TestSupervisorRepairRetryDelayBounds(t *testing.T) {
 			t.Logf("delay %s outside [%s, %s] for policy %+v failures %d", delay, floor, ceiling, policy, loop.repairFailures)
 			return false
 		}
+		// The window doubles per consecutive failure, so a jittered draw must
+		// come from exactly [0, window-floor); a window no wider than the floor
+		// draws nothing and waits the floor.
 		window := backoffCap(floor, ceiling, loop.repairFailures)
-		if random.bound != 0 && random.bound != int64(window-floor) {
-			t.Logf("drew from [0, %s), want [0, %s)", time.Duration(random.bound), window-floor)
+		if window <= floor {
+			if random.bound != 0 || delay != floor {
+				t.Logf("window %s ≤ floor %s, but drew [0, %s) and waited %s", window, floor, time.Duration(random.bound), delay)
+				return false
+			}
+			return true
+		}
+		if random.bound != int64(window-floor) {
+			t.Logf("failures %d: drew from [0, %s), want [0, %s)", loop.repairFailures, time.Duration(random.bound), window-floor)
 			return false
 		}
 		return true
