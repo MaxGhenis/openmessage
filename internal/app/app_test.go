@@ -197,6 +197,85 @@ func TestGoogleSendOutcomeRepairFlag(t *testing.T) {
 	}
 }
 
+// An expired cookie that the supervisor is still refreshing is
+// "reconnecting", never "needs repair": the 2026-10-22 banner told the user
+// to re-pair while the account only needed a cookie refresh. needs_repair
+// comes back once the supervisor parks.
+func TestGoogleStatusSeparatesReconnectingFromNeedsRepair(t *testing.T) {
+	a := &App{}
+	a.SessionPath = filepath.Join(t.TempDir(), "session.json")
+	if err := os.WriteFile(a.SessionPath, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if status := a.GoogleStatus(); status.Supervisor != nil || status.Reconnecting {
+		t.Fatalf("status without a supervisor = %+v, want no supervisor block", status)
+	}
+
+	supervisor := GoogleSupervisorStatus{
+		State: "repairing_credentials",
+		Repair: GoogleRepairStatus{
+			Attempts:    2,
+			LastOutcome: "failed_retrying",
+			LastError:   "refresh Google session cookies: keychain locked",
+		},
+	}
+	a.SetGoogleSupervisorStatus(func() (GoogleSupervisorStatus, bool) { return supervisor, true })
+	a.googleAuthExpired.Store(true)
+
+	status := a.GoogleStatus()
+	if status.NeedsRepair || !status.Reconnecting || !status.AuthExpired {
+		t.Fatalf("repairing status = %+v, want reconnecting + auth_expired, not needs_repair", status)
+	}
+	if status.Supervisor == nil || status.Supervisor.Repair.LastError != supervisor.Repair.LastError {
+		t.Fatalf("supervisor block = %+v, want the repair error exposed", status.Supervisor)
+	}
+
+	for _, state := range []string{"connecting", "backoff"} {
+		supervisor.State = state
+		if status := a.GoogleStatus(); !status.Reconnecting || status.NeedsRepair {
+			t.Fatalf("%s status = %+v, want reconnecting", state, status)
+		}
+	}
+
+	// A refresh that keeps failing escalates while the retries go on.
+	supervisor.State = "repairing_credentials"
+	supervisor.Repair.ConsecutiveFailures = GoogleRepairAttentionAfter - 1
+	if status := a.GoogleStatus(); status.RepairFailing || status.NeedsRepair || !status.Reconnecting {
+		t.Fatalf("status after %d failures = %+v, want still quietly reconnecting", supervisor.Repair.ConsecutiveFailures, status)
+	}
+	supervisor.Repair.ConsecutiveFailures = GoogleRepairAttentionAfter
+	if status := a.GoogleStatus(); !status.RepairFailing || !status.NeedsRepair || status.Reconnecting {
+		t.Fatalf("status after %d failures = %+v, want repair_failing + needs_repair", supervisor.Repair.ConsecutiveFailures, status)
+	}
+	supervisor.Repair.ConsecutiveFailures = 0
+
+	supervisor.State = "blocked"
+	supervisor.BlockReason = "repeated_failure"
+	status = a.GoogleStatus()
+	if !status.NeedsRepair || status.Reconnecting {
+		t.Fatalf("blocked status = %+v, want needs_repair and not reconnecting", status)
+	}
+
+	supervisor.State = "online"
+	supervisor.BlockReason = ""
+	a.Connected.Store(true)
+	if status := a.GoogleStatus(); status.NeedsRepair || status.Reconnecting {
+		t.Fatalf("online status = %+v, want neither flag", status)
+	}
+
+	// The send-failure zombie still asks for a re-pair while connected.
+	a.googleNeedsRepair.Store(true)
+	if status := a.GoogleStatus(); !status.NeedsRepair {
+		t.Fatalf("zombie status = %+v, want needs_repair", status)
+	}
+
+	// A control that has stopped reports no supervisor block.
+	a.SetGoogleSupervisorStatus(func() (GoogleSupervisorStatus, bool) { return GoogleSupervisorStatus{}, false })
+	if status := a.GoogleStatus(); status.Supervisor != nil {
+		t.Fatalf("stopped control status = %+v, want no supervisor block", status)
+	}
+}
+
 func TestGooglePhoneRespondingStatus(t *testing.T) {
 	a := &App{}
 	a.SessionPath = filepath.Join(t.TempDir(), "session.json")

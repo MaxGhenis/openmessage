@@ -1501,32 +1501,104 @@ curl -s http://127.0.0.1:7007/api/status | jq '.google.repairs_paced'
 The counter records exactly one thing: **how many repair requests were delayed
 by the floor**. A climbing count proves requests arrived faster than the
 configured interval — it does not identify why (could be fast revocation, a
-crash/reconnect loop, or repeated manual reconnects). It cannot clear the
-session healthy either: a single failed repair parks the supervisor in Blocked
-with the counter still at 0. For context, observed expiries on fixed builds
+crash/reconnect loop, or repeated manual Reconnect presses while a repair
+waits). Retries of a *failed* repair never count: the supervisor waits at
+least the same interval before retrying (`Policy.RepairRetryFloor`), so they
+never reach the gate early. For context, observed expiries on fixed builds
 were ~0-2/day (one account).
 
-To see *why* a repair failed: the refresh error is currently **returned but
-never logged** — the native path emits no log line, and the supervisor
-discards the error detail (`handleRepairResult` sets Blocked without logging
-it) — so the only way to observe it today is to reproduce it directly: run
-`scripts/refresh-google-session-cookies-macos.py` manually and read its error
-output. (A fix to log the repair failure is chipped.)
+**A failed repair is retried, not parked (as of the 2026-10-22 fix).** Before
+it, one failed cookie refresh parked the supervisor in Blocked with no log
+line and nothing to retry it; on 2026-10-22 19:26 that kept SMS dead until a
+manual cookie refresh and restart. Now:
+
+- A refresh error (Chrome cookie DB copy, keychain, missing cookies, the
+  session write, the 20 s timeout) is retried with backoff: at least
+  `OPENMESSAGE_REPAIR_MIN_INTERVAL` (90 s), then full jitter over a window that
+  doubles per consecutive failure, up to 5 min. No generation starts until a
+  refresh succeeds. The first two failures stay quiet; from the third in a
+  row (`repair_failing: true`, about 3–4.5 minutes after the expiry when each
+  refresh fails fast, up to a minute more when each runs into the 20 s refresh
+  timeout) status also raises
+  `needs_repair`, so the watchdog and the app's health notification fire,
+  while the retries go on. A refresh that keeps failing is usually Chrome
+  (signed out of the account, keychain access refused), never a re-pair; once
+  Chrome is fixed the next retry heals it with no Reconnect.
+- It parks only for a terminal error: no refresh mechanism at all
+  (`google_cookie_refresh_unavailable`, the one case that asks for a re-pair),
+  or a terminal class from the lifecycle (Gaia logout, unusable session). It
+  also parks after five consecutive expiries in one episode, the first plus
+  four repairs whose fresh cookies Google rejected too
+  (`block_reason: repeated_failure` with `error_class: credentials_expired`):
+  check that Chrome is signed in to the account, then press Reconnect; re-pair
+  only if that fails too. The count resets whenever a generation shows any
+  activity, so a generation that gets a long-poll event before each 401
+  (`ListenRecovered`, then a set-active 401) repairs again every pacing
+  interval instead of tripping the circuit; `repairs_paced` climbing is the
+  signal for that loop.
+- A libgm ping or set-active-session rejected with HTTP 401 now goes to
+  repair at once. Before, it took three failed pings (~2-3 min) and a
+  transient reconnect to learn the same thing from the new long poll
+  (observed 2026-10-22 21:01→21:03).
+- Pressing Reconnect while a failed repair waits retries it now
+  (`RetryCredentialRepairNow`); the pacing gate still applies.
+
+Every repair attempt and result is logged, with the error:
+
+```
+INF Google credential repair: refreshing session cookies   attempt=N trigger=google_auth_expired
+INF Refreshed Google session cookies from Chrome            cookies=60 changed=10
+INF Google credential repair succeeded; reconnecting        attempt=N took=…
+WRN Google credential repair failed; will retry             attempt=N error="…" retry_in=…
+ERR Google credential repair failed and cannot be retried automatically; …
+ERR Google Messages supervisor parked; it will not retry until Reconnect   block_reason=…
+```
+
+`changed=0` means Chrome holds the very cookies Google just rejected, so the
+reconnect will likely 401 again. The supervisor's own view is in
+`/api/status`:
+
+```bash
+curl -s http://127.0.0.1:7007/api/status | jq '.google | {connected, auth_expired, reconnecting, needs_repair, supervisor}'
+```
+
+`supervisor.state` is the lifecycle state (`online`, `connecting`, `backoff`,
+`repairing_credentials`, `blocked`, …), `supervisor.block_reason` says why it
+parked, `supervisor.retry_at_ms` is when the next attempt is due, and
+`supervisor.repair` holds the episode's `attempts` and the newest attempt's
+`last_started_ms`, `last_finished_ms`, `last_outcome` (`running`,
+`succeeded`, `failed_retrying`, `failed_blocked`) and `last_error`. The last
+repair's fields stay after the account heals, so the cause of the previous
+episode is still readable.
+
+What the flags mean now: `auth_expired` + `reconnecting` is a cookie refresh
+in progress or waiting to retry; it needs nothing from anyone. `needs_repair`
+is set only when a person must act: the supervisor parked
+(`supervisor.state == "blocked"`), the refresh has failed three times in a row
+(`repair_failing`, still retrying, fix Chrome), or sends keep failing while
+connected (the zombie). `supervisor.repair.consecutive_failures` counts the
+failed refreshes since the last success. The web banner, the macOS menu bar alert and the settings status
+follow the same split: "Reconnecting… No re-pair needed" while recovering, and
+the parked reason (with Re-pair only when the session is the problem) once it
+stops.
 
 An `auth_expired` session with its device link intact revives by cookie
-rewrite alone — **do not re-pair** for `needs_repair`; that resets nothing the
-refresh can't fix and risks pairing throttles. So the **first** thing to try
-when SMS is dead is nothing — wait ~2-3 min for the watchdog (the one observed
-live heal took 2m20s; under-waiting funnels you into the re-pair this section
-warns against). If it hasn't recovered, **read the actual repair and reconnect
-errors before deciding to re-pair** — the causes are broader than "the cookies
-are gone": Chrome/keychain/profile access, missing or undecryptable cookies, a
-session-file write failure, network or server rejection, or a genuinely revoked
-device link. Re-check the running binary (above) and whether Chrome still holds
-the five `.google.com` account cookies first; only once those are ruled out
-fall back to the manual re-pair recipe above. The app also posts a **health notification**
-(once, on the rising edge) when Google flips to `needs_repair` or WhatsApp
-logs out, so a dead platform can't sit silent for days.
+rewrite alone — **do not re-pair** while `reconnecting` is true; that resets
+nothing the refresh can't fix and risks pairing throttles. So the **first**
+thing to try when SMS is dead is nothing — wait ~2-3 min (the one observed
+live heal took 2m20s; the 2026-10-22 21:03 heal took 180 ms after the 401
+reached the supervisor). If it hasn't recovered, **read the repair errors
+before deciding to re-pair** (`supervisor.repair.last_error` and the log lines
+above) — the causes are broader than "the cookies are gone": Chrome/keychain/
+profile access, missing or undecryptable cookies, a session-file write
+failure, network or server rejection, or a genuinely revoked device link.
+Re-check the running binary (above) and whether Chrome still holds the five
+`.google.com` account cookies first; only once those are ruled out fall back to
+the manual re-pair recipe above. To reproduce a refresh by hand, run
+`scripts/refresh-google-session-cookies-macos.py` with the app quit. The app
+also posts a **health notification** (once, on the rising edge) when Google
+flips to `needs_repair` or WhatsApp logs out, so a dead platform can't sit
+silent for days.
 
 Prereq: the app must be **non-sandboxed** (it is — `OpenMessage.entitlements`
 is hardened-runtime only) so the backend can read Chrome's cookie DB and the
