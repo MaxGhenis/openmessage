@@ -77,6 +77,11 @@ type MessageService struct {
 	maxMediaBytes int64
 	batchLimit    int
 
+	transportTimeout       time.Duration
+	mediaTransportTimeout  time.Duration
+	transportShutdownGrace time.Duration
+	transport              transportCalls
+
 	wake chan struct{}
 
 	changeMu sync.Mutex
@@ -126,8 +131,13 @@ func NewMessageService(
 		maxPollDelay:  defaultMaxPollDelay,
 		maxMediaBytes: DefaultMaxMediaBytes,
 		batchLimit:    defaultBatchLimit,
-		wake:          make(chan struct{}, 1),
-		changed:       make(chan struct{}),
+
+		transportTimeout:       defaultTransportCallTimeout,
+		mediaTransportTimeout:  defaultMediaTransportCallTimeout,
+		transportShutdownGrace: defaultTransportShutdownGrace,
+
+		wake:    make(chan struct{}, 1),
+		changed: make(chan struct{}),
 	}, nil
 }
 
@@ -708,6 +718,8 @@ func (s *MessageService) Cancel(ctx context.Context, outboxID string) (Delivery,
 		return Delivery{}, fmt.Errorf("cancel delivery: %w", err)
 	}
 	s.signalChange()
+	// Canceling a send makes the reactions held for it due now.
+	s.signalWake()
 	return s.Get(ctx, outboxID)
 }
 
@@ -923,6 +935,52 @@ func (s *MessageService) ObserveTransportEcho(
 	default:
 		return "", fmt.Errorf("observe transport echo: unexpected reconcile outcome %q", outcome)
 	}
+}
+
+// ObserveUncorrelatedEcho pairs an echo that names no transport request with
+// the send it echoes (same conversation, identical body, received right after
+// the send went out; see sqlite.pairEchoes) and reconciles it like
+// ObserveTransportEcho. An echo of a
+// message sent from the phone itself matches nothing and is a successful
+// NotFound.
+func (s *MessageService) ObserveUncorrelatedEcho(
+	ctx context.Context,
+	echo UncorrelatedEcho,
+) (EchoOutcome, error) {
+	if ctx == nil {
+		return "", fmt.Errorf("observe uncorrelated echo: context is nil")
+	}
+	outcome, err := s.outbox.ReconcileUncorrelatedEcho(ctx, sqlite.UncorrelatedEchoRequest{
+		AccountID:            echo.AccountID,
+		RemoteConversationID: echo.RemoteConversationID,
+		RemoteMessageID:      echo.RemoteMessageID,
+		Body:                 echo.Body,
+		SeenAtMS:             echo.SeenAt.UnixMilli(),
+		OccurredAtMS:         echo.OccurredAt.UnixMilli(),
+	})
+	if err != nil {
+		return "", fmt.Errorf("observe uncorrelated echo: %w", err)
+	}
+	switch outcome {
+	case sqlite.ReconcileOutcomeNotFound, sqlite.ReconcileOutcomeNoop:
+		return outcome, nil
+	case sqlite.ReconcileOutcomeReconciled, sqlite.ReconcileOutcomeEnriched:
+		s.signalChange()
+		return outcome, nil
+	default:
+		return "", fmt.Errorf("observe uncorrelated echo: unexpected reconcile outcome %q", outcome)
+	}
+}
+
+// RepairUncorrelatedEchoDuplicates merges Google echo rows that projected
+// beside their sent message before echoes were correlated by content. See
+// sqlite.OutboxRepository.RepairUncorrelatedEchoDuplicates.
+func (s *MessageService) RepairUncorrelatedEchoDuplicates(ctx context.Context) (sqlite.EchoDuplicateRepairReport, error) {
+	report, err := s.outbox.RepairUncorrelatedEchoDuplicates(ctx)
+	if report.Merged > 0 {
+		s.signalChange()
+	}
+	return report, err
 }
 
 // RepairStoreFailed re-drives local confirmation for a result the transport

@@ -189,6 +189,7 @@ type App struct {
 	googleRepairPaceMu        sync.RWMutex
 	googlePull                googlePullHealth
 	googleRepairPaceCount     func() uint64
+	googleSupervisorStatus    func() (GoogleSupervisorStatus, bool)
 	signalLifecycleMu         sync.RWMutex
 	signalLifecycleNotifier   SignalLifecycleNotifier
 	tempDataDir               string
@@ -200,9 +201,17 @@ type GoogleStatusSnapshot struct {
 	Connected    bool `json:"connected"`
 	Paired       bool `json:"paired"`
 	NeedsPairing bool `json:"needs_pairing"`
-	// NeedsRepair is set when the session reports connected but sends keep
-	// failing — the phone has likely unlinked the device. The UI should
-	// offer re-pairing even though Connected is true.
+	// ClientLoaded is set while the backend holds a Google Messages client.
+	// Paired only says session.json exists: a client that is still loaded
+	// keeps rewriting that file on token refresh and cookie rotation even
+	// after it is deleted. Unpair drops the client.
+	ClientLoaded bool `json:"client_loaded"`
+	// NeedsRepair is set when automatic recovery has stopped and a person
+	// must act: sends keep failing while connected (the phone has likely
+	// unlinked the device), or the supervisor has parked the account
+	// (Supervisor.State "blocked"), or the cookie refresh keeps failing
+	// (RepairFailing). An expired cookie that is still being refreshed is
+	// not this: see AuthExpired and Reconnecting.
 	NeedsRepair bool   `json:"needs_repair,omitempty"`
 	LastError   string `json:"last_error,omitempty"`
 	// AuthExpired is set when Google rejects the web session cookies. Unlike a
@@ -216,11 +225,67 @@ type GoogleStatusSnapshot struct {
 	// heal cycle; a climbing count means cookies are being revoked within
 	// minutes, which the pacing floor is throttling rather than hiding.
 	RepairsPaced uint64 `json:"repairs_paced,omitempty"`
+	// Reconnecting is set while the supervisor is working its way back to a
+	// connection (connecting, backing off, or refreshing credentials) and
+	// nothing needs a person yet.
+	Reconnecting bool `json:"reconnecting,omitempty"`
+	// RepairFailing is set once the cookie refresh has failed
+	// GoogleRepairAttentionAfter times in a row. The supervisor keeps
+	// retrying, but a refresh that keeps failing (Chrome signed out of
+	// Google, keychain access denied) needs a person, so it also sets
+	// NeedsRepair. It is never a reason to re-pair.
+	RepairFailing bool `json:"repair_failing,omitempty"`
+	// Supervisor is the connection supervisor's own view, including the last
+	// credential repair. Absent outside the transport-owning daemon.
+	Supervisor *GoogleSupervisorStatus `json:"supervisor,omitempty"`
 	// PullHealth reports recent catch-up pulls (conversation listings and
 	// targeted lookups). Its empty_with_local_history flag is set when pulls
 	// return no data while the store holds this account's conversations, the
 	// state push-only health checks can't see. Absent before the first pull.
 	PullHealth *GooglePullHealthSnapshot `json:"pull_health,omitempty"`
+}
+
+// GoogleSupervisorStatus is the Google connection supervisor's state as
+// /api/status reports it. Times are Unix milliseconds; zero means never.
+type GoogleSupervisorStatus struct {
+	State            string `json:"state"`
+	Generation       uint64 `json:"generation"`
+	ErrorClass       string `json:"error_class,omitempty"`
+	ErrorFingerprint string `json:"error_fingerprint,omitempty"`
+	// BlockReason says why State is "blocked" (bridge.BlockReason*).
+	BlockReason string `json:"block_reason,omitempty"`
+	// RetryAtMS is when the next reconnect or repair attempt is due.
+	RetryAtMS int64              `json:"retry_at_ms,omitempty"`
+	Repair    GoogleRepairStatus `json:"repair"`
+}
+
+// GoogleRepairStatus describes credential repair: the attempts in the
+// current expiry episode and how the newest attempt went.
+type GoogleRepairStatus struct {
+	Attempts int `json:"attempts"`
+	// ConsecutiveFailures counts failed attempts since the last success.
+	ConsecutiveFailures int    `json:"consecutive_failures"`
+	LastStartedMS       int64  `json:"last_started_ms,omitempty"`
+	LastFinishedMS      int64  `json:"last_finished_ms,omitempty"`
+	LastOutcome         string `json:"last_outcome,omitempty"`
+	LastError           string `json:"last_error,omitempty"`
+}
+
+// GoogleRepairAttentionAfter is how many consecutive failed cookie
+// refreshes make status ask for a person (repair_failing, needs_repair). With
+// the 90 s repair pace and backoff, the third failure lands 3 to 4.5 minutes
+// after the expiry when each refresh fails fast, and up to a minute later if
+// every attempt runs into the 20 s refresh timeout: past the healthy heal
+// time of under 2.5 minutes. A single hiccup heals on its first retry without
+// anyone seeing it.
+const GoogleRepairAttentionAfter = 3
+
+// googleSupervisorWorking lists the states in which the supervisor is still
+// trying on its own.
+var googleSupervisorWorking = map[string]bool{
+	"connecting":            true,
+	"backoff":               true,
+	"repairing_credentials": true,
 }
 
 // googleRepairThreshold is how many consecutive failed Google sends (with no
@@ -764,22 +829,56 @@ func (a *App) GoogleStatus() GoogleStatusSnapshot {
 	a.statusMu.Unlock()
 	connected := a.Connected.Load()
 	paired := a.GooglePaired()
+	supervisor := a.googleSupervisorSnapshot()
+	blocked := supervisor != nil && supervisor.State == "blocked"
+	repairFailing := paired && supervisor != nil && supervisor.State == "repairing_credentials" &&
+		supervisor.Repair.ConsecutiveFailures >= GoogleRepairAttentionAfter
+	needsRepair := paired && (a.googleNeedsRepair.Load() || blocked || repairFailing)
 	return GoogleStatusSnapshot{
 		Connected:    connected,
 		Paired:       paired,
 		NeedsPairing: !connected && !paired,
-		// needs_repair surfaces whenever the session is known-bad and a session
-		// file still exists — whether that's a zombie (connected, sends fail)
-		// or a dead-credentials disconnect (auth 401). Either way the fix is
-		// re-pair, not reconnect; gating on `connected` alone would hide the
-		// 401 case (which is disconnected).
-		NeedsRepair:     paired && a.googleNeedsRepair.Load(),
+		ClientLoaded: a.GetClient() != nil,
+		// needs_repair surfaces whenever automatic recovery has given up and
+		// a session file still exists: a zombie (connected, sends fail), a
+		// terminal failure, or a parked supervisor. An expired cookie that the
+		// supervisor is still refreshing is auth_expired + reconnecting, not
+		// this; telling the user to re-pair then risks pairing throttles for
+		// nothing. A refresh that keeps failing counts too (repair_failing):
+		// it needs a person, though not a re-pair.
+		NeedsRepair:     needsRepair,
 		LastError:       lastError,
 		AuthExpired:     a.googleAuthExpired.Load(),
 		PhoneResponding: a.GooglePhoneResponding(),
 		RepairsPaced:    a.GoogleRepairsPaced(),
-		PullHealth:      a.GooglePullHealth(),
+		Reconnecting: paired && !connected && !needsRepair &&
+			supervisor != nil && googleSupervisorWorking[supervisor.State],
+		RepairFailing: repairFailing,
+		Supervisor:    supervisor,
+		PullHealth:    a.GooglePullHealth(),
 	}
+}
+
+// SetGoogleSupervisorStatus installs the reader of the Google supervisor's
+// state for status surfaces. Only the transport-owning daemon has one.
+func (a *App) SetGoogleSupervisorStatus(read func() (GoogleSupervisorStatus, bool)) {
+	a.googleRepairPaceMu.Lock()
+	a.googleSupervisorStatus = read
+	a.googleRepairPaceMu.Unlock()
+}
+
+func (a *App) googleSupervisorSnapshot() *GoogleSupervisorStatus {
+	a.googleRepairPaceMu.RLock()
+	read := a.googleSupervisorStatus
+	a.googleRepairPaceMu.RUnlock()
+	if read == nil {
+		return nil
+	}
+	status, ok := read()
+	if !ok {
+		return nil
+	}
+	return &status
 }
 
 // SetGoogleRepairPaceCounter installs the supervisor's paced-repair counter so

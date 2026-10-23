@@ -73,6 +73,21 @@ func NewReactionRepository(
 	return &ReactionRepository{store: store, now: now}, nil
 }
 
+// SelfReactorKey and SelfReactorLabel identify this account's own reaction on
+// a message. Every writer of an own reaction (the ingest worker for a
+// transport echo, the migration, and the outbox when it confirms a reaction
+// this account sent) uses them, so they all address one row per message.
+const (
+	SelfReactorKey   = "self"
+	SelfReactorLabel = "me"
+)
+
+// reactionExecer is the write surface ApplyReaction needs; *sql.DB and
+// *sql.Tx both provide it.
+type reactionExecer interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
 // ApplyReaction applies one WhatsApp, Signal, or tapback delta. A newer
 // removal preserves the previous emoji for audit; a removal received before
 // any add inserts an empty-emoji tombstone that fences stale adds. Delta
@@ -80,6 +95,21 @@ func NewReactionRepository(
 func (r *ReactionRepository) ApplyReaction(
 	ctx context.Context,
 	reaction ReactionApply,
+) (bool, error) {
+	nowMS, err := r.nowMS("apply reaction")
+	if err != nil {
+		return false, err
+	}
+	return applyReaction(ctx, r.store.db, reaction, nowMS)
+}
+
+// applyReaction is ApplyReaction on any execer, so the outbox can record a
+// confirmed own reaction inside its confirming transaction.
+func applyReaction(
+	ctx context.Context,
+	execer reactionExecer,
+	reaction ReactionApply,
+	nowMS int64,
 ) (bool, error) {
 	state := "active"
 	emoji := reaction.Emoji
@@ -99,11 +129,7 @@ func (r *ReactionRepository) ApplyReaction(
 		)
 	}
 
-	nowMS, err := r.nowMS("apply reaction")
-	if err != nil {
-		return false, err
-	}
-	result, err := r.store.db.ExecContext(ctx, `
+	result, err := execer.ExecContext(ctx, `
 		INSERT INTO reactions (
 			message_id,
 			reactor_key,

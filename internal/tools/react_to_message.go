@@ -35,19 +35,33 @@ var (
 	}
 )
 
-func reactToMessageTool() mcp.Tool {
-	return mcp.NewTool("react_to_message",
-		mcp.WithDescription("Add, remove, or switch a reaction on an existing message across supported platforms"),
+func reactToMessageTool(v2Enabled ...bool) mcp.Tool {
+	description := "Add, remove, or switch a reaction on an existing message across supported platforms"
+	options := []mcp.ToolOption{
+		mcp.WithDescription(description),
 		mcp.WithString("conversation_id", mcp.Required(), mcp.Description("Conversation ID containing the target message")),
 		mcp.WithString("message_id", mcp.Required(), mcp.Description("Target message ID")),
 		mcp.WithString("emoji", mcp.Required(), mcp.Description("Emoji reaction to apply")),
 		mcp.WithString("action", mcp.Description("Optional action: add, remove, or switch. Defaults to add.")),
+	}
+	if v2Requested(v2Enabled) {
+		options[0] = mcp.WithDescription(description + v2ReactionDescription)
+		options = append(options, mcp.WithString("idempotency_key", mcp.Description(v2ReactionIdempotencyDescription)))
+	}
+	options = append(options,
 		mcp.WithDestructiveHintAnnotation(false),
 		mcp.WithIdempotentHintAnnotation(false),
 	)
+	return mcp.NewTool("react_to_message", options...)
 }
 
-func reactToMessageHandler(a *app.App) server.ToolHandlerFunc {
+// reactToMessageHandler serves react_to_message in a process that owns its
+// transports. On a v2-primary install the read tools hand out v2 IDs, which
+// only the v2 outbox can place, so the reaction is queued there; otherwise it
+// goes straight to the platform's legacy sender.
+func reactToMessageHandler(a *app.App, configured ...Options) server.ToolHandlerFunc {
+	options := resolvedOptions(a, configured)
+	v2 := activeV2([]*V2Dependencies{options.V2})
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		args := req.GetArguments()
 		conversationID := strArg(args, "conversation_id")
@@ -63,6 +77,12 @@ func reactToMessageHandler(a *app.App) server.ToolHandlerFunc {
 		}
 		if emoji == "" {
 			return errorResult("emoji is required"), nil
+		}
+		if options.V2Primary {
+			if v2 == nil {
+				return errorResult("reactions on a v2-primary install go through the v2 outbox, which this process has not configured"), nil
+			}
+			return submitV2Reaction(ctx, v2, args, conversationID, messageID, emoji, action), nil
 		}
 
 		conv, err := a.Store.GetConversation(conversationID)

@@ -320,3 +320,102 @@ func TestDefaultBaseURLHonorsPortEnv(t *testing.T) {
 		t.Fatalf("DefaultBaseURL() = %q", got)
 	}
 }
+
+func TestReactionsViaOutboxNeedsV2Primary(t *testing.T) {
+	for _, status := range []DaemonStatus{
+		{}, {V2Send: true}, {V2Primary: true}, {V2Send: true, V2Primary: true},
+	} {
+		if got := status.ReactionsViaOutbox(); got != status.V2Primary {
+			t.Fatalf("%+v.ReactionsViaOutbox() = %v, want %v", status, got, status.V2Primary)
+		}
+	}
+}
+
+func TestSubmitReactionPostsToTheOutbox(t *testing.T) {
+	var path string
+	var body map[string]any
+	client := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path = r.Method + " " + r.URL.Path
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode: %v", err)
+		}
+		json.NewEncoder(w).Encode(map[string]any{"outbox_id": "out", "state": "queued", "deduplicated": true})
+	}))
+	submission, err := client.SubmitReaction(context.Background(), ReactionSubmission{
+		MessageID: "msg", Emoji: "👍", IdempotencyKey: "key",
+	})
+	if err != nil || submission.OutboxID != "out" || !submission.Deduplicated {
+		t.Fatalf("SubmitReaction() = %+v, %v", submission, err)
+	}
+	if path != "POST /api/v1/outbox/reactions" {
+		t.Fatalf("request = %s", path)
+	}
+	// conversation_id and action are optional and omitted when empty.
+	if len(body) != 3 || body["message_id"] != "msg" || body["emoji"] != "👍" || body["idempotency_key"] != "key" {
+		t.Fatalf("body = %v", body)
+	}
+
+	empty := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{"state": "queued"})
+	}))
+	if _, err := empty.SubmitReaction(context.Background(), ReactionSubmission{MessageID: "m", Emoji: "👍", IdempotencyKey: "k"}); err == nil {
+		t.Fatal("expected an error for a response without outbox_id")
+	}
+}
+
+func TestReactDecodesTheQueuedAnswer(t *testing.T) {
+	client := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusAccepted)
+		json.NewEncoder(w).Encode(map[string]any{"success": true, "queued": true, "outbox_id": "out", "state": "not_dispatched"})
+	}))
+	result, err := client.React(context.Background(), "conv", "msg", "👍", "add", "")
+	if err != nil || result != (ReactResult{Success: true, Queued: true, OutboxID: "out", State: "not_dispatched"}) {
+		t.Fatalf("React() = %+v, %v", result, err)
+	}
+
+	refused := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		json.NewEncoder(w).Encode(map[string]any{"success": false, "error": "send reaction: the transport refused the reaction"})
+	}))
+	if _, err := refused.React(context.Background(), "conv", "msg", "👍", "add", ""); err == nil {
+		t.Fatal("expected a ResponseError for a refused reaction")
+	} else if responseErr, ok := AsResponseError(err); !ok || responseErr.StatusCode != http.StatusBadGateway {
+		t.Fatalf("React() error = %v", err)
+	}
+}
+
+func TestMessageAttachmentReadsBytesHeadersAndLimit(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.EscapedPath() != "/api/v1/messages/msg%2F1/attachments/3" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Content-Disposition", `attachment; filename="Report.html"`)
+		w.Header().Set("X-Content-SHA256", "ABCDEF")
+		_, _ = w.Write([]byte("0123456789"))
+	}))
+	defer server.Close()
+	client := NewClient(server.URL, "")
+
+	attachment, err := client.MessageAttachment(context.Background(), "msg/1", 3, 10)
+	if err != nil {
+		t.Fatalf("MessageAttachment(): %v", err)
+	}
+	if string(attachment.Data) != "0123456789" || attachment.Filename != "Report.html" ||
+		attachment.MIME != "application/octet-stream" || attachment.SHA256 != "abcdef" {
+		t.Fatalf("MessageAttachment() = %+v", attachment)
+	}
+	if _, err := client.MessageAttachment(context.Background(), "msg/1", 3, 9); err == nil || !strings.Contains(err.Error(), "exceeds 9 bytes") {
+		t.Fatalf("MessageAttachment(limit 9) error = %v, want the size limit", err)
+	}
+	if _, err := client.MessageAttachment(context.Background(), "other", 0, 10); !IsDeterministicRejection(err) {
+		t.Fatalf("MessageAttachment(unknown) error = %v, want a 404 ResponseError", err)
+	}
+	if got := client.attachmentHTTP().Timeout; got < attachmentTimeout {
+		t.Fatalf("attachment timeout = %v, want at least %v", got, attachmentTimeout)
+	}
+	if client.HTTP.Timeout != 10*time.Second {
+		t.Fatalf("attachment requests changed the client's default timeout to %v", client.HTTP.Timeout)
+	}
+}

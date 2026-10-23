@@ -33,6 +33,7 @@ func TestV1RoutesReturnServiceUnavailableWhenDisabled(t *testing.T) {
 	}{
 		{http.MethodPost, "/api/v1/outbox/messages"},
 		{http.MethodPost, "/api/v1/outbox/media"},
+		{http.MethodPost, "/api/v1/outbox/reactions"},
 		{http.MethodGet, "/api/v1/outbox"},
 		{http.MethodGet, "/api/v1/outbox/outbox-1"},
 		{http.MethodPost, "/api/v1/outbox/outbox-1/cancel"},
@@ -263,6 +264,7 @@ func TestV1ErrorStatusMapping(t *testing.T) {
 		{name: "invalid state", err: messaging.ErrInvalidState, wantStatus: http.StatusConflict},
 		{name: "platform", err: v2wire.ErrPlatformNotSendable, wantStatus: http.StatusNotImplemented},
 		{name: "reply", err: v2wire.ErrReplyTargetUnavailable, wantStatus: http.StatusUnprocessableEntity, wantMessage: "reply_target_unavailable"},
+		{name: "reaction", err: fmt.Errorf("%w: no v2 message", v2wire.ErrReactionTargetUnavailable), wantStatus: http.StatusUnprocessableEntity, wantMessage: "reaction_target_unavailable"},
 		{name: "media unavailable", err: media.ErrUnavailable, wantStatus: http.StatusServiceUnavailable},
 		{name: "not found", err: sqlite.ErrNotFound, wantStatus: http.StatusNotFound, wantMessage: "not found"},
 		{name: "too large", err: messaging.ErrTooLarge, wantStatus: http.StatusRequestEntityTooLarge},
@@ -424,4 +426,40 @@ func (h *v1RecorderHarness) do(t *testing.T, request *http.Request) *http.Respon
 	recorder := httptest.NewRecorder()
 	h.handler.ServeHTTP(recorder, request)
 	return recorder.Result()
+}
+
+func TestStatusReportsV2DispatchHealth(t *testing.T) {
+	h := newA3Harness(t, true)
+	response := h.request(t, http.MethodGet, "/api/status", "", nil)
+	assertA3Status(t, response, http.StatusOK)
+
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(response.body, &payload); err != nil {
+		t.Fatal(err)
+	}
+	raw, ok := payload["v2_dispatch"]
+	if !ok {
+		t.Fatalf("status has no v2_dispatch: %s", response.body)
+	}
+	var health map[string]any
+	if err := json.Unmarshal(raw, &health); err != nil {
+		t.Fatal(err)
+	}
+	if health["abandoned_calls"] != float64(0) || health["abandoned_still_running"] != float64(0) {
+		t.Fatalf("v2_dispatch = %s, want zero abandoned calls", raw)
+	}
+	if _, inFlight := health["in_flight"]; inFlight {
+		t.Fatalf("v2_dispatch = %s, want no in-flight call while idle", raw)
+	}
+
+	disabled := newV1RecorderHarness(t, APIOptions{})
+	resp := disabled.do(t, httptest.NewRequest(http.MethodGet, "http://127.0.0.1/api/status", nil))
+	defer resp.Body.Close()
+	var legacyPayload map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&legacyPayload); err != nil {
+		t.Fatal(err)
+	}
+	if _, present := legacyPayload["v2_dispatch"]; present {
+		t.Fatalf("status without the v2 send stack reports v2_dispatch: %#v", legacyPayload["v2_dispatch"])
+	}
 }

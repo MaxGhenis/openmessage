@@ -2,6 +2,7 @@ package bridge
 
 import (
 	"context"
+	"errors"
 	"io"
 	"time"
 )
@@ -37,6 +38,15 @@ type HistoryIngressSink interface {
 	AppendHistoryIngress(ctx context.Context, record RawIngressRecord) error
 }
 
+// IngressDurability is an optional ConnectionSink extension. DurableIngress
+// reports whether AppendIngress commits frames to a durable inbox. It is false
+// in legacy-only mode, where the supervisor has no downstream sink and live
+// ingress is dropped, so a transport must not hold back a delivery
+// acknowledgement waiting for a commit that will never happen.
+type IngressDurability interface {
+	DurableIngress() bool
+}
+
 // Lifecycle owns transport connection generations.
 type Lifecycle interface {
 	// Start creates one owned connection generation. Run.Done must resolve when
@@ -60,11 +70,43 @@ type ConversationRef struct {
 	RemoteID string
 }
 
+// MessageRef names a stored message an operation refers to: a reaction or
+// read-receipt target, or the message a reply quotes. RemoteID is the
+// transport's identity for it. The dispatcher fills the other fields from the
+// stored message. AuthorID is the author's canonical identity. It is empty
+// when the stored message names no sender. That is always the case for a
+// message this account sent, but an incoming message can lack a sender too
+// (the legacy Signal receiver stored group messages with no source, and the
+// legacy-primary mirror records none), so an empty AuthorID does not by itself
+// mean this account. Outgoing reports that this account sent the message.
+// SentAt is the message's occurred time. Reaction and read refs always
+// describe the message they name. A reply ref with a zero SentAt is
+// undescribed (the dispatcher holds no message under RemoteID, or the quoted
+// message is an outgoing one still on its outbox request ID), so only its
+// RemoteID is meaningful.
 type MessageRef struct {
 	RemoteID string
 	AuthorID string
-	SentAt   time.Time
-	Text     string
+	Outgoing bool
+	// ProvisionalRemoteID is set for this account's own message while RemoteID
+	// is still the request ID its send was given and the platform may yet
+	// give it its own: the send has not gone out, or went out (confirmed and
+	// waiting for the echo that brings the platform's ID, uncertain, or
+	// store_failed) less than a minute ago. A minute is the longest lag after
+	// a send at which echo pairing considers an echo at all. A send that was
+	// canceled or rejected never gets one, so it is not set. The dispatcher
+	// holds a reaction to a message whose send has not gone out, and rejects
+	// one to a message whose send never will, before the transport call, so a
+	// reaction ref with this set always names a message that went out.
+	ProvisionalRemoteID bool
+	SentAt              time.Time
+	// Text, HasAttachment and AttachmentMIME are filled for reply targets
+	// only. Text is the stored body. HasAttachment reports whether the message
+	// carries an attachment, and AttachmentMIME is the first attachment's MIME
+	// type, so an adapter can describe a body-less message in its quote.
+	Text           string
+	HasAttachment  bool
+	AttachmentMIME string
 }
 
 type SendResult struct {
@@ -199,6 +241,12 @@ type MediaStream struct {
 	Filename string
 	MIME     string
 }
+
+// ErrMediaGone marks a DownloadMedia failure the transport cannot recover
+// from by retrying: it no longer holds the attachment's bytes and has nothing
+// it could fetch them with. Adapters wrap it (errors.Is must match) instead
+// of reporting an OpError class, so retry and lifecycle policy never see it.
+var ErrMediaGone = errors.New("bridge: the transport no longer has this attachment")
 
 type MediaDownloader interface {
 	DownloadMedia(ctx context.Context, accountID string, ref MediaRef) (MediaStream, error)

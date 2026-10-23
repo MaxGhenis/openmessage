@@ -35,10 +35,11 @@ before touching anything. The traps that cost the most:
 - **Read live messages via the HTTP API** (`/api/conversations/<id>/messages`,
   `/api/search`, `/api/status`) — the app holds the WAL'd DB, so a direct
   `sqlite3` reader hits "unable to open database file (14)".
-- **Re-pairing Google Messages:** QR is dead; use Google Account pairing via the
-  cookie method; clear `session.json` from **both** data dirs to reach the
-  pairing screen; don't over-reconnect (it throttles the account). Full recipe
-  in the runbook.
+- **Re-pairing Google Messages:** QR is dead; use Google Account pairing:
+  with the user at the phone, quit the app and run
+  `OPENMESSAGES_DATA_DIR=... openmessage pair --google-chrome` (reads the
+  signed-in Chrome profile's cookies; the user taps the printed emoji).
+  Don't over-reconnect (it throttles the account). Full recipe in the runbook.
 
 ## Local CLI (read-only, no transports)
 
@@ -85,14 +86,16 @@ per-platform freshness cannot see; on 2026-10-07 it was the phone's IMS stack
 `google_unreachable`; `/api/status` is the authority.
 
 "Read-only" here means no startup repair sweeps (`repairStartupArtifacts`) and
-no transports. Opening a store still writes: `sqlite.Open` (v2) applies any
-pending migrations and writes nothing when the store is current; `db.New`
-(legacy) runs `migrate()` on every open, which drops and recreates three
-`contact_avatars` indexes, keeps one row of each group of Signal rows that
-share a conversation, sender and timestamp and deletes the rest, and
-repopulates the FTS index when its row count differs from `messages`. Keeping
-the CLI binary in step with the app avoids the v2 migrations, not the legacy
-writes.
+no transports. The v2 store is opened with `sqlite.OpenWithoutMigrating`, which
+never migrates: a binary at a different schema version than the store refuses
+it (an older one reports the store as newer than supported; a newer one asks
+you to reopen the app). So on a macOS app install, `/usr/local/bin/openmessage`
+should be a symlink to the app bundle's binary (see the runbook's "MCP config").
+Opening the legacy store still writes: `db.New` runs `migrate()` on every open,
+which drops and recreates three `contact_avatars` indexes, keeps one row of
+each group of Signal rows that share a conversation, sender and timestamp and
+deletes the rest, and repopulates the FTS index when its row count differs
+from `messages`.
 
 `read` resolves each hit's sender (name → number → conversation id) so results
 are legible without a second lookup, and accepts
@@ -140,7 +143,17 @@ mode this prevents and the `~/.mcp.json` recipe.
 - `generate_person_story` — cross-platform narrative story for a person (merges + deduplicates)
 - `generate_viz` — self-contained HTML visualization combining data dashboards + narrative (see below)
 - `render_story` — render a pre-built Story JSON into HTML viz; supports `photo_paths` (curated list) or `photos_dir`
-- `send_message`, `draft_message`, `download_media`, `list_contacts`, `get_status`
+- `send_message`, `draft_message`, `list_contacts`, `get_status`
+- `download_media` — resolves a message ID or a `v2msg:<message>:<n>` media_id
+  (v2 reads go through the running app in client mode), downloads a pending
+  v2 attachment into the store, and with `save`/`output_path` writes a 0600
+  copy under the export root; an attachment its platform can no longer
+  deliver comes back as "attachment unavailable" with the reason
+
+Optional API story generation uses `claude-sonnet-5-5` with medium effort and
+a 16,000-token limit when the caller supplies an Anthropic API key. Without a
+key, or if the API fails or refuses the request, it generates a local
+stats-and-quotes story. There is no environment override for the model.
 
 On a v2-primary install the message-read tools (including `get_person_messages`
 and `get_person_messages_range`) serve the v2 store through the canonical read
@@ -169,6 +182,28 @@ return an error naming the working read tools instead.
   `/api/conversations/<id>/messages`), the HTTP twin of the `search_messages`
   MCP tool. Optional `phone`, `conversation_id`, `since`/`until` (YYYY-MM-DD,
   local time, `until` inclusive to end of day), `limit` (default 50, max 500).
+- `GET /api/media/<message-id|v2msg:<message>:<n>>` and
+  `GET /api/v1/messages/<id>/attachments/<n>` — attachment bytes (a pending
+  v2 attachment is downloaded first; `X-Content-SHA256` carries the digest).
+  An attachment the transport has no copy of is marked unavailable (asked
+  again at most hourly) and answers 410 Gone (404 is an unknown message or
+  ordinal); a transport that is unreachable right now answers 503. v2
+  message reads set `media_unavailable` on such a message.
+- `PUT /api/v1/messages/<id>/attachments/<n>` — import a local copy (raw
+  body, optional `X-Content-SHA256`) of a pending attachment the platform
+  can't deliver, e.g. a Signal attachment signal-cli never stored; checked
+  against the declared size. CLI: `openmessage media import`. See
+  [docs/agent-runbook.md](docs/agent-runbook.md) ("Signal attachments
+  signal-cli never stored").
+- `POST /api/react` — `{conversation_id, message_id, emoji, action}`. On a
+  v2-primary daemon it takes the v2 IDs the read API returns, queues the
+  reaction on the durable outbox and waits up to 8 s: 200 delivered, 202
+  queued and still retrying (don't repeat it), 502/409 not delivered, 422
+  unknown target. Legacy-primary daemons call the platform senders directly.
+- `POST /api/v1/outbox/reactions` — the durable twin (v2-primary only,
+  `idempotency_key` required), returns the outbox submission immediately.
+  Details: [docs/agent-runbook.md](docs/agent-runbook.md) ("Reactions on
+  v2-primary go through the outbox").
 
 ### Schema
 

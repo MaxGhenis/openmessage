@@ -405,11 +405,57 @@ func daemonReactToMessageHandler(options Options) server.ToolHandlerFunc {
 		if action == "" {
 			action = "add"
 		}
-		if err := daemon.React(ctx, conversationID, messageID, emoji, action); err != nil {
+		// One key for this reaction on every route: a v2-primary app dedupes on
+		// it, so a repeat after a lost answer cannot store a second reaction.
+		key, err := v2IdempotencyKey(args)
+		if err != nil {
+			return errorResult(err.Error()), nil
+		}
+		// A v2-primary app takes reactions on its durable outbox, where the
+		// intent carries an idempotency key and its delivery can be followed.
+		// Any other answer to the probe keeps the reaction on /api/react,
+		// which every app mode serves and which may also be a v2-primary app
+		// whose status could not be read.
+		status, reachable, probeErr := daemon.Status(ctx)
+		if probeErr != nil && !reachable {
+			return daemonDownResult(probeErr), nil
+		}
+		if probeErr == nil && status.ReactionsViaOutbox() {
+			args["idempotency_key"] = key
+			return daemonSubmitReactionAndWait(ctx, daemon, args, conversationID, messageID, emoji, action), nil
+		}
+		result, err := daemon.React(ctx, conversationID, messageID, emoji, action, key)
+		if err != nil {
+			if result.OutboxID != "" {
+				// A v2-primary app stored the reaction and then could not
+				// deliver it; its outbox state says what happened (an
+				// uncertain one may have been applied).
+				return v2ReactionResult(
+					messaging.Delivery{OutboxID: result.OutboxID, State: messaging.OutboxState(result.State)},
+					false, key, nil,
+				), nil
+			}
 			if responseErr, ok := localapi.AsResponseError(err); ok {
 				return errorResult(fmt.Sprintf("the app could not send the reaction: HTTP %d: %s", responseErr.StatusCode, responseErr.Body)), nil
 			}
-			return daemonDownResult(err), nil
+			if localapi.IsConnectionRefused(err) {
+				return daemonDownResult(err), nil
+			}
+			// The request failed mid-flight, so the app may hold the reaction.
+			return ambiguousReactionResult(key, err), nil
+		}
+		if !result.Success {
+			// The legacy Google route answers 200 with success false when the
+			// phone refuses the reaction.
+			return errorResult("the app reported that the reaction was not applied"), nil
+		}
+		if result.Queued {
+			// A v2-primary app answered on the compatibility route: the
+			// reaction is on its outbox, under key, and not delivered yet.
+			return v2ReactionResult(
+				messaging.Delivery{OutboxID: result.OutboxID, State: messaging.OutboxState(result.State)},
+				false, key, nil,
+			), nil
 		}
 		return structuredResult(map[string]any{
 			"ok":         true,

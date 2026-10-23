@@ -14,13 +14,17 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"mime/multipart"
 	"net"
 	"net/http"
 	"net/textproto"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -93,6 +97,14 @@ func (s DaemonStatus) SendsViaOutbox() bool {
 	return s.V2Send || s.V2Primary
 }
 
+// ReactionsViaOutbox reports whether the daemon takes reactions on the durable
+// /api/v1/outbox/reactions surface. Only a v2-primary daemon does: the route
+// addresses messages by v2 ID, which a legacy-primary daemon does not hand
+// out, even with v2 send enabled.
+func (s DaemonStatus) ReactionsViaOutbox() bool {
+	return s.V2Primary
+}
+
 // Status probes /api/status. The second result reports reachability: false
 // means no daemon answered at all (connection refused/timeout), while true
 // with a non-nil error means something answered but the response was not a
@@ -133,6 +145,18 @@ type MediaSubmission struct {
 	IdempotencyKey string
 	NotBeforeMS    *int64
 	Content        io.Reader
+}
+
+// ReactionSubmission is a durable reaction routed at
+// POST /api/v1/outbox/reactions. MessageID is the target's v2 message ID.
+// ConversationID is optional; when set it must name the target's conversation.
+// Action is "add", "remove", or "switch", and empty means add.
+type ReactionSubmission struct {
+	ConversationID string `json:"conversation_id,omitempty"`
+	MessageID      string `json:"message_id"`
+	Emoji          string `json:"emoji"`
+	Action         string `json:"action,omitempty"`
+	IdempotencyKey string `json:"idempotency_key"`
 }
 
 // Submission mirrors the daemon's v1 submission response.
@@ -187,6 +211,20 @@ func (c *Client) SubmitText(ctx context.Context, submission TextSubmission) (Sub
 	}
 	var result Submission
 	if err := decodeResponse(response, &result); err != nil {
+		return Submission{}, err
+	}
+	if result.OutboxID == "" {
+		return Submission{}, fmt.Errorf("submission response omitted outbox_id")
+	}
+	return result, nil
+}
+
+// SubmitReaction enqueues a reaction on a v2-primary daemon's durable outbox.
+// Like SubmitText it returns once the intent is stored; Delivery and
+// WaitDelivery report what became of it.
+func (c *Client) SubmitReaction(ctx context.Context, submission ReactionSubmission) (Submission, error) {
+	var result Submission
+	if err := c.postJSON(ctx, "/api/v1/outbox/reactions", submission, &result); err != nil {
 		return Submission{}, err
 	}
 	if result.OutboxID == "" {
@@ -372,16 +410,178 @@ func (c *Client) LegacySendMedia(ctx context.Context, submission MediaSubmission
 	return result, nil
 }
 
+// ReactResult is the daemon's answer on /api/react.
+//
+// A legacy-primary daemon answers only after the transport call, and sets
+// Success alone. A v2-primary daemon queues the reaction on its durable outbox
+// and waits a few seconds for it to settle, so its answer also carries the
+// intent: Queued is true (HTTP 202) when the reaction is stored but not yet
+// delivered, in which case the daemon keeps retrying it and the caller must
+// not react again. OutboxID and State identify the intent for Delivery.
+type ReactResult struct {
+	Success  bool   `json:"success"`
+	Queued   bool   `json:"queued"`
+	OutboxID string `json:"outbox_id"`
+	State    string `json:"state"`
+}
+
 // React routes a reaction through the daemon's /api/react surface, which
 // works in every daemon mode. Action is "add", "remove", or "switch".
-func (c *Client) React(ctx context.Context, conversationID, messageID, emoji, action string) error {
+// idempotencyKey, when set, lets a v2-primary daemon recognise a repeat of
+// the same reaction; a legacy-primary daemon ignores it. A reaction the
+// daemon could not deliver is a ResponseError. When a v2-primary daemon had
+// already stored it on its outbox, the returned ReactResult still carries
+// that outbox_id and state alongside the error. On a v2-primary daemon prefer
+// SubmitReaction.
+func (c *Client) React(ctx context.Context, conversationID, messageID, emoji, action, idempotencyKey string) (ReactResult, error) {
 	payload := struct {
 		ConversationID string `json:"conversation_id"`
 		MessageID      string `json:"message_id"`
 		Emoji          string `json:"emoji"`
 		Action         string `json:"action"`
-	}{conversationID, messageID, emoji, action}
-	return c.postJSON(ctx, "/api/react", payload, &map[string]any{})
+		IdempotencyKey string `json:"idempotency_key,omitempty"`
+	}{conversationID, messageID, emoji, action, idempotencyKey}
+	var result ReactResult
+	if err := c.postJSON(ctx, "/api/react", payload, &result); err != nil {
+		if responseErr, ok := AsResponseError(err); ok {
+			var stored ReactResult
+			if json.Unmarshal([]byte(responseErr.Body), &stored) == nil && stored.OutboxID != "" {
+				return stored, err
+			}
+		}
+		return ReactResult{}, err
+	}
+	return result, nil
+}
+
+// Attachment is one message attachment's bytes as the daemon served them.
+type Attachment struct {
+	Data     []byte
+	MIME     string
+	Filename string
+	// SHA256 is the daemon's hex digest of Data, when it sent one.
+	SHA256 string
+}
+
+// AttachmentImport is the daemon's answer to ImportMessageAttachment.
+type AttachmentImport struct {
+	MessageID string `json:"message_id"`
+	Ordinal   int64  `json:"ordinal"`
+	State     string `json:"state"`
+	BlobHash  string `json:"blob_hash"`
+	SizeBytes int64  `json:"size_bytes"`
+	MIME      string `json:"mime"`
+	Filename  string `json:"filename"`
+	Imported  bool   `json:"imported"`
+}
+
+// attachmentTimeout bounds one attachment request. The daemon downloads a
+// pending attachment from its platform before it answers, which can take far
+// longer than the default request timeout.
+const attachmentTimeout = 2 * time.Minute
+
+// contentSHA256Header mirrors the daemon's digest header on attachment
+// downloads and imports.
+const contentSHA256Header = "X-Content-SHA256"
+
+// MessageAttachment fetches attachment ordinal of v2 message messageID,
+// which the daemon first downloads from its platform when it is still
+// pending. A body longer than maxBytes is an error.
+func (c *Client) MessageAttachment(ctx context.Context, messageID string, ordinal int64, maxBytes int64) (Attachment, error) {
+	path := "/api/v1/messages/" + url.PathEscape(messageID) + "/attachments/" + strconv.FormatInt(ordinal, 10)
+	return c.getAttachment(ctx, path, maxBytes)
+}
+
+// LegacyMedia fetches a legacy-primary daemon's /api/media/<message-id>.
+func (c *Client) LegacyMedia(ctx context.Context, messageID string, maxBytes int64) (Attachment, error) {
+	return c.getAttachment(ctx, "/api/media/"+url.PathEscape(messageID), maxBytes)
+}
+
+// ImportMessageAttachment hands the daemon the bytes of a pending attachment
+// its platform can no longer deliver. sha256, when not empty, is the hex
+// digest the daemon must find. replace lets it swap the bytes of an
+// attachment that is already downloaded.
+func (c *Client) ImportMessageAttachment(
+	ctx context.Context,
+	messageID string,
+	ordinal int64,
+	content io.Reader,
+	sha256 string,
+	replace bool,
+) (AttachmentImport, error) {
+	path := "/api/v1/messages/" + url.PathEscape(messageID) + "/attachments/" + strconv.FormatInt(ordinal, 10)
+	if replace {
+		path += "?replace=true"
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPut, c.BaseURL+path, content)
+	if err != nil {
+		return AttachmentImport{}, err
+	}
+	request.Header.Set("Content-Type", "application/octet-stream")
+	if sha256 = strings.TrimSpace(sha256); sha256 != "" {
+		request.Header.Set(contentSHA256Header, sha256)
+	}
+	c.authorize(request)
+	response, err := c.attachmentHTTP().Do(request)
+	if err != nil {
+		return AttachmentImport{}, err
+	}
+	var result AttachmentImport
+	if err := decodeResponse(response, &result); err != nil {
+		return AttachmentImport{}, err
+	}
+	return result, nil
+}
+
+func (c *Client) getAttachment(ctx context.Context, path string, maxBytes int64) (Attachment, error) {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, c.BaseURL+path, nil)
+	if err != nil {
+		return Attachment{}, err
+	}
+	c.authorize(request)
+	response, err := c.attachmentHTTP().Do(request)
+	if err != nil {
+		return Attachment{}, err
+	}
+	defer response.Body.Close()
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
+		return Attachment{}, &ResponseError{StatusCode: response.StatusCode, Body: strings.TrimSpace(string(body))}
+	}
+	data, err := io.ReadAll(io.LimitReader(response.Body, maxBytes+1))
+	if err != nil {
+		return Attachment{}, fmt.Errorf("read local API attachment: %w", err)
+	}
+	if int64(len(data)) > maxBytes {
+		return Attachment{}, fmt.Errorf("local API attachment exceeds %d bytes", maxBytes)
+	}
+	attachment := Attachment{
+		Data:   data,
+		MIME:   strings.TrimSpace(response.Header.Get("Content-Type")),
+		SHA256: strings.ToLower(strings.TrimSpace(response.Header.Get(contentSHA256Header))),
+	}
+	if _, params, err := mime.ParseMediaType(response.Header.Get("Content-Disposition")); err == nil {
+		attachment.Filename = strings.TrimSpace(params["filename"])
+	}
+	return attachment, nil
+}
+
+// attachmentHTTP is c.HTTP with the longer attachment timeout.
+func (c *Client) attachmentHTTP() *http.Client {
+	client := http.Client{}
+	if c.HTTP != nil {
+		client = *c.HTTP
+	}
+	if client.Timeout < attachmentTimeout {
+		client.Timeout = attachmentTimeout
+	}
+	return &client
+}
+
+// IsConnectionRefused reports whether err means nothing was listening, so a
+// request certainly did not reach the daemon.
+func IsConnectionRefused(err error) bool {
+	return errors.Is(err, syscall.ECONNREFUSED)
 }
 
 func (c *Client) postJSON(ctx context.Context, path string, payload any, target any) error {

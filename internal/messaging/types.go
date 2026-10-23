@@ -122,6 +122,19 @@ type TransportEcho struct {
 	RemoteMessageID    string
 }
 
+// UncorrelatedEcho is an outgoing message frame that names no transport
+// request, such as a Google echo whose TmpID is empty. SeenAt is when this
+// machine received the frame.
+type UncorrelatedEcho struct {
+	AccountID            string
+	RemoteConversationID string
+	RemoteMessageID      string
+	Body                 string
+	SeenAt               time.Time
+	// OccurredAt is the phone's stamp on the message.
+	OccurredAt time.Time
+}
+
 // Timer is the one-shot timer seam used by Run and Wait.
 type Timer interface {
 	C() <-chan time.Time
@@ -172,4 +185,9 @@ func (t systemTimer) C() <-chan time.Time { return t.Timer.C }
 // operations through its application-facing API.
 type messageRepository interface {
 	GetMessage(context.Context, string) (sqlite.Message, error)
+	GetMessageByRemote(
+		ctx context.Context,
+		accountID, conversationID, remoteMessageID string,
+	) (sqlite.Message, error)
+	FirstAttachmentMIME(ctx context.Context, messageID string) (string, bool, error)
 }

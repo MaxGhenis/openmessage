@@ -1466,6 +1466,23 @@ html, body {
 
 .msg.sent .msg-attachment-card { margin-left: auto; }
 
+.msg-attachment-card.msg-attachment-unavailable {
+  border-style: dashed;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: default;
+}
+
+.msg-attachment-card.msg-attachment-unavailable:hover {
+  border-color: var(--border);
+  background: transparent;
+}
+
+.msg-attachment-unavailable .msg-attachment-icon {
+  background: var(--bg-hover);
+  color: var(--text-muted);
+}
+
 .msg-attachment-card:hover {
   border-color: var(--border-accent);
   background: var(--bg-hover);
@@ -5990,7 +6007,10 @@ body::after {
   const NOTIFICATION_MODE_MENTIONS = 'mentions';
   const NOTIFICATION_MODE_MUTED = 'muted';
   const OUTBOX_VISIBLE_STATES = new Set(['queued', 'dispatching', 'not_dispatched', 'uncertain', 'store_failed']);
-  const OUTBOX_SEND_KINDS = new Set(['text', 'media']);
+  const OUTBOX_TRAY_KINDS = new Set(['text', 'media', 'reaction']);
+  // A reaction is listed only while the app is still sending it. It has no
+  // "send again", so one that ends unresolved is reported when it is sent.
+  const OUTBOX_REACTION_STATES = new Set(['queued', 'dispatching', 'not_dispatched']);
   let activeConvoId = null;
   let conversations = [];
   let allConversations = [];
@@ -7255,6 +7275,20 @@ body::after {
       return `<div class="msg-attachment-card" aria-disabled="true">${body}</div>`;
     }
     return `<a class="msg-attachment-card" href="${escapeHtml(href)}" target="_blank" rel="noopener noreferrer">${body}</a>`;
+  }
+
+  // An attachment a download attempt found this app has no copy of (the v2
+  // read API sets media_unavailable): show what it was without a link that
+  // can only fail.
+  function renderUnavailableAttachmentHTML(message, reason) {
+    const mime = String(message && message.MimeType || '').trim();
+    return `<div class="msg-attachment-card msg-attachment-unavailable" aria-disabled="true" title="${escapeHtml(reason)}">
+        <span class="msg-attachment-icon">${escapeHtml(attachmentTypeLabel(mime))}</span>
+        <span class="msg-attachment-copy">
+          <span class="msg-attachment-title">${escapeHtml(attachmentTitle(message))} unavailable</span>
+          <span class="msg-attachment-meta">${message && message.IsFromMe ? 'This app has no copy of the file.' : 'This app has no copy of the file. Ask the sender to send it again.'}</span>
+        </span>
+      </div>`;
   }
 
   function truncateOneLine(value, max = 96) {
@@ -9910,6 +9944,14 @@ body::after {
     const label = platformMeta(item.platform).label;
     if (browserIsOffline()) return 'Message queued. It will send when you are back online.';
     if (item.platform === 'sms' && googleStatus.needs_repair) {
+      // Same reasoning as the banner: a refresh that keeps failing or a
+      // parked circuit is fixed in Chrome or by reconnecting, not a re-pair.
+      const stopped = googleStatus.connected ? null : googleStoppedCopy();
+      if (stopped && stopped.action === 'reconnect-google') {
+        return googleStatus.repair_failing
+          ? 'Message queued. It will send once Google Messages can refresh its sign-in; make sure Chrome is signed in to your Google account.'
+          : 'Message queued. Reconnect Google Messages to send it.';
+      }
       return 'Message queued. Re-pair Google Messages to send it.';
     }
     return `Message queued. It will send when ${label} reconnects.`;
@@ -10989,7 +11031,11 @@ body::after {
       const transcript = message.Transcript || message.transcript || '';
       const transcriptModel = message.TranscriptModel || message.transcript_model || '';
 
-      if (hasMediaID && isImage && mediaSrc) {
+      const mediaUnavailable = String(message.media_unavailable || '').trim();
+
+      if (mediaUnavailable && !message._pendingSend) {
+        html += renderUnavailableAttachmentHTML(message, mediaUnavailable);
+      } else if (hasMediaID && isImage && mediaSrc) {
         html += `<div class="msg-media">`;
         html += `<div class="msg-media-loading" data-msg-id="${escapeHtml(message.MessageID)}" data-kind="image"><div class="spinner"></div><span class="msg-media-loading-text">Fetching image...</span></div>`;
         html += `<img src="${mediaSrc}" alt="Image" loading="lazy" decoding="async" onload="handleMediaLoad(this)" onerror="handleMediaError(this, 'image')" onclick="showFullscreen(this.src,'image')">`;
@@ -11918,10 +11964,11 @@ body::after {
   }
 
   // The v2 tray is a read-through view of the durable outbox. It deliberately
-  // omits terminal rows and non-message intents; confirmed sends live in the
-  // thread, while reactions/read receipts remain outside this surface.
+  // omits terminal rows and read receipts; confirmed sends and reactions live
+  // in the thread.
   function outboxRowView(row, now = Date.now()) {
     const stateName = String(row && row.state || '').trim().toLowerCase();
+    const isReaction = String(row && row.kind || '').trim().toLowerCase() === 'reaction';
     const scheduledForMS = Number(row && row.scheduled_for_ms || 0);
     const nextAttemptMS = Number(row && row.next_attempt_at_ms || 0);
     const scheduled = stateName === 'queued' && scheduledForMS > now;
@@ -11942,22 +11989,28 @@ body::after {
         view.label = scheduled ? 'Scheduled' : 'Sending…';
         view.guidance = scheduled
           ? 'Waiting in the outbox until the scheduled time.'
-          : 'The app owns this send; do not resend it.';
+          : (isReaction ? 'The app owns this reaction; do not react again.' : 'The app owns this send; do not resend it.');
         view.action = 'cancel';
         view.actionLabel = 'Cancel';
-        view.actionTitle = scheduled ? 'Cancel scheduled send' : 'Cancel queued send';
+        view.actionTitle = scheduled ? 'Cancel scheduled send' : (isReaction ? 'Cancel queued reaction' : 'Cancel queued send');
         if (scheduled) view.timePrefix = 'For';
         break;
       case 'dispatching':
         view.label = 'Sending…';
-        view.guidance = 'The send is in progress; do not resend it.';
+        view.guidance = isReaction
+          ? 'The reaction is in progress; do not react again.'
+          : 'The send is in progress; do not resend it.';
         break;
       case 'not_dispatched':
         view.label = 'Retrying…';
-        view.guidance = 'The app retries automatically; do not resend it.';
+        view.guidance = isReaction
+          ? 'The app retries automatically; do not react again.'
+          : 'The app retries automatically; do not resend it.';
         view.action = 'cancel';
         view.actionLabel = 'Cancel';
-        view.actionTitle = 'Cancel this automatically retrying send';
+        view.actionTitle = isReaction
+          ? 'Cancel this automatically retrying reaction'
+          : 'Cancel this automatically retrying send';
         break;
       case 'uncertain':
         view.label = 'Sent — unconfirmed';
@@ -11976,14 +12029,19 @@ body::after {
       default:
         view.visible = false;
     }
+    if (isReaction && !OUTBOX_REACTION_STATES.has(stateName)) {
+      view.visible = false;
+      view.action = '';
+      view.actionLabel = '';
+      view.actionTitle = '';
+    }
     return view;
   }
 
   function visibleOutboxRows() {
     return outboxRows.filter(row => {
       const kind = String(row && row.kind || '').trim().toLowerCase();
-      const stateName = String(row && row.state || '').trim().toLowerCase();
-      return OUTBOX_SEND_KINDS.has(kind) && OUTBOX_VISIBLE_STATES.has(stateName);
+      return OUTBOX_TRAY_KINDS.has(kind) && outboxRowView(row).visible;
     });
   }
 
@@ -12001,8 +12059,10 @@ body::after {
 
   function outboxRowHTML(row, now) {
     const view = outboxRowView(row, now);
-    const summary = String(row && row.summary || '').trim()
-      || (String(row && row.kind || '').toLowerCase() === 'media' ? 'Attachment' : 'Message');
+    const kind = String(row && row.kind || '').toLowerCase();
+    const summary = kind === 'reaction'
+      ? `Reaction ${String(row && row.summary || '').trim()}`.trim()
+      : (String(row && row.summary || '').trim() || (kind === 'media' ? 'Attachment' : 'Message'));
     const time = view.timeMS > 0
       ? `${view.timePrefix} ${formatScheduledWhen(view.timeMS)}`
       : '';
@@ -12911,13 +12971,110 @@ body::after {
 
   // ─── Status Check ───
   function normalizeGoogleStatus(raw = {}) {
+    const supervisor = raw.supervisor || {};
+    const repair = supervisor.repair || {};
     return {
       connected: !!raw.connected,
       paired: raw.paired === undefined ? !!raw.connected : !!raw.paired,
       needs_pairing: !!raw.needs_pairing,
       needs_repair: !!raw.needs_repair,
+      auth_expired: !!raw.auth_expired,
+      reconnecting: !!raw.reconnecting,
+      repair_failing: !!raw.repair_failing,
       phone_responding: raw.phone_responding === undefined ? true : !!raw.phone_responding,
       last_error: raw.last_error || '',
+      supervisor: {
+        state: supervisor.state || '',
+        block_reason: supervisor.block_reason || '',
+        error_class: supervisor.error_class || '',
+        retry_at_ms: Number(supervisor.retry_at_ms || 0),
+        repair: {
+          attempts: Number(repair.attempts || 0),
+          consecutive_failures: Number(repair.consecutive_failures || 0),
+          last_outcome: repair.last_outcome || '',
+          last_error: repair.last_error || '',
+        },
+      },
+    };
+  }
+
+  // Disconnected, but the backend is still recovering on its own: connecting,
+  // backing off, or refreshing expired sign-in cookies from Chrome. That is
+  // never a reason to re-pair (2026-10-22: the banner said "Re-pair" while a
+  // cookie refresh was all the account needed).
+  function googleIsRecovering() {
+    if (googleStatus.connected || googleStatus.needs_repair || !googleStatus.paired) return false;
+    return googleStatus.reconnecting || googleStatus.auth_expired;
+  }
+
+  function googleRefreshingCredentials() {
+    return googleStatus.auth_expired || googleStatus.supervisor.state === 'repairing_credentials';
+  }
+
+  // A recovery step is waiting out a backoff, so "Retry now" can help.
+  function googleRetryIsWaiting() {
+    const repair = googleStatus.supervisor.repair;
+    return googleStatus.supervisor.retry_at_ms > 0 &&
+      (repair.last_outcome === 'failed_retrying' || googleStatus.supervisor.state === 'backoff');
+  }
+
+  // An absolute time, so the banner stays right between status changes (it
+  // re-renders only when the status itself changes).
+  function googleRetryWhen() {
+    const at = googleStatus.supervisor.retry_at_ms;
+    if (!at) return '';
+    if (at - Date.now() < 60_000) return 'shortly';
+    return 'at ' + new Date(at).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+  }
+
+  function googleRecoveringCopy() {
+    if (!googleRefreshingCredentials()) {
+      return 'Reconnecting to Google Messages…';
+    }
+    const repair = googleStatus.supervisor.repair;
+    if (repair.last_outcome === 'failed_retrying' && repair.last_error) {
+      const when = googleRetryWhen();
+      return `Reconnecting Google Messages — couldn’t refresh its Google sign-in from Chrome yet (${repair.last_error}).`
+        + (when ? ` Retrying ${when}.` : ' Retrying.');
+    }
+    return 'Reconnecting Google Messages — its Google sign-in expired, so OpenMessage is refreshing it from Chrome. No re-pair needed.';
+  }
+
+  // Automatic recovery has stopped. Say why, and only ask for a re-pair when
+  // the session itself is the problem.
+  function googleStoppedCopy() {
+    const { block_reason: reason, error_class: errorClass, repair } = googleStatus.supervisor;
+    if (googleStatus.repair_failing) {
+      // Still retrying, but the refresh keeps failing: the fix is usually in
+      // Chrome (signed out, keychain access), never a re-pair.
+      const detail = repair.last_error ? ` (${repair.last_error})` : '';
+      const when = googleRetryWhen();
+      return {
+        copy: `Google Messages can’t refresh its Google sign-in from Chrome${detail}. Make sure Chrome is signed in to your Google account; OpenMessage keeps retrying`
+          + (when ? ` (next try ${when}).` : '.'),
+        label: 'Retry now',
+        action: 'reconnect-google',
+      };
+    }
+    if (reason === 'repeated_failure' && errorClass === 'credentials_expired') {
+      return {
+        copy: 'Google keeps rejecting fresh sign-in cookies from Chrome. Make sure Chrome is signed in to your Google account, then reconnect. If that doesn’t work, re-pair.',
+        label: 'Reconnect',
+        action: 'reconnect-google',
+      };
+    }
+    if (reason === 'repair_failed' || reason === 'repair_unavailable') {
+      const detail = repair.last_error ? ` (${repair.last_error})` : '';
+      return {
+        copy: `Google Messages can’t refresh its sign-in automatically${detail}. Re-pair to fix it.`,
+        label: 'Re-pair',
+        action: 'open-platforms',
+      };
+    }
+    return {
+      copy: 'Google Messages disconnected and can’t recover on its own — your phone may have unlinked OpenMessage. Re-pair to fix it.',
+      label: 'Re-pair',
+      action: 'open-platforms',
     };
   }
 
@@ -12958,13 +13115,19 @@ body::after {
     $connectionBanner.className = 'connection-banner disconnected';
     $connectionBanner.style.display = 'flex';
     if (googleStatus.paired && googleStatus.needs_repair) {
-      // Disconnected because the credentials are dead (auth 401) — reconnect
-      // won't recover it, so steer to re-pair rather than a "Reconnect" that
-      // just 401s again.
-      $connectionBannerCopy.textContent = 'Google Messages disconnected — your phone unlinked OpenMessage. Re-pair to fix it.';
-      $connectionBannerAction.textContent = 'Re-pair';
-      $connectionBannerAction.dataset.action = 'open-platforms';
+      // Automatic recovery has stopped (the supervisor parked, or sends keep
+      // failing). Say why; steer to re-pair only when the session is the
+      // problem, since a needless re-pair risks pairing throttles.
+      const stopped = googleStoppedCopy();
+      $connectionBannerCopy.textContent = stopped.copy;
+      $connectionBannerAction.textContent = stopped.label;
+      $connectionBannerAction.dataset.action = stopped.action;
       $connectionBannerAction.style.display = '';
+    } else if (googleIsRecovering()) {
+      $connectionBannerCopy.textContent = googleRecoveringCopy();
+      $connectionBannerAction.textContent = 'Retry now';
+      $connectionBannerAction.dataset.action = 'reconnect-google';
+      $connectionBannerAction.style.display = googleRetryIsWaiting() ? '' : 'none';
     } else if (googleStatus.paired && !googleStatus.needs_pairing) {
       $connectionBannerCopy.textContent = 'Google Messages sync is paused';
       $connectionBannerAction.textContent = 'Reconnect';
@@ -13092,6 +13255,8 @@ body::after {
   function googleStatusText() {
     if (googleStatus.connected && !googleStatus.phone_responding) return 'Phone offline';
     if (googleStatus.connected) return 'Connected';
+    if (googleStatus.paired && googleStatus.needs_repair) return 'Needs attention';
+    if (googleIsRecovering()) return googleRefreshingCredentials() ? 'Refreshing sign-in…' : 'Reconnecting…';
     if (googleStatus.paired && !googleStatus.needs_pairing) return 'Needs reconnect';
     return 'Needs pairing';
   }
@@ -13126,8 +13291,11 @@ body::after {
     } else if (googleDisconnected) {
       // Live sync warning still surfaces a reconnect CTA whether or not
       // conversations already exist, because it is actionable either way.
-      title = noConversations ? 'Reconnect Google Messages' : 'Live sync is paused';
-      copy = 'New messages will not arrive until Google Messages reconnects.';
+      const recovering = googleIsRecovering();
+      title = recovering ? 'Reconnecting Google Messages' : (noConversations ? 'Reconnect Google Messages' : 'Live sync is paused');
+      copy = recovering
+        ? 'New messages will arrive once Google Messages reconnects. No re-pair needed.'
+        : 'New messages will not arrive until Google Messages reconnects.';
       notes = [];
       action = 'reconnect-google';
       cta = 'Reconnect';
@@ -13218,7 +13386,17 @@ body::after {
     } else if (googleStatus.last_error) {
       $gmStatusPill.classList.add('error');
     }
-    if (googleStatus.needs_repair) {
+    const stopped = googleStatus.needs_repair && !googleStatus.connected ? googleStoppedCopy() : null;
+    if (stopped && stopped.action === 'reconnect-google') {
+      // Parked or failing for a reason a reconnect can fix (Chrome's sign-in,
+      // repeatedly rejected cookies): the banner's action, not a re-pair.
+      $gmHelper.textContent = stopped.copy;
+      showGoogleError('');
+      $gmActionsRow.style.display = '';
+      $gmReconnectBtn.disabled = false;
+      $gmReconnectBtn.textContent = stopped.label === 'Retry now' ? 'Retry now' : 'Reconnect Google Messages';
+      $gmReconnectBtn.dataset.mode = 'reconnect';
+    } else if (googleStatus.needs_repair) {
       $gmHelper.textContent = nativeAppBridge()
         ? 'Google Messages needs to be paired again. Open the native pairing flow to refresh your Android phone connection.'
         : 'Google Messages needs to be paired again. Use the button below to copy the pair command, then run it in Terminal.';
@@ -13240,6 +13418,13 @@ body::after {
       $gmReconnectBtn.disabled = false;
       $gmReconnectBtn.textContent = 'Pair again';
       $gmReconnectBtn.dataset.mode = 'pair';
+    } else if (googleIsRecovering()) {
+      $gmHelper.textContent = googleRecoveringCopy();
+      showGoogleError('');
+      $gmActionsRow.style.display = '';
+      $gmReconnectBtn.disabled = !googleRetryIsWaiting();
+      $gmReconnectBtn.textContent = 'Retry now';
+      $gmReconnectBtn.dataset.mode = 'reconnect';
     } else if (googleStatus.paired && !googleStatus.needs_pairing) {
       $gmHelper.textContent = 'This Google Messages account is paired locally, but live SMS and RCS sync is currently paused. Reconnect to resume updates.';
       showGoogleError(googleStatus.last_error);
@@ -13779,7 +13964,9 @@ body::after {
     try {
       const status = await postJSON('/api/google/reconnect', {});
       applyAppStatus(status || {});
-      showThreadFeedback('Google Messages reconnected.');
+      // The request only starts a reconnect or a cookie-refresh retry; say
+      // "reconnected" only once the status shows it.
+      showThreadFeedback(googleStatus.connected ? 'Google Messages reconnected.' : 'Reconnecting Google Messages…');
     } catch (err) {
       showGoogleError(err.message || 'Failed to reconnect Google Messages', 'reconnect');
     } finally {
@@ -14059,20 +14246,66 @@ body::after {
   }
 
   // ─── Reactions ───
-	  window.sendReaction = async function(messageId, emoji) {
-	    // Close pickers
-	    document.querySelectorAll('.emoji-picker.show').forEach(p => p.classList.remove('show'));
-	    document.querySelectorAll('.emoji-full-panel.show').forEach(p => p.classList.remove('show'));
-	    closeComposeGifPanel();
+  // On a v2 daemon /api/react stores the reaction on the outbox and waits a
+  // few seconds for it. 200 means the platform accepted it, 202 means it is
+  // stored and still the app's to send, and anything else means this reaction
+  // will not go out.
+  async function reactionError(response) {
+    if (state.v2Primary === true) {
+      if (response.status === 422) return new Error("Can't react to that message.");
+      if (response.status === 501) return new Error("This conversation can't send reactions.");
+      if (response.status === 503) return new Error('Reactions are starting up — try again.');
+    }
+    return new Error(await responseError(response));
+  }
+
+  // A reaction whose outcome this page never learned (the request went out,
+  // the response was lost) keeps its idempotency key, so tapping it again
+  // replays the same intent instead of storing a second one.
+  const unresolvedReactionKeys = new Map();
+
+  window.sendReaction = async function(messageId, emoji) {
+    // Close pickers
+    document.querySelectorAll('.emoji-picker.show').forEach(p => p.classList.remove('show'));
+    document.querySelectorAll('.emoji-full-panel.show').forEach(p => p.classList.remove('show'));
+    closeComposeGifPanel();
+    const conversationId = activeConvoId;
+    const intent = JSON.stringify([conversationId, messageId, emoji, 'add']);
+    const key = unresolvedReactionKeys.get(intent) || freshV2IdempotencyKey();
+    unresolvedReactionKeys.set(intent, key);
+    let response;
     try {
-      await postJSON('/api/react', {
-        message_id: messageId,
-        emoji: emoji,
-        conversation_id: activeConvoId,
-        action: 'add',
+      response = await fetch(API + '/api/react', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          message_id: messageId,
+          emoji: emoji,
+          conversation_id: conversationId,
+          action: 'add',
+          idempotency_key: key,
+        }),
       });
+    } catch (err) {
+      // The request may have reached the app and been stored: don't call it
+      // unsent. The key stays, so another tap replays this reaction.
+      showThreadFeedback("Couldn't confirm the reaction reached the app. Check the outbox; tapping it again won't send it twice.", 'send');
+      scheduleOutboxRefresh(0);
+      console.error('Failed to send reaction:', err);
+      return;
+    }
+    // The app answered, so this intent is settled one way or another: a later
+    // tap is a new reaction.
+    unresolvedReactionKeys.delete(intent);
+    try {
+      if (!response.ok) throw await reactionError(response);
+      const result = await response.json().catch(() => null);
+      if (response.status === 202 || (result && result.queued)) {
+        showThreadFeedback("Reaction not sent yet. The app keeps trying; it's in the outbox, where you can cancel it.", 'send');
+        scheduleOutboxRefresh(0);
+      }
       // Reload to see updated reactions
-      if (activeConvoId) await loadMessages(activeConvoId, {poll: true});
+      if (conversationId) await loadMessages(conversationId, {poll: true});
     } catch (err) {
       showThreadFeedback(err.message || 'Failed to send reaction', 'send');
       console.error('Failed to send reaction:', err);

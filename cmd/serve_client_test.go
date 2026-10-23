@@ -3,6 +3,7 @@ package cmd
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -201,6 +202,55 @@ func TestRunServeMCPClientAdoptsDaemonTruth(t *testing.T) {
 	// blob store or any other dispatcher-side state.
 	if _, err := os.Stat(filepath.Join(v2Dir, "blobs")); !os.IsNotExist(err) {
 		t.Fatalf("client mode provisioned v2 blob state: %v", err)
+	}
+}
+
+// TestRunServeMCPClientNeverMigratesTheV2Store pins that the per-session MCP
+// client refuses a store the running app has not upgraded instead of
+// migrating it: the migration's write lock would stall the daemon's writes.
+func TestRunServeMCPClientNeverMigratesTheV2Store(t *testing.T) {
+	dataDir := t.TempDir()
+	v2Dir := filepath.Join(dataDir, "v2")
+	if err := os.MkdirAll(v2Dir, 0o700); err != nil {
+		t.Fatalf("create v2 dir: %v", err)
+	}
+	storePath := filepath.Join(v2Dir, "store.sqlite3")
+	store, err := sqlite.Open(storePath)
+	if err != nil {
+		t.Fatalf("provision v2 store: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close provisioned v2 store: %v", err)
+	}
+	latest := rollBackLedgerOneVersion(t, storePath)
+
+	daemon := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/status" {
+			http.NotFound(w, r)
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]any{
+			"connected":  true,
+			"v2_primary": true,
+			"v2_send":    true,
+			"auth":       map[string]any{"data_dir": dataDir},
+		})
+	}))
+	defer daemon.Close()
+	daemonURL, err := url.Parse(daemon.URL)
+	if err != nil {
+		t.Fatalf("parse daemon URL: %v", err)
+	}
+	setClientModeTestEnv(t, dataDir)
+	t.Setenv("OPENMESSAGES_PORT", daemonURL.Port())
+
+	var logs syncBuffer
+	err = RunServe(zerolog.New(&logs), "--mcp-stdio")
+	if !errors.Is(err, sqlite.ErrMigrationPending) || !strings.Contains(err.Error(), "reopen the OpenMessage app") {
+		t.Fatalf("RunServe(--mcp-stdio) error = %v, want ErrMigrationPending telling the user to reopen the app\n%s", err, logs.String())
+	}
+	if got := ledgerVersionCount(t, storePath); got != latest-1 {
+		t.Fatalf("ledger rows = %d after the refused client start, want %d: the client applied a migration", got, latest-1)
 	}
 }
 

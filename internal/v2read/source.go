@@ -20,6 +20,8 @@ type Source struct {
 	attachments *sqlite.MessageAttachmentRepository
 	outbox      *sqlite.OutboxRepository
 	reactions   *sqlite.ReactionRepository
+	// now times an attachment's unavailable mark; time.Now outside tests.
+	now func() time.Time
 
 	// batchPageQueries counts the page reads issued by the batch walks so
 	// tests can bound the read work, not just the result.
@@ -30,7 +32,7 @@ type Source struct {
 // invalid source so callers receive method errors rather than a constructor
 // panic; production wiring always passes an opened store.
 func New(store *sqlite.Store) *Source {
-	source := &Source{store: store}
+	source := &Source{store: store, now: time.Now}
 	if store == nil {
 		return source
 	}

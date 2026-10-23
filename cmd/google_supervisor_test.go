@@ -5,15 +5,20 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"math/rand"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/quick"
 	"time"
 
 	"github.com/rs/zerolog"
 
+	"github.com/maxghenis/openmessage/internal/app"
 	"github.com/maxghenis/openmessage/internal/bridge"
 )
 
@@ -21,7 +26,7 @@ func TestGoogleSupervisorCredentialRepairControlsGenerationStart(t *testing.T) {
 	tests := []struct {
 		name             string
 		canRepair        bool
-		refreshErr       error
+		refreshFailures  int32
 		wantRefreshCalls int32
 		wantStarts       int
 		wantState        bridge.State
@@ -35,13 +40,14 @@ func TestGoogleSupervisorCredentialRepairControlsGenerationStart(t *testing.T) {
 			wantFlagCalls: 1,
 		},
 		{
-			name:             "failed refresh parks without reconnect",
+			// 2026-10-22: one failed refresh used to park Google for good.
+			name:             "failed refresh is retried until it works, never flagging needs_repair",
 			canRepair:        true,
-			refreshErr:       errors.New("Chrome cookie database unavailable"),
-			wantRefreshCalls: 1,
-			wantStarts:       1,
-			wantState:        bridge.StateBlocked,
-			wantFlagCalls:    1,
+			refreshFailures:  3,
+			wantRefreshCalls: 4,
+			wantStarts:       2,
+			wantState:        bridge.StateOnline,
+			wantClearCalls:   1,
 		},
 		{
 			name:             "successful refresh starts exactly one new generation",
@@ -55,6 +61,9 @@ func TestGoogleSupervisorCredentialRepairControlsGenerationStart(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			// Millisecond pacing so retries finish inside the test; the policy
+			// and the repairer both read it, as in production.
+			t.Setenv(googleCredentialRepairMinIntervalEnv, "5ms")
 			lifecycle := &googleRepairTestLifecycle{}
 			var refreshCalls atomic.Int32
 			var flagCalls atomic.Int32
@@ -63,8 +72,10 @@ func TestGoogleSupervisorCredentialRepairControlsGenerationStart(t *testing.T) {
 				"session.json",
 				func() bool { return tc.canRepair },
 				func(context.Context, string) error {
-					refreshCalls.Add(1)
-					return tc.refreshErr
+					if refreshCalls.Add(1) <= tc.refreshFailures {
+						return errors.New("Chrome cookie database unavailable")
+					}
+					return nil
 				},
 				func() { flagCalls.Add(1) },
 				func() { clearCalls.Add(1) },
@@ -121,8 +132,330 @@ func TestGoogleSupervisorCredentialRepairControlsGenerationStart(t *testing.T) {
 			if got := clearCalls.Load(); got != tc.wantClearCalls {
 				t.Fatalf("repair-clear calls = %d, want %d", got, tc.wantClearCalls)
 			}
+			if got := repairer.PacedRepairCount(); got != 0 {
+				t.Fatalf("paced repairs = %d, want 0: retries must wait out the pace themselves", got)
+			}
 		})
 	}
+}
+
+// TestGoogleRepairRetriesNeverOutrunThePacingFloor runs the real repairer
+// under the real supervisor on the wall clock for arbitrary numbers of failed
+// refreshes and pacing intervals. For every case the refreshes are spaced at
+// least the pacing interval apart, none is delayed by the pacing gate (so a
+// retry never inflates repairs_paced, the fast-revocation alarm), needs_repair
+// is never raised, and the account comes back online.
+func TestGoogleRepairRetriesNeverOutrunThePacingFloor(t *testing.T) {
+	property := func(failureCount, intervalMS uint8) bool {
+		failures := int32(failureCount % 5)
+		interval := time.Duration(intervalMS%10+2) * time.Millisecond
+		t.Setenv(googleCredentialRepairMinIntervalEnv, interval.String())
+		lifecycle := &googleRepairTestLifecycle{}
+		var mu sync.Mutex
+		var refreshedAt []time.Time
+		var flagCalls atomic.Int32
+		repairer := newGoogleCredentialRepairer(
+			"session.json",
+			func() bool { return true },
+			func(context.Context, string) error {
+				mu.Lock()
+				defer mu.Unlock()
+				refreshedAt = append(refreshedAt, time.Now())
+				if int32(len(refreshedAt)) <= failures {
+					return errors.New("read Chrome Safe Storage from keychain: exit status 51")
+				}
+				return nil
+			},
+			func() { flagCalls.Add(1) },
+			func() {},
+			zerolog.Nop(),
+		)
+		supervisor, err := bridge.NewSupervisor(
+			googleAccountID,
+			bridge.PlatformGoogle,
+			lifecycle,
+			googleSupervisorPolicy(),
+			googleWallClock{},
+			googleRandom{},
+			bridge.WithCredentialRepairer(repairer),
+		)
+		if err != nil {
+			t.Fatalf("NewSupervisor() error = %v", err)
+		}
+		defer func() {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			_ = supervisor.Stop(ctx)
+		}()
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		err = supervisor.Start(ctx, bridge.StartRequest{})
+		cancel()
+		if err != nil {
+			t.Fatalf("Start() error = %v", err)
+		}
+		awaitGoogleSupervisorState(t, supervisor, bridge.StateOnline)
+		lifecycle.Run(0).Fail(bridge.OpError{
+			Class:       bridge.FailureCredentialsExpired,
+			Operation:   "ping",
+			Fingerprint: "google_auth_expired",
+			Cause:       errors.New("HTTP 401: invalid authentication credentials"),
+		})
+		awaitGoogleSupervisorGenerationStateWithin(t, supervisor, bridge.StateOnline, 2, 5*time.Second)
+
+		mu.Lock()
+		defer mu.Unlock()
+		if got := int32(len(refreshedAt)); got != failures+1 {
+			t.Logf("failures=%d interval=%s: refreshes = %d, want %d", failures, interval, got, failures+1)
+			return false
+		}
+		for i := 1; i < len(refreshedAt); i++ {
+			if gap := refreshedAt[i].Sub(refreshedAt[i-1]); gap < interval {
+				t.Logf("failures=%d interval=%s: refresh %d came %s after the last", failures, interval, i+1, gap)
+				return false
+			}
+		}
+		if paced := repairer.PacedRepairCount(); paced != 0 {
+			t.Logf("failures=%d interval=%s: %d retries hit the pacing gate", failures, interval, paced)
+			return false
+		}
+		if flagged := flagCalls.Load(); flagged != 0 {
+			t.Logf("failures=%d interval=%s: needs_repair raised %d times", failures, interval, flagged)
+			return false
+		}
+		return true
+	}
+	if err := quick.Check(property, &quick.Config{MaxCount: 16, Rand: rand.New(rand.NewSource(1022))}); err != nil {
+		t.Fatalf("repair pacing property: %v", err)
+	}
+}
+
+// Review of #260 (P1): a refresh that can never succeed on its own, such as a
+// Chrome profile signed out of Google, used to retry forever with
+// needs_repair false, so the app's own health notification never fired. It
+// must keep retrying, escalate to repair_failing + needs_repair once it has
+// failed GoogleRepairAttentionAfter times in a row, never ask for a re-pair
+// by starting a generation, and heal by itself once Chrome is signed in again.
+func TestGoogleRefreshThatKeepsFailingAsksForAttentionAndStillHeals(t *testing.T) {
+	t.Setenv(googleCredentialRepairMinIntervalEnv, "1ms")
+	a := &app.App{SessionPath: filepath.Join(t.TempDir(), "session.json"), Logger: zerolog.Nop()}
+	if err := os.WriteFile(a.SessionPath, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var signedIn atomic.Bool
+	var calls atomic.Int32
+	repairer := newGoogleCredentialRepairer(
+		a.SessionPath,
+		func() bool { return true },
+		func(context.Context, string) error {
+			calls.Add(1)
+			if !signedIn.Load() {
+				return errors.New("missing required cookies: .google.com:SID, .google.com:HSID, .google.com:SSID, .google.com:APISID, .google.com:SAPISID")
+			}
+			return nil
+		},
+		a.FlagGoogleNeedsRepair,
+		a.ClearGoogleRepairFlag,
+		zerolog.Nop(),
+	)
+	policy := googleSupervisorPolicy()
+	policy.MinBackoff = time.Millisecond
+	policy.MaxBackoff = 2 * time.Millisecond
+	lifecycle := &googleRepairTestLifecycle{}
+	// Status listeners (the web UI's event stream) must hear about the
+	// escalation: record what each published status event would refetch.
+	var readyForStatus atomic.Bool
+	var sawFailingStatus atomic.Bool
+	publish := func() {
+		if readyForStatus.Load() && a.GoogleStatus().RepairFailing {
+			sawFailingStatus.Store(true)
+		}
+	}
+	supervisor, err := bridge.NewSupervisor(
+		googleAccountID,
+		bridge.PlatformGoogle,
+		lifecycle,
+		policy,
+		googleWallClock{},
+		googleRandom{},
+		bridge.WithCredentialRepairer(repairer),
+		bridge.WithSnapshotObserver(googleSupervisorObserver(zerolog.Nop(), publish)),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = supervisor.Stop(ctx)
+	})
+	a.SetGoogleSupervisorStatus(func() (app.GoogleSupervisorStatus, bool) {
+		return googleSupervisorStatus(supervisor.Snapshot()), true
+	})
+	readyForStatus.Store(true)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	err = supervisor.Start(ctx, bridge.StartRequest{})
+	cancel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	awaitGoogleSupervisorState(t, supervisor, bridge.StateOnline)
+	a.HandleGoogleAuthExpiredError(errors.New("HTTP 401"))
+	lifecycle.Run(0).Fail(bridge.OpError{
+		Class:       bridge.FailureCredentialsExpired,
+		Fingerprint: "google_auth_expired",
+		Cause:       errors.New("HTTP 401"),
+	})
+
+	// Past the attention threshold and twice the same-fingerprint circuit:
+	// still retrying, never parked, and now asking for a person. Assert on one
+	// status read between attempts (a failed one, waiting to retry): with
+	// 1 ms retries the next attempt can start, and clear the last error, at
+	// any moment (review of #260, round 3).
+	var status app.GoogleStatusSnapshot
+	for deadline := time.Now().Add(2 * time.Second); ; {
+		status = a.GoogleStatus()
+		if status.Supervisor != nil &&
+			status.Supervisor.Repair.ConsecutiveFailures >= 2*policy.MaxSameFingerprint &&
+			status.Supervisor.Repair.LastOutcome == string(bridge.RepairOutcomeRetrying) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("refresh did not keep retrying: %+v", supervisor.Snapshot())
+		}
+		runtime.Gosched()
+	}
+	if !status.NeedsRepair || !status.RepairFailing || status.Reconnecting {
+		t.Fatalf("status after %d failed refreshes = %+v, want repair_failing + needs_repair", calls.Load(), status)
+	}
+	if status.Supervisor == nil || status.Supervisor.State != string(bridge.StateRepairingCredentials) ||
+		!strings.Contains(status.Supervisor.Repair.LastError, "missing required cookies") {
+		t.Fatalf("supervisor block = %+v, want still repairing with the refresh error", status.Supervisor)
+	}
+	if got := lifecycle.StartCount(); got != 1 {
+		t.Fatalf("generations started while every refresh failed = %d, want 1", got)
+	}
+	if repairer.PacedRepairCount() != 0 {
+		t.Fatalf("retries hit the pacing gate %d times", repairer.PacedRepairCount())
+	}
+	for deadline := time.Now().Add(time.Second); !sawFailingStatus.Load(); time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("no status event reached listeners once the refresh started needing attention")
+		}
+	}
+
+	// The user signs Chrome back in: the next retry heals without a Reconnect.
+	signedIn.Store(true)
+	awaitGoogleSupervisorGenerationStateWithin(t, supervisor, bridge.StateOnline, 2, 2*time.Second)
+	if status := a.GoogleStatus(); status.RepairFailing || status.Supervisor.Repair.ConsecutiveFailures != 0 {
+		t.Fatalf("status after healing = %+v, want repair_failing cleared", status)
+	}
+}
+
+func TestGoogleSupervisorTransitionLoggerRecordsEveryRepairAttemptAndResult(t *testing.T) {
+	var logs bytes.Buffer
+	var logsMu sync.Mutex
+	logger := zerolog.New(zerologSyncWriter{w: &logs, mu: &logsMu})
+	t.Setenv(googleCredentialRepairMinIntervalEnv, "5ms")
+	lifecycle := &googleRepairTestLifecycle{}
+	var refreshCalls atomic.Int32
+	repairer := newGoogleCredentialRepairer(
+		"session.json",
+		func() bool { return true },
+		func(context.Context, string) error {
+			if refreshCalls.Add(1) == 1 {
+				return errors.New("chrome cookie DB not found under /profile")
+			}
+			return nil
+		},
+		func() {},
+		func() {},
+		logger,
+	)
+	supervisor, err := bridge.NewSupervisor(
+		googleAccountID,
+		bridge.PlatformGoogle,
+		lifecycle,
+		googleSupervisorPolicy(),
+		googleWallClock{},
+		googleRandom{},
+		bridge.WithCredentialRepairer(repairer),
+		bridge.WithSnapshotObserver(googleSupervisorTransitionLogger(logger)),
+	)
+	if err != nil {
+		t.Fatalf("NewSupervisor() error = %v", err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = supervisor.Stop(ctx)
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	if err := supervisor.Start(ctx, bridge.StartRequest{}); err != nil {
+		cancel()
+		t.Fatalf("Start() error = %v", err)
+	}
+	cancel()
+	awaitGoogleSupervisorState(t, supervisor, bridge.StateOnline)
+	lifecycle.Run(0).Fail(bridge.OpError{
+		Class:       bridge.FailureCredentialsExpired,
+		Operation:   "send_text",
+		Fingerprint: "google_auth_expired",
+		Cause:       errors.New("get Google conversation: HTTP 401"),
+	})
+	awaitGoogleSupervisorGenerationState(t, supervisor, bridge.StateOnline, 2)
+
+	logsMu.Lock()
+	lines := strings.Split(strings.TrimSpace(logs.String()), "\n")
+	logsMu.Unlock()
+	type entry = map[string]any
+	var found []entry
+	for _, line := range lines {
+		var e entry
+		if err := json.Unmarshal([]byte(line), &e); err != nil {
+			t.Fatalf("parse log line %q: %v", line, err)
+		}
+		found = append(found, e)
+	}
+	want := []struct {
+		level, message string
+		check          func(entry) bool
+	}{
+		{"info", "Google credential repair: refreshing session cookies", func(e entry) bool {
+			return e["attempt"] == float64(1) && e["trigger"] == "google_auth_expired"
+		}},
+		{"warn", "Google credential repair failed; will retry", func(e entry) bool {
+			return e["attempt"] == float64(1) &&
+				e["error"] == "refresh Google session cookies: chrome cookie DB not found under /profile" &&
+				e["retry_in"] != nil
+		}},
+		{"info", "Google credential repair: refreshing session cookies", func(e entry) bool {
+			return e["attempt"] == float64(2)
+		}},
+		{"info", "Google credential repair succeeded; reconnecting", func(e entry) bool {
+			return e["attempt"] == float64(2)
+		}},
+	}
+	next := 0
+	for _, e := range found {
+		if next < len(want) && e["level"] == want[next].level && e["message"] == want[next].message &&
+			want[next].check(e) {
+			next++
+		}
+	}
+	if next != len(want) {
+		t.Fatalf("missing log %d (%s %q) in order; got:\n%s", next, want[next].level, want[next].message, strings.Join(lines, "\n"))
+	}
+}
+
+type zerologSyncWriter struct {
+	w  *bytes.Buffer
+	mu *sync.Mutex
+}
+
+func (w zerologSyncWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.w.Write(p)
 }
 
 func TestGoogleCredentialRepairMinInterval(t *testing.T) {
@@ -409,6 +742,76 @@ func TestGoogleSupervisorManualReconnectUsesOwnedCommands(t *testing.T) {
 	}
 }
 
+func TestGoogleSupervisorControlReconnectRetriesAWaitingRepairNow(t *testing.T) {
+	// A long pace, so only an expedited retry can explain a second attempt.
+	t.Setenv(googleCredentialRepairMinIntervalEnv, "1h")
+	sessionPath := filepath.Join(t.TempDir(), "session.json")
+	if err := os.WriteFile(sessionPath, []byte("session-v1"), 0o600); err != nil {
+		t.Fatalf("write session: %v", err)
+	}
+	lifecycle := &googleRepairTestLifecycle{}
+	var refreshCalls atomic.Int32
+	attempts := make(chan int32, 4)
+	repairer := bridge.CredentialRepairFunc(func(context.Context, string, bridge.OpError) error {
+		n := refreshCalls.Add(1)
+		attempts <- n
+		if n == 1 {
+			return errors.New("keychain locked")
+		}
+		return nil
+	})
+	supervisor, err := bridge.NewSupervisor(
+		googleAccountID,
+		bridge.PlatformGoogle,
+		lifecycle,
+		googleSupervisorPolicy(),
+		googleWallClock{},
+		googleRandom{},
+		bridge.WithCredentialRepairer(repairer),
+	)
+	if err != nil {
+		t.Fatalf("NewSupervisor() error = %v", err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = supervisor.Stop(ctx)
+	})
+	control := newGoogleSupervisorControl(supervisor, sessionPath, nil)
+	if err := control.Reconnect(); err != nil {
+		t.Fatalf("Reconnect() from stopped: %v", err)
+	}
+	awaitGoogleSupervisorGenerationState(t, supervisor, bridge.StateOnline, 1)
+	lifecycle.Run(0).Fail(bridge.OpError{
+		Class:       bridge.FailureCredentialsExpired,
+		Operation:   "listen",
+		Fingerprint: "google_auth_expired",
+		Cause:       errors.New("http 401 while polling"),
+	})
+	<-attempts
+	waiting := awaitGoogleSupervisorState(t, supervisor, bridge.StateRepairingCredentials)
+	for waiting.LastRepairOutcome != bridge.RepairOutcomeRetrying {
+		time.Sleep(time.Millisecond)
+		waiting = supervisor.Snapshot()
+	}
+	if time.Until(waiting.RetryAt) < 30*time.Minute {
+		t.Fatalf("retry due in %s, want the hour-long pace", time.Until(waiting.RetryAt))
+	}
+
+	if err := control.Reconnect(); err != nil {
+		t.Fatalf("Reconnect() while a repair waits: %v", err)
+	}
+	select {
+	case n := <-attempts:
+		if n != 2 {
+			t.Fatalf("expedited attempt = %d, want 2", n)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Reconnect() did not retry the waiting repair")
+	}
+	awaitGoogleSupervisorGenerationState(t, supervisor, bridge.StateOnline, 2)
+}
+
 func TestGoogleSupervisorControlReconnectAfterUnpairRebuildsSupervisor(t *testing.T) {
 	sessionPath := filepath.Join(t.TempDir(), "session.json")
 	if err := os.WriteFile(sessionPath, []byte("session-v1"), 0o600); err != nil {
@@ -544,7 +947,18 @@ func awaitGoogleSupervisorGenerationState(
 	wantGeneration bridge.Generation,
 ) bridge.Snapshot {
 	t.Helper()
-	deadline := time.NewTimer(time.Second)
+	return awaitGoogleSupervisorGenerationStateWithin(t, supervisor, want, wantGeneration, time.Second)
+}
+
+func awaitGoogleSupervisorGenerationStateWithin(
+	t *testing.T,
+	supervisor *bridge.Supervisor,
+	want bridge.State,
+	wantGeneration bridge.Generation,
+	within time.Duration,
+) bridge.Snapshot {
+	t.Helper()
+	deadline := time.NewTimer(within)
 	defer deadline.Stop()
 	ticker := time.NewTicker(time.Millisecond)
 	defer ticker.Stop()

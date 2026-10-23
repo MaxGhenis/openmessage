@@ -374,6 +374,9 @@ func TestSessionStoreDSNUsesModerncPragmas(t *testing.T) {
 	if !strings.Contains(got, "_pragma=busy_timeout(5000)") {
 		t.Fatalf("dsn missing busy_timeout pragma: %q", got)
 	}
+	if !strings.Contains(got, "_txlock=immediate") {
+		t.Fatalf("dsn missing _txlock=immediate: %q", got)
+	}
 	if !strings.Contains(got, "/tmp/wa%20store.db") {
 		t.Fatalf("dsn did not encode path correctly: %q", got)
 	}

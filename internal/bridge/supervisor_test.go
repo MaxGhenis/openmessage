@@ -458,12 +458,84 @@ func TestSupervisorCredentialRepairControlsRestart(t *testing.T) {
 		}
 	})
 
-	t.Run("failure blocks and never reconnects", func(t *testing.T) {
+	t.Run("recoverable failure retries the repair and never reconnects early", func(t *testing.T) {
+		clock := newSupervisorManualClock(supervisorTestEpoch)
+		runTwo := newSupervisorTestRun()
+		failure := OpError{
+			Class:       FailureCredentialsExpired,
+			Operation:   "start",
+			Fingerprint: "expired-cookie-set",
+		}
+		lifecycle := &supervisorTestLifecycle{scripts: []supervisorStartScript{
+			{err: failure},
+			{run: runTwo},
+		}}
+		repairer := newSupervisorControlledRepairer()
+		policy := supervisorTestPolicy()
+		supervisor := newTestSupervisor(
+			t,
+			lifecycle,
+			policy,
+			clock,
+			&supervisorScriptedRandom{},
+			WithCredentialRepairer(repairer),
+		)
+
+		if err := supervisorStart(t, supervisor, StartRequest{}); err == nil {
+			t.Fatal("Start() error = nil, want credentials-expired failure")
+		}
+		receiveSupervisorValue(t, repairer.started, "first credential repair start")
+		sendSupervisorValue(t, repairer.responses, errors.New("refresh rejected"), "failed repair")
+		waiting := awaitSupervisorSnapshot(t, supervisor, "repair retry scheduled", func(snapshot Snapshot) bool {
+			return snapshot.State == StateRepairingCredentials &&
+				snapshot.LastRepairOutcome == RepairOutcomeRetrying
+		})
+		if waiting.LastRepairError != "refresh rejected" || waiting.RepairAttempts != 1 {
+			t.Fatalf("retrying snapshot = %+v, want the error and one attempt recorded", waiting)
+		}
+		if wait := waiting.RetryAt.Sub(waiting.LastRepairFinishedAt); wait < policy.MinBackoff {
+			t.Fatalf("retry wait = %s, want at least the %s floor", wait, policy.MinBackoff)
+		}
+
+		clock.Advance(waiting.RetryAt.Sub(clock.Now()) - time.Nanosecond)
+		supervisorSync(t, supervisor)
+		select {
+		case call := <-repairer.started:
+			t.Fatalf("repair retried before RetryAt: %+v", call)
+		default:
+		}
+		if got := lifecycle.CallCount(); got != 1 {
+			t.Fatalf("starts while a failed repair waits = %d, want 1", got)
+		}
+
+		clock.Advance(time.Nanosecond)
+		call := receiveSupervisorValue(t, repairer.started, "second credential repair start")
+		if call.failure.Fingerprint != failure.Fingerprint {
+			t.Fatalf("retried repair failure = %+v, want the original trigger", call.failure)
+		}
+		sendSupervisorValue(t, repairer.responses, error(nil), "successful retry")
+		awaitSupervisorStartCount(t, lifecycle, 2)
+		connecting := awaitSupervisorSnapshot(t, supervisor, "post-retry connecting", func(snapshot Snapshot) bool {
+			return snapshot.State == StateConnecting && snapshot.Generation == 2
+		})
+		if connecting.LastRepairOutcome != RepairOutcomeSucceeded || connecting.LastRepairError != "" ||
+			connecting.RepairAttempts != 2 {
+			t.Fatalf("post-retry snapshot = %+v, want a recorded success after two attempts", connecting)
+		}
+	})
+
+	t.Run("terminal failure blocks and never reconnects", func(t *testing.T) {
 		clock := newSupervisorManualClock(supervisorTestEpoch)
 		failure := OpError{
 			Class:       FailureCredentialsExpired,
 			Operation:   "start",
 			Fingerprint: "expired-cookie-set",
+		}
+		terminal := OpError{
+			Class:       FailureUpgradeRequired,
+			Operation:   "refresh",
+			Fingerprint: "refresh_unavailable",
+			Cause:       errors.New("no refresh mechanism"),
 		}
 		lifecycle := &supervisorTestLifecycle{scripts: []supervisorStartScript{{err: failure}}}
 		repairer := newSupervisorControlledRepairer()
@@ -480,14 +552,22 @@ func TestSupervisorCredentialRepairControlsRestart(t *testing.T) {
 			t.Fatal("Start() error = nil, want credentials-expired failure")
 		}
 		receiveSupervisorValue(t, repairer.started, "first credential repair start")
-		sendSupervisorValue(t, repairer.responses, errors.New("refresh rejected"), "failed repair")
-		awaitSupervisorSnapshot(t, supervisor, "blocked after repair failure", func(snapshot Snapshot) bool {
+		sendSupervisorValue(t, repairer.responses, error(terminal), "terminal repair failure")
+		blocked := awaitSupervisorSnapshot(t, supervisor, "blocked after repair failure", func(snapshot Snapshot) bool {
 			return snapshot.State == StateBlocked
 		})
+		if blocked.BlockReason != BlockReasonRepairFailed || blocked.LastRepairOutcome != RepairOutcomeBlocked {
+			t.Fatalf("blocked snapshot = %+v, want repair_failed / failed_blocked", blocked)
+		}
 		clock.Advance(24 * time.Hour)
 		supervisorSync(t, supervisor)
 		if got := lifecycle.CallCount(); got != 1 {
 			t.Fatalf("starts after failed repair = %d, want 1", got)
+		}
+		select {
+		case call := <-repairer.started:
+			t.Fatalf("terminal repair failure was retried automatically: %+v", call)
+		default:
 		}
 
 		// An explicit retry retries the atomic repair; a second failure still
@@ -496,7 +576,7 @@ func TestSupervisorCredentialRepairControlsRestart(t *testing.T) {
 			t.Fatalf("RetryBlocked() error = %v", err)
 		}
 		receiveSupervisorValue(t, repairer.started, "second credential repair start")
-		sendSupervisorValue(t, repairer.responses, errors.New("still rejected"), "second failed repair")
+		sendSupervisorValue(t, repairer.responses, error(terminal), "second failed repair")
 		awaitSupervisorSnapshot(t, supervisor, "blocked after second repair failure", func(snapshot Snapshot) bool {
 			return snapshot.State == StateBlocked
 		})

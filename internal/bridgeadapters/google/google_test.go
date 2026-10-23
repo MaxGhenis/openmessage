@@ -72,6 +72,28 @@ func TestEventFailureClassification(t *testing.T) {
 			wantClass: bridge.FailureTransient,
 		},
 		{
+			name: "first ping rejected with 401 requires credential repair",
+			event: &events.PingFailed{
+				ErrorCount: 1,
+				Error:      errors.New("failed to notify ditto activity: HTTP 401: 16: Request had invalid authentication credentials."),
+			},
+			terminal:  true,
+			wantClass: bridge.FailureCredentialsExpired,
+		},
+		{
+			name: "set-active-session 401 requires credential repair",
+			event: &events.PingFailed{
+				Error: errors.New("failed to set active session: HTTP 401: 16: Request had invalid authentication credentials."),
+			},
+			terminal:  true,
+			wantClass: bridge.FailureCredentialsExpired,
+		},
+		{
+			name:     "first ping network failure is tolerated",
+			event:    &events.PingFailed{ErrorCount: 1, Error: errors.New("dial tcp: i/o timeout")},
+			terminal: false,
+		},
+		{
 			name:     "phone offline is not credential failure",
 			event:    &events.PhoneNotResponding{},
 			terminal: false,

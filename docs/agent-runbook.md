@@ -76,6 +76,166 @@ curl -s "http://127.0.0.1:7007/api/conversations/<id>/messages?limit=1" | jq '.[
 The web UI reads `TimestampMS` throughout, so these names are a stable contract
 — don't "fix" them by renaming.
 
+### Sent messages showing twice (Google echo without a TmpID)
+
+**Symptom:** every SMS/RCS message sent from OpenMessage shows twice in its
+thread. One copy has `Status: "sent"` and a 32-hex `source_id` (the local
+row). The other has an empty `Status` and Google's numeric message id (the
+echo). `v2_ingest.per_account.google-primary.echo_*` counters stay at 0.
+
+**Cause (decoded from raw inbox frames, 2026-10-16):** the phone echoes
+each sent message with an empty `TmpID`. Correlation used only the `TmpID`
+(`bridge.MessageEvent.ClientRequestID`), so the echo never reached the
+outbox reconcile and projected as its own row. The v2 store holds the same
+doubling for sends on 9/22 and 9/29, under the old QR pairing.
+
+**Fix (#245):** outgoing Google text echoes without a `TmpID` are paired
+with their sends by content and timing, within one thread and one body
+(`sqlite.pairEchoes`). Both times come from this machine's clock: when the
+send went out (the intent's `updated_at_ms`, its confirm) and when the echo
+was first seen (the frame's receipt, or the echo row's `created_at_ms`). On
+the 10/16 live store all 44 doubled sends had their echo first seen
+0.28-0.79 s after the confirm. The phone's own stamp ran 0.6 s behind to 3.7 s
+ahead, so it is not used. Pairs keep time order, and a pair's cost grows with
+the square of its lag's distance from 0.5 s. A pair therefore only beats
+leaving both unpaired for lags of about -5 s to +6 s, so the same words typed
+on the phone near a send stay their own message. Each pair then takes the
+normal reconcile, which repoints the local row and merges the echo row.
+A candidate's phone stamp must also be within 5 minutes of when it was first
+seen. That rules out an old message arriving now, from a history catch-up or
+from a live re-delivery after a reaction changes, however well its arrival
+fits.
+`echo_content_matched` counts these. On v2-primary installs a daemon-startup
+sweep pairs the duplicates already stored: on the 10/16 live-store copy it
+merged 43, left 0 twins, and took 86 ms. Not covered:
+- media sends;
+- uncertain sends: lease recovery stamps `updated_at_ms` about 30 s after the
+  call, and an abandoned call is stamped when it is given up (at its bound, or
+  about 2 s after a shutdown cancel), so their echo looks early and is left;
+- echoes first stored by a history import;
+- an echo that outran its confirm with no later frame of the same text in
+  that thread (it stays until the next startup sweep).
+
+To inspect a frame's `TmpID`, decode `inbox.payload`'s `proto_b64` as
+`gmproto.Message`.
+
+### Every send stuck behind one that never returned
+
+**Symptom (2026-10-20):** a message sent from OpenMessage stays pending, and
+every later send, reaction and read receipt, on every platform, waits behind
+it. `/api/status` still shows Google connected and the phone responding. In
+the v2 store one outbox row sits in `dispatching` with `transport_called_at_ms`
+set and `lease_expires_at_ms` long past; later rows stay `queued`.
+
+**Cause:** the dispatch loop (`MessageService.Run` → `DispatchDue`) makes one
+transport call at a time and waits for it. libgm used to wait for the phone's
+answer to a request with no timeout (`waitForResponse` in the fork's
+`pkg/libgm/session_handler.go`: "TODO hard timeout?"). On 10/20 a Google text
+send at 15:55 got no answer, so the loop waited three and a half hours and a
+19:17 text sat queued until the app restarted. Lease recovery could not help:
+it runs at startup and between the calls of a batch, never while the loop is
+blocked.
+
+**Fix, in two layers.**
+
+1. **libgm gives up after 35 s** (`client.RequestTimeout`, set on every libgm
+   client OpenMessage builds; the fork's own default is 60 s). The wait starts
+   once the request has been sent, and the fork's HTTP client allows 20 s for
+   the response headers, so 35 s keeps an unanswered lookup inside the
+   dispatcher's 60 s bound. See "Requests the phone never answers" for the
+   patch. The Google adapter classifies the failure, because it knows whether
+   anything was sent:
+   - The conversation lookup that every Google send, reaction and media send
+     makes first (media looks up before it uploads): nothing was sent, so the
+     intent stays retryable (`not_dispatched`).
+   - The send, reaction, media send or caption itself, and a read receipt:
+     the phone may still act on it, so it becomes `uncertain` and is never
+     sent again. If the phone does send it, its echo confirms the row. A send
+     cut off by a disconnect is `uncertain` too. A read receipt cut off by a
+     disconnect stays retryable, since repeating it costs nothing.
+   - If the dispatcher gave up on the call while the lookup or upload ran, the
+     adapter stops there and sends nothing. The row is still `uncertain`
+     (`transport_timeout`), because the dispatcher can't know that, but such
+     a message has not gone out: if no echo appears in its thread, send it
+     again.
+2. **Each transport call (text, media, reaction, read receipt; any platform)
+   has a hard bound in the dispatcher:** 60 s, or 5 minutes for media, whose
+   call includes the upload. It is the backstop for what libgm's bound can't
+   cover: a stalled HTTP send, a Google send whose two requests together run
+   past 60 s, and every other platform. A call past its bound is abandoned.
+   Its intent becomes `uncertain` with error code `transport_timeout`, and the
+   loop moves on. Nothing retries an uncertain intent, because the request may
+   have reached the phone; the user can send it again. The abandoned call's
+   goroutine, and its dispatch lease and media reader, live until the
+   transport returns; for Google that is now at most 35 s after its last
+   request was sent. At shutdown a canceled call gets 2 s to return its own
+   result before it is abandoned the same way.
+
+**A silent phone holds the loop once per window, not once per retry.** One
+loop serves every account, so each unanswered Google request holds every other
+intent, on any platform, for the whole timeout. The outbox retries a
+`not_dispatched` intent every 5 s with no cap, so without more, a retried
+lookup would keep the loop waiting on the phone almost all the time, and every
+queued Google intent would add its own timeout to each round. The Google
+adapter therefore holds its intents while the phone is silent
+(`internal/bridgeadapters/google/phone_silence.go`):
+
+- After any send-path request goes unanswered, every Google intent on that
+  account (text, media, reaction, read receipt) fails at once without reaching
+  the phone. It stays `not_dispatched` and is retried within 30 s, or when the
+  window ends if sooner. Media is neither read nor uploaded.
+- The first intent due after the window probes the phone. The window is 30 s
+  after the first unanswered request and doubles with each one after it, to
+  at most 5 minutes. A test with libgm's timing and seven queued Google
+  intents measures an hour of silence at 13 phone requests, with the loop
+  waiting on the phone 13% of the hour; without the hold it waits almost the
+  whole hour. A read receipt that happens to be the probe becomes `uncertain`
+  (see above), so a long silence can drop about one queued receipt per window.
+- A lookup that goes unanswered is retried a little after the window ends, so
+  the intents held meanwhile probe first. If the phone answered something
+  else since that intent's previous unanswered lookup, its own delay doubles
+  too, so one lookup the phone never answers can't hold the loop at every
+  window while everything else goes through. Its sixth such lookup refuses
+  the intent (`rejected`, class `unsupported`; nothing was sent), rather than
+  retrying it for ever.
+- An answer to a send-path request (a lookup, send, reaction or read receipt)
+  ends the hold. So do libgm's pinger reporting the phone responding again
+  (`Phone responding again` in the log) and a new Google generation (a
+  reconnect or re-pair). After that, held intents go out within 30 s. An
+  intent whose own lookup went unanswered goes at the retry it was given
+  then, after the window. Catch-up and backfill answers don't end the hold.
+
+What you see while the phone is silent:
+
+- The backend logs `Google Messages phone did not answer; holding Google
+  sends until the next probe` (a zerolog warning, with `held_until`) once
+  per window, and `... releasing held Google sends` when the hold ends. The
+  app forwards every backend line to os_log at Info, which macOS keeps only
+  in memory, so capture them live with `/usr/bin/log stream --level info`
+  (see "Reading the backend's os_log"), or use `log show --info` while they
+  are still in memory.
+- `GET /api/v1/outbox` lists the held intents as `not_dispatched`, with
+  `error_class` `transient` and `error_code` the operation (`send_text`,
+  `send_media`, `send_reaction`, `mark_read`). `next_attempt_at_ms` is at most
+  30 s out, and `attempt_count` climbs by about 100 an hour, since each held
+  recheck counts as an attempt. The stored error text (`error_detail`, which
+  the API doesn't return) begins `google_phone_not_answering:` for a held
+  intent and `google_conversation_get_unanswered:` for an unanswered lookup.
+
+`/api/status` `v2_dispatch` shows the loop's calls: `in_flight` (`outbox_id`,
+`account_id`, `operation`, `started_at_ms`, `elapsed_ms`, `timeout_ms`) while
+one is out, plus `abandoned_calls`, `abandoned_still_running` and
+`last_abandoned` (`reason` `timeout` or `shutdown`). An
+`abandoned_still_running` that keeps growing means a platform is not
+returning at all. For Google, libgm now ends an abandoned call within its
+35 s timeout, so that count falls back on its own.
+
+**On a build without the fix:** quit and reopen the app. Startup lease recovery
+marks the stuck row `uncertain` (its call was made, so it is not resent) and
+the queued rows dispatch. To tell whether the stuck message went out, look in
+its thread for an outgoing row with the same body after the send: that is the
+phone's echo, so it did.
+
 ## v2 cutover: conversation IDs re-key (issue #155)
 
 On a **v2-primary** install the API serves the v2 store, where a conversation's
@@ -166,6 +326,23 @@ repair still re-files messages but cannot restore overwritten titles/rosters.
 Outgoing-only windows are reported as `ambiguous` and left in place: a
 message frame carries no recipient, so nothing proves where an outbound text
 belongs until the thread's ConversationEvent re-binds the id.
+
+A duplicate is deleted only after what was recorded on it moves to the copy
+that stays, which each delete step in the report names as
+`survivor_message_id`: inbound reactions (per person, the newer one wins;
+where they came from Google's embedded snapshots, a person the newest
+snapshot no longer lists is marked removed), the reaction snapshot fence,
+attachments (a downloaded copy wins), queued reaction and read-receipt
+intents, and read cursors in the same thread.
+Intents take the surviving copy's thread, as they do when a row moves,
+because the dispatcher only sends an intent whose target is in its own
+thread. A row stays in its thread, and the group's `detail` says why, when an
+unfinished send names it as its local copy (dispatch reads that row in the
+send's own thread), when a read cursor names it (a cursor can't follow a row
+into another thread), or when the target thread already uses its remote id
+for other content (the two phones' ids collide by chance). A row kept for a
+cursor or a taken id is still deleted if it duplicates a row that stays in
+its thread; a row an unfinished send names is never deleted.
 
 ## Google Messages silent while "connected": the phone stopped relaying
 
@@ -382,6 +559,56 @@ All of this needs the request/response path to work. If the fetch replies are
 empty (`Fetched conversations count=0` while the store holds history), nothing
 can be recovered until that is fixed.
 
+### Requests the phone never answers
+
+libgm (the fork's third carried patch) gives up on a request the phone hasn't
+answered within its request timeout. Its default (`libgm.DefaultRequestTimeout`)
+is 60 s; OpenMessage sets 35 s on every client it builds
+(`client.RequestTimeout`), inside the outbox's 60 s bound on a transport call.
+The timeout starts once the request has been sent. It also fails every
+request still waiting when the client disconnects, which happens on unpair, on
+a reconnect that replaces the client, and at shutdown. The first kind fails
+with an error matching `libgm.ErrPhoneNotResponding`, the second with one
+matching `libgm.ErrConnectionClosed`. Before that patch such a request waited
+forever. A catch-up blocked on one held the backfill guard until the process
+restarted, so every later backfill, recent reconcile and pending-media refresh
+was refused (`backfill already running`).
+
+- **A catch-up stops after its first unanswered request.** Every later
+  request in the same run fails at once without reaching the phone, with
+  `skipped: an earlier request in this Google catch-up got no answer`
+  wrapping the first error. A run against a silent phone therefore ends about
+  35 s after its first unanswered request and releases the guard.
+  - Startup, deep and window backfills count each skipped fetch in
+    `/api/backfill/status` `errors` / `error_details`.
+  - The recent reconcile and the pending-media refresh log it.
+  - Run a backfill again once the phone answers. When the ditto pinger sees
+    the phone respond again, it starts a recent reconcile on its own
+    (`phone_responding_again`).
+- **Sends.** A send the phone never answers now fails after 35 s, in the
+  Google adapter, instead of being abandoned by the dispatcher's 60 s bound.
+  The server had already accepted it, so the phone may still deliver it: the
+  outbox records it as `uncertain` and never sends it again. The legacy HTTP
+  send keeps its idempotency claim, so a retry with the same key gets 409.
+  The legacy scheduler (legacy-primary daemons) treats a scheduled SMS the
+  same way: any SendMessage error other than an auth rejection or no client
+  (an unanswered request, a disconnect, a network or server error) marks it
+  `failed`, noting it may have gone out, instead of re-sending it with a new
+  TmpID. A timed-out conversation lookup before a send has no effect on the
+  phone and stays retryable, in the scheduler too. While the phone stays
+  silent, outbox intents are held, so the dispatch loop waits on the phone
+  at most once per window (see "Every send stuck behind one that never
+  returned").
+- **What you see.**
+  - libgm logs `Phone did not answer the request in time; giving up on it`
+    with `request_action` and `timeout`.
+  - A timed-out INBOX listing shows in `google.pull_health` as
+    `last_outcome: error` with `last_error` ending
+    `phone did not respond to request after 35s`.
+  - A request the phone answered only with the Google-account notice still
+    fails as `no_payload` (see "Pulls that return nothing"), even when the
+    timeout cuts it off.
+
 ## SMS stopped while RCS works: the phone's SMS path
 
 **Symptom:** from 2026-10-03 16:16 to 2026-10-07 15:29 EDT the user's Pixel
@@ -556,9 +783,21 @@ running app:
   `TestNewClientPerformsNoStoreWrites` (internal/app),
   `TestRunServeMCPClientDoesNotRepairStore` and
   `TestOpenCommandReadSourceLegacyDoesNotRepairStore` (cmd).
-- **Sends/reactions route through the daemon** (`/api/v1/outbox` on v2,
-  `/api/send`+`/api/react` on legacy), like the CLI has done since PR #140,
-  with the same do-not-resend idempotency contract. With the app closed,
+- **The v2 store opens without migrating** (`sqlite.OpenWithoutMigrating`):
+  only the store's owner applies schema migrations, i.e. the daemon as the
+  first step of building its v2 stack, plus `repair` and cutover. A migration
+  holds SQLite's write lock for its whole run (index builds take seconds on a
+  large store) and the daemon's writers give up after the 5 s busy timeout,
+  so a client migrating under the running app would drop inbox appends. A
+  client binary newer than the store refuses it with "quit and reopen the
+  OpenMessage app"; one older than the store refuses it as "newer than
+  supported". Regression tests: `TestOpenWithoutMigrating*`
+  (internal/storage/sqlite), `TestOpenCommandReadSourceNeverMigratesTheV2Store`
+  and `TestRunServeMCPClientNeverMigratesTheV2Store` (cmd).
+- **Sends/reactions route through the daemon** (sends: `/api/v1/outbox` on
+  v2, `/api/send` on legacy; reactions: `/api/v1/outbox/reactions` on a
+  v2-primary app, `/api/react` otherwise), like the CLI has done since PR
+  #140, with the same do-not-resend idempotency contract. With the app closed,
   send tools return an actionable "start the OpenMessage app" error — they
   never fall back to opening their own connections.
 - Escape hatches: `--transports` forces the old standalone full-stack stdio
@@ -574,7 +813,7 @@ running app:
 
 ```json
 "openmessage": {
-  "command": "/usr/local/bin/openmessage",
+  "command": "/Applications/OpenMessage.app/Contents/Resources/openmessage",
   "args": ["serve", "--mcp-stdio"],
   "env": {
     "OPENMESSAGES_DATA_DIR": "/Users/<user>/Library/Application Support/OpenMessage",
@@ -588,9 +827,35 @@ daemon-truth detection all line up (two-data-dirs trap above). On a migrated
 (v2-primary) install, also set `OPENMESSAGES_V2_PRIMARY=1` — the legacy
 `messages.db` froze at cutover, and this keeps MCP reads on the v2 store even
 when the app is closed or predates the `auth.data_dir` status field (drop the
-line on a non-migrated install). Keep the PATH binary in lockstep with the
-installed app — both open the same SQLite stores and a version-skewed binary
-can migrate the schema under the older one.
+line on a non-migrated install).
+
+**Run the app's own binary, not a copy.** The MCP client opens the same SQLite
+stores as the app, and a binary at a different schema version than the store
+refuses it when it starts. The backend inside the app bundle matches the store
+once the deployed app has started, so a client started after that can't drift.
+On 2026-10-21 a deploy added
+migration 0011, and the July copy at `/usr/local/bin/openmessage` failed with
+`database schema version 11 is newer than supported version 10`, so every new
+MCP session's openmessage server exited at startup. Point the PATH binary at the
+bundle too (it is root-owned, so this needs `sudo` once):
+
+```bash
+sudo ln -sf /Applications/OpenMessage.app/Contents/Resources/openmessage /usr/local/bin/openmessage
+```
+
+An MCP server checks the schema only when it starts. One started before a
+deploy keeps running the old build against the new store, so after a deploy
+that adds a migration, restart the MCP servers of open sessions. One started
+during a deploy fails: during a full deploy (`rm -rf` then `cp -R`) the bundle
+is briefly absent, and if the deploy adds a migration, the new binary is ahead
+of the store until the new app's first start (`ErrMigrationPending`, "quit and reopen the OpenMessage app").
+
+**Because sessions now run the bundle's binary, never overwrite it in place.**
+On macOS, `cp` over an executable that a process is running makes every later
+run of that path die (exit 137, kernel log `CODE SIGNING: ... rejecting invalid
+page`), even after the old process exits. Quitting the app does not stop MCP
+servers, so swap the file by rename (below). A path already broken this way is
+repaired by renaming a fresh copy over it.
 
 **Never** configure MCP to run `serve --web`, `serve --mcp-sse`, or
 `serve ... --transports` alongside the app: those are daemon shapes and will
@@ -609,31 +874,72 @@ hung daemon, and it alerts when the daemon is up but a platform has gone
 quiet.
 
 This section follows the script's code on Max's local dotfiles `master` at
-`b51582d` (2026-10-08), plus the `append_errors` alert (`27df7b3`) and the
-`pull_empty` alert (`ffda554`). Other commits on `master` after `b51582d`
-aren't covered yet. The script's header comment summarizes the checks but is
-incomplete: it leaves out the inbox-read alert and the parse-error path, and
-it lists a top-level `projection_stalled` check that never fires (the daemon
-publishes that flag inside `freshness`).
+`ffda554` (2026-10-09). The script's header comment summarizes the checks but
+is incomplete: it leaves out the inbox-read alert and the parse-error path,
+and it lists a top-level `projection_stalled` check that never fires (the
+daemon publishes that flag inside `freshness`).
 launchd runs the working-tree file, so editing it, or checking out another
 branch in `~/dotfiles`, changes live behavior within 5 minutes. Try changes on
 a copy ([testing a change](#testing-a-change)).
 
+- Health: `~/.local/state/openmessage-watchdog/health.txt`, rewritten by every
+  run, says what the last run did and every alert it raised or held back
+  ([reading it](#healthtxt-what-the-last-run-saw)). Read it first: a clean run
+  writes nothing to the log.
 - Log: `~/Library/Logs/openmessage-watchdog.log`.
 - Script stderr, including Python failures:
-  `~/Library/Logs/openmessage-watchdog-launchd.log`. Look there when the main
-  log shows probes and relaunches but no staleness lines. From 2026-09-15 to
-  09-20, `/usr/bin/python3` refused to run (an unaccepted Xcode license), every
-  staleness check was off, and the main log said nothing about it.
+  `~/Library/Logs/openmessage-watchdog-launchd.log`. From 2026-09-15 to 09-20,
+  `/usr/bin/python3` refused to run (an unaccepted Xcode license), every
+  staleness check was off, and the main log said nothing about it. Since
+  dotfiles `9a20c28` such a run logs `staleness checks did not run: python3
+  exited N (<last stderr line>)` and lists the same text as an `alert:` line
+  in `health.txt`. It posts no notification. The parenthesis holds the last
+  line of the Python block's stderr, cut to 160 printable characters, and is
+  left out when that line is empty. The whole stderr also lands in
+  `python.stderr` in the state dir, rewritten by every run where the daemon
+  answered. A run with no status data (python3 failed, or the status wasn't
+  valid JSON) leaves the disconnect and repair counters as they were. Before
+  `9a20c28` such a run zeroed them and logged `reconnected: <platform>` and
+  `google repair cleared`, so an episode that had already notified and
+  outlasted the gap notified again once data came back, and one that hadn't
+  yet started its count over.
 - State: `~/.local/state/openmessage-watchdog/` holds `consecutive_fails`,
-  `last_action_epoch` (the relaunch throttle), the episode counters
-  `disc_<platform>` and `repair_google`, one `alert_<key>` cooldown stamp
-  per alert (epoch seconds; deleting one re-arms that alert),
-  `append_errors` (see the `append_errors` alert below), and
-  `paired_<platform>`, the pairing state the watchdog last recorded (`1` or
-  `0`; a loss deferred by the cooldown stays `1` until it is announced).
-  Deleting a `paired_` file makes the platform's next unpaired run a first
-  sighting, which is only logged.
+  `last_action_epoch` (the relaunch throttle), `down_since` (the current
+  outage's first failed probe), the episode counters `disc_<platform>` and
+  `repair_google` with their start times `disc_since_<platform>` and
+  `repair_since_google`, one `alert_<key>` cooldown stamp per alert
+  (deleting one re-arms that alert), `append_errors` (see the
+  `append_errors` alert below), `paired_<platform>`, the pairing state the
+  watchdog last recorded (`1` or `0`; a loss deferred by the cooldown stays
+  `1` until it is announced), `python.stderr` and `health.txt`. Times are
+  epoch seconds. Deleting a `paired_` file makes the platform's next unpaired
+  run a first sighting, which is only logged.
+
+  Since dotfiles `ea25916` every counter and time is read through
+  `read_state`. A file that isn't a canonical decimal (digits only, no
+  leading zero, at most 18 digits; an empty file fails too), or a time later
+  than the run's clock, is logged as `state file <name> was damaged
+  ('<content>') - removed, read as 0` (or `was in the future (…)`), deleted,
+  and read as 0, which is how a missing file reads. `<content>` keeps only
+  the letters, digits, spaces and `._:-` of the file's first 64 bytes, cut
+  to 40 characters, so a rejected `+5` logs as `'5'`; look at the file before
+  the next run deletes it. A counter restarts, a cooldown stamp lets its
+  alert through, the relaunch throttle lifts, and a start time restarts at
+  that run. A file is checked only when a run reads it, so a damaged stamp
+  stays until its alert next comes up. `paired_<platform>` is compared as a
+  string. `append_errors` has its own check on runs whose status has ingest
+  accounts: it logs `state file append_errors was damaged (…) - bad fields
+  read as 0` and rewrites the file at the end of that run instead of
+  deleting it. An answered run without accounts (or without status data)
+  reads its bad fields as 0 without a log line; down and skipped runs don't
+  read it.
+  Before `ea25916` most of these values went straight into bash arithmetic:
+  a word ended any run that did arithmetic on it (a down run for
+  `consecutive_fails`, a due relaunch, an alert or episode whose condition
+  held), `08` in a stamp stopped the alert loop at that key on every run
+  (losing that alert and every line after it), and a future
+  `last_action_epoch` throttled every relaunch until 30 minutes after the
+  clock passed it.
 - Loaded? `launchctl list | grep openmessage-watchdog`.
 
 ### Relaunching a dead or hung daemon
@@ -645,7 +951,10 @@ A run first skips, logging why, if the `watchdog-disabled` flag exists
 missing. Until 2026-10-08 that check matched any command line containing the
 phrase, including a grep for it and a test's `pgrep` stub; a stub made it skip
 live runs that day.
-Skipped runs neither count nor reset anything. Otherwise it fetches
+A skipped run doesn't probe the daemon and leaves the fail count and the
+episode counters where they were, but it deletes `down_since`, the outage
+clock: nothing watches the daemon while runs skip, so the next failed probe
+starts a new outage. Otherwise it fetches
 `http://127.0.0.1:7007/api/status` with a 5 s timeout. The probe fails when the
 reply doesn't contain the string `"connected"`: connection refused, no answer
 within 5 s, or an error body. Any real status payload passes, even with every
@@ -674,6 +983,16 @@ was down - relaunched the app", in both cases; `quitting hung app` in the log
 tells them apart. The probe sends no control token. That works only while
 `/api/` auth is accept-and-log: if enforcement ships, every probe will fail.
 
+The outage clock, `down_since` (`daemon_down_since` in health.txt), starts at
+an outage's first failed probe and survives relaunches and throttled runs. An
+answered probe deletes it, and so does a skipped run. Every failed probe lists
+`daemon not answering since <time> (N failed probe(s) in a row) - messages are
+not syncing` in health.txt. N is the fail count, which a relaunch resets, so
+it starts over while the time stays. A skip does the opposite: it restarts
+the time but keeps the count. After a skip, N can include probes that failed
+before `<time>`, and with no app process a count left at 1 means the first
+failed probe after the skip relaunches.
+
 ### Staleness alerts
 
 While the daemon answers, the script reads `/api/status` for the "app up,
@@ -681,10 +1000,11 @@ platform silently dead" class. It only alerts; platform recovery stays with the
 in-app supervisors. It alerts on:
 
 - a paired platform (`paired` true, `connected` false) on 3 consecutive runs
-  where the daemon answered. That is 10–15 minutes while the Mac is awake, and
+  that read the status. That is 10–15 minutes while the Mac is awake, and
   longer across sleep, because launchd skips the runs that fall while it is
-  asleep;
-- `google.needs_repair` on 3 consecutive answered runs;
+  asleep. Runs where the daemon is down, the watchdog skips, or the status
+  couldn't be read neither count nor break the streak;
+- `google.needs_repair` on 3 consecutive runs that read the status;
 - `google.repairs_paced >= 3` (key `repairs_paced`): at least three cookie
   repairs since the daemon started had to wait out the daemon's own minimum
   repair interval (90 s by default), so something is revoking the cookies
@@ -786,15 +1106,28 @@ Each run posts at most one macOS notification: its first fresh alert, plus
 "(+N more - see log)" when there are others. A lost pairing always goes first,
 as one alert naming every platform announced in that run. The log has each
 alert as `ALERT: …` and the notification as `NOTIFY: …`. A `NOTIFY:` line
-records the attempt, not that macOS showed it.
+records the attempt, not that macOS showed it. The notification goes inside an
+AppleScript string literal, and parts of its text come from the daemon or from
+Python errors (Signal's `last_issue_reason`, the `silence_check` error), so
+since dotfiles `aaeefc3` it drops every `"` and `\` from the text. The
+`NOTIFY:` line and health.txt keep them. Before `aaeefc3`, a quote or a
+backslash in that text could keep the notification from compiling, and a
+quote could end the literal early and turn the rest into AppleScript.
 
-- The disconnect and `needs_repair` alerts count consecutive answered runs and
-  notify once, when the count reaches 3, so one notification covers the whole
-  episode. The count resets on any answered run without the condition,
-  including one where the platform became unpaired or the status didn't parse,
-  so `reconnected: <platform>` and `google repair cleared` in the log don't
-  prove a recovery. Runs where the daemon is down, or where the watchdog
-  skips, leave the count where it was.
+- The disconnect and `needs_repair` alerts count consecutive runs that read
+  the status and notify once, when the count reaches 3, so one notification
+  covers the whole episode. The count resets on any run that reads the status
+  without finding the condition, including one where the platform became
+  unpaired, so
+  `reconnected: <platform>` and `google repair cleared` in the log don't
+  prove a recovery. Runs where the daemon is down, where the watchdog skips,
+  or where it got no status data (python3 failed, or the status didn't parse)
+  leave the count where it was. Each episode's first check is kept in
+  `disc_since_<platform>` or `repair_since_google`, deleted when the count
+  resets. From the 3rd check on, every run that sees the condition lists the
+  episode in health.txt with that start, while the notification still fires
+  only at the 3rd. A count found without its start file (one from before
+  `9a20c28`, or a damaged file) starts the clock at that run.
 - Every other alert has a 6-hour cooldown per key. While the condition holds,
   the first answered run at least 6 hours after the key's last stamp alerts
   again; runs in between log `suppressed (cooldown): <key>`. Every alert in a
@@ -837,7 +1170,9 @@ records the attempt, not that macOS showed it.
   the previous one, if the platform is still unpaired then. A relink in the
   meantime logs nothing, since the stored state never left paired.
 - If `/api/status` contains `"connected"` but isn't valid JSON, the run logs
-  `status parse error: …` and checks nothing else.
+  `status parse error: …`, lists it in health.txt, checks nothing else in the
+  response, and posts no notification. health.txt can still list a saved
+  `append_errors` remainder on such a run.
 
 Consequences worth knowing:
 
@@ -861,12 +1196,13 @@ Consequences worth knowing:
   projected fine, and the cause is not stored (issue #161). Their inbox ids
   are only in the backend's `Quarantined ingest frame` log lines.
 - `append_errors` is the same kind of in-memory counter, but its banner
-  doesn't repeat for an unchanged count. In the state dir's `health.txt`
-  (rewritten by every run) the count is an `alert:` line on every run that
-  reads the status while it is above 0, reported or not, until the backend
-  restarts; attempts carried over a restart are listed until they are
-  reported, and on runs without
-  accounts the unreported remainder is listed instead. Failures after the
+  doesn't repeat for an unchanged count. In
+  [health.txt](#healthtxt-what-the-last-run-saw) the count is an `alert:`
+  line on every run that reads the status while it is above 0, reported or
+  not, until the backend restarts; attempts carried over a restart are listed
+  until they are reported, and on answered runs without accounts or without
+  status data the unreported remainder is listed instead (down and skipped
+  runs list nothing for it). Failures after the
   watchdog's last run that saw accounts and before a restart die with the old
   process uncounted. When the identity is unknown on a run after a restart and
   neither sum falls, that run takes the new backend for the old one: a count
@@ -881,25 +1217,145 @@ Consequences worth knowing:
   duplicated self-participants (fixed by deduping in `refreshConversation`,
   PR #160). The recent ones have no diagnosed cause.
 
+### health.txt: what the last run saw
+
+Since dotfiles `9a20c28`, every run rewrites
+`~/.local/state/openmessage-watchdog/health.txt` from an EXIT trap, skipped
+runs included. Only a malformed `OPENMESSAGE_WATCHDOG_NOW` exits before then.
+A clean run writes nothing to the main log, so this file is the proof of life
+and the quickest view of what the watchdog sees. On the live install at 06:11
+on 2026-10-09 it read:
+
+```text
+# openmessage-watchdog health, rewritten by each run (launchd, every 5 min while the Mac is awake)
+updated=2026-10-09 06:11:04
+updated_epoch=1791540664
+watchdog=active
+watchdog_detail=no banner this run
+daemon=up
+daemon_detail=answered /api/status
+alerts=2
+alert: Google pulls return no data while the store holds 1048 conversations (last pull 2h ago) - phone switched to Google-account pairing; re-link or switch back to QR (d1088)
+alert: 1 ingested frame(s) quarantined
+note: signal unpaired - its staleness checks are paused
+note: whatsapp unpaired - its staleness checks are paused
+# end
+```
+
+Both alerts were inside their cooldowns, so that run posted nothing and logged
+only `suppressed (cooldown)` lines. Runs stop while the Mac sleeps, so a stale
+`updated_epoch` alone doesn't mean the watchdog died. Check whether the Mac
+was awake in the meantime before suspecting launchd. Nothing reads the file
+automatically: a watchdog that stopped running, ended in `watchdog=error`, or
+lists `staleness checks did not run` posts no notification, so you have to
+look.
+
+The file is replaced whole. A run writes a temp file next to it and moves it
+into place only once the last line, `# end`, is written, so a reader sees one
+run's complete file. Lines end in `\n`, and every ASCII control character
+inside a value (tab, CR, DEL, …) becomes a space, so each value stays on its
+line. C1 controls, U+2028 and U+2029 pass through, so split on `\n` only. A
+newline in daemon text never gets that far: the script reads the Python
+block's output line by line, so a newline in, say, Signal's
+`last_issue_reason` cuts that alert off there, and the rest is read as a line
+of its own (a separate alert if it is shaped like one). After the comment line
+come:
+
+- `updated` and `updated_epoch`: the run's clock, in local time and epoch
+  seconds.
+- `watchdog`: `active` (the run reached the end of the relaunch path or of the
+  staleness checks), `disabled` (the flag), `pairing` (an `openmessage pair`
+  process), `app-missing`, or `error`. A run where python3 failed or the
+  status didn't parse is still `active`, with the failure as an `alert:` line,
+  so read the alerts before taking `active` to mean the checks ran. `error`
+  means the run stopped before its last lines (say, an unbound variable under
+  `set -u`); its stderr is in the launchd log.
+- `watchdog_detail`: `banner: <text>` (the notification as logged, before
+  quotes and backslashes are dropped), `no banner this run`, why checks are
+  paused, or, on an `error` run, `the run stopped before it finished; its
+  stderr is in the launchd log`. A dry run shows `would banner: <text>`, or
+  `DRYRUN: no relaunch, no banner` on the relaunch path. For the flag the
+  detail is when it was set, its age and its reason, as in `disable flag set
+  2026-10-09 08:32 (3h ago); reason: re-pairing Google; no probe, relaunch or
+  alert until it is removed`.
+- `daemon`: `up`, `down`, or `unknown` (not probed: a skipped run, or one that
+  stopped before the probe). `daemon_detail` says what happened:
+  `answered /api/status`, or the relaunch path's step, as in
+  `dead (no app process); 1/2 failed probes, no action yet`,
+  `… relaunch throttled (12m since the last; one per 30m)`,
+  `… relaunched the app` or `… DRYRUN: would relaunch`.
+- Only when they apply, in epoch seconds: `paused_since` (the flag file's
+  modification time, so touching or rewriting the flag restarts it),
+  `daemon_down_since` (on down runs, the outage's first failed probe), and
+  `disconnected_since_<platform>` and `repair_since_google` (the episode's
+  first check, on runs that list the episode).
+- `alerts=N`, then N `alert: <text>` lines, then any `note: <text>` lines.
+
+The `alert:` lines are every alert the run raised, whether or not a cooldown
+kept it out of the notification. The log's `ALERT:` lines are only the alerts
+that weren't suppressed, so health.txt can list an alert the log hasn't
+mentioned for hours. They are:
+
+- on a down run, `daemon not answering since <time> (N failed probe(s) in a
+  row) - messages are not syncing`, and nothing else: the staleness checks
+  need an answering daemon;
+- every staleness alert's text, including those logged as
+  `suppressed (cooldown)`;
+- a disconnect or `needs_repair` episode from its 3rd check, on every run that
+  sees the condition, as `<platform> disconnected since <time> (N checks in a
+  row)` or `Google needs repair since <time> (N checks in a row)`. Checks 1
+  and 2 show up only in the log, as `disconnected: <platform> (N/3)` and
+  `google needs_repair (N/3)`;
+- a lost pairing, as `<platform> no longer paired - check the app; relink
+  unless that was intended` (one line per platform), while its announcement
+  waits out the cooldown and on the run that announces it;
+- the `append_errors` counts described under
+  [how alerts repeat](#how-alerts-repeat);
+- `staleness checks did not run: python3 exited N (…)` and
+  `status parse error: …`, which post no notification. Such a run also lists
+  any unreported `append_errors` remainder from the state file, labeled "(no
+  ingest accounts this run)" although it read no status.
+
+The `note:` lines are `<platform> unpaired - its staleness checks are paused`,
+one per unpaired platform on every run that reads the status (next to the
+lost-pairing alert while that lasts), and each silence the daemon reports (the
+`note:` lines in the log).
+
+Episodes, unpaired notes and silence notes come only from a run that read the
+status. A down, skipped or data-less run lists none of them, though the
+counters and start times carry on, so a missing episode line on such a run
+doesn't mean the episode is over. A dry run writes health.txt into its own
+state dir ([testing a change](#testing-a-change)).
+
 ### Testing a change
 
 `OPENMESSAGE_WATCHDOG_DRYRUN=1` logs decisions without relaunching or
-notifying, but it still writes state: `consecutive_fails`, the episode
-counters, the `paired_<platform>` files, the `alert_<key>` stamps (not the
-relaunch stamp) and the `append_errors` file. Run against the real state dir,
-it can swallow the next real alert: a stamped key stays quiet for 6 hours, an
-episode counter pushed past 3 never alerts, an `append_errors` count marked
-reported never alerts, and a lost pairing it records is never announced. Point
-`OPENMESSAGE_WATCHDOG_STATE` and `OPENMESSAGE_WATCHDOG_LOG` at a scratch
-directory and run a copy of the script:
+notifying, but it still writes state: `consecutive_fails`, `down_since`, the
+episode counters and their start files, the `paired_<platform>` files, the
+`alert_<key>` stamps (it never writes the relaunch stamp), the
+`append_errors` file, `python.stderr` and `health.txt`. It also deletes any
+counter or time file it reads as damaged or later than its clock, the relaunch
+stamp included. With `OPENMESSAGE_WATCHDOG_NOW` pinned earlier than the
+stamps already in the state dir, it deletes each one it reads. Alert stamps
+and start times may come back on that earlier clock, but a deleted relaunch
+stamp stays deleted, which lifts the throttle. Run against the real state dir, it can swallow the next real alert:
+a stamped key stays quiet for 6 hours, an episode counter pushed past 3 never
+alerts, an `append_errors` count marked reported never alerts, and a lost
+pairing it records is never announced. It also overwrites the live
+health.txt. Point `OPENMESSAGE_WATCHDOG_STATE` and `OPENMESSAGE_WATCHDOG_LOG`
+at a scratch directory and run a copy of the script:
 
 ```bash
 d=$(mktemp -d)
 cp ~/dotfiles/bin/openmessage-watchdog "$d/wd"   # edit "$d/wd" to try a change
 OPENMESSAGE_WATCHDOG_DRYRUN=1 OPENMESSAGE_WATCHDOG_STATE="$d" \
   OPENMESSAGE_WATCHDOG_LOG="$d/log" bash "$d/wd"
-cat "$d/log"
+cat "$d/log" "$d/health.txt"
 ```
+
+In a dry run, health.txt's `watchdog_detail` reads `would banner: …` where a
+real run would notify, and `DRYRUN: no relaunch, no banner` where it would
+relaunch.
 
 A dry run still obeys the real `watchdog-disabled` flag (its path is fixed)
 and probes the live daemon. To exercise the staleness checks against a crafted
@@ -912,16 +1368,24 @@ the counter.
 Two more overrides exist for tests. `OPENMESSAGE_WATCHDOG_APP` replaces the
 `/Applications/OpenMessage.app` existence check (the relaunch still opens the
 app by name). `OPENMESSAGE_WATCHDOG_NOW` (epoch seconds) pins the clock for
-the cooldowns, the relaunch throttle and the python block's `now_ms`, which
-the silence estimate now reads too (before dotfiles `b51582d` it read the wall
-clock). The estimate buckets its baseline by local day and hour, so a test
-that pins the clock should pin `TZ` too.
+the cooldowns, the relaunch throttle, the future-time check on state files,
+health.txt's `updated` and the outage and episode clocks, the disable flag's
+age (measured from the flag's real modification time, so set that with
+`touch -t` to match), and the python block's `now_ms`, which the silence
+estimate now reads too (before dotfiles `b51582d` it read the wall clock).
+Log line timestamps stay on the wall clock.
+The estimate buckets its baseline by local day and hour, so a test that pins
+the clock should pin `TZ` too.
 `~/dotfiles/tests/test_openmessage_watchdog.py` runs the real script against a
 fixture daemon, and the silence estimate against a temp v2 store, with all of
-this sandboxed and stub `osascript`/`open`/`pgrep`/`pkill` first on `PATH`:
+this sandboxed and stub `osascript`/`open`/`pgrep`/`pkill` first on `PATH`.
+`test_openmessage_watchdog_append_errors.py` and
+`test_openmessage_watchdog_pull_health.py` next to it cover those two alerts.
+The suites use Hypothesis, which the plain `pytest` on Max's Mac lacks, so run
+them through `uvx` (226 tests, about 7 minutes at `ffda554`):
 
 ```bash
-cd ~/dotfiles && PYTHONDONTWRITEBYTECODE=1 pytest -q -p no:cacheprovider tests/test_openmessage_watchdog.py
+cd ~/dotfiles && PYTHONDONTWRITEBYTECODE=1 uvx --with hypothesis pytest -q -p no:cacheprovider tests/test_openmessage_watchdog.py tests/test_openmessage_watchdog_append_errors.py tests/test_openmessage_watchdog_pull_health.py
 ```
 
 ### Reading the backend's os_log
@@ -957,23 +1421,33 @@ are the quarantined ones. No ready-made replay test exists.
 (re-pairing, a slow deploy, long debugging), park the launchd watchdog:
 
 ```bash
-touch "$HOME/Library/Application Support/OpenMessage/watchdog-disabled"
+echo "re-pairing Google" > "$HOME/Library/Application Support/OpenMessage/watchdog-disabled"
 ```
 
-While the flag exists, every run logs `skip: disable flag present` and exits:
-no probe, no relaunch, no watchdog alert. (The app's own silence notification
+While the flag exists, every run logs
+`skip: disable flag present (set Nh ago; reason: re-pairing Google)` and exits:
+no probe, no relaunch, no watchdog alert. The reason is the first non-blank
+line in the flag's first 512 bytes, with leading spaces dropped, cut to 120
+characters. Tabs, CRs and other control bytes become spaces, and so do
+non-ASCII bytes, since launchd runs the script without a `LANG`; keep the
+reason to one line of plain ASCII. An empty flag, as `touch` makes, logs only
+`(set Nh ago)`. N counts whole hours since the file was last modified, so
+touching or rewriting the flag restarts it. health.txt shows
+`watchdog=disabled` with the same age and reason, and `paused_since`.
+(The app's own silence notification
 and the chief-of-staff watcher don't read the flag.) Remove it when you're
 done, whatever the outcome. Nothing ages it out. A flag forgotten from
 2026-08-29 17:44 to 09-03 16:00 (1,278 consecutive skipped runs) silenced the
 6-hourly `all_quiet` alerts in the middle of a two-week outage: the v2 inbox
 has no frames from any platform between 08-20 18:55 and 09-03 16:03. If alerts
-seem to have stopped, `tail` the log first; a parked watchdog says so on every
-run. The watchdog also skips while an `openmessage pair` process is running,
-but only while it runs, so don't rely on it for multi-step procedures. The
+seem to have stopped, read health.txt or `tail` the log first; a parked
+watchdog says so on every run. The watchdog also skips while an
+`openmessage pair` process is running, but only while it runs, so don't rely
+on it for multi-step procedures. The
 quick deploy recipe below doesn't need parking if the app is back within a few
 minutes: with no app process, a relaunch takes two failed probes 5 minutes
-apart, and the watchdog skips while `/Applications/OpenMessage.app` is
-missing.
+apart (counting one that failed before a skip), and the watchdog skips while
+`/Applications/OpenMessage.app` is missing.
 
 ## Pairing & the "zombie session"
 
@@ -999,44 +1473,78 @@ Key facts:
 
 ### Re-pair recipe (the one that works)
 
-1. Park the launchd watchdog
+Last used 2026-10-16 to move the live install from a QR pairing to
+Google-account pairing (see
+[pulls that return nothing](#pulls-that-return-nothing-phone-switched-to-google-account-pairing)).
+
+1. **Have the user at the phone first.** `pair` shows the emoji seconds after
+   it starts, and the phone shows a Google Messages prompt to pick the
+   matching emoji. The app stays quit for the whole wait, so do not start
+   while the user is away. On 2026-10-16 an unattended attempt sat for over 10
+   minutes. `pair` now gives up after 5 minutes (`gaiaConfirmTimeout`) and
+   sends the phone a pairing cancel. A second Ctrl-C ends it at once; it
+   also returns on its own 30 s after any cancel (`gaiaCancelGrace`), because
+   libgm's long-poll connect wait ignores cancellation.
+2. Park the launchd watchdog
    ([parking it](#parking-the-launchd-watchdog)); the flag stops its
    relaunches and its alerts alike. Then
-   `osascript -e 'quit app "OpenMessage"'`.
-2. Force the native pairing screen by removing `session.json` from **both**
-   data dirs (back them up first):
-   `~/Library/Application Support/OpenMessage/session.json` **and**
-   `~/.local/share/openmessage/session.json` (else migration copies the old one
-   back). Other platforms' sessions (`whatsapp-session.db`, `signal-cli/`) are
-   independent — leave them.
-3. **Clear the stale session FIRST (don't skip).** Running `pair --google` while a dead `session.json` is still in the data dir floods the pairing with `failed to decrypt data event: HMAC mismatch` and yields a new session that 401s on token refresh **immediately** (dead on arrival). Removing both `session.json` files (step 2) before pairing is what produces a healthy session that connects *and* syncs (`/api/status` freshness `behind_days` drops to 0). Some HMAC-mismatch lines are normal noise (events from the phone's own session the pairing client can't read) — the tell for a bad pair is an immediate post-pair 401, not the noise itself.
-4. The embedded Google sign-in inside `PairingView` is **blocked by Google**
-   ("sign-in not allowed in this app") and dead-ends in Google's troubleshooter.
-   Use the **cookie method** instead — extract Google cookies from the user's
-   signed-in Chrome and run:
+   `osascript -e 'quit app "OpenMessage"'` and check that nothing listens on
+   port 7007.
+3. Pair with the cookies of the user's signed-in Chrome profile:
    ```
    OPENMESSAGES_DATA_DIR="$HOME/Library/Application Support/OpenMessage" \
-     openmessage pair --google-file <cookiefile>
+     openmessage pair --google-chrome            # or: --google-chrome "<profile dir>"
    ```
-   Decrypting Chrome cookies on macOS:
-   - key: `security find-generic-password -w -s "Chrome Safe Storage"`
-   - derive: PBKDF2-HMAC-SHA1(key, salt=`saltysalt`, iterations=1003, len=16)
-   - decrypt each `encrypted_value`: strip `v10` prefix, AES-128-CBC, IV = 16
-     spaces, strip PKCS7 padding; recent Chrome prepends a 32-byte domain hash —
-     try stripping the first 32 bytes if the result isn't clean UTF-8.
-   - source: `~/Library/Application Support/Google/Chrome/Default/Cookies`
-     (the signed-in profile; `Local State` maps profiles → accounts). Build a
-     `name=value; name=value; …` header from `.google.com` / `messages.google.com`
-     cookies and write it to a `0600` file.
-   - **Extract cookies immediately before pairing** — pairing with an older
-     extract has returned HTTP 401 (the staleness threshold is not
-     established; don't rely on any grace window).
-5. `pair --google` prints `EMOJI: <emoji>`. The user taps that emoji in Google
-   Messages **on the phone** (notification shade, or profile → Device pairing)
-   to confirm. The Gaia client init can time out once — just retry.
-6. On confirmation the session saves to the app dir; relaunch the app and sends
-   work. Wipe the cookie file afterwards. Whatever the outcome, remove the
-   launchd watchdog's `watchdog-disabled` flag.
+   - It reads the cookies right before pairing, with the same native reader
+     the self-heal uses (keychain → PBKDF2 → AES; see
+     [self-healing](#self-healing-as-of-74-requirements-fixed-2026-07-20--try-this-before-any-manual-cookie-surgery)).
+     It prints how many it read, never their values.
+   - The profile must be signed in to the Google account the phone's Google
+     Messages uses. Chrome's `Local State` maps each profile directory to its
+     account (`profile.info_cache.<dir>.user_name`). The phone's account is
+     the address inside the `GAIA_1` frame's field-11 container (see
+     [pulls that return nothing](#pulls-that-return-nothing-phone-switched-to-google-account-pairing)).
+     The default profile is `Default`, or `OPENMESSAGE_CHROME_PROFILE` if set.
+   - It refuses to pair while a backend that may hold this data dir's Google
+     session answers on the API port. That means `/api/status` names the
+     same `auth.data_dir` and does not report `google.paired`,
+     `google.connected` and `google.client_loaded` all false. Such a backend
+     rewrites `session.json` on token refresh and cookie rotation, so it would
+     overwrite the new pairing. Deleting `session.json` only flips `paired`:
+     a client that is still loaded writes the old session back. A backend
+     with no Google client is no conflict: a first pairing in Docker, or the
+     macOS app after `/api/unpair`. It waits up to 15 s of wall time for one that is stopping;
+     each probe's timeout is capped at the time left.
+   - Before asking the phone anything, it copies an existing `session.json`
+     to `session.json.bak-<time>`, and it stops if that copy fails, so a
+     confirmed pairing is never lost to a failed backup. To roll back, quit
+     the app and move that file back.
+   - `pair` builds a fresh session and never reads the old `session.json`,
+     so there is no need to delete it first. (Older notes here said a stale
+     `session.json` made new pairings dead on arrival. The cause was never
+     established; a backend still running on the old session fits, and the
+     guard above now refuses that.)
+   - `--google-chrome` is macOS-only (it reads the keychain). A bare
+     profile name such as `"Profile 1"` resolves beside the default profile.
+   - Builds without `--google-chrome`: `pair --google-file <cookiefile>`,
+     where the file holds a `name=value; …` cookie header. Decrypt the Chrome
+     cookies the way `internal/googlecookies` does, or with
+     `scripts/refresh-google-session-cookies-macos.py`. Extract them right
+     before pairing: an older extract has returned HTTP 401.
+4. `pair` prints `EMOJI: <emoji>`. The user taps the matching emoji in the
+   Google Messages prompt on the phone. The Gaia client init can time out
+   once; just retry.
+5. On `Pairing successful!`, relaunch the app (`open -a
+   /Applications/OpenMessage.app`) and remove the watchdog's
+   `watchdog-disabled` flag. Remove the flag whatever the outcome.
+6. Verify: `/api/status` → `google.connected`, then `google.pull_health`
+   with `last_outcome: "ok"` and no `account_switch`. Check `v2_ingest` for
+   `quarantined: 0`. Then have the user send one real message and check that
+   it shows `OUTGOING_DELIVERED`.
+
+The macOS app's own pairing screen cannot do this: its embedded Google
+sign-in is blocked by Google ("sign-in not allowed in this app"). It takes a
+pasted cookie header or cURL command instead (`pair --google-stdin`).
 
 ### Self-healing (as of #74; requirements fixed 2026-07-20) — try this before any manual cookie surgery
 
@@ -1128,32 +1636,104 @@ curl -s http://127.0.0.1:7007/api/status | jq '.google.repairs_paced'
 The counter records exactly one thing: **how many repair requests were delayed
 by the floor**. A climbing count proves requests arrived faster than the
 configured interval — it does not identify why (could be fast revocation, a
-crash/reconnect loop, or repeated manual reconnects). It cannot clear the
-session healthy either: a single failed repair parks the supervisor in Blocked
-with the counter still at 0. For context, observed expiries on fixed builds
+crash/reconnect loop, or repeated manual Reconnect presses while a repair
+waits). Retries of a *failed* repair never count: the supervisor waits at
+least the same interval before retrying (`Policy.RepairRetryFloor`), so they
+never reach the gate early. For context, observed expiries on fixed builds
 were ~0-2/day (one account).
 
-To see *why* a repair failed: the refresh error is currently **returned but
-never logged** — the native path emits no log line, and the supervisor
-discards the error detail (`handleRepairResult` sets Blocked without logging
-it) — so the only way to observe it today is to reproduce it directly: run
-`scripts/refresh-google-session-cookies-macos.py` manually and read its error
-output. (A fix to log the repair failure is chipped.)
+**A failed repair is retried, not parked (as of the 2026-10-22 fix).** Before
+it, one failed cookie refresh parked the supervisor in Blocked with no log
+line and nothing to retry it; on 2026-10-22 19:26 that kept SMS dead until a
+manual cookie refresh and restart. Now:
+
+- A refresh error (Chrome cookie DB copy, keychain, missing cookies, the
+  session write, the 20 s timeout) is retried with backoff: at least
+  `OPENMESSAGE_REPAIR_MIN_INTERVAL` (90 s), then full jitter over a window that
+  doubles per consecutive failure, up to 5 min. No generation starts until a
+  refresh succeeds. The first two failures stay quiet; from the third in a
+  row (`repair_failing: true`, about 3–4.5 minutes after the expiry when each
+  refresh fails fast, up to a minute more when each runs into the 20 s refresh
+  timeout) status also raises
+  `needs_repair`, so the watchdog and the app's health notification fire,
+  while the retries go on. A refresh that keeps failing is usually Chrome
+  (signed out of the account, keychain access refused), never a re-pair; once
+  Chrome is fixed the next retry heals it with no Reconnect.
+- It parks only for a terminal error: no refresh mechanism at all
+  (`google_cookie_refresh_unavailable`, the one case that asks for a re-pair),
+  or a terminal class from the lifecycle (Gaia logout, unusable session). It
+  also parks after five consecutive expiries in one episode, the first plus
+  four repairs whose fresh cookies Google rejected too
+  (`block_reason: repeated_failure` with `error_class: credentials_expired`):
+  check that Chrome is signed in to the account, then press Reconnect; re-pair
+  only if that fails too. The count resets whenever a generation shows any
+  activity, so a generation that gets a long-poll event before each 401
+  (`ListenRecovered`, then a set-active 401) repairs again every pacing
+  interval instead of tripping the circuit; `repairs_paced` climbing is the
+  signal for that loop.
+- A libgm ping or set-active-session rejected with HTTP 401 now goes to
+  repair at once. Before, it took three failed pings (~2-3 min) and a
+  transient reconnect to learn the same thing from the new long poll
+  (observed 2026-10-22 21:01→21:03).
+- Pressing Reconnect while a failed repair waits retries it now
+  (`RetryCredentialRepairNow`); the pacing gate still applies.
+
+Every repair attempt and result is logged, with the error:
+
+```
+INF Google credential repair: refreshing session cookies   attempt=N trigger=google_auth_expired
+INF Refreshed Google session cookies from Chrome            cookies=60 changed=10
+INF Google credential repair succeeded; reconnecting        attempt=N took=…
+WRN Google credential repair failed; will retry             attempt=N error="…" retry_in=…
+ERR Google credential repair failed and cannot be retried automatically; …
+ERR Google Messages supervisor parked; it will not retry until Reconnect   block_reason=…
+```
+
+`changed=0` means Chrome holds the very cookies Google just rejected, so the
+reconnect will likely 401 again. The supervisor's own view is in
+`/api/status`:
+
+```bash
+curl -s http://127.0.0.1:7007/api/status | jq '.google | {connected, auth_expired, reconnecting, needs_repair, supervisor}'
+```
+
+`supervisor.state` is the lifecycle state (`online`, `connecting`, `backoff`,
+`repairing_credentials`, `blocked`, …), `supervisor.block_reason` says why it
+parked, `supervisor.retry_at_ms` is when the next attempt is due, and
+`supervisor.repair` holds the episode's `attempts` and the newest attempt's
+`last_started_ms`, `last_finished_ms`, `last_outcome` (`running`,
+`succeeded`, `failed_retrying`, `failed_blocked`) and `last_error`. The last
+repair's fields stay after the account heals, so the cause of the previous
+episode is still readable.
+
+What the flags mean now: `auth_expired` + `reconnecting` is a cookie refresh
+in progress or waiting to retry; it needs nothing from anyone. `needs_repair`
+is set only when a person must act: the supervisor parked
+(`supervisor.state == "blocked"`), the refresh has failed three times in a row
+(`repair_failing`, still retrying, fix Chrome), or sends keep failing while
+connected (the zombie). `supervisor.repair.consecutive_failures` counts the
+failed refreshes since the last success. The web banner, the macOS menu bar alert and the settings status
+follow the same split: "Reconnecting… No re-pair needed" while recovering, and
+the parked reason (with Re-pair only when the session is the problem) once it
+stops.
 
 An `auth_expired` session with its device link intact revives by cookie
-rewrite alone — **do not re-pair** for `needs_repair`; that resets nothing the
-refresh can't fix and risks pairing throttles. So the **first** thing to try
-when SMS is dead is nothing — wait ~2-3 min for the watchdog (the one observed
-live heal took 2m20s; under-waiting funnels you into the re-pair this section
-warns against). If it hasn't recovered, **read the actual repair and reconnect
-errors before deciding to re-pair** — the causes are broader than "the cookies
-are gone": Chrome/keychain/profile access, missing or undecryptable cookies, a
-session-file write failure, network or server rejection, or a genuinely revoked
-device link. Re-check the running binary (above) and whether Chrome still holds
-the five `.google.com` account cookies first; only once those are ruled out
-fall back to the manual re-pair recipe above. The app also posts a **health notification**
-(once, on the rising edge) when Google flips to `needs_repair` or WhatsApp
-logs out, so a dead platform can't sit silent for days.
+rewrite alone — **do not re-pair** while `reconnecting` is true; that resets
+nothing the refresh can't fix and risks pairing throttles. So the **first**
+thing to try when SMS is dead is nothing — wait ~2-3 min (the one observed
+live heal took 2m20s; the 2026-10-22 21:03 heal took 180 ms after the 401
+reached the supervisor). If it hasn't recovered, **read the repair errors
+before deciding to re-pair** (`supervisor.repair.last_error` and the log lines
+above) — the causes are broader than "the cookies are gone": Chrome/keychain/
+profile access, missing or undecryptable cookies, a session-file write
+failure, network or server rejection, or a genuinely revoked device link.
+Re-check the running binary (above) and whether Chrome still holds the five
+`.google.com` account cookies first; only once those are ruled out fall back to
+the manual re-pair recipe above. To reproduce a refresh by hand, run
+`scripts/refresh-google-session-cookies-macos.py` with the app quit. The app
+also posts a **health notification** (once, on the rising edge) when Google
+flips to `needs_repair` or WhatsApp logs out, so a dead platform can't sit
+silent for days.
 
 Prereq: the app must be **non-sandboxed** (it is — `OpenMessage.entitlements`
 is hardened-runtime only) so the backend can read Chrome's cookie DB and the
@@ -1169,10 +1749,10 @@ Without it, a single transient network blip during a scheduled token refresh
 permanently killed the session.
 
 The replacement in `go.mod` pins fork commit
-[`100192cb3078`](https://github.com/MaxGhenis/gmessages/commit/100192cb3078739f7ed925730f7248eb18b6c340).
+[`6495a585293d`](https://github.com/MaxGhenis/gmessages/commit/6495a585293d59a48984c50d63c8c4c11b425877).
 It is upstream `mautrix/gmessages` base
 [`3433cc07d5ea`](https://github.com/mautrix/gmessages/commit/3433cc07d5ea9522309adad3a8c92ed5b08dc11d),
-which contains the auth-refresh retry, plus two carried patches, oldest first:
+which contains the auth-refresh retry, plus three carried patches, oldest first:
 
 1. `Add ListConversationsWithCursor for paginated conversation listing`. That
    method is required by OpenMessage's backfill and reconciliation paths.
@@ -1184,16 +1764,33 @@ which contains the auth-refresh retry, plus two carried patches, oldest first:
    `libgm.ErrNoResponsePayload` instead of returning an empty success. A bare
    header answering a listing is still an empty result. See "Pulls that
    return nothing" below. Upstream still has the old behaviour.
+3. `libgm: fail phone requests after a hard timeout and on disconnect`
+   ([MaxGhenis/gmessages#1](https://github.com/MaxGhenis/gmessages/pull/1)).
+   A request the phone doesn't answer within its request timeout
+   (`DefaultRequestTimeout`, 60 s; OpenMessage sets 35 s with
+   `Client.SetRequestTimeout`) fails with `libgm.ErrPhoneNotResponding`; a
+   late answer is logged (`Received response with no pending request`) and
+   dropped.
+   `Client.Disconnect` fails every waiting request with
+   `libgm.ErrConnectionClosed`. See "Requests the phone never answers"
+   above. Upstream made the same change in
+   [`c0a2d38`](https://github.com/mautrix/gmessages/commit/c0a2d38a24dc187e135aad60cc35a4f840954905)
+   with the same sentinel names and default. Its version also adds a
+   `context.Context` parameter to every public method. A rebase past
+   `c0a2d38` drops this patch for upstream's and moves OpenMessage's call
+   sites to the context API.
 
 **Keep the fork rebased on upstream.** The weekly
 `gmessages-fork-drift.yml` workflow records the base and patch set (count and
 subjects) and fails as soon as upstream `main` advances. When rebasing, replay
-both carried patches, verify the auth-refresh retry is still present, and
+the carried patches, verify the auth-refresh retry is still present, and
 update the fork pin, `EXPECTED_PATCHES`, and recorded SHAs together. The pinned
-commit must be on the fork's `main`. `TestGMessagesForkRejectsPayloadlessResponses`
-runs the pinned fork's own response-acceptance tests, so it fails if a rebase
-drops the second patch or keeps its exported names without the rejection. The
-durable architectural fix (move SMS/RCS onto an Android companion) is issue #75.
+commit must be on the fork's `main`. Two tests run the pinned fork's own tests
+by name and require each to pass: `TestGMessagesForkRejectsPayloadlessResponses`
+(second patch) and `TestGMessagesForkTimesOutUnansweredRequests` (third
+patch). Each fails if a rebase drops its patch, or keeps the exported names
+without the behaviour. The durable architectural fix (move SMS/RCS onto an
+Android companion) is issue #75.
 
 ### Pulls that return nothing (phone switched to Google-account pairing)
 
@@ -1251,18 +1848,19 @@ curl -s http://127.0.0.1:7007/api/status | jq '.google.pull_health'
 
 **Fix:** not a reconnect, a restart, or a cookie refresh: none of them
 changes the phone's pairing mode (two app restarts on 10/8 changed nothing).
-Two remedies follow from the mechanism and from upstream mautrix-gmessages,
-whose (commented-out) alert for this state reads "Switched to Google account
-pairing, please switch back or relogin with `login-google`"
-(`pkg/connector/handlegmessages.go`). Neither has been tried on this install
-yet:
+Upstream mautrix-gmessages' (commented-out) alert for this state reads
+"Switched to google account pairing, please switch back or relogin with
+`login-google`" (`pkg/connector/handlegmessages.go`). The two remedies:
 
-1. Re-link OpenMessage with Google-account pairing (cookie method, re-pair
-   recipe above).
-2. Switch the phone back to QR/device pairing in Google Messages' device
-   pairing settings.
-
-Both are the user's call.
+1. Re-link OpenMessage with Google-account pairing
+   ([re-pair recipe](#re-pair-recipe-the-one-that-works),
+   `pair --google-chrome`). **Applied on the live install 2026-10-16**:
+   the first pull after relaunch returned 100 conversations with
+   `last_outcome: ok`, the account switch was gone, and a real send was
+   delivered.
+2. Switch the phone back to QR/device pairing. Not tried: decision d1104
+   records that Google's help page says QR pairing for web is no longer
+   offered in the US, so the option may not exist.
 
 ### Don't over-reconnect
 
@@ -1308,6 +1906,156 @@ Hard-won facts from the 2026-07-03/04 re-pair ordeal:
   workspace-mode build (including `macos/build.sh`). If a dependency bump
   mysteriously doesn't take, check `go.work`.
 
+## WhatsApp messages that arrive while a generation is torn down
+
+A lifecycle generation ends on a dropped socket, a keepalive or send failure,
+a supervisor Stop or a logout. whatsmeow may be inside a node handler at that
+moment (decrypting a message, storing an app-state patch). Before PR #236 that
+could lose data in two ways:
+
+- **Messages.** The adapter cancelled the context whatsmeow runs node handlers
+  with, and modernc.org/sqlite interrupts a statement whose context ends. A
+  prekey message could store its advanced Signal session and then fail on the
+  prekey removal. A plain message's session write could commit and still be
+  reported as cancelled (the driver checks the context after the statement
+  finishes). A message decrypted after the generation stopped observing
+  ingress was dropped from v2, while whatsmeow still counted it handled. In
+  each case the server's redelivery was decrypted against the advanced
+  session. That fails with `received message with old counter`, which
+  whatsmeow ignores and then acknowledges, so the message was gone for good.
+- **App state.** whatsmeow stores a patch's new collection version before its
+  value MACs, in separate statements. A cancel between them left the version
+  advanced without the MACs. The patch's changes (contact names, which
+  OpenMessage reads from whatsmeow's contact store) were never applied, and
+  every later patch touching the same entries failed with
+  `failed to verify patch vN: mismatching LTHash`.
+
+How it works now:
+
+- whatsmeow decrypts each message and stores its plaintext in
+  `whatsmeow_event_buffer` (in `whatsapp-session.db`) in one transaction
+  (`EnableDecryptedEventBuffer`). The session store opens with
+  `_txlock=immediate`, so that transaction waits for SQLite's write lock
+  instead of failing with `SQLITE_BUSY` when another connection is writing.
+- On an install with v2 ingest (a v2 sink behind the supervisor), the bridge
+  reports a message handled only once its v2 ingress frame is committed. A
+  message that finds no observing generation, a closed admission, a stale
+  generation or an append error is reported not handled, with the log line
+  `WhatsApp message not committed to ingress; leaving it for redelivery`.
+  whatsmeow then keeps the plaintext and sends no delivery receipt. When the
+  server redelivers the stanza (it does so for an unacknowledged message on a
+  later connection; whatsmeow's event buffer is built on that, and the tests
+  simulate it rather than exercise the real server), whatsmeow re-dispatches
+  the buffered plaintext and the v2 inbox dedupes it by key. An append error
+  leaves the message out of v2 until the next connection.
+- The legacy store takes a message on its first delivery whether or not v2
+  committed it, as before. When the redelivery of a frame legacy already took
+  without a v2 commit arrives, the legacy write is skipped, so an edit, revoke
+  or receipt status applied to the row in between is not undone. The bridge
+  remembers those frames in memory, so after a restart a redelivery writes
+  legacy again.
+- On a legacy-only install (the default: no v2 sink), the supervisor's
+  generation sink reports `DurableIngress() == false`, every message is
+  reported handled, and whatsmeow acknowledges it as before.
+- The context `ConnectPaired` hands whatsmeow is cancelled by the generation
+  only while it dials and handshakes. After that, teardown closes the socket,
+  which ends the handler loop, and a handler that is already running finishes
+  its writes.
+- Rows in `whatsmeow_event_buffer` whose `plaintext` is not NULL are messages
+  decrypted but not yet handled. whatsmeow deletes rows older than 14 days
+  (its comment says the server buffers events for that long).
+
+Reading old logs: `received message with old counter` right after a
+reconnect, with no matching message in v2, is a message the old teardown
+path lost. A collection stuck on `mismatching LTHash` stays stuck until
+whatsmeow does a full resync of it, and OpenMessage does not trigger one yet.
+
+Tests: `internal/whatsapplive/handler_teardown_test.go` sends real Signal
+ciphertext from a second Signal store through whatsmeow's real handler, the
+bridge, the adapter and the supervisor. It retires the generation before
+every session-store call for prekey, ordinary and group messages, with
+the handler context both detached and cancelled, on v2-ingest and
+legacy-only installs. It also covers an
+app-state patch interrupted between its version and MAC writes.
+
+## WhatsApp LIDs stored as phone numbers
+
+A WhatsApp LID (`<digits>@lid`) has an all-digit user part, like a phone
+number (`<digits>@s.whatsapp.net`), so its digits alone never say which it
+is. Until this fix both `jidToPhone` helpers turned any all-digit user into
+`+<digits>`: the legacy bridge stored a LID whose number `canonicalJID` did not
+know that way, and the WhatsApp Desktop importer every LID sender. Migration
+then minted an `e164` identity for the LID's digits. In v2 such a sender shows
+a phone number that is no one's, matches phone searches, and a reaction or read
+receipt to their group message names `<lid digits>@s.whatsapp.net`. The same
+check passed new-style group JIDs (`120363…@g.us`) and newsletters for phone
+numbers, so a legacy group with no subject was named `+120363…`, and a
+newsletter's posts named it as their sender by that number.
+
+What each path stores now:
+
+- **v2 live ingest** (unchanged): the phone number when whatsmeow knows the
+  LID's number, else `<digits>@lid` (`ingest.whatsAppIdentity`).
+- **Legacy bridge**: the same value (`whatsapplive.StoredAddress`), so a
+  migrated row names the identity a live frame does: the phone number, else
+  the sender's JID (a LID, a hosted or bot JID, a newsletter), and nothing for
+  a group or broadcast list. A chat with no name yet is named by its JID,
+  which a real name replaces when one arrives. `phoneForJID` no longer falls
+  back to a contact's `RedactedPhone` (the masked `+1 ••• ••21` a LID group
+  shows a non-contact by): once a LID gets no number from `jidToPhone`, that
+  fallback would store the mask's digits as one. It stays a display name.
+- **Desktop importer**: the number Desktop pairs the LID with (the chat's or
+  member's `ZCONTACTIDENTIFIER` when it is a phone-number JID or `+<digits>`,
+  or `LID.sqlite`), else `<digits>@lid`.
+
+**Repairing existing v2 identities** (the dry run may run beside the app;
+`--apply` needs the daemon down, takes the instance lock, refuses while
+`/api/status` answers, and copies `v2/store.sqlite3*` to
+`v2/repair-backups/<stamp>/` first; park the watchdog before applying):
+
+```bash
+OPENMESSAGES_DATA_DIR="$HOME/Library/Application Support/OpenMessage" \
+  openmessage repair whatsapp-lid --report lid-repair.json   # dry run
+# review, then add --apply
+```
+
+The repair rewrites an `e164` identity of the WhatsApp account only when a
+record that keeps the JID's server names its digits as a LID and no record
+names them as a phone number. It reads, read-only: the whatsmeow session store
+(`whatsapp-session.db`: `whatsmeow_lid_map`, the device row, contacts),
+WhatsApp Desktop (`ChatStorage.sqlite` chats, members and senders, and
+`LID.sqlite`; `--desktop-db ''` skips it), and the v2 store itself (the
+account's `<digits>@lid` identities and chats, its own number, and every
+number on another platform's account). Each source's line in the report says
+whether it was read, missing or failed; a source that fails only means less
+evidence, so fewer identities change. Digit length is never evidence. A LID
+becomes the form v2 ingest gives a LID: its phone number when the records pair
+it with exactly one (and nothing names that number a LID), otherwise
+`<digits>@lid`. The repair can know a number live ingest does not yet:
+`canonicalJID` asks only whatsmeow and the session store's LID map, not
+Desktop. Until whatsmeow learns that pair, a new live message from the LID
+names it `<digits>@lid`, a second identity beside the number; any LID whose
+number becomes known after its first message gets the same split today.
+When that identity exists the two merge: messages,
+roster rows, reactions (the newer per person and message) and the person link
+move, and display names that only repeat the LID's digits are cleared. It
+refuses, and reports, an identity also named as a phone number
+(`also-a-phone-number`), this account's own (`own-identity`), one whose LID
+pairs with this account's own number (`target-is-own-identity`), and one whose
+target links to a different person (`target-links-another-person`). Running it
+again plans nothing new. It changes only the v2 store; the legacy
+`messages.db` keeps its old rows. It rewrites only LIDs: a group's or
+newsletter's digits stored as `+<digits>` before the fix (a group title, a
+newsletter's sender) stay as they are, since no record names those digits a
+LID.
+
+Read receipts parse their stored sender the way reactions do
+(`whatsapplive.MarkReadRequest`; see "WhatsApp read-receipt senders" below).
+So after the repair a group receipt names a sender the repair left as
+`<digits>@lid` by that LID, and one it rewrote to a phone number the way any
+stored number is named. No production path queues a v2 read receipt yet:
+nothing outside tests calls `messaging.MessageService.MarkRead`.
+
 ## signal-cli
 
 Require **signal-cli ≥ 0.14.5**. 0.14.1 throws
@@ -1316,6 +2064,35 @@ envelopes, exits non-zero, never ACKs, and re-hits the same poison message every
 poll — a crash loop that flaps the Signal `connected` flag every few seconds and
 makes the whole UI flicker. `brew upgrade signal-cli` fixes it. (PR #41 also
 hardened the UI to ignore redundant status pushes.)
+
+### Re-linking Signal (QR)
+
+- **Each QR lives about 90 seconds** (observed 2026-10-21: `signal-cli
+  --verbose link` logged `[ProvisioningSocket] … onClosing … reason: Timeout`
+  90 s after start), and signal-cli then prints "Link request timed out,
+  please try again." Have the phone on Settings → Linked devices → Link new
+  device *before* the QR appears. Observed the same day: a phone that scanned
+  an expired QR reported a network error. Per Signal Android's
+  `LinkDeviceViewModel`, a phone whose link message is accepted but whose new
+  device never appears waits 30 s, then closes the dialog without an error.
+- **A fresh link prints a stderr line before its JSON.** Until the account's
+  first receive, signal-cli's `last-receive-timestamp` is 0 and every command
+  that loads the account logs `INFO AccountHelper - The Signal protocol expects that incoming
+  messages are regularly received.`; after 7 days without a receive it logs a
+  `WARN … Messages have been last received N days ago` instead
+  (`AccountHelper.checkAccountState`). The account probe reads CombinedOutput,
+  so before the line-wise decode it parsed neither buffer: the post-link probe
+  found no account, the link "failed" right after a good scan, and the status
+  showed `last_error: "Associated with: +1…"` with `paired: true,
+  connected: false`. On a build without that fix, unblock a fresh link by
+  setting the timestamp, with no signal-cli running on that config dir:
+  `sqlite3 <datadir>/signal-cli/data/<path>.d/account.db "INSERT INTO key_value
+  (key, value) VALUES ('last-receive-timestamp', <now ms>) ON CONFLICT(key) DO
+  UPDATE SET value=excluded.value;"`, then `POST /api/signal/connect`.
+- **Restore media after a re-link.** Unpair removes the whole `signal-cli/`
+  dir. Clone the backup's `attachments/ avatars/ stickers/
+  outgoing-attachments/` back with `cp -R -n -c -p` (APFS clones; no
+  overwrite of what the new link wrote), never `data/`.
 
 ### Signal `needs_reauth` — read the fingerprint before believing the park
 
@@ -1390,6 +2167,603 @@ up the whole `signal-cli/` dir first and restore the media subdirs
 after the new link (recipe proven 2026-07-20; backups live under
 `<datadir>/app-backups/`).
 
+### Receive calls that are still downloading an attachment
+
+Each `signal-cli receive` call is bounded at 5 s (`receiveCallDeadline`), then
+gets SIGTERM. What happens next decides whether a message survives
+(signal-cli 0.14.9 and libsignal 0.103 source, read 2026-10-21):
+
+- signal-cli **caches and acks** each envelope before handling it, downloads
+  its attachments **while handling it**, and prints it only after that.
+- SIGTERM is graceful: `receive` installs signal-cli's `Shutdown` handler,
+  which stops reading from the server and waits for the envelope in hand to
+  finish. The native build does this too (observed: `[SIGTERM handler] INFO
+  Shutdown - Received SIGTERM signal, shutting down ...`, exit 0).
+- **A SIGKILL between the decrypt and the print loses that message
+  silently.** The next `receive` retries the cached copy first, but the
+  decrypt already advanced the session, so libsignal reports a duplicate and
+  signal-cli deletes the entry without printing it. It sends no delivery
+  receipt and makes no resend request. It is not a wedge, because later
+  messages flow normally.
+- Downloads are what make that window long. The CDN client allows 30 s
+  **per read** with no overall deadline, so a large video on a slow link takes
+  minutes. Ciphertext grows in `signal-cli_tmp_*.tmp` in `java.io.tmpdir`. The
+  plaintext is stored through `attachments/<name>.<random>.tmp`, which exists
+  but stays empty for the whole download.
+
+Before #259 every call got a fixed 3 s between SIGTERM and SIGKILL, so a
+download still running about 8 s into a receive call lost its message. Now
+a receive call stopped by **its deadline** is *drained*
+(`internal/signallive/receive_drain.go`):
+
+- It keeps running while a download in it grows. The drain watches the
+  call's run dir and fresh `attachments/*.tmp` every 250 ms.
+- It is killed 3 s after no download is in flight (the old grace), 45 s
+  after its downloads stop growing (longer than the CDN's 30 s read timeout,
+  so a stalled download fails inside signal-cli, which still prints the
+  message; #258 then marks the attachment unavailable), or 10 min after the
+  SIGTERM, whichever comes first.
+- A stop by the **caller** (bridge Close, Unpair, a new generation) still
+  gets only 3 s. Those stops wait for the receive loop.
+- The drain beats the poller every 5 s while bytes arrive. Without the beat,
+  the supervisor's liveness probe (2 min, then a 30 s probe) would retire the
+  generation, and that would kill the download.
+- **Sends during a drain fail at once as not dispatched.** The dispatcher
+  then retries them about every 5 s. The dispatcher sends every platform's
+  messages one at a time, so blocking would stall WhatsApp and Google too.
+  Otherwise a send waits up to 10 s for the command gate, and its 20 s
+  timeout starts only once it holds the gate. A quoted reply to an author
+  the contact cache lacks can first wait for a contact refresh too, about
+  50 s in the worst case, still under the dispatcher's 60 s text limit. Before this change the wait
+  counted against that timeout, so a send whose timeout ran out before
+  signal-cli started could be marked uncertain.
+  Attachment fetches (`getAttachment`), and the contact refresh a send runs
+  to name a quoted or reacted-to author it doesn't know, give up the same
+  way; the author then goes to signal-cli as an ACI. A send already waiting
+  when a drain begins gives up then. The legacy paths (web API on a
+  legacy-primary install, scheduled messages) get the same error; a
+  scheduled message goes back to pending **without** spending one of its 5
+  attempts (`signallive.IsReceiveDrainingError`).
+
+Log lines (backend os_log):
+
+- `Holding a stopped Signal receive call open while it finishes an attachment download`
+- `Stopped Signal receive call exited after finishing its attachment download`
+- `Killed a Signal receive call with an attachment download in flight; ... that message is lost`
+  means the stall window or the 10 min limit was hit.
+- `Killed a Signal receive call that had not exited after SIGTERM` means
+  signal-cli was busy with something other than a download. That may have
+  been an envelope (now lost) or only post-print work such as receipts.
+
+Losses still possible: a caller stop during a download; non-download
+handling that takes more than 3 s after the SIGTERM (for example a slow
+group-state fetch); and the signal-cli races where a SIGTERM's stop request
+is lost or its interrupt fails an in-flight download. The last one keeps the
+message and loses only the attachment.
+
+**The native signal-cli and temp dirs.** Homebrew's `signal-cli` is a
+GraalVM native image (`file $(which signal-cli)` reports Mach-O). It ignores
+both `TMPDIR` and `SIGNAL_CLI_OPTS`, and takes `java.io.tmpdir` from
+`getconf DARWIN_USER_TEMP_DIR`. The bridge therefore passes
+`-Djava.io.tmpdir=<run dir>` as the first argument to a native binary
+(Mach-O or ELF), once a `-Djava.io.tmpdir=… --version` run of that build has
+succeeded. A JVM install keeps getting it through `SIGNAL_CLI_OPTS`, as
+before. A wrapper *script* around the native binary gets neither, so its
+ciphertext lands outside the run dir and the drain sees only the empty
+`attachments/*.tmp`. A wrapper that ends in `exec signal-cli "$@"` is then held
+for the 45 s stall window at most. One that doesn't `exec` dies on SIGTERM and
+leaves signal-cli running as an orphan, and the call holds the command gate
+until that orphan exits (10 min backstop), so point `OPENMESSAGES_SIGNAL_CLI`
+only at the binary or an `exec` wrapper. Builds before #259 had each
+call extract libsignal (29 MB) into the Darwin temp dir, and a killed call
+left it there as `libsignal<digits>/`. The periodic sweep looks only in the
+daemon's own temp dir, which is `/tmp`: the app starts the backend with an
+environment that has no `TMPDIR` (`BackendLauncherCore.swift`). So those
+leftovers stay until removed by hand: `find "$(getconf DARWIN_USER_TEMP_DIR)" -maxdepth 1 -name
+'libsignal*' -mtime +1`, with no signal-cli running. A killed call's empty
+`attachments/<name>.<digits>.tmp` is swept after 30 min; a stored attachment
+whose sender named it `.tmp` (`<id>.tmp`) is not.
+
+### Signal quote-replies on v2-primary
+
+Signal quotes a message by its author and sent timestamp, passed to signal-cli
+as `--quote-timestamp/--quote-author/--quote-message`. The outbox stores only
+the quoted message's v2 remote ID, which for an incoming message is a SHA-1
+(`v2keys.SignalIncomingSourceID`), not a timestamp. So the dispatcher
+(`messaging.replyRefForLease`) loads the quoted v2 message and puts its author,
+`occurred_at_ms`, body and first attachment on the request's
+`bridge.MessageRef`, and `signallive.QuoteArgs` builds the quote from those.
+No legacy row is needed. Before this, the Signal transport looked the quote up
+in the legacy `messages.db` only (the retained receive handler still writes
+it on v2-primary), and on v2-primary that lookup cannot find:
+
+- any send this account made through the v2 outbox. The legacy projector runs
+  only on legacy-primary, and the adapter expects no echo of its own sends;
+- messages this account sent from the phone after cutover. Legacy keeps them
+  as `signal:local:<sha1>`, v2 as the bare timestamp;
+- incoming messages whose sender the legacy handler resolved differently from
+  the capture-time contact cache (it refreshes contacts on a miss, capture
+  does not), which puts them under different IDs.
+
+Rules worth knowing when a quote looks wrong:
+
+- The timestamp is `occurred_at_ms`. The decoder sets it to the Signal sent
+  timestamp, and so does the migration, except for a text sent from the legacy
+  desktop path: that row kept its completion time and a `local:<sha1>` ID, so a
+  quote of it carries the completion time (a limitation the legacy store
+  already had). The other exception is a message this account wrote whose
+  remote ID is a decimal timestamp. A send through the outbox keeps its
+  *submit* time as `occurred_at_ms`, and confirming it sets the remote ID to the
+  timestamp signal-cli reported, so that ID wins.
+- A reply submitted while its quoted send was still pending stored the quoted
+  message's transport request ID. The dispatcher follows the outbox row from
+  that ID to the message's current remote ID.
+- A quoted message v2 does not hold, or an outgoing one still awaiting its
+  transport ID, gets a bare ref, and the transport falls back to the legacy
+  lookup. A delivery that fails with `signal reply target not found` is that
+  case. Check the quoted message's own outbox row
+  (`GET /api/v1/outbox/<outbox_id>`).
+- On legacy-primary with `OPENMESSAGES_V2_SEND=1`, the mirror keys a reply
+  target by its legacy ID (`signal:<ts>`) and records no sender or attachment.
+  Such an ID still quotes from its legacy row when that row exists. If the
+  legacy lookup itself fails, the send fails before signal-cli runs rather
+  than quoting the mirror's sender-less copy.
+
+### Signal reactions through the v2 outbox
+
+Signal names the message a reaction targets by its author and sent timestamp
+(`signal-cli sendReaction -a <author> -t <timestamp>`), never by an ID
+OpenMessage stores. The dispatcher (`messaging.targetRefForLease`) puts the
+target's sender, direction (`Outgoing`) and `occurred_at_ms` on the request's
+`bridge.MessageRef`, and `signallive.ReactionTargetArgs` sends a reaction only
+when the store vouches for both halves of that name:
+
+- **An incoming message** is named by its stored sender and `occurred_at_ms`,
+  and only when its remote ID is a SHA-1 (40 hex digits,
+  `v2keys.SignalIncomingSourceID`). That is the ID a Signal receiver gives a
+  message it keyed by sender and sent timestamp, and each writer that uses it
+  stores that timestamp as the occurred time: the v2 decoder, the legacy
+  receiver, and a Signal Desktop import of a row that has a sent time. The ID
+  itself is not sent.
+- **A message this account sent** is named by this account and its remote ID,
+  and only when that ID is a decimal timestamp. That is how a send Signal
+  accepted is stored when its timestamp was kept: an outbox confirm sets the ID
+  to the timestamp signal-cli reported, a sync message from the phone arrives
+  under its own, and the legacy `SendMedia` and legacy-primary projector keyed
+  their rows by signal-cli's. Its `occurred_at_ms` is not used. This is stricter than the
+  quote rule above, because a quote carries the quoted text with it and a
+  reaction carries nothing but the name.
+
+Anything else stops before signal-cli runs. The row goes `not_dispatched`
+(`error_class: transient`, `error_code: send_reaction` on
+`GET /api/v1/outbox/<id>`) and retries every 5 s with no cap. The reason is in
+the `error_detail` column of the `outbox` table in the v2 store:
+
+- `signal reaction target timestamp is unavailable`, for this account's own
+  message: its remote ID is not a Signal timestamp.
+  - *Still on its outbox request ID.* A send that has not gone out (`queued`,
+    `dispatching`, `not_dispatched`) never gets this far: the dispatcher holds
+    the reaction before the adapter (`error_code: reaction_target_unsent`, see
+    "Reactions stuck retrying" below), and it goes out once the send is
+    confirmed under its timestamp. A canceled or rejected send never gets
+    this far either: the dispatcher rejects the reaction
+    (`reaction_target_never_sent`). An uncertain one: not while it is
+    unresolved. Also a send Signal accepted
+    whose local confirm failed (`store_failed`): the outbox row holds the
+    timestamp as its result, but the message is not moved to it until that
+    confirm is repaired (`RepairStoreFailed`).
+  - *A migrated `local:<sha1>` message.* The legacy `SendText` stamped its row
+    with the wall clock after signal-cli returned, not with Signal's
+    timestamp. The phone's own sends were stored under the same alias with the
+    right time, and nothing tells the two apart, so none of them can be
+    reacted to through the outbox.
+  - *A migrated scheduled send caught in `sending`*: imported under a derived
+    request ID with its creation time and no outbox row.
+- `signal reaction target timestamp is unavailable`, for an incoming message:
+  its remote ID is not a SHA-1, or it has no occurred time.
+  - *`received:<sha1>`*: a Signal Desktop row that had no sent time. The
+    importer stores it under the time it was received and marks its source ID
+    (`v2keys.SignalReceivedSourceID`).
+  - *`signal:<id>`*: a legacy ID the legacy-primary mirror kept.
+- `signal reaction target author is unavailable`: an incoming message stored
+  with no sender. The legacy receiver stored a group message with no source
+  that way, and the legacy-primary mirror (`v2wire.MirrorReplyTarget`) records
+  none.
+
+A reaction that can never be named keeps retrying until it is canceled
+(`POST /api/v1/outbox/<id>/cancel`).
+
+One gap remains that nothing can mark. Before the importer marked them, a
+Signal Desktop row with no sent time was stored under a plain SHA-1 of its
+received time. A re-import rewrites that source ID in the legacy store, but a
+v2 store migrated before then still holds the row under the unmarked hash,
+indistinguishable from a message keyed by its sent timestamp. A reaction to
+it names the received time.
+
+Before this the transport passed the v2 remote ID to `-t`. For a decoded
+incoming message that is a SHA-1. signal-cli 0.14.8 refuses a non-integer
+while parsing its arguments (`could not convert '<id>' to integer (64 bits)`,
+exit 1), and the row ended `uncertain` with nothing sent.
+
+On a v2-primary install every reaction from the web UI and the
+`react_to_message` MCP tool takes this path; see "Reactions on v2-primary go
+through the outbox" below.
+
+### Signal attachments signal-cli never stored
+
+signal-cli downloads an attachment exactly once, while `receive` handles its
+envelope (`IncomingMessageHandler` → `AttachmentHelper.downloadAttachment`),
+into `<signal-cli dir>/attachments/<remote id>.<ext>`. That file name is the
+attachment `id` in the receive JSON, so an id like `aB3dE5fG7hJ9kL1mN2pQ.html` is correct.
+OpenMessage's download (`getAttachment --id`) only reads that file
+("Retrieve an already downloaded attachment"). When the receive-time download
+fails, signal-cli logs `WARN AttachmentHelper - Failed to download
+attachment (<remote id>), ignoring` plus the exception (0.14.9: on the
+following lines), still prints and acknowledges the envelope, and keeps no
+pointer it could fetch the file with later. No signal-cli command can fetch
+it again: upstream treats this as by design (AsamK/signal-cli#2116), and
+signal-cli has no command that sends Signal's linked-device
+attachment-backfill request. While a download is in flight, signal-cli writes
+`attachments/<name>.<random>.tmp` and deletes it in a `finally`. So no file
+and no `.tmp` means the download started and failed cleanly. A leftover
+`.tmp` means the process was killed mid-download.
+
+What OpenMessage records (since this fix):
+
+- The receive loop parses those WARN blocks out of the call's combined
+  output (`signallive.parseAttachmentDownloadFailures`). It logs `signal-cli
+  failed to download a Signal attachment while receiving it` with
+  `attachment_id` and `cause`, and stores the cause in the envelope's
+  `signal.jsonrpc` frame as `attachment_errors` (absent when nothing
+  failed). The decoder projects it onto the attachment row as `last_error =
+  'receive: <cause>'`, and Signal's declared size as `size_bytes`. A
+  replay from the receive WAL re-parses the crashed batch's log lines (the
+  WAL keeps every line), and one from the recovery queue, which keeps only
+  the JSON line, never erases a recorded cause.
+- A download that gets "Could not find attachment with ID" is
+  `signallive.ErrAttachmentNotStored` → `bridge.ErrMediaGone` →
+  `media.ErrGone`, not a transient failure. The media service then marks the
+  attachment **unavailable**: `last_error = 'unavailable: <reason>'`, with
+  the receive-time cause appended when one was recorded. For the next hour
+  (`unavailableRecheckAfter`, timed from `updated_at_ms`) requests answer
+  from the row without running signal-cli. After that the next request asks
+  once more, so a copy that comes back heals the row: for example signal-cli's
+  `attachments/` restored after a re-link, which wipes it. The row stays
+  `pending`, because the state column allows only `pending` and
+  `downloaded` and an import must still be able to fill it.
+  `/api/media/<id>` and `GET /api/v1/messages/<id>/attachments/<n>` answer
+  **410 Gone** with `media: attachment is no longer available from its
+  transport: signal-cli has no copy of attachment <id> …`. An unknown
+  message or ordinal stays 404. A transport that is only unreachable (Signal
+  not connected, any other signal-cli error) answers **503**. A transient
+  failure never overwrites a receive-time cause or an unavailable mark. None
+  of these is a 500.
+- v2 reads mark an attachment as unavailable only while a download attempt's
+  mark stands: an `unavailable:` `last_error` on a pending row, younger than
+  the hour (`MessageAttachment.UnavailableReasonAt`). A receive-time report
+  alone doesn't count. The mark shows as `media_unavailable` on the message.
+  Past the hour the message reads as having a normal attachment again, so
+  the UI fetches it and that fetch re-checks the transport. A transient
+  failure at the re-check keeps the mark and restarts its hour. The
+  web UI shows a disabled dashed card ("… unavailable · This app has no copy
+  of the file. Ask the sender to send it again.") instead of a link. MCP
+  message listings read `[attachment unavailable: this app has no copy, ask
+  the sender to resend; message_id: …]`, and `download_media` answers
+  `attachment unavailable: <reason>`. Media responses carry `ETag` (the blob
+  hash) with `Cache-Control: private, no-cache`, so a replaced attachment is
+  never served stale.
+
+Before this fix the same case showed as a pending row with `size_bytes = 0`
+and `last_error = "download_media: transient: download Signal attachment:
+exit status 1: Could not find attachment with ID: <id>"`, `/api/media` 500,
+and MCP `download_media` "message not found" (it searched only the legacy
+store). Live case: 2026-10-21, an HTML file from a contact's linked device.
+Its receive-time cause is unknown, because the WARN was discarded then.
+
+Recover one, in order. First check another linked device: if Signal Desktop
+shows the attachment as "File not available", it failed to download there
+too. Then the sender's upload or the CDN copy is gone, nothing on this Mac
+holds the bytes, and only a resend recovers them (the 2026-10-21 case).
+
+1. **A backup of signal-cli's store has the file** (for example the
+   pre-relink backup the "Re-linking Signal" section keeps): copy it back
+   (`cp -n -p` into `<signal-cli dir>/attachments/`). Within an hour of its
+   unavailable mark the attachment shows as a normal one again, and opening
+   it downloads it as usual. To land it right away, import the file as in
+   step 2.
+2. **Another client of the account has it** (Signal Desktop on the same
+   Mac, the phone): save the file from that client's UI. Don't open an HTML
+   or other active attachment there; use its save/download action. Then hand
+   it to the running app:
+
+   ```bash
+   openmessage media import <v2-message-id or v2msg:<id>:<n>> <saved file> [--sha256 HEX]
+   ```
+
+   This is `PUT /api/v1/messages/<id>/attachments/<n>` with the raw file as
+   the body (optional `X-Content-SHA256`). The app accepts bytes only for a
+   `pending` attachment, and only when they match the size Signal declared.
+   It records the blob hash and marks the row `downloaded`. Re-sending the
+   same bytes returns `imported: false`; different bytes for a downloaded
+   attachment return 409, unless `--replace` (`?replace=true`) asks to swap
+   them, which corrects an import of the wrong file. Empty files are
+   refused. Rows written before this fix have `size_bytes = 0`,
+   so the size isn't checked. Compare the file against `attachments[].size`
+   in the message's frame (`inbox.payload` → `line.envelope.dataMessage`)
+   first.
+
+Then `download_media` with `save=true` (or `output_path`) writes a private
+copy under the export root and returns its path and SHA-256.
+
+## Reactions on v2-primary go through the outbox
+
+On a v2-primary daemon the read API hands out v2 IDs (32-hex conversation and
+message keys). The legacy reaction senders cannot place those: `/api/react`
+used to tell platforms apart by a `signal:`/`whatsapp:` prefix or a
+legacy-store lookup and fall back to Google Messages, so before this every
+reaction from the UI or MCP to a v2 message, on any platform, went down the
+Google path with a v2 message ID: with no Google client it answered
+`503 not connected to Google Messages` (reproduced in
+`TestR5ReactRoutesThroughTheOutboxOnV2Primary`), and with one it asked Google
+to react to an ID that is not a Google message ID.
+Legacy-primary daemons, including ones with `OPENMESSAGES_V2_SEND=1`, keep the
+legacy senders unchanged.
+
+**Routes.**
+
+- `POST /api/react` `{conversation_id, message_id, emoji, action}` resolves the
+  target by its v2 message ID and queues the reaction on the outbox
+  (`MessageService.SendReaction`). The target decides the account and the
+  conversation; `conversation_id` may be omitted, and when given must name the
+  target's own conversation, by v2 ID or by its remote ID (`signal:+1…`, a
+  WhatsApp JID, a Google thread id). It then waits up to 8 s for the reaction
+  to settle, and the answer says how far it got:
+
+  | Status | Body | Meaning |
+  |---|---|---|
+  | 200 | `success: true` | The platform accepted it (`confirmed`, or `store_failed`). |
+  | 202 | `success: true, queued: true` | Stored, not delivered yet (`queued`, `dispatching`, `not_dispatched`). The app keeps retrying it; do not react again. A reaction to your own message that has not been sent yet (a scheduled send) waits here for it (`error_code: reaction_target_unsent`). |
+  | 502 | `error` | `uncertain` (the transport call ended without an answer: it may have been applied) or `rejected` (the platform refused it, for example Google's phone answering `success: false` for a message whose ID will not change, stored as `error_class: unsupported`; it is not retried). A reaction to your own message whose send was canceled or rejected is `rejected` before any transport call (`error_code: reaction_target_never_sent`, error "the message it reacts to was never sent"). |
+  | 409 | `error` | `canceled` before it was sent. |
+  | 422 | `reaction_target_unavailable` | No v2 message with that ID, or not in that conversation. Nothing was queued. |
+  | 501 | `error` | The account has no reaction sender (an import-only platform). |
+
+  Every 2xx/409/502 answer carries `outbox_id` and `state`. The legacy handler
+  answered only after the transport call; this one returns while delivery may
+  still be in progress, which is what the 202 is for. A request without
+  `idempotency_key` mints a new key, so repeating the POST queues a second
+  reaction.
+- `POST /api/v1/outbox/reactions` (same body plus a required
+  `idempotency_key`) is the durable twin, like `/api/v1/outbox/messages`: it
+  returns the submission at once and `GET /api/v1/outbox/<id>` follows it. A
+  legacy-primary daemon answers it `409 legacy primary: use /api/react`.
+- The MCP tool, in-process on a v2-primary daemon, queues on the outbox and
+  waits up to 25 s. In transportless client mode it probes `/api/status` and,
+  when the app reports `v2_primary`, submits to `/api/v1/outbox/reactions`
+  and polls the delivery; otherwise it uses `/api/react`. Its result carries
+  `outbox_id`, `state`, `idempotency_key` and `settled`; `settled: false` is not
+  an error and means do not react again.
+
+**What the user sees.** The adapters store nothing when they send a reaction
+(the legacy senders updated the stored reactions themselves after the send).
+So when the transport accepts a reaction, the outbox confirms the row and
+writes the account's own reaction (`reactor_key = 'self'`, shown as "You") in
+the same SQLite transaction (`OutboxRepository.ConfirmReaction`); without it
+the reaction would appear only if a transport later reported it. Its time is
+when the transport accepted it, and a later report for the same reactor key
+replaces it when it carries a later time (the usual `ApplyReaction`
+ordering). On Google Messages the phone's copy is authoritative instead:
+every Google frame for a message applies that message's full reaction
+snapshot (`ReplaceEmbeddedReactions`), which removes active reactors the
+snapshot does not list, and the Google decoder names reactors by participant
+ID rather than as self. So the next frame for the message replaces the "self"
+row with the reactor the phone names, or removes it if the phone's copy does
+not have the reaction yet; a reaction can disappear briefly and come back.
+The transport's answer and the phone's frame race. When the outbox confirms a
+Google reaction after a frame for the message that was received at or after
+the transport call (`reaction_snapshot_fences.source_seq_ms`, the frame's
+local receipt time, against the row's `transport_called_at_ms`) is already
+stored, it writes no "self" row, because that frame may already list the
+reaction. Before, both rows stayed active and the pill read 2 until the
+message's next frame. A frame received after the call can still have left the
+phone before the phone applied the reaction (the call is marked before the
+adapter's conversation lookup, and a frame can carry another change to the
+same message, such as another person's reaction). Then the reaction is hidden until the next
+frame that lists it, the same gap the other order has, where that frame
+tombstones the "self" row. A reaction that ends
+`uncertain`, `rejected`, `not_dispatched` or `canceled` writes nothing, so the
+thread shows only reactions that went out. While a reaction is `queued`,
+`dispatching` or `not_dispatched` it is listed in the web UI's outbox tray
+with a Cancel button.
+
+**WhatsApp reaction targets.** WhatsApp names the message a reaction targets
+by its chat, its ID, whether it is this account's own, and in a group its
+sender (whatsmeow's `BuildMessageKey`, which reads an empty sender as this
+account). The dispatcher passes the target's direction
+(`bridge.MessageRef.Outgoing`) and stored sender, and
+`whatsapplive.SendReactionRequest` addresses this account's message as its
+own, an incoming message by its stored sender, and an incoming 1:1 message
+with no stored sender as the other party's (the chat JID, as the legacy
+sender did). An incoming group message with no stored sender cannot be
+named, so nothing is sent: the row ends `rejected` (`error_class:
+unsupported`, `error_detail` `send_reaction: unsupported: whatsapp reaction
+target author is unavailable`). Before, both went out with an empty sender
+and addressed a message of this account's that does not exist. Unlike a Signal
+reaction whose target cannot be named (above), which keeps retrying, this one
+is not retried: if the message is later stored with its sender, react again.
+In a group, a stored sender that is neither a sender's JID (on the
+phone-number, LID, hosted or bot server) nor a phone number (digits, with or
+without a leading `+`) is refused the same way; that includes the group's own
+JID, which the history decoder stores as the sender of a group message that
+names no participant. In a 1:1 chat such a sender is replaced by the chat, as
+a missing one is.
+
+In a group the sender is sent in the form the message arrived with, the form
+whatsmeow puts in the keys it builds for a received message
+(`MessageInfo.Sender`): the member's LID (`<digits>@lid`) when the message was
+addressed by LID, the phone number otherwise. Live ingest stores the phone
+number whenever whatsmeow knew the LID's number when the message arrived, and
+`<digits>@lid` when it did not; history sync stores the phone number when the
+sync's own number mappings name it, and otherwise the form the phone's history
+gives. So `SendReactionRequest` sends a stored LID as it is, and maps a stored
+phone number back to its LID (whatsmeow's LID store, then the session store's
+`whatsmeow_lid_map`) when the group addresses members by LID. The store does
+not record each message's addressing, so the group's current addressing stands
+in for it: a message from before the group moved to LID addressing is named by
+its LID too. The addressing comes from the whatsmeow group cache that
+`SendMessage` reads to choose the identity it sends with; when the cache does
+not hold the group, the lookup fetches it and `SendMessage` then uses that
+copy. A phone number whose LID is not known, or a group whose addressing cannot
+be read, goes out as stored (and `SendMessage` repeats the lookup and reports a
+group it cannot read, as before). Before, a stored LID went out as
+`<digits>@lid@s.whatsapp.net`, which names no member, and a stored phone number
+went out as the phone number in a LID group. whatsmeow's own message-secret
+lookup accepts a key's sender in either form, so the phone number may have
+matched too; the LID is the form the message carries. 1:1 chats with a phone
+number or a LID were never affected: whatsmeow puts no participant in their
+messages' keys (a bot's chat, for one, does get one).
+
+Messages migrated from the legacy store, or imported from WhatsApp Desktop,
+before the fix in "WhatsApp LIDs stored as phone numbers" above can name a LID
+sender by the LID's digits as a phone number (`+<lid digits>`). Such a sender
+looks like a phone number here and goes out as `<lid digits>@s.whatsapp.net`
+until `openmessage repair whatsapp-lid` rewrites it.
+
+A WhatsApp send goes out under an ID derived from its request ID
+(`whatsapplive.deriveWebMessageID`), and its message is renamed to that ID
+when the send is confirmed. Until then the message is still named by the
+request ID itself, an ID WhatsApp never sees. So a reaction to a WhatsApp
+message of yours that has not been sent yet is held, and one to a message
+whose send was canceled or rejected is rejected (see "Reactions stuck
+retrying" below), rather than addressed to that ID. One sent but `uncertain` or `store_failed`
+is still named by the request ID, and a reaction to it is still addressed to
+that ID, which no WhatsApp message has.
+
+**WhatsApp read-receipt senders.** A WhatsApp read receipt names the messages
+it covers by their chat and IDs, and in a group by their sender too:
+whatsmeow's `MarkRead` puts the sender in the receipt's `participant` attribute
+(its documentation requires one in a group) and names one sender for every
+message a receipt covers. `whatsapplive.MarkReadRequest` names a group sender
+the way a reaction names it (above): a stored LID as stored, and a stored phone
+number as its LID when the group addresses members by LID. That is also the
+form whatsmeow's own delivery receipt for the message named, since it copies
+the participant the message arrived with. Reading the group's addressing
+fetches the group from WhatsApp if whatsmeow's cache does not hold it (which
+also stores the LID of each member the response names by both number and LID,
+so it is read before the number's LID is looked up). For a read receipt that
+fetch has 10 s of the receipt's 45 s; if it fails or runs out, the receipt goes
+out naming the stored phone number (`MarkRead` does not read the group cache).
+The 10 s does not cover waiting for whatsmeow's group cache lock, which another
+caller holds across its own fetch. A group receipt whose stored sender is
+neither a sender's JID nor a phone number (the same test as for reactions) is
+refused before anything is sent: the row ends `rejected` (`error_class:
+unsupported`, `error_code: mark_read`, `error_detail` `mark_read: unsupported:
+whatsapp read receipt sender is not a user's JID or phone number`), and the
+read cursor keeps its new position. A message with no stored sender is not
+refused. This account's own messages have none (neither the send path, ingest
+nor migration gives an outgoing message a sender identity), so a receipt for
+one goes out with no participant, as before. Before, a stored LID went out as
+`<digits>@lid@s.whatsapp.net`, and any other value went out as
+`<value>@s.whatsapp.net` (less a leading `+`; a bare `+` went out with no
+participant). In a 1:1 chat `MarkRead` sends no participant, so nothing changed
+there. When a request covers messages from several stored senders, the WhatsApp
+adapter sends one receipt per sender, in the order each first appears. Before,
+one receipt named the first message's author for all of them. A refused sender
+does not hold up the others' receipts; the refusal is reported after they are
+sent. A transport failure ends the request, and so does the end of its context:
+the 60 s `callTransport` bound covers the whole request. The dispatcher puts
+one message, the read cursor's, in each request. As of 2026-10-21 no production
+path queues a v2 read receipt: nothing outside tests calls
+`messaging.MessageService.MarkRead`, and `/api/mark-read` only moves the
+cursor. So none of this has reached a live install yet.
+
+**Reactions stuck retrying.** A reaction the transport cannot deliver yet goes
+`not_dispatched` and retries (every 5 s by default) with no cap; a Signal
+reaction whose target can never be named (above) stays there until it is
+canceled. A refusal is not among them: when Google's phone answers a reaction
+with `success: false`, the row ends `rejected` after one attempt
+(`error_class: unsupported`, `error_code: send_reaction`, `error_detail`
+`send_reaction: unsupported: Google Messages refused the reaction`), because a
+retry would send the same request. Before that change it went
+`not_dispatched` and was sent again every 5 s.
+
+A reaction to a message of your own that is still named by its send's request
+ID (Google's TmpID) depends on how far that send has got
+(`messaging.targetSendProgress`):
+
+- **Not sent yet** (`queued`, `dispatching`, `not_dispatched`, such as a
+  scheduled send). The platform has no such message, so the dispatcher holds
+  the reaction before the transport call, on every platform: no phone call, no
+  transport attempt counted. The row goes `not_dispatched` with
+  `error_class: transient`, `error_code: reaction_target_unsent` and
+  `error_detail` `the message this reaction targets has not been sent yet (its
+  send <outbox id> is <state>)`. It is tried again 1 ms after the send is next
+  due (a scheduled send's time, or a retrying send's next attempt), and never
+  sooner than 5 s. So a reaction to a message scheduled for tomorrow waits for
+  tomorrow, and the dispatcher, which takes due rows in the order they fell
+  due, sends the message first. Retrying the send early
+  (`POST /api/v1/outbox/<send id>/retry`) or canceling it makes the reactions
+  held for it due 1 ms later, in the same transaction
+  (`OutboxRepository.Cancel`, `RetryNotDispatched`): they follow a retried
+  send at once, and a canceled send's reactions are rejected (next bullet).
+  A cancel or retry that lands while the dispatcher is holding a reaction
+  for that send (the reaction is `dispatching`, so the wake passes it by) is
+  caught when the dispatcher reads the send again after recording the hold
+  (`wakeIfSendChanged`).
+  Before, the reaction went to the transport with the request ID: Google
+  asked the phone with the TmpID, and a refusal was retried every 5 s until
+  the send went out and its echo renamed the message, the send was canceled
+  or rejected (the next refusal was then final), or someone canceled the
+  reaction; WhatsApp addressed it to an ID no WhatsApp message has (above);
+  Signal refused it before signal-cli, every 5 s.
+- **Never sent** (`canceled`, or `rejected` by the platform). The platform
+  never got the message and never will, so the dispatcher rejects the
+  reaction before the transport call: `rejected`, `error_class:
+  unsupported`, `error_code: reaction_target_never_sent`, and `/api/react`
+  answers 502 "the message it reacts to was never sent". Before, it went to
+  the transport naming the request ID: Google asked the phone and rejected
+  the reaction on its refusal, WhatsApp addressed it to no message (and
+  recorded it as sent when WhatsApp accepted it), and Signal retried it
+  every 5 s for good.
+- **Sent less than a minute ago** (`confirmed` and waiting for the echo,
+  `uncertain`, or `store_failed`, timed from the send row's `updated_at_ms`:
+  when the transport's answer was recorded, or later lease recovery or a
+  reconcile).
+  The phone's echo may still rename the message to the phone's own ID, so the
+  dispatcher marks the target `ProvisionalRemoteID`. A refusal of it goes
+  `not_dispatched` (`error_detail` `send_reaction: transient: Google Messages
+  refused a reaction to a message still named by its send's request ID`), and
+  the retry after the echo names the phone's ID.
+- **Sent a minute ago or more.** The target is no longer provisional, so a
+  refusal is final (`rejected`, as above). The minute is
+  `sqlite.EchoMaxLag`, the longest lag at which echo pairing
+  (`internal/storage/sqlite/uncorrelated_echo.go`) considers an echo at all.
+  On the live install all 44 measured echoes were first seen 0.28-0.79 s
+  after their send, and pairing by content takes one only within about
+  6.2 s. On the live install the phone sent every echo without a TmpID when
+  this was checked (2026-10-16), and content pairing takes text sends only,
+  so a media send keeps its TmpID for good. (A text whose echo was stored
+  before its send was recorded can still be paired after the minute, by the
+  startup repair or a later frame for the message; every measured echo
+  arrived after.) A refused reaction to a message that keeps its TmpID is
+  now sent at most 13 times per window (once per 5 s for the minute, then the
+  final one; a later lease recovery or store repair of the send starts a new
+  window), where before it was sent every 5 s for as long as the message
+  kept it. If the phone did not have the message yet, react again once it does.
+
+Find the reactions still retrying with:
+
+```bash
+curl -s "http://127.0.0.1:7007/api/v1/outbox?limit=100" | jq '.[] | select(.kind=="reaction")'
+```
+
+and cancel one with `POST /api/v1/outbox/<id>/cancel`.
+
+**A count one higher than the reactors shown.** A migrated message whose legacy
+reaction named nobody (`[{"emoji":"👍","count":1}]`) keeps it as an anonymous
+reactor (`reactor_key = 'anon:👍'`, `migration/transform.go`). Reacting 👍 to it on v2 adds "me" beside
+it, so the pill reads 2 with only "You" listed.
+
 ## Deploying a new build to a live install
 
 **`RELEASE=1` is required.** Without it `build.sh` stamps the dev bundle id
@@ -1405,6 +2779,71 @@ rm -rf /Applications/OpenMessage.app && cp -R macos/build/OpenMessage.app /Appli
 xattr -cr /Applications/OpenMessage.app
 open -a OpenMessage
 ```
+
+A build with a new schema migration applies it when the new app starts,
+before its v2 stack (and so v2 ingest) exists. Any other copy of the binary
+must then match it: until it does, `openmessage read`/`status` and the MCP
+client refuse the store (a newer binary asks you to reopen the app; an older
+one reports the store as newer than supported). With the MCP config and
+`/usr/local/bin/openmessage` pointing at the bundle's binary (see "MCP config"),
+there is no other copy to update.
+
+**Backend-only swap.** When the Swift app is unchanged since the installed
+build, only the Go binary needs replacing. That skips the Swift build, the DMG,
+and most of the disk. The installed build's `git describe` is the
+`serverInfo.version` in an MCP `initialize` response; don't swap over a build
+whose version ends in `-dirty`. Check the precondition against the working
+tree, whose entitlements files the recipe signs with:
+`git diff --stat <installed-commit> -- macos/` must print nothing.
+
+Build to a file named `openmessage`: codesign takes the signing identifier from
+the file name, and `build.sh` signs the helper as `openmessage`. Swap it in by
+rename, never `cp` over the live path (see "MCP config" above for why):
+
+```
+mkdir -p /tmp/om-swap
+CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 GOWORK=off go build -trimpath \
+  -ldflags="-s -w -X main.version=$(git describe --tags --always --dirty)" -o /tmp/om-swap/openmessage .
+codesign --force --options runtime --entitlements macos/OpenMessageHelper.entitlements \
+  --sign "Developer ID Application: Max Ghenis (8VB5UKQZC6)" /tmp/om-swap/openmessage
+codesign -dv /tmp/om-swap/openmessage 2>&1 | grep -x 'Identifier=openmessage' || echo STOP
+R=/Applications/OpenMessage.app/Contents/Resources
+cp -p "$R/openmessage" ~/openmessage-backend.prev   # rollback copy, a bare file
+osascript -e 'quit app "OpenMessage"'
+cp /tmp/om-swap/openmessage "$R/openmessage.new" && mv -f "$R/openmessage.new" "$R/openmessage"
+codesign --force --options runtime --entitlements macos/OpenMessage.entitlements \
+  --sign "Developer ID Application: Max Ghenis (8VB5UKQZC6)" /Applications/OpenMessage.app
+codesign --verify --deep --strict /Applications/OpenMessage.app
+xattr -cr /Applications/OpenMessage.app
+open -a OpenMessage
+```
+
+The identifier check must print `Identifier=openmessage`; if it prints `STOP`,
+stop before the swap. A quick swap needs no
+[watchdog parking](#parking-the-launchd-watchdog): a relaunch takes two failed
+probes 5 minutes apart. If you park it, remove
+`$HOME/Library/Application Support/OpenMessage/watchdog-disabled` right after
+`open -a OpenMessage`.
+
+To roll back, stage the `.prev` copy and rename it into place (a copy, so the
+`.prev` file survives), then re-sign the bundle:
+
+```
+cp -p ~/openmessage-backend.prev "$R/openmessage.new" && mv -f "$R/openmessage.new" "$R/openmessage"
+```
+
+A binary rollback works only when the new build added no migration
+(`git diff --stat <installed-commit> -- internal/storage/sqlite/migrations/`
+prints nothing): an older binary refuses a store migrated past it. Otherwise
+the options are to roll forward, or to restore a copy of `v2/store.sqlite3`
+taken before the swap with sqlite3 `.backup`. Don't copy the raw file and its
+`-wal`/`-shm` instead: open MCP clients keep connections, and the last one to
+close may checkpoint the WAL into the main file mid-copy. Restoring loses
+whatever the new build stored after the swap. `openmessage backup` does not
+copy `v2/`.
+Keep the old binary as a bare file, not inside an `.app` (see "Bundle-id
+shadowing"). An arm64-only binary is fine on an Apple Silicon install; the next
+full `build.sh` deploy restores the universal one.
 
 Confirm the deployed bundle kept the release id:
 

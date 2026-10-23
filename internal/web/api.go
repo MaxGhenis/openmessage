@@ -179,7 +179,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 	if reads == nil {
 		reads = store
 	}
-	registerV1Routes(mux, store, logger, opts.V2, opts.V2Primary)
+	v1 := registerV1Routes(mux, store, logger, opts.V2, opts.V2Primary)
 	diagnosticsStartedAt := time.Now()
 	getClient := func() *client.Client {
 		if opts.Client != nil {
@@ -242,9 +242,10 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 	}
 	// Per-platform data-freshness, used to catch "zombie" bridges that report
 	// connected=true while no longer actually syncing (the connection flag
-	// lies; the data doesn't). Computing this scans the messages table, and
-	// /api/status is polled every few seconds, so cache it — staleness is a
-	// multi-day signal, so a 30s cache is plenty fresh.
+	// lies; the data doesn't). /api/status is polled every few seconds, so
+	// cache it — staleness is a multi-day signal, so a 30s cache is plenty
+	// fresh. On v2 the read is a few index seeks (platformLatest); the legacy
+	// store's PlatformStats still aggregates its whole messages table.
 	var (
 		freshnessMu       sync.Mutex
 		freshnessComputed time.Time
@@ -270,7 +271,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		if freshnessValue != nil && time.Since(freshnessComputed) < 30*time.Second {
 			return freshnessValue
 		}
-		stats, err := reads.PlatformStats()
+		stats, err := platformLatest(reads)
 		if err != nil {
 			// Keep the last good value on error, except the SMS path: it
 			// reads the inbox, not these stats, and a cached stall must not
@@ -345,6 +346,12 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 				"enabled":     opts.V2IngestCounters != nil,
 				"per_account": v2IngestPerAccount,
 			},
+		}
+		if opts.V2 != nil && opts.V2.Service != nil {
+			// The dispatch loop's in-flight and abandoned transport calls: a
+			// send that never returns froze all sending for hours on
+			// 2026-10-20 while every other field here looked healthy.
+			payload["v2_dispatch"] = opts.V2.Service.DispatchHealth()
 		}
 		if strings.TrimSpace(opts.IdentityName) != "" {
 			payload["identity_name"] = strings.TrimSpace(opts.IdentityName)
@@ -2022,9 +2029,9 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 				httpError(w, "v2 media not available", http.StatusServiceUnavailable)
 				return
 			}
-			if err := writeV2MessageMediaResponse(r.Context(), w, opts.V2, msgID); err != nil {
-				code, message := v1ErrorResponse(err)
-				httpError(w, message, code)
+			messageID, ordinal := parseV2MediaID(msgID)
+			if err := writeV2MessageMediaResponse(r, w, opts.V2, messageID, ordinal); err != nil {
+				writeMediaError(w, err)
 			}
 			return
 		}
@@ -2104,18 +2111,20 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			httpError(w, "method not allowed", 405)
 			return
 		}
-		var req struct {
-			ConversationID string `json:"conversation_id"`
-			MessageID      string `json:"message_id"`
-			Emoji          string `json:"emoji"`
-			Action         string `json:"action"` // "add", "remove", "switch"; default "add"
-		}
+		var req reactionRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			httpError(w, "invalid JSON: "+err.Error(), 400)
 			return
 		}
 		if req.MessageID == "" || req.Emoji == "" {
 			httpError(w, "message_id and emoji are required", 400)
+			return
+		}
+		if opts.V2Primary {
+			// The read API hands out v2 IDs here, which the legacy routing
+			// below cannot place: it tells platforms apart by ID prefix or a
+			// legacy-store lookup and falls back to Google Messages.
+			v1.react(w, r, req)
 			return
 		}
 		if isWhatsAppConversation(req.ConversationID) {
@@ -3489,12 +3498,33 @@ func scheduledID() string {
 	return "sched:" + hex.EncodeToString(b)
 }
 
+// parseV2MediaID accepts either a v2 message ID (its first attachment) or
+// the media_id the read API reports for an attachment, v2msg:<message>:<n>.
+func parseV2MediaID(raw string) (string, int64) {
+	raw = strings.TrimSpace(raw)
+	rest, ok := strings.CutPrefix(raw, "v2msg:")
+	if !ok {
+		return raw, 0
+	}
+	cut := strings.LastIndexByte(rest, ':')
+	if cut <= 0 {
+		return rest, 0
+	}
+	ordinal, err := strconv.ParseInt(rest[cut+1:], 10, 64)
+	if err != nil || ordinal < 0 {
+		return raw, 0
+	}
+	return rest[:cut], ordinal
+}
+
 func writeV2MessageMediaResponse(
-	ctx context.Context,
+	r *http.Request,
 	w http.ResponseWriter,
 	v2 *V2Options,
 	messageID string,
+	ordinal int64,
 ) error {
+	ctx := r.Context()
 	messages, err := sqlite.NewMessageRepository(v2.V2Store, time.Now)
 	if err != nil {
 		return err
@@ -3506,7 +3536,7 @@ func writeV2MessageMediaResponse(
 	descriptor, err := v2.Media.Resolve(ctx, media.DownloadCommand{
 		AccountID: message.AccountID,
 		MessageID: message.MessageID,
-		Ordinal:   0,
+		Ordinal:   ordinal,
 	})
 	if err != nil {
 		return err
@@ -3516,7 +3546,7 @@ func writeV2MessageMediaResponse(
 		return err
 	}
 	defer reader.Close()
-	writeDescriptorMediaResponse(w, reader, descriptor)
+	writeDescriptorMediaResponse(w, r, reader, descriptor)
 	return nil
 }
 
@@ -3839,6 +3869,34 @@ func daysBehind(older, newer int64) int {
 // (legacy path and v2 projection commit independently), so seconds of
 // disagreement are normal; a real projection stall shows up as minutes.
 const projectionLagFloorMS = int64(5 * 60 * 1000)
+
+// platformLatestSource is implemented by read sources that report each
+// platform's newest message times without counting every message (v2read).
+type platformLatestSource interface {
+	PlatformLatest() ([]db.PlatformLatest, error)
+}
+
+// platformLatest returns each stored platform's newest sent/received times.
+// Freshness never reads the counts, so a v2 store answers with index seeks; the
+// legacy store has no such method and still runs its GROUP BY.
+func platformLatest(reads readsource.ReadSource) ([]db.PlatformLatest, error) {
+	if source, ok := reads.(platformLatestSource); ok {
+		return source.PlatformLatest()
+	}
+	stats, err := reads.PlatformStats()
+	if err != nil {
+		return nil, err
+	}
+	latest := make([]db.PlatformLatest, 0, len(stats))
+	for _, st := range stats {
+		latest = append(latest, db.PlatformLatest{
+			Platform:     st.Platform,
+			LatestMS:     st.LatestMS,
+			LatestRecvMS: st.LatestRecvMS,
+		})
+	}
+	return latest, nil
+}
 
 // addProjectionLag annotates each per-platform freshness entry with how far the
 // active read source trails the legacy store, and stamps a top-level

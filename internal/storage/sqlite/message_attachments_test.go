@@ -83,8 +83,8 @@ func TestMessageAttachmentsMigrationAppliesToBlankAndExistingV7AndReopens(t *tes
 			}
 		})
 		after := readLedgerRows(t, store.db)
-		if len(after) != 10 {
-			t.Fatalf("migrated ledger rows = %d, want 10", len(after))
+		if len(after) != 11 {
+			t.Fatalf("migrated ledger rows = %d, want 11", len(after))
 		}
 		if !slices.Equal(after[:7], before) {
 			t.Fatalf("migrations 0001-0007 changed:\nbefore: %+v\nafter:  %+v", before, after[:7])
@@ -252,10 +252,10 @@ func TestMessageAttachmentRowsCascadeWithMessageDeletion(t *testing.T) {
 
 func assertMessageAttachmentsMigration(t *testing.T, store *Store) {
 	t.Helper()
-	if len(embeddedMigrations) != 10 {
-		t.Fatalf("embedded migrations = %d, want 10", len(embeddedMigrations))
+	if len(embeddedMigrations) != 11 {
+		t.Fatalf("embedded migrations = %d, want 11", len(embeddedMigrations))
 	}
-	assertPragmaInt(t, store.db, "user_version", 10)
+	assertPragmaInt(t, store.db, "user_version", 11)
 	ledger := readLedgerRow(t, store.db, 8)
 	if ledger.name != "message_attachments" {
 		t.Fatalf("migration 0008 name = %q, want message_attachments", ledger.name)
@@ -350,5 +350,41 @@ func recordMessageAttachment(
 	}
 	if err := tx.Commit(); err != nil {
 		t.Fatalf("commit attachment transaction: %v", err)
+	}
+}
+
+func TestMessageAttachmentUnavailableReason(t *testing.T) {
+	text := func(value string) *string { return &value }
+	for name, tc := range map[string]struct {
+		attachment MessageAttachment
+		reason     string
+		ok         bool
+	}{
+		"pending, no error":    {MessageAttachment{State: "pending"}, "", false},
+		"pending, transient":   {MessageAttachment{State: "pending", LastError: text("download_media: transient: offline")}, "", false},
+		"pending, unavailable": {MessageAttachment{State: "pending", LastError: text(UnavailableAttachmentErrorPrefix + "gone ")}, "gone", true},
+		"pending, receive":     {MessageAttachment{State: "pending", LastError: text(ReceiveAttachmentErrorPrefix + "reset")}, "", false},
+		"downloaded":           {MessageAttachment{State: "downloaded", LastError: text(UnavailableAttachmentErrorPrefix + "gone")}, "", false},
+	} {
+		reason, ok := tc.attachment.UnavailableReason()
+		if reason != tc.reason || ok != tc.ok {
+			t.Errorf("%s: UnavailableReason() = %q, %v; want %q, %v", name, reason, ok, tc.reason, tc.ok)
+		}
+	}
+}
+
+func TestMessageAttachmentUnavailableReasonAtExpires(t *testing.T) {
+	mark := UnavailableAttachmentErrorPrefix + "gone"
+	markedAt := time.Date(2026, time.October, 21, 22, 0, 0, 0, time.UTC)
+	attachment := MessageAttachment{State: "pending", LastError: &mark, UpdatedAtMS: markedAt.UnixMilli()}
+	if reason, ok := attachment.UnavailableReasonAt(markedAt.Add(59 * time.Minute)); !ok || reason != "gone" {
+		t.Fatalf("UnavailableReasonAt(+59m) = %q, %v; want the mark standing", reason, ok)
+	}
+	if _, ok := attachment.UnavailableReasonAt(markedAt.Add(UnavailableAttachmentRecheckAfter)); ok {
+		t.Fatal("UnavailableReasonAt(+1h) still reports the mark; readers would never re-check")
+	}
+	receive := ReceiveAttachmentErrorPrefix + "reset"
+	if _, ok := (MessageAttachment{State: "pending", LastError: &receive, UpdatedAtMS: markedAt.UnixMilli()}).UnavailableReasonAt(markedAt); ok {
+		t.Fatal("a receive-time note alone reads as unavailable")
 	}
 }

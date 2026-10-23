@@ -39,6 +39,10 @@ type Attachment struct {
 	Filename  string
 	MIME      string
 	Size      int64
+	// TransportError is the transport's own report, captured with the
+	// message, that it failed to fetch this attachment. Empty when it
+	// reported none.
+	TransportError string
 }
 
 type ConversationEvent struct {

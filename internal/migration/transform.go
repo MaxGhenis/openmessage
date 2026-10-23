@@ -498,7 +498,7 @@ func planLegacyReactions(dataset legacyDataset, state *transformState, report *R
 				normalizedActor := normalizeLegacyReactionActor(platform, actor)
 				switch {
 				case strings.EqualFold(actor, "me") || isOwnReactionActor(platform, actor, normalizedActor, ownNumbers[platform]):
-					row.ReactorKey, row.ReactorIsSelf, row.ReactorLabel = "self", true, "me"
+					row.ReactorKey, row.ReactorIsSelf, row.ReactorLabel = sqlite.SelfReactorKey, true, sqlite.SelfReactorLabel
 				case actor == "":
 					row.ReactorKey = "anon:" + emoji
 				default:

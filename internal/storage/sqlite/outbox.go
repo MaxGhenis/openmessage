@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/maxghenis/openmessage/internal/bridge"
 )
 
 // OutboxKind identifies the shape of an outbound intent.
@@ -208,6 +210,17 @@ type Confirmation struct {
 	LeaseToken        string
 	ResultRemoteID    string
 	TransportResultID string
+}
+
+// ReactionConfirmation records that the transport accepted a reaction for the
+// active lease. ResultRemoteID is empty when the transport returns no identity
+// for a reaction. OccurredAt is when the transport accepted it, and orders the
+// reaction against other mutations of the same reactor.
+type ReactionConfirmation struct {
+	OutboxID       string
+	LeaseToken     string
+	ResultRemoteID string
+	OccurredAt     time.Time
 }
 
 // ReconcileRequest identifies one accepted transport request and its
@@ -1385,7 +1398,12 @@ func (r *OutboxRepository) RetryNotDispatched(
 	if err != nil {
 		return err
 	}
-	result, err := r.store.db.ExecContext(ctx, `
+	tx, err := r.store.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("retry not-dispatched outbox item %q: begin transaction: %w", outboxID, err)
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `
 		UPDATE outbox
 		SET next_attempt_at_ms = ?,
 			updated_at_ms = ?
@@ -1395,7 +1413,87 @@ func (r *OutboxRepository) RetryNotDispatched(
 	if err != nil {
 		return fmt.Errorf("retry not-dispatched outbox item %q: %w", outboxID, err)
 	}
-	return r.requireStateMutation(ctx, "retry not dispatched", outboxID, result)
+	return r.commitSendStateChange(ctx, tx, "retry not dispatched", outboxID, nowMS, result)
+}
+
+// ReactionTargetUnsentCode is the error code of a reaction the messaging
+// dispatcher holds, before the transport call, because the message it targets
+// is this account's own and that message's send has not gone out yet. Such a
+// reaction is next due just after the send.
+const ReactionTargetUnsentCode = "reaction_target_unsent"
+
+// commitSendStateChange finishes Cancel and RetryNotDispatched. When the
+// update changed the row, the reactions held for it as their target's send
+// (ReactionTargetUnsentCode) are made due 1 ms after now, in the same
+// transaction: the send is due now, or canceled and never going out, and
+// either way they need not wait for its old due time. The 1 ms keeps a
+// retried send ahead of them in LeaseDue's order.
+func (r *OutboxRepository) commitSendStateChange(
+	ctx context.Context,
+	tx *sql.Tx,
+	operation, outboxID string,
+	nowMS int64,
+	result sql.Result,
+) error {
+	if affected, err := result.RowsAffected(); err != nil || affected != 1 {
+		_ = tx.Rollback()
+		return r.requireStateMutation(ctx, operation, outboxID, result)
+	}
+	if _, err := wakeReactionsHeldFor(ctx, tx, outboxID, nowMS); err != nil {
+		return fmt.Errorf("%s outbox item %q: wake reactions held for it: %w", operation, outboxID, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("%s outbox item %q: commit: %w", operation, outboxID, err)
+	}
+	return nil
+}
+
+// WakeReactionsHeldFor makes the reactions held for the send sendOutboxID
+// (ReactionTargetUnsentCode) due 1 ms from now, as Cancel and
+// RetryNotDispatched do, and reports how many it moved. The dispatcher calls
+// it when the send changed while a reaction to it was being held.
+func (r *OutboxRepository) WakeReactionsHeldFor(ctx context.Context, sendOutboxID string) (int64, error) {
+	nowMS, err := r.nowMS("wake reactions held for outbox item")
+	if err != nil {
+		return 0, err
+	}
+	woken, err := wakeReactionsHeldFor(ctx, r.store.db, sendOutboxID, nowMS)
+	if err != nil {
+		return 0, fmt.Errorf("wake reactions held for outbox item %q: %w", sendOutboxID, err)
+	}
+	return woken, nil
+}
+
+// wakeReactionsHeldFor moves the reactions held for the send sendOutboxID
+// that are due later than 1 ms after nowMS to that time. Only reactions to
+// the send's own message are held for it.
+func wakeReactionsHeldFor(
+	ctx context.Context,
+	execer interface {
+		ExecContext(context.Context, string, ...any) (sql.Result, error)
+	},
+	sendOutboxID string,
+	nowMS int64,
+) (int64, error) {
+	result, err := execer.ExecContext(ctx, `
+		UPDATE outbox
+		SET next_attempt_at_ms = ?,
+			updated_at_ms = ?
+		WHERE kind = 'reaction'
+		  AND state = 'not_dispatched'
+		  AND error_code = ?
+		  AND next_attempt_at_ms > ?
+		  AND outbox_id IN (
+		      SELECT r.outbox_id
+		      FROM outbox_reactions AS r
+		      JOIN outbox AS send ON send.local_message_id = r.target_message_id
+		      WHERE send.outbox_id = ?
+		  )
+	`, nowMS+1, nowMS, ReactionTargetUnsentCode, nowMS+1, sendOutboxID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }
 
 // Cancel transitions pending work to a terminal canceled state. Active or
@@ -1405,7 +1503,12 @@ func (r *OutboxRepository) Cancel(ctx context.Context, outboxID string) error {
 	if err != nil {
 		return err
 	}
-	result, err := r.store.db.ExecContext(ctx, `
+	tx, err := r.store.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("cancel outbox item %q: begin transaction: %w", outboxID, err)
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `
 		UPDATE outbox
 		SET state = 'canceled',
 			next_attempt_at_ms = NULL,
@@ -1416,7 +1519,7 @@ func (r *OutboxRepository) Cancel(ctx context.Context, outboxID string) error {
 	if err != nil {
 		return fmt.Errorf("cancel outbox item %q: %w", outboxID, err)
 	}
-	return r.requireStateMutation(ctx, "cancel", outboxID, result)
+	return r.commitSendStateChange(ctx, tx, "cancel", outboxID, nowMS, result)
 }
 
 // MarkUncertain records an unknown outcome after the transport call boundary.
@@ -1531,6 +1634,141 @@ func (r *OutboxRepository) ConfirmWithoutResult(
 	return r.requireLeaseMutation(ctx, "confirm without result", outboxID, result)
 }
 
+// ConfirmReaction terminally confirms a reaction's active called lease and, in
+// the same transaction, applies the reaction to the read model as this
+// account's own. Sending a reaction stores nothing else locally, so without
+// this row a reader would see the reaction only if the transport later
+// reported it back. The row is the one such a report addresses
+// (SelfReactorKey), and it is applied with ApplyReaction's ordering rule, so a
+// mutation of the same reactor that already carries a later time wins.
+//
+// The target's account and conversation are read from the message as it is
+// stored now, not from the outbox row, because a message can be rebound to
+// another conversation after its reaction was queued. applied reports whether
+// the read model changed.
+//
+// A message whose reactions come from full snapshots (Google, which has a
+// reaction_snapshot_fences row) gets no own row when the latest snapshot
+// applied to it was received at or after the transport was called. Such a
+// snapshot may already list the reaction under the reactor the phone names,
+// and an own row beside it would count the reaction twice until the next
+// snapshot. It may instead have left the phone before the phone applied the
+// reaction; then the reaction shows from the next snapshot that lists it,
+// the same gap the other order has, where that snapshot tombstones the own
+// row.
+func (r *OutboxRepository) ConfirmReaction(
+	ctx context.Context,
+	confirmation ReactionConfirmation,
+) (applied bool, err error) {
+	occurredAtMS := confirmation.OccurredAt.UnixMilli()
+	if occurredAtMS <= 0 {
+		return false, fmt.Errorf(
+			"confirm reaction outbox item %q: occurrence time is not positive",
+			confirmation.OutboxID,
+		)
+	}
+	nowMS, err := r.nowMS("confirm reaction outbox item")
+	if err != nil {
+		return false, err
+	}
+	tx, err := r.store.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, fmt.Errorf(
+			"confirm reaction outbox item %q: begin transaction: %w",
+			confirmation.OutboxID,
+			err,
+		)
+	}
+	defer tx.Rollback()
+
+	// Read before the update clears it. The update below succeeds only when
+	// the row is still called under this lease, so the value is then set.
+	var calledAtMS sql.NullInt64
+	if err := tx.QueryRowContext(ctx, `
+		SELECT transport_called_at_ms FROM outbox WHERE outbox_id = ?
+	`, confirmation.OutboxID).Scan(&calledAtMS); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return false, fmt.Errorf(
+			"confirm reaction outbox item %q: read transport call time: %w",
+			confirmation.OutboxID,
+			err,
+		)
+	}
+
+	result, err := tx.ExecContext(ctx, `
+		UPDATE outbox
+		SET state = 'confirmed',
+			result_remote_id = ?,
+			error_class = NULL,
+			error_code = NULL,
+			error_detail = NULL,
+			next_attempt_at_ms = NULL,
+			lease_owner = NULL,
+			lease_token = NULL,
+			lease_expires_at_ms = NULL,
+			transport_called_at_ms = NULL,
+			updated_at_ms = ?
+		WHERE outbox_id = ?
+		  AND kind = 'reaction'
+		  AND state = 'dispatching'
+		  AND lease_token = ?
+		  AND transport_called_at_ms IS NOT NULL
+	`,
+		nullableOutboxText(strings.TrimSpace(confirmation.ResultRemoteID)),
+		nowMS,
+		confirmation.OutboxID,
+		confirmation.LeaseToken,
+	)
+	if err != nil {
+		return false, fmt.Errorf("confirm reaction outbox item %q: update: %w", confirmation.OutboxID, err)
+	}
+	if err := r.requireLeaseMutationWithQueryer(
+		ctx, tx, "confirm reaction", confirmation.OutboxID, result,
+	); err != nil {
+		return false, err
+	}
+
+	reaction := ReactionApply{
+		ReactorKey:    SelfReactorKey,
+		ReactorIsSelf: true,
+		ReactorLabel:  SelfReactorLabel,
+		OccurredAtMS:  occurredAtMS,
+		SourceSeqMS:   occurredAtMS,
+	}
+	var action string
+	var snapshotSeqMS sql.NullInt64
+	if err := tx.QueryRowContext(ctx, `
+		SELECT m.message_id, m.account_id, m.conversation_id, r.emoji, r.action, f.source_seq_ms
+		FROM outbox_reactions AS r
+		JOIN messages AS m ON m.message_id = r.target_message_id
+		LEFT JOIN reaction_snapshot_fences AS f ON f.message_id = m.message_id
+		WHERE r.outbox_id = ?
+	`, confirmation.OutboxID).Scan(
+		&reaction.MessageID,
+		&reaction.AccountID,
+		&reaction.ConversationID,
+		&reaction.Emoji,
+		&action,
+		&snapshotSeqMS,
+	); err != nil {
+		return false, fmt.Errorf(
+			"confirm reaction outbox item %q: read reaction target: %w",
+			confirmation.OutboxID,
+			err,
+		)
+	}
+	reaction.Action = bridge.ReactionAction(action)
+	if !snapshotSeqMS.Valid || snapshotSeqMS.Int64 < calledAtMS.Int64 {
+		applied, err = applyReaction(ctx, tx, reaction, nowMS)
+		if err != nil {
+			return false, fmt.Errorf("confirm reaction outbox item %q: %w", confirmation.OutboxID, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("confirm reaction outbox item %q: commit: %w", confirmation.OutboxID, err)
+	}
+	return applied, nil
+}
+
 // Confirm atomically records a known remote result for the active called
 // transport lease.
 func (r *OutboxRepository) Confirm(
@@ -1581,17 +1819,15 @@ func (r *OutboxRepository) Confirm(
 
 	var (
 		accountID          string
-		conversationID     string
 		localMessageID     sql.NullString
 		transportRequestID string
 	)
 	if err := tx.QueryRowContext(ctx, `
-		SELECT account_id, conversation_id, local_message_id, transport_request_id
+		SELECT account_id, local_message_id, transport_request_id
 		FROM outbox
 		WHERE outbox_id = ?
 	`, confirmation.OutboxID).Scan(
 		&accountID,
-		&conversationID,
 		&localMessageID,
 		&transportRequestID,
 	); err != nil {
@@ -1606,7 +1842,6 @@ func (r *OutboxRepository) Confirm(
 			ctx,
 			tx,
 			accountID,
-			conversationID,
 			localMessageID.String,
 			transportRequestID,
 			resultRemoteID,
@@ -1647,18 +1882,45 @@ func (r *OutboxRepository) ReconcileConfirm(
 	}
 	defer tx.Rollback()
 
+	outcome, err := r.reconcileConfirmTx(ctx, tx, req)
+	if err != nil {
+		return "", err
+	}
+	if err := commitReconcile(tx, outcome, req.TransportRequestID); err != nil {
+		return "", err
+	}
+	return outcome, nil
+}
+
+// commitReconcile commits a reconcile that changed durable state. NotFound and
+// Noop changed nothing, so their transaction is left to roll back.
+func commitReconcile(tx *sql.Tx, outcome ReconcileOutcome, transportRequestID string) error {
+	if outcome != ReconcileOutcomeReconciled && outcome != ReconcileOutcomeEnriched {
+		return nil
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("reconcile transport request %q: commit %s: %w", transportRequestID, outcome, err)
+	}
+	return nil
+}
+
+// reconcileConfirmTx is ReconcileConfirm inside the caller's transaction. It
+// never commits; the caller commits when the outcome changed durable state.
+func (r *OutboxRepository) reconcileConfirmTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	req ReconcileRequest,
+) (ReconcileOutcome, error) {
 	var (
 		outboxID                string
-		conversationID          string
 		state                   OutboxState
 		localMessageID          sql.NullString
 		persistedResultRemoteID sql.NullString
 		localRemoteMessageID    sql.NullString
 	)
-	err = tx.QueryRowContext(ctx, `
+	err := tx.QueryRowContext(ctx, `
 		SELECT
 			o.outbox_id,
-			o.conversation_id,
 			o.state,
 			o.local_message_id,
 			o.result_remote_id,
@@ -1668,7 +1930,6 @@ func (r *OutboxRepository) ReconcileConfirm(
 		WHERE o.account_id = ? AND o.transport_request_id = ?
 	`, req.AccountID, req.TransportRequestID).Scan(
 		&outboxID,
-		&conversationID,
 		&state,
 		&localMessageID,
 		&persistedResultRemoteID,
@@ -1713,16 +1974,12 @@ func (r *OutboxRepository) ReconcileConfirm(
 				ctx,
 				tx,
 				req.AccountID,
-				conversationID,
 				localMessageID.String,
 				req.TransportRequestID,
 				req.ResultRemoteID,
 			); err != nil {
 				return "", fmt.Errorf("reconcile outbox item %q: %w", outboxID, err)
 			}
-		}
-		if err := tx.Commit(); err != nil {
-			return "", fmt.Errorf("reconcile outbox item %q: commit: %w", outboxID, err)
 		}
 		return ReconcileOutcomeReconciled, nil
 
@@ -1777,15 +2034,11 @@ func (r *OutboxRepository) ReconcileConfirm(
 			ctx,
 			tx,
 			req.AccountID,
-			conversationID,
 			localMessageID.String,
 			req.TransportRequestID,
 			req.ResultRemoteID,
 		); err != nil {
 			return "", fmt.Errorf("reconcile outbox item %q: %w", outboxID, err)
-		}
-		if err := tx.Commit(); err != nil {
-			return "", fmt.Errorf("reconcile outbox item %q: commit enrichment: %w", outboxID, err)
 		}
 		return ReconcileOutcomeEnriched, nil
 
@@ -1816,7 +2069,7 @@ func requireSingleReconcileMutation(result sql.Result, outboxID string) error {
 func (r *OutboxRepository) repointLocalMessage(
 	ctx context.Context,
 	tx *sql.Tx,
-	accountID, conversationID, localMessageID, transportRequestID, realID string,
+	accountID, localMessageID, transportRequestID, realID string,
 ) error {
 	if realID == transportRequestID {
 		return nil
@@ -1826,6 +2079,24 @@ func (r *OutboxRepository) repointLocalMessage(
 		return err
 	}
 
+	// The natural key the UPDATE below must keep unique is scoped to the
+	// conversation the local row is in now, which a repair move can change
+	// from the outbox row's. If the local row is gone there is nothing to
+	// repoint, and an echo row already holding realID is then the only copy
+	// of the sent message, so it stays.
+	var localConversationID string
+	err = tx.QueryRowContext(ctx, `
+		SELECT conversation_id
+		FROM messages
+		WHERE message_id = ? AND account_id = ?
+	`, localMessageID, accountID).Scan(&localConversationID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("repoint local message %q: read local row: %w", localMessageID, err)
+	}
+
 	var collisionMessageID string
 	err = tx.QueryRowContext(ctx, `
 		SELECT message_id
@@ -1833,11 +2104,25 @@ func (r *OutboxRepository) repointLocalMessage(
 		WHERE account_id = ?
 		  AND conversation_id = ?
 		  AND remote_message_id = ?
-	`, accountID, conversationID, realID).Scan(&collisionMessageID)
+	`, accountID, localConversationID, realID).Scan(&collisionMessageID)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("repoint local message %q: read remote-ID collision: %w", localMessageID, err)
 	}
 	if err == nil && collisionMessageID != localMessageID {
+		if err := mergeDuplicateMessage(
+			ctx,
+			tx,
+			collisionMessageID,
+			localMessageID,
+			nowMS,
+		); err != nil {
+			return fmt.Errorf(
+				"repoint local message %q: merge echo duplicate %q: %w",
+				localMessageID,
+				collisionMessageID,
+				mapConstraintError(err),
+			)
+		}
 		if _, err := tx.ExecContext(ctx, `
 			DELETE FROM messages
 			WHERE message_id = ?
@@ -2018,6 +2303,16 @@ func (r *OutboxRepository) FindStoreFailedDue(
 	return items, nil
 }
 
+// latestOutboxStateQuery seeks outbox_local_message_idx and reads its newest
+// entry; read surfaces run it for every outgoing message they render.
+const latestOutboxStateQuery = `
+	SELECT state
+	FROM outbox
+	WHERE account_id = ? AND local_message_id = ?
+	ORDER BY created_at_ms DESC, outbox_id DESC
+	LIMIT 1
+`
+
 // LatestStateForLocalMessage returns the delivery state of the most recent
 // outbox row for an optimistic outgoing message, so a read surface can show
 // its send lifecycle. ok is false when the message has no outbox row (a
@@ -2028,13 +2323,9 @@ func (r *OutboxRepository) LatestStateForLocalMessage(
 	accountID, localMessageID string,
 ) (state OutboxState, ok bool, err error) {
 	var value string
-	scanErr := r.store.db.QueryRowContext(ctx, `
-		SELECT state
-		FROM outbox
-		WHERE account_id = ? AND local_message_id = ?
-		ORDER BY created_at_ms DESC, outbox_id DESC
-		LIMIT 1
-	`, accountID, localMessageID).Scan(&value)
+	scanErr := r.store.db.QueryRowContext(
+		ctx, latestOutboxStateQuery, accountID, localMessageID,
+	).Scan(&value)
 	if errors.Is(scanErr, sql.ErrNoRows) {
 		return "", false, nil
 	}

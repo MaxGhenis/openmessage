@@ -24,6 +24,13 @@ type EchoObserver interface {
 	ObserveTransportEcho(context.Context, messaging.TransportEcho) (messaging.EchoOutcome, error)
 }
 
+// UncorrelatedEchoObserver is an optional EchoObserver capability: it
+// correlates an outgoing Google echo that carries no TmpID to its send by
+// content. Observers without it leave such echoes uncorrelated.
+type UncorrelatedEchoObserver interface {
+	ObserveUncorrelatedEcho(context.Context, messaging.UncorrelatedEcho) (messaging.EchoOutcome, error)
+}
+
 // DecoderRegistration binds a durable codec to both its pure decoder and the
 // platform needed for shared key derivation.
 //
@@ -626,6 +633,7 @@ func (w *Worker) applyEvents(
 				*event.Message,
 				messageCount == 0,
 				false,
+				record.ReceivedAt,
 			)
 			if err != nil {
 				return false, err
@@ -1259,7 +1267,7 @@ func (w *Worker) historyMessage(
 		w.counters.account(accountID).historyExisting.Add(1)
 		return sqlite.Message{}, false, nil
 	}
-	projection, duplicateOf, err := w.messageProjection(ctx, accountID, platform, inboxID, event, routeEcho, true)
+	projection, duplicateOf, err := w.messageProjection(ctx, accountID, platform, inboxID, event, routeEcho, true, time.Time{})
 	if errors.Is(err, errHistoryUnplaceable) {
 		w.counters.account(accountID).historySkipped.Add(1)
 		w.logger.Debug().
@@ -1451,9 +1459,9 @@ func (w *Worker) prepareReactionActor(
 ) (preparedReactionActor, error) {
 	if reference.IsSelf {
 		return preparedReactionActor{
-			key:    "self",
+			key:    sqlite.SelfReactorKey,
 			isSelf: true,
-			label:  "me",
+			label:  sqlite.SelfReactorLabel,
 		}, nil
 	}
 	if identityRaw(reference) == "" {
@@ -1616,6 +1624,56 @@ func reactionRemoteTargetKey(
 		"\x1f" + strings.TrimSpace(remoteMessageID)
 }
 
+// echoSeenAt is when this machine first had an echo frame: its inbox receipt,
+// or now for a record that carries none.
+func (w *Worker) echoSeenAt(receivedAt time.Time) time.Time {
+	if receivedAt.IsZero() {
+		return w.now()
+	}
+	return receivedAt
+}
+
+// observeUncorrelatedEcho correlates an outgoing Google text echo whose TmpID
+// is empty to its send (see sqlite.ReconcileUncorrelatedEcho). Like a TmpID
+// echo, it is best-effort: a fault is counted and the frame projects anyway.
+// Echoes of messages sent from the phone itself match nothing and are not
+// counted.
+func (w *Worker) observeUncorrelatedEcho(
+	ctx context.Context,
+	accountID string,
+	platform bridge.Platform,
+	event bridge.MessageEvent,
+	remoteMessageID string,
+	receivedAt time.Time,
+) {
+	if platform != bridge.PlatformGoogle || strings.TrimSpace(event.Body) == "" || len(event.Attachments) > 0 {
+		return
+	}
+	observer, ok := w.echoes.(UncorrelatedEchoObserver)
+	if !ok {
+		return
+	}
+	outcome, err := observer.ObserveUncorrelatedEcho(ctx, messaging.UncorrelatedEcho{
+		AccountID:            accountID,
+		RemoteConversationID: v2keys.NormalizeRemoteConversationID(string(platform), event.RemoteConversationID),
+		RemoteMessageID:      remoteMessageID,
+		Body:                 event.Body,
+		SeenAt:               w.echoSeenAt(receivedAt),
+		OccurredAt:           event.OccurredAt,
+	})
+	switch {
+	case err != nil:
+		w.counters.account(accountID).echoErrors.Add(1)
+		w.logger.Warn().
+			Str("account_id", accountID).
+			Str("remote_message_id", remoteMessageID).
+			Err(err).
+			Msg("ingest: uncorrelated echo reconcile failed; projecting anyway")
+	case outcome == messaging.EchoReconciled || outcome == messaging.EchoEnriched:
+		w.counters.account(accountID).echoContentMatched.Add(1)
+	}
+}
+
 func (w *Worker) messageProjection(
 	ctx context.Context,
 	accountID string,
@@ -1624,6 +1682,7 @@ func (w *Worker) messageProjection(
 	event bridge.MessageEvent,
 	routeEcho bool,
 	history bool,
+	receivedAt time.Time,
 ) (sqlite.MessageProjection, *sqlite.Message, error) {
 	direction, err := messageDirection(event.Direction)
 	if err != nil {
@@ -1635,7 +1694,11 @@ func (w *Worker) messageProjection(
 	}
 
 	observeEcho := func() error {
-		if !routeEcho || strings.TrimSpace(event.ClientRequestID) == "" || direction != sqlite.MessageDirectionOutgoing {
+		if !routeEcho || direction != sqlite.MessageDirectionOutgoing {
+			return nil
+		}
+		if strings.TrimSpace(event.ClientRequestID) == "" {
+			w.observeUncorrelatedEcho(ctx, accountID, platform, event, remoteMessageID, receivedAt)
 			return nil
 		}
 		if w.echoes == nil {
@@ -1798,6 +1861,11 @@ func (w *Worker) messageProjection(
 	attachments := make([]sqlite.MessageAttachment, 0, len(event.Attachments))
 	for index, attachment := range event.Attachments {
 		size := attachment.Size
+		var lastError *string
+		if report := strings.TrimSpace(attachment.TransportError); report != "" {
+			note := sqlite.ReceiveAttachmentErrorPrefix + report
+			lastError = &note
+		}
 		attachments = append(attachments, sqlite.MessageAttachment{
 			RemoteID:  attachment.RemoteID,
 			Ordinal:   int64(index),
@@ -1806,6 +1874,7 @@ func (w *Worker) messageProjection(
 			MIME:      attachment.MIME,
 			SizeBytes: &size,
 			State:     "pending",
+			LastError: lastError,
 		})
 	}
 

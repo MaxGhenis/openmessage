@@ -10,12 +10,32 @@ import (
 	"go.mau.fi/mautrix-gmessages/pkg/libgm/gmproto"
 
 	"github.com/maxghenis/openmessage/internal/db"
+	"github.com/maxghenis/openmessage/internal/signallive"
 )
 
 const (
 	schedulerTickInterval = 20 * time.Second
 	scheduleMaxAttempts   = 5
 )
+
+// errScheduledSendUnconfirmed marks a scheduled SMS/RCS send whose SendMessage
+// request may have reached Google: the phone never answered it, a disconnect
+// cut it off, or a network or server error ended it after it went out. The
+// phone may still deliver it, so sending it again could deliver it twice,
+// with a new TmpID each time.
+var errScheduledSendUnconfirmed = errors.New("Google Messages did not confirm the send, so it may have gone out; not retried")
+
+// googleSendStepError wraps an error from a scheduled send's SendMessage step.
+// Only an auth rejection, or no client to send with, proves the request was
+// not accepted; any other error is marked errScheduledSendUnconfirmed, as the
+// legacy HTTP send treats it (it keeps its idempotency claim). A failed
+// conversation lookup or upload before it sent nothing and stays retryable.
+func googleSendStepError(err error) error {
+	if IsGoogleAuthExpiredError(err) || isGoogleAuthInvalid(err) || strings.Contains(err.Error(), ErrNotConnected) {
+		return fmt.Errorf("send message: %w", err)
+	}
+	return fmt.Errorf("send message: %w: %w", errScheduledSendUnconfirmed, err)
+}
 
 // StartScheduler launches the background loop that sends due scheduled messages.
 // It catches up immediately on startup (for messages whose time passed while the
@@ -68,6 +88,18 @@ func (a *App) sendScheduledMessage(sm *db.ScheduledMessage) {
 	}
 	if err != nil {
 		a.Logger.Warn().Err(err).Str("scheduled_id", sm.ID).Msg("Scheduler: send failed")
+		if errors.Is(err, errScheduledSendUnconfirmed) {
+			_ = a.Store.MarkScheduledMessageFailed(sm.ID, err.Error())
+			a.emitConversationsChange()
+			return
+		}
+		// signal-cli was finishing an attachment download for a receive
+		// call, which can take minutes; the send never ran. Retry without
+		// spending one of the few attempts.
+		if signallive.IsReceiveDrainingError(err) {
+			_ = a.Store.RequeueScheduledMessage(sm.ID, err.Error())
+			return
+		}
 		a.retryOrFail(sm, err.Error())
 		return
 	}
@@ -159,23 +191,19 @@ func (a *App) recordScheduledSend(msg *db.Message, err error) (*db.Message, erro
 // and records it locally. The SMS media payload carries no caption, so a
 // non-empty caption is sent as a follow-up text (lossless).
 func (a *App) sendSMSMedia(conversationID string, data []byte, filename, mime, caption, replyToID string) (*db.Message, error) {
-	cli := a.GetClient()
-	if cli == nil {
-		return nil, errors.New(ErrNotConnected)
-	}
-	media, err := cli.GM.UploadMedia(data, filename, mime)
+	media, err := uploadGoogleMedia(a, data, filename, mime)
 	if err != nil {
 		return nil, fmt.Errorf("upload media: %w", err)
 	}
-	conv, err := cli.GM.GetConversation(conversationID)
+	conv, err := getGoogleConversationForSend(a, conversationID)
 	if err != nil {
 		return nil, fmt.Errorf("get conversation: %w", err)
 	}
 	myParticipantID, simPayload := ExtractSIMAndParticipant(conv)
 	payload := BuildSendMediaPayload(conversationID, media, myParticipantID, simPayload)
-	resp, err := cli.GM.SendMessage(payload)
+	resp, err := sendGoogleTextPayload(a, payload)
 	if err != nil {
-		return nil, fmt.Errorf("send message: %w", err)
+		return nil, googleSendStepError(err)
 	}
 	if resp.GetStatus() != gmproto.SendMessageResponse_SUCCESS {
 		return nil, fmt.Errorf("send failed: %s", resp.GetStatus().String())
@@ -235,19 +263,15 @@ func (a *App) routeReady(conversationID string) bool {
 
 // sendSMSText sends a Google Messages (SMS/RCS) text and records it locally.
 func (a *App) sendSMSText(conversationID, body, replyToID string) (*db.Message, error) {
-	cli := a.GetClient()
-	if cli == nil {
-		return nil, errors.New(ErrNotConnected)
-	}
-	conv, err := cli.GM.GetConversation(conversationID)
+	conv, err := getGoogleConversationForSend(a, conversationID)
 	if err != nil {
 		return nil, fmt.Errorf("get conversation: %w", err)
 	}
 	myParticipantID, simPayload := ExtractSIMAndParticipant(conv)
 	payload := BuildSendPayload(conversationID, body, replyToID, myParticipantID, simPayload)
-	resp, err := cli.GM.SendMessage(payload)
+	resp, err := sendGoogleTextPayload(a, payload)
 	if err != nil {
-		return nil, fmt.Errorf("send message: %w", err)
+		return nil, googleSendStepError(err)
 	}
 	if resp.GetStatus() != gmproto.SendMessageResponse_SUCCESS {
 		return nil, fmt.Errorf("send failed: %s", resp.GetStatus().String())
