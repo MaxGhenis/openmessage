@@ -2595,6 +2595,82 @@ test('an auth-dead Google session (disconnected + needs_repair) shows Re-pair, n
   await expect(page.locator('#connection-banner-action')).toHaveText('Reconnect');
 });
 
+// 2026-10-22: an expired Google cookie showed "your phone unlinked
+// OpenMessage. Re-pair to fix it." while the backend only needed to refresh
+// the cookie. Recovering states must never ask for a re-pair.
+test('an expired Google cookie being refreshed says reconnecting, never Re-pair', async ({ page }) => {
+  await page.waitForFunction(() => window.__openMessageTestHooks?.applyAppStatus);
+  const status = (google) => ({
+    connected: true,
+    google: { connected: false, paired: true, needs_pairing: false, needs_repair: false, ...google },
+    whatsapp: { connected: true, paired: true },
+    signal: { connected: true, paired: true },
+    backfill: { running: false },
+  });
+
+  // A refresh is running: say so, offer nothing to press.
+  await page.evaluate((s) => window.__openMessageTestHooks.applyAppStatus(s), status({
+    auth_expired: true,
+    reconnecting: true,
+    supervisor: { state: 'repairing_credentials', repair: { attempts: 1, last_outcome: 'running' } },
+  }));
+  await expect(page.locator('#connection-banner')).toBeVisible();
+  await expect(page.locator('#connection-banner-copy')).toContainText('refreshing it from Chrome');
+  await expect(page.locator('#connection-banner-copy')).toContainText('No re-pair needed');
+  await expect(page.locator('#connection-banner-copy')).not.toContainText('unlinked');
+  await expect(page.locator('#connection-banner-action')).toBeHidden();
+
+  // A refresh failed and waits to retry: show why, and let the user retry now.
+  await page.evaluate((s) => window.__openMessageTestHooks.applyAppStatus(s), status({
+    auth_expired: true,
+    reconnecting: true,
+    supervisor: {
+      state: 'repairing_credentials',
+      retry_at_ms: Date.now() + 4 * 60_000,
+      repair: { attempts: 2, last_outcome: 'failed_retrying', last_error: 'keychain locked' },
+    },
+  }));
+  await expect(page.locator('#connection-banner-copy')).toContainText('keychain locked');
+  await expect(page.locator('#connection-banner-copy')).toContainText('Retrying at');
+  await expect(page.locator('#connection-banner-action')).toHaveText('Retry now');
+  await expect(page.locator('#connection-banner-action')).toHaveAttribute('data-action', 'reconnect-google');
+
+  // A plain reconnect backoff also reads as recovering.
+  await page.evaluate((s) => window.__openMessageTestHooks.applyAppStatus(s), status({
+    reconnecting: true,
+    supervisor: { state: 'backoff', retry_at_ms: Date.now() + 30_000, repair: {} },
+  }));
+  await expect(page.locator('#connection-banner-copy')).toHaveText('Reconnecting to Google Messages…');
+  await expect(page.locator('#connection-banner-action')).toHaveText('Retry now');
+});
+
+test('a parked Google supervisor explains why and asks for Re-pair only when the session is the problem', async ({ page }) => {
+  await page.waitForFunction(() => window.__openMessageTestHooks?.applyAppStatus);
+  const parked = (supervisor) => ({
+    connected: true,
+    google: { connected: false, paired: true, needs_pairing: false, needs_repair: true, auth_expired: true, supervisor },
+    whatsapp: { connected: true, paired: true },
+    signal: { connected: true, paired: true },
+    backfill: { running: false },
+  });
+
+  // Fresh cookies rejected again and again: check Chrome, then reconnect.
+  await page.evaluate((s) => window.__openMessageTestHooks.applyAppStatus(s), parked({
+    state: 'blocked', block_reason: 'repeated_failure', error_class: 'credentials_expired', repair: { attempts: 5 },
+  }));
+  await expect(page.locator('#connection-banner-copy')).toContainText('keeps rejecting fresh sign-in cookies');
+  await expect(page.locator('#connection-banner-action')).toHaveText('Reconnect');
+  await expect(page.locator('#connection-banner-action')).toHaveAttribute('data-action', 'reconnect-google');
+
+  // No refresh mechanism at all: a re-pair is the fix.
+  await page.evaluate((s) => window.__openMessageTestHooks.applyAppStatus(s), parked({
+    state: 'blocked', block_reason: 'repair_failed', error_class: 'credentials_expired',
+    repair: { last_outcome: 'failed_blocked', last_error: 'Google cookie refresh is unavailable; pair again' },
+  }));
+  await expect(page.locator('#connection-banner-copy')).toContainText('can’t refresh its sign-in automatically');
+  await expect(page.locator('#connection-banner-action')).toHaveText('Re-pair');
+});
+
 // Review of #227: a reaction whose response was lost may already be on the
 // outbox. The page must not call it unsent, and tapping it again must replay
 // the same intent (same idempotency key) rather than store a second one. Once

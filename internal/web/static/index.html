@@ -12963,13 +12963,96 @@ body::after {
 
   // ─── Status Check ───
   function normalizeGoogleStatus(raw = {}) {
+    const supervisor = raw.supervisor || {};
+    const repair = supervisor.repair || {};
     return {
       connected: !!raw.connected,
       paired: raw.paired === undefined ? !!raw.connected : !!raw.paired,
       needs_pairing: !!raw.needs_pairing,
       needs_repair: !!raw.needs_repair,
+      auth_expired: !!raw.auth_expired,
+      reconnecting: !!raw.reconnecting,
       phone_responding: raw.phone_responding === undefined ? true : !!raw.phone_responding,
       last_error: raw.last_error || '',
+      supervisor: {
+        state: supervisor.state || '',
+        block_reason: supervisor.block_reason || '',
+        error_class: supervisor.error_class || '',
+        retry_at_ms: Number(supervisor.retry_at_ms || 0),
+        repair: {
+          attempts: Number(repair.attempts || 0),
+          last_outcome: repair.last_outcome || '',
+          last_error: repair.last_error || '',
+        },
+      },
+    };
+  }
+
+  // Disconnected, but the backend is still recovering on its own: connecting,
+  // backing off, or refreshing expired sign-in cookies from Chrome. That is
+  // never a reason to re-pair (2026-10-22: the banner said "Re-pair" while a
+  // cookie refresh was all the account needed).
+  function googleIsRecovering() {
+    if (googleStatus.connected || googleStatus.needs_repair || !googleStatus.paired) return false;
+    return googleStatus.reconnecting || googleStatus.auth_expired;
+  }
+
+  function googleRefreshingCredentials() {
+    return googleStatus.auth_expired || googleStatus.supervisor.state === 'repairing_credentials';
+  }
+
+  // A recovery step is waiting out a backoff, so "Retry now" can help.
+  function googleRetryIsWaiting() {
+    const repair = googleStatus.supervisor.repair;
+    return googleStatus.supervisor.retry_at_ms > 0 &&
+      (repair.last_outcome === 'failed_retrying' || googleStatus.supervisor.state === 'backoff');
+  }
+
+  // An absolute time, so the banner stays right between status changes (it
+  // re-renders only when the status itself changes).
+  function googleRetryWhen() {
+    const at = googleStatus.supervisor.retry_at_ms;
+    if (!at) return '';
+    if (at - Date.now() < 60_000) return 'shortly';
+    return 'at ' + new Date(at).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+  }
+
+  function googleRecoveringCopy() {
+    if (!googleRefreshingCredentials()) {
+      return 'Reconnecting to Google Messages…';
+    }
+    const repair = googleStatus.supervisor.repair;
+    if (repair.last_outcome === 'failed_retrying' && repair.last_error) {
+      const when = googleRetryWhen();
+      return `Reconnecting Google Messages — couldn’t refresh its Google sign-in from Chrome yet (${repair.last_error}).`
+        + (when ? ` Retrying ${when}.` : ' Retrying.');
+    }
+    return 'Reconnecting Google Messages — its Google sign-in expired, so OpenMessage is refreshing it from Chrome. No re-pair needed.';
+  }
+
+  // Automatic recovery has stopped. Say why, and only ask for a re-pair when
+  // the session itself is the problem.
+  function googleStoppedCopy() {
+    const { block_reason: reason, error_class: errorClass, repair } = googleStatus.supervisor;
+    if (reason === 'repeated_failure' && errorClass === 'credentials_expired') {
+      return {
+        copy: 'Google keeps rejecting fresh sign-in cookies from Chrome. Make sure Chrome is signed in to your Google account, then reconnect. If that doesn’t work, re-pair.',
+        label: 'Reconnect',
+        action: 'reconnect-google',
+      };
+    }
+    if (reason === 'repair_failed' || reason === 'repair_unavailable') {
+      const detail = repair.last_error ? ` (${repair.last_error})` : '';
+      return {
+        copy: `Google Messages can’t refresh its sign-in automatically${detail}. Re-pair to fix it.`,
+        label: 'Re-pair',
+        action: 'open-platforms',
+      };
+    }
+    return {
+      copy: 'Google Messages disconnected and can’t recover on its own — your phone may have unlinked OpenMessage. Re-pair to fix it.',
+      label: 'Re-pair',
+      action: 'open-platforms',
     };
   }
 
@@ -13010,13 +13093,19 @@ body::after {
     $connectionBanner.className = 'connection-banner disconnected';
     $connectionBanner.style.display = 'flex';
     if (googleStatus.paired && googleStatus.needs_repair) {
-      // Disconnected because the credentials are dead (auth 401) — reconnect
-      // won't recover it, so steer to re-pair rather than a "Reconnect" that
-      // just 401s again.
-      $connectionBannerCopy.textContent = 'Google Messages disconnected — your phone unlinked OpenMessage. Re-pair to fix it.';
-      $connectionBannerAction.textContent = 'Re-pair';
-      $connectionBannerAction.dataset.action = 'open-platforms';
+      // Automatic recovery has stopped (the supervisor parked, or sends keep
+      // failing). Say why; steer to re-pair only when the session is the
+      // problem, since a needless re-pair risks pairing throttles.
+      const stopped = googleStoppedCopy();
+      $connectionBannerCopy.textContent = stopped.copy;
+      $connectionBannerAction.textContent = stopped.label;
+      $connectionBannerAction.dataset.action = stopped.action;
       $connectionBannerAction.style.display = '';
+    } else if (googleIsRecovering()) {
+      $connectionBannerCopy.textContent = googleRecoveringCopy();
+      $connectionBannerAction.textContent = 'Retry now';
+      $connectionBannerAction.dataset.action = 'reconnect-google';
+      $connectionBannerAction.style.display = googleRetryIsWaiting() ? '' : 'none';
     } else if (googleStatus.paired && !googleStatus.needs_pairing) {
       $connectionBannerCopy.textContent = 'Google Messages sync is paused';
       $connectionBannerAction.textContent = 'Reconnect';
@@ -13144,6 +13233,8 @@ body::after {
   function googleStatusText() {
     if (googleStatus.connected && !googleStatus.phone_responding) return 'Phone offline';
     if (googleStatus.connected) return 'Connected';
+    if (googleStatus.paired && googleStatus.needs_repair) return 'Needs attention';
+    if (googleIsRecovering()) return googleRefreshingCredentials() ? 'Refreshing sign-in…' : 'Reconnecting…';
     if (googleStatus.paired && !googleStatus.needs_pairing) return 'Needs reconnect';
     return 'Needs pairing';
   }
@@ -13178,8 +13269,11 @@ body::after {
     } else if (googleDisconnected) {
       // Live sync warning still surfaces a reconnect CTA whether or not
       // conversations already exist, because it is actionable either way.
-      title = noConversations ? 'Reconnect Google Messages' : 'Live sync is paused';
-      copy = 'New messages will not arrive until Google Messages reconnects.';
+      const recovering = googleIsRecovering();
+      title = recovering ? 'Reconnecting Google Messages' : (noConversations ? 'Reconnect Google Messages' : 'Live sync is paused');
+      copy = recovering
+        ? 'New messages will arrive once Google Messages reconnects. No re-pair needed.'
+        : 'New messages will not arrive until Google Messages reconnects.';
       notes = [];
       action = 'reconnect-google';
       cta = 'Reconnect';
@@ -13292,6 +13386,13 @@ body::after {
       $gmReconnectBtn.disabled = false;
       $gmReconnectBtn.textContent = 'Pair again';
       $gmReconnectBtn.dataset.mode = 'pair';
+    } else if (googleIsRecovering()) {
+      $gmHelper.textContent = googleRecoveringCopy();
+      showGoogleError('');
+      $gmActionsRow.style.display = '';
+      $gmReconnectBtn.disabled = !googleRetryIsWaiting();
+      $gmReconnectBtn.textContent = 'Retry now';
+      $gmReconnectBtn.dataset.mode = 'reconnect';
     } else if (googleStatus.paired && !googleStatus.needs_pairing) {
       $gmHelper.textContent = 'This Google Messages account is paired locally, but live SMS and RCS sync is currently paused. Reconnect to resume updates.';
       showGoogleError(googleStatus.last_error);

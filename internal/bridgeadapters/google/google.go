@@ -673,6 +673,14 @@ func (r *run) classifyEvent(evt any) (bridge.OpError, bool) {
 			Cause:       errors.New("Google account logged out server-side"),
 		}, true
 	case *events.PingFailed:
+		// A ping (or set-active-session) rejected with HTTP 401 means Google
+		// no longer accepts the session cookies. That is one answer, not a
+		// flaky phone: route it to credential repair now. Waiting for three
+		// failures kept SMS dead for minutes, then spent a transient reconnect
+		// only to learn the same thing from the new generation's long poll.
+		if app.IsGoogleAuthExpiredError(event.Error) {
+			return r.adapter.classifyTransportError(event.Error, "ping", "google_ping_auth_expired"), true
+		}
 		if event.ErrorCount >= 3 {
 			return bridge.OpError{
 				Class:       bridge.FailureTransient,

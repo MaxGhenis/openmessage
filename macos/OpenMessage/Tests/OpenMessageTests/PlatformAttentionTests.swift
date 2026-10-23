@@ -69,6 +69,35 @@ final class PlatformAttentionTests: XCTestCase {
         )
     }
 
+    // 2026-10-22: an expired cookie being refreshed read as "needs re-pairing".
+    // A backend that says it is recovering gets a reconnecting line instead.
+    func testRecoveringGoogleSaysReconnectingNotRepair() {
+        let refreshing = status("""
+        {"google": {"connected": false, "paired": true, "needs_pairing": false,
+                    "auth_expired": true, "reconnecting": true}}
+        """)
+        let items = PlatformAttention.evaluate(status: refreshing)
+        XCTAssertEqual(items.map(\.reason), [.reconnecting(refreshingSignIn: true)])
+        XCTAssertEqual(
+            PlatformAttention.alertText(for: items),
+            "Google Messages is reconnecting: refreshing its Google sign-in from Chrome. No re-pair needed."
+        )
+
+        let backoff = status("""
+        {"google": {"connected": false, "paired": true, "reconnecting": true}}
+        """)
+        XCTAssertEqual(
+            PlatformAttention.alertText(for: PlatformAttention.evaluate(status: backoff)),
+            "Google Messages is reconnecting."
+        )
+
+        // Once the backend parks (needs_repair), it is a repair again.
+        let parked = status("""
+        {"google": {"connected": false, "paired": true, "auth_expired": true, "needs_repair": true}}
+        """)
+        XCTAssertEqual(PlatformAttention.evaluate(status: parked).map(\.reason), [.needsRepair])
+    }
+
     func testRepairAndSilenceCombine() {
         let json = status("""
         {"google": {"connected": true, "paired": true},

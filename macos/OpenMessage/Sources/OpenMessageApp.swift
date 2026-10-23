@@ -50,6 +50,11 @@ private final class SettingsViewModel: ObservableObject {
             let needs_pairing: Bool
             let needs_repair: Bool?
             let phone_responding: Bool?
+            /// Google rejected the sign-in cookies; the backend refreshes them
+            /// from Chrome on its own. Not a reason to re-pair.
+            let auth_expired: Bool?
+            /// The backend is reconnecting or refreshing on its own.
+            let reconnecting: Bool?
         }
 
         struct BackfillStatus: Decodable {
@@ -255,15 +260,41 @@ private struct AppSettingsView: View {
                     .buttonStyle(.borderedProminent)
                 } else if googleNeedsRepair {
                     VStack(alignment: .leading, spacing: 10) {
-                        Text("Google Messages needs to be paired again.")
+                        Text("Google Messages stopped and can't recover on its own. Try Reconnect first; if it stops again, pair again.")
                             .font(.footnote)
                             .foregroundStyle(.secondary)
 
-                        Button("Pair again") {
-                            openMainWindow()
-                            backend.beginGooglePairing()
+                        HStack(spacing: 10) {
+                            Button("Reconnect") {
+                                Task {
+                                    await model.reconnectGoogleMessages()
+                                    await model.refresh(notifications: notifications)
+                                }
+                            }
+                            .buttonStyle(.bordered)
+
+                            Button("Pair again") {
+                                openMainWindow()
+                                backend.beginGooglePairing()
+                            }
+                            .buttonStyle(.borderedProminent)
                         }
-                        .buttonStyle(.borderedProminent)
+                    }
+                } else if googleRecovering {
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text(model.appStatus.google?.auth_expired == true
+                            ? "Google's sign-in expired. OpenMessage is refreshing it from Chrome and will reconnect on its own. No re-pair needed."
+                            : "Reconnecting to Google Messages on its own.")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+
+                        Button("Retry now") {
+                            Task {
+                                await model.reconnectGoogleMessages()
+                                await model.refresh(notifications: notifications)
+                            }
+                        }
+                        .buttonStyle(.bordered)
                     }
                 } else if googleNeedsReconnect {
                     Button("Reconnect") {
@@ -443,6 +474,13 @@ private struct AppSettingsView: View {
         return google.paired && !google.connected && !google.needs_pairing && google.needs_repair != true
     }
 
+    /// Disconnected, but the backend is recovering by itself: reconnecting or
+    /// refreshing expired sign-in cookies (2026-10-22: this read as "re-pair").
+    private var googleRecovering: Bool {
+        guard let google = model.appStatus.google else { return false }
+        return googleNeedsReconnect && (google.reconnecting == true || google.auth_expired == true)
+    }
+
     private var googleNeedsRepair: Bool {
         guard let google = model.appStatus.google else { return false }
         return google.paired && google.needs_repair == true
@@ -450,9 +488,10 @@ private struct AppSettingsView: View {
 
     private var googleStatusText: String {
         guard let google = model.appStatus.google else { return "Unavailable" }
-        if google.paired && google.needs_repair == true { return "Needs re-pair" }
+        if google.paired && google.needs_repair == true { return "Needs attention" }
         if google.connected && google.phone_responding == false { return "Phone offline" }
         if google.connected { return "Connected" }
+        if googleRecovering { return google.auth_expired == true ? "Refreshing sign-in…" : "Reconnecting…" }
         if google.paired && !google.needs_pairing { return "Needs reconnect" }
         return "Needs pairing"
     }

@@ -9,6 +9,11 @@ struct PlatformAttention: Equatable {
         /// Re-pair or reauth needed, a paired platform is disconnected, or its
         /// newest message trails the other platforms by days.
         case needsRepair
+        /// Paired and disconnected, but the backend is recovering on its own:
+        /// it reports `reconnecting`, or Google's `auth_expired` while it
+        /// refreshes the sign-in cookies from Chrome. On 2026-10-22 the menu
+        /// said "needs re-pairing" while a cookie refresh was all it needed.
+        case reconnecting(refreshingSignIn: Bool)
         /// Connected, but nothing has arrived for longer than the platform's
         /// own recent traffic explains (`freshness.<key>.stale_reason ==
         /// "silent"`). On 2026-10-06 the phone relayed nothing for 38 hours
@@ -47,6 +52,15 @@ struct PlatformAttention: Equatable {
             let connected = (p["connected"] as? Bool) ?? false
             let needsPairing = (p["needs_pairing"] as? Bool) ?? false
             let needsReauth = (p["needs_reauth"] as? Bool) ?? false
+            let needsRepair = (p["needs_repair"] as? Bool) ?? false
+            let authExpired = (p["auth_expired"] as? Bool) ?? false
+            let reconnecting = (p["reconnecting"] as? Bool) ?? false
+            if paired && !connected && !needsPairing && !needsReauth && !needsRepair
+                && (reconnecting || authExpired) {
+                return PlatformAttention(
+                    key: platform.key, name: platform.name, reason: .reconnecting(refreshingSignIn: authExpired)
+                )
+            }
             if needsPairing || needsReauth || (paired && !connected) {
                 return PlatformAttention(key: platform.key, name: platform.name, reason: .needsRepair)
             }
@@ -103,6 +117,10 @@ struct PlatformAttention: Equatable {
                 sentences.append(silentSentence(item, hours: hours))
             case let .smsStopped(hours, _):
                 sentences.append(smsStoppedSentence(hours: hours))
+            case let .reconnecting(refreshingSignIn):
+                sentences.append(refreshingSignIn
+                    ? "\(item.name) is reconnecting: refreshing its Google sign-in from Chrome. No re-pair needed."
+                    : "\(item.name) is reconnecting.")
             case .needsRepair:
                 break
             }

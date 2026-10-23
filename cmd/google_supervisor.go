@@ -36,6 +36,9 @@ func googleSupervisorPolicy() bridge.Policy {
 		MinBackoff:         5 * time.Second,
 		MaxBackoff:         5 * time.Minute,
 		MaxSameFingerprint: 5,
+		// A failed repair is retried no sooner than the repairer's own pace,
+		// so retries never count as repairs_paced (the fast-revocation alarm).
+		RepairRetryFloor: googleCredentialRepairMinInterval(),
 	}
 }
 
@@ -187,6 +190,8 @@ func (r *googleCredentialRepairer) RepairCredentials(
 	}
 
 	if r.canRepair == nil || !r.canRepair() || r.refresh == nil {
+		// Terminal: without a refresh mechanism no retry can succeed, so this
+		// is the one repair failure that asks for a re-pair.
 		if r.flagRepair != nil {
 			r.flagRepair()
 		}
@@ -198,18 +203,114 @@ func (r *googleCredentialRepairer) RepairCredentials(
 		}
 	}
 
-	repairCtx, cancel := context.WithTimeout(ctx, googleCookieRefreshTimeout)
+	// A failed refresh is recoverable (Chrome, the keychain, a cookie-DB
+	// copy, or the session write can each fail once): the supervisor retries
+	// it with backoff, so it must not raise needs_repair.
+	repairCtx, cancel := context.WithTimeout(r.logger.WithContext(ctx), googleCookieRefreshTimeout)
 	defer cancel()
 	if err := r.refresh(repairCtx, r.sessionPath); err != nil {
-		if r.flagRepair != nil {
-			r.flagRepair()
-		}
 		return fmt.Errorf("refresh Google session cookies: %w", err)
 	}
 	if r.clearRepair != nil {
 		r.clearRepair()
 	}
 	return nil
+}
+
+// googleSupervisorTransitionLogger logs the Google supervisor's lifecycle
+// transitions, and every credential-repair attempt and result with its
+// error. Before it, a failed repair parked the account with no log line at
+// all (2026-10-22).
+func googleSupervisorTransitionLogger(logger zerolog.Logger) bridge.SnapshotObserver {
+	return func(previous, current bridge.Snapshot) {
+		if current.LastRepairOutcome == bridge.RepairOutcomeRunning &&
+			!current.LastRepairStartedAt.Equal(previous.LastRepairStartedAt) {
+			logger.Info().
+				Int("attempt", current.RepairAttempts).
+				Str("trigger_class", string(current.ErrorClass)).
+				Str("trigger", current.ErrorFingerprint).
+				Uint64("generation", uint64(current.Generation)).
+				Msg("Google credential repair: refreshing session cookies")
+		}
+		if previous.LastRepairOutcome == bridge.RepairOutcomeRunning &&
+			current.LastRepairOutcome != bridge.RepairOutcomeRunning {
+			took := current.LastRepairFinishedAt.Sub(current.LastRepairStartedAt)
+			switch current.LastRepairOutcome {
+			case bridge.RepairOutcomeSucceeded:
+				logger.Info().
+					Int("attempt", current.RepairAttempts).
+					Dur("took", took).
+					Msg("Google credential repair succeeded; reconnecting")
+			case bridge.RepairOutcomeRetrying:
+				logger.Warn().
+					Int("attempt", current.RepairAttempts).
+					Dur("took", took).
+					Str("error", current.LastRepairError).
+					Time("retry_at", current.RetryAt).
+					Dur("retry_in", current.RetryAt.Sub(current.LastRepairFinishedAt)).
+					Msg("Google credential repair failed; will retry")
+			case bridge.RepairOutcomeBlocked:
+				logger.Error().
+					Int("attempt", current.RepairAttempts).
+					Dur("took", took).
+					Str("error", current.LastRepairError).
+					Str("block_reason", current.BlockReason).
+					Msg("Google credential repair failed and cannot be retried automatically; Google Messages is parked until Reconnect or re-pair")
+			}
+		}
+		if current.State == previous.State {
+			return
+		}
+		if current.State == bridge.StateBlocked &&
+			!(previous.LastRepairOutcome == bridge.RepairOutcomeRunning &&
+				current.LastRepairOutcome == bridge.RepairOutcomeBlocked) {
+			logger.Error().
+				Str("block_reason", current.BlockReason).
+				Str("error_class", string(current.ErrorClass)).
+				Str("error", current.ErrorFingerprint).
+				Int("repair_attempts", current.RepairAttempts).
+				Str("last_repair_error", current.LastRepairError).
+				Msg("Google Messages supervisor parked; it will not retry until Reconnect")
+			return
+		}
+		event := logger.Debug()
+		if previous.State == bridge.StateBlocked {
+			event = logger.Info()
+		}
+		event.
+			Str("from", string(previous.State)).
+			Str("to", string(current.State)).
+			Uint64("generation", uint64(current.Generation)).
+			Str("error_class", string(current.ErrorClass)).
+			Str("error", current.ErrorFingerprint).
+			Msg("Google Messages supervisor state changed")
+	}
+}
+
+// googleSupervisorStatus renders a supervisor snapshot for /api/status.
+func googleSupervisorStatus(snapshot bridge.Snapshot) app.GoogleSupervisorStatus {
+	return app.GoogleSupervisorStatus{
+		State:            string(snapshot.State),
+		Generation:       uint64(snapshot.Generation),
+		ErrorClass:       string(snapshot.ErrorClass),
+		ErrorFingerprint: snapshot.ErrorFingerprint,
+		BlockReason:      snapshot.BlockReason,
+		RetryAtMS:        unixMilliOrZero(snapshot.RetryAt),
+		Repair: app.GoogleRepairStatus{
+			Attempts:       snapshot.RepairAttempts,
+			LastStartedMS:  unixMilliOrZero(snapshot.LastRepairStartedAt),
+			LastFinishedMS: unixMilliOrZero(snapshot.LastRepairFinishedAt),
+			LastOutcome:    string(snapshot.LastRepairOutcome),
+			LastError:      snapshot.LastRepairError,
+		},
+	}
+}
+
+func unixMilliOrZero(at time.Time) int64 {
+	if at.IsZero() {
+		return 0
+	}
+	return at.UnixMilli()
 }
 
 type googleSupervisorControl struct {
@@ -296,10 +397,18 @@ func (c *googleSupervisorControl) Reconnect() error {
 		}
 		c.mu.Unlock()
 		return nil
+	case bridge.StateRepairingCredentials:
+		// A failed repair waiting out its backoff is tried again now (the
+		// repairer's pacing still applies); a running one is already owned.
+		err := supervisor.RetryCredentialRepairNow(ctx)
+		if errors.Is(err, bridge.ErrSupervisorBusy) || errors.Is(err, bridge.ErrNoRepairScheduled) {
+			return nil
+		}
+		return err
 	case bridge.StateOnline, bridge.StateConnecting, bridge.StateDegraded,
-		bridge.StateBackoff, bridge.StateRepairingCredentials:
-		// A reconnect or repair is already owned by this supervisor. Treat a
-		// duplicate button press as successful admission, never a second owner.
+		bridge.StateBackoff:
+		// A reconnect is already owned by this supervisor. Treat a duplicate
+		// button press as successful admission, never a second owner.
 		return nil
 	case bridge.StateUnpaired:
 		return errors.New("Google Messages must be paired before reconnecting")
@@ -308,6 +417,19 @@ func (c *googleSupervisorControl) Reconnect() error {
 	default:
 		return fmt.Errorf("Google Messages cannot reconnect from supervisor state %q", snapshot.State)
 	}
+}
+
+// Snapshot reads the current supervisor's state, following a rebuild after
+// unpair. ok is false once the control has stopped for good.
+func (c *googleSupervisorControl) Snapshot() (bridge.Snapshot, bool) {
+	c.mu.Lock()
+	supervisor := c.supervisor
+	closed := c.closed
+	c.mu.Unlock()
+	if supervisor == nil || closed {
+		return bridge.Snapshot{}, false
+	}
+	return supervisor.Snapshot(), true
 }
 
 func (c *googleSupervisorControl) StopAndUnpair(unpair func() error) error {

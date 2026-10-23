@@ -366,7 +366,7 @@ final class NotificationManager: NSObject, ObservableObject, UNUserNotificationC
             key: "google",
             broken: (status.google?.paired ?? false) && (status.google?.needs_repair ?? false),
             title: "Google Messages needs attention",
-            body: "SMS/RCS sync stopped and couldn't auto-recover. Open OpenMessage to re-pair."
+            body: "SMS/RCS sync stopped and couldn't recover on its own. Open OpenMessage to see what it needs."
         )
         evaluatePlatformHealth(
             key: "whatsapp",
