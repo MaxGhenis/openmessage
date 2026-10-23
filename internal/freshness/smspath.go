@@ -66,10 +66,11 @@ type SMSPathConfig struct {
 	// next one being caught; a longer one, or a second, withholds judgment
 	// until it leaves the baseline. The rule cannot tell an outage from a
 	// quiet spell that follows MinRegularSpan of regular texting, so such a
-	// spell is judged (intended): a monthly lull of a few days, three busy
-	// weeks then quiet, or a phone that gets about one text a day and let at
-	// most one gap reach Window. At one arrival a day a stall takes about
-	// MinExpectedArrivals days to flag.
+	// spell is judged (intended): a monthly lull of a few days, 22 busy days
+	// then quiet ones (21 calendar days of daytime texting give a little
+	// under 21 regular days), or a phone that gets about one text a day and
+	// lets at most one gap reach Window. At one arrival a day a stall takes
+	// about MinExpectedArrivals days to flag.
 	BaselineWindow      time.Duration
 	MinRegularSpan      time.Duration
 	MinBaselineArrivals int
@@ -92,8 +93,8 @@ type SMSPathConfig struct {
 // frames counting only once received, the rule flags the outage about 25 hours
 // after the last SMS and nowhere before it. In simulation (texts in waking
 // hours, RCS hourly) it never fired for weekday-only texters, with or without
-// holidays, or for phones that text in clusters with quiet days between, and
-// fired at most a few times in 330 days for memoryless daily texters at one to
+// holidays, or for phones that text nine busy days in every 27, and fired at
+// most a few times in 330 days for memoryless daily texters at one to
 // ten arrivals a day, the statistical floor for a phone whose texts come at
 // random.
 var DefaultSMSPathConfig = SMSPathConfig{

@@ -720,10 +720,10 @@ Known limits:
   dual-SIM phone, so one SIM losing SMS while the other still gets texts goes
   unseen.
 - **Quiet RCS:** nothing can be judged while RCS is quiet too.
-- **Regular quiet spells:** a quiet spell that follows three weeks of regular
-  texting looks the same as an outage, so it is judged and can alarm: a
-  monthly lull of a few days, or three busy weeks followed by quiet ones
-  (intended; tested).
+- **Regular quiet spells:** a quiet spell that follows 21 days of regular
+  texting (time covered by gaps under a day) looks the same as an outage, so
+  it is judged and can alarm: a monthly lull of a few days, or 22 busy days
+  followed by quiet ones (intended; tested).
 - **Relay stalls:** the monitor reads only live frames (codec
   `google.protobuf`), not catch-up history (`google.protobuf.history`, see
   "Catch-up history reaches v2"). Messages the server replays after a

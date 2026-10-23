@@ -212,12 +212,13 @@ func TestEvaluateSMSPathJudgesADailyTexterWhoseGapsStayUnderADay(t *testing.T) {
 	}
 }
 
-// A phone that texts in busy clusters with quiet spells of days between them
-// is never judged: the quiet spells are long gaps, which never count as time
-// spent texting regularly, however busy the clusters and however far back the
-// history reaches. Review round 5 found the previous gate, which measured the
-// whole span, flagging the probe below in every quiet spell.
-func TestEvaluateSMSPathNeverJudgesClusteredTexters(t *testing.T) {
+// A phone whose busy clusters give it less than 21 regular days, with quiet
+// spells of days between them, is never judged: the quiet spells are long
+// gaps, which never count as time spent texting regularly, however far back
+// the history reaches. Review round 5 found the previous gate, which measured
+// the whole span, flagging the probe below in every quiet spell. Longer
+// clusters are judged (TestEvaluateSMSPathJudgesQuietSpellsAfter21RegularDays).
+func TestEvaluateSMSPathNeverJudgesShortClusters(t *testing.T) {
 	// The review's probe: six 27-day cycles, each nine days with SMS at 08:00,
 	// 11:00, 14:00, 17:00 and 20:00 UTC, the current cluster March 5-13.
 	current := time.Date(2026, 3, 5, 0, 0, 0, 0, time.UTC)
@@ -358,11 +359,12 @@ func TestEvaluateSMSPathFalseAlarmRateForMemorylessTexters(t *testing.T) {
 	}
 }
 
-// Intended limits (review round 6): a quiet spell that follows three weeks of
-// regular texting looks the same as an outage, so it is judged and stalls
-// once it outlasts the phone's pace. These pin the documented behaviour; a
-// change that stops judging them should update the runbook's known limits.
-func TestEvaluateSMSPathJudgesQuietSpellsAfterThreeRegularWeeks(t *testing.T) {
+// Intended limits (review round 6): a quiet spell that follows 21 days of
+// regular texting (gaps under a day) looks the same as an outage, so it is
+// judged and stalls once it outlasts the phone's pace. These pin the
+// documented behaviour; a change that stops judging them should update the
+// runbook's known limits.
+func TestEvaluateSMSPathJudgesQuietSpellsAfter21RegularDays(t *testing.T) {
 	recentRCS := func(events []TransportEvent, now time.Time) []TransportEvent {
 		return append(events,
 			TransportEvent{At: now.Add(-2 * time.Hour), Transport: TransportRCS},
