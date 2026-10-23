@@ -151,7 +151,9 @@ test('the page script runs under a CSP that refuses inline handlers', async ({ p
   await page.evaluate(() => {
     const probe = document.createElement('div');
     probe.id = 'csp-probe';
-    probe.innerHTML = '<img src="data:image/gif;base64,R0lGODlhAQABAAAAACw=" onload="globalThis.__omXss=3">';
+    // An undecodable image always fires error, so the browser must decide
+    // whether to run the injected handler.
+    probe.innerHTML = '<img src="data:image/png;base64,AAAA" onerror="globalThis.__omXss=3" onload="globalThis.__omXss=3">';
     document.body.appendChild(probe);
   });
   await expect.poll(() => page.evaluate(() => window.__cspViolations.length)).toBeGreaterThan(0);

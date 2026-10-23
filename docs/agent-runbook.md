@@ -30,8 +30,21 @@ Consequences:
 
 The running app holds `messages.db` open in WAL mode, so a second SQLite reader
 often fails with `unable to open database file (14)`, and `?immutable=1` opens
-but misses WAL-only (recent) writes. **Prefer the running app's HTTP API**
-(loopback-guarded; `curl` from localhost passes the origin check):
+but misses WAL-only (recent) writes. **Prefer the running app's HTTP API.**
+Every `/api/` and `/mcp` request needs the daemon's control token, or it
+answers `401` (since #261). The token is `control.token` in the data dir the
+daemon serves (the app's: `~/Library/Application Support/OpenMessage`). Send
+it from stdin so it never sits on a command line, where any local user's
+`ps` can read it; the examples in this runbook use this helper:
+
+```bash
+om_curl() { printf 'Authorization: Bearer %s\n' "$(cat "$HOME/Library/Application Support/OpenMessage/control.token")" | curl -s -H @- "$@"; }
+```
+
+`GET /healthz` answers `200` without the token and says only that a daemon
+is listening. The CLI and the stdio MCP client find the token themselves:
+they try `OPENMESSAGES_DATA_DIR`, then the app's data dir, then the CLI
+default, and keep the first one the daemon accepts.
 
 ```
 GET /api/status
@@ -70,7 +83,7 @@ placeholder timestamp means the reader used the wrong key. Check the raw JSON
 before chasing the bridge:
 
 ```bash
-curl -s "http://127.0.0.1:7007/api/conversations/<id>/messages?limit=1" | jq '.[0]|keys'
+om_curl "http://127.0.0.1:7007/api/conversations/<id>/messages?limit=1" | jq '.[0]|keys'
 ```
 
 The web UI reads `TimestampMS` throughout, so these names are a stable contract
@@ -275,7 +288,7 @@ Two more cutover artifacts worth knowing:
   while connected" below):
 
 ```bash
-curl -s http://127.0.0.1:7007/api/status | jq '.freshness'
+om_curl http://127.0.0.1:7007/api/status | jq '.freshness'
 ```
 
 ## Google thread ids are device-local: phone swaps re-key everything
@@ -410,7 +423,7 @@ applied again. A silence whose baseline can't be read is judged without one on
 every refresh (`baseline_unavailable`), so only the 72-hour floor can fire.
 
 ```bash
-curl -s http://127.0.0.1:7007/api/status | jq '.freshness.google | {stale, stale_reason, silence}'
+om_curl http://127.0.0.1:7007/api/status | jq '.freshness.google | {stale, stale_reason, silence}'
 ```
 
 From a terminal, `openmessage status` flags the same stall in its AGE column
@@ -535,9 +548,9 @@ above the hole once push resumes; unlike a deep backfill it does not re-fetch
 (and store a frame for) every message the phone has ever held.
 
 ```bash
-curl -s -X POST http://127.0.0.1:7007/api/backfill -d '{"since":"2026-10-05T22:00:00-04:00"}'
-curl -s http://127.0.0.1:7007/api/backfill/status | jq
-curl -s http://127.0.0.1:7007/api/status | jq '.v2_ingest.per_account["google-primary"] | with_entries(select(.key|startswith("history")))'
+om_curl -X POST http://127.0.0.1:7007/api/backfill -d '{"since":"2026-10-05T22:00:00-04:00"}'
+om_curl http://127.0.0.1:7007/api/backfill/status | jq
+om_curl http://127.0.0.1:7007/api/status | jq '.v2_ingest.per_account["google-primary"] | with_entries(select(.key|startswith("history")))'
 ```
 
 `since` also accepts a `YYYY-MM-DD` local date or Unix milliseconds. A body
@@ -820,11 +833,17 @@ A skipped run doesn't probe the daemon and leaves the fail count and the
 episode counters where they were, but it deletes `down_since`, the outage
 clock: nothing watches the daemon while runs skip, so the next failed probe
 starts a new outage. Otherwise it fetches
-`http://127.0.0.1:7007/api/status` with a 5 s timeout. The probe fails when the
-reply doesn't contain the string `"connected"`: connection refused, no answer
-within 5 s, or an error body. Any real status payload passes, even with every
-platform down. The probe tests that the daemon answers, not that platforms are
-up.
+`http://127.0.0.1:7007/api/status` with a 5 s timeout, sending the app's
+`control.token` as a Bearer header that curl reads from stdin
+(`OPENMESSAGE_WATCHDOG_TOKEN_FILE` overrides the path). A `401` means the
+daemon answers but refused the token: the run resets the fail count and the
+outage clock, never relaunches, names the problem in health.txt (`answered
+/api/status with 401: …`), posts "Watchdog can't read OpenMessage status"
+at most once per 6 h, and skips the staleness checks. Otherwise the probe
+fails when the reply doesn't contain the string `"connected"`: connection
+refused, no answer within 5 s, or an error body. Any real status payload
+passes, even with every platform down. The probe tests that the daemon
+answers, not that platforms are up.
 
 - **No app process** (`pgrep -x OpenMessage`, the Swift wrapper): on the 2nd
   consecutive failure it runs `open -ga OpenMessage`. That launches by name,
@@ -845,8 +864,9 @@ It relaunches at most once per 30 minutes, counted from its own last relaunch
 (manual restarts don't count), to stay clear of Google's reconnect throttling
 ([don't over-reconnect](#dont-over-reconnect)). Every relaunch posts "Daemon
 was down - relaunched the app", in both cases; `quitting hung app` in the log
-tells them apart. The probe sends no control token. That works only while
-`/api/` auth is accept-and-log: if enforcement ships, every probe will fail.
+tells them apart. Before the token change (dotfiles `012c4d7`), the probe
+sent no token, so against an enforcing daemon every probe would have read as
+an outage and relaunched a healthy app every 30 minutes.
 
 The outage clock, `down_since` (`daemon_down_since` in health.txt), starts at
 an outage's first failed probe and survives relaunches and throttled runs. An
@@ -959,7 +979,7 @@ in-app supervisors. It alerts on:
     `silence` block.
 
   To see which applies, run
-  `curl -s http://127.0.0.1:7007/api/status | jq '.freshness.google.silence'`.
+  `om_curl http://127.0.0.1:7007/api/status | jq '.freshness.google.silence'`.
   With the daemon answering, `null` almost always means it predates #190 (a
   #190 daemon also omits the block when Google has no recorded activity or its
   first activity query fails), and then the watchdog's estimate and
@@ -1226,7 +1246,7 @@ A dry run still obeys the real `watchdog-disabled` flag (its path is fixed)
 and probes the live daemon. To exercise the staleness checks against a crafted
 payload, set `OPENMESSAGE_WATCHDOG_PORT` to a stub server that serves it at
 `/api/status`; the body must contain `"connected"`, or the run takes the
-relaunch path. Repeated dry runs of the relaunch path count past the threshold
+relaunch path (a `401` from the stub takes the refused-token path instead). Repeated dry runs of the relaunch path count past the threshold
 (`4/3`, `5/3`, …), because only a real relaunch or an answered probe resets
 the counter.
 
@@ -1495,7 +1515,7 @@ waiting a full one.
 `google.repairs_paced` in `/api/status`:
 
 ```bash
-curl -s http://127.0.0.1:7007/api/status | jq '.google.repairs_paced'
+om_curl http://127.0.0.1:7007/api/status | jq '.google.repairs_paced'
 ```
 
 The counter records exactly one thing: **how many repair requests were delayed
@@ -1559,7 +1579,7 @@ reconnect will likely 401 again. The supervisor's own view is in
 `/api/status`:
 
 ```bash
-curl -s http://127.0.0.1:7007/api/status | jq '.google | {connected, auth_expired, reconnecting, needs_repair, supervisor}'
+om_curl http://127.0.0.1:7007/api/status | jq '.google | {connected, auth_expired, reconnecting, needs_repair, supervisor}'
 ```
 
 `supervisor.state` is the lifecycle state (`online`, `connecting`, `backoff`,
@@ -1708,7 +1728,7 @@ account pairing, please log in to continue using SMS/RCS").
   notification (key `pull_empty`; see [staleness alerts](#staleness-alerts)).
 
 ```bash
-curl -s http://127.0.0.1:7007/api/status | jq '.google.pull_health'
+om_curl http://127.0.0.1:7007/api/status | jq '.google.pull_health'
 ```
 
 **Fix:** not a reconnect, a restart, or a cookie refresh: none of them
@@ -2619,7 +2639,7 @@ ID (Google's TmpID) depends on how far that send has got
 Find the reactions still retrying with:
 
 ```bash
-curl -s "http://127.0.0.1:7007/api/v1/outbox?limit=100" | jq '.[] | select(.kind=="reaction")'
+om_curl "http://127.0.0.1:7007/api/v1/outbox?limit=100" | jq '.[] | select(.kind=="reaction")'
 ```
 
 and cancel one with `POST /api/v1/outbox/<id>/cancel`.
@@ -2797,7 +2817,7 @@ briefly show "reconnecting" before it settles (see throttling note above).
 
 ### Ingest smoke
 
-Read `curl -s http://127.0.0.1:7007/api/status | jq '.v2_ingest'`. A healthy
+Read `om_curl http://127.0.0.1:7007/api/status | jq '.v2_ingest'`. A healthy
 enabled stack reports `enabled: true`; under `per_account`, `appended` grows as
 receive frames arrive, message-bearing frames advance `projected`, and
 `quarantined` remains `0`. Catch-up history never moves `appended`,
