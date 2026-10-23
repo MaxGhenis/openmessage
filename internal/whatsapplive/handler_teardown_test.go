@@ -406,6 +406,13 @@ func forEachTeardownMode(t *testing.T, test func(t *testing.T, mode teardownMode
 // our device, as the peer's client does after fetching our keys.
 func (h *teardownHarness) startPeerSession() {
 	h.t.Helper()
+	h.startSessionFrom(h.peer)
+}
+
+// startSessionFrom builds a remote device's outgoing session to our device
+// from a prekey bundle of ours.
+func (h *teardownHarness) startSessionFrom(remote *store.Device) {
+	h.t.Helper()
 	ctx := context.Background()
 	our := h.cli.Store
 	oneTime, err := our.PreKeys.GenOnePreKey(ctx)
@@ -418,7 +425,7 @@ func (h *teardownHarness) startPeerSession() {
 		ecc.NewDjbECPublicKey(*oneTime.Pub), ecc.NewDjbECPublicKey(*our.SignedPreKey.Pub), *our.SignedPreKey.Signature,
 		identity.NewKey(ecc.NewDjbECPublicKey(*our.IdentityKey.Pub)),
 	)
-	builder := session.NewBuilderFromSignal(h.peer, h.ourJID.SignalAddress(), store.SignalProtobufSerializer)
+	builder := session.NewBuilderFromSignal(remote, h.ourJID.SignalAddress(), store.SignalProtobufSerializer)
 	if err := builder.ProcessBundle(ctx, bundle); err != nil {
 		h.t.Fatalf("peer ProcessBundle(): %v", err)
 	}
@@ -440,7 +447,13 @@ func marshalForTeardownTest(t *testing.T, message *waE2E.Message) []byte {
 // encryptToUs encrypts one Signal message from the peer to our device.
 func (h *teardownHarness) encryptToUs(message *waE2E.Message) waBinary.Node {
 	h.t.Helper()
-	builder := session.NewBuilderFromSignal(h.peer, h.ourJID.SignalAddress(), store.SignalProtobufSerializer)
+	return h.encryptToUsFrom(h.peer, message)
+}
+
+// encryptToUsFrom encrypts one Signal message from a remote device to ours.
+func (h *teardownHarness) encryptToUsFrom(remote *store.Device, message *waE2E.Message) waBinary.Node {
+	h.t.Helper()
+	builder := session.NewBuilderFromSignal(remote, h.ourJID.SignalAddress(), store.SignalProtobufSerializer)
 	ciphertext, err := session.NewCipher(builder, h.ourJID.SignalAddress()).Encrypt(context.Background(), marshalForTeardownTest(h.t, message))
 	if err != nil {
 		h.t.Fatalf("peer Encrypt(): %v", err)
@@ -649,14 +662,30 @@ func TestTeardownBeforeDispatchDoesNotLoseTheMessage(t *testing.T) {
 
 // TestTeardownBeforeDispatchAcknowledgesOnlyWhatV2Holds pins what whatsmeow
 // is told for a message dispatched after the generation retired. On a
-// v2-ingest install it is not handled: whatsmeow keeps the plaintext (and
-// sends no receipt) for the next generation. On a legacy-only install there
-// is no v2 to wait for: it is handled at once, whatsmeow clears the plaintext
-// and acknowledges it as on main, and the legacy store already holds it.
+// v2-ingest install the bridge holds it in its ingress spool and reports it
+// handled: whatsmeow clears the plaintext and acknowledges it, and the next
+// generation replays it from the spool. When the spool cannot take it, it is
+// not handled: whatsmeow keeps the plaintext (and sends no receipt) for the
+// next generation. On a legacy-only install there is no v2 to wait for: it is
+// handled at once, whatsmeow clears the plaintext and acknowledges it as on
+// main. The legacy store holds it after the first delivery in every case.
 func TestTeardownBeforeDispatchAcknowledgesOnlyWhatV2Holds(t *testing.T) {
-	for _, mode := range []teardownMode{{}, {legacyOnly: true}} {
-		t.Run(mode.String(), func(t *testing.T) {
-			h := newTeardownHarness(t, mode)
+	for _, test := range []struct {
+		name      string
+		mode      teardownMode
+		spoolFull bool
+		retained  int
+		held      int64
+	}{
+		{name: "v2 ingest, spool holds it", held: 1},
+		{name: "v2 ingest, spool full", spoolFull: true, retained: 1},
+		{name: "legacy-only install", mode: teardownMode{legacyOnly: true}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			h := newTeardownHarness(t, test.mode)
+			if test.spoolFull {
+				whatsapplive.BoundIngressSpoolForTeardownTest(h.host, 0, 0)
+			}
 			first, _ := h.awaitGeneration()
 			h.startPeerSession()
 			node := h.peerMessage("3EB0ACKTEARDOWN", "arrives as the generation retires")
@@ -670,19 +699,21 @@ func TestTeardownBeforeDispatchAcknowledgesOnlyWhatV2Holds(t *testing.T) {
 			if stored, err := h.messages.GetMessageByID("whatsapp:3EB0ACKTEARDOWN"); err != nil || stored == nil {
 				t.Fatalf("legacy store after the first delivery = %+v, %v; want the message", stored, err)
 			}
-			retained := whatsapplive.RetainedPlaintextsForTeardownTest(t, h.sessionPath)
-			if mode.legacyOnly && retained != 0 {
-				t.Fatalf("legacy-only install: whatsmeow kept %d plaintexts, want the message handled and cleared", retained)
+			if retained := whatsapplive.RetainedPlaintextsForTeardownTest(t, h.sessionPath); retained != test.retained {
+				t.Fatalf("whatsmeow kept %d plaintexts after the first delivery, want %d", retained, test.retained)
 			}
-			if !mode.legacyOnly && retained != 1 {
-				t.Fatalf("v2 install: whatsmeow kept %d plaintexts, want the uncommitted message kept for redelivery", retained)
+			if held := whatsapplive.HeldIngressFramesForTeardownTest(h.host); held != test.held {
+				t.Fatalf("the ingress spool holds %d frames after the first delivery, want %d", held, test.held)
 			}
 
 			second, _ := h.awaitGeneration()
 			h.deliver(second, node)
-			h.requireDelivered("3EB0ACKTEARDOWN", "arrives as the generation retires", "redelivered to the next generation")
+			h.requireDelivered("3EB0ACKTEARDOWN", "arrives as the generation retires", "replayed or redelivered to the next generation")
 			if retained := whatsapplive.RetainedPlaintextsForTeardownTest(t, h.sessionPath); retained != 0 {
-				t.Fatalf("whatsmeow still holds %d plaintexts after the redelivery was handled", retained)
+				t.Fatalf("whatsmeow still holds %d plaintexts after the next generation", retained)
+			}
+			if held := whatsapplive.HeldIngressFramesForTeardownTest(h.host); held != 0 {
+				t.Fatalf("the ingress spool still holds %d frames after the next generation", held)
 			}
 		})
 	}

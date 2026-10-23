@@ -1803,25 +1803,28 @@ How it works now:
   `_txlock=immediate`, so that transaction waits for SQLite's write lock
   instead of failing with `SQLITE_BUSY` when another connection is writing.
 - On an install with v2 ingest (a v2 sink behind the supervisor), the bridge
-  reports a message handled only once its v2 ingress frame is committed. A
+  reports a message handled only once its v2 ingress frame is committed, or
+  held in the ingress spool (next section) for the next generation. A
   message that finds no observing generation, a closed admission, a stale
-  generation or an append error is reported not handled, with the log line
-  `WhatsApp message not committed to ingress; leaving it for redelivery`.
-  whatsmeow then keeps the plaintext and sends no delivery receipt. When the
-  server redelivers the stanza (it does so for an unacknowledged message on a
-  later connection; whatsmeow's event buffer is built on that, and the tests
-  simulate it rather than exercise the real server), whatsmeow re-dispatches
-  the buffered plaintext and the v2 inbox dedupes it by key. An append error
-  leaves the message out of v2 until the next connection.
+  generation or an append error goes to the spool. Only when the spool
+  cannot take it (full, or its database unavailable) is it reported not
+  handled, with the log line `WhatsApp message not committed to ingress;
+  leaving it for redelivery`. whatsmeow then keeps the plaintext and sends
+  no delivery receipt. When the server redelivers the stanza (it does so for
+  an unacknowledged message on a later connection; whatsmeow's event buffer
+  is built on that, and the tests simulate it rather than exercise the real
+  server), whatsmeow re-dispatches the buffered plaintext and the v2 inbox
+  dedupes it by key.
 - The legacy store takes a message on its first delivery whether or not v2
   committed it, as before. When the redelivery of a frame legacy already took
-  without a v2 commit arrives, the legacy write is skipped, so an edit, revoke
-  or receipt status applied to the row in between is not undone. The bridge
-  remembers those frames in memory, so after a restart a redelivery writes
-  legacy again.
+  without a v2 commit (held in the spool, or left for redelivery) arrives,
+  the legacy write is skipped, so an edit, revoke or receipt status applied
+  to the row in between is not undone. The bridge remembers those frames in
+  memory, so after a restart a redelivery writes legacy again.
 - On a legacy-only install (the default: no v2 sink), the supervisor's
   generation sink reports `DurableIngress() == false`, every message is
-  reported handled, and whatsmeow acknowledges it as before.
+  reported handled, nothing is held in the spool, and whatsmeow acknowledges
+  it as before.
 - The context `ConnectPaired` hands whatsmeow is cancelled by the generation
   only while it dials and handshakes. After that, teardown closes the socket,
   which ends the handler loop, and a handler that is already running finishes
@@ -1835,6 +1838,73 @@ reconnect, with no matching message in v2, is a message the old teardown
 path lost. A collection stuck on `mismatching LTHash` stays stuck until
 whatsmeow does a full resync of it, and OpenMessage does not trigger one yet.
 
+### Frames held between generations (the ingress spool)
+
+Some frames are never delivered again, so redelivery cannot save them:
+
+- **History-sync chunks.** whatsmeow downloads each chunk in a background
+  loop that does not belong to any generation. It dispatches the chunk,
+  ignores whether the handler took it, and then deletes the server copy.
+- **Receipts.** whatsmeow acknowledges a receipt before dispatching it.
+- **Messages whose redelivery misses whatsmeow's event buffer.** The buffer
+  is keyed on the sender, so a stanza decrypted under the peer's phone number
+  and redelivered after a LID mapping for that peer arrived is decrypted
+  again under the LID. That fails with `received message with old counter`,
+  and whatsmeow acknowledges it. The same goes for a message the phone resent
+  inside a placeholder-resend response: whatsmeow turns the nested handler's
+  "not handled" into success for the enclosing stanza.
+
+Before this change, any of those that reached the bridge while no generation
+was committing ingress (after one generation retired and before the next
+began, or into a retiring one) was dropped from v2. On a v2-primary install,
+readers never saw it. History chunks still reached the legacy store, but
+v2-primary readers don't read it.
+
+Now the bridge holds every frame it captured but no generation committed in
+`openmessage_whatsapp_ingress_spool`, a table in `whatsapp-session.db`. It
+does this before the handler returns, so before whatsmeow deletes a history
+chunk's server copy. The next generation replays the spool, oldest first,
+when it installs its ingress observer (`ObserveIngress`, before it connects).
+A replayed frame commits under the new generation with the dedupe key it was
+captured with, so a frame that is also redelivered, or replayed twice after
+a crash, stays one inbox row. A replayed frame does not count as connection
+activity (`bridge.ReplayIngressSink`): it would otherwise refresh the new
+generation's liveness and reset the failure history that sizes backoff. A
+frame held after the next generation already replayed is replayed to it at
+once. A frame a replay could not commit stays held and is retried by the next
+generation, or after a later commit on the same one, at most every 30
+seconds.
+
+The spool holds at most 4,096 frames and 256 MiB of payload. A message it
+refuses falls back to redelivery (above). A refused receipt or history chunk
+is lost from v2 and logs `WhatsApp receipt neither committed nor held` or
+`WhatsApp history-sync chunk neither committed nor held` at error level. Rows
+survive a restart. The first generation of the next run replays them, and
+startup logs `WhatsApp ingress spool holds frames from an earlier run`.
+Unpairing does not clear them: they are frames the account received.
+
+Log lines: `WhatsApp ingress frame held for the next generation` (per frame,
+with `kind`, `dedupe_key` and the commit error) and `Replayed held WhatsApp
+ingress frames` (per replay, with `replayed` and `kept`; it is a warning with
+`first_error` when frames stayed held).
+
+Inspecting the spool on a live install (read-only; the app holds the file
+open, so use `-readonly`):
+
+```bash
+sqlite3 -readonly "$HOME/Library/Application Support/OpenMessage/whatsapp-session.db" \
+  "select seq, kind, dedupe_key, payload_bytes,
+          datetime(received_at_ns/1e9,'unixepoch','localtime') received,
+          datetime(spooled_at_ns/1e9,'unixepoch','localtime') spooled
+   from openmessage_whatsapp_ingress_spool order by seq"
+```
+
+An empty table is the normal state. Rows that stay across several
+reconnects mean v2 keeps refusing the appends. Look for the `first_error` of
+`Replayed held WhatsApp ingress frames` and `Failed to append WhatsApp
+ingress frame`. Don't delete rows by hand: each one is a frame v2 has not
+seen.
+
 Tests: `internal/whatsapplive/handler_teardown_test.go` sends real Signal
 ciphertext from a second Signal store through whatsmeow's real handler, the
 bridge, the adapter and the supervisor. It retires the generation before
@@ -1842,6 +1912,14 @@ every session-store call for prekey, ordinary and group messages, with
 the handler context both detached and cancelled, on v2-ingest and
 legacy-only installs. It also covers an
 app-state patch interrupted between its version and MAC writes.
+`generation_gap_test.go` uses the same harness for the spool. It sends a
+history-sync notification from our own phone through whatsmeow's real
+background loop, and the chunk is dispatched after the generation retired.
+It also covers a receipt in the gap, a redelivery under a LID, a
+placeholder resend, and a frame committed twice that stays one row in the
+real v2 inbox. `ingress_spool_test.go` and
+`ingress_spool_interleaving_test.go` check the spool against a model, and
+check every sequence of up to five gap events.
 
 ## WhatsApp LIDs stored as phone numbers
 
