@@ -260,6 +260,15 @@ func TestGoogleRefreshThatKeepsFailingAsksForAttentionAndStillHeals(t *testing.T
 	policy.MinBackoff = time.Millisecond
 	policy.MaxBackoff = 2 * time.Millisecond
 	lifecycle := &googleRepairTestLifecycle{}
+	// Status listeners (the web UI's event stream) must hear about the
+	// escalation: record what each published status event would refetch.
+	var readyForStatus atomic.Bool
+	var sawFailingStatus atomic.Bool
+	publish := func() {
+		if readyForStatus.Load() && a.GoogleStatus().RepairFailing {
+			sawFailingStatus.Store(true)
+		}
+	}
 	supervisor, err := bridge.NewSupervisor(
 		googleAccountID,
 		bridge.PlatformGoogle,
@@ -268,6 +277,7 @@ func TestGoogleRefreshThatKeepsFailingAsksForAttentionAndStillHeals(t *testing.T
 		googleWallClock{},
 		googleRandom{},
 		bridge.WithCredentialRepairer(repairer),
+		bridge.WithSnapshotObserver(googleSupervisorObserver(zerolog.Nop(), publish)),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -280,6 +290,7 @@ func TestGoogleRefreshThatKeepsFailingAsksForAttentionAndStillHeals(t *testing.T
 	a.SetGoogleSupervisorStatus(func() (app.GoogleSupervisorStatus, bool) {
 		return googleSupervisorStatus(supervisor.Snapshot()), true
 	})
+	readyForStatus.Store(true)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	err = supervisor.Start(ctx, bridge.StartRequest{})
 	cancel()
@@ -316,6 +327,11 @@ func TestGoogleRefreshThatKeepsFailingAsksForAttentionAndStillHeals(t *testing.T
 	}
 	if repairer.PacedRepairCount() != 0 {
 		t.Fatalf("retries hit the pacing gate %d times", repairer.PacedRepairCount())
+	}
+	for deadline := time.Now().Add(time.Second); !sawFailingStatus.Load(); time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("no status event reached listeners once the refresh started needing attention")
+		}
 	}
 
 	// The user signs Chrome back in: the next retry heals without a Reconnect.

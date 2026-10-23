@@ -1316,6 +1316,45 @@ test('queues a text message while Google Messages needs repair', async ({ page }
   expect(sendRequests).toBe(0);
 });
 
+// Review of #260: a refresh that keeps failing sets needs_repair too, but its
+// fix is Chrome's sign-in, so a queued text must not say "re-pair".
+test('queues a text while the Google sign-in refresh keeps failing, pointing at Chrome', async ({ page }) => {
+  const outbound = `Queued refresh ${Date.now()}`;
+  let sendRequests = 0;
+  const supervisor = {
+    state: 'repairing_credentials',
+    retry_at_ms: Date.now() + 4 * 60_000,
+    repair: { attempts: 3, consecutive_failures: 3, last_outcome: 'failed_retrying', last_error: 'missing required cookies: .google.com:SID' },
+  };
+  await page.route('**/api/status', route => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({
+      connected: true,
+      google: {
+        connected: false, paired: true, needs_pairing: false, needs_repair: true,
+        auth_expired: true, repair_failing: true, supervisor,
+      },
+      whatsapp: { connected: true, paired: true },
+      signal: { connected: true, paired: true },
+    }),
+  }));
+  page.on('request', req => {
+    if (req.method() === 'POST' && /\/api\/send(\?|$)/.test(req.url())) {
+      sendRequests += 1;
+    }
+  });
+
+  await page.reload();
+  await openConversation(page, 'Sarah Chen');
+  await page.locator('#compose-input').fill(outbound);
+  await page.locator('#send-btn').click();
+
+  await expect(page.locator('#thread-feedback')).toContainText('make sure Chrome is signed in');
+  await expect(page.locator('#thread-feedback')).not.toContainText('Re-pair');
+  expect(sendRequests).toBe(0);
+});
+
 test('queues an attachment while Google Messages needs repair', async ({ page }) => {
   let sendMediaRequests = 0;
 

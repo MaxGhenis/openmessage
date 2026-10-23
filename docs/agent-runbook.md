@@ -1517,7 +1517,9 @@ manual cookie refresh and restart. Now:
   `OPENMESSAGE_REPAIR_MIN_INTERVAL` (90 s), then full jitter over a window that
   doubles per consecutive failure, up to 5 min. No generation starts until a
   refresh succeeds. The first two failures stay quiet; from the third in a
-  row (`repair_failing: true`, about 3–4.5 minutes after the expiry) status also raises
+  row (`repair_failing: true`, about 3–4.5 minutes after the expiry when each
+  refresh fails fast, up to a minute more when each runs into the 20 s refresh
+  timeout) status also raises
   `needs_repair`, so the watchdog and the app's health notification fire,
   while the retries go on. A refresh that keeps failing is usually Chrome
   (signed out of the account, keychain access refused), never a re-pair; once

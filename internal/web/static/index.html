@@ -9944,6 +9944,14 @@ body::after {
     const label = platformMeta(item.platform).label;
     if (browserIsOffline()) return 'Message queued. It will send when you are back online.';
     if (item.platform === 'sms' && googleStatus.needs_repair) {
+      // Same reasoning as the banner: a refresh that keeps failing or a
+      // parked circuit is fixed in Chrome or by reconnecting, not a re-pair.
+      const stopped = googleStatus.connected ? null : googleStoppedCopy();
+      if (stopped && stopped.action === 'reconnect-google') {
+        return googleStatus.repair_failing
+          ? 'Message queued. It will send once Google Messages can refresh its sign-in; make sure Chrome is signed in to your Google account.'
+          : 'Message queued. Reconnect Google Messages to send it.';
+      }
       return 'Message queued. Re-pair Google Messages to send it.';
     }
     return `Message queued. It will send when ${label} reconnects.`;

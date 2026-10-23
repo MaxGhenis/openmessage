@@ -274,8 +274,10 @@ type GoogleRepairStatus struct {
 // GoogleRepairAttentionAfter is how many consecutive failed cookie
 // refreshes make status ask for a person (repair_failing, needs_repair). With
 // the 90 s repair pace and backoff, the third failure lands 3 to 4.5 minutes
-// after the expiry, past the healthy heal time of under 2.5 minutes; a single
-// hiccup heals on its first retry without anyone seeing it.
+// after the expiry when each refresh fails fast, and up to a minute later if
+// every attempt runs into the 20 s refresh timeout: past the healthy heal
+// time of under 2.5 minutes. A single hiccup heals on its first retry without
+// anyone seeing it.
 const GoogleRepairAttentionAfter = 3
 
 // googleSupervisorWorking lists the states in which the supervisor is still

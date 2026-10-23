@@ -287,6 +287,23 @@ func googleSupervisorTransitionLogger(logger zerolog.Logger) bridge.SnapshotObse
 	}
 }
 
+// googleSupervisorObserver logs each supervisor transition and tells status
+// listeners to refetch. /api/status derives reconnecting, repair_failing and
+// needs_repair from the supervisor at read time, so without an event an open
+// web client (whose healthy event stream turns its polling off) would keep
+// showing "reconnecting" after the refresh started needing attention (review
+// of #260). statusChanged runs off the run loop: publishing reads other
+// platforms' status, which may wait on their locks.
+func googleSupervisorObserver(logger zerolog.Logger, statusChanged func()) bridge.SnapshotObserver {
+	logTransition := googleSupervisorTransitionLogger(logger)
+	return func(previous, current bridge.Snapshot) {
+		logTransition(previous, current)
+		if statusChanged != nil {
+			go statusChanged()
+		}
+	}
+}
+
 // googleSupervisorStatus renders a supervisor snapshot for /api/status.
 func googleSupervisorStatus(snapshot bridge.Snapshot) app.GoogleSupervisorStatus {
 	return app.GoogleSupervisorStatus{

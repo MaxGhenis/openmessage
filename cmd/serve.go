@@ -286,7 +286,7 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 		newGoogleSupervisor := func() (*bridge.Supervisor, error) {
 			supervisorOptions := []bridge.SupervisorOption{
 				bridge.WithCredentialRepairer(repairer),
-				bridge.WithSnapshotObserver(googleSupervisorTransitionLogger(logger)),
+				bridge.WithSnapshotObserver(googleSupervisorObserver(logger, publishOverallStatus)),
 			}
 			if stack != nil {
 				supervisorOptions = append(supervisorOptions, bridge.WithConnectionSink(stack.Sink))
