@@ -2705,6 +2705,16 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		writeJSON(w, map[string]string{"status": "ok"})
 	})
 
+	// /healthz is liveness only: it answers without the control token and
+	// says nothing beyond "a daemon is listening", which a 401 already says.
+	// Supervisors (the Docker healthcheck) probe it; anything that needs
+	// state reads /api/status with the token.
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-store")
+		_, _ = io.WriteString(w, "ok\n")
+	})
+
 	mux.HandleFunc("/api/status", func(w http.ResponseWriter, r *http.Request) {
 		payload := statusPayload(currentConnected())
 		if opts.Auth != nil {

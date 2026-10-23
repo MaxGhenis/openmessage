@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -19,7 +20,140 @@ func testClient(t *testing.T, handler http.Handler) *Client {
 	t.Helper()
 	server := httptest.NewServer(handler)
 	t.Cleanup(server.Close)
-	return &Client{BaseURL: server.URL, HTTP: server.Client()}
+	// An empty, non-nil TokenDirs keeps a 401 from reading the real home
+	// directory's control tokens.
+	return &Client{BaseURL: server.URL, HTTP: server.Client(), TokenDirs: []string{}}
+}
+
+func writeToken(t *testing.T, token string) string {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, ControlTokenFile), []byte(token+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+// tokenDaemon accepts only want and records the Authorization header of
+// every request.
+func tokenDaemon(t *testing.T, want string, seen *[]string) *httptest.Server {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		*seen = append(*seen, r.URL.Path+" "+r.Header.Get("Authorization"))
+		if r.Header.Get("Authorization") != "Bearer "+want {
+			w.WriteHeader(http.StatusUnauthorized)
+			io.WriteString(w, `{"error":"unauthorized"}`)
+			return
+		}
+		io.WriteString(w, `{"connected":true,"v2_primary":true}`)
+	}))
+	t.Cleanup(server.Close)
+	return server
+}
+
+func TestStatusAdoptsTheFirstAcceptedCandidateToken(t *testing.T) {
+	var seen []string
+	server := tokenDaemon(t, "app-token", &seen)
+	client := &Client{
+		BaseURL:   server.URL,
+		HTTP:      server.Client(),
+		Token:     "cli-default-token",
+		TokenDirs: []string{t.TempDir(), writeToken(t, "cli-default-token"), writeToken(t, "stale-token"), writeToken(t, "app-token"), writeToken(t, "later-token")},
+	}
+	status, reachable, err := client.Status(context.Background())
+	if err != nil || !reachable || !status.V2Primary {
+		t.Fatalf("status = %+v reachable %t err %v", status, reachable, err)
+	}
+	if client.Token != "app-token" {
+		t.Fatalf("adopted token = %q, want app-token", client.Token)
+	}
+	want := []string{
+		"/api/status Bearer cli-default-token",
+		"/api/status Bearer stale-token",
+		"/api/status Bearer app-token",
+	}
+	if strings.Join(seen, "|") != strings.Join(want, "|") {
+		t.Fatalf("requests = %q, want %q (empty dir and duplicate token skipped, stops at the first accepted)", seen, want)
+	}
+}
+
+func TestStatusReportsUnauthorizedWhenNoCandidateIsAccepted(t *testing.T) {
+	var seen []string
+	server := tokenDaemon(t, "app-token", &seen)
+	client := &Client{BaseURL: server.URL, HTTP: server.Client(), TokenDirs: []string{writeToken(t, "wrong")}}
+	_, reachable, err := client.Status(context.Background())
+	if !reachable || !IsUnauthorized(err) || !IsAuthError(err) {
+		t.Fatalf("reachable %t err %v, want reachable 401", reachable, err)
+	}
+	if client.Token != "" {
+		t.Fatalf("token = %q, want unchanged", client.Token)
+	}
+	if _, err := client.RawStatus(context.Background()); !IsUnauthorized(err) {
+		t.Fatalf("RawStatus err = %v, want 401", err)
+	}
+}
+
+func TestRawStatusAdoptsAcceptedToken(t *testing.T) {
+	var seen []string
+	server := tokenDaemon(t, "app-token", &seen)
+	client := &Client{BaseURL: server.URL, HTTP: server.Client(), TokenDirs: []string{writeToken(t, "app-token")}}
+	raw, err := client.RawStatus(context.Background())
+	if err != nil || raw["connected"] != true || client.Token != "app-token" {
+		t.Fatalf("raw = %v err %v token %q", raw, err, client.Token)
+	}
+}
+
+func TestStatusNeverOffersTokensToANonLoopbackDaemon(t *testing.T) {
+	var offered []string
+	client := &Client{
+		BaseURL: "http://daemon.example:7007",
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			offered = append(offered, r.Header.Get("Authorization"))
+			return &http.Response{StatusCode: http.StatusUnauthorized, Body: io.NopCloser(strings.NewReader(`{}`)), Header: http.Header{}}, nil
+		})},
+		TokenDirs: []string{writeToken(t, "app-token")},
+	}
+	if _, _, err := client.Status(context.Background()); !IsUnauthorized(err) {
+		t.Fatalf("err = %v, want 401", err)
+	}
+	if len(offered) != 1 || offered[0] != "" {
+		t.Fatalf("Authorization headers sent = %q; a remote daemon must never be offered a local token", offered)
+	}
+}
+
+func TestStatusDoesNotRetryAForbiddenOrigin(t *testing.T) {
+	var seen []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen = append(seen, r.Header.Get("Authorization"))
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	t.Cleanup(server.Close)
+	client := &Client{BaseURL: server.URL, HTTP: server.Client(), TokenDirs: []string{writeToken(t, "app-token")}}
+	if _, _, err := client.Status(context.Background()); err == nil {
+		t.Fatal("want error")
+	}
+	if len(seen) != 1 {
+		t.Fatalf("requests = %d; a 403 is the origin guard, which no token fixes", len(seen))
+	}
+}
+
+func TestCandidateDataDirsOrder(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("OPENMESSAGES_DATA_DIR", "/pinned")
+	got := CandidateDataDirs()
+	want := []string{"/pinned"}
+	if runtime.GOOS == "darwin" {
+		want = append(want, filepath.Join(home, "Library", "Application Support", "OpenMessage"))
+	}
+	want = append(want, filepath.Join(home, ".local", "share", "openmessage"))
+	if strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Fatalf("CandidateDataDirs = %q, want %q", got, want)
+	}
+	t.Setenv("OPENMESSAGES_DATA_DIR", "")
+	if got := CandidateDataDirs(); got[0] == "" || got[0] == "/pinned" {
+		t.Fatalf("unset OPENMESSAGES_DATA_DIR still listed: %q", got)
+	}
 }
 
 func TestStatusReachability(t *testing.T) {
@@ -419,3 +553,7 @@ func TestMessageAttachmentReadsBytesHeadersAndLimit(t *testing.T) {
 		t.Fatalf("attachment requests changed the client's default timeout to %v", client.HTTP.Timeout)
 	}
 }
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }

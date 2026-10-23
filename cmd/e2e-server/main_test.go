@@ -63,14 +63,47 @@ func TestIsAPIRoutePatternHandlesMethodPrefix(t *testing.T) {
 	}
 }
 
-func TestE2EServerReportsV2Primary(t *testing.T) {
+// e2eTestToken is the control token these tests give the fixture server,
+// as playwright.config.js does.
+const e2eTestToken = "0e2e0e2e0e2e0e2e0e2e0e2e0e2e0e2e0e2e0e2e0e2e0e2e0e2e0e2e0e2e0e2e"
+
+func newAuthorizedE2EServer(t *testing.T) (*e2eServer, func()) {
+	t.Helper()
+	t.Setenv("OPENMESSAGES_E2E_CONTROL_TOKEN", e2eTestToken)
 	server, cleanup, err := newE2EServer(zerolog.Nop())
 	if err != nil {
 		t.Fatal(err)
 	}
+	return server, cleanup
+}
+
+func authorized(request *http.Request) *http.Request {
+	request.Header.Set("Authorization", "Bearer "+e2eTestToken)
+	return request
+}
+
+func TestE2EServerEnforcesTheFixtureToken(t *testing.T) {
+	server, cleanup := newAuthorizedE2EServer(t)
+	defer cleanup()
+	for _, token := range []string{"", strings.Repeat("0", 64)} {
+		request := httptest.NewRequest(http.MethodGet, "/api/status", nil)
+		request.Host = "127.0.0.1:7010"
+		if token != "" {
+			request.Header.Set("Authorization", "Bearer "+token)
+		}
+		response := httptest.NewRecorder()
+		server.ServeHTTP(response, request)
+		if response.Code != http.StatusUnauthorized {
+			t.Fatalf("token %q: status = %d, want 401", token, response.Code)
+		}
+	}
+}
+
+func TestE2EServerReportsV2Primary(t *testing.T) {
+	server, cleanup := newAuthorizedE2EServer(t)
 	defer cleanup()
 
-	request := httptest.NewRequest(http.MethodGet, "/api/status", nil)
+	request := authorized(httptest.NewRequest(http.MethodGet, "/api/status", nil))
 	request.Host = "127.0.0.1:7010"
 	response := httptest.NewRecorder()
 	server.ServeHTTP(response, request)
@@ -89,13 +122,10 @@ func TestE2EServerReportsV2Primary(t *testing.T) {
 }
 
 func TestJordanFixtureHasOneSMSAndOneWhatsAppRoute(t *testing.T) {
-	server, cleanup, err := newE2EServer(zerolog.Nop())
-	if err != nil {
-		t.Fatal(err)
-	}
+	server, cleanup := newAuthorizedE2EServer(t)
 	defer cleanup()
 
-	request := httptest.NewRequest(http.MethodGet, "/api/conversations?limit=200", nil)
+	request := authorized(httptest.NewRequest(http.MethodGet, "/api/conversations?limit=200", nil))
 	request.Host = "127.0.0.1:7010"
 	response := httptest.NewRecorder()
 	server.ServeHTTP(response, request)
@@ -131,10 +161,7 @@ func isAPIRoutePattern(literal string) bool {
 }
 
 func TestUncertainSubmitIsDurableAndIdempotent(t *testing.T) {
-	server, cleanup, err := newE2EServer(zerolog.Nop())
-	if err != nil {
-		t.Fatal(err)
-	}
+	server, cleanup := newAuthorizedE2EServer(t)
 	defer cleanup()
 
 	control := httptest.NewRequest(http.MethodPost, "/_e2e/bridges/google-primary/next-result", strings.NewReader(`{"next_result":"uncertain"}`))
@@ -184,7 +211,7 @@ type submissionResponse struct {
 
 func submitRequest(t *testing.T, server http.Handler, body []byte) submissionResponse {
 	t.Helper()
-	request := httptest.NewRequest(http.MethodPost, "/api/v1/outbox/messages", bytes.NewReader(body))
+	request := authorized(httptest.NewRequest(http.MethodPost, "/api/v1/outbox/messages", bytes.NewReader(body)))
 	request.Host = "127.0.0.1:7010"
 	request.Header.Set("Content-Type", "application/json")
 	response := httptest.NewRecorder()

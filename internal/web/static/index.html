@@ -10316,7 +10316,11 @@ body::after {
           ? `No ${platformMeta(currentPlatformFilter).label} results found`
           : `No ${platformMeta(currentPlatformFilter).label} conversations`;
       }
-      $convoList.innerHTML = `<div style="padding:40px 20px;text-align:center;color:var(--text-muted);font-size:13px">${emptyMsg}</div>`;
+      // Tab names are user text: set the message as text, never as markup.
+      const empty = document.createElement('div');
+      empty.style.cssText = 'padding:40px 20px;text-align:center;color:var(--text-muted);font-size:13px';
+      empty.textContent = emptyMsg;
+      $convoList.replaceChildren(empty);
       return;
     }
     const renderItems = buildConversationRenderItems(visibleConvos, isSearch);
@@ -11138,14 +11142,14 @@ body::after {
       } else if (hasMediaID && isImage && mediaSrc) {
         html += `<div class="msg-media">`;
         html += `<div class="msg-media-loading" data-msg-id="${escapeHtml(message.MessageID)}" data-kind="image"><div class="spinner"></div><span class="msg-media-loading-text">Fetching image...</span></div>`;
-        html += `<img src="${mediaSrc}" alt="Image" loading="lazy" decoding="async">`;
+        html += `<img src="${escapeHtml(mediaSrc)}" alt="Image" loading="lazy" decoding="async">`;
         html += `</div>`;
       } else if (hasMediaID && isAudio && mediaSrc) {
         html += `<div class="msg-media">`;
         if (audioLabel) {
           html += `<div class="msg-audio-label">${escapeHtml(audioLabel)}</div>`;
         }
-        html += `<audio src="${mediaSrc}" controls preload="metadata"></audio>`;
+        html += `<audio src="${escapeHtml(mediaSrc)}" controls preload="metadata"></audio>`;
         if (transcript) {
           html += `<div class="msg-transcript" title="${escapeHtml(transcriptModel || 'auto-transcribed')}">${escapeHtml(transcript)}</div>`;
         }
@@ -11153,7 +11157,7 @@ body::after {
       } else if (hasMediaID && isVideo && mediaSrc) {
         html += `<div class="msg-media">`;
         html += `<div class="msg-media-loading" data-msg-id="${escapeHtml(message.MessageID)}" data-kind="video"><div class="spinner"></div><span class="msg-media-loading-text">Fetching video...</span></div>`;
-        html += `<video src="${mediaSrc}" preload="none" controls playsinline style="display:none"></video>`;
+        html += `<video src="${escapeHtml(mediaSrc)}" preload="none" controls playsinline style="display:none"></video>`;
         html += `</div>`;
       } else if (hasMediaID && isPDF && mediaSrc) {
         html += `<div class="msg-media msg-document-preview">`;

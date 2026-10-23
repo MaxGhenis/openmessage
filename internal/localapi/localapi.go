@@ -22,6 +22,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -43,8 +44,8 @@ func DefaultBaseURL() string {
 }
 
 // LoadControlToken reads the local control token from dataDir. A missing or
-// unreadable token yields "" so callers degrade to unauthenticated requests
-// (the daemon decides whether those are acceptable).
+// unreadable token yields "": the daemon refuses unauthenticated requests
+// with 401, and Status then looks for the token in CandidateDataDirs.
 func LoadControlToken(dataDir string) string {
 	b, err := os.ReadFile(filepath.Join(dataDir, ControlTokenFile))
 	if err != nil {
@@ -53,12 +54,34 @@ func LoadControlToken(dataDir string) string {
 	return strings.TrimSpace(string(b))
 }
 
+// CandidateDataDirs lists the data directories a daemon on this machine may
+// be serving, most specific first: OPENMESSAGES_DATA_DIR when set, the macOS
+// app's directory (BackendManager.dataDir in the Swift wrapper), then the CLI
+// default. A terminal usually runs with the CLI default while the app's
+// daemon serves the macOS directory, so the default token alone is refused.
+func CandidateDataDirs() []string {
+	var dirs []string
+	if dir := strings.TrimSpace(os.Getenv("OPENMESSAGES_DATA_DIR")); dir != "" {
+		dirs = append(dirs, dir)
+	}
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		if runtime.GOOS == "darwin" {
+			dirs = append(dirs, filepath.Join(home, "Library", "Application Support", "OpenMessage"))
+		}
+		dirs = append(dirs, filepath.Join(home, ".local", "share", "openmessage"))
+	}
+	return dirs
+}
+
 // Client talks to one OpenMessage daemon. The zero value is not usable; call
 // NewClient or populate BaseURL and HTTP explicitly.
 type Client struct {
 	BaseURL string
 	HTTP    *http.Client
 	Token   string
+	// TokenDirs are the data directories whose control tokens Status tries
+	// when the daemon refuses Token. Nil means CandidateDataDirs().
+	TokenDirs []string
 }
 
 // NewClient returns a Client for baseURL with a conservative default timeout.
@@ -108,21 +131,92 @@ func (s DaemonStatus) ReactionsViaOutbox() bool {
 // Status probes /api/status. The second result reports reachability: false
 // means no daemon answered at all (connection refused/timeout), while true
 // with a non-nil error means something answered but the response was not a
-// usable status document.
+// usable status document. When the daemon refuses Token with 401, Status
+// adopts the first token from TokenDirs that it accepts, so later calls on
+// this client authenticate too.
 func (c *Client) Status(ctx context.Context) (DaemonStatus, bool, error) {
 	var status DaemonStatus
 	reachable, err := c.getJSON(ctx, "/api/status", &status)
+	if IsUnauthorized(err) {
+		var adopted DaemonStatus
+		if ok, adoptErr := c.adoptAcceptedToken(ctx, &adopted); ok {
+			return adopted, true, adoptErr
+		}
+	}
 	return status, reachable, err
 }
 
 // RawStatus returns the daemon's /api/status document verbatim, for callers
 // that surface daemon state to a human or agent rather than branching on it.
+// It finds an accepted token the same way Status does.
 func (c *Client) RawStatus(ctx context.Context) (map[string]any, error) {
 	raw := map[string]any{}
-	if _, err := c.getJSON(ctx, "/api/status", &raw); err != nil {
+	_, err := c.getJSON(ctx, "/api/status", &raw)
+	if IsUnauthorized(err) {
+		adopted := map[string]any{}
+		if ok, adoptErr := c.adoptAcceptedToken(ctx, &adopted); ok {
+			if adoptErr != nil {
+				return nil, adoptErr
+			}
+			return adopted, nil
+		}
+	}
+	if err != nil {
 		return nil, err
 	}
 	return raw, nil
+}
+
+// adoptAcceptedToken tries the control token of each TokenDirs entry against
+// /api/status and keeps the first the daemon accepts, decoding that status
+// response into target. Tokens only ever go to a daemon on this machine: a
+// non-loopback BaseURL is never offered one.
+func (c *Client) adoptAcceptedToken(ctx context.Context, target any) (bool, error) {
+	if !c.baseURLIsLoopback() {
+		return false, nil
+	}
+	dirs := c.TokenDirs
+	if dirs == nil {
+		dirs = CandidateDataDirs()
+	}
+	tried := map[string]bool{c.Token: true}
+	for _, dir := range dirs {
+		token := LoadControlToken(dir)
+		if token == "" || tried[token] {
+			continue
+		}
+		tried[token] = true
+		request, err := http.NewRequestWithContext(ctx, http.MethodGet, c.BaseURL+"/api/status", nil)
+		if err != nil {
+			return false, nil
+		}
+		request.Header.Set("Authorization", "Bearer "+token)
+		response, err := c.HTTP.Do(request)
+		if err != nil {
+			return false, nil
+		}
+		if response.StatusCode == http.StatusUnauthorized {
+			_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 4096))
+			response.Body.Close()
+			continue
+		}
+		c.Token = token
+		return true, decodeResponse(response, target)
+	}
+	return false, nil
+}
+
+func (c *Client) baseURLIsLoopback() bool {
+	u, err := url.Parse(c.BaseURL)
+	if err != nil {
+		return false
+	}
+	host := u.Hostname()
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // TextSubmission is a durable text send routed at POST /api/v1/outbox/messages.
@@ -671,6 +765,13 @@ func IsDeterministicRejection(err error) bool {
 	default:
 		return false
 	}
+}
+
+// IsUnauthorized reports whether err is the daemon's 401: no control token,
+// or the wrong one.
+func IsUnauthorized(err error) bool {
+	responseErr, ok := AsResponseError(err)
+	return ok && responseErr.StatusCode == http.StatusUnauthorized
 }
 
 // IsAuthError reports whether err is the daemon refusing our control token.

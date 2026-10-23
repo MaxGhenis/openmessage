@@ -1,4 +1,5 @@
 const { defineConfig } = require('@playwright/test');
+const { controlToken, authenticatedStorageState } = require('./e2e/control-token');
 
 const port = process.env.OPENMESSAGES_E2E_PORT || '7010';
 const baseURL = `http://127.0.0.1:${port}`;
@@ -12,6 +13,7 @@ module.exports = defineConfig({
     baseURL,
     headless: true,
     serviceWorkers: 'block',
+    storageState: authenticatedStorageState,
     trace: 'retain-on-failure',
   },
   webServer: {
@@ -20,6 +22,7 @@ module.exports = defineConfig({
     env: {
       ...process.env,
       OPENMESSAGES_E2E_PORT: port,
+      OPENMESSAGES_E2E_CONTROL_TOKEN: controlToken,
     },
     reuseExistingServer: !process.env.CI,
     timeout: 60_000,

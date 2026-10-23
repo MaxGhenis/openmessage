@@ -112,6 +112,14 @@ func newE2EServer(logger zerolog.Logger) (_ *e2eServer, cleanup func(), resultEr
 	if err != nil {
 		return nil, nil, err
 	}
+	// Playwright puts this fixed test token in its contexts' cookie jar, so
+	// the suite runs against the same enforced auth as a real daemon.
+	if token := strings.TrimSpace(os.Getenv("OPENMESSAGES_E2E_CONTROL_TOKEN")); token != "" {
+		if err := os.WriteFile(filepath.Join(dataDir, web.ControlTokenFile), []byte(token+"\n"), 0o600); err != nil {
+			_ = os.RemoveAll(dataDir)
+			return nil, nil, err
+		}
+	}
 	controlAuth, err := web.NewControlAuth(dataDir, logger)
 	if err != nil {
 		_ = os.RemoveAll(dataDir)

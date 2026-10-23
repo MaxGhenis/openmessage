@@ -106,7 +106,7 @@ func runSendWithDeps(ctx context.Context, deps sendCommandDeps, conversationID, 
 		}
 		return deps.legacySend(conversationID, message)
 	}
-	daemon.Token = controlTokenFromDaemonStatus(status, deps.controlToken)
+	daemon.Token = controlTokenFromDaemonStatus(status, daemon.Token)
 	if !status.V2Send && !status.V2Primary {
 		return deps.legacySend(conversationID, message)
 	}
@@ -150,11 +150,18 @@ func runSendWithDeps(ctx context.Context, deps sendCommandDeps, conversationID, 
 	return writeCLIDelivery(deps.output, delivery, key, scheduled)
 }
 
+// controlTokenFromDaemonStatus prefers the token in the data directory the
+// daemon reports serving. fallback is the token the status probe used, which
+// the daemon just accepted; it stays when the reported directory's token
+// can't be read.
 func controlTokenFromDaemonStatus(status v2DaemonStatus, fallback string) string {
 	if strings.TrimSpace(status.Auth.DataDir) == "" {
 		return fallback
 	}
-	return loadCLIControlToken(status.Auth.DataDir)
+	if token := loadCLIControlToken(status.Auth.DataDir); token != "" {
+		return token
+	}
+	return fallback
 }
 
 func deterministicRejectionError(err error) error {
