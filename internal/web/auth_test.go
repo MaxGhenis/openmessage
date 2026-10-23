@@ -13,6 +13,7 @@ import (
 	"strings"
 	"testing"
 	"testing/quick"
+	"time"
 
 	"github.com/maxghenis/openmessage/internal/db"
 	"github.com/rs/zerolog"
@@ -439,5 +440,159 @@ func TestEventStreamRejectsNewestSubscriberAtLimit(t *testing.T) {
 	h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "http://127.0.0.1/api/events", nil))
 	if w.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want 503", w.Code)
+	}
+}
+
+func mintBootstrapLink(t *testing.T, h http.Handler, token string) (int, string) {
+	t.Helper()
+	r := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:7007"+BootstrapLinkPath, nil)
+	if token != "" {
+		r.Header.Set("Authorization", "Bearer "+token)
+	}
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	var body struct {
+		Path string `json:"path"`
+	}
+	_ = json.Unmarshal(w.Body.Bytes(), &body)
+	return w.Code, body.Path
+}
+
+func useBootstrapPath(h http.Handler, path string) *httptest.ResponseRecorder {
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "http://127.0.0.1:7007"+path, nil))
+	return w
+}
+
+func TestMintedBootstrapLinkNeedsTheTokenAndWorksOnce(t *testing.T) {
+	a, err := NewControlAuth(t.TempDir(), zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	dispatched := false
+	h := ProtectLocalControl(a.Handler(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { dispatched = true })))
+
+	if code, path := mintBootstrapLink(t, h, ""); code != http.StatusUnauthorized || path != "" {
+		t.Fatalf("unauthenticated mint = %d %q, want 401", code, path)
+	}
+	get := httptest.NewRecorder()
+	getReq := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:7007"+BootstrapLinkPath, nil)
+	getReq.Header.Set("Authorization", "Bearer "+a.token)
+	h.ServeHTTP(get, getReq)
+	if get.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("GET mint = %d, want 405", get.Code)
+	}
+
+	code, path := mintBootstrapLink(t, h, a.token)
+	if code != http.StatusOK || !strings.HasPrefix(path, "/auth/bootstrap?t=") {
+		t.Fatalf("mint = %d %q", code, path)
+	}
+	if strings.Contains(path, a.token) {
+		t.Fatal("minted link carries the control token")
+	}
+	first := useBootstrapPath(h, path)
+	if first.Code != http.StatusFound || len(first.Result().Cookies()) != 1 || first.Result().Cookies()[0].Value != a.token {
+		t.Fatalf("minted link = %d cookies %+v", first.Code, first.Result().Cookies())
+	}
+	if again := useBootstrapPath(h, path); again.Code != http.StatusGone {
+		t.Fatalf("reused minted link = %d, want 410", again.Code)
+	}
+	// Minting leaves the startup link alone.
+	if startup := useBootstrapPath(h, strings.TrimPrefix(a.BootstrapURL("http://127.0.0.1:7007"), "http://127.0.0.1:7007")); startup.Code != http.StatusFound {
+		t.Fatalf("startup link after a mint = %d, want 302", startup.Code)
+	}
+	if dispatched {
+		t.Fatal("mint or bootstrap reached the API handler")
+	}
+}
+
+func TestMintedBootstrapLinkExpiresAndIsBounded(t *testing.T) {
+	a, err := NewControlAuth(t.TempDir(), zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	clock := time.Unix(1_800_000_000, 0)
+	a.now = func() time.Time { return clock }
+	h := a.Handler(http.NotFoundHandler())
+
+	expiring, err := a.MintBootstrapCode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	clock = clock.Add(mintedBootstrapTTL)
+	if w := useBootstrapPath(h, "/auth/bootstrap?t="+expiring); w.Code != http.StatusGone {
+		t.Fatalf("expired minted link = %d, want 410", w.Code)
+	}
+
+	codes := make([]string, 0, maxMintedBootstraps+1)
+	for i := 0; i <= maxMintedBootstraps; i++ {
+		clock = clock.Add(time.Second)
+		code, err := a.MintBootstrapCode()
+		if err != nil {
+			t.Fatal(err)
+		}
+		codes = append(codes, code)
+	}
+	if len(a.minted) != maxMintedBootstraps {
+		t.Fatalf("outstanding minted codes = %d, want %d", len(a.minted), maxMintedBootstraps)
+	}
+	if w := useBootstrapPath(h, "/auth/bootstrap?t="+codes[0]); w.Code != http.StatusGone {
+		t.Fatalf("evicted oldest code = %d, want 410", w.Code)
+	}
+	for _, code := range codes[1:] {
+		if w := useBootstrapPath(h, "/auth/bootstrap?t="+code); w.Code != http.StatusFound {
+			t.Fatalf("outstanding code = %d, want 302", w.Code)
+		}
+	}
+}
+
+// TestBootstrapCodesAreSpentAtMostOnce: across any interleaving of mints,
+// clock moves and redemption attempts, each code sets the cookie at most
+// once, never after its expiry, and an unknown code never does.
+func TestBootstrapCodesAreSpentAtMostOnce(t *testing.T) {
+	property := func(ops []uint8) bool {
+		a, err := NewControlAuth(t.TempDir(), zerolog.Nop())
+		if err != nil {
+			t.Fatal(err)
+		}
+		clock := time.Unix(1_800_000_000, 0)
+		a.now = func() time.Time { return clock }
+		type issued struct {
+			code    string
+			expires time.Time
+			spent   bool
+		}
+		var codes []*issued
+		startup := &issued{code: a.bootstrap, expires: time.Unix(1<<40, 0)}
+		codes = append(codes, startup)
+		for _, op := range ops {
+			switch op % 4 {
+			case 0:
+				code, err := a.MintBootstrapCode()
+				if err != nil {
+					t.Fatal(err)
+				}
+				codes = append(codes, &issued{code: code, expires: clock.Add(mintedBootstrapTTL)})
+			case 1:
+				clock = clock.Add(time.Duration(op) * time.Second)
+			case 2:
+				if a.consumeBootstrapCode(strings.Repeat("f", 64)) {
+					return false
+				}
+			default:
+				target := codes[int(op/4)%len(codes)]
+				got := a.consumeBootstrapCode(target.code)
+				if got && (target.spent || !clock.Before(target.expires)) {
+					return false
+				}
+				if got {
+					target.spent = true
+				}
+			}
+		}
+		return true
+	}
+	if err := quick.Check(property, &quick.Config{MaxCount: 300}); err != nil {
+		t.Fatal(err)
 	}
 }

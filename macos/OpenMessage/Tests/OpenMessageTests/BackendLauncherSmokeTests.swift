@@ -95,6 +95,87 @@ final class BackendLauncherSmokeTests: XCTestCase {
         XCTAssertNil(launcher.process)
     }
 
+    /// The real backend refuses an unauthenticated native call, accepts the
+    /// app's Bearer token, and the bootstrap link the app mints for its web
+    /// view sets a cookie that authenticates the page's own requests.
+    func testRealBackendEnforcesTheControlTokenTheAppSends() async throws {
+        let fileManager = FileManager.default
+        guard let configuredPath = ProcessInfo.processInfo.environment["OPENMESSAGE_BINARY"],
+              !configuredPath.isEmpty else {
+            throw XCTSkip("OPENMESSAGE_BINARY is not set")
+        }
+        let binaryPath = (configuredPath as NSString).standardizingPath
+        guard fileManager.isExecutableFile(atPath: binaryPath) else {
+            throw XCTSkip("OPENMESSAGE_BINARY is missing or not executable: \(binaryPath)")
+        }
+
+        let temporaryRoot = fileManager.temporaryDirectory
+            .appendingPathComponent("openmessage-auth-smoke-\(UUID().uuidString)", isDirectory: true)
+        let dataDirectory = temporaryRoot.appendingPathComponent("data", isDirectory: true)
+        try fileManager.createDirectory(at: dataDirectory, withIntermediateDirectories: true)
+        defer { try? fileManager.removeItem(at: temporaryRoot) }
+        let logURL = temporaryRoot.appendingPathComponent("backend.log")
+        guard fileManager.createFile(atPath: logURL.path, contents: nil) else {
+            throw SmokeFailure("Could not create backend log at \(logURL.path)")
+        }
+        let logHandle = try FileHandle(forWritingTo: logURL)
+        defer { try? logHandle.close() }
+
+        let configuration = BackendLaunchConfiguration.application(
+            executablePath: binaryPath,
+            dataDirectory: dataDirectory.path,
+            port: try reserveLoopbackPort(),
+            homeDirectory: temporaryRoot.path,
+            additionalEnvironment: [
+                "OPENMESSAGES_HOST": "127.0.0.1",
+                "OPENMESSAGES_SIGNAL_TMP_SWEEP": "0",
+                "OPENMESSAGES_STARTUP_BACKFILL": "off",
+                "OPENMESSAGE_TELEMETRY": "0",
+                "OPENMESSAGES_DEMO": "0",
+            ]
+        )
+        let launcher = BackendLauncherCore(configuration: configuration)
+        defer {
+            if launcher.process != nil {
+                _ = launcher.forceTerminateAndWait(timeout: 2)
+            }
+        }
+        let process = try launcher.launch { process in
+            process.standardOutput = logHandle
+            process.standardError = logHandle
+        }
+        try await waitForTwoHTTP200Responses(at: configuration.baseURL, process: process, timeout: 12, logHandle: logHandle, logURL: logURL)
+
+        let session = URLSession(configuration: .ephemeral)
+        defer { session.invalidateAndCancel() }
+        let statusURL = configuration.baseURL.appendingPathComponent("api/status")
+        func statusCode(_ request: URLRequest) async throws -> Int {
+            let (_, response) = try await session.data(for: request)
+            return (response as? HTTPURLResponse)?.statusCode ?? -1
+        }
+
+        let unauthenticated = try await statusCode(URLRequest(url: statusURL))
+        XCTAssertEqual(unauthenticated, 401, backendLog(logHandle: logHandle, logURL: logURL))
+        let authorized = LocalControlAuth.request(statusURL, dataDirectory: dataDirectory.path)
+        XCTAssertNotNil(authorized.value(forHTTPHeaderField: "Authorization"), "backend wrote no readable control.token")
+        let authenticated = try await statusCode(authorized)
+        XCTAssertEqual(authenticated, 200, backendLog(logHandle: logHandle, logURL: logURL))
+
+        // The web view's path: mint a link, load it (the backend sets the
+        // cookie and redirects to the UI), then the page's fetch carries it.
+        let uiURL = await LocalControlAuth.authorizedUIURL(baseURL: configuration.baseURL, dataDirectory: dataDirectory.path, session: session)
+        XCTAssertEqual(uiURL.path, "/auth/bootstrap")
+        let (_, landing) = try await session.data(from: uiURL)
+        XCTAssertEqual((landing as? HTTPURLResponse)?.statusCode, 200)
+        XCTAssertEqual(landing.url?.path, "/")
+        let withCookie = try await statusCode(URLRequest(url: statusURL))
+        XCTAssertEqual(withCookie, 200, "bootstrap cookie did not authenticate")
+        let reused = try await URLSession(configuration: .ephemeral).data(from: uiURL)
+        XCTAssertEqual((reused.1 as? HTTPURLResponse)?.statusCode, 410, "a minted link must work once")
+
+        try requireCleanExit(launcher.terminateAndWait(timeout: 5), phase: "auth smoke", logHandle: logHandle, logURL: logURL)
+    }
+
     private func waitForTwoHTTP200Responses(
         at baseURL: URL,
         process: Process,

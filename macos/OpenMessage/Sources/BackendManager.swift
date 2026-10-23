@@ -430,7 +430,7 @@ final class BackendManager: ObservableObject {
                 try? await Task.sleep(for: .milliseconds(500))
                 do {
                     let url = baseURL.appendingPathComponent("api/status")
-                    let (data, response) = try await URLSession.shared.data(from: url)
+                    let (data, response) = try await URLSession.shared.data(for: LocalControlAuth.request(url, dataDirectory: dataDir))
                     if let http = response as? HTTPURLResponse, http.statusCode == 200,
                        let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
                         _ = json
@@ -460,7 +460,7 @@ final class BackendManager: ObservableObject {
                 if Task.isCancelled { return }
                 do {
                     let url = baseURL.appendingPathComponent("api/status")
-                    let (data, response) = try await URLSession.shared.data(from: url)
+                    let (data, response) = try await URLSession.shared.data(for: LocalControlAuth.request(url, dataDirectory: dataDir))
                     if let http = response as? HTTPURLResponse, http.statusCode == 200 {
                         consecutiveFailures = 0
                         self.updatePlatformAlert(from: data)
@@ -516,9 +516,9 @@ final class BackendManager: ObservableObject {
     private func handleDisconnect() {
         // Tell the backend to clean up (capture URL before stopping)
         let unpairURL = baseURL.appendingPathComponent("api/unpair")
+        let dataDirectory = dataDir
         Task.detached {
-            var request = URLRequest(url: unpairURL)
-            request.httpMethod = "POST"
+            let request = LocalControlAuth.request(unpairURL, method: "POST", dataDirectory: dataDirectory)
             _ = try? await URLSession.shared.data(for: request)
         }
 

@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/rs/zerolog"
 )
@@ -29,11 +30,22 @@ const (
 	// LoginErrorQuery is the query parameter /auth/login adds to its redirect
 	// back to the UI when the pasted token does not match.
 	LoginErrorQuery = "auth_error"
+	// BootstrapLinkPath mints a fresh single-use bootstrap link for an
+	// already-authenticated native client (the macOS app), which loads it in
+	// its web view so the page gets the cookie through a normal Set-Cookie.
+	BootstrapLinkPath = "/api/auth/bootstrap-link"
+	// mintedBootstrapTTL bounds how long a minted link stays usable; the app
+	// loads it immediately.
+	mintedBootstrapTTL = 2 * time.Minute
+	// maxMintedBootstraps caps outstanding minted links.
+	maxMintedBootstraps = 16
 )
 
 type ControlAuth struct {
 	token             string
 	bootstrap         string
+	minted            map[string]time.Time
+	now               func() time.Time
 	logger            zerolog.Logger
 	dataDir           string
 	mu                sync.Mutex
@@ -59,7 +71,7 @@ func NewControlAuth(dataDir string, logger zerolog.Logger) (*ControlAuth, error)
 	if err != nil {
 		return nil, fmt.Errorf("mint bootstrap code: %w", err)
 	}
-	return &ControlAuth{token: token, bootstrap: bootstrap, logger: logger, dataDir: absDataDir, warned: make(map[string]struct{})}, nil
+	return &ControlAuth{token: token, bootstrap: bootstrap, minted: make(map[string]time.Time), now: time.Now, logger: logger, dataDir: absDataDir, warned: make(map[string]struct{})}, nil
 }
 
 func loadOrMintControlToken(dataDir string) (string, bool, error) {
@@ -170,6 +182,10 @@ func (a *ControlAuth) Handler(next http.Handler) http.Handler {
 			if fetchSite != "" && fetchSite != "same-origin" && fetchSite != "same-site" && fetchSite != "none" {
 				a.warnOnce(r, classification, fetchSite, "Authenticated local control request has an unexpected Sec-Fetch-Site")
 			}
+			if r.URL.Path == BootstrapLinkPath {
+				a.handleMintBootstrapLink(w, r)
+				return
+			}
 		}
 		next.ServeHTTP(w, r)
 	})
@@ -232,19 +248,86 @@ func (a *ControlAuth) handleBootstrap(w http.ResponseWriter, r *http.Request) {
 		httpError(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	code := r.URL.Query().Get("t")
-	a.mu.Lock()
-	valid := a.bootstrap != "" && secureEqual(code, a.bootstrap)
-	if valid {
-		a.bootstrap = ""
-	}
-	a.mu.Unlock()
-	if !valid {
+	if !a.consumeBootstrapCode(r.URL.Query().Get("t")) {
 		httpError(w, "bootstrap code is invalid or already used", http.StatusGone)
 		return
 	}
 	a.setControlCookie(w)
 	http.Redirect(w, r, "/", http.StatusFound)
+}
+
+// consumeBootstrapCode reports whether code is the startup code or an
+// unexpired minted one, and spends it. Every outstanding code is compared in
+// constant time.
+func (a *ControlAuth) consumeBootstrapCode(code string) bool {
+	if code == "" {
+		return false
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.bootstrap != "" && secureEqual(code, a.bootstrap) {
+		a.bootstrap = ""
+		return true
+	}
+	now := a.now()
+	matched := ""
+	for minted, expires := range a.minted {
+		if !now.Before(expires) {
+			delete(a.minted, minted)
+			continue
+		}
+		if secureEqual(code, minted) {
+			matched = minted
+		}
+	}
+	if matched == "" {
+		return false
+	}
+	delete(a.minted, matched)
+	return true
+}
+
+// MintBootstrapCode returns a fresh single-use bootstrap code that expires
+// after mintedBootstrapTTL. At most maxMintedBootstraps are outstanding; a
+// new one evicts the one closest to expiring.
+func (a *ControlAuth) MintBootstrapCode() (string, error) {
+	code, err := randomHex(32)
+	if err != nil {
+		return "", fmt.Errorf("mint bootstrap code: %w", err)
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	now := a.now()
+	for minted, expires := range a.minted {
+		if !now.Before(expires) {
+			delete(a.minted, minted)
+		}
+	}
+	for len(a.minted) >= maxMintedBootstraps {
+		oldest, oldestExpiry := "", time.Time{}
+		for minted, expires := range a.minted {
+			if oldest == "" || expires.Before(oldestExpiry) {
+				oldest, oldestExpiry = minted, expires
+			}
+		}
+		delete(a.minted, oldest)
+	}
+	a.minted[code] = now.Add(mintedBootstrapTTL)
+	return code, nil
+}
+
+func (a *ControlAuth) handleMintBootstrapLink(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		httpError(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	code, err := a.MintBootstrapCode()
+	if err != nil {
+		httpError(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, map[string]any{"path": "/auth/bootstrap?t=" + code, "expires_in_seconds": int(mintedBootstrapTTL / time.Second)})
 }
 
 // handleLogin is the fallback for a browser that missed the single-use
