@@ -57,17 +57,19 @@ type SMSPathConfig struct {
 	// most MaxLongGaps long gaps (a whole Window or more without any incoming
 	// SMS), and at least MinRegularSpan covered by the shorter gaps, the time
 	// the phone kept its usual rhythm. Long gaps never count toward
-	// MinRegularSpan, so a phone that texts in clusters with quiet days
-	// between them is not judged, however busy the clusters and however long
-	// the history reaches back. No calendar or time zone enters: a
-	// weekday-only texter goes two days without texts every weekend, wherever
-	// and whenever midnight falls, and is never judged. A phone that gets
-	// about one text a day is judged only if every gap stays under Window; at
-	// one arrival a day a stall then takes MinExpectedArrivals days to flag.
+	// MinRegularSpan. No calendar or time zone enters: a weekday-only texter
+	// goes two days without texts every weekend, wherever and whenever
+	// midnight falls, and is never judged; nor is a phone whose clusters of
+	// texts give it less than MinRegularSpan of regular time in a baseline.
 	// One long gap, shorter than BaselineWindow minus MinRegularSpan (a week
 	// by default), is allowed so that an earlier outage does not stop the
 	// next one being caught; a longer one, or a second, withholds judgment
-	// until it leaves the baseline.
+	// until it leaves the baseline. The rule cannot tell an outage from a
+	// quiet spell that follows MinRegularSpan of regular texting, so such a
+	// spell is judged (intended): a monthly lull of a few days, three busy
+	// weeks then quiet, or a phone that gets about one text a day and let at
+	// most one gap reach Window. At one arrival a day a stall takes about
+	// MinExpectedArrivals days to flag.
 	BaselineWindow      time.Duration
 	MinRegularSpan      time.Duration
 	MinBaselineArrivals int

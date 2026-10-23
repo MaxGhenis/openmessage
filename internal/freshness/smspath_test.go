@@ -358,6 +358,61 @@ func TestEvaluateSMSPathFalseAlarmRateForMemorylessTexters(t *testing.T) {
 	}
 }
 
+// Intended limits (review round 6): a quiet spell that follows three weeks of
+// regular texting looks the same as an outage, so it is judged and stalls
+// once it outlasts the phone's pace. These pin the documented behaviour; a
+// change that stops judging them should update the runbook's known limits.
+func TestEvaluateSMSPathJudgesQuietSpellsAfterThreeRegularWeeks(t *testing.T) {
+	recentRCS := func(events []TransportEvent, now time.Time) []TransportEvent {
+		return append(events,
+			TransportEvent{At: now.Add(-2 * time.Hour), Transport: TransportRCS},
+			TransportEvent{At: now.Add(-time.Hour), Transport: TransportRCS},
+			TransportEvent{At: now, Transport: TransportRCS})
+	}
+	// The review's probe: 32-day cycles of 22 busy days then 10 quiet, the
+	// current busy spell ending March 22 at 20:00; the previous quiet spell
+	// lies outside the baseline.
+	current := time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC)
+	var cycles []TransportEvent
+	for k := 0; k < 6; k++ {
+		start := current.AddDate(0, 0, -32*k)
+		cycles = append(cycles, smsDailyTraffic(start, start.AddDate(0, 0, 22).Add(-time.Minute))...)
+	}
+	now := time.Date(2026, 3, 24, 1, 0, 0, 0, time.UTC)
+	if v := EvaluateSMSPath(recentRCS(cycles, now), now, testSMSPathConfig); !v.Stalled || v.LongGaps != 0 {
+		t.Errorf("22 busy days then quiet: %+v, want stalled (intended)", v)
+	}
+
+	// A three-day lull every 28 days.
+	var lulls []TransportEvent
+	for k := 0; k < 4; k++ {
+		start := current.AddDate(0, 0, -28*k)
+		lulls = append(lulls, smsDailyTraffic(start, start.AddDate(0, 0, 25).Add(-time.Minute))...)
+	}
+	now = current.AddDate(0, 0, 27)
+	if v := EvaluateSMSPath(recentRCS(lulls, now), now, testSMSPathConfig); !v.Stalled {
+		t.Errorf("monthly three-day lull: %+v, want stalled (intended)", v)
+	}
+
+	// About one text a day: 27 gaps of 23 hours and one of 25 hours (the one
+	// long gap allowed), then seven quiet days.
+	lastSMS := time.Date(2026, 3, 13, 12, 0, 0, 0, time.UTC)
+	daily := []TransportEvent{{At: lastSMS, Transport: TransportSMS}}
+	at := lastSMS
+	for i := 0; i < 28; i++ {
+		gap := 23 * time.Hour
+		if i == 13 {
+			gap = 25 * time.Hour
+		}
+		at = at.Add(-gap)
+		daily = append(daily, TransportEvent{At: at, Transport: TransportSMS})
+	}
+	now = lastSMS.Add(7 * 24 * time.Hour)
+	if v := EvaluateSMSPath(recentRCS(daily, now), now, testSMSPathConfig); !v.Stalled || v.LongGaps != 1 {
+		t.Errorf("daily with one 25h gap: %+v, want stalled with one long gap (intended)", v)
+	}
+}
+
 // firstStall walks the clock from lastSMS in 15-minute steps for three days
 // and returns the first stalled verdict, if any.
 func firstStall(events []TransportEvent, lastSMS time.Time) (time.Time, SMSPathVerdict) {

@@ -650,12 +650,12 @@ curl -s http://127.0.0.1:7007/api/status | jq '.freshness.google.sms_path, .fres
   - No calendar or time zone enters, so travel and daylight-saving changes
     cannot move the verdict.
   - A phone that gets texts only on weekdays goes two days without one every
-    weekend, and is never judged (`thin_baseline`). Nor is a phone whose texts
-    come in clusters with quiet days between them, however busy the clusters.
+    weekend, and is never judged (`thin_baseline`). Nor is a phone whose
+    clusters of texts give it less than 21 regular days in the 28.
   - A phone that gets one text a day at a random time of day goes a whole day
-    without one at about half its gaps, and is then not judged. If every gap
-    stays under 24 hours it is judged, and at one arrival a day a stall takes
-    six days to flag.
+    without one at about half its gaps, and is then not judged. If at most one
+    gap reaches 24 hours it is judged, and at one arrival a day a stall takes
+    about six days to flag.
 - **RCS is flowing now:** at least 3 incoming RCS messages in the last 24 hours,
   the newest within 3 hours.
 
@@ -720,11 +720,18 @@ Known limits:
   dual-SIM phone, so one SIM losing SMS while the other still gets texts goes
   unseen.
 - **Quiet RCS:** nothing can be judged while RCS is quiet too.
+- **Regular quiet spells:** a quiet spell that follows three weeks of regular
+  texting looks the same as an outage, so it is judged and can alarm: a
+  monthly lull of a few days, or three busy weeks followed by quiet ones
+  (intended; tested).
 - **Relay stalls:** the monitor reads only live frames (codec
   `google.protobuf`), not catch-up history (`google.protobuf.history`, see
-  "Catch-up history reaches v2"). A relay stall of a day or more therefore
-  leaves a long gap in its baseline, which uses up the one allowance for the
-  next 28 days.
+  "Catch-up history reaches v2"). Messages the server replays after a
+  reconnect (`is_old`) arrive as live frames and count at their own times, so
+  they fill the gap. When the live channel never re-delivers what a relay
+  stall of a day or more held back (see "What a stall leaves behind"), the
+  stall leaves a long gap in the baseline, which uses up the one allowance
+  for the next 28 days.
 - **Lookback:** the daemon reads 42 days of frames, so an outage longer than
   about two weeks loses part of its baseline and can stop being judged.
 - **Deliberately offline phones:** a phone kept off the cellular network on
