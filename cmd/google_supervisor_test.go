@@ -17,6 +17,7 @@ import (
 
 	"github.com/rs/zerolog"
 
+	"github.com/maxghenis/openmessage/internal/app"
 	"github.com/maxghenis/openmessage/internal/bridge"
 )
 
@@ -224,6 +225,104 @@ func TestGoogleRepairRetriesNeverOutrunThePacingFloor(t *testing.T) {
 	}
 	if err := quick.Check(property, &quick.Config{MaxCount: 16, Rand: rand.New(rand.NewSource(1022))}); err != nil {
 		t.Fatalf("repair pacing property: %v", err)
+	}
+}
+
+// Review of #260 (P1): a refresh that can never succeed on its own, such as a
+// Chrome profile signed out of Google, used to retry forever with
+// needs_repair false, so the app's own health notification never fired. It
+// must keep retrying, escalate to repair_failing + needs_repair once it has
+// failed GoogleRepairAttentionAfter times in a row, never ask for a re-pair
+// by starting a generation, and heal by itself once Chrome is signed in again.
+func TestGoogleRefreshThatKeepsFailingAsksForAttentionAndStillHeals(t *testing.T) {
+	t.Setenv(googleCredentialRepairMinIntervalEnv, "1ms")
+	a := &app.App{SessionPath: filepath.Join(t.TempDir(), "session.json"), Logger: zerolog.Nop()}
+	if err := os.WriteFile(a.SessionPath, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var signedIn atomic.Bool
+	var calls atomic.Int32
+	repairer := newGoogleCredentialRepairer(
+		a.SessionPath,
+		func() bool { return true },
+		func(context.Context, string) error {
+			calls.Add(1)
+			if !signedIn.Load() {
+				return errors.New("missing required cookies: .google.com:SID, .google.com:HSID, .google.com:SSID, .google.com:APISID, .google.com:SAPISID")
+			}
+			return nil
+		},
+		a.FlagGoogleNeedsRepair,
+		a.ClearGoogleRepairFlag,
+		zerolog.Nop(),
+	)
+	policy := googleSupervisorPolicy()
+	policy.MinBackoff = time.Millisecond
+	policy.MaxBackoff = 2 * time.Millisecond
+	lifecycle := &googleRepairTestLifecycle{}
+	supervisor, err := bridge.NewSupervisor(
+		googleAccountID,
+		bridge.PlatformGoogle,
+		lifecycle,
+		policy,
+		googleWallClock{},
+		googleRandom{},
+		bridge.WithCredentialRepairer(repairer),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = supervisor.Stop(ctx)
+	})
+	a.SetGoogleSupervisorStatus(func() (app.GoogleSupervisorStatus, bool) {
+		return googleSupervisorStatus(supervisor.Snapshot()), true
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	err = supervisor.Start(ctx, bridge.StartRequest{})
+	cancel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	awaitGoogleSupervisorState(t, supervisor, bridge.StateOnline)
+	a.HandleGoogleAuthExpiredError(errors.New("HTTP 401"))
+	lifecycle.Run(0).Fail(bridge.OpError{
+		Class:       bridge.FailureCredentialsExpired,
+		Fingerprint: "google_auth_expired",
+		Cause:       errors.New("HTTP 401"),
+	})
+
+	// Past the attention threshold and twice the same-fingerprint circuit:
+	// still retrying, never parked, and now asking for a person.
+	deadline := time.Now().Add(2 * time.Second)
+	for supervisor.Snapshot().RepairFailures < 2*policy.MaxSameFingerprint {
+		if time.Now().After(deadline) {
+			t.Fatalf("refresh did not keep retrying: %+v", supervisor.Snapshot())
+		}
+		time.Sleep(time.Millisecond)
+	}
+	status := a.GoogleStatus()
+	if !status.NeedsRepair || !status.RepairFailing || status.Reconnecting {
+		t.Fatalf("status after %d failed refreshes = %+v, want repair_failing + needs_repair", calls.Load(), status)
+	}
+	if status.Supervisor == nil || status.Supervisor.State != string(bridge.StateRepairingCredentials) ||
+		!strings.Contains(status.Supervisor.Repair.LastError, "missing required cookies") {
+		t.Fatalf("supervisor block = %+v, want still repairing with the refresh error", status.Supervisor)
+	}
+	if got := lifecycle.StartCount(); got != 1 {
+		t.Fatalf("generations started while every refresh failed = %d, want 1", got)
+	}
+	if repairer.PacedRepairCount() != 0 {
+		t.Fatalf("retries hit the pacing gate %d times", repairer.PacedRepairCount())
+	}
+
+	// The user signs Chrome back in: the next retry heals without a Reconnect.
+	signedIn.Store(true)
+	awaitGoogleSupervisorGenerationStateWithin(t, supervisor, bridge.StateOnline, 2, 2*time.Second)
+	if status := a.GoogleStatus(); status.RepairFailing || status.Supervisor.Repair.ConsecutiveFailures != 0 {
+		t.Fatalf("status after healing = %+v, want repair_failing cleared", status)
 	}
 }
 

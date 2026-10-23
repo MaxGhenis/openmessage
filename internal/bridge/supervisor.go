@@ -460,9 +460,6 @@ type supervisorLoop struct {
 	sameFailureCount int
 	lastFailure      OpError
 	repairFailed     bool
-	// repairFailures counts consecutive failed repair attempts; it drives the
-	// retry backoff and resets when a repair succeeds.
-	repairFailures int
 
 	probeResults  <-chan probeResult
 	probeCancel   context.CancelFunc
@@ -1021,7 +1018,7 @@ func (l *supervisorLoop) handleRepairResult(result repairResult) {
 	l.snapshot.LastRepairFinishedAt = now
 	if result.err == nil {
 		l.repairFailed = false
-		l.repairFailures = 0
+		l.snapshot.RepairFailures = 0
 		l.snapshot.LastRepairOutcome = RepairOutcomeSucceeded
 		_ = l.startGeneration()
 		return
@@ -1039,7 +1036,7 @@ func (l *supervisorLoop) handleRepairResult(result repairResult) {
 		l.block(BlockReasonRepairFailed)
 		return
 	}
-	l.repairFailures++
+	l.snapshot.RepairFailures++
 	delay, err := l.repairRetryDelay()
 	if err != nil {
 		l.snapshot.LastRepairOutcome = RepairOutcomeBlocked
@@ -1079,7 +1076,7 @@ func (l *supervisorLoop) repairRetryDelay() (time.Duration, error) {
 	if maximum < floor {
 		maximum = floor
 	}
-	window := backoffCap(floor, maximum, l.repairFailures)
+	window := backoffCap(floor, maximum, l.snapshot.RepairFailures)
 	if window <= floor {
 		return floor, nil
 	}
@@ -1357,7 +1354,7 @@ func (l *supervisorLoop) resetFailureHistory() {
 	l.sameFingerprint = ""
 	l.sameFailureCount = 0
 	l.repairFailed = false
-	l.repairFailures = 0
+	l.snapshot.RepairFailures = 0
 	l.snapshot.RepairAttempts = 0
 	l.lastFailure = OpError{}
 	l.snapshot.RetryAt = time.Time{}
@@ -1571,6 +1568,7 @@ func snapshotTransitioned(previous, current Snapshot) bool {
 		previous.Generation != current.Generation ||
 		previous.BlockReason != current.BlockReason ||
 		previous.RepairAttempts != current.RepairAttempts ||
+		previous.RepairFailures != current.RepairFailures ||
 		previous.LastRepairOutcome != current.LastRepairOutcome ||
 		!previous.LastRepairStartedAt.Equal(current.LastRepairStartedAt) ||
 		!previous.RetryAt.Equal(current.RetryAt)

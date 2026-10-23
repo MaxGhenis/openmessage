@@ -297,11 +297,12 @@ func googleSupervisorStatus(snapshot bridge.Snapshot) app.GoogleSupervisorStatus
 		BlockReason:      snapshot.BlockReason,
 		RetryAtMS:        unixMilliOrZero(snapshot.RetryAt),
 		Repair: app.GoogleRepairStatus{
-			Attempts:       snapshot.RepairAttempts,
-			LastStartedMS:  unixMilliOrZero(snapshot.LastRepairStartedAt),
-			LastFinishedMS: unixMilliOrZero(snapshot.LastRepairFinishedAt),
-			LastOutcome:    string(snapshot.LastRepairOutcome),
-			LastError:      snapshot.LastRepairError,
+			Attempts:            snapshot.RepairAttempts,
+			ConsecutiveFailures: snapshot.RepairFailures,
+			LastStartedMS:       unixMilliOrZero(snapshot.LastRepairStartedAt),
+			LastFinishedMS:      unixMilliOrZero(snapshot.LastRepairFinishedAt),
+			LastOutcome:         string(snapshot.LastRepairOutcome),
+			LastError:           snapshot.LastRepairError,
 		},
 	}
 }

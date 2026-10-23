@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"math/rand"
 	"reflect"
 	"sync"
@@ -217,6 +218,7 @@ func TestSupervisorRepairEpisodeProperties(t *testing.T) {
 			return fail("Start() error = nil, want the expired-credentials failure")
 		}
 		starts := 1
+		consecutive := 0
 		for index, step := range episode.Steps[:model.consumed] {
 			attempt := receiveSupervisorValue(t, repairer.started, "repair attempt start")
 			if attempt.failure.Class != FailureCredentialsExpired {
@@ -234,6 +236,10 @@ func TestSupervisorRepairEpisodeProperties(t *testing.T) {
 				})
 				if waiting.State != StateRepairingCredentials {
 					return fail("step %d: state %q after a recoverable failure", index, waiting.State)
+				}
+				consecutive++
+				if waiting.RepairFailures != consecutive {
+					return fail("step %d: RepairFailures = %d, want %d consecutive", index, waiting.RepairFailures, consecutive)
 				}
 				wait := waiting.RetryAt.Sub(waiting.LastRepairFinishedAt)
 				if wait < floor || wait > ceiling {
@@ -257,6 +263,7 @@ func TestSupervisorRepairEpisodeProperties(t *testing.T) {
 				exercised["ineffective"]++
 				sendSupervisorValue(t, repairer.responses, error(nil), "ineffective repair")
 				starts++
+				consecutive = 0
 				awaitSupervisorStartCount(t, lifecycle, starts)
 			case repairStepHeals:
 				exercised["heals"]++
@@ -395,20 +402,25 @@ func TestSupervisorRepairRetryDelayBounds(t *testing.T) {
 		}
 		random := &fixedDrawRandom{draw: draw}
 		loop := supervisorLoop{supervisor: &Supervisor{policy: policy, random: random}}
-		loop.repairFailures = int(failures%40) + 1
+		loop.snapshot.RepairFailures = int(failures%40) + 1
 		delay, err := loop.repairRetryDelay()
 		if err != nil {
 			t.Logf("repairRetryDelay() error = %v", err)
 			return false
 		}
 		if delay < floor || delay > ceiling {
-			t.Logf("delay %s outside [%s, %s] for policy %+v failures %d", delay, floor, ceiling, policy, loop.repairFailures)
+			t.Logf("delay %s outside [%s, %s] for policy %+v failures %d", delay, floor, ceiling, policy, loop.snapshot.RepairFailures)
 			return false
 		}
-		// The window doubles per consecutive failure, so a jittered draw must
-		// come from exactly [0, window-floor); a window no wider than the floor
-		// draws nothing and waits the floor.
-		window := backoffCap(floor, ceiling, loop.repairFailures)
+		// The window doubles per consecutive failure: floor * 2^(failures-1),
+		// capped at the ceiling, computed here in closed form rather than with
+		// the production helper. A jittered draw must come from exactly
+		// [0, window-floor); a window no wider than the floor draws nothing
+		// and waits the floor.
+		window := ceiling
+		if doubled := float64(floor) * math.Pow(2, float64(loop.snapshot.RepairFailures-1)); doubled < float64(ceiling) {
+			window = floor << (loop.snapshot.RepairFailures - 1)
+		}
 		if window <= floor {
 			if random.bound != 0 || delay != floor {
 				t.Logf("window %s ≤ floor %s, but drew [0, %s) and waited %s", window, floor, time.Duration(random.bound), delay)
@@ -417,7 +429,7 @@ func TestSupervisorRepairRetryDelayBounds(t *testing.T) {
 			return true
 		}
 		if random.bound != int64(window-floor) {
-			t.Logf("failures %d: drew from [0, %s), want [0, %s)", loop.repairFailures, time.Duration(random.bound), window-floor)
+			t.Logf("failures %d: drew from [0, %s), want [0, %s)", loop.snapshot.RepairFailures, time.Duration(random.bound), window-floor)
 			return false
 		}
 		return true

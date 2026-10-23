@@ -1516,7 +1516,12 @@ manual cookie refresh and restart. Now:
   session write, the 20 s timeout) is retried with backoff: at least
   `OPENMESSAGE_REPAIR_MIN_INTERVAL` (90 s), then full jitter over a window that
   doubles per consecutive failure, up to 5 min. No generation starts until a
-  refresh succeeds. These retries don't raise `needs_repair`.
+  refresh succeeds. The first two failures stay quiet; from the third in a
+  row (`repair_failing: true`, about 3–4.5 minutes after the expiry) status also raises
+  `needs_repair`, so the watchdog and the app's health notification fire,
+  while the retries go on. A refresh that keeps failing is usually Chrome
+  (signed out of the account, keychain access refused), never a re-pair; once
+  Chrome is fixed the next retry heals it with no Reconnect.
 - It parks only for a terminal error: no refresh mechanism at all
   (`google_cookie_refresh_unavailable`, the one case that asks for a re-pair),
   or a terminal class from the lifecycle (Gaia logout, unusable session). It
@@ -1524,7 +1529,11 @@ manual cookie refresh and restart. Now:
   four repairs whose fresh cookies Google rejected too
   (`block_reason: repeated_failure` with `error_class: credentials_expired`):
   check that Chrome is signed in to the account, then press Reconnect; re-pair
-  only if that fails too.
+  only if that fails too. The count resets whenever a generation shows any
+  activity, so a generation that gets a long-poll event before each 401
+  (`ListenRecovered`, then a set-active 401) repairs again every pacing
+  interval instead of tripping the circuit; `repairs_paced` climbing is the
+  signal for that loop.
 - A libgm ping or set-active-session rejected with HTTP 401 now goes to
   repair at once. Before, it took three failed pings (~2-3 min) and a
   transient reconnect to learn the same thing from the new long poll
@@ -1562,9 +1571,11 @@ episode is still readable.
 
 What the flags mean now: `auth_expired` + `reconnecting` is a cookie refresh
 in progress or waiting to retry; it needs nothing from anyone. `needs_repair`
-is set only when automatic recovery has stopped: the supervisor parked
-(`supervisor.state == "blocked"`), or sends keep failing while connected (the
-zombie). The web banner, the macOS menu bar alert and the settings status
+is set only when a person must act: the supervisor parked
+(`supervisor.state == "blocked"`), the refresh has failed three times in a row
+(`repair_failing`, still retrying, fix Chrome), or sends keep failing while
+connected (the zombie). `supervisor.repair.consecutive_failures` counts the
+failed refreshes since the last success. The web banner, the macOS menu bar alert and the settings status
 follow the same split: "Reconnecting… No re-pair needed" while recovering, and
 the parked reason (with Re-pair only when the session is the problem) once it
 stops.

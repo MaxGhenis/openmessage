@@ -55,6 +55,8 @@ private final class SettingsViewModel: ObservableObject {
             let auth_expired: Bool?
             /// The backend is reconnecting or refreshing on its own.
             let reconnecting: Bool?
+            /// The cookie refresh keeps failing; the backend still retries.
+            let repair_failing: Bool?
         }
 
         struct BackfillStatus: Decodable {
@@ -258,6 +260,20 @@ private struct AppSettingsView: View {
                         backend.beginGooglePairing()
                     }
                     .buttonStyle(.borderedProminent)
+                } else if googleRepairFailing {
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text("OpenMessage can't refresh Google's sign-in from Chrome. Make sure Chrome is signed in to your Google account; it keeps retrying.")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+
+                        Button("Retry now") {
+                            Task {
+                                await model.reconnectGoogleMessages()
+                                await model.refresh(notifications: notifications)
+                            }
+                        }
+                        .buttonStyle(.borderedProminent)
+                    }
                 } else if googleNeedsRepair {
                     VStack(alignment: .leading, spacing: 10) {
                         Text("Google Messages stopped and can't recover on its own. Try Reconnect first; if it stops again, pair again.")
@@ -481,6 +497,13 @@ private struct AppSettingsView: View {
         return googleNeedsReconnect && (google.reconnecting == true || google.auth_expired == true)
     }
 
+    /// The cookie refresh keeps failing while the backend retries: a Chrome
+    /// fix, not a re-pair.
+    private var googleRepairFailing: Bool {
+        guard let google = model.appStatus.google else { return false }
+        return google.paired && !google.connected && google.repair_failing == true
+    }
+
     private var googleNeedsRepair: Bool {
         guard let google = model.appStatus.google else { return false }
         return google.paired && google.needs_repair == true
@@ -488,6 +511,7 @@ private struct AppSettingsView: View {
 
     private var googleStatusText: String {
         guard let google = model.appStatus.google else { return "Unavailable" }
+        if googleRepairFailing { return "Check Chrome sign-in" }
         if google.paired && google.needs_repair == true { return "Needs attention" }
         if google.connected && google.phone_responding == false { return "Phone offline" }
         if google.connected { return "Connected" }

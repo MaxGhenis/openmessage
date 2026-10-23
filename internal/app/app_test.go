@@ -237,6 +237,18 @@ func TestGoogleStatusSeparatesReconnectingFromNeedsRepair(t *testing.T) {
 		}
 	}
 
+	// A refresh that keeps failing escalates while the retries go on.
+	supervisor.State = "repairing_credentials"
+	supervisor.Repair.ConsecutiveFailures = GoogleRepairAttentionAfter - 1
+	if status := a.GoogleStatus(); status.RepairFailing || status.NeedsRepair || !status.Reconnecting {
+		t.Fatalf("status after %d failures = %+v, want still quietly reconnecting", supervisor.Repair.ConsecutiveFailures, status)
+	}
+	supervisor.Repair.ConsecutiveFailures = GoogleRepairAttentionAfter
+	if status := a.GoogleStatus(); !status.RepairFailing || !status.NeedsRepair || status.Reconnecting {
+		t.Fatalf("status after %d failures = %+v, want repair_failing + needs_repair", supervisor.Repair.ConsecutiveFailures, status)
+	}
+	supervisor.Repair.ConsecutiveFailures = 0
+
 	supervisor.State = "blocked"
 	supervisor.BlockReason = "repeated_failure"
 	status = a.GoogleStatus()

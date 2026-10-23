@@ -91,6 +91,19 @@ final class PlatformAttentionTests: XCTestCase {
             "Google Messages is reconnecting."
         )
 
+        // A refresh that keeps failing points at Chrome, not at a re-pair.
+        let failing = status("""
+        {"google": {"connected": false, "paired": true, "auth_expired": true,
+                    "needs_repair": true, "repair_failing": true}}
+        """)
+        let failingItems = PlatformAttention.evaluate(status: failing)
+        XCTAssertEqual(failingItems.map(\.reason), [.signInRefreshFailing])
+        XCTAssertEqual(
+            PlatformAttention.alertText(for: failingItems),
+            "Google Messages can't refresh its Google sign-in from Chrome. "
+                + "Make sure Chrome is signed in to your Google account; OpenMessage keeps retrying."
+        )
+
         // Once the backend parks (needs_repair), it is a repair again.
         let parked = status("""
         {"google": {"connected": false, "paired": true, "auth_expired": true, "needs_repair": true}}

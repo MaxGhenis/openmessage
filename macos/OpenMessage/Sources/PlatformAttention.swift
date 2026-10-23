@@ -14,6 +14,11 @@ struct PlatformAttention: Equatable {
         /// refreshes the sign-in cookies from Chrome. On 2026-10-22 the menu
         /// said "needs re-pairing" while a cookie refresh was all it needed.
         case reconnecting(refreshingSignIn: Bool)
+        /// Google's cookie refresh has failed several times in a row
+        /// (`repair_failing`): usually Chrome is signed out of Google or the
+        /// keychain refused access. The backend keeps retrying; the fix is in
+        /// Chrome, never a re-pair.
+        case signInRefreshFailing
         /// Connected, but nothing has arrived for longer than the platform's
         /// own recent traffic explains (`freshness.<key>.stale_reason ==
         /// "silent"`). On 2026-10-06 the phone relayed nothing for 38 hours
@@ -55,6 +60,9 @@ struct PlatformAttention: Equatable {
             let needsRepair = (p["needs_repair"] as? Bool) ?? false
             let authExpired = (p["auth_expired"] as? Bool) ?? false
             let reconnecting = (p["reconnecting"] as? Bool) ?? false
+            if paired && !connected && ((p["repair_failing"] as? Bool) ?? false) {
+                return PlatformAttention(key: platform.key, name: platform.name, reason: .signInRefreshFailing)
+            }
             if paired && !connected && !needsPairing && !needsReauth && !needsRepair
                 && (reconnecting || authExpired) {
                 return PlatformAttention(
@@ -121,6 +129,9 @@ struct PlatformAttention: Equatable {
                 sentences.append(refreshingSignIn
                     ? "\(item.name) is reconnecting: refreshing its Google sign-in from Chrome. No re-pair needed."
                     : "\(item.name) is reconnecting.")
+            case .signInRefreshFailing:
+                sentences.append("\(item.name) can't refresh its Google sign-in from Chrome. "
+                    + "Make sure Chrome is signed in to your Google account; OpenMessage keeps retrying.")
             case .needsRepair:
                 break
             }

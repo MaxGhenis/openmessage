@@ -2655,12 +2655,39 @@ test('a parked Google supervisor explains why and asks for Re-pair only when the
   });
 
   // Fresh cookies rejected again and again: check Chrome, then reconnect.
+  // The Platforms dialog must offer the same reconnect, not a re-pair
+  // (review of #260).
   await page.evaluate((s) => window.__openMessageTestHooks.applyAppStatus(s), parked({
     state: 'blocked', block_reason: 'repeated_failure', error_class: 'credentials_expired', repair: { attempts: 5 },
   }));
   await expect(page.locator('#connection-banner-copy')).toContainText('keeps rejecting fresh sign-in cookies');
   await expect(page.locator('#connection-banner-action')).toHaveText('Reconnect');
   await expect(page.locator('#connection-banner-action')).toHaveAttribute('data-action', 'reconnect-google');
+  await openPlatforms(page);
+  await expect(page.locator('#gm-reconnect-btn')).toHaveText('Reconnect Google Messages');
+  await expect(page.locator('#gm-reconnect-btn')).toHaveAttribute('data-mode', 'reconnect');
+  await page.keyboard.press('Escape');
+
+  // A refresh that keeps failing (Chrome signed out) asks for attention while
+  // it keeps retrying, and points at Chrome, never at a re-pair.
+  await page.evaluate((s) => window.__openMessageTestHooks.applyAppStatus(s), {
+    ...parked({
+      state: 'repairing_credentials',
+      retry_at_ms: Date.now() + 4 * 60_000,
+      repair: { attempts: 3, consecutive_failures: 3, last_outcome: 'failed_retrying', last_error: 'missing required cookies: .google.com:SID' },
+    }),
+    google: {
+      connected: false, paired: true, needs_pairing: false, needs_repair: true, auth_expired: true, repair_failing: true,
+      supervisor: {
+        state: 'repairing_credentials',
+        retry_at_ms: Date.now() + 4 * 60_000,
+        repair: { attempts: 3, consecutive_failures: 3, last_outcome: 'failed_retrying', last_error: 'missing required cookies: .google.com:SID' },
+      },
+    },
+  });
+  await expect(page.locator('#connection-banner-copy')).toContainText('Make sure Chrome is signed in');
+  await expect(page.locator('#connection-banner-copy')).not.toContainText('re-pair');
+  await expect(page.locator('#connection-banner-action')).toHaveText('Retry now');
 
   // No refresh mechanism at all: a re-pair is the fix.
   await page.evaluate((s) => window.__openMessageTestHooks.applyAppStatus(s), parked({

@@ -91,6 +91,11 @@ type Snapshot struct {
 	// episode. It resets when a generation proves live again or a user
 	// retries.
 	RepairAttempts int
+	// RepairFailures counts consecutive failed repair attempts. It drives the
+	// retry backoff and lets status escalate a refresh that keeps failing
+	// (Chrome signed out, say) while the retries go on. It resets when a
+	// repair succeeds or the episode resets.
+	RepairFailures int
 	// The newest repair attempt. These survive the episode, so status can
 	// show how the last repair went.
 	LastRepairStartedAt  time.Time

@@ -209,8 +209,9 @@ type GoogleStatusSnapshot struct {
 	// NeedsRepair is set when automatic recovery has stopped and a person
 	// must act: sends keep failing while connected (the phone has likely
 	// unlinked the device), or the supervisor has parked the account
-	// (Supervisor.State "blocked"). An expired cookie that is still being
-	// refreshed is not this: see AuthExpired and Reconnecting.
+	// (Supervisor.State "blocked"), or the cookie refresh keeps failing
+	// (RepairFailing). An expired cookie that is still being refreshed is
+	// not this: see AuthExpired and Reconnecting.
 	NeedsRepair bool   `json:"needs_repair,omitempty"`
 	LastError   string `json:"last_error,omitempty"`
 	// AuthExpired is set when Google rejects the web session cookies. Unlike a
@@ -228,6 +229,12 @@ type GoogleStatusSnapshot struct {
 	// connection (connecting, backing off, or refreshing credentials) and
 	// nothing needs a person yet.
 	Reconnecting bool `json:"reconnecting,omitempty"`
+	// RepairFailing is set once the cookie refresh has failed
+	// GoogleRepairAttentionAfter times in a row. The supervisor keeps
+	// retrying, but a refresh that keeps failing (Chrome signed out of
+	// Google, keychain access denied) needs a person, so it also sets
+	// NeedsRepair. It is never a reason to re-pair.
+	RepairFailing bool `json:"repair_failing,omitempty"`
 	// Supervisor is the connection supervisor's own view, including the last
 	// credential repair. Absent outside the transport-owning daemon.
 	Supervisor *GoogleSupervisorStatus `json:"supervisor,omitempty"`
@@ -255,12 +262,21 @@ type GoogleSupervisorStatus struct {
 // GoogleRepairStatus describes credential repair: the attempts in the
 // current expiry episode and how the newest attempt went.
 type GoogleRepairStatus struct {
-	Attempts       int    `json:"attempts"`
-	LastStartedMS  int64  `json:"last_started_ms,omitempty"`
-	LastFinishedMS int64  `json:"last_finished_ms,omitempty"`
-	LastOutcome    string `json:"last_outcome,omitempty"`
-	LastError      string `json:"last_error,omitempty"`
+	Attempts int `json:"attempts"`
+	// ConsecutiveFailures counts failed attempts since the last success.
+	ConsecutiveFailures int    `json:"consecutive_failures"`
+	LastStartedMS       int64  `json:"last_started_ms,omitempty"`
+	LastFinishedMS      int64  `json:"last_finished_ms,omitempty"`
+	LastOutcome         string `json:"last_outcome,omitempty"`
+	LastError           string `json:"last_error,omitempty"`
 }
+
+// GoogleRepairAttentionAfter is how many consecutive failed cookie
+// refreshes make status ask for a person (repair_failing, needs_repair). With
+// the 90 s repair pace and backoff, the third failure lands 3 to 4.5 minutes
+// after the expiry, past the healthy heal time of under 2.5 minutes; a single
+// hiccup heals on its first retry without anyone seeing it.
+const GoogleRepairAttentionAfter = 3
 
 // googleSupervisorWorking lists the states in which the supervisor is still
 // trying on its own.
@@ -813,6 +829,9 @@ func (a *App) GoogleStatus() GoogleStatusSnapshot {
 	paired := a.GooglePaired()
 	supervisor := a.googleSupervisorSnapshot()
 	blocked := supervisor != nil && supervisor.State == "blocked"
+	repairFailing := paired && supervisor != nil && supervisor.State == "repairing_credentials" &&
+		supervisor.Repair.ConsecutiveFailures >= GoogleRepairAttentionAfter
+	needsRepair := paired && (a.googleNeedsRepair.Load() || blocked || repairFailing)
 	return GoogleStatusSnapshot{
 		Connected:    connected,
 		Paired:       paired,
@@ -823,16 +842,18 @@ func (a *App) GoogleStatus() GoogleStatusSnapshot {
 		// terminal failure, or a parked supervisor. An expired cookie that the
 		// supervisor is still refreshing is auth_expired + reconnecting, not
 		// this; telling the user to re-pair then risks pairing throttles for
-		// nothing.
-		NeedsRepair:     paired && (a.googleNeedsRepair.Load() || blocked),
+		// nothing. A refresh that keeps failing counts too (repair_failing):
+		// it needs a person, though not a re-pair.
+		NeedsRepair:     needsRepair,
 		LastError:       lastError,
 		AuthExpired:     a.googleAuthExpired.Load(),
 		PhoneResponding: a.GooglePhoneResponding(),
 		RepairsPaced:    a.GoogleRepairsPaced(),
-		Reconnecting: paired && !connected && !a.googleNeedsRepair.Load() &&
+		Reconnecting: paired && !connected && !needsRepair &&
 			supervisor != nil && googleSupervisorWorking[supervisor.State],
-		Supervisor: supervisor,
-		PullHealth: a.GooglePullHealth(),
+		RepairFailing: repairFailing,
+		Supervisor:    supervisor,
+		PullHealth:    a.GooglePullHealth(),
 	}
 }
 

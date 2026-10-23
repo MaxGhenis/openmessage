@@ -12972,6 +12972,7 @@ body::after {
       needs_repair: !!raw.needs_repair,
       auth_expired: !!raw.auth_expired,
       reconnecting: !!raw.reconnecting,
+      repair_failing: !!raw.repair_failing,
       phone_responding: raw.phone_responding === undefined ? true : !!raw.phone_responding,
       last_error: raw.last_error || '',
       supervisor: {
@@ -12981,6 +12982,7 @@ body::after {
         retry_at_ms: Number(supervisor.retry_at_ms || 0),
         repair: {
           attempts: Number(repair.attempts || 0),
+          consecutive_failures: Number(repair.consecutive_failures || 0),
           last_outcome: repair.last_outcome || '',
           last_error: repair.last_error || '',
         },
@@ -13034,6 +13036,18 @@ body::after {
   // the session itself is the problem.
   function googleStoppedCopy() {
     const { block_reason: reason, error_class: errorClass, repair } = googleStatus.supervisor;
+    if (googleStatus.repair_failing) {
+      // Still retrying, but the refresh keeps failing: the fix is usually in
+      // Chrome (signed out, keychain access), never a re-pair.
+      const detail = repair.last_error ? ` (${repair.last_error})` : '';
+      const when = googleRetryWhen();
+      return {
+        copy: `Google Messages can’t refresh its Google sign-in from Chrome${detail}. Make sure Chrome is signed in to your Google account; OpenMessage keeps retrying`
+          + (when ? ` (next try ${when}).` : '.'),
+        label: 'Retry now',
+        action: 'reconnect-google',
+      };
+    }
     if (reason === 'repeated_failure' && errorClass === 'credentials_expired') {
       return {
         copy: 'Google keeps rejecting fresh sign-in cookies from Chrome. Make sure Chrome is signed in to your Google account, then reconnect. If that doesn’t work, re-pair.',
@@ -13364,7 +13378,17 @@ body::after {
     } else if (googleStatus.last_error) {
       $gmStatusPill.classList.add('error');
     }
-    if (googleStatus.needs_repair) {
+    const stopped = googleStatus.needs_repair && !googleStatus.connected ? googleStoppedCopy() : null;
+    if (stopped && stopped.action === 'reconnect-google') {
+      // Parked or failing for a reason a reconnect can fix (Chrome's sign-in,
+      // repeatedly rejected cookies): the banner's action, not a re-pair.
+      $gmHelper.textContent = stopped.copy;
+      showGoogleError('');
+      $gmActionsRow.style.display = '';
+      $gmReconnectBtn.disabled = false;
+      $gmReconnectBtn.textContent = stopped.label === 'Retry now' ? 'Retry now' : 'Reconnect Google Messages';
+      $gmReconnectBtn.dataset.mode = 'reconnect';
+    } else if (googleStatus.needs_repair) {
       $gmHelper.textContent = nativeAppBridge()
         ? 'Google Messages needs to be paired again. Open the native pairing flow to refresh your Android phone connection.'
         : 'Google Messages needs to be paired again. Use the button below to copy the pair command, then run it in Terminal.';
@@ -13932,7 +13956,9 @@ body::after {
     try {
       const status = await postJSON('/api/google/reconnect', {});
       applyAppStatus(status || {});
-      showThreadFeedback('Google Messages reconnected.');
+      // The request only starts a reconnect or a cookie-refresh retry; say
+      // "reconnected" only once the status shows it.
+      showThreadFeedback(googleStatus.connected ? 'Google Messages reconnected.' : 'Reconnecting Google Messages…');
     } catch (err) {
       showGoogleError(err.message || 'Failed to reconnect Google Messages', 'reconnect');
     } finally {
