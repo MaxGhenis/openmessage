@@ -8,6 +8,7 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -306,15 +307,23 @@ func TestGoogleRefreshThatKeepsFailingAsksForAttentionAndStillHeals(t *testing.T
 	})
 
 	// Past the attention threshold and twice the same-fingerprint circuit:
-	// still retrying, never parked, and now asking for a person.
-	deadline := time.Now().Add(2 * time.Second)
-	for supervisor.Snapshot().RepairFailures < 2*policy.MaxSameFingerprint {
+	// still retrying, never parked, and now asking for a person. Assert on one
+	// status read between attempts (a failed one, waiting to retry): with
+	// 1 ms retries the next attempt can start, and clear the last error, at
+	// any moment (review of #260, round 3).
+	var status app.GoogleStatusSnapshot
+	for deadline := time.Now().Add(2 * time.Second); ; {
+		status = a.GoogleStatus()
+		if status.Supervisor != nil &&
+			status.Supervisor.Repair.ConsecutiveFailures >= 2*policy.MaxSameFingerprint &&
+			status.Supervisor.Repair.LastOutcome == string(bridge.RepairOutcomeRetrying) {
+			break
+		}
 		if time.Now().After(deadline) {
 			t.Fatalf("refresh did not keep retrying: %+v", supervisor.Snapshot())
 		}
-		time.Sleep(time.Millisecond)
+		runtime.Gosched()
 	}
-	status := a.GoogleStatus()
 	if !status.NeedsRepair || !status.RepairFailing || status.Reconnecting {
 		t.Fatalf("status after %d failed refreshes = %+v, want repair_failing + needs_repair", calls.Load(), status)
 	}
