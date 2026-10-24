@@ -112,11 +112,13 @@ func decodeGoogleDownloadOpaque(opaque []byte) (googleDownloadRef, error) {
 		)
 	}
 	if strings.TrimSpace(payload.MediaID) == "" {
-		// Google sends an attachment's message before the phone has uploaded
-		// the bytes, with no media ID at all, and names the media in an update
-		// of the same message about a second later (every image on the live
-		// install, 2026-10-24). The projection writes that update's reference
-		// over this pending row, so this is "ask again", not a bad reference.
+		// Google often sends an attachment's message before the phone has
+		// uploaded the bytes, with no media ID at all, and names the media in
+		// an update of the same message about a second later (363 times in the
+		// live install's stored frames by 2026-10-24). The projection writes
+		// that update's reference over this pending row and keeps it against
+		// later updates that name nothing, so this is "ask again", not a bad
+		// reference.
 		return googleDownloadRef{}, fmt.Errorf(
 			"%w: Google has sent no media ID for this attachment yet",
 			bridge.ErrMediaNotReady,
