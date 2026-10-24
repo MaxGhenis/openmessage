@@ -134,7 +134,13 @@ func TestResolveNotReadyPastTheGraceIsGoneAndRecordsNothing(t *testing.T) {
 	service := newMediaTestService(t, env, availableDownloadRegistry(downloader))
 	command := DownloadCommand{AccountID: "account-1", MessageID: "message-unnamed", Ordinal: 0}
 
-	env.clock.advance(NotReadyGrace - time.Second)
+	// Nameless updates keep coming (they move updated_at_ms); the grace still
+	// runs from when the attachment arrived.
+	env.clock.advance(NotReadyGrace - time.Minute)
+	reprojectMediaMessage(t, env, "message-unnamed", "still-unnamed", []sqlite.MessageAttachment{{
+		Ordinal: 0, Filename: "IMG_2001.jpeg", MIME: "image/jpeg",
+	}})
+	env.clock.advance(time.Minute - time.Second)
 	if _, err := service.Resolve(context.Background(), command); !errors.Is(err, ErrNotReady) {
 		t.Fatalf("Resolve(just inside the grace) error = %v, want ErrNotReady", err)
 	}

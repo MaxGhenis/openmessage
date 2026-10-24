@@ -6969,6 +6969,7 @@ body::after {
   function handleMediaLoad(el) {
     el.dataset.mediaLoaded = 'true';
     delete el.dataset.mediaRetries;
+    delete el.dataset.mediaHeadOk;
     if (el.tagName === 'IMG') el.style.display = '';
     const loader = mediaLoaderFor(el);
     clearMediaLoaderTimer(loader);
@@ -7007,19 +7008,26 @@ body::after {
     setMediaLoaderLabel(loader, kind === 'video' ? 'Video unavailable' : 'Image unavailable');
   }
 
-  // mediaRetryDelayMs asks the server about a failed load: a delay to reload
-  // after, or -1 when waiting cannot help. A server that has the bytes
-  // (HEAD 200) gets one more load, in case the failure was the connection's;
-  // a second failure is the bytes' own (a file the browser cannot decode).
-  async function mediaRetryDelayMs(src, attempt) {
+  // mediaRetryDelayMs asks the server about a failed load of el: a delay to
+  // reload after, or -1 when waiting cannot help. A server that has the bytes
+  // (HEAD 200) gets one more load, in case the failure was the connection's
+  // or the bytes arrived just after it; a failure right after that load is
+  // the bytes' own (a file the browser cannot decode).
+  async function mediaRetryDelayMs(el, src, attempt) {
     const backoff = MEDIA_RETRY_DELAYS_MS[Math.min(attempt, MEDIA_RETRY_DELAYS_MS.length - 1)];
     let response;
     try {
       response = await fetch(src, { method: 'HEAD', cache: 'no-store' });
     } catch (_) {
+      delete el.dataset.mediaHeadOk;
       return backoff;
     }
-    if (response.ok) return attempt === 0 ? backoff : -1;
+    if (response.ok) {
+      if (el.dataset.mediaHeadOk === 'true') return -1;
+      el.dataset.mediaHeadOk = 'true';
+      return backoff;
+    }
+    delete el.dataset.mediaHeadOk;
     if (!MEDIA_RETRYABLE_STATUSES.has(response.status)) return -1;
     const retryAfterSeconds = Number(response.headers.get('Retry-After'));
     if (Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0) {
@@ -7053,7 +7061,7 @@ body::after {
       loader.classList.add('show-label');
       setMediaLoaderLabel(loader, kind === 'video' ? 'Waiting for video...' : 'Waiting for image...');
     }
-    const delay = await mediaRetryDelayMs(src, attempt);
+    const delay = await mediaRetryDelayMs(el, src, attempt);
     if (delay < 0) {
       mediaRetriesInFlight.delete(el);
       showMediaUnavailable(el, kind);

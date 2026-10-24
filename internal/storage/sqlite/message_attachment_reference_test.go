@@ -46,6 +46,20 @@ func TestRecordInboundAttachmentKeepsTheReferenceWhenAnUpdateNamesNone(t *testin
 		}
 	}
 
+	// While nothing is named yet, each update's description replaces the
+	// last: nothing that came with a reference is there to keep.
+	seedMessageAttachmentParent(t, store, "message-unnamed")
+	for _, mime := range []string{"image/jpeg", "image/heic"} {
+		recordMessageAttachment(t, store, repository, MessageAttachment{
+			MessageID: "message-unnamed", Ordinal: 0, MIME: mime,
+		})
+	}
+	if unnamed, err := repository.GetForDownload(context.Background(), "message-unnamed", 0); err != nil {
+		t.Fatalf("GetForDownload(unnamed): %v", err)
+	} else if unnamed.MIME != "image/heic" {
+		t.Fatalf("unnamed attachment MIME = %q, want the second update's image/heic", unnamed.MIME)
+	}
+
 	// A later update that names the media again still replaces it.
 	renamed := named
 	renamed.RemoteID = "full-1"
