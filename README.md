@@ -59,6 +59,22 @@ MCP transports require an explicit opt-in:
 - `./openmessage serve --web --mcp-sse` starts the web UI and both HTTP MCP endpoints.
 - `./openmessage serve --mcp-stdio` starts MCP over stdio for pipe-based clients.
 
+#### The control token
+
+The server answers `/api/*` and `/mcp*` only to requests that carry its control token, and refuses everything else with `401`. That stops another program, or a web page you visit, from reading or sending your messages through it. The token is a random value the server writes to `control.token` in its data directory (readable only by you) on first start.
+
+- **Web UI:** `serve` prints a single-use link (`…/auth/bootstrap?t=…`) when it starts. Open it once and the browser keeps a cookie. A browser without the cookie shows a form where you can paste the contents of `control.token` instead.
+- **macOS app:** handles the token itself.
+- **CLI and stdio MCP:** find the token in `OPENMESSAGES_DATA_DIR`, the macOS app's data directory or `~/.local/share/openmessage`, whichever the running server accepts.
+- **Scripts and HTTP MCP clients:** send `Authorization: Bearer <token>`. Keep the token off command lines, where other users' `ps` can see it; for example:
+
+  ```bash
+  printf 'Authorization: Bearer %s\n' "$(cat ~/.local/share/openmessage/control.token)" \
+    | curl -s -H @- http://127.0.0.1:7007/api/status
+  ```
+
+`GET /healthz` answers without the token, for liveness checks.
+
 ### 3a. Optional: link WhatsApp or Signal
 
 After `serve` is running, open the local UI and link WhatsApp or Signal from the Connections surface. OpenMessage keeps those bridges local and syncs them into the same inbox as Google Messages.
@@ -99,7 +115,7 @@ Add to `~/.mcp.json`:
 
 Restart Claude Code. The MCP tools appear automatically.
 
-To let a client connect over HTTP, start OpenMessage with `--mcp-sse` (or `--web --mcp-sse` to keep the web UI), then point it at:
+To let a client connect over HTTP, start OpenMessage with `--mcp-sse` (or `--web --mcp-sse` to keep the web UI), then point it at the endpoint below with the header `Authorization: Bearer <contents of control.token>` (see [the control token](#the-control-token)):
 
 - Streamable HTTP: `http://127.0.0.1:7007/mcp`
 - SSE: `http://127.0.0.1:7007/mcp/sse`
@@ -213,7 +229,7 @@ The macOS app target lives under `OpenMessage/`.
 | `OPENMESSAGES_ALLOW_ANY_EXPORT_PATH` | unset (off) | Set to `1`/`true`/`yes`/`on` to allow viz/story tools to read photos from, or write HTML to, arbitrary local paths. |
 | `OPENMESSAGE_TELEMETRY` | unset (off) | Set to `1` to send one anonymous heartbeat per launch (max one per 24h). Reports only: random install ID, version, OS/arch, and which platforms are paired (Google Messages / WhatsApp / Signal). No message content, no contact info, no IP-based identity. See `internal/telemetry/`. |
 
-`OPENMESSAGES_HOST` defaults to localhost for safety. If you bind the server to another interface for LAN testing, keep it on a trusted network; local-control APIs and MCP endpoints are meant for same-origin/local clients.
+`OPENMESSAGES_HOST` defaults to localhost for safety. Every API and MCP request needs the control token on any interface, and the web UI only works when reached through a loopback address, so to use it from another machine forward a port over SSH rather than binding to the network. The Docker Compose file publishes the port on the host's loopback only for the same reason.
 
 ### GIF picker setup
 
@@ -230,7 +246,8 @@ The web compose GIF picker uses Klipy search. To enable it:
 3. Optional: verify the local endpoint can reach Klipy:
 
    ```bash
-   curl "http://127.0.0.1:7007/api/gifs/trending?limit=1"
+   printf 'Authorization: Bearer %s\n' "$(cat ~/.local/share/openmessage/control.token)" \
+     | curl -s -H @- "http://127.0.0.1:7007/api/gifs/trending?limit=1"
    ```
 
 4. Open the web UI and use the `GIF` button in a media-capable conversation. GIF sends use the same media path as other attachments, so they are only enabled for routes that currently support media.

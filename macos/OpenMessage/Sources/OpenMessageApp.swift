@@ -13,7 +13,7 @@ struct OpenMessageApp: App {
     init() {
         let backend = BackendManager()
         self._backend = StateObject(wrappedValue: backend)
-        self._notifications = StateObject(wrappedValue: NotificationManager(baseURL: backend.baseURL))
+        self._notifications = StateObject(wrappedValue: NotificationManager(baseURL: backend.baseURL, dataDirectory: backend.dataDir))
         self._contacts = StateObject(wrappedValue: ContactsManager())
     }
 
@@ -98,9 +98,11 @@ private final class SettingsViewModel: ObservableObject {
     @Published var isRefreshing = false
 
     private let baseURL: URL
+    private let dataDirectory: String
 
-    init(baseURL: URL) {
+    init(baseURL: URL, dataDirectory: String) {
         self.baseURL = baseURL
+        self.dataDirectory = dataDirectory
     }
 
     func refresh(notifications: NotificationManager) async {
@@ -109,7 +111,7 @@ private final class SettingsViewModel: ObservableObject {
         notificationState = await notifications.bridgeState()
 
         do {
-            let (data, response) = try await URLSession.shared.data(from: endpoint("api/status"))
+            let (data, response) = try await URLSession.shared.data(for: request(endpoint("api/status")))
             guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
                 throw URLError(.badServerResponse)
             }
@@ -121,9 +123,7 @@ private final class SettingsViewModel: ObservableObject {
 
     func reconnectGoogleMessages() async {
         do {
-            var request = URLRequest(url: endpoint("api/google/reconnect"))
-            request.httpMethod = "POST"
-            let (_, response) = try await URLSession.shared.data(for: request)
+            let (_, response) = try await URLSession.shared.data(for: request(endpoint("api/google/reconnect"), method: "POST"))
             guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
                 throw URLError(.badServerResponse)
             }
@@ -135,9 +135,7 @@ private final class SettingsViewModel: ObservableObject {
 
     func startGoogleHistorySync() async {
         do {
-            var request = URLRequest(url: endpoint("api/backfill"))
-            request.httpMethod = "POST"
-            let (_, response) = try await URLSession.shared.data(for: request)
+            let (_, response) = try await URLSession.shared.data(for: request(endpoint("api/backfill"), method: "POST"))
             guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
                 throw URLError(.badServerResponse)
             }
@@ -194,7 +192,7 @@ private final class SettingsViewModel: ObservableObject {
     }
 
     private func diagnosticsText() async throws -> String {
-        let (data, response) = try await URLSession.shared.data(from: endpoint("api/diagnostics"))
+        let (data, response) = try await URLSession.shared.data(for: request(endpoint("api/diagnostics")))
         guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
             throw URLError(.badServerResponse)
         }
@@ -205,6 +203,10 @@ private final class SettingsViewModel: ObservableObject {
 
     private func endpoint(_ path: String) -> URL {
         baseURL.appendingPathComponent(path)
+    }
+
+    private func request(_ url: URL, method: String = "GET") -> URLRequest {
+        LocalControlAuth.request(url, method: method, dataDirectory: dataDirectory)
     }
 
     private func urlEscape(_ value: String) -> String {
@@ -221,7 +223,7 @@ private struct AppSettingsView: View {
     init(backend: BackendManager, notifications: NotificationManager) {
         self.backend = backend
         self.notifications = notifications
-        self._model = StateObject(wrappedValue: SettingsViewModel(baseURL: backend.baseURL))
+        self._model = StateObject(wrappedValue: SettingsViewModel(baseURL: backend.baseURL, dataDirectory: backend.dataDir))
     }
 
     var body: some View {

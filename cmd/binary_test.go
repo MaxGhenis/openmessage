@@ -5,11 +5,14 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/http/cookiejar"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -129,7 +132,7 @@ func TestBuiltBinaryDemoServesSeededDataWithoutTouchingConfiguredDataDir(t *test
 		"OPENMESSAGES_PORT="+port,
 	)
 
-	out := &strings.Builder{}
+	out := &lockedBuffer{}
 	cmd.Stdout = out
 	cmd.Stderr = out
 
@@ -139,11 +142,36 @@ func TestBuiltBinaryDemoServesSeededDataWithoutTouchingConfiguredDataDir(t *test
 	defer stopProcess(t, cmd)
 
 	baseURL := "http://127.0.0.1:" + port
-	if err := waitForHTTP(baseURL+"/api/status", 5*time.Second); err != nil {
+	if err := waitForHTTP(baseURL+"/healthz", 5*time.Second); err != nil {
 		t.Fatalf("demo server did not become ready: %v\n%s", err, out.String())
 	}
 
-	resp, err := http.Get(baseURL + "/api/status")
+	// The API refuses a client without the control token...
+	unauthenticated, err := http.Get(baseURL + "/api/status")
+	if err != nil {
+		t.Fatalf("GET /api/status: %v", err)
+	}
+	unauthenticated.Body.Close()
+	if unauthenticated.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated GET /api/status = %d, want 401", unauthenticated.StatusCode)
+	}
+	// ...and the single-use link the server prints authorizes a browser.
+	bootstrapURL := waitForBootstrapURL(t, out, 5*time.Second)
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &http.Client{Jar: jar, Timeout: 5 * time.Second}
+	bootstrap, err := client.Get(bootstrapURL)
+	if err != nil {
+		t.Fatalf("GET bootstrap link: %v", err)
+	}
+	bootstrap.Body.Close()
+	if bootstrap.StatusCode != http.StatusOK || bootstrap.Request.URL.Path != "/" {
+		t.Fatalf("bootstrap link = %d at %s, want the UI", bootstrap.StatusCode, bootstrap.Request.URL)
+	}
+
+	resp, err := client.Get(baseURL + "/api/status")
 	if err != nil {
 		t.Fatalf("GET /api/status: %v", err)
 	}
@@ -160,7 +188,7 @@ func TestBuiltBinaryDemoServesSeededDataWithoutTouchingConfiguredDataDir(t *test
 		t.Fatalf("status.connected = %v, want true", status["connected"])
 	}
 
-	resp, err = http.Get(baseURL + "/api/conversations?limit=50")
+	resp, err = client.Get(baseURL + "/api/conversations?limit=50")
 	if err != nil {
 		t.Fatalf("GET /api/conversations: %v", err)
 	}
@@ -337,6 +365,39 @@ func reserveTCPPort(t *testing.T) string {
 		t.Fatalf("unexpected addr type %T", ln.Addr())
 	}
 	return strconv.Itoa(addr.Port)
+}
+
+// lockedBuffer collects a child process's output while the test reads it.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf strings.Builder
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+var bootstrapURLPattern = regexp.MustCompile(`http://127\.0\.0\.1:\d+/auth/bootstrap\?t=[0-9a-f]{64}`)
+
+func waitForBootstrapURL(t *testing.T, out *lockedBuffer, timeout time.Duration) string {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if url := bootstrapURLPattern.FindString(out.String()); url != "" {
+			return url
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("server printed no bootstrap link:\n%s", out.String())
+	return ""
 }
 
 func waitForHTTP(url string, timeout time.Duration) error {

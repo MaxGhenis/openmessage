@@ -2730,6 +2730,16 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		writeJSON(w, map[string]string{"status": "ok"})
 	})
 
+	// /healthz is liveness only: it answers without the control token and
+	// says nothing beyond "a daemon is listening", which a 401 already says.
+	// Supervisors (the Docker healthcheck) probe it; anything that needs
+	// state reads /api/status with the token.
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-store")
+		_, _ = io.WriteString(w, "ok\n")
+	})
+
 	mux.HandleFunc("/api/status", func(w http.ResponseWriter, r *http.Request) {
 		payload := statusPayload(currentConnected())
 		if opts.Auth != nil {
@@ -3082,16 +3092,19 @@ func isProtectedLocalPath(path string) bool {
 	return strings.HasPrefix(path, "/api/") || path == "/mcp" || strings.HasPrefix(path, "/mcp/")
 }
 
-// setSecurityHeaders adds defense-in-depth headers. The UI relies on
-// disciplined manual escaping against XSS; the CSP doesn't stop inline-
-// handler injection (the app uses inline scripts/handlers throughout) but
-// it does contain a missed sink's blast radius: scripts, fetches, images,
-// and media can't reach non-loopback origins, so message history can't be
-// exfiltrated to an attacker host. Fonts are the one external dependency.
+// setSecurityHeaders adds defense-in-depth headers. script-src allows only
+// same-origin files and the UI's one inline script, by hash (see csp.go): the
+// UI attaches every event handler from script, so injected markup cannot run
+// code even if an escaping bug lets it in. The rest of the policy contains a
+// missed sink's blast radius: fetches, images and media can't reach
+// non-loopback origins, so message history can't be exfiltrated to an
+// attacker host. Fonts are the one external dependency. style-src keeps
+// 'unsafe-inline' for the UI's style attributes; styles cannot run script.
 func setSecurityHeaders(w http.ResponseWriter) {
 	w.Header().Set("Content-Security-Policy",
 		"default-src 'self'; "+
-			"script-src 'self' 'unsafe-inline'; "+
+			scriptSrcDirective+"; "+
+			"script-src-attr 'none'; "+
 			"worker-src 'self'; "+
 			"manifest-src 'self'; "+
 			"style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "+
@@ -3102,6 +3115,7 @@ func setSecurityHeaders(w http.ResponseWriter) {
 			"frame-src 'self' blob:; "+
 			"object-src 'none'; "+
 			"base-uri 'self'; "+
+			"form-action 'self'; "+
 			"frame-ancestors 'none'")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Referrer-Policy", "no-referrer")

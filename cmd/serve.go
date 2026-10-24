@@ -785,6 +785,9 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 			httpHandler = web.ProtectLocalControl(controlAuth.Handler(mcpHTTPHandler))
 		}
 
+		if !isLoopbackListenHost(host) {
+			logger.Warn().Str("addr", listenAddr).Msg("Listening beyond loopback: every API and MCP request needs the control token, and the web UI needs a loopback Host, so reach it through a loopback port forward")
+		}
 		ln, err := net.Listen("tcp", listenAddr)
 		if err != nil {
 			return fmt.Errorf("listen on %s: %w", listenAddr, err)
@@ -972,6 +975,17 @@ func initializeWhatsAppForServe(
 		return nil, false
 	}
 	return whatsappBridge, true
+}
+
+// isLoopbackListenHost reports whether OPENMESSAGES_HOST binds only this
+// machine's loopback interface.
+func isLoopbackListenHost(host string) bool {
+	host = strings.Trim(strings.TrimSpace(host), "[]")
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func newMCPHTTPHandler(mcpSrv *mcpserver.MCPServer, baseURL string) http.Handler {

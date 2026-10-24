@@ -111,7 +111,7 @@ struct WebViewContainer: NSViewRepresentable {
         context.coordinator.webView = webView
         WebViewBridge.shared.webView = webView
         webView.navigationDelegate = context.coordinator
-        webView.load(URLRequest(url: url))
+        context.coordinator.loadUI(url, in: webView)
         return webView
     }
 
@@ -119,9 +119,10 @@ struct WebViewContainer: NSViewRepresentable {
         context.coordinator.backend = backend
         context.coordinator.notifications = notifications
         context.coordinator.contacts = contacts
-        // Only reload if URL changed
-        if webView.url != url {
-            webView.load(URLRequest(url: url))
+        // Reload only when the backend's address changes. Compare with what
+        // was asked for, not webView.url: the bootstrap link redirects.
+        if context.coordinator.loadedBaseURL != url {
+            context.coordinator.loadUI(url, in: webView)
         }
     }
 
@@ -185,6 +186,7 @@ struct WebViewContainer: NSViewRepresentable {
         var notifications: NotificationManager
         var contacts: ContactsManager
         weak var webView: WKWebView?
+        var loadedBaseURL: URL?
 
         init(backend: BackendManager, notifications: NotificationManager, contacts: ContactsManager) {
             self.backend = backend
@@ -224,6 +226,21 @@ struct WebViewContainer: NSViewRepresentable {
                         reject(requestID: requestID, message: "Unknown notification bridge request")
                     }
                 }
+            }
+        }
+
+        /// Loads the UI through a single-use bootstrap link minted with the
+        /// control token, so the backend sets the cookie that the page's own
+        /// /api/ requests need (see LocalControlAuth). If minting fails the
+        /// UI loads anyway and explains how to authorize.
+        @MainActor
+        func loadUI(_ baseURL: URL, in webView: WKWebView) {
+            loadedBaseURL = baseURL
+            let dataDirectory = backend.dataDir
+            Task { @MainActor [weak self, weak webView] in
+                let url = await LocalControlAuth.authorizedUIURL(baseURL: baseURL, dataDirectory: dataDirectory)
+                guard let self, let webView, self.loadedBaseURL == baseURL else { return }
+                webView.load(URLRequest(url: url))
             }
         }
 

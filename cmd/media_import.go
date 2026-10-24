@@ -32,6 +32,9 @@ func RunMedia(args []string) error {
 	client := localapi.NewClient("", localapi.LoadControlToken(app.DefaultDataDir()))
 	ctx, cancel := context.WithTimeout(context.Background(), mediaImportTimeout)
 	defer cancel()
+	// The upload can't be replayed, so settle on a token the daemon accepts
+	// first; a status failure surfaces through the import itself.
+	_, _, _ = client.Status(ctx)
 	return runMediaImport(ctx, os.Stdout, client, args[1:])
 }
 

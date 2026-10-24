@@ -58,6 +58,7 @@ final class NotificationManager: NSObject, ObservableObject, UNUserNotificationC
     private let logger = Logger(subsystem: "com.openmessage.app", category: "Notifications")
     private let defaults = UserDefaults.standard
     private let baseURL: URL
+    private let dataDirectory: String
     private var streamTask: Task<Void, Never>?
     private var healthTask: Task<Void, Never>?
     private var bootstrapTask: Task<Void, Never>?
@@ -82,8 +83,9 @@ final class NotificationManager: NSObject, ObservableObject, UNUserNotificationC
     private let seenMessageCap = 500
     private let preferenceKey = "desktopNotificationsEnabled"
 
-    init(baseURL: URL) {
+    init(baseURL: URL, dataDirectory: String) {
         self.baseURL = baseURL
+        self.dataDirectory = dataDirectory
         if defaults.object(forKey: preferenceKey) == nil {
             defaults.set(true, forKey: preferenceKey)
         }
@@ -295,7 +297,7 @@ final class NotificationManager: NSObject, ObservableObject, UNUserNotificationC
     }
 
     private func streamEvents() async throws {
-        let request = URLRequest(url: apiURL(pathComponents: ["api", "events"]))
+        let request = LocalControlAuth.request(apiURL(pathComponents: ["api", "events"]), dataDirectory: dataDirectory)
         let (bytes, response) = try await URLSession.shared.bytes(for: request)
         guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
             throw URLError(.badServerResponse)
@@ -354,7 +356,7 @@ final class NotificationManager: NSObject, ObservableObject, UNUserNotificationC
         let status: PlatformStatus
         let attention: [PlatformAttention]
         do {
-            let (data, _) = try await URLSession.shared.data(from: apiURL(pathComponents: ["api", "status"]))
+            let (data, _) = try await URLSession.shared.data(for: LocalControlAuth.request(apiURL(pathComponents: ["api", "status"]), dataDirectory: dataDirectory))
             status = try JSONDecoder().decode(PlatformStatus.self, from: data)
             attention = PlatformAttention.evaluate(statusData: data) ?? []
         } catch {
@@ -448,7 +450,7 @@ final class NotificationManager: NSObject, ObservableObject, UNUserNotificationC
             pathComponents: ["api", "conversations"],
             queryItems: [URLQueryItem(name: "limit", value: String(recentConversationLimit))]
         )
-        let (data, _) = try await URLSession.shared.data(from: url)
+        let (data, _) = try await URLSession.shared.data(for: LocalControlAuth.request(url, dataDirectory: dataDirectory))
         return try JSONDecoder().decode([ConversationSummary].self, from: data)
     }
 
@@ -461,7 +463,7 @@ final class NotificationManager: NSObject, ObservableObject, UNUserNotificationC
                     URLQueryItem(name: "limit", value: String(recentMessageLimit)),
                 ]
             )
-            let (data, _) = try await URLSession.shared.data(from: url)
+            let (data, _) = try await URLSession.shared.data(for: LocalControlAuth.request(url, dataDirectory: dataDirectory))
             let messages = try JSONDecoder().decode([MessageSummary].self, from: data)
 
             let incoming = messages

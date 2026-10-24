@@ -34,7 +34,10 @@ before touching anything. The traps that cost the most:
   stale** store. Point CLI tools at the app dir for live data.
 - **Read live messages via the HTTP API** (`/api/conversations/<id>/messages`,
   `/api/search`, `/api/status`) — the app holds the WAL'd DB, so a direct
-  `sqlite3` reader hits "unable to open database file (14)".
+  `sqlite3` reader hits "unable to open database file (14)". Every `/api/`
+  request needs the control token (`control.token` in the app's data dir) or
+  gets `401`; send it from stdin with the runbook's `om_curl` helper, never on
+  a command line.
 - **Re-pairing Google Messages:** QR is dead; use Google Account pairing:
   with the user at the phone, quit the app and run
   `OPENMESSAGES_DATA_DIR=... openmessage pair --google-chrome` (reads the
