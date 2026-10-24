@@ -1497,7 +1497,9 @@ const onePixelPNG = Buffer.from(
 
 // lateImageThread adds one incoming image message to every newest-page thread
 // read, with whatever media_version the test sets, so a test controls both
-// what the UI renders from and what /api/media answers for it.
+// what the UI renders from and what /api/media answers for it. A text message
+// beside it carries state.neighbourBody, which a test changes to make the
+// thread render again without touching the image's own node.
 async function lateImageThread(page, state) {
   const timestampMS = Date.now();
   await page.route(/\/api\/conversations\/[^/]+\/messages/, async route => {
@@ -1523,6 +1525,17 @@ async function lateImageThread(page, state) {
       source_platform: 'sms',
       ...(state.version ? { media_version: state.version } : {}),
     });
+    messages.unshift({
+      MessageID: 'e2e-late-image-neighbour',
+      ConversationID: conversationID,
+      SenderName: 'Sarah Chen',
+      SenderNumber: '',
+      Body: state.neighbourBody || 'Sent you a photo',
+      TimestampMS: timestampMS + 1,
+      Status: '',
+      IsFromMe: false,
+      source_platform: 'sms',
+    });
     await route.fulfill({ response, json: messages });
   });
   const requests = [];
@@ -1531,7 +1544,7 @@ async function lateImageThread(page, state) {
     requests.push({ method: request.method(), url: request.url() });
     const answer = state.answer(request);
     if (answer.status === 200) {
-      await route.fulfill({ status: 200, contentType: 'image/png', body: onePixelPNG });
+      await route.fulfill({ status: 200, contentType: 'image/png', body: answer.body || onePixelPNG });
       return;
     }
     await route.fulfill({
@@ -1573,16 +1586,36 @@ test('retries an image whose first loads answer 503 until it loads', async ({ pa
 // An answer that waiting cannot change is final at once: no retries, nothing
 // asked again on later renders, and no broken-image box.
 test('shows an image that answers 404 as unavailable without retrying', async ({ page }) => {
-  const thread = await lateImageThread(page, {
+  const state = {
     version: '0123456789ab',
     answer: () => ({ status: 404, error: 'not found' }),
-  });
+  };
+  const thread = await lateImageThread(page, state);
 
   await expect(thread.message.locator('.msg-media-loading.is-error')).toContainText('Image unavailable');
   await expect(thread.message.locator('img')).toBeHidden();
-  // The stream's fallback poll re-renders the thread every few seconds.
-  await page.waitForTimeout(7_000);
+  // Change the message beside it: the thread renders again, which hydrates
+  // every media node, the failed image's included.
+  state.neighbourBody = 'Did the photo come through?';
+  await expect(page.locator('#messages-area')).toContainText('Did the photo come through?', { timeout: 20_000 });
+  await page.waitForTimeout(3_000);
   expect(thread.requests.map(request => request.method)).toEqual(['GET', 'HEAD']);
+  await expect(thread.message.locator('.msg-media-loading.is-error')).toContainText('Image unavailable');
+});
+
+// Bytes the server has (HEAD 200) but the browser cannot decode get one more
+// load, in case the first failure was the connection's, and then show as
+// unavailable rather than being fetched again and again.
+test('gives an image the server has but the browser cannot decode one more load', async ({ page }) => {
+  const thread = await lateImageThread(page, {
+    version: '0123456789ab',
+    answer: () => ({ status: 200, body: Buffer.from('not an image') }),
+  });
+
+  await expect(thread.message.locator('.msg-media-loading.is-error')).toContainText('Image unavailable', { timeout: 20_000 });
+  await page.waitForTimeout(3_000);
+  expect(thread.requests.map(request => request.method)).toEqual(['GET', 'HEAD', 'GET', 'HEAD']);
+  expect(new URL(thread.requests[2].url).searchParams.get('retry')).toBe('1');
 });
 
 // A failed image loads once its media_version changes: the server names new

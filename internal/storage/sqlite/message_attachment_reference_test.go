@@ -20,13 +20,17 @@ func TestRecordInboundAttachmentKeepsTheReferenceWhenAnUpdateNamesNone(t *testin
 		RemoteID: "thumb-1", RemoteRef: []byte(`{"v":1,"media_id":"thumb-1","decryption_key":"0a"}`),
 		Filename: "IMG.jpeg", MIME: "image/jpeg",
 	}
+	namedSize := int64(68691)
+	named.SizeBytes = &namedSize
 	recordMessageAttachment(t, store, repository, named)
-
 	for _, emptyID := range []string{"", "  \t"} {
+		// The nameless update describes the attachment differently too; the
+		// description that came with the reference stays with it.
+		otherSize := int64(0)
 		recordMessageAttachment(t, store, repository, MessageAttachment{
 			MessageID: "message-named", Ordinal: 0,
 			RemoteID: emptyID, RemoteRef: []byte(`{"v":1,"media_id":"","decryption_key":""}`),
-			Filename: "IMG.jpeg", MIME: "image/jpeg",
+			Filename: "", MIME: "application/octet-stream", SizeBytes: &otherSize,
 		})
 		got, err := repository.GetForDownload(context.Background(), "message-named", 0)
 		if err != nil {
@@ -35,6 +39,10 @@ func TestRecordInboundAttachmentKeepsTheReferenceWhenAnUpdateNamesNone(t *testin
 		if got.RemoteID != named.RemoteID || !bytes.Equal(got.RemoteRef, named.RemoteRef) {
 			t.Fatalf("after an update naming %q: reference = %q %s, want %q %s kept",
 				emptyID, got.RemoteID, got.RemoteRef, named.RemoteID, named.RemoteRef)
+		}
+		if got.Filename != "IMG.jpeg" || got.MIME != "image/jpeg" || got.SizeBytes == nil || *got.SizeBytes != namedSize {
+			t.Fatalf("after an update naming %q: description = %q %q %v, want IMG.jpeg image/jpeg %d kept",
+				emptyID, got.Filename, got.MIME, got.SizeBytes, namedSize)
 		}
 	}
 
@@ -54,8 +62,9 @@ func TestRecordInboundAttachmentKeepsTheReferenceWhenAnUpdateNamesNone(t *testin
 
 // For any sequence of updates to a pending attachment, each naming one of a
 // few media or nothing, the row ends up with the reference of the last update
-// that named something, exactly as that update sent it, and with no
-// reference only if none did.
+// that named something, exactly as that update sent it, and that update's
+// MIME type; with no reference only if none did, and then the last update's
+// MIME type.
 func TestRecordInboundAttachmentReferenceIsTheLastNamedUpdate(t *testing.T) {
 	clock := newMessageTestClock(messageAttachmentTestTimeMS)
 	store, repository := openMessageAttachmentTestRepository(t, clock.Now)
@@ -68,15 +77,19 @@ func TestRecordInboundAttachmentReferenceIsTheLastNamedUpdate(t *testing.T) {
 		cases++
 		messageID := fmt.Sprintf("message-%d", cases)
 		seedMessageAttachmentParent(t, store, messageID)
-		wantID, wantRef := "", []byte{}
+		wantID, wantRef, wantMIME := "", []byte{}, ""
 		for update, choice := range choices {
 			id := ids[int(choice)%len(ids)]
 			ref := refFor(id, update)
+			mime := fmt.Sprintf("image/x-update-%d", update)
 			if update == 0 || id != "" {
 				wantID, wantRef = id, ref
 			}
+			if wantID == "" || id != "" {
+				wantMIME = mime
+			}
 			recordMessageAttachment(t, store, repository, MessageAttachment{
-				MessageID: messageID, Ordinal: 0, RemoteID: id, RemoteRef: ref, MIME: "image/jpeg",
+				MessageID: messageID, Ordinal: 0, RemoteID: id, RemoteRef: ref, MIME: mime,
 			})
 		}
 		if len(choices) == 0 {
@@ -86,8 +99,9 @@ func TestRecordInboundAttachmentReferenceIsTheLastNamedUpdate(t *testing.T) {
 		if err != nil {
 			t.Fatalf("GetForDownload(%s): %v", messageID, err)
 		}
-		if got.RemoteID != wantID || !bytes.Equal(got.RemoteRef, wantRef) {
-			t.Logf("updates %v: reference = %q %s, want %q %s", choices, got.RemoteID, got.RemoteRef, wantID, wantRef)
+		if got.RemoteID != wantID || !bytes.Equal(got.RemoteRef, wantRef) || got.MIME != wantMIME {
+			t.Logf("updates %v: reference = %q %s (%s), want %q %s (%s)",
+				choices, got.RemoteID, got.RemoteRef, got.MIME, wantID, wantRef, wantMIME)
 			return false
 		}
 		return true

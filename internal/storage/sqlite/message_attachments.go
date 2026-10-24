@@ -75,8 +75,9 @@ type MessageAttachment struct {
 	// replay that carries none keeps what is stored.
 	LastError *string
 	AccountID string
-	// UpdatedAtMS is read by GetForDownload only.
+	// UpdatedAtMS and CreatedAtMS are read by GetForDownload only.
 	UpdatedAtMS int64
+	CreatedAtMS int64
 }
 
 // MessageAttachmentRepository owns inbound attachment lifecycle state.
@@ -103,10 +104,11 @@ func NewMessageAttachmentRepository(
 // the caller's projection transaction. A downloaded row is never modified.
 //
 // A refresh that names no remote media (an empty RemoteID) keeps the
-// reference already stored: a transport can follow the update that named an
-// attachment with one that names nothing (Google did, for 154 of the live
-// install's media frames by 2026-10-24), and taking it would leave the row
-// pointing nowhere for good.
+// reference already stored, and the filename, MIME type and size that came
+// with it: a transport can follow the update that named an attachment with
+// one that names nothing (Google did, for 154 of the live install's media
+// frames by 2026-10-24), and taking it would leave the row pointing nowhere
+// for good.
 func (r *MessageAttachmentRepository) RecordInboundAttachment(
 	ctx context.Context,
 	tx *sql.Tx,
@@ -138,6 +140,10 @@ func (r *MessageAttachmentRepository) RecordInboundAttachment(
 		return err
 	}
 
+	// keepsReference is whether the stored row names media and the refresh
+	// does not, so the row keeps its reference and the description that came
+	// with it.
+	const keepsReference = `(excluded.remote_id = '' AND message_attachments.remote_id <> '')`
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO message_attachments (
 			message_id,
@@ -158,9 +164,12 @@ func (r *MessageAttachmentRepository) RecordInboundAttachment(
 				THEN message_attachments.remote_id ELSE excluded.remote_id END,
 			remote_ref = CASE WHEN excluded.remote_id = ''
 				THEN message_attachments.remote_ref ELSE excluded.remote_ref END,
-			filename = excluded.filename,
-			mime = excluded.mime,
-			size_bytes = excluded.size_bytes,
+			filename = CASE WHEN `+keepsReference+`
+				THEN message_attachments.filename ELSE excluded.filename END,
+			mime = CASE WHEN `+keepsReference+`
+				THEN message_attachments.mime ELSE excluded.mime END,
+			size_bytes = CASE WHEN `+keepsReference+`
+				THEN message_attachments.size_bytes ELSE excluded.size_bytes END,
 			last_error = COALESCE(excluded.last_error, message_attachments.last_error),
 			updated_at_ms = excluded.updated_at_ms
 		WHERE message_attachments.blob_hash IS NULL
@@ -212,6 +221,7 @@ func (r *MessageAttachmentRepository) GetForDownload(
 			ma.blob_hash,
 			ma.last_error,
 			ma.updated_at_ms,
+			ma.created_at_ms,
 			m.account_id
 		FROM message_attachments AS ma
 		JOIN messages AS m ON m.message_id = ma.message_id
@@ -228,6 +238,7 @@ func (r *MessageAttachmentRepository) GetForDownload(
 		&hash,
 		&lastError,
 		&attachment.UpdatedAtMS,
+		&attachment.CreatedAtMS,
 		&attachment.AccountID,
 	)
 	if err != nil {

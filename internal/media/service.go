@@ -22,6 +22,15 @@ import (
 
 const failureRecordTimeout = 5 * time.Second
 
+// NotReadyGrace is how long after an attachment's row is created its
+// transport may go on naming no media (bridge.ErrMediaNotReady) before a
+// download answers ErrGone instead of ErrNotReady. Google names an image
+// about a second after the message; an attachment still unnamed after this
+// long was never uploaded, or the update that named it was lost, and readers
+// should stop waiting for it. Nothing is recorded either way: if a reference
+// does arrive, the next download uses it.
+const NotReadyGrace = 15 * time.Minute
+
 // Clock is the same application clock contract used by MessageService.
 type Clock = messaging.Clock
 
@@ -65,7 +74,8 @@ var (
 	// ErrNotReady reports an attachment whose message arrived before its
 	// transport said where the bytes are (bridge.ErrMediaNotReady). The row
 	// stays pending with nothing recorded: the message's next update fills in
-	// the reference, and a later download can then succeed.
+	// the reference, and a later download can then succeed. After
+	// NotReadyGrace the same answer is ErrGone, still unrecorded.
 	ErrNotReady = errors.New("media: attachment is not available from its transport yet")
 	// ErrImportMismatch rejects imported bytes that contradict what the
 	// attachment row or the caller says they must be.
@@ -249,6 +259,12 @@ func (s *Service) download(
 	})
 	if err != nil {
 		if errors.Is(err, bridge.ErrMediaNotReady) {
+			if waited := s.clock.Now().Sub(time.UnixMilli(row.CreatedAtMS)); waited >= NotReadyGrace {
+				return blob.BlobRef{}, fmt.Errorf(
+					"%w: %w (still, %s after the attachment arrived)",
+					ErrGone, err, waited.Round(time.Minute),
+				)
+			}
 			return blob.BlobRef{}, fmt.Errorf("%w: %w", ErrNotReady, err)
 		}
 		if errors.Is(err, bridge.ErrMediaGone) {

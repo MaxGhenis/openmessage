@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/maxghenis/openmessage/internal/bridge"
 	"github.com/maxghenis/openmessage/internal/storage/sqlite"
@@ -113,5 +114,48 @@ func reprojectMediaMessage(
 		Attachments: attachments,
 	}); err != nil {
 		t.Fatalf("ProjectMessage(update %s): %v", update, err)
+	}
+}
+
+// An attachment still unnamed NotReadyGrace after it arrived answers ErrGone,
+// so readers stop waiting for it, and still records nothing: a reference that
+// arrives later is downloaded as usual.
+func TestResolveNotReadyPastTheGraceIsGoneAndRecordsNothing(t *testing.T) {
+	env := newMediaTestEnvironment(t)
+	seedMediaMessage(t, env, "message-unnamed", []sqlite.MessageAttachment{{
+		Ordinal: 0, Filename: "IMG_2001.jpeg", MIME: "image/jpeg",
+	}})
+	notReady := fmt.Errorf("%w: no media ID yet", bridge.ErrMediaNotReady)
+	downloader := &scriptedDownloader{steps: []downloadStep{
+		{err: notReady},
+		{err: notReady},
+		byteStreamStep([]byte("late jpeg"), "image/jpeg"),
+	}}
+	service := newMediaTestService(t, env, availableDownloadRegistry(downloader))
+	command := DownloadCommand{AccountID: "account-1", MessageID: "message-unnamed", Ordinal: 0}
+
+	env.clock.advance(NotReadyGrace - time.Second)
+	if _, err := service.Resolve(context.Background(), command); !errors.Is(err, ErrNotReady) {
+		t.Fatalf("Resolve(just inside the grace) error = %v, want ErrNotReady", err)
+	}
+	env.clock.advance(time.Second)
+	_, err := service.Resolve(context.Background(), command)
+	if !errors.Is(err, ErrGone) || errors.Is(err, ErrNotReady) || !errors.Is(err, bridge.ErrMediaNotReady) {
+		t.Fatalf("Resolve(at the grace) error = %v, want ErrGone wrapping bridge.ErrMediaNotReady", err)
+	}
+	assertPendingWithoutBlob(t, env, "message-unnamed", 0)
+	if lastError := attachmentLastError(t, env.dbPath, "message-unnamed", 0); lastError.Valid {
+		t.Fatalf("gone-after-grace recorded last_error = %q, want nothing", lastError.String)
+	}
+
+	reprojectMediaMessage(t, env, "message-unnamed", "named-late", []sqlite.MessageAttachment{{
+		Ordinal: 0, RemoteID: "media-late", RemoteRef: []byte(`{"v":1,"media_id":"media-late"}`),
+		Filename: "IMG_2001.jpeg", MIME: "image/jpeg",
+	}})
+	if _, err := service.Resolve(context.Background(), command); err != nil {
+		t.Fatalf("Resolve(after a late reference): %v", err)
+	}
+	if got := getMediaAttachment(t, env, "message-unnamed", 0); got.State != "downloaded" {
+		t.Fatalf("after a late reference: row %+v, want downloaded", got)
 	}
 }

@@ -6975,12 +6975,14 @@ body::after {
     if (loader) loader.remove();
   }
 
-  // A failed attachment load asks the server why before giving up. Google
-  // sends an image's message about a second before it names the media, so the
-  // first load of a new image can answer 503 (Retry-After: 2); a transport
-  // that is briefly unreachable answers 503 too. Those are retried on this
-  // schedule (about two minutes in all); an answer that cannot change by
-  // waiting (404, 410, 501) shows "unavailable" at once.
+  // On a v2 store a failed attachment load asks the server why before giving
+  // up. Google often sends an image's message about a second before it names
+  // the media, so the first load of a new image can answer 503 (Retry-After:
+  // 2); a transport that is briefly unreachable answers 503 too. Those are
+  // retried on this schedule (about two minutes in all); an answer that
+  // cannot change by waiting (404, 410, 501) shows "unavailable" at once. The
+  // legacy store's media route downloads on HEAD as well as GET and reports
+  // every transport failure as 502, so there a failed load stays final.
   const MEDIA_RETRY_DELAYS_MS = [2000, 4000, 8000, 15000, 30000, 60000];
   const MEDIA_RETRY_MAX_DELAY_MS = 60000;
   const MEDIA_RETRYABLE_STATUSES = new Set([408, 425, 429, 500, 502, 503, 504]);
@@ -7005,8 +7007,10 @@ body::after {
     setMediaLoaderLabel(loader, kind === 'video' ? 'Video unavailable' : 'Image unavailable');
   }
 
-  // mediaRetryDelayMs asks the server about a failed load: 0 to reload now,
-  // a delay to reload after, or -1 when waiting cannot help.
+  // mediaRetryDelayMs asks the server about a failed load: a delay to reload
+  // after, or -1 when waiting cannot help. A server that has the bytes
+  // (HEAD 200) gets one more load, in case the failure was the connection's;
+  // a second failure is the bytes' own (a file the browser cannot decode).
   async function mediaRetryDelayMs(src, attempt) {
     const backoff = MEDIA_RETRY_DELAYS_MS[Math.min(attempt, MEDIA_RETRY_DELAYS_MS.length - 1)];
     let response;
@@ -7015,7 +7019,7 @@ body::after {
     } catch (_) {
       return backoff;
     }
-    if (response.ok) return 0;
+    if (response.ok) return attempt === 0 ? backoff : -1;
     if (!MEDIA_RETRYABLE_STATUSES.has(response.status)) return -1;
     const retryAfterSeconds = Number(response.headers.get('Retry-After'));
     if (Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0) {
@@ -7036,7 +7040,7 @@ body::after {
     if (!el || el.dataset.mediaFailed === 'true' || mediaRetriesInFlight.has(el)) return;
     const src = el.dataset.mediaSrc || el.getAttribute('src') || '';
     const attempt = Number(el.dataset.mediaRetries || 0);
-    if (!src.startsWith('/api/') || attempt >= MEDIA_RETRY_DELAYS_MS.length) {
+    if (state.v2Primary === false || !src.startsWith('/api/') || attempt >= MEDIA_RETRY_DELAYS_MS.length) {
       showMediaUnavailable(el, kind);
       return;
     }
