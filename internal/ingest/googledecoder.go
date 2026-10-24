@@ -375,7 +375,7 @@ func (d *GoogleDecoder) decodeMessage(
 		clientRequestID = tmpID
 	}
 	occurredAt := time.UnixMilli(message.GetTimestamp() / 1000)
-	attachments, err := googleAttachments(media)
+	attachments, err := googleAttachments(message.GetMessageID(), media)
 	if err != nil {
 		return nil, err
 	}
@@ -519,19 +519,31 @@ func googleMessageIsEmptyStub(
 	})
 }
 
-func googleAttachments(media *client.MediaInfo) ([]bridge.Attachment, error) {
+// googleAttachments packs the Google adapter's v1 download reference
+// (bridgeadapters/google googleDownloadOpaqueV1). When the message names only
+// a thumbnail, the reference is the thumbnail's, marked preview, and carries
+// the message and part IDs the adapter needs to ask the phone for the
+// full-size image.
+func googleAttachments(messageID string, media *client.MediaInfo) ([]bridge.Attachment, error) {
 	if media == nil {
 		return nil, nil
 	}
-	remoteRef, err := json.Marshal(struct {
+	packed := struct {
 		Version       int    `json:"v"`
 		MediaID       string `json:"media_id"`
 		DecryptionKey string `json:"decryption_key"`
+		MessageID     string `json:"message_id,omitempty"`
+		PartID        string `json:"part_id,omitempty"`
+		Preview       bool   `json:"preview,omitempty"`
 	}{
 		Version:       1,
 		MediaID:       media.MediaID,
 		DecryptionKey: hex.EncodeToString(media.DecryptionKey),
-	})
+	}
+	if media.IsThumbnail {
+		packed.MessageID, packed.PartID, packed.Preview = messageID, media.PartID, true
+	}
+	remoteRef, err := json.Marshal(packed)
 	if err != nil {
 		return nil, fmt.Errorf("pack Google attachment %q: %w", media.MediaID, err)
 	}
@@ -541,5 +553,6 @@ func googleAttachments(media *client.MediaInfo) ([]bridge.Attachment, error) {
 		Filename:  media.MediaName,
 		MIME:      media.MimeType,
 		Size:      media.Size,
+		Preview:   media.IsThumbnail,
 	}}, nil
 }

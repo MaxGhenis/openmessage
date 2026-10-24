@@ -1867,14 +1867,15 @@ func (w *Worker) messageProjection(
 			lastError = &note
 		}
 		attachments = append(attachments, sqlite.MessageAttachment{
-			RemoteID:  attachment.RemoteID,
-			Ordinal:   int64(index),
-			RemoteRef: attachment.RemoteRef,
-			Filename:  attachment.Filename,
-			MIME:      attachment.MIME,
-			SizeBytes: &size,
-			State:     "pending",
-			LastError: lastError,
+			RemoteID:      attachment.RemoteID,
+			Ordinal:       int64(index),
+			RemoteRef:     attachment.RemoteRef,
+			Filename:      attachment.Filename,
+			MIME:          attachment.MIME,
+			SizeBytes:     &size,
+			State:         "pending",
+			LastError:     lastError,
+			RemotePreview: attachment.Preview,
 		})
 	}
 

@@ -950,7 +950,7 @@ func TestProjectMessageAttachmentReplayPreservesDownloadedBlob(t *testing.T) {
 	blobHash := strings.Repeat("3c", 32)
 	clock.Set(messageTestTimeMS + 200)
 	if err := attachmentRepository.MarkDownloaded(
-		context.Background(), message.MessageID, 0, blobHash, 30, "image/webp",
+		context.Background(), message.MessageID, 0, blobHash, 30, "image/webp", false,
 	); err != nil {
 		t.Fatalf("MarkDownloaded(): %v", err)
 	}
@@ -1178,8 +1178,8 @@ func TestMessagesInboxMigrationIsChecksummedAndStrict(t *testing.T) {
 		t,
 		func() time.Time { return time.UnixMilli(messageTestTimeMS) },
 	)
-	if len(embeddedMigrations) != 11 {
-		t.Fatalf("embedded migrations = %d, want 11", len(embeddedMigrations))
+	if len(embeddedMigrations) != 12 {
+		t.Fatalf("embedded migrations = %d, want 12", len(embeddedMigrations))
 	}
 	assertPragmaInt(t, store.db, "user_version", len(embeddedMigrations))
 	ledger := readLedgerRow(t, store.db, 4)

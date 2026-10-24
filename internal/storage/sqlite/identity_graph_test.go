@@ -162,8 +162,8 @@ func openIdentityGraphTestStore(t *testing.T) *Store {
 		}
 	})
 
-	if len(embeddedMigrations) != 11 {
-		t.Fatalf("embedded migrations = %d, want 11", len(embeddedMigrations))
+	if len(embeddedMigrations) != 12 {
+		t.Fatalf("embedded migrations = %d, want 12", len(embeddedMigrations))
 	}
 	assertPragmaInt(t, store.db, "user_version", len(embeddedMigrations))
 	ledger := readLedgerRow(t, store.db, 2)

@@ -71,16 +71,27 @@ var downloadClientFor = func(cli *client.Client) downloadClient {
 
 // googleDownloadOpaqueV1 is Google's versioned Wave-4-to-M4b wire contract.
 // The Google ingest decoder (googleAttachments) packs these transport inputs
-// into message_attachments.remote_ref.
+// into message_attachments.remote_ref. MessageID, PartID and Preview are
+// optional additions: a reference packed before them still downloads, but
+// cannot ask for its original.
 type googleDownloadOpaqueV1 struct {
 	V             int    `json:"v"`
 	MediaID       string `json:"media_id"`
 	DecryptionKey string `json:"decryption_key"`
+	// MessageID and PartID name the message part, for GetFullSizeImage.
+	MessageID string `json:"message_id,omitempty"`
+	PartID    string `json:"part_id,omitempty"`
+	// Preview marks a reference to the thumbnail, packed because the
+	// message named no full-size media.
+	Preview bool `json:"preview,omitempty"`
 }
 
 type googleDownloadRef struct {
-	mediaID string
-	key     []byte
+	mediaID   string
+	key       []byte
+	messageID string
+	partID    string
+	preview   bool
 }
 
 // ValidateDownloadOpaque reports whether raw is a well-formed v1 download Opaque this
@@ -137,7 +148,13 @@ func decodeGoogleDownloadOpaque(opaque []byte) (googleDownloadRef, error) {
 			fmt.Errorf("decode Google media decryption key: %w", err),
 		)
 	}
-	return googleDownloadRef{mediaID: payload.MediaID, key: key}, nil
+	return googleDownloadRef{
+		mediaID:   payload.MediaID,
+		key:       key,
+		messageID: strings.TrimSpace(payload.MessageID),
+		partID:    strings.TrimSpace(payload.PartID),
+		preview:   payload.Preview,
+	}, nil
 }
 
 // Structural opaque failures are terminal unsupported errors: retrying the
@@ -151,6 +168,17 @@ func unsupportedGoogleOpaqueError(fingerprint string, cause error) bridge.OpErro
 		Fingerprint: fingerprint,
 		Cause:       cause,
 	}
+}
+
+type fullSizeImageClient interface {
+	GetFullSizeImage(messageID, actionMessageID string) (*gmproto.GetFullSizeImageResponse, error)
+}
+
+var fullSizeImageClientFor = func(cli *client.Client) fullSizeImageClient {
+	if cli == nil || cli.GM == nil {
+		return nil
+	}
+	return cli.GM
 }
 
 type mediaSendClient interface {
@@ -484,6 +512,61 @@ func (a *Adapter) DownloadMedia(
 		Filename:   ref.Filename,
 		MIME:       firstNonEmpty(transportMIME, ref.MIME),
 	}, nil
+}
+
+// RequestFullMedia asks the phone for the full-size original of an image
+// whose message named only a thumbnail (GetFullSizeImage, as upstream
+// mautrix-gmessages does after it downloads a thumbnail). Google answers,
+// if at all, with an update of the message that names the original; the
+// call itself returns nothing. A reference that is not a thumbnail, or that
+// was packed before references carried the message and part IDs, asks for
+// nothing. The caller paces repeated requests.
+func (a *Adapter) RequestFullMedia(
+	ctx context.Context,
+	accountID string,
+	ref bridge.MediaRef,
+) error {
+	decoded, err := decodeGoogleDownloadOpaque(ref.Opaque)
+	if err != nil {
+		return err
+	}
+	if !decoded.preview || decoded.messageID == "" || decoded.partID == "" {
+		return nil
+	}
+	if a == nil || a.host == nil || !a.host.Connected.Load() {
+		return notConnectedFullMediaError()
+	}
+	cli := a.host.GetClient()
+	transport := fullSizeImageClientFor(cli)
+	if transport == nil {
+		return notConnectedFullMediaError()
+	}
+	if ctx == nil {
+		return errors.New("Google full-size image request context is nil")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if _, err := transport.GetFullSizeImage(decoded.messageID, decoded.partID); err != nil {
+		failure := a.classifyTransportError(
+			fmt.Errorf("request Google full-size image: %w", err),
+			"request_full_media",
+			"google_full_media_request_failed",
+		)
+		failure.Dispatch = ""
+		a.reportIfAuthIndicting(failure)
+		return failure
+	}
+	return nil
+}
+
+func notConnectedFullMediaError() bridge.OpError {
+	return bridge.OpError{
+		Class:       bridge.FailureTransient,
+		Operation:   "request_full_media",
+		Fingerprint: "google_not_connected",
+		Cause:       errors.New("Google Messages is not connected"),
+	}
 }
 
 // SendMedia adapts the durable media outbox request to the connected libgm
@@ -863,3 +946,4 @@ var _ bridge.ReactionSender = (*Adapter)(nil)
 var _ bridge.ReadReceiptSender = (*Adapter)(nil)
 var _ bridge.MediaSender = (*Adapter)(nil)
 var _ bridge.MediaDownloader = (*Adapter)(nil)
+var _ bridge.FullMediaRequester = (*Adapter)(nil)

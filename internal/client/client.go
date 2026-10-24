@@ -98,6 +98,12 @@ type MediaInfo struct {
 	ThumbnailMediaID       string
 	ThumbnailDecryptionKey []byte
 	InlineData             []byte // Inline thumbnail bytes from mediaData field
+	// IsThumbnail reports that MediaID and DecryptionKey were taken from the
+	// thumbnail because the message named no full-size media.
+	IsThumbnail bool
+	// PartID is the message part's action message ID, which names the part
+	// when asking the phone for the full-size image (GetFullSizeImage).
+	PartID string
 }
 
 // ExtractMediaInfo extracts media content from a protobuf Message.
@@ -117,6 +123,7 @@ func ExtractMediaInfo(msg *gmproto.Message) *MediaInfo {
 			}
 
 			mi := &MediaInfo{
+				PartID:                 info.GetActionMessageID(),
 				MediaID:                mc.GetMediaID(),
 				MimeType:               mime,
 				MediaName:              mc.GetMediaName(),
@@ -131,6 +138,7 @@ func ExtractMediaInfo(msg *gmproto.Message) *MediaInfo {
 			if mi.MediaID == "" && mi.ThumbnailMediaID != "" {
 				mi.MediaID = mi.ThumbnailMediaID
 				mi.DecryptionKey = mi.ThumbnailDecryptionKey
+				mi.IsThumbnail = true
 			}
 
 			return mi

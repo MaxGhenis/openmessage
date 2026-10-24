@@ -21,8 +21,8 @@ import (
 	"github.com/maxghenis/openmessage/internal/storage/sqlite"
 )
 
-// RunRepair handles "openmessage repair google-idspace ..." and
-// "openmessage repair whatsapp-lid ...".
+// RunRepair handles "openmessage repair google-idspace ...",
+// "openmessage repair whatsapp-lid ..." and "openmessage repair google-media ...".
 //
 // A repair rewrites the v2 store, so --apply refuses to run while the daemon
 // holds the instance lock or answers on its API, and copies the store files
@@ -37,9 +37,12 @@ func RunRepair(logger zerolog.Logger, args ...string) error {
 		return runRepairGoogleIDSpace(context.Background(), logger, args[1:], os.Stdout, os.Stderr)
 	case "whatsapp-lid":
 		return runRepairWhatsAppLID(context.Background(), logger, args[1:], os.Stdout, os.Stderr)
+	case "google-media":
+		return runRepairGoogleMedia(context.Background(), logger, args[1:], os.Stdout, os.Stderr)
 	default:
 		fmt.Fprintln(os.Stderr, "Usage: openmessage repair google-idspace --since <RFC3339|unix-ms> [--account google-primary] [--apply] [--json] [--report path]")
 		fmt.Fprintln(os.Stderr, "       openmessage repair whatsapp-lid [--account whatsapp-primary] [--session path|''] [--desktop-db path|''] [--desktop-lid-db path|''] [--apply] [--json] [--report path]")
+		fmt.Fprintln(os.Stderr, "       openmessage repair google-media [--account google-primary] [--apply] [--json] [--verbose] [--report path]")
 		return errors.New("repair: unknown target")
 	}
 }
