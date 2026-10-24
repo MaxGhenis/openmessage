@@ -62,6 +62,11 @@ var (
 	// (bridge.ErrMediaGone). The row stays pending: Import can still fill
 	// it, and a later download succeeds if the transport's copy comes back.
 	ErrGone = errors.New("media: attachment is no longer available from its transport")
+	// ErrNotReady reports an attachment whose message arrived before its
+	// transport said where the bytes are (bridge.ErrMediaNotReady). The row
+	// stays pending with nothing recorded: the message's next update fills in
+	// the reference, and a later download can then succeed.
+	ErrNotReady = errors.New("media: attachment is not available from its transport yet")
 	// ErrImportMismatch rejects imported bytes that contradict what the
 	// attachment row or the caller says they must be.
 	ErrImportMismatch = errors.New("media: imported content does not match the attachment")
@@ -243,6 +248,9 @@ func (s *Service) download(
 		MIME:     row.MIME,
 	})
 	if err != nil {
+		if errors.Is(err, bridge.ErrMediaNotReady) {
+			return blob.BlobRef{}, fmt.Errorf("%w: %w", ErrNotReady, err)
+		}
 		if errors.Is(err, bridge.ErrMediaGone) {
 			return blob.BlobRef{}, s.recordGone(ctx, row, err)
 		}

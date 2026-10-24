@@ -55,6 +55,12 @@ type Message struct {
 	// download attempt found its platform client has no copy. Empty when it
 	// can be. Set by v2 reads only; not a legacy-store column.
 	MediaUnavailable string `json:"media_unavailable,omitempty"`
+
+	// MediaVersion changes when the attachment points at different transport
+	// media, such as a media ID that arrived after its message. A client
+	// that showed a failed load can fetch again when it changes. Set by v2
+	// reads only; not a legacy-store column.
+	MediaVersion string `json:"media_version,omitempty"`
 }
 
 type Contact struct {

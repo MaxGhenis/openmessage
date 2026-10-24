@@ -711,7 +711,15 @@ func (a *v1API) internalUnavailable(w http.ResponseWriter, detail string) {
 // refusing right now (Signal not connected, a signal-cli error, an expired
 // session), not a server fault: it answers 503, with Retry-After when the
 // transport named a time.
+// mediaNotReadyRetryAfter is the Retry-After on a 503 for an attachment its
+// transport has not located yet (media.ErrNotReady). Google names the media
+// in an update about a second after the message itself (live, 2026-10-24).
+const mediaNotReadyRetryAfter = 2 * time.Second
+
 func mediaErrorResponse(err error) (int, string, time.Time) {
+	if errors.Is(err, media.ErrNotReady) {
+		return http.StatusServiceUnavailable, err.Error(), time.Now().Add(mediaNotReadyRetryAfter)
+	}
 	code, message := v1ErrorResponse(err)
 	if code != http.StatusInternalServerError {
 		return code, message, time.Time{}
@@ -767,7 +775,7 @@ func v1ErrorResponse(err error) (int, string) {
 		errors.Is(err, messaging.ErrUnsupported),
 		errors.Is(err, media.ErrUnsupported):
 		return http.StatusNotImplemented, err.Error()
-	case errors.Is(err, media.ErrUnavailable):
+	case errors.Is(err, media.ErrUnavailable), errors.Is(err, media.ErrNotReady):
 		return http.StatusServiceUnavailable, err.Error()
 	case errors.Is(err, media.ErrGone):
 		// The message and its attachment exist, but no download can produce
