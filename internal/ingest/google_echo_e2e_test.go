@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -874,6 +875,8 @@ type googleEchoTextSender struct {
 	// uncertain makes sends end with an unknown outcome, as a timed-out
 	// transport call does.
 	uncertain bool
+	// captions lists the caption of each image sent.
+	captions []string
 }
 
 func (s *googleEchoTextSender) SendText(
@@ -888,6 +891,23 @@ func (s *googleEchoTextSender) SendText(
 			Cause:     errors.New("transport call timed out"),
 		}
 	}
+	return bridge.SendResult{
+		RemoteMessageID: request.RequestID,
+		AcceptedAt:      s.clock.Now(),
+		EchoExpected:    true,
+	}, nil
+}
+
+// SendMedia accepts an image send, reading its bytes, and records its
+// caption.
+func (s *googleEchoTextSender) SendMedia(
+	_ context.Context,
+	request bridge.MediaRequest,
+) (bridge.SendResult, error) {
+	if _, err := io.Copy(io.Discard, request.Reader); err != nil {
+		return bridge.SendResult{}, err
+	}
+	s.captions = append(s.captions, request.Caption)
 	return bridge.SendResult{
 		RemoteMessageID: request.RequestID,
 		AcceptedAt:      s.clock.Now(),
@@ -921,19 +941,33 @@ func (r *googleEchoRegistry) Acquire(
 	if accountID != googleEchoAccountID {
 		return nil, bridge.ErrAccountNotRegistered
 	}
-	if capability != bridge.CapabilityTextSend || r.sender == nil {
+	media, sendsMedia := r.sender.(bridge.MediaSender)
+	switch {
+	case capability == bridge.CapabilityTextSend && r.sender != nil:
+		return &bridge.DispatchLease{
+			AccountID: googleEchoAccountID,
+			Platform:  bridge.PlatformGoogle,
+			Ctx:       ctx,
+			Text:      r.sender,
+		}, nil
+	case capability == bridge.CapabilityMediaSend && sendsMedia:
+		return &bridge.DispatchLease{
+			AccountID: googleEchoAccountID,
+			Platform:  bridge.PlatformGoogle,
+			Ctx:       ctx,
+			Media:     media,
+		}, nil
+	default:
 		return nil, bridge.ErrCapabilityUnavailable
 	}
-	return &bridge.DispatchLease{
-		AccountID: googleEchoAccountID,
-		Platform:  bridge.PlatformGoogle,
-		Ctx:       ctx,
-		Text:      r.sender,
-	}, nil
 }
 
 func (r *googleEchoRegistry) Capabilities(accountID string) bridge.CapabilitySet {
-	return bridge.CapabilitySet{TextSend: accountID == googleEchoAccountID && r.sender != nil}
+	_, sendsMedia := r.sender.(bridge.MediaSender)
+	return bridge.CapabilitySet{
+		TextSend:  accountID == googleEchoAccountID && r.sender != nil,
+		MediaSend: accountID == googleEchoAccountID && sendsMedia,
+	}
 }
 
 type googleEchoClock struct {

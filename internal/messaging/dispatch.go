@@ -861,11 +861,9 @@ const reactionTargetNeverSentCode = "reaction_target_never_sent"
 // is correlated whenever it arrives; nothing in the code bounds that). Past
 // the window a Google refusal of a reaction to the message is final, instead
 // of being retried every 5 s for as long as the message keeps its request
-// ID. Content pairing takes text sends only, so with no TmpID on the echo a
-// media send keeps its request ID for good. (A text echo stored before its
-// send was recorded can still be paired after the window, by the startup
-// repair or a later frame for the message; every echo measured on the live
-// store arrived after.)
+// ID. (An echo stored before its send was recorded can still be paired after
+// the window, by the startup repair or a later frame for the message; every
+// echo measured on the live store arrived after.)
 const provisionalTargetWindow = sqlite.EchoMaxLag
 
 // ownSend is the send that named an own message under its request ID, which

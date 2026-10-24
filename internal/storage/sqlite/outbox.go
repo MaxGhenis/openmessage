@@ -573,6 +573,11 @@ func (r *OutboxRepository) enqueue(
 		if err := r.insertOutboxAttachment(ctx, tx, item.OutboxID, *carriers.attachment, nowMS); err != nil {
 			return OutboxItem{}, "", err
 		}
+		if message != nil {
+			if err := insertOutgoingMessageAttachment(ctx, tx, message.MessageID, *carriers.attachment, nowMS); err != nil {
+				return OutboxItem{}, "", err
+			}
+		}
 	}
 	if disposition == EnqueueInserted && carriers.reaction != nil {
 		if err := r.insertOutboxReaction(ctx, tx, item.OutboxID, *carriers.reaction, nowMS); err != nil {
@@ -622,6 +627,51 @@ func (r *OutboxRepository) insertOutboxAttachment(
 		return fmt.Errorf(
 			"enqueue outbox attachment for outbox item %q: %w",
 			outboxID,
+			mapConstraintError(err),
+		)
+	}
+	return nil
+}
+
+// insertOutgoingMessageAttachment gives an outgoing media message the image it
+// sends as its downloaded attachment (ordinal 0, no remote reference), so the
+// message shows it from the moment it is queued instead of an empty bubble.
+// When the platform's echo of the send merges into the message
+// (repointLocalMessage), this downloaded row is the one kept
+// (mergeDuplicateMessage), so the message keeps the original rather than the
+// copy the echo names, which Google often gives only as a thumbnail.
+func insertOutgoingMessageAttachment(
+	ctx context.Context,
+	tx *sql.Tx,
+	messageID string,
+	attachment OutboxAttachment,
+	nowMS int64,
+) error {
+	_, err := tx.ExecContext(ctx, `
+		INSERT INTO message_attachments (
+			message_id,
+			ordinal,
+			filename,
+			mime,
+			size_bytes,
+			state,
+			blob_hash,
+			created_at_ms,
+			updated_at_ms
+		) VALUES (?, 0, ?, ?, ?, 'downloaded', ?, ?, ?)
+	`,
+		messageID,
+		attachment.Filename,
+		attachment.MIME,
+		attachment.SizeBytes,
+		attachment.BlobHash,
+		nowMS,
+		nowMS,
+	)
+	if err != nil {
+		return fmt.Errorf(
+			"enqueue outgoing message %q: attachment: %w",
+			messageID,
 			mapConstraintError(err),
 		)
 	}
