@@ -101,6 +101,12 @@ func NewMessageAttachmentRepository(
 
 // RecordInboundAttachment inserts or refreshes one pending attachment inside
 // the caller's projection transaction. A downloaded row is never modified.
+//
+// A refresh that names no remote media (an empty RemoteID) keeps the
+// reference already stored: a transport can follow the update that named an
+// attachment with one that names nothing (Google did, for 154 of the live
+// install's media frames by 2026-10-24), and taking it would leave the row
+// pointing nowhere for good.
 func (r *MessageAttachmentRepository) RecordInboundAttachment(
 	ctx context.Context,
 	tx *sql.Tx,
@@ -120,6 +126,9 @@ func (r *MessageAttachmentRepository) RecordInboundAttachment(
 	}
 	if attachment.RemoteRef == nil {
 		attachment.RemoteRef = []byte{}
+	}
+	if strings.TrimSpace(attachment.RemoteID) == "" {
+		attachment.RemoteID = ""
 	}
 	if strings.TrimSpace(attachment.MIME) == "" {
 		attachment.MIME = "application/octet-stream"
@@ -145,8 +154,10 @@ func (r *MessageAttachmentRepository) RecordInboundAttachment(
 			updated_at_ms
 		) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', NULL, ?, ?, ?)
 		ON CONFLICT(message_id, ordinal) DO UPDATE SET
-			remote_id = excluded.remote_id,
-			remote_ref = excluded.remote_ref,
+			remote_id = CASE WHEN excluded.remote_id = ''
+				THEN message_attachments.remote_id ELSE excluded.remote_id END,
+			remote_ref = CASE WHEN excluded.remote_id = ''
+				THEN message_attachments.remote_ref ELSE excluded.remote_ref END,
 			filename = excluded.filename,
 			mime = excluded.mime,
 			size_bytes = excluded.size_bytes,
