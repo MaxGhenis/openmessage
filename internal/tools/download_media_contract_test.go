@@ -73,6 +73,9 @@ func TestDownloadMediaAgainstTheRealAppHandler(t *testing.T) {
 		"unsupported": func() (bridge.MediaStream, error) {
 			return bridge.MediaStream{}, bridge.OpError{Class: bridge.FailureUnsupported, Operation: "download_media", Cause: errors.New("unsupported opaque")}
 		},
+		"not-ready": func() (bridge.MediaStream, error) {
+			return bridge.MediaStream{}, fmt.Errorf("%w: no media ID yet", bridge.ErrMediaNotReady)
+		},
 	}
 	for id := range outcomes {
 		if err := messages.ImportMessage(ctx, sqlite.MessageProjection{
@@ -112,6 +115,7 @@ func TestDownloadMediaAgainstTheRealAppHandler(t *testing.T) {
 		"gone":        "attachment unavailable: media: attachment is no longer available from its transport",
 		"offline":     "attachment not downloadable right now (retry later): attachment download unavailable:",
 		"unsupported": "(HTTP 501)",
+		"not-ready":   "attachment not downloadable right now (retry later): media: attachment is not available from its transport yet",
 		"missing":     "message or attachment not found",
 	} {
 		result := callDownloadMedia(t, options, map[string]any{"message_id": "v2msg:message-" + id + ":0"})

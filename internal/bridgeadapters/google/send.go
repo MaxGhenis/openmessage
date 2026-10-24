@@ -70,9 +70,8 @@ var downloadClientFor = func(cli *client.Client) downloadClient {
 }
 
 // googleDownloadOpaqueV1 is Google's versioned Wave-4-to-M4b wire contract.
-// The future Google decoder must pack these transport inputs into
-// message_attachments.remote_ref. No decoder does so yet, so this shim is
-// unit-testable but remains production-inert until Wave-4 ingest lands.
+// The Google ingest decoder (googleAttachments) packs these transport inputs
+// into message_attachments.remote_ref.
 type googleDownloadOpaqueV1 struct {
 	V             int    `json:"v"`
 	MediaID       string `json:"media_id"`
@@ -113,9 +112,16 @@ func decodeGoogleDownloadOpaque(opaque []byte) (googleDownloadRef, error) {
 		)
 	}
 	if strings.TrimSpace(payload.MediaID) == "" {
-		return googleDownloadRef{}, unsupportedGoogleOpaqueError(
-			"google_opaque_media_id_missing",
-			errors.New("Google media opaque payload has no media_id"),
+		// Google often sends an attachment's message before the phone has
+		// uploaded the bytes, with no media ID at all, and names the media in
+		// an update of the same message about a second later (363 times in the
+		// live install's stored frames by 2026-10-24). The projection writes
+		// that update's reference over this pending row and keeps it against
+		// later updates that name nothing, so this is "ask again", not a bad
+		// reference.
+		return googleDownloadRef{}, fmt.Errorf(
+			"%w: Google has sent no media ID for this attachment yet",
+			bridge.ErrMediaNotReady,
 		)
 	}
 	if payload.DecryptionKey == "" {
@@ -134,9 +140,10 @@ func decodeGoogleDownloadOpaque(opaque []byte) (googleDownloadRef, error) {
 	return googleDownloadRef{mediaID: payload.MediaID, key: key}, nil
 }
 
-// Structural opaque failures are terminal unsupported errors: remote_ref is
-// immutable input, so retrying the same malformed or incomplete payload can
-// never make the download succeed.
+// Structural opaque failures are terminal unsupported errors: retrying the
+// same malformed payload can never make the download succeed. A payload that
+// only lacks its media ID is not one of them (bridge.ErrMediaNotReady): the
+// projection replaces a pending row's remote_ref when the message updates.
 func unsupportedGoogleOpaqueError(fingerprint string, cause error) bridge.OpError {
 	return bridge.OpError{
 		Class:       bridge.FailureUnsupported,

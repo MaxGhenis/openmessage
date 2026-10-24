@@ -188,7 +188,18 @@ return an error naming the working read tools instead.
   An attachment the transport has no copy of is marked unavailable (asked
   again at most hourly) and answers 410 Gone (404 is an unknown message or
   ordinal); a transport that is unreachable right now answers 503. v2
-  message reads set `media_unavailable` on such a message.
+  message reads set `media_unavailable` on such a message. Google often sends
+  an image's message about a second before it names the media; a download
+  asked for in between answers 503 with `Retry-After: 2` and records nothing.
+  An attachment still unnamed 15 minutes after its row was created answers
+  410 instead, also unrecorded, so a reference that arrives later still
+  downloads. An update that names no media keeps the reference already
+  stored. v2 message reads carry `media_version`, a digest of the
+  attachment's remote ID that changes when the media is named (or renamed),
+  and the web UI puts it in the image URL so a failed image loads again. On a
+  v2 store the UI also retries a 503 on the server's Retry-After, about two
+  minutes in all (a HEAD 200 after a failed load gets one more load); on the
+  legacy store a failed load is final.
 - `PUT /api/v1/messages/<id>/attachments/<n>` — import a local copy (raw
   body, optional `X-Content-SHA256`) of a pending attachment the platform
   can't deliver, e.g. a Signal attachment signal-cli never stored; checked

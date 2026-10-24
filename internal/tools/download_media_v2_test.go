@@ -223,7 +223,10 @@ func (r toolDownloadRegistry) Capabilities(string) bridge.CapabilitySet {
 
 type toolGoneDownloader struct{}
 
-func (toolGoneDownloader) DownloadMedia(context.Context, string, bridge.MediaRef) (bridge.MediaStream, error) {
+func (toolGoneDownloader) DownloadMedia(_ context.Context, _ string, ref bridge.MediaRef) (bridge.MediaStream, error) {
+	if ref.RemoteID == "" {
+		return bridge.MediaStream{}, fmt.Errorf("%w: no media ID yet", bridge.ErrMediaNotReady)
+	}
 	return bridge.MediaStream{}, fmt.Errorf("%w: Signal never delivered attachment x.html", bridge.ErrMediaGone)
 }
 
@@ -255,14 +258,14 @@ func TestDownloadMediaResolvesV2InProcess(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, id := range []string{"message-gone", "message-imported"} {
+	for id, remoteID := range map[string]string{"message-gone": "x.html", "message-imported": "x.html", "message-not-ready": ""} {
 		if err := messages.ImportMessage(ctx, sqlite.MessageProjection{
 			Message: sqlite.Message{
 				MessageID: id, ConversationID: "conversation-1", AccountID: "signal-primary",
 				RemoteMessageID: "remote-" + id, Direction: sqlite.MessageDirectionIncoming,
 				State: sqlite.MessageStateActive, OccurredAtMS: nowMS,
 			},
-			Attachments: []sqlite.MessageAttachment{{Ordinal: 0, RemoteID: "x.html", Filename: "Report.html", MIME: "text/html"}},
+			Attachments: []sqlite.MessageAttachment{{Ordinal: 0, RemoteID: remoteID, Filename: "Report.html", MIME: "text/html"}},
 		}); err != nil {
 			t.Fatal(err)
 		}
@@ -290,6 +293,12 @@ func TestDownloadMediaResolvesV2InProcess(t *testing.T) {
 	gone := callDownloadMedia(t, options, map[string]any{"message_id": "message-gone"})
 	if !gone.IsError || !strings.Contains(resultText(t, gone), "attachment unavailable: "+media.ErrGone.Error()) {
 		t.Fatalf("download_media(gone) = %s, want the gone reason", resultText(t, gone))
+	}
+	// Google names an image about a second after its message: the tool says
+	// to retry rather than calling the attachment unavailable.
+	notReady := callDownloadMedia(t, options, map[string]any{"message_id": "message-not-ready"})
+	if !notReady.IsError || !strings.Contains(resultText(t, notReady), "attachment not downloadable right now (retry later): "+media.ErrNotReady.Error()) {
+		t.Fatalf("download_media(not ready) = %s, want retry later", resultText(t, notReady))
 	}
 	missing := callDownloadMedia(t, options, map[string]any{"message_id": "message-missing"})
 	if !missing.IsError || resultText(t, missing) != "message or attachment not found" {

@@ -212,6 +212,7 @@ func fetchV2MediaInProcess(
 		case errors.Is(err, media.ErrGone):
 			return fetchedMedia{}, errorResult("attachment unavailable: " + err.Error())
 		case errors.Is(err, media.ErrUnavailable),
+			errors.Is(err, media.ErrNotReady),
 			errors.As(err, &transportFailure) && transportFailure.Class != bridge.FailureUnsupported:
 			return fetchedMedia{}, errorResult("attachment not downloadable right now (retry later): " + err.Error())
 		default:

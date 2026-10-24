@@ -2,7 +2,9 @@ package v2read
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -245,6 +247,7 @@ func (s *Source) mapMessage(
 	if ok {
 		dto.MediaID = fmt.Sprintf("v2msg:%s:%d", message.MessageID, attachment.Ordinal)
 		dto.MimeType = attachment.MIME
+		dto.MediaVersion = attachmentMediaVersion(attachment)
 		if reason, unavailable := attachment.UnavailableReasonAt(s.now()); unavailable {
 			if reason == "" {
 				reason = "this app has no copy of this attachment"
@@ -324,6 +327,20 @@ func (s *Source) messageAttachment(
 		)
 	}
 	return attachment, true, nil
+}
+
+// attachmentMediaVersion names the transport media an attachment's bytes come
+// from: a short digest of its remote ID, empty while it has none. It changes
+// when the reference does (Google names a message's media in a later update
+// of it) and stays the same across the download itself, so a client reloads
+// an attachment only when there is something new to load.
+func attachmentMediaVersion(attachment sqlite.MessageAttachment) string {
+	remoteID := strings.TrimSpace(attachment.RemoteID)
+	if remoteID == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(remoteID))
+	return hex.EncodeToString(sum[:6])
 }
 
 // sendStatusForMessage maps an outgoing message's most recent outbox delivery

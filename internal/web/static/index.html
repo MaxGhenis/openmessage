@@ -6967,29 +6967,122 @@ body::after {
   }
 
   function handleMediaLoad(el) {
+    el.dataset.mediaLoaded = 'true';
+    delete el.dataset.mediaRetries;
+    delete el.dataset.mediaHeadOk;
+    if (el.tagName === 'IMG') el.style.display = '';
     const loader = mediaLoaderFor(el);
     clearMediaLoaderTimer(loader);
     if (loader) loader.remove();
   }
 
-  function handleMediaError(el, kind) {
+  // On a v2 store a failed attachment load asks the server why before giving
+  // up. Google often sends an image's message about a second before it names
+  // the media, so the first load of a new image can answer 503 (Retry-After:
+  // 2); a transport that is briefly unreachable answers 503 too. Those are
+  // retried on this schedule (about two minutes in all); an answer that
+  // cannot change by waiting (404, 410, 501) shows "unavailable" at once. The
+  // legacy store's media route downloads on HEAD as well as GET and reports
+  // every transport failure as 502, so there a failed load stays final.
+  const MEDIA_RETRY_DELAYS_MS = [2000, 4000, 8000, 15000, 30000, 60000];
+  const MEDIA_RETRY_MAX_DELAY_MS = 60000;
+  const MEDIA_RETRYABLE_STATUSES = new Set([408, 425, 429, 500, 502, 503, 504]);
+  const mediaRetriesInFlight = new WeakSet();
+
+  function setMediaLoaderLabel(loader, text) {
+    const label = loader && loader.querySelector('.msg-media-loading-text');
+    if (label) label.textContent = text;
+  }
+
+  function showMediaUnavailable(el, kind) {
+    // Hide the browser's broken-image box; the loader says what happened.
+    // A failed node stays failed: renders re-hydrate every node, and only a
+    // new media_version (a new node) is worth asking again.
+    el.dataset.mediaFailed = 'true';
+    if (el.tagName === 'IMG') el.style.display = 'none';
     const loader = mediaLoaderFor(el);
     clearMediaLoaderTimer(loader);
     if (!loader) return;
     loader.classList.remove('show-label');
     loader.classList.add('is-error');
-    const label = loader.querySelector('.msg-media-loading-text');
-    if (label) {
-      label.textContent = kind === 'video' ? 'Video unavailable' : 'Image unavailable';
+    setMediaLoaderLabel(loader, kind === 'video' ? 'Video unavailable' : 'Image unavailable');
+  }
+
+  // mediaRetryDelayMs asks the server about a failed load of el: a delay to
+  // reload after, or -1 when waiting cannot help. A server that has the bytes
+  // (HEAD 200) gets one more load, in case the failure was the connection's
+  // or the bytes arrived just after it; a failure right after that load is
+  // the bytes' own (a file the browser cannot decode).
+  async function mediaRetryDelayMs(el, src, attempt) {
+    const backoff = MEDIA_RETRY_DELAYS_MS[Math.min(attempt, MEDIA_RETRY_DELAYS_MS.length - 1)];
+    let response;
+    try {
+      response = await fetch(src, { method: 'HEAD', cache: 'no-store' });
+    } catch (_) {
+      delete el.dataset.mediaHeadOk;
+      return backoff;
     }
+    if (response.ok) {
+      if (el.dataset.mediaHeadOk === 'true') return -1;
+      el.dataset.mediaHeadOk = 'true';
+      return backoff;
+    }
+    delete el.dataset.mediaHeadOk;
+    if (!MEDIA_RETRYABLE_STATUSES.has(response.status)) return -1;
+    const retryAfterSeconds = Number(response.headers.get('Retry-After'));
+    if (Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0) {
+      return Math.min(Math.max(retryAfterSeconds * 1000, backoff), MEDIA_RETRY_MAX_DELAY_MS);
+    }
+    return backoff;
+  }
+
+  function mediaRetrySrc(src, attempt) {
+    const url = new URL(src, window.location.href);
+    url.searchParams.set('retry', String(attempt));
+    return url.pathname + url.search;
+  }
+
+  async function handleMediaError(el, kind) {
+    // The error event can reach this twice (a hydrated listener per element
+    // plus a re-hydration check); one retry at a time per element.
+    if (!el || el.dataset.mediaFailed === 'true' || mediaRetriesInFlight.has(el)) return;
+    const src = el.dataset.mediaSrc || el.getAttribute('src') || '';
+    const attempt = Number(el.dataset.mediaRetries || 0);
+    if (state.v2Primary === false || !src.startsWith('/api/') || attempt >= MEDIA_RETRY_DELAYS_MS.length) {
+      showMediaUnavailable(el, kind);
+      return;
+    }
+    mediaRetriesInFlight.add(el);
+    if (el.tagName === 'IMG') el.style.display = 'none';
+    const loader = mediaLoaderFor(el);
+    clearMediaLoaderTimer(loader);
+    if (loader) {
+      loader.classList.remove('is-error');
+      loader.classList.add('show-label');
+      setMediaLoaderLabel(loader, kind === 'video' ? 'Waiting for video...' : 'Waiting for image...');
+    }
+    const delay = await mediaRetryDelayMs(el, src, attempt);
+    if (delay < 0) {
+      mediaRetriesInFlight.delete(el);
+      showMediaUnavailable(el, kind);
+      return;
+    }
+    setTimeout(() => {
+      mediaRetriesInFlight.delete(el);
+      if (!el.isConnected) return;
+      el.dataset.mediaRetries = String(attempt + 1);
+      if (el.tagName === 'IMG') el.style.display = '';
+      el.src = mediaRetrySrc(src, attempt + 1);
+      if (el.tagName === 'VIDEO') el.load();
+    }, delay);
   }
 
   function hydrateMediaElements(root = document) {
     if (!root || !root.querySelectorAll) return;
     root.querySelectorAll('.msg-media img, .msg-media video').forEach((el) => {
+      const kind = el.tagName === 'VIDEO' ? 'video' : 'image';
       if (el.dataset.mediaHydrated !== 'true') {
         el.dataset.mediaHydrated = 'true';
-        const kind = el.tagName === 'VIDEO' ? 'video' : 'image';
         el.addEventListener('load', () => handleMediaLoad(el));
         el.addEventListener('loadeddata', () => {
           if (el.tagName === 'VIDEO') {
@@ -7001,6 +7094,11 @@ body::after {
       }
       if (el.tagName === 'IMG' && el.complete && el.naturalWidth > 0) {
         handleMediaLoad(el);
+      } else if (el.tagName === 'IMG' && el.complete && el.getAttribute('src') && el.dataset.mediaLoaded !== 'true' && el.dataset.mediaFailed !== 'true') {
+        // It failed before this listener was attached. An image that loaded
+        // with no intrinsic size is complete with naturalWidth 0 too, so this
+        // runs once for it at most: the reload's load event marks it loaded.
+        handleMediaError(el, kind);
       } else if (el.tagName === 'VIDEO' && el.readyState >= 2) {
         el.style.display = 'block';
         handleMediaLoad(el);
@@ -10837,6 +10935,7 @@ body::after {
       msg.ReplyToID || '',
       msg.MediaID || '',
       msg.MimeType || '',
+      msg.media_version || '',
       msg.Body || '',
       sourcePlatformOf(msg),
       state.v2Primary === true && String(msg.Status || '').toUpperCase() === 'SENT' ? 'v2-sent' : '',
@@ -11026,7 +11125,13 @@ body::after {
       const isVideo = mimeType.startsWith('video/');
       const isPDF = mimeType === 'application/pdf';
       const hasMediaID = !!message.MediaID;
-      const mediaSrc = message._pendingSend ? (message._pendingFileURL || '') : `/api/media/${encodeURIComponent(message.MessageID)}`;
+      // media_version changes when the attachment points at new media (an ID
+      // Google sent after the message), so the URL and render signature change
+      // and an image that failed before it arrived loads again.
+      const mediaVersion = String(message.media_version || '');
+      const mediaSrc = message._pendingSend
+        ? (message._pendingFileURL || '')
+        : `/api/media/${encodeURIComponent(message.MessageID)}${mediaVersion ? `?v=${encodeURIComponent(mediaVersion)}` : ''}`;
       const audioLabel = (message.Body === '[Voice note]' || message.Body === '[Audio]' || !message.Body) ? (message.Body === '[Voice note]' ? 'Voice note' : 'Audio message') : '';
       const transcript = message.Transcript || message.transcript || '';
       const transcriptModel = message.TranscriptModel || message.transcript_model || '';
@@ -11038,7 +11143,7 @@ body::after {
       } else if (hasMediaID && isImage && mediaSrc) {
         html += `<div class="msg-media">`;
         html += `<div class="msg-media-loading" data-msg-id="${escapeHtml(message.MessageID)}" data-kind="image"><div class="spinner"></div><span class="msg-media-loading-text">Fetching image...</span></div>`;
-        html += `<img src="${mediaSrc}" alt="Image" loading="lazy" decoding="async" onload="handleMediaLoad(this)" onerror="handleMediaError(this, 'image')" onclick="showFullscreen(this.src,'image')">`;
+        html += `<img src="${escapeHtml(mediaSrc)}" data-media-src="${escapeHtml(mediaSrc)}" alt="Image" loading="lazy" decoding="async" onclick="showFullscreen(this.src,'image')">`;
         html += `</div>`;
       } else if (hasMediaID && isAudio && mediaSrc) {
         html += `<div class="msg-media">`;
@@ -11053,7 +11158,7 @@ body::after {
       } else if (hasMediaID && isVideo && mediaSrc) {
         html += `<div class="msg-media">`;
         html += `<div class="msg-media-loading" data-msg-id="${escapeHtml(message.MessageID)}" data-kind="video"><div class="spinner"></div><span class="msg-media-loading-text">Fetching video...</span></div>`;
-        html += `<video src="${mediaSrc}" preload="none" controls playsinline style="display:none" onloadeddata="this.style.display='block';handleMediaLoad(this)" onerror="handleMediaError(this, 'video')" onclick="event.stopPropagation()"></video>`;
+        html += `<video src="${escapeHtml(mediaSrc)}" data-media-src="${escapeHtml(mediaSrc)}" preload="none" controls playsinline style="display:none" onclick="event.stopPropagation()"></video>`;
         html += `</div>`;
       } else if (hasMediaID && isPDF && mediaSrc) {
         html += `<div class="msg-media msg-document-preview">`;
