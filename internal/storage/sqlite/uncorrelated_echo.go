@@ -67,35 +67,87 @@ const EchoMaxLag = time.Duration(echoMaxLagMS) * time.Millisecond
 
 // UncorrelatedEchoRequest is an outgoing message frame that names no
 // transport request. SeenAtMS is when this machine received the frame;
-// OccurredAtMS is the phone's stamp on the message.
+// OccurredAtMS is the phone's stamp on the message. Media is whether the frame
+// carries an attachment.
 type UncorrelatedEchoRequest struct {
 	AccountID            string
 	RemoteConversationID string
 	RemoteMessageID      string
 	Body                 string
+	Media                bool
 	SeenAtMS             int64
 	OccurredAtMS         int64
 }
 
-// unboundTextIntentPredicate selects text intents the transport accepted (or
-// may have accepted) whose local row still carries the transport request ID
-// because no echo has bound it to the real remote ID. An uncertain intent the
-// user already sent again is left alone: the resend owns the echo. It expects
-// the outbox as o and the intent's local message as m.
-const unboundTextIntentPredicate = `
-	o.kind = 'text'
-	AND o.state IN ('confirmed', 'uncertain', 'store_failed')
-	AND (o.result_remote_id IS NULL OR o.result_remote_id = o.transport_request_id)
-	AND m.remote_message_id = o.transport_request_id
+// Media sends pair the same way, with two differences that follow from how
+// the Google adapter sends one (google.Adapter.SendMedia): the image goes out
+// as a message of its own with no text, and a caption follows as a separate
+// text message. So the echo of the image is an outgoing message with an
+// attachment and no text, paired with the conversation's media sends whatever
+// their caption; and the echo of a caption is an ordinary text echo, paired
+// alongside the conversation's text sends of the same body. Pairing a caption
+// moves it out of the sent message, where it showed until then, leaving it to
+// the echo's own row, so the conversation reads as the phone shows it: the
+// image, then the caption. All six media sends on the live store (none with
+// a caption) had one such echo, first seen 0.27-0.59 s after the send went
+// out.
+
+// sendWentOutPredicate selects intents the transport accepted (or may have
+// accepted). An uncertain intent the user already sent again is left alone:
+// the resend owns the echo. It expects the outbox as o and the intent's local
+// message as m.
+const sendWentOutPredicate = `
+	o.state IN ('confirmed', 'uncertain', 'store_failed')
 	AND m.direction = 'outgoing'
 	AND NOT (o.state = 'uncertain' AND EXISTS (
 		SELECT 1 FROM outbox AS again WHERE again.send_again_of_outbox_id = o.outbox_id
 	))
 `
 
+// unboundIntentPredicate selects sent intents whose local row still carries
+// the transport request ID because no echo has bound it to the real remote ID.
+const unboundIntentPredicate = `
+	(o.result_remote_id IS NULL OR o.result_remote_id = o.transport_request_id)
+	AND m.remote_message_id = o.transport_request_id
+	AND ` + sendWentOutPredicate
+
+// unboundTextIntentPredicate and unboundMediaIntentPredicate select the
+// unbound sends of one kind.
+const (
+	unboundTextIntentPredicate  = `o.kind = 'text' AND ` + unboundIntentPredicate
+	unboundMediaIntentPredicate = `o.kind = 'media' AND ` + unboundIntentPredicate
+)
+
+// unsplitCaptionPredicate selects sent media intents whose local row still
+// shows the caption, bound or not: no echo of the caption has been paired yet.
+const unsplitCaptionPredicate = `
+	o.kind = 'media'
+	AND m.body <> ''
+	AND ` + sendWentOutPredicate
+
+// mediaEchoPredicate and textEchoPredicate tell the two kinds of echo apart.
+// They expect the echo's message as e.
+const (
+	mediaEchoPredicate = `trim(e.body) = ''
+		AND EXISTS (SELECT 1 FROM message_attachments AS a WHERE a.message_id = e.message_id)`
+	textEchoPredicate = `NOT EXISTS (SELECT 1 FROM message_attachments AS a WHERE a.message_id = e.message_id)`
+)
+
+// echoGroup is a set of sends and the echoes they can be paired with, all in
+// one conversation: the media sends and the image echoes (media), or the text
+// sends and unsplit captions that read body and the text echoes of body.
+type echoGroup struct {
+	conversationID string
+	media          bool
+	body           string
+}
+
 type echoIntent struct {
 	transportRequestID string
 	sentAtMS           int64
+	// captionOf is the local message of a media send whose caption this
+	// intent stands for, or empty for a send paired by its request ID.
+	captionOf string
 }
 
 type echoCandidate struct {
@@ -190,34 +242,48 @@ func echoPairCost(intent echoIntent, echo echoCandidate) (int64, bool) {
 	return off * off * 1000 / (2 * echoLagSpreadMS * echoLagSpreadMS), true
 }
 
-// reconcileEchoGroupTx pairs the unbound text intents of one conversation and
-// body with that conversation's unclaimed outgoing rows of the same body, plus
-// incoming (a frame not projected yet), and reconciles each pair. It reports
-// how many pairs changed durable state and whether incoming was one of them.
+// reconcileEchoGroupTx pairs the sends of one echo group with the group's
+// unclaimed echo rows, plus incoming (a frame not projected yet, of the
+// group's kind), and acts on each pair: a send is reconciled to its echo, and
+// a caption moves out of its sent message. It reports how many pairs changed
+// durable state and whether incoming was one of them.
 func (r *OutboxRepository) reconcileEchoGroupTx(
 	ctx context.Context,
 	tx *sql.Tx,
 	accountID string,
-	conversationID string,
-	body string,
+	group echoGroup,
 	incoming *echoCandidate,
 ) (int, bool, error) {
-	rows, err := tx.QueryContext(ctx, `
-		SELECT o.transport_request_id, o.updated_at_ms
+	intentQuery := `
+		SELECT o.transport_request_id, o.updated_at_ms, ''
 		FROM outbox AS o
 		JOIN messages AS m ON m.message_id = o.local_message_id
 		WHERE o.account_id = ?
 		  AND m.conversation_id = ?
-		  AND m.body = ?
-		  AND `+unboundTextIntentPredicate,
-		accountID, conversationID, body)
+		  AND ` + unboundMediaIntentPredicate
+	intentArgs := []any{accountID, group.conversationID}
+	echoPredicate := mediaEchoPredicate
+	if !group.media {
+		intentQuery = `
+			SELECT o.transport_request_id, o.updated_at_ms,
+				CASE WHEN o.kind = 'media' THEN m.message_id ELSE '' END
+			FROM outbox AS o
+			JOIN messages AS m ON m.message_id = o.local_message_id
+			WHERE o.account_id = ?
+			  AND m.conversation_id = ?
+			  AND m.body = ?
+			  AND ((` + unboundTextIntentPredicate + `) OR (` + unsplitCaptionPredicate + `))`
+		intentArgs = append(intentArgs, group.body)
+		echoPredicate = `e.body = ? AND ` + textEchoPredicate
+	}
+	rows, err := tx.QueryContext(ctx, intentQuery, intentArgs...)
 	if err != nil {
 		return 0, false, fmt.Errorf("list unbound intents: %w", err)
 	}
 	var intents []echoIntent
 	for rows.Next() {
 		var intent echoIntent
-		if err := rows.Scan(&intent.transportRequestID, &intent.sentAtMS); err != nil {
+		if err := rows.Scan(&intent.transportRequestID, &intent.sentAtMS, &intent.captionOf); err != nil {
 			rows.Close()
 			return 0, false, fmt.Errorf("scan unbound intent: %w", err)
 		}
@@ -239,6 +305,15 @@ func (r *OutboxRepository) reconcileEchoGroupTx(
 	// so a remote ID Google reused in another thread blocks nothing here.
 	// Bounding the phone stamp too lets the conversation-time index serve
 	// this, and drops rows that were stored long after they were sent.
+	echoArgs := []any{
+		accountID, group.conversationID,
+		firstSent - echoMaxLagMS - echoMaxStampSkewMS, lastSent + echoMaxLagMS + echoMaxStampSkewMS,
+		firstSent - echoMaxLagMS, lastSent + echoMaxLagMS,
+		echoMaxStampSkewMS, echoMaxStampSkewMS,
+	}
+	if !group.media {
+		echoArgs = append(echoArgs, group.body)
+	}
 	rows, err = tx.QueryContext(ctx, `
 		SELECT e.remote_message_id, e.created_at_ms
 		FROM messages AS e
@@ -248,15 +323,11 @@ func (r *OutboxRepository) reconcileEchoGroupTx(
 		  AND e.created_at_ms BETWEEN ? AND ?
 		  AND e.occurred_at_ms BETWEEN e.created_at_ms - ? AND e.created_at_ms + ?
 		  AND e.direction = 'outgoing'
-		  AND e.body = ?
+		  AND `+echoPredicate+`
 		  AND NOT EXISTS (
 		      SELECT 1 FROM outbox AS o WHERE o.local_message_id = e.message_id
 		  )
-	`, accountID, conversationID,
-		firstSent-echoMaxLagMS-echoMaxStampSkewMS, lastSent+echoMaxLagMS+echoMaxStampSkewMS,
-		firstSent-echoMaxLagMS, lastSent+echoMaxLagMS,
-		echoMaxStampSkewMS, echoMaxStampSkewMS,
-		body)
+	`, echoArgs...)
 	if err != nil {
 		return 0, false, fmt.Errorf("list echo rows: %w", err)
 	}
@@ -283,7 +354,7 @@ func (r *OutboxRepository) reconcileEchoGroupTx(
 		err := tx.QueryRowContext(ctx, `
 			SELECT 1 FROM messages
 			WHERE account_id = ? AND conversation_id = ? AND remote_message_id = ?
-		`, accountID, conversationID, incoming.remoteMessageID).Scan(&bound)
+		`, accountID, group.conversationID, incoming.remoteMessageID).Scan(&bound)
 		switch {
 		case errors.Is(err, sql.ErrNoRows):
 			echoes = append(echoes, *incoming)
@@ -295,15 +366,11 @@ func (r *OutboxRepository) reconcileEchoGroupTx(
 	changed := 0
 	incomingMatched := false
 	for _, pair := range pairEchoes(intents, echoes) {
-		outcome, err := r.reconcileConfirmTx(ctx, tx, ReconcileRequest{
-			AccountID:          accountID,
-			TransportRequestID: pair.intent.transportRequestID,
-			ResultRemoteID:     pair.echo.remoteMessageID,
-		})
+		applied, err := r.applyEchoPairTx(ctx, tx, accountID, group, pair)
 		if err != nil {
 			return 0, false, err
 		}
-		if outcome == ReconcileOutcomeReconciled || outcome == ReconcileOutcomeEnriched {
+		if applied {
 			changed++
 			if incoming != nil && pair.echo.remoteMessageID == incoming.remoteMessageID {
 				incomingMatched = true
@@ -313,13 +380,56 @@ func (r *OutboxRepository) reconcileEchoGroupTx(
 	return changed, incomingMatched, nil
 }
 
-// ReconcileUncorrelatedEcho pairs the sends in an echo's conversation that
-// carry the echo's body with their echoes, counting the echo itself (see
-// pairEchoes), and reconciles each pair. It returns Enriched or Reconciled
-// when the echo was paired with a send, Noop when other pairs changed (an
-// earlier echo row merged) or nothing applied, and NotFound when the
-// conversation has no unbound send with this body (a message sent from the
-// phone itself).
+// applyEchoPairTx acts on one pair and reports whether it changed durable
+// state. A send is reconciled to its echo, which merges any echo row into the
+// send's local row (repointLocalMessage). A caption is cleared from its media
+// send's local row; the echo keeps its own row, or projects as one.
+func (r *OutboxRepository) applyEchoPairTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	accountID string,
+	group echoGroup,
+	pair echoPair,
+) (bool, error) {
+	if pair.intent.captionOf == "" {
+		outcome, err := r.reconcileConfirmTx(ctx, tx, ReconcileRequest{
+			AccountID:          accountID,
+			TransportRequestID: pair.intent.transportRequestID,
+			ResultRemoteID:     pair.echo.remoteMessageID,
+		})
+		if err != nil {
+			return false, err
+		}
+		return outcome == ReconcileOutcomeReconciled || outcome == ReconcileOutcomeEnriched, nil
+	}
+	nowMS, err := r.nowMS("split caption")
+	if err != nil {
+		return false, err
+	}
+	result, err := tx.ExecContext(ctx, `
+		UPDATE messages
+		SET body = '',
+			updated_at_ms = MAX(updated_at_ms, ?)
+		WHERE message_id = ? AND body = ?
+	`, nowMS, pair.intent.captionOf, group.body)
+	if err != nil {
+		return false, fmt.Errorf("split caption from message %q: %w", pair.intent.captionOf, err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("split caption from message %q: read rows affected: %w", pair.intent.captionOf, err)
+	}
+	return affected == 1, nil
+}
+
+// ReconcileUncorrelatedEcho pairs the sends in an echo's group (see
+// echoGroup) with their echoes, counting the echo itself (see pairEchoes),
+// and acts on each pair. It returns Enriched or Reconciled when the echo was
+// paired with a send, Noop when other pairs changed (an earlier echo row
+// merged) or nothing applied, and NotFound when the conversation has no
+// unbound send the echo could belong to (a message sent from the phone
+// itself). An echo with both an attachment and text is never one of a send
+// from here, which sends a caption as a message of its own, and is NotFound.
 func (r *OutboxRepository) ReconcileUncorrelatedEcho(
 	ctx context.Context,
 	req UncorrelatedEchoRequest,
@@ -331,7 +441,12 @@ func (r *OutboxRepository) ReconcileUncorrelatedEcho(
 		{name: "account ID", value: req.AccountID},
 		{name: "remote conversation ID", value: req.RemoteConversationID},
 		{name: "remote message ID", value: req.RemoteMessageID},
-		{name: "body", value: req.Body},
+	}
+	if !req.Media {
+		checks = append(checks, struct {
+			name  string
+			value string
+		}{name: "body", value: req.Body})
 	}
 	for _, check := range checks {
 		if strings.TrimSpace(check.value) == "" {
@@ -341,22 +456,41 @@ func (r *OutboxRepository) ReconcileUncorrelatedEcho(
 	if req.SeenAtMS <= 0 || req.OccurredAtMS <= 0 {
 		return "", fmt.Errorf("reconcile uncorrelated echo: receipt or occurrence time is not positive")
 	}
+	if req.Media && strings.TrimSpace(req.Body) != "" {
+		return ReconcileOutcomeNotFound, nil
+	}
 
 	// Most outgoing frames (sent from the phone, or status re-deliveries of a
 	// bound send) have no unbound send to pair with: answer them from a read,
 	// without taking the write lock.
-	var conversationID string
-	err := r.store.db.QueryRowContext(ctx, `
+	findQuery := `
 		SELECT m.conversation_id
 		FROM outbox AS o
 		JOIN messages AS m ON m.message_id = o.local_message_id
 		JOIN conversations AS c ON c.conversation_id = m.conversation_id
 		WHERE o.account_id = ?
 		  AND c.remote_conversation_id = ?
-		  AND m.body = ?
-		  AND `+unboundTextIntentPredicate+`
-		LIMIT 1
-	`, req.AccountID, req.RemoteConversationID, req.Body).Scan(&conversationID)
+		  AND ` + unboundMediaIntentPredicate + `
+		LIMIT 1`
+	findArgs := []any{req.AccountID, req.RemoteConversationID}
+	if !req.Media {
+		findQuery = `
+			SELECT m.conversation_id
+			FROM outbox AS o
+			JOIN messages AS m ON m.message_id = o.local_message_id
+			JOIN conversations AS c ON c.conversation_id = m.conversation_id
+			WHERE o.account_id = ?
+			  AND c.remote_conversation_id = ?
+			  AND m.body = ?
+			  AND ((` + unboundTextIntentPredicate + `) OR (` + unsplitCaptionPredicate + `))
+			LIMIT 1`
+		findArgs = append(findArgs, req.Body)
+	}
+	group := echoGroup{media: req.Media}
+	if !req.Media {
+		group.body = req.Body
+	}
+	err := r.store.db.QueryRowContext(ctx, findQuery, findArgs...).Scan(&group.conversationID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ReconcileOutcomeNotFound, nil
 	}
@@ -369,7 +503,7 @@ func (r *OutboxRepository) ReconcileUncorrelatedEcho(
 		return "", fmt.Errorf("reconcile uncorrelated echo: begin transaction: %w", err)
 	}
 	defer tx.Rollback()
-	changed, incomingMatched, err := r.reconcileEchoGroupTx(ctx, tx, req.AccountID, conversationID, req.Body, &echoCandidate{
+	changed, incomingMatched, err := r.reconcileEchoGroupTx(ctx, tx, req.AccountID, group, &echoCandidate{
 		remoteMessageID: req.RemoteMessageID,
 		seenAtMS:        req.SeenAtMS,
 		occurredAtMS:    req.OccurredAtMS,
@@ -390,38 +524,62 @@ func (r *OutboxRepository) ReconcileUncorrelatedEcho(
 
 // EchoDuplicateRepairReport counts what RepairUncorrelatedEchoDuplicates saw.
 type EchoDuplicateRepairReport struct {
-	// Groups is the number of (conversation, body) groups with unbound sends.
+	// Attached is the number of sent media messages given the image they sent
+	// (see BackfillOutgoingMediaAttachments).
+	Attached int
+	// Groups is the number of echo groups with unbound sends or unsplit
+	// captions.
 	Groups int
-	// Merged is the number of sends paired with their echo.
+	// Merged is the number of sends paired with their echo, captions
+	// included.
 	Merged int
 	// Failed is the number of groups whose repair failed and rolled back.
 	Failed int
 }
 
 // RepairUncorrelatedEchoDuplicates pairs every Google conversation's unbound
-// text sends with their echo rows, exactly as the live path does (see
-// pairEchoes), and reconciles each pair, merging the echo row into the local
-// row. Each conversation and body is repaired in its own transaction; a group
+// sends and unsplit captions with their echo rows, exactly as the live path
+// does (see pairEchoes), and acts on each pair, merging an echo row into its
+// send's local row. Sent media messages first get the image they sent
+// (BackfillOutgoingMediaAttachments), so that a merge keeps it rather than the
+// echo's copy. Each echo group is repaired in its own transaction; a group
 // that fails is counted and skipped so it cannot block the rest. It is
-// idempotent: a repaired send is bound and no longer selected.
+// idempotent: a repaired send is bound, and a split caption gone from its
+// send, so neither is selected again.
 func (r *OutboxRepository) RepairUncorrelatedEchoDuplicates(ctx context.Context) (EchoDuplicateRepairReport, error) {
 	var report EchoDuplicateRepairReport
+	attached, err := r.BackfillOutgoingMediaAttachments(ctx)
+	if err != nil {
+		return report, fmt.Errorf("repair echo duplicates: %w", err)
+	}
+	report.Attached = attached
+
 	rows, err := r.store.db.QueryContext(ctx, `
-		SELECT DISTINCT o.account_id, m.conversation_id, m.body
+		SELECT DISTINCT o.account_id, m.conversation_id, 0, m.body
 		FROM outbox AS o
 		JOIN accounts AS a ON a.account_id = o.account_id
 		JOIN messages AS m ON m.message_id = o.local_message_id
 		WHERE a.bridge_key = 'google_messages'
 		  AND m.body <> ''
-		  AND `+unboundTextIntentPredicate)
+		  AND ((`+unboundTextIntentPredicate+`) OR (`+unsplitCaptionPredicate+`))
+		UNION
+		SELECT DISTINCT o.account_id, m.conversation_id, 1, ''
+		FROM outbox AS o
+		JOIN accounts AS a ON a.account_id = o.account_id
+		JOIN messages AS m ON m.message_id = o.local_message_id
+		WHERE a.bridge_key = 'google_messages'
+		  AND `+unboundMediaIntentPredicate)
 	if err != nil {
 		return report, fmt.Errorf("repair echo duplicates: list groups: %w", err)
 	}
-	type group struct{ accountID, conversationID, body string }
-	var groups []group
+	type accountGroup struct {
+		accountID string
+		group     echoGroup
+	}
+	var groups []accountGroup
 	for rows.Next() {
-		var g group
-		if err := rows.Scan(&g.accountID, &g.conversationID, &g.body); err != nil {
+		var g accountGroup
+		if err := rows.Scan(&g.accountID, &g.group.conversationID, &g.group.media, &g.group.body); err != nil {
 			rows.Close()
 			return report, fmt.Errorf("repair echo duplicates: scan group: %w", err)
 		}
@@ -434,7 +592,7 @@ func (r *OutboxRepository) RepairUncorrelatedEchoDuplicates(ctx context.Context)
 
 	var errs []error
 	for _, g := range groups {
-		merged, err := r.repairEchoGroup(ctx, g.accountID, g.conversationID, g.body)
+		merged, err := r.repairEchoGroup(ctx, g.accountID, g.group)
 		if err != nil {
 			report.Failed++
 			errs = append(errs, err)
@@ -445,20 +603,62 @@ func (r *OutboxRepository) RepairUncorrelatedEchoDuplicates(ctx context.Context)
 	return report, errors.Join(errs...)
 }
 
-func (r *OutboxRepository) repairEchoGroup(ctx context.Context, accountID, conversationID, body string) (int, error) {
+func (r *OutboxRepository) repairEchoGroup(ctx context.Context, accountID string, group echoGroup) (int, error) {
 	tx, err := r.store.db.BeginTx(ctx, nil)
 	if err != nil {
-		return 0, fmt.Errorf("repair echo duplicates in %q: begin transaction: %w", conversationID, err)
+		return 0, fmt.Errorf("repair echo duplicates in %q: begin transaction: %w", group.conversationID, err)
 	}
 	defer tx.Rollback()
-	changed, _, err := r.reconcileEchoGroupTx(ctx, tx, accountID, conversationID, body, nil)
+	changed, _, err := r.reconcileEchoGroupTx(ctx, tx, accountID, group, nil)
 	if err != nil {
-		return 0, fmt.Errorf("repair echo duplicates in %q: %w", conversationID, err)
+		return 0, fmt.Errorf("repair echo duplicates in %q: %w", group.conversationID, err)
 	}
 	if changed > 0 {
 		if err := tx.Commit(); err != nil {
-			return 0, fmt.Errorf("repair echo duplicates in %q: commit: %w", conversationID, err)
+			return 0, fmt.Errorf("repair echo duplicates in %q: commit: %w", group.conversationID, err)
 		}
 	}
 	return changed, nil
+}
+
+// BackfillOutgoingMediaAttachments gives each sent media message that has no
+// attachment the image its send carried, as a new send gets it when it is
+// queued (insertOutgoingMessageAttachment). Before that, a sent image showed
+// as an empty message beside its echo. It is idempotent and reports how many
+// messages it changed.
+func (r *OutboxRepository) BackfillOutgoingMediaAttachments(ctx context.Context) (int, error) {
+	nowMS, err := r.nowMS("backfill sent media attachments")
+	if err != nil {
+		return 0, err
+	}
+	result, err := r.store.db.ExecContext(ctx, `
+		INSERT INTO message_attachments (
+			message_id,
+			ordinal,
+			filename,
+			mime,
+			size_bytes,
+			state,
+			blob_hash,
+			created_at_ms,
+			updated_at_ms
+		)
+		SELECT m.message_id, 0, oa.filename, oa.mime, oa.size_bytes, 'downloaded', oa.blob_hash, ?, ?
+		FROM outbox AS o
+		JOIN outbox_attachments AS oa ON oa.outbox_id = o.outbox_id AND oa.ordinal = 0
+		JOIN messages AS m ON m.message_id = o.local_message_id
+		WHERE o.kind = 'media'
+		  AND m.direction = 'outgoing'
+		  AND NOT EXISTS (
+			SELECT 1 FROM message_attachments AS a WHERE a.message_id = m.message_id
+		  )
+	`, nowMS, nowMS)
+	if err != nil {
+		return 0, fmt.Errorf("backfill sent media attachments: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("backfill sent media attachments: read rows affected: %w", err)
+	}
+	return int(affected), nil
 }

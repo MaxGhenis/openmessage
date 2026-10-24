@@ -8,10 +8,12 @@ import (
 )
 
 // FirstAttachmentMIME reports the MIME type of a message's first attachment.
-// It reads the lowest-ordinal message_attachments row, which ingested and
-// migrated messages carry. An outgoing media message sent through the outbox
-// has no such row; its attachment is the one its newest outbox intent was
-// submitted with. ok is false when the message has neither.
+// It reads the lowest-ordinal message_attachments row, which ingested,
+// migrated and sent messages carry. An outgoing media message queued before
+// sends carried their image, and not yet backfilled
+// (BackfillOutgoingMediaAttachments), has no such row; its attachment is the
+// one its newest outbox intent was submitted with. ok is false when the
+// message has neither.
 func (r *MessageRepository) FirstAttachmentMIME(
 	ctx context.Context,
 	messageID string,

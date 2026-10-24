@@ -938,10 +938,10 @@ func (s *MessageService) ObserveTransportEcho(
 }
 
 // ObserveUncorrelatedEcho pairs an echo that names no transport request with
-// the send it echoes (same conversation, identical body, received right after
-// the send went out; see sqlite.pairEchoes) and reconciles it like
-// ObserveTransportEcho. An echo of a
-// message sent from the phone itself matches nothing and is a successful
+// the send it echoes (same conversation, received right after the send went
+// out, and the same body, or for an image an attachment and no text; see
+// sqlite.pairEchoes) and reconciles it like ObserveTransportEcho. An echo of
+// a message sent from the phone itself matches nothing and is a successful
 // NotFound.
 func (s *MessageService) ObserveUncorrelatedEcho(
 	ctx context.Context,
@@ -955,6 +955,7 @@ func (s *MessageService) ObserveUncorrelatedEcho(
 		RemoteConversationID: echo.RemoteConversationID,
 		RemoteMessageID:      echo.RemoteMessageID,
 		Body:                 echo.Body,
+		Media:                echo.Media,
 		SeenAtMS:             echo.SeenAt.UnixMilli(),
 		OccurredAtMS:         echo.OccurredAt.UnixMilli(),
 	})
@@ -1133,6 +1134,9 @@ func validateSendMediaCommand(cmd *SendMediaCommand) error {
 	if strings.ContainsRune(cmd.Filename, '\x00') {
 		return fmt.Errorf("%w: filename contains NUL", ErrInvalidCommand)
 	}
+	// The caption is stored as it is sent: the Google adapter sends it
+	// trimmed, and its echo is paired with the sent message by that text.
+	cmd.Caption = strings.TrimSpace(cmd.Caption)
 	if !cmd.NotBefore.IsZero() && cmd.NotBefore.UnixMilli() <= 0 {
 		return fmt.Errorf("%w: scheduled Unix time is not positive", ErrInvalidCommand)
 	}

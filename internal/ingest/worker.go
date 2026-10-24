@@ -1633,8 +1633,9 @@ func (w *Worker) echoSeenAt(receivedAt time.Time) time.Time {
 	return receivedAt
 }
 
-// observeUncorrelatedEcho correlates an outgoing Google text echo whose TmpID
-// is empty to its send (see sqlite.ReconcileUncorrelatedEcho). Like a TmpID
+// observeUncorrelatedEcho correlates an outgoing Google echo whose TmpID is
+// empty to its send (see sqlite.ReconcileUncorrelatedEcho): a text echo, or
+// the echo of an image, which carries an attachment and no text. Like a TmpID
 // echo, it is best-effort: a fault is counted and the frame projects anyway.
 // Echoes of messages sent from the phone itself match nothing and are not
 // counted.
@@ -1646,7 +1647,8 @@ func (w *Worker) observeUncorrelatedEcho(
 	remoteMessageID string,
 	receivedAt time.Time,
 ) {
-	if platform != bridge.PlatformGoogle || strings.TrimSpace(event.Body) == "" || len(event.Attachments) > 0 {
+	media := len(event.Attachments) > 0
+	if platform != bridge.PlatformGoogle || media == (strings.TrimSpace(event.Body) != "") {
 		return
 	}
 	observer, ok := w.echoes.(UncorrelatedEchoObserver)
@@ -1658,6 +1660,7 @@ func (w *Worker) observeUncorrelatedEcho(
 		RemoteConversationID: v2keys.NormalizeRemoteConversationID(string(platform), event.RemoteConversationID),
 		RemoteMessageID:      remoteMessageID,
 		Body:                 event.Body,
+		Media:                media,
 		SeenAt:               w.echoSeenAt(receivedAt),
 		OccurredAt:           event.OccurredAt,
 	})

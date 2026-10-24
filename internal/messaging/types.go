@@ -130,7 +130,9 @@ type UncorrelatedEcho struct {
 	RemoteConversationID string
 	RemoteMessageID      string
 	Body                 string
-	SeenAt               time.Time
+	// Media is whether the frame carries an attachment.
+	Media  bool
+	SeenAt time.Time
 	// OccurredAt is the phone's stamp on the message.
 	OccurredAt time.Time
 }
