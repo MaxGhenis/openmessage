@@ -497,7 +497,7 @@ func TestR5CanonicalMediaRouteServesV2PrimaryAttachment(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := attachments.MarkDownloaded(ctx, messageID, 0, ref.Hash, int64(len(content)), "text/plain"); err != nil {
+	if err := attachments.MarkDownloaded(ctx, messageID, 0, ref.Hash, int64(len(content)), "text/plain", false); err != nil {
 		t.Fatal(err)
 	}
 	mediaService, err := media.NewService(v2, &a3Registry{accountID: "google-primary"}, blobs, messaging.SystemClock{})

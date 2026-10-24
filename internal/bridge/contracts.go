@@ -260,6 +260,17 @@ type MediaDownloader interface {
 	DownloadMedia(ctx context.Context, accountID string, ref MediaRef) (MediaStream, error)
 }
 
+// FullMediaRequester is implemented by a MediaDownloader whose transport can
+// hold only a reduced copy of an attachment (Attachment.Preview) until it is
+// asked for the original. RequestFullMedia asks for the original of the
+// attachment ref names; the transport answers later, if at all, with an
+// update of the message that names it. It returns nil without asking when
+// ref is not a reduced copy, and it never waits for the update. It asks
+// every time it is called: pacing repeated requests is the caller's job.
+type FullMediaRequester interface {
+	RequestFullMedia(ctx context.Context, accountID string, ref MediaRef) error
+}
+
 type Adapter interface {
 	AccountID() string
 	Platform() Platform

@@ -489,6 +489,70 @@ func TestGoogleAttachmentRemoteRefRoundTrip(t *testing.T) {
 	}
 }
 
+// A message that names only its image's thumbnail yields a reference marked
+// preview that carries the message and part IDs the adapter needs to ask for
+// the full-size image. A reference to the full-size image is packed as
+// before.
+func TestGoogleAttachmentMarksAThumbnailAndCarriesItsPart(t *testing.T) {
+	t.Parallel()
+
+	for name, tc := range map[string]struct {
+		media   *gmproto.MediaContent
+		id      string
+		preview bool
+	}{
+		"thumbnail only": {
+			media: &gmproto.MediaContent{
+				MimeType: "image/jpeg", ThumbnailMediaID: "thumb-1", ThumbnailDecryptionKey: []byte{0x0a},
+			},
+			id: "thumb-1", preview: true,
+		},
+		"full size": {
+			media: &gmproto.MediaContent{
+				MimeType: "image/jpeg", MediaID: "full-1", DecryptionKey: []byte{0x0b},
+				ThumbnailMediaID: "thumb-1", ThumbnailDecryptionKey: []byte{0x0a},
+			},
+			id: "full-1",
+		},
+	} {
+		message := &gmproto.Message{
+			MessageID:      "89926",
+			ConversationID: "conversation-1",
+			Timestamp:      1_700_000_000_000_000,
+			MessageStatus:  &gmproto.MessageStatus{Status: gmproto.MessageStatusType_INCOMING_COMPLETE},
+			MessageInfo: []*gmproto.MessageInfo{{
+				ActionMessageID: proto.String("88846"),
+				Data:            &gmproto.MessageInfo_MediaContent{MediaContent: tc.media},
+			}},
+		}
+		events := decodeGoogleMessage(t, ingest.NewGoogleDecoder(nil), "account-1", message, false)
+		if len(events) != 1 || events[0].Message == nil || len(events[0].Message.Attachments) != 1 {
+			t.Fatalf("%s: events = %+v", name, events)
+		}
+		attachment := events[0].Message.Attachments[0]
+		var packed struct {
+			MediaID   string `json:"media_id"`
+			MessageID string `json:"message_id"`
+			PartID    string `json:"part_id"`
+			Preview   bool   `json:"preview"`
+		}
+		if err := json.Unmarshal(attachment.RemoteRef, &packed); err != nil {
+			t.Fatalf("%s: unpack RemoteRef: %v", name, err)
+		}
+		wantMessageID, wantPartID := "", ""
+		if tc.preview {
+			wantMessageID, wantPartID = "89926", "88846"
+		}
+		if attachment.RemoteID != tc.id || attachment.Preview != tc.preview || packed.MediaID != tc.id ||
+			packed.Preview != tc.preview || packed.MessageID != wantMessageID || packed.PartID != wantPartID {
+			t.Fatalf("%s: attachment %q preview=%v, packed %+v", name, attachment.RemoteID, attachment.Preview, packed)
+		}
+		if err := googleadapter.ValidateDownloadOpaque(attachment.RemoteRef); err != nil {
+			t.Fatalf("%s: packed RemoteRef failed Google adapter validation: %v", name, err)
+		}
+	}
+}
+
 func decodeGoogleMessage(
 	t *testing.T,
 	decoder *ingest.GoogleDecoder,

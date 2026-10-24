@@ -46,8 +46,11 @@ type DispatchLease struct {
 	Reaction    ReactionSender
 	ReadReceipt ReadReceiptSender
 	Download    MediaDownloader
-	release     func()
-	closeOnce   sync.Once
+	// FullMedia is set with Download when the adapter can also ask its
+	// transport for an attachment's original (FullMediaRequester).
+	FullMedia FullMediaRequester
+	release   func()
+	closeOnce sync.Once
 }
 
 func (l *DispatchLease) Close() {
@@ -92,6 +95,7 @@ type registryEntry struct {
 	reaction     ReactionSender
 	readReceipt  ReadReceiptSender
 	download     MediaDownloader
+	fullMedia    FullMediaRequester
 	pairer       Pairer
 }
 
@@ -224,6 +228,7 @@ func (r *AccountRegistry) Acquire(
 		Reaction:    narrowReactionSender(entry.reaction),
 		ReadReceipt: narrowReadReceiptSender(entry.readReceipt),
 		Download:    narrowMediaDownloader(entry.download),
+		FullMedia:   narrowFullMediaRequester(entry.download, entry.fullMedia),
 		release:     func() {},
 	}, nil
 }
@@ -236,6 +241,7 @@ func discoverRegistryEntry(adapter Adapter) *registryEntry {
 	entry.reaction, _ = adapter.(ReactionSender)
 	entry.readReceipt, _ = adapter.(ReadReceiptSender)
 	entry.download, _ = adapter.(MediaDownloader)
+	entry.fullMedia, _ = adapter.(FullMediaRequester)
 	// A Pairer accepts a PairMethod but does not reveal which methods it
 	// supports. Store the interface once, while deriving PairQR/PairPhone only
 	// from explicit declared metadata below.
@@ -395,6 +401,21 @@ func narrowMediaDownloader(target MediaDownloader) MediaDownloader {
 		return nil
 	}
 	return mediaDownloaderView{target: target}
+}
+
+type fullMediaRequesterView struct{ target FullMediaRequester }
+
+func (v fullMediaRequesterView) RequestFullMedia(ctx context.Context, accountID string, ref MediaRef) error {
+	return v.target.RequestFullMedia(ctx, accountID, ref)
+}
+
+// narrowFullMediaRequester exposes a FullMediaRequester only beside a
+// MediaDownloader: asking for an original nobody can download is pointless.
+func narrowFullMediaRequester(download MediaDownloader, target FullMediaRequester) FullMediaRequester {
+	if download == nil || target == nil {
+		return nil
+	}
+	return fullMediaRequesterView{target: target}
 }
 
 var _ Registry = (*AccountRegistry)(nil)

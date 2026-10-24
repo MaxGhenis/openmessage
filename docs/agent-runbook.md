@@ -751,6 +751,63 @@ purpose, restart it. If texts still fail, read the phone's own logs over adb (`d
 `logcat -b all | grep -E 'mSmsTL|onSendSmsResult|SEND_SMS|InboundSmsHandler'`)
 before blaming the carrier or the signal.
 
+## Google images stored as thumbnails
+
+A Google message often names only its image's thumbnail (`ThumbnailMediaID`),
+not the full-size image (`MediaID`). In the live install's frames up to
+2026-10-24, 164 of 233 incoming images and 118 of 139 sent ones never got a
+full-size ID; after a thumbnail, a full-size ID arrived unasked only twice,
+about 42 days later. Before migration 0012 the decoder fell back to the
+thumbnail without saying so, and a download stored the thumbnail as the
+image.
+
+What the code does now:
+
+- **Decoder** (`ingest.googleAttachments`): a thumbnail-only reference is
+  `Preview` and its packed reference carries `message_id`, `part_id` (the
+  media part's action message ID) and `preview`. A full-size reference is
+  packed as before.
+- **Projection** (`RecordInboundAttachment`): `remote_preview` marks a
+  thumbnail reference. On a pending row a thumbnail never replaces an
+  original's reference. A downloaded row with `blob_preview` (its bytes are a
+  thumbnail) takes an update that names the original, keeping its bytes.
+- **Media service** (`media.Service.improve`): serving a thumbnail whose
+  original is not named yet asks the adapter (`bridge.FullMediaRequester`,
+  Google: `GetFullSizeImage(message_id, part_id)`, as upstream
+  mautrix-gmessages does) at most once per 30 minutes per attachment, at most
+  4 at a time. The phone answers, if at all, with an update of the message
+  naming the original. Serving a thumbnail whose original is named downloads
+  the original in its place, waiting up to 8 s, and serves the thumbnail if it
+  takes longer; the download continues in the background and a failure holds
+  off the next for 30 minutes. `media_version` changes when the original is
+  named and again when it lands, so the UI reloads the image.
+
+**Backfilling older rows** (the dry run may run beside the app; `--apply`
+needs the daemon down and backs the store up first, as for the other
+repairs):
+
+```bash
+OPENMESSAGES_DATA_DIR="$HOME/Library/Application Support/OpenMessage" \
+  openmessage repair google-media --report google-media-repair.json   # dry run
+# review, then add --apply
+```
+
+It replays each message's Google inbox frames (live and catch-up) through
+today's decoder and gives each attachment what today's rules keep: the last
+original any frame named, else the last thumbnail, marked and packed with
+its part. A downloaded attachment whose stored reference only ever appears as
+a thumbnail is marked `blob_preview`, naming the original if a frame did.
+Downloaded originals, and attachments no frame describes, are left alone.
+Frames are matched by remote conversation and message ID within an hour of
+the message's own time (IDs are device-local and a phone swap reuses them),
+and a displaced conversation is matched by the remote ID in its marker. Each
+change applies only if the row is still as planned; a second run plans
+nothing. On a copy of the live store taken 2026-10-24 it planned 256
+changes: 87 downloaded thumbnails, 154 pending thumbnails marked, 13 pending
+thumbnails given the original a later frame named, and 2 references a
+nameless update had wiped. 1,514 attachments had no frames (their messages
+predate the v2 inbox), and 21 were never named by any frame.
+
 ## MCP serving — exactly one process may own live transports
 
 **The failure mode (empirically confirmed 2026-07-20):** `openmessage serve

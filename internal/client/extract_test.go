@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"go.mau.fi/mautrix-gmessages/pkg/libgm/gmproto"
+	"google.golang.org/protobuf/proto"
 )
 
 func TestExtractMediaInfo_NoMedia(t *testing.T) {
@@ -66,6 +67,7 @@ func TestExtractMediaInfo_Characterization(t *testing.T) {
 				DecryptionKey:          []byte{0x10, 0x20},
 				ThumbnailMediaID:       "thumb-only",
 				ThumbnailDecryptionKey: []byte{0x10, 0x20},
+				IsThumbnail:            true,
 			},
 		},
 		{
@@ -103,6 +105,26 @@ func TestExtractMediaInfo_Characterization(t *testing.T) {
 				t.Fatalf("ExtractMediaInfo() = %+v, want %+v", got, tt.want)
 			}
 		})
+	}
+}
+
+// The media part's action message ID names the part when asking the phone
+// for the full-size image.
+func TestExtractMediaInfoCarriesThePartID(t *testing.T) {
+	msg := &gmproto.Message{
+		MessageInfo: []*gmproto.MessageInfo{
+			{Data: &gmproto.MessageInfo_MessageContent{MessageContent: &gmproto.MessageContent{Content: "look"}}},
+			{
+				ActionMessageID: proto.String("88846"),
+				Data: &gmproto.MessageInfo_MediaContent{MediaContent: &gmproto.MediaContent{
+					MimeType: "image/jpeg", ThumbnailMediaID: "thumb-1", ThumbnailDecryptionKey: []byte{0x0a},
+				}},
+			},
+		},
+	}
+	got := ExtractMediaInfo(msg)
+	if got == nil || got.PartID != "88846" || !got.IsThumbnail || got.MediaID != "thumb-1" {
+		t.Fatalf("ExtractMediaInfo() = %+v, want thumbnail thumb-1 of part 88846", got)
 	}
 }
 

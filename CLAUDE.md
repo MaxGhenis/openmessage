@@ -199,7 +199,15 @@ return an error naming the working read tools instead.
   and the web UI puts it in the image URL so a failed image loads again. On a
   v2 store the UI also retries a 503 on the server's Retry-After, about two
   minutes in all (a HEAD 200 after a failed load gets one more load); on the
-  legacy store a failed load is final.
+  legacy store a failed load is final. Google often names only an image's
+  thumbnail. That reference is stored marked as one (`remote_preview`), and
+  bytes downloaded from it as a reduced copy (`blob_preview`). Serving a
+  reduced copy asks the phone for the original (`GetFullSizeImage`, at most
+  once per 30 minutes per attachment); once an update names the original,
+  the next read downloads it in the thumbnail's place (waiting up to 8 s and
+  serving the thumbnail meanwhile) and `media_version` changes.
+  `openmessage repair google-media` backfills the marks on older rows from
+  the inbox's raw frames (runbook: "Google images stored as thumbnails").
 - `PUT /api/v1/messages/<id>/attachments/<n>` — import a local copy (raw
   body, optional `X-Content-SHA256`) of a pending attachment the platform
   can't deliver, e.g. a Signal attachment signal-cli never stored; checked

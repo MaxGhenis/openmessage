@@ -613,6 +613,7 @@ func newE2EServer(logger zerolog.Logger) (_ *e2eServer, cleanup func(), resultEr
 	cleanup = func() {
 		cancel()
 		runWG.Wait()
+		mediaService.Close()
 		_ = v2Store.Close()
 		_ = store.Close()
 		_ = os.RemoveAll(dataDir)
@@ -682,7 +683,7 @@ func projectConfirmedMediaAttachments(ctx context.Context, store *sqlite.Store) 
 		}
 		if err := attachments.MarkDownloaded(
 			ctx, message.MessageID, attachment.Ordinal, attachment.BlobHash,
-			attachment.SizeBytes, attachment.MIME,
+			attachment.SizeBytes, attachment.MIME, false,
 		); err != nil {
 			return fmt.Errorf("project confirmed media %q: publish blob: %w", row.OutboxID, err)
 		}
