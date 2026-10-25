@@ -14,8 +14,11 @@ var pendingStatusMarkers = []string{
 // no media, and no reactions, with a terminal/complete status. These show up as
 // "Empty message" in the thread (and wrongly surface conversations) and arise
 // when group activity leaks an empty message into a 1:1 thread. Placeholders
-// (still downloading/sending), system tombstones, and unknown-status messages
-// are NOT stubs.
+// (still downloading/sending), system tombstones, and messages with no status
+// recorded at all (Status "", as imports leave it) are NOT stubs. A Google
+// frame without a MessageStatus is recorded as "unknown"
+// (client.MessageStatusString), which counts as terminal, so a contentless one
+// IS a stub.
 func IsEmptyStubMessage(m *Message) bool {
 	if m == nil {
 		return false

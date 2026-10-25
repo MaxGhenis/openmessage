@@ -273,3 +273,28 @@ func TestMessageIsFromMePrefersIncomingStatusWhenParticipantMissing(t *testing.T
 }
 
 func strPtr(s string) *string { return &s }
+
+func TestMessageStatusString(t *testing.T) {
+	cases := []struct {
+		name string
+		msg  *gmproto.Message
+		want string
+	}{
+		{"nil message", nil, UnknownMessageStatus},
+		{"no status", &gmproto.Message{}, UnknownMessageStatus},
+		{"zero status", &gmproto.Message{MessageStatus: &gmproto.MessageStatus{}}, "STATUS_UNKNOWN"},
+		{"incoming complete", &gmproto.Message{MessageStatus: &gmproto.MessageStatus{
+			Status: gmproto.MessageStatusType_INCOMING_COMPLETE,
+		}}, "INCOMING_COMPLETE"},
+		{"outside enum", &gmproto.Message{MessageStatus: &gmproto.MessageStatus{
+			Status: gmproto.MessageStatusType(9999),
+		}}, "9999"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := MessageStatusString(tc.msg); got != tc.want {
+				t.Fatalf("MessageStatusString = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
