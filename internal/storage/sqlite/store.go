@@ -88,6 +88,11 @@ func storeDSN(path string) string {
 	query.Add("_pragma", fmt.Sprintf("busy_timeout(%d)", busyTimeoutMS))
 	query.Add("_pragma", "foreign_keys(ON)")
 	query.Add("_pragma", "synchronous(NORMAL)")
+	// The triggers that keep the trigram search indexes equal to their tables
+	// (migration 0012) must also see the row a REPLACE deletes; SQLite fires
+	// delete triggers for those rows only with recursive triggers on. No
+	// trigger here writes to a table with triggers, so nothing recurses.
+	query.Add("_pragma", "recursive_triggers(ON)")
 	// modernc.org/sqlite maps this to BEGIN IMMEDIATE for writable
 	// database/sql transactions. Migration state is therefore rechecked only
 	// after acquiring SQLite's write reservation.
@@ -136,6 +141,7 @@ func verifyConnectionPragmas(ctx context.Context, db *sql.DB) error {
 		{pragma: "foreign_keys", want: 1},
 		{pragma: "busy_timeout", want: busyTimeoutMS},
 		{pragma: "synchronous", want: 1}, // NORMAL
+		{pragma: "recursive_triggers", want: 1},
 	}
 	for _, check := range checks {
 		var got int

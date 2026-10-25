@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -273,6 +274,17 @@ func Transform(ctx context.Context, options Options) (report Report, returnErr e
 	}
 	if err := writeReadCursors(target, dataset, state, &report); err != nil {
 		return report, fmt.Errorf("%w: %v", ErrTransform, err)
+	}
+
+	// The validation connection is read-only, and FTS5's integrity check runs
+	// as a write statement, so the search indexes are checked here.
+	if err := target.VerifySearchIndexes(ctx); err != nil {
+		if !errors.Is(err, sqlite.ErrSearchIndexMismatch) {
+			return report, fmt.Errorf("%w: verify staged search indexes: %v", ErrTransform, err)
+		}
+		report.Validation.SearchIndexesValid = false
+	} else {
+		report.Validation.SearchIndexesValid = true
 	}
 
 	storeID, err := target.StoreInstanceID()
