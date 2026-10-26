@@ -203,18 +203,20 @@ func (s *Store) GetLocalInstallationDevice(
 // BumpConversationRecency advances a conversation's last_message_at_ms to at
 // least atMS. Message frames never re-upsert existing conversation rows (their
 // titles and kinds are transport-refresh territory), so ingest recency flows
-// through this targeted monotone update instead. A missing conversation is a
-// no-op.
+// through this targeted monotone update instead. A missing conversation, or
+// one already at least that recent (a re-delivered or older message), is a
+// no-op that writes nothing.
 func (s *Store) BumpConversationRecency(conversationID string, atMS int64) error {
 	if atMS <= 0 {
 		return fmt.Errorf("bump conversation recency %q: time %d is not positive", conversationID, atMS)
 	}
 	_, err := s.db.Exec(
 		`UPDATE conversations
-		 SET last_message_at_ms = MAX(COALESCE(last_message_at_ms, 0), ?)
-		 WHERE conversation_id = ?`,
+		 SET last_message_at_ms = ?
+		 WHERE conversation_id = ? AND last_message_at_ms < ?`,
 		atMS,
 		conversationID,
+		atMS,
 	)
 	if err != nil {
 		return fmt.Errorf("bump conversation recency %q: %w", conversationID, err)
