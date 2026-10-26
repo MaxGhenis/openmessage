@@ -67,8 +67,8 @@ func TestMirrorConversationCreatesPerAccountDevicesAndCursors(t *testing.T) {
 		bridgeKey      string
 		kind           sqlite.ConversationKind
 	}{
-		{conversationID: "whatsapp:chat", accountID: whatsappAccountID, bridgeKey: "whatsapp", kind: sqlite.ConversationKindDirect},
-		{conversationID: "signal-group:chat", accountID: signalAccountID, bridgeKey: "signal", kind: sqlite.ConversationKindGroup},
+		{conversationID: "whatsapp:chat", accountID: whatsappAccountID, bridgeKey: "whatsmeow", kind: sqlite.ConversationKindDirect},
+		{conversationID: "signal-group:chat", accountID: signalAccountID, bridgeKey: "signal_cli", kind: sqlite.ConversationKindGroup},
 	} {
 		accountID, conversationID, err := MirrorConversation(legacy, v2, test.conversationID)
 		if err != nil {

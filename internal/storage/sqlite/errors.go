@@ -21,6 +21,18 @@ var (
 	// do not all belong to the same account.
 	ErrCrossAccountParticipant = errors.New("cross-account conversation participant")
 
+	// ErrCrossAccountDevice means a device write names a device ID that already
+	// belongs to a different account. Device IDs are account-scoped, and
+	// read_cursors references devices(account_id, device_id), so a device never
+	// moves between accounts.
+	ErrCrossAccountDevice = errors.New("device belongs to another account")
+
+	// ErrConversationIdentityConflict means a conversation ID and an
+	// account-scoped natural key (account_id, remote_conversation_id) name
+	// different rows: the key already belongs to a row with another ID, or the
+	// ID already belongs to a row with another key.
+	ErrConversationIdentityConflict = errors.New("conversation natural key belongs to another conversation")
+
 	// ErrOrphanParticipantIdentity means a participant references an identity
 	// that does not exist.
 	ErrOrphanParticipantIdentity = errors.New("orphan conversation participant identity")
