@@ -5,6 +5,7 @@ import (
 
 	"github.com/maxghenis/openmessage/internal/bridge"
 	"github.com/maxghenis/openmessage/internal/storage/sqlite"
+	"github.com/maxghenis/openmessage/internal/v2keys"
 )
 
 // ensureDirectPeerParticipant links an already-resolved remote identity to a
@@ -133,4 +134,37 @@ func directPeerAddress(platform bridge.Platform, remoteConversationID string) st
 		// they name no addressable party, so there is nothing to ensure.
 		return ""
 	}
+}
+
+// addressable reports whether a roster entry carries an address an identity
+// can be keyed from. An entry with no number (libgm delivers these: observed
+// live between 2026-08 and 2026-10, 1:1 snapshots listed the account itself
+// three to five times, all but one without a number) or with one v2keys
+// rejects (a bare "+") names no identity, so it can neither add a member nor
+// rule one out.
+func addressable(accountID string, platform bridge.Platform, reference bridge.IdentityRef) bool {
+	raw := identityRaw(reference)
+	if raw == "" {
+		return false
+	}
+	_, err := v2keys.IdentityKey(accountID, string(platform), raw)
+	return err == nil
+}
+
+// addressableParticipants splits roster entries into the addressable ones and
+// the rest, keeping each in order.
+func addressableParticipants(
+	accountID string,
+	platform bridge.Platform,
+	participants []bridge.Participant,
+) (usable, unaddressable []bridge.Participant) {
+	usable = make([]bridge.Participant, 0, len(participants))
+	for _, participant := range participants {
+		if addressable(accountID, platform, participant.Identity) {
+			usable = append(usable, participant)
+		} else {
+			unaddressable = append(unaddressable, participant)
+		}
+	}
+	return usable, unaddressable
 }
