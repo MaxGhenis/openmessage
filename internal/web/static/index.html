@@ -1423,33 +1423,6 @@ html, body {
   display: block;
 }
 
-.msg-document-preview {
-  border: 1px solid var(--border);
-  background: var(--bg-elevated);
-}
-
-.msg-document-preview .msg-pdf-preview {
-  display: block;
-  width: min(320px, 68vw);
-  height: 220px;
-  border: 0;
-  background: var(--bg-surface);
-}
-
-.msg-pdf-preview-error {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: min(320px, 68vw);
-  height: 220px;
-  padding: 16px;
-  color: var(--text-muted);
-  background: var(--bg-surface);
-  text-align: center;
-}
-
-.msg-pdf-preview-error[hidden] { display: none; }
-
 .msg-attachment-card {
   display: flex;
   align-items: center;
@@ -6106,7 +6079,6 @@ body::after {
   const googleAvatarCache = new Map();
   const googleAvatarInflight = new Map();
   const pendingMediaLoaderTimers = new WeakMap();
-  const pdfPreviewObjectURLs = new WeakMap();
 
   // ─── DOM refs ───
   const $convoList = document.getElementById('conversation-list');
@@ -7103,56 +7075,6 @@ body::after {
         el.style.display = 'block';
         handleMediaLoad(el);
       }
-    });
-  }
-
-  function cleanupPDFPreviewURLs(root) {
-    if (!root || !root.querySelectorAll || !window.URL?.revokeObjectURL) return;
-    root.querySelectorAll('iframe.msg-pdf-preview').forEach(frame => {
-      const objectURL = pdfPreviewObjectURLs.get(frame);
-      if (objectURL) {
-        URL.revokeObjectURL(objectURL);
-        pdfPreviewObjectURLs.delete(frame);
-      }
-    });
-  }
-
-  function markPDFPreviewUnavailable(frame) {
-    if (!frame) return;
-    frame.hidden = true;
-    const fallback = frame.parentElement ? frame.parentElement.querySelector('.msg-pdf-preview-error') : null;
-    if (fallback) fallback.hidden = false;
-  }
-
-  function hydratePDFPreviews(root = document) {
-    if (!root || !root.querySelectorAll) return;
-    root.querySelectorAll('iframe.msg-pdf-preview[data-pdf-src]').forEach(frame => {
-      if (frame.dataset.pdfHydrated === 'true') return;
-      const source = frame.dataset.pdfSrc || '';
-      if (!source || !window.URL?.createObjectURL) {
-        markPDFPreviewUnavailable(frame);
-        return;
-      }
-      frame.dataset.pdfHydrated = 'true';
-      fetch(source)
-        .then(response => {
-          if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
-          return response.blob();
-        })
-        .then(blob => {
-          if (!frame.isConnected) return;
-          const staleURL = pdfPreviewObjectURLs.get(frame);
-          if (staleURL && window.URL?.revokeObjectURL) {
-            URL.revokeObjectURL(staleURL);
-          }
-          const objectURL = URL.createObjectURL(blob);
-          pdfPreviewObjectURLs.set(frame, objectURL);
-          frame.src = `${objectURL}#toolbar=0&navpanes=0&view=FitH`;
-        })
-        .catch(err => {
-          console.warn('Failed to hydrate PDF preview:', err);
-          markPDFPreviewUnavailable(frame);
-        });
     });
   }
 
@@ -10321,7 +10243,6 @@ body::after {
     });
     Array.from(container.children).forEach(child => {
       if (!desiredSet.has(child)) {
-        cleanupPDFPreviewURLs(child);
         child.remove();
       }
     });
@@ -10708,7 +10629,6 @@ body::after {
 
   function renderThreadPlaceholder(message, modifier = '') {
     if (!$messagesArea) return;
-    cleanupPDFPreviewURLs($messagesArea);
     $messagesArea.innerHTML = '';
     const el = document.createElement('div');
     el.className = 'thread-placeholder' + (modifier ? ` ${modifier}` : '');
@@ -11123,7 +11043,6 @@ body::after {
       const isImage = mimeType.startsWith('image/');
       const isAudio = mimeType.startsWith('audio/');
       const isVideo = mimeType.startsWith('video/');
-      const isPDF = mimeType === 'application/pdf';
       const hasMediaID = !!message.MediaID;
       // media_version changes when the attachment points at new media (an ID
       // Google sent after the message), so the URL and render signature change
@@ -11160,17 +11079,14 @@ body::after {
         html += `<div class="msg-media-loading" data-msg-id="${escapeHtml(message.MessageID)}" data-kind="video"><div class="spinner"></div><span class="msg-media-loading-text">Fetching video...</span></div>`;
         html += `<video src="${escapeHtml(mediaSrc)}" data-media-src="${escapeHtml(mediaSrc)}" preload="none" controls playsinline style="display:none" onclick="event.stopPropagation()"></video>`;
         html += `</div>`;
-      } else if (hasMediaID && isPDF && mediaSrc) {
-        html += `<div class="msg-media msg-document-preview">`;
-        html += `<iframe class="msg-pdf-preview" data-pdf-src="${escapeHtml(mediaSrc)}" title="PDF preview" loading="lazy"></iframe>`;
-        html += `<div class="msg-pdf-preview-error" hidden>PDF preview unavailable. Open the attachment below.</div>`;
-        html += renderAttachmentCardHTML(message, mediaSrc);
-        html += `</div>`;
       } else if (!hasMediaID && (isImage || isAudio || isVideo)) {
         const icon = isImage ? '\uD83D\uDDBC\uFE0F' : (isAudio ? '\uD83C\uDFA4' : '\uD83C\uDFA5');
         const label = isImage ? 'Image' : (isAudio ? 'Audio' : 'Video');
         html += `<div style="padding:12px;background:var(--bg-tertiary, #f0f0f0);border-radius:8px;text-align:center;color:var(--text-muted, #999);font-size:13px">${icon} ${label} from phone</div>`;
       } else if (hasMediaID) {
+        // Native PDF viewers can steal focus (including on parse errors) and
+        // scroll an old attachment into view. Open documents only on request
+        // in a separate tab, keeping viewers outside the conversation.
         html += renderAttachmentCardHTML(message, mediaSrc);
       } else {
         html += renderAttachmentCardHTML(message, '');
@@ -11394,7 +11310,6 @@ body::after {
     hydrateLinkPreviews();
     hydrateNativeAvatars($messagesArea);
     hydrateMediaElements($messagesArea);
-    hydratePDFPreviews($messagesArea);
     hydrateQueuedAttachmentPreviews();
     scheduleMediaLoaderLabels($messagesArea);
     observeThreadContentResize();
@@ -14716,7 +14631,6 @@ body::after {
     if (threadContentResizeObserver) {
       threadContentResizeObserver.disconnect();
     }
-    cleanupPDFPreviewURLs($messagesArea);
     $messagesArea.innerHTML = '';
     clearThreadFeedback();
     refreshConversationChrome();
