@@ -328,7 +328,22 @@ func assertLegacyJSON(t *testing.T, value any, want string) {
 	if err != nil {
 		t.Fatalf("json.Marshal(%T): %v", value, err)
 	}
-	if string(got) != want {
+	// Compare decoded documents: MCP clients read the JSON, not its key order,
+	// and mcp-go's schema serializer has reordered keys between releases.
+	if canonicalJSON(t, got) != canonicalJSON(t, []byte(want)) {
 		t.Fatalf("legacy JSON changed\n got: %s\nwant: %s", got, want)
 	}
+}
+
+func canonicalJSON(t *testing.T, raw []byte) string {
+	t.Helper()
+	var decoded any
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("json.Unmarshal(%s): %v", raw, err)
+	}
+	canonical, err := json.Marshal(decoded)
+	if err != nil {
+		t.Fatalf("json.Marshal(%s): %v", raw, err)
+	}
+	return string(canonical)
 }
