@@ -2,6 +2,47 @@
 
 Use this before shipping a TestFlight/App Store build, public website update, or signed macOS release.
 
+## Preparing the v0.3.0 GitHub release
+
+The release-preparation PR proposes version 0.3.0 / macOS build 19. Review
+[the release notes](releases/v0.3.0.md) with the code and keep the PR in draft
+until the remaining platform checks below are complete. Opening or merging the
+PR does not publish a release.
+
+- Base the release on `MaxGhenis/openmessage` main. Do not merge a local
+  integration branch or rely on an unmerged contributor branch to build it.
+- Keep the checked-in dependency graph. The existing Google Messages replacement
+  is the public `MaxGhenis/gmessages` fork at
+  `0e43542dfa0e0b97e410f185a5842e8740106099`; this proposal does not require
+  PR #179 or a contributor's replacement fork.
+- The release workflow disables Go workspaces and private-module overrides,
+  resolves dependencies through the public Go proxy and checksum database, and
+  verifies/tests them using an empty module cache. Review the uploaded
+  `release-public-modules` artifact for the exact dependency versions.
+- Check the proposed `CFBundleShortVersionString` and `CFBundleVersion` in the
+  macOS source plist. All release artifacts use the same resolved tag/commit;
+  the workflow rejects a missing tag, an unmerged commit, or a tag that disagrees
+  with the app version.
+- After the PR is merged and all release gates pass, a maintainer can push the
+  `v0.3.0` tag at the approved commit. **Pushing the tag triggers publication.**
+  Manual runs also require an existing tag merged into main and build that tag,
+  regardless of the branch chosen in the workflow UI. Neither path creates a
+  tag automatically.
+- Keep the release tag immutable. The workflow checks it again before uploading
+  artifacts. Release notes include the resolved source commit.
+
+For an isolated container check, use a clean Git archive, a unique image name,
+and a disposable container with no host data or credential mounts. Use
+`serve --no-transports` for an unpaired startup check; browser tests use the
+synthetic e2e server. Avoid the default Compose project and port when another
+OpenMessage instance is installed. Do not connect test containers to a real
+message store or reuse a live pairing session.
+
+Release preparation still needs macOS packaging/signing/notarization checks and
+authorized live messaging checks before publication. Linux container results
+do not satisfy those gates. In particular, verify Google account pairing and
+dual-SIM behavior separately; issue #158 is not fully resolved by this release.
+
 ## 1. Worktree And Privacy Preflight
 
 - Run `git status --short` and confirm every changed file is intentional.
