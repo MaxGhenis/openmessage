@@ -83,6 +83,11 @@ func RegisterWithOptions(s *server.MCPServer, a *app.App, options Options) {
 	default:
 		s.AddTool(reactToMessageTool(), reactToMessageHandler(a))
 	}
+	if options.Daemon != nil {
+		s.AddTool(markReadTool(), daemonMarkReadHandler(options))
+	} else {
+		s.AddTool(markReadTool(), markReadHandler(a))
+	}
 	s.AddTool(setMessageTranscriptTool(), setMessageTranscriptHandler(a))
 	s.AddTool(listConversationsTool(), listConversationsHandler(a, options))
 	s.AddTool(listContactsTool(), listContactsHandler(a))
