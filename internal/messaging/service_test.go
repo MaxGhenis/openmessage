@@ -775,6 +775,7 @@ func TestTerminalFailuresAreRejected(t *testing.T) {
 		bridge.FailureUpgradeRequired,
 		bridge.FailureMisconfigured,
 		bridge.FailureUnsupported,
+		bridge.FailureRecipientMismatch,
 	}
 	for _, class := range classes {
 		class := class

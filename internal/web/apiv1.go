@@ -389,6 +389,11 @@ func reactOutcome(delivery messaging.Delivery) (int, map[string]any) {
 			// account's own message, and its send was canceled or refused.
 			return fail(http.StatusBadGateway, "the message it reacts to was never sent")
 		}
+		if delivery.ErrorClass == string(bridge.FailureRecipientMismatch) {
+			// Refused before sending: the phone's thread for this
+			// conversation now names other people.
+			return fail(http.StatusBadGateway, "the phone's thread for this conversation now names other people, so nothing was sent")
+		}
 		return fail(http.StatusBadGateway, "the transport refused the reaction")
 	case messaging.OutboxCanceled:
 		return fail(http.StatusConflict, "the reaction was canceled before it was sent")

@@ -18,6 +18,7 @@ import (
 	"github.com/maxghenis/openmessage/internal/app"
 	"github.com/maxghenis/openmessage/internal/bridge"
 	"github.com/maxghenis/openmessage/internal/client"
+	"github.com/maxghenis/openmessage/internal/ingest"
 )
 
 type textSendClient interface {
@@ -163,6 +164,59 @@ var mediaSendClientFor = func(cli *client.Client) mediaSendClient {
 	return cli.GM
 }
 
+// refuseMovedThread refuses an operation whose Google thread now names other
+// people than the stored conversation it was written in. Google's thread
+// numbers are local to the phone: after a phone swap or restore, a number v2
+// still binds to one person's thread can name someone else's, and v2 rebinds
+// it only when live traffic proves the move. Sending to the bound number would
+// reach whoever it names now. This builds the refusal directly rather than
+// through the classifiers, which report to the receive lifecycle: the phone
+// answered the lookup, so the connection is fine. Nothing went out, and a retry
+// against the same binding would fail the same way, so the refusal is
+// terminal. It names counts and kinds, never the people.
+func (a *Adapter) refuseMovedThread(
+	operation string,
+	accountID string,
+	ref bridge.ConversationRef,
+	conversation *gmproto.Conversation,
+) *bridge.OpError {
+	check := ingest.CheckGoogleSendTarget(accountID, ref, conversation)
+	if !check.Contradicts {
+		return nil
+	}
+	if a.host != nil {
+		a.host.Logger.Warn().
+			Str("operation", operation).
+			Str("stored_kind", check.StoredKind).
+			Str("phone_kind", check.RemoteKind).
+			Int("stored_peers", check.StoredPeers).
+			Int("phone_peers", check.RemotePeers).
+			Int("shared_peers", check.Shared).
+			Msg("Refused a Google send: the phone's thread for this conversation now names other people")
+	}
+	return &bridge.OpError{
+		Class:       bridge.FailureRecipientMismatch,
+		Operation:   operation,
+		Fingerprint: "google_conversation_roster_mismatch",
+		Dispatch:    bridge.DispatchNotCalled,
+		Cause: fmt.Errorf(
+			"the phone's Google thread for this conversation now names other people "+
+				"(this conversation: %s, %d %s; the phone's thread: %s, %d %s; %d in common), "+
+				"so nothing was sent",
+			check.StoredKind, check.StoredPeers, peopleNoun(check.StoredPeers),
+			check.RemoteKind, check.RemotePeers, peopleNoun(check.RemotePeers),
+			check.Shared,
+		),
+	}
+}
+
+func peopleNoun(n int) string {
+	if n == 1 {
+		return "person"
+	}
+	return "people"
+}
+
 // SendText adapts the durable text outbox request to the connected libgm
 // client retained by the lifecycle-owned App generation.
 func (a *Adapter) SendText(
@@ -215,6 +269,9 @@ func (a *Adapter) SendText(
 			bridge.DispatchNotCalled,
 		)
 		return bridge.SendResult{}, failure
+	}
+	if refused := a.refuseMovedThread("send_text", req.AccountID, req.Conversation, conversation); refused != nil {
+		return bridge.SendResult{}, *refused
 	}
 	participantID, sim := app.ExtractSIMAndParticipant(conversation)
 	replyToID := ""
@@ -320,6 +377,9 @@ func (a *Adapter) SendReaction(
 			bridge.DispatchNotCalled,
 		)
 		return bridge.SendResult{}, failure
+	}
+	if refused := a.refuseMovedThread("send_reaction", req.AccountID, req.Conversation, conversation); refused != nil {
+		return bridge.SendResult{}, *refused
 	}
 	_, sim := app.ExtractSIMAndParticipant(conversation)
 	payload := app.BuildReactionPayload(
@@ -561,6 +621,9 @@ func (a *Adapter) SendMedia(
 			bridge.DispatchNotCalled,
 		)
 		return bridge.SendResult{}, failure
+	}
+	if refused := a.refuseMovedThread("send_media", req.AccountID, req.Conversation, conversation); refused != nil {
+		return bridge.SendResult{}, *refused
 	}
 	if err := ctx.Err(); err != nil {
 		return bridge.SendResult{}, preDispatchMediaError("google_media_context_done", err)

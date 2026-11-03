@@ -204,6 +204,18 @@ func (s *MessageService) dispatchTextLease(ctx context.Context, outboxLease sqli
 		)
 	}
 
+	conversationRef, err := s.conversationRef(conversation)
+	if err != nil {
+		return s.markPreCallFailure(
+			ctx,
+			item,
+			string(bridge.FailureTransient),
+			"load_roster",
+			err,
+			s.clock.Now().Add(s.retryDelay),
+		)
+	}
+
 	if err := s.outbox.MarkTransportCalled(ctx, sqlite.Attempt{
 		OutboxID:             item.OutboxID,
 		LeaseToken:           *item.LeaseToken,
@@ -219,12 +231,10 @@ func (s *MessageService) dispatchTextLease(ctx context.Context, outboxLease sqli
 	s.signalChange()
 
 	request := bridge.TextRequest{
-		AccountID: item.AccountID,
-		Conversation: bridge.ConversationRef{
-			RemoteID: conversation.RemoteConversationID,
-		},
-		Body:      message.Body,
-		RequestID: item.TransportRequestID,
+		AccountID:    item.AccountID,
+		Conversation: conversationRef,
+		Body:         message.Body,
+		RequestID:    item.TransportRequestID,
 	}
 	request.ReplyTo = replyTo
 	closeLease = false
@@ -363,6 +373,18 @@ func (s *MessageService) dispatchMediaLease(ctx context.Context, outboxLease sql
 		)
 	}
 
+	conversationRef, err := s.conversationRef(conversation)
+	if err != nil {
+		return s.markPreCallFailure(
+			ctx,
+			item,
+			string(bridge.FailureTransient),
+			"load_roster",
+			err,
+			s.clock.Now().Add(s.retryDelay),
+		)
+	}
+
 	attachment, err := s.outbox.GetOutboxAttachment(ctx, item.OutboxID)
 	if err != nil {
 		return s.markPreCallFailure(
@@ -418,16 +440,14 @@ func (s *MessageService) dispatchMediaLease(ctx context.Context, outboxLease sql
 	s.signalChange()
 
 	request := bridge.MediaRequest{
-		AccountID: item.AccountID,
-		Conversation: bridge.ConversationRef{
-			RemoteID: conversation.RemoteConversationID,
-		},
-		Reader:    reader,
-		Size:      attachment.SizeBytes,
-		Filename:  attachment.Filename,
-		MIME:      attachment.MIME,
-		Caption:   message.Body,
-		RequestID: item.TransportRequestID,
+		AccountID:    item.AccountID,
+		Conversation: conversationRef,
+		Reader:       reader,
+		Size:         attachment.SizeBytes,
+		Filename:     attachment.Filename,
+		MIME:         attachment.MIME,
+		Caption:      message.Body,
+		RequestID:    item.TransportRequestID,
 	}
 	request.ReplyTo = replyTo
 	closeReader = false
@@ -608,6 +628,18 @@ func (s *MessageService) dispatchReactionLease(ctx context.Context, outboxLease 
 		)
 	}
 
+	conversationRef, err := s.conversationRef(conversation)
+	if err != nil {
+		return s.markPreCallFailure(
+			ctx,
+			item,
+			string(bridge.FailureTransient),
+			"load_roster",
+			err,
+			s.clock.Now().Add(s.retryDelay),
+		)
+	}
+
 	if err := s.outbox.MarkTransportCalled(ctx, sqlite.Attempt{
 		OutboxID:             item.OutboxID,
 		LeaseToken:           *item.LeaseToken,
@@ -623,14 +655,12 @@ func (s *MessageService) dispatchReactionLease(ctx context.Context, outboxLease 
 	s.signalChange()
 
 	reactionRequest := bridge.ReactionRequest{
-		AccountID: item.AccountID,
-		Conversation: bridge.ConversationRef{
-			RemoteID: conversation.RemoteConversationID,
-		},
-		Target:    target,
-		Emoji:     reaction.Emoji,
-		Action:    bridge.ReactionAction(reaction.Action),
-		RequestID: item.TransportRequestID,
+		AccountID:    item.AccountID,
+		Conversation: conversationRef,
+		Target:       target,
+		Emoji:        reaction.Emoji,
+		Action:       bridge.ReactionAction(reaction.Action),
+		RequestID:    item.TransportRequestID,
 	}
 	closeLease = false
 	result, sendErr := callTransport(s, ctx, item, reactionOperation, s.transportTimeout,
@@ -1193,6 +1223,40 @@ func (s *MessageService) markSendUncertain(
 	return nil
 }
 
+// conversationRef describes the stored conversation an operation goes to: its
+// remote ID, kind and roster, plus this account's own identities, so an
+// adapter that looks the remote conversation up first can refuse one that now
+// names other people.
+func (s *MessageService) conversationRef(conversation sqlite.Conversation) (bridge.ConversationRef, error) {
+	peers, err := s.store.ListConversationPeerIdentities(conversation.AccountID, conversation.ConversationID)
+	if err != nil {
+		return bridge.ConversationRef{}, err
+	}
+	self, err := s.store.ListSelfIdentities(conversation.AccountID)
+	if err != nil {
+		return bridge.ConversationRef{}, err
+	}
+	return bridge.ConversationRef{
+		RemoteID: conversation.RemoteConversationID,
+		Kind:     string(conversation.Kind),
+		Peers:    identityKeyRefs(peers),
+		Self:     identityKeyRefs(self),
+	}, nil
+}
+
+// identityKeyRefs carries identities' natural keys only: an adapter compares
+// them, and has no use for names or raw addresses.
+func identityKeyRefs(identities []sqlite.Identity) []bridge.IdentityRef {
+	refs := make([]bridge.IdentityRef, 0, len(identities))
+	for _, identity := range identities {
+		refs = append(refs, bridge.IdentityRef{
+			Kind:      string(identity.Kind),
+			Canonical: identity.CanonicalValue,
+			IsSelf:    identity.IsSelf,
+		})
+	}
+	return refs
+}
 func retryableFailure(class bridge.FailureClass) bool {
 	switch class {
 	case bridge.FailureTransient,
@@ -1210,7 +1274,8 @@ func terminalFailure(class bridge.FailureClass) bool {
 		bridge.FailureReauthRequired,
 		bridge.FailureUpgradeRequired,
 		bridge.FailureMisconfigured,
-		bridge.FailureUnsupported:
+		bridge.FailureUnsupported,
+		bridge.FailureRecipientMismatch:
 		return true
 	default:
 		return false
