@@ -120,8 +120,9 @@ openmessage import whatsapp /path/to/chat.txt --name "Your Name"
 sync loops, or schedulers — the app daemon owns all live connections (two
 processes sharing WhatsApp/signal-cli credentials log each other out). Reads
 come from the local store (v2 when the daemon reports v2-primary for the same
-data dir); sends, reactions, and `get_status` route through the running
-daemon's HTTP API (`internal/localapi`) with the CLI's daemon-truth semantics.
+data dir); sends, reactions, transcripts, and `get_status` route through the
+running daemon's HTTP API (`internal/localapi`) with the CLI's daemon-truth
+semantics.
 The client opens the store via `app.NewClient`, which skips the startup repair
 sweeps — those stay daemon-owned, so N concurrent sessions don't each burst
 repair writes into the live `messages.db`.
@@ -166,7 +167,11 @@ range tool labels rows in that same local time. The stats/story/viz tools
 (`conversation_stats`, `generate_story`,
 `person_stats`, `generate_person_story`, `generate_viz`, `render_story`) still
 load full histories from the legacy store, which froze at cutover, so they
-return an error naming the working read tools instead.
+return an error naming the working read tools instead. `set_message_transcript`
+refuses on v2-primary too: transcripts live only in the legacy store (the v2
+store has no place for them, and `migrate` counts and drops them), so no read
+would show one saved there. In client mode on a legacy-primary install it
+saves through the app's `POST /api/transcript`.
 
 ### HTTP API
 
@@ -215,6 +220,11 @@ return an error naming the working read tools instead.
   `idempotency_key` required), returns the outbox submission immediately.
   Details: [docs/agent-runbook.md](docs/agent-runbook.md) ("Reactions on
   v2-primary go through the outbox").
+- `POST /api/transcript` — `{message_id, transcript, model?}` saves a
+  transcript in the legacy store (an empty transcript clears it, an omitted
+  model keeps the stored one) and answers with `transcript_model`, the model
+  the message now carries. A v2-primary daemon answers 409: the v2 store keeps
+  no transcripts.
 
 ### Schema
 

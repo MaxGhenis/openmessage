@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -360,6 +361,73 @@ func TestSubmitReactionPostsToTheOutbox(t *testing.T) {
 	}))
 	if _, err := empty.SubmitReaction(context.Background(), ReactionSubmission{MessageID: "m", Emoji: "👍", IdempotencyKey: "k"}); err == nil {
 		t.Fatal("expected an error for a response without outbox_id")
+	}
+}
+
+// SetTranscript keeps the legacy store's rules on the wire: a nil model is
+// left out so the daemon keeps the stored one, an empty model is sent so the
+// daemon clears it, and an empty transcript is sent rather than dropped.
+func TestSetTranscriptKeepsTheModelRulesOnTheWire(t *testing.T) {
+	var mu sync.Mutex
+	var bodies []map[string]any
+	client := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		if r.Method != http.MethodPost || r.URL.Path != "/api/transcript" {
+			t.Errorf("request = %s %s", r.Method, r.URL.Path)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer secret" {
+			t.Errorf("Authorization = %q", got)
+		}
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode: %v", err)
+		}
+		bodies = append(bodies, body)
+		answer := map[string]any{"success": true, "message_id": body["message_id"], "transcript_length": 2}
+		if len(bodies) == 1 {
+			answer["transcript_model"] = "whisper"
+		}
+		json.NewEncoder(w).Encode(answer)
+	}))
+	client.Token = "secret"
+
+	empty := ""
+	saved, err := client.SetTranscript(context.Background(), "msg", "hi", nil)
+	if err != nil {
+		t.Fatalf("SetTranscript(nil model): %v", err)
+	}
+	if !saved.Success || saved.MessageID != "msg" || saved.TranscriptLength != 2 || saved.TranscriptModel == nil || *saved.TranscriptModel != "whisper" {
+		t.Fatalf("SetTranscript(nil model) = %+v", saved)
+	}
+	older, err := client.SetTranscript(context.Background(), "msg", "", &empty)
+	if err != nil {
+		t.Fatalf("SetTranscript(empty model): %v", err)
+	}
+	if older.TranscriptModel != nil {
+		t.Fatalf("an answer without transcript_model decoded as %q, want nil", *older.TranscriptModel)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if _, sent := bodies[0]["model"]; sent {
+		t.Fatalf("a nil model was sent: %v", bodies[0])
+	}
+	if model, sent := bodies[1]["model"]; !sent || model != "" {
+		t.Fatalf("an empty model was not sent as \"\": %v", bodies[1])
+	}
+	if transcript, sent := bodies[1]["transcript"]; !sent || transcript != "" {
+		t.Fatalf("an empty transcript was not sent as \"\": %v", bodies[1])
+	}
+
+	refused := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusConflict)
+		json.NewEncoder(w).Encode(map[string]any{"error": "transcripts are not available while v2 is the serving store"})
+	}))
+	if _, err := refused.SetTranscript(context.Background(), "msg", "hi", nil); err == nil {
+		t.Fatal("expected a ResponseError for a refused transcript")
+	} else if responseErr, ok := AsResponseError(err); !ok || responseErr.StatusCode != http.StatusConflict {
+		t.Fatalf("SetTranscript() error = %v", err)
 	}
 }
 

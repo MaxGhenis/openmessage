@@ -662,6 +662,79 @@ func TestSetTranscriptCountsCharacters(t *testing.T) {
 	}
 }
 
+func seedTranscriptVoiceNote(t *testing.T, store *db.Store) {
+	t.Helper()
+	if err := store.UpsertConversation(&db.Conversation{ConversationID: "c1", Name: "Alice", LastMessageTS: 100}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertMessage(&db.Message{
+		MessageID:      "audio-1",
+		ConversationID: "c1",
+		Body:           "[Voice note]",
+		MediaID:        "media-1",
+		MimeType:       "audio/ogg",
+		TimestampMS:    100,
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The answer names the model the message carries after the save, so a caller
+// that omitted the model learns which one the store kept.
+func TestSetTranscriptReportsTheStoredModel(t *testing.T) {
+	ts := newTestServer(t)
+	seedTranscriptVoiceNote(t, ts.store)
+
+	for _, step := range []struct{ body, wantModel string }{
+		{`{"message_id":"audio-1","transcript":"hello","model":"whisper-large-v3"}`, "whisper-large-v3"},
+		{`{"message_id":"audio-1","transcript":"refined"}`, "whisper-large-v3"},
+		{`{"message_id":"audio-1","transcript":""}`, ""},
+	} {
+		resp, err := http.Post(ts.server.URL+"/api/transcript", "application/json", strings.NewReader(step.body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got map[string]any
+		decodeErr := json.NewDecoder(resp.Body).Decode(&got)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK || decodeErr != nil {
+			t.Fatalf("POST %s: status %d, decode %v", step.body, resp.StatusCode, decodeErr)
+		}
+		if model, ok := got["transcript_model"].(string); !ok || model != step.wantModel {
+			t.Fatalf("POST %s: transcript_model = %#v, want %q", step.body, got["transcript_model"], step.wantModel)
+		}
+	}
+}
+
+// A v2-primary daemon refuses transcripts. The v2 store keeps none, and the
+// legacy store this route writes froze at the cutover, so reads, which serve
+// v2, would never show one saved there. The refusal says why, and the legacy
+// store stays as it was.
+func TestSetTranscriptRefusedWhileV2IsTheServingStore(t *testing.T) {
+	ts := newTestServerWithOptions(t, APIOptions{V2Primary: true})
+	seedTranscriptVoiceNote(t, ts.store)
+
+	resp, err := http.Post(ts.server.URL+"/api/transcript", "application/json", strings.NewReader(`{"message_id":"audio-1","transcript":"hello world","model":"whisper"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("got status %d, want 409: %s", resp.StatusCode, body)
+	}
+	if !strings.Contains(string(body), "not available while v2 is the serving store") {
+		t.Fatalf("body = %s, want the v2 refusal", body)
+	}
+	msg, err := ts.store.GetMessageByID("audio-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if msg.Transcript != "" || msg.TranscribedAtMS != 0 || msg.TranscriptModel != "" {
+		t.Fatalf("the legacy store holds a transcript: %q (model %q, at %d)", msg.Transcript, msg.TranscriptModel, msg.TranscribedAtMS)
+	}
+}
+
 func TestGetMessagesWithLimit(t *testing.T) {
 	ts := newTestServer(t)
 

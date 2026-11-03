@@ -83,7 +83,7 @@ func RegisterWithOptions(s *server.MCPServer, a *app.App, options Options) {
 	default:
 		s.AddTool(reactToMessageTool(), reactToMessageHandler(a))
 	}
-	s.AddTool(setMessageTranscriptTool(), setMessageTranscriptHandler(a))
+	s.AddTool(setMessageTranscriptTool(), setMessageTranscriptHandler(a, options))
 	s.AddTool(listConversationsTool(), listConversationsHandler(a, options))
 	s.AddTool(listContactsTool(), listContactsHandler(a))
 	s.AddTool(resolveContactRoutesTool(), resolveContactRoutesHandler(a))

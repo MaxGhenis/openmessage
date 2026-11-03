@@ -807,6 +807,12 @@ running app:
   #140, with the same do-not-resend idempotency contract. With the app closed,
   send tools return an actionable "start the OpenMessage app" error — they
   never fall back to opening their own connections.
+- **Transcripts save through the daemon too** (`/api/transcript`), so the
+  client never writes the live `messages.db` itself. On a v2-primary install
+  `set_message_transcript` refuses, in the client and in the app: transcripts
+  live only in the legacy store, which froze at cutover (the v2 store has no
+  place for them, and `migrate` counts and drops them), so a read would never
+  show one saved there.
 - Escape hatches: `--transports` forces the old standalone full-stack stdio
   behavior (only for machines where the MCP process is the *only* OpenMessage
   process, ever); `--no-transports` strips transports from a **legacy-mode**
