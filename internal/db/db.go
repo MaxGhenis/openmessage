@@ -151,9 +151,11 @@ func New(dsn string) (*Store, error) {
 // process holds the write lock, or committed after the read, its first write
 // fails at once with SQLITE_BUSY. Saving a message reads the stored body
 // before it writes, and the daemon shares this file with CLI and MCP
-// processes.
+// processes. An empty DSN, SQLite's private temporary database, stays empty:
+// the driver reads options only after a file name, so "?_txlock=immediate"
+// would name a file.
 func withImmediateWriteTransactions(dsn string) string {
-	if strings.Contains(dsn, "_txlock=") {
+	if dsn == "" || strings.Contains(dsn, "_txlock=") {
 		return dsn
 	}
 	sep := "?"
@@ -304,8 +306,22 @@ INSERT OR IGNORE INTO unified_contacts (unified_id, display_name, identifiers) V
 
 INSERT OR IGNORE INTO drafts VALUES('draft1','conv3','Count me in for Saturday! Lands End trail looks clear — 62°F and sunny. Want me to bring snacks?',1738961000000);
 	`
-	_, err := s.db.Exec(inserts)
-	return err
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(inserts); err != nil {
+		return err
+	}
+	// The inserts bypass the save path, so the search index learns of them
+	// here. Demo stores are small; a rebuild is exact whatever they held.
+	if s.ftsEnabled {
+		if err := rebuildSearchIndexTx(tx); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 func (s *Store) migrate() error {

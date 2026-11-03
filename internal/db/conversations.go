@@ -110,6 +110,13 @@ func (s *Store) MergeConversationIDs(sourceID, targetID string) error {
 	if sourceID == "" || targetID == "" || sourceID == targetID {
 		return nil
 	}
+	// Most calls find nothing to merge, so look before beginning: a write
+	// transaction starts with BEGIN IMMEDIATE and waits for any other
+	// process's writer.
+	var exists bool
+	if err := s.db.QueryRow(`SELECT EXISTS (SELECT 1 FROM conversations WHERE conversation_id = ?)`, sourceID).Scan(&exists); err != nil || !exists {
+		return err
+	}
 
 	tx, err := s.db.Begin()
 	if err != nil {

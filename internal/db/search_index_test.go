@@ -377,12 +377,72 @@ func TestSaveTouchesSearchIndexOnlyWhenTheBodyChanges(t *testing.T) {
 	if got, want := searchIndexEntries(t, store), []string{"m0\x00first needle", "m1\x00haystack"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("search index after an edit = %q, want %q", got, want)
 	}
-	got, err := store.SearchMessages("needle", "", 10)
+	// Search the index itself: SearchMessages answers from LIKE over messages
+	// whenever the index query fails or finds nothing.
+	rows, err := store.db.Query(`SELECT message_id FROM messages_fts WHERE messages_fts MATCH '"needle"' ORDER BY message_id`)
 	if err != nil {
-		t.Fatalf("SearchMessages(needle): %v", err)
+		t.Fatalf("MATCH needle: %v", err)
 	}
-	if len(got) != 1 || got[0].MessageID != "m0" {
-		t.Fatalf("search for the old body = %+v, want only m0", got)
+	defer rows.Close()
+	var matched []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		matched = append(matched, id)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("MATCH needle: %v", err)
+	}
+	if !reflect.DeepEqual(matched, []string{"m0"}) {
+		t.Fatalf("index search for the old body = %q, want only m0", matched)
+	}
+}
+
+// SeedDemo writes its rows with plain inserts, so it indexes them itself.
+func TestSeedDemoIndexesItsMessages(t *testing.T) {
+	store := newTestStore(t)
+	if !store.ftsEnabled {
+		t.Skip("fts index not enabled in this sqlite build")
+	}
+	if err := store.SeedDemo(); err != nil {
+		t.Fatalf("SeedDemo(): %v", err)
+	}
+	got, want := searchIndexEntries(t, store), messageEntries(t, store)
+	if len(want) == 0 || !reflect.DeepEqual(got, want) {
+		t.Fatalf("search index after SeedDemo = %d entries, want the %d messages", len(got), len(want))
+	}
+}
+
+// A merge with no source conversation returns before beginning a write
+// transaction, so another process's writer doesn't hold it up.
+func TestMergeConversationIDsWithNoSourceSkipsTheWriteLock(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "messages.db")
+	store, err := New(path)
+	if err != nil {
+		t.Fatalf("New(): %v", err)
+	}
+	defer store.Close()
+	other, err := New(path)
+	if err != nil {
+		t.Fatalf("New(other): %v", err)
+	}
+	defer other.Close()
+	holder, err := other.db.Begin()
+	if err != nil {
+		t.Fatalf("Begin(other): %v", err)
+	}
+	defer holder.Rollback()
+	if _, err := holder.Exec(`UPDATE conversations SET name = name`); err != nil {
+		t.Fatalf("take the write lock: %v", err)
+	}
+	start := time.Now()
+	if err := store.MergeConversationIDs("absent", "target"); err != nil {
+		t.Fatalf("MergeConversationIDs(absent): %v", err)
+	}
+	if waited := time.Since(start); waited > time.Second {
+		t.Fatalf("MergeConversationIDs(absent) waited %v for another writer", waited)
 	}
 }
 
@@ -534,6 +594,7 @@ func TestUpsertMessageWaitsForAnotherConnectionsWriteLock(t *testing.T) {
 
 func TestWithImmediateWriteTransactions(t *testing.T) {
 	for dsn, want := range map[string]string{
+		"":                                  "",
 		":memory:":                          ":memory:?_txlock=immediate",
 		"/tmp/messages.db":                  "/tmp/messages.db?_txlock=immediate",
 		"file:messages.db?mode=rwc":         "file:messages.db?mode=rwc&_txlock=immediate",
