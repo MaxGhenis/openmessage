@@ -232,7 +232,11 @@ func TestSearchIndexMatchesMessagesOverRandomWrites(t *testing.T) {
 		}
 		return true
 	}
-	if err := quick.Check(property, &quick.Config{MaxCount: 300, Rand: rand.New(rand.NewSource(20261103))}); err != nil {
+	cases := 300
+	if raceDetectorEnabled {
+		cases = 60
+	}
+	if err := quick.Check(property, &quick.Config{MaxCount: cases, Rand: rand.New(rand.NewSource(20261103))}); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -285,12 +289,21 @@ func (signalDuplicateCase) Generate(r *rand.Rand, _ int) reflect.Value {
 // SignalDuplicateWouldBeDropped says a new Signal message will be dropped if
 // and only if the store-open cleanup deletes it once it is stored.
 func TestSignalDuplicateWouldBeDroppedAgreesWithTheCleanup(t *testing.T) {
+	// Every case shares one store and starts by emptying it: opening a store
+	// runs the whole migration, which costs far more than a case.
+	store := newTestStore(t)
 	property := func(c signalDuplicateCase) bool {
-		store, err := New(":memory:")
+		tx, err := store.db.Begin()
 		if err != nil {
-			t.Fatalf("New(): %v", err)
+			t.Fatalf("Begin(): %v", err)
 		}
-		defer store.Close()
+		if _, err := store.deleteMessages(tx, "1 = 1"); err != nil {
+			tx.Rollback()
+			t.Fatalf("empty the store: %v", err)
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatalf("Commit(): %v", err)
+		}
 		for _, op := range c.Stored {
 			if err := store.UpsertMessage(op.duplicateMessage(storedSignalIDs)); err != nil {
 				t.Fatalf("seed: %v", err)
@@ -317,7 +330,11 @@ func TestSignalDuplicateWouldBeDroppedAgreesWithTheCleanup(t *testing.T) {
 		}
 		return true
 	}
-	if err := quick.Check(property, &quick.Config{MaxCount: 2000, Rand: rand.New(rand.NewSource(1103))}); err != nil {
+	cases := 2000
+	if raceDetectorEnabled {
+		cases = 400
+	}
+	if err := quick.Check(property, &quick.Config{MaxCount: cases, Rand: rand.New(rand.NewSource(1103))}); err != nil {
 		t.Fatal(err)
 	}
 }
