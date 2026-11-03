@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -19,6 +21,7 @@ type resilienceFixture struct {
 	raw        *sql.DB
 	sender     *scriptedTextSender
 	submission Submission
+	failures   chan FailedDispatchPass
 
 	stopped chan struct{}
 	runErr  error
@@ -49,8 +52,18 @@ func newResilienceFixture(t *testing.T, key, trigger string) *resilienceFixture 
 		raw:        raw,
 		sender:     sender,
 		submission: submission,
+		failures:   make(chan FailedDispatchPass, 64),
 		stopped:    make(chan struct{}),
 	}
+	service.OnPassFailure(func(err error, pass FailedDispatchPass) {
+		if err == nil || err.Error() != pass.Error {
+			t.Errorf("OnPassFailure(%v, %+v): error and pass disagree", err, pass)
+		}
+		select {
+		case f.failures <- pass:
+		default:
+		}
+	})
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
 		f.runErr = service.Run(ctx)
@@ -90,30 +103,29 @@ func (f *resilienceFixture) dropTrigger(t *testing.T, name string) {
 	}
 }
 
-// settled waits for the queued text to settle while Run keeps running.
-func (f *resilienceFixture) settled(t *testing.T) Delivery {
+// confirmed waits for the queued text to be confirmed while Run keeps
+// running. Wait alone would return at not_dispatched, which lease recovery
+// passes through on the way to a retry.
+func (f *resilienceFixture) confirmed(t *testing.T) {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	type waited struct {
-		delivery Delivery
-		err      error
-	}
-	result := make(chan waited, 1)
-	go func() {
-		delivery, err := f.service.Wait(ctx, f.submission.OutboxID)
-		result <- waited{delivery, err}
-	}()
-	select {
-	case got := <-result:
-		if got.err != nil {
-			t.Fatalf("Wait(): %v; row = %+v", got.err, mustOutboxItem(t, f.service, f.submission.OutboxID))
+	deadline := time.After(5 * time.Second)
+	for {
+		changes := f.service.Changes()
+		delivery, err := f.service.Get(context.Background(), f.submission.OutboxID)
+		if err != nil {
+			t.Fatalf("Get(): %v", err)
 		}
-		return got.delivery
-	case <-f.stopped:
-		t.Fatalf("Run() returned %v before the text settled", f.runErr)
+		if delivery.State == OutboxConfirmed {
+			return
+		}
+		select {
+		case <-changes:
+		case <-f.stopped:
+			t.Fatalf("Run() returned %v before the text was confirmed", f.runErr)
+		case <-deadline:
+			t.Fatalf("text not confirmed; row = %+v", mustOutboxItem(t, f.service, f.submission.OutboxID))
+		}
 	}
-	return Delivery{}
 }
 
 // One failed lease must not stop the dispatcher. On 2026-11-03 LeaseDue's
@@ -134,13 +146,51 @@ func TestRunKeepsDispatchingAfterAFailedLease(t *testing.T) {
 	if got := mustOutboxItem(t, f.service, f.submission.OutboxID); got.State != sqlite.OutboxQueued || got.AttemptCount != 0 {
 		t.Fatalf("row while leases fail = %+v, want queued with no attempt", got)
 	}
+	for want := int64(1); want <= 2; want++ {
+		pass := <-f.failures
+		if pass.Consecutive != want || !strings.Contains(pass.Error, "injected lease failure") {
+			t.Fatalf("failed pass %d = %+v, want consecutive %d naming the injected failure", want, pass, want)
+		}
+		if pass.RetryAtMS <= pass.AtMS {
+			t.Fatalf("failed pass %d retries at %d, not after it failed at %d", want, pass.RetryAtMS, pass.AtMS)
+		}
+	}
+	health := f.service.DispatchHealth()
+	if health.FailedPasses < 2 || health.ConsecutiveFailedPasses < 2 || health.LastFailedPass == nil {
+		t.Fatalf("health while leases fail = %+v, want two or more failed passes in a row", health)
+	}
 
 	f.dropTrigger(t, "fail_lease")
-	if delivery := f.settled(t); delivery.State != OutboxConfirmed {
-		t.Fatalf("delivery = %+v, want confirmed", delivery)
-	}
+	f.confirmed(t)
 	if got := f.sender.requestCount(); got != 1 {
 		t.Fatalf("transport requests = %d, want 1", got)
+	}
+	// The pass that sent the text ended the run of failures; the history
+	// stays.
+	f.passEnded(t)
+	recovered := f.service.DispatchHealth()
+	if recovered.ConsecutiveFailedPasses != 0 || recovered.FailedPasses < health.FailedPasses || recovered.LastFailedPass == nil {
+		t.Fatalf("health after recovery = %+v, want no current failures and the earlier ones kept", recovered)
+	}
+}
+
+func TestNextPassBackoffDoublesUpToTheLongestPollDelay(t *testing.T) {
+	const shortest, longest = 10 * time.Millisecond, 45 * time.Millisecond
+	var backoff time.Duration
+	var got []time.Duration
+	for range 5 {
+		backoff = nextPassBackoff(backoff, shortest, longest)
+		got = append(got, backoff)
+	}
+	want := []time.Duration{shortest, 20 * time.Millisecond, 40 * time.Millisecond, longest, longest}
+	if !slices.Equal(got, want) {
+		t.Fatalf("backoffs = %v, want %v", got, want)
+	}
+	if got := nextPassBackoff(0, time.Hour, time.Minute); got != time.Hour {
+		t.Fatalf("backoff with the shortest delay above the longest = %v, want the shortest", got)
+	}
+	if got := nextPassBackoff(0, 0, time.Minute); got != defaultPollDelay {
+		t.Fatalf("backoff with no shortest delay = %v, want %v", got, defaultPollDelay)
 	}
 }
 
@@ -171,9 +221,7 @@ func TestRunRecoversALeaseItsFailedPassLeftBehind(t *testing.T) {
 	}
 
 	f.clock.Advance(f.service.leaseTime)
-	if delivery := f.settled(t); delivery.State != OutboxConfirmed {
-		t.Fatalf("delivery = %+v, want confirmed", delivery)
-	}
+	f.confirmed(t)
 	if got := f.sender.requestCount(); got != 1 {
 		t.Fatalf("transport requests = %d, want 1", got)
 	}

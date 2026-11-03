@@ -13,42 +13,49 @@ import (
 	"github.com/maxghenis/openmessage/internal/storage/sqlite"
 )
 
-// Run recovers expired work once at startup and then periodically dispatches
-// due durable intents until ctx is canceled.
+// Run dispatches due durable intents in passes until ctx is canceled, and
+// returns only then. Each pass recovers expired leases, repairs store-failed
+// confirmations and dispatches what is due.
+//
+// A pass that fails on local storage does not end Run. On 2026-11-03 one
+// failed lease UPDATE returned from Run, and nothing left the outbox again
+// until the app restarted. Run now records the failure (DispatchHealth and the
+// OnPassFailure hook), waits a backoff that starts at the poll delay and
+// doubles up to the longest poll delay, and tries again. A lease the failed
+// pass left behind expires, and the next pass's recovery makes it dispatchable
+// again, or uncertain if its transport call was made.
 func (s *MessageService) Run(ctx context.Context) error {
 	if ctx == nil {
 		return fmt.Errorf("run message service: context is nil")
 	}
-	recovered, err := s.outbox.RecoverExpiredLeases(ctx, s.clock.Now())
-	if err != nil {
-		// Cancellation mid-query surfaces as a driver interrupt, not
-		// context.Canceled, so a shutdown race would read as a startup fault.
-		// As in DispatchDue's lease path, surface the cancellation itself.
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return ctxErr
-		}
-		return fmt.Errorf("run message service: recover expired leases: %w", err)
-	}
-	if recovered.NotDispatched > 0 || recovered.Uncertain > 0 {
-		s.signalChange()
-	}
-
+	var backoff time.Duration
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if _, err := s.reconcileStoreFailedDue(ctx, s.batchLimit); err != nil {
+		if err := s.dispatchPass(ctx); err != nil {
+			// Cancellation mid-query surfaces as a driver interrupt, not
+			// context.Canceled, so a shutdown race would read as a failed
+			// pass. As in DispatchDue's lease path, surface the cancellation
+			// itself.
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return ctxErr
 			}
-			return fmt.Errorf("run message service: reconcile store-failed deliveries: %w", err)
-		}
-		if _, err := s.DispatchDue(ctx, s.batchLimit); err != nil {
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				return ctxErr
+			backoff = nextPassBackoff(backoff, s.pollDelay, s.maxPollDelay)
+			s.passes.fail(fmt.Errorf("run message service: %w", err), s.clock.Now(), backoff)
+			// Only time ends the backoff: a wake from a new submission would
+			// turn a storage fault that persists into a tight retry loop.
+			timer := s.clock.NewTimer(backoff)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return ctx.Err()
+			case <-timer.C():
 			}
-			return fmt.Errorf("run message service: %w", err)
+			continue
 		}
+		backoff = 0
+		s.passes.succeed()
 
 		timer := s.clock.NewTimer(s.nextPollDelay(ctx))
 		select {
@@ -60,6 +67,42 @@ func (s *MessageService) Run(ctx context.Context) error {
 		case <-timer.C():
 		}
 	}
+}
+
+// dispatchPass is one round of Run. It recovers expired leases on every pass,
+// not only at startup, so a lease that a failed pass or a crashed process left
+// behind is freed once it expires. Passes run one at a time, and no pass ends
+// with a call in flight (a call past its bound is abandoned and its intent
+// marked uncertain), so recovery never takes the lease of a live call.
+func (s *MessageService) dispatchPass(ctx context.Context) error {
+	recovered, err := s.outbox.RecoverExpiredLeases(ctx, s.clock.Now())
+	if err != nil {
+		return fmt.Errorf("recover expired leases: %w", err)
+	}
+	if recovered.NotDispatched > 0 || recovered.Uncertain > 0 {
+		s.signalChange()
+	}
+	if _, err := s.reconcileStoreFailedDue(ctx, s.batchLimit); err != nil {
+		return fmt.Errorf("reconcile store-failed deliveries: %w", err)
+	}
+	if _, err := s.DispatchDue(ctx, s.batchLimit); err != nil {
+		return err
+	}
+	return nil
+}
+
+// nextPassBackoff is how long Run waits after a failed pass: the shortest
+// poll delay after the first failure, doubling with each failure in a row up
+// to the longest poll delay.
+func nextPassBackoff(previous, shortest, longest time.Duration) time.Duration {
+	if shortest <= 0 {
+		shortest = defaultPollDelay
+	}
+	longest = max(longest, shortest)
+	if previous < shortest {
+		return shortest
+	}
+	return min(previous*2, longest)
 }
 
 // DispatchDue claims and synchronously processes at most limit due intents.

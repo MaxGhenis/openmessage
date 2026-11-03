@@ -230,6 +230,18 @@ one is out, plus `abandoned_calls`, `abandoned_still_running` and
 returning at all. For Google, libgm now ends an abandoned call within its
 35 s timeout, so that count falls back on its own.
 
+`v2_dispatch` also counts dispatch passes that failed on the local store:
+`failed_passes` since the app started, `consecutive_failed_passes` since the
+last pass that worked (above zero, sends are failing now), and
+`last_failed_pass` (`at_ms`, `error`, `consecutive`, `retry_at_ms`). Each
+failure also logs `V2 message dispatch pass failed; retrying`. The loop retries
+after 1 s, doubling to 30 s while failures continue, and a lease that a failed
+pass left behind becomes dispatchable again when it expires (30 s), or
+`uncertain` if its transport call was made. Builds before PR #274 instead
+logged `V2 message dispatcher stopped` and sent nothing more until the app
+restarted; on 2026-11-03 a lease that failed the outbox's
+`updated_at_ms >= created_at_ms` CHECK stopped them that way.
+
 **On a build without the fix:** quit and reopen the app. Startup lease recovery
 marks the stuck row `uncertain` (its call was made, so it is not resent) and
 the queued rows dispatch. To tell whether the stuck message went out, look in

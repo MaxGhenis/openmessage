@@ -451,6 +451,12 @@ func TestStatusReportsV2DispatchHealth(t *testing.T) {
 	if _, inFlight := health["in_flight"]; inFlight {
 		t.Fatalf("v2_dispatch = %s, want no in-flight call while idle", raw)
 	}
+	if health["failed_passes"] != float64(0) || health["consecutive_failed_passes"] != float64(0) {
+		t.Fatalf("v2_dispatch = %s, want zero failed passes", raw)
+	}
+	if _, failed := health["last_failed_pass"]; failed {
+		t.Fatalf("v2_dispatch = %s, want no last failed pass", raw)
+	}
 
 	disabled := newV1RecorderHarness(t, APIOptions{})
 	resp := disabled.do(t, httptest.NewRequest(http.MethodGet, "http://127.0.0.1/api/status", nil))
