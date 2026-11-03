@@ -1162,6 +1162,51 @@ func accountForPlatform(platform string) (accountSpec, error) {
 	return account, nil
 }
 
+// ConversationPlacement reports where Transform files a legacy conversation:
+// the account for its stored source platform, and its remote conversation ID
+// normalized for that platform. ok is false for a platform Transform rejects.
+// The stored platform alone decides the account; an ID prefix does not.
+func ConversationPlacement(
+	sourcePlatform string,
+	legacyConversationID string,
+) (accountID string, remoteConversationID string, ok bool) {
+	account, err := accountForPlatform(sourcePlatform)
+	if err != nil {
+		return "", "", false
+	}
+	return account.AccountID, v2keys.NormalizeRemoteConversationID(account.Platform, legacyConversationID), true
+}
+
+// Placement is an account and remote conversation ID that Transform can file a
+// legacy conversation under.
+type Placement struct {
+	AccountID            string
+	RemoteConversationID string
+}
+
+// ConversationPlacements lists every placement Transform could have given this
+// legacy conversation ID: one per platform it migrates, deduplicated, in
+// account ID order. A conversation's stored platform can change in the legacy
+// store after migration, so a caller looking for the row a migration already
+// wrote must check them all rather than recompute one from current metadata.
+func ConversationPlacements(legacyConversationID string) []Placement {
+	platforms := sortedAccountPlatforms(platformAccounts)
+	placements := make([]Placement, 0, len(platforms))
+	seen := make(map[Placement]bool, len(platforms))
+	for _, platform := range platforms {
+		accountID, remoteID, ok := ConversationPlacement(platform, legacyConversationID)
+		if !ok {
+			continue
+		}
+		placement := Placement{AccountID: accountID, RemoteConversationID: remoteID}
+		if !seen[placement] {
+			seen[placement] = true
+			placements = append(placements, placement)
+		}
+	}
+	return placements
+}
+
 func minLegacyTimestamp(dataset legacyDataset) int64 {
 	minimum := int64(0)
 	consider := func(value int64) {
