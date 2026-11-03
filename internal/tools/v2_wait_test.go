@@ -222,7 +222,8 @@ func TestV2DeliveryTextExplainsARecipientMismatch(t *testing.T) {
 	})
 	for _, fragment := range []string{
 		"NOT sent", "outbox-moved", "now names other people", "do not resend", "send from the phone",
-		"for a direct conversation, usually the person's next message", "for a group, the phone listing a thread with exactly its members",
+		"only on live traffic from the phone, never on a catch-up",
+		"for a direct conversation, usually the person's next message", "for a group, a live update from the phone naming a thread with exactly its members",
 	} {
 		if !strings.Contains(text, fragment) {
 			t.Fatalf("recipient_mismatch text missing %q: %q", fragment, text)

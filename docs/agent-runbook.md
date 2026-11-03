@@ -329,11 +329,16 @@ proves nothing and sends. On a contradiction nothing goes out:
   now names other people`, with counts of each side's people;
 - the refusal leaves the receive lifecycle alone, since the phone answered.
 
-A direct thread moves to its peer's new number when the peer's next message
-arrives (`googleIncomingConversation`) or when the phone lists a thread with
-that peer alone (`googleConversationEventTarget`), and sends work again. A
-group moves when the phone lists a thread whose members match the group's
-exactly. Until then, send from the phone.
+Only live traffic moves a thread to its new number. A catch-up or backfill
+never does, because history never moves a binding. A direct thread usually
+moves when its peer's next message arrives live (`googleIncomingConversation`)
+or when the phone pushes a live update for a thread with that peer alone
+(`googleConversationEventTarget`), and sends work again. A live message leaves
+the binding alone when v2 binds its number to a group, or to a direct thread
+with no stored peers or with the sender already in it. When the peer has more
+than one direct thread, the most recently active one takes the number. A group
+moves when the phone pushes a live update for a thread whose members match the
+group's exactly. Until then, send from the phone.
 
 The check leaves three gaps:
 
@@ -343,11 +348,12 @@ The check leaves three gaps:
   together: group membership changes legitimately, and a stricter rule for
   sends alone would refuse threads that ingest treats as the same group.
 - **Reactions to old messages.** A reaction names its target by message ID
-  alone (Google's `SendReactionRequest` carries no thread). When the new phone
-  re-serves a text message from before the swap, ingest skips the copy as a
-  duplicate of the stored one, so the stored row keeps the old phone's ID. A
-  reaction to that message lands on whatever message the ID names on the new
-  phone, even in a thread whose binding the check accepts.
+  alone (Google's `SendReactionRequest` carries no thread). Every message
+  stored before the swap keeps the old phone's ID: ingest skips a re-served
+  text copy as a duplicate of the stored row, stores a media-only copy as a
+  new row, and never rewrites a stored message's ID. A reaction to one of
+  those messages lands on whatever message the ID names on the new phone, even
+  in a thread whose binding the check accepts.
 - **Read receipts** don't look the thread up, so the check doesn't cover them.
 
 **Repairing history after a reset** (daemon must be down — the command takes
