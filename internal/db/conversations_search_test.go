@@ -376,7 +376,11 @@ func TestSearchConversationsByMetadataAgreesWithTheFlaggedOwnerModel(t *testing.
 		}
 		return true
 	}
-	if err := quick.Check(property, &quick.Config{MaxCount: 200, Rand: rand.New(rand.NewSource(20261103))}); err != nil {
+	cases := 200
+	if raceDetectorEnabled {
+		cases = 40
+	}
+	if err := quick.Check(property, &quick.Config{MaxCount: cases, Rand: rand.New(rand.NewSource(20261103))}); err != nil {
 		t.Fatal(err)
 	}
 	for _, path := range []string{

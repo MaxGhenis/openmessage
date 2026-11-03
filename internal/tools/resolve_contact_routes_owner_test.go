@@ -164,7 +164,11 @@ func TestResolveContactRoutesThreadsThatListOnlyTheOwnerNeverHideAPerson(t *test
 		}
 		return true
 	}
-	if err := quick.Check(property, &quick.Config{MaxCount: 24, Rand: rand.New(rand.NewSource(20261103))}); err != nil {
+	cases := 24
+	if raceDetectorEnabled {
+		cases = 8
+	}
+	if err := quick.Check(property, &quick.Config{MaxCount: cases, Rand: rand.New(rand.NewSource(20261103))}); err != nil {
 		t.Fatal(err)
 	}
 	for _, path := range []string{

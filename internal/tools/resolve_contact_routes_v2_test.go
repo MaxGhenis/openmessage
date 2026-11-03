@@ -826,7 +826,11 @@ func TestResolveContactRoutesReturnsOnlyServingStoreThreadsOfThePerson(t *testin
 		}
 		return true
 	}
-	if err := quick.Check(property, &quick.Config{MaxCount: 160, Rand: rand.New(rand.NewSource(20261103))}); err != nil {
+	cases := 160
+	if raceDetectorEnabled {
+		cases = 80
+	}
+	if err := quick.Check(property, &quick.Config{MaxCount: cases, Rand: rand.New(rand.NewSource(20261103))}); err != nil {
 		t.Fatal(err)
 	}
 	for _, path := range []string{

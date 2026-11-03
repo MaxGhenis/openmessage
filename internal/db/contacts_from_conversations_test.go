@@ -228,7 +228,11 @@ func TestListContactsFromConversationsAgreesWithTheModel(t *testing.T) {
 		}
 		return true
 	}
-	if err := quick.Check(property, &quick.Config{MaxCount: 120, Rand: rand.New(rand.NewSource(20261103))}); err != nil {
+	cases := 120
+	if raceDetectorEnabled {
+		cases = 30
+	}
+	if err := quick.Check(property, &quick.Config{MaxCount: cases, Rand: rand.New(rand.NewSource(20261103))}); err != nil {
 		t.Fatal(err)
 	}
 	for _, path := range []string{"a query with contacts", "a match behind more owner-only threads than 20 times the limit"} {
