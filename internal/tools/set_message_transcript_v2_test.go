@@ -2,6 +2,7 @@ package tools
 
 import (
 	"context"
+	"fmt"
 	"math/rand"
 	"net/http"
 	"net/http/httptest"
@@ -311,7 +312,8 @@ type transcriptScript struct {
 
 func (transcriptScript) Generate(r *rand.Rand, _ int) reflect.Value {
 	messageIDs := []string{"voice-note", "voice-note", "voice-note", "no-such-message", ""}
-	transcripts := []any{"", "hello", "hé🙂", "hello again", strings.Repeat("x", db.MaxTranscriptBytes+1), 42}
+	// "<" at the limit: JSON escaping makes the app's request six times its length.
+	transcripts := []any{"", "hello", "hé🙂", "hello again", strings.Repeat("<", db.MaxTranscriptBytes), strings.Repeat("x", db.MaxTranscriptBytes+1), 42}
 	models := []any{"", "whisper", "faster-whisper:base.en", strings.Repeat("m", db.MaxTranscriptModelBytes+1), 7}
 	calls := make([]map[string]any, 1+r.Intn(12))
 	for i := range calls {
@@ -333,6 +335,14 @@ type transcriptState struct {
 	Stamped    bool
 }
 
+func (s transcriptState) String() string {
+	transcript := s.Transcript
+	if len(transcript) > 24 {
+		transcript = fmt.Sprintf("%.12s… (%d bytes)", transcript, len(transcript))
+	}
+	return fmt.Sprintf("{transcript %q, model %q, stamped %v}", transcript, s.Model, s.Stamped)
+}
+
 func voiceNoteTranscript(t *testing.T, store *db.Store) transcriptState {
 	t.Helper()
 	message, err := store.GetMessageByID("voice-note")
@@ -340,6 +350,19 @@ func voiceNoteTranscript(t *testing.T, store *db.Store) transcriptState {
 		t.Fatalf("reload voice-note: %v", err)
 	}
 	return transcriptState{Transcript: message.Transcript, Model: message.TranscriptModel, Stamped: message.TranscribedAtMS != 0}
+}
+
+// describeCall prints a call's arguments with long strings cut short, so a
+// failure log stays readable.
+func describeCall(call map[string]any) string {
+	short := make(map[string]any, len(call))
+	for key, value := range call {
+		if text, ok := value.(string); ok && len(text) > 24 {
+			value = fmt.Sprintf("%.12s… (%d bytes)", text, len(text))
+		}
+		short[key] = value
+	}
+	return fmt.Sprint(short)
 }
 
 // savedSummary is the "(N chars, model=...)." tail both serving modes put on
@@ -397,21 +420,21 @@ func TestSetMessageTranscriptServingModesAgreeProperty(t *testing.T) {
 			case want.IsError != got.IsError,
 				want.IsError && wantText != gotText,
 				!want.IsError && savedSummary(wantText) != savedSummary(gotText):
-				t.Logf("call %d %v: in process %q (error %v), client mode %q (error %v)", i, call, wantText, want.IsError, gotText, got.IsError)
+				t.Logf("call %d %v: in process %q (error %v), client mode %q (error %v)", i, describeCall(call), wantText, want.IsError, gotText, got.IsError)
 				return false
 			}
 			if wantState, gotState := voiceNoteTranscript(t, inProcess.Store), voiceNoteTranscript(t, appStore); wantState != gotState {
-				t.Logf("call %d %v: in-process store %+v, app's store %+v", i, call, wantState, gotState)
+				t.Logf("call %d %v: in-process store %+v, app's store %+v", i, describeCall(call), wantState, gotState)
 				return false
 			}
 			if state := voiceNoteTranscript(t, client.Store); state != (transcriptState{}) {
-				t.Logf("call %d %v: client mode wrote its own store: %+v", i, call, state)
+				t.Logf("call %d %v: client mode wrote its own store: %+v", i, describeCall(call), state)
 				return false
 			}
 			for _, tool := range v2Tools {
 				refusal := callTranscriptTool(t, tool, copyOf(call))
 				if text := resultText(t, refusal); !refusal.IsError || !strings.Contains(text, v2RefusalText) {
-					t.Logf("call %d %v on v2: %q (error %v), want the v2 refusal", i, call, text, refusal.IsError)
+					t.Logf("call %d %v on v2: %q (error %v), want the v2 refusal", i, describeCall(call), text, refusal.IsError)
 					return false
 				}
 			}

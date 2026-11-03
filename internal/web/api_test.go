@@ -679,6 +679,51 @@ func seedTranscriptVoiceNote(t *testing.T, store *db.Store) {
 	}
 }
 
+// A transcript at the length limit saves even when JSON escaping makes its
+// request six times longer than the text, as Go's encoder does for "<". The
+// MCP tool's client mode sends every transcript this way, and the tool in
+// process accepts it. A body past the request bound is still refused.
+func TestSetTranscriptAcceptsAnEscapedTranscriptAtTheLimit(t *testing.T) {
+	ts := newTestServer(t)
+	seedTranscriptVoiceNote(t, ts.store)
+
+	atLimit := strings.Repeat("<", db.MaxTranscriptBytes)
+	payload, err := json.Marshal(map[string]string{"message_id": "audio-1", "transcript": atLimit, "model": strings.Repeat("&", db.MaxTranscriptModelBytes)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(payload) < 6*db.MaxTranscriptBytes {
+		t.Fatalf("payload is %d bytes; the test needs the escaped form", len(payload))
+	}
+	resp, err := http.Post(ts.server.URL+"/api/transcript", "application/json", bytes.NewReader(payload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("got status %d, want 200: %s", resp.StatusCode, body)
+	}
+	msg, err := ts.store.GetMessageByID("audio-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if msg.Transcript != atLimit {
+		t.Fatalf("stored a %d-byte transcript, want the %d bytes sent", len(msg.Transcript), len(atLimit))
+	}
+
+	oversized := `{"message_id":"` + strings.Repeat("m", maxTranscriptRequestBytes) + `","transcript":"x"}`
+	resp, err = http.Post(ts.server.URL+"/api/transcript", "application/json", strings.NewReader(oversized))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusRequestEntityTooLarge || !strings.Contains(string(body), "transcript request too large") {
+		t.Fatalf("got status %d, want 413 for a body past the bound: %s", resp.StatusCode, body)
+	}
+}
+
 // The answer names the model the message carries after the save, so a caller
 // that omitted the model learns which one the store kept.
 func TestSetTranscriptReportsTheStoredModel(t *testing.T) {

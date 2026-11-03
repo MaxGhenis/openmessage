@@ -48,7 +48,12 @@ var staticFS embed.FS
 // production.
 var maxUploadBytes int64 = messaging.DefaultMaxMediaBytes
 
-const maxTranscriptRequestBytes = db.MaxTranscriptBytes + db.MaxTranscriptModelBytes + 4096
+// maxTranscriptRequestBytes bounds an /api/transcript body. JSON escaping can
+// spend 6 bytes on one byte of text (Go's encoder writes "<" as <), so
+// the bound leaves room for that on a transcript and model at their limits,
+// plus the message ID and the JSON around them. The limits themselves are
+// checked on the decoded text.
+const maxTranscriptRequestBytes = 6*(db.MaxTranscriptBytes+db.MaxTranscriptModelBytes) + 4096
 
 // transcriptsUnavailableInV2Primary is /api/transcript's refusal on a
 // v2-primary daemon. The v2 store keeps no transcripts (the legacy->v2
