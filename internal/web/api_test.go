@@ -679,10 +679,11 @@ func seedTranscriptVoiceNote(t *testing.T, store *db.Store) {
 	}
 }
 
-// A transcript at the length limit saves even when JSON escaping makes its
-// request six times longer than the text, as Go's encoder does for "<". The
-// MCP tool's client mode sends every transcript this way, and the tool in
-// process accepts it. A body past the request bound is still refused.
+// The route saves a transcript at the length limit even when JSON escaping
+// makes its request six times longer than the text, as Go's encoder does for
+// "<". The MCP tool's client mode sends every transcript this way, and the
+// tool in process accepts it. The route still refuses a body past the request
+// bound.
 func TestSetTranscriptAcceptsAnEscapedTranscriptAtTheLimit(t *testing.T) {
 	ts := newTestServer(t)
 	seedTranscriptVoiceNote(t, ts.store)

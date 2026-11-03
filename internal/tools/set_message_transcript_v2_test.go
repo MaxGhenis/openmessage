@@ -165,12 +165,12 @@ func appAPI(t *testing.T, store *db.Store, options web.APIOptions) *localapi.Cli
 	return localapi.NewClient(server.URL, "")
 }
 
-// Replays set_message_transcript on a migrated (v2-primary) install, served
-// in-process. The read tools hand out v2 message IDs, which the legacy store
-// doesn't hold, and they read v2, which keeps no transcripts, so a transcript
-// saved to legacy is one no read shows. The tool must refuse and say why, for the
-// ID an agent got from get_messages and for a legacy ID alike, and leave the
-// legacy store as it was.
+// Replays set_message_transcript in process on a migrated (v2-primary)
+// install. The read tools hand out v2 message IDs, which the legacy store
+// doesn't hold, and they read v2, which keeps no transcripts, so no read shows
+// a transcript the tool saves to legacy. The tool must refuse and say why, for
+// the ID an agent got from get_messages and for a legacy ID alike, and leave
+// the legacy store as it was.
 func TestSetMessageTranscriptRefusesWhileV2IsTheServingStore(t *testing.T) {
 	a := testApp(t)
 	seedLegacyVoiceNote(t, a.Store, "legacy-voice-note")
@@ -225,13 +225,12 @@ func TestSetMessageTranscriptClientModeRefusesWhileV2IsTheServingStore(t *testin
 	assertNoTranscript(t, a.Store, "legacy-voice-note", "the legacy store")
 }
 
-// In client mode the app owns every write to the live stores, so the tool
-// saves a transcript through the app's local API, as the send tools do, and
-// never writes the store this process opened. The test gives the two
-// processes separate stores, in place of the one file they share on an
-// install, to tell which process wrote. The legacy semantics survive the
+// In client mode the tool saves a transcript through the app's local API, as
+// the send tools do, and never writes the store this process opened. The test
+// gives the two processes separate stores, in place of the one file they share
+// on an install, to tell which process wrote. The legacy semantics survive the
 // trip: an omitted model keeps the stored one, an empty transcript clears
-// the transcript and its model, and an unknown ID is "message not found".
+// the transcript and its model, and an unknown ID gets "message not found".
 func TestSetMessageTranscriptClientModeSavesThroughTheApp(t *testing.T) {
 	a := testApp(t)
 	seedLegacyVoiceNote(t, a.Store, "voice-note")
@@ -381,9 +380,9 @@ func savedSummary(text string) string {
 //     and the store that took the save holds the same transcript, model and
 //     stamp (set or cleared);
 //   - client mode never writes the store its own process opened;
-//   - on a v2-primary install every call is refused with the v2 reason, in
-//     process and in client mode, whatever its arguments; neither legacy store
-//     changes, and client mode never asks the app.
+//   - on a v2-primary install every call gets the v2 refusal, in process and
+//     in client mode, whatever its arguments; neither legacy store changes,
+//     and client mode never asks the app.
 func TestSetMessageTranscriptServingModesAgreeProperty(t *testing.T) {
 	property := func(script transcriptScript) bool {
 		inProcess := testApp(t)
@@ -456,9 +455,9 @@ func TestSetMessageTranscriptServingModesAgreeProperty(t *testing.T) {
 	}
 }
 
-// A client that started while the app was closed, with no v2 hint in its
-// environment, serves the legacy store, and the app it later reaches is
-// v2-primary. The app refuses the transcript, and the tool passes on why.
+// A client that started before the app, with no v2 hint in its environment,
+// serves the legacy store, and the app it later reaches runs v2-primary. The
+// app refuses the transcript, and the tool passes on why.
 func TestSetMessageTranscriptClientModeReportsAV2PrimaryAppsRefusal(t *testing.T) {
 	a := testApp(t)
 	seedLegacyVoiceNote(t, a.Store, "voice-note")
