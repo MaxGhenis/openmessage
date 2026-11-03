@@ -266,7 +266,7 @@ func (s *Store) ApplyRepairPlan(ctx context.Context, accountID string, steps []R
 					conversation_id, account_id, remote_conversation_id, kind, title,
 					notification_mode, metadata_json, created_at_ms, updated_at_ms
 				) VALUES (?, ?, ?, ?, ?, 'all', '{}', ?, ?)
-			`, step.ConversationID, accountID, step.RemoteConversationID, step.Kind, step.Title, createdAt, nowMS)
+			`, step.ConversationID, accountID, step.RemoteConversationID, step.Kind, step.Title, createdAt, max(nowMS, createdAt))
 			if stepErr != nil {
 				break
 			}

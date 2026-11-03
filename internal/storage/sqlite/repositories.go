@@ -99,7 +99,7 @@ func (s *Store) UpsertAccount(account Account) error {
 			mode = excluded.mode,
 			enabled = excluded.enabled,
 			config_json = excluded.config_json,
-			updated_at_ms = excluded.updated_at_ms
+			updated_at_ms = MAX(accounts.updated_at_ms, excluded.updated_at_ms)
 	`,
 		account.AccountID,
 		account.BridgeKey,
@@ -201,7 +201,7 @@ func (s *Store) UpsertDevice(device Device) error {
 			state = excluded.state,
 			is_current = excluded.is_current,
 			last_seen_at_ms = excluded.last_seen_at_ms,
-			updated_at_ms = excluded.updated_at_ms
+			updated_at_ms = MAX(devices.updated_at_ms, excluded.updated_at_ms)
 	`,
 		device.DeviceID,
 		device.AccountID,
@@ -304,7 +304,7 @@ func (s *Store) UpsertIdentity(identity Identity) error {
 			display_name = excluded.display_name,
 			is_self = excluded.is_self,
 			metadata_json = excluded.metadata_json,
-			updated_at_ms = excluded.updated_at_ms
+			updated_at_ms = MAX(identities.updated_at_ms, excluded.updated_at_ms)
 	`,
 		identity.IdentityID,
 		identity.AccountID,
@@ -673,7 +673,7 @@ func (s *Store) UpsertConversation(conversation Conversation) error {
 			archived_at_ms = excluded.archived_at_ms,
 			last_message_at_ms = excluded.last_message_at_ms,
 			metadata_json = excluded.metadata_json,
-			updated_at_ms = excluded.updated_at_ms
+			updated_at_ms = MAX(conversations.updated_at_ms, excluded.updated_at_ms)
 	`,
 		conversation.ConversationID,
 		conversation.AccountID,

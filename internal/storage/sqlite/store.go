@@ -1,4 +1,14 @@
 // Package sqlite provides the clean-slate OpenMessage SQLite store.
+//
+// No write moves updated_at_ms backward on the tables whose CHECK requires
+// updated_at_ms >= created_at_ms (accounts, devices, identities, people,
+// conversations, messages, outbox, message_attachments, reactions). An UPDATE
+// sets MAX(updated_at_ms, now) and an upsert sets
+// MAX(<table>.updated_at_ms, excluded.updated_at_ms). A writer's time can
+// predate the row it changes: it read the clock before a concurrent insert
+// committed, or the wall clock stepped back. A plain now would then fail the
+// CHECK. The larger value is also the truer time, since the write commits after
+// the one that set it.
 package sqlite
 
 import (
