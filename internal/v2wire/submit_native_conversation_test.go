@@ -153,3 +153,78 @@ func sqliteStoreForProperty(t *testing.T) *sqlite.Store {
 	}
 	return store
 }
+
+// The property above draws these collisions only now and then, and none of
+// its fewer draws under -race, so they run here every time. A key that is
+// one conversation's v2 ID and another's remote ID sends to the conversation
+// the v2 ID names. A remote ID that two accounts share, and that no
+// conversation has as its v2 ID, is refused and queues nothing.
+func TestSubmitTextV2SendsToTheV2IDWhenIDsCollide(t *testing.T) {
+	type thread struct{ id, account, remote string }
+	tests := map[string]struct {
+		threads []thread
+		key     string
+		want    string // the conversation the send reaches; empty when refused
+	}{
+		"a v2 ID that is also another thread's remote ID": {
+			threads: []thread{{"c0", "account-a", "2957"}, {"2957", "account-b", "c0"}},
+			key:     "2957", want: "2957",
+		},
+		"the same key as a v2 ID and a remote ID under one account": {
+			threads: []thread{{"c0", "account-a", "c1"}, {"c1", "account-a", "3100"}},
+			key:     "c1", want: "c1",
+		},
+		"a remote ID that two accounts share": {
+			threads: []thread{{"c0", "account-a", "3100"}, {"c1", "account-b", "3100"}},
+			key:     "3100",
+		},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			v2 := sqliteStoreForProperty(t)
+			defer v2.Close()
+			now := time.Now().UnixMilli()
+			caps := map[string]bridge.CapabilitySet{}
+			for _, account := range []string{"account-a", "account-b"} {
+				caps[account] = bridge.CapabilitySet{TextSend: true}
+				if err := v2.UpsertAccount(sqlite.Account{
+					AccountID: account, BridgeKey: "google_messages", DisplayName: account,
+					Mode: sqlite.AccountModeLive, Enabled: true, ConfigJSON: "{}",
+					CreatedAtMS: now, UpdatedAtMS: now,
+				}); err != nil {
+					t.Fatalf("UpsertAccount(%s): %v", account, err)
+				}
+			}
+			accounts := map[string]string{}
+			for _, thread := range test.threads {
+				if err := v2.UpsertConversation(sqlite.Conversation{
+					ConversationID: thread.id, AccountID: thread.account, RemoteConversationID: thread.remote,
+					Kind: sqlite.ConversationKindDirect, NotificationMode: sqlite.NotificationModeAll,
+					MetadataJSON: "{}", CreatedAtMS: now, UpdatedAtMS: now,
+				}); err != nil {
+					t.Fatalf("UpsertConversation(%s): %v", thread.id, err)
+				}
+				accounts[thread.id] = thread.account
+			}
+			registry := submitTestRegistry{caps: caps}
+			service := newSubmitTestService(t, v2, registry, nil)
+			submission, err := SubmitTextV2(context.Background(), NativeDeps{V2: v2, Service: service, Registry: registry}, TextInput{
+				ConversationID: test.key, Body: "collision", IdempotencyKey: "collision-key",
+			})
+			pending, listErr := service.ListPending(context.Background(), messaging.ListPendingQuery{Limit: 10})
+			if listErr != nil {
+				t.Fatalf("ListPending(): %v", listErr)
+			}
+			if test.want == "" {
+				if !errors.Is(err, ErrUnknownConversation) || !errors.Is(err, sqlite.ErrNotFound) || len(pending) != 0 {
+					t.Fatalf("send to %q: err=%v, pending=%+v; want ErrUnknownConversation and nothing queued", test.key, err, pending)
+				}
+				return
+			}
+			if err != nil || len(pending) != 1 || pending[0].OutboxID != submission.OutboxID ||
+				pending[0].ConversationID != test.want || pending[0].AccountID != accounts[test.want] {
+				t.Fatalf("send to %q: err=%v, pending=%+v; want one queued send to %s under %s", test.key, err, pending, test.want, accounts[test.want])
+			}
+		})
+	}
+}
