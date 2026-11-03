@@ -314,9 +314,11 @@ up there. On a v2-primary daemon:
   - MCP `import_messages` (every MCP server registers it, the stdio client
     included) and `openmessage import` import into the legacy store.
 - **Other legacy-only writes.**
-  - Drafts, transcripts (`set_message_transcript`, `/api/transcript`) and the
-    `contacts` table live only in legacy. v2 holds the people and identities
-    the cutover migration built from those contacts.
+  - Drafts and the `contacts` table live only in legacy. v2 holds the people
+    and identities the cutover migration built from those contacts.
+  - `set_message_transcript` and `/api/transcript` save transcripts to
+    legacy, since v2 has no transcript columns. Draft #269 proposes refusing
+    both on v2-primary.
   - The web UI keeps its own state there: tabs, favorites, notification
     modes, and the People view's tags, reach-out reminders and summaries.
     `/api/new-conversation` writes a legacy conversation row for a new
