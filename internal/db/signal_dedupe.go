@@ -54,9 +54,12 @@ func (s *Store) dedupeSignalMessages() error {
 // store doesn't hold yet. It compares lengths in SQL, as the ranking does, so
 // both count characters the same way.
 //
-// Signal Desktop's archive holds some messages the store already keeps under
-// another ID. Skipping them keeps every periodic full rescan from inserting
-// rows that the next store open deletes again.
+// The store still holds some Signal messages under IDs from before v0.2.9,
+// whose hash included the body. The importer derives another ID for each, and
+// when the stored row ranks first (often only on the message_id tie-break),
+// the cleanup deletes the imported copy. Skipping such a copy keeps every
+// periodic full rescan from inserting rows that the next store open deletes
+// again.
 func (s *Store) SignalDuplicateWouldBeDropped(m *Message) (bool, error) {
 	if m.SourcePlatform != "signal" || m.TimestampMS <= 0 {
 		return false, nil
