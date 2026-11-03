@@ -71,9 +71,11 @@ func (s *MessageService) Run(ctx context.Context) error {
 
 // dispatchPass is one round of Run. It recovers expired leases on every pass,
 // not only at startup, so a lease that a failed pass or a crashed process left
-// behind is freed once it expires. Passes run one at a time, and no pass ends
-// with a call in flight (a call past its bound is abandoned and its intent
-// marked uncertain), so recovery never takes the lease of a live call.
+// behind is freed once it expires. Recovery never causes a resend: passes run
+// one at a time, a pass stops waiting on a call past its bound and marks its
+// intent uncertain, and recovery requeues only a lease whose transport call
+// never started (MarkTransportCalled commits before every call); a lease whose
+// call started becomes uncertain.
 func (s *MessageService) dispatchPass(ctx context.Context) error {
 	recovered, err := s.outbox.RecoverExpiredLeases(ctx, s.clock.Now())
 	if err != nil {
