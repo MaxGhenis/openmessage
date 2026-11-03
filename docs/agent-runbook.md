@@ -969,20 +969,30 @@ running app:
   thread numbers are device-local and a phone change re-numbers them (#176,
   #177; "Google thread ids are device-local" above), so an old number can
   name another person's thread.
-  The route tool finds a person by their number in any written form,
-  comparing the last ten digits as `send_message` does for a recipient (v2
-  stores E.164; the legacy store keeps numbers as the address book writes
-  them), and by a name that only the legacy store holds. It skips the
-  account's owner, whom most threads in both stores list: a thread that a
-  query matches only through the owner's entry or the owner's own messages is
-  no route, while a title that holds the owner's name still matches. v2's
-  conversation search (`SearchConversationsByName`, which also serves
-  `/api/search`) skips the owner's identity in SQL. It matches both a
-  participant row's name and the identity's name, while reads show only one
-  of them, so the route tool keeps every v2 hit and drops owner-only hits
-  from the legacy store alone. The legacy search matches only incoming
-  messages' senders, since the owner's outgoing messages carry the owner's
-  name and number.
+  The route tool finds a person by their number in any written form, comparing
+  the last ten digits as `send_message` does for a recipient (v2 stores E.164;
+  the legacy store keeps numbers as the address book writes them), and by a
+  name that only the legacy store holds. On legacy reads it searches for those
+  ten digits as text, so a number that the legacy store keeps with separators,
+  such as "(555) 555-0123", turns up only for a query that matches the stored
+  text, or by name. It skips the account's owner, whom most threads in both
+  stores list: a thread that a query matches only through the owner's entry or
+  the owner's own messages is no route, while a title that holds the owner's
+  name still matches. v2's conversation search (`SearchConversationsByName`,
+  which also serves `/api/search`) skips the owner's identity in SQL. The
+  legacy search (`SearchConversationsByMetadata`, which also serves
+  `openmessage thread` and, on a legacy-primary app, `/api/search`) skips
+  participant entries flagged as the owner's (`is_me` or `isMe` set to JSON
+  true) and matches only incoming messages' senders, since the owner's
+  outgoing messages carry the owner's name and number. Both searches skip the
+  owner before their limit, so newer threads that list only the owner and one
+  other person can't push a match out of the results, and both match `%` and
+  `_` literally. The route tool keeps every hit of either search, and when it
+  falls back to the contacts in legacy threads
+  (`ListContactsFromConversations`), that list skips flagged entries too and
+  reads past any number of threads that yield none. An entry that holds the
+  owner's name or number without the flag still matches: the WhatsApp text
+  importer lists every sender, the owner included, with no flag.
   Before the fix for the 2026-11-03 (UTC) incident, `resolve_contact_routes`
   read the legacy store on a v2-primary install and handed out Google thread
   numbers, which the outbox refused with a bare 404 `not found`, while
@@ -996,10 +1006,14 @@ running app:
   `TestResolveContactRoutesFindsPeopleByAnyFormOfTheirNumber`,
   `TestInProcessSendsTakeTheIDsResolveContactRoutesReturns`,
   `TestResolveContactRoutesIgnoresTheAccountOwner`,
+  `TestResolveContactRoutesKeepsAThreadThatOnlyAnIncomingSenderMatches`,
+  `TestResolveContactRoutesFindsAPersonBehindThreadsThatListOnlyTheOwner`,
   `TestResolveContactRoutesKeepsV2MatchesOnANameReadsHide` and
   `TestResolveContactRoutesReturnsOnlyServingStoreThreadsOfThePerson`
   (internal/tools), `TestSearchConversationsByMetadataSkipsTheAccountOwner`
-  (internal/v2read), `TestSearchConversationsByMetadataSkipsTheOwnersOwnMessages`
+  (internal/v2read), `TestSearchConversationsByMetadataSkipsTheOwnersOwnMessages`,
+  `TestSearchConversationsByMetadataSkipsEntriesFlaggedAsTheOwners`,
+  `TestListContactsFromConversationsReadsPastThreadsThatListOnlyTheOwner`
   (internal/db), `TestSubmitTextV2SendsOnlyToTheConversationItsIDNames`
   (internal/v2wire).
 - Escape hatches: `--transports` forces the old standalone full-stack stdio

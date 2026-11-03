@@ -63,6 +63,38 @@ func TestListContactsFromConversationsReadsPastThreadsThatListOnlyTheOwner(t *te
 	}
 }
 
+// A thread whose participants don't decode offers its title instead, and
+// those titles count toward the limit like any other contact. A limit below
+// one returns nothing.
+func TestListContactsFromConversationsKeepsToTheLimitWhenParticipantsDontDecode(t *testing.T) {
+	store := newTestStore(t)
+	var conversations []*Conversation
+	for index, participants := range []string{"", "not json", `["Bob Example"]`} {
+		conversations = append(conversations, &Conversation{
+			ConversationID: fmt.Sprintf("group-%d", index), Name: fmt.Sprintf("Group %d", index),
+			LastMessageTS: int64(100 + index), SourcePlatform: "sms", Participants: participants,
+		})
+	}
+	seedSearchStore(t, store, conversations, nil, nil)
+
+	got, err := store.ListContactsFromConversations("Group", 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if keys := conversationContactKeys(got); fmt.Sprint(keys) != "[group-2/Group 2/ group-1/Group 1/]" {
+		t.Errorf("contacts for %q, limit 2 = %v, want the two newest titles", "Group", keys)
+	}
+	for _, limit := range []int{0, -1} {
+		got, err := store.ListContactsFromConversations("Group", limit)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 0 {
+			t.Errorf("contacts for %q, limit %d = %v, want none", "Group", limit, conversationContactKeys(got))
+		}
+	}
+}
+
 // conversationContactsModel is a reference for ListContactsFromConversations.
 // Threads go newest first. A thread whose participants don't decode as a list
 // of entries offers its title; otherwise each entry not flagged as the

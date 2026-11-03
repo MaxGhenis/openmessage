@@ -155,21 +155,6 @@ func findRouteConversations(reads readsource.ReadSource, people *db.Store, query
 			addConversation(conv)
 		}
 	}
-	// The legacy store's search matches a thread by its title or by any
-	// participant's name or number, and the legacy store lists the account's
-	// owner in most threads. A thread that text matches only through the
-	// owner says nothing about whom to send to. v2's search skips the owner
-	// itself, and it matches names that reads don't show, so its hits stay.
-	_, legacyReads := reads.(*db.Store)
-	addSearchHits := func(text string, convos []*db.Conversation) {
-		for _, conv := range convos {
-			if legacyReads && matchesOnlyTheOwner(conv, text) {
-				continue
-			}
-			addConversation(conv)
-		}
-	}
-
 	// Only an exact ID names a conversation here. The v2 read source also
 	// resolves a platform's thread ID (#155), but a stale Google thread
 	// number can name another person's thread now (#177), and this tool says
@@ -178,11 +163,16 @@ func findRouteConversations(reads readsource.ReadSource, people *db.Store, query
 		addConversation(conv)
 	}
 
+	// Most threads list the account's owner, and a thread that a query
+	// matches only through the owner says nothing about whom to send to. Both
+	// stores' searches skip the owner before their limit: v2's skips the
+	// owner's identity, and the legacy store's skips participant entries
+	// flagged as the owner's and the owner's own messages.
 	convos, err := reads.SearchConversationsByMetadata(query, limit)
 	if err != nil {
 		return nil, err
 	}
-	addSearchHits(query, convos)
+	addConversations(convos)
 	addConversations(phoneLineConversations(reads, query, limit))
 
 	searchNumber := func(number string) {
@@ -191,7 +181,7 @@ func findRouteConversations(reads readsource.ReadSource, people *db.Store, query
 			return
 		}
 		if numberConvos, err := reads.SearchConversationsByMetadata(number, limit); err == nil {
-			addSearchHits(number, numberConvos)
+			addConversations(numberConvos)
 		}
 		addConversations(phoneLineConversations(reads, number, limit))
 	}
@@ -238,7 +228,8 @@ func findRouteConversations(reads readsource.ReadSource, people *db.Store, query
 // matter: v2 stores numbers in E.164 form, while the legacy store and address
 // books keep them as written, and a substring search for "+1 (555) 555-0123"
 // finds no "+15555550123". Text that isn't a phone number returns nothing,
-// and the account's own number matches no thread.
+// and an entry flagged as the account's owner's (is_me or isMe) puts no
+// thread on a line.
 func phoneLineConversations(reads readsource.ReadSource, text string, limit int) []*db.Conversation {
 	if !looksLikePhoneNumber(text) {
 		return nil
@@ -265,50 +256,20 @@ func conversationHasPhoneLine(conv *db.Conversation, line string) bool {
 		return false
 	}
 	var participants []struct {
-		Number string `json:"number"`
-		Phone  string `json:"phone"`
-		IsMe   bool   `json:"is_me"`
+		Number    string `json:"number"`
+		Phone     string `json:"phone"`
+		IsMe      bool   `json:"is_me"`
+		IsMeCamel bool   `json:"isMe"`
 	}
 	if err := json.Unmarshal([]byte(conv.Participants), &participants); err != nil {
 		return false
 	}
 	for _, participant := range participants {
-		if !participant.IsMe && phoneDigitsMatch(line, firstNonEmpty(participant.Number, participant.Phone)) {
+		if !participant.IsMe && !participant.IsMeCamel && phoneDigitsMatch(line, firstNonEmpty(participant.Number, participant.Phone)) {
 			return true
 		}
 	}
 	return false
-}
-
-// matchesOnlyTheOwner reports whether text, ignoring case, appears in the
-// name or number of conv's owner entry (is_me) but in neither conv's title
-// nor any other participant's name or number.
-func matchesOnlyTheOwner(conv *db.Conversation, text string) bool {
-	text = strings.ToLower(strings.TrimSpace(text))
-	if conv == nil || text == "" || strings.Contains(strings.ToLower(conv.Name), text) {
-		return false
-	}
-	var participants []struct {
-		Name   string `json:"name"`
-		Number string `json:"number"`
-		Phone  string `json:"phone"`
-		IsMe   bool   `json:"is_me"`
-	}
-	if err := json.Unmarshal([]byte(conv.Participants), &participants); err != nil {
-		return false
-	}
-	owner := false
-	for _, participant := range participants {
-		number := firstNonEmpty(participant.Number, participant.Phone)
-		if !strings.Contains(strings.ToLower(participant.Name), text) && !strings.Contains(strings.ToLower(number), text) {
-			continue
-		}
-		if !participant.IsMe {
-			return false
-		}
-		owner = true
-	}
-	return owner
 }
 
 func buildResolvedRouteMatches(people *db.Store, convos []*db.Conversation, limit int, whatsAppConnected, signalConnected bool) []resolvedRouteMatch {

@@ -110,7 +110,10 @@ func resolveThread(store *db.Store, query string, opts threadOptions) (*threadRe
 		return &threadResult{Conversation: conv, Label: conversationLabel(conv), Messages: msgs}, nil
 	}
 
-	// 2. Resolve by metadata (name / participants / sender name or number).
+	// 2. Resolve by metadata: the title, a participant entry, or the name or
+	//    number of an incoming message's sender. Entries flagged as the
+	//    account's owner's and the owner's own messages don't count, so the
+	//    owner's name or number doesn't match every thread.
 	matches, err := store.SearchConversationsByMetadata(query, 25)
 	if err != nil {
 		return nil, fmt.Errorf("resolve conversation: %w", err)
@@ -127,10 +130,9 @@ func resolveThread(store *db.Store, query string, opts threadOptions) (*threadRe
 		return &threadResult{Matches: matches}, nil
 	}
 
-	// 3. Nothing matched. (A phone number that has any messages always resolves
-	//    in step 2, because SearchConversationsByMetadata matches on participants
-	//    and sender_number; so there is no separate phone path to fall through
-	//    to here — an unmatched query is simply an empty thread.)
+	// 3. Nothing matched: an empty thread. There is no separate phone path.
+	//    Step 2 finds a number only as the store writes it, so "(555)
+	//    555-0123" misses a thread that stores it as "+15555550123".
 	return &threadResult{}, nil
 }
 

@@ -338,36 +338,65 @@ func (s *Store) ListConversationsByPlatform(platform string, limit int) ([]*Conv
 	return scanConversations(rows)
 }
 
-// SearchConversationsByMetadata matches a conversation by its name, its
-// participants, or the sender of a message in it. The owner's outgoing
-// messages carry the owner's name and number, so a sender match on them would
-// return every thread the owner wrote in; sender matches count incoming
-// messages only.
+// SearchConversationsByMetadata matches a conversation by its name, a
+// participant entry, or the sender of a message in it. Most threads list the
+// account's owner, so a participant match skips entries flagged as the
+// owner's (is_me or isMe), or the owner's name or number would find every
+// thread. The owner's outgoing messages carry the owner's name and number
+// too, so sender matches count incoming messages only. The SQL skips both
+// before its LIMIT, so threads that match only through the owner never
+// crowd out a match. The query matches as written: % and _ are no
+// wildcards, as in v2's search.
 func (s *Store) SearchConversationsByMetadata(query string, limit int) ([]*Conversation, error) {
+	pattern := "%" + escapeLikePattern(query) + "%"
 	rows, err := s.db.Query(`
 		SELECT DISTINCT `+conversationColumns+`
 		FROM conversations
-		WHERE name LIKE ?
-			OR participants LIKE ?
+		WHERE name LIKE ? ESCAPE '\'
+			OR EXISTS (
+				SELECT 1
+				FROM `+sqlParticipantEntries("conversations.participants")+` AS p
+				WHERE p.value LIKE ? ESCAPE '\'
+					AND NOT CASE WHEN p.type = 'object' THEN `+sqlOwnerFlag+` ELSE 0 END
+			)
 			OR conversation_id IN (
 				SELECT DISTINCT conversation_id
 				FROM messages
-				WHERE is_from_me = 0 AND (sender_name LIKE ? OR sender_number LIKE ?)
+				WHERE is_from_me = 0 AND (sender_name LIKE ? ESCAPE '\' OR sender_number LIKE ? ESCAPE '\')
 			)
 			OR conversation_id IN (
 				SELECT DISTINCT m.conversation_id
 				FROM messages m
 				JOIN contacts c ON c.number = m.sender_number
-				WHERE m.is_from_me = 0 AND (c.name LIKE ? OR c.number LIKE ?)
+				WHERE m.is_from_me = 0 AND (c.name LIKE ? ESCAPE '\' OR c.number LIKE ? ESCAPE '\')
 			)
 		ORDER BY last_message_ts DESC
 		LIMIT ?
-	`, "%"+query+"%", "%"+query+"%", "%"+query+"%", "%"+query+"%", "%"+query+"%", "%"+query+"%", limit)
+	`, pattern, pattern, pattern, pattern, pattern, pattern, limit)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	return scanConversations(rows)
+}
+
+// sqlOwnerFlag holds for an object entry that carries is_me or isMe. p is a
+// json_each row over a conversation's participants. Only a JSON true counts,
+// and json_type gives NULL for a missing key, hence IS.
+const sqlOwnerFlag = `(json_type(p.value, '$.is_me') IS 'true' OR json_type(p.value, '$.isMe') IS 'true')`
+
+// sqlParticipantEntries is the json_each source for a participants column:
+// the elements of a JSON array, and none for anything else. The JSON
+// functions fail on malformed JSON, such as an empty string, and SQLite can
+// evaluate both sides of an AND, so CASE guards them here and on p.value.
+func sqlParticipantEntries(column string) string {
+	return `json_each(CASE WHEN json_valid(` + column + `) THEN CASE json_type(` + column + `) WHEN 'array' THEN ` + column + ` ELSE '[]' END ELSE '[]' END)`
+}
+
+// escapeLikePattern makes user text match literally inside a LIKE pattern
+// that declares '\' as its escape character.
+func escapeLikePattern(text string) string {
+	return strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(text)
 }
 
 func scanConversations(rows interface {

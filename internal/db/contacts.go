@@ -64,33 +64,39 @@ func (s *Store) ListContacts(query string, limit int) ([]*Contact, error) {
 // The SQL prefilter is a strict superset of the per-participant matching
 // below (the participants JSON contains every name and number verbatim), so
 // it never hides a match — it just keeps a filtered autocomplete keystroke
-// from JSON-decoding every conversation in the store. The row LIMIT bounds
-// worst-case work; it is generous because one row can fan out to many
-// participants and duplicates are dropped.
+// from JSON-decoding every conversation in the store. Rows come newest first
+// and the loop stops once it has limit contacts, but no row limit applies:
+// most threads list the account's owner, so for a name the owner shares,
+// hundreds of newer rows can yield nothing but the owner's entries, which
+// the loop skips, before an older row yields a match. A limit below 1
+// returns nothing.
 func (s *Store) ListContactsFromConversations(query string, limit int) ([]*Contact, error) {
+	if limit < 1 {
+		return nil, nil
+	}
 	queryFilter := strings.ToLower(query)
 	rows, err := s.db.Query(`
 		SELECT conversation_id, name, participants FROM conversations
 		WHERE ? = '' OR instr(lower(name), ?) > 0 OR instr(lower(participants), ?) > 0
 		ORDER BY last_message_ts DESC
-		LIMIT ?
-	`, queryFilter, queryFilter, queryFilter, limit*20)
+	`, queryFilter, queryFilter, queryFilter)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
 	type participant struct {
-		Name   string `json:"name"`
-		Number string `json:"number"`
-		IsMe   bool   `json:"is_me"`
+		Name      string `json:"name"`
+		Number    string `json:"number"`
+		IsMe      bool   `json:"is_me"`
+		IsMeCamel bool   `json:"isMe"`
 	}
 
 	seen := map[string]bool{}
 	var contacts []*Contact
 	queryLower := strings.ToLower(query)
 
-	for rows.Next() {
+	for len(contacts) < limit && rows.Next() {
 		var convID, name, participantsJSON string
 		if err := rows.Scan(&convID, &name, &participantsJSON); err != nil {
 			continue
@@ -112,7 +118,7 @@ func (s *Store) ListContactsFromConversations(query string, limit int) ([]*Conta
 		}
 
 		for _, p := range participants {
-			if p.IsMe {
+			if p.IsMe || p.IsMeCamel {
 				continue
 			}
 			displayName := p.Name
@@ -136,11 +142,10 @@ func (s *Store) ListContactsFromConversations(query string, limit int) ([]*Conta
 				Number:    p.Number,
 			})
 		}
-
-		if len(contacts) >= limit {
-			contacts = contacts[:limit]
-			break
-		}
+	}
+	// One thread can list more matches than the limit leaves room for.
+	if len(contacts) > limit {
+		contacts = contacts[:limit]
 	}
 	return contacts, rows.Err()
 }
