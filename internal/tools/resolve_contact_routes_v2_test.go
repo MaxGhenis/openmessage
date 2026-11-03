@@ -38,12 +38,18 @@ const routeFixtureAccount = "google-primary"
 // Google thread number the legacy store files them under; RemoteThreadID is
 // the number their v2 thread carries now. A phone change re-numbers Google
 // threads (issue #177), so the two can differ, and either may be empty.
+// Number is the E.164 form v2 stores; LegacyNumber, when set, is the form the
+// legacy store keeps, as written in the address book. NamelessInV2 leaves the
+// v2 thread with the number only, as for someone missing from the phone's
+// contacts, so only the legacy store knows the name.
 type routeFixturePerson struct {
 	Name           string
 	Number         string
+	LegacyNumber   string
 	LegacyThreadID string
 	RemoteThreadID string
 	InAddressBook  bool
+	NamelessInV2   bool
 }
 
 // seedRouteFixture writes people into the legacy store and the v2 store and
@@ -72,8 +78,9 @@ func seedRouteFixture(t *testing.T, legacy *db.Store, store *sqlite.Store, peopl
 	threads := map[string]string{}
 	for index, person := range people {
 		lastMS := now - int64(index)
+		legacyNumber := firstNonEmpty(person.LegacyNumber, person.Number)
 		if person.LegacyThreadID != "" {
-			participants, err := json.Marshal([]map[string]string{{"name": person.Name, "number": person.Number}})
+			participants, err := json.Marshal([]map[string]string{{"name": person.Name, "number": legacyNumber}})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -89,7 +96,7 @@ func seedRouteFixture(t *testing.T, legacy *db.Store, store *sqlite.Store, peopl
 		}
 		if person.InAddressBook {
 			if err := legacy.UpsertContact(&db.Contact{
-				ContactID: "contact-" + person.Name, Name: person.Name, Number: person.Number,
+				ContactID: "contact-" + person.Name, Name: person.Name, Number: legacyNumber,
 			}); err != nil {
 				t.Fatalf("seed contact %q: %v", person.Name, err)
 			}
@@ -98,9 +105,13 @@ func seedRouteFixture(t *testing.T, legacy *db.Store, store *sqlite.Store, peopl
 			continue
 		}
 		identityID := "identity-" + strings.ReplaceAll(strings.ToLower(person.Name), " ", "-")
+		displayName := person.Name
+		if person.NamelessInV2 {
+			displayName = ""
+		}
 		if err := store.UpsertIdentity(sqlite.Identity{
 			IdentityID: identityID, AccountID: routeFixtureAccount, Kind: sqlite.IdentityKind("e164"),
-			CanonicalValue: person.Number, RawValue: person.Number, DisplayName: person.Name,
+			CanonicalValue: person.Number, RawValue: person.Number, DisplayName: displayName,
 			MetadataJSON: "{}", CreatedAtMS: now, UpdatedAtMS: now,
 		}); err != nil {
 			t.Fatalf("UpsertIdentity(%s): %v", identityID, err)
@@ -298,6 +309,20 @@ func TestResolveContactRoutesNeverRoutesByAReusedGoogleThreadNumber(t *testing.T
 		})
 	}
 
+	// A thread number names no route either. 2957, Alice's stale legacy ID,
+	// names Bob's thread now, so an agent recovering from a refused 2957 must
+	// not get Bob's thread back; 3100, Alice's thread number today, is just
+	// as device-local.
+	for _, query := range []string{"2957", "3100"} {
+		t.Run("thread number "+query, func(t *testing.T) {
+			matches := routeMatches(t, callRouteTool(t, resolveContactRoutesHandler(h.app, options), map[string]any{"query": query}))
+			if len(matches) != 0 {
+				t.Fatalf("routes for thread number %s = %+v, want none (Alice's thread is %q, Bob's %q)",
+					query, matches, threads["Alice Example"], threads["Bob Example"])
+			}
+		})
+	}
+
 	match := onlyRouteMatch(t, callRouteTool(t, resolveContactRoutesHandler(h.app, options), map[string]any{"query": "Alice"}))
 	sent := callRouteTool(t, daemonSendToConversationHandler(options), map[string]any{
 		"conversation_id": match.PreferredReplyConversationID,
@@ -310,6 +335,124 @@ func TestResolveContactRoutesNeverRoutesByAReusedGoogleThreadNumber(t *testing.T
 	requests := h.sender.snapshotRequests()
 	if len(requests) != 1 || requests[0].Conversation.RemoteID != "3100" {
 		t.Fatalf("transport requests = %+v, want one text to Alice's thread 3100", requests)
+	}
+}
+
+// routeNumberForms lists ways people and address books write a +1 number.
+func routeNumberForms(number string) []string {
+	digits := strings.TrimPrefix(number, "+1")
+	area, exchange, line := digits[:3], digits[3:6], digits[6:]
+	return []string{
+		number,
+		"+1 (" + area + ") " + exchange + "-" + line,
+		"(" + area + ") " + exchange + "-" + line,
+		area + "-" + exchange + "-" + line,
+		area + "." + exchange + "." + line,
+		"1-" + area + "-" + exchange + "-" + line,
+		"+1 " + area + " " + exchange + " " + line,
+		area + exchange + line,
+	}
+}
+
+// v2 stores numbers in E.164 form, while the legacy store keeps them as the
+// address book writes them. A number in any form, or a name that only the
+// legacy store knows, must still find the person's v2 thread: the one
+// send_message picks for that number.
+func TestResolveContactRoutesFindsPeopleByAnyFormOfTheirNumber(t *testing.T) {
+	h := newV2ToolHarness(t)
+	people := []routeFixturePerson{
+		// Only the address book knows Alice's name.
+		{Name: "Alice Example", Number: "+15555550123", LegacyNumber: "+1 (555) 555-0123", LegacyThreadID: "2957", RemoteThreadID: "3100", InAddressBook: true, NamelessInV2: true},
+		// Only a legacy thread knows Carol's name.
+		{Name: "Carol Example", Number: "+15555550177", LegacyNumber: "(555) 555-0177", LegacyThreadID: "3101", RemoteThreadID: "3102", NamelessInV2: true},
+		{Name: "Bob Example", Number: "+15555550199", RemoteThreadID: "2957"},
+	}
+	threads := seedRouteFixture(t, h.app.Store, h.deps.V2Store, people)
+	options := v2PrimaryClientOptions(t, h)
+
+	want := map[string]string{"Alice": "Alice Example", "Carol": "Carol Example", "Bob": "Bob Example"}
+	for _, person := range people {
+		for _, form := range routeNumberForms(person.Number) {
+			want[form] = person.Name
+		}
+	}
+	for query, name := range want {
+		t.Run(query, func(t *testing.T) {
+			match := onlyRouteMatch(t, callRouteTool(t, resolveContactRoutesHandler(h.app, options), map[string]any{"query": query}))
+			if match.PreferredReplyConversationID != threads[name] {
+				t.Fatalf("preferred_reply_conversation_id = %q, want %s's thread %q", match.PreferredReplyConversationID, name, threads[name])
+			}
+			for _, route := range match.Routes {
+				if route.Conversation.ConversationID != threads[name] {
+					t.Fatalf("routes = %+v, want only %s's thread", match.Routes, name)
+				}
+			}
+			if !looksLikePhoneNumber(query) {
+				return
+			}
+			direct, err := findDirectSMSConversation(options.Reads, query)
+			if err != nil || direct == nil || direct.ConversationID != threads[name] {
+				t.Fatalf("send_message's thread for %q = %+v (%v), want %s's thread %q", query, direct, err, name, threads[name])
+			}
+		})
+	}
+}
+
+// In-process serving (the app's own MCP endpoint, or `serve --transports`)
+// takes the same IDs as client mode. send_media_to_conversation looked the ID
+// up in the legacy store before it reached the v2 outbox, so on a v2-primary
+// install it refused every ID the read tools return ("failed to load
+// conversation"), while send_to_conversation took them.
+func TestInProcessSendsTakeTheIDsResolveContactRoutesReturns(t *testing.T) {
+	h := newV2ToolHarness(t)
+	h.deps.V2Primary = true
+	threads := seedRouteFixture(t, h.app.Store, h.deps.V2Store, []routeFixturePerson{
+		{Name: "Alice Example", Number: "+15555550123", LegacyThreadID: "2957", RemoteThreadID: "3100", InAddressBook: true},
+		{Name: "Bob Example", Number: "+15555550199", RemoteThreadID: "2957"},
+	})
+	options := Options{Reads: v2read.New(h.deps.V2Store), V2Primary: true, V2: &h.deps}
+	match := onlyRouteMatch(t, callRouteTool(t, resolveContactRoutesHandler(h.app, options), map[string]any{"query": "Alice"}))
+	if match.PreferredReplyConversationID != threads["Alice Example"] {
+		t.Fatalf("preferred_reply_conversation_id = %q, want Alice's thread %q", match.PreferredReplyConversationID, threads["Alice Example"])
+	}
+	file := filepath.Join(t.TempDir(), "link.png")
+	if err := os.WriteFile(file, []byte("\x89PNG\r\n\x1a\nroute fixture"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	sends := map[string]func(conversationID, key string) *mcp.CallToolResult{
+		"send_to_conversation": func(conversationID, key string) *mcp.CallToolResult {
+			return callRouteTool(t, sendToConversationHandler(h.app, &h.deps), map[string]any{
+				"conversation_id": conversationID, "message": "for Alice", "idempotency_key": key,
+			})
+		},
+		"send_media_to_conversation": func(conversationID, key string) *mcp.CallToolResult {
+			return callRouteTool(t, sendMediaToConversationHandler(h.app, &h.deps), map[string]any{
+				"conversation_id": conversationID, "file_path": file, "idempotency_key": key,
+			})
+		},
+	}
+	for name, send := range sends {
+		t.Run(name, func(t *testing.T) {
+			sent := send(match.PreferredReplyConversationID, "in-process-"+name)
+			if sent.IsError {
+				t.Fatalf("%s(preferred route) failed: %s", name, resultText(t, sent))
+			}
+			if payload := v2ToolPayload(t, sent); payload["ok"] != true || payload["state"] != "confirmed" {
+				t.Fatalf("%s payload = %v, want a confirmed delivery", name, payload)
+			}
+			// 2957 is Alice's legacy thread number, and Bob's thread number now.
+			refused := send("2957", "in-process-2957-"+name)
+			if !refused.IsError || !strings.Contains(resultText(t, refused), "unknown conversation") {
+				t.Fatalf("%s(2957) = %s, want an unknown-conversation refusal", name, resultText(t, refused))
+			}
+		})
+	}
+	if requests := h.sender.snapshotRequests(); len(requests) != 1 || requests[0].Conversation.RemoteID != "3100" {
+		t.Fatalf("text requests = %+v, want one to Alice's thread 3100", requests)
+	}
+	if requests := h.media.snapshotRequests(); len(requests) != 1 || requests[0].ConversationID != "3100" {
+		t.Fatalf("media requests = %+v, want one to Alice's thread 3100", requests)
 	}
 }
 
@@ -374,12 +517,14 @@ func TestResolveContactRoutesClientModeAsksTheAppWhichPlatformsCanSend(t *testin
 
 // Invariants, over random re-numberings of Google threads: every conversation
 // ID resolve_contact_routes returns names a conversation in the serving store,
-// so the send tools accept it; and a person's routes are threads that person
-// is in, however the legacy store files them. Each person's legacy thread
+// so the send tools accept it; a person's routes are threads that person is
+// in, however the legacy store files them; a thread number yields no route;
+// and the tool finds everyone the stores can identify, by their number in any
+// form or by a name either store still holds. Each person's legacy thread
 // number and current v2 thread number come from one small pool, so legacy
 // numbers collide, overwrite each other and name other people's v2 threads.
-// Differential: for a phone number, send_message's own thread lookup and
-// resolve_contact_routes pick the same thread.
+// Differential: for a phone number in any form, send_message's own thread
+// lookup and resolve_contact_routes pick the same thread.
 func TestResolveContactRoutesReturnsOnlyServingStoreThreadsOfThePerson(t *testing.T) {
 	names := []string{"Alice Example", "Bob Example", "Carol Example", "Dave Example"}
 	pool := []string{"2957", "3100", "3101", "3102", "3103"}
@@ -401,10 +546,14 @@ func TestResolveContactRoutesReturnsOnlyServingStoreThreadsOfThePerson(t *testin
 		remote := random.Perm(len(pool))
 		people := make([]routeFixturePerson, 0, len(names))
 		for index, name := range names {
+			number := "+1555555010" + strconv.Itoa(index)
+			forms := routeNumberForms(number)
 			person := routeFixturePerson{
 				Name:          name,
-				Number:        "+1555555010" + strconv.Itoa(index),
+				Number:        number,
+				LegacyNumber:  forms[random.Intn(len(forms))],
 				InAddressBook: random.Intn(2) == 0,
+				NamelessInV2:  random.Intn(3) == 0,
 			}
 			if random.Intn(4) != 0 {
 				person.LegacyThreadID = pool[random.Intn(len(pool))]
@@ -416,15 +565,43 @@ func TestResolveContactRoutesReturnsOnlyServingStoreThreadsOfThePerson(t *testin
 		}
 		threads := seedRouteFixture(t, a.Store, store, people)
 
+		// findableByName reports whether a name query can reach people[index]'s
+		// v2 thread: by the name v2 holds, through the address book, or
+		// through a legacy thread that still carries the name (a later person
+		// filed under the same thread number overwrites it).
+		findableByName := func(index int) bool {
+			person := people[index]
+			if threads[person.Name] == "" {
+				return false
+			}
+			if !person.NamelessInV2 || person.InAddressBook {
+				return true
+			}
+			if person.LegacyThreadID == "" {
+				return false
+			}
+			for _, later := range people[index+1:] {
+				if later.LegacyThreadID == person.LegacyThreadID {
+					return false
+				}
+			}
+			return true
+		}
+
 		var query, person, number string
-		switch random.Intn(5) {
+		found := false
+		switch random.Intn(6) {
 		case 0, 1:
-			person = names[random.Intn(len(names))]
-			query = strings.Fields(person)[0]
-		case 2:
 			index := random.Intn(len(names))
-			person, query, number = names[index], people[index].Number, people[index].Number
-		case 3:
+			person, query = names[index], strings.Fields(names[index])[0]
+			found = findableByName(index)
+		case 2, 3:
+			index := random.Intn(len(names))
+			forms := routeNumberForms(people[index].Number)
+			person, query = names[index], forms[random.Intn(len(forms))]
+			number = query
+			found = threads[person] != ""
+		case 4:
 			query = pool[random.Intn(len(pool))]
 		default:
 			query = "nobody-" + strconv.Itoa(random.Intn(100))
@@ -451,11 +628,14 @@ func TestResolveContactRoutesReturnsOnlyServingStoreThreadsOfThePerson(t *testin
 				}
 			}
 		}
-		if person != "" && threads[person] != "" {
+		if found {
 			if len(matches) != 1 || matches[0].PreferredReplyConversationID != threads[person] {
 				t.Logf("seed %d, query %q: matches=%+v, want one whose preferred route is %q; people=%+v", seed, query, matches, threads[person], people)
 				return false
 			}
+		} else if len(matches) != 0 {
+			t.Logf("seed %d, query %q: matches=%+v, want none; people=%+v", seed, query, matches, people)
+			return false
 		}
 		if number != "" {
 			direct, err := findDirectSMSConversation(options.Reads, number)
@@ -473,7 +653,7 @@ func TestResolveContactRoutesReturnsOnlyServingStoreThreadsOfThePerson(t *testin
 		}
 		return true
 	}
-	if err := quick.Check(property, &quick.Config{MaxCount: 80, Rand: rand.New(rand.NewSource(20261103))}); err != nil {
+	if err := quick.Check(property, &quick.Config{MaxCount: 160, Rand: rand.New(rand.NewSource(20261103))}); err != nil {
 		t.Fatal(err)
 	}
 }
