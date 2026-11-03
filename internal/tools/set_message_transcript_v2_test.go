@@ -451,7 +451,7 @@ func TestSetMessageTranscriptServingModesAgreeProperty(t *testing.T) {
 		}
 		return true
 	}
-	if err := quick.Check(property, &quick.Config{MaxCount: 60}); err != nil {
+	if err := quick.Check(property, &quick.Config{MaxCount: 60, Rand: rand.New(rand.NewSource(20261103))}); err != nil {
 		t.Fatal(err)
 	}
 }
