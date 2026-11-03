@@ -187,6 +187,8 @@ func v2ReactionText(outboxID string, state messaging.OutboxState, errorClass, er
 			text += " The platform refused this reaction, or the message it targets cannot be named: it was refused for this message, not because the platform lacks reactions."
 		case errorCode == "reaction_target_never_sent":
 			text += " The message it reacts to is your own and was never sent (its send was canceled or refused), so there is nothing to react to."
+		case errorClass == string(bridge.FailureRecipientMismatch):
+			text += " The phone's Google thread for this conversation now names other people, so the app sent nothing. Do not react again in this conversation; react from the phone instead."
 		}
 		return text
 	case messaging.OutboxCanceled:

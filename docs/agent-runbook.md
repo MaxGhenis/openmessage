@@ -308,6 +308,57 @@ are re-linked by peer when their thread shows up under its new id. Watch
 in `/api/status` — a burst right after a re-pair is the fix working, not a
 fault.
 
+**The Google adapter refuses a send to a thread number the phone has moved.**
+The running app rebinds a thread only on live traffic, so long after a swap v2
+can still bind a thread to a number the phone now uses for someone else's
+thread. On 2026-11-03 a read-only check of Max's install found 19 such
+threads: each number's post-swap messages came only from people outside the
+bound thread's roster.
+The Google adapter sends to the bound number, so a text in one of those
+threads would go to the other person. The adapter already looks the thread up
+before every text, media and reaction send, and now compares the phone's
+participants with the stored thread's roster using the rule history applies to
+stale bindings (`ingest.CheckSendTarget`). The kinds must agree, a direct
+thread's peers must match exactly, and a group must keep at least one member.
+A thread with no stored roster, or a phone answer naming only this account,
+proves nothing and sends. On a contradiction nothing goes out:
+
+- the outbox row ends `rejected`, with `error_class: recipient_mismatch` and
+  `error_code` `send_text`, `send_media` or `send_reaction`. The dispatcher
+  never retries it, and the adapter refuses media before uploading it;
+- the log says `Refused a Google send: the phone's thread for this conversation
+  now names other people`, with counts of each side's people;
+- the refusal leaves the receive lifecycle alone, since the phone answered.
+
+While the app runs, only live traffic moves a thread to its new number. A
+catch-up or backfill never does, because history never moves a binding. A
+direct thread usually moves when its peer's next message arrives live
+(`googleIncomingConversation`) or when the phone pushes a live update for a
+thread with that peer alone (`googleConversationEventTarget`), and sends work
+again. A live message leaves the binding alone when v2 binds its number to a
+group, or to a direct thread with no stored peers or with the sender already
+in it. When the peer has more than one direct thread, the most recently active
+one takes the number. A group moves when the phone pushes a live update for a
+thread whose members match the group's exactly. Until then, send from the
+phone. With the app stopped, `openmessage repair google-idspace` (below) can
+also move a binding when its plan includes a `rebind` step.
+
+The check leaves three gaps:
+
+- **Groups that share a member.** A group bound to a number that now names
+  another group with at least one of its members still sends there. The send
+  check keeps ingest's rule on purpose, and a differential test holds the two
+  together: group membership changes legitimately, and a stricter rule for
+  sends alone would refuse threads that ingest treats as the same group.
+- **Reactions to old messages.** A reaction names its target by message ID
+  alone (Google's `SendReactionRequest` carries no thread). Every message
+  stored before the swap keeps the old phone's ID: ingest skips a re-served
+  text copy as a duplicate of the stored row, stores a media-only copy as a
+  new row, and never rewrites a stored message's ID. A reaction to one of
+  those messages lands on whatever message the ID names on the new phone, even
+  in a thread whose binding the check accepts.
+- **Read receipts** don't look the thread up, so the check doesn't cover them.
+
 **Repairing history after a reset** (daemon must be down — the command takes
 the instance lock and refuses while `/api/status` answers; park the watchdog
 first):

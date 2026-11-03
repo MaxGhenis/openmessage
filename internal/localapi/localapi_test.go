@@ -382,6 +382,22 @@ func TestReactDecodesTheQueuedAnswer(t *testing.T) {
 	} else if responseErr, ok := AsResponseError(err); !ok || responseErr.StatusCode != http.StatusBadGateway {
 		t.Fatalf("React() error = %v", err)
 	}
+
+	// A v2-primary daemon that stored the reaction and then rejected it says
+	// why; the caller gets that alongside the error.
+	rejected := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		json.NewEncoder(w).Encode(map[string]any{
+			"success": false, "outbox_id": "out-rejected", "state": "rejected",
+			"error_class": "recipient_mismatch", "error_code": "send_reaction",
+			"error": "send reaction: the phone's thread for this conversation now names other people, so the app sent nothing",
+		})
+	}))
+	stored, err := rejected.React(context.Background(), "conv", "msg", "👍", "add", "")
+	if _, ok := AsResponseError(err); !ok ||
+		stored != (ReactResult{OutboxID: "out-rejected", State: "rejected", ErrorClass: "recipient_mismatch", ErrorCode: "send_reaction"}) {
+		t.Fatalf("React(rejected) = %+v, %v; want the stored intent with its error class and code", stored, err)
+	}
 }
 
 func TestMessageAttachmentReadsBytesHeadersAndLimit(t *testing.T) {
