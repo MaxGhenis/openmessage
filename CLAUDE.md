@@ -92,10 +92,15 @@ it (an older one reports the store as newer than supported; a newer one asks
 you to reopen the app). So on a macOS app install, `/usr/local/bin/openmessage`
 should be a symlink to the app bundle's binary (see the runbook's "MCP config").
 Opening the legacy store still writes: `db.New` runs `migrate()` on every open,
-which drops and recreates three `contact_avatars` indexes, keeps one row of
-each group of Signal rows that share a conversation, sender and timestamp and
-deletes the rest, and repopulates the FTS index when its row count differs
-from `messages`.
+which drops and recreates three `contact_avatars` indexes. It also keeps one
+row of each group of Signal rows that share a conversation, sender and
+timestamp and deletes the rest with their search index entries (with no group
+to clean, it only reads), and it rebuilds the FTS index in one transaction
+when the index's row count differs from `messages`. Every legacy write path
+keeps the index in step, so that rebuild means something else, such as an
+older build, changed `messages`. The Signal Desktop importer skips a message
+that the cleanup would delete (`SignalDuplicateWouldBeDropped`), so its
+30-minute full rescan doesn't re-add rows for the next open to delete.
 
 `read` resolves each hit's sender (name → number → conversation id) so results
 are legible without a second lookup, and accepts

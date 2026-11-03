@@ -224,6 +224,15 @@ func (s *SignalDesktop) ImportFromDB(store *db.Store) (*ImportResult, error) {
 		}
 		existing, _ := store.GetMessageByID(msg.MessageID)
 		if existing == nil {
+			dropped, err := store.SignalDuplicateWouldBeDropped(msg)
+			if err != nil {
+				result.Errors = append(result.Errors, fmt.Sprintf("message %s: %v", row.ID, err))
+				continue
+			}
+			if dropped {
+				result.MessagesDuplicate++
+				continue
+			}
 			result.MessagesImported++
 		} else {
 			result.MessagesDuplicate++
