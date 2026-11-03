@@ -309,10 +309,11 @@ in `/api/status` — a burst right after a re-pair is the fix working, not a
 fault.
 
 **The Google adapter refuses a send to a thread number the phone has moved.**
-Only live traffic rebinds a thread, so long after a swap v2 can still bind a
-thread to a number the phone now uses for someone else's thread. On 2026-11-03
-a read-only check of Max's install found 19 such threads: each number's
-post-swap messages came only from people outside the bound thread's roster.
+The running app rebinds a thread only on live traffic, so long after a swap v2
+can still bind a thread to a number the phone now uses for someone else's
+thread. On 2026-11-03 a read-only check of Max's install found 19 such
+threads: each number's post-swap messages came only from people outside the
+bound thread's roster.
 The Google adapter sends to the bound number, so a text in one of those
 threads would go to the other person. The adapter already looks the thread up
 before every text, media and reaction send, and now compares the phone's
@@ -329,16 +330,18 @@ proves nothing and sends. On a contradiction nothing goes out:
   now names other people`, with counts of each side's people;
 - the refusal leaves the receive lifecycle alone, since the phone answered.
 
-Only live traffic moves a thread to its new number. A catch-up or backfill
-never does, because history never moves a binding. A direct thread usually
-moves when its peer's next message arrives live (`googleIncomingConversation`)
-or when the phone pushes a live update for a thread with that peer alone
-(`googleConversationEventTarget`), and sends work again. A live message leaves
-the binding alone when v2 binds its number to a group, or to a direct thread
-with no stored peers or with the sender already in it. When the peer has more
-than one direct thread, the most recently active one takes the number. A group
-moves when the phone pushes a live update for a thread whose members match the
-group's exactly. Until then, send from the phone.
+While the app runs, only live traffic moves a thread to its new number. A
+catch-up or backfill never does, because history never moves a binding. A
+direct thread usually moves when its peer's next message arrives live
+(`googleIncomingConversation`) or when the phone pushes a live update for a
+thread with that peer alone (`googleConversationEventTarget`), and sends work
+again. A live message leaves the binding alone when v2 binds its number to a
+group, or to a direct thread with no stored peers or with the sender already
+in it. When the peer has more than one direct thread, the most recently active
+one takes the number. A group moves when the phone pushes a live update for a
+thread whose members match the group's exactly. Until then, send from the
+phone. With the app stopped, `openmessage repair google-idspace` (below) can
+also move a binding when its plan includes a `rebind` step.
 
 The check leaves three gaps:
 
