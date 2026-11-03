@@ -49,7 +49,7 @@ var staticFS embed.FS
 var maxUploadBytes int64 = messaging.DefaultMaxMediaBytes
 
 // maxTranscriptRequestBytes bounds an /api/transcript body. JSON escaping can
-// spend 6 bytes on one byte of text (Go's encoder writes "<" as <), so
+// spend 6 bytes on one byte of text (Go's encoder writes "<" as \u003c), so
 // the bound leaves room for that on a transcript and model at their limits,
 // plus the message ID and the JSON around them. The limits themselves are
 // checked on the decoded text.
