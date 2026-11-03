@@ -330,14 +330,15 @@ up there. On a v2-primary daemon:
     The stdio client in "MCP config" below writes no such row: it submits
     through the app's outbox API, and the app itself (`serve --web`) serves no
     MCP.
-- **The web UI's per-conversation writes change nothing.** The conversation
-  list on v2-primary carries v2 conversation IDs and reads favorites and
-  notification modes from v2. The favorite, notification-mode, tab, move and
-  mark-read handlers write the legacy row with the ID the UI sends
-  (`internal/web/api.go`), and no legacy row has a v2 ID. So favorite answers
-  404, notification mode and tab answer 500, and move and mark-read answer 200
-  and change nothing. The UI never posts mark-read there anyway, since v2
-  reads always report an unread count of 0.
+- **The web UI's per-conversation writes change nothing it shows.** The
+  conversation list on v2-primary carries v2 conversation IDs and reads
+  favorites and notification modes from v2. The favorite, notification-mode,
+  tab, move and mark-read handlers write the legacy row with the ID the UI
+  sends (`internal/web/api.go`). On Max's install no legacy conversation ID
+  matches a v2 one, so favorite answers 404, notification mode and tab answer
+  500, and move and mark-read answer 200 and change nothing. The UI never
+  posts mark-read there anyway, since v2 reads always report an unread count
+  of 0.
 - **Nothing copies v2 into legacy.** The v2 → legacy projector runs only on
   legacy-primary (`cmd/v2stack.go`). A send through the v2 outbox reaches
   `messages.db` only if another writer brings it back, such as Google's echo
@@ -358,18 +359,18 @@ frame for 63.6 days, from 2026-08-18 to 2026-10-21, and v2 holds no Signal
 message from that span. Legacy holds 2,464 from it, in 36 conversations, and
 since 2026-07-19 legacy holds 3,092 Signal messages that v2 lacks (read-only
 counts, 2026-11-03). Legacy stored 2,372 of those 2,464 in five blocks of
-consecutive rows, each covering days or weeks of messages. A Signal Desktop
-import wrote at least the last block, 1,063 messages sent from 2026-09-27.
-They went in on 2026-10-21 before 13:05. The app reported Signal unpaired
-from at least 2026-10-08 until about 11:40 that day (the watchdog's log), so
-signal-cli received nothing before then. After that it fed v2, which took no
-burst and holds none of them. A Desktop import writes legacy only, so v2
-reads never show a message that only Signal Desktop received after cutover
-(the cutover migration copied the earlier ones). Draft #234 proposes a v2
-feed for Signal Desktop history, but as written it appends only while
-signal-cli has no account, has stayed offline for five minutes or has gone
-silent, so while signal-cli keeps receiving it won't back-fill this span.
-Draft #231 proposes keeping the local imports off on v2-primary.
+consecutive rows, each covering hours to weeks of messages. A Signal Desktop
+import wrote at least the last block's 1,063 gap messages, sent from
+2026-09-27. They went in on 2026-10-21 before 13:05. The app reported Signal
+unpaired from at least 2026-10-08 until about 11:40 that day (the watchdog's
+log), so signal-cli received nothing in that span. After that it fed v2,
+which took no burst and holds none of them. A Desktop import writes legacy
+only, so v2 reads never show a message that only Signal Desktop received
+after cutover (the cutover migration copied the earlier ones). Draft #234
+proposes a v2 feed for Signal Desktop history, but as written it appends
+only while signal-cli has no account, has stayed offline for five minutes or
+has gone silent, so while signal-cli keeps receiving it won't back-fill this
+span. Draft #231 proposes keeping the local imports off on v2-primary.
 
 ## Google thread ids are device-local: phone swaps re-key everything
 
