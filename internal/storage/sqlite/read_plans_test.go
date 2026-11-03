@@ -244,6 +244,12 @@ func TestReadQueryPlansStayOffWholeTableScans(t *testing.T) {
 			!strings.Contains(plan[0], "occurred_at_ms=?") {
 			t.Fatalf("plan = %q, want a SEARCH bounded by occurred_at_ms=?", plan)
 		}
+		// Only that millisecond's rows ask whether they are a send still
+		// waiting for its echo, each with one seek.
+		seek := "SEARCH o USING INDEX outbox_local_message_idx (local_message_id=?)"
+		if !slices.Contains(plan, seek) || len(planScans(plan, "o")) > 0 {
+			t.Fatalf("plan = %q, want the outbox read as %q", plan, seek)
+		}
 	})
 	t.Run("newest message times seek both directions", func(t *testing.T) {
 		plan := explainPlanLines(t, db, latestMessageTimesQuery, account, account)

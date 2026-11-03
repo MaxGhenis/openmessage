@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"math/rand"
 	"reflect"
+	"strings"
 	"testing"
 	"testing/quick"
 	"time"
@@ -58,9 +59,10 @@ func (h *googleEchoHarness) waitDrained(t *testing.T) {
 
 // phoneClockOffset puts the phone's clock well off this machine's, so no
 // test can pass by pairing on the phone's stamp instead of the receipt time.
-// The odd milliseconds keep a phone stamp from landing exactly on a local
-// send's timestamp, which the store's same-millisecond content dedupe would
-// (rightly) treat as one message.
+// Its odd milliseconds keep phone stamps off the whole seconds most tests
+// send at. The property still draws stamps that land on another send's local
+// millisecond (the harness creates an outran send between seconds), which the
+// store must not take for a re-delivery of that send.
 const phoneClockOffset = -45123 * time.Millisecond
 
 // echo delivers an outgoing frame with no TmpID that this machine receives
@@ -500,8 +502,9 @@ func (echoScenario) Generate(r *rand.Rand, _ int) reflect.Value {
 
 // runEchoScenario plays the scenario through the live correlation, or
 // through a pre-fix build followed by the startup repair. It returns each
-// send's final remote ID and the total message count.
-func runEchoScenario(t *testing.T, scenario echoScenario, viaRepair bool) (map[int]string, int) {
+// send's final remote ID, the total message count, and how many frames the
+// store dropped as re-deliveries of a message it already held.
+func runEchoScenario(t *testing.T, scenario echoScenario, viaRepair bool) (map[int]string, int, uint64) {
 	t.Helper()
 	var h *googleEchoHarness
 	if viaRepair {
@@ -540,33 +543,83 @@ func runEchoScenario(t *testing.T, scenario echoScenario, viaRepair bool) (map[i
 	for i, submission := range sends {
 		bound[i] = ids[submission.LocalMessageID]
 	}
-	return bound, len(ids)
+	return bound, len(ids), h.counters.Snapshot(googleEchoAccountID).ContentDupesSkipped
 }
 
-// TestUncorrelatedEchoPairsEverySendWithItsOwnEchoProperty: for any
-// scenario, through the live path and through the pre-fix path plus repair,
-//   - every send ends bound to its own echo (ground truth, not just a
-//     consistent answer), and
-//   - every message, sent from the app or typed on the phone, is one row.
-func TestUncorrelatedEchoPairsEverySendWithItsOwnEchoProperty(t *testing.T) {
-	property := func(scenario echoScenario) bool {
-		for _, viaRepair := range []bool{false, true} {
-			bound, rows := runEchoScenario(t, scenario, viaRepair)
-			if rows != len(scenario.events) {
-				t.Logf("viaRepair=%v: rows = %d, want %d (%+v)", viaRepair, rows, len(scenario.events), scenario.events)
-				return false
-			}
-			for i, remote := range bound {
+// echoScenarioMismatches plays the scenario through both paths and lists
+// every way the result departs from the ground truth (none when it holds):
+//   - every send ends bound to its own echo (not just a consistent answer),
+//   - every message, sent from the app or typed on the phone, is one row, and
+//   - the store drops no frame as a re-delivery, since the scenario has none.
+func echoScenarioMismatches(t *testing.T, scenario echoScenario) []string {
+	t.Helper()
+	var mismatches []string
+	for _, viaRepair := range []bool{false, true} {
+		bound, rows, dropped := runEchoScenario(t, scenario, viaRepair)
+		for i := range scenario.events {
+			if remote, sent := bound[i]; sent {
 				if want := fmt.Sprintf("95%03d", i); remote != want {
-					t.Logf("viaRepair=%v: send %d bound to %q, want its own echo %q (%+v)", viaRepair, i, remote, want, scenario.events)
-					return false
+					mismatches = append(mismatches, fmt.Sprintf("viaRepair=%v: send %d bound to %q, want its own echo %q", viaRepair, i, remote, want))
 				}
 			}
 		}
+		if rows != len(scenario.events) {
+			mismatches = append(mismatches, fmt.Sprintf("viaRepair=%v: rows = %d, want %d", viaRepair, rows, len(scenario.events)))
+		}
+		if dropped != 0 {
+			mismatches = append(mismatches, fmt.Sprintf("viaRepair=%v: %d frames dropped as re-deliveries, want none", viaRepair, dropped))
+		}
+	}
+	return mismatches
+}
+
+// TestUncorrelatedEchoPairsEverySendWithItsOwnEchoProperty: every scenario
+// holds to the ground truth (echoScenarioMismatches) through the live path
+// and through the pre-fix path plus repair. It uses a fixed seed, so a
+// failure replays; OPENMESSAGE_PROPERTY_SEED and OPENMESSAGE_PROPERTY_CASES
+// sweep others.
+func TestUncorrelatedEchoPairsEverySendWithItsOwnEchoProperty(t *testing.T) {
+	property := func(scenario echoScenario) bool {
+		if mismatches := echoScenarioMismatches(t, scenario); len(mismatches) > 0 {
+			t.Logf("%s (%+v)", strings.Join(mismatches, "; "), scenario.events)
+			return false
+		}
 		return true
 	}
-	if err := quick.Check(property, &quick.Config{MaxCount: 30}); err != nil {
+	if err := quick.Check(property, repairPropertyConfig(t, 30, 30)); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// The input CI drew on 2026-11-03 (Go Test on main at 81be93f02, run
+// 41722281927, case #16), and its two-send core. Send 1 outran its confirm, so the harness created
+// its local row at 35 s - 0.545 s - 0.1 s = 34.355 s on this machine's clock.
+// Send 3's echo, received at 79.478 s, carries the phone's stamp, 79.478 s -
+// 45.123 s = 34.355 s. On the pre-fix path send 1 stays unbound until the
+// repair, so the store's content dedupe took that echo for a re-delivery of
+// send 1 and dropped it, and the repair had no echo to give send 3. On the
+// live path send 1's own echo binds and re-stamps it 44 s earlier. A
+// millisecond either way misses the collision.
+func TestUncorrelatedEchoStampedOnAnotherSendsMillisecondPairsWithItsOwnSend(t *testing.T) {
+	ci := []echoScenarioEvent{
+		{fromApp: false, outran: true, body: "ok", at: 26 * time.Second, lag: 690 * time.Millisecond},
+		{fromApp: true, outran: true, body: "on my way", at: 35 * time.Second, lag: 545 * time.Millisecond},
+		{fromApp: true, body: "on my way", at: 68 * time.Second, lag: 766 * time.Millisecond},
+		{fromApp: true, body: "on my way", at: 79 * time.Second, lag: 478 * time.Millisecond},
+		{fromApp: true, body: "ok", at: 102 * time.Second, lag: 451 * time.Millisecond},
+	}
+	for _, tc := range []struct {
+		name   string
+		events []echoScenarioEvent
+	}{
+		{name: "CI input", events: ci},
+		{name: "two sends", events: []echoScenarioEvent{ci[1], ci[3]}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if mismatches := echoScenarioMismatches(t, echoScenario{events: tc.events}); len(mismatches) > 0 {
+				t.Fatal(strings.Join(mismatches, "\n"))
+			}
+		})
 	}
 }
 
@@ -635,7 +688,7 @@ func TestRepairKeepsBothMessagesWhenIdenticalEchoesCross(t *testing.T) {
 		{fromApp: true, outran: true, body: "on my way", at: 112 * time.Second, lag: 259 * time.Millisecond},
 	}}
 	for _, viaRepair := range []bool{false, true} {
-		bound, rows := runEchoScenario(t, scenario, viaRepair)
+		bound, rows, _ := runEchoScenario(t, scenario, viaRepair)
 		if rows != len(scenario.events) {
 			t.Fatalf("viaRepair=%v: rows = %d, want every message kept (%d)", viaRepair, rows, len(scenario.events))
 		}
