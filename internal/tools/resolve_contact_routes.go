@@ -155,15 +155,18 @@ func findRouteConversations(reads readsource.ReadSource, people *db.Store, query
 			addConversation(conv)
 		}
 	}
-	// A store search for text matches a thread by its title or by any
+	// The legacy store's search matches a thread by its title or by any
 	// participant's name or number, and the legacy store lists the account's
 	// owner in most threads. A thread that text matches only through the
-	// owner says nothing about whom to send to.
+	// owner says nothing about whom to send to. v2's search skips the owner
+	// itself, and it matches names that reads don't show, so its hits stay.
+	_, legacyReads := reads.(*db.Store)
 	addSearchHits := func(text string, convos []*db.Conversation) {
 		for _, conv := range convos {
-			if !matchesOnlyTheOwner(conv, text) {
-				addConversation(conv)
+			if legacyReads && matchesOnlyTheOwner(conv, text) {
+				continue
 			}
+			addConversation(conv)
 		}
 	}
 

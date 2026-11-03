@@ -826,11 +826,12 @@ running app:
   query matches only through the owner's entry or the owner's own messages is
   no route, while a title that holds the owner's name still matches. v2's
   conversation search (`SearchConversationsByName`, which also serves
-  `/api/search`) skips the owner's identity in SQL: it matches both a
-  participant row's name and the identity's name, and reads show only one of
-  them, so the route tool can't spot every owner match on its own. The legacy
-  search matches only incoming messages' senders, since the owner's outgoing
-  messages carry the owner's name and number.
+  `/api/search`) skips the owner's identity in SQL. It matches both a
+  participant row's name and the identity's name, while reads show only one
+  of them, so the route tool keeps every v2 hit and drops owner-only hits
+  from the legacy store alone. The legacy search matches only incoming
+  messages' senders, since the owner's outgoing messages carry the owner's
+  name and number.
   Before the fix for the 2026-11-03 (UTC) incident, `resolve_contact_routes`
   read the legacy store on a v2-primary install and handed out Google thread
   numbers, which the outbox refused with a bare 404 `not found`, while
@@ -843,7 +844,8 @@ running app:
   `TestResolveContactRoutesNeverRoutesByAReusedGoogleThreadNumber`,
   `TestResolveContactRoutesFindsPeopleByAnyFormOfTheirNumber`,
   `TestInProcessSendsTakeTheIDsResolveContactRoutesReturns`,
-  `TestResolveContactRoutesIgnoresTheAccountOwner` and
+  `TestResolveContactRoutesIgnoresTheAccountOwner`,
+  `TestResolveContactRoutesKeepsV2MatchesOnANameReadsHide` and
   `TestResolveContactRoutesReturnsOnlyServingStoreThreadsOfThePerson`
   (internal/tools), `TestSearchConversationsByMetadataSkipsTheAccountOwner`
   (internal/v2read), `TestSearchConversationsByMetadataSkipsTheOwnersOwnMessages`
