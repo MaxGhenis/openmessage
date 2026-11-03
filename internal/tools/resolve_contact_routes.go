@@ -157,8 +157,8 @@ func findRouteConversations(reads readsource.ReadSource, people *db.Store, query
 	}
 	// A store search for text matches a thread by its title or by any
 	// participant's name or number, and the legacy store lists the account's
-	// owner in nearly every thread. A thread that text matches only through
-	// the owner says nothing about whom to send to.
+	// owner in most threads. A thread that text matches only through the
+	// owner says nothing about whom to send to.
 	addSearchHits := func(text string, convos []*db.Conversation) {
 		for _, conv := range convos {
 			if !matchesOnlyTheOwner(conv, text) {

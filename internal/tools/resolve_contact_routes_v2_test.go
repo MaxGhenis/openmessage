@@ -53,8 +53,8 @@ type routeFixturePerson struct {
 }
 
 // routeFixtureOwner is the account's owner. Both stores list the owner in
-// every fixture thread, as a live install's stores list them in nearly every
-// thread. ParticipantName, when set, is the name the owner's v2 participant
+// every fixture thread, as a live install's stores list them in most
+// threads. ParticipantName, when set, is the name the owner's v2 participant
 // rows carry in place of the identity's name, as some live rows do; reads
 // show that name. InAddressBook files the owner's own card in the address
 // book, as a phone's "my card" does.
@@ -430,12 +430,12 @@ func TestResolveContactRoutesFindsPeopleByAnyFormOfTheirNumber(t *testing.T) {
 	}
 }
 
-// Both stores list the account's owner in nearly every thread, and a phone's
-// own contact card puts the owner in the address book. A thread that matches
-// a query only through the owner says nothing about whom to send to, so the
-// owner's name and number route nowhere, and a search for another Sam doesn't
-// return every thread that the owner, Sam Owner, is in or wrote in. This holds
-// whichever store serves reads.
+// Both stores list the account's owner in most threads, and a phone's own
+// contact card puts the owner in the address book. A thread that matches a
+// query only through the owner says nothing about whom to send to. Here, where
+// no title holds the owner's name, the owner's names and number route nowhere,
+// and a search for another Sam doesn't return the threads that the owner, Sam
+// Owner, is in or wrote in. This holds whichever store serves reads.
 func TestResolveContactRoutesIgnoresTheAccountOwner(t *testing.T) {
 	owner := routeFixtureOwner{Name: "Sam Owner", ParticipantName: "Sammy", Number: "+15550009999", InAddressBook: true}
 	people := []routeFixturePerson{

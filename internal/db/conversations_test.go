@@ -644,11 +644,10 @@ func TestSearchConversationsByMetadata(t *testing.T) {
 	}
 }
 
-// The account's owner writes in nearly every thread, and the legacy store
-// keeps the owner's name and number on those outgoing messages, so a sender
-// match on them would return every thread the owner wrote in. A search for
-// the owner matches no thread through the owner's own messages, while an
-// incoming message's sender still matches.
+// The legacy store keeps the owner's name and number on the owner's outgoing
+// messages, so a sender match on them would return every thread the owner
+// wrote in. A search for the owner matches no thread through the owner's own
+// messages, while an incoming message's sender still matches.
 func TestSearchConversationsByMetadataSkipsTheOwnersOwnMessages(t *testing.T) {
 	store := newTestStore(t)
 

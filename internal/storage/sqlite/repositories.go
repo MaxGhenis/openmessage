@@ -806,9 +806,9 @@ func (s *Store) ListConversationsByRecencyAllAccounts(limit int) ([]Conversation
 // case-insensitive substring — newest first, at most limit rows. It is the
 // bounded v2 counterpart of the legacy metadata search: the match runs in SQL
 // so callers map only the hits instead of every conversation. The account's
-// owner takes part in nearly every conversation, so the owner's names and
-// address match nothing; matching them would return every recent
-// conversation and crowd out the people a search names.
+// owner takes part in most conversations, so the owner's names and address
+// match nothing; matching them would fill the results with the owner's
+// conversations and crowd out the people a search names.
 func (s *Store) SearchConversationsByName(query string, limit int) ([]Conversation, error) {
 	if limit <= 0 || strings.TrimSpace(query) == "" {
 		return []Conversation{}, nil

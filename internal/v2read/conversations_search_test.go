@@ -168,12 +168,12 @@ func TestSearchConversationsByMetadataTreatsLikeMetacharactersLiterally(t *testi
 	assertConversationIDs(t, got, "conversation-percent")
 }
 
-// The account's owner takes part in nearly every thread, under a name and a
-// number, and a thread's participant row can name the owner differently from
-// the owner's identity. A search that matched the owner would return every
-// recent thread and crowd out the people the searcher meant, so the owner's
-// names and number match nothing, while other participants and titles still
-// match.
+// The account's owner takes part in most threads, under a name and a number,
+// and a thread's participant row can name the owner differently from the
+// owner's identity. A search that matched the owner would fill the results
+// with the owner's threads and crowd out the people the searcher meant, so
+// the owner's names and number match nothing, while other participants and
+// titles still match.
 func TestSearchConversationsByMetadataSkipsTheAccountOwner(t *testing.T) {
 	store, _, source := openSourceTestStore(t)
 	seedSearchFixture(t, store)

@@ -822,13 +822,15 @@ running app:
   comparing the last ten digits as `send_message` does for a recipient (v2
   stores E.164; the legacy store keeps numbers as the address book writes
   them), and by a name that only the legacy store holds. It skips the
-  account's owner, whom nearly every thread in both stores lists: a thread
-  that a query matches only through the owner's name or number is no route.
-  v2's conversation search (`SearchConversationsByName`, which also serves
-  `/api/search`) never matches the owner, since the owner's rows can carry a
-  name that reads don't show. The legacy search matches only incoming
-  messages' senders, since the owner's outgoing messages carry the owner's
-  name and number.
+  account's owner, whom most threads in both stores list: a thread that a
+  query matches only through the owner's entry or the owner's own messages is
+  no route, while a title that holds the owner's name still matches. v2's
+  conversation search (`SearchConversationsByName`, which also serves
+  `/api/search`) skips the owner's identity in SQL: it matches both a
+  participant row's name and the identity's name, and reads show only one of
+  them, so the route tool can't spot every owner match on its own. The legacy
+  search matches only incoming messages' senders, since the owner's outgoing
+  messages carry the owner's name and number.
   Before the fix for the 2026-11-03 (UTC) incident, `resolve_contact_routes`
   read the legacy store on a v2-primary install and handed out Google thread
   numbers, which the outbox refused with a bare 404 `not found`, while

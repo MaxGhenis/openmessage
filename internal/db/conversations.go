@@ -340,8 +340,9 @@ func (s *Store) ListConversationsByPlatform(platform string, limit int) ([]*Conv
 
 // SearchConversationsByMetadata matches a conversation by its name, its
 // participants, or the sender of a message in it. The owner's outgoing
-// messages carry the owner's name and number, and the owner writes in nearly
-// every thread, so sender matches count incoming messages only.
+// messages carry the owner's name and number, so a sender match on them would
+// return every thread the owner wrote in; sender matches count incoming
+// messages only.
 func (s *Store) SearchConversationsByMetadata(query string, limit int) ([]*Conversation, error) {
 	rows, err := s.db.Query(`
 		SELECT DISTINCT `+conversationColumns+`
