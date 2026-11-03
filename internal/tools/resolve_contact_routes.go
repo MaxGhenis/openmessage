@@ -60,7 +60,7 @@ func resolveContactRoutesTool() mcp.Tool {
 	)
 }
 
-func resolveContactRoutesHandler(a *app.App) server.ToolHandlerFunc {
+func resolveContactRoutesHandler(a *app.App, _ ...Options) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		args := req.GetArguments()
 		query := strings.TrimSpace(strArg(args, "query"))

@@ -283,6 +283,26 @@ func TestV1ErrorStatusMapping(t *testing.T) {
 	}
 }
 
+// A send that names no v2 conversation stays a 404, the deterministic refusal
+// callers already handle, and the body says which ID to send instead: agents
+// holding a Google thread number need to look the conversation up again.
+func TestV1UnknownConversationSaysWhichIDToSend(t *testing.T) {
+	err := fmt.Errorf("%w %q: %w", v2wire.ErrUnknownConversation, "2957", sqlite.ErrNotFound)
+	status, message := v1ErrorResponse(err)
+	if status != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", status)
+	}
+	for _, want := range []string{"unknown conversation_id", "list_conversations", "resolve_contact_routes", "thread"} {
+		if !bytes.Contains([]byte(message), []byte(want)) {
+			t.Fatalf("message = %q, want it to mention %q", message, want)
+		}
+	}
+	// Other lookups that find nothing keep the generic answer.
+	if _, message := v1ErrorResponse(sqlite.ErrNotFound); message != "not found" {
+		t.Fatalf("plain not-found message = %q, want %q", message, "not found")
+	}
+}
+
 func TestLegacyMediaServesV2BlobBeforePlatformDownloader(t *testing.T) {
 	blobs, err := blob.New(filepath.Join(t.TempDir(), "blobs"))
 	if err != nil {

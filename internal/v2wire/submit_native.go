@@ -11,6 +11,8 @@ import (
 	"github.com/maxghenis/openmessage/internal/storage/sqlite"
 )
 
+var ErrUnknownConversation = errors.New("unknown conversation") // SHIM
+
 // NativeDeps are the v2 store and services needed to submit using v2-native
 // conversation and message IDs. Unlike Deps, this path has no legacy store.
 type NativeDeps struct {
