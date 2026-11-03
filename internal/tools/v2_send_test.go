@@ -30,7 +30,7 @@ func TestV2SendToConversationReturnsConfirmedDelivery(t *testing.T) {
 	}})
 	handler := sendToConversationHandler(harness.app, &harness.deps)
 
-	result, err := handler(context.Background(), v2ToolCall(map[string]any{
+	result, err := handler(harness.ctx, v2ToolCall(map[string]any{
 		"conversation_id": v2ToolConversationID,
 		"message":         "settle this send",
 		"idempotency_key": "mcp-confirmed-key",
@@ -71,7 +71,7 @@ func TestV2SendToConversationReturnsHonestUncertainDelivery(t *testing.T) {
 	}})
 	handler := sendToConversationHandler(harness.app, &harness.deps)
 
-	result, err := handler(context.Background(), v2ToolCall(map[string]any{
+	result, err := handler(harness.ctx, v2ToolCall(map[string]any{
 		"conversation_id": v2ToolConversationID,
 		"message":         "the outcome may be ambiguous",
 		"idempotency_key": "mcp-uncertain-key",
@@ -112,14 +112,14 @@ func TestV2SendToConversationDuplicateKeyReturnsSameOutboxAndDispatchesOnce(t *t
 		"idempotency_key": "mcp-duplicate-key",
 	})
 
-	first, err := handler(context.Background(), request)
+	first, err := handler(harness.ctx, request)
 	if err != nil {
 		t.Fatalf("first handler call: %v", err)
 	}
 	if first.IsError {
 		t.Fatalf("first handler result is error: %v", first.Content)
 	}
-	second, err := handler(context.Background(), request)
+	second, err := handler(harness.ctx, request)
 	if err != nil {
 		t.Fatalf("second handler call: %v", err)
 	}
@@ -159,7 +159,7 @@ func TestV2SendMediaRejectsMaxPlusOneWithoutOutbox(t *testing.T) {
 	}
 
 	handler := sendMediaToConversationHandler(harness.app, &harness.deps)
-	result, err := handler(context.Background(), v2ToolCall(map[string]any{
+	result, err := handler(harness.ctx, v2ToolCall(map[string]any{
 		"conversation_id": v2ToolConversationID,
 		"file_path":       filePath,
 		"idempotency_key": "mcp-media-too-large",
@@ -231,7 +231,7 @@ func TestV2SendMessageGoogleKeepsLegacyConversationLookupButUsesV2Transport(t *t
 	})
 
 	result, err := sendMessageHandler(harness.app, &harness.deps)(
-		context.Background(),
+		harness.ctx,
 		v2ToolCall(map[string]any{
 			"phone_number":    "+15551230000",
 			"message":         "direct through v2",
@@ -297,7 +297,7 @@ func TestV2SendGroupMessageKeepsLegacyConversationLookupButUsesV2Transport(t *te
 	t.Cleanup(func() { getOrCreateGoogleGroupConversationV2 = originalLookup })
 
 	result, err := sendGroupMessageHandler(harness.app, &harness.deps)(
-		context.Background(),
+		harness.ctx,
 		v2ToolCall(map[string]any{
 			"phone_numbers":   `["+15551230000","+15551230001"]`,
 			"message":         "group through v2",
@@ -366,7 +366,7 @@ func TestV2SendMediaToConversationStreamsAndReturnsConfirmedDelivery(t *testing.
 	})
 
 	result, err := sendMediaToConversationHandler(harness.app, &harness.deps)(
-		context.Background(),
+		harness.ctx,
 		v2ToolCall(map[string]any{
 			"conversation_id": v2ToolConversationID,
 			"file_path":       filePath,
@@ -410,6 +410,10 @@ const (
 )
 
 type v2ToolHarness struct {
+	// ctx is canceled when a dispatch pass fails or Run stops before the
+	// test ends. A tool call made with it then returns at once, instead of
+	// polling Wait with no deadline while nothing dispatches.
+	ctx      context.Context
 	app      *app.App
 	deps     V2Dependencies
 	sender   *v2ToolTextSender
@@ -417,6 +421,8 @@ type v2ToolHarness struct {
 	ids      *v2ToolIDs
 	clock    messaging.SystemClock
 	blobRoot string
+	// v2Path is the v2 store's file, for a second connection in tests.
+	v2Path string
 }
 
 func newV2ToolHarness(t *testing.T, steps ...v2ToolSendStep) *v2ToolHarness {
@@ -431,7 +437,8 @@ func newV2ToolHarness(t *testing.T, steps ...v2ToolSendStep) *v2ToolHarness {
 		t.Fatalf("seed legacy conversation: %v", err)
 	}
 
-	v2Store, err := sqlite.Open(filepath.Join(t.TempDir(), "v2.sqlite3"))
+	v2Path := filepath.Join(t.TempDir(), "v2.sqlite3")
+	v2Store, err := sqlite.Open(v2Path)
 	if err != nil {
 		t.Fatalf("sqlite.Open(): %v", err)
 	}
@@ -456,20 +463,36 @@ func newV2ToolHarness(t *testing.T, steps ...v2ToolSendStep) *v2ToolHarness {
 		t.Fatalf("NewMessageService(): %v", err)
 	}
 
+	harnessCtx, failHarness := context.WithCancelCause(context.Background())
+	service.OnPassFailure(func(err error, _ messaging.FailedDispatchPass) {
+		t.Errorf("MessageService dispatch pass failed: %v", err)
+		failHarness(err)
+	})
 	runCtx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { done <- service.Run(runCtx) }()
-	t.Cleanup(func() {
-		cancel()
-		if err := <-done; err != nil && !errors.Is(err, context.Canceled) {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		err := service.Run(runCtx)
+		if runCtx.Err() == nil {
+			t.Errorf("MessageService.Run() stopped before the test ended: %v", err)
+			failHarness(fmt.Errorf("message dispatcher stopped: %w", err))
+			return
+		}
+		if !errors.Is(err, context.Canceled) {
 			t.Errorf("MessageService.Run(): %v", err)
 		}
+	}()
+	t.Cleanup(func() {
+		cancel()
+		<-done
+		failHarness(context.Canceled)
 		if err := v2Store.Close(); err != nil {
 			t.Errorf("close v2 store: %v", err)
 		}
 	})
 
 	return &v2ToolHarness{
+		ctx: harnessCtx,
 		app: a,
 		deps: V2Dependencies{
 			Enabled:  true,
@@ -482,6 +505,7 @@ func newV2ToolHarness(t *testing.T, steps ...v2ToolSendStep) *v2ToolHarness {
 		ids:      ids,
 		clock:    clock,
 		blobRoot: blobRoot,
+		v2Path:   v2Path,
 	}
 }
 

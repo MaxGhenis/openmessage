@@ -103,13 +103,13 @@ func newV2ReactToolHarness(t *testing.T, steps ...v2ToolSendStep) (*v2ToolHarnes
 	return harness, sender, mcpServer
 }
 
-func callReactTool(t *testing.T, mcpServer *server.MCPServer, arguments map[string]any) *mcp.CallToolResult {
+func callReactTool(t *testing.T, ctx context.Context, mcpServer *server.MCPServer, arguments map[string]any) *mcp.CallToolResult {
 	t.Helper()
 	tool := mcpServer.GetTool("react_to_message")
 	if tool == nil {
 		t.Fatal("react_to_message is not registered")
 	}
-	result, err := tool.Handler(context.Background(), v2ToolCall(arguments))
+	result, err := tool.Handler(ctx, v2ToolCall(arguments))
 	if err != nil {
 		t.Fatalf("react_to_message: %v", err)
 	}
@@ -117,7 +117,7 @@ func callReactTool(t *testing.T, mcpServer *server.MCPServer, arguments map[stri
 }
 
 func TestV2ReactToMessageGoesThroughTheOutbox(t *testing.T) {
-	_, sender, mcpServer := newV2ReactToolHarness(t)
+	harness, sender, mcpServer := newV2ReactToolHarness(t)
 	if _, ok := mcpServer.GetTool("react_to_message").Tool.InputSchema.Properties["idempotency_key"]; !ok {
 		t.Fatal("the v2 react_to_message descriptor does not offer idempotency_key")
 	}
@@ -125,7 +125,7 @@ func TestV2ReactToMessageGoesThroughTheOutbox(t *testing.T) {
 		"conversation_id": v2ReactConversationID, "message_id": v2ReactMessageID,
 		"emoji": "👍", "idempotency_key": "react-tool-key",
 	}
-	result := callReactTool(t, mcpServer, arguments)
+	result := callReactTool(t, harness.ctx, mcpServer, arguments)
 	payload := v2ToolPayload(t, result)
 	if result.IsError {
 		t.Fatalf("react_to_message = error %v", payload)
@@ -141,7 +141,7 @@ func TestV2ReactToMessageGoesThroughTheOutbox(t *testing.T) {
 	}
 
 	// The same key replays the first intent and sends nothing new.
-	replay := v2ToolPayload(t, callReactTool(t, mcpServer, arguments))
+	replay := v2ToolPayload(t, callReactTool(t, harness.ctx, mcpServer, arguments))
 	assertV2ToolBool(t, replay, "deduplicated", true)
 	assertV2ToolString(t, replay, "outbox_id", v2ToolString(payload, "outbox_id"))
 	if requests := sender.snapshotRequests(); len(requests) != 1 {
@@ -150,11 +150,11 @@ func TestV2ReactToMessageGoesThroughTheOutbox(t *testing.T) {
 }
 
 func TestV2ReactToMessageReportsAnUndeliveredReactionWithoutAnError(t *testing.T) {
-	_, _, mcpServer := newV2ReactToolHarness(t, v2ToolSendStep{err: bridge.OpError{
+	harness, _, mcpServer := newV2ReactToolHarness(t, v2ToolSendStep{err: bridge.OpError{
 		Class: bridge.FailureTransient, Operation: "send_reaction", Fingerprint: "disconnected",
 		Dispatch: bridge.DispatchNotCalled,
 	}})
-	result := callReactTool(t, mcpServer, map[string]any{
+	result := callReactTool(t, harness.ctx, mcpServer, map[string]any{
 		"conversation_id": v2ReactConversationID, "message_id": v2ReactMessageID, "emoji": "👍",
 	})
 	payload := v2ToolPayload(t, result)
@@ -175,14 +175,14 @@ func TestV2ReactToMessageReportsAnUndeliveredReactionWithoutAnError(t *testing.T
 }
 
 func TestV2ReactToMessageRefusesWhatItCannotPlace(t *testing.T) {
-	_, sender, mcpServer := newV2ReactToolHarness(t)
+	harness, sender, mcpServer := newV2ReactToolHarness(t)
 	for name, arguments := range map[string]map[string]any{
 		"a legacy message ID":       {"conversation_id": v2ReactConversationID, "message_id": "signal:1700000001000", "emoji": "👍"},
 		"another conversation's ID": {"conversation_id": "v2-tool-conversation", "message_id": v2ReactMessageID, "emoji": "👍"},
 		"a blank idempotency key":   {"conversation_id": v2ReactConversationID, "message_id": v2ReactMessageID, "emoji": "👍", "idempotency_key": " "},
 	} {
 		t.Run(name, func(t *testing.T) {
-			if result := callReactTool(t, mcpServer, arguments); !result.IsError {
+			if result := callReactTool(t, harness.ctx, mcpServer, arguments); !result.IsError {
 				t.Fatalf("react_to_message = %v, want an error", v2ToolPayload(t, result))
 			}
 		})
@@ -196,7 +196,7 @@ func TestV2PrimaryReactToMessageWithoutTheOutboxIsAnError(t *testing.T) {
 	a := testApp(t)
 	mcpServer := server.NewMCPServer("v2-react-unconfigured", "test")
 	RegisterWithOptions(mcpServer, a, Options{Reads: a.Store, V2Primary: true})
-	result := callReactTool(t, mcpServer, map[string]any{
+	result := callReactTool(t, context.Background(), mcpServer, map[string]any{
 		"conversation_id": v2ReactConversationID, "message_id": v2ReactMessageID, "emoji": "👍",
 	})
 	if !result.IsError || !strings.Contains(resultText(t, result), "v2 outbox") {
