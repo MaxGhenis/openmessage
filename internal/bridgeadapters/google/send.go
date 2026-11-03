@@ -167,13 +167,13 @@ var mediaSendClientFor = func(cli *client.Client) mediaSendClient {
 // refuseMovedThread refuses an operation whose Google thread now names other
 // people than the stored conversation it belongs to. Google's thread
 // numbers are local to the phone: after a phone swap or restore, a number v2
-// still binds to one person's thread can name someone else's, and v2 rebinds
-// it only when live traffic proves the move. Sending to the bound number would
-// reach whoever it names now. This builds the refusal directly rather than
-// through the classifiers, which report to the receive lifecycle: the phone
-// answered the lookup, so the connection is fine. Nothing went out, and a retry
-// against the same binding would fail the same way, so the refusal is
-// terminal. It names counts and kinds, never the people.
+// still binds to one person's thread can name someone else's, and the running
+// app rebinds it only when live traffic proves the move. Sending to the bound
+// number would reach whoever it names now. This builds the refusal directly
+// rather than through the classifiers, which report to the receive lifecycle:
+// the phone answered the lookup, so the connection is fine. Nothing went out,
+// and a retry against the same binding would fail the same way, so the refusal
+// is terminal. It names counts and kinds, never the people.
 func (a *Adapter) refuseMovedThread(
 	operation string,
 	accountID string,
