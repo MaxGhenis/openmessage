@@ -78,7 +78,7 @@ func setMessageTranscriptHandler(a *app.App, configured ...Options) server.ToolH
 			return errorResult(fmt.Sprintf("set_message_transcript: %v", err)), nil
 		}
 		// In client mode the running app saves the transcript, as it does
-		// sends and reactions, so this process never writes the live store.
+		// sends and reactions, so the tool never writes the live store itself.
 		if options.Daemon != nil {
 			return daemonSetMessageTranscript(ctx, options.Daemon, messageID, transcript, model), nil
 		}
