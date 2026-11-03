@@ -280,16 +280,25 @@ curl -s http://127.0.0.1:7007/api/status | jq '.freshness'
 
 ### The legacy store keeps taking writes on v2-primary
 
-Cutover moved message reads to v2; it did not stop writes to `messages.db`,
-and some tools still read it (`list_contacts` and `resolve_contact_routes`
-look contacts and conversations up there). On a v2-primary daemon:
+Cutover moved the message-read tools to v2. It did not stop writes to
+`messages.db`, and some readers still use it: the web UI's People view
+(`/api/people`) loads its messages there with no v2-primary gate, and
+`list_contacts` and `resolve_contact_routes` look contacts and conversations
+up there. On a v2-primary daemon:
 
 - **Live transports write both stores.** The Google adapter hands each event
   to v2 ingest (`teeIngress`) and then to the legacy `client.EventHandler`,
   which stores it (`internal/bridgeadapters/google/google.go`). The Signal and
   WhatsApp bridges capture each received message for v2 and then run their
   legacy receive handlers (`signallive`: `observeIngress`, then
-  `handleDataMessage`; `whatsapplive.handleMessage`).
+  `handleDataMessage`; `whatsapplive.handleMessage`). A WhatsApp history sync
+  takes the same two steps (`captureHistorySyncIngress`, then
+  `handleHistorySync`).
+- **A failed v2 write leaves the legacy write in place.** Google logs `Google
+  ingest tee failed; continuing legacy event handling` and goes on. Signal
+  skips v2 when it has no sink and logs `Signal durable ingress tee failed;
+  legacy receive continued` when the append fails. WhatsApp stores a message
+  in legacy on its first delivery whether or not v2 committed it.
 - **Google catch-ups write both stores.** Every catch-up (startup, deep,
   window and phone backfills, reconciles, pending-media refreshes) offers each
   fetched message to v2's history ingress and then writes the legacy row
@@ -299,34 +308,59 @@ look contacts and conversations up there). On a v2-primary daemon:
     iMessage poll, off when `app.Sandboxed()`. The macOS launcher always sets
     that flag (`OPENMESSAGES_APP_SANDBOX=1` in `BackendLauncherCore.swift`),
     so the app never runs the poll.
-  - `cmd/serve.go` also runs a 30-minute Signal Desktop full rescan, which
-    checks only `SignalStatus().Paired`, so the app does run it.
-  - MCP `import_messages` (every daemon registers it) and `openmessage import`
-    import into the legacy store.
-- **Other legacy-only writes.** MCP `send_message` and `send_group_message`
-  upsert a legacy conversation row before they queue a send on v2, and drafts
-  and contacts live only in legacy.
+  - `cmd/serve.go` also runs a 30-minute Signal Desktop full rescan. It checks
+    only `SignalStatus().Paired`, which means signal-cli has an account, so
+    the app runs it even while signal-cli has no connection.
+  - MCP `import_messages` (every MCP server registers it, the stdio client
+    included) and `openmessage import` import into the legacy store.
+- **Other legacy-only writes.**
+  - Drafts, transcripts (`set_message_transcript`, `/api/transcript`) and the
+    `contacts` table live only in legacy. v2 holds the people and identities
+    the cutover migration built from those contacts.
+  - The web UI keeps its own state there: tabs, favorites, notification
+    modes, and the People view's tags, reach-out reminders and summaries.
+    `/api/new-conversation` writes a legacy conversation row for a new
+    WhatsApp or Signal thread, and `/api/mark-read` marks the legacy
+    conversation read before it copies the cursor into v2.
+  - An MCP server inside a process that runs the transports (`serve
+    --mcp-sse`, or `--mcp-stdio --transports`) upserts a legacy conversation
+    row before `send_message` or `send_group_message` queues a send on v2.
+    The stdio client in "MCP config" below writes no such row: it submits
+    through the app's outbox API, and the app itself (`serve --web`) serves no
+    MCP.
 - **Nothing copies v2 into legacy.** The v2 → legacy projector runs only on
   legacy-primary (`cmd/v2stack.go`). A send through the v2 outbox reaches
-  `messages.db` only when another writer brings it back: Google's echo and
-  catch-ups, or a desktop import that finds it in the desktop app's database.
+  `messages.db` only if another writer brings it back, such as Google's echo
+  and catch-ups, a WhatsApp history sync that carries it, or a desktop import
+  that finds it in the desktop app's database.
 
 So the two stores differ in both directions, and a reader of `messages.db` on
 a v2-primary install sees a different history from the read tools. That is
 one reason the stats/story/viz MCP tools refuse to run there
 (`unavailableWhileV2Serving`). `projection_stalled` (`addProjectionLag` in
 `internal/web/api.go`) compares the newest message in each store and flags a
-platform whose legacy side runs more than 5 minutes ahead. So it relies on
-these writes, and a local import alone can set it with no v2 stall.
+platform whose legacy side runs more than 5 minutes ahead, or that has legacy
+rows and none in v2. So it relies on these writes, and a local import alone
+can set it with no v2 stall.
 
 The difference can be large. On Max's install the v2 Signal inbox took no
 frame for 63.6 days, from 2026-08-18 to 2026-10-21, and v2 holds no Signal
 message from that span. Legacy holds 2,464 from it, in 36 conversations, and
 since 2026-07-19 legacy holds 3,092 Signal messages that v2 lacks (read-only
-counts, 2026-11-03). The Signal Desktop rescan writes legacy only, so v2
-reads never show a message that only Signal Desktop received. Draft #234
-proposes a v2 feed for Signal Desktop history, and draft #231 proposes
-keeping the local imports off on v2-primary.
+counts, 2026-11-03). Legacy stored 2,372 of those 2,464 in five blocks of
+consecutive rows, each covering days or weeks of messages at once. The last
+block holds 1,063 of them, sent from 2026-09-27, and went in on 2026-10-21
+between 13:04 and 13:18 local time. By then v2's Signal inbox had resumed (at
+11:39; it took 14 frames in the 13:00 hour), yet v2 holds none of those
+1,063. The live bridge offers each message to v2 before it writes legacy, so
+a Signal Desktop import wrote that block; the other four have the same shape.
+A Desktop import writes legacy only, so v2 reads never show a message that
+only Signal Desktop received after cutover (the cutover migration copied the
+earlier ones). Draft #234 proposes a v2 feed for Signal Desktop history, but
+as written it appends only while signal-cli has no account, has stayed
+offline for five minutes or has gone silent, so while signal-cli keeps
+receiving it won't back-fill this span. Draft #231 proposes keeping the local
+imports off on v2-primary.
 
 ## Google thread ids are device-local: phone swaps re-key everything
 
@@ -881,12 +915,12 @@ running app:
 
 Pin `OPENMESSAGES_DATA_DIR` to the app's dir so reads, the control token, and
 daemon-truth detection all line up (two-data-dirs trap above). On a migrated
-(v2-primary) install, also set `OPENMESSAGES_V2_PRIMARY=1`. The app serves
-message reads from the v2 store there, and the legacy `messages.db` keeps
-taking writes but differs from v2 (see "The legacy store keeps taking writes
-on v2-primary" above), so this keeps MCP reads on the v2 store even when the
-app isn't running or predates the `auth.data_dir` status field (drop the line
-on a non-migrated install).
+(v2-primary) install, also set `OPENMESSAGES_V2_PRIMARY=1`. The message-read
+tools serve the v2 store there, and the legacy `messages.db` keeps taking
+writes but differs from v2 (see "The legacy store keeps taking writes on
+v2-primary" above), so this keeps MCP reads on the v2 store even when the app
+isn't running or predates the `auth.data_dir` status field (drop the line on
+a non-migrated install).
 
 **Run the app's own binary, not a copy.** The MCP client opens the same SQLite
 stores as the app, and a binary at a different schema version than the store
