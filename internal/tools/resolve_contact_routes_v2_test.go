@@ -434,8 +434,8 @@ func TestResolveContactRoutesFindsPeopleByAnyFormOfTheirNumber(t *testing.T) {
 // own contact card puts the owner in the address book. A thread that matches
 // a query only through the owner says nothing about whom to send to, so the
 // owner's name and number route nowhere, and a search for another Sam doesn't
-// return every thread that the owner, Sam Owner, is in. This holds whichever
-// store serves reads.
+// return every thread that the owner, Sam Owner, is in or wrote in. This holds
+// whichever store serves reads.
 func TestResolveContactRoutesIgnoresTheAccountOwner(t *testing.T) {
 	owner := routeFixtureOwner{Name: "Sam Owner", ParticipantName: "Sammy", Number: "+15550009999", InAddressBook: true}
 	people := []routeFixturePerson{
@@ -457,6 +457,20 @@ func TestResolveContactRoutesIgnoresTheAccountOwner(t *testing.T) {
 			}
 			defer store.Close()
 			threads := seedRouteFixtureWithOwner(t, a.Store, store, owner, people)
+			// A legacy thread that doesn't list the owner still holds a
+			// message the owner sent, under the owner's name and number.
+			if err := a.Store.UpsertConversation(&db.Conversation{
+				ConversationID: "3102", Name: "Dee Example", SourcePlatform: "sms",
+				Participants: `[{"name":"Dee Example","number":"+15555550188"}]`, LastMessageTS: 1,
+			}); err != nil {
+				t.Fatalf("seed Dee's legacy thread: %v", err)
+			}
+			if err := a.Store.UpsertMessage(&db.Message{
+				MessageID: "owner-wrote", ConversationID: "3102", SenderName: owner.Name, SenderNumber: owner.Number,
+				IsFromMe: true, Body: "on my way", TimestampMS: 1, SourcePlatform: "sms",
+			}); err != nil {
+				t.Fatalf("seed the owner's message to Dee: %v", err)
+			}
 			options := Options{Reads: v2read.New(store), V2Primary: true, Daemon: daemon}
 			if mode == "legacy" {
 				// A legacy install routes by the legacy store's thread IDs.
