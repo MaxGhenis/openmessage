@@ -762,12 +762,23 @@ func (a *v1API) writeError(w http.ResponseWriter, err error) {
 	httpError(w, message, code)
 }
 
+// unknownConversationMessage answers a send whose conversation_id names no
+// conversation, such as a Google Messages thread number from a legacy read.
+const unknownConversationMessage = "unknown conversation_id: sends take the conversation_id that reads return " +
+	"(GET /api/conversations; MCP list_conversations, get_conversation or resolve_contact_routes), " +
+	"not a platform's thread ID such as a Google Messages thread number"
+
 func v1ErrorResponse(err error) (int, string) {
 	switch {
 	case errors.Is(err, v2wire.ErrReplyTargetUnavailable):
 		return http.StatusUnprocessableEntity, "reply_target_unavailable"
 	case errors.Is(err, v2wire.ErrReactionTargetUnavailable):
 		return http.StatusUnprocessableEntity, "reaction_target_unavailable"
+	case errors.Is(err, v2wire.ErrUnknownConversation):
+		// Still a 404, which callers already treat as a refusal, but one
+		// that names the ID to send: an agent holding a Google thread
+		// number needs to look the conversation up again.
+		return http.StatusNotFound, unknownConversationMessage
 	case errors.Is(err, messaging.ErrIdempotencyConflict):
 		return http.StatusConflict, err.Error()
 	case errors.Is(err, messaging.ErrInvalidState):

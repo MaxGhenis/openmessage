@@ -378,6 +378,8 @@ func TestResolveContactRoutesClientModeAsksTheAppWhichPlatformsCanSend(t *testin
 // is in, however the legacy store files them. Each person's legacy thread
 // number and current v2 thread number come from one small pool, so legacy
 // numbers collide, overwrite each other and name other people's v2 threads.
+// Differential: for a phone number, send_message's own thread lookup and
+// resolve_contact_routes pick the same thread.
 func TestResolveContactRoutesReturnsOnlyServingStoreThreadsOfThePerson(t *testing.T) {
 	names := []string{"Alice Example", "Bob Example", "Carol Example", "Dave Example"}
 	pool := []string{"2957", "3100", "3101", "3102", "3103"}
@@ -414,14 +416,14 @@ func TestResolveContactRoutesReturnsOnlyServingStoreThreadsOfThePerson(t *testin
 		}
 		threads := seedRouteFixture(t, a.Store, store, people)
 
-		var query, person string
+		var query, person, number string
 		switch random.Intn(5) {
 		case 0, 1:
 			person = names[random.Intn(len(names))]
 			query = strings.Fields(person)[0]
 		case 2:
 			index := random.Intn(len(names))
-			person, query = names[index], people[index].Number
+			person, query, number = names[index], people[index].Number, people[index].Number
 		case 3:
 			query = pool[random.Intn(len(pool))]
 		default:
@@ -452,6 +454,20 @@ func TestResolveContactRoutesReturnsOnlyServingStoreThreadsOfThePerson(t *testin
 		if person != "" && threads[person] != "" {
 			if len(matches) != 1 || matches[0].PreferredReplyConversationID != threads[person] {
 				t.Logf("seed %d, query %q: matches=%+v, want one whose preferred route is %q; people=%+v", seed, query, matches, threads[person], people)
+				return false
+			}
+		}
+		if number != "" {
+			direct, err := findDirectSMSConversation(options.Reads, number)
+			if err != nil {
+				t.Fatalf("findDirectSMSConversation(%q): %v", number, err)
+			}
+			viaSendMessage := ""
+			if direct != nil {
+				viaSendMessage = direct.ConversationID
+			}
+			if viaSendMessage != threads[person] {
+				t.Logf("seed %d, number %q: send_message picks %q, resolve_contact_routes picks %q; people=%+v", seed, number, viaSendMessage, threads[person], people)
 				return false
 			}
 		}

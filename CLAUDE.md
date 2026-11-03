@@ -122,6 +122,14 @@ processes sharing WhatsApp/signal-cli credentials log each other out). Reads
 come from the local store (v2 when the daemon reports v2-primary for the same
 data dir); sends, reactions, and `get_status` route through the running
 daemon's HTTP API (`internal/localapi`) with the CLI's daemon-truth semantics.
+Every conversation ID a read tool returns, `resolve_contact_routes` included,
+comes from that serving store, and the send tools take exactly those IDs. On
+a v2-primary daemon the outbox takes v2 conversation IDs only and answers any
+other ID, a Google Messages thread number included, with a 404 that says
+`unknown conversation_id`. Reads resolve a remote ID (#155); sends never do,
+because Google thread numbers are device-local and a phone change re-numbers
+them (#177). In client mode `resolve_contact_routes` asks the daemon whether
+WhatsApp and Signal can send.
 The client opens the store via `app.NewClient`, which skips the startup repair
 sweeps — those stay daemon-owned, so N concurrent sessions don't each burst
 repair writes into the live `messages.db`.

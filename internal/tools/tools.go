@@ -86,7 +86,7 @@ func RegisterWithOptions(s *server.MCPServer, a *app.App, options Options) {
 	s.AddTool(setMessageTranscriptTool(), setMessageTranscriptHandler(a))
 	s.AddTool(listConversationsTool(), listConversationsHandler(a, options))
 	s.AddTool(listContactsTool(), listContactsHandler(a))
-	s.AddTool(resolveContactRoutesTool(), resolveContactRoutesHandler(a))
+	s.AddTool(resolveContactRoutesTool(), resolveContactRoutesHandler(a, options))
 	if options.Daemon != nil {
 		s.AddTool(getStatusTool(), daemonGetStatusHandler(a, options))
 	} else {

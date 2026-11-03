@@ -57,7 +57,7 @@ func sendMediaToConversationTool(v2Enabled ...bool) mcp.Tool {
 	description := "Send a media attachment to an existing conversation by conversation ID across supported platforms"
 	options := []mcp.ToolOption{
 		mcp.WithDescription(description),
-		mcp.WithString("conversation_id", mcp.Required(), mcp.Description("Existing conversation ID from list_conversations or get_conversation")),
+		mcp.WithString("conversation_id", mcp.Required(), mcp.Description(conversationIDArgDescription)),
 		mcp.WithString("file_path", mcp.Required(), mcp.Description("Absolute or relative path to the local file to send")),
 		mcp.WithString("caption", mcp.Description("Optional caption for platforms that support media captions")),
 		mcp.WithString("mime_type", mcp.Description("Optional MIME type override, for example image/png")),

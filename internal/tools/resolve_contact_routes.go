@@ -12,6 +12,7 @@ import (
 
 	"github.com/maxghenis/openmessage/internal/app"
 	"github.com/maxghenis/openmessage/internal/db"
+	"github.com/maxghenis/openmessage/internal/readsource"
 )
 
 type resolvedRoute struct {
@@ -60,7 +61,16 @@ func resolveContactRoutesTool() mcp.Tool {
 	)
 }
 
-func resolveContactRoutesHandler(a *app.App, _ ...Options) server.ToolHandlerFunc {
+// resolveContactRoutesHandler finds routes in the serving store, so every
+// conversation ID it returns is one the send tools accept. On a v2-primary
+// install that is the v2 store. The legacy store files Google conversations
+// under the phone's thread numbers, which are device-local: a phone change
+// re-numbers them (issue #177), and the v2 outbox knows none of them, so a
+// legacy ID either fails the send (HTTP 404) or, aliased, could name another
+// person's thread. The legacy store still says who a name or number belongs
+// to (the address book and unified contacts), never which thread to use.
+func resolveContactRoutesHandler(a *app.App, configured ...Options) server.ToolHandlerFunc {
+	options := resolvedOptions(a, configured)
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		args := req.GetArguments()
 		query := strings.TrimSpace(strArg(args, "query"))
@@ -80,12 +90,16 @@ func resolveContactRoutesHandler(a *app.App, _ ...Options) server.ToolHandlerFun
 			}
 		}
 
-		convos, err := findRouteConversations(a, query, limit*8)
+		convos, err := findRouteConversations(options.Reads, a.Store, query, limit*8)
 		if err != nil {
 			return errorResult(fmt.Sprintf("resolve routes: %v", err)), nil
 		}
 
-		matches := buildResolvedRouteMatches(a, convos, limit)
+		var matches []resolvedRouteMatch
+		if len(convos) > 0 {
+			whatsAppConnected, signalConnected := routePlatformsConnected(ctx, a, options)
+			matches = buildResolvedRouteMatches(a.Store, convos, limit, whatsAppConnected, signalConnected)
+		}
 		if len(matches) == 0 {
 			return structuredResult(map[string]any{
 				"query":   query,
@@ -120,7 +134,11 @@ func resolveContactRoutesHandler(a *app.App, _ ...Options) server.ToolHandlerFun
 	}
 }
 
-func findRouteConversations(a *app.App, query string, limit int) ([]*db.Conversation, error) {
+// findRouteConversations returns the query's conversations from reads, the
+// serving store. people supplies the numbers of matching address-book
+// contacts and of matching participants in its own conversations; it then
+// searches reads for those numbers, never for a people-store conversation ID.
+func findRouteConversations(reads readsource.ReadSource, people *db.Store, query string, limit int) ([]*db.Conversation, error) {
 	if limit <= 0 {
 		limit = 20
 	}
@@ -138,24 +156,24 @@ func findRouteConversations(a *app.App, query string, limit int) ([]*db.Conversa
 		}
 	}
 
-	if conv, err := a.Store.GetConversation(query); err == nil && conv != nil {
+	if conv, err := reads.GetConversation(query); err == nil && conv != nil {
 		addConversation(conv)
 	}
 
-	convos, err := a.Store.SearchConversationsByMetadata(query, limit)
+	convos, err := reads.SearchConversationsByMetadata(query, limit)
 	if err != nil {
 		return nil, err
 	}
 	addConversations(convos)
 
-	contacts, err := a.Store.ListContacts(query, limit)
+	contacts, err := people.ListContacts(query, limit)
 	if err == nil {
 		for _, contact := range contacts {
 			if contact == nil {
 				continue
 			}
 			if number := strings.TrimSpace(contact.Number); number != "" {
-				numberConvos, err := a.Store.SearchConversationsByMetadata(number, limit)
+				numberConvos, err := reads.SearchConversationsByMetadata(number, limit)
 				if err == nil {
 					addConversations(numberConvos)
 				}
@@ -164,14 +182,14 @@ func findRouteConversations(a *app.App, query string, limit int) ([]*db.Conversa
 	}
 
 	if len(seen) == 0 {
-		fallbackContacts, err := a.Store.ListContactsFromConversations(query, limit)
+		fallbackContacts, err := people.ListContactsFromConversations(query, limit)
 		if err == nil {
 			for _, contact := range fallbackContacts {
 				if contact == nil {
 					continue
 				}
 				if number := strings.TrimSpace(contact.Number); number != "" {
-					numberConvos, err := a.Store.SearchConversationsByMetadata(number, limit)
+					numberConvos, err := reads.SearchConversationsByMetadata(number, limit)
 					if err == nil {
 						addConversations(numberConvos)
 					}
@@ -196,14 +214,12 @@ func findRouteConversations(a *app.App, query string, limit int) ([]*db.Conversa
 	return results, nil
 }
 
-func buildResolvedRouteMatches(a *app.App, convos []*db.Conversation, limit int) []resolvedRouteMatch {
+func buildResolvedRouteMatches(people *db.Store, convos []*db.Conversation, limit int, whatsAppConnected, signalConnected bool) []resolvedRouteMatch {
 	if len(convos) == 0 {
 		return nil
 	}
 
-	identityIndex := loadRouteIdentityIndex(a.Store)
-	whatsAppConnected := whatsAppStatus(a).Connected
-	signalConnected := signalStatus(a).Connected
+	identityIndex := loadRouteIdentityIndex(people)
 
 	type routeBucket struct {
 		MatchID       string
@@ -305,6 +321,29 @@ func resolveRouteBucketIdentity(conv *db.Conversation, identityIndex map[string]
 	}
 
 	return "participant:" + normalizeRouteIdentifier(participantID), "person", firstNonEmpty(displayName, participantID), "", participantID
+}
+
+// routePlatformsConnected reports whether WhatsApp and Signal can send now. In
+// client mode this process holds no transports, so the running app answers.
+// Asking this process instead would build its own bridges, which opens the
+// app's WhatsApp session store and starts Signal temp-dir sweeps, only to
+// report bridges that are not connected. An app that does not answer sends
+// nothing.
+func routePlatformsConnected(ctx context.Context, a *app.App, options Options) (whatsApp, signal bool) {
+	if options.Daemon != nil {
+		raw, err := options.Daemon.RawStatus(ctx)
+		if err != nil {
+			return false, false
+		}
+		return daemonPlatformConnected(raw, "whatsapp"), daemonPlatformConnected(raw, "signal")
+	}
+	return whatsAppStatus(a).Connected, signalStatus(a).Connected
+}
+
+func daemonPlatformConnected(raw map[string]any, key string) bool {
+	platform, _ := raw[key].(map[string]any)
+	connected, _ := platform["connected"].(bool)
+	return connected
 }
 
 func preferredReplyConversationID(routes []resolvedRoute) string {
