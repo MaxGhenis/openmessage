@@ -17,12 +17,13 @@ import (
 // transcriptsUnavailableWhileV2Serves explains the refusal on a v2-primary
 // install. Transcripts live only in the legacy store: v2 has no place for
 // them, and the legacy->v2 migration counts and drops them. The legacy store
-// froze at the cutover and the read tools serve v2, so a transcript saved
-// there is one no read shows, and the message IDs agents hold are v2 IDs the
-// legacy store doesn't know.
+// still takes writes, but the only places that show a transcript, the read
+// tools and the web UI's conversation view, read v2 there, so none would show
+// one saved to legacy. The message IDs agents hold are v2 IDs the legacy store
+// doesn't know.
 const transcriptsUnavailableWhileV2Serves = "not available while v2 is the serving store: " +
-	"the v2 store keeps no transcripts, and the legacy store, where this tool saves them, " +
-	"froze at the v2 cutover, so no read would show a transcript saved there."
+	"get_messages and the other message reads come from the v2 store, which keeps no transcripts, " +
+	"so none of them would show a transcript saved to the legacy store."
 
 func setMessageTranscriptTool() mcp.Tool {
 	return mcp.NewTool("set_message_transcript",

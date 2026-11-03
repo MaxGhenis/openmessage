@@ -166,12 +166,19 @@ local time on every surface (CLI, HTTP, MCP) via `db.ParseDayBound`, and the
 range tool labels rows in that same local time. The stats/story/viz tools
 (`conversation_stats`, `generate_story`,
 `person_stats`, `generate_person_story`, `generate_viz`, `render_story`) still
-load full histories from the legacy store, which froze at cutover, so they
-return an error naming the working read tools instead. `set_message_transcript`
-refuses on v2-primary too: transcripts live only in the legacy store (the v2
-store has no place for them, and `migrate` counts and drops them), so no read
-would show one saved there. In client mode on a legacy-primary install it
-saves through the app's `POST /api/transcript`.
+load full histories from the legacy store, so on v2-primary they return an
+error naming the working read tools instead. The message-read tools stopped
+reading that store at cutover, though the web UI's People view still does,
+and the store did not freeze: live transports, local imports and the web UI
+keep writing it, no projector mirrors v2 into it, and it differs from v2 in
+both directions (runbook: "The legacy store keeps taking writes on
+v2-primary"). `set_message_transcript` refuses on v2-primary too: transcripts
+live only in the legacy store (the v2 store has no place for them, and
+`migrate` counts and drops them), and the only places that show a transcript,
+the message-read tools and the web UI's conversation view, read v2 there. The
+People view reads legacy messages but never shows a transcript. In client mode
+on a legacy-primary install the tool saves through the app's
+`POST /api/transcript`.
 
 ### HTTP API
 

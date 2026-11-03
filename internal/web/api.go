@@ -57,11 +57,12 @@ const maxTranscriptRequestBytes = 6*(db.MaxTranscriptBytes+db.MaxTranscriptModel
 
 // transcriptsUnavailableInV2Primary is /api/transcript's refusal on a
 // v2-primary daemon. The v2 store keeps no transcripts (the legacy->v2
-// migration counts and drops them), and the legacy store this route writes
-// froze at the cutover: reads serve v2, so they would never show the
-// transcript, and the message IDs they hand out are v2 IDs.
+// migration counts and drops them). This route writes the legacy store, but
+// the message reads that show transcripts (the conversation view and the MCP
+// read tools) serve v2, so none would show it, and the message IDs they hand
+// out are v2 IDs.
 const transcriptsUnavailableInV2Primary = "transcripts are not available while v2 is the serving store: " +
-	"the v2 store keeps no transcripts, and the legacy store froze at the v2 cutover"
+	"message reads come from the v2 store, which keeps no transcripts"
 
 const sseWriteTimeout = 5 * time.Second
 

@@ -456,6 +456,23 @@ func TestDaemonReactToMessageThroughTheCompatibilityRoute(t *testing.T) {
 		assertV2ToolString(t, payload, "idempotency_key", "client-react-key")
 	})
 
+	t.Run("a rejected reaction keeps its error class", func(t *testing.T) {
+		daemon := &reactDaemon{t: t}
+		result := callDaemonReact(t, unreadableStatus(daemon, answerJSON(http.StatusBadGateway, map[string]any{
+			"success": false, "outbox_id": "out-rejected", "state": "rejected",
+			"error_class": "recipient_mismatch", "error_code": "send_reaction",
+			"error": "send reaction: the phone's thread for this conversation now names other people, so the app sent nothing",
+		})), arguments)
+		payload := v2ToolPayload(t, result)
+		assertV2ToolString(t, payload, "state", "rejected")
+		assertV2ToolString(t, payload, "error_class", "recipient_mismatch")
+		assertV2ToolString(t, payload, "error_code", "send_reaction")
+		if text := resultText(t, result); !strings.Contains(text, "error class recipient_mismatch") ||
+			!strings.Contains(text, "now names other people") {
+			t.Fatalf("rejected reaction text = %q, want its class and why", text)
+		}
+	})
+
 	t.Run("a refusal without a stored reaction is an error", func(t *testing.T) {
 		daemon := &reactDaemon{t: t}
 		result := callDaemonReact(t, unreadableStatus(daemon, answerJSON(http.StatusUnprocessableEntity, map[string]any{
@@ -501,6 +518,20 @@ func TestV2ReactionTextSaysAHeldReactionWaitsForItsMessage(t *testing.T) {
 		if strings.Contains(text, "waiting for the message") {
 			t.Fatalf("not_dispatched text for code %q = %q, want no mention of an unsent target", code, text)
 		}
+	}
+}
+
+// A reaction the adapter refused because the phone's thread now names other
+// people says the app sent nothing and steers away from reacting there again.
+func TestV2ReactionTextSaysAMovedThreadSentNothing(t *testing.T) {
+	text := v2ReactionText("outbox-1", messaging.OutboxRejected, "recipient_mismatch", "send_reaction", "")
+	for _, fragment := range []string{"outbox-1", "error class recipient_mismatch", "now names other people", "the app sent nothing", "react from the phone"} {
+		if !strings.Contains(text, fragment) {
+			t.Fatalf("recipient_mismatch reaction text missing %q: %q", fragment, text)
+		}
+	}
+	if strings.Contains(text, "The platform refused this reaction") {
+		t.Fatalf("recipient_mismatch reaction text reads as a platform refusal: %q", text)
 	}
 }
 

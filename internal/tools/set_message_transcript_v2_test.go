@@ -167,8 +167,8 @@ func appAPI(t *testing.T, store *db.Store, options web.APIOptions) *localapi.Cli
 
 // Replays set_message_transcript on a migrated (v2-primary) install, served
 // in-process. The read tools hand out v2 message IDs, which the legacy store
-// doesn't hold, and the legacy store froze at the cutover, so a transcript
-// saved there is one no read shows. The tool must refuse and say why, for the
+// doesn't hold, and they read v2, which keeps no transcripts, so a transcript
+// saved to legacy is one no read shows. The tool must refuse and say why, for the
 // ID an agent got from get_messages and for a legacy ID alike, and leave the
 // legacy store as it was.
 func TestSetMessageTranscriptRefusesWhileV2IsTheServingStore(t *testing.T) {

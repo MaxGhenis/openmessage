@@ -145,6 +145,10 @@ const (
 	FailureUpgradeRequired    FailureClass = "upgrade_required"
 	FailureMisconfigured      FailureClass = "misconfigured"
 	FailureUnsupported        FailureClass = "unsupported"
+	// FailureRecipientMismatch refuses a send whose remote conversation now
+	// names different people than the stored conversation it belongs to.
+	// Nothing went out, and resending to the same binding fails the same way.
+	FailureRecipientMismatch FailureClass = "recipient_mismatch"
 )
 
 type DispatchCertainty string

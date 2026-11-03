@@ -751,10 +751,10 @@ func TestSetTranscriptReportsTheStoredModel(t *testing.T) {
 	}
 }
 
-// A v2-primary daemon refuses transcripts. The v2 store keeps none, and the
-// legacy store this route writes froze at the cutover, so reads, which serve
-// v2, would never show one saved there. The refusal says why, and the legacy
-// store stays as it was.
+// A v2-primary daemon refuses transcripts. The v2 store keeps none, and
+// reads serve v2 there, so they would never show one saved to the legacy
+// store this route writes. The refusal says why, and the legacy store stays
+// as it was.
 func TestSetTranscriptRefusedWhileV2IsTheServingStore(t *testing.T) {
 	ts := newTestServerWithOptions(t, APIOptions{V2Primary: true})
 	seedTranscriptVoiceNote(t, ts.store)
