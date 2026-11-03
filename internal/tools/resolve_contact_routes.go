@@ -155,6 +155,17 @@ func findRouteConversations(reads readsource.ReadSource, people *db.Store, query
 			addConversation(conv)
 		}
 	}
+	// A store search for text matches a thread by its title or by any
+	// participant's name or number, and the legacy store lists the account's
+	// owner in nearly every thread. A thread that text matches only through
+	// the owner says nothing about whom to send to.
+	addSearchHits := func(text string, convos []*db.Conversation) {
+		for _, conv := range convos {
+			if !matchesOnlyTheOwner(conv, text) {
+				addConversation(conv)
+			}
+		}
+	}
 
 	// Only an exact ID names a conversation here. The v2 read source also
 	// resolves a platform's thread ID (#155), but a stale Google thread
@@ -168,7 +179,7 @@ func findRouteConversations(reads readsource.ReadSource, people *db.Store, query
 	if err != nil {
 		return nil, err
 	}
-	addConversations(convos)
+	addSearchHits(query, convos)
 	addConversations(phoneLineConversations(reads, query, limit))
 
 	searchNumber := func(number string) {
@@ -177,7 +188,7 @@ func findRouteConversations(reads readsource.ReadSource, people *db.Store, query
 			return
 		}
 		if numberConvos, err := reads.SearchConversationsByMetadata(number, limit); err == nil {
-			addConversations(numberConvos)
+			addSearchHits(number, numberConvos)
 		}
 		addConversations(phoneLineConversations(reads, number, limit))
 	}
@@ -264,6 +275,37 @@ func conversationHasPhoneLine(conv *db.Conversation, line string) bool {
 		}
 	}
 	return false
+}
+
+// matchesOnlyTheOwner reports whether text, ignoring case, appears in the
+// name or number of conv's owner entry (is_me) but in neither conv's title
+// nor any other participant's name or number.
+func matchesOnlyTheOwner(conv *db.Conversation, text string) bool {
+	text = strings.ToLower(strings.TrimSpace(text))
+	if conv == nil || text == "" || strings.Contains(strings.ToLower(conv.Name), text) {
+		return false
+	}
+	var participants []struct {
+		Name   string `json:"name"`
+		Number string `json:"number"`
+		Phone  string `json:"phone"`
+		IsMe   bool   `json:"is_me"`
+	}
+	if err := json.Unmarshal([]byte(conv.Participants), &participants); err != nil {
+		return false
+	}
+	owner := false
+	for _, participant := range participants {
+		number := firstNonEmpty(participant.Number, participant.Phone)
+		if !strings.Contains(strings.ToLower(participant.Name), text) && !strings.Contains(strings.ToLower(number), text) {
+			continue
+		}
+		if !participant.IsMe {
+			return false
+		}
+		owner = true
+	}
+	return owner
 }
 
 func buildResolvedRouteMatches(people *db.Store, convos []*db.Conversation, limit int, whatsAppConnected, signalConnected bool) []resolvedRouteMatch {

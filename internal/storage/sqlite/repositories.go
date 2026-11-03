@@ -805,7 +805,10 @@ func (s *Store) ListConversationsByRecencyAllAccounts(limit int) ([]Conversation
 // participants' display names or canonical addresses, contain query as a
 // case-insensitive substring — newest first, at most limit rows. It is the
 // bounded v2 counterpart of the legacy metadata search: the match runs in SQL
-// so callers map only the hits instead of every conversation.
+// so callers map only the hits instead of every conversation. The account's
+// owner takes part in nearly every conversation, so the owner's names and
+// address match nothing; matching them would return every recent
+// conversation and crowd out the people a search names.
 func (s *Store) SearchConversationsByName(query string, limit int) ([]Conversation, error) {
 	if limit <= 0 || strings.TrimSpace(query) == "" {
 		return []Conversation{}, nil
@@ -820,9 +823,10 @@ func (s *Store) SearchConversationsByName(query string, limit int) ([]Conversati
 		        SELECT cp.conversation_id
 		        FROM conversation_participants cp
 		        JOIN identities i ON i.identity_id = cp.identity_id
-		        WHERE cp.display_name LIKE ? ESCAPE '\'
-		           OR i.display_name LIKE ? ESCAPE '\'
-		           OR i.canonical_value LIKE ? ESCAPE '\'
+		        WHERE i.is_self = 0
+		          AND (cp.display_name LIKE ? ESCAPE '\'
+		               OR i.display_name LIKE ? ESCAPE '\'
+		               OR i.canonical_value LIKE ? ESCAPE '\')
 		    )
 		 ORDER BY last_message_at_ms DESC, conversation_id
 		 LIMIT ?`,

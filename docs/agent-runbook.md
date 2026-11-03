@@ -821,7 +821,12 @@ running app:
   The route tool finds a person by their number in any written form,
   comparing the last ten digits as `send_message` does for a recipient (v2
   stores E.164; the legacy store keeps numbers as the address book writes
-  them), and by a name that only the legacy store holds.
+  them), and by a name that only the legacy store holds. It skips the
+  account's owner, whom nearly every thread in both stores lists: a thread
+  that a query matches only through the owner's name or number is no route.
+  v2's conversation search (`SearchConversationsByName`, which also serves
+  `/api/search`) never matches the owner, since the owner's rows can carry a
+  name that reads don't show.
   Before the fix for the 2026-11-03 (UTC) incident, `resolve_contact_routes`
   read the legacy store on a v2-primary install and handed out Google thread
   numbers, which the outbox refused with a bare 404 `not found`, while
@@ -833,9 +838,11 @@ running app:
   tests: `TestClientModeSendsToTheRouteResolveContactRoutesPrefers`,
   `TestResolveContactRoutesNeverRoutesByAReusedGoogleThreadNumber`,
   `TestResolveContactRoutesFindsPeopleByAnyFormOfTheirNumber`,
-  `TestInProcessSendsTakeTheIDsResolveContactRoutesReturns` and
+  `TestInProcessSendsTakeTheIDsResolveContactRoutesReturns`,
+  `TestResolveContactRoutesIgnoresTheAccountOwner` and
   `TestResolveContactRoutesReturnsOnlyServingStoreThreadsOfThePerson`
-  (internal/tools), `TestSubmitTextV2SendsOnlyToTheConversationItsIDNames`
+  (internal/tools), `TestSearchConversationsByMetadataSkipsTheAccountOwner`
+  (internal/v2read), `TestSubmitTextV2SendsOnlyToTheConversationItsIDNames`
   (internal/v2wire).
 - Escape hatches: `--transports` forces the old standalone full-stack stdio
   behavior (only for machines where the MCP process is the *only* OpenMessage
