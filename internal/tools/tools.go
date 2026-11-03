@@ -115,9 +115,9 @@ func RegisterWithOptions(s *server.MCPServer, a *app.App, options Options) {
 
 // unavailableWhileV2Serving explains the gate on the stats/story/viz tools:
 // they load complete conversation histories from the legacy store, which
-// stopped serving reads at the v2 cutover and no longer matches the v2 store
-// (live transports and local desktop imports still write it, and v2 outbox
-// sends reach it only as a transport's echo), and the v2 read path maps messages
+// stopped serving message reads at the v2 cutover and no longer matches the v2
+// store (live transports and local imports still write it, and no projector
+// mirrors v2 outbox sends into it), and the v2 read path maps messages
 // row-by-row (identity, attachment, send-status lookups per message) —
 // pathological at full-history scale. The error names the tools that DO serve
 // v2 reads so agents don't dead-end here.
