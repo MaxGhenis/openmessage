@@ -132,9 +132,10 @@ device-local and a phone change re-numbers them (#177). The route tool finds
 a person by their number in any written form (the last ten digits, as
 `send_message` compares them) or by a name only the legacy store holds. It
 ignores the account's owner, whom nearly every thread lists, so the owner's
-name or number routes nowhere; v2's conversation search never matches the
-owner either. In client mode it asks the daemon whether WhatsApp and Signal
-can send.
+name or number routes nowhere. v2's conversation search never matches the
+owner either, and the legacy search matches only incoming messages' senders.
+In client mode the route tool asks the daemon whether WhatsApp and Signal can
+send.
 The client opens the store via `app.NewClient`, which skips the startup repair
 sweeps — those stay daemon-owned, so N concurrent sessions don't each burst
 repair writes into the live `messages.db`.

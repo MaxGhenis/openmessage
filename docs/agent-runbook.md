@@ -826,7 +826,9 @@ running app:
   that a query matches only through the owner's name or number is no route.
   v2's conversation search (`SearchConversationsByName`, which also serves
   `/api/search`) never matches the owner, since the owner's rows can carry a
-  name that reads don't show.
+  name that reads don't show. The legacy search matches only incoming
+  messages' senders, since the owner's outgoing messages carry the owner's
+  name and number.
   Before the fix for the 2026-11-03 (UTC) incident, `resolve_contact_routes`
   read the legacy store on a v2-primary install and handed out Google thread
   numbers, which the outbox refused with a bare 404 `not found`, while
@@ -842,7 +844,8 @@ running app:
   `TestResolveContactRoutesIgnoresTheAccountOwner` and
   `TestResolveContactRoutesReturnsOnlyServingStoreThreadsOfThePerson`
   (internal/tools), `TestSearchConversationsByMetadataSkipsTheAccountOwner`
-  (internal/v2read), `TestSubmitTextV2SendsOnlyToTheConversationItsIDNames`
+  (internal/v2read), `TestSearchConversationsByMetadataSkipsTheOwnersOwnMessages`
+  (internal/db), `TestSubmitTextV2SendsOnlyToTheConversationItsIDNames`
   (internal/v2wire).
 - Escape hatches: `--transports` forces the old standalone full-stack stdio
   behavior (only for machines where the MCP process is the *only* OpenMessage
