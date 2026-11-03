@@ -52,11 +52,35 @@ type routeFixturePerson struct {
 	NamelessInV2   bool
 }
 
-// seedRouteFixture writes people into the legacy store and the v2 store and
-// returns each v2 thread's conversation ID by name. Legacy rows are written in
-// order, so a later person filed under the same thread number overwrites an
-// earlier one, as the 2026-09-03 re-numbering overwrote legacy rows.
+// routeFixtureOwner is the account's owner. Both stores list the owner in
+// every fixture thread, as a live install's stores list them in nearly every
+// thread. ParticipantName, when set, is the name the owner's v2 participant
+// rows carry in place of the identity's name, as some live rows do; reads
+// show that name. InAddressBook files the owner's own card in the address
+// book, as a phone's "my card" does.
+type routeFixtureOwner struct {
+	Name            string
+	ParticipantName string
+	Number          string
+	InAddressBook   bool
+}
+
+// defaultRouteFixtureOwner shares no name or number with the people the
+// tests seed.
+var defaultRouteFixtureOwner = routeFixtureOwner{Name: "Me", Number: "+15550009999"}
+
+// seedRouteFixture seeds people under the default owner.
 func seedRouteFixture(t *testing.T, legacy *db.Store, store *sqlite.Store, people []routeFixturePerson) map[string]string {
+	t.Helper()
+	return seedRouteFixtureWithOwner(t, legacy, store, defaultRouteFixtureOwner, people)
+}
+
+// seedRouteFixtureWithOwner writes people into the legacy store and the v2
+// store and returns each v2 thread's conversation ID by name. Legacy rows are
+// written in order, so a later person filed under the same thread number
+// overwrites an earlier one, as the 2026-09-03 re-numbering overwrote legacy
+// rows.
+func seedRouteFixtureWithOwner(t *testing.T, legacy *db.Store, store *sqlite.Store, owner routeFixtureOwner, people []routeFixturePerson) map[string]string {
 	t.Helper()
 	now := time.Now().UnixMilli()
 	if err := store.UpsertAccount(sqlite.Account{
@@ -68,11 +92,16 @@ func seedRouteFixture(t *testing.T, legacy *db.Store, store *sqlite.Store, peopl
 	}
 	self := sqlite.Identity{
 		IdentityID: "identity-self", AccountID: routeFixtureAccount, Kind: sqlite.IdentityKind("e164"),
-		CanonicalValue: "+15550009999", RawValue: "+15550009999", DisplayName: "Me", IsSelf: true,
+		CanonicalValue: owner.Number, RawValue: owner.Number, DisplayName: owner.Name, IsSelf: true,
 		MetadataJSON: "{}", CreatedAtMS: now, UpdatedAtMS: now,
 	}
 	if err := store.UpsertIdentity(self); err != nil {
 		t.Fatalf("UpsertIdentity(self): %v", err)
+	}
+	if owner.InAddressBook {
+		if err := legacy.UpsertContact(&db.Contact{ContactID: "contact-owner", Name: owner.Name, Number: owner.Number}); err != nil {
+			t.Fatalf("seed the owner's contact card: %v", err)
+		}
 	}
 
 	threads := map[string]string{}
@@ -80,7 +109,10 @@ func seedRouteFixture(t *testing.T, legacy *db.Store, store *sqlite.Store, peopl
 		lastMS := now - int64(index)
 		legacyNumber := firstNonEmpty(person.LegacyNumber, person.Number)
 		if person.LegacyThreadID != "" {
-			participants, err := json.Marshal([]map[string]string{{"name": person.Name, "number": legacyNumber}})
+			participants, err := json.Marshal([]map[string]any{
+				{"name": person.Name, "number": legacyNumber},
+				{"name": owner.Name, "number": owner.Number, "is_me": true},
+			})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -128,7 +160,7 @@ func seedRouteFixture(t *testing.T, legacy *db.Store, store *sqlite.Store, peopl
 			t.Fatalf("UpsertConversation(%s): %v", person.Name, err)
 		}
 		if err := store.ReplaceConversationParticipants(conversationID, []sqlite.ConversationParticipant{
-			{AccountID: routeFixtureAccount, ConversationID: conversationID, IdentityID: self.IdentityID, Role: sqlite.ParticipantRoleMember, IsActive: true},
+			{AccountID: routeFixtureAccount, ConversationID: conversationID, IdentityID: self.IdentityID, Role: sqlite.ParticipantRoleMember, DisplayName: owner.ParticipantName, IsActive: true},
 			{AccountID: routeFixtureAccount, ConversationID: conversationID, IdentityID: identityID, Role: sqlite.ParticipantRoleMember, IsActive: true},
 		}); err != nil {
 			t.Fatalf("ReplaceConversationParticipants(%s): %v", person.Name, err)
@@ -398,6 +430,56 @@ func TestResolveContactRoutesFindsPeopleByAnyFormOfTheirNumber(t *testing.T) {
 	}
 }
 
+// Both stores list the account's owner in nearly every thread, and a phone's
+// own contact card puts the owner in the address book. A thread that matches
+// a query only through the owner says nothing about whom to send to, so the
+// owner's name and number route nowhere, and a search for another Sam doesn't
+// return every thread that the owner, Sam Owner, is in. This holds whichever
+// store serves reads.
+func TestResolveContactRoutesIgnoresTheAccountOwner(t *testing.T) {
+	owner := routeFixtureOwner{Name: "Sam Owner", ParticipantName: "Sammy", Number: "+15550009999", InAddressBook: true}
+	people := []routeFixturePerson{
+		{Name: "Sam Example", Number: "+15555550123", LegacyThreadID: "3100", RemoteThreadID: "3100"},
+		{Name: "Bob Example", Number: "+15555550199", LegacyThreadID: "3101", RemoteThreadID: "3101", InAddressBook: true},
+	}
+	status := http.NewServeMux()
+	status.HandleFunc("/api/status", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"connected": true})
+	})
+	daemon := daemonClientFor(t, status)
+
+	for _, mode := range []string{"v2-primary", "legacy"} {
+		t.Run(mode, func(t *testing.T) {
+			a := testApp(t)
+			store, err := sqlite.Open(filepath.Join(t.TempDir(), "v2.sqlite3"))
+			if err != nil {
+				t.Fatalf("sqlite.Open(): %v", err)
+			}
+			defer store.Close()
+			threads := seedRouteFixtureWithOwner(t, a.Store, store, owner, people)
+			options := Options{Reads: v2read.New(store), V2Primary: true, Daemon: daemon}
+			if mode == "legacy" {
+				// A legacy install routes by the legacy store's thread IDs.
+				options = Options{Reads: a.Store, Daemon: daemon}
+				threads = map[string]string{"Sam Example": "3100", "Bob Example": "3101"}
+			}
+			handler := resolveContactRoutesHandler(a, options)
+
+			for _, query := range append([]string{"Sam Owner", "Owner", "Sammy"}, routeNumberForms(owner.Number)...) {
+				if matches := routeMatches(t, callRouteTool(t, handler, map[string]any{"query": query})); len(matches) != 0 {
+					t.Errorf("routes for the owner's %q = %+v, want none", query, matches)
+				}
+			}
+			for query, name := range map[string]string{"Sam": "Sam Example", "Bob": "Bob Example"} {
+				matches := routeMatches(t, callRouteTool(t, handler, map[string]any{"query": query}))
+				if len(matches) != 1 || matches[0].PreferredReplyConversationID != threads[name] || matches[0].RouteCount != 1 {
+					t.Errorf("routes for %q = %+v, want one match with one route, %s's thread %q", query, matches, name, threads[name])
+				}
+			}
+		})
+	}
+}
+
 // In-process serving (the app's own MCP endpoint, or `serve --transports`)
 // takes the same IDs as client mode. send_media_to_conversation looked the ID
 // up in the legacy store before it reached the v2 outbox, so on a v2-primary
@@ -518,9 +600,11 @@ func TestResolveContactRoutesClientModeAsksTheAppWhichPlatformsCanSend(t *testin
 // Invariants, over random re-numberings of Google threads: every conversation
 // ID resolve_contact_routes returns names a conversation in the serving store,
 // so the send tools accept it; a person's routes are threads that person is
-// in, however the legacy store files them; a thread number yields no route;
-// and the tool finds everyone the stores can identify, by their number in any
-// form or by a name either store still holds. Each person's legacy thread
+// in, however the legacy store files them and even when the account's owner,
+// whom every thread lists, shares their first name; a thread number, or the
+// owner's name or number, yields no route; and the tool finds everyone the
+// stores can identify, by their number in any form or by a name either store
+// still holds. Each person's legacy thread
 // number and current v2 thread number come from one small pool, so legacy
 // numbers collide, overwrite each other and name other people's v2 threads.
 // Differential: for a person's number in any form, send_message's own thread
@@ -564,7 +648,12 @@ func TestResolveContactRoutesReturnsOnlyServingStoreThreadsOfThePerson(t *testin
 			}
 			people = append(people, person)
 		}
-		threads := seedRouteFixture(t, a.Store, store, people)
+		ownerFirstName := strings.Fields(names[random.Intn(len(names))])[0]
+		owner := routeFixtureOwner{Name: ownerFirstName + " Owner", Number: "+15550009999", InAddressBook: random.Intn(2) == 0}
+		if random.Intn(2) == 0 {
+			owner.ParticipantName = ownerFirstName + " O."
+		}
+		threads := seedRouteFixtureWithOwner(t, a.Store, store, owner, people)
 
 		// findableByName reports whether a name query can reach people[index]'s
 		// v2 thread: by the name v2 holds, through the address book, or
@@ -591,11 +680,14 @@ func TestResolveContactRoutesReturnsOnlyServingStoreThreadsOfThePerson(t *testin
 
 		var query, person, number string
 		found := false
-		switch random.Intn(6) {
+		switch random.Intn(7) {
 		case 0, 1:
 			index := random.Intn(len(names))
 			person, query = names[index], strings.Fields(names[index])[0]
 			found = findableByName(index)
+			if query == ownerFirstName {
+				exercised["a first name the owner shares"]++
+			}
 			switch {
 			case !found:
 				exercised["unfindable name"]++
@@ -620,6 +712,10 @@ func TestResolveContactRoutesReturnsOnlyServingStoreThreadsOfThePerson(t *testin
 		case 4:
 			query = pool[random.Intn(len(pool))]
 			exercised["thread number"]++
+		case 5:
+			forms := append([]string{owner.Name, "Owner", firstNonEmpty(owner.ParticipantName, owner.Name)}, routeNumberForms(owner.Number)...)
+			query = forms[random.Intn(len(forms))]
+			exercised["the owner's name or number"]++
 		default:
 			query = "nobody-" + strconv.Itoa(random.Intn(100))
 			exercised["unknown text"]++
@@ -677,6 +773,7 @@ func TestResolveContactRoutesReturnsOnlyServingStoreThreadsOfThePerson(t *testin
 	for _, path := range []string{
 		"name in v2", "name in the address book", "name on a legacy thread", "unfindable name",
 		"E.164 number", "number in another form", "thread number", "unknown text",
+		"a first name the owner shares", "the owner's name or number",
 	} {
 		if exercised[path] == 0 {
 			t.Errorf("the property never drew a query by %s; raise MaxCount (drew %v)", path, exercised)
