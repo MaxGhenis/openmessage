@@ -176,20 +176,21 @@ func (s *Store) RepairLegacyArtifacts() (LegacyRepairReport, error) {
 		}
 	}
 
-	if err := tx.Commit(); err != nil {
-		return report, err
-	}
-
 	if (report.DeletedWhatsAppReactionPlaceholders > 0 ||
 		report.DeletedWhatsAppUnsupportedRows > 0 ||
 		report.DeletedSignalReactionPlaceholders > 0 ||
 		report.FixedSignalBlankMessages > 0) && s.ftsEnabled {
 		// Repair rewrites message bodies in place (blank → placeholder), which
 		// doesn't change the row count, so the count-guarded rebuildFTS would
-		// skip it. Force a full repopulation to pick up the new bodies.
-		if err := s.forceRebuildFTS(); err != nil {
+		// skip it. Repopulate the index in the same transaction, so the new
+		// bodies and their index entries commit together.
+		if err := rebuildSearchIndexTx(tx); err != nil {
 			return report, err
 		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return report, err
 	}
 
 	if err := s.db.QueryRow(`
