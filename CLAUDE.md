@@ -179,8 +179,13 @@ local time on every surface (CLI, HTTP, MCP) via `db.ParseDayBound`, and the
 range tool labels rows in that same local time. The stats/story/viz tools
 (`conversation_stats`, `generate_story`,
 `person_stats`, `generate_person_story`, `generate_viz`, `render_story`) still
-load full histories from the legacy store, which froze at cutover, so they
-return an error naming the working read tools instead.
+load full histories from the legacy store, so on v2-primary they return an
+error naming the working read tools instead. The message-read tools stopped
+reading that store at cutover, though the web UI's People view still does,
+and the store did not freeze: live transports, local imports and the web UI
+keep writing it, no projector mirrors v2 into it, and it differs from v2 in
+both directions (runbook: "The legacy store keeps taking writes on
+v2-primary").
 
 ### HTTP API
 

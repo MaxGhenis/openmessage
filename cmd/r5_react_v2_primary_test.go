@@ -169,7 +169,7 @@ func TestR5ReactRoutesThroughTheOutboxOnV2Primary(t *testing.T) {
 			reachedLegacy := slices.Clone(legacyCalls[legacyBefore:])
 			legacyMu.Unlock()
 			if len(reachedLegacy) != 0 {
-				t.Errorf("the reaction went to the legacy transport callback, which reads the frozen legacy store: %+v", reachedLegacy)
+				t.Errorf("the reaction went to the legacy transport callback instead of the v2 outbox: %+v", reachedLegacy)
 			}
 			if response.Code < 200 || response.Code > 299 {
 				t.Errorf("POST /api/react = %d %s, want a 2xx", response.Code, bytes.TrimSpace(response.Body.Bytes()))

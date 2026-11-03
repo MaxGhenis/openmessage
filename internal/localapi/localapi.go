@@ -417,12 +417,15 @@ func (c *Client) LegacySendMedia(ctx context.Context, submission MediaSubmission
 // and waits a few seconds for it to settle, so its answer also carries the
 // intent: Queued is true (HTTP 202) when the reaction is stored but not yet
 // delivered, in which case the daemon keeps retrying it and the caller must
-// not react again. OutboxID and State identify the intent for Delivery.
+// not react again. OutboxID and State identify the intent for Delivery, and
+// ErrorClass and ErrorCode, when set, say why the outbox did not deliver it.
 type ReactResult struct {
-	Success  bool   `json:"success"`
-	Queued   bool   `json:"queued"`
-	OutboxID string `json:"outbox_id"`
-	State    string `json:"state"`
+	Success    bool   `json:"success"`
+	Queued     bool   `json:"queued"`
+	OutboxID   string `json:"outbox_id"`
+	State      string `json:"state"`
+	ErrorClass string `json:"error_class"`
+	ErrorCode  string `json:"error_code"`
 }
 
 // React routes a reaction through the daemon's /api/react surface, which

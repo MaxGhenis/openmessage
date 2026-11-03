@@ -89,9 +89,9 @@ func callDownloadMedia(t *testing.T, options Options, args map[string]any) *mcp.
 	return result
 }
 
-// Before the fix this tool looked every id up in the legacy store, which
-// froze at the v2 cutover, and answered "message not found" for both the v2
-// message ID and the media_id get_messages reported for it.
+// Before the fix this tool looked every id up in the legacy store, which holds
+// no v2 message IDs, and answered "message not found" for both the v2 message
+// ID and the media_id get_messages reported for it.
 func TestDownloadMediaResolvesV2MessageIDAndMediaIDThroughTheApp(t *testing.T) {
 	exportRoot := t.TempDir()
 	t.Setenv("OPENMESSAGES_EXPORT_DIR", exportRoot)
