@@ -109,6 +109,25 @@ day) to scope a search to a date window. Date filtering lives in the store via
 `SearchFilter`/`SearchMessagesFiltered`; the legacy `SearchMessages(query,
 phone, limit)` wrapper is preserved for the MCP tool and HTTP API.
 
+## Store disk use
+
+Both stores cap their WAL at 64 MiB: each sets `journal_size_limit` on every
+connection through its DSN. New legacy stores start in incremental
+auto-vacuum mode, and the daemon returns their free pages to disk in small
+steps (`cmd/legacy_free_pages.go`). A legacy store created before that keeps
+its free pages until one rewrite:
+
+```bash
+openmessage compact [--json]                               # report free pages and WAL size; only reads
+openmessage compact --apply [--backup-dir DIR] [--json]    # quit the app first: back up, VACUUM, verify
+```
+
+`--apply` refuses while the app runs. It backs the store up with `VACUUM
+INTO`, shows the backup holds the store's rows (per-table digests), rewrites
+the store into incremental mode, and checks every table again. It prints
+sizes and counts only. See [docs/agent-runbook.md](docs/agent-runbook.md)
+("Disk use: the WAL cap and free pages").
+
 ## Multi-platform import
 
 ```bash

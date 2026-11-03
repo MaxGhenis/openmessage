@@ -53,7 +53,13 @@ func (s StorageStats) FreeBytes() int64 { return s.PageSize * s.FreePages }
 // StorageStats reads the page counts and the auto-vacuum mode in one read
 // transaction, so all four come from the same snapshot.
 func (s *Store) StorageStats(ctx context.Context) (StorageStats, error) {
-	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	return StorageStatsOf(ctx, s.db)
+}
+
+// StorageStatsOf is StorageStats for a database opened some other way, such
+// as read-only, which never runs New's migrations.
+func StorageStatsOf(ctx context.Context, database *sql.DB) (StorageStats, error) {
+	tx, err := database.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		return StorageStats{}, fmt.Errorf("read storage stats: %w", err)
 	}
@@ -135,8 +141,17 @@ func (s *Store) Compact(ctx context.Context) (CompactReport, error) {
 	if _, err := conn.ExecContext(ctx, "VACUUM"); err != nil {
 		return CompactReport{}, fmt.Errorf("compact: vacuum: %w", err)
 	}
-	if report.Checkpoint, err = checkpoint(ctx, conn, "TRUNCATE"); err != nil {
-		return CompactReport{}, fmt.Errorf("compact: checkpoint: %w", err)
+	// A reader in another process that still holds an older snapshot keeps
+	// the checkpoint from finishing. Each attempt waits busy_timeout for it,
+	// so a few attempts ride out a slow reader; if one is still busy, the
+	// next checkpoint copies the rest and shrinks the file then.
+	for attempt := 1; ; attempt++ {
+		if report.Checkpoint, err = checkpoint(ctx, conn, "TRUNCATE"); err != nil {
+			return CompactReport{}, fmt.Errorf("compact: checkpoint: %w", err)
+		}
+		if !report.Checkpoint.Busy || attempt == compactCheckpointAttempts {
+			break
+		}
 	}
 	if report.After, err = storageStats(ctx, conn); err != nil {
 		return CompactReport{}, fmt.Errorf("compact: %w", err)
@@ -146,6 +161,8 @@ func (s *Store) Compact(ctx context.Context) (CompactReport, error) {
 	}
 	return report, nil
 }
+
+const compactCheckpointAttempts = 3
 
 func checkpoint(ctx context.Context, conn *sql.Conn, mode string) (Checkpoint, error) {
 	var busy int
@@ -217,9 +234,15 @@ type TableDigest struct {
 // ContentDigest digests every ordinary table, the search index's shadow
 // tables among them; virtual tables are skipped, since their rows live in
 // those shadow tables. It reads one snapshot. openmessage compact compares
-// the digests before and after the rewrite.
+// the digests of the store, its backup, and the rewritten store.
 func (s *Store) ContentDigest(ctx context.Context) (map[string]TableDigest, error) {
-	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	return ContentDigestOf(ctx, s.db)
+}
+
+// ContentDigestOf is ContentDigest for a database opened some other way, such
+// as a read-only backup.
+func ContentDigestOf(ctx context.Context, database *sql.DB) (map[string]TableDigest, error) {
+	tx, err := database.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		return nil, fmt.Errorf("digest store content: %w", err)
 	}
