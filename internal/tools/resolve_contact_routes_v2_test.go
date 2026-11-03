@@ -41,15 +41,18 @@ const routeFixtureAccount = "google-primary"
 // Number is the E.164 form v2 stores; LegacyNumber, when set, is the form the
 // legacy store keeps, as written in the address book. NamelessInV2 leaves the
 // v2 thread with the number only, as for someone missing from the phone's
-// contacts, so only the legacy store knows the name.
+// contacts, so only the legacy store knows the name. ParticipantName, when
+// set, is the name the person's v2 participant row carries in place of the
+// identity's name; reads show that name, and v2's search matches both.
 type routeFixturePerson struct {
-	Name           string
-	Number         string
-	LegacyNumber   string
-	LegacyThreadID string
-	RemoteThreadID string
-	InAddressBook  bool
-	NamelessInV2   bool
+	Name            string
+	Number          string
+	LegacyNumber    string
+	LegacyThreadID  string
+	RemoteThreadID  string
+	InAddressBook   bool
+	NamelessInV2    bool
+	ParticipantName string
 }
 
 // routeFixtureOwner is the account's owner. Both stores list the owner in
@@ -161,7 +164,7 @@ func seedRouteFixtureWithOwner(t *testing.T, legacy *db.Store, store *sqlite.Sto
 		}
 		if err := store.ReplaceConversationParticipants(conversationID, []sqlite.ConversationParticipant{
 			{AccountID: routeFixtureAccount, ConversationID: conversationID, IdentityID: self.IdentityID, Role: sqlite.ParticipantRoleMember, DisplayName: owner.ParticipantName, IsActive: true},
-			{AccountID: routeFixtureAccount, ConversationID: conversationID, IdentityID: identityID, Role: sqlite.ParticipantRoleMember, IsActive: true},
+			{AccountID: routeFixtureAccount, ConversationID: conversationID, IdentityID: identityID, Role: sqlite.ParticipantRoleMember, DisplayName: person.ParticipantName, IsActive: true},
 		}); err != nil {
 			t.Fatalf("ReplaceConversationParticipants(%s): %v", person.Name, err)
 		}
@@ -494,6 +497,41 @@ func TestResolveContactRoutesIgnoresTheAccountOwner(t *testing.T) {
 	}
 }
 
+// v2's search matches a participant by the name on their participant row or
+// by their identity's name, and reads show the row's name when it has one.
+// Here the owner is Sam Owner and Sam Example's row reads "Bobby", so a search
+// for "Sam" finds Sam's thread through a name that reads hide, while the only
+// "Sam" that reads show is the owner's. The thread still routes: v2's search
+// skips the owner, so none of its hits matches only through the owner.
+func TestResolveContactRoutesKeepsV2MatchesOnANameReadsHide(t *testing.T) {
+	a := testApp(t)
+	store, err := sqlite.Open(filepath.Join(t.TempDir(), "v2.sqlite3"))
+	if err != nil {
+		t.Fatalf("sqlite.Open(): %v", err)
+	}
+	defer store.Close()
+	owner := routeFixtureOwner{Name: "Sam Owner", Number: "+15550009999"}
+	threads := seedRouteFixtureWithOwner(t, a.Store, store, owner, []routeFixturePerson{
+		{Name: "Sam Example", ParticipantName: "Bobby", Number: "+15555550177", RemoteThreadID: "3100"},
+	})
+	status := http.NewServeMux()
+	status.HandleFunc("/api/status", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"connected": true})
+	})
+	options := Options{Reads: v2read.New(store), V2Primary: true, Daemon: daemonClientFor(t, status)}
+	handler := resolveContactRoutesHandler(a, options)
+
+	for _, query := range []string{"Sam", "Sam Example", "Bobby"} {
+		matches := routeMatches(t, callRouteTool(t, handler, map[string]any{"query": query}))
+		if len(matches) != 1 || matches[0].PreferredReplyConversationID != threads["Sam Example"] {
+			t.Errorf("routes for %q = %+v, want one whose preferred route is Sam Example's thread %q", query, matches, threads["Sam Example"])
+		}
+	}
+	if matches := routeMatches(t, callRouteTool(t, handler, map[string]any{"query": owner.Name})); len(matches) != 0 {
+		t.Errorf("routes for the owner's %q = %+v, want none", owner.Name, matches)
+	}
+}
+
 // In-process serving (the app's own MCP endpoint, or `serve --transports`)
 // takes the same IDs as client mode. send_media_to_conversation looked the ID
 // up in the legacy store before it reached the v2 outbox, so on a v2-primary
@@ -618,9 +656,10 @@ func TestResolveContactRoutesClientModeAsksTheAppWhichPlatformsCanSend(t *testin
 // whom every thread lists, shares their first name; a thread number, or the
 // owner's name or number, yields no route; and the tool finds everyone the
 // stores can identify, by their number in any form or by a name either store
-// still holds. Each person's legacy thread
-// number and current v2 thread number come from one small pool, so legacy
-// numbers collide, overwrite each other and name other people's v2 threads.
+// still holds, even where v2 reads show another name. Each person's legacy
+// thread number and current v2 thread number come from one small pool, so
+// legacy numbers collide, overwrite each other and name other people's v2
+// threads.
 // Differential: for a person's number in any form, send_message's own thread
 // lookup and resolve_contact_routes pick the same thread.
 func TestResolveContactRoutesReturnsOnlyServingStoreThreadsOfThePerson(t *testing.T) {
@@ -659,6 +698,9 @@ func TestResolveContactRoutesReturnsOnlyServingStoreThreadsOfThePerson(t *testin
 			}
 			if random.Intn(5) != 0 {
 				person.RemoteThreadID = pool[remote[index]]
+			}
+			if random.Intn(2) == 0 {
+				person.ParticipantName = "Contact " + strconv.Itoa(index)
 			}
 			people = append(people, person)
 		}
@@ -707,6 +749,9 @@ func TestResolveContactRoutesReturnsOnlyServingStoreThreadsOfThePerson(t *testin
 				exercised["unfindable name"]++
 			case !people[index].NamelessInV2:
 				exercised["name in v2"]++
+				if people[index].ParticipantName != "" {
+					exercised["a name in v2 that reads hide"]++
+				}
 			case people[index].InAddressBook:
 				exercised["name in the address book"]++
 			default:
@@ -787,7 +832,7 @@ func TestResolveContactRoutesReturnsOnlyServingStoreThreadsOfThePerson(t *testin
 	for _, path := range []string{
 		"name in v2", "name in the address book", "name on a legacy thread", "unfindable name",
 		"E.164 number", "number in another form", "thread number", "unknown text",
-		"a first name the owner shares", "the owner's name or number",
+		"a first name the owner shares", "the owner's name or number", "a name in v2 that reads hide",
 	} {
 		if exercised[path] == 0 {
 			t.Errorf("the property never drew a query by %s; raise MaxCount (drew %v)", path, exercised)
