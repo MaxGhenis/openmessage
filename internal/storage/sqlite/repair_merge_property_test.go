@@ -653,7 +653,8 @@ func readRepairPlanState(t *testing.T, store *Store) repairPlanState {
 // repairPropertyConfig returns the cases and seed for a repair property test:
 // fewer cases under -race, where the pure-Go SQLite engine runs about tenfold
 // slower. OPENMESSAGE_PROPERTY_CASES and OPENMESSAGE_PROPERTY_SEED override
-// both, so a sweep over seeds needs no rebuild.
+// both, so a sweep over seeds needs no rebuild. The test's log names both, so
+// a failure says how to replay it.
 func repairPropertyConfig(t *testing.T, cases, raceCases int) *quick.Config {
 	t.Helper()
 	if raceDetectorEnabled {
@@ -674,6 +675,7 @@ func repairPropertyConfig(t *testing.T, cases, raceCases int) *quick.Config {
 		}
 		target(value)
 	}
+	t.Logf("replay: OPENMESSAGE_PROPERTY_SEED=%d OPENMESSAGE_PROPERTY_CASES=%d go test -run '^%s$'", seed, cases, t.Name())
 	return &quick.Config{MaxCount: cases, Rand: rand.New(rand.NewSource(seed))}
 }
 
