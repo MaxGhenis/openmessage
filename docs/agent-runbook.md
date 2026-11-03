@@ -338,7 +338,13 @@ up there. On a v2-primary daemon:
   matches a v2 one, so favorite answers 404, notification mode and tab answer
   500, and move and mark-read answer 200 and change nothing. The UI never
   posts mark-read there anyway, since v2 reads always report an unread count
-  of 0.
+  of 0. Don't post mark-read with a legacy ID there either. Its copy into v2
+  (`v2wire.MirrorReadCursor`) rewrites the v2 account's bridge key and
+  display name before it fails. Google's `google_messages` becomes `google`,
+  so v2 reads then report `google` instead of `sms` as each Google thread's
+  platform, and the Google echo-duplicate repair
+  (`RepairUncorrelatedEchoDuplicates`) skips the account. PR #217 proposes
+  the fix.
 - **Nothing copies v2 into legacy.** The v2 → legacy projector runs only on
   legacy-primary (`cmd/v2stack.go`). A send through the v2 outbox reaches
   `messages.db` only if another writer brings it back, such as Google's echo
