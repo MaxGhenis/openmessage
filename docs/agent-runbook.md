@@ -813,18 +813,27 @@ running app:
   conversation IDs only: any other ID, a Google Messages thread number
   included, gets HTTP 404 `unknown conversation_id: …`, and the outbox queues
   nothing.
-  Reads resolve a remote ID to its conversation (#155); sends never do,
-  because Google thread numbers are device-local and a phone change
-  re-numbers them (#176, #177; "Google thread ids are device-local" above),
-  so an old number can name another person's thread.
+  Reads resolve a remote ID to its conversation (#155). Sends never do, and
+  neither does `resolve_contact_routes`, which says where to send: Google
+  thread numbers are device-local and a phone change re-numbers them (#176,
+  #177; "Google thread ids are device-local" above), so an old number can
+  name another person's thread.
+  The route tool finds a person by their number in any written form,
+  comparing the last ten digits as `send_message` does for a recipient (v2
+  stores E.164; the legacy store keeps numbers as the address book writes
+  them), and by a name that only the legacy store holds.
   Before the fix for the 2026-11-03 (UTC) incident, `resolve_contact_routes`
   read the legacy store on a v2-primary install and handed out Google thread
   numbers, which the outbox refused with a bare 404 `not found`, while
-  `send_message` by phone number worked. In client mode the route tool also takes WhatsApp and
-  Signal sendability from the daemon's `/api/status` (no answer: not
-  sendable) instead of building its own bridges. Regression tests:
-  `TestClientModeSendsToTheRouteResolveContactRoutesPrefers`,
-  `TestResolveContactRoutesNeverRoutesByAReusedGoogleThreadNumber` and
+  `send_message` by phone number worked. In-process
+  `send_media_to_conversation` on v2-primary refused every v2 ID too: it
+  looked the ID up in the legacy store first. In client mode the route tool
+  takes WhatsApp and Signal sendability from the daemon's `/api/status` (no
+  answer: not sendable) instead of building its own bridges. Regression
+  tests: `TestClientModeSendsToTheRouteResolveContactRoutesPrefers`,
+  `TestResolveContactRoutesNeverRoutesByAReusedGoogleThreadNumber`,
+  `TestResolveContactRoutesFindsPeopleByAnyFormOfTheirNumber`,
+  `TestInProcessSendsTakeTheIDsResolveContactRoutesReturns` and
   `TestResolveContactRoutesReturnsOnlyServingStoreThreadsOfThePerson`
   (internal/tools), `TestSubmitTextV2SendsOnlyToTheConversationItsIDNames`
   (internal/v2wire).

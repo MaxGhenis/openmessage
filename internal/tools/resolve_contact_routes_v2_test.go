@@ -523,7 +523,7 @@ func TestResolveContactRoutesClientModeAsksTheAppWhichPlatformsCanSend(t *testin
 // form or by a name either store still holds. Each person's legacy thread
 // number and current v2 thread number come from one small pool, so legacy
 // numbers collide, overwrite each other and name other people's v2 threads.
-// Differential: for a phone number in any form, send_message's own thread
+// Differential: for a person's number in any form, send_message's own thread
 // lookup and resolve_contact_routes pick the same thread.
 func TestResolveContactRoutesReturnsOnlyServingStoreThreadsOfThePerson(t *testing.T) {
 	names := []string{"Alice Example", "Bob Example", "Carol Example", "Dave Example"}
@@ -533,6 +533,7 @@ func TestResolveContactRoutesReturnsOnlyServingStoreThreadsOfThePerson(t *testin
 		_ = json.NewEncoder(w).Encode(map[string]any{"connected": true, "v2_primary": true, "v2_send": true})
 	})
 	daemon := daemonClientFor(t, status)
+	exercised := map[string]int{}
 
 	property := func(seed int64) bool {
 		random := rand.New(rand.NewSource(seed))
@@ -595,16 +596,33 @@ func TestResolveContactRoutesReturnsOnlyServingStoreThreadsOfThePerson(t *testin
 			index := random.Intn(len(names))
 			person, query = names[index], strings.Fields(names[index])[0]
 			found = findableByName(index)
+			switch {
+			case !found:
+				exercised["unfindable name"]++
+			case !people[index].NamelessInV2:
+				exercised["name in v2"]++
+			case people[index].InAddressBook:
+				exercised["name in the address book"]++
+			default:
+				exercised["name on a legacy thread"]++
+			}
 		case 2, 3:
 			index := random.Intn(len(names))
 			forms := routeNumberForms(people[index].Number)
 			person, query = names[index], forms[random.Intn(len(forms))]
 			number = query
 			found = threads[person] != ""
+			if query == people[index].Number {
+				exercised["E.164 number"]++
+			} else {
+				exercised["number in another form"]++
+			}
 		case 4:
 			query = pool[random.Intn(len(pool))]
+			exercised["thread number"]++
 		default:
 			query = "nobody-" + strconv.Itoa(random.Intn(100))
+			exercised["unknown text"]++
 		}
 
 		options := Options{Reads: v2read.New(store), V2Primary: true, Daemon: daemon}
@@ -655,5 +673,13 @@ func TestResolveContactRoutesReturnsOnlyServingStoreThreadsOfThePerson(t *testin
 	}
 	if err := quick.Check(property, &quick.Config{MaxCount: 160, Rand: rand.New(rand.NewSource(20261103))}); err != nil {
 		t.Fatal(err)
+	}
+	for _, path := range []string{
+		"name in v2", "name in the address book", "name on a legacy thread", "unfindable name",
+		"E.164 number", "number in another form", "thread number", "unknown text",
+	} {
+		if exercised[path] == 0 {
+			t.Errorf("the property never drew a query by %s; raise MaxCount (drew %v)", path, exercised)
+		}
 	}
 }

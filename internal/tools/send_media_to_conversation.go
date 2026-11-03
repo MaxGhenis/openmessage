@@ -96,12 +96,19 @@ func sendMediaToConversationHandler(a *app.App, v2Options ...*V2Dependencies) se
 			return errorResult("file_path is required"), nil
 		}
 
-		conv, err := a.Store.GetConversation(conversationID)
-		if err != nil {
-			return errorResult(fmt.Sprintf("failed to load conversation: %v", err)), nil
-		}
-		if conv == nil {
-			return errorResult(fmt.Sprintf("conversation %s not found", conversationID)), nil
+		// Legacy sends, and v2 sends in mirror mode, take legacy IDs. On
+		// v2-primary the IDs are v2's, which the legacy store doesn't hold;
+		// SubmitMediaV2 checks those, as SubmitTextV2 does for text.
+		var conv *db.Conversation
+		if v2 == nil || !v2.V2Primary {
+			loaded, err := a.Store.GetConversation(conversationID)
+			if err != nil {
+				return errorResult(fmt.Sprintf("failed to load conversation: %v", err)), nil
+			}
+			if loaded == nil {
+				return errorResult(fmt.Sprintf("conversation %s not found", conversationID)), nil
+			}
+			conv = loaded
 		}
 
 		if info, err := os.Stat(filePath); err != nil {

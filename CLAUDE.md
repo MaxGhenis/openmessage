@@ -127,9 +127,11 @@ comes from that serving store, and the send tools take exactly those IDs. On
 a v2-primary daemon the outbox takes v2 conversation IDs only and answers any
 other ID, a Google Messages thread number included, with a 404 that says
 `unknown conversation_id`. Reads resolve a remote ID (#155); sends never do,
-because Google thread numbers are device-local and a phone change re-numbers
-them (#177). In client mode `resolve_contact_routes` asks the daemon whether
-WhatsApp and Signal can send.
+and neither does `resolve_contact_routes`, because Google thread numbers are
+device-local and a phone change re-numbers them (#177). The route tool finds
+a person by their number in any written form (the last ten digits, as
+`send_message` compares them) or by a name only the legacy store holds. In
+client mode it asks the daemon whether WhatsApp and Signal can send.
 The client opens the store via `app.NewClient`, which skips the startup repair
 sweeps — those stay daemon-owned, so N concurrent sessions don't each burst
 repair writes into the live `messages.db`.

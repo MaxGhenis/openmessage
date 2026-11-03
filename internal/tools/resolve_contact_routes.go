@@ -156,7 +156,11 @@ func findRouteConversations(reads readsource.ReadSource, people *db.Store, query
 		}
 	}
 
-	if conv, err := reads.GetConversation(query); err == nil && conv != nil {
+	// Only an exact ID names a conversation here. The v2 read source also
+	// resolves a platform's thread ID (#155), but a stale Google thread
+	// number can name another person's thread now (#177), and this tool says
+	// where to send.
+	if conv, err := reads.GetConversation(query); err == nil && conv != nil && conv.ConversationID == query {
 		addConversation(conv)
 	}
 
@@ -165,18 +169,24 @@ func findRouteConversations(reads readsource.ReadSource, people *db.Store, query
 		return nil, err
 	}
 	addConversations(convos)
+	addConversations(phoneLineConversations(reads, query, limit))
+
+	searchNumber := func(number string) {
+		number = strings.TrimSpace(number)
+		if number == "" {
+			return
+		}
+		if numberConvos, err := reads.SearchConversationsByMetadata(number, limit); err == nil {
+			addConversations(numberConvos)
+		}
+		addConversations(phoneLineConversations(reads, number, limit))
+	}
 
 	contacts, err := people.ListContacts(query, limit)
 	if err == nil {
 		for _, contact := range contacts {
-			if contact == nil {
-				continue
-			}
-			if number := strings.TrimSpace(contact.Number); number != "" {
-				numberConvos, err := reads.SearchConversationsByMetadata(number, limit)
-				if err == nil {
-					addConversations(numberConvos)
-				}
+			if contact != nil {
+				searchNumber(contact.Number)
 			}
 		}
 	}
@@ -185,14 +195,8 @@ func findRouteConversations(reads readsource.ReadSource, people *db.Store, query
 		fallbackContacts, err := people.ListContactsFromConversations(query, limit)
 		if err == nil {
 			for _, contact := range fallbackContacts {
-				if contact == nil {
-					continue
-				}
-				if number := strings.TrimSpace(contact.Number); number != "" {
-					numberConvos, err := reads.SearchConversationsByMetadata(number, limit)
-					if err == nil {
-						addConversations(numberConvos)
-					}
+				if contact != nil {
+					searchNumber(contact.Number)
 				}
 			}
 		}
@@ -212,6 +216,54 @@ func findRouteConversations(reads readsource.ReadSource, people *db.Store, query
 		results = results[:limit]
 	}
 	return results, nil
+}
+
+// phoneLineConversations returns reads' conversations with a participant on
+// the phone line that text names. It matches as send_message matches a
+// recipient, by the last ten digits, so formatting and a country prefix don't
+// matter: v2 stores numbers in E.164 form, while the legacy store and address
+// books keep them as written, and a substring search for "+1 (555) 555-0123"
+// finds no "+15555550123". Text that isn't a phone number returns nothing,
+// and the account's own number matches no thread.
+func phoneLineConversations(reads readsource.ReadSource, text string, limit int) []*db.Conversation {
+	if !looksLikePhoneNumber(text) {
+		return nil
+	}
+	line := digitsOnly(text)
+	if len(line) > 10 {
+		line = line[len(line)-10:]
+	}
+	convos, err := reads.SearchConversationsByMetadata(line, limit)
+	if err != nil {
+		return nil
+	}
+	onLine := make([]*db.Conversation, 0, len(convos))
+	for _, conv := range convos {
+		if conversationHasPhoneLine(conv, line) {
+			onLine = append(onLine, conv)
+		}
+	}
+	return onLine
+}
+
+func conversationHasPhoneLine(conv *db.Conversation, line string) bool {
+	if conv == nil {
+		return false
+	}
+	var participants []struct {
+		Number string `json:"number"`
+		Phone  string `json:"phone"`
+		IsMe   bool   `json:"is_me"`
+	}
+	if err := json.Unmarshal([]byte(conv.Participants), &participants); err != nil {
+		return false
+	}
+	for _, participant := range participants {
+		if !participant.IsMe && phoneDigitsMatch(line, firstNonEmpty(participant.Number, participant.Phone)) {
+			return true
+		}
+	}
+	return false
 }
 
 func buildResolvedRouteMatches(people *db.Store, convos []*db.Conversation, limit int, whatsAppConnected, signalConnected bool) []resolvedRouteMatch {
