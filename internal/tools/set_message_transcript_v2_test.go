@@ -167,10 +167,10 @@ func appAPI(t *testing.T, store *db.Store, options web.APIOptions) *localapi.Cli
 
 // Replays set_message_transcript in process on a migrated (v2-primary)
 // install. The read tools hand out v2 message IDs, which the legacy store
-// doesn't hold, and they read v2, which keeps no transcripts, so no read shows
-// a transcript the tool saves to legacy. The tool must refuse and say why, for
-// the ID an agent got from get_messages and for a legacy ID alike, and leave
-// the legacy store as it was.
+// doesn't hold, and they read v2, which keeps no transcripts, so no read would
+// show a transcript the tool saved to legacy. The tool must refuse and say
+// why, for the ID an agent got from get_messages and for a legacy ID alike,
+// and leave the legacy store as it was.
 func TestSetMessageTranscriptRefusesWhileV2IsTheServingStore(t *testing.T) {
 	a := testApp(t)
 	seedLegacyVoiceNote(t, a.Store, "legacy-voice-note")
@@ -226,7 +226,7 @@ func TestSetMessageTranscriptClientModeRefusesWhileV2IsTheServingStore(t *testin
 }
 
 // In client mode the tool saves a transcript through the app's local API, as
-// the send tools do, and never writes the store this process opened. The test
+// send_message does, and never writes the store this process opened. The test
 // gives the two processes separate stores, in place of the one file they share
 // on an install, to tell which process wrote. The legacy semantics survive the
 // trip: an omitted model keeps the stored one, an empty transcript clears

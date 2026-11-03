@@ -19,8 +19,8 @@ import (
 // them, and the legacy->v2 migration counts and drops them. The legacy store
 // still takes writes, but the only places that show a transcript, the read
 // tools and the web UI's conversation view, read v2 there, so none would show
-// one saved to legacy. Agents hold v2 message IDs, which the legacy store
-// doesn't know.
+// one saved to legacy. The read tools hand agents v2 message IDs, which the
+// legacy store doesn't know.
 const transcriptsUnavailableWhileV2Serves = "not available while v2 is the serving store: " +
 	"get_messages and the other message reads come from the v2 store, which keeps no transcripts, " +
 	"so none of them would show a transcript saved to the legacy store."
@@ -78,7 +78,7 @@ func setMessageTranscriptHandler(a *app.App, configured ...Options) server.ToolH
 			return errorResult(fmt.Sprintf("set_message_transcript: %v", err)), nil
 		}
 		// In client mode the running app saves the transcript, as it does
-		// sends and reactions, so the tool never writes the live store itself.
+		// sends and reactions, so the tool itself never writes the live store.
 		if options.Daemon != nil {
 			return daemonSetMessageTranscript(ctx, options.Daemon, messageID, transcript, model), nil
 		}
