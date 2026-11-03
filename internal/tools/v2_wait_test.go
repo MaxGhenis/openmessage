@@ -210,8 +210,9 @@ func waitForCondition(t *testing.T, what string, check func() bool) {
 	t.Fatalf("timed out waiting for %s", what)
 }
 
-// A send refused because the phone's thread now names other people says
-// nothing went out and why, and steers away from resending to the same thread.
+// When the adapter refuses a send because the phone's thread now names other
+// people, the text says nothing went out and why, steers away from resending
+// to the same thread, and says what moves a direct conversation and a group.
 func TestV2DeliveryTextExplainsARecipientMismatch(t *testing.T) {
 	text := v2DeliveryText(messaging.Delivery{
 		OutboxID:   "outbox-moved",
@@ -219,7 +220,10 @@ func TestV2DeliveryTextExplainsARecipientMismatch(t *testing.T) {
 		ErrorClass: "recipient_mismatch",
 		ErrorCode:  "send_text",
 	})
-	for _, fragment := range []string{"NOT sent", "outbox-moved", "now names other people", "Do not resend", "send from the phone"} {
+	for _, fragment := range []string{
+		"NOT sent", "outbox-moved", "now names other people", "do not resend", "send from the phone",
+		"for a direct conversation, usually the person's next message", "for a group, the phone listing a thread with exactly its members",
+	} {
 		if !strings.Contains(text, fragment) {
 			t.Fatalf("recipient_mismatch text missing %q: %q", fragment, text)
 		}

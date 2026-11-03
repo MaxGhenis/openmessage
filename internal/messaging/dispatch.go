@@ -1228,11 +1228,11 @@ func (s *MessageService) markSendUncertain(
 // adapter that looks the remote conversation up first can refuse one that now
 // names other people.
 func (s *MessageService) conversationRef(conversation sqlite.Conversation) (bridge.ConversationRef, error) {
-	peers, err := s.store.ListConversationPeerIdentities(conversation.AccountID, conversation.ConversationID)
+	peers, err := s.roster.ListConversationPeerIdentities(conversation.AccountID, conversation.ConversationID)
 	if err != nil {
 		return bridge.ConversationRef{}, err
 	}
-	self, err := s.store.ListSelfIdentities(conversation.AccountID)
+	self, err := s.roster.ListSelfIdentities(conversation.AccountID)
 	if err != nil {
 		return bridge.ConversationRef{}, err
 	}
@@ -1257,6 +1257,7 @@ func identityKeyRefs(identities []sqlite.Identity) []bridge.IdentityRef {
 	}
 	return refs
 }
+
 func retryableFailure(class bridge.FailureClass) bool {
 	switch class {
 	case bridge.FailureTransient,

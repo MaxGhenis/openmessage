@@ -10,7 +10,7 @@ import (
 
 // SendTargetCheck is the verdict on a remote conversation a send is about to
 // go to: whether its current snapshot names a different thread than the stored
-// conversation the send was written in, and the shapes behind that verdict.
+// conversation the send belongs to, and the shapes behind that verdict.
 // It carries counts and kinds only, never who the people are.
 type SendTargetCheck struct {
 	Contradicts bool

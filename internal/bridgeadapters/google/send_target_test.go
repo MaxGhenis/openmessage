@@ -36,8 +36,8 @@ func storedThreadRef(kind string, peers ...string) bridge.ConversationRef {
 	return ref
 }
 
-// phoneThread is the phone's answer to a conversation lookup. Its own number
-// is listed with IsMe set, as the phone normally does.
+// phoneThread is the phone's answer to a conversation lookup. It lists its own
+// number with IsMe set, as the phone normally does.
 func phoneThread(group bool, peers ...string) *gmproto.Conversation {
 	conversation := &gmproto.Conversation{
 		ConversationID: "remote-conversation",
@@ -169,7 +169,7 @@ func TestSendReactionRefusesAThreadThatNowNamesOtherPeople(t *testing.T) {
 }
 
 // The phone answered the lookup, so a refusal says nothing about the
-// connection: the receive generation stays up and repair is not flagged.
+// connection: the receive generation stays up and needs_repair stays off.
 func TestMovedThreadRefusalLeavesTheReceiveLifecycleAlone(t *testing.T) {
 	host := newTestApp(t)
 	transport := &fakeTransport{}
@@ -206,11 +206,11 @@ func TestMovedThreadRefusalLeavesTheReceiveLifecycleAlone(t *testing.T) {
 }
 
 // The 2026-11 incident shape, end to end through the real dispatcher and v2
-// store with only libgm faked. A v2 thread with Vic is still bound to a Google
+// store with only libgm faked. v2 still binds a thread with Vic to a Google
 // thread number that, since a phone swap, names the phone's thread with Lee.
-// Before this check, a text or reaction written in Vic's thread went to Lee.
-// Now both are rejected as recipient_mismatch without reaching the phone, and
-// once the binding names Vic again, sending works.
+// Before this check, a text in Vic's thread went to Lee. Now the dispatcher
+// rejects a text and a reaction there as recipient_mismatch before either
+// reaches the phone, and once the number names Vic again, sending works.
 func TestDispatchRefusesAStaleGoogleBindingEndToEnd(t *testing.T) {
 	f := newReactionDispatchFixture(t)
 	nowMS := f.clock.Now().UnixMilli()
@@ -251,7 +251,7 @@ func TestDispatchRefusesAStaleGoogleBindingEndToEnd(t *testing.T) {
 	if f.text.sendCalls != 0 || f.reaction.sendCalls != 0 {
 		t.Fatalf("refused intents reached the phone: text=%d reaction=%d", f.text.sendCalls, f.reaction.sendCalls)
 	}
-	// Rejected is final: nothing is retried later.
+	// Rejected is final: the dispatcher never tries it again.
 	f.clock.Advance(time.Hour)
 	f.dispatch(0)
 
@@ -264,7 +264,7 @@ func TestDispatchRefusesAStaleGoogleBindingEndToEnd(t *testing.T) {
 	}
 	f.dispatch(1)
 	if delivery := f.delivery(again.OutboxID); delivery.State != messaging.OutboxConfirmed {
-		t.Fatalf("delivery after the binding was fixed = %+v, want confirmed", delivery)
+		t.Fatalf("delivery once the thread names Vic again = %+v, want confirmed", delivery)
 	}
 	if f.text.sendCalls != 1 {
 		t.Fatalf("SendMessage called %d times, want 1", f.text.sendCalls)

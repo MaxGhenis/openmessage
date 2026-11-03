@@ -431,7 +431,7 @@ func daemonReactToMessageHandler(options Options) server.ToolHandlerFunc {
 				// deliver it; its outbox state says what happened (an
 				// uncertain one may have been applied).
 				return v2ReactionResult(
-					messaging.Delivery{OutboxID: result.OutboxID, State: messaging.OutboxState(result.State)},
+					daemonReactDelivery(result),
 					false, key, nil,
 				), nil
 			}
@@ -453,7 +453,7 @@ func daemonReactToMessageHandler(options Options) server.ToolHandlerFunc {
 			// A v2-primary app answered on the compatibility route: the
 			// reaction is on its outbox, under key, and not delivered yet.
 			return v2ReactionResult(
-				messaging.Delivery{OutboxID: result.OutboxID, State: messaging.OutboxState(result.State)},
+				daemonReactDelivery(result),
 				false, key, nil,
 			), nil
 		}
@@ -464,6 +464,16 @@ func daemonReactToMessageHandler(options Options) server.ToolHandlerFunc {
 			"action":     action,
 			"via":        "app",
 		}, fmt.Sprintf("Reaction %s (%s) sent via the running OpenMessage app.", emoji, action)), nil
+	}
+}
+
+// daemonReactDelivery is the outbox delivery an /api/react answer describes.
+func daemonReactDelivery(result localapi.ReactResult) messaging.Delivery {
+	return messaging.Delivery{
+		OutboxID:   result.OutboxID,
+		State:      messaging.OutboxState(result.State),
+		ErrorClass: result.ErrorClass,
+		ErrorCode:  result.ErrorCode,
 	}
 }
 

@@ -310,17 +310,17 @@ fault.
 
 **The Google adapter refuses a send to a thread number the phone has moved.**
 Only live traffic rebinds a thread, so long after a swap v2 can still bind a
-thread to a number the phone now uses for someone else's thread. On 2026-11-03 a
-read-only check of Max's install found 19 such threads: each number's
+thread to a number the phone now uses for someone else's thread. On 2026-11-03
+a read-only check of Max's install found 19 such threads: each number's
 post-swap messages came only from people outside the bound thread's roster.
-The Google adapter sends to the bound number, so a text written in one of those
+The Google adapter sends to the bound number, so a text in one of those
 threads would go to the other person. The adapter already looks the thread up
-before every text, media and reaction send, and now compares the phone's participants with
-the stored thread's roster using the rule history applies to stale bindings
-(`ingest.CheckSendTarget`). The kinds must agree, a direct thread's peers must
-match exactly, and a group must keep at least one member. A thread with no
-stored roster, or a phone answer naming only this account, proves nothing and
-sends. On a contradiction nothing goes out:
+before every text, media and reaction send, and now compares the phone's
+participants with the stored thread's roster using the rule history applies to
+stale bindings (`ingest.CheckSendTarget`). The kinds must agree, a direct
+thread's peers must match exactly, and a group must keep at least one member.
+A thread with no stored roster, or a phone answer naming only this account,
+proves nothing and sends. On a contradiction nothing goes out:
 
 - the outbox row ends `rejected`, with `error_class: recipient_mismatch` and
   `error_code` `send_text`, `send_media` or `send_reaction`. The dispatcher
@@ -329,10 +329,26 @@ sends. On a contradiction nothing goes out:
   now names other people`, with counts of each side's people;
 - the refusal leaves the receive lifecycle alone, since the phone answered.
 
-An incoming message from a direct thread's peer rebinds the thread to that
-peer's new number (`googleIncomingConversation`), and sends to it work again.
-Until then, send from the phone. Read receipts don't look the thread up, so
-the check doesn't cover them.
+A direct thread moves to its peer's new number when the peer's next message
+arrives (`googleIncomingConversation`) or when the phone lists a thread with
+that peer alone (`googleConversationEventTarget`), and sends work again. A
+group moves when the phone lists a thread whose members match the group's
+exactly. Until then, send from the phone.
+
+The check leaves three gaps:
+
+- **Groups that share a member.** A group bound to a number that now names
+  another group with at least one of its members still sends there. The send
+  check keeps ingest's rule on purpose, and a differential test holds the two
+  together: group membership changes legitimately, and a stricter rule for
+  sends alone would refuse threads that ingest treats as the same group.
+- **Reactions to old messages.** A reaction names its target by message ID
+  alone (Google's `SendReactionRequest` carries no thread). When the new phone
+  re-serves a text message from before the swap, ingest skips the copy as a
+  duplicate of the stored one, so the stored row keeps the old phone's ID. A
+  reaction to that message lands on whatever message the ID names on the new
+  phone, even in a thread whose binding the check accepts.
+- **Read receipts** don't look the thread up, so the check doesn't cover them.
 
 **Repairing history after a reset** (daemon must be down — the command takes
 the instance lock and refuses while `/api/status` answers; park the watchdog

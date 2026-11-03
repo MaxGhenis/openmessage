@@ -254,9 +254,12 @@ func stOracle(c stCase) SendTargetCheck {
 //
 //   - S1: the verdict and its counts equal the set-based oracle (stOracle).
 //   - S2: the verdict does not depend on participant order or repetition.
-//   - S3: a snapshot naming exactly the stored peers, in any format, with this
-//     account listed flagged or not, never refuses.
-//   - S4: entries that cannot be keyed never change the verdict.
+//   - S3: a snapshot naming exactly the stored peers never refuses, whether
+//     it writes each number as plain E.164 or as "+1 (555) 010-0001", and
+//     whether or not it flags this account's own entry. A number without the
+//     leading "+" keys as a username, a different identity, so S3 does not
+//     cover it.
+//   - S4: entries v2keys cannot key never change the verdict.
 func TestCheckSendTargetPropertiesHold(t *testing.T) {
 	property := func(seed int64) bool {
 		rng := rand.New(rand.NewSource(seed))
@@ -296,7 +299,7 @@ func TestCheckSendTargetPropertiesHold(t *testing.T) {
 			mirror.participants = append(mirror.participants, stPeer(stFormat(rng, stSelf)))
 		}
 		if check := CheckSendTarget(stAccount, bridge.PlatformGoogle, mirror.ref(), mirror.snapshot()); check.Contradicts {
-			t.Logf("S3 seed %d: the stored roster itself was refused: %+v", seed, check)
+			t.Logf("S3 seed %d: the check refused the stored roster itself: %+v", seed, check)
 			return false
 		}
 
@@ -323,11 +326,11 @@ func TestCheckSendTargetPropertiesHold(t *testing.T) {
 // apply one rule to the same stored thread and the same phone snapshot, but
 // resolve identities differently. History looks each snapshot entry up in
 // the store; the send check compares the natural keys the dispatcher passes
-// (CheckSendTarget). Stored identities here sometimes carry IDs that are not
-// derived from their keys, as migrated ones do, and the account holds people
-// outside the thread. Unkeyable entries are left out: history on this branch
-// fails the snapshot on them (#207 changes that), while the send check
-// ignores them (S4).
+// (CheckSendTarget). Some stored identities here carry IDs that v2keys would
+// not derive from their keys, as migrated ones do, and the account holds
+// people outside the thread. The test leaves unkeyable entries out: history on
+// this branch fails the snapshot on them (#207 changes that), while the send
+// check ignores them (S4).
 func TestCheckSendTargetAgreesWithHistoryStaleBindingCheck(t *testing.T) {
 	store, worker := stOpenWorker(t)
 	nowMS := time.Date(2026, 11, 3, 12, 0, 0, 0, time.UTC).UnixMilli()

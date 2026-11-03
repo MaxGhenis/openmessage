@@ -263,7 +263,7 @@ func v2DeliveryText(delivery messaging.Delivery) string {
 		return fmt.Sprintf("The transport accepted the message (outbox %s, remote message %s); the local record is being repaired automatically. Do not resend.", delivery.OutboxID, delivery.RemoteMessageID)
 	case messaging.OutboxRejected:
 		if delivery.ErrorClass == string(bridge.FailureRecipientMismatch) {
-			return fmt.Sprintf("Message NOT sent (outbox %s): the phone's Google thread for this conversation now names other people, so the app refused to send to it. A phone swap or restore re-uses Google's thread numbers, and the app moves a conversation to its new thread only when a live message from it arrives. Do not resend to this conversation; send from the phone, or wait for their next message.", delivery.OutboxID)
+			return fmt.Sprintf("Message NOT sent (outbox %s): the phone's Google thread for this conversation now names other people, so the app refused to send to it. A phone swap or restore reuses Google's thread numbers, and the app moves a conversation to its new thread only when the phone's own traffic shows the move: for a direct conversation, usually the person's next message; for a group, the phone listing a thread with exactly its members. Until then, do not resend to this conversation; send from the phone instead.", delivery.OutboxID)
 		}
 		return fmt.Sprintf("Message delivery was rejected (outbox %s, error class %s). The app will not retry it; sending again creates a new message and may fail the same way.", delivery.OutboxID, firstNonEmpty(delivery.ErrorClass, "unknown"))
 	case messaging.OutboxCanceled:

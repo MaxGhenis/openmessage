@@ -165,7 +165,7 @@ var mediaSendClientFor = func(cli *client.Client) mediaSendClient {
 }
 
 // refuseMovedThread refuses an operation whose Google thread now names other
-// people than the stored conversation it was written in. Google's thread
+// people than the stored conversation it belongs to. Google's thread
 // numbers are local to the phone: after a phone swap or restore, a number v2
 // still binds to one person's thread can name someone else's, and v2 rebinds
 // it only when live traffic proves the move. Sending to the bound number would
@@ -202,7 +202,7 @@ func (a *Adapter) refuseMovedThread(
 		Cause: fmt.Errorf(
 			"the phone's Google thread for this conversation now names other people "+
 				"(this conversation: %s, %d %s; the phone's thread: %s, %d %s; %d in common), "+
-				"so nothing was sent",
+				"so the app sent nothing",
 			check.StoredKind, check.StoredPeers, peopleNoun(check.StoredPeers),
 			check.RemoteKind, check.RemotePeers, peopleNoun(check.RemotePeers),
 			check.Shared,
