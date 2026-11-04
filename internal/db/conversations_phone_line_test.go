@@ -17,41 +17,52 @@ import (
 // phoneLineModel is a reference for SearchConversationsByPhoneLine. A thread
 // is on a line when phonelinetest.MatchFirst, which states phoneline's rule
 // with regular expressions, finds the line in the number (or, without one,
-// the phone) of a participant entry not flagged as the owner's, where only
-// text counts, in a bare string entry, or in the sender number of an
-// incoming message. An entry carries the owner's flag when its is_me or isMe
-// holds JSON true. Hits come newest first, then in conversation ID order, up
-// to the limit.
+// the phone) of a participant object, where only text counts, in a bare
+// string entry, or in the sender number of an incoming message. Entries
+// that the owner rule counts as the owner's don't put a thread on a line:
+// objects whose is_me or isMe holds JSON true, and any entry whose number
+// sits on one of the owner's lines, which modelOwnerLines takes from every
+// thread. Hits come newest first, then in conversation ID order, up to the
+// limit.
 type phoneLineModel struct {
 	conversations []*Conversation
 	messages      []*Message
 }
 
-// onLine reports how conversation is on line: at all, through an incoming
-// sender alone, or only through entries flagged as the owner's.
-func (m phoneLineModel) onLine(conversation *Conversation, line string) (hit, senderOnly, ownerOnly bool) {
-	byEntry, byOwner := false, false
-	var elements []json.RawMessage
-	if json.Unmarshal([]byte(conversation.Participants), &elements) == nil {
-		for _, element := range elements {
-			var object map[string]any
-			if json.Unmarshal(element, &object) == nil && object != nil {
-				number, _ := object["number"].(string)
-				phone, _ := object["phone"].(string)
-				if !phonelinetest.MatchFirst(line, number, phone) {
-					continue
-				}
-				if object["is_me"] == true || object["isMe"] == true {
-					byOwner = true
-				} else {
-					byEntry = true
-				}
-				continue
-			}
-			var text string
-			if json.Unmarshal(element, &text) == nil && phonelinetest.MatchFirst(line, text) {
-				byEntry = true
-			}
+// lineReach says how a thread is on a line.
+type lineReach struct {
+	// hit holds when the search returns the thread, and senderOnly when an
+	// incoming sender alone puts it there.
+	hit, senderOnly bool
+	// flaggedOnly holds for a thread on the line only through the owner's
+	// entries, one of them flagged, and copyOnly for a thread on it only
+	// through unflagged copies of the owner.
+	flaggedOnly, copyOnly bool
+	// stringCopy holds when a bare string on the line counts as the owner's.
+	stringCopy bool
+}
+
+// onLine says how conversation is on line, given the owner's lines.
+func (m phoneLineModel) onLine(conversation *Conversation, line string, ownerLines []string) lineReach {
+	byEntry, byFlagged, byCopy, stringCopy := false, false, false, false
+	for _, entry := range modelEntries(conversation.Participants) {
+		on := false
+		if entry.isString {
+			on = phonelinetest.MatchFirst(line, entry.text)
+		} else {
+			number, _ := entry.object["number"].(string)
+			phone, _ := entry.object["phone"].(string)
+			on = phonelinetest.MatchFirst(line, number, phone)
+		}
+		switch {
+		case !on:
+		case modelFlagged(entry):
+			byFlagged = true
+		case modelOwners(entry, ownerLines):
+			byCopy = true
+			stringCopy = stringCopy || entry.isString
+		default:
+			byEntry = true
 		}
 	}
 	bySender := false
@@ -60,14 +71,21 @@ func (m phoneLineModel) onLine(conversation *Conversation, line string) (hit, se
 			bySender = true
 		}
 	}
-	hit = byEntry || bySender
-	return hit, bySender && !byEntry, byOwner && !hit
+	hit := byEntry || bySender
+	return lineReach{
+		hit:         hit,
+		senderOnly:  bySender && !byEntry,
+		flaggedOnly: byFlagged && !hit,
+		copyOnly:    byCopy && !byFlagged && !hit,
+		stringCopy:  stringCopy,
+	}
 }
 
 func (m phoneLineModel) search(line string, limit int) []string {
+	ownerLines := modelOwnerLines(m.conversations)
 	var hits []*Conversation
 	for _, conversation := range m.conversations {
-		if hit, _, _ := m.onLine(conversation, line); hit {
+		if m.onLine(conversation, line, ownerLines).hit {
 			hits = append(hits, conversation)
 		}
 	}
@@ -91,8 +109,8 @@ func (m phoneLineModel) search(line string, limit int) []string {
 // value in it, one that is no phone number such as an email address, holds
 // digits that end with the line's: a thread that matching digits alone
 // would put on the line.
-func (m phoneLineModel) heldOnlyByIdentifiers(conversation *Conversation, line string) bool {
-	if hit, _, _ := m.onLine(conversation, line); hit {
+func (m phoneLineModel) heldOnlyByIdentifiers(conversation *Conversation, line string, ownerLines []string) bool {
+	if m.onLine(conversation, line, ownerLines).hit {
 		return false
 	}
 	values := []string{}
@@ -159,13 +177,17 @@ func phoneLineForm(random *rand.Rand, digits string) string {
 // isn't text; identifiers that are no phone number, such as an email address,
 // a Signal UUID or a WhatsApp LID, hold targets' digits; the owner's entries
 // carry the owner's number flagged, unflagged or with a flag that isn't JSON
-// true, and the owner sends messages too; and threads often share a time.
-// So, as invariants, a thread is on a line only through someone other than
-// the flagged owner whose number, written as one, ends with the line's
-// digits (or the line ends with theirs), an incoming sender whom the roster
-// lacks counts, the limit applies after matching, so threads whose numbers
-// only contain the digits never crowd out one on the line, and threads that
-// share a time come in conversation ID order.
+// true, other objects and bare strings carry it too, and the owner sends
+// messages too; and threads often share a time. So, as invariants, a thread
+// is on a line only through an incoming sender or an entry that the owner
+// rule doesn't count as the owner's (neither flagged nor on a flagged
+// entry's line, which any thread may list) whose number, written as one,
+// ends with the line's digits (or the line ends with theirs); an incoming
+// sender whom the roster lacks counts; once a thread lists the owner
+// flagged, the owner's own line finds a thread only through an incoming
+// sender; the limit applies after matching, so threads whose numbers only
+// contain the digits never crowd out one on the line; and threads that share
+// a time come in conversation ID order.
 func TestSearchConversationsByPhoneLineAgreesWithTheLineModel(t *testing.T) {
 	targets := []string{"12025550123", "13035550147", "15555550199"}
 	owner := "15550009999"
@@ -256,6 +278,15 @@ func TestSearchConversationsByPhoneLineAgreesWithTheLineModel(t *testing.T) {
 			t.Fatalf("list conversations: %v", err)
 		}
 		model.conversations = stored
+		ownerLines := modelOwnerLines(stored)
+		incomingOn := func(conversationID, line string) bool {
+			for _, message := range model.messages {
+				if message.ConversationID == conversationID && !message.IsFromMe && phonelinetest.MatchFirst(line, message.SenderNumber) {
+					return true
+				}
+			}
+			return false
+		}
 
 		for _, number := range append(append([]string{owner, "5550123", "550123"}, targets...), decoys[:3]...) {
 			line := phoneline.Line(number)
@@ -269,15 +300,38 @@ func TestSearchConversationsByPhoneLineAgreesWithTheLineModel(t *testing.T) {
 			for _, conversation := range got {
 				gotIDs = append(gotIDs, conversation.ConversationID)
 			}
-			if fmt.Sprint(gotIDs) != fmt.Sprint(want) {
+			failed := func(format string, args ...any) bool {
 				for _, conversation := range stored {
 					t.Logf("  %s ts=%d: %s", conversation.ConversationID, conversation.LastMessageTS, conversation.Participants)
 				}
 				for _, message := range model.messages {
 					t.Logf("  message %s in %s from_me=%v sender=%q", message.MessageID, message.ConversationID, message.IsFromMe, message.SenderNumber)
 				}
-				t.Logf("seed %d: line %q (limit %d) = %v, model says %v", seed, line, limit, gotIDs, want)
+				t.Logf("seed %d: line %q (limit %d) = %v, owner lines %v: "+format, append([]any{seed, line, limit, gotIDs, ownerLines}, args...)...)
 				return false
+			}
+			if fmt.Sprint(gotIDs) != fmt.Sprint(want) {
+				return failed("model says %v", want)
+			}
+			if line == phoneline.Line(owner) && len(ownerLines) > 0 {
+				exercised["the owner's own line once a thread lists the owner flagged"]++
+				for _, id := range gotIDs {
+					if !incomingOn(id, line) {
+						return failed("%s is on the owner's own line through no incoming sender", id)
+					}
+				}
+			}
+			for _, conversation := range stored {
+				reach := model.onLine(conversation, line, ownerLines)
+				if reach.flaggedOnly {
+					exercised["a thread on the line only through the flagged owner"]++
+				}
+				if reach.copyOnly {
+					exercised["a thread on the line only through unflagged copies of the owner"]++
+				}
+				if reach.stringCopy {
+					exercised["a bare string that counts as the owner's"]++
+				}
 			}
 			if len(want) == 0 {
 				continue
@@ -299,17 +353,14 @@ func TestSearchConversationsByPhoneLineAgreesWithTheLineModel(t *testing.T) {
 				}
 			}
 			for _, conversation := range stored {
-				hit, senderOnly, ownerOnly := model.onLine(conversation, line)
-				if senderOnly {
+				reach := model.onLine(conversation, line, ownerLines)
+				if reach.senderOnly {
 					exercised["a hit through an incoming sender alone"]++
 				}
-				if ownerOnly {
-					exercised["a thread on the line only through the flagged owner"]++
-				}
-				if model.heldOnlyByIdentifiers(conversation, line) {
+				if model.heldOnlyByIdentifiers(conversation, line, ownerLines) {
 					exercised["a thread that only identifiers holding the line's digits tie to it"]++
 				}
-				if !hit && conversation.LastMessageTS > oldest && strings.Contains(conversation.Participants, line) {
+				if !reach.hit && conversation.LastMessageTS > oldest && strings.Contains(conversation.Participants, line) {
 					exercised["a hit behind a newer thread whose numbers only contain the line's digits"]++
 				}
 			}
@@ -327,6 +378,9 @@ func TestSearchConversationsByPhoneLineAgreesWithTheLineModel(t *testing.T) {
 		"a line with hits",
 		"a hit through an incoming sender alone",
 		"a thread on the line only through the flagged owner",
+		"a thread on the line only through unflagged copies of the owner",
+		"a bare string that counts as the owner's",
+		"the owner's own line once a thread lists the owner flagged",
 		"a hit behind a newer thread whose numbers only contain the line's digits",
 		"a tie at the limit",
 		"a thread that only identifiers holding the line's digits tie to it",

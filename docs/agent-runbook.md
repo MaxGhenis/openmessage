@@ -1014,14 +1014,29 @@ running app:
   matches. v2's conversation search (`SearchConversationsByName`, which also
   serves `/api/search`) skips the owner's identity in SQL. The legacy search
   (`SearchConversationsByMetadata`, which also serves `openmessage thread`
-  and, on a legacy-primary app, `/api/search`) skips participant entries
-  flagged as the owner's (`is_me` or `isMe` set to JSON true) and matches only
-  incoming messages' senders, since the owner's outgoing messages carry the
-  owner's name and number. Both searches skip the owner before their limit, so
+  and, on a legacy-primary app, `/api/search`) skips the owner's participant
+  entries and matches only incoming messages' senders, since the owner's
+  outgoing messages carry the owner's name and number, and the legacy line
+  search does the same. One rule in `internal/db/owner.go` names the owner's
+  entries for both legacy searches and `send_message`, and the searches' SQL
+  calls it through two registered functions. It names any object entry that
+  carries `is_me` or `isMe` set to JSON true, and any entry, a bare string
+  included, in any thread, on the phone line of a flagged entry whose number
+  reads as a phone number or a WhatsApp JID of one: the line is the number's
+  `phoneline.Line`, and an entry sits on it when `phoneline.Match` says so.
+  So the owner's WhatsApp JID sits on the owner's line, while a flagged
+  WhatsApp LID marks no line, and a `tel:` URI or an email address that holds
+  the owner's digits sits on none. The rule reads each element of a
+  participants list on its own, so an odd element hides no one beside it.
+  Google's participant lists often name the owner a second time without the
+  flag, so the flag alone misses the copy; v2 folds the copy into the owner's
+  self identity. In one live legacy store, OM_COPY_COUNT of 1,355 one-to-one
+  SMS threads carry the copy, and WhatsApp and Signal threads list the owner
+  only without the flag. Every search skips the owner before its limit, so
   newer threads that list only the owner and one other person can't push a
-  match out of the results, and both, like the address-book lookup
-  (`ListContacts`), match `%` and `_` literally. The route tool keeps every
-  hit of either search, and when it falls back to the contacts in legacy
+  match out of the results, and the text searches, like the address-book
+  lookup (`ListContacts`), match `%` and `_` literally. The route tool keeps
+  every hit of either search, and when it falls back to the contacts in legacy
   threads (`ListContactsFromConversations`), that list skips flagged entries
   too, reads past any number of threads that yield none, and matches what an
   entry says, not its JSON text: `R&D` finds R&D Desk, whose & Go's encoder
@@ -1029,9 +1044,15 @@ running app:
   case, so `ÁNGEL` finds Ángel Ruiz but `ángel` doesn't. Threads that share a
   time come in conversation ID order in both stores' searches and in this
   list, so a limit keeps the same threads whichever store serves the reads. An
-  entry that holds the owner's name or number without the flag still matches:
-  the WhatsApp text importer lists every sender, the owner included, with no
-  flag. Before the fix for the 2026-11-03 (UTC) incident,
+  entry that holds the owner's name with neither the flag nor a number on the
+  owner's line still matches: the WhatsApp text importer lists every sender,
+  the owner included, by name alone. `send_message` with platform `sms` skips
+  the same entries as the legacy searches when it picks the recipient's
+  one-to-one SMS thread, and refuses the owner's own number: it sends nothing
+  and says so. Without the rule, the owner's number matched the owner's entry
+  in every thread, so a send to it went to the newest one-to-one SMS thread,
+  which belonged to someone else. Before the fix for the 2026-11-03 (UTC)
+  incident,
   `resolve_contact_routes` read the legacy store on a v2-primary install and
   handed out Google thread numbers, which the outbox refused with a bare 404
   `not found`, while `send_message` by phone number worked. In-process
@@ -1073,7 +1094,19 @@ running app:
   `TestSearchConversationsByPhoneLineCallsTheMatcherOncePerSenderNumber`
   (internal/db), `TestMatch`, `TestNumber` and `TestMatchProperties`
   (internal/phoneline), `TestSubmitTextV2SendsOnlyToTheConversationItsIDNames`
-  and `TestSubmitTextV2SendsToTheV2IDWhenIDsCollide` (internal/v2wire).
+  and `TestSubmitTextV2SendsToTheV2IDWhenIDsCollide` (internal/v2wire). For
+  the owner's own number and the owner's entries:
+  `TestClientModeSendMessageRefusesTheOwnersOwnNumber`,
+  `TestClientModeSendMessageSendsOnlyToThePersonsOwnThread`,
+  `TestFindDirectSMSConversationTakesTheOwnersLinesOnlyFromPhoneNumbers`,
+  `TestFindDirectSMSConversationReadsEachParticipantOnItsOwn` and
+  `TestFindDirectSMSConversationReadsEveryConversation` (internal/tools),
+  `TestSearchConversationsByMetadataSkipsTheOwnersParticipantEntries`,
+  `TestSearchConversationsByMetadataReadsTheOwnersNumberWithAnySeparators`,
+  `TestSearchConversationsByMetadataAgreesWithTheOwnerSkippingModel`,
+  `TestSearchConversationsByPhoneLineSkipsTheOwnersParticipantEntries`,
+  `TestOwnerRuleReadsEachElementAlikeInGoAndSQL` and
+  `TestOwnerLinesFollowPhoneline` (internal/db).
 - Escape hatches: `--transports` forces the old standalone full-stack stdio
   behavior (only for machines where the MCP process is the *only* OpenMessage
   process, ever); `--no-transports` strips transports from a **legacy-mode**
