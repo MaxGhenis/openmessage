@@ -2,9 +2,9 @@ package tools
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -278,6 +278,11 @@ func daemonSendMessageHandler(options Options) server.ToolHandlerFunc {
 				return errorResult(fmt.Sprintf("SMS recipient must be a phone number with country code (e.g. +15551234567), got %q", recipient)), nil
 			}
 			conversation, err := findDirectSMSConversation(options.Reads, recipient)
+			if errors.Is(err, errOwnNumber) {
+				return errorResult(fmt.Sprintf(
+					"%s matches this account's own number, so send_message sent nothing. Give the other person's number, or find their thread with resolve_contact_routes and send with send_to_conversation.", recipient,
+				)), nil
+			}
 			if err != nil {
 				return errorResult(fmt.Sprintf("resolve SMS conversation: %v", err)), nil
 			}
@@ -483,8 +488,18 @@ func daemonReactDelivery(result localapi.ReactResult) messaging.Delivery {
 	}
 }
 
-// findDirectSMSConversation scans recent conversations for a non-group
-// SMS/RCS thread with one participant whose number matches the phone.
+// findDirectSMSConversation returns the most recent non-group SMS/RCS thread
+// in which someone other than the account's owner has a number on the phone's
+// line. Most threads list the owner, so a phone on the owner's own line gets
+// errOwnNumber rather than the latest one-to-one thread, which belongs to
+// someone else. db's owner rule (db.OwnerLines) names the owner's entries:
+// those that carry is_me (or isMe), and any entry, in any conversation, on
+// the line of a flagged entry whose number reads as a phone number. Google's
+// participant lists often repeat the owner without the flag. The flag can sit
+// in one old thread alone, so the finder takes the lines from every
+// conversation, and it reads each element of a list on its own, so an odd
+// one hides no flag.
+//
 // Matching compares each participant's number individually by digit suffix,
 // through phoneline (so +1 (650) 555-0100, 6505550100, and +16505550100 all
 // meet) — never a substring search over concatenated participant digits,
@@ -498,32 +513,45 @@ func findDirectSMSConversation(reads readsource.ReadSource, phone string) (*db.C
 	if line == "" {
 		return nil, fmt.Errorf("recipient %q has no digits", phone)
 	}
-	conversations, err := reads.ListConversations(2000)
+	conversations, err := reads.ListConversations(allConversations)
 	if err != nil {
 		return nil, err
 	}
-	for _, conversation := range conversations {
+	rosters := make([][]db.ParticipantEntry, len(conversations))
+	ownerLines := db.OwnerLines{}
+	for index, conversation := range conversations {
+		if conversation == nil {
+			continue
+		}
+		rosters[index] = db.ParticipantEntries(conversation.Participants)
+		for _, entry := range rosters[index] {
+			ownerLines.Add(entry)
+		}
+	}
+	if ownerLines.OnLine(line) {
+		return nil, errOwnNumber
+	}
+	for index, conversation := range conversations {
 		if conversation == nil || conversation.IsGroup {
 			continue
 		}
 		if normalizedPlatform(conversation.SourcePlatform) != "sms" {
 			continue
 		}
-		var participants []struct {
-			Number string `json:"number"`
-			Phone  string `json:"phone"`
-		}
-		if err := json.Unmarshal([]byte(conversation.Participants), &participants); err != nil {
-			continue
-		}
-		for _, participant := range participants {
-			if phoneline.MatchFirst(line, participant.Number, participant.Phone) {
+		for _, entry := range rosters[index] {
+			if ownerLines.Owner(entry) {
+				continue
+			}
+			if phoneline.Match(line, entry.Number) {
 				return conversation, nil
 			}
 		}
 	}
 	return nil, nil
 }
+
+// allConversations asks a read source for every conversation it holds.
+const allConversations = math.MaxInt32
 
 // smsPathStatusText warns, in one line, when the daemon reports that carrier
 // SMS has stopped reaching the phone while RCS still arrives
