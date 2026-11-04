@@ -136,21 +136,28 @@ other ID, a Google Messages thread number included, with a 404 that says
 and neither does `resolve_contact_routes`, because Google thread numbers are
 device-local and a phone change re-numbers them (#177). The route tool finds
 a person by their number in any written form or by a name only the legacy
-store holds. A query that looks like a phone number names a line, which both
-stores match as `send_message` matches a recipient, by the last ten digits:
-their SQL calls the Go matcher in `internal/phoneline` (registered as
-`om_phone_line_match`), so separators and a country prefix don't matter,
-a shorter number matches a longer one only at its end, and the match runs
-before the limit. Other text matches a title or the name, number, phone or
-email of a participant entry, never a JSON key.
-It ignores the account's owner, whom most threads list: a thread that a query
-matches only through the owner's entry or the owner's own messages is no
-route. v2's conversation search skips the owner's identity. The legacy search
-skips participant entries flagged `is_me` or `isMe` and matches only incoming
-messages' senders. Both skip the owner before their limit and, like the
-address-book lookup, match `%` and `_` literally, but an owner's entry
-without the flag still matches. In client
-mode the route tool asks the daemon whether WhatsApp and Signal can send.
+store holds. A query that reads as a phone number (`phoneline.Number`: 7 to
+15 digits, at most one `+` before them, and nothing else but white space,
+dashes, dots, slashes and parentheses) names a line, which both stores match
+as `send_message` matches a recipient, by the last ten digits of each value
+that reads as a number or as a WhatsApp JID of one: their SQL calls the Go
+matcher in `internal/phoneline`, which SQLite knows as `om_phone_line_match`,
+so separators and a country prefix don't matter, a shorter number matches a
+longer one only at its end, digits inside an email address, a Signal UUID, a
+WhatsApp LID or a name match nothing, and the match runs before the limit. A
+name that holds digits, in any script, stays a name, and `send_message`
+refuses it as an SMS recipient. Other text matches a title or the name,
+number, phone or email of a participant entry, never a JSON key: the searches
+decode JSON escapes and ignore only ASCII case, as SQLite's `LIKE` and
+`lower()` do. Threads that share a time come in conversation ID order in both
+stores. It ignores the account's owner, whom most threads list: a thread that
+a query matches only through the owner's entry or the owner's own messages is
+no route. v2's conversation search skips the owner's identity. The legacy
+search skips participant entries flagged `is_me` or `isMe` and matches only
+incoming messages' senders. Both skip the owner before their limit and, like
+the address-book lookup, match `%` and `_` literally, but an owner's entry
+without the flag still matches. In client mode the route tool asks the daemon
+whether WhatsApp and Signal can send.
 The client opens the store via `app.NewClient`, which skips the startup repair
 sweeps — those stay daemon-owned, so N concurrent sessions don't each burst
 repair writes into the live `messages.db`.

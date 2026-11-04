@@ -863,11 +863,15 @@ func (s *Store) SearchConversationsByName(query string, limit int) ([]Conversati
 
 // SearchConversationsByPhoneLine returns the conversations with a
 // participant on the phone line that line, a phoneline.Line, names, newest
-// first and at most limit. A participant's line is its identity's canonical
-// value, as reads show it, and the account's owner (the self identity) is on
-// no line. Numbers match as send_message matches a recipient, through
-// phoneline, and the match runs before the LIMIT, so numbers that only
-// contain the line's digits never crowd out one that ends with them.
+// first, then in conversation ID order, and at most limit. A participant's
+// line is its identity's canonical value, as reads show it, and the
+// account's owner (the self identity) is on no line. A canonical value
+// counts only where it reads as a phone number or a WhatsApp JID of one, so
+// an email address, a Signal UUID, a LID or a username that holds the line's
+// digits names no one; a number then matches as send_message matches a
+// recipient, through phoneline. The match runs before the LIMIT, so numbers
+// that only contain the line's digits never crowd out one that ends with
+// them.
 func (s *Store) SearchConversationsByPhoneLine(line string, limit int) ([]Conversation, error) {
 	if limit <= 0 {
 		return []Conversation{}, nil

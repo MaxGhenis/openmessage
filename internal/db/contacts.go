@@ -64,25 +64,44 @@ func (s *Store) ListContacts(query string, limit int) ([]*Contact, error) {
 // ListContactsFromConversations extracts contacts from conversation participants
 // as a fallback when the contacts table is empty.
 //
-// The SQL prefilter is a strict superset of the per-participant matching
-// below (the participants JSON contains every name and number verbatim), so
-// it never hides a match — it just keeps a filtered autocomplete keystroke
-// from JSON-decoding every conversation in the store. Rows come newest first
-// and the loop stops once it has limit contacts, but no row limit applies:
-// most threads list the account's owner, so for a name the owner shares,
-// hundreds of newer rows can yield nothing but the owner's entries, which
-// the loop skips, before an older row yields a match. A limit below 1
-// returns nothing.
+// A participant matches where its name or number holds the query as written,
+// ASCII case aside: SQLite's lower() folds only ASCII letters, and so does
+// the check below, so Ángel finds Ángel Ruiz and ÁNGEL does too, but ángel
+// doesn't. Both read the decoded entry, never its JSON text, where Go writes
+// & and < as escapes. The SQL prefilter passes every row the loop could take
+// a contact from: a conversation whose name holds the query, or one with an
+// entry whose name or number does, under any case of those keys, as Go's
+// decoder accepts them. It only keeps a filtered autocomplete keystroke from
+// JSON-decoding every conversation in the store. Rows come newest first,
+// then in conversation ID order, and the loop stops once it has limit
+// contacts, but no row limit applies: most threads list the account's owner,
+// so for a name the owner shares, hundreds of newer rows can yield nothing
+// but the owner's entries, which the loop skips, before an older row yields
+// a match. A limit below 1 returns nothing.
 func (s *Store) ListContactsFromConversations(query string, limit int) ([]*Contact, error) {
 	if limit < 1 {
 		return nil, nil
 	}
-	queryFilter := strings.ToLower(query)
 	rows, err := s.db.Query(`
 		SELECT conversation_id, name, participants FROM conversations
-		WHERE ? = '' OR instr(lower(name), ?) > 0 OR instr(lower(participants), ?) > 0
-		ORDER BY last_message_ts DESC
-	`, queryFilter, queryFilter, queryFilter)
+		WHERE ? = ''
+			OR instr(lower(name), lower(?)) > 0
+			OR EXISTS (
+				SELECT 1
+				FROM `+sqlParticipantEntries("conversations.participants")+` AS p
+				WHERE CASE p.type
+					WHEN 'object' THEN EXISTS (
+						SELECT 1
+						FROM json_each(p.value) AS field
+						WHERE lower(field.key) IN ('name', 'number')
+							AND field.type = 'text'
+							AND instr(lower(field.value), lower(?)) > 0
+					)
+					ELSE 0
+				END
+			)
+		ORDER BY last_message_ts DESC, conversation_id
+	`, query, query, query)
 	if err != nil {
 		return nil, err
 	}
@@ -97,7 +116,7 @@ func (s *Store) ListContactsFromConversations(query string, limit int) ([]*Conta
 
 	seen := map[string]bool{}
 	var contacts []*Contact
-	queryLower := strings.ToLower(query)
+	queryLower := lowerASCII(query)
 
 	for len(contacts) < limit && rows.Next() {
 		var convID, name, participantsJSON string
@@ -109,7 +128,7 @@ func (s *Store) ListContactsFromConversations(query string, limit int) ([]*Conta
 		if err := json.Unmarshal([]byte(participantsJSON), &participants); err != nil {
 			// Fall back to conversation name if participants can't be parsed
 			if name != "" && !seen[name] {
-				if query == "" || containsInsensitive(name, queryLower) {
+				if query == "" || containsFoldASCII(name, queryLower) {
 					seen[name] = true
 					contacts = append(contacts, &Contact{
 						ContactID: convID,
@@ -135,7 +154,7 @@ func (s *Store) ListContactsFromConversations(query string, limit int) ([]*Conta
 			if seen[key] {
 				continue
 			}
-			if query != "" && !containsInsensitive(displayName, queryLower) && !containsInsensitive(p.Number, queryLower) {
+			if query != "" && !containsFoldASCII(displayName, queryLower) && !containsFoldASCII(p.Number, queryLower) {
 				continue
 			}
 			seen[key] = true
@@ -208,8 +227,21 @@ func (s *Store) ListUnifiedContacts(query string, limit int) ([]*UnifiedContact,
 	return contacts, rows.Err()
 }
 
-func containsInsensitive(s, sub string) bool {
-	return strings.Contains(strings.ToLower(s), sub)
+// containsFoldASCII reports whether s holds sub, a lowerASCII string, with
+// ASCII letters' case aside, as SQLite's lower() folds them.
+func containsFoldASCII(s, sub string) bool {
+	return strings.Contains(lowerASCII(s), sub)
+}
+
+// lowerASCII lowers s's ASCII letters and leaves every other byte alone.
+func lowerASCII(s string) string {
+	b := []byte(s)
+	for index, c := range b {
+		if c >= 'A' && c <= 'Z' {
+			b[index] = c + 'a' - 'A'
+		}
+	}
+	return string(b)
 }
 
 func NormalizeAvatarPhone(phone string) string {

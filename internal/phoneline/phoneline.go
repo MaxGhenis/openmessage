@@ -1,21 +1,26 @@
 // Package phoneline compares phone numbers as send_message compares a
-// recipient with a thread's participants: by their digits alone, so
-// separators and a country prefix don't matter. Both stores' SQL calls the
-// same comparison through SQLMatch, so a search matches a number exactly as
-// a send does.
+// recipient with a thread's participants. A value names a phone line only
+// when it reads as a phone number, as Number defines one, or is a WhatsApp
+// JID on the phone-number server; then its digits alone decide, so
+// separators and a country prefix don't matter. An email address, a Signal
+// UUID, a WhatsApp LID or group JID, a user path or a name that holds
+// digits names no line. Both stores' SQL calls the same comparison through
+// SQLMatch, so a search matches a number exactly as a send does.
 package phoneline
 
 import (
 	"database/sql/driver"
 	"strings"
+	"unicode"
 
 	"modernc.org/sqlite"
 )
 
 // SQLMatch names the SQLite function om_phone_line_match(line, value, ...).
 // It returns 1 when the first value that isn't blank names the phone line
-// that line, a Line, names, and 0 otherwise. A value that isn't text counts
-// as blank. Every connection the "sqlite" driver opens has the function.
+// that line, a Line, names, and 0 otherwise. TEXT and BLOB arguments compare
+// as text; NULL, INTEGER and REAL ones count as blank. Every connection the
+// "sqlite" driver opens has the function.
 const SQLMatch = "om_phone_line_match"
 
 func init() {
@@ -66,20 +71,90 @@ func Line(value string) string {
 	return digits
 }
 
-// Match reports whether stored names the line that line, a Line, names. One
-// side may carry a country prefix the other lacks, so the shorter run of
-// digits must end the longer, and a run of fewer than 7 digits matches
-// nothing.
-func Match(line, stored string) bool {
-	storedDigits := Digits(stored)
-	if len(storedDigits) < 7 || len(line) < 7 {
+// Number returns the digits of value, and whether value is a phone number as
+// people write one: 7 to 15 ASCII digits, the most E.164 allows, with at most
+// one + before the first. White space, dashes of any kind, dots, slashes and
+// parentheses may sit around and between them. Any other character, a
+// letter, a colon or an @ among them, makes value something else: an email
+// address, a tel: URI, an extension or a name.
+func Number(value string) (string, bool) {
+	var digits strings.Builder
+	plus := false
+	for _, r := range value {
+		switch {
+		case r >= '0' && r <= '9':
+			digits.WriteRune(r)
+		case r == '+' && !plus && digits.Len() == 0:
+			plus = true
+		case unicode.IsSpace(r) || unicode.Is(unicode.Pd, r) || r == '.' || r == '/' || r == '(' || r == ')':
+		default:
+			return "", false
+		}
+	}
+	if digits.Len() < 7 || digits.Len() > 15 {
+		return "", false
+	}
+	return digits.String(), true
+}
+
+// whatsAppDigits returns the user of a WhatsApp JID on the phone-number
+// server, user@s.whatsapp.net or the older user@c.us, when the user is a
+// phone number's 7 to 15 digits. The server matches in any ASCII case.
+// WhatsApp's other JIDs, a LID's @lid and a group's @g.us, name no line.
+func whatsAppDigits(value string) (string, bool) {
+	user, server, ok := strings.Cut(strings.TrimSpace(value), "@")
+	if !ok || len(user) < 7 || len(user) > 15 || !(equalFoldASCII(server, "s.whatsapp.net") || equalFoldASCII(server, "c.us")) {
+		return "", false
+	}
+	for index := 0; index < len(user); index++ {
+		if user[index] < '0' || user[index] > '9' {
+			return "", false
+		}
+	}
+	return user, true
+}
+
+// equalFoldASCII reports whether a and b match with ASCII letters' case
+// aside. Unlike strings.EqualFold it folds nothing else, so a long s or a
+// Kelvin sign never stands in for s or k.
+func equalFoldASCII(a, b string) bool {
+	if len(a) != len(b) {
 		return false
 	}
-	return strings.HasSuffix(storedDigits, line) || strings.HasSuffix(line, storedDigits)
+	for index := 0; index < len(a); index++ {
+		if lowerASCII(a[index]) != lowerASCII(b[index]) {
+			return false
+		}
+	}
+	return true
+}
+
+func lowerASCII(c byte) byte {
+	if c >= 'A' && c <= 'Z' {
+		return c + 'a' - 'A'
+	}
+	return c
+}
+
+// Match reports whether stored names the line that line, a Line, names.
+// stored must read as a phone number or a WhatsApp JID of one. One side may
+// carry a country prefix the other lacks, so the shorter run of digits must
+// end the longer, and a line of fewer than 7 digits matches nothing.
+func Match(line, stored string) bool {
+	digits, ok := Number(stored)
+	if !ok {
+		digits, ok = whatsAppDigits(stored)
+	}
+	if !ok || len(line) < 7 {
+		return false
+	}
+	return strings.HasSuffix(digits, line) || strings.HasSuffix(line, digits)
 }
 
 // MatchFirst applies Match to the first of values that isn't blank, as a
-// participant's number stands in for its phone.
+// participant's number stands in for its phone. That value decides even when
+// it names no line: an entry whose number holds an email address doesn't
+// fall back to its phone.
 func MatchFirst(line string, values ...string) bool {
 	for _, value := range values {
 		if strings.TrimSpace(value) != "" {

@@ -136,8 +136,9 @@ func resolveContactRoutesHandler(a *app.App, configured ...Options) server.ToolH
 }
 
 // findRouteConversations returns the query's conversations from reads, the
-// serving store. A query that looks like a phone number names a phone line;
-// other text matches a conversation's title or someone in it. people supplies
+// serving store. A query that reads as a phone number, as phoneline.Number
+// defines one, names a phone line; other text matches a conversation's title
+// or someone in it. people supplies
 // the numbers of matching address-book contacts and of matching participants
 // in its own conversations; it then searches reads for those numbers, never
 // for a people-store conversation ID.
@@ -166,16 +167,18 @@ func findRouteConversations(reads readsource.ReadSource, people *db.Store, query
 		addConversation(conv)
 	}
 
-	// search finds text's conversations in reads. A phone number names its
-	// line, which both stores match as send_message matches a recipient, by
-	// the last ten digits: v2 stores numbers in E.164 form, while the legacy
-	// store and address books keep them as written, and a run of digits
-	// inside another number names someone else (5550123 sits inside
-	// +447555012399). Most threads list the account's owner, and a thread
-	// that a query matches only through the owner says nothing about whom to
-	// send to. Both stores' searches skip the owner before their limit: v2's
-	// skips the owner's identity, and the legacy store's skips participant
-	// entries flagged as the owner's and the owner's own messages.
+	// search finds text's conversations in reads. A phone number names its line,
+	// which both stores match as send_message matches a recipient: by the last
+	// ten digits of each value that reads as a number, or as a WhatsApp JID of
+	// one, since v2 stores numbers in E.164 form while the legacy store and
+	// address books keep them as people wrote them. A run of digits inside
+	// another number names someone else (5550123 sits inside +447555012399), and
+	// so do digits inside an email address, a Signal UUID or a name. Most
+	// threads list the account's owner, and a thread that a query matches only
+	// through the owner says nothing about whom to send to. Both stores'
+	// searches skip the owner before their limit: v2's skips the owner's
+	// identity, and the legacy store's skips participant entries flagged as the
+	// owner's and the owner's own messages.
 	search := func(text string) ([]*db.Conversation, error) {
 		if looksLikePhoneNumber(text) {
 			return reads.SearchConversationsByPhoneLine(phoneline.Line(text), limit)

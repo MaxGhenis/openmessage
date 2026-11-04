@@ -28,18 +28,26 @@ var (
 	digit    = regexp.MustCompile(`[0-9]`)
 )
 
-// Digits returns the digits that put value on a phone line, and whether any
-// do: a number written as one, or a WhatsApp JID whose user is one, with 7
-// to 15 digits.
-func Digits(value string) (string, bool) {
-	var digits string
-	if match := whatsApp.FindStringSubmatch(value); match != nil {
-		digits = match[1]
-	} else if written.MatchString(value) {
-		digits = strings.Join(digit.FindAllString(value, -1), "")
-	} else {
+// Number returns the digits of value, and whether value is a phone number
+// written as one, with 7 to 15 digits.
+func Number(value string) (string, bool) {
+	if !written.MatchString(value) {
 		return "", false
 	}
+	return counted(strings.Join(digit.FindAllString(value, -1), ""))
+}
+
+// Digits returns the digits that put value on a phone line, and whether any
+// do: a Number, or a WhatsApp JID whose user is 7 to 15 digits.
+func Digits(value string) (string, bool) {
+	if match := whatsApp.FindStringSubmatch(value); match != nil {
+		return counted(match[1])
+	}
+	return Number(value)
+}
+
+// counted keeps digits that number 7 to 15.
+func counted(digits string) (string, bool) {
 	if len(digits) < 7 || len(digits) > 15 {
 		return "", false
 	}

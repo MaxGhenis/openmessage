@@ -357,7 +357,9 @@ func (s *Store) ListConversationsByPlatform(platform string, limit int) ([]*Conv
 // messages carry the owner's name and number too, so sender matches count
 // incoming messages only. The SQL skips both before its LIMIT, so threads
 // that match only through the owner never crowd out a match. The query
-// matches as written: % and _ are no wildcards, as in v2's search.
+// matches as written: % and _ are no wildcards, as in v2's search. Threads
+// that share a time come in conversation ID order, as v2's do, so a limit
+// keeps the same threads whichever store serves the reads.
 func (s *Store) SearchConversationsByMetadata(query string, limit int) ([]*Conversation, error) {
 	pattern := "%" + escapeLikePattern(query) + "%"
 	rows, err := s.db.Query(`
@@ -390,7 +392,7 @@ func (s *Store) SearchConversationsByMetadata(query string, limit int) ([]*Conve
 				JOIN contacts c ON c.number = m.sender_number
 				WHERE m.is_from_me = 0 AND (c.name LIKE ? ESCAPE '\' OR c.number LIKE ? ESCAPE '\')
 			)
-		ORDER BY last_message_ts DESC
+		ORDER BY last_message_ts DESC, conversation_id
 		LIMIT ?
 	`, pattern, pattern, pattern, pattern, pattern, pattern, pattern, limit)
 	if err != nil {
@@ -401,14 +403,15 @@ func (s *Store) SearchConversationsByMetadata(query string, limit int) ([]*Conve
 }
 
 // SearchConversationsByPhoneLine returns the conversations with someone on
-// the phone line that line, a phoneline.Line, names, newest first and at
-// most limit. Someone is a participant entry not flagged as the owner's,
-// through its number (or, without one, its phone), a bare string entry, or
-// the sender of an incoming message, whom the roster may lack. Numbers match
-// as send_message matches a recipient, through phoneline, so separators and
-// a country prefix don't matter, and the match runs before the LIMIT, so
-// numbers that only contain the line's digits never crowd out one that ends
-// with them.
+// the phone line that line, a phoneline.Line, names, newest first, then in
+// conversation ID order, and at most limit. Someone is a participant entry
+// not flagged as the owner's, through its number (or, without one, its
+// phone), a bare string entry, or the sender of an incoming message, whom
+// the roster may lack. A value counts only where it reads as a phone number
+// or a WhatsApp JID of one, and then matches as send_message matches a
+// recipient, through phoneline, so separators and a country prefix don't
+// matter. The match runs before the LIMIT, so numbers that only contain the
+// line's digits never crowd out one that ends with them.
 func (s *Store) SearchConversationsByPhoneLine(line string, limit int) ([]*Conversation, error) {
 	rows, err := s.db.Query(phoneLineSearchSQL(phoneline.SQLMatch), line, line, line, limit)
 	if err != nil {
@@ -420,9 +423,16 @@ func (s *Store) SearchConversationsByPhoneLine(line string, limit int) ([]*Conve
 
 // phoneLineSearchSQL is SearchConversationsByPhoneLine's query, calling the
 // SQL function match to test a value against the line. It takes the line
-// three times, then the limit.
+// three times, then the limit. A thread can hold thousands of messages from
+// a few numbers, so match tests each distinct sender number once, in
+// sender_numbers, and the messages from the numbers on the line then give
+// their threads. SQLite pushes no WHERE term down into a MATERIALIZED CTE,
+// so match never reaches the scan of messages.
 func phoneLineSearchSQL(match string) string {
 	return `
+		WITH sender_numbers AS MATERIALIZED (
+			SELECT DISTINCT sender_number FROM messages
+		)
 		SELECT ` + conversationColumns + `
 		FROM conversations
 		WHERE EXISTS (
@@ -436,10 +446,12 @@ func phoneLineSearchSQL(match string) string {
 			)
 			OR conversation_id IN (
 				SELECT conversation_id
-				FROM (SELECT DISTINCT conversation_id, sender_number FROM messages WHERE is_from_me = 0)
-				WHERE ` + match + `(?, sender_number)
+				FROM messages
+				WHERE is_from_me = 0 AND sender_number IN (
+					SELECT sender_number FROM sender_numbers WHERE ` + match + `(?, sender_number)
+				)
 			)
-		ORDER BY last_message_ts DESC
+		ORDER BY last_message_ts DESC, conversation_id
 		LIMIT ?
 	`
 }

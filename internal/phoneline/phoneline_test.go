@@ -63,6 +63,51 @@ func TestMatch(t *testing.T) {
 	}
 }
 
+// Number takes a value as a phone number only when someone wrote it as one,
+// and agrees with phonelinetest on every draw. A WhatsApp JID, which a stored
+// value may be, is no number a person types.
+func TestNumber(t *testing.T) {
+	for value, want := range map[string]string{
+		"+1 (202) 555-0123": "12025550123", "202.555.0123": "2025550123", "5550123": "5550123",
+		"+44 20 7946 0958": "442079460958", "123456789012345": "123456789012345", "(+1) 202/555 0123 ": "12025550123",
+		"555012": "", "1234567890123456": "", "+": "", "": "", "+1 202 555 0123 ext 4": "", "+1 202 555 0123#": "",
+		"12025550123@s.whatsapp.net": "", "tel:+12025550123": "", "+1+2025550123": "", "1+2025550123": "",
+		"２０２５５５０１２３": "",
+	} {
+		got, ok := Number(value)
+		if got != want || ok != (want != "") {
+			t.Errorf("Number(%q) = %q, %v, want %q", value, got, ok, want)
+		}
+	}
+	exercised := map[string]int{}
+	property := func(seed int64) bool {
+		random := rand.New(rand.NewSource(seed))
+		digits := randomDigits(random, 1+random.Intn(17))
+		for _, value := range []string{numberForm(random, digits), identifierForm(random, digits), digits + "@s.whatsapp.net", noiseForm(random), noiseForm(random) + digits} {
+			got, ok := Number(value)
+			want, wantOK := phonelinetest.Number(value)
+			if got != want || ok != wantOK {
+				t.Logf("seed %d: Number(%q) = %q, %v; phonelinetest says %q, %v", seed, value, got, ok, want, wantOK)
+				return false
+			}
+			if ok {
+				exercised["a number"]++
+			} else {
+				exercised["something else"]++
+			}
+		}
+		return true
+	}
+	if err := quick.Check(property, &quick.Config{MaxCount: 400, Rand: rand.New(rand.NewSource(20261104))}); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{"a number", "something else"} {
+		if exercised[path] == 0 {
+			t.Errorf("the property never drew %s (drew %v)", path, exercised)
+		}
+	}
+}
+
 // numberForm writes digits as people write a phone number: separators of
 // every kind between them, white space around them, and an optional +
 // before them.
