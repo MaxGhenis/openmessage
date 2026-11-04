@@ -42,8 +42,10 @@ type ParticipantEntry struct {
 // ParticipantEntries reads each object or string element of a participants
 // list on its own, so an element of another JSON type, or a field of another
 // JSON type, costs only itself. Keys match after JSON unescaping and with
-// case: "\u0069s_me" names is_me, and "IS_ME" names nothing. Anything but a
-// JSON array holds no entries.
+// case: "\u0069s_me" names is_me, and "IS_ME" names nothing. Where a key
+// repeats, its last value counts, as when encoding/json decodes an object
+// into a map, but Texts keeps every text. Anything but a JSON array, as
+// encoding/json reads JSON, holds no entries.
 func ParticipantEntries(participants string) []ParticipantEntry {
 	var elements []json.RawMessage
 	if json.Unmarshal([]byte(participants), &elements) != nil {
@@ -61,24 +63,69 @@ func ParticipantEntries(participants string) []ParticipantEntry {
 // participantEntry reads one element of a participants list; ok is false
 // when the element is neither a JSON object nor a JSON string.
 func participantEntry(element []byte) (entry ParticipantEntry, ok bool) {
+	element = bytes.TrimSpace(element)
+	switch {
 	// JSON null decodes into a string too, so a string must start with a quote.
-	if bytes.HasPrefix(bytes.TrimSpace(element), []byte(`"`)) {
+	case bytes.HasPrefix(element, []byte(`"`)):
 		var text string
 		if json.Unmarshal(element, &text) != nil {
 			return ParticipantEntry{}, false
 		}
-		return ParticipantEntry{Number: strings.TrimSpace(text)}, true
+		return ParticipantEntry{Number: strings.TrimSpace(text), Texts: []string{text}}, true
+	case bytes.HasPrefix(element, []byte(`{`)):
+		return objectEntry(element)
 	}
-	var fields map[string]json.RawMessage
-	if json.Unmarshal(element, &fields) != nil || fields == nil {
+	return ParticipantEntry{}, false
+}
+
+// objectEntry reads an object element's members in order.
+func objectEntry(object []byte) (entry ParticipantEntry, ok bool) {
+	decoder := json.NewDecoder(bytes.NewReader(object))
+	if token, err := decoder.Token(); err != nil || token != json.Delim('{') {
 		return ParticipantEntry{}, false
 	}
-	entry.Number = jsonString(fields["number"])
-	if entry.Number == "" {
-		entry.Number = jsonString(fields["phone"])
+	var number, phone string
+	var isMe, isMeCamel bool
+	for decoder.More() {
+		token, err := decoder.Token()
+		if err != nil {
+			return ParticipantEntry{}, false
+		}
+		key, _ := token.(string)
+		var value json.RawMessage
+		if decoder.Decode(&value) != nil {
+			return ParticipantEntry{}, false
+		}
+		switch key {
+		case "name", "email":
+			entry.Texts = appendText(entry.Texts, value)
+		case "number":
+			entry.Texts = appendText(entry.Texts, value)
+			number = jsonString(value)
+		case "phone":
+			entry.Texts = appendText(entry.Texts, value)
+			phone = jsonString(value)
+		case "is_me":
+			isMe = jsonTrue(value)
+		case "isMe":
+			isMeCamel = jsonTrue(value)
+		}
 	}
-	entry.IsMe = jsonTrue(fields["is_me"]) || jsonTrue(fields["isMe"])
+	entry.Number = number
+	if entry.Number == "" {
+		entry.Number = phone
+	}
+	entry.IsMe = isMe || isMeCamel
 	return entry, true
+}
+
+// appendText appends the string raw holds, as it is, when raw holds one.
+func appendText(texts []string, raw json.RawMessage) []string {
+	var text string
+	if !bytes.HasPrefix(raw, []byte(`"`)) || json.Unmarshal(raw, &text) != nil {
+		return texts
+	}
+	return append(texts, text)
 }
 
 // jsonString is the string raw holds, trimmed, or "" when raw holds none.
@@ -113,20 +160,32 @@ func OwnerLine(entry ParticipantEntry) (line string, ok bool) {
 }
 
 // OwnerLines is a set of the owner's phone lines, as OwnerLine gives them.
-type OwnerLines map[string]bool
+// It holds the phoneline.LineKeys of each line, so OnLine answers through a
+// few lookups however many lines the set holds. The zero value is an empty
+// set.
+type OwnerLines struct {
+	keys map[string]bool
+}
 
 // Add puts the line entry gives the owner, if any, in the set.
-func (lines OwnerLines) Add(entry ParticipantEntry) {
-	if line, ok := OwnerLine(entry); ok {
-		lines[line] = true
+func (lines *OwnerLines) Add(entry ParticipantEntry) {
+	line, ok := OwnerLine(entry)
+	if !ok {
+		return
+	}
+	if lines.keys == nil {
+		lines.keys = map[string]bool{}
+	}
+	for _, key := range phoneline.LineKeys(line) {
+		lines.keys[key] = true
 	}
 }
 
 // OnLine reports whether number sits on one of the lines, as phoneline.Match
 // says.
 func (lines OwnerLines) OnLine(number string) bool {
-	for line := range lines {
-		if phoneline.Match(line, number) {
+	for _, key := range phoneline.ValueKeys(number) {
+		if lines.keys[key] {
 			return true
 		}
 	}
@@ -139,67 +198,83 @@ func (lines OwnerLines) Owner(entry ParticipantEntry) bool {
 	return entry.IsMe || lines.OnLine(entry.Number)
 }
 
-// init registers the owner rule as SQL functions over a json_each row of a
-// participants list:
+// init registers the SQL functions through which the legacy searches read
+// participant lists, so that SQLite's own JSON reader never reads one: it
+// stops at a NUL and gives up past a depth of 1000, where encoding/json
+// reads on. Each function takes a list whole, as a BLOB, since the driver
+// cuts a TEXT argument at its first NUL; reads it as ParticipantEntries
+// does; returns JSON text that SQLite's JSON functions read back, with every
+// NUL escaped; and fails on no input:
 //
-//	openmessage_owner_line(type, value) returns the line OwnerLine gives the
-//	element, or NULL.
-//	openmessage_owner_entry(type, value, lines) returns 1 when the rule counts
-//	the element as the owner's, given the owner's lines with commas between
-//	them, and 0 otherwise.
-//
-// Both read a row by its type: an 'object' row's value as the object's
-// JSON, and a 'text' row's value as the string itself, since json_each gives
-// a string element's bare text, which could read as an object. Rows of other
-// types hold no entry. Neither fails on any input, so SQLite may evaluate
-// them in any order.
+//	openmessage_participant_entries(list) returns an array that holds, for
+//	each entry ParticipantEntries gives, in order, an object with its
+//	"is_me" flag, its "number", its number's phoneline.ValueKeys as
+//	"number_keys", and its "texts".
+//	openmessage_owner_line_keys(list) returns an array of the
+//	phoneline.LineKeys of each line OwnerLine gives an entry of list.
 func init() {
-	sqlite.MustRegisterDeterministicScalarFunction("openmessage_owner_line", 2, sqlOwnerLine)
-	sqlite.MustRegisterDeterministicScalarFunction("openmessage_owner_entry", 3, sqlOwnerEntry)
+	sqlite.MustRegisterDeterministicScalarFunction("openmessage_participant_entries", 1, participantEntriesJSON)
+	sqlite.MustRegisterDeterministicScalarFunction("openmessage_owner_line_keys", 1, ownerLineKeysJSON)
 }
 
-// sqlEntry reads a json_each row as ParticipantEntries reads the element
-// behind it: an 'object' row through its JSON, a 'text' row as its string.
-func sqlEntry(elementType, value driver.Value) (ParticipantEntry, bool) {
-	var text string
-	switch value := value.(type) {
-	case string:
-		text = value
-	case []byte:
-		text = string(value)
-	default:
-		return ParticipantEntry{}, false
-	}
-	switch elementType {
-	case "object":
-		return participantEntry([]byte(text))
-	case "text":
-		return ParticipantEntry{Number: strings.TrimSpace(text)}, true
-	}
-	return ParticipantEntry{}, false
+// sqlEntry is an entry as openmessage_participant_entries writes it.
+type sqlEntry struct {
+	IsMe       bool     `json:"is_me"`
+	Number     string   `json:"number"`
+	NumberKeys []string `json:"number_keys"`
+	Texts      []string `json:"texts"`
 }
 
-func sqlOwnerLine(_ *sqlite.FunctionContext, args []driver.Value) (driver.Value, error) {
-	entry, ok := sqlEntry(args[0], args[1])
-	if !ok {
-		return nil, nil
-	}
-	if line, ok := OwnerLine(entry); ok {
-		return line, nil
-	}
-	return nil, nil
-}
-
-func sqlOwnerEntry(_ *sqlite.FunctionContext, args []driver.Value) (driver.Value, error) {
-	entry, ok := sqlEntry(args[0], args[1])
-	if !ok {
-		return false, nil
-	}
-	lines := OwnerLines{}
-	if joined, isText := args[2].(string); isText {
-		for _, line := range strings.Split(joined, ",") {
-			lines[line] = true
+func participantEntriesJSON(_ *sqlite.FunctionContext, args []driver.Value) (driver.Value, error) {
+	entries := ParticipantEntries(sqlList(args[0]))
+	rows := make([]sqlEntry, len(entries))
+	for index, entry := range entries {
+		rows[index] = sqlEntry{
+			IsMe:       entry.IsMe,
+			Number:     entry.Number,
+			NumberKeys: append([]string{}, phoneline.ValueKeys(entry.Number)...),
+			Texts:      append([]string{}, entry.Texts...),
 		}
 	}
-	return lines.Owner(entry), nil
+	return jsonText(rows)
+}
+
+func ownerLineKeysJSON(_ *sqlite.FunctionContext, args []driver.Value) (driver.Value, error) {
+	keys := []string{}
+	seen := map[string]bool{}
+	for _, entry := range ParticipantEntries(sqlList(args[0])) {
+		line, ok := OwnerLine(entry)
+		if !ok {
+			continue
+		}
+		for _, key := range phoneline.LineKeys(line) {
+			if !seen[key] {
+				seen[key] = true
+				keys = append(keys, key)
+			}
+		}
+	}
+	return jsonText(keys)
+}
+
+// sqlList is the list an SQL argument holds: a BLOB's bytes, a TEXT's text
+// as the driver passes it, or "" for anything else.
+func sqlList(value driver.Value) string {
+	switch value := value.(type) {
+	case []byte:
+		return string(value)
+	case string:
+		return value
+	}
+	return ""
+}
+
+// jsonText returns value's JSON as TEXT: SQLite's JSON functions read a
+// BLOB as JSONB.
+func jsonText(value any) (driver.Value, error) {
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return nil, err
+	}
+	return string(encoded), nil
 }

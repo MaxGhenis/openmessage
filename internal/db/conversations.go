@@ -349,43 +349,36 @@ func (s *Store) ListConversationsByPlatform(platform string, limit int) ([]*Conv
 
 // SearchConversationsByMetadata matches a conversation by its name, a
 // participant entry, or the sender of a message in it. A participant entry
-// matches through the text of its name, number, phone or email, or, for a
-// bare string, the string; JSON keys, flags and IDs match nothing, and
-// escapes are decoded. Most threads list the account's owner, so a
-// participant match skips the owner's entries, or the owner's name or number
-// would find every thread. The owner rule in owner.go names those entries:
-// an object that carries is_me (or isMe), and any entry, in any thread, on
-// the phone line of a flagged entry whose number reads as a phone number or
-// a WhatsApp JID of one. Google's participant lists often repeat the owner
-// without the flag. The owner's outgoing messages carry the owner's name and
-// number too, so sender matches count incoming messages only. The SQL skips
-// both before its LIMIT, so threads that match only through the owner never
-// crowd out a match. It reads the owner rule through the functions owner.go
-// registers, so it skips the entries send_message skips. The query matches
-// as written, as in v2's search: % and _ match only themselves. Threads that
-// share a time come in conversation ID order, as v2's do, so a limit keeps
-// the same threads whichever store serves the reads.
+// matches through its Texts, as owner.go's ParticipantEntries reads them:
+// the text of its name, number, phone or email, or, for a bare string, the
+// string; JSON keys, flags and IDs match nothing, and escapes are decoded.
+// Most threads list the account's owner, so a participant match skips the
+// owner's entries, or the owner's name or number would find every thread.
+// The owner rule in owner.go names those entries: an object that carries
+// is_me (or isMe), and any entry, in any thread, on the phone line of a
+// flagged entry whose number reads as a phone number or a WhatsApp JID of
+// one. Google's participant lists often repeat the owner without the flag.
+// The owner's outgoing messages carry the owner's name and number too, so
+// sender matches count incoming messages only. The SQL skips both before its
+// LIMIT, so threads that match only through the owner never crowd out a
+// match. Go reads every list, through the functions owner.go registers, so
+// the search skips the entries send_message skips. The query matches as
+// written, as in v2's search: % and _ match only themselves. LIKE folds the
+// case of ASCII letters alone, and it reads a text only up to a NUL. Threads
+// that share a time come in conversation ID order, as v2's do, so a limit
+// keeps the same threads whichever store serves the reads.
 func (s *Store) SearchConversationsByMetadata(query string, limit int) ([]*Conversation, error) {
 	pattern := "%" + escapeLikePattern(query) + "%"
 	rows, err := s.db.Query(`
-		WITH `+sqlOwnerLines()+`
+		WITH `+sqlOwnerKeys()+`
 		SELECT DISTINCT `+conversationColumns+`
 		FROM conversations
 		WHERE name LIKE ? ESCAPE '\'
 			OR EXISTS (
 				SELECT 1
-				FROM `+sqlParticipantEntries("conversations.participants")+` AS p
-				WHERE NOT `+sqlEntryIsOwners+` AND CASE p.type
-					WHEN 'text' THEN p.value LIKE ? ESCAPE '\'
-					WHEN 'object' THEN EXISTS (
-						SELECT 1
-						FROM json_each(p.value) AS field
-						WHERE field.key IN ('name', 'number', 'phone', 'email')
-							AND field.type = 'text'
-							AND field.value LIKE ? ESCAPE '\'
-					)
-					ELSE 0
-				END
+				FROM `+sqlParticipantEntries("conversations.participants")+` AS p,
+					json_each(p.value, '$.texts') AS entry_text
+				WHERE NOT `+sqlEntryIsOwners+` AND entry_text.value LIKE ? ESCAPE '\'
 			)
 			OR conversation_id IN (
 				SELECT DISTINCT conversation_id
@@ -400,7 +393,7 @@ func (s *Store) SearchConversationsByMetadata(query string, limit int) ([]*Conve
 			)
 		ORDER BY last_message_ts DESC, conversation_id
 		LIMIT ?
-	`, pattern, pattern, pattern, pattern, pattern, pattern, pattern, limit)
+	`, pattern, pattern, pattern, pattern, pattern, pattern, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -418,11 +411,13 @@ func (s *Store) SearchConversationsByMetadata(query string, limit int) ([]*Conve
 // hold, so the owner's own number finds no thread through its participants.
 // A value counts only where it reads as a phone number or a WhatsApp JID of
 // one, and then matches as send_message matches a recipient, through
-// phoneline, so separators and a country prefix don't matter. The match runs
-// before the LIMIT, so numbers that only contain the line's digits never
-// crowd out one that ends with them.
+// phoneline, so separators and a country prefix don't matter. Go reads every
+// list, through the functions owner.go registers, and phoneline reads each
+// value whole, NULs included. The match runs before the LIMIT, so numbers
+// that only contain the line's digits never crowd out one that ends with
+// them.
 func (s *Store) SearchConversationsByPhoneLine(line string, limit int) ([]*Conversation, error) {
-	rows, err := s.db.Query(phoneLineSearchSQL(phoneline.SQLMatch), line, line, line, limit)
+	rows, err := s.db.Query(phoneLineSearchSQL(phoneline.SQLMatch), line, line, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -432,14 +427,15 @@ func (s *Store) SearchConversationsByPhoneLine(line string, limit int) ([]*Conve
 
 // phoneLineSearchSQL is SearchConversationsByPhoneLine's query, calling the
 // SQL function match to test a value against the line. It takes the line
-// three times, then the limit. A thread can hold thousands of messages from
-// a few numbers, so match tests each distinct sender number once, in
-// sender_numbers, and the messages from the numbers on the line then give
-// their threads. SQLite pushes no WHERE term down into a MATERIALIZED CTE,
-// so match never reaches the scan of messages.
+// twice, then the limit. Each value reaches match as a BLOB, since the
+// driver cuts a TEXT argument at its first NUL. A thread can hold thousands
+// of messages from a few numbers, so match tests each distinct sender number
+// once, in sender_numbers, and the messages from the numbers on the line
+// then give their threads. SQLite pushes no WHERE term down into a
+// MATERIALIZED CTE, so match never reaches the scan of messages.
 func phoneLineSearchSQL(match string) string {
 	return `
-		WITH ` + sqlOwnerLines() + `,
+		WITH ` + sqlOwnerKeys() + `,
 		sender_numbers AS MATERIALIZED (
 			SELECT DISTINCT sender_number FROM messages
 		)
@@ -448,17 +444,13 @@ func phoneLineSearchSQL(match string) string {
 		WHERE EXISTS (
 				SELECT 1
 				FROM ` + sqlParticipantEntries("conversations.participants") + ` AS p
-				WHERE NOT ` + sqlEntryIsOwners + ` AND CASE p.type
-					WHEN 'text' THEN ` + match + `(?, p.value)
-					WHEN 'object' THEN ` + match + `(?, ` + sqlEntryText("number") + `, ` + sqlEntryText("phone") + `)
-					ELSE 0
-				END
+				WHERE NOT ` + sqlEntryIsOwners + ` AND ` + match + `(?, CAST(json_extract(p.value, '$.number') AS BLOB))
 			)
 			OR conversation_id IN (
 				SELECT conversation_id
 				FROM messages
 				WHERE is_from_me = 0 AND sender_number IN (
-					SELECT sender_number FROM sender_numbers WHERE ` + match + `(?, sender_number)
+					SELECT sender_number FROM sender_numbers WHERE ` + match + `(?, CAST(sender_number AS BLOB))
 				)
 			)
 		ORDER BY last_message_ts DESC, conversation_id
@@ -503,7 +495,7 @@ var addressSearchSQL = `
 	FROM conversations
 	WHERE EXISTS (
 			SELECT 1
-			FROM ` + sqlParticipantEntries("conversations.participants") + ` AS p
+			FROM ` + sqlRawParticipantEntries("conversations.participants") + ` AS p
 			WHERE CASE p.type
 				WHEN 'text' THEN p.value = ? COLLATE NOCASE
 				WHEN 'object' THEN NOT ` + sqlOwnerFlag + ` AND (
@@ -526,51 +518,63 @@ var addressSearchSQL = `
 `
 
 // sqlOwnerFlag holds for an object entry that carries is_me or isMe. p is a
-// json_each row over a conversation's participants. Only a JSON true counts,
+// row of sqlRawParticipantEntries. Only a JSON true counts,
 // and json_type gives NULL for a missing key, hence IS.
 const sqlOwnerFlag = `(json_type(p.value, '$.is_me') IS 'true' OR json_type(p.value, '$.isMe') IS 'true')`
 
 // sqlEntryText is an object entry's text under key, or NULL when the key is
-// missing or holds anything but text. p is a json_each row over a
-// conversation's participants.
+// missing or holds anything but text. p is a row of
+// sqlRawParticipantEntries.
 func sqlEntryText(key string) string {
 	return `CASE json_type(p.value, '$.` + key + `') WHEN 'text' THEN json_extract(p.value, '$.` + key + `') END`
 }
 
-// sqlOwnerLines is a common table expression for a WITH clause, owner_lines:
-// one row whose lines column holds the owner's phone lines, as owner.go's
-// OwnerLine gives them, from every conversation, with commas between them,
-// or NULL when no entry gives one.
-func sqlOwnerLines() string {
-	return `owner_lines AS MATERIALIZED (
-			SELECT group_concat(DISTINCT openmessage_owner_line(p.type, p.value)) AS lines
-			FROM conversations AS flagged, ` + sqlParticipantEntries("flagged.participants") + ` AS p
-		)`
-}
-
-// sqlOwnerLineKeys is the json_each source for the phoneline.LineKeys of the
-// owner's lines in a participants column.
-func sqlOwnerLineKeys(column string) string {
-	return `json_each('[]')`
+// sqlRawParticipantEntries is the json_each source for the elements of a
+// participants column as SQLite's JSON reader reads them: the elements of a
+// JSON array, and none for anything else. The JSON functions fail on
+// malformed JSON, such as an empty string, and SQLite can evaluate both sides
+// of an AND, so CASE guards them here and on p.value. Only the address
+// search reads lists this way.
+func sqlRawParticipantEntries(column string) string {
+	return `json_each(CASE WHEN json_valid(` + column + `) THEN CASE json_type(` + column + `) WHEN 'array' THEN ` + column + ` ELSE '[]' END ELSE '[]' END)`
 }
 
 // sqlOwnerKeys is a common table expression for a WITH clause, owner_keys:
-// a row for each key of the owner's lines from every conversation.
+// a row for each of the phoneline.LineKeys of the owner's lines, as owner.go's
+// OwnerLine gives them, from every conversation. SQLite fills a MATERIALIZED
+// table once for each query.
 func sqlOwnerKeys() string {
-	return `owner_keys(owner_key) AS (SELECT NULL WHERE 0)`
+	return `owner_keys(owner_key) AS MATERIALIZED (
+			SELECT DISTINCT line_key.value
+			FROM conversations AS flagged, ` + sqlOwnerLineKeys("flagged.participants") + ` AS line_key
+		)`
 }
 
-// sqlEntryIsOwners holds for an entry the owner rule counts as the owner's,
-// given the lines in owner_lines (see sqlOwnerLines). p is a json_each row
-// over a conversation's participants.
-const sqlEntryIsOwners = `openmessage_owner_entry(p.type, p.value, (SELECT lines FROM owner_lines))`
+// sqlOwnerLineKeys is the json_each source for the keys of the owner's lines
+// that the entries of a participants column give, as
+// openmessage_owner_line_keys reads them.
+func sqlOwnerLineKeys(column string) string {
+	return `json_each(openmessage_owner_line_keys(CAST(` + column + ` AS BLOB)))`
+}
 
-// sqlParticipantEntries is the json_each source for a participants column:
-// the elements of a JSON array, and none for anything else. The JSON
-// functions fail on malformed JSON, such as an empty string, and SQLite can
-// evaluate both sides of an AND, so CASE guards them here and on p.value.
+// sqlEntryIsOwners holds for an entry that OwnerLines.Owner counts as the
+// owner's, given the keys of the owner's lines in owner_keys (see
+// sqlOwnerKeys): it carries the flag, or one of its number's keys names one
+// of those lines. owner_keys doesn't depend on the entry, so SQLite reads it
+// into an index once for each query. p is a row of sqlParticipantEntries.
+const sqlEntryIsOwners = `(json_extract(p.value, '$.is_me') OR EXISTS (
+	SELECT 1
+	FROM json_each(p.value, '$.number_keys') AS number_key
+	WHERE number_key.value IN (SELECT owner_key FROM owner_keys)
+))`
+
+// sqlParticipantEntries is the json_each source for the entries of a
+// participants column: a row for each entry owner.go's ParticipantEntries
+// gives, in order, whose value is the object openmessage_participant_entries
+// writes for it. The column reaches Go whole, as a BLOB, so SQLite's JSON
+// reader never reads it.
 func sqlParticipantEntries(column string) string {
-	return `json_each(CASE WHEN json_valid(` + column + `) THEN CASE json_type(` + column + `) WHEN 'array' THEN ` + column + ` ELSE '[]' END ELSE '[]' END)`
+	return `json_each(openmessage_participant_entries(CAST(` + column + ` AS BLOB)))`
 }
 
 // escapeLikePattern makes user text match literally inside a LIKE pattern
