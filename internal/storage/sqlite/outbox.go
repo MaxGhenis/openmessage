@@ -259,9 +259,10 @@ type RecoveredLeases struct {
 // between the two still leases the row. A wall clock stepped back does the
 // same to any write. A plain now would then move updated_at_ms below
 // created_at_ms, which the 0005 CHECK refuses, and on 2026-11-03 that refusal
-// in LeaseDue stopped the dispatcher. The clamp is the truer time, too: the
-// write commits after the one that set the current value, so it happened no
-// earlier.
+// in LeaseDue stopped the dispatcher. If a correct clock set the current value,
+// the clamp also keeps the better time: the write commits after the one that
+// set it, so it happened no earlier. If a clock that ran ahead set it, the
+// clamp keeps that time until the local clock passes it.
 type OutboxRepository struct {
 	store *Store
 	now   func() time.Time

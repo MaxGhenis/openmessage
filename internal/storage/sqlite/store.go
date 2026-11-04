@@ -7,8 +7,10 @@
 // MAX(<table>.updated_at_ms, excluded.updated_at_ms). A writer's time can
 // predate the row it changes: it read the clock before a concurrent insert
 // committed, or the wall clock stepped back. A plain now would then fail the
-// CHECK. The larger value is also the truer time, since the write commits after
-// the one that set it.
+// CHECK. If a correct clock set the stored value, MAX also keeps the better
+// time, since the write commits after the one that set it. If a clock that ran
+// ahead set it, MAX keeps it until the local clock passes it, and
+// updated_at_ms runs ahead of the true time by no more than that clock's lead.
 //
 // An upsert also binds the row it would insert with updated_at_ms no lower
 // than that row's created_at_ms. SQLite checks the CHECK on that row before it
