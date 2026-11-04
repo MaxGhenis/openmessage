@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math/rand"
 	"runtime"
 	"sort"
@@ -404,6 +405,22 @@ type modelMember struct {
 	value any
 }
 
+// modelDecode decodes data, which must hold one JSON value and nothing but
+// whitespace after it, as json.Unmarshal does, except that numbers decode
+// into json.Number: a number too large for a float64 fails json.Unmarshal
+// into an interface, and costs a list nothing where owner.go reads it.
+func modelDecode(data []byte, value any) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	if err := decoder.Decode(value); err != nil {
+		return err
+	}
+	if _, err := decoder.Token(); err != io.EOF {
+		return fmt.Errorf("bytes after the JSON value: %v", err)
+	}
+	return nil
+}
+
 // modelEntries reads a participants list's string and object elements;
 // anything else, a list that isn't a JSON array included, holds none.
 func modelEntries(participants string) []modelEntry {
@@ -421,7 +438,7 @@ func modelEntries(participants string) []modelEntry {
 			}
 		case '{':
 			var object map[string]any
-			if json.Unmarshal(element, &object) == nil {
+			if modelDecode(element, &object) == nil {
 				entries = append(entries, modelEntry{object: object, members: modelMembers(element)})
 			}
 		}
@@ -430,9 +447,10 @@ func modelEntries(participants string) []modelEntry {
 }
 
 // modelMembers lists an object's members in order, a repeated key each
-// time it appears.
+// time it appears, with numbers as json.Number.
 func modelMembers(object []byte) []modelMember {
 	decoder := json.NewDecoder(bytes.NewReader(object))
+	decoder.UseNumber()
 	if token, err := decoder.Token(); err != nil || token != json.Delim('{') {
 		return nil
 	}
@@ -592,7 +610,8 @@ func (m searchModel) search(query string, limit int) []string {
 // the owner's digits but name no line, flagged or not; other people share
 // words of the owner's name; some participants columns hold nothing,
 // malformed JSON or a list of bare names, and lists can hold odd elements
-// (an element that isn't an object, or a field of another JSON type), nest
+// (an element that isn't an object, or a field of another JSON type) and
+// entries, flagged or not, with a number too large for a float64, nest
 // deeper than SQLite's JSON reader goes, or carry bytes after a NUL, where
 // SQLite's reader stops and Go's doesn't; names and the owner's values can
 // hold a NUL, and some names hold letters beyond ASCII; the owner's own
@@ -627,8 +646,12 @@ func TestSearchConversationsByMetadataAgreesWithTheOwnerSkippingModel(t *testing
 			var entries []map[string]any
 			for _, member := range random.Perm(len(people))[:1+random.Intn(3)] {
 				entry := map[string]any{"name": people[member].name, "number": people[member].number}
-				if random.Intn(4) == 0 {
+				switch random.Intn(8) {
+				case 0, 1:
 					entry["id"] = strconv.Itoa(member)
+				case 2:
+					entry["id"] = json.RawMessage("1e400")
+					exercised["a person's entry with a number too large for a float64"]++
 				}
 				entries = append(entries, entry)
 			}
@@ -647,7 +670,12 @@ func TestSearchConversationsByMetadataAgreesWithTheOwnerSkippingModel(t *testing
 			switch random.Intn(5) {
 			case 0: // not listed
 			case 1:
-				entries = append(entries, map[string]any{"name": owner.name, "number": ownerForm(), "is_me": true})
+				flagged := map[string]any{"name": owner.name, "number": ownerForm(), "is_me": true}
+				if random.Intn(3) == 0 {
+					flagged["contact_id"] = json.RawMessage("-1e400")
+					exercised["a flagged entry with a number too large for a float64"]++
+				}
+				entries = append(entries, flagged)
 				flaggedSomewhere = true
 			case 2:
 				entries = append(entries, map[string]any{"name": "Me", "phone": ownerForm(), "isMe": true})
@@ -800,7 +828,8 @@ func TestSearchConversationsByMetadataAgreesWithTheOwnerSkippingModel(t *testing
 		"an unflagged copy of the owner", "an owner's value that names no line", "a store that never flags the owner",
 		"an odd element", "a query with hits", "a tie at the limit", "an owner's value with a NUL",
 		"a list nested deeper than SQLite reads", "a list with bytes after a NUL", "a member nested deeper than SQLite reads",
-		"a query that only Unicode case folding would match",
+		"a query that only Unicode case folding would match", "a person's entry with a number too large for a float64",
+		"a flagged entry with a number too large for a float64",
 	} {
 		if exercised[path] == 0 {
 			t.Errorf("the property never drew %s; raise MaxCount (drew %v)", path, exercised)

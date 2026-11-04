@@ -115,7 +115,7 @@ func (m phoneLineModel) heldOnlyByIdentifiers(conversation *Conversation, line s
 	}
 	values := []string{}
 	var elements []any
-	if json.Unmarshal([]byte(conversation.Participants), &elements) == nil {
+	if modelDecode([]byte(conversation.Participants), &elements) == nil {
 		for _, element := range elements {
 			switch element := element.(type) {
 			case string:
@@ -193,14 +193,15 @@ func TestSearchConversationsByPhoneLineReadsARepeatedNumberAsSendMessageDoes(t *
 // number, share only its last seven, or are too short to name a line, and one
 // holds the owner's last seven digits, which also end a target's number; some
 // entries carry the number under phone, a blank number, or a number that
-// isn't text, and some repeat "number"; identifiers that are no phone
-// number, such as an email address, a Signal UUID, a WhatsApp LID or a
-// number followed by a NUL, hold targets' digits; some lists nest deeper
-// than SQLite's JSON reader goes or carry bytes after a NUL, where SQLite's
-// reader stops and Go's doesn't, so only Go's reading counts; the owner's entries
-// carry the owner's number flagged, unflagged or with a flag that isn't JSON
-// true, other objects and bare strings carry it too, and the owner sends
-// messages too; and threads often share a time. So, as invariants, a thread
+// isn't text, some repeat "number", and some, the owner's among them, hold a
+// number too large for a float64; identifiers that are no phone number, such
+// as an email address, a Signal UUID, a WhatsApp LID or a number followed by
+// a NUL, hold targets' digits; some lists nest deeper than SQLite's JSON
+// reader goes or carry bytes after a NUL, where SQLite's reader stops and
+// Go's doesn't, so only Go's reading counts; the owner's entries carry the
+// owner's number flagged, unflagged or with a flag that isn't JSON true,
+// other objects and bare strings carry it too, and the owner sends messages
+// too; and threads often share a time. So, as invariants, a thread
 // is on a line only through an incoming sender or an entry that the owner
 // rule doesn't count as the owner's (neither flagged nor on a flagged
 // entry's line, which any thread may list) whose number, written as one,
@@ -261,15 +262,27 @@ func TestSearchConversationsByPhoneLineAgreesWithTheLineModel(t *testing.T) {
 				default:
 					entries = append(entries, map[string]any{"name": "P" + strconv.Itoa(member), "number": form})
 				}
+				if entry, isObject := entries[len(entries)-1].(map[string]any); isObject && random.Intn(6) == 0 {
+					entry["id"] = json.RawMessage("1e400")
+					exercised["an entry with a number too large for a float64"]++
+				}
 			}
+			var me map[string]any
 			switch random.Intn(5) {
 			case 0: // the owner isn't listed
 			case 1:
-				entries = append(entries, map[string]any{"name": "Me", "number": phoneLineForm(random, owner), "is_me": "true"})
+				me = map[string]any{"name": "Me", "number": phoneLineForm(random, owner), "is_me": "true"}
 			case 2:
-				entries = append(entries, map[string]any{"name": "Me", "phone": phoneLineForm(random, owner), "isMe": true})
+				me = map[string]any{"name": "Me", "phone": phoneLineForm(random, owner), "isMe": true}
 			default:
-				entries = append(entries, map[string]any{"name": "Me", "number": phoneLineForm(random, owner), "is_me": true})
+				me = map[string]any{"name": "Me", "number": phoneLineForm(random, owner), "is_me": true}
+			}
+			if me != nil {
+				if random.Intn(5) == 0 {
+					me["contact_id"] = json.RawMessage("-1e400")
+					exercised["the owner's entry with a number too large for a float64"]++
+				}
+				entries = append(entries, me)
 			}
 			random.Shuffle(len(entries), func(i, j int) { entries[i], entries[j] = entries[j], entries[i] })
 			participants, err := json.Marshal(entries)
@@ -425,6 +438,7 @@ func TestSearchConversationsByPhoneLineAgreesWithTheLineModel(t *testing.T) {
 		"a tie at the limit",
 		"a thread that only identifiers holding the line's digits tie to it",
 		"an object that repeats number", "a list nested deeper than SQLite reads", "a list with bytes after a NUL",
+		"an entry with a number too large for a float64", "the owner's entry with a number too large for a float64",
 	} {
 		if exercised[path] == 0 {
 			t.Errorf("the property never drew %s; raise MaxCount (drew %v)", path, exercised)

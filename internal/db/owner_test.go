@@ -60,10 +60,11 @@ func ownerRuleNested(depth int) string {
 // ownerRuleElement is the JSON text of one random element of a participants
 // list, with the traits it drew. Most elements are objects whose fields can
 // repeat a key, escape a character of a key, hold another JSON type than the
-// rule reads, hold a NUL, nest deeper than SQLite's JSON reader goes, or sit
-// between extra whitespace. Some are strings: a name, the owner's number in
-// one of its written forms, any other value a number can hold, or text that
-// reads as a flagged object. The rest are neither objects nor strings.
+// rule reads, hold a number too large for a float64, hold a NUL, nest deeper
+// than SQLite's JSON reader goes, or sit between extra whitespace. Some are
+// strings: a name, the owner's number in one of its written forms, any other
+// value a number can hold, or text that reads as a flagged object. The rest
+// are neither objects nor strings.
 func ownerRuleElement(random *rand.Rand) (string, []string) {
 	switch random.Intn(10) {
 	case 0:
@@ -108,6 +109,12 @@ func ownerRuleElement(random *rand.Rand) (string, []string) {
 		case "nested":
 			traits = append(traits, "a member nested deeper than SQLite reads")
 			return ownerRuleNested(1000 + random.Intn(500))
+		case "id":
+			if random.Intn(2) == 0 {
+				traits = append(traits, "a number too large for a float64")
+				return []string{"1e400", "-1e400", "1E+999"}[random.Intn(3)]
+			}
+			return []string{"17", `"c17"`, "123456789012345678901234567890"}[random.Intn(3)]
 		}
 		if random.Intn(5) == 0 {
 			traits = append(traits, "a number of another JSON type")
@@ -119,7 +126,7 @@ func ownerRuleElement(random *rand.Rand) (string, []string) {
 	for _, field := range []struct {
 		name    string
 		percent int
-	}{{"name", 70}, {"number", 70}, {"phone", 30}, {"email", 20}, {"is_me", 40}, {"isMe", 15}, {"nested", 4}} {
+	}{{"name", 70}, {"number", 70}, {"phone", 30}, {"email", 20}, {"is_me", 40}, {"isMe", 15}, {"id", 20}, {"nested", 4}} {
 		if random.Intn(100) >= field.percent {
 			continue
 		}
@@ -170,14 +177,15 @@ func ownerRuleList(random *rand.Rand, exercised map[string]int) (string, []strin
 }
 
 // ownerRuleReference reads one element apart from owner.go: through a
-// generic decode, a string as its trimmed text, and an object through the
-// first non-blank string of "number" and "phone", with a flag only where
-// "is_me" or "isMe" decodes to true, and with the texts of its "name",
-// "number", "phone" and "email" strings in a token decode's order. ok is
-// false when the element is neither an object nor a string.
+// generic decode that keeps numbers as json.Number, a string as its trimmed
+// text, and an object through the first non-blank string of "number" and
+// "phone", with a flag only where "is_me" or "isMe" decodes to true, and
+// with the texts of its "name", "number", "phone" and "email" strings in a
+// token decode's order. ok is false when the element is neither an object
+// nor a string.
 func ownerRuleReference(element string) (entry ParticipantEntry, ok bool) {
 	var value any
-	if json.Unmarshal([]byte(element), &value) != nil {
+	if modelDecode([]byte(element), &value) != nil {
 		return ParticipantEntry{}, false
 	}
 	if text, isText := value.(string); isText {
@@ -238,9 +246,9 @@ type sqlEntryRow struct {
 
 // Invariants of the owner rule's readers, over random participants lists
 // whose elements can repeat or escape keys, hold fields of other JSON types,
-// hold NULs, carry extra whitespace, be strings, or be neither objects nor
-// strings, and whose text can nest deeper than SQLite's JSON reader goes or
-// carry bytes after a NUL:
+// hold numbers too large for a float64, hold NULs, carry extra whitespace,
+// be strings, or be neither objects nor strings, and whose text can nest
+// deeper than SQLite's JSON reader goes or carry bytes after a NUL:
 //
 //	R1. ParticipantEntries gives, in order, one entry per object or string
 //	    element, each as a reference decode of that element alone reads it,
@@ -395,7 +403,7 @@ func TestOwnerRuleReadsEachElementAlikeInGoAndSQL(t *testing.T) {
 	for _, path := range []string{
 		"an element that's neither an object nor a string", "a string element",
 		"a string that reads as a flagged object", "an escaped key", "a repeated key",
-		"a flag that isn't true", "a number of another JSON type", "a list that isn't a JSON array",
+		"a flag that isn't true", "a number of another JSON type", "a number too large for a float64", "a list that isn't a JSON array",
 		"a NUL in a text", "a number with a NUL", "a member nested deeper than SQLite reads",
 		"a list nested deeper than SQLite reads", "a list nested deeper than Go reads", "a list with bytes after a NUL",
 		"an owner line", "an unflagged entry on an owner line", "a string on an owner line",
