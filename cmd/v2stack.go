@@ -386,6 +386,15 @@ func (s *v2Stack) Start(
 			s.logger.Error().Err(err).Msg("V2 ingest worker stopped")
 		}
 	}()
+	// Run retries a failed pass on its own and returns only on shutdown; the
+	// hook puts each failure in the log (and /api/status v2_dispatch counts
+	// them).
+	s.Service.OnPassFailure(func(err error, pass messaging.FailedDispatchPass) {
+		s.logger.Error().Err(err).
+			Int64("consecutive", pass.Consecutive).
+			Int64("retry_at_ms", pass.RetryAtMS).
+			Msg("V2 message dispatch pass failed; retrying")
+	})
 	go func() {
 		defer runWG.Done()
 		if err := s.Service.Run(runCtx); err != nil && !errors.Is(err, context.Canceled) {

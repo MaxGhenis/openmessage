@@ -251,6 +251,18 @@ type RecoveredLeases struct {
 }
 
 // OutboxRepository owns durable outbound intent, leasing, and phase changes.
+//
+// Every write after the insert sets updated_at_ms to MAX(updated_at_ms, now),
+// so a row's updated_at_ms never falls. A writer's clock read can predate the
+// row it changes: SendText reads the clock for scheduled_for_ms and the insert
+// reads it again for created_at_ms, and a dispatcher whose lease time falls
+// between the two still leases the row. A wall clock stepped back does the
+// same to any write. A plain now would then move updated_at_ms below
+// created_at_ms, which the 0005 CHECK refuses, and on 2026-11-03 that refusal
+// in LeaseDue stopped the dispatcher. If a correct clock set the current value,
+// the clamp also keeps the better time: the write commits after the one that
+// set it, so it happened no earlier. If a clock that ran ahead set it, the
+// clamp keeps that time until the local clock passes it.
 type OutboxRepository struct {
 	store *Store
 	now   func() time.Time
@@ -1217,7 +1229,7 @@ func (r *OutboxRepository) LeaseDue(
 				lease_expires_at_ms = ?,
 				transport_called_at_ms = NULL,
 				next_attempt_at_ms = NULL,
-				updated_at_ms = ?
+				updated_at_ms = MAX(updated_at_ms, ?)
 			WHERE outbox_id = ?
 			  AND scheduled_for_ms <= ?
 			  AND state IN ('queued', 'not_dispatched')
@@ -1273,7 +1285,7 @@ func (r *OutboxRepository) MarkTransportCalled(
 		UPDATE outbox
 		SET transport_called_at_ms = ?,
 			attempt_count = attempt_count + 1,
-			updated_at_ms = ?
+			updated_at_ms = MAX(updated_at_ms, ?)
 		WHERE outbox_id = ?
 		  AND state = 'dispatching'
 		  AND lease_token = ?
@@ -1338,7 +1350,7 @@ func (r *OutboxRepository) markNotDispatched(
 			lease_token = NULL,
 			lease_expires_at_ms = NULL,
 			transport_called_at_ms = NULL,
-			updated_at_ms = ?
+			updated_at_ms = MAX(updated_at_ms, ?)
 		WHERE outbox_id = ?
 		  AND state = 'dispatching'
 		  AND lease_token = ?
@@ -1376,7 +1388,7 @@ func (r *OutboxRepository) ReleaseUnavailable(
 			lease_token = NULL,
 			lease_expires_at_ms = NULL,
 			transport_called_at_ms = NULL,
-			updated_at_ms = ?
+			updated_at_ms = MAX(updated_at_ms, ?)
 		WHERE outbox_id = ?
 		  AND state = 'dispatching'
 		  AND lease_token = ?
@@ -1406,7 +1418,7 @@ func (r *OutboxRepository) RetryNotDispatched(
 	result, err := tx.ExecContext(ctx, `
 		UPDATE outbox
 		SET next_attempt_at_ms = ?,
-			updated_at_ms = ?
+			updated_at_ms = MAX(updated_at_ms, ?)
 		WHERE outbox_id = ?
 		  AND state = 'not_dispatched'
 	`, nowMS, nowMS, outboxID)
@@ -1478,7 +1490,7 @@ func wakeReactionsHeldFor(
 	result, err := execer.ExecContext(ctx, `
 		UPDATE outbox
 		SET next_attempt_at_ms = ?,
-			updated_at_ms = ?
+			updated_at_ms = MAX(updated_at_ms, ?)
 		WHERE kind = 'reaction'
 		  AND state = 'not_dispatched'
 		  AND error_code = ?
@@ -1512,7 +1524,7 @@ func (r *OutboxRepository) Cancel(ctx context.Context, outboxID string) error {
 		UPDATE outbox
 		SET state = 'canceled',
 			next_attempt_at_ms = NULL,
-			updated_at_ms = ?
+			updated_at_ms = MAX(updated_at_ms, ?)
 		WHERE outbox_id = ?
 		  AND state IN ('queued', 'not_dispatched')
 	`, nowMS, outboxID)
@@ -1543,7 +1555,7 @@ func (r *OutboxRepository) MarkUncertain(
 			lease_token = NULL,
 			lease_expires_at_ms = NULL,
 			transport_called_at_ms = NULL,
-			updated_at_ms = ?
+			updated_at_ms = MAX(updated_at_ms, ?)
 		WHERE outbox_id = ?
 		  AND state = 'dispatching'
 		  AND lease_token = ?
@@ -1583,7 +1595,7 @@ func (r *OutboxRepository) Reject(
 			lease_token = NULL,
 			lease_expires_at_ms = NULL,
 			transport_called_at_ms = NULL,
-			updated_at_ms = ?
+			updated_at_ms = MAX(updated_at_ms, ?)
 		WHERE outbox_id = ?
 		  AND state = 'dispatching'
 		  AND lease_token = ?
@@ -1622,7 +1634,7 @@ func (r *OutboxRepository) ConfirmWithoutResult(
 			lease_token = NULL,
 			lease_expires_at_ms = NULL,
 			transport_called_at_ms = NULL,
-			updated_at_ms = ?
+			updated_at_ms = MAX(updated_at_ms, ?)
 		WHERE outbox_id = ?
 		  AND state = 'dispatching'
 		  AND lease_token = ?
@@ -1706,7 +1718,7 @@ func (r *OutboxRepository) ConfirmReaction(
 			lease_token = NULL,
 			lease_expires_at_ms = NULL,
 			transport_called_at_ms = NULL,
-			updated_at_ms = ?
+			updated_at_ms = MAX(updated_at_ms, ?)
 		WHERE outbox_id = ?
 		  AND kind = 'reaction'
 		  AND state = 'dispatching'
@@ -1804,7 +1816,7 @@ func (r *OutboxRepository) Confirm(
 			lease_token = NULL,
 			lease_expires_at_ms = NULL,
 			transport_called_at_ms = NULL,
-			updated_at_ms = ?
+			updated_at_ms = MAX(updated_at_ms, ?)
 		WHERE outbox_id = ?
 		  AND state = 'dispatching'
 		  AND lease_token = ?
@@ -1956,7 +1968,7 @@ func (r *OutboxRepository) reconcileConfirmTx(
 				error_code = NULL,
 				error_detail = NULL,
 				next_attempt_at_ms = NULL,
-				updated_at_ms = ?
+				updated_at_ms = MAX(updated_at_ms, ?)
 			WHERE outbox_id = ?
 			  AND state IN ('uncertain', 'store_failed')
 		`, req.ResultRemoteID, nowMS, outboxID)
@@ -2004,7 +2016,7 @@ func (r *OutboxRepository) reconcileConfirmTx(
 				error_class = NULL,
 				error_code = NULL,
 				error_detail = NULL,
-				updated_at_ms = ?
+				updated_at_ms = MAX(updated_at_ms, ?)
 			WHERE outbox_id = ?
 			  AND state = 'confirmed'
 			  AND result_remote_id = transport_request_id
@@ -2139,7 +2151,7 @@ func (r *OutboxRepository) repointLocalMessage(
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE messages
 		SET remote_message_id = ?,
-			updated_at_ms = ?
+			updated_at_ms = MAX(updated_at_ms, ?)
 		WHERE message_id = ?
 	`, realID, nowMS, localMessageID); err != nil {
 		return fmt.Errorf(
@@ -2174,7 +2186,7 @@ func (r *OutboxRepository) MarkStoreFailed(
 			lease_token = NULL,
 			lease_expires_at_ms = NULL,
 			transport_called_at_ms = NULL,
-			updated_at_ms = ?
+			updated_at_ms = MAX(updated_at_ms, ?)
 		WHERE outbox_id = ?
 		  AND state = 'dispatching'
 		  AND lease_token = ?
@@ -2217,7 +2229,7 @@ func (r *OutboxRepository) RecoverExpiredLeases(
 			lease_token = NULL,
 			lease_expires_at_ms = NULL,
 			transport_called_at_ms = NULL,
-			updated_at_ms = ?
+			updated_at_ms = MAX(updated_at_ms, ?)
 		WHERE state = 'dispatching'
 		  AND lease_expires_at_ms <= ?
 		  AND transport_called_at_ms IS NULL
@@ -2233,7 +2245,7 @@ func (r *OutboxRepository) RecoverExpiredLeases(
 			lease_token = NULL,
 			lease_expires_at_ms = NULL,
 			transport_called_at_ms = NULL,
-			updated_at_ms = ?
+			updated_at_ms = MAX(updated_at_ms, ?)
 		WHERE state = 'dispatching'
 		  AND lease_expires_at_ms <= ?
 		  AND transport_called_at_ms IS NOT NULL

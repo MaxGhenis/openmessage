@@ -539,7 +539,7 @@ func TestR5MCPV2PrimarySubmitUsesNativeConversationID(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	result, err := sendToConversationHandler(harness.app, &harness.deps)(context.Background(), toolRequest(map[string]any{
+	result, err := sendToConversationHandler(harness.app, &harness.deps)(harness.ctx, toolRequest(map[string]any{
 		"conversation_id": conversationID,
 		"message":         "native tool route",
 		"idempotency_key": "native-tool-route-key",

@@ -45,9 +45,9 @@ const (
 	abandonReasonShutdown = "shutdown"
 )
 
-// DispatchHealth reports the dispatch loop's transport calls, so a slow or
-// abandoned call is visible in /api/status instead of looking like an idle
-// outbox.
+// DispatchHealth reports the dispatch loop's transport calls and failed
+// passes, so a slow or abandoned call, or a loop that keeps failing on
+// storage, is visible in /api/status instead of looking like an idle outbox.
 type DispatchHealth struct {
 	// InFlight is the call the dispatch loop is waiting on, if any.
 	InFlight *InFlightTransportCall `json:"in_flight,omitempty"`
@@ -57,6 +57,14 @@ type DispatchHealth struct {
 	AbandonedStillRunning int64 `json:"abandoned_still_running"`
 	// LastAbandoned is the most recent abandoned call, if any.
 	LastAbandoned *AbandonedTransportCall `json:"last_abandoned,omitempty"`
+	// FailedPasses counts dispatch passes that failed on local storage since
+	// the service started. Run retries after each one.
+	FailedPasses int64 `json:"failed_passes"`
+	// ConsecutiveFailedPasses counts the failed passes since the last pass
+	// that succeeded. Above zero, dispatch is failing now.
+	ConsecutiveFailedPasses int64 `json:"consecutive_failed_passes"`
+	// LastFailedPass is the most recent failed pass, if any.
+	LastFailedPass *FailedDispatchPass `json:"last_failed_pass,omitempty"`
 }
 
 // InFlightTransportCall describes the transport call in progress.
@@ -172,9 +180,12 @@ func (t *transportCalls) health(now time.Time) DispatchHealth {
 	return health
 }
 
-// DispatchHealth snapshots the dispatch loop's transport calls.
+// DispatchHealth snapshots the dispatch loop's transport calls and failed
+// passes.
 func (s *MessageService) DispatchHealth() DispatchHealth {
-	return s.transport.health(s.clock.Now())
+	health := s.transport.health(s.clock.Now())
+	s.passes.report(&health)
+	return health
 }
 
 type transportOutcome[T any] struct {

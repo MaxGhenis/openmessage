@@ -28,7 +28,7 @@ func TestV2SendInterruptedWaitReturnsDurableStatusNotError(t *testing.T) {
 	})
 	handler := sendToConversationHandler(harness.app, &harness.deps)
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(harness.ctx)
 	results := make(chan *mcp.CallToolResult, 1)
 	go func() {
 		result, err := handler(ctx, v2ToolCall(map[string]any{
@@ -102,7 +102,7 @@ func TestV2SendNotDispatchedReturnsAutoRetryStatusNotError(t *testing.T) {
 	}})
 	handler := sendToConversationHandler(harness.app, &harness.deps)
 
-	result, err := handler(context.Background(), v2ToolCall(map[string]any{
+	result, err := handler(harness.ctx, v2ToolCall(map[string]any{
 		"conversation_id": v2ToolConversationID,
 		"message":         "the transport is briefly down",
 		"idempotency_key": "mcp-retrying-key",
@@ -150,7 +150,7 @@ func TestV2SendRejectedIsSettledWithNoRetryGuidance(t *testing.T) {
 	}})
 	handler := sendToConversationHandler(harness.app, &harness.deps)
 
-	result, err := handler(context.Background(), v2ToolCall(map[string]any{
+	result, err := handler(harness.ctx, v2ToolCall(map[string]any{
 		"conversation_id": v2ToolConversationID,
 		"message":         "the platform refuses this",
 		"idempotency_key": "mcp-rejected-key",
