@@ -269,9 +269,8 @@ do not update `:latest`.
 
 The image uses Alpine with CA certificates, timezone data, and the shell/`wget`
 needed by the Compose health check. It starts the web UI and HTTP MCP endpoints
-by default with `serve --web --mcp-sse`. Alpine's package manager is available
-for installing optional debugging or helper packages. Messages and sessions
-persist in `/data`.
+by default with `serve --web --mcp-sse`. Messages and sessions persist in
+`/data`.
 Optional `signal-cli`/Java, Node.js-based desktop import helpers, and
 browser-based cookie refresh tools are not included.
 
