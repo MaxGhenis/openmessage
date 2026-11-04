@@ -19,6 +19,9 @@ func (s *Store) UpsertContact(c *Contact) error {
 	return err
 }
 
+// ListContacts returns address-book contacts by name, at most limit. A
+// query keeps only those whose name or number contains it as written, ASCII
+// case aside: % and _ match only themselves.
 func (s *Store) ListContacts(query string, limit int) ([]*Contact, error) {
 	var rows_query string
 	var args []any
@@ -26,11 +29,11 @@ func (s *Store) ListContacts(query string, limit int) ([]*Contact, error) {
 	if query != "" {
 		rows_query = `
 			SELECT contact_id, name, number FROM contacts
-			WHERE name LIKE ? OR number LIKE ?
+			WHERE name LIKE ? ESCAPE '\' OR number LIKE ? ESCAPE '\'
 			ORDER BY name
 			LIMIT ?
 		`
-		like := "%" + query + "%"
+		like := "%" + escapeLikePattern(query) + "%"
 		args = []any{like, like, limit}
 	} else {
 		rows_query = `

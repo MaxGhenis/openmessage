@@ -969,13 +969,24 @@ running app:
   thread numbers are device-local and a phone change re-numbers them (#176,
   #177; "Google thread ids are device-local" above), so an old number can
   name another person's thread.
-  The route tool finds a person by their number in any written form, comparing
-  the last ten digits as `send_message` does for a recipient (v2 stores E.164;
-  the legacy store keeps numbers as the address book writes them), and by a
-  name that only the legacy store holds. On legacy reads it searches for those
-  ten digits as text, so a number that the legacy store keeps with separators,
-  such as "(555) 555-0123", turns up only for a query that matches the stored
-  text, or by name. It skips the account's owner, whom most threads in both
+  The route tool finds a person by their number in any written form and by a
+  name that only the legacy store holds. A query that looks like a phone
+  number names a line, and both stores search for that line
+  (`SearchConversationsByPhoneLine`) by comparing the last ten digits as
+  `send_message` does for a recipient (v2 stores E.164; the legacy store keeps
+  numbers as the address book writes them). Their SQL calls the same Go
+  matcher (`internal/phoneline`, registered with SQLite as
+  `om_phone_line_match`), so separators and a country prefix don't matter,
+  a shorter number matches a longer one only at its end (5550123 matches
+  +12025550123 but not +447555012399), and the match runs before the limit.
+  On legacy reads the line search also finds incoming messages' senders whom
+  the roster lacks. A number goes no further than that search: an
+  address-book card or participant on the same line adds nothing, and one
+  whose number only contains its digits belongs to someone else. Other text matches a title or the name, number, phone or email of a
+  participant entry, never a JSON key or an ID: `me`, the demo store's name
+  for its owner, matches the names that contain it, not the "name" key that
+  every entry has. It skips the account's
+  owner, whom most threads in both
   stores list: a thread that a query matches only through the owner's entry or
   the owner's own messages is no route, while a title that holds the owner's
   name still matches. v2's conversation search (`SearchConversationsByName`,
@@ -986,8 +997,9 @@ running app:
   true) and matches only incoming messages' senders, since the owner's
   outgoing messages carry the owner's name and number. Both searches skip the
   owner before their limit, so newer threads that list only the owner and one
-  other person can't push a match out of the results, and both match `%` and
-  `_` literally. The route tool keeps every hit of either search, and when it
+  other person can't push a match out of the results, and both, like the
+  address-book lookup (`ListContacts`), match `%` and `_` literally. The route
+  tool keeps every hit of either search, and when it
   falls back to the contacts in legacy threads
   (`ListContactsFromConversations`), that list skips flagged entries too and
   reads past any number of threads that yield none. An entry that holds the
@@ -1008,14 +1020,26 @@ running app:
   `TestResolveContactRoutesIgnoresTheAccountOwner`,
   `TestResolveContactRoutesKeepsAThreadThatOnlyAnIncomingSenderMatches`,
   `TestResolveContactRoutesFindsAPersonBehindThreadsThatListOnlyTheOwner`,
-  `TestResolveContactRoutesKeepsV2MatchesOnANameReadsHide` and
-  `TestResolveContactRoutesReturnsOnlyServingStoreThreadsOfThePerson`
+  `TestResolveContactRoutesKeepsV2MatchesOnANameReadsHide`,
+  `TestResolveContactRoutesReturnsOnlyServingStoreThreadsOfThePerson`,
+  `TestResolveContactRoutesMatchesParticipantValuesNotJSONKeys`,
+  `TestResolveContactRoutesMatchesANumberByItsLineNotAsASubstring`,
+  `TestResolveContactRoutesDoesNotRouteTheOwnerThroughAFragmentOfTheirNumber`,
+  `TestResolveContactRoutesFindsALineBehindNumbersThatOnlyContainItsDigits`,
+  `TestResolveContactRoutesMatchesTheAddressBookLiterally`,
+  `TestResolveContactRoutesFindsAnIncomingSenderByAnyFormOfTheirNumber` and
+  `TestResolveContactRoutesFindsALegacyNumberWrittenWithSeparators`
   (internal/tools), `TestSearchConversationsByMetadataSkipsTheAccountOwner`
+  and `TestSearchConversationsByPhoneLineAgreesWithTheLineModel`
   (internal/v2read), `TestSearchConversationsByMetadataSkipsTheOwnersOwnMessages`,
   `TestSearchConversationsByMetadataSkipsEntriesFlaggedAsTheOwners`,
+  `TestSearchConversationsByMetadataMatchesEntryValuesNotKeys`,
+  `TestSearchConversationsByPhoneLineAgreesWithTheLineModel`,
+  `TestListContactsMatchesTheQueryLiterally`,
   `TestListContactsFromConversationsReadsPastThreadsThatListOnlyTheOwner`
-  (internal/db), `TestSubmitTextV2SendsOnlyToTheConversationItsIDNames`
-  (internal/v2wire).
+  (internal/db), `TestMatchProperties` (internal/phoneline),
+  `TestSubmitTextV2SendsOnlyToTheConversationItsIDNames` and
+  `TestSubmitTextV2SendsToTheV2IDWhenIDsCollide` (internal/v2wire).
 - Escape hatches: `--transports` forces the old standalone full-stack stdio
   behavior (only for machines where the MCP process is the *only* OpenMessage
   process, ever); `--no-transports` strips transports from a **legacy-mode**

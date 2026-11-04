@@ -44,6 +44,26 @@ func (s *Source) SearchConversationsByMetadata(query string, limit int) ([]*db.C
 	if err != nil {
 		return nil, err
 	}
+	return s.mapSearchHits(conversations)
+}
+
+// SearchConversationsByPhoneLine is the v2 counterpart of the legacy phone
+// line search: conversations with a participant other than the owner on the
+// line that line, a phoneline.Line, names, matched in SQL before the limit.
+func (s *Source) SearchConversationsByPhoneLine(line string, limit int) ([]*db.Conversation, error) {
+	if err := s.ready(); err != nil {
+		return nil, err
+	}
+	conversations, err := s.store.SearchConversationsByPhoneLine(line, limit)
+	if err != nil {
+		return nil, err
+	}
+	return s.mapSearchHits(conversations)
+}
+
+// mapSearchHits maps a search's hits, and only those, to the canonical
+// legacy DTO.
+func (s *Source) mapSearchHits(conversations []sqlite.Conversation) ([]*db.Conversation, error) {
 	if len(conversations) == 0 {
 		return []*db.Conversation{}, nil
 	}

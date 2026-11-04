@@ -16,6 +16,7 @@ import (
 	"github.com/maxghenis/openmessage/internal/db"
 	"github.com/maxghenis/openmessage/internal/localapi"
 	"github.com/maxghenis/openmessage/internal/messaging"
+	"github.com/maxghenis/openmessage/internal/phoneline"
 	"github.com/maxghenis/openmessage/internal/readsource"
 )
 
@@ -479,21 +480,18 @@ func daemonReactDelivery(result localapi.ReactResult) messaging.Delivery {
 
 // findDirectSMSConversation scans recent conversations for a non-group
 // SMS/RCS thread with one participant whose number matches the phone.
-// Matching compares each participant's number individually by digit suffix
-// (so +1 (650) 555-0100, 6505550100, and +16505550100 all meet) — never a
-// substring search over concatenated participant digits, which could match a
-// sequence straddling two different numbers and route the send to the wrong
-// person.
+// Matching compares each participant's number individually by digit suffix,
+// through phoneline (so +1 (650) 555-0100, 6505550100, and +16505550100 all
+// meet) — never a substring search over concatenated participant digits,
+// which could match a sequence straddling two different numbers and route
+// the send to the wrong person.
 func findDirectSMSConversation(reads readsource.ReadSource, phone string) (*db.Conversation, error) {
 	if reads == nil {
 		return nil, fmt.Errorf("no read source available")
 	}
-	digits := digitsOnly(phone)
-	if digits == "" {
+	line := phoneline.Line(phone)
+	if line == "" {
 		return nil, fmt.Errorf("recipient %q has no digits", phone)
-	}
-	if len(digits) > 10 {
-		digits = digits[len(digits)-10:]
 	}
 	conversations, err := reads.ListConversations(2000)
 	if err != nil {
@@ -514,26 +512,12 @@ func findDirectSMSConversation(reads readsource.ReadSource, phone string) (*db.C
 			continue
 		}
 		for _, participant := range participants {
-			if phoneDigitsMatch(digits, firstNonEmpty(participant.Number, participant.Phone)) {
+			if phoneline.MatchFirst(line, participant.Number, participant.Phone) {
 				return conversation, nil
 			}
 		}
 	}
 	return nil, nil
-}
-
-// phoneDigitsMatch reports whether a stored participant number denotes the
-// same line as the wanted digits (already trimmed to the last 10). One side
-// may carry a country prefix the other lacks, so the shorter digit string
-// must be a suffix of the longer; a 7-digit floor keeps short fragments from
-// matching everything.
-func phoneDigitsMatch(wantedDigits, participantNumber string) bool {
-	participantDigits := digitsOnly(participantNumber)
-	if len(participantDigits) < 7 || len(wantedDigits) < 7 {
-		return false
-	}
-	return strings.HasSuffix(participantDigits, wantedDigits) ||
-		strings.HasSuffix(wantedDigits, participantDigits)
 }
 
 // smsPathStatusText warns, in one line, when the daemon reports that carrier

@@ -12,6 +12,7 @@ import (
 
 	"github.com/maxghenis/openmessage/internal/app"
 	"github.com/maxghenis/openmessage/internal/db"
+	"github.com/maxghenis/openmessage/internal/phoneline"
 	"github.com/maxghenis/openmessage/internal/readsource"
 )
 
@@ -135,9 +136,11 @@ func resolveContactRoutesHandler(a *app.App, configured ...Options) server.ToolH
 }
 
 // findRouteConversations returns the query's conversations from reads, the
-// serving store. people supplies the numbers of matching address-book
-// contacts and of matching participants in its own conversations; it then
-// searches reads for those numbers, never for a people-store conversation ID.
+// serving store. A query that looks like a phone number names a phone line;
+// other text matches a conversation's title or someone in it. people supplies
+// the numbers of matching address-book contacts and of matching participants
+// in its own conversations; it then searches reads for those numbers, never
+// for a people-store conversation ID.
 func findRouteConversations(reads readsource.ReadSource, people *db.Store, query string, limit int) ([]*db.Conversation, error) {
 	if limit <= 0 {
 		limit = 20
@@ -163,27 +166,42 @@ func findRouteConversations(reads readsource.ReadSource, people *db.Store, query
 		addConversation(conv)
 	}
 
-	// Most threads list the account's owner, and a thread that a query
-	// matches only through the owner says nothing about whom to send to. Both
-	// stores' searches skip the owner before their limit: v2's skips the
-	// owner's identity, and the legacy store's skips participant entries
-	// flagged as the owner's and the owner's own messages.
-	convos, err := reads.SearchConversationsByMetadata(query, limit)
+	// search finds text's conversations in reads. A phone number names its
+	// line, which both stores match as send_message matches a recipient, by
+	// the last ten digits: v2 stores numbers in E.164 form, while the legacy
+	// store and address books keep them as written, and a run of digits
+	// inside another number names someone else (5550123 sits inside
+	// +447555012399). Most threads list the account's owner, and a thread
+	// that a query matches only through the owner says nothing about whom to
+	// send to. Both stores' searches skip the owner before their limit: v2's
+	// skips the owner's identity, and the legacy store's skips participant
+	// entries flagged as the owner's and the owner's own messages.
+	search := func(text string) ([]*db.Conversation, error) {
+		if looksLikePhoneNumber(text) {
+			return reads.SearchConversationsByPhoneLine(phoneline.Line(text), limit)
+		}
+		return reads.SearchConversationsByMetadata(text, limit)
+	}
+	convos, err := search(query)
 	if err != nil {
 		return nil, err
 	}
 	addConversations(convos)
-	addConversations(phoneLineConversations(reads, query, limit))
+	// The line search finds every thread on a number's line. An address-book
+	// card or a participant whose number only contains the query's digits
+	// names someone else, so a number goes no further.
+	if looksLikePhoneNumber(query) {
+		return newestRoutes(seen, limit), nil
+	}
 
 	searchNumber := func(number string) {
 		number = strings.TrimSpace(number)
 		if number == "" {
 			return
 		}
-		if numberConvos, err := reads.SearchConversationsByMetadata(number, limit); err == nil {
+		if numberConvos, err := search(number); err == nil {
 			addConversations(numberConvos)
 		}
-		addConversations(phoneLineConversations(reads, number, limit))
 	}
 
 	contacts, err := people.ListContacts(query, limit)
@@ -205,7 +223,11 @@ func findRouteConversations(reads readsource.ReadSource, people *db.Store, query
 			}
 		}
 	}
+	return newestRoutes(seen, limit), nil
+}
 
+// newestRoutes returns the conversations in seen newest first, at most limit.
+func newestRoutes(seen map[string]*db.Conversation, limit int) []*db.Conversation {
 	results := make([]*db.Conversation, 0, len(seen))
 	for _, conv := range seen {
 		results = append(results, conv)
@@ -219,57 +241,7 @@ func findRouteConversations(reads readsource.ReadSource, people *db.Store, query
 	if len(results) > limit {
 		results = results[:limit]
 	}
-	return results, nil
-}
-
-// phoneLineConversations returns reads' conversations with a participant on
-// the phone line that text names. It matches as send_message matches a
-// recipient, by the last ten digits, so formatting and a country prefix don't
-// matter: v2 stores numbers in E.164 form, while the legacy store and address
-// books keep them as written, and a substring search for "+1 (555) 555-0123"
-// finds no "+15555550123". Text that isn't a phone number returns nothing,
-// and an entry flagged as the account's owner's (is_me or isMe) puts no
-// thread on a line.
-func phoneLineConversations(reads readsource.ReadSource, text string, limit int) []*db.Conversation {
-	if !looksLikePhoneNumber(text) {
-		return nil
-	}
-	line := digitsOnly(text)
-	if len(line) > 10 {
-		line = line[len(line)-10:]
-	}
-	convos, err := reads.SearchConversationsByMetadata(line, limit)
-	if err != nil {
-		return nil
-	}
-	onLine := make([]*db.Conversation, 0, len(convos))
-	for _, conv := range convos {
-		if conversationHasPhoneLine(conv, line) {
-			onLine = append(onLine, conv)
-		}
-	}
-	return onLine
-}
-
-func conversationHasPhoneLine(conv *db.Conversation, line string) bool {
-	if conv == nil {
-		return false
-	}
-	var participants []struct {
-		Number    string `json:"number"`
-		Phone     string `json:"phone"`
-		IsMe      bool   `json:"is_me"`
-		IsMeCamel bool   `json:"isMe"`
-	}
-	if err := json.Unmarshal([]byte(conv.Participants), &participants); err != nil {
-		return false
-	}
-	for _, participant := range participants {
-		if !participant.IsMe && !participant.IsMeCamel && phoneDigitsMatch(line, firstNonEmpty(participant.Number, participant.Phone)) {
-			return true
-		}
-	}
-	return false
+	return results
 }
 
 func buildResolvedRouteMatches(people *db.Store, convos []*db.Conversation, limit int, whatsAppConnected, signalConnected bool) []resolvedRouteMatch {

@@ -123,21 +123,24 @@ func TestSearchConversationsByMetadataSkipsEntriesFlaggedAsTheOwners(t *testing.
 
 // metadataSearchModel is a reference for the legacy store's
 // SearchConversationsByMetadata. A thread matches when the query, as
-// written and ASCII case aside, appears in its title, in the JSON text of a
-// participant entry not flagged as the owner's, or in the name or number of
-// an incoming message's sender or of a contact card with that sender's
-// number. An entry is flagged when its is_me or isMe holds JSON true.
-// Participants that aren't a JSON array offer no entries. Hits come newest
-// first, up to the limit.
+// written and ASCII case aside, appears in its title, in the decoded text of
+// the name, number, phone or email of a participant entry not flagged as the
+// owner's, in a bare string entry, or in the name or number of an incoming
+// message's sender or of a contact card with that sender's number. An entry
+// is flagged when its is_me or isMe holds JSON true. Participants that
+// aren't a JSON array offer no entries. Hits come newest first, up to the
+// limit.
 type metadataSearchModel struct {
 	conversations []*Conversation
 	messages      []*Message
 	contacts      []*Contact
 }
 
-// participantEntryTexts returns the text that each participant entry offers
-// the search, and whether the entry is flagged as the owner's.
-func participantEntryTexts(participants string) (texts []string, flagged []bool) {
+// participantEntryTexts returns the texts that each participant entry offers
+// the search, and whether the entry is flagged as the owner's. An object
+// offers the decoded text of its name, number, phone and email; a string
+// offers itself; anything else offers nothing.
+func participantEntryTexts(participants string) (texts [][]string, flagged []bool) {
 	var elements []json.RawMessage
 	if json.Unmarshal([]byte(participants), &elements) != nil {
 		return nil, nil
@@ -145,15 +148,22 @@ func participantEntryTexts(participants string) (texts []string, flagged []bool)
 	for _, element := range elements {
 		var object map[string]any
 		if json.Unmarshal(element, &object) == nil && object != nil {
-			texts = append(texts, string(element))
+			var values []string
+			for _, key := range []string{"name", "number", "phone", "email"} {
+				if value, ok := object[key].(string); ok {
+					values = append(values, value)
+				}
+			}
+			texts = append(texts, values)
 			flagged = append(flagged, object["is_me"] == true || object["isMe"] == true)
 			continue
 		}
 		var text string
-		if json.Unmarshal(element, &text) != nil {
-			text = string(element)
+		if json.Unmarshal(element, &text) == nil {
+			texts = append(texts, []string{text})
+		} else {
+			texts = append(texts, nil)
 		}
-		texts = append(texts, text)
 		flagged = append(flagged, false)
 	}
 	return texts, flagged
@@ -170,14 +180,16 @@ func (m metadataSearchModel) match(conversation *Conversation, query string) (hi
 	byText := holds(conversation.Name)
 	byOwner := false
 	texts, flagged := participantEntryTexts(conversation.Participants)
-	for index, text := range texts {
-		if !holds(text) {
-			continue
-		}
-		if flagged[index] {
-			byOwner = true
-		} else {
-			byText = true
+	for index, entry := range texts {
+		for _, text := range entry {
+			if !holds(text) {
+				continue
+			}
+			if flagged[index] {
+				byOwner = true
+			} else {
+				byText = true
+			}
 		}
 	}
 	bySender := false
@@ -235,6 +247,7 @@ func TestSearchConversationsByMetadataAgreesWithTheFlaggedOwnerModel(t *testing.
 		{"Carol Sammy", "+15555550102"},
 		{"Ed_Short", "56789"},
 		{"Fay 100%", "+15555550104"},
+		{"Gus R&D", "+15555550105"},
 	}
 	guest := struct{ name, number string }{"Sam Guest", "+15555550177"}
 	owner := struct{ name, number string }{"Sam Owner", "+15550009999"}
@@ -254,13 +267,16 @@ func TestSearchConversationsByMetadataAgreesWithTheFlaggedOwnerModel(t *testing.
 			if index < count {
 				for _, member := range random.Perm(len(people))[:1+random.Intn(3)] {
 					entry := map[string]any{"name": people[member].name, "number": people[member].number}
-					switch random.Intn(6) {
+					switch random.Intn(7) {
 					case 0:
 						entry["is_me"] = false
 					case 1:
 						entry["is_me"] = "true"
 					case 2:
 						entry["id"] = strconv.Itoa(member)
+					case 3:
+						entry["contact_id"] = "card-" + strconv.Itoa(member)
+						entry["email"] = strings.ToLower(strings.Fields(people[member].name)[0]) + "@example.com"
 					}
 					entries = append(entries, entry)
 				}
@@ -342,7 +358,8 @@ func TestSearchConversationsByMetadataAgreesWithTheFlaggedOwnerModel(t *testing.
 		for _, query := range []string{
 			owner.name, "Sam", "Owner", "Me", "is_me", "isMe", "true", "Sammy", "Guest", "Bob", "Carol",
 			"Lee", "Group", "club", "_", "%", "Ed_", "100%", "E_", "S%m", "not json", "+1555555", "56789",
-			owner.number, "5550009999", guest.number,
+			owner.number, "5550009999", guest.number, "name", "number", "phone", "email", `":"`,
+			"contact_id", "card-", "R&D", "u0026", "@example.com", "bob@",
 		} {
 			limit := 1 + random.Intn(10)
 			want := model.search(query, limit)

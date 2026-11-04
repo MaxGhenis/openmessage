@@ -8,6 +8,8 @@ import (
 	"strings"
 
 	moderncsqlite "modernc.org/sqlite"
+
+	"github.com/maxghenis/openmessage/internal/phoneline"
 )
 
 const (
@@ -855,6 +857,41 @@ func (s *Store) SearchConversationsByName(query string, limit int) ([]Conversati
 	conversations, err := collectRows(rows, scanConversation)
 	if err != nil {
 		return nil, fmt.Errorf("search conversations by name: %w", err)
+	}
+	return conversations, nil
+}
+
+// SearchConversationsByPhoneLine returns the conversations with a
+// participant on the phone line that line, a phoneline.Line, names, newest
+// first and at most limit. A participant's line is its identity's canonical
+// value, as reads show it, and the account's owner (the self identity) is on
+// no line. Numbers match as send_message matches a recipient, through
+// phoneline, and the match runs before the LIMIT, so numbers that only
+// contain the line's digits never crowd out one that ends with them.
+func (s *Store) SearchConversationsByPhoneLine(line string, limit int) ([]Conversation, error) {
+	if limit <= 0 {
+		return []Conversation{}, nil
+	}
+	rows, err := s.db.QueryContext(
+		context.Background(),
+		"SELECT "+conversationColumns+`
+		 FROM conversations
+		 WHERE conversation_id IN (
+		        SELECT cp.conversation_id
+		        FROM conversation_participants cp
+		        JOIN identities i ON i.identity_id = cp.identity_id
+		        WHERE i.is_self = 0 AND `+phoneline.SQLMatch+`(?, i.canonical_value)
+		    )
+		 ORDER BY last_message_at_ms DESC, conversation_id
+		 LIMIT ?`,
+		line, limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("search conversations by phone line: %w", err)
+	}
+	conversations, err := collectRows(rows, scanConversation)
+	if err != nil {
+		return nil, fmt.Errorf("search conversations by phone line: %w", err)
 	}
 	return conversations, nil
 }

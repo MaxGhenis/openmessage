@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+
+	"github.com/maxghenis/openmessage/internal/phoneline"
 )
 
 // conversationColumns is the canonical column list for SELECT queries on conversations.
@@ -339,14 +341,16 @@ func (s *Store) ListConversationsByPlatform(platform string, limit int) ([]*Conv
 }
 
 // SearchConversationsByMetadata matches a conversation by its name, a
-// participant entry, or the sender of a message in it. Most threads list the
-// account's owner, so a participant match skips entries flagged as the
-// owner's (is_me or isMe), or the owner's name or number would find every
-// thread. The owner's outgoing messages carry the owner's name and number
-// too, so sender matches count incoming messages only. The SQL skips both
-// before its LIMIT, so threads that match only through the owner never
-// crowd out a match. The query matches as written: % and _ are no
-// wildcards, as in v2's search.
+// participant entry, or the sender of a message in it. A participant entry
+// matches through the text of its name, number, phone or email, or, for a
+// bare string, the string; JSON keys, flags and IDs match nothing, and
+// escapes are decoded. Most threads list the account's owner, so a
+// participant match skips entries flagged as the owner's (is_me or isMe), or
+// the owner's name or number would find every thread. The owner's outgoing
+// messages carry the owner's name and number too, so sender matches count
+// incoming messages only. The SQL skips both before its LIMIT, so threads
+// that match only through the owner never crowd out a match. The query
+// matches as written: % and _ are no wildcards, as in v2's search.
 func (s *Store) SearchConversationsByMetadata(query string, limit int) ([]*Conversation, error) {
 	pattern := "%" + escapeLikePattern(query) + "%"
 	rows, err := s.db.Query(`
@@ -356,8 +360,17 @@ func (s *Store) SearchConversationsByMetadata(query string, limit int) ([]*Conve
 			OR EXISTS (
 				SELECT 1
 				FROM `+sqlParticipantEntries("conversations.participants")+` AS p
-				WHERE p.value LIKE ? ESCAPE '\'
-					AND NOT CASE WHEN p.type = 'object' THEN `+sqlOwnerFlag+` ELSE 0 END
+				WHERE CASE p.type
+					WHEN 'text' THEN p.value LIKE ? ESCAPE '\'
+					WHEN 'object' THEN NOT `+sqlOwnerFlag+` AND EXISTS (
+						SELECT 1
+						FROM json_each(p.value) AS field
+						WHERE field.key IN ('name', 'number', 'phone', 'email')
+							AND field.type = 'text'
+							AND field.value LIKE ? ESCAPE '\'
+					)
+					ELSE 0
+				END
 			)
 			OR conversation_id IN (
 				SELECT DISTINCT conversation_id
@@ -372,7 +385,44 @@ func (s *Store) SearchConversationsByMetadata(query string, limit int) ([]*Conve
 			)
 		ORDER BY last_message_ts DESC
 		LIMIT ?
-	`, pattern, pattern, pattern, pattern, pattern, pattern, limit)
+	`, pattern, pattern, pattern, pattern, pattern, pattern, pattern, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanConversations(rows)
+}
+
+// SearchConversationsByPhoneLine returns the conversations with someone on
+// the phone line that line, a phoneline.Line, names, newest first and at
+// most limit. Someone is a participant entry not flagged as the owner's,
+// through its number (or, without one, its phone), a bare string entry, or
+// the sender of an incoming message, whom the roster may lack. Numbers match
+// as send_message matches a recipient, through phoneline, so separators and
+// a country prefix don't matter, and the match runs before the LIMIT, so
+// numbers that only contain the line's digits never crowd out one that ends
+// with them.
+func (s *Store) SearchConversationsByPhoneLine(line string, limit int) ([]*Conversation, error) {
+	rows, err := s.db.Query(`
+		SELECT `+conversationColumns+`
+		FROM conversations
+		WHERE EXISTS (
+				SELECT 1
+				FROM `+sqlParticipantEntries("conversations.participants")+` AS p
+				WHERE CASE p.type
+					WHEN 'text' THEN `+phoneline.SQLMatch+`(?, p.value)
+					WHEN 'object' THEN NOT `+sqlOwnerFlag+` AND `+phoneline.SQLMatch+`(?, `+sqlEntryText("number")+`, `+sqlEntryText("phone")+`)
+					ELSE 0
+				END
+			)
+			OR conversation_id IN (
+				SELECT conversation_id
+				FROM (SELECT DISTINCT conversation_id, sender_number FROM messages WHERE is_from_me = 0)
+				WHERE `+phoneline.SQLMatch+`(?, sender_number)
+			)
+		ORDER BY last_message_ts DESC
+		LIMIT ?
+	`, line, line, line, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -384,6 +434,13 @@ func (s *Store) SearchConversationsByMetadata(query string, limit int) ([]*Conve
 // json_each row over a conversation's participants. Only a JSON true counts,
 // and json_type gives NULL for a missing key, hence IS.
 const sqlOwnerFlag = `(json_type(p.value, '$.is_me') IS 'true' OR json_type(p.value, '$.isMe') IS 'true')`
+
+// sqlEntryText is an object entry's text under key, or NULL when the key is
+// missing or holds anything but text. p is a json_each row over a
+// conversation's participants.
+func sqlEntryText(key string) string {
+	return `CASE json_type(p.value, '$.` + key + `') WHEN 'text' THEN json_extract(p.value, '$.` + key + `') END`
+}
 
 // sqlParticipantEntries is the json_each source for a participants column:
 // the elements of a JSON array, and none for anything else. The JSON
