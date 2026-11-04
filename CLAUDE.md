@@ -92,10 +92,15 @@ it (an older one reports the store as newer than supported; a newer one asks
 you to reopen the app). So on a macOS app install, `/usr/local/bin/openmessage`
 should be a symlink to the app bundle's binary (see the runbook's "MCP config").
 Opening the legacy store still writes: `db.New` runs `migrate()` on every open,
-which drops and recreates three `contact_avatars` indexes, keeps one row of
-each group of Signal rows that share a conversation, sender and timestamp and
-deletes the rest, and repopulates the FTS index when its row count differs
-from `messages`.
+which drops and recreates three `contact_avatars` indexes. It also keeps one
+row of each group of Signal rows that share a conversation, sender and
+timestamp and deletes the rest with their search index entries (with no group
+to clean, it only reads), and it rebuilds the FTS index in one transaction
+when the index's row count differs from `messages`. Every legacy write path
+keeps the index in step, so that rebuild means something else, such as an
+older build, changed `messages`. The Signal Desktop importer skips a message
+that the cleanup would delete (`SignalDuplicateWouldBeDropped`), so its
+30-minute full rescan doesn't re-add rows for the next open to delete.
 
 `read` resolves each hit's sender (name → number → conversation id) so results
 are legible without a second lookup, and accepts
@@ -120,8 +125,9 @@ openmessage import whatsapp /path/to/chat.txt --name "Your Name"
 sync loops, or schedulers — the app daemon owns all live connections (two
 processes sharing WhatsApp/signal-cli credentials log each other out). Reads
 come from the local store (v2 when the daemon reports v2-primary for the same
-data dir); sends, reactions, and `get_status` route through the running
-daemon's HTTP API (`internal/localapi`) with the CLI's daemon-truth semantics.
+data dir); sends, reactions, transcripts, and `get_status` route through the
+running daemon's HTTP API (`internal/localapi`) with the CLI's daemon-truth
+semantics.
 Every conversation ID a read tool returns, `resolve_contact_routes` included,
 comes from that serving store, and the send tools take exactly those IDs. On
 a v2-primary daemon the outbox takes v2 conversation IDs only and answers any
@@ -194,7 +200,13 @@ reading that store at cutover, though the web UI's People view still does,
 and the store did not freeze: live transports, local imports and the web UI
 keep writing it, no projector mirrors v2 into it, and it differs from v2 in
 both directions (runbook: "The legacy store keeps taking writes on
-v2-primary").
+v2-primary"). `set_message_transcript` refuses on v2-primary too: transcripts
+live only in the legacy store (the v2 store has no place for them, and
+`migrate` counts and drops them), and the only places that show a transcript,
+the message-read tools and the web UI's conversation view, read v2 there. The
+People view reads legacy messages but never shows a transcript. In client mode
+on a legacy-primary install the tool saves through the app's
+`POST /api/transcript`.
 
 ### HTTP API
 
@@ -243,6 +255,11 @@ v2-primary").
   `idempotency_key` required), returns the outbox submission immediately.
   Details: [docs/agent-runbook.md](docs/agent-runbook.md) ("Reactions on
   v2-primary go through the outbox").
+- `POST /api/transcript` — `{message_id, transcript, model?}` saves a
+  transcript in the legacy store (an empty transcript clears it, an omitted
+  model keeps the stored one) and answers with `transcript_model`, the model
+  the message now carries. A v2-primary daemon answers 409: the v2 store keeps
+  no transcripts.
 
 ### Schema
 

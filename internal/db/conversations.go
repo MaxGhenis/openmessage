@@ -112,6 +112,13 @@ func (s *Store) MergeConversationIDs(sourceID, targetID string) error {
 	if sourceID == "" || targetID == "" || sourceID == targetID {
 		return nil
 	}
+	// Most calls find nothing to merge, so look before beginning: a write
+	// transaction starts with BEGIN IMMEDIATE and waits for any other
+	// process's writer.
+	var exists bool
+	if err := s.db.QueryRow(`SELECT EXISTS (SELECT 1 FROM conversations WHERE conversation_id = ?)`, sourceID).Scan(&exists); err != nil || !exists {
+		return err
+	}
 
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -160,7 +167,7 @@ func (s *Store) DeleteConversation(id string) error {
 	}
 	defer tx.Rollback()
 
-	if _, err := tx.Exec(`DELETE FROM messages WHERE conversation_id = ?`, id); err != nil {
+	if _, err := s.deleteMessages(tx, `conversation_id = ?`, id); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(`DELETE FROM drafts WHERE conversation_id = ?`, id); err != nil {
