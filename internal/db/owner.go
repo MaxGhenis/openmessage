@@ -21,8 +21,8 @@ import (
 // flagged entry's number that names one, as phoneline.Match reads a number.
 // Google's participant lists often repeat the owner without the flag, and
 // the lines catch those copies. send_message reads lists with these
-// helpers, and the legacy searches call them from SQL through the functions
-// init registers, so all three read every entry alike.
+// helpers, and the three legacy searches call them from SQL through the
+// functions init registers, so all four read every entry alike.
 
 // ParticipantEntry is what the owner rule reads from one object or string
 // element of a participants list.
@@ -76,7 +76,7 @@ func participantEntry(element []byte) (entry ParticipantEntry, ok bool) {
 		if json.Unmarshal(element, &text) != nil {
 			return ParticipantEntry{}, false
 		}
-		return ParticipantEntry{Number: strings.TrimSpace(text), Texts: []string{text}}, true
+		return ParticipantEntry{Number: strings.TrimSpace(text), Texts: []string{text}, Addresses: []string{text}}, true
 	case bytes.HasPrefix(element, []byte(`{`)):
 		return objectEntry(element)
 	}
@@ -91,6 +91,12 @@ func objectEntry(object []byte) (entry ParticipantEntry, ok bool) {
 	}
 	var number, phone string
 	var isMe, isMeCamel bool
+	// addresses holds the last "number", "phone" and "email" value, in that
+	// order, where it holds a JSON string.
+	var addresses [3]struct {
+		text string
+		ok   bool
+	}
 	for decoder.More() {
 		token, err := decoder.Token()
 		if err != nil {
@@ -102,14 +108,19 @@ func objectEntry(object []byte) (entry ParticipantEntry, ok bool) {
 			return ParticipantEntry{}, false
 		}
 		switch key {
-		case "name", "email":
+		case "name":
 			entry.Texts = appendText(entry.Texts, value)
 		case "number":
 			entry.Texts = appendText(entry.Texts, value)
 			number = jsonString(value)
+			addresses[0].text, addresses[0].ok = stringValue(value)
 		case "phone":
 			entry.Texts = appendText(entry.Texts, value)
 			phone = jsonString(value)
+			addresses[1].text, addresses[1].ok = stringValue(value)
+		case "email":
+			entry.Texts = appendText(entry.Texts, value)
+			addresses[2].text, addresses[2].ok = stringValue(value)
 		case "is_me":
 			isMe = jsonTrue(value)
 		case "isMe":
@@ -121,25 +132,35 @@ func objectEntry(object []byte) (entry ParticipantEntry, ok bool) {
 		entry.Number = phone
 	}
 	entry.IsMe = isMe || isMeCamel
+	for _, address := range addresses {
+		if address.ok {
+			entry.Addresses = append(entry.Addresses, address.text)
+		}
+	}
 	return entry, true
+}
+
+// stringValue is the string raw holds, as it is; ok is false when raw holds
+// no JSON string.
+func stringValue(raw json.RawMessage) (text string, ok bool) {
+	if !bytes.HasPrefix(raw, []byte(`"`)) || json.Unmarshal(raw, &text) != nil {
+		return "", false
+	}
+	return text, true
 }
 
 // appendText appends the string raw holds, as it is, when raw holds one.
 func appendText(texts []string, raw json.RawMessage) []string {
-	var text string
-	if !bytes.HasPrefix(raw, []byte(`"`)) || json.Unmarshal(raw, &text) != nil {
-		return texts
+	if text, ok := stringValue(raw); ok {
+		return append(texts, text)
 	}
-	return append(texts, text)
+	return texts
 }
 
 // jsonString is the string raw holds, trimmed, or "" when raw holds none.
 func jsonString(raw json.RawMessage) string {
-	var value string
-	if json.Unmarshal(raw, &value) != nil {
-		return ""
-	}
-	return strings.TrimSpace(value)
+	text, _ := stringValue(raw)
+	return strings.TrimSpace(text)
 }
 
 // jsonTrue reports whether raw is the JSON literal true.
@@ -214,7 +235,8 @@ func (lines OwnerLines) Owner(entry ParticipantEntry) bool {
 //	openmessage_participant_entries(list) returns an array that holds, for
 //	each entry ParticipantEntries gives, in order, an object with its
 //	"is_me" flag, its "number", its number's phoneline.ValueKeys as
-//	"number_keys", and its "texts".
+//	"number_keys", its "texts", and its Addresses with ASCII letters
+//	lowered, as the address search compares them, as "address_keys".
 //	openmessage_owner_line_keys(list) returns an array of the
 //	phoneline.LineKeys of each line OwnerLine gives an entry of list.
 func init() {
@@ -235,11 +257,16 @@ func participantEntriesJSON(_ *sqlite.FunctionContext, args []driver.Value) (dri
 	entries := ParticipantEntries(sqlList(args[0]))
 	rows := make([]sqlEntry, len(entries))
 	for index, entry := range entries {
+		addressKeys := make([]string, len(entry.Addresses))
+		for at, address := range entry.Addresses {
+			addressKeys[at] = foldASCII(address)
+		}
 		rows[index] = sqlEntry{
-			IsMe:       entry.IsMe,
-			Number:     entry.Number,
-			NumberKeys: append([]string{}, phoneline.ValueKeys(entry.Number)...),
-			Texts:      append([]string{}, entry.Texts...),
+			IsMe:        entry.IsMe,
+			Number:      entry.Number,
+			NumberKeys:  append([]string{}, phoneline.ValueKeys(entry.Number)...),
+			Texts:       append([]string{}, entry.Texts...),
+			AddressKeys: addressKeys,
 		}
 	}
 	return jsonText(rows)
@@ -261,6 +288,17 @@ func ownerLineKeysJSON(_ *sqlite.FunctionContext, args []driver.Value) (driver.V
 		}
 	}
 	return jsonText(keys)
+}
+
+// foldASCII lowers s's ASCII letters and leaves every other byte alone.
+func foldASCII(s string) string {
+	b := []byte(s)
+	for index, c := range b {
+		if 'A' <= c && c <= 'Z' {
+			b[index] = c + 'a' - 'A'
+		}
+	}
+	return string(b)
 }
 
 // sqlList is the list an SQL argument holds: a BLOB's bytes, a TEXT's text

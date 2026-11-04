@@ -460,21 +460,27 @@ func phoneLineSearchSQL(match string) string {
 
 // SearchConversationsByAddress returns the conversations with someone whose
 // address is address as a whole, newest first, then in conversation ID
-// order, and at most limit. Someone is a participant entry not flagged as
-// the owner's, through the text of its number, phone or email, a bare
-// string entry, or the sender of an incoming message, whom the roster may
-// lack. The comparison ignores ASCII letters' case and nothing else, as
-// SQLite's NOCASE does, so an email address matches however its letters are
-// cased. A value that only contains address, a name, or a title matches
-// nothing: the legacy Google Chat importer files an email address as a
-// number, SMS threads list a short code as one, and another person's
-// address or phone number can hold either. The match runs before the
-// LIMIT. An empty address matches nothing.
+// order, and at most limit. Someone is a participant entry that the owner
+// rule in owner.go doesn't count as the owner's, through the text of its
+// number, phone or email (where a key repeats, its last value) or, for a
+// bare string, the string; or the sender of an incoming message, whom the
+// roster may lack. The rule skips flagged entries and the unflagged copies
+// of the owner that Google's lists hold, so the owner's own number or email
+// address finds no thread through such a copy. The comparison ignores ASCII
+// letters' case and nothing else, so an email address matches however its
+// letters are cased, and it compares every byte, NULs included. A value
+// that only contains address, a name, or a title matches nothing: the
+// legacy Google Chat importer files an email address as a number, SMS
+// threads list a short code as one, and another person's address or phone
+// number can hold either. Go reads every list, through the functions
+// owner.go registers. The match runs before the LIMIT. A blank address
+// matches nothing.
 func (s *Store) SearchConversationsByAddress(address string, limit int) ([]*Conversation, error) {
 	if strings.TrimSpace(address) == "" || limit <= 0 {
 		return []*Conversation{}, nil
 	}
-	rows, err := s.db.Query(addressSearchSQL, address, address, address, address, address, limit)
+	key := foldASCII(address)
+	rows, err := s.db.Query(addressSearchSQL, key, key, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -483,61 +489,35 @@ func (s *Store) SearchConversationsByAddress(address string, limit int) ([]*Conv
 }
 
 // addressSearchSQL is SearchConversationsByAddress's query. It takes the
-// address five times, then the limit. NOCASE can't use the sender_number
-// index, so the query compares each distinct sender number once, in
-// sender_numbers, and then finds the matching numbers' messages through the
-// index.
+// address with its ASCII letters lowered twice, then the limit. Go lowers
+// each entry's addresses the same way, and SQLite's lower() lowers ASCII
+// letters alone and keeps every byte, so the query compares bytes where
+// NOCASE would stop at a NUL. lower() can't use the sender_number index, so
+// the query lowers each distinct sender number once, in sender_numbers, and
+// then finds the matching numbers' messages through the index.
 var addressSearchSQL = `
-	WITH sender_numbers AS MATERIALIZED (
+	WITH ` + sqlOwnerKeys() + `,
+	sender_numbers AS MATERIALIZED (
 		SELECT DISTINCT sender_number FROM messages
 	)
 	SELECT ` + conversationColumns + `
 	FROM conversations
 	WHERE EXISTS (
 			SELECT 1
-			FROM ` + sqlRawParticipantEntries("conversations.participants") + ` AS p
-			WHERE CASE p.type
-				WHEN 'text' THEN p.value = ? COLLATE NOCASE
-				WHEN 'object' THEN NOT ` + sqlOwnerFlag + ` AND (
-					` + sqlEntryText("number") + ` = ? COLLATE NOCASE
-					OR ` + sqlEntryText("phone") + ` = ? COLLATE NOCASE
-					OR ` + sqlEntryText("email") + ` = ? COLLATE NOCASE
-				)
-				ELSE 0
-			END
+			FROM ` + sqlParticipantEntries("conversations.participants") + ` AS p,
+				json_each(p.value, '$.address_keys') AS address_key
+			WHERE address_key.value = ? AND NOT ` + sqlEntryIsOwners + `
 		)
 		OR conversation_id IN (
 			SELECT conversation_id
 			FROM messages
 			WHERE is_from_me = 0 AND sender_number IN (
-				SELECT sender_number FROM sender_numbers WHERE sender_number = ? COLLATE NOCASE
+				SELECT sender_number FROM sender_numbers WHERE lower(sender_number) = ?
 			)
 		)
 	ORDER BY last_message_ts DESC, conversation_id
 	LIMIT ?
 `
-
-// sqlOwnerFlag holds for an object entry that carries is_me or isMe. p is a
-// row of sqlRawParticipantEntries. Only a JSON true counts,
-// and json_type gives NULL for a missing key, hence IS.
-const sqlOwnerFlag = `(json_type(p.value, '$.is_me') IS 'true' OR json_type(p.value, '$.isMe') IS 'true')`
-
-// sqlEntryText is an object entry's text under key, or NULL when the key is
-// missing or holds anything but text. p is a row of
-// sqlRawParticipantEntries.
-func sqlEntryText(key string) string {
-	return `CASE json_type(p.value, '$.` + key + `') WHEN 'text' THEN json_extract(p.value, '$.` + key + `') END`
-}
-
-// sqlRawParticipantEntries is the json_each source for the elements of a
-// participants column as SQLite's JSON reader reads them: the elements of a
-// JSON array, and none for anything else. The JSON functions fail on
-// malformed JSON, such as an empty string, and SQLite can evaluate both sides
-// of an AND, so CASE guards them here and on p.value. Only the address
-// search reads lists this way.
-func sqlRawParticipantEntries(column string) string {
-	return `json_each(CASE WHEN json_valid(` + column + `) THEN CASE json_type(` + column + `) WHEN 'array' THEN ` + column + ` ELSE '[]' END ELSE '[]' END)`
-}
 
 // sqlOwnerKeys is a common table expression for a WITH clause, owner_keys:
 // a row for each of the phoneline.LineKeys of the owner's lines, as owner.go's
