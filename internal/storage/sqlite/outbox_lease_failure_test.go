@@ -401,74 +401,94 @@ func TestLeaseDueBatchLeasesPastARowWhoseWritesATriggerSkips(t *testing.T) {
 }
 
 // A leased row whose stored values do not read back is the row's failure: the
-// lease is undone and the row set aside. Here a schema edit lets kind hold a
-// NULL that OutboxItem cannot scan.
+// call undoes the lease and sets the row aside. Here a schema edit lets a NOT
+// NULL column hold a NULL that OutboxItem cannot scan. created_at_ms also keys
+// the call's pages, so a NULL there must neither fail the page select nor hide
+// the row from the page after it. All three rows come due at once, and a limit
+// of 1 makes the call page past each unreadable row in turn.
 func TestLeaseDueBatchSetsAsideALeasedRowThatDoesNotReadBack(t *testing.T) {
-	ctx := context.Background()
-	clock := newOutboxTestClock(outboxTestTimeMS)
-	store, repository := openOutboxTestRepository(t, clock.Now)
-	for offset, id := range []string{"head", "second"} {
-		item := outboxTestItem(id)
-		item.ScheduledForMS = outboxTestTimeMS - 100 + int64(offset)
-		mustEnqueueOutbox(t, repository, item)
-	}
-	withPinnedConnection(t, store, func(conn *sql.Conn) {
-		var schema string
-		if err := conn.QueryRowContext(ctx,
-			`SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'outbox'`,
-		).Scan(&schema); err != nil {
-			t.Fatalf("read outbox schema: %v", err)
-		}
-		notNullKind := regexp.MustCompile(`(?m)^(\s*kind\s+TEXT) NOT NULL`)
-		if !notNullKind.MatchString(schema) {
-			t.Fatalf("outbox schema has no NOT NULL kind column to relax:\n%s", schema)
-		}
-		var version int64
-		if err := conn.QueryRowContext(ctx, `PRAGMA schema_version`).Scan(&version); err != nil {
-			t.Fatalf("read schema version: %v", err)
-		}
-		mustExecConn(t, conn, `PRAGMA writable_schema = ON`)
-		mustExecConn(t, conn,
-			`UPDATE sqlite_schema SET sql = ? WHERE type = 'table' AND name = 'outbox'`,
-			notNullKind.ReplaceAllString(schema, "$1"),
-		)
-		mustExecConn(t, conn, fmt.Sprintf(`PRAGMA schema_version = %d`, version+1))
-		mustExecConn(t, conn, `PRAGMA writable_schema = RESET`)
-		mustExecConn(t, conn, `UPDATE outbox SET kind = NULL WHERE outbox_id = 'outbox-head'`)
-	})
+	for _, column := range []struct{ name, declaration string }{
+		{"kind", "TEXT"},
+		{"created_at_ms", "INTEGER"},
+	} {
+		t.Run(column.name, func(t *testing.T) {
+			ctx := context.Background()
+			clock := newOutboxTestClock(outboxTestTimeMS)
+			store, repository := openOutboxTestRepository(t, clock.Now)
+			for _, id := range []string{"a", "b", "c"} {
+				item := outboxTestItem(id)
+				item.ScheduledForMS = outboxTestTimeMS - 100
+				mustEnqueueOutbox(t, repository, item)
+			}
+			withPinnedConnection(t, store, func(conn *sql.Conn) {
+				var schema string
+				if err := conn.QueryRowContext(ctx,
+					`SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'outbox'`,
+				).Scan(&schema); err != nil {
+					t.Fatalf("read outbox schema: %v", err)
+				}
+				notNull := regexp.MustCompile(`(?m)^(\s*` + column.name + `\s+` + column.declaration + `) NOT NULL`)
+				if !notNull.MatchString(schema) {
+					t.Fatalf("outbox schema has no NOT NULL %s column to relax:\n%s", column.name, schema)
+				}
+				var version int64
+				if err := conn.QueryRowContext(ctx, `PRAGMA schema_version`).Scan(&version); err != nil {
+					t.Fatalf("read schema version: %v", err)
+				}
+				mustExecConn(t, conn, `PRAGMA writable_schema = ON`)
+				mustExecConn(t, conn,
+					`UPDATE sqlite_schema SET sql = ? WHERE type = 'table' AND name = 'outbox'`,
+					notNull.ReplaceAllString(schema, "$1"),
+				)
+				mustExecConn(t, conn, fmt.Sprintf(`PRAGMA schema_version = %d`, version+1))
+				mustExecConn(t, conn, `PRAGMA writable_schema = RESET`)
+				mustExecConn(t, conn,
+					`UPDATE outbox SET `+column.name+` = NULL WHERE outbox_id IN ('outbox-a', 'outbox-b')`)
+			})
 
-	batch := mustLeaseDueBatch(t, repository, clock.Now(), 8)
-	if got, want := leasedOutboxIDs(batch), []string{"outbox-second"}; !slices.Equal(got, want) {
-		t.Fatalf("LeaseDueBatch() leased %v, want %v", got, want)
-	}
-	if len(batch.Failed) != 1 || batch.Failed[0].OutboxID != "outbox-head" ||
-		!strings.Contains(batch.Failed[0].Err.Error(), "stored values do not read back") ||
-		batch.Failed[0].SetAsideErr != nil || batch.Failed[0].RetryAt.IsZero() {
-		t.Fatalf("LeaseDueBatch() failures = %+v, want the unreadable head set aside", batch.Failed)
-	}
-	// FindByID cannot read the row either, so read the columns that matter.
-	var state, code string
-	var leaseToken sql.NullString
-	var nextAttemptAtMS int64
-	if err := store.db.QueryRowContext(ctx, `
-		SELECT state, error_code, lease_token, next_attempt_at_ms
-		FROM outbox WHERE outbox_id = 'outbox-head'
-	`).Scan(&state, &code, &leaseToken, &nextAttemptAtMS); err != nil {
-		t.Fatalf("read the unreadable row's state: %v", err)
-	}
-	if state != string(OutboxNotDispatched) || code != LeaseFailedCode || leaseToken.Valid ||
-		nextAttemptAtMS != batch.Failed[0].RetryAt.UnixMilli() {
-		t.Fatalf("unreadable row = state %q, code %q, lease %v, next attempt %d; want it set aside with no lease",
-			state, code, leaseToken, nextAttemptAtMS)
-	}
-	// Every read of the row fails, the pending list's too, so the API's
-	// outbox listing, retry and cancel fail while it exists, as
-	// docs/agent-runbook.md tells operators. Change both together.
-	if _, err := repository.FindByID(ctx, "outbox-head"); err == nil {
-		t.Fatal("FindByID(unreadable row) succeeded, want the scan to fail")
-	}
-	if _, err := repository.ListPending(ctx, ListPendingParams{Limit: 100}); err == nil {
-		t.Fatal("ListPending() with an unreadable row succeeded, want the scan to fail")
+			batch := mustLeaseDueBatch(t, repository, clock.Now(), 1)
+			if got, want := leasedOutboxIDs(batch), []string{"outbox-c"}; !slices.Equal(got, want) {
+				t.Fatalf("LeaseDueBatch() leased %v, want %v", got, want)
+			}
+			var failed []string
+			for _, failure := range batch.Failed {
+				failed = append(failed, failure.OutboxID)
+				if !strings.Contains(failure.Err.Error(), "stored values do not read back") ||
+					failure.SetAsideErr != nil || failure.RetryAt.IsZero() {
+					t.Fatalf("LeaseDueBatch() failure = %+v, want the unreadable row set aside", failure)
+				}
+			}
+			if want := []string{"outbox-a", "outbox-b"}; !slices.Equal(failed, want) {
+				t.Fatalf("LeaseDueBatch() failed %v, want %v", failed, want)
+			}
+			for _, failure := range batch.Failed {
+				// FindByID cannot read the row either, so read the columns that
+				// matter.
+				var state, code string
+				var leaseToken sql.NullString
+				var nextAttemptAtMS int64
+				if err := store.db.QueryRowContext(ctx, `
+					SELECT state, error_code, lease_token, next_attempt_at_ms
+					FROM outbox WHERE outbox_id = ?
+				`, failure.OutboxID).Scan(&state, &code, &leaseToken, &nextAttemptAtMS); err != nil {
+					t.Fatalf("read unreadable row %s: %v", failure.OutboxID, err)
+				}
+				if state != string(OutboxNotDispatched) || code != LeaseFailedCode || leaseToken.Valid ||
+					nextAttemptAtMS != failure.RetryAt.UnixMilli() {
+					t.Fatalf("unreadable row %s = state %q, code %q, lease %v, next attempt %d; want it set aside with no lease",
+						failure.OutboxID, state, code, leaseToken, nextAttemptAtMS)
+				}
+			}
+			// Every read of the row fails, the pending list's too, so the API's
+			// outbox listing, retry and cancel fail while it exists, as
+			// docs/agent-runbook.md tells operators. Change both together.
+			if _, err := repository.FindByID(ctx, "outbox-a"); err == nil {
+				t.Fatal("FindByID(unreadable row) succeeded, want the scan to fail")
+			}
+			if _, err := repository.ListPending(ctx, ListPendingParams{Limit: 100}); err == nil {
+				t.Fatal("ListPending() with an unreadable row succeeded, want the scan to fail")
+			}
+		})
 	}
 }
 
