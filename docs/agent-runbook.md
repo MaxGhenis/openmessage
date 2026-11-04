@@ -248,6 +248,63 @@ the queued rows dispatch. To tell whether the stuck message went out, look in
 its thread for an outgoing row with the same body after the send: that is the
 phone's echo, so it did.
 
+**One row whose lease always fails no longer holds the rows behind it.** The
+dispatcher leases its due rows in one transaction, in due order. Before
+PR #278, the first lease that failed rolled back the whole batch, and every
+pass met the same row first again. So with #274's retrying `Run`, every pass
+failed on that one row, and no text, media, reaction or read receipt due
+after it went out. Now `LeaseDueBatch` leases each row under its own
+savepoint. When the failure belongs to the row, it undoes that row's lease,
+sets the row aside and leases the rows behind it. A failure belongs to the
+row when SQLite refuses the write as a constraint (a CHECK, NOT NULL, STRICT
+type or trigger) or a value of the wrong type or size, when a trigger skips
+the write, or when the leased row's values don't read back. What you see:
+
+- `GET /api/v1/outbox` lists the row as `not_dispatched`, with `error_class`
+  `transient` and `error_code` `lease`. The store sets its
+  `next_attempt_at_ms` 5 s after the failure, and each further failed lease
+  doubles the delay, up to 5 minutes. After the clock steps back, the
+  doubling can restart lower, so the row retries sooner, never later.
+  `attempt_count` stays the same, because the row's transport call never
+  started. The stored `error_detail`, which the API doesn't return, holds
+  the lease's error (`lease outbox item "<id>": update: constraint failed:
+  …`). The UI's outbox tray shows a text, media or reaction row as
+  `Retrying…`, with Cancel; it doesn't list read receipts.
+- `v2_dispatch` counts each failed lease in `failed_leases` and shows the
+  latest in `last_failed_lease` (`outbox_id`, `at_ms`, `error`,
+  `retry_at_ms`). The pass itself succeeds, so `failed_passes` stays where
+  it was.
+- The backend logs `Failed to lease V2 outbox item; set it aside to retry`
+  (a zerolog warning, with `outbox_id`, `error` and `retry_at_ms`).
+- When the set-aside write fails too, the row stays as it was, still due.
+  `last_failed_lease` then carries `set_aside_error` and no `retry_at_ms`,
+  and the backend logs `Failed to lease V2 outbox item or set it aside;
+  sending the rest` (an error). A pass meets each such row once, however
+  many come first, and leases the rows after them. It sends every other due
+  row and then fails, so `failed_passes` climbs and `Run` backs off, 1 s
+  doubling to 30 s, before it meets the row again.
+- When a row's stored values don't read back (a NULL where the schema says
+  NOT NULL, say), the store sets it aside the same way, and the rows behind
+  it still send. But every read of that row fails while it exists:
+  `GET /api/v1/outbox` answers 500, so the tray can't load, and retry and
+  cancel fail on the row too. `last_failed_lease` and the log line still
+  name it. To clear it, repair the row in the store.
+- A failure that belongs to the store, not the row (busy, locked, I/O,
+  corruption, any other SQLite error), still fails the whole pass and leases
+  nothing, as before.
+
+Setting a row aside never resends a message. A due row has state `queued` or
+`not_dispatched`: its transport call never started, or the transport proved
+it sent nothing (`MarkCalledNotDispatched`). The set-aside keeps it that
+way, and a row whose call started (`dispatching` with
+`transport_called_at_ms`, or `uncertain`) never enters the due set.
+
+To clear a set-aside row, find out why its writes fail (`error` names the
+constraint or trigger) and fix that. Then `POST /api/v1/outbox/<id>/retry`
+makes the row due at once instead of at its retry time, and
+`POST /api/v1/outbox/<id>/cancel` drops it. If the cause remains, the next
+lease fails again and the delay starts over at 5 s.
+
 ## v2 cutover: conversation IDs re-key (issue #155)
 
 On a **v2-primary** install the API serves the v2 store, where a conversation's

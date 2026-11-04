@@ -650,16 +650,22 @@ func readRepairPlanState(t *testing.T, store *Store) repairPlanState {
 	return state
 }
 
-// repairPropertyConfig returns the cases and seed for a repair property test:
-// fewer cases under -race, where the pure-Go SQLite engine runs about tenfold
-// slower. OPENMESSAGE_PROPERTY_CASES and OPENMESSAGE_PROPERTY_SEED override
-// both, so a sweep over seeds needs no rebuild.
+// repairPropertyConfig returns the cases and seed for a repair property test.
 func repairPropertyConfig(t *testing.T, cases, raceCases int) *quick.Config {
+	t.Helper()
+	return storagePropertyConfig(t, 20261010, cases, raceCases)
+}
+
+// storagePropertyConfig returns the cases and seed for a property test in
+// this package: the test's fixed seed, and fewer cases under -race, where the
+// pure-Go SQLite engine runs about tenfold slower.
+// OPENMESSAGE_PROPERTY_CASES and OPENMESSAGE_PROPERTY_SEED override both, so
+// a sweep over seeds needs no rebuild.
+func storagePropertyConfig(t *testing.T, seed int64, cases, raceCases int) *quick.Config {
 	t.Helper()
 	if raceDetectorEnabled {
 		cases = raceCases
 	}
-	seed := int64(20261010)
 	for name, target := range map[string]func(int64){
 		"OPENMESSAGE_PROPERTY_CASES": func(value int64) { cases = int(value) },
 		"OPENMESSAGE_PROPERTY_SEED":  func(value int64) { seed = value },

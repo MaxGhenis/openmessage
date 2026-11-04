@@ -468,6 +468,13 @@ func newV2ToolHarness(t *testing.T, steps ...v2ToolSendStep) *v2ToolHarness {
 		t.Errorf("MessageService dispatch pass failed: %v", err)
 		failHarness(err)
 	})
+	// A lease that fails on its row sets the row aside and the send returns
+	// as retrying, so without this a tool test would pass over it.
+	service.OnLeaseFailure(func(lease messaging.FailedLease) {
+		err := fmt.Errorf("lease outbox item %s: %s", lease.OutboxID, lease.Error)
+		t.Errorf("MessageService could not %v", err)
+		failHarness(err)
+	})
 	runCtx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
