@@ -431,6 +431,11 @@ func (s *v2Stack) Start(
 		stopOnce.Do(func() {
 			cancel()
 			runWG.Wait()
+			// Media downloads started in the background end before the
+			// store they write to closes.
+			if s.Media != nil {
+				s.Media.Close()
+			}
 			if err := s.Store.Close(); err != nil {
 				s.logger.Warn().Err(err).Msg("Failed to close v2 message store")
 			}

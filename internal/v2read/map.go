@@ -334,10 +334,18 @@ func (s *Source) messageAttachment(
 // when the reference does (Google names a message's media in a later update
 // of it) and stays the same across the download itself, so a client reloads
 // an attachment only when there is something new to load.
+//
+// A downloaded reduced copy whose reference names the original
+// (NeedsOriginal) has a version of its own, so the original replacing it
+// changes the version too: the media service may finish that download after
+// the reader that started it was served the copy.
 func attachmentMediaVersion(attachment sqlite.MessageAttachment) string {
 	remoteID := strings.TrimSpace(attachment.RemoteID)
 	if remoteID == "" {
 		return ""
+	}
+	if attachment.NeedsOriginal() {
+		remoteID += "\x00reduced copy"
 	}
 	sum := sha256.Sum256([]byte(remoteID))
 	return hex.EncodeToString(sum[:6])

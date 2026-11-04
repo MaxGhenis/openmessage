@@ -43,6 +43,11 @@ type Attachment struct {
 	// message, that it failed to fetch this attachment. Empty when it
 	// reported none.
 	TransportError string
+	// Preview reports that RemoteRef names a reduced copy (a thumbnail)
+	// because the transport has not named the original yet. A later update
+	// of the message can name the original; storage lets that reference
+	// replace this one even after the reduced copy is downloaded.
+	Preview bool
 }
 
 type ConversationEvent struct {

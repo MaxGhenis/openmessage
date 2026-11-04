@@ -163,7 +163,7 @@ func TestAttachmentRepositoryTreatsDownloadedMessageBlobAsReferenced(t *testing.
 	pendingCandidate := strings.Repeat("7a", 32)
 	orphanHash := strings.Repeat("8b", 32)
 	if err := messageAttachments.MarkDownloaded(
-		context.Background(), "message-inbound-media", 0, downloadedHash, 10, "image/png",
+		context.Background(), "message-inbound-media", 0, downloadedHash, 10, "image/png", false,
 	); err != nil {
 		t.Fatalf("MarkDownloaded(): %v", err)
 	}
@@ -322,8 +322,8 @@ func openAttachmentTestRepository(t *testing.T) (*Store, *AttachmentRepository) 
 		}
 	})
 
-	if len(embeddedMigrations) != 11 {
-		t.Fatalf("embedded migrations = %d, want 11", len(embeddedMigrations))
+	if len(embeddedMigrations) != 12 {
+		t.Fatalf("embedded migrations = %d, want 12", len(embeddedMigrations))
 	}
 	assertPragmaInt(t, store.db, "user_version", len(embeddedMigrations))
 	ledger := readLedgerRow(t, store.db, 3)

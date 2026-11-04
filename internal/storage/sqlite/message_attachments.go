@@ -78,6 +78,26 @@ type MessageAttachment struct {
 	// UpdatedAtMS and CreatedAtMS are read by GetForDownload only.
 	UpdatedAtMS int64
 	CreatedAtMS int64
+	// RemotePreview marks a RemoteRef that names a reduced copy (a
+	// thumbnail) because the transport has not named the original
+	// (bridge.Attachment.Preview).
+	RemotePreview bool
+	// BlobPreview marks downloaded bytes that are such a reduced copy. A row
+	// whose BlobPreview is set while RemotePreview is not holds a thumbnail
+	// and already knows where its original is (NeedsOriginal).
+	BlobPreview bool
+}
+
+// NeedsOriginal reports a downloaded reduced copy whose reference now names
+// the original, so the original can be downloaded in its place.
+func (a MessageAttachment) NeedsOriginal() bool {
+	return a.State == "downloaded" && a.BlobPreview && !a.RemotePreview && strings.TrimSpace(a.RemoteID) != ""
+}
+
+// AwaitsOriginal reports a downloaded reduced copy whose transport has not
+// named the original yet, so it can be asked to (bridge.FullMediaRequester).
+func (a MessageAttachment) AwaitsOriginal() bool {
+	return a.State == "downloaded" && a.BlobPreview && a.RemotePreview
 }
 
 // MessageAttachmentRepository owns inbound attachment lifecycle state.
@@ -100,15 +120,23 @@ func NewMessageAttachmentRepository(
 	return &MessageAttachmentRepository{store: store, now: now}, nil
 }
 
-// RecordInboundAttachment inserts or refreshes one pending attachment inside
-// the caller's projection transaction. A downloaded row is never modified.
+// RecordInboundAttachment inserts or refreshes one attachment inside the
+// caller's projection transaction.
 //
-// A refresh that names no remote media (an empty RemoteID) keeps the
-// reference already stored, and the filename, MIME type and size that came
-// with it: a transport can follow the update that named an attachment with
-// one that names nothing (Google did, for 154 of the live install's media
-// frames by 2026-10-24), and taking it would leave the row pointing nowhere
-// for good.
+// A pending row takes the refresh, except in two cases, where it keeps its
+// reference and the filename, MIME type and size that came with it:
+//   - A refresh that names no remote media (an empty RemoteID). A transport
+//     can follow the update that named an attachment with one that names
+//     nothing (Google did, for 154 of the live install's media frames by
+//     2026-10-24), and taking it would leave the row pointing nowhere for
+//     good.
+//   - A refresh naming a reduced copy (RemotePreview) when the row names the
+//     original.
+//
+// A downloaded row is never modified, with one exception: a downloaded
+// reduced copy (BlobPreview) takes a refresh that names the original, so the
+// original can be downloaded in its place. It keeps its bytes, and their
+// filename, MIME type and size, until then.
 func (r *MessageAttachmentRepository) RecordInboundAttachment(
 	ctx context.Context,
 	tx *sql.Tx,
@@ -131,6 +159,7 @@ func (r *MessageAttachmentRepository) RecordInboundAttachment(
 	}
 	if strings.TrimSpace(attachment.RemoteID) == "" {
 		attachment.RemoteID = ""
+		attachment.RemotePreview = false
 	}
 	if strings.TrimSpace(attachment.MIME) == "" {
 		attachment.MIME = "application/octet-stream"
@@ -140,16 +169,31 @@ func (r *MessageAttachmentRepository) RecordInboundAttachment(
 		return err
 	}
 
-	// keepsReference is whether the stored row names media and the refresh
-	// does not, so the row keeps its reference and the description that came
-	// with it.
-	const keepsReference = `(excluded.remote_id = '' AND message_attachments.remote_id <> '')`
+	// takesReference is whether the refresh's reference replaces the stored
+	// one. The WHERE clause admits a downloaded row only for a refresh that
+	// names the original, for which it is always true.
+	const takesReference = `(
+		excluded.remote_id <> ''
+		AND NOT (
+			excluded.remote_preview = 1
+			AND message_attachments.remote_id <> ''
+			AND message_attachments.remote_preview = 0
+		)
+	)`
+	// pending is whether the stored row has no bytes yet.
+	const pending = `message_attachments.blob_hash IS NULL`
+	// takesDescription is whether the refresh's filename, MIME type and size
+	// replace the stored ones: on a pending row, together with its reference,
+	// or while the row names no media at all.
+	const takesDescription = `(` + pending + ` AND (` + takesReference + `
+		OR message_attachments.remote_id = ''))`
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO message_attachments (
 			message_id,
 			ordinal,
 			remote_id,
 			remote_ref,
+			remote_preview,
 			filename,
 			mime,
 			size_bytes,
@@ -158,26 +202,36 @@ func (r *MessageAttachmentRepository) RecordInboundAttachment(
 			last_error,
 			created_at_ms,
 			updated_at_ms
-		) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', NULL, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', NULL, ?, ?, ?)
 		ON CONFLICT(message_id, ordinal) DO UPDATE SET
-			remote_id = CASE WHEN excluded.remote_id = ''
-				THEN message_attachments.remote_id ELSE excluded.remote_id END,
-			remote_ref = CASE WHEN excluded.remote_id = ''
-				THEN message_attachments.remote_ref ELSE excluded.remote_ref END,
-			filename = CASE WHEN `+keepsReference+`
-				THEN message_attachments.filename ELSE excluded.filename END,
-			mime = CASE WHEN `+keepsReference+`
-				THEN message_attachments.mime ELSE excluded.mime END,
-			size_bytes = CASE WHEN `+keepsReference+`
-				THEN message_attachments.size_bytes ELSE excluded.size_bytes END,
-			last_error = COALESCE(excluded.last_error, message_attachments.last_error),
+			remote_id = CASE WHEN `+takesReference+`
+				THEN excluded.remote_id ELSE message_attachments.remote_id END,
+			remote_ref = CASE WHEN `+takesReference+`
+				THEN excluded.remote_ref ELSE message_attachments.remote_ref END,
+			remote_preview = CASE WHEN `+takesReference+`
+				THEN excluded.remote_preview ELSE message_attachments.remote_preview END,
+			filename = CASE WHEN `+takesDescription+`
+				THEN excluded.filename ELSE message_attachments.filename END,
+			mime = CASE WHEN `+takesDescription+`
+				THEN excluded.mime ELSE message_attachments.mime END,
+			size_bytes = CASE WHEN `+takesDescription+`
+				THEN excluded.size_bytes ELSE message_attachments.size_bytes END,
+			last_error = CASE WHEN `+pending+`
+				THEN COALESCE(excluded.last_error, message_attachments.last_error)
+				ELSE message_attachments.last_error END,
 			updated_at_ms = excluded.updated_at_ms
-		WHERE message_attachments.blob_hash IS NULL
+		WHERE `+pending+`
+		   OR (
+			message_attachments.blob_preview = 1
+			AND excluded.remote_preview = 0
+			AND excluded.remote_id <> ''
+		   )
 	`,
 		attachment.MessageID,
 		attachment.Ordinal,
 		attachment.RemoteID,
 		attachment.RemoteRef,
+		attachment.RemotePreview,
 		attachment.Filename,
 		attachment.MIME,
 		attachment.SizeBytes,
@@ -222,6 +276,8 @@ func (r *MessageAttachmentRepository) GetForDownload(
 			ma.last_error,
 			ma.updated_at_ms,
 			ma.created_at_ms,
+			ma.remote_preview,
+			ma.blob_preview,
 			m.account_id
 		FROM message_attachments AS ma
 		JOIN messages AS m ON m.message_id = ma.message_id
@@ -239,6 +295,8 @@ func (r *MessageAttachmentRepository) GetForDownload(
 		&lastError,
 		&attachment.UpdatedAtMS,
 		&attachment.CreatedAtMS,
+		&attachment.RemotePreview,
+		&attachment.BlobPreview,
 		&attachment.AccountID,
 	)
 	if err != nil {
@@ -262,7 +320,9 @@ func (r *MessageAttachmentRepository) GetForDownload(
 }
 
 // MarkDownloaded atomically publishes a blob reference on a still-pending
-// attachment. A missing or already-downloaded row is an idempotent no-op.
+// attachment. preview says the bytes are a reduced copy (the row's
+// RemotePreview when its reference was read for the download). A missing or
+// already-downloaded row is an idempotent no-op.
 func (r *MessageAttachmentRepository) MarkDownloaded(
 	ctx context.Context,
 	messageID string,
@@ -270,6 +330,7 @@ func (r *MessageAttachmentRepository) MarkDownloaded(
 	blobHash string,
 	size int64,
 	mime string,
+	preview bool,
 ) error {
 	if err := validateBlobHash(blobHash); err != nil {
 		return fmt.Errorf("mark message attachment downloaded: %w", err)
@@ -288,12 +349,13 @@ func (r *MessageAttachmentRepository) MarkDownloaded(
 		UPDATE message_attachments
 		SET state = 'downloaded',
 		    blob_hash = ?,
+		    blob_preview = ?,
 		    size_bytes = ?,
 		    mime = ?,
 		    last_error = NULL,
 		    updated_at_ms = ?
 		WHERE message_id = ? AND ordinal = ? AND state = 'pending'
-	`, blobHash, size, mime, nowMS, messageID, ordinal)
+	`, blobHash, preview, size, mime, nowMS, messageID, ordinal)
 	if err != nil {
 		return fmt.Errorf(
 			"mark message attachment %q ordinal %d downloaded: %w",
@@ -315,8 +377,9 @@ func (r *MessageAttachmentRepository) MarkDownloaded(
 
 // ReplaceDownloaded points a downloaded attachment at different bytes, only
 // while it still holds oldBlobHash (compare-and-swap), and reports whether it
-// did. It exists to correct a wrong import; the old blob stays in the
-// BlobStore, which other rows may share.
+// did. It corrects a wrong import and puts an original in place of its
+// reduced copy; preview says whether the new bytes are themselves a reduced
+// copy. The old blob stays in the BlobStore, which other rows may share.
 func (r *MessageAttachmentRepository) ReplaceDownloaded(
 	ctx context.Context,
 	messageID string,
@@ -325,6 +388,7 @@ func (r *MessageAttachmentRepository) ReplaceDownloaded(
 	blobHash string,
 	size int64,
 	mime string,
+	preview bool,
 ) (bool, error) {
 	if err := validateBlobHash(blobHash); err != nil {
 		return false, fmt.Errorf("replace message attachment: %w", err)
@@ -342,12 +406,13 @@ func (r *MessageAttachmentRepository) ReplaceDownloaded(
 	result, err := r.store.db.ExecContext(ctx, `
 		UPDATE message_attachments
 		SET blob_hash = ?,
+		    blob_preview = ?,
 		    size_bytes = ?,
 		    mime = ?,
 		    last_error = NULL,
 		    updated_at_ms = ?
 		WHERE message_id = ? AND ordinal = ? AND state = 'downloaded' AND blob_hash = ?
-	`, blobHash, size, mime, nowMS, messageID, ordinal, oldBlobHash)
+	`, blobHash, preview, size, mime, nowMS, messageID, ordinal, oldBlobHash)
 	if err != nil {
 		return false, fmt.Errorf("replace message attachment %q ordinal %d: %w", messageID, ordinal, err)
 	}

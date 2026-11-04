@@ -83,8 +83,8 @@ func TestMessageAttachmentsMigrationAppliesToBlankAndExistingV7AndReopens(t *tes
 			}
 		})
 		after := readLedgerRows(t, store.db)
-		if len(after) != 11 {
-			t.Fatalf("migrated ledger rows = %d, want 11", len(after))
+		if len(after) != 12 {
+			t.Fatalf("migrated ledger rows = %d, want 12", len(after))
 		}
 		if !slices.Equal(after[:7], before) {
 			t.Fatalf("migrations 0001-0007 changed:\nbefore: %+v\nafter:  %+v", before, after[:7])
@@ -198,14 +198,14 @@ func TestMessageAttachmentRepositoryMarkDownloadedIsIdempotent(t *testing.T) {
 	firstHash := strings.Repeat("1a", 32)
 	clock.Set(messageAttachmentTestTimeMS + 100)
 	if err := repository.MarkDownloaded(
-		context.Background(), "message-download", 0, firstHash, 42, "image/png",
+		context.Background(), "message-download", 0, firstHash, 42, "image/png", false,
 	); err != nil {
 		t.Fatalf("MarkDownloaded(first): %v", err)
 	}
 	secondHash := strings.Repeat("2b", 32)
 	clock.Set(messageAttachmentTestTimeMS + 200)
 	if err := repository.MarkDownloaded(
-		context.Background(), "message-download", 0, secondHash, 99, "text/plain",
+		context.Background(), "message-download", 0, secondHash, 99, "text/plain", false,
 	); err != nil {
 		t.Fatalf("MarkDownloaded(second): %v", err)
 	}
@@ -228,7 +228,7 @@ func TestMessageAttachmentRepositoryMarkDownloadedIsIdempotent(t *testing.T) {
 		t.Fatalf("updated_at_ms = %d, want first update %d", updatedAtMS, messageAttachmentTestTimeMS+100)
 	}
 	if err := repository.MarkDownloaded(
-		context.Background(), "message-download", 0, strings.Repeat("AB", 32), 1, "image/png",
+		context.Background(), "message-download", 0, strings.Repeat("AB", 32), 1, "image/png", false,
 	); err == nil {
 		t.Fatal("MarkDownloaded(invalid hash) succeeded")
 	}
@@ -252,10 +252,10 @@ func TestMessageAttachmentRowsCascadeWithMessageDeletion(t *testing.T) {
 
 func assertMessageAttachmentsMigration(t *testing.T, store *Store) {
 	t.Helper()
-	if len(embeddedMigrations) != 11 {
-		t.Fatalf("embedded migrations = %d, want 11", len(embeddedMigrations))
+	if len(embeddedMigrations) != 12 {
+		t.Fatalf("embedded migrations = %d, want 12", len(embeddedMigrations))
 	}
-	assertPragmaInt(t, store.db, "user_version", 11)
+	assertPragmaInt(t, store.db, "user_version", 12)
 	ledger := readLedgerRow(t, store.db, 8)
 	if ledger.name != "message_attachments" {
 		t.Fatalf("migration 0008 name = %q, want message_attachments", ledger.name)

@@ -501,7 +501,7 @@ func TestResolveAlreadyDownloadedMakesNoTransportCall(t *testing.T) {
 		t.Fatalf("Put(): %v", err)
 	}
 	if err := env.attachments.MarkDownloaded(
-		context.Background(), "message-cached", 0, ref.Hash, ref.Size, ref.MIME,
+		context.Background(), "message-cached", 0, ref.Hash, ref.Size, ref.MIME, false,
 	); err != nil {
 		t.Fatalf("MarkDownloaded(): %v", err)
 	}
@@ -735,6 +735,7 @@ type fakeRegistry struct {
 	registered   bool
 	capabilities bridge.CapabilitySet
 	downloader   bridge.MediaDownloader
+	fullMedia    bridge.FullMediaRequester
 	acquireErr   error
 	nilDownload  bool
 	acquires     int
@@ -766,6 +767,7 @@ func (r *fakeRegistry) Acquire(
 	r.acquires++
 	err := r.acquireErr
 	downloader := r.downloader
+	fullMedia := r.fullMedia
 	nilDownload := r.nilDownload
 	r.mu.Unlock()
 	if err := ctx.Err(); err != nil {
@@ -782,6 +784,7 @@ func (r *fakeRegistry) Acquire(
 	}
 	if !nilDownload {
 		lease.Download = downloader
+		lease.FullMedia = fullMedia
 	}
 	return lease, nil
 }

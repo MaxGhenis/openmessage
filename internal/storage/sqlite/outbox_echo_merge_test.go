@@ -275,7 +275,7 @@ func seedEchoCascadeChildren(t *testing.T, store *Store, messageID string) {
 	if err := tx.Commit(); err != nil {
 		t.Fatalf("commit attachment seed: %v", err)
 	}
-	if err := attachments.MarkDownloaded(ctx, messageID, 0, echoMergeBlobHash, 42, "image/png"); err != nil {
+	if err := attachments.MarkDownloaded(ctx, messageID, 0, echoMergeBlobHash, 42, "image/png", false); err != nil {
 		t.Fatalf("MarkDownloaded(): %v", err)
 	}
 }

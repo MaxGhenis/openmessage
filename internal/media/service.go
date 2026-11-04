@@ -11,6 +11,7 @@ import (
 	"io"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/maxghenis/openmessage/internal/bridge"
@@ -31,6 +32,25 @@ const failureRecordTimeout = 5 * time.Second
 // does arrive, the next download uses it.
 const NotReadyGrace = 15 * time.Minute
 
+const (
+	// defaultOriginalWait is how long Resolve waits for an attachment's
+	// original to replace its downloaded reduced copy before serving the
+	// copy. The download carries on, and the attachment's media version
+	// changes when it lands, so a reader asks again.
+	defaultOriginalWait = 8 * time.Second
+	// originalTimeout bounds one download of an original.
+	originalTimeout = time.Minute
+	// originalRetryAfter is how long a failed download of an original, or a
+	// request for one, holds off the next attempt for the same attachment.
+	originalRetryAfter = 30 * time.Minute
+	// originalRequestTimeout bounds one request for an original, including
+	// its wait for one of originalRequestSlots.
+	originalRequestTimeout = 30 * time.Second
+	// originalRequestSlots bounds requests for originals in flight, so a
+	// thread full of old thumbnails does not ask the phone for all at once.
+	originalRequestSlots = 4
+)
+
 // Clock is the same application clock contract used by MessageService.
 type Clock = messaging.Clock
 
@@ -43,6 +63,22 @@ type Service struct {
 	clock       Clock
 	maxBytes    int64
 	group       singleflight.Group
+
+	// originals holds off work on reduced copies (a thumbnail standing in for
+	// an image), by hold and attachment: when a download of the original last
+	// failed, and when the original was last requested from the transport.
+	// downloads holds the downloads of originals in flight. background tracks
+	// the goroutines doing both, which can outlive the Resolve that started
+	// them; backgroundCtx is theirs, and Close cancels it.
+	originalsMu    sync.Mutex
+	originals      map[string]time.Time
+	downloads      map[string]*originalDownload
+	closed         bool
+	background     sync.WaitGroup
+	backgroundCtx  context.Context
+	stopBackground context.CancelFunc
+	requestsSlots  chan struct{}
+	originalWait   time.Duration
 }
 
 // DownloadCommand identifies one message-owned attachment. It deliberately
@@ -124,13 +160,32 @@ func NewService(
 	if err != nil {
 		return nil, fmt.Errorf("create media service attachments: %w", err)
 	}
+	backgroundCtx, stopBackground := context.WithCancel(context.Background())
 	return &Service{
-		attachments: attachments,
-		bridges:     bridges,
-		blobs:       blobs,
-		clock:       clock,
-		maxBytes:    messaging.DefaultMaxMediaBytes,
+		attachments:    attachments,
+		bridges:        bridges,
+		blobs:          blobs,
+		clock:          clock,
+		maxBytes:       messaging.DefaultMaxMediaBytes,
+		originals:      make(map[string]time.Time),
+		downloads:      make(map[string]*originalDownload),
+		backgroundCtx:  backgroundCtx,
+		stopBackground: stopBackground,
+		requestsSlots:  make(chan struct{}, originalRequestSlots),
+		originalWait:   defaultOriginalWait,
 	}, nil
+}
+
+// Close cancels the work toward originals that Resolve started in the
+// background and waits for it to end, so the caller can close the store
+// after. Resolve still serves what is stored afterwards; it starts no more
+// such work.
+func (s *Service) Close() {
+	s.originalsMu.Lock()
+	s.closed = true
+	s.originalsMu.Unlock()
+	s.stopBackground()
+	s.background.Wait()
 }
 
 // Resolve returns a safe descriptor for one message attachment, downloading it
@@ -159,35 +214,221 @@ func (s *Service) Resolve(ctx context.Context, command DownloadCommand) (Descrip
 	if row.AccountID != command.AccountID {
 		return Descriptor{}, ErrNotFound
 	}
-	if row.State == "downloaded" {
-		return s.descriptorForRow(row)
-	}
-	if err := s.unavailableError(row); err != nil {
-		return Descriptor{}, err
-	}
+	if row.State != "downloaded" {
+		if err := s.unavailableError(row); err != nil {
+			return Descriptor{}, err
+		}
+		_, err, _ = s.group.Do(attachmentKey(row), func() (any, error) {
+			return s.download(ctx, row)
+		})
+		if err != nil {
+			return Descriptor{}, err
+		}
 
-	key := row.MessageID + "\x00" + strconv.FormatInt(row.Ordinal, 10)
-	_, err, _ = s.group.Do(key, func() (any, error) {
-		return s.download(ctx, row)
+		// Re-read after the slot rather than trusting its returned BlobRef. A
+		// concurrent process may have won MarkDownloaded; the durable row is
+		// the authoritative winner in that race and also contains the resolved
+		// MIME.
+		row, err = s.attachments.GetForDownload(ctx, command.MessageID, command.Ordinal)
+		if errors.Is(err, sql.ErrNoRows) {
+			return Descriptor{}, ErrNotFound
+		}
+		if err != nil {
+			return Descriptor{}, fmt.Errorf("resolve media: reload attachment: %w", err)
+		}
+		if row.AccountID != command.AccountID {
+			return Descriptor{}, ErrNotFound
+		}
+	}
+	return s.descriptorForRow(s.improve(ctx, row))
+}
+
+// improve works toward the original of an attachment whose downloaded bytes
+// are a reduced copy. When the reference names the original it downloads the
+// original in the copy's place, waiting up to originalWait (8 s) for it; otherwise
+// it asks the transport to name the original. It returns the row to serve and
+// never fails: the reduced copy still shows the attachment.
+func (s *Service) improve(ctx context.Context, row sqlite.MessageAttachment) sqlite.MessageAttachment {
+	switch {
+	case row.NeedsOriginal():
+		download := s.startOriginalDownload(row)
+		if download == nil {
+			return row
+		}
+		timer := s.clock.NewTimer(s.originalWait)
+		defer timer.Stop()
+		select {
+		case <-download.done:
+			if download.err == nil {
+				return download.row
+			}
+		case <-timer.C():
+		case <-ctx.Done():
+		}
+	case row.AwaitsOriginal():
+		s.startOriginalRequest(row)
+	}
+	return row
+}
+
+// Holds on work toward an attachment's original. A failed download of the
+// original holds off the next for originalRetryAfter, and so does each
+// request for one, which the transport answers, if at all, by naming it.
+const (
+	originalDownloadHold = "download\x00"
+	originalRequestHold  = "request\x00"
+)
+
+// originalDownload is one download of an attachment's original in flight;
+// done closes when row and err are set.
+type originalDownload struct {
+	done chan struct{}
+	row  sqlite.MessageAttachment
+	err  error
+}
+
+// startOriginalDownload starts downloading row's original, or joins the
+// download already in flight, and returns nil while a failed one holds off
+// the next or after Close. The download runs detached from any request.
+func (s *Service) startOriginalDownload(row sqlite.MessageAttachment) *originalDownload {
+	key := attachmentKey(row)
+	s.originalsMu.Lock()
+	defer s.originalsMu.Unlock()
+	if download, ok := s.downloads[key]; ok {
+		return download
+	}
+	if s.closed || s.heldLocked(originalDownloadHold+key) {
+		return nil
+	}
+	download := &originalDownload{done: make(chan struct{})}
+	s.downloads[key] = download
+	s.background.Add(1)
+	go func() {
+		defer s.background.Done()
+		upgraded, err := s.downloadOriginal(row)
+		s.originalsMu.Lock()
+		delete(s.downloads, key)
+		if err != nil {
+			s.holdLocked(originalDownloadHold + key)
+		}
+		s.originalsMu.Unlock()
+		download.row, download.err = upgraded, err
+		close(download.done)
+	}()
+	return download
+}
+
+// startOriginalRequest asks row's transport for its original in the
+// background, unless a request for it was made within originalRetryAfter or
+// the service is closed. The request holds off the next whatever its outcome.
+func (s *Service) startOriginalRequest(row sqlite.MessageAttachment) {
+	key := originalRequestHold + attachmentKey(row)
+	s.originalsMu.Lock()
+	defer s.originalsMu.Unlock()
+	if s.closed || s.heldLocked(key) {
+		return
+	}
+	s.holdLocked(key)
+	s.background.Add(1)
+	go func() {
+		defer s.background.Done()
+		s.requestOriginal(row)
+	}()
+}
+
+func (s *Service) heldLocked(key string) bool {
+	since, ok := s.originals[key]
+	return ok && s.clock.Now().Sub(since) < originalRetryAfter
+}
+
+func (s *Service) holdLocked(key string) {
+	now := s.clock.Now()
+	if len(s.originals) >= 4096 {
+		for other, since := range s.originals {
+			if now.Sub(since) >= originalRetryAfter {
+				delete(s.originals, other)
+			}
+		}
+	}
+	s.originals[key] = now
+}
+
+// downloadOriginal downloads the original row's reference names and puts it
+// in place of the reduced copy row holds. It runs detached from the request
+// that started it, so a reader that stops waiting does not waste it.
+func (s *Service) downloadOriginal(row sqlite.MessageAttachment) (sqlite.MessageAttachment, error) {
+	if row.BlobHash == nil {
+		return row, errors.New("download original media: attachment holds no bytes")
+	}
+	ctx, cancel := context.WithTimeout(s.backgroundCtx, originalTimeout)
+	defer cancel()
+	lease, err := s.acquireDownload(ctx, row.AccountID)
+	if err != nil {
+		return row, err
+	}
+	defer lease.Close()
+	stream, err := lease.Download.DownloadMedia(ctx, row.AccountID, bridge.MediaRef{
+		RemoteID: row.RemoteID,
+		Opaque:   row.RemoteRef,
+		Filename: row.Filename,
+		MIME:     row.MIME,
 	})
 	if err != nil {
-		return Descriptor{}, err
+		return row, fmt.Errorf("download original media: %w", err)
 	}
-
-	// Re-read after the slot rather than trusting its returned BlobRef. A
-	// concurrent process may have won MarkDownloaded; the durable row is the
-	// authoritative winner in that race and also contains the resolved MIME.
-	row, err = s.attachments.GetForDownload(ctx, command.MessageID, command.Ordinal)
-	if errors.Is(err, sql.ErrNoRows) {
-		return Descriptor{}, ErrNotFound
+	if stream.ReadCloser == nil {
+		return row, errors.New("download original media: transport returned no stream")
 	}
+	defer stream.Close()
+	mime := firstNonEmpty(stream.MIME, row.MIME, "application/octet-stream")
+	ref, err := s.blobs.Put(ctx, stream, mime, s.maxBytes)
 	if err != nil {
-		return Descriptor{}, fmt.Errorf("resolve media: reload attachment: %w", err)
+		return row, fmt.Errorf("download original media: store: %w", err)
 	}
-	if row.AccountID != command.AccountID {
-		return Descriptor{}, ErrNotFound
+	if _, err := s.attachments.ReplaceDownloaded(
+		ctx, row.MessageID, row.Ordinal, *row.BlobHash, ref.Hash, ref.Size, mime, false,
+	); err != nil {
+		return row, fmt.Errorf("download original media: replace: %w", err)
 	}
-	return s.descriptorForRow(row)
+	// The durable row decides: an import may have replaced the bytes first.
+	current, err := s.attachments.GetForDownload(ctx, row.MessageID, row.Ordinal)
+	if err != nil {
+		return row, fmt.Errorf("download original media: reload attachment: %w", err)
+	}
+	return current, nil
+}
+
+// requestOriginal asks row's transport to name the original of the reduced
+// copy row holds. The transport answers, if at all, with an update of the
+// message that the projection applies. Failures are not recorded; the hold
+// placed for this request paces the next one.
+func (s *Service) requestOriginal(row sqlite.MessageAttachment) {
+	ctx, cancel := context.WithTimeout(s.backgroundCtx, originalRequestTimeout)
+	defer cancel()
+	select {
+	case s.requestsSlots <- struct{}{}:
+		defer func() { <-s.requestsSlots }()
+	case <-ctx.Done():
+		return
+	}
+	lease, err := s.acquireDownload(ctx, row.AccountID)
+	if err != nil {
+		return
+	}
+	defer lease.Close()
+	if lease.FullMedia == nil {
+		return
+	}
+	_ = lease.FullMedia.RequestFullMedia(ctx, row.AccountID, bridge.MediaRef{
+		RemoteID: row.RemoteID,
+		Opaque:   row.RemoteRef,
+		Filename: row.Filename,
+		MIME:     row.MIME,
+	})
+}
+
+func attachmentKey(row sqlite.MessageAttachment) string {
+	return row.MessageID + "\x00" + strconv.FormatInt(row.Ordinal, 10)
 }
 
 // Open delegates to the BlobStore's hash-validated, private-root reader.
@@ -216,38 +457,9 @@ func (s *Service) download(
 		return blob.BlobRef{}, err
 	}
 
-	// Capabilities returns the zero set for both an unsupported adapter and an
-	// unregistered account. Snapshot preserves the routing table's distinction:
-	// unregistered is unavailable, while registered-but-unsupported is terminal.
-	if _, registered := s.bridges.Snapshot(row.AccountID); !registered {
-		return blob.BlobRef{}, ErrUnavailable
-	}
-	if !s.bridges.Capabilities(row.AccountID).MediaDownload {
-		return blob.BlobRef{}, ErrUnsupported
-	}
-
-	lease, err := s.bridges.Acquire(ctx, row.AccountID, bridge.CapabilityMediaDownload)
+	lease, err := s.acquireDownload(ctx, row.AccountID)
 	if err != nil {
-		switch {
-		case errors.Is(err, bridge.ErrAccountNotRegistered):
-			return blob.BlobRef{}, fmt.Errorf("%w: %w", ErrUnavailable, err)
-		case errors.Is(err, bridge.ErrCapabilityUnavailable):
-			if _, registered := s.bridges.Snapshot(row.AccountID); !registered {
-				return blob.BlobRef{}, fmt.Errorf("%w: %w", ErrUnavailable, err)
-			}
-			if !s.bridges.Capabilities(row.AccountID).MediaDownload {
-				return blob.BlobRef{}, fmt.Errorf("%w: %w", ErrUnsupported, err)
-			}
-			return blob.BlobRef{}, fmt.Errorf("%w: %w", ErrUnavailable, err)
-		default:
-			return blob.BlobRef{}, err
-		}
-	}
-	if lease == nil || lease.Download == nil {
-		if lease != nil {
-			lease.Close()
-		}
-		return blob.BlobRef{}, ErrUnavailable
+		return blob.BlobRef{}, err
 	}
 	defer lease.Close()
 
@@ -298,10 +510,50 @@ func (s *Service) download(
 		ref.Hash,
 		ref.Size,
 		mime,
+		row.RemotePreview,
 	); err != nil {
 		return blob.BlobRef{}, fmt.Errorf("download media: mark downloaded: %w", err)
 	}
 	return ref, nil
+}
+
+// acquireDownload leases accountID's media download capability. The caller
+// closes the lease.
+func (s *Service) acquireDownload(ctx context.Context, accountID string) (*bridge.DispatchLease, error) {
+	// Capabilities returns the zero set for both an unsupported adapter and an
+	// unregistered account. Snapshot preserves the routing table's distinction:
+	// unregistered is unavailable, while registered-but-unsupported is terminal.
+	if _, registered := s.bridges.Snapshot(accountID); !registered {
+		return nil, ErrUnavailable
+	}
+	if !s.bridges.Capabilities(accountID).MediaDownload {
+		return nil, ErrUnsupported
+	}
+
+	lease, err := s.bridges.Acquire(ctx, accountID, bridge.CapabilityMediaDownload)
+	if err != nil {
+		switch {
+		case errors.Is(err, bridge.ErrAccountNotRegistered):
+			return nil, fmt.Errorf("%w: %w", ErrUnavailable, err)
+		case errors.Is(err, bridge.ErrCapabilityUnavailable):
+			if _, registered := s.bridges.Snapshot(accountID); !registered {
+				return nil, fmt.Errorf("%w: %w", ErrUnavailable, err)
+			}
+			if !s.bridges.Capabilities(accountID).MediaDownload {
+				return nil, fmt.Errorf("%w: %w", ErrUnsupported, err)
+			}
+			return nil, fmt.Errorf("%w: %w", ErrUnavailable, err)
+		default:
+			return nil, err
+		}
+	}
+	if lease == nil || lease.Download == nil {
+		if lease != nil {
+			lease.Close()
+		}
+		return nil, ErrUnavailable
+	}
+	return lease, nil
 }
 
 func (s *Service) descriptorForRow(row sqlite.MessageAttachment) (Descriptor, error) {
@@ -495,7 +747,7 @@ func (s *Service) Import(ctx context.Context, command ImportCommand) (Descriptor
 		return Descriptor{}, false, fmt.Errorf("import media: %w", err)
 	}
 	if replacing {
-		swapped, err := s.attachments.ReplaceDownloaded(ctx, row.MessageID, row.Ordinal, *row.BlobHash, ref.Hash, ref.Size, mime)
+		swapped, err := s.attachments.ReplaceDownloaded(ctx, row.MessageID, row.Ordinal, *row.BlobHash, ref.Hash, ref.Size, mime, false)
 		if err != nil {
 			return Descriptor{}, false, fmt.Errorf("import media: replace: %w", err)
 		}
@@ -512,7 +764,7 @@ func (s *Service) Import(ctx context.Context, command ImportCommand) (Descriptor
 			descriptor, err := s.descriptorForRow(row)
 			return descriptor, false, err
 		}
-	} else if err := s.attachments.MarkDownloaded(ctx, row.MessageID, row.Ordinal, ref.Hash, ref.Size, mime); err != nil {
+	} else if err := s.attachments.MarkDownloaded(ctx, row.MessageID, row.Ordinal, ref.Hash, ref.Size, mime, false); err != nil {
 		return Descriptor{}, false, fmt.Errorf("import media: mark downloaded: %w", err)
 	}
 	// A concurrent download may have won MarkDownloaded with other bytes; the
