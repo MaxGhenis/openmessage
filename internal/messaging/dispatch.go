@@ -113,8 +113,8 @@ func nextPassBackoff(previous, shortest, longest time.Duration) time.Duration {
 //
 // A due intent whose lease fails on its own row does not hold the others:
 // LeaseDueBatch sets it aside and leases the rows after it, and DispatchDue
-// records it (DispatchHealth and the OnLeaseFailure hook). A row that could not
-// be set aside either is still due, so DispatchDue sends the rest and then
+// records it (DispatchHealth and the OnLeaseFailure hook). A row the store
+// could not set aside either stays due, so DispatchDue sends the rest and then
 // returns an error naming it, and Run backs off before it meets that row again.
 func (s *MessageService) DispatchDue(ctx context.Context, limit int) (int, error) {
 	if ctx == nil {
@@ -184,7 +184,7 @@ func (s *MessageService) DispatchDue(ctx context.Context, limit int) (int, error
 }
 
 // recordFailedLeases records each due row whose lease failed on its own row
-// and returns an error naming the rows that could not be set aside either.
+// and returns an error naming the rows the store could not set aside either.
 func (s *MessageService) recordFailedLeases(failed []sqlite.LeaseFailure) error {
 	if len(failed) == 0 {
 		return nil

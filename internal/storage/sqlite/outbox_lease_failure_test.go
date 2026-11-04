@@ -27,7 +27,7 @@ func leaseFailureTrigger(outboxID string) string {
 // A row whose lease always fails must not hold back the rows due after it.
 // LeaseDue leased its batch in one transaction and the first failed lease
 // rolled the whole batch back, so the next call met the same row first again
-// and nothing behind it was ever leased.
+// and never leased anything behind it.
 func TestLeaseDueLeasesPastARowWhoseLeaseFails(t *testing.T) {
 	ctx := context.Background()
 	clock := newOutboxTestClock(outboxTestTimeMS)
@@ -116,8 +116,9 @@ func TestLeaseDueBatchBacksOffARowWhoseLeaseKeepsFailing(t *testing.T) {
 		t.Fatalf("delays after each failed lease = %v, want %v", delays, want)
 	}
 
-	// The row is set aside until 5 minutes from now. A manual retry makes it
-	// due at once, and its next failed lease waits the first delay again.
+	// The set-aside holds the row until 5 minutes from now. A manual retry
+	// makes it due at once, and its next failed lease waits the first delay
+	// again.
 	clock.Set(clock.Now().Add(-4 * time.Minute).UnixMilli())
 	if err := repository.RetryNotDispatched(ctx, "outbox-head"); err != nil {
 		t.Fatalf("RetryNotDispatched(): %v", err)
@@ -212,13 +213,13 @@ func TestLeaseDueBatchLeasesPastRowsThatCanBeNeitherLeasedNorSetAside(t *testing
 	assertStuckFailures(t, again, stuck, "injected write failure")
 }
 
-// A call meets each row that can be neither leased nor set aside once, and
-// pays for it with a few writes, not with a select over the whole due set.
-// When each select looked past every row the call had tried, every such row
-// cost a select of its own: 6,000 of them between the 31st and 32nd healthy
-// rows kept the call running for tens of seconds, near or past the
-// dispatcher's 30 s lease, with the store's write lock held throughout. The
-// test measures the call against the writes it cannot avoid, one failed UPDATE
+// A call meets each row it can neither lease nor set aside once, and pays for
+// it with a few writes, not with a select over the whole due set. A call that
+// selected again for each refill, leaving out every row it had tried, would
+// pay a select for each such row: 6,000 of them between the 31st and 32nd
+// healthy rows kept such a call running for tens of seconds, near or past the
+// dispatcher's 30 s lease, while it held the store's write lock. The test
+// measures the call against the writes it cannot avoid, one failed UPDATE
 // per stuck row, so the bound holds on a fast machine and under the race
 // detector alike.
 func TestLeaseDueBatchCostsAFewWritesPerStuckRow(t *testing.T) {
@@ -313,8 +314,8 @@ func timeFailedWrites(t *testing.T, store *Store, count int) time.Duration {
 // so the row retries sooner, never later. The set-aside reads a row's previous
 // delay as its next_attempt_at_ms less its updated_at_ms, and updated_at_ms
 // never moves back. Here the first failure comes 1 s behind the row's last
-// write, so the second delay is 8 s, not 10 s; the clock has caught up by
-// then, and the third doubles exactly.
+// write, so the second delay comes to 8 s, not 10 s; the clock has caught up
+// by then, and the third delay doubles the second.
 func TestLeaseDueBatchShortensTheDelayAfterTheClockStepsBack(t *testing.T) {
 	ctx := context.Background()
 	clock := newOutboxTestClock(outboxTestTimeMS)
@@ -351,9 +352,10 @@ func TestLeaseDueBatchShortensTheDelayAfterTheClockStepsBack(t *testing.T) {
 	}
 }
 
-// A row whose writes a real CHECK refuses is handled like one a trigger
-// refuses. This row's updated_at_ms is below its created_at_ms, which the
-// CHECK forbids, so every write to it fails until something repairs it.
+// LeaseDueBatch handles a row whose writes a real CHECK refuses like one whose
+// writes a trigger refuses. This row's updated_at_ms trails its
+// created_at_ms, which the CHECK forbids, so every write to it fails until
+// something repairs it.
 func TestLeaseDueBatchLeasesPastARowThatBreaksACheckOnEveryWrite(t *testing.T) {
 	ctx := context.Background()
 	clock := newOutboxTestClock(outboxTestTimeMS)
@@ -389,8 +391,9 @@ func TestLeaseDueBatchLeasesPastARowThatBreaksACheckOnEveryWrite(t *testing.T) {
 }
 
 // A trigger that skips a row's lease (RAISE(IGNORE)) changes nothing, so the
-// lease UPDATE affects no row. That is the row's failure too: the row is set
-// aside, or left as it was when its set-aside is skipped as well.
+// lease UPDATE affects no row. That failure belongs to the row too: the call
+// sets the row aside, or leaves it as it was when a trigger skips its
+// set-aside as well.
 func TestLeaseDueBatchLeasesPastARowWhoseWritesATriggerSkips(t *testing.T) {
 	for _, test := range []struct {
 		name, when string
@@ -442,8 +445,8 @@ func TestLeaseDueBatchLeasesPastARowWhoseWritesATriggerSkips(t *testing.T) {
 	}
 }
 
-// A leased row whose stored values do not read back is the row's failure: the
-// call undoes the lease and sets the row aside. Here a schema edit lets a NOT
+// A leased row whose stored values do not read back fails on itself: the call
+// undoes the lease and sets the row aside. Here a schema edit lets a NOT
 // NULL column hold a NULL that OutboxItem cannot scan. created_at_ms also keys
 // the call's pages, so a NULL there must neither fail the page select nor hide
 // the row from the page after it. All three rows come due at once, and a limit
@@ -626,8 +629,8 @@ func leasedOutboxIDs(batch LeaseBatch) []string {
 	return ids
 }
 
-// assertStuckFailures checks that batch reports exactly ids, in order, as rows
-// that could be neither leased nor set aside, both for cause.
+// assertStuckFailures checks that batch reports ids, in order and no others,
+// as rows the call could neither lease nor set aside, both for cause.
 func assertStuckFailures(t *testing.T, batch LeaseBatch, ids []string, cause string) {
 	t.Helper()
 	if len(batch.Failed) != len(ids) {

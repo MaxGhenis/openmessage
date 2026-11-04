@@ -139,8 +139,8 @@ func (f *resilienceFixture) confirmed(t *testing.T) {
 // One failed lease must not stop the dispatcher. On 2026-11-03 LeaseDue's
 // UPDATE failed a CHECK, Run returned the error, and no send left the outbox
 // until the app restarted. Here the trigger fails every write to the text
-// while it is due, so it can be neither leased nor set aside, and every pass
-// fails until the trigger is dropped.
+// while it is due, so the store can neither lease it nor set it aside, and
+// every pass fails until the test drops the trigger.
 func TestRunKeepsDispatchingAfterAFailedLease(t *testing.T) {
 	f := newResilienceFixture(t, "key-failed-lease", `
 		CREATE TRIGGER fail_lease
@@ -191,9 +191,9 @@ func TestRunKeepsDispatchingAfterAFailedLease(t *testing.T) {
 	}
 }
 
-// A text whose lease fails on its own row is set aside to retry, and the pass
-// that met it does not fail. Run sends it once its retry time comes and its
-// lease works.
+// The store sets aside a text whose lease fails on its own row, to retry,
+// and the pass that met it does not fail. Run sends it once its retry time
+// comes and its lease works.
 func TestRunSetsAsideARowWhoseLeaseFails(t *testing.T) {
 	f := newResilienceFixture(t, "key-set-aside", `
 		CREATE TRIGGER fail_lease

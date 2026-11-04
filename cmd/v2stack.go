@@ -395,10 +395,10 @@ func (s *v2Stack) Start(
 			Int64("retry_at_ms", pass.RetryAtMS).
 			Msg("V2 message dispatch pass failed; retrying")
 	})
-	// A due row whose lease fails on the row itself is set aside to retry and
-	// the rows behind it still send; the hook logs each such row (and
-	// /api/status v2_dispatch counts them). One that could not be set aside
-	// either also fails its pass, which the hook above logs.
+	// The store sets aside a due row whose lease fails on the row itself, to
+	// retry, and the rows behind it still send; the hook logs each such row
+	// (and /api/status v2_dispatch counts them). A row the store could not set
+	// aside either also fails its pass, which the hook above logs.
 	s.Service.OnLeaseFailure(func(lease messaging.FailedLease) {
 		if lease.SetAsideError != "" {
 			s.logger.Error().

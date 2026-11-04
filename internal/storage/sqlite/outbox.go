@@ -199,30 +199,32 @@ type Lease struct {
 // operation that failed.
 const LeaseFailedCode = "lease"
 
-// A row set aside after a failed lease is due again leaseRetryDelay later, the
-// dispatcher's default delay after its other pre-call failures. The delay doubles
-// while the row's leases keep failing, up to maxLeaseRetryDelay, so a row that
-// can never lease settles at one failed lease every five minutes. After the
-// clock steps back, the delay can restart lower (see setAsideOutboxRow).
+// A row the store sets aside after a failed lease comes due again
+// leaseRetryDelay later, the dispatcher's default delay after its other
+// pre-call failures. The delay doubles while the row's leases keep failing, up
+// to maxLeaseRetryDelay, so a row that can never lease settles at one failed
+// lease every five minutes. After the clock steps back, the delay can restart
+// lower (see setAsideOutboxRow).
 const (
 	leaseRetryDelay    = 5 * time.Second
 	maxLeaseRetryDelay = 5 * time.Minute
 )
 
-// LeaseFailure is a due row whose lease failed on the row itself.
+// LeaseFailure reports a due row whose lease failed on the row itself.
 type LeaseFailure struct {
 	OutboxID string
-	// Err is why the lease failed.
+	// Err says why the lease failed.
 	Err error
-	// RetryAt is when the row, now not_dispatched with LeaseFailedCode, is due
-	// again. It is zero when the row could not be set aside either.
+	// RetryAt gives the time the row, now not_dispatched with LeaseFailedCode,
+	// comes due again. It stays zero when the call could not set the row aside
+	// either.
 	RetryAt time.Time
-	// SetAsideErr is why the row could not be set aside. Such a row is left as
-	// it was, still due, and the next call meets it again.
+	// SetAsideErr says why the call could not set the row aside. The call
+	// leaves such a row as it was, still due, and the next call meets it again.
 	SetAsideErr error
 }
 
-// LeaseBatch is one LeaseDueBatch claim: the rows it leased and the due rows
+// LeaseBatch holds one LeaseDueBatch claim: the rows it leased and the due rows
 // whose lease failed, each in due order.
 type LeaseBatch struct {
 	Leases []Lease
@@ -1211,25 +1213,23 @@ func (r *OutboxRepository) LeaseDue(
 // rows, in due order. An uncertain row is structurally ineligible regardless of
 // its next-attempt value.
 //
-// Each row is leased under its own savepoint, so a lease that fails on the row
-// itself undoes only that row's writes and the rows after it still lease.
-// Before, the first such failure rolled back the whole batch, the next call met
-// the same row first again, and one row that could never lease held every send
-// queued behind it. A failure is the row's when SQLite refuses the write as a
-// constraint the row cannot meet (a CHECK, NOT NULL, STRICT type or trigger) or
-// a value of the wrong type or size, when a trigger skips the write, or when
-// the leased row's stored values do not read back. LeaseDueBatch then records
-// the error on the row and sets it aside: not_dispatched, error class
+// The call leases each row under its own savepoint, so a lease that fails on
+// the row itself undoes only that row's writes and the rows after it still
+// lease. A failure belongs to the row when SQLite refuses the write as a
+// constraint the row cannot meet (a CHECK, NOT NULL, STRICT type or trigger)
+// or a value of the wrong type or size, when a trigger skips the write, or
+// when the leased row's stored values do not read back. LeaseDueBatch then
+// records the error on the row and sets it aside: not_dispatched, error class
 // transient and code LeaseFailedCode, due again after leaseRetryDelay (see
-// setAsideOutboxRow). If that write fails too, the row is left as it was and
-// the call goes past it. Failed reports both.
+// setAsideOutboxRow). If that write fails too, the call leaves the row as it
+// was and goes past it. Failed reports both.
 //
-// A due row is queued or not_dispatched: its transport call never started, or
-// the transport proved the call sent nothing (MarkCalledNotDispatched).
-// Setting it aside keeps its transport_called_at_ms NULL and its
-// attempt_count, and touches no row outside the due set, so neither the
-// set-aside nor its retry calls the transport again for an intent that a call
-// may have sent.
+// A due row has state queued or not_dispatched: its transport call never
+// started, or the transport proved the call sent nothing
+// (MarkCalledNotDispatched). Setting it aside keeps its transport_called_at_ms
+// NULL and its attempt_count, and touches no row outside the due set, so
+// neither the set-aside nor its retry calls the transport again for an intent
+// that a call may have sent.
 //
 // The call meets each due row at most once, so rows it can neither lease nor
 // set aside cost it one lease and one set-aside apiece, however many of them
@@ -1313,7 +1313,7 @@ func (r *OutboxRepository) LeaseDueBatch(
 // maxDueOutboxPage bounds how many due rows LeaseDueBatch reads in one select.
 const maxDueOutboxPage = 4096
 
-// dueOutboxRow is a due row and its place in due order.
+// dueOutboxRow holds a due row's id and its place in due order.
 type dueOutboxRow struct {
 	outboxID    string
 	dueAtMS     int64
@@ -1370,9 +1370,9 @@ func selectDueOutboxPage(
 }
 
 // leaseCandidate leases one due row under its own savepoint. A lease that
-// fails on the row (isRowLeaseFailure) comes back as a LeaseFailure, after the
-// row has been set aside when that write works. Any other error fails the
-// caller's whole transaction.
+// fails on the row (isRowLeaseFailure) comes back as a LeaseFailure, after
+// leaseCandidate sets the row aside when that write works. Any other error
+// fails the caller's whole transaction.
 func leaseCandidate(
 	ctx context.Context,
 	tx *sql.Tx,
@@ -1390,7 +1390,7 @@ func leaseCandidate(
 	if leaseErr != nil {
 		// ROLLBACK TO keeps the savepoint open, so the set-aside runs under it
 		// too. A trigger's RAISE(ROLLBACK) ends the whole transaction instead;
-		// then no savepoint is left, and this fails the call.
+		// then no savepoint remains, and this fails the call.
 		if err := rollbackToLeaseCandidate(ctx, tx); err != nil {
 			return Lease{}, nil, errors.Join(leaseErr, err)
 		}
@@ -1480,8 +1480,8 @@ var errOutboxRowUnreadable = errors.New("stored values do not read back")
 var errOutboxRowUnchanged = errors.New("the update changed no row")
 
 // readLeasedOutboxRow reads back the row leaseOutboxRow just leased. The
-// query and the scan run as separate steps so a value that does not scan
-// (errOutboxRowUnreadable) is told apart from a query the store failed.
+// query and the scan run as separate steps, so the caller can tell a value
+// that does not scan (errOutboxRowUnreadable) from a query the store failed.
 func readLeasedOutboxRow(ctx context.Context, tx *sql.Tx, id string) (OutboxItem, error) {
 	rows, err := tx.QueryContext(ctx, `
 		SELECT `+outboxColumns+`
@@ -1517,17 +1517,17 @@ func readLeasedOutboxRow(ctx context.Context, tx *sql.Tx, id string) (OutboxItem
 // next_attempt_at_ms to now and updated_at_ms no lower, so the delay starts
 // over. SQLite evaluates every SET expression against the row as it was.
 //
-// The previous delay is read back as the row's next_attempt_at_ms less its
-// updated_at_ms, both written by the set-aside that recorded it. That is
-// exact while the clock runs forward and nothing else writes the row. A
-// set-aside that ran with the clock behind the row's updated_at_ms, which
-// never moves back, left a smaller difference, and so does a later write
-// that moves only updated_at_ms (retargetMessageIntents). Then the next delay
-// is less than double, never under leaseRetryDelay: the row retries sooner,
-// never later, and always within maxLeaseRetryDelay of the failure. Counting
-// the retry from updated_at_ms instead would keep the doubling exact, but
-// after a clock step it would hold a row whose lease works again until the
-// clock caught up.
+// The store reads the previous delay back as the row's next_attempt_at_ms
+// less its updated_at_ms; the set-aside that recorded the delay wrote both.
+// That difference matches the delay while the clock runs forward and nothing
+// else writes the row. A set-aside that ran with the clock behind the row's
+// updated_at_ms, which never moves back, left a smaller difference, and so
+// does a later write that moves only updated_at_ms (retargetMessageIntents).
+// Then the next delay comes out less than double, never under
+// leaseRetryDelay: the row retries sooner, never later, and always within
+// maxLeaseRetryDelay of the failure. Counting the retry from updated_at_ms
+// instead would keep the doubling exact, but after a clock step it would hold
+// a row whose lease works again until the clock caught up.
 func setAsideOutboxRow(
 	ctx context.Context,
 	tx *sql.Tx,

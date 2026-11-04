@@ -268,19 +268,19 @@ in a trigger, or when the leased row's values don't read back. What you see:
   pass itself succeeds, so `failed_passes` stays where it was.
 - The backend logs `V2 outbox item could not be leased; set aside to retry`
   (a zerolog warning, with `outbox_id`, `error` and `retry_at_ms`).
-- When the set-aside write fails too, the row stays exactly as it was, still
-  due. `last_failed_lease` then carries `set_aside_error` and no
-  `retry_at_ms`, and the backend logs `V2 outbox item can be neither leased
-  nor set aside; sending the rest` (an error). A pass meets each such row
-  once, however many come first, and leases the rows after them. It sends
-  every other due row and then fails, so `failed_passes` climbs and `Run`
-  backs off, 1 s doubling to 30 s, before it meets the row again.
-- A row whose stored values don't read back (a NULL where the schema says
-  NOT NULL, say) is set aside the same way, and the rows behind it still
-  send. But every read of that row fails while it exists: `GET /api/v1/outbox`
-  answers 500, so the tray can't load, and retry and cancel fail on the row
-  too. `last_failed_lease` and the log line still name it. Only a repair of
-  the row in the store clears it.
+- When the set-aside write fails too, the row stays as it was, still due.
+  `last_failed_lease` then carries `set_aside_error` and no `retry_at_ms`,
+  and the backend logs `V2 outbox item can be neither leased nor set aside;
+  sending the rest` (an error). A pass meets each such row once, however
+  many come first, and leases the rows after them. It sends every other due
+  row and then fails, so `failed_passes` climbs and `Run` backs off, 1 s
+  doubling to 30 s, before it meets the row again.
+- When a row's stored values don't read back (a NULL where the schema says
+  NOT NULL, say), the store sets it aside the same way, and the rows behind
+  it still send. But every read of that row fails while it exists:
+  `GET /api/v1/outbox` answers 500, so the tray can't load, and retry and
+  cancel fail on the row too. `last_failed_lease` and the log line still
+  name it. Only a repair of the row in the store clears it.
 - A failure that belongs to the store, not the row (busy, locked, I/O,
   corruption, any other SQLite error), still fails the whole pass and leases
   nothing, as before.

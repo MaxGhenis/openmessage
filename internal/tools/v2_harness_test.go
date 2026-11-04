@@ -20,8 +20,8 @@ var v2HarnessDispatchFaults = []struct {
 	want          []string
 }{
 	{
-		// The lease fails on the row, so the row is set aside and the send
-		// returns as retrying; the harness fails the test for the lease.
+		// The lease fails on the row, so the store sets the row aside and the
+		// send returns as retrying; the harness fails the test for the lease.
 		name: "lease",
 		trigger: `
 			CREATE TRIGGER fail_lease

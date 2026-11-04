@@ -29,13 +29,13 @@ const (
 	// skippedLeaseRowFault skips the text's lease (RAISE(IGNORE)); its
 	// set-aside goes through.
 	skippedLeaseRowFault
-	// stuckRowFault fails every write to the text while it is due, so it can
-	// be neither leased nor set aside.
+	// stuckRowFault fails every write to the text while it is due, so the
+	// store can neither lease it nor set it aside.
 	stuckRowFault
 	// skippedStuckRowFault skips every write to the text while it is due.
 	skippedStuckRowFault
 	// settleRowFault fails Confirm and MarkStoreFailed after the text's
-	// transport call, so the call's outcome is lost.
+	// transport call, so the store loses the call's outcome.
 	settleRowFault
 	rowFaultCount
 )
@@ -67,10 +67,10 @@ var rowFaultTriggers = map[rowFault]struct{ event, action string }{
 
 const maxLeaseScriptTexts = 6
 
-// leaseScript is one generated history of texts queued over several passes,
-// with the dispatcher's batch limit. Before each pass the clock steps (back, a
-// little, or past several retry delays) and new texts may be queued; during
-// the pass each queued text's writes may fail.
+// leaseScript holds one generated history: the texts the test queues over
+// several passes, and the dispatcher's batch limit. Before each pass the clock
+// steps (back, a little, or past several retry delays) and the test may queue
+// new texts; during the pass, each queued text's writes may fail.
 type leaseScript struct {
 	Limit  int
 	Passes []leaseScriptPass
@@ -125,20 +125,20 @@ func (leaseScript) Generate(r *rand.Rand, _ int) reflect.Value {
 // several texts whose writes fail in any pass and in any of the ways a row's
 // write can fail, with batch limits mostly below the number of texts, that
 // each pass does what a model of it predicts. The model walks the due texts
-// in due order: a text whose lease fails is set aside, one that can be neither
-// leased nor set aside is left as it was, and every other text is leased, until
-// the batch limit is reached; the texts after that wait. Then it sends the
-// leased texts in order, until one loses its outcome. So:
+// in due order: the store sets aside a text whose lease fails, leaves as it
+// was a text it can neither lease nor set aside, and leases every other text,
+// until the batch fills; the texts after that wait. Then the dispatcher sends
+// the leased texts in order, until one loses its outcome. So:
 //
-//   - one row's lease failure never blocks other due rows: the first due texts
-//     whose writes work, up to the batch limit, are leased and sent, whatever
-//     fails on the texts before them;
-//   - a due text whose lease fails is set aside, never called, due again 5 s
-//     to 5 minutes later and never later than twice its last such delay; the
-//     model reckons the delay from what it remembers of the text's last
-//     set-aside, not from the row;
-//   - a due text that can be neither leased nor set aside is left exactly as
-//     it was, and fails its pass; nothing else fails a pass but a lost outcome;
+//   - one row's lease failure never blocks other due rows: the dispatcher
+//     leases and sends the first due texts whose writes work, up to the batch
+//     limit, whatever fails on the texts before them;
+//   - the store sets aside a due text whose lease fails, and the text comes
+//     due again 5 s to 5 minutes later, never later than twice its last such
+//     delay, with no transport call; the model reckons the delay from what it
+//     remembers of the text's last set-aside, not from the row;
+//   - a due text the store can neither lease nor set aside stays as it was,
+//     and fails its pass; nothing else fails a pass but a lost outcome;
 //   - no fix path calls the transport again for an intent a call may have
 //     sent: each text reaches the transport at most once, as these
 //     transports never prove a call sent nothing, and a called text never
@@ -146,8 +146,9 @@ func (leaseScript) Generate(r *rand.Rand, _ int) reflect.Value {
 //   - a text the pass does not reach changes only when its called lease
 //     expires and it becomes uncertain, and updated_at_ms never moves back or
 //     below created_at_ms;
-//   - once the faults stop and every retry comes due, each text is confirmed,
-//     or uncertain when its outcome was lost, after exactly one transport call.
+//   - once the faults stop and every retry comes due, each text ends
+//     confirmed, or uncertain when the store lost its outcome, after one
+//     transport call and no second.
 func TestLeaseFailuresNeverHoldOtherSends(t *testing.T) {
 	property := func(script leaseScript) bool {
 		if err := runLeaseScript(t, script); err != nil {
@@ -161,7 +162,7 @@ func TestLeaseFailuresNeverHoldOtherSends(t *testing.T) {
 	}
 }
 
-// leaseChain is what the model remembers of a text whose last write was a
+// leaseChain holds what the model remembers of a text whose last write was a
 // set-aside: the delay that set-aside gave it, and how far the clock then ran
 // behind the text's updated_at_ms.
 type leaseChain struct {
@@ -297,7 +298,7 @@ const (
 	setAsideLeaseOutcome
 	stuckLeaseOutcome
 	sentLeaseOutcome
-	// Leased and called, but its outcome was lost.
+	// Leased and called, but the store lost its outcome.
 	lostLeaseOutcome
 	// Leased after another text lost its outcome, and released uncalled.
 	releasedLeaseOutcome
@@ -305,7 +306,7 @@ const (
 
 // checkLeasePass checks one pass against the model in
 // TestLeaseFailuresNeverHoldOtherSends, and updates what the model remembers:
-// the texts whose outcome was lost, and each text's last set-aside.
+// the texts whose outcome the store lost, and each text's last set-aside.
 func checkLeasePass(
 	now time.Time,
 	limit int,
@@ -442,11 +443,11 @@ func checkLeasePass(
 	return nil
 }
 
-// modelLeaseRetryDelayMS is the delay the model expects a text's set-aside to
-// give it, from what the model remembers of the text's last set-aside: 5 s
-// with none, else twice the last delay, less twice how far the clock then ran
-// behind the text's updated_at_ms, at least 5 s and at most 5 minutes; 5 s
-// when nothing of the last delay is left.
+// modelLeaseRetryDelayMS returns the delay the model expects a text's
+// set-aside to give it, from what the model remembers of the text's last
+// set-aside: 5 s with none, else twice the last delay, less twice how far the
+// clock then ran behind the text's updated_at_ms, at least 5 s and at most 5
+// minutes; 5 s when nothing of the last delay remains.
 func modelLeaseRetryDelayMS(chain leaseChain, chained bool) int64 {
 	const first, longest = int64(5_000), int64(300_000)
 	if !chained || chain.delayMS <= chain.behindMS {

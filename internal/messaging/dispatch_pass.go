@@ -79,10 +79,10 @@ type FailedLease struct {
 	OutboxID string `json:"outbox_id"`
 	AtMS     int64  `json:"at_ms"`
 	Error    string `json:"error"`
-	// RetryAtMS is when the row, set aside as not_dispatched with error code
-	// lease, is due again. It is zero when the row could not be set aside
-	// either; SetAsideError then says why, the row is still due, and its pass
-	// failed after sending the rows behind it.
+	// RetryAtMS gives the time the row comes due again, after the store set it
+	// aside as not_dispatched with error code lease. It stays zero when the
+	// store could not set the row aside either; SetAsideError then says why,
+	// the row stays due, and its pass failed after sending the rows behind it.
 	RetryAtMS     int64  `json:"retry_at_ms,omitempty"`
 	SetAsideError string `json:"set_aside_error,omitempty"`
 }
@@ -129,9 +129,9 @@ func (l *dispatchLeaseFailures) report(health *DispatchHealth) {
 }
 
 // OnLeaseFailure sets fn to run on the dispatching goroutine for each due row
-// whose lease failed on the row itself, whether the row was set aside or left
-// due. The daemon logs through it. Dispatch waits for fn, so it must return
-// promptly. A nil fn removes the hook.
+// whose lease failed on the row itself, whether the store set the row aside
+// or left it due. The daemon logs through it. Dispatch waits for fn, so it
+// must return promptly. A nil fn removes the hook.
 func (s *MessageService) OnLeaseFailure(fn func(lease FailedLease)) {
 	s.leaseFailures.mu.Lock()
 	s.leaseFailures.onFailure = fn

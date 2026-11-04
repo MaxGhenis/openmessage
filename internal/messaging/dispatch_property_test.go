@@ -24,8 +24,8 @@ type dispatchFault int
 
 const (
 	noDispatchFault dispatchFault = iota
-	// leaseDispatchFault fails LeaseDueBatch's lease UPDATE, so the row is set
-	// aside to retry.
+	// leaseDispatchFault fails LeaseDueBatch's lease UPDATE, so the store sets
+	// the row aside to retry.
 	leaseDispatchFault
 	// markCalledDispatchFault fails MarkTransportCalled, before the call.
 	markCalledDispatchFault
@@ -518,8 +518,8 @@ func setAsideAfterLeaseFailure(item sqlite.OutboxItem, now time.Time) bool {
 		item.TransportCalledAtMS == nil && item.LeaseToken == nil
 }
 
-// settleTime is the later of earliest and the time every row in items is due
-// again.
+// settleTime returns the later of earliest and the time every row in items
+// comes due again.
 func settleTime(earliest time.Time, items ...sqlite.OutboxItem) time.Time {
 	for _, item := range items {
 		if item.NextAttemptAtMS != nil && time.UnixMilli(*item.NextAttemptAtMS).After(earliest) {
