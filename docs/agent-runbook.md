@@ -994,8 +994,8 @@ running app:
   (`2025550123@vtext.com`), a Signal UUID, a WhatsApp LID or group JID, a
   Google Chat `users/...` ID, a `legacy-participant:` placeholder, a `tel:`
   URI, a number with an extension, or a name. A live store held Signal UUIDs
-  whose hex holds 7 to 15 digits, and email addresses, as participant numbers,
-  and the old digits-only rule could put either on someone's line.
+  whose hex holds 7 to 15 digits as participant numbers, and the old
+  digits-only rule could put one on someone's line.
   `send_message` follows the same rule. Its SMS lookup takes a number's own
   thread over a newer gateway thread whose address holds the digits, and its
   recipient check takes a name followed by digits, in any script (`Мама

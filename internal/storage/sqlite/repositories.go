@@ -867,7 +867,7 @@ func (s *Store) SearchConversationsByName(query string, limit int) ([]Conversati
 // line is its identity's canonical value, as reads show it, and the
 // account's owner (the self identity) is on no line. A canonical value
 // counts only where it reads as a phone number or a WhatsApp JID of one, so
-// an email address, a Signal UUID, a LID or a username that holds the line's
+// an email address, a Signal UUID, a LID or a user path that holds the line's
 // digits names no one; a number then matches as send_message matches a
 // recipient, through phoneline. The match runs before the LIMIT, so numbers
 // that only contain the line's digits never crowd out one that ends with
