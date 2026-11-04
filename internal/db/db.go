@@ -18,11 +18,10 @@ type Store struct {
 	// such as a search index query that fails. The zero value logs nothing.
 	logger zerolog.Logger
 
-	// The message count the search router last read, and when (see
-	// searchedMessageCount).
-	messageCountMu     sync.Mutex
-	messageCount       int
-	messageCountReadAt time.Time
+	// The counts the search router last read, and when (see searchedCounts).
+	countsMu     sync.Mutex
+	counts       searchCounts
+	countsReadAt time.Time
 }
 
 // SetLogger sets where the store reports errors it recovers from. Call it

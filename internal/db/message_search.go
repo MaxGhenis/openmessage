@@ -47,18 +47,37 @@ func (s *Store) SearchMessagesFiltered(query string, f SearchFilter) ([]*Message
 // scanned row about 0.45 µs.
 const searchIndexCandidateCost = 16
 
-// messageCountTTL is how long the search router trusts a message count. It
-// needs only the count's rough size, and counting 80,000 messages takes about
-// 3 ms.
-const messageCountTTL = 10 * time.Minute
+// searchIndexTrigramCost is about how many rows a LIKE scan reads in the time
+// the index path spends on one trigram of the query, however few candidates it
+// yields: FTS5 merges each trigram's postings, once in the probe and again in
+// the answer. On 80,000 messages the merges for "passport", 6 trigrams, take
+// about 1.4 ms, and those for 64 copies of it about 78 ms.
+const searchIndexTrigramCost = 200
+
+// searchCountsTTL is how long the search router trusts searchCounts. It needs
+// only the message count's rough size, and counting 80,000 messages takes
+// about 1 ms.
+const searchCountsTTL = 10 * time.Minute
+
+// searchCounts is what the search router knows about the whole store.
+type searchCounts struct {
+	messages int
+	// indexInSync reports whether the index holds one entry per message, as
+	// every write path keeps it and as New makes it. A count that differs
+	// means some writer, such as an older build, changed messages without
+	// the index since this store opened.
+	indexInSync bool
+}
 
 // searchIndexPays reports whether the index answers query under f faster than
-// a LIKE scan. The scan reads messages newest first and stops at f.Limit
-// matches. When n of the store's N messages match, spread over time, it reads
-// about Limit·N/n rows, and never more than the F rows that f keeps. The index
-// path reads all n candidates, whatever the limit. So the index pays when
+// a LIKE scan, counting both costs in rows the scan reads. The scan reads
+// messages newest first and stops at f.Limit matches. When n of the store's N
+// messages match, spread over time, it reads about Limit·N/n rows (all N when
+// n is at most Limit), and never more than the F rows that f keeps. The index
+// path merges the postings of the query's t trigrams and then reads all n
+// candidates, whatever the limit. So the index pays when
 //
-//	searchIndexCandidateCost·n < min(F, Limit·N/n)
+//	searchIndexTrigramCost·t + searchIndexCandidateCost·n < min(N, Limit·N/n, F)
 //
 // A common word is the case the index loses: on 80,000 messages, the 50
 // newest of 36,000 that contain "the" take the scan 0.2 ms and the index
@@ -67,17 +86,37 @@ const messageCountTTL = 10 * time.Minute
 //
 // The probe counts the index rows the LIKE pattern selects (searchIndexMatch)
 // and stops one past the most candidates for which the index can still pay.
-// It never decides a result, only which path finds it.
+// It never decides a result, only which path finds it. A query goes to the
+// scan without a probe when the index can't look it up, when it has more than
+// searchIndexMaxPhrases phrases, when its pattern is longer than LIKE accepts,
+// and while the index is out of step with messages, which would make the index
+// path miss a message the scan finds. It also skips the probe when the store,
+// or the filter, keeps no more than twice as many messages as the merges cost:
+// the probe pays for one of the two merges, so a probe that sends the search
+// to the scan costs at most about a quarter of scanning them all.
 func (s *Store) searchIndexPays(query string, f SearchFilter) (bool, error) {
-	match := searchIndexMatch(query)
-	if match == "" {
+	match, phrases, trigrams := searchIndexMatch(query)
+	if phrases == 0 || phrases > searchIndexMaxPhrases || len(searchLikePattern(query)) > likePatternMaxBytes {
 		return false, nil
 	}
-	total, err := s.searchedMessageCount()
+	counts, err := s.searchedCounts()
 	if err != nil {
 		return false, err
 	}
-	// cost·n < Limit·N/n
+	total, mergeCost := counts.messages, searchIndexTrigramCost*trigrams
+	if !counts.indexInSync || total <= 2*mergeCost {
+		return false, nil
+	}
+	// Most conversations and senders hold few messages, so a filter is
+	// counted before the probe.
+	conditions, _ := searchFilterConditions(f, "")
+	filtered := len(conditions) > 0
+	if filtered {
+		if kept, err := s.countSearchFilterKeeps(f, 2*mergeCost); err != nil || kept <= 2*mergeCost {
+			return false, err
+		}
+	}
+	// candidate cost·n < Limit·N/n
 	most := int(math.Sqrt(float64(f.Limit) * float64(total) / searchIndexCandidateCost))
 	var candidates int
 	if err := s.db.QueryRow(
@@ -89,57 +128,89 @@ func (s *Store) searchIndexPays(query string, f SearchFilter) (bool, error) {
 	if candidates > most {
 		return false, nil
 	}
-	// cost·n < F
-	budget := searchIndexCandidateCost * candidates
-	conditions, args := searchFilterConditions(f, "")
-	if len(conditions) == 0 {
-		return budget < total, nil
+	indexCost := mergeCost + searchIndexCandidateCost*candidates
+	scanCost := total
+	if candidates > f.Limit {
+		scanCost = f.Limit * total / candidates
 	}
+	if indexCost >= scanCost {
+		return false, nil
+	}
+	if !filtered {
+		return true, nil
+	}
+	// index cost < F
+	kept, err := s.countSearchFilterKeeps(f, indexCost)
+	return kept > indexCost, err
+}
+
+// countSearchFilterKeeps counts the messages f keeps, stopping one past most.
+func (s *Store) countSearchFilterKeeps(f SearchFilter, most int) (int, error) {
+	conditions, args := searchFilterConditions(f, "")
 	var kept int
 	if err := s.db.QueryRow(
 		`SELECT count(*) FROM (SELECT 1 FROM messages WHERE `+strings.Join(conditions, " AND ")+` LIMIT ?)`,
-		append(args, budget+1)...,
+		append(args, most+1)...,
 	).Scan(&kept); err != nil {
-		return false, fmt.Errorf("count messages the search filter keeps: %w", err)
+		return 0, fmt.Errorf("count messages the search filter keeps: %w", err)
 	}
-	return kept > budget, nil
+	return kept, nil
 }
 
-// searchedMessageCount returns the number of messages, counted at most
-// messageCountTTL ago.
-func (s *Store) searchedMessageCount() (int, error) {
-	s.messageCountMu.Lock()
-	defer s.messageCountMu.Unlock()
-	if !s.messageCountReadAt.IsZero() && time.Since(s.messageCountReadAt) < messageCountTTL {
-		return s.messageCount, nil
+// searchedCounts returns the store's searchCounts, read at most
+// searchCountsTTL ago. FTS5 keeps one messages_fts_docsize row per index
+// entry, and counting those takes 0.05 ms on 80,000 messages, where counting
+// messages_fts reads every entry and takes 45 ms.
+func (s *Store) searchedCounts() (searchCounts, error) {
+	s.countsMu.Lock()
+	defer s.countsMu.Unlock()
+	if !s.countsReadAt.IsZero() && time.Since(s.countsReadAt) < searchCountsTTL {
+		return s.counts, nil
 	}
-	var n int
-	if err := s.db.QueryRow(`SELECT count(*) FROM messages`).Scan(&n); err != nil {
-		return 0, fmt.Errorf("count messages: %w", err)
+	var messages, entries int
+	if err := s.db.QueryRow(
+		`SELECT (SELECT count(*) FROM messages), (SELECT count(*) FROM messages_fts_docsize)`,
+	).Scan(&messages, &entries); err != nil {
+		return searchCounts{}, fmt.Errorf("count messages and search index entries: %w", err)
 	}
-	s.messageCount, s.messageCountReadAt = n, time.Now()
-	return n, nil
+	s.counts = searchCounts{messages: messages, indexInSync: entries == messages}
+	s.countsReadAt = time.Now()
+	return s.counts, nil
 }
+
+// likePatternMaxBytes is the longest pattern SQLite's LIKE accepts
+// (SQLITE_MAX_LIKE_PATTERN_LENGTH). LIKE fails a longer one with "LIKE or
+// GLOB pattern too complex", but only when it compares a row, so an index
+// that finds no candidate would return no rows where the scan fails.
+const likePatternMaxBytes = 50_000
+
+// searchIndexMaxPhrases is the most phrases the router lets FTS5 AND. FTS5
+// parses an AND of n phrases in about n² time, which no count sees: on 80,000
+// messages the index path takes about 1 s for a query of 1,000 runs between
+// wildcards, and the scan 70 ms.
+const searchIndexMaxPhrases = 64
 
 // searchIndexMatch returns the FTS5 query that selects the index rows FTS5
-// reads for `body LIKE '%' || query || '%'`. It builds the query as FTS5
-// builds it for that LIKE (sqlite3Fts5ExprPattern): each run of 3 or more
-// characters between the wildcards % and _ becomes a phrase, its double
-// quotes doubled, and the phrases are ANDed. Inside a phrase every other
-// character is literal, FTS5 syntax such as *, ^, : and NEAR included. A
-// pattern with no run that long gives "": the trigram index can't narrow it.
-// SQLite reads a text argument up to its first NUL, so the runs stop there.
-func searchIndexMatch(query string) string {
+// reads for `body LIKE '%' || query || '%'`, how many phrases it ANDs and how
+// many trigrams they hold. It builds the query as FTS5 builds it for that LIKE
+// (sqlite3Fts5ExprPattern): each run of 3 or more characters between the
+// wildcards % and _ becomes a phrase, its double quotes doubled, and the
+// phrases are ANDed. Inside a phrase every other character is literal, FTS5
+// syntax such as *, ^, : and NEAR included. A pattern with no run that long
+// gives no phrase: the trigram index can't narrow it. SQLite reads a text
+// argument up to its first NUL, so the runs stop there.
+func searchIndexMatch(query string) (match string, phrases, trigrams int) {
 	if nul := strings.IndexByte(query, 0); nul >= 0 {
 		query = query[:nul]
 	}
-	var phrases []string
+	var quoted []string
 	for _, run := range strings.FieldsFunc(query, func(r rune) bool { return r == '%' || r == '_' }) {
-		if fts5CharCount(run) >= 3 {
-			phrases = append(phrases, `"`+strings.ReplaceAll(run, `"`, `""`)+`"`)
+		if n := fts5CharCount(run); n >= 3 {
+			quoted = append(quoted, `"`+strings.ReplaceAll(run, `"`, `""`)+`"`)
+			trigrams += n - 2
 		}
 	}
-	return strings.Join(phrases, " ")
+	return strings.Join(quoted, " "), len(quoted), trigrams
 }
 
 // fts5CharCount counts characters as FTS5 does when it decides whether a run

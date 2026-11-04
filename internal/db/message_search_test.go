@@ -82,10 +82,13 @@ func (q searchCaseQuery) query() string {
 	return strings.Join(q.Atoms, "")
 }
 
-// searchCase is a store of messages and the searches to run on it.
+// searchCase is a store of messages and the searches to run on it. With
+// BigStore, the router believes the store holds a million messages, so it
+// takes the index for a rare query, as it would on a large store.
 type searchCase struct {
 	Messages []searchCaseMessage
 	Queries  []searchCaseQuery
+	BigStore bool
 }
 
 var (
@@ -120,7 +123,7 @@ func randomSearchFilter(r *rand.Rand) SearchFilter {
 }
 
 func (searchCase) Generate(r *rand.Rand, _ int) reflect.Value {
-	c := searchCase{Messages: make([]searchCaseMessage, r.Intn(25))}
+	c := searchCase{Messages: make([]searchCaseMessage, r.Intn(25)), BigStore: r.Intn(2) == 0}
 	for i := range c.Messages {
 		atoms := make([]string, r.Intn(11))
 		for j := range atoms {
@@ -200,7 +203,7 @@ func queryIDs(t testing.TB, s *Store, query string, args ...any) (map[string]boo
 }
 
 // emptyStore deletes every message and its index entry, and forgets the
-// message count the search router read.
+// counts the search router read.
 func emptyStore(t testing.TB, s *Store) {
 	t.Helper()
 	tx, err := s.db.Begin()
@@ -214,7 +217,7 @@ func emptyStore(t testing.TB, s *Store) {
 	if err := tx.Commit(); err != nil {
 		t.Fatalf("Commit(): %v", err)
 	}
-	s.messageCountReadAt = time.Time{}
+	s.countsReadAt = time.Time{}
 }
 
 // The index path, the router and the LIKE scan return the same messages in
@@ -242,6 +245,10 @@ func TestSearchPathsAgreeWithLikeOverRandomStores(t *testing.T) {
 			if err := store.UpsertMessage(msg); err != nil {
 				t.Fatalf("UpsertMessage(%q): %v", msg.Body, err)
 			}
+		}
+		if c.BigStore {
+			store.counts = searchCounts{messages: 1_000_000, indexInSync: true}
+			store.countsReadAt = time.Now()
 		}
 		for _, sq := range c.Queries {
 			query, f := sq.query(), normalizedSearchFilter(sq.Filter)
@@ -276,7 +283,7 @@ func TestSearchPathsAgreeWithLikeOverRandomStores(t *testing.T) {
 			if err != nil {
 				t.Fatalf("LIKE %q: %v", query, err)
 			}
-			if match := searchIndexMatch(query); match != "" {
+			if match, _, _ := searchIndexMatch(query); match != "" {
 				candidates, err := queryIDs(t, store, `SELECT message_id FROM messages_fts WHERE messages_fts MATCH ?`, match)
 				if err != nil {
 					t.Logf("query %q: probe %q: %v", query, match, err)
@@ -467,8 +474,17 @@ func TestSearchIndexMatchBuildsFTS5sPhrases(t *testing.T) {
 		"\x80\x80ab":             "",                           // a continuation byte starts no character
 		"\xe6\x97\xa5\x80\x80ab": "\"\xe6\x97\xa5\x80\x80ab\"", // 日, a, b
 	} {
-		if got := searchIndexMatch(query); got != want {
+		if got, _, _ := searchIndexMatch(query); got != want {
 			t.Errorf("searchIndexMatch(%q) = %q, want %q", query, got, want)
+		}
+	}
+	for query, want := range map[string][2]int{ // phrases, trigrams
+		"": {0, 0}, "ab": {0, 0}, "abc": {1, 1}, "abcdef": {1, 4}, `"""`: {1, 1}, "日本語": {1, 1},
+		"abc%def": {2, 2}, "ab%cde_fg": {1, 1}, "ab\x00cde": {0, 0}, "abcd\x00ef": {1, 2},
+		strings.Repeat("abc%", 70): {70, 70},
+	} {
+		if _, phrases, trigrams := searchIndexMatch(query); phrases != want[0] || trigrams != want[1] {
+			t.Errorf("searchIndexMatch(%q) counts %d phrases of %d trigrams, want %d of %d", query, phrases, trigrams, want[0], want[1])
 		}
 	}
 }
@@ -521,10 +537,55 @@ func routeStore(t *testing.T) *Store {
 	return store
 }
 
+// The router scans a store of too few messages for the index to pay, and a store
+// whose index holds a different number of entries than it has messages,
+// since the index path misses a message without an entry.
+func TestSearchScansSmallStoresAndAnIndexOutOfStep(t *testing.T) {
+	t.Run("small store", func(t *testing.T) {
+		// "zebra" holds 3 trigrams; scanning this many messages costs about
+		// twice as much as merging their postings.
+		n := 2 * 3 * searchIndexTrigramCost
+		store := newTestStore(t)
+		for i := 0; i < n; i++ {
+			if err := store.UpsertMessage(&Message{MessageID: fmt.Sprintf("m%04d", i), ConversationID: "c1", Body: fmt.Sprintf("filler %d", i), TimestampMS: int64(i)}); err != nil {
+				t.Fatalf("seed: %v", err)
+			}
+		}
+		if pays, err := store.searchIndexPays("zebra", normalizedSearchFilter(SearchFilter{})); err != nil || pays {
+			t.Errorf("searchIndexPays on %d messages = %v, %v; want the scan", n, pays, err)
+		}
+	})
+	t.Run("index out of step", func(t *testing.T) {
+		store := routeStore(t)
+		// What a build that doesn't keep the index in step can write.
+		if _, err := store.db.Exec(`INSERT INTO messages (message_id, conversation_id, body, timestamp_ms) VALUES ('unindexed', 'c1', 'a zebra the index never saw', 5000)`); err != nil {
+			t.Fatalf("insert a message without an index entry: %v", err)
+		}
+		f := normalizedSearchFilter(SearchFilter{})
+		indexed, err := store.searchMessagesIndexed("zebra", f)
+		if err != nil {
+			t.Fatalf("searchMessagesIndexed(): %v", err)
+		}
+		if want := []string{"m3999", "m1000", "m0001"}; !reflect.DeepEqual(messageIDs(indexed), want) {
+			t.Fatalf("searchMessagesIndexed() = %q, want %q, without the unindexed message", messageIDs(indexed), want)
+		}
+		if pays, err := store.searchIndexPays("zebra", f); err != nil || pays {
+			t.Errorf("searchIndexPays() = %v, %v; want the scan", pays, err)
+		}
+		got, err := store.SearchMessagesFiltered("zebra", SearchFilter{})
+		if err != nil {
+			t.Fatalf("SearchMessagesFiltered(): %v", err)
+		}
+		if want := []string{"unindexed", "m3999", "m1000", "m0001"}; !reflect.DeepEqual(messageIDs(got), want) {
+			t.Errorf("SearchMessagesFiltered() = %q, want %q", messageIDs(got), want)
+		}
+	})
+}
+
 // The router takes the index for a rare word and the scan for a common one,
 // a query too short to look up, and a filter that keeps fewer messages than
-// the index path would spend on its candidates. Every search returns LIKE's
-// rows.
+// the index path would spend on its merges and candidates. Every search
+// returns LIKE's rows.
 func TestSearchRoutesByCost(t *testing.T) {
 	store := routeStore(t)
 	for _, tc := range []struct {
@@ -542,7 +603,8 @@ func TestSearchRoutesByCost(t *testing.T) {
 		{"text", SearchFilter{ConversationID: "tiny"}, false, 5},
 		{"ze", SearchFilter{}, false, 3},
 		{"number 3999", SearchFilter{}, true, 1},
-		{"no such words", SearchFilter{}, true, 0},
+		{"quagga", SearchFilter{}, true, 0},
+		{"no such words", SearchFilter{}, false, 0}, // 11 trigrams cost more than half a scan
 	} {
 		f := normalizedSearchFilter(tc.f)
 		pays, err := store.searchIndexPays(tc.query, f)
@@ -562,6 +624,60 @@ func TestSearchRoutesByCost(t *testing.T) {
 		}
 		if !reflect.DeepEqual(got, like) || len(got) != tc.want {
 			t.Errorf("SearchMessagesFiltered(%q, %+v) = %q, want LIKE's %d: %q", tc.query, tc.f, messageIDs(got), tc.want, messageIDs(like))
+		}
+	}
+}
+
+// The router scans a query of more phrases than it lets FTS5 AND, even on a
+// store large enough for their merges to pay.
+func TestSearchCapsThePhrasesFTS5ANDs(t *testing.T) {
+	store := routeStore(t)
+	store.counts = searchCounts{messages: 1_000_000_000, indexInSync: true}
+	store.countsReadAt = time.Now()
+	for _, tc := range []struct {
+		phrases int
+		index   bool
+	}{
+		{searchIndexMaxPhrases, true},
+		{searchIndexMaxPhrases + 1, false},
+	} {
+		query := strings.Repeat("zebra%", tc.phrases)
+		f := normalizedSearchFilter(SearchFilter{})
+		if pays, err := store.searchIndexPays(query, f); err != nil || pays != tc.index {
+			t.Errorf("searchIndexPays(%d phrases) = %v, %v; want %v", tc.phrases, pays, err, tc.index)
+		}
+		got, err := store.SearchMessagesFiltered(query, SearchFilter{})
+		if err != nil {
+			t.Fatalf("SearchMessagesFiltered(%d phrases): %v", tc.phrases, err)
+		}
+		if len(got) != 0 {
+			t.Errorf("SearchMessagesFiltered(%d phrases) = %q, want none: no body holds zebra twice", tc.phrases, messageIDs(got))
+		}
+	}
+}
+
+// LIKE fails a pattern longer than likePatternMaxBytes only when it compares a
+// row, so the index path, which finds no candidate for this one, would return
+// no rows. The router sends it to the scan, and the search fails as the scan
+// does. One byte shorter, both answer.
+func TestSearchFailsAPatternTooLongForLikeAsTheScanDoes(t *testing.T) {
+	store := routeStore(t)
+	for _, tc := range []struct {
+		query string
+		fails bool
+	}{
+		{strings.Repeat("q", likePatternMaxBytes-1), true},
+		{strings.Repeat("q", likePatternMaxBytes-2), false},
+	} {
+		_, likeErr := store.searchMessagesLike(tc.query, normalizedSearchFilter(SearchFilter{}))
+		got, err := store.SearchMessagesFiltered(tc.query, SearchFilter{})
+		switch {
+		case (likeErr != nil) != tc.fails:
+			t.Errorf("%d-byte query: LIKE error %v, want failure %v", len(tc.query), likeErr, tc.fails)
+		case tc.fails && (err == nil || err.Error() != likeErr.Error()):
+			t.Errorf("%d-byte query: SearchMessagesFiltered error %v, want LIKE's %v", len(tc.query), err, likeErr)
+		case !tc.fails && (err != nil || len(got) != 0):
+			t.Errorf("%d-byte query: SearchMessagesFiltered = %d messages, %v; want none and no error", len(tc.query), len(got), err)
 		}
 	}
 }
@@ -619,4 +735,29 @@ func TestSearchIndexPathSkipsAMessageWithoutAnID(t *testing.T) {
 	if want := []string{"m3999", "m1000", "m0001"}; !reflect.DeepEqual(messageIDs(got), want) {
 		t.Errorf("searchMessagesIndexed(zebra) = %q, want %q", messageIDs(got), want)
 	}
+}
+
+// BenchmarkSearchPaths times each search path alone, and the probe that picks
+// between them, on BenchmarkSearchLargeStore's searches. The scan for a word
+// in no message reads all 80,000 messages, and the index path for a word in
+// 4,000 reads 4,000 candidates, so the two give searchIndexCandidateCost.
+func BenchmarkSearchPaths(b *testing.B) {
+	runSearchBenchmarks(b, func(b *testing.B, store *Store, query string, f SearchFilter) {
+		for _, path := range []struct {
+			name string
+			run  func() error
+		}{
+			{"scan", func() error { _, err := store.searchMessagesLike(query, f); return err }},
+			{"index", func() error { _, err := store.searchMessagesIndexed(query, f); return err }},
+			{"probe", func() error { _, err := store.searchIndexPays(query, f); return err }},
+		} {
+			b.Run(path.name, func(b *testing.B) {
+				for i := 0; i < b.N; i++ {
+					if err := path.run(); err != nil {
+						b.Fatal(err)
+					}
+				}
+			})
+		}
+	})
 }

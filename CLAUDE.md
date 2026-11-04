@@ -107,7 +107,12 @@ are legible without a second lookup, and accepts
 `--since`/`--until` (YYYY-MM-DD, local time; `--until` is inclusive to end of
 day) to scope a search to a date window. Date filtering lives in the store via
 `SearchFilter`/`SearchMessagesFiltered`; the legacy `SearchMessages(query,
-phone, limit)` wrapper is preserved for the MCP tool and HTTP API.
+phone, limit)` wrapper is preserved for the MCP tool and HTTP API. On the
+legacy store, `SearchMessagesFiltered` answers from the `messages_fts` trigram
+index when a capped count of the index's candidates says that costs less than
+a newest-first `LIKE` scan. Both paths return the same rows in the same order
+(`TestSearchPathsAgreeWithLikeOverRandomStores`). If the index fails, the
+store logs the error and scans. `%` and `_` in a query stay `LIKE` wildcards.
 
 ## Multi-platform import
 
