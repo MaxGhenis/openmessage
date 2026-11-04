@@ -13,14 +13,18 @@ import (
 	"github.com/maxghenis/openmessage/internal/db"
 )
 
-// testReclaimer has small thresholds, so a test store of a few megabytes
-// exercises several steps.
+// testReclaimStep is small, so even the smaller stores the race job builds
+// hold several steps of free pages.
+const testReclaimStep = 16 << 10
+
+// testReclaimer has small thresholds, so a test store exercises several
+// steps.
 func testReclaimer(store *db.Store, logs *bytes.Buffer) *legacyFreePageReclaimer {
 	r := newLegacyFreePageReclaimer(store, zerolog.New(logs))
-	r.minFree = 256 << 10
-	r.step = 64 << 10
+	r.minFree = 4 * testReclaimStep
+	r.step = testReclaimStep
 	r.pause = 0
-	r.warnFree = 256 << 10
+	r.warnFree = 4 * testReclaimStep
 	return r
 }
 
@@ -31,7 +35,7 @@ func newIncrementalStoreWithFreePages(t *testing.T) *db.Store {
 		t.Fatalf("db.New(): %v", err)
 	}
 	t.Cleanup(func() { store.Close() })
-	saveAndThinMessages(t, store, 400, 1500, 10)
+	saveAndThinMessages(t, store, thinnedStoreMessages(), 1500, 10)
 	return store
 }
 
@@ -42,7 +46,7 @@ func TestLegacyFreePageReclaimerReturnsEveryFreePageAndKeepsEveryRow(t *testing.
 	if err != nil {
 		t.Fatalf("StorageStats(): %v", err)
 	}
-	if before.AutoVacuum != db.AutoVacuumIncremental || before.FreeBytes() < 4*(64<<10) {
+	if before.AutoVacuum != db.AutoVacuumIncremental || before.FreeBytes() < 4*testReclaimStep {
 		t.Fatalf("setup: %+v, want an incremental store with several steps of free pages", before)
 	}
 	digest, err := store.ContentDigest(ctx)
@@ -107,6 +111,9 @@ func TestLegacyFreePageReclaimerSaysOnceToCompactAStoreWithoutAutoVacuum(t *test
 	}
 	var logs bytes.Buffer
 	r := testReclaimer(store, &logs)
+	if before.FreeBytes() < r.warnFree {
+		t.Fatalf("setup: %d free bytes, want at least the %d that draw the warning", before.FreeBytes(), r.warnFree)
+	}
 	for i := 0; i < 2; i++ {
 		if freed, err := r.pass(ctx); err != nil || freed != 0 {
 			t.Fatalf("pass %d = %d, %v; want nothing freed", i, freed, err)

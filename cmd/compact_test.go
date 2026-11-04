@@ -49,8 +49,18 @@ func buildBloatedLegacyStore(t *testing.T) (string, []string) {
 		t.Fatalf("db.New(): %v", err)
 	}
 	defer store.Close()
-	kept := saveAndThinMessages(t, store, 400, 1500, 10)
+	kept := saveAndThinMessages(t, store, thinnedStoreMessages(), 1500, 10)
 	return dataDir, kept
+}
+
+// thinnedStoreMessages is how many messages a test store saves before it
+// deletes nine in ten. The race job saves fewer: each save costs it far more
+// time, and these tests check data, not concurrency.
+func thinnedStoreMessages() int {
+	if raceDetectorEnabled {
+		return 80
+	}
+	return 400
 }
 
 // saveAndThinMessages saves count messages of about bodyBytes each and

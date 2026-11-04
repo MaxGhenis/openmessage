@@ -250,7 +250,11 @@ func TestCompactDropsFreePagesAndKeepsEveryRow(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "messages.db")
 	store := openStoreWithoutAutoVacuum(t, path)
 	defer func() { store.Close() }()
-	kept := fillAndThin(t, store, 400, 1500, 10)
+	count := 400
+	if raceDetectorEnabled {
+		count = 80
+	}
+	kept := fillAndThin(t, store, count, 1500, 10)
 
 	before, err := store.StorageStats(ctx)
 	if err != nil {
@@ -341,8 +345,14 @@ type reclaimCase struct {
 }
 
 func (reclaimCase) Generate(r *rand.Rand, _ int) reflect.Value {
+	// Cases under -race hold fewer rows: each row costs the race job far
+	// more time, and the properties check data, not concurrency.
+	maxRows := 120
+	if raceDetectorEnabled {
+		maxRows = 30
+	}
 	c := reclaimCase{
-		Sizes:  make([]int, 1+r.Intn(120)),
+		Sizes:  make([]int, 1+r.Intn(maxRows)),
 		Delete: make([]bool, 0),
 		Steps:  make([]int64, 1+r.Intn(4)),
 	}
