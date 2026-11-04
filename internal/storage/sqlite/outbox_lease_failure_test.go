@@ -164,12 +164,13 @@ func TestLeaseDueBatchStartsTheDelayOverAfterAnotherFailure(t *testing.T) {
 	}
 }
 
-// A row that can be neither leased nor set aside stays as it was, still due,
-// and the call leases the rows behind it however many such rows come first.
+// A row the call can neither lease nor set aside stays as it was, still due,
+// and the call leases the rows behind it however many such rows come first,
+// up to the batch limit and no further.
 func TestLeaseDueBatchLeasesPastRowsThatCanBeNeitherLeasedNorSetAside(t *testing.T) {
 	clock := newOutboxTestClock(outboxTestTimeMS)
 	store, repository := openOutboxTestRepository(t, clock.Now)
-	for offset, id := range []string{"a", "b", "c", "d", "e"} {
+	for offset, id := range []string{"a", "b", "c", "d", "e", "f"} {
 		item := outboxTestItem(id)
 		item.ScheduledForMS = outboxTestTimeMS - 100 + int64(offset)
 		mustEnqueueOutbox(t, repository, item)
@@ -188,7 +189,9 @@ func TestLeaseDueBatchLeasesPastRowsThatCanBeNeitherLeasedNorSetAside(t *testing
 		before[id] = mustFindOutboxRow(t, repository, id)
 	}
 
-	// The limit is 2, so the first select returns only rows that fail.
+	// The limit is 2, so the first page holds only rows that fail. The second
+	// holds the third stuck row and three that lease, one more than the batch
+	// has room for, so f waits for the next call.
 	batch := mustLeaseDueBatch(t, repository, clock.Now(), 2)
 	if got, want := leasedOutboxIDs(batch), []string{"outbox-d", "outbox-e"}; !slices.Equal(got, want) {
 		t.Fatalf("LeaseDueBatch() leased %v, want %v", got, want)
@@ -200,9 +203,11 @@ func TestLeaseDueBatchLeasesPastRowsThatCanBeNeitherLeasedNorSetAside(t *testing
 		}
 	}
 
+	assertOutboxRowsQueued(t, repository, "outbox-f")
+
 	again := mustLeaseDueBatch(t, repository, clock.Now(), 2)
-	if len(again.Leases) != 0 {
-		t.Fatalf("LeaseDueBatch() again leased %v, want nothing", leasedOutboxIDs(again))
+	if got, want := leasedOutboxIDs(again), []string{"outbox-f"}; !slices.Equal(got, want) {
+		t.Fatalf("LeaseDueBatch() again leased %v, want %v", got, want)
 	}
 	assertStuckFailures(t, again, stuck, "injected write failure")
 }
