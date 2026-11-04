@@ -410,31 +410,38 @@ func (s *Store) SearchConversationsByMetadata(query string, limit int) ([]*Conve
 // numbers that only contain the line's digits never crowd out one that ends
 // with them.
 func (s *Store) SearchConversationsByPhoneLine(line string, limit int) ([]*Conversation, error) {
-	rows, err := s.db.Query(`
-		SELECT `+conversationColumns+`
+	rows, err := s.db.Query(phoneLineSearchSQL(phoneline.SQLMatch), line, line, line, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanConversations(rows)
+}
+
+// phoneLineSearchSQL is SearchConversationsByPhoneLine's query, calling the
+// SQL function match to test a value against the line. It takes the line
+// three times, then the limit.
+func phoneLineSearchSQL(match string) string {
+	return `
+		SELECT ` + conversationColumns + `
 		FROM conversations
 		WHERE EXISTS (
 				SELECT 1
-				FROM `+sqlParticipantEntries("conversations.participants")+` AS p
+				FROM ` + sqlParticipantEntries("conversations.participants") + ` AS p
 				WHERE CASE p.type
-					WHEN 'text' THEN `+phoneline.SQLMatch+`(?, p.value)
-					WHEN 'object' THEN NOT `+sqlOwnerFlag+` AND `+phoneline.SQLMatch+`(?, `+sqlEntryText("number")+`, `+sqlEntryText("phone")+`)
+					WHEN 'text' THEN ` + match + `(?, p.value)
+					WHEN 'object' THEN NOT ` + sqlOwnerFlag + ` AND ` + match + `(?, ` + sqlEntryText("number") + `, ` + sqlEntryText("phone") + `)
 					ELSE 0
 				END
 			)
 			OR conversation_id IN (
 				SELECT conversation_id
 				FROM (SELECT DISTINCT conversation_id, sender_number FROM messages WHERE is_from_me = 0)
-				WHERE `+phoneline.SQLMatch+`(?, sender_number)
+				WHERE ` + match + `(?, sender_number)
 			)
 		ORDER BY last_message_ts DESC
 		LIMIT ?
-	`, line, line, line, limit)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	return scanConversations(rows)
+	`
 }
 
 // sqlOwnerFlag holds for an object entry that carries is_me or isMe. p is a

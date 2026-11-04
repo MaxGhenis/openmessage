@@ -11,14 +11,17 @@ import (
 	"testing/quick"
 
 	"github.com/maxghenis/openmessage/internal/phoneline"
+	"github.com/maxghenis/openmessage/internal/phoneline/phonelinetest"
 )
 
 // phoneLineModel is a reference for SearchConversationsByPhoneLine. A thread
-// is on a line when phoneline.MatchFirst finds the line in the number (or,
-// without one, the phone) of a participant entry not flagged as the owner's,
-// where only text counts, in a bare string entry, or in the sender number of
-// an incoming message. An entry is flagged when its is_me or isMe holds JSON
-// true. Hits come newest first, up to the limit.
+// is on a line when phonelinetest.MatchFirst, which states phoneline's rule
+// with regular expressions, finds the line in the number (or, without one,
+// the phone) of a participant entry not flagged as the owner's, where only
+// text counts, in a bare string entry, or in the sender number of an
+// incoming message. An entry carries the owner's flag when its is_me or isMe
+// holds JSON true. Hits come newest first, then in conversation ID order, up
+// to the limit.
 type phoneLineModel struct {
 	conversations []*Conversation
 	messages      []*Message
@@ -35,7 +38,7 @@ func (m phoneLineModel) onLine(conversation *Conversation, line string) (hit, se
 			if json.Unmarshal(element, &object) == nil && object != nil {
 				number, _ := object["number"].(string)
 				phone, _ := object["phone"].(string)
-				if !phoneline.MatchFirst(line, number, phone) {
+				if !phonelinetest.MatchFirst(line, number, phone) {
 					continue
 				}
 				if object["is_me"] == true || object["isMe"] == true {
@@ -46,14 +49,14 @@ func (m phoneLineModel) onLine(conversation *Conversation, line string) (hit, se
 				continue
 			}
 			var text string
-			if json.Unmarshal(element, &text) == nil && phoneline.MatchFirst(line, text) {
+			if json.Unmarshal(element, &text) == nil && phonelinetest.MatchFirst(line, text) {
 				byEntry = true
 			}
 		}
 	}
 	bySender := false
 	for _, message := range m.messages {
-		if message.ConversationID == conversation.ConversationID && !message.IsFromMe && phoneline.MatchFirst(line, message.SenderNumber) {
+		if message.ConversationID == conversation.ConversationID && !message.IsFromMe && phonelinetest.MatchFirst(line, message.SenderNumber) {
 			bySender = true
 		}
 	}
@@ -68,7 +71,12 @@ func (m phoneLineModel) search(line string, limit int) []string {
 			hits = append(hits, conversation)
 		}
 	}
-	sort.Slice(hits, func(i, j int) bool { return hits[i].LastMessageTS > hits[j].LastMessageTS })
+	sort.Slice(hits, func(i, j int) bool {
+		if hits[i].LastMessageTS != hits[j].LastMessageTS {
+			return hits[i].LastMessageTS > hits[j].LastMessageTS
+		}
+		return hits[i].ConversationID < hits[j].ConversationID
+	})
 	ids := []string{}
 	for _, conversation := range hits {
 		if len(ids) == limit {
@@ -79,8 +87,47 @@ func (m phoneLineModel) search(line string, limit int) []string {
 	return ids
 }
 
+// heldOnlyByIdentifiers reports whether conversation is off line although a
+// value in it, one that is no phone number such as an email address, holds
+// digits that end with the line's: a thread that matching digits alone
+// would put on the line.
+func (m phoneLineModel) heldOnlyByIdentifiers(conversation *Conversation, line string) bool {
+	if hit, _, _ := m.onLine(conversation, line); hit {
+		return false
+	}
+	values := []string{}
+	var elements []any
+	if json.Unmarshal([]byte(conversation.Participants), &elements) == nil {
+		for _, element := range elements {
+			switch element := element.(type) {
+			case string:
+				values = append(values, element)
+			case map[string]any:
+				for _, key := range []string{"number", "phone"} {
+					if value, ok := element[key].(string); ok {
+						values = append(values, value)
+					}
+				}
+			}
+		}
+	}
+	for _, message := range m.messages {
+		if message.ConversationID == conversation.ConversationID {
+			values = append(values, message.SenderNumber)
+		}
+	}
+	for _, value := range values {
+		digits := phoneline.Digits(value)
+		if _, ok := phonelinetest.Digits(value); !ok && len(digits) >= 7 && strings.HasSuffix(digits, line) {
+			return true
+		}
+	}
+	return false
+}
+
 // phoneLineForm writes a number's digits as an address book or a transport
-// might: E.164, national with separators, or with a stray prefix.
+// might: E.164, national with separators, or with a stray prefix, or as a
+// tel: URI, which is no written number.
 func phoneLineForm(random *rand.Rand, digits string) string {
 	switch random.Intn(5) {
 	case 0:
@@ -109,17 +156,23 @@ func phoneLineForm(random *rand.Rand, digits string) string {
 // many written forms. Decoys hold a target's last ten digits inside a longer
 // number, share only its last seven, or are too short to name a line; some
 // entries carry the number under phone, a blank number, or a number that
-// isn't text; the owner's entries carry the owner's number flagged, unflagged
-// or with a flag that isn't JSON true, and the owner sends messages too. So,
-// as invariants, a thread is on a line only through someone other than the
-// flagged owner whose number ends with the line's digits (or the line ends
-// with theirs), an incoming sender whom the roster lacks counts, and the
-// limit applies after matching, so threads whose numbers only contain the
-// digits never crowd out one on the line.
+// isn't text; identifiers that are no phone number, such as an email address,
+// a Signal UUID or a WhatsApp LID, hold targets' digits; the owner's entries
+// carry the owner's number flagged, unflagged or with a flag that isn't JSON
+// true, and the owner sends messages too; and threads often share a time.
+// So, as invariants, a thread is on a line only through someone other than
+// the flagged owner whose number, written as one, ends with the line's
+// digits (or the line ends with theirs), an incoming sender whom the roster
+// lacks counts, the limit applies after matching, so threads whose numbers
+// only contain the digits never crowd out one on the line, and threads that
+// share a time come in conversation ID order.
 func TestSearchConversationsByPhoneLineAgreesWithTheLineModel(t *testing.T) {
 	targets := []string{"12025550123", "13035550147", "15555550199"}
 	owner := "15550009999"
 	decoys := []string{"447555012399", "4412025550123", "13035550123", "5550123", "550123", "12025550124"}
+	// identifiers hold a target's digits but are no phone number, except a
+	// WhatsApp JID on the phone-number server, which names its user's line.
+	identifiers := []string{"alice12025550123@example.com", "abcdefab-abcd-abcd-abcd-a13035550147", "15555550199@lid", "users/12025550123", "+99999912025550123", "13035550147@s.whatsapp.net"}
 	exercised := map[string]int{}
 
 	property := func(seed int64) bool {
@@ -128,13 +181,19 @@ func TestSearchConversationsByPhoneLineAgreesWithTheLineModel(t *testing.T) {
 		model := phoneLineModel{}
 		numbers := append(append([]string{owner}, targets...), decoys...)
 		pick := func() string { return numbers[random.Intn(len(numbers))] }
+		value := func() string {
+			if random.Intn(5) == 0 {
+				return identifiers[random.Intn(len(identifiers))]
+			}
+			return phoneLineForm(random, pick())
+		}
 
 		count := 4 + random.Intn(10)
 		for index := 0; index < count; index++ {
 			id := "c" + strconv.Itoa(index)
 			var entries []any
 			for member := 0; member < 1+random.Intn(3); member++ {
-				form := phoneLineForm(random, pick())
+				form := value()
 				switch random.Intn(8) {
 				case 0:
 					entries = append(entries, form)
@@ -143,7 +202,7 @@ func TestSearchConversationsByPhoneLineAgreesWithTheLineModel(t *testing.T) {
 				case 2:
 					entries = append(entries, map[string]any{"name": "P" + strconv.Itoa(member), "number": " ", "phone": form})
 				case 3:
-					entries = append(entries, map[string]any{"name": "P" + strconv.Itoa(member), "number": form, "phone": phoneLineForm(random, pick())})
+					entries = append(entries, map[string]any{"name": "P" + strconv.Itoa(member), "number": form, "phone": value()})
 				case 4:
 					number, _ := strconv.ParseInt(phoneline.Digits(form), 10, 64)
 					entries = append(entries, map[string]any{"name": "P" + strconv.Itoa(member), "number": number})
@@ -173,7 +232,7 @@ func TestSearchConversationsByPhoneLineAgreesWithTheLineModel(t *testing.T) {
 			}
 			if err := store.UpsertConversation(&Conversation{
 				ConversationID: id, Name: "Thread " + id, Participants: string(participants),
-				LastMessageTS: int64(1_000_000 + 1000*random.Intn(1000) + index), SourcePlatform: "sms",
+				LastMessageTS: int64(1_000_000 + 1000*random.Intn(6)), SourcePlatform: "sms",
 			}); err != nil {
 				t.Fatalf("seed conversation: %v", err)
 			}
@@ -181,7 +240,7 @@ func TestSearchConversationsByPhoneLineAgreesWithTheLineModel(t *testing.T) {
 				message := &Message{
 					MessageID: id + "-m" + strconv.Itoa(number), ConversationID: id, Body: "hello",
 					TimestampMS: int64(1000 + number), SourcePlatform: "sms",
-					SenderNumber: phoneLineForm(random, pick()),
+					SenderNumber: value(),
 				}
 				if random.Intn(3) == 0 {
 					message.IsFromMe = true
@@ -224,6 +283,15 @@ func TestSearchConversationsByPhoneLineAgreesWithTheLineModel(t *testing.T) {
 				continue
 			}
 			exercised["a line with hits"]++
+			if all := model.search(line, len(stored)); len(all) > len(want) {
+				at := map[string]int64{}
+				for _, conversation := range stored {
+					at[conversation.ConversationID] = conversation.LastMessageTS
+				}
+				if at[all[len(want)]] == at[want[len(want)-1]] {
+					exercised["a tie at the limit"]++
+				}
+			}
 			oldest := int64(-1)
 			for _, conversation := range stored {
 				if conversation.ConversationID == want[len(want)-1] {
@@ -237,6 +305,9 @@ func TestSearchConversationsByPhoneLineAgreesWithTheLineModel(t *testing.T) {
 				}
 				if ownerOnly {
 					exercised["a thread on the line only through the flagged owner"]++
+				}
+				if model.heldOnlyByIdentifiers(conversation, line) {
+					exercised["a thread that only identifiers holding the line's digits tie to it"]++
 				}
 				if !hit && conversation.LastMessageTS > oldest && strings.Contains(conversation.Participants, line) {
 					exercised["a hit behind a newer thread whose numbers only contain the line's digits"]++
@@ -257,6 +328,8 @@ func TestSearchConversationsByPhoneLineAgreesWithTheLineModel(t *testing.T) {
 		"a hit through an incoming sender alone",
 		"a thread on the line only through the flagged owner",
 		"a hit behind a newer thread whose numbers only contain the line's digits",
+		"a tie at the limit",
+		"a thread that only identifiers holding the line's digits tie to it",
 	} {
 		if exercised[path] == 0 {
 			t.Errorf("the property never drew %s; raise MaxCount (drew %v)", path, exercised)

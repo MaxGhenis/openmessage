@@ -8,15 +8,15 @@ import (
 // A participant entry is a JSON object, and only the text of its name,
 // number, phone or email names anyone. Its keys, its flags and its IDs match
 // nothing: the demo store names its owner Me, and "me" sits inside every
-// "name" key. JSON escapes are decoded, so R&D matches R&D. A bare
-// string entry still matches as written.
+// "name" key. The search decodes JSON escapes, so R&D matches R\u0026D. A
+// bare string entry still matches as written.
 func TestSearchConversationsByMetadataMatchesEntryValuesNotKeys(t *testing.T) {
 	store := newTestStore(t)
 	seedSearchStore(t, store, []*Conversation{
 		{ConversationID: "bob", Name: "Bob's thread", SourcePlatform: "sms", LastMessageTS: 40,
 			Participants: `[{"name":"Bob Example","number":"+15555550123","id":"7","contact_id":"c9"},{"name":"Me","number":"+15550009999","is_me":true}]`},
 		{ConversationID: "lab", Name: "Lab", SourcePlatform: "sms", LastMessageTS: 30,
-			Participants: `[{"name":"R&D Desk","phone":"+15555550188"},{"name":"Me","number":"+15550009999","is_me":true}]`},
+			Participants: `[{"name":"R\u0026D Desk","phone":"+15555550188"},{"name":"Me","number":"+15550009999","is_me":true}]`},
 		{ConversationID: "chat", Name: "Chat", SourcePlatform: "gchat", LastMessageTS: 20,
 			Participants: `[{"name":"Dee Example","email":"dee@example.com"}]`},
 		{ConversationID: "bare", Name: "Bare", SourcePlatform: "sms", LastMessageTS: 10,
