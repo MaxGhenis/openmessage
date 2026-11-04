@@ -352,26 +352,32 @@ func (s *Store) ListConversationsByPlatform(platform string, limit int) ([]*Conv
 // matches through the text of its name, number, phone or email, or, for a
 // bare string, the string; JSON keys, flags and IDs match nothing, and
 // escapes are decoded. Most threads list the account's owner, so a
-// participant match skips entries flagged as the owner's (is_me or isMe), or
-// the owner's name or number would find every thread. The owner's outgoing
-// messages carry the owner's name and number too, so sender matches count
-// incoming messages only. The SQL skips both before its LIMIT, so threads
-// that match only through the owner never crowd out a match. The query
-// matches as written: % and _ are no wildcards, as in v2's search. Threads
-// that share a time come in conversation ID order, as v2's do, so a limit
-// keeps the same threads whichever store serves the reads.
+// participant match skips the owner's entries, or the owner's name or number
+// would find every thread. The owner rule in owner.go names those entries:
+// an object that carries is_me (or isMe), and any entry, in any thread, on
+// the phone line of a flagged entry whose number reads as a phone number or
+// a WhatsApp JID of one. Google's participant lists often repeat the owner
+// without the flag. The owner's outgoing messages carry the owner's name and
+// number too, so sender matches count incoming messages only. The SQL skips
+// both before its LIMIT, so threads that match only through the owner never
+// crowd out a match. It reads the owner rule through the functions owner.go
+// registers, so it skips the entries send_message skips. The query matches
+// as written, as in v2's search: % and _ match only themselves. Threads that
+// share a time come in conversation ID order, as v2's do, so a limit keeps
+// the same threads whichever store serves the reads.
 func (s *Store) SearchConversationsByMetadata(query string, limit int) ([]*Conversation, error) {
 	pattern := "%" + escapeLikePattern(query) + "%"
 	rows, err := s.db.Query(`
+		WITH `+sqlOwnerLines()+`
 		SELECT DISTINCT `+conversationColumns+`
 		FROM conversations
 		WHERE name LIKE ? ESCAPE '\'
 			OR EXISTS (
 				SELECT 1
 				FROM `+sqlParticipantEntries("conversations.participants")+` AS p
-				WHERE CASE p.type
+				WHERE NOT `+sqlEntryIsOwners+` AND CASE p.type
 					WHEN 'text' THEN p.value LIKE ? ESCAPE '\'
-					WHEN 'object' THEN NOT `+sqlOwnerFlag+` AND EXISTS (
+					WHEN 'object' THEN EXISTS (
 						SELECT 1
 						FROM json_each(p.value) AS field
 						WHERE field.key IN ('name', 'number', 'phone', 'email')
@@ -405,13 +411,16 @@ func (s *Store) SearchConversationsByMetadata(query string, limit int) ([]*Conve
 // SearchConversationsByPhoneLine returns the conversations with someone on
 // the phone line that line, a phoneline.Line, names, newest first, then in
 // conversation ID order, and at most limit. Someone is a participant entry
-// not flagged as the owner's, through its number (or, without one, its
-// phone), a bare string entry, or the sender of an incoming message, whom
-// the roster may lack. A value counts only where it reads as a phone number
-// or a WhatsApp JID of one, and then matches as send_message matches a
-// recipient, through phoneline, so separators and a country prefix don't
-// matter. The match runs before the LIMIT, so numbers that only contain the
-// line's digits never crowd out one that ends with them.
+// that the owner rule in owner.go doesn't count as the owner's, through its
+// number (or, without one, its phone) or, for a bare string, the string; or
+// the sender of an incoming message, whom the roster may lack. The rule skips
+// flagged entries and the unflagged copies of the owner that Google's lists
+// hold, so the owner's own number finds no thread through its participants.
+// A value counts only where it reads as a phone number or a WhatsApp JID of
+// one, and then matches as send_message matches a recipient, through
+// phoneline, so separators and a country prefix don't matter. The match runs
+// before the LIMIT, so numbers that only contain the line's digits never
+// crowd out one that ends with them.
 func (s *Store) SearchConversationsByPhoneLine(line string, limit int) ([]*Conversation, error) {
 	rows, err := s.db.Query(phoneLineSearchSQL(phoneline.SQLMatch), line, line, line, limit)
 	if err != nil {
@@ -430,7 +439,8 @@ func (s *Store) SearchConversationsByPhoneLine(line string, limit int) ([]*Conve
 // so match never reaches the scan of messages.
 func phoneLineSearchSQL(match string) string {
 	return `
-		WITH sender_numbers AS MATERIALIZED (
+		WITH ` + sqlOwnerLines() + `,
+		sender_numbers AS MATERIALIZED (
 			SELECT DISTINCT sender_number FROM messages
 		)
 		SELECT ` + conversationColumns + `
@@ -438,9 +448,9 @@ func phoneLineSearchSQL(match string) string {
 		WHERE EXISTS (
 				SELECT 1
 				FROM ` + sqlParticipantEntries("conversations.participants") + ` AS p
-				WHERE CASE p.type
+				WHERE NOT ` + sqlEntryIsOwners + ` AND CASE p.type
 					WHEN 'text' THEN ` + match + `(?, p.value)
-					WHEN 'object' THEN NOT ` + sqlOwnerFlag + ` AND ` + match + `(?, ` + sqlEntryText("number") + `, ` + sqlEntryText("phone") + `)
+					WHEN 'object' THEN ` + match + `(?, ` + sqlEntryText("number") + `, ` + sqlEntryText("phone") + `)
 					ELSE 0
 				END
 			)
@@ -526,6 +536,22 @@ const sqlOwnerFlag = `(json_type(p.value, '$.is_me') IS 'true' OR json_type(p.va
 func sqlEntryText(key string) string {
 	return `CASE json_type(p.value, '$.` + key + `') WHEN 'text' THEN json_extract(p.value, '$.` + key + `') END`
 }
+
+// sqlOwnerLines is a common table expression for a WITH clause, owner_lines:
+// one row whose lines column holds the owner's phone lines, as owner.go's
+// OwnerLine gives them, from every conversation, with commas between them,
+// or NULL when no entry gives one.
+func sqlOwnerLines() string {
+	return `owner_lines AS MATERIALIZED (
+			SELECT group_concat(DISTINCT openmessage_owner_line(p.type, p.value)) AS lines
+			FROM conversations AS flagged, ` + sqlParticipantEntries("flagged.participants") + ` AS p
+		)`
+}
+
+// sqlEntryIsOwners holds for an entry the owner rule counts as the owner's,
+// given the lines in owner_lines (see sqlOwnerLines). p is a json_each row
+// over a conversation's participants.
+const sqlEntryIsOwners = `openmessage_owner_entry(p.type, p.value, (SELECT lines FROM owner_lines))`
 
 // sqlParticipantEntries is the json_each source for a participants column:
 // the elements of a JSON array, and none for anything else. The JSON
