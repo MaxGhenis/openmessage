@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 	"testing/quick"
+	"unicode/utf8"
 )
 
 // conversationContactKeys renders contacts as ID/name/number triples, for
@@ -96,15 +97,25 @@ func TestListContactsFromConversationsKeepsToTheLimitWhenParticipantsDontDecode(
 }
 
 // conversationContactsModel is a reference for ListContactsFromConversations.
-// Threads go newest first. A thread whose participants don't decode as a list
-// of entries offers its title; otherwise each entry not flagged as the
+// Threads go newest first, and entries read as Go's decoder reads them, a byte
+// that isn't UTF-8 as U+FFFD. A thread whose participants don't decode as a
+// list of entries offers its title; otherwise each entry not flagged as the
 // owner's (is_me or isMe) offers its name, or its number when it has no name,
 // together with its number. An offer counts when the query, ASCII case aside,
 // appears in the name offered or in the number, and only the first offer of
 // each name and number counts. The result is the first limit offers.
 func conversationContactsModel(conversations []*Conversation, query string, limit int) []*Contact {
+	foldASCII := func(text string) string {
+		folded := []byte(text)
+		for index, c := range folded {
+			if 'A' <= c && c <= 'Z' {
+				folded[index] = c + 'a' - 'A'
+			}
+		}
+		return string(folded)
+	}
 	holds := func(text string) bool {
-		return strings.Contains(strings.ToLower(text), strings.ToLower(query))
+		return strings.Contains(foldASCII(text), foldASCII(query))
 	}
 	ordered := append([]*Conversation(nil), conversations...)
 	sort.Slice(ordered, func(i, j int) bool { return ordered[i].LastMessageTS > ordered[j].LastMessageTS })
@@ -148,17 +159,24 @@ func conversationContactsModel(conversations []*Conversation, query string, limi
 // only Lee and the owner, flagged by is_me or isMe, so they can outnumber 20
 // times the limit; the older threads list people in shared threads, entries
 // without a name, the owner or not, and some have participants that don't
-// decode. So, as invariants, no limit hides an older match behind threads
-// that match only through the owner, the result never holds the owner's
-// flagged entries, and each name and number comes back once.
+// decode. Some names hold a character that JSON escapes or a letter beyond
+// ASCII, and some participants hold a byte that isn't UTF-8. So, as
+// invariants, no limit hides an older match behind threads that match only
+// through the owner, the result never holds the owner's flagged entries,
+// each name and number comes back once, and the SQL prefilter drops no row
+// that the loop could take a contact from.
 func TestListContactsFromConversationsAgreesWithTheModel(t *testing.T) {
 	people := []struct{ name, number string }{
 		{"Sam Example", "+15555550100"},
 		{"Bob Example", "+15555550101"},
 		{"", "+15555550102"},
 		{"Carol Sammy", "+15555550103"},
+		{"R&D Desk", "+15555550104"},
+		{"Ángel Ruiz", "+15555550105"},
+		{`Bob "Builder"`, "+15555550106"},
 	}
 	exercised := map[string]int{}
+	replacement := string(utf8.RuneError)
 
 	property := func(seed int64) bool {
 		random := rand.New(rand.NewSource(seed))
@@ -190,8 +208,13 @@ func TestListContactsFromConversationsAgreesWithTheModel(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if index < count && random.Intn(6) == 0 {
-				participants = []byte(`["Sam Example","Bob Example"]`)
+			if index < count {
+				switch random.Intn(6) {
+				case 0:
+					participants = []byte(`["Sam Example","Bob Example"]`)
+				case 1:
+					participants = []byte("[{\"name\":\"Ren\xffe Okafor\",\"number\":\"+15555550107\"}]")
+				}
 			}
 			if err := store.UpsertConversation(&Conversation{
 				ConversationID: id, Name: title, IsGroup: len(entries) > 2, Participants: string(participants),
@@ -205,7 +228,10 @@ func TestListContactsFromConversationsAgreesWithTheModel(t *testing.T) {
 			t.Fatalf("list conversations: %v", err)
 		}
 
-		for _, query := range []string{"", "Sam", "Owner", "Sam Owner", "Me", "Example", "555", "+1555555", "Lee", "Carol", "Group", "zzz"} {
+		for _, query := range []string{
+			"", "Sam", "Owner", "Sam Owner", "Me", "Example", "555", "+1555555", "Lee", "Carol", "Group", "zzz",
+			"R&D", `"Builder"`, "ÁNGEL", "ángel", replacement, "\xff",
+		} {
 			limit := 1 + random.Intn(4)
 			want := conversationContactKeys(conversationContactsModel(stored, query, limit))
 			contacts, err := store.ListContactsFromConversations(query, limit)
@@ -218,6 +244,14 @@ func TestListContactsFromConversationsAgreesWithTheModel(t *testing.T) {
 			}
 			if len(want) > 0 {
 				exercised["a query with contacts"]++
+				switch query {
+				case "R&D", `"Builder"`:
+					exercised["a match that the JSON text holds only as an escape"]++
+				case "ÁNGEL":
+					exercised["a match on a letter beyond ASCII"]++
+				case replacement:
+					exercised["a match through a byte that isn't UTF-8"]++
+				}
 				// Lee's entries and numbers match these, so for them the
 				// newest threads hold matches of their own.
 				matchesLee := map[string]bool{"": true, "Lee": true, "555": true, "+1555555": true}[query]
@@ -235,7 +269,11 @@ func TestListContactsFromConversationsAgreesWithTheModel(t *testing.T) {
 	if err := quick.Check(property, &quick.Config{MaxCount: cases, Rand: rand.New(rand.NewSource(20261103))}); err != nil {
 		t.Fatal(err)
 	}
-	for _, path := range []string{"a query with contacts", "a match behind more owner-only threads than 20 times the limit"} {
+	for _, path := range []string{
+		"a query with contacts", "a match behind more owner-only threads than 20 times the limit",
+		"a match that the JSON text holds only as an escape", "a match on a letter beyond ASCII",
+		"a match through a byte that isn't UTF-8",
+	} {
 		if exercised[path] == 0 {
 			t.Errorf("the property never drew %s; raise MaxCount (drew %v)", path, exercised)
 		}

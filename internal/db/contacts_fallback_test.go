@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"testing"
+	"unicode/utf8"
 )
 
 // The contacts listed in legacy threads match by what a participant entry
@@ -31,6 +32,35 @@ func TestListContactsFromConversationsMatchesWhatAnEntrySays(t *testing.T) {
 		"R&D": "[R&D Desk]", "r&d desk": "[R&D Desk]", "<ops>": "[<Ops> Team]", `"Builder"`: `[Bob "Builder"]`,
 		"Ángel": "[Ángel Ruiz]", "ÁNGEL": "[Ángel Ruiz]", "ángel": "[]", "5550188": "[R&D Desk]",
 		"Me": "[]", "+15550009999": "[]", `\u0026`: "[]", "u003c": "[]",
+	} {
+		contacts, err := store.ListContactsFromConversations(query, 10)
+		if err != nil {
+			t.Fatalf("ListContactsFromConversations(%q): %v", query, err)
+		}
+		names := []string{}
+		for _, contact := range contacts {
+			names = append(names, contact.Name)
+		}
+		if got := fmt.Sprint(names); got != want {
+			t.Errorf("ListContactsFromConversations(%q) = %s, want %s", query, got, want)
+		}
+	}
+}
+
+// Go's decoder reads a byte that isn't UTF-8 as U+FFFD, so where a thread's
+// participants hold such a byte in a name, the entry's name holds U+FFFD,
+// and a query that holds U+FFFD finds it. The byte itself finds no one,
+// since no decoded name holds it.
+func TestListContactsFromConversationsReadsABadByteAsTheDecoderDoes(t *testing.T) {
+	store := newTestStore(t)
+	seedSearchStore(t, store, []*Conversation{
+		{ConversationID: "ren", Name: "Ren", SourcePlatform: "sms", LastMessageTS: 10,
+			Participants: "[{\"name\":\"Ren\xffe Okafor\",\"number\":\"+15555550144\"}]"},
+	}, nil, nil)
+	replacement := string(utf8.RuneError)
+	found := "[Ren" + replacement + "e Okafor]"
+	for query, want := range map[string]string{
+		replacement: found, "Ren" + replacement + "e": found, "Okafor": found, "\xff": "[]",
 	} {
 		contacts, err := store.ListContactsFromConversations(query, 10)
 		if err != nil {
