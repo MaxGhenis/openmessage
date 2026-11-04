@@ -65,9 +65,10 @@ type DispatchHealth struct {
 	ConsecutiveFailedPasses int64 `json:"consecutive_failed_passes"`
 	// LastFailedPass is the most recent failed pass, if any.
 	LastFailedPass *FailedDispatchPass `json:"last_failed_pass,omitempty"`
-	// FailedLeases counts due rows whose lease failed on the row itself since
-	// the service started. The store set each aside to retry, or left it due
-	// when that failed too; either way it leased the rows behind it.
+	// FailedLeases counts the leases that failed on their own row since the
+	// service started; a row whose lease fails in three passes counts three
+	// times. The store set each such row aside to retry, or left it due when
+	// that failed too; either way it leased the rows behind it.
 	FailedLeases int64 `json:"failed_leases"`
 	// LastFailedLease is the most recent failed lease, if any.
 	LastFailedLease *FailedLease `json:"last_failed_lease,omitempty"`

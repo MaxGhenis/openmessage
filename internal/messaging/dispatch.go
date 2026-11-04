@@ -196,7 +196,7 @@ func (s *MessageService) recordFailedLeases(failed []sqlite.LeaseFailure) error 
 		s.leaseFailures.fail(failure, now)
 		if failure.SetAsideErr != nil {
 			stuck = append(stuck, fmt.Errorf(
-				"outbox item %q can be neither leased (%w) nor set aside (%w)",
+				"could neither lease outbox item %q (%w) nor set it aside (%w)",
 				failure.OutboxID, failure.Err, failure.SetAsideErr,
 			))
 			continue

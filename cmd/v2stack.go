@@ -397,22 +397,23 @@ func (s *v2Stack) Start(
 	})
 	// The store sets aside a due row whose lease fails on the row itself, to
 	// retry, and the rows behind it still send; the hook logs each such row
-	// (and /api/status v2_dispatch counts them). A row the store could not set
-	// aside either also fails its pass, which the hook above logs.
+	// (and /api/status v2_dispatch counts each failed lease). When the store
+	// cannot set the row aside either, its pass fails too, and the hook above
+	// logs that.
 	s.Service.OnLeaseFailure(func(lease messaging.FailedLease) {
 		if lease.SetAsideError != "" {
 			s.logger.Error().
 				Str("outbox_id", lease.OutboxID).
 				Str("error", lease.Error).
 				Str("set_aside_error", lease.SetAsideError).
-				Msg("V2 outbox item can be neither leased nor set aside; sending the rest")
+				Msg("Failed to lease V2 outbox item or set it aside; sending the rest")
 			return
 		}
 		s.logger.Warn().
 			Str("outbox_id", lease.OutboxID).
 			Str("error", lease.Error).
 			Int64("retry_at_ms", lease.RetryAtMS).
-			Msg("V2 outbox item could not be leased; set aside to retry")
+			Msg("Failed to lease V2 outbox item; set it aside to retry")
 	})
 	go func() {
 		defer runWG.Done()
