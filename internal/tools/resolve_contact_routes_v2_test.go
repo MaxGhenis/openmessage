@@ -65,12 +65,17 @@ type routeFixturePerson struct {
 // threads. ParticipantName, when set, is the name the owner's v2 participant
 // rows carry in place of the identity's name, as some live rows do; reads
 // show that name. InAddressBook files the owner's own card in the address
-// book, as a phone's "my card" does.
+// book, as a phone's "my card" does. LegacyUnflaggedCopy lists the owner a
+// second time in each legacy thread, under the same name and number but
+// without is_me, as Google's participant lists do in 211 of the 1,355
+// one-to-one SMS threads of one live legacy store. v2 folds that copy into
+// the owner's self identity.
 type routeFixtureOwner struct {
-	Name            string
-	ParticipantName string
-	Number          string
-	InAddressBook   bool
+	Name                string
+	ParticipantName     string
+	Number              string
+	InAddressBook       bool
+	LegacyUnflaggedCopy bool
 }
 
 // defaultRouteFixtureOwner shares no name or number with the people the
@@ -117,10 +122,17 @@ func seedRouteFixtureWithOwner(t *testing.T, legacy *db.Store, store *sqlite.Sto
 		lastMS := now - int64(index)
 		legacyNumber := firstNonEmpty(person.LegacyNumber, person.Number)
 		if person.LegacyThreadID != "" {
-			participants, err := json.Marshal([]map[string]any{
+			entries := []map[string]any{
 				{"name": person.Name, "number": legacyNumber},
 				{"name": owner.Name, "number": owner.Number, "is_me": true},
-			})
+			}
+			if owner.LegacyUnflaggedCopy {
+				entries = append(entries, map[string]any{
+					"name": owner.Name, "number": owner.Number,
+					"id": "owner-participant-" + person.LegacyThreadID, "contact_id": "owner-contact",
+				})
+			}
+			participants, err := json.Marshal(entries)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -489,13 +501,15 @@ func TestResolveContactRoutesFindsPeopleByAnyFormOfTheirNumber(t *testing.T) {
 }
 
 // Both stores list the account's owner in most threads, and a phone's own
-// contact card puts the owner in the address book. A thread that matches a
-// query only through the owner says nothing about whom to send to. Here, where
-// no title holds the owner's name, the owner's names and number route nowhere,
-// and a search for another Sam doesn't return the threads that the owner, Sam
-// Owner, is in or wrote in. This holds whichever store serves reads.
+// contact card puts the owner in the address book. The legacy store's Google
+// threads can list the owner twice, once without is_me. A thread that matches
+// a query only through the owner says nothing about whom to send to. Here,
+// where no title holds the owner's name, the owner's names and number route
+// nowhere, and a search for "Sam" finds only Sam Example's thread, not the
+// other threads that list the owner, Sam Owner, or hold the owner's
+// messages. This holds whichever store serves reads.
 func TestResolveContactRoutesIgnoresTheAccountOwner(t *testing.T) {
-	owner := routeFixtureOwner{Name: "Sam Owner", ParticipantName: "Sammy", Number: "+15550009999", InAddressBook: true}
+	owner := routeFixtureOwner{Name: "Sam Owner", ParticipantName: "Sammy", Number: "+15550009999", InAddressBook: true, LegacyUnflaggedCopy: true}
 	people := []routeFixturePerson{
 		{Name: "Sam Example", Number: "+15555550123", LegacyThreadID: "3100", RemoteThreadID: "3100"},
 		{Name: "Bob Example", Number: "+15555550199", LegacyThreadID: "3101", RemoteThreadID: "3101", InAddressBook: true},

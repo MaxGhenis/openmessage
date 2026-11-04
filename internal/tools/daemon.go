@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -31,6 +32,10 @@ const daemonDownText = "the OpenMessage app isn't running, and this MCP server r
 // daemonSettleTimeout bounds how long a daemon-routed send waits for the
 // outbox item to settle before reporting the durable queued state.
 const daemonSettleTimeout = 25 * time.Second
+
+// errOwnNumber is findDirectSMSConversation's answer for a phone on the line
+// of the account's owner.
+var errOwnNumber = errors.New("the number is the account owner's own")
 
 func daemonDownResult(err error) *mcp.CallToolResult {
 	if err != nil {
