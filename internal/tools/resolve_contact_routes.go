@@ -138,10 +138,10 @@ func resolveContactRoutesHandler(a *app.App, configured ...Options) server.ToolH
 // findRouteConversations returns the query's conversations from reads, the
 // serving store. A query that reads as a phone number, as phoneline.Number
 // defines one, names a phone line; other text matches a conversation's title
-// or someone in it. people supplies
-// the numbers of matching address-book contacts and of matching participants
-// in its own conversations; it then searches reads for those numbers, never
-// for a people-store conversation ID.
+// or someone in it. For other text, people also supplies the numbers of
+// matching address-book contacts and of matching participants in its own
+// conversations, and the function searches reads for each of those numbers
+// once, never for a people-store conversation ID.
 func findRouteConversations(reads readsource.ReadSource, people *db.Store, query string, limit int) ([]*db.Conversation, error) {
 	if limit <= 0 {
 		limit = 20
@@ -197,11 +197,24 @@ func findRouteConversations(reads readsource.ReadSource, people *db.Store, query
 		return newestRoutes(seen, limit), nil
 	}
 
+	// searched holds each line, and each other value, that searchNumber has
+	// asked reads about. The address book and legacy threads often hold one
+	// person's number, each written its own way, and every form names one
+	// line.
+	searched := make(map[string]bool)
 	searchNumber := func(number string) {
 		number = strings.TrimSpace(number)
 		if number == "" {
 			return
 		}
+		key := "text:" + number
+		if looksLikePhoneNumber(number) {
+			key = "line:" + phoneline.Line(number)
+		}
+		if searched[key] {
+			return
+		}
+		searched[key] = true
 		if numberConvos, err := search(number); err == nil {
 			addConversations(numberConvos)
 		}
@@ -216,13 +229,14 @@ func findRouteConversations(reads readsource.ReadSource, people *db.Store, query
 		}
 	}
 
-	if len(seen) == 0 {
-		fallbackContacts, err := people.ListContactsFromConversations(query, limit)
-		if err == nil {
-			for _, contact := range fallbackContacts {
-				if contact != nil {
-					searchNumber(contact.Number)
-				}
+	// A legacy thread can hold a name that reads lack, so its participants
+	// count even when a title or a card matched: a title that holds a name
+	// says nothing about where that person's own thread is.
+	threadContacts, err := people.ListContactsFromConversations(query, limit)
+	if err == nil {
+		for _, contact := range threadContacts {
+			if contact != nil {
+				searchNumber(contact.Number)
 			}
 		}
 	}

@@ -62,8 +62,9 @@ func (s *Store) ListContacts(query string, limit int) ([]*Contact, error) {
 	return contacts, rows.Err()
 }
 
-// ListContactsFromConversations extracts contacts from conversation participants
-// as a fallback when the contacts table is empty.
+// ListContactsFromConversations lists, as contacts, the people whom
+// conversations' participant entries name, for lookups that the address book
+// alone doesn't cover.
 //
 // A participant matches where its name or number holds the query as written,
 // ASCII case aside: SQLite's lower() folds only ASCII letters, and so does the

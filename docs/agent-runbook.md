@@ -1021,9 +1021,12 @@ running app:
   newer threads that list only the owner and one other person can't push a
   match out of the results, and both, like the address-book lookup
   (`ListContacts`), match `%` and `_` literally. The route tool keeps every
-  hit of either search, and when it falls back to the contacts in legacy
-  threads (`ListContactsFromConversations`), that list skips flagged entries
-  too, reads past any number of threads that yield none, and matches what an
+  hit of either search. For text that isn't a number, it also reads the
+  contacts in legacy threads (`ListContactsFromConversations`), even when a
+  title or a card matched. A title that holds a name says nothing about where
+  that person's own thread is. The tool searches each line once, however the
+  cards and threads write it. That contacts list skips flagged entries too,
+  reads past any number of threads that yield none, and matches what an
   entry says, not its JSON text: `R&D` finds R&D Desk, whose & Go's encoder
   writes as an escape, and like `LIKE` and `lower()` it ignores only ASCII
   case, so `ÁNGEL` finds Ángel Ruiz but `ángel` doesn't. Threads that share a
@@ -1056,7 +1059,9 @@ running app:
   `TestResolveContactRoutesFindsAnIncomingSenderByAnyFormOfTheirNumber`,
   `TestResolveContactRoutesFindsALegacyNumberWrittenWithSeparators`,
   `TestResolveContactRoutesFindsANumberOnlyWhereItReadsAsOne`,
-  `TestResolveContactRoutesTakesOnlyAWrittenNumberAsANumber` and
+  `TestResolveContactRoutesTakesOnlyAWrittenNumberAsANumber`,
+  `TestResolveContactRoutesFindsALegacyOnlyNameBesideATitleThatHoldsIt`,
+  `TestResolveContactRoutesSearchesEachLineOnce` and
   `TestResolveContactRoutesFindsALegacyNameThatJSONEscapes` (internal/tools),
   `TestSearchConversationsByMetadataSkipsTheAccountOwner` and
   `TestSearchConversationsByPhoneLineAgreesWithTheLineModel`
