@@ -140,23 +140,9 @@ jobs:
 
       - name: Verify runtime and Compose health check
         run: |
-          set -eu
-          docker compose run --detach --pull never --service-ports --name openmessage \
-            openmessage serve --web --mcp-sse
-          for _ in $(seq 1 90); do
-            health="$(docker inspect --format='{{.State.Health.Status}}' openmessage)"
-            if [ "$health" = healthy ]; then
-              break
-            fi
-            if [ "$health" = unhealthy ]; then
-              docker logs openmessage
-              exit 1
-            fi
-            sleep 1
-          done
-          test "$health" = healthy
+          docker compose up --detach --no-build --wait --wait-timeout 90
           docker compose port openmessage 7007 | grep -Fx '127.0.0.1:7007'
-          docker exec -i openmessage sh -es <<'SH'
+          docker compose exec -T openmessage sh -es <<'SH'
           test "$(id -u):$(id -g)" = "100:101"
           test "$HOME" = "/home/openmessage"
           command -v apk
@@ -174,13 +160,11 @@ jobs:
 
       - name: Show container logs on failure
         if: failure()
-        run: docker logs openmessage || docker compose logs
+        run: docker compose logs
 
       - name: Clean up
         if: always()
-        run: |
-          docker rm --force openmessage || true
-          docker compose down --volumes
+        run: docker compose down --volumes
 
   macos-build:
     name: macOS App Build
