@@ -5,7 +5,7 @@
 # running on a home server / NAS and connect from desktop clients.
 #
 # Build:   docker build -t openmessage .
-# Run:     docker run -p 127.0.0.1:7007:7007 -v openmessage-data:/data openmessage
+# Run:     docker run -p 127.0.0.1:7007:7007 -v openmessage-data:/data openmessage serve --web --mcp-sse
 # Pair:    docker exec -it <container> openmessage pair
 #          (restart the server afterward to load the new session)
 #          (to re-pair, stop the container and run pair in a fresh one with the same volume)
@@ -47,4 +47,4 @@ EXPOSE 7007
 
 # Default to running the server. Override with `pair`, `import`, etc.
 ENTRYPOINT ["openmessage"]
-CMD ["serve", "--web", "--mcp-sse"]
+CMD ["serve"]

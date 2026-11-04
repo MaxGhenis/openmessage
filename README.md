@@ -268,11 +268,12 @@ set `OPENMESSAGE_IMAGE` to use a fork's published image instead. Prerelease tags
 do not update `:latest`.
 
 The image uses Alpine with CA certificates, timezone data, and the shell/`wget`
-needed by the Compose health check. Its package manager is available for
-installing optional debugging or helper packages. It starts the web UI and HTTP
-MCP endpoints explicitly with `serve --web --mcp-sse` and persists messages
-and sessions in `/data`. Optional `signal-cli`/Java, Node.js-based desktop
-import helpers, and browser-based cookie refresh tools are not included.
+needed by the Compose health check. Its default command is `serve`; Compose
+overrides it with `serve --web --mcp-sse` to enable the web UI and HTTP MCP
+endpoints. Alpine's package manager is available for installing optional
+debugging or helper packages. Messages and sessions persist in `/data`.
+Optional `signal-cli`/Java, Node.js-based desktop import helpers, and
+browser-based cookie refresh tools are not included.
 
 From the repository root, after an image has been published:
 
