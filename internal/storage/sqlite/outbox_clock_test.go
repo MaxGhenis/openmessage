@@ -2,6 +2,8 @@ package sqlite
 
 import (
 	"context"
+	"fmt"
+	"reflect"
 	"testing"
 	"time"
 
@@ -65,12 +67,14 @@ func (f *clockSkewFixture) called(id string) (OutboxItem, string) {
 }
 
 // TestOutboxWritesNeverStampUpdatedAtBelowCreatedAt runs every outbox write
-// on a clock that reads 1 s before the rows it touches were created. Each
-// write must succeed and leave updated_at_ms where it was rather than move it
-// below created_at_ms, which the CHECK from 0005_outbox.sql (and 0004 for
-// messages, 0010 for reactions) refuses. Cases that need a lease taken before
-// the row's creation time get it from LeaseDue on the early clock, which is
-// the write the 2026-11-03 race failed.
+// on a clock that trails the rows it touches, once for each of clockSkews:
+// 1 s before they were created, and 1 s after creation but before their last
+// update. Each write must succeed, change its row, and leave every row's
+// updated_at_ms where it was rather than move it backward or below
+// created_at_ms, which the CHECK from 0005_outbox.sql (and 0004 for messages,
+// 0010 for reactions) refuses. Cases that need a lease taken before the row's
+// creation time get it from LeaseDue on an early clock, which is the write
+// the 2026-11-03 race failed.
 func TestOutboxWritesNeverStampUpdatedAtBelowCreatedAt(t *testing.T) {
 	const skew = time.Second
 	before := time.UnixMilli(outboxTestTimeMS).Add(-skew)
@@ -325,6 +329,7 @@ func TestOutboxWritesNeverStampUpdatedAtBelowCreatedAt(t *testing.T) {
 				return mustEnqueueOutgoingOutbox(f.t, f.outbox, item, "body").OutboxID
 			},
 			write: func(f *clockSkewFixture, outboxID string) error {
+				writeAt := f.clock.Now()
 				leaseAt := before.Add(-time.Minute)
 				leases, err := f.outbox.LeaseDue(f.ctx, LeaseRequest{
 					Owner: "dispatcher", Now: leaseAt, Duration: time.Second, Limit: 1,
@@ -338,7 +343,7 @@ func TestOutboxWritesNeverStampUpdatedAtBelowCreatedAt(t *testing.T) {
 				}); err != nil {
 					return err
 				}
-				f.clock.Set(before.UnixMilli())
+				f.clock.Set(writeAt.UnixMilli())
 				recovered, err := f.outbox.RecoverExpiredLeases(f.ctx, f.clock.Now())
 				if err == nil && recovered.Uncertain != 1 {
 					f.t.Fatalf("RecoverExpiredLeases() = %+v, want one uncertain row", recovered)
@@ -350,58 +355,160 @@ func TestOutboxWritesNeverStampUpdatedAtBelowCreatedAt(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			f := newClockSkewFixture(t)
-			outboxID := tc.arrange(f)
-			was := f.row(outboxID)
+			for _, writeTime := range clockSkews {
+				t.Run(writeTime.name, func(t *testing.T) {
+					f := newClockSkewFixture(t)
+					outboxID := tc.arrange(f)
+					rows := writeTime.prepare(t, f.store)
+					was := f.row(outboxID)
 
-			f.clock.Set(before.UnixMilli())
-			if err := tc.write(f, outboxID); err != nil {
-				t.Fatalf("%s on a clock %v before the row was created: %v", tc.name, skew, err)
-			}
+					f.clock.Set(time.UnixMilli(outboxTestTimeMS).Add(writeTime.offset).UnixMilli())
+					if err := tc.write(f, outboxID); err != nil {
+						t.Fatalf("%s on a %s: %v", tc.name, writeTime.name, err)
+					}
 
-			got := f.row(outboxID)
-			if got.UpdatedAtMS < was.UpdatedAtMS || got.UpdatedAtMS < got.CreatedAtMS {
-				t.Fatalf(
-					"updated_at_ms went from %d to %d (created_at_ms %d); want it never to fall",
-					was.UpdatedAtMS, got.UpdatedAtMS, got.CreatedAtMS,
-				)
+					got := f.row(outboxID)
+					if got.UpdatedAtMS < was.UpdatedAtMS || got.UpdatedAtMS < got.CreatedAtMS {
+						t.Fatalf(
+							"updated_at_ms went from %d to %d (created_at_ms %d); want it never to fall",
+							was.UpdatedAtMS, got.UpdatedAtMS, got.CreatedAtMS,
+						)
+					}
+					unchanged := got
+					unchanged.UpdatedAtMS = was.UpdatedAtMS
+					if reflect.DeepEqual(unchanged, was) {
+						t.Fatalf("%s left the outbox row as it was, so this case checks nothing", tc.name)
+					}
+					assertNoUpdatedAtFell(t, f.store, rows)
+					assertNoRowUpdatedBeforeCreated(t, f.store)
+				})
 			}
-			assertNoRowUpdatedBeforeCreated(t, f.store)
 		})
 	}
 }
 
 // TestOutboxConfirmReactionOverAnOlderOwnReactionOnAnEarlyClock confirms a
-// reaction whose own read-model row already exists, created after the
-// confirm's clock read. The confirm writes the reaction row's updated_at_ms
-// from that read, so it must not move below the row's created_at_ms.
+// reaction whose own read-model row already exists, on a clock that trails
+// that row, once for each of clockSkews. The confirm writes the reaction
+// row's updated_at_ms from its clock read, so it must not move it backward or
+// below the row's created_at_ms.
 func TestOutboxConfirmReactionOverAnOlderOwnReactionOnAnEarlyClock(t *testing.T) {
-	f := newConfirmReactionFixture(t)
-	ctx := context.Background()
-	if _, err := f.reactions.ApplyReaction(ctx, ReactionApply{
-		AccountID: "account-a", ConversationID: "conversation-a", MessageID: f.targetID,
-		ReactorKey: SelfReactorKey, ReactorIsSelf: true, ReactorLabel: SelfReactorLabel,
-		Emoji: "👍", Action: bridge.ReactionAdd,
-		OccurredAtMS: confirmReactionTimeMS - 500, SourceSeqMS: confirmReactionTimeMS - 500,
-	}); err != nil {
-		t.Fatalf("ApplyReaction(earlier own reaction): %v", err)
-	}
-	outboxID, leaseToken := f.called("🎉", bridge.ReactionAdd)
+	for _, writeTime := range clockSkews {
+		t.Run(writeTime.name, func(t *testing.T) {
+			f := newConfirmReactionFixture(t)
+			ctx := context.Background()
+			if _, err := f.reactions.ApplyReaction(ctx, ReactionApply{
+				AccountID: "account-a", ConversationID: "conversation-a", MessageID: f.targetID,
+				ReactorKey: SelfReactorKey, ReactorIsSelf: true, ReactorLabel: SelfReactorLabel,
+				Emoji: "👍", Action: bridge.ReactionAdd,
+				OccurredAtMS: confirmReactionTimeMS - 500, SourceSeqMS: confirmReactionTimeMS - 500,
+			}); err != nil {
+				t.Fatalf("ApplyReaction(earlier own reaction): %v", err)
+			}
+			outboxID, leaseToken := f.called("🎉", bridge.ReactionAdd)
+			rows := writeTime.prepare(t, f.store)
 
-	f.clock.Set(confirmReactionTimeMS - 1_000)
-	applied, err := f.outbox.ConfirmReaction(ctx, ReactionConfirmation{
-		OutboxID: outboxID, LeaseToken: leaseToken, OccurredAt: time.UnixMilli(confirmReactionTimeMS - 100),
-	})
-	if err != nil || !applied {
-		t.Fatalf("ConfirmReaction() on an early clock = %v, %v; want applied, nil", applied, err)
+			f.clock.Set(confirmReactionTimeMS + writeTime.offset.Milliseconds())
+			applied, err := f.outbox.ConfirmReaction(ctx, ReactionConfirmation{
+				OutboxID: outboxID, LeaseToken: leaseToken, OccurredAt: time.UnixMilli(confirmReactionTimeMS - 100),
+			})
+			if err != nil || !applied {
+				t.Fatalf("ConfirmReaction() on a %s = %v, %v; want applied, nil", writeTime.name, applied, err)
+			}
+			if state := f.state(outboxID); state != OutboxConfirmed {
+				t.Fatalf("state = %q, want confirmed", state)
+			}
+			if got := activeReactions(t, f.store, f.targetID); len(got) != 1 || got[0] != SelfReactorKey+" 🎉" {
+				t.Fatalf("active reactions = %v, want the confirmed 🎉 alone", got)
+			}
+			assertNoUpdatedAtFell(t, f.store, rows)
+			assertNoRowUpdatedBeforeCreated(t, f.store)
+		})
 	}
-	if state := f.state(outboxID); state != OutboxConfirmed {
-		t.Fatalf("state = %q, want confirmed", state)
+}
+
+// clampTables are the tables whose CHECK requires updated_at_ms >=
+// created_at_ms.
+var clampTables = []string{
+	"accounts", "devices", "identities", "people", "conversations",
+	"messages", "outbox", "message_attachments", "reactions",
+}
+
+// clockSkew is when a write under test reads its clock, relative to the rows
+// it changes.
+type clockSkew struct {
+	name string
+	// offset is the write's time minus the changed rows' created_at_ms.
+	offset time.Duration
+	// lastUpdate, when positive, moves every row's updated_at_ms to
+	// created_at_ms+lastUpdate before the write, as a later write would leave
+	// it.
+	lastUpdate time.Duration
+}
+
+// clockSkews are the two ways a write's time can trail the row it changes.
+// Before creation, a plain write fails the CHECK. After creation but before
+// the last update, a write clamped only to created_at_ms
+// (MAX(created_at_ms, ?)) satisfies the CHECK and still moves updated_at_ms
+// backward.
+var clockSkews = []clockSkew{
+	{name: "clock before the row was created", offset: -time.Second},
+	{name: "clock after creation, before the last update", offset: time.Second, lastUpdate: 2 * time.Second},
+}
+
+// prepare gives store's rows their last update, if the skew has one, and
+// returns each row's updated_at_ms for assertNoUpdatedAtFell.
+func (s clockSkew) prepare(t *testing.T, store *Store) map[string]int64 {
+	t.Helper()
+	if s.lastUpdate > 0 {
+		for _, table := range clampTables {
+			if _, err := store.db.Exec(
+				`UPDATE `+table+` SET updated_at_ms = MAX(updated_at_ms, created_at_ms + ?)`,
+				s.lastUpdate.Milliseconds(),
+			); err != nil {
+				t.Fatalf("move %s updated_at_ms past created_at_ms: %v", table, err)
+			}
+		}
 	}
-	if got := activeReactions(t, f.store, f.targetID); len(got) != 1 || got[0] != SelfReactorKey+" 🎉" {
-		t.Fatalf("active reactions = %v, want the confirmed 🎉 alone", got)
+	return updatedAtByRow(t, store)
+}
+
+// updatedAtByRow maps each row of clampTables, named by its table, rowid and
+// created_at_ms, to its updated_at_ms.
+func updatedAtByRow(t *testing.T, store *Store) map[string]int64 {
+	t.Helper()
+	byRow := make(map[string]int64)
+	for _, table := range clampTables {
+		rows, err := store.db.Query(`SELECT rowid, created_at_ms, updated_at_ms FROM ` + table)
+		if err != nil {
+			t.Fatalf("read %s updated_at_ms: %v", table, err)
+		}
+		for rows.Next() {
+			var rowID, createdAtMS, updatedAtMS int64
+			if err := rows.Scan(&rowID, &createdAtMS, &updatedAtMS); err != nil {
+				rows.Close()
+				t.Fatalf("scan %s updated_at_ms: %v", table, err)
+			}
+			byRow[fmt.Sprintf("%s row %d created at %d", table, rowID, createdAtMS)] = updatedAtMS
+		}
+		err = rows.Err()
+		rows.Close()
+		if err != nil {
+			t.Fatalf("read %s updated_at_ms: %v", table, err)
+		}
 	}
-	assertNoRowUpdatedBeforeCreated(t, f.store)
+	return byRow
+}
+
+// assertNoUpdatedAtFell checks that no row in before, from updatedAtByRow,
+// now has a lower updated_at_ms. It skips rows deleted since.
+func assertNoUpdatedAtFell(t *testing.T, store *Store, before map[string]int64) {
+	t.Helper()
+	for row, updatedAtMS := range updatedAtByRow(t, store) {
+		if was, ok := before[row]; ok && updatedAtMS < was {
+			t.Fatalf("%s: updated_at_ms fell from %d to %d", row, was, updatedAtMS)
+		}
+	}
 }
 
 // assertNoRowUpdatedBeforeCreated checks, across every table that carries
@@ -410,10 +517,7 @@ func TestOutboxConfirmReactionOverAnOlderOwnReactionOnAnEarlyClock(t *testing.T)
 // and documents which tables the invariant covers.
 func assertNoRowUpdatedBeforeCreated(t *testing.T, store *Store) {
 	t.Helper()
-	for _, table := range []string{
-		"accounts", "devices", "identities", "people", "conversations",
-		"messages", "outbox", "message_attachments", "reactions",
-	} {
+	for _, table := range clampTables {
 		var count int
 		if err := store.db.QueryRow(
 			`SELECT COUNT(*) FROM ` + table + ` WHERE updated_at_ms < created_at_ms`,

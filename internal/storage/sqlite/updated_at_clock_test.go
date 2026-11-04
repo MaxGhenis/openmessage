@@ -2,6 +2,7 @@ package sqlite
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -18,6 +19,15 @@ type clampFixture struct {
 	messages    *MessageRepository
 	attachments *MessageAttachmentRepository
 	reactions   *ReactionRepository
+	// writeTime is when the write under test reads its clock.
+	writeTime clockSkew
+}
+
+// repositoryWriteMS is the time a write under test stamps on an account,
+// device, identity or conversation, which the fixture creates at
+// repositoryTestTimeMS.
+func (f *clampFixture) repositoryWriteMS() int64 {
+	return repositoryTestTimeMS + f.writeTime.offset.Milliseconds()
 }
 
 func newClampFixture(t *testing.T) *clampFixture {
@@ -136,16 +146,51 @@ func (f *clampFixture) updatedAt(target clampTarget) (int64, bool) {
 	return updatedAtMS, count == 1
 }
 
+// rowExceptUpdatedAt formats every column of the target row but
+// updated_at_ms, so a test can tell whether a write changed the row.
+func (f *clampFixture) rowExceptUpdatedAt(target clampTarget) string {
+	f.t.Helper()
+	rows, err := f.store.db.Query(`SELECT * FROM `+target.table+` WHERE `+target.where, target.args...)
+	if err != nil {
+		f.t.Fatalf("read %s row: %v", target.table, err)
+	}
+	defer rows.Close()
+	columns, err := rows.Columns()
+	if err != nil {
+		f.t.Fatalf("read %s columns: %v", target.table, err)
+	}
+	var formatted strings.Builder
+	for rows.Next() {
+		values := make([]any, len(columns))
+		pointers := make([]any, len(columns))
+		for index := range values {
+			pointers[index] = &values[index]
+		}
+		if err := rows.Scan(pointers...); err != nil {
+			f.t.Fatalf("scan %s row: %v", target.table, err)
+		}
+		for index, column := range columns {
+			if column != "updated_at_ms" {
+				fmt.Fprintf(&formatted, "%s=%v;", column, values[index])
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		f.t.Fatalf("read %s row: %v", target.table, err)
+	}
+	return formatted.String()
+}
+
 // TestStoreWritesNeverStampUpdatedAtBelowCreatedAt covers every write outside
 // the outbox that sets updated_at_ms on a table whose CHECK requires
 // updated_at_ms >= created_at_ms (migrations 0002, 0004, 0008 and 0010). Each
-// write runs with a time older than the row's current updated_at_ms: the
-// clock read of a writer that raced the insert, or a wall clock stepped back.
-// It must succeed and must not move updated_at_ms backward.
+// write runs with a time older than the row's current updated_at_ms, once for
+// each of clockSkews: the clock read of a writer that raced the insert or a
+// later update, or a wall clock stepped back. It must succeed, change its row,
+// and move no row's updated_at_ms backward.
 func TestStoreWritesNeverStampUpdatedAtBelowCreatedAt(t *testing.T) {
+	// The mint case carries a creation time this far after its own clock.
 	const skewMS = 1_000
-	repositoryEarlyMS := repositoryTestTimeMS - skewMS
-	messageEarlyMS := messageTestTimeMS - skewMS
 	messageA := clampTarget{"messages", "message_id = ?", []any{"message-a"}}
 	attachmentA := clampTarget{"message_attachments", "message_id = ? AND ordinal = 0", []any{"message-a"}}
 	reactionA := clampTarget{"reactions", "message_id = ? AND reactor_key = ?", []any{"message-a", "identity-a"}}
@@ -163,7 +208,7 @@ func TestStoreWritesNeverStampUpdatedAtBelowCreatedAt(t *testing.T) {
 			act: func(f *clampFixture) error {
 				account := repositoryTestAccount("account-a")
 				account.DisplayName = "renamed by a writer that read its clock early"
-				account.CreatedAtMS, account.UpdatedAtMS = repositoryEarlyMS, repositoryEarlyMS
+				account.CreatedAtMS, account.UpdatedAtMS = f.repositoryWriteMS(), f.repositoryWriteMS()
 				return f.store.UpsertAccount(account)
 			},
 		},
@@ -171,7 +216,7 @@ func TestStoreWritesNeverStampUpdatedAtBelowCreatedAt(t *testing.T) {
 			name:   "UpsertDevice",
 			target: clampTarget{"devices", "device_id = ?", []any{"device-a"}},
 			arrange: func(f *clampFixture) {
-				mustRepositoryWrite(t, "UpsertDevice", f.store.UpsertDevice(Device{
+				mustRepositoryWrite(f.t, "UpsertDevice", f.store.UpsertDevice(Device{
 					DeviceID:    "device-a",
 					AccountID:   "account-a",
 					Kind:        DeviceKindLocalInstallation,
@@ -188,8 +233,8 @@ func TestStoreWritesNeverStampUpdatedAtBelowCreatedAt(t *testing.T) {
 					DisplayName: "renamed",
 					State:       DeviceStateActive,
 					IsCurrent:   true,
-					CreatedAtMS: repositoryEarlyMS,
-					UpdatedAtMS: repositoryEarlyMS,
+					CreatedAtMS: f.repositoryWriteMS(),
+					UpdatedAtMS: f.repositoryWriteMS(),
 				})
 			},
 		},
@@ -199,7 +244,7 @@ func TestStoreWritesNeverStampUpdatedAtBelowCreatedAt(t *testing.T) {
 			act: func(f *clampFixture) error {
 				identity := repositoryTestIdentity("identity-a", "account-a", "identity-a")
 				identity.DisplayName = "renamed"
-				identity.CreatedAtMS, identity.UpdatedAtMS = repositoryEarlyMS, repositoryEarlyMS
+				identity.CreatedAtMS, identity.UpdatedAtMS = f.repositoryWriteMS(), f.repositoryWriteMS()
 				return f.store.UpsertIdentity(identity)
 			},
 		},
@@ -215,8 +260,8 @@ func TestStoreWritesNeverStampUpdatedAtBelowCreatedAt(t *testing.T) {
 					Title:                "renamed",
 					NotificationMode:     NotificationModeAll,
 					MetadataJSON:         `{}`,
-					CreatedAtMS:          repositoryEarlyMS,
-					UpdatedAtMS:          repositoryEarlyMS,
+					CreatedAtMS:          f.repositoryWriteMS(),
+					UpdatedAtMS:          f.repositoryWriteMS(),
 				})
 			},
 		},
@@ -232,7 +277,7 @@ func TestStoreWritesNeverStampUpdatedAtBelowCreatedAt(t *testing.T) {
 					return err
 				}
 				account.DisplayName = "renamed"
-				account.UpdatedAtMS = repositoryEarlyMS
+				account.UpdatedAtMS = f.repositoryWriteMS()
 				return f.store.UpsertAccount(account)
 			},
 		},
@@ -240,7 +285,7 @@ func TestStoreWritesNeverStampUpdatedAtBelowCreatedAt(t *testing.T) {
 			name:   "UpsertDevice writing back a stored row",
 			target: clampTarget{"devices", "device_id = ?", []any{"device-a"}},
 			arrange: func(f *clampFixture) {
-				mustRepositoryWrite(t, "UpsertDevice", f.store.UpsertDevice(Device{
+				mustRepositoryWrite(f.t, "UpsertDevice", f.store.UpsertDevice(Device{
 					DeviceID:    "device-a",
 					AccountID:   "account-a",
 					Kind:        DeviceKindLocalInstallation,
@@ -255,7 +300,7 @@ func TestStoreWritesNeverStampUpdatedAtBelowCreatedAt(t *testing.T) {
 					return err
 				}
 				device.DisplayName = "renamed"
-				device.UpdatedAtMS = repositoryEarlyMS
+				device.UpdatedAtMS = f.repositoryWriteMS()
 				return f.store.UpsertDevice(device)
 			},
 		},
@@ -268,7 +313,7 @@ func TestStoreWritesNeverStampUpdatedAtBelowCreatedAt(t *testing.T) {
 					return err
 				}
 				identity.DisplayName = "renamed"
-				identity.UpdatedAtMS = repositoryEarlyMS
+				identity.UpdatedAtMS = f.repositoryWriteMS()
 				return f.store.UpsertIdentity(identity)
 			},
 		},
@@ -281,7 +326,7 @@ func TestStoreWritesNeverStampUpdatedAtBelowCreatedAt(t *testing.T) {
 					return err
 				}
 				conversation.Title = "renamed"
-				conversation.UpdatedAtMS = repositoryEarlyMS
+				conversation.UpdatedAtMS = f.repositoryWriteMS()
 				return f.store.UpsertConversation(conversation)
 			},
 		},
@@ -352,7 +397,7 @@ func TestStoreWritesNeverStampUpdatedAtBelowCreatedAt(t *testing.T) {
 			arrange: func(f *clampFixture) {
 				f.pendingAttachment()
 				if err := f.attachments.MarkDownloaded(f.ctx, "message-a", 0, downloadedHash, 10, "image/png"); err != nil {
-					t.Fatalf("MarkDownloaded(): %v", err)
+					f.t.Fatalf("MarkDownloaded(): %v", err)
 				}
 			},
 			act: func(f *clampFixture) error {
@@ -360,7 +405,7 @@ func TestStoreWritesNeverStampUpdatedAtBelowCreatedAt(t *testing.T) {
 					f.ctx, "message-a", 0, downloadedHash, strings.Repeat("cd", 32), 12, "image/png",
 				)
 				if err == nil && !replaced {
-					t.Fatal("ReplaceDownloaded() replaced = false, want true")
+					f.t.Fatal("ReplaceDownloaded() replaced = false, want true")
 				}
 				return err
 			},
@@ -379,7 +424,7 @@ func TestStoreWritesNeverStampUpdatedAtBelowCreatedAt(t *testing.T) {
 			arrange: func(f *clampFixture) {
 				f.projectMessageA()
 				if err := f.applyReaction("👍", messageTestTimeMS-500); err != nil {
-					t.Fatalf("ApplyReaction(👍): %v", err)
+					f.t.Fatalf("ApplyReaction(👍): %v", err)
 				}
 			},
 			act: func(f *clampFixture) error { return f.applyReaction("🎉", messageTestTimeMS-400) },
@@ -390,7 +435,7 @@ func TestStoreWritesNeverStampUpdatedAtBelowCreatedAt(t *testing.T) {
 			arrange: func(f *clampFixture) {
 				f.projectMessageA()
 				if err := f.snapshot(10, "👍"); err != nil {
-					t.Fatalf("ReplaceEmbeddedReactions(👍): %v", err)
+					f.t.Fatalf("ReplaceEmbeddedReactions(👍): %v", err)
 				}
 			},
 			act: func(f *clampFixture) error { return f.snapshot(11, "🎉") },
@@ -401,7 +446,7 @@ func TestStoreWritesNeverStampUpdatedAtBelowCreatedAt(t *testing.T) {
 			arrange: func(f *clampFixture) {
 				f.projectMessageA()
 				if err := f.snapshot(10, "👍"); err != nil {
-					t.Fatalf("ReplaceEmbeddedReactions(👍): %v", err)
+					f.t.Fatalf("ReplaceEmbeddedReactions(👍): %v", err)
 				}
 			},
 			act: func(f *clampFixture) error { return f.snapshot(11) },
@@ -410,35 +455,47 @@ func TestStoreWritesNeverStampUpdatedAtBelowCreatedAt(t *testing.T) {
 			name:   "ApplyRepairPlan mint carrying a later creation time",
 			target: clampTarget{"conversations", "conversation_id = ?", []any{"conversation-minted"}},
 			act: func(f *clampFixture) error {
+				nowMS := f.clock.Now().UnixMilli()
 				return f.store.ApplyRepairPlan(f.ctx, "account-a", []RepairStep{{
 					Op:                   "mint",
 					ConversationID:       "conversation-minted",
 					RemoteConversationID: "remote-conversation-minted",
 					Kind:                 string(ConversationKindDirect),
-					CreatedAtMS:          messageTestTimeMS,
-				}}, messageEarlyMS)
+					CreatedAtMS:          nowMS + skewMS,
+				}}, nowMS)
 			},
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			f := newClampFixture(t)
-			if test.arrange != nil {
-				test.arrange(f)
-			}
-			before, existed := f.updatedAt(test.target)
-			f.clock.Set(messageEarlyMS)
+			for _, writeTime := range clockSkews {
+				t.Run(writeTime.name, func(t *testing.T) {
+					f := newClampFixture(t)
+					f.writeTime = writeTime
+					if test.arrange != nil {
+						test.arrange(f)
+					}
+					rows := writeTime.prepare(t, f.store)
+					before, existed := f.updatedAt(test.target)
+					wasRow := f.rowExceptUpdatedAt(test.target)
+					f.clock.Set(messageTestTimeMS + writeTime.offset.Milliseconds())
 
-			if err := test.act(f); err != nil {
-				t.Fatalf("write on an early clock: %v", err)
+					if err := test.act(f); err != nil {
+						t.Fatalf("write on a %s: %v", writeTime.name, err)
+					}
+					after, exists := f.updatedAt(test.target)
+					if !exists {
+						t.Fatalf("%s row is missing after the write", test.target.table)
+					}
+					if existed && after < before {
+						t.Fatalf("%s updated_at_ms fell from %d to %d", test.target.table, before, after)
+					}
+					if existed && f.rowExceptUpdatedAt(test.target) == wasRow {
+						t.Fatalf("the write left the %s row as it was, so this case checks nothing", test.target.table)
+					}
+					assertNoUpdatedAtFell(t, f.store, rows)
+					assertNoRowUpdatedBeforeCreated(t, f.store)
+				})
 			}
-			after, exists := f.updatedAt(test.target)
-			if !exists {
-				t.Fatalf("%s row is missing after the write", test.target.table)
-			}
-			if existed && after < before {
-				t.Fatalf("%s updated_at_ms fell from %d to %d", test.target.table, before, after)
-			}
-			assertNoRowUpdatedBeforeCreated(t, f.store)
 		})
 	}
 }
