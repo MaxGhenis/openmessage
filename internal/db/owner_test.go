@@ -181,15 +181,17 @@ func ownerRuleList(random *rand.Rand, exercised map[string]int) (string, []strin
 // text, and an object through the first non-blank string of "number" and
 // "phone", with a flag only where "is_me" or "isMe" decodes to true, and
 // with the texts of its "name", "number", "phone" and "email" strings in a
-// token decode's order. ok is false when the element is neither an object
-// nor a string.
+// token decode's order. Its addresses are a string's text, or an object's
+// "number", "phone" and "email" strings as the generic decode, which keeps
+// a repeated key's last value, gives them. ok is false when the element is
+// neither an object nor a string.
 func ownerRuleReference(element string) (entry ParticipantEntry, ok bool) {
 	var value any
 	if modelDecode([]byte(element), &value) != nil {
 		return ParticipantEntry{}, false
 	}
 	if text, isText := value.(string); isText {
-		return ParticipantEntry{Number: strings.TrimSpace(text), Texts: []string{text}}, true
+		return ParticipantEntry{Number: strings.TrimSpace(text), Texts: []string{text}, Addresses: []string{text}}, true
 	}
 	object, ok := value.(map[string]any)
 	if !ok {
@@ -210,6 +212,11 @@ func ownerRuleReference(element string) (entry ParticipantEntry, ok bool) {
 			}
 		}
 	}
+	for _, key := range []string{"number", "phone", "email"} {
+		if text, isText := object[key].(string); isText {
+			entry.Addresses = append(entry.Addresses, text)
+		}
+	}
 	return entry, true
 }
 
@@ -219,7 +226,8 @@ func sameEntries(a, b []ParticipantEntry) bool {
 		return false
 	}
 	for index := range a {
-		if a[index].Number != b[index].Number || a[index].IsMe != b[index].IsMe || !slices.Equal(a[index].Texts, b[index].Texts) {
+		if a[index].Number != b[index].Number || a[index].IsMe != b[index].IsMe || !slices.Equal(a[index].Texts, b[index].Texts) ||
+			!slices.Equal(a[index].Addresses, b[index].Addresses) {
 			return false
 		}
 	}
@@ -238,10 +246,11 @@ func ownerLinesOf(numbers ...string) OwnerLines {
 
 // sqlEntryRow is an entry as openmessage_participant_entries writes it.
 type sqlEntryRow struct {
-	IsMe       bool     `json:"is_me"`
-	Number     string   `json:"number"`
-	NumberKeys []string `json:"number_keys"`
-	Texts      []string `json:"texts"`
+	IsMe        bool     `json:"is_me"`
+	Number      string   `json:"number"`
+	NumberKeys  []string `json:"number_keys"`
+	Texts       []string `json:"texts"`
+	AddressKeys []string `json:"address_keys"`
 }
 
 // Invariants of the owner rule's readers, over random participants lists
@@ -257,8 +266,9 @@ type sqlEntryRow struct {
 //	R2. The legacy searches read a list through Go, never through SQLite's
 //	    JSON reader: openmessage_participant_entries gives each entry
 //	    ParticipantEntries gives, in order, with its number's
-//	    phoneline.ValueKeys, and openmessage_owner_line_keys gives the
-//	    phoneline.LineKeys of each line OwnerLine gives one of them.
+//	    phoneline.ValueKeys and its Addresses with ASCII letters lowered,
+//	    and openmessage_owner_line_keys gives the phoneline.LineKeys of each
+//	    line OwnerLine gives one of them.
 //	R3. Over those rows, sqlEntryIsOwners agrees with OwnerLines.Owner, for
 //	    the list's own lines and for a line from another conversation. A
 //	    string never gives a line but counts as the owner's on an owner line,
@@ -369,9 +379,16 @@ func TestOwnerRuleReadsEachElementAlikeInGoAndSQL(t *testing.T) {
 				return failed("entry %d: %q isn't an entry object: %v", key, value, err)
 			}
 			entry := got[key]
+			addressKeys := []string{}
+			for _, address := range entry.Addresses {
+				addressKeys = append(addressKeys, modelFoldASCII(address))
+				if modelFoldASCII(address) != address {
+					exercised["an address with an ASCII capital"]++
+				}
+			}
 			if row.Number != entry.Number || row.IsMe != entry.IsMe || !slices.Equal(row.Texts, entry.Texts) ||
-				!slices.Equal(row.NumberKeys, phoneline.ValueKeys(entry.Number)) {
-				return failed("SQL entry %d = %#v, want %#v with keys %q", key, row, entry, phoneline.ValueKeys(entry.Number))
+				!slices.Equal(row.NumberKeys, phoneline.ValueKeys(entry.Number)) || !slices.Equal(row.AddressKeys, addressKeys) {
+				return failed("SQL entry %d = %#v, want %#v with keys %q and address keys %q", key, row, entry, phoneline.ValueKeys(entry.Number), addressKeys)
 			}
 			if owner != lines.Owner(entry) {
 				return failed("sqlEntryIsOwners(entry %d %#v, keys %s) = %v, want %v", key, entry, keysJSON, owner, !owner)
@@ -406,7 +423,7 @@ func TestOwnerRuleReadsEachElementAlikeInGoAndSQL(t *testing.T) {
 		"a flag that isn't true", "a number of another JSON type", "a number too large for a float64", "a list that isn't a JSON array",
 		"a NUL in a text", "a number with a NUL", "a member nested deeper than SQLite reads",
 		"a list nested deeper than SQLite reads", "a list nested deeper than Go reads", "a list with bytes after a NUL",
-		"an owner line", "an unflagged entry on an owner line", "a string on an owner line",
+		"an owner line", "an unflagged entry on an owner line", "a string on an owner line", "an address with an ASCII capital",
 	} {
 		if exercised[path] == 0 {
 			t.Errorf("the property never drew %s; raise MaxCount (drew %v)", path, exercised)

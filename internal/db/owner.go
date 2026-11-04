@@ -37,6 +37,11 @@ type ParticipantEntry struct {
 	// text, or each "name", "number", "phone" and "email" member of an
 	// object that holds a JSON string, in order, a repeated key each time.
 	Texts []string
+	// Addresses are the values an address search compares whole: a string
+	// element's text, or an object's "number", "phone" and "email" values,
+	// in that order, each as written where it holds a JSON string. Where a
+	// key repeats, its last value counts.
+	Addresses []string
 }
 
 // ParticipantEntries reads each object or string element of a participants
@@ -219,10 +224,11 @@ func init() {
 
 // sqlEntry is an entry as openmessage_participant_entries writes it.
 type sqlEntry struct {
-	IsMe       bool     `json:"is_me"`
-	Number     string   `json:"number"`
-	NumberKeys []string `json:"number_keys"`
-	Texts      []string `json:"texts"`
+	IsMe        bool     `json:"is_me"`
+	Number      string   `json:"number"`
+	NumberKeys  []string `json:"number_keys"`
+	Texts       []string `json:"texts"`
+	AddressKeys []string `json:"address_keys"`
 }
 
 func participantEntriesJSON(_ *sqlite.FunctionContext, args []driver.Value) (driver.Value, error) {
