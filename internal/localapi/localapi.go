@@ -457,6 +457,35 @@ func (c *Client) React(ctx context.Context, conversationID, messageID, emoji, ac
 	return result, nil
 }
 
+// TranscriptResult is the daemon's answer on /api/transcript.
+// TranscriptModel is the model the message carries after the save; a daemon
+// that predates the field leaves it nil.
+type TranscriptResult struct {
+	Success          bool    `json:"success"`
+	MessageID        string  `json:"message_id"`
+	TranscriptLength int     `json:"transcript_length"`
+	TranscriptModel  *string `json:"transcript_model"`
+}
+
+// SetTranscript saves a transcript for a message through the daemon's
+// /api/transcript surface, under the legacy store's rules: an empty
+// transcript clears the transcript and its model, and a nil model keeps the
+// stored one. Only a legacy-primary daemon saves it. A v2-primary daemon
+// refuses with HTTP 409, because the v2 store keeps no transcripts; an unknown
+// message is HTTP 404.
+func (c *Client) SetTranscript(ctx context.Context, messageID, transcript string, model *string) (TranscriptResult, error) {
+	payload := struct {
+		MessageID  string  `json:"message_id"`
+		Transcript string  `json:"transcript"`
+		Model      *string `json:"model,omitempty"`
+	}{messageID, transcript, model}
+	var result TranscriptResult
+	if err := c.postJSON(ctx, "/api/transcript", payload, &result); err != nil {
+		return TranscriptResult{}, err
+	}
+	return result, nil
+}
+
 // Attachment is one message attachment's bytes as the daemon served them.
 type Attachment struct {
 	Data     []byte
