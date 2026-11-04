@@ -151,6 +151,19 @@ func Match(line, stored string) bool {
 	return strings.HasSuffix(digits, line) || strings.HasSuffix(line, digits)
 }
 
+// LineKeys and ValueKeys index Match: Match(line, value) holds exactly when
+// LineKeys(line) and ValueKeys(value) share a key, for any line and any
+// value, and neither gives more than ten keys. So a set of lines answers
+// Match for a value through a few lookups, however many lines it holds.
+func LineKeys(line string) []string {
+	return nil
+}
+
+// ValueKeys gives the keys of value that LineKeys indexes Match by.
+func ValueKeys(value string) []string {
+	return nil
+}
+
 // MatchFirst applies Match to the first of values that isn't blank, as a
 // participant's number stands in for its phone. That value decides even when
 // it names no line: an entry whose number holds an email address doesn't

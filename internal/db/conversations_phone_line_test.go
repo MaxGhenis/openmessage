@@ -169,14 +169,35 @@ func phoneLineForm(random *rand.Rand, digits string) string {
 	return digits
 }
 
+// An object that repeats "number" names the line of the last one, as Go
+// reads the object for send_message and for the owner rule. SQLite's
+// json_extract takes the first, so the line search found Bob's thread under
+// a number that send_message never reads there.
+func TestSearchConversationsByPhoneLineReadsARepeatedNumberAsSendMessageDoes(t *testing.T) {
+	store := newTestStore(t)
+	seedConversations(t, store, &Conversation{
+		ConversationID: "bob", Name: "Bob Example", SourcePlatform: "sms", LastMessageTS: 1000,
+		Participants: `[{"name":"Bob Example","number":"+15555550199","number":"+15555550188"}]`,
+	})
+	if got := lineSearchIDs(t, store, "+15555550188", 10); fmt.Sprint(got) != "[bob]" {
+		t.Errorf("the line of the last number finds %v, want [bob]", got)
+	}
+	if got := lineSearchIDs(t, store, "+15555550199", 10); len(got) != 0 {
+		t.Errorf("the line of the first number finds %v, want none", got)
+	}
+}
+
 // Differential, over random stores: SearchConversationsByPhoneLine returns
 // exactly what phoneLineModel returns, in the same order. Numbers come in
 // many written forms. Decoys hold a target's last ten digits inside a longer
 // number, share only its last seven, or are too short to name a line, and one
 // holds the owner's last seven digits, which also end a target's number; some
 // entries carry the number under phone, a blank number, or a number that
-// isn't text; identifiers that are no phone number, such as an email address,
-// a Signal UUID or a WhatsApp LID, hold targets' digits; the owner's entries
+// isn't text, and some repeat "number"; identifiers that are no phone
+// number, such as an email address, a Signal UUID, a WhatsApp LID or a
+// number followed by a NUL, hold targets' digits; some lists nest deeper
+// than SQLite's JSON reader goes or carry bytes after a NUL, where SQLite's
+// reader stops and Go's doesn't, so only Go's reading counts; the owner's entries
 // carry the owner's number flagged, unflagged or with a flag that isn't JSON
 // true, other objects and bare strings carry it too, and the owner sends
 // messages too; and threads often share a time. So, as invariants, a thread
@@ -198,7 +219,7 @@ func TestSearchConversationsByPhoneLineAgreesWithTheLineModel(t *testing.T) {
 	decoys := []string{"447555012399", "4412025550123", "13035550123", "5550123", "550123", "12025550124", "0009999"}
 	// identifiers hold a target's digits but are no phone number, except a
 	// WhatsApp JID on the phone-number server, which names its user's line.
-	identifiers := []string{"alice12025550123@example.com", "abcdefab-abcd-abcd-abcd-a13035550147", "15555550199@lid", "users/12025550123", "+99999912025550123", "13035550147@s.whatsapp.net"}
+	identifiers := []string{"alice12025550123@example.com", "abcdefab-abcd-abcd-abcd-a13035550147", "15555550199@lid", "users/12025550123", "+99999912025550123", "13035550147@s.whatsapp.net", "+12025550123\x00", "+1 303 555 0147\x00x"}
 	exercised := map[string]int{}
 
 	property := func(seed int64) bool {
@@ -232,6 +253,11 @@ func TestSearchConversationsByPhoneLineAgreesWithTheLineModel(t *testing.T) {
 				case 4:
 					number, _ := strconv.ParseInt(phoneline.Digits(form), 10, 64)
 					entries = append(entries, map[string]any{"name": "P" + strconv.Itoa(member), "number": number})
+				case 5:
+					first, _ := json.Marshal(value())
+					last, _ := json.Marshal(form)
+					entries = append(entries, json.RawMessage(`{"name":"P`+strconv.Itoa(member)+`","number":`+string(first)+`,"number":`+string(last)+`}`))
+					exercised["an object that repeats number"]++
 				default:
 					entries = append(entries, map[string]any{"name": "P" + strconv.Itoa(member), "number": form})
 				}
@@ -250,11 +276,17 @@ func TestSearchConversationsByPhoneLineAgreesWithTheLineModel(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			switch random.Intn(12) {
+			switch random.Intn(14) {
 			case 0:
 				participants = []byte("")
 			case 1:
 				participants = []byte(`{"number":"+` + targets[0] + `"}`)
+			case 2:
+				participants = append([]byte("["+ownerRuleNested(1000+random.Intn(500))+","), participants[1:]...)
+				exercised["a list nested deeper than SQLite reads"]++
+			case 3:
+				participants = append(participants, "\x00garbage"...)
+				exercised["a list with bytes after a NUL"]++
 			}
 			if err := store.UpsertConversation(&Conversation{
 				ConversationID: id, Name: "Thread " + id, Participants: string(participants),
@@ -392,6 +424,7 @@ func TestSearchConversationsByPhoneLineAgreesWithTheLineModel(t *testing.T) {
 		"a hit behind a newer thread whose numbers only contain the line's digits",
 		"a tie at the limit",
 		"a thread that only identifiers holding the line's digits tie to it",
+		"an object that repeats number", "a list nested deeper than SQLite reads", "a list with bytes after a NUL",
 	} {
 		if exercised[path] == 0 {
 			t.Errorf("the property never drew %s; raise MaxCount (drew %v)", path, exercised)

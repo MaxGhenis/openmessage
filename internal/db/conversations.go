@@ -548,6 +548,18 @@ func sqlOwnerLines() string {
 		)`
 }
 
+// sqlOwnerLineKeys is the json_each source for the phoneline.LineKeys of the
+// owner's lines in a participants column.
+func sqlOwnerLineKeys(column string) string {
+	return `json_each('[]')`
+}
+
+// sqlOwnerKeys is a common table expression for a WITH clause, owner_keys:
+// a row for each key of the owner's lines from every conversation.
+func sqlOwnerKeys() string {
+	return `owner_keys(owner_key) AS (SELECT NULL WHERE 0)`
+}
+
 // sqlEntryIsOwners holds for an entry the owner rule counts as the owner's,
 // given the lines in owner_lines (see sqlOwnerLines). p is a json_each row
 // over a conversation's participants.

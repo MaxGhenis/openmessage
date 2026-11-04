@@ -33,6 +33,10 @@ type ParticipantEntry struct {
 	Number string
 	// IsMe holds when an object's "is_me" or "isMe" is JSON true.
 	IsMe bool
+	// Texts are the texts a metadata search matches: a string element's
+	// text, or each "name", "number", "phone" and "email" member of an
+	// object that holds a JSON string, in order, a repeated key each time.
+	Texts []string
 }
 
 // ParticipantEntries reads each object or string element of a participants

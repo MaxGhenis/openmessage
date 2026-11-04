@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/rand"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -42,6 +43,12 @@ var ownerDigitHolders = []string{
 	"users/15550009999", "sam.15550009999@example.com", "Sam 15550009999",
 }
 
+// ownerNULForms hold the owner's number and a NUL, so they name no line, as
+// phoneline reads a number. SQLite cuts a TEXT value at its first NUL when it
+// hands the value to Go, and the first two, cut there, read as the owner's
+// number.
+var ownerNULForms = []string{"15550009999\x00", "+1 555 000 9999\x00x", "\x00+15550009999"}
+
 func seedConversations(t *testing.T, store *Store, conversations ...*Conversation) {
 	t.Helper()
 	for _, conversation := range conversations {
@@ -58,6 +65,19 @@ func searchIDs(t *testing.T, store *Store, query string, limit int) []string {
 		t.Fatalf("search %q: %v", query, err)
 	}
 	ids := make([]string, 0, len(got))
+	for _, conversation := range got {
+		ids = append(ids, conversation.ConversationID)
+	}
+	return ids
+}
+
+func lineSearchIDs(t *testing.T, store *Store, number string, limit int) []string {
+	t.Helper()
+	got, err := store.SearchConversationsByPhoneLine(phoneline.Line(number), limit)
+	if err != nil {
+		t.Fatalf("search the line of %q: %v", number, err)
+	}
+	ids := []string{}
 	for _, conversation := range got {
 		ids = append(ids, conversation.ConversationID)
 	}
@@ -217,18 +237,144 @@ func TestSearchConversationsByMetadataReadsTheOwnersNumberWithAnySeparators(t *t
 	}
 }
 
+// A value with a NUL in it names no phone line, as send_message reads it, so
+// the owner rule doesn't count "15550009999\u0000" as the owner's copy, and
+// the line search finds no one through "+15555550199\u0000x". SQLite cut each
+// value at its NUL before Go read it, so the metadata search dropped the
+// thread that lists the first, and the line search put Erin's thread on the
+// line of what came before the NUL.
+func TestLegacySearchesReadAValueWithANULAsSendMessageDoes(t *testing.T) {
+	store := newTestStore(t)
+	seedConversations(t, store,
+		&Conversation{ConversationID: "owner", Name: "Owner thread", SourcePlatform: "sms", LastMessageTS: 1000,
+			Participants: `[{"name":"Sam Owner","number":"15550009999","is_me":true}]`},
+		&Conversation{ConversationID: "nul", Name: "Generic", SourcePlatform: "sms", LastMessageTS: 2000,
+			Participants: `["15550009999\u0000"]`},
+		&Conversation{ConversationID: "erin", Name: "Erin Example", SourcePlatform: "sms", LastMessageTS: 3000,
+			Participants: `[{"name":"Erin Example","number":"+15555550199\u0000x"},"+15555550188\u0000"]`},
+	)
+	if got := searchIDs(t, store, "15550009999", 10); fmt.Sprint(got) != "[nul]" {
+		t.Errorf("search 15550009999 = %v, want [nul]: its value names no line, so it isn't the owner's", got)
+	}
+	for _, number := range []string{"+15555550199", "+15555550188", "+15550009999"} {
+		if got := lineSearchIDs(t, store, number, 10); len(got) != 0 {
+			t.Errorf("the line of %s finds %v, want none: no value names it", number, got)
+		}
+	}
+}
+
+// SQLite's JSON reader stops at 1,000 levels of nesting, and Go's reads ten
+// times as deep. A list that flags the owner beside an element nested 1,001
+// deep gave send_message the owner's line and gave the searches none, so
+// they found another thread through the owner's unflagged copy, and they
+// read no one in that list. Both searches read lists through Go now.
+func TestLegacySearchesReadAListNestedDeeperThanSQLiteReads(t *testing.T) {
+	store := newTestStore(t)
+	seedConversations(t, store,
+		&Conversation{ConversationID: "owner", Name: "Owner thread", SourcePlatform: "sms", LastMessageTS: 1000,
+			Participants: `[` + ownerRuleNested(1001) + `,{"name":"Sam Owner","number":"15550009999","is_me":true},{"name":"Bob Example","number":"+15555550199"}]`},
+		&Conversation{ConversationID: "copy", Name: "Generic", SourcePlatform: "sms", LastMessageTS: 2000,
+			Participants: `[{"name":"Owner Copy","number":"15550009999"}]`},
+	)
+	for _, query := range []string{"15550009999", "Owner Copy"} {
+		if got := searchIDs(t, store, query, 10); len(got) != 0 {
+			t.Errorf("search %q = %v, want none: the copy is the owner's", query, got)
+		}
+	}
+	if got := lineSearchIDs(t, store, "+15550009999", 10); len(got) != 0 {
+		t.Errorf("the owner's line finds %v, want none", got)
+	}
+	if got := searchIDs(t, store, "Bob", 10); fmt.Sprint(got) != "[owner]" {
+		t.Errorf("search Bob = %v, want [owner]", got)
+	}
+	if got := lineSearchIDs(t, store, "+15555550199", 10); fmt.Sprint(got) != "[owner]" {
+		t.Errorf("Bob's line finds %v, want [owner]", got)
+	}
+}
+
+// SQLite's JSON reader stops at a NUL, and Go's reads the whole text, so a
+// list with bytes after a NUL is a JSON array to SQLite and no JSON to Go. Go
+// reads no entry from it, so it gives send_message no owner line, and Sam,
+// whose number is on that line, is just another person in Bob's thread.
+// Through the flag before the NUL, SQLite gave the searches the line, so they
+// skipped Sam. Both searches read lists through Go now.
+func TestLegacySearchesReadNoEntryFromAListWithBytesAfterANUL(t *testing.T) {
+	store := newTestStore(t)
+	seedConversations(t, store,
+		&Conversation{ConversationID: "owner", Name: "Owner thread", SourcePlatform: "sms", LastMessageTS: 1000,
+			Participants: "[{\"name\":\"Sam Owner\",\"number\":\"15550009999\",\"is_me\":true}]\x00garbage"},
+		&Conversation{ConversationID: "bob", Name: "Bob Example", SourcePlatform: "sms", LastMessageTS: 2000,
+			Participants: `[{"name":"Bob Example","number":"+15555550199"},{"name":"Sam","number":"+15550009999"}]`},
+	)
+	if got := lineSearchIDs(t, store, "+15550009999", 10); fmt.Sprint(got) != "[bob]" {
+		t.Errorf("Sam's line finds %v, want [bob]", got)
+	}
+	if got := searchIDs(t, store, "Sam", 10); fmt.Sprint(got) != "[bob]" {
+		t.Errorf("search Sam = %v, want [bob]", got)
+	}
+}
+
+// Both legacy searches cost about the same however many phone lines flagged
+// entries give the owner: an entry's owner test looks its number's keys up
+// in owner_keys, which SQLite gathers once for each query. They passed every
+// line to Go for every entry, so a store that flagged the owner on many
+// numbers made each search's cost grow with entries times lines.
+func TestLegacySearchesCostAboutTheSameForAnyNumberOfOwnerLines(t *testing.T) {
+	const threads = 300
+	seed := func(distinct bool) *Store {
+		store := newTestStore(t)
+		for index := 0; index < threads; index++ {
+			own := "+15550009999"
+			if distinct {
+				own = fmt.Sprintf("+1666%07d", index)
+			}
+			seedConversations(t, store, &Conversation{
+				ConversationID: fmt.Sprintf("c%03d", index), Name: "Thread", SourcePlatform: "sms", LastMessageTS: int64(index),
+				Participants: fmt.Sprintf(`[{"name":"Me","number":%q,"is_me":true},{"name":"Person %d","number":"+1444%07d"}]`, own, index, index),
+			})
+		}
+		return store
+	}
+	one, many := seed(false), seed(true)
+	allocated := func(search func()) uint64 {
+		search()
+		var before, after runtime.MemStats
+		runtime.ReadMemStats(&before)
+		search()
+		runtime.ReadMemStats(&after)
+		return after.TotalAlloc - before.TotalAlloc
+	}
+	for _, search := range []struct {
+		name string
+		run  func(*Store)
+	}{
+		{"metadata", func(store *Store) { searchIDs(t, store, "Person 7", 10) }},
+		{"line", func(store *Store) { lineSearchIDs(t, store, "+14440000007", 10) }},
+	} {
+		oneBytes := allocated(func() { search.run(one) })
+		manyBytes := allocated(func() { search.run(many) })
+		if manyBytes > 2*oneBytes {
+			t.Errorf("the %s search allocated %d bytes with %d owner lines and %d with one", search.name, manyBytes, threads, oneBytes)
+		}
+	}
+}
+
 // searchModel is a reference for SearchConversationsByMetadata on the
-// legacy store: a conversation matches when the query (ASCII case aside)
-// sits in its title; in a participant entry that isn't the owner's, which
-// for a string element means its text and for an object the text of any
-// "name", "number", "phone" or "email" member; or in the name or number of
-// an incoming message's sender, or of the contact with that sender's
-// number. Elements that are neither strings nor objects match nothing. It
-// counts as the owner's every object that carries is_me or isMe, and every
-// entry on the phone line of a flagged entry whose number names one, as
-// phonelinetest restates phoneline's rule. Threads that share a time come in
-// conversation ID order. It states the rule with regular expressions and a
-// token decode, apart from the helpers that implement it.
+// legacy store: a conversation matches when the query sits in its title; in
+// a participant entry that isn't the owner's, which for a string element
+// means its text and for an object the text of any "name", "number", "phone"
+// or "email" member; or in the name or number of an incoming message's
+// sender, or of the contact with that sender's number. A text holds the
+// query as SQLite's LIKE finds it: up to the text's first NUL, where LIKE
+// stops reading, and with only ASCII letters' case aside. Queries hold no
+// NUL. Elements that are neither strings nor objects match nothing, and so
+// does a list that isn't JSON as encoding/json reads it, however SQLite's
+// reader would take it. It counts as the owner's every object that carries
+// is_me or isMe, and every entry on the phone line of a flagged entry whose
+// number names one, as phonelinetest restates phoneline's rule. Threads that
+// share a time come in conversation ID order. It states the rule with
+// regular expressions and a token decode, apart from the helpers that
+// implement it.
 type searchModel struct {
 	conversations []*Conversation
 	messages      []*Message
@@ -375,8 +521,24 @@ func modelEntryMatches(entry modelEntry, query string) bool {
 	return false
 }
 
+// modelLike reports whether text holds query as SQLite's LIKE '%query%'
+// finds it: up to text's first NUL, and with only ASCII letters' case aside.
 func modelLike(text, query string) bool {
-	return strings.Contains(strings.ToLower(text), strings.ToLower(query))
+	if cut := strings.IndexByte(text, 0); cut >= 0 {
+		text = text[:cut]
+	}
+	return strings.Contains(modelFoldASCII(text), modelFoldASCII(query))
+}
+
+// modelFoldASCII lowers ASCII letters and leaves every other byte alone.
+func modelFoldASCII(text string) string {
+	folded := []byte(text)
+	for index, c := range folded {
+		if c >= 'A' && c <= 'Z' {
+			folded[index] = c + 'a' - 'A'
+		}
+	}
+	return string(folded)
 }
 
 func (m searchModel) search(query string, limit int) []string {
@@ -430,12 +592,15 @@ func (m searchModel) search(query string, limit int) []string {
 // the owner's digits but name no line, flagged or not; other people share
 // words of the owner's name; some participants columns hold nothing,
 // malformed JSON or a list of bare names, and lists can hold odd elements
-// (an element that isn't an object, or a field of another JSON type); the
-// owner's own messages and contact card carry the owner's name and number;
-// and threads often share a time. So no query finds a thread through an
-// entry of the owner's, every title, other participant and incoming sender
-// still matches, and threads that share a time come in conversation ID
-// order.
+// (an element that isn't an object, or a field of another JSON type), nest
+// deeper than SQLite's JSON reader goes, or carry bytes after a NUL, where
+// SQLite's reader stops and Go's doesn't; names and the owner's values can
+// hold a NUL, and some names hold letters beyond ASCII; the owner's own
+// messages and contact card carry the owner's name and number; and threads
+// often share a time. So no query finds a thread through an entry of the
+// owner's, every title, other participant and incoming sender still
+// matches, the searches read every list as send_message does, and threads
+// that share a time come in conversation ID order.
 func TestSearchConversationsByMetadataAgreesWithTheOwnerSkippingModel(t *testing.T) {
 	people := []struct{ name, number string }{
 		{"Sam Example", "+15555550100"},
@@ -443,6 +608,8 @@ func TestSearchConversationsByMetadataAgreesWithTheOwnerSkippingModel(t *testing
 		{"Carol Sammy", "15555550102"},
 		{"Dee Example", "+44 20 7946 0103"},
 		{"Ed Short", "56789"},
+		{"\u00c1ngel N\u00fa\u00f1ez", "+15555550104"},
+		{"Zed\x00Hidden", "+15555550105"},
 	}
 	owner := struct{ name, number string }{"Sam Owner", "+15550009999"}
 	exercised := map[string]int{}
@@ -470,6 +637,10 @@ func TestSearchConversationsByMetadataAgreesWithTheOwnerSkippingModel(t *testing
 				if random.Intn(8) == 0 {
 					exercised["an owner's value that names no line"]++
 					return ownerDigitHolders[random.Intn(len(ownerDigitHolders))]
+				}
+				if random.Intn(12) == 0 {
+					exercised["an owner's value with a NUL"]++
+					return ownerNULForms[random.Intn(len(ownerNULForms))]
 				}
 				return ownerForms[random.Intn(len(ownerForms))]
 			}
@@ -515,13 +686,24 @@ func TestSearchConversationsByMetadataAgreesWithTheOwnerSkippingModel(t *testing
 			if err != nil {
 				t.Fatal(err)
 			}
-			switch random.Intn(12) {
+			switch random.Intn(16) {
 			case 0:
 				participants = []byte("")
 			case 1:
 				participants = []byte("not json " + owner.name)
 			case 2:
 				participants = []byte(`["` + owner.name + `","Bob Owner"]`)
+			case 3:
+				participants = append([]byte("["+ownerRuleNested(1000+random.Intn(500))+","), participants[1:]...)
+				exercised["a list nested deeper than SQLite reads"]++
+			case 4:
+				participants = append(participants, "\x00garbage"...)
+				exercised["a list with bytes after a NUL"]++
+			case 5:
+				if at := bytes.IndexByte(participants, '{'); at >= 0 {
+					participants = append(append(append([]byte{}, participants[:at+1]...), `"nested":`+ownerRuleNested(1000+random.Intn(500))+`,`...), participants[at+1:]...)
+					exercised["a member nested deeper than SQLite reads"]++
+				}
 			}
 			title := entries[0]["name"].(string)
 			if random.Intn(3) == 0 {
@@ -571,6 +753,7 @@ func TestSearchConversationsByMetadataAgreesWithTheOwnerSkippingModel(t *testing
 		queries := append(append([]string{
 			owner.name, "Sam", "Owner", "Me", "is_me", "isMe", "name", "phone", "contact_id", "Odd", "whatsapp",
 			"Sammy", "Bob", "Carol", "Dee", "+1555555", "0103", "56789", "friends", "Group", "not json", "(phone)",
+			"\u00e1ngel", "\u00c1NGEL", "\u00c1ngel", "N\u00fa\u00f1ez", "N\u00da\u00d1EZ", "Zed", "zed", "Hidden",
 		}, ownerNumberForms...), ownerNumberSeparatedForms...)
 		queries = append(append(queries, ownerJIDs...), ownerDigitHolders...)
 		for _, query := range queries {
@@ -586,6 +769,13 @@ func TestSearchConversationsByMetadataAgreesWithTheOwnerSkippingModel(t *testing
 			}
 			if len(want) > 0 {
 				exercised["a query with hits"]++
+			}
+			if query == "\u00e1ngel" || query == "\u00c1NGEL" || query == "N\u00da\u00d1EZ" {
+				for _, conversation := range stored {
+					if strings.Contains(conversation.Name+conversation.Participants, "\u00c1ngel N\u00fa\u00f1ez") {
+						exercised["a query that only Unicode case folding would match"]++
+					}
+				}
 			}
 			if all := model.search(query, len(stored)); len(all) > len(want) && len(want) > 0 {
 				at := map[string]int64{}
@@ -608,7 +798,9 @@ func TestSearchConversationsByMetadataAgreesWithTheOwnerSkippingModel(t *testing
 	}
 	for _, path := range []string{
 		"an unflagged copy of the owner", "an owner's value that names no line", "a store that never flags the owner",
-		"an odd element", "a query with hits", "a tie at the limit",
+		"an odd element", "a query with hits", "a tie at the limit", "an owner's value with a NUL",
+		"a list nested deeper than SQLite reads", "a list with bytes after a NUL", "a member nested deeper than SQLite reads",
+		"a query that only Unicode case folding would match",
 	} {
 		if exercised[path] == 0 {
 			t.Errorf("the property never drew %s; raise MaxCount (drew %v)", path, exercised)
