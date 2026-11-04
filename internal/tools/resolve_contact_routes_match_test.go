@@ -364,11 +364,12 @@ func (r *countingRouteReads) SearchConversationsByMetadata(query string, limit i
 	return r.ReadSource.SearchConversationsByMetadata(query, limit)
 }
 
-// Two address-book cards and a legacy thread each write Alice's number their
-// own way, and every form names one line. Two Google Chat threads list her
-// email address, where the legacy importer files it as her number, under two
-// names. A search for Alice asks the serving store about her line once and
-// about her email address once, on either store.
+// Two address-book cards and a legacy thread hold Alice's number, in two
+// written forms that name one line. Two Google Chat threads list her email
+// address, where the legacy importer files it as her number, under two names.
+// On either store, the tool asks the serving store about her line once and
+// about her email address once when the query names her, and about the
+// address once when the query is the address itself.
 func TestResolveContactRoutesSearchesEachLineOnce(t *testing.T) {
 	for _, mode := range routeStoreModes {
 		t.Run(mode, func(t *testing.T) {
@@ -415,6 +416,14 @@ func TestResolveContactRoutesSearchesEachLineOnce(t *testing.T) {
 				if count != 1 {
 					t.Errorf("searches of %q = %d, want 1", text, count)
 				}
+			}
+
+			counting = newCountingRouteReads(reads)
+			if _, err := findRouteConversations(counting, a.Store, "alice.chen@example.com", 80); err != nil {
+				t.Fatalf("findRouteConversations(alice.chen@example.com): %v", err)
+			}
+			if len(counting.lines) != 0 || len(counting.texts) != 1 || counting.texts["alice.chen@example.com"] != 1 {
+				t.Errorf("for her email address: line searches %v, text searches %v; want one search of the address and no line search", counting.lines, counting.texts)
 			}
 		})
 	}
