@@ -3,6 +3,7 @@ package tools
 import (
 	"fmt"
 	"path/filepath"
+	"slices"
 	"testing"
 
 	"github.com/maxghenis/openmessage/internal/app"
@@ -296,5 +297,125 @@ func TestResolveContactRoutesFindsALegacyNumberWrittenWithSeparators(t *testing.
 		if len(got) != 1 || got[0].ConversationID != "alice" {
 			t.Errorf("routes for %q = %v, want Alice's thread only", query, routeIDs(got))
 		}
+	}
+}
+
+// A title that holds a name says nothing about where that person's own
+// thread is. Only a legacy thread knows Alice Chen's name, and v2 files her
+// thread under her number alone, while a newer group in both stores is
+// titled "Alice Chen dinner plans". A search for her name finds her thread
+// beside the group, on either store: a title that matches doesn't stop the
+// tool from reading the names in legacy threads.
+func TestResolveContactRoutesFindsALegacyOnlyNameBesideATitleThatHoldsIt(t *testing.T) {
+	for _, mode := range routeStoreModes {
+		t.Run(mode, func(t *testing.T) {
+			a := testApp(t)
+			store := openRouteV2Store(t)
+			threads := seedRouteFixture(t, a.Store, store, []routeFixturePerson{
+				{Name: "Alice Chen", Number: "+12025550123", LegacyThreadID: "alice", RemoteThreadID: "alice", NamelessInV2: true},
+			})
+			seedTitledRouteGroup(t, a.Store, store, defaultRouteFixtureOwner, "dinner", "Alice Chen dinner plans")
+			reads, options := routeReadsFor(t, a, store, mode)
+			alice := threads["Alice Chen"]
+			if mode == "legacy" {
+				alice = "alice"
+			}
+			want := []string{"dinner", alice}
+			for _, query := range []string{"Alice Chen", "alice", "Chen"} {
+				got, err := findRouteConversations(reads, a.Store, query, 80)
+				if err != nil {
+					t.Fatalf("findRouteConversations(%q): %v", query, err)
+				}
+				if !slices.Equal(routeIDs(got), want) {
+					t.Errorf("routes for %q = %v, want %v: the group, then Alice's thread", query, routeIDs(got), want)
+				}
+				matches := routeMatches(t, callRouteTool(t, resolveContactRoutesHandler(a, options), map[string]any{"query": query}))
+				preferred := make([]string, 0, len(matches))
+				for _, match := range matches {
+					preferred = append(preferred, match.PreferredReplyConversationID)
+				}
+				if !slices.Equal(preferred, want) {
+					t.Errorf("preferred routes for %q = %v, want %v; matches=%+v", query, preferred, want, matches)
+				}
+			}
+		})
+	}
+}
+
+// countingRouteReads counts the searches that the route tool asks the
+// serving store for, by line and by text.
+type countingRouteReads struct {
+	readsource.ReadSource
+	lines map[string]int
+	texts map[string]int
+}
+
+func newCountingRouteReads(reads readsource.ReadSource) *countingRouteReads {
+	return &countingRouteReads{ReadSource: reads, lines: map[string]int{}, texts: map[string]int{}}
+}
+
+func (r *countingRouteReads) SearchConversationsByPhoneLine(line string, limit int) ([]*db.Conversation, error) {
+	r.lines[line]++
+	return r.ReadSource.SearchConversationsByPhoneLine(line, limit)
+}
+
+func (r *countingRouteReads) SearchConversationsByMetadata(query string, limit int) ([]*db.Conversation, error) {
+	r.texts[query]++
+	return r.ReadSource.SearchConversationsByMetadata(query, limit)
+}
+
+// Two address-book cards and a legacy thread each write Alice's number their
+// own way, and every form names one line. Two Google Chat threads list her
+// email address, where the legacy importer files it as her number, under two
+// names. A search for Alice asks the serving store about her line once and
+// about her email address once, on either store.
+func TestResolveContactRoutesSearchesEachLineOnce(t *testing.T) {
+	for _, mode := range routeStoreModes {
+		t.Run(mode, func(t *testing.T) {
+			a := testApp(t)
+			store := openRouteV2Store(t)
+			threads := seedRouteFixture(t, a.Store, store, []routeFixturePerson{
+				{Name: "Alice Chen", Number: "+12025550123", LegacyNumber: "(202) 555-0123", LegacyThreadID: "alice", RemoteThreadID: "alice", InAddressBook: true},
+			})
+			if err := a.Store.UpsertContact(&db.Contact{ContactID: "contact-alice-work", Name: "Alice Chen (work)", Number: "+1 202-555-0123"}); err != nil {
+				t.Fatalf("seed Alice's work card: %v", err)
+			}
+			for _, conv := range []*db.Conversation{
+				{ConversationID: "lunch", Name: "Lunch", SourcePlatform: "gchat", LastMessageTS: 1,
+					Participants: `[{"name":"Alice Chen","number":"alice.chen@example.com"}]`},
+				{ConversationID: "books", Name: "Books", SourcePlatform: "gchat", LastMessageTS: 2,
+					Participants: `[{"name":"Alice C.","number":"alice.chen@example.com"}]`},
+			} {
+				if err := a.Store.UpsertConversation(conv); err != nil {
+					t.Fatalf("seed %s: %v", conv.ConversationID, err)
+				}
+			}
+			reads, _ := routeReadsFor(t, a, store, mode)
+			alice := threads["Alice Chen"]
+			if mode == "legacy" {
+				alice = "alice"
+			}
+			counting := newCountingRouteReads(reads)
+			got, err := findRouteConversations(counting, a.Store, "Alice", 80)
+			if err != nil {
+				t.Fatalf("findRouteConversations(Alice): %v", err)
+			}
+			if !slices.Contains(routeIDs(got), alice) {
+				t.Errorf("routes for Alice = %v, want her thread %q among them", routeIDs(got), alice)
+			}
+			if counting.lines["2025550123"] != 1 || counting.texts["alice.chen@example.com"] != 1 {
+				t.Errorf("line searches %v, text searches %v; want one search of Alice's line and one of her email address", counting.lines, counting.texts)
+			}
+			for line, count := range counting.lines {
+				if count != 1 {
+					t.Errorf("searches of line %s = %d, want 1", line, count)
+				}
+			}
+			for text, count := range counting.texts {
+				if count != 1 {
+					t.Errorf("searches of %q = %d, want 1", text, count)
+				}
+			}
+		})
 	}
 }

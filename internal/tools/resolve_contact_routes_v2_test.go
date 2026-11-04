@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -171,6 +172,49 @@ func seedRouteFixtureWithOwner(t *testing.T, legacy *db.Store, store *sqlite.Sto
 		threads[person.Name] = conversationID
 	}
 	return threads
+}
+
+// seedTitledRouteGroup writes a group thread titled title under id into both
+// stores, newer than any fixture thread. Its roster is the owner and a guest
+// whom no test query names, so a query reaches the group only through its
+// title. Seed the fixture first: the v2 group lists the fixture's owner.
+func seedTitledRouteGroup(t *testing.T, legacy *db.Store, store *sqlite.Store, owner routeFixtureOwner, id, title string) {
+	t.Helper()
+	now := time.Now().UnixMilli() + 1000
+	const guestNumber = "+15555550999"
+	participants, err := json.Marshal([]map[string]any{
+		{"name": "Guest", "number": guestNumber},
+		{"name": owner.Name, "number": owner.Number, "is_me": true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := legacy.UpsertConversation(&db.Conversation{
+		ConversationID: id, Name: title, IsGroup: true, Participants: string(participants),
+		LastMessageTS: now, SourcePlatform: "sms",
+	}); err != nil {
+		t.Fatalf("seed legacy group %q: %v", id, err)
+	}
+	guest := sqlite.Identity{
+		IdentityID: "identity-" + id + "-guest", AccountID: routeFixtureAccount, Kind: sqlite.IdentityKind("e164"),
+		CanonicalValue: guestNumber, RawValue: guestNumber, MetadataJSON: "{}", CreatedAtMS: now, UpdatedAtMS: now,
+	}
+	if err := store.UpsertIdentity(guest); err != nil {
+		t.Fatalf("UpsertIdentity(%s): %v", guest.IdentityID, err)
+	}
+	if err := store.UpsertConversation(sqlite.Conversation{
+		ConversationID: id, AccountID: routeFixtureAccount, RemoteConversationID: "remote-" + id,
+		Kind: sqlite.ConversationKindGroup, Title: title, NotificationMode: sqlite.NotificationModeAll,
+		MetadataJSON: "{}", LastMessageAtMS: now, CreatedAtMS: now, UpdatedAtMS: now,
+	}); err != nil {
+		t.Fatalf("UpsertConversation(%s): %v", id, err)
+	}
+	if err := store.ReplaceConversationParticipants(id, []sqlite.ConversationParticipant{
+		{AccountID: routeFixtureAccount, ConversationID: id, IdentityID: "identity-self", Role: sqlite.ParticipantRoleMember, IsActive: true},
+		{AccountID: routeFixtureAccount, ConversationID: id, IdentityID: guest.IdentityID, Role: sqlite.ParticipantRoleMember, IsActive: true},
+	}); err != nil {
+		t.Fatalf("ReplaceConversationParticipants(%s): %v", id, err)
+	}
 }
 
 // v2PrimaryClientOptions wires the tools the way `serve --mcp-stdio` does on a
@@ -653,14 +697,17 @@ func TestResolveContactRoutesClientModeAsksTheAppWhichPlatformsCanSend(t *testin
 // ID resolve_contact_routes returns names a conversation in the serving store,
 // so the send tools accept it; a person's routes are threads that person is
 // in, however the legacy store files them and even when the account's owner,
-// whom every thread lists, shares their first name; a thread number, or the
-// owner's name or number, yields no route; and the tool finds everyone the
-// stores can identify, by their number in any form or by a name either store
-// still holds, even where v2 reads show another name. Each person's legacy
-// thread number and current v2 thread number come from one small pool, so
-// legacy numbers collide, overwrite each other and name other people's v2
-// threads.
-// Differential: for a person's number in any form, send_message's own thread
+// whom every thread lists, shares their first name, beside a newer group
+// whose title holds the name searched for, when one exists; a thread number,
+// or the owner's name or number, yields no route; and the tool finds everyone
+// the stores can identify, by their number in any form or by a name either
+// store still holds, even where v2 reads show another name or a title also
+// matches. Each person's legacy thread number and current v2 thread number
+// come from one small pool, so legacy numbers collide, overwrite each other
+// and name other people's v2 threads.
+// Differential: send_message's thread lookup scans the newest 2,000 threads
+// and skips groups. These stores hold far fewer threads and no group where a
+// number is searched, and there, for a person's number in any form, that
 // lookup and resolve_contact_routes pick the same thread.
 func TestResolveContactRoutesReturnsOnlyServingStoreThreadsOfThePerson(t *testing.T) {
 	names := []string{"Alice Example", "Bob Example", "Carol Example", "Dave Example"}
@@ -734,13 +781,14 @@ func TestResolveContactRoutesReturnsOnlyServingStoreThreadsOfThePerson(t *testin
 			return true
 		}
 
-		var query, person, number string
-		found := false
+		var query, person, number, title string
+		found, legacyOnlyName := false, false
 		switch random.Intn(7) {
 		case 0, 1:
 			index := random.Intn(len(names))
 			person, query = names[index], strings.Fields(names[index])[0]
 			found = findableByName(index)
+			title = names[index] + " dinner plans"
 			if query == ownerFirstName {
 				exercised["a first name the owner shares"]++
 			}
@@ -756,6 +804,7 @@ func TestResolveContactRoutesReturnsOnlyServingStoreThreadsOfThePerson(t *testin
 				exercised["name in the address book"]++
 			default:
 				exercised["name on a legacy thread"]++
+				legacyOnlyName = true
 			}
 		case 2, 3:
 			index := random.Intn(len(names))
@@ -781,34 +830,63 @@ func TestResolveContactRoutesReturnsOnlyServingStoreThreadsOfThePerson(t *testin
 		}
 
 		options := Options{Reads: v2read.New(store), V2Primary: true, Daemon: daemon}
-		matches := routeMatches(t, callRouteTool(t, resolveContactRoutesHandler(a, options), map[string]any{"query": query}))
-		for _, match := range matches {
-			ids := []string{match.PreferredReplyConversationID}
-			for _, route := range match.Routes {
-				ids = append(ids, route.Conversation.ConversationID)
+		// check runs the query and tests the invariants. group is the ID of a
+		// group whose title holds the query, when the store holds one.
+		check := func(group string) bool {
+			matches := routeMatches(t, callRouteTool(t, resolveContactRoutesHandler(a, options), map[string]any{"query": query}))
+			for _, match := range matches {
+				ids := []string{match.PreferredReplyConversationID}
+				for _, route := range match.Routes {
+					ids = append(ids, route.Conversation.ConversationID)
+				}
+				for _, id := range ids {
+					if id == "" {
+						continue
+					}
+					if conversation, err := store.GetConversation(id); err != nil || conversation.ConversationID != id {
+						t.Logf("seed %d, query %q: route ID %q is not a serving-store conversation ID (%v); people=%+v", seed, query, id, err, people)
+						return false
+					}
+					if person != "" && id != threads[person] && id != group {
+						t.Logf("seed %d, query %q: route %q is neither %s's thread %q nor a group whose title holds the name; people=%+v", seed, query, id, person, threads[person], people)
+						return false
+					}
+				}
 			}
-			for _, id := range ids {
-				if id == "" {
-					continue
-				}
-				if conversation, err := store.GetConversation(id); err != nil || conversation.ConversationID != id {
-					t.Logf("seed %d, query %q: route ID %q is not a serving-store conversation ID (%v); people=%+v", seed, query, id, err, people)
-					return false
-				}
-				if person != "" && id != threads[person] {
-					t.Logf("seed %d, query %q: route %q is not %s's thread %q; people=%+v", seed, query, id, person, threads[person], people)
-					return false
-				}
+			// The group is newer than every fixture thread, so its match comes
+			// first.
+			var want []string
+			if group != "" {
+				want = append(want, group)
 			}
-		}
-		if found {
-			if len(matches) != 1 || matches[0].PreferredReplyConversationID != threads[person] {
-				t.Logf("seed %d, query %q: matches=%+v, want one whose preferred route is %q; people=%+v", seed, query, matches, threads[person], people)
+			if found {
+				want = append(want, threads[person])
+			}
+			preferred := make([]string, 0, len(matches))
+			for _, match := range matches {
+				preferred = append(preferred, match.PreferredReplyConversationID)
+			}
+			if !slices.Equal(preferred, want) {
+				t.Logf("seed %d, query %q, group %q: preferred routes %v, want %v; matches=%+v; people=%+v", seed, query, group, preferred, want, matches, people)
 				return false
 			}
-		} else if len(matches) != 0 {
-			t.Logf("seed %d, query %q: matches=%+v, want none; people=%+v", seed, query, matches, people)
+			return true
+		}
+		if !check("") {
 			return false
+		}
+		// Every name query runs again beside a newer group whose title holds
+		// the name. That title says nothing about where the person's own
+		// thread is.
+		if title != "" {
+			seedTitledRouteGroup(t, a.Store, store, owner, "dinner", title)
+			exercised["a title that holds the name"]++
+			if legacyOnlyName {
+				exercised["a name on a legacy thread, beside a title that holds it"]++
+			}
+			if !check("dinner") {
+				return false
+			}
 		}
 		if number != "" {
 			direct, err := findDirectSMSConversation(options.Reads, number)
@@ -837,6 +915,7 @@ func TestResolveContactRoutesReturnsOnlyServingStoreThreadsOfThePerson(t *testin
 		"name in v2", "name in the address book", "name on a legacy thread", "unfindable name",
 		"E.164 number", "number in another form", "thread number", "unknown text",
 		"a first name the owner shares", "the owner's name or number", "a name in v2 that reads hide",
+		"a title that holds the name", "a name on a legacy thread, beside a title that holds it",
 	} {
 		if exercised[path] == 0 {
 			t.Errorf("the property never drew a query by %s; raise MaxCount (drew %v)", path, exercised)
