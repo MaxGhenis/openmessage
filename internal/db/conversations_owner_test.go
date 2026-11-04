@@ -315,14 +315,14 @@ func TestLegacySearchesReadNoEntryFromAListWithBytesAfterANUL(t *testing.T) {
 	}
 }
 
-// Both legacy searches allocate about as much however many phone lines
+// The three legacy searches allocate about as much however many phone lines
 // flagged entries give the owner: an entry's owner test looks its number's
-// keys up in owner_keys, which SQLite gathers once for each query. They
-// passed every line to Go for every entry, so each search's work and
-// allocations grew with entries times lines. Allocations can't tell lookups
-// from a scan that allocates nothing, so this test bounds only allocations;
-// the owner test looks up at most ten keys, in an index that SQLite builds
-// once for each query.
+// keys up in owner_keys, which SQLite gathers once for each query. An owner
+// test that passed every line to Go for every entry would grow each search's
+// work and allocations with entries times lines. Allocations can't tell
+// lookups from a scan that allocates nothing, so this test bounds only
+// allocations; the owner test looks up at most ten keys, in an index that
+// SQLite builds once for each query.
 func TestLegacySearchesAllocateAboutTheSameForAnyNumberOfOwnerLines(t *testing.T) {
 	const threads = 300
 	seed := func(distinct bool) *Store {
@@ -354,6 +354,7 @@ func TestLegacySearchesAllocateAboutTheSameForAnyNumberOfOwnerLines(t *testing.T
 	}{
 		{"metadata", func(store *Store) { searchIDs(t, store, "Person 7", 10) }},
 		{"line", func(store *Store) { lineSearchIDs(t, store, "+14440000007", 10) }},
+		{"address", func(store *Store) { addressSearchIDs(t, store, "+14440000007", 10) }},
 	} {
 		oneBytes := allocated(func() { search.run(one) })
 		manyBytes := allocated(func() { search.run(many) })
