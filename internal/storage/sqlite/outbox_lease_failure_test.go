@@ -465,31 +465,7 @@ func TestLeaseDueBatchSetsAsideALeasedRowThatDoesNotReadBack(t *testing.T) {
 				item.ScheduledForMS = outboxTestTimeMS - 100
 				mustEnqueueOutbox(t, repository, item)
 			}
-			withPinnedConnection(t, store, func(conn *sql.Conn) {
-				var schema string
-				if err := conn.QueryRowContext(ctx,
-					`SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'outbox'`,
-				).Scan(&schema); err != nil {
-					t.Fatalf("read outbox schema: %v", err)
-				}
-				notNull := regexp.MustCompile(`(?m)^(\s*` + column.name + `\s+` + column.declaration + `) NOT NULL`)
-				if !notNull.MatchString(schema) {
-					t.Fatalf("outbox schema has no NOT NULL %s column to relax:\n%s", column.name, schema)
-				}
-				var version int64
-				if err := conn.QueryRowContext(ctx, `PRAGMA schema_version`).Scan(&version); err != nil {
-					t.Fatalf("read schema version: %v", err)
-				}
-				mustExecConn(t, conn, `PRAGMA writable_schema = ON`)
-				mustExecConn(t, conn,
-					`UPDATE sqlite_schema SET sql = ? WHERE type = 'table' AND name = 'outbox'`,
-					notNull.ReplaceAllString(schema, "$1"),
-				)
-				mustExecConn(t, conn, fmt.Sprintf(`PRAGMA schema_version = %d`, version+1))
-				mustExecConn(t, conn, `PRAGMA writable_schema = RESET`)
-				mustExecConn(t, conn,
-					`UPDATE outbox SET `+column.name+` = NULL WHERE outbox_id IN ('outbox-a', 'outbox-b')`)
-			})
+			relaxOutboxNotNull(t, store, column.name, column.declaration, "outbox-a", "outbox-b")
 
 			batch := mustLeaseDueBatch(t, repository, clock.Now(), 1)
 			if got, want := leasedOutboxIDs(batch), []string{"outbox-c"}; !slices.Equal(got, want) {
@@ -663,6 +639,41 @@ func mustFindOutboxRow(t *testing.T, repository *OutboxRepository, id string) Ou
 		t.Fatalf("FindByID(%q): %v", id, err)
 	}
 	return row
+}
+
+// relaxOutboxNotNull drops the NOT NULL from one outbox column with a schema
+// edit, as a botched table rebuild could, and then stores a NULL in that
+// column of each named row. Everything runs on one connection, since
+// writable_schema holds per connection.
+func relaxOutboxNotNull(t *testing.T, store *Store, column, declaration string, outboxIDs ...string) {
+	t.Helper()
+	ctx := context.Background()
+	withPinnedConnection(t, store, func(conn *sql.Conn) {
+		var schema string
+		if err := conn.QueryRowContext(ctx,
+			`SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'outbox'`,
+		).Scan(&schema); err != nil {
+			t.Fatalf("read outbox schema: %v", err)
+		}
+		notNull := regexp.MustCompile(`(?m)^(\s*` + column + `\s+` + declaration + `) NOT NULL`)
+		if !notNull.MatchString(schema) {
+			t.Fatalf("outbox schema has no NOT NULL %s column to relax:\n%s", column, schema)
+		}
+		var version int64
+		if err := conn.QueryRowContext(ctx, `PRAGMA schema_version`).Scan(&version); err != nil {
+			t.Fatalf("read schema version: %v", err)
+		}
+		mustExecConn(t, conn, `PRAGMA writable_schema = ON`)
+		mustExecConn(t, conn,
+			`UPDATE sqlite_schema SET sql = ? WHERE type = 'table' AND name = 'outbox'`,
+			notNull.ReplaceAllString(schema, "$1"),
+		)
+		mustExecConn(t, conn, fmt.Sprintf(`PRAGMA schema_version = %d`, version+1))
+		mustExecConn(t, conn, `PRAGMA writable_schema = RESET`)
+		for _, id := range outboxIDs {
+			mustExecConn(t, conn, `UPDATE outbox SET `+column+` = NULL WHERE outbox_id = ?`, id)
+		}
+	})
 }
 
 // withPinnedConnection runs fn on one connection of the store's pool, for
