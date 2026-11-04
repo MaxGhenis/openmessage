@@ -12,10 +12,6 @@
 # Connect: claude mcp add -s user --transport sse openmessage http://127.0.0.1:7007/mcp/sse
 
 FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS build
-RUN apk add --no-cache ca-certificates tzdata && \
-    addgroup -S -g 101 openmessage && \
-    adduser -S -u 100 -G openmessage -h /home/openmessage openmessage && \
-    mkdir -p /data
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
@@ -31,13 +27,12 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build \
       -o /out/openmessage \
       .
 
-# BusyBox retains the shell and wget used by the Compose health check.
-FROM busybox:1.37.0-musl
-COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
-COPY --from=build /usr/share/zoneinfo /usr/share/zoneinfo
-COPY --from=build /etc/passwd /etc/group /etc/
-COPY --from=build --chown=100:101 /home/openmessage /home/openmessage
-COPY --from=build --chown=100:101 /data /data
+FROM alpine:3.22
+RUN apk add --no-cache ca-certificates tzdata && \
+    addgroup -S -g 101 openmessage && \
+    adduser -S -u 100 -G openmessage -h /home/openmessage openmessage && \
+    mkdir -p /data && \
+    chown 100:101 /data
 USER 100:101
 WORKDIR /home/openmessage
 COPY --from=build /out/openmessage /usr/local/bin/openmessage

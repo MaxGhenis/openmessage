@@ -145,6 +145,7 @@ jobs:
           docker compose exec -T openmessage sh -es <<'SH'
           test "$(id -u):$(id -g)" = "100:101"
           test "$HOME" = "/home/openmessage"
+          command -v apk
           touch /data/.container-smoke
           rm /data/.container-smoke
           test -s /etc/ssl/certs/ca-certificates.crt
