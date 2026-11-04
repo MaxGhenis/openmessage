@@ -1025,8 +1025,8 @@ running app:
   contacts in legacy threads (`ListContactsFromConversations`), even when a
   title or a card matched. A title that holds a name says nothing about where
   that person's own thread is. The tool searches each line once, however the
-  cards and threads write it. That contacts list skips flagged entries too,
-  reads past any number of threads that yield none, and matches what an
+  cards and threads write its number. That contacts list skips flagged entries
+  too, reads past any number of threads that yield none, and matches what an
   entry says, not its JSON text: `R&D` finds R&D Desk, whose & Go's encoder
   writes as an escape, and like `LIKE` and `lower()` it ignores only ASCII
   case, so `ÁNGEL` finds Ángel Ruiz but `ángel` doesn't. Threads that share a

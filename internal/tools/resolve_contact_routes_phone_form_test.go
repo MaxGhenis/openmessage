@@ -219,8 +219,9 @@ func TestResolveContactRoutesTakesOnlyAWrittenNumberAsANumber(t *testing.T) {
 // The legacy store can hold the only name for a person: R&D Desk, <Ops>
 // Team and Bob "Builder" have v2 identities with no name, in threads with no
 // title. Go writes &, < and > into JSON as \u0026, \u003c and \u003e, and a
-// quote as \", so the fallback finds each name by what its entry says,
-// not by its JSON text, and the name routes to the v2 thread on its line.
+// quote as \", so ListContactsFromConversations matches each name by
+// what its entry says, not by its JSON text, and the name routes to the v2
+// thread on its line.
 func TestResolveContactRoutesFindsALegacyNameThatJSONEscapes(t *testing.T) {
 	a := testApp(t)
 	store := openRouteV2Store(t)
