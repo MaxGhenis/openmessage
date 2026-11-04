@@ -55,14 +55,14 @@ func seedRouteIdentityThreads(t *testing.T, store *sqlite.Store, threads []route
 	}
 }
 
-// A number names a phone line only in a value written as a number, or in a
-// WhatsApp JID whose user is one. An email address, a Signal UUID, a
+// A number names a phone line only in a value that reads as a number, or in
+// a WhatsApp JID whose user is one. An email address, a Signal UUID, a
 // WhatsApp LID or group, a Google Chat user, a legacy placeholder and a
-// number too long for E.164 can each hold Alice's ten digits, and the
-// bridges store each of them, but none of them is her line. So her number
-// in any written form routes to her threads only, and send_message picks her
-// SMS thread over a newer one with an SMS gateway's email address.
-func TestResolveContactRoutesFindsANumberOnlyWhereItIsWrittenAsOne(t *testing.T) {
+// number too long for E.164 can each hold Alice's ten digits, but none of
+// them is her line. So her number in any written form routes to her threads
+// only, and send_message picks her SMS thread over a newer one with an SMS
+// gateway's email address.
+func TestResolveContactRoutesFindsANumberOnlyWhereItReadsAsOne(t *testing.T) {
 	t.Run("v2", func(t *testing.T) {
 		a := testApp(t)
 		store := openRouteV2Store(t)

@@ -1055,7 +1055,7 @@ running app:
   `TestResolveContactRoutesMatchesTheAddressBookLiterally`,
   `TestResolveContactRoutesFindsAnIncomingSenderByAnyFormOfTheirNumber`,
   `TestResolveContactRoutesFindsALegacyNumberWrittenWithSeparators`,
-  `TestResolveContactRoutesFindsANumberOnlyWhereItIsWrittenAsOne`,
+  `TestResolveContactRoutesFindsANumberOnlyWhereItReadsAsOne`,
   `TestResolveContactRoutesTakesOnlyAWrittenNumberAsANumber` and
   `TestResolveContactRoutesFindsALegacyNameThatJSONEscapes` (internal/tools),
   `TestSearchConversationsByMetadataSkipsTheAccountOwner` and
@@ -1068,6 +1068,7 @@ running app:
   `TestListContactsMatchesTheQueryLiterally`,
   `TestListContactsFromConversationsReadsPastThreadsThatListOnlyTheOwner`,
   `TestListContactsFromConversationsMatchesWhatAnEntrySays`,
+  `TestListContactsFromConversationsReadsABadByteAsTheDecoderDoes`,
   `TestLegacySearchesBreakTiesByConversationID`,
   `TestSearchConversationsByPhoneLineCallsTheMatcherOncePerSenderNumber`
   (internal/db), `TestMatch`, `TestNumber` and `TestMatchProperties`
