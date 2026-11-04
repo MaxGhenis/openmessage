@@ -197,11 +197,11 @@ func findRouteConversations(reads readsource.ReadSource, people *db.Store, query
 		return newestRoutes(seen, limit), nil
 	}
 
-	// searched holds each line, and each other value, that searchNumber has
-	// asked reads about. The address book and legacy threads often hold one
-	// person's number, each written its own way, and every form names one
-	// line.
-	searched := make(map[string]bool)
+	// searched holds the query and each line, or other value, that
+	// searchNumber has asked reads about, so reads answer each search once. The
+	// address book and legacy threads often hold one person's number, each
+	// written its own way, and every form names one line.
+	searched := map[string]bool{"text:" + query: true}
 	searchNumber := func(number string) {
 		number = strings.TrimSpace(number)
 		if number == "" {
