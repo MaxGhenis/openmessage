@@ -257,6 +257,59 @@ If you launch OpenMessage from the macOS app, launchd, systemd, or another super
 - GIF and link-preview proxies validate remote URLs, cap downloads, and keep provider fetches inside the local backend
 - Auth tokens auto-refresh and persist to `session.json`; expired Google cookies can be refreshed by an optional script or surfaced as a guided re-pair flow
 
+## Running as a headless server (Docker)
+
+The release workflow publishes `ghcr.io/<owner>/<repository>` (lowercase) for
+`linux/amd64` and `linux/arm64`. Use `:latest` for the most recently published
+stable release, or pin an existing release tag with
+`OPENMESSAGE_IMAGE=ghcr.io/maxghenis/openmessage:<tag>` in your shell or Compose
+`.env` file. Compose defaults to upstream's `ghcr.io/maxghenis/openmessage:latest`;
+set `OPENMESSAGE_IMAGE` to use a fork's published image instead. Prerelease tags
+do not update `:latest`.
+
+The image uses a minimal BusyBox runtime with CA certificates, timezone data,
+and the shell/`wget` needed by the Compose health check. It starts the web UI
+and HTTP MCP endpoints explicitly with `serve --web --mcp-sse` and persists
+messages and sessions in `/data`. Optional `signal-cli`/Java, Node.js-based
+desktop import helpers, and browser-based cookie refresh tools are not included.
+
+From the repository root, after an image has been published:
+
+```bash
+docker compose pull
+docker compose up -d --no-build
+# One-time pairing with Google account cookies saved in ./cookies.txt:
+docker compose exec -T openmessage sh -c 'umask 077; cat > /data/cookies.txt' < ./cookies.txt
+docker compose exec openmessage openmessage pair --google-file /data/cookies.txt
+docker compose exec openmessage rm /data/cookies.txt
+docker compose restart openmessage
+# Connect MCP clients to http://127.0.0.1:7007/mcp or /mcp/sse.
+```
+
+The named volume retains your data across container updates. For re-pairing,
+save fresh cookies into `/data/cookies.txt` as above, stop the server with
+`docker compose stop`, and run
+`docker compose run --rm openmessage pair --google-file /data/cookies.txt`.
+Remove the cookie copy with `docker compose run --rm --entrypoint rm openmessage /data/cookies.txt`,
+then start the server again with `docker compose up -d --no-build`.
+
+To build locally instead (including before the first image is published):
+
+```bash
+export OPENMESSAGE_IMAGE=openmessage:local
+docker compose up -d --build
+```
+
+The non-root UID/GID remains `100:101`, matching the previous Alpine image;
+bind-mounted data directories must be writable by that identity. Compose
+publishes port 7007 only on `127.0.0.1`. The API and MCP endpoints are not
+authenticated for remote access; do not expose them on untrusted networks.
+For remote clients, use an SSH tunnel to the server's localhost port.
+
+Publishing uses `GITHUB_TOKEN` with package-write permission; no separate
+registry secret is needed. After the first publish, make the GHCR package
+public in its package settings if anonymous pulls are desired.
+
 ## Development
 
 ```bash
