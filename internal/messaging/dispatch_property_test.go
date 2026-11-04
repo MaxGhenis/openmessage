@@ -3,12 +3,14 @@ package messaging
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"math/rand"
 	"os"
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"testing/quick"
 	"time"
@@ -37,6 +39,13 @@ var dispatchFaultConditions = map[dispatchFault]string{
 	leaseDispatchFault:      `UPDATE OF state ON outbox WHEN NEW.state = 'dispatching'`,
 	markCalledDispatchFault: `UPDATE OF transport_called_at_ms ON outbox WHEN NEW.transport_called_at_ms IS NOT NULL`,
 	settleDispatchFault:     `UPDATE OF state ON outbox WHEN NEW.state IN ('confirmed', 'store_failed')`,
+}
+
+// checkedTables are the tables whose CHECK requires updated_at_ms >=
+// created_at_ms.
+var checkedTables = []string{
+	"accounts", "devices", "identities", "people", "conversations",
+	"messages", "outbox", "message_attachments", "reactions",
 }
 
 // dispatchScript is one generated history of a text send: the gap between
@@ -77,17 +86,28 @@ func (dispatchScript) Generate(r *rand.Rand, _ int) reflect.Value {
 	return reflect.ValueOf(script)
 }
 
-// TestDispatchPassInvariantsHoldForAnyTimingAndFaults checks, over generated
-// submit, lease and transition times and storage faults:
+// TestDispatchInvariantsHoldForAnyTimingAndFaults runs Run one pass at a time
+// over generated submit, lease and transition times and storage faults, and
+// checks after every pass:
 //
-//   - every write keeps updated_at_ms >= created_at_ms, and no write moves a
-//     row's updated_at_ms backward;
+//   - no row of checkedTables has updated_at_ms below its created_at_ms, or
+//     below its value before the pass;
 //   - a pass without a fault never fails, and leases and sends every row
 //     that is due when it runs;
-//   - failed passes never stop dispatch: once the faults stop and leases
-//     expire, the text is confirmed, or uncertain when a failure followed
-//     its transport call, and it reaches the transport exactly once.
-func TestDispatchPassInvariantsHoldForAnyTimingAndFaults(t *testing.T) {
+//   - Run keeps running after a failed pass: it reports the failure to
+//     OnPassFailure and DispatchHealth, waits the poll delay doubled for each
+//     earlier failure in the same run of failures, up to the longest poll
+//     delay, and passes again.
+//
+// Once the faults stop and leases expire, the text must be confirmed, or
+// uncertain when a failure followed its transport call, after exactly one
+// transport request, and Run must return only when its context is canceled.
+//
+// Each history sends one text. TestOutboxWritesNeverStampUpdatedAtBelowCreatedAt
+// and TestStoreWritesNeverStampUpdatedAtBelowCreatedAt (internal/storage/sqlite)
+// check each write's clamp on its own, on a clock before the row's creation
+// and on one after its creation but before its last update.
+func TestDispatchInvariantsHoldForAnyTimingAndFaults(t *testing.T) {
 	property := func(script dispatchScript) bool {
 		if err := runDispatchScript(t, script); err != nil {
 			t.Logf("script %+v: %v", script, err)
@@ -127,9 +147,9 @@ func dispatchPropertyConfig(t *testing.T, cases, raceCases int) *quick.Config {
 	return &quick.Config{MaxCount: cases, Rand: rand.New(rand.NewSource(seed))}
 }
 
-func runDispatchScript(t *testing.T, script dispatchScript) error {
+func runDispatchScript(t *testing.T, script dispatchScript) (err error) {
 	ctx := context.Background()
-	clock := &splitReadClock{now: messagingTestTime}
+	clock := newRunStepClock(time.Hour)
 	store, raw := openReconcileTestStore(t, clock.Now())
 	sender := &scriptedTextSender{steps: []sendStep{{result: bridge.SendResult{RemoteMessageID: "remote-property"}}}}
 	registry := newScriptedRegistry("property", sender)
@@ -138,6 +158,12 @@ func runDispatchScript(t *testing.T, script dispatchScript) error {
 	if err != nil {
 		return fmt.Errorf("NewMessageService: %w", err)
 	}
+	// Run waits between the poll delay and the longest poll delay. An hour and
+	// eight hours exceed every transport bound, so the clock can tell Run's
+	// waits from a transport call's.
+	service.pollDelay, service.maxPollDelay = clock.floor, 8*clock.floor
+	failures := &passFailures{}
+	service.OnPassFailure(failures.record)
 
 	submitAt := messagingTestTime.Add(time.Second)
 	clock.set(submitAt, time.Duration(script.SubmitReadGapMS)*time.Millisecond)
@@ -148,10 +174,17 @@ func runDispatchScript(t *testing.T, script dispatchScript) error {
 	if err != nil {
 		return fmt.Errorf("SendText: %w", err)
 	}
+	run := newSteppedRun(service, clock)
+	defer func() {
+		if stopErr := run.stop(); err == nil {
+			err = stopErr
+		}
+	}()
+
 	now := submitAt.Add(time.Duration(script.FirstPassMS) * time.Millisecond)
 	latest := submitAt.Add(time.Duration(script.SubmitReadGapMS) * time.Millisecond)
-	var lastUpdatedMS int64
 	postCallFailure := false
+	var failed, inARow int64
 
 	for index, pass := range script.Passes {
 		if index > 0 {
@@ -168,11 +201,22 @@ func runDispatchScript(t *testing.T, script dispatchScript) error {
 		if err != nil {
 			return fmt.Errorf("pass %d: read row: %w", index, err)
 		}
+		rows, err := updatedAtByRow(raw)
+		if err != nil {
+			return fmt.Errorf("pass %d: %w", index, err)
+		}
 		requestsBefore := sender.requestCount()
-		passErr := service.dispatchPass(ctx)
+		wait, err := run.pass()
+		if err != nil {
+			return fmt.Errorf("pass %d at %d with fault %d: %w", index, now.UnixMilli(), pass.Fault, err)
+		}
 		after, err := service.outbox.FindByID(ctx, submission.OutboxID)
 		if err != nil {
 			return fmt.Errorf("pass %d: read row: %w", index, err)
+		}
+		passErr, err := failures.after(failed)
+		if err != nil {
+			return fmt.Errorf("pass %d: %w", index, err)
 		}
 		if passErr != nil && (pass.Fault == noDispatchFault || !strings.Contains(passErr.Error(), injectedDispatchFault)) {
 			return fmt.Errorf("pass %d at %d with fault %d failed for another reason: %w", index, now.UnixMilli(), pass.Fault, passErr)
@@ -183,11 +227,16 @@ func runDispatchScript(t *testing.T, script dispatchScript) error {
 		if passErr != nil && sender.requestCount() > requestsBefore {
 			postCallFailure = true
 		}
-		if after.UpdatedAtMS < lastUpdatedMS {
-			return fmt.Errorf("pass %d moved updated_at_ms back from %d to %d", index, lastUpdatedMS, after.UpdatedAtMS)
+		if passErr != nil {
+			failed++
+			inARow++
+		} else {
+			inARow = 0
 		}
-		lastUpdatedMS = after.UpdatedAtMS
-		if err := rowsUpdatedBeforeCreated(raw); err != nil {
+		if err := checkRunWait(service, now, wait, failed, inARow, passErr); err != nil {
+			return fmt.Errorf("pass %d: %w", index, err)
+		}
+		if err := checkUpdatedAt(raw, rows); err != nil {
 			return fmt.Errorf("pass %d: %w", index, err)
 		}
 		if requests := sender.requestCount(); requests > 1 {
@@ -199,9 +248,25 @@ func runDispatchScript(t *testing.T, script dispatchScript) error {
 	if err := setDispatchFault(raw, noDispatchFault); err != nil {
 		return err
 	}
-	clock.set(latest.Add(service.leaseTime+time.Second), 0)
+	now = latest.Add(service.leaseTime + time.Second)
+	clock.set(now, 0)
 	for index := range 2 {
-		if err := service.dispatchPass(ctx); err != nil {
+		rows, err := updatedAtByRow(raw)
+		if err != nil {
+			return fmt.Errorf("pass %d after the faults stopped: %w", index, err)
+		}
+		wait, err := run.pass()
+		if err != nil {
+			return fmt.Errorf("pass %d after the faults stopped: %w", index, err)
+		}
+		passErr, err := failures.after(failed)
+		if err != nil || passErr != nil {
+			return fmt.Errorf("pass %d after the faults stopped failed: %w", index, errors.Join(err, passErr))
+		}
+		if err := checkRunWait(service, now, wait, failed, 0, nil); err != nil {
+			return fmt.Errorf("pass %d after the faults stopped: %w", index, err)
+		}
+		if err := checkUpdatedAt(raw, rows); err != nil {
 			return fmt.Errorf("pass %d after the faults stopped: %w", index, err)
 		}
 	}
@@ -216,7 +281,192 @@ func runDispatchScript(t *testing.T, script dispatchScript) error {
 	if final.State != want || sender.requestCount() != 1 {
 		return fmt.Errorf("final row %+v after %d transport requests, want %s after 1", final, sender.requestCount(), want)
 	}
-	return rowsUpdatedBeforeCreated(raw)
+	return nil
+}
+
+// checkRunWait checks what Run did after a pass that ran at now and was
+// followed by wait: failed passes in all, the last inARow of them in a row
+// (0 when the pass did not fail, and passErr is nil). After the k-th failed
+// pass in a row Run waits the poll delay doubled k-1 times, up to the longest
+// poll delay, and DispatchHealth reports the pass; after a pass that did not
+// fail it waits a poll delay in that range.
+func checkRunWait(service *MessageService, now time.Time, wait time.Duration, failed, inARow int64, passErr error) error {
+	health := service.DispatchHealth()
+	if health.FailedPasses != failed || health.ConsecutiveFailedPasses != inARow {
+		return fmt.Errorf(
+			"DispatchHealth() counts %d failed passes, %d in a row; want %d, %d",
+			health.FailedPasses, health.ConsecutiveFailedPasses, failed, inARow,
+		)
+	}
+	if passErr == nil {
+		if wait < service.pollDelay || wait > service.maxPollDelay {
+			return fmt.Errorf("Run waits %v after a pass, want %v to %v", wait, service.pollDelay, service.maxPollDelay)
+		}
+		return nil
+	}
+	backoff := service.pollDelay
+	for range inARow - 1 {
+		backoff = min(2*backoff, service.maxPollDelay)
+	}
+	if wait != backoff {
+		return fmt.Errorf("Run waits %v after failed pass %d in a row, want %v", wait, inARow, backoff)
+	}
+	want := FailedDispatchPass{
+		AtMS:        now.UnixMilli(),
+		Error:       passErr.Error(),
+		Consecutive: inARow,
+		RetryAtMS:   now.Add(backoff).UnixMilli(),
+	}
+	if health.LastFailedPass == nil || *health.LastFailedPass != want {
+		return fmt.Errorf("DispatchHealth().LastFailedPass = %+v, want %+v", health.LastFailedPass, want)
+	}
+	return nil
+}
+
+// passFailures records the errors OnPassFailure reports. checkRunWait
+// compares each with the pass DispatchHealth reports.
+type passFailures struct {
+	mu     sync.Mutex
+	errors []error
+}
+
+func (p *passFailures) record(err error, _ FailedDispatchPass) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.errors = append(p.errors, err)
+}
+
+// after returns passErr, the failure reported after the first n, if any. Run
+// reports each failed pass once, so more than one is an error.
+func (p *passFailures) after(n int64) (passErr, err error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	switch reported := int64(len(p.errors)); reported {
+	case n:
+		return nil, nil
+	case n + 1:
+		if p.errors[n] == nil {
+			return nil, errors.New("OnPassFailure reported a nil error")
+		}
+		return p.errors[n], nil
+	default:
+		return nil, fmt.Errorf("OnPassFailure ran %d times after %d failed passes", reported-n, n)
+	}
+}
+
+// runStepClock steps Run one pass at a time. Run creates a wait timer only
+// when a pass has ended, so NewTimer hands the wait to the test and blocks
+// until the test releases the next pass; the timer it then returns has
+// already fired. Timers shorter than floor bound transport calls (see
+// callTransport) and run on the system clock: Run never waits less than its
+// poll delay, which the test sets to floor.
+type runStepClock struct {
+	*splitReadClock
+	floor    time.Duration
+	passEnds chan time.Duration
+	release  chan struct{}
+	done     chan struct{}
+}
+
+func newRunStepClock(floor time.Duration) *runStepClock {
+	return &runStepClock{
+		splitReadClock: &splitReadClock{now: messagingTestTime},
+		floor:          floor,
+		passEnds:       make(chan time.Duration),
+		release:        make(chan struct{}),
+		done:           make(chan struct{}),
+	}
+}
+
+func (c *runStepClock) NewTimer(delay time.Duration) Timer {
+	if delay < c.floor {
+		return c.splitReadClock.NewTimer(delay)
+	}
+	select {
+	case c.passEnds <- delay:
+		select {
+		case <-c.release:
+		case <-c.done:
+		}
+	case <-c.done:
+	}
+	fired := make(firedTimer, 1)
+	fired <- time.Time{}
+	return fired
+}
+
+// firedTimer is a Timer that has already fired.
+type firedTimer chan time.Time
+
+func (t firedTimer) C() <-chan time.Time { return t }
+
+func (firedTimer) Stop() bool { return false }
+
+// steppedRun runs Run on a runStepClock, one pass per call to pass.
+type steppedRun struct {
+	service  *MessageService
+	clock    *runStepClock
+	ctx      context.Context
+	cancel   context.CancelFunc
+	started  bool
+	finished chan struct{}
+	// err is Run's result, set before finished closes.
+	err error
+}
+
+func newSteppedRun(service *MessageService, clock *runStepClock) *steppedRun {
+	ctx, cancel := context.WithCancel(context.Background())
+	return &steppedRun{
+		service:  service,
+		clock:    clock,
+		ctx:      ctx,
+		cancel:   cancel,
+		finished: make(chan struct{}),
+	}
+}
+
+// pass starts Run, or releases its next pass, and returns the wait Run asks
+// for when the pass ends. Run returning instead is an error.
+func (r *steppedRun) pass() (time.Duration, error) {
+	if !r.started {
+		r.started = true
+		go func() {
+			r.err = r.service.Run(r.ctx)
+			close(r.finished)
+		}()
+	} else {
+		select {
+		case r.clock.release <- struct{}{}:
+		case <-r.finished:
+			return 0, fmt.Errorf("Run() returned %v; want it to keep dispatching", r.err)
+		}
+	}
+	select {
+	case wait := <-r.clock.passEnds:
+		return wait, nil
+	case <-r.finished:
+		return 0, fmt.Errorf("Run() returned %v; want it to keep dispatching", r.err)
+	case <-time.After(10 * time.Second):
+		return 0, errors.New("Run() did not finish its pass within 10 s")
+	}
+}
+
+// stop cancels Run and checks that it returns context.Canceled.
+func (r *steppedRun) stop() error {
+	r.cancel()
+	close(r.clock.done)
+	if !r.started {
+		return nil
+	}
+	select {
+	case <-r.finished:
+	case <-time.After(10 * time.Second):
+		return errors.New("Run() did not return within 10 s of cancellation")
+	}
+	if !errors.Is(r.err, context.Canceled) {
+		return fmt.Errorf("Run() = %v after cancellation, want context.Canceled", r.err)
+	}
+	return nil
 }
 
 // dueAt reports whether a pass at now must lease item: it is queued or not
@@ -249,8 +499,45 @@ func setDispatchFault(raw *sql.DB, fault dispatchFault) error {
 	return nil
 }
 
-func rowsUpdatedBeforeCreated(raw *sql.DB) error {
-	for _, table := range []string{"accounts", "conversations", "messages", "outbox"} {
+// updatedAtByRow maps each row of checkedTables, named by its table, rowid
+// and created_at_ms, to its updated_at_ms.
+func updatedAtByRow(raw *sql.DB) (map[string]int64, error) {
+	byRow := make(map[string]int64)
+	for _, table := range checkedTables {
+		rows, err := raw.Query(`SELECT rowid, created_at_ms, updated_at_ms FROM ` + table)
+		if err != nil {
+			return nil, fmt.Errorf("read %s updated_at_ms: %w", table, err)
+		}
+		for rows.Next() {
+			var rowID, createdAtMS, updatedAtMS int64
+			if err := rows.Scan(&rowID, &createdAtMS, &updatedAtMS); err != nil {
+				rows.Close()
+				return nil, fmt.Errorf("scan %s updated_at_ms: %w", table, err)
+			}
+			byRow[fmt.Sprintf("%s row %d created at %d", table, rowID, createdAtMS)] = updatedAtMS
+		}
+		err = rows.Err()
+		rows.Close()
+		if err != nil {
+			return nil, fmt.Errorf("read %s updated_at_ms: %w", table, err)
+		}
+	}
+	return byRow, nil
+}
+
+// checkUpdatedAt checks that no row of checkedTables has updated_at_ms below
+// its created_at_ms, or below its value in before, from updatedAtByRow.
+func checkUpdatedAt(raw *sql.DB, before map[string]int64) error {
+	after, err := updatedAtByRow(raw)
+	if err != nil {
+		return err
+	}
+	for row, updatedAtMS := range after {
+		if was, ok := before[row]; ok && updatedAtMS < was {
+			return fmt.Errorf("%s: updated_at_ms fell from %d to %d", row, was, updatedAtMS)
+		}
+	}
+	for _, table := range checkedTables {
 		var count int
 		if err := raw.QueryRow(
 			`SELECT COUNT(*) FROM ` + table + ` WHERE updated_at_ms < created_at_ms`,

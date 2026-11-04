@@ -226,3 +226,98 @@ func TestRunRecoversALeaseItsFailedPassLeftBehind(t *testing.T) {
 		t.Fatalf("transport requests = %d, want 1", got)
 	}
 }
+
+// A failed pass waits out its backoff even when a submission wakes the
+// dispatcher. A wake that ended the wait would let a steady stream of sends
+// turn a storage fault that persists into a tight retry loop.
+func TestRunWaitsOutItsBackoffWhenASubmissionWakesIt(t *testing.T) {
+	clock := &waitProbeClock{
+		splitReadClock: &splitReadClock{now: messagingTestTime},
+		waits:          make(chan time.Duration, 8),
+	}
+	store, raw := openReconcileTestStore(t, clock.Now())
+	registry := newScriptedRegistry("wake-probe", &scriptedTextSender{})
+	registry.setAvailable(true)
+	service := newMessagingTestService(t, store, registry, clock)
+	service.pollDelay, service.maxPollDelay = time.Hour, 8*time.Hour
+	if _, err := raw.ExecContext(context.Background(), `
+		CREATE TRIGGER fail_lease
+		BEFORE UPDATE OF state ON outbox
+		WHEN NEW.state = 'dispatching'
+		BEGIN
+			SELECT RAISE(ABORT, 'injected lease failure');
+		END
+	`); err != nil {
+		t.Fatalf("create failure trigger: %v", err)
+	}
+	mustSendText(t, service, SendTextCommand{
+		CommonCommand: testCommonCommand("key-before-the-fault"),
+		Body:          "queued while leases fail",
+	})
+	drainReconcileWake(service)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	stopped := make(chan error, 1)
+	go func() { stopped <- service.Run(ctx) }()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case err := <-stopped:
+			if !errors.Is(err, context.Canceled) {
+				t.Errorf("Run() error = %v, want context.Canceled", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Error("Run() did not stop after cancellation")
+		}
+	})
+
+	select {
+	case wait := <-clock.waits:
+		if wait != service.pollDelay {
+			t.Fatalf("Run waits %v after its first failed pass, want the poll delay %v", wait, service.pollDelay)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run() did not finish its first pass")
+	}
+	mustSendText(t, service, SendTextCommand{
+		CommonCommand: testCommonCommand("key-during-the-backoff"),
+		Body:          "submitted while Run backs off",
+	})
+	select {
+	case wait := <-clock.waits:
+		t.Fatalf("the submission's wake ended the backoff: Run passed again and waits %v", wait)
+	case err := <-stopped:
+		t.Fatalf("Run() returned %v during its backoff", err)
+	case <-time.After(500 * time.Millisecond):
+	}
+	if health := service.DispatchHealth(); health.FailedPasses != 1 {
+		t.Fatalf("failed passes = %d during the backoff, want 1", health.FailedPasses)
+	}
+}
+
+// waitProbeClock reports each wait of an hour or more, the waits Run starts
+// when the test sets its poll delay to an hour, and never fires their timers,
+// so only a wake or cancellation can end one. Shorter timers bound transport
+// calls and run on the system clock.
+type waitProbeClock struct {
+	*splitReadClock
+	waits chan time.Duration
+}
+
+func (c *waitProbeClock) NewTimer(delay time.Duration) Timer {
+	if delay < time.Hour {
+		return c.splitReadClock.NewTimer(delay)
+	}
+	select {
+	case c.waits <- delay:
+	default:
+	}
+	return heldTimer{}
+}
+
+// heldTimer never fires: a receive from its nil channel blocks forever.
+type heldTimer struct{}
+
+func (heldTimer) C() <-chan time.Time { return nil }
+
+func (heldTimer) Stop() bool { return true }
