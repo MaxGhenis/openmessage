@@ -14,7 +14,6 @@ services:
   openmessage:
     build: .
     image: ${OPENMESSAGE_IMAGE:-ghcr.io/maxghenis/openmessage:latest}
-    command: ["serve", "--web", "--mcp-sse"]
     container_name: openmessage
     restart: unless-stopped
     ports:
