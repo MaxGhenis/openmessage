@@ -220,6 +220,71 @@ func TestStoreWritesNeverStampUpdatedAtBelowCreatedAt(t *testing.T) {
 				})
 			},
 		},
+		// The write-back cases read the row and keep its created_at_ms, as the
+		// ingest worker does, so the row the upsert would insert has
+		// updated_at_ms below created_at_ms (issue #169).
+		{
+			name:   "UpsertAccount writing back a stored row",
+			target: clampTarget{"accounts", "account_id = ?", []any{"account-a"}},
+			act: func(f *clampFixture) error {
+				account, err := f.store.GetAccount("account-a")
+				if err != nil {
+					return err
+				}
+				account.DisplayName = "renamed"
+				account.UpdatedAtMS = repositoryEarlyMS
+				return f.store.UpsertAccount(account)
+			},
+		},
+		{
+			name:   "UpsertDevice writing back a stored row",
+			target: clampTarget{"devices", "device_id = ?", []any{"device-a"}},
+			arrange: func(f *clampFixture) {
+				mustRepositoryWrite(t, "UpsertDevice", f.store.UpsertDevice(Device{
+					DeviceID:    "device-a",
+					AccountID:   "account-a",
+					Kind:        DeviceKindLocalInstallation,
+					State:       DeviceStateActive,
+					CreatedAtMS: repositoryTestTimeMS,
+					UpdatedAtMS: repositoryTestTimeMS,
+				}))
+			},
+			act: func(f *clampFixture) error {
+				device, err := f.store.GetDevice("device-a")
+				if err != nil {
+					return err
+				}
+				device.DisplayName = "renamed"
+				device.UpdatedAtMS = repositoryEarlyMS
+				return f.store.UpsertDevice(device)
+			},
+		},
+		{
+			name:   "UpsertIdentity writing back a stored row",
+			target: clampTarget{"identities", "identity_id = ?", []any{"identity-a"}},
+			act: func(f *clampFixture) error {
+				identity, err := f.store.GetIdentity("identity-a")
+				if err != nil {
+					return err
+				}
+				identity.DisplayName = "renamed"
+				identity.UpdatedAtMS = repositoryEarlyMS
+				return f.store.UpsertIdentity(identity)
+			},
+		},
+		{
+			name:   "UpsertConversation writing back a stored row",
+			target: clampTarget{"conversations", "conversation_id = ?", []any{"conversation-a"}},
+			act: func(f *clampFixture) error {
+				conversation, err := f.store.GetConversation("conversation-a")
+				if err != nil {
+					return err
+				}
+				conversation.Title = "renamed"
+				conversation.UpdatedAtMS = repositoryEarlyMS
+				return f.store.UpsertConversation(conversation)
+			},
+		},
 		{
 			name:    "ProjectMessage over a projected message",
 			target:  messageA,
