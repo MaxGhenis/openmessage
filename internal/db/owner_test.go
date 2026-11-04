@@ -61,9 +61,9 @@ func ownerRuleNested(depth int) string {
 // list, with the traits it drew. Most elements are objects whose fields can
 // repeat a key, escape a character of a key, hold another JSON type than the
 // rule reads, hold a NUL, nest deeper than SQLite's JSON reader goes, or sit
-// between extra whitespace. Some are strings: a name, a number in any
-// written form, or text that reads as a flagged object. The rest are neither
-// objects nor strings.
+// between extra whitespace. Some are strings: a name, the owner's number in
+// one of its written forms, any other value a number can hold, or text that
+// reads as a flagged object. The rest are neither objects nor strings.
 func ownerRuleElement(random *rand.Rand) (string, []string) {
 	switch random.Intn(10) {
 	case 0:
@@ -71,11 +71,13 @@ func ownerRuleElement(random *rand.Rand) (string, []string) {
 		return odd[random.Intn(len(odd))], []string{"an element that's neither an object nor a string"}
 	case 1:
 		traits := []string{"a string element"}
-		switch random.Intn(3) {
+		switch random.Intn(4) {
 		case 0:
 			return `"{\"is_me\":true,\"number\":\"+15550009999\"}"`, append(traits, "a string that reads as a flagged object")
 		case 1:
 			return `"Sam Owner"`, traits
+		case 2:
+			return ownerRuleQuote(ownerNumberForms[random.Intn(len(ownerNumberForms))], random.Intn(3) == 0), traits
 		}
 		return ownerRuleQuote(ownerRuleNumbers[random.Intn(len(ownerRuleNumbers))], random.Intn(3) == 0), traits
 	}
@@ -384,11 +386,10 @@ func TestOwnerRuleReadsEachElementAlikeInGoAndSQL(t *testing.T) {
 		}
 		return true
 	}
-	cases := 400
-	if raceDetectorEnabled {
-		cases = 80
-	}
-	if err := quick.Check(property, &quick.Config{MaxCount: cases, Rand: rand.New(rand.NewSource(20261103))}); err != nil {
+	// The race job runs every case as well: a case costs a few milliseconds
+	// under -race, and fewer cases can miss the rarest paths, such as a list
+	// nested deeper than Go reads.
+	if err := quick.Check(property, &quick.Config{MaxCount: 400, Rand: rand.New(rand.NewSource(20261103))}); err != nil {
 		t.Fatal(err)
 	}
 	for _, path := range []string{
@@ -420,7 +421,8 @@ func TestOwnerKeysHoldTheLinesSendMessageTakes(t *testing.T) {
 	property := func(seed int64) bool {
 		random := rand.New(rand.NewSource(seed))
 		store := newTestStore(t)
-		for index := 0; index < 1+random.Intn(5); index++ {
+		count := 1 + random.Intn(5)
+		for index := 0; index < count; index++ {
 			list, elements := ownerRuleList(random, exercised)
 			seedConversations(t, store, &Conversation{
 				ConversationID: "c" + strconv.Itoa(index), Name: "Thread", SourcePlatform: "sms", LastMessageTS: int64(index), Participants: list,

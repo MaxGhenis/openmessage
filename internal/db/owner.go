@@ -204,7 +204,7 @@ func (lines OwnerLines) Owner(entry ParticipantEntry) bool {
 // reads on. Each function takes a list whole, as a BLOB, since the driver
 // cuts a TEXT argument at its first NUL; reads it as ParticipantEntries
 // does; returns JSON text that SQLite's JSON functions read back, with every
-// NUL escaped; and fails on no input:
+// NUL escaped; and never returns an error, whatever the argument:
 //
 //	openmessage_participant_entries(list) returns an array that holds, for
 //	each entry ParticipantEntries gives, in order, an object with its
