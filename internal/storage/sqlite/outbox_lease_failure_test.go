@@ -127,6 +127,43 @@ func TestLeaseDueBatchBacksOffARowWhoseLeaseKeepsFailing(t *testing.T) {
 	}
 }
 
+// Only a lease failure's delay doubles. The dispatcher set this row's last
+// retry a minute out after another failure, so when its lease then fails, its
+// delay starts over at 5 s instead of doubling that minute.
+func TestLeaseDueBatchStartsTheDelayOverAfterAnotherFailure(t *testing.T) {
+	ctx := context.Background()
+	clock := newOutboxTestClock(outboxTestTimeMS)
+	store, repository := openOutboxTestRepository(t, clock.Now)
+	item := outboxTestItem("head")
+	item.ScheduledForMS = outboxTestTimeMS - 100
+	mustEnqueueOutbox(t, repository, item)
+	batch := mustLeaseDueBatch(t, repository, clock.Now(), 1)
+	if len(batch.Leases) != 1 || batch.Leases[0].LeaseToken == nil {
+		t.Fatalf("LeaseDueBatch() = %+v, want the row leased", batch)
+	}
+	retryAt := clock.Now().Add(time.Minute)
+	if err := repository.MarkNotDispatched(ctx, "outbox-head", *batch.Leases[0].LeaseToken,
+		"offline", "not_connected", "transport offline", retryAt); err != nil {
+		t.Fatalf("MarkNotDispatched(): %v", err)
+	}
+
+	clock.Set(retryAt.UnixMilli())
+	mustExec(t, store.db, leaseFailureTrigger("outbox-head"))
+	batch = mustLeaseDueBatch(t, repository, clock.Now(), 1)
+	if len(batch.Leases) != 0 || len(batch.Failed) != 1 || batch.Failed[0].SetAsideErr != nil {
+		t.Fatalf("LeaseDueBatch() at the retry = %+v, want the row set aside", batch)
+	}
+	if delay := batch.Failed[0].RetryAt.Sub(clock.Now()); delay != 5*time.Second {
+		t.Fatalf("delay after the first failed lease = %v, want 5s", delay)
+	}
+	row := mustFindOutboxRow(t, repository, "outbox-head")
+	if row.ErrorCode == nil || *row.ErrorCode != LeaseFailedCode || row.NextAttemptAtMS == nil ||
+		*row.NextAttemptAtMS != batch.Failed[0].RetryAt.UnixMilli() {
+		t.Fatalf("row set aside = %+v, want error code %q and the retry time the call returned",
+			row, LeaseFailedCode)
+	}
+}
+
 // A row that can be neither leased nor set aside stays as it was, still due,
 // and the call leases the rows behind it however many such rows come first.
 func TestLeaseDueBatchLeasesPastRowsThatCanBeNeitherLeasedNorSetAside(t *testing.T) {
