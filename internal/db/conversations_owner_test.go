@@ -315,12 +315,15 @@ func TestLegacySearchesReadNoEntryFromAListWithBytesAfterANUL(t *testing.T) {
 	}
 }
 
-// Both legacy searches cost about the same however many phone lines flagged
-// entries give the owner: an entry's owner test looks its number's keys up
-// in owner_keys, which SQLite gathers once for each query. They passed every
-// line to Go for every entry, so a store that flagged the owner on many
-// numbers made each search's cost grow with entries times lines.
-func TestLegacySearchesCostAboutTheSameForAnyNumberOfOwnerLines(t *testing.T) {
+// Both legacy searches allocate about as much however many phone lines
+// flagged entries give the owner: an entry's owner test looks its number's
+// keys up in owner_keys, which SQLite gathers once for each query. They
+// passed every line to Go for every entry, so each search's work and
+// allocations grew with entries times lines. Allocations can't tell lookups
+// from a scan that allocates nothing, so this test bounds only allocations;
+// the owner test looks up at most ten keys, in an index that SQLite builds
+// once for each query.
+func TestLegacySearchesAllocateAboutTheSameForAnyNumberOfOwnerLines(t *testing.T) {
 	const threads = 300
 	seed := func(distinct bool) *Store {
 		store := newTestStore(t)

@@ -1026,13 +1026,13 @@ running app:
   first NUL, and read it in Go, so a repeated key counts with its last value
   in all three. Each value reaches the Go matcher as a BLOB too. The keys of
   the owner's lines (`phoneline.LineKeys`) go into an index that SQLite
-  builds once per query, so a store that flags the owner on many numbers
-  costs each search about the same as one that flags one. It names any
-  object entry that
-  carries `is_me` or `isMe` set to JSON true, and any entry, a bare string
-  included, in any thread, on the phone line of a flagged entry whose number
-  reads as a phone number or a WhatsApp JID of one: the line is the number's
-  `phoneline.Line`, and an entry sits on it when `phoneline.Match` says so.
+  builds once per query, and an entry's owner test looks up at most ten keys
+  there, however many lines the owner has. The rule names any object entry
+  that carries `is_me` or `isMe` set to JSON true, and any entry, a bare
+  string included, in any thread, on the phone line of a flagged entry whose
+  number reads as a phone number or a WhatsApp JID of one: the line is the
+  number's `phoneline.Line`, and an entry sits on it when `phoneline.Match`
+  says so.
   So the owner's WhatsApp JID sits on the owner's line, while a flagged
   WhatsApp LID marks no line, and a `tel:` URI or an email address that holds
   the owner's digits sits on none. The rule reads each element of a
@@ -1141,10 +1141,10 @@ running app:
   `TestLegacySearchesReadAValueWithANULAsSendMessageDoes`,
   `TestLegacySearchesReadAListNestedDeeperThanSQLiteReads`,
   `TestLegacySearchesReadNoEntryFromAListWithBytesAfterANUL`,
-  `TestLegacySearchesCostAboutTheSameForAnyNumberOfOwnerLines`,
+  `TestLegacySearchesAllocateAboutTheSameForAnyNumberOfOwnerLines`,
   `TestOwnerRuleReadsEachElementAlikeInGoAndSQL`,
   `TestOwnerKeysHoldTheLinesSendMessageTakes`,
-  `TestOwnerLinesOnLineCostsTheSameForAnyNumberOfLines` and
+  `TestOwnerLinesOnLineAllocatesTheSameForAnyNumberOfLines` and
   `TestOwnerLinesFollowPhoneline` (internal/db), and `TestLineKeysIndexMatch`
   (internal/phoneline).
 - Escape hatches: `--transports` forces the old standalone full-stack stdio

@@ -517,10 +517,13 @@ func TestOwnerKeysHoldTheLinesSendMessageTakes(t *testing.T) {
 	}
 }
 
-// OwnerLines.OnLine costs the same however many lines the set holds: a store
-// can flag the owner on many numbers, and a send asks about every entry of
-// every conversation.
-func TestOwnerLinesOnLineCostsTheSameForAnyNumberOfLines(t *testing.T) {
+// OwnerLines.OnLine allocates no more over 2,000 lines than over one: a
+// store can flag the owner on many numbers, and a send asks about every
+// entry of every conversation. Allocations can't tell lookups from a scan of
+// every line that allocates nothing, so this test bounds only allocations;
+// OnLine looks up each of its number's phoneline.ValueKeys, and
+// TestLineKeysIndexMatch checks that a number has at most ten.
+func TestOwnerLinesOnLineAllocatesTheSameForAnyNumberOfLines(t *testing.T) {
 	one := ownerLinesOf("+15550009999")
 	many := OwnerLines{}
 	for index := 0; index < 2000; index++ {
