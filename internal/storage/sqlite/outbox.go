@@ -1322,6 +1322,14 @@ type dueOutboxRow struct {
 
 // selectDueOutboxPage returns up to limit due rows in due order, after the row
 // after when it is not nil.
+//
+// The order, the cursor and the scanned key all read created_at_ms through
+// IFNULL(created_at_ms, 0). The schema forbids a NULL there, but a schema
+// edit or a botched table rebuild that drops the NOT NULL lets a row hold
+// one. Scanning that NULL would fail the whole call, and comparing it would
+// hide the row from every page after the first. With IFNULL the row keeps a
+// place in the order and its lease decides its fate: the leased row does not
+// read back, so the call sets it aside like any row that fails on itself.
 func selectDueOutboxPage(
 	ctx context.Context,
 	tx *sql.Tx,
@@ -1330,7 +1338,7 @@ func selectDueOutboxPage(
 	limit int,
 ) ([]dueOutboxRow, error) {
 	query := `
-		SELECT outbox_id, COALESCE(next_attempt_at_ms, scheduled_for_ms), created_at_ms
+		SELECT outbox_id, COALESCE(next_attempt_at_ms, scheduled_for_ms), IFNULL(created_at_ms, 0)
 		FROM outbox
 		WHERE scheduled_for_ms <= ?
 		  AND state IN ('queued', 'not_dispatched')
@@ -1339,11 +1347,11 @@ func selectDueOutboxPage(
 	arguments := []any{nowMS, nowMS, nowMS}
 	if after != nil {
 		query += `
-		  AND (COALESCE(next_attempt_at_ms, scheduled_for_ms), created_at_ms, outbox_id) > (?, ?, ?)`
+		  AND (COALESCE(next_attempt_at_ms, scheduled_for_ms), IFNULL(created_at_ms, 0), outbox_id) > (?, ?, ?)`
 		arguments = append(arguments, after.dueAtMS, after.createdAtMS, after.outboxID)
 	}
 	query += `
-		ORDER BY COALESCE(next_attempt_at_ms, scheduled_for_ms), created_at_ms, outbox_id
+		ORDER BY COALESCE(next_attempt_at_ms, scheduled_for_ms), IFNULL(created_at_ms, 0), outbox_id
 		LIMIT ?`
 	arguments = append(arguments, limit)
 	rows, err := tx.QueryContext(ctx, query, arguments...)
