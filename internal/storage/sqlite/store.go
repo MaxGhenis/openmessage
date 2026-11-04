@@ -9,6 +9,13 @@
 // committed, or the wall clock stepped back. A plain now would then fail the
 // CHECK. The larger value is also the truer time, since the write commits after
 // the one that set it.
+//
+// An upsert also binds the row it would insert with updated_at_ms no lower
+// than that row's created_at_ms. SQLite checks the CHECK on that row before it
+// resolves the conflict, so the clamp in DO UPDATE never runs for a caller that
+// reads a row, keeps its created_at_ms and stamps updated_at_ms with an earlier
+// clock. The ingest worker does that when a message stamped ahead of the local
+// clock created the conversation (issue #169).
 package sqlite
 
 import (

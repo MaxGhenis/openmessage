@@ -109,7 +109,7 @@ func (s *Store) UpsertAccount(account Account) error {
 		account.Enabled,
 		account.ConfigJSON,
 		account.CreatedAtMS,
-		account.UpdatedAtMS,
+		max(account.UpdatedAtMS, account.CreatedAtMS),
 	)
 	if err != nil {
 		return fmt.Errorf("upsert account %q: %w", account.AccountID, mapConstraintError(err))
@@ -212,7 +212,7 @@ func (s *Store) UpsertDevice(device Device) error {
 		device.IsCurrent,
 		device.LastSeenAtMS,
 		device.CreatedAtMS,
-		device.UpdatedAtMS,
+		max(device.UpdatedAtMS, device.CreatedAtMS),
 	)
 	if err != nil {
 		return fmt.Errorf("upsert device %q: %w", device.DeviceID, mapConstraintError(err))
@@ -315,7 +315,7 @@ func (s *Store) UpsertIdentity(identity Identity) error {
 		identity.IsSelf,
 		identity.MetadataJSON,
 		identity.CreatedAtMS,
-		identity.UpdatedAtMS,
+		max(identity.UpdatedAtMS, identity.CreatedAtMS),
 	)
 	if err != nil {
 		return fmt.Errorf("upsert identity %q: %w", identity.IdentityID, mapConstraintError(err))
@@ -687,7 +687,7 @@ func (s *Store) UpsertConversation(conversation Conversation) error {
 		conversation.LastMessageAtMS,
 		conversation.MetadataJSON,
 		conversation.CreatedAtMS,
-		conversation.UpdatedAtMS,
+		max(conversation.UpdatedAtMS, conversation.CreatedAtMS),
 	)
 	if err != nil {
 		return fmt.Errorf(
