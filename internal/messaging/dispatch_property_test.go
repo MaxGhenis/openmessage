@@ -214,7 +214,7 @@ func runDispatchScript(t *testing.T, script dispatchScript) (err error) {
 		if err != nil {
 			return fmt.Errorf("pass %d: read row: %w", index, err)
 		}
-		passErr, err := failures.after(failed)
+		passErr, reported, err := failures.after(failed)
 		if err != nil {
 			return fmt.Errorf("pass %d: %w", index, err)
 		}
@@ -233,7 +233,7 @@ func runDispatchScript(t *testing.T, script dispatchScript) (err error) {
 		} else {
 			inARow = 0
 		}
-		if err := checkRunWait(service, now, wait, failed, inARow, passErr); err != nil {
+		if err := checkRunWait(service, now, wait, failed, inARow, passErr, reported); err != nil {
 			return fmt.Errorf("pass %d: %w", index, err)
 		}
 		if err := checkUpdatedAt(raw, rows); err != nil {
@@ -259,11 +259,11 @@ func runDispatchScript(t *testing.T, script dispatchScript) (err error) {
 		if err != nil {
 			return fmt.Errorf("pass %d after the faults stopped: %w", index, err)
 		}
-		passErr, err := failures.after(failed)
+		passErr, _, err := failures.after(failed)
 		if err != nil || passErr != nil {
 			return fmt.Errorf("pass %d after the faults stopped failed: %w", index, errors.Join(err, passErr))
 		}
-		if err := checkRunWait(service, now, wait, failed, 0, nil); err != nil {
+		if err := checkRunWait(service, now, wait, failed, 0, nil, FailedDispatchPass{}); err != nil {
 			return fmt.Errorf("pass %d after the faults stopped: %w", index, err)
 		}
 		if err := checkUpdatedAt(raw, rows); err != nil {
@@ -288,9 +288,10 @@ func runDispatchScript(t *testing.T, script dispatchScript) (err error) {
 // followed by wait: failed passes in all, the last inARow of them in a row
 // (0 when the pass did not fail, and passErr is nil). After the k-th failed
 // pass in a row Run waits the poll delay doubled k-1 times, up to the longest
-// poll delay, and DispatchHealth reports the pass; after a pass that did not
-// fail it waits a poll delay in that range.
-func checkRunWait(service *MessageService, now time.Time, wait time.Duration, failed, inARow int64, passErr error) error {
+// poll delay, and DispatchHealth and the OnPassFailure report (reported)
+// describe the pass; after a pass that did not fail it waits a poll delay in
+// that range.
+func checkRunWait(service *MessageService, now time.Time, wait time.Duration, failed, inARow int64, passErr error, reported FailedDispatchPass) error {
 	health := service.DispatchHealth()
 	if health.FailedPasses != failed || health.ConsecutiveFailedPasses != inARow {
 		return fmt.Errorf(
@@ -320,37 +321,47 @@ func checkRunWait(service *MessageService, now time.Time, wait time.Duration, fa
 	if health.LastFailedPass == nil || *health.LastFailedPass != want {
 		return fmt.Errorf("DispatchHealth().LastFailedPass = %+v, want %+v", health.LastFailedPass, want)
 	}
+	if reported != want {
+		return fmt.Errorf("OnPassFailure reported %+v, want %+v", reported, want)
+	}
 	return nil
 }
 
-// passFailures records the errors OnPassFailure reports. checkRunWait
-// compares each with the pass DispatchHealth reports.
+// passFailures records what OnPassFailure reports. checkRunWait compares
+// each report with the pass DispatchHealth reports.
 type passFailures struct {
-	mu     sync.Mutex
-	errors []error
+	mu      sync.Mutex
+	reports []passFailure
 }
 
-func (p *passFailures) record(err error, _ FailedDispatchPass) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.errors = append(p.errors, err)
+// passFailure is one OnPassFailure call.
+type passFailure struct {
+	err  error
+	pass FailedDispatchPass
 }
 
-// after returns passErr, the failure reported after the first n, if any. Run
-// reports each failed pass once, so more than one is an error.
-func (p *passFailures) after(n int64) (passErr, err error) {
+func (p *passFailures) record(err error, pass FailedDispatchPass) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	switch reported := int64(len(p.errors)); reported {
+	p.reports = append(p.reports, passFailure{err: err, pass: pass})
+}
+
+// after returns the failure reported after the first n, if any: passErr and
+// the pass the hook described. Run reports each failed pass once, so more
+// than one is an error.
+func (p *passFailures) after(n int64) (passErr error, pass FailedDispatchPass, err error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	switch reported := int64(len(p.reports)); reported {
 	case n:
-		return nil, nil
+		return nil, FailedDispatchPass{}, nil
 	case n + 1:
-		if p.errors[n] == nil {
-			return nil, errors.New("OnPassFailure reported a nil error")
+		if p.reports[n].err == nil {
+			return nil, FailedDispatchPass{}, errors.New("OnPassFailure reported a nil error")
 		}
-		return p.errors[n], nil
+		return p.reports[n].err, p.reports[n].pass, nil
 	default:
-		return nil, fmt.Errorf("OnPassFailure ran %d times after %d failed passes", reported-n, n)
+		return nil, FailedDispatchPass{}, fmt.Errorf("OnPassFailure ran %d times after %d failed passes", reported-n, n)
 	}
 }
 
