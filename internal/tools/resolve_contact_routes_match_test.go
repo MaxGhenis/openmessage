@@ -2,9 +2,11 @@ package tools
 
 import (
 	"fmt"
+	"maps"
 	"path/filepath"
 	"slices"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/maxghenis/openmessage/internal/app"
@@ -422,20 +424,26 @@ func TestResolveContactRoutesKeepsAPersonWhoseAddressOthersHold(t *testing.T) {
 }
 
 // countingRouteReads counts the searches that the route tool asks the
-// serving store for, by line and by text.
+// serving store for, by line, by whole address and by text.
 type countingRouteReads struct {
 	readsource.ReadSource
-	lines map[string]int
-	texts map[string]int
+	lines     map[string]int
+	addresses map[string]int
+	texts     map[string]int
 }
 
 func newCountingRouteReads(reads readsource.ReadSource) *countingRouteReads {
-	return &countingRouteReads{ReadSource: reads, lines: map[string]int{}, texts: map[string]int{}}
+	return &countingRouteReads{ReadSource: reads, lines: map[string]int{}, addresses: map[string]int{}, texts: map[string]int{}}
 }
 
 func (r *countingRouteReads) SearchConversationsByPhoneLine(line string, limit int) ([]*db.Conversation, error) {
 	r.lines[line]++
 	return r.ReadSource.SearchConversationsByPhoneLine(line, limit)
+}
+
+func (r *countingRouteReads) SearchConversationsByAddress(address string, limit int) ([]*db.Conversation, error) {
+	r.addresses[address]++
+	return r.ReadSource.SearchConversationsByAddress(address, limit)
 }
 
 func (r *countingRouteReads) SearchConversationsByMetadata(query string, limit int) ([]*db.Conversation, error) {
@@ -445,10 +453,13 @@ func (r *countingRouteReads) SearchConversationsByMetadata(query string, limit i
 
 // Two address-book cards and a legacy thread hold Alice's number, in two
 // written forms that name one line. Two Google Chat threads list her email
-// address, where the legacy importer files it as her number, under two names.
-// On either store, the tool asks the serving store about her line once and
-// about her email address once when the query names her, and about the
-// address once when the query is the address itself.
+// address, where the legacy importer files it as her number, under two names
+// and with its letters in two cases.
+// On either store, when the query names her, the tool searches the serving
+// store for the name once, her line once and her email address, as a whole
+// address, once. When the query is the address itself, the tool searches for
+// that text once and looks up nothing else: the address and every other way
+// of writing its ASCII letters' case name the same person.
 func TestResolveContactRoutesSearchesEachLineOnce(t *testing.T) {
 	for _, mode := range routeStoreModes {
 		t.Run(mode, func(t *testing.T) {
@@ -464,7 +475,7 @@ func TestResolveContactRoutesSearchesEachLineOnce(t *testing.T) {
 				{ConversationID: "lunch", Name: "Lunch", SourcePlatform: "gchat", LastMessageTS: 1,
 					Participants: `[{"name":"Alice Chen","number":"alice.chen@example.com"}]`},
 				{ConversationID: "books", Name: "Books", SourcePlatform: "gchat", LastMessageTS: 2,
-					Participants: `[{"name":"Alice C.","number":"alice.chen@example.com"}]`},
+					Participants: `[{"name":"Alice C.","number":"Alice.Chen@Example.com"}]`},
 			} {
 				if err := a.Store.UpsertConversation(conv); err != nil {
 					t.Fatalf("seed %s: %v", conv.ConversationID, err)
@@ -483,26 +494,37 @@ func TestResolveContactRoutesSearchesEachLineOnce(t *testing.T) {
 			if !slices.Contains(routeIDs(got), alice) {
 				t.Errorf("routes for Alice = %v, want her thread %q among them", routeIDs(got), alice)
 			}
-			if counting.lines["2025550123"] != 1 || counting.texts["alice.chen@example.com"] != 1 {
-				t.Errorf("line searches %v, text searches %v; want one search of Alice's line and one of her email address", counting.lines, counting.texts)
+			wantLines := map[string]int{"2025550123": 1}
+			wantTexts := map[string]int{"Alice": 1}
+			if !maps.Equal(counting.lines, wantLines) || !maps.Equal(counting.texts, wantTexts) {
+				t.Errorf("for Alice: line searches %v, text searches %v; want %v and %v", counting.lines, counting.texts, wantLines, wantTexts)
 			}
-			for line, count := range counting.lines {
-				if count != 1 {
-					t.Errorf("searches of line %s = %d, want 1", line, count)
+			// Either way of writing her address may come first.
+			lookups := 0
+			for address, count := range counting.addresses {
+				lookups += count
+				if !strings.EqualFold(address, "alice.chen@example.com") {
+					t.Errorf("for Alice: looked up %q, which isn't her address", address)
 				}
 			}
-			for text, count := range counting.texts {
-				if count != 1 {
-					t.Errorf("searches of %q = %d, want 1", text, count)
-				}
+			if lookups != 1 {
+				t.Errorf("for Alice: address lookups %v, want one lookup of her address", counting.addresses)
 			}
 
-			counting = newCountingRouteReads(reads)
-			if _, err := findRouteConversations(counting, a.Store, "alice.chen@example.com", 80); err != nil {
-				t.Fatalf("findRouteConversations(alice.chen@example.com): %v", err)
-			}
-			if len(counting.lines) != 0 || len(counting.texts) != 1 || counting.texts["alice.chen@example.com"] != 1 {
-				t.Errorf("for her email address: line searches %v, text searches %v; want one search of the address and no line search", counting.lines, counting.texts)
+			for _, query := range []string{"alice.chen@example.com", "Alice.Chen@Example.com"} {
+				counting = newCountingRouteReads(reads)
+				got, err := findRouteConversations(counting, a.Store, query, 80)
+				if err != nil {
+					t.Fatalf("findRouteConversations(%s): %v", query, err)
+				}
+				if ids := routeIDs(got); mode == "legacy" && (!slices.Contains(ids, "lunch") || !slices.Contains(ids, "books")) {
+					t.Errorf("routes for %s = %v, want both Google Chat threads", query, ids)
+				}
+				wantTexts := map[string]int{query: 1}
+				if len(counting.lines) != 0 || len(counting.addresses) != 0 || !maps.Equal(counting.texts, wantTexts) {
+					t.Errorf("for %s: line searches %v, address lookups %v, text searches %v; want only %v",
+						query, counting.lines, counting.addresses, counting.texts, wantTexts)
+				}
 			}
 		})
 	}

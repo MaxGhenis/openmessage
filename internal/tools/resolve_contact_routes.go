@@ -140,8 +140,9 @@ func resolveContactRoutesHandler(a *app.App, configured ...Options) server.ToolH
 // defines one, names a phone line; other text matches a conversation's title
 // or someone in it. For other text, people also supplies the numbers of
 // matching address-book contacts and of matching participants in its own
-// conversations, and the function searches reads for each of those numbers
-// once, never for a people-store conversation ID.
+// conversations, and the function looks each one up in reads once: a phone
+// number by its line, and any other value, such as an email address, as a
+// whole address. It never looks up a people-store conversation ID.
 func findRouteConversations(reads readsource.ReadSource, people *db.Store, query string, limit int) ([]*db.Conversation, error) {
 	if limit <= 0 {
 		limit = 20
@@ -197,26 +198,42 @@ func findRouteConversations(reads readsource.ReadSource, people *db.Store, query
 		return newestRoutes(seen, limit), nil
 	}
 
-	// searched holds the query and each line, or other value, that
-	// searchNumber has asked reads about, so reads answer each search once. The
-	// address book and legacy threads often hold one person's number, each
-	// written its own way, and every form names one line.
-	searched := map[string]bool{"text:" + query: true}
-	searchNumber := func(number string) {
+	// lookUp finds the threads of the person a number names. A phone number
+	// names a line. Any other value names whoever holds it as a whole
+	// address, with ASCII letters' case aside: the legacy Google Chat importer
+	// files an email address as a number, and another person's address, or a
+	// title, can hold it, so a search for the text would route to them.
+	// searched holds each line and address that lookUp has asked reads about,
+	// so reads answer each lookup once. The address book and legacy threads
+	// often hold one person's number, each written its own way, and every
+	// form names one line. The query's own search matches every thread that
+	// an address lookup of the query would, in the same order and under the
+	// same limit, so that lookup could add only threads that newestRoutes
+	// drops, and it counts as done.
+	searched := map[string]bool{"address:" + lowerASCII(query): true}
+	lookUp := func(number string) {
 		number = strings.TrimSpace(number)
 		if number == "" {
 			return
 		}
-		key := "text:" + number
-		if looksLikePhoneNumber(number) {
+		byLine := looksLikePhoneNumber(number)
+		key := "address:" + lowerASCII(number)
+		if byLine {
 			key = "line:" + phoneline.Line(number)
 		}
 		if searched[key] {
 			return
 		}
 		searched[key] = true
-		if numberConvos, err := search(number); err == nil {
-			addConversations(numberConvos)
+		var found []*db.Conversation
+		var err error
+		if byLine {
+			found, err = reads.SearchConversationsByPhoneLine(phoneline.Line(number), limit)
+		} else {
+			found, err = reads.SearchConversationsByAddress(number, limit)
+		}
+		if err == nil {
+			addConversations(found)
 		}
 	}
 
@@ -224,7 +241,7 @@ func findRouteConversations(reads readsource.ReadSource, people *db.Store, query
 	if err == nil {
 		for _, contact := range contacts {
 			if contact != nil {
-				searchNumber(contact.Number)
+				lookUp(contact.Number)
 			}
 		}
 	}
@@ -236,11 +253,23 @@ func findRouteConversations(reads readsource.ReadSource, people *db.Store, query
 	if err == nil {
 		for _, contact := range threadContacts {
 			if contact != nil {
-				searchNumber(contact.Number)
+				lookUp(contact.Number)
 			}
 		}
 	}
 	return newestRoutes(seen, limit), nil
+}
+
+// lowerASCII lowers s's ASCII letters and leaves every other byte alone, as
+// SQLite's NOCASE compares text.
+func lowerASCII(s string) string {
+	b := []byte(s)
+	for index, c := range b {
+		if c >= 'A' && c <= 'Z' {
+			b[index] = c + 'a' - 'A'
+		}
+	}
+	return string(b)
 }
 
 // newestRoutes returns the conversations in seen newest first, at most limit.

@@ -456,6 +456,64 @@ func phoneLineSearchSQL(match string) string {
 	`
 }
 
+// SearchConversationsByAddress returns the conversations with someone whose
+// address is address as a whole, newest first, then in conversation ID
+// order, and at most limit. Someone is a participant entry not flagged as
+// the owner's, through the text of its number, phone or email, a bare
+// string entry, or the sender of an incoming message, whom the roster may
+// lack. The comparison ignores ASCII letters' case and nothing else, as
+// SQLite's NOCASE does, so an email address matches however its letters are
+// cased. A value that only contains address, a name, or a title matches
+// nothing: the legacy Google Chat importer files an email address as a
+// number, and another person's address can hold it. The match runs before
+// the LIMIT. An empty address matches nothing.
+func (s *Store) SearchConversationsByAddress(address string, limit int) ([]*Conversation, error) {
+	if strings.TrimSpace(address) == "" || limit <= 0 {
+		return []*Conversation{}, nil
+	}
+	rows, err := s.db.Query(addressSearchSQL, address, address, address, address, address, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanConversations(rows)
+}
+
+// addressSearchSQL is SearchConversationsByAddress's query. It takes the
+// address five times, then the limit. NOCASE can't use the sender_number
+// index, so the query compares each distinct sender number once, in
+// sender_numbers, and then finds the matching numbers' messages through the
+// index.
+var addressSearchSQL = `
+	WITH sender_numbers AS MATERIALIZED (
+		SELECT DISTINCT sender_number FROM messages
+	)
+	SELECT ` + conversationColumns + `
+	FROM conversations
+	WHERE EXISTS (
+			SELECT 1
+			FROM ` + sqlParticipantEntries("conversations.participants") + ` AS p
+			WHERE CASE p.type
+				WHEN 'text' THEN p.value = ? COLLATE NOCASE
+				WHEN 'object' THEN NOT ` + sqlOwnerFlag + ` AND (
+					` + sqlEntryText("number") + ` = ? COLLATE NOCASE
+					OR ` + sqlEntryText("phone") + ` = ? COLLATE NOCASE
+					OR ` + sqlEntryText("email") + ` = ? COLLATE NOCASE
+				)
+				ELSE 0
+			END
+		)
+		OR conversation_id IN (
+			SELECT conversation_id
+			FROM messages
+			WHERE is_from_me = 0 AND sender_number IN (
+				SELECT sender_number FROM sender_numbers WHERE sender_number = ? COLLATE NOCASE
+			)
+		)
+	ORDER BY last_message_ts DESC, conversation_id
+	LIMIT ?
+`
+
 // sqlOwnerFlag holds for an object entry that carries is_me or isMe. p is a
 // json_each row over a conversation's participants. Only a JSON true counts,
 // and json_type gives NULL for a missing key, hence IS.

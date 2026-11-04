@@ -900,6 +900,42 @@ func (s *Store) SearchConversationsByPhoneLine(line string, limit int) ([]Conver
 	return conversations, nil
 }
 
+// SearchConversationsByAddress returns the conversations with a participant
+// whose identity's canonical value is address as a whole, newest first, then
+// in conversation ID order, and at most limit. The comparison ignores ASCII
+// letters' case and nothing else, as SQLite's NOCASE does. The account's
+// owner (the self identity) matches nothing, and neither does a canonical
+// value that only contains address, a display name, or a title: another
+// person's address can hold this one. The match runs before the LIMIT. An
+// empty address matches nothing.
+func (s *Store) SearchConversationsByAddress(address string, limit int) ([]Conversation, error) {
+	if limit <= 0 || strings.TrimSpace(address) == "" {
+		return []Conversation{}, nil
+	}
+	rows, err := s.db.QueryContext(
+		context.Background(),
+		"SELECT "+conversationColumns+`
+		 FROM conversations
+		 WHERE conversation_id IN (
+		        SELECT cp.conversation_id
+		        FROM conversation_participants cp
+		        JOIN identities i ON i.identity_id = cp.identity_id
+		        WHERE i.is_self = 0 AND i.canonical_value = ? COLLATE NOCASE
+		    )
+		 ORDER BY last_message_at_ms DESC, conversation_id
+		 LIMIT ?`,
+		address, limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("search conversations by address: %w", err)
+	}
+	conversations, err := collectRows(rows, scanConversation)
+	if err != nil {
+		return nil, fmt.Errorf("search conversations by address: %w", err)
+	}
+	return conversations, nil
+}
+
 // escapeLikePattern makes user text match literally inside a LIKE pattern
 // that declares '\' as its escape character.
 func escapeLikePattern(text string) string {

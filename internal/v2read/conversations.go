@@ -61,6 +61,21 @@ func (s *Source) SearchConversationsByPhoneLine(line string, limit int) ([]*db.C
 	return s.mapSearchHits(conversations)
 }
 
+// SearchConversationsByAddress is the v2 counterpart of the legacy address
+// search: conversations with a participant other than the owner whose
+// canonical address is address as a whole, ignoring ASCII case, matched in
+// SQL before the limit.
+func (s *Source) SearchConversationsByAddress(address string, limit int) ([]*db.Conversation, error) {
+	if err := s.ready(); err != nil {
+		return nil, err
+	}
+	conversations, err := s.store.SearchConversationsByAddress(address, limit)
+	if err != nil {
+		return nil, err
+	}
+	return s.mapSearchHits(conversations)
+}
+
 // mapSearchHits maps a search's hits, and only those, to the canonical
 // legacy DTO.
 func (s *Source) mapSearchHits(conversations []sqlite.Conversation) ([]*db.Conversation, error) {

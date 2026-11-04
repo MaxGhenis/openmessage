@@ -1025,7 +1025,16 @@ running app:
   contacts in legacy threads (`ListContactsFromConversations`), even when a
   title or a card matched. A title that holds a name says nothing about where
   that person's own thread is. The tool searches each line once, however the
-  cards and threads write its number. That contacts list skips flagged entries
+  cards and threads write its number. It looks up each other value it finds
+  there once, as a whole address in the serving store: email addresses, which
+  the legacy Google Chat importer files as participants' numbers, and Google
+  Chat `users/...` IDs. That lookup (`SearchConversationsByAddress`) ignores
+  only ASCII letters' case. A value that only contains the address
+  (`other-support@example.com` for `support@example.com`, `users/1234` for
+  `users/123`), a name and a title match nothing. A search for the address's
+  text would route a name query to strangers whose addresses, or groups whose
+  titles, hold the person's, and at a small limit newer ones would crowd the
+  person out. That contacts list skips flagged entries
   too, reads past any number of threads that yield none, and matches what an
   entry says, not its JSON text: `R&D` finds R&D Desk, whose & Go's encoder
   writes as an escape, and like `LIKE` and `lower()` it ignores only ASCII
@@ -1061,15 +1070,21 @@ running app:
   `TestResolveContactRoutesFindsANumberOnlyWhereItReadsAsOne`,
   `TestResolveContactRoutesTakesOnlyAWrittenNumberAsANumber`,
   `TestResolveContactRoutesFindsALegacyOnlyNameBesideATitleThatHoldsIt`,
+  `TestResolveContactRoutesLooksUpAFoundAddressAsAWhole`,
+  `TestResolveContactRoutesKeepsAPersonWhoseAddressOthersHold`,
   `TestResolveContactRoutesSearchesEachLineOnce` and
   `TestResolveContactRoutesFindsALegacyNameThatJSONEscapes` (internal/tools),
-  `TestSearchConversationsByMetadataSkipsTheAccountOwner` and
-  `TestSearchConversationsByPhoneLineAgreesWithTheLineModel`
+  `TestSearchConversationsByMetadataSkipsTheAccountOwner`,
+  `TestSearchConversationsByPhoneLineAgreesWithTheLineModel`,
+  `TestSearchConversationsByAddressMatchesTheWholeAddress` and
+  `TestSearchConversationsByAddressAgreesWithTheAddressModel`
   (internal/v2read),
   `TestSearchConversationsByMetadataSkipsTheOwnersOwnMessages`,
   `TestSearchConversationsByMetadataSkipsEntriesFlaggedAsTheOwners`,
   `TestSearchConversationsByMetadataMatchesEntryValuesNotKeys`,
   `TestSearchConversationsByPhoneLineAgreesWithTheLineModel`,
+  `TestSearchConversationsByAddressMatchesTheWholeAddress`,
+  `TestSearchConversationsByAddressAgreesWithTheAddressModel`,
   `TestListContactsMatchesTheQueryLiterally`,
   `TestListContactsFromConversationsReadsPastThreadsThatListOnlyTheOwner`,
   `TestListContactsFromConversationsMatchesWhatAnEntrySays`,
