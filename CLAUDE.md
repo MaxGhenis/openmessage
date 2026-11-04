@@ -168,10 +168,11 @@ address-book lookup, match `%` and `_` literally. `send_message` with platform
 `sms` skips the same entries as the metadata and line searches when it picks
 the recipient's one-to-one thread, and for the owner's own number it sends
 nothing and says so. One rule in `internal/db/owner.go` serves those searches
-and `send_message`, and the searches' SQL calls it through two registered
-functions. Each reads every element of a participants list on its own and
-takes the owner's lines from every thread. In client mode the route tool asks
-the daemon whether WhatsApp and Signal can send.
+and `send_message`. Those searches never read a participants list with
+SQLite's JSON reader: two registered functions take each list whole, as a BLOB
+(the driver cuts TEXT at its first NUL), and read it in Go. Each reads every
+element of a list on its own and takes the owner's lines from every thread. In
+client mode the route tool asks the daemon whether WhatsApp and Signal can send.
 The client opens the store via `app.NewClient`, which skips the startup repair
 sweeps — those stay daemon-owned, so N concurrent sessions don't each burst
 repair writes into the live `messages.db`.

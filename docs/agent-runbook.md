@@ -1018,8 +1018,17 @@ running app:
   entries and matches only incoming messages' senders, since the owner's
   outgoing messages carry the owner's name and number, and the legacy line
   search does the same. One rule in `internal/db/owner.go` names the owner's
-  entries for both legacy searches and `send_message`, and the searches' SQL
-  calls it through two registered functions. It names any object entry that
+  entries for both legacy searches and `send_message`. The searches never
+  read a participants list with SQLite's JSON reader, which gives up past a
+  depth of 1,000 and reads a list only up to a NUL, where encoding/json reads
+  10,000 deep and rejects bytes after a NUL. Two registered functions take
+  each list whole, as a BLOB, since the driver cuts a TEXT argument at its
+  first NUL, and read it in Go, so a repeated key counts with its last value
+  in all three. Each value reaches the Go matcher as a BLOB too. The keys of
+  the owner's lines (`phoneline.LineKeys`) go into an index that SQLite
+  builds once per query, so a store that flags the owner on many numbers
+  costs each search about the same as one that flags one. It names any
+  object entry that
   carries `is_me` or `isMe` set to JSON true, and any entry, a bare string
   included, in any thread, on the phone line of a flagged entry whose number
   reads as a phone number or a WhatsApp JID of one: the line is the number's
@@ -1128,8 +1137,16 @@ running app:
   `TestSearchConversationsByMetadataReadsTheOwnersNumberWithAnySeparators`,
   `TestSearchConversationsByMetadataAgreesWithTheOwnerSkippingModel`,
   `TestSearchConversationsByPhoneLineSkipsTheOwnersParticipantEntries`,
-  `TestOwnerRuleReadsEachElementAlikeInGoAndSQL` and
-  `TestOwnerLinesFollowPhoneline` (internal/db).
+  `TestSearchConversationsByPhoneLineReadsARepeatedNumberAsSendMessageDoes`,
+  `TestLegacySearchesReadAValueWithANULAsSendMessageDoes`,
+  `TestLegacySearchesReadAListNestedDeeperThanSQLiteReads`,
+  `TestLegacySearchesReadNoEntryFromAListWithBytesAfterANUL`,
+  `TestLegacySearchesCostAboutTheSameForAnyNumberOfOwnerLines`,
+  `TestOwnerRuleReadsEachElementAlikeInGoAndSQL`,
+  `TestOwnerKeysHoldTheLinesSendMessageTakes`,
+  `TestOwnerLinesOnLineCostsTheSameForAnyNumberOfLines` and
+  `TestOwnerLinesFollowPhoneline` (internal/db), and `TestLineKeysIndexMatch`
+  (internal/phoneline).
 - Escape hatches: `--transports` forces the old standalone full-stack stdio
   behavior (only for machines where the MCP process is the *only* OpenMessage
   process, ever); `--no-transports` strips transports from a **legacy-mode**
