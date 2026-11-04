@@ -170,6 +170,145 @@ func TestLeaseDueBatchLeasesPastRowsThatCanBeNeitherLeasedNorSetAside(t *testing
 	assertStuckFailures(t, again, stuck, "injected write failure")
 }
 
+// A call meets each row that can be neither leased nor set aside once, and
+// pays for it with a few writes, not with a select over the whole due set.
+// When each select looked past every row the call had tried, every such row
+// cost a select of its own: 6,000 of them between the 31st and 32nd healthy
+// rows kept the call running for tens of seconds, near or past the
+// dispatcher's 30 s lease, with the store's write lock held throughout. The
+// test measures the call against the writes it cannot avoid, one failed UPDATE
+// per stuck row, so the bound holds on a fast machine and under the race
+// detector alike.
+func TestLeaseDueBatchCostsAFewWritesPerStuckRow(t *testing.T) {
+	const stuck = 2000
+	ctx := context.Background()
+	clock := newOutboxTestClock(outboxTestTimeMS)
+	store, repository := openOutboxTestRepository(t, clock.Now)
+	for index := range 31 {
+		item := outboxTestItem(fmt.Sprintf("healthy-%02d", index))
+		item.ScheduledForMS = outboxTestTimeMS - 20_000 + int64(index)
+		mustEnqueueOutbox(t, repository, item)
+	}
+	mustExec(t, store.db, `
+		WITH RECURSIVE n(x) AS (VALUES (1) UNION ALL SELECT x + 1 FROM n WHERE x < ?)
+		INSERT INTO outbox (
+			outbox_id, account_id, conversation_id, kind, idempotency_key,
+			payload_hash, operation, state, transport_request_id,
+			scheduled_for_ms, created_at_ms, updated_at_ms
+		)
+		SELECT printf('stuck-%05d', x), account_id, conversation_id, kind, 'stuck-key-' || x,
+			payload_hash, operation, 'queued', 'stuck-request-' || x,
+			?, created_at_ms, updated_at_ms
+		FROM n CROSS JOIN outbox
+		WHERE outbox_id = 'outbox-healthy-00'
+	`, stuck, outboxTestTimeMS-10_000)
+	tail := outboxTestItem("tail")
+	tail.ScheduledForMS = outboxTestTimeMS - 1
+	mustEnqueueOutbox(t, repository, tail)
+	mustExec(t, store.db, `
+		CREATE TRIGGER fail_stuck_writes
+		BEFORE UPDATE ON outbox
+		WHEN OLD.outbox_id LIKE 'stuck-%'
+		BEGIN
+			SELECT RAISE(ABORT, 'injected write failure');
+		END`)
+
+	floor := timeFailedWrites(t, store, stuck)
+	// The dispatcher's lease time. A call that runs longer hands out leases
+	// that have already expired by the wall clock, and the dispatcher recovers
+	// them instead of sending.
+	const leaseTime = 30 * time.Second
+	started := time.Now()
+	batch, err := repository.LeaseDueBatch(ctx, LeaseRequest{
+		Owner: "dispatcher", Now: clock.Now(), Duration: leaseTime, Limit: 32,
+	})
+	elapsed := time.Since(started)
+	if err != nil {
+		t.Fatalf("LeaseDueBatch(): %v", err)
+	}
+	t.Logf("LeaseDueBatch() past %d stuck rows took %v; one failed write per row took %v", stuck, elapsed, floor)
+	if elapsed > 40*floor || elapsed >= leaseTime {
+		t.Fatalf("LeaseDueBatch() past %d stuck rows took %v, %.0f times the %v one failed write per row takes; want under 40 times, and under the %v lease",
+			stuck, elapsed, float64(elapsed)/float64(floor), floor, leaseTime)
+	}
+	leased := leasedOutboxIDs(batch)
+	if len(leased) != 32 || leased[0] != "outbox-healthy-00" || leased[31] != "outbox-tail" {
+		t.Fatalf("LeaseDueBatch() leased %d rows (%v), want the 31 healthy rows and the tail", len(leased), leased)
+	}
+	if len(batch.Failed) != stuck {
+		t.Fatalf("LeaseDueBatch() reported %d failures, want %d", len(batch.Failed), stuck)
+	}
+	for index, failure := range batch.Failed {
+		if want := fmt.Sprintf("stuck-%05d", index+1); failure.OutboxID != want || failure.SetAsideErr == nil {
+			t.Fatalf("failure %d = %+v, want %q neither leased nor set aside", index, failure, want)
+		}
+	}
+}
+
+// timeFailedWrites times one failed UPDATE of each of the count stuck rows,
+// in one transaction that it rolls back.
+func timeFailedWrites(t *testing.T, store *Store, count int) time.Duration {
+	t.Helper()
+	ctx := context.Background()
+	started := time.Now()
+	tx, err := store.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin transaction: %v", err)
+	}
+	defer tx.Rollback()
+	for x := 1; x <= count; x++ {
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE outbox SET updated_at_ms = MAX(updated_at_ms, ?) WHERE outbox_id = ?
+		`, outboxTestTimeMS, fmt.Sprintf("stuck-%05d", x)); err == nil {
+			t.Fatalf("UPDATE of stuck row %d succeeded, want the trigger to fail it", x)
+		}
+	}
+	return time.Since(started)
+}
+
+// After the clock steps back below a row's updated_at_ms, the next delay of a
+// row whose lease keeps failing comes out short of double, never under 5 s,
+// so the row retries sooner, never later. The set-aside reads a row's previous
+// delay as its next_attempt_at_ms less its updated_at_ms, and updated_at_ms
+// never moves back. Here the first failure comes 1 s behind the row's last
+// write, so the second delay is 8 s, not 10 s; the clock has caught up by
+// then, and the third doubles exactly.
+func TestLeaseDueBatchShortensTheDelayAfterTheClockStepsBack(t *testing.T) {
+	ctx := context.Background()
+	clock := newOutboxTestClock(outboxTestTimeMS)
+	store, repository := openOutboxTestRepository(t, clock.Now)
+	mustEnqueueOutbox(t, repository, outboxTestItem("head"))
+	leases := mustLeaseDueBatch(t, repository, clock.Now(), 8).Leases
+	if len(leases) != 1 {
+		t.Fatalf("LeaseDueBatch() leased %d rows, want 1", len(leases))
+	}
+	clock.Set(outboxTestTimeMS + 10_000)
+	if err := repository.ReleaseUnavailable(ctx, "outbox-head", *leases[0].LeaseToken); err != nil {
+		t.Fatalf("ReleaseUnavailable(): %v", err)
+	}
+	mustExec(t, store.db, leaseFailureTrigger("outbox-head"))
+
+	var delays []time.Duration
+	for _, nowMS := range []int64{outboxTestTimeMS + 9_000, outboxTestTimeMS + 14_000, outboxTestTimeMS + 22_000} {
+		clock.Set(nowMS)
+		before := mustFindOutboxRow(t, repository, "outbox-head")
+		batch := mustLeaseDueBatch(t, repository, clock.Now(), 8)
+		if len(batch.Leases) != 0 || len(batch.Failed) != 1 || batch.Failed[0].SetAsideErr != nil {
+			t.Fatalf("LeaseDueBatch() at %d = %+v, want the row set aside", nowMS, batch)
+		}
+		row := mustFindOutboxRow(t, repository, "outbox-head")
+		if row.UpdatedAtMS != max(before.UpdatedAtMS, nowMS) ||
+			row.NextAttemptAtMS == nil || *row.NextAttemptAtMS != batch.Failed[0].RetryAt.UnixMilli() {
+			t.Fatalf("row set aside at %d = %+v, want updated_at_ms %d and next attempt %d",
+				nowMS, row, max(before.UpdatedAtMS, nowMS), batch.Failed[0].RetryAt.UnixMilli())
+		}
+		delays = append(delays, batch.Failed[0].RetryAt.Sub(clock.Now()))
+	}
+	if want := []time.Duration{5 * time.Second, 8 * time.Second, 16 * time.Second}; !slices.Equal(delays, want) {
+		t.Fatalf("delays after each failed lease = %v, want %v", delays, want)
+	}
+}
+
 // A row whose writes a real CHECK refuses is handled like one a trigger
 // refuses. This row's updated_at_ms is below its created_at_ms, which the
 // CHECK forbids, so every write to it fails until something repairs it.
@@ -321,6 +460,15 @@ func TestLeaseDueBatchSetsAsideALeasedRowThatDoesNotReadBack(t *testing.T) {
 		nextAttemptAtMS != batch.Failed[0].RetryAt.UnixMilli() {
 		t.Fatalf("unreadable row = state %q, code %q, lease %v, next attempt %d; want it set aside with no lease",
 			state, code, leaseToken, nextAttemptAtMS)
+	}
+	// Every read of the row fails, the pending list's too, so the API's
+	// outbox listing, retry and cancel fail while it exists, as
+	// docs/agent-runbook.md tells operators. Change both together.
+	if _, err := repository.FindByID(ctx, "outbox-head"); err == nil {
+		t.Fatal("FindByID(unreadable row) succeeded, want the scan to fail")
+	}
+	if _, err := repository.ListPending(ctx, ListPendingParams{Limit: 100}); err == nil {
+		t.Fatal("ListPending() with an unreadable row succeeded, want the scan to fail")
 	}
 }
 

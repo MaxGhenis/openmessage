@@ -5,7 +5,6 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -203,7 +202,8 @@ const LeaseFailedCode = "lease"
 // A row set aside after a failed lease is due again leaseRetryDelay later, the
 // dispatcher's default delay after its other pre-call failures. The delay doubles
 // while the row's leases keep failing, up to maxLeaseRetryDelay, so a row that
-// can never lease costs one failed lease every five minutes.
+// can never lease settles at one failed lease every five minutes. After the
+// clock steps back, the delay can restart lower (see setAsideOutboxRow).
 const (
 	leaseRetryDelay    = 5 * time.Second
 	maxLeaseRetryDelay = 5 * time.Minute
@@ -1224,11 +1224,16 @@ func (r *OutboxRepository) LeaseDue(
 // setAsideOutboxRow). If that write fails too, the row is left as it was and
 // the call goes past it. Failed reports both.
 //
-// A due row is queued or not_dispatched, so its transport call never started,
-// or proved it sent nothing (MarkCalledNotDispatched). Setting it aside keeps
-// its transport_called_at_ms NULL and its attempt_count, and touches no row
-// outside the due set, so neither the set-aside nor its retry resends an
-// intent whose call started.
+// A due row is queued or not_dispatched: its transport call never started, or
+// the transport proved the call sent nothing (MarkCalledNotDispatched).
+// Setting it aside keeps its transport_called_at_ms NULL and its
+// attempt_count, and touches no row outside the due set, so neither the
+// set-aside nor its retry calls the transport again for an intent that a call
+// may have sent.
+//
+// The call meets each due row at most once, so rows it can neither lease nor
+// set aside cost it one lease and one set-aside apiece, however many of them
+// come first.
 //
 // Any other failure (busy, locked, I/O, corruption, cancellation) belongs to
 // the store, not the row, and fails the whole call as before, committing
@@ -1262,20 +1267,25 @@ func (r *OutboxRepository) LeaseDueBatch(
 	defer tx.Rollback()
 
 	batch := LeaseBatch{Leases: make([]Lease, 0, req.Limit)}
-	// Each select looks past every row this call has tried. A row left as it
-	// was is still due, and without this it would come back first every time.
-	tried := make([]string, 0, req.Limit)
-	for len(batch.Leases) < req.Limit {
-		ids, err := selectDueOutboxIDs(ctx, tx, nowMS, req.Limit-len(batch.Leases), tried)
+	// The due rows come a page at a time, in due order, each page starting
+	// after the last row the call has met. A row the call leases or sets aside
+	// leaves the due set, and a row it leaves as it was keeps its place behind
+	// the next page, so the call meets each due row at most once. Nothing else
+	// writes the store while this transaction holds its write lock. Each page
+	// is twice the size of the last, up to maxDueOutboxPage rows, so a long run
+	// of rows that fail costs few selects.
+	var after *dueOutboxRow
+	pageSize := req.Limit
+	for {
+		page, err := selectDueOutboxPage(ctx, tx, nowMS, after, pageSize)
 		if err != nil {
 			return LeaseBatch{}, fmt.Errorf("lease due outbox items: %w", err)
 		}
-		if len(ids) == 0 {
-			break
-		}
-		for _, id := range ids {
-			tried = append(tried, id)
-			lease, failure, err := leaseCandidate(ctx, tx, id, req.Owner, nowMS, expiresAtMS)
+		for _, row := range page {
+			if len(batch.Leases) == req.Limit {
+				break
+			}
+			lease, failure, err := leaseCandidate(ctx, tx, row.outboxID, req.Owner, nowMS, expiresAtMS)
 			if err != nil {
 				return LeaseBatch{}, err
 			}
@@ -1285,6 +1295,13 @@ func (r *OutboxRepository) LeaseDueBatch(
 			}
 			batch.Leases = append(batch.Leases, lease)
 		}
+		if len(batch.Leases) == req.Limit || len(page) < pageSize {
+			break
+		}
+		after = &page[len(page)-1]
+		if pageSize < maxDueOutboxPage {
+			pageSize = min(2*pageSize, maxDueOutboxPage)
+		}
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -1293,42 +1310,55 @@ func (r *OutboxRepository) LeaseDueBatch(
 	return batch, nil
 }
 
-// selectDueOutboxIDs returns up to limit due rows in due order, leaving out the
-// rows in skip.
-func selectDueOutboxIDs(
+// maxDueOutboxPage bounds how many due rows LeaseDueBatch reads in one select.
+const maxDueOutboxPage = 4096
+
+// dueOutboxRow is a due row and its place in due order.
+type dueOutboxRow struct {
+	outboxID    string
+	dueAtMS     int64
+	createdAtMS int64
+}
+
+// selectDueOutboxPage returns up to limit due rows in due order, after the row
+// after when it is not nil.
+func selectDueOutboxPage(
 	ctx context.Context,
 	tx *sql.Tx,
 	nowMS int64,
+	after *dueOutboxRow,
 	limit int,
-	skip []string,
-) ([]string, error) {
-	skipJSON, err := json.Marshal(skip)
-	if err != nil {
-		return nil, fmt.Errorf("encode rows to skip: %w", err)
-	}
-	rows, err := tx.QueryContext(ctx, `
-		SELECT outbox_id
+) ([]dueOutboxRow, error) {
+	query := `
+		SELECT outbox_id, COALESCE(next_attempt_at_ms, scheduled_for_ms), created_at_ms
 		FROM outbox
 		WHERE scheduled_for_ms <= ?
 		  AND state IN ('queued', 'not_dispatched')
 		  AND (next_attempt_at_ms IS NULL OR next_attempt_at_ms <= ?)
-		  AND (lease_expires_at_ms IS NULL OR lease_expires_at_ms <= ?)
-		  AND outbox_id NOT IN (SELECT value FROM json_each(?))
+		  AND (lease_expires_at_ms IS NULL OR lease_expires_at_ms <= ?)`
+	arguments := []any{nowMS, nowMS, nowMS}
+	if after != nil {
+		query += `
+		  AND (COALESCE(next_attempt_at_ms, scheduled_for_ms), created_at_ms, outbox_id) > (?, ?, ?)`
+		arguments = append(arguments, after.dueAtMS, after.createdAtMS, after.outboxID)
+	}
+	query += `
 		ORDER BY COALESCE(next_attempt_at_ms, scheduled_for_ms), created_at_ms, outbox_id
-		LIMIT ?
-	`, nowMS, nowMS, nowMS, string(skipJSON), limit)
+		LIMIT ?`
+	arguments = append(arguments, limit)
+	rows, err := tx.QueryContext(ctx, query, arguments...)
 	if err != nil {
 		return nil, fmt.Errorf("select candidates: %w", err)
 	}
-	ids, err := collectRows(rows, func(row rowScanner) (string, error) {
-		var id string
-		err := row.Scan(&id)
-		return id, err
+	page, err := collectRows(rows, func(row rowScanner) (dueOutboxRow, error) {
+		var due dueOutboxRow
+		err := row.Scan(&due.outboxID, &due.dueAtMS, &due.createdAtMS)
+		return due, err
 	})
 	if err != nil {
 		return nil, fmt.Errorf("scan candidates: %w", err)
 	}
-	return ids, nil
+	return page, nil
 }
 
 // leaseCandidate leases one due row under its own savepoint. A lease that
@@ -1473,13 +1503,23 @@ func readLeasedOutboxRow(ctx context.Context, tx *sql.Tx, id string) (OutboxItem
 
 // setAsideOutboxRow moves a due row whose lease failed out of the due set. It
 // records the error, makes the row not_dispatched, and returns its new
-// next_attempt_at_ms. That is leaseRetryDelay from now, or twice the row's
-// previous delay when its last failure was a failed lease too (its
-// next_attempt_at_ms less its updated_at_ms, both written by the set-aside
-// that recorded it), up to maxLeaseRetryDelay. A manual retry
-// (RetryNotDispatched) sets next_attempt_at_ms to now and updated_at_ms no
-// lower, so the delay starts over. SQLite evaluates every SET expression
-// against the row as it was.
+// next_attempt_at_ms: now plus the row's delay. The delay is leaseRetryDelay,
+// or, when the row's last failure was a failed lease too, twice its previous
+// delay, up to maxLeaseRetryDelay. A manual retry (RetryNotDispatched) sets
+// next_attempt_at_ms to now and updated_at_ms no lower, so the delay starts
+// over. SQLite evaluates every SET expression against the row as it was.
+//
+// The previous delay is read back as the row's next_attempt_at_ms less its
+// updated_at_ms, both written by the set-aside that recorded it. That is
+// exact while the clock runs forward and nothing else writes the row. A
+// set-aside that ran with the clock behind the row's updated_at_ms, which
+// never moves back, left a smaller difference, and so does a later write
+// that moves only updated_at_ms (retargetMessageIntents). Then the next delay
+// is less than double, never under leaseRetryDelay: the row retries sooner,
+// never later, and always within maxLeaseRetryDelay of the failure. Counting
+// the retry from updated_at_ms instead would keep the doubling exact, but
+// after a clock step it would hold a row whose lease works again until the
+// clock caught up.
 func setAsideOutboxRow(
 	ctx context.Context,
 	tx *sql.Tx,

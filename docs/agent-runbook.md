@@ -257,10 +257,12 @@ in a trigger, or when the leased row's values don't read back. What you see:
 - `GET /api/v1/outbox` lists the row as `not_dispatched`, with `error_class`
   `transient` and `error_code` `lease`. Its `next_attempt_at_ms` is 5 s after
   the failure; each further failed lease doubles the delay, up to 5 minutes.
-  `attempt_count` stays the same, because the row's transport call never
-  started. The stored `error_detail`, which the API doesn't return, holds
-  SQLite's error (`lease outbox item "<id>": update: constraint failed: …`).
-  The UI shows the row as `Retrying…`, with Cancel.
+  After the clock steps back, the doubling can restart lower, so the row
+  retries sooner, never later. `attempt_count` stays the same, because the
+  row's transport call never started. The stored `error_detail`, which the
+  API doesn't return, holds SQLite's error (`lease outbox item "<id>":
+  update: constraint failed: …`). The UI's outbox tray shows a text, media or
+  reaction row as `Retrying…`, with Cancel; it doesn't list read receipts.
 - `v2_dispatch` counts these rows in `failed_leases` and shows the latest in
   `last_failed_lease` (`outbox_id`, `at_ms`, `error`, `retry_at_ms`). The
   pass itself succeeds, so `failed_passes` stays where it was.
@@ -269,9 +271,16 @@ in a trigger, or when the leased row's values don't read back. What you see:
 - When the set-aside write fails too, the row stays exactly as it was, still
   due. `last_failed_lease` then carries `set_aside_error` and no
   `retry_at_ms`, and the backend logs `V2 outbox item can be neither leased
-  nor set aside; sending the rest` (an error). The pass sends every other due
-  row and then fails, so `failed_passes` climbs and `Run` backs off, 1 s
-  doubling to 30 s, before it meets the row again.
+  nor set aside; sending the rest` (an error). A pass meets each such row
+  once, however many come first, and leases the rows after them. It sends
+  every other due row and then fails, so `failed_passes` climbs and `Run`
+  backs off, 1 s doubling to 30 s, before it meets the row again.
+- A row whose stored values don't read back (a NULL where the schema says
+  NOT NULL, say) is set aside the same way, and the rows behind it still
+  send. But every read of that row fails while it exists: `GET /api/v1/outbox`
+  answers 500, so the tray can't load, and retry and cancel fail on the row
+  too. `last_failed_lease` and the log line still name it. Only a repair of
+  the row in the store clears it.
 - A failure that belongs to the store, not the row (busy, locked, I/O,
   corruption, any other SQLite error), still fails the whole pass and leases
   nothing, as before.

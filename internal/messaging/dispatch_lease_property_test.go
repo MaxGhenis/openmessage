@@ -1,11 +1,13 @@
 package messaging
 
 import (
+	"cmp"
 	"context"
 	"database/sql"
 	"fmt"
 	"math/rand"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"testing/quick"
@@ -65,11 +67,12 @@ var rowFaultTriggers = map[rowFault]struct{ event, action string }{
 
 const maxLeaseScriptTexts = 6
 
-// leaseScript is one generated history of texts queued over several passes.
-// Before each pass the clock steps (back, a little, or past several retry
-// delays) and new texts may be queued; during the pass each queued text's
-// writes may fail.
+// leaseScript is one generated history of texts queued over several passes,
+// with the dispatcher's batch limit. Before each pass the clock steps (back, a
+// little, or past several retry delays) and new texts may be queued; during
+// the pass each queued text's writes may fail.
 type leaseScript struct {
+	Limit  int
 	Passes []leaseScriptPass
 }
 
@@ -82,7 +85,12 @@ type leaseScriptPass struct {
 }
 
 func (leaseScript) Generate(r *rand.Rand, _ int) reflect.Value {
-	var script leaseScript
+	// Mostly limits below the number of texts, so the batch fills and the
+	// rows after the last lease wait for a later pass.
+	script := leaseScript{Limit: defaultBatchLimit}
+	if r.Intn(4) != 0 {
+		script.Limit = 1 + r.Intn(4)
+	}
 	texts := 0
 	for index := range 1 + r.Intn(10) {
 		pass := leaseScriptPass{}
@@ -115,25 +123,31 @@ func (leaseScript) Generate(r *rand.Rand, _ int) reflect.Value {
 
 // TestLeaseFailuresNeverHoldOtherSends checks, over generated histories of
 // several texts whose writes fail in any pass and in any of the ways a row's
-// write can fail:
+// write can fail, with batch limits mostly below the number of texts, that
+// each pass does what a model of it predicts. The model walks the due texts
+// in due order: a text whose lease fails is set aside, one that can be neither
+// leased nor set aside is left as it was, and every other text is leased, until
+// the batch limit is reached; the texts after that wait. Then it sends the
+// leased texts in order, until one loses its outcome. So:
 //
-//   - one row's lease failure never blocks other due rows: every due text
-//     with no fault is sent in that pass, unless another text's call lost
-//     its outcome first and the pass stopped;
-//   - a due text whose lease fails is set aside, never called, due again
-//     after 5 s, or twice its last such delay up to 5 minutes;
+//   - one row's lease failure never blocks other due rows: the first due texts
+//     whose writes work, up to the batch limit, are leased and sent, whatever
+//     fails on the texts before them;
+//   - a due text whose lease fails is set aside, never called, due again 5 s
+//     to 5 minutes later and never later than twice its last such delay; the
+//     model reckons the delay from what it remembers of the text's last
+//     set-aside, not from the row;
 //   - a due text that can be neither leased nor set aside is left exactly as
-//     it was, and its pass fails; nothing else fails a pass but a lost
-//     outcome;
-//   - no fix path resends a called intent: each text reaches the transport
-//     at most once, and a text the transport has seen never becomes due
-//     again;
-//   - a text that is not due changes only when its called lease expires and
-//     it becomes uncertain, and updated_at_ms never moves back or below
-//     created_at_ms;
-//   - once the faults stop and every retry comes due, each text is
-//     confirmed, or uncertain when its outcome was lost, after exactly one
-//     transport call.
+//     it was, and fails its pass; nothing else fails a pass but a lost outcome;
+//   - no fix path calls the transport again for an intent a call may have
+//     sent: each text reaches the transport at most once, as these
+//     transports never prove a call sent nothing, and a called text never
+//     becomes due again;
+//   - a text the pass does not reach changes only when its called lease
+//     expires and it becomes uncertain, and updated_at_ms never moves back or
+//     below created_at_ms;
+//   - once the faults stop and every retry comes due, each text is confirmed,
+//     or uncertain when its outcome was lost, after exactly one transport call.
 func TestLeaseFailuresNeverHoldOtherSends(t *testing.T) {
 	property := func(script leaseScript) bool {
 		if err := runLeaseScript(t, script); err != nil {
@@ -145,6 +159,13 @@ func TestLeaseFailuresNeverHoldOtherSends(t *testing.T) {
 	if err := quick.Check(property, dispatchPropertyConfig(t, 60, 8)); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// leaseChain is what the model remembers of a text whose last write was a
+// set-aside: the delay that set-aside gave it, and how far the clock then ran
+// behind the text's updated_at_ms.
+type leaseChain struct {
+	delayMS, behindMS int64
 }
 
 func runLeaseScript(t *testing.T, script leaseScript) error {
@@ -162,9 +183,11 @@ func runLeaseScript(t *testing.T, script leaseScript) error {
 	if err != nil {
 		return fmt.Errorf("NewMessageService: %w", err)
 	}
+	service.batchLimit = script.Limit
 
 	var texts []Submission
 	lostOutcome := make(map[string]bool)
+	chains := make(map[string]leaseChain)
 	now := messagingTestTime.Add(time.Second)
 	latest := now
 	for index, pass := range script.Passes {
@@ -206,7 +229,8 @@ func runLeaseScript(t *testing.T, script leaseScript) error {
 			return fmt.Errorf("pass %d: %w", index, err)
 		}
 		requestsAfter := requestsByID(sender)
-		if err := checkLeasePass(now, pass.Faults, before, after, requestsBefore, requestsAfter, passErr, lostOutcome); err != nil {
+		if err := checkLeasePass(now, script.Limit, pass.Faults, before, after,
+			requestsBefore, requestsAfter, passErr, lostOutcome, chains); err != nil {
 			return fmt.Errorf("pass %d at %d: %w", index, now.UnixMilli(), err)
 		}
 		if err := checkUpdatedAt(raw, updatedAt); err != nil {
@@ -214,7 +238,8 @@ func runLeaseScript(t *testing.T, script leaseScript) error {
 		}
 	}
 
-	// The faults stop, every lease expires and every retry comes due.
+	// The faults stop, every lease expires and every retry comes due. Each
+	// pass sends up to the batch limit.
 	if err := setRowFaults(raw, texts, nil); err != nil {
 		return err
 	}
@@ -223,7 +248,7 @@ func runLeaseScript(t *testing.T, script leaseScript) error {
 		return err
 	}
 	clock.set(settleTime(latest.Add(service.leaseTime), rows...).Add(time.Second), 0)
-	for index := range 3 {
+	for index := 0; ; index++ {
 		updatedAt, err := updatedAtByRow(raw)
 		if err != nil {
 			return fmt.Errorf("pass %d after the faults stopped: %w", index, err)
@@ -234,13 +259,20 @@ func runLeaseScript(t *testing.T, script leaseScript) error {
 		if err := checkUpdatedAt(raw, updatedAt); err != nil {
 			return fmt.Errorf("pass %d after the faults stopped: %w", index, err)
 		}
-	}
-	final, err := outboxRows(ctx, service, texts)
-	if err != nil {
-		return err
+		if rows, err = outboxRows(ctx, service, texts); err != nil {
+			return err
+		}
+		if !slices.ContainsFunc(rows, func(row sqlite.OutboxItem) bool {
+			return row.State != sqlite.OutboxConfirmed && row.State != sqlite.OutboxUncertain
+		}) {
+			break
+		}
+		if index > maxLeaseScriptTexts {
+			return fmt.Errorf("texts still pending %d passes after the faults stopped: %+v", index+1, rows)
+		}
 	}
 	requests := requestsByID(sender)
-	for _, row := range final {
+	for _, row := range rows {
 		want := sqlite.OutboxConfirmed
 		if lostOutcome[row.OutboxID] {
 			want = sqlite.OutboxUncertain
@@ -253,16 +285,36 @@ func runLeaseScript(t *testing.T, script leaseScript) error {
 	return nil
 }
 
-// checkLeasePass checks one pass's invariants (see
-// TestLeaseFailuresNeverHoldOtherSends) and records the texts whose outcome
-// it lost.
+// What a pass does to one text, as the model predicts it.
+type leaseOutcome int
+
+const (
+	// The pass does not reach the text: it is not due, or due after the
+	// batch filled.
+	unreachedLeaseOutcome leaseOutcome = iota
+	// Its called lease expired, and recovery makes it uncertain.
+	recoveredLeaseOutcome
+	setAsideLeaseOutcome
+	stuckLeaseOutcome
+	sentLeaseOutcome
+	// Leased and called, but its outcome was lost.
+	lostLeaseOutcome
+	// Leased after another text lost its outcome, and released uncalled.
+	releasedLeaseOutcome
+)
+
+// checkLeasePass checks one pass against the model in
+// TestLeaseFailuresNeverHoldOtherSends, and updates what the model remembers:
+// the texts whose outcome was lost, and each text's last set-aside.
 func checkLeasePass(
 	now time.Time,
+	limit int,
 	faults []rowFault,
 	before, after []sqlite.OutboxItem,
 	requestsBefore, requestsAfter map[string]int,
 	passErr error,
 	lostOutcome map[string]bool,
+	chains map[string]leaseChain,
 ) error {
 	faultOf := func(text int) rowFault {
 		if text < len(faults) {
@@ -270,23 +322,56 @@ func checkLeasePass(
 		}
 		return noRowFault
 	}
-	stuckDue, outcomeLost := false, false
-	for text, row := range before {
-		switch faultOf(text) {
-		case stuckRowFault, skippedStuckRowFault:
-			stuckDue = stuckDue || dueAt(row, now)
-		case settleRowFault:
-			if requestsAfter[row.TransportRequestID] > requestsBefore[row.TransportRequestID] {
-				outcomeLost = true
-				lostOutcome[row.OutboxID] = true
-			}
+	nowMS := now.UnixMilli()
+
+	outcomes := make([]leaseOutcome, len(before))
+	var due []int
+	for text, was := range before {
+		switch {
+		case expiredCalledLease(was, now):
+			outcomes[text] = recoveredLeaseOutcome
+		case was.State == sqlite.OutboxDispatching && dueAt(was, now):
+			// Every pass here sends or releases each lease it takes.
+			return fmt.Errorf("text %d holds an expired lease whose call never started: %+v", text, was)
+		case dueAt(was, now):
+			due = append(due, text)
 		}
 	}
+	slices.SortFunc(due, func(a, b int) int { return compareDueOrder(before[a], before[b]) })
+	var leased []int
+	stuckMet := false
+	for _, text := range due {
+		if len(leased) == limit {
+			break
+		}
+		switch faultOf(text) {
+		case abortedLeaseRowFault, skippedLeaseRowFault:
+			outcomes[text] = setAsideLeaseOutcome
+		case stuckRowFault, skippedStuckRowFault:
+			outcomes[text] = stuckLeaseOutcome
+			stuckMet = true
+		default:
+			leased = append(leased, text)
+		}
+	}
+	lost := false
+	for _, text := range leased {
+		switch {
+		case lost:
+			outcomes[text] = releasedLeaseOutcome
+		case faultOf(text) == settleRowFault:
+			outcomes[text] = lostLeaseOutcome
+			lost = true
+		default:
+			outcomes[text] = sentLeaseOutcome
+		}
+	}
+
 	switch {
-	case stuckDue && passErr == nil:
-		return fmt.Errorf("a due text that could not be set aside did not fail the pass")
-	case passErr != nil && !stuckDue && !outcomeLost:
-		return fmt.Errorf("pass failed with no stuck text or lost outcome: %w", passErr)
+	case (lost || stuckMet) && passErr == nil:
+		return fmt.Errorf("pass succeeded, want it to fail (outcome lost %t, stuck text met %t)", lost, stuckMet)
+	case !lost && !stuckMet && passErr != nil:
+		return fmt.Errorf("pass failed with no stuck text met and no outcome lost: %w", passErr)
 	case passErr != nil && !strings.Contains(passErr.Error(), injectedDispatchFault) &&
 		!strings.Contains(passErr.Error(), "the update changed no row"):
 		return fmt.Errorf("pass failed for a reason no fault explains: %w", passErr)
@@ -307,60 +392,82 @@ func checkLeasePass(
 			return fmt.Errorf("text %d: attempt_count moved back from %d to %d", text, was.AttemptCount, row.AttemptCount)
 		}
 
-		if !dueAt(was, now) {
-			if expiredCalledLease(was, now) {
-				if row.State != sqlite.OutboxUncertain {
-					return fmt.Errorf("text %d whose called lease expired = %+v, want uncertain", text, row)
-				}
-				continue
-			}
+		switch outcomes[text] {
+		case unreachedLeaseOutcome, stuckLeaseOutcome:
 			if !reflect.DeepEqual(row, was) {
-				return fmt.Errorf("text %d was not due and changed from %+v to %+v", text, was, row)
+				return fmt.Errorf("text %d the pass should leave as it was (outcome %d) changed from %+v to %+v",
+					text, outcomes[text], was, row)
 			}
-			continue
-		}
-		switch faultOf(text) {
-		case noRowFault:
-			if row.State != sqlite.OutboxConfirmed && (!outcomeLost || row.State != sqlite.OutboxQueued) {
-				return fmt.Errorf("due text %d with no fault = %+v, want it sent", text, row)
+		case recoveredLeaseOutcome:
+			if row.State != sqlite.OutboxUncertain || called != 0 {
+				return fmt.Errorf("text %d whose called lease expired = %+v after %d calls, want uncertain", text, row, called)
 			}
-		case abortedLeaseRowFault, skippedLeaseRowFault:
+		case setAsideLeaseOutcome:
+			chain, chained := chains[was.OutboxID]
+			delayMS := modelLeaseRetryDelayMS(chain, chained)
 			if !setAsideAfterLeaseFailure(row, now) || called != 0 ||
-				row.AttemptCount != was.AttemptCount || row.UpdatedAtMS != max(was.UpdatedAtMS, now.UnixMilli()) {
-				return fmt.Errorf("due text %d whose lease failed = %+v, want it set aside from %+v", text, row, was)
+				row.AttemptCount != was.AttemptCount || row.UpdatedAtMS != max(was.UpdatedAtMS, nowMS) ||
+				*row.NextAttemptAtMS != nowMS+delayMS {
+				return fmt.Errorf("due text %d whose lease failed = %+v, want it set aside for %d ms from %+v",
+					text, row, delayMS, was)
 			}
-			if was.State == sqlite.OutboxQueued || was.State == sqlite.OutboxNotDispatched {
-				if delay := *row.NextAttemptAtMS - now.UnixMilli(); delay != leaseRetryDelayMSAfter(was) {
-					return fmt.Errorf("due text %d set aside for %d ms, want %d after %+v",
-						text, delay, leaseRetryDelayMSAfter(was), was)
-				}
+			ladderMS := int64(5_000)
+			if chained {
+				ladderMS = min(max(2*chain.delayMS, 5_000), 300_000)
 			}
-		case stuckRowFault, skippedStuckRowFault:
-			if !reflect.DeepEqual(row, was) {
-				return fmt.Errorf("due text %d that could not be set aside changed from %+v to %+v", text, was, row)
+			if delayMS < 5_000 || delayMS > ladderMS {
+				return fmt.Errorf("due text %d set aside for %d ms, want 5000 to %d", text, delayMS, ladderMS)
 			}
-		case settleRowFault:
-			if called == 1 && (row.State != sqlite.OutboxDispatching || row.TransportCalledAtMS == nil) {
-				return fmt.Errorf("text %d whose outcome was lost = %+v, want its called lease kept", text, row)
+			chains[was.OutboxID] = leaseChain{delayMS: delayMS, behindMS: max(was.UpdatedAtMS-nowMS, 0)}
+		case sentLeaseOutcome:
+			if row.State != sqlite.OutboxConfirmed || called != 1 {
+				return fmt.Errorf("due text %d with no fault = %+v after %d calls, want it sent", text, row, called)
 			}
-			if called == 0 && row.State != sqlite.OutboxQueued {
-				return fmt.Errorf("due text %d released untouched = %+v, want queued", text, row)
+			delete(chains, was.OutboxID)
+		case lostLeaseOutcome:
+			if called != 1 || row.State != sqlite.OutboxDispatching || row.TransportCalledAtMS == nil {
+				return fmt.Errorf("text %d whose outcome was lost = %+v after %d calls, want its called lease kept",
+					text, row, called)
 			}
+			lostOutcome[was.OutboxID] = true
+			delete(chains, was.OutboxID)
+		case releasedLeaseOutcome:
+			if row.State != sqlite.OutboxQueued || called != 0 {
+				return fmt.Errorf("due text %d leased after a lost outcome = %+v after %d calls, want it released uncalled",
+					text, row, called)
+			}
+			delete(chains, was.OutboxID)
 		}
 	}
 	return nil
 }
 
-// leaseRetryDelayMSAfter is how long LeaseDueBatch sets aside a due row whose
-// lease fails, given the row before the failure: 5 s, or twice the row's last
-// delay when its last failure was a failed lease too, up to 5 minutes.
-func leaseRetryDelayMSAfter(item sqlite.OutboxItem) int64 {
+// modelLeaseRetryDelayMS is the delay the model expects a text's set-aside to
+// give it, from what the model remembers of the text's last set-aside: 5 s
+// with none, else twice the last delay, less twice how far the clock then ran
+// behind the text's updated_at_ms, at least 5 s and at most 5 minutes; 5 s
+// when nothing of the last delay is left.
+func modelLeaseRetryDelayMS(chain leaseChain, chained bool) int64 {
 	const first, longest = int64(5_000), int64(300_000)
-	if item.ErrorCode != nil && *item.ErrorCode == sqlite.LeaseFailedCode &&
-		item.NextAttemptAtMS != nil && *item.NextAttemptAtMS > item.UpdatedAtMS {
-		return min(max(2*(*item.NextAttemptAtMS-item.UpdatedAtMS), first), longest)
+	if !chained || chain.delayMS <= chain.behindMS {
+		return first
 	}
-	return first
+	return min(max(2*(chain.delayMS-chain.behindMS), first), longest)
+}
+
+// compareDueOrder orders due rows as LeaseDueBatch meets them.
+func compareDueOrder(a, b sqlite.OutboxItem) int {
+	dueAtMS := func(item sqlite.OutboxItem) int64 {
+		if item.NextAttemptAtMS != nil {
+			return *item.NextAttemptAtMS
+		}
+		return item.ScheduledForMS
+	}
+	return cmp.Or(
+		cmp.Compare(dueAtMS(a), dueAtMS(b)),
+		cmp.Compare(a.CreatedAtMS, b.CreatedAtMS),
+		strings.Compare(a.OutboxID, b.OutboxID),
+	)
 }
 
 // expiredCalledLease reports whether a pass at now recovers item as
