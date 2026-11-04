@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"testing"
 
 	"github.com/maxghenis/openmessage/internal/app"
@@ -337,6 +338,84 @@ func TestResolveContactRoutesFindsALegacyOnlyNameBesideATitleThatHoldsIt(t *test
 				if !slices.Equal(preferred, want) {
 					t.Errorf("preferred routes for %q = %v, want %v; matches=%+v", query, preferred, want, matches)
 				}
+			}
+		})
+	}
+}
+
+// The legacy Google Chat importer files an email address as a participant's
+// number, and a legacy thread can list a Google Chat user path the same way.
+// Only the legacy store knows Alice's and Erin's names, and it writes Alice's
+// address in other letter case. Bob's address holds Alice's, a group's title
+// holds it, and Frank's user path extends Erin's; all three threads are newer
+// than theirs. A search for Alice or Erin by name finds only her own thread,
+// on either store: an address that the tool finds on a legacy thread names
+// whoever holds that whole address, and no one whose address or title merely
+// contains it.
+func TestResolveContactRoutesLooksUpAFoundAddressAsAWhole(t *testing.T) {
+	for _, mode := range routeStoreModes {
+		t.Run(mode, func(t *testing.T) {
+			a := testApp(t)
+			store := openRouteV2Store(t)
+			threads := seedRouteFixture(t, a.Store, store, []routeFixturePerson{
+				{Name: "Bob Jones", Number: "other-support@example.com", Kind: "email", LegacyThreadID: "bob", RemoteThreadID: "bob"},
+				{Name: "Frank Lee", Number: "users/1234", Kind: "username", LegacyThreadID: "frank", RemoteThreadID: "frank"},
+				{Name: "Alice Chen", Number: "support@example.com", Kind: "email", LegacyNumber: "Support@Example.com", LegacyThreadID: "alice", RemoteThreadID: "alice", NamelessInV2: true},
+				{Name: "Erin Diaz", Number: "users/123", Kind: "username", LegacyThreadID: "erin", RemoteThreadID: "erin", NamelessInV2: true},
+			})
+			seedTitledRouteGroup(t, a.Store, store, defaultRouteFixtureOwner, "help", "Ask support@example.com")
+			reads, options := routeReadsFor(t, a, store, mode)
+			for _, name := range []string{"Alice Chen", "Erin Diaz"} {
+				want := threads[name]
+				if mode == "legacy" {
+					want = map[string]string{"Alice Chen": "alice", "Erin Diaz": "erin"}[name]
+				}
+				got, err := findRouteConversations(reads, a.Store, name, 80)
+				if err != nil {
+					t.Fatalf("findRouteConversations(%q): %v", name, err)
+				}
+				if !slices.Equal(routeIDs(got), []string{want}) {
+					t.Errorf("routes for %q = %v, want only her thread %q", name, routeIDs(got), want)
+				}
+				matches := routeMatches(t, callRouteTool(t, resolveContactRoutesHandler(a, options), map[string]any{"query": name}))
+				if len(matches) != 1 || matches[0].PreferredReplyConversationID != want {
+					t.Errorf("matches for %q = %+v, want one, preferring %q", name, matches, want)
+				}
+			}
+		})
+	}
+}
+
+// Nine people newer than Alice hold her email address inside their own. At a
+// limit of 1 the tool asks each search for 8 threads, so a search for any
+// address that holds hers would return only theirs. The tool still finds
+// her thread, on either store.
+func TestResolveContactRoutesKeepsAPersonWhoseAddressOthersHold(t *testing.T) {
+	for _, mode := range routeStoreModes {
+		t.Run(mode, func(t *testing.T) {
+			a := testApp(t)
+			store := openRouteV2Store(t)
+			people := make([]routeFixturePerson, 0, 10)
+			for index := 1; index <= 9; index++ {
+				id := "team" + strconv.Itoa(index)
+				people = append(people, routeFixturePerson{
+					Name: "Helper " + strconv.Itoa(index), Number: id + "-support@example.com", Kind: "email",
+					LegacyThreadID: id, RemoteThreadID: id,
+				})
+			}
+			people = append(people, routeFixturePerson{
+				Name: "Alice Chen", Number: "support@example.com", Kind: "email",
+				LegacyThreadID: "alice", RemoteThreadID: "alice", NamelessInV2: true,
+			})
+			threads := seedRouteFixture(t, a.Store, store, people)
+			_, options := routeReadsFor(t, a, store, mode)
+			want := threads["Alice Chen"]
+			if mode == "legacy" {
+				want = "alice"
+			}
+			matches := routeMatches(t, callRouteTool(t, resolveContactRoutesHandler(a, options), map[string]any{"query": "Alice Chen", "limit": 1}))
+			if len(matches) != 1 || matches[0].PreferredReplyConversationID != want {
+				t.Errorf("matches for Alice Chen at limit 1 = %+v, want one, preferring her thread %q", matches, want)
 			}
 		})
 	}
