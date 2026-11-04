@@ -157,11 +157,21 @@ never someone whose own address, number or title holds it. Threads that share a
 time come in conversation ID order in both stores. It ignores the account's
 owner, whom most threads list: a thread that a query matches only through the
 owner's entry or the owner's own messages is no route. v2's conversation search
-skips the owner's identity. The legacy search skips participant entries flagged
-`is_me` or `isMe` and matches only incoming messages' senders. Both skip the
-owner before their limit and, like the address-book lookup, match `%` and `_`
-literally, but an owner's entry without the flag still matches. In client mode
-the route tool asks the daemon whether WhatsApp and Signal can send.
+skips the owner's identity. The legacy metadata and line searches skip the
+owner's participant entries: objects that carry `is_me` (or `isMe`), and any
+entry, a bare string included, on the phone line of a flagged entry whose
+number reads as a phone number or a WhatsApp JID of one, since Google's
+participant lists often repeat the owner without the flag. The legacy address
+lookup skips flagged entries only. Of message senders the legacy searches match
+only incoming ones. Both stores skip the owner before their limit and, like the
+address-book lookup, match `%` and `_` literally. `send_message` with platform
+`sms` skips the same entries as the metadata and line searches when it picks
+the recipient's one-to-one thread, and for the owner's own number it sends
+nothing and says so. One rule in `internal/db/owner.go` serves those searches
+and `send_message`, and the searches' SQL calls it through two registered
+functions. Each reads every element of a participants list on its own and
+takes the owner's lines from every thread. In client mode the route tool asks
+the daemon whether WhatsApp and Signal can send.
 The client opens the store via `app.NewClient`, which skips the startup repair
 sweeps — those stay daemon-owned, so N concurrent sessions don't each burst
 repair writes into the live `messages.db`.
