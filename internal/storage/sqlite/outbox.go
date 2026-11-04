@@ -1271,9 +1271,9 @@ func (r *OutboxRepository) LeaseDueBatch(
 	// after the last row the call has met. A row the call leases or sets aside
 	// leaves the due set, and a row it leaves as it was keeps its place behind
 	// the next page, so the call meets each due row at most once. Nothing else
-	// writes the store while this transaction holds its write lock. Each page
-	// is twice the size of the last, up to maxDueOutboxPage rows, so a long run
-	// of rows that fail costs few selects.
+	// writes the store while this transaction holds its write lock. The first
+	// page holds req.Limit rows, and later pages double until they reach
+	// maxDueOutboxPage rows, so a long run of rows that fail costs few selects.
 	var after *dueOutboxRow
 	pageSize := req.Limit
 	for {
@@ -1310,7 +1310,9 @@ func (r *OutboxRepository) LeaseDueBatch(
 	return batch, nil
 }
 
-// maxDueOutboxPage bounds how many due rows LeaseDueBatch reads in one select.
+// maxDueOutboxPage stops LeaseDueBatch's pages from doubling past 4,096 rows.
+// A first page above it keeps its size: it holds req.Limit rows, and the batch
+// already makes room for that many leases.
 const maxDueOutboxPage = 4096
 
 // dueOutboxRow holds a due row's id and its place in due order.
