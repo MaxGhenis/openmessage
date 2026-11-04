@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"unicode/utf8"
 )
 
 func (s *Store) UpsertContact(c *Contact) error {
@@ -65,43 +66,37 @@ func (s *Store) ListContacts(query string, limit int) ([]*Contact, error) {
 // as a fallback when the contacts table is empty.
 //
 // A participant matches where its name or number holds the query as written,
-// ASCII case aside: SQLite's lower() folds only ASCII letters, and so does
-// the check below, so Ángel finds Ángel Ruiz and ÁNGEL does too, but ángel
-// doesn't. Both read the decoded entry, never its JSON text, where Go writes
-// & and < as escapes. The SQL prefilter passes every row the loop could take
-// a contact from: a conversation whose name holds the query, or one with an
-// entry whose name or number does, under any case of those keys, as Go's
-// decoder accepts them. It only keeps a filtered autocomplete keystroke from
-// JSON-decoding every conversation in the store. Rows come newest first,
-// then in conversation ID order, and the loop stops once it has limit
-// contacts, but no row limit applies: most threads list the account's owner,
-// so for a name the owner shares, hundreds of newer rows can yield nothing
-// but the owner's entries, which the loop skips, before an older row yields
-// a match. A limit below 1 returns nothing.
+// ASCII case aside: SQLite's lower() folds only ASCII letters, and so does the
+// check below, so Ángel finds Ángel Ruiz and ÁNGEL does too, but ángel
+// doesn't. The check reads the decoded entry, never its JSON text, where Go
+// writes & and < as escapes. The SQL prefilter only spares an autocomplete
+// keystroke from decoding every conversation in the store, and it passes every
+// row the loop could take a contact from. JSON text without a backslash holds
+// each name and number as it decodes, except where Go's decoder reads a byte
+// that isn't UTF-8 as U+FFFD. So the prefilter passes a conversation whose
+// name or participants text holds the query, or whose text holds a backslash,
+// and a query that holds U+FFFD, or a byte that isn't UTF-8, skips the
+// prefilter. Rows come newest first, then in conversation ID order, and the
+// loop stops once it has limit contacts, but no row limit applies: most
+// threads list the account's owner, so for a name the owner shares, hundreds
+// of newer rows can yield nothing but the owner's entries, which the loop
+// skips, before an older row yields a match. A limit below 1 returns nothing.
 func (s *Store) ListContactsFromConversations(query string, limit int) ([]*Contact, error) {
 	if limit < 1 {
 		return nil, nil
+	}
+	filter := query
+	if strings.ContainsRune(query, utf8.RuneError) {
+		filter = ""
 	}
 	rows, err := s.db.Query(`
 		SELECT conversation_id, name, participants FROM conversations
 		WHERE ? = ''
 			OR instr(lower(name), lower(?)) > 0
-			OR EXISTS (
-				SELECT 1
-				FROM `+sqlParticipantEntries("conversations.participants")+` AS p
-				WHERE CASE p.type
-					WHEN 'object' THEN EXISTS (
-						SELECT 1
-						FROM json_each(p.value) AS field
-						WHERE lower(field.key) IN ('name', 'number')
-							AND field.type = 'text'
-							AND instr(lower(field.value), lower(?)) > 0
-					)
-					ELSE 0
-				END
-			)
+			OR instr(lower(participants), lower(?)) > 0
+			OR instr(participants, '\') > 0
 		ORDER BY last_message_ts DESC, conversation_id
-	`, query, query, query)
+	`, filter, filter, filter)
 	if err != nil {
 		return nil, err
 	}
