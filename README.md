@@ -136,7 +136,7 @@ To let a client connect over HTTP, start OpenMessage with `--mcp-sse` (or `--web
 | `send_media_to_conversation` | Send a local file attachment to an existing conversation ID |
 | `send_group_message` | Send to a group conversation by conversation ID |
 | `react_to_message` | Add, remove, or switch a reaction on an existing message |
-| `set_message_transcript` | Save or update a transcript for an audio/media message |
+| `set_message_transcript` | Save or update a transcript for an audio/media message (not on a v2-primary install, whose v2 store keeps no transcripts) |
 | `list_conversations` | List recent conversations |
 | `list_contacts` | List/search contacts |
 | `resolve_contact_routes` | Resolve a person or phone number to the available SMS/WhatsApp/Signal routes |

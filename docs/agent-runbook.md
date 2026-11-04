@@ -329,9 +329,10 @@ up there. On a v2-primary daemon:
   - Drafts and the `contacts` table live only in legacy. The cutover
     migration turned `contacts` rows into v2 identities and
     `unified_contacts` rows into v2 people.
-  - `set_message_transcript` and `/api/transcript` save transcripts to
-    legacy, since v2 has no transcript columns. Draft #269 proposes refusing
-    both on v2-primary.
+  - Transcripts live only in legacy, since v2 has no transcript columns. On
+    v2-primary, `set_message_transcript` and `/api/transcript` refuse (409 on
+    the HTTP route), because v2 reads would never show a transcript saved to
+    legacy. A legacy-primary install saves them there.
   - The web UI keeps some of its state there: the tab list (`/api/tabs`) and
     the People view's tags, reach-out reminders and summaries.
     `/api/new-conversation` writes a legacy conversation row for a new
@@ -970,6 +971,14 @@ running app:
   #140, with the same do-not-resend idempotency contract. With the app closed,
   send tools return an actionable "start the OpenMessage app" error — they
   never fall back to opening their own connections.
+- **Transcripts save through the daemon too** (`/api/transcript`), so
+  `set_message_transcript` never writes the live `messages.db` from the
+  client. `draft_message` and `import_messages` still write it from the
+  client. On a v2-primary install `set_message_transcript` refuses, in the
+  client and in the app: transcripts live only in the legacy store (the v2
+  store has no place for them, and `migrate` counts and drops them), and the
+  message reads that show transcripts, the read tools and the web UI's
+  conversation view, serve v2 there, so none would show one saved to legacy.
 - Escape hatches: `--transports` forces the old standalone full-stack stdio
   behavior (only for machines where the MCP process is the *only* OpenMessage
   process, ever); `--no-transports` strips transports from a **legacy-mode**
