@@ -465,8 +465,9 @@ func phoneLineSearchSQL(match string) string {
 // SQLite's NOCASE does, so an email address matches however its letters are
 // cased. A value that only contains address, a name, or a title matches
 // nothing: the legacy Google Chat importer files an email address as a
-// number, and another person's address can hold it. The match runs before
-// the LIMIT. An empty address matches nothing.
+// number, SMS threads list a short code as one, and another person's
+// address or phone number can hold either. The match runs before the
+// LIMIT. An empty address matches nothing.
 func (s *Store) SearchConversationsByAddress(address string, limit int) ([]*Conversation, error) {
 	if strings.TrimSpace(address) == "" || limit <= 0 {
 		return []*Conversation{}, nil

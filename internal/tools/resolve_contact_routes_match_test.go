@@ -346,14 +346,16 @@ func TestResolveContactRoutesFindsALegacyOnlyNameBesideATitleThatHoldsIt(t *test
 }
 
 // The legacy Google Chat importer files an email address as a participant's
-// number, and a legacy thread can list a Google Chat user path the same way.
-// Only the legacy store knows Alice's and Erin's names, and it writes Alice's
-// address in other letter case. Bob's address holds Alice's, a group's title
-// holds it, and Frank's user path extends Erin's; all three threads are newer
-// than theirs. A search for Alice or Erin by name finds only her own thread,
-// on either store: an address that the tool finds on a legacy thread names
-// whoever holds that whole address, and no one whose address or title merely
-// contains it.
+// number, and SMS threads list a short code as one; the tool treats any other
+// value that reads as no phone number, such as a user path, the same way.
+// Only the legacy store knows the names of Alice, Erin and Pharmacy Alerts,
+// and it writes Alice's address in other letter case. Bob's address holds
+// Alice's, a group's title holds it, Frank's user path extends Erin's, and
+// Gina's phone number holds the pharmacy's short code; all four threads are
+// newer than theirs. A search for each of the three by name finds only their
+// own thread, on either store: a value that the tool finds on a legacy thread
+// and that reads as no phone number names whoever holds all of it, and no
+// one whose address, number or title merely contains it.
 func TestResolveContactRoutesLooksUpAFoundAddressAsAWhole(t *testing.T) {
 	for _, mode := range routeStoreModes {
 		t.Run(mode, func(t *testing.T) {
@@ -362,22 +364,24 @@ func TestResolveContactRoutesLooksUpAFoundAddressAsAWhole(t *testing.T) {
 			threads := seedRouteFixture(t, a.Store, store, []routeFixturePerson{
 				{Name: "Bob Jones", Number: "other-support@example.com", Kind: "email", LegacyThreadID: "bob", RemoteThreadID: "bob"},
 				{Name: "Frank Lee", Number: "users/1234", Kind: "username", LegacyThreadID: "frank", RemoteThreadID: "frank"},
+				{Name: "Gina Park", Number: "+12025550142", LegacyThreadID: "gina", RemoteThreadID: "gina"},
 				{Name: "Alice Chen", Number: "support@example.com", Kind: "email", LegacyNumber: "Support@Example.com", LegacyThreadID: "alice", RemoteThreadID: "alice", NamelessInV2: true},
 				{Name: "Erin Diaz", Number: "users/123", Kind: "username", LegacyThreadID: "erin", RemoteThreadID: "erin", NamelessInV2: true},
+				{Name: "Pharmacy Alerts", Number: "55501", Kind: "username", LegacyThreadID: "pharmacy", RemoteThreadID: "pharmacy", NamelessInV2: true},
 			})
 			seedTitledRouteGroup(t, a.Store, store, defaultRouteFixtureOwner, "help", "Ask support@example.com")
 			reads, options := routeReadsFor(t, a, store, mode)
-			for _, name := range []string{"Alice Chen", "Erin Diaz"} {
+			for _, name := range []string{"Alice Chen", "Erin Diaz", "Pharmacy Alerts"} {
 				want := threads[name]
 				if mode == "legacy" {
-					want = map[string]string{"Alice Chen": "alice", "Erin Diaz": "erin"}[name]
+					want = map[string]string{"Alice Chen": "alice", "Erin Diaz": "erin", "Pharmacy Alerts": "pharmacy"}[name]
 				}
 				got, err := findRouteConversations(reads, a.Store, name, 80)
 				if err != nil {
 					t.Fatalf("findRouteConversations(%q): %v", name, err)
 				}
 				if !slices.Equal(routeIDs(got), []string{want}) {
-					t.Errorf("routes for %q = %v, want only her thread %q", name, routeIDs(got), want)
+					t.Errorf("routes for %q = %v, want only their thread %q", name, routeIDs(got), want)
 				}
 				matches := routeMatches(t, callRouteTool(t, resolveContactRoutesHandler(a, options), map[string]any{"query": name}))
 				if len(matches) != 1 || matches[0].PreferredReplyConversationID != want {

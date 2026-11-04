@@ -906,8 +906,8 @@ func (s *Store) SearchConversationsByPhoneLine(line string, limit int) ([]Conver
 // letters' case and nothing else, as SQLite's NOCASE does. The account's
 // owner (the self identity) matches nothing, and neither does a canonical
 // value that only contains address, a display name, or a title: another
-// person's address can hold this one. The match runs before the LIMIT. An
-// empty address matches nothing.
+// person's address or phone number can hold this one. The match runs
+// before the LIMIT. An empty address matches nothing.
 func (s *Store) SearchConversationsByAddress(address string, limit int) ([]Conversation, error) {
 	if limit <= 0 || strings.TrimSpace(address) == "" {
 		return []Conversation{}, nil

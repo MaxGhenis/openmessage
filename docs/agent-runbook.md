@@ -1026,32 +1026,32 @@ running app:
   title or a card matched. A title that holds a name says nothing about where
   that person's own thread is. The tool searches each line once, however the
   cards and threads write its number. It looks up each other value it finds
-  there once, as a whole address in the serving store: email addresses, which
-  the legacy Google Chat importer files as participants' numbers, and Google
-  Chat `users/...` IDs. That lookup (`SearchConversationsByAddress`) ignores
-  only ASCII letters' case. A value that only contains the address
-  (`other-support@example.com` for `support@example.com`, `users/1234` for
-  `users/123`), a name and a title match nothing. A search for the address's
-  text would route a name query to strangers whose addresses, or groups whose
-  titles, hold the person's, and at a small limit newer ones would crowd the
-  person out. That contacts list skips flagged entries
-  too, reads past any number of threads that yield none, and matches what an
-  entry says, not its JSON text: `R&D` finds R&D Desk, whose & Go's encoder
-  writes as an escape, and like `LIKE` and `lower()` it ignores only ASCII
-  case, so `ÁNGEL` finds Ángel Ruiz but `ángel` doesn't. Threads that share a
-  time come in conversation ID order in both stores' searches and in this
-  list, so a limit keeps the same threads whichever store serves the reads. An
-  entry that holds the owner's name or number without the flag still matches:
-  the WhatsApp text importer lists every sender, the owner included, with no
-  flag. Before the fix for the 2026-11-03 (UTC) incident,
-  `resolve_contact_routes` read the legacy store on a v2-primary install and
-  handed out Google thread numbers, which the outbox refused with a bare 404
-  `not found`, while `send_message` by phone number worked. In-process
-  `send_media_to_conversation` on v2-primary refused every v2 ID too: it
-  looked the ID up in the legacy store first. In client mode the route tool
-  takes WhatsApp and Signal sendability from the daemon's `/api/status` (no
-  answer: not sendable) instead of building its own bridges. Regression tests:
-  `TestClientModeSendsToTheRouteResolveContactRoutesPrefers`,
+  there once, as a whole address in the serving store. Such values include SMS
+  short codes, Signal UUIDs and email addresses, which the legacy Google Chat
+  importer files as participants' numbers. That lookup
+  (`SearchConversationsByAddress`) ignores only ASCII letters' case. A longer
+  value that holds the one it looks up (`other-support@example.com` for
+  `support@example.com`, `+12025550142` for the short code `55501`), a name and
+  a title match nothing. A search for the value's text would route a name query
+  to strangers whose own addresses or phone numbers hold it, and to groups
+  whose titles do, and at a small limit newer ones would crowd the person out.
+  `ListContactsFromConversations` skips flagged entries too, reads past any
+  number of threads that yield none, and matches what an entry says, not its
+  JSON text: `R&D` finds R&D Desk, whose & Go's encoder writes as an escape,
+  and like `LIKE` and `lower()` it ignores only ASCII case, so `ÁNGEL` finds
+  Ángel Ruiz but `ángel` doesn't. Threads that share a time come in
+  conversation ID order in both stores' searches and in this list, so a limit
+  keeps the same threads whichever store serves the reads. An entry that holds
+  the owner's name or number without the flag still matches: the WhatsApp text
+  importer lists every sender, the owner included, with no flag. Before the fix
+  for the 2026-11-03 (UTC) incident, `resolve_contact_routes` read the legacy
+  store on a v2-primary install and handed out Google thread numbers, which the
+  outbox refused with a bare 404 `not found`, while `send_message` by phone
+  number worked. In-process `send_media_to_conversation` on v2-primary refused
+  every v2 ID too: it looked the ID up in the legacy store first. In client
+  mode the route tool takes WhatsApp and Signal sendability from the daemon's
+  `/api/status` (no answer: not sendable) instead of building its own bridges.
+  Regression tests: `TestClientModeSendsToTheRouteResolveContactRoutesPrefers`,
   `TestResolveContactRoutesNeverRoutesByAReusedGoogleThreadNumber`,
   `TestResolveContactRoutesFindsPeopleByAnyFormOfTheirNumber`,
   `TestInProcessSendsTakeTheIDsResolveContactRoutesReturns`,

@@ -141,8 +141,9 @@ func resolveContactRoutesHandler(a *app.App, configured ...Options) server.ToolH
 // or someone in it. For other text, people also supplies the numbers of
 // matching address-book contacts and of matching participants in its own
 // conversations, and the function looks each one up in reads once: a phone
-// number by its line, and any other value, such as an email address, as a
-// whole address. It never looks up a people-store conversation ID.
+// number by its line, and any other value, such as an email address or an
+// SMS short code, as a whole address. It never looks up a people-store
+// conversation ID.
 func findRouteConversations(reads readsource.ReadSource, people *db.Store, query string, limit int) ([]*db.Conversation, error) {
 	if limit <= 0 {
 		limit = 20
@@ -201,8 +202,9 @@ func findRouteConversations(reads readsource.ReadSource, people *db.Store, query
 	// lookUp finds the threads of the person a number names. A phone number
 	// names a line. Any other value names whoever holds it as a whole
 	// address, with ASCII letters' case aside: the legacy Google Chat importer
-	// files an email address as a number, and another person's address, or a
-	// title, can hold it, so a search for the text would route to them.
+	// files an email address as a number, SMS threads list a short code as
+	// one, and another person's address or phone number, or a title, can hold
+	// either, so a search for the text would route to them.
 	// searched holds each line and address that lookUp has asked reads about,
 	// so reads answer each lookup once. The address book and legacy threads
 	// often hold one person's number, each written its own way, and every

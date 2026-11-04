@@ -151,17 +151,17 @@ number, phone or email of a participant entry, never a JSON key: the searches
 decode JSON escapes and ignore only ASCII case, as SQLite's `LIKE` and
 `lower()` do. A value that a name query finds on a card or a legacy thread and
 that reads as no phone number, such as an email address, which the legacy
-Google Chat importer files as a number, names whoever holds it as a whole
-address (`SearchConversationsByAddress`, ASCII case aside), never someone whose
-own address or title holds it. Threads that share a time come in conversation
-ID order in both stores. It ignores the account's owner, whom most threads
-list: a thread that a query matches only through the owner's entry or the
-owner's own messages is no route. v2's conversation search skips the owner's
-identity. The legacy search skips participant entries flagged `is_me` or `isMe`
-and matches only incoming messages' senders. Both skip the owner before their
-limit and, like the address-book lookup, match `%` and `_` literally, but an
-owner's entry without the flag still matches. In client mode the route tool
-asks the daemon whether WhatsApp and Signal can send.
+Google Chat importer files as a number, or an SMS short code, names whoever
+holds it as a whole address (`SearchConversationsByAddress`, ASCII case aside),
+never someone whose own address, number or title holds it. Threads that share a
+time come in conversation ID order in both stores. It ignores the account's
+owner, whom most threads list: a thread that a query matches only through the
+owner's entry or the owner's own messages is no route. v2's conversation search
+skips the owner's identity. The legacy search skips participant entries flagged
+`is_me` or `isMe` and matches only incoming messages' senders. Both skip the
+owner before their limit and, like the address-book lookup, match `%` and `_`
+literally, but an owner's entry without the flag still matches. In client mode
+the route tool asks the daemon whether WhatsApp and Signal can send.
 The client opens the store via `app.NewClient`, which skips the startup repair
 sweeps — those stay daemon-owned, so N concurrent sessions don't each burst
 repair writes into the live `messages.db`.
