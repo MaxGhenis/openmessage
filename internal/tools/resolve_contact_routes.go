@@ -179,9 +179,9 @@ func findRouteConversations(reads readsource.ReadSource, people *db.Store, query
 	// threads list the account's owner, and a thread that a query matches only
 	// through the owner says nothing about whom to send to. Both stores'
 	// searches skip the owner before their limit: v2's skips the owner's
-	// identity, and the legacy store's skip the owner's participant entries
-	// (flagged, or on a flagged entry's phone line; see internal/db/owner.go)
-	// and the owner's own messages.
+	// identity, and the legacy store's, lookUp's address search included,
+	// skip the owner's participant entries (flagged, or on a flagged entry's
+	// phone line; see internal/db/owner.go) and the owner's own messages.
 	search := func(text string) ([]*db.Conversation, error) {
 		if looksLikePhoneNumber(text) {
 			return reads.SearchConversationsByPhoneLine(phoneline.Line(text), limit)
