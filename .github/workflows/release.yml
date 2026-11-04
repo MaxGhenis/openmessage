@@ -11,7 +11,10 @@ on:
         required: true
 
 permissions:
-  contents: write
+  contents: read
+
+env:
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
   build-cross-platform:
@@ -31,6 +34,8 @@ jobs:
             goarch: amd64
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
 
       - uses: actions/setup-go@v5
         with:
@@ -43,7 +48,7 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: 0
         run: |
-          version="${GITHUB_REF_NAME:-${{ inputs.tag }}}"
+          version="$RELEASE_TAG"
           mkdir -p dist
           go build -trimpath -ldflags "-s -w -X main.version=${version}" -o dist/openmessage .
           tar -C dist -czf "openmessage-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz" openmessage
@@ -61,6 +66,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
 
       - uses: actions/setup-go@v5
         with:
@@ -114,6 +121,7 @@ jobs:
           # so a stale dev build can never shadow the installed app in
           # LaunchServices. Shipping artifacts must carry the real id.
           RELEASE: "1"
+          VERSION: ${{ env.RELEASE_TAG }}
           DEVELOPER_ID: ${{ secrets.DEVELOPER_ID }}
           AC_USERNAME: ${{ secrets.AC_USERNAME }}
           AC_PASSWORD: ${{ secrets.AC_PASSWORD }}
@@ -160,25 +168,78 @@ jobs:
           path: macos/build/OpenMessage.dmg
           retention-days: 7
 
-  release:
-    name: Publish GitHub Release
+  publish-container:
+    name: Publish container image
     needs: [build-cross-platform, build-macos-app]
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.image.outputs.name }}
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          ref: refs/tags/${{ env.RELEASE_TAG }}
 
-      - name: Determine tag
-        id: tag
-        run: |
-          tag="${GITHUB_REF_NAME:-${{ inputs.tag }}}"
-          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+      - name: Determine image name
+        id: image
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v4.4.1
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Container metadata
+        id: meta
+        uses: docker/metadata-action@v6.2.0
+        with:
+          context: git
+          images: ${{ steps.image.outputs.name }}
+          flavor: latest=false
+          tags: |
+            type=raw,value=${{ env.RELEASE_TAG }}
+            type=raw,value=latest,enable=${{ !contains(env.RELEASE_TAG, '-') }}
+          labels: |
+            org.opencontainers.image.version=${{ env.RELEASE_TAG }}
+
+      - name: Build and push container image
+        uses: docker/build-push-action@v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: VERSION=${{ env.RELEASE_TAG }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  release:
+    name: Publish GitHub Release
+    needs: [build-cross-platform, build-macos-app, publish-container]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      CONTAINER_IMAGE: ${{ needs.publish-container.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
+          fetch-depth: 0
 
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
+          pattern: "!*.dockerbuild"
           path: artifacts
 
       - name: Stage release files
@@ -196,20 +257,21 @@ jobs:
       - name: Generate release notes
         id: notes
         run: |
-          tag="${{ steps.tag.outputs.tag }}"
-          previous=$(git tag --sort=-v:refname | grep -v "^${tag}$" | head -n1)
+          tag="$RELEASE_TAG"
+          previous=$(git tag --merged "$tag" --sort=-v:refname | awk -v tag="$tag" '$0 != tag && !found {print; found=1}')
           if [ -z "$previous" ]; then
             git log --pretty=format:"- %s (%h)" > NOTES.md
           else
             git log "${previous}..${tag}" --pretty=format:"- %s (%h)" > NOTES.md
           fi
+          printf '\n\n## Container image\n\n`docker pull %s:%s`\n' "$CONTAINER_IMAGE" "$tag" >> NOTES.md
           echo "Generated notes from ${previous:-beginning} to ${tag}"
 
       - name: Create or update release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          tag="${{ steps.tag.outputs.tag }}"
+          tag="$RELEASE_TAG"
           if gh release view "$tag" >/dev/null 2>&1; then
             gh release upload "$tag" release/* --clobber
             gh release edit "$tag" --notes-file NOTES.md
