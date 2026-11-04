@@ -110,6 +110,12 @@ func nextPassBackoff(previous, shortest, longest time.Duration) time.Duration {
 // DispatchDue claims and synchronously processes at most limit due intents.
 // Transport failures become durable states; only local state-machine failures
 // are returned.
+//
+// A due intent whose lease fails on its own row does not hold the others:
+// LeaseDueBatch sets it aside and leases the rows after it, and DispatchDue
+// records it (DispatchHealth and the OnLeaseFailure hook). A row that could not
+// be set aside either is still due, so DispatchDue sends the rest and then
+// returns an error naming it, and Run backs off before it meets that row again.
 func (s *MessageService) DispatchDue(ctx context.Context, limit int) (int, error) {
 	if ctx == nil {
 		return 0, fmt.Errorf("dispatch due messages: context is nil")
@@ -117,7 +123,7 @@ func (s *MessageService) DispatchDue(ctx context.Context, limit int) (int, error
 	if limit <= 0 {
 		return 0, fmt.Errorf("dispatch due messages: limit must be positive")
 	}
-	leases, err := s.outbox.LeaseDue(ctx, sqlite.LeaseRequest{
+	batch, err := s.outbox.LeaseDueBatch(ctx, sqlite.LeaseRequest{
 		Owner:    workerOwner,
 		Now:      s.clock.Now(),
 		Duration: s.leaseTime,
@@ -133,11 +139,13 @@ func (s *MessageService) DispatchDue(ctx context.Context, limit int) (int, error
 		}
 		return 0, fmt.Errorf("lease due messages: %w", err)
 	}
+	stuck := s.recordFailedLeases(batch.Failed)
 
+	leases := batch.Leases
 	processed := 0
 	for index, lease := range leases {
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			return processed, errors.Join(ctxErr, s.releaseUntouched(ctx, leases[index:]))
+			return processed, errors.Join(ctxErr, s.releaseUntouched(ctx, leases[index:]), stuck)
 		}
 		if lease.LeaseExpiresAtMS != nil && *lease.LeaseExpiresAtMS <= s.clock.Now().UnixMilli() {
 			mutationCtx, cancel := s.storageMutationContext(ctx)
@@ -147,7 +155,7 @@ func (s *MessageService) DispatchDue(ctx context.Context, limit int) (int, error
 				s.signalChange()
 			}
 			if recoverErr != nil {
-				return processed, fmt.Errorf("recover leases expired during dispatch: %w", recoverErr)
+				return processed, errors.Join(fmt.Errorf("recover leases expired during dispatch: %w", recoverErr), stuck)
 			}
 			break
 		}
@@ -168,11 +176,40 @@ func (s *MessageService) DispatchDue(ctx context.Context, limit int) (int, error
 			))
 		}
 		if dispatchErr != nil {
-			return processed, errors.Join(dispatchErr, s.releaseUntouched(ctx, leases[index+1:]))
+			return processed, errors.Join(dispatchErr, s.releaseUntouched(ctx, leases[index+1:]), stuck)
 		}
 		processed++
 	}
-	return processed, nil
+	return processed, stuck
+}
+
+// recordFailedLeases records each due row whose lease failed on its own row
+// and returns an error naming the rows that could not be set aside either.
+func (s *MessageService) recordFailedLeases(failed []sqlite.LeaseFailure) error {
+	if len(failed) == 0 {
+		return nil
+	}
+	now := s.clock.Now()
+	var stuck []error
+	setAside := false
+	for _, failure := range failed {
+		s.leaseFailures.fail(failure, now)
+		if failure.SetAsideErr != nil {
+			stuck = append(stuck, fmt.Errorf(
+				"outbox item %q can be neither leased (%w) nor set aside (%w)",
+				failure.OutboxID, failure.Err, failure.SetAsideErr,
+			))
+			continue
+		}
+		setAside = true
+	}
+	if setAside {
+		s.signalChange()
+	}
+	if len(stuck) == 0 {
+		return nil
+	}
+	return fmt.Errorf("lease due messages: %w", errors.Join(stuck...))
 }
 
 func (s *MessageService) dispatchTextLease(ctx context.Context, outboxLease sqlite.Lease) error {

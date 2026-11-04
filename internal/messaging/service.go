@@ -83,6 +83,7 @@ type MessageService struct {
 	transportShutdownGrace time.Duration
 	transport              transportCalls
 	passes                 dispatchPasses
+	leaseFailures          dispatchLeaseFailures
 
 	wake chan struct{}
 

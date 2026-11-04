@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -191,6 +192,41 @@ type LeaseRequest struct {
 // so callers can use the persisted fields directly.
 type Lease struct {
 	OutboxItem
+}
+
+// LeaseFailedCode is the error code, with error class transient, of a due row
+// that LeaseDueBatch set aside because its lease failed on the row itself.
+// Like the dispatcher's load_message and load_roster codes, it names the
+// operation that failed.
+const LeaseFailedCode = "lease"
+
+// A row set aside after a failed lease is due again leaseRetryDelay later, the
+// dispatcher's default delay after its other pre-call failures. The delay doubles
+// while the row's leases keep failing, up to maxLeaseRetryDelay, so a row that
+// can never lease costs one failed lease every five minutes.
+const (
+	leaseRetryDelay    = 5 * time.Second
+	maxLeaseRetryDelay = 5 * time.Minute
+)
+
+// LeaseFailure is a due row whose lease failed on the row itself.
+type LeaseFailure struct {
+	OutboxID string
+	// Err is why the lease failed.
+	Err error
+	// RetryAt is when the row, now not_dispatched with LeaseFailedCode, is due
+	// again. It is zero when the row could not be set aside either.
+	RetryAt time.Time
+	// SetAsideErr is why the row could not be set aside. Such a row is left as
+	// it was, still due, and the next call meets it again.
+	SetAsideErr error
+}
+
+// LeaseBatch is one LeaseDueBatch claim: the rows it leased and the due rows
+// whose lease failed, each in due order.
+type LeaseBatch struct {
+	Leases []Lease
+	Failed []LeaseFailure
 }
 
 // Attempt identifies the active lease crossing the transport-call boundary.
@@ -1160,36 +1196,116 @@ func (r *OutboxRepository) ListConfirmedSince(
 	return items, nil
 }
 
-// LeaseDue atomically claims due queued and retryable rows. An uncertain row is
-// structurally ineligible regardless of its next-attempt value.
+// LeaseDue claims due queued and retryable rows, as LeaseDueBatch does, and
+// returns only the leases. The dispatcher calls LeaseDueBatch, which also
+// reports the due rows whose lease failed.
 func (r *OutboxRepository) LeaseDue(
 	ctx context.Context,
 	req LeaseRequest,
 ) ([]Lease, error) {
+	batch, err := r.LeaseDueBatch(ctx, req)
+	return batch.Leases, err
+}
+
+// LeaseDueBatch atomically claims up to req.Limit due queued and retryable
+// rows, in due order. An uncertain row is structurally ineligible regardless of
+// its next-attempt value.
+//
+// Each row is leased under its own savepoint, so a lease that fails on the row
+// itself undoes only that row's writes and the rows after it still lease.
+// Before, the first such failure rolled back the whole batch, the next call met
+// the same row first again, and one row that could never lease held every send
+// queued behind it. A failure is the row's when SQLite refuses the write as a
+// constraint the row cannot meet (a CHECK, NOT NULL, STRICT type or trigger) or
+// a value of the wrong type or size, when a trigger skips the write, or when
+// the leased row's stored values do not read back. LeaseDueBatch then records
+// the error on the row and sets it aside: not_dispatched, error class
+// transient and code LeaseFailedCode, due again after leaseRetryDelay (see
+// setAsideOutboxRow). If that write fails too, the row is left as it was and
+// the call goes past it. Failed reports both.
+//
+// A due row is queued or not_dispatched, so its transport call never started,
+// or proved it sent nothing (MarkCalledNotDispatched). Setting it aside keeps
+// its transport_called_at_ms NULL and its attempt_count, and touches no row
+// outside the due set, so neither the set-aside nor its retry resends an
+// intent whose call started.
+//
+// Any other failure (busy, locked, I/O, corruption, cancellation) belongs to
+// the store, not the row, and fails the whole call as before, committing
+// nothing.
+func (r *OutboxRepository) LeaseDueBatch(
+	ctx context.Context,
+	req LeaseRequest,
+) (LeaseBatch, error) {
 	if strings.TrimSpace(req.Owner) == "" {
-		return nil, fmt.Errorf("lease due outbox items: owner is empty")
+		return LeaseBatch{}, fmt.Errorf("lease due outbox items: owner is empty")
 	}
 	if req.Limit <= 0 {
-		return nil, fmt.Errorf("lease due outbox items: limit must be positive")
+		return LeaseBatch{}, fmt.Errorf("lease due outbox items: limit must be positive")
 	}
 	if req.Duration <= 0 {
-		return nil, fmt.Errorf("lease due outbox items: duration must be positive")
+		return LeaseBatch{}, fmt.Errorf("lease due outbox items: duration must be positive")
 	}
 	nowMS := req.Now.UnixMilli()
 	if nowMS <= 0 {
-		return nil, fmt.Errorf("lease due outbox items: current Unix time is not positive")
+		return LeaseBatch{}, fmt.Errorf("lease due outbox items: current Unix time is not positive")
 	}
 	expiresAtMS := req.Now.Add(req.Duration).UnixMilli()
 	if expiresAtMS <= nowMS {
-		return nil, fmt.Errorf("lease due outbox items: lease expiry must be after now")
+		return LeaseBatch{}, fmt.Errorf("lease due outbox items: lease expiry must be after now")
 	}
 
 	tx, err := r.store.db.BeginTx(ctx, nil)
 	if err != nil {
-		return nil, fmt.Errorf("lease due outbox items: begin transaction: %w", err)
+		return LeaseBatch{}, fmt.Errorf("lease due outbox items: begin transaction: %w", err)
 	}
 	defer tx.Rollback()
 
+	batch := LeaseBatch{Leases: make([]Lease, 0, req.Limit)}
+	// Each select looks past every row this call has tried. A row left as it
+	// was is still due, and without this it would come back first every time.
+	tried := make([]string, 0, req.Limit)
+	for len(batch.Leases) < req.Limit {
+		ids, err := selectDueOutboxIDs(ctx, tx, nowMS, req.Limit-len(batch.Leases), tried)
+		if err != nil {
+			return LeaseBatch{}, fmt.Errorf("lease due outbox items: %w", err)
+		}
+		if len(ids) == 0 {
+			break
+		}
+		for _, id := range ids {
+			tried = append(tried, id)
+			lease, failure, err := leaseCandidate(ctx, tx, id, req.Owner, nowMS, expiresAtMS)
+			if err != nil {
+				return LeaseBatch{}, err
+			}
+			if failure != nil {
+				batch.Failed = append(batch.Failed, *failure)
+				continue
+			}
+			batch.Leases = append(batch.Leases, lease)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return LeaseBatch{}, fmt.Errorf("lease due outbox items: commit: %w", err)
+	}
+	return batch, nil
+}
+
+// selectDueOutboxIDs returns up to limit due rows in due order, leaving out the
+// rows in skip.
+func selectDueOutboxIDs(
+	ctx context.Context,
+	tx *sql.Tx,
+	nowMS int64,
+	limit int,
+	skip []string,
+) ([]string, error) {
+	skipJSON, err := json.Marshal(skip)
+	if err != nil {
+		return nil, fmt.Errorf("encode rows to skip: %w", err)
+	}
 	rows, err := tx.QueryContext(ctx, `
 		SELECT outbox_id
 		FROM outbox
@@ -1197,11 +1313,12 @@ func (r *OutboxRepository) LeaseDue(
 		  AND state IN ('queued', 'not_dispatched')
 		  AND (next_attempt_at_ms IS NULL OR next_attempt_at_ms <= ?)
 		  AND (lease_expires_at_ms IS NULL OR lease_expires_at_ms <= ?)
+		  AND outbox_id NOT IN (SELECT value FROM json_each(?))
 		ORDER BY COALESCE(next_attempt_at_ms, scheduled_for_ms), created_at_ms, outbox_id
 		LIMIT ?
-	`, nowMS, nowMS, nowMS, req.Limit)
+	`, nowMS, nowMS, nowMS, string(skipJSON), limit)
 	if err != nil {
-		return nil, fmt.Errorf("lease due outbox items: select candidates: %w", err)
+		return nil, fmt.Errorf("select candidates: %w", err)
 	}
 	ids, err := collectRows(rows, func(row rowScanner) (string, error) {
 		var id string
@@ -1209,58 +1326,232 @@ func (r *OutboxRepository) LeaseDue(
 		return id, err
 	})
 	if err != nil {
-		return nil, fmt.Errorf("lease due outbox items: scan candidates: %w", err)
+		return nil, fmt.Errorf("scan candidates: %w", err)
 	}
+	return ids, nil
+}
 
-	leases := make([]Lease, 0, len(ids))
-	for _, id := range ids {
-		token, err := newOutboxLeaseToken()
-		if err != nil {
-			return nil, fmt.Errorf("lease outbox item %q: generate token: %w", id, err)
-		}
-		result, err := tx.ExecContext(ctx, `
-			UPDATE outbox
-			SET state = 'dispatching',
-				error_class = NULL,
-				error_code = NULL,
-				error_detail = NULL,
-				lease_owner = ?,
-				lease_token = ?,
-				lease_expires_at_ms = ?,
-				transport_called_at_ms = NULL,
-				next_attempt_at_ms = NULL,
-				updated_at_ms = MAX(updated_at_ms, ?)
-			WHERE outbox_id = ?
-			  AND scheduled_for_ms <= ?
-			  AND state IN ('queued', 'not_dispatched')
-			  AND (next_attempt_at_ms IS NULL OR next_attempt_at_ms <= ?)
-			  AND (lease_expires_at_ms IS NULL OR lease_expires_at_ms <= ?)
-		`, req.Owner, token, expiresAtMS, nowMS, id, nowMS, nowMS, nowMS)
-		if err != nil {
-			return nil, fmt.Errorf("lease outbox item %q: update: %w", id, err)
-		}
-		affected, err := result.RowsAffected()
-		if err != nil {
-			return nil, fmt.Errorf("lease outbox item %q: read rows affected: %w", id, err)
-		}
-		if affected != 1 {
-			return nil, fmt.Errorf("lease outbox item %q: affected %d rows, want 1", id, affected)
-		}
-		item, err := scanOutboxItem(tx.QueryRowContext(ctx, `
-			SELECT `+outboxColumns+`
-			FROM outbox
-			WHERE outbox_id = ?
-		`, id))
-		if err != nil {
-			return nil, fmt.Errorf("lease outbox item %q: read claimed row: %w", id, err)
-		}
-		leases = append(leases, Lease{OutboxItem: item})
+// leaseCandidate leases one due row under its own savepoint. A lease that
+// fails on the row (isRowLeaseFailure) comes back as a LeaseFailure, after the
+// row has been set aside when that write works. Any other error fails the
+// caller's whole transaction.
+func leaseCandidate(
+	ctx context.Context,
+	tx *sql.Tx,
+	id, owner string,
+	nowMS, expiresAtMS int64,
+) (Lease, *LeaseFailure, error) {
+	if _, err := tx.ExecContext(ctx, `SAVEPOINT lease_candidate`); err != nil {
+		return Lease{}, nil, fmt.Errorf("lease outbox item %q: open savepoint: %w", id, err)
 	}
+	lease, leaseErr := leaseOutboxRow(ctx, tx, id, owner, nowMS, expiresAtMS)
+	if leaseErr != nil && !isRowLeaseFailure(leaseErr) {
+		return Lease{}, nil, leaseErr
+	}
+	var failure *LeaseFailure
+	if leaseErr != nil {
+		// ROLLBACK TO keeps the savepoint open, so the set-aside runs under it
+		// too. A trigger's RAISE(ROLLBACK) ends the whole transaction instead;
+		// then no savepoint is left, and this fails the call.
+		if err := rollbackToLeaseCandidate(ctx, tx); err != nil {
+			return Lease{}, nil, errors.Join(leaseErr, err)
+		}
+		failure = &LeaseFailure{OutboxID: id, Err: leaseErr}
+		retryAtMS, setAsideErr := setAsideOutboxRow(ctx, tx, id, leaseErr, nowMS)
+		switch {
+		case setAsideErr == nil:
+			failure.RetryAt = time.UnixMilli(retryAtMS)
+		case isRowLeaseFailure(setAsideErr):
+			if err := rollbackToLeaseCandidate(ctx, tx); err != nil {
+				return Lease{}, nil, errors.Join(leaseErr, setAsideErr, err)
+			}
+			failure.SetAsideErr = setAsideErr
+		default:
+			return Lease{}, nil, errors.Join(leaseErr, setAsideErr)
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `RELEASE lease_candidate`); err != nil {
+		return Lease{}, nil, fmt.Errorf("lease outbox item %q: release savepoint: %w", id, err)
+	}
+	return lease, failure, nil
+}
 
-	if err := tx.Commit(); err != nil {
-		return nil, fmt.Errorf("lease due outbox items: commit: %w", err)
+func rollbackToLeaseCandidate(ctx context.Context, tx *sql.Tx) error {
+	if _, err := tx.ExecContext(ctx, `ROLLBACK TO lease_candidate`); err != nil {
+		return fmt.Errorf("roll back to savepoint: %w", err)
 	}
-	return leases, nil
+	return nil
+}
+
+// leaseOutboxRow leases one due row and reads it back.
+func leaseOutboxRow(
+	ctx context.Context,
+	tx *sql.Tx,
+	id, owner string,
+	nowMS, expiresAtMS int64,
+) (Lease, error) {
+	token, err := newOutboxLeaseToken()
+	if err != nil {
+		return Lease{}, fmt.Errorf("lease outbox item %q: generate token: %w", id, err)
+	}
+	result, err := tx.ExecContext(ctx, `
+		UPDATE outbox
+		SET state = 'dispatching',
+			error_class = NULL,
+			error_code = NULL,
+			error_detail = NULL,
+			lease_owner = ?,
+			lease_token = ?,
+			lease_expires_at_ms = ?,
+			transport_called_at_ms = NULL,
+			next_attempt_at_ms = NULL,
+			updated_at_ms = MAX(updated_at_ms, ?)
+		WHERE outbox_id = ?
+		  AND scheduled_for_ms <= ?
+		  AND state IN ('queued', 'not_dispatched')
+		  AND (next_attempt_at_ms IS NULL OR next_attempt_at_ms <= ?)
+		  AND (lease_expires_at_ms IS NULL OR lease_expires_at_ms <= ?)
+	`, owner, token, expiresAtMS, nowMS, id, nowMS, nowMS, nowMS)
+	if err != nil {
+		return Lease{}, fmt.Errorf("lease outbox item %q: update: %w", id, err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return Lease{}, fmt.Errorf("lease outbox item %q: read rows affected: %w", id, err)
+	}
+	if affected == 0 {
+		return Lease{}, fmt.Errorf("lease outbox item %q: %w", id, errOutboxRowUnchanged)
+	}
+	if affected != 1 {
+		return Lease{}, fmt.Errorf("lease outbox item %q: affected %d rows, want 1", id, affected)
+	}
+	item, err := readLeasedOutboxRow(ctx, tx, id)
+	if err != nil {
+		return Lease{}, fmt.Errorf("lease outbox item %q: read claimed row: %w", id, err)
+	}
+	return Lease{OutboxItem: item}, nil
+}
+
+// errOutboxRowUnreadable marks a leased row whose stored values do not scan
+// into an OutboxItem, such as a NULL where the schema says NOT NULL.
+var errOutboxRowUnreadable = errors.New("stored values do not read back")
+
+// errOutboxRowUnchanged marks a lease or set-aside that changed no row,
+// although the same transaction had just selected the row as due under the
+// same predicate. Only a trigger's RAISE(IGNORE) skips such a write.
+var errOutboxRowUnchanged = errors.New("the update changed no row")
+
+// readLeasedOutboxRow reads back the row leaseOutboxRow just leased. The
+// query and the scan run as separate steps so a value that does not scan
+// (errOutboxRowUnreadable) is told apart from a query the store failed.
+func readLeasedOutboxRow(ctx context.Context, tx *sql.Tx, id string) (OutboxItem, error) {
+	rows, err := tx.QueryContext(ctx, `
+		SELECT `+outboxColumns+`
+		FROM outbox
+		WHERE outbox_id = ?
+	`, id)
+	if err != nil {
+		return OutboxItem{}, err
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		if err := rows.Err(); err != nil {
+			return OutboxItem{}, err
+		}
+		return OutboxItem{}, sql.ErrNoRows
+	}
+	item, err := scanOutboxItem(rows)
+	if err != nil {
+		// database/sql closes the rows when ctx ends, and Scan then fails.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return OutboxItem{}, ctxErr
+		}
+		return OutboxItem{}, fmt.Errorf("%w: %w", errOutboxRowUnreadable, err)
+	}
+	return item, rows.Close()
+}
+
+// setAsideOutboxRow moves a due row whose lease failed out of the due set. It
+// records the error, makes the row not_dispatched, and returns its new
+// next_attempt_at_ms. That is leaseRetryDelay from now, or twice the row's
+// previous delay when its last failure was a failed lease too (its
+// next_attempt_at_ms less its updated_at_ms, both written by the set-aside
+// that recorded it), up to maxLeaseRetryDelay. A manual retry
+// (RetryNotDispatched) sets next_attempt_at_ms to now and updated_at_ms no
+// lower, so the delay starts over. SQLite evaluates every SET expression
+// against the row as it was.
+func setAsideOutboxRow(
+	ctx context.Context,
+	tx *sql.Tx,
+	id string,
+	cause error,
+	nowMS int64,
+) (int64, error) {
+	firstMS, maxMS := leaseRetryDelay.Milliseconds(), maxLeaseRetryDelay.Milliseconds()
+	var retryAtMS int64
+	err := tx.QueryRowContext(ctx, `
+		UPDATE outbox
+		SET state = 'not_dispatched',
+			error_class = ?,
+			error_code = ?,
+			error_detail = ?,
+			next_attempt_at_ms = ? + CASE
+				WHEN error_code = ? AND next_attempt_at_ms > updated_at_ms
+					THEN MIN(MAX(2 * (next_attempt_at_ms - updated_at_ms), ?), ?)
+				ELSE ?
+			END,
+			updated_at_ms = MAX(updated_at_ms, ?)
+		WHERE outbox_id = ?
+		  AND scheduled_for_ms <= ?
+		  AND state IN ('queued', 'not_dispatched')
+		  AND (next_attempt_at_ms IS NULL OR next_attempt_at_ms <= ?)
+		  AND (lease_expires_at_ms IS NULL OR lease_expires_at_ms <= ?)
+		RETURNING next_attempt_at_ms
+	`,
+		string(bridge.FailureTransient),
+		LeaseFailedCode,
+		cause.Error(),
+		nowMS,
+		LeaseFailedCode,
+		firstMS,
+		maxMS,
+		firstMS,
+		nowMS,
+		id,
+		nowMS,
+		nowMS,
+		nowMS,
+	).Scan(&retryAtMS)
+	if errors.Is(err, sql.ErrNoRows) {
+		err = errOutboxRowUnchanged
+	}
+	if err != nil {
+		return 0, fmt.Errorf("set aside outbox item %q: %w", id, err)
+	}
+	return retryAtMS, nil
+}
+
+// isRowLeaseFailure reports whether err, from leasing or setting aside one due
+// row, belongs to that row rather than to the store: SQLite refused the write
+// as a constraint the row cannot meet (CHECK, NOT NULL, STRICT type, a
+// trigger's RAISE) or a value of the wrong type (SQLITE_MISMATCH) or size
+// (SQLITE_TOOBIG), a trigger skipped the write, or the row's stored values do
+// not read back. Busy, locked, I/O, corruption, an interrupted statement and a
+// canceled context are the store's.
+func isRowLeaseFailure(err error) bool {
+	if errors.Is(err, errOutboxRowUnreadable) || errors.Is(err, errOutboxRowUnchanged) {
+		return true
+	}
+	code, ok := sqliteErrorCode(err)
+	if !ok {
+		return false
+	}
+	switch code & 0xff {
+	case sqliteConstraintCode, sqliteMismatchCode, sqliteTooBigCode:
+		return true
+	default:
+		return false
+	}
 }
 
 // MarkTransportCalled durably crosses the boundary after which an unknown

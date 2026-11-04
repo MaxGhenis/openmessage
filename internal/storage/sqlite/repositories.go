@@ -11,7 +11,9 @@ import (
 )
 
 const (
+	sqliteTooBigCode               = 18
 	sqliteConstraintCode           = 19
+	sqliteMismatchCode             = 20
 	sqliteConstraintForeignKeyCode = 787
 	sqliteConstraintPrimaryKeyCode = 1555
 )
