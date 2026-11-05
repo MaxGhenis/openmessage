@@ -4,7 +4,8 @@
   "scripts": {
     "dev": "next dev",
     "build": "next build",
-    "start": "next start"
+    "start": "next start",
+    "test": "node --test lib/public-writes.test.mjs"
   },
   "dependencies": {
     "@vercel/blob": "^2.3.3",
