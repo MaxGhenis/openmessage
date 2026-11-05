@@ -166,19 +166,19 @@ first NUL, so values that differ after one would match. Threads that share a
 time come in conversation ID order in both stores. The tool asks the serving
 store once for all the lines a name's cards and threads give
 (`SearchConversationsByPhoneLines`) and once for all the other values
-(`SearchConversationsByAddresses`). Each batch returns the newest of what the
-search for each value returns, and if a batch fails, the tool runs those
-searches. `ListContactsFromConversations` reads legacy threads newest first
-through the partial index `idx_conversations_newest_first` and stops at its
-limit. The route tool ignores the
-account's owner, whom most threads list: a thread that a query matches only
-through the owner's entry or the owner's own messages gives no route. v2's
-conversation search skips the owner's identity. The legacy search skips
-participant entries that carry an `is_me` or `isMe` flag and matches only
-incoming messages' senders. Both skip the owner before their limit and, like
-the address-book lookup, match `%` and `_` literally, but an owner's entry
-without the flag still matches. In client mode the route tool asks the daemon
-whether WhatsApp and Signal can send.
+(`SearchConversationsByAddresses`), or runs the single search when there's only
+one. Each batch returns the newest of what the search for each value returns,
+and if a batch fails, the tool runs those searches.
+`ListContactsFromConversations` reads legacy threads newest first from the
+covering partial index `idx_conversations_newest_first` and stops at its limit.
+The route tool ignores the account's owner, whom most threads list: a thread
+that a query matches only through the owner's entry or the owner's own messages
+gives no route. v2's conversation search skips the owner's identity. The legacy
+search skips participant entries that carry an `is_me` or `isMe` flag and
+matches only incoming messages' senders. Both skip the owner before their limit
+and, like the address-book lookup, match `%` and `_` literally, but an owner's
+entry without the flag still matches. In client mode the route tool asks the
+daemon whether WhatsApp and Signal can send.
 The client opens the store via `app.NewClient`, which skips the startup repair
 sweeps — those stay daemon-owned, so N concurrent sessions don't each burst
 repair writes into the live `messages.db`.

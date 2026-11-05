@@ -1042,7 +1042,8 @@ running app:
   The tool asks the serving store once for all of a name's lines
   (`SearchConversationsByPhoneLines`) and once for all its other values
   (`SearchConversationsByAddresses`), where it used to run a search for each,
-  up to 160 at the default limit. Each batch returns the newest of what the
+  up to 160 at the default limit. A lone value goes to its single search, which
+  costs less than a batch of one. Each batch returns the newest of what the
   search for each value returns: every search matches before its limit, so the
   newest of their hits are the newest threads that any of them match. If a
   batch fails, the tool runs the search for each value.
@@ -1050,11 +1051,11 @@ running app:
   number of threads that yield none, and matches what an entry says, not its
   JSON text: `R&D` finds R&D Desk, whose & Go's encoder writes as an escape,
   and like `LIKE` and `lower()` it ignores only ASCII case, so `ÁNGEL` finds
-  Ángel Ruiz but `ángel` doesn't. It reads threads newest first through the
-  partial index `idx_conversations_newest_first` and stops where its loop
-  stops. Sorting every thread that passed its prefilter first spilled to disk
-  at ten times the live store's size; a store without the index still sorts
-  them. Threads that share a time come in
+  Ángel Ruiz but `ángel` doesn't. It reads threads newest first from the
+  covering partial index `idx_conversations_newest_first` and stops where its
+  loop stops. Sorting every thread that passed its prefilter first spilled to
+  disk at ten times the live store's size; a store without the index still
+  sorts them. Threads that share a time come in
   conversation ID order in both stores' searches and in this list, so a limit
   keeps the same threads whichever store serves the reads. An entry that holds
   the owner's name or number without the flag still matches: the WhatsApp text
