@@ -169,9 +169,10 @@ recipient's one-to-one thread, and for the owner's own number it sends nothing
 and says so. One rule in `internal/db/owner.go` serves the legacy searches and
 `send_message`. The searches never read a participants list with SQLite's JSON
 reader: two registered functions take each list whole, as a BLOB (the driver
-cuts TEXT at its first NUL), and read it in Go. Each reads every element of a
-list on its own and takes the owner's lines from every thread. In client mode
-the route tool asks the daemon whether WhatsApp and Signal can send.
+cuts TEXT at its first NUL), and read it in Go. The searches read every
+element of a list on its own and take the owner's lines from every thread. In
+client mode the route tool asks the daemon whether WhatsApp and Signal can
+send.
 The client opens the store via `app.NewClient`, which skips the startup repair
 sweeps — those stay daemon-owned, so N concurrent sessions don't each burst
 repair writes into the live `messages.db`.

@@ -1024,16 +1024,17 @@ running app:
   encoding/json reads 10,000 deep and rejects bytes after a NUL. Two registered
   functions take each list whole, as a BLOB, since the driver cuts a TEXT
   argument at its first NUL, and read it in Go, so a repeated key counts with
-  its last value in all four. Each value reaches the Go matcher as a BLOB too.
-  The keys of the owner's lines (`phoneline.LineKeys`) go into an index that
+  its last value in all four. The line search passes each value to the Go
+  matcher as a BLOB too. The keys of the owner's lines (`phoneline.LineKeys`)
+  go into an index that
   SQLite builds once per query, and an entry's owner test looks up at most ten
   keys there, however many lines the owner has. The rule names any object entry
   that carries `is_me` or `isMe` set to JSON true, and any entry, a bare
   string included, in any thread, on the phone line of a flagged entry whose
   number reads as a phone number or a WhatsApp JID of one: the line is the
   number's `phoneline.Line`, and an entry sits on it when `phoneline.Match`
-  says so.
-  So the owner's WhatsApp JID sits on the owner's line, while a flagged
+  says so. So the owner's WhatsApp JID sits on the owner's line, while a
+  flagged
   WhatsApp LID marks no line, and a `tel:` URI or an email address that holds
   the owner's digits sits on none. The rule reads each element of a
   participants list on its own, so an odd element hides no one beside it.
@@ -1053,8 +1054,8 @@ running app:
   there once, as a whole address in the serving store. Such values include SMS
   short codes, Signal UUIDs and email addresses, which the legacy Google Chat
   importer files as participants' numbers. That lookup
-  (`SearchConversationsByAddress`) ignores only ASCII letters' case and
-  compares every other byte, a NUL included, where SQLite's `NOCASE` stops
+  (`SearchConversationsByAddress`) lowers ASCII letters on both sides and
+  then compares every byte, NULs included, where SQLite's `NOCASE` stops
   comparing at a NUL. A longer value that holds the one it looks up
   (`other-support@example.com` for `support@example.com`, `+12025550142` for
   the short code `55501`), a name and a title match nothing. A search for the
@@ -1072,11 +1073,10 @@ running app:
   matches: the WhatsApp text importer lists every sender, the owner included,
   by name alone. `send_message` with platform `sms` skips the same entries as
   the legacy searches when it picks the recipient's one-to-one SMS thread,
-  and refuses the owner's own number: it sends nothing
-  and says so. Without the rule, the owner's number matched the owner's entry
-  in every thread, so a send to it went to the newest one-to-one SMS thread,
-  which belonged to someone else.
-  Before the fix for the 2026-11-03 (UTC) incident,
+  and refuses the owner's own number: it sends nothing and says so. Without
+  the rule, the owner's number matched the owner's entry in every thread, so
+  a send to it went to the newest one-to-one SMS thread, which belonged to
+  someone else. Before the fix for the 2026-11-03 (UTC) incident,
   `resolve_contact_routes` read the legacy store on a v2-primary install and
   handed out Google thread numbers, which the outbox refused with a bare 404
   `not found`, while `send_message` by phone number worked. In-process
