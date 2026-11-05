@@ -367,7 +367,7 @@ func TestSearchConversationsByAddressReadsListsAsSendMessageDoes(t *testing.T) {
 		&Conversation{ConversationID: "huge", Name: "Huge", SourcePlatform: "gchat", LastMessageTS: 6000,
 			Participants: `[{"id":1e400,"name":"Hugh","email":"hugh@example.com"}]`},
 		&Conversation{ConversationID: "escaped-key", Name: "Escaped key", SourcePlatform: "gchat", LastMessageTS: 7000,
-			Participants: `[{"name":"Esme","email":"esme@example.com"}]`},
+			Participants: `[{"name":"Esme","\u0065mail":"esme@example.com"}]`},
 	)
 	for _, test := range []struct{ address, want string }{
 		{"dee@example.com", "[deep]"},
