@@ -17,7 +17,7 @@ import (
 // phoneLineModel is a reference for SearchConversationsByPhoneLine. A thread
 // is on a line when phonelinetest.MatchFirst, which states phoneline's rule
 // with regular expressions, finds the line in the number (or, without one,
-// the phone) of a participant entry not flagged as the owner's, where only
+// the phone) of a participant entry without the owner's flag, where only
 // text counts, in a bare string entry, or in the sender number of an
 // incoming message. An entry carries the owner's flag when its is_me or isMe
 // holds JSON true. Hits come newest first, then in conversation ID order, up
@@ -28,7 +28,7 @@ type phoneLineModel struct {
 }
 
 // onLine reports how conversation is on line: at all, through an incoming
-// sender alone, or only through entries flagged as the owner's.
+// sender alone, or only through entries with the owner's flag.
 func (m phoneLineModel) onLine(conversation *Conversation, line string) (hit, senderOnly, ownerOnly bool) {
 	byEntry, byOwner := false, false
 	var elements []json.RawMessage
@@ -87,10 +87,10 @@ func (m phoneLineModel) search(line string, limit int) []string {
 	return ids
 }
 
-// heldOnlyByIdentifiers reports whether conversation is off line although a
-// value in it, one that is no phone number such as an email address, holds
-// digits that end with the line's: a thread that matching digits alone
-// would put on the line.
+// heldOnlyByIdentifiers reports whether conversation stays off the line
+// although a value in it that reads as no phone number, such as an email
+// address, holds digits that end with the line's: a thread that matching
+// digits alone would put on the line.
 func (m phoneLineModel) heldOnlyByIdentifiers(conversation *Conversation, line string) bool {
 	if hit, _, _ := m.onLine(conversation, line); hit {
 		return false
@@ -127,7 +127,7 @@ func (m phoneLineModel) heldOnlyByIdentifiers(conversation *Conversation, line s
 
 // phoneLineForm writes a number's digits as an address book or a transport
 // might: E.164, national with separators, or with a stray prefix, or as a
-// tel: URI, which is no written number.
+// tel: URI, which reads as no written number.
 func phoneLineForm(random *rand.Rand, digits string) string {
 	switch random.Intn(5) {
 	case 0:
@@ -157,22 +157,23 @@ func phoneLineForm(random *rand.Rand, digits string) string {
 // number, share only its last seven, or are too short to name a line; some
 // entries carry the number under phone, a blank number, or a number that
 // isn't text; identifiers that are no phone number, such as an email address,
-// a Signal UUID or a WhatsApp LID, hold targets' digits; the owner's entries
-// carry the owner's number flagged, unflagged or with a flag that isn't JSON
-// true, and the owner sends messages too; and threads often share a time.
-// So, as invariants, a thread is on a line only through someone other than
-// the flagged owner whose number, written as one, ends with the line's
-// digits (or the line ends with theirs), an incoming sender whom the roster
-// lacks counts, the limit applies after matching, so threads whose numbers
-// only contain the digits never crowd out one on the line, and threads that
-// share a time come in conversation ID order.
+// a Signal UUID, a WhatsApp LID or a number that a NUL ends early, hold
+// targets' digits; the owner's entries carry the owner's number flagged,
+// unflagged or with a flag that isn't JSON true, and the owner sends messages
+// too; and threads often share a time. So, as invariants, a thread joins a
+// line only through someone other than the flagged owner whose number reads
+// as one and ends with the line's digits (or the line ends with theirs), an
+// incoming sender whom the roster lacks counts, the limit applies after
+// matching, so threads whose numbers only contain the digits never crowd out
+// one on the line, and threads that share a time come in conversation ID
+// order.
 func TestSearchConversationsByPhoneLineAgreesWithTheLineModel(t *testing.T) {
 	targets := []string{"12025550123", "13035550147", "15555550199"}
 	owner := "15550009999"
 	decoys := []string{"447555012399", "4412025550123", "13035550123", "5550123", "550123", "12025550124"}
 	// identifiers hold a target's digits but are no phone number, except a
 	// WhatsApp JID on the phone-number server, which names its user's line.
-	identifiers := []string{"alice12025550123@example.com", "abcdefab-abcd-abcd-abcd-a13035550147", "15555550199@lid", "users/12025550123", "+99999912025550123", "13035550147@s.whatsapp.net"}
+	identifiers := []string{"alice12025550123@example.com", "abcdefab-abcd-abcd-abcd-a13035550147", "15555550199@lid", "users/12025550123", "+99999912025550123", "13035550147@s.whatsapp.net", "+12025550123\x00x"}
 	exercised := map[string]int{}
 
 	property := func(seed int64) bool {
