@@ -22,6 +22,7 @@ type resilienceFixture struct {
 	sender     *scriptedTextSender
 	submission Submission
 	failures   chan FailedDispatchPass
+	leases     chan FailedLease
 
 	stopped chan struct{}
 	runErr  error
@@ -53,6 +54,7 @@ func newResilienceFixture(t *testing.T, key, trigger string) *resilienceFixture 
 		sender:     sender,
 		submission: submission,
 		failures:   make(chan FailedDispatchPass, 64),
+		leases:     make(chan FailedLease, 64),
 		stopped:    make(chan struct{}),
 	}
 	service.OnPassFailure(func(err error, pass FailedDispatchPass) {
@@ -61,6 +63,12 @@ func newResilienceFixture(t *testing.T, key, trigger string) *resilienceFixture 
 		}
 		select {
 		case f.failures <- pass:
+		default:
+		}
+	})
+	service.OnLeaseFailure(func(lease FailedLease) {
+		select {
+		case f.leases <- lease:
 		default:
 		}
 	})
@@ -130,12 +138,14 @@ func (f *resilienceFixture) confirmed(t *testing.T) {
 
 // One failed lease must not stop the dispatcher. On 2026-11-03 LeaseDue's
 // UPDATE failed a CHECK, Run returned the error, and no send left the outbox
-// until the app restarted. The trigger fails every lease until it is dropped.
+// until the app restarted. Here the trigger fails every write to the text
+// while it is due, so the store can neither lease it nor set it aside, and
+// every pass fails until the test drops the trigger.
 func TestRunKeepsDispatchingAfterAFailedLease(t *testing.T) {
 	f := newResilienceFixture(t, "key-failed-lease", `
 		CREATE TRIGGER fail_lease
-		BEFORE UPDATE OF state ON outbox
-		WHEN NEW.state = 'dispatching'
+		BEFORE UPDATE ON outbox
+		WHEN OLD.state IN ('queued', 'not_dispatched')
 		BEGIN
 			SELECT RAISE(ABORT, 'injected lease failure');
 		END
@@ -154,10 +164,17 @@ func TestRunKeepsDispatchingAfterAFailedLease(t *testing.T) {
 		if pass.RetryAtMS <= pass.AtMS {
 			t.Fatalf("failed pass %d retries at %d, not after it failed at %d", want, pass.RetryAtMS, pass.AtMS)
 		}
+		lease := <-f.leases
+		if lease.OutboxID != f.submission.OutboxID || lease.RetryAtMS != 0 ||
+			!strings.Contains(lease.Error, "injected lease failure") ||
+			!strings.Contains(lease.SetAsideError, "injected lease failure") {
+			t.Fatalf("failed lease %d = %+v, want the text neither leased nor set aside", want, lease)
+		}
 	}
 	health := f.service.DispatchHealth()
-	if health.FailedPasses < 2 || health.ConsecutiveFailedPasses < 2 || health.LastFailedPass == nil {
-		t.Fatalf("health while leases fail = %+v, want two or more failed passes in a row", health)
+	if health.FailedPasses < 2 || health.ConsecutiveFailedPasses < 2 || health.LastFailedPass == nil ||
+		health.FailedLeases < 2 || health.LastFailedLease == nil || health.LastFailedLease.SetAsideError == "" {
+		t.Fatalf("health while leases fail = %+v, want two or more failed passes and leases in a row", health)
 	}
 
 	f.dropTrigger(t, "fail_lease")
@@ -171,6 +188,66 @@ func TestRunKeepsDispatchingAfterAFailedLease(t *testing.T) {
 	recovered := f.service.DispatchHealth()
 	if recovered.ConsecutiveFailedPasses != 0 || recovered.FailedPasses < health.FailedPasses || recovered.LastFailedPass == nil {
 		t.Fatalf("health after recovery = %+v, want no current failures and the earlier ones kept", recovered)
+	}
+}
+
+// The store sets aside a text whose lease fails on its own row, to retry,
+// and the pass that met it does not fail. Run sends it once its retry time
+// comes and its lease works.
+func TestRunSetsAsideARowWhoseLeaseFails(t *testing.T) {
+	f := newResilienceFixture(t, "key-set-aside", `
+		CREATE TRIGGER fail_lease
+		BEFORE UPDATE OF state ON outbox
+		WHEN NEW.state = 'dispatching'
+		BEGIN
+			SELECT RAISE(ABORT, 'injected lease failure');
+		END
+	`)
+	var lease FailedLease
+	select {
+	case lease = <-f.leases:
+	case <-f.stopped:
+		t.Fatalf("Run() returned %v before the lease failed", f.runErr)
+	case <-time.After(5 * time.Second):
+		t.Fatal("no lease failed")
+	}
+	f.passEnded(t)
+	row := mustOutboxItem(t, f.service, f.submission.OutboxID)
+	if lease.OutboxID != f.submission.OutboxID || lease.SetAsideError != "" ||
+		!strings.Contains(lease.Error, "injected lease failure") ||
+		lease.RetryAtMS <= lease.AtMS || row.NextAttemptAtMS == nil || *row.NextAttemptAtMS != lease.RetryAtMS {
+		t.Fatalf("failed lease = %+v for row %+v, want it set aside until its retry time", lease, row)
+	}
+	if row.State != sqlite.OutboxNotDispatched || row.AttemptCount != 0 || row.TransportCalledAtMS != nil ||
+		row.ErrorClass == nil || *row.ErrorClass != string(bridge.FailureTransient) ||
+		row.ErrorCode == nil || *row.ErrorCode != sqlite.LeaseFailedCode {
+		t.Fatalf("row whose lease failed = %+v, want not_dispatched, transient, %q, never called", row, sqlite.LeaseFailedCode)
+	}
+	delivery, err := f.service.Get(context.Background(), f.submission.OutboxID)
+	if err != nil {
+		t.Fatalf("Get(): %v", err)
+	}
+	if delivery.State != OutboxNotDispatched || delivery.ErrorClass != string(bridge.FailureTransient) ||
+		delivery.ErrorCode != sqlite.LeaseFailedCode {
+		t.Fatalf("delivery = %+v, want not dispatched, transient, with the lease error", delivery)
+	}
+	health := f.service.DispatchHealth()
+	if health.FailedLeases != 1 || health.LastFailedLease == nil || *health.LastFailedLease != lease ||
+		health.FailedPasses != 0 || health.ConsecutiveFailedPasses != 0 {
+		t.Fatalf("health after the set-aside = %+v, want one failed lease and no failed pass", health)
+	}
+	if got := f.sender.requestCount(); got != 0 {
+		t.Fatalf("transport requests = %d, want 0", got)
+	}
+
+	f.dropTrigger(t, "fail_lease")
+	f.clock.Advance(time.UnixMilli(lease.RetryAtMS).Sub(f.clock.Now()))
+	f.confirmed(t)
+	if got := f.sender.requestCount(); got != 1 {
+		t.Fatalf("transport requests = %d, want 1", got)
+	}
+	if health := f.service.DispatchHealth(); health.FailedLeases != 1 || health.FailedPasses != 0 {
+		t.Fatalf("health after the retry = %+v, want the one failed lease and no failed pass", health)
 	}
 }
 
@@ -229,7 +306,9 @@ func TestRunRecoversALeaseItsFailedPassLeftBehind(t *testing.T) {
 
 // A failed pass waits out its backoff even when a submission wakes the
 // dispatcher. A wake that ended the wait would let a steady stream of sends
-// turn a storage fault that persists into a tight retry loop.
+// turn a storage fault that persists into a tight retry loop. The trigger
+// fails every write to a due row, so the pass can neither lease the text nor
+// set it aside, and fails.
 func TestRunWaitsOutItsBackoffWhenASubmissionWakesIt(t *testing.T) {
 	clock := &waitProbeClock{
 		splitReadClock: &splitReadClock{now: messagingTestTime},
@@ -242,8 +321,8 @@ func TestRunWaitsOutItsBackoffWhenASubmissionWakesIt(t *testing.T) {
 	service.pollDelay, service.maxPollDelay = time.Hour, 8*time.Hour
 	if _, err := raw.ExecContext(context.Background(), `
 		CREATE TRIGGER fail_lease
-		BEFORE UPDATE OF state ON outbox
-		WHEN NEW.state = 'dispatching'
+		BEFORE UPDATE ON outbox
+		WHEN OLD.state IN ('queued', 'not_dispatched')
 		BEGIN
 			SELECT RAISE(ABORT, 'injected lease failure');
 		END

@@ -65,6 +65,13 @@ type DispatchHealth struct {
 	ConsecutiveFailedPasses int64 `json:"consecutive_failed_passes"`
 	// LastFailedPass is the most recent failed pass, if any.
 	LastFailedPass *FailedDispatchPass `json:"last_failed_pass,omitempty"`
+	// FailedLeases counts the leases that failed on their own row since the
+	// service started; a row whose lease fails in three passes counts three
+	// times. The store set each such row aside to retry, or left it due when
+	// that failed too; either way it leased the rows behind it.
+	FailedLeases int64 `json:"failed_leases"`
+	// LastFailedLease is the most recent failed lease, if any.
+	LastFailedLease *FailedLease `json:"last_failed_lease,omitempty"`
 }
 
 // InFlightTransportCall describes the transport call in progress.
@@ -180,11 +187,12 @@ func (t *transportCalls) health(now time.Time) DispatchHealth {
 	return health
 }
 
-// DispatchHealth snapshots the dispatch loop's transport calls and failed
-// passes.
+// DispatchHealth snapshots the dispatch loop's transport calls, failed passes
+// and failed leases.
 func (s *MessageService) DispatchHealth() DispatchHealth {
 	health := s.transport.health(s.clock.Now())
 	s.passes.report(&health)
+	s.leaseFailures.report(&health)
 	return health
 }
 

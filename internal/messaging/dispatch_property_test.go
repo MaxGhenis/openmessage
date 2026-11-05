@@ -24,7 +24,8 @@ type dispatchFault int
 
 const (
 	noDispatchFault dispatchFault = iota
-	// leaseDispatchFault fails LeaseDue's UPDATE.
+	// leaseDispatchFault fails LeaseDueBatch's lease UPDATE, so the store sets
+	// the row aside to retry.
 	leaseDispatchFault
 	// markCalledDispatchFault fails MarkTransportCalled, before the call.
 	markCalledDispatchFault
@@ -94,14 +95,17 @@ func (dispatchScript) Generate(r *rand.Rand, _ int) reflect.Value {
 //     below its value before the pass;
 //   - a pass without a fault never fails, and leases and sends every row
 //     that is due when it runs;
+//   - a failed lease never fails its pass: the store sets the due row aside,
+//     uncalled, until a later retry;
 //   - Run keeps running after a failed pass: it reports the failure to
 //     OnPassFailure and DispatchHealth, waits the poll delay doubled for each
 //     earlier failure in the same run of failures, up to the longest poll
 //     delay, and passes again.
 //
-// Once the faults stop and leases expire, the text must be confirmed, or
-// uncertain when a failure followed its transport call, after exactly one
-// transport request, and Run must return only when its context is canceled.
+// Once the faults stop, leases expire and retries come due, the text must be
+// confirmed, or uncertain when a failure followed its transport call, after
+// exactly one transport request, and Run must return only when its context is
+// canceled.
 //
 // Each history sends one text. TestOutboxWritesNeverStampUpdatedAtBelowCreatedAt
 // and TestStoreWritesNeverStampUpdatedAtBelowCreatedAt (internal/storage/sqlite)
@@ -227,11 +231,16 @@ func runDispatchScript(t *testing.T, script dispatchScript) (err error) {
 		if err != nil {
 			return fmt.Errorf("pass %d: %w", index, err)
 		}
-		if passErr != nil && (pass.Fault == noDispatchFault || !strings.Contains(passErr.Error(), injectedDispatchFault)) {
-			return fmt.Errorf("pass %d at %d with fault %d failed for another reason: %w", index, now.UnixMilli(), pass.Fault, passErr)
+		if passErr != nil && (pass.Fault == noDispatchFault || pass.Fault == leaseDispatchFault ||
+			!strings.Contains(passErr.Error(), injectedDispatchFault)) {
+			return fmt.Errorf("pass %d at %d with fault %d failed: %w", index, now.UnixMilli(), pass.Fault, passErr)
 		}
 		if pass.Fault == noDispatchFault && dueAt(before, now) && after.State != sqlite.OutboxConfirmed {
 			return fmt.Errorf("pass %d at %d left a due row %+v as %+v", index, now.UnixMilli(), before, after)
+		}
+		if pass.Fault == leaseDispatchFault && dueAt(before, now) && !setAsideAfterLeaseFailure(after, now) {
+			return fmt.Errorf("pass %d at %d left a due row whose lease failed %+v as %+v, want it set aside",
+				index, now.UnixMilli(), before, after)
 		}
 		if passErr != nil && sender.requestCount() > requestsBefore {
 			postCallFailure = true
@@ -253,11 +262,15 @@ func runDispatchScript(t *testing.T, script dispatchScript) (err error) {
 		}
 	}
 
-	// The faults stop and every lease expires.
+	// The faults stop, every lease expires and every retry comes due.
 	if err := setDispatchFault(raw, noDispatchFault); err != nil {
 		return err
 	}
-	now = latest.Add(service.leaseTime + time.Second)
+	settled, err := service.outbox.FindByID(ctx, submission.OutboxID)
+	if err != nil {
+		return fmt.Errorf("read row after the faults stopped: %w", err)
+	}
+	now = settleTime(latest.Add(service.leaseTime), settled).Add(time.Second)
 	clock.set(now, 0)
 	for index := range 2 {
 		rows, err := updatedAtByRow(raw)
@@ -501,6 +514,28 @@ func dueAt(item sqlite.OutboxItem, now time.Time) bool {
 	default:
 		return false
 	}
+}
+
+// setAsideAfterLeaseFailure reports whether item is how LeaseDueBatch leaves a
+// due row whose lease failed at now: not dispatched with the lease error,
+// due again later, its transport call never started.
+func setAsideAfterLeaseFailure(item sqlite.OutboxItem, now time.Time) bool {
+	return item.State == sqlite.OutboxNotDispatched &&
+		item.ErrorClass != nil && *item.ErrorClass == string(bridge.FailureTransient) &&
+		item.ErrorCode != nil && *item.ErrorCode == sqlite.LeaseFailedCode &&
+		item.NextAttemptAtMS != nil && *item.NextAttemptAtMS > now.UnixMilli() &&
+		item.TransportCalledAtMS == nil && item.LeaseToken == nil
+}
+
+// settleTime returns the later of earliest and the time every row in items
+// comes due again.
+func settleTime(earliest time.Time, items ...sqlite.OutboxItem) time.Time {
+	for _, item := range items {
+		if item.NextAttemptAtMS != nil && time.UnixMilli(*item.NextAttemptAtMS).After(earliest) {
+			earliest = time.UnixMilli(*item.NextAttemptAtMS)
+		}
+	}
+	return earliest
 }
 
 func setDispatchFault(raw *sql.DB, fault dispatchFault) error {
