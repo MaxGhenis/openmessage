@@ -425,11 +425,12 @@ func (s *Store) SearchConversationsByPhoneLine(line string, limit int) ([]*Conve
 
 // phoneLineSearchSQL is SearchConversationsByPhoneLine's query. match writes
 // a call of the SQL function that tests values against the line, as
-// phoneline.SQL does. The query takes the line three times, then the limit. A thread can hold thousands of messages from
-// a few numbers, so match tests each distinct sender number once, in
-// sender_numbers, and the messages from the numbers on the line then give
-// their threads. SQLite pushes no WHERE term down into a MATERIALIZED CTE,
-// so match never reaches the scan of messages.
+// phoneline.SQL does. The query takes the line three times, then the limit.
+// A thread can hold thousands of messages from a few numbers, so match tests
+// each distinct sender number once, in sender_numbers, and the messages from
+// the numbers on the line then give their threads. SQLite pushes no WHERE
+// term down into a MATERIALIZED CTE, so match never reaches the scan of
+// messages.
 func phoneLineSearchSQL(match func(args ...string) string) string {
 	return `
 		WITH sender_numbers AS MATERIALIZED (
