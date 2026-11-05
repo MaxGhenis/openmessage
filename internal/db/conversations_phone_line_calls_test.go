@@ -4,6 +4,7 @@ import (
 	"database/sql/driver"
 	"fmt"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -17,6 +18,16 @@ import (
 const countedPhoneLineMatch = "om_test_counted_phone_line_match"
 
 var countedPhoneLineMatches atomic.Int64
+
+// countedPhoneLineMatchSQL writes a call of countedPhoneLineMatch, casting
+// each argument to BLOB as phoneline.SQL does.
+func countedPhoneLineMatchSQL(args ...string) string {
+	cast := make([]string, len(args))
+	for index, arg := range args {
+		cast[index] = "CAST(" + arg + " AS BLOB)"
+	}
+	return countedPhoneLineMatch + "(" + strings.Join(cast, ", ") + ")"
+}
 
 func init() {
 	sqlite.MustRegisterDeterministicScalarFunction(countedPhoneLineMatch, -1, func(_ *sqlite.FunctionContext, args []driver.Value) (driver.Value, error) {
@@ -64,7 +75,7 @@ func TestSearchConversationsByPhoneLineCallsTheMatcherOncePerSenderNumber(t *tes
 	seedSearchStore(t, store, conversations, messages, nil)
 
 	countedPhoneLineMatches.Store(0)
-	rows, err := store.db.Query(phoneLineSearchSQL(countedPhoneLineMatch), "2025550123", "2025550123", "2025550123", 10)
+	rows, err := store.db.Query(phoneLineSearchSQL(countedPhoneLineMatchSQL), "2025550123", "2025550123", "2025550123", 10)
 	if err != nil {
 		t.Fatalf("query: %v", err)
 	}

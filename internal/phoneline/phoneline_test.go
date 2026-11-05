@@ -126,10 +126,10 @@ func numberForm(random *rand.Rand, digits string) string {
 	return b.String()
 }
 
-// identifierForm hides digits in an identifier that is no phone number: an
-// email address, a Signal UUID, a WhatsApp LID or group, a Google Chat
-// user, a legacy placeholder, a URI, a number with an extension, or a name
-// with a number in it.
+// identifierForm hides digits in an identifier that reads as no phone
+// number: an email address, a Signal UUID, a WhatsApp LID or group, a
+// Google Chat user, a legacy placeholder, a URI, a number with an
+// extension, or a name with a number in it.
 func identifierForm(random *rand.Rand, digits string) string {
 	switch random.Intn(10) {
 	case 0:
@@ -222,7 +222,9 @@ func TestMatchProperties(t *testing.T) {
 			t.Logf("seed %d: Match(%q, %q) holds for digits inside the number", seed, line, inside)
 			return false
 		}
-		for _, value := range []string{written, jid, hidden, inside, numberForm(random, randomDigits(random, random.Intn(18))), noiseForm(random), noiseForm(random) + national} {
+		// A NUL ends a value early only for code that reads it as a C string.
+		cut := written + "\x00" + noiseForm(random)
+		for _, value := range []string{written, jid, hidden, inside, cut, numberForm(random, randomDigits(random, random.Intn(18))), noiseForm(random), noiseForm(random) + national} {
 			if got, want := Match(line, value), phonelinetest.Match(line, value); got != want {
 				t.Logf("seed %d: Match(%q, %q) = %v, phonelinetest says %v", seed, line, value, got, want)
 				return false
@@ -231,13 +233,16 @@ func TestMatchProperties(t *testing.T) {
 		values := []any{line}
 		strs := []string{}
 		for count := 1 + random.Intn(3); count > 0; count-- {
-			value := []string{"", "  ", written, jid, hidden, inside, noiseForm(random), numberForm(random, randomDigits(random, random.Intn(14)))}[random.Intn(8)]
+			value := []string{"", "  ", written, jid, hidden, inside, cut, noiseForm(random), numberForm(random, randomDigits(random, random.Intn(14)))}[random.Intn(9)]
+			if value == cut {
+				exercised["a number that a NUL ends early"]++
+			}
 			values = append(values, value)
 			strs = append(strs, value)
 		}
-		placeholders := strings.TrimSuffix(strings.Repeat("?, ", len(values)), ", ")
+		placeholders := strings.Split(strings.Repeat("?", len(values)), "")
 		var fromSQL int64
-		if err := conn.QueryRow("SELECT "+SQLMatch+"("+placeholders+")", values...).Scan(&fromSQL); err != nil {
+		if err := conn.QueryRow("SELECT "+SQL(placeholders...), values...).Scan(&fromSQL); err != nil {
 			t.Fatalf("query %s: %v", SQLMatch, err)
 		}
 		if fromGo := MatchFirst(line, strs...); fromGo != (fromSQL == 1) {
@@ -258,7 +263,7 @@ func TestMatchProperties(t *testing.T) {
 	if err := quick.Check(property, &quick.Config{MaxCount: 400, Rand: rand.New(rand.NewSource(20261103))}); err != nil {
 		t.Fatal(err)
 	}
-	for _, path := range []string{"a written form of a line", "an identifier that holds a line's digits", "an SQL match", "an SQL mismatch"} {
+	for _, path := range []string{"a written form of a line", "an identifier that holds a line's digits", "a number that a NUL ends early", "an SQL match", "an SQL mismatch"} {
 		if exercised[path] == 0 {
 			t.Errorf("the property never drew %s (drew %v)", path, exercised)
 		}
@@ -270,5 +275,12 @@ func TestMatchProperties(t *testing.T) {
 	var blob int64
 	if err := conn.QueryRow("SELECT "+SQLMatch+"(?, CAST(? AS BLOB))", "2025550123", "+12025550123").Scan(&blob); err != nil || blob != 1 {
 		t.Errorf("a BLOB must count as its text: got %d, %v", blob, err)
+	}
+	// The driver hands a Go function a TEXT argument only up to its first
+	// NUL, so a bare call reads this value as a number. SQL casts each
+	// argument to BLOB, and the matcher then sees every byte.
+	var bare, cast int64
+	if err := conn.QueryRow("SELECT "+SQLMatch+"(?, ?), "+SQL("?", "?"), "2025550123", "+12025550123\x00x", "2025550123", "+12025550123\x00x").Scan(&bare, &cast); err != nil || bare != 1 || cast != 0 {
+		t.Errorf("a number that a NUL ends early: a bare call = %d and SQL = %d, want 1 and 0 (%v)", bare, cast, err)
 	}
 }

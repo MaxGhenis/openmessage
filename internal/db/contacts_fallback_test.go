@@ -7,10 +7,10 @@ import (
 	"unicode/utf8"
 )
 
-// The contacts listed in legacy threads match by what a participant entry
+// The contacts that legacy threads list match by what a participant entry
 // says, not by its JSON: Go writes &, < and > as \u0026, \u003c and \u003e,
-// and a quote as \". A name or number matches where it holds the query as
-// written, ASCII case aside, as the other searches match: SQLite's lower()
+// and a quote as \". A name or number matches where it holds the query
+// literally, ASCII case aside, as the other searches match: SQLite's lower()
 // folds only ASCII letters, so Ángel finds Ángel Ruiz and so does ÁNGEL, but
 // ángel doesn't. The owner's flagged entry names no contact.
 func TestListContactsFromConversationsMatchesWhatAnEntrySays(t *testing.T) {

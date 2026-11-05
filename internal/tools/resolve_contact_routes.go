@@ -10,6 +10,7 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 
+	"github.com/maxghenis/openmessage/internal/addressmatch"
 	"github.com/maxghenis/openmessage/internal/app"
 	"github.com/maxghenis/openmessage/internal/db"
 	"github.com/maxghenis/openmessage/internal/phoneline"
@@ -169,18 +170,18 @@ func findRouteConversations(reads readsource.ReadSource, people *db.Store, query
 		addConversation(conv)
 	}
 
-	// search finds text's conversations in reads. A phone number names its line,
-	// which both stores match as send_message matches a recipient: by the last
-	// ten digits of each value that reads as a number, or as a WhatsApp JID of
-	// one, since v2 stores numbers in E.164 form while the legacy store and
-	// address books keep them as people wrote them. A run of digits inside
-	// another number names someone else (5550123 sits inside +447555012399), and
-	// so do digits inside an email address, a Signal UUID or a name. Most
+	// search finds text's conversations in reads. A phone number names its
+	// line, which both stores match as send_message matches a recipient: by the
+	// last ten digits of each value that reads as a number, or as a WhatsApp
+	// JID of one, since v2 stores numbers in E.164 form while the legacy store
+	// and address books keep them as people wrote them. A run of digits inside
+	// another number names someone else (5550123 sits inside +447555012399),
+	// and so do digits inside an email address, a Signal UUID or a name. Most
 	// threads list the account's owner, and a thread that a query matches only
 	// through the owner says nothing about whom to send to. Both stores'
 	// searches skip the owner before their limit: v2's skips the owner's
-	// identity, and the legacy store's skips participant entries flagged as the
-	// owner's and the owner's own messages.
+	// identity, and the legacy store's skips participant entries with the
+	// owner's flag and the owner's own messages.
 	search := func(text string) ([]*db.Conversation, error) {
 		if looksLikePhoneNumber(text) {
 			return reads.SearchConversationsByPhoneLine(phoneline.Line(text), limit)
@@ -201,25 +202,28 @@ func findRouteConversations(reads readsource.ReadSource, people *db.Store, query
 
 	// lookUp finds the threads of the person a number names. A phone number
 	// names a line. Any other value names whoever holds it as a whole
-	// address, with ASCII letters' case aside: the legacy Google Chat importer
-	// files an email address as a number, SMS threads list a short code as
-	// one, and another person's address or phone number, or a title, can hold
-	// either, so a search for the text would route to them.
+	// address, with ASCII letters' case and the white space around it aside,
+	// as addressmatch.Key writes it: the legacy Google Chat importer files an
+	// email address as a number, SMS threads list a short code as one, and
+	// another person's address or phone number, or a title, can hold either,
+	// so a search for the text would route to them.
 	// searched holds each line and address that lookUp has asked reads about,
 	// so reads answer each lookup once. The address book and legacy threads
-	// often hold one person's number, each written its own way, and every
-	// form names one line. The query's own search matches every thread that
-	// an address lookup of the query would, in the same order and under the
-	// same limit, so that lookup could add only threads that newestRoutes
-	// drops, and it counts as done.
-	searched := map[string]bool{"address:" + lowerASCII(query): true}
+	// often hold one person's number, each in its own form, and every form
+	// names one line. Two values share an address key exactly when the
+	// stores' address searches can't tell them apart. The query arrives as
+	// JSON text, so it holds valid UTF-8, and its own search matches every
+	// thread that an address lookup of the query would, in the same order and
+	// under the same limit. That lookup could add only threads that
+	// newestRoutes drops, so it counts as done.
+	searched := map[string]bool{"address:" + addressmatch.Key(query): true}
 	lookUp := func(number string) {
 		number = strings.TrimSpace(number)
 		if number == "" {
 			return
 		}
 		byLine := looksLikePhoneNumber(number)
-		key := "address:" + lowerASCII(number)
+		key := "address:" + addressmatch.Key(number)
 		if byLine {
 			key = "line:" + phoneline.Line(number)
 		}
@@ -260,18 +264,6 @@ func findRouteConversations(reads readsource.ReadSource, people *db.Store, query
 		}
 	}
 	return newestRoutes(seen, limit), nil
-}
-
-// lowerASCII lowers s's ASCII letters and leaves every other byte alone, as
-// SQLite's NOCASE compares text.
-func lowerASCII(s string) string {
-	b := []byte(s)
-	for index, c := range b {
-		if c >= 'A' && c <= 'Z' {
-			b[index] = c + 'a' - 'A'
-		}
-	}
-	return string(b)
 }
 
 // newestRoutes returns the conversations in seen newest first, at most limit.
@@ -405,7 +397,7 @@ func resolveRouteBucketIdentity(conv *db.Conversation, identityIndex map[string]
 // client mode this process holds no transports, so the running app answers.
 // Asking this process instead would build its own bridges, which opens the
 // app's WhatsApp session store and starts Signal temp-dir sweeps, only to
-// report bridges that are not connected. An app that does not answer sends
+// report its own unconnected bridges. An app that does not answer sends
 // nothing.
 func routePlatformsConnected(ctx context.Context, a *app.App, options Options) (whatsApp, signal bool) {
 	if options.Daemon != nil {

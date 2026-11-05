@@ -15,12 +15,13 @@ import (
 	"github.com/maxghenis/openmessage/internal/storage/sqlite"
 )
 
-// A send names its conversation by v2 ID only. A conversation's remote ID (a
-// Google Messages thread number, a WhatsApp JID, "signal:+1…") is refused
-// before anything is queued: Google thread IDs are device-local, and a phone
-// change hands an old thread number to another person's thread (issue #177),
-// so resolving one could text the wrong person. Reads still resolve remote IDs
-// (issue #155); showing the wrong thread is recoverable, sending to it is not.
+// A send names its conversation by v2 ID only. SubmitTextV2 and SubmitMediaV2
+// refuse a conversation's remote ID (a Google Messages thread number, a
+// WhatsApp JID, "signal:+1…") before they queue anything: Google thread IDs
+// are device-local, and a phone change hands an old thread number to another
+// person's thread (issue #177), so resolving one could text the wrong person.
+// Reads still resolve remote IDs (issue #155); showing the wrong thread is
+// recoverable, sending to it is not.
 func TestSubmitV2RefusesARemoteConversationID(t *testing.T) {
 	tests := map[string]func(context.Context, NativeDeps) error{
 		"text": func(ctx context.Context, deps NativeDeps) error {
@@ -64,10 +65,10 @@ func TestSubmitV2RefusesARemoteConversationID(t *testing.T) {
 }
 
 // Invariant: a send reaches exactly the v2 conversation whose ID it names.
-// Any other key is refused with ErrUnknownConversation and queues nothing.
-// Remote IDs are drawn from the same pool as v2 IDs and accounts, so a key is
-// often one conversation's remote ID and another's v2 ID (the v2 ID must
-// win), or a remote ID under two accounts at once.
+// SubmitTextV2 refuses any other key with ErrUnknownConversation and queues
+// nothing. The test draws v2 IDs and remote IDs from one pool and accounts
+// from two, so a key is often one conversation's remote ID and another's v2
+// ID (the v2 ID must win), or a remote ID under two accounts at once.
 func TestSubmitTextV2SendsOnlyToTheConversationItsIDNames(t *testing.T) {
 	pool := []string{"2957", "3100", "c0", "c1", "c2"}
 	accounts := []string{"account-a", "account-b"}
@@ -157,8 +158,8 @@ func sqliteStoreForProperty(t *testing.T) *sqlite.Store {
 // The property above draws these collisions only now and then, and none of
 // its fewer draws under -race, so they run here every time. A key that is
 // one conversation's v2 ID and another's remote ID sends to the conversation
-// the v2 ID names. A remote ID that two accounts share, and that no
-// conversation has as its v2 ID, is refused and queues nothing.
+// the v2 ID names. SubmitTextV2 refuses a remote ID that two accounts share
+// and that no conversation has as its v2 ID, and queues nothing.
 func TestSubmitTextV2SendsToTheV2IDWhenIDsCollide(t *testing.T) {
 	type thread struct{ id, account, remote string }
 	tests := map[string]struct {

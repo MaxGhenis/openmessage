@@ -20,8 +20,25 @@ import (
 // It returns 1 when the first value that isn't blank names the phone line
 // that line, a Line, names, and 0 otherwise. TEXT and BLOB arguments compare
 // as text; NULL, INTEGER and REAL ones count as blank. Every connection the
-// "sqlite" driver opens has the function.
+// "sqlite" driver opens has the function. Call it through SQL, which keeps
+// every byte of each argument.
 const SQLMatch = "om_phone_line_match"
+
+// SQL returns an SQL expression that calls SQLMatch on args: SQL expressions
+// for the line and then the values. It casts each argument to BLOB, which
+// SQLMatch reads as text. The "sqlite" driver hands a Go function a TEXT
+// argument only up to its first NUL, so without the cast, a value such as
+// "2025550123" with a NUL and more text after it would reach the matcher as
+// a number. CAST also turns an INTEGER or REAL into its text, so each
+// argument must hold TEXT, a BLOB or NULL, as a column with TEXT affinity
+// does.
+func SQL(args ...string) string {
+	cast := make([]string, len(args))
+	for index, arg := range args {
+		cast[index] = "CAST(" + arg + " AS BLOB)"
+	}
+	return SQLMatch + "(" + strings.Join(cast, ", ") + ")"
+}
 
 func init() {
 	sqlite.MustRegisterDeterministicScalarFunction(SQLMatch, -1, func(_ *sqlite.FunctionContext, args []driver.Value) (driver.Value, error) {

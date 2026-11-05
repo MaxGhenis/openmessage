@@ -111,9 +111,9 @@ func resolveThread(store *db.Store, query string, opts threadOptions) (*threadRe
 	}
 
 	// 2. Resolve by metadata: the title, a participant entry, or the name or
-	//    number of an incoming message's sender. Entries flagged as the
-	//    account's owner's and the owner's own messages don't count, so the
-	//    owner's name or number doesn't match every thread.
+	//    number of an incoming message's sender. Entries with the owner's
+	//    flag and the owner's own messages don't count, so the owner's name or
+	//    number doesn't match every thread.
 	matches, err := store.SearchConversationsByMetadata(query, 25)
 	if err != nil {
 		return nil, fmt.Errorf("resolve conversation: %w", err)

@@ -9,7 +9,7 @@ import (
 // number, phone or email names anyone. Its keys, its flags and its IDs match
 // nothing: the demo store names its owner Me, and "me" sits inside every
 // "name" key. The search decodes JSON escapes, so R&D matches R\u0026D. A
-// bare string entry still matches as written.
+// bare string entry still matches literally.
 func TestSearchConversationsByMetadataMatchesEntryValuesNotKeys(t *testing.T) {
 	store := newTestStore(t)
 	seedSearchStore(t, store, []*Conversation{

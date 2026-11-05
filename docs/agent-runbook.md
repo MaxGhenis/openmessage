@@ -998,7 +998,7 @@ running app:
   digits-only rule could put one on someone's line.
   `send_message` follows the same rule. Its SMS lookup takes a number's own
   thread over a newer gateway thread whose address holds the digits, and its
-  recipient check takes a name followed by digits, in any script (`Мама
+  recipient check takes a name with digits after it, in any script (`Мама
   2025550123`), for a name and refuses it before anything reaches the daemon.
   On legacy reads the line search also finds incoming messages' senders whom
   the roster lacks, and it tests each distinct sender number once, however
@@ -1010,12 +1010,12 @@ running app:
   matches the names that contain it, not the "name" key that every entry has.
   It skips the account's owner, whom most threads in both stores list: a
   thread that a query matches only through the owner's entry or the owner's
-  own messages is no route, while a title that holds the owner's name still
+  own messages gives no route, while a title that holds the owner's name still
   matches. v2's conversation search (`SearchConversationsByName`, which also
   serves `/api/search`) skips the owner's identity in SQL. The legacy search
   (`SearchConversationsByMetadata`, which also serves `openmessage thread`
   and, on a legacy-primary app, `/api/search`) skips participant entries
-  flagged as the owner's (`is_me` or `isMe` set to JSON true) and matches only
+  with the owner's flag (`is_me` or `isMe` holding JSON true) and matches only
   incoming messages' senders, since the owner's outgoing messages carry the
   owner's name and number. Both searches skip the owner before their limit, so
   newer threads that list only the owner and one other person can't push a
@@ -1029,8 +1029,12 @@ running app:
   there once, as a whole address in the serving store. Such values include SMS
   short codes, Signal UUIDs and email addresses, which the legacy Google Chat
   importer files as participants' numbers. That lookup
-  (`SearchConversationsByAddress`) ignores only ASCII letters' case. A longer
-  value that holds the one it looks up (`other-support@example.com` for
+  (`SearchConversationsByAddress`) ignores only ASCII letters' case and the
+  white space around each value, which a card or an importer may keep. Both
+  stores' SQL compares values by the key that `addressmatch.Key` writes,
+  through a Go function SQLite knows as `om_address_match`. The tool keys its
+  lookups the same way, so it looks up each address once. A
+  longer value that holds the one it looks up (`other-support@example.com` for
   `support@example.com`, `+12025550142` for the short code `55501`), a name and
   a title match nothing. A search for the value's text would route a name query
   to strangers whose own addresses or phone numbers hold it, and to groups
@@ -1072,6 +1076,10 @@ running app:
   `TestResolveContactRoutesFindsALegacyOnlyNameBesideATitleThatHoldsIt`,
   `TestResolveContactRoutesLooksUpAFoundAddressAsAWhole`,
   `TestResolveContactRoutesKeepsAPersonWhoseAddressOthersHold`,
+  `TestResolveContactRoutesFindsAnAddressWhateverWhiteSpaceSurroundsIt`,
+  `TestResolveContactRoutesFindsEveryThreadOfEachAddressItLooksUp`,
+  `TestResolveContactRoutesTellsApartAddressesThatDifferAfterANUL`,
+  `TestResolveContactRoutesLooksUpTwoAddressesThatDifferAfterANUL`,
   `TestResolveContactRoutesSearchesEachLineOnce` and
   `TestResolveContactRoutesFindsALegacyNameThatJSONEscapes` (internal/tools),
   `TestSearchConversationsByMetadataSkipsTheAccountOwner`,
@@ -1092,8 +1100,10 @@ running app:
   `TestLegacySearchesBreakTiesByConversationID`,
   `TestSearchConversationsByPhoneLineCallsTheMatcherOncePerSenderNumber`
   (internal/db), `TestMatch`, `TestNumber` and `TestMatchProperties`
-  (internal/phoneline), `TestSubmitTextV2SendsOnlyToTheConversationItsIDNames`
-  and `TestSubmitTextV2SendsToTheV2IDWhenIDsCollide` (internal/v2wire).
+  (internal/phoneline), `TestKey`, `TestSQLMatch` and
+  `TestSQLMatchAgreesWithKey` (internal/addressmatch),
+  `TestSubmitTextV2SendsOnlyToTheConversationItsIDNames` and
+  `TestSubmitTextV2SendsToTheV2IDWhenIDsCollide` (internal/v2wire).
 - Escape hatches: `--transports` forces the old standalone full-stack stdio
   behavior (only for machines where the MCP process is the *only* OpenMessage
   process, ever); `--no-transports` strips transports from a **legacy-mode**
