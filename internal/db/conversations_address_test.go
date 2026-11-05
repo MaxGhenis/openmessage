@@ -493,7 +493,7 @@ func TestSearchConversationsByAddressAgreesWithTheAddressModel(t *testing.T) {
 				entries = append(entries, map[string]any{"name": "Me", "number": ownerNumber(), "email": addressForm(random, ownerEmail), "is_me": true})
 			}
 			random.Shuffle(len(entries), func(i, j int) { entries[i], entries[j] = entries[j], entries[i] })
-			// json.Marshal writes & as & and a NUL as \u0000, so the
+			// json.Marshal writes & as \u0026 and a NUL as \u0000, so the
 			// store must decode escapes.
 			participants, err := json.Marshal(entries)
 			if err != nil {

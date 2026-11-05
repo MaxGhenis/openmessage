@@ -563,7 +563,7 @@ func TestOwnerLinesOnLineAllocatesTheSameForAnyNumberOfLines(t *testing.T) {
 // ownerRuleSeparators are runes that phoneline lets sit around and between
 // a written number's digits: white space of several kinds, dashes, dots,
 // slashes and parentheses.
-var ownerRuleSeparators = []rune{' ', ' ', ' ', '\t', '/', '-', '–', '(', ')', '.'}
+var ownerRuleSeparators = []rune{' ', '\u00a0', '\u202f', '\t', '/', '-', '\u2013', '(', ')', '.'}
 
 // Invariants of the owner's phone lines, over the values the owner rule
 // meets, each written number with random separators added:
