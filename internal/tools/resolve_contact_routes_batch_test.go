@@ -430,8 +430,9 @@ func sameRoutes(a, b []*db.Conversation) bool {
 // skips it, matching before the limit, and newest first with ties in
 // conversation ID order. It returns the same when a batch fails and the
 // tool falls back to a search for each value. Two counts hold too: the tool
-// asks reads for each line and each address once, and runs no more than one
-// batch of each kind and no search for a single address.
+// asks reads for each line and each address once, and runs one query of
+// each kind at most, a batch for two or more values and the search for a
+// lone one.
 func TestFindRouteConversationsBatchesAgreeWithASearchForEachValue(t *testing.T) {
 	exercised := map[string]int{}
 	property := func(seed int64) bool {
@@ -476,8 +477,9 @@ func TestFindRouteConversationsBatchesAgreeWithASearchForEachValue(t *testing.T)
 						return false
 					}
 				}
-				if counting.queries["lines"] > 1 || counting.queries["addresses"] > 1 || counting.queries["line"] > 1 || counting.queries["address"] > 0 {
-					t.Logf("seed %d, %s: for %q, queries %v", seed, mode, query, counting.queries)
+				if counting.queries["lines"]+counting.queries["line"] > 1 || counting.queries["addresses"]+counting.queries["address"] > 1 ||
+					(counting.queries["lines"] == 1) != (len(counting.lines) > 1) || (counting.queries["addresses"] == 1) != (len(counting.addresses) > 1) {
+					t.Logf("seed %d, %s: for %q, queries %v for %d lines and %d addresses", seed, mode, query, counting.queries, len(counting.lines), len(counting.addresses))
 					return false
 				}
 
@@ -500,6 +502,12 @@ func TestFindRouteConversationsBatchesAgreeWithASearchForEachValue(t *testing.T)
 				if len(counting.addresses) >= 2 && counting.queries["addresses"] == 1 {
 					exercised[mode+": a batch of two or more addresses"]++
 				}
+				if !looksLikePhoneNumber(query) && len(counting.lines) == 1 && counting.queries["line"] == 1 {
+					exercised[mode+": a lone line searched alone"]++
+				}
+				if len(counting.addresses) == 1 && counting.queries["address"] == 1 {
+					exercised[mode+": a lone address searched alone"]++
+				}
 				if all, err := findRouteConversationsOneByOne(reads, a.Store, query, 1000); err == nil && len(all) > limit && len(want) == limit {
 					exercised[mode+": a limit that cuts the routes"]++
 				}
@@ -519,7 +527,7 @@ func TestFindRouteConversationsBatchesAgreeWithASearchForEachValue(t *testing.T)
 	}
 	var paths []string
 	for _, mode := range routeStoreModes {
-		for _, path := range []string{"a query that asks for both batches", "a batch of two or more lines", "a batch of two or more addresses", "a limit that cuts the routes", "a fallback to a search for each value"} {
+		for _, path := range []string{"a query that asks for both batches", "a batch of two or more lines", "a batch of two or more addresses", "a lone line searched alone", "a lone address searched alone", "a limit that cuts the routes", "a fallback to a search for each value"} {
 			paths = append(paths, mode+": "+path)
 		}
 	}

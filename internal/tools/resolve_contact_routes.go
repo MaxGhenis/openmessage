@@ -265,30 +265,27 @@ func findRouteConversations(reads readsource.ReadSource, people *db.Store, query
 	// them together are the newest limit threads among what a search for
 	// each value finds, and newestRoutes keeps no others. A name can find up
 	// to 2 × limit numbers, and a search for each would read every
-	// participant and sender again. When a batch fails, a search for each of
-	// its values takes over, and a value whose search fails adds nothing, as
-	// a search for each value always did.
-	lookUpEach := func(values []string, searchOne func(string, int) ([]*db.Conversation, error)) {
+	// participant and sender again. A lone value goes to the search for it,
+	// which returns what a batch of one would return and costs less: a line
+	// batch turns every stored value into keys, where the search for one line
+	// compares each stored value with it once. When a batch fails, a search
+	// for each of its values takes over, and a value whose search fails adds
+	// nothing, as a search for each value always did.
+	lookUpAll := func(values []string, searchAll func([]string, int) ([]*db.Conversation, error), searchOne func(string, int) ([]*db.Conversation, error)) {
+		if len(values) > 1 {
+			if found, err := searchAll(values, limit); err == nil {
+				addConversations(found)
+				return
+			}
+		}
 		for _, value := range values {
 			if found, err := searchOne(value, limit); err == nil {
 				addConversations(found)
 			}
 		}
 	}
-	if len(lines) > 0 {
-		if found, err := reads.SearchConversationsByPhoneLines(lines, limit); err == nil {
-			addConversations(found)
-		} else {
-			lookUpEach(lines, reads.SearchConversationsByPhoneLine)
-		}
-	}
-	if len(addresses) > 0 {
-		if found, err := reads.SearchConversationsByAddresses(addresses, limit); err == nil {
-			addConversations(found)
-		} else {
-			lookUpEach(addresses, reads.SearchConversationsByAddress)
-		}
-	}
+	lookUpAll(lines, reads.SearchConversationsByPhoneLines, reads.SearchConversationsByPhoneLine)
+	lookUpAll(addresses, reads.SearchConversationsByAddresses, reads.SearchConversationsByAddress)
 	return newestRoutes(seen, limit), nil
 }
 
