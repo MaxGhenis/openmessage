@@ -998,7 +998,7 @@ running app:
   digits-only rule could put one on someone's line.
   `send_message` follows the same rule. Its SMS lookup takes a number's own
   thread over a newer gateway thread whose address holds the digits, and its
-  recipient check takes a name followed by digits, in any script (`Мама
+  recipient check takes a name with digits after it, in any script (`Мама
   2025550123`), for a name and refuses it before anything reaches the daemon.
   On legacy reads the line search also finds incoming messages' senders whom
   the roster lacks, and it tests each distinct sender number once, however
@@ -1010,7 +1010,7 @@ running app:
   matches the names that contain it, not the "name" key that every entry has.
   It skips the account's owner, whom most threads in both stores list: a
   thread that a query matches only through the owner's entry or the owner's
-  own messages is no route, while a title that holds the owner's name still
+  own messages gives no route, while a title that holds the owner's name still
   matches. v2's conversation search (`SearchConversationsByName`, which also
   serves `/api/search`) skips the owner's identity in SQL. The legacy search
   (`SearchConversationsByMetadata`, which also serves `openmessage thread`
@@ -1023,26 +1023,25 @@ running app:
   gives up past a depth of 1,000 and reads a list only up to a NUL, where
   encoding/json reads 10,000 deep and rejects bytes after a NUL. Two registered
   functions take each list whole, as a BLOB, since the driver cuts a TEXT
-  argument at its first NUL, and read it in Go, so a repeated key counts with
-  its last value in all four. The line search passes each value to the Go
-  matcher as a BLOB too. The keys of the owner's lines (`phoneline.LineKeys`)
-  go into an index that
-  SQLite builds once per query, and an entry's owner test looks up at most ten
-  keys there, however many lines the owner has. The rule names any object entry
-  that carries `is_me` or `isMe` set to JSON true, and any entry, a bare
-  string included, in any thread, on the phone line of a flagged entry whose
-  number reads as a phone number or a WhatsApp JID of one: the line is the
-  number's `phoneline.Line`, and an entry sits on it when `phoneline.Match`
-  says so. So the owner's WhatsApp JID sits on the owner's line, while a
-  flagged
-  WhatsApp LID marks no line, and a `tel:` URI or an email address that holds
-  the owner's digits sits on none. The rule reads each element of a
-  participants list on its own, so an odd element hides no one beside it.
-  Google's participant lists often name the owner a second time without the
-  flag, so the flag alone misses the copy; v2 folds the copy into the owner's
-  self identity. In one live legacy store, 211 of 1,355 one-to-one
-  SMS threads carry the copy, and WhatsApp and Signal threads list the owner
-  only without the flag. Every search skips the owner before its limit, so
+  argument at its first NUL, and read it in Go. Where a key repeats, the owner
+  rule and the address search take its last value, and the metadata search
+  matches every value. The line search passes each value to the Go matcher
+  through `phoneline.SQL`, as a BLOB too. The keys of the owner's lines
+  (`phoneline.LineKeys`) go into an index that SQLite builds once per query, and
+  an entry's owner test looks up at most ten keys there, however many lines the
+  owner has. The rule names any object entry that carries `is_me` or `isMe` set
+  to JSON true, and any entry, a bare string included, in any thread, on the
+  phone line of a flagged entry whose number reads as a phone number or a
+  WhatsApp JID of one: the line is the number's `phoneline.Line`, and an entry
+  sits on it when `phoneline.Match` says so. So the owner's WhatsApp JID sits on
+  the owner's line, while a flagged WhatsApp LID marks no line, and a `tel:` URI
+  or an email address that holds the owner's digits sits on none. The rule reads
+  each element of a participants list on its own, so an odd element hides no one
+  beside it. Google's participant lists often name the owner a second time
+  without the flag, so the flag alone misses the copy; v2 folds the copy into the
+  owner's self identity. In one live legacy store, 211 of 1,355 one-to-one SMS
+  threads carry the copy, and WhatsApp and Signal threads list the owner only
+  without the flag. Every search skips the owner before its limit, so
   newer threads that list only the owner and one other person can't push a
   match out of the results, and the text searches, like the address-book
   lookup (`ListContacts`), match `%` and `_` literally. The route tool keeps
@@ -1054,9 +1053,14 @@ running app:
   there once, as a whole address in the serving store. Such values include SMS
   short codes, Signal UUIDs and email addresses, which the legacy Google Chat
   importer files as participants' numbers. That lookup
-  (`SearchConversationsByAddress`) lowers ASCII letters on both sides and
-  then compares every byte, NULs included, where SQLite's `NOCASE` stops
-  comparing at a NUL. A longer value that holds the one it looks up
+  (`SearchConversationsByAddress`) ignores only ASCII letters' case and the
+  white space around each value, which a card or an importer may keep. Both
+  stores compare values by the key that `addressmatch.Key` writes, in SQL
+  through a Go function SQLite knows as `om_address_match`, and the legacy
+  search compares its participant entries by keys that Go writes when it reads
+  each list. So it compares every byte, NULs included, where SQLite's `NOCASE`
+  stops comparing at a NUL. The tool keys its lookups the same way, so it looks
+  up each address once. A longer value that holds the one it looks up
   (`other-support@example.com` for `support@example.com`, `+12025550142` for
   the short code `55501`), a name and a title match nothing. A search for the
   value's text would route a name query to strangers whose own addresses or
@@ -1105,6 +1109,10 @@ running app:
   `TestResolveContactRoutesFindsALegacyOnlyNameBesideATitleThatHoldsIt`,
   `TestResolveContactRoutesLooksUpAFoundAddressAsAWhole`,
   `TestResolveContactRoutesKeepsAPersonWhoseAddressOthersHold`,
+  `TestResolveContactRoutesFindsAnAddressWhateverWhiteSpaceSurroundsIt`,
+  `TestResolveContactRoutesFindsEveryThreadOfEachAddressItLooksUp`,
+  `TestResolveContactRoutesTellsApartAddressesThatDifferAfterANUL`,
+  `TestResolveContactRoutesLooksUpTwoAddressesThatDifferAfterANUL`,
   `TestResolveContactRoutesSearchesEachLineOnce` and
   `TestResolveContactRoutesFindsALegacyNameThatJSONEscapes` (internal/tools),
   `TestSearchConversationsByMetadataSkipsTheAccountOwner`,
@@ -1125,9 +1133,11 @@ running app:
   `TestLegacySearchesBreakTiesByConversationID`,
   `TestSearchConversationsByPhoneLineCallsTheMatcherOncePerSenderNumber`
   (internal/db), `TestMatch`, `TestNumber` and `TestMatchProperties`
-  (internal/phoneline), `TestSubmitTextV2SendsOnlyToTheConversationItsIDNames`
-  and `TestSubmitTextV2SendsToTheV2IDWhenIDsCollide` (internal/v2wire). For
-  the owner's own number and the owner's entries:
+  (internal/phoneline), `TestKey`, `TestSQLMatch` and
+  `TestSQLMatchAgreesWithKey` (internal/addressmatch),
+  `TestSubmitTextV2SendsOnlyToTheConversationItsIDNames` and
+  `TestSubmitTextV2SendsToTheV2IDWhenIDsCollide` (internal/v2wire). For the
+  owner's own number and the owner's entries:
   `TestClientModeSendMessageRefusesTheOwnersOwnNumber`,
   `TestClientModeSendMessageSendsOnlyToThePersonsOwnThread`,
   `TestFindDirectSMSConversationTakesTheOwnersLinesOnlyFromPhoneNumbers`,

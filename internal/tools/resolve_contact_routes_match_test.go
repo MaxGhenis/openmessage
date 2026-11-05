@@ -49,9 +49,9 @@ func routeIDs(convos []*db.Conversation) []string {
 }
 
 // A participant entry is a JSON object, and its keys name no one. The
-// default fixture owner is named Me, as the demo store's owner is, and "me"
-// sits inside every entry's "name" key, so a search for Me must match no
-// one's entry through that key. Names and numbers still match.
+// default fixture names its owner Me, as the demo store does, and "me" sits
+// inside every entry's "name" key, so a search for Me must match no one's
+// entry through that key. Names and numbers still match.
 func TestResolveContactRoutesMatchesParticipantValuesNotJSONKeys(t *testing.T) {
 	for _, mode := range routeStoreModes {
 		t.Run(mode, func(t *testing.T) {
@@ -305,10 +305,10 @@ func TestResolveContactRoutesFindsALegacyNumberWrittenWithSeparators(t *testing.
 
 // A title that holds a name says nothing about where that person's own
 // thread is. Only a legacy thread knows Alice Chen's name, and v2 files her
-// thread under her number alone, while a newer group in both stores is
-// titled "Alice Chen dinner plans". A search for her name finds her thread
-// beside the group, on either store: a title that matches doesn't stop the
-// tool from reading the names in legacy threads.
+// thread under her number alone, while a newer group in both stores carries
+// the title "Alice Chen dinner plans". A search for her name finds her
+// thread beside the group, on either store: a title that matches doesn't
+// stop the tool from reading the names in legacy threads.
 func TestResolveContactRoutesFindsALegacyOnlyNameBesideATitleThatHoldsIt(t *testing.T) {
 	for _, mode := range routeStoreModes {
 		t.Run(mode, func(t *testing.T) {
@@ -458,12 +458,14 @@ func (r *countingRouteReads) SearchConversationsByMetadata(query string, limit i
 // Two address-book cards and a legacy thread hold Alice's number, in two
 // written forms that name one line. Two Google Chat threads list her email
 // address, where the legacy importer files it as her number, under two names
-// and with its letters in two cases.
+// and with its letters in two cases, and a third card holds it with white
+// space around it.
 // On either store, when the query names her, the tool searches the serving
 // store for the name once, her line once and her email address, as a whole
 // address, once. When the query is the address itself, the tool searches for
-// that text once and looks up nothing else: the address and every other way
-// of writing its ASCII letters' case name the same person.
+// that text once and looks up nothing else: the address, every other way of
+// writing its ASCII letters' case, and the address with white space around
+// it name the same person.
 func TestResolveContactRoutesSearchesEachLineOnce(t *testing.T) {
 	for _, mode := range routeStoreModes {
 		t.Run(mode, func(t *testing.T) {
@@ -474,6 +476,9 @@ func TestResolveContactRoutesSearchesEachLineOnce(t *testing.T) {
 			})
 			if err := a.Store.UpsertContact(&db.Contact{ContactID: "contact-alice-work", Name: "Alice Chen (work)", Number: "+1 202-555-0123"}); err != nil {
 				t.Fatalf("seed Alice's work card: %v", err)
+			}
+			if err := a.Store.UpsertContact(&db.Contact{ContactID: "contact-alice-home", Name: "Alice Chen (home)", Number: "\u00a0alice.chen@example.com\t"}); err != nil {
+				t.Fatalf("seed Alice's home card: %v", err)
 			}
 			for _, conv := range []*db.Conversation{
 				{ConversationID: "lunch", Name: "Lunch", SourcePlatform: "gchat", LastMessageTS: 1,

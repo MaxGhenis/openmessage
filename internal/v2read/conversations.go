@@ -47,9 +47,10 @@ func (s *Source) SearchConversationsByMetadata(query string, limit int) ([]*db.C
 	return s.mapSearchHits(conversations)
 }
 
-// SearchConversationsByPhoneLine is the v2 counterpart of the legacy phone
-// line search: conversations with a participant other than the owner on the
-// line that line, a phoneline.Line, names, matched in SQL before the limit.
+// SearchConversationsByPhoneLine runs the v2 store's phone line search, the
+// legacy one's counterpart. It returns the conversations with a participant
+// other than the owner on the line that line, a phoneline.Line, names, and
+// the store matches in SQL before the limit.
 func (s *Source) SearchConversationsByPhoneLine(line string, limit int) ([]*db.Conversation, error) {
 	if err := s.ready(); err != nil {
 		return nil, err
@@ -61,10 +62,10 @@ func (s *Source) SearchConversationsByPhoneLine(line string, limit int) ([]*db.C
 	return s.mapSearchHits(conversations)
 }
 
-// SearchConversationsByAddress is the v2 counterpart of the legacy address
-// search: conversations with a participant other than the owner whose
-// canonical address is address as a whole, ignoring ASCII case, matched in
-// SQL before the limit.
+// SearchConversationsByAddress runs the v2 store's address search, the
+// legacy one's counterpart. It returns the conversations with a participant
+// other than the owner whose canonical value shares address's addressmatch
+// key, and the store matches in SQL before the limit.
 func (s *Source) SearchConversationsByAddress(address string, limit int) ([]*db.Conversation, error) {
 	if err := s.ready(); err != nil {
 		return nil, err

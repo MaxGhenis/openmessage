@@ -9,6 +9,7 @@ import (
 
 	moderncsqlite "modernc.org/sqlite"
 
+	"github.com/maxghenis/openmessage/internal/addressmatch"
 	"github.com/maxghenis/openmessage/internal/phoneline"
 )
 
@@ -884,7 +885,7 @@ func (s *Store) SearchConversationsByPhoneLine(line string, limit int) ([]Conver
 		        SELECT cp.conversation_id
 		        FROM conversation_participants cp
 		        JOIN identities i ON i.identity_id = cp.identity_id
-		        WHERE i.is_self = 0 AND `+phoneline.SQLMatch+`(?, i.canonical_value)
+		        WHERE i.is_self = 0 AND `+phoneline.SQL("?", "i.canonical_value")+`
 		    )
 		 ORDER BY last_message_at_ms DESC, conversation_id
 		 LIMIT ?`,
@@ -901,15 +902,20 @@ func (s *Store) SearchConversationsByPhoneLine(line string, limit int) ([]Conver
 }
 
 // SearchConversationsByAddress returns the conversations with a participant
-// whose identity's canonical value is address as a whole, newest first, then
-// in conversation ID order, and at most limit. The comparison ignores ASCII
-// letters' case and nothing else, as SQLite's NOCASE does. The account's
-// owner (the self identity) matches nothing, and neither does a canonical
-// value that only contains address, a display name, or a title: another
-// person's address or phone number can hold this one. The match runs
-// before the LIMIT. An empty address matches nothing.
+// whose identity's canonical value matches address as a whole, newest first,
+// then in conversation ID order, and at most limit. A participant who has
+// left counts, as in SearchConversationsByName. A canonical value matches
+// address when the two share an addressmatch key, as in the legacy store's
+// address search: the key drops the white space around a value and lowers
+// ASCII letters. v2keys.IdentityKey trims a value before it stores it, so
+// the white space matters only for a value that another writer stored. The
+// account's owner (the self identity) matches nothing, and neither does a
+// canonical value that only contains address, a raw value, a display name,
+// or a title: another person's address or phone number can hold this one.
+// The match runs before the LIMIT. A blank address matches nothing.
 func (s *Store) SearchConversationsByAddress(address string, limit int) ([]Conversation, error) {
-	if limit <= 0 || strings.TrimSpace(address) == "" {
+	key := addressmatch.Key(address)
+	if limit <= 0 || key == "" {
 		return []Conversation{}, nil
 	}
 	rows, err := s.db.QueryContext(
@@ -920,11 +926,11 @@ func (s *Store) SearchConversationsByAddress(address string, limit int) ([]Conve
 		        SELECT cp.conversation_id
 		        FROM conversation_participants cp
 		        JOIN identities i ON i.identity_id = cp.identity_id
-		        WHERE i.is_self = 0 AND i.canonical_value = ? COLLATE NOCASE
+		        WHERE i.is_self = 0 AND `+addressmatch.SQL("?", "i.canonical_value")+`
 		    )
 		 ORDER BY last_message_at_ms DESC, conversation_id
 		 LIMIT ?`,
-		address, limit,
+		key, limit,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("search conversations by address: %w", err)

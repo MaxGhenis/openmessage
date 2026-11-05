@@ -21,7 +21,7 @@ func (s *Store) UpsertContact(c *Contact) error {
 }
 
 // ListContacts returns address-book contacts by name, at most limit. A
-// query keeps only those whose name or number contains it as written, ASCII
+// query keeps only those whose name or number contains it literally, ASCII
 // case aside: % and _ match only themselves.
 func (s *Store) ListContacts(query string, limit int) ([]*Contact, error) {
 	var rows_query string
@@ -66,7 +66,7 @@ func (s *Store) ListContacts(query string, limit int) ([]*Contact, error) {
 // conversations' participant entries name, for lookups that the address book
 // alone doesn't cover.
 //
-// A participant matches where its name or number holds the query as written,
+// A participant matches where its name or number holds the query literally,
 // ASCII case aside: SQLite's lower() folds only ASCII letters, and so does the
 // check below, so Ángel finds Ángel Ruiz and ÁNGEL does too, but ángel
 // doesn't. The check reads the decoded entry, never its JSON text, where Go

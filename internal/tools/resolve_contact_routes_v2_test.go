@@ -40,14 +40,13 @@ const routeFixtureAccount = "google-primary"
 // the number their v2 thread carries now. A phone change re-numbers Google
 // threads (issue #177), so the two can differ, and either may be empty.
 // Number is the E.164 form v2 stores; LegacyNumber, when set, is the form the
-// legacy store keeps, as written in the address book. NamelessInV2 leaves the
+// legacy store keeps, as the address book writes it. NamelessInV2 leaves the
 // v2 thread with the number only, as for someone missing from the phone's
 // contacts, so only the legacy store knows the name. ParticipantName, when
 // set, is the name the person's v2 participant row carries in place of the
 // identity's name; reads show that name, and v2's search matches both. Kind
-// is the kind of the v2 identity that holds Number, e164 when empty; a
-// person reached by an email address or a user path has the kind that v2
-// gives it.
+// is the kind of the v2 identity that holds Number, e164 when empty; a person
+// with an email address or a user path has the kind that v2 gives that value.
 type routeFixturePerson struct {
 	Name            string
 	Number          string
@@ -89,8 +88,8 @@ func seedRouteFixture(t *testing.T, legacy *db.Store, store *sqlite.Store, peopl
 }
 
 // seedRouteFixtureWithOwner writes people into the legacy store and the v2
-// store and returns each v2 thread's conversation ID by name. Legacy rows are
-// written in order, so a later person filed under the same thread number
+// store and returns each v2 thread's conversation ID by name. It writes
+// legacy rows in order, so a later person under the same thread number
 // overwrites an earlier one, as the 2026-09-03 re-numbering overwrote legacy
 // rows.
 func seedRouteFixtureWithOwner(t *testing.T, legacy *db.Store, store *sqlite.Store, owner routeFixtureOwner, people []routeFixturePerson) map[string]string {
@@ -190,10 +189,11 @@ func seedRouteFixtureWithOwner(t *testing.T, legacy *db.Store, store *sqlite.Sto
 	return threads
 }
 
-// seedTitledRouteGroup writes a group thread titled title under id into both
-// stores, newer than any fixture thread. Its roster is the owner and a guest
-// whom no test query names, so a query reaches the group only through its
-// title. Seed the fixture first: the v2 group lists the fixture's owner.
+// seedTitledRouteGroup writes a group thread with title as its name, under id,
+// into both stores, newer than any fixture thread. Its roster lists the owner
+// and a guest whom no test query names, so a query reaches the group only
+// through its title. Seed the fixture first: the v2 group lists the fixture's
+// owner.
 func seedTitledRouteGroup(t *testing.T, legacy *db.Store, store *sqlite.Store, owner routeFixtureOwner, id, title string) {
 	t.Helper()
 	seedTitledRouteGroupWithGuest(t, legacy, store, owner, id, title, "+15555550999")
@@ -722,22 +722,22 @@ func TestResolveContactRoutesClientModeAsksTheAppWhichPlatformsCanSend(t *testin
 // ID resolve_contact_routes returns names a conversation in the serving store,
 // so the send tools accept it; a person's routes are threads that person is
 // in, however the legacy store files them and even when the account's owner,
-// whom every thread lists, shares their first name, beside a newer group
-// whose title holds the name searched for, when one exists; a thread number,
-// or the owner's name or number, yields no route; and the tool finds everyone
-// the stores can identify, by their number in any form or by a name either
-// store still holds, even where v2 reads show another name or a title also
-// matches. Each person's legacy thread number and current v2 thread number
-// come from one small pool, so legacy numbers collide, overwrite each other
-// and name other people's v2 threads. Some people have an email address,
-// which the legacy Google Chat importer files as a number, or a Google Chat
-// user path in place of a phone number, and for some of them a stranger's
-// address or a group's title holds theirs: a name query that finds the
-// address on a legacy thread or a card routes to neither.
-// Differential: send_message's thread lookup scans the newest 2,000 threads
-// and skips groups. These stores hold far fewer threads and no group where a
-// number is searched, and there, for a person's number in any form, that
-// lookup and resolve_contact_routes pick the same thread.
+// whom every thread lists, shares their first name, beside a newer group whose
+// title holds the name searched for, when one exists; a thread number, or the
+// owner's name or number, yields no route; and the tool finds everyone the
+// stores can identify, by their number in any form or by a name either store
+// still holds, even where v2 reads show another name or a title also matches.
+// Each person's legacy thread number and current v2 thread number come from
+// one small pool, so legacy numbers collide, overwrite each other and name
+// other people's v2 threads. Some people have an email address, which the
+// legacy Google Chat importer files as a number, or a Google Chat user path in
+// place of a phone number, and for some of them a stranger's address or a
+// group's title holds theirs: a name query that finds the address on a legacy
+// thread or a card routes to neither. Differential: send_message's thread
+// lookup scans the newest 2,000 threads and skips groups. These stores hold
+// far fewer threads, and no group sits on a line the test searches, so for a
+// person's number in any form, that lookup and resolve_contact_routes pick the
+// same thread.
 func TestResolveContactRoutesReturnsOnlyServingStoreThreadsOfThePerson(t *testing.T) {
 	names := []string{"Alice Example", "Bob Example", "Carol Example", "Dave Example"}
 	pool := []string{"2957", "3100", "3101", "3102", "3103"}
@@ -824,8 +824,8 @@ func TestResolveContactRoutesReturnsOnlyServingStoreThreadsOfThePerson(t *testin
 		}
 
 		// legacyNameSurvives reports whether people[index]'s legacy thread
-		// still carries their name: a later person filed under the same
-		// thread number overwrites it.
+		// still carries their name: a later person under the same thread
+		// number overwrites it.
 		legacyNameSurvives := func(index int) bool {
 			if people[index].LegacyThreadID == "" {
 				return false

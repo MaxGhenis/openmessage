@@ -28,8 +28,8 @@ var (
 	digit    = regexp.MustCompile(`[0-9]`)
 )
 
-// Number returns the digits of value, and whether value is a phone number
-// written as one, with 7 to 15 digits.
+// Number returns the digits of value, and whether value reads as a phone
+// number with 7 to 15 digits.
 func Number(value string) (string, bool) {
 	if !written.MatchString(value) {
 		return "", false

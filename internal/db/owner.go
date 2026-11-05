@@ -8,6 +8,7 @@ import (
 
 	"modernc.org/sqlite"
 
+	"github.com/maxghenis/openmessage/internal/addressmatch"
 	"github.com/maxghenis/openmessage/internal/phoneline"
 )
 
@@ -235,8 +236,8 @@ func (lines OwnerLines) Owner(entry ParticipantEntry) bool {
 //	openmessage_participant_entries(list) returns an array that holds, for
 //	each entry ParticipantEntries gives, in order, an object with its
 //	"is_me" flag, its "number", its number's phoneline.ValueKeys as
-//	"number_keys", its "texts", and its Addresses with ASCII letters
-//	lowered, as the address search compares them, as "address_keys".
+//	"number_keys", its "texts", and the addressmatch.Key of each of its
+//	Addresses, as the address search compares them, as "address_keys".
 //	openmessage_owner_line_keys(list) returns an array of the
 //	phoneline.LineKeys of each line OwnerLine gives an entry of list.
 func init() {
@@ -259,7 +260,7 @@ func participantEntriesJSON(_ *sqlite.FunctionContext, args []driver.Value) (dri
 	for index, entry := range entries {
 		addressKeys := make([]string, len(entry.Addresses))
 		for at, address := range entry.Addresses {
-			addressKeys[at] = foldASCII(address)
+			addressKeys[at] = addressmatch.Key(address)
 		}
 		rows[index] = sqlEntry{
 			IsMe:        entry.IsMe,
@@ -288,17 +289,6 @@ func ownerLineKeysJSON(_ *sqlite.FunctionContext, args []driver.Value) (driver.V
 		}
 	}
 	return jsonText(keys)
-}
-
-// foldASCII lowers s's ASCII letters and leaves every other byte alone.
-func foldASCII(s string) string {
-	b := []byte(s)
-	for index, c := range b {
-		if 'A' <= c && c <= 'Z' {
-			b[index] = c + 'a' - 'A'
-		}
-	}
-	return string(b)
 }
 
 // sqlList is the list an SQL argument holds: a BLOB's bytes, a TEXT's text

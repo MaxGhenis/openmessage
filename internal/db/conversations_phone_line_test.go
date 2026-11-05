@@ -105,10 +105,10 @@ func (m phoneLineModel) search(line string, limit int) []string {
 	return ids
 }
 
-// heldOnlyByIdentifiers reports whether conversation is off line although a
-// value in it, one that is no phone number such as an email address, holds
-// digits that end with the line's: a thread that matching digits alone
-// would put on the line.
+// heldOnlyByIdentifiers reports whether conversation stays off the line
+// although a value in it that reads as no phone number, such as an email
+// address, holds digits that end with the line's: a thread that matching
+// digits alone would put on the line.
 func (m phoneLineModel) heldOnlyByIdentifiers(conversation *Conversation, line string, ownerLines []string) bool {
 	if m.onLine(conversation, line, ownerLines).hit {
 		return false
@@ -145,7 +145,7 @@ func (m phoneLineModel) heldOnlyByIdentifiers(conversation *Conversation, line s
 
 // phoneLineForm writes a number's digits as an address book or a transport
 // might: E.164, national with separators, or with a stray prefix, or as a
-// tel: URI, which is no written number.
+// tel: URI, which reads as no written number.
 func phoneLineForm(random *rand.Rand, digits string) string {
 	switch random.Intn(5) {
 	case 0:
@@ -195,22 +195,22 @@ func TestSearchConversationsByPhoneLineReadsARepeatedNumberAsSendMessageDoes(t *
 // entries carry the number under phone, a blank number, or a number that
 // isn't text, some repeat "number", and some, the owner's among them, hold a
 // number too large for a float64; identifiers that are no phone number, such
-// as an email address, a Signal UUID, a WhatsApp LID or a number followed by
-// a NUL, hold targets' digits; some lists nest deeper than SQLite's JSON
+// as an email address, a Signal UUID, a WhatsApp LID or a number that a NUL
+// ends early, hold targets' digits; some lists nest deeper than SQLite's JSON
 // reader goes or carry bytes after a NUL, where SQLite's reader stops and
 // Go's doesn't, so only Go's reading counts; the owner's entries carry the
 // owner's number flagged, unflagged or with a flag that isn't JSON true,
 // other objects and bare strings carry it too, and the owner sends messages
-// too; and threads often share a time. So, as invariants, a thread
-// is on a line only through an incoming sender or an entry that the owner
-// rule doesn't count as the owner's (neither flagged nor on a flagged
-// entry's line, which any thread may list) whose number, written as one,
-// ends with the line's digits (or the line ends with theirs); an incoming
-// sender whom the roster lacks counts; once a thread lists the owner
-// flagged, the owner's own line finds a thread only through an incoming
-// sender; the limit applies after matching, so threads whose numbers only
-// contain the digits never crowd out one on the line; and threads that share
-// a time come in conversation ID order.
+// too; and threads often share a time. So, as invariants, a thread joins a
+// line only through an incoming sender or an entry that the owner rule
+// doesn't count as the owner's (neither flagged nor on a flagged entry's
+// line, which any thread may list) whose number reads as one and ends with
+// the line's digits (or the line ends with theirs); an incoming sender whom
+// the roster lacks counts; once a thread lists the owner flagged, the owner's
+// own line finds a thread only through an incoming sender; the limit applies
+// after matching, so threads whose numbers only contain the digits never
+// crowd out one on the line; and threads that share a time come in
+// conversation ID order.
 func TestSearchConversationsByPhoneLineAgreesWithTheLineModel(t *testing.T) {
 	// neighbor's number ends in the owner's last seven digits, which the last
 	// decoy holds.

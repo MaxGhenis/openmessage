@@ -15,8 +15,8 @@ import (
 	"github.com/maxghenis/openmessage/internal/v2read"
 )
 
-// connectedDaemon answers /api/status as a running app whose platforms are
-// connected.
+// connectedDaemon answers /api/status as a running app whose platforms
+// have all connected.
 func connectedDaemon(t *testing.T) *localapi.Client {
 	t.Helper()
 	status := http.NewServeMux()

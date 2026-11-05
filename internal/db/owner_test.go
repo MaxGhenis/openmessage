@@ -19,10 +19,11 @@ import (
 // ownerRuleNumbers are values the owner rule meets in "number" and "phone":
 // the owner's number in many written forms, the owner's WhatsApp JIDs,
 // values that hold the owner's digits but name no line (a NUL among them),
-// a LID, other people's numbers, fragments too short for a line, and blanks.
+// a LID, other people's numbers, fragments too short for a line, an address
+// with capitals and white space around it, and blanks.
 var ownerRuleNumbers = append(append(append(append(append([]string{
 	"105274891234567@lid", "+15555550123", "5555550123",
-	"+44 20 7946 0958", "12345", "555-0199", "", "  ", " ",
+	"+44 20 7946 0958", "12345", "555-0199", " Support@Example.com\t", "", "  ", " ",
 }, ownerNumberForms...), ownerNumberSeparatedForms...), ownerJIDs...), ownerDigitHolders...), ownerNULForms...)
 
 // ownerRuleQuote writes s as a JSON string. With ascii set it escapes every
@@ -381,9 +382,12 @@ func TestOwnerRuleReadsEachElementAlikeInGoAndSQL(t *testing.T) {
 			entry := got[key]
 			addressKeys := []string{}
 			for _, address := range entry.Addresses {
-				addressKeys = append(addressKeys, modelFoldASCII(address))
+				addressKeys = append(addressKeys, modelAddressKey(address))
 				if modelFoldASCII(address) != address {
 					exercised["an address with an ASCII capital"]++
+				}
+				if strings.TrimSpace(address) != address {
+					exercised["an address with white space around it"]++
 				}
 			}
 			if row.Number != entry.Number || row.IsMe != entry.IsMe || !slices.Equal(row.Texts, entry.Texts) ||
@@ -424,6 +428,7 @@ func TestOwnerRuleReadsEachElementAlikeInGoAndSQL(t *testing.T) {
 		"a NUL in a text", "a number with a NUL", "a member nested deeper than SQLite reads",
 		"a list nested deeper than SQLite reads", "a list nested deeper than Go reads", "a list with bytes after a NUL",
 		"an owner line", "an unflagged entry on an owner line", "a string on an owner line", "an address with an ASCII capital",
+		"an address with white space around it",
 	} {
 		if exercised[path] == 0 {
 			t.Errorf("the property never drew %s; raise MaxCount (drew %v)", path, exercised)

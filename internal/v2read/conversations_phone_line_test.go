@@ -15,23 +15,23 @@ import (
 )
 
 // Differential, over random v2 stores: SearchConversationsByPhoneLine
-// returns, in order, the conversations with a participant other than the
-// self identity whose canonical value phonelinetest.Match, which states
+// returns, in order, the conversations with a participant other than the self
+// identity whose canonical value phonelinetest.Match, which states
 // phoneline's rule with regular expressions, puts on the line, newest first,
 // then in conversation ID order, and at most the limit. Decoys hold a
 // target's digits inside a longer number or share only its last seven;
 // identities of other kinds, an email address, a Signal UUID, a WhatsApp LID
-// and the like, hold targets' digits too; the owner takes part in most
-// conversations; and conversations often share a time. So, as invariants,
-// the owner is on no line, an identity is on a line only when its value is
-// written as a number (or is a WhatsApp JID of one), threads whose numbers
-// only contain the digits never crowd out one on the line, and threads that
-// share a time come in ID order.
+// and the like, hold targets' digits too, and so does a number that a NUL
+// ends early; the owner takes part in most conversations; and conversations
+// often share a time. So, as invariants, the owner joins no line, an identity
+// joins a line only when its value reads as a number (or as a WhatsApp JID of
+// one), threads whose numbers only contain the digits never crowd out one on
+// the line, and threads that share a time come in ID order.
 func TestSearchConversationsByPhoneLineAgreesWithTheLineModel(t *testing.T) {
 	numbers := []string{"+12025550123", "+13035550147", "+447555012399", "+4412025550123", "+13035550123", "+12025550124"}
 	// kinds names each identity's kind. The e164 ones above are phone
-	// numbers; of the rest, only the phone-number JID and the national
-	// number written as a username name a line.
+	// numbers; of the rest, only the phone-number JID and the username
+	// that holds a national number name a line.
 	kinds := map[string]string{
 		"alice12025550123@example.com":         "email",
 		"abcdefab-abcd-abcd-abcd-a13035550147": "signal_aci",
@@ -41,6 +41,7 @@ func TestSearchConversationsByPhoneLineAgreesWithTheLineModel(t *testing.T) {
 		"+99999912025550123":                   "e164",
 		"13035550147@s.whatsapp.net":           "jid",
 		"202-555-0123":                         "username",
+		"+12025550123\x00x":                    "e164",
 	}
 	members := append([]string{}, numbers...)
 	for value := range kinds {

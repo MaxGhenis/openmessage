@@ -30,20 +30,38 @@ func addressForm(random *rand.Rand, value string) string {
 	return string(b)
 }
 
+// spaceAround puts white space that strings.TrimSpace trims around value
+// some of the time, as a hand-typed card or an importer might, with runes
+// of one, two and three bytes.
+func spaceAround(random *rand.Rand, value string) string {
+	if random.Intn(4) != 0 {
+		return value
+	}
+	spaces := []string{" ", "\t", "\n", "\u0085", "\u00a0", "\u2028", "\u3000"}
+	pad := func() string {
+		var b strings.Builder
+		for count := random.Intn(3); count > 0; count-- {
+			b.WriteString(spaces[random.Intn(len(spaces))])
+		}
+		return b.String()
+	}
+	return pad() + value + pad()
+}
+
 // addressModel is a reference for SearchConversationsByAddress. A thread
 // holds an address when a participant entry that the owner rule doesn't
 // count as the owner's holds it, or when an incoming message's sender number
-// is it. An entry holds it through a string element's text, or through an
+// does. An entry holds it through a string element's text, or through an
 // object's "number", "phone" or "email" value where that value is a JSON
 // string; where a key repeats, its last value counts, as a generic decode
-// keeps it. A value is the address when the two agree byte for byte once
-// ASCII letters are lowered on both sides, so a NUL counts as any other byte
-// does. The owner rule is searchModel's: an object that carries is_me or
-// isMe as JSON true, and any entry, in any thread, on the phone line of a
-// flagged entry whose number names one, as phonelinetest restates
-// phoneline's rule. Lists read as modelEntries reads them. Names and titles
-// never count, and a blank address matches nothing. Hits come newest first,
-// then in conversation ID order, up to the limit.
+// keeps it. A value names the address when the two hold the same bytes once
+// strings.TrimSpace has trimmed both, ASCII letters' case aside, so a NUL
+// counts as any other byte does. The owner rule is searchModel's: an object
+// that carries is_me or isMe as JSON true, and any entry, in any thread, on
+// the phone line of a flagged entry whose number names one, as phonelinetest
+// restates phoneline's rule. Lists read as modelEntries reads them. Names and
+// titles never count, and a blank address matches nothing. Hits come newest
+// first, then in conversation ID order, up to the limit.
 type addressModel struct {
 	conversations []*Conversation
 	messages      []*Message
@@ -60,11 +78,12 @@ type addressModel struct {
 // that both hold, where SQLite's NOCASE stops comparing. earlierValueOnly:
 // it doesn't hold it, but an earlier value of a repeated key of someone's is
 // it. caseDiffers: it holds it only through values whose ASCII letters' case
-// differs from the address's. hugeNumber: someone who holds it holds a
-// number too large for a float64 too.
+// differs from the address's. padded: it holds it through a value with white
+// space around it. hugeNumber: someone who holds it holds a number too large
+// for a float64 too.
 type addressHold struct {
-	hit, senderOnly, ownerOnly, ownerCopyOnly, containsOnly, nameOnly     bool
-	otherCaseOnly, nulTwinOnly, earlierValueOnly, caseDiffers, hugeNumber bool
+	hit, senderOnly, ownerOnly, ownerCopyOnly, containsOnly, nameOnly             bool
+	otherCaseOnly, nulTwinOnly, earlierValueOnly, caseDiffers, padded, hugeNumber bool
 }
 
 // nocaseAgreesUpToANUL reports whether a and b, two different texts of one
@@ -92,15 +111,25 @@ func modelHoldsAHugeNumber(entry modelEntry) bool {
 	return false
 }
 
+// modelAddressKey writes value as the model compares values: without the
+// white space around it, as strings.TrimSpace trims it, and with its ASCII
+// letters lowered. The model uses it instead of addressmatch.Key, so it stays
+// apart from the code it checks.
+func modelAddressKey(value string) string {
+	return modelFoldASCII(strings.TrimSpace(value))
+}
+
 // holds says how conversation holds address, given the owner's phone lines,
 // which modelOwnerLines gathers from every conversation.
 func (m addressModel) holds(conversation *Conversation, address string, lines []string) addressHold {
+	address = strings.TrimSpace(address)
 	want := modelFoldASCII(address)
 	var held addressHold
 	byEntry, byOwner, byOwnerCopy, bySender, exact := false, false, false, false, false
 	// is reports whether value is the address, and notes how a value that
 	// isn't the address relates to it.
 	is := func(value string) bool {
+		value = strings.TrimSpace(value)
 		folded := modelFoldASCII(value)
 		switch {
 		case folded == want:
@@ -116,8 +145,11 @@ func (m addressModel) holds(conversation *Conversation, address string, lines []
 	}
 	// ties records value, which is the address, as tying the thread to it.
 	ties := func(value string) {
-		if value == address {
+		if strings.TrimSpace(value) == address {
 			exact = true
+		}
+		if strings.TrimSpace(value) != value {
+			held.padded = true
 		}
 	}
 	if is(conversation.Name) {
@@ -146,7 +178,7 @@ func (m addressModel) holds(conversation *Conversation, address string, lines []
 				case "number", "phone", "email":
 					value, isText := member.value.(string)
 					last, lastIsText := entry.object[member.key].(string)
-					if isText && modelFoldASCII(value) == want && (!lastIsText || modelFoldASCII(last) != want) {
+					if isText && modelAddressKey(value) == want && (!lastIsText || modelAddressKey(last) != want) {
 						held.earlierValueOnly = true
 					}
 				}
@@ -192,6 +224,7 @@ func (m addressModel) holds(conversation *Conversation, address string, lines []
 	held.nulTwinOnly = held.nulTwinOnly && !held.hit
 	held.earlierValueOnly = held.earlierValueOnly && !held.hit
 	held.caseDiffers = held.hit && !exact
+	held.padded = held.padded && held.hit
 	return held
 }
 
@@ -250,7 +283,7 @@ func TestSearchConversationsByAddressMatchesTheWholeAddress(t *testing.T) {
 		{ConversationID: "alice", Name: "Alice", LastMessageTS: 1, Participants: `[{"name":"Alice","number":"support@example.com"}]`},
 		{ConversationID: "alice-email", Name: "Alice", LastMessageTS: 2, Participants: `[{"name":"Alice C.","email":"Support@Example.COM"}]`},
 		{ConversationID: "bare", Name: "Bare", LastMessageTS: 3, Participants: `["support@example.com"]`},
-		{ConversationID: "escaped", Name: "Escaped", LastMessageTS: 4, Participants: `[{"number":"\u0073upport@example.com"}]`},
+		{ConversationID: "escaped", Name: "Escaped", LastMessageTS: 4, Participants: `[{"number":"support\u0040example.com"}]`},
 		{ConversationID: "sender", Name: "Sender", LastMessageTS: 5, Participants: `[]`},
 		{ConversationID: "sent", Name: "Sent", LastMessageTS: 6, Participants: `[]`},
 		{ConversationID: "owner", Name: "Owner", LastMessageTS: 7, Participants: `[{"name":"Me","number":"support@example.com","is_me":true}]`},
@@ -261,6 +294,16 @@ func TestSearchConversationsByAddressMatchesTheWholeAddress(t *testing.T) {
 		{ConversationID: "user", Name: "User", LastMessageTS: 12, Participants: `[{"name":"U","number":"users/1234"}]`},
 		{ConversationID: "accented", Name: "Accented", LastMessageTS: 13, Participants: `[{"name":"E","email":"élise@example.com"}]`},
 		{ConversationID: "blank", Name: "Blank", LastMessageTS: 14, Participants: `[{"name":"Blank","number":"","email":"   "},""]`},
+		{ConversationID: "padded", Name: "Padded", LastMessageTS: 15, Participants: `[{"name":"P","number":" support@example.com\t"}]`},
+		{ConversationID: "padded-wide", Name: "Wide", LastMessageTS: 16, Participants: `[{"name":"W","email":"\u00a0Support@Example.com\u3000"}]`},
+		{ConversationID: "padded-bare", Name: "Padded bare", LastMessageTS: 17, Participants: `["\nsupport@example.com\u2028"]`},
+		{ConversationID: "padded-sender", Name: "Padded sender", LastMessageTS: 18, Participants: `[]`},
+		{ConversationID: "inner-space", Name: "Inner", LastMessageTS: 19, Participants: `[{"name":"I","number":"support @example.com"}]`},
+		{ConversationID: "invisible", Name: "Invisible", LastMessageTS: 20, Participants: `[{"name":"Z","number":"\u200bsupport@example.com"},"support@example.com\ufeff"]`},
+		{ConversationID: "short-code", Name: "Pharmacy", LastMessageTS: 21, Participants: `[{"name":"Pharmacy","number":"55501"}]`},
+		{ConversationID: "numeric", Name: "Numeric", LastMessageTS: 22, Participants: `[{"name":"N","number":55501}]`},
+		{ConversationID: "nul-cut", Name: "Cut", LastMessageTS: 23, Participants: `[{"name":"C","number":"support@example.com\u0000x"},"support@example.com\u0000y"]`},
+		{ConversationID: "nul-inside", Name: "Inside", LastMessageTS: 24, Participants: `[{"name":"N","email":"a\u0000c@example.com"}]`},
 	} {
 		conversation.SourcePlatform = "gchat"
 		if err := store.UpsertConversation(conversation); err != nil {
@@ -271,26 +314,39 @@ func TestSearchConversationsByAddressMatchesTheWholeAddress(t *testing.T) {
 		{MessageID: "from-them", ConversationID: "sender", SenderNumber: "SUPPORT@example.com", Body: "hi", TimestampMS: 5, SourcePlatform: "gchat"},
 		{MessageID: "from-me", ConversationID: "sent", SenderNumber: "support@example.com", Body: "hi", TimestampMS: 6, SourcePlatform: "gchat", IsFromMe: true},
 		{MessageID: "from-nobody", ConversationID: "blank", SenderNumber: "", Body: "hi", TimestampMS: 14, SourcePlatform: "gchat"},
+		{MessageID: "from-them-padded", ConversationID: "padded-sender", SenderNumber: "\u0085support@example.com ", Body: "hi", TimestampMS: 18, SourcePlatform: "gchat"},
+		{MessageID: "from-them-cut", ConversationID: "nul-cut", SenderNumber: "support@example.com\x00z", Body: "hi", TimestampMS: 23, SourcePlatform: "gchat"},
 	} {
 		if err := store.UpsertMessage(message); err != nil {
 			t.Fatalf("seed %s: %v", message.MessageID, err)
 		}
 	}
+	hits := []string{"padded-sender", "padded-bare", "padded-wide", "padded", "sender", "escaped", "bare", "alice-email", "alice"}
 	for _, test := range []struct {
 		address string
 		limit   int
 		want    []string
 	}{
-		{"support@example.com", 20, []string{"sender", "escaped", "bare", "alice-email", "alice"}},
-		{"SUPPORT@EXAMPLE.COM", 20, []string{"sender", "escaped", "bare", "alice-email", "alice"}},
-		{"support@example.com", 1, []string{"sender"}},
+		{"support@example.com", 20, hits},
+		{"SUPPORT@EXAMPLE.COM", 20, hits},
+		{"\u3000support@example.com\n", 20, hits},
+		{"support@example.com", 1, []string{"padded-sender"}},
+		{"55501", 20, []string{"short-code"}},
+		// A NUL counts as any other byte, so a value that one ends early
+		// matches nothing, and neither does one that differs only after it.
+		{"a\x00c@example.com", 20, []string{"nul-inside"}},
+		{"A\x00C@EXAMPLE.COM ", 20, []string{"nul-inside"}},
+		{"a\x00b@example.com", 20, []string{}},
+		{"a", 20, []string{}},
 		{"example.com", 20, []string{}},
 		{"users/123", 20, []string{}},
 		{"Élise@example.com", 20, []string{}},
 		{"élise@EXAMPLE.com", 20, []string{"accented"}},
 		{"", 20, []string{}},
 		{"   ", 20, []string{}},
+		{"\u3000\u00a0", 20, []string{}},
 		{"support@example.com", 0, []string{}},
+		{"support@example.com", -1, []string{}},
 	} {
 		got, err := store.SearchConversationsByAddress(test.address, test.limit)
 		if err != nil {
@@ -344,12 +400,12 @@ func TestSearchConversationsByAddressSkipsTheOwnersParticipantEntries(t *testing
 // The address search reads participant lists through owner.go, as
 // send_message and the other legacy searches do. SQLite's JSON reader stops
 // at 1,000 levels of nesting, reads TEXT only up to a NUL, and takes a
-// repeated key's first value, so it read no one from the first list below,
-// read Nell from the second, and took Rae's old address and Flo's first
-// flag. Go reads 10,000 levels deep, reads no entry from a list with bytes
-// after a NUL, and takes a repeated key's last value. The search compares
-// whole values byte for byte once ASCII letters are lowered, where SQLite's
-// NOCASE stops at a NUL and then compares only lengths, so it took
+// repeated key's first value, so it would read no one from the first list
+// below, read Nell from the second, and take Rae's old address and Flo's
+// first flag. Go reads 10,000 levels deep, reads no entry from a list with
+// bytes after a NUL, and takes a repeated key's last value. The search
+// compares addressmatch keys byte by byte, where SQLite's NOCASE stops at a
+// NUL and then compares only lengths, so it would take
 // "val@example.com\u0000b" for Val's "val@example.com\u0000a".
 func TestSearchConversationsByAddressReadsListsAsSendMessageDoes(t *testing.T) {
 	store := newTestStore(t)
@@ -390,39 +446,41 @@ func TestSearchConversationsByAddressReadsListsAsSendMessageDoes(t *testing.T) {
 
 // Differential, over random stores: SearchConversationsByAddress returns
 // exactly what addressModel returns, in the same order. Addresses come with
-// their ASCII letters in any case. Decoys hold a target inside a longer
-// value, after a space, with a non-ASCII letter in another case, or with
-// other bytes after a NUL that the target holds, and some values are blank;
-// names, senders' names and titles hold targets too; some entries carry a
-// value under phone or email, a number that isn't text, a nested array, a
-// repeated key whose values differ, or a number too large for a float64;
-// JSON escapes encode some values; some lists nest an element deeper than
-// SQLite's JSON reader goes, or carry bytes after a NUL, where SQLite's
-// reader stops and Go's doesn't; the owner's entries carry the owner's
-// number and email address, flagged, unflagged or with a flag that isn't
-// JSON true, bare strings hold the owner's number, and the owner sends
+// their ASCII letters in any case and often with white space around them.
+// Decoys hold a target inside a longer value, beside a space inside it or a
+// character that only looks like white space, before a NUL, or with a
+// non-ASCII letter in another case, some differ from a target only after a
+// NUL, and some values are blank; names, senders' names and titles hold
+// targets too; some entries carry a value under phone or email, a number that
+// isn't text, a nested array, a repeated key whose values differ, or a number
+// too large for a float64; JSON escapes encode some values; some lists nest
+// an element deeper than SQLite's JSON reader goes, or carry bytes after a
+// NUL, where SQLite's reader stops and Go's doesn't; the owner's entries carry
+// the owner's number and email address, flagged, unflagged or with a flag that
+// isn't JSON true, bare strings hold the owner's number, and the owner sends
 // messages too; and threads often share a time. So, as invariants, a thread
 // holds an address only through someone whose number, phone, email or bare
-// entry is that address as a whole, up to ASCII letters' case and with every
-// byte after a NUL counting, and who isn't the owner, as the owner rule in
-// owner.go counts the owner's entries for send_message; an incoming sender
-// whom the roster lacks counts; the search reads every list as send_message
-// does; the limit applies after matching, so threads whose values only
-// contain the address never crowd out one that holds it; and threads that
-// share a time come in conversation ID order. Two more hold for every query:
-// any way of writing its ASCII letters' case finds the same threads, and the
-// metadata search for the same text at the same limit returns every thread
-// the address search returns, or newer ones in its place, so the route tool
-// loses nothing when it counts the query itself as an address it has looked
-// up.
+// entry is that address as a whole, up to ASCII letters' case and the white
+// space around each and with every byte after a NUL counting, and who isn't
+// the owner, as the owner rule in owner.go counts the owner's entries for
+// send_message; an incoming sender whom the roster lacks counts; the search
+// reads every list as send_message does; the limit applies after matching, so
+// threads whose values only contain the address never crowd out one that holds
+// it; and threads that share a time come in conversation ID order. Two more
+// hold for every query: any way of writing its ASCII letters' case, with any
+// white space around it, finds the same threads, and the metadata search for
+// the same text without the white space around it, at the same limit, returns
+// every thread the address search returns, or newer ones in its place, so the
+// route tool loses nothing when it counts the query, which its handler trims,
+// as an address it has looked up.
 func TestSearchConversationsByAddressAgreesWithTheAddressModel(t *testing.T) {
-	targets := []string{"support@example.com", "users/123", "abcdefab-abcd-abcd-abcd-abcdefabcdef", "a&b@example.com", "élise@example.com", "x\x00a@example.com"}
+	targets := []string{"support@example.com", "users/123", "abcdefab-abcd-abcd-abcd-abcdefabcdef", "a&b@example.com", "élise@example.com", "a\x00c@example.com"}
 	ownerEmail := "me@example.com"
 	ownerNumbers := []string{"+15550009999", "+1 (555) 000-9999", "555-000-9999", "15550009999@s.whatsapp.net"}
 	// The last two decoys are blank: a blank address matches nothing, not
-	// even a blank value. "x\x00b@example.com" agrees with a target up to the
+	// even a blank value. "a\x00b@example.com" agrees with a target up to the
 	// NUL both hold.
-	decoys := []string{"other-support@example.com", "support@example.com.au", " support@example.com", "x\x00b@example.com", "users/1234", "xusers/123", "Élise@example.com", "a&b@example.co", "x\x00a@example.com\x00", "", "  "}
+	decoys := []string{"other-support@example.com", "support@example.com.au", "\u200bsupport@example.com", "support@example.com\ufeff", "a\x00b@example.com", "support @example.com", "users/1234", "xusers/123", "Élise@example.com", "a&b@example.co", "a\x00c@example.com\x00", "support@example.com\x00x", "", "  "}
 	exercised := map[string]int{}
 
 	property := func(seed int64) bool {
@@ -430,7 +488,7 @@ func TestSearchConversationsByAddressAgreesWithTheAddressModel(t *testing.T) {
 		store := newTestStore(t)
 		model := addressModel{}
 		values := append(append(append([]string{ownerEmail}, ownerNumbers...), targets...), decoys...)
-		value := func() string { return addressForm(random, values[random.Intn(len(values))]) }
+		value := func() string { return spaceAround(random, addressForm(random, values[random.Intn(len(values))])) }
 		quote := func(text string) string { return ownerRuleQuote(text, random.Intn(3) == 0) }
 		// beforeNUL holds the list before the NUL of each list that carries
 		// bytes after one, and deep each list that nests an element deeper
@@ -475,22 +533,23 @@ func TestSearchConversationsByAddressAgreesWithTheAddressModel(t *testing.T) {
 					entries = append(entries, map[string]any{"name": person, "number": form})
 				}
 			}
-			ownerNumber := func() string { return ownerNumbers[random.Intn(len(ownerNumbers))] }
+			ownerNumber := func() string { return spaceAround(random, ownerNumbers[random.Intn(len(ownerNumbers))]) }
+			ownerForm := func() string { return spaceAround(random, addressForm(random, ownerEmail)) }
 			switch random.Intn(7) {
 			case 0: // the owner isn't listed
 			case 1:
-				entries = append(entries, map[string]any{"name": "Me", "number": ownerNumber(), "email": addressForm(random, ownerEmail), "is_me": "true"})
+				entries = append(entries, map[string]any{"name": "Me", "number": ownerNumber(), "email": ownerForm(), "is_me": "true"})
 				exercised["an owner's entry whose flag isn't JSON true"]++
 			case 2:
-				entries = append(entries, map[string]any{"name": "Me", "email": addressForm(random, ownerEmail), "isMe": true})
+				entries = append(entries, map[string]any{"name": "Me", "email": ownerForm(), "isMe": true})
 			case 3:
-				entries = append(entries, map[string]any{"name": "Me", "number": ownerNumber(), "email": addressForm(random, ownerEmail)})
+				entries = append(entries, map[string]any{"name": "Me", "number": ownerNumber(), "email": ownerForm()})
 				exercised["an unflagged copy of the owner"]++
 			case 4:
 				entries = append(entries, ownerNumber())
 				exercised["a bare string that holds the owner's number"]++
 			default:
-				entries = append(entries, map[string]any{"name": "Me", "number": ownerNumber(), "email": addressForm(random, ownerEmail), "is_me": true})
+				entries = append(entries, map[string]any{"name": "Me", "number": ownerNumber(), "email": ownerForm(), "is_me": true})
 			}
 			random.Shuffle(len(entries), func(i, j int) { entries[i], entries[j] = entries[j], entries[i] })
 			// json.Marshal writes & as \u0026 and a NUL as \u0000, so the
@@ -565,11 +624,12 @@ func TestSearchConversationsByAddressAgreesWithTheAddressModel(t *testing.T) {
 			return conversationIDs(got)
 		}
 
-		addresses := append(append([]string{ownerEmail, ownerNumbers[1], "", "  "}, targets...), decoys[:4]...)
+		addresses := append(append([]string{ownerEmail, ownerNumbers[1], "", "  "}, targets...), decoys[:5]...)
 		for _, address := range addresses {
 			if random.Intn(2) == 0 {
 				address = addressForm(random, address)
 			}
+			address = spaceAround(random, address)
 			limit := 1 + random.Intn(6)
 			want := model.search(address, limit)
 			got := search(address, limit)
@@ -578,20 +638,21 @@ func TestSearchConversationsByAddressAgreesWithTheAddressModel(t *testing.T) {
 				t.Logf("seed %d: address %q (limit %d) = %v, model says %v", seed, address, limit, got, want)
 				return false
 			}
-			variant := addressForm(random, address)
+			variant := spaceAround(random, addressForm(random, address))
 			if again := search(variant, limit); !slices.Equal(again, got) {
 				dump()
 				t.Logf("seed %d: address %q (limit %d) = %v, but %q = %v", seed, address, limit, got, variant, again)
 				return false
 			}
-			metadata, err := store.SearchConversationsByMetadata(address, limit)
+			text := strings.TrimSpace(address)
+			metadata, err := store.SearchConversationsByMetadata(text, limit)
 			if err != nil {
-				t.Fatalf("SearchConversationsByMetadata(%q): %v", address, err)
+				t.Fatalf("SearchConversationsByMetadata(%q): %v", text, err)
 			}
 			byText := conversationIDs(metadata)
 			if merged := newestIDs(stored, append(slices.Clone(byText), got...), limit); !slices.Equal(merged, byText) {
 				dump()
-				t.Logf("seed %d: address %q (limit %d) = %v, which the metadata search's %v lacks room for (merged %v)", seed, address, limit, got, byText, merged)
+				t.Logf("seed %d: address %q (limit %d) = %v, which the metadata search's %v for %q lacks room for (merged %v)", seed, address, limit, got, byText, text, merged)
 				return false
 			}
 			if strings.TrimSpace(address) == "" {
@@ -600,6 +661,12 @@ func TestSearchConversationsByAddressAgreesWithTheAddressModel(t *testing.T) {
 			oldest := int64(-1)
 			if len(want) > 0 {
 				exercised["an address with hits"]++
+				if text != address {
+					exercised["an address with white space around it that has hits"]++
+				}
+				if strings.Contains(address, "\x00") {
+					exercised["an address with a NUL in it that has hits"]++
+				}
 				if all := model.search(address, len(stored)); len(all) > len(want) {
 					at := map[string]int64{}
 					for _, conversation := range stored {
@@ -633,6 +700,7 @@ func TestSearchConversationsByAddressAgreesWithTheAddressModel(t *testing.T) {
 					"a hit through a value with a NUL":                                                              held.hit && strings.ContainsRune(address, 0),
 					"a hit in a list nested deeper than SQLite reads":                                               held.hit && !held.senderOnly && deep[conversation.ConversationID],
 					"a hit behind a newer thread whose values only contain the address":                             held.containsOnly && oldest >= 0 && conversation.LastMessageTS > oldest,
+					"a hit through a value with white space around it":                                              held.padded,
 				} {
 					if drawn {
 						exercised[path]++
@@ -662,6 +730,7 @@ func TestSearchConversationsByAddressAgreesWithTheAddressModel(t *testing.T) {
 	}
 	for _, path := range []string{
 		"an address with hits",
+		"an address with a NUL in it that has hits",
 		"a tie at the limit",
 		"a metadata search that returns other threads",
 		"a hit through an incoming sender alone",
@@ -685,6 +754,8 @@ func TestSearchConversationsByAddressAgreesWithTheAddressModel(t *testing.T) {
 		"an owner's entry whose flag isn't JSON true",
 		"an unflagged copy of the owner",
 		"a bare string that holds the owner's number",
+		"a hit through a value with white space around it",
+		"an address with white space around it that has hits",
 	} {
 		if exercised[path] == 0 {
 			t.Errorf("the property never drew %s; raise MaxCount (drew %v)", path, exercised)

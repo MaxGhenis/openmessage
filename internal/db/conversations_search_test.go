@@ -122,14 +122,14 @@ func TestSearchConversationsByMetadataSkipsEntriesFlaggedAsTheOwners(t *testing.
 }
 
 // metadataSearchModel is a reference for the legacy store's
-// SearchConversationsByMetadata. A thread matches when the query, as
-// written and ASCII case aside, appears in its title, in the decoded text of
-// the name, number, phone or email of a participant entry not flagged as the
-// owner's, in a bare string entry, or in the name or number of an incoming
+// SearchConversationsByMetadata. A thread matches when the query appears
+// literally, ASCII case aside, in its title, in the decoded text of the
+// name, number, phone or email of a participant entry without the owner's
+// flag, in a bare string entry, or in the name or number of an incoming
 // message's sender or of a contact card with that sender's number. An entry
-// is flagged when its is_me or isMe holds JSON true. Participants that
-// aren't a JSON array offer no entries. Hits come newest first, up to the
-// limit.
+// carries the owner's flag when its is_me or isMe holds JSON true.
+// Participants that aren't a JSON array offer no entries. Hits come newest
+// first, up to the limit.
 type metadataSearchModel struct {
 	conversations []*Conversation
 	messages      []*Message
@@ -137,7 +137,7 @@ type metadataSearchModel struct {
 }
 
 // participantEntryTexts returns the texts that each participant entry offers
-// the search, and whether the entry is flagged as the owner's. An object
+// the search, and whether the entry carries the owner's flag. An object
 // offers the decoded text of its name, number, phone and email; a string
 // offers itself; anything else offers nothing.
 func participantEntryTexts(participants string) (texts [][]string, flagged []bool) {
@@ -170,9 +170,9 @@ func participantEntryTexts(participants string) (texts [][]string, flagged []boo
 }
 
 // match reports how conversation matches query: through someone else (its
-// title, an entry not flagged as the owner's, an incoming sender or their
+// title, an entry without the owner's flag, an incoming sender or their
 // card), through an incoming sender or card alone, or only through entries
-// flagged as the owner's.
+// with the owner's flag.
 func (m metadataSearchModel) match(conversation *Conversation, query string) (hit, senderOnly, ownerOnly bool) {
 	holds := func(text string) bool {
 		return strings.Contains(strings.ToLower(text), strings.ToLower(query))
@@ -228,18 +228,18 @@ func (m metadataSearchModel) search(query string, limit int) []string {
 
 // Differential, over random stores: SearchConversationsByMetadata returns
 // exactly what metadataSearchModel returns, in the same order. The stores
-// list the owner flagged with is_me or isMe, or not at all, beside people
-// who share words of the owner's name, and they add up to 15 newer threads
-// that list only Lee and the owner. Some entries carry is_me false or the
-// string "true", which flag nothing; some participants are empty, malformed
-// or a list of bare names; titles and names hold % and _. Messages come from
-// the owner, from people in the roster, or from Sam Guest, whom no roster
-// lists, and the owner and Sam Guest can have contact cards. So, as
-// invariants, no query finds a thread through an entry flagged as the
-// owner's or through the owner's own messages; titles, other entries,
-// incoming senders and their cards still match, before the limit applies;
-// and % and _ match only themselves. The owner always appears flagged here:
-// the search makes no claim about an unflagged copy of the owner.
+// list the owner with an is_me or isMe flag or with none, beside people who
+// share words of the owner's name, and they add up to 15 newer threads that
+// list only Lee and the owner. Some entries carry is_me false or the string
+// "true", which flag nothing; some participants are empty, malformed or a
+// list of bare names; titles and names hold % and _. Messages come from the
+// owner, from people in the roster, or from Sam Guest, whom no roster lists,
+// and the owner and Sam Guest can have contact cards. So, as invariants, no
+// query finds a thread through an entry with the owner's flag or through the
+// owner's own messages; titles, other entries, incoming senders and their
+// cards still match, before the limit applies; and % and _ match only
+// themselves. The owner always appears flagged here: the search makes no
+// claim about an unflagged copy of the owner.
 func TestSearchConversationsByMetadataAgreesWithTheFlaggedOwnerModel(t *testing.T) {
 	people := []struct{ name, number string }{
 		{"Sam Example", "+15555550100"},

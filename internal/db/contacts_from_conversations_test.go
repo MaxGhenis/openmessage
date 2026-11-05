@@ -26,7 +26,7 @@ func conversationContactKeys(contacts []*Contact) []string {
 // Sam, appears in all of them. ListContactsFromConversations reads threads
 // newest first until it has limit contacts, so the 40 newer threads that
 // list only Lee and the owner can't hide Sam Example's older thread. It
-// never returns an entry flagged as the owner's, whether by is_me or isMe.
+// never returns an entry with the owner's flag, is_me or isMe.
 func TestListContactsFromConversationsReadsPastThreadsThatListOnlyTheOwner(t *testing.T) {
 	store := newTestStore(t)
 	conversations := []*Conversation{{
@@ -99,11 +99,11 @@ func TestListContactsFromConversationsKeepsToTheLimitWhenParticipantsDontDecode(
 // conversationContactsModel is a reference for ListContactsFromConversations.
 // Threads go newest first, and entries read as Go's decoder reads them, a byte
 // that isn't UTF-8 as U+FFFD. A thread whose participants don't decode as a
-// list of entries offers its title; otherwise each entry not flagged as the
-// owner's (is_me or isMe) offers its name, or its number when it has no name,
+// list of entries offers its title; otherwise each entry without the owner's
+// flag (is_me or isMe) offers its name, or its number when it has no name,
 // together with its number. An offer counts when the query, ASCII case aside,
 // appears in the name offered or in the number, and only the first offer of
-// each name and number counts. The result is the first limit offers.
+// each name and number counts. The result holds the first limit offers.
 func conversationContactsModel(conversations []*Conversation, query string, limit int) []*Contact {
 	foldASCII := func(text string) string {
 		folded := []byte(text)
@@ -156,15 +156,15 @@ func conversationContactsModel(conversations []*Conversation, query string, limi
 
 // Differential, over random stores: ListContactsFromConversations returns
 // what conversationContactsModel returns. Up to 90 of the newest threads list
-// only Lee and the owner, flagged by is_me or isMe, so they can outnumber 20
-// times the limit; the older threads list people in shared threads, entries
-// without a name, the owner or not, and some have participants that don't
-// decode. Some names hold a character that JSON escapes or a letter beyond
-// ASCII, and some participants hold a byte that isn't UTF-8. So, as
-// invariants, no limit hides an older match behind threads that match only
-// through the owner, the result never holds the owner's flagged entries,
-// each name and number comes back once, and the SQL prefilter drops no row
-// that the loop could take a contact from.
+// only Lee and the owner, whose entry carries is_me or isMe, so they can
+// outnumber 20 times the limit; the older threads list people in shared
+// threads, entries without a name, the owner or not, and some have
+// participants that don't decode. Some names hold a character that JSON
+// escapes or a letter beyond ASCII, and some participants hold a byte that
+// isn't UTF-8. So, as invariants, no limit hides an older match behind
+// threads that match only through the owner, the result never holds the
+// owner's flagged entries, each name and number comes back once, and the SQL
+// prefilter drops no row that the loop could take a contact from.
 func TestListContactsFromConversationsAgreesWithTheModel(t *testing.T) {
 	people := []struct{ name, number string }{
 		{"Sam Example", "+15555550100"},
