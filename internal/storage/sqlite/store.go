@@ -33,6 +33,15 @@ import (
 
 const busyTimeoutMS = 5000
 
+// journalSizeLimitBytes caps the WAL file that a checkpoint leaves behind.
+// After a checkpoint SQLite writes its WAL from the start again but never
+// shrinks the file, so without a limit the file keeps the largest size it
+// ever reached for as long as any process keeps the store open. Once a
+// checkpoint has copied every frame back and no reader still needs them, the
+// next write starts the WAL over, and with this limit set its commit
+// truncates the file to the limit (or to that one transaction, if larger).
+const journalSizeLimitBytes = 64 << 20
+
 var openMu sync.Mutex
 
 // Store owns a connection pool for an OpenMessage SQLite database.
@@ -107,6 +116,7 @@ func storeDSN(path string) string {
 	query.Add("_pragma", fmt.Sprintf("busy_timeout(%d)", busyTimeoutMS))
 	query.Add("_pragma", "foreign_keys(ON)")
 	query.Add("_pragma", "synchronous(NORMAL)")
+	query.Add("_pragma", fmt.Sprintf("journal_size_limit(%d)", journalSizeLimitBytes))
 	// modernc.org/sqlite maps this to BEGIN IMMEDIATE for writable
 	// database/sql transactions. Migration state is therefore rechecked only
 	// after acquiring SQLite's write reservation.
@@ -155,6 +165,7 @@ func verifyConnectionPragmas(ctx context.Context, db *sql.DB) error {
 		{pragma: "foreign_keys", want: 1},
 		{pragma: "busy_timeout", want: busyTimeoutMS},
 		{pragma: "synchronous", want: 1}, // NORMAL
+		{pragma: "journal_size_limit", want: journalSizeLimitBytes},
 	}
 	for _, check := range checks {
 		var got int

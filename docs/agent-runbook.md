@@ -3002,6 +3002,99 @@ reaction named nobody (`[{"emoji":"👍","count":1}]`) keeps it as an anonymous
 reactor (`reactor_key = 'anon:👍'`, `migration/transform.go`). Reacting 👍 to it on v2 adds "me" beside
 it, so the pill reads 2 with only "You" listed.
 
+## Disk use: the WAL cap and free pages
+
+Both stores cap their WAL at 64 MiB. Until PR #277 neither set
+`journal_size_limit`, and SQLite never shrinks a WAL file on its own: after a
+checkpoint it writes the file from the start again, so the file kept the
+largest size it ever reached for as long as any process held the store open.
+The daemon and every MCP client hold it open, and on 2026-11-03
+`messages.db-wal` stood at 1.0 GB. Each store now sets the limit on every
+connection through its DSN (`db.JournalSizeLimitBytes`,
+`sqlite.journalSizeLimitBytes`), since the pragma holds per connection. Once
+a checkpoint has copied every frame back and no reader still uses the WAL,
+the next commit truncates the file to 64 MiB, or to that one transaction if
+it is larger. A WAL well above the limit means checkpoints can't finish,
+usually because a reader keeps an old snapshot open.
+
+Deletes leave pages on SQLite's freelist. Later writes reuse them, but the
+file doesn't shrink. On 2026-11-03, 1.69 GB of the legacy store's 1.88 GB sat
+on the freelist, left by the delete-and-re-add churn and search-index
+rebuilds that PR #273 stopped. The v2 store's freelist held nothing, so v2
+gets only the WAL cap.
+
+- **New legacy stores use incremental auto-vacuum.** `db.New` sets
+  `auto_vacuum=INCREMENTAL` before the switch to WAL, which writes the first
+  page and fixes the mode. An existing store keeps its mode: SQLite changes
+  it only during a VACUUM.
+- **The daemon returns an incremental store's free pages.** The legacy
+  free-page reclaimer (`cmd/legacy_free_pages.go`) runs only in the daemon
+  (`serve` with transports, not demo). Its first pass comes 3 minutes after
+  start, then one every 15 minutes. A pass starts once the freelist holds
+  16 MiB and runs `PRAGMA incremental_vacuum` in 4 MiB steps, 200 ms apart,
+  until a step comes up short. It logs `returned the legacy store's free
+  pages to the filesystem` with `freed_bytes`. The file shrinks at the next
+  complete checkpoint.
+- **A store without auto-vacuum needs one rewrite.** On such a store the
+  reclaimer logs once per daemon run: `the legacy store holds free pages that
+  only a rewrite can return; quit the app and run openmessage compact
+  --apply`.
+
+### Compacting the legacy store
+
+`openmessage compact` reports the store's main file, free pages, WAL and
+auto-vacuum mode, and what `--apply` would need. It only reads, so it can run
+beside the app:
+
+```
+OPENMESSAGES_DATA_DIR="$HOME/Library/Application Support/OpenMessage" openmessage compact
+```
+
+`--apply` rewrites the store. Quit the app first: it refuses while another
+process holds the instance lock or anything answers on the app's port. In
+order, it:
+
+1. checks free disk. The backup, VACUUM's temporary copy (in `SQLITE_TMPDIR`,
+   else `TMPDIR`) and the WAL during the rewrite each need about the size of
+   the live pages plus a tenth and 64 MiB, added up per filesystem;
+2. backs the store up with `VACUUM INTO`, which reads it without writing, to
+   `--backup-dir` (default `<data-dir>/compact-backups/<UTC stamp>/`;
+   `messages.db` 0600 in a 0700 directory), and runs `quick_check` on the
+   backup;
+3. digests every ordinary table of the backup and of the store, the search
+   index's included: each table's row count and a sum of one SHA-256 per
+   row, which ignores row order and rowids. If any table differs, another
+   process wrote between the two reads, and it stops (exit 5) without
+   rewriting anything;
+4. opens the store with `db.New`, the app's own open path, and digests it
+   again;
+5. runs `PRAGMA auto_vacuum=INCREMENTAL; VACUUM` and a TRUNCATE checkpoint,
+   which shrinks the main file to its live pages and empties the WAL;
+6. digests the store once more, stops (exit 5) if any table changed, and
+   runs `quick_check`.
+
+It prints paths, sizes and counts, never message content. Exit codes: 2 the
+app runs or another process holds the lock, 3 a preflight check failed (no
+store, too little disk, the backup directory exists), 4 the backup failed, 5
+a check failed, 6 the rewrite failed. A second run finds nothing to do and
+takes no backup.
+
+On a clone of the live store (2026-11-03: a 1.75 GiB file, 1.57 GiB of it
+free, 15 tables, 291,138 rows), `--apply` took 43 s, 9.7 s of it the rewrite.
+The file went to 178 MiB with no free pages, the backup took another 178 MiB,
+and free disk dipped 0.73 GiB at the peak. The app stays down that long. A
+run this short needs no [watchdog
+parking](#parking-the-launchd-watchdog): a relaunch takes two failed probes 5
+minutes apart.
+
+MCP clients that hold the store open keep reading through the rewrite. A
+write from one waits up to 5 s and then fails. A reader that holds a snapshot
+open can keep the final checkpoint from finishing. The command then says so,
+and the next checkpoint shrinks the file.
+
+The backup stays where the command wrote it. Delete it once the app has run
+normally on the compacted store.
+
 ## Deploying a new build to a live install
 
 **`RELEASE=1` is required.** Without it `build.sh` stamps the dev bundle id
@@ -3057,7 +3150,10 @@ open -a OpenMessage
 ```
 
 The identifier check must print `Identifier=openmessage`; if it prints `STOP`,
-stop before the swap. A quick swap needs no
+stop before the swap. To compact the legacy store in the same downtime, run
+`OPENMESSAGES_DATA_DIR="$HOME/Library/Application Support/OpenMessage"
+"$R/openmessage" compact --apply` after the `mv` and before `open -a
+OpenMessage` (see [Compacting the legacy store](#compacting-the-legacy-store)). A quick swap needs no
 [watchdog parking](#parking-the-launchd-watchdog): a relaunch takes two failed
 probes 5 minutes apart. If you park it, remove
 `$HOME/Library/Application Support/OpenMessage/watchdog-disabled` right after
