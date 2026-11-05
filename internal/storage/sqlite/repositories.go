@@ -1,10 +1,12 @@
 package sqlite
 
 import (
+	"cmp"
 	"context"
 	"database/sql"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 
 	moderncsqlite "modernc.org/sqlite"
@@ -940,6 +942,160 @@ func (s *Store) SearchConversationsByAddress(address string, limit int) ([]Conve
 		return nil, fmt.Errorf("search conversations by address: %w", err)
 	}
 	return conversations, nil
+}
+
+// SearchConversationsByPhoneLines looks for many phone lines at once. It
+// returns the newest of the conversations that SearchConversationsByPhoneLine
+// returns for each of lines: newest first, then in conversation ID order,
+// and at most limit. Every search matches before its limit, so these are
+// the newest threads with a participant on any of the lines. One query reads
+// each identity once, through phoneline.SQLKeys, and looks the canonical
+// value's keys up among the lines' keys from phoneline.KeysOfLines, where a
+// search for each line reads every identity again. No lines, or a limit
+// below 1, match nothing.
+func (s *Store) SearchConversationsByPhoneLines(lines []string, limit int) ([]Conversation, error) {
+	if len(lines) == 0 || limit <= 0 {
+		return []Conversation{}, nil
+	}
+	rows, err := s.db.QueryContext(context.Background(), phoneLinesSearchSQL(phoneline.SQLKeys), phoneline.KeysOfLines(lines), limit)
+	if err != nil {
+		return nil, fmt.Errorf("search conversations by phone lines: %w", err)
+	}
+	conversations, err := collectRows(rows, scanConversation)
+	if err != nil {
+		return nil, fmt.Errorf("search conversations by phone lines: %w", err)
+	}
+	return conversations, nil
+}
+
+// phoneLinesSearchSQL is SearchConversationsByPhoneLines's query, calling the
+// SQL function keys, phoneline.SQLKeys or a stand-in, for each canonical
+// value's keys. It takes a JSON array of the lines' keys, then the limit.
+// on_line holds the identities other than the owner's that are on one of
+// the lines, so keys runs once for each identity, however many lines the
+// query holds and however many conversations list the identity.
+func phoneLinesSearchSQL(keys string) string {
+	return `
+		WITH line_keys(line_key) AS MATERIALIZED (
+			SELECT value FROM json_each(?)
+		),
+		on_line(identity_id) AS MATERIALIZED (
+			SELECT DISTINCT i.identity_id
+			FROM identities i, json_each(` + keys + `(i.canonical_value)) AS value_key
+			WHERE i.is_self = 0 AND value_key.value IN (SELECT line_key FROM line_keys)
+		)
+		SELECT ` + conversationColumns + `
+		FROM conversations
+		WHERE conversation_id IN (
+			SELECT cp.conversation_id
+			FROM conversation_participants cp
+			WHERE cp.identity_id IN (SELECT identity_id FROM on_line)
+		)
+		ORDER BY last_message_at_ms DESC, conversation_id
+		LIMIT ?`
+}
+
+// maxAddressesPerQuery caps the addresses that one query of
+// SearchConversationsByAddresses binds, each as its own value, far below
+// SQLite's default cap of 32,766 bound values. Tests lower it to make the
+// search split its addresses across queries.
+var maxAddressesPerQuery = 1000
+
+// SearchConversationsByAddresses looks for many addresses at once. It
+// returns the newest of the conversations that SearchConversationsByAddress
+// returns for each of addresses: newest first, then in conversation ID
+// order, and at most limit. Every search matches before its limit, so these
+// are the newest threads with a participant whose canonical value is one of
+// the addresses as a whole. A query binds each address as that search binds
+// it and compares it under the same NOCASE collation. It reads each identity
+// once and looks its canonical value up among the addresses, where a search
+// for each address reads every identity again. Past maxAddressesPerQuery
+// addresses, it runs a query for each group of that many and keeps the
+// newest of their hits. A blank address matches nothing, and so does a
+// limit below 1.
+func (s *Store) SearchConversationsByAddresses(addresses []string, limit int) ([]Conversation, error) {
+	addresses = nonBlankAddresses(addresses)
+	if len(addresses) == 0 || limit <= 0 {
+		return []Conversation{}, nil
+	}
+	var found []Conversation
+	for start := 0; start < len(addresses); start += maxAddressesPerQuery {
+		group := addresses[start:min(start+maxAddressesPerQuery, len(addresses))]
+		args := make([]any, 0, len(group)+1)
+		for _, address := range group {
+			args = append(args, address)
+		}
+		rows, err := s.db.QueryContext(context.Background(), addressesSearchSQL(len(group)), append(args, limit)...)
+		if err != nil {
+			return nil, fmt.Errorf("search conversations by addresses: %w", err)
+		}
+		hits, err := collectRows(rows, scanConversation)
+		if err != nil {
+			return nil, fmt.Errorf("search conversations by addresses: %w", err)
+		}
+		if len(group) == len(addresses) {
+			return hits, nil
+		}
+		found = append(found, hits...)
+	}
+	return newestConversations(found, limit), nil
+}
+
+// nonBlankAddresses returns the addresses that aren't blank, in order.
+func nonBlankAddresses(addresses []string) []string {
+	kept := make([]string, 0, len(addresses))
+	for _, address := range addresses {
+		if strings.TrimSpace(address) != "" {
+			kept = append(kept, address)
+		}
+	}
+	return kept
+}
+
+// newestConversations returns the conversations newest first, then in
+// conversation ID order, each ID once, and at most limit.
+func newestConversations(conversations []Conversation, limit int) []Conversation {
+	sorted := slices.Clone(conversations)
+	slices.SortStableFunc(sorted, func(a, b Conversation) int {
+		if a.LastMessageAtMS != b.LastMessageAtMS {
+			return cmp.Compare(b.LastMessageAtMS, a.LastMessageAtMS)
+		}
+		return strings.Compare(a.ConversationID, b.ConversationID)
+	})
+	seen := map[string]bool{}
+	newest := make([]Conversation, 0, min(len(sorted), limit))
+	for _, conversation := range sorted {
+		if len(newest) == limit {
+			break
+		}
+		if !seen[conversation.ConversationID] {
+			seen[conversation.ConversationID] = true
+			newest = append(newest, conversation)
+		}
+	}
+	return newest
+}
+
+// addressesSearchSQL is SearchConversationsByAddresses's query for count
+// addresses. It takes the addresses, then the limit. The IN reads the
+// addresses into an index under the collation of its left side, NOCASE,
+// once for the query.
+func addressesSearchSQL(count int) string {
+	values := strings.TrimSuffix(strings.Repeat("(?), ", count), ", ")
+	return `
+		WITH addresses(address) AS MATERIALIZED (
+			VALUES ` + values + `
+		)
+		SELECT ` + conversationColumns + `
+		FROM conversations
+		WHERE conversation_id IN (
+			SELECT cp.conversation_id
+			FROM conversation_participants cp
+			JOIN identities i ON i.identity_id = cp.identity_id
+			WHERE i.is_self = 0 AND i.canonical_value COLLATE NOCASE IN (SELECT address FROM addresses)
+		)
+		ORDER BY last_message_at_ms DESC, conversation_id
+		LIMIT ?`
 }
 
 // escapeLikePattern makes user text match literally inside a LIKE pattern

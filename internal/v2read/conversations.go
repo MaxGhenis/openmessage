@@ -77,6 +77,34 @@ func (s *Source) SearchConversationsByAddress(address string, limit int) ([]*db.
 	return s.mapSearchHits(conversations)
 }
 
+// SearchConversationsByPhoneLines is the v2 counterpart of the legacy
+// search for many phone lines: one query for the newest conversations that
+// SearchConversationsByPhoneLine returns for any of lines, at most limit.
+func (s *Source) SearchConversationsByPhoneLines(lines []string, limit int) ([]*db.Conversation, error) {
+	if err := s.ready(); err != nil {
+		return nil, err
+	}
+	conversations, err := s.store.SearchConversationsByPhoneLines(lines, limit)
+	if err != nil {
+		return nil, err
+	}
+	return s.mapSearchHits(conversations)
+}
+
+// SearchConversationsByAddresses is the v2 counterpart of the legacy search
+// for many addresses: one query for the newest conversations that
+// SearchConversationsByAddress returns for any of addresses, at most limit.
+func (s *Source) SearchConversationsByAddresses(addresses []string, limit int) ([]*db.Conversation, error) {
+	if err := s.ready(); err != nil {
+		return nil, err
+	}
+	conversations, err := s.store.SearchConversationsByAddresses(addresses, limit)
+	if err != nil {
+		return nil, err
+	}
+	return s.mapSearchHits(conversations)
+}
+
 // mapSearchHits maps a search's hits, and only those, to the canonical
 // legacy DTO.
 func (s *Source) mapSearchHits(conversations []sqlite.Conversation) ([]*db.Conversation, error) {
