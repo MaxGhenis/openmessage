@@ -188,14 +188,6 @@ func TestBatchedSearchesReturnTheNewestOfEachValuesSearch(t *testing.T) {
 		random := rand.New(rand.NewSource(seed))
 		store := openRepositoryTestStore(t)
 		seedBatchV2Store(t, random, store)
-		at := map[string]int64{}
-		everything, err := store.SearchConversationsByName("", 1000)
-		if err != nil {
-			t.Fatalf("list conversations: %v", err)
-		}
-		for _, conversation := range everything {
-			at[conversation.ConversationID] = conversation.LastMessageAtMS
-		}
 		note := func(kinds string, values []string, each [][]Conversation, limit int) {
 			withHits := 0
 			var all []Conversation
@@ -214,7 +206,7 @@ func TestBatchedSearchesReturnTheNewestOfEachValuesSearch(t *testing.T) {
 			}
 			if limit >= 1 && len(all) > limit {
 				exercised["a limit that cuts a batch of "+kinds]++
-				if at[all[limit].ConversationID] == at[all[limit-1].ConversationID] {
+				if all[limit].LastMessageAtMS == all[limit-1].LastMessageAtMS {
 					exercised["conversations that share a time across the limit of a batch of "+kinds]++
 				}
 			}

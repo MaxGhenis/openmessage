@@ -367,12 +367,14 @@ func TestMatchProperties(t *testing.T) {
 // SQLKeys answers SQLMatch for a whole set of lines at once, through SQLite:
 // a tuple of values is on one of the set's lines, as SQLMatch says for each
 // line in turn, exactly when a key that SQLKeys gives for the tuple is among
-// the lines' LineKeys. Tuples mix written numbers, WhatsApp JIDs,
-// identifiers that hold a line's digits, noise, blanks, NULLs, integers and
-// BLOBs, and sets run from no lines to six, so the first value that isn't
-// blank decides, as it does for SQLMatch, and a value off every line or a
-// set with no lines matches nothing. SQLKeys gives ValueKeys of that value,
-// at most ten, and NULL where it names no line.
+// the keys that KeysOfLines gives for the set. Tuples mix written numbers,
+// WhatsApp JIDs, identifiers that hold a line's digits, noise, blanks, NULLs,
+// integers and BLOBs, and sets run from no lines to six, so the first value
+// that isn't blank decides, as it does for SQLMatch, and a value off every
+// line or a set with no lines matches nothing. Some lines hold a NUL: SQL
+// text reaches SQLMatch cut there, and KeysOfLines cuts the line there too.
+// SQLKeys gives ValueKeys of that value, at most ten, and NULL where it names
+// no line.
 func TestSQLKeysAgreesWithSQLMatchOverSetsOfLines(t *testing.T) {
 	conn, err := sql.Open("sqlite", ":memory:")
 	if err != nil {
@@ -382,21 +384,22 @@ func TestSQLKeysAgreesWithSQLMatchOverSetsOfLines(t *testing.T) {
 	exercised := map[string]int{}
 	property := func(seed int64) bool {
 		random := rand.New(rand.NewSource(seed))
-		var lines []string
+		var lines, digits []string
 		for count := random.Intn(7); count > 0; count-- {
-			lines = append(lines, Line(randomDigits(random, 5+random.Intn(9))))
+			line := Line(randomDigits(random, 5+random.Intn(9)))
+			digits = append(digits, line)
+			switch random.Intn(8) {
+			case 0:
+				line += "\x00" + randomDigits(random, 7)
+			case 1:
+				line = "\x00" + line
+			}
+			lines = append(lines, line)
 		}
-		lineKeys := []string{}
-		for _, line := range lines {
-			lineKeys = append(lineKeys, LineKeys(line)...)
-		}
-		set, err := json.Marshal(lineKeys)
-		if err != nil {
-			t.Fatal(err)
-		}
+		set := KeysOfLines(lines)
 		base := randomDigits(random, 7+random.Intn(6))
-		if len(lines) > 0 && random.Intn(3) != 0 {
-			base = lines[random.Intn(len(lines))]
+		if len(digits) > 0 && random.Intn(3) != 0 {
+			base = digits[random.Intn(len(digits))]
 			if random.Intn(2) == 0 && len(base) > 7 {
 				base = base[random.Intn(len(base)-6):]
 			}
@@ -451,11 +454,17 @@ func TestSQLKeysAgreesWithSQLMatchOverSetsOfLines(t *testing.T) {
 				t.Fatalf("query %s: %v", SQLMatch, err)
 			}
 			want = want || matched == 1
+			if matched == 1 && strings.Contains(line, "\x00") {
+				exercised["a match through a line with a NUL"]++
+			}
+			if matched == 0 && strings.HasPrefix(line, "\x00") {
+				exercised["a line cut to nothing at a NUL"]++
+			}
 		}
 		var got int64
 		if err := conn.QueryRow(`SELECT EXISTS (
 			SELECT 1 FROM json_each(`+SQLKeys+`(`+placeholders+`)) AS value_key
-			WHERE value_key.value IN (SELECT value FROM json_each(?)))`, append(values, string(set))...).Scan(&got); err != nil {
+			WHERE value_key.value IN (SELECT value FROM json_each(?)))`, append(values, set)...).Scan(&got); err != nil {
 			t.Fatalf("query %s: %v", SQLKeys, err)
 		}
 		if (got == 1) != want {
@@ -505,6 +514,7 @@ func TestSQLKeysAgreesWithSQLMatchOverSetsOfLines(t *testing.T) {
 	for _, path := range []string{
 		"a set with no lines", "a tuple on one of the lines", "a tuple off every line",
 		"a tuple whose first value is blank", "a NULL", "an INTEGER", "a BLOB",
+		"a match through a line with a NUL", "a line cut to nothing at a NUL",
 	} {
 		if exercised[path] == 0 {
 			t.Errorf("the property never drew %s (drew %v)", path, exercised)
