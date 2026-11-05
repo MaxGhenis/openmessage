@@ -30,6 +30,16 @@ const signalCLIShutdownLine = "INFO  Shutdown - Received SIGTERM signal, shuttin
 // fake receive call can run into it quickly.
 const testReceiveCallDeadline = 50 * time.Millisecond
 
+// testReceiveRetryDelay stands in for the 500 ms pause after a failed call,
+// which a script can otherwise spend seconds on.
+const testReceiveRetryDelay = time.Millisecond
+
+// receiveLoopWait bounds a wait for the receive loop to reach the state a
+// test expects. It guards against a hang and claims nothing about speed:
+// each call's output goes through the real store, and under -race on a host
+// with every core busy one envelope has taken 1.4 s.
+const receiveLoopWait = time.Minute
+
 var errSignalCLIExit = errors.New("exit status 1")
 
 func failedReceiveEnvelope(sender string, ts int64, body string) string {
@@ -47,8 +57,9 @@ func runIntoDeadline(ctx context.Context, output string) ([]byte, error) {
 }
 
 // newFailedReceiveBridge wires a bridge to a real store, shortens the receive
-// deadline, and swaps runSignalCLI for receive, which answers the receive
-// calls the loop makes.
+// deadline and the pause after a failed call, and swaps runSignalCLI for
+// receive, which answers the receive calls the loop makes. Start the loop
+// with startTrackedReceiveLoop, so the cleanup's Close waits for it.
 func newFailedReceiveBridge(
 	t *testing.T,
 	receive func(ctx context.Context, call int32) ([]byte, error),
@@ -62,13 +73,17 @@ func newFailedReceiveBridge(
 
 	originalRun := runSignalCLI
 	originalDeadline := receiveCallDeadline
+	originalRetryDelay := receiveRetryDelay
 	originalVersionProbe := probeSignalCLIVersion
 	t.Cleanup(func() {
+		// Close returns once the loop and every goroutine it started have
+		// returned, so none of them reads the globals restored below.
 		_ = bridge.Close()
 		bridge.commandMu.Lock()
 		runSignalCLI = originalRun
 		receiveCallDeadline = originalDeadline
 		bridge.commandMu.Unlock()
+		receiveRetryDelay = originalRetryDelay
 		probeSignalCLIVersion = originalVersionProbe
 		store.Close()
 	})
@@ -76,6 +91,7 @@ func newFailedReceiveBridge(
 		return []byte("signal-cli 0.14.9"), nil
 	}
 	receiveCallDeadline = testReceiveCallDeadline
+	receiveRetryDelay = testReceiveRetryDelay
 
 	var calls atomic.Int32
 	runSignalCLI = func(ctx context.Context, configDir string, args ...string) ([]byte, error) {
@@ -89,6 +105,21 @@ func newFailedReceiveBridge(
 		return []byte{}, nil
 	}
 	return bridge, store, &calls
+}
+
+// startTrackedReceiveLoop runs the bridge's receive loop on a goroutine that
+// Close waits for, as Connect does, and returns a channel that closes when
+// the loop returns. A loop started with a bare go statement can outlive its
+// test: Close cancels it but does not wait, so it may still be storing a
+// batch, or starting a recovery sync that calls runSignalCLI, after the
+// cleanup has handed the package globals to the next test.
+func startTrackedReceiveLoop(bridge *Bridge, account string) <-chan struct{} {
+	returned := make(chan struct{})
+	bridge.goTracked(func() {
+		defer close(returned)
+		bridge.startReceiveLoop(account, false)
+	})
+	return returned
 }
 
 func signalBodies(t *testing.T, store *db.Store, sender string) []string {
@@ -123,8 +154,8 @@ func TestStartReceiveLoopKeepsEnvelopesFromTimedOutReceive(t *testing.T) {
 	unregister := bridge.ObserveIngress(func(string, []byte, string, string) { observed.Add(1) })
 	defer unregister()
 
-	go bridge.startReceiveLoop(failedReceiveAccount, false)
-	waitForCondition(t, 2*time.Second, func() bool { return calls.Load() >= 3 })
+	startTrackedReceiveLoop(bridge, failedReceiveAccount)
+	waitForCondition(t, receiveLoopWait, func() bool { return calls.Load() >= 3 })
 
 	if got := signalBodies(t, store, sender); !slices.Equal(got, []string{"sent just before the deadline"}) {
 		t.Fatalf("stored bodies = %q, want the envelope printed before the deadline", got)
@@ -154,8 +185,8 @@ func TestStartReceiveLoopTreatsDeadlineHitsThatDeliveredAsBatches(t *testing.T) 
 		return []byte{}, nil
 	})
 
-	go bridge.startReceiveLoop(failedReceiveAccount, false)
-	waitForCondition(t, 3*time.Second, func() bool { return calls.Load() > hits+1 })
+	startTrackedReceiveLoop(bridge, failedReceiveAccount)
+	waitForCondition(t, receiveLoopWait, func() bool { return calls.Load() > hits+1 })
 
 	if status := bridge.Status(); !status.Connected || status.LastError != "" {
 		t.Fatalf("%d deadline hits that delivered envelopes forced a reconnect; status = %+v", hits, status)
@@ -181,11 +212,15 @@ func TestStartReceiveLoopKeepsEnvelopesFromFailedReceiveAndStillCountsFailure(t 
 		return []byte(out), errSignalCLIExit
 	})
 
-	go bridge.startReceiveLoop(failedReceiveAccount, false)
-	waitForCondition(t, 2*time.Second, func() bool {
-		status := bridge.Status()
-		return !status.Connected && !status.Connecting && strings.Contains(status.LastError, "connection reset")
-	})
+	returned := startTrackedReceiveLoop(bridge, failedReceiveAccount)
+	select {
+	case <-returned:
+	case <-time.After(receiveLoopWait):
+		t.Fatalf("the receive loop did not give up within %s", receiveLoopWait)
+	}
+	if status := bridge.Status(); status.Connected || status.Connecting || !strings.Contains(status.LastError, "connection reset") {
+		t.Fatalf("status = %+v after the loop gave up, want disconnected with the receive error", status)
+	}
 
 	want := make([]string, 0, receiveFailureLimit)
 	for call := 1; call <= receiveFailureLimit; call++ {
@@ -262,18 +297,18 @@ func TestStartReceiveLoopStoresEveryPrintedEnvelopeProperty(t *testing.T) {
 				}
 				return []byte(out), nil
 			})
-			go bridge.startReceiveLoop(failedReceiveAccount, false)
+			returned := startTrackedReceiveLoop(bridge, failedReceiveAccount)
 			// The loop either runs past the end of the script or gives up
 			// after receiveFailureLimit consecutive failures and disconnects.
-			waitForCondition(t, 5*time.Second, func() bool {
-				select {
-				case <-done:
-					return true
-				default:
+			select {
+			case <-done:
+			case <-returned:
+				if status := bridge.Status(); status.Connected || status.Connecting || status.LastError == "" {
+					t.Fatalf("the receive loop returned before the end of the script without giving up: status %+v (script %+v)", status, script.Calls)
 				}
-				status := bridge.Status()
-				return !status.Connected && !status.Connecting && status.LastError != ""
-			})
+			case <-time.After(receiveLoopWait):
+				t.Fatalf("the receive loop neither finished the script nor gave up within %s (script %+v)", receiveLoopWait, script.Calls)
+			}
 			mu.Lock()
 			want := slices.Clone(printed)
 			mu.Unlock()

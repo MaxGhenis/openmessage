@@ -3,7 +3,6 @@ package ingest
 import (
 	"context"
 	"crypto/sha256"
-	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -1160,10 +1159,7 @@ func countSignalRows(t *testing.T, path, table string) int {
 	if table != "inbox" && table != "messages" {
 		t.Fatalf("unsupported count table %q", table)
 	}
-	database, err := sql.Open("sqlite", path)
-	if err != nil {
-		t.Fatalf("sql.Open(%s): %v", table, err)
-	}
+	database := openSQLiteInspector(t, path)
 	defer database.Close()
 	var count int
 	query := "SELECT COUNT(*) FROM " + table + " WHERE account_id = ?"
@@ -1175,10 +1171,7 @@ func countSignalRows(t *testing.T, path, table string) int {
 
 func countSignalReactionRows(t *testing.T, path, messageID string) int {
 	t.Helper()
-	database, err := sql.Open("sqlite", path)
-	if err != nil {
-		t.Fatalf("sql.Open(reactions): %v", err)
-	}
+	database := openSQLiteInspector(t, path)
 	defer database.Close()
 	var count int
 	if err := database.QueryRow(`
@@ -1197,10 +1190,7 @@ func migratedSignalMessageKeys(
 	conversationID string,
 ) (remoteMessageID string, messageID string) {
 	t.Helper()
-	database, err := sql.Open("sqlite", path)
-	if err != nil {
-		t.Fatalf("sql.Open(migrated): %v", err)
-	}
+	database := openSQLiteInspector(t, path)
 	defer database.Close()
 	if err := database.QueryRow(`
 		SELECT remote_message_id, message_id

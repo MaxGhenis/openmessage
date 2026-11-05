@@ -120,7 +120,7 @@ func TestRecordInboundAttachmentReferenceIsTheLastNamedUpdate(t *testing.T) {
 		}
 		return true
 	}
-	if err := quick.Check(property, &quick.Config{MaxCount: 300}); err != nil {
+	if err := quick.Check(property, &quick.Config{MaxCount: propertyCases(300, 60)}); err != nil {
 		t.Fatal(err)
 	}
 }
