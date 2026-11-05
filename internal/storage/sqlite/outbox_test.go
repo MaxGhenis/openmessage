@@ -2153,7 +2153,7 @@ func TestOutboxLateConfirmationWinsBeforeRecovery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RecoverExpiredLeases(): %v", err)
 	}
-	if recovered != (RecoveredLeases{}) {
+	if recovered.NotDispatched != 0 || recovered.Uncertain != 0 || len(recovered.Failed) != 0 {
 		t.Fatalf("RecoverExpiredLeases() = %+v, want no recovered terminal row", recovered)
 	}
 	confirmed, err := repository.FindByID(ctx, item.OutboxID)

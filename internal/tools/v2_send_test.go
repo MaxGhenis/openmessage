@@ -475,6 +475,13 @@ func newV2ToolHarness(t *testing.T, steps ...v2ToolSendStep) *v2ToolHarness {
 		t.Errorf("MessageService could not %v", err)
 		failHarness(err)
 	})
+	// A lease whose recovery fails leaves its row dispatching and the pass
+	// goes on, so without this a tool test would pass over it too.
+	service.OnRecoveryFailure(func(recovery messaging.FailedRecovery) {
+		err := fmt.Errorf("recover expired lease of outbox item %s: %s", recovery.OutboxID, recovery.Error)
+		t.Errorf("MessageService could not %v", err)
+		failHarness(err)
+	})
 	runCtx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
