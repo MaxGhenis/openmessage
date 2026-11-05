@@ -264,74 +264,133 @@ func TestDownloadWatchCountsOnlyTheCallsOwnDownloadFiles(t *testing.T) {
 
 // --- runSignalCLI with a stub signal-cli -------------------------------------
 
-// drainStubSignalCLI ignores SIGTERM like signal-cli finishing an envelope,
-// and touches STUB_READY once its trap is set. STUB_MODE picks what it does
-// meanwhile: grow streams STUB_STEPS chunks of
-// ciphertext into its temp dir and then prints STUB_ENVELOPE; stall creates
-// the ciphertext file and never writes to it; store creates a fresh
+// drainStubSignalCLI ignores SIGTERM like signal-cli finishing an envelope.
+// STUB_MODE picks its download: grow streams a chunk of ciphertext into its
+// temp dir every 50 ms until it has written STUB_STEPS chunks or STUB_FINISH
+// exists, and then prints STUB_ENVELOPE and exits 0; stall creates the
+// ciphertext file and never writes to it; store creates a fresh
 // attachments/*.tmp in STUB_CONFIG and never writes to it; idle downloads
-// nothing. Each step is 50 ms.
+// nothing. It touches STUB_READY once its trap is set and its download has
+// begun, so a drain that starts after that always sees the download.
 const drainStubSignalCLI = `#!/bin/sh
 trap 'echo "INFO  Shutdown - Received SIGTERM signal, shutting down ..." >&2' TERM
-: > "$STUB_READY"
 f="$TMPDIR/signal-cli_tmp_1.tmp"
 case "$STUB_MODE" in
-grow)
-	: > "$f"
+grow|stall) : > "$f" ;;
+store) mkdir -p "$STUB_CONFIG/attachments" && : > "$STUB_CONFIG/attachments/photo.jpg.42.tmp" ;;
+esac
+: > "$STUB_READY"
+if [ "$STUB_MODE" = grow ]; then
 	i=0
-	while [ "$i" -lt "$STUB_STEPS" ]; do
+	while [ "$i" -lt "$STUB_STEPS" ] && [ ! -e "$STUB_FINISH" ]; do
 		printf 'ciphertext' >> "$f"
 		sleep 0.05
 		i=$((i+1))
 	done
 	rm -f "$f"
 	printf '%s\n' "$STUB_ENVELOPE"
-	exit 0 ;;
-stall) : > "$f" ;;
-store) mkdir -p "$STUB_CONFIG/attachments" && : > "$STUB_CONFIG/attachments/photo.jpg.42.tmp" ;;
-esac
+	exit 0
+fi
 while :; do sleep 0.05; done
 `
 
 const drainStubEnvelope = `{"envelope":{"source":"+15551234567","timestamp":1700000000123}}`
 
-// stubDeadline is a context that ends deadline after the stub has set its
-// SIGTERM trap (STUB_READY appears), so a loaded host can't deliver the
-// SIGTERM to a shell that would still die of it.
-func stubDeadline(t *testing.T, deadline time.Duration) context.Context {
+// stubReadyWait bounds how long a stub may take to start. A freshly written
+// script can take seconds to start on a loaded macOS host.
+const stubReadyWait = time.Minute
+
+// stubStop ends a stub call's context deadline after the stub is ready, and
+// records when it did. The tests time what the drain does from that stop,
+// not from the spawn: how long the stub takes to start is no part of the
+// drain, and on a loaded host it varies by seconds.
+type stubStop struct {
+	ctx      context.Context
+	returned chan struct{} // closed by stopped once the call has returned
+	done     chan struct{} // closed once the stopper has finished
+	ready    bool          // STUB_READY appeared; read after done
+	at       time.Time     // when the deadline ended ctx, zero if it never did; read after done
+}
+
+// stubDeadline returns a stop whose context ends deadline after STUB_READY
+// appears, so the SIGTERM always reaches a shell that has set its trap and
+// begun its download.
+func stubDeadline(t *testing.T, deadline time.Duration) *stubStop {
 	t.Helper()
 	ready := filepath.Join(t.TempDir(), "ready")
 	t.Setenv("STUB_READY", ready)
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
+	stop := &stubStop{ctx: ctx, returned: make(chan struct{}), done: make(chan struct{})}
 	go func() {
-		for give := time.Now().Add(30 * time.Second); time.Now().Before(give); time.Sleep(5 * time.Millisecond) {
+		defer close(stop.done)
+		poll := time.NewTicker(5 * time.Millisecond)
+		defer poll.Stop()
+		giveUp := time.After(stubReadyWait)
+		for !stop.ready {
 			if _, err := os.Stat(ready); err == nil {
+				stop.ready = true
 				break
+			}
+			select {
+			case <-stop.returned:
+				return
+			case <-giveUp:
+				cancel() // end the call; stopped reports the stub never started
+				return
+			case <-poll.C:
 			}
 		}
 		select {
+		case <-stop.returned:
+			return
 		case <-time.After(deadline):
-			cancel()
-		case <-ctx.Done():
 		}
+		stop.at = time.Now()
+		cancel()
 	}()
-	return ctx
+	return stop
+}
+
+// stopped, called once the call has returned, gives the moment the deadline
+// stopped it. It fails the test if the stub never started or the call ended
+// before its deadline.
+func (s *stubStop) stopped(t *testing.T, err error, output []byte) time.Time {
+	t.Helper()
+	close(s.returned)
+	<-s.done
+	if !s.ready {
+		t.Fatalf("the stub did not start within %s: err = %v, output = %q", stubReadyWait, err, output)
+	}
+	if s.at.IsZero() {
+		t.Fatalf("the call ended before its deadline stopped it: err = %v, output = %q", err, output)
+	}
+	return s.at
 }
 
 type drainRun struct {
-	output   string
-	err      error
-	elapsed  time.Duration
-	held     bool
-	beats    int32
-	holdLeft bool // still holding after runSignalCLI returned
+	output     string
+	err        error
+	afterStop  time.Duration // from the deadline's stop to runSignalCLI's return
+	afterAbort time.Duration // from the caller's stop to the return; zero without one
+	held       bool          // the drain held the call open for its download
+	beats      int32
+	holdLeft   bool // still holding after runSignalCLI returned
+}
+
+// drainEvents says what happens once the drain first holds the call open.
+type drainEvents struct {
+	// callerStops closes the drain request's abort, as Close, Unpair or a
+	// new generation does.
+	callerStops bool
+	// finishAfter, when positive, ends the stub's download this long later.
+	finishAfter time.Duration
 }
 
 // runDrained runs the stub through the real runSignalCLI as the receive loop
-// does: deadline after deadline, drained, with abort closing after abortAfter
-// (zero: never).
-func runDrained(t *testing.T, policy receiveDrainPolicy, mode string, deadline, abortAfter time.Duration) drainRun {
+// does: stopped by its deadline, drained, and with then happening once the
+// drain holds the call.
+func runDrained(t *testing.T, policy receiveDrainPolicy, mode string, deadline time.Duration, then drainEvents) drainRun {
 	t.Helper()
 	t.Setenv("TMPDIR", t.TempDir())
 	stub := filepath.Join(t.TempDir(), "signal-cli-stub")
@@ -339,10 +398,12 @@ func runDrained(t *testing.T, policy receiveDrainPolicy, mode string, deadline, 
 		t.Fatal(err)
 	}
 	configDir := t.TempDir()
+	finish := filepath.Join(t.TempDir(), "finish")
 	t.Setenv("OPENMESSAGES_SIGNAL_CLI", stub)
 	t.Setenv("STUB_MODE", mode)
 	t.Setenv("STUB_CONFIG", configDir)
 	t.Setenv("STUB_ENVELOPE", drainStubEnvelope)
+	t.Setenv("STUB_FINISH", finish)
 	if os.Getenv("STUB_STEPS") == "" {
 		t.Setenv("STUB_STEPS", "1")
 	}
@@ -350,48 +411,74 @@ func runDrained(t *testing.T, policy receiveDrainPolicy, mode string, deadline, 
 	receiveDrain = policy
 	t.Cleanup(func() { receiveDrain = original })
 
-	abort := make(chan struct{})
-	if abortAfter > 0 {
-		timer := time.AfterFunc(abortAfter, func() { close(abort) })
-		t.Cleanup(func() { timer.Stop() })
-	}
 	var holding drainFlag
-	var held atomic.Bool
-	var beats atomic.Int32
-	watching := make(chan struct{})
-	watched := make(chan struct{})
+	held := holding.started() // closes the first time the drain holds the call
+	abort := make(chan struct{})
+	var abortedAt time.Time
+	returned := make(chan struct{})
+	acted := make(chan struct{})
 	go func() {
-		defer close(watched)
-		for {
-			if holding.Load() {
-				held.Store(true)
-			}
+		defer close(acted)
+		if !then.callerStops && then.finishAfter <= 0 {
+			return
+		}
+		select {
+		case <-held:
+		case <-returned:
+			return
+		}
+		if then.callerStops {
+			abortedAt = time.Now()
+			close(abort)
+		}
+		if then.finishAfter > 0 {
 			select {
-			case <-watching:
+			case <-time.After(then.finishAfter):
+			case <-returned:
 				return
-			case <-time.After(5 * time.Millisecond):
+			}
+			if err := os.WriteFile(finish, nil, 0o600); err != nil {
+				t.Errorf("finish the stub's download: %v", err)
 			}
 		}
 	}()
 
-	ctx := withReceiveDrain(stubDeadline(t, deadline), receiveDrainRequest{
+	var beats atomic.Int32
+	stop := stubDeadline(t, deadline)
+	ctx := withReceiveDrain(stop.ctx, receiveDrainRequest{
 		abort:   abort,
 		holding: &holding,
 		beat:    func(string) { beats.Add(1) },
 		logger:  zerolog.Nop(),
 	})
-	started := time.Now()
 	output, err := runSignalCLI(ctx, configDir, "-a", "+15550000000", "--output", "json", "receive")
-	elapsed := time.Since(started)
+	returnedAt := time.Now()
 	left := holding.Load()
-	close(watching)
-	<-watched
-	return drainRun{output: string(output), err: err, elapsed: elapsed, held: held.Load(), beats: beats.Load(), holdLeft: left}
+	close(returned)
+	<-acted
+	run := drainRun{
+		output:    string(output),
+		err:       err,
+		afterStop: returnedAt.Sub(stop.stopped(t, err, output)),
+		held:      isClosed(held),
+		beats:     beats.Load(),
+		holdLeft:  left,
+	}
+	if !abortedAt.IsZero() {
+		run.afterAbort = returnedAt.Sub(abortedAt)
+	}
+	return run
 }
 
 func testDrainPolicy() receiveDrainPolicy {
 	return receiveDrainPolicy{idle: 300 * time.Millisecond, stall: 1500 * time.Millisecond, limit: 20 * time.Second, tick: 25 * time.Millisecond}
 }
+
+// drainSlack bounds how long after the drain's verdict a test accepts the
+// call to return: the next tick, the kill and the stub's exit. It is
+// counted from the stop, which the drain itself starts from, so a slow
+// spawn never uses it up.
+const drainSlack = 3 * time.Second
 
 func wasKilled(err error) bool {
 	var exitErr *exec.ExitError
@@ -399,10 +486,13 @@ func wasKilled(err error) bool {
 }
 
 func TestRunSignalCLIDrainsAStoppedReceiveWhileItsDownloadGrows(t *testing.T) {
-	t.Setenv("STUB_STEPS", "30") // 1.5 s, five idle graces
-	run := runDrained(t, testDrainPolicy(), "grow", 200*time.Millisecond, 0)
+	t.Setenv("STUB_STEPS", "1000000") // grows until the test finishes it
+	policy := testDrainPolicy()
+	// The download keeps growing for three idle graces after the drain
+	// first holds the call, then finishes.
+	run := runDrained(t, policy, "grow", 200*time.Millisecond, drainEvents{finishAfter: 3 * policy.idle})
 	if !strings.Contains(run.output, drainStubEnvelope) {
-		t.Fatalf("output = %q (err %v after %s), want the envelope printed once the download finished", run.output, run.err, run.elapsed)
+		t.Fatalf("output = %q (err %v, %s after the stop), want the envelope printed once the download finished", run.output, run.err, run.afterStop)
 	}
 	if !errors.Is(run.err, context.Canceled) {
 		t.Fatalf("err = %v, want the stop: the call exited 0 after it", run.err)
@@ -417,13 +507,12 @@ func TestRunSignalCLIDrainsAStoppedReceiveWhileItsDownloadGrows(t *testing.T) {
 
 func TestRunSignalCLIKillsADrainedReceiveWhoseDownloadStalls(t *testing.T) {
 	policy := testDrainPolicy()
-	deadline := 200 * time.Millisecond
-	run := runDrained(t, policy, "stall", deadline, 0)
+	run := runDrained(t, policy, "stall", 200*time.Millisecond, drainEvents{})
 	if !wasKilled(run.err) {
-		t.Fatalf("err = %v after %s, want the call killed", run.err, run.elapsed)
+		t.Fatalf("err = %v %s after the stop, want the call killed", run.err, run.afterStop)
 	}
-	if run.elapsed < deadline+policy.stall || run.elapsed > deadline+policy.stall+3*time.Second {
-		t.Fatalf("killed after %s, want about the deadline plus the %s stall window", run.elapsed, policy.stall)
+	if run.afterStop < policy.stall || run.afterStop > policy.stall+drainSlack {
+		t.Fatalf("killed %s after the stop, want about the %s stall window", run.afterStop, policy.stall)
 	}
 }
 
@@ -432,13 +521,12 @@ func TestRunSignalCLIKillsADrainedReceiveWhoseDownloadStalls(t *testing.T) {
 // Its presence alone holds the call, up to the stall window.
 func TestRunSignalCLIHoldsAReceiveStoringAnAttachmentUntilTheStallWindow(t *testing.T) {
 	policy := testDrainPolicy()
-	deadline := 200 * time.Millisecond
-	run := runDrained(t, policy, "store", deadline, 0)
+	run := runDrained(t, policy, "store", 200*time.Millisecond, drainEvents{})
 	if !wasKilled(run.err) || !run.held {
-		t.Fatalf("err = %v, held = %v after %s; want held, then killed", run.err, run.held, run.elapsed)
+		t.Fatalf("err = %v, held = %v %s after the stop; want held, then killed", run.err, run.held, run.afterStop)
 	}
-	if run.elapsed < deadline+policy.stall {
-		t.Fatalf("killed after %s, before the %s stall window: the store file was not counted", run.elapsed, policy.stall)
+	if run.afterStop < policy.stall {
+		t.Fatalf("killed %s after the stop, before the %s stall window: the store file was not counted", run.afterStop, policy.stall)
 	}
 }
 
@@ -446,25 +534,23 @@ func TestRunSignalCLIKillsADrainedReceiveAtTheLimit(t *testing.T) {
 	t.Setenv("STUB_STEPS", "1000000")
 	policy := testDrainPolicy()
 	policy.limit = 1500 * time.Millisecond
-	deadline := 200 * time.Millisecond
-	run := runDrained(t, policy, "grow", deadline, 0)
+	run := runDrained(t, policy, "grow", 200*time.Millisecond, drainEvents{})
 	if !wasKilled(run.err) {
-		t.Fatalf("err = %v after %s, want the call killed", run.err, run.elapsed)
+		t.Fatalf("err = %v %s after the stop, want the call killed", run.err, run.afterStop)
 	}
-	if run.elapsed < deadline+policy.limit || run.elapsed > deadline+policy.limit+3*time.Second {
-		t.Fatalf("killed after %s, want about the deadline plus the %s limit", run.elapsed, policy.limit)
+	if run.afterStop < policy.limit || run.afterStop > policy.limit+drainSlack {
+		t.Fatalf("killed %s after the stop, want about the %s limit", run.afterStop, policy.limit)
 	}
 }
 
 func TestRunSignalCLIKillsAStoppedReceiveWithoutADownloadAfterTheIdleGrace(t *testing.T) {
 	policy := testDrainPolicy()
-	deadline := 200 * time.Millisecond
-	run := runDrained(t, policy, "idle", deadline, 0)
+	run := runDrained(t, policy, "idle", 200*time.Millisecond, drainEvents{})
 	if !wasKilled(run.err) || run.held {
-		t.Fatalf("err = %v, held = %v after %s; want killed without being held", run.err, run.held, run.elapsed)
+		t.Fatalf("err = %v, held = %v %s after the stop; want killed without being held", run.err, run.held, run.afterStop)
 	}
-	if run.elapsed < deadline+policy.idle || run.elapsed > deadline+policy.idle+3*time.Second {
-		t.Fatalf("killed after %s, want about the deadline plus the %s idle grace", run.elapsed, policy.idle)
+	if run.afterStop < policy.idle || run.afterStop > policy.idle+drainSlack {
+		t.Fatalf("killed %s after the stop, want about the %s idle grace", run.afterStop, policy.idle)
 	}
 }
 
@@ -474,14 +560,12 @@ func TestRunSignalCLIKillsAStoppedReceiveWithoutADownloadAfterTheIdleGrace(t *te
 func TestRunSignalCLIEndsTheDrainWhenTheCallerStops(t *testing.T) {
 	t.Setenv("STUB_STEPS", "1000000")
 	policy := testDrainPolicy()
-	deadline := 200 * time.Millisecond
-	abortAfter := 900 * time.Millisecond
-	run := runDrained(t, policy, "grow", deadline, abortAfter)
-	if !wasKilled(run.err) {
-		t.Fatalf("err = %v after %s, want the call killed", run.err, run.elapsed)
+	run := runDrained(t, policy, "grow", 200*time.Millisecond, drainEvents{callerStops: true})
+	if !wasKilled(run.err) || !run.held {
+		t.Fatalf("err = %v, held = %v %s after the stop; want the call held for its download, then killed", run.err, run.held, run.afterStop)
 	}
-	if run.elapsed < abortAfter+policy.idle || run.elapsed > abortAfter+policy.idle+3*time.Second {
-		t.Fatalf("killed after %s, want about the caller's stop plus the %s idle grace", run.elapsed, policy.idle)
+	if run.afterAbort < policy.idle || run.afterAbort > policy.idle+drainSlack {
+		t.Fatalf("killed %s after the caller stopped, want about the %s idle grace", run.afterAbort, policy.idle)
 	}
 }
 
@@ -499,13 +583,12 @@ func TestRunSignalCLIWithoutADrainRequestKeepsTheFixedGrace(t *testing.T) {
 	t.Setenv("OPENMESSAGES_SIGNAL_CLI", stub)
 	t.Setenv("STUB_MODE", "grow")
 	t.Setenv("STUB_STEPS", "1000000")
-	deadline := 200 * time.Millisecond
-	ctx := stubDeadline(t, deadline)
-	started := time.Now()
-	_, err := runSignalCLI(ctx, t.TempDir(), "listContacts")
-	elapsed := time.Since(started)
-	if !wasKilled(err) || elapsed < deadline+signalStopGrace || elapsed > deadline+signalStopGrace+3*time.Second {
-		t.Fatalf("err = %v after %s, want killed about %s after the deadline", err, elapsed, signalStopGrace)
+	t.Setenv("STUB_FINISH", filepath.Join(t.TempDir(), "finish"))
+	stop := stubDeadline(t, 200*time.Millisecond)
+	output, err := runSignalCLI(stop.ctx, t.TempDir(), "listContacts")
+	afterStop := time.Since(stop.stopped(t, err, output))
+	if !wasKilled(err) || afterStop < signalStopGrace || afterStop > signalStopGrace+drainSlack {
+		t.Fatalf("err = %v %s after the stop, want killed %s after it", err, afterStop, signalStopGrace)
 	}
 }
 
@@ -531,8 +614,8 @@ func TestStartReceiveLoopDrainsReceiveCallsUntilTheLoopStops(t *testing.T) {
 		}
 		return []byte{}, nil
 	})
-	go bridge.startReceiveLoop(failedReceiveAccount, false)
-	waitForCondition(t, 2*time.Second, func() bool { return calls.Load() >= 2 })
+	startTrackedReceiveLoop(bridge, failedReceiveAccount)
+	waitForCondition(t, receiveLoopWait, func() bool { return calls.Load() >= 2 })
 
 	first := <-requests
 	if !first.ok {

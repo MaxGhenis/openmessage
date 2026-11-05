@@ -879,16 +879,19 @@ func TestStartReceiveLoopDropsSignalConnectionAfterRepeatedReceiveFailures(t *te
 
 	originalRun := runSignalCLI
 	originalVersionProbe := probeSignalCLIVersion
+	originalRetryDelay := receiveRetryDelay
 	defer func() {
 		_ = bridge.Close()
 		bridge.commandMu.Lock()
 		runSignalCLI = originalRun
 		bridge.commandMu.Unlock()
 		probeSignalCLIVersion = originalVersionProbe
+		receiveRetryDelay = originalRetryDelay
 	}()
 	probeSignalCLIVersion = func(context.Context) ([]byte, error) {
 		return []byte("signal-cli 0.14.5"), nil
 	}
+	receiveRetryDelay = testReceiveRetryDelay
 
 	var receiveCalls atomic.Int32
 	runSignalCLI = func(ctx context.Context, configDir string, args ...string) ([]byte, error) {
@@ -902,9 +905,9 @@ func TestStartReceiveLoopDropsSignalConnectionAfterRepeatedReceiveFailures(t *te
 		return []byte{}, nil
 	}
 
-	go bridge.startReceiveLoop("+15551230000", false)
+	startTrackedReceiveLoop(bridge, "+15551230000")
 
-	waitForCondition(t, 2*time.Second, func() bool {
+	waitForCondition(t, receiveLoopWait, func() bool {
 		status := bridge.Status()
 		return !status.Connected &&
 			!status.Connecting &&
@@ -950,12 +953,12 @@ func TestStartReceiveLoopIgnoresIdleReceiveTimeouts(t *testing.T) {
 		return []byte{}, nil
 	}
 
-	go bridge.startReceiveLoop("+15551230000", false)
+	startTrackedReceiveLoop(bridge, "+15551230000")
 
-	waitForCondition(t, 2*time.Second, func() bool {
+	waitForCondition(t, receiveLoopWait, func() bool {
 		return receiveCalls.Load() >= int32(receiveFailureLimit+1)
 	})
-	waitForCondition(t, 2*time.Second, func() bool {
+	waitForCondition(t, receiveLoopWait, func() bool {
 		return !bridge.Status().Connected
 	})
 

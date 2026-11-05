@@ -1381,7 +1381,7 @@ func TestOutboxRepointEchoMergeConvergesWithOneMessageProperty(t *testing.T) {
 		assertNoMessageReferences(t, store, echoMergeEchoID)
 		return !t.Failed()
 	}
-	if err := quick.Check(property, &quick.Config{MaxCount: 300, Rand: rand.New(rand.NewSource(20261010))}); err != nil {
+	if err := quick.Check(property, &quick.Config{MaxCount: propertyCases(300, 60), Rand: rand.New(rand.NewSource(20261010))}); err != nil {
 		t.Fatal(err)
 	}
 	for _, name := range []string{
