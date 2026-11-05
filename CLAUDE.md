@@ -92,7 +92,9 @@ it (an older one reports the store as newer than supported; a newer one asks
 you to reopen the app). So on a macOS app install, `/usr/local/bin/openmessage`
 should be a symlink to the app bundle's binary (see the runbook's "MCP config").
 Opening the legacy store still writes: `db.New` runs `migrate()` on every open,
-which drops and recreates three `contact_avatars` indexes. It also keeps one
+which drops and recreates three `contact_avatars` indexes and creates any index
+the store lacks, such as `idx_conversations_newest_first` on a store an older
+build wrote. It also keeps one
 row of each group of Signal rows that share a conversation, sender and
 timestamp and deletes the rest with their search index entries (with no group
 to clean, it only reads), and it rebuilds the FTS index in one transaction
@@ -161,7 +163,14 @@ address once. Call `om_address_match` and `om_phone_line_match` only through
 `addressmatch.SQL` and `phoneline.SQL`, which cast each argument to BLOB. The
 `modernc.org/sqlite` driver hands a Go function a TEXT argument only up to its
 first NUL, so values that differ after one would match. Threads that share a
-time come in conversation ID order in both stores. The route tool ignores the
+time come in conversation ID order in both stores. The tool asks the serving
+store once for all the lines a name's cards and threads give
+(`SearchConversationsByPhoneLines`) and once for all the other values
+(`SearchConversationsByAddresses`). Each batch returns the newest of what the
+search for each value returns, and if a batch fails, the tool runs those
+searches. `ListContactsFromConversations` reads legacy threads newest first
+through the partial index `idx_conversations_newest_first` and stops at its
+limit. The route tool ignores the
 account's owner, whom most threads list: a thread that a query matches only
 through the owner's entry or the owner's own messages gives no route. v2's
 conversation search skips the owner's identity. The legacy search skips
