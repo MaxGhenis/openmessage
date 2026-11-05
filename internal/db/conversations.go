@@ -584,31 +584,36 @@ func phoneLinesSearchSQL(keys string) string {
 
 // maxAddressesPerQuery caps the addresses that one query of
 // SearchConversationsByAddresses binds, each as its own value, far below
-// SQLite's default cap of 32,766 bound values. Tests lower it to make the
-// search split its addresses across queries.
-var maxAddressesPerQuery = 1000
+// SQLite's default cap of 32,766 bound values.
+const maxAddressesPerQuery = 1000
 
 // SearchConversationsByAddresses looks for many addresses at once. It
-// returns the conversations that SearchConversationsByAddress returns for
-// any of addresses: the newest of those searches' hits, newest first, then
-// in conversation ID order, and at most limit. Since every search matches
-// before its limit, those are the newest threads that hold any of the
-// addresses as a whole. A query binds each address as that search binds
-// it, compares values with the same NOCASE collation, reads each
-// participant entry and each distinct sender number once, and looks each
-// value up among the addresses, which SQLite reads into an index once, so
-// its cost hardly grows with the number of addresses. Past
-// maxAddressesPerQuery addresses it runs a query for each group of that
+// returns the newest of the conversations that SearchConversationsByAddress
+// returns for each of addresses: newest first, then in conversation ID
+// order, and at most limit. Every search matches before its limit, so these
+// are the newest threads that hold any of the addresses as a whole. A query
+// binds each address as that search binds it and compares values under the
+// same NOCASE collation. It reads each participant entry and each distinct
+// sender number once and looks the value up among the addresses, which
+// SQLite reads into an index once. A search for each address reads every
+// conversation's participants and every sender number again. Past
+// maxAddressesPerQuery addresses, it runs a query for each group of that
 // many and keeps the newest of their hits. A blank address matches nothing,
-// and neither does a limit below 1.
+// and so does a limit below 1.
 func (s *Store) SearchConversationsByAddresses(addresses []string, limit int) ([]*Conversation, error) {
+	return s.searchConversationsByAddresses(addresses, limit, maxAddressesPerQuery)
+}
+
+// searchConversationsByAddresses is SearchConversationsByAddresses with
+// perQuery addresses, at most, in each query.
+func (s *Store) searchConversationsByAddresses(addresses []string, limit, perQuery int) ([]*Conversation, error) {
 	addresses = nonBlankAddresses(addresses)
 	if len(addresses) == 0 || limit <= 0 {
 		return []*Conversation{}, nil
 	}
 	var found []*Conversation
-	for start := 0; start < len(addresses); start += maxAddressesPerQuery {
-		group := addresses[start:min(start+maxAddressesPerQuery, len(addresses))]
+	for start := 0; start < len(addresses); start += perQuery {
+		group := addresses[start:min(start+perQuery, len(addresses))]
 		args := make([]any, 0, len(group)+1)
 		for _, address := range group {
 			args = append(args, address)
@@ -622,7 +627,7 @@ func (s *Store) SearchConversationsByAddresses(addresses []string, limit int) ([
 		if err != nil {
 			return nil, err
 		}
-		if start == 0 && len(group) == len(addresses) {
+		if len(group) == len(addresses) {
 			return hits, nil
 		}
 		found = append(found, hits...)

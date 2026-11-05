@@ -997,9 +997,8 @@ func phoneLinesSearchSQL(keys string) string {
 
 // maxAddressesPerQuery caps the addresses that one query of
 // SearchConversationsByAddresses binds, each as its own value, far below
-// SQLite's default cap of 32,766 bound values. Tests lower it to make the
-// search split its addresses across queries.
-var maxAddressesPerQuery = 1000
+// SQLite's default cap of 32,766 bound values.
+const maxAddressesPerQuery = 1000
 
 // SearchConversationsByAddresses looks for many addresses at once. It
 // returns the newest of the conversations that SearchConversationsByAddress
@@ -1014,13 +1013,19 @@ var maxAddressesPerQuery = 1000
 // newest of their hits. A blank address matches nothing, and so does a
 // limit below 1.
 func (s *Store) SearchConversationsByAddresses(addresses []string, limit int) ([]Conversation, error) {
+	return s.searchConversationsByAddresses(addresses, limit, maxAddressesPerQuery)
+}
+
+// searchConversationsByAddresses is SearchConversationsByAddresses with
+// perQuery addresses, at most, in each query.
+func (s *Store) searchConversationsByAddresses(addresses []string, limit, perQuery int) ([]Conversation, error) {
 	addresses = nonBlankAddresses(addresses)
 	if len(addresses) == 0 || limit <= 0 {
 		return []Conversation{}, nil
 	}
 	var found []Conversation
-	for start := 0; start < len(addresses); start += maxAddressesPerQuery {
-		group := addresses[start:min(start+maxAddressesPerQuery, len(addresses))]
+	for start := 0; start < len(addresses); start += perQuery {
+		group := addresses[start:min(start+perQuery, len(addresses))]
 		args := make([]any, 0, len(group)+1)
 		for _, address := range group {
 			args = append(args, address)
