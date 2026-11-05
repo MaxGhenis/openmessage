@@ -55,14 +55,19 @@ var (
 // seedContactThreads writes random threads into store. Participants come
 // as JSON from Go's encoder, which writes & and < as escapes; as JSON
 // written by hand, sometimes with a byte that isn't UTF-8; or as text that
-// isn't a JSON array. The owner's entries carry is_me or isMe, and threads
-// often share a time.
+// isn't a JSON array. A few threads list so many people that their
+// participants overflow an index page. The owner's entries carry is_me or
+// isMe, and threads often share a time.
 func seedContactThreads(t *testing.T, random *rand.Rand, store *Store) {
 	t.Helper()
 	for index := 0; index < 3+random.Intn(25); index++ {
 		id := fmt.Sprintf("c%02d", index)
 		var entries []map[string]any
-		for member := 0; member < 1+random.Intn(3); member++ {
+		members := 1 + random.Intn(3)
+		if random.Intn(8) == 0 {
+			members = 20 + random.Intn(140)
+		}
+		for member := 0; member < members; member++ {
 			entry := map[string]any{"name": contactNames[random.Intn(len(contactNames))], "number": contactNumbers[random.Intn(len(contactNumbers))]}
 			switch random.Intn(6) {
 			case 0:
@@ -241,23 +246,24 @@ func queryPlan(t *testing.T, store *Store, query string, args ...any) string {
 	return strings.Join(details, "\n")
 }
 
-// ListContactsFromConversations reads conversations through the
-// newest-first index, without sorting them, so it stops at its limit; the
-// sorted form it falls back to sorts every row. migrate creates the index
-// with its term, and no other query here may use it: each search's plan
-// leaves it alone.
+// ListContactsFromConversations reads conversations from the newest-first
+// index alone, without sorting them or going back to the table, so it stops
+// at its limit and a query that reads every row costs what a scan of the
+// table does. The sorted form it falls back to sorts every row. migrate
+// creates the index with its term, and no other query here may use it: each
+// search's plan leaves it alone.
 func TestListContactsFromConversationsPlanReadsTheNewestFirstIndex(t *testing.T) {
 	store := newTestStore(t)
 	var definition string
 	if err := store.db.QueryRow(`SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?`, newestFirstIndex).Scan(&definition); err != nil {
 		t.Fatalf("read the index: %v", err)
 	}
-	if !strings.Contains(definition, "(last_message_ts DESC, conversation_id) WHERE "+newestFirstIndexTerm) {
+	if !strings.Contains(definition, "(last_message_ts DESC, conversation_id, name, participants) WHERE "+newestFirstIndexTerm) {
 		t.Errorf("migrate created %s as %q", newestFirstIndex, definition)
 	}
 	plan := queryPlan(t, store, contactsFromConversationsSQL(true), "ann", "ann", "ann")
-	if !strings.Contains(plan, "USING INDEX "+newestFirstIndex) || strings.Contains(plan, "TEMP B-TREE") {
-		t.Errorf("the indexed query's plan = %q, want a scan of %s with no sort", plan, newestFirstIndex)
+	if !strings.Contains(plan, "USING COVERING INDEX "+newestFirstIndex) || strings.Contains(plan, "TEMP B-TREE") {
+		t.Errorf("the indexed query's plan = %q, want a scan of %s alone with no sort", plan, newestFirstIndex)
 	}
 	if plan := queryPlan(t, store, contactsFromConversationsSQL(false), "ann", "ann", "ann"); !strings.Contains(plan, "TEMP B-TREE") {
 		t.Errorf("the sorted query's plan = %q, want a sort", plan)

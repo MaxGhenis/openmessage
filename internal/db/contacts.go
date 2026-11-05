@@ -81,8 +81,8 @@ func (s *Store) ListContacts(query string, limit int) ([]*Contact, error) {
 // loop stops once it has limit contacts, but no row limit applies: most
 // threads list the account's owner, so for a name the owner shares, hundreds
 // of newer rows can yield nothing but the owner's entries, which the loop
-// skips, before an older row yields a match. The rows come through an index
-// in that order, so the query reads only the rows the loop gets to, where
+// skips, before an older row yields a match. The rows come from an index in
+// that order, so the query reads only the rows the loop gets to, where
 // sorting them would read and sort every row that passes the prefilter
 // first. A store without the index sorts them. A limit below 1 returns
 // nothing.
@@ -169,21 +169,23 @@ func (s *Store) ListContactsFromConversations(query string, limit int) ([]*Conta
 	return contacts, rows.Err()
 }
 
-// newestFirstIndex orders conversations newest first, then by conversation
-// ID, for ListContactsFromConversations alone. Its WHERE is
-// newestFirstIndexTerm, which holds for every row; SQLite lets a query use a
-// partial index only when the query's WHERE states the index's term.
+// newestFirstIndex holds conversations newest first, then by conversation
+// ID, with the columns ListContactsFromConversations reads, so that query
+// never goes back to the table for a row. Its WHERE is newestFirstIndexTerm,
+// which holds for every row. SQLite lets a query use a partial index only when
+// the query's WHERE states the index's term, and only that query states it: a
+// query that did could read the index and order its ties by ID.
 const (
 	newestFirstIndex     = "idx_conversations_newest_first"
 	newestFirstIndexTerm = "typeof(participants) <> 'null'"
 )
 
 // contactsFromConversationsSQL is ListContactsFromConversations' query. It
-// takes the prefilter's text three times. indexed reads the rows through
-// newestFirstIndex, in the order the ORDER BY asks for, so SQLite steps
-// through the index and stops when the caller stops reading; without it,
-// SQLite sorts every row that passes the prefilter before returning one.
-// Both return the same rows in the same order.
+// takes the prefilter's text three times. indexed reads the rows from
+// newestFirstIndex alone, in the order the ORDER BY asks for, so SQLite steps
+// through the index and stops when the caller stops reading. Without it,
+// SQLite sorts every row that passes the prefilter before returning one. Both
+// return the same rows in the same order.
 func contactsFromConversationsSQL(indexed bool) string {
 	from, term := "conversations", ""
 	if indexed {
