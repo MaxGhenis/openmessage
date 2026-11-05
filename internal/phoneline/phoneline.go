@@ -158,14 +158,50 @@ func lowerASCII(c byte) byte {
 // carry a country prefix the other lacks, so the shorter run of digits must
 // end the longer, and a line of fewer than 7 digits matches nothing.
 func Match(line, stored string) bool {
-	digits, ok := Number(stored)
-	if !ok {
-		digits, ok = whatsAppDigits(stored)
-	}
+	digits, ok := lineDigits(stored)
 	if !ok || len(line) < 7 {
 		return false
 	}
 	return strings.HasSuffix(digits, line) || strings.HasSuffix(line, digits)
+}
+
+// lineDigits returns the digits of a value that names a phone line: a phone
+// number as people write one, or a WhatsApp JID of one.
+func lineDigits(value string) (string, bool) {
+	if digits, ok := Number(value); ok {
+		return digits, true
+	}
+	return whatsAppDigits(value)
+}
+
+// LineKeys and ValueKeys index Match: Match(line, value) holds exactly when
+// LineKeys(line) and ValueKeys(value) share a key, for any line and any
+// value, and neither gives more than ten keys. So a set of lines answers
+// Match for a value through a few lookups, however many lines it holds.
+//
+// A key "L:" and digits stands for a line that a value's digits end with,
+// and "S:" and digits for a value's digits that a line ends with. Match
+// wants 7 digits or more on each side, and a value has at most 15.
+func LineKeys(line string) []string {
+	keys := []string{"L:" + line}
+	for length := 7; length <= len(line) && length <= 15; length++ {
+		keys = append(keys, "S:"+line[len(line)-length:])
+	}
+	return keys
+}
+
+// ValueKeys gives the keys that LineKeys indexes Match by for value, and
+// none when value names no line.
+func ValueKeys(value string) []string {
+	digits, ok := lineDigits(value)
+	if !ok {
+		return nil
+	}
+	keys := []string{"S:" + digits}
+	for length := 7; length <= len(digits); length++ {
+		keys = append(keys, "L:"+digits[len(digits)-length:])
+	}
+	return keys
 }
 
 // MatchFirst applies Match to the first of values that isn't blank, as a

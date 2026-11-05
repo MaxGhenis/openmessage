@@ -178,6 +178,83 @@ func randomDigits(random *rand.Rand, length int) string {
 	return b.String()
 }
 
+// LineKeys and ValueKeys index Match: for any line and any value, the two
+// share a key exactly when Match(line, value) holds, as phonelinetest also
+// says, and neither gives more than ten keys. Lines run from no digits to 16,
+// a few with a stray character; values are written forms of numbers that end
+// with the line, that the line ends with, or that share only some of its
+// last digits, WhatsApp JIDs, identifiers that hold the line's digits, and
+// noise.
+func TestLineKeysIndexMatch(t *testing.T) {
+	exercised := map[string]int{}
+	property := func(seed int64) bool {
+		random := rand.New(rand.NewSource(seed))
+		line := randomDigits(random, random.Intn(17))
+		if random.Intn(8) == 0 {
+			at := random.Intn(len(line) + 1)
+			line = line[:at] + []string{"a", "+", " ", "٣"}[random.Intn(4)] + line[at:]
+			exercised["a line with a stray character"]++
+		}
+		tail := line
+		if cut := 7 + random.Intn(4); len(tail) > cut {
+			tail = tail[len(tail)-cut:]
+		}
+		values := []string{
+			numberForm(random, randomDigits(random, random.Intn(6))+line),
+			numberForm(random, tail),
+			numberForm(random, randomDigits(random, 1+random.Intn(4))+tail),
+			randomDigits(random, random.Intn(4)) + line + []string{"@s.whatsapp.net", "@C.US"}[random.Intn(2)],
+			identifierForm(random, line),
+			noiseForm(random),
+			numberForm(random, randomDigits(random, random.Intn(18))),
+		}
+		lineKeys := LineKeys(line)
+		if len(lineKeys) > 10 {
+			t.Logf("seed %d: LineKeys(%q) gives %d keys", seed, line, len(lineKeys))
+			return false
+		}
+		for _, value := range values {
+			valueKeys := ValueKeys(value)
+			if len(valueKeys) > 10 {
+				t.Logf("seed %d: ValueKeys(%q) gives %d keys", seed, value, len(valueKeys))
+				return false
+			}
+			shared := false
+			for _, lineKey := range lineKeys {
+				for _, valueKey := range valueKeys {
+					shared = shared || lineKey == valueKey
+				}
+			}
+			if match, oracle := Match(line, value), phonelinetest.Match(line, value); shared != match || shared != oracle {
+				t.Logf("seed %d: LineKeys(%q) = %q and ValueKeys(%q) = %q share a key: %v; Match says %v, phonelinetest %v",
+					seed, line, lineKeys, value, valueKeys, shared, match, oracle)
+				return false
+			}
+			if !shared {
+				exercised["a value off the line"]++
+				continue
+			}
+			if digits, _ := phonelinetest.Digits(value); strings.HasSuffix(digits, line) {
+				exercised["a value whose digits end with the line"]++
+			} else {
+				exercised["a line that ends with a value's digits"]++
+			}
+		}
+		return true
+	}
+	if err := quick.Check(property, &quick.Config{MaxCount: 2000, Rand: rand.New(rand.NewSource(20261104))}); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{
+		"a line with a stray character", "a value off the line",
+		"a value whose digits end with the line", "a line that ends with a value's digits",
+	} {
+		if exercised[path] == 0 {
+			t.Errorf("the property never drew %s (drew %v)", path, exercised)
+		}
+	}
+}
+
 // Properties, for any digits d: a written form of d, with or without a
 // country prefix, matches the line of d whenever d has 7 digits or more, and
 // so does a WhatsApp JID of d; an identifier that only holds d's digits, such

@@ -154,22 +154,33 @@ that reads as no phone number, such as an email address, which the legacy
 Google Chat importer files as a number, or an SMS short code, names whoever
 holds it as a whole address (`SearchConversationsByAddress`, with ASCII case
 and the white space around each value aside), never someone whose own address,
-number or title holds it. Both stores' SQL compares those values by the key
-that `addressmatch.Key` writes, through a Go function SQLite knows as
-`om_address_match`. The tool keys its lookups the same way, so it looks up each
-address once. Call `om_address_match` and `om_phone_line_match` only through
-`addressmatch.SQL` and `phoneline.SQL`, which cast each argument to BLOB. The
-`modernc.org/sqlite` driver hands a Go function a TEXT argument only up to its
-first NUL, so values that differ after one would match. Threads that share a
-time come in conversation ID order in both stores. The route tool ignores the
-account's owner, whom most threads list: a thread that a query matches only
-through the owner's entry or the owner's own messages gives no route. v2's
-conversation search skips the owner's identity. The legacy search skips
-participant entries that carry an `is_me` or `isMe` flag and matches only
-incoming messages' senders. Both skip the owner before their limit and, like
-the address-book lookup, match `%` and `_` literally, but an owner's entry
-without the flag still matches. In client mode the route tool asks the daemon
-whether WhatsApp and Signal can send.
+number or title holds it. Both stores compare those values by the key that
+`addressmatch.Key` writes, in SQL through a Go function SQLite knows as
+`om_address_match`, and the legacy search compares its participant entries by
+keys that Go writes when it reads each list. The tool keys its lookups the same
+way, so it looks up each address once. Call `om_address_match` and
+`om_phone_line_match` only through `addressmatch.SQL` and `phoneline.SQL`, which
+cast each argument to BLOB. The `modernc.org/sqlite` driver hands a Go function
+a TEXT argument only up to its first NUL, so values that differ after one would
+match. Threads that share a time come in conversation ID order in both stores.
+The route tool ignores the account's owner, whom most threads list: a thread
+that a query matches only through the owner's entry or the owner's own messages
+gives no route. v2's conversation search skips the owner's identity. The three
+legacy searches, by text, line and address, skip the owner's participant
+entries: objects that carry `is_me` (or `isMe`), and any entry, a bare string
+included, on the phone line of a flagged entry whose number reads as a phone
+number or a WhatsApp JID of one, since Google's participant lists often repeat
+the owner without the flag. Of message senders they match only incoming ones.
+Both stores skip the owner before their limit and, like the address-book
+lookup, match `%` and `_` literally. `send_message` with platform `sms` skips
+the same entries when it picks the recipient's one-to-one thread, and for the
+owner's own number it sends nothing and says so. One rule in
+`internal/db/owner.go` serves the legacy searches and `send_message`. The
+searches never read a participants list with SQLite's JSON reader: two
+registered functions take each list whole, as a BLOB, and read it in Go. The
+searches read every element of a list on its own and take the owner's lines
+from every thread. In client mode the route tool asks the daemon whether
+WhatsApp and Signal can send.
 The client opens the store via `app.NewClient`, which skips the startup repair
 sweeps — those stay daemon-owned, so N concurrent sessions don't each burst
 repair writes into the live `messages.db`.

@@ -75,7 +75,7 @@ func TestSearchConversationsByPhoneLineCallsTheMatcherOncePerSenderNumber(t *tes
 	seedSearchStore(t, store, conversations, messages, nil)
 
 	countedPhoneLineMatches.Store(0)
-	rows, err := store.db.Query(phoneLineSearchSQL(countedPhoneLineMatchSQL), "2025550123", "2025550123", "2025550123", 10)
+	rows, err := store.db.Query(phoneLineSearchSQL(countedPhoneLineMatchSQL), "2025550123", "2025550123", 10)
 	if err != nil {
 		t.Fatalf("query: %v", err)
 	}
