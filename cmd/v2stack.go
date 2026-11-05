@@ -415,6 +415,17 @@ func (s *v2Stack) Start(
 			Int64("retry_at_ms", lease.RetryAtMS).
 			Msg("Failed to lease V2 outbox item; set it aside to retry")
 	})
+	// The store leaves an expired lease whose recovery fails on the row itself
+	// as it was, still dispatching, so nothing sends it, and recovers the
+	// others; the pass goes on to send. The hook logs each such failure (and
+	// /api/status v2_dispatch counts it). Every pass tries the row again.
+	s.Service.OnRecoveryFailure(func(recovery messaging.FailedRecovery) {
+		s.logger.Error().
+			Str("outbox_id", recovery.OutboxID).
+			Str("error", recovery.Error).
+			Bool("transport_called", recovery.TransportCalled).
+			Msg("Failed to recover expired lease of V2 outbox item; retrying it next pass")
+	})
 	go func() {
 		defer runWG.Done()
 		if err := s.Service.Run(runCtx); err != nil && !errors.Is(err, context.Canceled) {

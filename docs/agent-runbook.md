@@ -305,6 +305,61 @@ makes the row due at once instead of at its retry time, and
 `POST /api/v1/outbox/<id>/cancel` drops it. If the cause remains, the next
 lease fails again and the delay starts over at 5 s.
 
+**An expired lease whose recovery fails no longer holds back every send.**
+Each dispatch pass starts by ending the leases that have expired. A lease
+whose transport call never started makes its row `not_dispatched`, due at
+once; a lease whose call started makes its row `uncertain`. Before
+PR #280, one UPDATE rewrote every expired lease whose call never started,
+and another every expired lease whose call had started. So when SQLite
+refused the write for one row, the whole recovery failed, and the pass
+failed before it sent anything. Every later pass met that row again, so
+nothing due went out while the cause remained: `consecutive_failed_passes`
+climbed, and the `error` of `last_failed_pass` read `run message service:
+recover expired leases: recover expired pre-call outbox leases: …` (or
+`post-call`). Now the store recovers each expired lease under its own
+savepoint. When the failure belongs to the row (SQLite refuses the write as
+a constraint or a value of the wrong type or size, or a trigger skips it),
+the store undoes everything that row's write did, leaves the row as it was
+and recovers the rest. The pass then sends as usual. What you see:
+
+- The row stays `dispatching`, its lease expired and every column
+  unchanged. `GET /api/v1/outbox` lists it as `dispatching` (the API returns
+  no lease fields), and the UI's outbox tray shows a text, media or reaction
+  row as `Sending…`, with no action.
+- `v2_dispatch` counts each failed recovery in `failed_recoveries` and shows
+  the latest in `last_failed_recovery` (`outbox_id`, `at_ms`, `error`,
+  `transport_called`). Every pass tries the row again and counts it again:
+  each pass a new send wakes, and at least one every 30 s, since `Run` polls
+  that often when nothing is due. The pass itself succeeds, so
+  `failed_passes` stays where it was.
+- The backend logs `Failed to recover expired lease of V2 outbox item;
+  retrying it next pass` (a zerolog error, with `outbox_id`, `error` and
+  `transport_called`) on each of those passes.
+- A failure that belongs to the store, not the row, still fails the whole
+  recovery and the pass, and changes no row, as before. So does a trigger
+  that ends the transaction (`RAISE(ROLLBACK)`), since that leaves no
+  savepoint to roll back to.
+
+The stuck row never goes out, and it holds back no other row.
+`LeaseDueBatch` leases only `queued` and `not_dispatched` rows, so it passes
+over this one and leases the rows behind it, in its conversation and any
+other, as usual. No call can start under the expired lease either:
+`MarkTransportCalled`, which commits before every transport call, refuses
+it. A row whose call started can only become `uncertain`, so recovering it
+never resends it.
+
+To clear the row, find out why its write fails and fix that. `error`
+carries the reason: the constraint SQLite names, a trigger's message, or
+`the update changed no row` when a trigger skipped the write. The next pass
+then recovers the row, within 30 s. A row with `transport_called` false
+becomes `not_dispatched`, due at once, and goes out like any due row. A row
+with `transport_called` true becomes `uncertain`; for a text or media row,
+the tray then shows `Sent — unconfirmed`, with `Send again (may
+duplicate)`. Cancel, retry and send-again answer 409 for a `dispatching`
+row, so none of them clears it. On a build without the fix, restarting the
+app doesn't help either: the first pass after the restart runs the same
+recovery and fails the same way, so fix the cause there too.
+
 ## v2 cutover: conversation IDs re-key (issue #155)
 
 On a **v2-primary** install the API serves the v2 store, where a conversation's
