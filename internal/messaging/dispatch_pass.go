@@ -87,6 +87,7 @@ type FailedLease struct {
 	SetAsideError string `json:"set_aside_error,omitempty"`
 }
 
+// newFailedLease describes a due row whose lease failed on the row at now.
 func newFailedLease(failure sqlite.LeaseFailure, now time.Time) FailedLease {
 	lease := FailedLease{
 		OutboxID: failure.OutboxID,
@@ -110,16 +111,17 @@ func (s *MessageService) OnLeaseFailure(fn func(lease FailedLease)) {
 }
 
 // FailedRecovery describes an expired outbox lease whose recovery failed on
-// the row itself: a constraint the row cannot meet, or a trigger that refuses
-// or skips the write. The store left the row as it was, dispatching with its
-// lease expired, so nothing sends it, and the next pass tries again.
+// the row itself: a constraint the row cannot meet, a value of the wrong type
+// or size, or a trigger that refuses or skips the write. The store left the
+// row as it was, dispatching with its lease expired, so nothing sends it, and
+// the next pass tries again.
 type FailedRecovery struct {
 	OutboxID string `json:"outbox_id"`
 	AtMS     int64  `json:"at_ms"`
 	Error    string `json:"error"`
 	// TransportCalled reports whether the row's transport call had started.
-	// Once its recovery works, such a row becomes uncertain, never sent
-	// again, and any other row becomes due again.
+	// Once its recovery works, a row whose call had started becomes
+	// uncertain and never sends again; any other row becomes due again.
 	TransportCalled bool `json:"transport_called"`
 }
 

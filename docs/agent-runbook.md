@@ -329,8 +329,8 @@ and recovers the rest. The pass then sends as usual. What you see:
 - `v2_dispatch` counts each failed recovery in `failed_recoveries` and shows
   the latest in `last_failed_recovery` (`outbox_id`, `at_ms`, `error`,
   `transport_called`). Every pass tries the row again and counts it again:
-  each pass a new send wakes, and at least one every 30 s, since `Run` polls
-  that often when nothing is due. The pass itself succeeds, so
+  each pass a new send wakes, and while nothing is due, one every 30 s,
+  since `Run` polls that often. The pass itself succeeds, so
   `failed_passes` stays where it was.
 - The backend logs `Failed to recover expired lease of V2 outbox item;
   retrying it next pass` (a zerolog error, with `outbox_id`, `error` and
@@ -348,17 +348,18 @@ other, as usual. No call can start under the expired lease either:
 it. A row whose call started can only become `uncertain`, so recovering it
 never resends it.
 
-To clear the row, find out why its write fails and fix that. `error`
-carries the reason: the constraint SQLite names, a trigger's message, or
+To clear the row, find out why its write fails and fix that. `error` carries
+the reason: the constraint SQLite names, a trigger's message, or
 `the update changed no row` when a trigger skipped the write. The next pass
-then recovers the row, within 30 s. A row with `transport_called` false
-becomes `not_dispatched`, due at once, and goes out like any due row. A row
-with `transport_called` true becomes `uncertain`; for a text or media row,
-the tray then shows `Sent — unconfirmed`, with `Send again (may
-duplicate)`. Cancel, retry and send-again answer 409 for a `dispatching`
-row, so none of them clears it. On a build without the fix, restarting the
-app doesn't help either: the first pass after the restart runs the same
-recovery and fails the same way, so fix the cause there too.
+then recovers the row: within 30 s while nothing is due, sooner when a send
+wakes the loop. A row with `transport_called` false becomes
+`not_dispatched`, due at once, and goes out like any due row. A row with
+`transport_called` true becomes `uncertain`; for a text or media row, the
+tray then shows `Sent — unconfirmed`, with `Send again (may duplicate)`.
+Cancel, retry and send-again answer 409 for a `dispatching` row, so none of
+them clears it. On a build without the fix, restarting the app doesn't help
+either: the first pass after the restart runs the same recovery and fails
+the same way, so fix the cause there too.
 
 ## v2 cutover: conversation IDs re-key (issue #155)
 
