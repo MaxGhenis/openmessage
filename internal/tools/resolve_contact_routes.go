@@ -200,23 +200,24 @@ func findRouteConversations(reads readsource.ReadSource, people *db.Store, query
 		return newestRoutes(seen, limit), nil
 	}
 
-	// lookUp finds the threads of the person a number names. A phone number
-	// names a line. Any other value names whoever holds it as a whole
+	// lookUp notes the person a number names, for reads to look up. A phone
+	// number names a line. Any other value names whoever holds it as a whole
 	// address, with ASCII letters' case and the white space around it aside,
 	// as addressmatch.Key writes it: the legacy Google Chat importer files an
 	// email address as a number, SMS threads list a short code as one, and
 	// another person's address or phone number, or a title, can hold either,
 	// so a search for the text would route to them.
-	// searched holds each line and address that lookUp has asked reads about,
-	// so reads answer each lookup once. The address book and legacy threads
-	// often hold one person's number, each in its own form, and every form
-	// names one line. Two values share an address key exactly when the
-	// stores' address searches can't tell them apart. The query arrives as
-	// JSON text, so it holds valid UTF-8, and its own search matches every
-	// thread that an address lookup of the query would, in the same order and
-	// under the same limit. That lookup could add only threads that
-	// newestRoutes drops, so it counts as done.
+	// searched holds each line and address that lookUp has noted, so reads
+	// answer each once. The address book and legacy threads often hold one
+	// person's number, each in its own form, and every form names one line.
+	// Two values share an address key exactly when the stores' address
+	// searches can't tell them apart. The query arrives as JSON text, so it
+	// holds valid UTF-8, and its own search matches every thread that an
+	// address lookup of the query would, in the same order and under the same
+	// limit. That lookup could add only threads that newestRoutes drops, so it
+	// counts as done.
 	searched := map[string]bool{"address:" + addressmatch.Key(query): true}
+	var lines, addresses []string
 	lookUp := func(number string) {
 		number = strings.TrimSpace(number)
 		if number == "" {
@@ -231,15 +232,10 @@ func findRouteConversations(reads readsource.ReadSource, people *db.Store, query
 			return
 		}
 		searched[key] = true
-		var found []*db.Conversation
-		var err error
 		if byLine {
-			found, err = reads.SearchConversationsByPhoneLine(phoneline.Line(number), limit)
+			lines = append(lines, phoneline.Line(number))
 		} else {
-			found, err = reads.SearchConversationsByAddress(number, limit)
-		}
-		if err == nil {
-			addConversations(found)
+			addresses = append(addresses, number)
 		}
 	}
 
@@ -261,6 +257,36 @@ func findRouteConversations(reads readsource.ReadSource, people *db.Store, query
 			if contact != nil {
 				lookUp(contact.Number)
 			}
+		}
+	}
+
+	// One query asks reads for every line, and one for every address. Every
+	// search matches before its limit, so the newest limit threads of all of
+	// them together are the newest limit threads among what a search for
+	// each value finds, and newestRoutes keeps no others. A name can find up
+	// to 2 × limit numbers, and a search for each would read every
+	// participant and sender again. When a batch fails, a search for each of
+	// its values takes over, and a value whose search fails adds nothing, as
+	// a search for each value always did.
+	lookUpEach := func(values []string, searchOne func(string, int) ([]*db.Conversation, error)) {
+		for _, value := range values {
+			if found, err := searchOne(value, limit); err == nil {
+				addConversations(found)
+			}
+		}
+	}
+	if len(lines) > 0 {
+		if found, err := reads.SearchConversationsByPhoneLines(lines, limit); err == nil {
+			addConversations(found)
+		} else {
+			lookUpEach(lines, reads.SearchConversationsByPhoneLine)
+		}
+	}
+	if len(addresses) > 0 {
+		if found, err := reads.SearchConversationsByAddresses(addresses, limit); err == nil {
+			addConversations(found)
+		} else {
+			lookUpEach(addresses, reads.SearchConversationsByAddress)
 		}
 	}
 	return newestRoutes(seen, limit), nil
