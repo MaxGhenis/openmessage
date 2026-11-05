@@ -206,6 +206,10 @@ final class BackendManager: ObservableObject {
                         manager.logger.warning("Backend terminated via \(reason, privacy: .public) with code \(code)")
                         guard manager.launcher?.process === proc else { return }
                         manager.launcher = nil
+                        // The startup wait leaves a spawned backend's death to
+                        // this handler; end the wait before deciding.
+                        manager.healthCheckTask?.cancel()
+                        manager.healthCheckTask = nil
                         // Only react to crashes while we believed the backend was up. A
                         // deliberate stop()/quit clears ownership first, so this won't
                         // fight an intentional shutdown.
@@ -422,31 +426,54 @@ final class BackendManager: ObservableObject {
         healthyResetTask = nil
     }
 
-    /// Poll /api/status until the backend is ready.
+    /// How long to wait for a starting backend; see `BackendStartupWait`.
+    private static let startupWait = BackendStartupWait()
+
+    /// Poll /api/status until the backend is ready. Past the grace period the
+    /// wait continues while the backend process is alive, since it may still
+    /// be applying store migrations before it listens.
+    ///
+    /// A spawned backend that dies is its termination handler's to handle: it
+    /// cancels this wait, then restarts the backend or reports the error. If
+    /// the wait judged that death itself it could set `.error` first, and the
+    /// handler, which acts only on `.starting` or `.running`, would skip the
+    /// restart. So only an adopted backend, which has no handler, is judged
+    /// dead here. Cancellation (stop, quit, relaunch) leaves the state alone.
     private func startHealthCheck() {
+        let spawned = launcher != nil
         healthCheckTask = Task {
-            for attempt in 1...60 {
-                if Task.isCancelled { return }
-                try? await Task.sleep(for: .milliseconds(500))
-                do {
-                    let url = baseURL.appendingPathComponent("api/status")
-                    let (data, response) = try await URLSession.shared.data(from: url)
-                    if let http = response as? HTTPURLResponse, http.statusCode == 200,
-                       let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                        _ = json
-                        self.state = .running
-                        self.logger.info("Backend ready after \(attempt) checks")
-                        self.scheduleRestartBudgetReset()
-                        self.startConnectionMonitor()
-                        return
-                    }
-                } catch {
-                    self.logger.debug("Health check \(attempt): \(error)")
+            let outcome = await Self.startupWait.poll(
+                probe: { await self.backendAnswersStatus() },
+                processAlive: { spawned || !self.backendProcessIsDead() },
+                onSlowStart: { attempt in
+                    self.logger.warning("Backend not ready after \(attempt) checks but its process is alive (it may be applying store migrations); still waiting")
                 }
+            )
+            if Task.isCancelled { return }
+            switch outcome {
+            case .ready(let attempt):
+                self.state = .running
+                self.logger.info("Backend ready after \(attempt) checks")
+                self.scheduleRestartBudgetReset()
+                self.startConnectionMonitor()
+            case .gaveUp(let message):
+                self.state = .error(message)
+            case .cancelled:
+                return
             }
-            if !Task.isCancelled {
-                self.state = .error("Backend failed to start within 30 seconds")
-            }
+        }
+    }
+
+    /// Whether /api/status answers 200 with a JSON object.
+    private func backendAnswersStatus() async -> Bool {
+        do {
+            let url = baseURL.appendingPathComponent("api/status")
+            let (data, response) = try await URLSession.shared.data(from: url)
+            guard let http = response as? HTTPURLResponse, http.statusCode == 200 else { return false }
+            return (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) != nil
+        } catch {
+            logger.debug("Health check: \(error)")
+            return false
         }
     }
 

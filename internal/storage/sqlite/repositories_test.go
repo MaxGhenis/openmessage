@@ -611,11 +611,7 @@ func openRepositoryTestStore(t *testing.T) *Store {
 	if err != nil {
 		t.Fatalf("Open(): %v", err)
 	}
-	t.Cleanup(func() {
-		if err := store.Close(); err != nil {
-			t.Errorf("Close(): %v", err)
-		}
-	})
+	closeTestStore(t, store)
 	return store
 }
 
