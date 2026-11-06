@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"unicode/utf8"
 )
 
 func (s *Store) UpsertContact(c *Contact) error {
@@ -19,6 +20,9 @@ func (s *Store) UpsertContact(c *Contact) error {
 	return err
 }
 
+// ListContacts returns address-book contacts by name, at most limit. A
+// query keeps only those whose name or number contains it literally, ASCII
+// case aside: % and _ match only themselves.
 func (s *Store) ListContacts(query string, limit int) ([]*Contact, error) {
 	var rows_query string
 	var args []any
@@ -26,11 +30,11 @@ func (s *Store) ListContacts(query string, limit int) ([]*Contact, error) {
 	if query != "" {
 		rows_query = `
 			SELECT contact_id, name, number FROM contacts
-			WHERE name LIKE ? OR number LIKE ?
+			WHERE name LIKE ? ESCAPE '\' OR number LIKE ? ESCAPE '\'
 			ORDER BY name
 			LIMIT ?
 		`
-		like := "%" + query + "%"
+		like := "%" + escapeLikePattern(query) + "%"
 		args = []any{like, like, limit}
 	} else {
 		rows_query = `
@@ -58,39 +62,59 @@ func (s *Store) ListContacts(query string, limit int) ([]*Contact, error) {
 	return contacts, rows.Err()
 }
 
-// ListContactsFromConversations extracts contacts from conversation participants
-// as a fallback when the contacts table is empty.
+// ListContactsFromConversations lists, as contacts, the people whom
+// conversations' participant entries name, for lookups that the address book
+// alone doesn't cover.
 //
-// The SQL prefilter is a strict superset of the per-participant matching
-// below (the participants JSON contains every name and number verbatim), so
-// it never hides a match — it just keeps a filtered autocomplete keystroke
-// from JSON-decoding every conversation in the store. The row LIMIT bounds
-// worst-case work; it is generous because one row can fan out to many
-// participants and duplicates are dropped.
+// A participant matches where its name or number holds the query literally,
+// ASCII case aside: SQLite's lower() folds only ASCII letters, and so does the
+// check below, so Ángel finds Ángel Ruiz and ÁNGEL does too, but ángel
+// doesn't. The check reads the decoded entry, never its JSON text, where Go
+// writes & and < as escapes. The SQL prefilter only spares an autocomplete
+// keystroke from decoding every conversation in the store, and it passes every
+// row the loop could take a contact from. JSON text without a backslash holds
+// each name and number as it decodes, except where Go's decoder reads a byte
+// that isn't UTF-8 as U+FFFD. So the prefilter passes a conversation whose
+// name or participants text holds the query, or whose text holds a backslash,
+// and a query that holds U+FFFD, or a byte that isn't UTF-8, skips the
+// prefilter. Rows come newest first, then in conversation ID order, and the
+// loop stops once it has limit contacts, but no row limit applies: most
+// threads list the account's owner, so for a name the owner shares, hundreds
+// of newer rows can yield nothing but the owner's entries, which the loop
+// skips, before an older row yields a match. A limit below 1 returns nothing.
 func (s *Store) ListContactsFromConversations(query string, limit int) ([]*Contact, error) {
-	queryFilter := strings.ToLower(query)
+	if limit < 1 {
+		return nil, nil
+	}
+	filter := query
+	if strings.ContainsRune(query, utf8.RuneError) {
+		filter = ""
+	}
 	rows, err := s.db.Query(`
 		SELECT conversation_id, name, participants FROM conversations
-		WHERE ? = '' OR instr(lower(name), ?) > 0 OR instr(lower(participants), ?) > 0
-		ORDER BY last_message_ts DESC
-		LIMIT ?
-	`, queryFilter, queryFilter, queryFilter, limit*20)
+		WHERE ? = ''
+			OR instr(lower(name), lower(?)) > 0
+			OR instr(lower(participants), lower(?)) > 0
+			OR instr(participants, '\') > 0
+		ORDER BY last_message_ts DESC, conversation_id
+	`, filter, filter, filter)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
 	type participant struct {
-		Name   string `json:"name"`
-		Number string `json:"number"`
-		IsMe   bool   `json:"is_me"`
+		Name      string `json:"name"`
+		Number    string `json:"number"`
+		IsMe      bool   `json:"is_me"`
+		IsMeCamel bool   `json:"isMe"`
 	}
 
 	seen := map[string]bool{}
 	var contacts []*Contact
-	queryLower := strings.ToLower(query)
+	queryLower := lowerASCII(query)
 
-	for rows.Next() {
+	for len(contacts) < limit && rows.Next() {
 		var convID, name, participantsJSON string
 		if err := rows.Scan(&convID, &name, &participantsJSON); err != nil {
 			continue
@@ -100,7 +124,7 @@ func (s *Store) ListContactsFromConversations(query string, limit int) ([]*Conta
 		if err := json.Unmarshal([]byte(participantsJSON), &participants); err != nil {
 			// Fall back to conversation name if participants can't be parsed
 			if name != "" && !seen[name] {
-				if query == "" || containsInsensitive(name, queryLower) {
+				if query == "" || containsFoldASCII(name, queryLower) {
 					seen[name] = true
 					contacts = append(contacts, &Contact{
 						ContactID: convID,
@@ -112,7 +136,7 @@ func (s *Store) ListContactsFromConversations(query string, limit int) ([]*Conta
 		}
 
 		for _, p := range participants {
-			if p.IsMe {
+			if p.IsMe || p.IsMeCamel {
 				continue
 			}
 			displayName := p.Name
@@ -126,7 +150,7 @@ func (s *Store) ListContactsFromConversations(query string, limit int) ([]*Conta
 			if seen[key] {
 				continue
 			}
-			if query != "" && !containsInsensitive(displayName, queryLower) && !containsInsensitive(p.Number, queryLower) {
+			if query != "" && !containsFoldASCII(displayName, queryLower) && !containsFoldASCII(p.Number, queryLower) {
 				continue
 			}
 			seen[key] = true
@@ -136,11 +160,10 @@ func (s *Store) ListContactsFromConversations(query string, limit int) ([]*Conta
 				Number:    p.Number,
 			})
 		}
-
-		if len(contacts) >= limit {
-			contacts = contacts[:limit]
-			break
-		}
+	}
+	// One thread can list more matches than the limit leaves room for.
+	if len(contacts) > limit {
+		contacts = contacts[:limit]
 	}
 	return contacts, rows.Err()
 }
@@ -200,8 +223,21 @@ func (s *Store) ListUnifiedContacts(query string, limit int) ([]*UnifiedContact,
 	return contacts, rows.Err()
 }
 
-func containsInsensitive(s, sub string) bool {
-	return strings.Contains(strings.ToLower(s), sub)
+// containsFoldASCII reports whether s holds sub, a lowerASCII string, with
+// ASCII letters' case aside, as SQLite's lower() folds them.
+func containsFoldASCII(s, sub string) bool {
+	return strings.Contains(lowerASCII(s), sub)
+}
+
+// lowerASCII lowers s's ASCII letters and leaves every other byte alone.
+func lowerASCII(s string) string {
+	b := []byte(s)
+	for index, c := range b {
+		if c >= 'A' && c <= 'Z' {
+			b[index] = c + 'a' - 'A'
+		}
+	}
+	return string(b)
 }
 
 func NormalizeAvatarPhone(phone string) string {

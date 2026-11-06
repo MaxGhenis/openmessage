@@ -8,6 +8,9 @@ import (
 	"strings"
 
 	moderncsqlite "modernc.org/sqlite"
+
+	"github.com/maxghenis/openmessage/internal/addressmatch"
+	"github.com/maxghenis/openmessage/internal/phoneline"
 )
 
 const (
@@ -824,7 +827,10 @@ func (s *Store) ListConversationsByRecencyAllAccounts(limit int) ([]Conversation
 // participants' display names or canonical addresses, contain query as a
 // case-insensitive substring — newest first, at most limit rows. It is the
 // bounded v2 counterpart of the legacy metadata search: the match runs in SQL
-// so callers map only the hits instead of every conversation.
+// so callers map only the hits instead of every conversation. The account's
+// owner takes part in most conversations, so the owner's names and address
+// match nothing; matching them would fill the results with the owner's
+// conversations and crowd out the people a search names.
 func (s *Store) SearchConversationsByName(query string, limit int) ([]Conversation, error) {
 	if limit <= 0 || strings.TrimSpace(query) == "" {
 		return []Conversation{}, nil
@@ -839,9 +845,10 @@ func (s *Store) SearchConversationsByName(query string, limit int) ([]Conversati
 		        SELECT cp.conversation_id
 		        FROM conversation_participants cp
 		        JOIN identities i ON i.identity_id = cp.identity_id
-		        WHERE cp.display_name LIKE ? ESCAPE '\'
-		           OR i.display_name LIKE ? ESCAPE '\'
-		           OR i.canonical_value LIKE ? ESCAPE '\'
+		        WHERE i.is_self = 0
+		          AND (cp.display_name LIKE ? ESCAPE '\'
+		               OR i.display_name LIKE ? ESCAPE '\'
+		               OR i.canonical_value LIKE ? ESCAPE '\')
 		    )
 		 ORDER BY last_message_at_ms DESC, conversation_id
 		 LIMIT ?`,
@@ -855,6 +862,82 @@ func (s *Store) SearchConversationsByName(query string, limit int) ([]Conversati
 		return nil, fmt.Errorf("search conversations by name: %w", err)
 	}
 	return conversations, nil
+}
+
+// SearchConversationsByPhoneLine returns the conversations with a
+// participant on the phone line that line, a phoneline.Line, names, newest
+// first, then in conversation ID order, and at most limit. A participant's
+// line is its identity's canonical value, as reads show it, and the
+// account's owner (the self identity) is on no line. A canonical value
+// counts only where it reads as a phone number or a WhatsApp JID of one, so
+// an email address, a Signal UUID, a LID or a user path that holds the line's
+// digits names no one; a number then matches as send_message matches a
+// recipient, through phoneline. The match runs before the LIMIT, so numbers
+// that only contain the line's digits never crowd out one that ends with
+// them.
+func (s *Store) SearchConversationsByPhoneLine(line string, limit int) ([]Conversation, error) {
+	if limit <= 0 {
+		return []Conversation{}, nil
+	}
+	conversations, err := s.searchConversationsByIdentity(phoneline.SQL("?", "i.canonical_value"), line, limit)
+	if err != nil {
+		return nil, fmt.Errorf("search conversations by phone line: %w", err)
+	}
+	return conversations, nil
+}
+
+// SearchConversationsByAddress returns the conversations with a participant
+// whose identity's canonical value matches address as a whole, newest first,
+// then in conversation ID order, and at most limit. A participant who has
+// left counts, as in SearchConversationsByName. A canonical value matches
+// address when the two share an addressmatch key, as in the legacy store's
+// address search: the key drops the white space around a value and lowers
+// ASCII letters. v2keys.IdentityKey trims a value before it stores it, so
+// the white space matters only for a value that another writer stored. The
+// account's owner (the self identity) matches nothing, and neither does a
+// canonical value that only contains address, a raw value, a display name,
+// or a title: another person's address or phone number can hold this one.
+// The match runs before the LIMIT. A blank address matches nothing.
+func (s *Store) SearchConversationsByAddress(address string, limit int) ([]Conversation, error) {
+	key := addressmatch.Key(address)
+	if limit <= 0 || key == "" {
+		return []Conversation{}, nil
+	}
+	conversations, err := s.searchConversationsByIdentity(addressmatch.SQL("?", "i.canonical_value"), key, limit)
+	if err != nil {
+		return nil, fmt.Errorf("search conversations by address: %w", err)
+	}
+	return conversations, nil
+}
+
+// searchConversationsByIdentity returns the conversations with a participant
+// whose identity passes match, newest first, then in conversation ID order,
+// and at most limit. match writes an SQL test of the identity i against one
+// bound argument, value. The account's owner (the self identity) passes
+// nothing. SQLite runs the innermost query once, so a Go function in match
+// runs once for each identity, however many threads it joins.
+func (s *Store) searchConversationsByIdentity(match, value string, limit int) ([]Conversation, error) {
+	rows, err := s.db.QueryContext(
+		context.Background(),
+		"SELECT "+conversationColumns+`
+		 FROM conversations
+		 WHERE conversation_id IN (
+		        SELECT conversation_id
+		        FROM conversation_participants
+		        WHERE identity_id IN (
+		            SELECT i.identity_id
+		            FROM identities i
+		            WHERE i.is_self = 0 AND `+match+`
+		        )
+		    )
+		 ORDER BY last_message_at_ms DESC, conversation_id
+		 LIMIT ?`,
+		value, limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return collectRows(rows, scanConversation)
 }
 
 // escapeLikePattern makes user text match literally inside a LIKE pattern

@@ -11,6 +11,14 @@ import (
 	"github.com/maxghenis/openmessage/internal/storage/sqlite"
 )
 
+// ErrUnknownConversation reports a send that names no v2 conversation. Sends
+// take v2 conversation IDs only, the IDs v2 reads return. Reads also accept a
+// conversation's remote ID (issue #155), but a send must not: a Google
+// Messages thread number is device-local, and a phone change re-numbers
+// threads (issue #177), so an old number can name another person's thread
+// now. Showing the wrong thread is recoverable; texting it is not.
+var ErrUnknownConversation = errors.New("unknown conversation")
+
 // NativeDeps are the v2 store and services needed to submit using v2-native
 // conversation and message IDs. Unlike Deps, this path has no legacy store.
 type NativeDeps struct {
@@ -32,11 +40,7 @@ func SubmitTextV2(
 	}
 	conversation, err := deps.V2.GetConversation(input.ConversationID)
 	if err != nil {
-		return messaging.Submission{}, fmt.Errorf(
-			"resolve v2 conversation %q: %w",
-			input.ConversationID,
-			err,
-		)
+		return messaging.Submission{}, conversationLookupError(input.ConversationID, err)
 	}
 	if !deps.Registry.Capabilities(conversation.AccountID).TextSend {
 		return messaging.Submission{}, fmt.Errorf(
@@ -68,6 +72,21 @@ func SubmitTextV2(
 	})
 }
 
+// conversationLookupError wraps a failed lookup of a send's conversation. A
+// missing row becomes ErrUnknownConversation, still wrapping the store's
+// not-found error, so callers that map not-found keep working.
+func conversationLookupError(conversationID string, err error) error {
+	if errors.Is(err, sqlite.ErrNotFound) {
+		return fmt.Errorf(
+			"%w %q (sends take the conversation ID that reads return, not a platform's thread ID): %w",
+			ErrUnknownConversation,
+			conversationID,
+			err,
+		)
+	}
+	return fmt.Errorf("resolve v2 conversation %q: %w", conversationID, err)
+}
+
 // SubmitMediaV2 is the streaming media counterpart to SubmitTextV2.
 func SubmitMediaV2(
 	ctx context.Context,
@@ -79,11 +98,7 @@ func SubmitMediaV2(
 	}
 	conversation, err := deps.V2.GetConversation(input.ConversationID)
 	if err != nil {
-		return messaging.Submission{}, fmt.Errorf(
-			"resolve v2 conversation %q: %w",
-			input.ConversationID,
-			err,
-		)
+		return messaging.Submission{}, conversationLookupError(input.ConversationID, err)
 	}
 	if !deps.Registry.Capabilities(conversation.AccountID).MediaSend {
 		return messaging.Submission{}, fmt.Errorf(

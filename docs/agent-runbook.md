@@ -1036,6 +1036,143 @@ running app:
   store has no place for them, and `migrate` counts and drops them), and the
   message reads that show transcripts, the read tools and the web UI's
   conversation view, serve v2 there, so none would show one saved to legacy.
+- **Send to the conversation IDs the reads return.** Every read tool,
+  `resolve_contact_routes` included, returns IDs from the store it reads, and
+  the send tools take exactly those. On a v2-primary app the outbox takes v2
+  conversation IDs only: any other ID, a Google Messages thread number
+  included, gets HTTP 404 `unknown conversation_id: …`, and the outbox queues
+  nothing. Reads resolve a remote ID to its conversation (#155). Sends never
+  do, and neither does `resolve_contact_routes`, which says where to send:
+  Google thread numbers are device-local and a phone change re-numbers them
+  (#176, #177; "Google thread ids are device-local" above), so an old number
+  can name another person's thread. The route tool finds a person by their
+  number in any written form and by a name that only the legacy store holds. A
+  query that reads as a phone number names a line: 7 to 15 digits, at most one
+  `+` before them, and nothing else but white space, dashes of any kind, dots,
+  slashes and parentheses (`phoneline.Number`). Both stores search for that
+  line (`SearchConversationsByPhoneLine`) by comparing the last ten digits as
+  `send_message` does for a recipient (v2 stores E.164; the legacy store keeps
+  numbers as the address book writes them), and a stored value takes part only
+  where it reads as a number too, or as a WhatsApp JID on `@s.whatsapp.net` or
+  `@c.us` whose user is the number's digits. Their SQL calls the same Go
+  matcher (`internal/phoneline`, which SQLite knows as `om_phone_line_match`),
+  so separators and a country prefix don't matter, a shorter number matches a
+  longer one only at its end (5550123 matches +12025550123 but not
+  +447555012399), and the match runs before the limit. Digits inside any other
+  value match nothing: an email address or an SMS gateway's address
+  (`2025550123@vtext.com`), a Signal UUID, a WhatsApp LID or group JID, a
+  Google Chat `users/...` ID, a `legacy-participant:` placeholder, a `tel:`
+  URI, a number with an extension, or a name. A live store held Signal UUIDs
+  whose hex holds 7 to 15 digits as participant numbers, and the old
+  digits-only rule could put one on someone's line.
+  `send_message` follows the same rule. Its SMS lookup takes a number's own
+  thread over a newer gateway thread whose address holds the digits, and its
+  recipient check takes a name with digits after it, in any script (`Мама
+  2025550123`), for a name and refuses it before anything reaches the daemon.
+  On legacy reads the line search also finds incoming messages' senders whom
+  the roster lacks, and it tests each distinct sender number once, however
+  many messages it sent. A number goes no further than that search: an
+  address-book card or participant on the same line adds nothing, and one
+  whose number only contains its digits belongs to someone else. Other text
+  matches a title or the name, number, phone or email of a participant entry,
+  never a JSON key or an ID: `me`, the demo store's name for its owner,
+  matches the names that contain it, not the "name" key that every entry has.
+  It skips the account's owner, whom most threads in both stores list: a
+  thread that a query matches only through the owner's entry or the owner's
+  own messages gives no route, while a title that holds the owner's name still
+  matches. v2's conversation search (`SearchConversationsByName`, which also
+  serves `/api/search`) skips the owner's identity in SQL. The legacy search
+  (`SearchConversationsByMetadata`, which also serves `openmessage thread`
+  and, on a legacy-primary app, `/api/search`) skips participant entries
+  with the owner's flag (`is_me` or `isMe` holding JSON true) and matches only
+  incoming messages' senders, since the owner's outgoing messages carry the
+  owner's name and number. Both searches skip the owner before their limit, so
+  newer threads that list only the owner and one other person can't push a
+  match out of the results, and both, like the address-book lookup
+  (`ListContacts`), match `%` and `_` literally. The route tool keeps every
+  hit of either search. For text that isn't a number, it also reads the
+  contacts in legacy threads (`ListContactsFromConversations`), even when a
+  title or a card matched. A title that holds a name says nothing about where
+  that person's own thread is. The tool searches each line once, however the
+  cards and threads write its number. It looks up each other value it finds
+  there once, as a whole address in the serving store. Such values include SMS
+  short codes, Signal UUIDs and email addresses, which the legacy Google Chat
+  importer files as participants' numbers. That lookup
+  (`SearchConversationsByAddress`) ignores only ASCII letters' case and the
+  white space around each value, which a card or an importer may keep. Both
+  stores' SQL compares values by the key that `addressmatch.Key` writes,
+  through a Go function SQLite knows as `om_address_match`. The tool keys its
+  lookups the same way, so it looks up each address once. A
+  longer value that holds the one it looks up (`other-support@example.com` for
+  `support@example.com`, `+12025550142` for the short code `55501`), a name and
+  a title match nothing. A search for the value's text would route a name query
+  to strangers whose own addresses or phone numbers hold it, and to groups
+  whose titles do, and at a small limit newer ones would crowd the person out.
+  `ListContactsFromConversations` skips flagged entries too, reads past any
+  number of threads that yield none, and matches what an entry says, not its
+  JSON text: `R&D` finds R&D Desk, whose & Go's encoder writes as an escape,
+  and like `LIKE` and `lower()` it ignores only ASCII case, so `ÁNGEL` finds
+  Ángel Ruiz but `ángel` doesn't. Threads that share a time come in
+  conversation ID order in both stores' searches and in this list, so a limit
+  keeps the same threads whichever store serves the reads. An entry that holds
+  the owner's name or number without the flag still matches: the WhatsApp text
+  importer lists every sender, the owner included, with no flag. Before the fix
+  for the 2026-11-03 (UTC) incident, `resolve_contact_routes` read the legacy
+  store on a v2-primary install and handed out Google thread numbers, which the
+  outbox refused with a bare 404 `not found`, while `send_message` by phone
+  number worked. In-process `send_media_to_conversation` on v2-primary refused
+  every v2 ID too: it looked the ID up in the legacy store first. In client
+  mode the route tool takes WhatsApp and Signal sendability from the daemon's
+  `/api/status` (no answer: not sendable) instead of building its own bridges.
+  Regression tests: `TestClientModeSendsToTheRouteResolveContactRoutesPrefers`,
+  `TestResolveContactRoutesNeverRoutesByAReusedGoogleThreadNumber`,
+  `TestResolveContactRoutesFindsPeopleByAnyFormOfTheirNumber`,
+  `TestInProcessSendsTakeTheIDsResolveContactRoutesReturns`,
+  `TestResolveContactRoutesIgnoresTheAccountOwner`,
+  `TestResolveContactRoutesKeepsAThreadThatOnlyAnIncomingSenderMatches`,
+  `TestResolveContactRoutesFindsAPersonBehindThreadsThatListOnlyTheOwner`,
+  `TestResolveContactRoutesKeepsV2MatchesOnANameReadsHide`,
+  `TestResolveContactRoutesReturnsOnlyServingStoreThreadsOfThePerson`,
+  `TestResolveContactRoutesMatchesParticipantValuesNotJSONKeys`,
+  `TestResolveContactRoutesMatchesANumberByItsLineNotAsASubstring`,
+  `TestResolveContactRoutesDoesNotRouteTheOwnerThroughAFragmentOfTheirNumber`,
+  `TestResolveContactRoutesFindsALineBehindNumbersThatOnlyContainItsDigits`,
+  `TestResolveContactRoutesMatchesTheAddressBookLiterally`,
+  `TestResolveContactRoutesFindsAnIncomingSenderByAnyFormOfTheirNumber`,
+  `TestResolveContactRoutesFindsALegacyNumberWrittenWithSeparators`,
+  `TestResolveContactRoutesFindsANumberOnlyWhereItReadsAsOne`,
+  `TestResolveContactRoutesTakesOnlyAWrittenNumberAsANumber`,
+  `TestResolveContactRoutesFindsALegacyOnlyNameBesideATitleThatHoldsIt`,
+  `TestResolveContactRoutesLooksUpAFoundAddressAsAWhole`,
+  `TestResolveContactRoutesKeepsAPersonWhoseAddressOthersHold`,
+  `TestResolveContactRoutesFindsAnAddressWhateverWhiteSpaceSurroundsIt`,
+  `TestResolveContactRoutesFindsEveryThreadOfEachAddressItLooksUp`,
+  `TestResolveContactRoutesTellsApartAddressesThatDifferAfterANUL`,
+  `TestResolveContactRoutesLooksUpTwoAddressesThatDifferAfterANUL`,
+  `TestResolveContactRoutesSearchesEachLineOnce` and
+  `TestResolveContactRoutesFindsALegacyNameThatJSONEscapes` (internal/tools),
+  `TestSearchConversationsByMetadataSkipsTheAccountOwner`,
+  `TestSearchConversationsByPhoneLineAgreesWithTheLineModel`,
+  `TestSearchConversationsByAddressMatchesTheWholeAddress` and
+  `TestSearchConversationsByAddressAgreesWithTheAddressModel`
+  (internal/v2read),
+  `TestSearchConversationsByMetadataSkipsTheOwnersOwnMessages`,
+  `TestSearchConversationsByMetadataSkipsEntriesFlaggedAsTheOwners`,
+  `TestSearchConversationsByMetadataMatchesEntryValuesNotKeys`,
+  `TestSearchConversationsByPhoneLineAgreesWithTheLineModel`,
+  `TestSearchConversationsByAddressMatchesTheWholeAddress`,
+  `TestSearchConversationsByAddressAgreesWithTheAddressModel`,
+  `TestListContactsMatchesTheQueryLiterally`,
+  `TestListContactsFromConversationsReadsPastThreadsThatListOnlyTheOwner`,
+  `TestListContactsFromConversationsMatchesWhatAnEntrySays`,
+  `TestListContactsFromConversationsReadsABadByteAsTheDecoderDoes`,
+  `TestLegacySearchesBreakTiesByConversationID`,
+  `TestSearchConversationsByPhoneLineCallsTheMatcherOncePerSenderNumber`
+  (internal/db), `TestMatch`, `TestNumber` and `TestMatchProperties`
+  (internal/phoneline), `TestKey`, `TestSQLMatch` and
+  `TestSQLMatchAgreesWithKey` (internal/addressmatch),
+  `TestSubmitTextV2SendsOnlyToTheConversationItsIDNames` and
+  `TestSubmitTextV2SendsToTheV2IDWhenIDsCollide` (internal/v2wire).
 - Escape hatches: `--transports` forces the old standalone full-stack stdio
   behavior (only for machines where the MCP process is the *only* OpenMessage
   process, ever); `--no-transports` strips transports from a **legacy-mode**

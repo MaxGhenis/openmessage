@@ -167,3 +167,69 @@ func TestSearchConversationsByMetadataTreatsLikeMetacharactersLiterally(t *testi
 	}
 	assertConversationIDs(t, got, "conversation-percent")
 }
+
+// The account's owner takes part in most threads, under a name and a number,
+// and a thread's participant row can name the owner differently from the
+// owner's identity. A search that matched the owner would fill the results
+// with the owner's threads and crowd out the people the searcher meant, so
+// the owner's names and number match nothing, while other participants and
+// titles still match.
+func TestSearchConversationsByMetadataSkipsTheAccountOwner(t *testing.T) {
+	store, _, source := openSourceTestStore(t)
+	seedSearchFixture(t, store)
+	if err := store.UpsertIdentity(sqlite.Identity{
+		IdentityID:     "identity-self",
+		AccountID:      "search-account",
+		Kind:           sqlite.IdentityKind("e164"),
+		CanonicalValue: "+15550009999",
+		RawValue:       "+15550009999",
+		DisplayName:    "Sam Owner",
+		IsSelf:         true,
+		MetadataJSON:   `{}`,
+		CreatedAtMS:    sourceTestTimeMS,
+		UpdatedAtMS:    sourceTestTimeMS,
+	}); err != nil {
+		t.Fatalf("UpsertIdentity(self): %v", err)
+	}
+	if err := store.ReplaceConversationParticipants("conversation-direct", []sqlite.ConversationParticipant{{
+		AccountID:      "search-account",
+		ConversationID: "conversation-direct",
+		IdentityID:     "identity-alice",
+		Role:           sqlite.ParticipantRoleMember,
+		DisplayName:    "Ali (nickname)",
+		IsActive:       true,
+	}, {
+		AccountID:      "search-account",
+		ConversationID: "conversation-direct",
+		IdentityID:     "identity-self",
+		Role:           sqlite.ParticipantRoleMember,
+		DisplayName:    "Sammy",
+		IsActive:       true,
+	}}); err != nil {
+		t.Fatalf("ReplaceConversationParticipants(): %v", err)
+	}
+
+	for _, query := range []string{"Sam Owner", "owner", "Sammy", "+15550009999", "5550009999"} {
+		t.Run("owner "+query, func(t *testing.T) {
+			got, err := source.SearchConversationsByMetadata(query, 10)
+			if err != nil {
+				t.Fatalf("search %q: %v", query, err)
+			}
+			assertConversationIDs(t, got)
+		})
+	}
+	for query, want := range map[string]string{
+		"alice":      "conversation-direct",
+		"nickname":   "conversation-direct",
+		"5550000001": "conversation-direct",
+		"byte-exact": "conversation-group",
+	} {
+		t.Run(query, func(t *testing.T) {
+			got, err := source.SearchConversationsByMetadata(query, 10)
+			if err != nil {
+				t.Fatalf("search %q: %v", query, err)
+			}
+			assertConversationIDs(t, got, want)
+		})
+	}
+}

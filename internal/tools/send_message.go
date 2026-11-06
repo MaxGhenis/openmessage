@@ -13,6 +13,7 @@ import (
 
 	"github.com/maxghenis/openmessage/internal/app"
 	"github.com/maxghenis/openmessage/internal/db"
+	"github.com/maxghenis/openmessage/internal/phoneline"
 )
 
 var (
@@ -359,16 +360,13 @@ func digitsOnly(value string) string {
 	return b.String()
 }
 
-// looksLikePhoneNumber reports whether s is plausibly an E.164-style phone
-// number: 7–15 digits (after stripping +, spaces, dashes, parens) and no
-// letters. Rejects names like "Mom" or "John Smith" that would otherwise be
-// resolved against the address book and could send to the wrong contact.
+// looksLikePhoneNumber reports whether s is a phone number as people write
+// one, as phoneline.Number reads it: 7 to 15 digits, at most one + before
+// them, and nothing else but white space, dashes, dots, slashes and
+// parentheses. It rejects a name such as "Mom", "John Smith" or a name in
+// another script with digits after it, which Google would otherwise resolve
+// against the address book, and so could send to the wrong contact.
 func looksLikePhoneNumber(s string) bool {
-	for _, r := range s {
-		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') {
-			return false
-		}
-	}
-	digits := digitsOnly(s)
-	return len(digits) >= 7 && len(digits) <= 15
+	_, ok := phoneline.Number(s)
+	return ok
 }

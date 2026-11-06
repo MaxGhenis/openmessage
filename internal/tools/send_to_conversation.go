@@ -20,11 +20,15 @@ var (
 	}
 )
 
+// conversationIDArgDescription names the tools whose conversation IDs the
+// send tools accept: each reads the serving store, as the send path does.
+const conversationIDArgDescription = "Existing conversation ID from list_conversations, get_conversation or resolve_contact_routes"
+
 func sendToConversationTool(v2Enabled ...bool) mcp.Tool {
 	description := "Send a text message to an existing conversation by conversation ID across supported platforms"
 	options := []mcp.ToolOption{
 		mcp.WithDescription(description),
-		mcp.WithString("conversation_id", mcp.Required(), mcp.Description("Existing conversation ID from list_conversations or get_conversation")),
+		mcp.WithString("conversation_id", mcp.Required(), mcp.Description(conversationIDArgDescription)),
 		mcp.WithString("message", mcp.Required(), mcp.Description("Message text to send")),
 	}
 	if v2Requested(v2Enabled) {
