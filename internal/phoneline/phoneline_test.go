@@ -393,6 +393,9 @@ func TestSQLKeysAgreesWithSQLMatchOverSetsOfLines(t *testing.T) {
 				line += "\x00" + randomDigits(random, 7)
 			case 1:
 				line = "\x00" + line
+			case 2:
+				at := 1 + random.Intn(len(line)-1)
+				line = line[:at] + "\x00" + line[at:]
 			}
 			lines = append(lines, line)
 		}
@@ -474,6 +477,9 @@ func TestSQLKeysAgreesWithSQLMatchOverSetsOfLines(t *testing.T) {
 			if matched == 0 && hasNUL && MatchFirst(before, strs...) {
 				exercised["a line that a NUL keeps off a value"]++
 			}
+			if matched == 0 && hasNUL && MatchFirst(strings.ReplaceAll(line, "\x00", ""), strs...) {
+				exercised["a line whose digits only reach a value without its NUL"]++
+			}
 			if matched == 0 && MatchFirst(line, cut...) {
 				exercised["a value that a NUL keeps off a line"]++
 			}
@@ -531,7 +537,7 @@ func TestSQLKeysAgreesWithSQLMatchOverSetsOfLines(t *testing.T) {
 	for _, path := range []string{
 		"a set with no lines", "a tuple on one of the lines", "a tuple off every line",
 		"a tuple whose first value is blank", "a NULL", "an INTEGER", "a BLOB",
-		"a match through a line with a NUL", "a line that a NUL keeps off a value", "a value that a NUL keeps off a line",
+		"a match through a line with a NUL", "a line that a NUL keeps off a value", "a line whose digits only reach a value without its NUL", "a value that a NUL keeps off a line",
 	} {
 		if exercised[path] == 0 {
 			t.Errorf("the property never drew %s (drew %v)", path, exercised)
