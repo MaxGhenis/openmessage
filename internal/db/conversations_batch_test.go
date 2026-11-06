@@ -11,9 +11,11 @@ import (
 	"sync/atomic"
 	"testing"
 	"testing/quick"
+	"unicode/utf8"
 
 	"modernc.org/sqlite"
 
+	"github.com/maxghenis/openmessage/internal/addressmatch"
 	"github.com/maxghenis/openmessage/internal/phoneline"
 )
 
@@ -21,13 +23,13 @@ import (
 // random store hold. The phones include numbers that hold another's last ten
 // digits inside them, share only its last seven, or are too short to name a
 // line; the owner's number comes last. The addresses include values that hold
-// another inside them, differ from it only in a non-ASCII letter's case, or
-// differ from it only after a NUL, which SQLite's NOCASE stops comparing at;
-// the owner's address comes last. The odd values hold a line's digits but
-// name no line, are blank, or carry a NUL after a number.
+// another inside them, differ from it only in a non-ASCII letter's case or
+// only after a NUL, or hold a byte that isn't UTF-8; the owner's address comes
+// last. The odd values hold a line's digits but name no line, are blank, or
+// carry a NUL after a number.
 var (
 	batchPhones    = []string{"12025550123", "13035550147", "15555550199", "447555012399", "4412025550123", "13035550123", "5550123", "550123", "12025550124", "15550009999"}
-	batchAddresses = []string{"support@example.com", "other-support@example.com", "support@example.com.au", " support@example.com", "a&b@example.com", "élise@example.com", "Élise@example.com", "users/123", "users/1234", "abcdefab-abcd-abcd-abcd-abcdefabcdef", "72975", "nul\x00a@example.com", "nul\x00b@example.com", "me@example.com"}
+	batchAddresses = []string{"support@example.com", "other-support@example.com", "support@example.com.au", " support@example.com", "a&b@example.com", "élise@example.com", "Élise@example.com", "users/123", "users/1234", "abcdefab-abcd-abcd-abcd-abcdefabcdef", "72975", "nul\x00a@example.com", "nul\x00b@example.com", "bad\xff@example.com", "me@example.com"}
 	batchOddValues = []string{"12025550123@s.whatsapp.net", "15555550199@lid", "alice12025550123@example.com", "users/12025550123", "+99999912025550123", "13035550147@c.us", "", " ", "\t", "+1 202 555 0123\x00x", "\x002025550123"}
 )
 
@@ -37,7 +39,7 @@ func batchValue(random *rand.Rand) string {
 	case 0, 1, 2, 3:
 		return phoneLineForm(random, batchPhones[random.Intn(len(batchPhones))])
 	case 4, 5, 6:
-		return addressForm(random, batchAddresses[random.Intn(len(batchAddresses))])
+		return spaceAround(random, addressForm(random, batchAddresses[random.Intn(len(batchAddresses))]))
 	default:
 		return batchOddValues[random.Intn(len(batchOddValues))]
 	}
@@ -47,9 +49,10 @@ func batchValue(random *rand.Rand) string {
 // number, phone or email, as bare strings, as numbers that aren't text, or in
 // nested arrays; some carry a blank number before a phone or an email; the
 // owner's entries are flagged with JSON true under is_me or isMe, or with a
-// string that isn't JSON true; a participants text may be blank, an object
-// or broken JSON; incoming and outgoing messages carry senders; and threads
-// often share a time.
+// string that isn't JSON true; a participants text may be blank, an object,
+// broken JSON or JSON written by hand with a byte that isn't UTF-8, which Go's
+// encoder would write as U+FFFD; incoming and outgoing messages carry senders;
+// and threads often share a time.
 func seedBatchStore(t *testing.T, random *rand.Rand, store *Store) {
 	t.Helper()
 	ownerPhone, ownerAddress := batchPhones[len(batchPhones)-1], batchAddresses[len(batchAddresses)-1]
@@ -106,6 +109,8 @@ func seedBatchStore(t *testing.T, random *rand.Rand, store *Store) {
 			participants = []byte(`{"number":"+12025550123"}`)
 		case 2:
 			participants = []byte(`[{"number":"+12025550123"`)
+		case 3:
+			participants = []byte("[{\"name\":\"P0\",\"number\":\"\u00a0BAD\xff@Example.com \"},\"nul\\u0000a@example.com\"]")
 		}
 		if err := store.UpsertConversation(&Conversation{
 			ConversationID: id, Name: "Thread " + id, Participants: string(participants),
@@ -206,11 +211,11 @@ func batchAddress(random *rand.Rand) string {
 // does. Every search for one value matches before its limit, so the newest
 // of their hits are the newest threads on any value; so, as invariants, the
 // batch matches each value as its own search does, under phoneline's rules
-// for a line and NOCASE for a whole address, skips the flagged owner as that
-// search does, applies the limit after matching, and keeps threads that
-// share a time in ID order. Three more hold for every batch: the order of
-// the values and repeats among them change nothing, and neither does how
-// many addresses each query binds.
+// for a line and addressmatch's key for a whole address, skips the flagged
+// owner as that search does, applies the limit after matching, and keeps
+// threads that share a time in ID order. Three more hold for every batch: the
+// order of the values and repeats among them change nothing, and neither does
+// how many addresses each query binds.
 func TestBatchedSearchesReturnTheNewestOfEachValuesSearch(t *testing.T) {
 	exercised := map[string]int{}
 	property := func(seed int64) bool {
@@ -253,6 +258,12 @@ func TestBatchedSearchesReturnTheNewestOfEachValuesSearch(t *testing.T) {
 					withHits++
 					if strings.Contains(values[index], "\x00") {
 						exercised[article(kind)+" with a NUL that finds threads"]++
+					}
+					if strings.TrimSpace(values[index]) != values[index] {
+						exercised[article(kind)+" with white space around it that finds threads"]++
+					}
+					if !utf8.ValidString(values[index]) {
+						exercised[article(kind)+" with a byte that isn't UTF-8 that finds threads"]++
 					}
 				}
 				all = append(all, hits...)
@@ -342,7 +353,7 @@ func TestBatchedSearchesReturnTheNewestOfEachValuesSearch(t *testing.T) {
 					t.Logf("seed %d: addresses %q (limit %d) = %v, but %d to a query gives %v (%v)", seed, addresses, limit, conversationIDs(got), perQuery, conversationIDs(again), err)
 					return false
 				}
-				if len(nonBlankAddresses(addresses)) > perQuery && len(got) > 0 {
+				if len(addressmatch.Keys(addresses)) > perQuery && len(got) > 0 {
 					exercised["addresses split across queries"]++
 				}
 			}
@@ -377,6 +388,8 @@ func TestBatchedSearchesReturnTheNewestOfEachValuesSearch(t *testing.T) {
 		"threads that share a time across an address batch's limit",
 		"a line with a NUL that finds threads",
 		"an address with a NUL that finds threads",
+		"an address with white space around it that finds threads",
+		"an address with a byte that isn't UTF-8 that finds threads",
 		"addresses split across queries",
 	} {
 		if exercised[path] == 0 {
@@ -390,6 +403,16 @@ func TestBatchedSearchesReturnTheNewestOfEachValuesSearch(t *testing.T) {
 const countedPhoneLineKeys = "om_test_counted_phone_line_keys"
 
 var countedPhoneLineKeysCalls atomic.Int64
+
+// countedPhoneLineKeysSQL writes a call of countedPhoneLineKeys, casting each
+// argument to BLOB as phoneline.KeysSQL does.
+func countedPhoneLineKeysSQL(args ...string) string {
+	cast := make([]string, len(args))
+	for index, arg := range args {
+		cast[index] = "CAST(" + arg + " AS BLOB)"
+	}
+	return countedPhoneLineKeys + "(" + strings.Join(cast, ", ") + ")"
+}
 
 func init() {
 	sqlite.MustRegisterDeterministicScalarFunction(countedPhoneLineKeys, -1, func(_ *sqlite.FunctionContext, args []driver.Value) (driver.Value, error) {
@@ -445,7 +468,7 @@ func TestSearchConversationsByPhoneLinesReadsEachValueOnce(t *testing.T) {
 		lines = append(lines, phoneline.Line("1"+strconv.Itoa(4000000000+index)))
 	}
 	countedPhoneLineKeysCalls.Store(0)
-	rows, err := store.db.Query(phoneLinesSearchSQL(countedPhoneLineKeys), phoneline.KeysOfLines(lines), 10)
+	rows, err := store.db.Query(phoneLinesSearchSQL(countedPhoneLineKeysSQL), phoneline.KeysOfLines(lines), 10)
 	if err != nil {
 		t.Fatalf("query: %v", err)
 	}
@@ -464,5 +487,159 @@ func TestSearchConversationsByPhoneLinesReadsEachValueOnce(t *testing.T) {
 	real, err := store.SearchConversationsByPhoneLines(lines, 10)
 	if err != nil || !sameConversations(real, found) {
 		t.Errorf("SearchConversationsByPhoneLines = %v (%v), but the counted query found %v", conversationIDs(real), err, conversationIDs(found))
+	}
+}
+
+// countedAddressKey is addressmatch.SQLKey under another name, and
+// countedAddressKeyCalls counts its calls.
+const countedAddressKey = "om_test_counted_address_key"
+
+var countedAddressKeyCalls atomic.Int64
+
+// countedAddressKeySQL writes a call of countedAddressKey, casting its
+// argument to BLOB as addressmatch.KeySQL does.
+func countedAddressKeySQL(value string) string {
+	return countedAddressKey + "(CAST(" + value + " AS BLOB))"
+}
+
+func init() {
+	sqlite.MustRegisterDeterministicScalarFunction(countedAddressKey, 1, func(_ *sqlite.FunctionContext, args []driver.Value) (driver.Value, error) {
+		countedAddressKeyCalls.Add(1)
+		value, ok := args[0].([]byte)
+		if !ok {
+			return nil, nil
+		}
+		key := addressmatch.Key(string(value))
+		if key == "" {
+			return nil, nil
+		}
+		return []byte(key), nil
+	})
+}
+
+// The batched address search calls the Go key function up to three times for
+// each participant entry, for its number, phone and email, and once for each
+// distinct sender number at most, however many addresses it holds and however
+// many messages each sender sent: a name can find 160 values, and a search for
+// each read every entry and sender again.
+func TestSearchConversationsByAddressesReadsEachValueOnce(t *testing.T) {
+	store := newTestStore(t)
+	conversations := []*Conversation{
+		{ConversationID: "work", Name: "Work", IsGroup: true, SourcePlatform: "sms", LastMessageTS: 20,
+			Participants: `[{"name":"Bob Example","number":"bob@example.com"},{"name":"Dee Example","email":"dee@example.com"},{"name":"Me","number":"me@example.com","is_me":true}]`},
+		{ConversationID: "club", Name: "Club", IsGroup: true, SourcePlatform: "sms", LastMessageTS: 10,
+			Participants: `[{"name":"Eve Example","number":"eve@example.com"}]`},
+		{ConversationID: "desk", Name: "Desk", SourcePlatform: "sms", LastMessageTS: 5, Participants: `[]`},
+	}
+	var messages []*Message
+	for index := 0; index < 900; index++ {
+		messages = append(messages, &Message{
+			MessageID: "m" + strconv.Itoa(index), Body: "hello", TimestampMS: int64(index + 1), SourcePlatform: "sms",
+			ConversationID: []string{"desk", "club", "work"}[index%3],
+			SenderNumber:   []string{"sam@example.com", "kim@example.com", "me@example.com"}[index%3],
+			IsFromMe:       index%3 == 2,
+		})
+	}
+	seedSearchStore(t, store, conversations, messages, nil)
+
+	addresses := []string{"Bob@Example.com", "SAM@example.com "}
+	for index := 0; len(addresses) < 160; index++ {
+		addresses = append(addresses, "person"+strconv.Itoa(index)+"@example.com")
+	}
+	keys := addressmatch.Keys(addresses)
+	args := make([]any, 0, len(keys)+1)
+	for _, key := range keys {
+		args = append(args, []byte(key))
+	}
+	countedAddressKeyCalls.Store(0)
+	rows, err := store.db.Query(addressesSearchSQL(len(keys), countedAddressKeySQL), append(args, 10)...)
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	found, err := scanConversations(rows)
+	rows.Close()
+	if err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if ids := conversationIDs(found); !slices.Equal(ids, []string{"work", "desk"}) {
+		t.Errorf("%d addresses with bob@example.com and sam@example.com = %v, want Work, which lists Bob, and Desk, where Sam wrote", len(addresses), ids)
+	}
+	const entries, senderNumbers = 4, 3
+	if calls := countedAddressKeyCalls.Load(); calls > 3*entries+senderNumbers {
+		t.Errorf("the search called the key function %d times for %d addresses, %d entries and %d sender numbers in %d messages", calls, len(addresses), entries, senderNumbers, len(messages))
+	}
+	real, err := store.SearchConversationsByAddresses(addresses, 10)
+	if err != nil || !sameConversations(real, found) {
+		t.Errorf("SearchConversationsByAddresses = %v (%v), but the counted query found %v", conversationIDs(real), err, conversationIDs(found))
+	}
+}
+
+// A batch compares what the search for one address compares: every byte of a
+// value's key. Each row names the threads that its addresses must find: white
+// space around a value or an address and its ASCII letters' case don't matter,
+// but a non-ASCII letter's case, a byte after a NUL and a byte that isn't UTF-8
+// do, and a value that only holds an address matches nothing. The reads run
+// through entries and senders, so both arms stay under test.
+func TestSearchConversationsByAddressesComparesEveryByteOfTheKey(t *testing.T) {
+	store := newTestStore(t)
+	conversations := []*Conversation{
+		{ConversationID: "padded", Name: "Padded", SourcePlatform: "sms", LastMessageTS: 90,
+			Participants: `[{"name":"Sue","number":"\u00a0Support@Example.COM\t"}]`},
+		{ConversationID: "holds-it", Name: "Holds it", SourcePlatform: "sms", LastMessageTS: 85,
+			Participants: `[{"name":"Other","number":"other-support@example.com"}]`},
+		{ConversationID: "nul-a", Name: "NUL a", SourcePlatform: "sms", LastMessageTS: 80,
+			Participants: `[{"name":"A","email":"NUL\u0000a@example.com"}]`},
+		{ConversationID: "nul-b", Name: "NUL b", SourcePlatform: "sms", LastMessageTS: 70,
+			Participants: `["nul\u0000b@example.com"]`},
+		{ConversationID: "raw-entry", Name: "Raw entry", SourcePlatform: "sms", LastMessageTS: 60,
+			Participants: "[{\"name\":\"Raw\",\"phone\":\" RAW\xff@example.com\"}]"},
+		{ConversationID: "raw-sender", Name: "Raw sender", SourcePlatform: "sms", LastMessageTS: 50, Participants: `[]`},
+		{ConversationID: "accent", Name: "Accent", SourcePlatform: "sms", LastMessageTS: 40,
+			Participants: `[{"name":"Élise","number":"Élise@example.com"}]`},
+		{ConversationID: "owner", Name: "Owner", SourcePlatform: "sms", LastMessageTS: 30,
+			Participants: `[{"name":"Me","number":"me@example.com","is_me":true}]`},
+	}
+	messages := []*Message{
+		{MessageID: "raw", ConversationID: "raw-sender", Body: "hello", TimestampMS: 1, SourcePlatform: "sms", SenderNumber: "\u3000Sender\xfe@example.com"},
+		{MessageID: "from-me", ConversationID: "owner", Body: "hello", TimestampMS: 2, SourcePlatform: "sms", SenderNumber: "me@example.com", IsFromMe: true},
+	}
+	seedSearchStore(t, store, conversations, messages, nil)
+	for _, c := range []struct {
+		addresses []string
+		want      []string
+	}{
+		{[]string{"support@example.com", "nobody@example.com"}, []string{"padded"}},
+		{[]string{"\tSUPPORT@example.com\u2003", " support@example.com"}, []string{"padded"}},
+		{[]string{"example.com", "support", "nobody@example.com"}, []string{}},
+		{[]string{"nul\x00a@example.com", "nobody@example.com"}, []string{"nul-a"}},
+		{[]string{"NUL\x00B@example.com", "nobody@example.com"}, []string{"nul-b"}},
+		{[]string{"nul\x00a@example.com", "nul\x00b@example.com"}, []string{"nul-a", "nul-b"}},
+		{[]string{"nul", "nul\x00", "nul\x00c@example.com"}, []string{}},
+		{[]string{"raw\xff@example.com", "nobody@example.com"}, []string{"raw-entry"}},
+		{[]string{"raw\xfe@example.com", "raw\ufffd@example.com"}, []string{}},
+		{[]string{"sender\xfe@example.com", "nobody@example.com"}, []string{"raw-sender"}},
+		{[]string{"ÉLISE@EXAMPLE.com", "nobody@example.com"}, []string{"accent"}},
+		{[]string{"élise@example.com", "éLISE@example.com"}, []string{}},
+		{[]string{"me@example.com", "ME@example.com "}, []string{}},
+		{[]string{"", " ", "\u00a0"}, []string{}},
+	} {
+		var union []*Conversation
+		for _, address := range c.addresses {
+			hits, err := store.SearchConversationsByAddress(address, 10)
+			if err != nil {
+				t.Fatalf("SearchConversationsByAddress(%q): %v", address, err)
+			}
+			union = append(union, hits...)
+		}
+		if ids := conversationIDs(newestOfConversations(union, 10)); !slices.Equal(ids, c.want) {
+			t.Errorf("the searches for each of %q find %v, want %v", c.addresses, ids, c.want)
+		}
+		got, err := store.SearchConversationsByAddresses(c.addresses, 10)
+		if err != nil {
+			t.Fatalf("SearchConversationsByAddresses(%q): %v", c.addresses, err)
+		}
+		if ids := conversationIDs(got); !slices.Equal(ids, c.want) {
+			t.Errorf("SearchConversationsByAddresses(%q) = %v, want %v", c.addresses, ids, c.want)
+		}
 	}
 }

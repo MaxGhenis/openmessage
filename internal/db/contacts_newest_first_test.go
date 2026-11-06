@@ -9,6 +9,9 @@ import (
 	"strings"
 	"testing"
 	"testing/quick"
+
+	"github.com/maxghenis/openmessage/internal/addressmatch"
+	"github.com/maxghenis/openmessage/internal/phoneline"
 )
 
 // contactRow is one row of ListContactsFromConversations' query.
@@ -269,10 +272,10 @@ func TestListContactsFromConversationsPlanReadsTheNewestFirstIndex(t *testing.T)
 		t.Errorf("the sorted query's plan = %q, want a sort", plan)
 	}
 	for name, query := range map[string]string{
-		"phoneLineSearchSQL":   phoneLineSearchSQL("om_phone_line_match"),
-		"phoneLinesSearchSQL":  phoneLinesSearchSQL("om_phone_line_keys"),
+		"phoneLineSearchSQL":   phoneLineSearchSQL(phoneline.SQL),
+		"phoneLinesSearchSQL":  phoneLinesSearchSQL(phoneline.KeysSQL),
 		"addressSearchSQL":     addressSearchSQL,
-		"addressesSearchSQL":   addressesSearchSQL(2),
+		"addressesSearchSQL":   addressesSearchSQL(2, addressmatch.KeySQL),
 		"sorted contacts form": contactsFromConversationsSQL(false),
 	} {
 		count := strings.Count(query, "?")

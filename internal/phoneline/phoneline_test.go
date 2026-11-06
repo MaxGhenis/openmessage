@@ -364,17 +364,17 @@ func TestMatchProperties(t *testing.T) {
 	}
 }
 
-// SQLKeys answers SQLMatch for a whole set of lines at once, through SQLite:
-// a tuple of values is on one of the set's lines, as SQLMatch says for each
-// line in turn, exactly when a key that SQLKeys gives for the tuple is among
-// the keys that KeysOfLines gives for the set. Tuples mix written numbers,
-// WhatsApp JIDs, identifiers that hold a line's digits, noise, blanks, NULLs,
-// integers and BLOBs, and sets run from no lines to six, so the first value
-// that isn't blank decides, as it does for SQLMatch, and a value off every
-// line or a set with no lines matches nothing. Some lines hold a NUL: SQL
-// text reaches SQLMatch cut there, and KeysOfLines cuts the line there too.
-// SQLKeys gives ValueKeys of that value, at most ten, and NULL where it names
-// no line.
+// SQLKeys answers SQLMatch for a whole set of lines at once, through SQLite
+// and the SQL each function's helper writes: a tuple of values is on one of the
+// set's lines, as SQLMatch says for each line in turn, exactly when a key that
+// SQLKeys gives for the tuple is among the keys that KeysOfLines gives for the
+// set. Tuples mix written numbers, WhatsApp JIDs, identifiers that hold a
+// line's digits, noise, blanks, NULLs, integers and BLOBs, and sets run from no
+// lines to six, so the first value that isn't blank decides, as it does for
+// SQLMatch, and a value off every line or a set with no lines matches nothing.
+// Some lines and values hold a NUL, which the helpers' casts keep, so a value
+// or a line never matches through the part before it. SQLKeys gives ValueKeys
+// of that value, at most ten, and NULL where it names no line.
 func TestSQLKeysAgreesWithSQLMatchOverSetsOfLines(t *testing.T) {
 	conn, err := sql.Open("sqlite", ":memory:")
 	if err != nil {
@@ -415,8 +415,9 @@ func TestSQLKeysAgreesWithSQLMatchOverSetsOfLines(t *testing.T) {
 				strs = append(strs, "")
 				exercised["a NULL"]++
 			case 1:
-				value = int64(random.Intn(1_000_000_000))
-				strs = append(strs, "")
+				number := int64(random.Intn(1_000_000_000))
+				value = number
+				strs = append(strs, strconv.FormatInt(number, 10))
 				exercised["an INTEGER"]++
 			case 2:
 				written := numberForm(random, prefix+base)
@@ -424,6 +425,12 @@ func TestSQLKeysAgreesWithSQLMatchOverSetsOfLines(t *testing.T) {
 				strs = append(strs, written)
 				exercised["a BLOB"]++
 			case 3:
+				if random.Intn(2) == 0 {
+					written := numberForm(random, prefix+base) + "\x00" + noiseForm(random)
+					value = written
+					strs = append(strs, written)
+					break
+				}
 				blank := []string{"", "  ", "\t"}[random.Intn(3)]
 				value = blank
 				strs = append(strs, blank)
@@ -446,24 +453,34 @@ func TestSQLKeysAgreesWithSQLMatchOverSetsOfLines(t *testing.T) {
 			}
 			values = append(values, value)
 		}
-		placeholders := strings.TrimSuffix(strings.Repeat("?, ", len(values)), ", ")
+		marks := make([]string, len(values))
+		cut := make([]string, len(values))
+		for index := range values {
+			marks[index] = "?"
+			cut[index], _, _ = strings.Cut(strs[index], "\x00")
+		}
+		match, keysOf := SQL(append([]string{"?"}, marks...)...), KeysSQL(marks...)
 		want := false
 		for _, line := range lines {
 			var matched int64
-			if err := conn.QueryRow("SELECT "+SQLMatch+"(?, "+placeholders+")", append([]any{line}, values...)...).Scan(&matched); err != nil {
+			if err := conn.QueryRow("SELECT "+match, append([]any{line}, values...)...).Scan(&matched); err != nil {
 				t.Fatalf("query %s: %v", SQLMatch, err)
 			}
 			want = want || matched == 1
 			if matched == 1 && strings.Contains(line, "\x00") {
 				exercised["a match through a line with a NUL"]++
 			}
-			if matched == 0 && strings.HasPrefix(line, "\x00") {
-				exercised["a line cut to nothing at a NUL"]++
+			before, _, hasNUL := strings.Cut(line, "\x00")
+			if matched == 0 && hasNUL && MatchFirst(before, strs...) {
+				exercised["a line that a NUL keeps off a value"]++
+			}
+			if matched == 0 && MatchFirst(line, cut...) {
+				exercised["a value that a NUL keeps off a line"]++
 			}
 		}
 		var got int64
 		if err := conn.QueryRow(`SELECT EXISTS (
-			SELECT 1 FROM json_each(`+SQLKeys+`(`+placeholders+`)) AS value_key
+			SELECT 1 FROM json_each(`+keysOf+`) AS value_key
 			WHERE value_key.value IN (SELECT value FROM json_each(?)))`, append(values, set)...).Scan(&got); err != nil {
 			t.Fatalf("query %s: %v", SQLKeys, err)
 		}
@@ -472,7 +489,7 @@ func TestSQLKeysAgreesWithSQLMatchOverSetsOfLines(t *testing.T) {
 			return false
 		}
 		var keys sql.NullString
-		if err := conn.QueryRow("SELECT "+SQLKeys+"("+placeholders+")", values...).Scan(&keys); err != nil {
+		if err := conn.QueryRow("SELECT "+keysOf, values...).Scan(&keys); err != nil {
 			t.Fatalf("query %s: %v", SQLKeys, err)
 		}
 		var first string
@@ -514,10 +531,32 @@ func TestSQLKeysAgreesWithSQLMatchOverSetsOfLines(t *testing.T) {
 	for _, path := range []string{
 		"a set with no lines", "a tuple on one of the lines", "a tuple off every line",
 		"a tuple whose first value is blank", "a NULL", "an INTEGER", "a BLOB",
-		"a match through a line with a NUL", "a line cut to nothing at a NUL",
+		"a match through a line with a NUL", "a line that a NUL keeps off a value", "a value that a NUL keeps off a line",
 	} {
 		if exercised[path] == 0 {
 			t.Errorf("the property never drew %s (drew %v)", path, exercised)
+		}
+	}
+	// The function itself, called without KeysSQL's casts, counts an INTEGER as
+	// blank, and sees a TEXT argument only up to its first NUL, which is why
+	// KeysSQL casts each argument to BLOB.
+	for _, c := range []struct {
+		query string
+		args  []any
+		want  bool
+	}{
+		{"SELECT " + SQLKeys + "(12025550123)", nil, false},
+		{"SELECT " + SQLKeys + "(1.5)", nil, false},
+		{"SELECT " + SQLKeys + "(NULL)", nil, false},
+		{"SELECT " + SQLKeys + "(?)", []any{"+12025550123\x00x"}, true},
+		{"SELECT " + KeysSQL("?"), []any{"+12025550123\x00x"}, false},
+	} {
+		var keys sql.NullString
+		if err := conn.QueryRow(c.query, c.args...).Scan(&keys); err != nil {
+			t.Fatalf("%s: %v", c.query, err)
+		}
+		if keys.Valid != c.want {
+			t.Errorf("%s with %q = %q, want keys: %v", c.query, c.args, keys.String, c.want)
 		}
 	}
 }

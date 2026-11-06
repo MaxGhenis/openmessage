@@ -12,7 +12,9 @@ import (
 	"testing"
 	"testing/quick"
 	"time"
+	"unicode/utf8"
 
+	"github.com/maxghenis/openmessage/internal/addressmatch"
 	"github.com/maxghenis/openmessage/internal/db"
 	"github.com/maxghenis/openmessage/internal/phoneline"
 	"github.com/maxghenis/openmessage/internal/readsource"
@@ -21,7 +23,7 @@ import (
 )
 
 // findRouteConversationsOneByOne is findRouteConversations as it stood
-// before it batched its lookups (#267's head, 0107cc945), kept verbatim as
+// before it batched its lookups (#267's head, d03c6a382), kept verbatim as
 // the reference for the differential below: it searches reads once for each
 // line and each address that people's cards and threads hold.
 func findRouteConversationsOneByOne(reads readsource.ReadSource, people *db.Store, query string, limit int) ([]*db.Conversation, error) {
@@ -49,18 +51,18 @@ func findRouteConversationsOneByOne(reads readsource.ReadSource, people *db.Stor
 		addConversation(conv)
 	}
 
-	// search finds text's conversations in reads. A phone number names its line,
-	// which both stores match as send_message matches a recipient: by the last
-	// ten digits of each value that reads as a number, or as a WhatsApp JID of
-	// one, since v2 stores numbers in E.164 form while the legacy store and
-	// address books keep them as people wrote them. A run of digits inside
-	// another number names someone else (5550123 sits inside +447555012399), and
-	// so do digits inside an email address, a Signal UUID or a name. Most
+	// search finds text's conversations in reads. A phone number names its
+	// line, which both stores match as send_message matches a recipient: by the
+	// last ten digits of each value that reads as a number, or as a WhatsApp
+	// JID of one, since v2 stores numbers in E.164 form while the legacy store
+	// and address books keep them as people wrote them. A run of digits inside
+	// another number names someone else (5550123 sits inside +447555012399),
+	// and so do digits inside an email address, a Signal UUID or a name. Most
 	// threads list the account's owner, and a thread that a query matches only
 	// through the owner says nothing about whom to send to. Both stores'
 	// searches skip the owner before their limit: v2's skips the owner's
-	// identity, and the legacy store's skips participant entries flagged as the
-	// owner's and the owner's own messages.
+	// identity, and the legacy store's skips participant entries with the
+	// owner's flag and the owner's own messages.
 	search := func(text string) ([]*db.Conversation, error) {
 		if looksLikePhoneNumber(text) {
 			return reads.SearchConversationsByPhoneLine(phoneline.Line(text), limit)
@@ -81,25 +83,28 @@ func findRouteConversationsOneByOne(reads readsource.ReadSource, people *db.Stor
 
 	// lookUp finds the threads of the person a number names. A phone number
 	// names a line. Any other value names whoever holds it as a whole
-	// address, with ASCII letters' case aside: the legacy Google Chat importer
-	// files an email address as a number, SMS threads list a short code as
-	// one, and another person's address or phone number, or a title, can hold
-	// either, so a search for the text would route to them.
+	// address, with ASCII letters' case and the white space around it aside,
+	// as addressmatch.Key writes it: the legacy Google Chat importer files an
+	// email address as a number, SMS threads list a short code as one, and
+	// another person's address or phone number, or a title, can hold either,
+	// so a search for the text would route to them.
 	// searched holds each line and address that lookUp has asked reads about,
 	// so reads answer each lookup once. The address book and legacy threads
-	// often hold one person's number, each written its own way, and every
-	// form names one line. The query's own search matches every thread that
-	// an address lookup of the query would, in the same order and under the
-	// same limit, so that lookup could add only threads that newestRoutes
-	// drops, and it counts as done.
-	searched := map[string]bool{"address:" + lowerASCII(query): true}
+	// often hold one person's number, each in its own form, and every form
+	// names one line. Two values share an address key exactly when the
+	// stores' address searches can't tell them apart. The query arrives as
+	// JSON text, so it holds valid UTF-8, and its own search matches every
+	// thread that an address lookup of the query would, in the same order and
+	// under the same limit. That lookup could add only threads that
+	// newestRoutes drops, so it counts as done.
+	searched := map[string]bool{"address:" + addressmatch.Key(query): true}
 	lookUp := func(number string) {
 		number = strings.TrimSpace(number)
 		if number == "" {
 			return
 		}
 		byLine := looksLikePhoneNumber(number)
-		key := "address:" + lowerASCII(number)
+		key := "address:" + addressmatch.Key(number)
 		if byLine {
 			key = "line:" + phoneline.Line(number)
 		}
@@ -205,18 +210,24 @@ func routeBatchFlipCase(random *rand.Rand, value string) string {
 
 // routeBatchWritten writes a value as the legacy store or an address book
 // keeps it: a phone number in some written form, any other value with its
-// ASCII letters' case changed.
+// ASCII letters' case changed and, some of the time, white space around it.
 func routeBatchWritten(random *rand.Rand, value routeBatchValue) string {
 	if value.kind == "e164" {
 		return routeBatchPhoneForm(random, value.value)
 	}
-	return routeBatchFlipCase(random, value.value)
+	written := routeBatchFlipCase(random, value.value)
+	if random.Intn(4) == 0 {
+		spaces := []string{"", " ", "\t", "\u0085", "\u00a0", "\u2028", "\u3000"}
+		written = spaces[random.Intn(len(spaces))] + written + spaces[random.Intn(len(spaces))]
+	}
+	return written
 }
 
 // seedRouteBatchStores writes random people into the legacy store, which
 // serves as people and as legacy reads, and into the v2 store. People hold
 // phone numbers, some shared and some that hold another's digits inside
-// them, email addresses, an SMS short code, a Signal UUID or a WhatsApp LID.
+// them, email addresses, some that differ only after a NUL or hold a byte that
+// isn't UTF-8, an SMS short code, a Signal UUID or a WhatsApp LID.
 // The address book files cards for some of their values, in written forms;
 // legacy threads list people with the owner flagged, carry titles that hold
 // names, and have incoming senders, including some whom no roster lists and
@@ -231,7 +242,9 @@ func seedRouteBatchStores(t *testing.T, random *rand.Rand, legacy *db.Store, sto
 		last := routeBatchLastNames[random.Intn(len(routeBatchLastNames))]
 		person := routeBatchPerson{name: first + " " + last}
 		for count := 1 + random.Intn(3); count > 0; count-- {
-			switch random.Intn(9) {
+			switch random.Intn(10) {
+			case 8:
+				person.values = append(person.values, routeBatchValue{[]string{"nul\x00a@example.com", "nul\x00b@example.com", "bad\xff@example.com"}[random.Intn(3)], "email"})
 			case 0, 1, 2:
 				person.values = append(person.values, routeBatchValue{fmt.Sprintf("+1202555%04d", random.Intn(40)), "e164"})
 			case 3:
@@ -406,6 +419,15 @@ func (r *failingBatchRouteReads) SearchConversationsByAddresses(addresses []stri
 	return r.ReadSource.SearchConversationsByAddresses(addresses, limit)
 }
 
+// mapKeys returns counts' keys.
+func mapKeys(counts map[string]int) []string {
+	keys := make([]string, 0, len(counts))
+	for key := range counts {
+		keys = append(keys, key)
+	}
+	return keys
+}
+
 // sameRoutes reports whether a and b hold equal conversations in the same
 // order.
 func sameRoutes(a, b []*db.Conversation) bool {
@@ -426,8 +448,8 @@ func sameRoutes(a, b []*db.Conversation) bool {
 // findRouteConversationsOneByOne returns by searching for each value: the
 // same conversations, with the same fields, in the same order. So the
 // batches keep every rule that each value's search applies, phoneline's for
-// a line and NOCASE for a whole address, the owner skipped as each store
-// skips it, matching before the limit, and newest first with ties in
+// a line and addressmatch's key for a whole address, the owner skipped as each
+// store skips it, matching before the limit, and newest first with ties in
 // conversation ID order. It returns the same when a batch fails and the
 // tool falls back to a search for each value. Two counts hold too: the tool
 // asks reads for each line and each address once, and runs one query of
@@ -508,6 +530,18 @@ func TestFindRouteConversationsBatchesAgreeWithASearchForEachValue(t *testing.T)
 				if len(counting.addresses) == 1 && counting.queries["address"] == 1 {
 					exercised[mode+": a lone address searched alone"]++
 				}
+				for value := range counting.addresses {
+					if strings.Contains(value, "\x00") {
+						exercised[mode+": an address with a NUL to look up"]++
+					}
+					if !utf8.ValidString(value) {
+						exercised[mode+": an address with a byte that isn't UTF-8 to look up"]++
+					}
+				}
+				if len(addressmatch.Keys(append(mapKeys(counting.addresses), query))) < len(counting.addresses)+1 {
+					t.Logf("seed %d, %s: for %q, asked reads for addresses that share a key: %q", seed, mode, query, mapKeys(counting.addresses))
+					return false
+				}
 				if all, err := findRouteConversationsOneByOne(reads, a.Store, query, 1000); err == nil && len(all) > limit && len(want) == limit {
 					exercised[mode+": a limit that cuts the routes"]++
 				}
@@ -527,7 +561,7 @@ func TestFindRouteConversationsBatchesAgreeWithASearchForEachValue(t *testing.T)
 	}
 	var paths []string
 	for _, mode := range routeStoreModes {
-		for _, path := range []string{"a query that asks for both batches", "a batch of two or more lines", "a batch of two or more addresses", "a lone line searched alone", "a lone address searched alone", "a limit that cuts the routes", "a fallback to a search for each value"} {
+		for _, path := range []string{"a query that asks for both batches", "a batch of two or more lines", "a batch of two or more addresses", "a lone line searched alone", "a lone address searched alone", "a limit that cuts the routes", "a fallback to a search for each value", "an address with a NUL to look up", "an address with a byte that isn't UTF-8 to look up"} {
 			paths = append(paths, mode+": "+path)
 		}
 	}

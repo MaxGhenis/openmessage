@@ -37,7 +37,49 @@ func SQL(args ...string) string {
 	return SQLMatch + "(" + strings.Join(cast, ", ") + ")"
 }
 
+// SQLKey names the SQLite function om_address_key(value). It returns
+// Key(value) as a BLOB, and NULL when that key is empty or value is NULL, an
+// INTEGER or a REAL. Every connection the "sqlite" driver opens has the
+// function. SQLMatch(key, value) returns 1 exactly when SQLKey(value) equals
+// a key that isn't empty, bound as a BLOB. So a search for many addresses at
+// once reads each value through SQLKey once and looks its key up among
+// theirs, where SQLMatch would compare it with each in turn. Call it through
+// KeySQL, which keeps every byte of the value.
+const SQLKey = "om_address_key"
+
+// KeySQL returns an SQL expression that calls SQLKey on value, an SQL
+// expression. It casts value to BLOB, as SQL casts each of its arguments and
+// for the same reason.
+func KeySQL(value string) string {
+	return SQLKey + "(CAST(" + value + " AS BLOB))"
+}
+
+// Keys returns the Key of each of values, in order, without the empty key and
+// without repeats. A search for values looks for exactly these keys.
+func Keys(values []string) []string {
+	seen := make(map[string]bool, len(values))
+	keys := make([]string, 0, len(values))
+	for _, value := range values {
+		if key := Key(value); key != "" && !seen[key] {
+			seen[key] = true
+			keys = append(keys, key)
+		}
+	}
+	return keys
+}
+
 func init() {
+	sqlite.MustRegisterDeterministicScalarFunction(SQLKey, 1, func(_ *sqlite.FunctionContext, args []driver.Value) (driver.Value, error) {
+		value, ok := text(args[0])
+		if !ok {
+			return nil, nil
+		}
+		key := Key(value)
+		if key == "" {
+			return nil, nil
+		}
+		return []byte(key), nil
+	})
 	sqlite.MustRegisterDeterministicScalarFunction(SQLMatch, -1, func(_ *sqlite.FunctionContext, args []driver.Value) (driver.Value, error) {
 		if len(args) < 2 {
 			return int64(0), nil

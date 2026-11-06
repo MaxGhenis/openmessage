@@ -48,8 +48,20 @@ func SQL(args ...string) string {
 // SQLMatch(line, values...) returns 1 exactly when a key that SQLKeys(values...)
 // returns is among LineKeys(line). A search for many lines at once reads each
 // value through SQLKeys once and looks its keys up among the lines' keys,
-// where SQLMatch would compare it with each line in turn.
+// where SQLMatch would compare it with each line in turn. Call it through
+// KeysSQL, which keeps every byte of each argument.
 const SQLKeys = "om_phone_line_keys"
+
+// KeysSQL returns an SQL expression that calls SQLKeys on args, SQL
+// expressions for the values. It casts each argument to BLOB, as SQL does and
+// for the same reason.
+func KeysSQL(args ...string) string {
+	cast := make([]string, len(args))
+	for index, arg := range args {
+		cast[index] = "CAST(" + arg + " AS BLOB)"
+	}
+	return SQLKeys + "(" + strings.Join(cast, ", ") + ")"
+}
 
 func init() {
 	sqlite.MustRegisterDeterministicScalarFunction(SQLKeys, -1, func(_ *sqlite.FunctionContext, args []driver.Value) (driver.Value, error) {
@@ -250,13 +262,11 @@ func ValueKeys(value string) []string {
 // KeysOfLines returns the LineKeys of every one of lines, each key once, as
 // a JSON array of strings, for a search that looks for many lines at once.
 // A value whose SQLKeys share a key with the array is one that SQLMatch
-// matches against one of lines bound as SQL text. SQL text reaches SQLMatch
-// cut at its first NUL, so a line's keys come from the part before it.
+// matches against one of lines.
 func KeysOfLines(lines []string) string {
 	seen := map[string]bool{}
 	keys := []string{}
 	for _, line := range lines {
-		line, _, _ = strings.Cut(line, "\x00")
 		for _, key := range LineKeys(line) {
 			if !seen[key] {
 				seen[key] = true

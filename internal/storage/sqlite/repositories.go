@@ -949,7 +949,7 @@ func (s *Store) SearchConversationsByAddress(address string, limit int) ([]Conve
 // returns for each of lines: newest first, then in conversation ID order,
 // and at most limit. Every search matches before its limit, so these are
 // the newest threads with a participant on any of the lines. One query reads
-// each identity once, through phoneline.SQLKeys, and looks the canonical
+// each identity once, through phoneline.KeysSQL, and looks the canonical
 // value's keys up among the lines' keys from phoneline.KeysOfLines, where a
 // search for each line reads every identity again. No lines, or a limit
 // below 1, match nothing.
@@ -957,7 +957,7 @@ func (s *Store) SearchConversationsByPhoneLines(lines []string, limit int) ([]Co
 	if len(lines) == 0 || limit <= 0 {
 		return []Conversation{}, nil
 	}
-	rows, err := s.db.QueryContext(context.Background(), phoneLinesSearchSQL(phoneline.SQLKeys), phoneline.KeysOfLines(lines), limit)
+	rows, err := s.db.QueryContext(context.Background(), phoneLinesSearchSQL(phoneline.KeysSQL), phoneline.KeysOfLines(lines), limit)
 	if err != nil {
 		return nil, fmt.Errorf("search conversations by phone lines: %w", err)
 	}
@@ -968,20 +968,20 @@ func (s *Store) SearchConversationsByPhoneLines(lines []string, limit int) ([]Co
 	return conversations, nil
 }
 
-// phoneLinesSearchSQL is SearchConversationsByPhoneLines's query, calling the
-// SQL function keys, phoneline.SQLKeys or a stand-in, for each canonical
-// value's keys. It takes a JSON array of the lines' keys, then the limit.
-// on_line holds the identities other than the owner's that are on one of
-// the lines, so keys runs once for each identity, however many lines the
-// query holds and however many conversations list the identity.
-func phoneLinesSearchSQL(keys string) string {
+// phoneLinesSearchSQL is SearchConversationsByPhoneLines's query. keys writes
+// a call of the SQL function that gives a canonical value's keys, as
+// phoneline.KeysSQL does. The query takes a JSON array of the lines' keys, then
+// the limit. on_line holds the identities other than the owner's that are on
+// one of the lines, so keys runs once for each identity, however many lines
+// the query holds and however many conversations list the identity.
+func phoneLinesSearchSQL(keys func(args ...string) string) string {
 	return `
 		WITH line_keys(line_key) AS MATERIALIZED (
 			SELECT value FROM json_each(?)
 		),
 		on_line(identity_id) AS MATERIALIZED (
 			SELECT DISTINCT i.identity_id
-			FROM identities i, json_each(` + keys + `(i.canonical_value)) AS value_key
+			FROM identities i, json_each(` + keys("i.canonical_value") + `) AS value_key
 			WHERE i.is_self = 0 AND value_key.value IN (SELECT line_key FROM line_keys)
 		)
 		SELECT ` + conversationColumns + `
@@ -995,7 +995,7 @@ func phoneLinesSearchSQL(keys string) string {
 		LIMIT ?`
 }
 
-// maxAddressesPerQuery caps the addresses that one query of
+// maxAddressesPerQuery caps the addresses' keys that one query of
 // SearchConversationsByAddresses binds, each as its own value, far below
 // SQLite's default cap of 32,766 bound values.
 const maxAddressesPerQuery = 1000
@@ -1004,33 +1004,32 @@ const maxAddressesPerQuery = 1000
 // returns the newest of the conversations that SearchConversationsByAddress
 // returns for each of addresses: newest first, then in conversation ID
 // order, and at most limit. Every search matches before its limit, so these
-// are the newest threads with a participant whose canonical value is one of
-// the addresses as a whole. A query binds each address as that search binds
-// it and compares it under the same NOCASE collation. It reads each identity
-// once and looks its canonical value up among the addresses, where a search
-// for each address reads every identity again. Past maxAddressesPerQuery
-// addresses, it runs a query for each group of that many and keeps the
-// newest of their hits. A blank address matches nothing, and so does a
-// limit below 1.
+// are the newest threads with a participant whose canonical value matches one
+// of the addresses as a whole. A query reads each identity once, through
+// addressmatch.KeySQL, and looks its key up among the addresses' keys, which it
+// binds as BLOBs, so two keys match only when they hold the same bytes. A
+// search for each address reads every identity again. Past maxAddressesPerQuery
+// keys, it runs a query for each group of that many and keeps the newest of
+// their hits. A blank address matches nothing, and so does a limit below 1.
 func (s *Store) SearchConversationsByAddresses(addresses []string, limit int) ([]Conversation, error) {
 	return s.searchConversationsByAddresses(addresses, limit, maxAddressesPerQuery)
 }
 
 // searchConversationsByAddresses is SearchConversationsByAddresses with
-// perQuery addresses, at most, in each query.
+// perQuery keys, at most, in each query.
 func (s *Store) searchConversationsByAddresses(addresses []string, limit, perQuery int) ([]Conversation, error) {
-	addresses = nonBlankAddresses(addresses)
-	if len(addresses) == 0 || limit <= 0 {
+	keys := addressmatch.Keys(addresses)
+	if len(keys) == 0 || limit <= 0 {
 		return []Conversation{}, nil
 	}
 	var found []Conversation
-	for start := 0; start < len(addresses); start += perQuery {
-		group := addresses[start:min(start+perQuery, len(addresses))]
+	for start := 0; start < len(keys); start += perQuery {
+		group := keys[start:min(start+perQuery, len(keys))]
 		args := make([]any, 0, len(group)+1)
-		for _, address := range group {
-			args = append(args, address)
+		for _, key := range group {
+			args = append(args, []byte(key))
 		}
-		rows, err := s.db.QueryContext(context.Background(), addressesSearchSQL(len(group)), append(args, limit)...)
+		rows, err := s.db.QueryContext(context.Background(), addressesSearchSQL(len(group), addressmatch.KeySQL), append(args, limit)...)
 		if err != nil {
 			return nil, fmt.Errorf("search conversations by addresses: %w", err)
 		}
@@ -1038,23 +1037,12 @@ func (s *Store) searchConversationsByAddresses(addresses []string, limit, perQue
 		if err != nil {
 			return nil, fmt.Errorf("search conversations by addresses: %w", err)
 		}
-		if len(group) == len(addresses) {
+		if len(group) == len(keys) {
 			return hits, nil
 		}
 		found = append(found, hits...)
 	}
 	return newestConversations(found, limit), nil
-}
-
-// nonBlankAddresses returns the addresses that aren't blank, in order.
-func nonBlankAddresses(addresses []string) []string {
-	kept := make([]string, 0, len(addresses))
-	for _, address := range addresses {
-		if strings.TrimSpace(address) != "" {
-			kept = append(kept, address)
-		}
-	}
-	return kept
 }
 
 // newestConversations returns the conversations newest first, then in
@@ -1082,22 +1070,28 @@ func newestConversations(conversations []Conversation, limit int) []Conversation
 }
 
 // addressesSearchSQL is SearchConversationsByAddresses's query for count
-// addresses. It takes the addresses, then the limit. The IN reads the
-// addresses into an index under the collation of its left side, NOCASE,
-// once for the query.
-func addressesSearchSQL(count int) string {
+// keys. key writes a call of the SQL function that gives a canonical value's
+// key, as addressmatch.KeySQL does. The query takes the keys as BLOBs, then the
+// limit. holding holds the identities other than the owner's whose canonical
+// values match one of the keys, so key runs once for each identity, however
+// many keys the query holds and however many conversations list the identity.
+func addressesSearchSQL(count int, key func(value string) string) string {
 	values := strings.TrimSuffix(strings.Repeat("(?), ", count), ", ")
 	return `
-		WITH addresses(address) AS MATERIALIZED (
+		WITH address_keys(address_key) AS MATERIALIZED (
 			VALUES ` + values + `
+		),
+		holding(identity_id) AS MATERIALIZED (
+			SELECT i.identity_id
+			FROM identities i
+			WHERE i.is_self = 0 AND ` + key("i.canonical_value") + ` IN (SELECT address_key FROM address_keys)
 		)
 		SELECT ` + conversationColumns + `
 		FROM conversations
 		WHERE conversation_id IN (
 			SELECT cp.conversation_id
 			FROM conversation_participants cp
-			JOIN identities i ON i.identity_id = cp.identity_id
-			WHERE i.is_self = 0 AND i.canonical_value COLLATE NOCASE IN (SELECT address FROM addresses)
+			WHERE cp.identity_id IN (SELECT identity_id FROM holding)
 		)
 		ORDER BY last_message_at_ms DESC, conversation_id
 		LIMIT ?`
