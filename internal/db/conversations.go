@@ -1,9 +1,11 @@
 package db
 
 import (
+	"cmp"
 	"database/sql"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/maxghenis/openmessage/internal/addressmatch"
@@ -514,6 +516,192 @@ var addressSearchSQL = `
 	ORDER BY last_message_ts DESC, conversation_id
 	LIMIT ?
 `
+
+// SearchConversationsByPhoneLines looks for many phone lines at once. It
+// returns the newest of the conversations that SearchConversationsByPhoneLine
+// returns for each of lines: newest first, then in conversation ID order,
+// and at most limit, which it reads as that search does (0 returns nothing,
+// and below 0 sets no limit). Every search matches before its limit, so
+// these are the newest threads on any of the lines. One query reads each
+// participant entry and each distinct sender number once, through
+// phoneline.KeysSQL, and looks the value's keys up among the lines' keys
+// from phoneline.KeysOfLines. A search for each line reads every
+// conversation's participants and every sender number again. No lines
+// match nothing.
+func (s *Store) SearchConversationsByPhoneLines(lines []string, limit int) ([]*Conversation, error) {
+	if len(lines) == 0 {
+		return []*Conversation{}, nil
+	}
+	rows, err := s.db.Query(phoneLinesSearchSQL(phoneline.KeysSQL), phoneline.KeysOfLines(lines), limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanConversations(rows)
+}
+
+// phoneLinesSearchSQL is SearchConversationsByPhoneLines's query. keys writes
+// a call of the SQL function that gives a value's keys, as phoneline.KeysSQL
+// does. The query takes a JSON array of the lines' keys, then the limit. It
+// reads the values that phoneLineSearchSQL compares with a line, and in the
+// same way: a participant entry not flagged as the owner's, through its number
+// or, without one, its phone, a bare string entry, and each distinct sender
+// number of an incoming message. keys runs once for each of those entries
+// and sender numbers, however many lines the query holds, and SQLite reads
+// the lines' keys into an index once for the query.
+func phoneLinesSearchSQL(keys func(args ...string) string) string {
+	return `
+		WITH line_keys(line_key) AS MATERIALIZED (
+			SELECT value FROM json_each(?)
+		),
+		sender_numbers AS MATERIALIZED (
+			SELECT DISTINCT sender_number FROM messages
+		)
+		SELECT ` + conversationColumns + `
+		FROM conversations
+		WHERE EXISTS (
+				SELECT 1
+				FROM ` + sqlParticipantEntries("conversations.participants") + ` AS p,
+					json_each(CASE p.type
+						WHEN 'text' THEN ` + keys("p.value") + `
+						WHEN 'object' THEN CASE WHEN NOT ` + sqlOwnerFlag + ` THEN ` + keys(sqlEntryText("number"), sqlEntryText("phone")) + ` END
+					END) AS value_key
+				WHERE value_key.value IN (SELECT line_key FROM line_keys)
+			)
+			OR conversation_id IN (
+				SELECT conversation_id
+				FROM messages
+				WHERE is_from_me = 0 AND sender_number IN (
+					SELECT sender_number
+					FROM sender_numbers, json_each(` + keys("sender_number") + `) AS value_key
+					WHERE value_key.value IN (SELECT line_key FROM line_keys)
+				)
+			)
+		ORDER BY last_message_ts DESC, conversation_id
+		LIMIT ?
+	`
+}
+
+// maxAddressesPerQuery caps the addresses' keys that one query of
+// SearchConversationsByAddresses binds, each as its own value, far below
+// SQLite's default cap of 32,766 bound values.
+const maxAddressesPerQuery = 1000
+
+// SearchConversationsByAddresses looks for many addresses at once. It
+// returns the newest of the conversations that SearchConversationsByAddress
+// returns for each of addresses: newest first, then in conversation ID
+// order, and at most limit. Every search matches before its limit, so these
+// are the newest threads with someone who holds any of the addresses as a
+// whole. A query reads each participant entry's values and each distinct
+// sender number once, through addressmatch.KeySQL, and looks each key up among
+// the addresses' keys, which it binds as BLOBs, so two keys match only when
+// they hold the same bytes. A search for each address reads every
+// conversation's participants and every sender number again. Past
+// maxAddressesPerQuery keys, it runs a query for each group of that many and
+// keeps the newest of their hits. A blank address matches nothing, and so does
+// a limit below 1.
+func (s *Store) SearchConversationsByAddresses(addresses []string, limit int) ([]*Conversation, error) {
+	return s.searchConversationsByAddresses(addresses, limit, maxAddressesPerQuery)
+}
+
+// searchConversationsByAddresses is SearchConversationsByAddresses with
+// perQuery keys, at most, in each query.
+func (s *Store) searchConversationsByAddresses(addresses []string, limit, perQuery int) ([]*Conversation, error) {
+	keys := addressmatch.Keys(addresses)
+	if len(keys) == 0 || limit <= 0 {
+		return []*Conversation{}, nil
+	}
+	var found []*Conversation
+	for start := 0; start < len(keys); start += perQuery {
+		group := keys[start:min(start+perQuery, len(keys))]
+		args := make([]any, 0, len(group)+1)
+		for _, key := range group {
+			args = append(args, []byte(key))
+		}
+		rows, err := s.db.Query(addressesSearchSQL(len(group), addressmatch.KeySQL), append(args, limit)...)
+		if err != nil {
+			return nil, err
+		}
+		hits, err := scanConversations(rows)
+		rows.Close()
+		if err != nil {
+			return nil, err
+		}
+		if len(group) == len(keys) {
+			return hits, nil
+		}
+		found = append(found, hits...)
+	}
+	return newestConversations(found, limit), nil
+}
+
+// newestConversations returns the conversations newest first, then in
+// conversation ID order, each ID once, and at most limit.
+func newestConversations(conversations []*Conversation, limit int) []*Conversation {
+	sorted := slices.Clone(conversations)
+	slices.SortStableFunc(sorted, func(a, b *Conversation) int {
+		if a.LastMessageTS != b.LastMessageTS {
+			return cmp.Compare(b.LastMessageTS, a.LastMessageTS)
+		}
+		return strings.Compare(a.ConversationID, b.ConversationID)
+	})
+	seen := map[string]bool{}
+	newest := make([]*Conversation, 0, min(len(sorted), limit))
+	for _, conversation := range sorted {
+		if len(newest) == limit {
+			break
+		}
+		if !seen[conversation.ConversationID] {
+			seen[conversation.ConversationID] = true
+			newest = append(newest, conversation)
+		}
+	}
+	return newest
+}
+
+// addressesSearchSQL is SearchConversationsByAddresses's query for count
+// keys. key writes a call of the SQL function that gives a value's key, as
+// addressmatch.KeySQL does. The query takes the keys as BLOBs, then the limit.
+// It reads the values that addressSearchSQL compares with a key: a participant
+// entry not flagged as the owner's, through the text of its number, phone or
+// email, a bare string entry, and each distinct sender number of an incoming
+// message. Each IN reads the keys into an index once for the query, and key
+// returns no key for a blank value, so a blank value matches nothing.
+func addressesSearchSQL(count int, key func(value string) string) string {
+	values := strings.TrimSuffix(strings.Repeat("(?), ", count), ", ")
+	return `
+	WITH address_keys(address_key) AS MATERIALIZED (
+		VALUES ` + values + `
+	),
+	sender_numbers AS MATERIALIZED (
+		SELECT DISTINCT sender_number FROM messages
+	)
+	SELECT ` + conversationColumns + `
+	FROM conversations
+	WHERE EXISTS (
+			SELECT 1
+			FROM ` + sqlParticipantEntries("conversations.participants") + ` AS p
+			WHERE CASE p.type
+				WHEN 'text' THEN ` + key("p.value") + ` IN (SELECT address_key FROM address_keys)
+				WHEN 'object' THEN NOT ` + sqlOwnerFlag + ` AND (
+					` + key(sqlEntryText("number")) + ` IN (SELECT address_key FROM address_keys)
+					OR ` + key(sqlEntryText("phone")) + ` IN (SELECT address_key FROM address_keys)
+					OR ` + key(sqlEntryText("email")) + ` IN (SELECT address_key FROM address_keys)
+				)
+				ELSE 0
+			END
+		)
+		OR conversation_id IN (
+			SELECT conversation_id
+			FROM messages
+			WHERE is_from_me = 0 AND sender_number IN (
+				SELECT sender_number FROM sender_numbers WHERE ` + key("sender_number") + ` IN (SELECT address_key FROM address_keys)
+			)
+		)
+	ORDER BY last_message_ts DESC, conversation_id
+	LIMIT ?
+`
+}
 
 // sqlOwnerFlag holds for an object entry that carries is_me or isMe. p is a
 // json_each row over a conversation's participants. Only a JSON true counts,

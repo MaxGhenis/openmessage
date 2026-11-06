@@ -11,6 +11,13 @@ type ReadSource interface {
 	SearchConversationsByMetadata(query string, limit int) ([]*db.Conversation, error)
 	SearchConversationsByPhoneLine(line string, limit int) ([]*db.Conversation, error)
 	SearchConversationsByAddress(address string, limit int) ([]*db.Conversation, error)
+	// SearchConversationsByPhoneLines and SearchConversationsByAddresses
+	// return, from one query, the newest of the conversations that
+	// SearchConversationsByPhoneLine or SearchConversationsByAddress returns
+	// for each of their values, newest first, then in conversation ID order,
+	// and at most limit.
+	SearchConversationsByPhoneLines(lines []string, limit int) ([]*db.Conversation, error)
+	SearchConversationsByAddresses(addresses []string, limit int) ([]*db.Conversation, error)
 	GetConversation(id string) (*db.Conversation, error)
 	GetMessagesByConversation(conversationID string, limit int) ([]*db.Message, error)
 	GetMessagesByConversationBefore(conversationID string, beforeMS int64, beforeID string, limit int) ([]*db.Message, error)

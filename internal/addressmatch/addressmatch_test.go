@@ -289,3 +289,121 @@ func TestSQLMatchAgreesWithKey(t *testing.T) {
 		t.Fatal("no draw matched; want some")
 	}
 }
+
+func TestKeys(t *testing.T) {
+	cases := []struct {
+		values, want []string
+	}{
+		{nil, []string{}},
+		{[]string{"", " ", "\u00a0\t"}, []string{}},
+		{[]string{"B@x", " b@X\t", "a@x", "\u3000A@X"}, []string{"b@x", "a@x"}},
+		{[]string{"n\x00A", "N\x00a ", "n\x00b"}, []string{"n\x00a", "n\x00b"}},
+	}
+	for _, c := range cases {
+		got := Keys(c.values)
+		if got == nil || !reflect.DeepEqual(got, c.want) {
+			t.Errorf("Keys(%q) = %q, want %q", c.values, got, c.want)
+		}
+	}
+}
+
+func TestSQLKey(t *testing.T) {
+	db := openSQLite(t)
+	cases := []struct {
+		name string
+		sql  string
+		args []any
+		want []byte
+	}{
+		{"other case and white space around a value", KeySQL("?"), []any{"\u00a0Support@Example.com\t"}, []byte("support@example.com")},
+		{"a NUL stays", KeySQL("?"), []any{" A\x00B@example.com"}, []byte("a\x00b@example.com")},
+		{"a byte that isn't UTF-8 stays", KeySQL("?"), []any{"\u00a0\x80ABC"}, []byte("\x80abc")},
+		{"a BLOB reads as its text", KeySQL("?"), []any{[]byte(" ABC\x00D")}, []byte("abc\x00d")},
+		{"a blank value has no key", KeySQL("?"), []any{" \t\u3000"}, nil},
+		{"an empty value has no key", KeySQL("?"), []any{""}, nil},
+		{"an empty BLOB has no key", KeySQL("?"), []any{[]byte{}}, nil},
+		{"NULL has no key", KeySQL("NULL"), nil, nil},
+		// The function itself, called without KeySQL's cast.
+		{"an INTEGER has no key", `om_address_key(55501)`, nil, nil},
+		{"a REAL has no key", `om_address_key(1.5)`, nil, nil},
+		// The driver hands the function a TEXT argument only up to its first
+		// NUL, which is why KeySQL casts its argument to BLOB.
+		{"a bare call loses a TEXT argument's bytes after a NUL", `om_address_key(?)`, []any{"A\x00B"}, []byte("a")},
+	}
+	for _, c := range cases {
+		var got []byte
+		var kind string
+		if err := db.QueryRow(`SELECT `+c.sql+`, typeof(`+c.sql+`)`, append(append([]any{}, c.args...), c.args...)...).Scan(&got, &kind); err != nil {
+			t.Fatalf("%s: %v", c.name, err)
+		}
+		if !reflect.DeepEqual(got, c.want) {
+			t.Errorf("%s: SELECT %s with %q = %q, want %q", c.name, c.sql, c.args, got, c.want)
+		}
+		if wantKind := map[bool]string{true: "null", false: "blob"}[c.want == nil]; kind != wantKind {
+			t.Errorf("%s: SELECT %s with %q has type %s, want %s", c.name, c.sql, c.args, kind, wantKind)
+		}
+	}
+}
+
+// SQLKey answers SQLMatch for a set of keys at once. A value's SQLKey is its
+// Key as a BLOB, or NULL when that key is empty, and for any key that isn't
+// empty, the value's SQLKey is among a set that holds the key, bound as a BLOB,
+// exactly when SQLMatch matches the two. The query compares them as the
+// stores' batches do, against a materialized set, so a NUL, a byte that isn't
+// UTF-8 or a letter beyond ASCII can't make two keys meet.
+func TestSQLKeyAgreesWithKeyAndSQLMatch(t *testing.T) {
+	db := openSQLite(t)
+	key, err := db.Prepare(`SELECT ` + KeySQL("?"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer key.Close()
+	among, err := db.Prepare(`
+		WITH address_keys(address_key) AS MATERIALIZED (VALUES (?), (?))
+		SELECT COALESCE(` + KeySQL("?") + ` IN (SELECT address_key FROM address_keys), 0), ` + SQL("?", "?"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer among.Close()
+	var matches, misses, empty int
+	property := func(c keyCase) bool {
+		want := Key(c.Value)
+		for _, argument := range []any{c.Value, []byte(c.Value)} {
+			var got []byte
+			if err := key.QueryRow(argument).Scan(&got); err != nil {
+				t.Logf("SQLKey(%q): %v", argument, err)
+				return false
+			}
+			if want == "" && got != nil || want != "" && string(got) != want {
+				t.Logf("SQLKey(%q) = %q, want %q", argument, got, want)
+				return false
+			}
+		}
+		if want == "" {
+			empty++
+			return true
+		}
+		var batch, single int64
+		if err := among.QueryRow([]byte("\x00no such key"), []byte(want), c.Other, want, c.Other).Scan(&batch, &single); err != nil {
+			t.Logf("key %q, value %q: %v", want, c.Other, err)
+			return false
+		}
+		if batch != single {
+			t.Logf("key %q, value %q: %d among a set and %d through SQLMatch", want, c.Other, batch, single)
+			return false
+		}
+		if single == 1 {
+			matches++
+		} else {
+			misses++
+		}
+		return true
+	}
+	config := &quick.Config{MaxCount: 2000, Rand: rand.New(rand.NewSource(20261105))}
+	if err := quick.Check(property, config); err != nil {
+		t.Fatal(err)
+	}
+	if matches == 0 || misses == 0 || empty == 0 {
+		t.Fatalf("draws: %d matches, %d misses, %d empty keys; want each", matches, misses, empty)
+	}
+}

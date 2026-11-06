@@ -453,6 +453,18 @@ func (s *Store) migrate() error {
 	// Index for platform-filtered conversation queries
 	s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_conversations_platform ON conversations(source_platform)`)
 
+	// Holds conversations newest first, then by ID, with their names and
+	// participants, so that ListContactsFromConversations reads them in that
+	// order from the index alone and stops at its limit instead of sorting
+	// every row that passes its filter. Without those two columns, a query
+	// that reads most rows goes back to the table for each one, which took
+	// three times as long as a scan of the table at ten times the live size.
+	// The WHERE holds for every row, since participants is NOT NULL, and only
+	// a query that states the same term may use a partial index. So no other
+	// query's plan changes: ListConversations orders by time alone, and a new
+	// index there could reorder its ties.
+	s.db.Exec(`CREATE INDEX IF NOT EXISTS ` + newestFirstIndex + ` ON conversations(last_message_ts DESC, conversation_id, name, participants) WHERE ` + newestFirstIndexTerm)
+
 	// Index for the contacts.number = messages.sender_number JOIN in metadata search
 	s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_contacts_number ON contacts(number)`)
 

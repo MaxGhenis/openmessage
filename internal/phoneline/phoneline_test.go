@@ -2,7 +2,9 @@ package phoneline
 
 import (
 	"database/sql"
+	"encoding/json"
 	"math/rand"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -178,6 +180,83 @@ func randomDigits(random *rand.Rand, length int) string {
 	return b.String()
 }
 
+// LineKeys and ValueKeys index Match: for any line and any value, the two
+// share a key exactly when Match(line, value) holds, as phonelinetest also
+// says, and neither gives more than ten keys. Lines run from no digits to 16,
+// a few with a stray character; values are written forms of numbers that end
+// with the line, that the line ends with, or that share only some of its
+// last digits, WhatsApp JIDs, identifiers that hold the line's digits, and
+// noise.
+func TestLineKeysIndexMatch(t *testing.T) {
+	exercised := map[string]int{}
+	property := func(seed int64) bool {
+		random := rand.New(rand.NewSource(seed))
+		line := randomDigits(random, random.Intn(17))
+		if random.Intn(8) == 0 {
+			at := random.Intn(len(line) + 1)
+			line = line[:at] + []string{"a", "+", " ", "٣"}[random.Intn(4)] + line[at:]
+			exercised["a line with a stray character"]++
+		}
+		tail := line
+		if cut := 7 + random.Intn(4); len(tail) > cut {
+			tail = tail[len(tail)-cut:]
+		}
+		values := []string{
+			numberForm(random, randomDigits(random, random.Intn(6))+line),
+			numberForm(random, tail),
+			numberForm(random, randomDigits(random, 1+random.Intn(4))+tail),
+			randomDigits(random, random.Intn(4)) + line + []string{"@s.whatsapp.net", "@C.US"}[random.Intn(2)],
+			identifierForm(random, line),
+			noiseForm(random),
+			numberForm(random, randomDigits(random, random.Intn(18))),
+		}
+		lineKeys := LineKeys(line)
+		if len(lineKeys) > 10 {
+			t.Logf("seed %d: LineKeys(%q) gives %d keys", seed, line, len(lineKeys))
+			return false
+		}
+		for _, value := range values {
+			valueKeys := ValueKeys(value)
+			if len(valueKeys) > 10 {
+				t.Logf("seed %d: ValueKeys(%q) gives %d keys", seed, value, len(valueKeys))
+				return false
+			}
+			shared := false
+			for _, lineKey := range lineKeys {
+				for _, valueKey := range valueKeys {
+					shared = shared || lineKey == valueKey
+				}
+			}
+			if match, oracle := Match(line, value), phonelinetest.Match(line, value); shared != match || shared != oracle {
+				t.Logf("seed %d: LineKeys(%q) = %q and ValueKeys(%q) = %q share a key: %v; Match says %v, phonelinetest %v",
+					seed, line, lineKeys, value, valueKeys, shared, match, oracle)
+				return false
+			}
+			if !shared {
+				exercised["a value off the line"]++
+				continue
+			}
+			if digits, _ := phonelinetest.Digits(value); strings.HasSuffix(digits, line) {
+				exercised["a value whose digits end with the line"]++
+			} else {
+				exercised["a line that ends with a value's digits"]++
+			}
+		}
+		return true
+	}
+	if err := quick.Check(property, &quick.Config{MaxCount: 2000, Rand: rand.New(rand.NewSource(20261104))}); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{
+		"a line with a stray character", "a value off the line",
+		"a value whose digits end with the line", "a line that ends with a value's digits",
+	} {
+		if exercised[path] == 0 {
+			t.Errorf("the property never drew %s (drew %v)", path, exercised)
+		}
+	}
+}
+
 // Properties, for any digits d: a written form of d, with or without a
 // country prefix, matches the line of d whenever d has 7 digits or more, and
 // so does a WhatsApp JID of d; an identifier that only holds d's digits, such
@@ -282,5 +361,208 @@ func TestMatchProperties(t *testing.T) {
 	var bare, cast int64
 	if err := conn.QueryRow("SELECT "+SQLMatch+"(?, ?), "+SQL("?", "?"), "2025550123", "+12025550123\x00x", "2025550123", "+12025550123\x00x").Scan(&bare, &cast); err != nil || bare != 1 || cast != 0 {
 		t.Errorf("a number that a NUL ends early: a bare call = %d and SQL = %d, want 1 and 0 (%v)", bare, cast, err)
+	}
+}
+
+// SQLKeys answers SQLMatch for a whole set of lines at once, through SQLite
+// and the SQL each function's helper writes: a tuple of values is on one of the
+// set's lines, as SQLMatch says for each line in turn, exactly when a key that
+// SQLKeys gives for the tuple is among the keys that KeysOfLines gives for the
+// set. Tuples mix written numbers, WhatsApp JIDs, identifiers that hold a
+// line's digits, noise, blanks, NULLs, integers and BLOBs, and sets run from no
+// lines to six, so the first value that isn't blank decides, as it does for
+// SQLMatch, and a value off every line or a set with no lines matches nothing.
+// Some lines and values hold a NUL, which the helpers' casts keep, so a value
+// or a line never matches through the part before it. SQLKeys gives ValueKeys
+// of that value, at most ten, and NULL where it names no line.
+func TestSQLKeysAgreesWithSQLMatchOverSetsOfLines(t *testing.T) {
+	conn, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("open SQLite: %v", err)
+	}
+	defer conn.Close()
+	exercised := map[string]int{}
+	property := func(seed int64) bool {
+		random := rand.New(rand.NewSource(seed))
+		var lines, digits []string
+		for count := random.Intn(7); count > 0; count-- {
+			line := Line(randomDigits(random, 5+random.Intn(9)))
+			digits = append(digits, line)
+			switch random.Intn(8) {
+			case 0:
+				line += "\x00" + randomDigits(random, 7)
+			case 1:
+				line = "\x00" + line
+			case 2:
+				at := 1 + random.Intn(len(line)-1)
+				line = line[:at] + "\x00" + line[at:]
+			}
+			lines = append(lines, line)
+		}
+		set := KeysOfLines(lines)
+		base := randomDigits(random, 7+random.Intn(6))
+		if len(digits) > 0 && random.Intn(3) != 0 {
+			base = digits[random.Intn(len(digits))]
+			if random.Intn(2) == 0 && len(base) > 7 {
+				base = base[random.Intn(len(base)-6):]
+			}
+		}
+		prefix := []string{"", "1", "44", "353"}[random.Intn(4)]
+		var values []any
+		var strs []string
+		for count := 1 + random.Intn(3); count > 0; count-- {
+			var value any
+			switch random.Intn(10) {
+			case 0:
+				value = nil
+				strs = append(strs, "")
+				exercised["a NULL"]++
+			case 1:
+				number := int64(random.Intn(1_000_000_000))
+				value = number
+				strs = append(strs, strconv.FormatInt(number, 10))
+				exercised["an INTEGER"]++
+			case 2:
+				written := numberForm(random, prefix+base)
+				value = []byte(written)
+				strs = append(strs, written)
+				exercised["a BLOB"]++
+			case 3:
+				if random.Intn(2) == 0 {
+					written := numberForm(random, prefix+base) + "\x00" + noiseForm(random)
+					value = written
+					strs = append(strs, written)
+					break
+				}
+				blank := []string{"", "  ", "\t"}[random.Intn(3)]
+				value = blank
+				strs = append(strs, blank)
+			case 4:
+				jid := prefix + base + []string{"@s.whatsapp.net", "@c.us"}[random.Intn(2)]
+				value = jid
+				strs = append(strs, jid)
+			case 5:
+				hidden := identifierForm(random, prefix+base)
+				value = hidden
+				strs = append(strs, hidden)
+			case 6:
+				noise := noiseForm(random)
+				value = noise
+				strs = append(strs, noise)
+			default:
+				written := numberForm(random, randomDigits(random, random.Intn(3))+base)
+				value = written
+				strs = append(strs, written)
+			}
+			values = append(values, value)
+		}
+		marks := make([]string, len(values))
+		cut := make([]string, len(values))
+		for index := range values {
+			marks[index] = "?"
+			cut[index], _, _ = strings.Cut(strs[index], "\x00")
+		}
+		match, keysOf := SQL(append([]string{"?"}, marks...)...), KeysSQL(marks...)
+		want := false
+		for _, line := range lines {
+			var matched int64
+			if err := conn.QueryRow("SELECT "+match, append([]any{line}, values...)...).Scan(&matched); err != nil {
+				t.Fatalf("query %s: %v", SQLMatch, err)
+			}
+			want = want || matched == 1
+			if matched == 1 && strings.Contains(line, "\x00") {
+				exercised["a match through a line with a NUL"]++
+			}
+			before, _, hasNUL := strings.Cut(line, "\x00")
+			if matched == 0 && hasNUL && MatchFirst(before, strs...) {
+				exercised["a line that a NUL keeps off a value"]++
+			}
+			if matched == 0 && hasNUL && MatchFirst(strings.ReplaceAll(line, "\x00", ""), strs...) {
+				exercised["a line whose digits only reach a value without its NUL"]++
+			}
+			if matched == 0 && MatchFirst(line, cut...) {
+				exercised["a value that a NUL keeps off a line"]++
+			}
+		}
+		var got int64
+		if err := conn.QueryRow(`SELECT EXISTS (
+			SELECT 1 FROM json_each(`+keysOf+`) AS value_key
+			WHERE value_key.value IN (SELECT value FROM json_each(?)))`, append(values, set)...).Scan(&got); err != nil {
+			t.Fatalf("query %s: %v", SQLKeys, err)
+		}
+		if (got == 1) != want {
+			t.Logf("seed %d: lines %q, values %q: through %s %d, through %s %v", seed, lines, strs, SQLKeys, got, SQLMatch, want)
+			return false
+		}
+		var keys sql.NullString
+		if err := conn.QueryRow("SELECT "+keysOf, values...).Scan(&keys); err != nil {
+			t.Fatalf("query %s: %v", SQLKeys, err)
+		}
+		var first string
+		for _, value := range strs {
+			if strings.TrimSpace(value) != "" {
+				first = value
+				break
+			}
+		}
+		wantKeys := ValueKeys(first)
+		if len(wantKeys) == 0 {
+			if keys.Valid {
+				t.Logf("seed %d: %s(%q) = %q, want NULL", seed, SQLKeys, strs, keys.String)
+				return false
+			}
+		} else {
+			var gotKeys []string
+			if !keys.Valid || json.Unmarshal([]byte(keys.String), &gotKeys) != nil || !slices.Equal(gotKeys, wantKeys) || len(gotKeys) > 10 {
+				t.Logf("seed %d: %s(%q) = %q, want the %d keys %q", seed, SQLKeys, strs, keys.String, len(wantKeys), wantKeys)
+				return false
+			}
+		}
+		switch {
+		case len(lines) == 0:
+			exercised["a set with no lines"]++
+		case want:
+			exercised["a tuple on one of the lines"]++
+		default:
+			exercised["a tuple off every line"]++
+		}
+		if strings.TrimSpace(strs[0]) == "" && first != "" {
+			exercised["a tuple whose first value is blank"]++
+		}
+		return true
+	}
+	if err := quick.Check(property, &quick.Config{MaxCount: 600, Rand: rand.New(rand.NewSource(20261105))}); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{
+		"a set with no lines", "a tuple on one of the lines", "a tuple off every line",
+		"a tuple whose first value is blank", "a NULL", "an INTEGER", "a BLOB",
+		"a match through a line with a NUL", "a line that a NUL keeps off a value", "a line whose digits only reach a value without its NUL", "a value that a NUL keeps off a line",
+	} {
+		if exercised[path] == 0 {
+			t.Errorf("the property never drew %s (drew %v)", path, exercised)
+		}
+	}
+	// The function itself, called without KeysSQL's casts, counts an INTEGER as
+	// blank, and sees a TEXT argument only up to its first NUL, which is why
+	// KeysSQL casts each argument to BLOB.
+	for _, c := range []struct {
+		query string
+		args  []any
+		want  bool
+	}{
+		{"SELECT " + SQLKeys + "(12025550123)", nil, false},
+		{"SELECT " + SQLKeys + "(1.5)", nil, false},
+		{"SELECT " + SQLKeys + "(NULL)", nil, false},
+		{"SELECT " + SQLKeys + "(?)", []any{"+12025550123\x00x"}, true},
+		{"SELECT " + KeysSQL("?"), []any{"+12025550123\x00x"}, false},
+	} {
+		var keys sql.NullString
+		if err := conn.QueryRow(c.query, c.args...).Scan(&keys); err != nil {
+			t.Fatalf("%s: %v", c.query, err)
+		}
+		if keys.Valid != c.want {
+			t.Errorf("%s with %q = %q, want keys: %v", c.query, c.args, keys.String, c.want)
+		}
 	}
 }

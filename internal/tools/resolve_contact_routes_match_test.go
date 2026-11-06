@@ -428,26 +428,47 @@ func TestResolveContactRoutesKeepsAPersonWhoseAddressOthersHold(t *testing.T) {
 }
 
 // countingRouteReads counts the searches that the route tool asks the
-// serving store for, by line, by whole address and by text.
+// serving store for, by line, by whole address and by text. A line or an
+// address counts once for each search that asks for it, alone or in a
+// batch, and queries counts the store's queries of each kind.
 type countingRouteReads struct {
 	readsource.ReadSource
 	lines     map[string]int
 	addresses map[string]int
 	texts     map[string]int
+	queries   map[string]int
 }
 
 func newCountingRouteReads(reads readsource.ReadSource) *countingRouteReads {
-	return &countingRouteReads{ReadSource: reads, lines: map[string]int{}, addresses: map[string]int{}, texts: map[string]int{}}
+	return &countingRouteReads{ReadSource: reads, lines: map[string]int{}, addresses: map[string]int{}, texts: map[string]int{}, queries: map[string]int{}}
 }
 
 func (r *countingRouteReads) SearchConversationsByPhoneLine(line string, limit int) ([]*db.Conversation, error) {
 	r.lines[line]++
+	r.queries["line"]++
 	return r.ReadSource.SearchConversationsByPhoneLine(line, limit)
 }
 
 func (r *countingRouteReads) SearchConversationsByAddress(address string, limit int) ([]*db.Conversation, error) {
 	r.addresses[address]++
+	r.queries["address"]++
 	return r.ReadSource.SearchConversationsByAddress(address, limit)
+}
+
+func (r *countingRouteReads) SearchConversationsByPhoneLines(lines []string, limit int) ([]*db.Conversation, error) {
+	for _, line := range lines {
+		r.lines[line]++
+	}
+	r.queries["lines"]++
+	return r.ReadSource.SearchConversationsByPhoneLines(lines, limit)
+}
+
+func (r *countingRouteReads) SearchConversationsByAddresses(addresses []string, limit int) ([]*db.Conversation, error) {
+	for _, address := range addresses {
+		r.addresses[address]++
+	}
+	r.queries["addresses"]++
+	return r.ReadSource.SearchConversationsByAddresses(addresses, limit)
 }
 
 func (r *countingRouteReads) SearchConversationsByMetadata(query string, limit int) ([]*db.Conversation, error) {

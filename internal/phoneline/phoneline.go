@@ -10,6 +10,7 @@ package phoneline
 
 import (
 	"database/sql/driver"
+	"encoding/json"
 	"strings"
 	"unicode"
 
@@ -40,7 +41,43 @@ func SQL(args ...string) string {
 	return SQLMatch + "(" + strings.Join(cast, ", ") + ")"
 }
 
+// SQLKeys names the SQLite function om_phone_line_keys(value, ...). It
+// returns the ValueKeys of the first value that isn't blank, as a JSON array
+// of strings, and NULL when that value names no line or every value is
+// blank. It reads its arguments as SQLMatch does, so for any line,
+// SQLMatch(line, values...) returns 1 exactly when a key that SQLKeys(values...)
+// returns is among LineKeys(line). A search for many lines at once reads each
+// value through SQLKeys once and looks its keys up among the lines' keys,
+// where SQLMatch would compare it with each line in turn. Call it through
+// KeysSQL, which keeps every byte of each argument.
+const SQLKeys = "om_phone_line_keys"
+
+// KeysSQL returns an SQL expression that calls SQLKeys on args, SQL
+// expressions for the values. It casts each argument to BLOB, as SQL does and
+// for the same reason.
+func KeysSQL(args ...string) string {
+	cast := make([]string, len(args))
+	for index, arg := range args {
+		cast[index] = "CAST(" + arg + " AS BLOB)"
+	}
+	return SQLKeys + "(" + strings.Join(cast, ", ") + ")"
+}
+
 func init() {
+	sqlite.MustRegisterDeterministicScalarFunction(SQLKeys, -1, func(_ *sqlite.FunctionContext, args []driver.Value) (driver.Value, error) {
+		for _, arg := range args {
+			value := text(arg)
+			if strings.TrimSpace(value) == "" {
+				continue
+			}
+			keys := ValueKeys(value)
+			if len(keys) == 0 {
+				return nil, nil
+			}
+			return keysJSON(keys), nil
+		}
+		return nil, nil
+	})
 	sqlite.MustRegisterDeterministicScalarFunction(SQLMatch, -1, func(_ *sqlite.FunctionContext, args []driver.Value) (driver.Value, error) {
 		if len(args) < 2 {
 			return int64(0), nil
@@ -54,6 +91,24 @@ func init() {
 		}
 		return int64(0), nil
 	})
+}
+
+// keysJSON writes keys that ValueKeys gives as a JSON array of strings. Each
+// is "L:" or "S:" and ASCII digits, which JSON writes as they are, so none
+// needs an escape.
+func keysJSON(keys []string) string {
+	var b strings.Builder
+	b.WriteByte('[')
+	for index, key := range keys {
+		if index > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteByte('"')
+		b.WriteString(key)
+		b.WriteByte('"')
+	}
+	b.WriteByte(']')
+	return b.String()
 }
 
 // text is the string an SQL argument holds, or "" for anything else.
@@ -158,14 +213,74 @@ func lowerASCII(c byte) byte {
 // carry a country prefix the other lacks, so the shorter run of digits must
 // end the longer, and a line of fewer than 7 digits matches nothing.
 func Match(line, stored string) bool {
-	digits, ok := Number(stored)
-	if !ok {
-		digits, ok = whatsAppDigits(stored)
-	}
+	digits, ok := lineDigits(stored)
 	if !ok || len(line) < 7 {
 		return false
 	}
 	return strings.HasSuffix(digits, line) || strings.HasSuffix(line, digits)
+}
+
+// lineDigits returns the digits of a value that names a phone line: a phone
+// number as people write one, or a WhatsApp JID of one.
+func lineDigits(value string) (string, bool) {
+	if digits, ok := Number(value); ok {
+		return digits, true
+	}
+	return whatsAppDigits(value)
+}
+
+// LineKeys and ValueKeys index Match: Match(line, value) holds exactly when
+// LineKeys(line) and ValueKeys(value) share a key, for any line and any
+// value, and neither gives more than ten keys. So a set of lines answers
+// Match for a value through a few lookups, however many lines it holds.
+//
+// A key "L:" and digits stands for a line that a value's digits end with,
+// and "S:" and digits for a value's digits that a line ends with. Match
+// wants 7 digits or more on each side, and a value has at most 15.
+func LineKeys(line string) []string {
+	keys := []string{"L:" + line}
+	for length := 7; length <= len(line) && length <= 15; length++ {
+		keys = append(keys, "S:"+line[len(line)-length:])
+	}
+	return keys
+}
+
+// ValueKeys gives the keys that LineKeys indexes Match by for value, and
+// none when value names no line.
+func ValueKeys(value string) []string {
+	digits, ok := lineDigits(value)
+	if !ok {
+		return nil
+	}
+	keys := []string{"S:" + digits}
+	for length := 7; length <= len(digits); length++ {
+		keys = append(keys, "L:"+digits[len(digits)-length:])
+	}
+	return keys
+}
+
+// KeysOfLines returns the LineKeys of every one of lines, each key once, as
+// a JSON array of strings, for a search that looks for many lines at once.
+// A value whose SQLKeys share a key with the array is one that SQLMatch
+// matches against one of lines.
+func KeysOfLines(lines []string) string {
+	seen := map[string]bool{}
+	keys := []string{}
+	for _, line := range lines {
+		for _, key := range LineKeys(line) {
+			if !seen[key] {
+				seen[key] = true
+				keys = append(keys, key)
+			}
+		}
+	}
+	// Marshal fails only on values that have no JSON form, and a slice of
+	// strings has one. It writes invalid UTF-8 as U+FFFD, which changes only
+	// keys that hold something other than digits, and no value's key does. It
+	// writes a NUL as \u0000, which json_each reads back as that byte, so a
+	// line that holds one matches no value through the digits around it.
+	encoded, _ := json.Marshal(keys)
+	return string(encoded)
 }
 
 // MatchFirst applies Match to the first of values that isn't blank, as a
