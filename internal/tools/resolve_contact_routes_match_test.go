@@ -90,7 +90,7 @@ func TestResolveContactRoutesMatchesParticipantValuesNotJSONKeys(t *testing.T) {
 // A number names a phone line by its last ten digits, as send_message reads
 // a recipient, and never by a run of digits inside another number. 5550123
 // ends Alice's number but sits inside Bob's newer one, so it routes to Alice
-// only, the thread send_message picks, and at limit 1 it still prefers her.
+// only, the thread send_message picks, and at limit 1 it still prefers Alice.
 func TestResolveContactRoutesMatchesANumberByItsLineNotAsASubstring(t *testing.T) {
 	for _, mode := range routeStoreModes {
 		t.Run(mode, func(t *testing.T) {
@@ -199,7 +199,7 @@ func TestResolveContactRoutesFindsALineBehindNumbersThatOnlyContainItsDigits(t *
 
 // % and _ in a query match only themselves in the address book, as in both
 // stores' conversation searches. Anna's card holds neither, so no query made
-// of them routes to her.
+// of them routes to Anna.
 func TestResolveContactRoutesMatchesTheAddressBookLiterally(t *testing.T) {
 	for _, mode := range routeStoreModes {
 		t.Run(mode, func(t *testing.T) {
@@ -227,14 +227,14 @@ func TestResolveContactRoutesMatchesTheAddressBookLiterally(t *testing.T) {
 				t.Fatalf("findRouteConversations(Anna): %v", err)
 			}
 			if len(got) != 1 || got[0].ConversationID != anna {
-				t.Errorf("routes for Anna = %v, want her thread %q only", routeIDs(got), anna)
+				t.Errorf("routes for Anna = %v, want their thread %q only", routeIDs(got), anna)
 			}
 		})
 	}
 }
 
 // A group's roster can lag behind who writes in it. Carol, whom Work's roster
-// lacks, wrote in it, so her number in any written form finds Work. The same
+// lacks, wrote in it, so their number in any written form finds Work. The same
 // ten digits inside another sender's longer number find nothing, and neither
 // does the owner's number, though the owner wrote in Work.
 func TestResolveContactRoutesFindsAnIncomingSenderByAnyFormOfTheirNumber(t *testing.T) {
@@ -304,9 +304,9 @@ func TestResolveContactRoutesFindsALegacyNumberWrittenWithSeparators(t *testing.
 }
 
 // A title that holds a name says nothing about where that person's own
-// thread is. Only a legacy thread knows Alice Chen's name, and v2 files her
-// thread under her number alone, while a newer group in both stores carries
-// the title "Alice Chen dinner plans". A search for her name finds her
+// thread is. Only a legacy thread knows Alice Chen's name, and v2 files their
+// thread under their number alone, while a newer group in both stores carries
+// the title "Alice Chen dinner plans". A search for their name finds their
 // thread beside the group, on either store: a title that matches doesn't
 // stop the tool from reading the names in legacy threads.
 func TestResolveContactRoutesFindsALegacyOnlyNameBesideATitleThatHoldsIt(t *testing.T) {
@@ -392,10 +392,10 @@ func TestResolveContactRoutesLooksUpAFoundAddressAsAWhole(t *testing.T) {
 	}
 }
 
-// Nine people newer than Alice hold her email address inside their own. At a
-// limit of 1 the tool asks each search for 8 threads, so a search for any
-// address that holds hers would return only theirs. The tool still finds
-// her thread, on either store.
+// Nine people newer than Alice hold Alice's email address inside their own.
+// At a limit of 1 the tool asks each search for 8 threads, so a search for any
+// address that holds Alice's would return only those people's threads. The
+// tool still finds Alice's thread, on either store.
 func TestResolveContactRoutesKeepsAPersonWhoseAddressOthersHold(t *testing.T) {
 	for _, mode := range routeStoreModes {
 		t.Run(mode, func(t *testing.T) {
@@ -421,7 +421,7 @@ func TestResolveContactRoutesKeepsAPersonWhoseAddressOthersHold(t *testing.T) {
 			}
 			matches := routeMatches(t, callRouteTool(t, resolveContactRoutesHandler(a, options), map[string]any{"query": "Alice Chen", "limit": 1}))
 			if len(matches) != 1 || matches[0].PreferredReplyConversationID != want {
-				t.Errorf("matches for Alice Chen at limit 1 = %+v, want one, preferring her thread %q", matches, want)
+				t.Errorf("matches for Alice Chen at limit 1 = %+v, want one, preferring their thread %q", matches, want)
 			}
 		})
 	}
@@ -456,12 +456,12 @@ func (r *countingRouteReads) SearchConversationsByMetadata(query string, limit i
 }
 
 // Two address-book cards and a legacy thread hold Alice's number, in two
-// written forms that name one line. Two Google Chat threads list her email
-// address, where the legacy importer files it as her number, under two names
+// written forms that name one line. Two Google Chat threads list their email
+// address, where the legacy importer files it as their number, under two names
 // and with its letters in two cases, and a third card holds it with white
 // space around it.
-// On either store, when the query names her, the tool searches the serving
-// store for the name once, her line once and her email address, as a whole
+// On either store, when the query names them, the tool searches the serving
+// store for the name once, their line once and their email address, as a whole
 // address, once. When the query is the address itself, the tool searches for
 // that text once and looks up nothing else: the address, every other way of
 // writing its ASCII letters' case, and the address with white space around
@@ -501,23 +501,23 @@ func TestResolveContactRoutesSearchesEachLineOnce(t *testing.T) {
 				t.Fatalf("findRouteConversations(Alice): %v", err)
 			}
 			if !slices.Contains(routeIDs(got), alice) {
-				t.Errorf("routes for Alice = %v, want her thread %q among them", routeIDs(got), alice)
+				t.Errorf("routes for Alice = %v, want their thread %q among them", routeIDs(got), alice)
 			}
 			wantLines := map[string]int{"2025550123": 1}
 			wantTexts := map[string]int{"Alice": 1}
 			if !maps.Equal(counting.lines, wantLines) || !maps.Equal(counting.texts, wantTexts) {
 				t.Errorf("for Alice: line searches %v, text searches %v; want %v and %v", counting.lines, counting.texts, wantLines, wantTexts)
 			}
-			// Either way of writing her address may come first.
+			// Either way of writing their address may come first.
 			lookups := 0
 			for address, count := range counting.addresses {
 				lookups += count
 				if !strings.EqualFold(address, "alice.chen@example.com") {
-					t.Errorf("for Alice: looked up %q, which isn't her address", address)
+					t.Errorf("for Alice: looked up %q, which isn't their address", address)
 				}
 			}
 			if lookups != 1 {
-				t.Errorf("for Alice: address lookups %v, want one lookup of her address", counting.addresses)
+				t.Errorf("for Alice: address lookups %v, want one lookup of their address", counting.addresses)
 			}
 
 			for _, query := range []string{"alice.chen@example.com", "Alice.Chen@Example.com"} {

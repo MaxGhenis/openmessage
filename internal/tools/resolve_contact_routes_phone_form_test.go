@@ -59,9 +59,9 @@ func seedRouteIdentityThreads(t *testing.T, store *sqlite.Store, threads []route
 // a WhatsApp JID whose user is one. An email address, a Signal UUID, a
 // WhatsApp LID or group, a Google Chat user, a legacy placeholder and a
 // number too long for E.164 can each hold Alice's ten digits, but none of
-// them is her line. So her number in any written form routes to her threads
-// only, and send_message picks her SMS thread over a newer one with an SMS
-// gateway's email address.
+// them is Alice's line. So Alice's number in any written form routes to
+// Alice's threads only, and send_message picks Alice's SMS thread over a newer
+// one with an SMS gateway's email address.
 func TestResolveContactRoutesFindsANumberOnlyWhereItReadsAsOne(t *testing.T) {
 	t.Run("v2", func(t *testing.T) {
 		a := testApp(t)
@@ -127,7 +127,7 @@ func TestResolveContactRoutesFindsANumberOnlyWhereItReadsAsOne(t *testing.T) {
 				t.Fatalf("findRouteConversations(%q): %v", query, err)
 			}
 			if fmt.Sprint(routeIDs(got)) != "[alice alice-whatsapp club]" {
-				t.Errorf("routes for %q = %v, want Alice's two threads and Club, where she wrote", query, routeIDs(got))
+				t.Errorf("routes for %q = %v, want Alice's two threads and Club, where they wrote", query, routeIDs(got))
 			}
 			direct, err := findDirectSMSConversation(a.Store, query)
 			if err != nil || direct == nil || direct.ConversationID != "alice" {

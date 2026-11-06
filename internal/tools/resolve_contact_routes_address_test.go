@@ -77,12 +77,12 @@ func seedV2AddressThread(t *testing.T, store *sqlite.Store, id string, at int64,
 	return conversationID
 }
 
-// Only Alice's address-book card holds her name, and its number holds her
-// email address with white space around it. Her legacy thread, whose title
+// Only Alice's address-book card holds their name, and its number holds their
+// email address with white space around it. Their legacy thread, whose title
 // reads Support, lists the address with other white space around it and no
 // name; v2 holds it trimmed, as v2keys.IdentityKey stores it. A search for
-// her name finds her thread on either store: the tool and the lookup compare
-// addresses by key, and a key drops what strings.TrimSpace trims.
+// their name finds their thread on either store: the tool and the lookup
+// compare addresses by key, and a key drops what strings.TrimSpace trims.
 func TestResolveContactRoutesFindsAnAddressWhateverWhiteSpaceSurroundsIt(t *testing.T) {
 	for _, mode := range routeStoreModes {
 		t.Run(mode, func(t *testing.T) {
@@ -103,7 +103,7 @@ func TestResolveContactRoutesFindsAnAddressWhateverWhiteSpaceSurroundsIt(t *test
 				t.Fatalf("findRouteConversations(Alice Chen): %v", err)
 			}
 			if !slices.Equal(routeIDs(got), []string{want}) {
-				t.Errorf("routes for Alice Chen = %v, want only her thread %q", routeIDs(got), want)
+				t.Errorf("routes for Alice Chen = %v, want only their thread %q", routeIDs(got), want)
 			}
 			matches := routeMatches(t, callRouteTool(t, resolveContactRoutesHandler(a, options), map[string]any{"query": "Alice Chen"}))
 			if len(matches) != 1 || matches[0].PreferredReplyConversationID != want {
@@ -145,16 +145,16 @@ func TestFindRouteConversationsSearchesForTheTrimmedQuery(t *testing.T) {
 	}
 }
 
-// Elise's two address-book cards write her email address two ways that
+// Elise's two address-book cards write their email address two ways that
 // differ in the case of a letter outside ASCII, which the lookup tells
 // apart, and a legacy thread lists each way; v2 holds the address one way,
 // in lower case, as v2keys.IdentityKey writes an email address, so only the
 // lower-case card finds the v2 thread. Dana's card holds one address that two
-// of her threads list, an SMS thread and a Google Chat thread. No thread lists
-// either name. A search for each name finds every thread of that person on
-// either store: the tool looks up each way of writing an address that differs
-// beyond ASCII letters' case on its own, and keeps every thread a lookup
-// returns, up to its limit.
+// of their threads list, an SMS thread and a Google Chat thread. No thread
+// lists either name. A search for each name finds every thread of that person
+// on either store: the tool looks up each way of writing an address that
+// differs beyond ASCII letters' case on its own, and keeps every thread a
+// lookup returns, up to its limit.
 func TestResolveContactRoutesFindsEveryThreadOfEachAddressItLooksUp(t *testing.T) {
 	upper, lower := "\u00c9lise@example.com", "\u00e9lise@example.com"
 	for _, mode := range routeStoreModes {
@@ -243,8 +243,8 @@ func TestResolveContactRoutesTellsApartAddressesThatDifferAfterANUL(t *testing.T
 }
 
 // Ann's address-book card holds one email address, and a legacy thread lists
-// her name beside a second address that differs from the first only after a
-// NUL byte. A search for her name looks up both addresses and finds the
+// their name beside a second address that differs from the first only after a
+// NUL byte. A search for their name looks up both addresses and finds the
 // threads of each, on either store: the tool keys each lookup by every byte
 // of an address, as the stores compare addresses.
 func TestResolveContactRoutesLooksUpTwoAddressesThatDifferAfterANUL(t *testing.T) {

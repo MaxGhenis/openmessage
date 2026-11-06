@@ -373,7 +373,7 @@ func TestClientModeSendRefusesAGoogleThreadNumberAndSaysWhatToUse(t *testing.T) 
 
 // After a phone change re-numbers Google threads (2026-09-03, issue #177),
 // the legacy store still files Alice under thread 2957, while 2957 now names
-// Bob's thread and Alice's thread is 3100. Routing Alice by her legacy thread
+// Bob's thread and Alice's thread is 3100. Routing Alice by their legacy thread
 // number would text Bob, so routes must come from the serving store's own
 // participants.
 func TestResolveContactRoutesNeverRoutesByAReusedGoogleThreadNumber(t *testing.T) {
