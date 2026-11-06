@@ -113,6 +113,38 @@ func TestResolveContactRoutesFindsAnAddressWhateverWhiteSpaceSurroundsIt(t *test
 	}
 }
 
+// A query with white space around it finds what the trimmed query finds. The
+// card's name holds the padded text and its number holds the trimmed address,
+// so the card leads to the address that the query's own search covers, and
+// only a thread's roster holds that address.
+func TestFindRouteConversationsSearchesForTheTrimmedQuery(t *testing.T) {
+	const address = "support@example.com"
+	const query = " " + address + " "
+	for _, mode := range routeStoreModes {
+		t.Run(mode, func(t *testing.T) {
+			a := testApp(t)
+			store := openRouteV2Store(t)
+			seedRouteFixture(t, a.Store, store, nil)
+			if err := a.Store.UpsertContact(&db.Contact{ContactID: "contact-support", Name: query, Number: address}); err != nil {
+				t.Fatalf("seed the card: %v", err)
+			}
+			seedLegacyAddressThread(t, a.Store, "support", "Help desk", "sms", 2000, map[string]any{"number": address})
+			want := seedV2AddressThread(t, store, "support", 2000, address)
+			if mode == "legacy" {
+				want = "support"
+			}
+			reads, _ := routeReadsFor(t, a, store, mode)
+			got, err := findRouteConversations(reads, a.Store, query, 80)
+			if err != nil {
+				t.Fatalf("findRouteConversations(%q): %v", query, err)
+			}
+			if !slices.Equal(routeIDs(got), []string{want}) {
+				t.Errorf("routes for %q = %v, want only the thread %q", query, routeIDs(got), want)
+			}
+		})
+	}
+}
+
 // Elise's two address-book cards write her email address two ways that
 // differ in the case of a letter outside ASCII, which the lookup tells
 // apart, and a legacy thread lists each way; v2 holds the address one way,

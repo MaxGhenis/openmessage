@@ -877,24 +877,7 @@ func (s *Store) SearchConversationsByPhoneLine(line string, limit int) ([]Conver
 	if limit <= 0 {
 		return []Conversation{}, nil
 	}
-	rows, err := s.db.QueryContext(
-		context.Background(),
-		"SELECT "+conversationColumns+`
-		 FROM conversations
-		 WHERE conversation_id IN (
-		        SELECT cp.conversation_id
-		        FROM conversation_participants cp
-		        JOIN identities i ON i.identity_id = cp.identity_id
-		        WHERE i.is_self = 0 AND `+phoneline.SQL("?", "i.canonical_value")+`
-		    )
-		 ORDER BY last_message_at_ms DESC, conversation_id
-		 LIMIT ?`,
-		line, limit,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("search conversations by phone line: %w", err)
-	}
-	conversations, err := collectRows(rows, scanConversation)
+	conversations, err := s.searchConversationsByIdentity(phoneline.SQL("?", "i.canonical_value"), line, limit)
 	if err != nil {
 		return nil, fmt.Errorf("search conversations by phone line: %w", err)
 	}
@@ -918,6 +901,19 @@ func (s *Store) SearchConversationsByAddress(address string, limit int) ([]Conve
 	if limit <= 0 || key == "" {
 		return []Conversation{}, nil
 	}
+	conversations, err := s.searchConversationsByIdentity(addressmatch.SQL("?", "i.canonical_value"), key, limit)
+	if err != nil {
+		return nil, fmt.Errorf("search conversations by address: %w", err)
+	}
+	return conversations, nil
+}
+
+// searchConversationsByIdentity returns the conversations with a participant
+// whose identity passes match, newest first, then in conversation ID order,
+// and at most limit. match writes an SQL test of the identity i against one
+// bound argument, value. The account's owner (the self identity) passes
+// nothing.
+func (s *Store) searchConversationsByIdentity(match, value string, limit int) ([]Conversation, error) {
 	rows, err := s.db.QueryContext(
 		context.Background(),
 		"SELECT "+conversationColumns+`
@@ -926,20 +922,16 @@ func (s *Store) SearchConversationsByAddress(address string, limit int) ([]Conve
 		        SELECT cp.conversation_id
 		        FROM conversation_participants cp
 		        JOIN identities i ON i.identity_id = cp.identity_id
-		        WHERE i.is_self = 0 AND `+addressmatch.SQL("?", "i.canonical_value")+`
+		        WHERE i.is_self = 0 AND `+match+`
 		    )
 		 ORDER BY last_message_at_ms DESC, conversation_id
 		 LIMIT ?`,
-		key, limit,
+		value, limit,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("search conversations by address: %w", err)
+		return nil, err
 	}
-	conversations, err := collectRows(rows, scanConversation)
-	if err != nil {
-		return nil, fmt.Errorf("search conversations by address: %w", err)
-	}
-	return conversations, nil
+	return collectRows(rows, scanConversation)
 }
 
 // escapeLikePattern makes user text match literally inside a LIKE pattern
