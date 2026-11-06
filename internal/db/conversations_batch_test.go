@@ -643,3 +643,52 @@ func TestSearchConversationsByAddressesComparesEveryByteOfTheKey(t *testing.T) {
 		}
 	}
 }
+
+// The batches take as many values as a caller gives them. Address keys bind one
+// value each, so a query holds the cap's worth at most, and past the cap each
+// group runs as its own query; line keys bind as one JSON array. This runs the
+// real cap through real bound values, in one query and across groups: the tool
+// sends far fewer, but a store's search shouldn't hold a limit of its own.
+func TestBatchesTakeThousandsOfValues(t *testing.T) {
+	store := newTestStore(t)
+	total := maxAddressesPerQuery*5/2 + 1
+	addresses, lines := make([]string, total), make([]string, total)
+	for index := range addresses {
+		addresses[index] = "person" + strconv.Itoa(index) + "@example.com"
+		lines[index] = "20255" + strconv.Itoa(10000+index)
+	}
+	entry := func(index int) string {
+		return `[{"name":"P","number":"` + addresses[index] + `"},{"name":"Q","number":"+1` + lines[index] + `"}]`
+	}
+	seedSearchStore(t, store, []*Conversation{
+		{ConversationID: "other", Name: "Other", SourcePlatform: "sms", LastMessageTS: 40, Participants: `[{"name":"O","number":"nobody@example.com"},{"name":"R","number":"+13035550147"}]`},
+		{ConversationID: "first", Name: "First", SourcePlatform: "sms", LastMessageTS: 30, Participants: entry(0)},
+		{ConversationID: "middle", Name: "Middle", SourcePlatform: "sms", LastMessageTS: 20, Participants: entry(total / 2)},
+		{ConversationID: "last", Name: "Last", SourcePlatform: "sms", LastMessageTS: 10, Participants: entry(total - 1)},
+	}, nil, nil)
+	for _, c := range []struct {
+		count, limit int
+		want         []string
+	}{
+		{maxAddressesPerQuery, 10, []string{"first"}},
+		{maxAddressesPerQuery + 1, 10, []string{"first"}},
+		{total, 10, []string{"first", "middle", "last"}},
+		{total, 2, []string{"first", "middle"}},
+		{total, 1, []string{"first"}},
+	} {
+		byAddress, err := store.SearchConversationsByAddresses(addresses[:c.count], c.limit)
+		if err != nil {
+			t.Fatalf("%d addresses at limit %d: %v", c.count, c.limit, err)
+		}
+		if ids := conversationIDs(byAddress); !slices.Equal(ids, c.want) {
+			t.Errorf("%d addresses at limit %d = %v, want %v", c.count, c.limit, ids, c.want)
+		}
+		byLine, err := store.SearchConversationsByPhoneLines(lines[:c.count], c.limit)
+		if err != nil {
+			t.Fatalf("%d lines at limit %d: %v", c.count, c.limit, err)
+		}
+		if ids := conversationIDs(byLine); !slices.Equal(ids, c.want) {
+			t.Errorf("%d lines at limit %d = %v, want %v", c.count, c.limit, ids, c.want)
+		}
+	}
+}

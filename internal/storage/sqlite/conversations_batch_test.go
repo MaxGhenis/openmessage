@@ -611,3 +611,83 @@ func TestSearchConversationsByAddressesComparesEveryByteOfTheKey(t *testing.T) {
 		}
 	}
 }
+
+// The batches take as many values as a caller gives them. Address keys bind one
+// value each, so a query holds the cap's worth at most, and past the cap each
+// group runs as its own query; line keys bind as one JSON array. This runs the
+// real cap through real bound values, in one query and across groups: the tool
+// sends far fewer, but a store's search shouldn't hold a limit of its own.
+func TestBatchesTakeThousandsOfValues(t *testing.T) {
+	store := openRepositoryTestStore(t)
+	exec := func(query string, args ...any) {
+		t.Helper()
+		if _, err := store.db.Exec(query, args...); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+	}
+	total := maxAddressesPerQuery*5/2 + 1
+	addresses, lines := make([]string, total), make([]string, total)
+	for index := range addresses {
+		addresses[index] = fmt.Sprintf("person%d@example.com", index)
+		lines[index] = fmt.Sprintf("20255%d", 10000+index)
+	}
+	exec(`INSERT INTO accounts (account_id, bridge_key, created_at_ms, updated_at_ms) VALUES ('account', 'google_messages', 1, 1)`)
+	participant := func(conversation, value string) {
+		exec(`INSERT OR IGNORE INTO identities (identity_id, account_id, kind, canonical_value, raw_value, is_self, created_at_ms, updated_at_ms) VALUES (?, 'account', 'email', ?, ?, 0, 1, 1)`,
+			"identity-"+value, value, value)
+		exec(`INSERT INTO conversation_participants (account_id, conversation_id, identity_id) VALUES ('account', ?, ?)`, conversation, "identity-"+value)
+	}
+	for _, row := range []struct {
+		id    string
+		atMS  int64
+		at    int
+		other bool
+	}{
+		{id: "other", atMS: 40, other: true},
+		{id: "first", atMS: 30, at: 0},
+		{id: "middle", atMS: 20, at: total / 2},
+		{id: "last", atMS: 10, at: total - 1},
+	} {
+		exec(`INSERT INTO conversations (conversation_id, account_id, remote_conversation_id, kind, last_message_at_ms, created_at_ms, updated_at_ms) VALUES (?, 'account', ?, 'group', ?, 1, 1)`,
+			row.id, "remote-"+row.id, row.atMS)
+		if row.other {
+			participant(row.id, "nobody@example.com")
+			participant(row.id, "+13035550147")
+			continue
+		}
+		participant(row.id, addresses[row.at])
+		participant(row.id, "+1"+lines[row.at])
+	}
+	ids := func(conversations []Conversation) []string {
+		found := []string{}
+		for _, conversation := range conversations {
+			found = append(found, conversation.ConversationID)
+		}
+		return found
+	}
+	for _, c := range []struct {
+		count, limit int
+		want         []string
+	}{
+		{maxAddressesPerQuery, 10, []string{"first"}},
+		{maxAddressesPerQuery + 1, 10, []string{"first"}},
+		{total, 10, []string{"first", "middle", "last"}},
+		{total, 2, []string{"first", "middle"}},
+		{total, 1, []string{"first"}},
+	} {
+		byAddress, err := store.SearchConversationsByAddresses(addresses[:c.count], c.limit)
+		if err != nil {
+			t.Fatalf("%d addresses at limit %d: %v", c.count, c.limit, err)
+		}
+		if found := ids(byAddress); !slices.Equal(found, c.want) {
+			t.Errorf("%d addresses at limit %d = %v, want %v", c.count, c.limit, found, c.want)
+		}
+		byLine, err := store.SearchConversationsByPhoneLines(lines[:c.count], c.limit)
+		if err != nil {
+			t.Fatalf("%d lines at limit %d: %v", c.count, c.limit, err)
+		}
+		if found := ids(byLine); !slices.Equal(found, c.want) {
+			t.Errorf("%d lines at limit %d = %v, want %v", c.count, c.limit, found, c.want)
+		}
+	}
+}

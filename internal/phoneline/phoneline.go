@@ -276,7 +276,9 @@ func KeysOfLines(lines []string) string {
 	}
 	// Marshal fails only on values that have no JSON form, and a slice of
 	// strings has one. It writes invalid UTF-8 as U+FFFD, which changes only
-	// keys that hold something other than digits, and no value's key does.
+	// keys that hold something other than digits, and no value's key does. It
+	// writes a NUL as \u0000, which json_each reads back as that byte, so a
+	// line that holds one matches no value through the digits around it.
 	encoded, _ := json.Marshal(keys)
 	return string(encoded)
 }
