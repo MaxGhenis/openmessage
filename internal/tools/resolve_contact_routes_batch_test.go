@@ -399,10 +399,38 @@ func seedRouteBatchStores(t *testing.T, random *rand.Rand, legacy *db.Store, sto
 }
 
 // failingBatchRouteReads fails the batched searches that its flags name, as
-// a store that can't run them would, and passes every other read through.
+// a store that can't run them would, and the single searches for the values
+// that failValue picks. It passes every other read through, and notes whether
+// a single search found threads after another failed.
 type failingBatchRouteReads struct {
 	readsource.ReadSource
 	failLines, failAddresses bool
+	failValue                func(string) bool
+	failed, foundAfterFailed bool
+}
+
+func (r *failingBatchRouteReads) searchOne(value string, search func() ([]*db.Conversation, error)) ([]*db.Conversation, error) {
+	if r.failValue != nil && r.failValue(value) {
+		r.failed = true
+		return nil, errors.New("the search for one value failed")
+	}
+	found, err := search()
+	if err == nil && len(found) > 0 && r.failed {
+		r.foundAfterFailed = true
+	}
+	return found, err
+}
+
+func (r *failingBatchRouteReads) SearchConversationsByPhoneLine(line string, limit int) ([]*db.Conversation, error) {
+	return r.searchOne(line, func() ([]*db.Conversation, error) {
+		return r.ReadSource.SearchConversationsByPhoneLine(line, limit)
+	})
+}
+
+func (r *failingBatchRouteReads) SearchConversationsByAddress(address string, limit int) ([]*db.Conversation, error) {
+	return r.searchOne(address, func() ([]*db.Conversation, error) {
+		return r.ReadSource.SearchConversationsByAddress(address, limit)
+	})
 }
 
 func (r *failingBatchRouteReads) SearchConversationsByPhoneLines(lines []string, limit int) ([]*db.Conversation, error) {
@@ -451,7 +479,9 @@ func sameRoutes(a, b []*db.Conversation) bool {
 // a line and addressmatch's key for a whole address, the owner skipped as each
 // store skips it, matching before the limit, and newest first with ties in
 // conversation ID order. It returns the same when a batch fails and the
-// tool falls back to a search for each value. Two counts hold too: the tool
+// tool falls back to a search for each value, and when some of those searches
+// fail too: a failed search adds nothing, and the others still count, as they
+// did when the tool searched for each value. Two counts hold too: the tool
 // asks reads for each line and each address once, and runs one query of
 // each kind at most, a batch for two or more values and the search for a
 // lone one.
@@ -515,6 +545,28 @@ func TestFindRouteConversationsBatchesAgreeWithASearchForEachValue(t *testing.T)
 					return false
 				}
 
+				// Both lookups see the same searches fail. A query that reads as a
+				// phone number fails outright when its own line's search fails.
+				picked := map[string]bool{}
+				failValue := func(value string) bool {
+					fail, ok := picked[value]
+					if !ok {
+						fail = random.Intn(3) == 0
+						picked[value] = fail
+					}
+					return fail
+				}
+				partlyFailing := &failingBatchRouteReads{ReadSource: reads, failLines: true, failAddresses: true, failValue: failValue}
+				partly, partlyErr := findRouteConversations(partlyFailing, a.Store, query, limit)
+				wantPartly, wantPartlyErr := findRouteConversationsOneByOne(&failingBatchRouteReads{ReadSource: reads, failValue: failValue}, a.Store, query, limit)
+				if (partlyErr == nil) != (wantPartlyErr == nil) || !sameRoutes(partly, wantPartly) {
+					t.Logf("seed %d, %s: with some searches failing, routes for %q (limit %d) = %v (%v), a search for each value gives %v (%v)", seed, mode, query, limit, routeIDs(partly), partlyErr, routeIDs(wantPartly), wantPartlyErr)
+					return false
+				}
+				if partlyFailing.foundAfterFailed {
+					exercised[mode+": a search that finds threads after another failed"]++
+				}
+
 				if counting.queries["lines"] == 1 && counting.queries["addresses"] == 1 {
 					exercised[mode+": a query that asks for both batches"]++
 				}
@@ -561,7 +613,7 @@ func TestFindRouteConversationsBatchesAgreeWithASearchForEachValue(t *testing.T)
 	}
 	var paths []string
 	for _, mode := range routeStoreModes {
-		for _, path := range []string{"a query that asks for both batches", "a batch of two or more lines", "a batch of two or more addresses", "a lone line searched alone", "a lone address searched alone", "a limit that cuts the routes", "a fallback to a search for each value", "an address with a NUL to look up", "an address with a byte that isn't UTF-8 to look up"} {
+		for _, path := range []string{"a query that asks for both batches", "a batch of two or more lines", "a batch of two or more addresses", "a lone line searched alone", "a lone address searched alone", "a limit that cuts the routes", "a fallback to a search for each value", "a search that finds threads after another failed", "an address with a NUL to look up", "an address with a byte that isn't UTF-8 to look up"} {
 			paths = append(paths, mode+": "+path)
 		}
 	}
