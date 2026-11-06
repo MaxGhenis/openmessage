@@ -1102,9 +1102,9 @@ running app:
   `TestFindRouteConversationsBatchesAgreeWithASearchForEachValue`
   (internal/tools), `TestBatchedSearchesReturnTheNewestOfEachValuesSearch`,
   `TestSearchConversationsByPhoneLinesReadsEachIdentityOnce`,
-  `TestSearchConversationsByAddressesReadsEachIdentityOnce` and
-  `TestSearchConversationsByAddressesComparesEveryByteOfTheKey`
-  (internal/storage/sqlite),
+  `TestSearchConversationsByAddressesReadsEachIdentityOnce`,
+  `TestSearchConversationsByAddressesComparesEveryByteOfTheKey` and
+  `TestBatchesTakeThousandsOfValues` (internal/storage/sqlite),
   `TestSearchConversationsByMetadataSkipsTheAccountOwner`,
   `TestSearchConversationsByPhoneLineAgreesWithTheLineModel`,
   `TestSearchConversationsByAddressMatchesTheWholeAddress` and
@@ -1126,6 +1126,7 @@ running app:
   `TestSearchConversationsByPhoneLinesReadsEachValueOnce`,
   `TestSearchConversationsByAddressesReadsEachValueOnce`,
   `TestSearchConversationsByAddressesComparesEveryByteOfTheKey`,
+  `TestBatchesTakeThousandsOfValues`,
   `TestListContactsFromConversationsReadsTheIndexInTheSortedOrder`,
   `TestListContactsFromConversationsPlanReadsTheNewestFirstIndex`,
   `TestListContactsFromConversationsSortsWithoutTheIndex`
