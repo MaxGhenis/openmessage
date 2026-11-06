@@ -912,17 +912,21 @@ func (s *Store) SearchConversationsByAddress(address string, limit int) ([]Conve
 // whose identity passes match, newest first, then in conversation ID order,
 // and at most limit. match writes an SQL test of the identity i against one
 // bound argument, value. The account's owner (the self identity) passes
-// nothing.
+// nothing. SQLite runs the innermost query once, so a Go function in match
+// runs once for each identity, however many threads it joins.
 func (s *Store) searchConversationsByIdentity(match, value string, limit int) ([]Conversation, error) {
 	rows, err := s.db.QueryContext(
 		context.Background(),
 		"SELECT "+conversationColumns+`
 		 FROM conversations
 		 WHERE conversation_id IN (
-		        SELECT cp.conversation_id
-		        FROM conversation_participants cp
-		        JOIN identities i ON i.identity_id = cp.identity_id
-		        WHERE i.is_self = 0 AND `+match+`
+		        SELECT conversation_id
+		        FROM conversation_participants
+		        WHERE identity_id IN (
+		            SELECT i.identity_id
+		            FROM identities i
+		            WHERE i.is_self = 0 AND `+match+`
+		        )
 		    )
 		 ORDER BY last_message_at_ms DESC, conversation_id
 		 LIMIT ?`,

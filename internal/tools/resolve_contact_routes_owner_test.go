@@ -121,9 +121,10 @@ func TestResolveContactRoutesFindsAPersonBehindThreadsThatListOnlyTheOwner(t *te
 // Property, over random stores and limits: however many newer threads list
 // only someone else and the owner, a person who shares the owner's first
 // name still gets one match, their own thread, on either store, whether v2
-// knows their name or only the legacy store does. The decoys cross every
-// limit the tool's searches apply: 8 times the limit for the searches and
-// 160 times the limit for the contacts it reads from legacy threads.
+// knows their name or only the legacy store does. On legacy reads the decoys
+// cross the limit the tool's searches apply, 8 times the tool's limit. On v2
+// they cross 160 times the limit, where ListContactsFromConversations once
+// stopped reading.
 func TestResolveContactRoutesThreadsThatListOnlyTheOwnerNeverHideAPerson(t *testing.T) {
 	daemon := connectedDaemon(t)
 	exercised := map[string]int{}
@@ -160,7 +161,7 @@ func TestResolveContactRoutesThreadsThatListOnlyTheOwnerNeverHideAPerson(t *test
 		case legacyReads && count > 8*limit:
 			exercised["legacy reads behind more decoys than the search limit"]++
 		case !legacyReads && namelessInV2 && count > 160*limit:
-			exercised["v2 reads, a legacy-only name, behind more decoys than the contacts limit"]++
+			exercised["v2 reads, a legacy-only name, behind more than 160 times the limit in decoys"]++
 		}
 		return true
 	}
@@ -173,7 +174,7 @@ func TestResolveContactRoutesThreadsThatListOnlyTheOwnerNeverHideAPerson(t *test
 	}
 	for _, path := range []string{
 		"legacy reads behind more decoys than the search limit",
-		"v2 reads, a legacy-only name, behind more decoys than the contacts limit",
+		"v2 reads, a legacy-only name, behind more than 160 times the limit in decoys",
 	} {
 		if exercised[path] == 0 {
 			t.Errorf("the property never drew %s; raise MaxCount (drew %v)", path, exercised)

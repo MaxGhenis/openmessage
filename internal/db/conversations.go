@@ -423,9 +423,9 @@ func (s *Store) SearchConversationsByPhoneLine(line string, limit int) ([]*Conve
 	return scanConversations(rows)
 }
 
-// phoneLineSearchSQL is SearchConversationsByPhoneLine's query. match writes
-// a call of the SQL function that tests values against the line, as
-// phoneline.SQL does. The query takes the line three times, then the limit.
+// SearchConversationsByPhoneLine runs phoneLineSearchSQL. match writes a call
+// of the SQL function that tests values against the line, as phoneline.SQL
+// does. The query takes the line three times, then the limit.
 // A thread can hold thousands of messages from a few numbers, so match tests
 // each distinct sender number once, in sender_numbers, and the messages from
 // the numbers on the line then give their threads. SQLite pushes no WHERE
@@ -484,7 +484,7 @@ func (s *Store) SearchConversationsByAddress(address string, limit int) ([]*Conv
 	return scanConversations(rows)
 }
 
-// addressSearchSQL is SearchConversationsByAddress's query. It takes the
+// SearchConversationsByAddress runs addressSearchSQL, which takes the
 // address's key three times, then the limit, and compares each value through
 // addressmatch.SQL. The function can't use the sender_number index, so
 // the query compares each distinct sender number once, in sender_numbers,

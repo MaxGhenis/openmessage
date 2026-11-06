@@ -148,12 +148,13 @@ func TestFindRouteConversationsSearchesForTheTrimmedQuery(t *testing.T) {
 // Elise's two address-book cards write her email address two ways that
 // differ in the case of a letter outside ASCII, which the lookup tells
 // apart, and a legacy thread lists each way; v2 holds the address one way,
-// in lower case, as v2keys.IdentityKey writes an email address. Dana's card
-// holds one address that two of her threads list, an SMS thread and a
-// Google Chat thread. No thread lists either name. A search for each name
-// finds every thread of that person on either store: the tool looks up each
-// way of writing an address that differs beyond ASCII letters' case on its
-// own, and keeps every thread a lookup returns, up to its limit.
+// in lower case, as v2keys.IdentityKey writes an email address, so only the
+// lower-case card finds the v2 thread. Dana's card holds one address that two
+// of her threads list, an SMS thread and a Google Chat thread. No thread lists
+// either name. A search for each name finds every thread of that person on
+// either store: the tool looks up each way of writing an address that differs
+// beyond ASCII letters' case on its own, and keeps every thread a lookup
+// returns, up to its limit.
 func TestResolveContactRoutesFindsEveryThreadOfEachAddressItLooksUp(t *testing.T) {
 	upper, lower := "\u00c9lise@example.com", "\u00e9lise@example.com"
 	for _, mode := range routeStoreModes {

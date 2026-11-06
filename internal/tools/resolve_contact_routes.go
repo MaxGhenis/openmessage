@@ -136,8 +136,8 @@ func resolveContactRoutesHandler(a *app.App, configured ...Options) server.ToolH
 	}
 }
 
-// findRouteConversations returns the query's conversations from reads, the
-// serving store. A query that reads as a phone number, as phoneline.Number
+// findRouteConversations returns the trimmed query's conversations from reads,
+// the serving store. A query that reads as a phone number, as phoneline.Number
 // defines one, names a phone line; other text matches a conversation's title
 // or someone in it. For other text, people also supplies the numbers of
 // matching address-book contacts and of matching participants in its own
@@ -146,6 +146,7 @@ func resolveContactRoutesHandler(a *app.App, configured ...Options) server.ToolH
 // SMS short code, as a whole address. It never looks up a people-store
 // conversation ID.
 func findRouteConversations(reads readsource.ReadSource, people *db.Store, query string, limit int) ([]*db.Conversation, error) {
+	query = strings.TrimSpace(query)
 	if limit <= 0 {
 		limit = 20
 	}
@@ -212,10 +213,11 @@ func findRouteConversations(reads readsource.ReadSource, people *db.Store, query
 	// often hold one person's number, each in its own form, and every form
 	// names one line. Two values share an address key exactly when the
 	// stores' address searches can't tell them apart. The query arrives as
-	// JSON text, so it holds valid UTF-8, and its own search matches every
-	// thread that an address lookup of the query would, in the same order and
-	// under the same limit. That lookup could add only threads that
-	// newestRoutes drops, so it counts as done.
+	// JSON text, so it holds valid UTF-8, and this function trims it. Where a
+	// store holds its values as TEXT, as every writer stores them, the query's
+	// own search matches every thread that an address lookup of the query
+	// would, in the same order and under the same limit. That lookup could add
+	// only threads that newestRoutes drops, so it counts as done.
 	searched := map[string]bool{"address:" + addressmatch.Key(query): true}
 	lookUp := func(number string) {
 		number = strings.TrimSpace(number)

@@ -511,7 +511,7 @@ func TestSearchConversationsByAddressAgreesWithTheAddressModel(t *testing.T) {
 						exercised[path]++
 					}
 				}
-				if held.hit && strings.Contains(address, "&") {
+				if held.hit && !held.senderOnly && strings.Contains(address, "&") {
 					exercised["a hit through a JSON escape"]++
 				}
 			}

@@ -67,12 +67,11 @@ func text(value driver.Value) (string, bool) {
 	return "", false
 }
 
-// Key returns value without the white space around it, as strings.TrimSpace
-// trims it, and with its ASCII letters lowered. It keeps every other byte, a
-// NUL, a letter beyond ASCII and a byte that isn't UTF-8 among them, so two
-// keys match only when they hold the same bytes. SQLite can't compare values
-// this way by itself: NOCASE stops comparing at a NUL, and trim() with every
-// white-space rune takes about 20 times as long per row as this function.
+// Key trims value with strings.TrimSpace and lowers its ASCII letters. It
+// keeps every other byte, a NUL, a letter beyond ASCII and a byte that isn't
+// UTF-8 among them, so two keys match only when they hold the same bytes.
+// NOCASE can't stand in for it: that collation stops comparing at a NUL and
+// keeps white space.
 func Key(value string) string {
 	b := []byte(strings.TrimSpace(value))
 	for index, c := range b {
