@@ -160,15 +160,18 @@ number or title holds it. Both stores' SQL compares those values by the key
 that `addressmatch.Key` writes, through a Go function SQLite knows as
 `om_address_match`. The tool keys its lookups the same way, so it looks up each
 address once. Call `om_address_match` and `om_phone_line_match` only through
-`addressmatch.SQL` and `phoneline.SQL`, which cast each argument to BLOB. The
-`modernc.org/sqlite` driver hands a Go function a TEXT argument only up to its
-first NUL, so values that differ after one would match. Threads that share a
-time come in conversation ID order in both stores. The tool asks the serving
-store once for all the lines a name's cards and threads give
-(`SearchConversationsByPhoneLines`) and once for all the other values
+`addressmatch.SQL` and `phoneline.SQL`, and `om_address_key` and
+`om_phone_line_keys`, which the batch searches below use, only through
+`addressmatch.KeySQL` and `phoneline.KeysSQL`. All four helpers cast each
+argument to BLOB. The `modernc.org/sqlite` driver hands a Go function a TEXT
+argument only up to its first NUL, so values that differ after one would match.
+Threads that share a time come in conversation ID order in both stores. The
+tool asks the serving store once for all the lines a name's cards and threads
+give (`SearchConversationsByPhoneLines`) and once for all the other values
 (`SearchConversationsByAddresses`), or runs the single search when there's only
-one. Each batch returns the newest of what the search for each value returns,
-and if a batch fails, the tool runs those searches.
+one. Each batch looks each value up by the keys that say what its single search
+would match, and returns the newest of what the search for each value returns.
+If a batch fails, the tool runs those searches.
 `ListContactsFromConversations` reads legacy threads newest first from the
 covering partial index `idx_conversations_newest_first` and stops at its limit.
 The route tool ignores the account's owner, whom most threads list: a thread

@@ -1045,8 +1045,13 @@ running app:
   up to 160 at the default limit. A lone value goes to its single search, which
   costs less than a batch of one. Each batch returns the newest of what the
   search for each value returns: every search matches before its limit, so the
-  newest of their hits are the newest threads that any of them match. If a
-  batch fails, the tool runs the search for each value.
+  newest of their hits are the newest threads that any of them match. A batch
+  compares keys rather than call a matcher for every pair of value and entry:
+  the line batch compares the keys of `phoneline.LineKeys` and
+  `phoneline.ValueKeys` (`om_phone_line_keys`, through `phoneline.KeysSQL`), and
+  the address batch compares `addressmatch.Key` values (`om_address_key`,
+  through `addressmatch.KeySQL`). If a batch fails, the tool runs the search for
+  each value.
   `ListContactsFromConversations` skips flagged entries too, reads past any
   number of threads that yield none, and matches what an entry says, not its
   JSON text: `R&D` finds R&D Desk, whose & Go's encoder writes as an escape,
@@ -1095,8 +1100,10 @@ running app:
   `TestResolveContactRoutesSearchesEachLineOnce`,
   `TestResolveContactRoutesFindsALegacyNameThatJSONEscapes` and
   `TestFindRouteConversationsBatchesAgreeWithASearchForEachValue`
-  (internal/tools), `TestBatchedSearchesReturnTheNewestOfEachValuesSearch`
-  and `TestSearchConversationsByPhoneLinesReadsEachIdentityOnce`
+  (internal/tools), `TestBatchedSearchesReturnTheNewestOfEachValuesSearch`,
+  `TestSearchConversationsByPhoneLinesReadsEachIdentityOnce`,
+  `TestSearchConversationsByAddressesReadsEachIdentityOnce` and
+  `TestSearchConversationsByAddressesComparesEveryByteOfTheKey`
   (internal/storage/sqlite),
   `TestSearchConversationsByMetadataSkipsTheAccountOwner`,
   `TestSearchConversationsByPhoneLineAgreesWithTheLineModel`,
@@ -1117,14 +1124,16 @@ running app:
   `TestSearchConversationsByPhoneLineCallsTheMatcherOncePerSenderNumber`,
   `TestBatchedSearchesReturnTheNewestOfEachValuesSearch`,
   `TestSearchConversationsByPhoneLinesReadsEachValueOnce`,
+  `TestSearchConversationsByAddressesReadsEachValueOnce`,
+  `TestSearchConversationsByAddressesComparesEveryByteOfTheKey`,
   `TestListContactsFromConversationsReadsTheIndexInTheSortedOrder`,
   `TestListContactsFromConversationsPlanReadsTheNewestFirstIndex`,
   `TestListContactsFromConversationsSortsWithoutTheIndex`
   (internal/db), `TestMatch`, `TestNumber`, `TestMatchProperties`,
   `TestLineKeysIndexMatch` and
   `TestSQLKeysAgreesWithSQLMatchOverSetsOfLines` (internal/phoneline),
-  `TestKey`, `TestSQLMatch` and `TestSQLMatchAgreesWithKey`
-  (internal/addressmatch),
+  `TestKey`, `TestSQLMatch`, `TestSQLMatchAgreesWithKey`, `TestKeys`, `TestSQLKey`
+  and `TestSQLKeyAgreesWithKeyAndSQLMatch` (internal/addressmatch),
   `TestSubmitTextV2SendsOnlyToTheConversationItsIDNames` and
   `TestSubmitTextV2SendsToTheV2IDWhenIDsCollide` (internal/v2wire).
 - Escape hatches: `--transports` forces the old standalone full-stack stdio
