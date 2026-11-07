@@ -111,7 +111,9 @@ struct WebViewContainer: NSViewRepresentable {
         context.coordinator.webView = webView
         WebViewBridge.shared.webView = webView
         webView.navigationDelegate = context.coordinator
-        webView.load(URLRequest(url: url))
+        if let request = context.coordinator.pageLoads.request(for: url) {
+            webView.load(request)
+        }
         return webView
     }
 
@@ -119,9 +121,10 @@ struct WebViewContainer: NSViewRepresentable {
         context.coordinator.backend = backend
         context.coordinator.notifications = notifications
         context.coordinator.contacts = contacts
-        // Only reload if URL changed
-        if webView.url != url {
-            webView.load(URLRequest(url: url))
+        // Reload only for a new backend address, never because the page
+        // changed its own URL (see BackendPageLoadPolicy).
+        if let request = context.coordinator.pageLoads.request(for: url) {
+            webView.load(request)
         }
     }
 
@@ -185,6 +188,7 @@ struct WebViewContainer: NSViewRepresentable {
         var notifications: NotificationManager
         var contacts: ContactsManager
         weak var webView: WKWebView?
+        var pageLoads = BackendPageLoadPolicy()
 
         init(backend: BackendManager, notifications: NotificationManager, contacts: ContactsManager) {
             self.backend = backend

@@ -6254,7 +6254,12 @@ body::after {
   let forwardMessage = null;
   let forwarding = false;
   const forwardSendKeys = new Map();
-  const composeTextByConversation = new Map();
+  // Unsent compose text per conversation, mirrored to localStorage by
+  // rememberComposeText so a reload or relaunch keeps it.
+  const COMPOSE_DRAFTS_STORAGE_KEY = 'openmessage:compose-drafts:v1';
+  const COMPOSE_DRAFT_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
+  const COMPOSE_DRAFTS_LIMIT = 100;
+  const composeTextByConversation = loadStoredComposeDrafts();
   let contextMenuState = null;
   let threadSearchTimer = 0;
   let threadSearchRequestID = 0;
@@ -11780,7 +11785,7 @@ body::after {
     composeSendInFlight = true;
     clearThreadFeedback();
     $composeInput.value = '';
-    composeTextByConversation.delete(sendConvoId);
+    forgetComposeText(sendConvoId);
     if (hasMedia) {
       clearAttachment();
     }
@@ -11849,6 +11854,52 @@ body::after {
   }
 
   // ─── Compose Input ───
+  // Unsent text lives in composeTextByConversation and in localStorage, so
+  // it outlives the page: the macOS app builds a new web view whenever the
+  // backend restarts, and a notification tap loads the page afresh. Stored
+  // drafts expire after 30 days, and the store keeps only the newest 100.
+  function loadStoredComposeDrafts() {
+    const drafts = new Map();
+    const now = Date.now();
+    for (const [convoId, draft] of Object.entries(readStoredComposeDrafts())) {
+      if (storedComposeDraftIsLive(draft, now)) drafts.set(convoId, draft.text);
+    }
+    return drafts;
+  }
+
+  function readStoredComposeDrafts() {
+    try {
+      const parsed = JSON.parse(window.localStorage.getItem(COMPOSE_DRAFTS_STORAGE_KEY) || '{}');
+      return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+    } catch {
+      return {};
+    }
+  }
+
+  function storedComposeDraftIsLive(draft, now) {
+    return !!draft && typeof draft.text === 'string' && draft.text !== ''
+      && now - Number(draft.updated_at_ms || 0) <= COMPOSE_DRAFT_MAX_AGE_MS;
+  }
+
+  // Changes one conversation's stored draft. It re-reads the others first,
+  // so a draft another tab stored since this page loaded survives.
+  function storeComposeDraft(convoId, text) {
+    try {
+      const now = Date.now();
+      const drafts = readStoredComposeDrafts();
+      if (text) {
+        drafts[convoId] = { text, updated_at_ms: now };
+      } else {
+        delete drafts[convoId];
+      }
+      const kept = Object.entries(drafts)
+        .filter(([, draft]) => storedComposeDraftIsLive(draft, now))
+        .sort(([, a], [, b]) => Number(b.updated_at_ms) - Number(a.updated_at_ms))
+        .slice(0, COMPOSE_DRAFTS_LIMIT);
+      window.localStorage.setItem(COMPOSE_DRAFTS_STORAGE_KEY, JSON.stringify(Object.fromEntries(kept)));
+    } catch {}
+  }
+
   function rememberComposeText(convoId, value) {
     if (!convoId) return;
     const text = String(value || '');
@@ -11857,6 +11908,11 @@ body::after {
     } else {
       composeTextByConversation.delete(convoId);
     }
+    storeComposeDraft(convoId, text);
+  }
+
+  function forgetComposeText(convoId) {
+    rememberComposeText(convoId, '');
   }
 
   function rememberActiveComposeText(convoId = activeConvoId) {
@@ -11964,7 +12020,7 @@ body::after {
           && (pendingFile && pendingFile.file ? pendingFile.file : null) === scheduledFile
           && replyToMsg === scheduledReply;
         if (composeTextByConversation.get(sendConvoId) === rawText) {
-          composeTextByConversation.delete(sendConvoId);
+          forgetComposeText(sendConvoId);
         }
         if (sameCompose) {
           $composeInput.value = '';
@@ -12009,6 +12065,7 @@ body::after {
         });
       }
       $composeInput.value = '';
+      rememberActiveComposeText();
       autoResize();
       if (replyToMsg) clearReply();
       hideScheduleCustom();
@@ -12803,7 +12860,7 @@ body::after {
 	    clearThreadFeedback();
 	    gifSending = true;
 	    $composeInput.value = '';
-	    composeTextByConversation.delete(sendConvoId);
+	    forgetComposeText(sendConvoId);
 	    clearReply();
 	    autoResize();
 	    const queuedItems = [];
