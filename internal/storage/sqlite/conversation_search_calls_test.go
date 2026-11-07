@@ -163,6 +163,32 @@ func seedCallCountThread(t *testing.T, store *Store, id string, lastMessageAt in
 	}
 }
 
+// skewIdentitySearchStatistics runs ANALYZE on store, whose file sits at
+// path, and then rewrites two sqlite_stat1 rows so that they claim a million
+// participant rows for each identity and a single conversation. It closes
+// store and returns the store reopened, since a connection that opens after
+// this plans with those statistics.
+func skewIdentitySearchStatistics(t *testing.T, store *Store, path string) *Store {
+	t.Helper()
+	for _, statement := range []string{
+		`ANALYZE`,
+		`UPDATE sqlite_stat1 SET stat = '1000000 1000000 1' WHERE idx = 'conversation_participants_identity_idx'`,
+		`UPDATE sqlite_stat1 SET stat = '1 1' WHERE idx = 'sqlite_autoindex_conversations_1'`,
+	} {
+		result, err := store.db.Exec(statement)
+		if err != nil {
+			t.Fatalf("%s: %v", statement, err)
+		}
+		if changed, err := result.RowsAffected(); strings.HasPrefix(statement, "UPDATE") && (err != nil || changed != 1) {
+			t.Fatalf("%s changed %d rows (%v), want 1", statement, changed, err)
+		}
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close(): %v", err)
+	}
+	return openCallCountStore(t, path)
+}
+
 // Invariant: the phone line and address searches call the Go matcher at most
 // once for each identity, however many threads it joins. Alice and Bob share
 // 30 threads with the owner, Carol has one and Dan has none, so a plan that
@@ -210,11 +236,12 @@ func TestSearchConversationsByIdentityCallsTheMatcherOncePerIdentity(t *testing.
 
 // Invariant: the bound holds under statistics that would lead SQLite to index
 // identities if the query let it. The store never runs ANALYZE, but anyone
-// who opens its file can, and can write sqlite_stat1 by hand. With the
-// statistics below, SQLite plans the identities query through an automatic
-// index unless the query reads identities NOT INDEXED, and that plan calls the
-// matcher twice for the identity that matches. The last check shows that
-// these statistics still lead to that plan.
+// who opens its file can, and can write sqlite_stat1 by hand. Under the
+// statistics that skewIdentitySearchStatistics writes, SQLite plans the
+// identities query through an automatic index unless the query reads
+// identities NOT INDEXED, and that plan calls the matcher twice for the
+// identity that matches. The last check shows that these statistics still
+// lead to that plan.
 func TestSearchConversationsByIdentityCallsTheMatcherOncePerIdentityUnderSkewedStatistics(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "store.sqlite3")
 	store := openCallCountStore(t, path)
@@ -238,25 +265,7 @@ func TestSearchConversationsByIdentityCallsTheMatcherOncePerIdentityUnderSkewedS
 		seedCallCountThread(t, store, id, callCountAt+int64(index), "identity-00", fmt.Sprintf("identity-%02d", people-1))
 		threads = append([]string{id}, threads...)
 	}
-	for _, statement := range []string{
-		`ANALYZE`,
-		`UPDATE sqlite_stat1 SET stat = '1000000 1000000 1' WHERE idx = 'conversation_participants_identity_idx'`,
-		`UPDATE sqlite_stat1 SET stat = '1 1' WHERE idx = 'sqlite_autoindex_conversations_1'`,
-	} {
-		result, err := store.db.Exec(statement)
-		if err != nil {
-			t.Fatalf("%s: %v", statement, err)
-		}
-		if changed, err := result.RowsAffected(); strings.HasPrefix(statement, "UPDATE") && (err != nil || changed != 1) {
-			t.Fatalf("%s changed %d rows (%v), want 1", statement, changed, err)
-		}
-	}
-	// Every connection of a store opened after this plans with the
-	// statistics above.
-	if err := store.Close(); err != nil {
-		t.Fatalf("Close(): %v", err)
-	}
-	store = openCallCountStore(t, path)
+	store = skewIdentitySearchStatistics(t, store, path)
 
 	for _, search := range []struct {
 		name, match, value string
@@ -303,5 +312,56 @@ func TestSearchConversationsByIdentityCallsTheMatcherOncePerIdentityUnderSkewedS
 		if most < 2 {
 			t.Errorf("the %s search without NOT INDEXED called the matcher at most %d times for each identity, want twice for one: these statistics no longer make SQLite index identities", search.name, most)
 		}
+	}
+}
+
+// Invariant: threads that share a time come in conversation ID order. Under
+// the statistics that skewIdentitySearchStatistics writes, SQLite reads
+// conversations in the order the store wrote them. The test writes three
+// threads that share a time in reverse ID order, so only the query's ID
+// tie-break sorts them. The last check shows that these statistics still lead
+// SQLite to read them out of ID order.
+func TestSearchConversationsByIdentityBreaksTiesByConversationIDUnderSkewedStatistics(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "store.sqlite3")
+	store := openCallCountStore(t, path)
+	seedCallCountAccount(t, store)
+	seedCallCountIdentity(t, store, "identity-owner", "owner", true)
+	seedCallCountIdentity(t, store, "identity-sam", "sam", false)
+	for _, id := range []string{"tie-c", "tie-b", "tie-a"} {
+		seedCallCountThread(t, store, id, callCountAt+10, "identity-owner", "identity-sam")
+	}
+	seedCallCountThread(t, store, "older", callCountAt, "identity-owner", "identity-sam")
+	store = skewIdentitySearchStatistics(t, store, path)
+
+	match := countedIdentityMatch + "(?, i.canonical_value)"
+	want := []string{"tie-a", "tie-b", "tie-c", "older"}
+	for limit := 1; limit <= len(want); limit++ {
+		conversations, err := store.searchConversationsByIdentity(match, "sam", limit)
+		if err != nil {
+			t.Fatalf("searchConversationsByIdentity(%q, %d): %v", "sam", limit, err)
+		}
+		if got := conversationIDs(conversations); !slices.Equal(got, want[:limit]) {
+			t.Errorf("searchConversationsByIdentity(%q, %d) = %v, want %v", "sam", limit, got, want[:limit])
+		}
+	}
+
+	// Without its tie-break, the same query must return the ties out of ID
+	// order. When it stops, this test no longer covers the tie-break, and its
+	// statistics need a change.
+	query := identitySearchSQL(match)
+	untied := strings.Replace(query, "ORDER BY last_message_at_ms DESC, conversation_id", "ORDER BY last_message_at_ms DESC", 1)
+	if untied == query {
+		t.Fatalf("identitySearchSQL no longer orders by last_message_at_ms DESC, conversation_id")
+	}
+	rows, err := store.db.Query(untied, "sam", len(want))
+	if err != nil {
+		t.Fatalf("search without the tie-break: %v", err)
+	}
+	conversations, err := collectRows(rows, scanConversation)
+	if err != nil {
+		t.Fatalf("search without the tie-break: %v", err)
+	}
+	if got := conversationIDs(conversations); slices.Equal(got, want) {
+		t.Errorf("the search without its tie-break returned %v, in ID order: these statistics no longer make SQLite read the ties out of ID order", got)
 	}
 }
