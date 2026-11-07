@@ -1,5 +1,5 @@
 {
-  "buildCommand": "cd site && bun install && bun run build",
-  "outputDirectory": "site/out",
-  "cleanUrls": true
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "installCommand": "echo 'Skipping install: deploy the site from site/, not the repo root.'",
+  "buildCommand": "echo 'openmessage.ai deploys from the site/ directory. Run vercel from site/ (see site/README.md).' && exit 1"
 }
