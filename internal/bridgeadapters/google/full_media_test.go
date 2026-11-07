@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"testing"
+	"time"
 
 	"go.mau.fi/mautrix-gmessages/pkg/libgm/gmproto"
 
@@ -109,6 +110,56 @@ func TestRequestFullMediaFailures(t *testing.T) {
 	adapter = newFullMediaTestAdapter(t, malformed)
 	if err := adapter.RequestFullMedia(context.Background(), "google-primary", bridge.MediaRef{Opaque: []byte("{")}); err == nil || len(malformed.calls) != 0 {
 		t.Fatalf("RequestFullMedia(malformed) = %v after %d calls, want an error and no call", err, len(malformed.calls))
+	}
+}
+
+// A full-size request goes through the phone-silence gate like the send
+// path: while the phone is held as silent it asks nothing, an unanswered one
+// closes the gate, and an answered one ends the silence.
+func TestRequestFullMediaHonorsPhoneSilence(t *testing.T) {
+	opaque := googleOpaque(t, googleDownloadOpaqueV1{
+		V: 1, MediaID: "thumb-1", DecryptionKey: "0a", MessageID: "89926", PartID: "88846", Preview: true,
+	})
+	request := func(a *Adapter) error {
+		return a.RequestFullMedia(context.Background(), "google-primary", bridge.MediaRef{Opaque: opaque})
+	}
+
+	held := &fakeFullSizeImageClient{}
+	adapter := newFullMediaTestAdapter(t, held)
+	adapter.silence.now = newSilenceClock().Now
+	adapter.silence.recordUnanswered("")
+	err := request(adapter)
+	var failure bridge.OpError
+	if !errors.As(err, &failure) || failure.Fingerprint != "google_phone_not_answering" || len(held.calls) != 0 {
+		t.Fatalf("RequestFullMedia(phone held) = %v after %d calls, want held with no call", err, len(held.calls))
+	}
+
+	silent := &fakeFullSizeImageClient{err: unanswered(gmproto.ActionType_GET_FULL_SIZE_IMAGE)}
+	adapter = newFullMediaTestAdapter(t, silent)
+	adapter.silence.now = newSilenceClock().Now
+	if err := request(adapter); err == nil || len(silent.calls) != 1 {
+		t.Fatalf("RequestFullMedia(unanswered) = %v after %d calls, want the error after one call", err, len(silent.calls))
+	}
+	if _, _, closed := adapter.silence.held(); !closed {
+		t.Fatal("an unanswered full-size request left the gate open")
+	}
+	if err := request(adapter); err == nil || len(silent.calls) != 1 {
+		t.Fatalf("RequestFullMedia(after unanswered) = %v after %d calls, want held with no new call", err, len(silent.calls))
+	}
+
+	answered := &fakeFullSizeImageClient{}
+	adapter = newFullMediaTestAdapter(t, answered)
+	clock := newSilenceClock()
+	adapter.silence.now = clock.Now
+	adapter.silence.recordUnanswered("")
+	clock.Advance(time.Minute)
+	if err := request(adapter); err != nil || len(answered.calls) != 1 {
+		t.Fatalf("RequestFullMedia(probe) = %v after %d calls, want one call", err, len(answered.calls))
+	}
+	// The answer ended the silence, so the next one starts at the first window.
+	adapter.silence.recordUnanswered("")
+	if left := windowLeft(adapter); left != 30*time.Second {
+		t.Fatalf("window after an answered full-size request = %s, want 30s", left)
 	}
 }
 

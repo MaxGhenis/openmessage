@@ -431,8 +431,9 @@ func (s *v2Stack) Start(
 		stopOnce.Do(func() {
 			cancel()
 			runWG.Wait()
-			// Media downloads started in the background end before the
-			// store they write to closes.
+			// Media work started in the background is cancelled before the
+			// store it writes to closes; Close waits a bounded time for it
+			// (media.Service.Close).
 			if s.Media != nil {
 				s.Media.Close()
 			}

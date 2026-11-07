@@ -520,7 +520,11 @@ func (a *Adapter) DownloadMedia(
 // if at all, with an update of the message that names the original; the
 // call itself returns nothing. A reference that is not a thumbnail, or that
 // was packed before references carried the message and part IDs, asks for
-// nothing. The caller paces repeated requests.
+// nothing. The caller paces repeated requests. Like the send path, it asks
+// nothing while the phone is held as silent, and an unanswered request holds
+// it (see phoneSilence): a thread of old thumbnails opened while the phone is
+// away would otherwise send a request per image, each waiting out libgm's
+// request timeout.
 func (a *Adapter) RequestFullMedia(
 	ctx context.Context,
 	accountID string,
@@ -547,6 +551,10 @@ func (a *Adapter) RequestFullMedia(
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	if held := a.holdIfPhoneSilent("request_full_media"); held != nil {
+		held.Dispatch = ""
+		return *held
+	}
 	if _, err := transport.GetFullSizeImage(decoded.messageID, decoded.partID); err != nil {
 		failure := a.classifyTransportError(
 			fmt.Errorf("request Google full-size image: %w", err),
@@ -554,9 +562,13 @@ func (a *Adapter) RequestFullMedia(
 			"google_full_media_request_failed",
 		)
 		failure.Dispatch = ""
+		if errors.Is(err, libgm.ErrPhoneNotResponding) {
+			a.phoneUnanswered("request_full_media", "")
+		}
 		a.reportIfAuthIndicting(failure)
 		return failure
 	}
+	a.phoneAnswered("")
 	return nil
 }
 

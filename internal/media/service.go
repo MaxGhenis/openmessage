@@ -38,17 +38,28 @@ const (
 	// copy. The download carries on, and the attachment's media version
 	// changes when it lands, so a reader asks again.
 	defaultOriginalWait = 8 * time.Second
-	// originalTimeout bounds one download of an original.
+	// originalTimeout bounds one download of an original on a transport that
+	// stops when its context ends. Google's does not: libgm downloads media
+	// with no context, under its HTTP client's 2-minute timeout.
 	originalTimeout = time.Minute
 	// originalRetryAfter is how long a failed download of an original, or a
 	// request for one, holds off the next attempt for the same attachment.
 	originalRetryAfter = 30 * time.Minute
 	// originalRequestTimeout bounds one request for an original, including
-	// its wait for one of originalRequestSlots.
+	// its wait for one of originalRequestSlots, on a transport that stops when
+	// its context ends. Google's does not: once made, a request waits for the
+	// phone up to libgm's request timeout (35 s, internal/client), holding
+	// its slot.
 	originalRequestTimeout = 30 * time.Second
 	// originalRequestSlots bounds requests for originals in flight, so a
 	// thread full of old thumbnails does not ask the phone for all at once.
 	originalRequestSlots = 4
+	// defaultCloseWait bounds how long Close waits for that work to end. Work
+	// on Google runs on to libgm's limits whatever its context, and the macOS
+	// app gives the daemon 2 s to quit before it kills it, so Close stops
+	// waiting after this. Work that ends later then fails to write to the
+	// closed store; a download leaves at most an unreferenced blob.
+	defaultCloseWait = time.Second
 )
 
 // Clock is the same application clock contract used by MessageService.
@@ -79,6 +90,7 @@ type Service struct {
 	stopBackground context.CancelFunc
 	requestsSlots  chan struct{}
 	originalWait   time.Duration
+	closeWait      time.Duration
 }
 
 // DownloadCommand identifies one message-owned attachment. It deliberately
@@ -173,19 +185,30 @@ func NewService(
 		stopBackground: stopBackground,
 		requestsSlots:  make(chan struct{}, originalRequestSlots),
 		originalWait:   defaultOriginalWait,
+		closeWait:      defaultCloseWait,
 	}, nil
 }
 
 // Close cancels the work toward originals that Resolve started in the
-// background and waits for it to end, so the caller can close the store
-// after. Resolve still serves what is stored afterwards; it starts no more
-// such work.
+// background and waits for it to end, for at most closeWait (see
+// defaultCloseWait), so the caller can close the store after. Resolve still
+// serves what is stored afterwards; it starts no more such work.
 func (s *Service) Close() {
 	s.originalsMu.Lock()
 	s.closed = true
 	s.originalsMu.Unlock()
 	s.stopBackground()
-	s.background.Wait()
+	ended := make(chan struct{})
+	go func() {
+		s.background.Wait()
+		close(ended)
+	}()
+	timer := s.clock.NewTimer(s.closeWait)
+	defer timer.Stop()
+	select {
+	case <-ended:
+	case <-timer.C():
+	}
 }
 
 // Resolve returns a safe descriptor for one message attachment, downloading it

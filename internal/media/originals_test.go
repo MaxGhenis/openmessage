@@ -1,8 +1,10 @@
 package media
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"io"
 	"sync"
 	"testing"
 	"time"
@@ -411,5 +413,80 @@ func TestCloseStopsWorkTowardOriginals(t *testing.T) {
 	service.background.Wait()
 	if got := len(requester.requests()); got != requests {
 		t.Fatalf("requests for originals after Close = %d, want %d", got, requests)
+	}
+}
+
+// stubbornDownloader ignores its context, as libgm's media download does: it
+// runs until released.
+type stubbornDownloader struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+func (d *stubbornDownloader) DownloadMedia(context.Context, string, bridge.MediaRef) (bridge.MediaStream, error) {
+	close(d.started)
+	<-d.release
+	return bridge.MediaStream{
+		ReadCloser: io.NopCloser(bytes.NewReader(originalBytes)),
+		Size:       int64(len(originalBytes)),
+		MIME:       "image/jpeg",
+	}, nil
+}
+
+// Close stops waiting for work that ignores cancellation after closeWait, so
+// a Google download running on to libgm's own timeout cannot hold up the
+// daemon's quit. The download, ending after the store closed, changes nothing.
+func TestCloseStopsWaitingForWorkThatIgnoresCancellation(t *testing.T) {
+	env := newMediaTestEnvironment(t)
+	seedThumbnail(t, env, "message-thumb")
+	registry := availableDownloadRegistry(&scriptedDownloader{steps: []downloadStep{
+		byteStreamStep(thumbnailBytes, "image/jpeg"),
+	}})
+	registry.fullMedia = &recordingFullMediaRequester{}
+	service := newMediaTestService(t, env, registry)
+	service.originalWait = time.Millisecond
+	service.closeWait = 50 * time.Millisecond
+	resolveImage(t, service, "message-thumb")
+	service.background.Wait()
+	nameOriginal(t, env, "message-thumb", "named")
+	stubborn := &stubbornDownloader{started: make(chan struct{}), release: make(chan struct{})}
+	registry.mu.Lock()
+	registry.downloader = stubborn
+	registry.mu.Unlock()
+	resolveImage(t, service, "message-thumb")
+	<-stubborn.started
+
+	closed := make(chan struct{})
+	go func() {
+		service.Close()
+		close(closed)
+	}()
+	select {
+	case <-closed:
+	case <-time.After(10 * time.Second):
+		close(stubborn.release)
+		t.Fatal("Close() waited on a download that ignores cancellation")
+	}
+	if err := env.store.Close(); err != nil {
+		t.Fatalf("store.Close(): %v", err)
+	}
+	close(stubborn.release)
+	service.background.Wait()
+
+	reopened, err := sqlite.Open(env.dbPath)
+	if err != nil {
+		t.Fatalf("sqlite.Open(): %v", err)
+	}
+	defer reopened.Close()
+	attachments, err := sqlite.NewMessageAttachmentRepository(reopened, env.clock.Now)
+	if err != nil {
+		t.Fatalf("NewMessageAttachmentRepository(): %v", err)
+	}
+	row, err := attachments.GetForDownload(context.Background(), "message-thumb", 0)
+	if err != nil {
+		t.Fatalf("GetForDownload(): %v", err)
+	}
+	if !row.NeedsOriginal() || row.BlobHash == nil || *row.BlobHash != sha256Hex(thumbnailBytes) {
+		t.Fatalf("row after a late download = %+v, want the thumbnail still in place", row)
 	}
 }
