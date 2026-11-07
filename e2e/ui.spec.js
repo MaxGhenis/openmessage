@@ -281,6 +281,63 @@ test('keeps typed compose text scoped to each thread', async ({ page }) => {
   await expect(page.locator('#compose-input')).toHaveValue(sarahDraft);
 });
 
+// The macOS app builds a new web view whenever its backend restarts, and on
+// 2026-11-07 it reloaded the page every time Signal reconnected. Unsent text
+// must outlive the page.
+test('keeps typed compose text across a reload', async ({ page }) => {
+  const sarahDraft = `Sarah reload draft ${Date.now()}`;
+  const marcusDraft = `Marcus reload draft ${Date.now()}`;
+
+  await openConversation(page, 'Marcus Johnson');
+  await page.locator('#compose-input').fill(marcusDraft);
+  await openConversation(page, 'Sarah Chen');
+  await page.locator('#compose-input').fill(sarahDraft);
+
+  await page.reload();
+  await expect(page.locator('#chat-header-name')).toHaveText('Sarah Chen');
+  await expect(page.locator('#compose-input')).toHaveValue(sarahDraft);
+
+  await openConversation(page, 'Marcus Johnson');
+  await expect(page.locator('#compose-input')).toHaveValue(marcusDraft);
+});
+
+test('forgets compose text once you send it, so a reload brings none back', async ({ page }) => {
+  const outbound = `Playwright sent draft ${Date.now()}`;
+
+  await openConversation(page, 'Sarah Chen');
+  await page.locator('#compose-input').fill(outbound);
+  await page.locator('#send-btn').click();
+  await expect(page.locator('#messages-area')).toContainText(outbound);
+
+  await page.reload();
+  await expect(page.locator('#chat-header-name')).toHaveText('Sarah Chen');
+  await expect(page.locator('#messages-area')).toContainText(outbound);
+  await expect(page.locator('#compose-input')).toHaveValue('');
+});
+
+test('drops a stored compose draft after 30 days', async ({ page }) => {
+  const sarahConversationID = await page.evaluate(async () => {
+    const response = await fetch('/api/conversations?limit=200');
+    const conversations = await response.json();
+    return conversations.find(conversation => conversation.Name === 'Sarah Chen').ConversationID;
+  });
+  const dayMS = 24 * 60 * 60 * 1000;
+  await page.evaluate(({ id, dayMS }) => {
+    window.localStorage.setItem('openmessage:compose-drafts:v1', JSON.stringify({
+      [id]: { text: 'a month-old draft', updated_at_ms: Date.now() - 31 * dayMS },
+    }));
+  }, { id: sarahConversationID, dayMS });
+
+  await page.goto(`/?conversation=${encodeURIComponent(sarahConversationID)}`);
+  await expect(page.locator('#chat-header-name')).toHaveText('Sarah Chen');
+  await expect(page.locator('#compose-input')).toHaveValue('');
+
+  await page.locator('#compose-input').fill('a fresh draft');
+  const stored = await page.evaluate(() => JSON.parse(window.localStorage.getItem('openmessage:compose-drafts:v1')));
+  expect(Object.keys(stored)).toEqual([sarahConversationID]);
+  expect(stored[sarahConversationID].text).toBe('a fresh draft');
+});
+
 test('opens a deep-linked conversation from the URL', async ({ page }) => {
   const sarahConversationID = await page.evaluate(async () => {
     const response = await fetch('/api/conversations?limit=200');
