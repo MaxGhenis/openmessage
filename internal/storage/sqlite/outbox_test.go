@@ -274,6 +274,20 @@ func TestOutboxEnqueueOutgoingMediaMessageRoundTripAndDeduplicates(t *testing.T)
 	if gotMessage.Body != message.Body {
 		t.Fatalf("optimistic media message body = %q, want caption %q", gotMessage.Body, message.Body)
 	}
+	// The message shows the image it sends from the moment it is queued.
+	attachments, err := NewMessageAttachmentRepository(store, clock.Now)
+	if err != nil {
+		t.Fatalf("NewMessageAttachmentRepository(): %v", err)
+	}
+	shown, err := attachments.GetForDownload(ctx, item.LocalMessageID, 0)
+	if err != nil {
+		t.Fatalf("GetForDownload(): %v", err)
+	}
+	if shown.State != "downloaded" || shown.BlobHash == nil || *shown.BlobHash != attachment.BlobHash ||
+		shown.SizeBytes == nil || *shown.SizeBytes != attachment.SizeBytes ||
+		shown.MIME != attachment.MIME || shown.Filename != attachment.Filename || shown.RemoteID != "" {
+		t.Fatalf("optimistic media message attachment = %+v, want the sent blob %+v", shown, attachment)
+	}
 
 	clock.Set(outboxTestTimeMS + 500)
 	duplicate := item
@@ -295,6 +309,7 @@ func TestOutboxEnqueueOutgoingMediaMessageRoundTripAndDeduplicates(t *testing.T)
 	assertRowCount(t, store.db, "outbox", 1)
 	assertRowCount(t, store.db, "messages", 1)
 	assertRowCount(t, store.db, "outbox_attachments", 1)
+	assertRowCount(t, store.db, "message_attachments", 1)
 
 	if _, err := repository.GetOutboxAttachment(ctx, "missing"); !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("GetOutboxAttachment(missing) error = %v, want sql.ErrNoRows", err)
@@ -327,6 +342,57 @@ func TestOutboxEnqueueOutgoingMediaMessageRollsBackAttachmentInsertFailure(t *te
 	assertRowCount(t, store.db, "outbox", 0)
 	assertRowCount(t, store.db, "messages", 0)
 	assertRowCount(t, store.db, "outbox_attachments", 0)
+	assertRowCount(t, store.db, "message_attachments", 0)
+}
+
+// Sent media messages queued before sends carried their image get it from
+// their outbox attachment, once; a message that already shows an attachment,
+// and a text send, are left alone.
+func TestBackfillOutgoingMediaAttachments(t *testing.T) {
+	clock := newOutboxTestClock(outboxTestTimeMS)
+	store, repository := openOutboxTestRepository(t, clock.Now)
+	seedMessageIdentity(t, store, "identity-a", "account-a")
+	seedMessageConversation(t, store, "conversation-a", "account-a")
+	ctx := context.Background()
+
+	bare := outboxTestMediaItem("bare")
+	kept := outboxTestMediaItem("kept")
+	for _, item := range []NewOutboxItem{bare, kept} {
+		if _, _, err := repository.EnqueueOutgoingMediaMessage(ctx, item, outboxTestOutgoingMessage(item, ""), outboxTestAttachment()); err != nil {
+			t.Fatalf("EnqueueOutgoingMediaMessage(%s): %v", item.OutboxID, err)
+		}
+	}
+	text := outboxTestItem("text")
+	if _, _, err := repository.EnqueueOutgoingMessage(ctx, text, outboxTestOutgoingMessage(text, "hi")); err != nil {
+		t.Fatalf("EnqueueOutgoingMessage(): %v", err)
+	}
+	mustExec(t, store.db, `DELETE FROM message_attachments WHERE message_id = ?`, bare.LocalMessageID)
+	mustExec(t, store.db, `UPDATE message_attachments SET mime = 'image/jpeg' WHERE message_id = ?`, kept.LocalMessageID)
+
+	clock.Set(outboxTestTimeMS + 1000)
+	for run, want := range []int{1, 0} {
+		attached, err := repository.BackfillOutgoingMediaAttachments(ctx)
+		if err != nil || attached != want {
+			t.Fatalf("BackfillOutgoingMediaAttachments() run %d = %d, %v; want %d", run, attached, err, want)
+		}
+	}
+	attachments, err := NewMessageAttachmentRepository(store, clock.Now)
+	if err != nil {
+		t.Fatalf("NewMessageAttachmentRepository(): %v", err)
+	}
+	backfilled, err := attachments.GetForDownload(ctx, bare.LocalMessageID, 0)
+	if err != nil {
+		t.Fatalf("GetForDownload(bare): %v", err)
+	}
+	want := outboxTestAttachment()
+	if backfilled.State != "downloaded" || backfilled.BlobHash == nil || *backfilled.BlobHash != want.BlobHash ||
+		backfilled.MIME != want.MIME || backfilled.Filename != want.Filename || backfilled.CreatedAtMS != outboxTestTimeMS+1000 {
+		t.Fatalf("backfilled attachment = %+v, want the sent blob %+v", backfilled, want)
+	}
+	if untouched, err := attachments.GetForDownload(ctx, kept.LocalMessageID, 0); err != nil || untouched.MIME != "image/jpeg" {
+		t.Fatalf("kept attachment = %+v, %v; want it untouched", untouched, err)
+	}
+	assertRowCount(t, store.db, "message_attachments", 2)
 }
 
 func TestOutboxEnqueueValidatesMediaAttachmentPair(t *testing.T) {
