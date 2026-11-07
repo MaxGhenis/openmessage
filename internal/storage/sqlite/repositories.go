@@ -912,8 +912,9 @@ func (s *Store) SearchConversationsByAddress(address string, limit int) ([]Conve
 // whose identity passes match, newest first, then in conversation ID order,
 // and at most limit. match writes an SQL test of the identity i against one
 // bound argument, value. The account's owner (the self identity) passes
-// nothing. SQLite runs the innermost query once, so a Go function in match
-// runs once for each identity, however many threads it joins.
+// nothing. SQLite runs the innermost query once and scans identities in it,
+// so a Go function in match runs at most once for each identity, however
+// many threads it joins.
 func (s *Store) searchConversationsByIdentity(match, value string, limit int) ([]Conversation, error) {
 	rows, err := s.db.QueryContext(context.Background(), identitySearchSQL(match), value, limit)
 	if err != nil {
@@ -923,6 +924,11 @@ func (s *Store) searchConversationsByIdentity(match, value string, limit int) ([
 }
 
 // identitySearchSQL returns searchConversationsByIdentity's query for match.
+// It reads identities NOT INDEXED. Under some sqlite_stat1 statistics, SQLite
+// would otherwise build an automatic partial index of the identities that
+// pass match: it tests each identity as it fills the index, and tests those
+// that pass again as it reads the index. Without statistics, NOT INDEXED
+// leaves the plan unchanged.
 func identitySearchSQL(match string) string {
 	return "SELECT " + conversationColumns + `
 		 FROM conversations
@@ -931,7 +937,7 @@ func identitySearchSQL(match string) string {
 		        FROM conversation_participants
 		        WHERE identity_id IN (
 		            SELECT i.identity_id
-		            FROM identities i
+		            FROM identities i NOT INDEXED
 		            WHERE i.is_self = 0 AND ` + match + `
 		        )
 		    )
