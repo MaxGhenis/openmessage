@@ -65,6 +65,7 @@ type MessageService struct {
 	store    *sqlite.Store
 	outbox   *sqlite.OutboxRepository
 	messages messageRepository
+	roster   rosterRepository
 	bridges  bridge.Registry
 	blobs    *blob.BlobStore
 	clock    Clock
@@ -81,6 +82,8 @@ type MessageService struct {
 	mediaTransportTimeout  time.Duration
 	transportShutdownGrace time.Duration
 	transport              transportCalls
+	passes                 dispatchPasses
+	leaseFailures          dispatchLeaseFailures
 
 	wake chan struct{}
 
@@ -121,6 +124,7 @@ func NewMessageService(
 		store:         store,
 		outbox:        outbox,
 		messages:      messages,
+		roster:        store,
 		bridges:       bridges,
 		blobs:         blobs,
 		clock:         clock,

@@ -171,7 +171,7 @@ func (r *MessageAttachmentRepository) RecordInboundAttachment(
 			size_bytes = CASE WHEN `+keepsReference+`
 				THEN message_attachments.size_bytes ELSE excluded.size_bytes END,
 			last_error = COALESCE(excluded.last_error, message_attachments.last_error),
-			updated_at_ms = excluded.updated_at_ms
+			updated_at_ms = MAX(message_attachments.updated_at_ms, excluded.updated_at_ms)
 		WHERE message_attachments.blob_hash IS NULL
 	`,
 		attachment.MessageID,
@@ -291,7 +291,7 @@ func (r *MessageAttachmentRepository) MarkDownloaded(
 		    size_bytes = ?,
 		    mime = ?,
 		    last_error = NULL,
-		    updated_at_ms = ?
+		    updated_at_ms = MAX(updated_at_ms, ?)
 		WHERE message_id = ? AND ordinal = ? AND state = 'pending'
 	`, blobHash, size, mime, nowMS, messageID, ordinal)
 	if err != nil {
@@ -345,7 +345,7 @@ func (r *MessageAttachmentRepository) ReplaceDownloaded(
 		    size_bytes = ?,
 		    mime = ?,
 		    last_error = NULL,
-		    updated_at_ms = ?
+		    updated_at_ms = MAX(updated_at_ms, ?)
 		WHERE message_id = ? AND ordinal = ? AND state = 'downloaded' AND blob_hash = ?
 	`, blobHash, size, mime, nowMS, messageID, ordinal, oldBlobHash)
 	if err != nil {
@@ -372,7 +372,7 @@ func (r *MessageAttachmentRepository) MarkFailed(
 	}
 	if _, err := r.store.db.ExecContext(ctx, `
 		UPDATE message_attachments
-		SET last_error = ?, updated_at_ms = ?
+		SET last_error = ?, updated_at_ms = MAX(updated_at_ms, ?)
 		WHERE message_id = ? AND ordinal = ? AND state = 'pending'
 	`, errText, nowMS, messageID, ordinal); err != nil {
 		return fmt.Errorf(

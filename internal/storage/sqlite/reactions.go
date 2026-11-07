@@ -156,7 +156,7 @@ func applyReaction(
 			state = excluded.state,
 			occurred_at_ms = excluded.occurred_at_ms,
 			source_seq_ms = excluded.source_seq_ms,
-			updated_at_ms = excluded.updated_at_ms
+			updated_at_ms = MAX(reactions.updated_at_ms, excluded.updated_at_ms)
 		WHERE excluded.occurred_at_ms > reactions.occurred_at_ms
 		   OR (
 			excluded.occurred_at_ms = reactions.occurred_at_ms
@@ -311,7 +311,7 @@ func (r *ReactionRepository) ReplaceEmbeddedReactions(
 				state = 'active',
 				occurred_at_ms = excluded.occurred_at_ms,
 				source_seq_ms = excluded.source_seq_ms,
-				updated_at_ms = excluded.updated_at_ms
+				updated_at_ms = MAX(reactions.updated_at_ms, excluded.updated_at_ms)
 			WHERE excluded.source_seq_ms > reactions.source_seq_ms
 			   OR (
 				excluded.source_seq_ms = reactions.source_seq_ms
@@ -387,7 +387,7 @@ func (r *ReactionRepository) ReplaceEmbeddedReactions(
 			state = 'removed',
 			occurred_at_ms = ?,
 			source_seq_ms = ?,
-			updated_at_ms = ?
+			updated_at_ms = MAX(updated_at_ms, ?)
 		WHERE `+strings.Join(conditions, " AND "), arguments...)
 	if err != nil {
 		return changes, fmt.Errorf(

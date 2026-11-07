@@ -386,6 +386,35 @@ func (s *v2Stack) Start(
 			s.logger.Error().Err(err).Msg("V2 ingest worker stopped")
 		}
 	}()
+	// Run retries a failed pass on its own and returns only on shutdown; the
+	// hook puts each failure in the log (and /api/status v2_dispatch counts
+	// them).
+	s.Service.OnPassFailure(func(err error, pass messaging.FailedDispatchPass) {
+		s.logger.Error().Err(err).
+			Int64("consecutive", pass.Consecutive).
+			Int64("retry_at_ms", pass.RetryAtMS).
+			Msg("V2 message dispatch pass failed; retrying")
+	})
+	// The store sets aside a due row whose lease fails on the row itself, to
+	// retry, and the rows behind it still send; the hook logs each such row
+	// (and /api/status v2_dispatch counts each failed lease). When the store
+	// cannot set the row aside either, its pass fails too, and the hook above
+	// logs that.
+	s.Service.OnLeaseFailure(func(lease messaging.FailedLease) {
+		if lease.SetAsideError != "" {
+			s.logger.Error().
+				Str("outbox_id", lease.OutboxID).
+				Str("error", lease.Error).
+				Str("set_aside_error", lease.SetAsideError).
+				Msg("Failed to lease V2 outbox item or set it aside; sending the rest")
+			return
+		}
+		s.logger.Warn().
+			Str("outbox_id", lease.OutboxID).
+			Str("error", lease.Error).
+			Int64("retry_at_ms", lease.RetryAtMS).
+			Msg("Failed to lease V2 outbox item; set it aside to retry")
+	})
 	go func() {
 		defer runWG.Done()
 		if err := s.Service.Run(runCtx); err != nil && !errors.Is(err, context.Canceled) {

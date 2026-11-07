@@ -48,7 +48,21 @@ var staticFS embed.FS
 // production.
 var maxUploadBytes int64 = messaging.DefaultMaxMediaBytes
 
-const maxTranscriptRequestBytes = db.MaxTranscriptBytes + db.MaxTranscriptModelBytes + 4096
+// maxTranscriptRequestBytes bounds an /api/transcript body. JSON escaping can
+// spend 6 bytes on one byte of text (Go's encoder writes "<" as \u003c), so
+// the bound leaves room for that on a transcript and model at their limits,
+// plus the message ID and the JSON around them. The handler checks the limits
+// themselves against the decoded text.
+const maxTranscriptRequestBytes = 6*(db.MaxTranscriptBytes+db.MaxTranscriptModelBytes) + 4096
+
+// transcriptsUnavailableInV2Primary is /api/transcript's refusal on a
+// v2-primary daemon. The v2 store keeps no transcripts (the legacy->v2
+// migration counts and drops them). This route writes the legacy store, but
+// the message reads that show transcripts (the conversation view and the MCP
+// read tools) serve v2, so none would show it, and they hand out v2 message
+// IDs.
+const transcriptsUnavailableInV2Primary = "transcripts are not available while v2 is the serving store: " +
+	"message reads come from the v2 store, which keeps no transcripts"
 
 const sseWriteTimeout = 5 * time.Second
 
@@ -2188,6 +2202,10 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			httpError(w, "method not allowed", 405)
 			return
 		}
+		if opts.V2Primary {
+			httpError(w, transcriptsUnavailableInV2Primary, http.StatusConflict)
+			return
+		}
 		r.Body = http.MaxBytesReader(w, r.Body, maxTranscriptRequestBytes)
 		var req struct {
 			MessageID  string  `json:"message_id"`
@@ -2228,14 +2246,16 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			httpError(w, "load message: "+err.Error(), 500)
 			return
 		}
-		if msg != nil {
-			publishMessages(msg.ConversationID)
-		}
-		writeJSON(w, map[string]any{
+		response := map[string]any{
 			"success":           true,
 			"message_id":        req.MessageID,
 			"transcript_length": utf8.RuneCountInString(*req.Transcript),
-		})
+		}
+		if msg != nil {
+			response["transcript_model"] = msg.TranscriptModel
+			publishMessages(msg.ConversationID)
+		}
+		writeJSON(w, response)
 	})
 
 	mux.HandleFunc("/api/new-conversation", func(w http.ResponseWriter, r *http.Request) {

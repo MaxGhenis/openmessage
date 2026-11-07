@@ -66,8 +66,24 @@ type Liveness struct {
 	Detail  string
 }
 
+// ConversationRef names the remote conversation an operation goes to. Kind,
+// Peers and Self describe the stored conversation the dispatcher bound to
+// RemoteID, so an adapter that looks the remote conversation up before sending
+// can check it still names the same people. A phone swap or restore reuses
+// Google's thread numbers for other people's threads, and the running app
+// rebinds a number only when live traffic proves the move, so a stale binding
+// would otherwise send to whoever the number names now.
 type ConversationRef struct {
 	RemoteID string
+	// Kind is the stored conversation's kind ("direct", "group", "broadcast",
+	// "system"). Empty means the dispatcher did not say.
+	Kind string
+	// Peers are the stored conversation's active participants other than
+	// this account, and Self are this account's own identities, each as Kind
+	// and Canonical (v2keys.IdentityKey). A ref without Kind or Peers asserts
+	// nothing about the remote conversation's roster.
+	Peers []IdentityRef
+	Self  []IdentityRef
 }
 
 // MessageRef names a stored message an operation refers to: a reaction or

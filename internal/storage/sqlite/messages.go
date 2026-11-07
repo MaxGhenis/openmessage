@@ -915,7 +915,7 @@ func (r *MessageRepository) upsertMessage(
 			reply_to_remote_id = excluded.reply_to_remote_id,
 			state = excluded.state,
 			occurred_at_ms = excluded.occurred_at_ms,
-			updated_at_ms = excluded.updated_at_ms
+			updated_at_ms = MAX(messages.updated_at_ms, excluded.updated_at_ms)
 		WHERE messages.sender_identity_id IS NOT excluded.sender_identity_id
 		   OR messages.direction IS NOT excluded.direction
 		   OR messages.body IS NOT excluded.body

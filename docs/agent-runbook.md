@@ -230,11 +230,80 @@ one is out, plus `abandoned_calls`, `abandoned_still_running` and
 returning at all. For Google, libgm now ends an abandoned call within its
 35 s timeout, so that count falls back on its own.
 
+`v2_dispatch` also counts dispatch passes that failed on the local store:
+`failed_passes` since the app started, `consecutive_failed_passes` since the
+last pass that worked (above zero, sends are failing now), and
+`last_failed_pass` (`at_ms`, `error`, `consecutive`, `retry_at_ms`). Each
+failure also logs `V2 message dispatch pass failed; retrying`. The loop retries
+after 1 s, doubling to 30 s while failures continue, and a lease that a failed
+pass left behind becomes dispatchable again when it expires (30 s), or
+`uncertain` if its transport call was made. Builds before PR #274 instead
+logged `V2 message dispatcher stopped` and sent nothing more until the app
+restarted; on 2026-11-03 a lease that failed the outbox's
+`updated_at_ms >= created_at_ms` CHECK stopped them that way.
+
 **On a build without the fix:** quit and reopen the app. Startup lease recovery
 marks the stuck row `uncertain` (its call was made, so it is not resent) and
 the queued rows dispatch. To tell whether the stuck message went out, look in
 its thread for an outgoing row with the same body after the send: that is the
 phone's echo, so it did.
+
+**One row whose lease always fails no longer holds the rows behind it.** The
+dispatcher leases its due rows in one transaction, in due order. Before
+PR #278, the first lease that failed rolled back the whole batch, and every
+pass met the same row first again. So with #274's retrying `Run`, every pass
+failed on that one row, and no text, media, reaction or read receipt due
+after it went out. Now `LeaseDueBatch` leases each row under its own
+savepoint. When the failure belongs to the row, it undoes that row's lease,
+sets the row aside and leases the rows behind it. A failure belongs to the
+row when SQLite refuses the write as a constraint (a CHECK, NOT NULL, STRICT
+type or trigger) or a value of the wrong type or size, when a trigger skips
+the write, or when the leased row's values don't read back. What you see:
+
+- `GET /api/v1/outbox` lists the row as `not_dispatched`, with `error_class`
+  `transient` and `error_code` `lease`. The store sets its
+  `next_attempt_at_ms` 5 s after the failure, and each further failed lease
+  doubles the delay, up to 5 minutes. After the clock steps back, the
+  doubling can restart lower, so the row retries sooner, never later.
+  `attempt_count` stays the same, because the row's transport call never
+  started. The stored `error_detail`, which the API doesn't return, holds
+  the lease's error (`lease outbox item "<id>": update: constraint failed:
+  …`). The UI's outbox tray shows a text, media or reaction row as
+  `Retrying…`, with Cancel; it doesn't list read receipts.
+- `v2_dispatch` counts each failed lease in `failed_leases` and shows the
+  latest in `last_failed_lease` (`outbox_id`, `at_ms`, `error`,
+  `retry_at_ms`). The pass itself succeeds, so `failed_passes` stays where
+  it was.
+- The backend logs `Failed to lease V2 outbox item; set it aside to retry`
+  (a zerolog warning, with `outbox_id`, `error` and `retry_at_ms`).
+- When the set-aside write fails too, the row stays as it was, still due.
+  `last_failed_lease` then carries `set_aside_error` and no `retry_at_ms`,
+  and the backend logs `Failed to lease V2 outbox item or set it aside;
+  sending the rest` (an error). A pass meets each such row once, however
+  many come first, and leases the rows after them. It sends every other due
+  row and then fails, so `failed_passes` climbs and `Run` backs off, 1 s
+  doubling to 30 s, before it meets the row again.
+- When a row's stored values don't read back (a NULL where the schema says
+  NOT NULL, say), the store sets it aside the same way, and the rows behind
+  it still send. But every read of that row fails while it exists:
+  `GET /api/v1/outbox` answers 500, so the tray can't load, and retry and
+  cancel fail on the row too. `last_failed_lease` and the log line still
+  name it. To clear it, repair the row in the store.
+- A failure that belongs to the store, not the row (busy, locked, I/O,
+  corruption, any other SQLite error), still fails the whole pass and leases
+  nothing, as before.
+
+Setting a row aside never resends a message. A due row has state `queued` or
+`not_dispatched`: its transport call never started, or the transport proved
+it sent nothing (`MarkCalledNotDispatched`). The set-aside keeps it that
+way, and a row whose call started (`dispatching` with
+`transport_called_at_ms`, or `uncertain`) never enters the due set.
+
+To clear a set-aside row, find out why its writes fail (`error` names the
+constraint or trigger) and fix that. Then `POST /api/v1/outbox/<id>/retry`
+makes the row due at once instead of at its retry time, and
+`POST /api/v1/outbox/<id>/cancel` drops it. If the cause remains, the next
+lease fails again and the delay starts over at 5 s.
 
 ## v2 cutover: conversation IDs re-key (issue #155)
 
@@ -278,6 +347,107 @@ Two more cutover artifacts worth knowing:
 curl -s http://127.0.0.1:7007/api/status | jq '.freshness'
 ```
 
+### The legacy store keeps taking writes on v2-primary
+
+Cutover moved the message-read tools to v2. It did not stop writes to
+`messages.db`, and some readers still use it: the web UI's People view
+(`/api/people`) loads its messages there with no v2-primary gate, and
+`list_contacts` and `resolve_contact_routes` look contacts and conversations
+up there. On a v2-primary daemon:
+
+- **Live transports write both stores.** The Google adapter hands each event
+  to v2 ingest (`teeIngress`) and then to the legacy `client.EventHandler`,
+  which stores it (`internal/bridgeadapters/google/google.go`). The Signal and
+  WhatsApp bridges capture each received message for v2 and then run their
+  legacy receive handlers (`signallive`: `observeIngress`, then
+  `handleDataMessage`; `whatsapplive.handleMessage`). A WhatsApp history sync
+  takes the same two steps (`captureHistorySyncIngress`, then
+  `handleHistorySync`).
+- **A failed v2 write leaves the legacy write in place.** Google logs `Google
+  ingest tee failed; continuing legacy event handling` and goes on. Signal
+  skips v2 when it has no sink and logs `Signal durable ingress tee failed;
+  legacy receive continued` when the append fails. WhatsApp stores a message
+  in legacy on its first delivery whether or not v2 committed it.
+- **Google catch-ups write both stores.** Every catch-up (startup, deep,
+  window and phone backfills, reconciles, pending-media refreshes) offers each
+  fetched message to v2's history ingress and then writes the legacy row
+  (`googleCatchUp.storeMessage` in `internal/app/google_history.go`).
+- **Local imports write only legacy.**
+  - `cmd/serve.go` runs a 30-second WhatsApp Desktop, Signal Desktop and
+    iMessage poll, off when `app.Sandboxed()`. The macOS launcher always sets
+    that flag (`OPENMESSAGES_APP_SANDBOX=1` in `BackendLauncherCore.swift`),
+    so the app never runs the poll.
+  - `cmd/serve.go` also runs a 30-minute Signal Desktop full rescan. It checks
+    only `SignalStatus().Paired`, which means signal-cli has an account, so
+    the app runs it even while signal-cli has no connection.
+  - MCP `import_messages` (every MCP server registers it, the stdio client
+    included) and `openmessage import` import into the legacy store.
+- **Other legacy-only writes.**
+  - Drafts and the `contacts` table live only in legacy. The cutover
+    migration turned `contacts` rows into v2 identities and
+    `unified_contacts` rows into v2 people.
+  - Transcripts live only in legacy, since v2 has no transcript columns. On
+    v2-primary, `set_message_transcript` and `/api/transcript` refuse (409 on
+    the HTTP route), because v2 reads would never show a transcript saved to
+    legacy. A legacy-primary install saves them there.
+  - The web UI keeps some of its state there: the tab list (`/api/tabs`) and
+    the People view's tags, reach-out reminders and summaries.
+    `/api/new-conversation` writes a legacy conversation row for a new
+    WhatsApp or Signal thread.
+  - An MCP server inside a process that runs the transports (`serve
+    --mcp-sse`, or `--mcp-stdio --transports`) upserts a legacy conversation
+    row before `send_message` or `send_group_message` queues a send on v2.
+    The stdio client in "MCP config" below writes no such row: it submits
+    through the app's outbox API, and the app itself (`serve --web`) serves no
+    MCP.
+- **The web UI's per-conversation writes change nothing it shows.** The
+  conversation list on v2-primary carries v2 conversation IDs and reads
+  favorites and notification modes from v2. The favorite, notification-mode,
+  tab, move and mark-read handlers write the legacy row with the ID the UI
+  sends (`internal/web/api.go`). On Max's install no legacy conversation ID
+  matches a v2 one, so favorite answers 404, notification mode and tab answer
+  500, and move and mark-read answer 200 and change nothing. The UI never
+  posts mark-read there anyway, since v2 reads always report an unread count
+  of 0. Don't post mark-read with a legacy ID there either. Its copy into v2
+  (`v2wire.MirrorReadCursor`) rewrites the v2 account's bridge key and
+  display name before it fails. Google's `google_messages` becomes `google`,
+  so v2 reads then report `google` instead of `sms` as each Google thread's
+  platform, and the Google echo-duplicate repair
+  (`RepairUncorrelatedEchoDuplicates`) skips the account. PR #217 proposes
+  the fix.
+- **Nothing copies v2 into legacy.** The v2 → legacy projector runs only on
+  legacy-primary (`cmd/v2stack.go`). A send through the v2 outbox reaches
+  `messages.db` only if another writer brings it back, such as Google's echo
+  and catch-ups, a WhatsApp history sync that carries it, or a desktop import
+  that finds it in the desktop app's database.
+
+So the two stores differ in both directions, and a reader of `messages.db` on
+a v2-primary install sees a different history from the read tools. That is
+one reason the stats/story/viz MCP tools refuse to run there
+(`unavailableWhileV2Serving`). `projection_stalled` (`addProjectionLag` in
+`internal/web/api.go`) compares the newest message in each store and flags a
+platform whose legacy side runs more than 5 minutes ahead, or that has legacy
+rows and none in v2. So it relies on these writes, and a local import alone
+can set it with no v2 stall.
+
+The difference can be large. On Max's install the v2 Signal inbox took no
+frame for 63.6 days, from 2026-08-18 to 2026-10-21, and v2 holds no Signal
+message from that span. Legacy holds 2,464 from it, in 36 conversations, and
+since 2026-07-19 legacy holds 3,092 Signal messages that v2 lacks (read-only
+counts, 2026-11-03). Legacy stored 2,372 of those 2,464 in five blocks of
+consecutive rows, each covering hours to weeks of messages. A Signal Desktop
+import wrote at least the last block's 1,063 gap messages, sent from
+2026-09-27. They went in on 2026-10-21 before 13:05. The app reported Signal
+unpaired from at least 2026-10-08 until about 11:40 that day (the watchdog's
+log), so signal-cli received nothing in that span. After that it fed v2,
+which took no burst and holds none of them. A Desktop import writes legacy
+only, so v2 reads never show a message that only Signal Desktop received
+after cutover (the cutover migration copied the earlier ones). Draft #234
+proposes a v2 feed for Signal Desktop history, but as written it appends
+only while signal-cli has no account, has stayed offline for five minutes or
+has gone silent, so while signal-cli keeps receiving it won't back-fill this
+span. Draft #231 proposes keeping the local imports off on v2-primary.
+
 ## Google thread ids are device-local: phone swaps re-key everything
 
 Google Messages conversation and message ids are the phone's own row ids, not
@@ -307,6 +477,57 @@ are re-linked by peer when their thread shows up under its new id. Watch
 `v2_ingest.per_account.<account>.remote_rebinds` and `content_dupes_skipped`
 in `/api/status` — a burst right after a re-pair is the fix working, not a
 fault.
+
+**The Google adapter refuses a send to a thread number the phone has moved.**
+The running app rebinds a thread only on live traffic, so long after a swap v2
+can still bind a thread to a number the phone now uses for someone else's
+thread. On 2026-11-03 a read-only check of Max's install found 19 such
+threads: each number's post-swap messages came only from people outside the
+bound thread's roster.
+The Google adapter sends to the bound number, so a text in one of those
+threads would go to the other person. The adapter already looks the thread up
+before every text, media and reaction send, and now compares the phone's
+participants with the stored thread's roster using the rule history applies to
+stale bindings (`ingest.CheckSendTarget`). The kinds must agree, a direct
+thread's peers must match exactly, and a group must keep at least one member.
+A thread with no stored roster, or a phone answer naming only this account,
+proves nothing and sends. On a contradiction nothing goes out:
+
+- the outbox row ends `rejected`, with `error_class: recipient_mismatch` and
+  `error_code` `send_text`, `send_media` or `send_reaction`. The dispatcher
+  never retries it, and the adapter refuses media before uploading it;
+- the log says `Refused a Google send: the phone's thread for this conversation
+  now names other people`, with counts of each side's people;
+- the refusal leaves the receive lifecycle alone, since the phone answered.
+
+While the app runs, only live traffic moves a thread to its new number. A
+catch-up or backfill never does, because history never moves a binding. A
+direct thread usually moves when its peer's next message arrives live
+(`googleIncomingConversation`) or when the phone pushes a live update for a
+thread with that peer alone (`googleConversationEventTarget`), and sends work
+again. A live message leaves the binding alone when v2 binds its number to a
+group, or to a direct thread with no stored peers or with the sender already
+in it. When the peer has more than one direct thread, the most recently active
+one takes the number. A group moves when the phone pushes a live update for a
+thread whose members match the group's exactly. Until then, send from the
+phone. With the app stopped, `openmessage repair google-idspace` (below) can
+also move a binding when its plan includes a `rebind` step.
+
+The check leaves three gaps:
+
+- **Groups that share a member.** A group bound to a number that now names
+  another group with at least one of its members still sends there. The send
+  check keeps ingest's rule on purpose, and a differential test holds the two
+  together: group membership changes legitimately, and a stricter rule for
+  sends alone would refuse threads that ingest treats as the same group.
+- **Reactions to old messages.** A reaction names its target by message ID
+  alone (Google's `SendReactionRequest` carries no thread). Every message
+  stored before the swap keeps the old phone's ID: ingest skips a re-served
+  text copy as a duplicate of the stored row, stores a media-only copy as a
+  new row, and never rewrites a stored message's ID. A reaction to one of
+  those messages lands on whatever message the ID names on the new phone, even
+  in a thread whose binding the check accepts.
+- **Read receipts** don't look the thread up, so the check doesn't cover them.
 
 **Repairing history after a reset** (daemon must be down — the command takes
 the instance lock and refuses while `/api/status` answers; park the watchdog
@@ -807,6 +1028,14 @@ running app:
   #140, with the same do-not-resend idempotency contract. With the app closed,
   send tools return an actionable "start the OpenMessage app" error — they
   never fall back to opening their own connections.
+- **Transcripts save through the daemon too** (`/api/transcript`), so
+  `set_message_transcript` never writes the live `messages.db` from the
+  client. `draft_message` and `import_messages` still write it from the
+  client. On a v2-primary install `set_message_transcript` refuses, in the
+  client and in the app: transcripts live only in the legacy store (the v2
+  store has no place for them, and `migrate` counts and drops them), and the
+  message reads that show transcripts, the read tools and the web UI's
+  conversation view, serve v2 there, so none would show one saved to legacy.
 - Escape hatches: `--transports` forces the old standalone full-stack stdio
   behavior (only for machines where the MCP process is the *only* OpenMessage
   process, ever); `--no-transports` strips transports from a **legacy-mode**
@@ -831,10 +1060,12 @@ running app:
 
 Pin `OPENMESSAGES_DATA_DIR` to the app's dir so reads, the control token, and
 daemon-truth detection all line up (two-data-dirs trap above). On a migrated
-(v2-primary) install, also set `OPENMESSAGES_V2_PRIMARY=1` — the legacy
-`messages.db` froze at cutover, and this keeps MCP reads on the v2 store even
-when the app is closed or predates the `auth.data_dir` status field (drop the
-line on a non-migrated install).
+(v2-primary) install, also set `OPENMESSAGES_V2_PRIMARY=1`. The message-read
+tools serve the v2 store there, and the legacy `messages.db` keeps taking
+writes but differs from v2 (see "The legacy store keeps taking writes on
+v2-primary" above), so this keeps MCP reads on the v2 store even when the app
+isn't running or predates the `auth.data_dir` status field (drop the line on
+a non-migrated install).
 
 **Run the app's own binary, not a copy.** The MCP client opens the same SQLite
 stores as the app, and a binary at a different schema version than the store

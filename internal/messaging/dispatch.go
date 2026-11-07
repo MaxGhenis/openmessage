@@ -13,42 +13,49 @@ import (
 	"github.com/maxghenis/openmessage/internal/storage/sqlite"
 )
 
-// Run recovers expired work once at startup and then periodically dispatches
-// due durable intents until ctx is canceled.
+// Run dispatches due durable intents in passes until ctx is canceled, and
+// returns only then. Each pass recovers expired leases, repairs store-failed
+// confirmations and dispatches what is due.
+//
+// A pass that fails on local storage does not end Run. On 2026-11-03 one
+// failed lease UPDATE returned from Run, and nothing left the outbox again
+// until the app restarted. Run now records the failure (DispatchHealth and the
+// OnPassFailure hook), waits a backoff that starts at the poll delay and
+// doubles up to the longest poll delay, and tries again. A lease the failed
+// pass left behind expires, and the next pass's recovery makes it dispatchable
+// again, or uncertain if its transport call was made.
 func (s *MessageService) Run(ctx context.Context) error {
 	if ctx == nil {
 		return fmt.Errorf("run message service: context is nil")
 	}
-	recovered, err := s.outbox.RecoverExpiredLeases(ctx, s.clock.Now())
-	if err != nil {
-		// Cancellation mid-query surfaces as a driver interrupt, not
-		// context.Canceled, so a shutdown race would read as a startup fault.
-		// As in DispatchDue's lease path, surface the cancellation itself.
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return ctxErr
-		}
-		return fmt.Errorf("run message service: recover expired leases: %w", err)
-	}
-	if recovered.NotDispatched > 0 || recovered.Uncertain > 0 {
-		s.signalChange()
-	}
-
+	var backoff time.Duration
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if _, err := s.reconcileStoreFailedDue(ctx, s.batchLimit); err != nil {
+		if err := s.dispatchPass(ctx); err != nil {
+			// Cancellation mid-query surfaces as a driver interrupt, not
+			// context.Canceled, so a shutdown race would read as a failed
+			// pass. As in DispatchDue's lease path, surface the cancellation
+			// itself.
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return ctxErr
 			}
-			return fmt.Errorf("run message service: reconcile store-failed deliveries: %w", err)
-		}
-		if _, err := s.DispatchDue(ctx, s.batchLimit); err != nil {
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				return ctxErr
+			backoff = nextPassBackoff(backoff, s.pollDelay, s.maxPollDelay)
+			s.passes.fail(fmt.Errorf("run message service: %w", err), s.clock.Now(), backoff)
+			// Only time ends the backoff: a wake from a new submission would
+			// turn a storage fault that persists into a tight retry loop.
+			timer := s.clock.NewTimer(backoff)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return ctx.Err()
+			case <-timer.C():
 			}
-			return fmt.Errorf("run message service: %w", err)
+			continue
 		}
+		backoff = 0
+		s.passes.succeed()
 
 		timer := s.clock.NewTimer(s.nextPollDelay(ctx))
 		select {
@@ -62,9 +69,53 @@ func (s *MessageService) Run(ctx context.Context) error {
 	}
 }
 
+// dispatchPass is one round of Run. It recovers expired leases on every pass,
+// not only at startup, so a lease that a failed pass or a crashed process left
+// behind is freed once it expires. Recovery never causes a resend: passes run
+// one at a time, a pass stops waiting on a call past its bound and marks its
+// intent uncertain, and recovery requeues only a lease whose transport call
+// never started (MarkTransportCalled commits before every call); a lease whose
+// call started becomes uncertain.
+func (s *MessageService) dispatchPass(ctx context.Context) error {
+	recovered, err := s.outbox.RecoverExpiredLeases(ctx, s.clock.Now())
+	if err != nil {
+		return fmt.Errorf("recover expired leases: %w", err)
+	}
+	if recovered.NotDispatched > 0 || recovered.Uncertain > 0 {
+		s.signalChange()
+	}
+	if _, err := s.reconcileStoreFailedDue(ctx, s.batchLimit); err != nil {
+		return fmt.Errorf("reconcile store-failed deliveries: %w", err)
+	}
+	if _, err := s.DispatchDue(ctx, s.batchLimit); err != nil {
+		return err
+	}
+	return nil
+}
+
+// nextPassBackoff is how long Run waits after a failed pass: the shortest
+// poll delay after the first failure, doubling with each failure in a row up
+// to the longest poll delay.
+func nextPassBackoff(previous, shortest, longest time.Duration) time.Duration {
+	if shortest <= 0 {
+		shortest = defaultPollDelay
+	}
+	longest = max(longest, shortest)
+	if previous < shortest {
+		return shortest
+	}
+	return min(previous*2, longest)
+}
+
 // DispatchDue claims and synchronously processes at most limit due intents.
 // Transport failures become durable states; only local state-machine failures
 // are returned.
+//
+// A due intent whose lease fails on its own row does not hold the others:
+// LeaseDueBatch sets it aside and leases the rows after it, and DispatchDue
+// records it (DispatchHealth and the OnLeaseFailure hook). A row the store
+// could not set aside either stays due, so DispatchDue sends the rest and then
+// returns an error naming it, and Run backs off before it meets that row again.
 func (s *MessageService) DispatchDue(ctx context.Context, limit int) (int, error) {
 	if ctx == nil {
 		return 0, fmt.Errorf("dispatch due messages: context is nil")
@@ -72,7 +123,7 @@ func (s *MessageService) DispatchDue(ctx context.Context, limit int) (int, error
 	if limit <= 0 {
 		return 0, fmt.Errorf("dispatch due messages: limit must be positive")
 	}
-	leases, err := s.outbox.LeaseDue(ctx, sqlite.LeaseRequest{
+	batch, err := s.outbox.LeaseDueBatch(ctx, sqlite.LeaseRequest{
 		Owner:    workerOwner,
 		Now:      s.clock.Now(),
 		Duration: s.leaseTime,
@@ -88,11 +139,13 @@ func (s *MessageService) DispatchDue(ctx context.Context, limit int) (int, error
 		}
 		return 0, fmt.Errorf("lease due messages: %w", err)
 	}
+	stuck := s.recordFailedLeases(batch.Failed)
 
+	leases := batch.Leases
 	processed := 0
 	for index, lease := range leases {
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			return processed, errors.Join(ctxErr, s.releaseUntouched(ctx, leases[index:]))
+			return processed, errors.Join(ctxErr, s.releaseUntouched(ctx, leases[index:]), stuck)
 		}
 		if lease.LeaseExpiresAtMS != nil && *lease.LeaseExpiresAtMS <= s.clock.Now().UnixMilli() {
 			mutationCtx, cancel := s.storageMutationContext(ctx)
@@ -102,7 +155,7 @@ func (s *MessageService) DispatchDue(ctx context.Context, limit int) (int, error
 				s.signalChange()
 			}
 			if recoverErr != nil {
-				return processed, fmt.Errorf("recover leases expired during dispatch: %w", recoverErr)
+				return processed, errors.Join(fmt.Errorf("recover leases expired during dispatch: %w", recoverErr), stuck)
 			}
 			break
 		}
@@ -123,11 +176,40 @@ func (s *MessageService) DispatchDue(ctx context.Context, limit int) (int, error
 			))
 		}
 		if dispatchErr != nil {
-			return processed, errors.Join(dispatchErr, s.releaseUntouched(ctx, leases[index+1:]))
+			return processed, errors.Join(dispatchErr, s.releaseUntouched(ctx, leases[index+1:]), stuck)
 		}
 		processed++
 	}
-	return processed, nil
+	return processed, stuck
+}
+
+// recordFailedLeases records each due row whose lease failed on its own row
+// and returns an error naming the rows the store could not set aside either.
+func (s *MessageService) recordFailedLeases(failed []sqlite.LeaseFailure) error {
+	if len(failed) == 0 {
+		return nil
+	}
+	now := s.clock.Now()
+	var stuck []error
+	setAside := false
+	for _, failure := range failed {
+		s.leaseFailures.fail(failure, now)
+		if failure.SetAsideErr != nil {
+			stuck = append(stuck, fmt.Errorf(
+				"could neither lease outbox item %q (%w) nor set it aside (%w)",
+				failure.OutboxID, failure.Err, failure.SetAsideErr,
+			))
+			continue
+		}
+		setAside = true
+	}
+	if setAside {
+		s.signalChange()
+	}
+	if len(stuck) == 0 {
+		return nil
+	}
+	return fmt.Errorf("lease due messages: %w", errors.Join(stuck...))
 }
 
 func (s *MessageService) dispatchTextLease(ctx context.Context, outboxLease sqlite.Lease) error {
@@ -204,6 +286,18 @@ func (s *MessageService) dispatchTextLease(ctx context.Context, outboxLease sqli
 		)
 	}
 
+	conversationRef, err := s.conversationRef(conversation)
+	if err != nil {
+		return s.markPreCallFailure(
+			ctx,
+			item,
+			string(bridge.FailureTransient),
+			"load_roster",
+			err,
+			s.clock.Now().Add(s.retryDelay),
+		)
+	}
+
 	if err := s.outbox.MarkTransportCalled(ctx, sqlite.Attempt{
 		OutboxID:             item.OutboxID,
 		LeaseToken:           *item.LeaseToken,
@@ -219,12 +313,10 @@ func (s *MessageService) dispatchTextLease(ctx context.Context, outboxLease sqli
 	s.signalChange()
 
 	request := bridge.TextRequest{
-		AccountID: item.AccountID,
-		Conversation: bridge.ConversationRef{
-			RemoteID: conversation.RemoteConversationID,
-		},
-		Body:      message.Body,
-		RequestID: item.TransportRequestID,
+		AccountID:    item.AccountID,
+		Conversation: conversationRef,
+		Body:         message.Body,
+		RequestID:    item.TransportRequestID,
 	}
 	request.ReplyTo = replyTo
 	closeLease = false
@@ -363,6 +455,18 @@ func (s *MessageService) dispatchMediaLease(ctx context.Context, outboxLease sql
 		)
 	}
 
+	conversationRef, err := s.conversationRef(conversation)
+	if err != nil {
+		return s.markPreCallFailure(
+			ctx,
+			item,
+			string(bridge.FailureTransient),
+			"load_roster",
+			err,
+			s.clock.Now().Add(s.retryDelay),
+		)
+	}
+
 	attachment, err := s.outbox.GetOutboxAttachment(ctx, item.OutboxID)
 	if err != nil {
 		return s.markPreCallFailure(
@@ -418,16 +522,14 @@ func (s *MessageService) dispatchMediaLease(ctx context.Context, outboxLease sql
 	s.signalChange()
 
 	request := bridge.MediaRequest{
-		AccountID: item.AccountID,
-		Conversation: bridge.ConversationRef{
-			RemoteID: conversation.RemoteConversationID,
-		},
-		Reader:    reader,
-		Size:      attachment.SizeBytes,
-		Filename:  attachment.Filename,
-		MIME:      attachment.MIME,
-		Caption:   message.Body,
-		RequestID: item.TransportRequestID,
+		AccountID:    item.AccountID,
+		Conversation: conversationRef,
+		Reader:       reader,
+		Size:         attachment.SizeBytes,
+		Filename:     attachment.Filename,
+		MIME:         attachment.MIME,
+		Caption:      message.Body,
+		RequestID:    item.TransportRequestID,
 	}
 	request.ReplyTo = replyTo
 	closeReader = false
@@ -608,6 +710,18 @@ func (s *MessageService) dispatchReactionLease(ctx context.Context, outboxLease 
 		)
 	}
 
+	conversationRef, err := s.conversationRef(conversation)
+	if err != nil {
+		return s.markPreCallFailure(
+			ctx,
+			item,
+			string(bridge.FailureTransient),
+			"load_roster",
+			err,
+			s.clock.Now().Add(s.retryDelay),
+		)
+	}
+
 	if err := s.outbox.MarkTransportCalled(ctx, sqlite.Attempt{
 		OutboxID:             item.OutboxID,
 		LeaseToken:           *item.LeaseToken,
@@ -623,14 +737,12 @@ func (s *MessageService) dispatchReactionLease(ctx context.Context, outboxLease 
 	s.signalChange()
 
 	reactionRequest := bridge.ReactionRequest{
-		AccountID: item.AccountID,
-		Conversation: bridge.ConversationRef{
-			RemoteID: conversation.RemoteConversationID,
-		},
-		Target:    target,
-		Emoji:     reaction.Emoji,
-		Action:    bridge.ReactionAction(reaction.Action),
-		RequestID: item.TransportRequestID,
+		AccountID:    item.AccountID,
+		Conversation: conversationRef,
+		Target:       target,
+		Emoji:        reaction.Emoji,
+		Action:       bridge.ReactionAction(reaction.Action),
+		RequestID:    item.TransportRequestID,
 	}
 	closeLease = false
 	result, sendErr := callTransport(s, ctx, item, reactionOperation, s.transportTimeout,
@@ -1191,6 +1303,41 @@ func (s *MessageService) markSendUncertain(
 	return nil
 }
 
+// conversationRef describes the stored conversation an operation goes to: its
+// remote ID, kind and roster, plus this account's own identities, so an
+// adapter that looks the remote conversation up first can refuse one that now
+// names other people.
+func (s *MessageService) conversationRef(conversation sqlite.Conversation) (bridge.ConversationRef, error) {
+	peers, err := s.roster.ListConversationPeerIdentities(conversation.AccountID, conversation.ConversationID)
+	if err != nil {
+		return bridge.ConversationRef{}, err
+	}
+	self, err := s.roster.ListSelfIdentities(conversation.AccountID)
+	if err != nil {
+		return bridge.ConversationRef{}, err
+	}
+	return bridge.ConversationRef{
+		RemoteID: conversation.RemoteConversationID,
+		Kind:     string(conversation.Kind),
+		Peers:    identityKeyRefs(peers),
+		Self:     identityKeyRefs(self),
+	}, nil
+}
+
+// identityKeyRefs carries identities' natural keys only: an adapter compares
+// them, and has no use for names or raw addresses.
+func identityKeyRefs(identities []sqlite.Identity) []bridge.IdentityRef {
+	refs := make([]bridge.IdentityRef, 0, len(identities))
+	for _, identity := range identities {
+		refs = append(refs, bridge.IdentityRef{
+			Kind:      string(identity.Kind),
+			Canonical: identity.CanonicalValue,
+			IsSelf:    identity.IsSelf,
+		})
+	}
+	return refs
+}
+
 func retryableFailure(class bridge.FailureClass) bool {
 	switch class {
 	case bridge.FailureTransient,
@@ -1208,7 +1355,8 @@ func terminalFailure(class bridge.FailureClass) bool {
 		bridge.FailureReauthRequired,
 		bridge.FailureUpgradeRequired,
 		bridge.FailureMisconfigured,
-		bridge.FailureUnsupported:
+		bridge.FailureUnsupported,
+		bridge.FailureRecipientMismatch:
 		return true
 	default:
 		return false

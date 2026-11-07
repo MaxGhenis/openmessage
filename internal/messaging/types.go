@@ -193,3 +193,9 @@ type messageRepository interface {
 	) (sqlite.Message, error)
 	FirstAttachmentMIME(ctx context.Context, messageID string) (string, bool, error)
 }
+
+// rosterRepository loads the identities a send's ConversationRef carries.
+type rosterRepository interface {
+	ListConversationPeerIdentities(accountID, conversationID string) ([]sqlite.Identity, error)
+	ListSelfIdentities(accountID string) ([]sqlite.Identity, error)
+}
