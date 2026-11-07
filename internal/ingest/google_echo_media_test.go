@@ -165,6 +165,11 @@ func (h *googleEchoHarness) dropSentAttachments(t *testing.T) {
 		t.Fatalf("sql.Open(): %v", err)
 	}
 	defer db.Close()
+	// One connection, so it waits for the harness's writers as the store's do.
+	db.SetMaxOpenConns(1)
+	if _, err := db.Exec(`PRAGMA busy_timeout = 5000`); err != nil {
+		t.Fatalf("set busy timeout: %v", err)
+	}
 	if _, err := db.Exec(`
 		DELETE FROM message_attachments
 		WHERE message_id IN (SELECT local_message_id FROM outbox WHERE kind = 'media')
@@ -197,17 +202,18 @@ func TestGoogleImageEchoMergesIntoTheSentImage(t *testing.T) {
 }
 
 // A captioned image is two messages on the phone: the image, then the
-// caption. The sent message shows both until the caption's echo arrives, then
-// the caption is its own message, whichever echo comes first.
+// caption, which the Google adapter sends trimmed. The sent message shows both,
+// the caption as typed, until the caption's echo arrives, then the caption is
+// its own message, whichever echo comes first.
 func TestGoogleCaptionEchoBecomesItsOwnMessage(t *testing.T) {
 	for _, captionFirst := range []bool{false, true} {
 		t.Run(fmt.Sprintf("captionFirst=%v", captionFirst), func(t *testing.T) {
 			h := newGoogleEchoHarness(t, nil)
-			send := h.sendImageAt(t, "captioned", "  look at this ", googleEchoNow, googleEchoNow.Add(time.Second))
-			if len(h.sender.captions) != 1 || h.sender.captions[0] != "look at this" {
-				t.Fatalf("captions sent = %q, want the trimmed caption", h.sender.captions)
+			send := h.sendImageAt(t, "captioned", "  look at this\n", googleEchoNow, googleEchoNow.Add(time.Second))
+			if len(h.sender.captions) != 1 || h.sender.captions[0] != "  look at this\n" {
+				t.Fatalf("captions sent = %q, want the caption as typed", h.sender.captions)
 			}
-			assertShowsSentImage(t, h, send.LocalMessageID, "look at this")
+			assertShowsSentImage(t, h, send.LocalMessageID, "  look at this\n")
 
 			image := func(at time.Duration) { h.imageEcho(t, "89928", complete, googleEchoNow.Add(at)) }
 			caption := func(at time.Duration) { h.echo(t, "89929", "look at this", complete, googleEchoNow.Add(at)) }
@@ -265,32 +271,37 @@ func TestGoogleEchoKindsNeverCross(t *testing.T) {
 
 // Images sent before this fix: the sent message has no attachment and the
 // echo projected beside it. The startup repair gives the message its image,
-// merges the echo into it and moves any caption out, once.
+// merges the echo into it and moves any caption out, once. A caption of only
+// whitespace never goes out, so it stays.
 func TestRepairMergesImageEchoesIntoSentImages(t *testing.T) {
 	h := newGoogleEchoHarnessWithObserver(t, nil, preFixObserver)
 	plain := h.sendImageAt(t, "plain", "", googleEchoNow, googleEchoNow)
 	h.imageEcho(t, "92001", complete, googleEchoNow.Add(511*time.Millisecond))
-	captioned := h.sendImageAt(t, "captioned", "here", googleEchoNow.Add(time.Minute), googleEchoNow.Add(time.Minute))
+	captioned := h.sendImageAt(t, "captioned", " here\n", googleEchoNow.Add(time.Minute), googleEchoNow.Add(time.Minute))
 	h.imageEcho(t, "92002", complete, googleEchoNow.Add(time.Minute+453*time.Millisecond))
 	h.echo(t, "92003", "here", complete, googleEchoNow.Add(time.Minute+600*time.Millisecond))
+	blank := h.sendImageAt(t, "blank", " \n ", googleEchoNow.Add(2*time.Minute), googleEchoNow.Add(2*time.Minute))
+	h.imageEcho(t, "92004", complete, googleEchoNow.Add(2*time.Minute+387*time.Millisecond))
 	h.dropSentAttachments(t)
-	if got := h.countV2Messages(t); got != 5 {
+	if got := h.countV2Messages(t); got != 7 {
 		t.Fatalf("messages before repair = %d, want each send beside its echoes", got)
 	}
 
 	report, err := h.service.RepairUncorrelatedEchoDuplicates(context.Background())
-	if err != nil || report.Attached != 2 || report.Merged != 3 || report.Failed != 0 {
-		t.Fatalf("repair = %+v, %v; want 2 attached and 3 pairs (two images, one caption)", report, err)
+	if err != nil || report.Attached != 3 || report.Merged != 4 || report.Failed != 0 {
+		t.Fatalf("repair = %+v, %v; want 3 attached and 4 pairs (three images, one caption)", report, err)
 	}
 	h.assertBound(t, plain, "92001")
 	h.assertBound(t, captioned, "92002")
+	h.assertBound(t, blank, "92004")
 	assertShowsSentImage(t, h, plain.LocalMessageID, "")
 	assertShowsSentImage(t, h, captioned.LocalMessageID, "")
+	assertShowsSentImage(t, h, blank.LocalMessageID, " \n ")
 	if got := h.shown(t, h.messageWithRemoteID(t, "92003")); got.body != "here" || len(got.attachments) != 0 {
 		t.Fatalf("caption message shows %q %v, want the caption alone", got.body, got.attachments)
 	}
-	if got := h.countV2Messages(t); got != 3 {
-		t.Fatalf("messages after repair = %d (%v), want two images and a caption", got, h.remoteIDs(t))
+	if got := h.countV2Messages(t); got != 4 {
+		t.Fatalf("messages after repair = %d (%v), want three images and a caption", got, h.remoteIDs(t))
 	}
 
 	if again, err := h.service.RepairUncorrelatedEchoDuplicates(context.Background()); err != nil || again != (sqlite.EchoDuplicateRepairReport{}) {
@@ -304,7 +315,8 @@ func TestRepairMergesImageEchoesIntoSentImages(t *testing.T) {
 // received 0.2-0.8 s after its confirm, or (outran) that long before it with
 // a DELIVERED re-delivery after; a caption's echo follows its image's by
 // 30-230 ms. Captions and texts share their words, so a caption must be told
-// from a text by timing alone.
+// from a text by timing alone. A sent caption may be typed with whitespace
+// around it, which its echo lacks.
 type mediaEchoScenario struct {
 	events []mediaEchoEvent
 }
@@ -313,7 +325,8 @@ type mediaEchoEvent struct {
 	fromApp bool
 	image   bool
 	outran  bool
-	body    string // a text's body or an image's caption
+	body    string // a text's body or an image's caption, as it echoes
+	typed   string // a sent image's caption as typed
 	at      time.Duration
 	lag     time.Duration
 	gap     time.Duration // caption echo after the image's
@@ -324,6 +337,7 @@ func (mediaEchoScenario) Generate(r *rand.Rand, _ int) reflect.Value {
 	var scenario mediaEchoScenario
 	at := time.Duration(0)
 	words := []string{"ok", "on my way"}
+	pads := []string{"", " ", "\n "}
 	for i := 0; i < n; i++ {
 		at += time.Duration(2+r.Intn(40)) * time.Second
 		event := mediaEchoEvent{
@@ -337,6 +351,9 @@ func (mediaEchoScenario) Generate(r *rand.Rand, _ int) reflect.Value {
 		}
 		if event.image && (!event.fromApp || r.Intn(2) == 0) {
 			event.body = "" // phone images, and half the sent ones, have no caption
+		}
+		if event.image && event.body != "" {
+			event.typed = pads[r.Intn(len(pads))] + event.body + pads[r.Intn(len(pads))]
 		}
 		scenario.events = append(scenario.events, event)
 	}
@@ -375,7 +392,7 @@ func runMediaEchoScenario(t *testing.T, scenario mediaEchoScenario, viaRepair bo
 	enqueue := func(i int, event mediaEchoEvent) messaging.Submission {
 		key := fmt.Sprintf("send-%d", i)
 		if event.image {
-			return h.enqueueImage(t, key, event.body)
+			return h.enqueueImage(t, key, event.typed)
 		}
 		submission, _ := h.enqueue(t, key, event.body)
 		return submission

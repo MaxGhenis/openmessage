@@ -139,7 +139,11 @@ func validateTarget(
 
 	report.Validation.BlobReferencesValid, report.Media.ScheduledBlobsVerified =
 		validateScheduledBlobs(ctx, database, options.TempBlobPath, state.scheduledBlobs)
-	report.Media.PendingAttachments = report.Target.Counts["message_attachments"]
+	// A scheduled media send's queued message carries the image it will send
+	// (see sqlite.OutboxRepository.EnqueueOutgoingMediaMessage), so the table
+	// holds one row per legacy attachment, pending its remote copy, plus one
+	// per scheduled media send, already downloaded.
+	report.Media.PendingAttachments = report.Target.Counts["message_attachments"] - state.expectedPendingMedia
 	report.Schedule.PendingMedia = state.expectedPendingMedia
 
 	unchanged, evidenceErr := completeSourceFileEvidence(&report.Source)
@@ -186,7 +190,7 @@ func fillTableReconciliations(
 	add("conversations", int64(len(dataset.conversations)), report.Target.Counts["conversations"], report.Target.Counts["conversations"], "migrated")
 	add("conversation_participants", state.expectedParticipants, report.Target.Counts["conversation_participants"], report.Target.Counts["conversation_participants"], "derived")
 	add("messages", int64(len(dataset.messages)), actualHistory, actualHistory, "migrated_history")
-	add("message_attachments", dataset.mediaRows, report.Target.Counts["message_attachments"], report.Target.Counts["message_attachments"], "pending_remote_ref")
+	add("message_attachments", dataset.mediaRows+state.expectedPendingMedia, report.Target.Counts["message_attachments"], report.Target.Counts["message_attachments"], "pending_remote_ref_or_scheduled_media_blob")
 	add("contacts", int64(len(dataset.contacts)), int64(len(state.contactIdentityKeys)), state.contactRowsMapped, "address_book_identities")
 	add("unified_contacts", int64(len(dataset.unified)), report.Target.Counts["people"], report.Target.Counts["people"], "people")
 	add("scheduled_messages", int64(len(dataset.scheduled)), report.Target.Counts["outbox"], int64(len(dataset.scheduled)), "mapped_or_counted_skip")
@@ -332,7 +336,7 @@ func countsMatch(
 		report.Target.Counts["person_identities"] != state.expectedLinks ||
 		report.Target.Counts["conversations"] != int64(len(dataset.conversations)) ||
 		report.Target.Counts["conversation_participants"] != state.expectedParticipants ||
-		report.Target.Counts["message_attachments"] != dataset.mediaRows ||
+		report.Target.Counts["message_attachments"] != dataset.mediaRows+state.expectedPendingMedia ||
 		report.Target.Counts["outbox"] != dataset.scheduleByStatus["pending"] ||
 		report.Target.Counts["outbox_attachments"] != state.expectedPendingMedia ||
 		report.Target.Counts["read_cursors"] != state.expectedCursors ||

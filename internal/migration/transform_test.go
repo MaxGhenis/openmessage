@@ -528,7 +528,7 @@ func assertFixtureReport(t *testing.T, report Report, sourceHash string) {
 	wantTargetCounts := map[string]int64{
 		"accounts": 5, "devices": 5, "people": 1, "person_identities": 2,
 		"conversations": 6, "inbox": 0, "messages": 14,
-		"message_attachments": 3, "outbox": 2, "outbox_attachments": 1,
+		"message_attachments": 4, "outbox": 2, "outbox_attachments": 1,
 		"read_cursors": 6, "reactions": 1, "reaction_snapshot_fences": 0,
 	}
 	for table, want := range wantTargetCounts {
@@ -963,6 +963,20 @@ func assertFixtureSchedules(t *testing.T, database *sql.DB, blobRoot string, sch
 	if hash != wantHash || size != int64(len(scheduledBytes)) ||
 		mime != "application/octet-stream" || filename != "scheduled.bin" {
 		t.Errorf("scheduled attachment = hash/size/mime/name %q/%d/%q/%q", hash, size, mime, filename)
+	}
+	// The queued message shows the image it will send.
+	var messageHash, messageState, messageMIME, messageFilename string
+	var messageSize int64
+	mustNoError(t, database.QueryRow(`
+		SELECT a.blob_hash, a.state, a.size_bytes, a.mime, a.filename
+		FROM outbox AS o
+		JOIN message_attachments AS a ON a.message_id = o.local_message_id AND a.ordinal = 0
+		WHERE o.outbox_id = ?
+	`, mediaOutboxID).Scan(&messageHash, &messageState, &messageSize, &messageMIME, &messageFilename))
+	if messageHash != wantHash || messageState != "downloaded" || messageSize != size ||
+		messageMIME != mime || messageFilename != filename {
+		t.Errorf("scheduled message attachment = hash/state/size/mime/name %q/%q/%d/%q/%q, want the outbox attachment",
+			messageHash, messageState, messageSize, messageMIME, messageFilename)
 	}
 	blobStore, err := blob.New(blobRoot)
 	mustNoError(t, err)

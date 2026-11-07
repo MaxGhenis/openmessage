@@ -1134,9 +1134,6 @@ func validateSendMediaCommand(cmd *SendMediaCommand) error {
 	if strings.ContainsRune(cmd.Filename, '\x00') {
 		return fmt.Errorf("%w: filename contains NUL", ErrInvalidCommand)
 	}
-	// The caption is stored as it is sent: the Google adapter sends it
-	// trimmed, and its echo is paired with the sent message by that text.
-	cmd.Caption = strings.TrimSpace(cmd.Caption)
 	if !cmd.NotBefore.IsZero() && cmd.NotBefore.UnixMilli() <= 0 {
 		return fmt.Errorf("%w: scheduled Unix time is not positive", ErrInvalidCommand)
 	}

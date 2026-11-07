@@ -85,12 +85,21 @@ type UncorrelatedEchoRequest struct {
 // text message. So the echo of the image is an outgoing message with an
 // attachment and no text, paired with the conversation's media sends whatever
 // their caption; and the echo of a caption is an ordinary text echo, paired
-// alongside the conversation's text sends of the same body. Pairing a caption
-// moves it out of the sent message, where it showed until then, leaving it to
-// the echo's own row, so the conversation reads as the phone shows it: the
-// image, then the caption. All six media sends on the live store (none with
-// a caption) had one such echo, first seen 0.27-0.59 s after the send went
-// out.
+// alongside the conversation's text sends of the same body. The adapter
+// sends the caption trimmed (and sends none when that leaves nothing), so a
+// caption is paired by that text (captionText), while the sent message keeps
+// the caption as it was typed, which other platforms send unchanged. Pairing
+// a caption moves it out of the sent message, where it showed until then,
+// leaving it to the echo's own row, so the conversation reads as the phone
+// shows it: the image, then the caption. All six media sends on the live
+// store (none with a caption) had one such echo, first seen 0.27-0.59 s after
+// the send went out.
+
+// captionText is the text a media send's caption goes out as on Google, and
+// so the body of its echo; empty when no caption goes out.
+func captionText(caption string) string {
+	return strings.TrimSpace(caption)
+}
 
 // sendWentOutPredicate selects intents the transport accepted (or may have
 // accepted). An uncertain intent the user already sent again is left alone:
@@ -120,6 +129,8 @@ const (
 
 // unsplitCaptionPredicate selects sent media intents whose local row still
 // shows the caption, bound or not: no echo of the caption has been paired yet.
+// A caption that is only whitespace is selected too, and never pairs: its
+// captionText is empty.
 const unsplitCaptionPredicate = `
 	o.kind = 'media'
 	AND m.body <> ''
@@ -135,7 +146,8 @@ const (
 
 // echoGroup is a set of sends and the echoes they can be paired with, all in
 // one conversation: the media sends and the image echoes (media), or the text
-// sends and unsplit captions that read body and the text echoes of body.
+// sends of body, the unsplit captions whose captionText is body, and the text
+// echoes of body.
 type echoGroup struct {
 	conversationID string
 	media          bool
@@ -148,6 +160,8 @@ type echoIntent struct {
 	// captionOf is the local message of a media send whose caption this
 	// intent stands for, or empty for a send paired by its request ID.
 	captionOf string
+	// caption is that message's caption as stored.
+	caption string
 }
 
 type echoCandidate struct {
@@ -255,7 +269,7 @@ func (r *OutboxRepository) reconcileEchoGroupTx(
 	incoming *echoCandidate,
 ) (int, bool, error) {
 	intentQuery := `
-		SELECT o.transport_request_id, o.updated_at_ms, ''
+		SELECT o.transport_request_id, o.updated_at_ms, '', ''
 		FROM outbox AS o
 		JOIN messages AS m ON m.message_id = o.local_message_id
 		WHERE o.account_id = ?
@@ -266,13 +280,13 @@ func (r *OutboxRepository) reconcileEchoGroupTx(
 	if !group.media {
 		intentQuery = `
 			SELECT o.transport_request_id, o.updated_at_ms,
-				CASE WHEN o.kind = 'media' THEN m.message_id ELSE '' END
+				CASE WHEN o.kind = 'media' THEN m.message_id ELSE '' END,
+				CASE WHEN o.kind = 'media' THEN m.body ELSE '' END
 			FROM outbox AS o
 			JOIN messages AS m ON m.message_id = o.local_message_id
 			WHERE o.account_id = ?
 			  AND m.conversation_id = ?
-			  AND m.body = ?
-			  AND ((` + unboundTextIntentPredicate + `) OR (` + unsplitCaptionPredicate + `))`
+			  AND ((m.body = ? AND ` + unboundTextIntentPredicate + `) OR (` + unsplitCaptionPredicate + `))`
 		intentArgs = append(intentArgs, group.body)
 		echoPredicate = `e.body = ? AND ` + textEchoPredicate
 	}
@@ -283,9 +297,12 @@ func (r *OutboxRepository) reconcileEchoGroupTx(
 	var intents []echoIntent
 	for rows.Next() {
 		var intent echoIntent
-		if err := rows.Scan(&intent.transportRequestID, &intent.sentAtMS, &intent.captionOf); err != nil {
+		if err := rows.Scan(&intent.transportRequestID, &intent.sentAtMS, &intent.captionOf, &intent.caption); err != nil {
 			rows.Close()
 			return 0, false, fmt.Errorf("scan unbound intent: %w", err)
+		}
+		if intent.captionOf != "" && captionText(intent.caption) != group.body {
+			continue
 		}
 		intents = append(intents, intent)
 	}
@@ -411,7 +428,7 @@ func (r *OutboxRepository) applyEchoPairTx(
 		SET body = '',
 			updated_at_ms = MAX(updated_at_ms, ?)
 		WHERE message_id = ? AND body = ?
-	`, nowMS, pair.intent.captionOf, group.body)
+	`, nowMS, pair.intent.captionOf, pair.intent.caption)
 	if err != nil {
 		return false, fmt.Errorf("split caption from message %q: %w", pair.intent.captionOf, err)
 	}
@@ -463,8 +480,10 @@ func (r *OutboxRepository) ReconcileUncorrelatedEcho(
 	// Most outgoing frames (sent from the phone, or status re-deliveries of a
 	// bound send) have no unbound send to pair with: answer them from a read,
 	// without taking the write lock.
+	// A text send is found by its body; an unsplit caption by its captionText,
+	// which SQL cannot compute, so it is checked here.
 	findQuery := `
-		SELECT m.conversation_id
+		SELECT m.conversation_id, ''
 		FROM outbox AS o
 		JOIN messages AS m ON m.message_id = o.local_message_id
 		JOIN conversations AS c ON c.conversation_id = m.conversation_id
@@ -475,27 +494,39 @@ func (r *OutboxRepository) ReconcileUncorrelatedEcho(
 	findArgs := []any{req.AccountID, req.RemoteConversationID}
 	if !req.Media {
 		findQuery = `
-			SELECT m.conversation_id
+			SELECT m.conversation_id, CASE WHEN o.kind = 'media' THEN m.body ELSE '' END
 			FROM outbox AS o
 			JOIN messages AS m ON m.message_id = o.local_message_id
 			JOIN conversations AS c ON c.conversation_id = m.conversation_id
 			WHERE o.account_id = ?
 			  AND c.remote_conversation_id = ?
-			  AND m.body = ?
-			  AND ((` + unboundTextIntentPredicate + `) OR (` + unsplitCaptionPredicate + `))
-			LIMIT 1`
+			  AND ((m.body = ? AND ` + unboundTextIntentPredicate + `) OR (` + unsplitCaptionPredicate + `))`
 		findArgs = append(findArgs, req.Body)
 	}
 	group := echoGroup{media: req.Media}
 	if !req.Media {
 		group.body = req.Body
 	}
-	err := r.store.db.QueryRowContext(ctx, findQuery, findArgs...).Scan(&group.conversationID)
-	if errors.Is(err, sql.ErrNoRows) {
-		return ReconcileOutcomeNotFound, nil
-	}
+	rows, err := r.store.db.QueryContext(ctx, findQuery, findArgs...)
 	if err != nil {
 		return "", fmt.Errorf("reconcile uncorrelated echo: find unbound sends: %w", err)
+	}
+	for rows.Next() {
+		var conversationID, caption string
+		if err := rows.Scan(&conversationID, &caption); err != nil {
+			rows.Close()
+			return "", fmt.Errorf("reconcile uncorrelated echo: scan unbound send: %w", err)
+		}
+		if caption == "" || captionText(caption) == req.Body {
+			group.conversationID = conversationID
+			break
+		}
+	}
+	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+		return "", fmt.Errorf("reconcile uncorrelated echo: find unbound sends: %w", err)
+	}
+	if group.conversationID == "" {
+		return ReconcileOutcomeNotFound, nil
 	}
 
 	tx, err := r.store.db.BeginTx(ctx, nil)
@@ -554,8 +585,11 @@ func (r *OutboxRepository) RepairUncorrelatedEchoDuplicates(ctx context.Context)
 	}
 	report.Attached = attached
 
+	// The third column is the group's kind: 0 a text send, 1 an unsplit
+	// caption (grouped by its captionText), 2 a media send.
 	rows, err := r.store.db.QueryContext(ctx, `
-		SELECT DISTINCT o.account_id, m.conversation_id, 0, m.body
+		SELECT DISTINCT o.account_id, m.conversation_id,
+			CASE WHEN o.kind = 'media' THEN 1 ELSE 0 END, m.body
 		FROM outbox AS o
 		JOIN accounts AS a ON a.account_id = o.account_id
 		JOIN messages AS m ON m.message_id = o.local_message_id
@@ -563,7 +597,7 @@ func (r *OutboxRepository) RepairUncorrelatedEchoDuplicates(ctx context.Context)
 		  AND m.body <> ''
 		  AND ((`+unboundTextIntentPredicate+`) OR (`+unsplitCaptionPredicate+`))
 		UNION
-		SELECT DISTINCT o.account_id, m.conversation_id, 1, ''
+		SELECT DISTINCT o.account_id, m.conversation_id, 2, ''
 		FROM outbox AS o
 		JOIN accounts AS a ON a.account_id = o.account_id
 		JOIN messages AS m ON m.message_id = o.local_message_id
@@ -577,12 +611,24 @@ func (r *OutboxRepository) RepairUncorrelatedEchoDuplicates(ctx context.Context)
 		group     echoGroup
 	}
 	var groups []accountGroup
+	seen := map[accountGroup]bool{}
 	for rows.Next() {
 		var g accountGroup
-		if err := rows.Scan(&g.accountID, &g.group.conversationID, &g.group.media, &g.group.body); err != nil {
+		var kind int
+		if err := rows.Scan(&g.accountID, &g.group.conversationID, &kind, &g.group.body); err != nil {
 			rows.Close()
 			return report, fmt.Errorf("repair echo duplicates: scan group: %w", err)
 		}
+		switch kind {
+		case 1:
+			g.group.body = captionText(g.group.body)
+		case 2:
+			g.group.media = true
+		}
+		if (!g.group.media && g.group.body == "") || seen[g] {
+			continue
+		}
+		seen[g] = true
 		groups = append(groups, g)
 	}
 	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
