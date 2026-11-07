@@ -915,9 +915,16 @@ func (s *Store) SearchConversationsByAddress(address string, limit int) ([]Conve
 // nothing. SQLite runs the innermost query once, so a Go function in match
 // runs once for each identity, however many threads it joins.
 func (s *Store) searchConversationsByIdentity(match, value string, limit int) ([]Conversation, error) {
-	rows, err := s.db.QueryContext(
-		context.Background(),
-		"SELECT "+conversationColumns+`
+	rows, err := s.db.QueryContext(context.Background(), identitySearchSQL(match), value, limit)
+	if err != nil {
+		return nil, err
+	}
+	return collectRows(rows, scanConversation)
+}
+
+// identitySearchSQL returns searchConversationsByIdentity's query for match.
+func identitySearchSQL(match string) string {
+	return "SELECT " + conversationColumns + `
 		 FROM conversations
 		 WHERE conversation_id IN (
 		        SELECT conversation_id
@@ -925,17 +932,11 @@ func (s *Store) searchConversationsByIdentity(match, value string, limit int) ([
 		        WHERE identity_id IN (
 		            SELECT i.identity_id
 		            FROM identities i
-		            WHERE i.is_self = 0 AND `+match+`
+		            WHERE i.is_self = 0 AND ` + match + `
 		        )
 		    )
 		 ORDER BY last_message_at_ms DESC, conversation_id
-		 LIMIT ?`,
-		value, limit,
-	)
-	if err != nil {
-		return nil, err
-	}
-	return collectRows(rows, scanConversation)
+		 LIMIT ?`
 }
 
 // escapeLikePattern makes user text match literally inside a LIKE pattern
