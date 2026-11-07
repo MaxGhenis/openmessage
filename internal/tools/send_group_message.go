@@ -82,7 +82,7 @@ func sendGroupMessageHandler(a *app.App, v2Options ...*V2Dependencies) server.To
 			if err := upsertGoogleConversation(a, conv); err != nil {
 				return errorResult(fmt.Sprintf("failed to persist conversation: %v", err)), nil
 			}
-			return submitV2Text(ctx, a, v2, args, conv.GetConversationID(), message), nil
+			return submitV2Text(ctx, a, v2, args, conv.GetConversationID(), message, ""), nil
 		}
 
 		cli := a.GetClient()
