@@ -96,7 +96,7 @@ func daemonAmbiguousResult(idempotencyKey string, cause error) *mcp.CallToolResu
 // platform without checking that it names a message of the conversation, so
 // a quote of another conversation's message could go out; only the app's
 // durable outbox checks it.
-const legacyDaemonReplyRefusal = "Message NOT sent: the running OpenMessage app sends through its legacy route, which does not check that a reply target is a message of the conversation, so this tool refuses reply_to_id there rather than send the reply unchecked or as a plain message. Send without reply_to_id, or run the app with v2 sending (OPENMESSAGES_V2_SEND=1), whose durable outbox checks it."
+const legacyDaemonReplyRefusal = "Message NOT sent: the running OpenMessage app sends through its legacy route, which does not check that a reply target belongs to the conversation, so this tool refuses reply_to_id there rather than send the reply unchecked or as a plain message. Send without reply_to_id, or run the app with v2 sending (OPENMESSAGES_V2_SEND=1), whose durable outbox checks it."
 
 // daemonSubmitTextAndWait submits one durable text send to the daemon outbox
 // and waits (bounded) for it to settle, mirroring the in-process v2 result

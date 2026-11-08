@@ -70,7 +70,7 @@ func sendMessageTool(v2Enabled ...bool) mcp.Tool {
 // sendMessageReplyToIDDescription documents reply_to_id on the v2
 // send_message descriptor. send_message finds its conversation from the
 // recipient, so the reply target must belong to that thread.
-const sendMessageReplyToIDDescription = "Optional message_id of the message to quote-reply to, as get_conversation and search_messages return it. It must name a message of the thread this send goes to (this recipient on this platform); the app refuses any other ID as reply_target_unavailable and sends nothing. send_to_conversation is the usual way to reply. A server that runs its own transports refuses SMS/RCS replies here, since it asks the phone to get or create the thread before any check could run, and the legacy send route refuses every reply_to_id; neither drops it."
+const sendMessageReplyToIDDescription = "Optional message_id of the message to quote-reply to, as get_conversation and search_messages return it. It must name a message of the thread this send goes to (this recipient on this platform); the app refuses any other ID as reply_target_unavailable and sends nothing. Prefer send_to_conversation for a reply in a thread you already have. A server that runs its own transports refuses SMS/RCS replies here, since it asks the phone to get or create the thread before any check could run, and the legacy send route refuses every reply_to_id; neither drops it."
 
 // directSMSReplyRefusal is why the in-process SMS route refuses reply_to_id.
 // The route asks the phone to get or create the number's thread, which would

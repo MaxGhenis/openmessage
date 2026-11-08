@@ -39,20 +39,20 @@ const v2IdempotencyDescription = "Optional retry key for the exact same send. Ev
 
 // replyToIDDescription documents reply_to_id on the v2 text-send
 // descriptors. Only the durable outbox submit checks a reply target against
-// the send's conversation, so the argument exists only where sends take it.
-const replyToIDDescription = "Optional message_id of the message to quote-reply to, as get_conversation and search_messages return it. It must name a message of the conversation this send goes to: the app refuses any other ID as reply_target_unavailable and sends nothing. Omit it for a plain message. The reply target belongs to the send's intent, so repeating an idempotency_key with a different reply_to_id is refused, not replayed. Where the app sends through its legacy route instead of the durable outbox, a reply_to_id is refused, never dropped."
+// the send's conversation, so only the v2 descriptors offer the argument.
+const replyToIDDescription = "Optional message_id of the message to quote-reply to, as get_conversation and search_messages return it. It must name a message of the conversation this send goes to: the app refuses any other ID as reply_target_unavailable and sends nothing. Omit it for a plain message. The reply target belongs to the send's intent: the app refuses an idempotency_key repeated with a different reply_to_id instead of replaying the first send. Where the app sends through its legacy route instead of the durable outbox, the tool refuses a reply_to_id rather than drop it."
 
 // replyTargetUnavailableCode is the outbox's refusal of a reply target, as
 // the app's local API names it (HTTP 422).
 const replyTargetUnavailableCode = "reply_target_unavailable"
 
 // legacyReplyRefusal is why the in-process legacy send path refuses
-// reply_to_id. Only the durable outbox checks that a reply target is a message
-// of the send's conversation; the legacy transports hand the ID to the
-// platform as given, so a quote of another conversation's message could go
-// out, and dropping the ID would send a plain message the caller didn't ask
-// for.
-const legacyReplyRefusal = "Message NOT sent: reply_to_id needs the durable outbox (v2 sending), which checks that the reply target is a message of this conversation. This server sends through the legacy route, which does not check it, so it refuses the reply rather than send it unchecked or as a plain message. Send without reply_to_id, or run with v2 sending (OPENMESSAGES_V2_SEND=1)."
+// reply_to_id. Only the durable outbox checks that a reply target belongs to
+// the send's conversation. The legacy senders either take no reply ID, so the
+// reply would go out as a plain message the caller didn't ask for, or hand
+// the ID to the platform unchecked, so a quote of another conversation's
+// message could go out.
+const legacyReplyRefusal = "Message NOT sent: reply_to_id needs the durable outbox (v2 sending), which checks that the reply target belongs to this conversation. This server sends through the legacy route, which does not check it, so it refuses the reply rather than send it unchecked or as a plain message. Send without reply_to_id, or run with v2 sending (OPENMESSAGES_V2_SEND=1)."
 
 // replyToIDArg reads the optional reply_to_id argument. Absent, null and
 // blank all mean a plain message, as on the app's HTTP route. Any other

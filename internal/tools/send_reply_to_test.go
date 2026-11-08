@@ -778,7 +778,7 @@ func TestReplyToIDDescriptors(t *testing.T) {
 		}
 		description, _ := property["description"].(string)
 		neverDropped := map[string]string{
-			"send_to_conversation": "refused, never dropped",
+			"send_to_conversation": "refuses a reply_to_id rather than drop it",
 			"send_message":         "neither drops it",
 		}[tool.Name]
 		for _, want := range []string{"message_id", "get_conversation", replyRefusalCode, "sends nothing", neverDropped} {
