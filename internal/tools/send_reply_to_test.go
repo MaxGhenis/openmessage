@@ -889,8 +889,8 @@ func storedRemoteID(t *testing.T, store *sqlite.Store, messageID string) string 
 
 // For any sequence of sends to reply-thread, in process and in client mode:
 // a refused reply target (another thread's message, or no message) changes
-// nothing, with no ID, outbox row, stored message or transport call, and both
-// modes refuse it alike. Any other send queues exactly one message, and the
+// nothing, with no ID, outbox row, message or inbox row, or transport call,
+// and both modes refuse it alike. A blank reply_to_id sends a plain message. Any other send queues exactly one message, and the
 // transport quotes the named message's remote ID, or nothing when the call
 // named no target. Named targets include the test's own previous send.
 func TestReplyTargetPropertiesHoldInProcessAndThroughTheApp(t *testing.T) {
@@ -925,9 +925,12 @@ func TestReplyTargetPropertiesHoldInProcessAndThroughTheApp(t *testing.T) {
 				case replyToUnknown, replyToBlank:
 					arguments["reply_to_id"] = call.Drawn
 				}
-				before := harness.effects(t)
+				// Every message and inbox row, incoming ones included: a refusal
+				// must not copy or project anything either.
+				rows := func() [2]int { return [2]int{harness.v2Rows(t, "messages"), harness.v2Rows(t, "inbox")} }
+				before, rowsBefore := harness.effects(t), rows()
 				result := callTool(t, harness.ctx, mode.handler, arguments)
-				after := harness.effects(t)
+				after, rowsAfter := harness.effects(t), rows()
 				payload := v2ToolPayload(t, result)
 
 				if call.Target.refused() {
@@ -935,8 +938,9 @@ func TestReplyTargetPropertiesHoldInProcessAndThroughTheApp(t *testing.T) {
 						t.Logf("%s call %d (%s): %s, want reply_target_unavailable", mode.name, i, call.Target, resultText(t, result))
 						return false
 					}
-					if after != before {
-						t.Logf("%s call %d (%s): refused reply changed %+v to %+v", mode.name, i, call.Target, before, after)
+					if after != before || rowsAfter != rowsBefore {
+						t.Logf("%s call %d (%s): refused reply changed %+v %v to %+v %v",
+							mode.name, i, call.Target, before, rowsBefore, after, rowsAfter)
 						return false
 					}
 					continue
