@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"time"
 
 	"github.com/maxghenis/openmessage/internal/bridge"
@@ -152,6 +153,10 @@ func validateSubmitDeps(ctx context.Context, deps Deps) error {
 	return nil
 }
 
+// mirrorSubmitReplyTarget resolves a legacy reply target for a mirror send to
+// conversationID. It refuses a target from another conversation before
+// MirrorReplyTarget writes the target's conversation and message into v2, so
+// a refused reply leaves nothing behind, then checks the mirrored copy too.
 func mirrorSubmitReplyTarget(
 	ctx context.Context,
 	deps Deps,
@@ -159,6 +164,27 @@ func mirrorSubmitReplyTarget(
 	accountID string,
 	conversationID string,
 ) (string, error) {
+	legacyMessageID = strings.TrimSpace(legacyMessageID)
+	if legacyMessageID == "" {
+		return "", fmt.Errorf("%w: message id is empty", ErrReplyTargetUnavailable)
+	}
+	legacyTarget, err := deps.Legacy.GetMessageByID(legacyMessageID)
+	if err != nil {
+		return "", fmt.Errorf("load legacy reply target %q: %w", legacyMessageID, err)
+	}
+	if legacyTarget == nil {
+		return "", fmt.Errorf("%w: legacy message %q does not exist", ErrReplyTargetUnavailable, legacyMessageID)
+	}
+	// MirrorConversation keeps a v2 conversation ID equal to its trimmed
+	// legacy ID, so this matches the check on the mirrored copy below.
+	if targetConversationID := strings.TrimSpace(legacyTarget.ConversationID); targetConversationID != conversationID {
+		return "", fmt.Errorf(
+			"%w: legacy message %q belongs to conversation %q",
+			ErrReplyTargetUnavailable,
+			legacyMessageID,
+			targetConversationID,
+		)
+	}
 	messageID, err := MirrorReplyTarget(deps.Legacy, deps.V2, legacyMessageID)
 	if err != nil {
 		return "", err

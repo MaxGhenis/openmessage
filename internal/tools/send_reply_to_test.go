@@ -112,6 +112,21 @@ func (h *v2ToolHarness) effects(t *testing.T) sendEffects {
 	return effects
 }
 
+// v2Rows counts a v2 table's rows through a second connection to the store.
+func (h *v2ToolHarness) v2Rows(t *testing.T, table string) int {
+	t.Helper()
+	inspection, err := sql.Open("sqlite", "file:"+h.v2Path+"?_pragma=busy_timeout(5000)")
+	if err != nil {
+		t.Fatalf("open a second connection to the v2 store: %v", err)
+	}
+	defer inspection.Close()
+	var rows int
+	if err := inspection.QueryRow("SELECT COUNT(*) FROM " + table).Scan(&rows); err != nil {
+		t.Fatalf("count %s rows: %v", table, err)
+	}
+	return rows
+}
+
 func callTool(t *testing.T, ctx context.Context, handler server.ToolHandlerFunc, arguments map[string]any) *mcp.CallToolResult {
 	t.Helper()
 	result, err := handler(ctx, v2ToolCall(arguments))
@@ -321,13 +336,14 @@ func TestV2PrimaryReplyTakesTheMessageIDTheReadToolsReturn(t *testing.T) {
 // conversation must hold it.
 func TestMirrorSendToConversationQuoteRepliesByLegacyMessageID(t *testing.T) {
 	const (
-		quotedID       = "legacy-quoted"
-		elsewhereID    = "legacy-elsewhere"
-		otherConvID    = "v2-tool-other-conversation"
-		quotedBody     = "legacy quote"
-		quotedAtMS     = int64(1_700_000_100_000)
-		elsewhereAtMS  = int64(1_700_000_200_000)
-		mirrorReplyKey = "mirror-reply"
+		quotedID        = "legacy-quoted"
+		elsewhereID     = "legacy-elsewhere"
+		mineElsewhereID = "legacy-mine-elsewhere"
+		otherConvID     = "v2-tool-other-conversation"
+		quotedBody      = "legacy quote"
+		quotedAtMS      = int64(1_700_000_100_000)
+		elsewhereAtMS   = int64(1_700_000_200_000)
+		mirrorReplyKey  = "mirror-reply"
 	)
 	seed := func(t *testing.T) *v2ToolHarness {
 		t.Helper()
@@ -341,6 +357,7 @@ func TestMirrorSendToConversationQuoteRepliesByLegacyMessageID(t *testing.T) {
 		for _, message := range []*db.Message{
 			{MessageID: quotedID, ConversationID: v2ToolConversationID, Body: quotedBody, TimestampMS: quotedAtMS, SourcePlatform: "sms"},
 			{MessageID: elsewhereID, ConversationID: otherConvID, Body: "elsewhere", TimestampMS: elsewhereAtMS, SourcePlatform: "sms"},
+			{MessageID: mineElsewhereID, ConversationID: otherConvID, Body: "mine elsewhere", TimestampMS: elsewhereAtMS + 1, IsFromMe: true, SourcePlatform: "sms"},
 		} {
 			if err := store.UpsertMessage(message); err != nil {
 				t.Fatalf("seed legacy message %s: %v", message.MessageID, err)
@@ -370,8 +387,9 @@ func TestMirrorSendToConversationQuoteRepliesByLegacyMessageID(t *testing.T) {
 		assertStoredReply(t, harness.deps.V2Store, v2ToolString(payload, "local_message_id"), v2ToolConversationID, quotedID)
 	})
 	for name, replyToID := range map[string]string{
-		"another conversation's message": elsewhereID,
-		"unknown message":                "legacy-missing",
+		"another conversation's message":         elsewhereID,
+		"my own message in another conversation": mineElsewhereID,
+		"unknown message":                        "legacy-missing",
 	} {
 		t.Run(name, func(t *testing.T) {
 			harness := seed(t)
@@ -384,6 +402,13 @@ func TestMirrorSendToConversationQuoteRepliesByLegacyMessageID(t *testing.T) {
 			assertReplyRefused(t, result, v2ToolConversationID, replyToID)
 			if got := harness.effects(t); got != (sendEffects{}) {
 				t.Fatalf("a refused mirror reply left %+v, want nothing", got)
+			}
+			// The mirror's v2 store starts empty, and the refusal comes before
+			// the mirror copies the quoted message into it.
+			for _, table := range []string{"messages", "inbox"} {
+				if rows := harness.v2Rows(t, table); rows != 0 {
+					t.Fatalf("a refused mirror reply left %d %s rows in v2, want none", rows, table)
+				}
 			}
 		})
 	}
