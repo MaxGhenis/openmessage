@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -142,6 +143,49 @@ func TestSubmitTextRejectsMissingOutboxID(t *testing.T) {
 	}))
 	if _, err := client.SubmitText(context.Background(), TextSubmission{ConversationID: "c", IdempotencyKey: "k"}); err == nil {
 		t.Fatal("expected error for response without outbox_id")
+	}
+}
+
+// The app refuses a reply target with HTTP 422 and
+// {"error":"reply_target_unavailable"}; only that answer classifies as one.
+func TestIsReplyTargetUnavailable(t *testing.T) {
+	refusal := func(status int, body string) error {
+		return &ResponseError{StatusCode: status, Body: body}
+	}
+	for name, test := range map[string]struct {
+		err  error
+		want bool
+	}{
+		"the app's refusal":            {refusal(http.StatusUnprocessableEntity, `{"error":"reply_target_unavailable"}`+"\n"), true},
+		"wrapped":                      {fmt.Errorf("submit: %w", refusal(http.StatusUnprocessableEntity, `{"error":"reply_target_unavailable"}`)), true},
+		"another 422":                  {refusal(http.StatusUnprocessableEntity, `{"error":"reaction_target_unavailable"}`), false},
+		"the code with another status": {refusal(http.StatusNotFound, `{"error":"reply_target_unavailable"}`), false},
+		"a plain-text body":            {refusal(http.StatusUnprocessableEntity, "reply_target_unavailable"), false},
+		"a transport error":            {errors.New("reply_target_unavailable"), false},
+		"no error":                     {nil, false},
+	} {
+		if got := IsReplyTargetUnavailable(test.err); got != test.want {
+			t.Errorf("%s: IsReplyTargetUnavailable(%v) = %v, want %v", name, test.err, got, test.want)
+		}
+	}
+
+	client := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request TextSubmission
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Errorf("decode: %v", err)
+		}
+		if request.ReplyToID != "msg-elsewhere" {
+			t.Errorf("reply_to_id = %q, want msg-elsewhere", request.ReplyToID)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		json.NewEncoder(w).Encode(map[string]string{"error": "reply_target_unavailable"})
+	}))
+	_, err := client.SubmitText(context.Background(), TextSubmission{
+		ConversationID: "conv", Body: "hi", ReplyToID: "msg-elsewhere", IdempotencyKey: "key",
+	})
+	if !IsReplyTargetUnavailable(err) || !IsDeterministicRejection(err) {
+		t.Fatalf("SubmitText error %v: want a deterministic reply-target refusal", err)
 	}
 }
 
