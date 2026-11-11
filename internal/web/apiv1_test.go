@@ -463,6 +463,12 @@ func TestStatusReportsV2DispatchHealth(t *testing.T) {
 	if _, failed := health["last_failed_lease"]; failed {
 		t.Fatalf("v2_dispatch = %s, want no last failed lease", raw)
 	}
+	if health["failed_recoveries"] != float64(0) {
+		t.Fatalf("v2_dispatch = %s, want zero failed recoveries", raw)
+	}
+	if _, failed := health["last_failed_recovery"]; failed {
+		t.Fatalf("v2_dispatch = %s, want no last failed recovery", raw)
+	}
 
 	disabled := newV1RecorderHarness(t, APIOptions{})
 	resp := disabled.do(t, httptest.NewRequest(http.MethodGet, "http://127.0.0.1/api/status", nil))

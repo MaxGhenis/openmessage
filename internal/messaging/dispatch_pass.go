@@ -87,17 +87,8 @@ type FailedLease struct {
 	SetAsideError string `json:"set_aside_error,omitempty"`
 }
 
-// dispatchLeaseFailures is the bookkeeping behind DispatchHealth's lease
-// fields and the OnLeaseFailure hook.
-type dispatchLeaseFailures struct {
-	mu        sync.Mutex
-	failed    int64
-	last      *FailedLease
-	onFailure func(FailedLease)
-}
-
-// fail records one failed lease, then reports it to the hook outside the lock.
-func (l *dispatchLeaseFailures) fail(failure sqlite.LeaseFailure, now time.Time) {
+// newFailedLease describes a due row whose lease failed on the row at now.
+func newFailedLease(failure sqlite.LeaseFailure, now time.Time) FailedLease {
 	lease := FailedLease{
 		OutboxID: failure.OutboxID,
 		AtMS:     now.UnixMilli(),
@@ -108,24 +99,7 @@ func (l *dispatchLeaseFailures) fail(failure sqlite.LeaseFailure, now time.Time)
 	} else {
 		lease.RetryAtMS = failure.RetryAt.UnixMilli()
 	}
-	l.mu.Lock()
-	l.failed++
-	l.last = &lease
-	onFailure := l.onFailure
-	l.mu.Unlock()
-	if onFailure != nil {
-		onFailure(lease)
-	}
-}
-
-func (l *dispatchLeaseFailures) report(health *DispatchHealth) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	health.FailedLeases = l.failed
-	if l.last != nil {
-		last := *l.last
-		health.LastFailedLease = &last
-	}
+	return lease
 }
 
 // OnLeaseFailure sets fn to run on the dispatching goroutine for each due row
@@ -133,7 +107,68 @@ func (l *dispatchLeaseFailures) report(health *DispatchHealth) {
 // or left it due. The daemon logs through it. Dispatch waits for fn, so it
 // must return promptly. A nil fn removes the hook.
 func (s *MessageService) OnLeaseFailure(fn func(lease FailedLease)) {
-	s.leaseFailures.mu.Lock()
-	s.leaseFailures.onFailure = fn
-	s.leaseFailures.mu.Unlock()
+	s.leaseFailures.setHook(fn)
+}
+
+// FailedRecovery describes an expired outbox lease whose recovery failed on
+// the row itself: a constraint the row cannot meet, a value of the wrong type
+// or size, or a trigger that refuses or skips the write. The store left the
+// row as it was, dispatching with its lease expired, so nothing sends it, and
+// the next pass tries again.
+type FailedRecovery struct {
+	OutboxID string `json:"outbox_id"`
+	AtMS     int64  `json:"at_ms"`
+	Error    string `json:"error"`
+	// TransportCalled reports whether the row's transport call had started.
+	// Once its recovery works, a row whose call had started becomes
+	// uncertain and never sends again; any other row becomes due again.
+	TransportCalled bool `json:"transport_called"`
+}
+
+// OnRecoveryFailure sets fn to run on the dispatching goroutine for each
+// expired lease whose recovery failed on the row itself. The daemon logs
+// through it. Dispatch waits for fn, so it must return promptly. A nil fn
+// removes the hook.
+func (s *MessageService) OnRecoveryFailure(fn func(recovery FailedRecovery)) {
+	s.recoveryFailures.setHook(fn)
+}
+
+// failureRecord is the bookkeeping behind one kind of failure in
+// DispatchHealth: how many happened since the service started, the latest
+// one, and the hook that reports each.
+type failureRecord[T any] struct {
+	mu        sync.Mutex
+	count     int64
+	last      *T
+	onFailure func(T)
+}
+
+// add records one failure, then reports it to the hook outside the lock.
+func (r *failureRecord[T]) add(failure T) {
+	r.mu.Lock()
+	r.count++
+	r.last = &failure
+	onFailure := r.onFailure
+	r.mu.Unlock()
+	if onFailure != nil {
+		onFailure(failure)
+	}
+}
+
+// read returns the count and a copy of the latest failure, nil before the
+// first.
+func (r *failureRecord[T]) read() (int64, *T) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.last == nil {
+		return r.count, nil
+	}
+	last := *r.last
+	return r.count, &last
+}
+
+func (r *failureRecord[T]) setHook(fn func(T)) {
+	r.mu.Lock()
+	r.onFailure = fn
+	r.mu.Unlock()
 }
