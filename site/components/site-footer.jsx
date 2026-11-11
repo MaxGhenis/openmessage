@@ -1,51 +1,38 @@
-import { repoUrl } from "../data/site-content";
+import Link from "next/link";
+
+import { RELEASES_URL, REPO_URL } from "../data/facts";
 
 export function SiteFooter() {
   return (
-    <footer className="border-t border-[var(--border)]">
-      <div className="mx-auto flex max-w-[1520px] flex-col gap-4 px-6 py-8 text-sm text-[var(--text-muted)] md:flex-row md:items-center md:justify-between lg:px-10">
+    <footer className="foot">
+      <div className="wrap foot__inner">
         <p>
-          A solo project by{" "}
-          <a
-            className="text-[var(--text-secondary)] transition-colors hover:text-[var(--text-primary)]"
-            href="https://maxghenis.com"
-            target="_blank"
-            rel="noreferrer"
-          >
+          OpenMessage is free and open source, made by{" "}
+          <a href="https://maxghenis.com" rel="noopener">
             Max Ghenis
+          </a>{" "}
+          and{" "}
+          <a href={`${REPO_URL}/graphs/contributors`} rel="noopener">
+            contributors
           </a>
-          . Free and open source under the MIT license.
+          .
         </p>
-        <div className="flex flex-wrap items-center gap-4">
-          <a className="transition-colors hover:text-[var(--text-primary)]" href="/#updates">
-            Get updates
-          </a>
-          <a className="transition-colors hover:text-[var(--text-primary)]" href="/blog">
-            Blog
-          </a>
-          <a className="transition-colors hover:text-[var(--text-primary)]" href="/privacy">
-            Privacy
-          </a>
-          <a className="transition-colors hover:text-[var(--text-primary)]" href="/thesis">
-            Thesis
-          </a>
-          <a
-            className="transition-colors hover:text-[var(--text-primary)]"
-            href={repoUrl}
-            target="_blank"
-            rel="noreferrer"
-          >
+        <nav className="foot__links" aria-label="Footer">
+          <a href={REPO_URL} rel="noopener">
             GitHub
           </a>
-          <a
-            className="transition-colors hover:text-[var(--text-primary)]"
-            href="https://github.com/sponsors/MaxGhenis"
-            target="_blank"
-            rel="noreferrer"
-          >
+          <a href={RELEASES_URL} rel="noopener">
+            Releases
+          </a>
+          <Link href="/blog">Blog</Link>
+          <Link href="/privacy">Privacy</Link>
+          <a href={`${REPO_URL}/blob/main/LICENSE`} rel="noopener">
+            License
+          </a>
+          <a href="https://github.com/sponsors/MaxGhenis" rel="noopener">
             Sponsor
           </a>
-        </div>
+        </nav>
       </div>
     </footer>
   );

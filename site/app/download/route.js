@@ -1,33 +1,14 @@
 import { NextResponse } from "next/server";
 
-import { releaseDownloadUrl } from "../../data/site-content";
-import { trackGoogleAnalyticsEvent } from "../../lib/analytics";
+import { RELEASE_DMG_URL } from "../../data/facts";
 
 export const dynamic = "force-dynamic";
 
-function normalizeValue(value, fallback) {
-  const normalized = `${value || ""}`.trim().toLowerCase().replace(/[^a-z0-9-_]/g, "-");
-  return normalized || fallback;
-}
-
-export async function GET(request) {
-  const url = new URL(request.url);
-  const source = normalizeValue(url.searchParams.get("source"), "site");
-  const platform = normalizeValue(url.searchParams.get("platform"), "macos-dmg");
-  const referrer = request.headers.get("referer") || "";
-
-  await trackGoogleAnalyticsEvent({
-    request,
-    name: "download_redirect",
-    params: {
-      download_source: source,
-      download_platform: platform,
-      download_target: "github_release_dmg",
-      referrer_url: referrer
-    }
-  });
-
-  const response = NextResponse.redirect(releaseDownloadUrl, 307);
+// Sends the visitor to the disk image on GitHub's latest release. The `source`
+// and `platform` query parameters on older links are accepted and ignored: the
+// site records nothing about who downloads.
+export async function GET() {
+  const response = NextResponse.redirect(RELEASE_DMG_URL, 307);
   response.headers.set("Cache-Control", "no-store, max-age=0");
   return response;
 }
