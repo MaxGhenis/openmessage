@@ -6265,7 +6265,10 @@ body::after {
   // wrote it there. The box holds something else only after an edit this
   // tab hasn't stored.
   let composeSyncedText = '';
-  let composeDraftStoreWritable = true;
+  // Conversations whose latest text this tab failed to store (a full or
+  // blocked localStorage). This tab's copy answers for them until a write
+  // succeeds, so a later read can't swap in an older stored draft.
+  const composeDraftsOnlyHere = new Set();
   let contextMenuState = null;
   let threadSearchTimer = 0;
   let threadSearchRequestID = 0;
@@ -11896,10 +11899,11 @@ body::after {
 
   // A conversation's unsent text as the store holds it now, which includes
   // what other tabs stored or cleared since this page loaded. When this tab
-  // can't use the store, its own copy answers.
+  // can't read the store, or failed to store this conversation's latest
+  // text, its own copy answers.
   function currentComposeDraft(convoId) {
     if (!convoId) return '';
-    const stored = composeDraftStoreWritable ? readComposeDraftStore() : null;
+    const stored = composeDraftsOnlyHere.has(convoId) ? null : readComposeDraftStore();
     if (!stored) return composeTextByConversation.get(convoId) || '';
     const draft = stored[convoId];
     const text = storedComposeDraftIsLive(draft, Date.now()) ? draft.text : '';
@@ -11916,8 +11920,9 @@ body::after {
       && now - Number(draft.updated_at_ms || 0) <= COMPOSE_DRAFT_MAX_AGE_MS;
   }
 
-  // Changes one conversation's stored draft. It re-reads the others first,
-  // so a draft another tab stored since this page loaded survives.
+  // Changes one conversation's stored draft and says whether the write
+  // succeeded. It re-reads the others first, so a draft another tab stored
+  // since this page loaded survives.
   function storeComposeDraft(convoId, text) {
     try {
       const now = Date.now();
@@ -11932,12 +11937,16 @@ body::after {
         .sort(([, a], [, b]) => Number(b.updated_at_ms) - Number(a.updated_at_ms))
         .slice(0, COMPOSE_DRAFTS_LIMIT);
       window.localStorage.setItem(COMPOSE_DRAFTS_STORAGE_KEY, JSON.stringify(Object.fromEntries(kept)));
-      composeDraftStoreWritable = true;
+      return true;
     } catch {
-      composeDraftStoreWritable = false;
+      return false;
     }
   }
 
+  // Keeps a conversation's text in this tab's copy and in the store. When
+  // the store refuses it, the open box stays marked as edited, so leaving
+  // the conversation tries the store again and other tabs' changes don't
+  // overwrite it.
   function rememberComposeText(convoId, value) {
     if (!convoId) return;
     const text = String(value || '');
@@ -11946,8 +11955,12 @@ body::after {
     } else {
       composeTextByConversation.delete(convoId);
     }
-    storeComposeDraft(convoId, text);
-    if (convoId === activeConvoId) composeSyncedText = text;
+    if (storeComposeDraft(convoId, text)) {
+      composeDraftsOnlyHere.delete(convoId);
+      if (convoId === activeConvoId) composeSyncedText = text;
+    } else {
+      composeDraftsOnlyHere.add(convoId);
+    }
   }
 
   function forgetComposeText(convoId) {
@@ -11968,7 +11981,8 @@ body::after {
   function restoreComposeText(convoId) {
     const text = currentComposeDraft(convoId);
     $composeInput.value = text;
-    composeSyncedText = text;
+    // Text the store refused counts as an unstored edit (see rememberComposeText).
+    composeSyncedText = composeDraftsOnlyHere.has(convoId) ? null : text;
     autoResize();
   }
 

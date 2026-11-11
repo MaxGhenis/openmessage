@@ -111,9 +111,7 @@ struct WebViewContainer: NSViewRepresentable {
         context.coordinator.webView = webView
         WebViewBridge.shared.webView = webView
         webView.navigationDelegate = context.coordinator
-        if let request = context.coordinator.pageLoads.request(for: url) {
-            webView.load(request)
-        }
+        context.coordinator.pageLoader.show(url)
         return webView
     }
 
@@ -121,11 +119,9 @@ struct WebViewContainer: NSViewRepresentable {
         context.coordinator.backend = backend
         context.coordinator.notifications = notifications
         context.coordinator.contacts = contacts
-        // Reload only for a new backend address, never because the page
+        // Loads only for a new backend address, never because the page
         // changed its own URL (see BackendPageLoadPolicy).
-        if let request = context.coordinator.pageLoads.request(for: url) {
-            webView.load(request)
-        }
+        context.coordinator.pageLoader.show(url)
     }
 
     private static let notificationBridgeScript = """
@@ -188,7 +184,9 @@ struct WebViewContainer: NSViewRepresentable {
         var notifications: NotificationManager
         var contacts: ContactsManager
         weak var webView: WKWebView?
-        var pageLoads = BackendPageLoadPolicy()
+        lazy var pageLoader = BackendPageLoader { [weak self] request in
+            self?.webView?.load(request)
+        }
 
         init(backend: BackendManager, notifications: NotificationManager, contacts: ContactsManager) {
             self.backend = backend
@@ -244,18 +242,7 @@ struct WebViewContainer: NSViewRepresentable {
 
         @MainActor
         func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
-            // The page never arrived, so window updates (which load only a
-            // new backend address) would leave the window blank. Retry after a
-            // pause. If the backend itself has gone, BackendManager leaves
-            // .running and removes this web view, which ends the retries.
-            guard BackendPageLoadPolicy.shouldRetry(after: error),
-                  let failedURL = pageLoads.loadFailed() else { return }
-            Task { @MainActor [weak self, weak webView] in
-                try? await Task.sleep(for: .seconds(2))
-                guard let self, let webView,
-                      let request = self.pageLoads.request(for: failedURL) else { return }
-                webView.load(request)
-            }
+            pageLoader.navigationFailed(error)
         }
 
         @MainActor

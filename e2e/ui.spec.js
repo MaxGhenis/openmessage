@@ -374,6 +374,34 @@ test('keeps only the newest 100 stored compose drafts', async ({ page }) => {
   expect(stored).not.toHaveProperty('seeded-099');
 });
 
+test('keeps text the store refused, and stores it once the store works again', async ({ page }) => {
+  const sarahConversationID = await conversationIDNamed(page, 'Sarah Chen');
+  const breakStore = () => page.evaluate(() => {
+    window.__realSetItem = Storage.prototype.setItem;
+    Storage.prototype.setItem = function refuse() {
+      throw new DOMException('The quota has been exceeded.', 'QuotaExceededError');
+    };
+  });
+  const fixStore = () => page.evaluate(() => {
+    Storage.prototype.setItem = window.__realSetItem;
+  });
+
+  await openConversation(page, 'Sarah Chen');
+  await page.locator('#compose-input').fill('short draft');
+  await breakStore();
+  await page.locator('#compose-input').fill('a much longer draft the store refused');
+  await openConversation(page, 'Marcus Johnson');
+  await fixStore();
+  // A later write that succeeds must not make the page trust the older
+  // stored text for Sarah.
+  await page.locator('#compose-input').fill('a draft for Marcus');
+
+  await openConversation(page, 'Sarah Chen');
+  await expect(page.locator('#compose-input')).toHaveValue('a much longer draft the store refused');
+  await openConversation(page, 'Marcus Johnson');
+  expect((await storedComposeDrafts(page))[sarahConversationID].text).toBe('a much longer draft the store refused');
+});
+
 // Tabs share the store. PR #284's review found that one tab could store
 // text another tab had sent, because it kept the drafts it read at load.
 test('never brings back text that another tab sent', async ({ page }) => {
