@@ -10,7 +10,6 @@ package ingest
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"math/rand"
 	"reflect"
@@ -93,10 +92,7 @@ func (h *googleEchoHarness) sendAt(t *testing.T, key, body string, createdAt, se
 // remoteIDs maps every message row in the test conversation to its remote ID.
 func (h *googleEchoHarness) remoteIDs(t *testing.T) map[string]string {
 	t.Helper()
-	inspection, err := sql.Open("sqlite", h.storePath)
-	if err != nil {
-		t.Fatalf("sql.Open(inspect): %v", err)
-	}
+	inspection := openSQLiteInspector(t, h.storePath)
 	defer inspection.Close()
 	rows, err := inspection.Query(
 		"SELECT message_id, remote_message_id FROM messages WHERE account_id = ? AND conversation_id = ?",

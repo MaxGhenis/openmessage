@@ -1134,7 +1134,7 @@ func TestReactionToAnOwnMessageFollowsItsSend(t *testing.T) {
 		}
 		return true
 	}
-	if err := quick.Check(property, &quick.Config{MaxCount: 150, Rand: rand.New(rand.NewSource(20261021))}); err != nil {
+	if err := quick.Check(property, &quick.Config{MaxCount: propertyCases(150, 30), Rand: rand.New(rand.NewSource(20261021))}); err != nil {
 		t.Fatal(err)
 	}
 }

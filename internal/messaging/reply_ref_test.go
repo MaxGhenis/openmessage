@@ -328,7 +328,7 @@ func TestReplyTargetLoadFailureFailsBeforeTransport(t *testing.T) {
 //     its body, and the attachment fields its first attachment.
 //   - The mapping is deterministic: a retried attempt carries the same ref.
 func TestReplyRefInvariants(t *testing.T) {
-	for seed := int64(1); seed <= 40; seed++ {
+	for seed := int64(1); seed <= int64(propertyCases(40, 10)); seed++ {
 		seed := seed
 		t.Run(fmt.Sprintf("seed=%d", seed), func(t *testing.T) {
 			checkReplyRefInvariants(t, seed)

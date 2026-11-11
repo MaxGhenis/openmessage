@@ -3,7 +3,6 @@ package ingest
 import (
 	"context"
 	"crypto/sha256"
-	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -857,10 +856,7 @@ func (h *googleEchoHarness) countOutboxRows(t *testing.T) int {
 
 func countSQLiteRows(t *testing.T, path, query string, args ...any) int {
 	t.Helper()
-	inspection, err := sql.Open("sqlite", path)
-	if err != nil {
-		t.Fatalf("sql.Open(inspect): %v", err)
-	}
+	inspection := openSQLiteInspector(t, path)
 	defer inspection.Close()
 	var count int
 	if err := inspection.QueryRow(query, args...).Scan(&count); err != nil {
