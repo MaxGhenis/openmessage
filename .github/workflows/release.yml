@@ -7,15 +7,84 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Tag to release (e.g. v0.2.0)'
+        description: 'Existing tag merged into main (e.g. v0.3.0)'
         required: true
 
 permissions:
-  contents: write
+  contents: read
+
+# Release builds must resolve the checked-in public module graph, even if a
+# runner has a Go workspace or private-module configuration left over.
+env:
+  GOENV: 'off'
+  GOWORK: 'off'
+  GOFLAGS: '-mod=readonly'
+  GOPROXY: https://proxy.golang.org
+  GOSUMDB: sum.golang.org
+  GOPRIVATE: ''
+  GONOPROXY: none
+  GONOSUMDB: none
+  GOVCS: '*:off'
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
 
 jobs:
+  prepare:
+    name: Resolve release tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.metadata.outputs.tag }}
+      commit: ${{ steps.metadata.outputs.commit }}
+      version: ${{ steps.metadata.outputs.version }}
+      build: ${{ steps.metadata.outputs.build }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate tag, mainline ancestry, and bundle version
+        id: metadata
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+        run: python3 scripts/release_metadata.py --tag "$RELEASE_TAG" --github-output "$GITHUB_OUTPUT"
+
+  verify:
+    name: Verify release source
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.commit }}
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Verify dependencies with an empty public module cache
+        env:
+          GOMODCACHE: ${{ runner.temp }}/release-modules
+        run: |
+          go mod download
+          go mod verify
+          go list -m -json all > public-modules.json
+          go test ./...
+          go test -race ./...
+      - name: Verify release metadata regression tests
+        run: python3 -m unittest discover -s scripts -p 'test_release_*.py'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-public-modules
+          path: public-modules.json
+          retention-days: 7
+
   build-cross-platform:
     name: Build CLI binaries
+    needs: prepare
     runs-on: ubuntu-latest
     timeout-minutes: 15
     strategy:
@@ -31,21 +100,24 @@ jobs:
             goarch: amd64
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.commit }}
+          persist-credentials: false
 
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-          cache: true
+          cache: false
 
       - name: Build binary
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: 0
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
         run: |
-          version="${GITHUB_REF_NAME:-${{ inputs.tag }}}"
           mkdir -p dist
-          go build -trimpath -ldflags "-s -w -X main.version=${version}" -o dist/openmessage .
+          go build -trimpath -ldflags "-s -w -X main.version=${RELEASE_TAG}" -o dist/openmessage .
           tar -C dist -czf "openmessage-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz" openmessage
 
       - name: Upload artifact
@@ -57,15 +129,19 @@ jobs:
 
   build-macos-app:
     name: Build macOS .app + .dmg
+    needs: prepare
     runs-on: macos-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.commit }}
+          persist-credentials: false
 
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-          cache: true
+          cache: false
 
       # Import the Developer ID Application certificate into a temporary
       # keychain so codesign can find it. Skipped when secrets are unset
@@ -89,7 +165,11 @@ jobs:
           security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
 
           # Make the new keychain the default search target so codesign sees it
-          security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | tr -d '"')
+          existing_keychains=()
+          while IFS= read -r keychain; do
+            existing_keychains+=("$keychain")
+          done < <(security list-keychains -d user | sed 's/^[[:space:]]*"//;s/"[[:space:]]*$//')
+          security list-keychains -d user -s "$KEYCHAIN_PATH" "${existing_keychains[@]}"
 
           # Import the cert and authorize codesign to use it without prompting
           security import "$RUNNER_TEMP/cert.p12" \
@@ -114,13 +194,17 @@ jobs:
           # so a stale dev build can never shadow the installed app in
           # LaunchServices. Shipping artifacts must carry the real id.
           RELEASE: "1"
+          VERSION: ${{ needs.prepare.outputs.tag }}
           DEVELOPER_ID: ${{ secrets.DEVELOPER_ID }}
           AC_USERNAME: ${{ secrets.AC_USERNAME }}
           AC_PASSWORD: ${{ secrets.AC_PASSWORD }}
           AC_TEAM_ID: ${{ secrets.AC_TEAM_ID }}
         run: bash macos/build.sh
 
-      - name: Verify release bundle identity
+      - name: Verify release bundle identity and version
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+          RELEASE_BUILD: ${{ needs.prepare.outputs.build }}
         run: |
           plist=macos/build/OpenMessage.app/Contents/Info.plist
           id=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$plist")
@@ -129,6 +213,12 @@ jobs:
           if [ "$id" != "com.openmessage.app" ] || [ "$name" != "OpenMessage" ]; then
             echo "::error::Release build has id '$id' / name '$name', expected com.openmessage.app / OpenMessage."
             echo "::error::RELEASE=1 was not honored — refusing to ship a dev-identity build."
+            exit 1
+          fi
+          version=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$plist")
+          build=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$plist")
+          if [ "$version" != "$RELEASE_VERSION" ] || [ "$build" != "$RELEASE_BUILD" ]; then
+            echo "::error::Packaged bundle version does not match the validated release tag."
             exit 1
           fi
           test -f macos/build/OpenMessage.dmg || {
@@ -162,19 +252,24 @@ jobs:
 
   release:
     name: Publish GitHub Release
-    needs: [build-cross-platform, build-macos-app]
+    needs: [prepare, verify, build-cross-platform, build-macos-app]
+    if: github.repository == 'MaxGhenis/openmessage'
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+      RELEASE_COMMIT: ${{ needs.prepare.outputs.commit }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ needs.prepare.outputs.commit }}
           fetch-depth: 0
+          persist-credentials: false
 
-      - name: Determine tag
-        id: tag
-        run: |
-          tag="${GITHUB_REF_NAME:-${{ inputs.tag }}}"
-          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+      - name: Confirm the tag still identifies the built commit
+        run: test "$(git rev-parse "refs/tags/${RELEASE_TAG}^{commit}")" = "$RELEASE_COMMIT"
 
       - name: Download all artifacts
         uses: actions/download-artifact@v4
@@ -191,31 +286,33 @@ jobs:
           cp artifacts/OpenMessage-dmg/OpenMessage.dmg release/
 
           # Generate SHA256 checksums for verification + Homebrew updates
-          (cd release && shasum -a 256 * > SHA256SUMS)
+          (cd release && shasum -a 256 ./* > SHA256SUMS)
 
-      - name: Generate release notes
-        id: notes
+      - name: Prepare release notes
         run: |
-          tag="${{ steps.tag.outputs.tag }}"
-          previous=$(git tag --sort=-v:refname | grep -v "^${tag}$" | head -n1)
-          if [ -z "$previous" ]; then
-            git log --pretty=format:"- %s (%h)" > NOTES.md
+          if [ -f "docs/releases/${RELEASE_TAG}.md" ]; then
+            cp "docs/releases/${RELEASE_TAG}.md" NOTES.md
           else
-            git log "${previous}..${tag}" --pretty=format:"- %s (%h)" > NOTES.md
+            previous=$(git describe --tags --abbrev=0 --match 'v[0-9]*' "${RELEASE_COMMIT}^" 2>/dev/null || true)
+            if [ -n "$previous" ]; then
+              git log "${previous}..${RELEASE_COMMIT}" --pretty=format:"- %s (%h)" > NOTES.md
+            else
+              git log "$RELEASE_COMMIT" --pretty=format:"- %s (%h)" > NOTES.md
+            fi
           fi
-          echo "Generated notes from ${previous:-beginning} to ${tag}"
+          printf '\n\nSource commit: %s\n' "$RELEASE_COMMIT" >> NOTES.md
 
       - name: Create or update release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          tag="${{ steps.tag.outputs.tag }}"
-          if gh release view "$tag" >/dev/null 2>&1; then
-            gh release upload "$tag" release/* --clobber
-            gh release edit "$tag" --notes-file NOTES.md
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" release/* --clobber
+            gh release edit "$RELEASE_TAG" --notes-file NOTES.md
           else
-            gh release create "$tag" \
-              --title "OpenMessage ${tag}" \
+            gh release create "$RELEASE_TAG" \
+              --verify-tag \
+              --title "OpenMessage ${RELEASE_TAG}" \
               --notes-file NOTES.md \
               release/*
           fi
