@@ -1649,6 +1649,30 @@ func (s *generationSink) AppendHistoryIngress(ctx context.Context, record RawIng
 	return history.AppendHistoryIngress(ctx, record)
 }
 
+// AppendReplayedIngress commits a frame the transport held across a
+// generation change under the same account, generation, and fence checks as
+// AppendIngress, and forwards it to the downstream sink's live AppendIngress,
+// but records no generation activity (ReplayIngressSink). In legacy-only mode
+// (no downstream sink) the frame is discarded, as a live frame is.
+func (s *generationSink) AppendReplayedIngress(ctx context.Context, record RawIngressRecord) error {
+	if record.AccountID != s.supervisor.accountID || record.Generation != s.generation {
+		return ErrStaleGeneration
+	}
+	if ctx == nil {
+		return errors.New("bridge: connection sink context is nil")
+	}
+	fence := &s.supervisor.gate
+	fence.mu.RLock()
+	defer fence.mu.RUnlock()
+	if !fence.active || fence.generation != s.generation {
+		return ErrStaleGeneration
+	}
+	if s.supervisor.sink == nil {
+		return nil
+	}
+	return s.supervisor.sink.AppendIngress(ctx, record)
+}
+
 func (s *generationSink) EmitEphemeral(ctx context.Context, event EphemeralEvent) error {
 	if event.AccountID != s.supervisor.accountID || event.Generation != s.generation {
 		return ErrStaleGeneration
@@ -1912,4 +1936,6 @@ func callPair(
 }
 
 var _ ConnectionSink = (*generationSink)(nil)
+var _ HistoryIngressSink = (*generationSink)(nil)
+var _ ReplayIngressSink = (*generationSink)(nil)
 var _ PairSink = (*pairingSink)(nil)
