@@ -6266,10 +6266,12 @@ body::after {
   // tab hasn't stored.
   let composeSyncedText = '';
   // Conversations whose latest text this tab failed to store (a full or
-  // blocked localStorage). This tab's copy answers for them until a write
-  // succeeds, so a later read can't swap in an older stored draft. When the
-  // store takes that text later, it replaces whatever another tab stored
-  // for the conversation meanwhile; the macOS app has one tab.
+  // blocked localStorage), or whose draft it failed to delete. This tab's
+  // copy answers for them until the store takes that conversation's text,
+  // so a later read can't swap in an older stored draft. When the store
+  // takes it, it replaces whatever another tab stored for the conversation
+  // meanwhile, and a refused delete deletes another tab's newer draft; the
+  // macOS app has one tab.
   const composeDraftsOnlyHere = new Set();
   let contextMenuState = null;
   let threadSearchTimer = 0;
@@ -11963,6 +11965,9 @@ body::after {
       storeRefusedComposeDrafts();
     } else {
       composeDraftsOnlyHere.add(convoId);
+      // The box may hold other text than the refused write (a schedule
+      // that couldn't empty it), so leaving stores whatever it holds.
+      if (convoId === activeConvoId) composeSyncedText = null;
     }
   }
 

@@ -404,12 +404,8 @@ test('keeps text the store refused, and stores it with the next write that succe
   await page.locator('#compose-input').fill('a draft for Marcus');
   expect((await storedComposeDrafts(page))[sarahConversationID].text).toBe('a much longer draft the store refused');
 
-  await openConversation(page, 'Sarah Chen');
-  await expect(page.locator('#compose-input')).toHaveValue('a much longer draft the store refused');
-
   // Once stored, Sarah's draft follows the store again: another tab's
   // change shows here.
-  await openConversation(page, 'Marcus Johnson');
   const now = Date.now();
   await storeComposeDrafts(page, {
     [sarahConversationID]: { text: 'changed in another tab', updated_at_ms: now },
@@ -417,6 +413,22 @@ test('keeps text the store refused, and stores it with the next write that succe
   });
   await openConversation(page, 'Sarah Chen');
   await expect(page.locator('#compose-input')).toHaveValue('changed in another tab');
+});
+
+test('shows refused text when you reopen its conversation while the store still refuses', async ({ page }) => {
+  const sarahConversationID = await conversationIDNamed(page, 'Sarah Chen');
+
+  await openConversation(page, 'Sarah Chen');
+  await page.locator('#compose-input').fill('short draft');
+  await breakComposeDraftStore(page);
+  await page.locator('#compose-input').fill('a much longer draft the store refused');
+  await openConversation(page, 'Marcus Johnson');
+  await openConversation(page, 'Sarah Chen');
+  await expect(page.locator('#compose-input')).toHaveValue('a much longer draft the store refused');
+
+  await fixComposeDraftStore(page);
+  await openConversation(page, 'Marcus Johnson');
+  expect((await storedComposeDrafts(page))[sarahConversationID].text).toBe('a much longer draft the store refused');
 });
 
 test('stores refused text when you leave its conversation after the store recovers', async ({ page }) => {
