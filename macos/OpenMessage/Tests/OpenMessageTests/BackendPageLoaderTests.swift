@@ -101,12 +101,14 @@ final class BackendPageLoaderTests: XCTestCase {
     }
 
     // Two pending retries: the newer failure's retry replaces the older
-    // one, so the old address never loads over the new.
+    // one, so the old address never loads over the new. The pause between
+    // failures makes the older retry wake first if it isn't cancelled.
     func testOnlyTheNewestFailureRetries() async {
         let recorder = Recorder()
-        let loader = makeLoader(recorder, retryDelay: .milliseconds(50))
+        let loader = makeLoader(recorder, retryDelay: .milliseconds(200))
         loader.show(backend)
         loader.navigationFailed(refused)
+        try? await Task.sleep(for: .milliseconds(20))
         loader.show(movedBackend)
         loader.navigationFailed(refused)
         await waitForLoads(recorder, count: 3)

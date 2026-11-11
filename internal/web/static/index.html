@@ -11966,7 +11966,8 @@ body::after {
     } else {
       composeDraftsOnlyHere.add(convoId);
       // The box may hold other text than the refused write (a schedule
-      // that couldn't empty it), so leaving stores whatever it holds.
+      // that left the box alone because its message changed meanwhile), so
+      // leaving stores whatever the box holds.
       if (convoId === activeConvoId) composeSyncedText = null;
     }
   }
