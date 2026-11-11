@@ -10,7 +10,7 @@
 #          (to re-pair, stop the container and run pair in a fresh one with the same volume)
 # Connect: claude mcp add -s user --transport sse openmessage http://<host>:7007/mcp/sse
 
-FROM golang:1.25-alpine AS build
+FROM golang:1.26-alpine3.24 AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
@@ -22,7 +22,7 @@ RUN CGO_ENABLED=0 go build \
       -o /out/openmessage \
       .
 
-FROM alpine:3.20
+FROM alpine:3.24
 RUN apk add --no-cache ca-certificates tzdata && \
     addgroup -S openmessage && \
     adduser -S -G openmessage -h /home/openmessage openmessage && \
