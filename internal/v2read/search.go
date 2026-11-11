@@ -7,9 +7,11 @@ import (
 	"github.com/maxghenis/openmessage/internal/storage/sqlite"
 )
 
-// SearchMessagesFiltered performs a bounded LIKE substring scan. R5 preserves
-// substring matching and deterministic recency order; FTS relevance ranking is
-// explicitly deferred to S8.
+// SearchMessagesFiltered returns the newest messages whose body contains query
+// under SQLite LIKE semantics (R5: substring, ASCII case-insensitive, '%' and
+// '_' as wildcards) in deterministic recency order. The store reads candidates
+// from its trigram index or its newest messages; the LIKE decides every match
+// (sqlite.MessageRepository.SearchMessages).
 func (s *Source) SearchMessagesFiltered(
 	query string,
 	filter db.SearchFilter,
