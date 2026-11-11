@@ -9,72 +9,23 @@
 // Required env vars:
 //   BLOB_READ_WRITE_TOKEN   — Vercel Blob token (already set for waitlist)
 //
-// Telemetry is opt-in client-side. This endpoint accepts whatever is sent;
-// rate-limiting + per-install dedup is the client's responsibility.
+// Telemetry is opt-in client-side. The server bounds what anyone can store:
+// install ids must have the app's format, each address is rate-limited, and
+// at most HEARTBEAT.dailyCap objects are written per day
+// (lib/public-writes.mjs).
 
-import { put } from "@vercel/blob";
+import { list, put } from "@vercel/blob";
 import { NextResponse } from "next/server";
 
-const SCHEMA_VERSION = 1;
+import { HEARTBEAT, createRateLimiter, handleHeartbeat } from "../../../lib/public-writes.mjs";
 
-function safeString(value, max = 64) {
-  return `${value || ""}`.replace(/[^A-Za-z0-9._-]/g, "").slice(0, max);
-}
+const allow = createRateLimiter(HEARTBEAT.perAddress);
 
 export async function POST(request) {
-  let payload;
-  try {
-    payload = await request.json();
-  } catch {
-    return NextResponse.json({ ok: false }, { status: 400 });
-  }
-
-  if (!payload || payload.schema_version !== SCHEMA_VERSION) {
-    return NextResponse.json({ ok: false }, { status: 400 });
-  }
-
-  const installId = safeString(payload.install_id, 64);
-  if (installId.length < 16) {
-    return NextResponse.json({ ok: false }, { status: 400 });
-  }
-
-  const day = new Date().toISOString().slice(0, 10);
-  const record = {
-    install_id: installId,
-    version: safeString(payload.version, 32),
-    os: safeString(payload.os, 16),
-    arch: safeString(payload.arch, 16),
-    platforms: {
-      google_messages: !!payload?.platforms?.google_messages,
-      whatsapp: !!payload?.platforms?.whatsapp,
-      signal: !!payload?.platforms?.signal,
-    },
-    received_at: new Date().toISOString(),
-  };
-
-  if (!process.env.BLOB_READ_WRITE_TOKEN) {
-    // No-op if not configured; respond OK so the app doesn't retry.
-    return NextResponse.json({ ok: true, persisted: false });
-  }
-
-  try {
-    await put(
-      `heartbeats/${day}/${installId}.json`,
-      JSON.stringify(record),
-      {
-        access: "public",
-        addRandomSuffix: false,
-        contentType: "application/json",
-      },
-    );
-  } catch (err) {
-    console.error("heartbeat persist failed:", err);
-    return NextResponse.json({ ok: false }, { status: 502 });
-  }
-
-  return NextResponse.json({ ok: true });
+  const { status, body } = await handleHeartbeat(request, { put, list, env: process.env, allow });
+  return NextResponse.json(body, { status });
 }
 
 export async function GET() {
-  return NextResponse.json({ ok: true, schema_version: SCHEMA_VERSION });
+  return NextResponse.json({ ok: true, schema_version: HEARTBEAT.schemaVersion });
 }
