@@ -1,8 +1,11 @@
 # OpenMessage as a headless server with persistent storage.
 #
 # Usage:
-#     docker compose up -d
+#     docker compose pull
+#     docker compose up -d --no-build
+#     # or build locally: docker compose up -d --build
 #     docker compose exec openmessage openmessage pair    # one-time
+#     docker compose restart openmessage                  # load the new session
 #     # re-pairing later: docker compose stop, then
 #     #   docker compose run --rm openmessage pair, then up -d
 #     # then connect Claude / other MCP clients to http://localhost:7007/mcp/sse
@@ -10,11 +13,11 @@
 services:
   openmessage:
     build: .
-    image: openmessage:latest
+    image: ${OPENMESSAGE_IMAGE:-ghcr.io/maxghenis/openmessage:latest}
     container_name: openmessage
     restart: unless-stopped
     ports:
-      - "7007:7007"
+      - "127.0.0.1:7007:7007"
     volumes:
       - openmessage-data:/data
     environment:

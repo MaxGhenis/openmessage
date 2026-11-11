@@ -2,6 +2,14 @@
 
 Use this before shipping a TestFlight/App Store build, public website update, or signed macOS release.
 
+Pushing a `v*` tag runs the `Release` workflow to build the CLI binaries and
+macOS app and publish a GitHub Release. It also publishes a multi-platform
+(`linux/amd64`, `linux/arm64`) image to `ghcr.io/maxghenis/openmessage`, tagged
+with the release tag and, for stable releases, `latest`. Other forks use their
+own lowercased `ghcr.io/<owner>/<repository>` image name.
+Manual runs require an existing release tag; all builds check out that tag
+and use it as their version, not the selected workflow branch.
+
 ## 1. Worktree And Privacy Preflight
 
 - Run `git status --short` and confirm every changed file is intentional.
@@ -42,5 +50,6 @@ Use this before shipping a TestFlight/App Store build, public website update, or
 
 - No open P1/P2 review findings or known privacy leaks.
 - No failing required CI checks.
-- Release artifacts are generated from the intended commit.
+- Release artifacts and container images are generated from the intended commit/tag.
+- Confirm both container platforms can be pulled, the Compose health check passes, and prereleases do not replace `latest`.
 - Rollback path is known before promoting a website deployment or public build.

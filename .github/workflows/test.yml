@@ -123,6 +123,49 @@ jobs:
       - name: Build marketing site
         run: npm run build
 
+  container:
+    name: Container smoke test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      OPENMESSAGE_IMAGE: openmessage:test
+      COMPOSE_PROJECT_NAME: openmessage-container-test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build container
+        run: |
+          docker compose config --quiet
+          docker compose build --build-arg VERSION=container-test
+
+      - name: Verify runtime and Compose health check
+        run: |
+          docker compose up --detach --no-build --wait --wait-timeout 90
+          docker compose port openmessage 7007 | grep -Fx '127.0.0.1:7007'
+          docker compose exec -T openmessage sh -es <<'SH'
+          test "$(id -u):$(id -g)" = "100:101"
+          test "$HOME" = "/home/openmessage"
+          command -v apk
+          touch /data/.container-smoke
+          rm /data/.container-smoke
+          test -s /etc/ssl/certs/ca-certificates.crt
+          test -s /usr/share/zoneinfo/America/New_York
+          test "$(TZ=America/New_York date -d @0 +%z)" = "-0500"
+          wget -qO- \
+            --header='Content-Type: application/json' \
+            --header='Accept: application/json, text/event-stream' \
+            --post-data='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"container-smoke","version":"1"}}}' \
+            http://127.0.0.1:7007/mcp | grep -q '"version":"container-test"'
+          SH
+
+      - name: Show container logs on failure
+        if: failure()
+        run: docker compose logs
+
+      - name: Clean up
+        if: always()
+        run: docker compose down --volumes
+
   macos-build:
     name: macOS App Build
     runs-on: macos-latest
