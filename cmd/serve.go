@@ -84,6 +84,7 @@ func mcpV2Dependencies(stack *v2Stack) []*tools.V2Dependencies {
 		Service:  stack.Service,
 		V2Store:  stack.Store,
 		Registry: stack.Registry,
+		Media:    stack.Media,
 	}}
 }
 
@@ -128,6 +129,17 @@ var freshnessPlatformByStorage = map[string]string{
 	"rcs":      "google",
 	"whatsapp": "whatsapp",
 	"signal":   "signal",
+}
+
+// googleSMSPathMonitor judges whether carrier SMS has stopped reaching the
+// phone while RCS flows. Only the v2 inbox keeps the protobuf type that tells
+// SMS from RCS, and only v2 ingest writes it, so without both there is
+// nothing to judge.
+func googleSMSPathMonitor(stack *v2Stack, ingestEnabled bool) *freshness.SMSPathMonitor {
+	if stack == nil || stack.Store == nil || !ingestEnabled {
+		return nil
+	}
+	return freshness.NewSMSPathMonitor(ingest.GoogleSMSPathLoader(stack.Store))
 }
 
 func v2IngestCountersProvider(stack *v2Stack) func() map[string]ingest.CounterSnapshot {
@@ -268,6 +280,9 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 		} else {
 			logger.Info().Msg("V2 stack disabled (flags off)")
 		}
+		// Pull health compares empty Google pulls against what readers see;
+		// install the count before the supervisor can start a backfill.
+		installGooglePullCounter(a, v2Primary, stack)
 		repairer := newGoogleCredentialRepairer(
 			a.SessionPath,
 			canRefreshGoogleCookies,
@@ -282,6 +297,7 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 		newGoogleSupervisor := func() (*bridge.Supervisor, error) {
 			supervisorOptions := []bridge.SupervisorOption{
 				bridge.WithCredentialRepairer(repairer),
+				bridge.WithSnapshotObserver(googleSupervisorObserver(logger, publishOverallStatus)),
 			}
 			if stack != nil {
 				supervisorOptions = append(supervisorOptions, bridge.WithConnectionSink(stack.Sink))
@@ -301,6 +317,13 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 			return fmt.Errorf("init Google Messages supervisor: %w", err)
 		}
 		googleControl = newGoogleSupervisorControl(googleSupervisor, a.SessionPath, newGoogleSupervisor)
+		a.SetGoogleSupervisorStatus(func() (app.GoogleSupervisorStatus, bool) {
+			snapshot, ok := googleControl.Snapshot()
+			if !ok {
+				return app.GoogleSupervisorStatus{}, false
+			}
+			return googleSupervisorStatus(snapshot), true
+		})
 		googleStartupCtx, cancelGoogleStartup := context.WithCancel(context.Background())
 		var googleStartupWG sync.WaitGroup
 		defer func() {
@@ -714,6 +737,7 @@ func RunServe(logger zerolog.Logger, args ...string) error {
 				V2:                    v2Options,
 				V2IngestCounters:      v2IngestCounters,
 				Activity:              freshnessActivity,
+				GoogleSMSPath:         googleSMSPathMonitor(stack, v2Ingest),
 				Reads:                 reads,
 				V2Primary:             v2Primary,
 				Client:                a.GetClient,
@@ -878,9 +902,11 @@ func runServeMCPClient(logger zerolog.Logger, opts serveOptions) error {
 		if _, err := os.Stat(v2StorePath); err != nil {
 			return fmt.Errorf("v2-primary reads selected but no migrated store at %s: %w", v2StorePath, err)
 		}
-		opened, err := sqlite.Open(v2StorePath)
+		// Never migrate here: the daemon owns the store, and a migration's
+		// write lock would stall its writes for the whole index build.
+		opened, err := sqlite.OpenWithoutMigrating(v2StorePath)
 		if err != nil {
-			return fmt.Errorf("open v2 read store %q: %w", v2StorePath, err)
+			return fmt.Errorf("open v2 read store %q: %w", v2StorePath, clientStoreOpenError(err))
 		}
 		v2Store = opened
 		defer func() {
@@ -1116,12 +1142,19 @@ var refreshGoogleSessionCookies = func(ctx context.Context, sessionPath string) 
 	if !googlecookies.NativeSupported() {
 		return nil
 	}
-	if err := googlecookies.Refresh(ctx, googlecookies.DefaultChromeProfile(), sessionPath); err != nil {
+	stats, err := googlecookies.RefreshWithStats(ctx, googlecookies.DefaultChromeProfile(), sessionPath)
+	if err != nil {
 		if ctx.Err() != nil {
 			return fmt.Errorf("refresh Google cookies timed out after %s", googleCookieRefreshTimeout)
 		}
 		return fmt.Errorf("refresh Google cookies: %w", err)
 	}
+	// Counts only, never values. changed=0 means Chrome holds the very
+	// cookies Google just rejected, so the reconnect will likely fail too.
+	zerolog.Ctx(ctx).Info().
+		Int("cookies", stats.Cookies).
+		Int("changed", stats.Changed).
+		Msg("Refreshed Google session cookies from Chrome")
 	return nil
 }
 
@@ -1178,4 +1211,14 @@ func logSyncError(logger zerolog.Logger, lastImportErr map[string]string, platfo
 		event = logger.Debug().Err(err).Str("platform", platform)
 	}
 	event.Msg("Local platform sync unavailable")
+}
+
+// installGooglePullCounter points pull health at the store readers use: v2 on
+// a v2-primary install, else the legacy store.
+func installGooglePullCounter(a *app.App, v2Primary bool, stack *v2Stack) {
+	var reads readsource.ReadSource = a.Store
+	if v2Primary && stack != nil {
+		reads = v2read.New(stack.Store)
+	}
+	a.SetGoogleConversationCounter(func() (int, error) { return reads.ConversationCount("sms") })
 }

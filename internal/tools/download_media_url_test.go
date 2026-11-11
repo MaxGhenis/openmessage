@@ -62,15 +62,23 @@ func TestDownloadMediaReturnsLegacyMediaURLWithoutDownloadingOrWriting(t *testin
 	}
 }
 
-func TestDownloadMediaToolIsReadOnlyServingURL(t *testing.T) {
+// Saving is opt-in (save or output_path) and writes only a private file under
+// the export root, so the tool is no longer read-only, but it never destroys
+// anything and repeating it is harmless.
+func TestDownloadMediaToolDocumentsURLAndOptInSave(t *testing.T) {
 	tool := downloadMediaTool()
-	if tool.Annotations.ReadOnlyHint == nil || !*tool.Annotations.ReadOnlyHint {
-		t.Fatalf("readOnlyHint = %#v, want true", tool.Annotations.ReadOnlyHint)
+	if tool.Annotations.ReadOnlyHint == nil || *tool.Annotations.ReadOnlyHint {
+		t.Fatalf("readOnlyHint = %#v, want false: save writes a file", tool.Annotations.ReadOnlyHint)
 	}
-	if strings.Contains(strings.ToLower(tool.Description), "save to a local file") {
-		t.Fatalf("description still promises a local-file mutation: %q", tool.Description)
+	if tool.Annotations.DestructiveHint == nil || *tool.Annotations.DestructiveHint {
+		t.Fatalf("destructiveHint = %#v, want false", tool.Annotations.DestructiveHint)
 	}
-	if !strings.Contains(tool.Description, "/api/media/") {
-		t.Fatalf("description does not document the serving URL: %q", tool.Description)
+	if tool.Annotations.IdempotentHint == nil || !*tool.Annotations.IdempotentHint {
+		t.Fatalf("idempotentHint = %#v, want true", tool.Annotations.IdempotentHint)
+	}
+	for _, want := range []string{"/api/media/", "v2msg:", "save=true", "OPENMESSAGES_EXPORT_DIR"} {
+		if !strings.Contains(tool.Description, want) {
+			t.Fatalf("description does not mention %q: %q", want, tool.Description)
+		}
 	}
 }

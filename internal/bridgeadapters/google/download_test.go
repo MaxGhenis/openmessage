@@ -171,8 +171,6 @@ func TestDownloadMediaInvalidOpaqueFieldsAreTerminalPreCall(t *testing.T) {
 		key         string
 		fingerprint string
 	}{
-		{name: "missing media id", key: "00", fingerprint: "google_opaque_media_id_missing"},
-		{name: "blank media id", mediaID: "  ", key: "00", fingerprint: "google_opaque_media_id_missing"},
 		{name: "missing key", mediaID: "media-id", fingerprint: "google_opaque_decryption_key_missing"},
 		{name: "non-hex key", mediaID: "media-id", key: "not-hex", fingerprint: "google_opaque_decryption_key_invalid"},
 		{name: "odd-length key", mediaID: "media-id", key: "abc", fingerprint: "google_opaque_decryption_key_invalid"},
@@ -193,6 +191,47 @@ func TestDownloadMediaInvalidOpaqueFieldsAreTerminalPreCall(t *testing.T) {
 			}
 			if fake.calls != 0 {
 				t.Fatalf("DownloadMedia transport calls = %d, want 0", fake.calls)
+			}
+		})
+	}
+}
+
+// Google sends an attachment's message before it names the media (no media
+// ID, full-size or thumbnail) and names it in an update about a second later.
+// That reference is not malformed: the download must say "not yet" without
+// calling the transport, and must not be a terminal OpError.
+func TestDownloadMediaWithoutMediaIDIsNotReadyPreCall(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		mediaID string
+		key     string
+	}{
+		{name: "missing media id and key"},
+		{name: "missing media id", key: "00"},
+		{name: "blank media id", mediaID: "  ", key: "00"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fake := &fakeDownloadClient{}
+			a := newDownloadTestAdapter(t, fake)
+			stream, err := a.DownloadMedia(context.Background(), "google-primary", bridge.MediaRef{
+				Opaque: googleDownloadOpaque(t, 1, test.mediaID, test.key),
+			})
+			if stream.ReadCloser != nil {
+				stream.Close()
+				t.Fatal("not-ready DownloadMedia returned a stream")
+			}
+			if !errors.Is(err, bridge.ErrMediaNotReady) {
+				t.Fatalf("DownloadMedia() error = %v, want bridge.ErrMediaNotReady", err)
+			}
+			var failure bridge.OpError
+			if errors.As(err, &failure) {
+				t.Fatalf("DownloadMedia() error carries OpError %+v, want a plain not-ready error", failure)
+			}
+			if fake.calls != 0 {
+				t.Fatalf("DownloadMedia transport calls = %d, want 0", fake.calls)
+			}
+			if err := ValidateDownloadOpaque(googleDownloadOpaque(t, 1, test.mediaID, test.key)); !errors.Is(err, bridge.ErrMediaNotReady) {
+				t.Fatalf("ValidateDownloadOpaque() = %v, want bridge.ErrMediaNotReady", err)
 			}
 		})
 	}

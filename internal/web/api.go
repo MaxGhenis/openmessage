@@ -48,7 +48,21 @@ var staticFS embed.FS
 // production.
 var maxUploadBytes int64 = messaging.DefaultMaxMediaBytes
 
-const maxTranscriptRequestBytes = db.MaxTranscriptBytes + db.MaxTranscriptModelBytes + 4096
+// maxTranscriptRequestBytes bounds an /api/transcript body. JSON escaping can
+// spend 6 bytes on one byte of text (Go's encoder writes "<" as \u003c), so
+// the bound leaves room for that on a transcript and model at their limits,
+// plus the message ID and the JSON around them. The handler checks the limits
+// themselves against the decoded text.
+const maxTranscriptRequestBytes = 6*(db.MaxTranscriptBytes+db.MaxTranscriptModelBytes) + 4096
+
+// transcriptsUnavailableInV2Primary is /api/transcript's refusal on a
+// v2-primary daemon. The v2 store keeps no transcripts (the legacy->v2
+// migration counts and drops them). This route writes the legacy store, but
+// the message reads that show transcripts (the conversation view and the MCP
+// read tools) serve v2, so none would show it, and they hand out v2 message
+// IDs.
+const transcriptsUnavailableInV2Primary = "transcripts are not available while v2 is the serving store: " +
+	"message reads come from the v2 store, which keeps no transcripts"
 
 const sseWriteTimeout = 5 * time.Second
 
@@ -138,6 +152,10 @@ type APIOptions struct {
 	// /api/status uses it to flag a platform whose silence outlasts its own
 	// baseline (freshness.<platform>.silence). Nil skips the silence check.
 	Activity freshness.ActivitySource
+
+	// GoogleSMSPath judges whether carrier SMS has stopped reaching the phone
+	// while RCS still flows (freshness.google.sms_path). Nil skips the check.
+	GoogleSMSPath *freshness.SMSPathMonitor
 }
 
 type SearchResult struct {
@@ -175,7 +193,7 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 	if reads == nil {
 		reads = store
 	}
-	registerV1Routes(mux, store, logger, opts.V2, opts.V2Primary)
+	v1 := registerV1Routes(mux, store, logger, opts.V2, opts.V2Primary)
 	diagnosticsStartedAt := time.Now()
 	getClient := func() *client.Client {
 		if opts.Client != nil {
@@ -238,24 +256,42 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 	}
 	// Per-platform data-freshness, used to catch "zombie" bridges that report
 	// connected=true while no longer actually syncing (the connection flag
-	// lies; the data doesn't). Computing this scans the messages table, and
-	// /api/status is polled every few seconds, so cache it — staleness is a
-	// multi-day signal, so a 30s cache is plenty fresh.
+	// lies; the data doesn't). /api/status is polled every few seconds, so
+	// cache it — staleness is a multi-day signal, so a 30s cache is plenty
+	// fresh. On v2 the read is a few index seeks (platformLatest); the legacy
+	// store's PlatformStats still aggregates its whole messages table.
 	var (
 		freshnessMu       sync.Mutex
 		freshnessComputed time.Time
 		freshnessValue    map[string]any
 		silenceBaselines  = silenceBaselineCache{}
 	)
+	// googleReachable reports whether the daemon can reach the phone right
+	// now: connected to Google, and the phone answering.
+	googleReachable := func() bool {
+		if !googlePhoneResponding() {
+			return false
+		}
+		if opts.GoogleStatus != nil {
+			if status, ok := opts.GoogleStatus().(app.GoogleStatusSnapshot); ok {
+				return status.Connected
+			}
+		}
+		return true
+	}
 	computeFreshness := func() map[string]any {
 		freshnessMu.Lock()
 		defer freshnessMu.Unlock()
 		if freshnessValue != nil && time.Since(freshnessComputed) < 30*time.Second {
 			return freshnessValue
 		}
-		stats, err := reads.PlatformStats()
+		stats, err := platformLatest(reads)
 		if err != nil {
-			return freshnessValue // keep last good value on error
+			// Keep the last good value on error, except the SMS path: it
+			// reads the inbox, not these stats, and a cached stall must not
+			// outlive the phone becoming unreachable or its history going
+			// stale.
+			return withFreshGoogleSMSPath(freshnessValue, opts.GoogleSMSPath, time.Now(), googleReachable)
 		}
 		var newest int64
 		for _, st := range stats {
@@ -300,6 +336,10 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 		// "behind". Judge each platform's silence against its own baseline too
 		// (2026-10-06: Google ingest silent 38h with stale=false throughout).
 		addSilence(out, opts.Activity, silenceBaselines, freshnessValue, time.Now(), time.Local)
+		// A phone can lose carrier SMS while RCS keeps arriving over data
+		// (2026-10-03 to 10-07: 95 hours). Google stays the newest platform the
+		// whole time, so judge its SMS path on its own.
+		addGoogleSMSPath(out, opts.GoogleSMSPath, time.Now(), googleReachable)
 		freshnessValue = out
 		freshnessComputed = time.Now()
 		return out
@@ -320,6 +360,12 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 				"enabled":     opts.V2IngestCounters != nil,
 				"per_account": v2IngestPerAccount,
 			},
+		}
+		if opts.V2 != nil && opts.V2.Service != nil {
+			// The dispatch loop's in-flight and abandoned transport calls: a
+			// send that never returns froze all sending for hours on
+			// 2026-10-20 while every other field here looked healthy.
+			payload["v2_dispatch"] = opts.V2.Service.DispatchHealth()
 		}
 		if strings.TrimSpace(opts.IdentityName) != "" {
 			payload["identity_name"] = strings.TrimSpace(opts.IdentityName)
@@ -1997,9 +2043,9 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 				httpError(w, "v2 media not available", http.StatusServiceUnavailable)
 				return
 			}
-			if err := writeV2MessageMediaResponse(r.Context(), w, opts.V2, msgID); err != nil {
-				code, message := v1ErrorResponse(err)
-				httpError(w, message, code)
+			messageID, ordinal := parseV2MediaID(msgID)
+			if err := writeV2MessageMediaResponse(r, w, opts.V2, messageID, ordinal); err != nil {
+				writeMediaError(w, err)
 			}
 			return
 		}
@@ -2079,18 +2125,20 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			httpError(w, "method not allowed", 405)
 			return
 		}
-		var req struct {
-			ConversationID string `json:"conversation_id"`
-			MessageID      string `json:"message_id"`
-			Emoji          string `json:"emoji"`
-			Action         string `json:"action"` // "add", "remove", "switch"; default "add"
-		}
+		var req reactionRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			httpError(w, "invalid JSON: "+err.Error(), 400)
 			return
 		}
 		if req.MessageID == "" || req.Emoji == "" {
 			httpError(w, "message_id and emoji are required", 400)
+			return
+		}
+		if opts.V2Primary {
+			// The read API hands out v2 IDs here, which the legacy routing
+			// below cannot place: it tells platforms apart by ID prefix or a
+			// legacy-store lookup and falls back to Google Messages.
+			v1.react(w, r, req)
 			return
 		}
 		if isWhatsAppConversation(req.ConversationID) {
@@ -2154,6 +2202,10 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			httpError(w, "method not allowed", 405)
 			return
 		}
+		if opts.V2Primary {
+			httpError(w, transcriptsUnavailableInV2Primary, http.StatusConflict)
+			return
+		}
 		r.Body = http.MaxBytesReader(w, r.Body, maxTranscriptRequestBytes)
 		var req struct {
 			MessageID  string  `json:"message_id"`
@@ -2194,14 +2246,16 @@ func APIHandlerWithOptions(store *db.Store, cli *client.Client, logger zerolog.L
 			httpError(w, "load message: "+err.Error(), 500)
 			return
 		}
-		if msg != nil {
-			publishMessages(msg.ConversationID)
-		}
-		writeJSON(w, map[string]any{
+		response := map[string]any{
 			"success":           true,
 			"message_id":        req.MessageID,
 			"transcript_length": utf8.RuneCountInString(*req.Transcript),
-		})
+		}
+		if msg != nil {
+			response["transcript_model"] = msg.TranscriptModel
+			publishMessages(msg.ConversationID)
+		}
+		writeJSON(w, response)
 	})
 
 	mux.HandleFunc("/api/new-conversation", func(w http.ResponseWriter, r *http.Request) {
@@ -3464,12 +3518,33 @@ func scheduledID() string {
 	return "sched:" + hex.EncodeToString(b)
 }
 
+// parseV2MediaID accepts either a v2 message ID (its first attachment) or
+// the media_id the read API reports for an attachment, v2msg:<message>:<n>.
+func parseV2MediaID(raw string) (string, int64) {
+	raw = strings.TrimSpace(raw)
+	rest, ok := strings.CutPrefix(raw, "v2msg:")
+	if !ok {
+		return raw, 0
+	}
+	cut := strings.LastIndexByte(rest, ':')
+	if cut <= 0 {
+		return rest, 0
+	}
+	ordinal, err := strconv.ParseInt(rest[cut+1:], 10, 64)
+	if err != nil || ordinal < 0 {
+		return raw, 0
+	}
+	return rest[:cut], ordinal
+}
+
 func writeV2MessageMediaResponse(
-	ctx context.Context,
+	r *http.Request,
 	w http.ResponseWriter,
 	v2 *V2Options,
 	messageID string,
+	ordinal int64,
 ) error {
+	ctx := r.Context()
 	messages, err := sqlite.NewMessageRepository(v2.V2Store, time.Now)
 	if err != nil {
 		return err
@@ -3481,7 +3556,7 @@ func writeV2MessageMediaResponse(
 	descriptor, err := v2.Media.Resolve(ctx, media.DownloadCommand{
 		AccountID: message.AccountID,
 		MessageID: message.MessageID,
-		Ordinal:   0,
+		Ordinal:   ordinal,
 	})
 	if err != nil {
 		return err
@@ -3491,7 +3566,7 @@ func writeV2MessageMediaResponse(
 		return err
 	}
 	defer reader.Close()
-	writeDescriptorMediaResponse(w, reader, descriptor)
+	writeDescriptorMediaResponse(w, r, reader, descriptor)
 	return nil
 }
 
@@ -3698,6 +3773,9 @@ func googleAPIErrorMessage(action string, err error) string {
 	if isGoogleNetworkError(err) {
 		return "Google Messages is offline. Check your internet connection, then try again."
 	}
+	if app.IsGoogleAccountSwitchError(err) {
+		return "Google Messages on your phone switched to Google-account pairing and no longer answers this OpenMessage link. Re-pair OpenMessage, or switch the phone back to QR-code pairing."
+	}
 	return action + ": " + err.Error()
 }
 
@@ -3811,6 +3889,34 @@ func daysBehind(older, newer int64) int {
 // (legacy path and v2 projection commit independently), so seconds of
 // disagreement are normal; a real projection stall shows up as minutes.
 const projectionLagFloorMS = int64(5 * 60 * 1000)
+
+// platformLatestSource is implemented by read sources that report each
+// platform's newest message times without counting every message (v2read).
+type platformLatestSource interface {
+	PlatformLatest() ([]db.PlatformLatest, error)
+}
+
+// platformLatest returns each stored platform's newest sent/received times.
+// Freshness never reads the counts, so a v2 store answers with index seeks; the
+// legacy store has no such method and still runs its GROUP BY.
+func platformLatest(reads readsource.ReadSource) ([]db.PlatformLatest, error) {
+	if source, ok := reads.(platformLatestSource); ok {
+		return source.PlatformLatest()
+	}
+	stats, err := reads.PlatformStats()
+	if err != nil {
+		return nil, err
+	}
+	latest := make([]db.PlatformLatest, 0, len(stats))
+	for _, st := range stats {
+		latest = append(latest, db.PlatformLatest{
+			Platform:     st.Platform,
+			LatestMS:     st.LatestMS,
+			LatestRecvMS: st.LatestRecvMS,
+		})
+	}
+	return latest, nil
+}
 
 // addProjectionLag annotates each per-platform freshness entry with how far the
 // active read source trails the legacy store, and stamps a top-level

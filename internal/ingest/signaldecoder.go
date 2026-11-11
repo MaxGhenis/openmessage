@@ -26,6 +26,11 @@ type signalJSONRPCFrame struct {
 	Line                json.RawMessage `json:"line"`
 	ResolvedSource      string          `json:"resolved_source"`
 	ResolvedDestination string          `json:"resolved_destination"`
+	// AttachmentErrors maps an attachment id in Line to the download failure
+	// signal-cli logged for it while printing Line. Absent from frames whose
+	// attachments all downloaded and from every frame captured before it
+	// existed.
+	AttachmentErrors map[string]string `json:"attachment_errors,omitempty"`
 }
 
 type signalDownloadOpaqueV1 struct {
@@ -56,6 +61,33 @@ func BuildSignalIngress(
 	line []byte,
 	resolvedSource string,
 	resolvedDestination string,
+	receivedAt time.Time,
+) (*bridge.RawIngressRecord, *bridge.EphemeralEvent, error) {
+	return BuildSignalIngressWithAttachmentErrors(
+		accountID,
+		generation,
+		signalAccount,
+		line,
+		resolvedSource,
+		resolvedDestination,
+		nil,
+		receivedAt,
+	)
+}
+
+// BuildSignalIngressWithAttachmentErrors is BuildSignalIngress for a line
+// whose receive call also reported attachment downloads that failed (keyed by
+// attachment id, see signallive.IngressLine). The frame keeps them next to
+// the line, so the decoder can record why those attachments never reached
+// signal-cli's store.
+func BuildSignalIngressWithAttachmentErrors(
+	accountID string,
+	generation bridge.Generation,
+	signalAccount string,
+	line []byte,
+	resolvedSource string,
+	resolvedDestination string,
+	attachmentErrors map[string]string,
 	receivedAt time.Time,
 ) (*bridge.RawIngressRecord, *bridge.EphemeralEvent, error) {
 	resolvedAccount, env, err := signallive.ParseReceiveEnvelope(signalAccount, line)
@@ -92,6 +124,7 @@ func BuildSignalIngress(
 		line,
 		resolvedSource,
 		resolvedDestination,
+		attachmentErrors,
 	)
 	if err != nil {
 		return nil, nil, err
@@ -118,6 +151,7 @@ func marshalSignalJSONRPCFrame(
 	line []byte,
 	resolvedSource string,
 	resolvedDestination string,
+	attachmentErrors map[string]string,
 ) ([]byte, error) {
 	if !json.Valid(line) {
 		return nil, fmt.Errorf("encode Signal ingress: line is not valid JSON")
@@ -143,6 +177,16 @@ func marshalSignalJSONRPCFrame(
 	payload = append(payload, encodedSource...)
 	payload = append(payload, `,"resolved_destination":`...)
 	payload = append(payload, encodedDestination...)
+	if len(attachmentErrors) > 0 {
+		// Only frames that carry failures change shape; every other frame
+		// stays byte-identical to the frames captured before this field.
+		encodedErrors, err := json.Marshal(attachmentErrors)
+		if err != nil {
+			return nil, fmt.Errorf("encode Signal ingress attachment errors: %w", err)
+		}
+		payload = append(payload, `,"attachment_errors":`...)
+		payload = append(payload, encodedErrors...)
+	}
 	payload = append(payload, '}')
 	return payload, nil
 }
@@ -226,7 +270,7 @@ func (d *SignalDecoder) Decode(
 		}
 	}
 	if env.DataMessage != nil {
-		event, err := decodeSignalData(account, &env, source)
+		event, err := decodeSignalData(account, &env, source, frame.AttachmentErrors)
 		if err != nil {
 			return nil, err
 		}
@@ -235,7 +279,7 @@ func (d *SignalDecoder) Decode(
 		}
 	}
 	if env.SyncMessage != nil && env.SyncMessage.SentMessage != nil {
-		event, err := decodeSignalSent(account, &env, destination)
+		event, err := decodeSignalSent(account, &env, destination, frame.AttachmentErrors)
 		if err != nil {
 			return nil, err
 		}
@@ -250,6 +294,7 @@ func decodeSignalData(
 	account string,
 	env *signallive.Envelope,
 	source string,
+	attachmentErrors map[string]string,
 ) (*bridge.Event, error) {
 	message := env.DataMessage
 	source = strings.TrimSpace(source)
@@ -278,7 +323,7 @@ func decodeSignalData(
 	if timestamp <= 0 {
 		return nil, fmt.Errorf("decode Signal data message: timestamp is not positive")
 	}
-	attachments, err := signalAttachments(conversationID, message.Attachments)
+	attachments, err := signalAttachments(conversationID, message.Attachments, attachmentErrors)
 	if err != nil {
 		return nil, err
 	}
@@ -344,6 +389,7 @@ func decodeSignalSent(
 	account string,
 	env *signallive.Envelope,
 	target string,
+	attachmentErrors map[string]string,
 ) (*bridge.Event, error) {
 	sent := env.SyncMessage.SentMessage
 	// Sent-message edits are retained by the legacy path but have no specified
@@ -375,7 +421,7 @@ func decodeSignalSent(
 	if timestamp <= 0 {
 		return nil, fmt.Errorf("decode Signal sent message: timestamp is not positive")
 	}
-	attachments, err := signalAttachments(conversationID, sent.Attachments)
+	attachments, err := signalAttachments(conversationID, sent.Attachments, attachmentErrors)
 	if err != nil {
 		return nil, err
 	}
@@ -441,6 +487,7 @@ func decodeSignalReaction(
 func signalAttachments(
 	conversationID string,
 	attachments []signallive.Attachment,
+	attachmentErrors map[string]string,
 ) ([]bridge.Attachment, error) {
 	result := make([]bridge.Attachment, 0, len(attachments))
 	for _, attachment := range attachments {
@@ -457,11 +504,17 @@ func signalAttachments(
 		if err != nil {
 			return nil, fmt.Errorf("encode Signal attachment %q: %w", attachmentID, err)
 		}
+		var size int64
+		if attachment.Size != nil && *attachment.Size > 0 {
+			size = *attachment.Size
+		}
 		result = append(result, bridge.Attachment{
-			RemoteID:  attachmentID,
-			RemoteRef: remoteRef,
-			Filename:  strings.TrimSpace(attachment.Filename),
-			MIME:      strings.TrimSpace(attachment.ContentType),
+			RemoteID:       attachmentID,
+			RemoteRef:      remoteRef,
+			Filename:       strings.TrimSpace(attachment.Filename),
+			MIME:           strings.TrimSpace(attachment.ContentType),
+			Size:           size,
+			TransportError: strings.TrimSpace(attachmentErrors[attachmentID]),
 		})
 	}
 	return result, nil

@@ -2,8 +2,14 @@ package whatsapplive
 
 import (
 	"context"
+	"database/sql"
 	"errors"
+	"math/rand"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
+	"testing/quick"
 	"time"
 
 	"go.mau.fi/whatsmeow"
@@ -41,11 +47,16 @@ func TestMarkReadRequestMapsTransportArguments(t *testing.T) {
 			host := connectedMediaTestBridge()
 			originalMarkRead := markReadMessages
 			originalIsConnected := clientIsConnected
+			originalAddressing := groupAddressingMode
 			defer func() {
 				markReadMessages = originalMarkRead
 				clientIsConnected = originalIsConnected
+				groupAddressingMode = originalAddressing
 			}()
 			clientIsConnected = func(*whatsmeow.Client) bool { return true }
+			groupAddressingMode = func(*whatsmeow.Client, context.Context, watypes.JID) (watypes.AddressingMode, error) {
+				return watypes.AddressingModePN, nil
+			}
 
 			var (
 				gotClient    *whatsmeow.Client
@@ -227,5 +238,558 @@ func TestMarkReadRequestTransportErrorIsWrappedAndReported(t *testing.T) {
 	}
 	if !errors.Is(reported, want) {
 		t.Fatalf("retained lifecycle report = %v, want transport cause %v", reported, want)
+	}
+}
+
+// readReceiptTestCall is one receipt whatsmeow's MarkRead was asked to send.
+type readReceiptTestCall struct {
+	ctx    context.Context
+	ctxErr error // ctx.Err() when MarkRead was called
+	ids    []watypes.MessageID
+	chat   watypes.JID
+	sender watypes.JID
+}
+
+// readReceiptTestTransport stands in for a connected WhatsApp transport in
+// read-receipt tests: it records each receipt sent and answers the group
+// addressing lookup with mode, or with lookupErr.
+type readReceiptTestTransport struct {
+	mode       watypes.AddressingMode
+	lookupErr  error
+	lookups    []watypes.JID
+	lookupCtxs []context.Context
+	receipts   []readReceiptTestCall
+}
+
+func newReadReceiptTestTransport(t *testing.T) *readReceiptTestTransport {
+	t.Helper()
+	transport := &readReceiptTestTransport{mode: watypes.AddressingModePN}
+	originalMarkRead := markReadMessages
+	originalIsConnected := clientIsConnected
+	originalAddressing := groupAddressingMode
+	t.Cleanup(func() {
+		markReadMessages = originalMarkRead
+		clientIsConnected = originalIsConnected
+		groupAddressingMode = originalAddressing
+	})
+	clientIsConnected = func(*whatsmeow.Client) bool { return true }
+	groupAddressingMode = func(_ *whatsmeow.Client, ctx context.Context, group watypes.JID) (watypes.AddressingMode, error) {
+		transport.lookups = append(transport.lookups, group)
+		transport.lookupCtxs = append(transport.lookupCtxs, ctx)
+		return transport.mode, transport.lookupErr
+	}
+	markReadMessages = func(_ *whatsmeow.Client, ctx context.Context, ids []watypes.MessageID, _ time.Time, chat, sender watypes.JID, _ ...watypes.ReceiptType) error {
+		transport.receipts = append(transport.receipts, readReceiptTestCall{
+			ctx:    ctx,
+			ctxErr: ctx.Err(),
+			ids:    append([]watypes.MessageID(nil), ids...),
+			chat:   chat,
+			sender: sender,
+		})
+		return nil
+	}
+	return transport
+}
+
+// whatsmeow's MarkRead puts the sender in a group receipt's participant
+// attribute as it is given (receipt.go), and its own delivery receipt for a
+// group message copies the participant the message arrived with
+// (buildBaseReceipt): the member's LID when the group addressed it by LID, its
+// phone number otherwise. A read receipt names the sender the same way a
+// reaction does. Before, a stored LID went out as the participant
+// "<digits>@lid@s.whatsapp.net", which names no member, and a stored phone
+// number went out as the phone number in a group that addresses members by
+// LID.
+func TestMarkReadRequestNamesAGroupSenderInTheFormItsMessagesArrivedWith(t *testing.T) {
+	const (
+		lidJID   = senderTestLID + "@lid"
+		phoneJID = senderTestPhone + "@s.whatsapp.net"
+	)
+	lookupFailed := errors.New("group info query timed out")
+	tests := []struct {
+		name      string
+		lids      senderTestLIDs
+		mode      watypes.AddressingMode
+		lookupErr error
+		sender    string
+		want      string
+	}{
+		{
+			name:   "LID-only sender in a group that addresses by LID",
+			lids:   senderTestLIDs{},
+			mode:   watypes.AddressingModeLID,
+			sender: lidJID,
+			want:   lidJID,
+		},
+		// The messages arrived from the LID; a phone number learned since
+		// does not change who sent them.
+		{
+			name:   "LID sender whose number became known later",
+			lids:   senderTestLIDs{senderTestLID: senderTestPhone},
+			mode:   watypes.AddressingModeLID,
+			sender: lidJID,
+			want:   lidJID,
+		},
+		// A stored LID is never looked up as a phone number, even when its
+		// digits are some member's number.
+		{
+			name:   "LID sender whose digits are a known phone number",
+			lids:   senderTestLIDs{"11111111111111": senderTestLID},
+			mode:   watypes.AddressingModeLID,
+			sender: lidJID,
+			want:   lidJID,
+		},
+		{
+			name:   "LID sender in a group that now reads phone-number addressing",
+			lids:   senderTestLIDs{senderTestLID: senderTestPhone},
+			mode:   watypes.AddressingModePN,
+			sender: lidJID,
+			want:   lidJID,
+		},
+		{
+			name:   "phone-number sender in a group that addresses by LID",
+			lids:   senderTestLIDs{senderTestLID: senderTestPhone},
+			mode:   watypes.AddressingModeLID,
+			sender: "+" + senderTestPhone,
+			want:   lidJID,
+		},
+		{
+			name:   "phone-number sender whose LID is unknown",
+			lids:   senderTestLIDs{},
+			mode:   watypes.AddressingModeLID,
+			sender: "+" + senderTestPhone,
+			want:   phoneJID,
+		},
+		{
+			name:   "phone-number sender in a group that addresses by phone number",
+			lids:   senderTestLIDs{senderTestLID: senderTestPhone},
+			mode:   watypes.AddressingModePN,
+			sender: "+" + senderTestPhone,
+			want:   phoneJID,
+		},
+		// whatsmeow's SendMessage treats any addressing but "lid" as phone
+		// numbers.
+		{
+			name:   "group that reports no addressing",
+			lids:   senderTestLIDs{senderTestLID: senderTestPhone},
+			mode:   "",
+			sender: "+" + senderTestPhone,
+			want:   phoneJID,
+		},
+		// MarkRead does not read the group cache, so the receipt goes out
+		// naming the stored sender rather than failing.
+		{
+			name:      "group addressing lookup fails",
+			lids:      senderTestLIDs{senderTestLID: senderTestPhone},
+			mode:      watypes.AddressingModeLID,
+			lookupErr: lookupFailed,
+			sender:    "+" + senderTestPhone,
+			want:      phoneJID,
+		},
+		{
+			name:   "phone number stored without a plus",
+			lids:   senderTestLIDs{},
+			mode:   watypes.AddressingModePN,
+			sender: senderTestPhone,
+			want:   phoneJID,
+		},
+		{
+			name:   "hosted sender",
+			lids:   senderTestLIDs{},
+			mode:   watypes.AddressingModeLID,
+			sender: senderTestPhone + "@hosted",
+			want:   senderTestPhone + "@hosted",
+		},
+		{
+			name:   "bot sender",
+			lids:   senderTestLIDs{},
+			mode:   watypes.AddressingModeLID,
+			sender: "867051314767696@bot",
+			want:   "867051314767696@bot",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			transport := newReadReceiptTestTransport(t)
+			transport.mode = test.mode
+			transport.lookupErr = test.lookupErr
+
+			err := senderTestBridge(test.lids).MarkReadRequest(
+				senderTestGroup,
+				[]string{"message-one", "message-two"},
+				test.sender,
+				time.Now(),
+			)
+			if err != nil {
+				t.Fatalf("MarkReadRequest() error = %v", err)
+			}
+			if len(transport.receipts) != 1 {
+				t.Fatalf("receipts sent = %d, want one", len(transport.receipts))
+			}
+			receipt := transport.receipts[0]
+			if receipt.sender.String() != test.want {
+				t.Fatalf("receipt participant = %q, want %q", receipt.sender.String(), test.want)
+			}
+			if receipt.chat.String() != strings.TrimPrefix(senderTestGroup, "whatsapp:") {
+				t.Fatalf("receipt chat = %q, want the group", receipt.chat.String())
+			}
+			if len(receipt.ids) != 2 || receipt.ids[0] != "message-one" || receipt.ids[1] != "message-two" {
+				t.Fatalf("receipt IDs = %q, want both messages under the one sender", receipt.ids)
+			}
+			// Only a phone number has another form to look up.
+			wantLookups := 0
+			if !strings.Contains(test.sender, "@") {
+				wantLookups = 1
+			}
+			if len(transport.lookups) != wantLookups {
+				t.Fatalf("group addressing lookups = %v, want %d", transport.lookups, wantLookups)
+			}
+		})
+	}
+}
+
+// whatsmeow's MarkRead sends no participant in a 1:1 chat with a phone number
+// or a LID, so the stored sender only has to parse there. The group's
+// addressing is not looked up, and a sender that is neither a JID nor a number
+// is left out as a missing one is, rather than refused.
+func TestMarkReadRequestNamesADirectChatSenderOfEitherForm(t *testing.T) {
+	for _, test := range []struct {
+		chat   string
+		sender string
+		want   string
+	}{
+		{chat: "whatsapp:" + senderTestPhone + "@s.whatsapp.net", sender: senderTestLID + "@lid", want: senderTestLID + "@lid"},
+		{chat: "whatsapp:" + senderTestLID + "@lid", sender: senderTestLID + "@lid", want: senderTestLID + "@lid"},
+		{chat: "whatsapp:" + senderTestLID + "@lid", sender: "+" + senderTestPhone, want: senderTestPhone + "@s.whatsapp.net"},
+		{chat: "whatsapp:" + senderTestPhone + "@s.whatsapp.net", sender: "+" + senderTestPhone, want: senderTestPhone + "@s.whatsapp.net"},
+		{chat: "whatsapp:" + senderTestPhone + "@s.whatsapp.net", sender: "", want: ""},
+		{chat: "whatsapp:" + senderTestPhone + "@s.whatsapp.net", sender: senderTestLID + "@lid@s.whatsapp.net", want: ""},
+		{chat: "whatsapp:" + senderTestPhone + "@s.whatsapp.net", sender: "Me", want: ""},
+	} {
+		t.Run(test.chat+" "+test.sender, func(t *testing.T) {
+			transport := newReadReceiptTestTransport(t)
+			transport.mode = watypes.AddressingModeLID
+			lids := senderTestLIDs{senderTestLID: senderTestPhone}
+			if strings.HasSuffix(test.chat, "@lid") {
+				// A LID chat whose number is known is first merged into
+				// the phone-number chat, and this bridge has no store.
+				lids = senderTestLIDs{}
+			}
+			if err := senderTestBridge(lids).MarkReadRequest(test.chat, []string{"message-one"}, test.sender, time.Now()); err != nil {
+				t.Fatalf("MarkReadRequest() error = %v", err)
+			}
+			if len(transport.receipts) != 1 {
+				t.Fatalf("receipts sent = %d, want one", len(transport.receipts))
+			}
+			if got := transport.receipts[0].sender; got.String() != test.want {
+				t.Fatalf("receipt sender = %q, want %q", got.String(), test.want)
+			}
+			if len(transport.lookups) != 0 {
+				t.Fatalf("group addressing lookups = %v, want none for a 1:1 chat", transport.lookups)
+			}
+		})
+	}
+}
+
+// In a chat that is neither a group nor a 1:1 chat, such as a bot's, MarkRead
+// does send a participant. A sender's JID goes out as stored (before, a bot
+// went out as "<id>@bot@s.whatsapp.net"), and a sender that is neither a JID
+// nor a number is left out as a missing one is.
+func TestMarkReadRequestNamesABotChatSenderAsStored(t *testing.T) {
+	const bot = "867051314767696@bot"
+	for _, test := range []struct {
+		sender string
+		want   string
+	}{
+		{sender: bot, want: bot},
+		{sender: "", want: ""},
+		{sender: bot + "@s.whatsapp.net", want: ""},
+	} {
+		t.Run(test.sender, func(t *testing.T) {
+			transport := newReadReceiptTestTransport(t)
+			if err := senderTestBridge(senderTestLIDs{}).MarkReadRequest("whatsapp:"+bot, []string{"message-one"}, test.sender, time.Now()); err != nil {
+				t.Fatalf("MarkReadRequest() error = %v", err)
+			}
+			if len(transport.receipts) != 1 || transport.receipts[0].sender.String() != test.want {
+				t.Fatalf("receipts = %+v, want one naming %q", transport.receipts, test.want)
+			}
+			if len(transport.lookups) != 0 {
+				t.Fatalf("group addressing lookups = %v, want none outside a group", transport.lookups)
+			}
+		})
+	}
+}
+
+// A group receipt names the sender of the messages it covers (MarkRead's
+// documentation requires one in a group), so a group message stored with a
+// sender that is neither a user's JID nor a phone number cannot be marked
+// read. The receipt is refused before anything is sent, even while
+// disconnected; before, it went out naming "<value>@s.whatsapp.net", which no
+// message has (a bare "+" went out with no participant). That includes the
+// group's own JID, which the history decoder stores as the sender of a group
+// message that names no participant. In a 1:1 chat the same receipt goes out
+// with no sender, which MarkRead does not send anyway.
+func TestMarkReadRequestRefusesAGroupSenderThatIsNotAJIDOrNumber(t *testing.T) {
+	for _, sender := range []string{
+		"@lid",
+		senderTestLID + "@",
+		senderTestLID + "@lid@s.whatsapp.net",
+		strings.TrimPrefix(senderTestGroup, "whatsapp:"),
+		"status@broadcast",
+		"120363000000000000@newsletter",
+		senderTestPhone + "@c.us",
+		"Me",
+		"+",
+		"+1-555-765-4321",
+	} {
+		t.Run(sender, func(t *testing.T) {
+			transport := newReadReceiptTestTransport(t)
+			err := senderTestBridge(senderTestLIDs{}).MarkReadRequest(senderTestGroup, []string{"message-one"}, sender, time.Now())
+			if !errors.Is(err, ErrReadReceiptSenderUnknown) || !errors.Is(err, ErrSendNotDispatched) {
+				t.Fatalf("MarkReadRequest() error = %v, want the unparseable-sender refusal marked not dispatched", err)
+			}
+			if len(transport.receipts) != 0 || len(transport.lookups) != 0 {
+				t.Fatalf("receipts = %d, lookups = %d, want none", len(transport.receipts), len(transport.lookups))
+			}
+
+			err = (&Bridge{}).MarkReadRequest(senderTestGroup, []string{"message-one"}, sender, time.Now())
+			if !errors.Is(err, ErrReadReceiptSenderUnknown) || errors.Is(err, whatsmeow.ErrNotConnected) {
+				t.Fatalf("disconnected MarkReadRequest() error = %v, want the refusal, not a retryable disconnect", err)
+			}
+
+			err = senderTestBridge(senderTestLIDs{}).MarkReadRequest("whatsapp:"+senderTestPhone+"@s.whatsapp.net", []string{"message-one"}, sender, time.Now())
+			if err != nil {
+				t.Fatalf("1:1 MarkReadRequest() error = %v", err)
+			}
+			if len(transport.receipts) != 1 || !transport.receipts[0].sender.IsEmpty() {
+				t.Fatalf("1:1 receipts = %+v, want one with no sender", transport.receipts)
+			}
+		})
+	}
+}
+
+// TestMarkReadRequestGroupParticipantProperty checks the participant rule over
+// random senders in the two forms ingest stores ("+<digits>" and
+// "<digits>@lid"), LID maps, group addressing and message counts. A group
+// receipt always names a well-formed member JID (one "@", the phone-number or
+// LID server, no device) and covers every message ID in request order. A
+// stored LID is sent as stored, with no lookup. A stored phone number is sent
+// as its LID exactly when the group addresses members by LID and the LID is
+// known, and as the phone number otherwise, after exactly one addressing
+// lookup.
+func TestMarkReadRequestGroupParticipantProperty(t *testing.T) {
+	type input struct {
+		Phone     uint64
+		LID       uint64
+		StoredLID bool
+		NoPlus    bool
+		Known     bool
+		Mode      uint8
+		Messages  uint8
+	}
+	transport := newReadReceiptTestTransport(t)
+	property := func(in input) bool {
+		phone := strconv.FormatUint(in.Phone%1_000_000_000_000_000+1, 10)
+		lid := strconv.FormatUint(in.LID%1_000_000_000_000_000+1, 10)
+		lids := senderTestLIDs{}
+		if in.Known {
+			lids[lid] = phone
+		}
+		transport.receipts = nil
+		transport.lookups = nil
+		transport.lookupErr = nil
+		switch in.Mode % 4 {
+		case 0:
+			transport.mode = watypes.AddressingModePN
+		case 1:
+			transport.mode = watypes.AddressingModeLID
+		case 2:
+			transport.mode = ""
+		default:
+			transport.mode = watypes.AddressingModeLID
+			transport.lookupErr = errors.New("lookup failed")
+		}
+		ids := make([]string, int(in.Messages%5)+1)
+		for i := range ids {
+			ids[i] = "message-" + strconv.Itoa(i)
+		}
+
+		sender, want, wantLookups := "+"+phone, phone+"@s.whatsapp.net", 1
+		if in.NoPlus {
+			sender = phone
+		}
+		if in.StoredLID {
+			sender, want, wantLookups = lid+"@lid", lid+"@lid", 0
+		} else if transport.mode == watypes.AddressingModeLID && transport.lookupErr == nil && in.Known {
+			want = lid + "@lid"
+		}
+
+		err := senderTestBridge(lids).MarkReadRequest(senderTestGroup, ids, sender, time.Now())
+		if err != nil || len(transport.receipts) != 1 {
+			t.Logf("sender %q: error %v, %d receipts", sender, err, len(transport.receipts))
+			return false
+		}
+		receipt := transport.receipts[0]
+		participant := receipt.sender.String()
+		parsed, parseErr := watypes.ParseJID(participant)
+		wellFormed := parseErr == nil && strings.Count(participant, "@") == 1 && parsed.Device == 0 &&
+			(parsed.Server == watypes.DefaultUserServer || parsed.Server == watypes.HiddenUserServer)
+		coversAll := len(receipt.ids) == len(ids)
+		for i := 0; coversAll && i < len(ids); i++ {
+			coversAll = string(receipt.ids[i]) == ids[i]
+		}
+		if !wellFormed || participant != want || !coversAll || len(transport.lookups) != wantLookups {
+			t.Logf("sender %q, mode %q, lookup error %v, known %t: participant %q (want %q), ids %q, lookups %d",
+				sender, transport.mode, transport.lookupErr, in.Known, participant, want, receipt.ids, len(transport.lookups))
+			return false
+		}
+		return true
+	}
+	if err := quick.Check(property, &quick.Config{MaxCount: 2000, Rand: rand.New(rand.NewSource(20261021))}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Fetching a group whatsmeow has not cached stores its members' LID mappings
+// (getGroupInfo), so the addressing is read before the LID is looked up: a
+// number whose LID only the fetch supplies is still named by its LID.
+func TestMarkReadRequestNamesTheLIDTheGroupFetchSupplies(t *testing.T) {
+	transport := newReadReceiptTestTransport(t)
+	lids := senderTestLIDs{}
+	groupAddressingMode = func(_ *whatsmeow.Client, _ context.Context, group watypes.JID) (watypes.AddressingMode, error) {
+		transport.lookups = append(transport.lookups, group)
+		lids[senderTestLID] = senderTestPhone
+		return watypes.AddressingModeLID, nil
+	}
+	if err := senderTestBridge(lids).MarkReadRequest(senderTestGroup, []string{"message-one"}, "+"+senderTestPhone, time.Now()); err != nil {
+		t.Fatalf("MarkReadRequest() error = %v", err)
+	}
+	if len(transport.receipts) != 1 {
+		t.Fatalf("receipts sent = %d, want one", len(transport.receipts))
+	}
+	if got := transport.receipts[0].sender.String(); got != senderTestLID+"@lid" {
+		t.Fatalf("receipt participant = %q, want the LID the fetch stored", got)
+	}
+}
+
+// Like canonicalJID, the phone number's LID falls back to the session store's
+// LID map when whatsmeow's LID store has none.
+func TestMarkReadRequestFindsAGroupSendersLIDInTheSessionStore(t *testing.T) {
+	sessionPath := filepath.Join(t.TempDir(), "whatsapp-session.db")
+	sessionDB, err := sql.Open("sqlite", sessionStoreDSN(sessionPath))
+	if err != nil {
+		t.Fatalf("sql.Open(session store): %v", err)
+	}
+	defer sessionDB.Close()
+	if _, err := sessionDB.Exec(`CREATE TABLE whatsmeow_lid_map (lid TEXT PRIMARY KEY, pn TEXT NOT NULL)`); err != nil {
+		t.Fatalf("create lid map: %v", err)
+	}
+	if _, err := sessionDB.Exec(`INSERT INTO whatsmeow_lid_map (lid, pn) VALUES (?, ?)`, senderTestLID, senderTestPhone); err != nil {
+		t.Fatalf("seed lid map: %v", err)
+	}
+
+	transport := newReadReceiptTestTransport(t)
+	transport.mode = watypes.AddressingModeLID
+	bridge := senderTestBridge(senderTestLIDs{})
+	bridge.sessionPath = sessionPath
+	if err := bridge.MarkReadRequest(senderTestGroup, []string{"message-one"}, "+"+senderTestPhone, time.Now()); err != nil {
+		t.Fatalf("MarkReadRequest() error = %v", err)
+	}
+	if len(transport.receipts) != 1 {
+		t.Fatalf("receipts sent = %d, want one", len(transport.receipts))
+	}
+	if got := transport.receipts[0].sender.String(); got != senderTestLID+"@lid" {
+		t.Fatalf("receipt participant = %q, want the session store's LID %q", got, senderTestLID+"@lid")
+	}
+}
+
+// The addressing lookup can fetch the group from WhatsApp, so it runs under
+// its own deadline, shorter than and inside the receipt's 45 s one.
+func TestMarkReadRequestBoundsTheGroupAddressingLookup(t *testing.T) {
+	transport := newReadReceiptTestTransport(t)
+	started := time.Now()
+	lids := senderTestLIDs{senderTestLID: senderTestPhone}
+	if err := senderTestBridge(lids).MarkReadRequest(senderTestGroup, []string{"message-one"}, "+"+senderTestPhone, time.Now()); err != nil {
+		t.Fatalf("MarkReadRequest() error = %v", err)
+	}
+	if len(transport.lookupCtxs) != 1 || len(transport.receipts) != 1 {
+		t.Fatalf("lookups = %d, receipts = %d, want one of each", len(transport.lookupCtxs), len(transport.receipts))
+	}
+	lookupDeadline, ok := transport.lookupCtxs[0].Deadline()
+	if !ok || lookupDeadline.After(started.Add(11*time.Second)) {
+		t.Fatalf("lookup deadline = %v (set %t), want within 10 s", lookupDeadline, ok)
+	}
+	receiptDeadline, ok := transport.receipts[0].ctx.Deadline()
+	if !ok || receiptDeadline.After(started.Add(46*time.Second)) || !receiptDeadline.After(lookupDeadline) {
+		t.Fatalf("receipt deadline = %v (set %t), want after the lookup's %v and within 45 s", receiptDeadline, ok, lookupDeadline)
+	}
+}
+
+// A group fetch that goes unanswered gives up at the lookup's own deadline,
+// and the receipt still goes out, naming the stored sender, under a context
+// with time left.
+func TestMarkReadRequestSendsTheStoredSenderWhenTheAddressingLookupHangs(t *testing.T) {
+	transport := newReadReceiptTestTransport(t)
+	originalTimeout := readReceiptAddressingTimeout
+	t.Cleanup(func() { readReceiptAddressingTimeout = originalTimeout })
+	readReceiptAddressingTimeout = 20 * time.Millisecond
+	groupAddressingMode = func(_ *whatsmeow.Client, ctx context.Context, _ watypes.JID) (watypes.AddressingMode, error) {
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-time.After(5 * time.Second):
+			return "", errors.New("lookup was not bounded")
+		}
+	}
+
+	lids := senderTestLIDs{senderTestLID: senderTestPhone}
+	if err := senderTestBridge(lids).MarkReadRequest(senderTestGroup, []string{"message-one"}, "+"+senderTestPhone, time.Now()); err != nil {
+		t.Fatalf("MarkReadRequest() error = %v", err)
+	}
+	if len(transport.receipts) != 1 {
+		t.Fatalf("receipts sent = %d, want one", len(transport.receipts))
+	}
+	receipt := transport.receipts[0]
+	if got := receipt.sender.String(); got != senderTestPhone+"@s.whatsapp.net" {
+		t.Fatalf("receipt participant = %q, want the stored phone number", got)
+	}
+	if receipt.ctxErr != nil {
+		t.Fatalf("receipt context had ended (%v) when MarkRead was called, want time left", receipt.ctxErr)
+	}
+}
+
+// This account's own messages are stored with no sender (neither the send
+// path, ingest nor migration gives an outgoing message a sender identity), and
+// a read cursor may rest on one. An empty sender is not refused: the receipt
+// goes out with no participant in a group, as before, and nothing is looked
+// up.
+func TestMarkReadRequestSendsAGroupReceiptWithNoStoredSenderWithoutAParticipant(t *testing.T) {
+	for _, sender := range []string{"", "  "} {
+		t.Run(strconv.Quote(sender), func(t *testing.T) {
+			transport := newReadReceiptTestTransport(t)
+			if err := senderTestBridge(senderTestLIDs{}).MarkReadRequest(senderTestGroup, []string{"message-one"}, sender, time.Now()); err != nil {
+				t.Fatalf("MarkReadRequest() error = %v", err)
+			}
+			if len(transport.receipts) != 1 || !transport.receipts[0].sender.IsEmpty() {
+				t.Fatalf("receipts = %+v, want one with no participant", transport.receipts)
+			}
+			if len(transport.lookups) != 0 {
+				t.Fatalf("group addressing lookups = %v, want none", transport.lookups)
+			}
+		})
+	}
+}
+
+// The refusal covers groups only. A broadcast chat's receipt carries a
+// participant too, but a sender there that is neither a JID nor a number is
+// left out rather than refused, as in other chats that are not groups.
+func TestMarkReadRequestLeavesAnUnparseableBroadcastSenderOut(t *testing.T) {
+	transport := newReadReceiptTestTransport(t)
+	if err := senderTestBridge(senderTestLIDs{}).MarkReadRequest("whatsapp:status@broadcast", []string{"message-one"}, "Me", time.Now()); err != nil {
+		t.Fatalf("MarkReadRequest() error = %v", err)
+	}
+	if len(transport.receipts) != 1 || !transport.receipts[0].sender.IsEmpty() {
+		t.Fatalf("receipts = %+v, want one with no participant", transport.receipts)
 	}
 }

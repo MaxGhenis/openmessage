@@ -166,7 +166,7 @@ func TestSendTextMapsRetainedTimestampAndRequest(t *testing.T) {
 	request := poller.lastTextRequest()
 	if request.conversationID != "signal:+15551234567" ||
 		request.body != "hello from durable Signal" ||
-		request.replyToID != "signal:1700000000000" {
+		request.reply != (signallive.ReplyTarget{RemoteID: "signal:1700000000000"}) {
 		t.Fatalf("retained SendTextRequest = %+v, want mapped TextRequest", request)
 	}
 }
@@ -433,8 +433,9 @@ func TestSendReactionMapsAllActionsAndReturnsEmptyResult(t *testing.T) {
 				AccountID:    "signal-primary",
 				Conversation: bridge.ConversationRef{RemoteID: "signal-group:test-group"},
 				Target: bridge.MessageRef{
-					RemoteID: "1700000000123",
+					RemoteID: "f48818f15483f503bb133d92360ca8e2fbd8287e",
 					AuthorID: "+15551234567",
+					SentAt:   time.UnixMilli(1_700_000_000_123),
 				},
 				Emoji:     "👍",
 				Action:    action,
@@ -447,9 +448,13 @@ func TestSendReactionMapsAllActionsAndReturnsEmptyResult(t *testing.T) {
 				t.Fatalf("SendReaction() result = %+v, want empty ConfirmWithoutResult mapping", result)
 			}
 			request := poller.lastReactionRequest()
+			wantTarget := signallive.ReactionTarget{
+				RemoteID: "f48818f15483f503bb133d92360ca8e2fbd8287e",
+				AuthorID: "+15551234567",
+				SentAt:   time.UnixMilli(1_700_000_000_123),
+			}
 			if request.conversationID != "signal-group:test-group" ||
-				request.targetRemoteID != "1700000000123" ||
-				request.targetAuthorID != "+15551234567" ||
+				request.target != wantTarget ||
 				request.emoji != "👍" ||
 				request.action != string(action) {
 				t.Fatalf("retained SendReactionRequest = %+v, want mapped ReactionRequest", request)
@@ -679,7 +684,7 @@ func TestSendMediaMapsRetainedTimestampAndRequest(t *testing.T) {
 		request.filename != "photo.png" ||
 		request.mime != "image/png" ||
 		request.caption != "signal photo" ||
-		request.replyToID != "signal:1700000000000" ||
+		request.reply != (signallive.ReplyTarget{RemoteID: "signal:1700000000000"}) ||
 		!bytes.Equal(request.content, content) {
 		t.Fatalf("retained SendMediaRequest = %+v, want mapped MediaRequest", request)
 	}
@@ -1492,6 +1497,7 @@ type fakePoller struct {
 	ingressID                uint64
 	ingress                  func(account string, line []byte, resolvedSource string, resolvedDestination string)
 	ingressHistory           []func(account string, line []byte, resolvedSource string, resolvedDestination string)
+	ingressLine              func(signallive.IngressLine)
 	unregistered             int
 	startAccount             string
 	startLine                []byte
@@ -1525,13 +1531,12 @@ type fakePoller struct {
 type fakeTextRequest struct {
 	conversationID string
 	body           string
-	replyToID      string
+	reply          signallive.ReplyTarget
 }
 
 type fakeReactionRequest struct {
 	conversationID string
-	targetRemoteID string
-	targetAuthorID string
+	target         signallive.ReactionTarget
 	emoji          string
 	action         string
 }
@@ -1543,7 +1548,7 @@ type fakeMediaRequest struct {
 	filename       string
 	mime           string
 	caption        string
-	replyToID      string
+	reply          signallive.ReplyTarget
 }
 
 type fakeDownloadRequest struct {
@@ -1567,6 +1572,35 @@ func (*fakeSignalSendNotDispatchedError) SignalSendNotDispatched() {}
 
 func newFakePoller() *fakePoller {
 	return &fakePoller{started: make(chan *fakePollerRun, 16)}
+}
+
+// ObserveIngressLine registers through ObserveIngress, as the real bridge
+// does, so tests that drive the four-argument observer keep working; tests
+// that need attachment errors call ingressLine.
+func (p *fakePoller) ObserveIngressLine(observer func(signallive.IngressLine)) func() {
+	var legacy func(account string, line []byte, resolvedSource string, resolvedDestination string)
+	if observer != nil {
+		legacy = func(account string, line []byte, resolvedSource string, resolvedDestination string) {
+			observer(signallive.IngressLine{
+				Account:             account,
+				Line:                line,
+				ResolvedSource:      resolvedSource,
+				ResolvedDestination: resolvedDestination,
+			})
+		}
+	}
+	unregister := p.ObserveIngress(legacy)
+	p.mu.Lock()
+	p.ingressLine = observer
+	p.mu.Unlock()
+	return func() {
+		unregister()
+		p.mu.Lock()
+		if p.ingress == nil {
+			p.ingressLine = nil
+		}
+		p.mu.Unlock()
+	}
 }
 
 func (p *fakePoller) ObserveIngress(observer func(
@@ -1653,12 +1687,12 @@ func (p *fakePoller) Status() signallive.StatusSnapshot {
 	return p.status
 }
 
-func (p *fakePoller) SendTextRequest(conversationID, body, replyToID string) (int64, error) {
+func (p *fakePoller) SendTextRequest(conversationID, body string, reply signallive.ReplyTarget) (int64, error) {
 	p.mu.Lock()
 	p.textCalls = append(p.textCalls, fakeTextRequest{
 		conversationID: conversationID,
 		body:           body,
-		replyToID:      replyToID,
+		reply:          reply,
 	})
 	timestamp, err := p.textTimestamp, p.textErr
 	p.mu.Unlock()
@@ -1681,13 +1715,14 @@ func (p *fakePoller) lastTextRequest() fakeTextRequest {
 }
 
 func (p *fakePoller) SendReactionRequest(
-	conversationID, targetRemoteID, targetAuthorID, emoji, action string,
+	conversationID string,
+	target signallive.ReactionTarget,
+	emoji, action string,
 ) error {
 	p.mu.Lock()
 	p.reactionCalls = append(p.reactionCalls, fakeReactionRequest{
 		conversationID: conversationID,
-		targetRemoteID: targetRemoteID,
-		targetAuthorID: targetAuthorID,
+		target:         target,
 		emoji:          emoji,
 		action:         action,
 	})
@@ -1715,7 +1750,8 @@ func (p *fakePoller) SendMediaRequest(
 	conversationID string,
 	content io.Reader,
 	size int64,
-	filename, mime, caption, replyToID string,
+	filename, mime, caption string,
+	reply signallive.ReplyTarget,
 ) (int64, error) {
 	data, readErr := io.ReadAll(content)
 	p.mu.Lock()
@@ -1726,7 +1762,7 @@ func (p *fakePoller) SendMediaRequest(
 		filename:       filename,
 		mime:           mime,
 		caption:        caption,
-		replyToID:      replyToID,
+		reply:          reply,
 	})
 	timestamp, sendErr := p.mediaTimestamp, p.mediaErr
 	p.mu.Unlock()

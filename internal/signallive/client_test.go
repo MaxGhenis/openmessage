@@ -19,6 +19,7 @@ import (
 
 	"github.com/maxghenis/openmessage/internal/db"
 	"github.com/maxghenis/openmessage/internal/storage/sqlite"
+	"github.com/maxghenis/openmessage/internal/v2keys"
 )
 
 func TestQRCodeRendersDataURL(t *testing.T) {
@@ -47,6 +48,34 @@ func TestParseSignalAccountsAcceptsJSONPhoneNumbers(t *testing.T) {
 	got := parseSignalAccounts([]byte(`[{"number":"+15551230000"}]`))
 	if len(got) != 1 || got[0] != "+15551230000" {
 		t.Fatalf("parseSignalAccounts() = %#v, want +15551230000", got)
+	}
+}
+
+// The probe reads CombinedOutput, so anything signal-cli writes to stderr
+// lands in the same buffer as its --output=json payload. This particular WARN
+// is emitted once receiving has stalled for a few days, which made the failure
+// self-latching in production: the stall produced the warning, the warning
+// broke the whole-buffer decode, the empty result parked the bridge on
+// needs_reauth, and a parked bridge never receives anything again. signal-cli
+// itself was healthy throughout -- the same command by hand returned the
+// account with exit status 0.
+func TestParseSignalAccountsSurvivesStderrNoiseBeforeJSON(t *testing.T) {
+	raw := []byte("WARN  AccountHelper - Messages have been last received 8 days ago. " +
+		"The Signal protocol expects that incoming messages are regularly received.\n" +
+		`[{"number":"+15551230000"}]` + "\n")
+	got := parseSignalAccounts(raw)
+	if len(got) != 1 || got[0] != "+15551230000" {
+		t.Fatalf("parseSignalAccounts() = %#v, want +15551230000 despite the WARN line", got)
+	}
+}
+
+func TestParseSignalAccountsSurvivesStderrNoiseAroundWrappedJSON(t *testing.T) {
+	raw := []byte("INFO  Manager - Starting up\n" +
+		`{"accounts":[{"number":"+16506303657"}],"version":2}` + "\n" +
+		"WARN  AccountHelper - Messages have been last received 8 days ago.\n")
+	got := parseSignalAccounts(raw)
+	if len(got) != 1 || got[0] != "+16506303657" {
+		t.Fatalf("parseSignalAccounts() = %#v, want +16506303657 despite surrounding noise", got)
 	}
 }
 
@@ -141,7 +170,7 @@ func TestBridgeSendTextRequestRunsJSONSendAndReturnsSignalTimestamp(t *testing.T
 				return success, nil
 			}
 
-			timestamp, err := bridge.SendTextRequest(tc.conversationID, "  hello from durable Signal  ", "")
+			timestamp, err := bridge.SendTextRequest(tc.conversationID, "  hello from durable Signal  ", ReplyTarget{})
 			if err != nil {
 				t.Fatalf("SendTextRequest(): %v", err)
 			}
@@ -202,7 +231,7 @@ func TestBridgeSendTextRequestIncludesSignalQuoteArguments(t *testing.T) {
 		return success, nil
 	}
 
-	if _, err := bridge.SendTextRequest(conversationID, "replying", "signal:reply-1"); err != nil {
+	if _, err := bridge.SendTextRequest(conversationID, "replying", ReplyTarget{RemoteID: "signal:reply-1"}); err != nil {
 		t.Fatalf("SendTextRequest(): %v", err)
 	}
 	wantArgs := []string{
@@ -276,7 +305,7 @@ func TestBridgeSendTextRequestClassifiesStructuredAndOpaqueFailures(t *testing.T
 				return tc.output, tc.commandErr
 			}
 
-			_, err := bridge.SendTextRequest("signal:+15551234567", "hello", "")
+			_, err := bridge.SendTextRequest("signal:+15551234567", "hello", ReplyTarget{})
 			if err == nil || !IsCommandError(err) {
 				t.Fatalf("SendTextRequest() error = %v (%T), want CommandError", err, err)
 			}
@@ -310,7 +339,7 @@ func TestBridgeSendTextRequestSucceedsOnMixedRecipientResults(t *testing.T) {
 		return mixed, nil
 	}
 
-	timestamp, err := bridge.SendTextRequest("signal-group:test-group", "hello group", "")
+	timestamp, err := bridge.SendTextRequest("signal-group:test-group", "hello group", ReplyTarget{})
 	if err != nil {
 		t.Fatalf("SendTextRequest() on mixed results = %v, want success", err)
 	}
@@ -455,7 +484,7 @@ func TestBridgeSendMediaRequestStreamsAttachmentAndRemovesTempFileOnSuccess(t *t
 		"photo.png",
 		"image/png",
 		"signal photo",
-		"",
+		ReplyTarget{},
 	)
 	if err != nil {
 		t.Fatalf("SendMediaRequest(): %v", err)
@@ -555,7 +584,7 @@ func TestBridgeSendMediaRequestClassifiesStructuredAndOpaqueFailures(t *testing.
 				"photo.png",
 				"image/png",
 				"",
-				"",
+				ReplyTarget{},
 			)
 			if err == nil || !IsCommandError(err) {
 				t.Fatalf("SendMediaRequest() error = %v (%T), want CommandError", err, err)
@@ -615,7 +644,7 @@ func TestBridgeSendMediaRequestSucceedsOnMixedRecipientResults(t *testing.T) {
 		"photo.png",
 		"image/png",
 		"group photo",
-		"",
+		ReplyTarget{},
 	)
 	if err != nil {
 		t.Fatalf("SendMediaRequest() on mixed results = %v, want success", err)
@@ -723,7 +752,7 @@ func TestBridgeSendMediaRequestRejectsOversizeReaderBeforeCommand(t *testing.T) 
 		"attachment.bin",
 		"application/octet-stream",
 		"",
-		"",
+		ReplyTarget{},
 	)
 	if err == nil || !strings.Contains(err.Error(), "exceeds declared size") {
 		t.Fatalf("SendMediaRequest() error = %v, want declared-size error", err)
@@ -2248,10 +2277,15 @@ func TestBridgeSendReactionRequestMapsActionsWithoutStoredState(t *testing.T) {
 				return []byte("ok"), nil
 			}
 
+			// An incoming target: its v2 remote ID is a SHA-1, so -t is the
+			// described sent time.
 			err := bridge.SendReactionRequest(
 				"signal:+15551234567",
-				"1700000000123",
-				"+15551234567",
+				ReactionTarget{
+					RemoteID: v2keys.SignalIncomingSourceID("signal:+15551234567", "+15551234567", 1700000000123),
+					AuthorID: "+15551234567",
+					SentAt:   time.UnixMilli(1700000000123),
+				},
 				"😂",
 				tc.action,
 			)
@@ -2295,10 +2329,11 @@ func TestBridgeSendReactionRequestMapsEmptyAuthorToSelfForGroup(t *testing.T) {
 		return []byte("ok"), nil
 	}
 
+	// This account's confirmed send: its remote ID is the timestamp signal-cli
+	// reported, while its occurred time is the earlier submit time.
 	if err := bridge.SendReactionRequest(
 		"signal-group:test-group",
-		"1700000000123",
-		"",
+		ReactionTarget{RemoteID: "1700000000123", Outgoing: true, SentAt: time.UnixMilli(1700000000000)},
 		"👍",
 		"switch",
 	); err != nil {
@@ -2333,7 +2368,8 @@ func TestBridgeSendReactionRequestSeparatesPreCallAndCommandFailures(t *testing.
 		return nil, errors.New("exit status 1")
 	}
 
-	err := bridge.SendReactionRequest("invalid-conversation", "1700000000123", "", "👍", "add")
+	ownSend := ReactionTarget{RemoteID: "1700000000123", Outgoing: true}
+	err := bridge.SendReactionRequest("invalid-conversation", ownSend, "👍", "add")
 	if err == nil || IsCommandError(err) || IsSendNotDispatchedError(err) {
 		t.Fatalf("pre-call error = %v (%T), want unmarked validation error", err, err)
 	}
@@ -2341,7 +2377,7 @@ func TestBridgeSendReactionRequestSeparatesPreCallAndCommandFailures(t *testing.
 		t.Fatalf("signal-cli calls after pre-call failure = %d, want 0", calls)
 	}
 
-	err = bridge.SendReactionRequest("signal:+15551234567", "1700000000123", "", "👍", "add")
+	err = bridge.SendReactionRequest("signal:+15551234567", ownSend, "👍", "add")
 	if err == nil || !IsCommandError(err) || IsSendNotDispatchedError(err) {
 		t.Fatalf("send-boundary error = %v (%T), want uncertain CommandError", err, err)
 	}

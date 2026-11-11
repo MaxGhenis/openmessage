@@ -1,8 +1,11 @@
 package media
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -18,6 +21,15 @@ import (
 )
 
 const failureRecordTimeout = 5 * time.Second
+
+// NotReadyGrace is how long after an attachment's row is created its
+// transport may go on naming no media (bridge.ErrMediaNotReady) before a
+// download answers ErrGone instead of ErrNotReady. Google names an image
+// about a second after the message; an attachment still unnamed after this
+// long was never uploaded, or the update that named it was lost, and readers
+// should stop waiting for it. Nothing is recorded either way: if a reference
+// does arrive, the next download uses it.
+const NotReadyGrace = 15 * time.Minute
 
 // Clock is the same application clock contract used by MessageService.
 type Clock = messaging.Clock
@@ -55,7 +67,37 @@ var (
 	ErrUnavailable = errors.New("media: download capability unavailable")
 	ErrNotFound    = errors.New("media: attachment not found")
 	ErrTooLarge    = errors.New("media: attachment exceeds size limit")
+	// ErrGone reports an attachment whose transport no longer has its bytes
+	// (bridge.ErrMediaGone). The row stays pending: Import can still fill
+	// it, and a later download succeeds if the transport's copy comes back.
+	ErrGone = errors.New("media: attachment is no longer available from its transport")
+	// ErrNotReady reports an attachment whose message arrived before its
+	// transport said where the bytes are (bridge.ErrMediaNotReady). The row
+	// stays pending with nothing recorded: the message's next update fills in
+	// the reference, and a later download can then succeed. After
+	// NotReadyGrace the same answer is ErrGone, still unrecorded.
+	ErrNotReady = errors.New("media: attachment is not available from its transport yet")
+	// ErrImportMismatch rejects imported bytes that contradict what the
+	// attachment row or the caller says they must be.
+	ErrImportMismatch = errors.New("media: imported content does not match the attachment")
+	// ErrImportConflict rejects an import into an attachment that already
+	// holds different bytes.
+	ErrImportConflict = errors.New("media: attachment already holds different content")
 )
+
+// ImportCommand fills one pending attachment with bytes obtained outside its
+// transport, such as a copy saved from another client of the same account.
+type ImportCommand struct {
+	AccountID string
+	MessageID string
+	Ordinal   int64
+	Content   io.Reader
+	// SHA256 is the lowercase hex digest the content must have, or empty.
+	SHA256 string
+	// Replace lets the import swap the bytes of an attachment that is
+	// already downloaded, to correct an earlier import of the wrong file.
+	Replace bool
+}
 
 // NewService constructs the media download service over application-owned
 // storage and transport capabilities. The caller retains ownership of every
@@ -120,6 +162,9 @@ func (s *Service) Resolve(ctx context.Context, command DownloadCommand) (Descrip
 	if row.State == "downloaded" {
 		return s.descriptorForRow(row)
 	}
+	if err := s.unavailableError(row); err != nil {
+		return Descriptor{}, err
+	}
 
 	key := row.MessageID + "\x00" + strconv.FormatInt(row.Ordinal, 10)
 	_, err, _ = s.group.Do(key, func() (any, error) {
@@ -167,6 +212,9 @@ func (s *Service) download(
 	if row.State == "downloaded" {
 		return blobRefForAttachment(row)
 	}
+	if err := s.unavailableError(row); err != nil {
+		return blob.BlobRef{}, err
+	}
 
 	// Capabilities returns the zero set for both an unsupported adapter and an
 	// unregistered account. Snapshot preserves the routing table's distinction:
@@ -210,6 +258,18 @@ func (s *Service) download(
 		MIME:     row.MIME,
 	})
 	if err != nil {
+		if errors.Is(err, bridge.ErrMediaNotReady) {
+			if waited := s.clock.Now().Sub(time.UnixMilli(row.CreatedAtMS)); waited >= NotReadyGrace {
+				return blob.BlobRef{}, fmt.Errorf(
+					"%w: %w (still, %s after the attachment arrived)",
+					ErrGone, err, waited.Round(time.Minute),
+				)
+			}
+			return blob.BlobRef{}, fmt.Errorf("%w: %w", ErrNotReady, err)
+		}
+		if errors.Is(err, bridge.ErrMediaGone) {
+			return blob.BlobRef{}, s.recordGone(ctx, row, err)
+		}
 		return blob.BlobRef{}, s.recordFailure(ctx, row, classifyTransportError(err))
 	}
 	if stream.ReadCloser == nil {
@@ -284,17 +344,188 @@ func (s *Service) recordFailure(
 	row sqlite.MessageAttachment,
 	failure error,
 ) error {
+	if row.LastError != nil && strings.HasPrefix(*row.LastError, sqlite.ReceiveAttachmentErrorPrefix) {
+		// A transient failure (the transport offline, say) says nothing new
+		// about this attachment; keep the transport's receive-time report.
+		return failure
+	}
+	mutationCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), failureRecordTimeout)
+	defer cancel()
+	text := failure.Error()
+	if row.LastError != nil && strings.HasPrefix(*row.LastError, sqlite.UnavailableAttachmentErrorPrefix) {
+		// Nor does it lift an unavailable mark. Rewriting the mark restarts
+		// its window, so a transport that keeps failing is asked at most
+		// once per window rather than on every request.
+		text = *row.LastError
+	}
+	if err := s.attachments.MarkFailed(
+		mutationCtx,
+		row.MessageID,
+		row.Ordinal,
+		text,
+	); err != nil {
+		return errors.Join(failure, fmt.Errorf("record media download failure: %w", err))
+	}
+	return failure
+}
+
+// receiveCauseMarker opens the receive-time cause an unavailable mark keeps.
+const receiveCauseMarker = " (when the message arrived: "
+
+// recordGone marks an attachment whose transport has no copy of it
+// unavailable (sqlite.UnavailableAttachmentErrorPrefix), so requests within
+// sqlite.UnavailableAttachmentRecheckAfter answer ErrGone without asking the
+// transport. The reason keeps the transport's receive-time account of the
+// failure, from the projection's note or the mark it replaces, because that
+// is the useful diagnosis.
+func (s *Service) recordGone(
+	ctx context.Context,
+	row sqlite.MessageAttachment,
+	transportErr error,
+) error {
+	receiveCause := ""
+	if row.LastError != nil {
+		if cause, ok := strings.CutPrefix(*row.LastError, sqlite.ReceiveAttachmentErrorPrefix); ok {
+			receiveCause = receiveCauseMarker + strings.TrimSpace(cause) + ")"
+		} else if strings.HasPrefix(*row.LastError, sqlite.UnavailableAttachmentErrorPrefix) {
+			if at := strings.Index(*row.LastError, receiveCauseMarker); at >= 0 {
+				receiveCause = (*row.LastError)[at:]
+			}
+		}
+	}
+	failure := fmt.Errorf("%w: %w%s", ErrGone, transportErr, receiveCause)
 	mutationCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), failureRecordTimeout)
 	defer cancel()
 	if err := s.attachments.MarkFailed(
 		mutationCtx,
 		row.MessageID,
 		row.Ordinal,
-		failure.Error(),
+		sqlite.UnavailableAttachmentErrorPrefix+transportErr.Error()+receiveCause,
 	); err != nil {
 		return errors.Join(failure, fmt.Errorf("record media download failure: %w", err))
 	}
 	return failure
+}
+
+// unavailableError answers for an attachment whose unavailable mark still
+// stands; an older mark lets the transport be asked again.
+func (s *Service) unavailableError(row sqlite.MessageAttachment) error {
+	reason, ok := row.UnavailableReasonAt(s.clock.Now())
+	if !ok {
+		return nil
+	}
+	return fmt.Errorf("%w: %s", ErrGone, reason)
+}
+
+// Import stores content as one attachment's bytes and marks it downloaded,
+// for an attachment its transport cannot deliver (ErrGone). Only a pending
+// attachment accepts new bytes, unless command.Replace is set. Importing the
+// bytes an attachment already holds is an idempotent success that reports
+// imported=false; different bytes fail with ErrImportConflict. The content
+// must be non-empty, match command.SHA256 when that is set, and match the
+// size the transport declared when it declared one. The stored MIME type and
+// filename stay the transport's.
+func (s *Service) Import(ctx context.Context, command ImportCommand) (Descriptor, bool, error) {
+	if ctx == nil {
+		return Descriptor{}, false, fmt.Errorf("import media: context is nil")
+	}
+	if strings.TrimSpace(command.AccountID) == "" {
+		return Descriptor{}, false, fmt.Errorf("import media: account ID is empty")
+	}
+	if strings.TrimSpace(command.MessageID) == "" {
+		return Descriptor{}, false, fmt.Errorf("import media: message ID is empty")
+	}
+	if command.Ordinal < 0 {
+		return Descriptor{}, false, fmt.Errorf("import media: attachment ordinal is negative")
+	}
+	if command.Content == nil {
+		return Descriptor{}, false, fmt.Errorf("import media: content is nil")
+	}
+	wantSHA := strings.ToLower(strings.TrimSpace(command.SHA256))
+
+	row, err := s.attachments.GetForDownload(ctx, command.MessageID, command.Ordinal)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Descriptor{}, false, ErrNotFound
+	}
+	if err != nil {
+		return Descriptor{}, false, fmt.Errorf("import media: read attachment: %w", err)
+	}
+	if row.AccountID != command.AccountID {
+		return Descriptor{}, false, ErrNotFound
+	}
+
+	// Validate the whole content before anything reaches the BlobStore, so a
+	// rejected import leaves no blob behind.
+	data, err := io.ReadAll(io.LimitReader(command.Content, s.maxBytes+1))
+	if err != nil {
+		return Descriptor{}, false, fmt.Errorf("import media: read content: %w", err)
+	}
+	if int64(len(data)) > s.maxBytes {
+		return Descriptor{}, false, fmt.Errorf("%w: content exceeds %d bytes", ErrTooLarge, s.maxBytes)
+	}
+	if len(data) == 0 {
+		return Descriptor{}, false, fmt.Errorf("%w: content is empty", ErrImportMismatch)
+	}
+	digest := sha256.Sum256(data)
+	gotSHA := hex.EncodeToString(digest[:])
+	if wantSHA != "" && gotSHA != wantSHA {
+		return Descriptor{}, false, fmt.Errorf("%w: content SHA-256 is %s, expected %s", ErrImportMismatch, gotSHA, wantSHA)
+	}
+	replacing := false
+	if row.State == "downloaded" {
+		if row.BlobHash != nil && *row.BlobHash == gotSHA {
+			descriptor, err := s.descriptorForRow(row)
+			return descriptor, false, err
+		}
+		if !command.Replace || row.BlobHash == nil {
+			return Descriptor{}, false, ErrImportConflict
+		}
+		replacing = true
+	}
+	// A downloaded row's size_bytes is the stored blob's size, not a
+	// declaration, so only a pending row's size constrains the import.
+	if !replacing && row.SizeBytes != nil && *row.SizeBytes > 0 && int64(len(data)) != *row.SizeBytes {
+		return Descriptor{}, false, fmt.Errorf("%w: content is %d bytes, the transport declared %d",
+			ErrImportMismatch, len(data), *row.SizeBytes)
+	}
+
+	mime := firstNonEmpty(row.MIME, "application/octet-stream")
+	ref, err := s.blobs.Put(ctx, bytes.NewReader(data), mime, s.maxBytes)
+	if err != nil {
+		return Descriptor{}, false, fmt.Errorf("import media: %w", err)
+	}
+	if replacing {
+		swapped, err := s.attachments.ReplaceDownloaded(ctx, row.MessageID, row.Ordinal, *row.BlobHash, ref.Hash, ref.Size, mime)
+		if err != nil {
+			return Descriptor{}, false, fmt.Errorf("import media: replace: %w", err)
+		}
+		if !swapped {
+			// Lost a race; the reload below accepts a winner that stored
+			// these same bytes.
+			row, err = s.attachments.GetForDownload(ctx, command.MessageID, command.Ordinal)
+			if err != nil {
+				return Descriptor{}, false, fmt.Errorf("import media: reload attachment: %w", err)
+			}
+			if row.State != "downloaded" || row.BlobHash == nil || *row.BlobHash != ref.Hash {
+				return Descriptor{}, false, ErrImportConflict
+			}
+			descriptor, err := s.descriptorForRow(row)
+			return descriptor, false, err
+		}
+	} else if err := s.attachments.MarkDownloaded(ctx, row.MessageID, row.Ordinal, ref.Hash, ref.Size, mime); err != nil {
+		return Descriptor{}, false, fmt.Errorf("import media: mark downloaded: %w", err)
+	}
+	// A concurrent download may have won MarkDownloaded with other bytes; the
+	// durable row decides.
+	row, err = s.attachments.GetForDownload(ctx, command.MessageID, command.Ordinal)
+	if err != nil {
+		return Descriptor{}, false, fmt.Errorf("import media: reload attachment: %w", err)
+	}
+	if row.State != "downloaded" || row.BlobHash == nil || *row.BlobHash != ref.Hash {
+		return Descriptor{}, false, ErrImportConflict
+	}
+	descriptor, err := s.descriptorForRow(row)
+	return descriptor, err == nil, err
 }
 
 func blobRefForAttachment(row sqlite.MessageAttachment) (blob.BlobRef, error) {

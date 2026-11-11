@@ -9,6 +9,12 @@ import (
 	"github.com/maxghenis/openmessage/internal/storage/sqlite"
 )
 
+// Every aggregate below is per account: a COUNT(*) range or MAX seeks on an
+// account-leading index (see sqlite.Store.LatestMessageTimes). Before, each
+// loaded the account's whole conversation list; PlatformStats and MessageCount
+// then paged through every message, and LatestTimestamp read each
+// conversation's newest message.
+
 // MessageCount returns all message rows or those whose account maps to the
 // requested legacy source platform.
 func (s *Source) MessageCount(sourcePlatform string) (int, error) {
@@ -24,17 +30,11 @@ func (s *Source) MessageCount(sourcePlatform string) (int, error) {
 		if sourcePlatform != "" && platformForBridgeKey(account.BridgeKey) != sourcePlatform {
 			continue
 		}
-		conversations, err := s.store.ListConversationsByRecency(account.AccountID)
+		accountCount, err := s.store.CountMessages(account.AccountID)
 		if err != nil {
 			return 0, err
 		}
-		for _, conversation := range conversations {
-			if err := s.walkConversationMessages(conversation.ConversationID, func(sqlite.Message) {
-				count++
-			}); err != nil {
-				return 0, err
-			}
-		}
+		count += int(accountCount)
 	}
 	return count, nil
 }
@@ -54,11 +54,11 @@ func (s *Source) ConversationCount(sourcePlatform string) (int, error) {
 		if sourcePlatform != "" && platformForBridgeKey(account.BridgeKey) != sourcePlatform {
 			continue
 		}
-		conversations, err := s.store.ListConversationsByRecency(account.AccountID)
+		accountCount, err := s.store.CountConversations(account.AccountID)
 		if err != nil {
 			return 0, err
 		}
-		count += len(conversations)
+		count += int(accountCount)
 	}
 	return count, nil
 }
@@ -77,27 +77,40 @@ func (s *Source) LatestTimestamp(sourcePlatform string) (int64, error) {
 		if platformForBridgeKey(account.BridgeKey) != sourcePlatform {
 			continue
 		}
-		conversations, err := s.store.ListConversationsByRecency(account.AccountID)
+		accountLatest, _, err := s.store.LatestMessageTimes(account.AccountID)
 		if err != nil {
 			return 0, err
 		}
-		for _, conversation := range conversations {
-			messages, err := s.messages.ListMessagesByConversation(
-				context.Background(), conversation.ConversationID, 0, "", 1,
-			)
-			if err != nil {
-				return 0, err
-			}
-			if len(messages) > 0 && messages[0].OccurredAtMS > latest {
-				latest = messages[0].OccurredAtMS
-			}
-		}
+		latest = max(latest, accountLatest)
 	}
 	return latest, nil
 }
 
-// PlatformStats summarizes v2 messages under their legacy platform labels.
+// PlatformStats summarizes v2 messages under their legacy platform labels. A
+// platform appears only when it holds at least one message.
 func (s *Source) PlatformStats() ([]db.PlatformStat, error) {
+	return s.platformStats(true)
+}
+
+// PlatformLatest is PlatformStats without the message counts: only seeks, so
+// it stays cheap however large the store grows. /api/status freshness uses it.
+func (s *Source) PlatformLatest() ([]db.PlatformLatest, error) {
+	stats, err := s.platformStats(false)
+	if err != nil {
+		return nil, err
+	}
+	latest := make([]db.PlatformLatest, 0, len(stats))
+	for _, stat := range stats {
+		latest = append(latest, db.PlatformLatest{
+			Platform:     stat.Platform,
+			LatestMS:     stat.LatestMS,
+			LatestRecvMS: stat.LatestRecvMS,
+		})
+	}
+	return latest, nil
+}
+
+func (s *Source) platformStats(withCounts bool) ([]db.PlatformStat, error) {
 	if err := s.ready(); err != nil {
 		return nil, err
 	}
@@ -107,33 +120,33 @@ func (s *Source) PlatformStats() ([]db.PlatformStat, error) {
 	}
 	byPlatform := make(map[string]*db.PlatformStat)
 	for _, account := range accounts {
+		latestMS, latestRecvMS, err := s.store.LatestMessageTimes(account.AccountID)
+		if err != nil {
+			return nil, err
+		}
+		// occurred_at_ms is always positive, so 0 means the account has no
+		// messages; it then contributes no platform row.
+		if latestMS == 0 {
+			continue
+		}
+		var count int64
+		if withCounts {
+			if count, err = s.store.CountMessages(account.AccountID); err != nil {
+				return nil, err
+			}
+		}
 		platform := platformForBridgeKey(account.BridgeKey)
 		if strings.TrimSpace(platform) == "" {
 			platform = "unknown"
 		}
-		conversations, err := s.store.ListConversationsByRecency(account.AccountID)
-		if err != nil {
-			return nil, err
+		stat := byPlatform[platform]
+		if stat == nil {
+			stat = &db.PlatformStat{Platform: platform}
+			byPlatform[platform] = stat
 		}
-		for _, conversation := range conversations {
-			if err := s.walkConversationMessages(conversation.ConversationID, func(message sqlite.Message) {
-				stat := byPlatform[platform]
-				if stat == nil {
-					stat = &db.PlatformStat{Platform: platform}
-					byPlatform[platform] = stat
-				}
-				stat.Count++
-				if message.OccurredAtMS > stat.LatestMS {
-					stat.LatestMS = message.OccurredAtMS
-				}
-				if message.Direction == sqlite.MessageDirectionIncoming &&
-					message.OccurredAtMS > stat.LatestRecvMS {
-					stat.LatestRecvMS = message.OccurredAtMS
-				}
-			}); err != nil {
-				return nil, err
-			}
-		}
+		stat.Count += int(count)
+		stat.LatestMS = max(stat.LatestMS, latestMS)
+		stat.LatestRecvMS = max(stat.LatestRecvMS, latestRecvMS)
 	}
 	stats := make([]db.PlatformStat, 0, len(byPlatform))
 	for _, stat := range byPlatform {

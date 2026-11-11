@@ -5,14 +5,15 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"sort"
 	"strings"
 
 	moderncsqlite "modernc.org/sqlite"
 )
 
 const (
+	sqliteTooBigCode               = 18
 	sqliteConstraintCode           = 19
+	sqliteMismatchCode             = 20
 	sqliteConstraintForeignKeyCode = 787
 	sqliteConstraintPrimaryKeyCode = 1555
 )
@@ -100,7 +101,7 @@ func (s *Store) UpsertAccount(account Account) error {
 			mode = excluded.mode,
 			enabled = excluded.enabled,
 			config_json = excluded.config_json,
-			updated_at_ms = excluded.updated_at_ms
+			updated_at_ms = MAX(accounts.updated_at_ms, excluded.updated_at_ms)
 	`,
 		account.AccountID,
 		account.BridgeKey,
@@ -110,7 +111,7 @@ func (s *Store) UpsertAccount(account Account) error {
 		account.Enabled,
 		account.ConfigJSON,
 		account.CreatedAtMS,
-		account.UpdatedAtMS,
+		max(account.UpdatedAtMS, account.CreatedAtMS),
 	)
 	if err != nil {
 		return fmt.Errorf("upsert account %q: %w", account.AccountID, mapConstraintError(err))
@@ -202,7 +203,7 @@ func (s *Store) UpsertDevice(device Device) error {
 			state = excluded.state,
 			is_current = excluded.is_current,
 			last_seen_at_ms = excluded.last_seen_at_ms,
-			updated_at_ms = excluded.updated_at_ms
+			updated_at_ms = MAX(devices.updated_at_ms, excluded.updated_at_ms)
 	`,
 		device.DeviceID,
 		device.AccountID,
@@ -213,7 +214,7 @@ func (s *Store) UpsertDevice(device Device) error {
 		device.IsCurrent,
 		device.LastSeenAtMS,
 		device.CreatedAtMS,
-		device.UpdatedAtMS,
+		max(device.UpdatedAtMS, device.CreatedAtMS),
 	)
 	if err != nil {
 		return fmt.Errorf("upsert device %q: %w", device.DeviceID, mapConstraintError(err))
@@ -305,7 +306,7 @@ func (s *Store) UpsertIdentity(identity Identity) error {
 			display_name = excluded.display_name,
 			is_self = excluded.is_self,
 			metadata_json = excluded.metadata_json,
-			updated_at_ms = excluded.updated_at_ms
+			updated_at_ms = MAX(identities.updated_at_ms, excluded.updated_at_ms)
 	`,
 		identity.IdentityID,
 		identity.AccountID,
@@ -316,7 +317,7 @@ func (s *Store) UpsertIdentity(identity Identity) error {
 		identity.IsSelf,
 		identity.MetadataJSON,
 		identity.CreatedAtMS,
-		identity.UpdatedAtMS,
+		max(identity.UpdatedAtMS, identity.CreatedAtMS),
 	)
 	if err != nil {
 		return fmt.Errorf("upsert identity %q: %w", identity.IdentityID, mapConstraintError(err))
@@ -389,6 +390,23 @@ func (s *Store) ListIdentities(accountID string) ([]Identity, error) {
 	identities, err := collectRows(rows, scanIdentity)
 	if err != nil {
 		return nil, fmt.Errorf("list identities for account %q: %w", accountID, err)
+	}
+	return identities, nil
+}
+
+// ListSelfIdentities returns the account's own identities.
+func (s *Store) ListSelfIdentities(accountID string) ([]Identity, error) {
+	rows, err := s.db.QueryContext(
+		context.Background(),
+		"SELECT "+identityColumns+" FROM identities WHERE account_id = ? AND is_self = 1 ORDER BY identity_id",
+		accountID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list self identities for account %q: %w", accountID, err)
+	}
+	identities, err := collectRows(rows, scanIdentity)
+	if err != nil {
+		return nil, fmt.Errorf("list self identities for account %q: %w", accountID, err)
 	}
 	return identities, nil
 }
@@ -657,7 +675,7 @@ func (s *Store) UpsertConversation(conversation Conversation) error {
 			archived_at_ms = excluded.archived_at_ms,
 			last_message_at_ms = excluded.last_message_at_ms,
 			metadata_json = excluded.metadata_json,
-			updated_at_ms = excluded.updated_at_ms
+			updated_at_ms = MAX(conversations.updated_at_ms, excluded.updated_at_ms)
 	`,
 		conversation.ConversationID,
 		conversation.AccountID,
@@ -671,7 +689,7 @@ func (s *Store) UpsertConversation(conversation Conversation) error {
 		conversation.LastMessageAtMS,
 		conversation.MetadataJSON,
 		conversation.CreatedAtMS,
-		conversation.UpdatedAtMS,
+		max(conversation.UpdatedAtMS, conversation.CreatedAtMS),
 	)
 	if err != nil {
 		return fmt.Errorf(
@@ -753,33 +771,51 @@ func (s *Store) ListConversationsByRecency(accountID string) ([]Conversation, er
 	return conversations, nil
 }
 
-// ListConversationsByRecencyAllAccounts merges every account's recency list,
-// orders the result deterministically, and returns at most limit rows.
+// conversationsByRecencyQuery is ListConversationsByRecencyAllAccounts in one
+// statement over conversations_recency_idx (archived_at_ms, last_message_at_ms
+// DESC, conversation_id). Unarchived conversations are its archived_at_ms IS
+// NULL prefix, already in recency order, so that arm stops after limit rows.
+// Archived ones are the archived_at_ms >= 0 range (the column's CHECK makes
+// that every non-NULL value; IS NOT NULL would plan as a table scan without
+// statistics); the range is ordered by archive time first, so that arm reads
+// and sorts every archived conversation. The read is therefore bounded by the
+// limit plus the archived count, not by the table.
+const conversationsByRecencyQuery = `
+	SELECT * FROM (
+		SELECT ` + conversationColumns + `
+		FROM conversations
+		WHERE archived_at_ms IS NULL
+		ORDER BY last_message_at_ms DESC, conversation_id
+		LIMIT ?
+	)
+	UNION ALL
+	SELECT * FROM (
+		SELECT ` + conversationColumns + `
+		FROM conversations
+		WHERE archived_at_ms >= 0
+		ORDER BY last_message_at_ms DESC, conversation_id
+		LIMIT ?
+	)
+	ORDER BY last_message_at_ms DESC, conversation_id
+	LIMIT ?
+`
+
+// ListConversationsByRecencyAllAccounts returns at most limit conversations
+// across every account, newest first, with conversation ID as a deterministic
+// tie-breaker.
 func (s *Store) ListConversationsByRecencyAllAccounts(limit int) ([]Conversation, error) {
 	if limit <= 0 {
 		return []Conversation{}, nil
 	}
-	accounts, err := s.ListAccounts()
+	rows, err := s.db.QueryContext(
+		context.Background(), conversationsByRecencyQuery, limit, limit, limit,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("list conversations across accounts: %w", err)
 	}
-
-	conversations := make([]Conversation, 0)
-	for _, account := range accounts {
-		accountConversations, err := s.ListConversationsByRecency(account.AccountID)
-		if err != nil {
-			return nil, fmt.Errorf("list conversations across accounts: %w", err)
-		}
-		conversations = append(conversations, accountConversations...)
-	}
-	sort.Slice(conversations, func(i, j int) bool {
-		if conversations[i].LastMessageAtMS != conversations[j].LastMessageAtMS {
-			return conversations[i].LastMessageAtMS > conversations[j].LastMessageAtMS
-		}
-		return conversations[i].ConversationID < conversations[j].ConversationID
-	})
-	if len(conversations) > limit {
-		conversations = conversations[:limit]
+	conversations, err := collectRows(rows, scanConversation)
+	if err != nil {
+		return nil, fmt.Errorf("list conversations across accounts: %w", err)
 	}
 	return conversations, nil
 }

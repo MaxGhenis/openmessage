@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
+	"go.mau.fi/mautrix-gmessages/pkg/libgm"
 	"go.mau.fi/mautrix-gmessages/pkg/libgm/gmproto"
 
 	"github.com/maxghenis/openmessage/internal/app"
@@ -658,6 +659,125 @@ func TestSetTranscriptCountsCharacters(t *testing.T) {
 	}
 	if got["transcript_length"] != float64(3) {
 		t.Fatalf("transcript_length = %#v, want 3", got["transcript_length"])
+	}
+}
+
+func seedTranscriptVoiceNote(t *testing.T, store *db.Store) {
+	t.Helper()
+	if err := store.UpsertConversation(&db.Conversation{ConversationID: "c1", Name: "Alice", LastMessageTS: 100}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertMessage(&db.Message{
+		MessageID:      "audio-1",
+		ConversationID: "c1",
+		Body:           "[Voice note]",
+		MediaID:        "media-1",
+		MimeType:       "audio/ogg",
+		TimestampMS:    100,
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The route saves a transcript at the length limit even when JSON escaping
+// makes its request six times longer than the text, as Go's encoder does for
+// "<". The MCP tool's client mode sends every transcript this way, and the
+// tool in process accepts it. The route still refuses a body past the request
+// bound.
+func TestSetTranscriptAcceptsAnEscapedTranscriptAtTheLimit(t *testing.T) {
+	ts := newTestServer(t)
+	seedTranscriptVoiceNote(t, ts.store)
+
+	atLimit := strings.Repeat("<", db.MaxTranscriptBytes)
+	payload, err := json.Marshal(map[string]string{"message_id": "audio-1", "transcript": atLimit, "model": strings.Repeat("&", db.MaxTranscriptModelBytes)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(payload) < 6*db.MaxTranscriptBytes {
+		t.Fatalf("payload is %d bytes; the test needs the escaped form", len(payload))
+	}
+	resp, err := http.Post(ts.server.URL+"/api/transcript", "application/json", bytes.NewReader(payload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("got status %d, want 200: %s", resp.StatusCode, body)
+	}
+	msg, err := ts.store.GetMessageByID("audio-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if msg.Transcript != atLimit {
+		t.Fatalf("stored a %d-byte transcript, want the %d bytes sent", len(msg.Transcript), len(atLimit))
+	}
+
+	oversized := `{"message_id":"` + strings.Repeat("m", maxTranscriptRequestBytes) + `","transcript":"x"}`
+	resp, err = http.Post(ts.server.URL+"/api/transcript", "application/json", strings.NewReader(oversized))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusRequestEntityTooLarge || !strings.Contains(string(body), "transcript request too large") {
+		t.Fatalf("got status %d, want 413 for a body past the bound: %s", resp.StatusCode, body)
+	}
+}
+
+// The answer names the model the message carries after the save, so a caller
+// that omitted the model learns which one the store kept.
+func TestSetTranscriptReportsTheStoredModel(t *testing.T) {
+	ts := newTestServer(t)
+	seedTranscriptVoiceNote(t, ts.store)
+
+	for _, step := range []struct{ body, wantModel string }{
+		{`{"message_id":"audio-1","transcript":"hello","model":"whisper-large-v3"}`, "whisper-large-v3"},
+		{`{"message_id":"audio-1","transcript":"refined"}`, "whisper-large-v3"},
+		{`{"message_id":"audio-1","transcript":""}`, ""},
+	} {
+		resp, err := http.Post(ts.server.URL+"/api/transcript", "application/json", strings.NewReader(step.body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got map[string]any
+		decodeErr := json.NewDecoder(resp.Body).Decode(&got)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK || decodeErr != nil {
+			t.Fatalf("POST %s: status %d, decode %v", step.body, resp.StatusCode, decodeErr)
+		}
+		if model, ok := got["transcript_model"].(string); !ok || model != step.wantModel {
+			t.Fatalf("POST %s: transcript_model = %#v, want %q", step.body, got["transcript_model"], step.wantModel)
+		}
+	}
+}
+
+// A v2-primary daemon refuses transcripts. The v2 store keeps none, and
+// reads serve v2 there, so they would never show one saved to the legacy
+// store this route writes. The refusal says why, and the legacy store stays
+// as it was.
+func TestSetTranscriptRefusedWhileV2IsTheServingStore(t *testing.T) {
+	ts := newTestServerWithOptions(t, APIOptions{V2Primary: true})
+	seedTranscriptVoiceNote(t, ts.store)
+
+	resp, err := http.Post(ts.server.URL+"/api/transcript", "application/json", strings.NewReader(`{"message_id":"audio-1","transcript":"hello world","model":"whisper"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("got status %d, want 409: %s", resp.StatusCode, body)
+	}
+	if !strings.Contains(string(body), "not available while v2 is the serving store") {
+		t.Fatalf("body = %s, want the v2 refusal", body)
+	}
+	msg, err := ts.store.GetMessageByID("audio-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if msg.Transcript != "" || msg.TranscribedAtMS != 0 || msg.TranscriptModel != "" {
+		t.Fatalf("the legacy store holds a transcript: %q (model %q, at %d)", msg.Transcript, msg.TranscriptModel, msg.TranscribedAtMS)
 	}
 }
 
@@ -2039,6 +2159,25 @@ func TestGoogleAuthExpiredErrorIsUserFacing(t *testing.T) {
 	}
 	if strings.Contains(got, "OAuth") || strings.Contains(got, "credential") || strings.Contains(got, "HTTP 401") {
 		t.Fatalf("error leaked auth details: %q", got)
+	}
+}
+
+func TestGoogleAccountSwitchErrorIsUserFacing(t *testing.T) {
+	err := fmt.Errorf("get conversation: %w", &libgm.ResponsePayloadError{
+		Action:        gmproto.ActionType_GET_CONVERSATION,
+		Frames:        1,
+		AccountSwitch: true,
+	})
+	got := googleAPIErrorMessage("get conversation", err)
+	if !strings.Contains(got, "switched to Google-account pairing") || !strings.Contains(got, "Re-pair") {
+		t.Fatalf("error = %q", got)
+	}
+	if strings.Contains(got, "GET_CONVERSATION") || strings.Contains(got, "f11") {
+		t.Fatalf("error leaked protocol details: %q", got)
+	}
+	plain := googleAPIErrorMessage("get conversation", &libgm.ResponsePayloadError{Action: gmproto.ActionType_GET_CONVERSATION})
+	if strings.Contains(plain, "switched to Google-account pairing") {
+		t.Fatalf("a payload error without the switch notice was misreported: %q", plain)
 	}
 }
 

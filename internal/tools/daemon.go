@@ -405,11 +405,57 @@ func daemonReactToMessageHandler(options Options) server.ToolHandlerFunc {
 		if action == "" {
 			action = "add"
 		}
-		if err := daemon.React(ctx, conversationID, messageID, emoji, action); err != nil {
+		// One key for this reaction on every route: a v2-primary app dedupes on
+		// it, so a repeat after a lost answer cannot store a second reaction.
+		key, err := v2IdempotencyKey(args)
+		if err != nil {
+			return errorResult(err.Error()), nil
+		}
+		// A v2-primary app takes reactions on its durable outbox, where the
+		// intent carries an idempotency key and its delivery can be followed.
+		// Any other answer to the probe keeps the reaction on /api/react,
+		// which every app mode serves and which may also be a v2-primary app
+		// whose status could not be read.
+		status, reachable, probeErr := daemon.Status(ctx)
+		if probeErr != nil && !reachable {
+			return daemonDownResult(probeErr), nil
+		}
+		if probeErr == nil && status.ReactionsViaOutbox() {
+			args["idempotency_key"] = key
+			return daemonSubmitReactionAndWait(ctx, daemon, args, conversationID, messageID, emoji, action), nil
+		}
+		result, err := daemon.React(ctx, conversationID, messageID, emoji, action, key)
+		if err != nil {
+			if result.OutboxID != "" {
+				// A v2-primary app stored the reaction and then could not
+				// deliver it; its outbox state says what happened (an
+				// uncertain one may have been applied).
+				return v2ReactionResult(
+					daemonReactDelivery(result),
+					false, key, nil,
+				), nil
+			}
 			if responseErr, ok := localapi.AsResponseError(err); ok {
 				return errorResult(fmt.Sprintf("the app could not send the reaction: HTTP %d: %s", responseErr.StatusCode, responseErr.Body)), nil
 			}
-			return daemonDownResult(err), nil
+			if localapi.IsConnectionRefused(err) {
+				return daemonDownResult(err), nil
+			}
+			// The request failed mid-flight, so the app may hold the reaction.
+			return ambiguousReactionResult(key, err), nil
+		}
+		if !result.Success {
+			// The legacy Google route answers 200 with success false when the
+			// phone refuses the reaction.
+			return errorResult("the app reported that the reaction was not applied"), nil
+		}
+		if result.Queued {
+			// A v2-primary app answered on the compatibility route: the
+			// reaction is on its outbox, under key, and not delivered yet.
+			return v2ReactionResult(
+				daemonReactDelivery(result),
+				false, key, nil,
+			), nil
 		}
 		return structuredResult(map[string]any{
 			"ok":         true,
@@ -418,6 +464,16 @@ func daemonReactToMessageHandler(options Options) server.ToolHandlerFunc {
 			"action":     action,
 			"via":        "app",
 		}, fmt.Sprintf("Reaction %s (%s) sent via the running OpenMessage app.", emoji, action)), nil
+	}
+}
+
+// daemonReactDelivery is the outbox delivery an /api/react answer describes.
+func daemonReactDelivery(result localapi.ReactResult) messaging.Delivery {
+	return messaging.Delivery{
+		OutboxID:   result.OutboxID,
+		State:      messaging.OutboxState(result.State),
+		ErrorClass: result.ErrorClass,
+		ErrorCode:  result.ErrorCode,
 	}
 }
 
@@ -478,6 +534,22 @@ func phoneDigitsMatch(wantedDigits, participantNumber string) bool {
 	}
 	return strings.HasSuffix(participantDigits, wantedDigits) ||
 		strings.HasSuffix(wantedDigits, participantDigits)
+}
+
+// smsPathStatusText warns, in one line, when the daemon reports that carrier
+// SMS has stopped reaching the phone while RCS still arrives
+// (freshness.google.sms_path), and says nothing otherwise.
+func smsPathStatusText(raw map[string]any) string {
+	freshness, _ := raw["freshness"].(map[string]any)
+	google, _ := freshness["google"].(map[string]any)
+	path, _ := google["sms_path"].(map[string]any)
+	if stalled, _ := path["stalled"].(bool); !stalled {
+		return ""
+	}
+	silentMS, _ := path["silent_ms"].(float64)
+	return fmt.Sprintf("Google SMS: STOPPED. No incoming SMS for %.0fh while RCS still arrives; "+
+		"the phone has likely stopped receiving SMS (try restarting it). See freshness.google.sms_path.\n",
+		silentMS/float64(time.Hour/time.Millisecond))
 }
 
 // daemonGetStatusHandler serves get_status in client mode: daemon truth when
@@ -543,6 +615,7 @@ func daemonGetStatusHandler(a *app.App, options Options) server.ToolHandlerFunc 
 		appendPlatform("Google Messages", "google")
 		appendPlatform("WhatsApp", "whatsapp")
 		appendPlatform("Signal", "signal")
+		sb.WriteString(smsPathStatusText(raw))
 		if v2Primary, ok := raw["v2_primary"].(bool); ok {
 			fmt.Fprintf(&sb, "App v2 mode: primary=%v send=%v\n", v2Primary, raw["v2_send"])
 		}

@@ -23,6 +23,13 @@ var (
 		}
 		return cli.GM.SendMessage(payload)
 	}
+	uploadGoogleMedia = func(a *App, data []byte, filename, mime string) (*gmproto.MediaContent, error) {
+		cli := a.GetClient()
+		if cli == nil {
+			return nil, fmt.Errorf(ErrNotConnected)
+		}
+		return cli.GM.UploadMedia(data, filename, mime)
+	}
 )
 
 // ErrNotConnected is the error message returned when an operation requires

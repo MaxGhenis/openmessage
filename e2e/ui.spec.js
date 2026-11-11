@@ -1070,6 +1070,98 @@ test('maps durable outbox states to honest tray labels and actions', async ({ pa
   }
 });
 
+test('lists a reaction in the tray only while the app is still sending it', async ({ page }) => {
+  await page.waitForFunction(() => window.__openMessageTestHooks?.outboxRowView);
+  const views = await page.evaluate(() => {
+    const now = 1_700_000_000_000;
+    const view = window.__openMessageTestHooks.outboxRowView;
+    const reaction = state => view({ kind: 'reaction', state, scheduled_for_ms: now }, now);
+    return {
+      queued: reaction('queued'),
+      dispatching: reaction('dispatching'),
+      retrying: reaction('not_dispatched'),
+      uncertain: reaction('uncertain'),
+      repairing: reaction('store_failed'),
+      confirmed: reaction('confirmed'),
+      rejected: reaction('rejected'),
+    };
+  });
+
+  expect(views.queued).toMatchObject({ visible: true, label: 'Sending…', action: 'cancel' });
+  expect(views.queued.guidance).toContain('do not react again');
+  expect(views.dispatching).toMatchObject({ visible: true, label: 'Sending…', action: '' });
+  expect(views.retrying).toMatchObject({ visible: true, label: 'Retrying…', action: 'cancel' });
+  // A reaction cannot be sent again from the tray, so one the app has stopped
+  // sending is not listed there with an action that would fail.
+  for (const done of [views.uncertain, views.repairing, views.confirmed, views.rejected]) {
+    expect(done).toMatchObject({ visible: false, action: '' });
+  }
+});
+
+async function reactToLastReceivedMessage(page) {
+  const target = page.locator('#messages-area .msg.received').last();
+  const messageID = await target.getAttribute('data-msg-id');
+  const message = page.locator(`#messages-area .msg[data-msg-id="${messageID}"]`);
+  const answered = page.waitForResponse(response =>
+    response.request().method() === 'POST' && /\/api\/react(\?|$)/.test(response.url()));
+  await message.hover();
+  await message.locator('.action-react').click();
+  const emoji = (await message.locator('.emoji-picker button').first().textContent()).trim();
+  await message.locator('.emoji-picker button').first().click();
+  return { message, emoji, response: await answered };
+}
+
+test('sends a reaction through the outbox and shows it on the message', async ({ page }) => {
+  await openConversation(page, 'Sarah Chen');
+
+  const { message, emoji, response } = await reactToLastReceivedMessage(page);
+  expect(response.status()).toBe(200);
+  expect(await response.json()).toMatchObject({ success: true, state: 'confirmed' });
+
+  // Nothing echoes the reaction back in this fixture: the pill is the own
+  // reaction the app recorded when the transport accepted it.
+  const pill = message.locator('.reaction-pill').filter({ hasText: emoji });
+  await expect(pill).toHaveCount(1);
+  await expect(pill).toHaveAttribute('title', /You/);
+});
+
+test('reports a queued reaction and lists it in the outbox while the platform is down', async ({ page, request }) => {
+  await openConversation(page, 'Sarah Chen');
+  // Enough refusals that the app's automatic retries cannot deliver the
+  // reaction before the test cancels it.
+  for (let i = 0; i < 12; i++) {
+    await request.post('/_e2e/bridges/google-primary/next-reaction', { data: { next_result: 'not_connected' } });
+  }
+  try {
+    const { response } = await reactToLastReceivedMessage(page);
+    expect(response.status()).toBe(202);
+    expect(await response.json()).toMatchObject({ success: true, queued: true, state: 'not_dispatched' });
+    await expect(page.locator('#thread-feedback')).toContainText('Reaction not sent yet');
+
+    await page.locator('#outbox-toggle-btn').click();
+    const row = page.locator('#outbox-tray .outbox-row').filter({ hasText: 'Reaction' });
+    await expect(row).toHaveCount(1);
+    await expect(row).toContainText('Retrying…');
+    await row.locator('.outbox-row-action').click();
+    await expect(row).toHaveCount(0);
+  } finally {
+    await request.post('/_e2e/bridges/google-primary/next-reaction', { data: { next_result: 'clear' } });
+  }
+});
+
+test('says so when the platform refuses a reaction', async ({ page, request }) => {
+  await openConversation(page, 'Sarah Chen');
+  await request.post('/_e2e/bridges/google-primary/next-reaction', { data: { next_result: 'rejected' } });
+  try {
+    const { response } = await reactToLastReceivedMessage(page);
+    expect(response.status()).toBe(502);
+    expect(await response.json()).toMatchObject({ success: false, state: 'rejected' });
+    await expect(page.locator('#thread-feedback')).toContainText('refused the reaction');
+  } finally {
+    await request.post('/_e2e/bridges/google-primary/next-reaction', { data: { next_result: 'clear' } });
+  }
+});
+
 test('keeps existing thread nodes mounted after sending', async ({ page }) => {
   const outbound = `Stable send ${Date.now()}`;
 
@@ -1224,6 +1316,45 @@ test('queues a text message while Google Messages needs repair', async ({ page }
   expect(sendRequests).toBe(0);
 });
 
+// Review of #260: a refresh that keeps failing sets needs_repair too, but its
+// fix is Chrome's sign-in, so a queued text must not say "re-pair".
+test('queues a text while the Google sign-in refresh keeps failing, pointing at Chrome', async ({ page }) => {
+  const outbound = `Queued refresh ${Date.now()}`;
+  let sendRequests = 0;
+  const supervisor = {
+    state: 'repairing_credentials',
+    retry_at_ms: Date.now() + 4 * 60_000,
+    repair: { attempts: 3, consecutive_failures: 3, last_outcome: 'failed_retrying', last_error: 'missing required cookies: .google.com:SID' },
+  };
+  await page.route('**/api/status', route => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({
+      connected: true,
+      google: {
+        connected: false, paired: true, needs_pairing: false, needs_repair: true,
+        auth_expired: true, repair_failing: true, supervisor,
+      },
+      whatsapp: { connected: true, paired: true },
+      signal: { connected: true, paired: true },
+    }),
+  }));
+  page.on('request', req => {
+    if (req.method() === 'POST' && /\/api\/send(\?|$)/.test(req.url())) {
+      sendRequests += 1;
+    }
+  });
+
+  await page.reload();
+  await openConversation(page, 'Sarah Chen');
+  await page.locator('#compose-input').fill(outbound);
+  await page.locator('#send-btn').click();
+
+  await expect(page.locator('#thread-feedback')).toContainText('make sure Chrome is signed in');
+  await expect(page.locator('#thread-feedback')).not.toContainText('Re-pair');
+  expect(sendRequests).toBe(0);
+});
+
 test('queues an attachment while Google Messages needs repair', async ({ page }) => {
   let sendMediaRequests = 0;
 
@@ -1357,6 +1488,152 @@ test('sends a Signal image attachment through the compose box', async ({ page })
   const latestMessage = page.locator('#messages-area .msg').last();
   await expect(latestMessage.locator('img[src*="/api/media/"]')).toBeVisible();
   await expect(latestMessage.locator('.msg-media-loading')).toHaveCount(0);
+});
+
+const onePixelPNG = Buffer.from(
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO7Z9wAAAABJRU5ErkJggg==',
+  'base64',
+);
+
+// lateImageThread adds one incoming image message to every newest-page thread
+// read, with whatever media_version the test sets, so a test controls both
+// what the UI renders from and what /api/media answers for it. A text message
+// beside it carries state.neighbourBody, which a test changes to make the
+// thread render again without touching the image's own node.
+async function lateImageThread(page, state) {
+  const timestampMS = Date.now();
+  await page.route(/\/api\/conversations\/[^/]+\/messages/, async route => {
+    const url = new URL(route.request().url());
+    const response = await route.fetch();
+    const messages = await response.json();
+    if (!Array.isArray(messages) || url.searchParams.has('before')) {
+      await route.fulfill({ response, json: messages });
+      return;
+    }
+    const conversationID = decodeURIComponent(url.pathname.split('/')[3]);
+    messages.unshift({
+      MessageID: 'e2e-late-image',
+      ConversationID: conversationID,
+      SenderName: 'Sarah Chen',
+      SenderNumber: '',
+      Body: '',
+      TimestampMS: timestampMS,
+      Status: '',
+      IsFromMe: false,
+      MediaID: 'v2msg:e2e-late-image:0',
+      MimeType: 'image/png',
+      source_platform: 'sms',
+      ...(state.version ? { media_version: state.version } : {}),
+    });
+    messages.unshift({
+      MessageID: 'e2e-late-image-neighbour',
+      ConversationID: conversationID,
+      SenderName: 'Sarah Chen',
+      SenderNumber: '',
+      Body: state.neighbourBody || 'Sent you a photo',
+      TimestampMS: timestampMS + 1,
+      Status: '',
+      IsFromMe: false,
+      source_platform: 'sms',
+    });
+    await route.fulfill({ response, json: messages });
+  });
+  const requests = [];
+  await page.route(/\/api\/media\/e2e-late-image/, async route => {
+    const request = route.request();
+    requests.push({ method: request.method(), url: request.url() });
+    const answer = state.answer(request);
+    if (answer.status === 200) {
+      await route.fulfill({ status: 200, contentType: 'image/png', body: answer.body || onePixelPNG });
+      return;
+    }
+    await route.fulfill({
+      status: answer.status,
+      headers: { 'Content-Type': 'application/json', ...(answer.retryAfter ? { 'Retry-After': answer.retryAfter } : {}) },
+      body: JSON.stringify({ error: answer.error || 'test answer' }),
+    });
+  });
+  await openConversation(page, 'Sarah Chen');
+  return {
+    message: page.locator('#messages-area .msg').filter({ has: page.locator('img[src*="/api/media/e2e-late-image"]') }),
+    requests,
+  };
+}
+
+// 2026-10-24: Google sends an image's message about a second before it names
+// the media, so the first load answered no and the thread kept "Image
+// unavailable" for good. A temporary answer (503 with Retry-After) is waited
+// out, and the image loads.
+test('retries an image whose first loads answer 503 until it loads', async ({ page }) => {
+  let gets = 0;
+  const thread = await lateImageThread(page, {
+    version: '0123456789ab',
+    answer: request => {
+      if (request.method() === 'GET') gets++;
+      return gets < 3
+        ? { status: 503, retryAfter: '1', error: 'media: attachment is not available from its transport yet' }
+        : { status: 200 };
+    },
+  });
+
+  const image = thread.message.locator('img');
+  await expect(image).toBeVisible({ timeout: 20_000 });
+  await expect(thread.message.locator('.msg-media-loading')).toHaveCount(0);
+  await expect(image).toHaveAttribute('src', /[?&]retry=2(&|$)/);
+  expect(thread.requests.map(request => request.method)).toEqual(['GET', 'HEAD', 'GET', 'HEAD', 'GET']);
+});
+
+// An answer that waiting cannot change is final at once: no retries, nothing
+// asked again on later renders, and no broken-image box.
+test('shows an image that answers 404 as unavailable without retrying', async ({ page }) => {
+  const state = {
+    version: '0123456789ab',
+    answer: () => ({ status: 404, error: 'not found' }),
+  };
+  const thread = await lateImageThread(page, state);
+
+  await expect(thread.message.locator('.msg-media-loading.is-error')).toContainText('Image unavailable');
+  await expect(thread.message.locator('img')).toBeHidden();
+  // Change the message beside it: the thread renders again, which hydrates
+  // every media node, the failed image's included.
+  state.neighbourBody = 'Did the photo come through?';
+  await expect(page.locator('#messages-area')).toContainText('Did the photo come through?', { timeout: 20_000 });
+  await page.waitForTimeout(3_000);
+  expect(thread.requests.map(request => request.method)).toEqual(['GET', 'HEAD']);
+  await expect(thread.message.locator('.msg-media-loading.is-error')).toContainText('Image unavailable');
+});
+
+// Bytes the server has (HEAD 200) but the browser cannot decode get one more
+// load, in case the first failure was the connection's, and then show as
+// unavailable rather than being fetched again and again.
+test('gives an image the server has but the browser cannot decode one more load', async ({ page }) => {
+  const thread = await lateImageThread(page, {
+    version: '0123456789ab',
+    answer: () => ({ status: 200, body: Buffer.from('not an image') }),
+  });
+
+  await expect(thread.message.locator('.msg-media-loading.is-error')).toContainText('Image unavailable', { timeout: 20_000 });
+  await page.waitForTimeout(3_000);
+  expect(thread.requests.map(request => request.method)).toEqual(['GET', 'HEAD', 'GET', 'HEAD']);
+  expect(new URL(thread.requests[2].url).searchParams.get('retry')).toBe('1');
+});
+
+// A failed image loads once its media_version changes: the server names new
+// media (Google's media ID arriving after the message), and the UI renders a
+// new image for it on the next thread refresh.
+test('loads a failed image again when its media_version changes', async ({ page }) => {
+  const state = {
+    version: '',
+    answer: () => (state.version ? { status: 200 } : { status: 404, error: 'not found' }),
+  };
+  const thread = await lateImageThread(page, state);
+  await expect(thread.message.locator('.msg-media-loading.is-error')).toContainText('Image unavailable');
+
+  state.version = 'fedcba987654';
+  const image = thread.message.locator('img');
+  await expect(image).toBeVisible({ timeout: 20_000 });
+  await expect(image).toHaveAttribute('src', /[?&]v=fedcba987654(&|$)/);
+  await expect(thread.message.locator('.msg-media-loading')).toHaveCount(0);
 });
 
 test('ignores duplicate composer submissions while media send is in flight', async ({ page }) => {
@@ -2501,4 +2778,178 @@ test('an auth-dead Google session (disconnected + needs_repair) shows Re-pair, n
     backfill: { running: false },
   }));
   await expect(page.locator('#connection-banner-action')).toHaveText('Reconnect');
+});
+
+// 2026-10-22: an expired Google cookie showed "your phone unlinked
+// OpenMessage. Re-pair to fix it." while the backend only needed to refresh
+// the cookie. Recovering states must never ask for a re-pair.
+test('an expired Google cookie being refreshed says reconnecting, never Re-pair', async ({ page }) => {
+  await page.waitForFunction(() => window.__openMessageTestHooks?.applyAppStatus);
+  const status = (google) => ({
+    connected: true,
+    google: { connected: false, paired: true, needs_pairing: false, needs_repair: false, ...google },
+    whatsapp: { connected: true, paired: true },
+    signal: { connected: true, paired: true },
+    backfill: { running: false },
+  });
+
+  // A refresh is running: say so, offer nothing to press.
+  await page.evaluate((s) => window.__openMessageTestHooks.applyAppStatus(s), status({
+    auth_expired: true,
+    reconnecting: true,
+    supervisor: { state: 'repairing_credentials', repair: { attempts: 1, last_outcome: 'running' } },
+  }));
+  await expect(page.locator('#connection-banner')).toBeVisible();
+  await expect(page.locator('#connection-banner-copy')).toContainText('refreshing it from Chrome');
+  await expect(page.locator('#connection-banner-copy')).toContainText('No re-pair needed');
+  await expect(page.locator('#connection-banner-copy')).not.toContainText('unlinked');
+  await expect(page.locator('#connection-banner-action')).toBeHidden();
+
+  // A refresh failed and waits to retry: show why, and let the user retry now.
+  await page.evaluate((s) => window.__openMessageTestHooks.applyAppStatus(s), status({
+    auth_expired: true,
+    reconnecting: true,
+    supervisor: {
+      state: 'repairing_credentials',
+      retry_at_ms: Date.now() + 4 * 60_000,
+      repair: { attempts: 2, last_outcome: 'failed_retrying', last_error: 'keychain locked' },
+    },
+  }));
+  await expect(page.locator('#connection-banner-copy')).toContainText('keychain locked');
+  await expect(page.locator('#connection-banner-copy')).toContainText('Retrying at');
+  await expect(page.locator('#connection-banner-action')).toHaveText('Retry now');
+  await expect(page.locator('#connection-banner-action')).toHaveAttribute('data-action', 'reconnect-google');
+
+  // A plain reconnect backoff also reads as recovering.
+  await page.evaluate((s) => window.__openMessageTestHooks.applyAppStatus(s), status({
+    reconnecting: true,
+    supervisor: { state: 'backoff', retry_at_ms: Date.now() + 30_000, repair: {} },
+  }));
+  await expect(page.locator('#connection-banner-copy')).toHaveText('Reconnecting to Google Messages…');
+  await expect(page.locator('#connection-banner-action')).toHaveText('Retry now');
+});
+
+test('a parked Google supervisor explains why and asks for Re-pair only when the session is the problem', async ({ page }) => {
+  await page.waitForFunction(() => window.__openMessageTestHooks?.applyAppStatus);
+  const parked = (supervisor) => ({
+    connected: true,
+    google: { connected: false, paired: true, needs_pairing: false, needs_repair: true, auth_expired: true, supervisor },
+    whatsapp: { connected: true, paired: true },
+    signal: { connected: true, paired: true },
+    backfill: { running: false },
+  });
+
+  // Fresh cookies rejected again and again: check Chrome, then reconnect.
+  // The Platforms dialog must offer the same reconnect, not a re-pair
+  // (review of #260).
+  await page.evaluate((s) => window.__openMessageTestHooks.applyAppStatus(s), parked({
+    state: 'blocked', block_reason: 'repeated_failure', error_class: 'credentials_expired', repair: { attempts: 5 },
+  }));
+  await expect(page.locator('#connection-banner-copy')).toContainText('keeps rejecting fresh sign-in cookies');
+  await expect(page.locator('#connection-banner-action')).toHaveText('Reconnect');
+  await expect(page.locator('#connection-banner-action')).toHaveAttribute('data-action', 'reconnect-google');
+  await openPlatforms(page);
+  await expect(page.locator('#gm-reconnect-btn')).toHaveText('Reconnect Google Messages');
+  await expect(page.locator('#gm-reconnect-btn')).toHaveAttribute('data-mode', 'reconnect');
+  await page.keyboard.press('Escape');
+
+  // A refresh that keeps failing (Chrome signed out) asks for attention while
+  // it keeps retrying, and points at Chrome, never at a re-pair.
+  await page.evaluate((s) => window.__openMessageTestHooks.applyAppStatus(s), {
+    ...parked({
+      state: 'repairing_credentials',
+      retry_at_ms: Date.now() + 4 * 60_000,
+      repair: { attempts: 3, consecutive_failures: 3, last_outcome: 'failed_retrying', last_error: 'missing required cookies: .google.com:SID' },
+    }),
+    google: {
+      connected: false, paired: true, needs_pairing: false, needs_repair: true, auth_expired: true, repair_failing: true,
+      supervisor: {
+        state: 'repairing_credentials',
+        retry_at_ms: Date.now() + 4 * 60_000,
+        repair: { attempts: 3, consecutive_failures: 3, last_outcome: 'failed_retrying', last_error: 'missing required cookies: .google.com:SID' },
+      },
+    },
+  });
+  await expect(page.locator('#connection-banner-copy')).toContainText('Make sure Chrome is signed in');
+  await expect(page.locator('#connection-banner-copy')).not.toContainText('re-pair');
+  await expect(page.locator('#connection-banner-action')).toHaveText('Retry now');
+
+  // No refresh mechanism at all: a re-pair is the fix.
+  await page.evaluate((s) => window.__openMessageTestHooks.applyAppStatus(s), parked({
+    state: 'blocked', block_reason: 'repair_failed', error_class: 'credentials_expired',
+    repair: { last_outcome: 'failed_blocked', last_error: 'Google cookie refresh is unavailable; pair again' },
+  }));
+  await expect(page.locator('#connection-banner-copy')).toContainText('can’t refresh its sign-in automatically');
+  await expect(page.locator('#connection-banner-action')).toHaveText('Re-pair');
+});
+
+// Review of #227: a reaction whose response was lost may already be on the
+// outbox. The page must not call it unsent, and tapping it again must replay
+// the same intent (same idempotency key) rather than store a second one. Once
+// the app answers, the next tap is a new reaction.
+test('replays a reaction whose response was lost under the same key', async ({ page }) => {
+  await openConversation(page, 'Sarah Chen');
+  const bodies = [];
+  let mode = 'drop';
+  await page.route('**/api/react', async (route) => {
+    bodies.push(JSON.parse(route.request().postData() || '{}'));
+    if (mode === 'drop') {
+      await route.abort('failed');
+      return;
+    }
+    await route.fulfill({ status: 200, contentType: 'application/json', body: '{"success":true,"state":"confirmed"}' });
+  });
+
+  await page.evaluate(() => window.sendReaction('seeded-message', '👍'));
+  await expect(page.locator('#thread-feedback')).toContainText("Couldn't confirm the reaction reached the app");
+  await expect(page.locator('#thread-feedback')).not.toContainText('not sent');
+
+  mode = 'answer';
+  await page.evaluate(() => window.sendReaction('seeded-message', '👍'));
+  await page.evaluate(() => window.sendReaction('seeded-message', '👍'));
+
+  expect(bodies).toHaveLength(3);
+  expect(bodies[0].idempotency_key).toBeTruthy();
+  expect(bodies[1].idempotency_key).toBe(bodies[0].idempotency_key);
+  expect(bodies[2].idempotency_key).not.toBe(bodies[0].idempotency_key);
+});
+
+test('marks an attachment this app has no copy of as unavailable instead of linking it', async ({ page }) => {
+  const marcusConversationID = await page.evaluate(async () => {
+    const response = await fetch('/api/conversations?limit=200');
+    const conversations = await response.json();
+    return conversations.find(conversation => conversation.Name === 'Marcus Johnson').ConversationID;
+  });
+  await page.route(new RegExp(`/api/conversations/${marcusConversationID}/messages\\?`), async route => {
+    const response = await route.fetch();
+    const payload = await response.json();
+    const messages = Array.isArray(payload) ? payload : (payload.messages || []);
+    const unavailable = {
+      MessageID: 'e2e-unavailable-attachment',
+      ConversationID: marcusConversationID,
+      SenderName: 'Marcus Johnson',
+      Body: 'here is the spec',
+      TimestampMS: Date.now(),
+      MediaID: 'v2msg:e2e-unavailable-attachment:0',
+      MimeType: 'text/html',
+      media_unavailable: 'media: attachment is no longer available from its transport: signal-cli has no copy of attachment x.html',
+      source_platform: 'signal',
+    };
+    if (Array.isArray(payload)) {
+      payload.push(unavailable);
+    } else {
+      messages.push(unavailable);
+      payload.messages = messages;
+    }
+    await route.fulfill({ response, json: payload });
+  });
+
+  await page.locator('#conversation-list .convo-item').filter({ hasText: 'Marcus Johnson' }).first().click();
+  const message = page.locator('#messages-area .msg').filter({ hasText: 'here is the spec' }).first();
+  const card = message.locator('.msg-attachment-card.msg-attachment-unavailable');
+  await expect(card).toBeVisible();
+  await expect(card).toContainText('unavailable');
+  await expect(card).toContainText('Ask the sender to send it again.');
+  await expect(card).toHaveAttribute('title', /has no copy of attachment/);
+  await expect(message.locator('a[href*="/api/media/"], img[src*="/api/media/"]')).toHaveCount(0);
 });
