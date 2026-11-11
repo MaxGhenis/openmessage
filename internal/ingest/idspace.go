@@ -241,8 +241,8 @@ func (w *Worker) googleConversationEventTarget(
 }
 
 // resolveEventPeers resolves a conversation event's non-self participants to
-// identity rows. Participants without a usable address are skipped: they can
-// neither prove nor disprove a binding.
+// identity rows. Participants without a usable address (see addressable) are
+// skipped: they can neither prove nor disprove a binding.
 func (w *Worker) resolveEventPeers(
 	accountID string,
 	platform bridge.Platform,
@@ -252,7 +252,7 @@ func (w *Worker) resolveEventPeers(
 	peers := make([]sqlite.Identity, 0, len(event.Participants))
 	seen := make(map[string]struct{}, len(event.Participants))
 	for _, participant := range event.Participants {
-		if participant.Identity.IsSelf || identityRaw(participant.Identity) == "" {
+		if participant.Identity.IsSelf || !addressable(accountID, platform, participant.Identity) {
 			continue
 		}
 		identity, err := w.resolveIdentityFor(accountID, platform, participant.Identity, createOnly)
