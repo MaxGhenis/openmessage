@@ -28,6 +28,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "  serve [--demo] [--web|--no-web] [--mcp-sse|--no-mcp-sse] [--mcp-stdio] - Start explicit web/MCP transports")
 		fmt.Fprintln(os.Stderr, "  demo                                     - Start a seeded fake-data UI with live transports disabled")
 		fmt.Fprintln(os.Stderr, "  backup [--to dir] [--json]               - Create a verified legacy migration backup and manifest")
+		fmt.Fprintln(os.Stderr, "  compact [--apply] [--backup-dir dir] [--json] - Return the legacy store's free pages to disk (dry run by default; quit the app first)")
 		fmt.Fprintln(os.Stderr, "  migrate [--check] [--from dir] [--to dir] [--json] - Transform the legacy store into a validated v2 store")
 		fmt.Fprintln(os.Stderr, "  repair google-idspace --since <RFC3339|unix-ms> [--apply] [--json] - Re-file v2 rows misrouted by a Google device id-space reset (dry run by default)")
 		fmt.Fprintln(os.Stderr, "  read <query> [--limit N] [--phone X] [--since YYYY-MM-DD] [--until YYYY-MM-DD] [--json] - Search the local store")
@@ -55,6 +56,8 @@ func main() {
 		err = cmd.RunDemo(logger)
 	case "backup":
 		err = cmd.RunBackup(logger, os.Args[2:]...)
+	case "compact":
+		err = cmd.RunCompact(logger, os.Args[2:]...)
 	case "migrate":
 		err = cmd.RunMigrate(logger, os.Args[2:]...)
 	case "repair":
