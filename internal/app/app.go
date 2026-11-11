@@ -456,6 +456,7 @@ func newApp(logger zerolog.Logger, runRepairSweeps bool) (*App, error) {
 		}
 		return nil, fmt.Errorf("open db: %w", err)
 	}
+	store.SetLogger(logger)
 	for _, path := range []string{dbPath, dbPath + "-wal", dbPath + "-shm"} {
 		if err := chmodIfExists(path, 0600); err != nil {
 			store.Close()
