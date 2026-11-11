@@ -115,14 +115,24 @@ func runStatus(ctx context.Context, session *commandReadSession, deps statusDeps
 
 	dbPath := session.StorePath
 	out := deps.output
+	// Only the v2 inbox can tell SMS from RCS; a legacy-mode session skips it.
+	var smsPath *freshness.SMSPathReport
+	if session.V2Store != nil && !deps.demo {
+		smsPath = statusSMSPath(ctx, session.V2Store, now)
+	}
 
 	if asJSON {
-		return writeStatusJSON(out, dbPath, session.DataDir, total, rows, silence.note)
+		return writeStatusJSON(out, dbPath, session.DataDir, total, rows, silence.note, smsPath)
 	}
 
 	fmt.Fprintf(out, "OpenMessage store — %s\n", dbPath)
 	if len(stats) == 0 {
 		fmt.Fprintln(out, "\nNo messages stored yet. Pair and serve, or run an `openmessage import …`.")
+		// The inbox can hold frames that never became stored messages; --json
+		// reports their verdict too.
+		if smsPath != nil {
+			fmt.Fprintln(out, smsPathStatusLine(*smsPath))
+		}
 		return nil
 	}
 	fmt.Fprintln(out)
@@ -142,6 +152,9 @@ func runStatus(ctx context.Context, session *commandReadSession, deps statusDeps
 	}
 	if silence.note != "" {
 		fmt.Fprintln(out, silence.note)
+	}
+	if smsPath != nil {
+		fmt.Fprintln(out, smsPathStatusLine(*smsPath))
 	}
 	return nil
 }
@@ -165,7 +178,14 @@ func staleWarning(behindDays int, silence *platformSilence) string {
 	}
 }
 
-func writeStatusJSON(out io.Writer, dbPath, dataDir string, total int, rows []statusRow, silenceNote string) error {
+func writeStatusJSON(
+	out io.Writer,
+	dbPath, dataDir string,
+	total int,
+	rows []statusRow,
+	silenceNote string,
+	smsPath *freshness.SMSPathReport,
+) error {
 	type platformJSON struct {
 		Platform         string `json:"platform"`
 		Count            int    `json:"count"`
@@ -180,12 +200,13 @@ func writeStatusJSON(out io.Writer, dbPath, dataDir string, total int, rows []st
 		SilenceJudgedBy string          `json:"silence_judged_by,omitempty"`
 	}
 	payload := struct {
-		DataDir     string         `json:"data_dir"`
-		DBPath      string         `json:"db_path"`
-		Total       int            `json:"total_messages"`
-		Platforms   []platformJSON `json:"platforms"`
-		SilenceNote string         `json:"silence_note,omitempty"`
-	}{DataDir: dataDir, DBPath: dbPath, Total: total, SilenceNote: silenceNote}
+		DataDir     string                   `json:"data_dir"`
+		DBPath      string                   `json:"db_path"`
+		Total       int                      `json:"total_messages"`
+		Platforms   []platformJSON           `json:"platforms"`
+		SilenceNote string                   `json:"silence_note,omitempty"`
+		SMSPath     *freshness.SMSPathReport `json:"google_sms_path,omitempty"`
+	}{DataDir: dataDir, DBPath: dbPath, Total: total, SilenceNote: silenceNote, SMSPath: smsPath}
 
 	for _, row := range rows {
 		pj := platformJSON{

@@ -39,6 +39,10 @@ type Attachment struct {
 	Filename  string
 	MIME      string
 	Size      int64
+	// TransportError is the transport's own report, captured with the
+	// message, that it failed to fetch this attachment. Empty when it
+	// reported none.
+	TransportError string
 }
 
 type ConversationEvent struct {
@@ -141,6 +145,10 @@ const (
 	FailureUpgradeRequired    FailureClass = "upgrade_required"
 	FailureMisconfigured      FailureClass = "misconfigured"
 	FailureUnsupported        FailureClass = "unsupported"
+	// FailureRecipientMismatch refuses a send whose remote conversation now
+	// names different people than the stored conversation it belongs to.
+	// Nothing went out, and resending to the same binding fails the same way.
+	FailureRecipientMismatch FailureClass = "recipient_mismatch"
 )
 
 type DispatchCertainty string

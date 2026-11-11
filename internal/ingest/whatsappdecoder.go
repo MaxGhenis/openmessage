@@ -221,6 +221,15 @@ func (d *WhatsAppDecoder) decodeMessageProto(
 		if emoji == "" {
 			action = bridge.ReactionRemove
 		}
+		// The envelope time has whole-second precision; the reaction's own
+		// sender timestamp has milliseconds, and it is what this account's
+		// confirmed reactions carry. Comparing on it keeps a change made on
+		// the phone in the same second as a confirmation from being dropped
+		// as stale.
+		reactionAt := occurredAt
+		if ms := reaction.GetSenderTimestampMS(); ms > 0 {
+			reactionAt = time.UnixMilli(ms)
+		}
 		return []bridge.Event{{
 			Kind: bridge.EventReaction,
 			Reaction: &bridge.ReactionEvent{
@@ -229,7 +238,7 @@ func (d *WhatsAppDecoder) decodeMessageProto(
 				Actor:                 sender,
 				Emoji:                 emoji,
 				Action:                action,
-				OccurredAt:            occurredAt,
+				OccurredAt:            reactionAt,
 			},
 		}}, nil
 	}

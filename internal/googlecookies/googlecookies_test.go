@@ -167,6 +167,39 @@ func TestUpdateSessionCookiesPreservesOtherFields(t *testing.T) {
 	}
 }
 
+func TestInstallCookiesCountsChangedCookiesNeverValues(t *testing.T) {
+	sessionPath := filepath.Join(t.TempDir(), "session.json")
+	raw, _ := json.Marshal(map[string]any{"auth_data": map[string]any{
+		"cookies": map[string]string{"SID": "same", "HSID": "old", "GONE": "x"},
+	}})
+	if err := os.WriteFile(sessionPath, raw, 0o600); err != nil {
+		t.Fatalf("write session: %v", err)
+	}
+	stats, err := installCookies(sessionPath, map[string]string{"SID": "same", "HSID": "new", "SSID": "added"})
+	if err != nil {
+		t.Fatalf("installCookies(): %v", err)
+	}
+	if stats != (RefreshStats{Cookies: 3, Changed: 2}) {
+		t.Fatalf("stats = %+v, want 3 cookies with 2 changed (HSID rotated, SSID added)", stats)
+	}
+
+	// Installing the same set again changes nothing; that is the "Chrome
+	// holds the cookies Google just rejected" signal.
+	stats, err = installCookies(sessionPath, map[string]string{"SID": "same", "HSID": "new", "SSID": "added"})
+	if err != nil || stats.Changed != 0 {
+		t.Fatalf("reinstall stats = %+v, %v; want 0 changed", stats, err)
+	}
+
+	// An unreadable session counts every cookie as changed rather than
+	// failing the comparison; the write itself still decides the error.
+	if err := os.WriteFile(sessionPath, []byte("{"), 0o600); err != nil {
+		t.Fatalf("corrupt session: %v", err)
+	}
+	if _, err := installCookies(sessionPath, map[string]string{"SID": "v"}); err == nil {
+		t.Fatal("installCookies() on an unparseable session = nil error, want the parse failure")
+	}
+}
+
 func TestLoadChromeCookiesRequiresAllAccountCookies(t *testing.T) {
 	// Exact host/name requirements guard Wave 1 from persisting partial credentials.
 	secret := []byte("secret")

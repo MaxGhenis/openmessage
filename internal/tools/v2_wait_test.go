@@ -28,7 +28,7 @@ func TestV2SendInterruptedWaitReturnsDurableStatusNotError(t *testing.T) {
 	})
 	handler := sendToConversationHandler(harness.app, &harness.deps)
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(harness.ctx)
 	results := make(chan *mcp.CallToolResult, 1)
 	go func() {
 		result, err := handler(ctx, v2ToolCall(map[string]any{
@@ -102,7 +102,7 @@ func TestV2SendNotDispatchedReturnsAutoRetryStatusNotError(t *testing.T) {
 	}})
 	handler := sendToConversationHandler(harness.app, &harness.deps)
 
-	result, err := handler(context.Background(), v2ToolCall(map[string]any{
+	result, err := handler(harness.ctx, v2ToolCall(map[string]any{
 		"conversation_id": v2ToolConversationID,
 		"message":         "the transport is briefly down",
 		"idempotency_key": "mcp-retrying-key",
@@ -150,7 +150,7 @@ func TestV2SendRejectedIsSettledWithNoRetryGuidance(t *testing.T) {
 	}})
 	handler := sendToConversationHandler(harness.app, &harness.deps)
 
-	result, err := handler(context.Background(), v2ToolCall(map[string]any{
+	result, err := handler(harness.ctx, v2ToolCall(map[string]any{
 		"conversation_id": v2ToolConversationID,
 		"message":         "the platform refuses this",
 		"idempotency_key": "mcp-rejected-key",
@@ -208,4 +208,28 @@ func waitForCondition(t *testing.T, what string, check func() bool) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("timed out waiting for %s", what)
+}
+
+// When the adapter refuses a send because the phone's thread now names other
+// people, the text says nothing went out and why, steers away from resending
+// to the same thread, and says what moves a direct conversation and a group.
+func TestV2DeliveryTextExplainsARecipientMismatch(t *testing.T) {
+	text := v2DeliveryText(messaging.Delivery{
+		OutboxID:   "outbox-moved",
+		State:      messaging.OutboxRejected,
+		ErrorClass: "recipient_mismatch",
+		ErrorCode:  "send_text",
+	})
+	for _, fragment := range []string{
+		"NOT sent", "outbox-moved", "now names other people", "do not resend", "send from the phone",
+		"only on live traffic from the phone, never on a catch-up",
+		"for a direct conversation, usually the person's next message", "for a group, a live update from the phone naming a thread with exactly its members",
+	} {
+		if !strings.Contains(text, fragment) {
+			t.Fatalf("recipient_mismatch text missing %q: %q", fragment, text)
+		}
+	}
+	if other := v2DeliveryText(messaging.Delivery{OutboxID: "outbox-x", State: messaging.OutboxRejected, ErrorClass: "unsupported"}); strings.Contains(other, "names other people") {
+		t.Fatalf("another rejection reads as a recipient mismatch: %q", other)
+	}
 }

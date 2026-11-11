@@ -12,6 +12,7 @@ import (
 
 	"github.com/maxghenis/openmessage/internal/app"
 	"github.com/maxghenis/openmessage/internal/bridge"
+	"github.com/maxghenis/openmessage/internal/media"
 	"github.com/maxghenis/openmessage/internal/messaging"
 	"github.com/maxghenis/openmessage/internal/storage/sqlite"
 	"github.com/maxghenis/openmessage/internal/v2wire"
@@ -26,6 +27,10 @@ type V2Dependencies struct {
 	Service   *messaging.MessageService
 	V2Store   *sqlite.Store
 	Registry  bridge.Registry
+	// Media resolves v2 attachments for download_media in a process that
+	// owns the store; nil in transportless client mode, which asks the
+	// running app instead.
+	Media *media.Service
 }
 
 const v2DeliveryDescription = " With v2 sending enabled, this waits for a settled delivery result. Every result includes outbox_id and idempotency_key. If settled is false (the wait was interrupted or the app is retrying automatically), the message is still durably queued and the app finishes sending it in the background: never send it again in response. An uncertain result means the transport may have accepted the message; do not retry automatically. Send again only as a deliberate new intent, reusing the returned idempotency_key when repeating the exact same send after a lost response."
@@ -257,6 +262,9 @@ func v2DeliveryText(delivery messaging.Delivery) string {
 	case messaging.OutboxStoreFailed:
 		return fmt.Sprintf("The transport accepted the message (outbox %s, remote message %s); the local record is being repaired automatically. Do not resend.", delivery.OutboxID, delivery.RemoteMessageID)
 	case messaging.OutboxRejected:
+		if delivery.ErrorClass == string(bridge.FailureRecipientMismatch) {
+			return fmt.Sprintf("Message NOT sent (outbox %s): the phone's Google thread for this conversation now names other people, so the app refused to send to it. A phone swap or restore reuses Google's thread numbers, and the app moves a conversation to its new thread only on live traffic from the phone, never on a catch-up: for a direct conversation, usually the person's next message; for a group, a live update from the phone naming a thread with exactly its members. Until then, do not resend to this conversation; send from the phone instead.", delivery.OutboxID)
+		}
 		return fmt.Sprintf("Message delivery was rejected (outbox %s, error class %s). The app will not retry it; sending again creates a new message and may fail the same way.", delivery.OutboxID, firstNonEmpty(delivery.ErrorClass, "unknown"))
 	case messaging.OutboxCanceled:
 		return fmt.Sprintf("Message delivery was canceled (outbox %s).", delivery.OutboxID)

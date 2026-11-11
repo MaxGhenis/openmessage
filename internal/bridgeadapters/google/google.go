@@ -47,6 +47,10 @@ type Adapter struct {
 	starting bool
 
 	ingressErrors atomic.Uint64
+
+	// silence holds Google intents while the phone is not answering them
+	// (phone_silence.go).
+	silence phoneSilence
 }
 
 func New(accountID string, host *app.App, canRepair func() bool) *Adapter {
@@ -190,6 +194,9 @@ func (a *Adapter) Start(
 	a.starting = false
 	installed = true
 	a.mu.Unlock()
+	// A new client may well reach a phone the old one could not; don't hold
+	// its first sends for the rest of the old probe window.
+	a.phoneRecovered("new_generation")
 
 	if err := transport.Connect(); err != nil {
 		failure := a.classifyTransportError(err, "connect", "connect_failed")
@@ -666,6 +673,14 @@ func (r *run) classifyEvent(evt any) (bridge.OpError, bool) {
 			Cause:       errors.New("Google account logged out server-side"),
 		}, true
 	case *events.PingFailed:
+		// A ping (or set-active-session) rejected with HTTP 401 means Google
+		// no longer accepts the session cookies. That is one answer, not a
+		// flaky phone: route it to credential repair now. Waiting for three
+		// failures kept SMS dead for minutes, then spent a transient reconnect
+		// only to learn the same thing from the new generation's long poll.
+		if app.IsGoogleAuthExpiredError(event.Error) {
+			return r.adapter.classifyTransportError(event.Error, "ping", "google_ping_auth_expired"), true
+		}
 		if event.ErrorCount >= 3 {
 			return bridge.OpError{
 				Class:       bridge.FailureTransient,
@@ -730,6 +745,9 @@ func (r *run) recordActivity(evt any, at time.Time, detail string) {
 		r.phoneNotResponding = true
 	case *events.PhoneRespondingAgain:
 		r.phoneNotResponding = false
+		// libgm's pinger got an answer: release intents held while the phone
+		// was silent instead of waiting out the probe window.
+		r.adapter.phoneRecovered("phone_responding_again")
 	}
 	close(r.activity)
 	r.activity = make(chan struct{})

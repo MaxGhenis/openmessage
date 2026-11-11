@@ -82,7 +82,7 @@ func TestRegistryDiscoversAllOptionalCapabilitiesAndDispatches(t *testing.T) {
 	if err != nil {
 		t.Fatalf("lease.Text.SendText() error = %v", err)
 	}
-	if textResult.RemoteMessageID != "text-remote-id" || adapter.lastText != textRequest {
+	if textResult.RemoteMessageID != "text-remote-id" || !reflect.DeepEqual(adapter.lastText, textRequest) {
 		t.Fatalf("SendText() result/request = %+v / %+v", textResult, adapter.lastText)
 	}
 

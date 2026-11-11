@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/maxghenis/openmessage/internal/bridge"
 )
 
 // OutboxKind identifies the shape of an outbound intent.
@@ -191,6 +193,44 @@ type Lease struct {
 	OutboxItem
 }
 
+// LeaseFailedCode is the error code, with error class transient, of a due row
+// that LeaseDueBatch set aside because its lease failed on the row itself.
+// Like the dispatcher's load_message and load_roster codes, it names the
+// operation that failed.
+const LeaseFailedCode = "lease"
+
+// A row the store sets aside after a failed lease comes due again
+// leaseRetryDelay later, the dispatcher's default delay after its other
+// pre-call failures. The delay doubles while the row's leases keep failing, up
+// to maxLeaseRetryDelay, so a row that can never lease settles at one failed
+// lease every five minutes. After the clock steps back, the delay can restart
+// lower (see setAsideOutboxRow).
+const (
+	leaseRetryDelay    = 5 * time.Second
+	maxLeaseRetryDelay = 5 * time.Minute
+)
+
+// LeaseFailure reports a due row whose lease failed on the row itself.
+type LeaseFailure struct {
+	OutboxID string
+	// Err says why the lease failed.
+	Err error
+	// RetryAt gives the time the row, now not_dispatched with LeaseFailedCode,
+	// comes due again. It stays zero when the call could not set the row aside
+	// either.
+	RetryAt time.Time
+	// SetAsideErr says why the call could not set the row aside. The call
+	// leaves such a row as it was, still due, and the next call meets it again.
+	SetAsideErr error
+}
+
+// LeaseBatch holds one LeaseDueBatch claim: the rows it leased and the due rows
+// whose lease failed, each in due order.
+type LeaseBatch struct {
+	Leases []Lease
+	Failed []LeaseFailure
+}
+
 // Attempt identifies the active lease crossing the transport-call boundary.
 // AttemptToken and ConnectionGeneration are reserved for the dispatcher layer;
 // this repository persists only the lease phase and stable request identity.
@@ -208,6 +248,17 @@ type Confirmation struct {
 	LeaseToken        string
 	ResultRemoteID    string
 	TransportResultID string
+}
+
+// ReactionConfirmation records that the transport accepted a reaction for the
+// active lease. ResultRemoteID is empty when the transport returns no identity
+// for a reaction. OccurredAt is when the transport accepted it, and orders the
+// reaction against other mutations of the same reactor.
+type ReactionConfirmation struct {
+	OutboxID       string
+	LeaseToken     string
+	ResultRemoteID string
+	OccurredAt     time.Time
 }
 
 // ReconcileRequest identifies one accepted transport request and its
@@ -238,6 +289,18 @@ type RecoveredLeases struct {
 }
 
 // OutboxRepository owns durable outbound intent, leasing, and phase changes.
+//
+// Every write after the insert sets updated_at_ms to MAX(updated_at_ms, now),
+// so a row's updated_at_ms never falls. A writer's clock read can predate the
+// row it changes: SendText reads the clock for scheduled_for_ms and the insert
+// reads it again for created_at_ms, and a dispatcher whose lease time falls
+// between the two still leases the row. A wall clock stepped back does the
+// same to any write. A plain now would then move updated_at_ms below
+// created_at_ms, which the 0005 CHECK refuses, and on 2026-11-03 that refusal
+// in LeaseDue stopped the dispatcher. If a correct clock set the current value,
+// the clamp also keeps the better time: the write commits after the one that
+// set it, so it happened no earlier. If a clock that ran ahead set it, the
+// clamp keeps that time until the local clock passes it.
 type OutboxRepository struct {
 	store *Store
 	now   func() time.Time
@@ -1135,107 +1198,410 @@ func (r *OutboxRepository) ListConfirmedSince(
 	return items, nil
 }
 
-// LeaseDue atomically claims due queued and retryable rows. An uncertain row is
-// structurally ineligible regardless of its next-attempt value.
+// LeaseDue claims due queued and retryable rows, as LeaseDueBatch does, and
+// returns only the leases. The dispatcher calls LeaseDueBatch, which also
+// reports the due rows whose lease failed.
 func (r *OutboxRepository) LeaseDue(
 	ctx context.Context,
 	req LeaseRequest,
 ) ([]Lease, error) {
+	batch, err := r.LeaseDueBatch(ctx, req)
+	return batch.Leases, err
+}
+
+// LeaseDueBatch atomically claims up to req.Limit due queued and retryable
+// rows, in due order. An uncertain row is structurally ineligible regardless of
+// its next-attempt value.
+//
+// The call leases each row under its own savepoint, so a lease that fails on
+// the row itself undoes only that row's writes and the rows after it still
+// lease. A failure belongs to the row when SQLite refuses the write as a
+// constraint the row cannot meet (a CHECK, NOT NULL, STRICT type or trigger)
+// or a value of the wrong type or size, when a trigger skips the write, or
+// when the leased row's stored values do not read back. LeaseDueBatch then
+// records the error on the row and sets it aside: not_dispatched, error class
+// transient and code LeaseFailedCode, due again after leaseRetryDelay (see
+// setAsideOutboxRow). If that write fails too, the call leaves the row as it
+// was and goes past it. Failed reports both.
+//
+// A due row has state queued or not_dispatched: its transport call never
+// started, or the transport proved the call sent nothing
+// (MarkCalledNotDispatched). Setting it aside keeps its transport_called_at_ms
+// NULL and its attempt_count, and touches no row outside the due set, so
+// neither the set-aside nor its retry calls the transport again for an intent
+// that a call may have sent.
+//
+// The call meets each due row at most once, so rows it can neither lease nor
+// set aside cost it one lease and one set-aside apiece, however many of them
+// come first.
+//
+// Any other failure (busy, locked, I/O, corruption, cancellation) belongs to
+// the store, not the row, and fails the whole call as before, committing
+// nothing.
+func (r *OutboxRepository) LeaseDueBatch(
+	ctx context.Context,
+	req LeaseRequest,
+) (LeaseBatch, error) {
 	if strings.TrimSpace(req.Owner) == "" {
-		return nil, fmt.Errorf("lease due outbox items: owner is empty")
+		return LeaseBatch{}, fmt.Errorf("lease due outbox items: owner is empty")
 	}
 	if req.Limit <= 0 {
-		return nil, fmt.Errorf("lease due outbox items: limit must be positive")
+		return LeaseBatch{}, fmt.Errorf("lease due outbox items: limit must be positive")
 	}
 	if req.Duration <= 0 {
-		return nil, fmt.Errorf("lease due outbox items: duration must be positive")
+		return LeaseBatch{}, fmt.Errorf("lease due outbox items: duration must be positive")
 	}
 	nowMS := req.Now.UnixMilli()
 	if nowMS <= 0 {
-		return nil, fmt.Errorf("lease due outbox items: current Unix time is not positive")
+		return LeaseBatch{}, fmt.Errorf("lease due outbox items: current Unix time is not positive")
 	}
 	expiresAtMS := req.Now.Add(req.Duration).UnixMilli()
 	if expiresAtMS <= nowMS {
-		return nil, fmt.Errorf("lease due outbox items: lease expiry must be after now")
+		return LeaseBatch{}, fmt.Errorf("lease due outbox items: lease expiry must be after now")
 	}
 
 	tx, err := r.store.db.BeginTx(ctx, nil)
 	if err != nil {
-		return nil, fmt.Errorf("lease due outbox items: begin transaction: %w", err)
+		return LeaseBatch{}, fmt.Errorf("lease due outbox items: begin transaction: %w", err)
 	}
 	defer tx.Rollback()
 
-	rows, err := tx.QueryContext(ctx, `
-		SELECT outbox_id
+	batch := LeaseBatch{Leases: make([]Lease, 0, req.Limit)}
+	// The due rows come a page at a time, in due order, each page starting
+	// after the last row the call has met. A row the call leases or sets aside
+	// leaves the due set, and a row it leaves as it was keeps its place behind
+	// the next page, so the call meets each due row at most once. Nothing else
+	// writes the store while this transaction holds its write lock. The first
+	// page holds req.Limit rows, and later pages double until they reach
+	// maxDueOutboxPage rows, so a long run of rows that fail costs few selects.
+	var after *dueOutboxRow
+	pageSize := req.Limit
+	for {
+		page, err := selectDueOutboxPage(ctx, tx, nowMS, after, pageSize)
+		if err != nil {
+			return LeaseBatch{}, fmt.Errorf("lease due outbox items: %w", err)
+		}
+		for _, row := range page {
+			if len(batch.Leases) == req.Limit {
+				break
+			}
+			lease, failure, err := leaseCandidate(ctx, tx, row.outboxID, req.Owner, nowMS, expiresAtMS)
+			if err != nil {
+				return LeaseBatch{}, err
+			}
+			if failure != nil {
+				batch.Failed = append(batch.Failed, *failure)
+				continue
+			}
+			batch.Leases = append(batch.Leases, lease)
+		}
+		if len(batch.Leases) == req.Limit || len(page) < pageSize {
+			break
+		}
+		after = &page[len(page)-1]
+		if pageSize < maxDueOutboxPage {
+			pageSize = min(2*pageSize, maxDueOutboxPage)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return LeaseBatch{}, fmt.Errorf("lease due outbox items: commit: %w", err)
+	}
+	return batch, nil
+}
+
+// maxDueOutboxPage stops LeaseDueBatch's pages from doubling past 4,096 rows.
+// A first page above it keeps its size: it holds req.Limit rows, and the batch
+// already makes room for that many leases.
+const maxDueOutboxPage = 4096
+
+// dueOutboxRow holds a due row's id and its place in due order.
+type dueOutboxRow struct {
+	outboxID    string
+	dueAtMS     int64
+	createdAtMS int64
+}
+
+// selectDueOutboxPage returns up to limit due rows in due order, after the row
+// after when it is not nil.
+//
+// The order, the cursor and the scanned key all read created_at_ms through
+// IFNULL(created_at_ms, 0). The schema forbids a NULL there, but a schema
+// edit or a botched table rebuild that drops the NOT NULL lets a row hold
+// one. Scanning that NULL would fail the whole call, and comparing it would
+// hide the row from every page after the first. With IFNULL the row keeps a
+// place in the order and its lease decides its fate: the leased row does not
+// read back, so the call sets it aside like any row that fails on itself.
+func selectDueOutboxPage(
+	ctx context.Context,
+	tx *sql.Tx,
+	nowMS int64,
+	after *dueOutboxRow,
+	limit int,
+) ([]dueOutboxRow, error) {
+	query := `
+		SELECT outbox_id, COALESCE(next_attempt_at_ms, scheduled_for_ms), IFNULL(created_at_ms, 0)
 		FROM outbox
 		WHERE scheduled_for_ms <= ?
 		  AND state IN ('queued', 'not_dispatched')
 		  AND (next_attempt_at_ms IS NULL OR next_attempt_at_ms <= ?)
-		  AND (lease_expires_at_ms IS NULL OR lease_expires_at_ms <= ?)
-		ORDER BY COALESCE(next_attempt_at_ms, scheduled_for_ms), created_at_ms, outbox_id
-		LIMIT ?
-	`, nowMS, nowMS, nowMS, req.Limit)
-	if err != nil {
-		return nil, fmt.Errorf("lease due outbox items: select candidates: %w", err)
+		  AND (lease_expires_at_ms IS NULL OR lease_expires_at_ms <= ?)`
+	arguments := []any{nowMS, nowMS, nowMS}
+	if after != nil {
+		query += `
+		  AND (COALESCE(next_attempt_at_ms, scheduled_for_ms), IFNULL(created_at_ms, 0), outbox_id) > (?, ?, ?)`
+		arguments = append(arguments, after.dueAtMS, after.createdAtMS, after.outboxID)
 	}
-	ids, err := collectRows(rows, func(row rowScanner) (string, error) {
-		var id string
-		err := row.Scan(&id)
-		return id, err
+	query += `
+		ORDER BY COALESCE(next_attempt_at_ms, scheduled_for_ms), IFNULL(created_at_ms, 0), outbox_id
+		LIMIT ?`
+	arguments = append(arguments, limit)
+	rows, err := tx.QueryContext(ctx, query, arguments...)
+	if err != nil {
+		return nil, fmt.Errorf("select candidates: %w", err)
+	}
+	page, err := collectRows(rows, func(row rowScanner) (dueOutboxRow, error) {
+		var due dueOutboxRow
+		err := row.Scan(&due.outboxID, &due.dueAtMS, &due.createdAtMS)
+		return due, err
 	})
 	if err != nil {
-		return nil, fmt.Errorf("lease due outbox items: scan candidates: %w", err)
+		return nil, fmt.Errorf("scan candidates: %w", err)
 	}
+	return page, nil
+}
 
-	leases := make([]Lease, 0, len(ids))
-	for _, id := range ids {
-		token, err := newOutboxLeaseToken()
-		if err != nil {
-			return nil, fmt.Errorf("lease outbox item %q: generate token: %w", id, err)
-		}
-		result, err := tx.ExecContext(ctx, `
-			UPDATE outbox
-			SET state = 'dispatching',
-				error_class = NULL,
-				error_code = NULL,
-				error_detail = NULL,
-				lease_owner = ?,
-				lease_token = ?,
-				lease_expires_at_ms = ?,
-				transport_called_at_ms = NULL,
-				next_attempt_at_ms = NULL,
-				updated_at_ms = ?
-			WHERE outbox_id = ?
-			  AND scheduled_for_ms <= ?
-			  AND state IN ('queued', 'not_dispatched')
-			  AND (next_attempt_at_ms IS NULL OR next_attempt_at_ms <= ?)
-			  AND (lease_expires_at_ms IS NULL OR lease_expires_at_ms <= ?)
-		`, req.Owner, token, expiresAtMS, nowMS, id, nowMS, nowMS, nowMS)
-		if err != nil {
-			return nil, fmt.Errorf("lease outbox item %q: update: %w", id, err)
-		}
-		affected, err := result.RowsAffected()
-		if err != nil {
-			return nil, fmt.Errorf("lease outbox item %q: read rows affected: %w", id, err)
-		}
-		if affected != 1 {
-			return nil, fmt.Errorf("lease outbox item %q: affected %d rows, want 1", id, affected)
-		}
-		item, err := scanOutboxItem(tx.QueryRowContext(ctx, `
-			SELECT `+outboxColumns+`
-			FROM outbox
-			WHERE outbox_id = ?
-		`, id))
-		if err != nil {
-			return nil, fmt.Errorf("lease outbox item %q: read claimed row: %w", id, err)
-		}
-		leases = append(leases, Lease{OutboxItem: item})
+// leaseCandidate leases one due row under its own savepoint. A lease that
+// fails on the row (isRowLeaseFailure) comes back as a LeaseFailure, after
+// leaseCandidate sets the row aside when that write works. Any other error
+// fails the caller's whole transaction.
+func leaseCandidate(
+	ctx context.Context,
+	tx *sql.Tx,
+	id, owner string,
+	nowMS, expiresAtMS int64,
+) (Lease, *LeaseFailure, error) {
+	if _, err := tx.ExecContext(ctx, `SAVEPOINT lease_candidate`); err != nil {
+		return Lease{}, nil, fmt.Errorf("lease outbox item %q: open savepoint: %w", id, err)
 	}
+	lease, leaseErr := leaseOutboxRow(ctx, tx, id, owner, nowMS, expiresAtMS)
+	if leaseErr != nil && !isRowLeaseFailure(leaseErr) {
+		return Lease{}, nil, leaseErr
+	}
+	var failure *LeaseFailure
+	if leaseErr != nil {
+		// ROLLBACK TO keeps the savepoint open, so the set-aside runs under it
+		// too. A trigger's RAISE(ROLLBACK) ends the whole transaction instead;
+		// then no savepoint remains, and this fails the call.
+		if err := rollbackToLeaseCandidate(ctx, tx); err != nil {
+			return Lease{}, nil, errors.Join(leaseErr, err)
+		}
+		failure = &LeaseFailure{OutboxID: id, Err: leaseErr}
+		retryAtMS, setAsideErr := setAsideOutboxRow(ctx, tx, id, leaseErr, nowMS)
+		switch {
+		case setAsideErr == nil:
+			failure.RetryAt = time.UnixMilli(retryAtMS)
+		case isRowLeaseFailure(setAsideErr):
+			if err := rollbackToLeaseCandidate(ctx, tx); err != nil {
+				return Lease{}, nil, errors.Join(leaseErr, setAsideErr, err)
+			}
+			failure.SetAsideErr = setAsideErr
+		default:
+			return Lease{}, nil, errors.Join(leaseErr, setAsideErr)
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `RELEASE lease_candidate`); err != nil {
+		return Lease{}, nil, fmt.Errorf("lease outbox item %q: release savepoint: %w", id, err)
+	}
+	return lease, failure, nil
+}
 
-	if err := tx.Commit(); err != nil {
-		return nil, fmt.Errorf("lease due outbox items: commit: %w", err)
+func rollbackToLeaseCandidate(ctx context.Context, tx *sql.Tx) error {
+	if _, err := tx.ExecContext(ctx, `ROLLBACK TO lease_candidate`); err != nil {
+		return fmt.Errorf("roll back to savepoint: %w", err)
 	}
-	return leases, nil
+	return nil
+}
+
+// leaseOutboxRow leases one due row and reads it back.
+func leaseOutboxRow(
+	ctx context.Context,
+	tx *sql.Tx,
+	id, owner string,
+	nowMS, expiresAtMS int64,
+) (Lease, error) {
+	token, err := newOutboxLeaseToken()
+	if err != nil {
+		return Lease{}, fmt.Errorf("lease outbox item %q: generate token: %w", id, err)
+	}
+	result, err := tx.ExecContext(ctx, `
+		UPDATE outbox
+		SET state = 'dispatching',
+			error_class = NULL,
+			error_code = NULL,
+			error_detail = NULL,
+			lease_owner = ?,
+			lease_token = ?,
+			lease_expires_at_ms = ?,
+			transport_called_at_ms = NULL,
+			next_attempt_at_ms = NULL,
+			updated_at_ms = MAX(updated_at_ms, ?)
+		WHERE outbox_id = ?
+		  AND scheduled_for_ms <= ?
+		  AND state IN ('queued', 'not_dispatched')
+		  AND (next_attempt_at_ms IS NULL OR next_attempt_at_ms <= ?)
+		  AND (lease_expires_at_ms IS NULL OR lease_expires_at_ms <= ?)
+	`, owner, token, expiresAtMS, nowMS, id, nowMS, nowMS, nowMS)
+	if err != nil {
+		return Lease{}, fmt.Errorf("lease outbox item %q: update: %w", id, err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return Lease{}, fmt.Errorf("lease outbox item %q: read rows affected: %w", id, err)
+	}
+	if affected == 0 {
+		return Lease{}, fmt.Errorf("lease outbox item %q: %w", id, errOutboxRowUnchanged)
+	}
+	if affected != 1 {
+		return Lease{}, fmt.Errorf("lease outbox item %q: affected %d rows, want 1", id, affected)
+	}
+	item, err := readLeasedOutboxRow(ctx, tx, id)
+	if err != nil {
+		return Lease{}, fmt.Errorf("lease outbox item %q: read claimed row: %w", id, err)
+	}
+	return Lease{OutboxItem: item}, nil
+}
+
+// errOutboxRowUnreadable marks a leased row whose stored values do not scan
+// into an OutboxItem, such as a NULL where the schema says NOT NULL.
+var errOutboxRowUnreadable = errors.New("stored values do not read back")
+
+// errOutboxRowUnchanged marks a lease or set-aside that changed no row,
+// although the same transaction had just selected the row as due under the
+// same predicate. Only a trigger's RAISE(IGNORE) skips such a write.
+var errOutboxRowUnchanged = errors.New("the update changed no row")
+
+// readLeasedOutboxRow reads back the row leaseOutboxRow just leased. The
+// query and the scan run as separate steps, so the caller can tell a value
+// that does not scan (errOutboxRowUnreadable) from a query the store failed.
+func readLeasedOutboxRow(ctx context.Context, tx *sql.Tx, id string) (OutboxItem, error) {
+	rows, err := tx.QueryContext(ctx, `
+		SELECT `+outboxColumns+`
+		FROM outbox
+		WHERE outbox_id = ?
+	`, id)
+	if err != nil {
+		return OutboxItem{}, err
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		if err := rows.Err(); err != nil {
+			return OutboxItem{}, err
+		}
+		return OutboxItem{}, sql.ErrNoRows
+	}
+	item, err := scanOutboxItem(rows)
+	if err != nil {
+		// database/sql closes the rows when ctx ends, and Scan then fails.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return OutboxItem{}, ctxErr
+		}
+		return OutboxItem{}, fmt.Errorf("%w: %w", errOutboxRowUnreadable, err)
+	}
+	return item, rows.Close()
+}
+
+// setAsideOutboxRow moves a due row whose lease failed out of the due set. It
+// records the error, makes the row not_dispatched, and returns its new
+// next_attempt_at_ms: now plus the row's delay. The delay is leaseRetryDelay,
+// or, when the row's last failure was a failed lease too, twice its previous
+// delay, up to maxLeaseRetryDelay. A manual retry (RetryNotDispatched) sets
+// next_attempt_at_ms to now and updated_at_ms no lower, so the delay starts
+// over. SQLite evaluates every SET expression against the row as it was.
+//
+// The store reads the previous delay back as the row's next_attempt_at_ms
+// less its updated_at_ms; the set-aside that recorded the delay wrote both.
+// That difference matches the delay while the clock runs forward and nothing
+// else writes the row. A set-aside that ran with the clock behind the row's
+// updated_at_ms, which never moves back, left a smaller difference, and so
+// does a later write that moves only updated_at_ms (retargetMessageIntents).
+// Then the next delay comes out less than double, never under
+// leaseRetryDelay: the row retries sooner, never later, and always within
+// maxLeaseRetryDelay of the failure. Counting the retry from updated_at_ms
+// instead would keep the doubling exact, but after a clock step it would hold
+// a row whose lease works again until the clock caught up.
+func setAsideOutboxRow(
+	ctx context.Context,
+	tx *sql.Tx,
+	id string,
+	cause error,
+	nowMS int64,
+) (int64, error) {
+	firstMS, maxMS := leaseRetryDelay.Milliseconds(), maxLeaseRetryDelay.Milliseconds()
+	var retryAtMS int64
+	err := tx.QueryRowContext(ctx, `
+		UPDATE outbox
+		SET state = 'not_dispatched',
+			error_class = ?,
+			error_code = ?,
+			error_detail = ?,
+			next_attempt_at_ms = ? + CASE
+				WHEN error_code = ? AND next_attempt_at_ms > updated_at_ms
+					THEN MIN(MAX(2 * (next_attempt_at_ms - updated_at_ms), ?), ?)
+				ELSE ?
+			END,
+			updated_at_ms = MAX(updated_at_ms, ?)
+		WHERE outbox_id = ?
+		  AND scheduled_for_ms <= ?
+		  AND state IN ('queued', 'not_dispatched')
+		  AND (next_attempt_at_ms IS NULL OR next_attempt_at_ms <= ?)
+		  AND (lease_expires_at_ms IS NULL OR lease_expires_at_ms <= ?)
+		RETURNING next_attempt_at_ms
+	`,
+		string(bridge.FailureTransient),
+		LeaseFailedCode,
+		cause.Error(),
+		nowMS,
+		LeaseFailedCode,
+		firstMS,
+		maxMS,
+		firstMS,
+		nowMS,
+		id,
+		nowMS,
+		nowMS,
+		nowMS,
+	).Scan(&retryAtMS)
+	if errors.Is(err, sql.ErrNoRows) {
+		err = errOutboxRowUnchanged
+	}
+	if err != nil {
+		return 0, fmt.Errorf("set aside outbox item %q: %w", id, err)
+	}
+	return retryAtMS, nil
+}
+
+// isRowLeaseFailure reports whether err, from leasing or setting aside one due
+// row, belongs to that row rather than to the store: SQLite refused the write
+// as a constraint the row cannot meet (CHECK, NOT NULL, STRICT type, a
+// trigger's RAISE) or a value of the wrong type (SQLITE_MISMATCH) or size
+// (SQLITE_TOOBIG), a trigger skipped the write, or the row's stored values do
+// not read back. Busy, locked, I/O, corruption, an interrupted statement and a
+// canceled context are the store's.
+func isRowLeaseFailure(err error) bool {
+	if errors.Is(err, errOutboxRowUnreadable) || errors.Is(err, errOutboxRowUnchanged) {
+		return true
+	}
+	code, ok := sqliteErrorCode(err)
+	if !ok {
+		return false
+	}
+	switch code & 0xff {
+	case sqliteConstraintCode, sqliteMismatchCode, sqliteTooBigCode:
+		return true
+	default:
+		return false
+	}
 }
 
 // MarkTransportCalled durably crosses the boundary after which an unknown
@@ -1260,7 +1626,7 @@ func (r *OutboxRepository) MarkTransportCalled(
 		UPDATE outbox
 		SET transport_called_at_ms = ?,
 			attempt_count = attempt_count + 1,
-			updated_at_ms = ?
+			updated_at_ms = MAX(updated_at_ms, ?)
 		WHERE outbox_id = ?
 		  AND state = 'dispatching'
 		  AND lease_token = ?
@@ -1325,7 +1691,7 @@ func (r *OutboxRepository) markNotDispatched(
 			lease_token = NULL,
 			lease_expires_at_ms = NULL,
 			transport_called_at_ms = NULL,
-			updated_at_ms = ?
+			updated_at_ms = MAX(updated_at_ms, ?)
 		WHERE outbox_id = ?
 		  AND state = 'dispatching'
 		  AND lease_token = ?
@@ -1363,7 +1729,7 @@ func (r *OutboxRepository) ReleaseUnavailable(
 			lease_token = NULL,
 			lease_expires_at_ms = NULL,
 			transport_called_at_ms = NULL,
-			updated_at_ms = ?
+			updated_at_ms = MAX(updated_at_ms, ?)
 		WHERE outbox_id = ?
 		  AND state = 'dispatching'
 		  AND lease_token = ?
@@ -1385,17 +1751,102 @@ func (r *OutboxRepository) RetryNotDispatched(
 	if err != nil {
 		return err
 	}
-	result, err := r.store.db.ExecContext(ctx, `
+	tx, err := r.store.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("retry not-dispatched outbox item %q: begin transaction: %w", outboxID, err)
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `
 		UPDATE outbox
 		SET next_attempt_at_ms = ?,
-			updated_at_ms = ?
+			updated_at_ms = MAX(updated_at_ms, ?)
 		WHERE outbox_id = ?
 		  AND state = 'not_dispatched'
 	`, nowMS, nowMS, outboxID)
 	if err != nil {
 		return fmt.Errorf("retry not-dispatched outbox item %q: %w", outboxID, err)
 	}
-	return r.requireStateMutation(ctx, "retry not dispatched", outboxID, result)
+	return r.commitSendStateChange(ctx, tx, "retry not dispatched", outboxID, nowMS, result)
+}
+
+// ReactionTargetUnsentCode is the error code of a reaction the messaging
+// dispatcher holds, before the transport call, because the message it targets
+// is this account's own and that message's send has not gone out yet. Such a
+// reaction is next due just after the send.
+const ReactionTargetUnsentCode = "reaction_target_unsent"
+
+// commitSendStateChange finishes Cancel and RetryNotDispatched. When the
+// update changed the row, the reactions held for it as their target's send
+// (ReactionTargetUnsentCode) are made due 1 ms after now, in the same
+// transaction: the send is due now, or canceled and never going out, and
+// either way they need not wait for its old due time. The 1 ms keeps a
+// retried send ahead of them in LeaseDue's order.
+func (r *OutboxRepository) commitSendStateChange(
+	ctx context.Context,
+	tx *sql.Tx,
+	operation, outboxID string,
+	nowMS int64,
+	result sql.Result,
+) error {
+	if affected, err := result.RowsAffected(); err != nil || affected != 1 {
+		_ = tx.Rollback()
+		return r.requireStateMutation(ctx, operation, outboxID, result)
+	}
+	if _, err := wakeReactionsHeldFor(ctx, tx, outboxID, nowMS); err != nil {
+		return fmt.Errorf("%s outbox item %q: wake reactions held for it: %w", operation, outboxID, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("%s outbox item %q: commit: %w", operation, outboxID, err)
+	}
+	return nil
+}
+
+// WakeReactionsHeldFor makes the reactions held for the send sendOutboxID
+// (ReactionTargetUnsentCode) due 1 ms from now, as Cancel and
+// RetryNotDispatched do, and reports how many it moved. The dispatcher calls
+// it when the send changed while a reaction to it was being held.
+func (r *OutboxRepository) WakeReactionsHeldFor(ctx context.Context, sendOutboxID string) (int64, error) {
+	nowMS, err := r.nowMS("wake reactions held for outbox item")
+	if err != nil {
+		return 0, err
+	}
+	woken, err := wakeReactionsHeldFor(ctx, r.store.db, sendOutboxID, nowMS)
+	if err != nil {
+		return 0, fmt.Errorf("wake reactions held for outbox item %q: %w", sendOutboxID, err)
+	}
+	return woken, nil
+}
+
+// wakeReactionsHeldFor moves the reactions held for the send sendOutboxID
+// that are due later than 1 ms after nowMS to that time. Only reactions to
+// the send's own message are held for it.
+func wakeReactionsHeldFor(
+	ctx context.Context,
+	execer interface {
+		ExecContext(context.Context, string, ...any) (sql.Result, error)
+	},
+	sendOutboxID string,
+	nowMS int64,
+) (int64, error) {
+	result, err := execer.ExecContext(ctx, `
+		UPDATE outbox
+		SET next_attempt_at_ms = ?,
+			updated_at_ms = MAX(updated_at_ms, ?)
+		WHERE kind = 'reaction'
+		  AND state = 'not_dispatched'
+		  AND error_code = ?
+		  AND next_attempt_at_ms > ?
+		  AND outbox_id IN (
+		      SELECT r.outbox_id
+		      FROM outbox_reactions AS r
+		      JOIN outbox AS send ON send.local_message_id = r.target_message_id
+		      WHERE send.outbox_id = ?
+		  )
+	`, nowMS+1, nowMS, ReactionTargetUnsentCode, nowMS+1, sendOutboxID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }
 
 // Cancel transitions pending work to a terminal canceled state. Active or
@@ -1405,18 +1856,23 @@ func (r *OutboxRepository) Cancel(ctx context.Context, outboxID string) error {
 	if err != nil {
 		return err
 	}
-	result, err := r.store.db.ExecContext(ctx, `
+	tx, err := r.store.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("cancel outbox item %q: begin transaction: %w", outboxID, err)
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `
 		UPDATE outbox
 		SET state = 'canceled',
 			next_attempt_at_ms = NULL,
-			updated_at_ms = ?
+			updated_at_ms = MAX(updated_at_ms, ?)
 		WHERE outbox_id = ?
 		  AND state IN ('queued', 'not_dispatched')
 	`, nowMS, outboxID)
 	if err != nil {
 		return fmt.Errorf("cancel outbox item %q: %w", outboxID, err)
 	}
-	return r.requireStateMutation(ctx, "cancel", outboxID, result)
+	return r.commitSendStateChange(ctx, tx, "cancel", outboxID, nowMS, result)
 }
 
 // MarkUncertain records an unknown outcome after the transport call boundary.
@@ -1440,7 +1896,7 @@ func (r *OutboxRepository) MarkUncertain(
 			lease_token = NULL,
 			lease_expires_at_ms = NULL,
 			transport_called_at_ms = NULL,
-			updated_at_ms = ?
+			updated_at_ms = MAX(updated_at_ms, ?)
 		WHERE outbox_id = ?
 		  AND state = 'dispatching'
 		  AND lease_token = ?
@@ -1480,7 +1936,7 @@ func (r *OutboxRepository) Reject(
 			lease_token = NULL,
 			lease_expires_at_ms = NULL,
 			transport_called_at_ms = NULL,
-			updated_at_ms = ?
+			updated_at_ms = MAX(updated_at_ms, ?)
 		WHERE outbox_id = ?
 		  AND state = 'dispatching'
 		  AND lease_token = ?
@@ -1519,7 +1975,7 @@ func (r *OutboxRepository) ConfirmWithoutResult(
 			lease_token = NULL,
 			lease_expires_at_ms = NULL,
 			transport_called_at_ms = NULL,
-			updated_at_ms = ?
+			updated_at_ms = MAX(updated_at_ms, ?)
 		WHERE outbox_id = ?
 		  AND state = 'dispatching'
 		  AND lease_token = ?
@@ -1529,6 +1985,141 @@ func (r *OutboxRepository) ConfirmWithoutResult(
 		return fmt.Errorf("confirm outbox item %q without result: %w", outboxID, err)
 	}
 	return r.requireLeaseMutation(ctx, "confirm without result", outboxID, result)
+}
+
+// ConfirmReaction terminally confirms a reaction's active called lease and, in
+// the same transaction, applies the reaction to the read model as this
+// account's own. Sending a reaction stores nothing else locally, so without
+// this row a reader would see the reaction only if the transport later
+// reported it back. The row is the one such a report addresses
+// (SelfReactorKey), and it is applied with ApplyReaction's ordering rule, so a
+// mutation of the same reactor that already carries a later time wins.
+//
+// The target's account and conversation are read from the message as it is
+// stored now, not from the outbox row, because a message can be rebound to
+// another conversation after its reaction was queued. applied reports whether
+// the read model changed.
+//
+// A message whose reactions come from full snapshots (Google, which has a
+// reaction_snapshot_fences row) gets no own row when the latest snapshot
+// applied to it was received at or after the transport was called. Such a
+// snapshot may already list the reaction under the reactor the phone names,
+// and an own row beside it would count the reaction twice until the next
+// snapshot. It may instead have left the phone before the phone applied the
+// reaction; then the reaction shows from the next snapshot that lists it,
+// the same gap the other order has, where that snapshot tombstones the own
+// row.
+func (r *OutboxRepository) ConfirmReaction(
+	ctx context.Context,
+	confirmation ReactionConfirmation,
+) (applied bool, err error) {
+	occurredAtMS := confirmation.OccurredAt.UnixMilli()
+	if occurredAtMS <= 0 {
+		return false, fmt.Errorf(
+			"confirm reaction outbox item %q: occurrence time is not positive",
+			confirmation.OutboxID,
+		)
+	}
+	nowMS, err := r.nowMS("confirm reaction outbox item")
+	if err != nil {
+		return false, err
+	}
+	tx, err := r.store.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, fmt.Errorf(
+			"confirm reaction outbox item %q: begin transaction: %w",
+			confirmation.OutboxID,
+			err,
+		)
+	}
+	defer tx.Rollback()
+
+	// Read before the update clears it. The update below succeeds only when
+	// the row is still called under this lease, so the value is then set.
+	var calledAtMS sql.NullInt64
+	if err := tx.QueryRowContext(ctx, `
+		SELECT transport_called_at_ms FROM outbox WHERE outbox_id = ?
+	`, confirmation.OutboxID).Scan(&calledAtMS); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return false, fmt.Errorf(
+			"confirm reaction outbox item %q: read transport call time: %w",
+			confirmation.OutboxID,
+			err,
+		)
+	}
+
+	result, err := tx.ExecContext(ctx, `
+		UPDATE outbox
+		SET state = 'confirmed',
+			result_remote_id = ?,
+			error_class = NULL,
+			error_code = NULL,
+			error_detail = NULL,
+			next_attempt_at_ms = NULL,
+			lease_owner = NULL,
+			lease_token = NULL,
+			lease_expires_at_ms = NULL,
+			transport_called_at_ms = NULL,
+			updated_at_ms = MAX(updated_at_ms, ?)
+		WHERE outbox_id = ?
+		  AND kind = 'reaction'
+		  AND state = 'dispatching'
+		  AND lease_token = ?
+		  AND transport_called_at_ms IS NOT NULL
+	`,
+		nullableOutboxText(strings.TrimSpace(confirmation.ResultRemoteID)),
+		nowMS,
+		confirmation.OutboxID,
+		confirmation.LeaseToken,
+	)
+	if err != nil {
+		return false, fmt.Errorf("confirm reaction outbox item %q: update: %w", confirmation.OutboxID, err)
+	}
+	if err := r.requireLeaseMutationWithQueryer(
+		ctx, tx, "confirm reaction", confirmation.OutboxID, result,
+	); err != nil {
+		return false, err
+	}
+
+	reaction := ReactionApply{
+		ReactorKey:    SelfReactorKey,
+		ReactorIsSelf: true,
+		ReactorLabel:  SelfReactorLabel,
+		OccurredAtMS:  occurredAtMS,
+		SourceSeqMS:   occurredAtMS,
+	}
+	var action string
+	var snapshotSeqMS sql.NullInt64
+	if err := tx.QueryRowContext(ctx, `
+		SELECT m.message_id, m.account_id, m.conversation_id, r.emoji, r.action, f.source_seq_ms
+		FROM outbox_reactions AS r
+		JOIN messages AS m ON m.message_id = r.target_message_id
+		LEFT JOIN reaction_snapshot_fences AS f ON f.message_id = m.message_id
+		WHERE r.outbox_id = ?
+	`, confirmation.OutboxID).Scan(
+		&reaction.MessageID,
+		&reaction.AccountID,
+		&reaction.ConversationID,
+		&reaction.Emoji,
+		&action,
+		&snapshotSeqMS,
+	); err != nil {
+		return false, fmt.Errorf(
+			"confirm reaction outbox item %q: read reaction target: %w",
+			confirmation.OutboxID,
+			err,
+		)
+	}
+	reaction.Action = bridge.ReactionAction(action)
+	if !snapshotSeqMS.Valid || snapshotSeqMS.Int64 < calledAtMS.Int64 {
+		applied, err = applyReaction(ctx, tx, reaction, nowMS)
+		if err != nil {
+			return false, fmt.Errorf("confirm reaction outbox item %q: %w", confirmation.OutboxID, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("confirm reaction outbox item %q: commit: %w", confirmation.OutboxID, err)
+	}
+	return applied, nil
 }
 
 // Confirm atomically records a known remote result for the active called
@@ -1566,7 +2157,7 @@ func (r *OutboxRepository) Confirm(
 			lease_token = NULL,
 			lease_expires_at_ms = NULL,
 			transport_called_at_ms = NULL,
-			updated_at_ms = ?
+			updated_at_ms = MAX(updated_at_ms, ?)
 		WHERE outbox_id = ?
 		  AND state = 'dispatching'
 		  AND lease_token = ?
@@ -1581,17 +2172,15 @@ func (r *OutboxRepository) Confirm(
 
 	var (
 		accountID          string
-		conversationID     string
 		localMessageID     sql.NullString
 		transportRequestID string
 	)
 	if err := tx.QueryRowContext(ctx, `
-		SELECT account_id, conversation_id, local_message_id, transport_request_id
+		SELECT account_id, local_message_id, transport_request_id
 		FROM outbox
 		WHERE outbox_id = ?
 	`, confirmation.OutboxID).Scan(
 		&accountID,
-		&conversationID,
 		&localMessageID,
 		&transportRequestID,
 	); err != nil {
@@ -1606,7 +2195,6 @@ func (r *OutboxRepository) Confirm(
 			ctx,
 			tx,
 			accountID,
-			conversationID,
 			localMessageID.String,
 			transportRequestID,
 			resultRemoteID,
@@ -1647,18 +2235,45 @@ func (r *OutboxRepository) ReconcileConfirm(
 	}
 	defer tx.Rollback()
 
+	outcome, err := r.reconcileConfirmTx(ctx, tx, req)
+	if err != nil {
+		return "", err
+	}
+	if err := commitReconcile(tx, outcome, req.TransportRequestID); err != nil {
+		return "", err
+	}
+	return outcome, nil
+}
+
+// commitReconcile commits a reconcile that changed durable state. NotFound and
+// Noop changed nothing, so their transaction is left to roll back.
+func commitReconcile(tx *sql.Tx, outcome ReconcileOutcome, transportRequestID string) error {
+	if outcome != ReconcileOutcomeReconciled && outcome != ReconcileOutcomeEnriched {
+		return nil
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("reconcile transport request %q: commit %s: %w", transportRequestID, outcome, err)
+	}
+	return nil
+}
+
+// reconcileConfirmTx is ReconcileConfirm inside the caller's transaction. It
+// never commits; the caller commits when the outcome changed durable state.
+func (r *OutboxRepository) reconcileConfirmTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	req ReconcileRequest,
+) (ReconcileOutcome, error) {
 	var (
 		outboxID                string
-		conversationID          string
 		state                   OutboxState
 		localMessageID          sql.NullString
 		persistedResultRemoteID sql.NullString
 		localRemoteMessageID    sql.NullString
 	)
-	err = tx.QueryRowContext(ctx, `
+	err := tx.QueryRowContext(ctx, `
 		SELECT
 			o.outbox_id,
-			o.conversation_id,
 			o.state,
 			o.local_message_id,
 			o.result_remote_id,
@@ -1668,7 +2283,6 @@ func (r *OutboxRepository) ReconcileConfirm(
 		WHERE o.account_id = ? AND o.transport_request_id = ?
 	`, req.AccountID, req.TransportRequestID).Scan(
 		&outboxID,
-		&conversationID,
 		&state,
 		&localMessageID,
 		&persistedResultRemoteID,
@@ -1695,7 +2309,7 @@ func (r *OutboxRepository) ReconcileConfirm(
 				error_code = NULL,
 				error_detail = NULL,
 				next_attempt_at_ms = NULL,
-				updated_at_ms = ?
+				updated_at_ms = MAX(updated_at_ms, ?)
 			WHERE outbox_id = ?
 			  AND state IN ('uncertain', 'store_failed')
 		`, req.ResultRemoteID, nowMS, outboxID)
@@ -1713,16 +2327,12 @@ func (r *OutboxRepository) ReconcileConfirm(
 				ctx,
 				tx,
 				req.AccountID,
-				conversationID,
 				localMessageID.String,
 				req.TransportRequestID,
 				req.ResultRemoteID,
 			); err != nil {
 				return "", fmt.Errorf("reconcile outbox item %q: %w", outboxID, err)
 			}
-		}
-		if err := tx.Commit(); err != nil {
-			return "", fmt.Errorf("reconcile outbox item %q: commit: %w", outboxID, err)
 		}
 		return ReconcileOutcomeReconciled, nil
 
@@ -1747,7 +2357,7 @@ func (r *OutboxRepository) ReconcileConfirm(
 				error_class = NULL,
 				error_code = NULL,
 				error_detail = NULL,
-				updated_at_ms = ?
+				updated_at_ms = MAX(updated_at_ms, ?)
 			WHERE outbox_id = ?
 			  AND state = 'confirmed'
 			  AND result_remote_id = transport_request_id
@@ -1777,15 +2387,11 @@ func (r *OutboxRepository) ReconcileConfirm(
 			ctx,
 			tx,
 			req.AccountID,
-			conversationID,
 			localMessageID.String,
 			req.TransportRequestID,
 			req.ResultRemoteID,
 		); err != nil {
 			return "", fmt.Errorf("reconcile outbox item %q: %w", outboxID, err)
-		}
-		if err := tx.Commit(); err != nil {
-			return "", fmt.Errorf("reconcile outbox item %q: commit enrichment: %w", outboxID, err)
 		}
 		return ReconcileOutcomeEnriched, nil
 
@@ -1816,7 +2422,7 @@ func requireSingleReconcileMutation(result sql.Result, outboxID string) error {
 func (r *OutboxRepository) repointLocalMessage(
 	ctx context.Context,
 	tx *sql.Tx,
-	accountID, conversationID, localMessageID, transportRequestID, realID string,
+	accountID, localMessageID, transportRequestID, realID string,
 ) error {
 	if realID == transportRequestID {
 		return nil
@@ -1826,6 +2432,24 @@ func (r *OutboxRepository) repointLocalMessage(
 		return err
 	}
 
+	// The natural key the UPDATE below must keep unique is scoped to the
+	// conversation the local row is in now, which a repair move can change
+	// from the outbox row's. If the local row is gone there is nothing to
+	// repoint, and an echo row already holding realID is then the only copy
+	// of the sent message, so it stays.
+	var localConversationID string
+	err = tx.QueryRowContext(ctx, `
+		SELECT conversation_id
+		FROM messages
+		WHERE message_id = ? AND account_id = ?
+	`, localMessageID, accountID).Scan(&localConversationID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("repoint local message %q: read local row: %w", localMessageID, err)
+	}
+
 	var collisionMessageID string
 	err = tx.QueryRowContext(ctx, `
 		SELECT message_id
@@ -1833,11 +2457,25 @@ func (r *OutboxRepository) repointLocalMessage(
 		WHERE account_id = ?
 		  AND conversation_id = ?
 		  AND remote_message_id = ?
-	`, accountID, conversationID, realID).Scan(&collisionMessageID)
+	`, accountID, localConversationID, realID).Scan(&collisionMessageID)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("repoint local message %q: read remote-ID collision: %w", localMessageID, err)
 	}
 	if err == nil && collisionMessageID != localMessageID {
+		if err := mergeDuplicateMessage(
+			ctx,
+			tx,
+			collisionMessageID,
+			localMessageID,
+			nowMS,
+		); err != nil {
+			return fmt.Errorf(
+				"repoint local message %q: merge echo duplicate %q: %w",
+				localMessageID,
+				collisionMessageID,
+				mapConstraintError(err),
+			)
+		}
 		if _, err := tx.ExecContext(ctx, `
 			DELETE FROM messages
 			WHERE message_id = ?
@@ -1854,7 +2492,7 @@ func (r *OutboxRepository) repointLocalMessage(
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE messages
 		SET remote_message_id = ?,
-			updated_at_ms = ?
+			updated_at_ms = MAX(updated_at_ms, ?)
 		WHERE message_id = ?
 	`, realID, nowMS, localMessageID); err != nil {
 		return fmt.Errorf(
@@ -1889,7 +2527,7 @@ func (r *OutboxRepository) MarkStoreFailed(
 			lease_token = NULL,
 			lease_expires_at_ms = NULL,
 			transport_called_at_ms = NULL,
-			updated_at_ms = ?
+			updated_at_ms = MAX(updated_at_ms, ?)
 		WHERE outbox_id = ?
 		  AND state = 'dispatching'
 		  AND lease_token = ?
@@ -1932,7 +2570,7 @@ func (r *OutboxRepository) RecoverExpiredLeases(
 			lease_token = NULL,
 			lease_expires_at_ms = NULL,
 			transport_called_at_ms = NULL,
-			updated_at_ms = ?
+			updated_at_ms = MAX(updated_at_ms, ?)
 		WHERE state = 'dispatching'
 		  AND lease_expires_at_ms <= ?
 		  AND transport_called_at_ms IS NULL
@@ -1948,7 +2586,7 @@ func (r *OutboxRepository) RecoverExpiredLeases(
 			lease_token = NULL,
 			lease_expires_at_ms = NULL,
 			transport_called_at_ms = NULL,
-			updated_at_ms = ?
+			updated_at_ms = MAX(updated_at_ms, ?)
 		WHERE state = 'dispatching'
 		  AND lease_expires_at_ms <= ?
 		  AND transport_called_at_ms IS NOT NULL
@@ -2018,6 +2656,16 @@ func (r *OutboxRepository) FindStoreFailedDue(
 	return items, nil
 }
 
+// latestOutboxStateQuery seeks outbox_local_message_idx and reads its newest
+// entry; read surfaces run it for every outgoing message they render.
+const latestOutboxStateQuery = `
+	SELECT state
+	FROM outbox
+	WHERE account_id = ? AND local_message_id = ?
+	ORDER BY created_at_ms DESC, outbox_id DESC
+	LIMIT 1
+`
+
 // LatestStateForLocalMessage returns the delivery state of the most recent
 // outbox row for an optimistic outgoing message, so a read surface can show
 // its send lifecycle. ok is false when the message has no outbox row (a
@@ -2028,13 +2676,9 @@ func (r *OutboxRepository) LatestStateForLocalMessage(
 	accountID, localMessageID string,
 ) (state OutboxState, ok bool, err error) {
 	var value string
-	scanErr := r.store.db.QueryRowContext(ctx, `
-		SELECT state
-		FROM outbox
-		WHERE account_id = ? AND local_message_id = ?
-		ORDER BY created_at_ms DESC, outbox_id DESC
-		LIMIT 1
-	`, accountID, localMessageID).Scan(&value)
+	scanErr := r.store.db.QueryRowContext(
+		ctx, latestOutboxStateQuery, accountID, localMessageID,
+	).Scan(&value)
 	if errors.Is(scanErr, sql.ErrNoRows) {
 		return "", false, nil
 	}

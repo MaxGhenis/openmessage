@@ -13,42 +13,49 @@ import (
 	"github.com/maxghenis/openmessage/internal/storage/sqlite"
 )
 
-// Run recovers expired work once at startup and then periodically dispatches
-// due durable intents until ctx is canceled.
+// Run dispatches due durable intents in passes until ctx is canceled, and
+// returns only then. Each pass recovers expired leases, repairs store-failed
+// confirmations and dispatches what is due.
+//
+// A pass that fails on local storage does not end Run. On 2026-11-03 one
+// failed lease UPDATE returned from Run, and nothing left the outbox again
+// until the app restarted. Run now records the failure (DispatchHealth and the
+// OnPassFailure hook), waits a backoff that starts at the poll delay and
+// doubles up to the longest poll delay, and tries again. A lease the failed
+// pass left behind expires, and the next pass's recovery makes it dispatchable
+// again, or uncertain if its transport call was made.
 func (s *MessageService) Run(ctx context.Context) error {
 	if ctx == nil {
 		return fmt.Errorf("run message service: context is nil")
 	}
-	recovered, err := s.outbox.RecoverExpiredLeases(ctx, s.clock.Now())
-	if err != nil {
-		// Cancellation mid-query surfaces as a driver interrupt, not
-		// context.Canceled, so a shutdown race would read as a startup fault.
-		// As in DispatchDue's lease path, surface the cancellation itself.
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return ctxErr
-		}
-		return fmt.Errorf("run message service: recover expired leases: %w", err)
-	}
-	if recovered.NotDispatched > 0 || recovered.Uncertain > 0 {
-		s.signalChange()
-	}
-
+	var backoff time.Duration
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if _, err := s.reconcileStoreFailedDue(ctx, s.batchLimit); err != nil {
+		if err := s.dispatchPass(ctx); err != nil {
+			// Cancellation mid-query surfaces as a driver interrupt, not
+			// context.Canceled, so a shutdown race would read as a failed
+			// pass. As in DispatchDue's lease path, surface the cancellation
+			// itself.
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return ctxErr
 			}
-			return fmt.Errorf("run message service: reconcile store-failed deliveries: %w", err)
-		}
-		if _, err := s.DispatchDue(ctx, s.batchLimit); err != nil {
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				return ctxErr
+			backoff = nextPassBackoff(backoff, s.pollDelay, s.maxPollDelay)
+			s.passes.fail(fmt.Errorf("run message service: %w", err), s.clock.Now(), backoff)
+			// Only time ends the backoff: a wake from a new submission would
+			// turn a storage fault that persists into a tight retry loop.
+			timer := s.clock.NewTimer(backoff)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return ctx.Err()
+			case <-timer.C():
 			}
-			return fmt.Errorf("run message service: %w", err)
+			continue
 		}
+		backoff = 0
+		s.passes.succeed()
 
 		timer := s.clock.NewTimer(s.nextPollDelay(ctx))
 		select {
@@ -62,9 +69,53 @@ func (s *MessageService) Run(ctx context.Context) error {
 	}
 }
 
+// dispatchPass is one round of Run. It recovers expired leases on every pass,
+// not only at startup, so a lease that a failed pass or a crashed process left
+// behind is freed once it expires. Recovery never causes a resend: passes run
+// one at a time, a pass stops waiting on a call past its bound and marks its
+// intent uncertain, and recovery requeues only a lease whose transport call
+// never started (MarkTransportCalled commits before every call); a lease whose
+// call started becomes uncertain.
+func (s *MessageService) dispatchPass(ctx context.Context) error {
+	recovered, err := s.outbox.RecoverExpiredLeases(ctx, s.clock.Now())
+	if err != nil {
+		return fmt.Errorf("recover expired leases: %w", err)
+	}
+	if recovered.NotDispatched > 0 || recovered.Uncertain > 0 {
+		s.signalChange()
+	}
+	if _, err := s.reconcileStoreFailedDue(ctx, s.batchLimit); err != nil {
+		return fmt.Errorf("reconcile store-failed deliveries: %w", err)
+	}
+	if _, err := s.DispatchDue(ctx, s.batchLimit); err != nil {
+		return err
+	}
+	return nil
+}
+
+// nextPassBackoff is how long Run waits after a failed pass: the shortest
+// poll delay after the first failure, doubling with each failure in a row up
+// to the longest poll delay.
+func nextPassBackoff(previous, shortest, longest time.Duration) time.Duration {
+	if shortest <= 0 {
+		shortest = defaultPollDelay
+	}
+	longest = max(longest, shortest)
+	if previous < shortest {
+		return shortest
+	}
+	return min(previous*2, longest)
+}
+
 // DispatchDue claims and synchronously processes at most limit due intents.
 // Transport failures become durable states; only local state-machine failures
 // are returned.
+//
+// A due intent whose lease fails on its own row does not hold the others:
+// LeaseDueBatch sets it aside and leases the rows after it, and DispatchDue
+// records it (DispatchHealth and the OnLeaseFailure hook). A row the store
+// could not set aside either stays due, so DispatchDue sends the rest and then
+// returns an error naming it, and Run backs off before it meets that row again.
 func (s *MessageService) DispatchDue(ctx context.Context, limit int) (int, error) {
 	if ctx == nil {
 		return 0, fmt.Errorf("dispatch due messages: context is nil")
@@ -72,7 +123,7 @@ func (s *MessageService) DispatchDue(ctx context.Context, limit int) (int, error
 	if limit <= 0 {
 		return 0, fmt.Errorf("dispatch due messages: limit must be positive")
 	}
-	leases, err := s.outbox.LeaseDue(ctx, sqlite.LeaseRequest{
+	batch, err := s.outbox.LeaseDueBatch(ctx, sqlite.LeaseRequest{
 		Owner:    workerOwner,
 		Now:      s.clock.Now(),
 		Duration: s.leaseTime,
@@ -88,11 +139,13 @@ func (s *MessageService) DispatchDue(ctx context.Context, limit int) (int, error
 		}
 		return 0, fmt.Errorf("lease due messages: %w", err)
 	}
+	stuck := s.recordFailedLeases(batch.Failed)
 
+	leases := batch.Leases
 	processed := 0
 	for index, lease := range leases {
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			return processed, errors.Join(ctxErr, s.releaseUntouched(ctx, leases[index:]))
+			return processed, errors.Join(ctxErr, s.releaseUntouched(ctx, leases[index:]), stuck)
 		}
 		if lease.LeaseExpiresAtMS != nil && *lease.LeaseExpiresAtMS <= s.clock.Now().UnixMilli() {
 			mutationCtx, cancel := s.storageMutationContext(ctx)
@@ -102,7 +155,7 @@ func (s *MessageService) DispatchDue(ctx context.Context, limit int) (int, error
 				s.signalChange()
 			}
 			if recoverErr != nil {
-				return processed, fmt.Errorf("recover leases expired during dispatch: %w", recoverErr)
+				return processed, errors.Join(fmt.Errorf("recover leases expired during dispatch: %w", recoverErr), stuck)
 			}
 			break
 		}
@@ -123,11 +176,40 @@ func (s *MessageService) DispatchDue(ctx context.Context, limit int) (int, error
 			))
 		}
 		if dispatchErr != nil {
-			return processed, errors.Join(dispatchErr, s.releaseUntouched(ctx, leases[index+1:]))
+			return processed, errors.Join(dispatchErr, s.releaseUntouched(ctx, leases[index+1:]), stuck)
 		}
 		processed++
 	}
-	return processed, nil
+	return processed, stuck
+}
+
+// recordFailedLeases records each due row whose lease failed on its own row
+// and returns an error naming the rows the store could not set aside either.
+func (s *MessageService) recordFailedLeases(failed []sqlite.LeaseFailure) error {
+	if len(failed) == 0 {
+		return nil
+	}
+	now := s.clock.Now()
+	var stuck []error
+	setAside := false
+	for _, failure := range failed {
+		s.leaseFailures.fail(failure, now)
+		if failure.SetAsideErr != nil {
+			stuck = append(stuck, fmt.Errorf(
+				"could neither lease outbox item %q (%w) nor set it aside (%w)",
+				failure.OutboxID, failure.Err, failure.SetAsideErr,
+			))
+			continue
+		}
+		setAside = true
+	}
+	if setAside {
+		s.signalChange()
+	}
+	if len(stuck) == 0 {
+		return nil
+	}
+	return fmt.Errorf("lease due messages: %w", errors.Join(stuck...))
 }
 
 func (s *MessageService) dispatchTextLease(ctx context.Context, outboxLease sqlite.Lease) error {
@@ -151,7 +233,14 @@ func (s *MessageService) dispatchTextLease(ctx context.Context, outboxLease sqli
 		}
 		return s.releaseUnavailable(ctx, item, bridge.ErrCapabilityUnavailable)
 	}
-	defer dispatchLease.Close()
+	// An abandoned transport call may still be using the lease, so once the
+	// call starts its own goroutine releases it.
+	closeLease := true
+	defer func() {
+		if closeLease {
+			dispatchLease.Close()
+		}
+	}()
 
 	message, err := s.messageForLease(ctx, item)
 	if err != nil {
@@ -185,6 +274,29 @@ func (s *MessageService) dispatchTextLease(ctx context.Context, outboxLease sqli
 			s.clock.Now().Add(s.retryDelay),
 		)
 	}
+	replyTo, code, err := s.replyRefForLease(ctx, item, message)
+	if err != nil {
+		return s.markPreCallFailure(
+			ctx,
+			item,
+			string(bridge.FailureTransient),
+			code,
+			err,
+			s.clock.Now().Add(s.retryDelay),
+		)
+	}
+
+	conversationRef, err := s.conversationRef(conversation)
+	if err != nil {
+		return s.markPreCallFailure(
+			ctx,
+			item,
+			string(bridge.FailureTransient),
+			"load_roster",
+			err,
+			s.clock.Now().Add(s.retryDelay),
+		)
+	}
 
 	if err := s.outbox.MarkTransportCalled(ctx, sqlite.Attempt{
 		OutboxID:             item.OutboxID,
@@ -201,17 +313,18 @@ func (s *MessageService) dispatchTextLease(ctx context.Context, outboxLease sqli
 	s.signalChange()
 
 	request := bridge.TextRequest{
-		AccountID: item.AccountID,
-		Conversation: bridge.ConversationRef{
-			RemoteID: conversation.RemoteConversationID,
-		},
-		Body:      message.Body,
-		RequestID: item.TransportRequestID,
+		AccountID:    item.AccountID,
+		Conversation: conversationRef,
+		Body:         message.Body,
+		RequestID:    item.TransportRequestID,
 	}
-	if message.ReplyToRemoteID != nil {
-		request.ReplyTo = &bridge.MessageRef{RemoteID: *message.ReplyToRemoteID}
-	}
-	result, sendErr := dispatchLease.Text.SendText(ctx, request)
+	request.ReplyTo = replyTo
+	closeLease = false
+	result, sendErr := callTransport(s, ctx, item, textOperation, s.transportTimeout,
+		func(callCtx context.Context) (bridge.SendResult, error) {
+			defer dispatchLease.Close()
+			return dispatchLease.Text.SendText(callCtx, request)
+		})
 	mutationCtx, cancel := s.storageMutationContext(ctx)
 	defer cancel()
 	if sendErr != nil {
@@ -289,7 +402,14 @@ func (s *MessageService) dispatchMediaLease(ctx context.Context, outboxLease sql
 		}
 		return s.releaseUnavailable(ctx, item, bridge.ErrCapabilityUnavailable)
 	}
-	defer dispatchLease.Close()
+	// An abandoned transport call may still be using the lease, so once the
+	// call starts its own goroutine releases it.
+	closeLease := true
+	defer func() {
+		if closeLease {
+			dispatchLease.Close()
+		}
+	}()
 
 	message, err := s.messageForLease(ctx, item)
 	if err != nil {
@@ -320,6 +440,29 @@ func (s *MessageService) dispatchMediaLease(ctx context.Context, outboxLease sql
 			string(bridge.FailureTransient),
 			"cross_account_conversation",
 			fmt.Errorf("conversation %q belongs to account %q", item.ConversationID, conversation.AccountID),
+			s.clock.Now().Add(s.retryDelay),
+		)
+	}
+	replyTo, code, err := s.replyRefForLease(ctx, item, message)
+	if err != nil {
+		return s.markPreCallFailure(
+			ctx,
+			item,
+			string(bridge.FailureTransient),
+			code,
+			err,
+			s.clock.Now().Add(s.retryDelay),
+		)
+	}
+
+	conversationRef, err := s.conversationRef(conversation)
+	if err != nil {
+		return s.markPreCallFailure(
+			ctx,
+			item,
+			string(bridge.FailureTransient),
+			"load_roster",
+			err,
 			s.clock.Now().Add(s.retryDelay),
 		)
 	}
@@ -355,7 +498,14 @@ func (s *MessageService) dispatchMediaLease(ctx context.Context, outboxLease sql
 			s.clock.Now().Add(s.retryDelay),
 		)
 	}
-	defer reader.Close()
+	// An abandoned media call may still be reading the attachment, so once the
+	// call starts its own goroutine closes the reader.
+	closeReader := true
+	defer func() {
+		if closeReader {
+			_ = reader.Close()
+		}
+	}()
 
 	if err := s.outbox.MarkTransportCalled(ctx, sqlite.Attempt{
 		OutboxID:             item.OutboxID,
@@ -372,21 +522,24 @@ func (s *MessageService) dispatchMediaLease(ctx context.Context, outboxLease sql
 	s.signalChange()
 
 	request := bridge.MediaRequest{
-		AccountID: item.AccountID,
-		Conversation: bridge.ConversationRef{
-			RemoteID: conversation.RemoteConversationID,
-		},
-		Reader:    reader,
-		Size:      attachment.SizeBytes,
-		Filename:  attachment.Filename,
-		MIME:      attachment.MIME,
-		Caption:   message.Body,
-		RequestID: item.TransportRequestID,
+		AccountID:    item.AccountID,
+		Conversation: conversationRef,
+		Reader:       reader,
+		Size:         attachment.SizeBytes,
+		Filename:     attachment.Filename,
+		MIME:         attachment.MIME,
+		Caption:      message.Body,
+		RequestID:    item.TransportRequestID,
 	}
-	if message.ReplyToRemoteID != nil {
-		request.ReplyTo = &bridge.MessageRef{RemoteID: *message.ReplyToRemoteID}
-	}
-	result, sendErr := dispatchLease.Media.SendMedia(ctx, request)
+	request.ReplyTo = replyTo
+	closeReader = false
+	closeLease = false
+	result, sendErr := callTransport(s, ctx, item, mediaOperation, s.mediaTransportTimeout,
+		func(callCtx context.Context) (bridge.SendResult, error) {
+			defer dispatchLease.Close()
+			defer reader.Close()
+			return dispatchLease.Media.SendMedia(callCtx, request)
+		})
 	mutationCtx, cancel := s.storageMutationContext(ctx)
 	defer cancel()
 	if sendErr != nil {
@@ -464,7 +617,14 @@ func (s *MessageService) dispatchReactionLease(ctx context.Context, outboxLease 
 		}
 		return s.releaseUnavailable(ctx, item, bridge.ErrCapabilityUnavailable)
 	}
-	defer dispatchLease.Close()
+	// An abandoned transport call may still be using the lease, so once the
+	// call starts its own goroutine releases it.
+	closeLease := true
+	defer func() {
+		if closeLease {
+			dispatchLease.Close()
+		}
+	}()
 
 	reaction, err := s.outbox.GetOutboxReaction(ctx, item.OutboxID)
 	if err != nil {
@@ -477,7 +637,7 @@ func (s *MessageService) dispatchReactionLease(ctx context.Context, outboxLease 
 			s.clock.Now().Add(s.retryDelay),
 		)
 	}
-	target, code, err := s.targetRefForLease(ctx, item, reaction.TargetMessageID)
+	target, send, code, err := s.targetRefForLease(ctx, item, reaction.TargetMessageID)
 	if err != nil {
 		return s.markPreCallFailure(
 			ctx,
@@ -486,6 +646,46 @@ func (s *MessageService) dispatchReactionLease(ctx context.Context, outboxLease 
 			code,
 			err,
 			s.clock.Now().Add(s.retryDelay),
+		)
+	}
+	afterReactionTargetRead()
+	switch {
+	case send != nil && send.progress == sendUnsent:
+		// The target is this account's message whose send has not gone out,
+		// so the platform has no message to react to yet. Sending would name
+		// a message nobody has (on Google the phone may refuse it, on
+		// WhatsApp the reaction would address an ID the send never uses), so
+		// the reaction waits, uncalled, until the send is next due.
+		if err := s.markPreCallFailure(
+			ctx,
+			item,
+			string(bridge.FailureTransient),
+			sqlite.ReactionTargetUnsentCode,
+			fmt.Errorf(
+				"the message this reaction targets has not been sent yet (its send %s is %s)",
+				send.row.OutboxID,
+				send.row.State,
+			),
+			s.unsentTargetRetryAt(send.row),
+		); err != nil {
+			return err
+		}
+		s.wakeIfSendChanged(ctx, send.row)
+		return nil
+	case send != nil && send.progress == sendNeverSent:
+		// The target is this account's message whose send was canceled or
+		// rejected: the platform never got it and never will, so there is
+		// nothing to react to.
+		return s.rejectPreCall(
+			ctx,
+			item,
+			string(bridge.FailureUnsupported),
+			reactionTargetNeverSentCode,
+			fmt.Errorf(
+				"the message this reaction targets was never sent (its send %s is %s)",
+				send.row.OutboxID,
+				send.row.State,
+			),
 		)
 	}
 	conversation, err := s.store.GetConversation(item.ConversationID)
@@ -510,6 +710,18 @@ func (s *MessageService) dispatchReactionLease(ctx context.Context, outboxLease 
 		)
 	}
 
+	conversationRef, err := s.conversationRef(conversation)
+	if err != nil {
+		return s.markPreCallFailure(
+			ctx,
+			item,
+			string(bridge.FailureTransient),
+			"load_roster",
+			err,
+			s.clock.Now().Add(s.retryDelay),
+		)
+	}
+
 	if err := s.outbox.MarkTransportCalled(ctx, sqlite.Attempt{
 		OutboxID:             item.OutboxID,
 		LeaseToken:           *item.LeaseToken,
@@ -524,59 +736,49 @@ func (s *MessageService) dispatchReactionLease(ctx context.Context, outboxLease 
 	}
 	s.signalChange()
 
-	result, sendErr := dispatchLease.Reaction.SendReaction(ctx, bridge.ReactionRequest{
-		AccountID: item.AccountID,
-		Conversation: bridge.ConversationRef{
-			RemoteID: conversation.RemoteConversationID,
-		},
-		Target:    target,
-		Emoji:     reaction.Emoji,
-		Action:    bridge.ReactionAction(reaction.Action),
-		RequestID: item.TransportRequestID,
-	})
+	reactionRequest := bridge.ReactionRequest{
+		AccountID:    item.AccountID,
+		Conversation: conversationRef,
+		Target:       target,
+		Emoji:        reaction.Emoji,
+		Action:       bridge.ReactionAction(reaction.Action),
+		RequestID:    item.TransportRequestID,
+	}
+	closeLease = false
+	result, sendErr := callTransport(s, ctx, item, reactionOperation, s.transportTimeout,
+		func(callCtx context.Context) (bridge.SendResult, error) {
+			defer dispatchLease.Close()
+			return dispatchLease.Reaction.SendReaction(callCtx, reactionRequest)
+		})
 	mutationCtx, cancel := s.storageMutationContext(ctx)
 	defer cancel()
 	if sendErr != nil {
 		return s.recordSendError(mutationCtx, item, sendErr, reactionOperation)
 	}
-	if strings.TrimSpace(result.RemoteMessageID) == "" {
-		// Legacy web/api.go reaction dispatch returns only a success boolean, so
-		// an empty remote result is a valid confirmation for this operation.
-		if err := s.outbox.ConfirmWithoutResult(
-			mutationCtx,
-			item.OutboxID,
-			*item.LeaseToken,
-		); err != nil {
-			return fmt.Errorf(
-				"dispatch outbox item %q: confirm reaction without result: %w",
-				item.OutboxID,
-				err,
-			)
-		}
-		s.signalChange()
-		return nil
+	// The transport accepted the reaction. Confirming also records it in the
+	// read model as this account's own, in one transaction. The adapters store
+	// nothing when they send a reaction (the legacy senders wrote the stored
+	// reaction themselves after the send), so without this row a reader sees
+	// the reaction only if the transport later reports it back. The Google,
+	// WhatsApp and Signal adapters return no remote identity for a reaction,
+	// so an empty result is a valid confirmation.
+	occurredAt := result.AcceptedAt
+	if occurredAt.IsZero() {
+		occurredAt = s.clock.Now()
 	}
-
-	confirmation := sqlite.Confirmation{
+	if _, err := s.outbox.ConfirmReaction(mutationCtx, sqlite.ReactionConfirmation{
 		OutboxID:       item.OutboxID,
 		LeaseToken:     *item.LeaseToken,
 		ResultRemoteID: result.RemoteMessageID,
-	}
-	if err := s.outbox.Confirm(mutationCtx, confirmation); err != nil {
-		storeErr := s.outbox.MarkStoreFailed(
-			mutationCtx,
+		OccurredAt:     occurredAt,
+	}); err != nil {
+		// The row stays leased and called, so lease recovery settles it as
+		// uncertain: the reaction went out, and nothing here may send it again.
+		return fmt.Errorf(
+			"dispatch outbox item %q: confirm reaction: %w",
 			item.OutboxID,
-			*item.LeaseToken,
-			result.RemoteMessageID,
-			err.Error(),
+			err,
 		)
-		if storeErr != nil {
-			return fmt.Errorf(
-				"dispatch outbox item %q: confirm: %w",
-				item.OutboxID,
-				errors.Join(err, storeErr),
-			)
-		}
 	}
 	s.signalChange()
 	return nil
@@ -614,7 +816,14 @@ func (s *MessageService) dispatchReadLease(ctx context.Context, outboxLease sqli
 		}
 		return s.releaseUnavailable(ctx, item, bridge.ErrCapabilityUnavailable)
 	}
-	defer dispatchLease.Close()
+	// An abandoned transport call may still be using the lease, so once the
+	// call starts its own goroutine releases it.
+	closeLease := true
+	defer func() {
+		if closeLease {
+			dispatchLease.Close()
+		}
+	}()
 
 	receipt, err := s.outbox.GetOutboxReadReceipt(ctx, item.OutboxID)
 	if err != nil {
@@ -627,7 +836,9 @@ func (s *MessageService) dispatchReadLease(ctx context.Context, outboxLease sqli
 			s.clock.Now().Add(s.retryDelay),
 		)
 	}
-	target, code, err := s.targetRefForLease(ctx, item, receipt.LastReadMessageID)
+	// A read receipt is not held for its target's send: it names how far the
+	// conversation is read, not one message that must exist on the platform.
+	target, _, code, err := s.targetRefForLease(ctx, item, receipt.LastReadMessageID)
 	if err != nil {
 		return s.markPreCallFailure(
 			ctx,
@@ -674,14 +885,20 @@ func (s *MessageService) dispatchReadLease(ctx context.Context, outboxLease sqli
 	}
 	s.signalChange()
 
-	sendErr := dispatchLease.ReadReceipt.MarkRead(ctx, bridge.ReadReceiptRequest{
+	readRequest := bridge.ReadReceiptRequest{
 		AccountID: item.AccountID,
 		Conversation: bridge.ConversationRef{
 			RemoteID: conversation.RemoteConversationID,
 		},
 		Messages: []bridge.MessageRef{target},
 		ReadAt:   time.UnixMilli(receipt.ReadAtMS),
-	})
+	}
+	closeLease = false
+	_, sendErr := callTransport(s, ctx, item, readOperation, s.transportTimeout,
+		func(callCtx context.Context) (struct{}, error) {
+			defer dispatchLease.Close()
+			return struct{}{}, dispatchLease.ReadReceipt.MarkRead(callCtx, readRequest)
+		})
 	mutationCtx, cancel := s.storageMutationContext(ctx)
 	defer cancel()
 	if sendErr != nil {
@@ -702,45 +919,170 @@ func (s *MessageService) dispatchReadLease(ctx context.Context, outboxLease sqli
 	return nil
 }
 
+// targetRefForLease describes the message a reaction or read receipt names.
+// send is the send that named an own target under its request ID, which the
+// target still carries (see targetSendProgress), and nil for any other
+// target.
 func (s *MessageService) targetRefForLease(
 	ctx context.Context,
 	item sqlite.OutboxItem,
 	targetMessageID string,
-) (bridge.MessageRef, string, error) {
+) (ref bridge.MessageRef, send *ownSend, code string, err error) {
 	target, err := s.messages.GetMessage(ctx, targetMessageID)
 	if err != nil {
-		return bridge.MessageRef{}, "load_target", err
+		return bridge.MessageRef{}, nil, "load_target", err
 	}
 	if target.AccountID != item.AccountID || target.ConversationID != item.ConversationID {
-		return bridge.MessageRef{}, "load_target", fmt.Errorf(
+		return bridge.MessageRef{}, nil, "load_target", fmt.Errorf(
 			"target message does not match outbox account/conversation",
 		)
 	}
 
-	authorID := ""
-	if target.SenderIdentityID != nil {
-		identity, err := s.store.GetIdentity(*target.SenderIdentityID)
-		if err != nil {
-			return bridge.MessageRef{}, "load_target_author", err
-		}
-		if identity.AccountID != item.AccountID {
-			return bridge.MessageRef{}, "load_target_author", fmt.Errorf(
-				"target author %q belongs to account %q",
-				identity.IdentityID,
-				identity.AccountID,
-			)
-		}
-		authorID = identity.CanonicalValue
+	authorID, err := s.messageAuthorID(item, target)
+	if err != nil {
+		return bridge.MessageRef{}, nil, "load_target_author", err
 	}
-	// A nil sender marks an outgoing message authored by self, so an empty
-	// transport-neutral AuthorID preserves that distinction for adapter shims.
 	// Until echo reconciliation, an outgoing target's RemoteID remains its
 	// stable transport request ID.
+	send, provisional, err := s.targetSendProgress(ctx, target)
+	if err != nil {
+		return bridge.MessageRef{}, nil, "load_target", err
+	}
 	return bridge.MessageRef{
-		RemoteID: target.RemoteMessageID,
-		AuthorID: authorID,
-		SentAt:   time.UnixMilli(target.OccurredAtMS),
-	}, "", nil
+		RemoteID:            target.RemoteMessageID,
+		AuthorID:            authorID,
+		Outgoing:            target.Direction == sqlite.MessageDirectionOutgoing,
+		ProvisionalRemoteID: provisional,
+		SentAt:              time.UnixMilli(target.OccurredAtMS),
+	}, send, "", nil
+}
+
+// reactionTargetNeverSentCode is the error code of a reaction rejected before
+// the transport call because its target's send was canceled or rejected.
+const reactionTargetNeverSentCode = "reaction_target_never_sent"
+
+// provisionalTargetWindow is how long after its send went out an own message
+// still named by that send's request ID may yet be renamed by the echo that
+// brings the platform's own ID. "Went out" is the send row's updated_at_ms:
+// when the dispatcher recorded the transport's answer, or later when lease
+// recovery marked the send uncertain or a reconcile confirmed it. It is the
+// time echo pairing measures from. It is sqlite.EchoMaxLag (60 s), the
+// longest lag at which pairing considers an echo at all. On the live install
+// every echo was first seen 0.28-0.79 s after its send, and pairing by
+// content takes one only within about 6.2 s (an echo that carries its TmpID
+// is correlated whenever it arrives; nothing in the code bounds that). Past
+// the window a Google refusal of a reaction to the message is final, instead
+// of being retried every 5 s for as long as the message keeps its request
+// ID. Content pairing takes text sends only, so with no TmpID on the echo a
+// media send keeps its request ID for good. (A text echo stored before its
+// send was recorded can still be paired after the window, by the startup
+// repair or a later frame for the message; every echo measured on the live
+// store arrived after.)
+const provisionalTargetWindow = sqlite.EchoMaxLag
+
+// ownSend is the send that named an own message under its request ID, which
+// the message still carries, and how far that send has got.
+type ownSend struct {
+	row      sqlite.OutboxItem
+	progress sendProgress
+}
+
+type sendProgress int
+
+const (
+	// sendUnsent: queued, dispatching or not_dispatched. The platform has no
+	// such message yet.
+	sendUnsent sendProgress = iota + 1
+	// sendNeverSent: canceled or rejected. The platform never got the
+	// message and never will.
+	sendNeverSent
+	// sendWentOut: confirmed and waiting for its echo, uncertain, or
+	// store_failed.
+	sendWentOut
+)
+
+// targetSendProgress finds the send that named an outgoing message under its
+// request ID, when the message still carries that ID, and says whether the
+// message's remote ID is provisional: the platform may still give the message
+// its own ID, because the send is unsent, or went out less than
+// provisionalTargetWindow ago. send is nil for any other message: a received
+// one, or one already renamed to the platform's ID.
+func (s *MessageService) targetSendProgress(
+	ctx context.Context,
+	message sqlite.Message,
+) (send *ownSend, provisional bool, err error) {
+	row, found, err := s.ownSendRow(ctx, message.AccountID, message)
+	if err != nil || !found {
+		return nil, false, err
+	}
+	switch row.State {
+	case sqlite.OutboxQueued, sqlite.OutboxDispatching, sqlite.OutboxNotDispatched:
+		return &ownSend{row: row, progress: sendUnsent}, true, nil
+	case sqlite.OutboxCanceled, sqlite.OutboxRejected:
+		return &ownSend{row: row, progress: sendNeverSent}, false, nil
+	case sqlite.OutboxConfirmed, sqlite.OutboxUncertain, sqlite.OutboxStoreFailed:
+		wentOut := time.UnixMilli(row.UpdatedAtMS)
+		return &ownSend{row: row, progress: sendWentOut},
+			s.clock.Now().Before(wentOut.Add(provisionalTargetWindow)), nil
+	default:
+		return nil, false, nil
+	}
+}
+
+// afterReactionTargetRead runs between reading a reaction's target (and its
+// send) and acting on it. Tests set it to land a change to the send in that
+// gap.
+var afterReactionTargetRead = func() {}
+
+// wakeIfSendChanged closes the gap between reading a held reaction's target
+// send and recording the hold. A cancel or early retry of the send that
+// committed in that gap found the reaction still dispatching, so its wake
+// (OutboxRepository.Cancel, RetryNotDispatched) passed the reaction by, and
+// the hold was timed from the send as it was. So the send is read again, and
+// if it has changed the reactions held for it are made due at once, to be
+// judged again. Should that fail, the hold stands as recorded: the reaction
+// is tried at the send's old due time.
+func (s *MessageService) wakeIfSendChanged(ctx context.Context, read sqlite.OutboxItem) {
+	current, err := s.outbox.FindByID(ctx, read.OutboxID)
+	if err != nil {
+		return
+	}
+	if current.State == read.State && current.UpdatedAtMS == read.UpdatedAtMS &&
+		equalOptionalMS(current.NextAttemptAtMS, read.NextAttemptAtMS) {
+		return
+	}
+	mutationCtx, cancel := s.storageMutationContext(ctx)
+	defer cancel()
+	if woken, err := s.outbox.WakeReactionsHeldFor(mutationCtx, read.OutboxID); err == nil && woken > 0 {
+		s.signalChange()
+		s.signalWake()
+	}
+}
+
+func equalOptionalMS(a, b *int64) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return *a == *b
+}
+
+// unsentTargetRetryAt is when a reaction held for its target's unsent send is
+// next tried: one millisecond after the send is next due (the later of its
+// scheduled time and its next attempt, as LeaseDue reads them), and never
+// sooner than the usual retry delay. So a reaction to a message scheduled for
+// tomorrow waits for tomorrow instead of waking every 5 s, and LeaseDue, which
+// hands out due rows in order of when they fell due, gives a dispatcher that
+// reaches both the send first, so the reaction finds it sent.
+func (s *MessageService) unsentTargetRetryAt(send sqlite.OutboxItem) time.Time {
+	dueMS := send.ScheduledForMS
+	if send.NextAttemptAtMS != nil {
+		dueMS = max(dueMS, *send.NextAttemptAtMS)
+	}
+	retryAt := s.clock.Now().Add(s.retryDelay)
+	if after := time.UnixMilli(dueMS + 1); after.After(retryAt) {
+		return after
+	}
+	return retryAt
 }
 
 func (s *MessageService) messageForLease(
@@ -963,6 +1305,41 @@ func (s *MessageService) markSendUncertain(
 	return nil
 }
 
+// conversationRef describes the stored conversation an operation goes to: its
+// remote ID, kind and roster, plus this account's own identities, so an
+// adapter that looks the remote conversation up first can refuse one that now
+// names other people.
+func (s *MessageService) conversationRef(conversation sqlite.Conversation) (bridge.ConversationRef, error) {
+	peers, err := s.roster.ListConversationPeerIdentities(conversation.AccountID, conversation.ConversationID)
+	if err != nil {
+		return bridge.ConversationRef{}, err
+	}
+	self, err := s.roster.ListSelfIdentities(conversation.AccountID)
+	if err != nil {
+		return bridge.ConversationRef{}, err
+	}
+	return bridge.ConversationRef{
+		RemoteID: conversation.RemoteConversationID,
+		Kind:     string(conversation.Kind),
+		Peers:    identityKeyRefs(peers),
+		Self:     identityKeyRefs(self),
+	}, nil
+}
+
+// identityKeyRefs carries identities' natural keys only: an adapter compares
+// them, and has no use for names or raw addresses.
+func identityKeyRefs(identities []sqlite.Identity) []bridge.IdentityRef {
+	refs := make([]bridge.IdentityRef, 0, len(identities))
+	for _, identity := range identities {
+		refs = append(refs, bridge.IdentityRef{
+			Kind:      string(identity.Kind),
+			Canonical: identity.CanonicalValue,
+			IsSelf:    identity.IsSelf,
+		})
+	}
+	return refs
+}
+
 func retryableFailure(class bridge.FailureClass) bool {
 	switch class {
 	case bridge.FailureTransient,
@@ -980,7 +1357,8 @@ func terminalFailure(class bridge.FailureClass) bool {
 		bridge.FailureReauthRequired,
 		bridge.FailureUpgradeRequired,
 		bridge.FailureMisconfigured,
-		bridge.FailureUnsupported:
+		bridge.FailureUnsupported,
+		bridge.FailureRecipientMismatch:
 		return true
 	default:
 		return false

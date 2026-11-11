@@ -155,7 +155,8 @@ func daemonSilenceBlocks(ctx context.Context, daemon *localapi.Client, dataDir, 
 		var entry struct {
 			Silence json.RawMessage `json:"silence"`
 		}
-		// Top-level scalars (newest_ms, silence_stalled) aren't objects.
+		// Top-level scalars (newest_ms, silence_stalled, sms_path_stalled)
+		// aren't objects.
 		if json.Unmarshal(raw, &entry) != nil {
 			continue
 		}

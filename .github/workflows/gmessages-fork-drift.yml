@@ -16,13 +16,14 @@ env:
   FORK_REPOSITORY: MaxGhenis/gmessages
   FORK_MODULE: github.com/MaxGhenis/gmessages
   FORK_BRANCH: main
-  FORK_VERSION: v0.2602.1-0.20261009001900-100192cb3078
-  FORK_COMMIT: 100192cb3078739f7ed925730f7248eb18b6c340
-  EXPECTED_PATCH_COUNT: "2"
+  FORK_VERSION: v0.2602.1-0.20261021163109-6495a585293d
+  FORK_COMMIT: 6495a585293d59a48984c50d63c8c4c11b425877
+  EXPECTED_PATCH_COUNT: "3"
   # Subjects of the carried patches, oldest first, one per line.
   EXPECTED_PATCHES: |-
     Add ListConversationsWithCursor for paginated conversation listing
     libgm: don't complete data requests with payload-less frames
+    libgm: fail phone requests after a hard timeout and on disconnect
 
 jobs:
   drift:

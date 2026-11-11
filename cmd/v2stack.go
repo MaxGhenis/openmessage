@@ -362,12 +362,59 @@ func (s *v2Stack) Start(
 			Int("unresolved", report.Unresolved).
 			Msg("Backfilled participants for direct conversations missing them")
 	}
+	// Merge Google echo rows that projected beside their sent message because
+	// the phone echoed it without its TmpID. Runs before the worker and the
+	// dispatcher start, so nothing races it; idempotent, so safe on every
+	// start. Only on v2-primary: a merge stamps the send's outbox row as
+	// updated now, and the legacy projector would re-mirror weeks-old sends
+	// with that time.
+	if v2Primary {
+		report, err := s.Service.RepairUncorrelatedEchoDuplicates(runCtx)
+		if err != nil {
+			s.logger.Warn().Err(err).Int("failed_groups", report.Failed).Msg("Some Google echo duplicates could not be merged")
+		}
+		if report.Merged > 0 {
+			s.logger.Info().
+				Int("groups", report.Groups).
+				Int("merged", report.Merged).
+				Msg("Merged Google echo duplicates into their sent messages")
+		}
+	}
 	go func() {
 		defer runWG.Done()
 		if err := s.worker.Run(runCtx); err != nil && !errors.Is(err, context.Canceled) {
 			s.logger.Error().Err(err).Msg("V2 ingest worker stopped")
 		}
 	}()
+	// Run retries a failed pass on its own and returns only on shutdown; the
+	// hook puts each failure in the log (and /api/status v2_dispatch counts
+	// them).
+	s.Service.OnPassFailure(func(err error, pass messaging.FailedDispatchPass) {
+		s.logger.Error().Err(err).
+			Int64("consecutive", pass.Consecutive).
+			Int64("retry_at_ms", pass.RetryAtMS).
+			Msg("V2 message dispatch pass failed; retrying")
+	})
+	// The store sets aside a due row whose lease fails on the row itself, to
+	// retry, and the rows behind it still send; the hook logs each such row
+	// (and /api/status v2_dispatch counts each failed lease). When the store
+	// cannot set the row aside either, its pass fails too, and the hook above
+	// logs that.
+	s.Service.OnLeaseFailure(func(lease messaging.FailedLease) {
+		if lease.SetAsideError != "" {
+			s.logger.Error().
+				Str("outbox_id", lease.OutboxID).
+				Str("error", lease.Error).
+				Str("set_aside_error", lease.SetAsideError).
+				Msg("Failed to lease V2 outbox item or set it aside; sending the rest")
+			return
+		}
+		s.logger.Warn().
+			Str("outbox_id", lease.OutboxID).
+			Str("error", lease.Error).
+			Int64("retry_at_ms", lease.RetryAtMS).
+			Msg("Failed to lease V2 outbox item; set it aside to retry")
+	})
 	go func() {
 		defer runWG.Done()
 		if err := s.Service.Run(runCtx); err != nil && !errors.Is(err, context.Canceled) {
